@@ -4,9 +4,10 @@ import (
 	"fmt"
 	"io"
 	"reflect"
-	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 	"unsafe"
 
 	"github.com/vapstack/qx"
@@ -70,24 +71,85 @@ func (db *DB[K, V]) query(q *qx.QX) ([]K, error) {
 			return nil, fmt.Errorf("no index for field: %v", f)
 		}
 	}
+
+	// optimization for simple ORDER BY + LIMIT without complex filters
+	if len(q.Order) == 1 && q.Order[0].Type == qx.OrderBasic && q.Limit > 0 {
+		if out, ok, err := db.tryQueryOrderBasicAndLimitDriver(q); ok {
+			return out, err
+		}
+	}
+
 	result, err := db.evalExpr(q.Expr)
 	if err != nil {
 		return nil, err
 	}
-	if result == nil || result.IsEmpty() {
-		if result != nil {
-			releaseRoaringBuf(result)
+	if !result.neg {
+		if result.bm == nil || result.bm.IsEmpty() {
+			result.release()
+			return nil, nil
 		}
-		return nil, nil
+	} else {
+		if db.universe.IsEmpty() {
+			result.release()
+			return nil, nil
+		}
 	}
-	defer releaseRoaringBuf(result)
+	defer result.release()
 
 	skip := q.Offset
 	needAll := q.Limit == 0
 	need := q.Limit
 
-	if len(q.Order) > 0 {
+	// case 1: no ordering, negative result (e.g. NOT ...): iterate over universe excluding the result set
+	if len(q.Order) == 0 && result.neg {
+		if db.strkey {
+			db.strmap.RLock()
+			defer db.strmap.RUnlock()
+		}
 
+		out := make([]K, 0, func() uint64 {
+			if needAll {
+				return db.universe.GetCardinality()
+			}
+			return need
+		}())
+
+		ex := result.bm
+		it := db.universe.Iterator()
+		for it.HasNext() {
+			idx := it.Next()
+			if ex != nil && ex.Contains(idx) {
+				continue
+			}
+			if skip > 0 {
+				skip--
+				continue
+			}
+			out = append(out, db.idFromIdxNoLock(idx))
+			if !needAll {
+				need--
+				if need == 0 {
+					break
+				}
+			}
+		}
+		return out, nil
+	}
+
+	// case 2: ordering with negative result:
+	// materialize the negative set into a positive one (universe AND NOT result)
+	if len(q.Order) > 0 && result.neg {
+		mat := getRoaringBuf()
+		mat.Or(db.universe)
+		if result.bm != nil {
+			mat.AndNot(result.bm)
+		}
+		result.release()
+		result = bitmap{bm: mat}
+	}
+
+	// case 3: ordering with positive result
+	if len(q.Order) > 0 {
 		order := q.Order[0]
 
 		switch order.Type {
@@ -109,25 +171,26 @@ func (db *DB[K, V]) query(q *qx.QX) ([]K, error) {
 		default:
 		}
 
-		// what is the expected result of sorting by the slice field?...
-		/*
-			if f := db.fields[order.Field]; f != nil && f.Slice {
-				return nil, fmt.Errorf("%w: cannot use By(\"%v\") on slice field; use ByArrayPos/ByArrayCount", ErrInvalidQuery, order.Field)
-			}
-		*/
-
 		slice := db.index[order.Field]
 		if slice == nil {
 			return nil, fmt.Errorf("cannot sort non-indexed field: %v", order.Field)
 		}
 
-		seen := getRoaringBuf()
-		defer releaseRoaringBuf(seen)
+		isSliceOrderField := false
+		if fm := db.fields[order.Field]; fm != nil && fm.Slice {
+			isSliceOrderField = true
+		}
+
+		var seen *roaring64.Bitmap
+		if isSliceOrderField {
+			seen = getRoaringBuf()
+			defer releaseRoaringBuf(seen)
+		}
 
 		tmp := getRoaringBuf()
 		defer releaseRoaringBuf(tmp)
 
-		out := makeOutSlice[K](result, need)
+		out := makeOutSlice[K](result.bm, need)
 
 		if db.strkey {
 			db.strmap.RLock()
@@ -138,19 +201,82 @@ func (db *DB[K, V]) query(q *qx.QX) ([]K, error) {
 
 		LOOP_ASC:
 			for _, ix := range *slice {
+				// fast path: if the bucket is small, avoid expensive bitmap operations
+				// (iterating and checking Contains() is faster than Or/And for small sets)
+				if card := ix.IDs.GetCardinality(); card <= 256 {
+					if card == 0 {
+						continue
+					}
+
+					// fast path for unique keys
+					if card == 1 {
+						idx := ix.IDs.Minimum()
+						if !result.bm.Contains(idx) {
+							continue
+						}
+						if seen != nil {
+							if seen.Contains(idx) {
+								continue
+							}
+							seen.Add(idx)
+						}
+						if skip > 0 {
+							skip--
+							continue
+						}
+						out = append(out, db.idFromIdxNoLock(idx))
+						if !needAll {
+							need--
+							if need == 0 {
+								break LOOP_ASC
+							}
+						}
+						continue
+					}
+
+					iter := ix.IDs.Iterator()
+					for iter.HasNext() {
+						idx := iter.Next()
+						if !result.bm.Contains(idx) {
+							continue
+						}
+						if seen != nil {
+							if seen.Contains(idx) {
+								continue
+							}
+							seen.Add(idx)
+						}
+						if skip > 0 {
+							skip--
+							continue
+						}
+						out = append(out, db.idFromIdxNoLock(idx))
+						if !needAll {
+							need--
+							if need == 0 {
+								break LOOP_ASC
+							}
+						}
+					}
+					continue
+				}
+
+				// slow path: large buckets require full bitmap intersection
 				tmp.Clear()
 				tmp.Or(ix.IDs)
-				tmp.And(result)
+				tmp.And(result.bm)
 				if tmp.IsEmpty() {
 					continue
 				}
 				iter := tmp.Iterator()
 				for iter.HasNext() {
 					idx := iter.Next()
-					if seen.Contains(idx) {
-						continue
+					if seen != nil {
+						if seen.Contains(idx) {
+							continue
+						}
+						seen.Add(idx)
 					}
-					seen.Add(idx)
 					if skip > 0 {
 						skip--
 						continue
@@ -165,26 +291,88 @@ func (db *DB[K, V]) query(q *qx.QX) ([]K, error) {
 				}
 			}
 
-		} else {
+		} else { // DESC
 
 			s := *slice
 			l := len(*slice)
 		LOOP_DESC:
 			for i := l - 1; i >= 0; i-- {
 				ix := s[i]
+
+				// fast path (same as ASC)
+				if card := ix.IDs.GetCardinality(); card <= 256 {
+					if card == 0 {
+						continue
+					}
+
+					if card == 1 {
+						idx := ix.IDs.Minimum()
+						if !result.bm.Contains(idx) {
+							continue
+						}
+						if seen != nil {
+							if seen.Contains(idx) {
+								continue
+							}
+							seen.Add(idx)
+						}
+						if skip > 0 {
+							skip--
+							continue
+						}
+						out = append(out, db.idFromIdxNoLock(idx))
+						if !needAll {
+							need--
+							if need == 0 {
+								break LOOP_DESC
+							}
+						}
+						continue
+					}
+
+					iter := ix.IDs.Iterator()
+					for iter.HasNext() {
+						idx := iter.Next()
+						if !result.bm.Contains(idx) {
+							continue
+						}
+						if seen != nil {
+							if seen.Contains(idx) {
+								continue
+							}
+							seen.Add(idx)
+						}
+						if skip > 0 {
+							skip--
+							continue
+						}
+						out = append(out, db.idFromIdxNoLock(idx))
+						if !needAll {
+							need--
+							if need == 0 {
+								break LOOP_DESC
+							}
+						}
+					}
+					continue
+				}
+
+				// slow path
 				tmp.Clear()
 				tmp.Or(ix.IDs)
-				tmp.And(result)
+				tmp.And(result.bm)
 				if tmp.IsEmpty() {
 					continue
 				}
 				iter := tmp.Iterator()
 				for iter.HasNext() {
 					idx := iter.Next()
-					if seen.Contains(idx) {
-						continue
+					if seen != nil {
+						if seen.Contains(idx) {
+							continue
+						}
+						seen.Add(idx)
 					}
-					seen.Add(idx)
 					if skip > 0 {
 						skip--
 						continue
@@ -203,8 +391,11 @@ func (db *DB[K, V]) query(q *qx.QX) ([]K, error) {
 		return out, nil
 	}
 
+	// case 4: no ordering, positive result:
+	// simply return the IDs from the result bitmap.
+
 	if !db.strkey && needAll {
-		ids := result.ToArray()
+		ids := result.bm.ToArray()
 		return unsafe.Slice((*K)(unsafe.Pointer(&ids[0])), len(ids)), nil
 	}
 
@@ -213,9 +404,9 @@ func (db *DB[K, V]) query(q *qx.QX) ([]K, error) {
 		defer db.strmap.RUnlock()
 	}
 
-	out := makeOutSlice[K](result, need)
+	out := makeOutSlice[K](result.bm, need)
 
-	iter := result.Iterator()
+	iter := result.bm.Iterator()
 	for iter.HasNext() {
 		idx := iter.Next()
 		if skip > 0 {
@@ -243,14 +434,18 @@ func makeOutSlice[K ~int64 | ~uint64 | ~string](result *roaring64.Bitmap, limit 
 	return out
 }
 
-func (db *DB[K, V]) queryOrderArrayPos(result *roaring64.Bitmap, s *[]index, o qx.Order, skip, need uint64, all bool) ([]K, error) {
+func (db *DB[K, V]) queryOrderArrayPos(result bitmap, s *[]index, o qx.Order, skip, need uint64, all bool) ([]K, error) {
 
 	vals, _, err := db.exprValueToIdx(qx.Expr{Op: qx.OpIN, Value: o.Data})
 	if err != nil {
 		return nil, err
 	}
 
-	out := makeOutSlice[K](result, need)
+	if result.readonly {
+		result = result.clone()
+	}
+
+	out := makeOutSlice[K](result.bm, need)
 
 	if db.strkey {
 		db.strmap.RLock()
@@ -268,7 +463,7 @@ func (db *DB[K, V]) queryOrderArrayPos(result *roaring64.Bitmap, s *[]index, o q
 
 		tmp.Clear()
 		tmp.Or(bm)
-		tmp.And(result)
+		tmp.And(result.bm)
 		if tmp.IsEmpty() {
 			return nil
 		}
@@ -277,7 +472,7 @@ func (db *DB[K, V]) queryOrderArrayPos(result *roaring64.Bitmap, s *[]index, o q
 		for iter.HasNext() {
 			idx := iter.Next()
 
-			result.Remove(idx)
+			result.bm.Remove(idx)
 
 			if skip > 0 {
 				skip--
@@ -314,7 +509,8 @@ func (db *DB[K, V]) queryOrderArrayPos(result *roaring64.Bitmap, s *[]index, o q
 		}
 	}
 
-	iter := result.Iterator()
+	// process remaining items (those not in the priority list)
+	iter := result.bm.Iterator()
 	for iter.HasNext() {
 		idx := iter.Next()
 
@@ -336,9 +532,13 @@ func (db *DB[K, V]) queryOrderArrayPos(result *roaring64.Bitmap, s *[]index, o q
 	return out, nil
 }
 
-func (db *DB[K, V]) queryOrderArrayCount(result *roaring64.Bitmap, s []index, o qx.Order, skip, need uint64, all bool) ([]K, error) {
+func (db *DB[K, V]) queryOrderArrayCount(result bitmap, s []index, o qx.Order, skip, need uint64, all bool) ([]K, error) {
 
-	out := makeOutSlice[K](result, need)
+	out := makeOutSlice[K](result.bm, need)
+
+	if result.readonly {
+		result = result.clone()
+	}
 
 	if db.strkey {
 		db.strmap.RLock()
@@ -353,7 +553,7 @@ func (db *DB[K, V]) queryOrderArrayCount(result *roaring64.Bitmap, s []index, o 
 		for _, ix := range s {
 			tmp.Clear()
 			tmp.Or(ix.IDs)
-			tmp.And(result)
+			tmp.And(result.bm)
 
 			if tmp.IsEmpty() {
 				continue
@@ -385,7 +585,7 @@ func (db *DB[K, V]) queryOrderArrayCount(result *roaring64.Bitmap, s []index, o 
 
 			tmp.Clear()
 			tmp.Or(ix.IDs)
-			tmp.And(result)
+			tmp.And(result.bm)
 
 			if tmp.IsEmpty() {
 				continue
@@ -446,19 +646,31 @@ func (db *DB[K, V]) Count(q *qx.QX) (uint64, error) {
 		}
 	}
 
-	bm, err := db.evalExpr(q.Expr)
+	b, err := db.evalExpr(q.Expr)
 	if err != nil {
 		return 0, err
 	}
-	if bm == nil {
+	defer b.release()
+
+	if b.neg {
+		if b.bm == nil {
+			return db.universe.GetCardinality(), nil
+		}
+		ex := b.bm.GetCardinality()
+		uc := db.universe.GetCardinality()
+		if ex >= uc {
+			return 0, nil
+		}
+		return uc - ex, nil
+	}
+	if b.bm == nil {
 		return 0, nil
 	}
-	defer releaseRoaringBuf(bm)
-
-	return bm.GetCardinality(), nil
+	return b.bm.GetCardinality(), nil
 }
 
 // QueryBitmap evaluates expression against the index and returns a bitmap of matching record IDs.
+// The caller is free to modify the returned bitmap.
 func (db *DB[K, V]) QueryBitmap(expr qx.Expr) (*roaring64.Bitmap, error) {
 
 	db.mu.RLock()
@@ -477,197 +689,251 @@ func (db *DB[K, V]) QueryBitmap(expr qx.Expr) (*roaring64.Bitmap, error) {
 		}
 	}
 
-	bm, err := db.evalExpr(expr)
+	b, err := db.evalExpr(expr)
 	if err != nil {
 		return nil, err
 	}
-	if bm == nil {
+	if b.bm == nil {
 		return roaring64.NewBitmap(), nil
 	}
-	defer releaseRoaringBuf(bm)
+	defer b.release()
 
-	result := bm.Clone()
-
-	return result, nil
+	return b.bm.Clone(), nil
 }
 
-func (db *DB[K, V]) evalExpr(e qx.Expr) (*roaring64.Bitmap, error) {
+func (db *DB[K, V]) evalExpr(e qx.Expr) (bitmap, error) {
 	switch e.Op {
 
-	case qx.OpNOOP: // weird but anyway
+	case qx.OpNOOP:
 		if e.Field != "" || e.Value != nil || len(e.Operands) != 0 {
-			return nil, fmt.Errorf("%w: invalid expression, op: %v", ErrInvalidQuery, e.Op)
+			return bitmap{}, fmt.Errorf("%w: invalid expression, op: %v", ErrInvalidQuery, e.Op)
 		}
+		res := bitmap{neg: true}
 		if e.Not {
-			return getRoaringBuf(), nil
+			res.neg = !res.neg
 		}
-		res := getRoaringBuf()
-		res.Or(db.universe)
 		return res, nil
 
 	case qx.OpAND:
-		n := len(e.Operands)
-		if n == 0 {
-			return nil, fmt.Errorf("%w: empty AND expression", ErrInvalidQuery)
+		if len(e.Operands) == 0 {
+			return bitmap{}, fmt.Errorf("%w: empty AND expression", ErrInvalidQuery)
 		}
 
-		if n == 1 {
-			bm, err := db.evalExpr(e.Operands[0])
-			if err != nil {
-				return nil, err
-			}
-			if e.Not {
-				negated := getRoaringBuf()
-				negated.Or(db.universe)
-				negated.AndNot(bm)
-				releaseRoaringBuf(bm)
-				return negated, nil
-			}
-			return bm, nil
-		}
-
-		type bmCardinality struct {
-			bm   *roaring64.Bitmap
-			card uint64
-		}
-		bms := make([]bmCardinality, 0, n)
+		var (
+			first    bitmap
+			hasFirst bool
+		)
 
 		for _, op := range e.Operands {
-			bm, err := db.evalExpr(op)
+			b, err := db.evalExpr(op)
 			if err != nil {
-				for _, bb := range bms {
-					releaseRoaringBuf(bb.bm)
+				if hasFirst {
+					first.release()
 				}
-				return nil, err
+				return bitmap{}, err
 			}
-			if bm == nil || bm.IsEmpty() {
-				for _, bb := range bms {
-					releaseRoaringBuf(bb.bm)
+
+			// short-circuit: if empty non-neg set is found, the result is empty
+			if !b.neg && (b.bm == nil || b.bm.IsEmpty()) {
+				b.release()
+				if hasFirst {
+					first.release()
 				}
-				return getRoaringBuf(), nil
+				return bitmap{}, nil
 			}
-			bms = append(bms, bmCardinality{bm: bm, card: bm.GetCardinality()})
+
+			if !hasFirst {
+				first = b
+				hasFirst = true
+				continue
+			}
+
+			first, err = db.andBitmap(first, b)
+			if err != nil {
+				first.release()
+				return bitmap{}, err
+			}
+
+			if !first.neg && (first.bm == nil || first.bm.IsEmpty()) {
+				first.release()
+				return bitmap{}, nil
+			}
 		}
 
-		sort.Slice(bms, func(i, j int) bool { return bms[i].card < bms[j].card })
-
-		res := bms[0].bm
-		for i := 1; i < len(bms); i++ {
-			res.And(bms[i].bm)
-			releaseRoaringBuf(bms[i].bm)
-		}
 		if e.Not {
-			negated := getRoaringBuf()
-			negated.Or(db.universe)
-			negated.AndNot(res)
-			releaseRoaringBuf(res)
-			return negated, nil
+			first.neg = !first.neg
 		}
-		return res, nil
+		return first, nil
 
 	case qx.OpOR:
 		if len(e.Operands) == 0 {
-			return nil, fmt.Errorf("%w: empty OR expression", ErrInvalidQuery)
+			return bitmap{}, fmt.Errorf("%w: empty OR expression", ErrInvalidQuery)
 		}
-		res := getRoaringBuf()
+
+		var (
+			positives []*roaring64.Bitmap
+			negatives []bitmap
+		)
 
 		for _, op := range e.Operands {
-			bm, err := db.evalExpr(op)
+			b, err := db.evalExpr(op)
 			if err != nil {
-				releaseRoaringBuf(res)
-				return nil, err
+				for _, n := range negatives {
+					n.release()
+				}
+				return bitmap{}, err
 			}
-			if bm == nil {
+
+			// short-circuit: universe OR ... == universe
+			if b.neg && (b.bm == nil || b.bm.IsEmpty()) {
+				b.release()
+				for _, n := range negatives {
+					n.release()
+				}
+				res := bitmap{neg: true}
+				if e.Not {
+					res.neg = !res.neg
+				}
+				return res, nil
+			}
+
+			if b.neg {
+				negatives = append(negatives, b)
 				continue
 			}
-			res.Or(bm)
-			releaseRoaringBuf(bm)
+
+			if b.bm == nil || b.bm.IsEmpty() {
+				b.release()
+				continue
+			}
+
+			positives = append(positives, b.bm)
 		}
+
+		// 1. merge all positives using batched parallel union
+		var resultBm *roaring64.Bitmap
+		if len(positives) > 0 {
+			resultBm = db.unionBitmaps(positives)
+		} else {
+			resultBm = getRoaringBuf()
+		}
+		res := bitmap{bm: resultBm}
+
+		// 2. merge negatives (slow path: A OR NOT B)
+		for _, neg := range negatives {
+			var err error
+			res, err = db.orBitmap(res, neg)
+			if err != nil {
+				res.release()
+				return bitmap{}, err
+			}
+		}
+
 		if e.Not {
-			negated := getRoaringBuf()
-			negated.Or(db.universe)
-			negated.AndNot(res)
-			releaseRoaringBuf(res)
-			return negated, nil
+			res.neg = !res.neg
 		}
 		return res, nil
 
 	default:
-		bm, err := db.evalSimple(e)
+		res, err := db.evalSimple(e)
 		if err != nil {
-			return nil, err
+			return bitmap{}, err
 		}
 		if e.Not {
-			negated := getRoaringBuf()
-			negated.Or(db.universe)
-			negated.AndNot(bm)
-			releaseRoaringBuf(bm)
-			return negated, nil
+			res.neg = !res.neg
 		}
-		return bm, nil
+		return res, nil
 	}
 }
 
-func (db *DB[K, V]) evalSimple(e qx.Expr) (*roaring64.Bitmap, error) {
+func (db *DB[K, V]) evalSimple(e qx.Expr) (bitmap, error) {
 	slice := db.index[e.Field]
 	if slice == nil {
-		return nil, fmt.Errorf("no index for field: %v", e.Field)
+		return bitmap{}, fmt.Errorf("no index for field: %v", e.Field)
 	}
 
 	f := db.fields[e.Field]
 	if f == nil {
-		return nil, fmt.Errorf("no metadata for field: %v", e.Field)
+		return bitmap{}, fmt.Errorf("no metadata for field: %v", e.Field)
 	}
 
 	vals, isSlice, err := db.exprValueToIdx(e)
 	if err != nil {
-		return nil, err
+		return bitmap{}, err
 	}
 
-	switch e.Op {
+	var bitmaps []*roaring64.Bitmap
 
+	switch e.Op {
 	case qx.OpEQ:
 		if !f.Slice {
 			if isSlice {
-				return nil, fmt.Errorf("%w: %v expects a single value for scalar field %v", ErrInvalidQuery, e.Op, e.Field)
+				return bitmap{}, fmt.Errorf("%w: %v expects a single value for scalar field %v", ErrInvalidQuery, e.Op, e.Field)
 			}
 		} else {
 			if !isSlice {
-				return nil, fmt.Errorf("%w: %v expects a slice for slice field %v", ErrInvalidQuery, e.Op, e.Field)
+				return bitmap{}, fmt.Errorf("%w: %v expects a slice for slice field %v", ErrInvalidQuery, e.Op, e.Field)
 			}
 			return db.evalSliceEQ(e.Field, vals)
 		}
-		result := getRoaringBuf()
-		for _, v := range vals {
-			if bm := findIndex(slice, v); bm != nil {
-				result.Or(bm)
-			}
+		if bm := findIndex(slice, vals[0]); bm != nil {
+			return bitmap{bm: bm, readonly: true}, nil
 		}
-		return result, nil
+		return bitmap{bm: getRoaringBuf()}, nil
 
 	case qx.OpIN:
 		if f.Slice {
-			return nil, fmt.Errorf("%w: %v not supported on slice field %v", ErrInvalidQuery, e.Op, e.Field)
+			return bitmap{}, fmt.Errorf("%w: %v not supported on slice field %v", ErrInvalidQuery, e.Op, e.Field)
 		}
 		if !isSlice && e.Value != nil {
-			return nil, fmt.Errorf("%w: %v expects a slice", ErrInvalidQuery, e.Op)
+			return bitmap{}, fmt.Errorf("%w: %v expects a slice", ErrInvalidQuery, e.Op)
 		}
 		if len(vals) == 0 {
-			return nil, fmt.Errorf("%v: %v: no values provided", ErrInvalidQuery, e.Op)
+			return bitmap{}, fmt.Errorf("%v: %v: no values provided", ErrInvalidQuery, e.Op)
 		}
-		result := getRoaringBuf()
-		roaring64.FastOr()
 		for _, v := range vals {
 			if bm := findIndex(slice, v); bm != nil {
-				result.Or(bm)
+				bitmaps = append(bitmaps, bm)
 			}
 		}
-		return result, nil
+
+	case qx.OpHASANY, qx.OpHAS:
+		if !f.Slice {
+			return bitmap{}, fmt.Errorf("%w: %v not supported on non-slice field %v", ErrInvalidQuery, e.Op, e.Field)
+		}
+		if !isSlice && e.Value != nil {
+			return bitmap{}, fmt.Errorf("%w: %v expects a slice", ErrInvalidQuery, e.Op)
+		}
+		if len(vals) == 0 {
+			return bitmap{}, fmt.Errorf("%v: %v: no values provided", ErrInvalidQuery, e.Op)
+		}
+
+		if e.Op == qx.OpHAS {
+			// HAS - AND logic
+			var andBitmaps []*roaring64.Bitmap
+			for _, v := range vals {
+				bm := findIndex(slice, v)
+				if bm == nil {
+					// if any value is missing, result is empty
+					return bitmap{bm: getRoaringBuf()}, nil
+				}
+				andBitmaps = append(andBitmaps, bm)
+			}
+			return db.mergeAnd(andBitmaps)
+		}
+
+		// HASANY - OR logic
+		for _, v := range vals {
+			if bm := findIndex(slice, v); bm != nil {
+				bitmaps = append(bitmaps, bm)
+			}
+		}
 
 	case qx.OpGT, qx.OpGTE, qx.OpLT, qx.OpLTE, qx.OpPREFIX:
 		if len(vals) != 1 {
-			return nil, fmt.Errorf("%w: %v expects a single value", ErrInvalidQuery, e.Op)
+			return bitmap{}, fmt.Errorf("%w: %v expects a single value", ErrInvalidQuery, e.Op)
 		}
+
 		s := *slice
 		key := vals[0]
 
@@ -681,7 +947,6 @@ func (db *DB[K, V]) evalSimple(e qx.Expr) (*roaring64.Bitmap, error) {
 			}
 		}
 
-		result := getRoaringBuf()
 		switch e.Op {
 		case qx.OpGT:
 			start := lo
@@ -689,207 +954,257 @@ func (db *DB[K, V]) evalSimple(e qx.Expr) (*roaring64.Bitmap, error) {
 				start++
 			}
 			for i := start; i < len(s); i++ {
-				result.Or(s[i].IDs)
+				bitmaps = append(bitmaps, s[i].IDs)
 			}
-
 		case qx.OpGTE:
 			for i := lo; i < len(s); i++ {
-				result.Or(s[i].IDs)
+				bitmaps = append(bitmaps, s[i].IDs)
 			}
-
 		case qx.OpLT:
 			for i := 0; i < lo; i++ {
-				result.Or(s[i].IDs)
+				bitmaps = append(bitmaps, s[i].IDs)
 			}
-
 		case qx.OpLTE:
 			for i := 0; i < lo; i++ {
-				result.Or(s[i].IDs)
+				bitmaps = append(bitmaps, s[i].IDs)
 			}
 			if lo < len(s) && s[lo].Key == key {
-				result.Or(s[lo].IDs)
+				bitmaps = append(bitmaps, s[lo].IDs)
 			}
-
 		case qx.OpPREFIX:
 			for i := lo; i < len(s); i++ {
-				k := s[i].Key
-				if !strings.HasPrefix(k, key) {
+				if !strings.HasPrefix(s[i].Key, key) {
 					break
 				}
-				result.Or(s[i].IDs)
+				bitmaps = append(bitmaps, s[i].IDs)
 			}
 		}
-		return result, nil
-
-	case qx.OpHAS:
-		if !f.Slice {
-			return nil, fmt.Errorf("%w: %v not supported on non-slice field %v", ErrInvalidQuery, e.Op, e.Field)
-		}
-		if !isSlice && e.Value != nil {
-			return nil, fmt.Errorf("%w: %v expects a slice", ErrInvalidQuery, e.Op)
-		}
-		if len(vals) == 0 {
-			return nil, fmt.Errorf("%v: %v: no values provided", ErrInvalidQuery, e.Op)
-		}
-		result := getRoaringBuf()
-		first := true
-		for _, v := range vals {
-			if bm := findIndex(slice, v); bm != nil {
-				if first {
-					result.Or(bm)
-					first = false
-				} else {
-					result.And(bm)
-				}
-			} else {
-				result.Clear()
-				return result, nil
-			}
-		}
-		return result, nil
-
-	case qx.OpHASANY:
-		if !f.Slice {
-			return nil, fmt.Errorf("%w: %v not supported on non-slice field %v, use IN instead", ErrInvalidQuery, e.Op, e.Field)
-		}
-		if !isSlice && e.Value != nil {
-			return nil, fmt.Errorf("%w: %v expects a slice", ErrInvalidQuery, e.Op)
-		}
-		if len(vals) == 0 {
-			return nil, fmt.Errorf("%v: %v: no values provided", ErrInvalidQuery, e.Op)
-		}
-		result := getRoaringBuf()
-		for _, v := range vals {
-			if bm := findIndex(slice, v); bm != nil {
-				result.Or(bm)
-			}
-		}
-		return result, nil
 
 	case qx.OpHASNONE:
 		if !f.Slice {
-			return nil, fmt.Errorf("%w: %v not supported on non-slice field %v, use NOTIN instead", ErrInvalidQuery, e.Op, e.Field)
+			return bitmap{}, fmt.Errorf("%w: %v not supported on non-slice field %v, use NOTIN instead", ErrInvalidQuery, e.Op, e.Field)
 		}
 		if !isSlice && e.Value != nil {
-			return nil, fmt.Errorf("%w: %v expects a slice", ErrInvalidQuery, e.Op)
-		}
-		result := getRoaringBuf()
-		if len(vals) == 0 {
-			result.Or(db.universe)
-			return result, nil
-		}
-		if len(vals) == 1 {
-			result.Or(db.universe)
-			if bm := findIndex(slice, vals[0]); bm != nil {
-				result.AndNot(bm)
-			}
-			return result, nil
+			return bitmap{}, fmt.Errorf("%w: %v expects a slice", ErrInvalidQuery, e.Op)
 		}
 
-		tmp := getRoaringBuf()
-		defer releaseRoaringBuf(tmp)
-
+		var unionParts []*roaring64.Bitmap
 		for _, v := range vals {
-			if bm := findIndex(slice, v); bm != nil {
-				tmp.Or(bm)
+			if bm := findIndex(slice, v); bm != nil && !bm.IsEmpty() {
+				unionParts = append(unionParts, bm)
 			}
 		}
-		result.Or(db.universe)
-		result.AndNot(tmp)
-		return result, nil
 
-	case qx.OpSUFFIX:
-		if len(vals) != 1 {
-			return nil, fmt.Errorf("%w: %v expects a single string value", ErrInvalidQuery, e.Op)
+		if len(unionParts) == 0 {
+			return bitmap{neg: true}, nil // Universe
 		}
-		result := getRoaringBuf()
-		suf := vals[0]
-		for _, ix := range *slice { // very slow
-			if strings.HasSuffix(ix.Key, suf) {
-				result.Or(ix.IDs)
-			}
-		}
-		return result, nil
 
-	case qx.OpCONTAINS:
+		union := db.unionBitmaps(unionParts)
+		return bitmap{bm: union, neg: true}, nil
+
+	case qx.OpSUFFIX, qx.OpCONTAINS:
 		if len(vals) != 1 {
-			return nil, fmt.Errorf("%w: %v expects a single string value", ErrInvalidQuery, e.Op)
+			return bitmap{}, fmt.Errorf("%w: %v expects a single string value", ErrInvalidQuery, e.Op)
 		}
-		result := getRoaringBuf()
-		sub := vals[0]
-		for _, ix := range *slice { // very slow
-			if strings.Contains(ix.Key, sub) {
-				result.Or(ix.IDs)
+		s := *slice
+		v := vals[0]
+		for i := range s {
+			match := false
+			if e.Op == qx.OpSUFFIX {
+				match = strings.HasSuffix(s[i].Key, v)
+			} else {
+				match = strings.Contains(s[i].Key, v)
+			}
+			if match {
+				bitmaps = append(bitmaps, s[i].IDs)
 			}
 		}
-		return result, nil
 
 	default:
-		return nil, fmt.Errorf("%w: unsupported op: %v", ErrInvalidQuery, e.Op)
+		return bitmap{}, fmt.Errorf("unsupported op: %v", e.Op)
 	}
+
+	if len(bitmaps) == 0 {
+		return bitmap{bm: getRoaringBuf()}, nil
+	}
+	if len(bitmaps) == 1 {
+		return bitmap{bm: bitmaps[0], readonly: true}, nil
+	}
+
+	res := db.unionBitmaps(bitmaps)
+	return bitmap{bm: res}, nil
 }
 
-func (db *DB[K, V]) evalSliceEQ(field string, vals []string) (*roaring64.Bitmap, error) {
+// unionBitmaps merges multiple bitmaps using an adaptive strategy:
+// linear merge for small counts, batched parallel merge for large counts.
+func (db *DB[K, V]) unionBitmaps(bitmaps []*roaring64.Bitmap) *roaring64.Bitmap {
+	n := len(bitmaps)
+	switch n {
+	case 0:
+		return getRoaringBuf()
+	case 1:
+		res := getRoaringBuf()
+		res.Or(bitmaps[0])
+		return res
+	}
+
+	// if few bitmaps, linear is faster/cheaper than goroutine overhead
+	if n < 256 {
+		return db.linearOr(bitmaps)
+	}
+
+	return db.parallelBatchedOr(bitmaps)
+}
+
+func (db *DB[K, V]) linearOr(bitmaps []*roaring64.Bitmap) *roaring64.Bitmap {
+
+	bestIdx := 0
+	maxCard := bitmaps[0].GetCardinality()
+
+	for i := 1; i < len(bitmaps); i++ {
+		c := bitmaps[i].GetCardinality()
+		if c > maxCard {
+			maxCard = c
+			bestIdx = i
+		}
+	}
+
+	res := getRoaringBuf()
+	res.Or(bitmaps[bestIdx])
+
+	for i, bm := range bitmaps {
+		if i == bestIdx {
+			continue
+		}
+		res.Or(bm)
+	}
+	return res
+}
+
+func (db *DB[K, V]) parallelBatchedOr(bitmaps []*roaring64.Bitmap) *roaring64.Bitmap {
+
+	n := len(bitmaps)
+
+	workers := 8
+	if n < workers*2 {
+		workers = n / 2
+	}
+	if workers < 2 {
+		return db.linearOr(bitmaps)
+	}
+
+	chunkSize := (n + workers - 1) / workers
+	results := make([]*roaring64.Bitmap, workers)
+	var wg sync.WaitGroup
+
+	for i := 0; i < workers; i++ {
+		start := i * chunkSize
+		if start >= n {
+			break
+		}
+		end := start + chunkSize
+		if end > n {
+			end = n
+		}
+
+		wg.Add(1)
+		go func(idx int, part []*roaring64.Bitmap) {
+			defer wg.Done()
+			results[idx] = db.linearOr(part)
+		}(i, bitmaps[start:end])
+	}
+
+	wg.Wait()
+
+	finalRes := results[0]
+	if finalRes == nil {
+		finalRes = getRoaringBuf()
+	}
+
+	for i := 1; i < len(results); i++ {
+		if results[i] != nil {
+			finalRes.Or(results[i])
+			releaseRoaringBuf(results[i])
+		}
+	}
+
+	return finalRes
+}
+
+func (db *DB[K, V]) mergeAnd(bitmaps []*roaring64.Bitmap) (bitmap, error) {
+
+	if len(bitmaps) == 0 {
+		return bitmap{bm: getRoaringBuf()}, nil
+	}
+
+	smallest := bitmaps[0]
+	cardinality := smallest.GetCardinality()
+
+	for _, b := range bitmaps[1:] {
+		if c := b.GetCardinality(); c < cardinality {
+			smallest = b
+			cardinality = c
+		}
+	}
+
+	res := getRoaringBuf()
+	res.Or(smallest)
+
+	for _, b := range bitmaps {
+		if b != smallest {
+			res.And(b)
+			if res.IsEmpty() {
+				break
+			}
+		}
+	}
+	return bitmap{bm: res}, nil
+}
+
+func (db *DB[K, V]) evalSliceEQ(field string, vals []string) (bitmap, error) {
 
 	vals = dedupStringsInplace(vals)
 
-	slice := db.index[field]
-	if slice == nil {
-		return nil, fmt.Errorf("no index for field: %v", field)
-	}
-
 	lenSlice := db.lenIndex[field]
 	if lenSlice == nil {
-		return nil, fmt.Errorf("no lenIndex for slice field: %v", field)
+		return bitmap{}, fmt.Errorf("no lenIndex for slice field: %v", field)
 	}
 
 	lenBM := findIndex(lenSlice, uint64ByteStr(uint64(len(vals))))
 
-	result := getRoaringBuf()
-
-	if len(vals) == 0 {
-		if lenBM != nil {
-			result.Or(lenBM)
-		}
-		return result, nil
+	if lenBM == nil || lenBM.IsEmpty() {
+		return bitmap{bm: getRoaringBuf()}, nil
 	}
 
-	first := true
+	slice := db.index[field]
+
+	var bitmaps []*roaring64.Bitmap
+	bitmaps = append(bitmaps, lenBM)
+
 	for _, v := range vals {
 		bm := findIndex(slice, v)
 		if bm == nil {
-			result.Clear()
-			return result, nil
+			return bitmap{bm: getRoaringBuf()}, nil
 		}
-		if first {
-			result.Or(bm)
-			first = false
-		} else {
-			result.And(bm)
-			if result.IsEmpty() {
-				return result, nil
-			}
-		}
+		bitmaps = append(bitmaps, bm)
 	}
 
-	if lenBM == nil {
-		result.Clear()
-		return result, nil
+	return db.mergeAnd(bitmaps)
+}
+
+func (db *DB[K, V]) diffBitmap(acc, sub bitmap) (bitmap, error) {
+	if !acc.readonly {
+		acc.bm.AndNot(sub.bm)
+		sub.release()
+		return acc, nil
 	}
-	result.And(lenBM)
-	return result, nil
-}
 
-var roaringPool = sync.Pool{
-	New: func() any { return roaring64.New() },
-}
+	res := acc.clone()
+	res.bm.AndNot(sub.bm)
 
-func getRoaringBuf() *roaring64.Bitmap {
-	return roaringPool.Get().(*roaring64.Bitmap)
-}
-func releaseRoaringBuf(rb *roaring64.Bitmap) {
-	rb.Clear()
-	roaringPool.Put(rb)
+	acc.release()
+	sub.release()
+	return res, nil
 }
 
 func (db *DB[K, V]) exprValueToIdx(expr qx.Expr) ([]string, bool, error) {
@@ -991,4 +1306,658 @@ func (db *DB[K, V]) exprValueToIdx(expr qx.Expr) ([]string, bool, error) {
 	}
 
 	return ixs, false, nil
+}
+
+func (db *DB[K, V]) negate(res bitmap) (bitmap, error) {
+	res.neg = !res.neg
+	return res, nil
+}
+
+type bitmap struct {
+	bm       *roaring64.Bitmap
+	readonly bool
+	neg      bool
+}
+
+func (b bitmap) release() {
+	if !b.readonly && b.bm != nil {
+		releaseRoaringBuf(b.bm)
+	}
+}
+
+func (b bitmap) clone() bitmap {
+	if b.bm == nil {
+		return b
+	}
+	c := getRoaringBuf()
+	c.Or(b.bm)
+	return bitmap{bm: c, neg: b.neg, readonly: false}
+}
+
+func (db *DB[K, V]) universeCard() uint64 {
+	return db.universe.GetCardinality()
+}
+
+func (db *DB[K, V]) cardOf(b bitmap) uint64 {
+	if !b.neg {
+		if b.bm == nil {
+			return 0
+		}
+		return b.bm.GetCardinality()
+	}
+	uc := db.universeCard()
+	if b.bm == nil {
+		return uc
+	}
+	ex := b.bm.GetCardinality()
+	if ex >= uc {
+		return 0
+	}
+	return uc - ex
+}
+
+func diffOwned(a, b *roaring64.Bitmap) *roaring64.Bitmap {
+	res := getRoaringBuf()
+	if a != nil {
+		res.Or(a)
+	}
+	if b != nil && !b.IsEmpty() {
+		res.AndNot(b)
+	}
+	return res
+}
+
+func (db *DB[K, V]) andBitmap(a, b bitmap) (bitmap, error) {
+	// handle empty sets
+	if !a.neg && (a.bm == nil || a.bm.IsEmpty()) {
+		a.release()
+		b.release()
+		return bitmap{}, nil
+	}
+	if !b.neg && (b.bm == nil || b.bm.IsEmpty()) {
+		a.release()
+		b.release()
+		return bitmap{}, nil
+	}
+
+	switch {
+
+	case !a.neg && !b.neg:
+
+		// A AND B (intersection)
+		// Reuse mutable bitmap if possible.
+		// If both readonly: clone the smallest one to minimize allocations
+
+		var res bitmap
+
+		if !a.readonly {
+			a.bm.And(b.bm)
+			b.release()
+			return a, nil
+		}
+		if !b.readonly {
+			b.bm.And(a.bm)
+			a.release()
+			return b, nil
+		}
+
+		// both are readonly, clone the smallest
+		cardA := a.bm.GetCardinality()
+		cardB := b.bm.GetCardinality()
+
+		if cardA < cardB {
+			res = a.clone()
+			res.bm.And(b.bm)
+		} else {
+			res = b.clone()
+			res.bm.And(a.bm)
+		}
+
+		a.release()
+		b.release()
+		return res, nil
+
+	case a.neg && b.neg:
+
+		// NOT A AND NOT B == NOT (A OR B)
+		// merge A and B, return as negative
+
+		if !a.readonly {
+			if b.bm != nil {
+				a.bm.Or(b.bm)
+			}
+			b.release()
+			a.neg = true
+			return a, nil
+		}
+		if !b.readonly {
+			if a.bm != nil {
+				b.bm.Or(a.bm)
+			}
+			a.release()
+			b.neg = true
+			return b, nil
+		}
+
+		u := getRoaringBuf()
+		if a.bm != nil {
+			u.Or(a.bm)
+		}
+		if b.bm != nil {
+			u.Or(b.bm)
+		}
+
+		a.release()
+		b.release()
+		return bitmap{bm: u, neg: true}, nil
+
+	case a.neg && !b.neg:
+		// NOT A AND B ==  B \ A
+		return db.diffBitmap(b, a)
+
+	case !a.neg && b.neg:
+		// A AND NOT B  ->  A \ B
+		return db.diffBitmap(a, b)
+	}
+
+	return bitmap{}, nil
+}
+
+func (db *DB[K, V]) orBitmap(a, b bitmap) (bitmap, error) {
+	// universe (negative empty)
+	if a.neg && (a.bm == nil || a.bm.IsEmpty()) {
+		a.release()
+		b.release()
+		return bitmap{neg: true}, nil
+	}
+	if b.neg && (b.bm == nil || b.bm.IsEmpty()) {
+		a.release()
+		b.release()
+		return bitmap{neg: true}, nil
+	}
+
+	// standard empty
+	if !a.neg && (a.bm == nil || a.bm.IsEmpty()) {
+		a.release()
+		return b, nil
+	}
+	if !b.neg && (b.bm == nil || b.bm.IsEmpty()) {
+		b.release()
+		return a, nil
+	}
+
+	switch {
+
+	case !a.neg && !b.neg:
+
+		// A OR B (union)
+		// Reuse mutable. If both readonly: clone largest to minimize resizing
+
+		if !a.readonly {
+			a.bm.Or(b.bm)
+			b.release()
+			return a, nil
+		}
+		if !b.readonly {
+			b.bm.Or(a.bm)
+			a.release()
+			return b, nil
+		}
+
+		cardA := a.bm.GetCardinality()
+		cardB := b.bm.GetCardinality()
+
+		var res bitmap
+		if cardA >= cardB {
+			res = a.clone()
+			res.bm.Or(b.bm)
+		} else {
+			res = b.clone()
+			res.bm.Or(a.bm)
+		}
+		a.release()
+		b.release()
+		return res, nil
+
+	case a.neg && b.neg:
+
+		// NOT A OR NOT B == NOT (A AND B)
+		// Intersect internals
+
+		var res *roaring64.Bitmap
+
+		if !a.readonly {
+			a.bm.And(b.bm)
+			b.release()
+			a.neg = true
+			return a, nil
+		}
+		if !b.readonly {
+			b.bm.And(a.bm)
+			a.release()
+			b.neg = true
+			return b, nil
+		}
+
+		if a.bm.GetCardinality() < b.bm.GetCardinality() {
+			res = getRoaringBuf()
+			res.Or(a.bm)
+			res.And(b.bm)
+		} else {
+			res = getRoaringBuf()
+			res.Or(b.bm)
+			res.And(a.bm)
+		}
+		a.release()
+		b.release()
+		return bitmap{bm: res, neg: true}, nil
+
+	case a.neg && !b.neg:
+		// NOT A OR B  ->  NOT (A \ B)
+		payload := diffOwned(a.bm, b.bm)
+		a.release()
+		b.release()
+		return bitmap{bm: payload, neg: true}, nil
+
+	case !a.neg && b.neg:
+		// A OR NOT B  ->  NOT (B \ A)
+		payload := diffOwned(b.bm, a.bm)
+		a.release()
+		b.release()
+		return bitmap{bm: payload, neg: true}, nil
+	}
+
+	return bitmap{}, nil
+}
+
+func lowerBoundIndex(s []index, key string) int {
+	lo, hi := 0, len(s)
+	for lo < hi {
+		mid := (lo + hi) >> 1
+		if s[mid].Key < key {
+			lo = mid + 1
+		} else {
+			hi = mid
+		}
+	}
+	return lo
+}
+
+func upperBoundIndex(s []index, key string) int {
+	lo, hi := 0, len(s)
+	for lo < hi {
+		mid := (lo + hi) >> 1
+		if s[mid].Key <= key {
+			lo = mid + 1
+		} else {
+			hi = mid
+		}
+	}
+	return lo
+}
+
+type rangeBounds struct {
+	hasLo bool
+	loKey string
+	loInc bool
+	hasHi bool
+	hiKey string
+	hiInc bool
+}
+
+func (rb *rangeBounds) applyLo(key string, inc bool) {
+	if !rb.hasLo || rb.loKey < key || (rb.loKey == key && rb.loInc == false && inc == true) {
+		rb.hasLo = true
+		rb.loKey = key
+		rb.loInc = inc
+	}
+}
+
+func (rb *rangeBounds) applyHi(key string, inc bool) {
+	if !rb.hasHi || rb.hiKey > key || (rb.hiKey == key && rb.hiInc == false && inc == true) {
+		rb.hasHi = true
+		rb.hiKey = key
+		rb.hiInc = inc
+	}
+}
+
+func (db *DB[K, V]) tryQueryOrderBasicAndLimitDriver(q *qx.QX) ([]K, bool, error) {
+	if q == nil || len(q.Order) != 1 {
+		return nil, false, nil
+	}
+	order := q.Order[0]
+	if order.Type != qx.OrderBasic {
+		return nil, false, nil
+	}
+	if q.Limit == 0 {
+		return nil, false, nil
+	}
+	if q.Expr.Op != qx.OpAND || q.Expr.Not {
+		return nil, false, nil
+	}
+
+	f := order.Field
+	fm := db.fields[f]
+	if fm == nil || fm.Slice {
+		return nil, false, nil
+	}
+
+	slice := db.index[f]
+	if slice == nil {
+		return nil, false, nil
+	}
+	s := *slice
+	if len(s) == 0 {
+		return nil, true, nil
+	}
+
+	var rb rangeBounds
+	baseOps := make([]qx.Expr, 0, len(q.Expr.Operands))
+
+	for _, op := range q.Expr.Operands {
+		if op.Not {
+			return nil, false, nil
+		}
+		if op.Field == f {
+			switch op.Op {
+			case qx.OpGT, qx.OpGTE, qx.OpLT, qx.OpLTE, qx.OpEQ:
+				vals, isSlice, err := db.exprValueToIdx(op)
+				if err != nil {
+					return nil, true, err
+				}
+				if isSlice || len(vals) != 1 {
+					return nil, false, nil
+				}
+				k := vals[0]
+				switch op.Op {
+				case qx.OpGT:
+					rb.applyLo(k, false)
+				case qx.OpGTE:
+					rb.applyLo(k, true)
+				case qx.OpLT:
+					rb.applyHi(k, false)
+				case qx.OpLTE:
+					rb.applyHi(k, true)
+				case qx.OpEQ:
+					rb.applyLo(k, true)
+					rb.applyHi(k, true)
+				}
+				continue
+			default:
+				return nil, false, nil
+			}
+		}
+		baseOps = append(baseOps, op)
+	}
+
+	var base bitmap
+	if len(baseOps) == 0 {
+		bm := getRoaringBuf()
+		bm.Or(db.universe)
+		base = bitmap{bm: bm}
+	} else if len(baseOps) == 1 {
+		b, err := db.evalExpr(baseOps[0])
+		if err != nil {
+			return nil, true, err
+		}
+		if b.bm == nil || b.bm.IsEmpty() {
+			b.release()
+			return nil, true, nil
+		}
+		base = b
+	} else {
+		b, err := db.evalExpr(qx.Expr{Op: qx.OpAND, Operands: baseOps})
+		if err != nil {
+			return nil, true, err
+		}
+		if b.bm == nil || b.bm.IsEmpty() {
+			b.release()
+			return nil, true, nil
+		}
+		base = b
+	}
+	defer base.release()
+
+	start := 0
+	end := len(s) // exclusive
+
+	if rb.hasLo {
+		start = lowerBoundIndex(s, rb.loKey)
+		if !rb.loInc {
+			if start < len(s) && s[start].Key == rb.loKey {
+				start++
+			}
+		}
+	}
+	if rb.hasHi {
+		if rb.hiInc {
+			end = upperBoundIndex(s, rb.hiKey)
+		} else {
+			end = lowerBoundIndex(s, rb.hiKey)
+		}
+	}
+	if start < 0 {
+		start = 0
+	}
+	if end > len(s) {
+		end = len(s)
+	}
+	if start >= end {
+		return nil, true, nil
+	}
+
+	skip := q.Offset
+	need := q.Limit
+
+	out := makeOutSlice[K](base.bm, need)
+
+	if db.strkey {
+		db.strmap.RLock()
+		defer db.strmap.RUnlock()
+	}
+
+	tmp := getRoaringBuf()
+	defer releaseRoaringBuf(tmp)
+
+	emit := func(bm *roaring64.Bitmap) bool {
+		it := bm.Iterator()
+		for it.HasNext() {
+			idx := it.Next()
+			if skip > 0 {
+				skip--
+				continue
+			}
+			out = append(out, db.idFromIdxNoLock(idx))
+			need--
+			if need == 0 {
+				return true
+			}
+		}
+		return false
+	}
+
+	if !order.Desc {
+		for i := start; i < end; i++ {
+			// fast path check
+			if card := s[i].IDs.GetCardinality(); card <= 256 {
+				if card == 0 {
+					continue
+				}
+				// manual iteration
+				it := s[i].IDs.Iterator()
+				for it.HasNext() {
+					idx := it.Next()
+					if !base.bm.Contains(idx) {
+						continue
+					}
+					if skip > 0 {
+						skip--
+						continue
+					}
+					out = append(out, db.idFromIdxNoLock(idx))
+					need--
+					if need == 0 {
+						return out, true, nil
+					}
+				}
+				continue
+			}
+
+			// slow path
+			tmp.Clear()
+			tmp.Or(s[i].IDs)
+			tmp.And(base.bm)
+			if tmp.IsEmpty() {
+				continue
+			}
+			if emit(tmp) {
+				return out, true, nil
+			}
+		}
+	} else {
+		for i := end - 1; i >= start; i-- {
+			if card := s[i].IDs.GetCardinality(); card <= 256 {
+				if card == 0 {
+					continue
+				}
+				it := s[i].IDs.Iterator()
+				for it.HasNext() {
+					idx := it.Next()
+					if !base.bm.Contains(idx) {
+						continue
+					}
+					if skip > 0 {
+						skip--
+						continue
+					}
+					out = append(out, db.idFromIdxNoLock(idx))
+					need--
+					if need == 0 {
+						return out, true, nil
+					}
+				}
+				continue
+			}
+
+			tmp.Clear()
+			tmp.Or(s[i].IDs)
+			tmp.And(base.bm)
+			if tmp.IsEmpty() {
+				continue
+			}
+			if emit(tmp) {
+				return out, true, nil
+			}
+			if i == start {
+				break
+			}
+		}
+	}
+
+	return out, true, nil
+}
+
+/**/
+
+var roaringPool = sync.Pool{
+	New: func() any { return roaring64.New() },
+}
+
+func getRoaringBuf() *roaring64.Bitmap {
+	return roaringPool.Get().(*roaring64.Bitmap)
+}
+
+type cell struct {
+	seq atomic.Uint64
+	val atomic.Pointer[roaring64.Bitmap]
+}
+
+type ringQue struct {
+	mask  uint64
+	head  atomic.Uint64
+	tail  atomic.Uint64
+	cells []cell
+}
+
+const ringSizePow2 = 1 << 13
+
+func newQue() *ringQue {
+	r := &ringQue{
+		mask:  uint64(ringSizePow2 - 1),
+		cells: make([]cell, ringSizePow2),
+	}
+	for i := 0; i < ringSizePow2; i++ {
+		r.cells[i].seq.Store(uint64(i))
+	}
+	return r
+}
+
+func (q *ringQue) enqueue(bm *roaring64.Bitmap) bool {
+	for {
+		pos := q.tail.Load()
+		c := &q.cells[pos&q.mask]
+		seq := c.seq.Load()
+		dif := int64(seq) - int64(pos)
+		if dif == 0 {
+			if q.tail.CompareAndSwap(pos, pos+1) {
+				c.val.Store(bm)
+				c.seq.Store(pos + 1)
+				return true
+			}
+			continue
+		}
+		if dif < 0 {
+			return false
+		}
+	}
+}
+
+func (q *ringQue) dequeue() (*roaring64.Bitmap, bool) {
+	for {
+		pos := q.head.Load()
+		c := &q.cells[pos&q.mask]
+		seq := c.seq.Load()
+		dif := int64(seq) - int64(pos+1)
+		if dif == 0 {
+			if q.head.CompareAndSwap(pos, pos+1) {
+				bm := c.val.Swap(nil)
+				c.seq.Store(pos + q.mask + 1)
+				return bm, true
+			}
+			continue
+		}
+		if dif < 0 {
+			return nil, false
+		}
+	}
+}
+
+var releaseQue = newQue()
+
+func releaseRoaringBuf(rb *roaring64.Bitmap) {
+	if releaseQue.enqueue(rb) {
+		return
+	}
+	rb.Clear()
+	roaringPool.Put(rb)
+}
+
+func init() {
+	go func() {
+		t := time.NewTicker(50 * time.Millisecond)
+		defer t.Stop()
+
+		for range t.C {
+			for {
+				bm, ok := releaseQue.dequeue()
+				if !ok {
+					break
+				}
+				if bm != nil {
+					bm.Clear()
+					roaringPool.Put(bm)
+				}
+			}
+		}
+	}()
 }

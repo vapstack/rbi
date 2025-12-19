@@ -3,7 +3,10 @@ package rbi
 import (
 	"bytes"
 	"encoding/binary"
+	"fmt"
+	"math"
 	"os"
+	"path/filepath"
 	"reflect"
 	"slices"
 	"strings"
@@ -140,6 +143,8 @@ func (db *DB[K, V]) encode(v *V, b *bytes.Buffer) error {
 	return nil
 }
 
+/**/
+
 var encodePool = sync.Pool{
 	New: func() any { return new(bytes.Buffer) },
 }
@@ -153,6 +158,8 @@ func releaseEncodeBuf(b *bytes.Buffer) {
 	encodePool.Put(b)
 }
 
+/**/
+
 func rollback(tx *bbolt.Tx) { _ = tx.Rollback() }
 
 func touch(name string) error {
@@ -163,7 +170,9 @@ func touch(name string) error {
 	return file.Close()
 }
 
-func closefile(f *os.File) { _ = f.Close() }
+func closeFile(f *os.File) { _ = f.Close() }
+
+/**/
 
 func sanitizeSuffix(s string) string {
 	out := make([]rune, 0, len(s))
@@ -207,4 +216,64 @@ func dedupStringsInplace(s []string) []string {
 		}
 	}
 	return s[:w]
+}
+
+func uint64Bytes(v uint64) []byte {
+	var key [8]byte
+	binary.BigEndian.PutUint64(key[:], v)
+	return key[:]
+}
+
+func uint64ByteStr(v uint64) string {
+	b := uint64Bytes(v)
+	return unsafe.String(unsafe.SliceData(b), len(b))
+}
+
+func int64ByteStr(v int64) string {
+	return uint64ByteStr(uint64(v) ^ (uint64(1) << 63))
+}
+
+func float64ByteStr(f float64) string {
+	u := math.Float64bits(f)
+	const sign = uint64(1) << 63
+	if u&sign != 0 {
+		u = ^u // negative: flip all bits
+	} else {
+		u ^= sign // non-negative (includes +0): flip sign bit
+	}
+	return uint64ByteStr(u)
+}
+
+/**/
+
+var (
+	registryMu sync.Mutex
+	registry   = make(map[string]struct{})
+)
+
+func regInstance(dbPath, bucket string) error {
+	registryMu.Lock()
+	defer registryMu.Unlock()
+
+	abs, err := filepath.Abs(dbPath)
+	if err != nil {
+		return fmt.Errorf("error getting absolute file path: %w", err)
+	}
+
+	key := abs + "::" + bucket
+	if _, exists := registry[key]; exists {
+		return fmt.Errorf("rbi is alread open for \"%v\" at %v", bucket, dbPath)
+	}
+
+	registry[key] = struct{}{}
+	return nil
+}
+
+func unregInstance(dbPath, bucket string) {
+	registryMu.Lock()
+	defer registryMu.Unlock()
+
+	absPath, _ := filepath.Abs(dbPath)
+	key := absPath + "::" + bucket
+	delete(registry, key)
 }

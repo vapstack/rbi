@@ -31,7 +31,7 @@ func (db *DB[K, V]) loadIndex() (map[string]struct{}, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer closefile(f)
+	defer closeFile(f)
 
 	start := time.Now()
 
@@ -158,7 +158,7 @@ func (db *DB[K, V]) storeIndex() error {
 	if err != nil {
 		return err
 	}
-	defer closefile(f)
+	defer closeFile(f)
 
 	buf := bufio.NewWriter(f)
 	enc := gob.NewEncoder(buf)
@@ -865,13 +865,14 @@ func distinctCount(s []string) int {
 		}
 		return 3
 	}
-	if n <= 16 {
-		return distinctCountNoAlloc(s, n)
+	if n <= 8 {
+		return distinctCountLoop(s, n)
 	}
-	return distinctCountMap(s, n)
+	return len(dedupStringsInplace(s))
+	// return distinctCountMap(s, n)
 }
 
-func distinctCountNoAlloc(s []string, n int) int {
+func distinctCountLoop(s []string, n int) int {
 	uniq := 0
 OUTER:
 	for i := 0; i < n; i++ {

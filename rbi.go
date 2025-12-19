@@ -117,6 +117,15 @@ func Wrap[K ~uint64 | ~string, V any](bolt *bbolt.DB, options *Options[K, V]) (*
 	if vname == "" {
 		return nil, fmt.Errorf("cannot resolve value name of %v", vtype)
 	}
+	if bolt == nil {
+		return nil, fmt.Errorf("bolt instance is nil")
+	}
+
+	boltPath := bolt.Path()
+
+	if err := regInstance(boltPath, vname); err != nil {
+		return nil, err
+	}
 
 	db := &DB[K, V]{
 		bolt:   bolt,
@@ -151,16 +160,18 @@ func Wrap[K ~uint64 | ~string, V any](bolt *bbolt.DB, options *Options[K, V]) (*
 
 	for _, f := range db.fields {
 		if db.getters[f.DBName], err = db.makeGetter(f); err != nil {
+			unregInstance(boltPath, vname)
 			return nil, fmt.Errorf("failed to create accessor func for %v: %w", f.Name, err)
 		}
 	}
 
 	err = bolt.Update(func(tx *bbolt.Tx) error {
-		_, berr := tx.CreateBucketIfNotExists(db.bucket)
-		return berr
+		_, e := tx.CreateBucketIfNotExists(db.bucket)
+		return e
 	})
 	if err != nil {
 		_ = bolt.Close()
+		unregInstance(boltPath, vname)
 		return nil, err
 	}
 
@@ -182,6 +193,7 @@ func Wrap[K ~uint64 | ~string, V any](bolt *bbolt.DB, options *Options[K, V]) (*
 	if !options.DisableIndexRebuild {
 		if err = db.buildIndex(skipFields); err != nil {
 			_ = bolt.Close()
+			unregInstance(boltPath, vname)
 			return nil, fmt.Errorf("error building index: %w", err)
 		}
 	}
@@ -189,6 +201,7 @@ func Wrap[K ~uint64 | ~string, V any](bolt *bbolt.DB, options *Options[K, V]) (*
 	db.patchMap = make(map[string]*field)
 	if err = db.populatePatcher(vtype, nil); err != nil {
 		_ = bolt.Close()
+		unregInstance(boltPath, vname)
 		return nil, fmt.Errorf("failed to populate patch fields: %w", err)
 	}
 
@@ -198,6 +211,7 @@ func Wrap[K ~uint64 | ~string, V any](bolt *bbolt.DB, options *Options[K, V]) (*
 
 	if err = touch(db.opnFile); err != nil {
 		_ = bolt.Close()
+		unregInstance(boltPath, vname)
 		return nil, fmt.Errorf("error creating flag-file: %w", err)
 	}
 
@@ -234,7 +248,11 @@ func Open[K ~uint64 | ~string, V any](filename string, mode os.FileMode, options
 
 	options.AutoClose = true
 
-	return Wrap(bolt, options)
+	db, err := Wrap(bolt, options)
+	if err != nil {
+		_ = bolt.Close()
+	}
+	return db, err
 }
 
 type (
@@ -372,6 +390,8 @@ func (db *DB[K, V]) Close() error {
 	if !db.closed.CompareAndSwap(false, true) {
 		return nil
 	}
+
+	unregInstance(db.bolt.Path(), string(db.bucket))
 
 	var err error
 
@@ -567,7 +587,7 @@ func (db *DB[K, V]) Set(id K, newVal *V, fns ...PreCommitFunc[K, V]) error {
 
 	bucket := tx.Bucket(db.bucket)
 	if bucket == nil {
-		return fmt.Errorf("rbi: default bucket does not exist")
+		return fmt.Errorf("bucket does not exist")
 	}
 
 	var oldVal *V
@@ -649,7 +669,7 @@ func (db *DB[K, V]) SetMany(ids []K, newVals []*V, fns ...PreCommitFunc[K, V]) e
 
 	bucket := tx.Bucket(db.bucket)
 	if bucket == nil {
-		return fmt.Errorf("rbi: default bucket does not exist")
+		return fmt.Errorf("bucket does not exist")
 	}
 	bucket.FillPercent = BucketFillPercent
 
@@ -737,7 +757,7 @@ func (db *DB[K, V]) patch(id K, fields []Field, ignoreUnknown bool, fns ...PreCo
 
 	bucket := tx.Bucket(db.bucket)
 	if bucket == nil {
-		return fmt.Errorf("rbi: default bucket does not exist")
+		return fmt.Errorf("bucket does not exist")
 	}
 
 	key := db.keyFromID(id)
@@ -746,20 +766,20 @@ func (db *DB[K, V]) patch(id K, fields []Field, ignoreUnknown bool, fns ...PreCo
 	var oldVal *V
 	oldBytes := bucket.Get(key)
 	if oldBytes == nil {
-		return fmt.Errorf("rbi: item with id %v does not exist", id)
+		return fmt.Errorf("item with id %v does not exist", id)
 	}
 
 	if oldVal, err = db.decode(oldBytes); err != nil {
-		return fmt.Errorf("rbi: failed to decode existing value: %w", err)
+		return fmt.Errorf("failed to decode existing value: %w", err)
 	}
 
 	newVal, err := db.decode(oldBytes)
 	if err != nil {
-		return fmt.Errorf("rbi: failed to re-decode value for patching: %w", err)
+		return fmt.Errorf("failed to re-decode value for patching: %w", err)
 	}
 
 	if err = db.applyPatch(newVal, fields, ignoreUnknown); err != nil {
-		return fmt.Errorf("rbi: failed to apply patch: %w", err)
+		return fmt.Errorf("failed to apply patch: %w", err)
 	}
 
 	b := getEncodeBuf()
@@ -842,7 +862,7 @@ func (db *DB[K, V]) patchMany(ids []K, patch []Field, ignoreUnknown bool, fns ..
 
 	bucket := tx.Bucket(db.bucket)
 	if bucket == nil {
-		return fmt.Errorf("rbi: default bucket does not exist")
+		return fmt.Errorf("bucket does not exist")
 	}
 	bucket.FillPercent = BucketFillPercent
 
@@ -852,7 +872,7 @@ func (db *DB[K, V]) patchMany(ids []K, patch []Field, ignoreUnknown bool, fns ..
 
 		oldBytes := bucket.Get(key)
 		if oldBytes == nil {
-			return fmt.Errorf("rbi: item with id %v does not exist", id) // todo: ignore and try next id?
+			return fmt.Errorf("item with id %v does not exist", id) // todo: ignore and try next id?
 		}
 
 		var (
@@ -860,16 +880,16 @@ func (db *DB[K, V]) patchMany(ids []K, patch []Field, ignoreUnknown bool, fns ..
 			newVal *V
 		)
 		if oldVal, err = db.decode(oldBytes); err != nil {
-			return fmt.Errorf("rbi: failed to decode existing value for id %v: %w", id, err)
+			return fmt.Errorf("failed to decode existing value for id %v: %w", id, err)
 		}
 		oldVals[i] = oldVal
 
 		if newVal, err = db.decode(oldBytes); err != nil {
-			return fmt.Errorf("rbi: failed to re-decode value for patching id %v: %w", id, err)
+			return fmt.Errorf("failed to re-decode value for patching id %v: %w", id, err)
 		}
 
 		if err = db.applyPatch(newVal, patch, ignoreUnknown); err != nil {
-			return fmt.Errorf("rbi: failed to apply patch for id %v: %w", id, err)
+			return fmt.Errorf("failed to apply patch for id %v: %w", id, err)
 		}
 		newVals[i] = newVal
 
@@ -927,7 +947,7 @@ func (db *DB[K, V]) Delete(id K, fns ...PreCommitFunc[K, V]) error {
 
 	bucket := tx.Bucket(db.bucket)
 	if bucket == nil {
-		return fmt.Errorf("rbi: default bucket does not exist")
+		return fmt.Errorf("bucket does not exist")
 	}
 	bucket.FillPercent = BucketFillPercent
 
@@ -982,7 +1002,7 @@ func (db *DB[K, V]) DeleteMany(ids []K, fns ...PreCommitFunc[K, V]) error {
 
 	bucket := tx.Bucket(db.bucket)
 	if bucket == nil {
-		return fmt.Errorf("rbi: default bucket does not exist")
+		return fmt.Errorf("bucket does not exist")
 	}
 	bucket.FillPercent = BucketFillPercent
 
@@ -1074,3 +1094,5 @@ func (sm *strMapper) mustGetStringNoLock(idx uint64) string {
 	}
 	panic(fmt.Errorf("no id associated with idx %v", idx))
 }
+
+/**/

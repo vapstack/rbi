@@ -1,13 +1,16 @@
 package rbi
 
 import (
+	"errors"
 	"fmt"
 	"math"
 	"math/rand"
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/vapstack/qx"
 )
@@ -20,6 +23,7 @@ type Rec struct {
 	Meta
 
 	Name   string   `db:"name"`
+	Email  string   `db:"email"`
 	Age    int      `db:"age"`
 	Score  float64  `db:"score"`
 	Active bool     `db:"active"`
@@ -32,24 +36,30 @@ type Rec struct {
 func openTempDBUint64(t *testing.T, opts *Options[uint64, Rec]) (*DB[uint64, Rec], string) {
 	t.Helper()
 	dir := t.TempDir()
-	path := filepath.Join(dir, "test.db")
+	path := filepath.Join(dir, "test_uint64.db")
+
 	db, err := Open[uint64, Rec](path, 0o600, opts)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
+
 	t.Cleanup(func() { _ = db.Close() })
+
 	return db, path
 }
 
 func openTempDBString(t *testing.T, opts *Options[string, Rec]) (*DB[string, Rec], string) {
 	t.Helper()
 	dir := t.TempDir()
-	path := filepath.Join(dir, "test.db")
+	path := filepath.Join(dir, "test_string.db")
+
 	db, err := Open[string, Rec](path, 0o600, opts)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
+
 	t.Cleanup(func() { _ = db.Close() })
+
 	return db, path
 }
 
@@ -82,7 +92,7 @@ func seedData(t *testing.T, db *DB[uint64, Rec], n int) []uint64 {
 			Age:      18 + r.Intn(50),
 			Score:    math.Round((r.Float64()*100.0)*100) / 100,
 			Active:   r.Intn(2) == 0,
-			Tags:     append([]string(nil), tagsPool[r.Intn(len(tagsPool))]...),
+			Tags:     append([]string(nil), tagsPool[r.Intn(len(tagsPool))]...), // clone slice
 			FullName: "FN-" + fmt.Sprintf("%02d", i),
 			Opt:      opt,
 		}
@@ -97,7 +107,7 @@ func seedData(t *testing.T, db *DB[uint64, Rec], n int) []uint64 {
 
 func containsAll(haystack []string, needles []string) bool {
 	if len(needles) == 0 {
-		return false
+		return false // in logic context usually empty filter matches nothing or needs definition
 	}
 	set := make(map[string]int, len(haystack))
 	for _, v := range haystack {
@@ -231,6 +241,7 @@ func asInt(v any) (int64, bool) {
 	}
 }
 
+// evalExprBool tries to implement the query logic to serve as a reference implementation
 func evalExprBool(rec *Rec, e qx.Expr) (bool, error) {
 
 	if e.Op == qx.OpNOOP {
@@ -261,6 +272,7 @@ func evalExprBool(rec *Rec, e qx.Expr) (bool, error) {
 			}
 			return out, nil
 		}
+		// OpOR
 		out := false
 		for _, ch := range e.Operands {
 			b, err := evalExprBool(rec, ch)
@@ -280,7 +292,6 @@ func evalExprBool(rec *Rec, e qx.Expr) (bool, error) {
 
 	fv := fieldValue(rec, e.Field)
 
-	var ok bool
 	var out bool
 
 	switch e.Op {
@@ -478,15 +489,13 @@ func evalExprBool(rec *Rec, e qx.Expr) (bool, error) {
 		return false, fmt.Errorf("test harness: unsupported op %v", e.Op)
 	}
 
-	ok = true
-	_ = ok
-
 	if e.Not {
 		out = !out
 	}
 	return out, nil
 }
 
+// expectedKeysUint64 scans the DB linearly and applies logic to produce the expected result set
 func expectedKeysUint64(t *testing.T, db *DB[uint64, Rec], q *qx.QX) ([]uint64, error) {
 	t.Helper()
 
@@ -496,6 +505,7 @@ func expectedKeysUint64(t *testing.T, db *DB[uint64, Rec], q *qx.QX) ([]uint64, 
 	}
 
 	var rows []row
+
 	err := db.SeqScan(0, func(id uint64, v *Rec) (bool, error) {
 		ok, e := evalExprBool(v, q.Expr)
 		if e != nil {
@@ -568,6 +578,7 @@ func expectedKeysUint64(t *testing.T, db *DB[uint64, Rec], q *qx.QX) ([]uint64, 
 			priority := want
 			if o.Desc {
 				priority = append([]string(nil), want...)
+				// reverse priority for desc
 				for i, j := 0, len(priority)-1; i < j; i, j = i+1, j-1 {
 					priority[i], priority[j] = priority[j], priority[i]
 				}
@@ -642,59 +653,44 @@ func assertSameSlice(t *testing.T, got, want []uint64) {
 		}
 	}
 }
+
 func TestQueryCorrectnessAgainstSeqScan_Uint64Keys(t *testing.T) {
 	db, _ := openTempDBUint64(t, nil)
 	_ = seedData(t, db, 80)
 
 	queries := []*qx.QX{
-		{Expr: qx.Expr{Op: qx.OpEQ, Field: "name", Value: "alice"}},
-		{Expr: qx.Expr{Op: qx.OpPREFIX, Field: "name", Value: "al"}},
-		{Expr: qx.Expr{Op: qx.OpSUFFIX, Field: "country", Value: "land"}},
-		{Expr: qx.Expr{Op: qx.OpCONTAINS, Field: "country", Value: "land"}},
+		qx.Query(qx.EQ("name", "alice")),
+		qx.Query(qx.PREFIX("name", "al")),
+		qx.Query(qx.SUFFIX("country", "land")),
+		qx.Query(qx.CONTAINS("country", "land")),
 
-		{Expr: qx.Expr{Op: qx.OpGT, Field: "age", Value: 30}},
-		{Expr: qx.Expr{Op: qx.OpGTE, Field: "age", Value: 30}},
-		{Expr: qx.Expr{Op: qx.OpLT, Field: "age", Value: 25}},
-		{Expr: qx.Expr{Op: qx.OpLTE, Field: "age", Value: 25}},
-		{Expr: qx.Expr{Op: qx.OpIN, Field: "age", Value: []int{18, 19, 20}}},
+		qx.Query(qx.GT("age", 30)),
+		qx.Query(qx.GTE("age", 30)),
+		qx.Query(qx.LT("age", 25)),
+		qx.Query(qx.LTE("age", 25)),
+		qx.Query(qx.IN("age", []int{18, 19, 20})),
 
-		{Expr: qx.Expr{Op: qx.OpHAS, Field: "tags", Value: []string{"go", "db"}}},
-		{Expr: qx.Expr{Op: qx.OpHASANY, Field: "tags", Value: []string{"go", "java"}}},
-		{Expr: qx.Expr{Op: qx.OpHASNONE, Field: "tags", Value: []string{"rust"}}},
+		qx.Query(qx.HAS("tags", []string{"go", "db"})),
+		qx.Query(qx.HASANY("tags", []string{"go", "java"})),
+		qx.Query(qx.HASNONE("tags", []string{"rust"})),
 
-		{
-			Expr: qx.Expr{
-				Op: qx.OpOR,
-				Operands: []qx.Expr{
-					{
-						Op: qx.OpAND,
-						Operands: []qx.Expr{
-							{Op: qx.OpGT, Field: "age", Value: 30},
-							{Op: qx.OpEQ, Field: "active", Value: true},
-						},
-					},
-					{Op: qx.OpPREFIX, Field: "name", Value: "al"},
-				},
-			},
-		},
+		qx.Query(
+			qx.OR(
+				qx.AND(
+					qx.GT("age", 30),
+					qx.EQ("active", true),
+				),
+				qx.PREFIX("name", "al"),
+			),
+		),
 
-		{Expr: qx.Expr{Op: qx.OpCONTAINS, Field: "country", Value: "land", Not: true}},
+		qx.Query(qx.NOT(qx.CONTAINS("country", "land"))),
 	}
 
 	queries = append(queries,
-		&qx.QX{
-			Expr:   qx.Expr{Op: qx.OpGT, Field: "age", Value: 20},
-			Order:  []qx.Order{{Type: qx.OrderBasic, Field: "age", Desc: false}},
-			Offset: 5, Limit: 10,
-		},
-		&qx.QX{
-			Expr:  qx.Expr{Op: qx.OpNOOP},
-			Order: []qx.Order{{Type: qx.OrderByArrayCount, Field: "tags", Desc: true}},
-		},
-		&qx.QX{
-			Expr:  qx.Expr{Op: qx.OpNOOP},
-			Order: []qx.Order{{Type: qx.OrderByArrayPos, Field: "tags", Data: []string{"go", "java"}, Desc: false}},
-		},
+		qx.Query(qx.GT("age", 20)).By("age", qx.ASC).Skip(5).Max(10),
+		qx.Query().ByArrayCount("tags", qx.DESC),
+		qx.Query().ByArrayPos("tags", []string{"go", "java"}, qx.ASC),
 	)
 
 	for i, q := range queries {
@@ -743,7 +739,7 @@ func TestQueryUnknownFieldReturnsError(t *testing.T) {
 	db, _ := openTempDBUint64(t, nil)
 	_ = seedData(t, db, 10)
 
-	_, err := db.QueryKeys(&qx.QX{Expr: qx.Expr{Op: qx.OpEQ, Field: "no_such_field", Value: 1}})
+	_, err := db.QueryKeys(qx.Query(qx.EQ("no_such_field", 1)))
 	if err == nil {
 		t.Fatalf("expected error for unknown field")
 	}
@@ -768,7 +764,7 @@ func TestStringKeys_BasicQuerySetEquivalence(t *testing.T) {
 		}
 	}
 
-	q := &qx.QX{Expr: qx.Expr{Op: qx.OpGT, Field: "age", Value: 10}}
+	q := qx.Query(qx.GT("age", 10))
 
 	got, err := db.QueryKeys(q)
 	if err != nil {
@@ -802,5 +798,261 @@ func TestStringKeys_BasicQuerySetEquivalence(t *testing.T) {
 		if _, ok := gotSet[k]; !ok {
 			t.Fatalf("missing id %q in result set", k)
 		}
+	}
+}
+
+/**/
+
+func TestRace_ConcurrentReadersAndWriters(t *testing.T) {
+	db, _ := openTempDBUint64(t, nil)
+	_ = seedData(t, db, 200)
+
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+
+	errCh := make(chan error, 100)
+
+	reportErr := func(err error) {
+		select {
+		case errCh <- err:
+		default:
+		}
+	}
+
+	for w := 0; w < 4; w++ {
+		wg.Add(1)
+		go func(seed int64) {
+			defer wg.Done()
+			defer func() {
+				if r := recover(); r != nil {
+					reportErr(fmt.Errorf("panic in writer: %v", r))
+				}
+			}()
+
+			r := rand.New(rand.NewSource(seed))
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+
+				id := uint64(1 + r.Intn(250))
+				op := r.Intn(3)
+
+				switch op {
+				case 0:
+					rec := &Rec{
+						Meta:     Meta{Country: "NL"},
+						Name:     []string{"alice", "bob", "carol"}[r.Intn(3)],
+						Age:      18 + r.Intn(60),
+						Score:    r.Float64() * 100,
+						Active:   r.Intn(2) == 0,
+						Tags:     []string{"go", "java", "ops"}[:1+r.Intn(3)],
+						FullName: "FN",
+					}
+					if err := db.Set(id, rec); err != nil {
+						reportErr(fmt.Errorf("writer set error: %w", err))
+						return
+					}
+
+				case 1:
+					patch := []Field{{Name: "age", Value: float64(20 + r.Intn(50))}}
+					if err := db.Patch(id, patch); err != nil {
+						if strings.Contains(err.Error(), "does not exist") {
+							continue
+						}
+						reportErr(fmt.Errorf("writer patch error: %w", err))
+						return
+					}
+
+				case 2:
+					if err := db.Delete(id); err != nil {
+						reportErr(fmt.Errorf("writer delete error: %w", err))
+						return
+					}
+				}
+			}
+		}(int64(1000 + w))
+	}
+
+	for rr := 0; rr < 6; rr++ {
+		wg.Add(1)
+		go func(seed int64) {
+			defer wg.Done()
+			defer func() {
+				if r := recover(); r != nil {
+					reportErr(fmt.Errorf("panic in reader: %v", r))
+				}
+			}()
+
+			r := rand.New(rand.NewSource(seed))
+
+			qs := []*qx.QX{
+				qx.Query(qx.GT("age", 30)),
+				qx.Query(qx.PREFIX("name", "a")),
+				qx.Query(qx.HASANY("tags", []string{"go", "java"})),
+				qx.Query(
+					qx.AND(
+						qx.GTE("age", 25),
+						qx.EQ("active", true),
+					),
+				),
+			}
+
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+
+				q := qs[r.Intn(len(qs))]
+
+				items, err := db.QueryItems(q)
+				if err != nil {
+					if errors.Is(err, ErrIndexDisabled) || errors.Is(err, ErrClosed) {
+						return
+					}
+					reportErr(fmt.Errorf("query error: %w", err))
+					return
+				}
+
+				for _, it := range items {
+					if it == nil {
+						continue
+					}
+					ok, e := evalExprBool(it, q.Expr)
+					if e != nil {
+						reportErr(fmt.Errorf("eval logic error: %w", e))
+						return
+					}
+					if !ok {
+						reportErr(fmt.Errorf("consistency error: item %v returned for query %v", it, q.Expr))
+						return
+					}
+				}
+
+				if _, err = db.Count(q); err != nil {
+					if errors.Is(err, ErrIndexDisabled) || errors.Is(err, ErrClosed) {
+						return
+					}
+					reportErr(fmt.Errorf("count error: %w", err))
+					return
+				}
+			}
+		}(int64(2000 + rr))
+	}
+
+	time.Sleep(400 * time.Millisecond)
+	close(stop)
+	wg.Wait()
+	close(errCh)
+
+	for err := range errCh {
+		t.Errorf("Race test failure: %v", err)
+	}
+}
+
+func TestEmptySliceQueries(t *testing.T) {
+	db, _ := openTempDBUint64(t, nil)
+	if err := db.Set(1, &Rec{Tags: []string{"go"}}); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := db.QueryKeys(qx.Query(qx.HASANY("tags", []string{})))
+	if err == nil {
+		t.Fatal("HASANY with empty slice: error expected, got nil")
+	}
+
+	_, err = db.QueryKeys(qx.Query(qx.HAS("tags", []string{})))
+	if err == nil {
+		t.Fatal("HAS with empty slice: error expected, got nil")
+	}
+}
+
+func TestSort_OrderStability_WithDupValues(t *testing.T) {
+	db, _ := openTempDBUint64(t, nil)
+
+	for i := 1; i <= 10; i++ {
+		if err := db.Set(uint64(i), &Rec{Age: 20}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	q := qx.Query(qx.EQ("age", 20)).By("age", qx.ASC)
+
+	ids, err := db.QueryKeys(q)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for i := 0; i < len(ids)-1; i++ {
+		if ids[i] > ids[i+1] {
+			t.Errorf("unstable sort for dup values at index %d: %d > %d", i, ids[i], ids[i+1])
+		}
+	}
+}
+
+func TestEdge_ZeroValueVsNil(t *testing.T) {
+	db, _ := openTempDBUint64(t, nil)
+
+	sEmpty := ""
+	sVal := "val"
+
+	if err := db.Set(1, &Rec{Name: "nil_opt", Opt: nil}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Set(2, &Rec{Name: "empty_opt", Opt: &sEmpty}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Set(3, &Rec{Name: "val_opt", Opt: &sVal}); err != nil {
+		t.Fatal(err)
+	}
+
+	ids, err := db.QueryKeys(qx.Query(qx.EQ("opt", nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ids) != 1 || ids[0] != 1 {
+		t.Errorf("Query NIL: expected [1], got %v", ids)
+	}
+
+	// find empty string (value should be "" string, not pointer)
+	ids, err = db.QueryKeys(qx.Query(qx.EQ("opt", "")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ids) != 1 || ids[0] != 2 {
+		t.Errorf("expected [2], got %v", ids)
+	}
+}
+
+func TestStringPrefixLogic(t *testing.T) {
+	db, _ := openTempDBUint64(t, nil)
+
+	names := []string{"item", "item-1", "item-10", "items", "iterator"}
+	for i, n := range names {
+		if err := db.Set(uint64(i), &Rec{Name: n}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	q := qx.Query(qx.PREFIX("name", "item"))
+	ids, err := db.QueryKeys(q)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ids) != 4 {
+		t.Errorf("PREFIX 'item': expected 4, got %d", len(ids))
+	}
+
+	q = qx.Query(qx.PREFIX("name", "iter"))
+	ids, err = db.QueryKeys(q)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ids) != 1 {
+		t.Errorf("PREFIX 'iter': expected 1, got %d", len(ids))
 	}
 }

@@ -1,7 +1,6 @@
 package rbi
 
 import (
-	"encoding/binary"
 	"fmt"
 	"math"
 	"reflect"
@@ -11,7 +10,7 @@ import (
 
 type field struct {
 	Name   string
-	Unique bool // currently not used
+	Unique bool
 	Kind   reflect.Kind
 	Ptr    bool
 	Slice  bool
@@ -527,13 +526,13 @@ func (db *DB[K, V]) applyPatch(v *V, patch []Field, ignoreUnknown bool) error {
 					fv.Set(reflect.Zero(fv.Type()))
 				}
 			default:
-				return fmt.Errorf("rbi: field %v: cannot assign nil to non-nillable field", p.Name)
+				return fmt.Errorf("field %v: cannot assign nil to non-nillable field", p.Name)
 			}
 			continue
 		}
 
 		if err := db.setReflectValue(fv, p.Value); err != nil {
-			return fmt.Errorf("rbi: field %v: %w", p.Name, err)
+			return fmt.Errorf("field %v: %w", p.Name, err)
 		}
 	}
 	return nil
@@ -710,10 +709,7 @@ func (db *DB[K, V]) populatePatcher(t reflect.Type, idx []int) error {
 
 		if dbTag := rf.Tag.Get("db"); dbTag != "" && dbTag != "-" {
 			if existing, ok := db.patchMap[dbTag]; ok && existing.Name != f.Name {
-				return fmt.Errorf(
-					"rbi: ambiguous db tag '%v' used by fields %v and %v",
-					dbTag, existing.Name, f.Name,
-				)
+				return fmt.Errorf("ambiguous db tag '%v' used by fields %v and %v", dbTag, existing.Name, f.Name)
 			}
 			db.patchMap[dbTag] = f
 		}
@@ -725,10 +721,7 @@ func (db *DB[K, V]) populatePatcher(t reflect.Type, idx []int) error {
 				continue
 			}
 			if existing, ok := db.patchMap[jsonName]; ok && existing.Name != f.Name {
-				return fmt.Errorf(
-					"rbi: ambiguous json tag '%v' used by fields %v and %v",
-					jsonName, existing.Name, f.Name,
-				)
+				return fmt.Errorf("ambiguous json tag '%v' used by fields %v and %v", jsonName, existing.Name, f.Name)
 			}
 			db.patchMap[jsonName] = f
 		}
@@ -834,30 +827,4 @@ func deepCopy(origin reflect.Value, visited map[uintptr]reflect.Value) reflect.V
 	default:
 		panic(fmt.Errorf("rbi: deepCopy: unsupported value kind: %v", kind))
 	}
-}
-
-func uint64Bytes(v uint64) []byte {
-	var key [8]byte
-	binary.BigEndian.PutUint64(key[:], v)
-	return key[:]
-}
-
-func uint64ByteStr(v uint64) string {
-	b := uint64Bytes(v)
-	return unsafe.String(unsafe.SliceData(b), len(b))
-}
-
-func int64ByteStr(v int64) string {
-	return uint64ByteStr(uint64(v) ^ (uint64(1) << 63))
-}
-
-func float64ByteStr(f float64) string {
-	u := math.Float64bits(f)
-	const sign = uint64(1) << 63
-	if u&sign != 0 {
-		u = ^u // negative: flip all bits
-	} else {
-		u ^= sign // non-negative (includes +0): flip sign bit
-	}
-	return uint64ByteStr(u)
 }
