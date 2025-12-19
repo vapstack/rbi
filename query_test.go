@@ -456,7 +456,7 @@ func evalExprBool(rec *Rec, e qx.Expr) (bool, error) {
 		}
 		out = strings.Contains(s, p)
 
-	case qx.OpHAS, qx.OpHASANY, qx.OpHASNONE:
+	case qx.OpHAS, qx.OpHASANY:
 		arr, ok2 := fv.([]string)
 		if !ok2 {
 			return false, fmt.Errorf("test harness: %v only for []string in this test", e.Op)
@@ -467,8 +467,6 @@ func evalExprBool(rec *Rec, e qx.Expr) (bool, error) {
 				return false, fmt.Errorf("HAS: no values provided")
 			case qx.OpHASANY:
 				out = false
-			case qx.OpHASNONE:
-				out = true
 			}
 			break
 		}
@@ -481,8 +479,6 @@ func evalExprBool(rec *Rec, e qx.Expr) (bool, error) {
 			out = containsAll(arr, needles)
 		case qx.OpHASANY:
 			out = containsAny(arr, needles)
-		case qx.OpHASNONE:
-			out = containsNone(arr, needles)
 		}
 
 	default:

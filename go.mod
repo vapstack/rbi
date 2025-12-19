@@ -4,7 +4,7 @@ go 1.25
 
 require (
 	github.com/RoaringBitmap/roaring/v2 v2.14.4
-	github.com/vapstack/qx v0.1.1
+	github.com/vapstack/qx v0.2.0
 	github.com/vmihailenco/msgpack/v5 v5.4.1
 	go.etcd.io/bbolt v1.4.3
 )

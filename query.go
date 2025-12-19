@@ -980,28 +980,6 @@ func (db *DB[K, V]) evalSimple(e qx.Expr) (bitmap, error) {
 			}
 		}
 
-	case qx.OpHASNONE:
-		if !f.Slice {
-			return bitmap{}, fmt.Errorf("%w: %v not supported on non-slice field %v, use NOTIN instead", ErrInvalidQuery, e.Op, e.Field)
-		}
-		if !isSlice && e.Value != nil {
-			return bitmap{}, fmt.Errorf("%w: %v expects a slice", ErrInvalidQuery, e.Op)
-		}
-
-		var unionParts []*roaring64.Bitmap
-		for _, v := range vals {
-			if bm := findIndex(slice, v); bm != nil && !bm.IsEmpty() {
-				unionParts = append(unionParts, bm)
-			}
-		}
-
-		if len(unionParts) == 0 {
-			return bitmap{neg: true}, nil // Universe
-		}
-
-		union := db.unionBitmaps(unionParts)
-		return bitmap{bm: union, neg: true}, nil
-
 	case qx.OpSUFFIX, qx.OpCONTAINS:
 		if len(vals) != 1 {
 			return bitmap{}, fmt.Errorf("%w: %v expects a single string value", ErrInvalidQuery, e.Op)
@@ -1211,7 +1189,7 @@ func (db *DB[K, V]) exprValueToIdx(expr qx.Expr) ([]string, bool, error) {
 
 	if expr.Value == nil {
 		switch expr.Op {
-		case qx.OpIN, qx.OpHAS, qx.OpHASANY, qx.OpHASNONE:
+		case qx.OpIN, qx.OpHAS, qx.OpHASANY:
 			return nil, false, nil
 		default:
 			return []string{nilValue}, false, nil
