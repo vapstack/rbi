@@ -12,8 +12,7 @@ It turns a simple key-value store into a document-oriented database with rich
 query capabilities, while preserving bbolt’s ACID guarantees for data storage.
 
 Indexes are kept fully in memory and built on top of
-[roaring64](https://github.com/RoaringBitmap/roaring), allowing fast set
-operations, range scans, ordering, and filtering with microsecond-level latency.
+[roaring64](https://github.com/RoaringBitmap/roaring), allowing fast set operations, ordering, and filtering.
 
 ## Key Properties
 
