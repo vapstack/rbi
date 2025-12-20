@@ -21,8 +21,7 @@ operations, range scans, ordering, and filtering with microsecond-level latency.
 * **Index-only queries** – all queries are evaluated via in-memory indexes.
 * **Document-centric** – queries select whole records, not individual fields.
 * **Strong typing** – generic API with user-defined key and value types.
-* **Index-driven execution** – filters and ordering are applied using
-  index structures and bitmap algebra.
+* **Index-driven execution** – filters and ordering use index structures and bitmap algebra.
 * **Crash-safe** – indexes are automatically rebuilt after unclean shutdowns.
 
 ## Features
@@ -119,21 +118,12 @@ For the full API reference see the
 
 ### Writing Data
 
-* `Set(id, value)`\
-  Inserts or replaces a record and updates indexes for modified fields.
-
-* `SetMany(ids, values)`\
-  Batch variant of `Set`, significantly faster for bulk inserts.
-
-* `Patch(id, fields)`\
-  Partial update mechanism:
-    - decodes the existing record,
-    - applies field-level changes,
-    - computes a diff,
-    - updates only affected index entries.
-
-* `Delete(id)`\
-  Removes a record and its index entries.
+* `Set(id, value)` – insert or replace a record and update affected indexes.
+* `SetMany(ids, values)` – batch variant of `Set`, significantly faster for bulk inserts.
+* `Patch(id, fields)` – apply partial updates and update only changed indexes.
+* `PatchMany(ids, fields)` – patch multiple records with the same set of values.
+* `Delete(id)` – remove a record and its index entries.
+* `DeleteMany(ids)` – batch variant of `Delete`.
 
 ### Querying
 
@@ -157,31 +147,27 @@ q := qx.Query(
 
 Execution methods:
 
-* `QueryItems(q)` – returns matching records
-* `QueryKeys(q)` – returns matching IDs only
-* `QueryBitmap(expr)` – returns a Roaring bitmap of matching IDs
-* `Count(q)` – returns cardinality of the result set
+* `QueryItems(q)` – return matching records
+* `QueryKeys(q)` – return matching IDs
+* `QueryBitmap(expr)` – return a bitmap of matching IDs
+* `Count(q)` – return result cardinality
 
 ## Query Execution Model
 
 Queries are evaluated exclusively through secondary indexes and bitmap algebra.
-
-At a high level:
 
 1. **Expression evaluation**\
    Each leaf condition (e.g. `age > 30`, `tags HAS "go"`) is resolved into a
    bitmap of matching record IDs using the corresponding index.
 
 2. **Bitmap composition**\
-   Logical operators (`AND`, `OR`, `NOT`) are executed using Roaring bitmap
-   operations. Intermediate results may be represented either as positive sets
-   or as *negative* sets (universe minus exclusions) to keep large result sets
-   efficient.
+   Logical operators (`AND`, `OR`, `NOT`) are applied using Roaring bitmap
+   operations. Intermediate results may be represented as negative sets
+   (universe minus exclusions) to keep large result sets efficient.
 
 3. **Ordering and limiting**\
-   When `Order` is present, the index of the ordered field is traversed,
-   intersecting buckets with the filtered bitmap and applying `Offset`
-   and `Limit` incrementally.
+   When ordering is requested, the index of the ordered field is traversed and
+   intersected with the filtered bitmap while applying offset and limit.
 
 4. **Materialization**  
    Only the final set of matching IDs is materialized. Record values are fetched
@@ -197,19 +183,18 @@ directly via index traversal without materializing or re-sorting intermediate
 result sets.
 
 If multi-column ordering is required, it must be implemented at the application
-level after fetching the result set.
+level.
 
 ## Struct Tags and Indexing
 
 By default, **all exported struct fields** are indexed using the Go field name.
 
-To exclude a field from indexing, set one of the following tags to `"-"`:
+To exclude a field from indexing, use one of:
+- `db:"-"`
+-`dbi:"-"`
+-`rbi:"-"`
 
-* `db:"-"`
-* `dbi:"-"`
-* `rbi:"-"`
-
-> Excluding large or opaque fields (JSON blobs, encrypted payloads, binary data)
+> Excluding large or opaque fields (blobs, binary data)
 > is strongly recommended unless you actually query on them.
 
 ## Slice Fields
@@ -230,13 +215,12 @@ enforces a uniqueness constraint for that field.
 * Only scalar (non-slice) fields can be unique.
 * Uniqueness is enforced across single and batch writes (`SetMany`, `PatchMany`).
 * Violations return `ErrUniqueViolation` before committing the transaction.
-* Uniqueness guarantees rely on indexes and are unavailable when indexing is
-  explicitly disabled.
+* Uniqueness guarantees rely on indexes and are unavailable when indexing is disabled.
 
 ## Custom Indexing with `ValueIndexer`
 
-The package indexes scalar values and slices of scalar values by default.
-For custom or complex types, it provides the `ValueIndexer` interface:
+Scalar values and slices of scalars are indexed by default.
+Custom types may implement:
 
 ```go
 type ValueIndexer interface {
@@ -244,35 +228,22 @@ type ValueIndexer interface {
 }
 ```
 
-If a field value implements `ValueIndexer`, indexing engine uses the value 
-returned by `IndexingValue()` as the indexed representation of that field.
+The returned value is used as the indexed representation.
 
-This allows user-defined types to participate in indexing without changing 
-their in-memory or serialized representation.
+### Requirements:
+- Must return a stable, deterministic value.
+- Equal values must produce equal indexing values.
+- `nil` handling is the responsibility of the implementation.
+- `IndexingValue` may be called on a nil receiver.
 
-> Incorrect or unstable implementations of `ValueIndexer` may lead to panics
-> and/or undefined query behavior.
-
-### Usage Notes
-
-- `IndexingValue()` must return a stable and deterministic value.
-- Different values that should compare equal in queries must return the same
-  indexing value.
-- The returned value is treated as an opaque index key and is compared using
-  the same semantics as built-in scalar types.
-- Nil handling is the responsibility of the implementation.
-  If nil values are expected, `IndexingValue()` must handle them explicitly.
-
-This mechanism is intended for advanced use cases where built-in scalar
-indexing is insufficient.
+> Incorrect implementations may cause panics or undefined query behavior.
 
 ## Patch Resolution Rules
 
 `Patch` accepts string field identifiers and resolves them in the following order:
-
-1. **Struct field name**
-2. **`db` tag**
-3. **`json` tag**
+1. Struct field name
+2. `db` tag
+3. `json` tag
 
 This allows JSON payloads to be applied directly without additional mapping.
 
@@ -284,7 +255,7 @@ type User struct {
     // Indexed as "email". Patchable via "Email", "email", or "mail".
     Email string `db:"email" json:"mail"`
     
-    // Indexed as "Password". Patchable via "Password" or "pass".
+    // Not indexed. Patchable via "Password" or "pass".
     Password string `db:"-" json:"pass"`
     
     // Not indexed. Patchable via "Meta".
@@ -296,48 +267,97 @@ type User struct {
 
 Indexes are persisted only on `Close()`.
 
-On startup, an `.rbo` marker file is created. If the marker is present during
+An `.rbo` marker file is created on startup. If the marker is present during
 the next open, it indicates an unclean shutdown and automatically triggers a
 full index rebuild from the stored data.
 
 ## Memory Usage
 
-All secondary indexes are stored fully in memory.\
+All secondary indexes are kept in memory.\
 Memory usage is roughly proportional to:
 * number of indexed fields,
 * number of records,
 * cardinality and distribution of indexed values.
 
-Careful selection of indexed fields is strongly recommended for large datasets.
+Careful index selection is recommended for large datasets.
 
 ## Multiple Instances
 
-Multiple instances of `DB` can safely work on top of a single bbolt database.
-Each instance maintains its own in-memory index. Whether this is desirable
-depends on workload and memory constraints and should be benchmarked for the
-target use case.
+Multiple `DB` instances may safely operate on the same bbolt database.\
+Each instance maintains its own in-memory index.
 
 ## Encoding and Schema Evolution
 
-Values are encoded using **msgpack**.
+Values are encoded using [msgpack](https://github.com/vmihailenco/msgpack).
 
-This provides:
-* good performance,
-* compact representation,
-* stable field layout.
+Msgpack provides good performance, compact binary representation, and a
+flatten encoding model similar to JSON. This makes it tolerant to many
+schema changes, including field reordering and movement between embedded
+and top-level structs.
 
-Schema changes are generally safe:
-* adding fields – safe,
-* removing fields – safe,
-* renaming fields – requires index rebuild,
-* changing field types – requires index rebuild.
+Unlike `gob`, field decoding does not depend on the exact structural layout of
+the type, which allows values to be safely decoded even if fields are moved
+between embedded structs or promoted to the parent struct.
 
-Indexes are automatically rebuilt for affected fields when schema changes are
+Most schema changes are handled gracefully:
+
+* **Adding fields** – a new index is created for the field; existing records
+  simply have no value for it.
+* **Removing fields** – the corresponding index is removed, but encoded data
+  for the field remains on disk until the record is updated.
+* **Renaming fields** – the old index is removed and a new one is created;
+  stored data remains until records are updated.
+* **Changing field types** – affected indexes are rebuilt; decoding behavior
+  and compatibility are the responsibility of the user.
+
+Indexes for affected fields are automatically rebuilt when schema changes are
 detected.
+
+## Optional LRU Cache
+
+The package provides an optional cache wrapper that adds two layers of caching:
+
+1. In-memory LRU cache for individual records.\
+   Is stores decoded values and returns **pointers to the cached data**.
+
+2. Invalidation-based cache for query results.\
+   A cache that maps a caching key (`QX.Key`) to the resulting list of record **IDs**.
+
+### Item Cache Limitations
+
+Cached values are returned as **pointers to the cached data**.\
+No copying is performed.
+
+This means:
+- Modifying a returned value mutates the cached entry.
+- Concurrent reads and writes to cached values may lead to data races.
+- Callers must treat cached values as read-only.
+
+### Query Cache Limitations
+
+- **Phantom Reads**\
+  The query cache relies on reactive invalidation:
+  a cache entry is cleared only if one of the keys already contained in that entry
+  is modified or deleted. If a **new record is inserted** that matches the query
+  criteria, the cached result will not be updated or invalidated.
+  The `InvalidateQuery` and `InvalidateQueryPrefix` methods can be used
+  for manual invalidation.
+
+* **Memory Usage**\
+  While the item cache is bounded by the specified capacity,
+  the query cache is **unbounded**. Heavy usage of unique query keys may lead
+  to memory growth. The `Reset` method clears the entire cache
+  and releases memory back to the GC.
+
+### Atomicity Notes
+
+When wrapped by a cache instance, `QueryItems` resolves keys first and fetches
+values afterward. If a concurrent update or delete occurs between these steps,
+the returned slice may contain `nil` values for records that no longer exist.
 
 ## Design Scope and Non-Goals
 
-This package intentionally does **not** aim to be a relational database or a SQL engine.
+This package does **not** aim to be a relational database or a SQL engine.
 
 * no projections (`SELECT field1, field2`),
 * no joins,
@@ -353,14 +373,13 @@ The package is optimized for read-heavy workloads with complex filters.
 Typical characteristics:
 * microsecond-level query latency,
 * logarithmic range queries,
-* very fast `AND` / `OR` filtering via roaring bitmaps,
-* batch writes strongly preferred over single inserts.
+* fast bitmap-based filtering,
+* batch writes are preferred over single inserts.
 
 There is still room for optimization, but the current performance is already
 suitable for many workloads.
 
 ## Contributing
 
-Pull requests are welcome.
-
-For major changes, please open an issue first to discuss design and compatibility.
+Pull requests are welcome.\
+For major changes, please open an issue first.
