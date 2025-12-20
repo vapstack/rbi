@@ -2,6 +2,7 @@ package rbi
 
 import (
 	"container/list"
+	"strings"
 	"sync"
 
 	"github.com/vapstack/qx"
@@ -88,6 +89,42 @@ func (c *LRUCache[K, V]) invalidateKey(id K) {
 		}
 		delete(c.keyToQueries, id)
 	}
+}
+
+// InvalidateQuery removes a cached query result identified by its query key.
+//
+// This only invalidates the cached list of keys for the given query.
+// It does not affect cached individual records and does not touch the underlying DB.
+func (c *LRUCache[K, V]) InvalidateQuery(key string) {
+	c.mu.Lock()
+	delete(c.queryToKeys, key)
+	c.mu.Unlock()
+}
+
+// InvalidateQueryPrefix removes all cached query results whose keys
+// start with the specified prefix.
+//
+// This is useful for bulk invalidation of logically related queries
+// that share a common query key namespace.
+//
+// Only query result caches are affected; item cache entries remain intact.
+func (c *LRUCache[K, V]) InvalidateQueryPrefix(prefix string) {
+	c.mu.Lock()
+	for k := range c.queryToKeys {
+		if strings.HasPrefix(k, prefix) {
+			delete(c.queryToKeys, k)
+		}
+	}
+	c.mu.Unlock()
+}
+
+// Invalidate removes all cache entries associated with the given record ID
+// and all cached query results that included this ID.
+// It does not modify the underlying database.
+func (c *LRUCache[K, V]) Invalidate(id K) {
+	c.mu.Lock()
+	c.invalidateKey(id)
+	c.mu.Unlock()
 }
 
 // Get retrieves an item from the cache or falls back to the underlying DB.
