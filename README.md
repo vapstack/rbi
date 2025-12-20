@@ -119,20 +119,20 @@ For the full API reference see the
 
 ### Writing Data
 
-* **`Set(id, value)`**  
+* `Set(id, value)`\
   Inserts or replaces a record and updates indexes for modified fields.
 
-* **`SetMany(ids, values)`**  
+* `SetMany(ids, values)`\
   Batch variant of `Set`, significantly faster for bulk inserts.
 
-* **`Patch(id, fields)`**  
+* `Patch(id, fields)`\
   Partial update mechanism:
     - decodes the existing record,
     - applies field-level changes,
     - computes a diff,
     - updates only affected index entries.
 
-* **`Delete(id)`**  
+* `Delete(id)`\
   Removes a record and its index entries.
 
 ### Querying
@@ -157,10 +157,10 @@ q := qx.Query(
 
 Execution methods:
 
-* **`QueryItems(q)`** – returns matching records
-* **`QueryKeys(q)`** – returns matching IDs only
-* **`QueryBitmap(expr)`** – returns a Roaring bitmap of matching IDs
-* **`Count(q)`** – returns cardinality of the result set
+* `QueryItems(q)` – returns matching records
+* `QueryKeys(q)` – returns matching IDs only
+* `QueryBitmap(expr)` – returns a Roaring bitmap of matching IDs
+* `Count(q)` – returns cardinality of the result set
 
 ## Query Execution Model
 
