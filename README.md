@@ -227,7 +227,7 @@ type ValueIndexer interface {
 
 The returned value is used as the indexed representation.
 
-### Requirements:
+### Contract:
 - Must return a stable, deterministic value.
 - Equal values must produce equal indexing values.
 - `nil` handling is the responsibility of the implementation.
