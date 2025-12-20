@@ -613,7 +613,8 @@ func (db *DB[K, V]) queryOrderArrayCount(result bitmap, s []index, o qx.Order, s
 	return out, nil
 }
 
-// Count evaluates the given query and returns the number of matching records.
+// Count evaluates the expression from the given query and returns the number of matching records.
+// It ignores Order, Offset and Limit fields.
 // If q is nil, Count returns the total number of keys currently present in the database.
 func (db *DB[K, V]) Count(q *qx.QX) (uint64, error) {
 	if q == nil {
