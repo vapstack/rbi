@@ -10,6 +10,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unsafe"
 
 	"github.com/RoaringBitmap/roaring/v2/roaring64"
 	"go.etcd.io/bbolt"
@@ -1042,6 +1043,30 @@ func (db *DB[K, V]) DeleteMany(ids []K, fns ...PreCommitFunc[K, V]) error {
 	return db.setIndexOnSuccessMulti(tx.Commit(), idxs, oldVals, nil, nil)
 }
 
+// ToKey converts an internal bitmap index value into the corresponding user key.
+//
+// QueryBitmap returns a bitmap containing internal record identifiers.
+// When the database uses numeric keys (uint64), these identifiers are the keys
+// themselves. When the database uses string keys, the identifiers are internal
+// indices and must be translated back to user-facing keys.
+//
+// ToKey performs this translation. It is primarily intended for advanced use
+// cases where the caller iterates over a bitmap returned by QueryBitmap and
+// needs to map bitmap entries back to actual record keys.
+//
+// The second return value reports whether the key was successfully resolved.
+// For numeric-key databases this always returns true. For string-key databases
+// it may return false if the index value does not correspond to a known key.
+func (db *DB[K, V]) ToKey(idx uint64) (K, bool) {
+	if db.strkey {
+		db.strmap.RLock()
+		v, ok := db.strmap.getStringNoLock(idx)
+		db.strmap.RUnlock()
+		return *(*K)(unsafe.Pointer(&v)), ok
+	}
+	return *(*K)(unsafe.Pointer(&idx)), true
+}
+
 // Bolt returns the underlying *bbolt.DB instance used by this DB.
 // Should be used with caution.
 func (db *DB[K, V]) Bolt() *bbolt.DB {
@@ -1094,5 +1119,3 @@ func (sm *strMapper) mustGetStringNoLock(idx uint64) string {
 	}
 	panic(fmt.Errorf("no id associated with idx %v", idx))
 }
-
-/**/
