@@ -15,19 +15,15 @@ Indexes are kept fully in memory and built on top of
 [roaring64](https://github.com/RoaringBitmap/roaring), allowing fast set
 operations, range scans, ordering, and filtering with microsecond-level latency.
 
----
-
 ## Key Properties
 
 * **ACID data** – data durability is delegated to bbolt.
 * **Index-only queries** – all queries are evaluated via in-memory indexes.
 * **Document-centric** – queries select whole records, not individual fields.
 * **Strong typing** – generic API with user-defined key and value types.
-* **Index-driven execution** – filters, ordering, and limits are applied using
+* **Index-driven execution** – filters and ordering are applied using
   index structures and bitmap algebra.
 * **Crash-safe** – indexes are automatically rebuilt after unclean shutdowns.
-
----
 
 ## Features
 
@@ -43,8 +39,6 @@ operations, range scans, ordering, and filtering with microsecond-level latency.
 * Batch writes (`SetMany`, `PatchMany`)
 * Optional uniqueness constraints
 
----
-
 ## Quick Start
 
 ```go
@@ -58,6 +52,7 @@ import (
 )
 
 type User struct {
+    ID     uint64   `db:"-"`  // not indexed
     Name   string   `db:"name"`
     Age    int      `db:"age"`
     Active bool     `db:"active"`
@@ -73,19 +68,26 @@ func main() {
     }
     defer db.Close()
 
-    _ = db.Set(1, &User{
+    err = db.Set(1, &User{
         Name:   "Alice",
         Age:    30,
         Active: true,
         Tags:   []string{"admin", "dev"},
     })
+    if err != nil {
+        panic(err)
+    }
 
-    _ = db.Set(2, &User{
+    err = db.Set(2, &User{
+		ID:     2,
         Name:   "Bob",
         Age:    40,
         Active: false,
         Tags:   []string{"dev"},
     })
+    if err != nil {
+        panic(err)
+    }
 
     q := qx.Query(
         qx.OR(
@@ -109,8 +111,6 @@ func main() {
     }
 }
 ```
-
----
 
 ## API Overview
 
@@ -161,8 +161,6 @@ Execution methods:
 * **`QueryKeys(q)`** – returns matching IDs only
 * **`QueryBitmap(expr)`** – returns a Roaring bitmap of matching IDs
 * **`Count(q)`** – returns cardinality of the result set
-
----
 
 ## Query Execution Model
 
@@ -319,8 +317,6 @@ Each instance maintains its own in-memory index. Whether this is desirable
 depends on workload and memory constraints and should be benchmarked for the
 target use case.
 
----
-
 ## Encoding and Schema Evolution
 
 Values are encoded using **msgpack**.
@@ -362,8 +358,6 @@ Typical characteristics:
 
 There is still room for optimization, but the current performance is already
 suitable for many workloads.
-
----
 
 ## Contributing
 
