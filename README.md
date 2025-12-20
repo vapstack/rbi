@@ -21,8 +21,6 @@ operations, range scans, ordering, and filtering with microsecond-level latency.
 * **Index-only queries** – all queries are evaluated via in-memory indexes.
 * **Document-centric** – queries select whole records, not individual fields.
 * **Strong typing** – generic API with user-defined key and value types.
-* **Index-driven execution** – filters and ordering use index structures and bitmap algebra.
-* **Crash-safe** – indexes are automatically rebuilt after unclean shutdowns.
 
 ## Features
 
