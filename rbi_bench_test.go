@@ -9,7 +9,6 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/RoaringBitmap/roaring/v2/roaring64"
 	"github.com/vapstack/qx"
 )
 
@@ -157,18 +156,32 @@ func BenchmarkIndexPerformance_Simple_EQ(b *testing.B) {
 	db := buildBenchDB(b, benchN)
 	b.ReportAllocs()
 
-	q := &qx.QX{Expr: qx.Expr{Op: qx.OpEQ, Field: "country", Value: "NL"}}
-	roaring64.FastOr()
+	q := qx.Query(qx.EQ("country", "NL"))
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_, err := db.Count(q) // index performance only
+		_, err := db.Count(q)
 		if err != nil {
 			b.Fatal(err)
 		}
 	}
 }
 
-func BenchmarkIndexPerformance_Medium_Range(b *testing.B) {
+func BenchmarkIndexPerformance_Medium_In(b *testing.B) {
+	db := buildBenchDB(b, benchN)
+	b.ReportAllocs()
+
+	q := qx.Query(qx.IN("country", []string{"NL", "DE"}))
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, err := db.Count(q)
+		if err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkIndexPerformance_Heavy_Range(b *testing.B) {
 	db := buildBenchDB(b, benchN)
 	b.ReportAllocs()
 

@@ -66,10 +66,8 @@ func (db *DB[K, V]) QueryKeys(q *qx.QX) ([]K, error) {
 
 func (db *DB[K, V]) query(q *qx.QX) ([]K, error) {
 
-	for _, f := range q.UsedFields() {
-		if _, ok := db.fields[f]; !ok {
-			return nil, fmt.Errorf("no index for field: %v", f)
-		}
+	if err := db.checkUsedFields(q); err != nil {
+		return nil, err
 	}
 
 	// optimization for simple ORDER BY + LIMIT without complex filters
@@ -640,10 +638,8 @@ func (db *DB[K, V]) Count(q *qx.QX) (uint64, error) {
 		return 0, ErrIndexDisabled
 	}
 
-	for _, f := range q.UsedFields() {
-		if _, ok := db.fields[f]; !ok {
-			return 0, fmt.Errorf("no index for field: %v", f)
-		}
+	if err := db.checkUsedFields(q); err != nil {
+		return 0, err
 	}
 
 	b, err := db.evalExpr(q.Expr)
@@ -683,10 +679,8 @@ func (db *DB[K, V]) QueryBitmap(expr qx.Expr) (*roaring64.Bitmap, error) {
 		return nil, ErrIndexDisabled
 	}
 
-	for _, f := range expr.UsedFields() {
-		if _, ok := db.fields[f]; !ok {
-			return nil, fmt.Errorf("no index for field: %v", f)
-		}
+	if err := db.checkUsed(expr); err != nil {
+		return nil, err
 	}
 
 	b, err := db.evalExpr(expr)
@@ -699,6 +693,29 @@ func (db *DB[K, V]) QueryBitmap(expr qx.Expr) (*roaring64.Bitmap, error) {
 	defer b.release()
 
 	return b.bm.Clone(), nil
+}
+
+func (db *DB[K, V]) checkUsedFields(q *qx.QX) error {
+	for _, o := range q.Order {
+		if _, ok := db.fields[o.Field]; !ok {
+			return fmt.Errorf("no index for field: %v", o.Field)
+		}
+	}
+	return db.checkUsed(q.Expr)
+}
+
+func (db *DB[K, V]) checkUsed(exp qx.Expr) error {
+	if exp.Field != "" {
+		if _, ok := db.fields[exp.Field]; !ok {
+			return fmt.Errorf("no index for field: %v", exp.Field)
+		}
+	}
+	for _, op := range exp.Operands {
+		if err := db.checkUsed(op); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (db *DB[K, V]) evalExpr(e qx.Expr) (bitmap, error) {
