@@ -191,10 +191,10 @@ By default, **all exported struct fields** are indexed using the Go field name.
 
 To exclude a field from indexing, use one of:
 - `db:"-"`
--`dbi:"-"`
--`rbi:"-"`
+- `dbi:"-"`
+- `rbi:"-"`
 
-> Excluding large or opaque fields (blobs, binary data)
+> Excluding large fields (blobs, binary data)
 > is strongly recommended unless you actually query on them.
 
 ## Slice Fields
@@ -286,12 +286,21 @@ Careful index selection is recommended for large datasets.
 Multiple `DB` instances may safely operate on the same bbolt database.\
 Each instance maintains its own in-memory index.
 
+## Bucket Name
+
+`DB` stores all records in a single top-level bbolt bucket.
+
+By default, the bucket name is derived from the value type.
+A custom bucket name can be provided via `Options` 
+if explicit control is required (e.g. when value type is renamed).
+
+
 ## Encoding and Schema Evolution
 
 Values are encoded using [msgpack](https://github.com/vmihailenco/msgpack).
 
 Msgpack provides good performance, compact binary representation, and a
-flatten encoding model similar to JSON. This makes it tolerant to many
+flat encoding model similar to JSON. This makes it tolerant to many
 schema changes, including field reordering and movement between embedded
 and top-level structs.
 
