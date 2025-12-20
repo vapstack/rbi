@@ -17,7 +17,7 @@ import (
 	"go.etcd.io/bbolt"
 )
 
-// MakePatch returns a PreCommitFunc that populates the provided target slice
+// CollectPatch returns a PreCommitFunc that populates the provided target slice
 // with a patch describing all fields that have changed between old and new
 // values of a record.
 //
@@ -25,24 +25,31 @@ import (
 // For each modified field, it appends a Field entry with the field name
 // and a deep copy of the new value.
 //
-// The returned PreCommitFunc should not be used with Delete or DeleteMany (where newv is always nil).
-func (db *DB[K, V]) MakePatch(target *[]Field) PreCommitFunc[K, V] {
+// IMPORTANT: When used with SetMany/PatchMany, this callback is invoked once per record.
+// Since it always overwrites the same target slice, the final contents will correspond
+// to the last processed record only. For batched writes, use CollectPatchMany instead.
+//
+// The returned PreCommitFunc should not be used with Delete or DeleteMany
+// (where newVal is always nil); in such cases the resulting slice will be empty.
+func (db *DB[K, V]) CollectPatch(target *[]Field) PreCommitFunc[K, V] {
 
-	return func(tx *bbolt.Tx, key K, oldv, newv *V) error {
+	return func(tx *bbolt.Tx, _ K, oldVal, newVal *V) error {
 
 		*target = (*target)[:0]
 
+		if newVal == nil {
+			return nil
+		}
+
 		var rvOld, rvNew reflect.Value
-		if oldv != nil {
-			rvOld = reflect.ValueOf(oldv).Elem()
+		if oldVal != nil {
+			rvOld = reflect.ValueOf(oldVal).Elem()
 		}
-		if newv != nil {
-			rvNew = reflect.ValueOf(newv).Elem()
-		}
+		rvNew = reflect.ValueOf(newVal).Elem()
 
 		processed := make(map[string]struct{})
 
-		mods := db.getModifiedIndexedFields(oldv, newv)
+		mods := db.getModifiedIndexedFields(oldVal, newVal)
 
 		for _, dbname := range mods {
 			f := db.fields[dbname]
@@ -83,6 +90,83 @@ func (db *DB[K, V]) MakePatch(target *[]Field) PreCommitFunc[K, V] {
 			processed[f.Name] = struct{}{}
 		}
 
+		return nil
+	}
+}
+
+// CollectPatchMany returns a PreCommitFunc that collects per-record patches into target,
+// keyed by the record ID.
+//
+// It is designed for SetMany/PatchMany: the callback is invoked once per record, and
+// this helper stores the corresponding patch under target[key].
+//
+// The returned function compares both indexed and non-indexed fields.
+// For each modified field, it appends a Field entry with the field name
+// and a deep copy of the new value.
+//
+// If newVal is nil (e.g. Delete/DeleteMany), no patch is produced for that key.
+// The provided map must be initialized by the caller.
+func (db *DB[K, V]) CollectPatchMany(target map[K][]Field) PreCommitFunc[K, V] {
+
+	return func(tx *bbolt.Tx, key K, oldVal, newVal *V) error {
+
+		if newVal == nil {
+			return nil
+		}
+
+		var rvOld, rvNew reflect.Value
+		if oldVal != nil {
+			rvOld = reflect.ValueOf(oldVal).Elem()
+		}
+		rvNew = reflect.ValueOf(newVal).Elem()
+
+		out := target[key] // reuse existing if exists
+		out = out[:0]
+
+		processed := make(map[string]struct{})
+
+		mods := db.getModifiedIndexedFields(oldVal, newVal)
+
+		for _, dbname := range mods {
+			f := db.fields[dbname]
+
+			processed[f.Name] = struct{}{}
+
+			var newValue any
+			if rvNew.IsValid() {
+				newValue = rvNew.FieldByIndex(f.Index).Interface()
+			}
+
+			out = append(out, Field{
+				Name:  dbname,
+				Value: deepCopyValue(newValue),
+			})
+		}
+
+		for patchKey, f := range db.patchMap {
+
+			if _, ok := processed[f.Name]; ok {
+				continue
+			}
+
+			var v1, v2 any
+			if rvOld.IsValid() {
+				v1 = rvOld.FieldByIndex(f.Index).Interface()
+			}
+			if rvNew.IsValid() {
+				v2 = rvNew.FieldByIndex(f.Index).Interface()
+			}
+
+			if !reflect.DeepEqual(v1, v2) {
+				out = append(out, Field{
+					Name:  patchKey,
+					Value: deepCopyValue(v2),
+				})
+			}
+			processed[f.Name] = struct{}{}
+		}
+
+		target[key] = out
 		return nil
 	}
 }

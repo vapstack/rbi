@@ -692,10 +692,12 @@ func (db *DB[K, V]) SetMany(ids []K, newVals []*V, fns ...PreCommitFunc[K, V]) e
 		}
 	}
 
-	for i, id := range ids {
-		for _, fn := range fns {
-			if err = fn(tx, id, oldVals[i], newVals[i]); err != nil {
-				return err
+	if len(fns) > 0 {
+		for i, id := range ids {
+			for _, fn := range fns {
+				if err = fn(tx, id, oldVals[i], newVals[i]); err != nil {
+					return err
+				}
 			}
 		}
 	}
@@ -905,10 +907,12 @@ func (db *DB[K, V]) patchMany(ids []K, patch []Field, ignoreUnknown bool, fns ..
 		}
 	}
 
-	for i, id := range ids {
-		for _, fn := range fns {
-			if err = fn(tx, id, oldVals[i], newVals[i]); err != nil {
-				return err
+	if len(fns) > 0 {
+		for i, id := range ids {
+			for _, fn := range fns {
+				if err = fn(tx, id, oldVals[i], newVals[i]); err != nil {
+					return err
+				}
 			}
 		}
 	}
@@ -1025,10 +1029,12 @@ func (db *DB[K, V]) DeleteMany(ids []K, fns ...PreCommitFunc[K, V]) error {
 		}
 	}
 
-	for i, id := range ids {
-		for _, fn := range fns {
-			if err = fn(tx, id, oldVals[i], nil); err != nil {
-				return err
+	if len(fns) > 0 {
+		for i, id := range ids {
+			for _, fn := range fns {
+				if err = fn(tx, id, oldVals[i], nil); err != nil {
+					return err
+				}
 			}
 		}
 	}
