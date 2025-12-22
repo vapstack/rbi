@@ -32,7 +32,7 @@ Indexes are kept fully in memory and built on top of
     - slice operations: `IN`, `HAS`, `HASANY`
     - string operations: `PREFIX`, `SUFFIX`, `CONTAINS`
     - logical operators: `AND`, `OR`, `NOT`
-* Index-based ordering with **offset** / **limit**
+* Index-based ordering with offset / limit
 * Partial updates (`Patch`) with minimal index churn
 * Batch writes (`SetMany`, `PatchMany`)
 * Optional uniqueness constraints
