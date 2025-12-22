@@ -3,12 +3,11 @@
 [![GoDoc](https://godoc.org/github.com/vapstack/rbi?status.svg)](https://godoc.org/github.com/vapstack/rbi)
 [![License](https://img.shields.io/badge/license-Apache2-blue.svg)](https://raw.githubusercontent.com/vapstack/rbi/master/LICENSE)
 
-> **This package should be considered experimental.**
+> This package should be considered experimental.
 
 ### Roaring Bolt Indexer
 
-A high-performance in-memory secondary index layer for
-[bbolt](https://github.com/etcd-io/bbolt) written in pure Go.
+A secondary index layer for [bbolt](https://github.com/etcd-io/bbolt) written in pure Go.
 
 It turns a simple key-value store into a document-oriented database with rich
 query capabilities, while preserving bbolt’s ACID guarantees for data storage.
@@ -161,8 +160,8 @@ Queries are evaluated exclusively through secondary indexes and bitmap algebra.
    bitmap of matching record IDs using the corresponding index.
 
 2. **Bitmap composition**\
-   Logical operators (`AND`, `OR`, `NOT`) are applied using Roaring bitmap
-   operations. Intermediate results may be represented as negative sets
+   Logical operators (`AND`, `OR`, `NOT`) are applied using bitmap operations.
+   Intermediate results may be represented as negative sets
    (universe minus exclusions) to keep large result sets efficient.
 
 3. **Ordering and limiting**\
@@ -172,6 +171,12 @@ Queries are evaluated exclusively through secondary indexes and bitmap algebra.
 4. **Materialization**  
    Only the final set of matching IDs is materialized. Record values are fetched
    from bbolt only for IDs that survive all filters.
+
+> Currently, there is no full-fledged query planner,
+> and instead the code relies on several fast-path implementations.
+> If you have experience with database indexing and have the time and interest 
+> to help the project, pull requests are very welcome.
+
 
 ## Ordering Limitations
 
@@ -366,24 +371,20 @@ the returned slice may contain `nil` values for records that no longer exist.
 
 ## Design Scope and Non-Goals
 
-This package does **not** aim to be a relational database or a SQL engine.
+This package does not aim to be a relational database or a SQL engine.
 
 * no projections (`SELECT field1, field2`),
 * no joins,
 * no aggregation functions,
 * no query-time computed fields.
 
-The focus is on fast selection of complete documents using secondary indexes.
+The focus is on fast selection of complete documents.
 
 ## Performance Notes
 
-The package is optimized for read-heavy workloads with complex filters.
-
-Typical characteristics:
-* microsecond-level query latency,
-* logarithmic range queries,
-* fast bitmap-based filtering,
-* batch writes are preferred over single inserts.
+- The package is read-optimized.
+- Prefer batch writes over single inserts, if possible.
+- Always use limits if you do not need the whole set.
 
 There is still room for optimization, but the current performance is already
 suitable for many workloads.

@@ -25,9 +25,8 @@ type UserBench struct {
 }
 
 const (
-	benchN          = 200_000
-	benchBatchSmall = 128
-	benchBatchBig   = 1024
+	benchN     = 200_000
+	benchBatch = 100_000
 )
 
 func openBenchDB(b *testing.B) (*DB[uint64, UserBench], string) {
@@ -58,7 +57,9 @@ func seedBenchData(b *testing.B, db *DB[uint64, UserBench], n int) {
 	defer func() {
 		db.EnableIndexing()
 		db.EnableSync()
-		_ = db.RebuildIndex()
+		if err := db.RebuildIndex(); err != nil {
+			b.Fatalf("rebuilding index: %v", err)
+		}
 	}()
 
 	r := rand.New(rand.NewSource(1))
@@ -86,8 +87,8 @@ func seedBenchData(b *testing.B, db *DB[uint64, UserBench], n int) {
 		{"user", "support"},
 	}
 
-	ids := make([]uint64, 0, benchBatchBig)
-	vals := make([]*UserBench, 0, benchBatchBig)
+	ids := make([]uint64, 0, benchBatch)
+	vals := make([]*UserBench, 0, benchBatch)
 
 	flush := func() {
 		if len(ids) == 0 {
@@ -123,7 +124,7 @@ func seedBenchData(b *testing.B, db *DB[uint64, UserBench], n int) {
 
 		ids = append(ids, id)
 		vals = append(vals, rec)
-		if len(ids) == benchBatchBig {
+		if len(ids) == benchBatch {
 			flush()
 		}
 	}
@@ -147,6 +148,15 @@ func buildBenchDB(b *testing.B, n int) *DB[uint64, UserBench] {
 	b.StopTimer()
 	seedBenchData(b, db, n)
 	_, _ = db.QueryKeys(&qx.QX{Expr: qx.Expr{Op: qx.OpEQ, Field: "country", Value: "NL"}}) // warmup
+
+	// s := db.Stats()
+	// b.Logf("total size: %v", s.IndexSize)
+	// b.Logf("index size: %v", s.IndexFieldSize)
+	// b.Logf("index build rps: %v", s.IndexBuildRPS)
+	// b.Logf("index build time: %v", s.IndexBuildTime)
+	// b.Logf("key count: %v", s.KeyCount)
+	// b.Logf("unique field keys: %v", s.UniqueFieldKeys)
+
 	b.StartTimer()
 	oneDB = db
 	return db
@@ -170,7 +180,7 @@ func BenchmarkStats(b *testing.B) {
 }
 */
 
-func BenchmarkIndexPerformance_Simple_EQ(b *testing.B) {
+func BenchmarkCount_Simple_EQ_Count(b *testing.B) {
 	db := buildBenchDB(b, benchN)
 	b.ReportAllocs()
 
@@ -184,22 +194,22 @@ func BenchmarkIndexPerformance_Simple_EQ(b *testing.B) {
 	}
 }
 
-func BenchmarkIndexPerformance_Medium_In(b *testing.B) {
+func BenchmarkQueryKeys_Medium_IN_Limit(b *testing.B) {
 	db := buildBenchDB(b, benchN)
 	b.ReportAllocs()
 
-	q := qx.Query(qx.IN("country", []string{"NL", "DE"}))
+	q := qx.Query(qx.IN("country", []string{"NL", "DE"})).Max(100)
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_, err := db.Count(q)
+		_, err := db.QueryKeys(q)
 		if err != nil {
 			b.Fatal(err)
 		}
 	}
 }
 
-func BenchmarkIndexPerformance_Heavy_Range(b *testing.B) {
+func BenchmarkQueryKeys_Heavy_Range_Order_Limit(b *testing.B) {
 	db := buildBenchDB(b, benchN)
 	b.ReportAllocs()
 
@@ -211,14 +221,14 @@ func BenchmarkIndexPerformance_Heavy_Range(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_, err := db.Count(q)
+		_, err := db.QueryKeys(q)
 		if err != nil {
 			b.Fatal(err)
 		}
 	}
 }
 
-func BenchmarkIndexPerformance_Heavy_All(b *testing.B) {
+func BenchmarkQueryKeys_Heavy_All(b *testing.B) {
 	db := buildBenchDB(b, benchN)
 	b.ReportAllocs()
 
@@ -238,54 +248,87 @@ func BenchmarkIndexPerformance_Heavy_All(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_, err := db.Count(q)
+		_, err := db.QueryKeys(q)
 		if err != nil {
 			b.Fatal(err)
 		}
 	}
 }
 
-func BenchmarkIndexPerformance_Realistic_DashboardFilter(b *testing.B) {
+func BenchmarkQueryKeys_Realistic_DashboardFilter_Limit(b *testing.B) {
 	db := buildBenchDB(b, benchN)
 	b.ReportAllocs()
 
-	// SELECT * FROM users WHERE status='active' AND plan='enterprise' AND country='US'
+	// SELECT * FROM users WHERE status='active' AND plan='enterprise' AND country='US' LIMIT 100
 	q := qx.Query(
 		qx.EQ("status", "active"),
 		qx.EQ("plan", "enterprise"),
 		qx.EQ("country", "US"),
-	)
+	).Max(100)
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_, err := db.Count(q)
+		_, err := db.QueryKeys(q)
 		if err != nil {
 			b.Fatal(err)
 		}
 	}
 }
 
-func BenchmarkIndexPerformance_Realistic_Analytics_Ranges(b *testing.B) {
+func BenchmarkQueryKeys_Realistic_Analytics_Range_Order_Limit(b *testing.B) {
 	db := buildBenchDB(b, benchN)
 	b.ReportAllocs()
 
-	// SELECT * FROM users WHERE age >= 25 AND age <= 40 AND score > 0.5
+	// SELECT * FROM users WHERE age >= 25 AND age <= 40 AND score > 0.5 ORDER BY score DESC LIMIT 100
 	q := qx.Query(
 		qx.GTE("age", 25),
 		qx.LTE("age", 40),
 		qx.GT("score", 0.5),
-	)
+	).By("score", qx.DESC).Max(100)
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_, err := db.Count(q)
+		_, err := db.QueryKeys(q)
 		if err != nil {
 			b.Fatal(err)
 		}
 	}
 }
 
-func BenchmarkIndexPerformance_Realistic_Permissions_HasAny(b *testing.B) {
+func BenchmarkQueryKeys_Realistic_LeaderBoard(b *testing.B) {
+	db := buildBenchDB(b, benchN)
+	b.ReportAllocs()
+
+	q := qx.Query().By("score", qx.DESC).Max(10)
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, err := db.QueryKeys(q)
+		if err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkQueryKeys_Realistic_Permissions_HasAny_Limit(b *testing.B) {
+	db := buildBenchDB(b, benchN)
+	b.ReportAllocs()
+
+	// SELECT * FROM users WHERE roles && ['admin', 'moderator']
+	q := qx.Query(
+		qx.HASANY("roles", []string{"admin", "moderator"}),
+	).Max(100)
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, err := db.QueryKeys(q)
+		if err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkQueryKeys_Realistic_Permissions_HasAny_All(b *testing.B) {
 	db := buildBenchDB(b, benchN)
 	b.ReportAllocs()
 
@@ -296,14 +339,32 @@ func BenchmarkIndexPerformance_Realistic_Permissions_HasAny(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_, err := db.Count(q)
+		_, err := db.QueryKeys(q)
 		if err != nil {
 			b.Fatal(err)
 		}
 	}
 }
 
-func BenchmarkIndexPerformance_Realistic_Skills_HasAll(b *testing.B) {
+func BenchmarkQueryKeys_Realistic_Skills_HasAll_Limit(b *testing.B) {
+	db := buildBenchDB(b, benchN)
+	b.ReportAllocs()
+
+	// SELECT * FROM users WHERE tags @> ['go', 'db']
+	q := qx.Query(
+		qx.HAS("tags", []string{"go", "db"}),
+	).Max(100)
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, err := db.QueryKeys(q)
+		if err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkQueryKeys_Realistic_Skills_HasAll_All(b *testing.B) {
 	db := buildBenchDB(b, benchN)
 	b.ReportAllocs()
 
@@ -314,14 +375,14 @@ func BenchmarkIndexPerformance_Realistic_Skills_HasAll(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_, err := db.Count(q)
+		_, err := db.QueryKeys(q)
 		if err != nil {
 			b.Fatal(err)
 		}
 	}
 }
 
-func BenchmarkIndexPerformance_Realistic_Exclusion(b *testing.B) {
+func BenchmarkQueryKeys_Realistic_Exclusion_All(b *testing.B) {
 	db := buildBenchDB(b, benchN)
 	b.ReportAllocs()
 
@@ -334,31 +395,66 @@ func BenchmarkIndexPerformance_Realistic_Exclusion(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_, err := db.Count(q)
+		_, err := db.QueryKeys(q)
 		if err != nil {
 			b.Fatal(err)
 		}
 	}
 }
 
-func BenchmarkIndexPerformance_Realistic_Autocomplete_Prefix(b *testing.B) {
+func BenchmarkQueryKeys_Realistic_Autocomplete_Prefix_Limit(b *testing.B) {
+	db := buildBenchDB(b, benchN)
+	b.ReportAllocs()
+
+	q := qx.Query(qx.PREFIX("email", "user10")).Max(10)
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, err := db.QueryKeys(q)
+		if err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkQueryKeys_Realistic_Autocomplete_Order_Limit(b *testing.B) {
 	db := buildBenchDB(b, benchN)
 	b.ReportAllocs()
 
 	q := qx.Query(
 		qx.PREFIX("email", "user10"),
-	)
+		qx.EQ("status", "active"),
+	).By("email", qx.ASC).Max(10)
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_, err := db.Count(q)
+		_, err := db.QueryKeys(q)
 		if err != nil {
 			b.Fatal(err)
 		}
 	}
 }
 
-func BenchmarkIndexPerformance_Realistic_ComplexSegment(b *testing.B) {
+func BenchmarkQueryKeys_Realistic_Autocomplete_Complex_Limit(b *testing.B) {
+	db := buildBenchDB(b, benchN)
+	b.ReportAllocs()
+
+	q := qx.Query(
+		qx.PREFIX("email", "user10"),
+		qx.EQ("status", "active"),
+		qx.NOTIN("plan", []string{"free"}),
+	).By("score", qx.DESC).Max(10)
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, err := db.QueryKeys(q)
+		if err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkQueryKeys_Realistic_ComplexSegment_All(b *testing.B) {
 	db := buildBenchDB(b, benchN)
 	b.ReportAllocs()
 
@@ -374,14 +470,14 @@ func BenchmarkIndexPerformance_Realistic_ComplexSegment(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_, err := db.Count(q)
+		_, err := db.QueryKeys(q)
 		if err != nil {
 			b.Fatal(err)
 		}
 	}
 }
 
-func BenchmarkIndexPerformance_Realistic_TopLevel_OR(b *testing.B) {
+func BenchmarkQueryKeys_Realistic_TopLevel_OR_All(b *testing.B) {
 	db := buildBenchDB(b, benchN)
 	b.ReportAllocs()
 
@@ -394,7 +490,7 @@ func BenchmarkIndexPerformance_Realistic_TopLevel_OR(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_, err := db.Count(q)
+		_, err := db.QueryKeys(q)
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -423,7 +519,7 @@ func BenchmarkQueryKeys_Sort_EarlyExit(b *testing.B) {
 	}
 }
 
-func BenchmarkQueryKeys_Sort_DeepOffset(b *testing.B) {
+func BenchmarkQueryKeys_Sort_DeepOffset_Limit(b *testing.B) {
 	db := buildBenchDB(b, benchN)
 	b.ReportAllocs()
 
@@ -440,7 +536,7 @@ func BenchmarkQueryKeys_Sort_DeepOffset(b *testing.B) {
 	}
 }
 
-func BenchmarkQueryKeys_Sort_Complex(b *testing.B) {
+func BenchmarkQueryKeys_Sort_Complex_Order_Limit(b *testing.B) {
 	db := buildBenchDB(b, benchN)
 	b.ReportAllocs()
 
@@ -458,7 +554,7 @@ func BenchmarkQueryKeys_Sort_Complex(b *testing.B) {
 	}
 }
 
-func BenchmarkQueryKeys_Sort_ArrayPos(b *testing.B) {
+func BenchmarkQueryKeys_Sort_ArrayPos_Limit(b *testing.B) {
 	db := buildBenchDB(b, benchN)
 	b.ReportAllocs()
 
@@ -475,11 +571,43 @@ func BenchmarkQueryKeys_Sort_ArrayPos(b *testing.B) {
 	}
 }
 
-func BenchmarkQueryKeys_Sort_ArrayCount(b *testing.B) {
+func BenchmarkQueryKeys_Sort_ArrayPos_All(b *testing.B) {
+	db := buildBenchDB(b, benchN)
+	b.ReportAllocs()
+
+	priority := []string{"enterprise", "pro", "basic", "free"}
+
+	q := qx.Query(qx.EQ("status", "active")).ByArrayPos("plan", priority, qx.ASC)
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, err := db.QueryKeys(q)
+		if err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkQueryKeys_Sort_ArrayCount_Limit(b *testing.B) {
 	db := buildBenchDB(b, benchN)
 	b.ReportAllocs()
 
 	q := qx.Query(qx.EQ("status", "active")).ByArrayCount("roles", qx.DESC).Max(50)
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, err := db.QueryKeys(q)
+		if err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkQueryKeys_Sort_ArrayCount_All(b *testing.B) {
+	db := buildBenchDB(b, benchN)
+	b.ReportAllocs()
+
+	q := qx.Query(qx.EQ("status", "active")).ByArrayCount("roles", qx.DESC)
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {

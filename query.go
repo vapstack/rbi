@@ -15,6 +15,8 @@ import (
 	"github.com/RoaringBitmap/roaring/v2/roaring64"
 )
 
+const iteratorThreshold = 2048 // 256
+
 // QueryItems evaluates the given query against the index and returns all matching values.
 func (db *DB[K, V]) QueryItems(q *qx.QX) ([]*V, error) {
 
@@ -70,11 +72,8 @@ func (db *DB[K, V]) query(q *qx.QX) ([]K, error) {
 		return nil, err
 	}
 
-	// optimization for simple ORDER BY + LIMIT without complex filters
-	if len(q.Order) == 1 && q.Order[0].Type == qx.OrderBasic && q.Limit > 0 {
-		if out, ok, err := db.tryQueryOrderBasicWithLimit(q); ok {
-			return out, err
-		}
+	if out, ok, err := db.tryFastPath(q); ok {
+		return out, err
 	}
 
 	result, err := db.evalExpr(q.Expr)
@@ -98,7 +97,7 @@ func (db *DB[K, V]) query(q *qx.QX) ([]K, error) {
 	needAll := q.Limit == 0
 	need := q.Limit
 
-	// case 1: no ordering, negative result (e.g. NOT ...): iterate over universe excluding the result set
+	// case 1: no ordering, negative result: iterate over universe excluding the result set
 	if len(q.Order) == 0 && result.neg {
 		if db.strkey {
 			db.strmap.RLock()
@@ -201,7 +200,7 @@ func (db *DB[K, V]) query(q *qx.QX) ([]K, error) {
 			for _, ix := range *slice {
 				// fast path: if the bucket is small, avoid expensive bitmap operations
 				// (iterating and checking Contains() is faster than Or/And for small sets)
-				if card := ix.IDs.GetCardinality(); card <= 256 {
+				if card := ix.IDs.GetCardinality(); card <= iteratorThreshold || (0 < need && need < 1000) {
 					if card == 0 {
 						continue
 					}
@@ -260,9 +259,10 @@ func (db *DB[K, V]) query(q *qx.QX) ([]K, error) {
 				}
 
 				// slow path: large buckets require full bitmap intersection
-				tmp.Clear()
-				tmp.Or(ix.IDs)
-				tmp.And(result.bm)
+				tmpORSmallestAND(tmp, ix.IDs, result.bm)
+				// tmp.Clear() // tmp.Xor(tmp)
+				// tmp.Or(ix.IDs)
+				// tmp.And(result.bm)
 				if tmp.IsEmpty() {
 					continue
 				}
@@ -298,7 +298,7 @@ func (db *DB[K, V]) query(q *qx.QX) ([]K, error) {
 				ix := s[i]
 
 				// fast path (same as ASC)
-				if card := ix.IDs.GetCardinality(); card <= 256 {
+				if card := ix.IDs.GetCardinality(); card <= iteratorThreshold || (0 < need && need < 1000) {
 					if card == 0 {
 						continue
 					}
@@ -356,9 +356,10 @@ func (db *DB[K, V]) query(q *qx.QX) ([]K, error) {
 				}
 
 				// slow path
-				tmp.Clear()
-				tmp.Or(ix.IDs)
-				tmp.And(result.bm)
+				tmpORSmallestAND(tmp, ix.IDs, result.bm)
+				// tmp.Clear() // tmp.Xor(tmp)
+				// tmp.Or(ix.IDs)
+				// tmp.And(result.bm)
 				if tmp.IsEmpty() {
 					continue
 				}
@@ -422,6 +423,17 @@ func (db *DB[K, V]) query(q *qx.QX) ([]K, error) {
 	return out, nil
 }
 
+func tmpORSmallestAND(tmp, a, b *roaring64.Bitmap) {
+	tmp.Xor(tmp)
+	if a.GetCardinality() < b.GetCardinality() {
+		tmp.Or(a)
+		tmp.And(b)
+	} else {
+		tmp.Or(b)
+		tmp.And(a)
+	}
+}
+
 func makeOutSlice[K ~int64 | ~uint64 | ~string](result *roaring64.Bitmap, limit uint64) []K {
 	var out []K
 	if limit > 0 {
@@ -459,7 +471,8 @@ func (db *DB[K, V]) queryOrderArrayPos(result bitmap, s *[]index, o qx.Order, sk
 			return nil
 		}
 
-		tmp.Clear()
+		// tmp.Clear()
+		tmp.Xor(tmp)
 		tmp.Or(bm)
 		tmp.And(result.bm)
 		if tmp.IsEmpty() {
@@ -549,9 +562,10 @@ func (db *DB[K, V]) queryOrderArrayCount(result bitmap, s []index, o qx.Order, s
 	if !o.Desc {
 
 		for _, ix := range s {
-			tmp.Clear()
-			tmp.Or(ix.IDs)
-			tmp.And(result.bm)
+			// tmp.Clear() // tmp.Xor(tmp)
+			// tmp.Or(ix.IDs)
+			// tmp.And(result.bm)
+			tmpORSmallestAND(tmp, ix.IDs, result.bm)
 
 			if tmp.IsEmpty() {
 				continue
@@ -581,9 +595,10 @@ func (db *DB[K, V]) queryOrderArrayCount(result bitmap, s []index, o qx.Order, s
 		for i := len(s) - 1; i >= 0; i-- {
 			ix := s[i]
 
-			tmp.Clear()
-			tmp.Or(ix.IDs)
-			tmp.And(result.bm)
+			// tmp.Clear() // tmp.Xor(tmp)
+			// tmp.Or(ix.IDs)
+			// tmp.And(result.bm)
+			tmpORSmallestAND(tmp, ix.IDs, result.bm)
 
 			if tmp.IsEmpty() {
 				continue
@@ -864,6 +879,8 @@ func (db *DB[K, V]) evalExpr(e qx.Expr) (bitmap, error) {
 	}
 }
 
+var FlagRangeAlternativeOR = true
+
 func (db *DB[K, V]) evalSimple(e qx.Expr) (bitmap, error) {
 	slice := db.index[e.Field]
 	if slice == nil {
@@ -965,6 +982,43 @@ func (db *DB[K, V]) evalSimple(e qx.Expr) (bitmap, error) {
 			}
 		}
 
+		if FlagRangeAlternativeOR { // && e.Op != qx.OpPREFIX {
+			start := 0
+			end := len(s)
+
+			switch e.Op {
+			case qx.OpGT:
+				start = lo
+				if start < len(s) && s[start].Key == key {
+					start++
+				}
+				end = len(s)
+			case qx.OpGTE:
+				start = lo
+				end = len(s)
+			case qx.OpLT:
+				start = 0
+				end = lo
+			case qx.OpLTE:
+				start = 0
+				end = lo
+				if lo < len(s) && s[lo].Key == key {
+					end = lo + 1
+				}
+			case qx.OpPREFIX:
+				start = lo
+				end = lo
+				for end < len(s) {
+					if !strings.HasPrefix(s[end].Key, key) {
+						break
+					}
+					end++
+				}
+			}
+			res := db.unionIndexRange(e.Field, start, end)
+			return bitmap{bm: res}, nil
+		}
+
 		switch e.Op {
 		case qx.OpGT:
 			start := lo
@@ -1029,6 +1083,128 @@ func (db *DB[K, V]) evalSimple(e qx.Expr) (bitmap, error) {
 
 	res := db.unionBitmaps(bitmaps)
 	return bitmap{bm: res}, nil
+}
+
+// unionIndexRange merges bitmaps between start and end for a single field
+func (db *DB[K, V]) unionIndexRange(field string, start, end int) *roaring64.Bitmap {
+	slice := db.index[field]
+	if slice == nil || start >= end {
+		return getRoaringBuf()
+	}
+	s := *slice
+
+	if start < 0 {
+		start = 0
+	}
+	if end > len(s) {
+		end = len(s)
+	}
+	if start >= end {
+		return getRoaringBuf()
+	}
+
+	n := end - start
+
+	if n >= 256 {
+		return db.parallelUnionIndexRange(s, start, end)
+	}
+
+	best := -1
+	var bestCard uint64
+	for i := start; i < end; i++ {
+		c := s[i].IDs.GetCardinality()
+		if c > bestCard {
+			bestCard = c
+			best = i
+		}
+	}
+
+	res := getRoaringBuf()
+	if best == -1 || bestCard == 0 {
+		return res
+	}
+	res.Or(s[best].IDs)
+	for i := start; i < end; i++ {
+		if i == best {
+			continue
+		}
+		res.Or(s[i].IDs)
+	}
+	return res
+}
+
+func (db *DB[K, V]) parallelUnionIndexRange(s []index, start, end int) *roaring64.Bitmap {
+	n := end - start
+
+	workers := 8
+	if n < workers*2 {
+		workers = n / 2
+	}
+	if workers < 2 {
+		// fallback
+		res := getRoaringBuf()
+		for i := start; i < end; i++ {
+			res.Or(s[i].IDs)
+		}
+		return res
+	}
+
+	chunk := (n + workers - 1) / workers
+	results := make([]*roaring64.Bitmap, workers)
+	var wg sync.WaitGroup
+
+	for w := 0; w < workers; w++ {
+		a := start + w*chunk
+		if a >= end {
+			break
+		}
+		b := a + chunk
+		if b > end {
+			b = end
+		}
+
+		wg.Add(1)
+		go func(idx, lo, hi int) {
+			defer wg.Done()
+
+			best := -1
+			var bestCard uint64
+			for i := lo; i < hi; i++ {
+				c := s[i].IDs.GetCardinality()
+				if c > bestCard {
+					bestCard = c
+					best = i
+				}
+			}
+
+			r := getRoaringBuf()
+			if best != -1 && bestCard != 0 {
+				r.Or(s[best].IDs)
+				for i := lo; i < hi; i++ {
+					if i == best {
+						continue
+					}
+					r.Or(s[i].IDs)
+				}
+			}
+			results[idx] = r
+		}(w, a, b)
+	}
+
+	wg.Wait()
+
+	final := results[0]
+	if final == nil {
+		final = getRoaringBuf()
+	}
+	for i := 1; i < len(results); i++ {
+		if results[i] == nil {
+			continue
+		}
+		final.Or(results[i])
+		releaseRoaringBuf(results[i])
+	}
+	return final
 }
 
 // unionBitmaps merges multiple bitmaps using an adaptive strategy:
@@ -1112,19 +1288,19 @@ func (db *DB[K, V]) parallelBatchedOr(bitmaps []*roaring64.Bitmap) *roaring64.Bi
 
 	wg.Wait()
 
-	finalRes := results[0]
-	if finalRes == nil {
-		finalRes = getRoaringBuf()
+	final := results[0]
+	if final == nil {
+		final = getRoaringBuf()
 	}
 
 	for i := 1; i < len(results); i++ {
 		if results[i] != nil {
-			finalRes.Or(results[i])
+			final.Or(results[i])
 			releaseRoaringBuf(results[i])
 		}
 	}
 
-	return finalRes
+	return final
 }
 
 func (db *DB[K, V]) mergeAnd(bitmaps []*roaring64.Bitmap) (bitmap, error) {
@@ -1557,300 +1733,6 @@ func (db *DB[K, V]) orBitmap(a, b bitmap) (bitmap, error) {
 	return bitmap{}, nil
 }
 
-func lowerBoundIndex(s []index, key string) int {
-	lo, hi := 0, len(s)
-	for lo < hi {
-		mid := (lo + hi) >> 1
-		if s[mid].Key < key {
-			lo = mid + 1
-		} else {
-			hi = mid
-		}
-	}
-	return lo
-}
-
-func upperBoundIndex(s []index, key string) int {
-	lo, hi := 0, len(s)
-	for lo < hi {
-		mid := (lo + hi) >> 1
-		if s[mid].Key <= key {
-			lo = mid + 1
-		} else {
-			hi = mid
-		}
-	}
-	return lo
-}
-
-type rangeBounds struct {
-	hasLo bool
-	loKey string
-	loInc bool
-	hasHi bool
-	hiKey string
-	hiInc bool
-}
-
-func (rb *rangeBounds) applyLo(key string, inc bool) {
-	if !rb.hasLo || rb.loKey < key || (rb.loKey == key && rb.loInc == false && inc == true) {
-		rb.hasLo = true
-		rb.loKey = key
-		rb.loInc = inc
-	}
-}
-
-func (rb *rangeBounds) applyHi(key string, inc bool) {
-	if !rb.hasHi || rb.hiKey > key || (rb.hiKey == key && rb.hiInc == false && inc == true) {
-		rb.hasHi = true
-		rb.hiKey = key
-		rb.hiInc = inc
-	}
-}
-
-func (db *DB[K, V]) tryQueryOrderBasicWithLimit(q *qx.QX) ([]K, bool, error) {
-	if q == nil || len(q.Order) != 1 {
-		return nil, false, nil
-	}
-	order := q.Order[0]
-	if order.Type != qx.OrderBasic {
-		return nil, false, nil
-	}
-	if q.Limit == 0 {
-		return nil, false, nil
-	}
-	if q.Expr.Op != qx.OpAND || q.Expr.Not {
-		return nil, false, nil
-	}
-
-	f := order.Field
-	fm := db.fields[f]
-	if fm == nil || fm.Slice {
-		return nil, false, nil
-	}
-
-	slice := db.index[f]
-	if slice == nil {
-		return nil, false, nil
-	}
-	s := *slice
-	if len(s) == 0 {
-		return nil, true, nil
-	}
-
-	var rb rangeBounds
-
-	baseOps := make([]qx.Expr, 0, len(q.Expr.Operands))
-
-	for _, op := range q.Expr.Operands {
-		if op.Not {
-			return nil, false, nil
-		}
-		if op.Field == f {
-			switch op.Op {
-			case qx.OpGT, qx.OpGTE, qx.OpLT, qx.OpLTE, qx.OpEQ:
-				vals, isSlice, err := db.exprValueToIdx(op)
-				if err != nil {
-					return nil, true, err
-				}
-				if isSlice || len(vals) != 1 {
-					return nil, false, nil
-				}
-				k := vals[0]
-				switch op.Op {
-				case qx.OpGT:
-					rb.applyLo(k, false)
-				case qx.OpGTE:
-					rb.applyLo(k, true)
-				case qx.OpLT:
-					rb.applyHi(k, false)
-				case qx.OpLTE:
-					rb.applyHi(k, true)
-				case qx.OpEQ:
-					rb.applyLo(k, true)
-					rb.applyHi(k, true)
-				}
-				continue
-			default:
-				return nil, false, nil
-			}
-		}
-		baseOps = append(baseOps, op)
-	}
-
-	var base bitmap
-
-	if len(baseOps) == 0 {
-		bm := getRoaringBuf()
-		bm.Or(db.universe)
-		base = bitmap{bm: bm}
-
-	} else if len(baseOps) == 1 {
-
-		b, err := db.evalExpr(baseOps[0])
-		if err != nil {
-			return nil, true, err
-		}
-		if b.bm == nil || b.bm.IsEmpty() {
-			b.release()
-			return nil, true, nil
-		}
-		base = b
-
-	} else {
-
-		b, err := db.evalExpr(qx.Expr{Op: qx.OpAND, Operands: baseOps})
-		if err != nil {
-			return nil, true, err
-		}
-		if b.bm == nil || b.bm.IsEmpty() {
-			b.release()
-			return nil, true, nil
-		}
-		base = b
-
-	}
-	defer base.release()
-
-	start := 0
-	end := len(s)
-
-	if rb.hasLo {
-		start = lowerBoundIndex(s, rb.loKey)
-		if !rb.loInc {
-			if start < len(s) && s[start].Key == rb.loKey {
-				start++
-			}
-		}
-	}
-	if rb.hasHi {
-		if rb.hiInc {
-			end = upperBoundIndex(s, rb.hiKey)
-		} else {
-			end = lowerBoundIndex(s, rb.hiKey)
-		}
-	}
-	if start < 0 {
-		start = 0
-	}
-	if end > len(s) {
-		end = len(s)
-	}
-	if start >= end {
-		return nil, true, nil
-	}
-
-	skip := q.Offset
-	need := q.Limit
-
-	out := makeOutSlice[K](base.bm, need)
-
-	if db.strkey {
-		db.strmap.RLock()
-		defer db.strmap.RUnlock()
-	}
-
-	tmp := getRoaringBuf()
-	defer releaseRoaringBuf(tmp)
-
-	emit := func(bm *roaring64.Bitmap) bool {
-		it := bm.Iterator()
-		for it.HasNext() {
-			idx := it.Next()
-			if skip > 0 {
-				skip--
-				continue
-			}
-			out = append(out, db.idFromIdxNoLock(idx))
-			need--
-			if need == 0 {
-				return true
-			}
-		}
-		return false
-	}
-
-	if !order.Desc {
-		for i := start; i < end; i++ {
-			// fast path check
-			if card := s[i].IDs.GetCardinality(); card <= 256 {
-				if card == 0 {
-					continue
-				}
-				// manual iteration
-				it := s[i].IDs.Iterator()
-				for it.HasNext() {
-					idx := it.Next()
-					if !base.bm.Contains(idx) {
-						continue
-					}
-					if skip > 0 {
-						skip--
-						continue
-					}
-					out = append(out, db.idFromIdxNoLock(idx))
-					need--
-					if need == 0 {
-						return out, true, nil
-					}
-				}
-				continue
-			}
-
-			// slow path
-			tmp.Clear()
-			tmp.Or(s[i].IDs)
-			tmp.And(base.bm)
-			if tmp.IsEmpty() {
-				continue
-			}
-			if emit(tmp) {
-				return out, true, nil
-			}
-		}
-	} else {
-		for i := end - 1; i >= start; i-- {
-			if card := s[i].IDs.GetCardinality(); card <= 256 {
-				if card == 0 {
-					continue
-				}
-				it := s[i].IDs.Iterator()
-				for it.HasNext() {
-					idx := it.Next()
-					if !base.bm.Contains(idx) {
-						continue
-					}
-					if skip > 0 {
-						skip--
-						continue
-					}
-					out = append(out, db.idFromIdxNoLock(idx))
-					need--
-					if need == 0 {
-						return out, true, nil
-					}
-				}
-				continue
-			}
-
-			tmp.Clear()
-			tmp.Or(s[i].IDs)
-			tmp.And(base.bm)
-			if tmp.IsEmpty() {
-				continue
-			}
-			if emit(tmp) {
-				return out, true, nil
-			}
-			if i == start {
-				break
-			}
-		}
-	}
-
-	return out, true, nil
-}
-
 /**/
 
 var roaringPool = sync.Pool{
@@ -1873,7 +1755,7 @@ type ringQue struct {
 	cells []cell
 }
 
-const ringSizePow2 = 1 << 13
+const ringSizePow2 = 1 << 14
 
 func newQue() *ringQue {
 	r := &ringQue{
@@ -1928,12 +1810,13 @@ func (q *ringQue) dequeue() (*roaring64.Bitmap, bool) {
 
 var releaseQue = newQue()
 
-func releaseRoaringBuf(rb *roaring64.Bitmap) {
-	if releaseQue.enqueue(rb) {
+func releaseRoaringBuf(bm *roaring64.Bitmap) {
+	if releaseQue.enqueue(bm) {
 		return
 	}
-	rb.Clear()
-	roaringPool.Put(rb)
+	bm.Clear()
+	// bm.Xor(bm)
+	roaringPool.Put(bm)
 }
 
 func init() {
@@ -1948,7 +1831,8 @@ func init() {
 					break
 				}
 				if bm != nil {
-					bm.Clear()
+					bm.Xor(bm)
+					// bm.Clear()
 					roaringPool.Put(bm)
 				}
 			}
