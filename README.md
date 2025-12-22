@@ -50,12 +50,13 @@ import (
 )
 
 type User struct {
-    ID     uint64   `db:"-"`  // not indexed
-    Name   string   `db:"name"`
-    Age    int      `db:"age"`
-    Active bool     `db:"active"`
-    Tags   []string `db:"tags"`
-    Meta   string   `rbi:"-"` // not indexed
+    ID      uint64   `db:"id"`
+    Name    string   `db:"name"`
+    Age     int      `db:"age"`
+    Active  bool     `db:"active"`
+    Tags    []string `db:"tags"`
+    Meta    string   `rbi:"-"` // not indexed
+    Exclude string   `db:"-"`  // not indexed
 }
 
 func main() {
