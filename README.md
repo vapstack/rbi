@@ -3,7 +3,7 @@
 [![GoDoc](https://godoc.org/github.com/vapstack/rbi?status.svg)](https://godoc.org/github.com/vapstack/rbi)
 [![License](https://img.shields.io/badge/license-Apache2-blue.svg)](https://raw.githubusercontent.com/vapstack/rbi/master/LICENSE)
 
-> This package should be considered experimental.
+> **This package should be considered experimental.**
 
 ### Roaring Bolt Indexer
 
