@@ -72,7 +72,7 @@ func (db *DB[K, V]) query(q *qx.QX) ([]K, error) {
 
 	// optimization for simple ORDER BY + LIMIT without complex filters
 	if len(q.Order) == 1 && q.Order[0].Type == qx.OrderBasic && q.Limit > 0 {
-		if out, ok, err := db.tryQueryOrderBasicAndLimitDriver(q); ok {
+		if out, ok, err := db.tryQueryOrderBasicWithLimit(q); ok {
 			return out, err
 		}
 	}
@@ -1304,11 +1304,6 @@ func (db *DB[K, V]) exprValueToIdx(expr qx.Expr) ([]string, bool, error) {
 	return ixs, false, nil
 }
 
-func (db *DB[K, V]) negate(res bitmap) (bitmap, error) {
-	res.neg = !res.neg
-	return res, nil
-}
-
 type bitmap struct {
 	bm       *roaring64.Bitmap
 	readonly bool
@@ -1330,10 +1325,6 @@ func (b bitmap) clone() bitmap {
 	return bitmap{bm: c, neg: b.neg, readonly: false}
 }
 
-func (db *DB[K, V]) universeCard() uint64 {
-	return db.universe.GetCardinality()
-}
-
 func (db *DB[K, V]) cardOf(b bitmap) uint64 {
 	if !b.neg {
 		if b.bm == nil {
@@ -1341,7 +1332,7 @@ func (db *DB[K, V]) cardOf(b bitmap) uint64 {
 		}
 		return b.bm.GetCardinality()
 	}
-	uc := db.universeCard()
+	uc := db.universe.GetCardinality()
 	if b.bm == nil {
 		return uc
 	}
@@ -1617,7 +1608,7 @@ func (rb *rangeBounds) applyHi(key string, inc bool) {
 	}
 }
 
-func (db *DB[K, V]) tryQueryOrderBasicAndLimitDriver(q *qx.QX) ([]K, bool, error) {
+func (db *DB[K, V]) tryQueryOrderBasicWithLimit(q *qx.QX) ([]K, bool, error) {
 	if q == nil || len(q.Order) != 1 {
 		return nil, false, nil
 	}
@@ -1648,6 +1639,7 @@ func (db *DB[K, V]) tryQueryOrderBasicAndLimitDriver(q *qx.QX) ([]K, bool, error
 	}
 
 	var rb rangeBounds
+
 	baseOps := make([]qx.Expr, 0, len(q.Expr.Operands))
 
 	for _, op := range q.Expr.Operands {
@@ -1687,11 +1679,14 @@ func (db *DB[K, V]) tryQueryOrderBasicAndLimitDriver(q *qx.QX) ([]K, bool, error
 	}
 
 	var base bitmap
+
 	if len(baseOps) == 0 {
 		bm := getRoaringBuf()
 		bm.Or(db.universe)
 		base = bitmap{bm: bm}
+
 	} else if len(baseOps) == 1 {
+
 		b, err := db.evalExpr(baseOps[0])
 		if err != nil {
 			return nil, true, err
@@ -1701,7 +1696,9 @@ func (db *DB[K, V]) tryQueryOrderBasicAndLimitDriver(q *qx.QX) ([]K, bool, error
 			return nil, true, nil
 		}
 		base = b
+
 	} else {
+
 		b, err := db.evalExpr(qx.Expr{Op: qx.OpAND, Operands: baseOps})
 		if err != nil {
 			return nil, true, err
@@ -1711,11 +1708,12 @@ func (db *DB[K, V]) tryQueryOrderBasicAndLimitDriver(q *qx.QX) ([]K, bool, error
 			return nil, true, nil
 		}
 		base = b
+
 	}
 	defer base.release()
 
 	start := 0
-	end := len(s) // exclusive
+	end := len(s)
 
 	if rb.hasLo {
 		start = lowerBoundIndex(s, rb.loKey)

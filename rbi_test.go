@@ -1309,7 +1309,7 @@ func TestIndexPersistence(t *testing.T) {
 	}
 
 	st := db2.Stats()
-	if st.Keys != 2 {
-		t.Fatalf("expected Stats.Keys=2, got %d", st.Keys)
+	if st.KeyCount != 2 {
+		t.Fatalf("expected Stats.KeyCount=2, got %d", st.KeyCount)
 	}
 }

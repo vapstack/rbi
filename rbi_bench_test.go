@@ -152,6 +152,24 @@ func buildBenchDB(b *testing.B, n int) *DB[uint64, UserBench] {
 	return db
 }
 
+/*
+func BenchmarkStats(b *testing.B) {
+	db := buildBenchDB(b, benchN)
+
+	var s Stats[uint64]
+
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		s = db.Stats()
+	}
+	b.Log(s.KeyCount)
+	b.Log(s.IndexSize)
+	b.Log(s.IndexFieldSize)
+}
+*/
+
 func BenchmarkIndexPerformance_Simple_EQ(b *testing.B) {
 	db := buildBenchDB(b, benchN)
 	b.ReportAllocs()

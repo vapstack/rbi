@@ -887,14 +887,6 @@ OUTER:
 	return uniq
 }
 
-func distinctCountMap(s []string, n int) int {
-	m := make(map[string]struct{}, n)
-	for _, v := range s {
-		m[v] = struct{}{}
-	}
-	return len(m)
-}
-
 func (db *DB[K, V]) checkUniqueOnWrite(idx uint64, newVal *V, modified []string) error {
 	if newVal == nil {
 		return nil

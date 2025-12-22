@@ -3,6 +3,8 @@
 [![GoDoc](https://godoc.org/github.com/vapstack/rbi?status.svg)](https://godoc.org/github.com/vapstack/rbi)
 [![License](https://img.shields.io/badge/license-Apache2-blue.svg)](https://raw.githubusercontent.com/vapstack/rbi/master/LICENSE)
 
+> This package should be considered experimental.
+
 ### Roaring Bolt Indexer
 
 A high-performance in-memory secondary index layer for
@@ -30,7 +32,7 @@ Indexes are kept fully in memory and built on top of
     - slice operations: `IN`, `HAS`, `HASANY`
     - string operations: `PREFIX`, `SUFFIX`, `CONTAINS`
     - logical operators: `AND`, `OR`, `NOT`
-* Index-based ordering with offset/limit
+* Index-based ordering with **offset** / **limit**
 * Partial updates (`Patch`) with minimal index churn
 * Batch writes (`SetMany`, `PatchMany`)
 * Optional uniqueness constraints

@@ -309,13 +309,17 @@ type (
 		// IndexLoadTime is the time spent loading a persisted index from disk on the last successful load.
 		IndexLoadTime time.Duration
 		// UniqueFieldKeys contains the number of unique index keys per indexed field name.
-		UniqueFieldKeys map[string]int
+		UniqueFieldKeys map[string]uint64
+		// IndexSize contains the total size of the index, in bytes.
+		IndexSize uint64
+		// IndexFieldSize contains the size of the index for each indexed field.
+		IndexFieldSize map[string]uint64
 		// LastKey is the largest key present in the database according to the
 		// current universe bitmap. For string keys this is derived from the
 		// internal string mapping.
 		LastKey K
-		// Keys is the total number of keys currently present in the database.
-		Keys uint64
+		// KeyCount is the total number of keys currently present in the database.
+		KeyCount uint64
 	}
 )
 
@@ -361,14 +365,21 @@ func (db *DB[K, V]) Stats() Stats[K] {
 
 	s := db.stats
 
-	s.UniqueFieldKeys = make(map[string]int)
+	s.UniqueFieldKeys = make(map[string]uint64)
+	s.IndexFieldSize = make(map[string]uint64)
 
 	for name, i := range db.index {
-		s.UniqueFieldKeys[name] = len(*i)
+		s.UniqueFieldKeys[name] = uint64(len(*i))
+		var size uint64
+		for _, bm := range *i {
+			size += bm.IDs.GetSizeInBytes()
+		}
+		s.IndexFieldSize[name] = size
+		s.IndexSize += size
 	}
 
 	s.LastKey = db.lastIDNoLock()
-	s.Keys = db.universe.GetCardinality()
+	s.KeyCount = db.universe.GetCardinality()
 
 	return s
 }

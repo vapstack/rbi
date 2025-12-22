@@ -137,22 +137,6 @@ func containsAny(haystack []string, needles []string) bool {
 	return false
 }
 
-func containsNone(haystack []string, needles []string) bool {
-	if len(needles) == 0 {
-		return true
-	}
-	set := make(map[string]struct{}, len(haystack))
-	for _, v := range haystack {
-		set[v] = struct{}{}
-	}
-	for _, n := range needles {
-		if _, ok := set[n]; ok {
-			return false
-		}
-	}
-	return true
-}
-
 func distinctCountStrings(s []string) int {
 	if len(s) == 0 {
 		return 0
