@@ -68,6 +68,8 @@ func (db *DB[K, V]) QueryKeys(q *qx.QX) ([]K, error) {
 
 func (db *DB[K, V]) query(q *qx.QX) ([]K, error) {
 
+	q = normalizeQuery(q)
+
 	if err := db.checkUsedFields(q); err != nil {
 		return nil, err
 	}
@@ -658,7 +660,9 @@ func (db *DB[K, V]) Count(q *qx.QX) (uint64, error) {
 		return 0, err
 	}
 
-	b, err := db.evalExpr(q.Expr)
+	expr, _ := normalizeExpr(q.Expr)
+
+	b, err := db.evalExpr(expr)
 	if err != nil {
 		return 0, err
 	}

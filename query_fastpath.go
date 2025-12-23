@@ -8,24 +8,26 @@ import (
 	"github.com/vapstack/qx"
 )
 
-// a query planned must be introduced, but implementing one is huge amount of work...
+// we definitely need a normal query planner...
 
 func (db *DB[K, V]) tryFastPath(q *qx.QX) ([]K, bool, error) {
 
-	return nil, false, nil
+	// optimized path for LIMIT without OFFSET
+	if out, ok, err := db.tryLimitQuery(q); ok {
+		return out, ok, err
+	}
 
-	// optimization for simple ORDER BY + LIMIT without complex filters
+	// optimization for simple ORDER + LIMIT without complex filters (and OFFSET)
 	if out, ok, err := db.tryQueryOrderBasicWithLimit(q); ok {
 		return out, ok, err
 	}
 
-	// optimization for PREFIX + ORDER BY + LIMIT without complex filters
-	if out, ok, err := db.tryQueryOrderPrefixWithLimit(q); ok {
-		return out, ok, err
-	}
+	//
+	// these old paths can be removed, but more benchmarks is needed (with OFFSET)
+	//
 
-	// optimization for simple range + LIMIT without ORDER
-	if out, ok, err := db.tryQueryRangeNoOrderWithLimit(q); ok {
+	// optimization for PREFIX + ORDER + LIMIT without complex filters
+	if out, ok, err := db.tryQueryOrderPrefixWithLimit(q); ok {
 		return out, ok, err
 	}
 
@@ -34,16 +36,27 @@ func (db *DB[K, V]) tryFastPath(q *qx.QX) ([]K, bool, error) {
 		return out, ok, err
 	}
 
+	// optimization for simple range + LIMIT without ORDER
+	if out, ok, err := db.tryQueryRangeNoOrderWithLimit(q); ok {
+		return out, ok, err
+	}
+
 	return nil, false, nil
 }
 
 type rangeBounds struct {
+	has bool
+
 	hasLo bool
 	loKey string
 	loInc bool
+
 	hasHi bool
 	hiKey string
 	hiInc bool
+
+	hasPrefix bool
+	prefix    string
 }
 
 func (rb *rangeBounds) applyLo(key string, inc bool) {
@@ -334,9 +347,9 @@ func (db *DB[K, V]) tryQueryOrderBasicWithLimit(q *qx.QX) ([]K, bool, error) {
 				if card == 0 {
 					continue
 				}
-				it := s[i].IDs.Iterator()
-				for it.HasNext() {
-					idx := it.Next()
+				iter := s[i].IDs.Iterator()
+				for iter.HasNext() {
+					idx := iter.Next()
 					if !contains(idx) {
 						continue
 					}

@@ -25,7 +25,7 @@ type UserBench struct {
 }
 
 const (
-	benchN     = 200_000
+	benchN     = 500_000
 	benchBatch = 100_000
 )
 
@@ -382,6 +382,26 @@ func BenchmarkQueryKeys_Realistic_Skills_HasAll_All(b *testing.B) {
 	}
 }
 
+func BenchmarkQueryKeys_Realistic_Exclusion_Limit(b *testing.B) {
+	db := buildBenchDB(b, benchN)
+	b.ReportAllocs()
+
+	// SELECT * FROM users WHERE status = 'active' AND plan != 'free' AND country NOT IN ('US', 'GB')
+	q := qx.Query(
+		qx.EQ("status", "active"),
+		qx.NE("plan", "free"),
+		qx.NOTIN("country", []string{"US", "GB"}),
+	).Max(100)
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, err := db.QueryKeys(q)
+		if err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
 func BenchmarkQueryKeys_Realistic_Exclusion_All(b *testing.B) {
 	db := buildBenchDB(b, benchN)
 	b.ReportAllocs()
@@ -454,6 +474,29 @@ func BenchmarkQueryKeys_Realistic_Autocomplete_Complex_Limit(b *testing.B) {
 	}
 }
 
+func BenchmarkQueryKeys_Realistic_ComplexSegment_Limit(b *testing.B) {
+	db := buildBenchDB(b, benchN)
+	b.ReportAllocs()
+
+	europe := []string{"NL", "DE", "PL", "SE", "FR", "ES", "GB"}
+
+	q := qx.Query(
+		qx.EQ("status", "active"),
+		qx.IN("country", europe),
+		qx.NE("plan", "free"),
+		qx.GTE("age", 20),
+		qx.HASANY("tags", []string{"security", "ops"}),
+	).Max(100)
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, err := db.QueryKeys(q)
+		if err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
 func BenchmarkQueryKeys_Realistic_ComplexSegment_All(b *testing.B) {
 	db := buildBenchDB(b, benchN)
 	b.ReportAllocs()
@@ -467,6 +510,26 @@ func BenchmarkQueryKeys_Realistic_ComplexSegment_All(b *testing.B) {
 		qx.GTE("age", 20),
 		qx.HASANY("tags", []string{"security", "ops"}),
 	)
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, err := db.QueryKeys(q)
+		if err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkQueryKeys_Realistic_TopLevel_OR_Limit(b *testing.B) {
+	db := buildBenchDB(b, benchN)
+	b.ReportAllocs()
+
+	q := qx.Query(
+		qx.OR(
+			qx.HAS("roles", []string{"admin"}),
+			qx.EQ("plan", "enterprise"),
+		),
+	).Max(100)
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {

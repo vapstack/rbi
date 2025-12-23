@@ -97,7 +97,7 @@ func main() {
         ),
     ).
         By("age", qx.ASC).
-        Limit(10)
+        Max(10)
 
     users, err := db.QueryItems(q)
     if err != nil {
@@ -153,30 +153,60 @@ Execution methods:
 
 ## Query Execution Model
 
-Queries are evaluated exclusively through secondary indexes and bitmap algebra.
+Queries are executed entirely using in-memory secondary indexes.
+Stored record are never scanned or inspected during query evaluation.
 
-1. **Expression evaluation**\
-   Each leaf condition (e.g. `age > 30`, `tags HAS "go"`) is resolved into a
-   bitmap of matching record IDs using the corresponding index.
+Depending on the query shape, the engine chooses between a general bitmap-based
+execution path and several specialized fast-paths optimized for common cases.
 
-2. **Bitmap composition**\
-   Logical operators (`AND`, `OR`, `NOT`) are applied using bitmap operations.
-   Intermediate results may be represented as negative sets
-   (universe minus exclusions) to keep large result sets efficient.
+1. **Predicate Resolution**
+   
+   Each leaf predicate (e.g. `age > 30`, `tags HAS "go"`) is resolved using 
+   the corresponding field index. Depending on the operator, this may produce
+   a bitmap of matching record IDs, or an index-backed predicate that can test 
+   membership (`Contains(id)`) and iterate candidate IDs.
 
-3. **Ordering and limiting**\
-   When ordering is requested, the index of the ordered field is traversed and
-   intersected with the filtered bitmap while applying offset and limit.
+2. **Logical Composition**
+   
+   Logical operators (`AND`, `OR`, `NOT`) are applied using bitmap algebra where
+   appropriate. Intermediate results may be represented as negative sets
+   (universe minus exclusions) to keep large result sets efficient and avoid
+   materializing large bitmaps.
 
-4. **Materialization**  
-   Only the final set of matching IDs is materialized. Record values are fetched
-   from bbolt only for IDs that survive all filters.
+3. **Candidate-Driven Fast Paths**
+   
+   For some query shapes (most notably queries with a `LIMIT` and no `OFFSET`)
+   the engine may use a specialized execution path.
+   
+   In this mode:
+   - a selective index is chosen as the leading source of candidate IDs, 
+   - remaining predicates are applied incrementally via index lookups, 
+   - evaluation stops as soon as the requested number of results is reached.
 
-> Currently, there is no full-fledged query planner,
-> and instead the code relies on several fast-path implementations.
-> If you have experience with database indexing and have the time and interest 
-> to help the project, pull requests are very welcome.
+   This avoids full bitmap materialization and significantly reduces CPU and memory
+   usage for small or bounded result sets.
 
+4. **Ordering and Limiting**
+   
+   If ordering is requested, the index of the ordered field is traversed directly
+   and intersected with the filtered result set.
+   
+   Ordering is supported for a single indexed field only, which allows ordered
+   queries to be executed without materializing or re-sorting intermediate results.
+
+   Offset and limit are applied during index traversal whenever possible.
+
+5. **Materialization**
+   
+   Only the final set of matching record IDs is materialized.
+   
+   For `QueryItems`, record values are fetched from bbolt only for IDs that have
+   passed all filters, ordering, and limits.
+
+> Currently, there is no full-fledged query planner.
+> Execution strategies are selected using a small number of specialized
+> fast-paths combined with a general bitmap-based fallback.
+> Contributions improving query planning or execution strategies are very welcome.
 
 ## Ordering Limitations
 
@@ -206,6 +236,9 @@ To exclude a field from indexing, use one of:
 
 Slice-typed fields are indexed element-wise and support `HAS`, `HASNOT`, `HASANY`, 
 `HASNONE` operations.
+
+Equality for slice fields is implemented as **set equality**, not array equality.\
+This means, that `["a", "b", "a"] == ["a", "b"]`
 
 ## Unique Constraints
 
@@ -385,6 +418,7 @@ The focus is on fast selection of complete documents.
 - The package is read-optimized.
 - Prefer batch writes over single inserts, if possible.
 - Always use limits if you do not need the whole set.
+- Not all logical branches are currently optimized.
 
 There is still room for optimization, but the current performance is already
 suitable for many workloads.
