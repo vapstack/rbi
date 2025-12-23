@@ -196,7 +196,7 @@ execution path and several specialized fast-paths optimized for common cases.
    
    Only the final set of matching record IDs is materialized.\
    For `QueryItems`, record values are fetched from bbolt only for IDs that have
-   passed all filters, ordering, and limits.
+   passed all filters and limits.
 
 > Currently, there is no full-fledged query planner.
 > Execution strategies are selected using a small number of specialized
