@@ -190,16 +190,11 @@ execution path and several specialized fast-paths optimized for common cases.
    
    If ordering is requested, the index of the ordered field is traversed directly
    and intersected with the filtered result set.
-   
-   Ordering is supported for a single indexed field only, which allows ordered
-   queries to be executed without materializing or re-sorting intermediate results.
-
    Offset and limit are applied during index traversal whenever possible.
 
 5. **Materialization**
    
-   Only the final set of matching record IDs is materialized.
-   
+   Only the final set of matching record IDs is materialized.\
    For `QueryItems`, record values are fetched from bbolt only for IDs that have
    passed all filters, ordering, and limits.
 
