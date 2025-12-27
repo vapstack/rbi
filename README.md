@@ -128,6 +128,9 @@ For the full API reference see the
 
 Queries are constructed using the [`qx`](https://github.com/vapstack/qx) package.
 
+Field names refer to the names specified in `db` tags.\
+If a field does not have a `db` tag, the Go struct field name is used.
+
 ```go
 q := qx.Query(
     qx.EQ("field", val),

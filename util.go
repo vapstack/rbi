@@ -17,6 +17,100 @@ import (
 	"go.etcd.io/bbolt"
 )
 
+// MakePatch builds and returns a patch describing fields that changed between
+// oldVal and newVal.
+//
+// The patch includes both indexed and non-indexed fields. For every modified
+// field it adds a Field entry whose Name is the Go struct field name,
+// and whose Value is a deep copy of the value taken from newVal.
+//
+// If newVal is nil, it returns an empty slice.
+func (db *DB[K, V]) MakePatch(oldVal, newVal *V) []Field {
+	return db.makePatch(oldVal, newVal, make([]Field, 0))
+}
+
+// MakePatchInto is like MakePatch, but writes the result into the provided
+// buffer to reduce allocations.
+//
+// dst is treated as scratch space: it will be reset to length 0 and then filled
+// with the resulting patch. The returned slice may refer to the same underlying
+// array or a grown one if capacity is insufficient.
+//
+// If newVal is nil, it returns an empty slice.
+func (db *DB[K, V]) MakePatchInto(oldVal, newVal *V, dst []Field) []Field {
+	return db.makePatch(oldVal, newVal, dst)
+}
+
+var patchMapPool = sync.Pool{
+	New: func() any {
+		return make(map[string]struct{})
+	},
+}
+
+func (db *DB[K, V]) makePatch(oldVal, newVal *V, target []Field) []Field {
+
+	target = target[:0]
+
+	if newVal == nil {
+		return target
+	}
+
+	var rvOld, rvNew reflect.Value
+	if oldVal != nil {
+		rvOld = reflect.ValueOf(oldVal).Elem()
+	}
+	rvNew = reflect.ValueOf(newVal).Elem()
+
+	processed := patchMapPool.Get().(map[string]struct{})
+	clear(processed)
+	defer patchMapPool.Put(processed)
+
+	mods := db.getModifiedIndexedFields(oldVal, newVal)
+
+	for _, dbname := range mods {
+		f := db.fields[dbname]
+
+		processed[f.Name] = struct{}{}
+
+		var newValue any
+		if rvNew.IsValid() {
+			newValue = rvNew.FieldByIndex(f.Index).Interface()
+		}
+
+		target = append(target, Field{
+			Name:  f.Name, // dbname,
+			Value: deepCopyValue(newValue),
+		})
+	}
+
+	for patchKey, f := range db.patchMap {
+		if patchKey != f.Name {
+			continue
+		}
+		if _, ok := processed[f.Name]; ok {
+			continue
+		}
+
+		var v1, v2 any
+		if rvOld.IsValid() {
+			v1 = rvOld.FieldByIndex(f.Index).Interface()
+		}
+		if rvNew.IsValid() {
+			v2 = rvNew.FieldByIndex(f.Index).Interface()
+		}
+
+		if !reflect.DeepEqual(v1, v2) {
+			target = append(target, Field{
+				Name:  f.Name,
+				Value: deepCopyValue(v2),
+			})
+		}
+		processed[f.Name] = struct{}{}
+	}
+
+	return target
+}
+
 // CollectPatch returns a PreCommitFunc that populates the provided target slice
 // with a patch describing all fields that have changed between old and new
 // values of a record.
@@ -31,6 +125,7 @@ import (
 //
 // The returned PreCommitFunc should not be used with Delete or DeleteMany
 // (where newVal is always nil); in such cases the resulting slice will be empty.
+/*
 func (db *DB[K, V]) CollectPatch(target *[]Field) PreCommitFunc[K, V] {
 
 	return func(tx *bbolt.Tx, _ K, oldVal, newVal *V) error {
@@ -93,6 +188,7 @@ func (db *DB[K, V]) CollectPatch(target *[]Field) PreCommitFunc[K, V] {
 		return nil
 	}
 }
+*/
 
 // CollectPatchMany returns a PreCommitFunc that collects per-record patches into target,
 // keyed by the record ID.
@@ -106,6 +202,7 @@ func (db *DB[K, V]) CollectPatch(target *[]Field) PreCommitFunc[K, V] {
 //
 // If newVal is nil (e.g. Delete/DeleteMany), no patch is produced for that key.
 // The provided map must be initialized by the caller.
+/*
 func (db *DB[K, V]) CollectPatchMany(target map[K][]Field) PreCommitFunc[K, V] {
 
 	return func(tx *bbolt.Tx, key K, oldVal, newVal *V) error {
@@ -170,6 +267,7 @@ func (db *DB[K, V]) CollectPatchMany(target map[K][]Field) PreCommitFunc[K, V] {
 		return nil
 	}
 }
+*/
 
 func (db *DB[K, V]) keyFromID(id K) []byte {
 	if db.strkey {

@@ -711,6 +711,40 @@ func BenchmarkQueryItems_HeavyFetch(b *testing.B) {
 	}
 }
 
+func BenchmarkMakePatch(b *testing.B) {
+	db := buildBenchDB(b, benchN)
+	b.ReportAllocs()
+
+	v1 := &UserBench{
+		Country: "ES",
+		Plan:    "free",
+		Status:  "trial",
+		Age:     20,
+		Score:   0.5,
+		Name:    "Test",
+		Email:   "test@example.com",
+		Tags:    []string{"go"},
+		Roles:   []string{"user"},
+	}
+	v2 := &UserBench{
+		Country: "ES",
+		Plan:    "basic",
+		Status:  "active",
+		Age:     20,
+		Score:   0.8,
+		Name:    "Test",
+		Email:   "test@example.com",
+		Tags:    []string{"go", "java"},
+		Roles:   []string{"user", "admin"},
+	}
+
+	buf := make([]Field, 0, 8)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		buf = db.MakePatchInto(v1, v2, buf)
+	}
+}
+
 /**/
 
 func buildWriteBenchDB(b *testing.B) (*DB[uint64, UserBench], uint64) {
