@@ -7,6 +7,7 @@ import (
 	"log"
 	"os"
 	"reflect"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -1088,6 +1089,11 @@ func (db *DB[K, V]) ToKey(idx uint64) (K, bool) {
 // Should be used with caution.
 func (db *DB[K, V]) Bolt() *bbolt.DB {
 	return db.bolt
+}
+
+// BucketName returns a name of the bucket at which the data is stored.
+func (db *DB[K, V]) BucketName() []byte {
+	return slices.Clone(db.bucket)
 }
 
 /**/
