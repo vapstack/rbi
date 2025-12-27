@@ -651,8 +651,15 @@ func (db *DB[K, V]) Set(id K, newVal *V, fns ...PreCommitFunc[K, V]) error {
 // After a successful commit, the in-memory index state is updated for all
 // modified keys unless indexing is disabled.
 func (db *DB[K, V]) SetMany(ids []K, newVals []*V, fns ...PreCommitFunc[K, V]) error {
+
 	if len(ids) != len(newVals) {
 		return fmt.Errorf("different slice lengths")
+	}
+	if len(ids) == 0 {
+		return nil
+	}
+	if len(ids) == 1 {
+		return db.Set(ids[0], newVals[0], fns...)
 	}
 
 	bufs := make([]*bytes.Buffer, 0, len(ids))
@@ -860,6 +867,9 @@ func (db *DB[K, V]) patchMany(ids []K, patch []Field, ignoreUnknown bool, fns ..
 	if len(ids) == 0 || len(patch) == 0 {
 		return nil
 	}
+	if len(ids) == 1 {
+		return db.patch(ids[0], patch, ignoreUnknown, fns...)
+	}
 
 	bufs := make([]*bytes.Buffer, 0, len(ids))
 	defer func() {
@@ -1014,6 +1024,13 @@ func (db *DB[K, V]) Delete(id K, fns ...PreCommitFunc[K, V]) error {
 // PreCommitFunc fns. If an error is encountered during processing,
 // the entire operation is rolled back.
 func (db *DB[K, V]) DeleteMany(ids []K, fns ...PreCommitFunc[K, V]) error {
+
+	if len(ids) == 0 {
+		return nil
+	}
+	if len(ids) == 1 {
+		return db.Delete(ids[0], fns...)
+	}
 
 	tx, txerr := db.bolt.Begin(true)
 	if txerr != nil {
