@@ -23,6 +23,7 @@ var (
 	ErrInvalidQuery    = errors.New("invalid query")
 	ErrIndexDisabled   = errors.New("index is disabled")
 	ErrUniqueViolation = errors.New("unique constraint violation")
+	ErrRecordNotFound  = errors.New("record not found")
 )
 
 var BucketFillPercent = 0.75
@@ -745,9 +746,10 @@ func (db *DB[K, V]) SetMany(ids []K, newVals []*V, fns ...PreCommitFunc[K, V]) e
 // values to the appropriate field type, if possible.
 // If conversion fails for any field, Patch returns an error and no changes are committed.
 //
+// If no item is found for the specified id, ErrRecordNotFound is returned.
+//
 // All PreCommitFunc fns are invoked with the original (old) and patched (new) values
-// before commit. After a successful commit, the in-memory index is updated
-// unless indexing is disabled.
+// before commit. After a successful commit, the in-memory index is updated.
 func (db *DB[K, V]) Patch(id K, patch []Field, fns ...PreCommitFunc[K, V]) error {
 	return db.patch(id, patch, true, fns...)
 }
@@ -781,7 +783,7 @@ func (db *DB[K, V]) patch(id K, fields []Field, ignoreUnknown bool, fns ...PreCo
 	var oldVal *V
 	oldBytes := bucket.Get(key)
 	if oldBytes == nil {
-		return fmt.Errorf("item with id %v does not exist", id)
+		return ErrRecordNotFound
 	}
 
 	if oldVal, err = db.decode(oldBytes); err != nil {
@@ -839,12 +841,16 @@ func (db *DB[K, V]) patch(id K, fields []Field, ignoreUnknown bool, fns ...PreCo
 //
 // Unknown fields are ignored (as in Patch).
 // Any errors during processing aborts the entire batch and rolls back the transaction.
+//
+// Non-existent IDs are skipped.
 func (db *DB[K, V]) PatchMany(ids []K, patch []Field, fns ...PreCommitFunc[K, V]) error {
 	return db.patchMany(ids, patch, true, fns...)
 }
 
 // PatchManyStrict is like PatchMany, but returns an error if patch contains
 // any field names that cannot be resolved to known struct fields.
+//
+// Non-existent IDs are skipped.
 func (db *DB[K, V]) PatchManyStrict(ids []K, patch []Field, fns ...PreCommitFunc[K, V]) error {
 	return db.patchMany(ids, patch, false, fns...)
 }
@@ -887,7 +893,8 @@ func (db *DB[K, V]) patchMany(ids []K, patch []Field, ignoreUnknown bool, fns ..
 
 		oldBytes := bucket.Get(key)
 		if oldBytes == nil {
-			return fmt.Errorf("item with id %v does not exist", id) // todo: ignore and try next id?
+			continue
+			// return fmt.Errorf("item with id %v does not exist", id)
 		}
 
 		var (

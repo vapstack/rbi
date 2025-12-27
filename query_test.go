@@ -840,10 +840,7 @@ func TestRace_ConcurrentReadersAndWriters(t *testing.T) {
 
 				case 1:
 					patch := []Field{{Name: "age", Value: float64(20 + r.Intn(50))}}
-					if err := db.Patch(id, patch); err != nil {
-						if strings.Contains(err.Error(), "does not exist") {
-							continue
-						}
+					if err := db.Patch(id, patch); err != nil && !errors.Is(err, ErrRecordNotFound) {
 						reportErr(fmt.Errorf("writer patch error: %w", err))
 						return
 					}
