@@ -5,36 +5,35 @@
 
 > This package should be considered experimental.
 
-### Roaring Bolt Indexer
+## Roaring Bolt Indexer
 
 A secondary index layer for [bbolt](https://github.com/etcd-io/bbolt) written in pure Go.
 
 It turns a simple key-value store into a document-oriented database with rich
 query capabilities, while preserving bbolt’s ACID guarantees for data storage.
-
 Indexes are kept fully in memory and built on top of
-[roaring64](https://github.com/RoaringBitmap/roaring), allowing fast set operations, ordering, and filtering.
+[roaring64](https://github.com/RoaringBitmap/roaring) for fast set operations, ordering, and filtering.
 
-## Key Properties
+### Key Properties
 
-* **ACID data** – data durability is delegated to bbolt.
-* **Index-only queries** – all queries are evaluated via in-memory indexes.
-* **Document-centric** – queries select whole records, not individual fields.
+* **ACID** – data durability is delegated to bbolt.
+* **Index-only queries** – queries are evaluated via in-memory indexes; disk is never touched.
+* **Document-oriented** – queries select whole records, not individual fields.
 * **Strong typing** – generic API with user-defined key and value types.
 
-## Features
+### Features
 
 * Automatic indexing of exported struct fields
-* Fine-grained control via struct tags
+* Fine-grained control via struct tags (`db`, `dbi`, `rbi`)
 * Efficient query building via [qx package](https://github.com/vapstack/qx):
     - comparisons: `EQ`, `GT`, `GTE`, `LT`, `LTE`
-    - slice operations: `IN`, `HAS`, `HASANY`
-    - string operations: `PREFIX`, `SUFFIX`, `CONTAINS`
-    - logical operators: `AND`, `OR`, `NOT`
+    - slices: `IN`, `HAS`, `HASANY`
+    - strings: `PREFIX`, `SUFFIX`, `CONTAINS`
+    - logical: `AND`, `OR`, `NOT`
 * Index-based ordering with offset / limit
-* Partial updates (`Patch`) with minimal index churn
+* Partial updates (`Patch*`) with minimal index churn
 * Batch writes (`SetMany`, `PatchMany`)
-* Optional uniqueness constraints
+* Uniqueness constraints
 
 ## Quick Start
 
@@ -110,7 +109,7 @@ func main() {
 }
 ```
 
-## API Overview
+## API
 
 For the full API reference see the
 [GoDoc](https://godoc.org/github.com/vapstack/rbi).
@@ -147,59 +146,37 @@ q := qx.Query(
     Max(50)
 ```
 
-Execution methods:
+Query methods:
 
 * `QueryItems(q)` – return matching records
 * `QueryKeys(q)` – return matching IDs
 * `QueryBitmap(expr)` – return a bitmap of matching IDs
-* `Count(q)` – return result cardinality
+* `Count(q)` – return result cardinality (ignoring offset/limit)
 
 ## Query Execution Model
 
-Queries are executed entirely using in-memory secondary indexes.
-Stored record are never scanned or inspected during query evaluation.
+Queries run entirely in-memory; stored records are never scanned.
+Depending on query shape, the engine uses either a generic bitmap-based
+execution or specialized fast paths.
 
-Depending on the query shape, the engine chooses between a general bitmap-based
-execution path and several specialized fast-paths optimized for common cases.
+Leaf predicates are resolved via field indexes, producing either bitmaps
+of matching record IDs or index-backed iterators with `Contains(id)` checks.
+Logical operators (`AND`, `OR`, `NOT`) are applied using bitmap operations; 
+large result sets may be represented as negative sets to avoid materializing 
+large bitmaps.
 
-1. **Predicate Resolution**
-   
-   Each leaf predicate (e.g. `age > 30`, `tags HAS "go"`) is resolved using 
-   the corresponding field index. Depending on the operator, this may produce
-   a bitmap of matching record IDs, or an index-backed predicate that can test 
-   membership (`Contains(id)`) and iterate candidate IDs.
+For some queries (mostly with LIMIT without OFFSET), 
+the engine switches to a candidate-driven fast path. 
+A selective index yields candidate IDs, remaining predicates are checked 
+via index lookups, and execution stops once enough results are found. 
 
-2. **Logical Composition**
-   
-   Logical operators (`AND`, `OR`, `NOT`) are applied using bitmap algebra where
-   appropriate. Intermediate results may be represented as negative sets
-   (universe minus exclusions) to keep large result sets efficient and avoid
-   materializing large bitmaps.
+If ordering is requested, the index of the ordered field is traversed directly 
+and intersected with the filtered result set. 
+Offset and limit are applied during traversal when possible.
 
-3. **Candidate-Driven Fast Paths**
-   
-   For some query shapes (most notably queries with a `LIMIT` and no `OFFSET`)
-   the engine may use a specialized execution path.
-   
-   In this mode:
-   - a selective index is chosen as the leading source of candidate IDs, 
-   - remaining predicates are applied incrementally via index lookups, 
-   - evaluation stops as soon as the requested number of results is reached.
-
-   This avoids full bitmap materialization and significantly reduces CPU and memory
-   usage for small or bounded result sets.
-
-4. **Ordering and Limiting**
-   
-   If ordering is requested, the index of the ordered field is traversed directly
-   and intersected with the filtered result set.
-   Offset and limit are applied during index traversal whenever possible.
-
-5. **Materialization**
-   
-   Only the final set of matching record IDs is materialized.\
-   For `QueryItems`, record values are fetched from bbolt only for IDs that have
-   passed all filters and limits.
+Only the final set of matching record IDs is materialized.
+For `QueryItems`, record values are fetched from bbolt only for IDs that have
+passed all filters and limits.
 
 > Currently, there is no full-fledged query planner.
 > Execution strategies are selected using a small number of specialized
@@ -338,11 +315,8 @@ Values are encoded using [msgpack](https://github.com/vmihailenco/msgpack).
 Msgpack provides good performance, compact binary representation, and a
 flat encoding model similar to JSON. This makes it tolerant to many
 schema changes, including field reordering and movement between embedded
-and top-level structs.
-
-Unlike `gob`, field decoding does not depend on the exact structural layout of
-the type, which allows values to be safely decoded even if fields are moved
-between embedded structs or promoted to the parent struct.
+and top-level structs. Unlike `gob`, field decoding does not depend on 
+the exact structural layout of the type.
 
 Most schema changes are handled gracefully:
 

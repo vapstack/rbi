@@ -345,7 +345,7 @@ func releaseEncodeBuf(b *bytes.Buffer) {
 func rollback(tx *bbolt.Tx) { _ = tx.Rollback() }
 
 func touch(name string) error {
-	file, err := os.OpenFile(name, os.O_RDONLY|os.O_CREATE, 0600)
+	file, err := os.OpenFile(name, os.O_WRONLY|os.O_CREATE, 0600)
 	if err != nil {
 		return err
 	}

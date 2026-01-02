@@ -7,6 +7,7 @@ import (
 	"encoding/gob"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"runtime"
 	"slices"
@@ -237,6 +238,7 @@ func (db *DB[K, V]) buildIndex(skipFields map[string]struct{}) error {
 		db.buildLenIndex()
 		return nil
 	}
+	log.Printf("rbi: building index (fields: %v)...", fcnt)
 
 	start := time.Now()
 
@@ -405,6 +407,8 @@ func (db *DB[K, V]) buildIndex(skipFields map[string]struct{}) error {
 	db.stats.IndexBuildTime = time.Since(start)
 	db.stats.IndexBuildRPS = int(recordCount / max(uint64(time.Since(start).Seconds()), 1))
 
+	log.Println("rbi: index built in", db.stats.IndexBuildTime, "with rate", db.stats.IndexBuildRPS, "records/second")
+
 	db.buildLenIndex()
 
 	return nil
@@ -470,6 +474,8 @@ func (db *DB[K, V]) buildLenIndex() {
 		if slice == nil {
 			continue
 		}
+
+		log.Printf("building length index for %v...", f.Name)
 
 		counts := make(map[uint64]uint32, 1024)
 

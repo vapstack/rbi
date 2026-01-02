@@ -26,7 +26,7 @@ var (
 	ErrRecordNotFound  = errors.New("record not found")
 )
 
-var BucketFillPercent = 0.75
+var BucketFillPercent = 0.8
 
 // Options configures how indexer works a bbolt database.
 // All fields are optional; a nil *Options is equivalent to using zero values.
@@ -181,7 +181,7 @@ func Wrap[K ~uint64 | ~string, V any](bolt *bbolt.DB, options *Options[K, V]) (*
 	var skipFields map[string]struct{}
 
 	if _, err = os.Stat(db.opnFile); err == nil {
-		log.Println("rbi: unsafe shutdown: rebuilding index...")
+		log.Println("rbi: unclean shutdown detected")
 	} else {
 		if _, err = os.Stat(db.rbiFile); err == nil {
 			if !options.DisableIndexLoad {
