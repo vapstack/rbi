@@ -380,7 +380,7 @@ This package does not aim to be a relational database or a SQL engine.
 
 * no projections (`SELECT field1, field2`),
 * no joins,
-* no aggregation functions,
+* no aggregation functions (for now),
 * no query-time computed fields.
 
 The focus is on fast selection of complete documents.
