@@ -194,6 +194,20 @@ func BenchmarkCount_Simple_EQ_Count(b *testing.B) {
 	}
 }
 
+func BenchmarkQueryKeys_Simple_First100(b *testing.B) {
+	db := buildBenchDB(b, benchN)
+	b.ReportAllocs()
+
+	q := qx.Query().Max(100)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, err := db.QueryKeys(q)
+		if err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
 func BenchmarkQueryKeys_Medium_IN_Limit(b *testing.B) {
 	db := buildBenchDB(b, benchN)
 	b.ReportAllocs()
