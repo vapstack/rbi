@@ -618,8 +618,10 @@ func (db *DB[K, V]) Set(id K, newVal *V, fns ...PreCommitFunc[K, V]) error {
 	}
 
 	for _, fn := range fns {
-		if err = fn(tx, id, oldVal, newVal); err != nil {
-			return err
+		if fn != nil {
+			if err = fn(tx, id, oldVal, newVal); err != nil {
+				return err
+			}
 		}
 	}
 
@@ -715,8 +717,10 @@ func (db *DB[K, V]) SetMany(ids []K, newVals []*V, fns ...PreCommitFunc[K, V]) e
 	if len(fns) > 0 {
 		for i, id := range ids {
 			for _, fn := range fns {
-				if err = fn(tx, id, oldVals[i], newVals[i]); err != nil {
-					return err
+				if fn != nil {
+					if err = fn(tx, id, oldVals[i], newVals[i]); err != nil {
+						return err
+					}
 				}
 			}
 		}
@@ -820,8 +824,10 @@ func (db *DB[K, V]) patch(id K, fields []Field, ignoreUnknown bool, fns ...PreCo
 	}
 
 	for _, fn := range fns {
-		if err = fn(tx, id, oldVal, newVal); err != nil {
-			return err
+		if fn != nil {
+			if err = fn(tx, id, oldVal, newVal); err != nil {
+				return err
+			}
 		}
 	}
 
@@ -939,8 +945,10 @@ func (db *DB[K, V]) patchMany(ids []K, patch []Field, ignoreUnknown bool, fns ..
 	if len(fns) > 0 {
 		for i, id := range ids {
 			for _, fn := range fns {
-				if err = fn(tx, id, oldVals[i], newVals[i]); err != nil {
-					return err
+				if fn != nil {
+					if err = fn(tx, id, oldVals[i], newVals[i]); err != nil {
+						return err
+					}
 				}
 			}
 		}
@@ -1000,8 +1008,10 @@ func (db *DB[K, V]) Delete(id K, fns ...PreCommitFunc[K, V]) error {
 	}
 
 	for _, fn := range fns {
-		if err = fn(tx, id, oldVal, nil); err != nil {
-			return err
+		if fn != nil {
+			if err = fn(tx, id, oldVal, nil); err != nil {
+				return err
+			}
 		}
 	}
 
@@ -1068,8 +1078,10 @@ func (db *DB[K, V]) DeleteMany(ids []K, fns ...PreCommitFunc[K, V]) error {
 	if len(fns) > 0 {
 		for i, id := range ids {
 			for _, fn := range fns {
-				if err = fn(tx, id, oldVals[i], nil); err != nil {
-					return err
+				if fn != nil {
+					if err = fn(tx, id, oldVals[i], nil); err != nil {
+						return err
+					}
 				}
 			}
 		}
