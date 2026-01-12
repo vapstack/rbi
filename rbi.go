@@ -259,7 +259,7 @@ func Open[K ~uint64 | ~string, V any](filename string, mode os.FileMode, options
 }
 
 type (
-	// DB wraps a bbolt database and maintains secondary indexes over values of type V
+	// DB wraps a bbolt database and maintains secondary indexes over values of type *V
 	// stored in a single bucket. It supports efficient equality and range queries,
 	// as well as array membership and array-length queries for slice fields.
 	//

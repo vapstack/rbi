@@ -7,7 +7,6 @@ import (
 	"encoding/gob"
 	"fmt"
 	"io"
-	"log"
 	"os"
 	"runtime"
 	"slices"
@@ -238,7 +237,7 @@ func (db *DB[K, V]) buildIndex(skipFields map[string]struct{}) error {
 		db.buildLenIndex()
 		return nil
 	}
-	log.Printf("rbi: building index (fields: %v)...", fcnt)
+	// log.Printf("rbi: building index (fields: %v)...", fcnt)
 
 	start := time.Now()
 
@@ -330,8 +329,6 @@ func (db *DB[K, V]) buildIndex(skipFields map[string]struct{}) error {
 		}(i)
 	}
 
-	recordCount := uint64(0)
-
 	err := db.bolt.View(func(tx *bbolt.Tx) error {
 
 		defer wg.Wait()
@@ -348,7 +345,6 @@ func (db *DB[K, V]) buildIndex(skipFields map[string]struct{}) error {
 			case <-done:
 				return nil
 			case jobs <- rawdata{k, v, db.idxFromKeyNoLock(k)}:
-				recordCount++
 			}
 		}
 		return nil
@@ -396,18 +392,18 @@ func (db *DB[K, V]) buildIndex(skipFields map[string]struct{}) error {
 		db.index[name] = &s
 	}
 
-	universe := roaring64.NewBitmap()
+	db.universe = roaring64.NewBitmap()
 	for _, lu := range localUniverse {
 		if lu != nil {
-			universe.Or(lu)
+			db.universe.Or(lu)
 		}
 	}
-	db.universe = universe
+	recordCount := db.universe.GetCardinality()
 
 	db.stats.IndexBuildTime = time.Since(start)
-	db.stats.IndexBuildRPS = int(recordCount / max(uint64(time.Since(start).Seconds()), 1))
+	db.stats.IndexBuildRPS = int(float64(recordCount) / max(time.Since(start).Seconds(), 1))
 
-	log.Println("rbi: index built in", db.stats.IndexBuildTime, "with rate", db.stats.IndexBuildRPS, "records/second")
+	// log.Println("rbi: index built in", db.stats.IndexBuildTime, "with rate", db.stats.IndexBuildRPS, "records/second, total:", recordCount)
 
 	db.buildLenIndex()
 
@@ -474,8 +470,6 @@ func (db *DB[K, V]) buildLenIndex() {
 		if slice == nil {
 			continue
 		}
-
-		log.Printf("building length index for %v...", f.Name)
 
 		counts := make(map[uint64]uint32, 1024)
 
