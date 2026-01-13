@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"io"
 	"math"
 	"os"
 	"path/filepath"
@@ -310,19 +311,37 @@ func (db *DB[K, V]) idxsFromID(ids []K) []uint64 {
 	return *(*[]uint64)(unsafe.Pointer(&ids))
 }
 
+var msgpackEncPool = sync.Pool{New: func() any { return msgpack.NewEncoder(io.Discard) }}
+var msgpackDecPool = sync.Pool{New: func() any { return msgpack.NewDecoder(strings.NewReader("")) }}
+
 func (db *DB[K, V]) decode(b []byte) (*V, error) {
 	v := new(V)
-	if err := msgpack.NewDecoder(bytes.NewReader(b)).Decode(v); err != nil {
+	dec := msgpackDecPool.Get().(*msgpack.Decoder)
+	dec.Reset(bytes.NewReader(b))
+	err := dec.Decode(v)
+	msgpackDecPool.Put(dec)
+	if err != nil {
 		return nil, err
 	}
 	return v, nil
+
+	// if err := msgpack.NewDecoder(bytes.NewReader(b)).Decode(v); err != nil {
+	// 	return nil, err
+	// }
+	// return v, nil
 }
 
 func (db *DB[K, V]) encode(v *V, b *bytes.Buffer) error {
-	if err := msgpack.NewEncoder(b).Encode(v); err != nil {
-		return err
-	}
-	return nil
+	enc := msgpackEncPool.Get().(*msgpack.Encoder)
+	enc.Reset(b)
+	err := enc.Encode(v)
+	msgpackEncPool.Put(enc)
+	return err
+
+	// if err := msgpack.NewEncoder(b).Encode(v); err != nil {
+	// 	return err
+	// }
+	// return nil
 }
 
 /**/

@@ -6,8 +6,6 @@ import (
 	"reflect"
 	"strings"
 	"sync"
-	"sync/atomic"
-	"time"
 	"unsafe"
 
 	"github.com/vapstack/qx"
@@ -687,7 +685,7 @@ func (db *DB[K, V]) Count(q *qx.QX) (uint64, error) {
 
 // QueryBitmap evaluates expression against the index and returns a bitmap of matching record IDs.
 // The caller is free to modify the returned bitmap.
-func (db *DB[K, V]) QueryBitmap(expr qx.Expr) (*roaring64.Bitmap, error) {
+/*func (db *DB[K, V]) QueryBitmap(expr qx.Expr) (*roaring64.Bitmap, error) {
 
 	db.mu.RLock()
 	defer db.mu.RUnlock()
@@ -713,7 +711,7 @@ func (db *DB[K, V]) QueryBitmap(expr qx.Expr) (*roaring64.Bitmap, error) {
 	defer b.release()
 
 	return b.bm.Clone(), nil
-}
+}*/
 
 func (db *DB[K, V]) checkUsedFields(q *qx.QX) error {
 	for _, o := range q.Order {
@@ -1747,6 +1745,16 @@ func getRoaringBuf() *roaring64.Bitmap {
 	return roaringPool.Get().(*roaring64.Bitmap)
 }
 
+func releaseRoaringBuf(bm *roaring64.Bitmap) {
+	// if releaseQue.enqueue(bm) {
+	// 	return
+	// }
+	bm.Clear()
+	// bm.Xor(bm)
+	roaringPool.Put(bm)
+}
+
+/*
 type cell struct {
 	seq atomic.Uint64
 	val atomic.Pointer[roaring64.Bitmap]
@@ -1814,15 +1822,6 @@ func (q *ringQue) dequeue() (*roaring64.Bitmap, bool) {
 
 var releaseQue = newQue()
 
-func releaseRoaringBuf(bm *roaring64.Bitmap) {
-	if releaseQue.enqueue(bm) {
-		return
-	}
-	bm.Clear()
-	// bm.Xor(bm)
-	roaringPool.Put(bm)
-}
-
 func init() {
 	go func() {
 		t := time.NewTicker(50 * time.Millisecond)
@@ -1843,3 +1842,4 @@ func init() {
 		}
 	}()
 }
+*/

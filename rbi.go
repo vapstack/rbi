@@ -11,7 +11,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-	"unsafe"
 
 	"github.com/RoaringBitmap/roaring/v2/roaring64"
 	"go.etcd.io/bbolt"
@@ -39,9 +38,7 @@ type Options[K ~string | ~uint64, V any] struct {
 	DisableIndexLoad bool
 
 	// DisableIndexStore prevents indexer from saving the in-memory index state
-	// to the .rbi file on Close. This is useful when index persistence is
-	// not required or when the caller prefers to manage index lifecycle
-	// manually.
+	// to the .rbi file on Close.
 	DisableIndexStore bool
 
 	// DisableIndexRebuild skips automatic index rebuilding when the index
@@ -337,7 +334,7 @@ func (db *DB[K, V]) EnableSync() { db.bolt.NoSync = false }
 //
 // When indexing is disabled:
 //   - Index structures are no longer kept up to date.
-//   - QueryItems, QueryKeys, QueryBitmap and Count will return an error, because the index is considered invalid.
+//   - QueryItems, QueryKeys and Count will return an error, because the index is considered invalid.
 //   - The caller is responsible for rebuilding the index via RebuildIndex before attempting to run queries again.
 //
 // This is intended for high-throughput batch writes where the index will be rebuilt later.
@@ -650,8 +647,11 @@ func (db *DB[K, V]) Set(id K, newVal *V, fns ...PreCommitFunc[K, V]) error {
 // PreCommitFunc fns. If an error is encountered during any of the processing steps,
 // the transaction is rolled back and the error is returned.
 //
-// After a successful commit, the in-memory index state is updated for all
+// After a successful commit, the in-memory index is updated for all
 // modified keys unless indexing is disabled.
+//
+// SetMany allocates a buffer for each encoded value.
+// Storing a large number of values will consume a proportional amount of memory.
 func (db *DB[K, V]) SetMany(ids []K, newVals []*V, fns ...PreCommitFunc[K, V]) error {
 
 	if len(ids) != len(newVals) {
@@ -664,18 +664,36 @@ func (db *DB[K, V]) SetMany(ids []K, newVals []*V, fns ...PreCommitFunc[K, V]) e
 		return db.Set(ids[0], newVals[0], fns...)
 	}
 
+	var getbuf func() *bytes.Buffer
+
+	// bbolt requires that value (bytes) remain valid for the life of the transaction
+
 	bufs := make([]*bytes.Buffer, 0, len(ids))
-	defer func() {
-		for _, buf := range bufs {
-			if buf != nil {
-				releaseEncodeBuf(buf)
+
+	if len(ids) < 1024 {
+		defer func() {
+			for _, buf := range bufs {
+				if buf != nil {
+					releaseEncodeBuf(buf)
+				}
 			}
+		}()
+		getbuf = func() *bytes.Buffer {
+			b := getEncodeBuf()
+			bufs = append(bufs, b)
+			return b
 		}
-	}()
+
+	} else {
+		getbuf = func() *bytes.Buffer {
+			b := new(bytes.Buffer)
+			bufs = append(bufs, b)
+			return b
+		}
+	}
 
 	for _, v := range newVals {
-		b := getEncodeBuf()
-		bufs = append(bufs, b)
+		b := getbuf()
 		if err := db.encode(v, b); err != nil {
 			return err
 		}
@@ -856,14 +874,15 @@ func (db *DB[K, V]) patch(id K, fields []Field, ignoreUnknown bool, fns ...PreCo
 // Any errors during processing aborts the entire batch and rolls back the transaction.
 //
 // Non-existent IDs are skipped.
+//
+// PatchMany allocates a buffer for each encoded value.
+// Patching a large number of values will consume a proportional amount of memory.
 func (db *DB[K, V]) PatchMany(ids []K, patch []Field, fns ...PreCommitFunc[K, V]) error {
 	return db.patchMany(ids, patch, true, fns...)
 }
 
-// PatchManyStrict is like PatchMany, but returns an error if patch contains
-// any field names that cannot be resolved to known struct fields.
-//
-// Non-existent IDs are skipped.
+// PatchManyStrict is like PatchMany, but returns an error if the patch contains field names
+// that cannot be resolved to a known struct field (by name, db or json tag).
 func (db *DB[K, V]) PatchManyStrict(ids []K, patch []Field, fns ...PreCommitFunc[K, V]) error {
 	return db.patchMany(ids, patch, false, fns...)
 }
@@ -877,14 +896,29 @@ func (db *DB[K, V]) patchMany(ids []K, patch []Field, ignoreUnknown bool, fns ..
 		return db.patch(ids[0], patch, ignoreUnknown, fns...)
 	}
 
-	bufs := make([]*bytes.Buffer, 0, len(ids))
-	defer func() {
-		for _, buf := range bufs {
-			if buf != nil {
-				releaseEncodeBuf(buf)
+	var getbuf func() *bytes.Buffer
+
+	// bbolt requires that value (bytes) remain valid for the life of the transaction
+
+	if len(ids) < 1024 {
+
+		bufs := make([]*bytes.Buffer, 0, len(ids))
+		defer func() {
+			for _, buf := range bufs {
+				if buf != nil {
+					releaseEncodeBuf(buf)
+				}
 			}
+		}()
+		getbuf = func() *bytes.Buffer {
+			b := getEncodeBuf()
+			bufs = append(bufs, b)
+			return b
 		}
-	}()
+
+	} else {
+		getbuf = func() *bytes.Buffer { return new(bytes.Buffer) }
+	}
 
 	tx, txerr := db.bolt.Begin(true)
 	if txerr != nil {
@@ -931,12 +965,10 @@ func (db *DB[K, V]) patchMany(ids []K, patch []Field, ignoreUnknown bool, fns ..
 		}
 		newVals[i] = newVal
 
-		b := getEncodeBuf()
-		bufs = append(bufs, b)
+		b := getbuf()
 		if err = db.encode(newVal, b); err != nil {
 			return err
 		}
-
 		if err = bucket.Put(key, b.Bytes()); err != nil {
 			return err
 		}
@@ -1111,7 +1143,7 @@ func (db *DB[K, V]) DeleteMany(ids []K, fns ...PreCommitFunc[K, V]) error {
 // The second return value reports whether the key was successfully resolved.
 // For numeric-key databases this always returns true. For string-key databases
 // it may return false if the index value does not correspond to a known key.
-func (db *DB[K, V]) ToKey(idx uint64) (K, bool) {
+/*func (db *DB[K, V]) ToKey(idx uint64) (K, bool) {
 	if db.strkey {
 		db.strmap.RLock()
 		v, ok := db.strmap.getStringNoLock(idx)
@@ -1119,7 +1151,7 @@ func (db *DB[K, V]) ToKey(idx uint64) (K, bool) {
 		return *(*K)(unsafe.Pointer(&v)), ok
 	}
 	return *(*K)(unsafe.Pointer(&idx)), true
-}
+}*/
 
 // Bolt returns the underlying *bbolt.DB instance used by this DB.
 // Should be used with caution.
