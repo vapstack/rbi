@@ -150,7 +150,6 @@ Query methods:
 
 * `QueryItems(q)` – return matching records
 * `QueryKeys(q)` – return matching IDs
-* `QueryBitmap(expr)` – return a bitmap of matching IDs
 * `Count(q)` – return result cardinality (ignoring offset/limit)
 
 ## Query Execution Model
