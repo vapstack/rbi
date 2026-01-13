@@ -439,7 +439,7 @@ func (db *DB[K, V]) Get(id K) (*V, error) {
 
 	tx, err := db.bolt.Begin(false)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("tx error: %w", err)
 	}
 	defer rollback(tx)
 
@@ -447,7 +447,11 @@ func (db *DB[K, V]) Get(id K) (*V, error) {
 	if v == nil {
 		return nil, nil
 	}
-	return db.decode(v)
+	r, err := db.decode(v)
+	if err != nil {
+		return nil, fmt.Errorf("decode: %w", err)
+	}
+	return r, nil
 }
 
 // GetMany retrieves multiple values by their IDs in a single read transaction.
@@ -461,7 +465,7 @@ func (db *DB[K, V]) GetMany(ids ...K) ([]*V, error) {
 
 	tx, err := db.bolt.Begin(false)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("tx error: %w", err)
 	}
 	defer rollback(tx)
 
@@ -476,7 +480,7 @@ func (db *DB[K, V]) GetMany(ids ...K) ([]*V, error) {
 		}
 		value, e := db.decode(v)
 		if e != nil {
-			return s, e
+			return s, fmt.Errorf("decode: %w", e)
 		}
 		s[i] = value
 	}
@@ -496,7 +500,7 @@ func (db *DB[K, V]) SeqScan(seek K, fn func(K, *V) (bool, error)) error {
 
 	tx, err := db.bolt.Begin(false)
 	if err != nil {
-		return err
+		return fmt.Errorf("tx error: %w", err)
 	}
 	defer rollback(tx)
 
@@ -509,7 +513,7 @@ func (db *DB[K, V]) SeqScan(seek K, fn func(K, *V) (bool, error)) error {
 	}
 	val, err := db.decode(value)
 	if err != nil {
-		return err
+		return fmt.Errorf("decode: %w", err)
 	}
 
 	more, err := fn(db.idFromKey(key), val)
@@ -522,7 +526,7 @@ func (db *DB[K, V]) SeqScan(seek K, fn func(K, *V) (bool, error)) error {
 			return nil
 		}
 		if val, err = db.decode(value); err != nil {
-			return err
+			return fmt.Errorf("decode: %w", err)
 		}
 		if more, err = fn(db.idFromKey(key), val); err != nil {
 			return err
@@ -547,7 +551,7 @@ func (db *DB[K, V]) SeqScanRaw(seek K, fn func(K, []byte) (bool, error)) error {
 
 	tx, err := db.bolt.Begin(false)
 	if err != nil {
-		return err
+		return fmt.Errorf("tx error: %w", err)
 	}
 	defer rollback(tx)
 
@@ -588,7 +592,7 @@ func (db *DB[K, V]) Truncate() error {
 
 	tx, err := db.bolt.Begin(true)
 	if err != nil {
-		return err
+		return fmt.Errorf("tx error: %w", err)
 	}
 	defer rollback(tx)
 
@@ -637,12 +641,12 @@ func (db *DB[K, V]) Set(id K, newVal *V, fns ...PreCommitFunc[K, V]) error {
 	defer releaseEncodeBuf(b)
 
 	if err := db.encode(newVal, b); err != nil {
-		return err
+		return fmt.Errorf("encode: %w", err)
 	}
 
 	tx, err := db.bolt.Begin(true)
 	if err != nil {
-		return err
+		return fmt.Errorf("tx error: %w", err)
 	}
 	defer rollback(tx)
 
@@ -657,14 +661,14 @@ func (db *DB[K, V]) Set(id K, newVal *V, fns ...PreCommitFunc[K, V]) error {
 	var oldVal *V
 	if prev := bucket.Get(key); prev != nil {
 		if oldVal, err = db.decode(prev); err != nil {
-			return err
+			return fmt.Errorf("decode: %w", err)
 		}
 	}
 
 	bucket.FillPercent = BucketFillPercent
 
 	if err = bucket.Put(key, b.Bytes()); err != nil {
-		return err
+		return fmt.Errorf("put: %w", err)
 	}
 
 	for _, fn := range fns {
@@ -748,13 +752,13 @@ func (db *DB[K, V]) SetMany(ids []K, newVals []*V, fns ...PreCommitFunc[K, V]) e
 	for _, v := range newVals {
 		b := getbuf()
 		if err := db.encode(v, b); err != nil {
-			return err
+			return fmt.Errorf("encode: %w", err)
 		}
 	}
 
 	tx, txerr := db.bolt.Begin(true)
 	if txerr != nil {
-		return txerr
+		return fmt.Errorf("tx error: %w", txerr)
 	}
 	defer rollback(tx)
 
@@ -775,13 +779,13 @@ func (db *DB[K, V]) SetMany(ids []K, newVals []*V, fns ...PreCommitFunc[K, V]) e
 		var oldVal *V
 		if prev := bucket.Get(key); prev != nil {
 			if oldVal, err = db.decode(prev); err != nil {
-				return err
+				return fmt.Errorf("decode: %w", err)
 			}
 		}
 		oldVals[i] = oldVal
 
 		if err = bucket.Put(key, bufs[i].Bytes()); err != nil {
-			return err
+			return fmt.Errorf("put: %w", err)
 		}
 	}
 
@@ -885,13 +889,13 @@ func (db *DB[K, V]) patch(id K, fields []Field, ignoreUnknown bool, fns ...PreCo
 	defer releaseEncodeBuf(b)
 
 	if err = db.encode(newVal, b); err != nil {
-		return err
+		return fmt.Errorf("encode: %w", err)
 	}
 
 	bucket.FillPercent = BucketFillPercent
 
 	if err = bucket.Put(key, b.Bytes()); err != nil {
-		return err
+		return fmt.Errorf("put: %w", err)
 	}
 
 	for _, fn := range fns {
@@ -975,7 +979,7 @@ func (db *DB[K, V]) patchMany(ids []K, patch []Field, ignoreUnknown bool, fns ..
 
 	tx, txerr := db.bolt.Begin(true)
 	if txerr != nil {
-		return txerr
+		return fmt.Errorf("tx error: %w", txerr)
 	}
 	defer rollback(tx)
 
@@ -1020,7 +1024,7 @@ func (db *DB[K, V]) patchMany(ids []K, patch []Field, ignoreUnknown bool, fns ..
 
 		b := getbuf()
 		if err = db.encode(newVal, b); err != nil {
-			return err
+			return fmt.Errorf("encode: %w", err)
 		}
 		if err = bucket.Put(key, b.Bytes()); err != nil {
 			return err
@@ -1068,7 +1072,7 @@ func (db *DB[K, V]) Delete(id K, fns ...PreCommitFunc[K, V]) error {
 
 	tx, err := db.bolt.Begin(true)
 	if err != nil {
-		return err
+		return fmt.Errorf("tx error: %w", err)
 	}
 	defer rollback(tx)
 
@@ -1084,12 +1088,12 @@ func (db *DB[K, V]) Delete(id K, fns ...PreCommitFunc[K, V]) error {
 	var oldVal *V
 	if prev := bucket.Get(key); prev != nil {
 		if oldVal, err = db.decode(prev); err != nil {
-			return err
+			return fmt.Errorf("decode: %w", err)
 		}
 	}
 
 	if err = bucket.Delete(key); err != nil {
-		return err
+		return fmt.Errorf("delete: %w", err)
 	}
 
 	for _, fn := range fns {
@@ -1129,7 +1133,7 @@ func (db *DB[K, V]) DeleteMany(ids []K, fns ...PreCommitFunc[K, V]) error {
 
 	tx, txerr := db.bolt.Begin(true)
 	if txerr != nil {
-		return txerr
+		return fmt.Errorf("tx error: %w", txerr)
 	}
 	defer rollback(tx)
 
@@ -1150,13 +1154,13 @@ func (db *DB[K, V]) DeleteMany(ids []K, fns ...PreCommitFunc[K, V]) error {
 		var oldVal *V
 		if prev := bucket.Get(key); prev != nil {
 			if oldVal, err = db.decode(prev); err != nil {
-				return err
+				return fmt.Errorf("decode: %w", err)
 			}
 		}
 		oldVals[i] = oldVal
 
 		if err = bucket.Delete(key); err != nil {
-			return err
+			return fmt.Errorf("delete: %w", err)
 		}
 	}
 
