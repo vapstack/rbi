@@ -575,6 +575,56 @@ func (db *DB[K, V]) SeqScanRaw(seek K, fn func(K, []byte) (bool, error)) error {
 	return nil
 }
 
+// Truncate deletes all values stored in the database. This cannot be undone.
+//
+// Truncate does not reclaim disk space.
+func (db *DB[K, V]) Truncate() error {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+
+	if db.closed.Load() {
+		return ErrClosed
+	}
+
+	tx, err := db.bolt.Begin(true)
+	if err != nil {
+		return err
+	}
+	defer rollback(tx)
+
+	if tx.Bucket(db.bucket) != nil {
+		if err = tx.DeleteBucket(db.bucket); err != nil {
+			return fmt.Errorf("error deleting bucket: %w", err)
+		}
+	}
+
+	if _, err = tx.CreateBucketIfNotExists(db.bucket); err != nil {
+		return fmt.Errorf("error creating bucket: %w", err)
+	}
+
+	if err = tx.Commit(); err != nil {
+		return fmt.Errorf("commit error: %w", err)
+	}
+
+	db.strmap.truncate()
+
+	// for k := range db.index {
+	// 	s := make([]index, 0, initialIndexLen)
+	// 	db.index[k] = &s
+	// }
+	db.index = make(map[string]*[]index)
+
+	// for k := range db.lenIndex {
+	// 	s := make([]index, 0, 8)
+	// 	db.lenIndex[k] = &s
+	// }
+	db.lenIndex = make(map[string]*[]index)
+
+	db.universe.Clear()
+
+	return nil
+}
+
 // Set stores the given value under the specified key ID.
 //
 // The value is msgpack-encoded and written inside a single write
@@ -1182,6 +1232,14 @@ func newStrMapper(size uint64) *strMapper {
 		Keys: make(map[string]uint64, size),
 		Strs: make(map[uint64]string, size),
 	}
+}
+
+func (sm *strMapper) truncate() {
+	sm.Lock()
+	defer sm.Unlock()
+	sm.Next = 0
+	sm.Keys = make(map[string]uint64)
+	sm.Strs = make(map[uint64]string)
 }
 
 func (sm *strMapper) createIdxNoLock(s string) uint64 {

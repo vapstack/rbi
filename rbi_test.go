@@ -1319,3 +1319,120 @@ func TestIndexPersistence(t *testing.T) {
 		t.Fatalf("expected Stats.KeyCount=2, got %d", st.KeyCount)
 	}
 }
+
+func TestTruncate(t *testing.T) {
+	db, _ := openTempDBUint64Unique(t, nil)
+
+	if err := db.Set(1, &UniqueTestRec{Email: "a@x", Code: 1, Tags: []string{"t1"}}); err != nil {
+		t.Fatalf("Set(1): %v", err)
+	}
+	if err := db.Set(2, &UniqueTestRec{Email: "b@x", Code: 2, Tags: []string{"t2"}}); err != nil {
+		t.Fatalf("Set(2): %v", err)
+	}
+
+	if cnt, err := db.Count(nil); err != nil || cnt != 2 {
+		t.Fatalf("Count(before): cnt=%d err=%v", cnt, err)
+	}
+	if ids, err := db.QueryKeys(qx.Query(qx.EQ("email", "a@x"))); err != nil || len(ids) != 1 || ids[0] != 1 {
+		t.Fatalf("QueryKeys(before): ids=%v err=%v", ids, err)
+	}
+
+	// concurrent readers while truncate happens should not panic
+	done := make(chan struct{})
+	errCh := make(chan error, 16)
+
+	var wg sync.WaitGroup
+	reader := func(name string) {
+		defer wg.Done()
+		defer func() {
+			if r := recover(); r != nil {
+				errCh <- fmt.Errorf("panic in %s: %v", name, r)
+			}
+		}()
+		for {
+			select {
+			case <-done:
+				return
+			default:
+			}
+			_, _ = db.Get(1)
+			_, _ = db.GetMany(1, 2, 999)
+
+			_ = db.SeqScan(0, func(_ uint64, _ *UniqueTestRec) (bool, error) { return true, nil })
+			_ = db.SeqScanRaw(0, func(_ uint64, _ []byte) (bool, error) { return true, nil })
+
+			_, _ = db.QueryKeys(&qx.QX{Expr: qx.Expr{Op: qx.OpNOOP}})
+			_, _ = db.Count(nil)
+		}
+	}
+
+	wg.Add(2)
+	go reader("r1")
+	go reader("r2")
+
+	if err := db.Truncate(); err != nil {
+		close(done)
+		wg.Wait()
+		t.Fatalf("Truncate #1: %v", err)
+	}
+	if err := db.Truncate(); err != nil {
+		close(done)
+		wg.Wait()
+		t.Fatalf("Truncate #2: %v", err)
+	}
+
+	close(done)
+	wg.Wait()
+	close(errCh)
+
+	for e := range errCh {
+		t.Errorf("%v", e)
+	}
+	if t.Failed() {
+		t.FailNow()
+	}
+
+	if v, err := db.Get(1); err != nil {
+		t.Fatalf("Get(after): %v", err)
+	} else if v != nil {
+		t.Fatalf("expected Get(1)==nil after truncate, got %#v", v)
+	}
+	if vals, err := db.GetMany(1, 2); err != nil {
+		t.Fatalf("GetMany(after): %v", err)
+	} else if len(vals) != 2 || vals[0] != nil || vals[1] != nil {
+		t.Fatalf("expected GetMany to return [nil nil], got %#v", vals)
+	}
+
+	if cnt, err := db.Count(nil); err != nil {
+		t.Fatalf("Count(after): %v", err)
+	} else if cnt != 0 {
+		t.Fatalf("expected 0 records after truncate, got %d", cnt)
+	}
+	if ids, err := db.QueryKeys(&qx.QX{Expr: qx.Expr{Op: qx.OpNOOP}}); err != nil {
+		t.Fatalf("QueryKeys(NOOP after): %v", err)
+	} else if len(ids) != 0 {
+		t.Fatalf("expected no keys after truncate, got %v", ids)
+	}
+
+	st := db.Stats()
+	if st.KeyCount != 0 {
+		t.Fatalf("expected Stats.KeyCount=0 after truncate, got %d", st.KeyCount)
+	}
+	var zero uint64
+	if st.LastKey != zero {
+		t.Fatalf("expected Stats.LastKey=%v after truncate, got %v", zero, st.LastKey)
+	}
+
+	if err := db.Set(10, &UniqueTestRec{Email: "a@x", Code: 1}); err != nil {
+		t.Fatalf("expected unique values reusable after truncate, got: %v", err)
+	}
+	if err := db.Set(11, &UniqueTestRec{Email: "a@x", Code: 2}); err == nil || !errors.Is(err, ErrUniqueViolation) {
+		t.Fatalf("expected ErrUniqueViolation after truncate+reuse, got: %v", err)
+	}
+
+	if ids, err := db.QueryKeys(qx.Query(qx.EQ("email", "a@x"))); err != nil {
+		t.Fatalf("QueryKeys(after reinsert): %v", err)
+	} else if len(ids) != 1 || ids[0] != 10 {
+		t.Fatalf("expected [10] after reinsert, got %v", ids)
+	}
+}
