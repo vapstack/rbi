@@ -328,7 +328,10 @@ func (db *DB[K, V]) DisableSync() { db.bolt.NoSync = true }
 
 // EnableSync enables fsync for bolt writes. See DisableSync.
 // By default, fsync is enabled.
-func (db *DB[K, V]) EnableSync() { db.bolt.NoSync = false }
+func (db *DB[K, V]) EnableSync() {
+	db.bolt.NoSync = false
+	_ = db.bolt.Sync()
+}
 
 // DisableIndexing disables index updates for subsequent write operations .
 //
