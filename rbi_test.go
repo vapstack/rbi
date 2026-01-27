@@ -21,6 +21,18 @@ type Product struct {
 	Tags  []string `db:"tags"`
 }
 
+func openTempDBStringProduct(t *testing.T) (*DB[string, Product], string) {
+	t.Helper()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test_product.db")
+	db, err := Open[string, Product](path, 0o600, nil)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	return db, path
+}
+
 func openRawBolt(t *testing.T) (*bbolt.DB, string) {
 	t.Helper()
 	dir := t.TempDir()
@@ -427,6 +439,69 @@ func TestLargeBatch_AtomicFailure(t *testing.T) {
 	}
 	if v != nil {
 		t.Fatal("SetMany was not atomic: ID 2 was inserted despite batch failure")
+	}
+}
+
+func TestPatchMany_MissingIDs_CallbacksOnlyForExisting(t *testing.T) {
+	db, _ := openTempDBStringProduct(t)
+
+	if err := db.Set("p1", &Product{SKU: "p1", Price: 10}); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+
+	var called []string
+	cb := func(tx *bbolt.Tx, key string, oldValue, newValue *Product) error {
+		called = append(called, key)
+		return nil
+	}
+
+	err := db.PatchMany([]string{"missing", "p1", "missing2"}, []Field{{Name: "price", Value: 20.0}}, cb)
+	if err != nil {
+		t.Fatalf("PatchMany: %v", err)
+	}
+	if len(called) != 1 || called[0] != "p1" {
+		t.Fatalf("expected callback for p1 only, got: %v", called)
+	}
+
+	v, err := db.Get("p1")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if v == nil || v.Price != 20.0 {
+		t.Fatalf("expected price 20.0, got: %#v", v)
+	}
+}
+
+func TestMissingIDs_DoNotGrowStrMap(t *testing.T) {
+	db, _ := openTempDBStringProduct(t)
+
+	if err := db.Set("p1", &Product{SKU: "p1", Price: 10}); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+
+	db.strmap.RLock()
+	initial := len(db.strmap.Keys)
+	db.strmap.RUnlock()
+
+	if err := db.Patch("missing", []Field{{Name: "price", Value: 1.0}}); !errors.Is(err, ErrRecordNotFound) {
+		t.Fatalf("expected ErrRecordNotFound, got: %v", err)
+	}
+	if err := db.Delete("missing"); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	if err := db.DeleteMany([]string{"missing2", "missing3"}); err != nil {
+		t.Fatalf("DeleteMany: %v", err)
+	}
+	if err := db.PatchMany([]string{"missing4"}, []Field{{Name: "price", Value: 2.0}}); err != nil {
+		t.Fatalf("PatchMany: %v", err)
+	}
+
+	db.strmap.RLock()
+	after := len(db.strmap.Keys)
+	db.strmap.RUnlock()
+
+	if after != initial {
+		t.Fatalf("expected strmap size %d, got %d", initial, after)
 	}
 }
 

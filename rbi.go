@@ -70,6 +70,9 @@ type Options[K ~string | ~uint64, V any] struct {
 //   - May perform additional reads or writes within the same transaction.
 //   - May return an error to abort the operation; in this case the
 //     transaction will be rolled back and index state will not be updated.
+//
+// PreCommitFunc is invoked only for records that exist or are being written.
+// Patch/Delete operations skip missing records and do not invoke callbacks for them.
 type PreCommitFunc[K ~string | ~uint64, V any] = func(tx *bbolt.Tx, key K, oldValue, newValue *V) error
 
 // Field represents a single field assignment used by Patch and PatchMany.
@@ -832,21 +835,32 @@ func (db *DB[K, V]) SetMany(ids []K, newVals []*V, fns ...PreCommitFunc[K, V]) e
 // values to the appropriate field type, if possible.
 // If conversion fails for any field, Patch returns an error and no changes are committed.
 //
-// If no item is found for the specified id, ErrRecordNotFound is returned.
+// If no item is found for the specified id, ErrRecordNotFound is returned
+// and callbacks are not invoked.
 //
 // All PreCommitFunc fns are invoked with the original (old) and patched (new) values
 // before commit. After a successful commit, the in-memory index is updated.
 func (db *DB[K, V]) Patch(id K, patch []Field, fns ...PreCommitFunc[K, V]) error {
-	return db.patch(id, patch, true, fns...)
+	return db.patch(id, patch, true, false, fns...)
 }
 
 // PatchStrict is like Patch, but returns an error if the patch contains field names
 // that cannot be resolved to a known struct field (by name, db or json tag).
 func (db *DB[K, V]) PatchStrict(id K, patch []Field, fns ...PreCommitFunc[K, V]) error {
-	return db.patch(id, patch, false, fns...)
+	return db.patch(id, patch, false, false, fns...)
 }
 
-func (db *DB[K, V]) patch(id K, fields []Field, ignoreUnknown bool, fns ...PreCommitFunc[K, V]) error {
+// PatchIfExists is like Patch, but missing records are skipped.
+func (db *DB[K, V]) PatchIfExists(id K, patch []Field, fns ...PreCommitFunc[K, V]) error {
+	return db.patch(id, patch, true, true, fns...)
+}
+
+// PatchStrictIfExists is like PatchStrict, but missing records are skipped.
+func (db *DB[K, V]) PatchStrictIfExists(id K, patch []Field, fns ...PreCommitFunc[K, V]) error {
+	return db.patch(id, patch, false, true, fns...)
+}
+
+func (db *DB[K, V]) patch(id K, fields []Field, ignoreUnknown bool, allowMissing bool, fns ...PreCommitFunc[K, V]) error {
 
 	if len(fields) == 0 {
 		return nil
@@ -864,13 +878,16 @@ func (db *DB[K, V]) patch(id K, fields []Field, ignoreUnknown bool, fns ...PreCo
 	}
 
 	key := db.keyFromID(id)
-	idx := db.idxFromID(id)
 
 	var oldVal *V
 	oldBytes := bucket.Get(key)
 	if oldBytes == nil {
+		if allowMissing {
+			return nil
+		}
 		return ErrRecordNotFound
 	}
+	idx := db.idxFromID(id)
 
 	if oldVal, err = db.decode(oldBytes); err != nil {
 		return fmt.Errorf("failed to decode existing value: %w", err)
@@ -930,7 +947,7 @@ func (db *DB[K, V]) patch(id K, fields []Field, ignoreUnknown bool, fns ...PreCo
 // Unknown fields are ignored (as in Patch).
 // Any errors during processing aborts the entire batch and rolls back the transaction.
 //
-// Non-existent IDs are skipped.
+// Non-existent IDs are skipped and do not trigger callbacks.
 //
 // PatchMany allocates a buffer for each encoded value.
 // Patching a large number of values will consume a proportional amount of memory.
@@ -950,7 +967,7 @@ func (db *DB[K, V]) patchMany(ids []K, patch []Field, ignoreUnknown bool, fns ..
 		return nil
 	}
 	if len(ids) == 1 {
-		return db.patch(ids[0], patch, ignoreUnknown, fns...)
+		return db.patch(ids[0], patch, ignoreUnknown, true, fns...)
 	}
 
 	var getbuf func() *bytes.Buffer
@@ -983,10 +1000,10 @@ func (db *DB[K, V]) patchMany(ids []K, patch []Field, ignoreUnknown bool, fns ..
 	}
 	defer rollback(tx)
 
-	oldVals := make([]*V, len(ids))
-	newVals := make([]*V, len(ids))
-
-	idxs := db.idxsFromID(ids)
+	oldVals := make([]*V, 0, len(ids))
+	newVals := make([]*V, 0, len(ids))
+	idxs := make([]uint64, 0, len(ids))
+	foundIDs := make([]K, 0, len(ids))
 
 	bucket := tx.Bucket(db.bucket)
 	if bucket == nil {
@@ -995,7 +1012,7 @@ func (db *DB[K, V]) patchMany(ids []K, patch []Field, ignoreUnknown bool, fns ..
 	bucket.FillPercent = BucketFillPercent
 
 	var err error
-	for i, id := range ids {
+	for _, id := range ids {
 		key := db.keyFromID(id)
 
 		oldBytes := bucket.Get(key)
@@ -1011,7 +1028,7 @@ func (db *DB[K, V]) patchMany(ids []K, patch []Field, ignoreUnknown bool, fns ..
 		if oldVal, err = db.decode(oldBytes); err != nil {
 			return fmt.Errorf("failed to decode existing value for id %v: %w", id, err)
 		}
-		oldVals[i] = oldVal
+		oldVals = append(oldVals, oldVal)
 
 		if newVal, err = db.decode(oldBytes); err != nil {
 			return fmt.Errorf("failed to re-decode value for patching id %v: %w", id, err)
@@ -1020,7 +1037,7 @@ func (db *DB[K, V]) patchMany(ids []K, patch []Field, ignoreUnknown bool, fns ..
 		if err = db.applyPatch(newVal, patch, ignoreUnknown); err != nil {
 			return fmt.Errorf("failed to apply patch for id %v: %w", id, err)
 		}
-		newVals[i] = newVal
+		newVals = append(newVals, newVal)
 
 		b := getbuf()
 		if err = db.encode(newVal, b); err != nil {
@@ -1029,10 +1046,17 @@ func (db *DB[K, V]) patchMany(ids []K, patch []Field, ignoreUnknown bool, fns ..
 		if err = bucket.Put(key, b.Bytes()); err != nil {
 			return err
 		}
+
+		idxs = append(idxs, db.idxFromID(id))
+		foundIDs = append(foundIDs, id)
+	}
+
+	if len(foundIDs) == 0 {
+		return nil
 	}
 
 	if len(fns) > 0 {
-		for i, id := range ids {
+		for i, id := range foundIDs {
 			for _, fn := range fns {
 				if fn != nil {
 					if err = fn(tx, id, oldVals[i], newVals[i]); err != nil {
@@ -1068,6 +1092,7 @@ func (db *DB[K, V]) patchMany(ids []K, patch []Field, ignoreUnknown bool, fns ..
 //
 // The existing value (if present) is decoded and passed as oldValue to all
 // PreCommitFunc fns. If any fn returns an error, the operation is aborted.
+// If the record does not exist, Delete is a no-op and no callbacks are invoked.
 func (db *DB[K, V]) Delete(id K, fns ...PreCommitFunc[K, V]) error {
 
 	tx, err := db.bolt.Begin(true)
@@ -1083,14 +1108,17 @@ func (db *DB[K, V]) Delete(id K, fns ...PreCommitFunc[K, V]) error {
 	bucket.FillPercent = BucketFillPercent
 
 	key := db.keyFromID(id)
-	idx := db.idxFromID(id)
 
 	var oldVal *V
 	if prev := bucket.Get(key); prev != nil {
 		if oldVal, err = db.decode(prev); err != nil {
 			return fmt.Errorf("decode: %w", err)
 		}
+	} else {
+		return nil
 	}
+
+	idx := db.idxFromID(id)
 
 	if err = bucket.Delete(key); err != nil {
 		return fmt.Errorf("delete: %w", err)
@@ -1122,6 +1150,7 @@ func (db *DB[K, V]) Delete(id K, fns ...PreCommitFunc[K, V]) error {
 // For each key, any existing value is decoded and passed as oldValue to all
 // PreCommitFunc fns. If an error is encountered during processing,
 // the entire operation is rolled back.
+// Missing IDs are skipped and do not trigger callbacks.
 func (db *DB[K, V]) DeleteMany(ids []K, fns ...PreCommitFunc[K, V]) error {
 
 	if len(ids) == 0 {
@@ -1137,8 +1166,9 @@ func (db *DB[K, V]) DeleteMany(ids []K, fns ...PreCommitFunc[K, V]) error {
 	}
 	defer rollback(tx)
 
-	oldVals := make([]*V, len(ids))
-	idxs := db.idxsFromID(ids)
+	oldVals := make([]*V, 0, len(ids))
+	idxs := make([]uint64, 0, len(ids))
+	foundIDs := make([]K, 0, len(ids))
 
 	bucket := tx.Bucket(db.bucket)
 	if bucket == nil {
@@ -1147,7 +1177,7 @@ func (db *DB[K, V]) DeleteMany(ids []K, fns ...PreCommitFunc[K, V]) error {
 	bucket.FillPercent = BucketFillPercent
 
 	var err error
-	for i, id := range ids {
+	for _, id := range ids {
 
 		key := db.keyFromID(id)
 
@@ -1156,16 +1186,25 @@ func (db *DB[K, V]) DeleteMany(ids []K, fns ...PreCommitFunc[K, V]) error {
 			if oldVal, err = db.decode(prev); err != nil {
 				return fmt.Errorf("decode: %w", err)
 			}
+		} else {
+			continue
 		}
-		oldVals[i] = oldVal
+		oldVals = append(oldVals, oldVal)
 
 		if err = bucket.Delete(key); err != nil {
 			return fmt.Errorf("delete: %w", err)
 		}
+
+		idxs = append(idxs, db.idxFromID(id))
+		foundIDs = append(foundIDs, id)
+	}
+
+	if len(foundIDs) == 0 {
+		return nil
 	}
 
 	if len(fns) > 0 {
-		for i, id := range ids {
+		for i, id := range foundIDs {
 			for _, fn := range fns {
 				if fn != nil {
 					if err = fn(tx, id, oldVals[i], nil); err != nil {
