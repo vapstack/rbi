@@ -171,9 +171,10 @@ func BenchmarkStats(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		s = db.Stats()
 	}
+	b.StopTimer()
 	b.Log(s.KeyCount)
 	b.Log(s.IndexSize)
 	b.Log(s.IndexFieldSize)
@@ -186,7 +187,7 @@ func BenchmarkCount_Simple_EQ_Count(b *testing.B) {
 
 	q := qx.Query(qx.EQ("country", "NL"))
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		_, err := db.Count(q)
 		if err != nil {
 			b.Fatal(err)
@@ -200,7 +201,7 @@ func BenchmarkQueryKeys_Simple_First100(b *testing.B) {
 
 	q := qx.Query().Max(100)
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		_, err := db.QueryKeys(q)
 		if err != nil {
 			b.Fatal(err)
@@ -234,7 +235,7 @@ func BenchmarkQueryKeys_Medium_IN_Limit(b *testing.B) {
 	q := qx.Query(qx.IN("country", []string{"NL", "DE"})).Max(100)
 
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		_, err := db.QueryKeys(q)
 		if err != nil {
 			b.Fatal(err)
@@ -253,7 +254,7 @@ func BenchmarkQueryKeys_Heavy_Range_Order_Limit(b *testing.B) {
 	).By("age", qx.ASC).Max(100)
 
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		_, err := db.QueryKeys(q)
 		if err != nil {
 			b.Fatal(err)
@@ -280,7 +281,7 @@ func BenchmarkQueryKeys_Heavy_All(b *testing.B) {
 		))
 
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		_, err := db.QueryKeys(q)
 		if err != nil {
 			b.Fatal(err)
@@ -300,7 +301,7 @@ func BenchmarkQueryKeys_Realistic_DashboardFilter_Limit(b *testing.B) {
 	).Max(100)
 
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		_, err := db.QueryKeys(q)
 		if err != nil {
 			b.Fatal(err)
@@ -320,7 +321,7 @@ func BenchmarkQueryKeys_Realistic_Analytics_Range_Order_Limit(b *testing.B) {
 	).By("score", qx.DESC).Max(100)
 
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		_, err := db.QueryKeys(q)
 		if err != nil {
 			b.Fatal(err)
@@ -335,7 +336,7 @@ func BenchmarkQueryKeys_Realistic_LeaderBoard(b *testing.B) {
 	q := qx.Query().By("score", qx.DESC).Max(10)
 
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		_, err := db.QueryKeys(q)
 		if err != nil {
 			b.Fatal(err)
@@ -353,7 +354,7 @@ func BenchmarkQueryKeys_Realistic_Permissions_HasAny_Limit(b *testing.B) {
 	).Max(100)
 
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		_, err := db.QueryKeys(q)
 		if err != nil {
 			b.Fatal(err)
@@ -371,7 +372,7 @@ func BenchmarkQueryKeys_Realistic_Permissions_HasAny_All(b *testing.B) {
 	)
 
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		_, err := db.QueryKeys(q)
 		if err != nil {
 			b.Fatal(err)
@@ -389,7 +390,7 @@ func BenchmarkQueryKeys_Realistic_Skills_HasAll_Limit(b *testing.B) {
 	).Max(100)
 
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		_, err := db.QueryKeys(q)
 		if err != nil {
 			b.Fatal(err)
@@ -407,7 +408,7 @@ func BenchmarkQueryKeys_Realistic_Skills_HasAll_All(b *testing.B) {
 	)
 
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		_, err := db.QueryKeys(q)
 		if err != nil {
 			b.Fatal(err)
@@ -427,7 +428,7 @@ func BenchmarkQueryKeys_Realistic_Exclusion_Limit(b *testing.B) {
 	).Max(100)
 
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		_, err := db.QueryKeys(q)
 		if err != nil {
 			b.Fatal(err)
@@ -447,7 +448,7 @@ func BenchmarkQueryKeys_Realistic_Exclusion_All(b *testing.B) {
 	)
 
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		_, err := db.QueryKeys(q)
 		if err != nil {
 			b.Fatal(err)
@@ -462,7 +463,7 @@ func BenchmarkQueryKeys_Realistic_Autocomplete_Prefix_Limit(b *testing.B) {
 	q := qx.Query(qx.PREFIX("email", "user10")).Max(10)
 
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		_, err := db.QueryKeys(q)
 		if err != nil {
 			b.Fatal(err)
@@ -480,7 +481,7 @@ func BenchmarkQueryKeys_Realistic_Autocomplete_Order_Limit(b *testing.B) {
 	).By("email", qx.ASC).Max(10)
 
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		_, err := db.QueryKeys(q)
 		if err != nil {
 			b.Fatal(err)
@@ -499,7 +500,7 @@ func BenchmarkQueryKeys_Realistic_Autocomplete_Complex_Limit(b *testing.B) {
 	).By("score", qx.DESC).Max(10)
 
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		_, err := db.QueryKeys(q)
 		if err != nil {
 			b.Fatal(err)
@@ -522,7 +523,7 @@ func BenchmarkQueryKeys_Realistic_ComplexSegment_Limit(b *testing.B) {
 	).Max(100)
 
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		_, err := db.QueryKeys(q)
 		if err != nil {
 			b.Fatal(err)
@@ -545,7 +546,7 @@ func BenchmarkQueryKeys_Realistic_ComplexSegment_All(b *testing.B) {
 	)
 
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		_, err := db.QueryKeys(q)
 		if err != nil {
 			b.Fatal(err)
@@ -565,7 +566,7 @@ func BenchmarkQueryKeys_Realistic_TopLevel_OR_Limit(b *testing.B) {
 	).Max(100)
 
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		_, err := db.QueryKeys(q)
 		if err != nil {
 			b.Fatal(err)
@@ -585,7 +586,7 @@ func BenchmarkQueryKeys_Realistic_TopLevel_OR_All(b *testing.B) {
 	)
 
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		_, err := db.QueryKeys(q)
 		if err != nil {
 			b.Fatal(err)
@@ -604,7 +605,7 @@ func BenchmarkQueryKeys_Sort_EarlyExit(b *testing.B) {
 	).By("age", qx.ASC).Max(20)
 
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		ids, err := db.QueryKeys(q)
 		if err != nil {
 			b.Fatal(err)
@@ -624,7 +625,7 @@ func BenchmarkQueryKeys_Sort_DeepOffset_Limit(b *testing.B) {
 	).By("score", qx.DESC).Skip(5000).Max(50)
 
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		_, err := db.QueryKeys(q)
 		if err != nil {
 			b.Fatal(err)
@@ -642,7 +643,7 @@ func BenchmarkQueryKeys_Sort_Complex_Order_Limit(b *testing.B) {
 	).By("age", qx.DESC).Max(50)
 
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		_, err := db.QueryKeys(q)
 		if err != nil {
 			b.Fatal(err)
@@ -659,7 +660,7 @@ func BenchmarkQueryKeys_Sort_ArrayPos_Limit(b *testing.B) {
 	q := qx.Query(qx.EQ("status", "active")).ByArrayPos("plan", priority, qx.ASC).Max(50)
 
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		_, err := db.QueryKeys(q)
 		if err != nil {
 			b.Fatal(err)
@@ -676,7 +677,7 @@ func BenchmarkQueryKeys_Sort_ArrayPos_All(b *testing.B) {
 	q := qx.Query(qx.EQ("status", "active")).ByArrayPos("plan", priority, qx.ASC)
 
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		_, err := db.QueryKeys(q)
 		if err != nil {
 			b.Fatal(err)
@@ -691,7 +692,7 @@ func BenchmarkQueryKeys_Sort_ArrayCount_Limit(b *testing.B) {
 	q := qx.Query(qx.EQ("status", "active")).ByArrayCount("roles", qx.DESC).Max(50)
 
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		_, err := db.QueryKeys(q)
 		if err != nil {
 			b.Fatal(err)
@@ -706,7 +707,7 @@ func BenchmarkQueryKeys_Sort_ArrayCount_All(b *testing.B) {
 	q := qx.Query(qx.EQ("status", "active")).ByArrayCount("roles", qx.DESC)
 
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		_, err := db.QueryKeys(q)
 		if err != nil {
 			b.Fatal(err)
@@ -721,7 +722,7 @@ func BenchmarkQueryItems_SimpleFetch(b *testing.B) {
 	q := qx.Query(qx.EQ("country", "US")).By("age", qx.DESC).Max(20)
 
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		_, err := db.QueryItems(q)
 		if err != nil {
 			b.Fatal(err)
@@ -736,10 +737,25 @@ func BenchmarkQueryItems_HeavyFetch(b *testing.B) {
 	q := qx.Query(qx.GTE("age", 20)).By("score", qx.DESC).Max(100)
 
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		_, err := db.QueryItems(q)
 		if err != nil {
 			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkQueryItems_GT_NoMatch(b *testing.B) {
+	db := buildBenchDB(b, benchN)
+
+	q := qx.Query(qx.GT("age", 100))
+
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for b.Loop() {
+		if _, err := db.QueryItems(q); err != nil {
+			b.Fatalf("QueryItems: %v", err)
 		}
 	}
 }
@@ -773,7 +789,7 @@ func BenchmarkMakePatch(b *testing.B) {
 
 	buf := make([]Field, 0, 8)
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		buf = db.MakePatchInto(v1, v2, buf)
 	}
 }
