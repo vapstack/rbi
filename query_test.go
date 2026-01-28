@@ -6,6 +6,7 @@ import (
 	"math"
 	"math/rand"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -779,6 +780,70 @@ func TestStringKeys_BasicQuerySetEquivalence(t *testing.T) {
 	for k := range wantSet {
 		if _, ok := gotSet[k]; !ok {
 			t.Fatalf("missing id %q in result set", k)
+		}
+	}
+}
+
+func TestScanKeysUint64_SeekOrder(t *testing.T) {
+	db, _ := openTempDBUint64(t, nil)
+
+	for i := 1; i <= 5; i++ {
+		r := &Rec{Name: fmt.Sprintf("n%d", i), Age: i}
+		if err := db.Set(uint64(i), r); err != nil {
+			t.Fatalf("Set: %v", err)
+		}
+	}
+
+	var got []uint64
+	err := db.ScanKeys(3, func(id uint64) (bool, error) {
+		got = append(got, id)
+		return true, nil
+	})
+	if err != nil {
+		t.Fatalf("ScanKeys: %v", err)
+	}
+
+	want := []uint64{3, 4, 5}
+	if !slices.Equal(want, got) {
+		t.Fatalf("expected %v, got %v", want, got)
+	}
+}
+
+func TestScanKeysString_Filter(t *testing.T) {
+	db, _ := openTempDBString(t, nil)
+
+	for i := 1; i <= 5; i++ {
+		id := fmt.Sprintf("id-%02d", i)
+		r := &Rec{Name: "x", Age: i}
+		if err := db.Set(id, r); err != nil {
+			t.Fatalf("Set: %v", err)
+		}
+	}
+
+	seek := "id-03"
+	got := make(map[string]struct{})
+	err := db.ScanKeys(seek, func(id string) (bool, error) {
+		if id < seek {
+			t.Fatalf("unexpected id below seek: %v", id)
+		}
+		got[id] = struct{}{}
+		return true, nil
+	})
+	if err != nil {
+		t.Fatalf("ScanKeys: %v", err)
+	}
+
+	want := map[string]struct{}{
+		"id-03": {},
+		"id-04": {},
+		"id-05": {},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("expected %d keys, got %d: %v", len(want), len(got), got)
+	}
+	for id := range want {
+		if _, ok := got[id]; !ok {
+			t.Fatalf("missing key: %v (got=%v)", id, got)
 		}
 	}
 }

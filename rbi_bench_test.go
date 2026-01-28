@@ -208,6 +208,25 @@ func BenchmarkQueryKeys_Simple_First100(b *testing.B) {
 	}
 }
 
+func BenchmarkScanKeys_All_Uint64(b *testing.B) {
+	db := buildBenchDB(b, benchN)
+
+	var count int
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for b.Loop() {
+		count = 0
+		if err := db.ScanKeys(0, func(_ uint64) (bool, error) {
+			count++
+			return true, nil
+		}); err != nil {
+			b.Fatalf("ScanKeys: %v", err)
+		}
+	}
+	b.ReportMetric(float64(count), "keys/op")
+}
+
 func BenchmarkQueryKeys_Medium_IN_Limit(b *testing.B) {
 	db := buildBenchDB(b, benchN)
 	b.ReportAllocs()

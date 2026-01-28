@@ -426,6 +426,16 @@ func (db *DB[K, V]) idxFromKeyNoLock(key []byte) uint64 {
 	return binary.BigEndian.Uint64(key)
 }
 
+func (db *DB[K, V]) keyFromIdx(idx uint64) (K, bool) {
+	if db.strkey {
+		db.strmap.RLock()
+		v, ok := db.strmap.getStringNoLock(idx)
+		db.strmap.RUnlock()
+		return *(*K)(unsafe.Pointer(&v)), ok
+	}
+	return *(*K)(unsafe.Pointer(&idx)), true
+}
+
 func (db *DB[K, V]) lastIDNoLock() K {
 	if db.universe.IsEmpty() {
 		var k K

@@ -23,6 +23,7 @@ var (
 	ErrIndexDisabled   = errors.New("index is disabled")
 	ErrUniqueViolation = errors.New("unique constraint violation")
 	ErrRecordNotFound  = errors.New("record not found")
+	ErrNoValidKeyIndex = errors.New("no valid key for index")
 )
 
 var BucketFillPercent = 0.8
@@ -488,6 +489,50 @@ func (db *DB[K, V]) GetMany(ids ...K) ([]*V, error) {
 		s[i] = value
 	}
 	return s, nil
+}
+
+// ScanKeys iterates over keys in the in-memory index snapshot and calls fn for
+// each key greater than or equal to seek.
+//
+// The scan stops when fn returns false or a non-nil error. The scan does not
+// open a Bolt transaction and may not reflect concurrent writes.
+//
+// For string keys, iteration order follows internal key index order,
+// not lexicographic order; seek is applied only as a prefix filter.
+func (db *DB[K, V]) ScanKeys(seek K, fn func(K) (bool, error)) error {
+	db.mu.RLock()
+	closed := db.closed.Load()
+	noIndex := db.noIndex.Load()
+	universe := db.universe.Clone()
+	db.mu.RUnlock()
+
+	if closed {
+		return ErrClosed
+	}
+	if noIndex {
+		return ErrIndexDisabled
+	}
+
+	iter := universe.Iterator()
+
+	for iter.HasNext() {
+		idx := iter.Next()
+		key, ok := db.keyFromIdx(idx)
+		if !ok {
+			return fmt.Errorf("%w: %v", ErrNoValidKeyIndex, idx)
+		}
+		if key < seek {
+			continue
+		}
+		cont, err := fn(key)
+		if err != nil {
+			return err
+		}
+		if !cont {
+			break
+		}
+	}
+	return nil
 }
 
 // SeqScan performs a sequential scan over all records starting at the given
