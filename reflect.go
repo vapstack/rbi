@@ -369,7 +369,7 @@ func (db *DB[K, V]) getModifiedIndexedFields(v1 *V, v2 *V) []string {
 	rv1 := reflect.ValueOf(v1).Elem()
 	rv2 := reflect.ValueOf(v2).Elem()
 
-	var modified []string
+	modified := make([]string, 0, len(db.fields))
 	for _, f := range db.fields {
 
 		fv1 := rv1.FieldByIndex(f.Index)
@@ -385,17 +385,6 @@ func (db *DB[K, V]) getModifiedIndexedFields(v1 *V, v2 *V) []string {
 					sv2 := fv2.Index(i)
 
 					if f.UseVI {
-						// if canNil(f.Kind) {
-						// 	sv1nil := sv1.IsNil()
-						// 	sv2nil := sv2.IsNil()
-						// 	if sv1nil != sv2nil {
-						// 		modified = append(modified, f.DBName)
-						// 		break
-						// 	}
-						// 	if sv1nil && sv2nil {
-						// 		continue
-						// 	}
-						// }
 						if sv1.Interface().(ValueIndexer).IndexingValue() != sv2.Interface().(ValueIndexer).IndexingValue() {
 							modified = append(modified, f.DBName)
 							break
@@ -441,17 +430,6 @@ func (db *DB[K, V]) getModifiedIndexedFields(v1 *V, v2 *V) []string {
 		}
 
 		if f.UseVI {
-			// if canNil(f.Kind) {
-			// 	fv1nil := fv1.IsNil()
-			// 	fv2nil := fv2.IsNil()
-			// 	if fv1nil != fv2nil {
-			// 		modified = append(modified, f.DBName)
-			// 		continue
-			// 	}
-			// 	if fv1nil && fv2nil {
-			// 		continue
-			// 	}
-			// }
 			if fv1.Interface().(ValueIndexer).IndexingValue() != fv2.Interface().(ValueIndexer).IndexingValue() {
 				modified = append(modified, f.DBName)
 			}
@@ -733,8 +711,25 @@ func deepCopyValue(src any) any {
 	if src == nil {
 		return nil
 	}
-	visited := make(map[uintptr]reflect.Value)
 	origin := reflect.ValueOf(src)
+
+	for origin.Kind() == reflect.Interface {
+		if origin.IsNil() {
+			return nil
+		}
+		origin = origin.Elem()
+	}
+
+	switch origin.Kind() {
+	case reflect.Bool, reflect.String,
+		reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr,
+		reflect.Float32, reflect.Float64,
+		reflect.Complex64, reflect.Complex128:
+		return origin.Interface()
+	}
+
+	visited := make(map[uintptr]reflect.Value)
 	clone := deepCopy(origin, visited)
 	return clone.Interface()
 }

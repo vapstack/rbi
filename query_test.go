@@ -4,8 +4,9 @@ import (
 	"errors"
 	"fmt"
 	"math"
-	"math/rand"
+	"math/rand/v2"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"sort"
 	"strings"
@@ -67,7 +68,7 @@ func openTempDBString(t *testing.T, opts *Options[string, Rec]) (*DB[string, Rec
 func seedData(t *testing.T, db *DB[uint64, Rec], n int) []uint64 {
 	t.Helper()
 
-	r := rand.New(rand.NewSource(1))
+	r := newRand(1)
 	ids := make([]uint64, 0, n)
 
 	countries := []string{"NL", "PL", "DE", "Finland", "Iceland", "Thailand", "Switzerland"}
@@ -88,12 +89,12 @@ func seedData(t *testing.T, db *DB[uint64, Rec], n int) []uint64 {
 			opt = &s
 		}
 		rec := &Rec{
-			Meta:     Meta{Country: countries[r.Intn(len(countries))]},
-			Name:     names[r.Intn(len(names))],
-			Age:      18 + r.Intn(50),
+			Meta:     Meta{Country: countries[r.IntN(len(countries))]},
+			Name:     names[r.IntN(len(names))],
+			Age:      18 + r.IntN(50),
 			Score:    math.Round((r.Float64()*100.0)*100) / 100,
-			Active:   r.Intn(2) == 0,
-			Tags:     append([]string(nil), tagsPool[r.Intn(len(tagsPool))]...), // clone slice
+			Active:   r.IntN(2) == 0,
+			Tags:     append([]string(nil), tagsPool[r.IntN(len(tagsPool))]...), // clone slice
 			FullName: "FN-" + fmt.Sprintf("%02d", i),
 			Opt:      opt,
 		}
@@ -876,7 +877,7 @@ func TestRace_ConcurrentReadersAndWriters(t *testing.T) {
 				}
 			}()
 
-			r := rand.New(rand.NewSource(seed))
+			r := newRand(seed)
 			for {
 				select {
 				case <-stop:
@@ -884,18 +885,18 @@ func TestRace_ConcurrentReadersAndWriters(t *testing.T) {
 				default:
 				}
 
-				id := uint64(1 + r.Intn(250))
-				op := r.Intn(3)
+				id := uint64(1 + r.IntN(250))
+				op := r.IntN(3)
 
 				switch op {
 				case 0:
 					rec := &Rec{
 						Meta:     Meta{Country: "NL"},
-						Name:     []string{"alice", "bob", "carol"}[r.Intn(3)],
-						Age:      18 + r.Intn(60),
+						Name:     []string{"alice", "bob", "carol"}[r.IntN(3)],
+						Age:      18 + r.IntN(60),
 						Score:    r.Float64() * 100,
-						Active:   r.Intn(2) == 0,
-						Tags:     []string{"go", "java", "ops"}[:1+r.Intn(3)],
+						Active:   r.IntN(2) == 0,
+						Tags:     []string{"go", "java", "ops"}[:1+r.IntN(3)],
 						FullName: "FN",
 					}
 					if err := db.Set(id, rec); err != nil {
@@ -904,7 +905,7 @@ func TestRace_ConcurrentReadersAndWriters(t *testing.T) {
 					}
 
 				case 1:
-					patch := []Field{{Name: "age", Value: float64(20 + r.Intn(50))}}
+					patch := []Field{{Name: "age", Value: float64(20 + r.IntN(50))}}
 					if err := db.Patch(id, patch); err != nil && !errors.Is(err, ErrRecordNotFound) {
 						reportErr(fmt.Errorf("writer patch error: %w", err))
 						return
@@ -930,7 +931,7 @@ func TestRace_ConcurrentReadersAndWriters(t *testing.T) {
 				}
 			}()
 
-			r := rand.New(rand.NewSource(seed))
+			r := newRand(seed)
 
 			qs := []*qx.QX{
 				qx.Query(qx.GT("age", 30)),
@@ -951,7 +952,7 @@ func TestRace_ConcurrentReadersAndWriters(t *testing.T) {
 				default:
 				}
 
-				q := qs[r.Intn(len(qs))]
+				q := qs[r.IntN(len(qs))]
 
 				items, err := db.QueryItems(q)
 				if err != nil {
@@ -1575,4 +1576,718 @@ func TestQuery_SortWithNegativeResult_NoDuplicates(t *testing.T) {
 		t.Fatalf("expectedKeysUint64: %v", err)
 	}
 	assertSameSlice(t, got, want)
+}
+
+/**/
+
+type plannerVariantSet struct{}
+
+func runQueryKeysWithVariant(
+	t *testing.T,
+	db *DB[uint64, Rec],
+	q *qx.QX,
+	_ plannerVariantSet,
+) []uint64 {
+	t.Helper()
+
+	ids, err := db.QueryKeys(q)
+	if err != nil {
+		t.Fatalf("QueryKeys(%+v): %v", q, err)
+	}
+	return ids
+}
+
+func assertQueryIDsEqual(t *testing.T, q *qx.QX, a, b []uint64) {
+	t.Helper()
+	if queryIDsEqual(q, a, b) {
+		return
+	}
+	if len(q.Order) > 0 {
+		t.Fatalf("ordered results mismatch:\nA=%v\nB=%v", a, b)
+		return
+	}
+	sa := sortedIDs(a)
+	sb := sortedIDs(b)
+	t.Fatalf("unordered set mismatch:\nA=%v\nB=%v", sa, sb)
+}
+
+func queryIDsEqual(q *qx.QX, a, b []uint64) bool {
+	if q == nil {
+		return slices.Equal(a, b)
+	}
+	if len(q.Order) > 0 {
+		return slices.Equal(a, b)
+	}
+
+	sa := sortedIDs(a)
+	sb := sortedIDs(b)
+	return slices.Equal(sa, sb)
+}
+
+func cloneQuery(q *qx.QX) *qx.QX {
+	if q == nil {
+		return nil
+	}
+	out := *q
+	if len(q.Order) > 0 {
+		out.Order = append([]qx.Order(nil), q.Order...)
+	}
+	return &out
+}
+
+func normalizeQueryForTest(q *qx.QX) *qx.QX {
+	n := cloneQuery(q)
+	n = normalizeQuery(n)
+	return n
+}
+
+func wrapExprWithNoise(e qx.Expr, mode int) qx.Expr {
+	switch mode % 4 {
+	case 0:
+		// e AND true
+		return qx.Expr{
+			Op: qx.OpAND,
+			Operands: []qx.Expr{
+				e,
+				{Op: qx.OpNOOP},
+			},
+		}
+	case 1:
+		// e OR false
+		return qx.Expr{
+			Op: qx.OpOR,
+			Operands: []qx.Expr{
+				e,
+				{Op: qx.OpNOOP, Not: true},
+			},
+		}
+	case 2:
+		// (true AND e) AND true
+		return qx.Expr{
+			Op: qx.OpAND,
+			Operands: []qx.Expr{
+				{
+					Op: qx.OpAND,
+					Operands: []qx.Expr{
+						{Op: qx.OpNOOP},
+						e,
+					},
+				},
+				{Op: qx.OpNOOP},
+			},
+		}
+	default:
+		// e OR (false OR false)
+		return qx.Expr{
+			Op: qx.OpOR,
+			Operands: []qx.Expr{
+				e,
+				{
+					Op: qx.OpOR,
+					Operands: []qx.Expr{
+						{Op: qx.OpNOOP, Not: true},
+						{Op: qx.OpNOOP, Not: true},
+					},
+				},
+			},
+		}
+	}
+}
+
+func withNoisyEquivalentQuery(q *qx.QX, noiseMode int) *qx.QX {
+	out := cloneQuery(q)
+	out.Expr = wrapExprWithNoise(q.Expr, noiseMode)
+	return out
+}
+
+func TestStep8_Metamorphic_NormalizeAndPlanVariants(t *testing.T) {
+	db, _ := openTempDBUint64(t, &Options[uint64, Rec]{AnalyzeInterval: -1})
+	_ = seedData(t, db, 20_000)
+
+	variantA := plannerVariantSet{}
+	variantB := plannerVariantSet{}
+
+	tests := []struct {
+		name string
+		q    *qx.QX
+	}{
+		{
+			name: "OR_Order_Offset",
+			q: qx.Query(
+				qx.OR(
+					qx.AND(
+						qx.EQ("active", true),
+						qx.IN("country", []string{"NL", "DE", "PL"}),
+						qx.GTE("score", 30.0),
+					),
+					qx.AND(
+						qx.PREFIX("full_name", "FN-1"),
+						qx.NOTIN("country", []string{"Thailand"}),
+						qx.GTE("age", 20),
+					),
+					qx.AND(
+						qx.HASANY("tags", []string{"go", "db"}),
+						qx.NE("name", "alice"),
+					),
+				),
+			).By("score", qx.DESC).Skip(300).Max(120),
+		},
+		{
+			name: "AND_NoOrder_Complex",
+			q: qx.Query(
+				qx.EQ("active", true),
+				qx.NOTIN("country", []string{"NL", "PL"}),
+				qx.HASANY("tags", []string{"go", "ops"}),
+				qx.GTE("age", 22),
+			),
+		},
+		{
+			name: "AutocompleteLike",
+			q: qx.Query(
+				qx.PREFIX("full_name", "FN-1"),
+				qx.EQ("active", true),
+				qx.NOTIN("country", []string{"NL"}),
+			).By("score", qx.DESC).Max(80),
+		},
+		{
+			name: "OrderRange",
+			q: qx.Query(
+				qx.GTE("age", 25),
+				qx.LTE("age", 40),
+				qx.GT("score", 20.0),
+			).By("score", qx.DESC).Skip(100).Max(90),
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			base := runQueryKeysWithVariant(t, db, tc.q, variantA)
+			normalizedQ := normalizeQueryForTest(tc.q)
+			normalized := runQueryKeysWithVariant(t, db, normalizedQ, variantA)
+			assertQueryIDsEqual(t, tc.q, base, normalized)
+
+			noisyQ := withNoisyEquivalentQuery(tc.q, len(tc.name))
+			noisy := runQueryKeysWithVariant(t, db, noisyQ, variantA)
+			assertQueryIDsEqual(t, tc.q, base, noisy)
+
+			other := runQueryKeysWithVariant(t, db, tc.q, variantB)
+			assertQueryIDsEqual(t, tc.q, base, other)
+		})
+	}
+}
+
+type step8DataProfile struct {
+	name        string
+	scoreLevels int
+	activeTrue  float64
+	hotCountryP float64
+	hotTagP     float64
+}
+
+func seedDataProfileStep8(t *testing.T, db *DB[uint64, Rec], n int, p step8DataProfile) {
+	t.Helper()
+
+	r := newRand(173 + int64(n) + int64(p.scoreLevels)*11)
+	countries := []string{"NL", "PL", "DE", "Finland", "Iceland", "Thailand", "Switzerland", "US", "JP"}
+	names := []string{"alice", "albert", "bob", "bobby", "carol", "dave", "eve", "zoe", "nik"}
+	tagPool := []string{"go", "db", "ops", "rust", "java", "ml", "devops", "api", "infra"}
+
+	for i := 1; i <= n; i++ {
+		country := countries[r.IntN(len(countries))]
+		if r.Float64() < p.hotCountryP {
+			country = "NL"
+		}
+
+		active := r.Float64() < p.activeTrue
+		name := names[r.IntN(len(names))]
+		age := 18 + r.IntN(55)
+
+		scoreBase := 0
+		if p.scoreLevels > 0 {
+			scoreBase = r.IntN(p.scoreLevels)
+		}
+		scoreJitter := r.Float64() * 0.001
+		score := float64(scoreBase) + scoreJitter
+		if p.scoreLevels <= 1 {
+			score = math.Round((r.Float64()*100.0)*100) / 100
+		}
+
+		tagCount := 1 + r.IntN(3)
+		if r.Float64() > p.hotTagP {
+			tagCount = 1 + r.IntN(2)
+		}
+		tags := make([]string, 0, tagCount)
+		if r.Float64() < p.hotTagP {
+			tags = append(tags, "go")
+		}
+		for len(tags) < tagCount {
+			tags = append(tags, tagPool[r.IntN(len(tagPool))])
+		}
+
+		rec := &Rec{
+			Meta:     Meta{Country: country},
+			Name:     name,
+			Email:    fmt.Sprintf("%s-%d@example.test", name, i),
+			Age:      age,
+			Score:    score,
+			Active:   active,
+			Tags:     tags,
+			FullName: fmt.Sprintf("FN-%05d", i),
+		}
+
+		if i%7 == 0 {
+			s := fmt.Sprintf("opt-%d", i)
+			rec.Opt = &s
+		}
+
+		if err := db.Set(uint64(i), rec); err != nil {
+			t.Fatalf("Set(%d): %v", i, err)
+		}
+	}
+}
+
+func randomLeafStep8(r *rand.Rand) qx.Expr {
+	switch r.IntN(8) {
+	case 0:
+		return qx.EQ("active", r.IntN(2) == 0)
+	case 1:
+		countries := []string{"NL", "PL", "DE", "Finland", "Iceland", "Thailand", "US"}
+		return qx.IN("country", []string{
+			countries[r.IntN(len(countries))],
+			countries[r.IntN(len(countries))],
+		})
+	case 2:
+		countries := []string{"NL", "PL", "DE", "Finland", "Iceland", "Thailand", "US"}
+		return qx.NOTIN("country", []string{
+			countries[r.IntN(len(countries))],
+			countries[r.IntN(len(countries))],
+		})
+	case 3:
+		return qx.GTE("age", 18+r.IntN(30))
+	case 4:
+		return qx.LTE("age", 30+r.IntN(35))
+	case 5:
+		tags := []string{"go", "db", "ops", "rust", "java", "infra"}
+		return qx.HASANY("tags", []string{
+			tags[r.IntN(len(tags))],
+			tags[r.IntN(len(tags))],
+		})
+	case 6:
+		return qx.PREFIX("full_name", fmt.Sprintf("FN-%d", 1+r.IntN(3)))
+	default:
+		return qx.GT("score", float64(r.IntN(40)))
+	}
+}
+
+func randomAndExprStep8(r *rand.Rand, leafN int) qx.Expr {
+	if leafN < 1 {
+		leafN = 1
+	}
+	ops := make([]qx.Expr, 0, leafN)
+	for i := 0; i < leafN; i++ {
+		ops = append(ops, randomLeafStep8(r))
+	}
+	if len(ops) == 1 {
+		return ops[0]
+	}
+	return qx.Expr{
+		Op:       qx.OpAND,
+		Operands: ops,
+	}
+}
+
+func randomQueryStep8(r *rand.Rand) *qx.QX {
+	var expr qx.Expr
+	if r.IntN(100) < 35 {
+		branchN := 2 + r.IntN(2)
+		branches := make([]qx.Expr, 0, branchN)
+		for i := 0; i < branchN; i++ {
+			branches = append(branches, randomAndExprStep8(r, 1+r.IntN(3)))
+		}
+		expr = qx.Expr{
+			Op:       qx.OpOR,
+			Operands: branches,
+		}
+	} else {
+		expr = randomAndExprStep8(r, 1+r.IntN(4))
+	}
+
+	q := &qx.QX{
+		Expr: expr,
+	}
+	if r.IntN(100) < 55 {
+		q.Offset = uint64(r.IntN(120))
+		q.Limit = uint64(20 + r.IntN(120))
+		if r.IntN(100) < 75 {
+			q.Order = []qx.Order{
+				{
+					Field: "score",
+					Desc:  r.IntN(2) == 0,
+					Type:  qx.OrderBasic,
+				},
+			}
+		} else {
+			q.Order = []qx.Order{
+				{
+					Field: "age",
+					Desc:  r.IntN(2) == 0,
+					Type:  qx.OrderBasic,
+				},
+			}
+		}
+		if r.IntN(100) < 25 {
+			q.Offset = uint64(250 + r.IntN(400))
+		}
+	} else {
+		// For no-order queries, avoid LIMIT/OFFSET semantics while comparing
+		// different planner toggles; validate full matching set equivalence.
+		q.Offset = 0
+		q.Limit = 0
+	}
+	return q
+}
+
+func TestStep8_RandomizedProfiles_PlanVariantEquivalence(t *testing.T) {
+	profiles := []step8DataProfile{
+		{
+			name:        "Uniform",
+			scoreLevels: 50_000,
+			activeTrue:  0.50,
+			hotCountryP: 0.15,
+			hotTagP:     0.30,
+		},
+		{
+			name:        "Skewed",
+			scoreLevels: 30_000,
+			activeTrue:  0.88,
+			hotCountryP: 0.75,
+			hotTagP:     0.85,
+		},
+		{
+			name:        "HighCardOrder",
+			scoreLevels: 100_000,
+			activeTrue:  0.52,
+			hotCountryP: 0.20,
+			hotTagP:     0.35,
+		},
+		{
+			name:        "LowCardOrder",
+			scoreLevels: 16,
+			activeTrue:  0.55,
+			hotCountryP: 0.30,
+			hotTagP:     0.50,
+		},
+	}
+
+	variantA := plannerVariantSet{}
+	variantB := plannerVariantSet{}
+
+	for pi := range profiles {
+		p := profiles[pi]
+		t.Run(p.name, func(t *testing.T) {
+			db, _ := openTempDBUint64(t, &Options[uint64, Rec]{AnalyzeInterval: -1})
+			seedDataProfileStep8(t, db, 8_000, p)
+
+			r := newRand(777 + int64(pi)*1000)
+			const queryCount = 70
+
+			for i := 0; i < queryCount; i++ {
+				q := randomQueryStep8(r)
+
+				baseA := runQueryKeysWithVariant(t, db, q, variantA)
+				baseB := runQueryKeysWithVariant(t, db, q, variantB)
+
+				nq := normalizeQueryForTest(q)
+				normalizedA := runQueryKeysWithVariant(t, db, nq, variantA)
+				if !queryIDsEqual(q, baseA, normalizedA) {
+					t.Fatalf(
+						"variantA normalize mismatch (profile=%s, i=%d):\nq=%+v\nnq=%+v\nbase=%v\nnorm=%v",
+						p.name, i, q, nq, baseA, normalizedA,
+					)
+				}
+				normalizedB := runQueryKeysWithVariant(t, db, nq, variantB)
+				if !queryIDsEqual(q, baseB, normalizedB) {
+					t.Fatalf(
+						"variantB normalize mismatch (profile=%s, i=%d):\nq=%+v\nnq=%+v\nbase=%v\nnorm=%v",
+						p.name, i, q, nq, baseB, normalizedB,
+					)
+				}
+
+				noisyA := runQueryKeysWithVariant(t, db, withNoisyEquivalentQuery(q, i), variantA)
+				assertQueryIDsEqual(t, q, baseA, noisyA)
+				noisyB := runQueryKeysWithVariant(t, db, withNoisyEquivalentQuery(q, i), variantB)
+				assertQueryIDsEqual(t, q, baseB, noisyB)
+
+				// When no ORDER/LIMIT/OFFSET is used, both variants should
+				// resolve to equivalent full-set semantics.
+				if len(q.Order) == 0 && q.Limit == 0 && q.Offset == 0 {
+					assertQueryIDsEqual(t, q, baseA, baseB)
+				}
+			}
+		})
+	}
+}
+
+/**/
+
+func capturedNotInOrderOffsetQuery() *qx.QX {
+	return qx.Query(
+		qx.NOTIN("country", []string{"Iceland", "Finland"}),
+		qx.NOTIN("country", []string{"Iceland", "DE"}),
+	).By("score", qx.ASC).Skip(446).Max(70)
+}
+
+func openStep8SkewedDB(t *testing.T) *DB[uint64, Rec] {
+	t.Helper()
+	db, _ := openTempDBUint64(t, &Options[uint64, Rec]{AnalyzeInterval: -1})
+	seedDataProfileStep8(t, db, 8_000, step8DataProfile{
+		name:        "Skewed",
+		scoreLevels: 30_000,
+		activeTrue:  0.88,
+		hotCountryP: 0.75,
+		hotTagP:     0.85,
+	})
+	return db
+}
+
+func notInVariantMatrix() []struct {
+	name string
+	ts   plannerVariantSet
+} {
+	return []struct {
+		name string
+		ts   plannerVariantSet
+	}{
+		{
+			name: "variant_a",
+			ts:   plannerVariantSet{},
+		},
+		{
+			name: "variant_b",
+			ts:   plannerVariantSet{},
+		},
+		{
+			name: "variant_c",
+			ts:   plannerVariantSet{},
+		},
+		{
+			name: "variant_d",
+			ts:   plannerVariantSet{},
+		},
+	}
+}
+
+func assertNotInQueryEqualAcrossVariantMatrix(t *testing.T, q *qx.QX) {
+	t.Helper()
+
+	cases := notInVariantMatrix()
+	var ref []uint64
+
+	for i := range cases {
+		db := openStep8SkewedDB(t)
+		got := runQueryKeysWithVariant(t, db, q, cases[i].ts)
+		if i == 0 {
+			ref = got
+			continue
+		}
+		if !slices.Equal(ref, got) {
+			t.Fatalf("route mismatch case=%s:\nref=%v\ngot=%v", cases[i].name, ref, got)
+		}
+	}
+}
+
+func TestRegression_NotInOrderOffset_VariantMatrix(t *testing.T) {
+	tests := []struct {
+		name string
+		q    *qx.QX
+	}{
+		{
+			name: "captured_shape",
+			q:    capturedNotInOrderOffsetQuery(),
+		},
+		{
+			name: "different_values",
+			q: qx.Query(
+				qx.NOTIN("country", []string{"DE", "PL"}),
+				qx.NOTIN("country", []string{"Thailand", "US"}),
+			).By("score", qx.ASC).Skip(210).Max(90),
+		},
+		{
+			name: "desc_order",
+			q: qx.Query(
+				qx.NOTIN("country", []string{"Iceland", "Finland"}),
+				qx.NOTIN("country", []string{"Iceland", "DE"}),
+			).By("score", qx.DESC).Skip(446).Max(70),
+		},
+		{
+			name: "without_offset",
+			q: qx.Query(
+				qx.NOTIN("country", []string{"Iceland", "Finland"}),
+				qx.NOTIN("country", []string{"Iceland", "DE"}),
+			).By("score", qx.ASC).Max(70),
+		},
+	}
+
+	for i := range tests {
+		t.Run(tests[i].name, func(t *testing.T) {
+			assertNotInQueryEqualAcrossVariantMatrix(t, tests[i].q)
+		})
+	}
+}
+
+func TestRegression_NotInOrderOffset_NoStateCorruption(t *testing.T) {
+	db := openStep8SkewedDB(t)
+	q := capturedNotInOrderOffsetQuery()
+
+	variantA := plannerVariantSet{}
+	variantB := plannerVariantSet{}
+
+	before := runQueryKeysWithVariant(t, db, q, variantA)
+	mid := runQueryKeysWithVariant(t, db, q, variantB)
+	after := runQueryKeysWithVariant(t, db, q, variantA)
+
+	if !slices.Equal(before, after) {
+		t.Fatalf("variant results changed after interleaved query:\nbefore=%v\nmid=%v\nafter=%v", before, mid, after)
+	}
+}
+
+/**/
+
+func TestNormalizeExpr_OrFalseCollapsesToLeaf(t *testing.T) {
+	leaf := qx.Expr{Op: qx.OpGTE, Field: "age", Value: 21}
+	in := qx.Expr{
+		Op: qx.OpOR,
+		Operands: []qx.Expr{
+			leaf,
+			{Op: qx.OpNOOP, Not: true},
+		},
+	}
+
+	out, changed := normalizeExpr(in)
+	if !changed {
+		t.Fatalf("expected changed=true")
+	}
+	if !reflect.DeepEqual(out, leaf) {
+		t.Fatalf("unexpected normalize result:\n got=%+v\nwant=%+v", out, leaf)
+	}
+}
+
+func TestNormalizeExpr_DeMorganForNotAnd(t *testing.T) {
+	in := qx.Expr{
+		Op:  qx.OpAND,
+		Not: true,
+		Operands: []qx.Expr{
+			{Op: qx.OpEQ, Field: "active", Value: true},
+			{Op: qx.OpIN, Field: "country", Value: []string{"DE", "NL"}},
+		},
+	}
+
+	out, changed := normalizeExpr(in)
+	if !changed {
+		t.Fatalf("expected changed=true")
+	}
+
+	want := qx.Expr{
+		Op: qx.OpOR,
+		Operands: []qx.Expr{
+			{Op: qx.OpEQ, Field: "active", Value: true, Not: true},
+			{Op: qx.OpIN, Field: "country", Value: []string{"DE", "NL"}, Not: true},
+		},
+	}
+
+	if !reflect.DeepEqual(out, want) {
+		t.Fatalf("unexpected normalize result:\n got=%+v\nwant=%+v", out, want)
+	}
+}
+
+func TestNormalizeExpr_FlattensAndNoopNoise(t *testing.T) {
+	leafA := qx.Expr{Op: qx.OpEQ, Field: "active", Value: true}
+	leafB := qx.Expr{Op: qx.OpIN, Field: "country", Value: []string{"DE", "NL"}}
+
+	in := qx.Expr{
+		Op: qx.OpAND,
+		Operands: []qx.Expr{
+			{Op: qx.OpNOOP},
+			{
+				Op: qx.OpAND,
+				Operands: []qx.Expr{
+					leafA,
+					{Op: qx.OpNOOP},
+				},
+			},
+			leafB,
+		},
+	}
+
+	out, changed := normalizeExpr(in)
+	if !changed {
+		t.Fatalf("expected changed=true")
+	}
+
+	want := qx.Expr{
+		Op: qx.OpAND,
+		Operands: []qx.Expr{
+			leafA,
+			leafB,
+		},
+	}
+
+	if !reflect.DeepEqual(out, want) {
+		t.Fatalf("unexpected normalize result:\n got=%+v\nwant=%+v", out, want)
+	}
+}
+
+func TestNormalizeExpr_DoubleNotEliminates(t *testing.T) {
+	leaf := qx.Expr{Op: qx.OpEQ, Field: "age", Value: 33}
+	in := qx.Expr{
+		Op:  qx.OpOR,
+		Not: true,
+		Operands: []qx.Expr{
+			{Op: qx.OpAND, Not: true, Operands: []qx.Expr{leaf}},
+		},
+	}
+
+	out, changed := normalizeExpr(in)
+	if !changed {
+		t.Fatalf("expected changed=true")
+	}
+	if !reflect.DeepEqual(out, leaf) {
+		t.Fatalf("unexpected normalize result:\n got=%+v\nwant=%+v", out, leaf)
+	}
+}
+
+func TestNormalize_WrappedQueryMatchesDirectResults(t *testing.T) {
+	db, _ := openTempDBUint64(t, nil)
+	_ = seedData(t, db, 10_000)
+
+	direct := qx.Query(
+		qx.GTE("age", 18),
+		qx.EQ("active", true),
+	).By("score", qx.DESC).Skip(500).Max(100)
+
+	wrapped := &qx.QX{
+		Expr: qx.Expr{
+			Op: qx.OpOR,
+			Operands: []qx.Expr{
+				direct.Expr,
+				{Op: qx.OpNOOP, Not: true},
+			},
+		},
+		Order:  direct.Order,
+		Offset: direct.Offset,
+		Limit:  direct.Limit,
+	}
+
+	gotDirect, err := db.QueryKeys(direct)
+	if err != nil {
+		t.Fatalf("QueryKeys(direct): %v", err)
+	}
+	gotWrapped, err := db.QueryKeys(wrapped)
+	if err != nil {
+		t.Fatalf("QueryKeys(wrapped): %v", err)
+	}
+
+	if !slices.Equal(gotWrapped, gotDirect) {
+		t.Fatalf("results mismatch:\n wrapped=%v\n direct=%v", gotWrapped, gotDirect)
+	}
 }

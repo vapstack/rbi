@@ -1,7 +1,6 @@
 package rbi
 
 import (
-	"bytes"
 	"errors"
 	"fmt"
 	"log"
@@ -60,6 +59,36 @@ type Options[K ~string | ~uint64, V any] struct {
 	// BoltOptions are forwarded to bbolt.Open when using Open. They are
 	// ignored by Wrap, which operates on an already opened *bbolt.DB.
 	BoltOptions *bbolt.Options
+
+	// AnalyzeInterval configures how often planner statistics should be
+	// refreshed in the background. A zero value means "use default",
+	// while a negative value disables periodic refresh.
+	AnalyzeInterval time.Duration
+
+	// TraceSink receives optional per-query planner tracing events.
+	// If nil, planner tracing is disabled.
+	TraceSink func(TraceEvent)
+
+	// TraceSampleEvery controls trace sampling:
+	//   - 0: when sink is set, sample every query (equivalent to 1)
+	//   - 1: sample every query
+	//   - N>1: sample every Nth query
+	TraceSampleEvery uint64
+
+	// CalibrationEnabled enables online self-calibration of planner
+	// cost coefficients using sampled query traces.
+	CalibrationEnabled bool
+
+	// CalibrationSampleEvery controls calibration sampling:
+	//   - 0: use default sampling interval
+	//   - 1: calibrate every query
+	//   - N>1: calibrate every Nth query
+	// The value is ignored when CalibrationEnabled is false.
+	CalibrationSampleEvery uint64
+
+	// CalibrationPersistPath enables optional auto load/save of planner
+	// calibration state from/to this JSON file.
+	CalibrationPersistPath string
 }
 
 // PreCommitFunc is a callback invoked inside the write transaction just before
@@ -147,9 +176,31 @@ func Wrap[K ~uint64 | ~string, V any](bolt *bbolt.DB, options *Options[K, V]) (*
 		rbiFile: bolt.Path() + "." + sanitizeSuffix(vname) + ".rbi",
 		opnFile: bolt.Path() + "." + sanitizeSuffix(vname) + ".rbo",
 
+		pool: sync.Pool{
+			New: func() any {
+				return new(V)
+			},
+		},
+
 		noSave: options.DisableIndexStore,
 
 		autoclose: options.AutoClose,
+
+		planner: planner{
+			analyzer: analyzer{
+				interval:   resolvePlannerAnalyzeInterval(options.AnalyzeInterval),
+				softBudget: defaultAnalyzeSoftBudget,
+			},
+			tracer: tracer{
+				sink:        options.TraceSink,
+				sampleEvery: resolveTraceSampleEvery(options.TraceSampleEvery, options.TraceSink),
+			},
+			calibrator: calibrator{
+				enabled:     options.CalibrationEnabled,
+				sampleEvery: resolveCalibrationSampleEvery(options.CalibrationEnabled, options.CalibrationSampleEvery),
+				persistPath: options.CalibrationPersistPath,
+			},
+		},
 	}
 
 	var k K
@@ -213,11 +264,21 @@ func Wrap[K ~uint64 | ~string, V any](bolt *bbolt.DB, options *Options[K, V]) (*
 		db.fieldSlice = append(db.fieldSlice, name)
 	}
 
+	if err = db.RefreshPlannerStats(); err != nil {
+		_ = bolt.Close()
+		unregInstance(boltPath, vname)
+		return nil, fmt.Errorf("failed to build planner stats snapshot: %w", err)
+	}
+
+	db.initCalibration()
+
 	if err = touch(db.opnFile); err != nil {
 		_ = bolt.Close()
 		unregInstance(boltPath, vname)
 		return nil, fmt.Errorf("error creating flag-file: %w", err)
 	}
+
+	db.startPlannerAnalyzeLoop()
 
 	return db, nil
 }
@@ -259,6 +320,41 @@ func Open[K ~uint64 | ~string, V any](filename string, mode os.FileMode, options
 	return db, err
 }
 
+type planner struct {
+	statsVersion atomic.Uint64
+	stats        atomic.Pointer[PlannerStatsSnapshot]
+
+	analyzer   analyzer
+	tracer     tracer
+	calibrator calibrator
+}
+
+type analyzer struct {
+	interval   time.Duration
+	stop       chan struct{}
+	done       chan struct{}
+	softBudget time.Duration
+	cursor     int
+
+	sync.Mutex
+}
+
+type tracer struct {
+	sink        func(TraceEvent)
+	sampleEvery uint64
+	seq         atomic.Uint64
+}
+
+type calibrator struct {
+	enabled     bool
+	sampleEvery uint64
+	seq         atomic.Uint64
+	state       atomic.Pointer[calibration]
+	persistPath string
+
+	sync.Mutex
+}
+
 type (
 	// DB wraps a bbolt database and maintains secondary indexes over values of type *V
 	// stored in a single bucket. It supports efficient equality and range queries,
@@ -288,6 +384,8 @@ type (
 		rbiFile string
 		opnFile string
 
+		pool sync.Pool
+
 		mu     sync.RWMutex
 		closed atomic.Bool
 
@@ -297,6 +395,8 @@ type (
 		autoclose bool
 
 		stats Stats[K]
+
+		planner planner
 	}
 	index struct {
 		Key string
@@ -361,10 +461,16 @@ func (db *DB[K, V]) RebuildIndex() error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 
-	return db.buildIndex(nil)
+	if err := db.buildIndex(nil); err != nil {
+		return err
+	}
+
+	db.refreshPlannerStatsLocked()
+	return nil
 }
 
 // Stats returns basic information about the index, load times and key space.
+// On large databases Stats can be slow.
 func (db *DB[K, V]) Stats() Stats[K] {
 	db.mu.RLock()
 	defer db.mu.RUnlock()
@@ -401,13 +507,14 @@ func (db *DB[K, V]) Stats() Stats[K] {
 // Subsequent calls to Close are no-op.
 // After Close, all other methods return ErrClosed.
 func (db *DB[K, V]) Close() error {
-
-	db.mu.Lock()
-	defer db.mu.Unlock()
-
 	if !db.closed.CompareAndSwap(false, true) {
 		return nil
 	}
+
+	db.stopAnalyzeLoop()
+
+	db.mu.Lock()
+	defer db.mu.Unlock()
 
 	unregInstance(db.bolt.Path(), string(db.bucket))
 
@@ -415,6 +522,14 @@ func (db *DB[K, V]) Close() error {
 
 	if !db.noSave {
 		err = db.storeIndex()
+	}
+
+	if e := db.persistCalibrationOnClose(); e != nil {
+		if err == nil {
+			err = e
+		} else {
+			log.Println("rbi: failed to persist planner calibration:", e)
+		}
 	}
 
 	if e := os.Remove(db.opnFile); e != nil {
@@ -432,199 +547,6 @@ func (db *DB[K, V]) Close() error {
 	}
 
 	return err
-}
-
-// Get returns the value stored by id or nil if key was not found.
-func (db *DB[K, V]) Get(id K) (*V, error) {
-
-	if db.closed.Load() {
-		return nil, ErrClosed
-	}
-
-	tx, err := db.bolt.Begin(false)
-	if err != nil {
-		return nil, fmt.Errorf("tx error: %w", err)
-	}
-	defer rollback(tx)
-
-	v := tx.Bucket(db.bucket).Get(db.keyFromID(id))
-	if v == nil {
-		return nil, nil
-	}
-	r, err := db.decode(v)
-	if err != nil {
-		return nil, fmt.Errorf("decode: %w", err)
-	}
-	return r, nil
-}
-
-// GetMany retrieves multiple values by their IDs in a single read transaction.
-// The returned slice has the same length as ids; any missing keys have a nil
-// entry at the corresponding index.
-func (db *DB[K, V]) GetMany(ids ...K) ([]*V, error) {
-
-	if db.closed.Load() {
-		return nil, ErrClosed
-	}
-
-	tx, err := db.bolt.Begin(false)
-	if err != nil {
-		return nil, fmt.Errorf("tx error: %w", err)
-	}
-	defer rollback(tx)
-
-	bucket := tx.Bucket(db.bucket)
-
-	s := make([]*V, len(ids))
-
-	for i, id := range ids {
-		v := bucket.Get(db.keyFromID(id))
-		if v == nil {
-			continue
-		}
-		value, e := db.decode(v)
-		if e != nil {
-			return s, fmt.Errorf("decode: %w", e)
-		}
-		s[i] = value
-	}
-	return s, nil
-}
-
-// ScanKeys iterates over keys in the in-memory index snapshot and calls fn for
-// each key greater than or equal to seek.
-//
-// The scan stops when fn returns false or a non-nil error. The scan does not
-// open a Bolt transaction and may not reflect concurrent writes.
-//
-// For string keys, iteration order follows internal key index order,
-// not lexicographic order; seek is applied only as a prefix filter.
-func (db *DB[K, V]) ScanKeys(seek K, fn func(K) (bool, error)) error {
-	db.mu.RLock()
-	closed := db.closed.Load()
-	noIndex := db.noIndex.Load()
-	universe := db.universe.Clone()
-	db.mu.RUnlock()
-
-	if closed {
-		return ErrClosed
-	}
-	if noIndex {
-		return ErrIndexDisabled
-	}
-
-	iter := universe.Iterator()
-
-	for iter.HasNext() {
-		idx := iter.Next()
-		key, ok := db.keyFromIdx(idx)
-		if !ok {
-			return fmt.Errorf("%w: %v", ErrNoValidKeyIndex, idx)
-		}
-		if key < seek {
-			continue
-		}
-		cont, err := fn(key)
-		if err != nil {
-			return err
-		}
-		if !cont {
-			break
-		}
-	}
-	return nil
-}
-
-// SeqScan performs a sequential scan over all records starting at the given
-// key (inclusive), decoding each value and passing it to the provided fn.
-// SeqScan stops reading when the fn returns false or a non-nil error.
-// The scan runs inside a read-only transaction which remains open for the
-// duration of the scan.
-func (db *DB[K, V]) SeqScan(seek K, fn func(K, *V) (bool, error)) error {
-
-	if db.closed.Load() {
-		return ErrClosed
-	}
-
-	tx, err := db.bolt.Begin(false)
-	if err != nil {
-		return fmt.Errorf("tx error: %w", err)
-	}
-	defer rollback(tx)
-
-	b := tx.Bucket(db.bucket)
-	c := b.Cursor()
-
-	key, value := c.Seek(db.keyFromID(seek))
-	if key == nil {
-		return nil
-	}
-	val, err := db.decode(value)
-	if err != nil {
-		return fmt.Errorf("decode: %w", err)
-	}
-
-	more, err := fn(db.idFromKey(key), val)
-	if err != nil {
-		return err
-	}
-	for more {
-		key, value = c.Next()
-		if key == nil {
-			return nil
-		}
-		if val, err = db.decode(value); err != nil {
-			return fmt.Errorf("decode: %w", err)
-		}
-		if more, err = fn(db.idFromKey(key), val); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-// SeqScanRaw performs a sequential scan over all records starting at the
-// given key (inclusive), passing raw bytes to the provided fn.
-// These bytes are msgpack-encoded representation of the values.
-//
-// SeqScanRaw stops reading when the provided fn returns false or a non-nil error.
-// The database transaction remains open during the scan.
-//
-// Bytes passed to fn must not be modified.
-func (db *DB[K, V]) SeqScanRaw(seek K, fn func(K, []byte) (bool, error)) error {
-
-	if db.closed.Load() {
-		return ErrClosed
-	}
-
-	tx, err := db.bolt.Begin(false)
-	if err != nil {
-		return fmt.Errorf("tx error: %w", err)
-	}
-	defer rollback(tx)
-
-	b := tx.Bucket(db.bucket)
-	c := b.Cursor()
-
-	key, value := c.Seek(db.keyFromID(seek))
-	if key == nil {
-		return nil
-	}
-
-	more, err := fn(db.idFromKey(key), value)
-	if err != nil {
-		return err
-	}
-	for more {
-		key, value = c.Next()
-		if key == nil {
-			return nil
-		}
-		if more, err = fn(db.idFromKey(key), value); err != nil {
-			return err
-		}
-	}
-	return nil
 }
 
 // Truncate deletes all values stored in the database. This cannot be undone.
@@ -677,622 +599,18 @@ func (db *DB[K, V]) Truncate() error {
 	return nil
 }
 
-// Set stores the given value under the specified key ID.
+// ReleaseRecords returns records to the record pool.
 //
-// The value is msgpack-encoded and written inside a single write
-// transaction. Any existing value for the key is decoded and passed as oldValue
-// to all PreCommitFunc fns. If any fn returns an error, the
-// transaction is rolled back and the error is returned.
-func (db *DB[K, V]) Set(id K, newVal *V, fns ...PreCommitFunc[K, V]) error {
-
-	b := getEncodeBuf()
-	defer releaseEncodeBuf(b)
-
-	if err := db.encode(newVal, b); err != nil {
-		return fmt.Errorf("encode: %w", err)
-	}
-
-	tx, err := db.bolt.Begin(true)
-	if err != nil {
-		return fmt.Errorf("tx error: %w", err)
-	}
-	defer rollback(tx)
-
-	key := db.keyFromID(id)
-	idx := db.idxFromID(id)
-
-	bucket := tx.Bucket(db.bucket)
-	if bucket == nil {
-		return fmt.Errorf("bucket does not exist")
-	}
-
-	var oldVal *V
-	if prev := bucket.Get(key); prev != nil {
-		if oldVal, err = db.decode(prev); err != nil {
-			return fmt.Errorf("decode: %w", err)
+// Make sure that the passed records are no longer used or held.
+func (db *DB[K, V]) ReleaseRecords(v ...*V) {
+	var zero V
+	for _, rec := range v {
+		if rec != nil {
+			*rec = zero
+			db.pool.Put(rec)
 		}
 	}
-
-	bucket.FillPercent = BucketFillPercent
-
-	if err = bucket.Put(key, b.Bytes()); err != nil {
-		return fmt.Errorf("put: %w", err)
-	}
-
-	for _, fn := range fns {
-		if fn != nil {
-			if err = fn(tx, id, oldVal, newVal); err != nil {
-				return err
-			}
-		}
-	}
-
-	db.mu.Lock()
-	defer db.mu.Unlock()
-
-	if db.closed.Load() {
-		return ErrClosed
-	}
-
-	modified := db.getModifiedIndexedFields(oldVal, newVal)
-
-	if db.hasUnique {
-		if err = db.checkUniqueOnWrite(idx, newVal, modified); err != nil {
-			return err
-		}
-	}
-
-	return db.setIndexOnSuccess(tx.Commit(), idx, oldVal, newVal, modified)
 }
-
-// SetMany stores multiple values under the provided IDs in a single write
-// transaction. The length of the ids and values must be equal.
-//
-// For each key, any existing value is decoded and passed as oldValue to all
-// PreCommitFunc fns. If an error is encountered during any of the processing steps,
-// the transaction is rolled back and the error is returned.
-//
-// After a successful commit, the in-memory index is updated for all
-// modified keys unless indexing is disabled.
-//
-// SetMany allocates a buffer for each encoded value.
-// Storing a large number of values will consume a proportional amount of memory.
-func (db *DB[K, V]) SetMany(ids []K, newVals []*V, fns ...PreCommitFunc[K, V]) error {
-
-	if len(ids) != len(newVals) {
-		return fmt.Errorf("different slice lengths")
-	}
-	if len(ids) == 0 {
-		return nil
-	}
-	if len(ids) == 1 {
-		return db.Set(ids[0], newVals[0], fns...)
-	}
-
-	var getbuf func() *bytes.Buffer
-
-	// bbolt requires that value (bytes) remain valid for the life of the transaction
-
-	bufs := make([]*bytes.Buffer, 0, len(ids))
-
-	if len(ids) < 1024 {
-		defer func() {
-			for _, buf := range bufs {
-				if buf != nil {
-					releaseEncodeBuf(buf)
-				}
-			}
-		}()
-		getbuf = func() *bytes.Buffer {
-			b := getEncodeBuf()
-			bufs = append(bufs, b)
-			return b
-		}
-
-	} else {
-		getbuf = func() *bytes.Buffer {
-			b := new(bytes.Buffer)
-			bufs = append(bufs, b)
-			return b
-		}
-	}
-
-	for _, v := range newVals {
-		b := getbuf()
-		if err := db.encode(v, b); err != nil {
-			return fmt.Errorf("encode: %w", err)
-		}
-	}
-
-	tx, txerr := db.bolt.Begin(true)
-	if txerr != nil {
-		return fmt.Errorf("tx error: %w", txerr)
-	}
-	defer rollback(tx)
-
-	oldVals := make([]*V, len(ids))
-	idxs := db.idxsFromID(ids)
-
-	bucket := tx.Bucket(db.bucket)
-	if bucket == nil {
-		return fmt.Errorf("bucket does not exist")
-	}
-	bucket.FillPercent = BucketFillPercent
-
-	var err error
-	for i, id := range ids {
-
-		key := db.keyFromID(id)
-
-		var oldVal *V
-		if prev := bucket.Get(key); prev != nil {
-			if oldVal, err = db.decode(prev); err != nil {
-				return fmt.Errorf("decode: %w", err)
-			}
-		}
-		oldVals[i] = oldVal
-
-		if err = bucket.Put(key, bufs[i].Bytes()); err != nil {
-			return fmt.Errorf("put: %w", err)
-		}
-	}
-
-	if len(fns) > 0 {
-		for i, id := range ids {
-			for _, fn := range fns {
-				if fn != nil {
-					if err = fn(tx, id, oldVals[i], newVals[i]); err != nil {
-						return err
-					}
-				}
-			}
-		}
-	}
-
-	/**/
-
-	db.mu.Lock()
-	defer db.mu.Unlock()
-
-	if db.closed.Load() {
-		return ErrClosed
-	}
-
-	modified := make([][]string, len(idxs))
-	for i := range idxs {
-		modified[i] = db.getModifiedIndexedFields(oldVals[i], newVals[i])
-	}
-
-	if db.hasUnique {
-		if err = db.checkUniqueOnWriteMulti(idxs, oldVals, newVals, modified); err != nil {
-			return err
-		}
-	}
-
-	return db.setIndexOnSuccessMulti(tx.Commit(), idxs, oldVals, newVals, modified)
-}
-
-// Patch applies a partial update to the value stored under the given id,
-// updating only the fields listed in patch.
-//
-// Unknown field names in patch are silently ignored. All fields, indexed or
-// not, are eligible to be patched. Patch attempts to convert the provided
-// values to the appropriate field type, if possible.
-// If conversion fails for any field, Patch returns an error and no changes are committed.
-//
-// If no item is found for the specified id, ErrRecordNotFound is returned
-// and callbacks are not invoked.
-//
-// All PreCommitFunc fns are invoked with the original (old) and patched (new) values
-// before commit. After a successful commit, the in-memory index is updated.
-func (db *DB[K, V]) Patch(id K, patch []Field, fns ...PreCommitFunc[K, V]) error {
-	return db.patch(id, patch, true, false, fns...)
-}
-
-// PatchStrict is like Patch, but returns an error if the patch contains field names
-// that cannot be resolved to a known struct field (by name, db or json tag).
-func (db *DB[K, V]) PatchStrict(id K, patch []Field, fns ...PreCommitFunc[K, V]) error {
-	return db.patch(id, patch, false, false, fns...)
-}
-
-// PatchIfExists is like Patch, but missing records are skipped.
-func (db *DB[K, V]) PatchIfExists(id K, patch []Field, fns ...PreCommitFunc[K, V]) error {
-	return db.patch(id, patch, true, true, fns...)
-}
-
-// PatchStrictIfExists is like PatchStrict, but missing records are skipped.
-func (db *DB[K, V]) PatchStrictIfExists(id K, patch []Field, fns ...PreCommitFunc[K, V]) error {
-	return db.patch(id, patch, false, true, fns...)
-}
-
-func (db *DB[K, V]) patch(id K, fields []Field, ignoreUnknown bool, allowMissing bool, fns ...PreCommitFunc[K, V]) error {
-
-	if len(fields) == 0 {
-		return nil
-	}
-
-	tx, err := db.bolt.Begin(true)
-	if err != nil {
-		return err
-	}
-	defer rollback(tx)
-
-	bucket := tx.Bucket(db.bucket)
-	if bucket == nil {
-		return fmt.Errorf("bucket does not exist")
-	}
-
-	key := db.keyFromID(id)
-
-	var oldVal *V
-	oldBytes := bucket.Get(key)
-	if oldBytes == nil {
-		if allowMissing {
-			return nil
-		}
-		return ErrRecordNotFound
-	}
-	idx := db.idxFromID(id)
-
-	if oldVal, err = db.decode(oldBytes); err != nil {
-		return fmt.Errorf("failed to decode existing value: %w", err)
-	}
-
-	newVal, err := db.decode(oldBytes)
-	if err != nil {
-		return fmt.Errorf("failed to re-decode value for patching: %w", err)
-	}
-
-	if err = db.applyPatch(newVal, fields, ignoreUnknown); err != nil {
-		return fmt.Errorf("failed to apply patch: %w", err)
-	}
-
-	b := getEncodeBuf()
-	defer releaseEncodeBuf(b)
-
-	if err = db.encode(newVal, b); err != nil {
-		return fmt.Errorf("encode: %w", err)
-	}
-
-	bucket.FillPercent = BucketFillPercent
-
-	if err = bucket.Put(key, b.Bytes()); err != nil {
-		return fmt.Errorf("put: %w", err)
-	}
-
-	for _, fn := range fns {
-		if fn != nil {
-			if err = fn(tx, id, oldVal, newVal); err != nil {
-				return err
-			}
-		}
-	}
-
-	db.mu.Lock()
-	defer db.mu.Unlock()
-
-	if db.closed.Load() {
-		return ErrClosed
-	}
-
-	modified := db.getModifiedIndexedFields(oldVal, newVal)
-
-	if db.hasUnique {
-		if err = db.checkUniqueOnWrite(idx, newVal, modified); err != nil {
-			return err
-		}
-	}
-
-	return db.setIndexOnSuccess(tx.Commit(), idx, oldVal, newVal, modified)
-}
-
-// PatchMany applies the same patch to all values stored under the given IDs
-// in a single write transaction.
-//
-// Unknown fields are ignored (as in Patch).
-// Any errors during processing aborts the entire batch and rolls back the transaction.
-//
-// Non-existent IDs are skipped and do not trigger callbacks.
-//
-// PatchMany allocates a buffer for each encoded value.
-// Patching a large number of values will consume a proportional amount of memory.
-func (db *DB[K, V]) PatchMany(ids []K, patch []Field, fns ...PreCommitFunc[K, V]) error {
-	return db.patchMany(ids, patch, true, fns...)
-}
-
-// PatchManyStrict is like PatchMany, but returns an error if the patch contains field names
-// that cannot be resolved to a known struct field (by name, db or json tag).
-func (db *DB[K, V]) PatchManyStrict(ids []K, patch []Field, fns ...PreCommitFunc[K, V]) error {
-	return db.patchMany(ids, patch, false, fns...)
-}
-
-func (db *DB[K, V]) patchMany(ids []K, patch []Field, ignoreUnknown bool, fns ...PreCommitFunc[K, V]) error {
-
-	if len(ids) == 0 || len(patch) == 0 {
-		return nil
-	}
-	if len(ids) == 1 {
-		return db.patch(ids[0], patch, ignoreUnknown, true, fns...)
-	}
-
-	var getbuf func() *bytes.Buffer
-
-	// bbolt requires that value (bytes) remain valid for the life of the transaction
-
-	if len(ids) < 1024 {
-
-		bufs := make([]*bytes.Buffer, 0, len(ids))
-		defer func() {
-			for _, buf := range bufs {
-				if buf != nil {
-					releaseEncodeBuf(buf)
-				}
-			}
-		}()
-		getbuf = func() *bytes.Buffer {
-			b := getEncodeBuf()
-			bufs = append(bufs, b)
-			return b
-		}
-
-	} else {
-		getbuf = func() *bytes.Buffer { return new(bytes.Buffer) }
-	}
-
-	tx, txerr := db.bolt.Begin(true)
-	if txerr != nil {
-		return fmt.Errorf("tx error: %w", txerr)
-	}
-	defer rollback(tx)
-
-	oldVals := make([]*V, 0, len(ids))
-	newVals := make([]*V, 0, len(ids))
-	idxs := make([]uint64, 0, len(ids))
-	foundIDs := make([]K, 0, len(ids))
-
-	bucket := tx.Bucket(db.bucket)
-	if bucket == nil {
-		return fmt.Errorf("bucket does not exist")
-	}
-	bucket.FillPercent = BucketFillPercent
-
-	var err error
-	for _, id := range ids {
-		key := db.keyFromID(id)
-
-		oldBytes := bucket.Get(key)
-		if oldBytes == nil {
-			continue
-			// return fmt.Errorf("item with id %v does not exist", id)
-		}
-
-		var (
-			oldVal *V
-			newVal *V
-		)
-		if oldVal, err = db.decode(oldBytes); err != nil {
-			return fmt.Errorf("failed to decode existing value for id %v: %w", id, err)
-		}
-		oldVals = append(oldVals, oldVal)
-
-		if newVal, err = db.decode(oldBytes); err != nil {
-			return fmt.Errorf("failed to re-decode value for patching id %v: %w", id, err)
-		}
-
-		if err = db.applyPatch(newVal, patch, ignoreUnknown); err != nil {
-			return fmt.Errorf("failed to apply patch for id %v: %w", id, err)
-		}
-		newVals = append(newVals, newVal)
-
-		b := getbuf()
-		if err = db.encode(newVal, b); err != nil {
-			return fmt.Errorf("encode: %w", err)
-		}
-		if err = bucket.Put(key, b.Bytes()); err != nil {
-			return err
-		}
-
-		idxs = append(idxs, db.idxFromID(id))
-		foundIDs = append(foundIDs, id)
-	}
-
-	if len(foundIDs) == 0 {
-		return nil
-	}
-
-	if len(fns) > 0 {
-		for i, id := range foundIDs {
-			for _, fn := range fns {
-				if fn != nil {
-					if err = fn(tx, id, oldVals[i], newVals[i]); err != nil {
-						return err
-					}
-				}
-			}
-		}
-	}
-
-	db.mu.Lock()
-	defer db.mu.Unlock()
-
-	if db.closed.Load() {
-		return ErrClosed
-	}
-
-	modified := make([][]string, len(idxs))
-	for i := range idxs {
-		modified[i] = db.getModifiedIndexedFields(oldVals[i], newVals[i])
-	}
-
-	if db.hasUnique {
-		if err = db.checkUniqueOnWriteMulti(idxs, oldVals, newVals, modified); err != nil {
-			return err
-		}
-	}
-
-	return db.setIndexOnSuccessMulti(tx.Commit(), idxs, oldVals, newVals, modified)
-}
-
-// Delete removes the value stored under the given id, if any.
-//
-// The existing value (if present) is decoded and passed as oldValue to all
-// PreCommitFunc fns. If any fn returns an error, the operation is aborted.
-// If the record does not exist, Delete is a no-op and no callbacks are invoked.
-func (db *DB[K, V]) Delete(id K, fns ...PreCommitFunc[K, V]) error {
-
-	tx, err := db.bolt.Begin(true)
-	if err != nil {
-		return fmt.Errorf("tx error: %w", err)
-	}
-	defer rollback(tx)
-
-	bucket := tx.Bucket(db.bucket)
-	if bucket == nil {
-		return fmt.Errorf("bucket does not exist")
-	}
-	bucket.FillPercent = BucketFillPercent
-
-	key := db.keyFromID(id)
-
-	var oldVal *V
-	if prev := bucket.Get(key); prev != nil {
-		if oldVal, err = db.decode(prev); err != nil {
-			return fmt.Errorf("decode: %w", err)
-		}
-	} else {
-		return nil
-	}
-
-	idx := db.idxFromID(id)
-
-	if err = bucket.Delete(key); err != nil {
-		return fmt.Errorf("delete: %w", err)
-	}
-
-	for _, fn := range fns {
-		if fn != nil {
-			if err = fn(tx, id, oldVal, nil); err != nil {
-				return err
-			}
-		}
-	}
-
-	db.mu.Lock()
-	defer db.mu.Unlock()
-
-	if db.closed.Load() {
-		return ErrClosed
-	}
-
-	modified := db.getModifiedIndexedFields(oldVal, nil)
-
-	return db.setIndexOnSuccess(tx.Commit(), idx, oldVal, nil, modified)
-}
-
-// DeleteMany removes all values stored under the provided ids in a single
-// write transaction.
-//
-// For each key, any existing value is decoded and passed as oldValue to all
-// PreCommitFunc fns. If an error is encountered during processing,
-// the entire operation is rolled back.
-// Missing IDs are skipped and do not trigger callbacks.
-func (db *DB[K, V]) DeleteMany(ids []K, fns ...PreCommitFunc[K, V]) error {
-
-	if len(ids) == 0 {
-		return nil
-	}
-	if len(ids) == 1 {
-		return db.Delete(ids[0], fns...)
-	}
-
-	tx, txerr := db.bolt.Begin(true)
-	if txerr != nil {
-		return fmt.Errorf("tx error: %w", txerr)
-	}
-	defer rollback(tx)
-
-	oldVals := make([]*V, 0, len(ids))
-	idxs := make([]uint64, 0, len(ids))
-	foundIDs := make([]K, 0, len(ids))
-
-	bucket := tx.Bucket(db.bucket)
-	if bucket == nil {
-		return fmt.Errorf("bucket does not exist")
-	}
-	bucket.FillPercent = BucketFillPercent
-
-	var err error
-	for _, id := range ids {
-
-		key := db.keyFromID(id)
-
-		var oldVal *V
-		if prev := bucket.Get(key); prev != nil {
-			if oldVal, err = db.decode(prev); err != nil {
-				return fmt.Errorf("decode: %w", err)
-			}
-		} else {
-			continue
-		}
-		oldVals = append(oldVals, oldVal)
-
-		if err = bucket.Delete(key); err != nil {
-			return fmt.Errorf("delete: %w", err)
-		}
-
-		idxs = append(idxs, db.idxFromID(id))
-		foundIDs = append(foundIDs, id)
-	}
-
-	if len(foundIDs) == 0 {
-		return nil
-	}
-
-	if len(fns) > 0 {
-		for i, id := range foundIDs {
-			for _, fn := range fns {
-				if fn != nil {
-					if err = fn(tx, id, oldVals[i], nil); err != nil {
-						return err
-					}
-				}
-			}
-		}
-	}
-
-	db.mu.Lock()
-	defer db.mu.Unlock()
-
-	if db.closed.Load() {
-		return ErrClosed
-	}
-
-	return db.setIndexOnSuccessMulti(tx.Commit(), idxs, oldVals, nil, nil)
-}
-
-// ToKey converts an internal bitmap index value into the corresponding user key.
-//
-// QueryBitmap returns a bitmap containing internal record identifiers.
-// When the database uses numeric keys (uint64), these identifiers are the keys
-// themselves. When the database uses string keys, the identifiers are internal
-// indices and must be translated back to user-facing keys.
-//
-// ToKey performs this translation. It is primarily intended for advanced use
-// cases where the caller iterates over a bitmap returned by QueryBitmap and
-// needs to map bitmap entries back to actual record keys.
-//
-// The second return value reports whether the key was successfully resolved.
-// For numeric-key databases this always returns true. For string-key databases
-// it may return false if the index value does not correspond to a known key.
-/*func (db *DB[K, V]) ToKey(idx uint64) (K, bool) {
-	if db.strkey {
-		db.strmap.RLock()
-		v, ok := db.strmap.getStringNoLock(idx)
-		db.strmap.RUnlock()
-		return *(*K)(unsafe.Pointer(&v)), ok
-	}
-	return *(*K)(unsafe.Pointer(&idx)), true
-}*/
 
 // Bolt returns the underlying *bbolt.DB instance used by this DB.
 // Should be used with caution.
@@ -1304,8 +622,6 @@ func (db *DB[K, V]) Bolt() *bbolt.DB {
 func (db *DB[K, V]) BucketName() []byte {
 	return slices.Clone(db.bucket)
 }
-
-/**/
 
 type strMapper struct {
 	Next uint64

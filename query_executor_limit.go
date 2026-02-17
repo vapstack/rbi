@@ -1,8 +1,6 @@
 package rbi
 
 import (
-	"strings"
-
 	"github.com/RoaringBitmap/roaring/v2/roaring64"
 	"github.com/vapstack/qx"
 )
@@ -18,30 +16,56 @@ type roaringIter interface {
 	Next() uint64
 }
 
-// should it be the main path now?
-
-func (db *DB[K, V]) tryLimitQuery(q *qx.QX) ([]K, bool, error) {
+func (db *DB[K, V]) tryLimitQuery(q *qx.QX) ([]K, bool, PlanName, error) {
 	if q.Limit == 0 || q.Offset != 0 {
-		return nil, false, nil
+		return nil, false, "", nil
 	}
 	if q.Expr.Not {
-		return nil, false, nil
+		return nil, false, "", nil
 	}
 
 	leaves, ok := extractAndLeaves(q.Expr)
 	if !ok || len(leaves) == 0 {
-		return nil, false, nil
+		return nil, false, "", nil
 	}
 
 	if len(q.Order) == 1 && q.Order[0].Type == qx.OrderBasic {
-		return db.tryLimitQueryOrderBasic(q, leaves)
+		out, used, err := db.tryLimitQueryOrderBasic(q, leaves)
+		if !used {
+			return nil, false, "", err
+		}
+		plan := PlanLimitOrderBasic
+		if hasPrefixBoundForField(leaves, q.Order[0].Field) {
+			plan = PlanLimitOrderPrefix
+		}
+		return out, true, plan, err
 	}
 
 	if f, bounds, ok := db.tryExtractFieldBoundsNoOrder(leaves); ok {
-		return db.tryLimitQueryByFieldBounds(q, leaves, f, bounds)
+		out, used, err := db.tryLimitQueryByFieldBounds(q, leaves, f, bounds)
+		if !used {
+			return nil, false, "", err
+		}
+		return out, true, PlanLimitRangeNoOrder, err
 	}
 
-	return db.tryLimitQueryNoOrder(q, leaves)
+	out, used, err := db.tryLimitQueryNoOrder(q, leaves)
+	if !used {
+		return nil, false, "", err
+	}
+	return out, true, PlanLimit, err
+}
+
+func hasPrefixBoundForField(leaves []qx.Expr, field string) bool {
+	for _, e := range leaves {
+		if e.Not {
+			continue
+		}
+		if e.Field == field && e.Op == qx.OpPREFIX {
+			return true
+		}
+	}
+	return false
 }
 
 func (db *DB[K, V]) tryLimitQueryNoOrder(q *qx.QX, leaves []qx.Expr) ([]K, bool, error) {
@@ -74,6 +98,7 @@ func (db *DB[K, V]) tryLimitQueryNoOrder(q *qx.QX, leaves []qx.Expr) ([]K, bool,
 
 	limit := int(q.Limit)
 	out := make([]K, 0, limit)
+	cursor := db.newQueryCursor(out, 0, q.Limit, false, nil)
 
 	iter := lead.iter()
 	for iter.HasNext() {
@@ -90,13 +115,12 @@ func (db *DB[K, V]) tryLimitQueryNoOrder(q *qx.QX, leaves []qx.Expr) ([]K, bool,
 			continue
 		}
 
-		out = append(out, db.idFromIdxNoLock(idx))
-		if len(out) == limit {
-			return out, true, nil
+		if cursor.emit(idx) {
+			return cursor.out, true, nil
 		}
 	}
 
-	return out, true, nil
+	return cursor.out, true, nil
 }
 
 func (db *DB[K, V]) tryLimitQueryOrderBasic(q *qx.QX, leaves []qx.Expr) ([]K, bool, error) {
@@ -157,6 +181,7 @@ func (db *DB[K, V]) tryLimitQueryOrderBasic(q *qx.QX, leaves []qx.Expr) ([]K, bo
 
 	limit := int(q.Limit)
 	out := make([]K, 0, limit)
+	cursor := db.newQueryCursor(out, 0, q.Limit, false, nil)
 
 	emitBucket := func(bm *roaring64.Bitmap) bool {
 		it := bm.Iterator()
@@ -174,8 +199,7 @@ func (db *DB[K, V]) tryLimitQueryOrderBasic(q *qx.QX, leaves []qx.Expr) ([]K, bo
 				continue
 			}
 
-			out = append(out, db.idFromIdxNoLock(idx))
-			if len(out) == limit {
+			if cursor.emit(idx) {
 				return true
 			}
 		}
@@ -188,7 +212,7 @@ func (db *DB[K, V]) tryLimitQueryOrderBasic(q *qx.QX, leaves []qx.Expr) ([]K, bo
 				continue
 			}
 			if emitBucket(s[i].IDs) {
-				return out, true, nil
+				return cursor.out, true, nil
 			}
 		}
 	} else {
@@ -200,7 +224,7 @@ func (db *DB[K, V]) tryLimitQueryOrderBasic(q *qx.QX, leaves []qx.Expr) ([]K, bo
 				continue
 			}
 			if emitBucket(s[i].IDs) {
-				return out, true, nil
+				return cursor.out, true, nil
 			}
 			if i == start {
 				break
@@ -208,7 +232,7 @@ func (db *DB[K, V]) tryLimitQueryOrderBasic(q *qx.QX, leaves []qx.Expr) ([]K, bo
 		}
 	}
 
-	return out, true, nil
+	return cursor.out, true, nil
 }
 
 func (db *DB[K, V]) tryExtractFieldBoundsNoOrder(leaves []qx.Expr) (string, rangeBounds, bool) {
@@ -284,6 +308,7 @@ func (db *DB[K, V]) tryLimitQueryByFieldBounds(q *qx.QX, leaves []qx.Expr, field
 
 	limit := int(q.Limit)
 	out := make([]K, 0, limit)
+	cursor := db.newQueryCursor(out, 0, q.Limit, false, nil)
 
 	for i := start; i < end; i++ {
 		bm := s[i].IDs
@@ -305,14 +330,13 @@ func (db *DB[K, V]) tryLimitQueryByFieldBounds(q *qx.QX, leaves []qx.Expr, field
 				continue
 			}
 
-			out = append(out, db.idFromIdxNoLock(idx))
-			if len(out) == limit {
-				return out, true, nil
+			if cursor.emit(idx) {
+				return cursor.out, true, nil
 			}
 		}
 	}
 
-	return out, true, nil
+	return cursor.out, true, nil
 }
 
 func isBoundOp(op qx.Op) bool {
@@ -340,14 +364,13 @@ func (db *DB[K, V]) extractBoundsForField(field string, leaves []qx.Expr) (range
 			return b, nil, false, nil
 		}
 
-		keys, isSlice, err := db.exprValueToIdx(e)
+		k, isSlice, err := db.exprValueToIdxScalar(e)
 		if err != nil {
 			return b, nil, true, err
 		}
-		if isSlice || len(keys) != 1 {
+		if isSlice {
 			return b, nil, false, nil
 		}
-		k := keys[0]
 
 		b.has = true
 
@@ -376,13 +399,7 @@ func applyBoundsToIndexRange(s []index, b rangeBounds) (start, end int) {
 	if b.hasPrefix {
 		p := b.prefix
 		start = lowerBoundIndex(s, p)
-		end = start
-		for end < len(s) {
-			if !strings.HasPrefix(s[end].Key, p) {
-				break
-			}
-			end++
-		}
+		end = prefixRangeEndIndex(s, p, start)
 		return start, end
 	}
 
@@ -436,15 +453,15 @@ func (db *DB[K, V]) buildLeafPred(e qx.Expr) (leafPred, bool, error) {
 			return leafPred{}, false, nil
 		}
 
-		keys, isSlice, err := db.exprValueToIdx(e)
+		key, isSlice, err := db.exprValueToIdxScalar(e)
 		if err != nil {
 			return leafPred{}, true, err
 		}
-		if isSlice || len(keys) != 1 {
+		if isSlice {
 			return leafPred{}, false, nil
 		}
 
-		bm := findIndex(slice, keys[0])
+		bm := findIndex(slice, key)
 		if bm == nil {
 			return emptyLeaf(), true, nil
 		}
@@ -476,7 +493,7 @@ func (db *DB[K, V]) buildLeafPred(e qx.Expr) (leafPred, bool, error) {
 		}
 
 		return leafPred{
-			iter: func() roaringIter { return newUnionIter(bms) },
+			iter: func() roaringIter { return newConcatIter(bms) },
 			contains: func(idx uint64) bool {
 				for _, bm := range bms {
 					if bm.Contains(idx) {
@@ -579,6 +596,47 @@ func pickLead(ps []leafPred) *leafPred {
 }
 
 func extractAndLeaves(e qx.Expr) ([]qx.Expr, bool) {
+	n, ok := countExtractAndLeaves(e)
+	if !ok {
+		return nil, false
+	}
+	if n == 0 {
+		return nil, true
+	}
+	out := make([]qx.Expr, 0, n)
+	out, ok = appendExtractAndLeaves(out, e)
+	if !ok {
+		return nil, false
+	}
+	return out, true
+}
+
+func countExtractAndLeaves(e qx.Expr) (int, bool) {
+	switch e.Op {
+	case qx.OpNOOP:
+		return 0, false
+	case qx.OpAND:
+		if len(e.Operands) == 0 {
+			return 0, false
+		}
+		total := 0
+		for _, ch := range e.Operands {
+			n, ok := countExtractAndLeaves(ch)
+			if !ok {
+				return 0, false
+			}
+			total += n
+		}
+		return total, true
+	default:
+		if e.Not {
+			return 0, false
+		}
+		return 1, true
+	}
+}
+
+func appendExtractAndLeaves(dst []qx.Expr, e qx.Expr) ([]qx.Expr, bool) {
 	switch e.Op {
 	case qx.OpNOOP:
 		return nil, false
@@ -586,20 +644,19 @@ func extractAndLeaves(e qx.Expr) ([]qx.Expr, bool) {
 		if len(e.Operands) == 0 {
 			return nil, false
 		}
-		var out []qx.Expr
 		for _, ch := range e.Operands {
-			sub, ok := extractAndLeaves(ch)
+			var ok bool
+			dst, ok = appendExtractAndLeaves(dst, ch)
 			if !ok {
 				return nil, false
 			}
-			out = append(out, sub...)
 		}
-		return out, true
+		return dst, true
 	default:
 		if e.Not {
 			return nil, false
 		}
-		return []qx.Expr{e}, true
+		return append(dst, e), true
 	}
 }
 
@@ -639,14 +696,44 @@ func emptyLeaf() leafPred {
 	}
 }
 
-/**/
-
 type emptyIter struct{}
 
 func (emptyIter) HasNext() bool { return false }
 func (emptyIter) Next() uint64  { return 0 }
 
-/**/
+type concatIter struct {
+	bms   []*roaring64.Bitmap
+	i     int
+	curIt roaringIter
+}
+
+func newConcatIter(bms []*roaring64.Bitmap) roaringIter {
+	return &concatIter{bms: bms}
+}
+
+func (it *concatIter) HasNext() bool {
+	for {
+		if it.curIt != nil && it.curIt.HasNext() {
+			return true
+		}
+		if it.i >= len(it.bms) {
+			return false
+		}
+		bm := it.bms[it.i]
+		it.i++
+		if bm == nil || bm.IsEmpty() {
+			continue
+		}
+		it.curIt = bm.Iterator()
+	}
+}
+
+func (it *concatIter) Next() uint64 {
+	if !it.HasNext() {
+		return 0
+	}
+	return it.curIt.Next()
+}
 
 type unionIter struct {
 	iters []roaringIter
@@ -661,9 +748,16 @@ func newUnionIter(bms []*roaring64.Bitmap) roaringIter {
 	for _, bm := range bms {
 		iters = append(iters, bm.Iterator())
 	}
+	capHint := len(bms) * 16
+	if capHint < 64 {
+		capHint = 64
+	}
+	if capHint > 1024 {
+		capHint = 1024
+	}
 	return &unionIter{
 		iters: iters,
-		seen:  newU64Set(256),
+		seen:  newU64Set(capHint),
 	}
 }
 
@@ -693,8 +787,6 @@ func (u *unionIter) Next() uint64 {
 	u.has = false
 	return u.next
 }
-
-/**/
 
 type u64set struct {
 	keys []uint64
@@ -732,6 +824,26 @@ func (s *u64set) Add(x uint64) bool {
 		}
 		i = (i + 1) & s.mask
 	}
+}
+
+func (s *u64set) Has(x uint64) bool {
+	if len(s.keys) == 0 {
+		return false
+	}
+	i := mix64(x) & s.mask
+	for {
+		if s.used[i] == 0 {
+			return false
+		}
+		if s.keys[i] == x {
+			return true
+		}
+		i = (i + 1) & s.mask
+	}
+}
+
+func (s *u64set) Len() int {
+	return s.n
 }
 
 func (s *u64set) grow() {

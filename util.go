@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"math/rand/v2"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -112,164 +113,6 @@ func (db *DB[K, V]) makePatch(oldVal, newVal *V, target []Field) []Field {
 	return target
 }
 
-// CollectPatch returns a PreCommitFunc that populates the provided target slice
-// with a patch describing all fields that have changed between old and new
-// values of a record.
-//
-// The returned function compares both indexed and non-indexed fields.
-// For each modified field, it appends a Field entry with the field name
-// and a deep copy of the new value.
-//
-// IMPORTANT: When used with SetMany/PatchMany, this callback is invoked once per record.
-// Since it always overwrites the same target slice, the final contents will correspond
-// to the last processed record only. For batched writes, use CollectPatchMany instead.
-//
-// The returned PreCommitFunc should not be used with Delete or DeleteMany
-// (where newVal is always nil); in such cases the resulting slice will be empty.
-/*
-func (db *DB[K, V]) CollectPatch(target *[]Field) PreCommitFunc[K, V] {
-
-	return func(tx *bbolt.Tx, _ K, oldVal, newVal *V) error {
-
-		*target = (*target)[:0]
-
-		if newVal == nil {
-			return nil
-		}
-
-		var rvOld, rvNew reflect.Value
-		if oldVal != nil {
-			rvOld = reflect.ValueOf(oldVal).Elem()
-		}
-		rvNew = reflect.ValueOf(newVal).Elem()
-
-		processed := make(map[string]struct{})
-
-		mods := db.getModifiedIndexedFields(oldVal, newVal)
-
-		for _, dbname := range mods {
-			f := db.fields[dbname]
-
-			processed[f.Name] = struct{}{}
-
-			var newValue any
-			if rvNew.IsValid() {
-				newValue = rvNew.FieldByIndex(f.Index).Interface()
-			}
-
-			*target = append(*target, Field{
-				Name:  dbname,
-				Value: deepCopyValue(newValue),
-			})
-		}
-
-		for patchKey, f := range db.patchMap {
-
-			if _, ok := processed[f.Name]; ok {
-				continue
-			}
-
-			var v1, v2 any
-			if rvOld.IsValid() {
-				v1 = rvOld.FieldByIndex(f.Index).Interface()
-			}
-			if rvNew.IsValid() {
-				v2 = rvNew.FieldByIndex(f.Index).Interface()
-			}
-
-			if !reflect.DeepEqual(v1, v2) {
-				*target = append(*target, Field{
-					Name:  patchKey,
-					Value: deepCopyValue(v2),
-				})
-			}
-			processed[f.Name] = struct{}{}
-		}
-
-		return nil
-	}
-}
-*/
-
-// CollectPatchMany returns a PreCommitFunc that collects per-record patches into target,
-// keyed by the record ID.
-//
-// It is designed for SetMany/PatchMany: the callback is invoked once per record, and
-// this helper stores the corresponding patch under target[key].
-//
-// The returned function compares both indexed and non-indexed fields.
-// For each modified field, it appends a Field entry with the field name
-// and a deep copy of the new value.
-//
-// If newVal is nil (e.g. Delete/DeleteMany), no patch is produced for that key.
-// The provided map must be initialized by the caller.
-/*
-func (db *DB[K, V]) CollectPatchMany(target map[K][]Field) PreCommitFunc[K, V] {
-
-	return func(tx *bbolt.Tx, key K, oldVal, newVal *V) error {
-
-		if newVal == nil {
-			return nil
-		}
-
-		var rvOld, rvNew reflect.Value
-		if oldVal != nil {
-			rvOld = reflect.ValueOf(oldVal).Elem()
-		}
-		rvNew = reflect.ValueOf(newVal).Elem()
-
-		out := target[key] // reuse existing if exists
-		out = out[:0]
-
-		processed := make(map[string]struct{})
-
-		mods := db.getModifiedIndexedFields(oldVal, newVal)
-
-		for _, dbname := range mods {
-			f := db.fields[dbname]
-
-			processed[f.Name] = struct{}{}
-
-			var newValue any
-			if rvNew.IsValid() {
-				newValue = rvNew.FieldByIndex(f.Index).Interface()
-			}
-
-			out = append(out, Field{
-				Name:  dbname,
-				Value: deepCopyValue(newValue),
-			})
-		}
-
-		for patchKey, f := range db.patchMap {
-
-			if _, ok := processed[f.Name]; ok {
-				continue
-			}
-
-			var v1, v2 any
-			if rvOld.IsValid() {
-				v1 = rvOld.FieldByIndex(f.Index).Interface()
-			}
-			if rvNew.IsValid() {
-				v2 = rvNew.FieldByIndex(f.Index).Interface()
-			}
-
-			if !reflect.DeepEqual(v1, v2) {
-				out = append(out, Field{
-					Name:  patchKey,
-					Value: deepCopyValue(v2),
-				})
-			}
-			processed[f.Name] = struct{}{}
-		}
-
-		target[key] = out
-		return nil
-	}
-}
-*/
-
 func (db *DB[K, V]) keyFromID(id K) []byte {
 	if db.strkey {
 		s := *(*string)(unsafe.Pointer(&id))
@@ -315,20 +158,17 @@ var msgpackEncPool = sync.Pool{New: func() any { return msgpack.NewEncoder(io.Di
 var msgpackDecPool = sync.Pool{New: func() any { return msgpack.NewDecoder(strings.NewReader("")) }}
 
 func (db *DB[K, V]) decode(b []byte) (*V, error) {
-	v := new(V)
+	// v := new(V)
+	v := db.pool.Get().(*V)
 	dec := msgpackDecPool.Get().(*msgpack.Decoder)
 	dec.Reset(bytes.NewReader(b))
 	err := dec.Decode(v)
 	msgpackDecPool.Put(dec)
 	if err != nil {
+		db.ReleaseRecords(v)
 		return nil, err
 	}
 	return v, nil
-
-	// if err := msgpack.NewDecoder(bytes.NewReader(b)).Decode(v); err != nil {
-	// 	return nil, err
-	// }
-	// return v, nil
 }
 
 func (db *DB[K, V]) encode(v *V, b *bytes.Buffer) error {
@@ -337,14 +177,7 @@ func (db *DB[K, V]) encode(v *V, b *bytes.Buffer) error {
 	err := enc.Encode(v)
 	msgpackEncPool.Put(enc)
 	return err
-
-	// if err := msgpack.NewEncoder(b).Encode(v); err != nil {
-	// 	return err
-	// }
-	// return nil
 }
-
-/**/
 
 var encodePool = sync.Pool{
 	New: func() any { return new(bytes.Buffer) },
@@ -359,8 +192,6 @@ func releaseEncodeBuf(b *bytes.Buffer) {
 	encodePool.Put(b)
 }
 
-/**/
-
 func rollback(tx *bbolt.Tx) { _ = tx.Rollback() }
 
 func touch(name string) error {
@@ -372,8 +203,6 @@ func touch(name string) error {
 }
 
 func closeFile(f *os.File) { _ = f.Close() }
-
-/**/
 
 func sanitizeSuffix(s string) string {
 	out := make([]rune, 0, len(s))
@@ -445,8 +274,6 @@ func float64ByteStr(f float64) string {
 	return uint64ByteStr(u)
 }
 
-/**/
-
 var (
 	registryMu sync.Mutex
 	registry   = make(map[string]struct{})
@@ -477,4 +304,11 @@ func unregInstance(dbPath, bucket string) {
 	absPath, _ := filepath.Abs(dbPath)
 	key := absPath + "::" + bucket
 	delete(registry, key)
+}
+
+const randStreamMix uint64 = 0x9e3779b97f4a7c15
+
+func newRand(seed int64) *rand.Rand {
+	s := uint64(seed)
+	return rand.New(rand.NewPCG(s, s^randStreamMix))
 }

@@ -155,32 +155,34 @@ Query methods:
 ## Query Execution Model
 
 Queries run entirely in-memory; stored records are never scanned.
-Depending on query shape, the engine uses either a generic bitmap-based
-execution or specialized fast paths.
+
+The runtime uses a single planner/executor pipeline:
+
+1. Normalize query tree into a deterministic internal form.
+2. Compile leaf predicates into bitmap/iterator-backed checks.
+3. Select an execution strategy by shape and cost.
+4. Execute using shared iterator/bitmap contracts and tracing hooks.
 
 Leaf predicates are resolved via field indexes, producing either bitmaps
 of matching record IDs or index-backed iterators with `Contains(id)` checks.
-Logical operators (`AND`, `OR`, `NOT`) are applied using bitmap operations; 
-large result sets may be represented as negative sets to avoid materializing 
+Logical operators (`AND`, `OR`, `NOT`) are applied using bitmap operations;
+large result sets may be represented as negative sets to avoid materializing
 large bitmaps.
 
-For some queries (mostly with LIMIT without OFFSET), 
-the engine switches to a candidate-driven fast path. 
-A selective index yields candidate IDs, remaining predicates are checked 
-via index lookups, and execution stops once enough results are found. 
+For ordered queries, the ordered field index is traversed directly and
+intersected with compiled predicates. Offset and limit are applied during
+traversal when possible.
 
-If ordering is requested, the index of the ordered field is traversed directly 
-and intersected with the filtered result set. 
-Offset and limit are applied during traversal when possible.
+For limit-driven candidate plans, a selective index yields candidate IDs,
+remaining predicates are checked via index lookups, and execution stops once
+enough results are collected.
 
 Only the final set of matching record IDs is materialized.
 For `QueryItems`, record values are fetched from bbolt only for IDs that have
 passed all filters and limits.
 
-> Currently, there is no full-fledged query planner.
-> Execution strategies are selected using a small number of specialized
-> fast-paths combined with a general bitmap-based fallback.
-> Contributions improving query planning or execution strategies are very welcome.
+> Planner statistics, tracing and calibration can be enabled via options to
+> tune strategy selection for real workloads.
 
 ## Ordering Limitations
 

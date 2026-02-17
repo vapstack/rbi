@@ -2,42 +2,49 @@ package rbi
 
 import (
 	"fmt"
-	"strings"
 
-	"github.com/RoaringBitmap/roaring/v2/roaring64"
 	"github.com/vapstack/qx"
 )
 
-// we definitely need a normal query planner...
-
-func (db *DB[K, V]) tryFastPath(q *qx.QX) ([]K, bool, error) {
+func (db *DB[K, V]) tryExecutionPlan(q *qx.QX, trace *queryTrace) ([]K, bool, error) {
 
 	// optimized path for LIMIT without OFFSET
-	if out, ok, err := db.tryLimitQuery(q); ok {
+	if out, ok, plan, err := db.tryLimitQuery(q); ok {
+		if trace != nil {
+			trace.setPlan(plan)
+		}
 		return out, ok, err
 	}
 
 	// optimization for simple ORDER + LIMIT without complex filters (and OFFSET)
 	if out, ok, err := db.tryQueryOrderBasicWithLimit(q); ok {
+		if trace != nil {
+			trace.setPlan(PlanLimitOrderBasic)
+		}
 		return out, ok, err
 	}
 
-	//
-	// these old paths can be removed, but more benchmarks is needed (with OFFSET)
-	//
-
 	// optimization for PREFIX + ORDER + LIMIT without complex filters
 	if out, ok, err := db.tryQueryOrderPrefixWithLimit(q); ok {
+		if trace != nil {
+			trace.setPlan(PlanLimitOrderPrefix)
+		}
 		return out, ok, err
 	}
 
 	// optimization for simple PREFIX + LIMIT without ORDER
 	if out, ok, err := db.tryQueryPrefixNoOrderWithLimit(q); ok {
+		if trace != nil {
+			trace.setPlan(PlanLimitPrefixNoOrder)
+		}
 		return out, ok, err
 	}
 
 	// optimization for simple range + LIMIT without ORDER
 	if out, ok, err := db.tryQueryRangeNoOrderWithLimit(q); ok {
+		if trace != nil {
+			trace.setPlan(PlanLimitRangeNoOrder)
+		}
 		return out, ok, err
 	}
 
@@ -101,6 +108,50 @@ func upperBoundIndex(s []index, key string) int {
 	return lo
 }
 
+func nextPrefixUpperBound(prefix string) (string, bool) {
+	if prefix == "" {
+		return "", false
+	}
+	buf := []byte(prefix)
+	for i := len(buf) - 1; i >= 0; i-- {
+		if buf[i] == 0xFF {
+			continue
+		}
+		buf[i]++
+		return string(buf[:i+1]), true
+	}
+	return "", false
+}
+
+func prefixRangeEndIndex(s []index, prefix string, start int) int {
+	if start < 0 || start >= len(s) {
+		return start
+	}
+	if s[start].Key < prefix || len(s[start].Key) < len(prefix) || s[start].Key[:len(prefix)] != prefix {
+		return start
+	}
+	if upper, ok := nextPrefixUpperBound(prefix); ok {
+		end := lowerBoundIndex(s, upper)
+		if end < start {
+			end = start
+		}
+		return end
+	}
+
+	// Extremely rare fallback when prefix consists entirely of 0xFF bytes.
+	end := start
+	for end < len(s) {
+		key := s[end].Key
+		if len(key) < len(prefix) || key[:len(prefix)] != prefix {
+			break
+		}
+		end++
+	}
+	return end
+}
+
+const iteratorThreshold = 2048 // 256
+
 func (db *DB[K, V]) tryQueryOrderBasicWithLimit(q *qx.QX) ([]K, bool, error) {
 
 	if len(q.Order) != 1 || q.Limit == 0 {
@@ -145,17 +196,22 @@ func (db *DB[K, V]) tryQueryOrderBasicWithLimit(q *qx.QX) ([]K, bool, error) {
 		if op.Not {
 			return nil, false, nil
 		}
+		// Prefix on a non-ordered field is typically expensive with this plan:
+		// it forces broad ordered-field traversal plus per-id contains checks.
+		// Let planner paths handle this shape instead.
+		if op.Op == qx.OpPREFIX && op.Field != f {
+			return nil, false, nil
+		}
 		if op.Field == f {
 			switch op.Op {
 			case qx.OpGT, qx.OpGTE, qx.OpLT, qx.OpLTE, qx.OpEQ:
-				vals, isSlice, err := db.exprValueToIdx(op)
+				k, isSlice, err := db.exprValueToIdxScalar(op)
 				if err != nil {
 					return nil, true, err
 				}
-				if isSlice || len(vals) != 1 {
+				if isSlice {
 					return nil, false, nil
 				}
-				k := vals[0]
 				switch op.Op {
 				case qx.OpGT:
 					rb.applyLo(k, false)
@@ -243,6 +299,7 @@ func (db *DB[K, V]) tryQueryOrderBasicWithLimit(q *qx.QX) ([]K, bool, error) {
 	need := q.Limit
 
 	out := make([]K, 0, need)
+	cursor := db.newQueryCursor(out, skip, need, false, nil)
 
 	if db.strkey {
 		db.strmap.RLock()
@@ -251,23 +308,6 @@ func (db *DB[K, V]) tryQueryOrderBasicWithLimit(q *qx.QX) ([]K, bool, error) {
 
 	tmp := getRoaringBuf()
 	defer releaseRoaringBuf(tmp)
-
-	emit := func(bm *roaring64.Bitmap) bool {
-		iter := bm.Iterator()
-		for iter.HasNext() {
-			idx := iter.Next()
-			if skip > 0 {
-				skip--
-				continue
-			}
-			out = append(out, db.idFromIdxNoLock(idx))
-			need--
-			if need == 0 {
-				return true
-			}
-		}
-		return false
-	}
 
 	contains := func(idx uint64) bool {
 		if base.neg {
@@ -285,7 +325,7 @@ func (db *DB[K, V]) tryQueryOrderBasicWithLimit(q *qx.QX) ([]K, bool, error) {
 	if !order.Desc {
 		for i := start; i < end; i++ {
 			// fast path check
-			if card := s[i].IDs.GetCardinality(); card <= iteratorThreshold || (0 < need && need < 1000) {
+			if card := s[i].IDs.GetCardinality(); card <= iteratorThreshold || (0 < cursor.need && cursor.need < 1000) {
 				if card == 0 {
 					continue
 				}
@@ -296,30 +336,12 @@ func (db *DB[K, V]) tryQueryOrderBasicWithLimit(q *qx.QX) ([]K, bool, error) {
 					if !contains(idx) {
 						continue
 					}
-					if skip > 0 {
-						skip--
-						continue
-					}
-					out = append(out, db.idFromIdxNoLock(idx))
-					need--
-					if need == 0 {
-						return out, true, nil
+					if cursor.emit(idx) {
+						return cursor.out, true, nil
 					}
 				}
 				continue
 			}
-
-			// slow path
-			// tmp.Clear()
-			// tmp.Or(s[i].IDs)
-			// tmp.And(base.bm)
-			// if tmp.IsEmpty() {
-			// 	continue
-			// }
-
-			// tmp.Clear()
-			// tmp.Xor(tmp)
-			// tmp.Or(s[i].IDs)
 
 			if base.neg {
 				tmp.Xor(tmp)
@@ -332,18 +354,17 @@ func (db *DB[K, V]) tryQueryOrderBasicWithLimit(q *qx.QX) ([]K, bool, error) {
 					continue
 				}
 				tmpORSmallestAND(tmp, s[i].IDs, base.bm)
-				// tmp.And(base.bm)
 			}
 			if tmp.IsEmpty() {
 				continue
 			}
-			if emit(tmp) {
-				return out, true, nil
+			if cursor.emitBitmap(tmp) {
+				return cursor.out, true, nil
 			}
 		}
 	} else {
 		for i := end - 1; i >= start; i-- {
-			if card := s[i].IDs.GetCardinality(); card <= iteratorThreshold || (0 < need && need < 1000) {
+			if card := s[i].IDs.GetCardinality(); card <= iteratorThreshold || (0 < cursor.need && cursor.need < 1000) {
 				if card == 0 {
 					continue
 				}
@@ -353,29 +374,12 @@ func (db *DB[K, V]) tryQueryOrderBasicWithLimit(q *qx.QX) ([]K, bool, error) {
 					if !contains(idx) {
 						continue
 					}
-					if skip > 0 {
-						skip--
-						continue
-					}
-					out = append(out, db.idFromIdxNoLock(idx))
-					need--
-					if need == 0 {
-						return out, true, nil
+					if cursor.emit(idx) {
+						return cursor.out, true, nil
 					}
 				}
 				continue
 			}
-
-			// tmp.Clear()
-			// tmp.Or(s[i].IDs)
-			// tmp.And(base.bm)
-			// if tmp.IsEmpty() {
-			// 	continue
-			// }
-
-			// tmp.Clear()
-			// tmp.Xor(tmp)
-			// tmp.Or(s[i].IDs)
 
 			if base.neg {
 				tmp.Xor(tmp)
@@ -388,13 +392,12 @@ func (db *DB[K, V]) tryQueryOrderBasicWithLimit(q *qx.QX) ([]K, bool, error) {
 					continue
 				}
 				tmpORSmallestAND(tmp, s[i].IDs, base.bm)
-				// tmp.And(base.bm)
 			}
 			if tmp.IsEmpty() {
 				continue
 			}
-			if emit(tmp) {
-				return out, true, nil
+			if cursor.emitBitmap(tmp) {
+				return cursor.out, true, nil
 			}
 			if i == start {
 				break
@@ -402,7 +405,7 @@ func (db *DB[K, V]) tryQueryOrderBasicWithLimit(q *qx.QX) ([]K, bool, error) {
 		}
 	}
 
-	return out, true, nil
+	return cursor.out, true, nil
 }
 
 func (db *DB[K, V]) tryQueryOrderPrefixWithLimit(q *qx.QX) ([]K, bool, error) {
@@ -451,15 +454,15 @@ func (db *DB[K, V]) tryQueryOrderPrefixWithLimit(q *qx.QX) ([]K, bool, error) {
 			return nil, false, nil
 		}
 		if op.Field == f && op.Op == qx.OpPREFIX {
-			vals, isSlice, err := db.exprValueToIdx(op)
+			p, isSlice, err := db.exprValueToIdxScalar(op)
 			if err != nil {
 				return nil, true, err
 			}
-			if isSlice || len(vals) != 1 {
+			if isSlice {
 				return nil, false, nil
 			}
 			hasPrefix = true
-			prefix = vals[0]
+			prefix = p
 			continue
 		}
 		baseOps = append(baseOps, op)
@@ -501,13 +504,7 @@ func (db *DB[K, V]) tryQueryOrderPrefixWithLimit(q *qx.QX) ([]K, bool, error) {
 	defer base.release()
 
 	start := lowerBoundIndex(s, prefix)
-	end := start
-	for end < len(s) {
-		if !strings.HasPrefix(s[end].Key, prefix) {
-			break
-		}
-		end++
-	}
+	end := prefixRangeEndIndex(s, prefix, start)
 	if start >= end {
 		return nil, true, nil
 	}
@@ -515,6 +512,7 @@ func (db *DB[K, V]) tryQueryOrderPrefixWithLimit(q *qx.QX) ([]K, bool, error) {
 	skip := q.Offset
 	need := q.Limit
 	out := make([]K, 0, need)
+	cursor := db.newQueryCursor(out, skip, need, false, nil)
 
 	if db.strkey {
 		db.strmap.RLock()
@@ -543,14 +541,8 @@ func (db *DB[K, V]) tryQueryOrderPrefixWithLimit(q *qx.QX) ([]K, bool, error) {
 				if !contains(idx) {
 					continue
 				}
-				if skip > 0 {
-					skip--
-					continue
-				}
-				out = append(out, db.idFromIdxNoLock(idx))
-				need--
-				if need == 0 {
-					return out, true, nil
+				if cursor.emit(idx) {
+					return cursor.out, true, nil
 				}
 			}
 		}
@@ -564,14 +556,8 @@ func (db *DB[K, V]) tryQueryOrderPrefixWithLimit(q *qx.QX) ([]K, bool, error) {
 				if !contains(idx) {
 					continue
 				}
-				if skip > 0 {
-					skip--
-					continue
-				}
-				out = append(out, db.idFromIdxNoLock(idx))
-				need--
-				if need == 0 {
-					return out, true, nil
+				if cursor.emit(idx) {
+					return cursor.out, true, nil
 				}
 			}
 			if i == start {
@@ -580,7 +566,7 @@ func (db *DB[K, V]) tryQueryOrderPrefixWithLimit(q *qx.QX) ([]K, bool, error) {
 		}
 	}
 
-	return out, true, nil
+	return cursor.out, true, nil
 }
 
 func (db *DB[K, V]) tryQueryRangeNoOrderWithLimit(q *qx.QX) ([]K, bool, error) {
@@ -623,14 +609,13 @@ func (db *DB[K, V]) tryQueryRangeNoOrderWithLimit(q *qx.QX) ([]K, bool, error) {
 		return nil, true, nil
 	}
 
-	vals, isSlice, err := db.exprValueToIdx(e)
+	key, isSlice, err := db.exprValueToIdxScalar(e)
 	if err != nil {
 		return nil, true, err
 	}
-	if isSlice || len(vals) != 1 {
+	if isSlice {
 		return nil, false, nil
 	}
-	key := vals[0]
 
 	start := 0
 	end := len(s)
@@ -671,6 +656,7 @@ func (db *DB[K, V]) tryQueryRangeNoOrderWithLimit(q *qx.QX) ([]K, bool, error) {
 	need := q.Limit
 
 	out := make([]K, 0, need)
+	cursor := db.newQueryCursor(out, skip, need, false, nil)
 
 	if db.strkey {
 		db.strmap.RLock()
@@ -680,20 +666,13 @@ func (db *DB[K, V]) tryQueryRangeNoOrderWithLimit(q *qx.QX) ([]K, bool, error) {
 	for i := start; i < end; i++ {
 		it := s[i].IDs.Iterator()
 		for it.HasNext() {
-			idx := it.Next()
-			if skip > 0 {
-				skip--
-				continue
-			}
-			out = append(out, db.idFromIdxNoLock(idx))
-			need--
-			if need == 0 {
-				return out, true, nil
+			if cursor.emit(it.Next()) {
+				return cursor.out, true, nil
 			}
 		}
 	}
 
-	return out, true, nil
+	return cursor.out, true, nil
 }
 
 func (db *DB[K, V]) tryQueryPrefixNoOrderWithLimit(q *qx.QX) ([]K, bool, error) {
@@ -719,14 +698,13 @@ func (db *DB[K, V]) tryQueryPrefixNoOrderWithLimit(q *qx.QX) ([]K, bool, error) 
 		return nil, false, nil
 	}
 
-	vals, isSlice, err := db.exprValueToIdx(e)
+	prefix, isSlice, err := db.exprValueToIdxScalar(e)
 	if err != nil {
 		return nil, true, err
 	}
-	if isSlice || len(vals) != 1 {
+	if isSlice {
 		return nil, false, nil
 	}
-	prefix := vals[0]
 
 	slice := db.index[e.Field]
 	if slice == nil {
@@ -738,13 +716,7 @@ func (db *DB[K, V]) tryQueryPrefixNoOrderWithLimit(q *qx.QX) ([]K, bool, error) 
 	}
 
 	start := lowerBoundIndex(s, prefix)
-	end := start
-	for end < len(s) {
-		if !strings.HasPrefix(s[end].Key, prefix) {
-			break
-		}
-		end++
-	}
+	end := prefixRangeEndIndex(s, prefix, start)
 	if start >= end {
 		return nil, true, nil
 	}
@@ -752,6 +724,7 @@ func (db *DB[K, V]) tryQueryPrefixNoOrderWithLimit(q *qx.QX) ([]K, bool, error) 
 	skip := q.Offset
 	need := q.Limit
 	out := make([]K, 0, need)
+	cursor := db.newQueryCursor(out, skip, need, false, nil)
 
 	if db.strkey {
 		db.strmap.RLock()
@@ -761,18 +734,11 @@ func (db *DB[K, V]) tryQueryPrefixNoOrderWithLimit(q *qx.QX) ([]K, bool, error) 
 	for i := start; i < end; i++ {
 		it := s[i].IDs.Iterator()
 		for it.HasNext() {
-			idx := it.Next()
-			if skip > 0 {
-				skip--
-				continue
-			}
-			out = append(out, db.idFromIdxNoLock(idx))
-			need--
-			if need == 0 {
-				return out, true, nil
+			if cursor.emit(it.Next()) {
+				return cursor.out, true, nil
 			}
 		}
 	}
 
-	return out, true, nil
+	return cursor.out, true, nil
 }

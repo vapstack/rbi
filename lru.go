@@ -192,6 +192,12 @@ func (c *LRUCache[K, V]) GetMany(ids ...K) ([]*V, error) {
 	return results, nil
 }
 
+// ReleaseRecords is no-op on LRUCache because it returns direct pointers
+// to cached items.
+func (c *LRUCache[K, V]) ReleaseRecords(v ...*V) {
+	return
+}
+
 // QueryKeys executes a query and caches the resulting list of keys.
 // If q.Key is empty, caching is skipped.
 //
