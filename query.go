@@ -139,17 +139,17 @@ func (db *DB[K, V]) QueryKeys(q *qx.QX) ([]K, error) {
 }
 
 func (db *DB[K, V]) query(q *qx.QX) ([]K, error) {
-	return db.queryInternalMode(q, true, false)
+	return db.execQuery(q, true, false)
 }
 
 func (db *DB[K, V]) queryNoTrace(q *qx.QX) ([]K, error) {
-	return db.queryInternalMode(q, false, false)
+	return db.execQuery(q, false, false)
 }
 
 // queryNoTracePrepared skips normalize/field-validation phase and is intended
 // only for internal callers that already operate on validated/normalized QX.
 func (db *DB[K, V]) queryNoTracePrepared(q *qx.QX) ([]K, error) {
-	return db.queryInternalMode(q, false, true)
+	return db.execQuery(q, false, true)
 }
 
 func (db *DB[K, V]) queryNoTraceOnSnapshot(q *qx.QX, snap *indexSnapshot) ([]K, error) {
@@ -207,15 +207,11 @@ func (db *DB[K, V]) releaseQueryView(view *DB[K, V]) {
 	root.viewPool.Put(view)
 }
 
-func (db *DB[K, V]) queryInternal(q *qx.QX, emitTrace bool) (out []K, err error) {
-	return db.queryInternalMode(q, emitTrace, false)
-}
-
-// queryInternalMode runs the full query pipeline against one snapshot view.
+// execQuery runs the full query pipeline against one snapshot view.
 //
 // The method keeps all routing decisions in one place so fast-path/planner
 // selection remains consistent across QueryKeys and Query callers.
-func (db *DB[K, V]) queryInternalMode(q *qx.QX, emitTrace bool, prepared bool) (out []K, err error) {
+func (db *DB[K, V]) execQuery(q *qx.QX, emitTrace bool, prepared bool) (out []K, err error) {
 
 	// Normalization is intentionally skipped for pre-normalized internal calls
 	// to avoid duplicate AST rewrites in hot paths.

@@ -500,7 +500,7 @@ func TestSnapshotDelta_UsesCandidateOrderWithoutMaterializedFallback(t *testing.
 		qx.EQ("active", true),
 	).By("age", qx.ASC).Max(10)
 
-	ids, err := db.queryInternal(q, true)
+	ids, err := db.execQuery(q, true, false)
 	if err != nil {
 		t.Fatalf("query: %v", err)
 	}
@@ -560,7 +560,7 @@ func TestSnapshotDelta_UsesOrderedPlanWithoutMaterializedFallback(t *testing.T) 
 		t.Fatalf("ordered basic mismatch: %v", ids)
 	}
 
-	ids2, err := db.queryInternal(q, true)
+	ids2, err := db.execQuery(q, true, false)
 	if err != nil {
 		t.Fatalf("query: %v", err)
 	}
@@ -593,7 +593,7 @@ func TestSnapshotDelta_UsesORNoOrderPlanWithoutMaterializedFallback(t *testing.T
 		),
 	).Max(120)
 
-	ids, err := db.queryInternal(q, true)
+	ids, err := db.execQuery(q, true, false)
 	if err != nil {
 		t.Fatalf("query: %v", err)
 	}
@@ -653,7 +653,7 @@ func TestSnapshotDelta_UsesOROrderStreamPlanWithoutMaterializedFallback(t *testi
 		),
 	).By("age", qx.ASC).Max(10)
 
-	ids, err := db.queryInternal(q, true)
+	ids, err := db.execQuery(q, true, false)
 	if err != nil {
 		t.Fatalf("query: %v", err)
 	}
@@ -687,7 +687,7 @@ func TestSnapshotDelta_UsesBitmapFallbackForSafeOverlayShape(t *testing.T) {
 		t.Fatalf("expected snapshot delta to be present")
 	}
 
-	ids, err := db.queryInternal(qx.Query(qx.EQ("country", "NL")), true)
+	ids, err := db.execQuery(qx.Query(qx.EQ("country", "NL")), true, false)
 	if err != nil {
 		t.Fatalf("query: %v", err)
 	}
@@ -722,7 +722,7 @@ func TestSnapshotDelta_UsesBitmapFallbackForArrayOrder(t *testing.T) {
 	}
 
 	q := qx.Query(qx.GTE("age", 0)).ByArrayCount("tags", qx.DESC)
-	ids, err := db.queryInternal(q, true)
+	ids, err := db.execQuery(q, true, false)
 	if err != nil {
 		t.Fatalf("query: %v", err)
 	}

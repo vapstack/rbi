@@ -412,7 +412,7 @@ The focus is on fast selection of complete documents.
 There is still room for optimization, but the current performance is already
 suitable for many workloads.
 
-### Query performance expectations
+### Query performance
 
 Query performance is shape-dependent. Some classes are fast by design,
 some are highly data-dependent, and some are inherently expensive.
@@ -465,7 +465,7 @@ enumeration, global deduplication, expensive ordering, and/or large materializat
 > For heavy and data-dependent classes, benchmark with your real data distribution.\
 > Synthetic uniform datasets often hide worst-case behavior.
 
-### Write performance expectations
+### Write performance
 
 Write speed depends on how many index entries are touched per operation
 (changed fields, slice fan-out, uniqueness checks), and on bbolt fsync/IO.
