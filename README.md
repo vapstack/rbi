@@ -110,7 +110,7 @@ func main() {
         By("age", qx.ASC).
         Max(10)
 
-    users, err := db.QueryItems(q)
+    users, err := db.Query(q)
     if err != nil {
         panic(err)
     }
@@ -162,7 +162,7 @@ q := qx.Query(
 
 Query methods:
 
-* `QueryItems(q)` – return matching records
+* `Query(q)` – return matching records
 * `QueryKeys(q)` – return matching IDs
 * `Count(q)` – return result cardinality (ignoring offset/limit)
 
@@ -191,14 +191,14 @@ remaining predicates are checked via index lookups, and execution stops once
 enough results are collected.
 
 Only the final set of matching record IDs is materialized.
-For `QueryItems`, record values are fetched from bbolt only for IDs that have
+For `Query`, record values are fetched from bbolt only for IDs that have
 passed all filters and limits.
 
-`QueryItems` runs against an index snapshot aligned with a bbolt read transaction.
+`Query` runs against an index snapshot aligned with a bbolt read transaction.
 When an exact snapshot for transaction is not immediately available,
 it uses bounded waiting with a few fallbacks.
 If none of the available paths can provide a valid snapshot within the retry
-budget, `QueryItems` returns an error.
+budget, `Query` returns an error.
 Retry budget is `30 * SnapshotPinWaitTimeout` (default: `30s`, because
 `SnapshotPinWaitTimeout` default is `1s`).
 
