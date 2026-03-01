@@ -4,32 +4,68 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"maps"
 	"os"
 	"reflect"
+	"runtime"
 	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
+	"unsafe"
 
 	"github.com/RoaringBitmap/roaring/v2/roaring64"
 	"go.etcd.io/bbolt"
 )
 
 var (
-	ErrNotStructType   = errors.New("value is not a struct")
-	ErrClosed          = errors.New("database closed")
-	ErrInvalidQuery    = errors.New("invalid query")
-	ErrIndexDisabled   = errors.New("index is disabled")
-	ErrUniqueViolation = errors.New("unique constraint violation")
-	ErrRecordNotFound  = errors.New("record not found")
-	ErrNoValidKeyIndex = errors.New("no valid key for index")
+	ErrNotStructType     = errors.New("value is not a struct")
+	ErrClosed            = errors.New("database closed")
+	ErrRebuildInProgress = errors.New("index rebuild in progress")
+	ErrInvalidQuery      = errors.New("invalid query")
+	ErrIndexDisabled     = errors.New("index is disabled")
+	ErrUniqueViolation   = errors.New("unique constraint violation")
+	ErrRecordNotFound    = errors.New("record not found")
+	ErrNoValidKeyIndex   = errors.New("no valid key for index")
+	ErrNilValue          = errors.New("value is nil")
 )
 
-var BucketFillPercent = 0.8
+const (
+	defaultOptionsAnalyzeInterval                   = time.Hour
+	defaultOptionsSnapshotPinWaitTimeout            = 1 * time.Second
+	defaultOptionsCalibrationSampleEvery            = 16
+	defaultBucketFillPercent                        = 0.8
+	defaultSnapshotMaterializedPredCacheMaxEntries  = 16
+	defaultSnapshotMatPredCacheEntriesWithDelta     = 2
+	defaultSnapshotMatPredCacheMaxBitmapCardinality = 32 << 10
+	defaultSnapshotRegistryMax                      = 16
+	defaultSnapshotDeltaCompactFieldKeys            = 256
+	defaultSnapshotDeltaCompactFieldOps             = 4 << 10
+	defaultSnapshotDeltaCompactMaxFieldsPerPublish  = 3
+	defaultSnapshotDeltaCompactUniverseOps          = 4 << 10
+	defaultSnapshotDeltaLayerMaxDepth               = 6
+	defaultSnapshotCompactorMaxIterationsPerRun     = 2
+	defaultSnapshotCompactorRequestEveryNWrites     = 8
+	defaultSnapshotCompactorIdleInterval            = 2 * time.Second
+	defaultBatchWindow                              = 200 * time.Microsecond
+	defaultBatchMax                                 = 16
+	defaultBatchMaxQueue                            = 512 // 1024
+	defaultBatchAllowCallbacks                      = false
+	defaultSnapshotDeltaCompactLargeBaseFieldKeys   = 128 << 10 // 64 << 10
+	defaultSnapshotDeltaCompactLargeBaseMinDeltaDiv = 32        // 16
+	defaultSnapshotDeltaCompactForceFieldOps        = 256 << 10 // 512 << 10
+	defaultSnapshotCompactorUrgentDepthSlack        = 4         // 8
+	defaultSnapshotStrMapCompactDepth               = 256       // 512
+	defaultNumericRangeBucketSize                   = 512       // 256
+	defaultNumericRangeBucketMinFieldKeys           = 8192      // 4096
+	defaultNumericRangeBucketMinSpanKeys            = 2048      // 1024
+)
 
-// Options configures how indexer works a bbolt database.
-// All fields are optional; a nil *Options is equivalent to using zero values.
-type Options[K ~string | ~uint64, V any] struct {
+// Options configures how indexer works with a bbolt database.
+//
+// DefaultOptions returns a new options object with all defaults pre-filled.
+// Passing nil options to New is equivalent to DefaultOptions.
+type Options struct {
 
 	// DisableIndexLoad prevents indexer from loading previously persisted index
 	// data from the .rbi file on startup. If set, indexer will either rebuild
@@ -48,47 +84,342 @@ type Options[K ~string | ~uint64, V any] struct {
 	DisableIndexRebuild bool
 
 	// BucketName overrides the default bucket name.
-	// By default, the bucket name is derived from the name of the value type V.
+	// By default, bucket name is derived from the name of the value type V.
 	BucketName string
 
-	// AutoClose controls whether the indexer should close the underlying Bolt
-	// database when DB.Close is called. Open sets this to true automatically;
-	// Wrap leaves it as provided by the caller.
-	AutoClose bool
-
-	// BoltOptions are forwarded to bbolt.Open when using Open. They are
-	// ignored by Wrap, which operates on an already opened *bbolt.DB.
-	BoltOptions *bbolt.Options
-
 	// AnalyzeInterval configures how often planner statistics should be
-	// refreshed in the background. A zero value means "use default",
-	// while a negative value disables periodic refresh.
+	// refreshed in the background.
+	//
+	// Default: 1 hour
+	//
+	// Negative value disables periodic refresh.
 	AnalyzeInterval time.Duration
 
 	// TraceSink receives optional per-query planner tracing events.
 	// If nil, planner tracing is disabled.
+	//
+	// Synchronous or heavy sinks can significantly increase query latency.
 	TraceSink func(TraceEvent)
 
 	// TraceSampleEvery controls trace sampling:
 	//   - 0: when sink is set, sample every query (equivalent to 1)
 	//   - 1: sample every query
-	//   - N>1: sample every Nth query
+	//   - N: sample every Nth query
 	TraceSampleEvery uint64
+
+	// SnapshotPinWaitTimeout controls how long Query waits for a snapshot
+	// with matching Bolt txID to appear after opening a read transaction.
+	// Non-positive values use the default timeout.
+	//
+	// Default: 1s
+	//
+	// Query retry budget is bounded by 10x this value.
+	// Too low can increase "snapshot is not available" errors under write bursts.
+	// Too high can increase tail latency when snapshot publication is delayed.
+	SnapshotPinWaitTimeout time.Duration
 
 	// CalibrationEnabled enables online self-calibration of planner
 	// cost coefficients using sampled query traces.
+	//
+	// Enable for workloads with evolving predicate selectivity/cost profile.
+	// Keep disabled when strict latency determinism is preferred.
 	CalibrationEnabled bool
 
 	// CalibrationSampleEvery controls calibration sampling:
 	//   - 0: use default sampling interval
 	//   - 1: calibrate every query
-	//   - N>1: calibrate every Nth query
+	//   - N: calibrate every Nth query
 	// The value is ignored when CalibrationEnabled is false.
+	//
+	// Default: 16
+	//
+	// Lower values adapt faster but add overhead and sensitivity to noise.
+	// Higher values reduce overhead but adapt slower to workload shifts.
 	CalibrationSampleEvery uint64
 
 	// CalibrationPersistPath enables optional auto load/save of planner
 	// calibration state from/to this JSON file.
+	//
+	// Default: empty (disabled).
 	CalibrationPersistPath string
+
+	// BucketFillPercent controls bbolt bucket fill factor for write operations.
+	//
+	// Default: 0.8
+	//
+	// Valid range: (0, 1]
+	//
+	// Lower values leave more free space on pages (usually larger file and
+	// lower split cost on random updates). Higher values pack pages denser
+	// (usually smaller file, potentially higher split/relocation cost).
+	//
+	// Values too low can cause excessive file growth and write amplification.
+	// Values too high on churn-heavy workloads can sharply increase write latency.
+	BucketFillPercent float64
+
+	// SnapshotMaterializedPredCacheMaxEntries controls max number of cached
+	// materialized predicate bitmaps for stable snapshots (without deltas).
+	//
+	// Default: 16
+	//
+	// Typical range: 16..256
+	//
+	// Negative value disables cache for stable snapshots.
+	//
+	// High values on diverse workloads can cause sharp memory growth.
+	SnapshotMaterializedPredCacheMaxEntries int
+
+	// SnapshotMaterializedPredCacheMaxEntriesWithDelta controls max cached
+	// materialized predicate bitmaps for snapshots with active deltas.
+	//
+	// Default: 2
+	//
+	// Typical range: 2..64
+	//
+	// Negative value disables cache for delta snapshots.
+	//
+	// High values can increase GC pressure under write-heavy workloads.
+	SnapshotMaterializedPredCacheMaxEntriesWithDelta int
+
+	// SnapshotMaterializedPredCacheMaxBitmapCardinality skips caching very large
+	// bitmaps to reduce retained heap and GC pressure.
+	//
+	// Default: 32K
+	//
+	// Negative value disables the guard.
+	//
+	// Negative (disabled) or very large values can significantly increase memory
+	// usage for broad predicates.
+	SnapshotMaterializedPredCacheMaxBitmapCardinality int
+
+	// SnapshotRegistryMax limits amount of snapshots tracked for txID pinning/floor fallback.
+	//
+	// Default: 16
+	//
+	// Typical range: 32..512
+	//
+	// Higher values retain more snapshots (higher memory).
+	// Too low values can increase snapshot misses for long readers.
+	SnapshotRegistryMax uint
+
+	// SnapshotDeltaCompactFieldKeys is a per-field threshold for accumulated
+	// delta keys; above it field delta is compacted into base index.
+	//
+	// Default: 256
+	//
+	// Typical range: 128..2048
+	//
+	// Negative value disables key-count trigger.
+	//
+	// Too high can increase delta memory/read CPU.
+	// Too low can increase compaction frequency and hurt write latency.
+	SnapshotDeltaCompactFieldKeys int
+
+	// SnapshotDeltaCompactFieldOps is a per-field threshold for accumulated
+	// add/del cardinality across delta entries.
+	//
+	// Default: 4096
+	//
+	// Typical range: 2K..64K
+	//
+	// Negative value disables ops-count trigger.
+	//
+	// Too high delays compaction (delta growth, read overhead).
+	// Too low can force frequent compaction and hurt write throughput.
+	SnapshotDeltaCompactFieldOps int
+
+	// SnapshotDeltaCompactMaxFieldsPerPublish limits how many fields can be
+	// compacted from delta into base in one publish pass.
+	//
+	// Default: 3
+	//
+	// Negative value disables field compaction in publish path.
+	//
+	// High values can create severe write-latency spikes.
+	SnapshotDeltaCompactMaxFieldsPerPublish int
+
+	// SnapshotDeltaCompactUniverseOps is a threshold for universe add/drop
+	// cardinality sum; above it universe delta is compacted into base.
+	//
+	// Default: 4096
+	//
+	// Typical values: 2K..64K
+	//
+	// Negative value disables universe compaction trigger.
+	//
+	// Too high values can increase overlay growth/read cost.
+	// Too low values can increase write-path compaction work.
+	SnapshotDeltaCompactUniverseOps int
+
+	// SnapshotDeltaLayerMaxDepth limits per-field delta layer depth.
+	// Once exceeded, layered delta is flattened into one layer.
+	//
+	// Default: 6
+	//
+	// Typical range: 4..64
+	//
+	// Negative value disables depth-based flattening.
+	//
+	// Very high/disabled values can increase read-path CPU and memory.
+	// Very low values can increase flattening overhead on writes.
+	SnapshotDeltaLayerMaxDepth int
+
+	// SnapshotCompactorMaxIterationsPerRun limits background compaction work per wake-up.
+	//
+	// Default: 3
+	//
+	// Typical range: 1..8
+	//
+	// Zero disables compaction passes.
+	//
+	// High values increase contention with writers and can degrade throughput.
+	SnapshotCompactorMaxIterationsPerRun uint
+
+	// SnapshotCompactorRequestEveryNWrites controls best-effort compactor
+	// wakeups under steady write load.
+	//
+	// Default: 4
+	//
+	// Typical range: 4..64
+	//
+	// Lower values improve delta control but increase write contention.
+	// Higher values reduce contention but can increase delta memory/read cost.
+	//
+	// Zero disables periodic write-triggered compactor requests.
+	//
+	// Value 1 can cause sustained compactor/writer contention and write
+	// throughput degradation on heavy write workloads.
+	SnapshotCompactorRequestEveryNWrites uint
+
+	// SnapshotCompactorIdleInterval configures one-shot idle debounce for
+	// force-drain compaction when snapshot activity stops.
+	// After this pause without new snapshot publication, compactor performs a
+	// bounded force pass to collapse remaining deltas and aggressively prune
+	// snapshot registry for best read-path locality.
+	//
+	// Default: 2s
+	//
+	// Typical range: 500ms..10s
+	//
+	// Non-positive value disables idle force-drain mode.
+	//
+	// Lower values converge faster after write bursts but can increase
+	// compactor/writer contention on bursty workloads.
+	// Higher values reduce background churn but keep layered state longer.
+	SnapshotCompactorIdleInterval time.Duration
+
+	// BatchWindow enables lightweight write micro-batching window for
+	// single-record Set/Patch/Delete operations.
+	//
+	// Default: 200us
+	//
+	// Typical range: 10us..500us
+	//
+	// Non-positive value disables write combining.
+	//
+	// Higher values can reduce write-path overhead under contention but may
+	// increase single-write latency at low load.
+	BatchWindow time.Duration
+
+	// BatchMax limits max operations merged into one combined write tx.
+	//
+	// Default: 16
+	//
+	// Typical range: 4..64
+	//
+	// Values <=1 disable effective batching.
+	//
+	// Very high values can create commit-size spikes and tail-latency variance.
+	BatchMax int
+
+	// BatchMaxQueue limits pending combined write requests.
+	//
+	// Default: 512
+	//
+	// Typical range: 128..8192
+	//
+	// Non-positive value disables queue cap.
+	//
+	// Larger values can increase memory usage under sustained overload.
+	BatchMaxQueue int
+
+	// BatchAllowCallbacks allows combiner batching for requests with one or more
+	// PreCommit callbacks.
+	//
+	// Default: false
+	//
+	// When false, any Set/Patch/Delete call with callbacks bypasses combiner queue
+	// and is executed via direct single-write path.
+	//
+	// When true, callback-bearing requests may be combined with other writes and
+	// callbacks run inside the same shared write transaction.
+	//
+	// Limitations:
+	// - A callback error aborts the current combined-transaction attempt. The
+	//   failed request is isolated and remaining requests are retried without it.
+	// - On such abort, the whole current write transaction is rolled back.
+	//   Stored records and in-memory index state remain consistent; no partial
+	//   data/index changes from the failed attempt are published.
+	// - Non-callback transaction errors (put/delete/commit) still fail all
+	//   requests from the current combined batch.
+	// - Callback execution order follows operation order inside combined batch.
+	// - Because surviving requests can be retried after isolating a failed one,
+	//   their callbacks may run more than once. Callback logic with side effects
+	//   outside this DB write transaction should be idempotent.
+	BatchAllowCallbacks bool
+
+	// NumericRangeBucketSize controls amount of sorted numeric keys grouped into one
+	// pre-aggregated bucket for range predicate acceleration.
+	//
+	// Default: 512
+	//
+	// Non-positive value disables numeric bucket acceleration.
+	NumericRangeBucketSize int
+
+	// NumericRangeBucketMinFieldKeys is the minimum amount of unique keys in a
+	// numeric field required to build range buckets.
+	//
+	// Default: 8192
+	//
+	// Non-positive value disables numeric bucket acceleration.
+	NumericRangeBucketMinFieldKeys int
+
+	// NumericRangeBucketMinSpanKeys is the minimum range span (in keys) required to
+	// route GT/GTE/LT/LTE through bucket acceleration path.
+	//
+	// Default: 2048
+	//
+	// Non-positive value disables numeric bucket acceleration.
+	NumericRangeBucketMinSpanKeys int
+}
+
+// DefaultOptions returns a new options object with default settings.
+func DefaultOptions() *Options {
+	return &Options{
+		BucketFillPercent:                                 defaultBucketFillPercent,
+		AnalyzeInterval:                                   defaultOptionsAnalyzeInterval,
+		SnapshotPinWaitTimeout:                            defaultOptionsSnapshotPinWaitTimeout,
+		CalibrationSampleEvery:                            defaultOptionsCalibrationSampleEvery,
+		SnapshotMaterializedPredCacheMaxEntries:           defaultSnapshotMaterializedPredCacheMaxEntries,
+		SnapshotMaterializedPredCacheMaxEntriesWithDelta:  defaultSnapshotMatPredCacheEntriesWithDelta,
+		SnapshotMaterializedPredCacheMaxBitmapCardinality: defaultSnapshotMatPredCacheMaxBitmapCardinality,
+		SnapshotRegistryMax:                               defaultSnapshotRegistryMax,
+		SnapshotDeltaCompactFieldKeys:                     defaultSnapshotDeltaCompactFieldKeys,
+		SnapshotDeltaCompactFieldOps:                      defaultSnapshotDeltaCompactFieldOps,
+		SnapshotDeltaCompactMaxFieldsPerPublish:           defaultSnapshotDeltaCompactMaxFieldsPerPublish,
+		SnapshotDeltaCompactUniverseOps:                   defaultSnapshotDeltaCompactUniverseOps,
+		SnapshotDeltaLayerMaxDepth:                        defaultSnapshotDeltaLayerMaxDepth,
+		SnapshotCompactorMaxIterationsPerRun:              defaultSnapshotCompactorMaxIterationsPerRun,
+		SnapshotCompactorRequestEveryNWrites:              defaultSnapshotCompactorRequestEveryNWrites,
+		SnapshotCompactorIdleInterval:                     defaultSnapshotCompactorIdleInterval,
+		BatchWindow:                                       defaultBatchWindow,
+		BatchMax:                                          defaultBatchMax,
+		BatchMaxQueue:                                     defaultBatchMaxQueue,
+		BatchAllowCallbacks:                               defaultBatchAllowCallbacks,
+		NumericRangeBucketSize:                            defaultNumericRangeBucketSize,
+		NumericRangeBucketMinFieldKeys:                    defaultNumericRangeBucketMinFieldKeys,
+		NumericRangeBucketMinSpanKeys:                     defaultNumericRangeBucketMinSpanKeys,
+	}
 }
 
 // PreCommitFunc is a callback invoked inside the write transaction just before
@@ -97,6 +428,9 @@ type Options[K ~string | ~uint64, V any] struct {
 // The callback:
 //   - Must not modify oldValue or newValue.
 //   - Must not commit or roll back the transaction.
+//   - Must not modify records in the bucket managed by this DB instance
+//     (or by any other DB instance with enabled indexing),
+//     because such writes bypass index synchronization.
 //   - May perform additional reads or writes within the same transaction.
 //   - May return an error to abort the operation; in this case the
 //     transaction will be rolled back and index state will not be updated.
@@ -105,7 +439,7 @@ type Options[K ~string | ~uint64, V any] struct {
 // Patch/Delete operations skip missing records and do not invoke callbacks for them.
 type PreCommitFunc[K ~string | ~uint64, V any] = func(tx *bbolt.Tx, key K, oldValue, newValue *V) error
 
-// Field represents a single field assignment used by Patch and PatchMany.
+// Field represents a single field assignment used by Patch and BatchPatch.
 // Name is matched against struct field name, "db" tag, or "json" tag,
 // and Value is assigned to the matched field using reflection and conversion rules.
 type Field struct {
@@ -118,19 +452,20 @@ type Field struct {
 	Value any
 }
 
-// Wrap creates a new indexed DB that uses the provided bbolt database.
+// New creates a new indexed DB that uses the provided bbolt database.
 //
 // The generic type V must be a struct; otherwise ErrNotStructType is returned.
 //
-// If options is nil, default options are used. If options.BucketName is empty,
-// the name of the value type V is used as the bucket name. Wrap ensures the
+// If options is nil, default options are used. For custom configuration,
+// start from DefaultOptions and override required fields.
+// If options.BucketName is empty,
+// the name of the value type V is used as the bucket name. New ensures the
 // bucket exists, optionally loads a persisted index from disk, rebuilds
 // missing parts of the index if allowed, and sets up field metadata and
 // accessors.
 //
-// The returned DB does not own the underlying *bbolt.DB unless options.AutoClose
-// is true; in that case DB.Close will also close the bbolt database.
-func Wrap[K ~uint64 | ~string, V any](bolt *bbolt.DB, options *Options[K, V]) (*DB[K, V], error) {
+// New does not manage the underlying *bbolt.DB lifecycle.
+func New[K ~uint64 | ~string, V any](bolt *bbolt.DB, options *Options) (db *DB[K, V], err error) {
 	var v V
 	vtype := reflect.TypeOf(v)
 	if vtype == nil {
@@ -140,7 +475,7 @@ func Wrap[K ~uint64 | ~string, V any](bolt *bbolt.DB, options *Options[K, V]) (*
 		return nil, ErrNotStructType
 	}
 	if options == nil {
-		options = new(Options[K, V])
+		options = DefaultOptions()
 	}
 
 	vname := vtype.Name()
@@ -156,58 +491,71 @@ func Wrap[K ~uint64 | ~string, V any](bolt *bbolt.DB, options *Options[K, V]) (*
 
 	boltPath := bolt.Path()
 
-	if err := regInstance(boltPath, vname); err != nil {
+	if err = regInstance(boltPath, vname); err != nil {
 		return nil, err
 	}
+	defer func() {
+		if err != nil {
+			unregInstance(boltPath, vname)
+		}
+	}()
 
-	db := &DB[K, V]{
+	db = &DB[K, V]{
 		bolt:   bolt,
 		vtype:  vtype,
-		strmap: newStrMapper(0),
+		strmap: newStrMapper(0, defaultSnapshotStrMapCompactDepth),
 		bucket: []byte(vname),
 
-		fields:   make(map[string]*field),
-		getters:  make(map[string]getterFn),
-		index:    make(map[string]*[]index),
-		lenIndex: make(map[string]*[]index),
+		fields:            make(map[string]*field),
+		getters:           make(map[string]getterFn),
+		index:             make(map[string]*[]index),
+		lenIndex:          make(map[string]*[]index),
+		lenZeroComplement: make(map[string]bool),
 
 		universe: roaring64.NewBitmap(),
 
 		rbiFile: bolt.Path() + "." + sanitizeSuffix(vname) + ".rbi",
 		opnFile: bolt.Path() + "." + sanitizeSuffix(vname) + ".rbo",
 
-		pool: sync.Pool{
+		recPool: sync.Pool{
 			New: func() any {
 				return new(V)
 			},
 		},
+		viewPool: sync.Pool{
+			New: func() any {
+				return new(DB[K, V])
+			},
+		},
 
-		noSave: options.DisableIndexStore,
+		options: options,
 
-		autoclose: options.AutoClose,
+		snapshot: snapshot{
+			pinWait: snapshotPinWaitTimeout(options.SnapshotPinWaitTimeout),
+		},
 
 		planner: planner{
 			analyzer: analyzer{
-				interval:   resolvePlannerAnalyzeInterval(options.AnalyzeInterval),
+				interval:   plannerAnalyzeInterval(options.AnalyzeInterval),
 				softBudget: defaultAnalyzeSoftBudget,
 			},
 			tracer: tracer{
 				sink:        options.TraceSink,
-				sampleEvery: resolveTraceSampleEvery(options.TraceSampleEvery, options.TraceSink),
+				sampleEvery: traceSampleEvery(options.TraceSampleEvery, options.TraceSink),
 			},
 			calibrator: calibrator{
 				enabled:     options.CalibrationEnabled,
-				sampleEvery: resolveCalibrationSampleEvery(options.CalibrationEnabled, options.CalibrationSampleEvery),
+				sampleEvery: calibrationSampleEvery(options.CalibrationEnabled, options.CalibrationSampleEvery),
 				persistPath: options.CalibrationPersistPath,
 			},
 		},
 	}
+	db.rebuilder.cond = sync.NewCond(&db.rebuilder.mu)
 
 	var k K
 	if reflect.TypeOf(k).Kind() == reflect.String {
 		db.strkey = true
 	}
-	var err error
 
 	if err = db.populateFields(vtype, nil); err != nil {
 		return nil, fmt.Errorf("failed to populate index fields: %w", err)
@@ -215,18 +563,17 @@ func Wrap[K ~uint64 | ~string, V any](bolt *bbolt.DB, options *Options[K, V]) (*
 
 	for _, f := range db.fields {
 		if db.getters[f.DBName], err = db.makeGetter(f); err != nil {
-			unregInstance(boltPath, vname)
 			return nil, fmt.Errorf("failed to create accessor func for %v: %w", f.Name, err)
 		}
 	}
+	db.initIndexedFieldAccessors()
+	db.initBatcher()
 
 	err = bolt.Update(func(tx *bbolt.Tx) error {
 		_, e := tx.CreateBucketIfNotExists(db.bucket)
 		return e
 	})
 	if err != nil {
-		_ = bolt.Close()
-		unregInstance(boltPath, vname)
 		return nil, err
 	}
 
@@ -247,82 +594,90 @@ func Wrap[K ~uint64 | ~string, V any](bolt *bbolt.DB, options *Options[K, V]) (*
 
 	if !options.DisableIndexRebuild {
 		if err = db.buildIndex(skipFields); err != nil {
-			_ = bolt.Close()
-			unregInstance(boltPath, vname)
 			return nil, fmt.Errorf("error building index: %w", err)
 		}
 	}
 
 	db.patchMap = make(map[string]*field)
 	if err = db.populatePatcher(vtype, nil); err != nil {
-		_ = bolt.Close()
-		unregInstance(boltPath, vname)
 		return nil, fmt.Errorf("failed to populate patch fields: %w", err)
 	}
 
 	for name := range db.fields {
 		db.fieldSlice = append(db.fieldSlice, name)
 	}
+	db.publishSnapshotNoLock(db.currentBoltTxID())
 
 	if err = db.RefreshPlannerStats(); err != nil {
-		_ = bolt.Close()
-		unregInstance(boltPath, vname)
 		return nil, fmt.Errorf("failed to build planner stats snapshot: %w", err)
 	}
 
 	db.initCalibration()
 
 	if err = touch(db.opnFile); err != nil {
-		_ = bolt.Close()
-		unregInstance(boltPath, vname)
 		return nil, fmt.Errorf("error creating flag-file: %w", err)
 	}
 
 	db.startPlannerAnalyzeLoop()
+	db.startSnapshotCompactor()
 
 	return db, nil
 }
 
-// Open opens or creates a bbolt database at the given filename with the
-// provided file mode, and wraps it with an indexer.
-//
-// It is equivalent to calling bbolt.Open and then Wrap with AutoClose enabled.
-// If options is nil, a default Options value is used. Open returns ErrNotStructType
-// if V is not a struct or any error returned by bbolt.Open or Wrap.
-func Open[K ~uint64 | ~string, V any](filename string, mode os.FileMode, options *Options[K, V]) (*DB[K, V], error) {
-
-	var v V
-	t := reflect.TypeOf(v)
-	if t == nil {
-		return nil, ErrNotStructType
-	}
-	if t.Kind() == reflect.Ptr {
-		t = t.Elem()
-	}
-	if t.Kind() != reflect.Struct {
-		return nil, ErrNotStructType
-	}
-	if options == nil {
-		options = new(Options[K, V])
+func (db *DB[K, V]) initIndexedFieldAccessors() {
+	if len(db.fields) == 0 {
+		db.indexedFieldAccess = nil
+		db.indexedFieldByName = nil
+		db.uniqueFieldAccessors = nil
+		return
 	}
 
-	bolt, err := bbolt.Open(filename, mode, options.BoltOptions)
-	if err != nil {
-		return nil, err
-	}
+	db.indexedFieldAccess = make([]indexedFieldAccessor, 0, len(db.fields))
+	db.indexedFieldByName = make(map[string]indexedFieldAccessor, len(db.fields))
+	db.uniqueFieldAccessors = make([]indexedFieldAccessor, 0, 4)
 
-	options.AutoClose = true
-
-	db, err := Wrap(bolt, options)
-	if err != nil {
-		_ = bolt.Close()
+	for _, f := range db.fields {
+		acc := indexedFieldAccessor{
+			name:   f.DBName,
+			field:  f,
+			getter: db.getters[f.DBName],
+		}
+		db.indexedFieldAccess = append(db.indexedFieldAccess, acc)
+		db.indexedFieldByName[f.DBName] = acc
+		if f.Unique && !f.Slice {
+			db.uniqueFieldAccessors = append(db.uniqueFieldAccessors, acc)
+		}
 	}
-	return db, err
+}
+
+func (db *DB[K, V]) initBatcher() {
+	maxOps := db.options.BatchMax
+	if maxOps <= 1 || db.options.BatchWindow <= 0 {
+		db.combiner = combiner[K, V]{}
+		return
+	}
+	maxQueue := db.options.BatchMaxQueue
+	if maxQueue < 0 {
+		maxQueue = 0
+	}
+	capHint := max(64, maxOps*4)
+	if maxQueue > 0 && maxQueue < capHint {
+		capHint = maxQueue
+	}
+	db.combiner = combiner[K, V]{
+		enabled:        true,
+		window:         db.options.BatchWindow,
+		maxOps:         maxOps,
+		maxQ:           maxQueue,
+		allowCallbacks: db.options.BatchAllowCallbacks,
+		queue:          make([]*combineRequest[K, V], 0, capHint),
+	}
+	db.combiner.retCond = sync.NewCond(&db.combiner.mu)
 }
 
 type planner struct {
 	statsVersion atomic.Uint64
-	stats        atomic.Pointer[PlannerStatsSnapshot]
+	stats        atomic.Pointer[plannerStatsSnapshot]
 
 	analyzer   analyzer
 	tracer     tracer
@@ -355,6 +710,95 @@ type calibrator struct {
 	sync.Mutex
 }
 
+type snapshot struct {
+	current atomic.Pointer[indexSnapshot]
+
+	byTx  map[uint64]*snapshotRef
+	order []uint64
+	head  int
+
+	pinWait time.Duration
+
+	compactReq  chan struct{}
+	compactIdle chan struct{}
+	compactStop chan struct{}
+	compactDone chan struct{}
+
+	compactForcePending atomic.Bool
+	compactPinsBlocked  atomic.Bool
+	compactLastActivity atomic.Int64
+
+	compactRequested atomic.Uint64
+	compactRuns      atomic.Uint64
+	compactAttempts  atomic.Uint64
+	compactSucceeded atomic.Uint64
+	compactLockMiss  atomic.Uint64
+	compactNoChange  atomic.Uint64
+	compactWriteSeq  atomic.Uint64
+	compactSkipUntil atomic.Uint64
+
+	mu sync.RWMutex
+}
+
+type indexedFieldAccessor struct {
+	name   string
+	field  *field
+	getter getterFn
+}
+
+type combiner[K ~string | ~uint64, V any] struct {
+	enabled        bool
+	window         time.Duration
+	maxOps         int
+	maxQ           int
+	allowCallbacks bool
+
+	mu       sync.Mutex
+	retCond  *sync.Cond
+	running  bool
+	queue    []*combineRequest[K, V]
+	emitSeq  uint64
+	retSeq   uint64
+	hotUntil time.Time
+
+	submitted          atomic.Uint64
+	enqueued           atomic.Uint64
+	dequeued           atomic.Uint64
+	batches            atomic.Uint64
+	combinedBatches    atomic.Uint64
+	combinedOps        atomic.Uint64
+	callbackOps        atomic.Uint64
+	coalescedSetDelete atomic.Uint64
+	maxBatchSeen       atomic.Uint64
+	queueHighWater     atomic.Uint64
+	coalesceWaits      atomic.Uint64
+	coalesceWaitNanos  atomic.Uint64
+
+	fallbackDisabled    atomic.Uint64
+	fallbackQueueFull   atomic.Uint64
+	fallbackCallbacks   atomic.Uint64
+	fallbackPatchUnique atomic.Uint64
+	fallbackClosed      atomic.Uint64
+
+	uniqueRejected atomic.Uint64
+	txBeginErrors  atomic.Uint64
+	txOpErrors     atomic.Uint64
+	txCommitErrors atomic.Uint64
+	callbackErrors atomic.Uint64
+}
+
+type rebuilder struct {
+	active   atomic.Bool
+	inflight atomic.Int64
+	mu       sync.Mutex
+	cond     *sync.Cond
+}
+
+type testHooks struct {
+	beforeCommit     func(op string) error
+	beforeStoreIndex func() error
+}
+
 type (
 	// DB wraps a bbolt database and maintains secondary indexes over values of type *V
 	// stored in a single bucket. It supports efficient equality and range queries,
@@ -367,62 +811,324 @@ type (
 
 		bucket []byte
 
-		strkey   bool
-		strmap   *strMapper
+		strkey     bool
+		strmap     *strMapper
+		strmapView *strMapSnapshot
+
 		universe *roaring64.Bitmap
 
-		fields     map[string]*field
-		fieldSlice []string
-		hasUnique  bool
+		fields         map[string]*field
+		fieldSlice     []string
+		hasUnique      bool
+		lenIndexLoaded bool
 
-		getters  map[string]getterFn
-		index    map[string]*[]index
-		lenIndex map[string]*[]index
+		getters              map[string]getterFn
+		indexedFieldAccess   []indexedFieldAccessor
+		indexedFieldByName   map[string]indexedFieldAccessor
+		uniqueFieldAccessors []indexedFieldAccessor
+		index                map[string]*[]index
+		lenIndex             map[string]*[]index
+		lenZeroComplement    map[string]bool
+		patchMap             map[string]*field
 
-		patchMap map[string]*field
+		planner   planner
+		snapshot  snapshot
+		combiner  combiner[K, V]
+		rebuilder rebuilder
+
+		options *Options
 
 		rbiFile string
 		opnFile string
 
-		pool sync.Pool
+		recPool  sync.Pool
+		viewPool sync.Pool
 
-		mu     sync.RWMutex
-		closed atomic.Bool
-
+		mu      sync.RWMutex
+		closed  atomic.Bool
 		noIndex atomic.Bool
-		noSave  bool
-
-		autoclose bool
 
 		stats Stats[K]
 
-		planner planner
-	}
-	index struct {
-		Key string
-		IDs *roaring64.Bitmap
+		traceRoot *DB[K, V]
+		testHooks testHooks
 	}
 
-	// Stats contains some metrics about the current index and key space.
+	index struct {
+		Key indexKey
+		IDs postingList
+	}
+
+	// Stats is an aggregate diagnostic snapshot of DB state.
+	//
+	// It combines outputs of IndexStats, RuntimeStats, SnapshotStats,
+	// PlannerStats, CalibrationStats and BatchStats.
+	//
+	// For scenario-specific telemetry, prefer calling the corresponding
+	// component method directly to avoid unnecessary work.
 	Stats[K ~uint64 | ~string] struct {
+		// Index contains additional index shape diagnostics useful for memory analysis.
+		Index IndexStats[K]
+		// Runtime contains process-level memory counters sampled during Stats().
+		Runtime RuntimeStats
+		// Snapshot contains copy-on-write snapshot/compactor diagnostics.
+		Snapshot SnapshotStats
+		// Planner contains current planner statistics snapshot and settings.
+		Planner PlannerStats
+		// Calibration contains current online planner calibration state.
+		Calibration CalibrationStats
+		// Batch contains write-combiner queue/batch/fallback diagnostics.
+		Batch BatchStats
+	}
+
+	// PlannerStats contains planner snapshot metadata, per-field stats and sampling settings.
+	PlannerStats struct {
+		// Version is the current planner statistics version.
+		Version uint64
+		// GeneratedAt is the timestamp when planner stats were generated.
+		GeneratedAt time.Time
+		// UniverseCardinality is the universe cardinality used by planner stats.
+		UniverseCardinality uint64
+		// FieldCount is the number of fields represented in planner stats.
+		FieldCount int
+		// Fields contains per-field planner cardinality distribution metrics.
+		// The map is deep-copied and safe for caller mutation.
+		Fields map[string]PlannerFieldStats
+
+		// AnalyzeInterval is the configured periodic planner analyze interval.
+		AnalyzeInterval time.Duration
+		// TraceSampleEvery controls trace sampling frequency (every Nth query).
+		TraceSampleEvery uint64
+	}
+
+	// CalibrationStats contains online planner calibration diagnostics.
+	CalibrationStats struct {
+		// Enabled reports whether online calibration is enabled.
+		Enabled bool
+		// SampleEvery controls calibration sampling frequency (every Nth query).
+		SampleEvery uint64
+
+		// UpdatedAt is the timestamp of the last calibration state update.
+		UpdatedAt time.Time
+		// SamplesTotal is the total number of accumulated calibration samples.
+		SamplesTotal uint64
+
+		// Multipliers stores per-plan calibration multipliers.
+		Multipliers map[string]float64
+		// Samples stores per-plan calibration sample counters.
+		Samples map[string]uint64
+	}
+
+	// IndexStats contains index build/load timings and current index shape metrics.
+	IndexStats[K ~uint64 | ~string] struct {
 		// IndexBuildTime is the duration of the last index rebuild.
-		IndexBuildTime time.Duration
+		BuildTime time.Duration
 		// IndexBuildRPS is an approximate throughput (records per second) of the last index rebuild.
-		IndexBuildRPS int
+		BuildRPS int
 		// IndexLoadTime is the time spent loading a persisted index from disk on the last successful load.
-		IndexLoadTime time.Duration
-		// UniqueFieldKeys contains the number of unique index keys per indexed field name.
-		UniqueFieldKeys map[string]uint64
-		// IndexSize contains the total size of the index, in bytes.
-		IndexSize uint64
-		// IndexFieldSize contains the size of the index for each indexed field.
-		IndexFieldSize map[string]uint64
+		LoadTime time.Duration
+
 		// LastKey is the largest key present in the database according to the
 		// current universe bitmap. For string keys this is derived from the
 		// internal string mapping.
 		LastKey K
 		// KeyCount is the total number of keys currently present in the database.
 		KeyCount uint64
+
+		// UniqueFieldKeys contains the number of unique index keys per indexed field name.
+		UniqueFieldKeys map[string]uint64
+		// IndexSize contains the total size of the index, in bytes.
+		Size uint64
+		// IndexFieldSize contains the size of the index for each indexed field.
+		FieldSize map[string]uint64
+		// IndexFieldKeyBytes contains total bytes occupied by index keys per field.
+		FieldKeyBytes map[string]uint64
+		// IndexFieldTotalCardinality contains sum of posting-list cardinalities per field.
+		FieldTotalCardinality map[string]uint64
+
+		// FieldCount is the number of indexed fields in the current snapshot.
+		FieldCount int
+
+		// EntryCount is the total number of non-empty index entries across fields.
+		EntryCount uint64
+		// KeyBytes is the total byte length of index keys across entries.
+		KeyBytes uint64
+		// BitmapCardinality is the sum of posting bitmap cardinalities across entries.
+		BitmapCardinality uint64
+
+		// ApproxStructBytes is approximate memory used by index entry structs.
+		ApproxStructBytes uint64
+		// ApproxHeapBytes is rough index heap estimate from bitmaps, keys and structs.
+		ApproxHeapBytes uint64
+	}
+
+	// RuntimeStats contains process runtime memory counters.
+	RuntimeStats struct {
+		// Goroutines is the current number of goroutines.
+		Goroutines int
+
+		// HeapAlloc is bytes of allocated heap objects.
+		HeapAlloc uint64
+		// HeapInuse is bytes in in-use heap spans.
+		HeapInuse uint64
+		// HeapIdle is bytes in idle heap spans.
+		HeapIdle uint64
+		// HeapReleased is bytes returned from heap to OS.
+		HeapReleased uint64
+		// HeapObjects is the number of allocated heap objects.
+		HeapObjects uint64
+
+		// StackInuse is bytes in stack spans.
+		StackInuse uint64
+		// MSpanInuse is bytes in mspan allocator metadata.
+		MSpanInuse uint64
+		// MCacheInuse is bytes in mcache allocator metadata.
+		MCacheInuse uint64
+
+		// NextGC is the target heap size for the next GC cycle.
+		NextGC uint64
+		// LastGC is the timestamp of the last completed GC cycle.
+		LastGC time.Time
+		// NumGC is the total number of completed GC cycles.
+		NumGC uint32
+		// GCCPUFraction is the fraction of available CPU used by GC since start.
+		GCCPUFraction float64
+	}
+
+	// BatchStats contains write-combiner queue/batch/fallback diagnostics.
+	BatchStats struct {
+		// Enabled reports whether write combining is enabled.
+		Enabled bool
+		// Window is current coalescing window duration.
+		Window time.Duration
+		// MaxBatch is configured maximum combined batch size.
+		MaxBatch int
+		// MaxQueue is configured maximum queue size (0 means unbounded).
+		MaxQueue int
+		// AllowCallbacks reports whether callback-bearing writes can be combined.
+		AllowCallbacks bool
+
+		// QueueLen is current pending requests in queue.
+		QueueLen int
+		// QueueCap is current allocated queue capacity.
+		QueueCap int
+		// WorkerRunning reports whether combiner worker goroutine is active.
+		WorkerRunning bool
+		// HotWindowActive reports whether adaptive hot coalescing window is active.
+		HotWindowActive bool
+
+		// Submitted is number of submit attempts from eligible write calls.
+		Submitted uint64
+		// Enqueued is number of requests accepted into combiner queue.
+		Enqueued uint64
+		// Dequeued is number of requests popped from queue for execution.
+		Dequeued uint64
+		// QueueHighWater is maximum observed queue length.
+		QueueHighWater uint64
+
+		// Batches is total executed combined-transaction batches.
+		Batches uint64
+		// CombinedBatches is number of batches containing more than one request.
+		CombinedBatches uint64
+		// CombinedOps is total requests executed inside multi-request batches.
+		CombinedOps uint64
+		// AvgBatchSize is average requests per executed batch.
+		AvgBatchSize float64
+		// MaxBatchSeen is maximum observed executed batch size.
+		MaxBatchSeen uint64
+
+		// CallbackOps is number of requests with PreCommit callbacks executed by combiner.
+		CallbackOps uint64
+		// CoalescedSetDelete is number of Set/Delete requests collapsed into later Set/Delete of same ID.
+		CoalescedSetDelete uint64
+
+		// CoalesceWaits is number of coalescing sleeps performed by worker.
+		CoalesceWaits uint64
+		// CoalesceWaitTime is total time spent sleeping for coalescing.
+		CoalesceWaitTime time.Duration
+
+		// FallbackDisabled is number of write calls not queued because combiner is disabled.
+		FallbackDisabled uint64
+		// FallbackQueueFull is number of write calls not queued because queue is full.
+		FallbackQueueFull uint64
+		// FallbackCallbacks is number of write calls not queued because callbacks
+		// are present and callback batching is disabled.
+		FallbackCallbacks uint64
+		// FallbackPatchUnique is a legacy counter of patch calls not queued due to
+		// potential unique-field touch (kept for compatibility; expected to stay 0).
+		FallbackPatchUnique uint64
+		// FallbackClosed is number of write calls rejected by combiner because DB is closed.
+		FallbackClosed uint64
+
+		// UniqueRejected is number of queued requests rejected by unique checks before commit.
+		UniqueRejected uint64
+		// TxBeginErrors is number of write tx begin failures inside combiner.
+		TxBeginErrors uint64
+		// TxOpErrors is number of write tx operation failures before commit.
+		TxOpErrors uint64
+		// TxCommitErrors is number of write tx commit failures.
+		TxCommitErrors uint64
+		// CallbackErrors is number of callback failures returned by PreCommit funcs.
+		CallbackErrors uint64
+	}
+
+	// SnapshotStats contains copy-on-write snapshot and compactor diagnostics.
+	SnapshotStats struct {
+		// TxID is the transaction ID of the published snapshot.
+		TxID uint64
+
+		// HasDelta reports whether snapshot contains any delta state.
+		HasDelta bool
+		// UniverseBaseCard is cardinality of the base universe bitmap.
+		UniverseBaseCard uint64
+		// IndexLayerDepth is depth of index delta layer chain.
+		IndexLayerDepth int
+		// LenLayerDepth is depth of length-index delta layer chain.
+		LenLayerDepth int
+
+		// IndexDeltaFields is number of fields with effective index delta.
+		IndexDeltaFields int
+		// LenDeltaFields is number of fields with effective length delta.
+		LenDeltaFields int
+		// IndexDeltaKeys is total effective keys in index delta layers.
+		IndexDeltaKeys int
+		// LenDeltaKeys is total effective keys in length delta layers.
+		LenDeltaKeys int
+		// IndexDeltaOps is total effective operations in index delta layers.
+		IndexDeltaOps uint64
+		// LenDeltaOps is total effective operations in length delta layers.
+		LenDeltaOps uint64
+
+		// UniverseAddCard is cardinality of pending universe additions.
+		UniverseAddCard uint64
+		// UniverseRemCard is cardinality of pending universe removals.
+		UniverseRemCard uint64
+
+		// RegistrySize is number of snapshot entries tracked in registry map.
+		RegistrySize int
+		// RegistryOrderLen is length of registry order buffer.
+		RegistryOrderLen int
+		// RegistryHead is current head offset inside registry order buffer.
+		RegistryHead int
+		// PinnedRefs is number of registry snapshots with active pins.
+		PinnedRefs int
+		// PendingRefs is number of registry snapshots marked pending.
+		PendingRefs int
+
+		// CompactorQueueLen is current compactor request queue length.
+		CompactorQueueLen int
+		// CompactorRequested is total number of compaction requests.
+		CompactorRequested uint64
+		// CompactorRuns is total number of compactor loop runs.
+		CompactorRuns uint64
+		// CompactorAttempts is total latest-snapshot compaction attempts.
+		CompactorAttempts uint64
+		// CompactorSucceeded is total successful compactions applied.
+		CompactorSucceeded uint64
+		// CompactorLockMiss is total attempts skipped due to DB lock contention.
+		CompactorLockMiss uint64
+		// CompactorNoChange is total attempts that produced no effective changes.
+		CompactorNoChange uint64
 	}
 )
 
@@ -441,7 +1147,7 @@ func (db *DB[K, V]) EnableSync() {
 //
 // When indexing is disabled:
 //   - Index structures are no longer kept up to date.
-//   - QueryItems, QueryKeys and Count will return an error, because the index is considered invalid.
+//   - Query, QueryKeys and Count will return an error, because the index is considered invalid.
 //   - The caller is responsible for rebuilding the index via RebuildIndex before attempting to run queries again.
 //
 // This is intended for high-throughput batch writes where the index will be rebuilt later.
@@ -454,12 +1160,113 @@ func (db *DB[K, V]) DisableIndexing() { db.noIndex.Store(true) }
 // may be stale or inconsistent until RebuildIndex is called.
 func (db *DB[K, V]) EnableIndexing() { db.noIndex.Store(false) }
 
+func (db *DB[K, V]) beginOp() error {
+	if db.closed.Load() {
+		return ErrClosed
+	}
+	if db.rebuilder.active.Load() {
+		return ErrRebuildInProgress
+	}
+
+	db.rebuilder.inflight.Add(1)
+	if db.closed.Load() {
+		db.endOp()
+		return ErrClosed
+	}
+	if db.rebuilder.active.Load() {
+		db.endOp()
+		return ErrRebuildInProgress
+	}
+	return nil
+}
+
+func (db *DB[K, V]) beginOpWait() bool {
+	for {
+		if db.closed.Load() {
+			return false
+		}
+		if !db.rebuilder.active.Load() {
+			db.rebuilder.inflight.Add(1)
+			if db.closed.Load() {
+				db.endOp()
+				return false
+			}
+			if !db.rebuilder.active.Load() {
+				return true
+			}
+			db.endOp()
+		}
+		db.rebuilder.mu.Lock()
+		for db.rebuilder.active.Load() {
+			db.rebuilder.cond.Wait()
+		}
+		db.rebuilder.mu.Unlock()
+	}
+}
+
+func (db *DB[K, V]) endOp() {
+	if db.rebuilder.inflight.Add(-1) == 0 {
+		db.rebuilder.mu.Lock()
+		db.rebuilder.cond.Broadcast()
+		db.rebuilder.mu.Unlock()
+	}
+}
+
+func (db *DB[K, V]) beginRebuildSuspend() error {
+	if db.closed.Load() {
+		return ErrClosed
+	}
+	if !db.rebuilder.active.CompareAndSwap(false, true) {
+		if db.closed.Load() {
+			return ErrClosed
+		}
+		return ErrRebuildInProgress
+	}
+	return nil
+}
+
+func (db *DB[K, V]) endRebuildSuspend() {
+	db.rebuilder.active.Store(false)
+	db.rebuilder.mu.Lock()
+	db.rebuilder.cond.Broadcast()
+	db.rebuilder.mu.Unlock()
+}
+
+func (db *DB[K, V]) waitForInFlightOps() {
+	db.rebuilder.mu.Lock()
+	for db.rebuilder.inflight.Load() > 0 {
+		db.rebuilder.cond.Wait()
+	}
+	db.rebuilder.mu.Unlock()
+}
+
+func (db *DB[K, V]) commitTx(tx *bbolt.Tx, op string) error {
+	if hook := db.testHooks.beforeCommit; hook != nil {
+		if err := hook(op); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
 // RebuildIndex discards and rebuilds all in-memory index data.
 // It acquires an exclusive lock for its duration.
+// While rebuild is active, new DB operations fail with ErrRebuildInProgress.
 // While it is safe to call at any time, it might be expensive for large datasets.
 func (db *DB[K, V]) RebuildIndex() error {
+	if err := db.beginRebuildSuspend(); err != nil {
+		return err
+	}
+	defer db.endRebuildSuspend()
+
+	db.waitForInFlightOps()
+
 	db.mu.Lock()
 	defer db.mu.Unlock()
+
+	if db.closed.Load() {
+		return ErrClosed
+	}
 
 	if err := db.buildIndex(nil); err != nil {
 		return err
@@ -469,40 +1276,260 @@ func (db *DB[K, V]) RebuildIndex() error {
 	return nil
 }
 
-// Stats returns basic information about the index, load times and key space.
-// On large databases Stats can be slow.
+// Stats returns an aggregate diagnostic snapshot by combining results of
+// IndexStats, RuntimeStats, SnapshotStats, PlannerStats, CalibrationStats and
+// BatchStats.
+//
+// On large databases this can be expensive.
+//
+// For specific use-cases, prefer calling the corresponding component method
+// directly to avoid collecting unrelated diagnostic data.
 func (db *DB[K, V]) Stats() Stats[K] {
-	db.mu.RLock()
-	defer db.mu.RUnlock()
-
-	s := db.stats
-
-	s.UniqueFieldKeys = make(map[string]uint64)
-	s.IndexFieldSize = make(map[string]uint64)
-
-	for name, i := range db.index {
-		s.UniqueFieldKeys[name] = uint64(len(*i))
-		var size uint64
-		for _, bm := range *i {
-			size += bm.IDs.GetSizeInBytes()
-		}
-		s.IndexFieldSize[name] = size
-		s.IndexSize += size
-	}
-
-	s.LastKey = db.lastIDNoLock()
-	s.KeyCount = db.universe.GetCardinality()
-
+	var s Stats[K]
+	s.Index = db.IndexStats()
+	s.Runtime = db.RuntimeStats()
+	s.Snapshot = db.SnapshotStats()
+	s.Planner = db.PlannerStats()
+	s.Calibration = db.CalibrationStats()
+	s.Batch = db.BatchStats()
 	return s
 }
 
-// Close closes the indexed DB and optionally the underlying Bolt database.
+// IndexStats returns current index stats.
+// On large databases this can be expensive.
+func (db *DB[K, V]) IndexStats() IndexStats[K] {
+	if !db.beginOpWait() {
+		return IndexStats[K]{}
+	}
+	defer db.endOp()
+
+	snap := db.getSnapshot()
+
+	// Preserve persistent index timings captured during build/load, while
+	// recalculating shape/size diagnostics from the current snapshot.
+	db.mu.RLock()
+	idx := db.stats.Index
+	db.mu.RUnlock()
+	idx.Size = 0
+	idx.FieldCount = 0
+	idx.EntryCount = 0
+	idx.KeyBytes = 0
+	idx.BitmapCardinality = 0
+	idx.ApproxStructBytes = 0
+	idx.ApproxHeapBytes = 0
+	idx.UniqueFieldKeys = make(map[string]uint64)
+	idx.FieldSize = make(map[string]uint64)
+	idx.FieldKeyBytes = make(map[string]uint64)
+	idx.FieldTotalCardinality = make(map[string]uint64)
+
+	fields := snap.fieldNameSet()
+	idx.FieldCount = len(fields)
+
+	scratch := getRoaringBuf()
+	defer releaseRoaringBuf(scratch)
+
+	for name := range fields {
+		ov := newFieldOverlay(snap.fieldIndexSlice(name), snap.fieldDelta(name))
+		br := ov.rangeForBounds(rangeBounds{has: true})
+		if br.baseStart >= br.baseEnd && br.deltaStart >= br.deltaEnd {
+			continue
+		}
+		var (
+			unique uint64
+			size   uint64
+			keyLen uint64
+			card   uint64
+		)
+		cur := ov.newCursor(br, false)
+		for {
+			key, baseBM, de, ok := cur.next()
+			if !ok {
+				break
+			}
+			if deltaEntryIsEmpty(de) {
+				if baseBM.IsEmpty() {
+					continue
+				}
+				unique++
+				size += baseBM.SizeInBytes()
+				keyLen += uint64(key.byteLen())
+				curCard := baseBM.Cardinality()
+				card += curCard
+				idx.EntryCount++
+				idx.KeyBytes += uint64(key.byteLen())
+				idx.BitmapCardinality += curCard
+				continue
+			}
+			bm, owned := composePostingOwned(baseBM, de, scratch)
+			if bm == nil || bm.IsEmpty() {
+				if owned && bm != nil && bm != scratch {
+					releaseRoaringBuf(bm)
+				}
+				continue
+			}
+			unique++
+			size += bm.GetSizeInBytes()
+			keyLen += uint64(key.byteLen())
+			curCard := bm.GetCardinality()
+			card += curCard
+			idx.EntryCount++
+			idx.KeyBytes += uint64(key.byteLen())
+			idx.BitmapCardinality += curCard
+			if owned && bm != scratch {
+				releaseRoaringBuf(bm)
+			}
+		}
+		idx.UniqueFieldKeys[name] = unique
+		idx.FieldSize[name] = size
+		idx.FieldKeyBytes[name] = keyLen
+		idx.FieldTotalCardinality[name] = card
+		idx.Size += size
+	}
+	idx.ApproxStructBytes = idx.EntryCount * uint64(unsafe.Sizeof(index{}))
+	idx.ApproxHeapBytes = idx.Size + idx.KeyBytes + idx.ApproxStructBytes
+
+	universe := roaring64.NewBitmap()
+	if snap.universe != nil && !snap.universe.IsEmpty() {
+		universe.Or(snap.universe)
+	}
+	if snap.universeAdd != nil && !snap.universeAdd.IsEmpty() {
+		universe.Or(snap.universeAdd)
+	}
+	if snap.universeRem != nil && !snap.universeRem.IsEmpty() {
+		universe.AndNot(snap.universeRem)
+	}
+	idx.KeyCount = universe.GetCardinality()
+	if idx.KeyCount > 0 {
+		maxIdx := universe.Maximum()
+		if db.strkey {
+			if key, ok := snap.strmap.getStringNoLock(maxIdx); ok {
+				idx.LastKey = *(*K)(unsafe.Pointer(&key))
+			}
+		} else {
+			idx.LastKey = *(*K)(unsafe.Pointer(&maxIdx))
+		}
+	}
+	return idx
+}
+
+// RuntimeStats returns process runtime memory stats.
+func (db *DB[K, V]) RuntimeStats() RuntimeStats {
+	var out RuntimeStats
+	var mem runtime.MemStats
+	runtime.ReadMemStats(&mem)
+	out.Goroutines = runtime.NumGoroutine()
+	out.HeapAlloc = mem.HeapAlloc
+	out.HeapInuse = mem.HeapInuse
+	out.HeapIdle = mem.HeapIdle
+	out.HeapReleased = mem.HeapReleased
+	out.HeapObjects = mem.HeapObjects
+	out.StackInuse = mem.StackInuse
+	out.MSpanInuse = mem.MSpanInuse
+	out.MCacheInuse = mem.MCacheInuse
+	out.NextGC = mem.NextGC
+	if mem.LastGC > 0 {
+		out.LastGC = time.Unix(0, int64(mem.LastGC))
+	}
+	out.NumGC = mem.NumGC
+	out.GCCPUFraction = mem.GCCPUFraction
+	return out
+}
+
+// BatchStats returns write-combiner queue/batch/fallback diagnostics.
+func (db *DB[K, V]) BatchStats() BatchStats {
+	out := BatchStats{
+		Enabled:             db.combiner.enabled,
+		Window:              db.combiner.window,
+		MaxBatch:            db.combiner.maxOps,
+		MaxQueue:            db.combiner.maxQ,
+		AllowCallbacks:      db.combiner.allowCallbacks,
+		Submitted:           db.combiner.submitted.Load(),
+		Enqueued:            db.combiner.enqueued.Load(),
+		Dequeued:            db.combiner.dequeued.Load(),
+		QueueHighWater:      db.combiner.queueHighWater.Load(),
+		Batches:             db.combiner.batches.Load(),
+		CombinedBatches:     db.combiner.combinedBatches.Load(),
+		CombinedOps:         db.combiner.combinedOps.Load(),
+		MaxBatchSeen:        db.combiner.maxBatchSeen.Load(),
+		CallbackOps:         db.combiner.callbackOps.Load(),
+		CoalescedSetDelete:  db.combiner.coalescedSetDelete.Load(),
+		CoalesceWaits:       db.combiner.coalesceWaits.Load(),
+		CoalesceWaitTime:    time.Duration(db.combiner.coalesceWaitNanos.Load()),
+		FallbackDisabled:    db.combiner.fallbackDisabled.Load(),
+		FallbackQueueFull:   db.combiner.fallbackQueueFull.Load(),
+		FallbackCallbacks:   db.combiner.fallbackCallbacks.Load(),
+		FallbackPatchUnique: db.combiner.fallbackPatchUnique.Load(),
+		FallbackClosed:      db.combiner.fallbackClosed.Load(),
+		UniqueRejected:      db.combiner.uniqueRejected.Load(),
+		TxBeginErrors:       db.combiner.txBeginErrors.Load(),
+		TxOpErrors:          db.combiner.txOpErrors.Load(),
+		TxCommitErrors:      db.combiner.txCommitErrors.Load(),
+		CallbackErrors:      db.combiner.callbackErrors.Load(),
+	}
+
+	db.combiner.mu.Lock()
+	out.QueueLen = len(db.combiner.queue)
+	out.QueueCap = cap(db.combiner.queue)
+	out.WorkerRunning = db.combiner.running
+	out.HotWindowActive = time.Now().Before(db.combiner.hotUntil)
+	db.combiner.mu.Unlock()
+
+	if out.Batches > 0 {
+		out.AvgBatchSize = float64(out.Dequeued) / float64(out.Batches)
+	}
+	return out
+}
+
+// PlannerStats returns current planner stats.
+func (db *DB[K, V]) PlannerStats() PlannerStats {
+	out := PlannerStats{
+		Fields: make(map[string]PlannerFieldStats),
+	}
+	if ps := db.planner.stats.Load(); ps != nil {
+		out.Version = ps.Version
+		out.GeneratedAt = ps.GeneratedAt
+		out.UniverseCardinality = ps.UniverseCardinality
+		out.FieldCount = len(ps.Fields)
+		if out.FieldCount > 0 {
+			out.Fields = make(map[string]PlannerFieldStats, out.FieldCount)
+			for k, v := range ps.Fields {
+				out.Fields[k] = v
+			}
+		}
+	}
+	out.TraceSampleEvery = db.planner.tracer.sampleEvery
+	db.planner.analyzer.Lock()
+	out.AnalyzeInterval = db.planner.analyzer.interval
+	db.planner.analyzer.Unlock()
+	return out
+}
+
+// CalibrationStats returns current planner calibration stats.
+func (db *DB[K, V]) CalibrationStats() CalibrationStats {
+	out := CalibrationStats{
+		Enabled:     db.planner.calibrator.enabled,
+		SampleEvery: db.planner.calibrator.sampleEvery,
+		Multipliers: make(map[string]float64, int(plannerCalPlanCount)),
+		Samples:     make(map[string]uint64, int(plannerCalPlanCount)),
+	}
+	if cs := db.planner.calibrator.state.Load(); cs != nil {
+		cal := calibrationSnapshotFromState(cs)
+		out.UpdatedAt = cal.UpdatedAt
+		out.Multipliers = cal.Multipliers
+		out.Samples = cal.Samples
+		for _, n := range cal.Samples {
+			out.SamplesTotal += n
+		}
+	}
+	return out
+}
+
+// Close closes the indexed DB.
 //
 // On the first call, Close:
-//   - Persists the current index state to the .rbi file unless index
-//     persistence is disabled.
+//   - Persists the current index state to the .rbi file unless index persistence is disabled.
 //   - Removes the .rbo flag file used to detect unsafe shutdowns.
-//   - Closes the underlying Bolt database if AutoClose was set.
+//   - Does not close the underlying *bbolt.DB.
 //
 // Subsequent calls to Close are no-op.
 // After Close, all other methods return ErrClosed.
@@ -512,6 +1539,7 @@ func (db *DB[K, V]) Close() error {
 	}
 
 	db.stopAnalyzeLoop()
+	db.stopSnapshotCompactor()
 
 	db.mu.Lock()
 	defer db.mu.Unlock()
@@ -520,7 +1548,7 @@ func (db *DB[K, V]) Close() error {
 
 	var err error
 
-	if !db.noSave {
+	if !db.options.DisableIndexStore {
 		err = db.storeIndex()
 	}
 
@@ -540,12 +1568,6 @@ func (db *DB[K, V]) Close() error {
 		}
 	}
 
-	if db.autoclose {
-		if e := db.bolt.Close(); e != nil {
-			return e // bolt errors are more important
-		}
-	}
-
 	return err
 }
 
@@ -553,18 +1575,26 @@ func (db *DB[K, V]) Close() error {
 //
 // Truncate does not reclaim disk space.
 func (db *DB[K, V]) Truncate() error {
+	if err := db.beginOp(); err != nil {
+		return err
+	}
+	defer db.endOp()
+
+	// Keep writer lock order consistent with batched/single write paths:
+	// open bbolt write tx first, then take db.mu. This avoids tx<->mu inversion
+	// deadlocks against executeCombinedBatch (which already uses that order).
+	tx, err := db.bolt.Begin(true)
+	if err != nil {
+		return fmt.Errorf("tx error: %w", err)
+	}
+	defer rollback(tx)
+
 	db.mu.Lock()
 	defer db.mu.Unlock()
 
 	if db.closed.Load() {
 		return ErrClosed
 	}
-
-	tx, err := db.bolt.Begin(true)
-	if err != nil {
-		return fmt.Errorf("tx error: %w", err)
-	}
-	defer rollback(tx)
 
 	if tx.Bucket(db.bucket) != nil {
 		if err = tx.DeleteBucket(db.bucket); err != nil {
@@ -576,25 +1606,21 @@ func (db *DB[K, V]) Truncate() error {
 		return fmt.Errorf("error creating bucket: %w", err)
 	}
 
-	if err = tx.Commit(); err != nil {
+	txID := uint64(tx.ID())
+	db.markPending(txID)
+	if err = db.commitTx(tx, "truncate"); err != nil {
+		db.clearPending(txID)
 		return fmt.Errorf("commit error: %w", err)
 	}
 
 	db.strmap.truncate()
-
-	// for k := range db.index {
-	// 	s := make([]index, 0, initialIndexLen)
-	// 	db.index[k] = &s
-	// }
 	db.index = make(map[string]*[]index)
-
-	// for k := range db.lenIndex {
-	// 	s := make([]index, 0, 8)
-	// 	db.lenIndex[k] = &s
-	// }
 	db.lenIndex = make(map[string]*[]index)
+	db.lenZeroComplement = make(map[string]bool)
 
-	db.universe.Clear()
+	// Keep previously published snapshots immutable for concurrent readers.
+	db.universe = roaring64.NewBitmap()
+	db.publishSnapshotNoLock(txID)
 
 	return nil
 }
@@ -607,7 +1633,7 @@ func (db *DB[K, V]) ReleaseRecords(v ...*V) {
 	for _, rec := range v {
 		if rec != nil {
 			*rec = zero
-			db.pool.Put(rec)
+			db.recPool.Put(rec)
 		}
 	}
 }
@@ -623,27 +1649,108 @@ func (db *DB[K, V]) BucketName() []byte {
 	return slices.Clone(db.bucket)
 }
 
-type strMapper struct {
+type strMapSnapshot struct {
 	Next uint64
 	Keys map[string]uint64
 	Strs map[uint64]string
 
-	sync.RWMutex
+	// DenseStrs/DenseUsed store compact base snapshots.
+	// Delta layers keep sparse Strs map to avoid full-slice copies per publish.
+	DenseStrs []string
+	DenseUsed []bool
+
+	base     *strMapSnapshot
+	baseNext uint64
+	depth    int
 }
 
-func newStrMapper(size uint64) *strMapper {
-	return &strMapper{
-		Keys: make(map[string]uint64, size),
-		Strs: make(map[uint64]string, size),
+func (s *strMapSnapshot) getIdxNoLock(key string) (uint64, bool) {
+	for cur := s; cur != nil; cur = cur.base {
+		if cur.Keys == nil {
+			continue
+		}
+		if v, ok := cur.Keys[key]; ok {
+			return v, true
+		}
 	}
+	return 0, false
+}
+
+func (s *strMapSnapshot) getStringNoLock(idx uint64) (string, bool) {
+	for cur := s; cur != nil; cur = cur.base {
+		if cur.base != nil && idx <= cur.baseNext {
+			continue
+		}
+
+		if cur.DenseStrs != nil {
+			if idx <= uint64(^uint(0)>>1) {
+				i := int(idx)
+				if i < len(cur.DenseStrs) && i < len(cur.DenseUsed) && cur.DenseUsed[i] {
+					return cur.DenseStrs[i], true
+				}
+			}
+			continue
+		}
+
+		if cur.Strs != nil {
+			if v, ok := cur.Strs[idx]; ok {
+				return v, true
+			}
+		}
+	}
+	return "", false
+}
+
+func (s *strMapSnapshot) mustGetStringNoLock(idx uint64) string {
+	if v, ok := s.getStringNoLock(idx); ok {
+		return v
+	}
+	panic(fmt.Errorf("no id associated with idx %v", idx))
+}
+
+type strMapper struct {
+	Next uint64
+	Keys map[string]uint64
+	Strs []string
+
+	strsUsed []bool
+
+	deltaKeys map[string]uint64
+	deltaStrs map[uint64]string
+	snap      *strMapSnapshot
+	compactAt int
+
+	sync.Mutex
+}
+
+func newStrMapper(size uint64, compactAt int) *strMapper {
+	capHint := 1
+	if size > 0 && size < uint64(^uint(0)>>1) {
+		capHint = int(size) + 1
+	}
+	sm := &strMapper{
+		Keys:      make(map[string]uint64, size),
+		Strs:      make([]string, 1, capHint),
+		strsUsed:  make([]bool, 1, capHint),
+		compactAt: compactAt,
+	}
+	sm.snap = new(strMapSnapshot)
+	return sm
 }
 
 func (sm *strMapper) truncate() {
 	sm.Lock()
 	defer sm.Unlock()
+
 	sm.Next = 0
 	sm.Keys = make(map[string]uint64)
-	sm.Strs = make(map[uint64]string)
+	sm.Strs = sm.Strs[:1]
+	sm.Strs[0] = ""
+	sm.strsUsed = sm.strsUsed[:1]
+	sm.strsUsed[0] = false
+	sm.deltaKeys = nil
+	sm.deltaStrs = nil
+	sm.snap = &strMapSnapshot{}
 }
 
 func (sm *strMapper) createIdxNoLock(s string) uint64 {
@@ -651,27 +1758,90 @@ func (sm *strMapper) createIdxNoLock(s string) uint64 {
 		return v
 	}
 	sm.Next++
-	sm.Keys[s] = sm.Next
-	sm.Strs[sm.Next] = s
-	return sm.Next
-}
-
-func (sm *strMapper) createIdxsNoLock(s []string) []uint64 {
-	r := make([]uint64, len(s))
-	for i, v := range s {
-		r[i] = sm.createIdxNoLock(v)
+	idx := sm.Next
+	sm.Keys[s] = idx
+	if idx > uint64(^uint(0)>>1) {
+		panic(fmt.Errorf("strmap index overflows int: %v", idx))
 	}
-	return r
-}
-
-func (sm *strMapper) getStringNoLock(idx uint64) (string, bool) {
-	v, ok := sm.Strs[idx]
-	return v, ok
-}
-
-func (sm *strMapper) mustGetStringNoLock(idx uint64) string {
-	if v, ok := sm.Strs[idx]; ok {
-		return v
+	need := int(idx) + 1
+	if need > len(sm.Strs) {
+		grow := need - len(sm.Strs)
+		sm.Strs = append(sm.Strs, make([]string, grow)...)
+		sm.strsUsed = append(sm.strsUsed, make([]bool, grow)...)
 	}
-	panic(fmt.Errorf("no id associated with idx %v", idx))
+	sm.Strs[int(idx)] = s
+	sm.strsUsed[int(idx)] = true
+	if sm.deltaKeys == nil {
+		sm.deltaKeys = make(map[string]uint64, 4)
+		sm.deltaStrs = make(map[uint64]string, 4)
+	}
+	sm.deltaKeys[s] = idx
+	sm.deltaStrs[idx] = s
+	return idx
+}
+
+func (sm *strMapper) replaceAllNoLock(keys map[string]uint64, strs []string, used []bool, next uint64) {
+	sm.Next = next
+	sm.Keys = keys
+	sm.Strs = strs
+	sm.strsUsed = used
+	sm.deltaKeys = nil
+	sm.deltaStrs = nil
+	keysCopy := maps.Clone(keys)
+	sm.snap = &strMapSnapshot{
+		Next:      next,
+		Keys:      keysCopy,
+		DenseStrs: slices.Clone(strs),
+		DenseUsed: slices.Clone(used),
+		baseNext:  0,
+		depth:     1,
+	}
+}
+
+func (sm *strMapper) snapshot() *strMapSnapshot {
+	sm.Lock()
+	defer sm.Unlock()
+	return sm.snapshotNoLock()
+}
+
+func (sm *strMapper) snapshotNoLock() *strMapSnapshot {
+	if sm.snap == nil {
+		sm.snap = &strMapSnapshot{}
+	}
+	if len(sm.deltaKeys) == 0 {
+		return sm.snap
+	}
+	keys := sm.deltaKeys
+	strs := sm.deltaStrs
+	sm.deltaKeys = nil
+	sm.deltaStrs = nil
+	nextDepth := 1
+	if sm.snap != nil {
+		nextDepth = sm.snap.depth + 1
+	}
+	if sm.compactAt > 0 && nextDepth >= sm.compactAt {
+		keysCopy := maps.Clone(sm.Keys)
+		sm.snap = &strMapSnapshot{
+			Next:      sm.Next,
+			Keys:      keysCopy,
+			DenseStrs: slices.Clone(sm.Strs),
+			DenseUsed: slices.Clone(sm.strsUsed),
+			baseNext:  0,
+			depth:     1,
+		}
+		return sm.snap
+	}
+	var baseNext uint64
+	if sm.snap != nil {
+		baseNext = sm.snap.Next
+	}
+	sm.snap = &strMapSnapshot{
+		Next:     sm.Next,
+		Keys:     keys,
+		Strs:     strs,
+		base:     sm.snap,
+		baseNext: baseNext,
+		depth:    nextDepth,
+	}
+	return sm.snap
 }

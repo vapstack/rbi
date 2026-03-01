@@ -3,13 +3,44 @@ package rbi
 import (
 	"fmt"
 	"reflect"
-	"strings"
+	"slices"
 	"sync"
 
 	"github.com/vapstack/qx"
 
 	"github.com/RoaringBitmap/roaring/v2/roaring64"
 )
+
+const (
+	singleChunkCap       = 32768
+	singleAdaptiveMaxLen = 200_000
+)
+
+var singleIDsPool = sync.Pool{
+	New: func() any {
+		return &singleIDsBuffer{
+			values: make([]uint64, 0, singleChunkCap),
+		}
+	},
+}
+
+type singleIDsBuffer struct {
+	values []uint64
+}
+
+func getSingleIDsBuf() *singleIDsBuffer {
+	buf := singleIDsPool.Get().(*singleIDsBuffer)
+	buf.values = buf.values[:0]
+	return buf
+}
+
+func releaseSingleIDs(buf *singleIDsBuffer) {
+	if buf == nil || cap(buf.values) != singleChunkCap {
+		return
+	}
+	buf.values = buf.values[:0]
+	singleIDsPool.Put(buf)
+}
 
 func (db *DB[K, V]) checkUsedFields(q *qx.QX) error {
 	for _, o := range q.Order {
@@ -34,6 +65,10 @@ func (db *DB[K, V]) checkUsed(exp qx.Expr) error {
 	return nil
 }
 
+// evalExpr evaluates a boolean expression tree into a bitmap representation.
+//
+// Results may be positive sets or negative/complement sets to
+// postpone expensive universe materialization until it is actually required.
 func (db *DB[K, V]) evalExpr(e qx.Expr) (bitmap, error) {
 	switch e.Op {
 
@@ -81,6 +116,8 @@ func (db *DB[K, V]) evalExpr(e qx.Expr) (bitmap, error) {
 				continue
 			}
 
+			// Keep the accumulator in bitmap form to preserve short-circuiting and
+			// avoid temporary key arrays in deep boolean trees.
 			first, err = db.andBitmap(first, b)
 			if err != nil {
 				first.release()
@@ -103,26 +140,39 @@ func (db *DB[K, V]) evalExpr(e qx.Expr) (bitmap, error) {
 			return bitmap{}, fmt.Errorf("%w: empty OR expression", ErrInvalidQuery)
 		}
 
-		var (
-			positives []*roaring64.Bitmap
-			negatives []bitmap
-		)
+		positivesBuf := getBitmapResultSliceBuf(len(e.Operands))
+		positives := positivesBuf.values
+		defer func() {
+			positivesBuf.values = positives
+			releaseBitmapResultSliceBuf(positivesBuf)
+		}()
+
+		negativesBuf := getBitmapResultSliceBuf(len(e.Operands))
+		negatives := negativesBuf.values
+		defer func() {
+			negativesBuf.values = negatives
+			releaseBitmapResultSliceBuf(negativesBuf)
+		}()
+
+		releaseAll := func(xs []bitmap) {
+			for _, x := range xs {
+				x.release()
+			}
+		}
 
 		for _, op := range e.Operands {
 			b, err := db.evalExpr(op)
 			if err != nil {
-				for _, n := range negatives {
-					n.release()
-				}
+				releaseAll(positives)
+				releaseAll(negatives)
 				return bitmap{}, err
 			}
 
 			// short-circuit: universe OR ... == universe
 			if b.neg && (b.bm == nil || b.bm.IsEmpty()) {
 				b.release()
-				for _, n := range negatives {
-					n.release()
-				}
+				releaseAll(positives)
+				releaseAll(negatives)
 				res := bitmap{neg: true}
 				if e.Not {
 					res.neg = !res.neg
@@ -140,24 +190,34 @@ func (db *DB[K, V]) evalExpr(e qx.Expr) (bitmap, error) {
 				continue
 			}
 
-			positives = append(positives, b.bm)
+			positives = append(positives, b)
 		}
 
-		// 1. merge all positives using batched parallel union
+		// 1. Merge positive branches first; this captures the common OR pattern
+		// and keeps negative-branch handling as a rare slow path.
 		var resultBm *roaring64.Bitmap
 		if len(positives) > 0 {
-			resultBm = db.unionBitmaps(positives)
+			unionInputsBuf := getRoaringSliceBuf(len(positives))
+			unionInputs := unionInputsBuf.values
+			for _, p := range positives {
+				unionInputs = append(unionInputs, p.bm)
+			}
+			resultBm = db.unionBitmaps(unionInputs)
+			unionInputsBuf.values = unionInputs
+			releaseRoaringSliceBuf(unionInputsBuf)
+			releaseAll(positives)
 		} else {
 			resultBm = getRoaringBuf()
 		}
 		res := bitmap{bm: resultBm}
 
-		// 2. merge negatives (slow path: A OR NOT B)
-		for _, neg := range negatives {
+		// 2. Merge negatives (A OR NOT B) via bitmap algebra.
+		for i, neg := range negatives {
 			var err error
 			res, err = db.orBitmap(res, neg)
 			if err != nil {
 				res.release()
+				releaseAll(negatives[i+1:])
 				return bitmap{}, err
 			}
 		}
@@ -179,11 +239,13 @@ func (db *DB[K, V]) evalExpr(e qx.Expr) (bitmap, error) {
 	}
 }
 
-var FlagRangeAlternativeOR = true
-
+// evalSimple evaluates a single non-boolean predicate against index snapshots.
+//
+// It routes every operator through overlay-aware lookups so query semantics
+// stay correct during snapshot-delta compaction.
 func (db *DB[K, V]) evalSimple(e qx.Expr) (bitmap, error) {
-	slice := db.index[e.Field]
-	if slice == nil {
+	ov := db.fieldOverlay(e.Field)
+	if !ov.hasData() && !db.hasFieldIndex(e.Field) {
 		return bitmap{}, fmt.Errorf("no index for field: %v", e.Field)
 	}
 
@@ -191,8 +253,6 @@ func (db *DB[K, V]) evalSimple(e qx.Expr) (bitmap, error) {
 	if f == nil {
 		return bitmap{}, fmt.Errorf("no metadata for field: %v", e.Field)
 	}
-
-	var bitmaps []*roaring64.Bitmap
 
 	switch e.Op {
 	case qx.OpEQ:
@@ -205,12 +265,14 @@ func (db *DB[K, V]) evalSimple(e qx.Expr) (bitmap, error) {
 				return bitmap{}, fmt.Errorf("%w: %v expects a single value for scalar field %v", ErrInvalidQuery, e.Op, e.Field)
 			}
 
-			if bm := findIndex(slice, key); bm != nil {
-				return bitmap{bm: bm, readonly: true}, nil
+			bm, owned := ov.lookupWithState(key, nil)
+			if bm != nil && !bm.IsEmpty() {
+				return bitmap{bm: bm, readonly: !owned}, nil
 			}
 			return bitmap{bm: getRoaringBuf()}, nil
+
 		} else {
-			vals, isSlice, err := db.exprValueToIdx(e)
+			vals, isSlice, err := db.exprValueToIdxOwned(e)
 			if err != nil {
 				return bitmap{}, err
 			}
@@ -234,12 +296,25 @@ func (db *DB[K, V]) evalSimple(e qx.Expr) (bitmap, error) {
 		if len(vals) == 0 {
 			return bitmap{}, fmt.Errorf("%v: %v: no values provided", ErrInvalidQuery, e.Op)
 		}
-		bitmaps = make([]*roaring64.Bitmap, 0, len(vals))
+
+		res := getRoaringBuf()
+		var scratch *roaring64.Bitmap
+		if ov.delta != nil {
+			scratch = getRoaringBuf()
+			defer releaseRoaringBuf(scratch)
+		}
+
 		for _, v := range vals {
-			if bm := findIndex(slice, v); bm != nil {
-				bitmaps = append(bitmaps, bm)
+			bm, owned := ov.lookupWithState(v, scratch)
+			if bm == nil || bm.IsEmpty() {
+				continue
+			}
+			orBitmapAdaptive(res, bm)
+			if owned && bm != scratch {
+				releaseRoaringBuf(bm)
 			}
 		}
+		return bitmap{bm: res}, nil
 
 	case qx.OpHASANY, qx.OpHAS:
 		if !f.Slice {
@@ -257,26 +332,59 @@ func (db *DB[K, V]) evalSimple(e qx.Expr) (bitmap, error) {
 		}
 
 		if e.Op == qx.OpHAS {
-			// HAS - AND logic
-			var andBitmaps []*roaring64.Bitmap
+			var acc *roaring64.Bitmap
+			var scratch *roaring64.Bitmap
+			if ov.delta != nil {
+				scratch = getRoaringBuf()
+				defer releaseRoaringBuf(scratch)
+			}
 			for _, v := range vals {
-				bm := findIndex(slice, v)
-				if bm == nil {
+				bm, owned := ov.lookupWithState(v, scratch)
+				if bm == nil || bm.IsEmpty() {
 					// if any value is missing, result is empty
+					if acc != nil {
+						releaseRoaringBuf(acc)
+					}
 					return bitmap{bm: getRoaringBuf()}, nil
 				}
-				andBitmaps = append(andBitmaps, bm)
+				if acc == nil {
+					acc = getRoaringBuf()
+					acc.Or(bm)
+				} else {
+					acc.And(bm)
+				}
+				if owned && bm != scratch {
+					releaseRoaringBuf(bm)
+				}
+				if acc.IsEmpty() {
+					return bitmap{bm: acc}, nil
+				}
 			}
-			return db.mergeAnd(andBitmaps)
+			if acc == nil {
+				return bitmap{bm: getRoaringBuf()}, nil
+			}
+			return bitmap{bm: acc}, nil
 		}
 
 		// HASANY - OR logic
-		bitmaps = make([]*roaring64.Bitmap, 0, len(vals))
+		res := getRoaringBuf()
+		var scratch *roaring64.Bitmap
+		if ov.delta != nil {
+			scratch = getRoaringBuf()
+			defer releaseRoaringBuf(scratch)
+		}
+
 		for _, v := range vals {
-			if bm := findIndex(slice, v); bm != nil {
-				bitmaps = append(bitmaps, bm)
+			bm, owned := ov.lookupWithState(v, scratch)
+			if bm == nil || bm.IsEmpty() {
+				continue
+			}
+			orBitmapAdaptive(res, bm)
+			if owned && bm != scratch {
+				releaseRoaringBuf(bm)
 			}
 		}
+		return bitmap{bm: res}, nil
 
 	case qx.OpGT, qx.OpGTE, qx.OpLT, qx.OpLTE, qx.OpPREFIX:
 		key, isSlice, err := db.exprValueToIdxScalar(e)
@@ -286,88 +394,135 @@ func (db *DB[K, V]) evalSimple(e qx.Expr) (bitmap, error) {
 		if isSlice {
 			return bitmap{}, fmt.Errorf("%w: %v expects a single value", ErrInvalidQuery, e.Op)
 		}
-
-		s := *slice
-
-		lo, hi := 0, len(s)
-		for lo < hi {
-			mid := (lo + hi) >> 1
-			if s[mid].Key < key {
-				lo = mid + 1
-			} else {
-				hi = mid
+		cacheKey := db.materializedPredCacheKeyForScalar(e.Field, e.Op, key)
+		if cacheKey != "" {
+			if cached, ok := db.getSnapshot().loadMaterializedPred(cacheKey); ok {
+				if cached == nil || cached.IsEmpty() {
+					return bitmap{bm: getRoaringBuf()}, nil
+				}
+				return bitmap{bm: cached, readonly: true}, nil
 			}
 		}
 
-		if FlagRangeAlternativeOR { // && e.Op != qx.OpPREFIX {
-			start := 0
-			end := len(s)
-
-			switch e.Op {
-			case qx.OpGT:
-				start = lo
-				if start < len(s) && s[start].Key == key {
-					start++
-				}
-				end = len(s)
-			case qx.OpGTE:
-				start = lo
-				end = len(s)
-			case qx.OpLT:
-				start = 0
-				end = lo
-			case qx.OpLTE:
-				start = 0
-				end = lo
-				if lo < len(s) && s[lo].Key == key {
-					end = lo + 1
-				}
-			case qx.OpPREFIX:
-				start = lo
-				end = lo
-				for end < len(s) {
-					if !strings.HasPrefix(s[end].Key, key) {
-						break
-					}
-					end++
-				}
-			}
-			res := db.unionIndexRange(e.Field, start, end)
-			return bitmap{bm: res}, nil
-		}
-
+		rb := rangeBounds{has: true}
 		switch e.Op {
 		case qx.OpGT:
-			start := lo
-			if start < len(s) && s[start].Key == key {
-				start++
-			}
-			for i := start; i < len(s); i++ {
-				bitmaps = append(bitmaps, s[i].IDs)
-			}
+			rb.applyLo(key, false)
 		case qx.OpGTE:
-			for i := lo; i < len(s); i++ {
-				bitmaps = append(bitmaps, s[i].IDs)
-			}
+			rb.applyLo(key, true)
 		case qx.OpLT:
-			for i := 0; i < lo; i++ {
-				bitmaps = append(bitmaps, s[i].IDs)
-			}
+			rb.applyHi(key, false)
 		case qx.OpLTE:
-			for i := 0; i < lo; i++ {
-				bitmaps = append(bitmaps, s[i].IDs)
-			}
-			if lo < len(s) && s[lo].Key == key {
-				bitmaps = append(bitmaps, s[lo].IDs)
-			}
+			rb.applyHi(key, true)
 		case qx.OpPREFIX:
-			for i := lo; i < len(s); i++ {
-				if !strings.HasPrefix(s[i].Key, key) {
-					break
+			rb.hasPrefix = true
+			rb.prefix = key
+		}
+
+		br := ov.rangeForBounds(rb)
+		if br.baseStart >= br.baseEnd && br.deltaStart >= br.deltaEnd {
+			if cacheKey != "" {
+				db.getSnapshot().storeMaterializedPred(cacheKey, nil)
+			}
+			return bitmap{bm: getRoaringBuf()}, nil
+		}
+
+		if e.Op != qx.OpPREFIX {
+			if out, ok := db.tryEvalNumericRangeBuckets(e.Field, f, ov, br); ok {
+				if db.tryStoreMaterializedPredShared(cacheKey, out.bm) {
+					out.readonly = true
 				}
-				bitmaps = append(bitmaps, s[i].IDs)
+				return out, nil
 			}
 		}
+
+		res := getRoaringBuf()
+		var scratch *roaring64.Bitmap
+		if ov.delta != nil {
+			scratch = getRoaringBuf()
+			defer releaseRoaringBuf(scratch)
+		}
+
+		spanLen := (br.baseEnd - br.baseStart) + (br.deltaEnd - br.deltaStart)
+		bulkSingles := spanLen > 0 && spanLen <= singleAdaptiveMaxLen
+
+		var singles *singleIDsBuffer
+		if bulkSingles {
+			singles = getSingleIDsBuf()
+			defer releaseSingleIDs(singles)
+		}
+
+		if ov.delta == nil {
+			for i := br.baseStart; i < br.baseEnd; i++ {
+				ids := ov.base[i].IDs
+				if ids.IsEmpty() {
+					continue
+				}
+
+				// Singleton-heavy ranges are accumulated via batched AddMany
+				// because repeated OR of tiny bitmaps is much more expensive.
+				if ids.isSingleton() {
+					if bulkSingles {
+						singles.values = append(singles.values, ids.single)
+						if len(singles.values) == cap(singles.values) {
+							res.AddMany(singles.values)
+							singles.values = singles.values[:0]
+						}
+					} else {
+						res.Add(ids.single)
+					}
+					continue
+				}
+
+				if singles != nil && len(singles.values) > 0 {
+					res.AddMany(singles.values)
+					singles.values = singles.values[:0]
+				}
+				res.Or(ids.bitmap())
+			}
+		} else {
+			cur := ov.newCursor(br, false)
+			for {
+				_, baseBM, de, ok := cur.next()
+				if !ok {
+					break
+				}
+
+				bm := composePosting(baseBM, de, scratch)
+				if bm == nil || bm.IsEmpty() {
+					continue
+				}
+
+				// Singleton-heavy ranges are accumulated via batched AddMany because
+				// repeated OR of tiny bitmaps is much more expensive.
+				if bm.GetCardinality() == 1 {
+					if bulkSingles {
+						singles.values = append(singles.values, bm.Minimum())
+						if len(singles.values) == cap(singles.values) {
+							res.AddMany(singles.values)
+							singles.values = singles.values[:0]
+						}
+					} else {
+						res.Add(bm.Minimum())
+					}
+					continue
+				}
+
+				if singles != nil && len(singles.values) > 0 {
+					res.AddMany(singles.values)
+					singles.values = singles.values[:0]
+				}
+				res.Or(bm)
+			}
+		}
+
+		if singles != nil && len(singles.values) > 0 {
+			res.AddMany(singles.values)
+		}
+		if db.tryStoreMaterializedPredShared(cacheKey, res) {
+			return bitmap{bm: res, readonly: true}, nil
+		}
+		return bitmap{bm: res}, nil
 
 	case qx.OpSUFFIX, qx.OpCONTAINS:
 		v, isSlice, err := db.exprValueToIdxScalar(e)
@@ -377,154 +532,127 @@ func (db *DB[K, V]) evalSimple(e qx.Expr) (bitmap, error) {
 		if isSlice {
 			return bitmap{}, fmt.Errorf("%w: %v expects a single string value", ErrInvalidQuery, e.Op)
 		}
-		s := *slice
-		for i := range s {
-			match := false
-			if e.Op == qx.OpSUFFIX {
-				match = strings.HasSuffix(s[i].Key, v)
-			} else {
-				match = strings.Contains(s[i].Key, v)
-			}
-			if match {
-				bitmaps = append(bitmaps, s[i].IDs)
+		cacheKey := db.materializedPredCacheKeyForScalar(e.Field, e.Op, v)
+		if cacheKey != "" {
+			if cached, ok := db.getSnapshot().loadMaterializedPred(cacheKey); ok {
+				if cached == nil || cached.IsEmpty() {
+					return bitmap{bm: getRoaringBuf()}, nil
+				}
+				return bitmap{bm: cached, readonly: true}, nil
 			}
 		}
+
+		res := getRoaringBuf()
+		var scratch *roaring64.Bitmap
+		if ov.delta != nil {
+			scratch = getRoaringBuf()
+			defer releaseRoaringBuf(scratch)
+		}
+
+		full := ov.rangeForBounds(rangeBounds{has: true})
+		spanLen := (full.baseEnd - full.baseStart) + (full.deltaEnd - full.deltaStart)
+		bulkSingles := spanLen > 0 && spanLen <= singleAdaptiveMaxLen
+
+		var singles *singleIDsBuffer
+		if bulkSingles {
+			singles = getSingleIDsBuf()
+			defer releaseSingleIDs(singles)
+		}
+
+		if ov.delta == nil {
+			for i := full.baseStart; i < full.baseEnd; i++ {
+				kv := ov.base[i]
+				match := e.Op == qx.OpSUFFIX && indexKeyHasSuffixString(kv.Key, v) ||
+					e.Op == qx.OpCONTAINS && indexKeyContainsString(kv.Key, v)
+				if !match {
+					continue
+				}
+
+				ids := kv.IDs
+				if ids.IsEmpty() {
+					continue
+				}
+
+				// Same singleton optimization for suffix/contains scans over wide
+				// dictionary spans.
+				if ids.isSingleton() {
+					if bulkSingles {
+						singles.values = append(singles.values, ids.single)
+						if len(singles.values) == cap(singles.values) {
+							res.AddMany(singles.values)
+							singles.values = singles.values[:0]
+						}
+					} else {
+						res.Add(ids.single)
+					}
+					continue
+				}
+				if singles != nil && len(singles.values) > 0 {
+					res.AddMany(singles.values)
+					singles.values = singles.values[:0]
+				}
+				res.Or(ids.bitmap())
+			}
+		} else {
+			cur := ov.newCursor(full, false)
+			for {
+				k, baseBM, de, ok := cur.next()
+				if !ok {
+					break
+				}
+				match := e.Op == qx.OpSUFFIX && indexKeyHasSuffixString(k, v) ||
+					e.Op == qx.OpCONTAINS && indexKeyContainsString(k, v)
+				if !match {
+					continue
+				}
+				bm := composePosting(baseBM, de, scratch)
+				if bm == nil || bm.IsEmpty() {
+					continue
+				}
+
+				// Same singleton optimization for suffix/contains scans over wide
+				// dictionary spans.
+				if bm.GetCardinality() == 1 {
+					if bulkSingles {
+						singles.values = append(singles.values, bm.Minimum())
+						if len(singles.values) == cap(singles.values) {
+							res.AddMany(singles.values)
+							singles.values = singles.values[:0]
+						}
+					} else {
+						res.Add(bm.Minimum())
+					}
+					continue
+				}
+				if singles != nil && len(singles.values) > 0 {
+					res.AddMany(singles.values)
+					singles.values = singles.values[:0]
+				}
+				res.Or(bm)
+			}
+		}
+		if singles != nil && len(singles.values) > 0 {
+			res.AddMany(singles.values)
+		}
+		if db.tryStoreMaterializedPredShared(cacheKey, res) {
+			return bitmap{bm: res, readonly: true}, nil
+		}
+		return bitmap{bm: res}, nil
 
 	default:
 		return bitmap{}, fmt.Errorf("unsupported op: %v", e.Op)
 	}
-
-	if len(bitmaps) == 0 {
-		return bitmap{bm: getRoaringBuf()}, nil
-	}
-	if len(bitmaps) == 1 {
-		return bitmap{bm: bitmaps[0], readonly: true}, nil
-	}
-
-	res := db.unionBitmaps(bitmaps)
-	return bitmap{bm: res}, nil
 }
 
-// unionIndexRange merges bitmaps between start and end for a single field
-func (db *DB[K, V]) unionIndexRange(field string, start, end int) *roaring64.Bitmap {
-	slice := db.index[field]
-	if slice == nil || start >= end {
-		return getRoaringBuf()
+func orBitmapAdaptive(dst, src *roaring64.Bitmap) {
+	if dst == nil || src == nil || src.IsEmpty() {
+		return
 	}
-	s := *slice
-
-	if start < 0 {
-		start = 0
+	if src.GetCardinality() == 1 {
+		dst.Add(src.Minimum())
+		return
 	}
-	if end > len(s) {
-		end = len(s)
-	}
-	if start >= end {
-		return getRoaringBuf()
-	}
-
-	n := end - start
-
-	if n >= 256 {
-		return db.parallelUnionIndexRange(s, start, end)
-	}
-
-	best := -1
-	var bestCard uint64
-	for i := start; i < end; i++ {
-		c := s[i].IDs.GetCardinality()
-		if c > bestCard {
-			bestCard = c
-			best = i
-		}
-	}
-
-	res := getRoaringBuf()
-	if best == -1 || bestCard == 0 {
-		return res
-	}
-	res.Or(s[best].IDs)
-	for i := start; i < end; i++ {
-		if i == best {
-			continue
-		}
-		res.Or(s[i].IDs)
-	}
-	return res
-}
-
-func (db *DB[K, V]) parallelUnionIndexRange(s []index, start, end int) *roaring64.Bitmap {
-	n := end - start
-
-	workers := 8
-	if n < workers*2 {
-		workers = n / 2
-	}
-	if workers < 2 {
-		// fallback
-		res := getRoaringBuf()
-		for i := start; i < end; i++ {
-			res.Or(s[i].IDs)
-		}
-		return res
-	}
-
-	chunk := (n + workers - 1) / workers
-	results := make([]*roaring64.Bitmap, workers)
-	var wg sync.WaitGroup
-
-	for w := 0; w < workers; w++ {
-		a := start + w*chunk
-		if a >= end {
-			break
-		}
-		b := a + chunk
-		if b > end {
-			b = end
-		}
-
-		wg.Add(1)
-		go func(idx, lo, hi int) {
-			defer wg.Done()
-
-			best := -1
-			var bestCard uint64
-			for i := lo; i < hi; i++ {
-				c := s[i].IDs.GetCardinality()
-				if c > bestCard {
-					bestCard = c
-					best = i
-				}
-			}
-
-			r := getRoaringBuf()
-			if best != -1 && bestCard != 0 {
-				r.Or(s[best].IDs)
-				for i := lo; i < hi; i++ {
-					if i == best {
-						continue
-					}
-					r.Or(s[i].IDs)
-				}
-			}
-			results[idx] = r
-		}(w, a, b)
-	}
-
-	wg.Wait()
-
-	final := results[0]
-	if final == nil {
-		final = getRoaringBuf()
-	}
-	for i := 1; i < len(results); i++ {
-		if results[i] == nil {
-			continue
-		}
-		final.Or(results[i])
-		releaseRoaringBuf(results[i])
-	}
-	return final
+	dst.Or(src)
 }
 
 // unionBitmaps merges multiple bitmaps using an adaptive strategy:
@@ -568,7 +696,7 @@ func (db *DB[K, V]) linearOr(bitmaps []*roaring64.Bitmap) *roaring64.Bitmap {
 		if i == bestIdx {
 			continue
 		}
-		res.Or(bm)
+		orBitmapAdaptive(res, bm)
 	}
 	return res
 }
@@ -587,6 +715,7 @@ func (db *DB[K, V]) parallelBatchedOr(bitmaps []*roaring64.Bitmap) *roaring64.Bi
 
 	chunkSize := (n + workers - 1) / workers
 	results := make([]*roaring64.Bitmap, workers)
+
 	var wg sync.WaitGroup
 
 	for i := 0; i < workers; i++ {
@@ -623,65 +752,79 @@ func (db *DB[K, V]) parallelBatchedOr(bitmaps []*roaring64.Bitmap) *roaring64.Bi
 	return final
 }
 
-func (db *DB[K, V]) mergeAnd(bitmaps []*roaring64.Bitmap) (bitmap, error) {
-
-	if len(bitmaps) == 0 {
-		return bitmap{bm: getRoaringBuf()}, nil
-	}
-
-	smallest := bitmaps[0]
-	cardinality := smallest.GetCardinality()
-
-	for _, b := range bitmaps[1:] {
-		if c := b.GetCardinality(); c < cardinality {
-			smallest = b
-			cardinality = c
-		}
-	}
-
-	res := getRoaringBuf()
-	res.Or(smallest)
-
-	for _, b := range bitmaps {
-		if b != smallest {
-			res.And(b)
-			if res.IsEmpty() {
-				break
-			}
-		}
-	}
-	return bitmap{bm: res}, nil
-}
-
+// evalSliceEQ evaluates equality for slice fields by intersecting member
+// bitmaps, because slice-EQ semantics require full set match.
 func (db *DB[K, V]) evalSliceEQ(field string, vals []string) (bitmap, error) {
 
 	vals = dedupStringsInplace(vals)
 
-	lenSlice := db.lenIndex[field]
-	if lenSlice == nil {
+	lenOV := db.lenFieldOverlay(field)
+	useZeroComplement := len(vals) == 0 && db.isLenZeroComplementField(field)
+	if !lenOV.hasData() && db.snapshotLenFieldIndexSlice(field) == nil && !useZeroComplement {
 		return bitmap{}, fmt.Errorf("no lenIndex for slice field: %v", field)
 	}
 
-	lenBM := findIndex(lenSlice, uint64ByteStr(uint64(len(vals))))
-
+	var (
+		lenBM    *roaring64.Bitmap
+		lenOwned bool
+	)
+	if useZeroComplement {
+		nonEmpty, nonEmptyOwned := lenOV.lookupWithState(lenIndexNonEmptyKey, nil)
+		universe, universeOwned := db.snapshotUniverseView()
+		zero := getRoaringBuf()
+		if universe != nil && !universe.IsEmpty() {
+			zero.Or(universe)
+		}
+		if nonEmpty != nil && !nonEmpty.IsEmpty() {
+			zero.AndNot(nonEmpty)
+		}
+		if universeOwned && universe != nil {
+			releaseRoaringBuf(universe)
+		}
+		if nonEmptyOwned && nonEmpty != nil {
+			releaseRoaringBuf(nonEmpty)
+		}
+		lenBM = zero
+		lenOwned = true
+	} else {
+		lenKey := uint64ByteStr(uint64(len(vals)))
+		lenBM, lenOwned = lenOV.lookupWithState(lenKey, nil)
+	}
 	if lenBM == nil || lenBM.IsEmpty() {
+		if lenOwned && lenBM != nil {
+			releaseRoaringBuf(lenBM)
+		}
 		return bitmap{bm: getRoaringBuf()}, nil
 	}
 
-	slice := db.index[field]
-
-	var bitmaps []*roaring64.Bitmap
-	bitmaps = append(bitmaps, lenBM)
-
-	for _, v := range vals {
-		bm := findIndex(slice, v)
-		if bm == nil {
-			return bitmap{bm: getRoaringBuf()}, nil
-		}
-		bitmaps = append(bitmaps, bm)
+	ov := db.fieldOverlay(field)
+	acc := getRoaringBuf()
+	acc.Or(lenBM)
+	if lenOwned {
+		releaseRoaringBuf(lenBM)
 	}
 
-	return db.mergeAnd(bitmaps)
+	var scratch *roaring64.Bitmap
+	if ov.delta != nil {
+		scratch = getRoaringBuf()
+		defer releaseRoaringBuf(scratch)
+	}
+	for _, v := range vals {
+		bm, owned := ov.lookupWithState(v, scratch)
+		if bm == nil || bm.IsEmpty() {
+			releaseRoaringBuf(acc)
+			return bitmap{bm: getRoaringBuf()}, nil
+		}
+		acc.And(bm)
+		if owned && bm != scratch {
+			releaseRoaringBuf(bm)
+		}
+		if acc.IsEmpty() {
+			return bitmap{bm: acc}, nil
+		}
+	}
+
+	return bitmap{bm: acc}, nil
 }
 
 func unwrapExprValue(v reflect.Value) (reflect.Value, bool) {
@@ -768,6 +911,15 @@ func (db *DB[K, V]) diffBitmap(acc, sub bitmap) (bitmap, error) {
 }
 
 func (db *DB[K, V]) exprValueToIdx(expr qx.Expr) ([]string, bool, error) {
+	return db.exprValueToIdxWithMode(expr, false)
+}
+
+// exprValueToIdxOwned returns a slice safe for in-place mutation by callers.
+func (db *DB[K, V]) exprValueToIdxOwned(expr qx.Expr) ([]string, bool, error) {
+	return db.exprValueToIdxWithMode(expr, true)
+}
+
+func (db *DB[K, V]) exprValueToIdxWithMode(expr qx.Expr, cloneStringSlice bool) ([]string, bool, error) {
 
 	if expr.Value == nil {
 		switch expr.Op {
@@ -776,6 +928,15 @@ func (db *DB[K, V]) exprValueToIdx(expr qx.Expr) ([]string, bool, error) {
 		default:
 			return []string{nilValue}, false, nil
 		}
+	}
+	switch v := expr.Value.(type) {
+	case []string:
+		if cloneStringSlice && len(v) > 1 {
+			return slices.Clone(v), true, nil
+		}
+		return v, true, nil
+	case string:
+		return []string{v}, false, nil
 	}
 
 	v := reflect.ValueOf(expr.Value)
@@ -857,24 +1018,6 @@ func (b bitmap) clone() bitmap {
 	return bitmap{bm: c, neg: b.neg, readonly: false}
 }
 
-func (db *DB[K, V]) cardOf(b bitmap) uint64 {
-	if !b.neg {
-		if b.bm == nil {
-			return 0
-		}
-		return b.bm.GetCardinality()
-	}
-	uc := db.universe.GetCardinality()
-	if b.bm == nil {
-		return uc
-	}
-	ex := b.bm.GetCardinality()
-	if ex >= uc {
-		return 0
-	}
-	return uc - ex
-}
-
 func diffOwned(a, b *roaring64.Bitmap) *roaring64.Bitmap {
 	res := getRoaringBuf()
 	if a != nil {
@@ -920,7 +1063,8 @@ func (db *DB[K, V]) andBitmap(a, b bitmap) (bitmap, error) {
 			return b, nil
 		}
 
-		// both are readonly, clone the smallest
+		// Both operands are readonly: clone the smaller payload to reduce copy
+		// and reduce subsequent intersection work.
 		cardA := a.bm.GetCardinality()
 		cardB := b.bm.GetCardinality()
 

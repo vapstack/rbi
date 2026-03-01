@@ -11,11 +11,7 @@ import (
 const (
 	// defaultAnalyzeSoftBudget bounds one periodic analyze cycle.
 	// A zero/negative value means no time budget.
-	defaultAnalyzeSoftBudget = 25 * time.Millisecond
-
-	// plannerAnalyzeCardChunkSize controls how many index buckets are scanned
-	// per short read-lock window.
-	plannerAnalyzeCardChunkSize = 256
+	defaultAnalyzeSoftBudget = 100 * time.Millisecond
 )
 
 // RefreshPlannerStats rebuilds planner statistics from the current in-memory index.
@@ -29,10 +25,15 @@ func (db *DB[K, V]) refreshPlannerStatsPeriodic() error {
 }
 
 func (db *DB[K, V]) refreshPlannerStatsWithBudget(softBudget time.Duration, useCursor bool) error {
+	if err := db.beginOp(); err != nil {
+		return err
+	}
+	defer db.endOp()
+
 	db.planner.analyzer.Lock()
 	defer db.planner.analyzer.Unlock()
 
-	fieldNames, universeCardinality, err := db.collectPlannerFieldNamesAndUniverse()
+	snap, fieldNames, universeCardinality, err := db.collectPlannerFieldNamesAndUniverse()
 	if err != nil {
 		return err
 	}
@@ -43,7 +44,7 @@ func (db *DB[K, V]) refreshPlannerStatsWithBudget(softBudget time.Duration, useC
 		capHint = len(prev.Fields)
 	}
 
-	out := PlannerStatsSnapshot{
+	out := plannerStatsSnapshot{
 		GeneratedAt:         time.Now(),
 		UniverseCardinality: universeCardinality,
 		Fields:              make(map[string]PlannerFieldStats, capHint),
@@ -81,7 +82,7 @@ func (db *DB[K, V]) refreshPlannerStatsWithBudget(softBudget time.Duration, useC
 		}
 		fieldName := fieldNames[fieldIdx]
 
-		stats, e := db.collectPlannerFieldStatsChunked(fieldName, plannerAnalyzeCardChunkSize)
+		stats, e := db.collectPlannerFieldStatsFromOverlay(snap, fieldName)
 		if e != nil {
 			return e
 		}
@@ -100,87 +101,95 @@ func (db *DB[K, V]) refreshPlannerStatsWithBudget(softBudget time.Duration, useC
 	return nil
 }
 
-func (db *DB[K, V]) collectPlannerFieldNamesAndUniverse() ([]string, uint64, error) {
-	db.mu.RLock()
-	defer db.mu.RUnlock()
-
+func (db *DB[K, V]) collectPlannerFieldNamesAndUniverse() (*indexSnapshot, []string, uint64, error) {
 	if db.closed.Load() {
-		return nil, 0, ErrClosed
+		return nil, nil, 0, ErrClosed
 	}
 	if db.noIndex.Load() {
-		return nil, 0, ErrIndexDisabled
+		return nil, nil, 0, ErrIndexDisabled
 	}
 
-	fieldNames := make([]string, 0, len(db.index))
-	for fieldName := range db.index {
+	s := db.getSnapshot()
+	fields := s.fieldNameSet()
+
+	fieldNames := make([]string, 0, len(fields))
+	for fieldName := range fields {
 		fieldNames = append(fieldNames, fieldName)
 	}
 	sort.Strings(fieldNames)
 
-	return fieldNames, db.universe.GetCardinality(), nil
+	return s, fieldNames, s.universeCardinality(), nil
 }
 
-func (db *DB[K, V]) collectPlannerFieldStatsChunked(fieldName string, chunkSize int) (PlannerFieldStats, error) {
-	if chunkSize <= 0 {
-		chunkSize = plannerAnalyzeCardChunkSize
+func (s *indexSnapshot) universeCardinality() uint64 {
+	base := uint64(0)
+	if s.universe != nil {
+		base = s.universe.GetCardinality()
+	}
+	if s.universeAdd != nil {
+		base += s.universeAdd.GetCardinality()
+	}
+	if s.universeRem != nil {
+		drop := s.universeRem.GetCardinality()
+		if drop >= base {
+			return 0
+		}
+		base -= drop
+	}
+	return base
+}
+
+func (db *DB[K, V]) collectPlannerFieldStatsFromOverlay(s *indexSnapshot, fieldName string) (PlannerFieldStats, error) {
+	if db.closed.Load() {
+		return PlannerFieldStats{}, ErrClosed
+	}
+	if db.noIndex.Load() {
+		return PlannerFieldStats{}, ErrIndexDisabled
 	}
 
-	cards := make([]uint64, 0, 64)
+	ov := newFieldOverlay(s.fieldIndexSlice(fieldName), s.fieldDelta(fieldName))
+	if !ov.hasData() {
+		return PlannerFieldStats{}, nil
+	}
+	return ov.fieldStats(), nil
+}
+
+func (ov fieldOverlay) fieldStats() PlannerFieldStats {
+	cardBuf := getUint64SliceBuf(64)
+	cards := cardBuf.values[:0]
+	defer func() {
+		cardBuf.values = cards
+		releaseUint64SliceBuffer(cardBuf)
+	}()
 	var (
 		total    uint64
 		maxCard  uint64
 		nonEmpty uint64
-		offset   int
 	)
+	br := ov.rangeForBounds(rangeBounds{has: true})
+	if br.baseStart >= br.baseEnd && br.deltaStart >= br.deltaEnd {
+		return PlannerFieldStats{}
+	}
 
+	cur := ov.newCursor(br, false)
 	for {
-		db.mu.RLock()
-		if db.closed.Load() {
-			db.mu.RUnlock()
-			return PlannerFieldStats{}, ErrClosed
-		}
-		if db.noIndex.Load() {
-			db.mu.RUnlock()
-			return PlannerFieldStats{}, ErrIndexDisabled
-		}
-
-		idxPtr := db.index[fieldName]
-		if idxPtr == nil {
-			db.mu.RUnlock()
+		_, baseIDs, de, ok := cur.next()
+		if !ok {
 			break
 		}
-
-		idx := *idxPtr
-		if offset >= len(idx) {
-			db.mu.RUnlock()
-			break
+		card := composePostingCardinality(baseIDs, de)
+		cards = append(cards, card)
+		total += card
+		if card > maxCard {
+			maxCard = card
 		}
-
-		end := offset + chunkSize
-		if end > len(idx) {
-			end = len(idx)
+		if card > 0 {
+			nonEmpty++
 		}
-
-		for i := offset; i < end; i++ {
-			var card uint64
-			if idx[i].IDs != nil {
-				card = idx[i].IDs.GetCardinality()
-			}
-			cards = append(cards, card)
-			total += card
-			if card > maxCard {
-				maxCard = card
-			}
-			if card > 0 {
-				nonEmpty++
-			}
-		}
-		offset = end
-		db.mu.RUnlock()
 	}
 
 	if len(cards) == 0 {
-		return PlannerFieldStats{}, nil
+		return PlannerFieldStats{}
 	}
 
 	sort.Slice(cards, func(i, j int) bool {
@@ -195,17 +204,15 @@ func (db *DB[K, V]) collectPlannerFieldStatsChunked(fieldName string, chunkSize 
 		MaxBucketCard:   maxCard,
 		P50BucketCard:   percentileSortedU64(cards, 0.50),
 		P95BucketCard:   percentileSortedU64(cards, 0.95),
-	}, nil
+	}
 }
 
-const defaultPlannerAnalyzeInterval = time.Hour
-
-func resolvePlannerAnalyzeInterval(v time.Duration) time.Duration {
+func plannerAnalyzeInterval(v time.Duration) time.Duration {
 	if v < 0 {
 		return 0
 	}
 	if v == 0 {
-		return defaultPlannerAnalyzeInterval
+		return defaultOptionsAnalyzeInterval
 	}
 	return v
 }
@@ -267,7 +274,11 @@ func (db *DB[K, V]) runPlannerAnalyzeLoop(stop <-chan struct{}, done chan<- stru
 			if errors.Is(err, ErrClosed) {
 				return
 			}
-			failures++
+			if errors.Is(err, ErrRebuildInProgress) {
+				failures = 0
+			} else {
+				failures++
+			}
 		} else {
 			failures = 0
 		}
@@ -305,23 +316,37 @@ func addPositiveJitter(d time.Duration, rng *rand.Rand) time.Duration {
 	return d + time.Duration(rng.Int64N(int64(j)+1))
 }
 
-// PlannerStatsSnapshot is an immutable snapshot used by planner heuristics.
-// The map and nested values are deep-copied on read to avoid caller mutation.
-type PlannerStatsSnapshot struct {
+// plannerStatsSnapshot is an immutable snapshot used by planner heuristics.
+type plannerStatsSnapshot struct {
 	Version             uint64
 	GeneratedAt         time.Time
 	UniverseCardinality uint64
 	Fields              map[string]PlannerFieldStats
 }
 
+func (s *plannerStatsSnapshot) universeOr(fallback uint64) uint64 {
+	if s != nil && s.UniverseCardinality > 0 {
+		return s.UniverseCardinality
+	}
+	return fallback
+}
+
+// PlannerFieldStats contains per-field cardinality distribution metrics.
 type PlannerFieldStats struct {
-	DistinctKeys    uint64
-	NonEmptyKeys    uint64
+	// DistinctKeys is number of distinct keys in field index.
+	DistinctKeys uint64
+	// NonEmptyKeys is number of keys with non-empty posting bitmap.
+	NonEmptyKeys uint64
+	// TotalBucketCard is total cardinality summed across all field buckets.
 	TotalBucketCard uint64
-	AvgBucketCard   float64
-	MaxBucketCard   uint64
-	P50BucketCard   uint64
-	P95BucketCard   uint64
+	// AvgBucketCard is average bucket cardinality.
+	AvgBucketCard float64
+	// MaxBucketCard is maximum bucket cardinality.
+	MaxBucketCard uint64
+	// P50BucketCard is median bucket cardinality.
+	P50BucketCard uint64
+	// P95BucketCard is 95th percentile bucket cardinality.
+	P95BucketCard uint64
 }
 
 func (db *DB[K, V]) refreshPlannerStatsLocked() {
@@ -330,65 +355,20 @@ func (db *DB[K, V]) refreshPlannerStatsLocked() {
 	db.planner.stats.Store(s)
 }
 
-func (db *DB[K, V]) buildPlannerStatsSnapshotLocked(version uint64) *PlannerStatsSnapshot {
-	out := &PlannerStatsSnapshot{
+func (db *DB[K, V]) buildPlannerStatsSnapshotLocked(version uint64) *plannerStatsSnapshot {
+	snap := db.getSnapshot()
+	fields := snap.fieldNameSet()
+
+	out := &plannerStatsSnapshot{
 		Version:             version,
 		GeneratedAt:         time.Now(),
-		UniverseCardinality: db.universe.GetCardinality(),
-		Fields:              make(map[string]PlannerFieldStats, len(db.index)),
+		UniverseCardinality: db.snapshotUniverseCardinality(),
+		Fields:              make(map[string]PlannerFieldStats, len(fields)),
 	}
 
-	for fieldName, idx := range db.index {
-		if idx == nil {
-			continue
-		}
-
-		buckets := *idx
-		if len(buckets) == 0 {
-			out.Fields[fieldName] = PlannerFieldStats{}
-			continue
-		}
-
-		cards := make([]uint64, 0, len(buckets))
-		var (
-			total    uint64
-			maxCard  uint64
-			nonEmpty uint64
-		)
-
-		for _, b := range buckets {
-			var card uint64
-			if b.IDs != nil {
-				card = b.IDs.GetCardinality()
-			}
-			cards = append(cards, card)
-			total += card
-			if card > maxCard {
-				maxCard = card
-			}
-			if card > 0 {
-				nonEmpty++
-			}
-		}
-
-		sort.Slice(cards, func(i, j int) bool {
-			return cards[i] < cards[j]
-		})
-
-		avg := 0.0
-		if len(cards) > 0 {
-			avg = float64(total) / float64(len(cards))
-		}
-
-		out.Fields[fieldName] = PlannerFieldStats{
-			DistinctKeys:    uint64(len(cards)),
-			NonEmptyKeys:    nonEmpty,
-			TotalBucketCard: total,
-			AvgBucketCard:   avg,
-			MaxBucketCard:   maxCard,
-			P50BucketCard:   percentileSortedU64(cards, 0.50),
-			P95BucketCard:   percentileSortedU64(cards, 0.95),
-		}
+	for fieldName := range fields {
+		ov := newFieldOverlay(snap.fieldIndexSlice(fieldName), snap.fieldDelta(fieldName))
+		out.Fields[fieldName] = ov.fieldStats()
 	}
 
 	return out
@@ -406,7 +386,7 @@ func percentileSortedU64(sorted []uint64, q float64) uint64 {
 		return sorted[n-1]
 	}
 
-	// Nearest-rank percentile with 0-based index.
+	// nearest-rank percentile with 0-based index
 	pos := int(math.Ceil(q*float64(n))) - 1
 	if pos < 0 {
 		pos = 0
@@ -415,26 +395,4 @@ func percentileSortedU64(sorted []uint64, q float64) uint64 {
 		pos = n - 1
 	}
 	return sorted[pos]
-}
-
-// GetPlannerStatsSnapshot returns a deep-copied planner stats snapshot.
-func (db *DB[K, V]) GetPlannerStatsSnapshot() (PlannerStatsSnapshot, bool) {
-	cur := db.planner.stats.Load()
-	if cur == nil {
-		return PlannerStatsSnapshot{}, false
-	}
-	return clonePlannerStatsSnapshot(*cur), true
-}
-
-func clonePlannerStatsSnapshot(s PlannerStatsSnapshot) PlannerStatsSnapshot {
-	out := PlannerStatsSnapshot{
-		Version:             s.Version,
-		GeneratedAt:         s.GeneratedAt,
-		UniverseCardinality: s.UniverseCardinality,
-		Fields:              make(map[string]PlannerFieldStats, len(s.Fields)),
-	}
-	for k, v := range s.Fields {
-		out.Fields[k] = v
-	}
-	return out
 }

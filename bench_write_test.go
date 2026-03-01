@@ -13,11 +13,13 @@ func buildWriteBenchDB(b *testing.B) (*DB[uint64, UserBench], uint64) {
 	dir := b.TempDir()
 	path := filepath.Join(dir, "bench_write_seeded.db")
 
-	opts := &Options[uint64, UserBench]{DisableIndexRebuild: true}
-	db, err := Open[uint64, UserBench](path, 0o600, opts)
-	if err != nil {
-		b.Fatalf("open: %v", err)
-	}
+	opts := DefaultOptions()
+	opts.DisableIndexRebuild = true
+	db, raw := openBoltAndNew[uint64, UserBench](b, path, opts)
+	b.Cleanup(func() {
+		_ = db.Close()
+		_ = raw.Close()
+	})
 	db.DisableSync()
 
 	seedCount := 200_000
@@ -44,7 +46,7 @@ func buildWriteBenchDB(b *testing.B) (*DB[uint64, UserBench], uint64) {
 		vals = append(vals, rec)
 
 		if len(ids) >= 1000 {
-			if err := db.SetMany(ids, vals); err != nil {
+			if err := db.BatchSet(ids, vals); err != nil {
 				b.Fatalf("seed error: %v", err)
 			}
 			ids = ids[:0]
@@ -52,23 +54,22 @@ func buildWriteBenchDB(b *testing.B) (*DB[uint64, UserBench], uint64) {
 		}
 	}
 	if len(ids) > 0 {
-		if err = db.SetMany(ids, vals); err != nil {
+		if err := db.BatchSet(ids, vals); err != nil {
 			b.Fatal(err)
 		}
 	}
 
-	if err = db.RebuildIndex(); err != nil {
+	if err := db.RebuildIndex(); err != nil {
 		b.Fatalf("rebuild: %v", err)
 	}
 
+	db.EnableSync()
 	db.EnableIndexing()
-
-	b.Cleanup(func() { _ = db.Close() })
 
 	return db, uint64(seedCount)
 }
 
-func BenchmarkWrite_W_Set_New_Indexed(b *testing.B) {
+func Benchmark_Write_Set_New_Indexed(b *testing.B) {
 	db, startOffset := buildWriteBenchDB(b)
 
 	rec := &UserBench{Name: "new", Age: 20, Country: "DE"}
@@ -84,7 +85,7 @@ func BenchmarkWrite_W_Set_New_Indexed(b *testing.B) {
 	}
 }
 
-func BenchmarkWrite_W_Set_New_NoIndex(b *testing.B) {
+func Benchmark_Write_Set_New_NoIndex(b *testing.B) {
 	db, startOffset := buildWriteBenchDB(b)
 	db.DisableIndexing()
 
@@ -101,7 +102,7 @@ func BenchmarkWrite_W_Set_New_NoIndex(b *testing.B) {
 	}
 }
 
-func BenchmarkWrite_W_Update_Indexed(b *testing.B) {
+func Benchmark_Write_Update_Indexed(b *testing.B) {
 	db, _ := buildWriteBenchDB(b)
 	targetID := uint64(1000)
 
@@ -124,7 +125,7 @@ func BenchmarkWrite_W_Update_Indexed(b *testing.B) {
 	}
 }
 
-func BenchmarkWrite_W_Update_NoIndex(b *testing.B) {
+func Benchmark_Write_Update_NoIndex(b *testing.B) {
 	db, _ := buildWriteBenchDB(b)
 	db.DisableIndexing()
 
@@ -148,7 +149,7 @@ func BenchmarkWrite_W_Update_NoIndex(b *testing.B) {
 	}
 }
 
-func BenchmarkWrite_W_Patch_Indexed(b *testing.B) {
+func Benchmark_Write_Patch_Indexed(b *testing.B) {
 	db, _ := buildWriteBenchDB(b)
 	targetID := uint64(2000)
 
@@ -171,7 +172,7 @@ func BenchmarkWrite_W_Patch_Indexed(b *testing.B) {
 	}
 }
 
-func BenchmarkWrite_W_Patch_NoIndex(b *testing.B) {
+func Benchmark_Write_Patch_NoIndex(b *testing.B) {
 	db, _ := buildWriteBenchDB(b)
 	db.DisableIndexing()
 

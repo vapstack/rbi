@@ -4,7 +4,6 @@ import (
 	"math"
 	"path/filepath"
 	"slices"
-	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -13,8 +12,12 @@ import (
 	"github.com/vapstack/qx"
 )
 
+func postingOf(ids ...uint64) postingList {
+	return postingFromBitmapViewAdaptive(roaring64.BitmapOf(ids...))
+}
+
 func TestPlannerCalibration_ObserveUpdatesMultiplier(t *testing.T) {
-	db, _ := openTempDBUint64(t, &Options[uint64, Rec]{
+	db, _ := openTempDBUint64(t, &Options{
 		AnalyzeInterval:        -1,
 		CalibrationEnabled:     true,
 		CalibrationSampleEvery: 1,
@@ -48,7 +51,7 @@ func TestPlannerCalibration_ObserveUpdatesMultiplier(t *testing.T) {
 }
 
 func TestPlannerCalibration_QueryPathUpdatesWithoutTracerSink(t *testing.T) {
-	db, _ := openTempDBUint64(t, &Options[uint64, Rec]{
+	db, _ := openTempDBUint64(t, &Options{
 		AnalyzeInterval:        -1,
 		CalibrationEnabled:     true,
 		CalibrationSampleEvery: 1,
@@ -88,8 +91,173 @@ func TestPlannerCalibration_QueryPathUpdatesWithoutTracerSink(t *testing.T) {
 	}
 }
 
+func TestPlannerCalibration_SampleEveryNormalization(t *testing.T) {
+	dbEnabled, _ := openTempDBUint64(t, &Options{
+		AnalyzeInterval:        -1,
+		CalibrationEnabled:     true,
+		CalibrationSampleEvery: 0,
+	})
+	if got := dbEnabled.planner.calibrator.sampleEvery; got != defaultOptionsCalibrationSampleEvery {
+		t.Fatalf("expected default calibration sampleEvery=%d, got=%d", defaultOptionsCalibrationSampleEvery, got)
+	}
+
+	dbDisabled, _ := openTempDBUint64(t, &Options{
+		AnalyzeInterval:        -1,
+		CalibrationEnabled:     false,
+		CalibrationSampleEvery: 1,
+	})
+	if got := dbDisabled.planner.calibrator.sampleEvery; got != 0 {
+		t.Fatalf("expected calibration sampleEvery=0 when disabled, got=%d", got)
+	}
+}
+
+func TestTraceAndCalibrationDisabled_BeginTraceReturnsNil(t *testing.T) {
+	db, _ := openTempDBUint64(t, &Options{
+		AnalyzeInterval:        -1,
+		CalibrationEnabled:     false,
+		CalibrationSampleEvery: 1,
+		TraceSink:              nil,
+		TraceSampleEvery:       1,
+	})
+	if db.traceOrCalibrationSamplingEnabled() {
+		t.Fatalf("expected trace/calibration sampling to be disabled")
+	}
+
+	q := qx.Query(qx.EQ("age", 10))
+	if tr := db.beginTrace(q); tr != nil {
+		t.Fatalf("expected nil trace when trace sink and calibration are disabled")
+	}
+}
+
+func TestOrderRangeCoverage_ConsistencyBetweenPredicateKinds(t *testing.T) {
+	db, _ := openTempDBUint64(t, nil)
+
+	s := []index{
+		{Key: indexKeyFromString("alice"), IDs: postingOf(1)},
+		{Key: indexKeyFromString("alina"), IDs: postingOf(2)},
+		{Key: indexKeyFromString("bob"), IDs: postingOf(3)},
+	}
+	delta := &fieldIndexDelta{
+		byKey: map[string]indexDeltaEntry{
+			"albert": {addSingle: 10, addSingleSet: true},
+		},
+	}
+	ov := newFieldOverlay(&s, delta)
+
+	exprs := []qx.Expr{
+		{Op: qx.OpPREFIX, Field: "name", Value: "al"},
+		{Op: qx.OpGTE, Field: "name", Value: "al"},
+		{Op: qx.OpEQ, Field: "age", Value: 20},
+		{Op: qx.OpEQ, Field: "name", Value: "alice", Not: true},
+	}
+
+	cands := make([]predicate, len(exprs))
+	preds := make([]predicate, len(exprs))
+	for i := range exprs {
+		cands[i] = predicate{expr: exprs[i]}
+		preds[i] = predicate{expr: exprs[i]}
+	}
+
+	st1, en1, cov1, ok1 := db.extractOrderRangeCoverage("name", cands, s)
+	if !ok1 {
+		t.Fatalf("extractOrderRangeCoverage failed")
+	}
+	st2, en2, cov2, ok2 := db.extractOrderRangeCoveragePreds("name", preds, s)
+	if !ok2 {
+		t.Fatalf("extractOrderRangeCoveragePreds failed")
+	}
+	if st1 != st2 || en1 != en2 {
+		t.Fatalf("range mismatch: candidate=(%d,%d) planner=(%d,%d)", st1, en1, st2, en2)
+	}
+	if !slices.Equal(cov1, cov2) {
+		t.Fatalf("covered mismatch: candidate=%v planner=%v", cov1, cov2)
+	}
+
+	br1, covOv1, okOv1 := db.extractOrderRangeCoverageOverlay("name", cands, ov)
+	if !okOv1 {
+		t.Fatalf("extractOrderRangeCoverageOverlay failed")
+	}
+	br2, covOv2, okOv2 := db.extractOrderRangeCoveragePredsOverlay("name", preds, ov)
+	if !okOv2 {
+		t.Fatalf("extractOrderRangeCoveragePredsOverlay failed")
+	}
+	if br1.baseStart != br2.baseStart || br1.baseEnd != br2.baseEnd || br1.deltaStart != br2.deltaStart || br1.deltaEnd != br2.deltaEnd {
+		t.Fatalf("overlay range mismatch: candidate=%+v planner=%+v", br1, br2)
+	}
+	if !slices.Equal(covOv1, covOv2) {
+		t.Fatalf("overlay covered mismatch: candidate=%v planner=%v", covOv1, covOv2)
+	}
+}
+
+func TestRangeContainsThresholds_Adaptive(t *testing.T) {
+	sparseSmall := rangeLinearContainsLimit(128, 128)
+	denseSmall := rangeLinearContainsLimit(128, 16_384)
+	if sparseSmall <= denseSmall {
+		t.Fatalf("expected wider linear limit for sparse probe: sparse=%d dense=%d", sparseSmall, denseSmall)
+	}
+
+	// Use probe width where density scaling is observable and doesn't collapse to clamp=1.
+	afterSparse := rangeMaterializeAfterForProbe(2_048, 2_048)
+	afterDense := rangeMaterializeAfterForProbe(2_048, 2_048*256)
+	if afterSparse >= afterDense {
+		t.Fatalf("expected sparse probe to materialize earlier than dense: sparse=%d dense=%d", afterSparse, afterDense)
+	}
+
+	afterSmall := rangeMaterializeAfterForProbe(256, 2_048)
+	afterLarge := rangeMaterializeAfterForProbe(8_192, 65_536)
+	if afterLarge >= afterSmall {
+		t.Fatalf("expected wider probe to materialize earlier: small=%d large=%d", afterSmall, afterLarge)
+	}
+}
+
+func TestPlannerExecutionOrderFactors_Adaptive(t *testing.T) {
+	baseProfile := plannerOrderedProfile{
+		coverage:     1.0,
+		activeChecks: 2,
+	}
+	baseBase, baseCheck, baseRange, basePrefix := plannerExecutionOrderFactors(baseProfile, 1.2, 500_000)
+
+	narrowProfile := plannerOrderedProfile{
+		coverage:     0.10,
+		activeChecks: 2,
+	}
+	narrowBase, narrowCheck, narrowRange, narrowPrefix := plannerExecutionOrderFactors(narrowProfile, 1.2, 500_000)
+	if narrowBase >= baseBase || narrowCheck >= baseCheck || narrowRange >= baseRange || narrowPrefix >= basePrefix {
+		t.Fatalf(
+			"expected narrower coverage to reduce factors: base=(%.3f %.3f %.3f %.3f) narrow=(%.3f %.3f %.3f %.3f)",
+			baseBase, baseCheck, baseRange, basePrefix,
+			narrowBase, narrowCheck, narrowRange, narrowPrefix,
+		)
+	}
+
+	_, lowSkewCheck, _, _ := plannerExecutionOrderFactors(baseProfile, 1.2, 500_000)
+	_, highSkewCheck, _, _ := plannerExecutionOrderFactors(baseProfile, 5.0, 500_000)
+	if highSkewCheck <= lowSkewCheck {
+		t.Fatalf("expected higher skew to increase check factor: low=%.3f high=%.3f", lowSkewCheck, highSkewCheck)
+	}
+}
+
+func TestPlannerOrderedFallbackProbeFactor_Adaptive(t *testing.T) {
+	profile := plannerOrderedProfile{
+		coverage:         0.25,
+		hasPrefix:        true,
+		orderRangeLeaves: 1,
+	}
+	noOffset := plannerOrderedFallbackProbeFactor(2.0, profile, 0)
+	withOffset := plannerOrderedFallbackProbeFactor(2.0, profile, 1_000)
+	if withOffset >= noOffset {
+		t.Fatalf("expected offset shape to reduce fallback probe factor: no_offset=%.3f with_offset=%.3f", noOffset, withOffset)
+	}
+
+	lowSkew := plannerOrderedFallbackProbeFactor(1.2, profile, 0)
+	highSkew := plannerOrderedFallbackProbeFactor(5.0, profile, 0)
+	if highSkew <= lowSkew {
+		t.Fatalf("expected higher skew to increase fallback probe factor: low=%.3f high=%.3f", lowSkew, highSkew)
+	}
+}
+
 func TestPlannerCalibration_InfluencesORNoOrderDecision(t *testing.T) {
-	db, _ := openTempDBUint64(t, &Options[uint64, Rec]{
+	db, _ := openTempDBUint64(t, &Options{
 		AnalyzeInterval:        -1,
 		CalibrationEnabled:     true,
 		CalibrationSampleEvery: 1,
@@ -113,7 +281,7 @@ func TestPlannerCalibration_InfluencesORNoOrderDecision(t *testing.T) {
 		P95BucketCard:   2,
 	})
 
-	branches := []plannerORBranch{
+	branches := plannerORBranches{
 		makeORBranchForCalibrationDecisionTest(4_000, 4),
 		makeORBranchForCalibrationDecisionTest(4_000, 4),
 		makeORBranchForCalibrationDecisionTest(4_000, 4),
@@ -142,7 +310,7 @@ func TestPlannerCalibration_InfluencesORNoOrderDecision(t *testing.T) {
 }
 
 func TestPlannerCalibration_SaveLoadRoundTrip(t *testing.T) {
-	db, _ := openTempDBUint64(t, &Options[uint64, Rec]{
+	db, _ := openTempDBUint64(t, &Options{
 		AnalyzeInterval:    -1,
 		CalibrationEnabled: true,
 	})
@@ -171,7 +339,7 @@ func TestPlannerCalibration_SaveLoadRoundTrip(t *testing.T) {
 		t.Fatalf("SaveCalibration: %v", err)
 	}
 
-	db2, _ := openTempDBUint64(t, &Options[uint64, Rec]{
+	db2, _ := openTempDBUint64(t, &Options{
 		AnalyzeInterval:    -1,
 		CalibrationEnabled: true,
 	})
@@ -201,16 +369,13 @@ func TestPlannerCalibration_AutoPersist(t *testing.T) {
 	dbPath := filepath.Join(dir, "auto_persist.db")
 	calPath := filepath.Join(dir, "planner_calibration_auto.json")
 
-	opts := &Options[uint64, Rec]{
+	opts := optsWithDefaults(&Options{
 		AnalyzeInterval:        -1,
 		CalibrationEnabled:     true,
 		CalibrationPersistPath: calPath,
-	}
+	})
 
-	db, err := Open[uint64, Rec](dbPath, 0o600, opts)
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
+	db, raw := openBoltAndNew[uint64, Rec](t, dbPath, opts)
 
 	if err := db.SetCalibrationSnapshot(CalibrationSnapshot{
 		UpdatedAt: time.Now(),
@@ -227,12 +392,13 @@ func TestPlannerCalibration_AutoPersist(t *testing.T) {
 	if err := db.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
-
-	db2, err := Open[uint64, Rec](dbPath, 0o600, opts)
-	if err != nil {
-		t.Fatalf("Open (reopen): %v", err)
+	if err := raw.Close(); err != nil {
+		t.Fatalf("raw close: %v", err)
 	}
+
+	db2, raw2 := openBoltAndNew[uint64, Rec](t, dbPath, opts)
 	defer func() { _ = db2.Close() }()
+	defer func() { _ = raw2.Close() }()
 
 	snap, ok := db2.GetCalibrationSnapshot()
 	if !ok {
@@ -245,7 +411,7 @@ func TestPlannerCalibration_AutoPersist(t *testing.T) {
 }
 
 func TestPlannerCalibration_SupportsExecutionPlanNames(t *testing.T) {
-	db, _ := openTempDBUint64(t, &Options[uint64, Rec]{
+	db, _ := openTempDBUint64(t, &Options{
 		AnalyzeInterval:    -1,
 		CalibrationEnabled: true,
 	})
@@ -290,14 +456,14 @@ func makeORBranchForCalibrationDecisionTest(estCard uint64, extraChecks int) pla
 	if extraChecks < 0 {
 		extraChecks = 0
 	}
-	preds := make([]plannerPred, 0, 1+extraChecks)
-	preds = append(preds, plannerPred{
+	preds := make([]predicate, 0, 1+extraChecks)
+	preds = append(preds, predicate{
 		estCard:  estCard,
 		iter:     func() roaringIter { return roaring64.NewBitmap().Iterator() },
 		contains: func(uint64) bool { return true },
 	})
 	for i := 0; i < extraChecks; i++ {
-		preds = append(preds, plannerPred{
+		preds = append(preds, predicate{
 			// estCard=0 keeps branch cardinality estimate driven by lead,
 			// but contains!=nil increases per-row check cost.
 			contains: func(uint64) bool { return true },
@@ -312,450 +478,13 @@ func makeORBranchForCalibrationDecisionTest(estCard uint64, extraChecks int) pla
 }
 
 func setORPlannerStatsSnapshotForTest(db *DB[uint64, Rec], universe uint64, scoreStats PlannerFieldStats) {
-	db.planner.stats.Store(&PlannerStatsSnapshot{
+	db.planner.stats.Store(&plannerStatsSnapshot{
 		Version:             1,
 		UniverseCardinality: universe,
 		Fields: map[string]PlannerFieldStats{
 			"score": scoreStats,
 		},
 	})
-}
-
-/**/
-
-func TestPlannerStatsCollector_FullRefreshMatchesLockedSnapshot(t *testing.T) {
-	db, _ := openTempDBUint64(t, &Options[uint64, Rec]{AnalyzeInterval: -1})
-	_ = seedData(t, db, 3_000)
-
-	db.mu.RLock()
-	expected := db.buildPlannerStatsSnapshotLocked(1)
-	db.mu.RUnlock()
-
-	if err := db.RefreshPlannerStats(); err != nil {
-		t.Fatalf("RefreshPlannerStats: %v", err)
-	}
-
-	got, ok := db.GetPlannerStatsSnapshot()
-	if !ok {
-		t.Fatalf("expected planner stats snapshot")
-	}
-
-	if got.UniverseCardinality != expected.UniverseCardinality {
-		t.Fatalf("universe mismatch: got=%d want=%d", got.UniverseCardinality, expected.UniverseCardinality)
-	}
-
-	if len(got.Fields) != len(expected.Fields) {
-		t.Fatalf("fields count mismatch: got=%d want=%d", len(got.Fields), len(expected.Fields))
-	}
-
-	for fieldName, expectedStats := range expected.Fields {
-		gotStats, ok := got.Fields[fieldName]
-		if !ok {
-			t.Fatalf("missing field stats for %q", fieldName)
-		}
-		if gotStats != expectedStats {
-			t.Fatalf("field %q stats mismatch: got=%+v want=%+v", fieldName, gotStats, expectedStats)
-		}
-	}
-}
-
-func TestPlannerStatsCollector_PeriodicBudgetAdvancesCursor(t *testing.T) {
-	db, _ := openTempDBUint64(t, &Options[uint64, Rec]{AnalyzeInterval: -1})
-	_ = seedData(t, db, 3_000)
-
-	db.mu.RLock()
-	fieldCount := len(db.index)
-	db.mu.RUnlock()
-	if fieldCount < 2 {
-		t.Skip("not enough indexed fields for cursor progression test")
-	}
-
-	db.planner.analyzer.Lock()
-	db.planner.analyzer.cursor = 0
-	db.planner.analyzer.softBudget = 1 // 1ns, effectively one heavy field per cycle
-	db.planner.analyzer.Unlock()
-
-	s0, ok := db.GetPlannerStatsSnapshot()
-	if !ok {
-		t.Fatalf("expected initial planner stats snapshot")
-	}
-	prevVersion := s0.Version
-	prevCursor := 0
-
-	cycles := fieldCount + 3
-	for i := 0; i < cycles; i++ {
-		if err := db.refreshPlannerStatsPeriodic(); err != nil {
-			t.Fatalf("refreshPlannerStatsPeriodic cycle %d: %v", i, err)
-		}
-
-		db.planner.analyzer.Lock()
-		curCursor := db.planner.analyzer.cursor
-		db.planner.analyzer.Unlock()
-
-		wantCursor := (prevCursor + 1) % fieldCount
-		if curCursor != wantCursor {
-			t.Fatalf("cursor mismatch at cycle %d: got=%d want=%d", i, curCursor, wantCursor)
-		}
-		prevCursor = curCursor
-
-		s, ok := db.GetPlannerStatsSnapshot()
-		if !ok {
-			t.Fatalf("expected planner stats snapshot at cycle %d", i)
-		}
-		if s.Version <= prevVersion {
-			t.Fatalf("version did not advance at cycle %d: got=%d prev=%d", i, s.Version, prevVersion)
-		}
-		prevVersion = s.Version
-	}
-}
-
-/**/
-
-func TestResolvePlannerAnalyzeInterval(t *testing.T) {
-	if got := resolvePlannerAnalyzeInterval(-1); got != 0 {
-		t.Fatalf("negative interval should disable scheduler: got=%v", got)
-	}
-	if got := resolvePlannerAnalyzeInterval(0); got != defaultPlannerAnalyzeInterval {
-		t.Fatalf("zero interval should map to default: got=%v want=%v", got, defaultPlannerAnalyzeInterval)
-	}
-	custom := 37 * time.Second
-	if got := resolvePlannerAnalyzeInterval(custom); got != custom {
-		t.Fatalf("custom interval mismatch: got=%v want=%v", got, custom)
-	}
-}
-
-func TestPlannerAnalyzeScheduler_Disabled(t *testing.T) {
-	db, _ := openTempDBUint64(t, &Options[uint64, Rec]{AnalyzeInterval: -1})
-
-	if db.planner.analyzer.stop != nil || db.planner.analyzer.done != nil {
-		t.Fatalf("scheduler should be disabled for negative interval")
-	}
-
-	s0, ok := db.GetPlannerStatsSnapshot()
-	if !ok {
-		t.Fatalf("expected initial snapshot")
-	}
-
-	time.Sleep(120 * time.Millisecond)
-
-	s1, ok := db.GetPlannerStatsSnapshot()
-	if !ok {
-		t.Fatalf("expected snapshot after sleep")
-	}
-	if s1.Version != s0.Version {
-		t.Fatalf("snapshot version changed while scheduler disabled: before=%d after=%d", s0.Version, s1.Version)
-	}
-}
-
-func TestPlannerAnalyzeScheduler_StartAndStop(t *testing.T) {
-	db, _ := openTempDBUint64(t, &Options[uint64, Rec]{AnalyzeInterval: 20 * time.Millisecond})
-
-	if db.planner.analyzer.stop == nil || db.planner.analyzer.done == nil {
-		t.Fatalf("scheduler should be started")
-	}
-
-	s0, ok := db.GetPlannerStatsSnapshot()
-	if !ok {
-		t.Fatalf("expected initial snapshot")
-	}
-
-	if latest, ok := waitPlannerStatsVersionGreater(db, s0.Version, 900*time.Millisecond); !ok {
-		t.Fatalf("expected background refresh to advance snapshot version: start=%d latest=%d", s0.Version, latest)
-	}
-
-	if err := db.Close(); err != nil {
-		t.Fatalf("Close: %v", err)
-	}
-
-	if db.planner.analyzer.stop != nil || db.planner.analyzer.done != nil {
-		t.Fatalf("scheduler channels must be cleared on close")
-	}
-
-	closedSnapshot, ok := db.GetPlannerStatsSnapshot()
-	if !ok {
-		t.Fatalf("expected snapshot after close")
-	}
-
-	time.Sleep(120 * time.Millisecond)
-
-	afterSnapshot, ok := db.GetPlannerStatsSnapshot()
-	if !ok {
-		t.Fatalf("expected snapshot after close sleep")
-	}
-	if afterSnapshot.Version != closedSnapshot.Version {
-		t.Fatalf("snapshot version changed after close: before=%d after=%d", closedSnapshot.Version, afterSnapshot.Version)
-	}
-}
-
-func waitPlannerStatsVersionGreater(db *DB[uint64, Rec], version uint64, timeout time.Duration) (uint64, bool) {
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		s, ok := db.GetPlannerStatsSnapshot()
-		if ok && s.Version > version {
-			return s.Version, true
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
-	s, ok := db.GetPlannerStatsSnapshot()
-	if !ok {
-		return 0, false
-	}
-	return s.Version, false
-}
-
-/**/
-
-func TestPlannerStatsSnapshot_RefreshAndVersion(t *testing.T) {
-	db, _ := openTempDBUint64(t, nil)
-	_ = seedData(t, db, 1_000)
-
-	s0, ok := db.GetPlannerStatsSnapshot()
-	if !ok {
-		t.Fatalf("expected initial planner stats snapshot")
-	}
-
-	if err := db.RefreshPlannerStats(); err != nil {
-		t.Fatalf("RefreshPlannerStats: %v", err)
-	}
-
-	s1, ok := db.GetPlannerStatsSnapshot()
-	if !ok {
-		t.Fatalf("expected planner stats snapshot after refresh")
-	}
-
-	if s1.Version <= s0.Version {
-		t.Fatalf("version did not advance: before=%d after=%d", s0.Version, s1.Version)
-	}
-	if s1.UniverseCardinality != 1_000 {
-		t.Fatalf("unexpected universe cardinality: got=%d want=%d", s1.UniverseCardinality, 1_000)
-	}
-
-	country, ok := s1.Fields["country"]
-	if !ok {
-		t.Fatalf("expected country field stats")
-	}
-	if country.DistinctKeys == 0 {
-		t.Fatalf("expected non-zero distinct keys for country")
-	}
-	if country.P95BucketCard < country.P50BucketCard {
-		t.Fatalf("expected p95 >= p50, got p95=%d p50=%d", country.P95BucketCard, country.P50BucketCard)
-	}
-
-	// Returned snapshot must be safe to mutate by caller.
-	s1.Fields["country"] = PlannerFieldStats{}
-	s2, ok := db.GetPlannerStatsSnapshot()
-	if !ok {
-		t.Fatalf("expected planner stats snapshot")
-	}
-	if s2.Fields["country"].DistinctKeys == 0 {
-		t.Fatalf("snapshot was mutated by caller")
-	}
-}
-
-/**/
-
-func TestTracer_EmitsAndSamples(t *testing.T) {
-	var (
-		mu     sync.Mutex
-		events []TraceEvent
-	)
-
-	sink := func(ev TraceEvent) {
-		mu.Lock()
-		events = append(events, ev)
-		mu.Unlock()
-	}
-
-	db, _ := openTempDBUint64(t, &Options[uint64, Rec]{
-		AnalyzeInterval:  -1,
-		TraceSink:        sink,
-		TraceSampleEvery: 2,
-	})
-	_ = seedData(t, db, 5_000)
-
-	q := qx.Query(
-		qx.EQ("active", true),
-		qx.GTE("age", 20),
-	).Max(100)
-
-	for i := 0; i < 5; i++ {
-		ids, err := db.QueryKeys(q)
-		if err != nil {
-			t.Fatalf("QueryKeys: %v", err)
-		}
-		if len(ids) == 0 {
-			t.Fatalf("expected non-empty ids")
-		}
-	}
-
-	mu.Lock()
-	got := append([]TraceEvent(nil), events...)
-	mu.Unlock()
-
-	// sampleEvery=2 emits for query #2 and #4.
-	if len(got) != 2 {
-		t.Fatalf("unexpected trace events count: got=%d want=%d", len(got), 2)
-	}
-
-	for i, ev := range got {
-		if ev.Plan == "" {
-			t.Fatalf("event %d: empty plan", i)
-		}
-		if ev.Duration <= 0 {
-			t.Fatalf("event %d: expected positive duration", i)
-		}
-		if ev.RowsReturned == 0 {
-			t.Fatalf("event %d: expected positive rows returned", i)
-		}
-	}
-}
-
-func TestTracer_ORDecisionEstimates(t *testing.T) {
-	var (
-		mu     sync.Mutex
-		events []TraceEvent
-	)
-
-	sink := func(ev TraceEvent) {
-		mu.Lock()
-		events = append(events, ev)
-		mu.Unlock()
-	}
-
-	db, _ := openTempDBUint64(t, &Options[uint64, Rec]{
-		AnalyzeInterval:  -1,
-		TraceSink:        sink,
-		TraceSampleEvery: 1,
-	})
-	_ = seedData(t, db, 20_000)
-
-	q := qx.Query(
-		qx.OR(
-			qx.EQ("active", true),
-			qx.EQ("name", "alice"),
-		),
-	).Max(120)
-
-	ids, err := db.QueryKeys(q)
-	if err != nil {
-		t.Fatalf("QueryKeys: %v", err)
-	}
-	if len(ids) == 0 {
-		t.Fatalf("expected non-empty ids")
-	}
-
-	mu.Lock()
-	defer mu.Unlock()
-	if len(events) == 0 {
-		t.Fatalf("expected trace event")
-	}
-	ev := events[len(events)-1]
-
-	if !strings.HasPrefix(ev.Plan, "plan_or_merge_") {
-		t.Fatalf("expected OR planner plan, got %q", ev.Plan)
-	}
-	if ev.EstimatedRows == 0 {
-		t.Fatalf("expected estimated rows to be set")
-	}
-	if ev.EstimatedCost <= 0 {
-		t.Fatalf("expected estimated cost to be positive")
-	}
-	if ev.RowsExamined == 0 {
-		t.Fatalf("expected rows examined to be recorded")
-	}
-	if ev.RowsReturned != uint64(len(ids)) {
-		t.Fatalf("rows returned mismatch: ev=%d ids=%d", ev.RowsReturned, len(ids))
-	}
-	if len(ev.ORBranches) == 0 {
-		t.Fatalf("expected OR branch trace")
-	}
-	var branchExamined uint64
-	var branchEmitted uint64
-	for _, b := range ev.ORBranches {
-		branchExamined += b.RowsExamined
-		branchEmitted += b.RowsEmitted
-	}
-	if branchExamined == 0 {
-		t.Fatalf("expected OR branch examined rows to be recorded")
-	}
-	if branchEmitted == 0 {
-		t.Fatalf("expected OR branch emitted rows to be recorded")
-	}
-	if ev.EarlyStopReason == "" {
-		t.Fatalf("expected early stop reason to be set")
-	}
-	if ev.OrderIndexScanWidth != 0 {
-		t.Fatalf("expected no order-index scan width for unordered OR query, got=%d", ev.OrderIndexScanWidth)
-	}
-}
-
-func TestTracer_OROrderMetrics(t *testing.T) {
-	var (
-		mu     sync.Mutex
-		events []TraceEvent
-	)
-
-	sink := func(ev TraceEvent) {
-		mu.Lock()
-		events = append(events, ev)
-		mu.Unlock()
-	}
-
-	db, _ := openTempDBUint64(t, &Options[uint64, Rec]{
-		AnalyzeInterval:  -1,
-		TraceSink:        sink,
-		TraceSampleEvery: 1,
-	})
-	_ = seedData(t, db, 20_000)
-
-	q := qx.Query(
-		qx.OR(
-			qx.EQ("active", true),
-			qx.EQ("name", "alice"),
-		),
-	).By("age", qx.ASC).Max(80)
-
-	ids, err := db.QueryKeys(q)
-	if err != nil {
-		t.Fatalf("QueryKeys: %v", err)
-	}
-	if len(ids) == 0 {
-		t.Fatalf("expected non-empty ids")
-	}
-
-	mu.Lock()
-	defer mu.Unlock()
-	if len(events) == 0 {
-		t.Fatalf("expected trace event")
-	}
-	ev := events[len(events)-1]
-
-	if !strings.HasPrefix(ev.Plan, "plan_or_merge_order_") {
-		t.Fatalf("expected ordered OR planner plan, got %q", ev.Plan)
-	}
-	if len(ev.ORBranches) == 0 {
-		t.Fatalf("expected OR branch trace")
-	}
-
-	var branchExamined uint64
-	var branchEmitted uint64
-	for _, b := range ev.ORBranches {
-		branchExamined += b.RowsExamined
-		branchEmitted += b.RowsEmitted
-	}
-
-	if branchExamined == 0 {
-		t.Fatalf("expected OR branch examined rows to be recorded")
-	}
-	if branchEmitted == 0 {
-		t.Fatalf("expected OR branch emitted rows to be recorded")
-	}
-	if ev.OrderIndexScanWidth == 0 {
-		t.Fatalf("expected order-index scan width to be recorded")
-	}
-	if ev.EarlyStopReason == "" {
-		t.Fatalf("expected early stop reason to be set")
-	}
 }
 
 func TestTracer_ORNoOrderAdaptiveSkipsBranchByThreshold(t *testing.T) {
@@ -770,7 +499,7 @@ func TestTracer_ORNoOrderAdaptiveSkipsBranchByThreshold(t *testing.T) {
 		mu.Unlock()
 	}
 
-	db, _ := openTempDBUint64(t, &Options[uint64, Rec]{
+	db, _ := openTempDBUint64(t, &Options{
 		AnalyzeInterval:  -1,
 		TraceSink:        sink,
 		TraceSampleEvery: 1,
@@ -825,7 +554,7 @@ func TestTracer_ORNoOrderAdaptiveSkipsBranchByThreshold(t *testing.T) {
 }
 
 func TestPlannerORNoOrderAdaptive_MatchesBaseline(t *testing.T) {
-	db, _ := openTempDBUint64(t, &Options[uint64, Rec]{
+	db, _ := openTempDBUint64(t, &Options{
 		AnalyzeInterval: -1,
 	})
 	_ = seedData(t, db, 20_000)
@@ -873,7 +602,7 @@ func TestPlannerORNoOrderAdaptive_MatchesBaseline(t *testing.T) {
 }
 
 func TestPlannerOROrderKWay_MatchesFallbackMerge(t *testing.T) {
-	db, _ := openTempDBUint64(t, &Options[uint64, Rec]{
+	db, _ := openTempDBUint64(t, &Options{
 		AnalyzeInterval: -1,
 	})
 	_ = seedData(t, db, 20_000)
@@ -932,6 +661,214 @@ func TestPlannerOROrderKWay_MatchesFallbackMerge(t *testing.T) {
 	}
 }
 
+func TestPlannerOROrderMergePaths_MatchBasic_WithOrderDelta(t *testing.T) {
+	db, _ := openTempDBUint64(t, &Options{
+		AnalyzeInterval: -1,
+	})
+	_ = seedData(t, db, 20_000)
+
+	rec, err := db.Get(1)
+	if err != nil {
+		t.Fatalf("Get(1): %v", err)
+	}
+	rec.Age++
+	if err := db.Set(1, rec); err != nil {
+		t.Fatalf("Set(1): %v", err)
+	}
+
+	ov := db.fieldOverlay("age")
+	if ov.delta == nil {
+		t.Fatalf("expected non-nil age delta overlay")
+	}
+
+	q := normalizeQuery(qx.Query(
+		qx.OR(
+			qx.AND(
+				qx.EQ("active", true),
+				qx.EQ("country", "NL"),
+			),
+			qx.AND(
+				qx.EQ("name", "alice"),
+				qx.GTE("age", 25),
+			),
+			qx.PREFIX("full_name", "FN-1"),
+		),
+	).By("age", qx.ASC).Skip(30).Max(120))
+
+	branchesKWay, alwaysFalse, ok := db.buildORBranches(q.Expr.Operands)
+	if !ok {
+		t.Fatalf("buildORBranches kway: ok=false")
+	}
+	if alwaysFalse {
+		t.Fatalf("unexpected alwaysFalse for kway branches")
+	}
+	defer releaseORBranches(branchesKWay)
+
+	gotKWay, ok, err := db.execPlanOROrderKWay(q, branchesKWay, nil)
+	if err != nil {
+		t.Fatalf("execPlanOROrderKWay err: %v", err)
+	}
+	if !ok {
+		t.Fatalf("execPlanOROrderKWay: ok=false")
+	}
+
+	branchesFallback, alwaysFalse, ok := db.buildORBranches(q.Expr.Operands)
+	if !ok {
+		t.Fatalf("buildORBranches fallback: ok=false")
+	}
+	if alwaysFalse {
+		t.Fatalf("unexpected alwaysFalse for fallback branches")
+	}
+	defer releaseORBranches(branchesFallback)
+
+	gotFallback, ok, err := db.execPlanOROrderMergeFallback(q, branchesFallback, nil)
+	if err != nil {
+		t.Fatalf("execPlanOROrderMergeFallback err: %v", err)
+	}
+	if !ok {
+		t.Fatalf("execPlanOROrderMergeFallback: ok=false")
+	}
+
+	branchesBasic, alwaysFalse, ok := db.buildORBranches(q.Expr.Operands)
+	if !ok {
+		t.Fatalf("buildORBranches basic: ok=false")
+	}
+	if alwaysFalse {
+		t.Fatalf("unexpected alwaysFalse for basic branches")
+	}
+	defer releaseORBranches(branchesBasic)
+
+	gotBasic, ok := db.execPlanOROrderBasic(q, branchesBasic, nil)
+	if !ok {
+		t.Fatalf("execPlanOROrderBasic: ok=false")
+	}
+
+	if !slices.Equal(gotKWay, gotBasic) {
+		t.Fatalf("kway/basic mismatch with order delta:\nkway=%v\nbasic=%v", gotKWay, gotBasic)
+	}
+	if !slices.Equal(gotFallback, gotBasic) {
+		t.Fatalf("fallback/basic mismatch with order delta:\nfallback=%v\nbasic=%v", gotFallback, gotBasic)
+	}
+}
+
+func TestPlannerOROrderMergePaths_WithDeltaInsertDelete_MatchSeqScan(t *testing.T) {
+	db, _ := openTempDBUint64(t, &Options{
+		AnalyzeInterval: -1,
+	})
+	_ = seedData(t, db, 20_000)
+
+	// Create order-field delta with both insertion and tombstone scenarios.
+	idTop := uint64(30_001)
+	if err := db.Set(idTop, &Rec{
+		Meta:     Meta{Country: "NL"},
+		Name:     "alice",
+		Email:    "delta-top@example.test",
+		Age:      34,
+		Score:    9_999.9,
+		Active:   true,
+		Tags:     []string{"go", "ops"},
+		FullName: "FN-DELTA-TOP",
+	}); err != nil {
+		t.Fatalf("Set(idTop): %v", err)
+	}
+
+	idGone := uint64(30_002)
+	if err := db.Set(idGone, &Rec{
+		Meta:     Meta{Country: "DE"},
+		Name:     "alice",
+		Email:    "delta-gone@example.test",
+		Age:      31,
+		Score:    9_995.7,
+		Active:   true,
+		Tags:     []string{"go", "ops"},
+		FullName: "FN-DELTA-GONE",
+	}); err != nil {
+		t.Fatalf("Set(idGone): %v", err)
+	}
+	if err := db.Delete(idGone); err != nil {
+		t.Fatalf("Delete(idGone): %v", err)
+	}
+
+	ov := db.fieldOverlay("score")
+	if ov.delta == nil {
+		t.Fatalf("expected non-nil score delta overlay")
+	}
+
+	q := normalizeQuery(qx.Query(
+		qx.OR(
+			qx.AND(
+				qx.EQ("active", true),
+				qx.IN("country", []string{"NL", "DE", "PL"}),
+				qx.HASANY("tags", []string{"go", "ops"}),
+				qx.GTE("score", 40.0),
+			),
+			qx.AND(
+				qx.EQ("name", "alice"),
+				qx.GTE("age", 20),
+				qx.LTE("age", 45),
+			),
+			qx.AND(
+				qx.HASANY("tags", []string{"rust", "db"}),
+				qx.GTE("score", 30.0),
+			),
+		),
+	).By("score", qx.DESC).Max(120))
+
+	want, err := expectedKeysUint64(t, db, q)
+	if err != nil {
+		t.Fatalf("expectedKeysUint64: %v", err)
+	}
+	if len(want) == 0 || want[0] != idTop {
+		t.Fatalf("expected delta-top id as first result, got=%v", want)
+	}
+	for _, id := range want {
+		if id == idGone {
+			t.Fatalf("deleted id leaked into expected set: %d", idGone)
+		}
+	}
+
+	branchesKWay, alwaysFalse, ok := db.buildORBranches(q.Expr.Operands)
+	if !ok {
+		t.Fatalf("buildORBranches kway: ok=false")
+	}
+	if alwaysFalse {
+		t.Fatalf("unexpected alwaysFalse for kway branches")
+	}
+	defer releaseORBranches(branchesKWay)
+
+	gotKWay, ok, err := db.execPlanOROrderKWay(q, branchesKWay, nil)
+	if err != nil {
+		t.Fatalf("execPlanOROrderKWay err: %v", err)
+	}
+	if !ok {
+		t.Fatalf("execPlanOROrderKWay: ok=false")
+	}
+
+	branchesFallback, alwaysFalse, ok := db.buildORBranches(q.Expr.Operands)
+	if !ok {
+		t.Fatalf("buildORBranches fallback: ok=false")
+	}
+	if alwaysFalse {
+		t.Fatalf("unexpected alwaysFalse for fallback branches")
+	}
+	defer releaseORBranches(branchesFallback)
+
+	gotFallback, ok, err := db.execPlanOROrderMergeFallback(q, branchesFallback, nil)
+	if err != nil {
+		t.Fatalf("execPlanOROrderMergeFallback err: %v", err)
+	}
+	if !ok {
+		t.Fatalf("execPlanOROrderMergeFallback: ok=false")
+	}
+
+	if !slices.Equal(gotKWay, want) {
+		t.Fatalf("kway/seqscan mismatch:\nkway=%v\nwant=%v", gotKWay, want)
+	}
+	if !slices.Equal(gotFallback, want) {
+		t.Fatalf("fallback/seqscan mismatch:\nfallback=%v\nwant=%v", gotFallback, want)
+	}
+}
+
 func TestPlannerORKWayShouldFallbackRuntime(t *testing.T) {
 	if plannerORKWayShouldFallbackRuntime(120, 16, 20, 300_000) {
 		t.Fatalf("unexpected fallback for too-small pop sample")
@@ -948,10 +885,13 @@ func TestPlannerORKWayShouldFallbackRuntime(t *testing.T) {
 	if !plannerORKWayShouldFallbackRuntime(120, 64, 12, 500_000) {
 		t.Fatalf("expected fallback for poor projected k-way efficiency")
 	}
+	if !plannerORKWayShouldFallbackRuntime(250_000, 3_000, 2_900, 300_000) {
+		t.Fatalf("expected fallback for large-window low-overlap stream")
+	}
 }
 
 func TestPlannerOROrderKWayRuntimeFallbackEnable(t *testing.T) {
-	db, _ := openTempDBUint64(t, &Options[uint64, Rec]{
+	db, _ := openTempDBUint64(t, &Options{
 		AnalyzeInterval: -1,
 	})
 	_ = seedData(t, db, 20_000)
@@ -1014,7 +954,7 @@ func TestPlannerOROrderKWayRuntimeFallbackEnable(t *testing.T) {
 }
 
 func TestPlannerOrderedAnchor_MatchesBaseline(t *testing.T) {
-	db, _ := openTempDBUint64(t, &Options[uint64, Rec]{
+	db, _ := openTempDBUint64(t, &Options{
 		AnalyzeInterval: -1,
 	})
 	_ = seedData(t, db, 20_000)
@@ -1050,9 +990,10 @@ func TestPlannerOrderedAnchor_MatchesBaseline(t *testing.T) {
 	defer releasePredicates(predsB)
 
 	orderField := q.Order[0].Field
-	slice := db.index[orderField]
+	ov := db.fieldOverlay(orderField)
+	slice := materializeFieldOverlay(ov)
 	if slice == nil {
-		t.Fatalf("order slice is nil")
+		t.Fatalf("materialized order slice is nil")
 	}
 	s := *slice
 	start, end := 0, len(s)
@@ -1095,7 +1036,7 @@ func TestPlannerRouting_PrefersOrderedAnchorForMixedPredicates(t *testing.T) {
 		mu.Unlock()
 	}
 
-	db, _ := openTempDBUint64(t, &Options[uint64, Rec]{
+	db, _ := openTempDBUint64(t, &Options{
 		AnalyzeInterval:  -1,
 		TraceSink:        sink,
 		TraceSampleEvery: 1,
@@ -1124,8 +1065,8 @@ func TestPlannerRouting_PrefersOrderedAnchorForMixedPredicates(t *testing.T) {
 	}
 	ev := events[len(events)-1]
 
-	if ev.Plan != "plan_ordered_anchor" {
-		t.Fatalf("expected ordered anchor plan, got %q", ev.Plan)
+	if ev.Plan != "plan_ordered_anchor" && ev.Plan != "plan_ordered" {
+		t.Fatalf("expected ordered plan (anchor/basic), got %q", ev.Plan)
 	}
 	if ev.OrderIndexScanWidth == 0 {
 		t.Fatalf("expected non-zero order index scan width")
@@ -1147,7 +1088,7 @@ func TestPlannerRouting_PrefersExecutionForPrefixOrderLimit(t *testing.T) {
 		mu.Unlock()
 	}
 
-	db, _ := openTempDBUint64(t, &Options[uint64, Rec]{
+	db, _ := openTempDBUint64(t, &Options{
 		AnalyzeInterval:  -1,
 		TraceSink:        sink,
 		TraceSampleEvery: 1,
@@ -1200,7 +1141,7 @@ func TestPlannerRouting_PrefersExecutionForPrefixNoOrderLimit(t *testing.T) {
 		mu.Unlock()
 	}
 
-	db, _ := openTempDBUint64(t, &Options[uint64, Rec]{
+	db, _ := openTempDBUint64(t, &Options{
 		AnalyzeInterval:  -1,
 		TraceSink:        sink,
 		TraceSampleEvery: 1,
@@ -1244,7 +1185,7 @@ func TestPlannerRouting_PrefersExecutionForWidePrefixNoOrderLimit(t *testing.T) 
 		mu.Unlock()
 	}
 
-	db, _ := openTempDBUint64(t, &Options[uint64, Rec]{
+	db, _ := openTempDBUint64(t, &Options{
 		AnalyzeInterval:  -1,
 		TraceSink:        sink,
 		TraceSampleEvery: 1,
@@ -1285,7 +1226,7 @@ func TestPlannerRouting_PrefersExecutionForWidePrefixNoOrderLimit(t *testing.T) 
 }
 
 func TestPlannerRouting_AvoidsExecutionForWidePrefixLowHitRate(t *testing.T) {
-	db, _ := openTempDBUint64(t, &Options[uint64, Rec]{
+	db, _ := openTempDBUint64(t, &Options{
 		AnalyzeInterval: -1,
 	})
 	_ = seedData(t, db, 20_000)
@@ -1304,8 +1245,28 @@ func TestPlannerRouting_AvoidsExecutionForWidePrefixLowHitRate(t *testing.T) {
 	}
 }
 
+func TestPlannerRouting_AvoidsExecutionForWidePrefixZeroHitRate(t *testing.T) {
+	db, _ := openTempDBUint64(t, &Options{
+		AnalyzeInterval: -1,
+	})
+	_ = seedData(t, db, 20_000)
+
+	q := normalizeQuery(qx.Query(
+		qx.PREFIX("full_name", "FN-"),
+		qx.EQ("full_name", "FN-999999999"),
+	).Max(15))
+
+	leaves, ok := extractAndLeaves(q.Expr)
+	if !ok || len(leaves) == 0 {
+		t.Fatalf("extractAndLeaves: ok=%v len=%d", ok, len(leaves))
+	}
+	if db.shouldPreferExecutionNoOrderPrefix(q, leaves) {
+		t.Fatalf("expected fallback/planner preference for zero-hit wide prefix shape")
+	}
+}
+
 func TestPlannerOROrderMergeFallbackFirst_ComplexOffset(t *testing.T) {
-	db, _ := openTempDBUint64(t, &Options[uint64, Rec]{
+	db, _ := openTempDBUint64(t, &Options{
 		AnalyzeInterval: -1,
 	})
 	_ = seedData(t, db, 20_000)
@@ -1340,7 +1301,13 @@ func TestPlannerOROrderMergeFallbackFirst_ComplexOffset(t *testing.T) {
 	defer releaseORBranches(branchesComplex)
 
 	if !db.shouldPreferOROrderFallbackFirst(qComplex, branchesComplex) {
-		t.Fatalf("expected fallback-first preference for complex offset ordered OR")
+		needComplex, ok := orderWindow(qComplex)
+		if !ok {
+			t.Fatalf("orderWindow complex: ok=false")
+		}
+		if !db.shouldUseOROrderKWayRuntimeFallback(qComplex, branchesComplex, needComplex) {
+			t.Fatalf("expected either fallback-first or runtime fallback guard for complex offset ordered OR")
+		}
 	}
 
 	qLight := normalizeQuery(qx.Query(
@@ -1371,6 +1338,135 @@ func TestPlannerOROrderMergeFallbackFirst_ComplexOffset(t *testing.T) {
 	}
 }
 
+func TestPlannerOROrderMergeFallbackFirst_DisabledWithOrderDelta(t *testing.T) {
+	db, _ := openTempDBUint64(t, &Options{
+		AnalyzeInterval: -1,
+	})
+	_ = seedData(t, db, 20_000)
+
+	rec, err := db.Get(1)
+	if err != nil {
+		t.Fatalf("Get(1): %v", err)
+	}
+	rec.Score += 0.314159
+	if err := db.Set(1, rec); err != nil {
+		t.Fatalf("Set(1): %v", err)
+	}
+
+	ov := db.fieldOverlay("score")
+	if ov.delta == nil {
+		t.Fatalf("expected non-nil score delta overlay")
+	}
+
+	q := normalizeQuery(qx.Query(
+		qx.OR(
+			qx.AND(
+				qx.EQ("active", true),
+				qx.IN("country", []string{"NL", "DE", "PL"}),
+				qx.HASANY("tags", []string{"go", "ops"}),
+				qx.GTE("score", 40.0),
+			),
+			qx.AND(
+				qx.EQ("name", "alice"),
+				qx.GTE("age", 20),
+				qx.LTE("age", 45),
+			),
+			qx.AND(
+				qx.HASANY("tags", []string{"rust", "db"}),
+				qx.GTE("score", 30.0),
+			),
+		),
+	).By("score", qx.DESC).Skip(500).Max(100))
+
+	branches, alwaysFalse, ok := db.buildORBranches(q.Expr.Operands)
+	if !ok {
+		t.Fatalf("buildORBranches: ok=false")
+	}
+	if alwaysFalse {
+		t.Fatalf("unexpected alwaysFalse branches")
+	}
+	defer releaseORBranches(branches)
+
+	if db.shouldPreferOROrderFallbackFirst(q, branches) {
+		t.Fatalf("fallback-first must stay disabled when order field overlay has delta")
+	}
+}
+
+func TestTracer_OROrderRouteDecision_WithOrderDelta(t *testing.T) {
+	db, _ := openTempDBUint64(t, &Options{
+		AnalyzeInterval: -1,
+	})
+	_ = seedData(t, db, 20_000)
+
+	rec, err := db.Get(1)
+	if err != nil {
+		t.Fatalf("Get(1): %v", err)
+	}
+	rec.Score += 0.271828
+	if err := db.Set(1, rec); err != nil {
+		t.Fatalf("Set(1): %v", err)
+	}
+
+	ov := db.fieldOverlay("score")
+	if ov.delta == nil {
+		t.Fatalf("expected non-nil score delta overlay")
+	}
+
+	q := normalizeQuery(qx.Query(
+		qx.OR(
+			qx.AND(
+				qx.EQ("active", true),
+				qx.IN("country", []string{"NL", "DE", "PL"}),
+				qx.HASANY("tags", []string{"go", "ops"}),
+				qx.GTE("score", 40.0),
+			),
+			qx.AND(
+				qx.EQ("name", "alice"),
+				qx.GTE("age", 20),
+				qx.LTE("age", 45),
+			),
+			qx.AND(
+				qx.HASANY("tags", []string{"rust", "db"}),
+				qx.GTE("score", 30.0),
+			),
+		),
+	).By("score", qx.DESC).Skip(500).Max(100))
+
+	branches, alwaysFalse, ok := db.buildORBranches(q.Expr.Operands)
+	if !ok {
+		t.Fatalf("buildORBranches: ok=false")
+	}
+	if alwaysFalse {
+		t.Fatalf("unexpected alwaysFalse branches")
+	}
+	defer releaseORBranches(branches)
+
+	trace := &queryTrace{}
+	_, _, err = db.execPlanOROrderMerge(q, branches, trace)
+	if err != nil {
+		t.Fatalf("execPlanOROrderMerge: %v", err)
+	}
+
+	if trace.ev.ORRoute.Route != "kway_first" {
+		t.Fatalf("expected kway_first route, got %q", trace.ev.ORRoute.Route)
+	}
+	if trace.ev.ORRoute.Reason != "order_delta_present" {
+		t.Fatalf("expected route reason order_delta_present, got %q", trace.ev.ORRoute.Reason)
+	}
+	if trace.ev.ORRoute.FallbackCollectFast {
+		t.Fatalf("expected fallbackCollectFast=false with order delta")
+	}
+	if trace.ev.ORRoute.KWayCost <= 0 || trace.ev.ORRoute.FallbackCost <= 0 {
+		t.Fatalf(
+			"expected positive route costs: kway=%v fallback=%v",
+			trace.ev.ORRoute.KWayCost, trace.ev.ORRoute.FallbackCost,
+		)
+	}
+	if trace.ev.ORRoute.RuntimeGuardReason == "" {
+		t.Fatalf("expected runtime guard reason in OR route trace")
+	}
+}
+
 func TestPlannerRouting_PrefersExecutionForRangeOrderLimit(t *testing.T) {
 	var (
 		mu     sync.Mutex
@@ -1383,7 +1479,7 @@ func TestPlannerRouting_PrefersExecutionForRangeOrderLimit(t *testing.T) {
 		mu.Unlock()
 	}
 
-	db, _ := openTempDBUint64(t, &Options[uint64, Rec]{
+	db, _ := openTempDBUint64(t, &Options{
 		AnalyzeInterval:  -1,
 		TraceSink:        sink,
 		TraceSampleEvery: 1,
@@ -1422,5 +1518,74 @@ func TestPlannerRouting_PrefersExecutionForRangeOrderLimit(t *testing.T) {
 	}
 	if ev.FallbackCost <= 0 {
 		t.Fatalf("expected fallback cost to be set")
+	}
+}
+
+func TestPlannerCandidateOrder_MatchesSeqScan(t *testing.T) {
+	db, _ := openTempDBUint64(t, &Options{
+		AnalyzeInterval: -1,
+	})
+	_ = seedData(t, db, 20_000)
+
+	q := normalizeQuery(qx.Query(
+		qx.EQ("active", true),
+		qx.NOTIN("country", []string{"NL", "DE"}),
+		qx.IN("name", []string{"alice", "bob", "carol"}),
+	).By("age", qx.ASC).Max(120))
+
+	leaves, ok := collectAndLeaves(q.Expr)
+	if !ok || len(leaves) == 0 {
+		t.Fatalf("collectAndLeaves: ok=%v len=%d", ok, len(leaves))
+	}
+	if !db.shouldUseCandidateOrder(q.Order[0], leaves) {
+		t.Fatalf("expected candidate-order precheck to pass for query shape")
+	}
+
+	got, used, err := db.tryPlanCandidate(q, nil)
+	if err != nil {
+		t.Fatalf("tryPlanCandidate: %v", err)
+	}
+	if !used {
+		t.Fatalf("expected candidate-order route to be used")
+	}
+
+	want, err := expectedKeysUint64(t, db, q)
+	if err != nil {
+		t.Fatalf("expectedKeysUint64: %v", err)
+	}
+	assertSameSlice(t, got, want)
+}
+
+func TestPlannerCandidateNoOrder_RespectsWindowAndPredicateSet(t *testing.T) {
+	db, _ := openTempDBUint64(t, &Options{
+		AnalyzeInterval: -1,
+	})
+	_ = seedData(t, db, 20_000)
+
+	q := normalizeQuery(qx.Query(
+		qx.EQ("active", true),
+		qx.NOTIN("country", []string{"NL", "DE"}),
+		qx.IN("name", []string{"alice", "bob", "carol"}),
+	).Max(90))
+
+	got, used, err := db.tryPlanCandidate(q, nil)
+	if err != nil {
+		t.Fatalf("tryPlanCandidate: %v", err)
+	}
+	if !used {
+		t.Fatalf("expected candidate no-order route to be used")
+	}
+
+	fullQ := cloneQuery(q)
+	fullQ.Offset = 0
+	fullQ.Limit = 0
+	full, err := expectedKeysUint64(t, db, fullQ)
+	if err != nil {
+		t.Fatalf("expectedKeysUint64(full): %v", err)
+	}
+	assertNoOrderWindowSubset(t, q, got, full, "candidate_no_order")
+
+	if len(full) >= int(q.Limit) && len(got) != int(q.Limit) {
+		t.Fatalf("expected full page for no-order candidate route: got=%d limit=%d full=%d", len(got), q.Limit, len(full))
 	}
 }

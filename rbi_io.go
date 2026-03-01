@@ -9,10 +9,10 @@ import (
 
 // Get returns the value stored by id or nil if key was not found.
 func (db *DB[K, V]) Get(id K) (*V, error) {
-
-	if db.closed.Load() {
-		return nil, ErrClosed
+	if err := db.beginOp(); err != nil {
+		return nil, err
 	}
+	defer db.endOp()
 
 	tx, err := db.bolt.Begin(false)
 	if err != nil {
@@ -20,7 +20,12 @@ func (db *DB[K, V]) Get(id K) (*V, error) {
 	}
 	defer rollback(tx)
 
-	v := tx.Bucket(db.bucket).Get(db.keyFromID(id))
+	bucket := tx.Bucket(db.bucket)
+	if bucket == nil {
+		return nil, fmt.Errorf("bucket does not exist")
+	}
+
+	v := bucket.Get(db.keyFromID(id))
 	if v == nil {
 		return nil, nil
 	}
@@ -31,14 +36,14 @@ func (db *DB[K, V]) Get(id K) (*V, error) {
 	return r, nil
 }
 
-// GetMany retrieves multiple values by their IDs in a single read transaction.
+// BatchGet retrieves multiple values by their IDs in a single read transaction.
 // The returned slice has the same length as ids; any missing keys have a nil
 // entry at the corresponding index.
-func (db *DB[K, V]) GetMany(ids ...K) ([]*V, error) {
-
-	if db.closed.Load() {
-		return nil, ErrClosed
+func (db *DB[K, V]) BatchGet(ids ...K) ([]*V, error) {
+	if err := db.beginOp(); err != nil {
+		return nil, err
 	}
+	defer db.endOp()
 	if len(ids) == 0 {
 		return nil, nil
 	}
@@ -48,11 +53,11 @@ func (db *DB[K, V]) GetMany(ids ...K) ([]*V, error) {
 		return nil, fmt.Errorf("tx error: %w", err)
 	}
 	defer rollback(tx)
-	return db.getManyTx(tx, ids...)
+	return db.batchGetTx(tx, ids...)
 }
 
-// getManyTx retrieves multiple values by IDs using an existing read transaction.
-func (db *DB[K, V]) getManyTx(tx *bbolt.Tx, ids ...K) ([]*V, error) {
+// batchGetTx retrieves multiple values by IDs using an existing read transaction.
+func (db *DB[K, V]) batchGetTx(tx *bbolt.Tx, ids ...K) ([]*V, error) {
 	bucket := tx.Bucket(db.bucket)
 	if bucket == nil {
 		return nil, fmt.Errorf("bucket does not exist")
@@ -73,6 +78,32 @@ func (db *DB[K, V]) getManyTx(tx *bbolt.Tx, ids ...K) ([]*V, error) {
 	return s, nil
 }
 
+// batchGetTxCompact retrieves multiple values by IDs using an existing read
+// transaction and returns only existing records (without nil holes).
+func (db *DB[K, V]) batchGetTxCompact(tx *bbolt.Tx, ids []K) ([]*V, error) {
+	bucket := tx.Bucket(db.bucket)
+	if bucket == nil {
+		return nil, fmt.Errorf("bucket does not exist")
+	}
+	if len(ids) == 0 {
+		return nil, nil
+	}
+
+	out := make([]*V, 0, len(ids))
+	for _, id := range ids {
+		v := bucket.Get(db.keyFromID(id))
+		if v == nil {
+			continue
+		}
+		value, err := db.decode(v)
+		if err != nil {
+			return out, fmt.Errorf("decode: %w", err)
+		}
+		out = append(out, value)
+	}
+	return out, nil
+}
+
 // ScanKeys iterates over keys in the in-memory index snapshot and calls fn for
 // each key greater than or equal to seek.
 //
@@ -82,15 +113,17 @@ func (db *DB[K, V]) getManyTx(tx *bbolt.Tx, ids ...K) ([]*V, error) {
 // For string keys, iteration order follows internal key index order,
 // not lexicographic order; seek is applied only as a prefix filter.
 func (db *DB[K, V]) ScanKeys(seek K, fn func(K) (bool, error)) error {
-	db.mu.RLock()
-	closed := db.closed.Load()
-	noIndex := db.noIndex.Load()
-	universe := db.universe.Clone()
-	db.mu.RUnlock()
-
-	if closed {
-		return ErrClosed
+	if err := db.beginOp(); err != nil {
+		return err
 	}
+	defer db.endOp()
+
+	noIndex := db.noIndex.Load()
+	universe, owned := db.snapshotUniverseView()
+	if owned {
+		defer releaseRoaringBuf(universe)
+	}
+
 	if noIndex {
 		return ErrIndexDisabled
 	}
@@ -123,10 +156,10 @@ func (db *DB[K, V]) ScanKeys(seek K, fn func(K) (bool, error)) error {
 // The scan runs inside a read-only transaction which remains open for the
 // duration of the scan.
 func (db *DB[K, V]) SeqScan(seek K, fn func(K, *V) (bool, error)) error {
-
-	if db.closed.Load() {
-		return ErrClosed
+	if err := db.beginOp(); err != nil {
+		return err
 	}
+	defer db.endOp()
 
 	tx, err := db.bolt.Begin(false)
 	if err != nil {
@@ -135,6 +168,9 @@ func (db *DB[K, V]) SeqScan(seek K, fn func(K, *V) (bool, error)) error {
 	defer rollback(tx)
 
 	b := tx.Bucket(db.bucket)
+	if b == nil {
+		return fmt.Errorf("bucket does not exist")
+	}
 	c := b.Cursor()
 
 	key, value := c.Seek(db.keyFromID(seek))
@@ -174,10 +210,10 @@ func (db *DB[K, V]) SeqScan(seek K, fn func(K, *V) (bool, error)) error {
 //
 // Bytes passed to fn must not be modified.
 func (db *DB[K, V]) SeqScanRaw(seek K, fn func(K, []byte) (bool, error)) error {
-
-	if db.closed.Load() {
-		return ErrClosed
+	if err := db.beginOp(); err != nil {
+		return err
 	}
+	defer db.endOp()
 
 	tx, err := db.bolt.Begin(false)
 	if err != nil {
@@ -186,6 +222,9 @@ func (db *DB[K, V]) SeqScanRaw(seek K, fn func(K, []byte) (bool, error)) error {
 	defer rollback(tx)
 
 	b := tx.Bucket(db.bucket)
+	if b == nil {
+		return fmt.Errorf("bucket does not exist")
+	}
 	c := b.Cursor()
 
 	key, value := c.Seek(db.keyFromID(seek))
@@ -216,6 +255,19 @@ func (db *DB[K, V]) SeqScanRaw(seek K, fn func(K, []byte) (bool, error)) error {
 // to all PreCommitFunc fns. If any fn returns an error, the
 // transaction is rolled back and the error is returned.
 func (db *DB[K, V]) Set(id K, newVal *V, fns ...PreCommitFunc[K, V]) error {
+	if err := db.beginOp(); err != nil {
+		return err
+	}
+	defer db.endOp()
+	if newVal == nil {
+		return ErrNilValue
+	}
+
+	if db.combiner.enabled {
+		if err, handled := db.tryQueueSetCombine(id, newVal, fns); handled {
+			return err
+		}
+	}
 
 	b := getEncodeBuf()
 	defer releaseEncodeBuf(b)
@@ -231,7 +283,6 @@ func (db *DB[K, V]) Set(id K, newVal *V, fns ...PreCommitFunc[K, V]) error {
 	defer rollback(tx)
 
 	key := db.keyFromID(id)
-	idx := db.idxFromID(id)
 
 	bucket := tx.Bucket(db.bucket)
 	if bucket == nil {
@@ -245,7 +296,7 @@ func (db *DB[K, V]) Set(id K, newVal *V, fns ...PreCommitFunc[K, V]) error {
 		}
 	}
 
-	bucket.FillPercent = BucketFillPercent
+	bucket.FillPercent = db.options.BucketFillPercent
 
 	if err = bucket.Put(key, b.Bytes()); err != nil {
 		return fmt.Errorf("put: %w", err)
@@ -266,18 +317,40 @@ func (db *DB[K, V]) Set(id K, newVal *V, fns ...PreCommitFunc[K, V]) error {
 		return ErrClosed
 	}
 
-	modified := db.getModifiedIndexedFields(oldVal, newVal)
+	idx, idxCreated := db.idxFromIDWithCreated(id)
+	cleanupCreated := db.strkey && idxCreated && oldVal == nil
+	cleanupOnErr := true
+	if cleanupCreated {
+		defer func() {
+			if cleanupOnErr {
+				db.rollbackCreatedStrIdx(id, idx)
+			}
+		}()
+	}
 
-	if db.hasUnique {
-		if err = db.checkUniqueOnWrite(idx, newVal, modified); err != nil {
+	modified := db.getModifiedIndexedFields(oldVal, newVal)
+	noIndex := db.noIndex.Load()
+	if noIndex {
+		modified = nil
+	}
+
+	if !noIndex && db.hasUnique {
+		if err = db.checkUniqueOnWrite(idx, oldVal, newVal, modified); err != nil {
 			return err
 		}
 	}
 
-	return db.setIndexOnSuccess(tx.Commit(), idx, oldVal, newVal, modified)
+	txID := uint64(tx.ID())
+	db.markPending(txID)
+	commitErr := db.commitTx(tx, "set")
+	outErr := db.setIndexOnSuccess(commitErr, txID, idx, oldVal, newVal, modified)
+	if commitErr == nil {
+		cleanupOnErr = false
+	}
+	return outErr
 }
 
-// SetMany stores multiple values under the provided IDs in a single write
+// BatchSet stores multiple values under the provided IDs in a single write
 // transaction. The length of the ids and values must be equal.
 //
 // For each key, any existing value is decoded and passed as oldValue to all
@@ -287,10 +360,9 @@ func (db *DB[K, V]) Set(id K, newVal *V, fns ...PreCommitFunc[K, V]) error {
 // After a successful commit, the in-memory index is updated for all
 // modified keys unless indexing is disabled.
 //
-// SetMany allocates a buffer for each encoded value.
+// BatchSet allocates a buffer for each encoded value.
 // Storing a large number of values will consume a proportional amount of memory.
-func (db *DB[K, V]) SetMany(ids []K, newVals []*V, fns ...PreCommitFunc[K, V]) error {
-
+func (db *DB[K, V]) BatchSet(ids []K, newVals []*V, fns ...PreCommitFunc[K, V]) error {
 	if len(ids) != len(newVals) {
 		return fmt.Errorf("different slice lengths")
 	}
@@ -299,6 +371,16 @@ func (db *DB[K, V]) SetMany(ids []K, newVals []*V, fns ...PreCommitFunc[K, V]) e
 	}
 	if len(ids) == 1 {
 		return db.Set(ids[0], newVals[0], fns...)
+	}
+	if err := db.beginOp(); err != nil {
+		return err
+	}
+	defer db.endOp()
+
+	for i := range newVals {
+		if newVals[i] == nil {
+			return fmt.Errorf("%w: values[%v]", ErrNilValue, i)
+		}
 	}
 
 	var getbuf func() *bytes.Buffer
@@ -343,13 +425,12 @@ func (db *DB[K, V]) SetMany(ids []K, newVals []*V, fns ...PreCommitFunc[K, V]) e
 	defer rollback(tx)
 
 	oldVals := make([]*V, len(ids))
-	idxs := db.idxsFromID(ids)
 
 	bucket := tx.Bucket(db.bucket)
 	if bucket == nil {
 		return fmt.Errorf("bucket does not exist")
 	}
-	bucket.FillPercent = BucketFillPercent
+	bucket.FillPercent = db.options.BucketFillPercent
 
 	var err error
 	for i, id := range ids {
@@ -388,18 +469,53 @@ func (db *DB[K, V]) SetMany(ids []K, newVals []*V, fns ...PreCommitFunc[K, V]) e
 		return ErrClosed
 	}
 
-	modified := make([][]string, len(idxs))
-	for i := range idxs {
-		modified[i] = db.getModifiedIndexedFields(oldVals[i], newVals[i])
+	idxs, idxCreated := db.idxsFromIDWithCreated(ids)
+	var cleanupCreated map[uint64]K
+	if db.strkey {
+		cleanupCreated = make(map[uint64]K, len(ids))
+		for i := range idxs {
+			if idxCreated[i] && oldVals[i] == nil {
+				if _, seen := cleanupCreated[idxs[i]]; !seen {
+					cleanupCreated[idxs[i]] = ids[i]
+				}
+			}
+		}
+	}
+	cleanupOnErr := true
+	if len(cleanupCreated) > 0 {
+		defer func() {
+			if !cleanupOnErr {
+				return
+			}
+			for idx, id := range cleanupCreated {
+				db.rollbackCreatedStrIdx(id, idx)
+			}
+		}()
 	}
 
-	if db.hasUnique {
+	noIndex := db.noIndex.Load()
+	var modified [][]string
+	if !noIndex {
+		modified = make([][]string, len(idxs))
+		for i := range idxs {
+			modified[i] = db.getModifiedIndexedFields(oldVals[i], newVals[i])
+		}
+	}
+
+	if !noIndex && db.hasUnique {
 		if err = db.checkUniqueOnWriteMulti(idxs, oldVals, newVals, modified); err != nil {
 			return err
 		}
 	}
 
-	return db.setIndexOnSuccessMulti(tx.Commit(), idxs, oldVals, newVals, modified)
+	txID := uint64(tx.ID())
+	db.markPending(txID)
+	commitErr := db.commitTx(tx, "set_many")
+	outErr := db.setIndexOnSuccessMulti(commitErr, txID, idxs, oldVals, newVals, modified)
+	if commitErr == nil {
+		cleanupOnErr = false
+	}
+	return outErr
 }
 
 // Patch applies a partial update to the value stored under the given id,
@@ -435,10 +551,20 @@ func (db *DB[K, V]) PatchStrictIfExists(id K, patch []Field, fns ...PreCommitFun
 	return db.patch(id, patch, false, true, fns...)
 }
 
+// patch handles patch.
 func (db *DB[K, V]) patch(id K, fields []Field, ignoreUnknown bool, allowMissing bool, fns ...PreCommitFunc[K, V]) error {
+	if err := db.beginOp(); err != nil {
+		return err
+	}
+	defer db.endOp()
 
 	if len(fields) == 0 {
 		return nil
+	}
+	if db.combiner.enabled {
+		if err, handled := db.tryQueuePatchCombine(id, fields, ignoreUnknown, allowMissing, fns); handled {
+			return err
+		}
 	}
 
 	tx, err := db.bolt.Begin(true)
@@ -484,7 +610,7 @@ func (db *DB[K, V]) patch(id K, fields []Field, ignoreUnknown bool, allowMissing
 		return fmt.Errorf("encode: %w", err)
 	}
 
-	bucket.FillPercent = BucketFillPercent
+	bucket.FillPercent = db.options.BucketFillPercent
 
 	if err = bucket.Put(key, b.Bytes()); err != nil {
 		return fmt.Errorf("put: %w", err)
@@ -506,17 +632,24 @@ func (db *DB[K, V]) patch(id K, fields []Field, ignoreUnknown bool, allowMissing
 	}
 
 	modified := db.getModifiedIndexedFields(oldVal, newVal)
+	noIndex := db.noIndex.Load()
+	if noIndex {
+		modified = nil
+	}
 
-	if db.hasUnique {
-		if err = db.checkUniqueOnWrite(idx, newVal, modified); err != nil {
+	if !noIndex && db.hasUnique {
+		if err = db.checkUniqueOnWrite(idx, oldVal, newVal, modified); err != nil {
 			return err
 		}
 	}
 
-	return db.setIndexOnSuccess(tx.Commit(), idx, oldVal, newVal, modified)
+	txID := uint64(tx.ID())
+	db.markPending(txID)
+	commitErr := db.commitTx(tx, "patch")
+	return db.setIndexOnSuccess(commitErr, txID, idx, oldVal, newVal, modified)
 }
 
-// PatchMany applies the same patch to all values stored under the given IDs
+// BatchPatch applies the same patch to all values stored under the given IDs
 // in a single write transaction.
 //
 // Unknown fields are ignored (as in Patch).
@@ -524,26 +657,29 @@ func (db *DB[K, V]) patch(id K, fields []Field, ignoreUnknown bool, allowMissing
 //
 // Non-existent IDs are skipped and do not trigger callbacks.
 //
-// PatchMany allocates a buffer for each encoded value.
+// BatchPatch allocates a buffer for each encoded value.
 // Patching a large number of values will consume a proportional amount of memory.
-func (db *DB[K, V]) PatchMany(ids []K, patch []Field, fns ...PreCommitFunc[K, V]) error {
-	return db.patchMany(ids, patch, true, fns...)
+func (db *DB[K, V]) BatchPatch(ids []K, patch []Field, fns ...PreCommitFunc[K, V]) error {
+	return db.batchPatch(ids, patch, true, fns...)
 }
 
-// PatchManyStrict is like PatchMany, but returns an error if the patch contains field names
+// BatchPatchStrict is like BatchPatch, but returns an error if the patch contains field names
 // that cannot be resolved to a known struct field (by name, db or json tag).
-func (db *DB[K, V]) PatchManyStrict(ids []K, patch []Field, fns ...PreCommitFunc[K, V]) error {
-	return db.patchMany(ids, patch, false, fns...)
+func (db *DB[K, V]) BatchPatchStrict(ids []K, patch []Field, fns ...PreCommitFunc[K, V]) error {
+	return db.batchPatch(ids, patch, false, fns...)
 }
 
-func (db *DB[K, V]) patchMany(ids []K, patch []Field, ignoreUnknown bool, fns ...PreCommitFunc[K, V]) error {
-
+func (db *DB[K, V]) batchPatch(ids []K, patch []Field, ignoreUnknown bool, fns ...PreCommitFunc[K, V]) error {
 	if len(ids) == 0 || len(patch) == 0 {
 		return nil
 	}
 	if len(ids) == 1 {
 		return db.patch(ids[0], patch, ignoreUnknown, true, fns...)
 	}
+	if err := db.beginOp(); err != nil {
+		return err
+	}
+	defer db.endOp()
 
 	var getbuf func() *bytes.Buffer
 
@@ -584,7 +720,7 @@ func (db *DB[K, V]) patchMany(ids []K, patch []Field, ignoreUnknown bool, fns ..
 	if bucket == nil {
 		return fmt.Errorf("bucket does not exist")
 	}
-	bucket.FillPercent = BucketFillPercent
+	bucket.FillPercent = db.options.BucketFillPercent
 
 	var err error
 	for _, id := range ids {
@@ -593,7 +729,6 @@ func (db *DB[K, V]) patchMany(ids []K, patch []Field, ignoreUnknown bool, fns ..
 		oldBytes := bucket.Get(key)
 		if oldBytes == nil {
 			continue
-			// return fmt.Errorf("item with id %v does not exist", id)
 		}
 
 		var (
@@ -649,18 +784,25 @@ func (db *DB[K, V]) patchMany(ids []K, patch []Field, ignoreUnknown bool, fns ..
 		return ErrClosed
 	}
 
-	modified := make([][]string, len(idxs))
-	for i := range idxs {
-		modified[i] = db.getModifiedIndexedFields(oldVals[i], newVals[i])
+	noIndex := db.noIndex.Load()
+	var modified [][]string
+	if !noIndex {
+		modified = make([][]string, len(idxs))
+		for i := range idxs {
+			modified[i] = db.getModifiedIndexedFields(oldVals[i], newVals[i])
+		}
 	}
 
-	if db.hasUnique {
+	if !noIndex && db.hasUnique {
 		if err = db.checkUniqueOnWriteMulti(idxs, oldVals, newVals, modified); err != nil {
 			return err
 		}
 	}
 
-	return db.setIndexOnSuccessMulti(tx.Commit(), idxs, oldVals, newVals, modified)
+	txID := uint64(tx.ID())
+	db.markPending(txID)
+	commitErr := db.commitTx(tx, "patch_many")
+	return db.setIndexOnSuccessMulti(commitErr, txID, idxs, oldVals, newVals, modified)
 }
 
 // Delete removes the value stored under the given id, if any.
@@ -669,6 +811,16 @@ func (db *DB[K, V]) patchMany(ids []K, patch []Field, ignoreUnknown bool, fns ..
 // PreCommitFunc fns. If any fn returns an error, the operation is aborted.
 // If the record does not exist, Delete is a no-op and no callbacks are invoked.
 func (db *DB[K, V]) Delete(id K, fns ...PreCommitFunc[K, V]) error {
+	if err := db.beginOp(); err != nil {
+		return err
+	}
+	defer db.endOp()
+
+	if db.combiner.enabled {
+		if err, handled := db.tryQueueDeleteCombine(id, fns); handled {
+			return err
+		}
+	}
 
 	tx, err := db.bolt.Begin(true)
 	if err != nil {
@@ -680,7 +832,7 @@ func (db *DB[K, V]) Delete(id K, fns ...PreCommitFunc[K, V]) error {
 	if bucket == nil {
 		return fmt.Errorf("bucket does not exist")
 	}
-	bucket.FillPercent = BucketFillPercent
+	bucket.FillPercent = db.options.BucketFillPercent
 
 	key := db.keyFromID(id)
 
@@ -715,25 +867,34 @@ func (db *DB[K, V]) Delete(id K, fns ...PreCommitFunc[K, V]) error {
 	}
 
 	modified := db.getModifiedIndexedFields(oldVal, nil)
+	if db.noIndex.Load() {
+		modified = nil
+	}
 
-	return db.setIndexOnSuccess(tx.Commit(), idx, oldVal, nil, modified)
+	txID := uint64(tx.ID())
+	db.markPending(txID)
+	commitErr := db.commitTx(tx, "delete")
+	return db.setIndexOnSuccess(commitErr, txID, idx, oldVal, nil, modified)
 }
 
-// DeleteMany removes all values stored under the provided ids in a single
+// BatchDelete removes all values stored under the provided ids in a single
 // write transaction.
 //
 // For each key, any existing value is decoded and passed as oldValue to all
 // PreCommitFunc fns. If an error is encountered during processing,
 // the entire operation is rolled back.
 // Missing IDs are skipped and do not trigger callbacks.
-func (db *DB[K, V]) DeleteMany(ids []K, fns ...PreCommitFunc[K, V]) error {
-
+func (db *DB[K, V]) BatchDelete(ids []K, fns ...PreCommitFunc[K, V]) error {
 	if len(ids) == 0 {
 		return nil
 	}
 	if len(ids) == 1 {
 		return db.Delete(ids[0], fns...)
 	}
+	if err := db.beginOp(); err != nil {
+		return err
+	}
+	defer db.endOp()
 
 	tx, txerr := db.bolt.Begin(true)
 	if txerr != nil {
@@ -749,7 +910,7 @@ func (db *DB[K, V]) DeleteMany(ids []K, fns ...PreCommitFunc[K, V]) error {
 	if bucket == nil {
 		return fmt.Errorf("bucket does not exist")
 	}
-	bucket.FillPercent = BucketFillPercent
+	bucket.FillPercent = db.options.BucketFillPercent
 
 	var err error
 	for _, id := range ids {
@@ -797,5 +958,16 @@ func (db *DB[K, V]) DeleteMany(ids []K, fns ...PreCommitFunc[K, V]) error {
 		return ErrClosed
 	}
 
-	return db.setIndexOnSuccessMulti(tx.Commit(), idxs, oldVals, nil, nil)
+	var modified [][]string
+	if !db.noIndex.Load() {
+		modified = make([][]string, len(idxs))
+		for i := range idxs {
+			modified[i] = db.getModifiedIndexedFields(oldVals[i], nil)
+		}
+	}
+
+	txID := uint64(tx.ID())
+	db.markPending(txID)
+	commitErr := db.commitTx(tx, "delete_many")
+	return db.setIndexOnSuccessMulti(commitErr, txID, idxs, oldVals, nil, modified)
 }

@@ -2,3 +2,9 @@ old.txt
 new.txt
 rbi.test
 mem.out
+bench/bench
+bench/bench.db
+bench/bench.db.UserBench.rbi
+bench/bench.db.UserBench.rbo
+bench/bench_report*.json
+bench/result_*.json

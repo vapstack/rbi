@@ -33,6 +33,8 @@ type TraceEvent struct {
 
 	// ORBranches contains per-branch runtime metrics for OR plans.
 	ORBranches []TraceORBranch
+	// ORRoute contains route/cost diagnostics for ordered OR merge path.
+	ORRoute TraceORRoute
 
 	// OrderIndexScanWidth is the number of non-empty order-index buckets
 	// traversed while producing query output.
@@ -46,6 +48,30 @@ type TraceEvent struct {
 	EarlyStopReason string
 
 	Error string
+}
+
+// TraceORRoute carries route diagnostics for ordered OR merge decisions.
+type TraceORRoute struct {
+	Route  string
+	Reason string
+
+	KWayCost     float64
+	FallbackCost float64
+	Overlap      float64
+	AvgChecks    float64
+
+	HasPrefixNonOrder   bool
+	HasSelectiveLead    bool
+	FallbackCollectFast bool
+
+	RuntimeGuardEnabled bool
+	RuntimeGuardReason  string
+
+	RuntimeFallbackTriggered    bool
+	RuntimeFallbackReason       string
+	RuntimeExaminedPerUnique    float64
+	RuntimeProjectedExamined    float64
+	RuntimeProjectedExaminedMax float64
 }
 
 type TraceORBranch struct {
@@ -65,7 +91,7 @@ type queryTrace struct {
 	ev       TraceEvent
 }
 
-func resolveTraceSampleEvery(sampleEvery uint64, sink func(TraceEvent)) uint64 {
+func traceSampleEvery(sampleEvery uint64, sink func(TraceEvent)) uint64 {
 	if sink == nil {
 		return 0
 	}
@@ -75,7 +101,22 @@ func resolveTraceSampleEvery(sampleEvery uint64, sink func(TraceEvent)) uint64 {
 	return sampleEvery
 }
 
+func (db *DB[K, V]) traceOrCalibrationSamplingEnabled() bool {
+	if db.traceRoot != nil {
+		return db.traceRoot.traceOrCalibrationSamplingEnabled()
+	}
+	if db.planner.tracer.sink != nil && db.planner.tracer.sampleEvery > 0 {
+		return true
+	}
+	return db.planner.calibrator.enabled && db.planner.calibrator.sampleEvery > 0
+}
+
+// beginTrace handles begin trace.
 func (db *DB[K, V]) beginTrace(q *qx.QX) *queryTrace {
+	if db.traceRoot != nil {
+		return db.traceRoot.beginTrace(q)
+	}
+
 	emitTrace := false
 	sink := db.planner.tracer.sink
 	if sink != nil && db.planner.tracer.sampleEvery > 0 {
@@ -195,6 +236,45 @@ func (t *queryTrace) setEstimated(rows uint64, estCost, fallbackCost float64) {
 	t.ev.FallbackCost = fallbackCost
 }
 
+func (t *queryTrace) setOROrderRouteDecision(route, reason string, cost plannerOROrderRouteCost, avgChecks float64, fallbackCollectFast bool) {
+	if t == nil {
+		return
+	}
+	t.ev.ORRoute.Route = route
+	t.ev.ORRoute.Reason = reason
+	t.ev.ORRoute.KWayCost = cost.kWay
+	t.ev.ORRoute.FallbackCost = cost.fallback
+	t.ev.ORRoute.Overlap = cost.overlap
+	t.ev.ORRoute.AvgChecks = avgChecks
+	t.ev.ORRoute.HasPrefixNonOrder = cost.hasPrefixNonOrder
+	t.ev.ORRoute.HasSelectiveLead = cost.hasSelectiveLead
+	t.ev.ORRoute.FallbackCollectFast = fallbackCollectFast
+}
+
+func (t *queryTrace) setOROrderRuntimeGuard(enabled bool, reason string) {
+	if t == nil {
+		return
+	}
+	t.ev.ORRoute.RuntimeGuardEnabled = enabled
+	t.ev.ORRoute.RuntimeGuardReason = reason
+}
+
+func (t *queryTrace) setOROrderRuntimeFallback(
+	reason string,
+	examinedPerUnique float64,
+	projectedExamined float64,
+	projectedExaminedMax float64,
+) {
+	if t == nil {
+		return
+	}
+	t.ev.ORRoute.RuntimeFallbackTriggered = true
+	t.ev.ORRoute.RuntimeFallbackReason = reason
+	t.ev.ORRoute.RuntimeExaminedPerUnique = examinedPerUnique
+	t.ev.ORRoute.RuntimeProjectedExamined = projectedExamined
+	t.ev.ORRoute.RuntimeProjectedExaminedMax = projectedExaminedMax
+}
+
 func (t *queryTrace) finish(rowsReturned uint64, err error) {
 	if t == nil {
 		return
@@ -204,22 +284,10 @@ func (t *queryTrace) finish(rowsReturned uint64, err error) {
 	if err != nil {
 		t.ev.Error = err.Error()
 	}
-
 	if t.onFinish != nil {
-		func() {
-			// defer func() {
-			// 	_ = recover()
-			// }()
-			t.onFinish(t.ev)
-		}()
+		t.onFinish(t.ev)
 	}
-
 	if t.sink != nil {
-		func() {
-			// defer func() {
-			// 	_ = recover()
-			// }()
-			t.sink(t.ev)
-		}()
+		t.sink(t.ev)
 	}
 }

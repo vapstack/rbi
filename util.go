@@ -28,7 +28,7 @@ import (
 //
 // If newVal is nil, it returns an empty slice.
 func (db *DB[K, V]) MakePatch(oldVal, newVal *V) []Field {
-	return db.makePatch(oldVal, newVal, make([]Field, 0))
+	return db.makePatch(oldVal, newVal, nil)
 }
 
 // MakePatchInto is like MakePatch, but writes the result into the provided
@@ -80,7 +80,7 @@ func (db *DB[K, V]) makePatch(oldVal, newVal *V, target []Field) []Field {
 		}
 
 		target = append(target, Field{
-			Name:  f.Name, // dbname,
+			Name:  f.Name,
 			Value: deepCopyValue(newValue),
 		})
 	}
@@ -133,33 +133,132 @@ func (db *DB[K, V]) idFromKey(b []byte) K {
 }
 
 func (db *DB[K, V]) idxFromID(id K) uint64 {
+	idx, _ := db.idxFromIDWithCreated(id)
+	return idx
+}
+
+func (db *DB[K, V]) idxFromIDWithCreated(id K) (uint64, bool) {
 	if db.strkey {
 		s := *(*string)(unsafe.Pointer(&id))
 		db.strmap.Lock()
+		defer db.strmap.Unlock()
+		if idx, ok := db.strmap.Keys[s]; ok {
+			return idx, false
+		}
 		idx := db.strmap.createIdxNoLock(s)
-		db.strmap.Unlock()
-		return idx
+		return idx, true
 	}
-	return *(*uint64)(unsafe.Pointer(&id))
+	return *(*uint64)(unsafe.Pointer(&id)), false
 }
 
-func (db *DB[K, V]) idxsFromID(ids []K) []uint64 {
+func (db *DB[K, V]) idxsFromIDWithCreated(ids []K) ([]uint64, []bool) {
+	if db.strkey {
+		s := *(*[]string)(unsafe.Pointer(&ids))
+		idxs := make([]uint64, len(s))
+		created := make([]bool, len(s))
+		db.strmap.Lock()
+		for i := range s {
+			if idx, ok := db.strmap.Keys[s[i]]; ok {
+				idxs[i] = idx
+				continue
+			}
+			idxs[i] = db.strmap.createIdxNoLock(s[i])
+			created[i] = true
+		}
+		db.strmap.Unlock()
+		return idxs, created
+	}
+	return *(*[]uint64)(unsafe.Pointer(&ids)), nil
+}
+
+func (db *DB[K, V]) rollbackCreatedStrIdx(id K, idx uint64) {
+	if !db.strkey || idx == 0 {
+		return
+	}
+	s := *(*string)(unsafe.Pointer(&id))
+
+	db.strmap.Lock()
+	defer db.strmap.Unlock()
+
+	cur, ok := db.strmap.Keys[s]
+	if !ok || cur != idx {
+		return
+	}
+
+	delete(db.strmap.Keys, s)
+	if idx <= uint64(^uint(0)>>1) {
+		i := int(idx)
+		if i < len(db.strmap.Strs) {
+			db.strmap.Strs[i] = ""
+		}
+		if i < len(db.strmap.strsUsed) {
+			db.strmap.strsUsed[i] = false
+		}
+	}
+
+	if idx <= db.strmap.Next {
+		for db.strmap.Next > 0 {
+			if db.strmap.Next > uint64(^uint(0)>>1) {
+				db.strmap.Next = 0
+				break
+			}
+			i := int(db.strmap.Next)
+			if i < len(db.strmap.strsUsed) && db.strmap.strsUsed[i] {
+				break
+			}
+			db.strmap.Next--
+		}
+
+		trim := int(db.strmap.Next) + 1
+		if trim < len(db.strmap.Strs) {
+			clear(db.strmap.Strs[trim:])
+			db.strmap.Strs = db.strmap.Strs[:trim]
+		}
+		if trim < len(db.strmap.strsUsed) {
+			clear(db.strmap.strsUsed[trim:])
+			db.strmap.strsUsed = db.strmap.strsUsed[:trim]
+		}
+	}
+
+	if db.strmap.deltaKeys != nil {
+		delete(db.strmap.deltaKeys, s)
+		if len(db.strmap.deltaKeys) == 0 {
+			db.strmap.deltaKeys = nil
+		}
+	}
+	if db.strmap.deltaStrs != nil {
+		delete(db.strmap.deltaStrs, idx)
+		if len(db.strmap.deltaStrs) == 0 {
+			db.strmap.deltaStrs = nil
+		}
+	}
+}
+
+func (db *DB[K, V]) forEachIdxFromID(ids []K, fn func(uint64)) {
+	if len(ids) == 0 || fn == nil {
+		return
+	}
+
 	if db.strkey {
 		s := *(*[]string)(unsafe.Pointer(&ids))
 		db.strmap.Lock()
-		idxs := db.strmap.createIdxsNoLock(s)
+		for i := range s {
+			fn(db.strmap.createIdxNoLock(s[i]))
+		}
 		db.strmap.Unlock()
-		return idxs
+		return
 	}
-	return *(*[]uint64)(unsafe.Pointer(&ids))
+
+	for _, idx := range *(*[]uint64)(unsafe.Pointer(&ids)) {
+		fn(idx)
+	}
 }
 
 var msgpackEncPool = sync.Pool{New: func() any { return msgpack.NewEncoder(io.Discard) }}
 var msgpackDecPool = sync.Pool{New: func() any { return msgpack.NewDecoder(strings.NewReader("")) }}
 
 func (db *DB[K, V]) decode(b []byte) (*V, error) {
-	// v := new(V)
-	v := db.pool.Get().(*V)
+	v := db.recPool.Get().(*V)
 	dec := msgpackDecPool.Get().(*msgpack.Decoder)
 	dec.Reset(bytes.NewReader(b))
 	err := dec.Decode(v)
@@ -290,7 +389,7 @@ func regInstance(dbPath, bucket string) error {
 
 	key := abs + "::" + bucket
 	if _, exists := registry[key]; exists {
-		return fmt.Errorf("rbi is alread open for \"%v\" at %v", bucket, dbPath)
+		return fmt.Errorf("rbi is already open for \"%v\" at %v", bucket, dbPath)
 	}
 
 	registry[key] = struct{}{}

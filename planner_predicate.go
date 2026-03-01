@@ -1,28 +1,361 @@
 package rbi
 
 import (
-	"strings"
+	"math"
+	"strconv"
 	"sync"
 
 	"github.com/RoaringBitmap/roaring/v2/roaring64"
 	"github.com/vapstack/qx"
 )
 
-type predCandidate struct {
+type predicate struct {
 	expr qx.Expr
 
 	contains func(uint64) bool
 	iter     func() roaringIter
 	estCard  uint64
 
+	kind     predicateKind
+	iterKind predicateIterKind
+	posting  postingList
+	posts    []postingList
+	bm       *roaring64.Bitmap
+
 	alwaysTrue  bool
 	alwaysFalse bool
 	covered     bool
 
+	// exact bucket match count when known; ok=false means unknown.
+	bucketCount func(*roaring64.Bitmap) (uint64, bool)
+
 	cleanup func()
 }
 
+type predicateKind uint8
+
+const (
+	predicateKindCustom predicateKind = iota
+	predicateKindPosting
+	predicateKindPostingNot
+	predicateKindPostsAny
+	predicateKindPostsAnyNot
+	predicateKindPostsAll
+	predicateKindPostsAllNot
+	predicateKindBitmap
+	predicateKindBitmapNot
+)
+
+type predicateIterKind uint8
+
+const (
+	predicateIterNone predicateIterKind = iota
+	predicateIterPosting
+	predicateIterPostsConcat
+	predicateIterPostsUnion
+	predicateIterBitmap
+)
+
+func (p predicate) hasContains() bool {
+	switch p.kind {
+	case predicateKindPosting,
+		predicateKindPostingNot,
+		predicateKindPostsAny,
+		predicateKindPostsAnyNot,
+		predicateKindPostsAll,
+		predicateKindPostsAllNot,
+		predicateKindBitmap,
+		predicateKindBitmapNot:
+		return true
+	default:
+		return p.contains != nil
+	}
+}
+
+func (p predicate) hasIter() bool {
+	switch p.iterKind {
+	case predicateIterPosting, predicateIterPostsConcat, predicateIterPostsUnion, predicateIterBitmap:
+		return true
+	default:
+		return p.iter != nil
+	}
+}
+
+func (p predicate) leadIterNeedsContainsCheck() bool {
+	// HAS(list) uses a single posting as iterator seed and validates the rest
+	// via contains checks; iterator alone is not exact when term count > 1.
+	return p.kind == predicateKindPostsAll && len(p.posts) > 1
+}
+
+func (p predicate) newIter() roaringIter {
+	switch p.iterKind {
+	case predicateIterPosting:
+		return postingIterFromPosting(p.posting)
+	case predicateIterPostsConcat:
+		return newPostingConcatIter(p.posts)
+	case predicateIterPostsUnion:
+		return newPostingUnionIter(p.posts)
+	case predicateIterBitmap:
+		if p.bm == nil {
+			return nil
+		}
+		return p.bm.Iterator()
+	default:
+		if p.iter == nil {
+			return nil
+		}
+		return p.iter()
+	}
+}
+
+func (p predicate) matches(idx uint64) bool {
+	if p.alwaysTrue {
+		return true
+	}
+	if p.alwaysFalse {
+		return false
+	}
+	switch p.kind {
+	case predicateKindPosting:
+		return p.posting.Contains(idx)
+	case predicateKindPostingNot:
+		return !p.posting.Contains(idx)
+	case predicateKindPostsAny:
+		for _, ids := range p.posts {
+			if ids.Contains(idx) {
+				return true
+			}
+		}
+		return false
+	case predicateKindPostsAnyNot:
+		for _, ids := range p.posts {
+			if ids.Contains(idx) {
+				return false
+			}
+		}
+		return true
+	case predicateKindPostsAll:
+		for _, ids := range p.posts {
+			if !ids.Contains(idx) {
+				return false
+			}
+		}
+		return true
+	case predicateKindPostsAllNot:
+		for _, ids := range p.posts {
+			if !ids.Contains(idx) {
+				return true
+			}
+		}
+		return false
+	case predicateKindBitmap:
+		return p.bm != nil && p.bm.Contains(idx)
+	case predicateKindBitmapNot:
+		return p.bm == nil || !p.bm.Contains(idx)
+	default:
+		if p.contains == nil {
+			return false
+		}
+		return p.contains(idx)
+	}
+}
+
+func (p predicate) countBucket(bucket *roaring64.Bitmap) (uint64, bool) {
+	switch p.kind {
+	case predicateKindPosting:
+		if bucket == nil || bucket.IsEmpty() {
+			return 0, true
+		}
+		return p.posting.AndCardinalityBitmap(bucket), true
+	case predicateKindPostingNot:
+		if bucket == nil || bucket.IsEmpty() {
+			return 0, true
+		}
+		bc := bucket.GetCardinality()
+		hit := p.posting.AndCardinalityBitmap(bucket)
+		if hit >= bc {
+			return 0, true
+		}
+		return bc - hit, true
+	case predicateKindPostsAny:
+		return countBucketPostsAny(p.posts, bucket)
+	case predicateKindPostsAnyNot:
+		return countBucketPostsAnyNot(p.posts, bucket)
+	case predicateKindPostsAll:
+		return countBucketPostsAll(p.posts, bucket)
+	case predicateKindPostsAllNot:
+		return countBucketPostsAllNot(p.posts, bucket)
+	case predicateKindBitmap:
+		if bucket == nil || bucket.IsEmpty() || p.bm == nil {
+			return 0, true
+		}
+		return p.bm.AndCardinality(bucket), true
+	case predicateKindBitmapNot:
+		if bucket == nil || bucket.IsEmpty() {
+			return 0, true
+		}
+		bc := bucket.GetCardinality()
+		if p.bm == nil {
+			return bc, true
+		}
+		hit := p.bm.AndCardinality(bucket)
+		if hit >= bc {
+			return 0, true
+		}
+		return bc - hit, true
+	default:
+		if p.bucketCount == nil {
+			return 0, false
+		}
+		return p.bucketCount(bucket)
+	}
+}
+
+// applyToBitmap intersects (or subtracts for NOT variants) predicate matches
+// with dst in place. Returns false when exact bitmap application is not
+// available for this predicate shape.
+func (p predicate) applyToBitmap(dst *roaring64.Bitmap) bool {
+	if dst == nil {
+		return false
+	}
+	if p.alwaysTrue || p.covered {
+		return true
+	}
+	if p.alwaysFalse {
+		dst.Clear()
+		return true
+	}
+
+	switch p.kind {
+	case predicateKindPosting:
+		if p.posting.IsEmpty() {
+			dst.Clear()
+			return true
+		}
+		if p.posting.isSingleton() {
+			if !dst.Contains(p.posting.single) {
+				dst.Clear()
+				return true
+			}
+			// Intersection with singleton is the singleton itself.
+			dst.Clear()
+			dst.Add(p.posting.single)
+			return true
+		}
+		if bm := p.posting.bitmap(); bm != nil {
+			dst.And(bm)
+			return true
+		}
+		dst.Clear()
+		return true
+
+	case predicateKindPostingNot:
+		p.posting.AndNotFrom(dst)
+		return true
+
+	case predicateKindBitmap:
+		if p.bm == nil {
+			dst.Clear()
+			return true
+		}
+		dst.And(p.bm)
+		return true
+
+	case predicateKindBitmapNot:
+		if p.bm != nil {
+			dst.AndNot(p.bm)
+		}
+		return true
+	}
+
+	return false
+}
+
+func countBucketPostsAny(posts []postingList, bucket *roaring64.Bitmap) (uint64, bool) {
+	if bucket == nil || bucket.IsEmpty() {
+		return 0, true
+	}
+	if len(posts) == 0 {
+		return 0, true
+	}
+	if len(posts) == 1 {
+		return posts[0].AndCardinalityBitmap(bucket), true
+	}
+	for _, ids := range posts {
+		if ids.IntersectsBitmap(bucket) {
+			return 0, false
+		}
+	}
+	return 0, true
+}
+
+func countBucketPostsAnyNot(posts []postingList, bucket *roaring64.Bitmap) (uint64, bool) {
+	if bucket == nil || bucket.IsEmpty() {
+		return 0, true
+	}
+	bc := bucket.GetCardinality()
+	if len(posts) == 0 {
+		return bc, true
+	}
+	if len(posts) == 1 {
+		hit := posts[0].AndCardinalityBitmap(bucket)
+		if hit >= bc {
+			return 0, true
+		}
+		return bc - hit, true
+	}
+	for _, ids := range posts {
+		if ids.IntersectsBitmap(bucket) {
+			return 0, false
+		}
+	}
+	return bc, true
+}
+
+func countBucketPostsAll(posts []postingList, bucket *roaring64.Bitmap) (uint64, bool) {
+	if bucket == nil || bucket.IsEmpty() {
+		return 0, true
+	}
+	if len(posts) == 0 {
+		return 0, true
+	}
+	if len(posts) == 1 {
+		return posts[0].AndCardinalityBitmap(bucket), true
+	}
+	for _, ids := range posts {
+		if !ids.IntersectsBitmap(bucket) {
+			return 0, true
+		}
+	}
+	return 0, false
+}
+
+func countBucketPostsAllNot(posts []postingList, bucket *roaring64.Bitmap) (uint64, bool) {
+	if bucket == nil || bucket.IsEmpty() {
+		return 0, true
+	}
+	bc := bucket.GetCardinality()
+	if len(posts) == 0 {
+		return bc, true
+	}
+	if len(posts) == 1 {
+		hit := posts[0].AndCardinalityBitmap(bucket)
+		if hit >= bc {
+			return 0, true
+		}
+		return bc - hit, true
+	}
+	for _, ids := range posts {
+		if !ids.IntersectsBitmap(bucket) {
+			return bc, true
+		}
+	}
+	return 0, false
+}
+
+// tryPlanCandidate attempts the internal plan candidate path and returns ok=false when fast-path preconditions are not satisfied.
 func (db *DB[K, V]) tryPlanCandidate(q *qx.QX, trace *queryTrace) ([]K, bool, error) {
+
 	// candidate planner is focused on the latency-critical paged path.
 	if q.Limit == 0 {
 		return nil, false, nil
@@ -73,6 +406,7 @@ func (db *DB[K, V]) tryPlanCandidate(q *qx.QX, trace *queryTrace) ([]K, bool, er
 			return nil, false, nil
 		}
 	}
+
 	// pure EQ conjunctions are already handled very well by baseline paths
 	allEq := len(leaves) > 0
 	for _, e := range leaves {
@@ -108,7 +442,7 @@ func (db *DB[K, V]) shouldUseCandidateOrder(o qx.Order, leaves []qx.Expr) bool {
 	if fm == nil || fm.Slice {
 		return false
 	}
-	if db.index[o.Field] == nil {
+	if !db.fieldOverlay(o.Field).hasData() {
 		return false
 	}
 	if len(leaves) < 2 {
@@ -222,7 +556,7 @@ func appendCollectAndLeaves(dst []qx.Expr, e qx.Expr) ([]qx.Expr, bool) {
 	}
 }
 
-func releasePredicatesCandidate(preds []predCandidate) {
+func releasePredicatesCandidate(preds []predicate) {
 	for i := range preds {
 		if preds[i].cleanup != nil {
 			preds[i].cleanup()
@@ -230,12 +564,12 @@ func releasePredicatesCandidate(preds []predCandidate) {
 	}
 }
 
-func (db *DB[K, V]) buildPredicatesCandidate(leaves []qx.Expr) ([]predCandidate, bool) {
+func (db *DB[K, V]) buildPredicatesCandidate(leaves []qx.Expr) ([]predicate, bool) {
 	if len(leaves) == 1 && leaves[0].Op == qx.OpNOOP && leaves[0].Not {
-		return []predCandidate{{alwaysFalse: true}}, true
+		return []predicate{{alwaysFalse: true}}, true
 	}
 
-	preds := make([]predCandidate, 0, len(leaves))
+	preds := make([]predicate, 0, len(leaves))
 	for _, e := range leaves {
 		p, ok := db.buildPredicateCandidate(e)
 		if !ok {
@@ -247,105 +581,174 @@ func (db *DB[K, V]) buildPredicatesCandidate(leaves []qx.Expr) ([]predCandidate,
 	return preds, true
 }
 
-func (db *DB[K, V]) buildPredicateCandidate(e qx.Expr) (predCandidate, bool) {
+func (db *DB[K, V]) buildPredicateCandidate(e qx.Expr) (predicate, bool) {
 	if e.Op == qx.OpNOOP {
 		if e.Not {
-			return predCandidate{expr: e, alwaysFalse: true}, true
+			return predicate{expr: e, alwaysFalse: true}, true
 		}
-		return predCandidate{expr: e, alwaysTrue: true}, true
+		return predicate{expr: e, alwaysTrue: true}, true
 	}
 	if e.Field == "" {
-		return predCandidate{}, false
+		return predicate{}, false
 	}
 
-	slice := db.index[e.Field]
-	if slice == nil {
-		return predCandidate{}, false
-	}
 	fm := db.fields[e.Field]
 	if fm == nil {
-		return predCandidate{}, false
+		return predicate{}, false
 	}
+	ov := db.fieldOverlay(e.Field)
 
 	switch e.Op {
+
 	case qx.OpEQ:
-		return db.buildPredEqCandidate(e, fm, slice)
+		if !ov.hasData() {
+			return predicate{}, false
+		}
+		return db.buildPredEqCandidate(e, fm, ov)
+
 	case qx.OpIN:
-		return db.buildPredInCandidate(e, fm, slice)
+		if !ov.hasData() {
+			return predicate{}, false
+		}
+		return db.buildPredInCandidate(e, fm, ov)
+
 	case qx.OpHAS:
-		return db.buildPredHasCandidate(e, fm, slice)
+		if !ov.hasData() {
+			return predicate{}, false
+		}
+		return db.buildPredHasCandidate(e, fm, ov)
+
 	case qx.OpHASANY:
-		return db.buildPredHasAnyCandidate(e, fm, slice)
+		if !ov.hasData() {
+			return predicate{}, false
+		}
+		return db.buildPredHasAnyCandidate(e, fm, ov)
+
 	case qx.OpGT, qx.OpGTE, qx.OpLT, qx.OpLTE, qx.OpPREFIX:
-		return db.buildPredRangeCandidate(e, fm, slice)
+		if !ov.hasData() {
+			return predicate{}, false
+		}
+		return db.buildPredRangeCandidate(e, fm, ov)
+
 	case qx.OpSUFFIX, qx.OpCONTAINS:
 		return db.buildPredMaterializedCandidate(e)
+
 	default:
-		return predCandidate{}, false
+		return predicate{}, false
 	}
 }
 
-func (db *DB[K, V]) buildPredEqCandidate(e qx.Expr, fm *field, slice *[]index) (predCandidate, bool) {
+func overlayLookupPostingRetained(ov fieldOverlay, key string) (postingList, *roaring64.Bitmap) {
+	var base postingList
+	if len(ov.base) > 0 {
+		if i := lowerBoundIndex(ov.base, key); i < len(ov.base) && indexKeyEqualsString(ov.base[i].Key, key) {
+			base = ov.base[i].IDs
+		}
+	}
+
+	if ov.delta == nil || !ov.delta.hasEntries() {
+		return base, nil
+	}
+	de, ok := ov.delta.get(key)
+	if !ok {
+		return base, nil
+	}
+
+	bm, owned := composePostingOwned(base, de, nil)
+	if !owned {
+		return postingFromBitmapViewAdaptive(bm), nil
+	}
+	if bm == nil || bm.IsEmpty() {
+		if bm != nil {
+			releaseRoaringBuf(bm)
+		}
+		return postingList{}, nil
+	}
+	p := postingFromBitmapOwned(bm)
+	keep := p.bitmap()
+	return p, keep
+}
+
+func releaseOwnedBitmapSlice(owned []*roaring64.Bitmap) {
+	for _, bm := range owned {
+		if bm != nil {
+			releaseRoaringBuf(bm)
+		}
+	}
+}
+
+func (db *DB[K, V]) buildPredEqCandidate(e qx.Expr, fm *field, ov fieldOverlay) (predicate, bool) {
 	key, isSlice, err := db.exprValueToIdxScalar(qx.Expr{Op: e.Op, Field: e.Field, Value: e.Value})
 	if err != nil {
-		return predCandidate{}, false
+		return predicate{}, false
 	}
 
 	if !fm.Slice {
 		if isSlice {
-			return predCandidate{}, false
+			return predicate{}, false
 		}
-		bm := findIndex(slice, key)
+		ids, owned := overlayLookupPostingRetained(ov, key)
+		var cleanup func()
+		if owned != nil {
+			keep := owned
+			cleanup = func() { releaseRoaringBuf(keep) }
+		}
+
 		if e.Not {
-			if bm == nil || bm.IsEmpty() {
-				return predCandidate{expr: e, alwaysTrue: true}, true
+			if ids.IsEmpty() {
+				if cleanup != nil {
+					cleanup()
+				}
+				return predicate{expr: e, alwaysTrue: true}, true
 			}
-			return predCandidate{
-				expr: e,
-				contains: func(idx uint64) bool {
-					return !bm.Contains(idx)
-				},
+			return predicate{
+				expr:    e,
+				kind:    predicateKindPostingNot,
+				posting: ids,
+				cleanup: cleanup,
 			}, true
 		}
-		if bm == nil || bm.IsEmpty() {
-			return predCandidate{expr: e, alwaysFalse: true}, true
+		if ids.IsEmpty() {
+			if cleanup != nil {
+				cleanup()
+			}
+			return predicate{expr: e, alwaysFalse: true}, true
 		}
-		return predCandidate{
-			expr: e,
-			iter: func() roaringIter { return bm.Iterator() },
-			contains: func(idx uint64) bool {
-				return bm.Contains(idx)
-			},
-			estCard: bm.GetCardinality(),
+		return predicate{
+			expr:     e,
+			kind:     predicateKindPosting,
+			iterKind: predicateIterPosting,
+			posting:  ids,
+			estCard:  ids.Cardinality(),
+			cleanup:  cleanup,
 		}, true
 	}
 
 	if !isSlice {
-		return predCandidate{}, false
+		return predicate{}, false
 	}
 
-	vals, _, err := db.exprValueToIdx(qx.Expr{Op: e.Op, Field: e.Field, Value: e.Value})
+	vals, _, err := db.exprValueToIdxOwned(qx.Expr{Op: e.Op, Field: e.Field, Value: e.Value})
 	if err != nil {
-		return predCandidate{}, false
+		return predicate{}, false
 	}
 
 	b, err := db.evalSliceEQ(e.Field, vals)
 	if err != nil {
-		return predCandidate{}, false
+		return predicate{}, false
 	}
 
 	if e.Not {
 		if b.bm == nil || b.bm.IsEmpty() {
 			b.release()
-			return predCandidate{expr: e, alwaysTrue: true}, true
+			return predicate{expr: e, alwaysTrue: true}, true
 		}
 		bm := b.bm
 		readonly := b.readonly
-		return predCandidate{
+		return predicate{
 			expr: e,
-			contains: func(idx uint64) bool {
-				return !bm.Contains(idx)
-			},
+			kind: predicateKindBitmapNot,
+			bm:   bm,
 			cleanup: func() {
 				if !readonly {
 					releaseRoaringBuf(bm)
@@ -356,18 +759,17 @@ func (db *DB[K, V]) buildPredEqCandidate(e qx.Expr, fm *field, slice *[]index) (
 
 	if b.bm == nil || b.bm.IsEmpty() {
 		b.release()
-		return predCandidate{expr: e, alwaysFalse: true}, true
+		return predicate{expr: e, alwaysFalse: true}, true
 	}
 
 	bm := b.bm
 	readonly := b.readonly
-	return predCandidate{
-		expr: e,
-		iter: func() roaringIter { return bm.Iterator() },
-		contains: func(idx uint64) bool {
-			return bm.Contains(idx)
-		},
-		estCard: bm.GetCardinality(),
+	return predicate{
+		expr:     e,
+		kind:     predicateKindBitmap,
+		iterKind: predicateIterBitmap,
+		bm:       bm,
+		estCard:  bm.GetCardinality(),
 		cleanup: func() {
 			if !readonly {
 				releaseRoaringBuf(bm)
@@ -376,269 +778,501 @@ func (db *DB[K, V]) buildPredEqCandidate(e qx.Expr, fm *field, slice *[]index) (
 	}, true
 }
 
-func (db *DB[K, V]) buildPredInCandidate(e qx.Expr, fm *field, slice *[]index) (predCandidate, bool) {
+func (db *DB[K, V]) buildPredInCandidate(e qx.Expr, fm *field, ov fieldOverlay) (predicate, bool) {
 	if fm.Slice {
-		return predCandidate{}, false
+		return predicate{}, false
 	}
 
-	vals, isSlice, err := db.exprValueToIdx(qx.Expr{Op: e.Op, Field: e.Field, Value: e.Value})
+	vals, isSlice, err := db.exprValueToIdxOwned(qx.Expr{Op: e.Op, Field: e.Field, Value: e.Value})
 	if err != nil {
-		return predCandidate{}, false
+		return predicate{}, false
 	}
 	if !isSlice || len(vals) == 0 {
-		return predCandidate{}, false
+		return predicate{}, false
 	}
 	vals = dedupStringsInplace(vals)
 
-	bms := make([]*roaring64.Bitmap, 0, len(vals))
+	postsBuf := getPostingListSliceBuf(len(vals))
+	posts := postsBuf.values
+
+	var ownedInline [8]*roaring64.Bitmap
+	owned := ownedInline[:0]
+
 	var est uint64
 	for _, v := range vals {
-		bm := findIndex(slice, v)
-		if bm != nil && !bm.IsEmpty() {
-			bms = append(bms, bm)
-			est += bm.GetCardinality()
+		ids, keep := overlayLookupPostingRetained(ov, v)
+		if ids.IsEmpty() {
+			continue
 		}
+		posts = append(posts, ids)
+		est += ids.Cardinality()
+		if keep != nil {
+			owned = append(owned, keep)
+		}
+	}
+	cleanup := func() {
+		if len(owned) > 0 {
+			releaseOwnedBitmapSlice(owned)
+		}
+		postsBuf.values = posts
+		releasePostingListSliceBuf(postsBuf)
 	}
 
 	if e.Not {
-		if len(bms) == 0 {
-			return predCandidate{expr: e, alwaysTrue: true}, true
+		if len(posts) == 0 {
+			cleanup()
+			return predicate{expr: e, alwaysTrue: true}, true
 		}
-		return predCandidate{
-			expr: e,
-			contains: func(idx uint64) bool {
-				for _, bm := range bms {
-					if bm.Contains(idx) {
-						return false
-					}
-				}
-				return true
-			},
+		if len(posts) == 1 {
+			return predicate{
+				expr:    e,
+				kind:    predicateKindPostingNot,
+				posting: posts[0],
+				cleanup: cleanup,
+			}, true
+		}
+		return predicate{
+			expr:    e,
+			kind:    predicateKindPostsAnyNot,
+			posts:   posts,
+			cleanup: cleanup,
 		}, true
 	}
 
-	if len(bms) == 0 {
-		return predCandidate{expr: e, alwaysFalse: true}, true
+	if len(posts) == 0 {
+		cleanup()
+		return predicate{expr: e, alwaysFalse: true}, true
 	}
-	if len(bms) == 1 {
-		bm := bms[0]
-		return predCandidate{
-			expr: e,
-			iter: func() roaringIter { return bm.Iterator() },
-			contains: func(idx uint64) bool {
-				return bm.Contains(idx)
-			},
-			estCard: bm.GetCardinality(),
+	if len(posts) == 1 {
+		ids := posts[0]
+		return predicate{
+			expr:     e,
+			kind:     predicateKindPosting,
+			iterKind: predicateIterPosting,
+			posting:  ids,
+			estCard:  ids.Cardinality(),
+			cleanup:  cleanup,
 		}, true
 	}
 
-	return predCandidate{
-		expr: e,
-		iter: func() roaringIter { return newConcatIter(bms) },
-		contains: func(idx uint64) bool {
-			for _, bm := range bms {
-				if bm.Contains(idx) {
-					return true
-				}
-			}
-			return false
-		},
-		estCard: est,
+	return predicate{
+		expr:     e,
+		kind:     predicateKindPostsAny,
+		iterKind: predicateIterPostsConcat,
+		posts:    posts,
+		estCard:  est,
+		cleanup:  cleanup,
 	}, true
 }
 
-func (db *DB[K, V]) buildPredHasCandidate(e qx.Expr, fm *field, slice *[]index) (predCandidate, bool) {
+func (db *DB[K, V]) buildPredHasCandidate(e qx.Expr, fm *field, ov fieldOverlay) (predicate, bool) {
 	if !fm.Slice {
-		return predCandidate{}, false
+		return predicate{}, false
 	}
 
-	vals, isSlice, err := db.exprValueToIdx(qx.Expr{Op: e.Op, Field: e.Field, Value: e.Value})
+	vals, isSlice, err := db.exprValueToIdxOwned(qx.Expr{Op: e.Op, Field: e.Field, Value: e.Value})
 	if err != nil {
-		return predCandidate{}, false
+		return predicate{}, false
 	}
 	if !isSlice || len(vals) == 0 {
-		return predCandidate{}, false
+		return predicate{}, false
 	}
 	vals = dedupStringsInplace(vals)
 
-	bms := make([]*roaring64.Bitmap, 0, len(vals))
+	postsBuf := getPostingListSliceBuf(len(vals))
+	posts := postsBuf.values
+
+	var ownedInline [8]*roaring64.Bitmap
+	owned := ownedInline[:0]
+
 	var minCard uint64
 
 	for _, v := range vals {
-		bm := findIndex(slice, v)
-		if bm == nil || bm.IsEmpty() {
-			if e.Not {
-				return predCandidate{expr: e, alwaysTrue: true}, true
+		ids, keep := overlayLookupPostingRetained(ov, v)
+		if ids.IsEmpty() {
+			if len(owned) > 0 {
+				releaseOwnedBitmapSlice(owned)
 			}
-			return predCandidate{expr: e, alwaysFalse: true}, true
+			postsBuf.values = posts
+			releasePostingListSliceBuf(postsBuf)
+			if e.Not {
+				return predicate{expr: e, alwaysTrue: true}, true
+			}
+			return predicate{expr: e, alwaysFalse: true}, true
 		}
-		bms = append(bms, bm)
-		c := bm.GetCardinality()
+		posts = append(posts, ids)
+		if keep != nil {
+			owned = append(owned, keep)
+		}
+		c := ids.Cardinality()
 		if minCard == 0 || c < minCard {
 			minCard = c
 		}
 	}
 
+	cleanup := func() {
+		if len(owned) > 0 {
+			releaseOwnedBitmapSlice(owned)
+		}
+		postsBuf.values = posts
+		releasePostingListSliceBuf(postsBuf)
+	}
+
 	if e.Not {
-		return predCandidate{
-			expr: e,
-			contains: func(idx uint64) bool {
-				for _, bm := range bms {
-					if !bm.Contains(idx) {
-						return true
-					}
-				}
-				return false
-			},
+		if len(posts) == 1 {
+			return predicate{
+				expr:    e,
+				kind:    predicateKindPostingNot,
+				posting: posts[0],
+				cleanup: cleanup,
+			}, true
+		}
+		return predicate{
+			expr:    e,
+			kind:    predicateKindPostsAllNot,
+			posts:   posts,
+			cleanup: cleanup,
 		}, true
 	}
 
-	lead := minCardBM(bms)
-	return predCandidate{
-		expr: e,
-		iter: func() roaringIter { return lead.Iterator() },
-		contains: func(idx uint64) bool {
-			for _, bm := range bms {
-				if !bm.Contains(idx) {
-					return false
-				}
-			}
-			return true
-		},
-		estCard: minCard,
+	lead := minCardPosting(posts)
+	return predicate{
+		expr:     e,
+		kind:     predicateKindPostsAll,
+		iterKind: predicateIterPosting,
+		posting:  lead,
+		posts:    posts,
+		estCard:  minCard,
+		cleanup:  cleanup,
 	}, true
 }
 
-func (db *DB[K, V]) buildPredHasAnyCandidate(e qx.Expr, fm *field, slice *[]index) (predCandidate, bool) {
+func (db *DB[K, V]) buildPredHasAnyCandidate(e qx.Expr, fm *field, ov fieldOverlay) (predicate, bool) {
 	if !fm.Slice {
-		return predCandidate{}, false
+		return predicate{}, false
 	}
 
-	vals, isSlice, err := db.exprValueToIdx(qx.Expr{Op: e.Op, Field: e.Field, Value: e.Value})
+	vals, isSlice, err := db.exprValueToIdxOwned(qx.Expr{Op: e.Op, Field: e.Field, Value: e.Value})
 	if err != nil {
-		return predCandidate{}, false
+		return predicate{}, false
 	}
 	if !isSlice || len(vals) == 0 {
-		return predCandidate{}, false
+		return predicate{}, false
 	}
 	vals = dedupStringsInplace(vals)
 
-	bms := make([]*roaring64.Bitmap, 0, len(vals))
+	postsBuf := getPostingListSliceBuf(len(vals))
+	posts := postsBuf.values
+
+	var ownedInline [8]*roaring64.Bitmap
+	owned := ownedInline[:0]
+
 	var est uint64
+
 	for _, v := range vals {
-		bm := findIndex(slice, v)
-		if bm != nil && !bm.IsEmpty() {
-			bms = append(bms, bm)
-			est += bm.GetCardinality()
+		ids, keep := overlayLookupPostingRetained(ov, v)
+		if ids.IsEmpty() {
+			continue
 		}
+		posts = append(posts, ids)
+		est += ids.Cardinality()
+		if keep != nil {
+			owned = append(owned, keep)
+		}
+	}
+	cleanup := func() {
+		if len(owned) > 0 {
+			releaseOwnedBitmapSlice(owned)
+		}
+		postsBuf.values = posts
+		releasePostingListSliceBuf(postsBuf)
 	}
 
 	if e.Not {
-		if len(bms) == 0 {
-			return predCandidate{expr: e, alwaysTrue: true}, true
+		if len(posts) == 0 {
+			cleanup()
+			return predicate{expr: e, alwaysTrue: true}, true
 		}
-		return predCandidate{
-			expr: e,
-			contains: func(idx uint64) bool {
-				for _, bm := range bms {
-					if bm.Contains(idx) {
-						return false
-					}
-				}
-				return true
-			},
+		if len(posts) == 1 {
+			return predicate{
+				expr:    e,
+				kind:    predicateKindPostingNot,
+				posting: posts[0],
+				cleanup: cleanup,
+			}, true
+		}
+		return predicate{
+			expr:    e,
+			kind:    predicateKindPostsAnyNot,
+			posts:   posts,
+			cleanup: cleanup,
 		}, true
 	}
 
-	if len(bms) == 0 {
-		return predCandidate{expr: e, alwaysFalse: true}, true
+	if len(posts) == 0 {
+		cleanup()
+		return predicate{expr: e, alwaysFalse: true}, true
 	}
-	if len(bms) == 1 {
-		bm := bms[0]
-		return predCandidate{
-			expr: e,
-			iter: func() roaringIter { return bm.Iterator() },
-			contains: func(idx uint64) bool {
-				return bm.Contains(idx)
-			},
-			estCard: bm.GetCardinality(),
+
+	if len(posts) == 1 {
+		ids := posts[0]
+		return predicate{
+			expr:     e,
+			kind:     predicateKindPosting,
+			iterKind: predicateIterPosting,
+			posting:  ids,
+			estCard:  ids.Cardinality(),
+			cleanup:  cleanup,
 		}, true
 	}
 
-	return predCandidate{
-		expr: e,
-		iter: func() roaringIter { return newUnionIter(bms) },
-		contains: func(idx uint64) bool {
-			for _, bm := range bms {
-				if bm.Contains(idx) {
-					return true
-				}
-			}
-			return false
-		},
-		estCard: est,
+	return predicate{
+		expr:     e,
+		kind:     predicateKindPostsAny,
+		iterKind: predicateIterPostsUnion,
+		posts:    posts,
+		estCard:  est,
+		cleanup:  cleanup,
 	}, true
 }
 
-func (db *DB[K, V]) buildPredRangeCandidate(e qx.Expr, fm *field, slice *[]index) (predCandidate, bool) {
+func rangeBoundsForOp(op qx.Op, key string) (rangeBounds, bool) {
+	rb := rangeBounds{has: true}
+	switch op {
+	case qx.OpGT:
+		rb.applyLo(key, false)
+	case qx.OpGTE:
+		rb.applyLo(key, true)
+	case qx.OpLT:
+		rb.applyHi(key, false)
+	case qx.OpLTE:
+		rb.applyHi(key, true)
+	case qx.OpPREFIX:
+		rb.hasPrefix = true
+		rb.prefix = key
+	default:
+		return rangeBounds{}, false
+	}
+	return rb, true
+}
+
+func overlayRangeStats(ov fieldOverlay, br overlayRange) (int, uint64) {
+	cur := ov.newCursor(br, false)
+	n := 0
+	est := uint64(0)
+	for {
+		_, baseIDs, de, ok := cur.next()
+		if !ok {
+			break
+		}
+		card := composePostingCardinality(baseIDs, de)
+		if card == 0 {
+			continue
+		}
+		n++
+		est += card
+	}
+	return n, est
+}
+
+func overlayRangeContains(ov fieldOverlay, br overlayRange, idx uint64) bool {
+	cur := ov.newCursor(br, false)
+	for {
+		_, baseIDs, de, ok := cur.next()
+		if !ok {
+			return false
+		}
+		if composePostingContains(baseIDs, de, idx) {
+			return true
+		}
+	}
+}
+
+func overlayUnionRange(ov fieldOverlay, br overlayRange) *roaring64.Bitmap {
+	out := getRoaringBuf()
+	cur := ov.newCursor(br, false)
+	scratch := getRoaringBuf()
+	defer releaseRoaringBuf(scratch)
+	for {
+		_, baseBM, de, ok := cur.next()
+		if !ok {
+			break
+		}
+		bm, owned := composePostingOwned(baseBM, de, scratch)
+		if bm != nil && !bm.IsEmpty() {
+			out.Or(bm)
+		}
+		if owned && bm != nil && bm != scratch {
+			releaseRoaringBuf(bm)
+		}
+	}
+	return out
+}
+
+type overlayRangeIter struct {
+	cur      overlayKeyCursor
+	curIt    roaringIter
+	curBM    *roaring64.Bitmap
+	curOwned bool
+	scratch  *roaring64.Bitmap
+	released bool
+}
+
+func newOverlayRangeIter(ov fieldOverlay, br overlayRange) *overlayRangeIter {
+	return &overlayRangeIter{
+		cur:     ov.newCursor(br, false),
+		scratch: getRoaringBuf(),
+	}
+}
+
+func (it *overlayRangeIter) release() {
+	if it.released {
+		return
+	}
+	it.released = true
+	if it.curOwned && it.curBM != nil && it.curBM != it.scratch {
+		releaseRoaringBuf(it.curBM)
+	}
+	it.curOwned = false
+	it.curBM = nil
+	it.curIt = nil
+	if it.scratch != nil {
+		releaseRoaringBuf(it.scratch)
+		it.scratch = nil
+	}
+}
+
+func (it *overlayRangeIter) HasNext() bool {
+	if it.released {
+		return false
+	}
+	for {
+		if it.curIt != nil && it.curIt.HasNext() {
+			return true
+		}
+		if it.curOwned && it.curBM != nil && it.curBM != it.scratch {
+			releaseRoaringBuf(it.curBM)
+		}
+		it.curOwned = false
+		it.curBM = nil
+		it.curIt = nil
+
+		_, baseBM, de, ok := it.cur.next()
+		if !ok {
+			return false
+		}
+		bm, owned := composePostingOwned(baseBM, de, it.scratch)
+		if bm == nil || bm.IsEmpty() {
+			if owned && bm != nil && bm != it.scratch {
+				releaseRoaringBuf(bm)
+			}
+			continue
+		}
+		it.curBM = bm
+		it.curOwned = owned
+		it.curIt = bm.Iterator()
+	}
+}
+
+func (it *overlayRangeIter) Next() uint64 {
+	if !it.HasNext() {
+		return 0
+	}
+	return it.curIt.Next()
+}
+
+func (db *DB[K, V]) buildPredRangeCandidate(e qx.Expr, fm *field, ov fieldOverlay) (predicate, bool) {
 	if fm.Slice {
-		return predCandidate{}, false
+		return predicate{}, false
+	}
+	if ov.delta == nil {
+		s := ov.base
+		p, ok := db.buildPredRange(e, fm, &s)
+		if !ok {
+			return predicate{}, false
+		}
+		return p, true
 	}
 
 	key, isSlice, err := db.exprValueToIdxScalar(qx.Expr{Op: e.Op, Field: e.Field, Value: e.Value})
 	if err != nil {
-		return predCandidate{}, false
+		return predicate{}, false
 	}
 	if isSlice {
-		return predCandidate{}, false
+		return predicate{}, false
 	}
-
-	s := *slice
-	start, end, ok := resolveRange(s, e.Op, key)
-	if !ok {
-		return predCandidate{}, false
-	}
-
-	if start >= end {
-		if e.Not {
-			return predCandidate{expr: e, alwaysTrue: true}, true
+	cacheKey := db.materializedPredCacheKeyForScalar(e.Field, e.Op, key)
+	if cacheKey != "" {
+		if cached, ok := db.getSnapshot().loadMaterializedPred(cacheKey); ok {
+			return materializedRangePredicateReadonly(e, cached), true
 		}
-		return predCandidate{expr: e, alwaysFalse: true}, true
 	}
 
-	var est uint64
-	for i := start; i < end; i++ {
-		est += s[i].IDs.GetCardinality()
+	rb, ok := rangeBoundsForOp(e.Op, key)
+	if !ok {
+		return predicate{}, false
+	}
+	br := ov.rangeForBounds(rb)
+	if br.baseStart >= br.baseEnd && br.deltaStart >= br.deltaEnd {
+		if e.Not {
+			return predicate{expr: e, alwaysTrue: true}, true
+		}
+		return predicate{expr: e, alwaysFalse: true}, true
+	}
+
+	if out, ok := db.tryEvalNumericRangeBuckets(e.Field, fm, ov, br); ok {
+		if db.tryStoreMaterializedPredShared(cacheKey, out.bm) {
+			return materializedRangePredicateReadonly(e, out.bm), true
+		}
+		return materializedRangePredicate(e, out.bm), true
+	}
+
+	bucketCount, est := overlayRangeStats(ov, br)
+	if bucketCount == 0 {
+		if e.Not {
+			return predicate{expr: e, alwaysTrue: true}, true
+		}
+		return predicate{expr: e, alwaysFalse: true}, true
 	}
 
 	var (
 		once sync.Once
 		bm   *roaring64.Bitmap
+		ro   bool
+		itMu sync.Mutex
+		its  []*overlayRangeIter
 	)
 	contains := func(idx uint64) bool {
-		if end-start <= 16 {
-			for i := start; i < end; i++ {
-				if s[i].IDs.Contains(idx) {
-					return true
-				}
-			}
-			return false
+		if bucketCount <= 16 {
+			return overlayRangeContains(ov, br, idx)
 		}
 
 		once.Do(func() {
-			bm = db.unionIndexRange(e.Field, start, end)
+			bm = overlayUnionRange(ov, br)
+			ro = db.tryStoreMaterializedPredShared(cacheKey, bm)
 		})
+		if bm == nil {
+			return false
+		}
 		return bm.Contains(idx)
 	}
 
 	cleanup := func() {
-		if bm != nil {
+		if bm != nil && !ro {
 			releaseRoaringBuf(bm)
 		}
+		itMu.Lock()
+		for _, it := range its {
+			if it != nil {
+				it.release()
+			}
+		}
+		its = nil
+		itMu.Unlock()
 	}
 
 	if e.Not {
-		return predCandidate{
+		return predicate{
 			expr: e,
 			contains: func(idx uint64) bool {
 				return !contains(idx)
@@ -647,10 +1281,14 @@ func (db *DB[K, V]) buildPredRangeCandidate(e qx.Expr, fm *field, slice *[]index
 		}, true
 	}
 
-	return predCandidate{
+	return predicate{
 		expr: e,
 		iter: func() roaringIter {
-			return newRangeIter(s, start, end)
+			it := newOverlayRangeIter(ov, br)
+			itMu.Lock()
+			its = append(its, it)
+			itMu.Unlock()
+			return it
 		},
 		contains: contains,
 		estCard:  est,
@@ -658,55 +1296,147 @@ func (db *DB[K, V]) buildPredRangeCandidate(e qx.Expr, fm *field, slice *[]index
 	}, true
 }
 
-func (db *DB[K, V]) buildPredMaterializedCandidate(e qx.Expr) (predCandidate, bool) {
+func (db *DB[K, V]) buildPredMaterializedCandidate(e qx.Expr) (predicate, bool) {
 	raw := e
 	raw.Not = false
+	cacheKey := db.materializedPredCacheKey(raw)
 
-	b, err := db.evalSimple(raw)
-	if err != nil {
-		return predCandidate{}, false
+	var (
+		once     sync.Once
+		bm       *roaring64.Bitmap
+		readonly bool
+	)
+	load := func() {
+		if cacheKey != "" {
+			if cached, ok := db.getSnapshot().loadMaterializedPred(cacheKey); ok {
+				bm = cached
+				readonly = true
+				return
+			}
+		}
+
+		b, err := db.evalSimple(raw)
+		if err != nil {
+			if cacheKey != "" {
+				db.getSnapshot().storeMaterializedPred(cacheKey, nil)
+			}
+			return
+		}
+		if b.bm == nil || b.bm.IsEmpty() {
+			b.release()
+			if cacheKey != "" {
+				db.getSnapshot().storeMaterializedPred(cacheKey, nil)
+			}
+			return
+		}
+		bm = b.bm
+		readonly = b.readonly
+		if cacheKey != "" {
+			if db.tryStoreMaterializedPredShared(cacheKey, bm) {
+				// cached bitmap is shared and must not be returned to pool
+				// by this predicate cleanup.
+				readonly = true
+			}
+		}
+	}
+	cleanup := func() {
+		if bm != nil && !readonly {
+			releaseRoaringBuf(bm)
+		}
+	}
+
+	est := db.snapshotUniverseCardinality()
+	if est == 0 {
+		est = 1
 	}
 
 	if e.Not {
-		if b.bm == nil || b.bm.IsEmpty() {
-			b.release()
-			return predCandidate{expr: e, alwaysTrue: true}, true
-		}
-		bm := b.bm
-		readonly := b.readonly
-		return predCandidate{
+		return predicate{
 			expr: e,
 			contains: func(idx uint64) bool {
+				once.Do(load)
+				if bm == nil {
+					return true
+				}
 				return !bm.Contains(idx)
 			},
-			cleanup: func() {
-				if !readonly {
-					releaseRoaringBuf(bm)
-				}
-			},
+			estCard: est,
+			cleanup: cleanup,
 		}, true
 	}
 
-	if b.bm == nil || b.bm.IsEmpty() {
-		b.release()
-		return predCandidate{expr: e, alwaysFalse: true}, true
-	}
-
-	bm := b.bm
-	readonly := b.readonly
-	return predCandidate{
+	return predicate{
 		expr: e,
-		iter: func() roaringIter { return bm.Iterator() },
-		contains: func(idx uint64) bool {
-			return bm.Contains(idx)
-		},
-		estCard: bm.GetCardinality(),
-		cleanup: func() {
-			if !readonly {
-				releaseRoaringBuf(bm)
+		iter: func() roaringIter {
+			once.Do(load)
+			if bm == nil {
+				return emptyIter{}
 			}
+			return bm.Iterator()
 		},
+		contains: func(idx uint64) bool {
+			once.Do(load)
+			return bm != nil && bm.Contains(idx)
+		},
+		estCard: est,
+		cleanup: cleanup,
 	}, true
+}
+
+func (db *DB[K, V]) materializedPredCacheEnabled() bool {
+	snap := db.getSnapshot()
+	return snap != nil && snap.materializedPredCacheLimit() > 0
+}
+
+func (db *DB[K, V]) materializedPredCacheKeyForScalar(field string, op qx.Op, key string) string {
+	if !db.materializedPredCacheEnabled() {
+		return ""
+	}
+	return materializedPredCacheKeyFromScalar(field, op, key)
+}
+
+func (db *DB[K, V]) materializedPredCacheKey(e qx.Expr) string {
+	key, isSlice, err := db.exprValueToIdxScalar(qx.Expr{Op: e.Op, Field: e.Field, Value: e.Value})
+	if err != nil || isSlice {
+		return ""
+	}
+	return db.materializedPredCacheKeyForScalar(e.Field, e.Op, key)
+}
+
+func materializedPredCacheKeyFromScalar(field string, op qx.Op, key string) string {
+	if field == "" {
+		return ""
+	}
+	switch op {
+	case qx.OpSUFFIX, qx.OpCONTAINS, qx.OpPREFIX, qx.OpGT, qx.OpGTE, qx.OpLT, qx.OpLTE:
+	default:
+		return ""
+	}
+	return field + "\x1f" + strconv.Itoa(int(op)) + "\x1f" + key
+}
+
+func (db *DB[K, V]) tryStoreMaterializedPredShared(cacheKey string, bm *roaring64.Bitmap) bool {
+	if cacheKey == "" || bm == nil {
+		return false
+	}
+	snap := db.getSnapshot()
+	if snap == nil || snap.materializedPredCacheLimit() <= 0 {
+		return false
+	}
+	if bm.IsEmpty() {
+		snap.storeMaterializedPred(cacheKey, nil)
+		return false
+	}
+	snap.storeMaterializedPred(cacheKey, bm)
+	cached, ok := snap.loadMaterializedPred(cacheKey)
+	if ok && cached == bm {
+		return true
+	}
+	if snap.tryStoreMaterializedPredOversized(cacheKey, bm) {
+		cached, ok = snap.loadMaterializedPred(cacheKey)
+		return ok && cached == bm
+	}
+	return false
 }
 
 func resolveRange(s []index, op qx.Op, key string) (start, end int, ok bool) {
@@ -718,7 +1448,7 @@ func resolveRange(s []index, op qx.Op, key string) (start, end int, ok bool) {
 	switch op {
 	case qx.OpGT:
 		start = lo
-		if start < len(s) && s[start].Key == key {
+		if start < len(s) && indexKeyEqualsString(s[start].Key, key) {
 			start++
 		}
 	case qx.OpGTE:
@@ -729,10 +1459,7 @@ func resolveRange(s []index, op qx.Op, key string) (start, end int, ok bool) {
 		end = upperBoundIndex(s, key)
 	case qx.OpPREFIX:
 		start = lo
-		end = start
-		for end < len(s) && strings.HasPrefix(s[end].Key, key) {
-			end++
-		}
+		end = prefixRangeEndIndex(s, key, start)
 	default:
 		return 0, 0, false
 	}
@@ -750,10 +1477,33 @@ func resolveRange(s []index, op qx.Op, key string) (start, end int, ok bool) {
 }
 
 type rangeIter struct {
-	s     []index
-	i     int
-	end   int
-	curIt roaringIter
+	s      []index
+	i      int
+	end    int
+	curIt  roaringIter
+	single struct {
+		set bool
+		v   uint64
+	}
+}
+
+type singletonIter struct {
+	v   uint64
+	has bool
+}
+
+func newSingletonIter(v uint64) roaringIter {
+	return &singletonIter{v: v, has: true}
+}
+
+func (it *singletonIter) HasNext() bool { return it.has }
+
+func (it *singletonIter) Next() uint64 {
+	if !it.has {
+		return 0
+	}
+	it.has = false
+	return it.v
 }
 
 func newRangeIter(s []index, start, end int) roaringIter {
@@ -762,6 +1512,9 @@ func newRangeIter(s []index, start, end int) roaringIter {
 
 func (it *rangeIter) HasNext() bool {
 	for {
+		if it.single.set {
+			return true
+		}
 		if it.curIt != nil && it.curIt.HasNext() {
 			return true
 		}
@@ -770,10 +1523,16 @@ func (it *rangeIter) HasNext() bool {
 		}
 		bm := it.s[it.i].IDs
 		it.i++
-		if bm == nil || bm.IsEmpty() {
+		if bm.IsEmpty() {
 			continue
 		}
-		it.curIt = bm.Iterator()
+		if bm.isSingleton() {
+			it.single.set = true
+			it.single.v = bm.single
+			continue
+		}
+		bmRO := bm.bitmap()
+		it.curIt = bmRO.Iterator()
 	}
 }
 
@@ -781,10 +1540,14 @@ func (it *rangeIter) Next() uint64 {
 	if !it.HasNext() {
 		return 0
 	}
+	if it.single.set {
+		it.single.set = false
+		return it.single.v
+	}
 	return it.curIt.Next()
 }
 
-func (db *DB[K, V]) execPlanCandidateNoOrder(q *qx.QX, preds []predCandidate) []K {
+func (db *DB[K, V]) execPlanCandidateNoOrder(q *qx.QX, preds []predicate) []K {
 	skip := q.Offset
 	need := q.Limit
 
@@ -792,7 +1555,7 @@ func (db *DB[K, V]) execPlanCandidateNoOrder(q *qx.QX, preds []predCandidate) []
 	var best uint64
 	for i := range preds {
 		p := preds[i]
-		if p.alwaysTrue || p.alwaysFalse || p.iter == nil {
+		if p.alwaysTrue || p.alwaysFalse || !p.hasIter() {
 			continue
 		}
 		if leadIdx == -1 || p.estCard < best {
@@ -802,25 +1565,28 @@ func (db *DB[K, V]) execPlanCandidateNoOrder(q *qx.QX, preds []predCandidate) []
 	}
 
 	var it roaringIter
+	var universe *roaring64.Bitmap
+	leadNeedsCheck := false
 	if leadIdx >= 0 {
-		it = preds[leadIdx].iter()
+		it = preds[leadIdx].newIter()
+		leadNeedsCheck = preds[leadIdx].leadIterNeedsContainsCheck()
 	} else {
-		it = db.universe.Iterator()
+		var owned bool
+		universe, owned = db.snapshotUniverseView()
+		if owned {
+			defer releaseRoaringBuf(universe)
+		}
+		it = universe.Iterator()
 	}
 
 	out := make([]K, 0, need)
-
-	if db.strkey {
-		db.strmap.RLock()
-		defer db.strmap.RUnlock()
-	}
 
 	for it.HasNext() {
 		idx := it.Next()
 
 		pass := true
 		for i := range preds {
-			if i == leadIdx {
+			if i == leadIdx && !leadNeedsCheck {
 				continue
 			}
 			p := preds[i]
@@ -831,7 +1597,7 @@ func (db *DB[K, V]) execPlanCandidateNoOrder(q *qx.QX, preds []predCandidate) []
 				pass = false
 				break
 			}
-			if p.contains == nil || !p.contains(idx) {
+			if !p.hasContains() || !p.matches(idx) {
 				pass = false
 				break
 			}
@@ -855,29 +1621,114 @@ func (db *DB[K, V]) execPlanCandidateNoOrder(q *qx.QX, preds []predCandidate) []
 	return out
 }
 
-func (db *DB[K, V]) execPlanCandidateOrderBasic(q *qx.QX, preds []predCandidate) []K {
+func (db *DB[K, V]) execPlanCandidateOrderBasic(q *qx.QX, preds []predicate) []K {
 	o := q.Order[0]
 
 	fm := db.fields[o.Field]
 	if fm == nil || fm.Slice {
 		return nil
 	}
-	slice := db.index[o.Field]
-	if slice == nil {
-		return nil
-	}
-	s := *slice
-	if len(s) == 0 {
+
+	ov := db.fieldOverlay(o.Field)
+	if !ov.hasData() {
 		return nil
 	}
 
-	start, end := 0, len(s)
-	rangeCovered := make([]bool, len(preds))
-	if st, en, cov, ok := db.extractOrderRangeCoverage(o.Field, preds, s); ok {
-		start, end = st, en
-		rangeCovered = cov
+	// Fast base-only path preserves legacy low-overhead order scan behavior.
+	if ov.delta == nil {
+		s := ov.base
+		if len(s) == 0 {
+			return nil
+		}
+
+		start, end := 0, len(s)
+		var rangeCovered []bool
+		if st, en, cov, ok := db.extractOrderRangeCoverage(o.Field, preds, s); ok {
+			start, end = st, en
+			rangeCovered = cov
+		}
+		if start >= end {
+			return nil
+		}
+		for i := range rangeCovered {
+			if rangeCovered[i] {
+				preds[i].covered = true
+			}
+		}
+
+		skip := q.Offset
+		need := q.Limit
+		out := make([]K, 0, need)
+
+		emit := func(bm postingList) bool {
+			stop := false
+			bm.ForEach(func(idx uint64) bool {
+
+				pass := true
+				for i := range preds {
+					p := preds[i]
+					if p.covered || p.alwaysTrue {
+						continue
+					}
+					if p.alwaysFalse {
+						pass = false
+						break
+					}
+					if !p.hasContains() || !p.matches(idx) {
+						pass = false
+						break
+					}
+				}
+				if !pass {
+					return true
+				}
+
+				if skip > 0 {
+					skip--
+					return true
+				}
+
+				out = append(out, db.idFromIdxNoLock(idx))
+				need--
+				if need == 0 {
+					stop = true
+					return false
+				}
+				return true
+			})
+			return stop
+		}
+
+		if !o.Desc {
+			for i := start; i < end; i++ {
+				if s[i].IDs.IsEmpty() {
+					continue
+				}
+				if emit(s[i].IDs) {
+					break
+				}
+			}
+		} else {
+			for i := end - 1; i >= start; i-- {
+				if !s[i].IDs.IsEmpty() {
+					if emit(s[i].IDs) {
+						break
+					}
+				}
+				if i == start {
+					break
+				}
+			}
+		}
+
+		return out
 	}
-	if start >= end {
+
+	br, rangeCovered, ok := db.extractOrderRangeCoverageOverlay(o.Field, preds, ov)
+	if !ok {
+		return nil
+	}
+	if br.baseStart >= br.baseEnd && br.deltaStart >= br.deltaEnd {
 		return nil
 	}
 	for i := range rangeCovered {
@@ -889,11 +1740,6 @@ func (db *DB[K, V]) execPlanCandidateOrderBasic(q *qx.QX, preds []predCandidate)
 	skip := q.Offset
 	need := q.Limit
 	out := make([]K, 0, need)
-
-	if db.strkey {
-		db.strmap.RLock()
-		defer db.strmap.RUnlock()
-	}
 
 	emit := func(bm *roaring64.Bitmap) bool {
 		it := bm.Iterator()
@@ -910,7 +1756,7 @@ func (db *DB[K, V]) execPlanCandidateOrderBasic(q *qx.QX, preds []predCandidate)
 					pass = false
 					break
 				}
-				if p.contains == nil || !p.contains(idx) {
+				if !p.hasContains() || !p.matches(idx) {
 					pass = false
 					break
 				}
@@ -933,72 +1779,42 @@ func (db *DB[K, V]) execPlanCandidateOrderBasic(q *qx.QX, preds []predCandidate)
 		return false
 	}
 
-	if !o.Desc {
-		for i := start; i < end; i++ {
-			if s[i].IDs == nil || s[i].IDs.IsEmpty() {
-				continue
-			}
-			if emit(s[i].IDs) {
-				break
-			}
+	scratch := getRoaringBuf()
+	defer releaseRoaringBuf(scratch)
+
+	keyCur := ov.newCursor(br, o.Desc)
+	for {
+		_, baseBM, de, ok := keyCur.next()
+		if !ok {
+			break
 		}
-	} else {
-		for i := end - 1; i >= start; i-- {
-			if s[i].IDs != nil && !s[i].IDs.IsEmpty() {
-				if emit(s[i].IDs) {
-					break
-				}
+		bm, owned := composePostingOwned(baseBM, de, scratch)
+		if bm == nil || bm.IsEmpty() {
+			if owned && bm != nil && bm != scratch {
+				releaseRoaringBuf(bm)
 			}
-			if i == start {
-				break
+			continue
+		}
+		if emit(bm) {
+			if owned && bm != scratch {
+				releaseRoaringBuf(bm)
 			}
+			return out
+		}
+		if owned && bm != scratch {
+			releaseRoaringBuf(bm)
 		}
 	}
 
 	return out
 }
 
-func (db *DB[K, V]) extractOrderRangeCoverage(field string, preds []predCandidate, s []index) (int, int, []bool, bool) {
-	rb := rangeBounds{}
-	covered := make([]bool, len(preds))
-
-	has := false
-	for i := range preds {
-		e := preds[i].expr
-		if e.Not || e.Field != field {
-			continue
-		}
-		switch e.Op {
-		case qx.OpGT, qx.OpGTE, qx.OpLT, qx.OpLTE, qx.OpEQ:
-			k, isSlice, err := db.exprValueToIdxScalar(qx.Expr{Op: e.Op, Field: e.Field, Value: e.Value})
-			if err != nil || isSlice {
-				return 0, 0, nil, false
-			}
-			switch e.Op {
-			case qx.OpGT:
-				rb.applyLo(k, false)
-			case qx.OpGTE:
-				rb.applyLo(k, true)
-			case qx.OpLT:
-				rb.applyHi(k, false)
-			case qx.OpLTE:
-				rb.applyHi(k, true)
-			case qx.OpEQ:
-				rb.applyLo(k, true)
-				rb.applyHi(k, true)
-			}
-			covered[i] = true
-			has = true
-		case qx.OpPREFIX:
-			p, isSlice, err := db.exprValueToIdxScalar(qx.Expr{Op: e.Op, Field: e.Field, Value: e.Value})
-			if err != nil || isSlice {
-				return 0, 0, nil, false
-			}
-			rb.hasPrefix = true
-			rb.prefix = p
-			covered[i] = true
-			has = true
-		}
+func (db *DB[K, V]) extractOrderRangeCoverage(field string, preds []predicate, s []index) (int, int, []bool, bool) {
+	rb, covered, has, ok := db.collectOrderRangeBounds(field, len(preds), func(i int) qx.Expr {
+		return preds[i].expr
+	})
+	if !ok {
+		return 0, 0, nil, false
 	}
 
 	if !has {
@@ -1009,33 +1825,159 @@ func (db *DB[K, V]) extractOrderRangeCoverage(field string, preds []predCandidat
 	return st, en, covered, true
 }
 
+func (db *DB[K, V]) extractOrderRangeCoverageOverlay(field string, preds []predicate, ov fieldOverlay) (overlayRange, []bool, bool) {
+	rb, covered, _, ok := db.collectOrderRangeBounds(field, len(preds), func(i int) qx.Expr {
+		return preds[i].expr
+	})
+	if !ok {
+		return overlayRange{}, nil, false
+	}
+
+	return ov.rangeForBounds(rb), covered, true
+}
+
 const (
 	rangeLinearContainsMax   = 16
 	rangeMaterializeAfter    = 64
-	rangeMaterializeAfterMed = 8
-	rangeMaterializeAfterBig = 1
 	rangeHashSetBucketsMin   = 1024
-	rangeHashSetMaxCard      = 200_000
+	rangeHashSetMaxCard      = 50_000
 	rangeBucketCountMaxProbe = 64
+	rangeFastSinglesMinProbe = 4096
 )
 
-type plannerPred struct {
-	expr qx.Expr
+func rangeLinearContainsLimit(probeLen int, est uint64) int {
+	limit := rangeLinearContainsMax
+	if probeLen > 0 {
+		if probeLen >= 8_192 {
+			limit -= 3
+		} else if probeLen >= 2_048 {
+			limit -= 2
+		} else if probeLen >= 512 {
+			limit--
+		}
+	}
 
-	contains func(uint64) bool
-	iter     func() roaringIter
-	estCard  uint64
-
-	alwaysTrue  bool
-	alwaysFalse bool
-	covered     bool
-
-	// Exact match count for a candidate order bucket.
-	bucketCount func(*roaring64.Bitmap) (uint64, bool)
-
-	cleanup func()
+	if probeLen > 0 && est > 0 {
+		avgPerBucket := est / uint64(probeLen)
+		switch {
+		case avgPerBucket <= 2:
+			// Sparse probes keep linear path cheap; avoid eager materialization.
+			limit += 3
+		case avgPerBucket <= 8:
+			limit += 2
+		case avgPerBucket >= 128:
+			limit -= 2
+		case avgPerBucket >= 64:
+			limit--
+		}
+	}
+	if limit < 8 {
+		limit = 8
+	}
+	if limit > 32 {
+		limit = 32
+	}
+	return limit
 }
 
+func rangeMaterializeAfterForProbe(probeLen int, est uint64) int {
+	if probeLen <= 0 {
+		return rangeMaterializeAfter
+	}
+
+	// Scale smoothly with probe width. Around 1k buckets this converges to ~4
+	// calls, and for very wide probes drops to 1-2 calls.
+	after := (rangeMaterializeAfter * rangeHashSetBucketsMin) / probeLen
+	if after < 1 {
+		after = 1
+	}
+	if after > rangeMaterializeAfter {
+		after = rangeMaterializeAfter
+	}
+
+	if est > 0 {
+		avgPerBucket := est / uint64(probeLen)
+		switch {
+		case avgPerBucket <= 2:
+			after = after * 3 / 4
+		case avgPerBucket <= 8:
+			after = after * 7 / 8
+		case avgPerBucket >= 128:
+			after = after * 5 / 4
+		case avgPerBucket >= 64:
+			after = after * 9 / 8
+		}
+	}
+
+	// Keep very wide probes from burning repeated linear scans.
+	if probeLen >= 16_384 && after > 2 {
+		after = 2
+	}
+	if probeLen >= 65_536 && after > 1 {
+		after = 1
+	}
+
+	if after < 1 {
+		after = 1
+	}
+	if after > rangeMaterializeAfter {
+		after = rangeMaterializeAfter
+	}
+	return after
+}
+
+func rangeHashSetBucketsMinForProbe(probeLen int, est uint64) int {
+	minBuckets := rangeHashSetBucketsMin
+	if est > 0 && est <= 6_000 && probeLen >= 16_384 {
+		minBuckets = 896
+	}
+	if minBuckets < 128 {
+		minBuckets = 128
+	}
+	return minBuckets
+}
+
+func rangeHashSetMaxCardForProbe(probeLen int, est uint64) uint64 {
+	maxCard := uint64(rangeHashSetMaxCard)
+	if probeLen >= 4_096 {
+		maxCard = 60_000
+	} else if probeLen <= 256 {
+		maxCard = 45_000
+	}
+	return maxCard
+}
+
+func rangeBucketCountMaxProbeForShape(probeLen int, est uint64) int {
+	maxProbe := rangeBucketCountMaxProbe
+	if probeLen <= 16 && est > 0 && est <= 8_192 {
+		maxProbe = 96
+	}
+	return maxProbe
+}
+
+func rangeFastSinglesMinProbeForShape(probeLen int, est uint64) int {
+	minProbe := rangeFastSinglesMinProbe
+	if est > 0 && est <= 8_000 && probeLen >= 16_384 {
+		minProbe = 3_072
+	}
+	return minProbe
+}
+
+func rangeSingletonProbeSampleSize(probeLen int) int {
+	sampleN := rangeBucketCountMaxProbe
+	if probeLen > 4_096 {
+		sampleN = 72
+	}
+	if probeLen < sampleN {
+		sampleN = probeLen
+	}
+	if sampleN <= 0 {
+		sampleN = 1
+	}
+	return sampleN
+}
+
+// tryPlanOrdered attempts the internal plan ordered path and returns false when fast-path preconditions are not satisfied.
 func (db *DB[K, V]) tryPlanOrdered(q *qx.QX, trace *queryTrace) ([]K, bool, error) {
 	if q.Limit == 0 {
 		return nil, false, nil
@@ -1062,7 +2004,7 @@ func (db *DB[K, V]) tryPlanOrdered(q *qx.QX, trace *queryTrace) ([]K, bool, erro
 			return nil, false, nil
 		}
 
-		preds, ok := db.buildPredicates(leaves)
+		preds, ok := db.buildPredicatesOrdered(leaves, o.Field)
 		if !ok {
 			return nil, false, nil
 		}
@@ -1120,24 +2062,76 @@ func (db *DB[K, V]) tryPlanOrdered(q *qx.QX, trace *queryTrace) ([]K, bool, erro
 	return db.execPlanOrderedNoOrder(q, preds, trace), true, nil
 }
 
-func (db *DB[K, V]) shouldUseOrdered(q *qx.QX, leaves []qx.Expr) bool {
-	return db.shouldUseOrderedByCost(q, leaves)
+func (p predicate) checkCost() int {
+	if p.alwaysFalse {
+		return -1
+	}
+
+	cost := 5
+	switch p.expr.Op {
+	case qx.OpEQ:
+		cost = 0
+	case qx.OpIN, qx.OpHAS, qx.OpHASANY:
+		cost = 1
+	case qx.OpGT, qx.OpGTE, qx.OpLT, qx.OpLTE:
+		cost = 2
+	case qx.OpNOOP:
+		cost = 0
+	case qx.OpPREFIX, qx.OpSUFFIX, qx.OpCONTAINS:
+		cost = 4
+	}
+
+	if p.expr.Not {
+		cost++
+	}
+	return cost
 }
 
-func plannerPredFromCandidate(p predCandidate) plannerPred {
-	return plannerPred{
-		expr:        p.expr,
-		contains:    p.contains,
-		iter:        p.iter,
-		estCard:     p.estCard,
-		alwaysTrue:  p.alwaysTrue,
-		alwaysFalse: p.alwaysFalse,
-		covered:     p.covered,
-		cleanup:     p.cleanup,
+func sortActivePredicates(active []int, preds []predicate) {
+	if len(active) <= 1 {
+		return
+	}
+
+	estOf := func(pi int) uint64 {
+		if pi < 0 || pi >= len(preds) {
+			return math.MaxUint64
+		}
+		est := preds[pi].estCard
+		if est == 0 {
+			return math.MaxUint64
+		}
+		return est
+	}
+
+	less := func(a, b int) bool {
+		pa := preds[a]
+		pb := preds[b]
+		ca := pa.checkCost()
+		cb := pb.checkCost()
+		if ca != cb {
+			return ca < cb
+		}
+		ea := estOf(a)
+		eb := estOf(b)
+		if ea != eb {
+			return ea < eb
+		}
+		return a < b
+	}
+
+	// Small in-place insertion sort keeps overhead allocation-free.
+	for i := 1; i < len(active); i++ {
+		cur := active[i]
+		j := i
+		for j > 0 && less(cur, active[j-1]) {
+			active[j] = active[j-1]
+			j--
+		}
+		active[j] = cur
 	}
 }
 
-func releasePredicates(preds []plannerPred) {
+func releasePredicates(preds []predicate) {
 	for i := range preds {
 		if preds[i].cleanup != nil {
 			preds[i].cleanup()
@@ -1145,12 +2139,12 @@ func releasePredicates(preds []plannerPred) {
 	}
 }
 
-func (db *DB[K, V]) buildPredicates(leaves []qx.Expr) ([]plannerPred, bool) {
+func (db *DB[K, V]) buildPredicates(leaves []qx.Expr) ([]predicate, bool) {
 	if len(leaves) == 1 && leaves[0].Op == qx.OpNOOP && leaves[0].Not {
-		return []plannerPred{{alwaysFalse: true}}, true
+		return []predicate{{alwaysFalse: true}}, true
 	}
 
-	preds := make([]plannerPred, 0, len(leaves))
+	preds := make([]predicate, 0, len(leaves))
 	for _, e := range leaves {
 		p, ok := db.buildPredicate(e)
 		if !ok {
@@ -1162,70 +2156,138 @@ func (db *DB[K, V]) buildPredicates(leaves []qx.Expr) ([]plannerPred, bool) {
 	return preds, true
 }
 
-func (db *DB[K, V]) buildPredicate(e qx.Expr) (plannerPred, bool) {
+func isOrderRangeCoveredLeaf(orderField string, e qx.Expr) bool {
+	if e.Not || e.Field != orderField {
+		return false
+	}
+	switch e.Op {
+	case qx.OpGT, qx.OpGTE, qx.OpLT, qx.OpLTE, qx.OpEQ, qx.OpPREFIX:
+		return true
+	default:
+		return false
+	}
+}
+
+func (db *DB[K, V]) buildPredicatesOrdered(leaves []qx.Expr, orderField string) ([]predicate, bool) {
+	if len(leaves) == 1 && leaves[0].Op == qx.OpNOOP && leaves[0].Not {
+		return []predicate{{alwaysFalse: true}}, true
+	}
+
+	preds := make([]predicate, 0, len(leaves))
+	for _, e := range leaves {
+		if isOrderRangeCoveredLeaf(orderField, e) {
+			// Keep conversion/typing validation, but avoid expensive predicate
+			// materialization for leaves that are fully covered by order range.
+			_, isSlice, err := db.exprValueToIdxScalar(qx.Expr{Op: e.Op, Field: e.Field, Value: e.Value})
+			if err != nil || isSlice {
+				releasePredicates(preds)
+				return nil, false
+			}
+			preds = append(preds, predicate{
+				expr:    e,
+				covered: true,
+			})
+			continue
+		}
+
+		p, ok := db.buildPredicate(e)
+		if !ok {
+			releasePredicates(preds)
+			return nil, false
+		}
+		preds = append(preds, p)
+	}
+	return preds, true
+}
+
+func (db *DB[K, V]) buildPredicate(e qx.Expr) (predicate, bool) {
 	if e.Op == qx.OpNOOP {
 		if e.Not {
-			return plannerPred{expr: e, alwaysFalse: true}, true
+			return predicate{expr: e, alwaysFalse: true}, true
 		}
-		return plannerPred{expr: e, alwaysTrue: true}, true
+		return predicate{expr: e, alwaysTrue: true}, true
 	}
 
 	if e.Field == "" {
-		return plannerPred{}, false
+		return predicate{}, false
 	}
 
-	slice := db.index[e.Field]
-	if slice == nil {
-		return plannerPred{}, false
-	}
 	fm := db.fields[e.Field]
 	if fm == nil {
-		return plannerPred{}, false
+		return predicate{}, false
 	}
 
 	switch e.Op {
 	case qx.OpGT, qx.OpGTE, qx.OpLT, qx.OpLTE, qx.OpPREFIX:
+		ov := db.fieldOverlay(e.Field)
+		if ov.hasData() && ov.delta != nil {
+			p, ok := db.buildPredRangeCandidate(e, fm, ov)
+			if !ok {
+				return predicate{}, false
+			}
+			return p, true
+		}
+		slice := db.snapshotFieldIndexSlice(e.Field)
+		if slice == nil {
+			return predicate{}, false
+		}
 		return db.buildPredRange(e, fm, slice)
 	default:
 		p, ok := db.buildPredicateCandidate(e)
 		if !ok {
-			return plannerPred{}, false
+			return predicate{}, false
 		}
-		return plannerPredFromCandidate(p), true
+		return p, true
 	}
 }
 
-func (db *DB[K, V]) buildPredRange(e qx.Expr, fm *field, slice *[]index) (plannerPred, bool) {
+func (db *DB[K, V]) buildPredRange(e qx.Expr, fm *field, slice *[]index) (predicate, bool) {
 	if fm.Slice {
-		return plannerPred{}, false
+		return predicate{}, false
 	}
 
 	key, isSlice, err := db.exprValueToIdxScalar(qx.Expr{Op: e.Op, Field: e.Field, Value: e.Value})
 	if err != nil {
-		return plannerPred{}, false
+		return predicate{}, false
 	}
 	if isSlice {
-		return plannerPred{}, false
+		return predicate{}, false
+	}
+	cacheKey := db.materializedPredCacheKeyForScalar(e.Field, e.Op, key)
+	if cacheKey != "" {
+		if cached, ok := db.getSnapshot().loadMaterializedPred(cacheKey); ok {
+			return materializedRangePredicateReadonly(e, cached), true
+		}
 	}
 
 	s := *slice
 	start, end, ok := resolveRange(s, e.Op, key)
 	if !ok {
-		return plannerPred{}, false
+		return predicate{}, false
 	}
 
 	if start >= end {
 		if e.Not {
-			return plannerPred{expr: e, alwaysTrue: true}, true
+			return predicate{expr: e, alwaysTrue: true}, true
 		}
-		return plannerPred{expr: e, alwaysFalse: true}, true
+		return predicate{expr: e, alwaysFalse: true}, true
 	}
 
 	if start == 0 && end == len(s) {
 		if e.Not {
-			return plannerPred{expr: e, alwaysFalse: true}, true
+			return predicate{expr: e, alwaysFalse: true}, true
 		}
-		return plannerPred{expr: e, alwaysTrue: true}, true
+		return predicate{expr: e, alwaysTrue: true}, true
+	}
+
+	if out, ok := db.tryEvalNumericRangeBuckets(e.Field, fm, fieldOverlay{base: s}, overlayRange{
+		baseStart: start,
+		baseEnd:   end,
+	}); ok {
+		if db.tryStoreMaterializedPredShared(cacheKey, out.bm) {
+			return materializedRangePredicateReadonly(e, out.bm), true
+		}
+		return materializedRangePredicate(e, out.bm), true
 	}
 
 	inBuckets := end - start
@@ -1236,8 +2298,8 @@ func (db *DB[K, V]) buildPredRange(e qx.Expr, fm *field, slice *[]index) (planne
 	// keep it cheap and avoid full-range cardinality scans
 	var est uint64
 	if inBuckets == 1 {
-		if ids := s[start].IDs; ids != nil {
-			est = ids.GetCardinality()
+		if ids := s[start].IDs; !ids.IsEmpty() {
+			est = ids.Cardinality()
 		}
 	} else {
 		ix0 := start
@@ -1246,19 +2308,19 @@ func (db *DB[K, V]) buildPredRange(e qx.Expr, fm *field, slice *[]index) (planne
 		var sum uint64
 		var n uint64
 
-		if ids := s[ix0].IDs; ids != nil {
-			sum += ids.GetCardinality()
+		if ids := s[ix0].IDs; !ids.IsEmpty() {
+			sum += ids.Cardinality()
 			n++
 		}
 		if ix1 != ix0 && ix1 != ix2 {
-			if ids := s[ix1].IDs; ids != nil {
-				sum += ids.GetCardinality()
+			if ids := s[ix1].IDs; !ids.IsEmpty() {
+				sum += ids.Cardinality()
 				n++
 			}
 		}
 		if ix2 != ix0 {
-			if ids := s[ix2].IDs; ids != nil {
-				sum += ids.GetCardinality()
+			if ids := s[ix2].IDs; !ids.IsEmpty() {
+				sum += ids.Cardinality()
 				n++
 			}
 		}
@@ -1271,45 +2333,81 @@ func (db *DB[K, V]) buildPredRange(e qx.Expr, fm *field, slice *[]index) (planne
 		est = uint64(inBuckets)
 	}
 
-	probe := make([]*roaring64.Bitmap, 0, func() int {
-		if useComplement {
-			return outBuckets
-		}
-		return inBuckets
-	}())
+	probeCap := inBuckets
+	if useComplement {
+		probeCap = outBuckets
+	}
+	probeBuf := getPostingListSliceBuf(max(probeCap, 8))
+	probe := probeBuf.values[:0]
+	probeEst := uint64(0)
 
 	if useComplement {
 		for i := 0; i < start; i++ {
-			if s[i].IDs != nil && !s[i].IDs.IsEmpty() {
-				probe = append(probe, s[i].IDs)
+			ids := s[i].IDs
+			if !ids.IsEmpty() {
+				probe = append(probe, ids)
+				card := ids.Cardinality()
+				if ^uint64(0)-probeEst < card {
+					probeEst = ^uint64(0)
+				} else {
+					probeEst += card
+				}
 			}
 		}
 		for i := end; i < len(s); i++ {
-			if s[i].IDs != nil && !s[i].IDs.IsEmpty() {
-				probe = append(probe, s[i].IDs)
+			ids := s[i].IDs
+			if !ids.IsEmpty() {
+				probe = append(probe, ids)
+				card := ids.Cardinality()
+				if ^uint64(0)-probeEst < card {
+					probeEst = ^uint64(0)
+				} else {
+					probeEst += card
+				}
 			}
 		}
 	} else {
 		for i := start; i < end; i++ {
-			if s[i].IDs != nil && !s[i].IDs.IsEmpty() {
-				probe = append(probe, s[i].IDs)
+			ids := s[i].IDs
+			if !ids.IsEmpty() {
+				probe = append(probe, ids)
+				card := ids.Cardinality()
+				if ^uint64(0)-probeEst < card {
+					probeEst = ^uint64(0)
+				} else {
+					probeEst += card
+				}
 			}
 		}
 	}
 
-	containsInRange, cleanup := db.buildRangeContains(probe, useComplement, est)
+	var onMaterialized func(*roaring64.Bitmap) bool
+	if cacheKey != "" && !useComplement {
+		onMaterialized = func(bm *roaring64.Bitmap) bool {
+			return db.tryStoreMaterializedPredShared(cacheKey, bm)
+		}
+	}
+	containsInRange, cleanupRange := db.buildRangeContains(probe, useComplement, probeEst, onMaterialized)
+	bucketCountMaxProbe := rangeBucketCountMaxProbeForShape(len(probe), est)
+	cleanup := func() {
+		if cleanupRange != nil {
+			cleanupRange()
+		}
+		probeBuf.values = probe
+		releasePostingListSliceBuf(probeBuf)
+	}
 
 	countInRange := func(bucket *roaring64.Bitmap) (uint64, bool) {
 		if bucket == nil || bucket.IsEmpty() {
 			return 0, true
 		}
-		if len(probe) > rangeBucketCountMaxProbe {
+		if len(probe) > bucketCountMaxProbe {
 			return 0, false
 		}
 
 		var hit uint64
-		for _, bm := range probe {
-			hit += bucket.AndCardinality(bm)
+		for _, ids := range probe {
+			hit += ids.AndCardinalityBitmap(bucket)
 		}
 
 		if !useComplement {
@@ -1324,7 +2422,7 @@ func (db *DB[K, V]) buildPredRange(e qx.Expr, fm *field, slice *[]index) (planne
 	}
 
 	if e.Not {
-		return plannerPred{
+		return predicate{
 			expr: e,
 			contains: func(idx uint64) bool {
 				return !containsInRange(idx)
@@ -1344,7 +2442,7 @@ func (db *DB[K, V]) buildPredRange(e qx.Expr, fm *field, slice *[]index) (planne
 		}, true
 	}
 
-	return plannerPred{
+	return predicate{
 		expr: e,
 		iter: func() roaringIter {
 			return newRangeIter(s, start, end)
@@ -1358,81 +2456,179 @@ func (db *DB[K, V]) buildPredRange(e qx.Expr, fm *field, slice *[]index) (planne
 	}, true
 }
 
-func (db *DB[K, V]) buildRangeContains(probe []*roaring64.Bitmap, invert bool, est uint64) (func(uint64) bool, func()) {
+func materializedRangePredicate(e qx.Expr, bm *roaring64.Bitmap) predicate {
+	return materializedRangePredicateWithMode(e, bm, false)
+}
+
+func materializedRangePredicateReadonly(e qx.Expr, bm *roaring64.Bitmap) predicate {
+	return materializedRangePredicateWithMode(e, bm, true)
+}
+
+func materializedRangePredicateWithMode(e qx.Expr, bm *roaring64.Bitmap, readonly bool) predicate {
+	if bm == nil || bm.IsEmpty() {
+		if bm != nil && !readonly {
+			releaseRoaringBuf(bm)
+		}
+		if e.Not {
+			return predicate{expr: e, alwaysTrue: true}
+		}
+		return predicate{expr: e, alwaysFalse: true}
+	}
+
+	containsInRange := func(idx uint64) bool {
+		return bm.Contains(idx)
+	}
+	countInRange := func(bucket *roaring64.Bitmap) (uint64, bool) {
+		if bucket == nil || bucket.IsEmpty() {
+			return 0, true
+		}
+		return bucket.AndCardinality(bm), true
+	}
+	cleanup := func() {
+		if !readonly {
+			releaseRoaringBuf(bm)
+		}
+	}
+
+	if e.Not {
+		return predicate{
+			expr: e,
+			contains: func(idx uint64) bool {
+				return !containsInRange(idx)
+			},
+			bucketCount: func(bucket *roaring64.Bitmap) (uint64, bool) {
+				if bucket == nil || bucket.IsEmpty() {
+					return 0, true
+				}
+				in, _ := countInRange(bucket)
+				bc := bucket.GetCardinality()
+				if in >= bc {
+					return 0, true
+				}
+				return bc - in, true
+			},
+			cleanup: cleanup,
+		}
+	}
+
+	return predicate{
+		expr: e,
+		iter: func() roaringIter {
+			return bm.Iterator()
+		},
+		contains: containsInRange,
+		estCard:  bm.GetCardinality(),
+		bucketCount: func(bucket *roaring64.Bitmap) (uint64, bool) {
+			return countInRange(bucket)
+		},
+		cleanup: cleanup,
+	}
+}
+
+// buildRangeContains builds a membership checker for a range probe set.
+//
+// The checker starts cheap (linear Contains over probe buckets) and upgrades
+// to hash/bitmap materialization only after enough repeated calls.
+func (db *DB[K, V]) buildRangeContains(
+	probe []postingList,
+	invert bool,
+	est uint64,
+	onMaterialized func(*roaring64.Bitmap) bool,
+) (func(uint64) bool, func()) {
 	if len(probe) == 0 {
 		if invert {
 			return func(uint64) bool { return true }, nil
 		}
 		return func(uint64) bool { return false }, nil
 	}
+	linearContainsMax := rangeLinearContainsLimit(len(probe), est)
+	materializeAfter := rangeMaterializeAfterForProbe(len(probe), est)
+	hashSetBucketsMin := rangeHashSetBucketsMinForProbe(len(probe), est)
+	hashSetMaxCard := rangeHashSetMaxCardForProbe(len(probe), est)
+	fastSinglesMinProbe := rangeFastSinglesMinProbeForShape(len(probe), est)
+	singleSampleN := rangeSingletonProbeSampleSize(len(probe))
 
 	linearContains := func(idx uint64) bool {
-		for _, bm := range probe {
-			if bm.Contains(idx) {
+		for _, p := range probe {
+			if p.Contains(idx) {
 				return true
 			}
 		}
 		return false
 	}
 
-	if invert || len(probe) <= rangeLinearContainsMax {
+	project := func(hit bool) bool {
+		// Invert is projected at the very end so all internal heuristics operate
+		// on the same positive-hit semantics.
+		if invert {
+			return !hit
+		}
+		return hit
+	}
+
+	if len(probe) <= linearContainsMax {
 		return func(idx uint64) bool {
-			hit := linearContains(idx)
-			if invert {
-				return !hit
-			}
-			return hit
+			return project(linearContains(idx))
 		}, nil
 	}
 
 	var (
-		calls int
-		set   *u64set
-		bm    *roaring64.Bitmap
+		calls      int
+		set        *u64set
+		bm         *roaring64.Bitmap
+		bmReadonly bool
 	)
 
 	contains := func(idx uint64) bool {
 		if set != nil {
-			return set.Has(idx)
+			return project(set.Has(idx))
 		}
 		if bm != nil {
-			return bm.Contains(idx)
+			return project(bm.Contains(idx))
 		}
 
 		calls++
-		materializeAfter := rangeMaterializeAfter
-		if len(probe) >= rangeHashSetBucketsMin {
-			materializeAfter = rangeMaterializeAfterBig
-		} else if len(probe) >= 256 {
-			materializeAfter = rangeMaterializeAfterMed
-		}
 		if calls >= materializeAfter {
-			if len(probe) >= rangeHashSetBucketsMin && est > 0 && est <= rangeHashSetMaxCard {
+			// Hash-set representation wins when estimated cardinality is bounded;
+			// it avoids the high constant factor of huge roaring unions.
+			if len(probe) >= hashSetBucketsMin && est > 0 && est <= hashSetMaxCard {
 				capHint := int(est)
 				if capHint < 64 {
 					capHint = 64
 				}
 				hs := newU64Set(capHint)
 				for _, b := range probe {
-					it := b.Iterator()
-					for it.HasNext() {
-						hs.Add(it.Next())
-					}
+					b.ForEach(func(v uint64) bool {
+						hs.Add(v)
+						return true
+					})
 				}
 				set = &hs
-				return set.Has(idx)
+				return project(set.Has(idx))
 			}
-			if len(probe) > rangeLinearContainsMax {
-				bm = db.unionBitmaps(probe)
-				return bm.Contains(idx)
+
+			if len(probe) > linearContainsMax {
+				// High-card ranges (e.g. score>=X on dense numeric fields) are
+				// often represented by a huge number of singleton buckets.
+				// Materializing such probes via OR across all buckets is expensive.
+				// Fast-path singleton-heavy probes through batched AddMany.
+				if isSingletonHeavyProbe(probe, fastSinglesMinProbe, singleSampleN) {
+					bm = materializeProbeFast(probe)
+				} else {
+					bm = db.materializeProbeUnion(probe)
+				}
+				if bm != nil && onMaterialized != nil {
+					bmReadonly = onMaterialized(bm)
+				}
+				return project(bm.Contains(idx))
 			}
 		}
 
-		return linearContains(idx)
+		return project(linearContains(idx))
 	}
 
 	cleanup := func() {
-		if bm != nil {
+		if bm != nil && !bmReadonly {
 			releaseRoaringBuf(bm)
 		}
 	}
@@ -1440,7 +2636,106 @@ func (db *DB[K, V]) buildRangeContains(probe []*roaring64.Bitmap, invert bool, e
 	return contains, cleanup
 }
 
-func (db *DB[K, V]) execPlanOrderedNoOrder(q *qx.QX, preds []plannerPred, trace *queryTrace) []K {
+func isSingletonHeavyProbe(probe []postingList, minProbe int, sampleN int) bool {
+	if len(probe) < minProbe {
+		return false
+	}
+	if sampleN <= 0 {
+		return false
+	}
+	step := len(probe) / sampleN
+	if step < 1 {
+		step = 1
+	}
+	nonEmpty := 0
+	singletons := 0
+	for i := 0; i < len(probe) && nonEmpty < sampleN; i += step {
+		p := probe[i]
+		if p.IsEmpty() {
+			continue
+		}
+		nonEmpty++
+		if p.Cardinality() == 1 {
+			singletons++
+		}
+	}
+	if nonEmpty == 0 {
+		return false
+	}
+	// 75%+ singleton buckets are enough to justify fast path.
+	return singletons*4 >= nonEmpty*3
+}
+
+func materializeProbeFast(probe []postingList) *roaring64.Bitmap {
+	out := getRoaringBuf()
+	singles := getSingleIDsBuf()
+	defer releaseSingleIDs(singles)
+
+	flushSingles := func() {
+		if len(singles.values) == 0 {
+			return
+		}
+		out.AddMany(singles.values)
+		singles.values = singles.values[:0]
+	}
+
+	for _, p := range probe {
+		if p.IsEmpty() {
+			continue
+		}
+		if p.Cardinality() == 1 {
+			id, _ := p.Minimum()
+			singles.values = append(singles.values, id)
+			if len(singles.values) == cap(singles.values) {
+				flushSingles()
+			}
+			continue
+		}
+
+		flushSingles()
+		p.OrInto(out)
+	}
+	flushSingles()
+	return out
+}
+
+func (db *DB[K, V]) materializeProbeUnion(probe []postingList) *roaring64.Bitmap {
+	bmBuf := getRoaringSliceBuf(len(probe))
+	bitmaps := bmBuf.values
+	singles := getSingleIDsBuf()
+	defer releaseSingleIDs(singles)
+
+	for _, p := range probe {
+		if p.IsEmpty() {
+			continue
+		}
+		if p.isSingleton() {
+			singles.values = append(singles.values, p.single)
+			continue
+		}
+		bitmaps = append(bitmaps, p.bitmap())
+	}
+
+	var out *roaring64.Bitmap
+	switch len(bitmaps) {
+	case 0:
+		out = getRoaringBuf()
+	case 1:
+		out = getRoaringBuf()
+		out.Or(bitmaps[0])
+	default:
+		out = db.unionBitmaps(bitmaps)
+	}
+	if len(singles.values) > 0 {
+		out.AddMany(singles.values)
+	}
+
+	bmBuf.values = bitmaps
+	releaseRoaringSliceBuf(bmBuf)
+	return out
+}
+
+func (db *DB[K, V]) execPlanOrderedNoOrder(q *qx.QX, preds []predicate, trace *queryTrace) []K {
 	skip := q.Offset
 	need := q.Limit
 
@@ -1448,7 +2743,7 @@ func (db *DB[K, V]) execPlanOrderedNoOrder(q *qx.QX, preds []plannerPred, trace 
 	var best uint64
 	for i := range preds {
 		p := preds[i]
-		if p.alwaysTrue || p.alwaysFalse || p.iter == nil {
+		if p.alwaysTrue || p.alwaysFalse || !p.hasIter() {
 			continue
 		}
 		if leadIdx == -1 || p.estCard < best {
@@ -1458,32 +2753,35 @@ func (db *DB[K, V]) execPlanOrderedNoOrder(q *qx.QX, preds []plannerPred, trace 
 	}
 
 	var it roaringIter
+	var universe *roaring64.Bitmap
+	leadNeedsCheck := false
 	if leadIdx >= 0 {
-		it = preds[leadIdx].iter()
+		it = preds[leadIdx].newIter()
+		leadNeedsCheck = preds[leadIdx].leadIterNeedsContainsCheck()
 	} else {
-		it = db.universe.Iterator()
+		var owned bool
+		universe, owned = db.snapshotUniverseView()
+		if owned {
+			defer releaseRoaringBuf(universe)
+		}
+		it = universe.Iterator()
 	}
 	if trace != nil {
 		if leadIdx >= 0 && best > 0 {
 			trace.addExamined(best)
 		} else {
-			trace.addExamined(db.universe.GetCardinality())
+			trace.addExamined(db.snapshotUniverseCardinality())
 		}
 	}
 
 	out := make([]K, 0, need)
-
-	if db.strkey {
-		db.strmap.RLock()
-		defer db.strmap.RUnlock()
-	}
 
 	for it.HasNext() {
 		idx := it.Next()
 
 		pass := true
 		for i := range preds {
-			if i == leadIdx {
+			if i == leadIdx && !leadNeedsCheck {
 				continue
 			}
 			p := preds[i]
@@ -1494,7 +2792,7 @@ func (db *DB[K, V]) execPlanOrderedNoOrder(q *qx.QX, preds []plannerPred, trace 
 				pass = false
 				break
 			}
-			if p.contains == nil || !p.contains(idx) {
+			if !p.hasContains() || !p.matches(idx) {
 				pass = false
 				break
 			}
@@ -1529,45 +2827,112 @@ const (
 	plannerOrderedAnchorCandidateNeedMul = 64
 )
 
-func orderedAnchorLeadOpRank(op qx.Op) int {
+func plannerOrderedAnchorBudgets(needWindow int, activeCount int, leadEst uint64) (leadBudget uint64, candidateCap uint64) {
+	leadBudget = uint64(max(
+		plannerOrderedAnchorLeadBudgetMin,
+		min(plannerOrderedAnchorLeadBudgetMax, needWindow*plannerOrderedAnchorLeadNeedMul),
+	))
+	candidateCap = uint64(max(
+		plannerOrderedAnchorCandidateCapMin,
+		min(plannerOrderedAnchorCandidateCapMax, needWindow*plannerOrderedAnchorCandidateNeedMul),
+	))
+
+	if activeCount >= 4 {
+		leadBudget = leadBudget * 3 / 4
+		candidateCap = candidateCap * 3 / 4
+	} else if activeCount == 2 {
+		leadBudget = leadBudget * 9 / 8
+	}
+
+	if leadEst > 0 {
+		estLeadCap := leadEst * 6
+		if estLeadCap < leadEst {
+			estLeadCap = leadEst
+		}
+		if estLeadCap < leadBudget {
+			leadBudget = estLeadCap
+		}
+
+		estCandidateCap := leadEst * 8
+		if estCandidateCap < leadEst {
+			estCandidateCap = leadEst
+		}
+		if estCandidateCap < candidateCap {
+			floor := uint64(max(needWindow*2, plannerOrderedAnchorCandidateCapMin/2))
+			if estCandidateCap < floor {
+				estCandidateCap = floor
+			}
+			candidateCap = estCandidateCap
+		}
+	}
+
+	minLeadBudget := uint64(plannerOrderedAnchorLeadBudgetMin)
+	maxLeadBudget := uint64(plannerOrderedAnchorLeadBudgetMax)
+	if leadBudget < minLeadBudget {
+		leadBudget = minLeadBudget
+	}
+	if leadBudget > maxLeadBudget {
+		leadBudget = maxLeadBudget
+	}
+
+	minCandidateCap := uint64(plannerOrderedAnchorCandidateCapMin)
+	maxCandidateCap := uint64(plannerOrderedAnchorCandidateCapMax)
+	if candidateCap < minCandidateCap {
+		candidateCap = minCandidateCap
+	}
+	if candidateCap > maxCandidateCap {
+		candidateCap = maxCandidateCap
+	}
+
+	return leadBudget, candidateCap
+}
+
+func orderedAnchorLeadOpWeight(op qx.Op) float64 {
 	switch op {
 	case qx.OpEQ:
-		return 0
+		return 1.0
 	case qx.OpIN, qx.OpHAS, qx.OpHASANY:
-		return 1
+		return 1.35
 	case qx.OpGT, qx.OpGTE, qx.OpLT, qx.OpLTE, qx.OpPREFIX:
-		return 2
+		return 1.9
 	default:
-		return 3
+		return 2.5
 	}
 }
 
-func chooseOrderedAnchorLead(orderField string, preds []plannerPred, active []int) (int, bool) {
+func chooseOrderedAnchorLead(orderField string, preds []predicate, active []int) (int, bool) {
 	lead := -1
-	bestRank := 0
 	bestCard := uint64(0)
+	bestScore := 0.0
+	bestWeight := 0.0
 
 	for _, pi := range active {
 		p := preds[pi]
-		if p.iter == nil || p.estCard == 0 {
+		if !p.hasIter() || p.estCard == 0 {
 			continue
 		}
-		rank := orderedAnchorLeadOpRank(p.expr.Op)
+		weight := orderedAnchorLeadOpWeight(p.expr.Op)
 		if p.expr.Field == orderField {
-			// prefer non-order predicates for anchoring
-			rank += 3
+			// Predicates on the order field usually provide weak anchor signal.
+			weight *= 2.8
 		}
-		if lead == -1 || rank < bestRank || (rank == bestRank && p.estCard < bestCard) {
+		score := float64(p.estCard) * weight
+
+		if lead == -1 ||
+			score < bestScore ||
+			(score == bestScore && p.estCard < bestCard) ||
+			(score == bestScore && p.estCard == bestCard && weight < bestWeight) {
 			lead = pi
-			bestRank = rank
 			bestCard = p.estCard
+			bestScore = score
+			bestWeight = weight
 		}
 	}
 
 	return lead, lead >= 0
 }
 
-func (db *DB[K, V]) execPlanOrderedBasicAnchored(q *qx.QX, preds []plannerPred, active []int, start, end int, s []index, trace *queryTrace) ([]K, bool) {
+func (db *DB[K, V]) execPlanOrderedBasicAnchored(q *qx.QX, preds []predicate, active []int, start, end int, s []index, trace *queryTrace) ([]K, bool) {
 	if len(active) < plannerOrderedAnchorMinActive {
 		return nil, false
 	}
@@ -1585,19 +2950,13 @@ func (db *DB[K, V]) execPlanOrderedBasicAnchored(q *qx.QX, preds []plannerPred, 
 		return nil, false
 	}
 
-	leadBudget := uint64(max(
-		plannerOrderedAnchorLeadBudgetMin,
-		min(plannerOrderedAnchorLeadBudgetMax, needWindow*plannerOrderedAnchorLeadNeedMul),
-	))
-	candidateCap := uint64(max(
-		plannerOrderedAnchorCandidateCapMin,
-		min(plannerOrderedAnchorCandidateCapMax, needWindow*plannerOrderedAnchorCandidateNeedMul),
-	))
+	leadBudget, candidateCap := plannerOrderedAnchorBudgets(needWindow, len(active), preds[leadIdx].estCard)
 
-	leadIt := preds[leadIdx].iter()
+	leadIt := preds[leadIdx].newIter()
 	if leadIt == nil {
 		return nil, false
 	}
+	leadNeedsCheck := preds[leadIdx].leadIterNeedsContainsCheck()
 
 	candidates := getRoaringBuf()
 	defer releaseRoaringBuf(candidates)
@@ -1616,11 +2975,11 @@ func (db *DB[K, V]) execPlanOrderedBasicAnchored(q *qx.QX, preds []plannerPred, 
 
 		pass := true
 		for _, pi := range active {
-			if pi == leadIdx {
+			if pi == leadIdx && !leadNeedsCheck {
 				continue
 			}
 			p := preds[pi]
-			if p.contains == nil || !p.contains(idx) {
+			if !p.hasContains() || !p.matches(idx) {
 				pass = false
 				break
 			}
@@ -1650,40 +3009,36 @@ func (db *DB[K, V]) execPlanOrderedBasicAnchored(q *qx.QX, preds []plannerPred, 
 	seenCandidates := uint64(0)
 	scanWidth := uint64(0)
 
-	if db.strkey {
-		db.strmap.RLock()
-		defer db.strmap.RUnlock()
-	}
-
-	emitBucket := func(bm *roaring64.Bitmap) bool {
-		if bm == nil || bm.IsEmpty() {
+	emitBucket := func(bm postingList) bool {
+		if bm.IsEmpty() {
 			return false
 		}
 		scanWidth++
 		if trace != nil {
-			trace.addExamined(bm.GetCardinality())
+			trace.addExamined(bm.Cardinality())
 		}
 
-		it := bm.Iterator()
-		for it.HasNext() {
-			idx := it.Next()
+		stop := false
+		bm.ForEach(func(idx uint64) bool {
 			if !candidates.Contains(idx) {
-				continue
+				return true
 			}
 			seenCandidates++
 
 			if skip > 0 {
 				skip--
-				continue
+				return true
 			}
 
 			out = append(out, db.idFromIdxNoLock(idx))
 			need--
 			if need == 0 {
-				return true
+				stop = true
+				return false
 			}
-		}
-		return false
+			return true
+		})
+		return stop
 	}
 
 	if !o.Desc {
@@ -1723,29 +3078,73 @@ func (db *DB[K, V]) execPlanOrderedBasicAnchored(q *qx.QX, preds []plannerPred, 
 	return out, true
 }
 
-func (db *DB[K, V]) execPlanOrderedBasic(q *qx.QX, preds []plannerPred, trace *queryTrace) ([]K, bool) {
+func (db *DB[K, V]) execPlanOrderedBasic(q *qx.QX, preds []predicate, trace *queryTrace) ([]K, bool) {
 	o := q.Order[0]
 
 	fm := db.fields[o.Field]
 	if fm == nil || fm.Slice {
 		return nil, false
 	}
-	slice := db.index[o.Field]
-	if slice == nil {
+	ov := db.fieldOverlay(o.Field)
+	if !ov.hasData() {
 		return nil, false
 	}
-	s := *slice
-	if len(s) == 0 {
-		return nil, true
+
+	// Fast base-only path preserves anchored/fallback heuristics.
+	if ov.delta == nil {
+		s := ov.base
+		if len(s) == 0 {
+			return nil, true
+		}
+
+		start, end := 0, len(s)
+		var rangeCovered []bool
+		if st, en, cov, ok := db.extractOrderRangeCoveragePreds(o.Field, preds, s); ok {
+			start, end = st, en
+			rangeCovered = cov
+		}
+		if start >= end {
+			return nil, true
+		}
+		for i := range rangeCovered {
+			if rangeCovered[i] {
+				preds[i].covered = true
+			}
+		}
+
+		activeBuf := getIntSliceBuf(len(preds))
+		active := activeBuf.values
+		defer func() {
+			activeBuf.values = active
+			releaseIntSliceBuf(activeBuf)
+		}()
+		for i := range preds {
+			p := preds[i]
+			if p.covered || p.alwaysTrue {
+				continue
+			}
+			if p.alwaysFalse {
+				return nil, true
+			}
+			active = append(active, i)
+		}
+
+		if out, ok := db.execPlanOrderedBasicAnchored(q, preds, active, start, end, s, trace); ok {
+			if trace != nil {
+				trace.setPlan(PlanOrderedAnchor)
+			}
+			return out, true
+		}
+
+		sortActivePredicates(active, preds)
+		return db.execPlanOrderedBasicFallback(q, preds, active, start, end, s, trace), true
 	}
 
-	start, end := 0, len(s)
-	rangeCovered := make([]bool, len(preds))
-	if st, en, cov, ok := db.extractOrderRangeCoveragePreds(o.Field, preds, s); ok {
-		start, end = st, en
-		rangeCovered = cov
+	br, rangeCovered, ok := db.extractOrderRangeCoveragePredsOverlay(o.Field, preds, ov)
+	if !ok {
+		return nil, false
 	}
-	if start >= end {
+	if br.baseStart >= br.baseEnd && br.deltaStart >= br.deltaEnd {
 		return nil, true
 	}
 	for i := range rangeCovered {
@@ -1754,7 +3153,12 @@ func (db *DB[K, V]) execPlanOrderedBasic(q *qx.QX, preds []plannerPred, trace *q
 		}
 	}
 
-	active := make([]int, 0, len(preds))
+	activeBuf := getIntSliceBuf(len(preds))
+	active := activeBuf.values
+	defer func() {
+		activeBuf.values = active
+		releaseIntSliceBuf(activeBuf)
+	}()
 	for i := range preds {
 		p := preds[i]
 		if p.covered || p.alwaysTrue {
@@ -1765,114 +3169,22 @@ func (db *DB[K, V]) execPlanOrderedBasic(q *qx.QX, preds []plannerPred, trace *q
 		}
 		active = append(active, i)
 	}
+	sortActivePredicates(active, preds)
 
-	if out, ok := db.execPlanOrderedBasicAnchored(q, preds, active, start, end, s, trace); ok {
-		if trace != nil {
-			trace.setPlan(PlanOrderedAnchor)
-		}
-		return out, true
-	}
+	out := make([]K, 0, int(q.Limit))
+	cursor := db.newQueryCursor(out, q.Offset, q.Limit, false, nil)
+	scanWidth := uint64(0)
+	scratch := getRoaringBuf()
+	defer releaseRoaringBuf(scratch)
 
-	return db.execPlanOrderedBasicFallback(q, preds, active, start, end, s, trace), true
-}
-
-func (db *DB[K, V]) execPlanOrderedBasicFallback(q *qx.QX, preds []plannerPred, active []int, start, end int, s []index, trace *queryTrace) []K {
-	skip := q.Offset
-	need := q.Limit
-	out := make([]K, 0, need)
-
-	if db.strkey {
-		db.strmap.RLock()
-		defer db.strmap.RUnlock()
-	}
-
-	singleActive := -1
-	if len(active) == 1 {
-		singleActive = active[0]
-	}
-
-	maybeSkipBucket := func(bucket *roaring64.Bitmap) bool {
-		if bucket == nil || bucket.IsEmpty() {
-			return true
-		}
-
-		if skip == 0 {
-			return false
-		}
-
-		if len(active) == 0 {
-			bc := bucket.GetCardinality()
-			if bc <= skip {
-				skip -= bc
-				return true
-			}
-			return false
-		}
-
-		if singleActive >= 0 {
-			if counter := preds[singleActive].bucketCount; counter != nil {
-				cnt, ok := counter(bucket)
-				if ok {
-					if cnt == 0 {
-						return true
-					}
-					if cnt <= skip {
-						skip -= cnt
-						return true
-					}
-				}
-			}
-		}
-
-		return false
-	}
-
-	emit := func(bm *roaring64.Bitmap) bool {
+	emitBucket := func(bm *roaring64.Bitmap) bool {
 		if bm == nil || bm.IsEmpty() {
 			return false
 		}
+		scanWidth++
 		if trace != nil {
 			trace.addExamined(bm.GetCardinality())
 		}
-
-		if len(active) == 0 {
-			it := bm.Iterator()
-			for it.HasNext() {
-				idx := it.Next()
-				if skip > 0 {
-					skip--
-					continue
-				}
-				out = append(out, db.idFromIdxNoLock(idx))
-				need--
-				if need == 0 {
-					return true
-				}
-			}
-			return false
-		}
-
-		if singleActive >= 0 {
-			pred := preds[singleActive]
-			it := bm.Iterator()
-			for it.HasNext() {
-				idx := it.Next()
-				if pred.contains == nil || !pred.contains(idx) {
-					continue
-				}
-				if skip > 0 {
-					skip--
-					continue
-				}
-				out = append(out, db.idFromIdxNoLock(idx))
-				need--
-				if need == 0 {
-					return true
-				}
-			}
-			return false
-		}
-
 		it := bm.Iterator()
 		for it.HasNext() {
 			idx := it.Next()
@@ -1880,7 +3192,7 @@ func (db *DB[K, V]) execPlanOrderedBasicFallback(q *qx.QX, preds []plannerPred, 
 			pass := true
 			for _, pi := range active {
 				p := preds[pi]
-				if p.contains == nil || !p.contains(idx) {
+				if !p.hasContains() || !p.matches(idx) {
 					pass = false
 					break
 				}
@@ -1889,18 +3201,231 @@ func (db *DB[K, V]) execPlanOrderedBasicFallback(q *qx.QX, preds []plannerPred, 
 				continue
 			}
 
+			if cursor.emit(idx) {
+				return true
+			}
+		}
+		return false
+	}
+
+	keyCur := ov.newCursor(br, o.Desc)
+	for {
+		_, baseBM, de, ok := keyCur.next()
+		if !ok {
+			break
+		}
+		bm, owned := composePostingOwned(baseBM, de, scratch)
+		if bm == nil || bm.IsEmpty() {
+			if owned && bm != nil && bm != scratch {
+				releaseRoaringBuf(bm)
+			}
+			continue
+		}
+		done := emitBucket(bm)
+		if owned && bm != scratch {
+			releaseRoaringBuf(bm)
+		}
+		if done {
+			break
+		}
+	}
+
+	if trace != nil {
+		trace.addOrderScanWidth(scanWidth)
+		if cursor.need == 0 {
+			trace.setEarlyStopReason("limit_reached")
+		} else {
+			trace.setEarlyStopReason("order_index_exhausted")
+		}
+	}
+
+	return cursor.out, true
+}
+
+// execPlanOrderedBasicFallback scans ordered buckets and applies remaining
+// predicates when ordered-anchor shortcuts are not available.
+func (db *DB[K, V]) execPlanOrderedBasicFallback(q *qx.QX, preds []predicate, active []int, start, end int, s []index, trace *queryTrace) []K {
+	skip := q.Offset
+	need := q.Limit
+	out := make([]K, 0, need)
+
+	singleActive := -1
+	if len(active) == 1 {
+		singleActive = active[0]
+	}
+
+	bucketScratch := getRoaringBuf()
+	defer releaseRoaringBuf(bucketScratch)
+
+	maybeSkipBucket := func(bucket postingList) bool {
+		if bucket.IsEmpty() {
+			return true
+		}
+		// Fast singleton handling avoids per-bucket bitmap materialization in
+		// high-cardinality ordered scans (common for score/id-like fields).
+		if bucket.isSingleton() {
+			idx := bucket.single
+			if len(active) == 0 {
+				if skip > 0 {
+					skip--
+					return true
+				}
+				return false
+			}
+			for _, pi := range active {
+				p := preds[pi]
+				if !p.hasContains() || !p.matches(idx) {
+					return true
+				}
+			}
 			if skip > 0 {
 				skip--
-				continue
+				return true
+			}
+			return false
+		}
+
+		var (
+			bucketBM    *roaring64.Bitmap
+			bucketOwned bool
+			bucketReady bool
+		)
+		ensureBucketBM := func() *roaring64.Bitmap {
+			if bucketReady {
+				return bucketBM
+			}
+			bucketBM, bucketOwned = bucket.ToBitmapOwned(bucketScratch)
+			bucketReady = true
+			return bucketBM
+		}
+		defer func() {
+			if bucketOwned && bucketBM != nil && bucketBM != bucketScratch {
+				releaseRoaringBuf(bucketBM)
+			}
+		}()
+
+		// For deep-offset scans, quickly prune impossible buckets when any
+		// predicate can prove zero matches at bucket granularity.
+		if skip > 0 && len(active) > 0 {
+			for _, pi := range active {
+				bm := ensureBucketBM()
+				cnt, ok := preds[pi].countBucket(bm)
+				if ok && cnt == 0 {
+					return true
+				}
+			}
+		}
+
+		if skip == 0 {
+			return false
+		}
+
+		if len(active) == 0 {
+			bc := bucket.Cardinality()
+			if bc <= skip {
+				skip -= bc
+				return true
+			}
+			return false
+		}
+
+		if singleActive >= 0 {
+			bm := ensureBucketBM()
+			cnt, ok := preds[singleActive].countBucket(bm)
+			if ok {
+				if cnt == 0 {
+					return true
+				}
+				if cnt <= skip {
+					skip -= cnt
+					return true
+				}
+			}
+		}
+
+		return false
+	}
+
+	emit := func(bm postingList) bool {
+		if bm.IsEmpty() {
+			return false
+		}
+		if trace != nil {
+			trace.addExamined(bm.Cardinality())
+		}
+
+		if len(active) == 0 {
+			// No remaining predicates: emit directly from ordered bucket scan.
+			stop := false
+			bm.ForEach(func(idx uint64) bool {
+				if skip > 0 {
+					skip--
+					return true
+				}
+				out = append(out, db.idFromIdxNoLock(idx))
+				need--
+				if need == 0 {
+					stop = true
+					return false
+				}
+				return true
+			})
+			return stop
+		}
+
+		if singleActive >= 0 {
+			// Single predicate gets a specialized loop to avoid per-row dispatch
+			// overhead in the common one-filter case.
+			pred := preds[singleActive]
+			stop := false
+			bm.ForEach(func(idx uint64) bool {
+				if !pred.hasContains() || !pred.matches(idx) {
+					return true
+				}
+				if skip > 0 {
+					skip--
+					return true
+				}
+				out = append(out, db.idFromIdxNoLock(idx))
+				need--
+				if need == 0 {
+					stop = true
+					return false
+				}
+				return true
+			})
+			return stop
+		}
+
+		stop := false
+		bm.ForEach(func(idx uint64) bool {
+
+			pass := true
+			for _, pi := range active {
+				p := preds[pi]
+				if !p.hasContains() || !p.matches(idx) {
+					pass = false
+					break
+				}
+			}
+			if !pass {
+				return true
+			}
+
+			if skip > 0 {
+				skip--
+				return true
 			}
 
 			out = append(out, db.idFromIdxNoLock(idx))
 			need--
 			if need == 0 {
-				return true
+				stop = true
+				return false
 			}
-		}
-		return false
+			return true
+		})
+		return stop
 	}
 
 	o := q.Order[0]
@@ -1935,24 +3460,55 @@ func (db *DB[K, V]) execPlanOrderedBasicFallback(q *qx.QX, preds []plannerPred, 
 	return out
 }
 
-func (db *DB[K, V]) extractOrderRangeCoveragePreds(field string, preds []plannerPred, s []index) (int, int, []bool, bool) {
+func (db *DB[K, V]) extractOrderRangeCoveragePreds(field string, preds []predicate, s []index) (int, int, []bool, bool) {
+	rb, covered, has, ok := db.collectOrderRangeBounds(field, len(preds), func(i int) qx.Expr {
+		return preds[i].expr
+	})
+	if !ok {
+		return 0, 0, nil, false
+	}
+
+	if !has {
+		return 0, len(s), covered, true
+	}
+
+	st, en := applyBoundsToIndexRange(s, rb)
+	return st, en, covered, true
+}
+
+func (db *DB[K, V]) extractOrderRangeCoveragePredsOverlay(field string, preds []predicate, ov fieldOverlay) (overlayRange, []bool, bool) {
+	rb, covered, _, ok := db.collectOrderRangeBounds(field, len(preds), func(i int) qx.Expr {
+		return preds[i].expr
+	})
+	if !ok {
+		return overlayRange{}, nil, false
+	}
+
+	return ov.rangeForBounds(rb), covered, true
+}
+
+func (db *DB[K, V]) collectOrderRangeBounds(field string, n int, exprAt func(i int) qx.Expr) (rangeBounds, []bool, bool, bool) {
 	var rb rangeBounds
-
-	covered := make([]bool, len(preds))
-
+	var covered []bool
 	has := false
-	for i := range preds {
-		e := preds[i].expr
+	markCovered := func(i int) {
+		if covered == nil {
+			covered = make([]bool, n)
+		}
+		covered[i] = true
+	}
+
+	for i := 0; i < n; i++ {
+		e := exprAt(i)
 		if e.Not || e.Field != field {
 			continue
 		}
 
 		switch e.Op {
-
 		case qx.OpGT, qx.OpGTE, qx.OpLT, qx.OpLTE, qx.OpEQ:
 			k, isSlice, err := db.exprValueToIdxScalar(qx.Expr{Op: e.Op, Field: e.Field, Value: e.Value})
 			if err != nil || isSlice {
-				return 0, 0, nil, false
+				return rangeBounds{}, nil, false, false
 			}
 			switch e.Op {
 			case qx.OpGT:
@@ -1967,25 +3523,19 @@ func (db *DB[K, V]) extractOrderRangeCoveragePreds(field string, preds []planner
 				rb.applyLo(k, true)
 				rb.applyHi(k, true)
 			}
-			covered[i] = true
+			markCovered(i)
 			has = true
-
 		case qx.OpPREFIX:
 			p, isSlice, err := db.exprValueToIdxScalar(qx.Expr{Op: e.Op, Field: e.Field, Value: e.Value})
 			if err != nil || isSlice {
-				return 0, 0, nil, false
+				return rangeBounds{}, nil, false, false
 			}
 			rb.hasPrefix = true
 			rb.prefix = p
-			covered[i] = true
+			markCovered(i)
 			has = true
 		}
 	}
 
-	if !has {
-		return 0, len(s), covered, true
-	}
-
-	st, en := applyBoundsToIndexRange(s, rb)
-	return st, en, covered, true
+	return rb, covered, has, true
 }

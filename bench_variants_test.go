@@ -160,17 +160,13 @@ func openDynamicBenchDB(b *testing.B) (*DB[uint64, UserBench], string) {
 	dir := b.TempDir()
 	path := filepath.Join(dir, "dynamic_bench.db")
 
-	opts := &Options[uint64, UserBench]{
-		DisableIndexLoad:    true,
-		DisableIndexStore:   true,
-		DisableIndexRebuild: true,
-		AnalyzeInterval:     -1,
-	}
+	opts := DefaultOptions()
+	opts.DisableIndexLoad = true
+	opts.DisableIndexStore = true
+	opts.DisableIndexRebuild = true
+	opts.AnalyzeInterval = -1
 
-	db, err := Open[uint64, UserBench](path, 0o600, opts)
-	if err != nil {
-		b.Fatalf("Open: %v", err)
-	}
+	db, _ := openBoltAndNew[uint64, UserBench](b, path, opts)
 	return db, path
 }
 
@@ -221,7 +217,7 @@ func scoreForDynamicProfile(r *rand.Rand, i int, p dynamicBenchProfile, scoreZip
 			}
 			return float64(r.IntN(int(p.scoreBuckets)))
 		}
-		return float64(scoreZipf.Uint64() % maxU64(1, p.scoreBuckets))
+		return float64(scoreZipf.Uint64() % max(1, p.scoreBuckets))
 	default:
 		buckets := p.scoreBuckets
 		if buckets == 0 {
@@ -296,8 +292,8 @@ func seedBenchDataDynamicProfile(b *testing.B, db *DB[uint64, UserBench], profil
 		if len(ids) == 0 {
 			return
 		}
-		if err := db.SetMany(ids, vals); err != nil {
-			b.Fatalf("SetMany(seed dynamic): %v", err)
+		if err := db.BatchSet(ids, vals); err != nil {
+			b.Fatalf("BatchSet(seed dynamic): %v", err)
 		}
 		ids = ids[:0]
 		vals = vals[:0]
@@ -405,30 +401,30 @@ func runQueryKeysBenchWithPlanMetrics(b *testing.B, db *DB[uint64, UserBench], q
 	}
 }
 
-func BenchmarkQueryKeys_Q_DynamicProfiles_Perf(b *testing.B) {
+func Benchmark_Query_Index_Keys_DynamicProfiles_Perf(b *testing.B) {
 	for _, profile := range dynamicBenchProfiles {
-		p := profile
-		b.Run(p.name, func(b *testing.B) {
-			db := buildBenchDBDynamicProfile(b, p)
+		profile := profile
+		b.Run(profile.name, func(b *testing.B) {
+			db := buildBenchDBDynamicProfile(b, profile)
 			for _, qc := range dynamicBenchQueries {
-				q := qc
-				b.Run(q.name, func(b *testing.B) {
-					runQueryKeysBench(b, db, q.query())
+				qc := qc
+				b.Run(qc.name, func(b *testing.B) {
+					runQueryKeysBench(b, db, qc.query())
 				})
 			}
 		})
 	}
 }
 
-func BenchmarkQueryKeys_Q_DynamicProfiles_PlanStability(b *testing.B) {
+func Benchmark_Query_Index_Keys_DynamicProfiles_PlanStability(b *testing.B) {
 	for _, profile := range dynamicBenchProfiles {
-		p := profile
-		b.Run(p.name, func(b *testing.B) {
-			db := buildBenchDBDynamicProfile(b, p)
+		profile := profile
+		b.Run(profile.name, func(b *testing.B) {
+			db := buildBenchDBDynamicProfile(b, profile)
 			for _, qc := range dynamicBenchQueries {
-				q := qc
-				b.Run(q.name, func(b *testing.B) {
-					runQueryKeysBenchWithPlanMetrics(b, db, q.query())
+				qc := qc
+				b.Run(qc.name, func(b *testing.B) {
+					runQueryKeysBenchWithPlanMetrics(b, db, qc.query())
 				})
 			}
 		})

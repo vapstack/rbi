@@ -2,11 +2,20 @@ package rbi
 
 import (
 	"fmt"
+	"unsafe"
 
+	"github.com/RoaringBitmap/roaring/v2/roaring64"
 	"github.com/vapstack/qx"
 )
 
 func (db *DB[K, V]) tryExecutionPlan(q *qx.QX, trace *queryTrace) ([]K, bool, error) {
+	// Execution-plan fast paths support only single-column basic order.
+	// Non-basic order types must stay on planner/bitmap routes.
+	if len(q.Order) > 0 {
+		if len(q.Order) != 1 || q.Order[0].Type != qx.OrderBasic {
+			return nil, false, nil
+		}
+	}
 
 	// optimized path for LIMIT without OFFSET
 	if out, ok, plan, err := db.tryLimitQuery(q); ok {
@@ -86,7 +95,7 @@ func lowerBoundIndex(s []index, key string) int {
 	lo, hi := 0, len(s)
 	for lo < hi {
 		mid := (lo + hi) >> 1
-		if s[mid].Key < key {
+		if compareIndexKeyString(s[mid].Key, key) < 0 {
 			lo = mid + 1
 		} else {
 			hi = mid
@@ -99,7 +108,7 @@ func upperBoundIndex(s []index, key string) int {
 	lo, hi := 0, len(s)
 	for lo < hi {
 		mid := (lo + hi) >> 1
-		if s[mid].Key <= key {
+		if compareIndexKeyString(s[mid].Key, key) <= 0 {
 			lo = mid + 1
 		} else {
 			hi = mid
@@ -118,7 +127,8 @@ func nextPrefixUpperBound(prefix string) (string, bool) {
 			continue
 		}
 		buf[i]++
-		return string(buf[:i+1]), true
+		result := buf[:i+1]
+		return unsafe.String(unsafe.SliceData(result), len(result)), true
 	}
 	return "", false
 }
@@ -127,7 +137,7 @@ func prefixRangeEndIndex(s []index, prefix string, start int) int {
 	if start < 0 || start >= len(s) {
 		return start
 	}
-	if s[start].Key < prefix || len(s[start].Key) < len(prefix) || s[start].Key[:len(prefix)] != prefix {
+	if compareIndexKeyString(s[start].Key, prefix) < 0 || !indexKeyHasPrefixString(s[start].Key, prefix) {
 		return start
 	}
 	if upper, ok := nextPrefixUpperBound(prefix); ok {
@@ -141,8 +151,7 @@ func prefixRangeEndIndex(s []index, prefix string, start int) int {
 	// Extremely rare fallback when prefix consists entirely of 0xFF bytes.
 	end := start
 	for end < len(s) {
-		key := s[end].Key
-		if len(key) < len(prefix) || key[:len(prefix)] != prefix {
+		if !indexKeyHasPrefixString(s[end].Key, prefix) {
 			break
 		}
 		end++
@@ -170,7 +179,9 @@ func (db *DB[K, V]) tryQueryOrderBasicWithLimit(q *qx.QX) ([]K, bool, error) {
 	ops := q.Expr.Operands
 
 	if q.Expr.Op != qx.OpAND {
-		ops = []qx.Expr{q.Expr}
+		var single [1]qx.Expr
+		single[0] = q.Expr
+		ops = single[:]
 	}
 
 	f := order.Field
@@ -179,27 +190,26 @@ func (db *DB[K, V]) tryQueryOrderBasicWithLimit(q *qx.QX) ([]K, bool, error) {
 		return nil, false, nil
 	}
 
-	slice := db.index[f]
-	if slice == nil {
-		return nil, false, nil
-	}
-	s := *slice
-	if len(s) == 0 {
+	ov := db.fieldOverlay(f)
+	if !ov.hasData() {
+		if !db.hasFieldIndex(f) {
+			return nil, false, nil
+		}
 		return nil, true, nil
 	}
 
 	var rb rangeBounds
 
-	baseOps := make([]qx.Expr, 0, len(ops))
+	var baseOps []qx.Expr
+	var baseOpsStack [8]qx.Expr
+	if len(ops) <= len(baseOpsStack) {
+		baseOps = baseOpsStack[:0]
+	} else {
+		baseOps = make([]qx.Expr, 0, len(ops))
+	}
 
 	for _, op := range ops {
 		if op.Not {
-			return nil, false, nil
-		}
-		// Prefix on a non-ordered field is typically expensive with this plan:
-		// it forces broad ordered-field traversal plus per-id contains checks.
-		// Let planner paths handle this shape instead.
-		if op.Op == qx.OpPREFIX && op.Field != f {
 			return nil, false, nil
 		}
 		if op.Field == f {
@@ -237,7 +247,11 @@ func (db *DB[K, V]) tryQueryOrderBasicWithLimit(q *qx.QX) ([]K, bool, error) {
 
 	if len(baseOps) == 0 {
 		bm := getRoaringBuf()
-		bm.Or(db.universe)
+		universe, owned := db.snapshotUniverseView()
+		bm.Or(universe)
+		if owned {
+			releaseRoaringBuf(universe)
+		}
 		base = bitmap{bm: bm}
 
 	} else if len(baseOps) == 1 {
@@ -267,31 +281,14 @@ func (db *DB[K, V]) tryQueryOrderBasicWithLimit(q *qx.QX) ([]K, bool, error) {
 	}
 	defer base.release()
 
-	start := 0
-	end := len(s)
+	baseBM := base.bm
+	baseNegUniverse := base.neg && (baseBM == nil || baseBM.IsEmpty())
+	if !base.neg && (baseBM == nil || baseBM.IsEmpty()) {
+		return nil, true, nil
+	}
 
-	if rb.hasLo {
-		start = lowerBoundIndex(s, rb.loKey)
-		if !rb.loInc {
-			if start < len(s) && s[start].Key == rb.loKey {
-				start++
-			}
-		}
-	}
-	if rb.hasHi {
-		if rb.hiInc {
-			end = upperBoundIndex(s, rb.hiKey)
-		} else {
-			end = lowerBoundIndex(s, rb.hiKey)
-		}
-	}
-	if start < 0 {
-		start = 0
-	}
-	if end > len(s) {
-		end = len(s)
-	}
-	if start >= end {
+	br := ov.rangeForBounds(rb)
+	if br.baseStart >= br.baseEnd && br.deltaStart >= br.deltaEnd {
 		return nil, true, nil
 	}
 
@@ -301,107 +298,135 @@ func (db *DB[K, V]) tryQueryOrderBasicWithLimit(q *qx.QX) ([]K, bool, error) {
 	out := make([]K, 0, need)
 	cursor := db.newQueryCursor(out, skip, need, false, nil)
 
-	if db.strkey {
-		db.strmap.RLock()
-		defer db.strmap.RUnlock()
-	}
-
 	tmp := getRoaringBuf()
 	defer releaseRoaringBuf(tmp)
+	var scratch *roaring64.Bitmap
+	if ov.delta != nil {
+		scratch = getRoaringBuf()
+		defer releaseRoaringBuf(scratch)
+	}
 
 	contains := func(idx uint64) bool {
 		if base.neg {
-			if base.bm == nil || base.bm.IsEmpty() {
+			if baseNegUniverse {
 				return true // NOT empty == universe
 			}
-			return !base.bm.Contains(idx)
+			return !baseBM.Contains(idx)
 		}
-		if base.bm == nil || base.bm.IsEmpty() {
-			return false
-		}
-		return base.bm.Contains(idx)
+		return baseBM.Contains(idx)
 	}
 
-	if !order.Desc {
-		for i := start; i < end; i++ {
-			// fast path check
-			if card := s[i].IDs.GetCardinality(); card <= iteratorThreshold || (0 < cursor.need && cursor.need < 1000) {
-				if card == 0 {
-					continue
+	keyCur := ov.newCursor(br, order.Desc)
+	if ov.delta == nil {
+		for {
+			_, ids, _, ok := keyCur.next()
+			if !ok {
+				break
+			}
+			if ids.IsEmpty() {
+				continue
+			}
+
+			if card := ids.Cardinality(); card <= iteratorThreshold || (0 < cursor.need && cursor.need < 1000) {
+				if ids.isSingleton() {
+					idx := ids.single
+					if contains(idx) && cursor.emit(idx) {
+						return cursor.out, true, nil
+					}
+				} else {
+					it := ids.bitmap().Iterator()
+					for it.HasNext() {
+						idx := it.Next()
+						if !contains(idx) {
+							continue
+						}
+						if cursor.emit(idx) {
+							return cursor.out, true, nil
+						}
+					}
 				}
-				// manual iteration
-				it := s[i].IDs.Iterator()
+				continue
+			}
+
+			if base.neg {
+				tmp.Xor(tmp)
+				ids.OrInto(tmp)
+				if !baseNegUniverse {
+					tmp.AndNot(baseBM)
+				}
+			} else {
+				tmpORSmallestANDPosting(tmp, ids, baseBM)
+			}
+			if tmp.IsEmpty() {
+				continue
+			}
+			if cursor.emitBitmap(tmp) {
+				return cursor.out, true, nil
+			}
+		}
+		return cursor.out, true, nil
+	}
+
+	for {
+		_, bucketIDs, de, ok := keyCur.next()
+		if !ok {
+			break
+		}
+		bm, owned := composePostingOwned(bucketIDs, de, scratch)
+		if bm == nil || bm.IsEmpty() {
+			if owned && bm != nil && bm != scratch {
+				releaseRoaringBuf(bm)
+			}
+			continue
+		}
+
+		if card := bm.GetCardinality(); card <= iteratorThreshold || (0 < cursor.need && cursor.need < 1000) {
+			if card == 1 {
+				idx := bm.Minimum()
+				if contains(idx) && cursor.emit(idx) {
+					if owned && bm != scratch {
+						releaseRoaringBuf(bm)
+					}
+					return cursor.out, true, nil
+				}
+			} else {
+				it := bm.Iterator()
 				for it.HasNext() {
 					idx := it.Next()
 					if !contains(idx) {
 						continue
 					}
 					if cursor.emit(idx) {
+						if owned && bm != scratch {
+							releaseRoaringBuf(bm)
+						}
 						return cursor.out, true, nil
 					}
 				}
-				continue
 			}
-
-			if base.neg {
-				tmp.Xor(tmp)
-				tmp.Or(s[i].IDs)
-				if base.bm != nil && !base.bm.IsEmpty() {
-					tmp.AndNot(base.bm)
-				}
-			} else {
-				if base.bm == nil || base.bm.IsEmpty() {
-					continue
-				}
-				tmpORSmallestAND(tmp, s[i].IDs, base.bm)
+			if owned && bm != scratch {
+				releaseRoaringBuf(bm)
 			}
-			if tmp.IsEmpty() {
-				continue
-			}
-			if cursor.emitBitmap(tmp) {
-				return cursor.out, true, nil
-			}
+			continue
 		}
-	} else {
-		for i := end - 1; i >= start; i-- {
-			if card := s[i].IDs.GetCardinality(); card <= iteratorThreshold || (0 < cursor.need && cursor.need < 1000) {
-				if card == 0 {
-					continue
-				}
-				iter := s[i].IDs.Iterator()
-				for iter.HasNext() {
-					idx := iter.Next()
-					if !contains(idx) {
-						continue
-					}
-					if cursor.emit(idx) {
-						return cursor.out, true, nil
-					}
-				}
-				continue
-			}
 
-			if base.neg {
-				tmp.Xor(tmp)
-				tmp.Or(s[i].IDs)
-				if base.bm != nil && !base.bm.IsEmpty() {
-					tmp.AndNot(base.bm)
-				}
-			} else {
-				if base.bm == nil || base.bm.IsEmpty() {
-					continue
-				}
-				tmpORSmallestAND(tmp, s[i].IDs, base.bm)
+		if base.neg {
+			tmp.Xor(tmp)
+			tmp.Or(bm)
+			if !baseNegUniverse {
+				tmp.AndNot(baseBM)
 			}
-			if tmp.IsEmpty() {
-				continue
-			}
-			if cursor.emitBitmap(tmp) {
-				return cursor.out, true, nil
-			}
-			if i == start {
-				break
-			}
+		} else {
+			tmpORSmallestAND(tmp, bm, baseBM)
+		}
+		if owned && bm != scratch {
+			releaseRoaringBuf(bm)
+		}
+		if tmp.IsEmpty() {
+			continue
+		}
+		if cursor.emitBitmap(tmp) {
+			return cursor.out, true, nil
 		}
 	}
 
@@ -428,26 +453,30 @@ func (db *DB[K, V]) tryQueryOrderPrefixWithLimit(q *qx.QX) ([]K, bool, error) {
 		return nil, false, nil
 	}
 
-	slice := db.index[f]
-	if slice == nil {
-		return nil, false, nil
-	}
-	s := *slice
-	if len(s) == 0 {
+	ov := db.fieldOverlay(f)
+	if !ov.hasData() {
 		return nil, true, nil
 	}
 
 	expr := q.Expr
 	ops := expr.Operands
 	if expr.Op != qx.OpAND {
-		ops = []qx.Expr{expr}
+		var single [1]qx.Expr
+		single[0] = expr
+		ops = single[:]
 	}
 
 	var (
 		hasPrefix bool
 		prefix    string
-		baseOps   = make([]qx.Expr, 0, len(ops))
+		baseOps   []qx.Expr
 	)
+	var baseOpsStack [8]qx.Expr
+	if len(ops) <= len(baseOpsStack) {
+		baseOps = baseOpsStack[:0]
+	} else {
+		baseOps = make([]qx.Expr, 0, len(ops))
+	}
 
 	for _, op := range ops {
 		if op.Not {
@@ -476,7 +505,11 @@ func (db *DB[K, V]) tryQueryOrderPrefixWithLimit(q *qx.QX) ([]K, bool, error) {
 
 	if len(baseOps) == 0 {
 		bm := getRoaringBuf()
-		bm.Or(db.universe)
+		universe, owned := db.snapshotUniverseView()
+		bm.Or(universe)
+		if owned {
+			releaseRoaringBuf(universe)
+		}
 		base = bitmap{bm: bm}
 
 	} else if len(baseOps) == 1 {
@@ -503,9 +536,18 @@ func (db *DB[K, V]) tryQueryOrderPrefixWithLimit(q *qx.QX) ([]K, bool, error) {
 	}
 	defer base.release()
 
-	start := lowerBoundIndex(s, prefix)
-	end := prefixRangeEndIndex(s, prefix, start)
-	if start >= end {
+	baseBM := base.bm
+	baseNegUniverse := base.neg && (baseBM == nil || baseBM.IsEmpty())
+	if !base.neg && (baseBM == nil || baseBM.IsEmpty()) {
+		return nil, true, nil
+	}
+
+	br := ov.rangeForBounds(rangeBounds{
+		has:       true,
+		hasPrefix: true,
+		prefix:    prefix,
+	})
+	if br.baseStart >= br.baseEnd && br.deltaStart >= br.deltaEnd {
 		return nil, true, nil
 	}
 
@@ -514,28 +556,39 @@ func (db *DB[K, V]) tryQueryOrderPrefixWithLimit(q *qx.QX) ([]K, bool, error) {
 	out := make([]K, 0, need)
 	cursor := db.newQueryCursor(out, skip, need, false, nil)
 
-	if db.strkey {
-		db.strmap.RLock()
-		defer db.strmap.RUnlock()
-	}
-
 	contains := func(idx uint64) bool {
 		if base.neg {
-			if base.bm == nil || base.bm.IsEmpty() {
+			if baseNegUniverse {
 				return true // NOT empty == universe
 			}
-			return !base.bm.Contains(idx)
+			return !baseBM.Contains(idx)
 		}
-		if base.bm == nil || base.bm.IsEmpty() {
-			return false
-		}
-		return base.bm.Contains(idx)
+		return baseBM.Contains(idx)
 	}
 
-	if !ord.Desc {
+	var scratch *roaring64.Bitmap
+	if ov.delta != nil {
+		scratch = getRoaringBuf()
+		defer releaseRoaringBuf(scratch)
+	}
 
-		for i := start; i < end; i++ {
-			iter := s[i].IDs.Iterator()
+	keyCur := ov.newCursor(br, ord.Desc)
+	if ov.delta == nil {
+		for {
+			_, ids, _, ok := keyCur.next()
+			if !ok {
+				break
+			}
+			if ids.IsEmpty() {
+				continue
+			}
+			if ids.isSingleton() {
+				if contains(ids.single) && cursor.emit(ids.single) {
+					return cursor.out, true, nil
+				}
+				continue
+			}
+			iter := ids.bitmap().Iterator()
 			for iter.HasNext() {
 				idx := iter.Next()
 				if !contains(idx) {
@@ -546,23 +599,36 @@ func (db *DB[K, V]) tryQueryOrderPrefixWithLimit(q *qx.QX) ([]K, bool, error) {
 				}
 			}
 		}
+		return cursor.out, true, nil
+	}
 
-	} else {
-
-		for i := end - 1; i >= start; i-- {
-			iter := s[i].IDs.Iterator()
-			for iter.HasNext() {
-				idx := iter.Next()
-				if !contains(idx) {
-					continue
-				}
-				if cursor.emit(idx) {
-					return cursor.out, true, nil
-				}
+	for {
+		_, baseIDs, de, ok := keyCur.next()
+		if !ok {
+			break
+		}
+		bm, owned := composePostingOwned(baseIDs, de, scratch)
+		if bm == nil || bm.IsEmpty() {
+			if owned && bm != nil && bm != scratch {
+				releaseRoaringBuf(bm)
 			}
-			if i == start {
-				break
+			continue
+		}
+		iter := bm.Iterator()
+		for iter.HasNext() {
+			idx := iter.Next()
+			if !contains(idx) {
+				continue
 			}
+			if cursor.emit(idx) {
+				if owned && bm != scratch {
+					releaseRoaringBuf(bm)
+				}
+				return cursor.out, true, nil
+			}
+		}
+		if owned && bm != scratch {
+			releaseRoaringBuf(bm)
 		}
 	}
 
@@ -600,12 +666,8 @@ func (db *DB[K, V]) tryQueryRangeNoOrderWithLimit(q *qx.QX) ([]K, bool, error) {
 		return nil, false, nil
 	}
 
-	slice := db.index[f]
-	if slice == nil {
-		return nil, false, nil
-	}
-	s := *slice
-	if len(s) == 0 {
+	ov := db.fieldOverlay(f)
+	if !ov.hasData() {
 		return nil, true, nil
 	}
 
@@ -617,38 +679,23 @@ func (db *DB[K, V]) tryQueryRangeNoOrderWithLimit(q *qx.QX) ([]K, bool, error) {
 		return nil, false, nil
 	}
 
-	start := 0
-	end := len(s)
-
-	lo := lowerBoundIndex(s, key)
-
+	rb := rangeBounds{has: true}
 	switch e.Op {
 	case qx.OpGT:
-		start = lo
-		if start < len(s) && s[start].Key == key {
-			start++
-		}
+		rb.applyLo(key, false)
 	case qx.OpGTE:
-		start = lo
+		rb.applyLo(key, true)
 	case qx.OpLT:
-		end = lo
+		rb.applyHi(key, false)
 	case qx.OpLTE:
-		end = upperBoundIndex(s, key)
+		rb.applyHi(key, true)
 	case qx.OpEQ:
-		start = lo
-		if start >= len(s) || s[start].Key != key {
-			return nil, true, nil
-		}
-		end = start + 1
+		rb.applyLo(key, true)
+		rb.applyHi(key, true)
 	}
 
-	if start < 0 {
-		start = 0
-	}
-	if end > len(s) {
-		end = len(s)
-	}
-	if start >= end {
+	br := ov.rangeForBounds(rb)
+	if br.baseStart >= br.baseEnd && br.deltaStart >= br.deltaEnd {
 		return nil, true, nil
 	}
 
@@ -658,17 +705,61 @@ func (db *DB[K, V]) tryQueryRangeNoOrderWithLimit(q *qx.QX) ([]K, bool, error) {
 	out := make([]K, 0, need)
 	cursor := db.newQueryCursor(out, skip, need, false, nil)
 
-	if db.strkey {
-		db.strmap.RLock()
-		defer db.strmap.RUnlock()
+	var scratch *roaring64.Bitmap
+	if ov.delta != nil {
+		scratch = getRoaringBuf()
+		defer releaseRoaringBuf(scratch)
 	}
 
-	for i := start; i < end; i++ {
-		it := s[i].IDs.Iterator()
+	keyCur := ov.newCursor(br, false)
+	if ov.delta == nil {
+		for {
+			_, ids, _, ok := keyCur.next()
+			if !ok {
+				break
+			}
+			if ids.IsEmpty() {
+				continue
+			}
+			if ids.isSingleton() {
+				if cursor.emit(ids.single) {
+					return cursor.out, true, nil
+				}
+				continue
+			}
+			it := ids.bitmap().Iterator()
+			for it.HasNext() {
+				if cursor.emit(it.Next()) {
+					return cursor.out, true, nil
+				}
+			}
+		}
+		return cursor.out, true, nil
+	}
+
+	for {
+		_, baseIDs, de, ok := keyCur.next()
+		if !ok {
+			break
+		}
+		bm, owned := composePostingOwned(baseIDs, de, scratch)
+		if bm == nil || bm.IsEmpty() {
+			if owned && bm != nil && bm != scratch {
+				releaseRoaringBuf(bm)
+			}
+			continue
+		}
+		it := bm.Iterator()
 		for it.HasNext() {
 			if cursor.emit(it.Next()) {
+				if owned && bm != scratch {
+					releaseRoaringBuf(bm)
+				}
 				return cursor.out, true, nil
 			}
+		}
+		if owned && bm != scratch {
+			releaseRoaringBuf(bm)
 		}
 	}
 
@@ -706,18 +797,20 @@ func (db *DB[K, V]) tryQueryPrefixNoOrderWithLimit(q *qx.QX) ([]K, bool, error) 
 		return nil, false, nil
 	}
 
-	slice := db.index[e.Field]
-	if slice == nil {
-		return nil, true, fmt.Errorf("no index for field: %v", e.Field)
-	}
-	s := *slice
-	if len(s) == 0 {
+	ov := db.fieldOverlay(e.Field)
+	if !ov.hasData() {
+		if !db.hasFieldIndex(e.Field) {
+			return nil, true, fmt.Errorf("no index for field: %v", e.Field)
+		}
 		return nil, true, nil
 	}
 
-	start := lowerBoundIndex(s, prefix)
-	end := prefixRangeEndIndex(s, prefix, start)
-	if start >= end {
+	br := ov.rangeForBounds(rangeBounds{
+		has:       true,
+		hasPrefix: true,
+		prefix:    prefix,
+	})
+	if br.baseStart >= br.baseEnd && br.deltaStart >= br.deltaEnd {
 		return nil, true, nil
 	}
 
@@ -726,17 +819,61 @@ func (db *DB[K, V]) tryQueryPrefixNoOrderWithLimit(q *qx.QX) ([]K, bool, error) 
 	out := make([]K, 0, need)
 	cursor := db.newQueryCursor(out, skip, need, false, nil)
 
-	if db.strkey {
-		db.strmap.RLock()
-		defer db.strmap.RUnlock()
+	var scratch *roaring64.Bitmap
+	if ov.delta != nil {
+		scratch = getRoaringBuf()
+		defer releaseRoaringBuf(scratch)
 	}
 
-	for i := start; i < end; i++ {
-		it := s[i].IDs.Iterator()
+	keyCur := ov.newCursor(br, false)
+	if ov.delta == nil {
+		for {
+			_, ids, _, ok := keyCur.next()
+			if !ok {
+				break
+			}
+			if ids.IsEmpty() {
+				continue
+			}
+			if ids.isSingleton() {
+				if cursor.emit(ids.single) {
+					return cursor.out, true, nil
+				}
+				continue
+			}
+			it := ids.bitmap().Iterator()
+			for it.HasNext() {
+				if cursor.emit(it.Next()) {
+					return cursor.out, true, nil
+				}
+			}
+		}
+		return cursor.out, true, nil
+	}
+
+	for {
+		_, baseIDs, de, ok := keyCur.next()
+		if !ok {
+			break
+		}
+		bm, owned := composePostingOwned(baseIDs, de, scratch)
+		if bm == nil || bm.IsEmpty() {
+			if owned && bm != nil && bm != scratch {
+				releaseRoaringBuf(bm)
+			}
+			continue
+		}
+		it := bm.Iterator()
 		for it.HasNext() {
 			if cursor.emit(it.Next()) {
+				if owned && bm != scratch {
+					releaseRoaringBuf(bm)
+				}
 				return cursor.out, true, nil
 			}
+		}
+		if owned && bm != scratch {
+			releaseRoaringBuf(bm)
 		}
 	}
 

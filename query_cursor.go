@@ -56,20 +56,3 @@ func (c *queryCursor[K, V]) emitBitmap(bm *roaring64.Bitmap) bool {
 	}
 	return false
 }
-
-func (c *queryCursor[K, V]) emitBitmapIf(bm *roaring64.Bitmap, keep func(uint64) bool) bool {
-	if bm == nil || bm.IsEmpty() {
-		return false
-	}
-	it := bm.Iterator()
-	for it.HasNext() {
-		idx := it.Next()
-		if keep != nil && !keep(idx) {
-			continue
-		}
-		if c.emit(idx) {
-			return true
-		}
-	}
-	return false
-}

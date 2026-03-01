@@ -183,111 +183,119 @@ func (db *DB[K, V]) populateFields(t reflect.Type, idx []int) error {
 }
 
 type getterFn func(ptr unsafe.Pointer) (string, []string, bool)
+type valueGetterFn func(fv reflect.Value) (string, []string, bool)
 
-var nilValue = "\x00NIL"
+const nilValue = "\xFFNIL"
 
 func (db *DB[K, V]) makeGetter(f *field) (getterFn, error) {
+	sub, err := db.makeFieldValueGetter(f)
+	if err != nil {
+		return nil, err
+	}
+	return db.fieldGetter(f.Index, sub), nil
+}
 
+func (db *DB[K, V]) makeFieldValueGetter(f *field) (valueGetterFn, error) {
 	if f.UseVI {
 		if f.Slice {
-			return db.fieldGetter(f.Index, func(fv reflect.Value) (single string, multi []string) {
+			return func(fv reflect.Value) (single string, multi []string, ok bool) {
 				if fv.Len() == 0 {
-					return "", nil
+					return "", nil, true
 				}
 				s := make([]string, fv.Len())
 				for i := 0; i < len(s); i++ {
 					s[i] = fv.Index(i).Interface().(ValueIndexer).IndexingValue()
 				}
-				return "", s
-			}), nil
+				return "", s, true
+			}, nil
 		} else {
-			return db.fieldGetter(f.Index, func(fv reflect.Value) (single string, multi []string) {
-				return fv.Interface().(ValueIndexer).IndexingValue(), nil
-			}), nil
+			return func(fv reflect.Value) (single string, multi []string, ok bool) {
+				return fv.Interface().(ValueIndexer).IndexingValue(), nil, true
+			}, nil
 		}
 	}
 
-	var fn func(fv reflect.Value) (string, []string)
+	var fn valueGetterFn
 
 	switch f.Kind {
 
 	case reflect.String:
 		if f.Slice {
-			fn = func(fv reflect.Value) (string, []string) {
+			fn = func(fv reflect.Value) (string, []string, bool) {
 				if fv.Len() == 0 {
-					return "", nil
+					return "", nil, true
 				}
 				s := make([]string, fv.Len())
 				for i := 0; i < len(s); i++ {
 					s[i] = fv.Index(i).String()
 				}
-				return "", s
+				return "", s, true
 			}
 		} else {
-			fn = func(fv reflect.Value) (string, []string) {
+			fn = func(fv reflect.Value) (string, []string, bool) {
 				if f.Ptr {
 					if fv.IsNil() {
-						return nilValue, nil
+						return nilValue, nil, true
 					}
 					fv = fv.Elem()
 				}
-				return fv.String(), nil
+				return fv.String(), nil, true
 			}
 		}
 
 	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
 		if f.Slice {
-			fn = func(fv reflect.Value) (string, []string) {
+			fn = func(fv reflect.Value) (string, []string, bool) {
 				if fv.Len() == 0 {
-					return "", nil
+					return "", nil, true
 				}
 				s := make([]string, fv.Len())
 				for i := 0; i < len(s); i++ {
 					s[i] = uint64ByteStr(fv.Index(i).Uint())
 				}
-				return "", s
+				return "", s, true
 			}
 		} else {
-			fn = func(fv reflect.Value) (string, []string) {
+			fn = func(fv reflect.Value) (string, []string, bool) {
 				if f.Ptr {
 					if fv.IsNil() {
-						return nilValue, nil
+						return nilValue, nil, true
 					}
 					fv = fv.Elem()
 				}
-				return uint64ByteStr(fv.Uint()), nil
+				return uint64ByteStr(fv.Uint()), nil, true
 			}
 		}
 
 	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
 		if f.Slice {
-			fn = func(fv reflect.Value) (string, []string) {
+			fn = func(fv reflect.Value) (string, []string, bool) {
 				if fv.Len() == 0 {
-					return "", nil
+					return "", nil, true
 				}
 				s := make([]string, fv.Len())
 				for i := 0; i < len(s); i++ {
 					s[i] = int64ByteStr(fv.Index(i).Int())
 				}
-				return "", s
+				return "", s, true
 			}
 		} else {
-			fn = func(fv reflect.Value) (string, []string) {
+			fn = func(fv reflect.Value) (string, []string, bool) {
 				if f.Ptr {
 					if fv.IsNil() {
-						return nilValue, nil
+						return nilValue, nil, true
 					}
 					fv = fv.Elem()
 				}
-				return int64ByteStr(fv.Int()), nil
+				return int64ByteStr(fv.Int()), nil, true
 			}
 		}
 
 	case reflect.Bool:
 		if f.Slice {
-			fn = func(fv reflect.Value) (string, []string) {
+			fn = func(fv reflect.Value) (string, []string, bool) {
 				if fv.Len() == 0 {
-					return "", nil
+					return "", nil, true
 				}
 				s := make([]string, fv.Len())
 				for i := 0; i < len(s); i++ {
@@ -297,45 +305,45 @@ func (db *DB[K, V]) makeGetter(f *field) (getterFn, error) {
 						s[i] = "0"
 					}
 				}
-				return "", s
+				return "", s, true
 			}
 		} else {
-			fn = func(fv reflect.Value) (string, []string) {
+			fn = func(fv reflect.Value) (string, []string, bool) {
 				if f.Ptr {
 					if fv.IsNil() {
-						return nilValue, nil
+						return nilValue, nil, true
 					}
 					fv = fv.Elem()
 				}
 				if fv.Bool() {
-					return "1", nil
+					return "1", nil, true
 				} else {
-					return "0", nil
+					return "0", nil, true
 				}
 			}
 		}
 
 	case reflect.Float32, reflect.Float64:
 		if f.Slice {
-			fn = func(fv reflect.Value) (string, []string) {
+			fn = func(fv reflect.Value) (string, []string, bool) {
 				if fv.Len() == 0 {
-					return "", nil
+					return "", nil, true
 				}
 				s := make([]string, fv.Len())
 				for i := 0; i < len(s); i++ {
 					s[i] = float64ByteStr(fv.Index(i).Float())
 				}
-				return "", s
+				return "", s, true
 			}
 		} else {
-			fn = func(fv reflect.Value) (string, []string) {
+			fn = func(fv reflect.Value) (string, []string, bool) {
 				if f.Ptr {
 					if fv.IsNil() {
-						return nilValue, nil
+						return nilValue, nil, true
 					}
 					fv = fv.Elem()
 				}
-				return float64ByteStr(fv.Float()), nil
+				return float64ByteStr(fv.Float()), nil, true
 			}
 		}
 
@@ -343,10 +351,10 @@ func (db *DB[K, V]) makeGetter(f *field) (getterFn, error) {
 		return nil, fmt.Errorf("unknown or unsupported field kind: %v", f.Kind)
 	}
 
-	return db.fieldGetter(f.Index, fn), nil
+	return fn, nil
 }
 
-func (db *DB[K, V]) fieldGetter(idx []int, sub func(fv reflect.Value) (string, []string)) getterFn {
+func (db *DB[K, V]) fieldGetter(idx []int, sub valueGetterFn) getterFn {
 	return func(ptr unsafe.Pointer) (string, []string, bool) {
 		if ptr == nil {
 			return "", nil, false
@@ -355,8 +363,7 @@ func (db *DB[K, V]) fieldGetter(idx []int, sub func(fv reflect.Value) (string, [
 		if !fv.IsValid() {
 			return "", nil, false
 		}
-		single, multi := sub(fv.FieldByIndex(idx))
-		return single, multi, true
+		return sub(fv.FieldByIndex(idx))
 	}
 }
 

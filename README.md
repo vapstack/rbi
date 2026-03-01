@@ -1,24 +1,24 @@
 # rbi
 
-[![GoDoc](https://godoc.org/github.com/vapstack/rbi?status.svg)](https://godoc.org/github.com/vapstack/rbi)
+[![GoDoc](https://pkg.go.dev/badge/github.com/vapstack/rbi.svg)](https://pkg.go.dev/github.com/vapstack/rbi)
 [![License](https://img.shields.io/badge/license-Apache2-blue.svg)](https://raw.githubusercontent.com/vapstack/rbi/master/LICENSE)
 
 > This package should be considered experimental.
 
 ## Roaring Bolt Indexer
 
-A secondary index layer for [bbolt](https://github.com/etcd-io/bbolt) written in pure Go.
+A secondary index layer for [bbolt](https://github.com/etcd-io/bbolt).
 
-It turns a simple key-value store into a document-oriented database with rich
+It turns a key-value store into a document-oriented database with rich
 query capabilities, while preserving bbolt’s ACID guarantees for data storage.
 Indexes are kept fully in memory and built on top of
-[roaring64](https://github.com/RoaringBitmap/roaring) for fast set operations, ordering, and filtering.
+[roaring64](https://github.com/RoaringBitmap/roaring) for fast set operations.
 
-### Key Properties
+### Properties
 
 * **ACID** – data durability is delegated to bbolt.
-* **Index-only queries** – queries are evaluated via in-memory indexes; disk is never touched.
-* **Document-oriented** – queries select whole records, not individual fields.
+* **Index-only filtering** – disk is never touched.
+* **Document-oriented** – queries return whole records, not individual fields.
 * **Strong typing** – generic API with user-defined key and value types.
 
 ### Features
@@ -32,10 +32,15 @@ Indexes are kept fully in memory and built on top of
     - logical: `AND`, `OR`, `NOT`
 * Index-based ordering with offset / limit
 * Partial updates (`Patch*`) with minimal index churn
-* Batch writes (`SetMany`, `PatchMany`)
+* Batch writes (`BatchSet`, `BatchPatch`, `BatchDelete`)
 * Uniqueness constraints
 
-## Quick Start
+### LLM notice
+Starting from v0.7, parts of the code, documentation and tests were created 
+or improved with the assistance of LLM. Code created with LLM has been tested 
+and verified, but may still contain inefficiencies.
+
+## Usage
 
 ```go
 package main
@@ -45,6 +50,7 @@ import (
 
     "github.com/vapstack/qx"
     "github.com/vapstack/rbi"
+    "go.etcd.io/bbolt"
 )
 
 type User struct {
@@ -59,11 +65,17 @@ type User struct {
 
 func main() {
 
-    db, err := rbi.Open[uint64, User]("test.db", 0600, nil)
+    bolt, err := bbolt.Open("test.db", 0600, nil)
     if err != nil {
         panic(err)
     }
+    db, err := rbi.New[uint64, User](bolt, nil)
+    if err != nil {
+        _ = bolt.Close()
+        panic(err)
+    }
     defer db.Close()
+    defer bolt.Close()
 
     err = db.Set(1, &User{
         Name:   "Alice",
@@ -76,7 +88,7 @@ func main() {
     }
 
     err = db.Set(2, &User{
-		ID:     2,
+        ID:     2,
         Name:   "Bob",
         Age:    40,
         Active: false,
@@ -111,17 +123,19 @@ func main() {
 
 ## API
 
-For the full API reference see the
-[GoDoc](https://godoc.org/github.com/vapstack/rbi).
+For the full API reference see
+[GoDoc](https://pkg.go.dev/github.com/vapstack/rbi).
 
-### Writing Data
+### Writing data
 
 * `Set(id, value)` – insert or replace a record and update affected indexes.
-* `SetMany(ids, values)` – batch variant of `Set`, significantly faster for bulk inserts.
+* `BatchSet(ids, values)` – batch variant of `Set`, significantly faster for bulk inserts.
 * `Patch(id, fields)` – apply partial updates and update only changed indexes.
-* `PatchMany(ids, fields)` – patch multiple records with the same set of values.
+* `PatchStrict(id, fields)` – like `Patch`, but fails on unknown fields.
+* `PatchIfExists(id, fields)` / `PatchStrictIfExists(id, fields)` – patch only existing records.
+* `BatchPatch(ids, fields)` / `BatchPatchStrict(ids, fields)` – batch patch variants.
 * `Delete(id)` – remove a record and its index entries.
-* `DeleteMany(ids)` – batch variant of `Delete`.
+* `BatchDelete(ids)` – batch variant of `Delete`.
 
 ### Querying
 
@@ -152,19 +166,18 @@ Query methods:
 * `QueryKeys(q)` – return matching IDs
 * `Count(q)` – return result cardinality (ignoring offset/limit)
 
-## Query Execution Model
+## Query execution model
 
 Queries run entirely in-memory; stored records are never scanned.
 
 The runtime uses a single planner/executor pipeline:
-
 1. Normalize query tree into a deterministic internal form.
 2. Compile leaf predicates into bitmap/iterator-backed checks.
 3. Select an execution strategy by shape and cost.
 4. Execute using shared iterator/bitmap contracts and tracing hooks.
 
 Leaf predicates are resolved via field indexes, producing either bitmaps
-of matching record IDs or index-backed iterators with `Contains(id)` checks.
+of matching record IDs or index-backed iterators.
 Logical operators (`AND`, `OR`, `NOT`) are applied using bitmap operations;
 large result sets may be represented as negative sets to avoid materializing
 large bitmaps.
@@ -181,8 +194,43 @@ Only the final set of matching record IDs is materialized.
 For `QueryItems`, record values are fetched from bbolt only for IDs that have
 passed all filters and limits.
 
-> Planner statistics, tracing and calibration can be enabled via options to
-> tune strategy selection for real workloads.
+`QueryItems` runs against an index snapshot aligned with a bbolt read transaction.
+When an exact snapshot for transaction is not immediately available,
+it uses bounded waiting with a few fallbacks.
+If none of the available paths can provide a valid snapshot within the retry
+budget, `QueryItems` returns an error.
+Retry budget is `30 * SnapshotPinWaitTimeout` (default: `30s`, because
+`SnapshotPinWaitTimeout` default is `1s`).
+
+## Configuration
+
+All runtime controls are configured through `Options`.
+Recommended pattern is to start with defaults and override only required values.
+
+```go
+opts := rbi.DefaultOptions()
+
+// Planner/trace settings
+opts.AnalyzeInterval = 30 * time.Minute // < 0 disables periodic analyze loop
+opts.TraceSink = func(ev rbi.TraceEvent) { /* log/collect trace */ }
+opts.TraceSampleEvery = 1000 // 0 means "every query" when TraceSink is set
+
+// Online calibration settings
+opts.CalibrationEnabled = true           // false disables calibration (default)
+opts.CalibrationSampleEvery = 32         // 0 uses default (16)
+opts.CalibrationPersistPath = "planner_calibration.json" // optional auto load/save
+
+// Single-op write batcher settings
+opts.BatchWindow = 200 * time.Microsecond
+opts.BatchMax = 16
+opts.BatchMaxQueue = 512 // <= 0 means unbounded queue
+opts.BatchAllowCallbacks = true // true allows combining ops with PreCommit callbacks
+
+db, err := rbi.New[uint64, User](bolt, opts)
+if err != nil {
+    panic(err)
+}
+```
 
 ## Ordering Limitations
 
@@ -214,7 +262,7 @@ Slice-typed fields are indexed element-wise and support `HAS`, `HASNOT`, `HASANY
 `HASNONE` operations.
 
 Equality for slice fields is implemented as **set equality**, not array equality.\
-This means, that `["a", "b", "a"] == ["a", "b"]`
+This means `["a", "b", "a"] == ["a", "b"]`
 
 ## Unique Constraints
 
@@ -227,7 +275,7 @@ Tagging a field with:
 enforces a uniqueness constraint for that field.
 
 * Only scalar (non-slice) fields can be unique.
-* Uniqueness is enforced across single and batch writes (`SetMany`, `PatchMany`).
+* Uniqueness is enforced across single and batch writes (`Set`, `Patch*`, `BatchSet`, `BatchPatch*`).
 * Violations return `ErrUniqueViolation` before committing the transaction.
 * Uniqueness guarantees rely on indexes and are unavailable when indexing is disabled.
 
@@ -293,14 +341,24 @@ Memory usage is roughly proportional to:
 * number of records,
 * cardinality and distribution of indexed values.
 
-Careful index selection is recommended for large datasets.
+Memory usage can also grow in these cases:
+- High write rate with slow compaction (larger snapshot-delta overlays)
+- Larger snapshot registry and deeper delta chains
+- Large delta compact thresholds combined with write bursts
+- Long-lived readers that keep old snapshots pinned (delays snapshot cleanup)
+
+Memory stabilizes when write rate, compaction throughput, and
+snapshot retention are balanced. It grows when write churn consistently outruns
+compaction/cleanup.
+
+Careful index and snapshot configuration is recommended for large datasets.
 
 ## Multiple Instances
 
 Multiple `DB` instances may safely operate on the same bbolt database.\
 Each instance maintains its own in-memory index.
 
-## Bucket Name
+## Bucket name
 
 `DB` stores all records in a single top-level bbolt bucket.
 
@@ -309,7 +367,7 @@ A custom bucket name can be provided via `Options`
 if explicit control is required (e.g. when value type is renamed).
 
 
-## Encoding and Schema Evolution
+## Encoding and schema evolution
 
 Values are encoded using [msgpack](https://github.com/vmihailenco/msgpack).
 
@@ -333,49 +391,7 @@ Most schema changes are handled gracefully:
 Indexes for affected fields are automatically rebuilt when schema changes are
 detected.
 
-## Optional LRU Cache
-
-The package provides an optional cache wrapper that adds two layers of caching:
-
-1. In-memory LRU cache for individual records.\
-   Is stores decoded values and returns **pointers to the cached data**.
-
-2. Invalidation-based cache for query results.\
-   A cache that maps a caching key (`QX.Key`) to the resulting list of record **IDs**.
-
-### Item Cache Limitations
-
-Cached values are returned as **pointers to the cached data**.\
-No copying is performed.
-
-This means:
-- Modifying a returned value mutates the cached entry.
-- Concurrent reads and writes to cached values may lead to data races.
-- Callers must treat cached values as read-only.
-
-### Query Cache Limitations
-
-- **Phantom Reads**\
-  The query cache relies on reactive invalidation:
-  a cache entry is cleared only if one of the keys already contained in that entry
-  is modified or deleted. If a **new record is inserted** that matches the query
-  criteria, the cached result will not be updated or invalidated.
-  The `InvalidateQuery` and `InvalidateQueryPrefix` methods can be used
-  for manual invalidation.
-
-* **Memory Usage**\
-  While the item cache is bounded by the specified capacity,
-  the query cache is **unbounded**. Heavy usage of unique query keys may lead
-  to memory growth. The `Reset` method clears the entire cache
-  and releases memory back to the GC.
-
-### Atomicity Notes
-
-When wrapped by a cache instance, `QueryItems` resolves keys first and fetches
-values afterward. If a concurrent update or delete occurs between these steps,
-the returned slice may contain `nil` values for records that no longer exist.
-
-## Design Scope and Non-Goals
+## Non-goals
 
 This package does not aim to be a relational database or a SQL engine.
 
@@ -386,15 +402,77 @@ This package does not aim to be a relational database or a SQL engine.
 
 The focus is on fast selection of complete documents.
 
-## Performance Notes
+## Performance notes
 
-- The package is read-optimized.
+- Package is read-optimized.
 - Prefer batch writes over single inserts, if possible.
 - Always use limits if you do not need the whole set.
 - Not all logical branches are currently optimized.
 
 There is still room for optimization, but the current performance is already
 suitable for many workloads.
+
+### Query performance expectations
+
+Query performance is shape-dependent. Some classes are fast by design,
+some are highly data-dependent, and some are inherently expensive.
+
+#### 1. Fast-by-design classes
+
+These classes are consistently fast when predicates are selective and `LIMIT` is small.
+Typical behavior is low-microsecond to sub-microsecond in the current benchmark profile.
+
+- Unique/equality point query with `LIMIT 1`
+  - `O(1)` index lookup + `O(1)` result extraction
+- Top-N on ordered field (`ORDER BY field LIMIT N`, small `N`)
+  - `O(N)` in best case (early stop on first buckets)
+- Selective `IN`/`HAS`/`HASANY` with `LIMIT`
+  - approximately `O(k + N)`, where `k` is number of touched postings
+- Selective prefix with small limit
+  - `O(log M + span(prefix) + N)`
+- Selective range + order + limit
+  - `O(scanned_buckets + checked_rows)` with early stop
+
+#### 2. Data-dependent classes
+
+These can differ by one to two orders of magnitude for the same query shape.
+The main reason is that planner/executor cost is dominated by data distribution.
+
+- Range queries (`GT/GTE/LT/LTE`)
+- Prefix/text-like filters (`PREFIX`, `SUFFIX`, `CONTAINS`)
+- Moderate `OR` expressions with mixed predicates
+
+What mostly determines runtime:
+- Predicate selectivity and field cardinality
+- Overlap between OR branches (high overlap increases redundant checks + dedupe work)
+- Order-field cardinality/skew (high-cardinality order can increase scan/probe cost)
+- Prefix span size (short/broad prefix can degenerate into near full-range scan)
+- Offset depth (deep skip forces extra scanning even with small limit)
+- Negative predicates (`NOT*`) that reduce early-stop opportunities
+
+#### 3. Inherently heavy classes
+
+These are expensive in almost any workload because they force broad candidate
+enumeration, global deduplication, expensive ordering, and/or large materialization.
+
+- Wide `OR` trees with ordering and deep pagination:
+  - Needs branch-level scanning, dedupe, global rank merge, then skip large prefixes
+  - Practical complexity often approaches `O(total_examined_rows)`, with large constants
+- Broad text scans (`CONTAINS` / `SUFFIX`) without a selective anchor:
+  - Often requires scanning many index keys/buckets before filtering
+  - Little opportunity for early pruning without additional anchors
+
+> For heavy and data-dependent classes, benchmark with your real data distribution.\
+> Synthetic uniform datasets often hide worst-case behavior.
+
+### Write performance expectations
+
+Write speed depends on how many index entries are touched per operation
+(changed fields, slice fan-out, uniqueness checks), and on bbolt fsync/IO.
+Insertions are typically more expensive than updates. 
+`Patch*` is usually faster than full `Set*` when only a subset of indexed fields changes.
+
+Batch APIs (`BatchSet`, `BatchPatch`, `BatchDelete`) significantly reduce per-record overhead.
 
 ## Contributing
 

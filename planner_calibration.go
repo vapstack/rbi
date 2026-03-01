@@ -10,8 +10,6 @@ import (
 )
 
 const (
-	defaultCalibrationSampleEvery = 16
-
 	calibrationMinEstimatedRows = 16
 	calibrationRatioMin         = 0.25
 	calibrationRatioMax         = 8.0
@@ -54,12 +52,12 @@ type CalibrationSnapshot struct {
 	Samples     map[string]uint64  `json:"samples"`
 }
 
-func resolveCalibrationSampleEvery(enabled bool, sampleEvery uint64) uint64 {
+func calibrationSampleEvery(enabled bool, sampleEvery uint64) uint64 {
 	if !enabled {
 		return 0
 	}
 	if sampleEvery == 0 {
-		return defaultCalibrationSampleEvery
+		return defaultOptionsCalibrationSampleEvery
 	}
 	return sampleEvery
 }
@@ -250,7 +248,7 @@ func (db *DB[K, V]) initCalibration() {
 	}
 
 	if err := db.LoadCalibration(path); err != nil && !errors.Is(err, os.ErrNotExist) {
-		log.Printf("rbi: failed to load planner calibration (%s): %v", path, err)
+		log.Printf("rbi: failed to load planner calibration (%v): %v", path, err)
 	}
 }
 
@@ -265,8 +263,8 @@ func (db *DB[K, V]) persistCalibrationOnClose() error {
 	return db.SaveCalibration(path)
 }
 
-// GetCalibrationSnapshot returns a copy of current planner calibration
-// state. The bool result is false if state was not initialized yet.
+// GetCalibrationSnapshot returns a copy of current planner calibration state.
+// The bool result is false if state was not initialized yet.
 func (db *DB[K, V]) GetCalibrationSnapshot() (CalibrationSnapshot, bool) {
 	cur := db.planner.calibrator.state.Load()
 	if cur == nil {
