@@ -113,7 +113,7 @@ type Options struct {
 	//
 	// Default: 1s
 	//
-	// Query retry budget is bounded by 10x this value.
+	// Query retry budget is bounded by 30x this value.
 	// Too low can increase "snapshot is not available" errors under write bursts.
 	// Too high can increase tail latency when snapshot publication is delayed.
 	SnapshotPinWaitTimeout time.Duration
@@ -266,7 +266,7 @@ type Options struct {
 
 	// SnapshotCompactorMaxIterationsPerRun limits background compaction work per wake-up.
 	//
-	// Default: 3
+	// Default: 2
 	//
 	// Typical range: 1..8
 	//
@@ -278,7 +278,7 @@ type Options struct {
 	// SnapshotCompactorRequestEveryNWrites controls best-effort compactor
 	// wakeups under steady write load.
 	//
-	// Default: 4
+	// Default: 8
 	//
 	// Typical range: 4..64
 	//

@@ -23,7 +23,7 @@ func snapshotPinWaitTimeout(v time.Duration) time.Duration {
 func (db *DB[K, V]) Query(q *qx.QX) ([]*V, error) {
 
 	if q == nil {
-		return nil, fmt.Errorf("QL is nil")
+		return nil, fmt.Errorf("QX is nil")
 	}
 	if len(q.Order) > 1 {
 		return nil, fmt.Errorf("rbi does not support multi-column ordering")
@@ -122,7 +122,7 @@ func (db *DB[K, V]) queryRecords(tx *bbolt.Tx, snap *indexSnapshot, q *qx.QX) ([
 // QueryKeys evaluates the given query against the index and returns all matching ids.
 func (db *DB[K, V]) QueryKeys(q *qx.QX) ([]K, error) {
 	if q == nil {
-		return nil, fmt.Errorf("QL is nil")
+		return nil, fmt.Errorf("QX is nil")
 	}
 	if len(q.Order) > 1 {
 		return nil, fmt.Errorf("rbi does not support multi-column ordering")
