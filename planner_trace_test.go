@@ -20,7 +20,7 @@ func TestTracer_EmitsAndSamples(t *testing.T) {
 		mu.Unlock()
 	}
 
-	db, _ := openTempDBUint64(t, &Options{
+	db, _ := openTempDBUint64(t, Options{
 		AnalyzeInterval:  -1,
 		TraceSink:        sink,
 		TraceSampleEvery: 2,
@@ -76,7 +76,7 @@ func TestTracer_ORDecisionEstimates(t *testing.T) {
 		mu.Unlock()
 	}
 
-	db, _ := openTempDBUint64(t, &Options{
+	db, _ := openTempDBUint64(t, Options{
 		AnalyzeInterval:  -1,
 		TraceSink:        sink,
 		TraceSampleEvery: 1,
@@ -155,7 +155,7 @@ func TestTracer_OROrderMetrics(t *testing.T) {
 		mu.Unlock()
 	}
 
-	db, _ := openTempDBUint64(t, &Options{
+	db, _ := openTempDBUint64(t, Options{
 		AnalyzeInterval:  -1,
 		TraceSink:        sink,
 		TraceSampleEvery: 1,

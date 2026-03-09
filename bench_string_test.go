@@ -34,12 +34,11 @@ func openBenchDBString(b *testing.B) (*DB[string, UserBench], *bbolt.DB, string)
 	}
 	path := filepath.Join(dir, "bench_string.db")
 
-	opts := DefaultOptions()
-	opts.DisableIndexLoad = true
-	opts.DisableIndexStore = true
-	opts.DisableIndexRebuild = true
-
-	db, raw := openBoltAndNew[string, UserBench](b, path, opts)
+	db, raw := openBoltAndNew[string, UserBench](b, path, Options{
+		DisableIndexLoad:    true,
+		DisableIndexStore:   true,
+		DisableIndexRebuild: true,
+	})
 	return db, raw, dir
 }
 
@@ -169,11 +168,10 @@ func closeBenchDBStringLocked() {
 func buildWriteBenchDBString(b *testing.B) *DB[string, UserBench] {
 	b.Helper()
 	dir := b.TempDir()
-	path := filepath.Join(dir, "bench_write_string_seeded.db")
 
-	opts := DefaultOptions()
-	opts.DisableIndexRebuild = true
-	db, raw := openBoltAndNew[string, UserBench](b, path, opts)
+	db, raw := openBoltAndNew[string, UserBench](b, filepath.Join(dir, "bench_write_string_seeded.db"), Options{
+		DisableIndexRebuild: true,
+	})
 	b.Cleanup(func() {
 		_ = db.Close()
 		_ = raw.Close()

@@ -313,7 +313,11 @@ func (db *DB[K, V]) maybeRequestSnapshotCompaction(s *indexSnapshot, indexDelta,
 }
 
 func (db *DB[K, V]) compactorRequestEveryForSnapshot(s *indexSnapshot) uint64 {
-	every := uint64(db.options.SnapshotCompactorRequestEveryNWrites)
+	everyOpt := db.options.SnapshotCompactorRequestEveryNWrites
+	if everyOpt < 0 {
+		return 0
+	}
+	every := uint64(everyOpt)
 	if every <= 1 || s == nil {
 		return every
 	}
@@ -626,7 +630,7 @@ func (db *DB[K, V]) compactLatestSnapshotOnce(force bool) (bool, bool) {
 	if !db.mu.TryLock() {
 		db.snapshot.compactLockMiss.Add(1)
 		seq := db.snapshot.compactWriteSeq.Load()
-		skip := uint64(db.options.SnapshotCompactorRequestEveryNWrites)
+		skip := uint64(max(0, db.options.SnapshotCompactorRequestEveryNWrites))
 		if skip < 4 {
 			skip = 4
 		}

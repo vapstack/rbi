@@ -42,6 +42,17 @@ func TestReadString_InternsNilValue(t *testing.T) {
 	}
 }
 
+func TestReadBitmap_CorruptedRoaringPayload_ReturnsMeaningfulError(t *testing.T) {
+	payload := []byte{8, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff}
+	_, err := readBitmap(bufio.NewReader(bytes.NewReader(payload)))
+	if err == nil {
+		t.Fatal("expected corrupted bitmap error")
+	}
+	if !strings.Contains(err.Error(), "corrupted roaring64 bitmap payload") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
 func TestReadStrMap_RejectsSparseIndexes(t *testing.T) {
 	var payload bytes.Buffer
 	writer := bufio.NewWriter(&payload)
@@ -390,7 +401,7 @@ func deltaEntryDelToArray(e indexDeltaEntry) []uint64 {
 	return e.del.ToArray()
 }
 func TestDisableIndexing_RebuildIndex(t *testing.T) {
-	db, _ := openTempDBUint64(t, nil)
+	db, _ := openTempDBUint64(t)
 
 	if err := db.Set(1, &Rec{Name: "alice", Age: 10, Tags: []string{"go"}}); err != nil {
 		t.Fatalf("Set: %v", err)
@@ -421,7 +432,7 @@ func TestDisableIndexing_RebuildIndex(t *testing.T) {
 }
 
 func TestDisableIndexing_UniqueChecksDoNotBlockWritesOnStaleIndex(t *testing.T) {
-	db, _ := openTempDBUint64Unique(t, nil)
+	db, _ := openTempDBUint64Unique(t)
 
 	if err := db.Set(1, &UniqueTestRec{Email: "a@x", Code: 1}); err != nil {
 		t.Fatalf("Set(1): %v", err)
@@ -465,7 +476,7 @@ func TestIndexPersistence(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "persist.db")
 
-	db, raw := openBoltAndNew[uint64, Rec](t, path, nil)
+	db, raw := openBoltAndNew[uint64, Rec](t, path)
 
 	if err := db.Set(1, &Rec{Name: "alice", Age: 10, Tags: []string{"go"}}); err != nil {
 		t.Fatalf("Set: %v", err)
@@ -481,7 +492,7 @@ func TestIndexPersistence(t *testing.T) {
 		t.Fatalf("raw close: %v", err)
 	}
 
-	db2, raw2 := openBoltAndNew[uint64, Rec](t, path, nil)
+	db2, raw2 := openBoltAndNew[uint64, Rec](t, path)
 	t.Cleanup(func() {
 		if err := db2.Close(); err != nil {
 			t.Fatal(err)
@@ -509,7 +520,7 @@ func TestIndexPersistence_LenZeroComplement_AllEmptyAfterReopen(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "persist_len_zero_complement_all_empty.db")
 
-	db, raw := openBoltAndNew[uint64, Rec](t, path, nil)
+	db, raw := openBoltAndNew[uint64, Rec](t, path)
 	for i := 1; i <= 90; i++ {
 		rec := &Rec{
 			Name:  fmt.Sprintf("u_%d", i),
@@ -555,7 +566,7 @@ func TestIndexPersistence_LenZeroComplement_AllEmptyAfterReopen(t *testing.T) {
 		t.Fatalf("raw close: %v", err)
 	}
 
-	db2, raw2 := openBoltAndNew[uint64, Rec](t, path, nil)
+	db2, raw2 := openBoltAndNew[uint64, Rec](t, path)
 	t.Cleanup(func() {
 		if err = db2.Close(); err != nil {
 			t.Fatal(err)
@@ -575,7 +586,7 @@ func TestIndexPersistence_LenZeroComplement_AllEmptyAfterReopen(t *testing.T) {
 }
 
 func TestRebuildIndex_CleanState(t *testing.T) {
-	db, _ := openTempDBUint64(t, nil)
+	db, _ := openTempDBUint64(t)
 
 	if err := db.Set(1, &Rec{Name: "alice", Age: 30}); err != nil {
 		t.Fatal(err)
@@ -623,7 +634,7 @@ func TestRebuildIndex_CleanState(t *testing.T) {
 }
 
 func TestRebuildIndex_ClosedReturnsErrClosed(t *testing.T) {
-	db, _ := openTempDBUint64(t, nil)
+	db, _ := openTempDBUint64(t)
 	if err := db.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
@@ -634,7 +645,7 @@ func TestRebuildIndex_ClosedReturnsErrClosed(t *testing.T) {
 }
 
 func TestReadMethods_ReturnErrorWhenBucketMissing(t *testing.T) {
-	db, _ := openTempDBUint64(t, nil)
+	db, _ := openTempDBUint64(t)
 	if err := db.Set(1, &Rec{Name: "alice", Age: 30}); err != nil {
 		t.Fatalf("Set: %v", err)
 	}
@@ -679,7 +690,7 @@ func TestReadMethods_ReturnErrorWhenBucketMissing(t *testing.T) {
 }
 
 func TestQuery_MissingBucket_EmptyIndexResultSkipsBucketRead(t *testing.T) {
-	db, _ := openTempDBUint64(t, nil)
+	db, _ := openTempDBUint64(t)
 	if err := db.Set(1, &Rec{Name: "alice", Age: 30}); err != nil {
 		t.Fatalf("Set: %v", err)
 	}
@@ -703,7 +714,7 @@ func TestQuery_MissingBucket_EmptyIndexResultSkipsBucketRead(t *testing.T) {
 }
 
 func TestRebuildIndex_ScanErrorClearsActiveFlag(t *testing.T) {
-	db, _ := openTempDBUint64(t, nil)
+	db, _ := openTempDBUint64(t)
 	if err := db.Set(1, &Rec{Name: "alice", Age: 30}); err != nil {
 		t.Fatalf("Set: %v", err)
 	}
@@ -738,7 +749,7 @@ func TestRebuildIndex_ScanErrorClearsActiveFlag(t *testing.T) {
 }
 
 func TestRebuildIndex_StopTheWorld(t *testing.T) {
-	db, _ := openTempDBUint64(t, nil)
+	db, _ := openTempDBUint64(t)
 
 	if err := db.Set(1, &Rec{Name: "alice", Age: 30}); err != nil {
 		t.Fatalf("Set(1): %v", err)
@@ -798,7 +809,7 @@ func TestRebuildIndex_StopTheWorld(t *testing.T) {
 }
 
 func TestRebuildIndex_ConcurrentCallReturnsErrRebuildInProgress(t *testing.T) {
-	db, _ := openTempDBUint64(t, nil)
+	db, _ := openTempDBUint64(t)
 
 	if err := db.Set(1, &Rec{Name: "alice", Age: 30}); err != nil {
 		t.Fatalf("Set(1): %v", err)
@@ -854,7 +865,7 @@ func TestRebuildIndex_ConcurrentCallReturnsErrRebuildInProgress(t *testing.T) {
 }
 
 func TestRebuildIndex_StopsTruncateWhileActive(t *testing.T) {
-	db, _ := openTempDBUint64Unique(t, nil)
+	db, _ := openTempDBUint64Unique(t)
 
 	if err := db.Set(1, &UniqueTestRec{Email: "a@x", Code: 1}); err != nil {
 		t.Fatalf("Set(1): %v", err)
@@ -922,7 +933,7 @@ func TestRebuildIndex_StopsTruncateWhileActive(t *testing.T) {
 }
 
 func TestRebuildIndex_RejectsSetWhileActive(t *testing.T) {
-	db, _ := openTempDBUint64(t, nil)
+	db, _ := openTempDBUint64(t)
 
 	if err := db.Set(1, &Rec{Name: "alice", Age: 30}); err != nil {
 		t.Fatalf("Set(1): %v", err)
@@ -990,7 +1001,7 @@ func TestRebuildIndex_RejectsSetWhileActive(t *testing.T) {
 }
 
 func TestRebuildIndex_ConcurrentCloseReturnsErrClosed(t *testing.T) {
-	db, _ := openTempDBUint64(t, nil)
+	db, _ := openTempDBUint64(t)
 
 	if err := db.Set(1, &Rec{Name: "alice", Age: 30}); err != nil {
 		t.Fatalf("Set(1): %v", err)
@@ -1071,7 +1082,7 @@ func TestRebuildIndex_ConcurrentCloseReturnsErrClosed(t *testing.T) {
 }
 
 func TestRebuildIndex_WaitsForInFlightBatchedSet(t *testing.T) {
-	db, _ := openTempDBUint64(t, &Options{
+	db, _ := openTempDBUint64(t, Options{
 		BatchWindow:         5 * time.Millisecond,
 		BatchMax:            16,
 		BatchMaxQueue:       1024,
@@ -1156,7 +1167,7 @@ func TestRebuildIndex_WaitsForInFlightBatchedSet(t *testing.T) {
 }
 
 func TestRebuildIndex_StormConcurrentMixedOps_FinalConsistency(t *testing.T) {
-	db, _ := openTempDBUint64(t, &Options{
+	db, _ := openTempDBUint64(t, Options{
 		BatchWindow:   2 * time.Millisecond,
 		BatchMax:      16,
 		BatchMaxQueue: 2048,
@@ -1326,7 +1337,7 @@ func TestRebuildIndex_StormConcurrentMixedOps_FinalConsistency(t *testing.T) {
 }
 
 func TestRebuildIndex_StatsBlockUntilRebuildCompletes(t *testing.T) {
-	db, _ := openTempDBUint64(t, nil)
+	db, _ := openTempDBUint64(t)
 
 	if err := db.Set(1, &Rec{Name: "alice", Age: 30, Tags: []string{"go"}}); err != nil {
 		t.Fatalf("Set(1): %v", err)
@@ -1407,7 +1418,7 @@ func TestRebuildIndex_StatsBlockUntilRebuildCompletes(t *testing.T) {
 }
 
 func TestRebuildIndex_RejectsCoreOpsWhileActive(t *testing.T) {
-	db, _ := openTempDBUint64(t, nil)
+	db, _ := openTempDBUint64(t)
 
 	if err := db.Set(1, &Rec{Name: "alice", Age: 30, Tags: []string{"go"}}); err != nil {
 		t.Fatalf("Set(1): %v", err)

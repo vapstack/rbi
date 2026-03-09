@@ -12,7 +12,7 @@ import (
 )
 
 func TestRace_ConcurrentReadersAndWriters(t *testing.T) {
-	db, _ := openTempDBUint64(t, nil)
+	db, _ := openTempDBUint64(t)
 	_ = seedData(t, db, 200)
 
 	stop := make(chan struct{})
@@ -160,7 +160,7 @@ func TestRace_ConcurrentReadersAndWriters(t *testing.T) {
 }
 
 func TestRace_ConcurrentReadersAndWriters_SnapshotDelta(t *testing.T) {
-	db, _ := openTempDBUint64(t, nil)
+	db, _ := openTempDBUint64(t)
 	_ = seedData(t, db, 200)
 
 	stop := make(chan struct{})
@@ -305,7 +305,7 @@ func TestRace_ConcurrentReadersAndWriters_SnapshotDelta(t *testing.T) {
 }
 
 func TestRace_ConcurrentWriters_SnapshotRouteEquivalence(t *testing.T) {
-	db, _ := openTempDBUint64(t, &Options{AnalyzeInterval: -1})
+	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
 	_ = seedData(t, db, 1_200)
 
 	stop := make(chan struct{})
@@ -483,7 +483,7 @@ func TestRace_ConcurrentWriters_SnapshotRouteEquivalence(t *testing.T) {
 }
 
 func TestRace_ConcurrentWriters_OROrderScoreChurn_SnapshotRouteEquivalence(t *testing.T) {
-	db, _ := openTempDBUint64(t, &Options{AnalyzeInterval: -1})
+	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
 	_ = seedData(t, db, 1_600)
 
 	stop := make(chan struct{})
@@ -658,7 +658,7 @@ func TestRace_ConcurrentWriters_OROrderScoreChurn_SnapshotRouteEquivalence(t *te
 }
 
 func TestRace_StringKeyGrowth_FastPaths_SnapshotRouteEquivalence(t *testing.T) {
-	db, _ := openTempDBString(t, &Options{AnalyzeInterval: -1})
+	db, _ := openTempDBString(t, Options{AnalyzeInterval: -1})
 
 	countries := []string{"NL", "PL", "DE", "Finland", "Iceland", "Thailand", "US"}
 	tagPool := []string{"go", "db", "ops", "rust", "java", "infra"}

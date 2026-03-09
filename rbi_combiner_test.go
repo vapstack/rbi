@@ -13,7 +13,7 @@ import (
 )
 
 func TestBatch_PreCommit_CallbacksRunForSetPatchDelete(t *testing.T) {
-	db, _ := openTempDBUint64(t, &Options{BatchAllowCallbacks: true})
+	db, _ := openTempDBUint64(t, Options{BatchAllowCallbacks: true})
 
 	var (
 		mu     sync.Mutex
@@ -60,7 +60,7 @@ func TestBatch_PreCommit_CallbacksRunForSetPatchDelete(t *testing.T) {
 }
 
 func TestBatch_SequentialSet_DoesNotProduceCombinedBatches(t *testing.T) {
-	db, _ := openTempDBUint64(t, &Options{
+	db, _ := openTempDBUint64(t, Options{
 		BatchWindow:   5 * time.Millisecond,
 		BatchMax:      16,
 		BatchMaxQueue: 64,
@@ -90,7 +90,7 @@ func TestBatch_SequentialSet_DoesNotProduceCombinedBatches(t *testing.T) {
 }
 
 func TestBatch_DisabledCombiner_SkipsCombinerPath(t *testing.T) {
-	db, _ := openTempDBUint64(t, &Options{
+	db, _ := openTempDBUint64(t, Options{
 		BatchWindow: 5 * time.Millisecond,
 		BatchMax:    1,
 	})
@@ -114,7 +114,7 @@ func TestBatch_DisabledCombiner_SkipsCombinerPath(t *testing.T) {
 }
 
 func TestBatch_CallbacksBypassCombinerWhenDisabled(t *testing.T) {
-	db, _ := openTempDBUint64(t, &Options{
+	db, _ := openTempDBUint64(t, Options{
 		BatchWindow:   5 * time.Millisecond,
 		BatchMax:      16,
 		BatchMaxQueue: 64,
@@ -146,7 +146,7 @@ func TestBatch_CallbacksBypassCombinerWhenDisabled(t *testing.T) {
 }
 
 func TestBatch_CallbackBarrier_RespectsBatchAllowCallbacks(t *testing.T) {
-	db, _ := openTempDBUint64(t, &Options{
+	db, _ := openTempDBUint64(t, Options{
 		BatchWindow:   5 * time.Millisecond,
 		BatchMax:      16,
 		BatchMaxQueue: 64,
@@ -195,7 +195,7 @@ func TestBatch_CallbackBarrier_RespectsBatchAllowCallbacks(t *testing.T) {
 }
 
 func TestBatch_PatchUnique_QueuedIntoCombiner(t *testing.T) {
-	db, _ := openTempDBUint64Unique(t, &Options{
+	db, _ := openTempDBUint64Unique(t, Options{
 		BatchWindow:   5 * time.Millisecond,
 		BatchMax:      16,
 		BatchMaxQueue: 256,
@@ -235,7 +235,7 @@ func TestBatch_PatchUnique_QueuedIntoCombiner(t *testing.T) {
 }
 
 func TestBatch_SetDeleteSameID_CoalescedToLastWrite(t *testing.T) {
-	db, _ := openTempDBUint64(t, &Options{
+	db, _ := openTempDBUint64(t, Options{
 		BatchWindow:   5 * time.Millisecond,
 		BatchMax:      16,
 		BatchMaxQueue: 64,
@@ -331,7 +331,7 @@ func TestBatch_SetDeleteSameID_CoalescedToLastWrite(t *testing.T) {
 }
 
 func TestBatch_CoalescedChain_PropagatesTerminalError(t *testing.T) {
-	db, _ := openTempDBUint64Unique(t, &Options{
+	db, _ := openTempDBUint64Unique(t, Options{
 		BatchWindow:   5 * time.Millisecond,
 		BatchMax:      16,
 		BatchMaxQueue: 64,
@@ -477,7 +477,7 @@ func TestBatch_CombinedPatchFailures_IsolateFailedRequest(t *testing.T) {
 	for _, c := range cases {
 		c := c
 		t.Run(c.name, func(t *testing.T) {
-			db, _ := openTempDBUint64(t, &Options{
+			db, _ := openTempDBUint64(t, Options{
 				BatchWindow:   5 * time.Millisecond,
 				BatchMax:      16,
 				BatchMaxQueue: 64,
@@ -541,7 +541,7 @@ func TestBatch_CombinedPatchFailures_IsolateFailedRequest(t *testing.T) {
 }
 
 func TestBatch_QueueFullFallback_UsesDirectPath(t *testing.T) {
-	db, _ := openTempDBUint64(t, &Options{
+	db, _ := openTempDBUint64(t, Options{
 		BatchWindow:   5 * time.Millisecond,
 		BatchMax:      16,
 		BatchMaxQueue: 1,
@@ -587,7 +587,7 @@ func TestBatch_QueueFullFallback_UsesDirectPath(t *testing.T) {
 }
 
 func TestBatch_PreCommitError_RollsBack(t *testing.T) {
-	db, _ := openTempDBUint64(t, nil)
+	db, _ := openTempDBUint64(t)
 
 	wantErr := errors.New("precommit failed")
 	err := db.Set(1, &Rec{Name: "alice", Age: 10}, func(_ *bbolt.Tx, _ uint64, _, _ *Rec) error {
@@ -607,7 +607,7 @@ func TestBatch_PreCommitError_RollsBack(t *testing.T) {
 }
 
 func TestBatch_PreCommitError_IsolatesFailedRequest_WhenCallbacksAllowed(t *testing.T) {
-	db, _ := openTempDBUint64(t, &Options{BatchAllowCallbacks: true})
+	db, _ := openTempDBUint64(t, Options{BatchAllowCallbacks: true})
 
 	encode := func(v *Rec) []byte {
 		t.Helper()
@@ -665,7 +665,7 @@ func TestBatch_PreCommitError_IsolatesFailedRequest_WhenCallbacksAllowed(t *test
 }
 
 func TestBatch_PreCommitError_Isolation_RechecksUniqueAfterRetry(t *testing.T) {
-	db, _ := openTempDBUint64Unique(t, &Options{BatchAllowCallbacks: true})
+	db, _ := openTempDBUint64Unique(t, Options{BatchAllowCallbacks: true})
 
 	encode := func(v *UniqueTestRec) []byte {
 		t.Helper()

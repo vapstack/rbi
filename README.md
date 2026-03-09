@@ -69,13 +69,14 @@ func main() {
     if err != nil {
         panic(err)
     }
-    db, err := rbi.New[uint64, User](bolt, nil)
+    defer bolt.Close()
+	
+    db, err := rbi.New[uint64, User](bolt, rbi.Options{})
     if err != nil {
         _ = bolt.Close()
         panic(err)
     }
     defer db.Close()
-    defer bolt.Close()
 
     err = db.Set(1, &User{
         Name:   "Alice",
@@ -205,28 +206,27 @@ Retry budget is `30 * SnapshotPinWaitTimeout` (default: `30s`, because
 ## Configuration
 
 All runtime controls are configured through `Options`.
-Recommended pattern is to start with defaults and override only required values.
+Recommended pattern is to set only the fields you need.
 
 ```go
-opts := rbi.DefaultOptions()
+db, err := rbi.New[uint64, User](bolt, rbi.Options{
 
-// Planner/trace settings
-opts.AnalyzeInterval = 30 * time.Minute // < 0 disables periodic analyze loop
-opts.TraceSink = func(ev rbi.TraceEvent) { /* log/collect trace */ }
-opts.TraceSampleEvery = 1000 // 0 means "every query" when TraceSink is set
-
-// Online calibration settings
-opts.CalibrationEnabled = true           // false disables calibration (default)
-opts.CalibrationSampleEvery = 32         // 0 uses default (16)
-opts.CalibrationPersistPath = "planner_calibration.json" // optional auto load/save
-
-// Single-op write batcher settings
-opts.BatchWindow = 200 * time.Microsecond
-opts.BatchMax = 16
-opts.BatchMaxQueue = 512 // <= 0 means unbounded queue
-opts.BatchAllowCallbacks = true // true allows combining ops with PreCommit callbacks
-
-db, err := rbi.New[uint64, User](bolt, opts)
+    // Planner/trace settings
+    AnalyzeInterval: 30 * time.Minute, // < 0 disables periodic analyze loop
+    TraceSink: func(ev rbi.TraceEvent) { /* log/collect trace */ },
+    TraceSampleEvery: 1000, // 0 uses default (1), < 0 disables tracing    
+    
+    // Online calibration settings
+    CalibrationEnabled: true, // false disables calibration (default)
+    CalibrationSampleEvery: 32, // 0 uses default (16), < 0 disables sampled calibration
+    CalibrationPersistPath: "planner_calibration.json", // optional auto load/save
+    
+    // Single-op write batcher settings
+    BatchWindow: 100 * time.Microsecond,
+    BatchMax: 32,
+    BatchMaxQueue: 512, // < 0 means unbounded queue, 0 uses default
+    BatchAllowCallbacks: true, // true allows combining ops with PreCommit callbacks
+})
 if err != nil {
     panic(err)
 }

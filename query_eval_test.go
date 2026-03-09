@@ -8,7 +8,7 @@ import (
 )
 
 func TestQueryUnknownFieldReturnsError(t *testing.T) {
-	db, _ := openTempDBUint64(t, nil)
+	db, _ := openTempDBUint64(t)
 	_ = seedData(t, db, 10)
 
 	_, err := db.QueryKeys(qx.Query(qx.EQ("no_such_field", 1)))
@@ -18,7 +18,7 @@ func TestQueryUnknownFieldReturnsError(t *testing.T) {
 }
 
 func TestEmptySliceQueries(t *testing.T) {
-	db, _ := openTempDBUint64(t, nil)
+	db, _ := openTempDBUint64(t)
 	if err := db.Set(1, &Rec{Tags: []string{"go"}}); err != nil {
 		t.Fatal(err)
 	}
@@ -35,7 +35,7 @@ func TestEmptySliceQueries(t *testing.T) {
 }
 
 func TestQuery_PointerField_NilVsZeroValue(t *testing.T) {
-	db, _ := openTempDBUint64(t, nil)
+	db, _ := openTempDBUint64(t)
 
 	sEmpty := ""
 	sVal := "val"
@@ -69,7 +69,7 @@ func TestQuery_PointerField_NilVsZeroValue(t *testing.T) {
 }
 
 func TestQueryPrefix_MatchingSemantics(t *testing.T) {
-	db, _ := openTempDBUint64(t, nil)
+	db, _ := openTempDBUint64(t)
 
 	names := []string{"item", "item-1", "item-10", "items", "iterator"}
 	for i, n := range names {
@@ -98,7 +98,7 @@ func TestQueryPrefix_MatchingSemantics(t *testing.T) {
 }
 
 func TestQuery_OR_WithNegativeBranch_EqualsUniverse(t *testing.T) {
-	db, _ := openTempDBUint64(t, nil)
+	db, _ := openTempDBUint64(t)
 	ids := seedData(t, db, 120)
 
 	// OR( NOT EQ(name,"alice"), EQ(name,"alice") ) == universe
@@ -127,7 +127,7 @@ func TestQuery_OR_WithNegativeBranch_EqualsUniverse(t *testing.T) {
 }
 
 func TestQuery_AND_WithNegativeBranch_Empty(t *testing.T) {
-	db, _ := openTempDBUint64(t, nil)
+	db, _ := openTempDBUint64(t)
 	_ = seedData(t, db, 120)
 
 	// AND( EQ(name,"alice"), NOT EQ(name,"alice") ) == empty
@@ -148,7 +148,7 @@ func TestQuery_AND_WithNegativeBranch_Empty(t *testing.T) {
 }
 
 func TestQuery_DoubleNot_SameAsOriginal(t *testing.T) {
-	db, _ := openTempDBUint64(t, nil)
+	db, _ := openTempDBUint64(t)
 	_ = seedData(t, db, 150)
 
 	inner := qx.AND(
@@ -171,7 +171,7 @@ func TestQuery_DoubleNot_SameAsOriginal(t *testing.T) {
 }
 
 func TestQuery_RangeBoundaries_Int_Correctness(t *testing.T) {
-	db, _ := openTempDBUint64(t, nil)
+	db, _ := openTempDBUint64(t)
 
 	// deterministic ages so boundary conditions are obvious
 	for i := 0; i < 100; i++ {
@@ -218,7 +218,7 @@ func TestQuery_RangeBoundaries_Int_Correctness(t *testing.T) {
 }
 
 func TestQuery_IN_WithDuplicates_DoesNotDuplicateResults(t *testing.T) {
-	db, _ := openTempDBUint64(t, nil)
+	db, _ := openTempDBUint64(t)
 	_ = seedData(t, db, 160)
 
 	// duplicate values in IN should not cause duplicated ids
@@ -245,7 +245,7 @@ func TestQuery_IN_WithDuplicates_DoesNotDuplicateResults(t *testing.T) {
 }
 
 func TestQuery_SliceField_HASANY_WithDuplicateNeedles(t *testing.T) {
-	db, _ := openTempDBUint64(t, nil)
+	db, _ := openTempDBUint64(t)
 
 	// force duplicates in both data and needles
 	if err := db.Set(1, &Rec{Tags: []string{"go", "go", "db"}}); err != nil {
@@ -274,7 +274,7 @@ func TestQuery_SliceField_HASANY_WithDuplicateNeedles(t *testing.T) {
 }
 
 func TestQuery_SliceField_HAS_DuplicateNeedles_MatchesAccordingToHarness(t *testing.T) {
-	db, _ := openTempDBUint64(t, nil)
+	db, _ := openTempDBUint64(t)
 
 	// this test locks in the current reference semantics:
 	// containsAll() in harness treats duplicates as requiring multiple occurrences,

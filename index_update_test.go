@@ -9,7 +9,7 @@ import (
 )
 
 func TestSet_ReindexesAllSliceValues_OnReplace(t *testing.T) {
-	db, _ := openTempDBUint64(t, nil)
+	db, _ := openTempDBUint64(t)
 	_ = seedData(t, db, 420)
 
 	old, err := db.Get(215)
@@ -51,7 +51,7 @@ func TestSet_ReindexesAllSliceValues_OnReplace(t *testing.T) {
 }
 
 func TestQuery_DeleteUpdatesIndex_Correctness(t *testing.T) {
-	db, _ := openTempDBUint64(t, nil)
+	db, _ := openTempDBUint64(t)
 
 	// arrange deterministic values so the query result is known
 	for i := 1; i <= 50; i++ {
@@ -103,7 +103,7 @@ func TestQuery_DeleteUpdatesIndex_Correctness(t *testing.T) {
 }
 
 func TestQuery_PatchUpdatesIndex_Correctness(t *testing.T) {
-	db, _ := openTempDBUint64(t, nil)
+	db, _ := openTempDBUint64(t)
 
 	// put some records with age=10, then patch some to age=40 and ensure range queries reflect changes
 	for i := 1; i <= 60; i++ {

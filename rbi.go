@@ -60,10 +60,10 @@ const (
 	defaultNumericRangeBucketMinSpanKeys            = 2048
 )
 
-// Options configures how indexer works with a bbolt database.
+// Options configures indexer and how it works with a bbolt database.
 //
-// DefaultOptions returns a new options object with all defaults pre-filled.
-// Passing nil options to New is equivalent to DefaultOptions.
+// Zero-valued option fields use defaults.
+// DefaultOptions returns options with all defaults pre-filled.
 type Options struct {
 
 	// DisableIndexLoad prevents indexer from loading previously persisted index
@@ -104,11 +104,16 @@ type Options struct {
 	//   - 0: when sink is set, sample every query (equivalent to 1)
 	//   - 1: sample every query
 	//   - N: sample every Nth query
-	TraceSampleEvery uint64
+	//
+	// Negative value disables tracing (even when sink is set)
+	//
+	// Default: 1
+	TraceSampleEvery int
 
 	// SnapshotPinWaitTimeout controls how long Query waits for a snapshot
 	// with matching Bolt txID to appear after opening a read transaction.
-	// Non-positive values use the default timeout.
+	//
+	// Negative value disables waiting.
 	//
 	// Default: 1s
 	//
@@ -130,11 +135,13 @@ type Options struct {
 	//   - N: calibrate every Nth query
 	// The value is ignored when CalibrationEnabled is false.
 	//
+	// Negative value disables sampled calibration.
+	//
 	// Default: 16
 	//
 	// Lower values adapt faster but add overhead and sensitivity to noise.
 	// Higher values reduce overhead but adapt slower to workload shifts.
-	CalibrationSampleEvery uint64
+	CalibrationSampleEvery int
 
 	// CalibrationPersistPath enables optional auto load/save of planner
 	// calibration state from/to this JSON file.
@@ -159,11 +166,11 @@ type Options struct {
 	// SnapshotMaterializedPredCacheMaxEntries controls max number of cached
 	// materialized predicate bitmaps for stable snapshots (without deltas).
 	//
+	// Negative value disables cache for stable snapshots.
+	//
 	// Default: 16
 	//
 	// Typical range: 16..256
-	//
-	// Negative value disables cache for stable snapshots.
 	//
 	// High values on diverse workloads can cause sharp memory growth.
 	SnapshotMaterializedPredCacheMaxEntries int
@@ -171,11 +178,11 @@ type Options struct {
 	// SnapshotMaterializedPredCacheMaxEntriesWithDelta controls max cached
 	// materialized predicate bitmaps for snapshots with active deltas.
 	//
+	// Negative value disables cache for delta snapshots.
+	//
 	// Default: 2
 	//
 	// Typical range: 2..64
-	//
-	// Negative value disables cache for delta snapshots.
 	//
 	// High values can increase GC pressure under write-heavy workloads.
 	SnapshotMaterializedPredCacheMaxEntriesWithDelta int
@@ -183,9 +190,9 @@ type Options struct {
 	// SnapshotMaterializedPredCacheMaxBitmapCardinality skips caching very large
 	// bitmaps to reduce retained heap and GC pressure.
 	//
-	// Default: 32K
-	//
 	// Negative value disables the guard.
+	//
+	// Default: 32K
 	//
 	// Negative (disabled) or very large values can significantly increase memory
 	// usage for broad predicates.
@@ -193,22 +200,24 @@ type Options struct {
 
 	// SnapshotRegistryMax limits amount of snapshots tracked for txID pinning/floor fallback.
 	//
+	// Negative value disables the cap.
+	//
 	// Default: 16
 	//
 	// Typical range: 32..512
 	//
 	// Higher values retain more snapshots (higher memory).
 	// Too low values can increase snapshot misses for long readers.
-	SnapshotRegistryMax uint
+	SnapshotRegistryMax int
 
 	// SnapshotDeltaCompactFieldKeys is a per-field threshold for accumulated
 	// delta keys; above it field delta is compacted into base index.
 	//
+	// Negative value disables key-count trigger.
+	//
 	// Default: 256
 	//
 	// Typical range: 128..2048
-	//
-	// Negative value disables key-count trigger.
 	//
 	// Too high can increase delta memory/read CPU.
 	// Too low can increase compaction frequency and hurt write latency.
@@ -217,11 +226,11 @@ type Options struct {
 	// SnapshotDeltaCompactFieldOps is a per-field threshold for accumulated
 	// add/del cardinality across delta entries.
 	//
+	// Negative value disables ops-count trigger.
+	//
 	// Default: 4096
 	//
 	// Typical range: 2K..64K
-	//
-	// Negative value disables ops-count trigger.
 	//
 	// Too high delays compaction (delta growth, read overhead).
 	// Too low can force frequent compaction and hurt write throughput.
@@ -230,9 +239,9 @@ type Options struct {
 	// SnapshotDeltaCompactMaxFieldsPerPublish limits how many fields can be
 	// compacted from delta into base in one publish pass.
 	//
-	// Default: 3
-	//
 	// Negative value disables field compaction in publish path.
+	//
+	// Default: 3
 	//
 	// High values can create severe write-latency spikes.
 	SnapshotDeltaCompactMaxFieldsPerPublish int
@@ -240,11 +249,11 @@ type Options struct {
 	// SnapshotDeltaCompactUniverseOps is a threshold for universe add/drop
 	// cardinality sum; above it universe delta is compacted into base.
 	//
+	// Negative value disables universe compaction trigger.
+	//
 	// Default: 4096
 	//
 	// Typical values: 2K..64K
-	//
-	// Negative value disables universe compaction trigger.
 	//
 	// Too high values can increase overlay growth/read cost.
 	// Too low values can increase write-path compaction work.
@@ -253,11 +262,11 @@ type Options struct {
 	// SnapshotDeltaLayerMaxDepth limits per-field delta layer depth.
 	// Once exceeded, layered delta is flattened into one layer.
 	//
+	// Negative value disables depth-based flattening.
+	//
 	// Default: 6
 	//
 	// Typical range: 4..64
-	//
-	// Negative value disables depth-based flattening.
 	//
 	// Very high/disabled values can increase read-path CPU and memory.
 	// Very low values can increase flattening overhead on writes.
@@ -265,17 +274,19 @@ type Options struct {
 
 	// SnapshotCompactorMaxIterationsPerRun limits background compaction work per wake-up.
 	//
+	// Negative value disables compaction passes.
+	//
 	// Default: 2
 	//
 	// Typical range: 1..8
 	//
-	// Zero disables compaction passes.
-	//
 	// High values increase contention with writers and can degrade throughput.
-	SnapshotCompactorMaxIterationsPerRun uint
+	SnapshotCompactorMaxIterationsPerRun int
 
 	// SnapshotCompactorRequestEveryNWrites controls best-effort compactor
 	// wakeups under steady write load.
+	//
+	// Negative value disables periodic write-triggered compactor requests.
 	//
 	// Default: 8
 	//
@@ -284,11 +295,9 @@ type Options struct {
 	// Lower values improve delta control but increase write contention.
 	// Higher values reduce contention but can increase delta memory/read cost.
 	//
-	// Zero disables periodic write-triggered compactor requests.
-	//
 	// Value 1 can cause sustained compactor/writer contention and write
 	// throughput degradation on heavy write workloads.
-	SnapshotCompactorRequestEveryNWrites uint
+	SnapshotCompactorRequestEveryNWrites int
 
 	// SnapshotCompactorIdleInterval configures one-shot idle debounce for
 	// force-drain compaction when snapshot activity stops.
@@ -296,11 +305,11 @@ type Options struct {
 	// bounded force pass to collapse remaining deltas and aggressively prune
 	// snapshot registry for best read-path locality.
 	//
+	// Negative value disables idle force-drain mode.
+	//
 	// Default: 2s
 	//
 	// Typical range: 500ms..10s
-	//
-	// Non-positive value disables idle force-drain mode.
 	//
 	// Lower values converge faster after write bursts but can increase
 	// compactor/writer contention on bursty workloads.
@@ -310,11 +319,11 @@ type Options struct {
 	// BatchWindow enables lightweight write micro-batching window for
 	// single-record Set/Patch/Delete operations.
 	//
+	// Negative value disables write combining.
+	//
 	// Default: 200us
 	//
 	// Typical range: 10us..500us
-	//
-	// Non-positive value disables write combining.
 	//
 	// Higher values can reduce write-path overhead under contention but may
 	// increase single-write latency at low load.
@@ -322,22 +331,23 @@ type Options struct {
 
 	// BatchMax limits max operations merged into one combined write tx.
 	//
+	// Negative value disables effective batching.
+	// Value 1 also disables effective batching (single op per batch).
+	//
 	// Default: 16
 	//
 	// Typical range: 4..64
-	//
-	// Values <=1 disable effective batching.
 	//
 	// Very high values can create commit-size spikes and tail-latency variance.
 	BatchMax int
 
 	// BatchMaxQueue limits pending combined write requests.
 	//
+	// Negative value disables queue cap.
+	//
 	// Default: 512
 	//
 	// Typical range: 128..8192
-	//
-	// Non-positive value disables queue cap.
 	//
 	// Larger values can increase memory usage under sustained overload.
 	BatchMaxQueue int
@@ -370,54 +380,99 @@ type Options struct {
 	// NumericRangeBucketSize controls amount of sorted numeric keys grouped into one
 	// pre-aggregated bucket for range predicate acceleration.
 	//
-	// Default: 512
+	// Negative value disables numeric bucket acceleration.
 	//
-	// Non-positive value disables numeric bucket acceleration.
+	// Default: 512
 	NumericRangeBucketSize int
 
 	// NumericRangeBucketMinFieldKeys is the minimum amount of unique keys in a
 	// numeric field required to build range buckets.
 	//
-	// Default: 8192
+	// Negative value disables numeric bucket acceleration.
 	//
-	// Non-positive value disables numeric bucket acceleration.
+	// Default: 8192
 	NumericRangeBucketMinFieldKeys int
 
 	// NumericRangeBucketMinSpanKeys is the minimum range span (in keys) required to
 	// route GT/GTE/LT/LTE through bucket acceleration path.
 	//
-	// Default: 2048
+	// Negative value disables numeric bucket acceleration.
 	//
-	// Non-positive value disables numeric bucket acceleration.
+	// Default: 2048
 	NumericRangeBucketMinSpanKeys int
 }
 
-// DefaultOptions returns a new options object with default settings.
-func DefaultOptions() *Options {
-	return &Options{
-		BucketFillPercent:                                 defaultBucketFillPercent,
-		AnalyzeInterval:                                   defaultOptionsAnalyzeInterval,
-		SnapshotPinWaitTimeout:                            defaultOptionsSnapshotPinWaitTimeout,
-		CalibrationSampleEvery:                            defaultOptionsCalibrationSampleEvery,
-		SnapshotMaterializedPredCacheMaxEntries:           defaultSnapshotMaterializedPredCacheMaxEntries,
-		SnapshotMaterializedPredCacheMaxEntriesWithDelta:  defaultSnapshotMatPredCacheEntriesWithDelta,
-		SnapshotMaterializedPredCacheMaxBitmapCardinality: defaultSnapshotMatPredCacheMaxBitmapCardinality,
-		SnapshotRegistryMax:                               defaultSnapshotRegistryMax,
-		SnapshotDeltaCompactFieldKeys:                     defaultSnapshotDeltaCompactFieldKeys,
-		SnapshotDeltaCompactFieldOps:                      defaultSnapshotDeltaCompactFieldOps,
-		SnapshotDeltaCompactMaxFieldsPerPublish:           defaultSnapshotDeltaCompactMaxFieldsPerPublish,
-		SnapshotDeltaCompactUniverseOps:                   defaultSnapshotDeltaCompactUniverseOps,
-		SnapshotDeltaLayerMaxDepth:                        defaultSnapshotDeltaLayerMaxDepth,
-		SnapshotCompactorMaxIterationsPerRun:              defaultSnapshotCompactorMaxIterationsPerRun,
-		SnapshotCompactorRequestEveryNWrites:              defaultSnapshotCompactorRequestEveryNWrites,
-		SnapshotCompactorIdleInterval:                     defaultSnapshotCompactorIdleInterval,
-		BatchWindow:                                       defaultBatchWindow,
-		BatchMax:                                          defaultBatchMax,
-		BatchMaxQueue:                                     defaultBatchMaxQueue,
-		BatchAllowCallbacks:                               defaultBatchAllowCallbacks,
-		NumericRangeBucketSize:                            defaultNumericRangeBucketSize,
-		NumericRangeBucketMinFieldKeys:                    defaultNumericRangeBucketMinFieldKeys,
-		NumericRangeBucketMinSpanKeys:                     defaultNumericRangeBucketMinSpanKeys,
+func (o *Options) setDefaults() {
+	if o.AnalyzeInterval == 0 {
+		o.AnalyzeInterval = defaultOptionsAnalyzeInterval
+	}
+	if o.TraceSampleEvery == 0 {
+		o.TraceSampleEvery = 1
+	}
+	if o.SnapshotPinWaitTimeout == 0 {
+		o.SnapshotPinWaitTimeout = defaultOptionsSnapshotPinWaitTimeout
+	}
+	if o.CalibrationSampleEvery == 0 {
+		o.CalibrationSampleEvery = defaultOptionsCalibrationSampleEvery
+	}
+	if o.BucketFillPercent == 0 {
+		o.BucketFillPercent = defaultBucketFillPercent
+	}
+	if o.SnapshotMaterializedPredCacheMaxEntries == 0 {
+		o.SnapshotMaterializedPredCacheMaxEntries = defaultSnapshotMaterializedPredCacheMaxEntries
+	}
+	if o.SnapshotMaterializedPredCacheMaxEntriesWithDelta == 0 {
+		o.SnapshotMaterializedPredCacheMaxEntriesWithDelta = defaultSnapshotMatPredCacheEntriesWithDelta
+	}
+	if o.SnapshotMaterializedPredCacheMaxBitmapCardinality == 0 {
+		o.SnapshotMaterializedPredCacheMaxBitmapCardinality = defaultSnapshotMatPredCacheMaxBitmapCardinality
+	}
+	if o.SnapshotRegistryMax == 0 {
+		o.SnapshotRegistryMax = defaultSnapshotRegistryMax
+	} else if o.SnapshotRegistryMax < 0 {
+		o.SnapshotRegistryMax = int(^uint(0) >> 1)
+	}
+	if o.SnapshotDeltaCompactFieldKeys == 0 {
+		o.SnapshotDeltaCompactFieldKeys = defaultSnapshotDeltaCompactFieldKeys
+	}
+	if o.SnapshotDeltaCompactFieldOps == 0 {
+		o.SnapshotDeltaCompactFieldOps = defaultSnapshotDeltaCompactFieldOps
+	}
+	if o.SnapshotDeltaCompactMaxFieldsPerPublish == 0 {
+		o.SnapshotDeltaCompactMaxFieldsPerPublish = defaultSnapshotDeltaCompactMaxFieldsPerPublish
+	}
+	if o.SnapshotDeltaCompactUniverseOps == 0 {
+		o.SnapshotDeltaCompactUniverseOps = defaultSnapshotDeltaCompactUniverseOps
+	}
+	if o.SnapshotDeltaLayerMaxDepth == 0 {
+		o.SnapshotDeltaLayerMaxDepth = defaultSnapshotDeltaLayerMaxDepth
+	}
+	if o.SnapshotCompactorMaxIterationsPerRun == 0 {
+		o.SnapshotCompactorMaxIterationsPerRun = defaultSnapshotCompactorMaxIterationsPerRun
+	}
+	if o.SnapshotCompactorRequestEveryNWrites == 0 {
+		o.SnapshotCompactorRequestEveryNWrites = defaultSnapshotCompactorRequestEveryNWrites
+	}
+	if o.SnapshotCompactorIdleInterval == 0 {
+		o.SnapshotCompactorIdleInterval = defaultSnapshotCompactorIdleInterval
+	}
+	if o.BatchWindow == 0 {
+		o.BatchWindow = defaultBatchWindow
+	}
+	if o.BatchMax == 0 {
+		o.BatchMax = defaultBatchMax
+	}
+	if o.BatchMaxQueue == 0 {
+		o.BatchMaxQueue = defaultBatchMaxQueue
+	}
+	if o.NumericRangeBucketSize == 0 {
+		o.NumericRangeBucketSize = defaultNumericRangeBucketSize
+	}
+	if o.NumericRangeBucketMinFieldKeys == 0 {
+		o.NumericRangeBucketMinFieldKeys = defaultNumericRangeBucketMinFieldKeys
+	}
+	if o.NumericRangeBucketMinSpanKeys == 0 {
+		o.NumericRangeBucketMinSpanKeys = defaultNumericRangeBucketMinSpanKeys
 	}
 }
 
@@ -455,16 +510,16 @@ type Field struct {
 //
 // The generic type V must be a struct; otherwise ErrNotStructType is returned.
 //
-// If options is nil, default options are used. For custom configuration,
-// start from DefaultOptions and override required fields.
-// If options.BucketName is empty,
-// the name of the value type V is used as the bucket name. New ensures the
-// bucket exists, optionally loads a persisted index from disk, rebuilds
-// missing parts of the index if allowed, and sets up field metadata and
-// accessors.
+// Zero-valued option fields use defaults.
 //
-// New does not manage the underlying *bbolt.DB lifecycle.
-func New[K ~uint64 | ~string, V any](bolt *bbolt.DB, options *Options) (db *DB[K, V], err error) {
+// If options.BucketName is empty,
+// the name of the value type V is used as the bucket name.
+// New ensures the bucket exists, optionally loads a persisted index from disk,
+// rebuilds missing parts of the index if allowed, and sets up field metadata
+// and accessors.
+//
+// The resulting DB does not manage the underlying *bbolt.DB lifecycle.
+func New[K ~uint64 | ~string, V any](bolt *bbolt.DB, options Options) (db *DB[K, V], err error) {
 	var v V
 	vtype := reflect.TypeOf(v)
 	if vtype == nil {
@@ -473,9 +528,7 @@ func New[K ~uint64 | ~string, V any](bolt *bbolt.DB, options *Options) (db *DB[K
 	if vtype.Kind() != reflect.Struct {
 		return nil, ErrNotStructType
 	}
-	if options == nil {
-		options = DefaultOptions()
-	}
+	options.setDefaults()
 
 	vname := vtype.Name()
 	if options.BucketName != "" {
@@ -527,7 +580,7 @@ func New[K ~uint64 | ~string, V any](bolt *bbolt.DB, options *Options) (db *DB[K
 			},
 		},
 
-		options: options,
+		options: &options,
 
 		snapshot: snapshot{
 			pinWait: snapshotPinWaitTimeout(options.SnapshotPinWaitTimeout),
@@ -585,7 +638,7 @@ func New[K ~uint64 | ~string, V any](bolt *bbolt.DB, options *Options) (db *DB[K
 			if !options.DisableIndexLoad {
 				skipFields, err = db.loadIndex()
 				if err != nil {
-					log.Println("rbi: failed to load index:", err)
+					log.Println("rbi: failed to load persisted index:", err)
 				}
 			}
 		}

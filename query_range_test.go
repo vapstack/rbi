@@ -59,7 +59,7 @@ func bitmapToIDs(t *testing.T, b bitmap) []uint64 {
 }
 
 func TestEvalSimple_NumericRangeBuckets_MatchClassicPath(t *testing.T) {
-	db, _ := openTempDBUint64(t, &Options{
+	db, _ := openTempDBUint64(t, Options{
 		SnapshotMaterializedPredCacheMaxEntries:          -1,
 		SnapshotMaterializedPredCacheMaxEntriesWithDelta: -1,
 	})
@@ -115,7 +115,7 @@ func TestEvalSimple_NumericRangeBuckets_MatchClassicPath(t *testing.T) {
 }
 
 func TestEvalSimple_NumericRangeBuckets_WorksWithFieldDelta(t *testing.T) {
-	db, _ := openTempDBUint64(t, &Options{
+	db, _ := openTempDBUint64(t, Options{
 		SnapshotCompactorRequestEveryNWrites:             1 << 30,
 		SnapshotCompactorIdleInterval:                    -1,
 		SnapshotDeltaLayerMaxDepth:                       1 << 30,
@@ -182,7 +182,7 @@ func TestEvalSimple_NumericRangeBuckets_WorksWithFieldDelta(t *testing.T) {
 }
 
 func TestCount_NumericRangeBuckets_MatchClassicPath(t *testing.T) {
-	db, _ := openTempDBUint64(t, &Options{
+	db, _ := openTempDBUint64(t, Options{
 		SnapshotMaterializedPredCacheMaxEntries:          -1,
 		SnapshotMaterializedPredCacheMaxEntriesWithDelta: -1,
 	})
@@ -227,7 +227,7 @@ func TestCount_NumericRangeBuckets_MatchClassicPath(t *testing.T) {
 }
 
 func TestCount_NumericRangeBuckets_WorksWithFieldDelta(t *testing.T) {
-	db, _ := openTempDBUint64(t, &Options{
+	db, _ := openTempDBUint64(t, Options{
 		SnapshotCompactorRequestEveryNWrites:             1 << 30,
 		SnapshotCompactorIdleInterval:                    -1,
 		SnapshotDeltaLayerMaxDepth:                       1 << 30,
@@ -289,7 +289,7 @@ func TestCount_NumericRangeBuckets_WorksWithFieldDelta(t *testing.T) {
 }
 
 func TestNumericRangeBucketCache_ReusedAcrossDeltaSnapshotsWithSameBase(t *testing.T) {
-	db, _ := openTempDBUint64(t, &Options{
+	db, _ := openTempDBUint64(t, Options{
 		SnapshotCompactorRequestEveryNWrites:             1 << 30,
 		SnapshotCompactorIdleInterval:                    -1,
 		SnapshotDeltaLayerMaxDepth:                       1 << 30,

@@ -9,7 +9,7 @@ import (
 )
 
 func TestQuery_LimitNoOrder_UnsatisfiableLeafs_ReturnEmpty(t *testing.T) {
-	db, _ := openTempDBUint64(t, nil)
+	db, _ := openTempDBUint64(t)
 
 	if err := db.Set(1, &Rec{Name: "alice", Email: "alice@example.com", Tags: []string{"go", "db"}}); err != nil {
 		t.Fatal(err)
@@ -70,7 +70,7 @@ func TestQuery_LimitNoOrder_UnsatisfiableLeafs_ReturnEmpty(t *testing.T) {
 }
 
 func TestQuery_LimitOrderAndRange_UnsatisfiableRest_ReturnEmpty(t *testing.T) {
-	db, _ := openTempDBUint64(t, nil)
+	db, _ := openTempDBUint64(t)
 
 	for i := 1; i <= 120; i++ {
 		email := fmt.Sprintf("user-%d@example.com", i)
@@ -127,7 +127,7 @@ func TestQuery_LimitOrderAndRange_UnsatisfiableRest_ReturnEmpty(t *testing.T) {
 }
 
 func TestQuery_OffsetBeyondResult_ReturnsEmpty(t *testing.T) {
-	db, _ := openTempDBUint64(t, nil)
+	db, _ := openTempDBUint64(t)
 	_ = seedData(t, db, 80)
 
 	q := qx.Query(qx.EQ("country", "NL")).Skip(10_000).Max(50)
@@ -148,7 +148,7 @@ func TestQuery_OffsetBeyondResult_ReturnsEmpty(t *testing.T) {
 }
 
 func TestQuery_NoOrder_UnboundedLimit_RespectsOffset(t *testing.T) {
-	db, _ := openTempDBUint64(t, nil)
+	db, _ := openTempDBUint64(t)
 	_ = seedData(t, db, 140)
 
 	q := qx.Query(qx.GTE("age", 18)).Skip(35)
@@ -170,7 +170,7 @@ func TestQuery_NoOrder_UnboundedLimit_RespectsOffset(t *testing.T) {
 }
 
 func TestQuery_NoOrder_UnboundedLimit_RandomizedOffsetConsistency(t *testing.T) {
-	db, _ := openTempDBUint64(t, nil)
+	db, _ := openTempDBUint64(t)
 	_ = seedData(t, db, 260)
 
 	r := newRand(20260327)

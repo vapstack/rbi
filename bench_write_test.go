@@ -13,9 +13,9 @@ func buildWriteBenchDB(b *testing.B) (*DB[uint64, UserBench], uint64) {
 	dir := b.TempDir()
 	path := filepath.Join(dir, "bench_write_seeded.db")
 
-	opts := DefaultOptions()
-	opts.DisableIndexRebuild = true
-	db, raw := openBoltAndNew[uint64, UserBench](b, path, opts)
+	db, raw := openBoltAndNew[uint64, UserBench](b, path, Options{
+		DisableIndexRebuild: true,
+	})
 	b.Cleanup(func() {
 		_ = db.Close()
 		_ = raw.Close()

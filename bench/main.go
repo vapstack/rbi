@@ -95,19 +95,18 @@ func main() {
 
 func openBenchDatabase(opts benchOptions) (*rbi.DB[uint64, UserBench], *bolt.DB) {
 	log.Println("Opening database...")
-	defaultOpts := rbi.DefaultOptions()
-	dbOpts := rbi.DefaultOptions()
+	dbOpts := rbi.Options{}
 	if opts.analyzeInterval != 0 {
 		dbOpts.AnalyzeInterval = opts.analyzeInterval
 	}
 
-	registryLabel := "default(" + strconv.FormatUint(uint64(defaultOpts.SnapshotRegistryMax), 10) + ")"
-	fieldKeysLabel := "default(" + strconv.Itoa(defaultOpts.SnapshotDeltaCompactFieldKeys) + ")"
-	fieldOpsLabel := "default(" + strconv.Itoa(defaultOpts.SnapshotDeltaCompactFieldOps) + ")"
-	maxFieldsLabel := "default(" + strconv.Itoa(defaultOpts.SnapshotDeltaCompactMaxFieldsPerPublish) + ")"
-	universeOpsLabel := "default(" + strconv.Itoa(defaultOpts.SnapshotDeltaCompactUniverseOps) + ")"
-	layerDepthLabel := "default(" + strconv.Itoa(defaultOpts.SnapshotDeltaLayerMaxDepth) + ")"
-	analyzeLabel := "default(" + defaultOpts.AnalyzeInterval.String() + ")"
+	registryLabel := "default"
+	fieldKeysLabel := "default"
+	fieldOpsLabel := "default"
+	maxFieldsLabel := "default"
+	universeOpsLabel := "default"
+	layerDepthLabel := "default"
+	analyzeLabel := "default"
 	if opts.analyzeInterval < 0 {
 		analyzeLabel = "disabled"
 	} else if opts.analyzeInterval > 0 {
@@ -115,7 +114,7 @@ func openBenchDatabase(opts benchOptions) (*rbi.DB[uint64, UserBench], *bolt.DB)
 	}
 
 	if opts.snapshotRegistryMax >= 0 {
-		dbOpts.SnapshotRegistryMax = uint(opts.snapshotRegistryMax)
+		dbOpts.SnapshotRegistryMax = opts.snapshotRegistryMax
 		registryLabel = strconv.Itoa(opts.snapshotRegistryMax)
 	}
 	if opts.snapshotDeltaCompactFieldKeys >= 0 {

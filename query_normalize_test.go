@@ -112,7 +112,7 @@ func TestNormalizeExpr_DoubleNotEliminates(t *testing.T) {
 }
 
 func TestNormalize_WrappedQueryMatchesDirectResults(t *testing.T) {
-	db, _ := openTempDBUint64(t, nil)
+	db, _ := openTempDBUint64(t)
 	_ = seedData(t, db, 10_000)
 
 	direct := qx.Query(

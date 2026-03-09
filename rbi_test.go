@@ -29,15 +29,11 @@ type invalidUniqueSliceRec struct {
 	Tags []string `rbi:"unique"`
 }
 
-func openTempDBStringProduct(t *testing.T, options ...*Options) (*DB[string, Product], string) {
+func openTempDBStringProduct(t *testing.T, options ...Options) (*DB[string, Product], string) {
 	t.Helper()
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test_product.db")
-	var opts *Options
-	if len(options) > 0 {
-		opts = options[0]
-	}
-	db, raw := openBoltAndNew[string, Product](t, path, opts)
+	db, raw := openBoltAndNew[string, Product](t, path, options...)
 	t.Cleanup(func() {
 		_ = db.Close()
 		_ = raw.Close()
@@ -65,12 +61,12 @@ func TestMultiWrap_DifferentStructs(t *testing.T) {
 		}
 	}()
 
-	recDB, err := New[uint64, Rec](rawDB, nil)
+	recDB, err := New[uint64, Rec](rawDB, Options{})
 	if err != nil {
 		t.Fatalf("Wrap 1 (Rec): %v", err)
 	}
 
-	productDB, err := New[string, Product](rawDB, nil)
+	productDB, err := New[string, Product](rawDB, Options{})
 	if err != nil {
 		t.Fatalf("Wrap 2 (Product): %v", err)
 	}
@@ -120,16 +116,12 @@ func TestWrap_FailedPopulateFields_DoesNotLeakRegistry(t *testing.T) {
 
 	const bucket = "registry-cleanup-check"
 
-	_, err := New[uint64, invalidUniqueSliceRec](rawDB, optsWithDefaults(&Options{
-		BucketName: bucket,
-	}))
+	_, err := New[uint64, invalidUniqueSliceRec](rawDB, Options{BucketName: bucket})
 	if err == nil {
 		t.Fatalf("expected Wrap failure for invalidUniqueSliceRec")
 	}
 
-	db, err := New[uint64, Rec](rawDB, optsWithDefaults(&Options{
-		BucketName: bucket,
-	}))
+	db, err := New[uint64, Rec](rawDB, Options{BucketName: bucket})
 	if err != nil {
 		t.Fatalf("Wrap after failed Wrap must succeed, got: %v", err)
 	}
@@ -152,20 +144,77 @@ func TestWrap_BuildIndexError_DoesNotCloseCallerBolt(t *testing.T) {
 		t.Fatalf("seed invalid payload: %v", err)
 	}
 
-	_, err := New[uint64, Rec](rawDB, optsWithDefaults(&Options{
-		BucketName: bucket,
-	}))
+	_, err := New[uint64, Rec](rawDB, Options{BucketName: bucket})
 	if err == nil {
 		t.Fatalf("expected Wrap failure on malformed payload")
 	}
 
-	if err := rawDB.View(func(tx *bbolt.Tx) error {
+	if err = rawDB.View(func(tx *bbolt.Tx) error {
 		if tx.Bucket([]byte(bucket)) == nil {
 			return fmt.Errorf("bucket is missing")
 		}
 		return nil
 	}); err != nil {
 		t.Fatalf("raw bbolt must stay open after Wrap error, got: %v", err)
+	}
+}
+
+func TestWrap_CorruptedPersistedIndex_RebuildsInsteadOfPanicking(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "corrupted_index.db")
+
+	rawDB, err := bbolt.Open(path, 0o600, nil)
+	if err != nil {
+		t.Fatalf("bbolt.Open: %v", err)
+	}
+
+	db, err := New[uint64, Rec](rawDB, Options{})
+	if err != nil {
+		t.Fatalf("initial New: %v", err)
+	}
+	rbiPath := db.rbiFile
+
+	if err = db.Set(1, &Rec{Name: "alice", Age: 30}); err != nil {
+		t.Fatalf("seed Set: %v", err)
+	}
+	if err = db.Close(); err != nil {
+		t.Fatalf("initial Close: %v", err)
+	}
+	if err = rawDB.Close(); err != nil {
+		t.Fatalf("initial raw Close: %v", err)
+	}
+
+	corrupted := []byte{3, 8, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff}
+	if err = os.WriteFile(rbiPath, corrupted, 0o600); err != nil {
+		t.Fatalf("corrupt .rbi: %v", err)
+	}
+
+	rawDB2, err := bbolt.Open(path, 0o600, nil)
+	if err != nil {
+		t.Fatalf("reopen bbolt.Open: %v", err)
+	}
+	defer func() { _ = rawDB2.Close() }()
+
+	var db2 *DB[uint64, Rec]
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				t.Fatalf("reopen New panicked on corrupted persisted index: %v", r)
+			}
+		}()
+		db2, err = New[uint64, Rec](rawDB2, Options{})
+	}()
+	if err != nil {
+		t.Fatalf("reopen New: %v", err)
+	}
+	defer func() { _ = db2.Close() }()
+
+	got, err := db2.Get(1)
+	if err != nil {
+		t.Fatalf("Get(1): %v", err)
+	}
+	if got == nil || got.Name != "alice" || got.Age != 30 {
+		t.Fatalf("expected rebuilt record after corrupted persisted index, got %#v", got)
 	}
 }
 
@@ -177,12 +226,12 @@ func TestMultiWrap_SameStruct_DifferentBuckets(t *testing.T) {
 		}
 	}()
 
-	dbUS, err := New[uint64, Rec](rawDB, optsWithDefaults(&Options{BucketName: "users_us"}))
+	dbUS, err := New[uint64, Rec](rawDB, Options{BucketName: "users_us"})
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	dbEU, err := New[uint64, Rec](rawDB, optsWithDefaults(&Options{BucketName: "users_eu"}))
+	dbEU, err := New[uint64, Rec](rawDB, Options{BucketName: "users_eu"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -230,11 +279,11 @@ func TestMultiWrap_ConcurrentWrites(t *testing.T) {
 		}
 	}()
 
-	db1, err := New[uint64, Rec](rawDB, optsWithDefaults(&Options{BucketName: "b1"}))
+	db1, err := New[uint64, Rec](rawDB, Options{BucketName: "b1"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	db2, err := New[uint64, Rec](rawDB, optsWithDefaults(&Options{BucketName: "b2"}))
+	db2, err := New[uint64, Rec](rawDB, Options{BucketName: "b2"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -323,8 +372,8 @@ func TestMultiWrap_ConcurrentWrites(t *testing.T) {
 func TestMultiWrap_ReopenPersistence(t *testing.T) {
 	rawDB, path := openRawBolt(t)
 
-	opts1 := optsWithDefaults(&Options{BucketName: "t1"})
-	opts2 := optsWithDefaults(&Options{BucketName: "t2"})
+	opts1 := Options{BucketName: "t1"}
+	opts2 := Options{BucketName: "t2"}
 
 	db1, _ := New[uint64, Rec](rawDB, opts1)
 	db2, _ := New[uint64, Rec](rawDB, opts2)
@@ -394,12 +443,12 @@ func TestMultiWrap_CloseBehavior(t *testing.T) {
 	rawDB, _ := openRawBolt(t)
 	// Wrap does not transfer ownership of rawDB to wrapped instances.
 
-	db1, err := New[uint64, Rec](rawDB, optsWithDefaults(&Options{BucketName: "b1"}))
+	db1, err := New[uint64, Rec](rawDB, Options{BucketName: "b1"})
 	if err != nil {
 		t.Fatalf("Wrap 1: %v", err)
 	}
 
-	db2, err := New[uint64, Rec](rawDB, optsWithDefaults(&Options{BucketName: "b2"}))
+	db2, err := New[uint64, Rec](rawDB, Options{BucketName: "b2"})
 	if err != nil {
 		t.Fatalf("Wrap 2: %v", err)
 	}
@@ -434,7 +483,7 @@ func TestMultiWrap_CloseBehavior(t *testing.T) {
 }
 
 func TestClose_UnblocksQueuedBatchWriters(t *testing.T) {
-	db, _ := openTempDBUint64(t, &Options{
+	db, _ := openTempDBUint64(t, Options{
 		BatchWindow:         10 * time.Millisecond,
 		BatchMax:            16,
 		BatchMaxQueue:       1024,
@@ -552,12 +601,11 @@ type UniqueTestRec struct {
 	Tags  []string `db:"tags"`
 }
 
-func openTempDBUint64Unique(t *testing.T, opts *Options) (*DB[uint64, UniqueTestRec], string) {
+func openTempDBUint64Unique(t *testing.T, options ...Options) (*DB[uint64, UniqueTestRec], string) {
 	t.Helper()
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test_unique.db")
-	opts = optsWithDefaults(opts)
-	db, raw := openBoltAndNew[uint64, UniqueTestRec](t, path, opts)
+	db, raw := openBoltAndNew[uint64, UniqueTestRec](t, path, options...)
 	t.Cleanup(func() {
 		_ = db.Close()
 		_ = raw.Close()
@@ -570,7 +618,7 @@ func openBenchDBUint64Unique(b *testing.B, n int) *DB[uint64, UniqueTestRec] {
 	dir := b.TempDir()
 	path := filepath.Join(dir, "bench_unique.db")
 
-	db, raw := openBoltAndNew[uint64, UniqueTestRec](b, path, nil)
+	db, raw := openBoltAndNew[uint64, UniqueTestRec](b, path)
 	db.DisableSync()
 	b.Cleanup(func() {
 		_ = db.Close()
@@ -639,7 +687,7 @@ func Benchmark_Query_UniqueEQ_Limit1(b *testing.B) {
 }
 
 func TestStringKeys_ExoticCharacters(t *testing.T) {
-	db, _ := openTempDBString(t, nil)
+	db, _ := openTempDBString(t)
 
 	keys := []string{
 		"simple",
@@ -690,7 +738,7 @@ func TestStringKeys_Persistence_MappingStability(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "string_keys_persist.db")
 
-	db, raw := openBoltAndNew[string, Rec](t, path, nil)
+	db, raw := openBoltAndNew[string, Rec](t, path)
 
 	if err := db.Set("alice", &Rec{Age: 20}); err != nil {
 		t.Fatalf("Set: %v", err)
@@ -708,7 +756,7 @@ func TestStringKeys_Persistence_MappingStability(t *testing.T) {
 	}
 
 	// reopen
-	db2, raw2 := openBoltAndNew[string, Rec](t, path, nil)
+	db2, raw2 := openBoltAndNew[string, Rec](t, path)
 	defer func() {
 		if err := db2.Close(); err != nil {
 			t.Fatalf("db2 close: %v", err)
@@ -747,7 +795,7 @@ func TestStringKeys_RebuildIndex_FromScratch(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "string_keys_rebuild.db")
 
-	db, raw := openBoltAndNew[string, Rec](t, path, nil)
+	db, raw := openBoltAndNew[string, Rec](t, path)
 
 	keys := []string{"k1", "k2", "k3"}
 	for i, k := range keys {
@@ -769,7 +817,7 @@ func TestStringKeys_RebuildIndex_FromScratch(t *testing.T) {
 	}
 
 	// reopen and rebuild
-	db2, raw2 := openBoltAndNew[string, Rec](t, path, nil)
+	db2, raw2 := openBoltAndNew[string, Rec](t, path)
 	defer func() {
 		if err := db2.Close(); err != nil {
 			t.Fatalf("db2 close: %v", err)
@@ -793,7 +841,7 @@ func TestStringKeys_RebuildIndex_FromScratch(t *testing.T) {
 }
 
 func TestStringKeys_Concurrency_MapperStress(t *testing.T) {
-	db, _ := openTempDBString(t, nil)
+	db, _ := openTempDBString(t)
 
 	var wg sync.WaitGroup
 	workers := 10
@@ -837,7 +885,7 @@ func TestStringKeys_Concurrency_MapperStress(t *testing.T) {
 }
 
 func TestStringKeys_BatchMutations_ModelReplayConsistency(t *testing.T) {
-	db, _ := openTempDBString(t, nil)
+	db, _ := openTempDBString(t)
 
 	type modelRec struct {
 		name   string
@@ -994,7 +1042,7 @@ func TestStringKeys_BatchMutations_ModelReplayConsistency(t *testing.T) {
 }
 
 func TestStringKeys_ConcurrentMixedOps_FinalIndexConsistency(t *testing.T) {
-	db, _ := openTempDBString(t, nil)
+	db, _ := openTempDBString(t)
 
 	const (
 		keySpace     = 144
@@ -1185,7 +1233,7 @@ func TestStringKeys_ConcurrentMixedOps_FinalIndexConsistency(t *testing.T) {
 }
 
 func TestConcurrentWriters_FinalStateAndIndexConsistency(t *testing.T) {
-	db, _ := openTempDBUint64(t, nil)
+	db, _ := openTempDBUint64(t)
 
 	const (
 		writers    = 8
@@ -1385,7 +1433,7 @@ func TestConcurrentWriters_FinalStateAndIndexConsistency(t *testing.T) {
 }
 
 func TestConcurrentBatchWriters_ModelReplayConsistency(t *testing.T) {
-	db, _ := openTempDBUint64(t, nil)
+	db, _ := openTempDBUint64(t)
 
 	const (
 		writers    = 6
@@ -1663,7 +1711,7 @@ func TestConcurrentBatchWriters_ModelReplayConsistency(t *testing.T) {
 }
 
 func TestBatchConcurrentSingleOps_ModelReplayConsistency(t *testing.T) {
-	db, _ := openTempDBUint64(t, &Options{
+	db, _ := openTempDBUint64(t, Options{
 		BatchMax:      32,
 		BatchMaxQueue: 0, // unlimited to avoid fallback due queue pressure
 	})
@@ -1909,7 +1957,7 @@ func TestBatchConcurrentSingleOps_ModelReplayConsistency(t *testing.T) {
 }
 
 func TestStringKeys_QueryOrder_FollowsInternalIndex(t *testing.T) {
-	db, _ := openTempDBString(t, nil)
+	db, _ := openTempDBString(t)
 
 	inputs := []string{"b", "a", "d", "c"}
 	for _, k := range inputs {
@@ -1938,7 +1986,7 @@ func TestStringKeys_QueryOrder_FollowsInternalIndex(t *testing.T) {
 }
 
 func TestStringKeys_VeryLongKey(t *testing.T) {
-	db, _ := openTempDBString(t, nil)
+	db, _ := openTempDBString(t)
 
 	longKey := strings.Repeat("A", 4096)
 
@@ -1968,7 +2016,7 @@ func TestStringKeys_VeryLongKey(t *testing.T) {
 }
 
 func TestStringKeys_QueryResultKey_RemainsValidAfterClose(t *testing.T) {
-	db, _ := openTempDBString(t, nil)
+	db, _ := openTempDBString(t)
 	key := "my-key"
 	if err := db.Set(key, &Rec{}); err != nil {
 		t.Fatalf("Set: %v", err)
@@ -2000,17 +2048,17 @@ func TestWrap_DoubleOpenCheck(t *testing.T) {
 		}
 	}()
 
-	db1, err := New[uint64, Rec](rawDB, optsWithDefaults(&Options{BucketName: "users"}))
+	db1, err := New[uint64, Rec](rawDB, Options{BucketName: "users"})
 	if err != nil {
 		t.Fatalf("first open failed: %v", err)
 	}
 
-	_, err = New[uint64, Rec](rawDB, optsWithDefaults(&Options{BucketName: "users"}))
+	_, err = New[uint64, Rec](rawDB, Options{BucketName: "users"})
 	if err == nil {
 		t.Fatal("expected error on double open, got nil")
 	}
 
-	db2, err := New[uint64, Rec](rawDB, optsWithDefaults(&Options{BucketName: "admins"}))
+	db2, err := New[uint64, Rec](rawDB, Options{BucketName: "admins"})
 	if err != nil {
 		t.Fatalf("different bucket open failed: %v", err)
 	}
@@ -2019,7 +2067,7 @@ func TestWrap_DoubleOpenCheck(t *testing.T) {
 		t.Fatalf("db1 close: %v", err)
 	}
 
-	db1Reopen, err := New[uint64, Rec](rawDB, optsWithDefaults(&Options{BucketName: "users"}))
+	db1Reopen, err := New[uint64, Rec](rawDB, Options{BucketName: "users"})
 	if err != nil {
 		t.Fatalf("reopen failed: %v", err)
 	}
@@ -2032,7 +2080,7 @@ func TestWrap_DoubleOpenCheck(t *testing.T) {
 }
 
 func TestFailpoint_CommitSetRollsBackAndKeepsState(t *testing.T) {
-	db, _ := openTempDBUint64(t, &Options{
+	db, _ := openTempDBUint64(t, Options{
 		BatchMax: 1,
 	})
 
@@ -2064,7 +2112,7 @@ func TestFailpoint_CommitSetRollsBackAndKeepsState(t *testing.T) {
 }
 
 func TestFailpoint_CommitBatchRollsBackAndKeepsState(t *testing.T) {
-	db, _ := openTempDBUint64(t, &Options{
+	db, _ := openTempDBUint64(t, Options{
 		BatchWindow:   10 * time.Millisecond,
 		BatchMax:      16,
 		BatchMaxQueue: 1024,
@@ -2098,7 +2146,7 @@ func TestFailpoint_CommitBatchRollsBackAndKeepsState(t *testing.T) {
 }
 
 func TestFailpoint_CommitTruncateRollsBackAndKeepsData(t *testing.T) {
-	db, _ := openTempDBUint64Unique(t, nil)
+	db, _ := openTempDBUint64Unique(t)
 
 	if err := db.Set(1, &UniqueTestRec{Email: "a@x", Code: 1}); err != nil {
 		t.Fatalf("Set(1): %v", err)
@@ -2127,7 +2175,7 @@ func TestFailpoint_CommitTruncateRollsBackAndKeepsData(t *testing.T) {
 
 func TestFailpoint_CommitPatchAndDelete_RollbackAndNoPendingRefs(t *testing.T) {
 	t.Run("patch", func(t *testing.T) {
-		db, _ := openTempDBUint64(t, &Options{BatchMax: 1})
+		db, _ := openTempDBUint64(t, Options{BatchMax: 1})
 		if err := db.Set(1, &Rec{Name: "alice", Age: 30, Meta: Meta{Country: "NL"}}); err != nil {
 			t.Fatalf("Set(1): %v", err)
 		}
@@ -2157,7 +2205,7 @@ func TestFailpoint_CommitPatchAndDelete_RollbackAndNoPendingRefs(t *testing.T) {
 	})
 
 	t.Run("delete", func(t *testing.T) {
-		db, _ := openTempDBUint64(t, &Options{BatchMax: 1})
+		db, _ := openTempDBUint64(t, Options{BatchMax: 1})
 		if err := db.Set(1, &Rec{Name: "alice", Age: 30, Meta: Meta{Country: "NL"}}); err != nil {
 			t.Fatalf("Set(1): %v", err)
 		}
@@ -2292,7 +2340,7 @@ func TestFailpoint_CommitMultiWritePaths_RollbackAndNoPendingRefs(t *testing.T) 
 	for _, c := range cases {
 		c := c
 		t.Run(c.name, func(t *testing.T) {
-			db, _ := openTempDBUint64(t, &Options{BatchMax: 1})
+			db, _ := openTempDBUint64(t, Options{BatchMax: 1})
 			if c.setup != nil {
 				c.setup(t, db)
 			}
@@ -2319,7 +2367,7 @@ func TestFailpoint_CommitMultiWritePaths_RollbackAndNoPendingRefs(t *testing.T) 
 }
 
 func TestBatchSet_DuplicateIDs_LastWriteWinsAndIndexConsistent(t *testing.T) {
-	db, _ := openTempDBUint64(t, &Options{BatchMax: 1})
+	db, _ := openTempDBUint64(t, Options{BatchMax: 1})
 
 	if err := db.Set(1, &Rec{Name: "seed", Age: 21, Tags: []string{"go"}, Meta: Meta{Country: "NL"}}); err != nil {
 		t.Fatalf("seed Set: %v", err)
@@ -2377,7 +2425,7 @@ func TestBatchSet_DuplicateIDs_LastWriteWinsAndIndexConsistent(t *testing.T) {
 }
 
 func TestSet_NilValue_ReturnsErrNilValueAndNoWrites(t *testing.T) {
-	db, _ := openTempDBUint64(t, &Options{BatchMax: 1})
+	db, _ := openTempDBUint64(t, Options{BatchMax: 1})
 
 	err := db.Set(1, nil)
 	if err == nil || !errors.Is(err, ErrNilValue) {
@@ -2412,7 +2460,7 @@ func TestSet_NilValue_ReturnsErrNilValueAndNoWrites(t *testing.T) {
 }
 
 func TestBatchSet_NilValue_ReturnsErrNilValueAndAtomic(t *testing.T) {
-	db, _ := openTempDBUint64(t, &Options{BatchMax: 1})
+	db, _ := openTempDBUint64(t, Options{BatchMax: 1})
 
 	base := &Rec{Name: "base", Age: 21, Tags: []string{"go"}, Meta: Meta{Country: "NL"}}
 	if err := db.Set(1, base); err != nil {
@@ -2466,7 +2514,7 @@ func TestBatchSet_NilValue_ReturnsErrNilValueAndAtomic(t *testing.T) {
 }
 
 func TestBatchPatchBatchDelete_DuplicateIDs_IndexConsistency(t *testing.T) {
-	db, _ := openTempDBUint64(t, &Options{BatchMax: 1})
+	db, _ := openTempDBUint64(t, Options{BatchMax: 1})
 
 	if err := db.Set(1, &Rec{Name: "n1", Age: 10, Tags: []string{"go"}, Meta: Meta{Country: "NL"}}); err != nil {
 		t.Fatalf("Set(1): %v", err)
@@ -2546,7 +2594,7 @@ func TestBatchPatchBatchDelete_DuplicateIDs_IndexConsistency(t *testing.T) {
 }
 
 func TestBatchPatch_DecodeError_RollsBackEarlierWrites(t *testing.T) {
-	db, _ := openTempDBUint64(t, &Options{BatchMax: 1})
+	db, _ := openTempDBUint64(t, Options{BatchMax: 1})
 
 	if err := db.Set(1, &Rec{Name: "a", Age: 10, Meta: Meta{Country: "NL"}}); err != nil {
 		t.Fatalf("Set(1): %v", err)
@@ -2618,7 +2666,7 @@ func TestBatchPatch_DecodeError_RollsBackEarlierWrites(t *testing.T) {
 }
 
 func TestBatchDelete_DecodeError_RollsBackEarlierDeletes(t *testing.T) {
-	db, _ := openTempDBUint64(t, &Options{BatchMax: 1})
+	db, _ := openTempDBUint64(t, Options{BatchMax: 1})
 
 	if err := db.Set(1, &Rec{Name: "a", Age: 10, Meta: Meta{Country: "NL"}}); err != nil {
 		t.Fatalf("Set(1): %v", err)
@@ -2734,7 +2782,7 @@ func TestMultiWrite_CallbackError_RollbackDataAndIndex(t *testing.T) {
 	for _, c := range cases {
 		c := c
 		t.Run(c.name, func(t *testing.T) {
-			db, _ := openTempDBUint64(t, &Options{BatchMax: 1})
+			db, _ := openTempDBUint64(t, Options{BatchMax: 1})
 
 			base := map[uint64]*Rec{
 				1: {Name: "base-1", Age: 21, Tags: []string{"go"}, Meta: Meta{Country: "NL"}},
@@ -2797,7 +2845,7 @@ func TestMultiWrite_CallbackError_RollbackDataAndIndex(t *testing.T) {
 }
 
 func TestMultiWrite_CallbackError_RandomizedAtomicRollback(t *testing.T) {
-	db, _ := openTempDBUint64(t, &Options{BatchMax: 1})
+	db, _ := openTempDBUint64(t, Options{BatchMax: 1})
 
 	r := newRand(20260327)
 	countries := []string{"NL", "PL", "DE", "US"}
@@ -2946,7 +2994,7 @@ func TestMultiWrite_CallbackError_RandomizedAtomicRollback(t *testing.T) {
 func TestFailpoint_CloseStoreIndexErrorStillCloses(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "close_store_failpoint.db")
-	db, raw := openBoltAndNew[uint64, Rec](t, path, nil)
+	db, raw := openBoltAndNew[uint64, Rec](t, path)
 	defer func() { _ = raw.Close() }()
 
 	if err := db.Set(1, &Rec{Name: "alice", Age: 30}); err != nil {
@@ -2986,7 +3034,7 @@ func TestFailpoint_CloseStoreIndexErrorStillCloses(t *testing.T) {
 }
 
 func TestLargeBatch_AtomicFailure(t *testing.T) {
-	db, _ := openTempDBUint64Unique(t, nil)
+	db, _ := openTempDBUint64Unique(t)
 
 	if err := db.Set(1, &UniqueTestRec{Email: "exists@x", Code: 1}); err != nil {
 		t.Fatal(err)
@@ -3063,7 +3111,7 @@ func TestBatchPatchStrict_ValidationError_IsAtomic(t *testing.T) {
 	for _, c := range cases {
 		c := c
 		t.Run(c.name, func(t *testing.T) {
-			db, _ := openTempDBUint64(t, &Options{BatchMax: 1})
+			db, _ := openTempDBUint64(t, Options{BatchMax: 1})
 
 			if err := db.Set(1, &Rec{Name: "n1", Age: 10, Meta: Meta{Country: "NL"}}); err != nil {
 				t.Fatalf("Set(1): %v", err)
@@ -3273,12 +3321,11 @@ type StringUniqueTestRec struct {
 	Code  int    `db:"code"  rbi:"unique"`
 }
 
-func openTempDBStringUnique(t *testing.T, opts *Options) (*DB[string, StringUniqueTestRec], string) {
+func openTempDBStringUnique(t *testing.T, options ...Options) (*DB[string, StringUniqueTestRec], string) {
 	t.Helper()
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test_string_unique.db")
-	opts = optsWithDefaults(opts)
-	db, raw := openBoltAndNew[string, StringUniqueTestRec](t, path, opts)
+	db, raw := openBoltAndNew[string, StringUniqueTestRec](t, path, options...)
 	t.Cleanup(func() {
 		_ = db.Close()
 		_ = raw.Close()
@@ -3287,8 +3334,7 @@ func openTempDBStringUnique(t *testing.T, opts *Options) (*DB[string, StringUniq
 }
 
 func TestBatchSet_CallbackError_DoesNotGrowStrMap(t *testing.T) {
-	opts := DefaultOptions()
-	opts.BatchAllowCallbacks = true
+	opts := Options{BatchAllowCallbacks: true}
 	db, _ := openTempDBStringProduct(t, opts)
 
 	if err := db.Set("p1", &Product{SKU: "p1", Price: 10}); err != nil {
@@ -3319,7 +3365,7 @@ func TestBatchSet_CallbackError_DoesNotGrowStrMap(t *testing.T) {
 }
 
 func TestBatchSet_UniqueReject_DoesNotGrowStrMap(t *testing.T) {
-	db, _ := openTempDBStringUnique(t, nil)
+	db, _ := openTempDBStringUnique(t)
 
 	if err := db.Set("u1", &StringUniqueTestRec{Email: "a@x", Code: 1}); err != nil {
 		t.Fatalf("seed Set: %v", err)

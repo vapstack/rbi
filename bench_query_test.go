@@ -47,14 +47,12 @@ func openBenchDB(b *testing.B) (*DB[uint64, UserBench], *bbolt.DB, string) {
 	if err != nil {
 		b.Fatalf("os.MkdirTemp: %v", err)
 	}
-	path := filepath.Join(dir, "bench.db")
 
-	opts := DefaultOptions()
-	opts.DisableIndexLoad = true
-	opts.DisableIndexStore = true
-	opts.DisableIndexRebuild = true
-
-	db, raw := openBoltAndNew[uint64, UserBench](b, path, opts)
+	db, raw := openBoltAndNew[uint64, UserBench](b, filepath.Join(dir, "bench.db"), Options{
+		DisableIndexLoad:    true,
+		DisableIndexStore:   true,
+		DisableIndexRebuild: true,
+	})
 	return db, raw, dir
 }
 

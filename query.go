@@ -13,8 +13,11 @@ import (
 const snapshotRetryBudgetMult = 30
 
 func snapshotPinWaitTimeout(v time.Duration) time.Duration {
-	if v <= 0 {
+	if v == 0 {
 		return defaultOptionsSnapshotPinWaitTimeout
+	}
+	if v < 0 {
+		return 0
 	}
 	return v
 }

@@ -43,7 +43,7 @@ func collectIDsByTagDistinctLen(t *testing.T, db *DB[uint64, Rec], wantLen int) 
 }
 
 func TestLenIndex_ZeroComplement_BaseQueryAndOrder(t *testing.T) {
-	db, _ := openTempDBUint64(t, nil)
+	db, _ := openTempDBUint64(t)
 
 	for i := 1; i <= 200; i++ {
 		rec := &Rec{
@@ -111,7 +111,7 @@ func TestLenIndex_ZeroComplement_BaseQueryAndOrder(t *testing.T) {
 }
 
 func TestLenIndex_ZeroComplement_WorksWithFieldDelta(t *testing.T) {
-	db, _ := openTempDBUint64(t, &Options{
+	db, _ := openTempDBUint64(t, Options{
 		SnapshotCompactorRequestEveryNWrites: 1 << 30,
 		SnapshotCompactorIdleInterval:        -1,
 		SnapshotDeltaLayerMaxDepth:           1 << 30,
@@ -189,7 +189,7 @@ func TestLenIndex_ZeroComplement_WorksWithFieldDelta(t *testing.T) {
 	assertSameSlice(t, gotDesc, wantDesc)
 }
 func TestQuery_OrderBy_WithNegationAndLimit(t *testing.T) {
-	db, _ := openTempDBUint64(t, nil)
+	db, _ := openTempDBUint64(t)
 	_ = seedData(t, db, 200)
 
 	// order + NOT branch
@@ -211,7 +211,7 @@ func TestQuery_OrderBy_WithNegationAndLimit(t *testing.T) {
 }
 
 func TestQuery_Prefix_OrderBySameField_Limit(t *testing.T) {
-	db, _ := openTempDBUint64(t, nil)
+	db, _ := openTempDBUint64(t)
 
 	for i := 1; i <= 120; i++ {
 		email := fmt.Sprintf("user%03d@example.com", i)
@@ -250,7 +250,7 @@ func TestQuery_Prefix_OrderBySameField_Limit(t *testing.T) {
 }
 
 func TestQuery_ByArrayPos_WithLimitAndNegation(t *testing.T) {
-	db, _ := openTempDBUint64(t, nil)
+	db, _ := openTempDBUint64(t)
 	_ = seedData(t, db, 220)
 
 	priority := []string{"go", "java", "ops"}
@@ -271,7 +271,7 @@ func TestQuery_ByArrayPos_WithLimitAndNegation(t *testing.T) {
 }
 
 func TestQuery_ByArrayCount_WithLimitAndNegation(t *testing.T) {
-	db, _ := openTempDBUint64(t, nil)
+	db, _ := openTempDBUint64(t)
 	_ = seedData(t, db, 220)
 
 	q := qx.Query(
@@ -291,7 +291,7 @@ func TestQuery_ByArrayCount_WithLimitAndNegation(t *testing.T) {
 }
 
 func TestQuery_SortWithNegativeResult_NoDuplicates(t *testing.T) {
-	db, _ := openTempDBUint64(t, nil)
+	db, _ := openTempDBUint64(t)
 	_ = seedData(t, db, 300)
 
 	// negative result + ORDER triggers materialization path; ensure no duplicates in output

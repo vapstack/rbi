@@ -33,12 +33,11 @@ type Rec struct {
 	Opt      *string `db:"opt"`
 }
 
-func openTempDBUint64(t *testing.T, opts *Options) (*DB[uint64, Rec], string) {
+func openTempDBUint64(t *testing.T, options ...Options) (*DB[uint64, Rec], string) {
 	t.Helper()
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test_uint64.db")
-	opts = optsWithDefaults(opts)
-	db, raw := openBoltAndNew[uint64, Rec](t, path, opts)
+	db, raw := openBoltAndNew[uint64, Rec](t, path, options...)
 
 	t.Cleanup(func() {
 		_ = db.Close()
@@ -48,12 +47,11 @@ func openTempDBUint64(t *testing.T, opts *Options) (*DB[uint64, Rec], string) {
 	return db, path
 }
 
-func openTempDBString(t *testing.T, opts *Options) (*DB[string, Rec], string) {
+func openTempDBString(t *testing.T, options ...Options) (*DB[string, Rec], string) {
 	t.Helper()
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test_string.db")
-	opts = optsWithDefaults(opts)
-	db, raw := openBoltAndNew[string, Rec](t, path, opts)
+	db, raw := openBoltAndNew[string, Rec](t, path, options...)
 
 	t.Cleanup(func() {
 		_ = db.Close()
@@ -63,28 +61,15 @@ func openTempDBString(t *testing.T, opts *Options) (*DB[string, Rec], string) {
 	return db, path
 }
 
-func optsWithDefaults(overrides *Options) *Options {
-	opts := DefaultOptions()
-	if overrides == nil {
-		return opts
-	}
-
-	src := reflect.ValueOf(overrides).Elem()
-	dst := reflect.ValueOf(opts).Elem()
-	for i := 0; i < src.NumField(); i++ {
-		if src.Field(i).IsZero() {
-			continue
-		}
-		dst.Field(i).Set(src.Field(i))
-	}
-	return opts
-}
-
-func openBoltAndNew[K ~string | ~uint64, V any](tb testing.TB, path string, opts *Options) (*DB[K, V], *bbolt.DB) {
+func openBoltAndNew[K ~string | ~uint64, V any](tb testing.TB, path string, options ...Options) (*DB[K, V], *bbolt.DB) {
 	tb.Helper()
 	raw, err := bbolt.Open(path, 0o600, nil)
 	if err != nil {
 		tb.Fatalf("bbolt.Open: %v", err)
+	}
+	var opts Options
+	if len(options) > 0 {
+		opts = options[0]
 	}
 	db, err := New[K, V](raw, opts)
 	if err != nil {
@@ -911,7 +896,7 @@ func assertNoOrderWindowSubsetString(t testing.TB, q *qx.QX, got, full []string,
 }
 
 func TestQuery_RouteEquivalence_StringKeys_Randomized(t *testing.T) {
-	db, _ := openTempDBString(t, &Options{AnalyzeInterval: -1})
+	db, _ := openTempDBString(t, Options{AnalyzeInterval: -1})
 
 	countries := []string{"NL", "PL", "DE", "Finland", "Iceland", "Thailand", "US"}
 	names := []string{"alice", "albert", "bob", "bobby", "carol", "dave", "eve", "zoe", "nik"}
@@ -1185,7 +1170,7 @@ func assertPreparedRouteEquivalenceString(
 }
 
 func TestQuery_RouteEquivalence_PreparedExecutionPlanner_StringKeys(t *testing.T) {
-	db, _ := openTempDBString(t, &Options{AnalyzeInterval: -1})
+	db, _ := openTempDBString(t, Options{AnalyzeInterval: -1})
 	r := newRand(20260303)
 	countries := []string{"NL", "PL", "DE", "Finland", "Iceland", "Thailand", "US"}
 	names := []string{"alice", "albert", "bob", "bobby", "carol", "dave", "eve", "zoe", "nik"}
@@ -1301,7 +1286,7 @@ func TestQuery_RouteEquivalence_PreparedExecutionPlanner_StringKeys(t *testing.T
 }
 
 func TestQueryCorrectnessAgainstSeqScan_Uint64Keys(t *testing.T) {
-	db, _ := openTempDBUint64(t, nil)
+	db, _ := openTempDBUint64(t)
 	_ = seedData(t, db, 80)
 
 	queries := []*qx.QX{
@@ -1382,7 +1367,7 @@ func TestQueryCorrectnessAgainstSeqScan_Uint64Keys(t *testing.T) {
 }
 
 func TestQuerySetEquivalence_StringKeys(t *testing.T) {
-	db, path := openTempDBString(t, nil)
+	db, path := openTempDBString(t)
 
 	for i := 1; i <= 20; i++ {
 		id := fmt.Sprintf("id-%02d", i)
@@ -1438,7 +1423,7 @@ func TestQuerySetEquivalence_StringKeys(t *testing.T) {
 }
 
 func TestScanKeysUint64_SeekOrder(t *testing.T) {
-	db, _ := openTempDBUint64(t, nil)
+	db, _ := openTempDBUint64(t)
 
 	for i := 1; i <= 5; i++ {
 		r := &Rec{Name: fmt.Sprintf("n%d", i), Age: i}
@@ -1463,7 +1448,7 @@ func TestScanKeysUint64_SeekOrder(t *testing.T) {
 }
 
 func TestScanKeys_String_SeekLowerBound(t *testing.T) {
-	db, _ := openTempDBString(t, nil)
+	db, _ := openTempDBString(t)
 
 	for i := 1; i <= 5; i++ {
 		id := fmt.Sprintf("id-%02d", i)
@@ -1502,7 +1487,7 @@ func TestScanKeys_String_SeekLowerBound(t *testing.T) {
 }
 
 func TestSort_OrderStability_WithDupValues(t *testing.T) {
-	db, _ := openTempDBUint64(t, nil)
+	db, _ := openTempDBUint64(t)
 
 	for i := 1; i <= 10; i++ {
 		if err := db.Set(uint64(i), &Rec{Age: 20}); err != nil {
@@ -1525,7 +1510,7 @@ func TestSort_OrderStability_WithDupValues(t *testing.T) {
 }
 
 func TestQuery_NegativeNoOrder_ExcludesCorrectly_WithPaging(t *testing.T) {
-	db, _ := openTempDBUint64(t, nil)
+	db, _ := openTempDBUint64(t)
 	_ = seedData(t, db, 220)
 
 	q := qx.Query(
@@ -1545,7 +1530,7 @@ func TestQuery_NegativeNoOrder_ExcludesCorrectly_WithPaging(t *testing.T) {
 }
 
 func TestQuery_OrderVariants_BaseAndDelta_MatchSeqScanModel(t *testing.T) {
-	db, _ := openTempDBUint64(t, nil)
+	db, _ := openTempDBUint64(t)
 	_ = seedData(t, db, 320)
 
 	// Force a clean base snapshot (without field deltas) to exercise base order paths.
@@ -1637,7 +1622,7 @@ func TestQuery_ArrayOrder_RandomMutations_MatchSeqScan(t *testing.T) {
 	for _, tc := range cases {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
-			db, _ := openTempDBUint64(t, nil)
+			db, _ := openTempDBUint64(t)
 			_ = seedData(t, db, 420)
 
 			r := newRand(tc.seed)
@@ -1855,7 +1840,7 @@ func TestQuery_ArrayOrder_RandomMutations_MatchSeqScan(t *testing.T) {
 }
 
 func TestQuery_RandomMixedMultiWrites_MatchSeqScanModel(t *testing.T) {
-	db, _ := openTempDBUint64(t, nil)
+	db, _ := openTempDBUint64(t)
 	_ = seedData(t, db, 240)
 
 	r := newRand(20260326)
@@ -2122,7 +2107,7 @@ func TestQuery_RandomMixedMultiWrites_MatchSeqScanModel(t *testing.T) {
 }
 
 func TestQuery_ByArrayPos_Scalar_DuplicatePriority_BaseAndOverlay(t *testing.T) {
-	db, _ := openTempDBUint64(t, nil)
+	db, _ := openTempDBUint64(t)
 	_ = seedData(t, db, 260)
 
 	check := func(label string, q *qx.QX) {
@@ -2405,7 +2390,7 @@ func withNoisyEquivalentQuery(q *qx.QX, noiseMode int) *qx.QX {
 }
 
 func TestQuery_Metamorphic_NormalizeAndNoiseEquivalence(t *testing.T) {
-	db, _ := openTempDBUint64(t, &Options{AnalyzeInterval: -1})
+	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
 	_ = seedData(t, db, 20_000)
 
 	tests := []struct {
@@ -2766,7 +2751,7 @@ func TestQuery_Metamorphic_RandomizedProfiles_RouteEquivalence(t *testing.T) {
 	for pi := range profiles {
 		p := profiles[pi]
 		t.Run(p.name, func(t *testing.T) {
-			db, _ := openTempDBUint64(t, &Options{AnalyzeInterval: -1})
+			db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
 			seedMetamorphicDataProfile(t, db, 8_000, p)
 
 			r := newRand(777 + int64(pi)*1000)
@@ -2841,7 +2826,7 @@ func capturedNotInOrderOffsetQuery() *qx.QX {
 
 func openSkewedNotInRegressionDB(t *testing.T) *DB[uint64, Rec] {
 	t.Helper()
-	db, _ := openTempDBUint64(t, &Options{AnalyzeInterval: -1})
+	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
 	seedMetamorphicDataProfile(t, db, 8_000, metamorphicDataProfile{
 		name:        "Skewed",
 		scoreLevels: 30_000,
@@ -2923,7 +2908,7 @@ func TestRegression_NotInOrderOffset_NoStateCorruption(t *testing.T) {
 }
 
 func TestRegression_MultiTermHAS_LeadSelfCheck_RouteAndCount(t *testing.T) {
-	db, _ := openTempDBUint64(t, &Options{AnalyzeInterval: -1})
+	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
 	seedMetamorphicDataProfile(t, db, 8_000, metamorphicDataProfile{
 		name:        "Uniform",
 		scoreLevels: 50_000,
@@ -3012,7 +2997,7 @@ func TestRegression_MultiTermHAS_LeadSelfCheck_RouteAndCount(t *testing.T) {
 }
 
 func TestRegression_CountORByPredicates_MultiTermHASLead(t *testing.T) {
-	db, _ := openTempDBUint64(t, &Options{AnalyzeInterval: -1})
+	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
 	seedMetamorphicDataProfile(t, db, 8_000, metamorphicDataProfile{
 		name:        "Skewed",
 		scoreLevels: 30_000,
@@ -3062,7 +3047,7 @@ func TestRegression_CountORByPredicates_MultiTermHASLead(t *testing.T) {
 }
 
 func TestQuery_RouteEquivalence_PreparedExecutionPlanner_BaseAndDelta(t *testing.T) {
-	db, _ := openTempDBUint64(t, &Options{AnalyzeInterval: -1})
+	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
 	_ = seedData(t, db, 8_000)
 
 	if err := db.RebuildIndex(); err != nil {

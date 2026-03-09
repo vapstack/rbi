@@ -14,7 +14,7 @@ import (
 )
 
 func TestUnique_QueryEQ_Max1Equivalent(t *testing.T) {
-	db, _ := openTempDBUint64Unique(t, nil)
+	db, _ := openTempDBUint64Unique(t)
 
 	if err := db.Set(1, &UniqueTestRec{Email: "a@x", Code: 1}); err != nil {
 		t.Fatalf("Set: %v", err)
@@ -63,12 +63,12 @@ func TestUnique_QueryEQ_Max1Equivalent(t *testing.T) {
 
 func TestUnique_QueryEQ_UsesUniquePlan_AcrossHitMissAndUnsatisfiable(t *testing.T) {
 	var events []TraceEvent
-	opts := optsWithDefaults(&Options{
+	opts := Options{
 		TraceSink: func(ev TraceEvent) {
 			events = append(events, ev)
 		},
 		TraceSampleEvery: 1,
-	})
+	}
 	db, _ := openTempDBUint64Unique(t, opts)
 
 	if err := db.Set(1, &UniqueTestRec{Email: "a@x", Code: 1, Tags: []string{"go"}}); err != nil {
@@ -132,7 +132,7 @@ func TestUnique_QueryEQ_UsesUniquePlan_AcrossHitMissAndUnsatisfiable(t *testing.
 }
 
 func TestUnique_Count_WithUniqueAnchor(t *testing.T) {
-	db, _ := openTempDBUint64Unique(t, nil)
+	db, _ := openTempDBUint64Unique(t)
 
 	if err := db.Set(1, &UniqueTestRec{Email: "a@x", Code: 1, Tags: []string{"go"}}); err != nil {
 		t.Fatalf("Set: %v", err)
@@ -173,7 +173,7 @@ func TestUnique_Count_WithUniqueAnchor(t *testing.T) {
 }
 
 func TestUnique_Set_DuplicateRejected(t *testing.T) {
-	db, _ := openTempDBUint64Unique(t, nil)
+	db, _ := openTempDBUint64Unique(t)
 
 	if err := db.Set(1, &UniqueTestRec{Email: "a@x", Code: 1}); err != nil {
 		t.Fatalf("Set: %v", err)
@@ -186,7 +186,7 @@ func TestUnique_Set_DuplicateRejected(t *testing.T) {
 }
 
 func TestUnique_Set_DuplicateRejected_WithSnapshotDelta(t *testing.T) {
-	db, _ := openTempDBUint64Unique(t, nil)
+	db, _ := openTempDBUint64Unique(t)
 
 	if err := db.Set(1, &UniqueTestRec{Email: "a@x", Code: 1}); err != nil {
 		t.Fatalf("Set: %v", err)
@@ -199,7 +199,7 @@ func TestUnique_Set_DuplicateRejected_WithSnapshotDelta(t *testing.T) {
 }
 
 func TestUnique_Set_SameRecordUpdateAllowed(t *testing.T) {
-	db, _ := openTempDBUint64Unique(t, nil)
+	db, _ := openTempDBUint64Unique(t)
 
 	if err := db.Set(1, &UniqueTestRec{Email: "a@x", Code: 1}); err != nil {
 		t.Fatalf("Set: %v", err)
@@ -210,7 +210,7 @@ func TestUnique_Set_SameRecordUpdateAllowed(t *testing.T) {
 }
 
 func TestUnique_Patch_ConflictingUpdateRejected(t *testing.T) {
-	db, _ := openTempDBUint64Unique(t, nil)
+	db, _ := openTempDBUint64Unique(t)
 
 	if err := db.Set(1, &UniqueTestRec{Email: "a@x", Code: 1}); err != nil {
 		t.Fatalf("Set: %v", err)
@@ -229,7 +229,7 @@ func TestUnique_Patch_ConflictingUpdateRejected(t *testing.T) {
 }
 
 func TestUnique_NilAllowedMultipleTimes(t *testing.T) {
-	db, _ := openTempDBUint64Unique(t, nil)
+	db, _ := openTempDBUint64Unique(t)
 
 	if err := db.Set(1, &UniqueTestRec{Email: "a@x", Code: 1, Opt: nil}); err != nil {
 		t.Fatalf("Set: %v", err)
@@ -240,7 +240,7 @@ func TestUnique_NilAllowedMultipleTimes(t *testing.T) {
 }
 
 func TestUnique_OptDuplicateRejected(t *testing.T) {
-	db, _ := openTempDBUint64Unique(t, nil)
+	db, _ := openTempDBUint64Unique(t)
 
 	v := "same"
 
@@ -255,7 +255,7 @@ func TestUnique_OptDuplicateRejected(t *testing.T) {
 }
 
 func TestUnique_BatchSet_DuplicateWithinBatchRejected(t *testing.T) {
-	db, _ := openTempDBUint64Unique(t, nil)
+	db, _ := openTempDBUint64Unique(t)
 
 	ids := []uint64{1, 2}
 	vals := []*UniqueTestRec{
@@ -270,7 +270,7 @@ func TestUnique_BatchSet_DuplicateWithinBatchRejected(t *testing.T) {
 }
 
 func TestUnique_BatchSet_DuplicateAgainstDBRejected(t *testing.T) {
-	db, _ := openTempDBUint64Unique(t, nil)
+	db, _ := openTempDBUint64Unique(t)
 
 	if err := db.Set(1, &UniqueTestRec{Email: "a@x", Code: 1}); err != nil {
 		t.Fatalf("Set: %v", err)
@@ -289,7 +289,7 @@ func TestUnique_BatchSet_DuplicateAgainstDBRejected(t *testing.T) {
 }
 
 func TestUnique_BatchSet_SwapValuesAllowed(t *testing.T) {
-	db, _ := openTempDBUint64Unique(t, nil)
+	db, _ := openTempDBUint64Unique(t)
 
 	if err := db.Set(1, &UniqueTestRec{Email: "x@x", Code: 10}); err != nil {
 		t.Fatalf("Set: %v", err)
@@ -310,7 +310,7 @@ func TestUnique_BatchSet_SwapValuesAllowed(t *testing.T) {
 }
 
 func TestUnique_BatchSet_DuplicateID_TransientConflictResolvedByLastWrite(t *testing.T) {
-	db, _ := openTempDBUint64Unique(t, nil)
+	db, _ := openTempDBUint64Unique(t)
 
 	if err := db.Set(1, &UniqueTestRec{Email: "u1@x", Code: 1}); err != nil {
 		t.Fatalf("Set(1): %v", err)
@@ -359,7 +359,7 @@ func TestUnique_BatchSet_DuplicateID_TransientConflictResolvedByLastWrite(t *tes
 }
 
 func TestUnique_BatchSet_DuplicateID_FinalConflictStillRejected(t *testing.T) {
-	db, _ := openTempDBUint64Unique(t, nil)
+	db, _ := openTempDBUint64Unique(t)
 
 	if err := db.Set(1, &UniqueTestRec{Email: "u1@x", Code: 1}); err != nil {
 		t.Fatalf("Set(1): %v", err)
@@ -390,7 +390,7 @@ func TestUnique_BatchSet_DuplicateID_FinalConflictStillRejected(t *testing.T) {
 
 func TestUnique_BatchSet_DuplicateNewID_FinalValueDrivesConstraint(t *testing.T) {
 	t.Run("final_non_conflicting_value_passes", func(t *testing.T) {
-		db, _ := openTempDBUint64Unique(t, nil)
+		db, _ := openTempDBUint64Unique(t)
 
 		if err := db.Set(2, &UniqueTestRec{Email: "u2@x", Code: 2}); err != nil {
 			t.Fatalf("Set(2): %v", err)
@@ -417,7 +417,7 @@ func TestUnique_BatchSet_DuplicateNewID_FinalValueDrivesConstraint(t *testing.T)
 	})
 
 	t.Run("final_conflicting_value_fails", func(t *testing.T) {
-		db, _ := openTempDBUint64Unique(t, nil)
+		db, _ := openTempDBUint64Unique(t)
 
 		if err := db.Set(2, &UniqueTestRec{Email: "u2@x", Code: 2}); err != nil {
 			t.Fatalf("Set(2): %v", err)
@@ -445,7 +445,7 @@ func TestUnique_BatchSet_DuplicateNewID_FinalValueDrivesConstraint(t *testing.T)
 }
 
 func TestUnique_BatchDeleteThenSet_ReusesFreedValueInSameTx(t *testing.T) {
-	db, _ := openTempDBUint64Unique(t, nil)
+	db, _ := openTempDBUint64Unique(t)
 
 	if err := db.Set(1, &UniqueTestRec{Email: "a@x", Code: 1}); err != nil {
 		t.Fatalf("Set(1): %v", err)
@@ -511,7 +511,7 @@ func TestUnique_BatchDeleteThenSet_ReusesFreedValueInSameTx(t *testing.T) {
 }
 
 func TestUnique_BatchPartialReject_PreservesAcceptedOpsAndIndex(t *testing.T) {
-	db, _ := openTempDBUint64Unique(t, nil)
+	db, _ := openTempDBUint64Unique(t)
 
 	if err := db.Set(1, &UniqueTestRec{Email: "a@x", Code: 1}); err != nil {
 		t.Fatalf("Set(1): %v", err)
@@ -597,8 +597,8 @@ func TestUnique_BatchPartialReject_PreservesAcceptedOpsAndIndex(t *testing.T) {
 }
 
 func TestUnique_ExecuteBatch_MixedOps_MatchesSequentialModel(t *testing.T) {
-	dbBatch, _ := openTempDBUint64Unique(t, nil)
-	dbSeq, _ := openTempDBUint64Unique(t, &Options{BatchMax: 1})
+	dbBatch, _ := openTempDBUint64Unique(t)
+	dbSeq, _ := openTempDBUint64Unique(t, Options{BatchMax: 1})
 
 	const idSpace = 32
 
@@ -852,7 +852,7 @@ func TestUnique_ExecuteBatch_MixedOps_MatchesSequentialModel(t *testing.T) {
 }
 
 func TestUnique_RandomMixedWrites_ModelConsistency(t *testing.T) {
-	db, _ := openTempDBUint64Unique(t, &Options{BatchMax: 1})
+	db, _ := openTempDBUint64Unique(t, Options{BatchMax: 1})
 
 	type modelRec struct {
 		Email string
@@ -1135,7 +1135,7 @@ func TestUnique_RandomMixedWrites_ModelConsistency(t *testing.T) {
 }
 
 func TestUnique_DeleteThenReuseAllowed(t *testing.T) {
-	db, _ := openTempDBUint64Unique(t, nil)
+	db, _ := openTempDBUint64Unique(t)
 
 	if err := db.Set(1, &UniqueTestRec{Email: "a@x", Code: 1}); err != nil {
 		t.Fatalf("Set: %v", err)
@@ -1149,7 +1149,7 @@ func TestUnique_DeleteThenReuseAllowed(t *testing.T) {
 }
 
 func TestUnique_ConcurrentSet_SingleWinner(t *testing.T) {
-	db, _ := openTempDBUint64Unique(t, nil)
+	db, _ := openTempDBUint64Unique(t)
 
 	const workers = 32
 
@@ -1225,7 +1225,7 @@ func TestUnique_ConcurrentSet_SingleWinner(t *testing.T) {
 }
 
 func TestUnique_BatchPatch_DuplicateWithinBatchRejected(t *testing.T) {
-	db, _ := openTempDBUint64Unique(t, nil)
+	db, _ := openTempDBUint64Unique(t)
 
 	if err := db.Set(1, &UniqueTestRec{Email: "a@x", Code: 1}); err != nil {
 		t.Fatalf("Set: %v", err)
@@ -1257,7 +1257,7 @@ func TestUnique_BatchPatch_DuplicateWithinBatchRejected(t *testing.T) {
 }
 
 func TestUnique_BatchPatch_DuplicateAgainstDBRejected(t *testing.T) {
-	db, _ := openTempDBUint64Unique(t, nil)
+	db, _ := openTempDBUint64Unique(t)
 
 	if err := db.Set(1, &UniqueTestRec{Email: "a@x", Code: 1}); err != nil {
 		t.Fatalf("Set: %v", err)
@@ -1299,7 +1299,7 @@ func TestUnique_BatchPatch_DuplicateAgainstDBRejected(t *testing.T) {
 }
 
 func TestUnique_BatchPatch_SwapValuesAllowed(t *testing.T) {
-	db, _ := openTempDBUint64Unique(t, nil)
+	db, _ := openTempDBUint64Unique(t)
 
 	if err := db.Set(1, &UniqueTestRec{Email: "x@x", Code: 10}); err != nil {
 		t.Fatalf("Set: %v", err)
@@ -1330,7 +1330,7 @@ func TestUnique_BatchPatch_SwapValuesAllowed(t *testing.T) {
 }
 
 func TestUnique_OptNilReleasesAndReuseAllowed(t *testing.T) {
-	db, _ := openTempDBUint64Unique(t, nil)
+	db, _ := openTempDBUint64Unique(t)
 	s := "same"
 
 	err := db.Set(1, &UniqueTestRec{Email: "a@x", Code: 1, Opt: &s})

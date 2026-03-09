@@ -6,7 +6,7 @@ import (
 )
 
 func TestPlannerStatsCollector_FullRefreshMatchesLockedSnapshot(t *testing.T) {
-	db, _ := openTempDBUint64(t, &Options{AnalyzeInterval: -1})
+	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
 	_ = seedData(t, db, 3_000)
 
 	db.mu.RLock()
@@ -39,7 +39,7 @@ func TestPlannerStatsCollector_FullRefreshMatchesLockedSnapshot(t *testing.T) {
 }
 
 func TestPlannerStatsCollector_PeriodicBudgetAdvancesCursor(t *testing.T) {
-	db, _ := openTempDBUint64(t, &Options{AnalyzeInterval: -1})
+	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
 	_ = seedData(t, db, 3_000)
 
 	db.mu.RLock()
@@ -96,7 +96,7 @@ func TestResolvePlannerAnalyzeInterval(t *testing.T) {
 }
 
 func TestPlannerAnalyzeScheduler_Disabled(t *testing.T) {
-	db, _ := openTempDBUint64(t, &Options{AnalyzeInterval: -1})
+	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
 
 	if db.planner.analyzer.stop != nil || db.planner.analyzer.done != nil {
 		t.Fatalf("scheduler should be disabled for negative interval")
@@ -113,7 +113,7 @@ func TestPlannerAnalyzeScheduler_Disabled(t *testing.T) {
 }
 
 func TestPlannerAnalyzeScheduler_StartAndStop(t *testing.T) {
-	db, _ := openTempDBUint64(t, &Options{AnalyzeInterval: 20 * time.Millisecond})
+	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: 20 * time.Millisecond})
 
 	if db.planner.analyzer.stop == nil || db.planner.analyzer.done == nil {
 		t.Fatalf("scheduler should be started")
@@ -160,7 +160,7 @@ func waitPlannerStatsVersionGreater(db *DB[uint64, Rec], version uint64, timeout
 }
 
 func TestPlannerStats_RefreshAndVersion(t *testing.T) {
-	db, _ := openTempDBUint64(t, nil)
+	db, _ := openTempDBUint64(t)
 	_ = seedData(t, db, 1_000)
 
 	s0 := db.PlannerStats()

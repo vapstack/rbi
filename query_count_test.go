@@ -18,7 +18,7 @@ func countByExprBitmap(t *testing.T, db *DB[uint64, Rec], expr qx.Expr) uint64 {
 }
 
 func TestCount_ByPredicates_BucketLead_MatchesBitmap(t *testing.T) {
-	db, _ := openTempDBUint64(t, &Options{AnalyzeInterval: -1})
+	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
 
 	for i := 1; i <= 20_000; i++ {
 		err := db.Set(uint64(i), &Rec{
@@ -56,7 +56,7 @@ func TestCount_ByPredicates_BucketLead_MatchesBitmap(t *testing.T) {
 }
 
 func TestCount_ORPredicates_FiveBranches_MatchesBitmap(t *testing.T) {
-	db, _ := openTempDBUint64(t, &Options{AnalyzeInterval: -1})
+	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
 
 	for i := 1; i <= 25_000; i++ {
 		err := db.Set(uint64(i), &Rec{
@@ -181,7 +181,7 @@ func TestCountPredicateMaterializationThresholds_Adaptive(t *testing.T) {
 }
 
 func TestCount_ScalarINSplit_MatchesBitmap(t *testing.T) {
-	db, _ := openTempDBUint64(t, &Options{AnalyzeInterval: -1})
+	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
 
 	countries := []string{"US", "DE", "FR", "IN", "NL"}
 	for i := 1; i <= 30_000; i++ {
@@ -218,7 +218,7 @@ func TestCount_ScalarINSplit_MatchesBitmap(t *testing.T) {
 }
 
 func TestCount_ScalarINSplit_WorksWithFieldDelta(t *testing.T) {
-	db, _ := openTempDBUint64(t, &Options{
+	db, _ := openTempDBUint64(t, Options{
 		SnapshotCompactorRequestEveryNWrites: 1 << 30,
 		SnapshotCompactorIdleInterval:        -1,
 		SnapshotDeltaLayerMaxDepth:           1 << 30,

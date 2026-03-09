@@ -428,7 +428,13 @@ const (
 	maxStoredStrMapSparseSlack  = 1 << 20
 )
 
-func (db *DB[K, V]) loadIndex() (map[string]struct{}, error) {
+func (db *DB[K, V]) loadIndex() (skipFields map[string]struct{}, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("%v", r)
+		}
+	}()
+
 	f, err := os.Open(db.rbiFile)
 	if err != nil {
 		return nil, err
@@ -443,10 +449,7 @@ func (db *DB[K, V]) loadIndex() (map[string]struct{}, error) {
 		return nil, fmt.Errorf("load: reading version: %w", err)
 	}
 
-	var (
-		skipFields map[string]struct{}
-		lenLoaded  bool
-	)
+	var lenLoaded bool
 	switch ver {
 	case 3:
 		skipFields, lenLoaded, err = db.loadIndexV3(reader)
@@ -1142,7 +1145,7 @@ func writeBitmap(writer *bufio.Writer, bm *roaring64.Bitmap) error {
 	return nil
 }
 
-func readBitmap(reader *bufio.Reader) (*roaring64.Bitmap, error) {
+func readBitmap(reader *bufio.Reader) (bm *roaring64.Bitmap, err error) {
 	size, err := binary.ReadUvarint(reader)
 	if err != nil {
 		return nil, err
@@ -1153,8 +1156,15 @@ func readBitmap(reader *bufio.Reader) (*roaring64.Bitmap, error) {
 	if size > (^uint64(0) >> 1) {
 		return nil, fmt.Errorf("bitmap size overflows int64: %v", size)
 	}
-	bm := getRoaringBuf()
+	bm = getRoaringBuf()
 	bm.Clear()
+	defer func() {
+		if r := recover(); r != nil {
+			releaseRoaringBuf(bm)
+			bm = nil
+			err = fmt.Errorf("corrupted roaring64 bitmap payload: %v", r)
+		}
+	}()
 	n, err := bm.ReadFrom(reader)
 	if err != nil {
 		releaseRoaringBuf(bm)

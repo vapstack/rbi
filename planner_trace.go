@@ -91,14 +91,17 @@ type queryTrace struct {
 	ev       TraceEvent
 }
 
-func traceSampleEvery(sampleEvery uint64, sink func(TraceEvent)) uint64 {
+func traceSampleEvery(sampleEvery int, sink func(TraceEvent)) uint64 {
 	if sink == nil {
+		return 0
+	}
+	if sampleEvery < 0 {
 		return 0
 	}
 	if sampleEvery == 0 {
 		return 1
 	}
-	return sampleEvery
+	return uint64(sampleEvery)
 }
 
 func (db *DB[K, V]) traceOrCalibrationSamplingEnabled() bool {

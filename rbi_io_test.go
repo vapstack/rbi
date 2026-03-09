@@ -13,7 +13,7 @@ import (
 )
 
 func TestPatchStrict_StructTags_NumConversion(t *testing.T) {
-	db, _ := openTempDBUint64(t, nil)
+	db, _ := openTempDBUint64(t)
 
 	if err := db.Set(1, &Rec{
 		Name:     "alice",
@@ -60,7 +60,7 @@ func TestPatchStrict_StructTags_NumConversion(t *testing.T) {
 }
 
 func TestPatchStrict_NilRules(t *testing.T) {
-	db, _ := openTempDBUint64(t, nil)
+	db, _ := openTempDBUint64(t)
 
 	s := "opt"
 	if err := db.Set(1, &Rec{
@@ -87,7 +87,7 @@ func TestPatchStrict_NilRules(t *testing.T) {
 }
 
 func TestMakePatch_PreCommit_DeepCopy_SliceValues(t *testing.T) {
-	db, _ := openTempDBUint64(t, nil)
+	db, _ := openTempDBUint64(t)
 
 	rec := &Rec{
 		Name: "alice",
@@ -150,7 +150,7 @@ func TestMakePatch_PreCommit_DeepCopy_SliceValues(t *testing.T) {
 }
 
 func TestCollectBatchPatch_PreCommit_CollectsAndDeepCopies_SliceValues(t *testing.T) {
-	db, _ := openTempDBUint64(t, nil)
+	db, _ := openTempDBUint64(t)
 
 	ids := []uint64{1, 2}
 	base := []*Rec{
@@ -252,7 +252,7 @@ func TestCollectBatchPatch_PreCommit_CollectsAndDeepCopies_SliceValues(t *testin
 /**/
 
 func TestTruncate(t *testing.T) {
-	db, _ := openTempDBUint64Unique(t, nil)
+	db, _ := openTempDBUint64Unique(t)
 
 	if err := db.Set(1, &UniqueTestRec{Email: "a@x", Code: 1, Tags: []string{"t1"}}); err != nil {
 		t.Fatalf("Set(1): %v", err)
@@ -371,7 +371,7 @@ func TestTruncate(t *testing.T) {
 func TestTruncate_NoDeadlock_WithConcurrentExecuteBatchWriter(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "truncate_deadlock.db")
-	db, raw := openBoltAndNew[uint64, Rec](t, path, nil)
+	db, raw := openBoltAndNew[uint64, Rec](t, path)
 
 	if err := db.Set(1, &Rec{Name: "seed", Age: 1}); err != nil {
 		t.Fatalf("seed Set: %v", err)

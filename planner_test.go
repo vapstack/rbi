@@ -17,7 +17,7 @@ func postingOf(ids ...uint64) postingList {
 }
 
 func TestPlannerCalibration_ObserveUpdatesMultiplier(t *testing.T) {
-	db, _ := openTempDBUint64(t, &Options{
+	db, _ := openTempDBUint64(t, Options{
 		AnalyzeInterval:        -1,
 		CalibrationEnabled:     true,
 		CalibrationSampleEvery: 1,
@@ -51,7 +51,7 @@ func TestPlannerCalibration_ObserveUpdatesMultiplier(t *testing.T) {
 }
 
 func TestPlannerCalibration_QueryPathUpdatesWithoutTracerSink(t *testing.T) {
-	db, _ := openTempDBUint64(t, &Options{
+	db, _ := openTempDBUint64(t, Options{
 		AnalyzeInterval:        -1,
 		CalibrationEnabled:     true,
 		CalibrationSampleEvery: 1,
@@ -92,7 +92,7 @@ func TestPlannerCalibration_QueryPathUpdatesWithoutTracerSink(t *testing.T) {
 }
 
 func TestPlannerCalibration_SampleEveryNormalization(t *testing.T) {
-	dbEnabled, _ := openTempDBUint64(t, &Options{
+	dbEnabled, _ := openTempDBUint64(t, Options{
 		AnalyzeInterval:        -1,
 		CalibrationEnabled:     true,
 		CalibrationSampleEvery: 0,
@@ -101,7 +101,7 @@ func TestPlannerCalibration_SampleEveryNormalization(t *testing.T) {
 		t.Fatalf("expected default calibration sampleEvery=%d, got=%d", defaultOptionsCalibrationSampleEvery, got)
 	}
 
-	dbDisabled, _ := openTempDBUint64(t, &Options{
+	dbDisabled, _ := openTempDBUint64(t, Options{
 		AnalyzeInterval:        -1,
 		CalibrationEnabled:     false,
 		CalibrationSampleEvery: 1,
@@ -112,7 +112,7 @@ func TestPlannerCalibration_SampleEveryNormalization(t *testing.T) {
 }
 
 func TestTraceAndCalibrationDisabled_BeginTraceReturnsNil(t *testing.T) {
-	db, _ := openTempDBUint64(t, &Options{
+	db, _ := openTempDBUint64(t, Options{
 		AnalyzeInterval:        -1,
 		CalibrationEnabled:     false,
 		CalibrationSampleEvery: 1,
@@ -130,7 +130,7 @@ func TestTraceAndCalibrationDisabled_BeginTraceReturnsNil(t *testing.T) {
 }
 
 func TestOrderRangeCoverage_ConsistencyBetweenPredicateKinds(t *testing.T) {
-	db, _ := openTempDBUint64(t, nil)
+	db, _ := openTempDBUint64(t)
 
 	s := []index{
 		{Key: indexKeyFromString("alice"), IDs: postingOf(1)},
@@ -257,7 +257,7 @@ func TestPlannerOrderedFallbackProbeFactor_Adaptive(t *testing.T) {
 }
 
 func TestPlannerCalibration_InfluencesORNoOrderDecision(t *testing.T) {
-	db, _ := openTempDBUint64(t, &Options{
+	db, _ := openTempDBUint64(t, Options{
 		AnalyzeInterval:        -1,
 		CalibrationEnabled:     true,
 		CalibrationSampleEvery: 1,
@@ -310,7 +310,7 @@ func TestPlannerCalibration_InfluencesORNoOrderDecision(t *testing.T) {
 }
 
 func TestPlannerCalibration_SaveLoadRoundTrip(t *testing.T) {
-	db, _ := openTempDBUint64(t, &Options{
+	db, _ := openTempDBUint64(t, Options{
 		AnalyzeInterval:    -1,
 		CalibrationEnabled: true,
 	})
@@ -335,15 +335,15 @@ func TestPlannerCalibration_SaveLoadRoundTrip(t *testing.T) {
 	}
 
 	path := filepath.Join(t.TempDir(), "planner_calibration.json")
-	if err := db.SaveCalibration(path); err != nil {
+	if err = db.SaveCalibration(path); err != nil {
 		t.Fatalf("SaveCalibration: %v", err)
 	}
 
-	db2, _ := openTempDBUint64(t, &Options{
+	db2, _ := openTempDBUint64(t, Options{
 		AnalyzeInterval:    -1,
 		CalibrationEnabled: true,
 	})
-	if err := db2.LoadCalibration(path); err != nil {
+	if err = db2.LoadCalibration(path); err != nil {
 		t.Fatalf("LoadCalibration: %v", err)
 	}
 
@@ -369,11 +369,11 @@ func TestPlannerCalibration_AutoPersist(t *testing.T) {
 	dbPath := filepath.Join(dir, "auto_persist.db")
 	calPath := filepath.Join(dir, "planner_calibration_auto.json")
 
-	opts := optsWithDefaults(&Options{
+	opts := Options{
 		AnalyzeInterval:        -1,
 		CalibrationEnabled:     true,
 		CalibrationPersistPath: calPath,
-	})
+	}
 
 	db, raw := openBoltAndNew[uint64, Rec](t, dbPath, opts)
 
@@ -411,7 +411,7 @@ func TestPlannerCalibration_AutoPersist(t *testing.T) {
 }
 
 func TestPlannerCalibration_SupportsExecutionPlanNames(t *testing.T) {
-	db, _ := openTempDBUint64(t, &Options{
+	db, _ := openTempDBUint64(t, Options{
 		AnalyzeInterval:    -1,
 		CalibrationEnabled: true,
 	})
@@ -499,7 +499,7 @@ func TestTracer_ORNoOrderAdaptiveSkipsBranchByThreshold(t *testing.T) {
 		mu.Unlock()
 	}
 
-	db, _ := openTempDBUint64(t, &Options{
+	db, _ := openTempDBUint64(t, Options{
 		AnalyzeInterval:  -1,
 		TraceSink:        sink,
 		TraceSampleEvery: 1,
@@ -554,7 +554,7 @@ func TestTracer_ORNoOrderAdaptiveSkipsBranchByThreshold(t *testing.T) {
 }
 
 func TestPlannerORNoOrderAdaptive_MatchesBaseline(t *testing.T) {
-	db, _ := openTempDBUint64(t, &Options{
+	db, _ := openTempDBUint64(t, Options{
 		AnalyzeInterval: -1,
 	})
 	_ = seedData(t, db, 20_000)
@@ -602,7 +602,7 @@ func TestPlannerORNoOrderAdaptive_MatchesBaseline(t *testing.T) {
 }
 
 func TestPlannerOROrderKWay_MatchesFallbackMerge(t *testing.T) {
-	db, _ := openTempDBUint64(t, &Options{
+	db, _ := openTempDBUint64(t, Options{
 		AnalyzeInterval: -1,
 	})
 	_ = seedData(t, db, 20_000)
@@ -662,7 +662,7 @@ func TestPlannerOROrderKWay_MatchesFallbackMerge(t *testing.T) {
 }
 
 func TestPlannerOROrderMergePaths_MatchBasic_WithOrderDelta(t *testing.T) {
-	db, _ := openTempDBUint64(t, &Options{
+	db, _ := openTempDBUint64(t, Options{
 		AnalyzeInterval: -1,
 	})
 	_ = seedData(t, db, 20_000)
@@ -752,7 +752,7 @@ func TestPlannerOROrderMergePaths_MatchBasic_WithOrderDelta(t *testing.T) {
 }
 
 func TestPlannerOROrderMergePaths_WithDeltaInsertDelete_MatchSeqScan(t *testing.T) {
-	db, _ := openTempDBUint64(t, &Options{
+	db, _ := openTempDBUint64(t, Options{
 		AnalyzeInterval: -1,
 	})
 	_ = seedData(t, db, 20_000)
@@ -891,7 +891,7 @@ func TestPlannerORKWayShouldFallbackRuntime(t *testing.T) {
 }
 
 func TestPlannerOROrderKWayRuntimeFallbackEnable(t *testing.T) {
-	db, _ := openTempDBUint64(t, &Options{
+	db, _ := openTempDBUint64(t, Options{
 		AnalyzeInterval: -1,
 	})
 	_ = seedData(t, db, 20_000)
@@ -954,7 +954,7 @@ func TestPlannerOROrderKWayRuntimeFallbackEnable(t *testing.T) {
 }
 
 func TestPlannerOrderedAnchor_MatchesBaseline(t *testing.T) {
-	db, _ := openTempDBUint64(t, &Options{
+	db, _ := openTempDBUint64(t, Options{
 		AnalyzeInterval: -1,
 	})
 	_ = seedData(t, db, 20_000)
@@ -1036,7 +1036,7 @@ func TestPlannerRouting_PrefersOrderedAnchorForMixedPredicates(t *testing.T) {
 		mu.Unlock()
 	}
 
-	db, _ := openTempDBUint64(t, &Options{
+	db, _ := openTempDBUint64(t, Options{
 		AnalyzeInterval:  -1,
 		TraceSink:        sink,
 		TraceSampleEvery: 1,
@@ -1088,7 +1088,7 @@ func TestPlannerRouting_PrefersExecutionForPrefixOrderLimit(t *testing.T) {
 		mu.Unlock()
 	}
 
-	db, _ := openTempDBUint64(t, &Options{
+	db, _ := openTempDBUint64(t, Options{
 		AnalyzeInterval:  -1,
 		TraceSink:        sink,
 		TraceSampleEvery: 1,
@@ -1141,7 +1141,7 @@ func TestPlannerRouting_PrefersExecutionForPrefixNoOrderLimit(t *testing.T) {
 		mu.Unlock()
 	}
 
-	db, _ := openTempDBUint64(t, &Options{
+	db, _ := openTempDBUint64(t, Options{
 		AnalyzeInterval:  -1,
 		TraceSink:        sink,
 		TraceSampleEvery: 1,
@@ -1185,7 +1185,7 @@ func TestPlannerRouting_PrefersExecutionForWidePrefixNoOrderLimit(t *testing.T) 
 		mu.Unlock()
 	}
 
-	db, _ := openTempDBUint64(t, &Options{
+	db, _ := openTempDBUint64(t, Options{
 		AnalyzeInterval:  -1,
 		TraceSink:        sink,
 		TraceSampleEvery: 1,
@@ -1226,7 +1226,7 @@ func TestPlannerRouting_PrefersExecutionForWidePrefixNoOrderLimit(t *testing.T) 
 }
 
 func TestPlannerRouting_AvoidsExecutionForWidePrefixLowHitRate(t *testing.T) {
-	db, _ := openTempDBUint64(t, &Options{
+	db, _ := openTempDBUint64(t, Options{
 		AnalyzeInterval: -1,
 	})
 	_ = seedData(t, db, 20_000)
@@ -1246,7 +1246,7 @@ func TestPlannerRouting_AvoidsExecutionForWidePrefixLowHitRate(t *testing.T) {
 }
 
 func TestPlannerRouting_AvoidsExecutionForWidePrefixZeroHitRate(t *testing.T) {
-	db, _ := openTempDBUint64(t, &Options{
+	db, _ := openTempDBUint64(t, Options{
 		AnalyzeInterval: -1,
 	})
 	_ = seedData(t, db, 20_000)
@@ -1266,7 +1266,7 @@ func TestPlannerRouting_AvoidsExecutionForWidePrefixZeroHitRate(t *testing.T) {
 }
 
 func TestPlannerOROrderMergeFallbackFirst_ComplexOffset(t *testing.T) {
-	db, _ := openTempDBUint64(t, &Options{
+	db, _ := openTempDBUint64(t, Options{
 		AnalyzeInterval: -1,
 	})
 	_ = seedData(t, db, 20_000)
@@ -1339,7 +1339,7 @@ func TestPlannerOROrderMergeFallbackFirst_ComplexOffset(t *testing.T) {
 }
 
 func TestPlannerOROrderMergeFallbackFirst_DisabledWithOrderDelta(t *testing.T) {
-	db, _ := openTempDBUint64(t, &Options{
+	db, _ := openTempDBUint64(t, Options{
 		AnalyzeInterval: -1,
 	})
 	_ = seedData(t, db, 20_000)
@@ -1393,7 +1393,7 @@ func TestPlannerOROrderMergeFallbackFirst_DisabledWithOrderDelta(t *testing.T) {
 }
 
 func TestTracer_OROrderRouteDecision_WithOrderDelta(t *testing.T) {
-	db, _ := openTempDBUint64(t, &Options{
+	db, _ := openTempDBUint64(t, Options{
 		AnalyzeInterval: -1,
 	})
 	_ = seedData(t, db, 20_000)
@@ -1479,7 +1479,7 @@ func TestPlannerRouting_PrefersExecutionForRangeOrderLimit(t *testing.T) {
 		mu.Unlock()
 	}
 
-	db, _ := openTempDBUint64(t, &Options{
+	db, _ := openTempDBUint64(t, Options{
 		AnalyzeInterval:  -1,
 		TraceSink:        sink,
 		TraceSampleEvery: 1,
@@ -1522,7 +1522,7 @@ func TestPlannerRouting_PrefersExecutionForRangeOrderLimit(t *testing.T) {
 }
 
 func TestPlannerCandidateOrder_MatchesSeqScan(t *testing.T) {
-	db, _ := openTempDBUint64(t, &Options{
+	db, _ := openTempDBUint64(t, Options{
 		AnalyzeInterval: -1,
 	})
 	_ = seedData(t, db, 20_000)
@@ -1557,7 +1557,7 @@ func TestPlannerCandidateOrder_MatchesSeqScan(t *testing.T) {
 }
 
 func TestPlannerCandidateNoOrder_RespectsWindowAndPredicateSet(t *testing.T) {
-	db, _ := openTempDBUint64(t, &Options{
+	db, _ := openTempDBUint64(t, Options{
 		AnalyzeInterval: -1,
 	})
 	_ = seedData(t, db, 20_000)

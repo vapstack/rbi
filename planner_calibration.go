@@ -52,14 +52,17 @@ type CalibrationSnapshot struct {
 	Samples     map[string]uint64  `json:"samples"`
 }
 
-func calibrationSampleEvery(enabled bool, sampleEvery uint64) uint64 {
+func calibrationSampleEvery(enabled bool, sampleEvery int) uint64 {
 	if !enabled {
+		return 0
+	}
+	if sampleEvery < 0 {
 		return 0
 	}
 	if sampleEvery == 0 {
 		return defaultOptionsCalibrationSampleEvery
 	}
-	return sampleEvery
+	return uint64(sampleEvery)
 }
 
 func newCalibration() *calibration {

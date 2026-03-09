@@ -50,7 +50,7 @@ func snapshotTestWaitTimeout(timeout time.Duration) time.Duration {
 }
 
 func TestSnapshotTxID_PublishedOnWrite(t *testing.T) {
-	db, _ := openTempDBUint64(t, nil)
+	db, _ := openTempDBUint64(t)
 
 	before := db.getSnapshot().txID
 
@@ -70,7 +70,7 @@ func TestSnapshotTxID_PublishedOnWrite(t *testing.T) {
 }
 
 func TestSnapshotTxID_PreviousTxRemainsPinable(t *testing.T) {
-	db, _ := openTempDBUint64(t, nil)
+	db, _ := openTempDBUint64(t)
 
 	if err := db.Set(1, &Rec{Name: "seed", Age: 10}); err != nil {
 		t.Fatalf("seed Set: %v", err)
@@ -94,7 +94,7 @@ func TestSnapshotTxID_PreviousTxRemainsPinable(t *testing.T) {
 }
 
 func TestSnapshotTxID_AdvancesWhenIndexingDisabled(t *testing.T) {
-	db, _ := openTempDBUint64(t, nil)
+	db, _ := openTempDBUint64(t)
 
 	db.DisableIndexing()
 
@@ -109,7 +109,7 @@ func TestSnapshotTxID_AdvancesWhenIndexingDisabled(t *testing.T) {
 }
 
 func TestSnapshotDelta_PublishedOnSet(t *testing.T) {
-	db, _ := openTempDBUint64(t, nil)
+	db, _ := openTempDBUint64(t)
 
 	if err := db.Set(1, &Rec{Name: "alice", Tags: []string{"go", "db"}}); err != nil {
 		t.Fatalf("Set: %v", err)
@@ -163,7 +163,7 @@ func TestSnapshotDelta_PublishedOnSet(t *testing.T) {
 }
 
 func TestSnapshotDelta_UpdateNeutralizesLenNoop(t *testing.T) {
-	db, _ := openTempDBUint64(t, nil)
+	db, _ := openTempDBUint64(t)
 
 	if err := db.Set(1, &Rec{Name: "alice", Tags: []string{"go"}}); err != nil {
 		t.Fatalf("seed Set: %v", err)
@@ -202,7 +202,7 @@ func TestSnapshotDelta_UpdateNeutralizesLenNoop(t *testing.T) {
 }
 
 func TestSnapshotDelta_WritePublishesDeltaByDefault(t *testing.T) {
-	db, _ := openTempDBUint64(t, nil)
+	db, _ := openTempDBUint64(t)
 	if err := db.Set(1, &Rec{Name: "alice", Age: 10}); err != nil {
 		t.Fatalf("Set: %v", err)
 	}
@@ -213,7 +213,7 @@ func TestSnapshotDelta_WritePublishesDeltaByDefault(t *testing.T) {
 }
 
 func TestSnapshotStrMap_OldSnapshotDoesNotSeeFutureKeyMappings(t *testing.T) {
-	db, _ := openTempDBString(t, nil)
+	db, _ := openTempDBString(t)
 
 	if err := db.Set("k1", &Rec{Name: "a", Age: 10}); err != nil {
 		t.Fatalf("Set k1: %v", err)
@@ -247,7 +247,7 @@ func TestSnapshotStrMap_OldSnapshotDoesNotSeeFutureKeyMappings(t *testing.T) {
 }
 
 func TestSnapshotStrMap_CompactsOverlayDepth(t *testing.T) {
-	db, _ := openTempDBString(t, nil)
+	db, _ := openTempDBString(t)
 	db.strmap.compactAt = 2
 
 	if err := db.Set("k1", &Rec{Name: "a", Age: 10}); err != nil {
@@ -292,7 +292,7 @@ func TestSnapshotStrMap_CompactsOverlayDepth(t *testing.T) {
 }
 
 func TestSnapshotStrMap_DeltaOverDenseBaseLookup(t *testing.T) {
-	db, _ := openTempDBString(t, nil)
+	db, _ := openTempDBString(t)
 	db.strmap.compactAt = 3
 
 	if err := db.Set("k1", &Rec{Name: "a", Age: 10}); err != nil {
@@ -374,7 +374,7 @@ func TestSnapshotDelta_StoreIndexPersistsOverlayState(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "persist_snapshot_delta.db")
 
-	db, raw := openBoltAndNew[uint64, Rec](t, path, nil)
+	db, raw := openBoltAndNew[uint64, Rec](t, path)
 
 	if err := db.Set(1, &Rec{Name: "alice", Age: 10}); err != nil {
 		_ = db.Close()
@@ -391,9 +391,8 @@ func TestSnapshotDelta_StoreIndexPersistsOverlayState(t *testing.T) {
 		t.Fatalf("raw close 1: %v", err)
 	}
 
-	db2, raw2 := openBoltAndNew[uint64, Rec](t, path, optsWithDefaults(&Options{
-		DisableIndexRebuild: true,
-	}))
+	opts := Options{DisableIndexRebuild: true}
+	db2, raw2 := openBoltAndNew[uint64, Rec](t, path, opts)
 	defer func() {
 		_ = db2.Close()
 		_ = raw2.Close()
@@ -417,7 +416,7 @@ func TestSnapshotDelta_StoreIndexPersistsOverlayState(t *testing.T) {
 }
 
 func TestQueryWorksWhenSnapshotDeltaEnabled(t *testing.T) {
-	db, _ := openTempDBUint64(t, nil)
+	db, _ := openTempDBUint64(t)
 	if err := db.Set(1, &Rec{Name: "alice", Age: 20, Tags: []string{"go", "db"}}); err != nil {
 		t.Fatalf("Set 1: %v", err)
 	}
@@ -475,7 +474,7 @@ func TestQueryWorksWhenSnapshotDeltaEnabled(t *testing.T) {
 
 func TestSnapshotDelta_UsesCandidateOrderWithoutMaterializedFallback(t *testing.T) {
 	var events []TraceEvent
-	db, _ := openTempDBUint64(t, &Options{
+	db, _ := openTempDBUint64(t, Options{
 		TraceSink: func(ev TraceEvent) {
 			events = append(events, ev)
 		},
@@ -518,7 +517,7 @@ func TestSnapshotDelta_UsesCandidateOrderWithoutMaterializedFallback(t *testing.
 }
 
 func TestSnapshotDelta_UsesOrderedPlanWithoutMaterializedFallback(t *testing.T) {
-	db, _ := openTempDBUint64(t, nil)
+	db, _ := openTempDBUint64(t)
 
 	if err := db.Set(1, &Rec{Meta: Meta{Country: "NL"}, Age: 30}); err != nil {
 		t.Fatalf("Set 1: %v", err)
@@ -571,7 +570,7 @@ func TestSnapshotDelta_UsesOrderedPlanWithoutMaterializedFallback(t *testing.T) 
 
 func TestSnapshotDelta_UsesORNoOrderPlanWithoutMaterializedFallback(t *testing.T) {
 	var events []TraceEvent
-	db, _ := openTempDBUint64(t, &Options{
+	db, _ := openTempDBUint64(t, Options{
 		AnalyzeInterval:  -1,
 		TraceSink:        func(ev TraceEvent) { events = append(events, ev) },
 		TraceSampleEvery: 1,
@@ -611,7 +610,7 @@ func TestSnapshotDelta_UsesORNoOrderPlanWithoutMaterializedFallback(t *testing.T
 
 func TestSnapshotDelta_UsesOROrderStreamPlanWithoutMaterializedFallback(t *testing.T) {
 	var events []TraceEvent
-	db, _ := openTempDBUint64(t, &Options{
+	db, _ := openTempDBUint64(t, Options{
 		AnalyzeInterval:        -1,
 		CalibrationEnabled:     true,
 		CalibrationSampleEvery: 1,
@@ -671,7 +670,7 @@ func TestSnapshotDelta_UsesOROrderStreamPlanWithoutMaterializedFallback(t *testi
 
 func TestSnapshotDelta_UsesBitmapFallbackForSafeOverlayShape(t *testing.T) {
 	var events []TraceEvent
-	db, _ := openTempDBUint64(t, &Options{
+	db, _ := openTempDBUint64(t, Options{
 		AnalyzeInterval:  -1,
 		TraceSink:        func(ev TraceEvent) { events = append(events, ev) },
 		TraceSampleEvery: 1,
@@ -705,7 +704,7 @@ func TestSnapshotDelta_UsesBitmapFallbackForSafeOverlayShape(t *testing.T) {
 
 func TestSnapshotDelta_UsesBitmapFallbackForArrayOrder(t *testing.T) {
 	var events []TraceEvent
-	db, _ := openTempDBUint64(t, &Options{
+	db, _ := openTempDBUint64(t, Options{
 		AnalyzeInterval:  -1,
 		TraceSink:        func(ev TraceEvent) { events = append(events, ev) },
 		TraceSampleEvery: 1,
@@ -739,7 +738,7 @@ func TestSnapshotDelta_UsesBitmapFallbackForArrayOrder(t *testing.T) {
 }
 
 func TestSnapshotDelta_DecideOrderedByCost_UsesOverlayWhenBaseOrderSliceEmpty(t *testing.T) {
-	db, _ := openTempDBUint64(t, &Options{
+	db, _ := openTempDBUint64(t, Options{
 		AnalyzeInterval: -1,
 	})
 
@@ -800,11 +799,11 @@ func TestSnapshotDelta_DecideOrderedByCost_UsesOverlayWhenBaseOrderSliceEmpty(t 
 }
 
 func TestSnapshotDelta_CompactionIntoBase(t *testing.T) {
-	opts := optsWithDefaults(&Options{
+	opts := Options{
 		SnapshotDeltaCompactFieldKeys:           1,
 		SnapshotDeltaCompactMaxFieldsPerPublish: 16,
 		SnapshotDeltaCompactUniverseOps:         1,
-	})
+	}
 
 	db, _ := openTempDBUint64(t, opts)
 
@@ -849,7 +848,7 @@ func TestSnapshotDelta_CompactionIntoBase(t *testing.T) {
 }
 
 func TestSnapshotDelta_UniverseBasePreservedAcrossNonUniverseWriteAfterCompaction(t *testing.T) {
-	db, _ := openTempDBUint64(t, &Options{
+	db, _ := openTempDBUint64(t, Options{
 		SnapshotDeltaCompactUniverseOps: 1,
 	})
 	if err := db.Set(1, &Rec{Name: "a", Age: 10}); err != nil {
@@ -882,7 +881,7 @@ func TestSnapshotDelta_UniverseBasePreservedAcrossNonUniverseWriteAfterCompactio
 }
 
 func TestSnapshotDelta_DefaultLimitsEnabled(t *testing.T) {
-	db, _ := openTempDBUint64(t, nil)
+	db, _ := openTempDBUint64(t)
 	if db.options.SnapshotDeltaLayerMaxDepth <= 0 {
 		t.Fatalf("SnapshotDeltaLayerMaxDepth must be enabled by default")
 	}
@@ -890,7 +889,7 @@ func TestSnapshotDelta_DefaultLimitsEnabled(t *testing.T) {
 
 func TestSnapshotDelta_LayerDepthIsBounded(t *testing.T) {
 	maxDepth := 2
-	db, _ := openTempDBUint64(t, &Options{
+	db, _ := openTempDBUint64(t, Options{
 		SnapshotDeltaLayerMaxDepth:              maxDepth,
 		SnapshotDeltaCompactMaxFieldsPerPublish: -1,
 	})
@@ -907,7 +906,7 @@ func TestSnapshotDelta_LayerDepthIsBounded(t *testing.T) {
 }
 
 func TestSnapshotCompactor_IdleForceCompactsDelta(t *testing.T) {
-	db, _ := openTempDBUint64(t, &Options{
+	db, _ := openTempDBUint64(t, Options{
 		SnapshotDeltaCompactFieldKeys:                    1 << 20,
 		SnapshotDeltaCompactFieldOps:                     1 << 20,
 		SnapshotDeltaCompactUniverseOps:                  1 << 20,
@@ -940,7 +939,7 @@ func TestSnapshotCompactor_IdleForceCompactsDelta(t *testing.T) {
 }
 
 func TestSnapshotCompactor_IdlePrunesRegistryToLatest(t *testing.T) {
-	db, _ := openTempDBUint64(t, &Options{
+	db, _ := openTempDBUint64(t, Options{
 		SnapshotDeltaCompactFieldKeys:           1 << 20,
 		SnapshotDeltaCompactFieldOps:            1 << 20,
 		SnapshotDeltaCompactUniverseOps:         1 << 20,
@@ -971,7 +970,7 @@ func TestSnapshotCompactor_IdlePrunesRegistryToLatest(t *testing.T) {
 }
 
 func TestSnapshotCompactor_IdlePrunesAfterPinnedSnapshotReleased(t *testing.T) {
-	db, _ := openTempDBUint64(t, &Options{
+	db, _ := openTempDBUint64(t, Options{
 		SnapshotDeltaCompactFieldKeys:           1 << 20,
 		SnapshotDeltaCompactFieldOps:            1 << 20,
 		SnapshotDeltaCompactUniverseOps:         1 << 20,
@@ -1063,7 +1062,7 @@ func TestOverlayDistinctCount_ExcludesFullyDeletedBucket(t *testing.T) {
 }
 
 func TestPinSnapshotByTxIDWait_FailsFastWhenLatestPassedTarget(t *testing.T) {
-	db, _ := openTempDBUint64(t, nil)
+	db, _ := openTempDBUint64(t)
 	if err := db.Set(1, &Rec{Name: "a", Age: 10}); err != nil {
 		t.Fatalf("Set 1: %v", err)
 	}
@@ -1093,7 +1092,7 @@ func TestPinSnapshotByTxIDWait_FailsFastWhenLatestPassedTarget(t *testing.T) {
 }
 
 func TestQuery_RetriesWithNewTxWhenSnapshotMissingForCurrentTx(t *testing.T) {
-	db, _ := openTempDBUint64(t, &Options{
+	db, _ := openTempDBUint64(t, Options{
 		SnapshotPinWaitTimeout: 100 * time.Millisecond,
 	})
 	if err := db.Set(1, &Rec{Name: "alice", Age: 10}); err != nil {
@@ -1125,7 +1124,7 @@ func TestQuery_RetriesWithNewTxWhenSnapshotMissingForCurrentTx(t *testing.T) {
 }
 
 func TestQuery_UsesLatestSnapshotWhenBoltTxAheadAndNotPending(t *testing.T) {
-	db, _ := openTempDBUint64(t, &Options{
+	db, _ := openTempDBUint64(t, Options{
 		SnapshotPinWaitTimeout: 200 * time.Millisecond,
 	})
 	if err := db.Set(1, &Rec{Name: "alice", Age: 10}); err != nil {
@@ -1158,7 +1157,7 @@ func TestQuery_UsesLatestSnapshotWhenBoltTxAheadAndNotPending(t *testing.T) {
 }
 
 func TestQuery_UsesLatestSnapshotWhenRegistryHasHoleForCurrentTx(t *testing.T) {
-	db, _ := openTempDBUint64(t, &Options{
+	db, _ := openTempDBUint64(t, Options{
 		SnapshotPinWaitTimeout: 200 * time.Millisecond,
 	})
 	if err := db.Set(1, &Rec{Name: "alice", Age: 10}); err != nil {
@@ -1189,7 +1188,7 @@ func TestQuery_UsesLatestSnapshotWhenRegistryHasHoleForCurrentTx(t *testing.T) {
 }
 
 func TestPinSnapshotByTxIDWait_FailsFastWhenTargetAheadAndNotPending(t *testing.T) {
-	db, _ := openTempDBUint64(t, nil)
+	db, _ := openTempDBUint64(t)
 	if err := db.Set(1, &Rec{Name: "seed", Age: 10}); err != nil {
 		t.Fatalf("Set: %v", err)
 	}
@@ -1208,7 +1207,7 @@ func TestPinSnapshotByTxIDWait_FailsFastWhenTargetAheadAndNotPending(t *testing.
 }
 
 func TestPinSnapshotByTxIDWait_WaitsForPendingAndSucceeds(t *testing.T) {
-	db, _ := openTempDBUint64(t, nil)
+	db, _ := openTempDBUint64(t)
 	if err := db.Set(1, &Rec{Name: "seed", Age: 10}); err != nil {
 		t.Fatalf("Set: %v", err)
 	}
@@ -1233,7 +1232,7 @@ func TestPinSnapshotByTxIDWait_WaitsForPendingAndSucceeds(t *testing.T) {
 }
 
 func TestPinSnapshotByTxIDWait_FailsFastWhenLatestEqualsTargetButRegistryMissing(t *testing.T) {
-	db, _ := openTempDBUint64(t, nil)
+	db, _ := openTempDBUint64(t)
 	if err := db.Set(1, &Rec{Name: "seed", Age: 10}); err != nil {
 		t.Fatalf("Set: %v", err)
 	}
@@ -1255,7 +1254,7 @@ func TestPinSnapshotByTxIDWait_FailsFastWhenLatestEqualsTargetButRegistryMissing
 }
 
 func TestPinSnapshotFloorByTxID_ReturnsNearestAvailableWhenExactMissing(t *testing.T) {
-	db, _ := openTempDBUint64(t, nil)
+	db, _ := openTempDBUint64(t)
 	if err := db.Set(1, &Rec{Name: "a", Age: 10}); err != nil {
 		t.Fatalf("Set 1: %v", err)
 	}
@@ -1294,8 +1293,8 @@ func TestPinSnapshotFloorByTxID_ReturnsNearestAvailableWhenExactMissing(t *testi
 
 func TestSnapshotRegistry_PrunesPastPinnedHead(t *testing.T) {
 	maxRegistry := 8
-	db, _ := openTempDBUint64(t, &Options{
-		SnapshotRegistryMax: uint(maxRegistry),
+	db, _ := openTempDBUint64(t, Options{
+		SnapshotRegistryMax: maxRegistry,
 	})
 	if err := db.Set(1, &Rec{Name: "seed", Age: 10}); err != nil {
 		t.Fatalf("seed Set: %v", err)
@@ -1327,8 +1326,8 @@ func TestSnapshotRegistry_PrunesPastPinnedHead(t *testing.T) {
 
 func TestSnapshotRegistry_CompactsHugeOrderWithPinnedHead(t *testing.T) {
 	maxRegistry := 4
-	db, _ := openTempDBUint64(t, &Options{
-		SnapshotRegistryMax: uint(maxRegistry),
+	db, _ := openTempDBUint64(t, Options{
+		SnapshotRegistryMax: maxRegistry,
 	})
 
 	db.snapshot.mu.Lock()
@@ -1367,10 +1366,10 @@ func TestSnapshotRegistry_CompactsHugeOrderWithPinnedHead(t *testing.T) {
 }
 
 func TestAccumulateDeltaLayerState_SkipsCompactionForLargeBaseSmallDelta(t *testing.T) {
-	opt := DefaultOptions()
-	opt.SnapshotDeltaCompactFieldKeys = 1
-	opt.SnapshotDeltaCompactFieldOps = 0
-	opt.SnapshotDeltaCompactMaxFieldsPerPublish = 4
+	opt := Options{
+		SnapshotDeltaCompactFieldKeys:           1,
+		SnapshotDeltaCompactMaxFieldsPerPublish: 4,
+	}
 
 	baseSlice := make([]index, 0, defaultSnapshotDeltaCompactLargeBaseFieldKeys+1)
 	for i := 0; i <= defaultSnapshotDeltaCompactLargeBaseFieldKeys; i++ {
@@ -1385,7 +1384,7 @@ func TestAccumulateDeltaLayerState_SkipsCompactionForLargeBaseSmallDelta(t *test
 		},
 	}
 
-	nextBase, nextLayer, _ := accumulateDeltaLayerState(base, nil, 0, changes, opt)
+	nextBase, nextLayer, _ := accumulateDeltaLayerState(base, nil, 0, changes, &opt)
 	if nextBase["hot"] != origPtr {
 		t.Fatalf("expected no base compaction for large base with tiny delta")
 	}
@@ -1397,10 +1396,11 @@ func TestAccumulateDeltaLayerState_SkipsCompactionForLargeBaseSmallDelta(t *test
 }
 
 func TestAccumulateDeltaLayerState_ForceCompactionByOps(t *testing.T) {
-	opt := DefaultOptions()
-	opt.SnapshotDeltaCompactFieldKeys = 1
-	opt.SnapshotDeltaCompactFieldOps = 1
-	opt.SnapshotDeltaCompactMaxFieldsPerPublish = 4
+	opt := Options{
+		SnapshotDeltaCompactFieldKeys:           1,
+		SnapshotDeltaCompactFieldOps:            1,
+		SnapshotDeltaCompactMaxFieldsPerPublish: 4,
+	}
 
 	baseSlice := make([]index, 0, defaultSnapshotDeltaCompactLargeBaseFieldKeys+1)
 	for i := 0; i <= defaultSnapshotDeltaCompactLargeBaseFieldKeys; i++ {
@@ -1418,7 +1418,7 @@ func TestAccumulateDeltaLayerState_ForceCompactionByOps(t *testing.T) {
 		},
 	}
 
-	nextBase, nextLayer, _ := accumulateDeltaLayerState(base, nil, 0, changes, opt)
+	nextBase, nextLayer, _ := accumulateDeltaLayerState(base, nil, 0, changes, &opt)
 	if nextBase["hot"] == origPtr {
 		t.Fatalf("expected force-compaction to materialize new base field")
 	}

@@ -160,13 +160,12 @@ func openDynamicBenchDB(b *testing.B) (*DB[uint64, UserBench], string) {
 	dir := b.TempDir()
 	path := filepath.Join(dir, "dynamic_bench.db")
 
-	opts := DefaultOptions()
-	opts.DisableIndexLoad = true
-	opts.DisableIndexStore = true
-	opts.DisableIndexRebuild = true
-	opts.AnalyzeInterval = -1
-
-	db, _ := openBoltAndNew[uint64, UserBench](b, path, opts)
+	db, _ := openBoltAndNew[uint64, UserBench](b, path, Options{
+		DisableIndexLoad:    true,
+		DisableIndexStore:   true,
+		DisableIndexRebuild: true,
+		AnalyzeInterval:     -1,
+	})
 	return db, path
 }
 

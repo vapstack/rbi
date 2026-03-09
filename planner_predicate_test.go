@@ -8,7 +8,7 @@ import (
 )
 
 func TestBuildPredRange_PrefixMaterializationStoredInCache(t *testing.T) {
-	db, _ := openTempDBUint64(t, nil)
+	db, _ := openTempDBUint64(t)
 
 	for i := 0; i < 700; i++ {
 		err := db.Set(uint64(i+1), &Rec{
@@ -61,7 +61,7 @@ func TestBuildPredRange_PrefixMaterializationStoredInCache(t *testing.T) {
 }
 
 func TestBuildPredRange_PrefixMaterializationSkippedWhenCacheDisabled(t *testing.T) {
-	db, _ := openTempDBUint64(t, &Options{
+	db, _ := openTempDBUint64(t, Options{
 		SnapshotMaterializedPredCacheMaxEntries:          -1,
 		SnapshotMaterializedPredCacheMaxEntriesWithDelta: -1,
 	})

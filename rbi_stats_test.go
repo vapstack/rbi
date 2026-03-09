@@ -6,7 +6,7 @@ import (
 )
 
 func TestStats_ExposePlannerCalibrationAndSnapshotDiagnostics(t *testing.T) {
-	db, _ := openTempDBUint64(t, &Options{
+	db, _ := openTempDBUint64(t, Options{
 		CalibrationEnabled:     true,
 		CalibrationSampleEvery: 1,
 		AnalyzeInterval:        -1,
@@ -88,7 +88,7 @@ func TestStats_ExposePlannerCalibrationAndSnapshotDiagnostics(t *testing.T) {
 }
 
 func TestStats_PreservesIndexTimingFields(t *testing.T) {
-	db, _ := openTempDBUint64(t, nil)
+	db, _ := openTempDBUint64(t)
 
 	db.stats.Index.BuildTime = 123 * time.Millisecond
 	db.stats.Index.BuildRPS = 456
@@ -108,7 +108,7 @@ func TestStats_PreservesIndexTimingFields(t *testing.T) {
 }
 
 func TestStats_ComponentAccessors(t *testing.T) {
-	db, _ := openTempDBUint64(t, &Options{
+	db, _ := openTempDBUint64(t, Options{
 		CalibrationEnabled:     true,
 		CalibrationSampleEvery: 1,
 		AnalyzeInterval:        -1,
