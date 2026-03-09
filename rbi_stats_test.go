@@ -33,12 +33,6 @@ func TestStats_ExposePlannerCalibrationAndSnapshotDiagnostics(t *testing.T) {
 	if st.Index.ApproxHeapBytes < st.Index.Size {
 		t.Fatalf("expected approx heap bytes >= index size, got approx=%d index=%d", st.Index.ApproxHeapBytes, st.Index.Size)
 	}
-	if st.Runtime.Goroutines == 0 {
-		t.Fatalf("expected runtime goroutine count > 0")
-	}
-	if st.Runtime.HeapAlloc == 0 {
-		t.Fatalf("expected runtime heap_alloc > 0")
-	}
 
 	if st.Snapshot.TxID == 0 {
 		t.Fatalf("expected snapshot txID > 0")
@@ -139,14 +133,6 @@ func TestStats_ComponentAccessors(t *testing.T) {
 	}
 	if len(idx.UniqueFieldKeys) == 0 {
 		t.Fatalf("expected IndexStats.UniqueFieldKeys to be populated")
-	}
-
-	rt := db.RuntimeStats()
-	if rt.Goroutines == 0 {
-		t.Fatalf("expected RuntimeStats.Goroutines > 0")
-	}
-	if rt.HeapAlloc == 0 {
-		t.Fatalf("expected RuntimeStats.HeapAlloc > 0")
 	}
 
 	pl := db.PlannerStats()

@@ -666,7 +666,7 @@ func (db *DB[K, V]) executeCombinedBatchAttempt(active []*combineRequest[K, V]) 
 
 	txID := uint64(tx.ID())
 	db.markPending(txID)
-	commitErr := db.commitTx(tx, "batch")
+	commitErr := db.commit(tx, "batch")
 	if commitErr == nil {
 		committed = true
 	} else {

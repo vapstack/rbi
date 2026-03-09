@@ -2198,8 +2198,8 @@ func TestFailpoint_CommitMultiWritePaths_RollbackAndNoPendingRefs(t *testing.T) 
 
 	cases := []tc{
 		{
-			name: "set_many",
-			op:   "set_many",
+			name: "batch_set",
+			op:   "batch_set",
 			run: func(db *DB[uint64, Rec]) error {
 				return db.BatchSet(
 					[]uint64{1, 2},
@@ -2225,8 +2225,8 @@ func TestFailpoint_CommitMultiWritePaths_RollbackAndNoPendingRefs(t *testing.T) 
 			},
 		},
 		{
-			name: "patch_many",
-			op:   "patch_many",
+			name: "batch_patch",
+			op:   "batch_patch",
 			setup: func(t *testing.T, db *DB[uint64, Rec]) {
 				t.Helper()
 				if err := db.Set(1, &Rec{Name: "a", Age: 10, Meta: Meta{Country: "NL"}}); err != nil {
@@ -2258,8 +2258,8 @@ func TestFailpoint_CommitMultiWritePaths_RollbackAndNoPendingRefs(t *testing.T) 
 			},
 		},
 		{
-			name: "delete_many",
-			op:   "delete_many",
+			name: "batch_delete",
+			op:   "batch_delete",
 			setup: func(t *testing.T, db *DB[uint64, Rec]) {
 				t.Helper()
 				if err := db.Set(1, &Rec{Name: "a", Age: 10, Meta: Meta{Country: "NL"}}); err != nil {
@@ -2697,7 +2697,7 @@ func TestMultiWrite_CallbackError_RollbackDataAndIndex(t *testing.T) {
 
 	cases := []tc{
 		{
-			name: "set_many",
+			name: "batch_set",
 			run: func(db *DB[uint64, Rec], cb PreCommitFunc[uint64, Rec]) error {
 				return db.BatchSet(
 					[]uint64{1, 2},
@@ -2710,7 +2710,7 @@ func TestMultiWrite_CallbackError_RollbackDataAndIndex(t *testing.T) {
 			},
 		},
 		{
-			name: "patch_many",
+			name: "batch_patch",
 			run: func(db *DB[uint64, Rec], cb PreCommitFunc[uint64, Rec]) error {
 				return db.BatchPatch(
 					[]uint64{1, 2},
@@ -2724,7 +2724,7 @@ func TestMultiWrite_CallbackError_RollbackDataAndIndex(t *testing.T) {
 			},
 		},
 		{
-			name: "delete_many",
+			name: "batch_delete",
 			run: func(db *DB[uint64, Rec], cb PreCommitFunc[uint64, Rec]) error {
 				return db.BatchDelete([]uint64{1, 2}, cb)
 			},

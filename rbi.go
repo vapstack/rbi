@@ -7,7 +7,6 @@ import (
 	"maps"
 	"os"
 	"reflect"
-	"runtime"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -49,16 +48,16 @@ const (
 	defaultSnapshotCompactorIdleInterval            = 2 * time.Second
 	defaultBatchWindow                              = 200 * time.Microsecond
 	defaultBatchMax                                 = 16
-	defaultBatchMaxQueue                            = 512 // 1024
+	defaultBatchMaxQueue                            = 512
 	defaultBatchAllowCallbacks                      = false
-	defaultSnapshotDeltaCompactLargeBaseFieldKeys   = 128 << 10 // 64 << 10
-	defaultSnapshotDeltaCompactLargeBaseMinDeltaDiv = 32        // 16
-	defaultSnapshotDeltaCompactForceFieldOps        = 256 << 10 // 512 << 10
-	defaultSnapshotCompactorUrgentDepthSlack        = 4         // 8
-	defaultSnapshotStrMapCompactDepth               = 256       // 512
-	defaultNumericRangeBucketSize                   = 512       // 256
-	defaultNumericRangeBucketMinFieldKeys           = 8192      // 4096
-	defaultNumericRangeBucketMinSpanKeys            = 2048      // 1024
+	defaultSnapshotDeltaCompactLargeBaseFieldKeys   = 128 << 10
+	defaultSnapshotDeltaCompactLargeBaseMinDeltaDiv = 32
+	defaultSnapshotDeltaCompactForceFieldOps        = 256 << 10
+	defaultSnapshotCompactorUrgentDepthSlack        = 4
+	defaultSnapshotStrMapCompactDepth               = 256
+	defaultNumericRangeBucketSize                   = 512
+	defaultNumericRangeBucketMinFieldKeys           = 8192
+	defaultNumericRangeBucketMinSpanKeys            = 2048
 )
 
 // Options configures how indexer works with a bbolt database.
@@ -861,16 +860,13 @@ type (
 
 	// Stats is an aggregate diagnostic snapshot of DB state.
 	//
-	// It combines outputs of IndexStats, RuntimeStats, SnapshotStats,
-	// PlannerStats, CalibrationStats and BatchStats.
+	// It combines outputs of IndexStats, SnapshotStats, PlannerStats, CalibrationStats and BatchStats.
 	//
 	// For scenario-specific telemetry, prefer calling the corresponding
 	// component method directly to avoid unnecessary work.
 	Stats[K ~uint64 | ~string] struct {
 		// Index contains additional index shape diagnostics useful for memory analysis.
 		Index IndexStats[K]
-		// Runtime contains process-level memory counters sampled during Stats().
-		Runtime RuntimeStats
 		// Snapshot contains copy-on-write snapshot/compactor diagnostics.
 		Snapshot SnapshotStats
 		// Planner contains current planner statistics snapshot and settings.
@@ -960,39 +956,6 @@ type (
 		ApproxStructBytes uint64
 		// ApproxHeapBytes is rough index heap estimate from bitmaps, keys and structs.
 		ApproxHeapBytes uint64
-	}
-
-	// RuntimeStats contains process runtime memory counters.
-	RuntimeStats struct {
-		// Goroutines is the current number of goroutines.
-		Goroutines int
-
-		// HeapAlloc is bytes of allocated heap objects.
-		HeapAlloc uint64
-		// HeapInuse is bytes in in-use heap spans.
-		HeapInuse uint64
-		// HeapIdle is bytes in idle heap spans.
-		HeapIdle uint64
-		// HeapReleased is bytes returned from heap to OS.
-		HeapReleased uint64
-		// HeapObjects is the number of allocated heap objects.
-		HeapObjects uint64
-
-		// StackInuse is bytes in stack spans.
-		StackInuse uint64
-		// MSpanInuse is bytes in mspan allocator metadata.
-		MSpanInuse uint64
-		// MCacheInuse is bytes in mcache allocator metadata.
-		MCacheInuse uint64
-
-		// NextGC is the target heap size for the next GC cycle.
-		NextGC uint64
-		// LastGC is the timestamp of the last completed GC cycle.
-		LastGC time.Time
-		// NumGC is the total number of completed GC cycles.
-		NumGC uint32
-		// GCCPUFraction is the fraction of available CPU used by GC since start.
-		GCCPUFraction float64
 	}
 
 	// BatchStats contains write-combiner queue/batch/fallback diagnostics.
@@ -1240,7 +1203,7 @@ func (db *DB[K, V]) waitForInFlightOps() {
 	db.rebuilder.mu.Unlock()
 }
 
-func (db *DB[K, V]) commitTx(tx *bbolt.Tx, op string) error {
+func (db *DB[K, V]) commit(tx *bbolt.Tx, op string) error {
 	if hook := db.testHooks.beforeCommit; hook != nil {
 		if err := hook(op); err != nil {
 			return err
@@ -1277,8 +1240,7 @@ func (db *DB[K, V]) RebuildIndex() error {
 }
 
 // Stats returns an aggregate diagnostic snapshot by combining results of
-// IndexStats, RuntimeStats, SnapshotStats, PlannerStats, CalibrationStats and
-// BatchStats.
+// IndexStats, SnapshotStats, PlannerStats, CalibrationStats and BatchStats.
 //
 // On large databases this can be expensive.
 //
@@ -1287,7 +1249,6 @@ func (db *DB[K, V]) RebuildIndex() error {
 func (db *DB[K, V]) Stats() Stats[K] {
 	var s Stats[K]
 	s.Index = db.IndexStats()
-	s.Runtime = db.RuntimeStats()
 	s.Snapshot = db.SnapshotStats()
 	s.Planner = db.PlannerStats()
 	s.Calibration = db.CalibrationStats()
@@ -1410,29 +1371,6 @@ func (db *DB[K, V]) IndexStats() IndexStats[K] {
 		}
 	}
 	return idx
-}
-
-// RuntimeStats returns process runtime memory stats.
-func (db *DB[K, V]) RuntimeStats() RuntimeStats {
-	var out RuntimeStats
-	var mem runtime.MemStats
-	runtime.ReadMemStats(&mem)
-	out.Goroutines = runtime.NumGoroutine()
-	out.HeapAlloc = mem.HeapAlloc
-	out.HeapInuse = mem.HeapInuse
-	out.HeapIdle = mem.HeapIdle
-	out.HeapReleased = mem.HeapReleased
-	out.HeapObjects = mem.HeapObjects
-	out.StackInuse = mem.StackInuse
-	out.MSpanInuse = mem.MSpanInuse
-	out.MCacheInuse = mem.MCacheInuse
-	out.NextGC = mem.NextGC
-	if mem.LastGC > 0 {
-		out.LastGC = time.Unix(0, int64(mem.LastGC))
-	}
-	out.NumGC = mem.NumGC
-	out.GCCPUFraction = mem.GCCPUFraction
-	return out
 }
 
 // BatchStats returns write-combiner queue/batch/fallback diagnostics.
@@ -1608,7 +1546,7 @@ func (db *DB[K, V]) Truncate() error {
 
 	txID := uint64(tx.ID())
 	db.markPending(txID)
-	if err = db.commitTx(tx, "truncate"); err != nil {
+	if err = db.commit(tx, "truncate"); err != nil {
 		db.clearPending(txID)
 		return fmt.Errorf("commit error: %w", err)
 	}
