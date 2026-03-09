@@ -143,11 +143,14 @@ type Options struct {
 	// Higher values reduce overhead but adapt slower to workload shifts.
 	CalibrationSampleEvery int
 
-	// CalibrationPersistPath enables optional auto load/save of planner
-	// calibration state from/to this JSON file.
+	// PersistCalibration enables automatic load/save of planner calibration
+	// state in a sidecar JSON file next to the Bolt DB.
 	//
-	// Default: empty (disabled).
-	CalibrationPersistPath string
+	// File name is derived from the Bolt path and bucket name, using the
+	// same pattern as the index sidecar but with ".cal" extension.
+	//
+	// Default: false (disabled).
+	PersistCalibration bool
 
 	// BucketFillPercent controls bbolt bucket fill factor for write operations.
 	//
@@ -552,6 +555,11 @@ func New[K ~uint64 | ~string, V any](bolt *bbolt.DB, options Options) (db *DB[K,
 		}
 	}()
 
+	calPath := ""
+	if options.PersistCalibration {
+		calPath = bolt.Path() + "." + sanitizeSuffix(vname) + ".cal"
+	}
+
 	db = &DB[K, V]{
 		bolt:   bolt,
 		vtype:  vtype,
@@ -598,7 +606,7 @@ func New[K ~uint64 | ~string, V any](bolt *bbolt.DB, options Options) (db *DB[K,
 			calibrator: calibrator{
 				enabled:     options.CalibrationEnabled,
 				sampleEvery: calibrationSampleEvery(options.CalibrationEnabled, options.CalibrationSampleEvery),
-				persistPath: options.CalibrationPersistPath,
+				persistPath: calPath,
 			},
 		},
 	}

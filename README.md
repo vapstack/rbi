@@ -219,7 +219,7 @@ db, err := rbi.New[uint64, User](bolt, rbi.Options{
     // Online calibration settings
     CalibrationEnabled: true, // false disables calibration (default)
     CalibrationSampleEvery: 32, // 0 uses default (16), < 0 disables sampled calibration
-    CalibrationPersistPath: "planner_calibration.json", // optional auto load/save
+    PersistCalibration: true, // optional auto load/save to .cal file
     
     // Single-op write batcher settings
     BatchWindow: 100 * time.Microsecond,

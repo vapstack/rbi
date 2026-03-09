@@ -2,6 +2,7 @@ package rbi
 
 import (
 	"math"
+	"os"
 	"path/filepath"
 	"slices"
 	"sync"
@@ -367,15 +368,15 @@ func TestPlannerCalibration_SaveLoadRoundTrip(t *testing.T) {
 func TestPlannerCalibration_AutoPersist(t *testing.T) {
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "auto_persist.db")
-	calPath := filepath.Join(dir, "planner_calibration_auto.json")
 
 	opts := Options{
-		AnalyzeInterval:        -1,
-		CalibrationEnabled:     true,
-		CalibrationPersistPath: calPath,
+		AnalyzeInterval:    -1,
+		CalibrationEnabled: true,
+		PersistCalibration: true,
 	}
 
 	db, raw := openBoltAndNew[uint64, Rec](t, dbPath, opts)
+	calPath := db.planner.calibrator.persistPath
 
 	if err := db.SetCalibrationSnapshot(CalibrationSnapshot{
 		UpdatedAt: time.Now(),
@@ -394,6 +395,9 @@ func TestPlannerCalibration_AutoPersist(t *testing.T) {
 	}
 	if err := raw.Close(); err != nil {
 		t.Fatalf("raw close: %v", err)
+	}
+	if _, err := os.Stat(calPath); err != nil {
+		t.Fatalf("expected persisted calibration file %q: %v", calPath, err)
 	}
 
 	db2, raw2 := openBoltAndNew[uint64, Rec](t, dbPath, opts)
