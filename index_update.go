@@ -552,10 +552,6 @@ func (db *DB[K, V]) setIndexOnSuccessMulti(err error, txID uint64, idxs []uint64
 		db.clearPending(txID)
 		return err
 	}
-	if db.noIndex.Load() {
-		db.publishSnapshotNoLock(txID)
-		return nil
-	}
 
 	indexChanges := getWriteDeltaOuterMap()
 	defer releaseWriteDeltaOuterMap(indexChanges)
@@ -717,11 +713,6 @@ func (db *DB[K, V]) setIndexOnSuccess(err error, txID uint64, idx uint64, oldVal
 	if err != nil {
 		db.clearPending(txID)
 		return err
-	}
-
-	if db.noIndex.Load() {
-		db.publishSnapshotNoLock(txID)
-		return nil
 	}
 
 	indexChanges := getWriteDeltaOuterMap()

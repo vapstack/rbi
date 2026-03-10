@@ -38,37 +38,47 @@ type UserBench struct {
 
 const (
 	benchN     = 500_000
-	benchBatch = 100_000
+	benchBatch = 20_000
 )
 
-func openBenchDB(b *testing.B) (*DB[uint64, UserBench], *bbolt.DB, string) {
+type benchCacheMode struct {
+	suffix      string
+	withCaching bool
+}
+
+var benchCacheModes = []benchCacheMode{
+	{suffix: "WithCaching", withCaching: true},
+	{suffix: "NoCaching", withCaching: false},
+}
+
+func benchOptions(withCaching bool) Options {
+	opts := Options{
+		DisableIndexLoad:  true,
+		DisableIndexStore: true,
+	}
+	if !withCaching {
+		opts.SnapshotMaterializedPredCacheMaxEntries = -1
+		opts.SnapshotMaterializedPredCacheMaxEntriesWithDelta = -1
+	}
+	return opts
+}
+
+func openBenchDBWithCaching(b *testing.B, withCaching bool) (*DB[uint64, UserBench], *bbolt.DB, string) {
 	b.Helper()
 	dir, err := os.MkdirTemp("", "rbi-bench-*")
 	if err != nil {
 		b.Fatalf("os.MkdirTemp: %v", err)
 	}
 
-	db, raw := openBoltAndNew[uint64, UserBench](b, filepath.Join(dir, "bench.db"), Options{
-		DisableIndexLoad:    true,
-		DisableIndexStore:   true,
-		DisableIndexRebuild: true,
-	})
+	db, raw := openBoltAndNew[uint64, UserBench](b, filepath.Join(dir, "bench.db"), benchOptions(withCaching))
 	return db, raw, dir
 }
 
 func seedBenchData(b *testing.B, db *DB[uint64, UserBench], n int) {
 	b.Helper()
 
-	db.DisableIndexing()
 	db.DisableSync()
-
-	defer func() {
-		db.EnableIndexing()
-		db.EnableSync()
-		if err := db.RebuildIndex(); err != nil {
-			b.Fatalf("rebuilding index: %v", err)
-		}
-	}()
+	defer db.EnableSync()
 
 	r := newRand(1)
 
@@ -140,23 +150,25 @@ func seedBenchData(b *testing.B, db *DB[uint64, UserBench], n int) {
 }
 
 var (
-	oneDB  *DB[uint64, UserBench]
-	oneRaw *bbolt.DB
-	oneDir string
-	oneMu  sync.Mutex
+	benchDBs  = make(map[bool]*DB[uint64, UserBench])
+	benchRaws = make(map[bool]*bbolt.DB)
+	benchDirs = make(map[bool]string)
+	oneMu     sync.Mutex
 )
 
 func buildBenchDB(b *testing.B, n int) *DB[uint64, UserBench] {
+	return buildBenchDBWithCaching(b, n, true)
+}
+
+func buildBenchDBWithCaching(b *testing.B, n int, withCaching bool) *DB[uint64, UserBench] {
 	b.Helper()
 	oneMu.Lock()
 	defer oneMu.Unlock()
-	if oneDB != nil && !oneDB.closed.Load() {
-		return oneDB
+	if db := benchDBs[withCaching]; db != nil && !db.closed.Load() {
+		return db
 	}
 
-	closeBenchDBLocked()
-
-	db, raw, dir := openBenchDB(b)
+	db, raw, dir := openBenchDBWithCaching(b, withCaching)
 
 	b.StopTimer()
 	seedBenchData(b, db, n)
@@ -171,30 +183,44 @@ func buildBenchDB(b *testing.B, n int) *DB[uint64, UserBench] {
 	// b.Logf("unique field keys: %v", s.UniqueFieldKeys)
 
 	b.StartTimer()
-	oneDB = db
-	oneRaw = raw
-	oneDir = dir
+	benchDBs[withCaching] = db
+	benchRaws[withCaching] = raw
+	benchDirs[withCaching] = dir
 	return db
 }
 
-func closeBenchDBLocked() {
-	db := oneDB
-	raw := oneRaw
-	dir := oneDir
+func runBenchCacheModes(b *testing.B, fn func(*testing.B, bool)) {
+	b.Helper()
+	for _, mode := range benchCacheModes {
+		mode := mode
+		b.Run(mode.suffix, func(b *testing.B) {
+			fn(b, mode.withCaching)
+		})
+	}
+}
 
-	oneDB = nil
-	oneRaw = nil
-	oneDir = ""
+func runCountBenchCacheModes(b *testing.B, qf func() *qx.QX) {
+	b.Helper()
+	runBenchCacheModes(b, func(b *testing.B, withCaching bool) {
+		db := buildBenchDBWithCaching(b, benchN, withCaching)
+		runCountBench(b, db, qf())
+	})
+}
 
-	if db != nil {
-		_ = db.Close()
-	}
-	if raw != nil {
-		_ = raw.Close()
-	}
-	if dir != "" {
-		_ = os.RemoveAll(dir)
-	}
+func runQueryKeysBenchCacheModes(b *testing.B, qf func() *qx.QX) {
+	b.Helper()
+	runBenchCacheModes(b, func(b *testing.B, withCaching bool) {
+		db := buildBenchDBWithCaching(b, benchN, withCaching)
+		runQueryKeysBench(b, db, qf())
+	})
+}
+
+func runReadQueryBenchCacheModes(b *testing.B, qf func() *qx.QX) {
+	b.Helper()
+	runBenchCacheModes(b, func(b *testing.B, withCaching bool) {
+		db := buildBenchDBWithCaching(b, benchN, withCaching)
+		runReadQueryBench(b, db, qf())
+	})
 }
 
 func Benchmark_Query_Index_Count_Simple_EQ_Count(b *testing.B) {
@@ -230,155 +256,141 @@ func Benchmark_Query_Index_Count_Simple_NOTIN_Count(b *testing.B) {
 }
 
 func Benchmark_Query_Index_Count_Realistic_FeedEligible(b *testing.B) {
-	db := buildBenchDB(b, benchN)
-
-	// Feed eligibility: active, non-free, high score, relevant tags.
-	q := qx.Query(
-		qx.EQ("status", "active"),
-		qx.NOTIN("plan", []string{"free"}),
-		qx.GTE("score", 120.0),
-		qx.HASANY("tags", []string{"go", "security", "ops"}),
-	)
-	runCountBench(b, db, q)
+	runCountBenchCacheModes(b, func() *qx.QX {
+		return qx.Query(
+			qx.EQ("status", "active"),
+			qx.NOTIN("plan", []string{"free"}),
+			qx.GTE("score", 120.0),
+			qx.HASANY("tags", []string{"go", "security", "ops"}),
+		)
+	})
 }
 
 func Benchmark_Query_Index_Count_Realistic_ModerationQueue(b *testing.B) {
-	db := buildBenchDB(b, benchN)
-
-	// Moderation queue style OR of suspicious/priority cohorts.
-	q := qx.Query(
-		qx.OR(
-			qx.AND(
-				qx.EQ("status", "trial"),
-				qx.HASANY("roles", []string{"moderator", "admin"}),
+	runCountBenchCacheModes(b, func() *qx.QX {
+		return qx.Query(
+			qx.OR(
+				qx.AND(
+					qx.EQ("status", "trial"),
+					qx.HASANY("roles", []string{"moderator", "admin"}),
+				),
+				qx.AND(
+					qx.EQ("status", "paused"),
+					qx.GTE("age", 25),
+				),
+				qx.AND(
+					qx.EQ("plan", "enterprise"),
+					qx.HASANY("tags", []string{"security", "ops"}),
+				),
 			),
-			qx.AND(
-				qx.EQ("status", "paused"),
-				qx.GTE("age", 25),
-			),
-			qx.AND(
-				qx.EQ("plan", "enterprise"),
-				qx.HASANY("tags", []string{"security", "ops"}),
-			),
-		),
-	)
-	runCountBench(b, db, q)
+		)
+	})
 }
 
 func Benchmark_Query_Index_Count_Realistic_Discovery_OR(b *testing.B) {
-	db := buildBenchDB(b, benchN)
-
-	// Discovery/search audience expansion with broad OR branches.
-	q := qx.Query(
-		qx.OR(
-			qx.AND(
-				qx.PREFIX("email", "user1"),
-				qx.EQ("status", "active"),
-				qx.GTE("score", 60.0),
+	runCountBenchCacheModes(b, func() *qx.QX {
+		return qx.Query(
+			qx.OR(
+				qx.AND(
+					qx.PREFIX("email", "user1"),
+					qx.EQ("status", "active"),
+					qx.GTE("score", 60.0),
+				),
+				qx.AND(
+					qx.EQ("country", "DE"),
+					qx.HASANY("tags", []string{"rust", "go"}),
+					qx.GTE("age", 24),
+				),
+				qx.AND(
+					qx.EQ("plan", "enterprise"),
+					qx.HASANY("roles", []string{"admin", "support"}),
+					qx.NOTIN("status", []string{"banned"}),
+				),
 			),
-			qx.AND(
-				qx.EQ("country", "DE"),
-				qx.HASANY("tags", []string{"rust", "go"}),
-				qx.GTE("age", 24),
-			),
-			qx.AND(
-				qx.EQ("plan", "enterprise"),
-				qx.HASANY("roles", []string{"admin", "support"}),
-				qx.NOTIN("status", []string{"banned"}),
-			),
-		),
-	)
-	runCountBench(b, db, q)
+		)
+	})
 }
 
 func Benchmark_Query_Index_Count_Realistic_DraftReview(b *testing.B) {
-	db := buildBenchDB(b, benchN)
-
-	// Admin view: draft/trial review queue by region/role.
-	q := qx.Query(
-		qx.AND(
-			qx.EQ("status", "trial"),
-			qx.IN("country", []string{"US", "DE", "FR", "GB"}),
-			qx.NOTIN("plan", []string{"free"}),
-			qx.GTE("age", 21),
-			qx.HASANY("roles", []string{"admin", "moderator", "support"}),
-		),
-	)
-	runCountBench(b, db, q)
+	runCountBenchCacheModes(b, func() *qx.QX {
+		return qx.Query(
+			qx.AND(
+				qx.EQ("status", "trial"),
+				qx.IN("country", []string{"US", "DE", "FR", "GB"}),
+				qx.NOTIN("plan", []string{"free"}),
+				qx.GTE("age", 21),
+				qx.HASANY("roles", []string{"admin", "moderator", "support"}),
+			),
+		)
+	})
 }
 
 func Benchmark_Query_Index_Count_Realistic_SecurityAudit(b *testing.B) {
-	db := buildBenchDB(b, benchN)
-
-	// Security/audit count with role + score + region filters.
-	q := qx.Query(
-		qx.AND(
-			qx.HASANY("roles", []string{"admin", "support"}),
-			qx.NOTIN("status", []string{"banned"}),
-			qx.GTE("score", 50.0),
-			qx.IN("country", []string{"US", "DE", "GB", "FR"}),
-		),
-	)
-	runCountBench(b, db, q)
+	runCountBenchCacheModes(b, func() *qx.QX {
+		return qx.Query(
+			qx.AND(
+				qx.HASANY("roles", []string{"admin", "support"}),
+				qx.NOTIN("status", []string{"banned"}),
+				qx.GTE("score", 50.0),
+				qx.IN("country", []string{"US", "DE", "GB", "FR"}),
+			),
+		)
+	})
 }
 
 func Benchmark_Query_Index_Count_Realistic_Cohort_Retention(b *testing.B) {
-	db := buildBenchDB(b, benchN)
-
-	// Cohort analytics: retained/high-engagement segment.
-	q := qx.Query(
-		qx.AND(
-			qx.NOTIN("status", []string{"banned"}),
-			qx.IN("country", []string{"NL", "DE", "PL", "SE", "FR", "ES", "GB"}),
-			qx.GTE("age", 25),
-			qx.LTE("age", 45),
-			qx.HASANY("tags", []string{"go", "db", "security"}),
-			qx.GTE("score", 80.0),
-		),
-	)
-	runCountBench(b, db, q)
+	runCountBenchCacheModes(b, func() *qx.QX {
+		return qx.Query(
+			qx.AND(
+				qx.NOTIN("status", []string{"banned"}),
+				qx.IN("country", []string{"NL", "DE", "PL", "SE", "FR", "ES", "GB"}),
+				qx.GTE("age", 25),
+				qx.LTE("age", 45),
+				qx.HASANY("tags", []string{"go", "db", "security"}),
+				qx.GTE("score", 80.0),
+			),
+		)
+	})
 }
 
 func Benchmark_Query_Index_Count_Gap_BroadPrefix_Mixed(b *testing.B) {
-	db := buildBenchDB(b, benchN)
-
-	q := qx.Query(
-		qx.PREFIX("email", "user"),
-		qx.EQ("status", "active"),
-		qx.NOTIN("plan", []string{"free"}),
-	)
-	runCountBench(b, db, q)
+	runCountBenchCacheModes(b, func() *qx.QX {
+		return qx.Query(
+			qx.PREFIX("email", "user"),
+			qx.EQ("status", "active"),
+			qx.NOTIN("plan", []string{"free"}),
+		)
+	})
 }
 
 func Benchmark_Query_Index_Count_Gap_HeavyOR_MultiBranch(b *testing.B) {
-	db := buildBenchDB(b, benchN)
-
-	q := qx.Query(
-		qx.OR(
-			qx.AND(
-				qx.EQ("country", "DE"),
-				qx.HASANY("tags", []string{"rust", "go"}),
-				qx.GTE("score", 40.0),
+	runCountBenchCacheModes(b, func() *qx.QX {
+		return qx.Query(
+			qx.OR(
+				qx.AND(
+					qx.EQ("country", "DE"),
+					qx.HASANY("tags", []string{"rust", "go"}),
+					qx.GTE("score", 40.0),
+				),
+				qx.AND(
+					qx.PREFIX("email", "user1"),
+					qx.EQ("status", "active"),
+				),
+				qx.AND(
+					qx.EQ("plan", "enterprise"),
+					qx.GTE("age", 30),
+				),
+				qx.AND(
+					qx.HASANY("roles", []string{"admin"}),
+					qx.NOTIN("status", []string{"banned"}),
+				),
+				qx.AND(
+					qx.CONTAINS("name", "user-1"),
+					qx.GTE("score", 20.0),
+				),
 			),
-			qx.AND(
-				qx.PREFIX("email", "user1"),
-				qx.EQ("status", "active"),
-			),
-			qx.AND(
-				qx.EQ("plan", "enterprise"),
-				qx.GTE("age", 30),
-			),
-			qx.AND(
-				qx.HASANY("roles", []string{"admin"}),
-				qx.NOTIN("status", []string{"banned"}),
-			),
-			qx.AND(
-				qx.CONTAINS("name", "user-1"),
-				qx.GTE("score", 20.0),
-			),
-		),
-	)
-	runCountBench(b, db, q)
+		)
+	})
 }
 
 func Benchmark_Query_Index_Keys_Simple_First100(b *testing.B) {
@@ -431,49 +443,32 @@ func Benchmark_Query_Index_Keys_Medium_IN_Limit(b *testing.B) {
 }
 
 func Benchmark_Query_Index_Keys_Heavy_Range_Order_Limit(b *testing.B) {
-	db := buildBenchDB(b, benchN)
-	b.ReportAllocs()
-
-	q := qx.Query(
-		qx.EQ("status", "active"),
-		qx.GTE("age", 30),
-		qx.LT("age", 50),
-	).By("age", qx.ASC).Max(100)
-
-	b.ResetTimer()
-	for b.Loop() {
-		_, err := db.QueryKeys(q)
-		if err != nil {
-			b.Fatal(err)
-		}
-	}
+	runQueryKeysBenchCacheModes(b, func() *qx.QX {
+		return qx.Query(
+			qx.EQ("status", "active"),
+			qx.GTE("age", 30),
+			qx.LT("age", 50),
+		).By("age", qx.ASC).Max(100)
+	})
 }
 
 func Benchmark_Query_Index_Keys_Heavy_All(b *testing.B) {
-	db := buildBenchDB(b, benchN)
-	b.ReportAllocs()
-
-	q := qx.Query(
-		qx.OR(
-			qx.AND(
-				qx.EQ("country", "DE"),
-				qx.EQ("plan", "enterprise"),
-				qx.HASANY("tags", []string{"go", "security", "ops"}),
+	runQueryKeysBenchCacheModes(b, func() *qx.QX {
+		return qx.Query(
+			qx.OR(
+				qx.AND(
+					qx.EQ("country", "DE"),
+					qx.EQ("plan", "enterprise"),
+					qx.HASANY("tags", []string{"go", "security", "ops"}),
+				),
+				qx.AND(
+					qx.PREFIX("email", "user1"),
+					qx.LT("age", 25),
+				),
+				qx.HASNONE("roles", []string{"admin"}),
 			),
-			qx.AND(
-				qx.PREFIX("email", "user1"),
-				qx.LT("age", 25),
-			),
-			qx.HASNONE("roles", []string{"admin"}),
-		))
-
-	b.ResetTimer()
-	for b.Loop() {
-		_, err := db.QueryKeys(q)
-		if err != nil {
-			b.Fatal(err)
-		}
-	}
+		)
+	})
 }
 
 func Benchmark_Query_Index_Keys_Realistic_DashboardFilter_Limit(b *testing.B) {
@@ -497,23 +492,13 @@ func Benchmark_Query_Index_Keys_Realistic_DashboardFilter_Limit(b *testing.B) {
 }
 
 func Benchmark_Query_Index_Keys_Realistic_Analytics_Range_Order_Limit(b *testing.B) {
-	db := buildBenchDB(b, benchN)
-	b.ReportAllocs()
-
-	// SELECT * FROM users WHERE age >= 25 AND age <= 40 AND score > 0.5 ORDER BY score DESC LIMIT 100
-	q := qx.Query(
-		qx.GTE("age", 25),
-		qx.LTE("age", 40),
-		qx.GT("score", 0.5),
-	).By("score", qx.DESC).Max(100)
-
-	b.ResetTimer()
-	for b.Loop() {
-		_, err := db.QueryKeys(q)
-		if err != nil {
-			b.Fatal(err)
-		}
-	}
+	runQueryKeysBenchCacheModes(b, func() *qx.QX {
+		return qx.Query(
+			qx.GTE("age", 25),
+			qx.LTE("age", 40),
+			qx.GT("score", 0.5),
+		).By("score", qx.DESC).Max(100)
+	})
 }
 
 func Benchmark_Query_Index_Keys_Realistic_LeaderBoard(b *testing.B) {
@@ -644,102 +629,54 @@ func Benchmark_Query_Index_Keys_Realistic_Exclusion_All(b *testing.B) {
 }
 
 func Benchmark_Query_Index_Keys_Realistic_Autocomplete_Prefix_Limit(b *testing.B) {
-	db := buildBenchDB(b, benchN)
-	b.ReportAllocs()
-
-	q := qx.Query(qx.PREFIX("email", "user10")).Max(10)
-
-	b.ResetTimer()
-	for b.Loop() {
-		_, err := db.QueryKeys(q)
-		if err != nil {
-			b.Fatal(err)
-		}
-	}
+	runQueryKeysBenchCacheModes(b, func() *qx.QX {
+		return qx.Query(qx.PREFIX("email", "user10")).Max(10)
+	})
 }
 
 func Benchmark_Query_Index_Keys_Realistic_Autocomplete_Order_Limit(b *testing.B) {
-	db := buildBenchDB(b, benchN)
-	b.ReportAllocs()
-
-	q := qx.Query(
-		qx.PREFIX("email", "user10"),
-		qx.EQ("status", "active"),
-	).By("email", qx.ASC).Max(10)
-
-	b.ResetTimer()
-	for b.Loop() {
-		_, err := db.QueryKeys(q)
-		if err != nil {
-			b.Fatal(err)
-		}
-	}
+	runQueryKeysBenchCacheModes(b, func() *qx.QX {
+		return qx.Query(
+			qx.PREFIX("email", "user10"),
+			qx.EQ("status", "active"),
+		).By("email", qx.ASC).Max(10)
+	})
 }
 
 func Benchmark_Query_Index_Keys_Realistic_Autocomplete_Complex_Limit(b *testing.B) {
-	db := buildBenchDB(b, benchN)
-	b.ReportAllocs()
-
-	q := qx.Query(
-		qx.PREFIX("email", "user10"),
-		qx.EQ("status", "active"),
-		qx.NOTIN("plan", []string{"free"}),
-	).By("score", qx.DESC).Max(10)
-
-	b.ResetTimer()
-	for b.Loop() {
-		_, err := db.QueryKeys(q)
-		if err != nil {
-			b.Fatal(err)
-		}
-	}
+	runQueryKeysBenchCacheModes(b, func() *qx.QX {
+		return qx.Query(
+			qx.PREFIX("email", "user10"),
+			qx.EQ("status", "active"),
+			qx.NOTIN("plan", []string{"free"}),
+		).By("score", qx.DESC).Max(10)
+	})
 }
 
 func Benchmark_Query_Index_Keys_Realistic_ComplexSegment_Limit(b *testing.B) {
-	db := buildBenchDB(b, benchN)
-	b.ReportAllocs()
-
 	europe := []string{"NL", "DE", "PL", "SE", "FR", "ES", "GB"}
-
-	q := qx.Query(
-		qx.EQ("status", "active"),
-		qx.IN("country", europe),
-		qx.NE("plan", "free"),
-		qx.GTE("age", 20),
-		qx.HASANY("tags", []string{"security", "ops"}),
-	).Max(100)
-
-	b.ResetTimer()
-	b.ReportAllocs()
-	for b.Loop() {
-		_, err := db.QueryKeys(q)
-		if err != nil {
-			b.Fatal(err)
-		}
-	}
+	runQueryKeysBenchCacheModes(b, func() *qx.QX {
+		return qx.Query(
+			qx.EQ("status", "active"),
+			qx.IN("country", europe),
+			qx.NE("plan", "free"),
+			qx.GTE("age", 20),
+			qx.HASANY("tags", []string{"security", "ops"}),
+		).Max(100)
+	})
 }
 
 func Benchmark_Query_Index_Keys_Realistic_ComplexSegment_All(b *testing.B) {
-	db := buildBenchDB(b, benchN)
-	b.ReportAllocs()
-
 	europe := []string{"NL", "DE", "PL", "SE", "FR", "ES", "GB"}
-
-	q := qx.Query(
-		qx.EQ("status", "active"),
-		qx.IN("country", europe),
-		qx.NE("plan", "free"),
-		qx.GTE("age", 20),
-		qx.HASANY("tags", []string{"security", "ops"}),
-	)
-
-	b.ResetTimer()
-	for b.Loop() {
-		_, err := db.QueryKeys(q)
-		if err != nil {
-			b.Fatal(err)
-		}
-	}
+	runQueryKeysBenchCacheModes(b, func() *qx.QX {
+		return qx.Query(
+			qx.EQ("status", "active"),
+			qx.IN("country", europe),
+			qx.NE("plan", "free"),
+			qx.GTE("age", 20),
+			qx.HASANY("tags", []string{"security", "ops"}),
+		)
+	})
 }
 
 func Benchmark_Query_Index_Keys_Realistic_TopLevel_OR_Limit(b *testing.B) {
@@ -803,20 +740,11 @@ func Benchmark_Query_Index_Keys_Sort_EarlyExit(b *testing.B) {
 }
 
 func Benchmark_Query_Index_Keys_Sort_DeepOffset_Limit(b *testing.B) {
-	db := buildBenchDB(b, benchN)
-	b.ReportAllocs()
-
-	q := qx.Query(
-		qx.GTE("age", 18),
-	).By("score", qx.DESC).Skip(5000).Max(50)
-
-	b.ResetTimer()
-	for b.Loop() {
-		_, err := db.QueryKeys(q)
-		if err != nil {
-			b.Fatal(err)
-		}
-	}
+	runQueryKeysBenchCacheModes(b, func() *qx.QX {
+		return qx.Query(
+			qx.GTE("age", 18),
+		).By("score", qx.DESC).Skip(5000).Max(50)
+	})
 }
 
 func Benchmark_Query_Index_Keys_Sort_Complex_Order_Limit(b *testing.B) {
@@ -917,33 +845,15 @@ func Benchmark_Read_Query_Items_SimpleFetch(b *testing.B) {
 }
 
 func Benchmark_Read_Query_Items_HeavyFetch(b *testing.B) {
-	db := buildBenchDB(b, benchN)
-	b.ReportAllocs()
-
-	q := qx.Query(qx.GTE("age", 20)).By("score", qx.DESC).Max(100)
-
-	b.ResetTimer()
-	for b.Loop() {
-		_, err := db.Query(q)
-		if err != nil {
-			b.Fatal(err)
-		}
-	}
+	runReadQueryBenchCacheModes(b, func() *qx.QX {
+		return qx.Query(qx.GTE("age", 20)).By("score", qx.DESC).Max(100)
+	})
 }
 
 func Benchmark_Read_Query_Items_GT_NoMatch(b *testing.B) {
-	db := buildBenchDB(b, benchN)
-
-	q := qx.Query(qx.GT("age", 100))
-
-	b.ReportAllocs()
-	b.ResetTimer()
-
-	for b.Loop() {
-		if _, err := db.Query(q); err != nil {
-			b.Fatalf("Query: %v", err)
-		}
-	}
+	runReadQueryBenchCacheModes(b, func() *qx.QX {
+		return qx.Query(qx.GT("age", 100))
+	})
 }
 
 func Benchmark_Write_Helper_MakePatch(b *testing.B) {
@@ -981,129 +891,115 @@ func Benchmark_Write_Helper_MakePatch(b *testing.B) {
 }
 
 func Benchmark_Query_Index_Keys_Gap_FacetedSearch_OR_Order_Offset_Limit(b *testing.B) {
-	db := buildBenchDB(b, benchN)
-
-	q := qx.Query(
-		qx.OR(
-			qx.AND(
-				qx.EQ("status", "active"),
-				qx.IN("country", []string{"US", "DE", "NL", "PL"}),
-				qx.HASANY("tags", []string{"go", "ops"}),
-				qx.GTE("score", 60.0),
+	runQueryKeysBenchCacheModes(b, func() *qx.QX {
+		return qx.Query(
+			qx.OR(
+				qx.AND(
+					qx.EQ("status", "active"),
+					qx.IN("country", []string{"US", "DE", "NL", "PL"}),
+					qx.HASANY("tags", []string{"go", "ops"}),
+					qx.GTE("score", 60.0),
+				),
+				qx.AND(
+					qx.EQ("status", "trial"),
+					qx.NOTIN("plan", []string{"free"}),
+					qx.GTE("age", 25),
+					qx.LTE("age", 40),
+				),
+				qx.AND(
+					qx.HASANY("roles", []string{"admin", "moderator"}),
+					qx.GTE("score", 70.0),
+				),
 			),
-			qx.AND(
-				qx.EQ("status", "trial"),
-				qx.NOTIN("plan", []string{"free"}),
-				qx.GTE("age", 25),
-				qx.LTE("age", 40),
-			),
-			qx.AND(
-				qx.HASANY("roles", []string{"admin", "moderator"}),
-				qx.GTE("score", 70.0),
-			),
-		),
-	).By("score", qx.DESC).Skip(500).Max(100)
-
-	runQueryKeysBench(b, db, q)
+		).By("score", qx.DESC).Skip(500).Max(100)
+	})
 }
 
 func Benchmark_Query_Index_Keys_Gap_CRM_MultiBranch_OR_Limit(b *testing.B) {
-	db := buildBenchDB(b, benchN)
-
-	q := qx.Query(
-		qx.OR(
-			qx.AND(
-				qx.PREFIX("email", "user1"),
-				qx.EQ("status", "active"),
+	runQueryKeysBenchCacheModes(b, func() *qx.QX {
+		return qx.Query(
+			qx.OR(
+				qx.AND(
+					qx.PREFIX("email", "user1"),
+					qx.EQ("status", "active"),
+				),
+				qx.AND(
+					qx.SUFFIX("email", "@example.com"),
+					qx.NOTIN("country", []string{"US", "GB"}),
+					qx.GTE("score", 50.0),
+				),
+				qx.AND(
+					qx.EQ("plan", "enterprise"),
+					qx.HASANY("tags", []string{"security", "ops"}),
+				),
 			),
-			qx.AND(
-				qx.SUFFIX("email", "@example.com"),
-				qx.NOTIN("country", []string{"US", "GB"}),
-				qx.GTE("score", 50.0),
-			),
-			qx.AND(
-				qx.EQ("plan", "enterprise"),
-				qx.HASANY("tags", []string{"security", "ops"}),
-			),
-		),
-	).Max(150)
-
-	runQueryKeysBench(b, db, q)
+		).Max(150)
+	})
 }
 
 func Benchmark_Query_Index_Keys_Gap_OR_NoOrder_AdaptiveLateBranch_Limit(b *testing.B) {
-	db := buildBenchDB(b, benchN)
-
-	q := qx.Query(
-		qx.OR(
-			qx.EQ("email", "user000010@example.com"),
-			qx.EQ("email", "user000020@example.com"),
-			qx.GTE("email", "user490000@example.com"),
-		),
-	).Max(2)
-
-	runQueryKeysBench(b, db, q)
+	runQueryKeysBenchCacheModes(b, func() *qx.QX {
+		return qx.Query(
+			qx.OR(
+				qx.EQ("email", "user000010@example.com"),
+				qx.EQ("email", "user000020@example.com"),
+				qx.GTE("email", "user490000@example.com"),
+			),
+		).Max(2)
+	})
 }
 
 func Benchmark_Query_Index_Keys_Gap_HeavyOR_Order_Limit(b *testing.B) {
-	db := buildBenchDB(b, benchN)
-
-	q := qx.Query(
-		qx.OR(
-			qx.AND(
-				qx.EQ("country", "DE"),
-				qx.HASANY("tags", []string{"rust", "go"}),
-				qx.GTE("score", 40.0),
+	runQueryKeysBenchCacheModes(b, func() *qx.QX {
+		return qx.Query(
+			qx.OR(
+				qx.AND(
+					qx.EQ("country", "DE"),
+					qx.HASANY("tags", []string{"rust", "go"}),
+					qx.GTE("score", 40.0),
+				),
+				qx.AND(
+					qx.PREFIX("email", "user1"),
+					qx.EQ("status", "active"),
+				),
+				qx.AND(
+					qx.EQ("plan", "enterprise"),
+					qx.GTE("age", 30),
+				),
 			),
-			qx.AND(
-				qx.PREFIX("email", "user1"),
-				qx.EQ("status", "active"),
-			),
-			qx.AND(
-				qx.EQ("plan", "enterprise"),
-				qx.GTE("age", 30),
-			),
-		),
-	).By("score", qx.DESC).Max(120)
-
-	runQueryKeysBench(b, db, q)
+		).By("score", qx.DESC).Max(120)
+	})
 }
 
 func Benchmark_Query_Index_Keys_Gap_Mixed_EQ_HASANY_GTE_Order_Limit(b *testing.B) {
-	db := buildBenchDB(b, benchN)
-
-	q := qx.Query(
-		qx.EQ("status", "active"),
-		qx.HASANY("tags", []string{"go", "security", "ops"}),
-		qx.GTE("age", 25),
-	).By("score", qx.DESC).Max(100)
-
-	runQueryKeysBench(b, db, q)
+	runQueryKeysBenchCacheModes(b, func() *qx.QX {
+		return qx.Query(
+			qx.EQ("status", "active"),
+			qx.HASANY("tags", []string{"go", "security", "ops"}),
+			qx.GTE("age", 25),
+		).By("score", qx.DESC).Max(100)
+	})
 }
 
 func Benchmark_Query_Index_Keys_Gap_BroadPrefix_OtherOrder_Limit(b *testing.B) {
-	db := buildBenchDB(b, benchN)
-
-	q := qx.Query(
-		qx.PREFIX("email", "user"),
-		qx.EQ("status", "active"),
-		qx.NOTIN("plan", []string{"free"}),
-	).By("score", qx.DESC).Max(100)
-
-	runQueryKeysBench(b, db, q)
+	runQueryKeysBenchCacheModes(b, func() *qx.QX {
+		return qx.Query(
+			qx.PREFIX("email", "user"),
+			qx.EQ("status", "active"),
+			qx.NOTIN("plan", []string{"free"}),
+		).By("score", qx.DESC).Max(100)
+	})
 }
 
 func Benchmark_Query_Index_Keys_Gap_ArrayCountSort_MixedFilters_Offset_Limit(b *testing.B) {
-	db := buildBenchDB(b, benchN)
-
-	q := qx.Query(
-		qx.EQ("status", "active"),
-		qx.NOTIN("country", []string{"US", "GB"}),
-		qx.HASANY("tags", []string{"go", "security", "ops"}),
-		qx.GTE("age", 25),
-	).ByArrayCount("roles", qx.DESC).Skip(2000).Max(100)
-
-	runQueryKeysBench(b, db, q)
+	runQueryKeysBenchCacheModes(b, func() *qx.QX {
+		return qx.Query(
+			qx.EQ("status", "active"),
+			qx.NOTIN("country", []string{"US", "GB"}),
+			qx.HASANY("tags", []string{"go", "security", "ops"}),
+			qx.GTE("age", 25),
+		).ByArrayCount("roles", qx.DESC).Skip(2000).Max(100)
+	})
 }
 
 func runQueryKeysBench(b *testing.B, db *DB[uint64, UserBench], q *qx.QX) {
@@ -1124,6 +1020,18 @@ func runCountBench(b *testing.B, db *DB[uint64, UserBench], q *qx.QX) {
 	b.ResetTimer()
 	for b.Loop() {
 		_, err := db.Count(q)
+		if err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func runReadQueryBench(b *testing.B, db *DB[uint64, UserBench], q *qx.QX) {
+	b.Helper()
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		_, err := db.Query(q)
 		if err != nil {
 			b.Fatal(err)
 		}

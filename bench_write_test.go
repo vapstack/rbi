@@ -1,20 +1,25 @@
 package rbi
 
 import (
+	"fmt"
 	"math"
 	"path/filepath"
 	"strconv"
 	"testing"
+
+	"go.etcd.io/bbolt"
 )
 
-func buildWriteBenchDB(b *testing.B) (*DB[uint64, UserBench], uint64) {
+const writeBenchSeedBatch = 20_000
+
+func buildWriteBenchDB(b *testing.B) (*DB[uint64, UserBench], *bbolt.DB, uint64) {
 	b.Helper()
 
 	dir := b.TempDir()
 	path := filepath.Join(dir, "bench_write_seeded.db")
 
 	db, raw := openBoltAndNew[uint64, UserBench](b, path, Options{
-		DisableIndexRebuild: true,
+		DisableIndexStore: true,
 	})
 	b.Cleanup(func() {
 		_ = db.Close()
@@ -24,14 +29,12 @@ func buildWriteBenchDB(b *testing.B) (*DB[uint64, UserBench], uint64) {
 
 	seedCount := 200_000
 
-	db.DisableIndexing()
-
 	r := newRand(42)
 	countries := []string{"US", "NL", "DE", "PL", "SE", "FR", "GB", "ES"}
 	plans := []string{"free", "basic", "pro", "enterprise"}
 
-	ids := make([]uint64, 0, 1000)
-	vals := make([]*UserBench, 0, 1000)
+	ids := make([]uint64, 0, writeBenchSeedBatch)
+	vals := make([]*UserBench, 0, writeBenchSeedBatch)
 
 	for i := 1; i <= seedCount; i++ {
 		rec := &UserBench{
@@ -45,7 +48,7 @@ func buildWriteBenchDB(b *testing.B) (*DB[uint64, UserBench], uint64) {
 		ids = append(ids, uint64(i))
 		vals = append(vals, rec)
 
-		if len(ids) >= 1000 {
+		if len(ids) >= writeBenchSeedBatch {
 			if err := db.BatchSet(ids, vals); err != nil {
 				b.Fatalf("seed error: %v", err)
 			}
@@ -59,18 +62,76 @@ func buildWriteBenchDB(b *testing.B) (*DB[uint64, UserBench], uint64) {
 		}
 	}
 
-	if err := db.RebuildIndex(); err != nil {
-		b.Fatalf("rebuild: %v", err)
+	db.EnableSync()
+
+	return db, raw, uint64(seedCount)
+}
+
+func rawSetBench(db *DB[uint64, UserBench], raw *bbolt.DB, id uint64, rec *UserBench) error {
+	b := getEncodeBuf()
+	defer releaseEncodeBuf(b)
+
+	if err := db.encode(rec, b); err != nil {
+		return fmt.Errorf("encode: %w", err)
 	}
 
-	db.EnableSync()
-	db.EnableIndexing()
+	return raw.Update(func(tx *bbolt.Tx) error {
+		bucket := tx.Bucket(db.bucket)
+		if bucket == nil {
+			return fmt.Errorf("bucket does not exist")
+		}
+		bucket.FillPercent = db.options.BucketFillPercent
+		if err := bucket.Put(db.keyFromID(id), b.Bytes()); err != nil {
+			return fmt.Errorf("put: %w", err)
+		}
+		return nil
+	})
+}
 
-	return db, uint64(seedCount)
+func rawPatchBench(db *DB[uint64, UserBench], raw *bbolt.DB, id uint64, patch []Field) error {
+	return raw.Update(func(tx *bbolt.Tx) error {
+		bucket := tx.Bucket(db.bucket)
+		if bucket == nil {
+			return fmt.Errorf("bucket does not exist")
+		}
+
+		key := db.keyFromID(id)
+		oldBytes := bucket.Get(key)
+		if oldBytes == nil {
+			return ErrRecordNotFound
+		}
+
+		oldVal, err := db.decode(oldBytes)
+		if err != nil {
+			return fmt.Errorf("decode old: %w", err)
+		}
+		newVal, err := db.decode(oldBytes)
+		if err != nil {
+			db.ReleaseRecords(oldVal)
+			return fmt.Errorf("decode new: %w", err)
+		}
+		defer db.ReleaseRecords(oldVal, newVal)
+
+		if err = db.applyPatch(newVal, patch, true); err != nil {
+			return fmt.Errorf("apply patch: %w", err)
+		}
+
+		b := getEncodeBuf()
+		defer releaseEncodeBuf(b)
+		if err = db.encode(newVal, b); err != nil {
+			return fmt.Errorf("encode: %w", err)
+		}
+
+		bucket.FillPercent = db.options.BucketFillPercent
+		if err = bucket.Put(key, b.Bytes()); err != nil {
+			return fmt.Errorf("put: %w", err)
+		}
+		return nil
+	})
 }
 
 func Benchmark_Write_Set_New_Indexed(b *testing.B) {
-	db, startOffset := buildWriteBenchDB(b)
+	db, _, startOffset := buildWriteBenchDB(b)
 
 	rec := &UserBench{Name: "new", Age: 20, Country: "DE"}
 
@@ -86,8 +147,7 @@ func Benchmark_Write_Set_New_Indexed(b *testing.B) {
 }
 
 func Benchmark_Write_Set_New_NoIndex(b *testing.B) {
-	db, startOffset := buildWriteBenchDB(b)
-	db.DisableIndexing()
+	db, raw, startOffset := buildWriteBenchDB(b)
 
 	rec := &UserBench{Name: "new", Age: 20, Country: "DE"}
 
@@ -96,14 +156,14 @@ func Benchmark_Write_Set_New_NoIndex(b *testing.B) {
 
 	for i := 0; i < b.N; i++ {
 		id := startOffset + uint64(i) + 1
-		if err := db.Set(id, rec); err != nil {
+		if err := rawSetBench(db, raw, id, rec); err != nil {
 			b.Fatal(err)
 		}
 	}
 }
 
 func Benchmark_Write_Update_Indexed(b *testing.B) {
-	db, _ := buildWriteBenchDB(b)
+	db, _, _ := buildWriteBenchDB(b)
 	targetID := uint64(1000)
 
 	recA := &UserBench{Name: "A", Age: 20, Country: "US", Tags: []string{"a"}}
@@ -126,10 +186,9 @@ func Benchmark_Write_Update_Indexed(b *testing.B) {
 }
 
 func Benchmark_Write_Update_NoIndex(b *testing.B) {
-	db, _ := buildWriteBenchDB(b)
-	db.DisableIndexing()
-
+	db, raw, _ := buildWriteBenchDB(b)
 	targetID := uint64(1000)
+
 	recA := &UserBench{Name: "A", Age: 20, Country: "US", Tags: []string{"a"}}
 	recB := &UserBench{Name: "B", Age: 30, Country: "DE", Tags: []string{"b"}}
 
@@ -137,20 +196,20 @@ func Benchmark_Write_Update_NoIndex(b *testing.B) {
 	b.ReportAllocs()
 
 	for i := 0; i < b.N; i++ {
+		var rec *UserBench
 		if i%2 == 0 {
-			if err := db.Set(targetID, recA); err != nil {
-				b.Fatal(err)
-			}
+			rec = recA
 		} else {
-			if err := db.Set(targetID, recB); err != nil {
-				b.Fatal(err)
-			}
+			rec = recB
+		}
+		if err := rawSetBench(db, raw, targetID, rec); err != nil {
+			b.Fatal(err)
 		}
 	}
 }
 
 func Benchmark_Write_Patch_Indexed(b *testing.B) {
-	db, _ := buildWriteBenchDB(b)
+	db, _, _ := buildWriteBenchDB(b)
 	targetID := uint64(2000)
 
 	patchA := []Field{{Name: "age", Value: 100}}
@@ -173,10 +232,9 @@ func Benchmark_Write_Patch_Indexed(b *testing.B) {
 }
 
 func Benchmark_Write_Patch_NoIndex(b *testing.B) {
-	db, _ := buildWriteBenchDB(b)
-	db.DisableIndexing()
-
+	db, raw, _ := buildWriteBenchDB(b)
 	targetID := uint64(2000)
+
 	patchA := []Field{{Name: "age", Value: 100}}
 	patchB := []Field{{Name: "age", Value: 200}}
 
@@ -184,14 +242,14 @@ func Benchmark_Write_Patch_NoIndex(b *testing.B) {
 	b.ReportAllocs()
 
 	for i := 0; i < b.N; i++ {
+		var patch []Field
 		if i%2 == 0 {
-			if err := db.Patch(targetID, patchA); err != nil {
-				b.Fatal(err)
-			}
+			patch = patchA
 		} else {
-			if err := db.Patch(targetID, patchB); err != nil {
-				b.Fatal(err)
-			}
+			patch = patchB
+		}
+		if err := rawPatchBench(db, raw, targetID, patch); err != nil {
+			b.Fatal(err)
 		}
 	}
 }

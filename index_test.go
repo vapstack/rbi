@@ -400,78 +400,6 @@ func deltaEntryDelToArray(e indexDeltaEntry) []uint64 {
 	}
 	return e.del.ToArray()
 }
-func TestDisableIndexing_RebuildIndex(t *testing.T) {
-	db, _ := openTempDBUint64(t)
-
-	if err := db.Set(1, &Rec{Name: "alice", Age: 10, Tags: []string{"go"}}); err != nil {
-		t.Fatalf("Set: %v", err)
-	}
-
-	db.DisableIndexing()
-	if err := db.Set(2, &Rec{Name: "bob", Age: 20, Tags: []string{"java"}}); err != nil {
-		t.Fatalf("Set (noindex): %v", err)
-	}
-
-	_, err := db.QueryKeys(&qx.QX{Expr: qx.Expr{Op: qx.OpNOOP}})
-	if !errors.Is(err, ErrIndexDisabled) {
-		t.Fatalf("expected ErrIndexDisabled, got: %v", err)
-	}
-
-	if err = db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
-	}
-	db.EnableIndexing()
-
-	ids, err := db.QueryKeys(&qx.QX{Expr: qx.Expr{Op: qx.OpNOOP}})
-	if err != nil {
-		t.Fatalf("QueryKeys after rebuild: %v", err)
-	}
-	if len(ids) != 2 {
-		t.Fatalf("expected 2 ids, got %d (%v)", len(ids), ids)
-	}
-}
-
-func TestDisableIndexing_UniqueChecksDoNotBlockWritesOnStaleIndex(t *testing.T) {
-	db, _ := openTempDBUint64Unique(t)
-
-	if err := db.Set(1, &UniqueTestRec{Email: "a@x", Code: 1}); err != nil {
-		t.Fatalf("Set(1): %v", err)
-	}
-
-	db.DisableIndexing()
-
-	// Changes id=1, but index is intentionally stale while indexing is disabled.
-	if err := db.Set(1, &UniqueTestRec{Email: "b@x", Code: 1}); err != nil {
-		t.Fatalf("Set(1,b@x) with indexing disabled: %v", err)
-	}
-
-	// Should not be rejected by stale index entry for a@x.
-	if err := db.Set(2, &UniqueTestRec{Email: "a@x", Code: 2}); err != nil {
-		t.Fatalf("Set(2,a@x) should not fail on stale unique index: %v", err)
-	}
-
-	db.EnableIndexing()
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
-	}
-
-	idsA, err := db.QueryKeys(qx.Query(qx.EQ("email", "a@x")))
-	if err != nil {
-		t.Fatalf("QueryKeys(a@x): %v", err)
-	}
-	if len(idsA) != 1 || idsA[0] != 2 {
-		t.Fatalf("unexpected owners for a@x: %v", idsA)
-	}
-
-	idsB, err := db.QueryKeys(qx.Query(qx.EQ("email", "b@x")))
-	if err != nil {
-		t.Fatalf("QueryKeys(b@x): %v", err)
-	}
-	if len(idsB) != 1 || idsB[0] != 1 {
-		t.Fatalf("unexpected owners for b@x: %v", idsB)
-	}
-}
-
 func TestIndexPersistence(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "persist.db")
@@ -594,27 +522,18 @@ func TestRebuildIndex_CleanState(t *testing.T) {
 	if err := db.Set(2, &Rec{Name: "bob", Age: 30}); err != nil {
 		t.Fatal(err)
 	}
-
-	db.DisableIndexing()
 	if err := db.Set(3, &Rec{Name: "charlie", Age: 30}); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.Delete(2); err != nil {
 		t.Fatal(err)
 	}
-	db.EnableIndexing()
-
-	// verify broken state (index: 1, 2; data: 1, 3)
-	// query uses index, so it should find 1 and 2 (ghost), and miss 3.
 	cnt, err := db.Count(&qx.QX{Expr: qx.Expr{Op: qx.OpEQ, Field: "age", Value: 30}})
 	if err != nil {
 		t.Fatal(err)
 	}
-
-	// expecting index to be stale, indexer returns what's in bitmap:
-	// 1, 2 (2 is deleted but index not updated); 3 is missing
 	if cnt != 2 {
-		t.Logf("State before rebuild: expected 2 (stale), got %d. (Implementation specific)", cnt)
+		t.Fatalf("before rebuild: expected 2, got %d", cnt)
 	}
 
 	if err = db.RebuildIndex(); err != nil {

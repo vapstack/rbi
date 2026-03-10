@@ -1,6 +1,8 @@
 package rbi
 
 import (
+	"bufio"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"math/rand"
@@ -50,6 +52,60 @@ func openRawBolt(t *testing.T) (*bbolt.DB, string) {
 		t.Fatalf("bbolt.Open: %v", err)
 	}
 	return db, path
+}
+
+func readPersistedIndexSequence(tb testing.TB, path string) uint64 {
+	tb.Helper()
+
+	f, err := os.Open(path)
+	if err != nil {
+		tb.Fatalf("open persisted index: %v", err)
+	}
+	defer func() { _ = f.Close() }()
+
+	reader := bufio.NewReader(f)
+	if _, err = reader.ReadByte(); err != nil {
+		tb.Fatalf("read persisted index format byte: %v", err)
+	}
+	seq, err := binary.ReadUvarint(reader)
+	if err != nil {
+		tb.Fatalf("read persisted index sequence: %v", err)
+	}
+	return seq
+}
+
+func readPersistedIndexFormatByte(tb testing.TB, path string) byte {
+	tb.Helper()
+
+	f, err := os.Open(path)
+	if err != nil {
+		tb.Fatalf("open persisted index: %v", err)
+	}
+	defer func() { _ = f.Close() }()
+
+	reader := bufio.NewReader(f)
+	ver, err := reader.ReadByte()
+	if err != nil {
+		tb.Fatalf("read persisted index format byte: %v", err)
+	}
+	return ver
+}
+
+func readBucketSequence(tb testing.TB, raw *bbolt.DB, bucket []byte) uint64 {
+	tb.Helper()
+
+	var seq uint64
+	if err := raw.View(func(tx *bbolt.Tx) error {
+		b := tx.Bucket(bucket)
+		if b == nil {
+			return fmt.Errorf("bucket does not exist")
+		}
+		seq = b.Sequence()
+		return nil
+	}); err != nil {
+		tb.Fatalf("read bucket sequence: %v", err)
+	}
+	return seq
 }
 
 func TestMultiWrap_DifferentStructs(t *testing.T) {
@@ -180,11 +236,15 @@ func TestWrap_CorruptedPersistedIndex_RebuildsInsteadOfPanicking(t *testing.T) {
 	if err = db.Close(); err != nil {
 		t.Fatalf("initial Close: %v", err)
 	}
+	seq := readBucketSequence(t, rawDB, db.bucket)
 	if err = rawDB.Close(); err != nil {
 		t.Fatalf("initial raw Close: %v", err)
 	}
 
-	corrupted := []byte{3, 8, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff}
+	var enc [binary.MaxVarintLen64]byte
+	n := binary.PutUvarint(enc[:], seq)
+	corrupted := append([]byte{readPersistedIndexFormatByte(t, rbiPath)}, enc[:n]...)
+	corrupted = append(corrupted, 0xff, 0xff, 0xff, 0xff)
 	if err = os.WriteFile(rbiPath, corrupted, 0o600); err != nil {
 		t.Fatalf("corrupt .rbi: %v", err)
 	}
@@ -3012,14 +3072,14 @@ func TestFailpoint_CloseStoreIndexErrorStillCloses(t *testing.T) {
 	if !db.closed.Load() {
 		t.Fatal("expected db to be marked closed even when storeIndex fails")
 	}
-	if _, statErr := os.Stat(db.opnFile); !os.IsNotExist(statErr) {
-		t.Fatalf("expected .rbo flag file to be removed on Close, statErr=%v", statErr)
+	if _, statErr := os.Stat(db.rbiFile); !os.IsNotExist(statErr) {
+		t.Fatalf("expected persisted index to stay absent after failed Close, statErr=%v", statErr)
 	}
-	if err := db.Close(); err != nil {
+	if err = db.Close(); err != nil {
 		t.Fatalf("second Close must be no-op, got: %v", err)
 	}
 
-	if err := raw.View(func(tx *bbolt.Tx) error {
+	if err = raw.View(func(tx *bbolt.Tx) error {
 		b := tx.Bucket(db.bucket)
 		if b == nil {
 			return fmt.Errorf("bucket missing after close")
@@ -3030,6 +3090,148 @@ func TestFailpoint_CloseStoreIndexErrorStillCloses(t *testing.T) {
 		return nil
 	}); err != nil {
 		t.Fatalf("raw.View: %v", err)
+	}
+}
+
+func TestPersistedIndex_RemainsPresentUntilClose(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "persisted_index_sequence.db")
+
+	db, raw := openBoltAndNew[uint64, Rec](t, path)
+	if err := db.Set(1, &Rec{Name: "alice", Age: 30}); err != nil {
+		t.Fatalf("seed Set: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("seed Close: %v", err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatalf("seed raw close: %v", err)
+	}
+
+	db2, raw2 := openBoltAndNew[uint64, Rec](t, path)
+	defer func() {
+		_ = db2.Close()
+		_ = raw2.Close()
+	}()
+
+	if _, err := os.Stat(db2.rbiFile); err != nil {
+		t.Fatalf("expected persisted index before write, stat err=%v", err)
+	}
+	storedSeq := readPersistedIndexSequence(t, db2.rbiFile)
+	if currentSeq := readBucketSequence(t, raw2, db2.bucket); currentSeq != storedSeq {
+		t.Fatalf("expected persisted index sequence=%d before write, got bucket sequence=%d", storedSeq, currentSeq)
+	}
+	if err := db2.Set(2, &Rec{Name: "bob", Age: 31}); err != nil {
+		t.Fatalf("Set after reopen: %v", err)
+	}
+	if _, err := os.Stat(db2.rbiFile); err != nil {
+		t.Fatalf("expected persisted index to remain present after write, stat err=%v", err)
+	}
+	if currentSeq := readBucketSequence(t, raw2, db2.bucket); currentSeq <= storedSeq {
+		t.Fatalf("expected bucket sequence to advance after write, before=%d after=%d", storedSeq, currentSeq)
+	}
+	if staleSeq := readPersistedIndexSequence(t, db2.rbiFile); staleSeq != storedSeq {
+		t.Fatalf("expected persisted index sequence to stay stale until Close, before=%d after=%d", storedSeq, staleSeq)
+	}
+	if err := db2.Close(); err != nil {
+		t.Fatalf("Close after write: %v", err)
+	}
+	if freshSeq := readPersistedIndexSequence(t, db2.rbiFile); freshSeq != readBucketSequence(t, raw2, db2.bucket) {
+		t.Fatalf("expected Close to refresh persisted index sequence, got %d", freshSeq)
+	}
+}
+
+func TestPersistedIndex_RebuildsAfterCloseFailure(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "close_store_failure_rebuild.db")
+
+	db, raw := openBoltAndNew[uint64, Rec](t, path)
+	if err := db.Set(1, &Rec{Name: "alice", Age: 30}); err != nil {
+		t.Fatalf("Set(1): %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("seed Close: %v", err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatalf("seed raw close: %v", err)
+	}
+
+	db2, raw2 := openBoltAndNew[uint64, Rec](t, path)
+	if err := db2.Set(2, &Rec{Name: "bob", Age: 40}); err != nil {
+		t.Fatalf("Set(2): %v", err)
+	}
+	db2.testHooks.beforeStoreIndex = func() error {
+		return fmt.Errorf("failpoint: store index")
+	}
+	if err := db2.Close(); err == nil || !strings.Contains(err.Error(), "failpoint: store index") {
+		t.Fatalf("expected failpoint store index error on Close, got: %v", err)
+	}
+	if _, err := os.Stat(db2.rbiFile); err != nil {
+		t.Fatalf("expected stale persisted index file to remain after failed Close, stat err=%v", err)
+	}
+	staleSeq := readPersistedIndexSequence(t, db2.rbiFile)
+	currentSeq := readBucketSequence(t, raw2, db2.bucket)
+	if staleSeq == currentSeq {
+		t.Fatalf("expected persisted index sequence to stay stale after failed Close, seq=%d", staleSeq)
+	}
+	if err := raw2.Close(); err != nil {
+		t.Fatalf("raw2 close: %v", err)
+	}
+
+	db3, raw3 := openBoltAndNew[uint64, Rec](t, path)
+	defer func() {
+		_ = db3.Close()
+		_ = raw3.Close()
+	}()
+
+	ids, err := db3.QueryKeys(qx.Query())
+	if err != nil {
+		t.Fatalf("QueryKeys after reopen: %v", err)
+	}
+	slices.Sort(ids)
+	if !slices.Equal(ids, []uint64{1, 2}) {
+		t.Fatalf("unexpected ids after rebuild-on-open: %v", ids)
+	}
+}
+
+func TestPersistedIndex_NoOpDeleteKeepsSequence(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "persisted_index_noop_delete.db")
+
+	db, raw := openBoltAndNew[uint64, Rec](t, path)
+	if err := db.Set(1, &Rec{Name: "alice", Age: 30}); err != nil {
+		t.Fatalf("seed Set: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("seed Close: %v", err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatalf("seed raw close: %v", err)
+	}
+
+	db2, raw2 := openBoltAndNew[uint64, Rec](t, path)
+	defer func() {
+		_ = db2.Close()
+		_ = raw2.Close()
+	}()
+
+	storedSeq := readPersistedIndexSequence(t, db2.rbiFile)
+	beforeSeq := readBucketSequence(t, raw2, db2.bucket)
+	if storedSeq != beforeSeq {
+		t.Fatalf("expected persisted index sequence=%d before no-op delete, got bucket sequence=%d", storedSeq, beforeSeq)
+	}
+
+	if err := db2.Delete(999); err != nil {
+		t.Fatalf("Delete missing: %v", err)
+	}
+
+	afterStoredSeq := readPersistedIndexSequence(t, db2.rbiFile)
+	afterSeq := readBucketSequence(t, raw2, db2.bucket)
+	if afterSeq != beforeSeq {
+		t.Fatalf("expected missing Delete to keep bucket sequence=%d, got %d", beforeSeq, afterSeq)
+	}
+	if afterStoredSeq != storedSeq {
+		t.Fatalf("expected missing Delete to keep persisted index sequence=%d, got %d", storedSeq, afterStoredSeq)
 	}
 }
 

@@ -451,10 +451,10 @@ func (db *DB[K, V]) loadIndex() (skipFields map[string]struct{}, err error) {
 
 	var lenLoaded bool
 	switch ver {
-	case 3:
-		skipFields, lenLoaded, err = db.loadIndexV3(reader)
+	case 4:
+		skipFields, lenLoaded, err = db.loadIndexV4(reader)
 	default:
-		return nil, fmt.Errorf("unknown or unsupported version: %v", ver)
+		return nil, fmt.Errorf("unsupported persisted index version: %v", ver)
 	}
 	if err != nil {
 		return nil, fmt.Errorf("error loading index: %w", err)
@@ -467,7 +467,24 @@ func (db *DB[K, V]) loadIndex() (skipFields map[string]struct{}, err error) {
 	return skipFields, nil
 }
 
-func (db *DB[K, V]) loadIndexV3(reader *bufio.Reader) (map[string]struct{}, bool, error) {
+func (db *DB[K, V]) loadIndexV4(reader *bufio.Reader) (map[string]struct{}, bool, error) {
+	storedSeq, err := binary.ReadUvarint(reader)
+	if err != nil {
+		return nil, false, fmt.Errorf("decode: reading bucket sequence: %w", err)
+	}
+
+	currentSeq, err := db.currentBucketSequence()
+	if err != nil {
+		return nil, false, fmt.Errorf("decode: reading current bucket sequence: %w", err)
+	}
+	if storedSeq != currentSeq {
+		return nil, false, fmt.Errorf("%w: bucket sequence mismatch (stored=%v, current=%v)", errPersistedIndexStale, storedSeq, currentSeq)
+	}
+
+	return db.loadIndexPayload(reader)
+}
+
+func (db *DB[K, V]) loadIndexPayload(reader *bufio.Reader) (map[string]struct{}, bool, error) {
 
 	universe, err := readBitmap(reader)
 	if err != nil {
@@ -609,7 +626,12 @@ func (db *DB[K, V]) storeIndex() error {
 
 	buf := bufio.NewWriterSize(f, 32<<20)
 
-	if err = db.storeIndexV3(buf); err != nil {
+	seq, err := db.currentBucketSequence()
+	if err != nil {
+		return fmt.Errorf("store: reading bucket sequence: %w", err)
+	}
+
+	if err = db.storeIndexV4(buf, seq); err != nil {
 		return err
 	}
 
@@ -623,11 +645,18 @@ func (db *DB[K, V]) storeIndex() error {
 	return os.Rename(tmpFile, db.rbiFile)
 }
 
-func (db *DB[K, V]) storeIndexV3(writer *bufio.Writer) error {
-	if err := writer.WriteByte(3); err != nil {
+func (db *DB[K, V]) storeIndexV4(writer *bufio.Writer, bucketSeq uint64) error {
+	if err := writer.WriteByte(4); err != nil {
 		return fmt.Errorf("store: writing version: %w", err)
 	}
+	if err := writeUvarint(writer, bucketSeq); err != nil {
+		return fmt.Errorf("store: writing bucket sequence: %w", err)
+	}
 
+	return db.storeIndexPayload(writer)
+}
+
+func (db *DB[K, V]) storeIndexPayload(writer *bufio.Writer) error {
 	snap := db.getSnapshot()
 	universe := snapshotUniverseView(snap)
 

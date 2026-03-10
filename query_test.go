@@ -844,18 +844,6 @@ func assertSameSlice(t *testing.T, got, want []uint64) {
 	}
 }
 
-func assertSameStringSlice(t *testing.T, got, want []string) {
-	t.Helper()
-	if len(got) != len(want) {
-		t.Fatalf("len mismatch: got=%d want=%d\ngot=%v\nwant=%v", len(got), len(want), got, want)
-	}
-	for i := range got {
-		if got[i] != want[i] {
-			t.Fatalf("mismatch at %d: got=%v want=%v\ngot=%v\nwant=%v", i, got[i], want[i], got, want)
-		}
-	}
-}
-
 func assertNoDuplicateStringIDs(t testing.TB, label string, ids []string) {
 	t.Helper()
 	seen := make(map[string]struct{}, len(ids))

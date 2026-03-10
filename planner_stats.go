@@ -105,9 +105,6 @@ func (db *DB[K, V]) collectPlannerFieldNamesAndUniverse() (*indexSnapshot, []str
 	if db.closed.Load() {
 		return nil, nil, 0, ErrClosed
 	}
-	if db.noIndex.Load() {
-		return nil, nil, 0, ErrIndexDisabled
-	}
 
 	s := db.getSnapshot()
 	fields := s.fieldNameSet()
@@ -142,9 +139,6 @@ func (s *indexSnapshot) universeCardinality() uint64 {
 func (db *DB[K, V]) collectPlannerFieldStatsFromOverlay(s *indexSnapshot, fieldName string) (PlannerFieldStats, error) {
 	if db.closed.Load() {
 		return PlannerFieldStats{}, ErrClosed
-	}
-	if db.noIndex.Load() {
-		return PlannerFieldStats{}, ErrIndexDisabled
 	}
 
 	ov := newFieldOverlay(s.fieldIndexSlice(fieldName), s.fieldDelta(fieldName))

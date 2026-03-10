@@ -1073,10 +1073,10 @@ func (db *DB[K, V]) shouldPreferExecutionNoOrderPrefix(q *qx.QX, leaves []qx.Exp
 		return false
 	}
 	probeShare := plannerExecutionNoOrderPrefixProbeShare(restCount, restSelectivity)
+
 	if expectedProbe > float64(prefixRows)*probeShare {
 		return false
 	}
-
 	return true
 }
 

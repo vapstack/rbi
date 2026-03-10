@@ -22,11 +22,12 @@ var (
 	ErrClosed            = errors.New("database closed")
 	ErrRebuildInProgress = errors.New("index rebuild in progress")
 	ErrInvalidQuery      = errors.New("invalid query")
-	ErrIndexDisabled     = errors.New("index is disabled")
 	ErrUniqueViolation   = errors.New("unique constraint violation")
 	ErrRecordNotFound    = errors.New("record not found")
 	ErrNoValidKeyIndex   = errors.New("no valid key for index")
 	ErrNilValue          = errors.New("value is nil")
+
+	errPersistedIndexStale = errors.New("persisted index is stale")
 )
 
 const (
@@ -67,20 +68,13 @@ const (
 type Options struct {
 
 	// DisableIndexLoad prevents indexer from loading previously persisted index
-	// data from the .rbi file on startup. If set, indexer will either rebuild
-	// the index from the underlying bucket (unless DisableIndexRebuild is
-	// also set) or operate with an empty index until rebuilt.
+	// data from the .rbi file on startup. If set, indexer rebuilds the index
+	// from the underlying bucket.
 	DisableIndexLoad bool
 
 	// DisableIndexStore prevents indexer from saving the in-memory index state
 	// to the .rbi file on Close.
 	DisableIndexStore bool
-
-	// DisableIndexRebuild skips automatic index rebuilding when the index
-	// cannot be loaded or is incomplete. When this is true and the index
-	// cannot be reused, queries will fail until the caller explicitly
-	// rebuilds the index using RebuildIndex.
-	DisableIndexRebuild bool
 
 	// BucketName overrides the default bucket name.
 	// By default, bucket name is derived from the name of the value type V.
@@ -485,7 +479,7 @@ func (o *Options) setDefaults() {
 // The callback:
 //   - Must not modify oldValue or newValue.
 //   - Must not commit or roll back the transaction.
-//   - Must not modify records in the bucket managed by this DB instance
+//   - Must not modify records or bucket sequence in the bucket managed by this DB instance
 //     (or by any other DB instance with enabled indexing),
 //     because such writes bypass index synchronization.
 //   - May perform additional reads or writes within the same transaction.
@@ -575,7 +569,6 @@ func New[K ~uint64 | ~string, V any](bolt *bbolt.DB, options Options) (db *DB[K,
 		universe: roaring64.NewBitmap(),
 
 		rbiFile: bolt.Path() + "." + sanitizeSuffix(vname) + ".rbi",
-		opnFile: bolt.Path() + "." + sanitizeSuffix(vname) + ".rbo",
 
 		recPool: sync.Pool{
 			New: func() any {
@@ -639,23 +632,17 @@ func New[K ~uint64 | ~string, V any](bolt *bbolt.DB, options Options) (db *DB[K,
 
 	var skipFields map[string]struct{}
 
-	if _, err = os.Stat(db.opnFile); err == nil {
-		log.Println("rbi: unclean shutdown detected")
-	} else {
-		if _, err = os.Stat(db.rbiFile); err == nil {
-			if !options.DisableIndexLoad {
-				skipFields, err = db.loadIndex()
-				if err != nil {
-					log.Println("rbi: failed to load persisted index:", err)
-				}
+	if _, err = os.Stat(db.rbiFile); err == nil {
+		if !options.DisableIndexLoad {
+			skipFields, err = db.loadIndex()
+			if err != nil && !errors.Is(err, errPersistedIndexStale) {
+				log.Println("rbi: failed to load persisted index:", err)
 			}
 		}
 	}
 
-	if !options.DisableIndexRebuild {
-		if err = db.buildIndex(skipFields); err != nil {
-			return nil, fmt.Errorf("error building index: %w", err)
-		}
+	if err = db.buildIndex(skipFields); err != nil {
+		return nil, fmt.Errorf("error building index: %w", err)
 	}
 
 	db.patchMap = make(map[string]*field)
@@ -673,10 +660,6 @@ func New[K ~uint64 | ~string, V any](bolt *bbolt.DB, options Options) (db *DB[K,
 	}
 
 	db.initCalibration()
-
-	if err = touch(db.opnFile); err != nil {
-		return nil, fmt.Errorf("error creating flag-file: %w", err)
-	}
 
 	db.startPlannerAnalyzeLoop()
 	db.startSnapshotCompactor()
@@ -899,14 +882,12 @@ type (
 		options *Options
 
 		rbiFile string
-		opnFile string
 
 		recPool  sync.Pool
 		viewPool sync.Pool
 
-		mu      sync.RWMutex
-		closed  atomic.Bool
-		noIndex atomic.Bool
+		mu     sync.RWMutex
+		closed atomic.Bool
 
 		stats Stats[K]
 
@@ -1167,23 +1148,6 @@ func (db *DB[K, V]) EnableSync() {
 	_ = db.bolt.Sync()
 }
 
-// DisableIndexing disables index updates for subsequent write operations .
-//
-// When indexing is disabled:
-//   - Index structures are no longer kept up to date.
-//   - Query, QueryKeys and Count will return an error, because the index is considered invalid.
-//   - The caller is responsible for rebuilding the index via RebuildIndex before attempting to run queries again.
-//
-// This is intended for high-throughput batch writes where the index will be rebuilt later.
-func (db *DB[K, V]) DisableIndexing() { db.noIndex.Store(true) }
-
-// EnableIndexing re-enables index updates for subsequent write operations.
-// It does not automatically rebuild or validate any existing index state.
-//
-// If indexing was previously disabled and writes were performed, the index
-// may be stale or inconsistent until RebuildIndex is called.
-func (db *DB[K, V]) EnableIndexing() { db.noIndex.Store(false) }
-
 func (db *DB[K, V]) beginOp() error {
 	if db.closed.Load() {
 		return ErrClosed
@@ -1262,6 +1226,34 @@ func (db *DB[K, V]) waitForInFlightOps() {
 		db.rebuilder.cond.Wait()
 	}
 	db.rebuilder.mu.Unlock()
+}
+
+func (db *DB[K, V]) bucketSequence(tx *bbolt.Tx) (uint64, error) {
+	bucket := tx.Bucket(db.bucket)
+	if bucket == nil {
+		return 0, fmt.Errorf("bucket does not exist")
+	}
+	return bucket.Sequence(), nil
+}
+
+func (db *DB[K, V]) currentBucketSequence() (uint64, error) {
+	var seq uint64
+	err := db.bolt.View(func(tx *bbolt.Tx) error {
+		var err error
+		seq, err = db.bucketSequence(tx)
+		return err
+	})
+	if err != nil {
+		return 0, err
+	}
+	return seq, nil
+}
+
+func advanceBucketSequence(bucket *bbolt.Bucket) error {
+	if _, err := bucket.NextSequence(); err != nil {
+		return fmt.Errorf("advance bucket sequence: %w", err)
+	}
+	return nil
 }
 
 func (db *DB[K, V]) commit(tx *bbolt.Tx, op string) error {
@@ -1523,15 +1515,13 @@ func (db *DB[K, V]) CalibrationStats() CalibrationStats {
 	return out
 }
 
-// Close closes the indexed DB.
+// Close closes the indexer and persists the current index state
+// to the .rbi file unless index persistence is disabled.
 //
-// On the first call, Close:
-//   - Persists the current index state to the .rbi file unless index persistence is disabled.
-//   - Removes the .rbo flag file used to detect unsafe shutdowns.
-//   - Does not close the underlying *bbolt.DB.
-//
-// Subsequent calls to Close are no-op.
 // After Close, all other methods return ErrClosed.
+// Subsequent calls to Close are no-op.
+//
+// It does not close the underlying *bbolt.DB.
 func (db *DB[K, V]) Close() error {
 	if !db.closed.CompareAndSwap(false, true) {
 		return nil
@@ -1556,14 +1546,6 @@ func (db *DB[K, V]) Close() error {
 			err = e
 		} else {
 			log.Println("rbi: failed to persist planner calibration:", e)
-		}
-	}
-
-	if e := os.Remove(db.opnFile); e != nil {
-		if err == nil {
-			err = e
-		} else {
-			log.Println("rbi: failed to remove flag-file:", e)
 		}
 	}
 
@@ -1601,8 +1583,12 @@ func (db *DB[K, V]) Truncate() error {
 		}
 	}
 
-	if _, err = tx.CreateBucketIfNotExists(db.bucket); err != nil {
+	bucket, err := tx.CreateBucketIfNotExists(db.bucket)
+	if err != nil {
 		return fmt.Errorf("error creating bucket: %w", err)
+	}
+	if err = advanceBucketSequence(bucket); err != nil {
+		return err
 	}
 
 	txID := uint64(tx.ID())
@@ -1638,7 +1624,8 @@ func (db *DB[K, V]) ReleaseRecords(v ...*V) {
 }
 
 // Bolt returns the underlying *bbolt.DB instance used by this DB.
-// Should be used with caution.
+// Should be used with caution; callers must not mutate the bucket managed by
+// this DB instance, including its sequence counter.
 func (db *DB[K, V]) Bolt() *bbolt.DB {
 	return db.bolt
 }

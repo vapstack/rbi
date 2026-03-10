@@ -398,6 +398,7 @@ func (db *DB[K, V]) executeCombinedBatchAttempt(active []*combineRequest[K, V]) 
 		db.combiner.txBeginErrors.Add(1)
 		return nil, true, fmt.Errorf("tx error: %w", err)
 	}
+
 	committed := false
 	defer func() {
 		if !committed {
@@ -410,9 +411,11 @@ func (db *DB[K, V]) executeCombinedBatchAttempt(active []*combineRequest[K, V]) 
 		db.combiner.txOpErrors.Add(1)
 		return nil, true, fmt.Errorf("bucket does not exist")
 	}
+
 	bucket.FillPercent = db.options.BucketFillPercent
 
 	prepared := make([]combinedBatchPrepared[K, V], 0, len(active))
+
 	rollbackCreated := func(ops []combinedBatchPrepared[K, V]) {
 		if !db.strkey {
 			return
@@ -425,7 +428,9 @@ func (db *DB[K, V]) executeCombinedBatchAttempt(active []*combineRequest[K, V]) 
 			db.rollbackCreatedStrIdx(op.req.id, op.idx)
 		}
 	}
+
 	states := make(map[K]*combinedBatchState[K, V], len(active))
+
 	loadState := func(req *combineRequest[K, V], createIdx bool) (*combinedBatchState[K, V], error) {
 		st := states[req.id]
 		if st == nil {
@@ -448,6 +453,7 @@ func (db *DB[K, V]) executeCombinedBatchAttempt(active []*combineRequest[K, V]) 
 		}
 		return st, nil
 	}
+
 	ensureIdx := func(req *combineRequest[K, V], st *combinedBatchState[K, V], create bool) {
 		if st.idxKnown {
 			return
@@ -459,6 +465,7 @@ func (db *DB[K, V]) executeCombinedBatchAttempt(active []*combineRequest[K, V]) 
 		}
 		st.idxKnown = true
 	}
+
 	for _, req := range active {
 		if req.err != nil {
 			continue
@@ -651,6 +658,12 @@ func (db *DB[K, V]) executeCombinedBatchAttempt(active []*combineRequest[K, V]) 
 			return callbackFailedReq, false, nil
 		}
 		return nil, true, fatalErr
+	}
+	if err = advanceBucketSequence(bucket); err != nil {
+		db.combiner.txOpErrors.Add(1)
+		rollbackCreated(accepted)
+		db.mu.Unlock()
+		return nil, true, err
 	}
 
 	idxs := make([]uint64, len(accepted))

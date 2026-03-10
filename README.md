@@ -138,6 +138,9 @@ For the full API reference see
 * `Delete(id)` – remove a record and its index entries.
 * `BatchDelete(ids)` – batch variant of `Delete`.
 
+Do not write directly to the bucket managed by `rbi` through raw Bolt APIs,
+(including `SetSequence`/`NextSequence`).
+
 ### Querying
 
 Queries are constructed using the [`qx`](https://github.com/vapstack/qx) package.
@@ -277,7 +280,6 @@ enforces a uniqueness constraint for that field.
 * Only scalar (non-slice) fields can be unique.
 * Uniqueness is enforced across single and batch writes (`Set`, `Patch*`, `BatchSet`, `BatchPatch*`).
 * Violations return `ErrUniqueViolation` before committing the transaction.
-* Uniqueness guarantees rely on indexes and are unavailable when indexing is disabled.
 
 ## Custom Indexing with `ValueIndexer`
 
@@ -327,11 +329,14 @@ type User struct {
 
 ## Index Persistence and Recovery
 
-Indexes are persisted only on `Close()`.
+Indexes are persisted only on `Close`.
 
-An `.rbo` marker file is created on startup. If the marker is present during
-the next open, it indicates an unclean shutdown and automatically triggers a
-full index rebuild from the stored data.
+`rbi` reserves the bucket sequence counter and advances it on each
+successful write. The `.rbi` file stores the bucket sequence it was
+built from and is loaded only when the current bucket sequence matches.
+
+After a successful `Close`, a fresh `.rbi` file is written from the current
+in-memory snapshot and can be reused on the next open.
 
 ## Memory Usage
 

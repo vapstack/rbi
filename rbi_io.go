@@ -118,14 +118,9 @@ func (db *DB[K, V]) ScanKeys(seek K, fn func(K) (bool, error)) error {
 	}
 	defer db.endOp()
 
-	noIndex := db.noIndex.Load()
 	universe, owned := db.snapshotUniverseView()
 	if owned {
 		defer releaseRoaringBuf(universe)
-	}
-
-	if noIndex {
-		return ErrIndexDisabled
 	}
 
 	iter := universe.Iterator()
@@ -259,6 +254,7 @@ func (db *DB[K, V]) Set(id K, newVal *V, fns ...PreCommitFunc[K, V]) error {
 		return err
 	}
 	defer db.endOp()
+
 	if newVal == nil {
 		return ErrNilValue
 	}
@@ -329,15 +325,13 @@ func (db *DB[K, V]) Set(id K, newVal *V, fns ...PreCommitFunc[K, V]) error {
 	}
 
 	modified := db.getModifiedIndexedFields(oldVal, newVal)
-	noIndex := db.noIndex.Load()
-	if noIndex {
-		modified = nil
-	}
-
-	if !noIndex && db.hasUnique {
+	if db.hasUnique {
 		if err = db.checkUniqueOnWrite(idx, oldVal, newVal, modified); err != nil {
 			return err
 		}
+	}
+	if err = advanceBucketSequence(bucket); err != nil {
+		return err
 	}
 
 	txID := uint64(tx.ID())
@@ -357,8 +351,7 @@ func (db *DB[K, V]) Set(id K, newVal *V, fns ...PreCommitFunc[K, V]) error {
 // PreCommitFunc fns. If an error is encountered during any of the processing steps,
 // the transaction is rolled back and the error is returned.
 //
-// After a successful commit, the in-memory index is updated for all
-// modified keys unless indexing is disabled.
+// After a successful commit, the in-memory index is updated for all modified keys.
 //
 // BatchSet allocates a buffer for each encoded value.
 // Storing a large number of values will consume a proportional amount of memory.
@@ -493,19 +486,18 @@ func (db *DB[K, V]) BatchSet(ids []K, newVals []*V, fns ...PreCommitFunc[K, V]) 
 		}()
 	}
 
-	noIndex := db.noIndex.Load()
-	var modified [][]string
-	if !noIndex {
-		modified = make([][]string, len(idxs))
-		for i := range idxs {
-			modified[i] = db.getModifiedIndexedFields(oldVals[i], newVals[i])
-		}
+	modified := make([][]string, len(idxs))
+	for i := range idxs {
+		modified[i] = db.getModifiedIndexedFields(oldVals[i], newVals[i])
 	}
 
-	if !noIndex && db.hasUnique {
+	if db.hasUnique {
 		if err = db.checkUniqueOnWriteMulti(idxs, oldVals, newVals, modified); err != nil {
 			return err
 		}
+	}
+	if err = advanceBucketSequence(bucket); err != nil {
+		return err
 	}
 
 	txID := uint64(tx.ID())
@@ -632,15 +624,13 @@ func (db *DB[K, V]) patch(id K, fields []Field, ignoreUnknown bool, allowMissing
 	}
 
 	modified := db.getModifiedIndexedFields(oldVal, newVal)
-	noIndex := db.noIndex.Load()
-	if noIndex {
-		modified = nil
-	}
-
-	if !noIndex && db.hasUnique {
+	if db.hasUnique {
 		if err = db.checkUniqueOnWrite(idx, oldVal, newVal, modified); err != nil {
 			return err
 		}
+	}
+	if err = advanceBucketSequence(bucket); err != nil {
+		return err
 	}
 
 	txID := uint64(tx.ID())
@@ -784,19 +774,18 @@ func (db *DB[K, V]) batchPatch(ids []K, patch []Field, ignoreUnknown bool, fns .
 		return ErrClosed
 	}
 
-	noIndex := db.noIndex.Load()
-	var modified [][]string
-	if !noIndex {
-		modified = make([][]string, len(idxs))
-		for i := range idxs {
-			modified[i] = db.getModifiedIndexedFields(oldVals[i], newVals[i])
-		}
+	modified := make([][]string, len(idxs))
+	for i := range idxs {
+		modified[i] = db.getModifiedIndexedFields(oldVals[i], newVals[i])
 	}
 
-	if !noIndex && db.hasUnique {
+	if db.hasUnique {
 		if err = db.checkUniqueOnWriteMulti(idxs, oldVals, newVals, modified); err != nil {
 			return err
 		}
+	}
+	if err = advanceBucketSequence(bucket); err != nil {
+		return err
 	}
 
 	txID := uint64(tx.ID())
@@ -867,8 +856,8 @@ func (db *DB[K, V]) Delete(id K, fns ...PreCommitFunc[K, V]) error {
 	}
 
 	modified := db.getModifiedIndexedFields(oldVal, nil)
-	if db.noIndex.Load() {
-		modified = nil
+	if err = advanceBucketSequence(bucket); err != nil {
+		return err
 	}
 
 	txID := uint64(tx.ID())
@@ -958,12 +947,12 @@ func (db *DB[K, V]) BatchDelete(ids []K, fns ...PreCommitFunc[K, V]) error {
 		return ErrClosed
 	}
 
-	var modified [][]string
-	if !db.noIndex.Load() {
-		modified = make([][]string, len(idxs))
-		for i := range idxs {
-			modified[i] = db.getModifiedIndexedFields(oldVals[i], nil)
-		}
+	modified := make([][]string, len(idxs))
+	for i := range idxs {
+		modified[i] = db.getModifiedIndexedFields(oldVals[i], nil)
+	}
+	if err = advanceBucketSequence(bucket); err != nil {
+		return err
 	}
 
 	txID := uint64(tx.ID())

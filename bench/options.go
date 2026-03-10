@@ -41,7 +41,6 @@ type benchOptions struct {
 	ceilingRegressP99Pct        float64
 	ceilingSuites               string
 
-	disableIndexing     bool
 	boltNoSync          bool
 	snapshotDiagnostics bool
 	analyzeInterval     time.Duration
@@ -91,7 +90,6 @@ func parseBenchOptions() benchOptions {
 	flag.Float64Var(&opts.ceilingRegressP99Pct, "ceiling-regress-p99-increase-pct", DefaultCeilingRegressionP99Increase, "ceiling: fast-read p99 increase pct considered regression")
 	flag.StringVar(&opts.ceilingSuites, "ceiling-suites", DefaultCeilingSuites, "ceiling: suites to run (all or comma-separated names)")
 
-	flag.BoolVar(&opts.disableIndexing, "disable-indexing", false, "disable in-memory index updates for writes (diagnostic)")
 	flag.BoolVar(&opts.boltNoSync, "bolt-no-sync", false, "set bbolt NoSync=true (diagnostic, unsafe)")
 	flag.BoolVar(&opts.snapshotDiagnostics, "snapshot-diagnostics", false, "log snapshot/compactor diagnostics in progress ticker")
 	flag.DurationVar(&opts.analyzeInterval, "analyze-interval", 0, "rbi analyze interval (0=default, <0 disable)")

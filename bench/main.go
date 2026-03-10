@@ -48,11 +48,6 @@ func main() {
 	startCount, maxID := loadOrSeedDatabase(db)
 	emailSamples := buildEmailSamples(db, maxID, opts.emailSampleN)
 
-	if opts.disableIndexing {
-		db.DisableIndexing()
-		log.Printf("Indexing disabled: write operations will not update in-memory index")
-	}
-
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 

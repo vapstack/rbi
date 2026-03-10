@@ -93,18 +93,16 @@ func TestSnapshotTxID_PreviousTxRemainsPinable(t *testing.T) {
 	db.unpinByTxID(oldTxID)
 }
 
-func TestSnapshotTxID_AdvancesWhenIndexingDisabled(t *testing.T) {
+func TestSnapshotTxID_AdvancesOnWrite(t *testing.T) {
 	db, _ := openTempDBUint64(t)
-
-	db.DisableIndexing()
 
 	before := db.getSnapshot().txID
 	if err := db.Set(1, &Rec{Name: "x", Age: 1}); err != nil {
-		t.Fatalf("Set with indexing disabled: %v", err)
+		t.Fatalf("Set: %v", err)
 	}
 	after := db.getSnapshot().txID
 	if after <= before {
-		t.Fatalf("snapshot txID did not advance with indexing disabled: before=%d after=%d", before, after)
+		t.Fatalf("snapshot txID did not advance on write: before=%d after=%d", before, after)
 	}
 }
 
@@ -391,7 +389,7 @@ func TestSnapshotDelta_StoreIndexPersistsOverlayState(t *testing.T) {
 		t.Fatalf("raw close 1: %v", err)
 	}
 
-	opts := Options{DisableIndexRebuild: true}
+	opts := Options{}
 	db2, raw2 := openBoltAndNew[uint64, Rec](t, path, opts)
 	defer func() {
 		_ = db2.Close()

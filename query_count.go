@@ -11,7 +11,6 @@ const countORSeenUnionThresholdBase = 64_000
 const countORSeenUniverseDiv = 16
 const countScalarInSplitMaxValues = 32
 const countScalarInSplitMaxOtherLeaves = 3
-const countPredSetMaterializeMinProbeBase = 1_024
 const countPredSetMaterializeMinTermsBase = 6
 const countPredCustomMaterializeMinProbeBase = 4_096
 
@@ -23,10 +22,6 @@ func (db *DB[K, V]) Count(q *qx.QX) (uint64, error) {
 		return 0, err
 	}
 	defer db.endOp()
-
-	if db.noIndex.Load() {
-		return 0, ErrIndexDisabled
-	}
 	view := db.makeQueryView(db.getSnapshot())
 	defer db.releaseQueryView(view)
 	return view.countInternal(q)
@@ -561,7 +556,7 @@ func chainPredicateCleanup(prev, next func()) func() {
 }
 
 func countSetMaterializeMinTerms(probeEst uint64, universe uint64) int {
-	terms := countPredSetMaterializeMinTermsBase
+	var terms int
 	if probeEst >= 2_048 {
 		terms = countPredSetMaterializeMinTermsBase
 	} else if probeEst >= 1_024 {
@@ -590,7 +585,7 @@ func countSetMaterializeMinTerms(probeEst uint64, universe uint64) int {
 }
 
 func countSetMaterializeMinProbe(termCount int, probeEst uint64, universe uint64) uint64 {
-	minProbe := uint64(countPredSetMaterializeMinProbeBase)
+	var minProbe uint64
 	switch {
 	case termCount >= 24:
 		minProbe = 384

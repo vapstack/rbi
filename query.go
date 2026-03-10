@@ -36,10 +36,6 @@ func (db *DB[K, V]) Query(q *qx.QX) ([]*V, error) {
 	}
 	defer db.endOp()
 
-	if db.noIndex.Load() {
-		return nil, ErrIndexDisabled
-	}
-
 	retryBudget := db.snapshot.pinWait * snapshotRetryBudgetMult
 	deadline := time.Now().Add(retryBudget)
 
@@ -134,10 +130,6 @@ func (db *DB[K, V]) QueryKeys(q *qx.QX) ([]K, error) {
 		return nil, err
 	}
 	defer db.endOp()
-
-	if db.noIndex.Load() {
-		return nil, ErrIndexDisabled
-	}
 	return db.queryOnSnapshot(q, db.getSnapshot())
 }
 

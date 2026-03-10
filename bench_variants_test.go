@@ -4,10 +4,12 @@ import (
 	"fmt"
 	"math/rand/v2"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"testing"
 
 	"github.com/vapstack/qx"
+	"go.etcd.io/bbolt"
 )
 
 const dynamicBenchN = 180_000
@@ -151,41 +153,45 @@ var dynamicBenchQueries = []dynamicBenchQueryCase{
 }
 
 var (
-	dynamicBenchMu  sync.Mutex
-	dynamicBenchDBs = make(map[string]*DB[uint64, UserBench])
+	dynamicBenchMu   sync.Mutex
+	dynamicBenchDBs  = make(map[string]*DB[uint64, UserBench])
+	dynamicBenchRaws = make(map[string]*bbolt.DB)
 )
 
-func openDynamicBenchDB(b *testing.B) (*DB[uint64, UserBench], string) {
+func openDynamicBenchDBWithCaching(b *testing.B, withCaching bool) (*DB[uint64, UserBench], *bbolt.DB, string) {
 	b.Helper()
 	dir := b.TempDir()
 	path := filepath.Join(dir, "dynamic_bench.db")
 
-	db, _ := openBoltAndNew[uint64, UserBench](b, path, Options{
-		DisableIndexLoad:    true,
-		DisableIndexStore:   true,
-		DisableIndexRebuild: true,
-		AnalyzeInterval:     -1,
-	})
-	return db, path
+	opts := benchOptions(withCaching)
+	opts.AnalyzeInterval = -1
+	db, raw := openBoltAndNew[uint64, UserBench](b, path, opts)
+	return db, raw, path
 }
 
 func buildBenchDBDynamicProfile(b *testing.B, profile dynamicBenchProfile) *DB[uint64, UserBench] {
+	return buildBenchDBDynamicProfileWithCaching(b, profile, true)
+}
+
+func buildBenchDBDynamicProfileWithCaching(b *testing.B, profile dynamicBenchProfile, withCaching bool) *DB[uint64, UserBench] {
 	b.Helper()
 	dynamicBenchMu.Lock()
 	defer dynamicBenchMu.Unlock()
 
-	if db := dynamicBenchDBs[profile.name]; db != nil {
+	key := profile.name + "/" + strconv.FormatBool(withCaching)
+	if db := dynamicBenchDBs[key]; db != nil {
 		return db
 	}
 
-	db, _ := openDynamicBenchDB(b)
+	db, raw, _ := openDynamicBenchDBWithCaching(b, withCaching)
 
 	b.StopTimer()
 	seedBenchDataDynamicProfile(b, db, profile)
 	_, _ = db.QueryKeys(qx.Query(qx.EQ("country", "US")).Max(100)) // warm-up
 	b.StartTimer()
 
-	dynamicBenchDBs[profile.name] = db
+	dynamicBenchDBs[key] = db
+	dynamicBenchRaws[key] = raw
 	return db
 }
 
@@ -229,15 +235,8 @@ func scoreForDynamicProfile(r *rand.Rand, i int, p dynamicBenchProfile, scoreZip
 func seedBenchDataDynamicProfile(b *testing.B, db *DB[uint64, UserBench], profile dynamicBenchProfile) {
 	b.Helper()
 
-	db.DisableIndexing()
 	db.DisableSync()
-	defer func() {
-		db.EnableIndexing()
-		db.EnableSync()
-		if err := db.RebuildIndex(); err != nil {
-			b.Fatalf("rebuild index: %v", err)
-		}
-	}()
+	defer db.EnableSync()
 
 	r := newRand(profile.seed)
 
@@ -401,18 +400,20 @@ func runQueryKeysBenchWithPlanMetrics(b *testing.B, db *DB[uint64, UserBench], q
 }
 
 func Benchmark_Query_Index_Keys_DynamicProfiles_Perf(b *testing.B) {
-	for _, profile := range dynamicBenchProfiles {
-		profile := profile
-		b.Run(profile.name, func(b *testing.B) {
-			db := buildBenchDBDynamicProfile(b, profile)
-			for _, qc := range dynamicBenchQueries {
-				qc := qc
-				b.Run(qc.name, func(b *testing.B) {
-					runQueryKeysBench(b, db, qc.query())
-				})
-			}
-		})
-	}
+	runBenchCacheModes(b, func(b *testing.B, withCaching bool) {
+		for _, profile := range dynamicBenchProfiles {
+			profile := profile
+			b.Run(profile.name, func(b *testing.B) {
+				db := buildBenchDBDynamicProfileWithCaching(b, profile, withCaching)
+				for _, qc := range dynamicBenchQueries {
+					qc := qc
+					b.Run(qc.name, func(b *testing.B) {
+						runQueryKeysBench(b, db, qc.query())
+					})
+				}
+			})
+		}
+	})
 }
 
 func Benchmark_Query_Index_Keys_DynamicProfiles_PlanStability(b *testing.B) {

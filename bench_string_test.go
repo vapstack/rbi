@@ -15,18 +15,18 @@ import (
 
 const (
 	benchStringQueryN     = 300_000
-	benchStringQueryBatch = 100_000
+	benchStringQueryBatch = 20_000
 	benchStringWriteSeed  = 120_000
 )
 
 var (
-	oneStringDB  *DB[string, UserBench]
-	oneStringRaw *bbolt.DB
-	oneStringDir string
-	oneStringMu  sync.Mutex
+	oneStringDBs  = make(map[bool]*DB[string, UserBench])
+	oneStringRaws = make(map[bool]*bbolt.DB)
+	oneStringDirs = make(map[bool]string)
+	oneStringMu   sync.Mutex
 )
 
-func openBenchDBString(b *testing.B) (*DB[string, UserBench], *bbolt.DB, string) {
+func openBenchDBStringWithCaching(b *testing.B, withCaching bool) (*DB[string, UserBench], *bbolt.DB, string) {
 	b.Helper()
 	dir, err := os.MkdirTemp("", "rbi-bench-string-*")
 	if err != nil {
@@ -34,27 +34,15 @@ func openBenchDBString(b *testing.B) (*DB[string, UserBench], *bbolt.DB, string)
 	}
 	path := filepath.Join(dir, "bench_string.db")
 
-	db, raw := openBoltAndNew[string, UserBench](b, path, Options{
-		DisableIndexLoad:    true,
-		DisableIndexStore:   true,
-		DisableIndexRebuild: true,
-	})
+	db, raw := openBoltAndNew[string, UserBench](b, path, benchOptions(withCaching))
 	return db, raw, dir
 }
 
 func seedBenchDataString(b *testing.B, db *DB[string, UserBench], n int) {
 	b.Helper()
 
-	db.DisableIndexing()
 	db.DisableSync()
-
-	defer func() {
-		db.EnableIndexing()
-		db.EnableSync()
-		if err := db.RebuildIndex(); err != nil {
-			b.Fatalf("rebuilding index: %v", err)
-		}
-	}()
+	defer db.EnableSync()
 
 	r := newRand(7)
 	countries := []string{"US", "NL", "DE", "PL", "SE", "FR", "GB", "ES"}
@@ -123,46 +111,44 @@ func seedBenchDataString(b *testing.B, db *DB[string, UserBench], n int) {
 }
 
 func buildBenchDBString(b *testing.B, n int) *DB[string, UserBench] {
+	return buildBenchDBStringWithCaching(b, n, true)
+}
+
+func buildBenchDBStringWithCaching(b *testing.B, n int, withCaching bool) *DB[string, UserBench] {
 	b.Helper()
 	oneStringMu.Lock()
 	defer oneStringMu.Unlock()
 
-	if oneStringDB != nil && !oneStringDB.closed.Load() {
-		return oneStringDB
+	if db := oneStringDBs[withCaching]; db != nil && !db.closed.Load() {
+		return db
 	}
 
-	closeBenchDBStringLocked()
-
-	db, raw, dir := openBenchDBString(b)
+	db, raw, dir := openBenchDBStringWithCaching(b, withCaching)
 	b.StopTimer()
 	seedBenchDataString(b, db, n)
 	_, _ = db.QueryKeys(qx.Query(qx.EQ("country", "NL"))) // warmup
 	b.StartTimer()
 
-	oneStringDB = db
-	oneStringRaw = raw
-	oneStringDir = dir
+	oneStringDBs[withCaching] = db
+	oneStringRaws[withCaching] = raw
+	oneStringDirs[withCaching] = dir
 	return db
 }
 
-func closeBenchDBStringLocked() {
-	db := oneStringDB
-	raw := oneStringRaw
-	dir := oneStringDir
-
-	oneStringDB = nil
-	oneStringRaw = nil
-	oneStringDir = ""
-
-	if db != nil {
-		_ = db.Close()
-	}
-	if raw != nil {
-		_ = raw.Close()
-	}
-	if dir != "" {
-		_ = os.RemoveAll(dir)
-	}
+func runStringCountBenchCacheModes(b *testing.B, qf func() *qx.QX) {
+	b.Helper()
+	runBenchCacheModes(b, func(b *testing.B, withCaching bool) {
+		db := buildBenchDBStringWithCaching(b, benchStringQueryN, withCaching)
+		q := qf()
+		b.ReportAllocs()
+		b.ResetTimer()
+		for b.Loop() {
+			_, err := db.Count(q)
+			if err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
 }
 
 func buildWriteBenchDBString(b *testing.B) *DB[string, UserBench] {
@@ -170,7 +156,7 @@ func buildWriteBenchDBString(b *testing.B) *DB[string, UserBench] {
 	dir := b.TempDir()
 
 	db, raw := openBoltAndNew[string, UserBench](b, filepath.Join(dir, "bench_write_string_seeded.db"), Options{
-		DisableIndexRebuild: true,
+		DisableIndexStore: true,
 	})
 	b.Cleanup(func() {
 		_ = db.Close()
@@ -178,14 +164,12 @@ func buildWriteBenchDBString(b *testing.B) *DB[string, UserBench] {
 	})
 	db.DisableSync()
 
-	db.DisableIndexing()
-
 	r := newRand(42)
 	countries := []string{"US", "NL", "DE", "PL", "SE", "FR", "GB", "ES"}
 	plans := []string{"free", "basic", "pro", "enterprise"}
 
-	ids := make([]string, 0, 1000)
-	vals := make([]*UserBench, 0, 1000)
+	ids := make([]string, 0, writeBenchSeedBatch)
+	vals := make([]*UserBench, 0, writeBenchSeedBatch)
 	for i := 1; i <= benchStringWriteSeed; i++ {
 		key := fmt.Sprintf("seed-%06d", i)
 		rec := &UserBench{
@@ -198,7 +182,7 @@ func buildWriteBenchDBString(b *testing.B) *DB[string, UserBench] {
 		}
 		ids = append(ids, key)
 		vals = append(vals, rec)
-		if len(ids) == 1000 {
+		if len(ids) == writeBenchSeedBatch {
 			if err := db.BatchSet(ids, vals); err != nil {
 				b.Fatalf("seed BatchSet string: %v", err)
 			}
@@ -212,11 +196,7 @@ func buildWriteBenchDBString(b *testing.B) *DB[string, UserBench] {
 		}
 	}
 
-	if err := db.RebuildIndex(); err != nil {
-		b.Fatalf("rebuild string index: %v", err)
-	}
 	db.EnableSync()
-	db.EnableIndexing()
 	return db
 }
 
@@ -235,60 +215,44 @@ func Benchmark_Query_Index_Count_Simple_EQ_Count_StringKeyDB(b *testing.B) {
 }
 
 func Benchmark_Query_Index_Count_Realistic_Cohort_StringKeyDB(b *testing.B) {
-	db := buildBenchDBString(b, benchStringQueryN)
-	q := qx.Query(
-		qx.AND(
-			qx.NOTIN("status", []string{"banned"}),
-			qx.IN("country", []string{"NL", "DE", "PL", "SE", "FR", "ES", "GB"}),
-			qx.GTE("age", 25),
-			qx.LTE("age", 45),
-			qx.HASANY("tags", []string{"go", "db", "security"}),
-			qx.GTE("score", 80.0),
-		),
-	)
-
-	b.ReportAllocs()
-	b.ResetTimer()
-	for b.Loop() {
-		_, err := db.Count(q)
-		if err != nil {
-			b.Fatal(err)
-		}
-	}
+	runStringCountBenchCacheModes(b, func() *qx.QX {
+		return qx.Query(
+			qx.AND(
+				qx.NOTIN("status", []string{"banned"}),
+				qx.IN("country", []string{"NL", "DE", "PL", "SE", "FR", "ES", "GB"}),
+				qx.GTE("age", 25),
+				qx.LTE("age", 45),
+				qx.HASANY("tags", []string{"go", "db", "security"}),
+				qx.GTE("score", 80.0),
+			),
+		)
+	})
 }
 
 func Benchmark_Query_Index_Count_Realistic_HeavyOR_StringKeyDB(b *testing.B) {
-	db := buildBenchDBString(b, benchStringQueryN)
-	q := qx.Query(
-		qx.OR(
-			qx.AND(
-				qx.EQ("country", "DE"),
-				qx.HASANY("tags", []string{"rust", "go"}),
-				qx.GTE("score", 40.0),
+	runStringCountBenchCacheModes(b, func() *qx.QX {
+		return qx.Query(
+			qx.OR(
+				qx.AND(
+					qx.EQ("country", "DE"),
+					qx.HASANY("tags", []string{"rust", "go"}),
+					qx.GTE("score", 40.0),
+				),
+				qx.AND(
+					qx.PREFIX("email", "user1"),
+					qx.EQ("status", "active"),
+				),
+				qx.AND(
+					qx.EQ("plan", "enterprise"),
+					qx.GTE("age", 30),
+				),
+				qx.AND(
+					qx.HASANY("roles", []string{"admin"}),
+					qx.NOTIN("status", []string{"banned"}),
+				),
 			),
-			qx.AND(
-				qx.PREFIX("email", "user1"),
-				qx.EQ("status", "active"),
-			),
-			qx.AND(
-				qx.EQ("plan", "enterprise"),
-				qx.GTE("age", 30),
-			),
-			qx.AND(
-				qx.HASANY("roles", []string{"admin"}),
-				qx.NOTIN("status", []string{"banned"}),
-			),
-		),
-	)
-
-	b.ReportAllocs()
-	b.ResetTimer()
-	for b.Loop() {
-		_, err := db.Count(q)
-		if err != nil {
-			b.Fatal(err)
-		}
-	}
+		)
+	})
 }
 
 func Benchmark_Query_Index_Keys_Medium_IN_Limit_StringKeyDB(b *testing.B) {
