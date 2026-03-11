@@ -679,25 +679,21 @@ func (db *DB[K, V]) executeCombinedBatchAttempt(active []*combineRequest[K, V]) 
 
 	txID := uint64(tx.ID())
 	db.markPending(txID)
-	commitErr := db.commit(tx, "batch")
-	if commitErr == nil {
-		committed = true
-	} else {
+	if err = db.commit(tx, "batch"); err != nil {
 		db.combiner.txCommitErrors.Add(1)
-	}
-	postErr := db.setIndexOnSuccessMulti(commitErr, txID, idxs, oldVals, newVals, modified)
-	if commitErr != nil {
+		db.clearPending(txID)
 		rollbackCreated(accepted)
-	}
-	db.mu.Unlock()
-
-	if postErr != nil {
+		db.mu.Unlock()
 		for _, op := range accepted {
 			if op.req.err == nil {
-				op.req.err = postErr
+				op.req.err = err
 			}
 		}
+		return nil, true, nil
 	}
+	committed = true
+	db.publishWriteDeltaBatch(txID, idxs, oldVals, newVals, modified)
+	db.mu.Unlock()
 
 	return nil, true, nil
 }
@@ -739,19 +735,17 @@ func (db *DB[K, V]) failCombinedBatch(batch []*combineRequest[K, V], err error) 
 }
 
 func (db *DB[K, V]) finishCombinedBatch(batch []*combineRequest[K, V]) {
-	resolveErr := func(req *combineRequest[K, V]) error {
-		for req != nil && req.coalescedTo != nil {
-			req = req.coalescedTo
-		}
-		if req == nil {
-			return nil
-		}
-		return req.err
-	}
-
 	for _, req := range batch {
 		if req.coalescedTo != nil {
-			req.err = resolveErr(req.coalescedTo)
+			target := req.coalescedTo
+			for target != nil && target.coalescedTo != nil {
+				target = target.coalescedTo
+			}
+			if target == nil {
+				req.err = nil
+			} else {
+				req.err = target.err
+			}
 		}
 		req.done <- req.err
 	}

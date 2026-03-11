@@ -265,7 +265,7 @@ func (db *DB[K, V]) evalSimple(e qx.Expr) (bitmap, error) {
 				return bitmap{}, fmt.Errorf("%w: %v expects a single value for scalar field %v", ErrInvalidQuery, e.Op, e.Field)
 			}
 
-			bm, owned := ov.lookupWithState(key, nil)
+			bm, owned := ov.lookupOwned(key, nil)
 			if bm != nil && !bm.IsEmpty() {
 				return bitmap{bm: bm, readonly: !owned}, nil
 			}
@@ -305,7 +305,7 @@ func (db *DB[K, V]) evalSimple(e qx.Expr) (bitmap, error) {
 		}
 
 		for _, v := range vals {
-			bm, owned := ov.lookupWithState(v, scratch)
+			bm, owned := ov.lookupOwned(v, scratch)
 			if bm == nil || bm.IsEmpty() {
 				continue
 			}
@@ -339,7 +339,7 @@ func (db *DB[K, V]) evalSimple(e qx.Expr) (bitmap, error) {
 				defer releaseRoaringBuf(scratch)
 			}
 			for _, v := range vals {
-				bm, owned := ov.lookupWithState(v, scratch)
+				bm, owned := ov.lookupOwned(v, scratch)
 				if bm == nil || bm.IsEmpty() {
 					// if any value is missing, result is empty
 					if acc != nil {
@@ -375,7 +375,7 @@ func (db *DB[K, V]) evalSimple(e qx.Expr) (bitmap, error) {
 		}
 
 		for _, v := range vals {
-			bm, owned := ov.lookupWithState(v, scratch)
+			bm, owned := ov.lookupOwned(v, scratch)
 			if bm == nil || bm.IsEmpty() {
 				continue
 			}
@@ -429,7 +429,7 @@ func (db *DB[K, V]) evalSimple(e qx.Expr) (bitmap, error) {
 
 		if e.Op != qx.OpPREFIX {
 			if out, ok := db.tryEvalNumericRangeBuckets(e.Field, f, ov, br); ok {
-				if db.tryStoreMaterializedPredShared(cacheKey, out.bm) {
+				if db.tryShareMaterializedPred(cacheKey, out.bm) {
 					out.readonly = true
 				}
 				return out, nil
@@ -519,7 +519,7 @@ func (db *DB[K, V]) evalSimple(e qx.Expr) (bitmap, error) {
 		if singles != nil && len(singles.values) > 0 {
 			res.AddMany(singles.values)
 		}
-		if db.tryStoreMaterializedPredShared(cacheKey, res) {
+		if db.tryShareMaterializedPred(cacheKey, res) {
 			return bitmap{bm: res, readonly: true}, nil
 		}
 		return bitmap{bm: res}, nil
@@ -634,7 +634,7 @@ func (db *DB[K, V]) evalSimple(e qx.Expr) (bitmap, error) {
 		if singles != nil && len(singles.values) > 0 {
 			res.AddMany(singles.values)
 		}
-		if db.tryStoreMaterializedPredShared(cacheKey, res) {
+		if db.tryShareMaterializedPred(cacheKey, res) {
 			return bitmap{bm: res, readonly: true}, nil
 		}
 		return bitmap{bm: res}, nil
@@ -769,7 +769,7 @@ func (db *DB[K, V]) evalSliceEQ(field string, vals []string) (bitmap, error) {
 		lenOwned bool
 	)
 	if useZeroComplement {
-		nonEmpty, nonEmptyOwned := lenOV.lookupWithState(lenIndexNonEmptyKey, nil)
+		nonEmpty, nonEmptyOwned := lenOV.lookupOwned(lenIndexNonEmptyKey, nil)
 		universe, universeOwned := db.snapshotUniverseView()
 		zero := getRoaringBuf()
 		if universe != nil && !universe.IsEmpty() {
@@ -788,7 +788,7 @@ func (db *DB[K, V]) evalSliceEQ(field string, vals []string) (bitmap, error) {
 		lenOwned = true
 	} else {
 		lenKey := uint64ByteStr(uint64(len(vals)))
-		lenBM, lenOwned = lenOV.lookupWithState(lenKey, nil)
+		lenBM, lenOwned = lenOV.lookupOwned(lenKey, nil)
 	}
 	if lenBM == nil || lenBM.IsEmpty() {
 		if lenOwned && lenBM != nil {
@@ -810,7 +810,7 @@ func (db *DB[K, V]) evalSliceEQ(field string, vals []string) (bitmap, error) {
 		defer releaseRoaringBuf(scratch)
 	}
 	for _, v := range vals {
-		bm, owned := ov.lookupWithState(v, scratch)
+		bm, owned := ov.lookupOwned(v, scratch)
 		if bm == nil || bm.IsEmpty() {
 			releaseRoaringBuf(acc)
 			return bitmap{bm: getRoaringBuf()}, nil

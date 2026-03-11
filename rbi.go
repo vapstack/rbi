@@ -1228,22 +1228,16 @@ func (db *DB[K, V]) waitForInFlightOps() {
 	db.rebuilder.mu.Unlock()
 }
 
-func (db *DB[K, V]) bucketSequence(tx *bbolt.Tx) (uint64, error) {
-	bucket := tx.Bucket(db.bucket)
-	if bucket == nil {
-		return 0, fmt.Errorf("bucket does not exist")
-	}
-	return bucket.Sequence(), nil
-}
-
 func (db *DB[K, V]) currentBucketSequence() (uint64, error) {
 	var seq uint64
-	err := db.bolt.View(func(tx *bbolt.Tx) error {
-		var err error
-		seq, err = db.bucketSequence(tx)
-		return err
-	})
-	if err != nil {
+	if err := db.bolt.View(func(tx *bbolt.Tx) error {
+		bucket := tx.Bucket(db.bucket)
+		if bucket == nil {
+			return fmt.Errorf("bucket does not exist")
+		}
+		seq = bucket.Sequence()
+		return nil
+	}); err != nil {
 		return 0, err
 	}
 	return seq, nil
@@ -1685,13 +1679,6 @@ func (s *strMapSnapshot) getStringNoLock(idx uint64) (string, bool) {
 		}
 	}
 	return "", false
-}
-
-func (s *strMapSnapshot) mustGetStringNoLock(idx uint64) string {
-	if v, ok := s.getStringNoLock(idx); ok {
-		return v
-	}
-	panic(fmt.Errorf("no id associated with idx %v", idx))
 }
 
 type strMapper struct {

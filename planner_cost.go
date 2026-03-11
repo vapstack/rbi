@@ -1692,7 +1692,7 @@ func (db *DB[K, V]) estimateEqSelectivity(field string, value any, universe uint
 		scratch := getRoaringBuf()
 		defer releaseRoaringBuf(scratch)
 
-		bm, owned := ov.lookupWithState(key, scratch)
+		bm, owned := ov.lookupOwned(key, scratch)
 		card := uint64(0)
 		if bm != nil {
 			card = bm.GetCardinality()
@@ -1741,7 +1741,7 @@ func (db *DB[K, V]) estimateInLikeSelectivity(field string, value any, universe 
 	defer releaseRoaringBuf(scratch)
 
 	for _, key := range vals {
-		bm, owned := ov.lookupWithState(key, scratch)
+		bm, owned := ov.lookupOwned(key, scratch)
 		card := uint64(0)
 		if bm != nil {
 			card = bm.GetCardinality()

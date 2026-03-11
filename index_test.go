@@ -104,19 +104,19 @@ func TestFieldIndexOverlay_LookupCompose(t *testing.T) {
 	}
 	ov := newFieldOverlay(&base, delta)
 
-	if got := ov.lookup("a", nil); !slices.Equal(got.ToArray(), []uint64{1, 2}) {
+	if got, _ := ov.lookupOwned("a", nil); !slices.Equal(got.ToArray(), []uint64{1, 2}) {
 		t.Fatalf("lookup a mismatch: %v", got.ToArray())
 	}
-	if got := ov.lookup("b", nil); !slices.Equal(got.ToArray(), []uint64{3}) {
+	if got, _ := ov.lookupOwned("b", nil); !slices.Equal(got.ToArray(), []uint64{3}) {
 		t.Fatalf("lookup b mismatch: %v", got.ToArray())
 	}
-	if got := ov.lookup("c", nil); !slices.Equal(got.ToArray(), []uint64{11}) {
+	if got, _ := ov.lookupOwned("c", nil); !slices.Equal(got.ToArray(), []uint64{11}) {
 		t.Fatalf("lookup c mismatch: %v", got.ToArray())
 	}
-	if got := ov.lookup("d", nil); got != nil {
+	if got, _ := ov.lookupOwned("d", nil); got != nil {
 		t.Fatalf("lookup d expected nil/empty, got: %v", got.ToArray())
 	}
-	if got := ov.lookup("z", nil); got != nil {
+	if got, _ := ov.lookupOwned("z", nil); got != nil {
 		t.Fatalf("lookup z expected nil, got: %v", got.ToArray())
 	}
 }

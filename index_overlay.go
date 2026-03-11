@@ -89,12 +89,7 @@ func (o fieldOverlay) hasData() bool {
 	return o.delta != nil && o.delta.hasEntries()
 }
 
-func (o fieldOverlay) lookup(key string, scratch *roaring64.Bitmap) *roaring64.Bitmap {
-	bm, _ := o.lookupWithState(key, scratch)
-	return bm
-}
-
-func (o fieldOverlay) lookupWithState(key string, scratch *roaring64.Bitmap) (*roaring64.Bitmap, bool) {
+func (o fieldOverlay) lookupOwned(key string, scratch *roaring64.Bitmap) (*roaring64.Bitmap, bool) {
 	var base postingList
 	if len(o.base) > 0 {
 		if i := lowerBoundIndex(o.base, key); i < len(o.base) && indexKeyEqualsString(o.base[i].Key, key) {

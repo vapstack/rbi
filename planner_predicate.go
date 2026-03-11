@@ -1221,7 +1221,7 @@ func (db *DB[K, V]) buildPredRangeCandidate(e qx.Expr, fm *field, ov fieldOverla
 	}
 
 	if out, ok := db.tryEvalNumericRangeBuckets(e.Field, fm, ov, br); ok {
-		if db.tryStoreMaterializedPredShared(cacheKey, out.bm) {
+		if db.tryShareMaterializedPred(cacheKey, out.bm) {
 			return materializedRangePredicateReadonly(e, out.bm), true
 		}
 		return materializedRangePredicate(e, out.bm), true
@@ -1249,7 +1249,7 @@ func (db *DB[K, V]) buildPredRangeCandidate(e qx.Expr, fm *field, ov fieldOverla
 
 		once.Do(func() {
 			bm = overlayUnionRange(ov, br)
-			ro = db.tryStoreMaterializedPredShared(cacheKey, bm)
+			ro = db.tryShareMaterializedPred(cacheKey, bm)
 		})
 		if bm == nil {
 			return false
@@ -1332,7 +1332,7 @@ func (db *DB[K, V]) buildPredMaterializedCandidate(e qx.Expr) (predicate, bool) 
 		bm = b.bm
 		readonly = b.readonly
 		if cacheKey != "" {
-			if db.tryStoreMaterializedPredShared(cacheKey, bm) {
+			if db.tryShareMaterializedPred(cacheKey, bm) {
 				// cached bitmap is shared and must not be returned to pool
 				// by this predicate cleanup.
 				readonly = true
@@ -1415,7 +1415,10 @@ func materializedPredCacheKeyFromScalar(field string, op qx.Op, key string) stri
 	return field + "\x1f" + strconv.Itoa(int(op)) + "\x1f" + key
 }
 
-func (db *DB[K, V]) tryStoreMaterializedPredShared(cacheKey string, bm *roaring64.Bitmap) bool {
+// tryShareMaterializedPred caches bm and reports whether the snapshot cache
+// ended up reusing the same bitmap pointer, so caller may keep using bm as
+// readonly without cloning.
+func (db *DB[K, V]) tryShareMaterializedPred(cacheKey string, bm *roaring64.Bitmap) bool {
 	if cacheKey == "" || bm == nil {
 		return false
 	}
@@ -2284,7 +2287,7 @@ func (db *DB[K, V]) buildPredRange(e qx.Expr, fm *field, slice *[]index) (predic
 		baseStart: start,
 		baseEnd:   end,
 	}); ok {
-		if db.tryStoreMaterializedPredShared(cacheKey, out.bm) {
+		if db.tryShareMaterializedPred(cacheKey, out.bm) {
 			return materializedRangePredicateReadonly(e, out.bm), true
 		}
 		return materializedRangePredicate(e, out.bm), true
@@ -2384,7 +2387,7 @@ func (db *DB[K, V]) buildPredRange(e qx.Expr, fm *field, slice *[]index) (predic
 	var onMaterialized func(*roaring64.Bitmap) bool
 	if cacheKey != "" && !useComplement {
 		onMaterialized = func(bm *roaring64.Bitmap) bool {
-			return db.tryStoreMaterializedPredShared(cacheKey, bm)
+			return db.tryShareMaterializedPred(cacheKey, bm)
 		}
 	}
 	containsInRange, cleanupRange := db.buildRangeContains(probe, useComplement, probeEst, onMaterialized)

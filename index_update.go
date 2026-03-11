@@ -256,7 +256,7 @@ func (db *DB[K, V]) checkUniqueBatchAppend(state uniqueBatchCheckState, idx uint
 func noReleaseUniqueBitmap() {}
 
 func lookupUniqueBitmap[K ~string | ~uint64, V any](db *DB[K, V], field, key string) (*roaring64.Bitmap, func()) {
-	bm, owned := db.fieldLookupWithState(field, key, nil)
+	bm, owned := db.fieldLookupOwned(field, key, nil)
 	if !owned {
 		return bm, noReleaseUniqueBitmap
 	}
@@ -547,12 +547,7 @@ func (db *DB[K, V]) checkUniqueBatchCandidate(
 	return nil
 }
 
-func (db *DB[K, V]) setIndexOnSuccessMulti(err error, txID uint64, idxs []uint64, oldVals, newVals []*V, modified [][]string) error {
-	if err != nil {
-		db.clearPending(txID)
-		return err
-	}
-
+func (db *DB[K, V]) publishWriteDeltaBatch(txID uint64, idxs []uint64, oldVals, newVals []*V, modified [][]string) {
 	indexChanges := getWriteDeltaOuterMap()
 	defer releaseWriteDeltaOuterMap(indexChanges)
 
@@ -612,7 +607,6 @@ func (db *DB[K, V]) setIndexOnSuccessMulti(err error, txID uint64, idxs []uint64
 	}
 
 	db.publishSnapshotWithAccumDeltaNoLock(txID, indexChanges, lenChanges, add, rem)
-	return nil
 }
 
 func distinctCount(s []string) int {
@@ -709,12 +703,7 @@ func (db *DB[K, V]) checkUniqueSingleCandidate(idx uint64, ptr unsafe.Pointer, a
 	return fmt.Errorf("%w: value for field %v already exists", ErrUniqueViolation, acc.name)
 }
 
-func (db *DB[K, V]) setIndexOnSuccess(err error, txID uint64, idx uint64, oldVal, newVal *V, modified []string) error {
-	if err != nil {
-		db.clearPending(txID)
-		return err
-	}
-
+func (db *DB[K, V]) publishWriteDelta(txID uint64, idx uint64, oldVal, newVal *V, modified []string) {
 	indexChanges := getWriteDeltaOuterMap()
 	defer releaseWriteDeltaOuterMap(indexChanges)
 
@@ -762,7 +751,6 @@ func (db *DB[K, V]) setIndexOnSuccess(err error, txID uint64, idx uint64, oldVal
 		universeAdd,
 		universeDel,
 	)
-	return nil
 }
 
 const (

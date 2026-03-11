@@ -337,11 +337,13 @@ func (db *DB[K, V]) Set(id K, newVal *V, fns ...PreCommitFunc[K, V]) error {
 	txID := uint64(tx.ID())
 	db.markPending(txID)
 
-	err = db.setIndexOnSuccess(db.commit(tx, "set"), txID, idx, oldVal, newVal, modified)
-	if err == nil {
-		cleanupOnErr = false
+	if err = db.commit(tx, "set"); err != nil {
+		db.clearPending(txID)
+		return err
 	}
-	return err
+	db.publishWriteDelta(txID, idx, oldVal, newVal, modified)
+	cleanupOnErr = false
+	return nil
 }
 
 // BatchSet stores multiple values under the provided IDs in a single write
@@ -503,11 +505,13 @@ func (db *DB[K, V]) BatchSet(ids []K, newVals []*V, fns ...PreCommitFunc[K, V]) 
 	txID := uint64(tx.ID())
 	db.markPending(txID)
 
-	err = db.setIndexOnSuccessMulti(db.commit(tx, "batch_set"), txID, idxs, oldVals, newVals, modified)
-	if err == nil {
-		cleanupOnErr = false
+	if err = db.commit(tx, "batch_set"); err != nil {
+		db.clearPending(txID)
+		return err
 	}
-	return err
+	db.publishWriteDeltaBatch(txID, idxs, oldVals, newVals, modified)
+	cleanupOnErr = false
+	return nil
 }
 
 // Patch applies a partial update to the value stored under the given id,
@@ -636,7 +640,12 @@ func (db *DB[K, V]) patch(id K, fields []Field, ignoreUnknown bool, allowMissing
 	txID := uint64(tx.ID())
 	db.markPending(txID)
 
-	return db.setIndexOnSuccess(db.commit(tx, "patch"), txID, idx, oldVal, newVal, modified)
+	if err = db.commit(tx, "patch"); err != nil {
+		db.clearPending(txID)
+		return err
+	}
+	db.publishWriteDelta(txID, idx, oldVal, newVal, modified)
+	return nil
 }
 
 // BatchPatch applies the same patch to all values stored under the given IDs
@@ -791,7 +800,12 @@ func (db *DB[K, V]) batchPatch(ids []K, patch []Field, ignoreUnknown bool, fns .
 	txID := uint64(tx.ID())
 	db.markPending(txID)
 
-	return db.setIndexOnSuccessMulti(db.commit(tx, "batch_patch"), txID, idxs, oldVals, newVals, modified)
+	if err = db.commit(tx, "batch_patch"); err != nil {
+		db.clearPending(txID)
+		return err
+	}
+	db.publishWriteDeltaBatch(txID, idxs, oldVals, newVals, modified)
+	return nil
 }
 
 // Delete removes the value stored under the given id, if any.
@@ -863,7 +877,12 @@ func (db *DB[K, V]) Delete(id K, fns ...PreCommitFunc[K, V]) error {
 	txID := uint64(tx.ID())
 	db.markPending(txID)
 
-	return db.setIndexOnSuccess(db.commit(tx, "delete"), txID, idx, oldVal, nil, modified)
+	if err = db.commit(tx, "delete"); err != nil {
+		db.clearPending(txID)
+		return err
+	}
+	db.publishWriteDelta(txID, idx, oldVal, nil, modified)
+	return nil
 }
 
 // BatchDelete removes all values stored under the provided ids in a single
@@ -958,5 +977,10 @@ func (db *DB[K, V]) BatchDelete(ids []K, fns ...PreCommitFunc[K, V]) error {
 	txID := uint64(tx.ID())
 	db.markPending(txID)
 
-	return db.setIndexOnSuccessMulti(db.commit(tx, "batch_delete"), txID, idxs, oldVals, nil, modified)
+	if err = db.commit(tx, "batch_delete"); err != nil {
+		db.clearPending(txID)
+		return err
+	}
+	db.publishWriteDeltaBatch(txID, idxs, oldVals, nil, modified)
+	return nil
 }

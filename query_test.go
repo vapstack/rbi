@@ -1082,9 +1082,9 @@ func assertPreparedRouteEquivalenceString(
 		t.Fatalf("checkUsedFields(%+v): %v", nq, err)
 	}
 
-	ref, err := db.queryNoTracePrepared(nq)
+	ref, err := db.execPreparedQuery(nq)
 	if err != nil {
-		t.Fatalf("queryNoTracePrepared(%+v): %v", nq, err)
+		t.Fatalf("execPreparedQuery(%+v): %v", nq, err)
 	}
 	assertNoDuplicateStringIDs(t, "prepared", ref)
 
@@ -1095,9 +1095,9 @@ func assertPreparedRouteEquivalenceString(
 		fullQ.Offset = 0
 		fullQ.Limit = 0
 
-		noOrderFull, err = db.queryNoTracePrepared(fullQ)
+		noOrderFull, err = db.execPreparedQuery(fullQ)
 		if err != nil {
-			t.Fatalf("queryNoTracePrepared(full %+v): %v", fullQ, err)
+			t.Fatalf("execPreparedQuery(full %+v): %v", fullQ, err)
 		}
 		assertNoOrderWindowSubsetString(t, nq, ref, noOrderFull, "prepared")
 	}
@@ -1790,7 +1790,7 @@ func TestQuery_ArrayOrder_RandomMutations_MatchSeqScan(t *testing.T) {
 								vals, _ := q.Order[0].Data.([]string)
 								var bits []string
 								for _, tag := range vals {
-									bm, owned := db.fieldLookupWithState("tags", tag, nil)
+									bm, owned := db.fieldLookupOwned("tags", tag, nil)
 									gHas := bm != nil && bm.Contains(gid)
 									wHas := bm != nil && bm.Contains(wid)
 									if owned && bm != nil {
@@ -2039,7 +2039,7 @@ func TestQuery_RandomMixedMultiWrites_MatchSeqScanModel(t *testing.T) {
 					}
 					var gm, wm []string
 					for _, tag := range []string{"rust", "java", "infra", "go", "db"} {
-						bm, owned := db.fieldLookupWithState("tags", tag, nil)
+						bm, owned := db.fieldLookupOwned("tags", tag, nil)
 						gHas := bm != nil && bm.Contains(gid)
 						wHas := bm != nil && bm.Contains(wid)
 						if owned && bm != nil {
@@ -2232,9 +2232,9 @@ func assertPreparedRouteEquivalence(
 		t.Fatalf("checkUsedFields(%+v): %v", nq, err)
 	}
 
-	ref, err := db.queryNoTracePrepared(nq)
+	ref, err := db.execPreparedQuery(nq)
 	if err != nil {
-		t.Fatalf("queryNoTracePrepared(%+v): %v", nq, err)
+		t.Fatalf("execPreparedQuery(%+v): %v", nq, err)
 	}
 	assertNoDuplicateIDs(t, "prepared", ref)
 
@@ -2245,9 +2245,9 @@ func assertPreparedRouteEquivalence(
 		fullQ.Offset = 0
 		fullQ.Limit = 0
 
-		noOrderFull, err = db.queryNoTracePrepared(fullQ)
+		noOrderFull, err = db.execPreparedQuery(fullQ)
 		if err != nil {
-			t.Fatalf("queryNoTracePrepared(full %+v): %v", fullQ, err)
+			t.Fatalf("execPreparedQuery(full %+v): %v", fullQ, err)
 		}
 		assertNoOrderWindowSubset(t, nq, ref, noOrderFull, "prepared")
 	}

@@ -104,7 +104,10 @@ func (db *DB[K, V]) Query(q *qx.QX) ([]*V, error) {
 }
 
 func (db *DB[K, V]) queryRecords(tx *bbolt.Tx, snap *indexSnapshot, q *qx.QX) ([]*V, error) {
-	ids, err := db.queryNoTraceOnSnapshot(q, snap)
+	view := db.makeQueryView(snap)
+	defer db.releaseQueryView(view)
+
+	ids, err := view.execQuery(q, false, false)
 	if err != nil {
 		return nil, err
 	}
@@ -130,33 +133,16 @@ func (db *DB[K, V]) QueryKeys(q *qx.QX) ([]K, error) {
 		return nil, err
 	}
 	defer db.endOp()
-	return db.queryOnSnapshot(q, db.getSnapshot())
+
+	view := db.makeQueryView(db.getSnapshot())
+	defer db.releaseQueryView(view)
+	return view.execQuery(q, true, false)
 }
 
-func (db *DB[K, V]) query(q *qx.QX) ([]K, error) {
-	return db.execQuery(q, true, false)
-}
-
-func (db *DB[K, V]) queryNoTrace(q *qx.QX) ([]K, error) {
-	return db.execQuery(q, false, false)
-}
-
-// queryNoTracePrepared skips normalize/field-validation phase and is intended
-// only for internal callers that already operate on validated/normalized QX.
-func (db *DB[K, V]) queryNoTracePrepared(q *qx.QX) ([]K, error) {
+// execPreparedQuery skips normalize/field-validation and tracing for internal
+// callers that already operate on validated/normalized QX.
+func (db *DB[K, V]) execPreparedQuery(q *qx.QX) ([]K, error) {
 	return db.execQuery(q, false, true)
-}
-
-func (db *DB[K, V]) queryNoTraceOnSnapshot(q *qx.QX, snap *indexSnapshot) ([]K, error) {
-	view := db.makeQueryView(snap)
-	defer db.releaseQueryView(view)
-	return view.queryNoTrace(q)
-}
-
-func (db *DB[K, V]) queryOnSnapshot(q *qx.QX, snap *indexSnapshot) ([]K, error) {
-	view := db.makeQueryView(snap)
-	defer db.releaseQueryView(view)
-	return view.query(q)
 }
 
 func shouldSkipPlannerInDeltaMode(q *qx.QX) bool {

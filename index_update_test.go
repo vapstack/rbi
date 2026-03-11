@@ -36,7 +36,7 @@ func TestSet_ReindexesAllSliceValues_OnReplace(t *testing.T) {
 		t.Fatalf("Set(215): %v", err)
 	}
 
-	bm, owned := db.fieldLookupWithState("tags", "db", nil)
+	bm, owned := db.fieldLookupOwned("tags", "db", nil)
 	has := bm != nil && bm.Contains(215)
 	if owned && bm != nil {
 		releaseRoaringBuf(bm)

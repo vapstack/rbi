@@ -1100,7 +1100,7 @@ func lookupLayerFieldDeltaEntry(layer *fieldDeltaLayer, field, key string) (inde
 	return out, true
 }
 
-func (s *indexSnapshot) fieldLookupWithState(field, key string, scratch *roaring64.Bitmap) (*roaring64.Bitmap, bool) {
+func (s *indexSnapshot) fieldLookupOwned(field, key string, scratch *roaring64.Bitmap) (*roaring64.Bitmap, bool) {
 	if s == nil {
 		return nil, false
 	}
@@ -2120,8 +2120,8 @@ func (db *DB[K, V]) fieldOverlay(field string) fieldOverlay {
 	return newFieldOverlay(s.fieldIndexSlice(field), s.fieldDelta(field))
 }
 
-func (db *DB[K, V]) fieldLookupWithState(field, key string, scratch *roaring64.Bitmap) (*roaring64.Bitmap, bool) {
-	return db.getSnapshot().fieldLookupWithState(field, key, scratch)
+func (db *DB[K, V]) fieldLookupOwned(field, key string, scratch *roaring64.Bitmap) (*roaring64.Bitmap, bool) {
+	return db.getSnapshot().fieldLookupOwned(field, key, scratch)
 }
 
 func (db *DB[K, V]) lenFieldOverlay(field string) fieldOverlay {

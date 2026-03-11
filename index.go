@@ -274,7 +274,10 @@ func (db *DB[K, V]) keyFromIdx(idx uint64) (K, bool) {
 
 func (db *DB[K, V]) idFromIdxNoLock(idx uint64) K {
 	if db.strkey {
-		v := db.strMapSnapshot().mustGetStringNoLock(idx)
+		v, ok := db.strMapSnapshot().getStringNoLock(idx)
+		if !ok {
+			panic(fmt.Errorf("no id associated with idx %v", idx))
+		}
 		return *(*K)(unsafe.Pointer(&v))
 	}
 	return *(*K)(unsafe.Pointer(&idx))

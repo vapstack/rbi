@@ -2169,7 +2169,7 @@ func (db *DB[K, V]) execPlanOROrderMergeFallback(q *qx.QX, branches plannerORBra
 			subQ.Order = q.Order
 		}
 
-		ids, err := db.queryNoTracePrepared(subQ)
+		ids, err := db.execPreparedQuery(subQ)
 		if err != nil {
 			return nil, true, err
 		}

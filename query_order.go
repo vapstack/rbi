@@ -559,7 +559,7 @@ func (db *DB[K, V]) queryOrderArrayPosOverlay(result bitmap, ov fieldOverlay, o 
 	cursor := db.newQueryCursor(out, skip, need, all, nil)
 
 	doValue := func(key string) bool {
-		bm, owned := ov.lookupWithState(key, scratch)
+		bm, owned := ov.lookupOwned(key, scratch)
 		if bm == nil || bm.IsEmpty() {
 			if owned && bm != nil && bm != scratch {
 				releaseRoaringBuf(bm)
@@ -802,7 +802,7 @@ func (db *DB[K, V]) queryOrderArrayCountOverlay(result bitmap, ov fieldOverlay, 
 		if !useZeroComplement {
 			return false
 		}
-		nonEmpty, nonEmptyOwned := ov.lookupWithState(lenIndexNonEmptyKey, scratch)
+		nonEmpty, nonEmptyOwned := ov.lookupOwned(lenIndexNonEmptyKey, scratch)
 		zero := getRoaringBuf()
 		zero.Or(resultBM)
 		if nonEmpty != nil && !nonEmpty.IsEmpty() {
