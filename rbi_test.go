@@ -557,11 +557,11 @@ func TestClose_UnblocksQueuedBatchWriters(t *testing.T) {
 	closeDone := make(chan error, 1)
 
 	go func() {
-		firstDone <- db.Set(1, &Rec{Name: "first", Age: 10}, func(_ *bbolt.Tx, _ uint64, _, _ *Rec) error {
+		firstDone <- db.Set(1, &Rec{Name: "first", Age: 10}, BeforeCommit(func(_ *bbolt.Tx, _ uint64, _, _ *Rec) error {
 			close(firstStarted)
 			<-releaseFirst
 			return nil
-		})
+		}))
 	}()
 
 	select {
@@ -1885,7 +1885,7 @@ func TestBatchConcurrentSingleOps_ModelReplayConsistency(t *testing.T) {
 					})
 					logMu.Unlock()
 
-				case 1: // PatchIfExists
+				case 1: // Patch
 					var patch []Field
 					switch r.Intn(6) {
 					case 0:
@@ -1901,7 +1901,7 @@ func TestBatchConcurrentSingleOps_ModelReplayConsistency(t *testing.T) {
 					default:
 						patch = []Field{{Name: "tags", Value: randTags()}}
 					}
-					if err := db.PatchIfExists(id, patch); err != nil {
+					if err := db.Patch(id, patch); err != nil {
 						errCh <- fmt.Errorf("writer=%d patch id=%d patch=%v: %w", w, id, patch, err)
 						return
 					}
@@ -2800,26 +2800,26 @@ func TestBatchDelete_DecodeError_RollsBackEarlierDeletes(t *testing.T) {
 func TestMultiWrite_CallbackError_RollbackDataAndIndex(t *testing.T) {
 	type tc struct {
 		name string
-		run  func(db *DB[uint64, Rec], cb PreCommitFunc[uint64, Rec]) error
+		run  func(db *DB[uint64, Rec], cb func(*bbolt.Tx, uint64, *Rec, *Rec) error) error
 	}
 
 	cases := []tc{
 		{
 			name: "batch_set",
-			run: func(db *DB[uint64, Rec], cb PreCommitFunc[uint64, Rec]) error {
+			run: func(db *DB[uint64, Rec], cb func(*bbolt.Tx, uint64, *Rec, *Rec) error) error {
 				return db.BatchSet(
 					[]uint64{1, 2},
 					[]*Rec{
 						{Name: "new-1", Age: 100, Tags: []string{"x"}, Meta: Meta{Country: "PL"}},
 						{Name: "new-2", Age: 200, Tags: []string{"y"}, Meta: Meta{Country: "DE"}},
 					},
-					cb,
+					BeforeCommit(cb),
 				)
 			},
 		},
 		{
 			name: "batch_patch",
-			run: func(db *DB[uint64, Rec], cb PreCommitFunc[uint64, Rec]) error {
+			run: func(db *DB[uint64, Rec], cb func(*bbolt.Tx, uint64, *Rec, *Rec) error) error {
 				return db.BatchPatch(
 					[]uint64{1, 2},
 					[]Field{
@@ -2827,14 +2827,14 @@ func TestMultiWrite_CallbackError_RollbackDataAndIndex(t *testing.T) {
 						{Name: "country", Value: "US"},
 						{Name: "tags", Value: []string{"patched"}},
 					},
-					cb,
+					BeforeCommit(cb),
 				)
 			},
 		},
 		{
 			name: "batch_delete",
-			run: func(db *DB[uint64, Rec], cb PreCommitFunc[uint64, Rec]) error {
-				return db.BatchDelete([]uint64{1, 2}, cb)
+			run: func(db *DB[uint64, Rec], cb func(*bbolt.Tx, uint64, *Rec, *Rec) error) error {
+				return db.BatchDelete([]uint64{1, 2}, BeforeCommit(cb))
 			},
 		},
 	}
@@ -2901,6 +2901,61 @@ func TestMultiWrite_CallbackError_RollbackDataAndIndex(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestNew_DefaultExecOptions_ApplyToWrites(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "default_before_commit.db")
+
+	raw, err := bbolt.Open(path, 0o600, nil)
+	if err != nil {
+		t.Fatalf("bbolt.Open: %v", err)
+	}
+	defer func() { _ = raw.Close() }()
+
+	var calls []string
+	db, err := New[uint64, Rec](
+		raw,
+		Options{BatchMax: 1},
+		PatchStrict,
+		BeforeCommit(func(_ *bbolt.Tx, _ uint64, _, _ *Rec) error {
+			calls = append(calls, "default")
+			return nil
+		}),
+	)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	err = db.Set(
+		1,
+		&Rec{Name: "alice", Age: 30},
+		BeforeCommit(func(_ *bbolt.Tx, _ uint64, _, _ *Rec) error {
+			calls = append(calls, "call")
+			return nil
+		}),
+	)
+	if err != nil {
+		t.Fatalf("Set with default exec options: %v", err)
+	}
+
+	if !slices.Equal(calls, []string{"default", "call"}) {
+		t.Fatalf("unexpected callback order: %v", calls)
+	}
+
+	v, err := db.Get(1)
+	if err != nil {
+		t.Fatalf("Get(1): %v", err)
+	}
+	if v == nil || v.Name != "alice" || v.Age != 30 {
+		t.Fatalf("unexpected stored value: %#v", v)
+	}
+
+	err = db.Patch(1, []Field{{Name: "does_not_exist", Value: 1}})
+	if err == nil {
+		t.Fatal("expected Patch to inherit default PatchStrict option")
 	}
 }
 
@@ -3013,7 +3068,7 @@ func TestMultiWrite_CallbackError_RandomizedAtomicRollback(t *testing.T) {
 				ids[i] = id
 				vals[i] = randomRec(id)
 			}
-			opErr = db.BatchSet(ids, vals, cb)
+			opErr = db.BatchSet(ids, vals, BeforeCommit(cb))
 		case 1: // BatchPatch
 			n := 3 + r.IntN(6)
 			ids := make([]uint64, n)
@@ -3024,14 +3079,14 @@ func TestMultiWrite_CallbackError_RandomizedAtomicRollback(t *testing.T) {
 				{Name: "age", Value: 18 + r.IntN(62)},
 				{Name: "country", Value: countries[r.IntN(len(countries))]},
 			}
-			opErr = db.BatchPatch(ids, patch, cb)
+			opErr = db.BatchPatch(ids, patch, BeforeCommit(cb))
 		default: // BatchDelete
 			n := 2 + r.IntN(6)
 			ids := make([]uint64, n)
 			for i := 0; i < n; i++ {
 				ids[i] = uint64(1 + r.IntN(96))
 			}
-			opErr = db.BatchDelete(ids, cb)
+			opErr = db.BatchDelete(ids, BeforeCommit(cb))
 		}
 
 		if cbCalls == 0 {
@@ -3276,7 +3331,7 @@ func TestBatchPatch_MissingIDs_CallbacksOnlyForExisting(t *testing.T) {
 		return nil
 	}
 
-	err := db.BatchPatch([]string{"missing", "p1", "missing2"}, []Field{{Name: "price", Value: 20.0}}, cb)
+	err := db.BatchPatch([]string{"missing", "p1", "missing2"}, []Field{{Name: "price", Value: 20.0}}, BeforeCommit(cb))
 	if err != nil {
 		t.Fatalf("BatchPatch: %v", err)
 	}
@@ -3293,7 +3348,7 @@ func TestBatchPatch_MissingIDs_CallbacksOnlyForExisting(t *testing.T) {
 	}
 }
 
-func TestBatchPatchStrict_ValidationError_IsAtomic(t *testing.T) {
+func TestBatchPatch_WithPatchStrict_ValidationError_IsAtomic(t *testing.T) {
 	type tc struct {
 		name  string
 		patch []Field
@@ -3322,9 +3377,9 @@ func TestBatchPatchStrict_ValidationError_IsAtomic(t *testing.T) {
 				t.Fatalf("Set(2): %v", err)
 			}
 
-			err := db.BatchPatchStrict([]uint64{1, 2}, c.patch)
+			err := db.BatchPatch([]uint64{1, 2}, c.patch, PatchStrict)
 			if err == nil {
-				t.Fatalf("expected BatchPatchStrict error, got nil")
+				t.Fatalf("expected BatchPatch(..., PatchStrict) error, got nil")
 			}
 
 			v1, err := db.Get(1)
@@ -3332,7 +3387,7 @@ func TestBatchPatchStrict_ValidationError_IsAtomic(t *testing.T) {
 				t.Fatalf("Get(1): %v", err)
 			}
 			if v1 == nil || v1.Name != "n1" || v1.Age != 10 || v1.Country != "NL" {
-				t.Fatalf("id=1 changed after failed BatchPatchStrict: %#v", v1)
+				t.Fatalf("id=1 changed after failed BatchPatch(..., PatchStrict): %#v", v1)
 			}
 
 			v2, err := db.Get(2)
@@ -3340,7 +3395,7 @@ func TestBatchPatchStrict_ValidationError_IsAtomic(t *testing.T) {
 				t.Fatalf("Get(2): %v", err)
 			}
 			if v2 == nil || v2.Name != "n2" || v2.Age != 20 || v2.Country != "DE" {
-				t.Fatalf("id=2 changed after failed BatchPatchStrict: %#v", v2)
+				t.Fatalf("id=2 changed after failed BatchPatch(..., PatchStrict): %#v", v2)
 			}
 
 			ids, err := db.QueryKeys(qx.Query(qx.EQ("name", "n1")))
@@ -3348,7 +3403,7 @@ func TestBatchPatchStrict_ValidationError_IsAtomic(t *testing.T) {
 				t.Fatalf("QueryKeys(name=n1): %v", err)
 			}
 			if len(ids) != 1 || ids[0] != 1 {
-				t.Fatalf("unexpected name index for n1 after failed BatchPatchStrict: %v", ids)
+				t.Fatalf("unexpected name index for n1 after failed BatchPatch(..., PatchStrict): %v", ids)
 			}
 		})
 	}
@@ -3363,8 +3418,8 @@ func TestMissingIDs_DoNotGrowStrMap(t *testing.T) {
 
 	initial := len(db.strmap.Keys)
 
-	if err := db.Patch("missing", []Field{{Name: "price", Value: 1.0}}); !errors.Is(err, ErrRecordNotFound) {
-		t.Fatalf("expected ErrRecordNotFound, got: %v", err)
+	if err := db.Patch("missing", []Field{{Name: "price", Value: 1.0}}); err != nil {
+		t.Fatalf("Patch(missing): %v", err)
 	}
 	if err := db.Delete("missing"); err != nil {
 		t.Fatalf("Delete: %v", err)
@@ -3477,10 +3532,10 @@ func TestFailedSetPaths_DoNotGrowStrMap(t *testing.T) {
 	}
 
 	initial := len(db.strmap.Keys)
-	cbErr := errors.New("precommit fail")
+	cbErr := errors.New("before commit fail")
 	cb := func(_ *bbolt.Tx, _ string, _ *Product, _ *Product) error { return cbErr }
 
-	if err := db.Set("ghost-set", &Product{SKU: "ghost-set", Price: 11}, cb); !errors.Is(err, cbErr) {
+	if err := db.Set("ghost-set", &Product{SKU: "ghost-set", Price: 11}, BeforeCommit(cb)); !errors.Is(err, cbErr) {
 		t.Fatalf("Set callback error mismatch: %v", err)
 	}
 	if v, err := db.Get("ghost-set"); err != nil {
@@ -3498,7 +3553,7 @@ func TestFailedSetPaths_DoNotGrowStrMap(t *testing.T) {
 			{SKU: "ghost-many-1", Price: 12},
 			{SKU: "ghost-many-2", Price: 13},
 		},
-		cb,
+		BeforeCommit(cb),
 	)
 	if !errors.Is(err, cbErr) {
 		t.Fatalf("BatchSet callback error mismatch: %v", err)
@@ -3545,9 +3600,9 @@ func TestBatchSet_CallbackError_DoesNotGrowStrMap(t *testing.T) {
 	initial := len(db.strmap.Keys)
 
 	cbErr := errors.New("cb fail")
-	err := db.Set("ghost-cb", &Product{SKU: "ghost-cb", Price: 11}, func(_ *bbolt.Tx, _ string, _ *Product, _ *Product) error {
+	err := db.Set("ghost-cb", &Product{SKU: "ghost-cb", Price: 11}, BeforeCommit(func(_ *bbolt.Tx, _ string, _ *Product, _ *Product) error {
 		return cbErr
-	})
+	}))
 	if !errors.Is(err, cbErr) {
 		t.Fatalf("Set callback error mismatch: %v", err)
 	}

@@ -23,7 +23,6 @@ var (
 	ErrRebuildInProgress = errors.New("index rebuild in progress")
 	ErrInvalidQuery      = errors.New("invalid query")
 	ErrUniqueViolation   = errors.New("unique constraint violation")
-	ErrRecordNotFound    = errors.New("record not found")
 	ErrNoValidKeyIndex   = errors.New("no valid key for index")
 	ErrNilValue          = errors.New("value is nil")
 
@@ -50,7 +49,6 @@ const (
 	defaultBatchWindow                              = 200 * time.Microsecond
 	defaultBatchMax                                 = 16
 	defaultBatchMaxQueue                            = 512
-	defaultBatchAllowCallbacks                      = false
 	defaultSnapshotDeltaCompactLargeBaseFieldKeys   = 128 << 10
 	defaultSnapshotDeltaCompactLargeBaseMinDeltaDiv = 32
 	defaultSnapshotDeltaCompactForceFieldOps        = 256 << 10
@@ -350,7 +348,7 @@ type Options struct {
 	BatchMaxQueue int
 
 	// BatchAllowCallbacks allows combiner batching for requests with one or more
-	// PreCommit callbacks.
+	// BeforeCommit callbacks.
 	//
 	// Default: false
 	//
@@ -473,23 +471,6 @@ func (o *Options) setDefaults() {
 	}
 }
 
-// PreCommitFunc is a callback invoked inside the write transaction just before
-// it is committed.
-//
-// The callback:
-//   - Must not modify oldValue or newValue.
-//   - Must not commit or roll back the transaction.
-//   - Must not modify records or bucket sequence in the bucket managed by this DB instance
-//     (or by any other DB instance with enabled indexing),
-//     because such writes bypass index synchronization.
-//   - May perform additional reads or writes within the same transaction.
-//   - May return an error to abort the operation; in this case the
-//     transaction will be rolled back and index state will not be updated.
-//
-// PreCommitFunc is invoked only for records that exist or are being written.
-// Patch/Delete operations skip missing records and do not invoke callbacks for them.
-type PreCommitFunc[K ~string | ~uint64, V any] = func(tx *bbolt.Tx, key K, oldValue, newValue *V) error
-
 // Field represents a single field assignment used by Patch and BatchPatch.
 // Name is matched against struct field name, "db" tag, or "json" tag,
 // and Value is assigned to the matched field using reflection and conversion rules.
@@ -515,8 +496,11 @@ type Field struct {
 // rebuilds missing parts of the index if allowed, and sets up field metadata
 // and accessors.
 //
+// Any ExecOptions passed to New become defaults applied to subsequent write
+// operations on the returned DB.
+//
 // The resulting DB does not manage the underlying *bbolt.DB lifecycle.
-func New[K ~uint64 | ~string, V any](bolt *bbolt.DB, options Options) (db *DB[K, V], err error) {
+func New[K ~uint64 | ~string, V any](bolt *bbolt.DB, options Options, execOpts ...ExecOption[K, V]) (db *DB[K, V], err error) {
 	var v V
 	vtype := reflect.TypeOf(v)
 	if vtype == nil {
@@ -581,7 +565,8 @@ func New[K ~uint64 | ~string, V any](bolt *bbolt.DB, options Options) (db *DB[K,
 			},
 		},
 
-		options: &options,
+		options:            &options,
+		defaultExecOptions: append([]ExecOption[K, V](nil), execOpts...),
 
 		snapshot: snapshot{
 			pinWait: snapshotPinWaitTimeout(options.SnapshotPinWaitTimeout),
@@ -879,7 +864,8 @@ type (
 		combiner  combiner[K, V]
 		rebuilder rebuilder
 
-		options *Options
+		options            *Options
+		defaultExecOptions []ExecOption[K, V]
 
 		rbiFile string
 
@@ -1042,7 +1028,7 @@ type (
 		// MaxBatchSeen is maximum observed executed batch size.
 		MaxBatchSeen uint64
 
-		// CallbackOps is number of requests with PreCommit callbacks executed by combiner.
+		// CallbackOps is number of requests with BeforeCommit callbacks executed by combiner.
 		CallbackOps uint64
 		// CoalescedSetDelete is number of Set/Delete requests collapsed into later Set/Delete of same ID.
 		CoalescedSetDelete uint64
@@ -1073,7 +1059,7 @@ type (
 		TxOpErrors uint64
 		// TxCommitErrors is number of write tx commit failures.
 		TxCommitErrors uint64
-		// CallbackErrors is number of callback failures returned by PreCommit funcs.
+		// CallbackErrors is number of callback failures returned by BeforeCommit callbacks.
 		CallbackErrors uint64
 	}
 

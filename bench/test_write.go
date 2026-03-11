@@ -27,7 +27,7 @@ func runDedicatedWriteTouchLastSeen(
 	if rng.Float64() < 0.06 {
 		patch = append(patch, rbi.Field{Name: "plan", Value: weightedPlan(rng)})
 	}
-	return "write_touch_last_seen", db.PatchIfExists(id, patch)
+	return "write_touch_last_seen", db.Patch(id, patch)
 }
 
 func runDedicatedWriteVoteKarma(
@@ -49,7 +49,7 @@ func runDedicatedWriteVoteKarma(
 	if rng.Float64() < 0.10 {
 		patch = append(patch, rbi.Field{Name: "is_verified", Value: rng.Float64() < 0.70})
 	}
-	return "write_vote_karma", db.PatchIfExists(id, patch)
+	return "write_vote_karma", db.Patch(id, patch)
 }
 
 func runDedicatedWriteProfileEdit(
@@ -74,7 +74,7 @@ func runDedicatedWriteProfileEdit(
 	if rng.Float64() < 0.18 {
 		patch = append(patch, rbi.Field{Name: "roles", Value: sampleRoleSet(rng)})
 	}
-	return "write_profile_edit", db.PatchIfExists(id, patch)
+	return "write_profile_edit", db.Patch(id, patch)
 }
 
 func runDedicatedWriteModerationAction(
@@ -100,7 +100,7 @@ func runDedicatedWriteModerationAction(
 	if rng.Float64() < 0.20 {
 		patch = append(patch, rbi.Field{Name: "is_verified", Value: false})
 	}
-	return "write_moderation_action", db.PatchIfExists(id, patch)
+	return "write_moderation_action", db.Patch(id, patch)
 }
 
 func runDedicatedWriteInsert(

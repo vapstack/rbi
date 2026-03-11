@@ -132,9 +132,7 @@ For the full API reference see
 * `Set(id, value)` – insert or replace a record and update affected indexes.
 * `BatchSet(ids, values)` – batch variant of `Set`, significantly faster for bulk inserts.
 * `Patch(id, fields)` – apply partial updates and update only changed indexes.
-* `PatchStrict(id, fields)` – like `Patch`, but fails on unknown fields.
-* `PatchIfExists(id, fields)` / `PatchStrictIfExists(id, fields)` – patch only existing records.
-* `BatchPatch(ids, fields)` / `BatchPatchStrict(ids, fields)` – batch patch variants.
+* `BatchPatch(ids, fields)` – batch patch variant.
 * `Delete(id)` – remove a record and its index entries.
 * `BatchDelete(ids)` – batch variant of `Delete`.
 
@@ -228,7 +226,7 @@ db, err := rbi.New[uint64, User](bolt, rbi.Options{
     BatchWindow: 100 * time.Microsecond,
     BatchMax: 32,
     BatchMaxQueue: 512, // < 0 means unbounded queue, 0 uses default
-    BatchAllowCallbacks: true, // true allows combining ops with PreCommit callbacks
+    BatchAllowCallbacks: true, // true allows combining ops with BeforeCommit callbacks
 })
 if err != nil {
     panic(err)

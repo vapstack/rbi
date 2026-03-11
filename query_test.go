@@ -1743,8 +1743,8 @@ func TestQuery_ArrayOrder_RandomMutations_MatchSeqScan(t *testing.T) {
 					opsLog = append(opsLog, fmt.Sprintf("step=%d set id=%d tags=%v country=%s age=%d active=%v", step, id, rec.Tags, rec.Country, rec.Age, rec.Active))
 				case x < 80:
 					patch := randomPatch()
-					if err := db.PatchIfExists(id, patch); err != nil {
-						t.Fatalf("PatchIfExists(seed=%d,step=%d,id=%d): %v", tc.seed, step, id, err)
+					if err := db.Patch(id, patch); err != nil {
+						t.Fatalf("Patch(seed=%d,step=%d,id=%d): %v", tc.seed, step, id, err)
 					}
 					opsLog = append(opsLog, fmt.Sprintf("step=%d patch id=%d patch=%v", step, id, patch))
 				default:
@@ -1965,8 +1965,8 @@ func TestQuery_RandomMixedMultiWrites_MatchSeqScanModel(t *testing.T) {
 			opsLog = append(opsLog, fmt.Sprintf("step=%d set_many %s", step, strings.Join(pairs, " | ")))
 		case x < 58:
 			patch := randomPatch()
-			if err := db.PatchIfExists(id, patch); err != nil {
-				t.Fatalf("step=%d PatchIfExists(id=%d): %v", step, id, err)
+			if err := db.Patch(id, patch); err != nil {
+				t.Fatalf("step=%d Patch(id=%d): %v", step, id, err)
 			}
 			opsLog = append(opsLog, fmt.Sprintf("step=%d patch id=%d patch=%v", step, id, patch))
 		case x < 74:
@@ -3171,8 +3171,8 @@ func TestQuery_RouteEquivalence_PreparedExecutionPlanner_BaseAndDelta(t *testing
 			}
 		case 1:
 			patch := []Field{{Name: "age", Value: float64(18 + r.IntN(65))}}
-			if err := db.PatchIfExists(id, patch); err != nil {
-				t.Fatalf("delta PatchIfExists(id=%d): %v", id, err)
+			if err := db.Patch(id, patch); err != nil {
+				t.Fatalf("delta Patch(id=%d): %v", id, err)
 			}
 		default:
 			if err := db.Delete(id); err != nil {

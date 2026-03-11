@@ -219,7 +219,7 @@ func TestUnique_Patch_ConflictingUpdateRejected(t *testing.T) {
 		t.Fatalf("Set: %v", err)
 	}
 
-	err := db.PatchStrict(2, []Field{{Name: "email", Value: "a@x"}})
+	err := db.Patch(2, []Field{{Name: "email", Value: "a@x"}}, PatchStrict)
 	if err == nil {
 		t.Fatalf("expected unique violation")
 	}
@@ -636,8 +636,6 @@ func TestUnique_ExecuteBatch_MixedOps_MatchesSequentialModel(t *testing.T) {
 			return "ok"
 		case errors.Is(err, ErrUniqueViolation):
 			return "unique"
-		case errors.Is(err, ErrRecordNotFound):
-			return "not_found"
 		default:
 			return err.Error()
 		}
@@ -724,7 +722,7 @@ func TestUnique_ExecuteBatch_MixedOps_MatchesSequentialModel(t *testing.T) {
 	compareState(0)
 
 	type batchOp struct {
-		kind  uint8 // 0=set, 1=patch_if_exists, 2=delete
+		kind  uint8 // 0=set, 1=patch, 2=delete
 		id    uint64
 		value *UniqueTestRec
 		patch []Field
@@ -807,7 +805,6 @@ func TestUnique_ExecuteBatch_MixedOps_MatchesSequentialModel(t *testing.T) {
 					id:                 op.id,
 					patch:              cloneFields(op.patch),
 					patchIgnoreUnknown: true,
-					patchAllowMissing:  true,
 					done:               make(chan error, 1),
 				})
 			default:
@@ -832,7 +829,7 @@ func TestUnique_ExecuteBatch_MixedOps_MatchesSequentialModel(t *testing.T) {
 			case 0:
 				seqErrs[i] = dbSeq.Set(op.id, cloneUniqueRec(op.value))
 			case 1:
-				seqErrs[i] = dbSeq.PatchIfExists(op.id, cloneFields(op.patch))
+				seqErrs[i] = dbSeq.Patch(op.id, cloneFields(op.patch))
 			default:
 				seqErrs[i] = dbSeq.Delete(op.id)
 			}
@@ -1059,7 +1056,7 @@ func TestUnique_RandomMixedWrites_ModelConsistency(t *testing.T) {
 				model = next
 			}
 
-		case 2: // PatchIfExists
+		case 2: // Patch
 			id := uint64(1 + r.Intn(48))
 			patch := randPatch()
 			next := copyModel(model)
@@ -1068,14 +1065,14 @@ func TestUnique_RandomMixedWrites_ModelConsistency(t *testing.T) {
 			}
 			wantUniqueErr := hasUniqueViolation(next)
 
-			err := db.PatchIfExists(id, patch)
+			err := db.Patch(id, patch)
 			if wantUniqueErr {
 				if err == nil || !errors.Is(err, ErrUniqueViolation) {
-					t.Fatalf("step=%d PatchIfExists expected ErrUniqueViolation, got: %v patch=%v", step, err, patch)
+					t.Fatalf("step=%d Patch expected ErrUniqueViolation, got: %v patch=%v", step, err, patch)
 				}
 			} else {
 				if err != nil {
-					t.Fatalf("step=%d PatchIfExists unexpected err: %v patch=%v", step, err, patch)
+					t.Fatalf("step=%d Patch unexpected err: %v patch=%v", step, err, patch)
 				}
 				model = next
 			}
@@ -1235,7 +1232,7 @@ func TestUnique_BatchPatch_DuplicateWithinBatchRejected(t *testing.T) {
 	}
 
 	ids := []uint64{1, 2}
-	err := db.BatchPatchStrict(ids, []Field{{Name: "email", Value: "dup@x"}})
+	err := db.BatchPatch(ids, []Field{{Name: "email", Value: "dup@x"}}, PatchStrict)
 	if err == nil || !errors.Is(err, ErrUniqueViolation) {
 		t.Fatalf("expected ErrUniqueViolation, got: %v", err)
 	}
@@ -1245,14 +1242,14 @@ func TestUnique_BatchPatch_DuplicateWithinBatchRejected(t *testing.T) {
 		t.Fatalf("Get(1): %v", err)
 	}
 	if v1 == nil || v1.Email != "a@x" || v1.Code != 1 {
-		t.Fatalf("id=1 must stay unchanged after rejected BatchPatchStrict, got: %#v", v1)
+		t.Fatalf("id=1 must stay unchanged after rejected BatchPatch(..., PatchStrict), got: %#v", v1)
 	}
 	v2, err := db.Get(2)
 	if err != nil {
 		t.Fatalf("Get(2): %v", err)
 	}
 	if v2 == nil || v2.Email != "b@x" || v2.Code != 2 {
-		t.Fatalf("id=2 must stay unchanged after rejected BatchPatchStrict, got: %#v", v2)
+		t.Fatalf("id=2 must stay unchanged after rejected BatchPatch(..., PatchStrict), got: %#v", v2)
 	}
 }
 
@@ -1269,7 +1266,7 @@ func TestUnique_BatchPatch_DuplicateAgainstDBRejected(t *testing.T) {
 		t.Fatalf("Set: %v", err)
 	}
 	ids := []uint64{2, 3}
-	err := db.BatchPatchStrict(ids, []Field{{Name: "code", Value: 1}})
+	err := db.BatchPatch(ids, []Field{{Name: "code", Value: 1}}, PatchStrict)
 	if err == nil || !errors.Is(err, ErrUniqueViolation) {
 		t.Fatalf("expected ErrUniqueViolation, got: %v", err)
 	}
@@ -1279,14 +1276,14 @@ func TestUnique_BatchPatch_DuplicateAgainstDBRejected(t *testing.T) {
 		t.Fatalf("Get(2): %v", err)
 	}
 	if v2 == nil || v2.Email != "b@x" || v2.Code != 2 {
-		t.Fatalf("id=2 must stay unchanged after rejected BatchPatchStrict, got: %#v", v2)
+		t.Fatalf("id=2 must stay unchanged after rejected BatchPatch(..., PatchStrict), got: %#v", v2)
 	}
 	v3, err := db.Get(3)
 	if err != nil {
 		t.Fatalf("Get(3): %v", err)
 	}
 	if v3 == nil || v3.Email != "c@x" || v3.Code != 3 {
-		t.Fatalf("id=3 must stay unchanged after rejected BatchPatchStrict, got: %#v", v3)
+		t.Fatalf("id=3 must stay unchanged after rejected BatchPatch(..., PatchStrict), got: %#v", v3)
 	}
 
 	owners, err := db.QueryKeys(qx.Query(qx.EQ("code", 1)))
@@ -1294,7 +1291,7 @@ func TestUnique_BatchPatch_DuplicateAgainstDBRejected(t *testing.T) {
 		t.Fatalf("QueryKeys(code=1): %v", err)
 	}
 	if len(owners) != 1 || owners[0] != 1 {
-		t.Fatalf("unexpected owners for code=1 after failed BatchPatchStrict: %v", owners)
+		t.Fatalf("unexpected owners for code=1 after failed BatchPatch(..., PatchStrict): %v", owners)
 	}
 }
 
@@ -1307,14 +1304,14 @@ func TestUnique_BatchPatch_SwapValuesAllowed(t *testing.T) {
 	if err := db.Set(2, &UniqueTestRec{Email: "y@x", Code: 20}); err != nil {
 		t.Fatalf("Set: %v", err)
 	}
-	if err := db.PatchStrict(1, []Field{{Name: "email", Value: "tmp@x"}}); err != nil {
-		t.Fatalf("PatchStrict(1)->tmp: %v", err)
+	if err := db.Patch(1, []Field{{Name: "email", Value: "tmp@x"}}, PatchStrict); err != nil {
+		t.Fatalf("Patch(1, ..., PatchStrict)->tmp: %v", err)
 	}
-	if err := db.PatchStrict(2, []Field{{Name: "email", Value: "x@x"}}); err != nil {
-		t.Fatalf("PatchStrict(2)->x: %v", err)
+	if err := db.Patch(2, []Field{{Name: "email", Value: "x@x"}}, PatchStrict); err != nil {
+		t.Fatalf("Patch(2, ..., PatchStrict)->x: %v", err)
 	}
-	if err := db.PatchStrict(1, []Field{{Name: "email", Value: "y@x"}}); err != nil {
-		t.Fatalf("PatchStrict(1)->y: %v", err)
+	if err := db.Patch(1, []Field{{Name: "email", Value: "y@x"}}, PatchStrict); err != nil {
+		t.Fatalf("Patch(1, ..., PatchStrict)->y: %v", err)
 	}
 	v1, err := db.Get(1)
 	if err != nil {
@@ -1342,8 +1339,8 @@ func TestUnique_OptNilReleasesAndReuseAllowed(t *testing.T) {
 	if err == nil || !errors.Is(err, ErrUniqueViolation) {
 		t.Fatalf("expected unique violation on Opt duplicate, got: %v", err)
 	}
-	if err = db.PatchStrict(1, []Field{{Name: "opt", Value: nil}}); err != nil {
-		t.Fatalf("PatchStrict(1) opt=nil: %v", err)
+	if err = db.Patch(1, []Field{{Name: "opt", Value: nil}}, PatchStrict); err != nil {
+		t.Fatalf("Patch(1, ..., PatchStrict) opt=nil: %v", err)
 	}
 	if err = db.Set(2, &UniqueTestRec{Email: "b@x", Code: 2, Opt: &s}); err != nil {
 		t.Fatalf("Set(2) after releasing opt should be allowed: %v", err)

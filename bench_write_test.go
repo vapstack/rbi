@@ -98,7 +98,7 @@ func rawPatchBench(db *DB[uint64, UserBench], raw *bbolt.DB, id uint64, patch []
 		key := db.keyFromID(id)
 		oldBytes := bucket.Get(key)
 		if oldBytes == nil {
-			return ErrRecordNotFound
+			return nil
 		}
 
 		oldVal, err := db.decode(oldBytes)

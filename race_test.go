@@ -66,7 +66,7 @@ func TestRace_ConcurrentReadersAndWriters(t *testing.T) {
 
 				case 1:
 					patch := []Field{{Name: "age", Value: float64(20 + r.IntN(50))}}
-					if err := db.Patch(id, patch); err != nil && !errors.Is(err, ErrRecordNotFound) {
+					if err := db.Patch(id, patch); err != nil {
 						reportErr(fmt.Errorf("writer patch error: %w", err))
 						return
 					}
@@ -204,7 +204,7 @@ func TestRace_ConcurrentReadersAndWriters_SnapshotDelta(t *testing.T) {
 					}
 				case 1:
 					patch := []Field{{Name: "age", Value: float64(20 + r.IntN(50))}}
-					if err := db.Patch(id, patch); err != nil && !errors.Is(err, ErrRecordNotFound) {
+					if err := db.Patch(id, patch); err != nil {
 						reportErr(fmt.Errorf("writer patch error: %w", err))
 						return
 					}
@@ -379,7 +379,7 @@ func TestRace_ConcurrentWriters_SnapshotRouteEquivalence(t *testing.T) {
 				case 0:
 					reportErr(db.Set(id, randomRec(id)))
 				case 1:
-					reportErr(db.PatchIfExists(id, randomPatch()))
+					reportErr(db.Patch(id, randomPatch()))
 				default:
 					reportErr(db.Delete(id))
 				}
@@ -573,7 +573,7 @@ func TestRace_ConcurrentWriters_OROrderScoreChurn_SnapshotRouteEquivalence(t *te
 				case 0, 1, 2, 3:
 					reportErr(db.Set(id, randomRec(id)))
 				case 4, 5, 6, 7, 8:
-					reportErr(db.PatchIfExists(id, randomPatch()))
+					reportErr(db.Patch(id, randomPatch()))
 				default:
 					reportErr(db.Delete(id))
 				}
@@ -760,7 +760,7 @@ func TestRace_StringKeyGrowth_FastPaths_SnapshotRouteEquivalence(t *testing.T) {
 						{Name: "score", Value: float64(r.IntN(20_000))/10.0 + r.Float64()*0.001},
 						{Name: "active", Value: r.IntN(2) == 0},
 					}
-					reportErr(db.PatchIfExists(key, patch))
+					reportErr(db.Patch(key, patch))
 				default:
 					key := randomExistingKey(r)
 					reportErr(db.Delete(key))

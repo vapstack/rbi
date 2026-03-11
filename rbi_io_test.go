@@ -12,7 +12,7 @@ import (
 	"go.etcd.io/bbolt"
 )
 
-func TestPatchStrict_StructTags_NumConversion(t *testing.T) {
+func TestPatchStrictOption_StructTags_NumConversion(t *testing.T) {
 	db, _ := openTempDBUint64(t)
 
 	if err := db.Set(1, &Rec{
@@ -24,8 +24,8 @@ func TestPatchStrict_StructTags_NumConversion(t *testing.T) {
 		t.Fatalf("Set: %v", err)
 	}
 
-	if err := db.PatchStrict(1, []Field{{Name: "age", Value: 42.0}}); err != nil {
-		t.Fatalf("PatchStrict age float->int: %v", err)
+	if err := db.Patch(1, []Field{{Name: "age", Value: 42.0}}, PatchStrict); err != nil {
+		t.Fatalf("Patch(..., PatchStrict) age float->int: %v", err)
 	}
 	v, err := db.Get(1)
 	if err != nil {
@@ -35,8 +35,8 @@ func TestPatchStrict_StructTags_NumConversion(t *testing.T) {
 		t.Fatalf("age not patched: got %d", v.Age)
 	}
 
-	if err = db.PatchStrict(1, []Field{{Name: "fullName", Value: "Alice Alpha"}}); err != nil {
-		t.Fatalf("PatchStrict json tag: %v", err)
+	if err = db.Patch(1, []Field{{Name: "fullName", Value: "Alice Alpha"}}, PatchStrict); err != nil {
+		t.Fatalf("Patch(..., PatchStrict) json tag: %v", err)
 	}
 	v, err = db.Get(1)
 	if err != nil {
@@ -46,7 +46,7 @@ func TestPatchStrict_StructTags_NumConversion(t *testing.T) {
 		t.Fatalf("full name not patched: got %q", v.FullName)
 	}
 
-	err = db.PatchStrict(1, []Field{{Name: "age", Value: 1.25}})
+	err = db.Patch(1, []Field{{Name: "age", Value: 1.25}}, PatchStrict)
 	if err == nil {
 		t.Fatalf("expected error on float->int with fraction")
 	}
@@ -59,7 +59,7 @@ func TestPatchStrict_StructTags_NumConversion(t *testing.T) {
 	}
 }
 
-func TestPatchStrict_NilRules(t *testing.T) {
+func TestPatchStrictOption_NilRules(t *testing.T) {
 	db, _ := openTempDBUint64(t)
 
 	s := "opt"
@@ -69,8 +69,8 @@ func TestPatchStrict_NilRules(t *testing.T) {
 		t.Fatalf("Set: %v", err)
 	}
 
-	if err := db.PatchStrict(1, []Field{{Name: "opt", Value: nil}}); err != nil {
-		t.Fatalf("PatchStrict opt=nil: %v", err)
+	if err := db.Patch(1, []Field{{Name: "opt", Value: nil}}, PatchStrict); err != nil {
+		t.Fatalf("Patch(..., PatchStrict) opt=nil: %v", err)
 	}
 	v, err := db.Get(1)
 	if err != nil {
@@ -80,13 +80,13 @@ func TestPatchStrict_NilRules(t *testing.T) {
 		t.Fatalf("expected opt=nil after patch")
 	}
 
-	err = db.PatchStrict(1, []Field{{Name: "age", Value: nil}})
+	err = db.Patch(1, []Field{{Name: "age", Value: nil}}, PatchStrict)
 	if err == nil {
 		t.Fatalf("expected error for age=nil")
 	}
 }
 
-func TestMakePatch_PreCommit_DeepCopy_SliceValues(t *testing.T) {
+func TestMakePatch_BeforeCommit_DeepCopy_SliceValues(t *testing.T) {
 	db, _ := openTempDBUint64(t)
 
 	rec := &Rec{
@@ -108,10 +108,10 @@ func TestMakePatch_PreCommit_DeepCopy_SliceValues(t *testing.T) {
 		Tags: origTags,
 	}
 
-	if err := db.Set(1, updated, func(_ *bbolt.Tx, _ uint64, oldValue, newValue *Rec) error {
+	if err := db.Set(1, updated, BeforeCommit(func(_ *bbolt.Tx, _ uint64, oldValue, newValue *Rec) error {
 		patch = db.MakePatch(oldValue, newValue)
 		return nil
-	}); err != nil {
+	})); err != nil {
 		t.Fatalf("Set(update): %v", err)
 	}
 
@@ -149,7 +149,7 @@ func TestMakePatch_PreCommit_DeepCopy_SliceValues(t *testing.T) {
 	}
 }
 
-func TestCollectBatchPatch_PreCommit_CollectsAndDeepCopies_SliceValues(t *testing.T) {
+func TestCollectBatchPatch_BeforeCommit_CollectsAndDeepCopies_SliceValues(t *testing.T) {
 	db, _ := openTempDBUint64(t)
 
 	ids := []uint64{1, 2}
@@ -172,10 +172,10 @@ func TestCollectBatchPatch_PreCommit_CollectsAndDeepCopies_SliceValues(t *testin
 		{Name: "carol", Age: 21, Tags: origTags2}, // age+tags changed, name unchanged
 	}
 
-	if err := db.BatchSet(ids, updated, func(_ *bbolt.Tx, key uint64, oldValue, newValue *Rec) error {
+	if err := db.BatchSet(ids, updated, BeforeCommit(func(_ *bbolt.Tx, key uint64, oldValue, newValue *Rec) error {
 		patchByID[key] = db.MakePatch(oldValue, newValue)
 		return nil
-	}); err != nil {
+	})); err != nil {
 		t.Fatalf("BatchSet(update): %v", err)
 	}
 
@@ -418,7 +418,7 @@ func TestTruncate_NoDeadlock_WithConcurrentExecuteBatchWriter(t *testing.T) {
 
 	select {
 	case err := <-req.done:
-		if err != nil && !errors.Is(err, ErrRecordNotFound) {
+		if err != nil {
 			t.Fatalf("executeCombinedBatch req error: %v", err)
 		}
 	case <-time.After(2 * time.Second):

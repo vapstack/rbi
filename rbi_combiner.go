@@ -24,9 +24,8 @@ type combineRequest[K ~string | ~uint64, V any] struct {
 
 	patch              []Field
 	patchIgnoreUnknown bool
-	patchAllowMissing  bool
 
-	fns []PreCommitFunc[K, V]
+	beforeCommit []beforeCommitFunc[K, V]
 
 	coalescedTo *combineRequest[K, V]
 
@@ -80,16 +79,16 @@ func atomicSetMax(dst *atomic.Uint64, v uint64) {
 	}
 }
 
-func hasCallbacks[K ~string | ~uint64, V any](fns []PreCommitFunc[K, V]) bool {
-	for i := range fns {
-		if fns[i] != nil {
+func hasBeforeCommitCallbacks[K ~string | ~uint64, V any](callbacks []beforeCommitFunc[K, V]) bool {
+	for i := range callbacks {
+		if callbacks[i] != nil {
 			return true
 		}
 	}
 	return false
 }
 
-func (db *DB[K, V]) tryQueueSetCombine(id K, newVal *V, fns []PreCommitFunc[K, V]) (error, bool) {
+func (db *DB[K, V]) tryQueueSetCombine(id K, newVal *V, callbacks []beforeCommitFunc[K, V]) (error, bool) {
 	if !db.combiner.enabled {
 		db.combiner.fallbackDisabled.Add(1)
 		return nil, false
@@ -101,7 +100,7 @@ func (db *DB[K, V]) tryQueueSetCombine(id K, newVal *V, fns []PreCommitFunc[K, V
 		db.combiner.fallbackClosed.Add(1)
 		return ErrClosed, true
 	}
-	if !db.combiner.allowCallbacks && hasCallbacks(fns) {
+	if !db.combiner.allowCallbacks && hasBeforeCommitCallbacks(callbacks) {
 		db.combiner.fallbackCallbacks.Add(1)
 		return nil, false
 	}
@@ -113,17 +112,17 @@ func (db *DB[K, V]) tryQueueSetCombine(id K, newVal *V, fns []PreCommitFunc[K, V
 	}
 
 	req := &combineRequest[K, V]{
-		op:         combineSet,
-		id:         id,
-		setValue:   newVal,
-		setPayload: append([]byte(nil), b.Bytes()...),
-		fns:        append([]PreCommitFunc[K, V](nil), fns...),
-		done:       make(chan error, 1),
+		op:           combineSet,
+		id:           id,
+		setValue:     newVal,
+		setPayload:   append([]byte(nil), b.Bytes()...),
+		beforeCommit: append([]beforeCommitFunc[K, V](nil), callbacks...),
+		done:         make(chan error, 1),
 	}
 	return db.submitCombinedBatch(req)
 }
 
-func (db *DB[K, V]) tryQueuePatchCombine(id K, fields []Field, ignoreUnknown bool, allowMissing bool, fns []PreCommitFunc[K, V]) (error, bool) {
+func (db *DB[K, V]) tryQueuePatchCombine(id K, fields []Field, ignoreUnknown bool, callbacks []beforeCommitFunc[K, V]) (error, bool) {
 	if !db.combiner.enabled {
 		db.combiner.fallbackDisabled.Add(1)
 		return nil, false
@@ -132,7 +131,7 @@ func (db *DB[K, V]) tryQueuePatchCombine(id K, fields []Field, ignoreUnknown boo
 		db.combiner.fallbackClosed.Add(1)
 		return ErrClosed, true
 	}
-	if !db.combiner.allowCallbacks && hasCallbacks(fns) {
+	if !db.combiner.allowCallbacks && hasBeforeCommitCallbacks(callbacks) {
 		db.combiner.fallbackCallbacks.Add(1)
 		return nil, false
 	}
@@ -142,14 +141,13 @@ func (db *DB[K, V]) tryQueuePatchCombine(id K, fields []Field, ignoreUnknown boo
 		id:                 id,
 		patch:              append([]Field(nil), fields...),
 		patchIgnoreUnknown: ignoreUnknown,
-		patchAllowMissing:  allowMissing,
-		fns:                append([]PreCommitFunc[K, V](nil), fns...),
+		beforeCommit:       append([]beforeCommitFunc[K, V](nil), callbacks...),
 		done:               make(chan error, 1),
 	}
 	return db.submitCombinedBatch(req)
 }
 
-func (db *DB[K, V]) tryQueueDeleteCombine(id K, fns []PreCommitFunc[K, V]) (error, bool) {
+func (db *DB[K, V]) tryQueueDeleteCombine(id K, callbacks []beforeCommitFunc[K, V]) (error, bool) {
 	if !db.combiner.enabled {
 		db.combiner.fallbackDisabled.Add(1)
 		return nil, false
@@ -158,16 +156,16 @@ func (db *DB[K, V]) tryQueueDeleteCombine(id K, fns []PreCommitFunc[K, V]) (erro
 		db.combiner.fallbackClosed.Add(1)
 		return ErrClosed, true
 	}
-	if !db.combiner.allowCallbacks && hasCallbacks(fns) {
+	if !db.combiner.allowCallbacks && hasBeforeCommitCallbacks(callbacks) {
 		db.combiner.fallbackCallbacks.Add(1)
 		return nil, false
 	}
 
 	req := &combineRequest[K, V]{
-		op:   combineDelete,
-		id:   id,
-		fns:  append([]PreCommitFunc[K, V](nil), fns...),
-		done: make(chan error, 1),
+		op:           combineDelete,
+		id:           id,
+		beforeCommit: append([]beforeCommitFunc[K, V](nil), callbacks...),
+		done:         make(chan error, 1),
 	}
 	return db.submitCombinedBatch(req)
 }
@@ -281,7 +279,7 @@ func (db *DB[K, V]) popCombinedBatch() []*combineRequest[K, V] {
 	if n > 1 {
 		if !db.combiner.allowCallbacks {
 			for i := 0; i < n; i++ {
-				if len(db.combiner.queue[i].fns) == 0 {
+				if len(db.combiner.queue[i].beforeCommit) == 0 {
 					continue
 				}
 				if i == 0 {
@@ -320,7 +318,7 @@ func (db *DB[K, V]) popCombinedBatch() []*combineRequest[K, V] {
 }
 
 func canCoalesceSetDelete[K ~string | ~uint64, V any](req *combineRequest[K, V]) bool {
-	if req == nil || req.coalescedTo != nil || hasCallbacks(req.fns) {
+	if req == nil || req.coalescedTo != nil || hasBeforeCommitCallbacks(req.beforeCommit) {
 		return false
 	}
 	return req.op == combineSet || req.op == combineDelete
@@ -500,10 +498,6 @@ func (db *DB[K, V]) executeCombinedBatchAttempt(active []*combineRequest[K, V]) 
 				continue
 			}
 			if st.current == nil {
-				if req.patchAllowMissing {
-					continue
-				}
-				req.err = ErrRecordNotFound
 				continue
 			}
 
@@ -629,11 +623,11 @@ func (db *DB[K, V]) executeCombinedBatchAttempt(active []*combineRequest[K, V]) 
 			break
 		}
 
-		if len(op.req.fns) == 0 {
+		if len(op.req.beforeCommit) == 0 {
 			continue
 		}
 		db.combiner.callbackOps.Add(1)
-		for _, fn := range op.req.fns {
+		for _, fn := range op.req.beforeCommit {
 			if fn == nil {
 				continue
 			}

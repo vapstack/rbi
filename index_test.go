@@ -1013,11 +1013,11 @@ func TestRebuildIndex_WaitsForInFlightBatchedSet(t *testing.T) {
 	setDone := make(chan error, 1)
 
 	go func() {
-		setDone <- db.Set(1, &Rec{Name: "alice", Age: 30}, func(_ *bbolt.Tx, _ uint64, _, _ *Rec) error {
+		setDone <- db.Set(1, &Rec{Name: "alice", Age: 30}, BeforeCommit(func(_ *bbolt.Tx, _ uint64, _, _ *Rec) error {
 			close(setStarted)
 			<-releaseSet
 			return nil
-		})
+		}))
 	}()
 
 	select {
@@ -1169,8 +1169,8 @@ func TestRebuildIndex_StormConcurrentMixedOps_FinalConsistency(t *testing.T) {
 						{Name: "active", Value: i%2 == 0},
 						{Name: "country", Value: countries[(w+i)%len(countries)]},
 					}
-					if err := db.PatchIfExists(id, patch); err != nil && !errors.Is(err, ErrRebuildInProgress) {
-						errCh <- fmt.Errorf("writer=%d PatchIfExists(id=%d): %w", w, id, err)
+					if err := db.Patch(id, patch); err != nil && !errors.Is(err, ErrRebuildInProgress) {
+						errCh <- fmt.Errorf("writer=%d Patch(id=%d): %w", w, id, err)
 						return
 					}
 				default:
@@ -1431,8 +1431,8 @@ func TestRebuildIndex_RejectsCoreOpsWhileActive(t *testing.T) {
 	)
 	expectBusy("BatchSet", err)
 
-	err = db.PatchIfExists(1, []Field{{Name: "age", Value: 35}})
-	expectBusy("PatchIfExists", err)
+	err = db.Patch(1, []Field{{Name: "age", Value: 35}})
+	expectBusy("Patch", err)
 
 	err = db.BatchPatch([]uint64{1, 2}, []Field{{Name: "age", Value: 37}})
 	expectBusy("BatchPatch", err)

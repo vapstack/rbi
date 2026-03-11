@@ -247,9 +247,9 @@ func (db *DB[K, V]) SeqScanRaw(seek K, fn func(K, []byte) (bool, error)) error {
 //
 // The value is msgpack-encoded and written inside a single write
 // transaction. Any existing value for the key is decoded and passed as oldValue
-// to all PreCommitFunc fns. If any fn returns an error, the
+// to all configured BeforeCommit callbacks. If any callback returns an error, the
 // transaction is rolled back and the error is returned.
-func (db *DB[K, V]) Set(id K, newVal *V, fns ...PreCommitFunc[K, V]) error {
+func (db *DB[K, V]) Set(id K, newVal *V, execOpts ...ExecOption[K, V]) error {
 	if err := db.beginOp(); err != nil {
 		return err
 	}
@@ -259,8 +259,10 @@ func (db *DB[K, V]) Set(id K, newVal *V, fns ...PreCommitFunc[K, V]) error {
 		return ErrNilValue
 	}
 
+	cfg := db.resolveExecOptions(execOpts)
+
 	if db.combiner.enabled {
-		if err, handled := db.tryQueueSetCombine(id, newVal, fns); handled {
+		if err, handled := db.tryQueueSetCombine(id, newVal, cfg.beforeCommit); handled {
 			return err
 		}
 	}
@@ -298,7 +300,7 @@ func (db *DB[K, V]) Set(id K, newVal *V, fns ...PreCommitFunc[K, V]) error {
 		return fmt.Errorf("put: %w", err)
 	}
 
-	for _, fn := range fns {
+	for _, fn := range cfg.beforeCommit {
 		if fn != nil {
 			if err = fn(tx, id, oldVal, newVal); err != nil {
 				return err
@@ -350,14 +352,14 @@ func (db *DB[K, V]) Set(id K, newVal *V, fns ...PreCommitFunc[K, V]) error {
 // transaction. The length of the ids and values must be equal.
 //
 // For each key, any existing value is decoded and passed as oldValue to all
-// PreCommitFunc fns. If an error is encountered during any of the processing steps,
-// the transaction is rolled back and the error is returned.
+// configured BeforeCommit callbacks. If an error is encountered during any of
+// the processing steps, the transaction is rolled back and the error is returned.
 //
 // After a successful commit, the in-memory index is updated for all modified keys.
 //
 // BatchSet allocates a buffer for each encoded value.
 // Storing a large number of values will consume a proportional amount of memory.
-func (db *DB[K, V]) BatchSet(ids []K, newVals []*V, fns ...PreCommitFunc[K, V]) error {
+func (db *DB[K, V]) BatchSet(ids []K, newVals []*V, execOpts ...ExecOption[K, V]) error {
 	if len(ids) != len(newVals) {
 		return fmt.Errorf("different slice lengths")
 	}
@@ -365,7 +367,7 @@ func (db *DB[K, V]) BatchSet(ids []K, newVals []*V, fns ...PreCommitFunc[K, V]) 
 		return nil
 	}
 	if len(ids) == 1 {
-		return db.Set(ids[0], newVals[0], fns...)
+		return db.Set(ids[0], newVals[0], execOpts...)
 	}
 	if err := db.beginOp(); err != nil {
 		return err
@@ -377,6 +379,8 @@ func (db *DB[K, V]) BatchSet(ids []K, newVals []*V, fns ...PreCommitFunc[K, V]) 
 			return fmt.Errorf("%w: values[%v]", ErrNilValue, i)
 		}
 	}
+
+	cfg := db.resolveExecOptions(execOpts)
 
 	var getbuf func() *bytes.Buffer
 
@@ -445,9 +449,9 @@ func (db *DB[K, V]) BatchSet(ids []K, newVals []*V, fns ...PreCommitFunc[K, V]) 
 		}
 	}
 
-	if len(fns) > 0 {
+	if len(cfg.beforeCommit) > 0 {
 		for i, id := range ids {
-			for _, fn := range fns {
+			for _, fn := range cfg.beforeCommit {
 				if fn != nil {
 					if err = fn(tx, id, oldVals[i], newVals[i]); err != nil {
 						return err
@@ -522,33 +526,18 @@ func (db *DB[K, V]) BatchSet(ids []K, newVals []*V, fns ...PreCommitFunc[K, V]) 
 // values to the appropriate field type, if possible.
 // If conversion fails for any field, Patch returns an error and no changes are committed.
 //
-// If no item is found for the specified id, ErrRecordNotFound is returned
-// and callbacks are not invoked.
+// If no item is found for the specified id, Patch is a no-op and callbacks are
+// not invoked.
 //
-// All PreCommitFunc fns are invoked with the original (old) and patched (new) values
-// before commit. After a successful commit, the in-memory index is updated.
-func (db *DB[K, V]) Patch(id K, patch []Field, fns ...PreCommitFunc[K, V]) error {
-	return db.patch(id, patch, true, false, fns...)
-}
-
-// PatchStrict is like Patch, but returns an error if the patch contains field names
-// that cannot be resolved to a known struct field (by name, db or json tag).
-func (db *DB[K, V]) PatchStrict(id K, patch []Field, fns ...PreCommitFunc[K, V]) error {
-	return db.patch(id, patch, false, false, fns...)
-}
-
-// PatchIfExists is like Patch, but missing records are skipped.
-func (db *DB[K, V]) PatchIfExists(id K, patch []Field, fns ...PreCommitFunc[K, V]) error {
-	return db.patch(id, patch, true, true, fns...)
-}
-
-// PatchStrictIfExists is like PatchStrict, but missing records are skipped.
-func (db *DB[K, V]) PatchStrictIfExists(id K, patch []Field, fns ...PreCommitFunc[K, V]) error {
-	return db.patch(id, patch, false, true, fns...)
+// All configured BeforeCommit callbacks are invoked with the original (old)
+// and patched (new) values before commit. After a successful commit, the
+// in-memory index is updated.
+func (db *DB[K, V]) Patch(id K, patch []Field, execOpts ...ExecOption[K, V]) error {
+	return db.patch(id, patch, execOpts...)
 }
 
 // patch handles patch.
-func (db *DB[K, V]) patch(id K, fields []Field, ignoreUnknown bool, allowMissing bool, fns ...PreCommitFunc[K, V]) error {
+func (db *DB[K, V]) patch(id K, fields []Field, execOpts ...ExecOption[K, V]) error {
 	if err := db.beginOp(); err != nil {
 		return err
 	}
@@ -557,8 +546,10 @@ func (db *DB[K, V]) patch(id K, fields []Field, ignoreUnknown bool, allowMissing
 	if len(fields) == 0 {
 		return nil
 	}
+	cfg := db.resolveExecOptions(execOpts)
+	ignoreUnknown := !cfg.patchStrict
 	if db.combiner.enabled {
-		if err, handled := db.tryQueuePatchCombine(id, fields, ignoreUnknown, allowMissing, fns); handled {
+		if err, handled := db.tryQueuePatchCombine(id, fields, ignoreUnknown, cfg.beforeCommit); handled {
 			return err
 		}
 	}
@@ -579,10 +570,7 @@ func (db *DB[K, V]) patch(id K, fields []Field, ignoreUnknown bool, allowMissing
 	var oldVal *V
 	oldBytes := bucket.Get(key)
 	if oldBytes == nil {
-		if allowMissing {
-			return nil
-		}
-		return ErrRecordNotFound
+		return nil
 	}
 	idx := db.idxFromID(id)
 
@@ -612,7 +600,7 @@ func (db *DB[K, V]) patch(id K, fields []Field, ignoreUnknown bool, allowMissing
 		return fmt.Errorf("put: %w", err)
 	}
 
-	for _, fn := range fns {
+	for _, fn := range cfg.beforeCommit {
 		if fn != nil {
 			if err = fn(tx, id, oldVal, newVal); err != nil {
 				return err
@@ -658,27 +646,24 @@ func (db *DB[K, V]) patch(id K, fields []Field, ignoreUnknown bool, allowMissing
 //
 // BatchPatch allocates a buffer for each encoded value.
 // Patching a large number of values will consume a proportional amount of memory.
-func (db *DB[K, V]) BatchPatch(ids []K, patch []Field, fns ...PreCommitFunc[K, V]) error {
-	return db.batchPatch(ids, patch, true, fns...)
+func (db *DB[K, V]) BatchPatch(ids []K, patch []Field, execOpts ...ExecOption[K, V]) error {
+	return db.batchPatch(ids, patch, execOpts...)
 }
 
-// BatchPatchStrict is like BatchPatch, but returns an error if the patch contains field names
-// that cannot be resolved to a known struct field (by name, db or json tag).
-func (db *DB[K, V]) BatchPatchStrict(ids []K, patch []Field, fns ...PreCommitFunc[K, V]) error {
-	return db.batchPatch(ids, patch, false, fns...)
-}
-
-func (db *DB[K, V]) batchPatch(ids []K, patch []Field, ignoreUnknown bool, fns ...PreCommitFunc[K, V]) error {
+func (db *DB[K, V]) batchPatch(ids []K, patch []Field, execOpts ...ExecOption[K, V]) error {
 	if len(ids) == 0 || len(patch) == 0 {
 		return nil
 	}
 	if len(ids) == 1 {
-		return db.patch(ids[0], patch, ignoreUnknown, true, fns...)
+		return db.patch(ids[0], patch, execOpts...)
 	}
 	if err := db.beginOp(); err != nil {
 		return err
 	}
 	defer db.endOp()
+
+	cfg := db.resolveExecOptions(execOpts)
+	ignoreUnknown := !cfg.patchStrict
 
 	var getbuf func() *bytes.Buffer
 
@@ -764,9 +749,9 @@ func (db *DB[K, V]) batchPatch(ids []K, patch []Field, ignoreUnknown bool, fns .
 		return nil
 	}
 
-	if len(fns) > 0 {
+	if len(cfg.beforeCommit) > 0 {
 		for i, id := range foundIDs {
-			for _, fn := range fns {
+			for _, fn := range cfg.beforeCommit {
 				if fn != nil {
 					if err = fn(tx, id, oldVals[i], newVals[i]); err != nil {
 						return err
@@ -811,16 +796,19 @@ func (db *DB[K, V]) batchPatch(ids []K, patch []Field, ignoreUnknown bool, fns .
 // Delete removes the value stored under the given id, if any.
 //
 // The existing value (if present) is decoded and passed as oldValue to all
-// PreCommitFunc fns. If any fn returns an error, the operation is aborted.
-// If the record does not exist, Delete is a no-op and no callbacks are invoked.
-func (db *DB[K, V]) Delete(id K, fns ...PreCommitFunc[K, V]) error {
+// configured BeforeCommit callbacks. If any callback returns an error, the
+// operation is aborted. If the record does not exist, Delete is a no-op and no
+// callbacks are invoked.
+func (db *DB[K, V]) Delete(id K, execOpts ...ExecOption[K, V]) error {
 	if err := db.beginOp(); err != nil {
 		return err
 	}
 	defer db.endOp()
 
+	cfg := db.resolveExecOptions(execOpts)
+
 	if db.combiner.enabled {
-		if err, handled := db.tryQueueDeleteCombine(id, fns); handled {
+		if err, handled := db.tryQueueDeleteCombine(id, cfg.beforeCommit); handled {
 			return err
 		}
 	}
@@ -854,7 +842,7 @@ func (db *DB[K, V]) Delete(id K, fns ...PreCommitFunc[K, V]) error {
 		return fmt.Errorf("delete: %w", err)
 	}
 
-	for _, fn := range fns {
+	for _, fn := range cfg.beforeCommit {
 		if fn != nil {
 			if err = fn(tx, id, oldVal, nil); err != nil {
 				return err
@@ -889,20 +877,22 @@ func (db *DB[K, V]) Delete(id K, fns ...PreCommitFunc[K, V]) error {
 // write transaction.
 //
 // For each key, any existing value is decoded and passed as oldValue to all
-// PreCommitFunc fns. If an error is encountered during processing,
-// the entire operation is rolled back.
+// configured BeforeCommit callbacks. If an error is encountered during
+// processing, the entire operation is rolled back.
 // Missing IDs are skipped and do not trigger callbacks.
-func (db *DB[K, V]) BatchDelete(ids []K, fns ...PreCommitFunc[K, V]) error {
+func (db *DB[K, V]) BatchDelete(ids []K, execOpts ...ExecOption[K, V]) error {
 	if len(ids) == 0 {
 		return nil
 	}
 	if len(ids) == 1 {
-		return db.Delete(ids[0], fns...)
+		return db.Delete(ids[0], execOpts...)
 	}
 	if err := db.beginOp(); err != nil {
 		return err
 	}
 	defer db.endOp()
+
+	cfg := db.resolveExecOptions(execOpts)
 
 	tx, txerr := db.bolt.Begin(true)
 	if txerr != nil {
@@ -947,9 +937,9 @@ func (db *DB[K, V]) BatchDelete(ids []K, fns ...PreCommitFunc[K, V]) error {
 		return nil
 	}
 
-	if len(fns) > 0 {
+	if len(cfg.beforeCommit) > 0 {
 		for i, id := range foundIDs {
-			for _, fn := range fns {
+			for _, fn := range cfg.beforeCommit {
 				if fn != nil {
 					if err = fn(tx, id, oldVals[i], nil); err != nil {
 						return err

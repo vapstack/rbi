@@ -12,7 +12,7 @@ import (
 	"go.etcd.io/bbolt"
 )
 
-func TestBatch_PreCommit_CallbacksRunForSetPatchDelete(t *testing.T) {
+func TestBatch_BeforeCommit_CallbacksRunForSetPatchDelete(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{BatchAllowCallbacks: true})
 
 	var (
@@ -34,13 +34,13 @@ func TestBatch_PreCommit_CallbacksRunForSetPatchDelete(t *testing.T) {
 		return nil
 	}
 
-	if err := db.Set(1, &Rec{Name: "alice", Age: 10}, cb); err != nil {
+	if err := db.Set(1, &Rec{Name: "alice", Age: 10}, BeforeCommit(cb)); err != nil {
 		t.Fatalf("Set: %v", err)
 	}
-	if err := db.Patch(1, []Field{{Name: "name", Value: "bob"}}, cb); err != nil {
+	if err := db.Patch(1, []Field{{Name: "name", Value: "bob"}}, BeforeCommit(cb)); err != nil {
 		t.Fatalf("Patch: %v", err)
 	}
-	if err := db.Delete(1, cb); err != nil {
+	if err := db.Delete(1, BeforeCommit(cb)); err != nil {
 		t.Fatalf("Delete: %v", err)
 	}
 
@@ -122,10 +122,10 @@ func TestBatch_CallbacksBypassCombinerWhenDisabled(t *testing.T) {
 
 	before := db.BatchStats()
 	calls := 0
-	err := db.Set(1, &Rec{Name: "alice", Age: 10}, func(_ *bbolt.Tx, _ uint64, _, _ *Rec) error {
+	err := db.Set(1, &Rec{Name: "alice", Age: 10}, BeforeCommit(func(_ *bbolt.Tx, _ uint64, _, _ *Rec) error {
 		calls++
 		return nil
-	})
+	}))
 	if err != nil {
 		t.Fatalf("Set: %v", err)
 	}
@@ -156,7 +156,7 @@ func TestBatch_CallbackBarrier_RespectsBatchAllowCallbacks(t *testing.T) {
 	makeReq := func(id uint64, withCB bool) *combineRequest[uint64, Rec] {
 		req := &combineRequest[uint64, Rec]{op: combineSet, id: id}
 		if withCB {
-			req.fns = []PreCommitFunc[uint64, Rec]{cb}
+			req.beforeCommit = []beforeCommitFunc[uint64, Rec]{cb}
 		}
 		return req
 	}
@@ -180,8 +180,8 @@ func TestBatch_CallbackBarrier_RespectsBatchAllowCallbacks(t *testing.T) {
 	if len(batch) != 1 {
 		t.Fatalf("expected callback barrier to cut batch to 1 when disabled, got %d", len(batch))
 	}
-	if len(batch[0].fns) != 0 {
-		t.Fatalf("expected first request without callbacks, got callbacks=%d", len(batch[0].fns))
+	if len(batch[0].beforeCommit) != 0 {
+		t.Fatalf("expected first request without callbacks, got callbacks=%d", len(batch[0].beforeCommit))
 	}
 
 	loadQueue(true)
@@ -189,7 +189,7 @@ func TestBatch_CallbackBarrier_RespectsBatchAllowCallbacks(t *testing.T) {
 	if len(batch) != 3 {
 		t.Fatalf("expected callbacks to be batchable when enabled, got %d", len(batch))
 	}
-	if len(batch[1].fns) == 0 {
+	if len(batch[1].beforeCommit) == 0 {
 		t.Fatalf("expected middle request with callback to stay in combined batch")
 	}
 }
@@ -452,11 +452,10 @@ func TestBatch_CombinedPatchFailures_IsolateFailedRequest(t *testing.T) {
 					id:                 999,
 					patch:              []Field{{Name: "age", Value: 77}},
 					patchIgnoreUnknown: true,
-					patchAllowMissing:  false,
 					done:               make(chan error, 1),
 				}
 			},
-			checkErr: func(err error) bool { return errors.Is(err, ErrRecordNotFound) },
+			checkErr: func(err error) bool { return err == nil },
 		},
 		{
 			name: "invalid_patch",
@@ -466,7 +465,6 @@ func TestBatch_CombinedPatchFailures_IsolateFailedRequest(t *testing.T) {
 					id:                 1,
 					patch:              []Field{{Name: "age", Value: "not-an-int"}},
 					patchIgnoreUnknown: true,
-					patchAllowMissing:  false,
 					done:               make(chan error, 1),
 				}
 			},
@@ -586,15 +584,15 @@ func TestBatch_QueueFullFallback_UsesDirectPath(t *testing.T) {
 	}
 }
 
-func TestBatch_PreCommitError_RollsBack(t *testing.T) {
+func TestBatch_BeforeCommitError_RollsBack(t *testing.T) {
 	db, _ := openTempDBUint64(t)
 
-	wantErr := errors.New("precommit failed")
-	err := db.Set(1, &Rec{Name: "alice", Age: 10}, func(_ *bbolt.Tx, _ uint64, _, _ *Rec) error {
+	wantErr := errors.New("before commit failed")
+	err := db.Set(1, &Rec{Name: "alice", Age: 10}, BeforeCommit(func(_ *bbolt.Tx, _ uint64, _, _ *Rec) error {
 		return wantErr
-	})
+	}))
 	if !errors.Is(err, wantErr) {
-		t.Fatalf("expected precommit error %v, got %v", wantErr, err)
+		t.Fatalf("expected BeforeCommit error %v, got %v", wantErr, err)
 	}
 
 	got, gerr := db.Get(1)
@@ -602,11 +600,11 @@ func TestBatch_PreCommitError_RollsBack(t *testing.T) {
 		t.Fatalf("Get: %v", gerr)
 	}
 	if got != nil {
-		t.Fatalf("expected rollback on precommit error, got %#v", got)
+		t.Fatalf("expected rollback on BeforeCommit error, got %#v", got)
 	}
 }
 
-func TestBatch_PreCommitError_IsolatesFailedRequest_WhenCallbacksAllowed(t *testing.T) {
+func TestBatch_BeforeCommitError_IsolatesFailedRequest_WhenCallbacksAllowed(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{BatchAllowCallbacks: true})
 
 	encode := func(v *Rec) []byte {
@@ -630,7 +628,7 @@ func TestBatch_PreCommitError_IsolatesFailedRequest_WhenCallbacksAllowed(t *test
 		id:         1,
 		setValue:   badVal,
 		setPayload: encode(badVal),
-		fns: []PreCommitFunc[uint64, Rec]{
+		beforeCommit: []beforeCommitFunc[uint64, Rec]{
 			func(_ *bbolt.Tx, _ uint64, _, _ *Rec) error { return cbErr },
 		},
 		done: make(chan error, 1),
@@ -664,7 +662,7 @@ func TestBatch_PreCommitError_IsolatesFailedRequest_WhenCallbacksAllowed(t *test
 	}
 }
 
-func TestBatch_PreCommitError_Isolation_RechecksUniqueAfterRetry(t *testing.T) {
+func TestBatch_BeforeCommitError_Isolation_RechecksUniqueAfterRetry(t *testing.T) {
 	db, _ := openTempDBUint64Unique(t, Options{BatchAllowCallbacks: true})
 
 	encode := func(v *UniqueTestRec) []byte {
@@ -688,7 +686,7 @@ func TestBatch_PreCommitError_Isolation_RechecksUniqueAfterRetry(t *testing.T) {
 		id:         1,
 		setValue:   badVal,
 		setPayload: encode(badVal),
-		fns: []PreCommitFunc[uint64, UniqueTestRec]{
+		beforeCommit: []beforeCommitFunc[uint64, UniqueTestRec]{
 			func(_ *bbolt.Tx, _ uint64, _, _ *UniqueTestRec) error { return cbErr },
 		},
 		done: make(chan error, 1),
