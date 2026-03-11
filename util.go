@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"runtime/debug"
 	"slices"
 	"strings"
 	"sync"
@@ -19,6 +20,14 @@ import (
 	"github.com/vmihailenco/msgpack/v5"
 	"go.etcd.io/bbolt"
 )
+
+func forceMemoryCleanup(releaseOSMemory bool) {
+	if releaseOSMemory {
+		debug.FreeOSMemory()
+		return
+	}
+	runtime.GC()
+}
 
 // MakePatch builds and returns a patch describing fields that changed between
 // oldVal and newVal.

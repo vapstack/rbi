@@ -156,12 +156,19 @@ func (db *DB[K, V]) buildIndex(skipFields map[string]struct{}) error {
 			db.strmap.Lock()
 			defer db.strmap.Unlock()
 		}
+		nextGCAt := uint64(indexBuildGCStride)
+		scanned := uint64(0)
 		for k, v := c.First(); k != nil; k, v = c.Next() {
 			idx := db.idxFromKeyNoLock(k)
 			select {
 			case <-done:
 				return nil
 			case jobs <- rawdata{v: v, idx: idx}:
+			}
+			scanned++
+			if scanned >= nextGCAt {
+				forceMemoryCleanup(false)
+				nextGCAt += indexBuildGCStride
 			}
 		}
 		return nil
@@ -227,6 +234,13 @@ func (db *DB[K, V]) buildIndex(skipFields map[string]struct{}) error {
 	db.buildLenIndex()
 	db.lenIndexLoaded = false
 	db.publishSnapshotNoLock(db.currentBoltTxID())
+
+	active = nil
+	global = nil
+	locals = nil
+	localUniverse = nil
+	workerErrs = nil
+	forceMemoryCleanup(true)
 
 	return nil
 }
@@ -423,6 +437,7 @@ const (
 	initialIndexLen    = 32 << 10
 	maxStoredStringLen = 64 << 30
 	maxStoredAllocHint = 64 << 10
+	indexBuildGCStride = 1_000_000
 
 	lenIndexNonEmptyKey = "\xFFNONEMPTY"
 
@@ -470,6 +485,7 @@ func (db *DB[K, V]) loadIndex() (skipFields map[string]struct{}, err error) {
 	db.lenIndexLoaded = lenLoaded
 	db.stats.Index.LoadTime = time.Since(start)
 	db.publishSnapshotNoLock(db.currentBoltTxID())
+	forceMemoryCleanup(true)
 
 	return skipFields, nil
 }
@@ -626,6 +642,8 @@ func (db *DB[K, V]) storeIndex() error {
 			return err
 		}
 	}
+
+	forceMemoryCleanup(true)
 
 	tmpFile := db.rbiFile + ".temp"
 	defer func() {
