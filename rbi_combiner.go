@@ -19,13 +19,16 @@ type combineRequest[K ~string | ~uint64, V any] struct {
 	op combineOp
 	id K
 
-	setValue   *V
-	setPayload []byte
+	setValue    *V
+	setBaseline *V
+	setPayload  []byte
 
 	patch              []Field
 	patchIgnoreUnknown bool
 
+	beforeStore  []beforeStoreFunc[K, V]
 	beforeCommit []beforeCommitFunc[K, V]
+	cloneValue   func(K, *V) *V
 
 	coalescedTo *combineRequest[K, V]
 
@@ -79,16 +82,7 @@ func atomicSetMax(dst *atomic.Uint64, v uint64) {
 	}
 }
 
-func hasBeforeCommitCallbacks[K ~string | ~uint64, V any](callbacks []beforeCommitFunc[K, V]) bool {
-	for i := range callbacks {
-		if callbacks[i] != nil {
-			return true
-		}
-	}
-	return false
-}
-
-func (db *DB[K, V]) tryQueueSetCombine(id K, newVal *V, callbacks []beforeCommitFunc[K, V]) (error, bool) {
+func (db *DB[K, V]) tryQueueSetCombine(id K, newVal *V, beforeStore []beforeStoreFunc[K, V], beforeCommit []beforeCommitFunc[K, V], cloneValue func(K, *V) *V) (error, bool) {
 	if !db.combiner.enabled {
 		db.combiner.fallbackDisabled.Add(1)
 		return nil, false
@@ -100,29 +94,37 @@ func (db *DB[K, V]) tryQueueSetCombine(id K, newVal *V, callbacks []beforeCommit
 		db.combiner.fallbackClosed.Add(1)
 		return ErrClosed, true
 	}
-	if !db.combiner.allowCallbacks && hasBeforeCommitCallbacks(callbacks) {
+	if !db.combiner.allowCallbacks && hasExecHooks(beforeStore, beforeCommit) {
 		db.combiner.fallbackCallbacks.Add(1)
 		return nil, false
-	}
-
-	b := getEncodeBuf()
-	defer releaseEncodeBuf(b)
-	if err := db.encode(newVal, b); err != nil {
-		return fmt.Errorf("encode: %w", err), true
 	}
 
 	req := &combineRequest[K, V]{
 		op:           combineSet,
 		id:           id,
-		setValue:     newVal,
-		setPayload:   append([]byte(nil), b.Bytes()...),
-		beforeCommit: append([]beforeCommitFunc[K, V](nil), callbacks...),
+		beforeStore:  beforeStore,
+		beforeCommit: beforeCommit,
+		cloneValue:   cloneValue,
 		done:         make(chan error, 1),
+	}
+	if len(beforeStore) > 0 && cloneValue != nil {
+		var err error
+		if req.setBaseline, err = cloneBeforeStoreValue(id, newVal, cloneValue); err != nil {
+			return err, true
+		}
+	} else {
+		b := getEncodeBuf()
+		defer releaseEncodeBuf(b)
+		if err := db.encode(newVal, b); err != nil {
+			return fmt.Errorf("encode: %w", err), true
+		}
+		req.setValue = newVal
+		req.setPayload = append([]byte(nil), b.Bytes()...)
 	}
 	return db.submitCombinedBatch(req)
 }
 
-func (db *DB[K, V]) tryQueuePatchCombine(id K, fields []Field, ignoreUnknown bool, callbacks []beforeCommitFunc[K, V]) (error, bool) {
+func (db *DB[K, V]) tryQueuePatchCombine(id K, fields []Field, ignoreUnknown bool, beforeStore []beforeStoreFunc[K, V], beforeCommit []beforeCommitFunc[K, V]) (error, bool) {
 	if !db.combiner.enabled {
 		db.combiner.fallbackDisabled.Add(1)
 		return nil, false
@@ -131,7 +133,7 @@ func (db *DB[K, V]) tryQueuePatchCombine(id K, fields []Field, ignoreUnknown boo
 		db.combiner.fallbackClosed.Add(1)
 		return ErrClosed, true
 	}
-	if !db.combiner.allowCallbacks && hasBeforeCommitCallbacks(callbacks) {
+	if !db.combiner.allowCallbacks && hasExecHooks(beforeStore, beforeCommit) {
 		db.combiner.fallbackCallbacks.Add(1)
 		return nil, false
 	}
@@ -141,13 +143,14 @@ func (db *DB[K, V]) tryQueuePatchCombine(id K, fields []Field, ignoreUnknown boo
 		id:                 id,
 		patch:              append([]Field(nil), fields...),
 		patchIgnoreUnknown: ignoreUnknown,
-		beforeCommit:       append([]beforeCommitFunc[K, V](nil), callbacks...),
+		beforeStore:        beforeStore,
+		beforeCommit:       beforeCommit,
 		done:               make(chan error, 1),
 	}
 	return db.submitCombinedBatch(req)
 }
 
-func (db *DB[K, V]) tryQueueDeleteCombine(id K, callbacks []beforeCommitFunc[K, V]) (error, bool) {
+func (db *DB[K, V]) tryQueueDeleteCombine(id K, beforeCommit []beforeCommitFunc[K, V]) (error, bool) {
 	if !db.combiner.enabled {
 		db.combiner.fallbackDisabled.Add(1)
 		return nil, false
@@ -156,7 +159,7 @@ func (db *DB[K, V]) tryQueueDeleteCombine(id K, callbacks []beforeCommitFunc[K, 
 		db.combiner.fallbackClosed.Add(1)
 		return ErrClosed, true
 	}
-	if !db.combiner.allowCallbacks && hasBeforeCommitCallbacks(callbacks) {
+	if !db.combiner.allowCallbacks && hasExecHooks(nil, beforeCommit) {
 		db.combiner.fallbackCallbacks.Add(1)
 		return nil, false
 	}
@@ -164,7 +167,7 @@ func (db *DB[K, V]) tryQueueDeleteCombine(id K, callbacks []beforeCommitFunc[K, 
 	req := &combineRequest[K, V]{
 		op:           combineDelete,
 		id:           id,
-		beforeCommit: append([]beforeCommitFunc[K, V](nil), callbacks...),
+		beforeCommit: beforeCommit,
 		done:         make(chan error, 1),
 	}
 	return db.submitCombinedBatch(req)
@@ -279,7 +282,7 @@ func (db *DB[K, V]) popCombinedBatch() []*combineRequest[K, V] {
 	if n > 1 {
 		if !db.combiner.allowCallbacks {
 			for i := 0; i < n; i++ {
-				if len(db.combiner.queue[i].beforeCommit) == 0 {
+				if !hasExecHooks(db.combiner.queue[i].beforeStore, db.combiner.queue[i].beforeCommit) {
 					continue
 				}
 				if i == 0 {
@@ -318,7 +321,7 @@ func (db *DB[K, V]) popCombinedBatch() []*combineRequest[K, V] {
 }
 
 func canCoalesceSetDelete[K ~string | ~uint64, V any](req *combineRequest[K, V]) bool {
-	if req == nil || req.coalescedTo != nil || hasBeforeCommitCallbacks(req.beforeCommit) {
+	if req == nil || req.coalescedTo != nil || hasExecHooks(req.beforeStore, req.beforeCommit) {
 		return false
 	}
 	return req.op == combineSet || req.op == combineDelete
@@ -471,25 +474,59 @@ func (db *DB[K, V]) executeCombinedBatchAttempt(active []*combineRequest[K, V]) 
 
 		switch req.op {
 		case combineSet:
-			st, stErr := loadState(req, true)
+			st, stErr := loadState(req, false)
 			if stErr != nil {
 				req.err = fmt.Errorf("decode: %w", stErr)
 				continue
 			}
 			oldVal := st.current
+			newVal := req.setValue
+			payload := req.setPayload
+			if len(req.beforeStore) > 0 {
+				db.combiner.callbackOps.Add(1)
+				if req.cloneValue != nil {
+					var cloneErr error
+					if newVal, cloneErr = cloneBeforeStoreValue(req.id, req.setBaseline, req.cloneValue); cloneErr != nil {
+						req.err = cloneErr
+						continue
+					}
+				} else {
+					decodedVal, decErr := db.decode(req.setPayload)
+					if decErr != nil {
+						req.err = fmt.Errorf("decode prepared value: %w", decErr)
+						continue
+					}
+					newVal = decodedVal
+				}
+				if hookErr := runBeforeStoreHooks(req.id, oldVal, newVal, req.beforeStore); hookErr != nil {
+					req.err = hookErr
+					db.combiner.callbackErrors.Add(1)
+					continue
+				}
+
+				b := getEncodeBuf()
+				if encErr := db.encode(newVal, b); encErr != nil {
+					releaseEncodeBuf(b)
+					req.err = fmt.Errorf("encode: %w", encErr)
+					continue
+				}
+				payload = append([]byte(nil), b.Bytes()...)
+				releaseEncodeBuf(b)
+			}
+			ensureIdx(req, st, true)
 
 			prepared = append(prepared, combinedBatchPrepared[K, V]{
 				req:      req,
 				key:      st.key,
-				payload:  req.setPayload,
+				payload:  payload,
 				idx:      st.idx,
 				idxNew:   st.idxNew,
 				oldVal:   oldVal,
-				newVal:   req.setValue,
-				modified: db.getModifiedIndexedFields(oldVal, req.setValue),
+				newVal:   newVal,
+				modified: db.getModifiedIndexedFields(oldVal, newVal),
 			})
-			st.current = req.setValue
-			st.currentPayload = req.setPayload
+			st.current = newVal
+			st.currentPayload = payload
 
 		case combinePatch:
 			st, stErr := loadState(req, false)
@@ -515,6 +552,15 @@ func (db *DB[K, V]) executeCombinedBatchAttempt(active []*combineRequest[K, V]) 
 			if patchErr := db.applyPatch(newVal, req.patch, req.patchIgnoreUnknown); patchErr != nil {
 				req.err = fmt.Errorf("failed to apply patch: %w", patchErr)
 				continue
+			}
+
+			if len(req.beforeStore) > 0 {
+				db.combiner.callbackOps.Add(1)
+				if hookErr := runBeforeStoreHooks(req.id, oldVal, newVal, req.beforeStore); hookErr != nil {
+					req.err = hookErr
+					db.combiner.callbackErrors.Add(1)
+					continue
+				}
 			}
 
 			b := getEncodeBuf()
@@ -626,18 +672,14 @@ func (db *DB[K, V]) executeCombinedBatchAttempt(active []*combineRequest[K, V]) 
 		if len(op.req.beforeCommit) == 0 {
 			continue
 		}
-		db.combiner.callbackOps.Add(1)
-		for _, fn := range op.req.beforeCommit {
-			if fn == nil {
-				continue
-			}
-			if cbErr := fn(tx, op.req.id, op.oldVal, op.newVal); cbErr != nil {
-				op.req.err = cbErr
-				callbackFailedReq = op.req
-				db.combiner.callbackErrors.Add(1)
-				fatalErr = cbErr
-				break
-			}
+		if len(op.req.beforeStore) == 0 {
+			db.combiner.callbackOps.Add(1)
+		}
+		if cbErr := runBeforeCommitHooks(tx, op.req.id, op.oldVal, op.newVal, op.req.beforeCommit); cbErr != nil {
+			op.req.err = cbErr
+			callbackFailedReq = op.req
+			db.combiner.callbackErrors.Add(1)
+			fatalErr = cbErr
 		}
 		if fatalErr != nil {
 			db.combiner.txOpErrors.Add(1)

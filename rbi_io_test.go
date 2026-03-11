@@ -9,8 +9,44 @@ import (
 	"time"
 
 	"github.com/vapstack/qx"
+	"github.com/vmihailenco/msgpack/v5"
 	"go.etcd.io/bbolt"
 )
+
+type beforeStoreCloneRec struct {
+	Name  string `db:"name"`
+	Ready bool   `db:"ready"`
+}
+
+func (r *beforeStoreCloneRec) MarshalMsgpack() ([]byte, error) {
+	if !r.Ready {
+		return nil, errors.New("beforeStoreCloneRec: not ready")
+	}
+	type alias beforeStoreCloneRec
+	return msgpack.Marshal((*alias)(r))
+}
+
+func (r *beforeStoreCloneRec) UnmarshalMsgpack(b []byte) error {
+	type alias beforeStoreCloneRec
+	var tmp alias
+	if err := msgpack.Unmarshal(b, &tmp); err != nil {
+		return err
+	}
+	*r = beforeStoreCloneRec(tmp)
+	return nil
+}
+
+func openTempDBUint64BeforeStoreCloneRec(t *testing.T, options ...Options) *DB[uint64, beforeStoreCloneRec] {
+	t.Helper()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test_before_store_clone.db")
+	db, raw := openBoltAndNew[uint64, beforeStoreCloneRec](t, path, options...)
+	t.Cleanup(func() {
+		_ = db.Close()
+		_ = raw.Close()
+	})
+	return db
+}
 
 func TestPatchStrictOption_StructTags_NumConversion(t *testing.T) {
 	db, _ := openTempDBUint64(t)
@@ -83,6 +119,228 @@ func TestPatchStrictOption_NilRules(t *testing.T) {
 	err = db.Patch(1, []Field{{Name: "age", Value: nil}}, PatchStrict)
 	if err == nil {
 		t.Fatalf("expected error for age=nil")
+	}
+}
+
+func TestBeforeStore_Patch_MutatesFinalStoredValue(t *testing.T) {
+	db, _ := openTempDBUint64(t)
+
+	if err := db.Set(1, &Rec{Name: "alice", Age: 10, Meta: Meta{Country: "NL"}}); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+
+	calls := 0
+	err := db.Patch(1, []Field{{Name: "age", Value: 20}}, BeforeStore(func(key uint64, oldValue, newValue *Rec) error {
+		calls++
+		if key != 1 {
+			t.Fatalf("unexpected key: %d", key)
+		}
+		if oldValue == nil || oldValue.Age != 10 || oldValue.Country != "NL" {
+			t.Fatalf("unexpected old value: %#v", oldValue)
+		}
+		if newValue == nil || newValue.Age != 20 {
+			t.Fatalf("unexpected patched value before BeforeStore mutation: %#v", newValue)
+		}
+		newValue.Country = "US"
+		newValue.Name = "alice-updated"
+		return nil
+	}))
+	if err != nil {
+		t.Fatalf("Patch with BeforeStore: %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("expected BeforeStore to run once, got %d", calls)
+	}
+
+	v, err := db.Get(1)
+	if err != nil {
+		t.Fatalf("Get(1): %v", err)
+	}
+	if v == nil || v.Name != "alice-updated" || v.Age != 20 || v.Country != "US" {
+		t.Fatalf("unexpected stored value: %#v", v)
+	}
+}
+
+func TestBeforeStore_BatchSet_SharedPointerUsesIndependentWorkingCopies(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{BatchMax: 1})
+
+	shared := &Rec{Name: "shared", Age: 10, Meta: Meta{Country: "NL"}}
+	err := db.BatchSet(
+		[]uint64{1, 2},
+		[]*Rec{shared, shared},
+		BeforeStore(func(key uint64, oldValue, newValue *Rec) error {
+			if oldValue != nil {
+				t.Fatalf("expected insert oldValue=nil, got %#v", oldValue)
+			}
+			newValue.Name = fmt.Sprintf("user-%d", key)
+			newValue.Age += int(key)
+			newValue.Country = fmt.Sprintf("C%d", key)
+			return nil
+		}),
+	)
+	if err != nil {
+		t.Fatalf("BatchSet with BeforeStore: %v", err)
+	}
+
+	if shared.Name != "shared" || shared.Age != 10 || shared.Country != "NL" {
+		t.Fatalf("caller-owned shared value was mutated: %#v", shared)
+	}
+
+	v1, err := db.Get(1)
+	if err != nil {
+		t.Fatalf("Get(1): %v", err)
+	}
+	v2, err := db.Get(2)
+	if err != nil {
+		t.Fatalf("Get(2): %v", err)
+	}
+	if v1 == nil || v1.Name != "user-1" || v1.Age != 11 || v1.Country != "C1" {
+		t.Fatalf("unexpected value for id=1: %#v", v1)
+	}
+	if v2 == nil || v2.Name != "user-2" || v2.Age != 12 || v2.Country != "C2" {
+		t.Fatalf("unexpected value for id=2: %#v", v2)
+	}
+}
+
+func TestBeforeStore_MissingPatch_IsNoOp(t *testing.T) {
+	db, _ := openTempDBUint64(t)
+
+	calls := 0
+	err := db.Patch(42, []Field{{Name: "age", Value: 99}}, BeforeStore(func(_ uint64, _ *Rec, _ *Rec) error {
+		calls++
+		return nil
+	}))
+	if err != nil {
+		t.Fatalf("Patch(missing): %v", err)
+	}
+	if calls != 0 {
+		t.Fatalf("expected BeforeStore not to run for missing Patch target, got %d", calls)
+	}
+}
+
+func TestBeforeStore_CloneFunc_Set_AllowsNormalizationBeforeEncode(t *testing.T) {
+	db := openTempDBUint64BeforeStoreCloneRec(t, Options{BatchMax: 1})
+
+	calls := 0
+	input := &beforeStoreCloneRec{}
+	err := db.Set(
+		1,
+		input,
+		CloneFunc(func(_ uint64, v *beforeStoreCloneRec) *beforeStoreCloneRec {
+			cp := *v
+			return &cp
+		}),
+		BeforeStore(func(key uint64, oldValue, newValue *beforeStoreCloneRec) error {
+			calls++
+			if key != 1 {
+				t.Fatalf("unexpected key: %d", key)
+			}
+			if oldValue != nil {
+				t.Fatalf("expected insert oldValue=nil, got %#v", oldValue)
+			}
+			newValue.Name = "normalized"
+			newValue.Ready = true
+			return nil
+		}),
+	)
+	if err != nil {
+		t.Fatalf("Set with CloneFunc: %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("expected BeforeStore to run once, got %d", calls)
+	}
+	if input.Name != "" || input.Ready {
+		t.Fatalf("caller-owned input was mutated: %#v", input)
+	}
+
+	got, err := db.Get(1)
+	if err != nil {
+		t.Fatalf("Get(1): %v", err)
+	}
+	if got == nil || got.Name != "normalized" || !got.Ready {
+		t.Fatalf("unexpected stored value: %#v", got)
+	}
+}
+
+func TestBeforeStore_CloneFunc_BatchSet_AllowsNormalizationBeforeEncode(t *testing.T) {
+	db := openTempDBUint64BeforeStoreCloneRec(t, Options{BatchMax: 1})
+
+	inputA := &beforeStoreCloneRec{}
+	inputB := &beforeStoreCloneRec{}
+	err := db.BatchSet(
+		[]uint64{1, 2},
+		[]*beforeStoreCloneRec{inputA, inputB},
+		CloneFunc(func(_ uint64, v *beforeStoreCloneRec) *beforeStoreCloneRec {
+			cp := *v
+			return &cp
+		}),
+		BeforeStore(func(key uint64, oldValue, newValue *beforeStoreCloneRec) error {
+			if oldValue != nil {
+				t.Fatalf("expected insert oldValue=nil, got %#v", oldValue)
+			}
+			newValue.Name = fmt.Sprintf("normalized-%d", key)
+			newValue.Ready = true
+			return nil
+		}),
+	)
+	if err != nil {
+		t.Fatalf("BatchSet with CloneFunc: %v", err)
+	}
+	if inputA.Name != "" || inputA.Ready || inputB.Name != "" || inputB.Ready {
+		t.Fatalf("caller-owned inputs were mutated: %#v %#v", inputA, inputB)
+	}
+
+	got1, err := db.Get(1)
+	if err != nil {
+		t.Fatalf("Get(1): %v", err)
+	}
+	got2, err := db.Get(2)
+	if err != nil {
+		t.Fatalf("Get(2): %v", err)
+	}
+	if got1 == nil || got1.Name != "normalized-1" || !got1.Ready {
+		t.Fatalf("unexpected stored value for id=1: %#v", got1)
+	}
+	if got2 == nil || got2.Name != "normalized-2" || !got2.Ready {
+		t.Fatalf("unexpected stored value for id=2: %#v", got2)
+	}
+}
+
+func TestBeforeStore_CloneFunc_CombinedSet_AllowsNormalizationBeforeEncode(t *testing.T) {
+	db := openTempDBUint64BeforeStoreCloneRec(t, Options{BatchAllowCallbacks: true})
+
+	calls := 0
+	err := db.Set(
+		1,
+		&beforeStoreCloneRec{},
+		CloneFunc(func(_ uint64, v *beforeStoreCloneRec) *beforeStoreCloneRec {
+			cp := *v
+			return &cp
+		}),
+		BeforeStore(func(_ uint64, _ *beforeStoreCloneRec, newValue *beforeStoreCloneRec) error {
+			calls++
+			newValue.Name = "combined"
+			newValue.Ready = true
+			return nil
+		}),
+	)
+	if err != nil {
+		t.Fatalf("Set with CloneFunc via combiner: %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("expected BeforeStore to run once, got %d", calls)
+	}
+
+	got, err := db.Get(1)
+	if err != nil {
+		t.Fatalf("Get(1): %v", err)
+	}
+	if got == nil || got.Name != "combined" || !got.Ready {
+		t.Fatalf("unexpected stored value: %#v", got)
+	}
+
+	if st := db.BatchStats(); st.Enqueued == 0 {
+		t.Fatalf("expected Set with CloneFunc to use combiner path, stats=%+v", st)
 	}
 }
 

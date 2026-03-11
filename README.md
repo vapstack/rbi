@@ -226,12 +226,37 @@ db, err := rbi.New[uint64, User](bolt, rbi.Options{
     BatchWindow: 100 * time.Microsecond,
     BatchMax: 32,
     BatchMaxQueue: 512, // < 0 means unbounded queue, 0 uses default
-    BatchAllowCallbacks: true, // true allows combining ops with BeforeCommit callbacks
+    BatchAllowCallbacks: true, // true allows combining ops with BeforeStore/BeforeCommit hooks
 })
 if err != nil {
     panic(err)
 }
 ```
+
+### Hooks
+
+Write methods accept `ExecOption` values, and the same options may also be
+passed to `New` to become defaults for the whole DB instance.
+
+Available hooks/options:
+
+- `BeforeStore` - runs for inserts and updates before RBI encodes the final value.
+  It may modify `newValue`.
+- `BeforeCommit` - runs inside the Bolt write transaction after the record
+  has been written, but before commit. Useful for audit records and other
+  writes to neighboring buckets.
+- `CloneFunc` - optional helper for `Set`/`BatchSet` with `BeforeStore`.
+  It can be used when the value becomes encodable only after normalization, or
+  simply as a faster cloning path than RBI's fallback msgpack snapshotting.
+- `PatchStrict` - makes `Patch`/`BatchPatch` reject unknown fields.
+
+Important notes:
+
+- When `BatchAllowCallbacks` is `false`, writes with `BeforeStore` or
+  `BeforeCommit` bypass the micro-batcher and run directly.
+- Under batching/retry, hooks may run more than once for the same logical write,
+  so external side effects should be idempotent.
+- `BeforeCommit` must not modify the bucket managed by RBI itself.
 
 ## Ordering Limitations
 
@@ -329,7 +354,7 @@ type User struct {
 
 Indexes are persisted only on `Close`.
 
-`rbi` reserves the bucket sequence counter and advances it on each
+RBI reserves the bucket sequence counter and advances it on each
 successful write. The `.rbi` file stores the bucket sequence it was
 built from and is loaded only when the current bucket sequence matches.
 

@@ -26,8 +26,8 @@ const (
 	DefaultCeilingReadSlowWorkers          = 128
 	DefaultCeilingWriteUpdateWorkers       = 256
 	DefaultCeilingWriteInsertWorkers       = 16
-	DefaultCeilingReadFastGrid             = "50000,75000,100000,125000,150000,200000,250000"
-	DefaultCeilingWriteGrid                = "1500" // "1000,2500,5000,7500,10000"
+	DefaultCeilingReadFastGrid             = "50000,75000,100000,125000,150000,175000,200000"
+	DefaultCeilingWriteGrid                = "500,1000,1500,2000,2500,3000,4000,5000"
 	DefaultCeilingReadSlowGrid             = "32,64,128,256"
 	DefaultCeilingLowWriteGrid             = "250,500,1000,1500"
 	DefaultCeilingMixedSlowOps             = 8.0

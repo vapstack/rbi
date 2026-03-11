@@ -64,16 +64,13 @@ func TestEvalSimple_NumericRangeBuckets_MatchClassicPath(t *testing.T) {
 		SnapshotMaterializedPredCacheMaxEntriesWithDelta: -1,
 	})
 
-	for i := 1; i <= 20_000; i++ {
-		err := db.Set(uint64(i), &Rec{
+	seedGeneratedUint64Data(t, db, 20_000, func(i int) *Rec {
+		return &Rec{
 			Name:  fmt.Sprintf("u_%d", i),
 			Age:   i,
 			Score: float64(i),
-		})
-		if err != nil {
-			t.Fatalf("seed Set(%d): %v", i, err)
 		}
-	}
+	})
 	if err := db.RebuildIndex(); err != nil {
 		t.Fatalf("RebuildIndex: %v", err)
 	}
@@ -123,16 +120,13 @@ func TestEvalSimple_NumericRangeBuckets_WorksWithFieldDelta(t *testing.T) {
 		SnapshotMaterializedPredCacheMaxEntriesWithDelta: -1,
 	})
 
-	for i := 1; i <= 8_000; i++ {
-		err := db.Set(uint64(i), &Rec{
+	seedGeneratedUint64Data(t, db, 8_000, func(i int) *Rec {
+		return &Rec{
 			Name:  fmt.Sprintf("u_%d", i),
 			Age:   i,
 			Score: float64(i),
-		})
-		if err != nil {
-			t.Fatalf("seed Set(%d): %v", i, err)
 		}
-	}
+	})
 	if err := db.RebuildIndex(); err != nil {
 		t.Fatalf("RebuildIndex: %v", err)
 	}
@@ -187,17 +181,14 @@ func TestCount_NumericRangeBuckets_MatchClassicPath(t *testing.T) {
 		SnapshotMaterializedPredCacheMaxEntriesWithDelta: -1,
 	})
 
-	for i := 1; i <= 25_000; i++ {
-		err := db.Set(uint64(i), &Rec{
+	seedGeneratedUint64Data(t, db, 25_000, func(i int) *Rec {
+		return &Rec{
 			Name:   fmt.Sprintf("u_%d", i),
 			Age:    i,
 			Score:  float64(i),
 			Active: i%2 == 0,
-		})
-		if err != nil {
-			t.Fatalf("seed Set(%d): %v", i, err)
 		}
-	}
+	})
 	if err := db.RebuildIndex(); err != nil {
 		t.Fatalf("RebuildIndex: %v", err)
 	}
@@ -235,17 +226,14 @@ func TestCount_NumericRangeBuckets_WorksWithFieldDelta(t *testing.T) {
 		SnapshotMaterializedPredCacheMaxEntriesWithDelta: -1,
 	})
 
-	for i := 1; i <= 12_000; i++ {
-		err := db.Set(uint64(i), &Rec{
+	seedGeneratedUint64Data(t, db, 12_000, func(i int) *Rec {
+		return &Rec{
 			Name:   fmt.Sprintf("u_%d", i),
 			Age:    i,
 			Score:  float64(i),
 			Active: i%2 == 0,
-		})
-		if err != nil {
-			t.Fatalf("seed Set(%d): %v", i, err)
 		}
-	}
+	})
 	if err := db.RebuildIndex(); err != nil {
 		t.Fatalf("RebuildIndex: %v", err)
 	}
@@ -297,16 +285,13 @@ func TestNumericRangeBucketCache_ReusedAcrossDeltaSnapshotsWithSameBase(t *testi
 		SnapshotMaterializedPredCacheMaxEntriesWithDelta: -1,
 	})
 
-	for i := 1; i <= 6_000; i++ {
-		err := db.Set(uint64(i), &Rec{
+	seedGeneratedUint64Data(t, db, 6_000, func(i int) *Rec {
+		return &Rec{
 			Name:  fmt.Sprintf("u_%d", i),
 			Age:   i,
 			Score: float64(i),
-		})
-		if err != nil {
-			t.Fatalf("seed Set(%d): %v", i, err)
 		}
-	}
+	})
 	if err := db.RebuildIndex(); err != nil {
 		t.Fatalf("RebuildIndex: %v", err)
 	}

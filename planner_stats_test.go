@@ -104,7 +104,7 @@ func TestPlannerAnalyzeScheduler_Disabled(t *testing.T) {
 
 	s0 := db.PlannerStats()
 
-	time.Sleep(120 * time.Millisecond)
+	time.Sleep(30 * time.Millisecond)
 
 	s1 := db.PlannerStats()
 	if s1.Version != s0.Version {
@@ -113,7 +113,7 @@ func TestPlannerAnalyzeScheduler_Disabled(t *testing.T) {
 }
 
 func TestPlannerAnalyzeScheduler_StartAndStop(t *testing.T) {
-	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: 20 * time.Millisecond})
+	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: 10 * time.Millisecond})
 
 	if db.planner.analyzer.stop == nil || db.planner.analyzer.done == nil {
 		t.Fatalf("scheduler should be started")
@@ -121,7 +121,7 @@ func TestPlannerAnalyzeScheduler_StartAndStop(t *testing.T) {
 
 	s0 := db.PlannerStats()
 
-	if latest, ok := waitPlannerStatsVersionGreater(db, s0.Version, 900*time.Millisecond); !ok {
+	if latest, ok := waitPlannerStatsVersionGreater(db, s0.Version, 250*time.Millisecond); !ok {
 		t.Fatalf("expected background refresh to advance snapshot version: start=%d latest=%d", s0.Version, latest)
 	}
 
@@ -135,7 +135,7 @@ func TestPlannerAnalyzeScheduler_StartAndStop(t *testing.T) {
 
 	closedSnapshot := db.PlannerStats()
 
-	time.Sleep(120 * time.Millisecond)
+	time.Sleep(35 * time.Millisecond)
 
 	afterSnapshot := db.PlannerStats()
 	if afterSnapshot.Version != closedSnapshot.Version {
@@ -150,7 +150,7 @@ func waitPlannerStatsVersionGreater(db *DB[uint64, Rec], version uint64, timeout
 		if s.Version > version {
 			return s.Version, true
 		}
-		time.Sleep(5 * time.Millisecond)
+		time.Sleep(2 * time.Millisecond)
 	}
 	s := db.PlannerStats()
 	if s.Version == 0 {

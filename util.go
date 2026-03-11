@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"slices"
 	"strings"
 	"sync"
@@ -294,6 +295,22 @@ func releaseEncodeBuf(b *bytes.Buffer) {
 func rollback(tx *bbolt.Tx) { _ = tx.Rollback() }
 
 func closeFile(f *os.File) { _ = f.Close() }
+
+func syncDir(path string) error {
+	if runtime.GOOS == "windows" {
+		return nil
+	}
+	dir := filepath.Dir(path)
+	if dir == "" || dir == "." {
+		dir = "."
+	}
+	f, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer closeFile(f)
+	return f.Sync()
+}
 
 func sanitizeSuffix(s string) string {
 	out := make([]rune, 0, len(s))

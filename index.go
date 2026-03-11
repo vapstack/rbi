@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -449,7 +450,7 @@ func (db *DB[K, V]) loadIndex() (skipFields map[string]struct{}, err error) {
 
 	ver, err := reader.ReadByte()
 	if err != nil {
-		return nil, fmt.Errorf("load: reading version: %w", err)
+		return nil, fmt.Errorf("%w: reading version: %w", errPersistedIndexInvalid, err)
 	}
 
 	var lenLoaded bool
@@ -457,9 +458,12 @@ func (db *DB[K, V]) loadIndex() (skipFields map[string]struct{}, err error) {
 	case 4:
 		skipFields, lenLoaded, err = db.loadIndexV4(reader)
 	default:
-		return nil, fmt.Errorf("unsupported persisted index version: %v", ver)
+		return nil, fmt.Errorf("%w: unsupported persisted index version: %v", errPersistedIndexInvalid, ver)
 	}
 	if err != nil {
+		if errors.Is(err, errPersistedIndexStale) || errors.Is(err, errPersistedIndexInvalid) {
+			return nil, err
+		}
 		return nil, fmt.Errorf("error loading index: %w", err)
 	}
 
@@ -484,7 +488,11 @@ func (db *DB[K, V]) loadIndexV4(reader *bufio.Reader) (map[string]struct{}, bool
 		return nil, false, fmt.Errorf("%w: bucket sequence mismatch (stored=%v, current=%v)", errPersistedIndexStale, storedSeq, currentSeq)
 	}
 
-	return db.loadIndexPayload(reader)
+	skipFields, lenLoaded, err := db.loadIndexPayload(reader)
+	if err != nil {
+		return nil, false, fmt.Errorf("%w: %w", errPersistedIndexInvalid, err)
+	}
+	return skipFields, lenLoaded, nil
 }
 
 func (db *DB[K, V]) loadIndexPayload(reader *bufio.Reader) (map[string]struct{}, bool, error) {
@@ -620,6 +628,9 @@ func (db *DB[K, V]) storeIndex() error {
 	}
 
 	tmpFile := db.rbiFile + ".temp"
+	defer func() {
+		_ = os.Remove(tmpFile)
+	}()
 
 	f, err := os.Create(tmpFile)
 	if err != nil {
@@ -641,11 +652,20 @@ func (db *DB[K, V]) storeIndex() error {
 	if err = buf.Flush(); err != nil {
 		return fmt.Errorf("flushing write buffers: %w", err)
 	}
+	if err = f.Sync(); err != nil {
+		return fmt.Errorf("syncing persisted index temp file: %w", err)
+	}
 
 	if err = f.Close(); err != nil {
 		return err
 	}
-	return os.Rename(tmpFile, db.rbiFile)
+	if err = os.Rename(tmpFile, db.rbiFile); err != nil {
+		return err
+	}
+	if err = syncDir(db.rbiFile); err != nil {
+		return fmt.Errorf("syncing persisted index directory: %w", err)
+	}
+	return nil
 }
 
 func (db *DB[K, V]) storeIndexV4(writer *bufio.Writer, bucketSeq uint64) error {

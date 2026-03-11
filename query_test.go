@@ -143,6 +143,40 @@ func seedData(t *testing.T, db *DB[uint64, Rec], n int) []uint64 {
 	return ids
 }
 
+func seedGeneratedUint64Data(t *testing.T, db *DB[uint64, Rec], n int, gen func(i int) *Rec) {
+	t.Helper()
+
+	db.DisableSync()
+	defer db.EnableSync()
+
+	batchSize := 20_000
+	if n > 0 && n < batchSize {
+		batchSize = n
+	}
+	batchIDs := make([]uint64, 0, batchSize)
+	batchVals := make([]*Rec, 0, batchSize)
+
+	flush := func() {
+		if len(batchIDs) == 0 {
+			return
+		}
+		if err := db.BatchSet(batchIDs, batchVals); err != nil {
+			t.Fatalf("BatchSet(seed batch=%d): %v", len(batchIDs), err)
+		}
+		batchIDs = batchIDs[:0]
+		batchVals = batchVals[:0]
+	}
+
+	for i := 1; i <= n; i++ {
+		batchIDs = append(batchIDs, uint64(i))
+		batchVals = append(batchVals, gen(i))
+		if len(batchIDs) == cap(batchIDs) {
+			flush()
+		}
+	}
+	flush()
+}
+
 func mustExtractAndLeaves(t testing.TB, e qx.Expr) []qx.Expr {
 	t.Helper()
 	leaves, ok := extractAndLeaves(e)

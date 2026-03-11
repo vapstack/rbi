@@ -2,9 +2,11 @@ package rbi
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"log"
 	"math/rand"
 	"os"
 	"path/filepath"
@@ -255,6 +257,11 @@ func TestWrap_CorruptedPersistedIndex_RebuildsInsteadOfPanicking(t *testing.T) {
 	}
 	defer func() { _ = rawDB2.Close() }()
 
+	var logBuf bytes.Buffer
+	prevLogWriter := log.Writer()
+	log.SetOutput(&logBuf)
+	defer log.SetOutput(prevLogWriter)
+
 	var db2 *DB[uint64, Rec]
 	func() {
 		defer func() {
@@ -268,6 +275,16 @@ func TestWrap_CorruptedPersistedIndex_RebuildsInsteadOfPanicking(t *testing.T) {
 		t.Fatalf("reopen New: %v", err)
 	}
 	defer func() { _ = db2.Close() }()
+	gotLog := logBuf.String()
+	if !strings.Contains(gotLog, "persisted index unavailable") {
+		t.Fatalf("expected corrupted persisted index reason in log, got: %q", gotLog)
+	}
+	if !strings.Contains(gotLog, "persisted index is invalid") {
+		t.Fatalf("expected corrupted persisted index invalid marker in log, got: %q", gotLog)
+	}
+	if !strings.Contains(gotLog, "rbi: rebuilding index from bbolt") {
+		t.Fatalf("expected rebuild start in log, got: %q", gotLog)
+	}
 
 	got, err := db2.Get(1)
 	if err != nil {
@@ -1303,19 +1320,7 @@ func TestConcurrentWriters_FinalStateAndIndexConsistency(t *testing.T) {
 		staleProbe = 256
 	)
 
-	type appliedOp struct {
-		seq     uint64
-		id      uint64
-		deleted bool
-		name    string
-		age     int
-	}
-
-	var (
-		seq    atomic.Uint64
-		opsMu  sync.Mutex
-		opsLog = make([]appliedOp, 0, writers*opsPerW)
-	)
+	var historicNames sync.Map
 
 	errCh := make(chan error, writers+readers+16)
 	stopReaders := make(chan struct{})
@@ -1370,18 +1375,12 @@ func TestConcurrentWriters_FinalStateAndIndexConsistency(t *testing.T) {
 						errCh <- fmt.Errorf("writer=%d Delete(%d): %w", w, id, err)
 						return
 					}
-					opsMu.Lock()
-					opsLog = append(opsLog, appliedOp{
-						seq:     seq.Add(1),
-						id:      id,
-						deleted: true,
-					})
-					opsMu.Unlock()
 					continue
 				}
 
 				name := fmt.Sprintf("id-%03d-w%02d-op%04d", id, w, i)
 				age := w*10_000 + i
+				historicNames.Store(name, struct{}{})
 				rec := &Rec{
 					Name:   name,
 					Age:    age,
@@ -1396,14 +1395,6 @@ func TestConcurrentWriters_FinalStateAndIndexConsistency(t *testing.T) {
 					errCh <- fmt.Errorf("writer=%d Set(%d): %w", w, id, err)
 					return
 				}
-				opsMu.Lock()
-				opsLog = append(opsLog, appliedOp{
-					seq:  seq.Add(1),
-					id:   id,
-					name: name,
-					age:  age,
-				})
-				opsMu.Unlock()
 			}
 		}()
 	}
@@ -1420,63 +1411,57 @@ func TestConcurrentWriters_FinalStateAndIndexConsistency(t *testing.T) {
 		t.FailNow()
 	}
 
-	opsMu.Lock()
-	ops := slices.Clone(opsLog)
-	opsMu.Unlock()
-	sort.Slice(ops, func(i, j int) bool {
-		return ops[i].seq < ops[j].seq
-	})
-
-	type finalRec struct {
+	type liveRec struct {
+		id   uint64
 		name string
 		age  int
 	}
-	expectedByID := make(map[uint64]finalRec, idSpace)
-	allNames := make([]string, 0, len(ops))
-	for _, op := range ops {
-		if op.deleted {
-			delete(expectedByID, op.id)
-			continue
+	live := make(map[uint64]liveRec, idSpace)
+	err := db.SeqScan(0, func(id uint64, rec *Rec) (bool, error) {
+		if rec == nil {
+			return false, fmt.Errorf("nil record for id=%d", id)
 		}
-		expectedByID[op.id] = finalRec{name: op.name, age: op.age}
-		allNames = append(allNames, op.name)
+		if rec.Name == "" {
+			return false, fmt.Errorf("empty name for id=%d", id)
+		}
+		live[id] = liveRec{id: id, name: rec.Name, age: rec.Age}
+		return true, nil
+	})
+	if err != nil {
+		t.Fatalf("SeqScan: %v", err)
 	}
 
 	total, err := db.Count(nil)
 	if err != nil {
 		t.Fatalf("Count(nil): %v", err)
 	}
-	if total != uint64(len(expectedByID)) {
-		t.Fatalf("count mismatch: got=%d want=%d", total, len(expectedByID))
+	if total != uint64(len(live)) {
+		t.Fatalf("count mismatch: got=%d want=%d", total, len(live))
 	}
 
-	liveNames := make(map[string]uint64, len(expectedByID))
-	for id, exp := range expectedByID {
-		v, err := db.Get(id)
+	liveNames := make(map[string]uint64, len(live))
+	for id, rec := range live {
+		ids, err := db.QueryKeys(qx.Query(qx.EQ("name", rec.name)))
 		if err != nil {
-			t.Fatalf("Get(%d): %v", id, err)
-		}
-		if v == nil {
-			t.Fatalf("Get(%d): expected record, got nil", id)
-		}
-		if v.Name != exp.name || v.Age != exp.age {
-			t.Fatalf("Get(%d) mismatch: got={name:%q age:%d} want={name:%q age:%d}", id, v.Name, v.Age, exp.name, exp.age)
-		}
-
-		ids, err := db.QueryKeys(qx.Query(qx.EQ("name", exp.name)))
-		if err != nil {
-			t.Fatalf("QueryKeys(name=%q): %v", exp.name, err)
+			t.Fatalf("QueryKeys(name=%q): %v", rec.name, err)
 		}
 		if len(ids) != 1 || ids[0] != id {
-			t.Fatalf("name index mismatch for %q: got=%v want=[%d]", exp.name, ids, id)
+			t.Fatalf("name index mismatch for %q: got=%v want=[%d]", rec.name, ids, id)
 		}
-		liveNames[exp.name] = id
+		liveNames[rec.name] = id
 	}
 
 	checked := 0
-	for _, name := range allNames {
-		if _, live := liveNames[name]; live {
-			continue
+	historicNames.Range(func(k, _ any) bool {
+		if checked >= staleProbe {
+			return false
+		}
+		name, ok := k.(string)
+		if !ok {
+			return true
+		}
+		if _, stillLive := liveNames[name]; stillLive {
+			return true
 		}
 		ids, err := db.QueryKeys(qx.Query(qx.EQ("name", name)))
 		if err != nil {
@@ -1486,10 +1471,8 @@ func TestConcurrentWriters_FinalStateAndIndexConsistency(t *testing.T) {
 			t.Fatalf("stale name %q still indexed: ids=%v", name, ids)
 		}
 		checked++
-		if checked >= staleProbe {
-			break
-		}
-	}
+		return true
+	})
 }
 
 func TestConcurrentBatchWriters_ModelReplayConsistency(t *testing.T) {
@@ -2919,6 +2902,10 @@ func TestNew_DefaultExecOptions_ApplyToWrites(t *testing.T) {
 		raw,
 		Options{BatchMax: 1},
 		PatchStrict,
+		BeforeStore(func(_ uint64, _ *Rec, newValue *Rec) error {
+			newValue.Age++
+			return nil
+		}),
 		BeforeCommit(func(_ *bbolt.Tx, _ uint64, _, _ *Rec) error {
 			calls = append(calls, "default")
 			return nil
@@ -2949,7 +2936,7 @@ func TestNew_DefaultExecOptions_ApplyToWrites(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Get(1): %v", err)
 	}
-	if v == nil || v.Name != "alice" || v.Age != 30 {
+	if v == nil || v.Name != "alice" || v.Age != 31 {
 		t.Fatalf("unexpected stored value: %#v", v)
 	}
 

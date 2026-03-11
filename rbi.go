@@ -26,7 +26,8 @@ var (
 	ErrNoValidKeyIndex   = errors.New("no valid key for index")
 	ErrNilValue          = errors.New("value is nil")
 
-	errPersistedIndexStale = errors.New("persisted index is stale")
+	errPersistedIndexStale   = errors.New("persisted index is stale")
+	errPersistedIndexInvalid = errors.New("persisted index is invalid")
 )
 
 const (
@@ -348,28 +349,31 @@ type Options struct {
 	BatchMaxQueue int
 
 	// BatchAllowCallbacks allows combiner batching for requests with one or more
-	// BeforeCommit callbacks.
+	// BeforeStore or BeforeCommit hooks.
 	//
 	// Default: false
 	//
-	// When false, any Set/Patch/Delete call with callbacks bypasses combiner queue
-	// and is executed via direct single-write path.
+	// When false, any Set/Patch/Delete call with BeforeStore/BeforeCommit hooks
+	// bypasses combiner queue and is executed via direct single-write path.
 	//
-	// When true, callback-bearing requests may be combined with other writes and
-	// callbacks run inside the same shared write transaction.
+	// When true, hook-bearing requests may be combined with other writes.
+	// BeforeStore runs during request preparation; BeforeCommit runs inside the
+	// shared write transaction after the value has been written to Bolt.
 	//
 	// Limitations:
-	// - A callback error aborts the current combined-transaction attempt. The
-	//   failed request is isolated and remaining requests are retried without it.
-	// - On such abort, the whole current write transaction is rolled back.
-	//   Stored records and in-memory index state remain consistent; no partial
-	//   data/index changes from the failed attempt are published.
+	// - A BeforeStore error rejects only that request for the current attempt;
+	//   other requests may still proceed in the same combined transaction.
+	// - A BeforeCommit error aborts the current combined-transaction attempt.
+	//   The failed request is isolated and remaining requests are retried without it.
+	// - On such BeforeCommit abort, the whole current write transaction is
+	//   rolled back. Stored records and in-memory index state remain consistent;
+	//   no partial data/index changes from the failed attempt are published.
 	// - Non-callback transaction errors (put/delete/commit) still fail all
 	//   requests from the current combined batch.
-	// - Callback execution order follows operation order inside combined batch.
+	// - Hook execution order follows operation order inside combined batch.
 	// - Because surviving requests can be retried after isolating a failed one,
-	//   their callbacks may run more than once. Callback logic with side effects
-	//   outside this DB write transaction should be idempotent.
+	//   their hooks may run more than once. Hook logic with side effects outside
+	//   this DB write transaction should be idempotent.
 	BatchAllowCallbacks bool
 
 	// NumericRangeBucketSize controls amount of sorted numeric keys grouped into one
@@ -521,6 +525,9 @@ func New[K ~uint64 | ~string, V any](bolt *bbolt.DB, options Options, execOpts .
 	if bolt == nil {
 		return nil, fmt.Errorf("bolt instance is nil")
 	}
+	var defaultExecOptions execOptions[K, V]
+	applyExecOptions(&defaultExecOptions, execOpts)
+	defaultExecOptions = freezeExecOptions(defaultExecOptions)
 
 	boltPath := bolt.Path()
 
@@ -565,8 +572,8 @@ func New[K ~uint64 | ~string, V any](bolt *bbolt.DB, options Options, execOpts .
 			},
 		},
 
-		options:            &options,
-		defaultExecOptions: append([]ExecOption[K, V](nil), execOpts...),
+		options:     &options,
+		execOptions: defaultExecOptions,
 
 		snapshot: snapshot{
 			pinWait: snapshotPinWaitTimeout(options.SnapshotPinWaitTimeout),
@@ -615,15 +622,27 @@ func New[K ~uint64 | ~string, V any](bolt *bbolt.DB, options Options, execOpts .
 		return nil, err
 	}
 
-	var skipFields map[string]struct{}
+	var (
+		skipFields    map[string]struct{}
+		rebuildReason string
+	)
 
 	if _, err = os.Stat(db.rbiFile); err == nil {
-		if !options.DisableIndexLoad {
+		if options.DisableIndexLoad {
+			rebuildReason = "persisted index load disabled"
+		} else {
 			skipFields, err = db.loadIndex()
-			if err != nil && !errors.Is(err, errPersistedIndexStale) {
-				log.Println("rbi: failed to load persisted index:", err)
+			if err != nil {
+				rebuildReason = fmt.Sprintf("persisted index unavailable (%v)", err)
 			}
 		}
+	} else if !os.IsNotExist(err) {
+		rebuildReason = fmt.Sprintf("persisted index stat failed (%v)", err)
+	}
+
+	if rebuildReason != "" {
+		log.Printf("rbi: %s", rebuildReason)
+		log.Printf("rbi: rebuilding index from bbolt")
 	}
 
 	if err = db.buildIndex(skipFields); err != nil {
@@ -864,8 +883,8 @@ type (
 		combiner  combiner[K, V]
 		rebuilder rebuilder
 
-		options            *Options
-		defaultExecOptions []ExecOption[K, V]
+		options     *Options
+		execOptions execOptions[K, V]
 
 		rbiFile string
 
@@ -996,7 +1015,7 @@ type (
 		MaxBatch int
 		// MaxQueue is configured maximum queue size (0 means unbounded).
 		MaxQueue int
-		// AllowCallbacks reports whether callback-bearing writes can be combined.
+		// AllowCallbacks reports whether BeforeStore/BeforeCommit-bearing writes can be combined.
 		AllowCallbacks bool
 
 		// QueueLen is current pending requests in queue.
@@ -1028,7 +1047,8 @@ type (
 		// MaxBatchSeen is maximum observed executed batch size.
 		MaxBatchSeen uint64
 
-		// CallbackOps is number of requests with BeforeCommit callbacks executed by combiner.
+		// CallbackOps is number of requests with BeforeStore or BeforeCommit hooks
+		// executed by combiner.
 		CallbackOps uint64
 		// CoalescedSetDelete is number of Set/Delete requests collapsed into later Set/Delete of same ID.
 		CoalescedSetDelete uint64
@@ -1059,7 +1079,8 @@ type (
 		TxOpErrors uint64
 		// TxCommitErrors is number of write tx commit failures.
 		TxCommitErrors uint64
-		// CallbackErrors is number of callback failures returned by BeforeCommit callbacks.
+		// CallbackErrors is number of hook failures returned by BeforeStore or
+		// BeforeCommit hooks.
 		CallbackErrors uint64
 	}
 

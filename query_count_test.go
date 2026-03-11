@@ -20,8 +20,8 @@ func countByExprBitmap(t *testing.T, db *DB[uint64, Rec], expr qx.Expr) uint64 {
 func TestCount_ByPredicates_BucketLead_MatchesBitmap(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
 
-	for i := 1; i <= 20_000; i++ {
-		err := db.Set(uint64(i), &Rec{
+	seedGeneratedUint64Data(t, db, 20_000, func(i int) *Rec {
+		return &Rec{
 			Name:   fmt.Sprintf("u_%d", i),
 			Email:  fmt.Sprintf("user%05d@example.com", i),
 			Age:    i,
@@ -33,11 +33,8 @@ func TestCount_ByPredicates_BucketLead_MatchesBitmap(t *testing.T) {
 				}
 				return "US"
 			}()},
-		})
-		if err != nil {
-			t.Fatalf("seed Set(%d): %v", i, err)
 		}
-	}
+	})
 
 	q := qx.Query(
 		qx.GTE("age", 2_500),
@@ -58,8 +55,8 @@ func TestCount_ByPredicates_BucketLead_MatchesBitmap(t *testing.T) {
 func TestCount_ORPredicates_FiveBranches_MatchesBitmap(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
 
-	for i := 1; i <= 25_000; i++ {
-		err := db.Set(uint64(i), &Rec{
+	seedGeneratedUint64Data(t, db, 25_000, func(i int) *Rec {
+		return &Rec{
 			Name:   fmt.Sprintf("u_%d", i),
 			Email:  fmt.Sprintf("user%05d@example.com", i),
 			Age:    i,
@@ -71,11 +68,8 @@ func TestCount_ORPredicates_FiveBranches_MatchesBitmap(t *testing.T) {
 				}
 				return "US"
 			}()},
-		})
-		if err != nil {
-			t.Fatalf("seed Set(%d): %v", i, err)
 		}
-	}
+	})
 
 	expr := qx.OR(
 		qx.AND(qx.PREFIX("email", "user10"), qx.EQ("active", true)),
@@ -184,8 +178,8 @@ func TestCount_ScalarINSplit_MatchesBitmap(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
 
 	countries := []string{"US", "DE", "FR", "IN", "NL"}
-	for i := 1; i <= 30_000; i++ {
-		err := db.Set(uint64(i), &Rec{
+	seedGeneratedUint64Data(t, db, 30_000, func(i int) *Rec {
+		return &Rec{
 			Name:   fmt.Sprintf("u_%d", i),
 			Email:  fmt.Sprintf("user%05d@example.com", i),
 			Age:    i % 20_000,
@@ -194,11 +188,8 @@ func TestCount_ScalarINSplit_MatchesBitmap(t *testing.T) {
 			Meta: Meta{
 				Country: countries[i%len(countries)],
 			},
-		})
-		if err != nil {
-			t.Fatalf("seed Set(%d): %v", i, err)
 		}
-	}
+	})
 
 	expr := qx.AND(
 		qx.GTE("age", 4_000),
@@ -226,8 +217,8 @@ func TestCount_ScalarINSplit_WorksWithFieldDelta(t *testing.T) {
 	})
 
 	countries := []string{"US", "DE", "FR", "IN", "NL"}
-	for i := 1; i <= 12_000; i++ {
-		err := db.Set(uint64(i), &Rec{
+	seedGeneratedUint64Data(t, db, 12_000, func(i int) *Rec {
+		return &Rec{
 			Name:   fmt.Sprintf("u_%d", i),
 			Email:  fmt.Sprintf("user%05d@example.com", i),
 			Age:    i % 10_000,
@@ -236,11 +227,8 @@ func TestCount_ScalarINSplit_WorksWithFieldDelta(t *testing.T) {
 			Meta: Meta{
 				Country: countries[i%len(countries)],
 			},
-		})
-		if err != nil {
-			t.Fatalf("seed Set(%d): %v", i, err)
 		}
-	}
+	})
 	if err := db.RebuildIndex(); err != nil {
 		t.Fatalf("RebuildIndex: %v", err)
 	}

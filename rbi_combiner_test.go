@@ -145,6 +145,36 @@ func TestBatch_CallbacksBypassCombinerWhenDisabled(t *testing.T) {
 	}
 }
 
+func TestBatch_BeforeStoreBypassesCombinerWhenDisabled(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{
+		BatchWindow:   5 * time.Millisecond,
+		BatchMax:      16,
+		BatchMaxQueue: 64,
+	})
+
+	before := db.BatchStats()
+	calls := 0
+	err := db.Set(1, &Rec{Name: "alice", Age: 10}, BeforeStore(func(_ uint64, _ *Rec, newValue *Rec) error {
+		calls++
+		newValue.Name = "mutated"
+		return nil
+	}))
+	if err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("expected BeforeStore to run exactly once, got %d", calls)
+	}
+
+	after := db.BatchStats()
+	if after.Enqueued != before.Enqueued {
+		t.Fatalf("expected BeforeStore write to bypass combiner queue, before=%+v after=%+v", before, after)
+	}
+	if after.FallbackCallbacks <= before.FallbackCallbacks {
+		t.Fatalf("expected fallback-callback counter increment, before=%+v after=%+v", before, after)
+	}
+}
+
 func TestBatch_CallbackBarrier_RespectsBatchAllowCallbacks(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
 		BatchWindow:   5 * time.Millisecond,
@@ -717,6 +747,119 @@ func TestBatch_BeforeCommitError_Isolation_RechecksUniqueAfterRetry(t *testing.T
 		t.Fatalf("Get(2): %v", err)
 	} else if got == nil || got.Email != "shared@x" || got.Code != 2 {
 		t.Fatalf("id=2 must persist with shared unique value after retry, got: %#v", got)
+	}
+}
+
+func TestBatch_BeforeStore_RerunsFromBaselineOnRetry(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{BatchAllowCallbacks: true})
+
+	encode := func(v *Rec) []byte {
+		t.Helper()
+		b := getEncodeBuf()
+		if err := db.encode(v, b); err != nil {
+			releaseEncodeBuf(b)
+			t.Fatalf("encode: %v", err)
+		}
+		out := append([]byte(nil), b.Bytes()...)
+		releaseEncodeBuf(b)
+		return out
+	}
+
+	beforeStoreCalls := 0
+	goodVal := &Rec{Name: "good", Age: 10}
+	goodReq := &combineRequest[uint64, Rec]{
+		op:         combineSet,
+		id:         1,
+		setValue:   goodVal,
+		setPayload: encode(goodVal),
+		beforeStore: []beforeStoreFunc[uint64, Rec]{
+			func(_ uint64, _ *Rec, newValue *Rec) error {
+				beforeStoreCalls++
+				newValue.Age++
+				return nil
+			},
+		},
+		done: make(chan error, 1),
+	}
+
+	cbErr := errors.New("before commit fail")
+	badVal := &Rec{Name: "bad", Age: 20}
+	badReq := &combineRequest[uint64, Rec]{
+		op:         combineSet,
+		id:         2,
+		setValue:   badVal,
+		setPayload: encode(badVal),
+		beforeCommit: []beforeCommitFunc[uint64, Rec]{
+			func(_ *bbolt.Tx, _ uint64, _, _ *Rec) error { return cbErr },
+		},
+		done: make(chan error, 1),
+	}
+
+	db.executeCombinedBatch([]*combineRequest[uint64, Rec]{badReq, goodReq})
+
+	if err := <-badReq.done; !errors.Is(err, cbErr) {
+		t.Fatalf("bad request must fail with BeforeCommit error, got: %v", err)
+	}
+	if err := <-goodReq.done; err != nil {
+		t.Fatalf("good request must succeed after retry, got: %v", err)
+	}
+	if beforeStoreCalls != 2 {
+		t.Fatalf("expected BeforeStore to run twice due to retry, got %d", beforeStoreCalls)
+	}
+
+	got, err := db.Get(1)
+	if err != nil {
+		t.Fatalf("Get(1): %v", err)
+	}
+	if got == nil || got.Age != 11 {
+		t.Fatalf("expected BeforeStore to restart from baseline and persist age=11, got %#v", got)
+	}
+}
+
+func TestBatch_StringKeyBeforeStoreError_DoesNotGrowStrMap(t *testing.T) {
+	db, _ := openTempDBStringProduct(t)
+
+	if err := db.Set("p1", &Product{SKU: "p1", Price: 10}); err != nil {
+		t.Fatalf("seed Set: %v", err)
+	}
+	initial := len(db.strmap.Keys)
+
+	encode := func(v *Product) []byte {
+		t.Helper()
+		b := getEncodeBuf()
+		if err := db.encode(v, b); err != nil {
+			releaseEncodeBuf(b)
+			t.Fatalf("encode: %v", err)
+		}
+		out := append([]byte(nil), b.Bytes()...)
+		releaseEncodeBuf(b)
+		return out
+	}
+
+	hookErr := errors.New("before store fail")
+	req := &combineRequest[string, Product]{
+		op:         combineSet,
+		id:         "ghost-before-store",
+		setValue:   &Product{SKU: "ghost-before-store", Price: 11},
+		setPayload: encode(&Product{SKU: "ghost-before-store", Price: 11}),
+		beforeStore: []beforeStoreFunc[string, Product]{
+			func(_ string, _ *Product, _ *Product) error { return hookErr },
+		},
+		done: make(chan error, 1),
+	}
+
+	db.executeCombinedBatch([]*combineRequest[string, Product]{req})
+
+	if err := <-req.done; !errors.Is(err, hookErr) {
+		t.Fatalf("request must fail with BeforeStore error, got: %v", err)
+	}
+	if got, err := db.Get("ghost-before-store"); err != nil {
+		t.Fatalf("Get(ghost-before-store): %v", err)
+	} else if got != nil {
+		t.Fatalf("ghost-before-store must not persist after BeforeStore failure, got %#v", got)
+	}
+	if after := len(db.strmap.Keys); after != initial {
+		t.Fatalf("strmap grew after BeforeStore failure: initial=%d after=%d", initial, after)
 	}
 }
 

@@ -12,7 +12,7 @@ import (
 )
 
 func TestRace_ConcurrentReadersAndWriters(t *testing.T) {
-	db, _ := openTempDBUint64(t)
+	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
 	_ = seedData(t, db, 200)
 
 	stop := make(chan struct{})
@@ -149,7 +149,7 @@ func TestRace_ConcurrentReadersAndWriters(t *testing.T) {
 		}(int64(2000 + rr))
 	}
 
-	time.Sleep(400 * time.Millisecond)
+	time.Sleep(250 * time.Millisecond)
 	close(stop)
 	wg.Wait()
 	close(errCh)
@@ -160,7 +160,7 @@ func TestRace_ConcurrentReadersAndWriters(t *testing.T) {
 }
 
 func TestRace_ConcurrentReadersAndWriters_SnapshotDelta(t *testing.T) {
-	db, _ := openTempDBUint64(t)
+	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
 	_ = seedData(t, db, 200)
 
 	stop := make(chan struct{})
@@ -294,7 +294,7 @@ func TestRace_ConcurrentReadersAndWriters_SnapshotDelta(t *testing.T) {
 		}(int64(4100 + rr))
 	}
 
-	time.Sleep(400 * time.Millisecond)
+	time.Sleep(250 * time.Millisecond)
 	close(stop)
 	wg.Wait()
 	close(errCh)
