@@ -41,6 +41,9 @@ func (db *DB[K, V]) countInternal(q *qx.QX) (uint64, error) {
 	if cnt, ok, err := db.tryCountByUniqueEq(expr); ok || err != nil {
 		return cnt, err
 	}
+	if cnt, ok, err := db.tryCountByScalarLookup(expr); ok || err != nil {
+		return cnt, err
+	}
 	if cnt, ok, err := db.tryCountByScalarInSplit(expr); ok || err != nil {
 		return cnt, err
 	}
@@ -58,6 +61,56 @@ func (db *DB[K, V]) countInternal(q *qx.QX) (uint64, error) {
 	defer b.release()
 
 	return db.countBitmapResult(b), nil
+}
+
+func (db *DB[K, V]) tryCountByScalarLookup(expr qx.Expr) (uint64, bool, error) {
+	if expr.Field == "" {
+		return 0, false, nil
+	}
+
+	f := db.fields[expr.Field]
+	if f == nil || f.Slice {
+		return 0, false, nil
+	}
+
+	ov := db.fieldOverlay(expr.Field)
+	if !ov.hasData() && !db.hasFieldIndex(expr.Field) {
+		return 0, false, nil
+	}
+
+	switch expr.Op {
+	case qx.OpEQ:
+		key, isSlice, err := db.exprValueToIdxScalar(expr)
+		if err != nil || isSlice {
+			return 0, false, err
+		}
+		return countScalarLookupComplement(db.snapshotUniverseCardinality(), ov.lookupCardinality(key), expr.Not), true, nil
+
+	case qx.OpIN:
+		vals, isSlice, err := db.exprValueToIdxOwned(expr)
+		if err != nil || !isSlice || len(vals) == 0 {
+			return 0, false, err
+		}
+		vals = dedupStringsInplace(vals)
+
+		var sum uint64
+		for _, key := range vals {
+			sum += ov.lookupCardinality(key)
+		}
+		return countScalarLookupComplement(db.snapshotUniverseCardinality(), sum, expr.Not), true, nil
+	}
+
+	return 0, false, nil
+}
+
+func countScalarLookupComplement(universe, hit uint64, invert bool) uint64 {
+	if !invert {
+		return hit
+	}
+	if hit >= universe {
+		return 0
+	}
+	return universe - hit
 }
 
 // tryCountByScalarInSplit accelerates flat AND counts with a positive scalar IN leaf:

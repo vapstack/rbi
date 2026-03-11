@@ -1689,17 +1689,7 @@ func (db *DB[K, V]) estimateEqSelectivity(field string, value any, universe uint
 
 	ov := db.fieldOverlay(field)
 	if ov.hasData() {
-		scratch := getRoaringBuf()
-		defer releaseRoaringBuf(scratch)
-
-		bm, owned := ov.lookupOwned(key, scratch)
-		card := uint64(0)
-		if bm != nil {
-			card = bm.GetCardinality()
-		}
-		if owned && bm != nil && bm != scratch {
-			releaseRoaringBuf(bm)
-		}
+		card := ov.lookupCardinality(key)
 		if card == 0 {
 			return 0, true
 		}
@@ -1737,18 +1727,8 @@ func (db *DB[K, V]) estimateInLikeSelectivity(field string, value any, universe 
 		return 0, 0, false
 	}
 
-	scratch := getRoaringBuf()
-	defer releaseRoaringBuf(scratch)
-
 	for _, key := range vals {
-		bm, owned := ov.lookupOwned(key, scratch)
-		card := uint64(0)
-		if bm != nil {
-			card = bm.GetCardinality()
-		}
-		if owned && bm != nil && bm != scratch {
-			releaseRoaringBuf(bm)
-		}
+		card := ov.lookupCardinality(key)
 		sum += card
 		if minCard == 0 || card < minCard {
 			minCard = card

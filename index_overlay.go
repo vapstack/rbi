@@ -107,6 +107,24 @@ func (o fieldOverlay) lookupOwned(key string, scratch *roaring64.Bitmap) (*roari
 	return composePostingOwned(base, de, scratch)
 }
 
+func (o fieldOverlay) lookupCardinality(key string) uint64 {
+	var base postingList
+	if len(o.base) > 0 {
+		if i := lowerBoundIndex(o.base, key); i < len(o.base) && indexKeyEqualsString(o.base[i].Key, key) {
+			base = o.base[i].IDs
+		}
+	}
+
+	if o.delta == nil || !o.delta.hasEntries() {
+		return base.Cardinality()
+	}
+	de, ok := o.delta.get(key)
+	if !ok {
+		return base.Cardinality()
+	}
+	return composePostingCardinality(base, de)
+}
+
 func composePosting(base postingList, de indexDeltaEntry, scratch *roaring64.Bitmap) *roaring64.Bitmap {
 	bm, _ := composePostingOwned(base, de, scratch)
 	return bm
