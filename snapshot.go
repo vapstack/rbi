@@ -142,6 +142,75 @@ func (db *DB[K, V]) publishSnapshotWithTxDeltaNoLock(txID uint64, indexChanges, 
 	db.noteSnapshotActivity()
 }
 
+func (db *DB[K, V]) publishPreparedSnapshotWithAccumDeltaNoLock(txID uint64, delta *preparedSnapshotDelta) {
+	if delta == nil {
+		db.publishSnapshotWithAccumDeltaNoLock(txID, nil, nil, nil, nil)
+		return
+	}
+
+	prev := db.getSnapshot()
+
+	baseIndex := db.index
+	baseLenIndex := db.lenIndex
+	baseUniverse := db.universe
+	var baseStrMap *strMapSnapshot
+	if db.strkey {
+		baseStrMap = db.strmap.snapshot()
+	}
+	if prev != nil {
+		baseIndex = prev.index
+		baseLenIndex = prev.lenIndex
+		baseUniverse = prev.universe
+		if !db.strkey {
+			baseStrMap = prev.strmap
+		}
+	}
+	prevIndexLayer := prev.getIndexLayer()
+	prevLenLayer := prev.getLenLayer()
+
+	nextIndexLayer := appendDeltaLayer(prevIndexLayer, delta.indexDelta)
+	nextLenLayer := appendDeltaLayer(prevLenLayer, delta.lenDelta)
+	nextIndexCount := appendDeltaLayerFieldCount(prev.indexDeltaCount(), delta.indexDelta, len(baseIndex))
+	nextLenCount := appendDeltaLayerFieldCount(prev.lenDeltaCount(), delta.lenDelta, len(baseLenIndex))
+
+	nextUniverseAdd, nextUniverseRem := mergeUniverseDelta(nil, nil, delta.universeAdd, delta.universeRem)
+	if prev != nil {
+		nextUniverseAdd, nextUniverseRem = mergeUniverseDelta(prev.universeAdd, prev.universeRem, delta.universeAdd, delta.universeRem)
+	}
+
+	nextIndexDelta := maybeExposeFlatLayerMap(nextIndexLayer)
+	nextLenDelta := maybeExposeFlatLayerMap(nextLenLayer)
+
+	s := &indexSnapshot{
+		txID:        txID,
+		index:       baseIndex,
+		lenIndex:    baseLenIndex,
+		indexDelta:  nextIndexDelta,
+		lenIdxDelta: nextLenDelta,
+		indexLayer:  nextIndexLayer,
+		lenLayer:    nextLenLayer,
+		indexDCount: nextIndexCount,
+		lenDCount:   nextLenCount,
+		universe:    baseUniverse,
+		universeAdd: nextUniverseAdd,
+		universeRem: nextUniverseRem,
+		strmap:      baseStrMap,
+
+		numericRangeBucketCache: inheritNumericRangeBucketCache(prev, prev != nil),
+
+		matPredCacheMaxEntries:          max(0, db.options.SnapshotMaterializedPredCacheMaxEntries),
+		matPredCacheMaxEntriesWithDelta: max(0, db.options.SnapshotMaterializedPredCacheMaxEntriesWithDelta),
+		matPredCacheMaxBitmapCard:       materializedPredCacheMaxBitmapCardinality(db.options.SnapshotMaterializedPredCacheMaxBitmapCardinality),
+	}
+	db.snapshot.current.Store(s)
+	db.registerSnapshot(s)
+	if s.hasAnyDeltaState() {
+		db.maybeRequestSnapshotCompaction(s, delta.indexDelta, delta.lenDelta, delta.universeAdd, delta.universeRem)
+	}
+	db.noteSnapshotActivity()
+	delta.releaseTransientUniverse()
+}
+
 func (db *DB[K, V]) publishSnapshotWithAccumDeltaNoLock(txID uint64, indexChanges, lenChanges map[string]map[string]indexDeltaEntry, add, rem *roaring64.Bitmap) {
 	indexDelta := buildSnapshotDeltaMap(indexChanges, func(field string) bool {
 		return fieldUsesFixed8Keys(db.fields[field])

@@ -19,7 +19,7 @@ const (
 	DefaultSweepDuration = 20 * time.Second
 	MaxLatencySampleSize = 250_000
 
-	DefaultCeilingStageDuration            = 60 * time.Second
+	DefaultCeilingStageDuration            = 10 * time.Second
 	DefaultCeilingDispatchQuantum          = 1 * time.Millisecond
 	DefaultCeilingQueueCap                 = 8192
 	DefaultCeilingReadFastWorkers          = 1024
@@ -27,7 +27,7 @@ const (
 	DefaultCeilingWriteUpdateWorkers       = 256
 	DefaultCeilingWriteInsertWorkers       = 16
 	DefaultCeilingReadFastGrid             = "50000,75000,100000,125000,150000,175000,200000"
-	DefaultCeilingWriteGrid                = "500,1000,1500,2000,2500,3000,4000,5000"
+	DefaultCeilingWriteGrid                = "2000,3000,4000,5000,6000"
 	DefaultCeilingReadSlowGrid             = "32,64,128,256"
 	DefaultCeilingLowWriteGrid             = "250,500,1000,1500"
 	DefaultCeilingMixedSlowOps             = 8.0
@@ -250,8 +250,9 @@ type CeilingReport struct {
 	DispatchQuantum  float64 `json:"dispatch_quantum_sec"`
 	QueueCapacity    int     `json:"queue_capacity"`
 
-	Suites  []CeilingSuiteResult `json:"suites"`
-	Summary *CeilingSummary      `json:"summary,omitempty"`
+	FastReadBaseline *CeilingBaselineInfo `json:"fast_read_baseline,omitempty"`
+	Suites           []CeilingSuiteResult `json:"suites"`
+	Summary          *CeilingSummary      `json:"summary,omitempty"`
 
 	Interrupted    bool   `json:"interrupted"`
 	RecordsAtStart uint64 `json:"records_at_start"`
@@ -318,9 +319,16 @@ type CeilingRegression struct {
 	Reasons           []string `json:"reasons,omitempty"`
 }
 
+type CeilingBaselineInfo struct {
+	Throughput float64 `json:"throughput"`
+	P99Us      float64 `json:"p99_us,omitempty"`
+	Source     string  `json:"source"`
+}
+
 type CeilingSummary struct {
-	GeneratedAt string                `json:"generated_at"`
-	Suites      []CeilingSuiteSummary `json:"suites"`
+	GeneratedAt      string                `json:"generated_at"`
+	FastReadBaseline *CeilingBaselineInfo  `json:"fast_read_baseline,omitempty"`
+	Suites           []CeilingSuiteSummary `json:"suites"`
 }
 
 type CeilingSuiteSummary struct {
@@ -339,8 +347,9 @@ type CeilingSuiteSummary struct {
 	FirstFastReadRegressionStage string            `json:"first_fast_read_regression_stage,omitempty"`
 	FirstClassSaturation         map[string]string `json:"first_class_saturation,omitempty"`
 
-	MaxCompletedOpsPerSec  map[string]float64 `json:"max_completed_ops_per_sec,omitempty"`
-	MaxSafeTargetOpsPerSec map[string]float64 `json:"max_safe_target_ops_per_sec,omitempty"`
+	MaxCompletedOpsPerSec   map[string]float64 `json:"max_completed_ops_per_sec,omitempty"`
+	MaxSafeTargetOpsPerSec  map[string]float64 `json:"max_safe_target_ops_per_sec,omitempty"`
+	MaxSafeOfferedOpsPerSec map[string]float64 `json:"max_safe_offered_ops_per_sec,omitempty"`
 }
 
 type dedicatedWorkerRunner struct {

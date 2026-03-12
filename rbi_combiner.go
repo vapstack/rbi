@@ -301,7 +301,8 @@ func (db *DB[K, V]) popCombinedBatch() []*combineRequest[K, V] {
 			prevIdx, seen := lastByID[req.id]
 			if seen {
 				prev := db.combiner.queue[prevIdx]
-				if !(canCoalesceSetDelete(req) && canCoalesceSetDelete(prev)) {
+				if !(canCoalesceSetDelete(req) && canCoalesceSetDelete(prev)) &&
+					!(db.canBatchRepeatedID(req) && db.canBatchRepeatedID(prev)) {
 					n = i
 					break
 				}
@@ -325,6 +326,47 @@ func canCoalesceSetDelete[K ~string | ~uint64, V any](req *combineRequest[K, V])
 		return false
 	}
 	return req.op == combineSet || req.op == combineDelete
+}
+
+func (db *DB[K, V]) canBatchRepeatedID(req *combineRequest[K, V]) bool {
+	if req == nil || req.coalescedTo != nil {
+		return false
+	}
+	switch req.op {
+	case combineDelete:
+		return true
+	case combinePatch:
+		if db.hasUnique && len(req.beforeStore) > 0 {
+			return false
+		}
+		if !db.hasUnique {
+			return true
+		}
+		return !db.patchTouchesUnique(req.patch)
+	default:
+		return false
+	}
+}
+
+func (db *DB[K, V]) patchTouchesUnique(patch []Field) bool {
+	for _, p := range patch {
+		f, ok := db.patchMap[p.Name]
+		if !ok || f == nil {
+			continue
+		}
+		if f.Unique {
+			return true
+		}
+		if f.DBName != "" {
+			if indexed, ok := db.fields[f.DBName]; ok && indexed.Unique {
+				return true
+			}
+		}
+		if indexed, ok := db.fields[f.Name]; ok && indexed.Unique {
+			return true
+		}
+	}
+	return false
 }
 
 func (db *DB[K, V]) coalesceSetDeleteBatch(batch []*combineRequest[K, V]) {
@@ -616,6 +658,24 @@ func (db *DB[K, V]) executeCombinedBatchAttempt(active []*combineRequest[K, V]) 
 		return nil, true, nil
 	}
 
+	preparedIdxs := make([]uint64, len(prepared))
+	preparedOldVals := make([]*V, len(prepared))
+	preparedNewVals := make([]*V, len(prepared))
+	preparedModified := make([][]string, len(prepared))
+	for i, op := range prepared {
+		preparedIdxs[i] = op.idx
+		preparedOldVals[i] = op.oldVal
+		preparedNewVals[i] = op.newVal
+		preparedModified[i] = op.modified
+	}
+	preparedDelta := db.prepareSnapshotWriteDeltaBatch(preparedIdxs, preparedOldVals, preparedNewVals, preparedModified)
+	preparedDeltaOwned := true
+	defer func() {
+		if preparedDeltaOwned {
+			preparedDelta.release()
+		}
+	}()
+
 	db.mu.Lock()
 	if db.closed.Load() {
 		rollbackCreated(prepared)
@@ -728,7 +788,12 @@ func (db *DB[K, V]) executeCombinedBatchAttempt(active []*combineRequest[K, V]) 
 		return nil, true, nil
 	}
 	committed = true
-	db.publishWriteDeltaBatch(txID, idxs, oldVals, newVals, modified)
+	if len(accepted) == len(prepared) {
+		db.publishPreparedSnapshotWithAccumDeltaNoLock(txID, &preparedDelta)
+		preparedDeltaOwned = false
+	} else {
+		db.publishWriteDeltaBatch(txID, idxs, oldVals, newVals, modified)
+	}
 	db.mu.Unlock()
 
 	return nil, true, nil

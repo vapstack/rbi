@@ -547,6 +547,177 @@ func (db *DB[K, V]) checkUniqueBatchCandidate(
 	return nil
 }
 
+type preparedSnapshotDelta struct {
+	indexDelta  map[string]*fieldIndexDelta
+	lenDelta    map[string]*fieldIndexDelta
+	universeAdd *roaring64.Bitmap
+	universeRem *roaring64.Bitmap
+}
+
+func releasePreparedFieldDelta(delta *fieldIndexDelta) {
+	if delta == nil {
+		return
+	}
+	if delta.singleSet {
+		releaseRoaringBuf(delta.singleEntry.add)
+		releaseRoaringBuf(delta.singleEntry.del)
+		return
+	}
+	releaseWriteDeltaInnerMap(delta.byKey)
+}
+
+func releasePreparedFieldDeltaMap(delta map[string]*fieldIndexDelta) {
+	if len(delta) == 0 {
+		return
+	}
+	for f, d := range delta {
+		releasePreparedFieldDelta(d)
+		delete(delta, f)
+	}
+}
+
+func (delta *preparedSnapshotDelta) release() {
+	if delta == nil {
+		return
+	}
+	releasePreparedFieldDeltaMap(delta.indexDelta)
+	releasePreparedFieldDeltaMap(delta.lenDelta)
+	releaseRoaringBuf(delta.universeAdd)
+	releaseRoaringBuf(delta.universeRem)
+	delta.indexDelta = nil
+	delta.lenDelta = nil
+	delta.universeAdd = nil
+	delta.universeRem = nil
+}
+
+func (delta *preparedSnapshotDelta) releaseTransientUniverse() {
+	if delta == nil {
+		return
+	}
+	releaseRoaringBuf(delta.universeAdd)
+	releaseRoaringBuf(delta.universeRem)
+	delta.universeAdd = nil
+	delta.universeRem = nil
+}
+
+func (db *DB[K, V]) prepareSnapshotWriteDeltaBatch(idxs []uint64, oldVals, newVals []*V, modified [][]string) preparedSnapshotDelta {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+
+	indexChanges := getWriteDeltaOuterMap()
+	lenChanges := getWriteDeltaOuterMap()
+
+	var add *roaring64.Bitmap
+	var rem *roaring64.Bitmap
+
+	for i, idx := range idxs {
+		oldV := oldVals[i]
+		var newV *V
+		if newVals != nil {
+			newV = newVals[i]
+		}
+		var mods []string
+		if modified != nil {
+			mods = modified[i]
+		} else if oldV != nil && newV != nil {
+			mods = db.getModifiedIndexedFields(oldV, newV)
+		}
+
+		if oldV != nil {
+			ptr := unsafe.Pointer(oldV)
+			if newV == nil {
+				db.applyDeltaAllIndexedFields(ptr, idx, false, indexChanges, lenChanges)
+			} else {
+				db.applyDeltaModifiedIndexedFields(ptr, idx, mods, false, indexChanges, lenChanges)
+			}
+		}
+
+		if newV != nil {
+			ptr := unsafe.Pointer(newV)
+			if oldV == nil {
+				db.applyDeltaAllIndexedFields(ptr, idx, true, indexChanges, lenChanges)
+			} else {
+				db.applyDeltaModifiedIndexedFields(ptr, idx, mods, true, indexChanges, lenChanges)
+			}
+		}
+
+		switch {
+		case oldV == nil && newV != nil:
+			if add == nil {
+				add = getRoaringBuf()
+			}
+			add.Add(idx)
+		case oldV != nil && newV == nil:
+			if rem == nil {
+				rem = getRoaringBuf()
+			}
+			rem.Add(idx)
+		}
+	}
+
+	delta := preparedSnapshotDelta{
+		indexDelta: buildSnapshotDeltaMap(indexChanges, func(field string) bool {
+			return fieldUsesFixed8Keys(db.fields[field])
+		}),
+		lenDelta:    buildSnapshotDeltaMap(lenChanges, func(string) bool { return true }),
+		universeAdd: add,
+		universeRem: rem,
+	}
+	releaseWriteDeltaOuterMap(indexChanges)
+	releaseWriteDeltaOuterMap(lenChanges)
+	return delta
+}
+
+func (db *DB[K, V]) prepareSnapshotWriteDelta(idx uint64, oldVal, newVal *V, modified []string) preparedSnapshotDelta {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+
+	indexChanges := getWriteDeltaOuterMap()
+	lenChanges := getWriteDeltaOuterMap()
+
+	var universeAdd *roaring64.Bitmap
+	var universeDel *roaring64.Bitmap
+
+	if oldVal != nil {
+		ptr := unsafe.Pointer(oldVal)
+		if newVal == nil {
+			db.applyDeltaAllIndexedFields(ptr, idx, false, indexChanges, lenChanges)
+		} else {
+			db.applyDeltaModifiedIndexedFields(ptr, idx, modified, false, indexChanges, lenChanges)
+		}
+	}
+
+	if newVal != nil {
+		ptr := unsafe.Pointer(newVal)
+		if oldVal == nil {
+			db.applyDeltaAllIndexedFields(ptr, idx, true, indexChanges, lenChanges)
+		} else {
+			db.applyDeltaModifiedIndexedFields(ptr, idx, modified, true, indexChanges, lenChanges)
+		}
+	}
+
+	switch {
+	case oldVal == nil && newVal != nil:
+		universeAdd = getRoaringBuf()
+		universeAdd.Add(idx)
+	case oldVal != nil && newVal == nil:
+		universeDel = getRoaringBuf()
+		universeDel.Add(idx)
+	}
+
+	delta := preparedSnapshotDelta{
+		indexDelta: buildSnapshotDeltaMap(indexChanges, func(field string) bool {
+			return fieldUsesFixed8Keys(db.fields[field])
+		}),
+		lenDelta:    buildSnapshotDeltaMap(lenChanges, func(string) bool { return true }),
+		universeAdd: universeAdd,
+		universeRem: universeDel,
+	}
+	releaseWriteDeltaOuterMap(indexChanges)
+	releaseWriteDeltaOuterMap(lenChanges)
+	return delta
+}
+
 func (db *DB[K, V]) publishWriteDeltaBatch(txID uint64, idxs []uint64, oldVals, newVals []*V, modified [][]string) {
 	indexChanges := getWriteDeltaOuterMap()
 	defer releaseWriteDeltaOuterMap(indexChanges)

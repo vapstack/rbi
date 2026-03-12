@@ -47,8 +47,8 @@ const (
 	defaultSnapshotCompactorMaxIterationsPerRun     = 2
 	defaultSnapshotCompactorRequestEveryNWrites     = 8
 	defaultSnapshotCompactorIdleInterval            = 2 * time.Second
-	defaultBatchWindow                              = 200 * time.Microsecond
-	defaultBatchMax                                 = 16
+	defaultBatchWindow                              = 50 * time.Microsecond
+	defaultBatchMax                                 = 64
 	defaultBatchMaxQueue                            = 512
 	defaultSnapshotDeltaCompactLargeBaseFieldKeys   = 128 << 10
 	defaultSnapshotDeltaCompactLargeBaseMinDeltaDiv = 32
@@ -317,7 +317,7 @@ type Options struct {
 	//
 	// Negative value disables write combining.
 	//
-	// Default: 200us
+	// Default: 50us
 	//
 	// Typical range: 10us..500us
 	//
@@ -330,9 +330,9 @@ type Options struct {
 	// Negative value disables effective batching.
 	// Value 1 also disables effective batching (single op per batch).
 	//
-	// Default: 16
+	// Default: 64
 	//
-	// Typical range: 4..64
+	// Typical range: 4..1024
 	//
 	// Very high values can create commit-size spikes and tail-latency variance.
 	BatchMax int

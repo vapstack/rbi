@@ -753,6 +753,15 @@ func (db *DB[K, V]) patch(id K, fields []Field, execOpts ...ExecOption[K, V]) er
 		return err
 	}
 
+	modified := db.getModifiedIndexedFields(oldVal, newVal)
+	delta := db.prepareSnapshotWriteDelta(idx, oldVal, newVal, modified)
+	deltaOwned := true
+	defer func() {
+		if deltaOwned {
+			delta.release()
+		}
+	}()
+
 	db.mu.Lock()
 	defer db.mu.Unlock()
 
@@ -760,7 +769,6 @@ func (db *DB[K, V]) patch(id K, fields []Field, execOpts ...ExecOption[K, V]) er
 		return ErrClosed
 	}
 
-	modified := db.getModifiedIndexedFields(oldVal, newVal)
 	if db.hasUnique {
 		if err = db.checkUniqueOnWrite(idx, oldVal, newVal, modified); err != nil {
 			return err
@@ -777,7 +785,8 @@ func (db *DB[K, V]) patch(id K, fields []Field, execOpts ...ExecOption[K, V]) er
 		db.clearPending(txID)
 		return err
 	}
-	db.publishWriteDelta(txID, idx, oldVal, newVal, modified)
+	db.publishPreparedSnapshotWithAccumDeltaNoLock(txID, &delta)
+	deltaOwned = false
 	return nil
 }
 
@@ -906,16 +915,23 @@ func (db *DB[K, V]) batchPatch(ids []K, patch []Field, execOpts ...ExecOption[K,
 		}
 	}
 
+	modified := make([][]string, len(idxs))
+	for i := range idxs {
+		modified[i] = db.getModifiedIndexedFields(oldVals[i], newVals[i])
+	}
+	delta := db.prepareSnapshotWriteDeltaBatch(idxs, oldVals, newVals, modified)
+	deltaOwned := true
+	defer func() {
+		if deltaOwned {
+			delta.release()
+		}
+	}()
+
 	db.mu.Lock()
 	defer db.mu.Unlock()
 
 	if db.closed.Load() {
 		return ErrClosed
-	}
-
-	modified := make([][]string, len(idxs))
-	for i := range idxs {
-		modified[i] = db.getModifiedIndexedFields(oldVals[i], newVals[i])
 	}
 
 	if db.hasUnique {
@@ -934,7 +950,8 @@ func (db *DB[K, V]) batchPatch(ids []K, patch []Field, execOpts ...ExecOption[K,
 		db.clearPending(txID)
 		return err
 	}
-	db.publishWriteDeltaBatch(txID, idxs, oldVals, newVals, modified)
+	db.publishPreparedSnapshotWithAccumDeltaNoLock(txID, &delta)
+	deltaOwned = false
 	return nil
 }
 
@@ -991,6 +1008,15 @@ func (db *DB[K, V]) Delete(id K, execOpts ...ExecOption[K, V]) error {
 		return err
 	}
 
+	modified := db.getModifiedIndexedFields(oldVal, nil)
+	delta := db.prepareSnapshotWriteDelta(idx, oldVal, nil, modified)
+	deltaOwned := true
+	defer func() {
+		if deltaOwned {
+			delta.release()
+		}
+	}()
+
 	db.mu.Lock()
 	defer db.mu.Unlock()
 
@@ -998,7 +1024,6 @@ func (db *DB[K, V]) Delete(id K, execOpts ...ExecOption[K, V]) error {
 		return ErrClosed
 	}
 
-	modified := db.getModifiedIndexedFields(oldVal, nil)
 	if err = advanceBucketSequence(bucket); err != nil {
 		return err
 	}
@@ -1010,7 +1035,8 @@ func (db *DB[K, V]) Delete(id K, execOpts ...ExecOption[K, V]) error {
 		db.clearPending(txID)
 		return err
 	}
-	db.publishWriteDelta(txID, idx, oldVal, nil, modified)
+	db.publishPreparedSnapshotWithAccumDeltaNoLock(txID, &delta)
+	deltaOwned = false
 	return nil
 }
 
@@ -1086,6 +1112,18 @@ func (db *DB[K, V]) BatchDelete(ids []K, execOpts ...ExecOption[K, V]) error {
 		}
 	}
 
+	modified := make([][]string, len(idxs))
+	for i := range idxs {
+		modified[i] = db.getModifiedIndexedFields(oldVals[i], nil)
+	}
+	delta := db.prepareSnapshotWriteDeltaBatch(idxs, oldVals, nil, modified)
+	deltaOwned := true
+	defer func() {
+		if deltaOwned {
+			delta.release()
+		}
+	}()
+
 	db.mu.Lock()
 	defer db.mu.Unlock()
 
@@ -1093,10 +1131,6 @@ func (db *DB[K, V]) BatchDelete(ids []K, execOpts ...ExecOption[K, V]) error {
 		return ErrClosed
 	}
 
-	modified := make([][]string, len(idxs))
-	for i := range idxs {
-		modified[i] = db.getModifiedIndexedFields(oldVals[i], nil)
-	}
 	if err = advanceBucketSequence(bucket); err != nil {
 		return err
 	}
@@ -1108,6 +1142,7 @@ func (db *DB[K, V]) BatchDelete(ids []K, execOpts ...ExecOption[K, V]) error {
 		db.clearPending(txID)
 		return err
 	}
-	db.publishWriteDeltaBatch(txID, idxs, oldVals, nil, modified)
+	db.publishPreparedSnapshotWithAccumDeltaNoLock(txID, &delta)
+	deltaOwned = false
 	return nil
 }

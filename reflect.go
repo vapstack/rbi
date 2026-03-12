@@ -680,9 +680,10 @@ func (db *DB[K, V]) populatePatcher(t reflect.Type, idx []int) error {
 		}
 
 		f := &field{
-			Name:  rf.Name,
-			Kind:  rf.Type.Kind(),
-			Index: append(append([]int{}, idx...), i),
+			Name:   rf.Name,
+			DBName: rf.Name,
+			Kind:   rf.Type.Kind(),
+			Index:  append(append([]int{}, idx...), i),
 		}
 
 		if f.Kind == reflect.Pointer {
@@ -693,6 +694,7 @@ func (db *DB[K, V]) populatePatcher(t reflect.Type, idx []int) error {
 		db.patchMap[rf.Name] = f
 
 		if dbTag := rf.Tag.Get("db"); dbTag != "" && dbTag != "-" {
+			f.DBName = dbTag
 			if existing, ok := db.patchMap[dbTag]; ok && existing.Name != f.Name {
 				return fmt.Errorf("ambiguous db tag '%v' used by fields %v and %v", dbTag, existing.Name, f.Name)
 			}

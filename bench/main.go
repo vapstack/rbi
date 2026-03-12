@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"sync/atomic"
 	"syscall"
+	"time"
 
 	"github.com/vapstack/rbi"
 	bolt "go.etcd.io/bbolt"
@@ -133,9 +134,9 @@ func openBenchDatabase(opts benchOptions) (*rbi.DB[uint64, UserBench], *bolt.DB)
 		layerDepthLabel = strconv.Itoa(opts.snapshotDeltaLayerMaxDepth)
 	}
 
-	// dbOpts.BatchMax = 64
-	// dbOpts.BatchWindow = 400 * time.Microsecond
-	// dbOpts.BatchAllowCallbacks = true
+	dbOpts.BatchMax = 1024
+	dbOpts.BatchWindow = 50 * time.Microsecond
+	dbOpts.BatchAllowCallbacks = true
 	// dbOpts.BatchMaxQueue = 2048
 
 	log.Printf(

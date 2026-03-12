@@ -12,7 +12,6 @@ import (
 	"path/filepath"
 	"reflect"
 	"slices"
-	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1486,20 +1485,6 @@ func TestConcurrentBatchWriters_ModelReplayConsistency(t *testing.T) {
 		staleProbe = 320
 	)
 
-	type modelRec struct {
-		name   string
-		age    int
-		active bool
-	}
-	type batchOp struct {
-		seq         uint64
-		kind        uint8 // 0=set, 1=patch, 2=delete
-		ids         []uint64
-		setVals     []modelRec
-		patchAge    int
-		patchActive bool
-	}
-
 	makeBatchIDs := func(writer, iter, size int) []uint64 {
 		out := make([]uint64, 0, size)
 		used := make(map[uint64]struct{}, size)
@@ -1516,11 +1501,7 @@ func TestConcurrentBatchWriters_ModelReplayConsistency(t *testing.T) {
 		return out
 	}
 
-	var (
-		seq   atomic.Uint64
-		opsMu sync.Mutex
-		logOp = make([]batchOp, 0, writers*opsPerW)
-	)
+	var historicNames sync.Map
 
 	errCh := make(chan error, writers+readers+16)
 	stopReaders := make(chan struct{})
@@ -1575,11 +1556,11 @@ func TestConcurrentBatchWriters_ModelReplayConsistency(t *testing.T) {
 					size := 2 + ((w + i) % 4)
 					ids := makeBatchIDs(w, i, size)
 					vals := make([]*Rec, 0, len(ids))
-					modelVals := make([]modelRec, 0, len(ids))
 					for p, id := range ids {
 						name := fmt.Sprintf("bm-id%03d-w%02d-i%04d-p%02d", id, w, i, p)
 						age := w*100_000 + i*10 + p
 						active := (i+p)%2 == 0
+						historicNames.Store(name, struct{}{})
 						vals = append(vals, &Rec{
 							Name:   name,
 							Age:    age,
@@ -1590,24 +1571,11 @@ func TestConcurrentBatchWriters_ModelReplayConsistency(t *testing.T) {
 							},
 							Meta: Meta{Country: "NL"},
 						})
-						modelVals = append(modelVals, modelRec{
-							name:   name,
-							age:    age,
-							active: active,
-						})
 					}
 					if err := db.BatchSet(ids, vals); err != nil {
 						errCh <- fmt.Errorf("writer=%d BatchSet: %w", w, err)
 						return
 					}
-					opsMu.Lock()
-					logOp = append(logOp, batchOp{
-						seq:     seq.Add(1),
-						kind:    0,
-						ids:     slices.Clone(ids),
-						setVals: slices.Clone(modelVals),
-					})
-					opsMu.Unlock()
 
 				case 1: // BatchPatch
 					size := 2 + ((w + i + 1) % 4)
@@ -1622,15 +1590,6 @@ func TestConcurrentBatchWriters_ModelReplayConsistency(t *testing.T) {
 						errCh <- fmt.Errorf("writer=%d BatchPatch: %w", w, err)
 						return
 					}
-					opsMu.Lock()
-					logOp = append(logOp, batchOp{
-						seq:         seq.Add(1),
-						kind:        1,
-						ids:         slices.Clone(ids),
-						patchAge:    patchAge,
-						patchActive: patchActive,
-					})
-					opsMu.Unlock()
 
 				default: // BatchDelete
 					size := 1 + ((w + i + 2) % 4)
@@ -1639,13 +1598,6 @@ func TestConcurrentBatchWriters_ModelReplayConsistency(t *testing.T) {
 						errCh <- fmt.Errorf("writer=%d BatchDelete: %w", w, err)
 						return
 					}
-					opsMu.Lock()
-					logOp = append(logOp, batchOp{
-						seq:  seq.Add(1),
-						kind: 2,
-						ids:  slices.Clone(ids),
-					})
-					opsMu.Unlock()
 				}
 			}
 		}()
@@ -1663,47 +1615,33 @@ func TestConcurrentBatchWriters_ModelReplayConsistency(t *testing.T) {
 		t.FailNow()
 	}
 
-	opsMu.Lock()
-	ops := slices.Clone(logOp)
-	opsMu.Unlock()
-	sort.Slice(ops, func(i, j int) bool { return ops[i].seq < ops[j].seq })
-
-	expected := make(map[uint64]modelRec, idSpace)
-	allNames := make([]string, 0, len(ops)*3)
-	for _, op := range ops {
-		switch op.kind {
-		case 0:
-			for i, id := range op.ids {
-				expected[id] = op.setVals[i]
-				allNames = append(allNames, op.setVals[i].name)
-			}
-		case 1:
-			for _, id := range op.ids {
-				v, ok := expected[id]
-				if !ok {
-					continue
-				}
-				v.age = op.patchAge
-				v.active = op.patchActive
-				expected[id] = v
-			}
-		case 2:
-			for _, id := range op.ids {
-				delete(expected, id)
-			}
+	type liveRec struct {
+		name   string
+		age    int
+		active bool
+	}
+	live := make(map[uint64]liveRec, idSpace)
+	err := db.SeqScan(0, func(id uint64, rec *Rec) (bool, error) {
+		if rec == nil {
+			return false, fmt.Errorf("nil record for id=%d", id)
 		}
+		live[id] = liveRec{name: rec.Name, age: rec.Age, active: rec.Active}
+		return true, nil
+	})
+	if err != nil {
+		t.Fatalf("SeqScan: %v", err)
 	}
 
 	total, err := db.Count(nil)
 	if err != nil {
 		t.Fatalf("Count(nil): %v", err)
 	}
-	if total != uint64(len(expected)) {
-		t.Fatalf("count mismatch: got=%d want=%d", total, len(expected))
+	if total != uint64(len(live)) {
+		t.Fatalf("count mismatch: got=%d want=%d", total, len(live))
 	}
 
-	liveNames := make(map[string]uint64, len(expected))
-	for id, exp := range expected {
+	liveNames := make(map[string]uint64, len(live))
+	for id, exp := range live {
 		v, err := db.Get(id)
 		if err != nil {
 			t.Fatalf("Get(%d): %v", id, err)
@@ -1728,17 +1666,18 @@ func TestConcurrentBatchWriters_ModelReplayConsistency(t *testing.T) {
 		liveNames[exp.name] = id
 	}
 
-	staleChecked := 0
-	seenStale := make(map[string]struct{}, staleProbe*2)
-	for _, name := range allNames {
-		if _, live := liveNames[name]; live {
-			continue
+	checked := 0
+	historicNames.Range(func(k, _ any) bool {
+		if checked >= staleProbe {
+			return false
 		}
-		if _, dup := seenStale[name]; dup {
-			continue
+		name, ok := k.(string)
+		if !ok {
+			return true
 		}
-		seenStale[name] = struct{}{}
-
+		if _, stillLive := liveNames[name]; stillLive {
+			return true
+		}
 		ids, err := db.QueryKeys(qx.Query(qx.EQ("name", name)))
 		if err != nil {
 			t.Fatalf("QueryKeys(stale name=%q): %v", name, err)
@@ -1746,11 +1685,9 @@ func TestConcurrentBatchWriters_ModelReplayConsistency(t *testing.T) {
 		if len(ids) != 0 {
 			t.Fatalf("stale name %q still indexed: ids=%v", name, ids)
 		}
-		staleChecked++
-		if staleChecked >= staleProbe {
-			break
-		}
-	}
+		checked++
+		return true
+	})
 }
 
 func TestBatchConcurrentSingleOps_ModelReplayConsistency(t *testing.T) {
@@ -1760,13 +1697,13 @@ func TestBatchConcurrentSingleOps_ModelReplayConsistency(t *testing.T) {
 	})
 
 	const (
-		writers = 8
-		opsPerW = 220
-		idSpace = 96
+		writers    = 8
+		opsPerW    = 220
+		idSpace    = 96
+		staleProbe = 512
 	)
 
 	type op struct {
-		seq   uint64
 		kind  uint8 // 0=set, 1=patch_if_exists, 2=delete
 		id    uint64
 		rec   *Rec
@@ -1795,29 +1732,9 @@ func TestBatchConcurrentSingleOps_ModelReplayConsistency(t *testing.T) {
 		}
 		return out
 	}
-	applyPatch := func(dst *Rec, patch []Field) {
-		for _, f := range patch {
-			switch f.Name {
-			case "name":
-				dst.Name = f.Value.(string)
-			case "age":
-				dst.Age = f.Value.(int)
-			case "country":
-				dst.Country = f.Value.(string)
-			case "active":
-				dst.Active = f.Value.(bool)
-			case "score":
-				dst.Score = f.Value.(float64)
-			case "tags":
-				dst.Tags = slices.Clone(f.Value.([]string))
-			}
-		}
-	}
-
 	var (
 		logMu sync.Mutex
-		log   = make([]op, 0, writers*opsPerW)
-		seq   atomic.Uint64
+		logs  = make([]op, 0, writers*opsPerW)
 	)
 
 	errCh := make(chan error, writers)
@@ -1860,8 +1777,7 @@ func TestBatchConcurrentSingleOps_ModelReplayConsistency(t *testing.T) {
 						return
 					}
 					logMu.Lock()
-					log = append(log, op{
-						seq:  seq.Add(1),
+					logs = append(logs, op{
 						kind: 0,
 						id:   id,
 						rec:  cloneRec(rec),
@@ -1889,8 +1805,7 @@ func TestBatchConcurrentSingleOps_ModelReplayConsistency(t *testing.T) {
 						return
 					}
 					logMu.Lock()
-					log = append(log, op{
-						seq:   seq.Add(1),
+					logs = append(logs, op{
 						kind:  1,
 						id:    id,
 						patch: clonePatch(patch),
@@ -1903,8 +1818,7 @@ func TestBatchConcurrentSingleOps_ModelReplayConsistency(t *testing.T) {
 						return
 					}
 					logMu.Lock()
-					log = append(log, op{
-						seq:  seq.Add(1),
+					logs = append(logs, op{
 						kind: 2,
 						id:   id,
 					})
@@ -1935,34 +1849,113 @@ func TestBatchConcurrentSingleOps_ModelReplayConsistency(t *testing.T) {
 	}
 
 	logMu.Lock()
-	ops := slices.Clone(log)
+	ops := slices.Clone(logs)
 	logMu.Unlock()
-	sort.Slice(ops, func(i, j int) bool { return ops[i].seq < ops[j].seq })
 
-	expected := make(map[uint64]*Rec, idSpace)
+	type singleOpHistory struct {
+		names     map[string]struct{}
+		emails    map[string]struct{}
+		countries map[string]struct{}
+		ages      map[int]struct{}
+		scores    map[float64]struct{}
+		actives   map[bool]struct{}
+		tags      map[string]struct{}
+	}
+	getHistory := func(m map[uint64]*singleOpHistory, id uint64) *singleOpHistory {
+		h := m[id]
+		if h != nil {
+			return h
+		}
+		h = &singleOpHistory{
+			names:     make(map[string]struct{}),
+			emails:    make(map[string]struct{}),
+			countries: make(map[string]struct{}),
+			ages:      make(map[int]struct{}),
+			scores:    make(map[float64]struct{}),
+			actives:   make(map[bool]struct{}),
+			tags:      make(map[string]struct{}),
+		}
+		m[id] = h
+		return h
+	}
+
+	historyByID := make(map[uint64]*singleOpHistory, idSpace)
 	for _, o := range ops {
+		h := getHistory(historyByID, o.id)
 		switch o.kind {
 		case 0:
-			expected[o.id] = cloneRec(o.rec)
-		case 1:
-			cur := expected[o.id]
-			if cur == nil {
+			if o.rec == nil {
 				continue
 			}
-			cp := cloneRec(cur)
-			applyPatch(cp, o.patch)
-			expected[o.id] = cp
-		case 2:
-			delete(expected, o.id)
+			h.names[o.rec.Name] = struct{}{}
+			h.emails[o.rec.Email] = struct{}{}
+			h.countries[o.rec.Country] = struct{}{}
+			h.ages[o.rec.Age] = struct{}{}
+			h.scores[o.rec.Score] = struct{}{}
+			h.actives[o.rec.Active] = struct{}{}
+			for _, tag := range o.rec.Tags {
+				h.tags[tag] = struct{}{}
+			}
+		case 1:
+			for _, f := range o.patch {
+				switch f.Name {
+				case "name":
+					h.names[f.Value.(string)] = struct{}{}
+				case "email":
+					h.emails[f.Value.(string)] = struct{}{}
+				case "country":
+					h.countries[f.Value.(string)] = struct{}{}
+				case "age":
+					h.ages[f.Value.(int)] = struct{}{}
+				case "score":
+					h.scores[f.Value.(float64)] = struct{}{}
+				case "active":
+					h.actives[f.Value.(bool)] = struct{}{}
+				case "tags":
+					for _, tag := range f.Value.([]string) {
+						h.tags[tag] = struct{}{}
+					}
+				}
+			}
 		}
+	}
+
+	live := make(map[uint64]*Rec, idSpace)
+	scanErr := db.SeqScan(0, func(id uint64, rec *Rec) (bool, error) {
+		if rec == nil {
+			return false, fmt.Errorf("nil record for id=%d", id)
+		}
+		live[id] = cloneRec(rec)
+		return true, nil
+	})
+	if scanErr != nil {
+		t.Fatalf("SeqScan: %v", scanErr)
 	}
 
 	count, err := db.Count(nil)
 	if err != nil {
 		t.Fatalf("Count(nil): %v", err)
 	}
-	if count != uint64(len(expected)) {
-		t.Fatalf("count mismatch: got=%d want=%d", count, len(expected))
+	if count != uint64(len(live)) {
+		t.Fatalf("count mismatch: got=%d want=%d", count, len(live))
+	}
+
+	queryContainsID := func(q *qx.QX, id uint64) bool {
+		ids, qerr := db.QueryKeys(q)
+		if qerr != nil {
+			t.Fatalf("QueryKeys(%v): %v", q, qerr)
+		}
+		return slices.Contains(ids, id)
+	}
+	assertIndexContains := func(q *qx.QX, id uint64, desc string) {
+		if !queryContainsID(q, id) {
+			t.Fatalf("%s index missing id=%d", desc, id)
+		}
+	}
+	assertIndexOmits := func(q *qx.QX, id uint64, desc string) {
+		if queryContainsID(q, id) {
+			t.Fatalf("stale %s index still contains id=%d", desc, id)
+		}
 	}
 
 	for id := uint64(1); id <= idSpace; id++ {
@@ -1970,7 +1963,7 @@ func TestBatchConcurrentSingleOps_ModelReplayConsistency(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Get(%d): %v", id, err)
 		}
-		want := expected[id]
+		want := live[id]
 		switch {
 		case want == nil && got != nil:
 			t.Fatalf("id=%d expected nil, got %#v", id, got)
@@ -1983,18 +1976,100 @@ func TestBatchConcurrentSingleOps_ModelReplayConsistency(t *testing.T) {
 		}
 
 		fullName := fmt.Sprintf("ID-%03d", id)
-		ids, qerr := db.QueryKeys(qx.Query(qx.EQ("full_name", fullName)))
-		if qerr != nil {
-			t.Fatalf("QueryKeys(full_name=%q): %v", fullName, qerr)
-		}
 		if want == nil {
-			if len(ids) != 0 {
-				t.Fatalf("stale full_name index for id=%d: %v", id, ids)
+			assertIndexOmits(qx.Query(qx.EQ("full_name", fullName)), id, fmt.Sprintf("full_name=%q", fullName))
+			continue
+		}
+
+		assertIndexContains(qx.Query(qx.EQ("full_name", fullName)), id, fmt.Sprintf("full_name=%q", fullName))
+		assertIndexContains(qx.Query(qx.EQ("name", want.Name)), id, fmt.Sprintf("name=%q", want.Name))
+		assertIndexContains(qx.Query(qx.EQ("email", want.Email)), id, fmt.Sprintf("email=%q", want.Email))
+		assertIndexContains(qx.Query(qx.EQ("country", want.Country)), id, fmt.Sprintf("country=%q", want.Country))
+		assertIndexContains(qx.Query(qx.EQ("age", want.Age)), id, fmt.Sprintf("age=%d", want.Age))
+		assertIndexContains(qx.Query(qx.EQ("score", want.Score)), id, fmt.Sprintf("score=%v", want.Score))
+		assertIndexContains(qx.Query(qx.EQ("active", want.Active)), id, fmt.Sprintf("active=%v", want.Active))
+		for _, tag := range want.Tags {
+			assertIndexContains(qx.Query(qx.HAS("tags", []string{tag})), id, fmt.Sprintf("tag=%q", tag))
+		}
+	}
+
+	staleChecked := 0
+	for id := uint64(1); id <= idSpace && staleChecked < staleProbe; id++ {
+		h := historyByID[id]
+		if h == nil {
+			continue
+		}
+		cur := live[id]
+
+		for name := range h.names {
+			if staleChecked >= staleProbe {
+				break
 			}
-		} else {
-			if len(ids) != 1 || ids[0] != id {
-				t.Fatalf("full_name index mismatch for id=%d: got=%v", id, ids)
+			if cur != nil && cur.Name == name {
+				continue
 			}
+			assertIndexOmits(qx.Query(qx.EQ("name", name)), id, fmt.Sprintf("name=%q", name))
+			staleChecked++
+		}
+		for email := range h.emails {
+			if staleChecked >= staleProbe {
+				break
+			}
+			if cur != nil && cur.Email == email {
+				continue
+			}
+			assertIndexOmits(qx.Query(qx.EQ("email", email)), id, fmt.Sprintf("email=%q", email))
+			staleChecked++
+		}
+		for country := range h.countries {
+			if staleChecked >= staleProbe {
+				break
+			}
+			if cur != nil && cur.Country == country {
+				continue
+			}
+			assertIndexOmits(qx.Query(qx.EQ("country", country)), id, fmt.Sprintf("country=%q", country))
+			staleChecked++
+		}
+		for age := range h.ages {
+			if staleChecked >= staleProbe {
+				break
+			}
+			if cur != nil && cur.Age == age {
+				continue
+			}
+			assertIndexOmits(qx.Query(qx.EQ("age", age)), id, fmt.Sprintf("age=%d", age))
+			staleChecked++
+		}
+		for score := range h.scores {
+			if staleChecked >= staleProbe {
+				break
+			}
+			if cur != nil && cur.Score == score {
+				continue
+			}
+			assertIndexOmits(qx.Query(qx.EQ("score", score)), id, fmt.Sprintf("score=%v", score))
+			staleChecked++
+		}
+		for active := range h.actives {
+			if staleChecked >= staleProbe {
+				break
+			}
+			if cur != nil && cur.Active == active {
+				continue
+			}
+			assertIndexOmits(qx.Query(qx.EQ("active", active)), id, fmt.Sprintf("active=%v", active))
+			staleChecked++
+		}
+		for tag := range h.tags {
+			if staleChecked >= staleProbe {
+				break
+			}
+			if cur != nil && slices.Contains(cur.Tags, tag) {
+				continue
+			}
+			assertIndexOmits(qx.Query(qx.HAS("tags", []string{tag})), id, fmt.Sprintf("tag=%q", tag))
+			staleChecked++
 		}
 	}
 }

@@ -63,6 +63,7 @@ type ceilingSuitePlan struct {
 type ceilingFastBaseline struct {
 	Throughput float64
 	P99Us      float64
+	Source     string
 	Valid      bool
 }
 
@@ -82,6 +83,7 @@ type ceilingCounterSnapshot struct {
 	completed uint64
 	errors    uint64
 	inflight  int64
+	queueHigh uint64
 }
 
 type ceilingClassMetrics struct {
@@ -193,6 +195,7 @@ func (m *ceilingClassMetrics) snapshot() ceilingCounterSnapshot {
 		completed: m.completed.Load(),
 		errors:    m.errors.Load(),
 		inflight:  m.inflight.Load(),
+		queueHigh: m.queueHigh.Load(),
 	}
 }
 
@@ -513,6 +516,57 @@ func buildSingleClassStages(prefix, desc, className string, grid []float64) []ce
 	return stages
 }
 
+func formatTargetsMapForLog(m map[string]float64) string {
+	if len(m) == 0 {
+		return "-"
+	}
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	slices.Sort(keys)
+	parts := make([]string, 0, len(keys))
+	for _, k := range keys {
+		parts = append(parts, fmt.Sprintf("%s=%.0f/s", k, m[k]))
+	}
+	return strings.Join(parts, ", ")
+}
+
+func formatCeilingStageClassSummary(classes map[string]CeilingClassResult) string {
+	if len(classes) == 0 {
+		return "-"
+	}
+	keys := make([]string, 0, len(classes))
+	for k := range classes {
+		keys = append(keys, k)
+	}
+	slices.Sort(keys)
+	parts := make([]string, 0, len(keys))
+	for _, k := range keys {
+		cl := classes[k]
+		parts = append(parts, fmt.Sprintf(
+			"%s offer=%.0f/s done=%.0f/s q_end=%d sat=%t",
+			k,
+			cl.OfferedOpsPerSec,
+			cl.CompletedOpsPerSec,
+			cl.QueueDepthEnd,
+			cl.Saturated,
+		))
+	}
+	return strings.Join(parts, " | ")
+}
+
+func ceilingBaselineInfo(base ceilingFastBaseline) *CeilingBaselineInfo {
+	if !base.Valid || base.Throughput <= 0 {
+		return nil
+	}
+	return &CeilingBaselineInfo{
+		Throughput: base.Throughput,
+		P99Us:      base.P99Us,
+		Source:     base.Source,
+	}
+}
+
 func runCeilingStage(
 	ctx context.Context,
 	db *rbi.DB[uint64, UserBench],
@@ -525,6 +579,12 @@ func runCeilingStage(
 	withFastRegression bool,
 ) (CeilingStageResult, bool) {
 	startedAt := time.Now()
+	log.Printf(
+		"[ceiling stage=%s] start duration=%s targets={%s}",
+		plan.Name,
+		opts.ceilingStageDuration,
+		formatTargetsMapForLog(plan.Targets),
+	)
 	res := CeilingStageResult{
 		Name:             plan.Name,
 		Description:      plan.Description,
@@ -595,9 +655,11 @@ func runCeilingStage(
 	}
 
 	var ticker *time.Ticker
+	var tick <-chan time.Time
 	if opts.reportEvery > 0 {
 		ticker = time.NewTicker(opts.reportEvery)
 		defer ticker.Stop()
+		tick = ticker.C
 	}
 
 	for {
@@ -634,9 +696,18 @@ func runCeilingStage(
 				}
 			}
 
+			log.Printf(
+				"[ceiling stage=%s] done duration=%.2fs saturated=%t reasons=%s results={%s}",
+				plan.Name,
+				res.DurationSec,
+				res.Saturated,
+				emptyIfBlank(strings.Join(res.Reasons, ","), "-"),
+				formatCeilingStageClassSummary(res.Classes),
+			)
+
 			return res, ctx.Err() != nil
 
-		case <-ticker.C:
+		case <-tick:
 			now := time.Now()
 			deltaSec := now.Sub(prevAt).Seconds()
 			if deltaSec <= 0 {
@@ -647,13 +718,14 @@ func runCeilingStage(
 				cur := rt.M.snapshot()
 				last := prev[rt.Spec.Name]
 				parts = append(parts, fmt.Sprintf(
-					"%s tgt=%.0f off=%.0f comp=%.0f drop=%d q=%d in=%d",
+					"%s tgt=%.0f offer=%.0f done=%.0f drop=%d q=%d/%d in=%d",
 					rt.Spec.Name,
 					rt.Target,
 					float64(cur.offered-last.offered)/deltaSec,
 					float64(cur.completed-last.completed)/deltaSec,
 					cur.dropped-last.dropped,
 					len(rt.Queue),
+					cur.queueHigh,
 					cur.inflight,
 				))
 				prev[rt.Spec.Name] = cur
@@ -704,6 +776,7 @@ func deriveFastBaselineFromSuite(suite CeilingSuiteResult, opts benchOptions) ce
 	return ceilingFastBaseline{
 		Throughput: bestThroughput * opts.ceilingBaselineFraction,
 		P99Us:      bestP99,
+		Source:     "measured_read_fast_ceiling",
 		Valid:      true,
 	}
 }
@@ -898,12 +971,13 @@ func detectSweepKnee(points []ceilingSweepPoint) (int, string) {
 
 func buildCeilingSuiteSummary(suite CeilingSuiteResult) CeilingSuiteSummary {
 	summary := CeilingSuiteSummary{
-		Name:                   suite.Name,
-		Description:            suite.Description,
-		StageCount:             len(suite.Stages),
-		MaxCompletedOpsPerSec:  make(map[string]float64, 8),
-		MaxSafeTargetOpsPerSec: make(map[string]float64, 8),
-		FirstClassSaturation:   make(map[string]string, 8),
+		Name:                    suite.Name,
+		Description:             suite.Description,
+		StageCount:              len(suite.Stages),
+		MaxCompletedOpsPerSec:   make(map[string]float64, 8),
+		MaxSafeTargetOpsPerSec:  make(map[string]float64, 8),
+		MaxSafeOfferedOpsPerSec: make(map[string]float64, 8),
+		FirstClassSaturation:    make(map[string]string, 8),
 	}
 
 	summary.SweepClasses = suiteSweepClasses(suite)
@@ -932,6 +1006,9 @@ func buildCeilingSuiteSummary(suite CeilingSuiteResult) CeilingSuiteSummary {
 			if !classRes.Saturated {
 				if target := st.TargetsOpsPerSec[className]; target > summary.MaxSafeTargetOpsPerSec[className] {
 					summary.MaxSafeTargetOpsPerSec[className] = target
+				}
+				if classRes.OfferedOpsPerSec > summary.MaxSafeOfferedOpsPerSec[className] {
+					summary.MaxSafeOfferedOpsPerSec[className] = classRes.OfferedOpsPerSec
 				}
 			}
 			if classRes.Saturated && summary.FirstClassSaturation[className] == "" {
@@ -972,6 +1049,9 @@ func buildCeilingSuiteSummary(suite CeilingSuiteResult) CeilingSuiteSummary {
 	if len(summary.MaxSafeTargetOpsPerSec) == 0 {
 		summary.MaxSafeTargetOpsPerSec = nil
 	}
+	if len(summary.MaxSafeOfferedOpsPerSec) == 0 {
+		summary.MaxSafeOfferedOpsPerSec = nil
+	}
 	if len(summary.FirstClassSaturation) == 0 {
 		summary.FirstClassSaturation = nil
 	}
@@ -983,8 +1063,9 @@ func buildCeilingSummary(report *CeilingReport) *CeilingSummary {
 		return nil
 	}
 	s := &CeilingSummary{
-		GeneratedAt: time.Now().Format(time.RFC3339),
-		Suites:      make([]CeilingSuiteSummary, 0, len(report.Suites)),
+		GeneratedAt:      time.Now().Format(time.RFC3339),
+		FastReadBaseline: report.FastReadBaseline,
+		Suites:           make([]CeilingSuiteSummary, 0, len(report.Suites)),
 	}
 	for _, suite := range report.Suites {
 		s.Suites = append(s.Suites, buildCeilingSuiteSummary(suite))
@@ -1012,9 +1093,17 @@ func logCeilingSummary(summary *CeilingSummary) {
 	if summary == nil || len(summary.Suites) == 0 {
 		return
 	}
+	if summary.FastReadBaseline != nil {
+		log.Printf(
+			"[ceiling baseline] fast_read=%.0f/s source=%s p99=%.1fus",
+			summary.FastReadBaseline.Throughput,
+			emptyIfBlank(summary.FastReadBaseline.Source, "-"),
+			summary.FastReadBaseline.P99Us,
+		)
+	}
 	for _, suite := range summary.Suites {
 		log.Printf(
-			"[ceiling summary=%s] knee=%s class=%s reason=%s first_sat=%s first_fast_reg=%s safe={%s}",
+			"[ceiling summary=%s] knee=%s class=%s reason=%s first_sat=%s first_fast_reg=%s safe_target={%s} safe_offer={%s}",
 			suite.Name,
 			emptyIfBlank(suite.KneeStage, "-"),
 			emptyIfBlank(suite.KneeClass, "-"),
@@ -1022,6 +1111,7 @@ func logCeilingSummary(summary *CeilingSummary) {
 			emptyIfBlank(suite.FirstSaturationStage, "-"),
 			emptyIfBlank(suite.FirstFastReadRegressionStage, "-"),
 			formatOpsMapForLog(suite.MaxSafeTargetOpsPerSec),
+			formatOpsMapForLog(suite.MaxSafeOfferedOpsPerSec),
 		)
 	}
 }
@@ -1121,11 +1211,37 @@ func runCeiling(
 
 	if !baseline.Valid {
 		fallback := readFastGrid[0] * opts.ceilingBaselineFraction
-		baseline = ceilingFastBaseline{Throughput: fallback, Valid: true}
-		log.Printf("ceiling: fast-read baseline fallback=%.0f ops/s (read_fast_ceiling not available)", baseline.Throughput)
+		source := "configured_read_fast_grid_fallback"
+		if suiteAllowed(suiteFilter, "read_fast_ceiling") {
+			source = "configured_read_fast_grid_fallback_after_ceiling_miss"
+		}
+		baseline = ceilingFastBaseline{
+			Throughput: fallback,
+			Source:     source,
+			Valid:      true,
+		}
+		if source == "configured_read_fast_grid_fallback" {
+			log.Printf(
+				"ceiling: fast-read baseline=%.0f ops/s source=%s (read_fast_ceiling suite not run)",
+				baseline.Throughput,
+				source,
+			)
+		} else {
+			log.Printf(
+				"ceiling: fast-read baseline=%.0f ops/s source=%s (read_fast_ceiling produced no usable baseline)",
+				baseline.Throughput,
+				source,
+			)
+		}
 	} else {
-		log.Printf("ceiling: fast-read baseline=%.0f ops/s (p99=%.1fus)", baseline.Throughput, baseline.P99Us)
+		log.Printf(
+			"ceiling: fast-read baseline=%.0f ops/s source=%s (p99=%.1fus)",
+			baseline.Throughput,
+			baseline.Source,
+			baseline.P99Us,
+		)
 	}
+	out.FastReadBaseline = ceilingBaselineInfo(baseline)
 
 	if suiteAllowed(suiteFilter, "write_update_ceiling") {
 		plan := ceilingSuitePlan{

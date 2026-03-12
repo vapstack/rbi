@@ -84,7 +84,7 @@ func parseBenchOptions() benchOptions {
 	flag.StringVar(&opts.ceilingReadSlowGrid, "ceiling-read-slow-grid", DefaultCeilingReadSlowGrid, "ceiling: slow-read target ops/s grid (comma-separated)")
 	flag.StringVar(&opts.ceilingLowWriteGrid, "ceiling-low-write-grid", DefaultCeilingLowWriteGrid, "ceiling: low-write target ops/s grid (comma-separated)")
 	flag.Float64Var(&opts.ceilingMixedSlowOps, "ceiling-mixed-slow-ops", DefaultCeilingMixedSlowOps, "ceiling: fixed slow-read ops/s in mixed suite")
-	flag.Float64Var(&opts.ceilingBaselineFraction, "ceiling-baseline-fraction", DefaultCeilingBaselineFraction, "ceiling: fraction of discovered fast-read ceiling used as baseline")
+	flag.Float64Var(&opts.ceilingBaselineFraction, "ceiling-baseline-fraction", DefaultCeilingBaselineFraction, "ceiling: fraction of discovered fast-read ceiling, or of the first read-fast grid entry when the ceiling suite is skipped")
 	flag.Float64Var(&opts.ceilingMinThroughputRatio, "ceiling-min-throughput-ratio", DefaultCeilingMinThroughputRatio, "ceiling: minimal completed/offered ratio before saturation")
 	flag.Float64Var(&opts.ceilingRegressThroughputPct, "ceiling-regress-throughput-drop-pct", DefaultCeilingRegressionThroughputDrop, "ceiling: fast-read throughput drop pct considered regression")
 	flag.Float64Var(&opts.ceilingRegressP99Pct, "ceiling-regress-p99-increase-pct", DefaultCeilingRegressionP99Increase, "ceiling: fast-read p99 increase pct considered regression")
