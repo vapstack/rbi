@@ -11,6 +11,15 @@ func hasExecHooks[K ~string | ~uint64, V any](beforeStore []beforeStoreFunc[K, V
 	return len(beforeStore) > 0 || len(beforeCommit) > 0
 }
 
+func runBeforeProcessHooks[K ~string | ~uint64, V any](id K, newVal *V, hooks []beforeProcessFunc[K, V]) error {
+	for _, fn := range hooks {
+		if err := fn(id, newVal); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func runBeforeStoreHooks[K ~string | ~uint64, V any](id K, oldVal, newVal *V, hooks []beforeStoreFunc[K, V]) error {
 	for _, fn := range hooks {
 		if err := fn(id, oldVal, newVal); err != nil {
@@ -306,6 +315,9 @@ func (db *DB[K, V]) SeqScanRaw(seek K, fn func(K, []byte) (bool, error)) error {
 
 // Set stores the given value under the specified key ID.
 //
+// BeforeProcess hooks, if any, run on the caller-owned input value before RBI
+// starts encoding, cloning, queueing, or transactional work for Set.
+//
 // The value is msgpack-encoded and written inside a single write
 // transaction. Any existing value for the key is decoded and passed as oldValue
 // to BeforeStore and BeforeCommit hooks. BeforeStore may modify the stored
@@ -316,16 +328,18 @@ func (db *DB[K, V]) SeqScanRaw(seek K, fn func(K, []byte) (bool, error)) error {
 // independent copy more cheaply than msgpack snapshotting. If any hook returns
 // an error, the transaction is rolled back and the error is returned.
 func (db *DB[K, V]) Set(id K, newVal *V, execOpts ...ExecOption[K, V]) error {
-	if err := db.beginOp(); err != nil {
-		return err
-	}
-	defer db.endOp()
-
 	if newVal == nil {
 		return ErrNilValue
 	}
 
 	cfg := db.resolveExecOptions(execOpts)
+	if err := runBeforeProcessHooks(id, newVal, cfg.beforeProcess); err != nil {
+		return err
+	}
+	if err := db.beginOp(); err != nil {
+		return err
+	}
+	defer db.endOp()
 	var err error
 
 	if db.combiner.enabled {
@@ -449,6 +463,9 @@ func (db *DB[K, V]) Set(id K, newVal *V, execOpts ...ExecOption[K, V]) error {
 // BatchSet stores multiple values under the provided IDs in a single write
 // transaction. The length of the ids and values must be equal.
 //
+// BeforeProcess hooks, if any, run on each caller-owned input value before RBI
+// starts encoding, cloning, queueing, or transactional work for BatchSet.
+//
 // For each key, any existing value is decoded and passed as oldValue to all
 // configured BeforeStore and BeforeCommit hooks. If an error is encountered during any of
 // the processing steps, the transaction is rolled back and the error is returned.
@@ -472,10 +489,6 @@ func (db *DB[K, V]) BatchSet(ids []K, newVals []*V, execOpts ...ExecOption[K, V]
 	if len(ids) == 1 {
 		return db.Set(ids[0], newVals[0], execOpts...)
 	}
-	if err := db.beginOp(); err != nil {
-		return err
-	}
-	defer db.endOp()
 
 	for i := range newVals {
 		if newVals[i] == nil {
@@ -484,6 +497,15 @@ func (db *DB[K, V]) BatchSet(ids []K, newVals []*V, execOpts ...ExecOption[K, V]
 	}
 
 	cfg := db.resolveExecOptions(execOpts)
+	for i := range newVals {
+		if err := runBeforeProcessHooks(ids[i], newVals[i], cfg.beforeProcess); err != nil {
+			return err
+		}
+	}
+	if err := db.beginOp(); err != nil {
+		return err
+	}
+	defer db.endOp()
 	var err error
 
 	var getbuf func() *bytes.Buffer
@@ -674,6 +696,9 @@ func (db *DB[K, V]) BatchSet(ids []K, newVals []*V, execOpts ...ExecOption[K, V]
 // If no item is found for the specified id, Patch is a no-op and callbacks are
 // not invoked.
 //
+// BeforeProcess hooks, if any, run on the mutable post-patch working copy
+// before BeforeStore and BeforeCommit.
+//
 // All configured BeforeStore and BeforeCommit hooks are invoked with the
 // original (old) and final (new) values before commit. After a successful
 // commit, the in-memory index is updated.
@@ -694,7 +719,7 @@ func (db *DB[K, V]) patch(id K, fields []Field, execOpts ...ExecOption[K, V]) er
 	cfg := db.resolveExecOptions(execOpts)
 	ignoreUnknown := !cfg.patchStrict
 	if db.combiner.enabled {
-		if err, handled := db.tryQueuePatchCombine(id, fields, ignoreUnknown, cfg.beforeStore, cfg.beforeCommit); handled {
+		if err, handled := db.tryQueuePatchCombine(id, fields, ignoreUnknown, cfg.beforeProcess, cfg.beforeStore, cfg.beforeCommit); handled {
 			return err
 		}
 	}
@@ -730,6 +755,9 @@ func (db *DB[K, V]) patch(id K, fields []Field, execOpts ...ExecOption[K, V]) er
 
 	if err = db.applyPatch(newVal, fields, ignoreUnknown); err != nil {
 		return fmt.Errorf("failed to apply patch: %w", err)
+	}
+	if err = runBeforeProcessHooks(id, newVal, cfg.beforeProcess); err != nil {
+		return err
 	}
 
 	if err = runBeforeStoreHooks(id, oldVal, newVal, cfg.beforeStore); err != nil {
@@ -884,6 +912,9 @@ func (db *DB[K, V]) batchPatch(ids []K, patch []Field, execOpts ...ExecOption[K,
 
 		if err = db.applyPatch(newVal, patch, ignoreUnknown); err != nil {
 			return fmt.Errorf("failed to apply patch for id %v: %w", id, err)
+		}
+		if err = runBeforeProcessHooks(id, newVal, cfg.beforeProcess); err != nil {
+			return err
 		}
 
 		if err = runBeforeStoreHooks(id, oldVal, newVal, cfg.beforeStore); err != nil {

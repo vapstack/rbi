@@ -2977,6 +2977,11 @@ func TestNew_DefaultExecOptions_ApplyToWrites(t *testing.T) {
 		raw,
 		Options{BatchMax: 1},
 		PatchStrict,
+		BeforeProcess(func(_ uint64, value *Rec) error {
+			value.Name = "pre-" + value.Name
+			value.Country = "US"
+			return nil
+		}),
 		BeforeStore(func(_ uint64, _ *Rec, newValue *Rec) error {
 			newValue.Age++
 			return nil
@@ -3011,8 +3016,21 @@ func TestNew_DefaultExecOptions_ApplyToWrites(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Get(1): %v", err)
 	}
-	if v == nil || v.Name != "alice" || v.Age != 31 {
+	if v == nil || v.Name != "pre-alice" || v.Age != 31 {
 		t.Fatalf("unexpected stored value: %#v", v)
+	}
+
+	err = db.Patch(1, []Field{{Name: "country", Value: "CA"}})
+	if err != nil {
+		t.Fatalf("Patch with default BeforeProcess: %v", err)
+	}
+
+	v, err = db.Get(1)
+	if err != nil {
+		t.Fatalf("Get(1) after Patch: %v", err)
+	}
+	if v == nil || v.Country != "US" {
+		t.Fatalf("expected Patch to inherit default BeforeProcess, got %#v", v)
 	}
 
 	err = db.Patch(1, []Field{{Name: "does_not_exist", Value: 1}})

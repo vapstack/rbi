@@ -441,6 +441,65 @@ func TestBatch_DuplicatePatchSameID_BeforeStoreOnUniqueDBCutsBatch(t *testing.T)
 	}
 }
 
+func TestBatch_DuplicatePatchSameID_BeforeProcessOnUniqueDBCutsBatch(t *testing.T) {
+	db, _ := openTempDBUint64Unique(t, Options{
+		BatchWindow:         5 * time.Millisecond,
+		BatchMax:            16,
+		BatchMaxQueue:       64,
+		BatchAllowCallbacks: true,
+	})
+
+	cb := func(_ uint64, newValue *UniqueTestRec) error {
+		newValue.Email = "mutated@x"
+		return nil
+	}
+
+	req1 := &combineRequest[uint64, UniqueTestRec]{
+		op:                 combinePatch,
+		id:                 1,
+		patch:              []Field{{Name: "tags", Value: []string{"x"}}},
+		patchIgnoreUnknown: true,
+		beforeProcess:      []beforeProcessFunc[uint64, UniqueTestRec]{cb},
+		done:               make(chan error, 1),
+	}
+	req2 := &combineRequest[uint64, UniqueTestRec]{
+		op:                 combinePatch,
+		id:                 1,
+		patch:              []Field{{Name: "tags", Value: []string{"y"}}},
+		patchIgnoreUnknown: true,
+		beforeProcess:      []beforeProcessFunc[uint64, UniqueTestRec]{cb},
+		done:               make(chan error, 1),
+	}
+	req3 := &combineRequest[uint64, UniqueTestRec]{
+		op:                 combinePatch,
+		id:                 2,
+		patch:              []Field{{Name: "email", Value: "other@x"}},
+		patchIgnoreUnknown: true,
+		done:               make(chan error, 1),
+	}
+
+	db.combiner.mu.Lock()
+	db.combiner.window = 0
+	db.combiner.maxOps = 16
+	db.combiner.running = true
+	db.combiner.queue = []*combineRequest[uint64, UniqueTestRec]{req1, req2, req3}
+	db.combiner.mu.Unlock()
+
+	batch := db.popCombinedBatch()
+	if len(batch) != 1 {
+		t.Fatalf("expected BeforeProcess-bearing repeated same-id patch to cut batch on unique DB, got=%d", len(batch))
+	}
+	if batch[0] != req1 {
+		t.Fatalf("expected first request to stay alone in batch")
+	}
+
+	db.combiner.mu.Lock()
+	defer db.combiner.mu.Unlock()
+	if len(db.combiner.queue) != 2 || db.combiner.queue[0] != req2 || db.combiner.queue[1] != req3 {
+		t.Fatalf("expected remaining requests to stay queued in order, queue=%+v", db.combiner.queue)
+	}
+}
+
 func TestBatch_SetDeleteSameID_CoalescedToLastWrite(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
 		BatchWindow:   5 * time.Millisecond,

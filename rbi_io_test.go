@@ -161,6 +161,92 @@ func TestBeforeStore_Patch_MutatesFinalStoredValue(t *testing.T) {
 	}
 }
 
+func TestBeforeProcess_Set_MutatesCallerOwnedValue(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{BatchMax: 1})
+
+	input := &Rec{Name: "alice", Age: 10, Meta: Meta{Country: "NL"}}
+	calls := 0
+	err := db.Set(1, input, BeforeProcess(func(key uint64, value *Rec) error {
+		calls++
+		if key != 1 {
+			t.Fatalf("unexpected key: %d", key)
+		}
+		value.Name = "alice-before-insert"
+		value.Country = "US"
+		value.Age++
+		return nil
+	}))
+	if err != nil {
+		t.Fatalf("Set with BeforeProcess: %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("expected BeforeProcess to run once, got %d", calls)
+	}
+	if input.Name != "alice-before-insert" || input.Country != "US" || input.Age != 11 {
+		t.Fatalf("expected caller-owned value to be mutated in place, got %#v", input)
+	}
+
+	got, err := db.Get(1)
+	if err != nil {
+		t.Fatalf("Get(1): %v", err)
+	}
+	if got == nil || got.Name != "alice-before-insert" || got.Country != "US" || got.Age != 11 {
+		t.Fatalf("unexpected stored value: %#v", got)
+	}
+}
+
+func TestBeforeProcess_Patch_MutatesFinalStoredValue(t *testing.T) {
+	db, _ := openTempDBUint64(t)
+
+	if err := db.Set(1, &Rec{Name: "alice", Age: 10, Meta: Meta{Country: "NL"}}); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+
+	calls := 0
+	err := db.Patch(1, []Field{{Name: "age", Value: 20}}, BeforeProcess(func(key uint64, newValue *Rec) error {
+		calls++
+		if key != 1 {
+			t.Fatalf("unexpected key: %d", key)
+		}
+		if newValue == nil || newValue.Age != 20 {
+			t.Fatalf("unexpected patched value before BeforeProcess mutation: %#v", newValue)
+		}
+		newValue.Country = "US"
+		newValue.Name = "alice-updated"
+		return nil
+	}))
+	if err != nil {
+		t.Fatalf("Patch with BeforeProcess: %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("expected BeforeProcess to run once, got %d", calls)
+	}
+
+	v, err := db.Get(1)
+	if err != nil {
+		t.Fatalf("Get(1): %v", err)
+	}
+	if v == nil || v.Name != "alice-updated" || v.Age != 20 || v.Country != "US" {
+		t.Fatalf("unexpected stored value: %#v", v)
+	}
+}
+
+func TestBeforeProcess_MissingPatch_IsNoOp(t *testing.T) {
+	db, _ := openTempDBUint64(t)
+
+	calls := 0
+	err := db.Patch(42, []Field{{Name: "age", Value: 99}}, BeforeProcess(func(_ uint64, _ *Rec) error {
+		calls++
+		return nil
+	}))
+	if err != nil {
+		t.Fatalf("Patch(missing): %v", err)
+	}
+	if calls != 0 {
+		t.Fatalf("expected BeforeProcess not to run for missing Patch target, got %d", calls)
+	}
+}
+
 func TestBeforeStore_BatchSet_SharedPointerUsesIndependentWorkingCopies(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{BatchMax: 1})
 

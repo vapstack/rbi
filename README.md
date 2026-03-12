@@ -16,10 +16,10 @@ Indexes are kept fully in memory and built on top of
 
 ### Properties
 
-* **ACID** – data durability is delegated to bbolt.
-* **Index-only filtering** – disk is never touched.
-* **Document-oriented** – queries return whole records, not individual fields.
-* **Strong typing** – generic API with user-defined key and value types.
+* ACID – data durability is delegated to bbolt.
+* Index-only filtering – disk is never touched.
+* Document-oriented – queries return whole records, not individual fields.
+* Strong typing – generic API with user-defined key and value types.
 
 ### Features
 
@@ -240,6 +240,10 @@ passed to `New` to become defaults for the whole DB instance.
 
 Available hooks/options:
 
+- `BeforeProcess` - cheap mutable pre-processing hook.
+  For `Set`/`BatchSet` it runs on the caller-owned value before RBI starts
+  encoding or batching; for `Patch`/`BatchPatch` it runs on the mutable
+  post-patch value before `BeforeStore`.
 - `BeforeStore` - runs for inserts and updates before RBI encodes the final value.
   It may modify `newValue`.
 - `BeforeCommit` - runs inside the Bolt write transaction after the record
@@ -252,10 +256,18 @@ Available hooks/options:
 
 Important notes:
 
+- `BeforeProcess` may run at different stages depending on the write method.
+  Do not retain the value pointer after the hook returns.
+- For `Set`/`BatchSet`, `BeforeProcess` mutates the caller-owned value
+  directly. RBI does not protect against aliasing or restore the value if the
+  later write fails.
+- `BeforeProcess` is treated as value preparation; by itself it does not make
+  a write bypass the micro-batcher when `BatchAllowCallbacks=false`.
 - When `BatchAllowCallbacks` is `false`, writes with `BeforeStore` or
   `BeforeCommit` bypass the micro-batcher and run directly.
-- Under batching/retry, hooks may run more than once for the same logical write,
-  so external side effects should be idempotent.
+- Under batching/retry, `BeforeProcess` on `Patch`/`BatchPatch`,
+  `BeforeStore`, and `BeforeCommit` may run more than once for the same
+  logical write, so external side effects should be idempotent.
 - `BeforeCommit` must not modify the bucket managed by RBI itself.
 
 ## Ordering Limitations
@@ -304,7 +316,7 @@ enforces a uniqueness constraint for that field.
 * Uniqueness is enforced across single and batch writes (`Set`, `Patch*`, `BatchSet`, `BatchPatch*`).
 * Violations return `ErrUniqueViolation` before committing the transaction.
 
-## Custom Indexing with `ValueIndexer`
+## Custom indexing with `ValueIndexer`
 
 Scalar values and slices of scalars are indexed by default.
 Custom types may implement:
@@ -325,7 +337,7 @@ The returned value is used as the indexed representation.
 
 > Incorrect implementations may cause panics or undefined query behavior.
 
-## Patch Resolution Rules
+## Patch resolution rules
 
 `Patch` accepts string field identifiers and resolves them in the following order:
 1. Struct field name
@@ -350,7 +362,7 @@ type User struct {
 }
 ```
 
-## Index Persistence and Recovery
+## Index persistence and recovery
 
 Indexes are persisted only on `Close`.
 
@@ -361,7 +373,7 @@ built from and is loaded only when the current bucket sequence matches.
 After a successful `Close`, a fresh `.rbi` file is written from the current
 in-memory snapshot and can be reused on the next open.
 
-## Memory Usage
+## Memory usage
 
 All secondary indexes are kept in memory.\
 Memory usage is roughly proportional to:
@@ -381,7 +393,7 @@ compaction/cleanup.
 
 Careful index and snapshot configuration is recommended for large datasets.
 
-## Multiple Instances
+## Multiple instances
 
 Multiple `DB` instances may safely operate on the same bbolt database.\
 Each instance maintains its own in-memory index.

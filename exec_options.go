@@ -4,18 +4,61 @@ import "go.etcd.io/bbolt"
 
 type beforeStoreFunc[K ~string | ~uint64, V any] = func(key K, oldValue, newValue *V) error
 type beforeCommitFunc[K ~string | ~uint64, V any] = func(tx *bbolt.Tx, key K, oldValue, newValue *V) error
+type beforeProcessFunc[K ~string | ~uint64, V any] = func(key K, value *V) error
 
 type execOptions[K ~string | ~uint64, V any] struct {
-	beforeStore  []beforeStoreFunc[K, V]
-	beforeCommit []beforeCommitFunc[K, V]
-	cloneValue   func(K, *V) *V
-	patchStrict  bool
+	beforeProcess []beforeProcessFunc[K, V]
+	beforeStore   []beforeStoreFunc[K, V]
+	beforeCommit  []beforeCommitFunc[K, V]
+	cloneValue    func(K, *V) *V
+	patchStrict   bool
 }
 
 // ExecOption configures execution behavior for a write operation.
 //
 // Different write methods may honor different options.
 type ExecOption[K ~string | ~uint64, V any] func(*execOptions[K, V])
+
+// BeforeProcess registers a lightweight pre-processing callback for Set,
+// BatchSet, Patch, and BatchPatch.
+//
+// BeforeProcess runs wherever RBI first has a mutable value available:
+//   - For Set/BatchSet it runs on the caller-owned input value before RBI
+//     performs encoding, cloning, queueing, or transactional work.
+//   - For Patch/BatchPatch it runs on the mutable post-patch working copy
+//     after RBI applies the patch and before BeforeStore/BeforeCommit.
+//
+// BeforeProcess:
+//   - Receives only the key and mutable input value.
+//   - May modify the value in place.
+//   - May return an error to abort the operation.
+//   - Must not retain the value pointer after it returns, because the pointer
+//     may refer either to caller-owned input (Set/BatchSet) or to an
+//     RBI-owned working copy (Patch/BatchPatch).
+//   - For Set/BatchSet, the caller must avoid concurrent mutations of the same
+//     value until the write returns.
+//   - For Patch/BatchPatch, the hook may be invoked more than once for the
+//     same logical operation when the micro-batcher retries a request.
+//   - Is ignored by Delete and BatchDelete.
+//
+// Because BeforeProcess may run on caller-owned values for Set/BatchSet, RBI
+// does not protect against aliasing, repeated pointers inside BatchSet, or
+// mutations remaining visible to the caller after a later write failure. Use
+// BeforeStore when isolation or oldValue access is required.
+//
+// BeforeProcess is part of value preparation and does not, by itself, force a
+// write to bypass the micro-batcher when BatchAllowCallbacks is false.
+//
+// BeforeProcess may be passed more than once. Hooks passed to New are invoked
+// before per-operation hooks.
+func BeforeProcess[K ~string | ~uint64, V any](fn func(key K, value *V) error) ExecOption[K, V] {
+	return func(cfg *execOptions[K, V]) {
+		if cfg == nil || fn == nil {
+			return
+		}
+		cfg.beforeProcess = append(cfg.beforeProcess, fn)
+	}
+}
 
 // BeforeStore registers a callback invoked for every insert or update just
 // before RBI starts processing the value for storage and index maintenance.
@@ -132,6 +175,10 @@ func applyExecOptions[K ~string | ~uint64, V any](cfg *execOptions[K, V], opts [
 }
 
 func freezeExecOptions[K ~string | ~uint64, V any](cfg execOptions[K, V]) execOptions[K, V] {
+	if len(cfg.beforeProcess) > 0 {
+		cfg.beforeProcess = append([]beforeProcessFunc[K, V](nil), cfg.beforeProcess...)
+		cfg.beforeProcess = cfg.beforeProcess[:len(cfg.beforeProcess):len(cfg.beforeProcess)]
+	}
 	if len(cfg.beforeStore) > 0 {
 		cfg.beforeStore = append([]beforeStoreFunc[K, V](nil), cfg.beforeStore...)
 		cfg.beforeStore = cfg.beforeStore[:len(cfg.beforeStore):len(cfg.beforeStore)]

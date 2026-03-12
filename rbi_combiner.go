@@ -26,9 +26,10 @@ type combineRequest[K ~string | ~uint64, V any] struct {
 	patch              []Field
 	patchIgnoreUnknown bool
 
-	beforeStore  []beforeStoreFunc[K, V]
-	beforeCommit []beforeCommitFunc[K, V]
-	cloneValue   func(K, *V) *V
+	beforeProcess []beforeProcessFunc[K, V]
+	beforeStore   []beforeStoreFunc[K, V]
+	beforeCommit  []beforeCommitFunc[K, V]
+	cloneValue    func(K, *V) *V
 
 	coalescedTo *combineRequest[K, V]
 
@@ -124,7 +125,7 @@ func (db *DB[K, V]) tryQueueSetCombine(id K, newVal *V, beforeStore []beforeStor
 	return db.submitCombinedBatch(req)
 }
 
-func (db *DB[K, V]) tryQueuePatchCombine(id K, fields []Field, ignoreUnknown bool, beforeStore []beforeStoreFunc[K, V], beforeCommit []beforeCommitFunc[K, V]) (error, bool) {
+func (db *DB[K, V]) tryQueuePatchCombine(id K, fields []Field, ignoreUnknown bool, beforeProcess []beforeProcessFunc[K, V], beforeStore []beforeStoreFunc[K, V], beforeCommit []beforeCommitFunc[K, V]) (error, bool) {
 	if !db.combiner.enabled {
 		db.combiner.fallbackDisabled.Add(1)
 		return nil, false
@@ -143,6 +144,7 @@ func (db *DB[K, V]) tryQueuePatchCombine(id K, fields []Field, ignoreUnknown boo
 		id:                 id,
 		patch:              append([]Field(nil), fields...),
 		patchIgnoreUnknown: ignoreUnknown,
+		beforeProcess:      beforeProcess,
 		beforeStore:        beforeStore,
 		beforeCommit:       beforeCommit,
 		done:               make(chan error, 1),
@@ -336,7 +338,7 @@ func (db *DB[K, V]) canBatchRepeatedID(req *combineRequest[K, V]) bool {
 	case combineDelete:
 		return true
 	case combinePatch:
-		if db.hasUnique && len(req.beforeStore) > 0 {
+		if db.hasUnique && (len(req.beforeProcess) > 0 || len(req.beforeStore) > 0) {
 			return false
 		}
 		if !db.hasUnique {
@@ -594,6 +596,12 @@ func (db *DB[K, V]) executeCombinedBatchAttempt(active []*combineRequest[K, V]) 
 			if patchErr := db.applyPatch(newVal, req.patch, req.patchIgnoreUnknown); patchErr != nil {
 				req.err = fmt.Errorf("failed to apply patch: %w", patchErr)
 				continue
+			}
+			if len(req.beforeProcess) > 0 {
+				if hookErr := runBeforeProcessHooks(req.id, newVal, req.beforeProcess); hookErr != nil {
+					req.err = hookErr
+					continue
+				}
 			}
 
 			if len(req.beforeStore) > 0 {
