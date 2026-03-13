@@ -88,10 +88,11 @@ func TestSnapshotTxID_PreviousTxRemainsPinable(t *testing.T) {
 		t.Fatalf("latest txID did not advance: old=%d latest=%d", oldTxID, latest)
 	}
 
-	if _, ok := db.pinByTxID(oldTxID); !ok {
+	if _, ref, ok := db.pinSnapshotRefByTxID(oldTxID); !ok {
 		t.Fatalf("previous snapshot disappeared: txID=%d", oldTxID)
+	} else {
+		db.unpinSnapshotRef(ref)
 	}
-	db.unpinByTxID(oldTxID)
 }
 
 func TestSnapshotTxID_AdvancesOnWrite(t *testing.T) {
@@ -984,7 +985,8 @@ func TestSnapshotCompactor_IdlePrunesAfterPinnedSnapshotReleased(t *testing.T) {
 		t.Fatalf("Set #1: %v", err)
 	}
 	pinnedTx := db.getSnapshot().txID
-	if _, ok := db.pinByTxID(pinnedTx); !ok {
+	_, ref, ok := db.pinSnapshotRefByTxID(pinnedTx)
+	if !ok {
 		t.Fatalf("pinByTxID(%d) failed", pinnedTx)
 	}
 
@@ -995,8 +997,7 @@ func TestSnapshotCompactor_IdlePrunesAfterPinnedSnapshotReleased(t *testing.T) {
 	waitForSnapshotState(t, 700*time.Millisecond, "force pass observed pinned snapshot", func() bool {
 		return db.snapshot.compactPinsBlocked.Load()
 	})
-
-	db.unpinByTxID(pinnedTx)
+	db.unpinSnapshotRef(ref)
 
 	waitForSnapshotState(t, 700*time.Millisecond, "registry pruned after pinned release", func() bool {
 		db.snapshot.mu.RLock()
@@ -1080,7 +1081,7 @@ func TestPinSnapshotByTxIDWait_FailsFastWhenLatestPassedTarget(t *testing.T) {
 	db.snapshot.mu.Unlock()
 
 	start := time.Now()
-	snap, ok := db.pinByTxIDWait(targetTx)
+	snap, _, ok := db.pinSnapshotRefByTxIDWait(targetTx)
 	elapsed := time.Since(start)
 	if ok || snap != nil {
 		t.Fatalf("expected pin wait to fail for missing old txID=%d", targetTx)
@@ -1265,7 +1266,7 @@ func TestPinSnapshotByTxIDWait_FailsFastWhenTargetAheadAndNotPending(t *testing.
 	target := latest + 100
 
 	start := time.Now()
-	snap, ok := db.pinByTxIDWait(target)
+	snap, _, ok := db.pinSnapshotRefByTxIDWait(target)
 	elapsed := time.Since(start)
 	if ok || snap != nil {
 		t.Fatalf("expected fast fail for non-pending future txID=%d", target)
@@ -1292,11 +1293,11 @@ func TestPinSnapshotByTxIDWait_WaitsForPendingAndSucceeds(t *testing.T) {
 		close(done)
 	}()
 
-	snap, ok := db.pinByTxIDWait(target)
+	snap, ref, ok := db.pinSnapshotRefByTxIDWait(target)
 	if !ok || snap == nil {
 		t.Fatalf("expected pending txID pin to succeed")
 	}
-	db.unpinByTxID(target)
+	db.unpinSnapshotRef(ref)
 	<-done
 }
 
@@ -1312,7 +1313,7 @@ func TestPinSnapshotByTxIDWait_FailsFastWhenLatestEqualsTargetButRegistryMissing
 	db.snapshot.mu.Unlock()
 
 	start := time.Now()
-	snap, ok := db.pinByTxIDWait(target)
+	snap, _, ok := db.pinSnapshotRefByTxIDWait(target)
 	elapsed := time.Since(start)
 	if ok || snap != nil {
 		t.Fatalf("expected fast fail for missing current txID=%d", target)
@@ -1331,10 +1332,11 @@ func TestSnapshotRegistry_PrunesPastPinnedHead(t *testing.T) {
 		t.Fatalf("seed Set: %v", err)
 	}
 	pinnedTx := db.getSnapshot().txID
-	if _, ok := db.pinByTxID(pinnedTx); !ok {
+	if _, ref, ok := db.pinSnapshotRefByTxID(pinnedTx); !ok {
 		t.Fatalf("failed to pin snapshot txID=%d", pinnedTx)
+	} else {
+		defer db.unpinSnapshotRef(ref)
 	}
-	defer db.unpinByTxID(pinnedTx)
 
 	for i := 2; i <= 220; i++ {
 		if err := db.Set(uint64(i), &Rec{Name: "u", Age: i}); err != nil {

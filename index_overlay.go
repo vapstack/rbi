@@ -1142,7 +1142,7 @@ func (s *mutableDeltaSide) bmOrNil() *roaring64.Bitmap {
 }
 
 func neutralizeMutableDeltaSides(add, del *mutableDeltaSide) {
-	if add == nil || del == nil || !add.hasData() || !del.hasData() {
+	if !add.hasData() || !del.hasData() {
 		return
 	}
 
@@ -1163,7 +1163,7 @@ func neutralizeMutableDeltaSides(add, del *mutableDeltaSide) {
 		common := getRoaringBuf()
 		common.Or(add.bm)
 		common.And(del.bm)
-		if common != nil && !common.IsEmpty() {
+		if !common.IsEmpty() {
 			add.bm.AndNot(common)
 			del.bm.AndNot(common)
 		}

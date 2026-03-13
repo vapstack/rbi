@@ -61,7 +61,7 @@ type combinedBatchState[K ~string | ~uint64, V any] struct {
 }
 
 func rollbackCreatedStrIdxIfNeeded[K ~string | ~uint64, V any](db *DB[K, V], op combinedBatchPrepared[K, V]) {
-	if db == nil || !db.strkey {
+	if !db.strkey {
 		return
 	}
 	if !op.idxNew || op.oldVal != nil || op.newVal == nil {
@@ -163,19 +163,10 @@ func (db *DB[K, V]) tryQueueDeleteCombine(id K, beforeCommit []beforeCommitFunc[
 }
 
 func (db *DB[K, V]) submitCombinedBatch(req *combineRequest[K, V]) (error, bool) {
-	if !db.combiner.enabled {
-		db.combiner.fallbackDisabled.Add(1)
-		return nil, false
-	}
 	db.combiner.submitted.Add(1)
 
 	startRunner := false
 	db.combiner.mu.Lock()
-	if !db.combiner.enabled {
-		db.combiner.mu.Unlock()
-		db.combiner.fallbackDisabled.Add(1)
-		return nil, false
-	}
 	if db.combiner.maxQ > 0 && len(db.combiner.queue) >= db.combiner.maxQ {
 		db.combiner.mu.Unlock()
 		db.combiner.fallbackQueueFull.Add(1)
@@ -288,14 +279,14 @@ func (db *DB[K, V]) popCombinedBatch() []*combineRequest[K, V] {
 }
 
 func canCoalesceSetDelete[K ~string | ~uint64, V any](req *combineRequest[K, V]) bool {
-	if req == nil || req.coalescedTo != nil || hasExecHooks(req.beforeStore, req.beforeCommit) {
+	if req.coalescedTo != nil || hasExecHooks(req.beforeStore, req.beforeCommit) {
 		return false
 	}
 	return req.op == combineSet || req.op == combineDelete
 }
 
 func (db *DB[K, V]) canBatchRepeatedID(req *combineRequest[K, V]) bool {
-	if req == nil || req.coalescedTo != nil {
+	if req.coalescedTo != nil {
 		return false
 	}
 	switch req.op {
@@ -387,9 +378,17 @@ func (db *DB[K, V]) executeCombinedBatch(batch []*combineRequest[K, V]) {
 			return
 		}
 
-		prevN := len(active)
-		active = removeCombineRequestByPtr(active, retryWithoutReq)
-		if len(active) == prevN {
+		out := active[:0]
+		removed := false
+		for _, req := range active {
+			if !removed && req == retryWithoutReq {
+				removed = true
+				continue
+			}
+			out = append(out, req)
+		}
+		active = out
+		if !removed {
 			db.failCombinedBatch(batch, fmt.Errorf("internal batch retry error: failed request not found"))
 			return
 		}
@@ -397,7 +396,11 @@ func (db *DB[K, V]) executeCombinedBatch(batch []*combineRequest[K, V]) {
 			db.finishCombinedBatch(batch)
 			return
 		}
-		resetRetryableBatchErrors(active)
+		for _, req := range active {
+			if errors.Is(req.err, ErrUniqueViolation) {
+				req.err = nil
+			}
+		}
 	}
 }
 
@@ -786,33 +789,6 @@ func (db *DB[K, V]) executeCombinedBatchAttempt(active []*combineRequest[K, V]) 
 	return nil, true, nil
 }
 
-func removeCombineRequestByPtr[K ~string | ~uint64, V any](reqs []*combineRequest[K, V], victim *combineRequest[K, V]) []*combineRequest[K, V] {
-	if victim == nil {
-		return reqs
-	}
-	out := reqs[:0]
-	removed := false
-	for _, req := range reqs {
-		if !removed && req == victim {
-			removed = true
-			continue
-		}
-		out = append(out, req)
-	}
-	return out
-}
-
-func resetRetryableBatchErrors[K ~string | ~uint64, V any](reqs []*combineRequest[K, V]) {
-	for _, req := range reqs {
-		if req == nil || req.err == nil {
-			continue
-		}
-		if errors.Is(req.err, ErrUniqueViolation) {
-			req.err = nil
-		}
-	}
-}
-
 func (db *DB[K, V]) failCombinedBatch(batch []*combineRequest[K, V], err error) {
 	for _, req := range batch {
 		if req.err == nil {
@@ -826,14 +802,10 @@ func (db *DB[K, V]) finishCombinedBatch(batch []*combineRequest[K, V]) {
 	for _, req := range batch {
 		if req.coalescedTo != nil {
 			target := req.coalescedTo
-			for target != nil && target.coalescedTo != nil {
+			for target.coalescedTo != nil {
 				target = target.coalescedTo
 			}
-			if target == nil {
-				req.err = nil
-			} else {
-				req.err = target.err
-			}
+			req.err = target.err
 		}
 		req.done <- req.err
 	}

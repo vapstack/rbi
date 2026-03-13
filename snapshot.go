@@ -72,9 +72,6 @@ func getSnapshotRef() *snapshotRef {
 }
 
 func releaseSnapshotRef(ref *snapshotRef) {
-	if ref == nil {
-		return
-	}
 	ref.snap = nil
 	ref.pending = false
 	ref.refs.Store(0)
@@ -682,11 +679,6 @@ func (db *DB[K, V]) compactSnapshotRegistryIdleOnce() (changed bool, blocked boo
 	}
 
 	for txID, ref := range db.snapshot.byTx {
-		if ref == nil {
-			delete(db.snapshot.byTx, txID)
-			changed = true
-			continue
-		}
 		if txID == latestTx {
 			continue
 		}
@@ -2271,15 +2263,8 @@ func (s *indexSnapshot) hasAnyDeltaState() bool {
 }
 
 func (db *DB[K, V]) registerSnapshot(s *indexSnapshot) {
-	if s == nil {
-		return
-	}
 	db.snapshot.mu.Lock()
 	defer db.snapshot.mu.Unlock()
-
-	if db.snapshot.byTx == nil {
-		db.snapshot.byTx = make(map[uint64]*snapshotRef, 128)
-	}
 
 	ref, exists := db.snapshot.byTx[s.txID]
 	if !exists {
@@ -2300,10 +2285,6 @@ func (db *DB[K, V]) markPending(txID uint64) {
 	}
 	db.snapshot.mu.Lock()
 	defer db.snapshot.mu.Unlock()
-
-	if db.snapshot.byTx == nil {
-		db.snapshot.byTx = make(map[uint64]*snapshotRef, 128)
-	}
 
 	ref, exists := db.snapshot.byTx[txID]
 	if !exists {
@@ -2356,11 +2337,6 @@ func (db *DB[K, V]) pinSnapshotRefByTxID(txID uint64) (*indexSnapshot, *snapshot
 	return ref.snap, ref, true
 }
 
-func (db *DB[K, V]) pinByTxID(txID uint64) (*indexSnapshot, bool) {
-	snap, _, ok := db.pinSnapshotRefByTxID(txID)
-	return snap, ok
-}
-
 func (db *DB[K, V]) pinSnapshotRefByTxIDWait(txID uint64) (*indexSnapshot, *snapshotRef, bool) {
 	db.snapshot.mu.Lock()
 	defer db.snapshot.mu.Unlock()
@@ -2398,28 +2374,13 @@ func (db *DB[K, V]) pinSnapshotRefByTxIDWait(txID uint64) (*indexSnapshot, *snap
 	}
 }
 
-func (db *DB[K, V]) pinByTxIDWait(txID uint64) (*indexSnapshot, bool) {
-	snap, _, ok := db.pinSnapshotRefByTxIDWait(txID)
-	return snap, ok
-}
-
 func (db *DB[K, V]) unpinSnapshotRef(ref *snapshotRef) {
-	if ref == nil {
-		return
-	}
 	refs := ref.refs.Add(-1)
 	// Pruning is intentionally not triggered from read-path unpin to avoid
 	// O(snapshot-registry) work and lock contention on every Query call.
 	if refs <= 0 && db.snapshot.compactPinsBlocked.Load() {
 		db.noteSnapshotActivity()
 	}
-}
-
-func (db *DB[K, V]) unpinByTxID(txID uint64) {
-	db.snapshot.mu.RLock()
-	ref := db.snapshot.byTx[txID]
-	db.snapshot.mu.RUnlock()
-	db.unpinSnapshotRef(ref)
 }
 
 func (db *DB[K, V]) pruneSnapshotsLocked() {
@@ -2460,8 +2421,8 @@ func (db *DB[K, V]) pruneSnapshotsLocked() {
 		removedAny := false
 		for i := db.snapshot.head; i < len(db.snapshot.order) && len(db.snapshot.byTx) > maxRegistry; i++ {
 			txID := db.snapshot.order[i]
-			ref := db.snapshot.byTx[txID]
-			if ref == nil {
+			ref, ok := db.snapshot.byTx[txID]
+			if !ok {
 				if i == db.snapshot.head {
 					db.snapshot.head++
 				}
@@ -2490,7 +2451,7 @@ func (db *DB[K, V]) pruneSnapshotsLocked() {
 
 	for db.snapshot.head < len(db.snapshot.order) {
 		txID := db.snapshot.order[db.snapshot.head]
-		if db.snapshot.byTx[txID] != nil {
+		if _, ok := db.snapshot.byTx[txID]; ok {
 			break
 		}
 		db.snapshot.head++
@@ -2550,9 +2511,6 @@ func (db *DB[K, V]) SnapshotStats() SnapshotStats {
 	diag.RegistryOrderLen = len(db.snapshot.order)
 	diag.RegistryHead = db.snapshot.head
 	for _, ref := range db.snapshot.byTx {
-		if ref == nil {
-			continue
-		}
 		if ref.pending {
 			diag.PendingRefs++
 		}

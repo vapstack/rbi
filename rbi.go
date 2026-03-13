@@ -535,7 +535,9 @@ func New[K ~uint64 | ~string, V any](bolt *bbolt.DB, options Options, execOpts .
 
 		options:     &options,
 		execOptions: defaultExecOptions,
-		snapshot:    snapshot{},
+		snapshot: snapshot{
+			byTx: make(map[uint64]*snapshotRef, 128),
+		},
 
 		planner: planner{
 			analyzer: analyzer{
