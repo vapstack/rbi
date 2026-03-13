@@ -129,12 +129,12 @@ For the full API reference see
 
 ### Writing data
 
-* `Set(id, value)` – insert or replace a record and update affected indexes.
-* `BatchSet(ids, values)` – batch variant of `Set`, significantly faster for bulk inserts.
-* `Patch(id, fields)` – apply partial updates and update only changed indexes.
-* `BatchPatch(ids, fields)` – batch patch variant.
-* `Delete(id)` – remove a record and its index entries.
-* `BatchDelete(ids)` – batch variant of `Delete`.
+* `Set` – insert or replace a record and update affected indexes
+* `BatchSet` – batch variant of `Set`, significantly faster for bulk inserts
+* `Patch` – apply partial updates and update only changed indexes
+* `BatchPatch` – batch patch variant
+* `Delete` – remove a record and its index entries
+* `BatchDelete` – batch variant of `Delete`
 
 Do not write directly to the bucket managed by `rbi` through raw Bolt APIs,
 (including `SetSequence`/`NextSequence`).
@@ -164,9 +164,11 @@ q := qx.Query(
 
 Query methods:
 
-* `Query(q)` – return matching records
-* `QueryKeys(q)` – return matching IDs
-* `Count(q)` – return result cardinality (ignoring offset/limit)
+* `Query` – return matching records
+* `QueryKeys` – return matching IDs
+* `Count` – return result cardinality (ignoring offset/limit)
+* `SeqScan` - performs a sequential scan over all records starting at the given key
+* `ScanKeys` – iterate the current in-memory key set without opening a Bolt read transaction
 
 ## Query execution model
 
@@ -240,34 +242,38 @@ Available hooks/options:
   For `Set`/`BatchSet` it runs on the caller-owned value before RBI starts
   encoding or batching; for `Patch`/`BatchPatch` it runs on the mutable
   post-patch value before `BeforeStore`.
-- `BeforeStore` - runs for inserts and updates before RBI encodes the final value.
+
+* `BeforeStore` - runs for inserts and updates before RBI encodes the final value.
   It may modify `newValue`.
+
 - `BeforeCommit` - runs inside the Bolt write transaction after the record
   has been written, but before commit. Useful for audit records and other
   writes to neighboring buckets.
-- `NoAutoBatch` - forces a single `Set`/`Patch`/`Delete` call to bypass the
+
+* `NoAutoBatch` - forces a single `Set`/`Patch`/`Delete` call to bypass the
   auto-batcher and execute directly.
+
 - `CloneFunc` - optional helper for `Set`/`BatchSet` with `BeforeStore`.
   It can be used when the value becomes encodable only after normalization, or
   simply as a faster cloning path than RBI's fallback msgpack snapshotting.
-- `PatchStrict` - makes `Patch`/`BatchPatch` reject unknown fields.
+
+* `PatchStrict` - makes `Patch`/`BatchPatch` reject unknown fields.
 
 Important notes:
 
 - `BeforeProcess` may run at different stages depending on the write method.
-  Do not retain the value pointer after the hook returns.
-- For `Set`/`BatchSet`, `BeforeProcess` mutates the caller-owned value
-  directly. RBI does not protect against aliasing and does not restore the value 
-  if the later write fails.
+  Do not retain the value pointer after the hook returns. With `Set`/`BatchSet`, 
+  it mutates the caller-owned value directly. RBI does not protect against 
+  aliasing and does not restore the value if the later write fails.
 - Auto-batching is only useful for parallel single-record writes from multiple
-  goroutines. `BatchSet`/`BatchPatch`/`BatchDelete` already define their own
-  explicit transaction boundaries.
-- `BeforeProcess`, `BeforeStore`, and `BeforeCommit` remain auto-batchable by
-  default. Use `NoAutoBatch` when a specific single-record write should run
-  directly.
+  goroutines. `Batch*` methods already define their own explicit transaction boundaries.
 - Under batching/retry, `BeforeProcess` on `Patch`/`BatchPatch`,
   `BeforeStore`, and `BeforeCommit` may run more than once for the same
   logical write, so external side effects should be idempotent.
+- `BeforeCommit` must use the provided `*bbolt.Tx` directly and must not call
+  methods on the same `DB` instance. Depending on execution mode, RBI may hold
+  internal locks while running `BeforeCommit`, so re-entering the same `DB`
+  can deadlock or become mode-dependent.
 - `BeforeCommit` must not modify the bucket managed by RBI itself.
 
 ## Ordering Limitations

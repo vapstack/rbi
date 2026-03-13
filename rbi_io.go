@@ -180,8 +180,12 @@ func (db *DB[K, V]) batchGetTxCompact(tx *bbolt.Tx, ids []K) ([]*V, error) {
 // The scan stops when fn returns false or a non-nil error. The scan does not
 // open a Bolt transaction and may not reflect concurrent writes.
 //
-// For string keys, iteration order follows internal key index order,
-// not lexicographic order; seek is applied only as a prefix filter.
+// For string keys, iteration order follows internal key-index order, not
+// lexicographic order. In that mode, seek is still applied as a plain
+// `key >= seek` value filter, but not as a lexicographic seek in traversal
+// order. As a result, string-key ScanKeys is not suitable for prefix scans,
+// resume/pagination cursors, or ordered iteration. Use QueryKeys(PREFIX(...))
+// for prefix matching or SeqScan/SeqScanRaw for ordered key traversal.
 func (db *DB[K, V]) ScanKeys(seek K, fn func(K) (bool, error)) error {
 	if err := db.beginOp(); err != nil {
 		return err

@@ -144,14 +144,17 @@ func CloneFunc[K ~string | ~uint64, V any](fn func(key K, v *V) *V) ExecOption[K
 // before it is committed.
 //
 // The callback:
+//   - May perform additional reads or writes through the provided tx.
+//   - May return an error to abort the operation; in this case the
+//     transaction will be rolled back and index state will not be updated.
 //   - Must not modify oldValue or newValue.
 //   - Must not commit or roll back the transaction.
 //   - Must not modify records or bucket sequence in the bucket managed by this DB instance
 //     (or by any other DB instance with enabled indexing),
 //     because such writes bypass index synchronization.
-//   - May perform additional reads or writes within the same transaction.
-//   - May return an error to abort the operation; in this case the
-//     transaction will be rolled back and index state will not be updated.
+//   - Must not call any methods on the DB instance. Depending on execution mode,
+//     BeforeCommit may run while RBI holds internal locks, so re-entering the
+//     same DB can deadlock or become mode-dependent.
 //
 // BeforeCommit is invoked only for records that exist or are being written.
 // Patch/Delete operations skip missing records and do not invoke callbacks for them.
