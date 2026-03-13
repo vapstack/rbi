@@ -33,9 +33,8 @@ type combineRequest[K ~string | ~uint64, V any] struct {
 
 	coalescedTo *combineRequest[K, V]
 
-	ticket uint64
-	err    error
-	done   chan error
+	err  error
+	done chan error
 }
 
 type combinedBatchPrepared[K ~string | ~uint64, V any] struct {
@@ -91,13 +90,9 @@ func (db *DB[K, V]) tryQueueSetCombine(id K, newVal *V, beforeStore []beforeStor
 	if newVal == nil {
 		return ErrNilValue, true
 	}
-	if db.closed.Load() {
+	if err := db.unavailableErr(); err != nil {
 		db.combiner.fallbackClosed.Add(1)
-		return ErrClosed, true
-	}
-	if !db.combiner.allowCallbacks && hasExecHooks(beforeStore, beforeCommit) {
-		db.combiner.fallbackCallbacks.Add(1)
-		return nil, false
+		return err, true
 	}
 
 	req := &combineRequest[K, V]{
@@ -130,13 +125,9 @@ func (db *DB[K, V]) tryQueuePatchCombine(id K, fields []Field, ignoreUnknown boo
 		db.combiner.fallbackDisabled.Add(1)
 		return nil, false
 	}
-	if db.closed.Load() {
+	if err := db.unavailableErr(); err != nil {
 		db.combiner.fallbackClosed.Add(1)
-		return ErrClosed, true
-	}
-	if !db.combiner.allowCallbacks && hasExecHooks(beforeStore, beforeCommit) {
-		db.combiner.fallbackCallbacks.Add(1)
-		return nil, false
+		return err, true
 	}
 
 	req := &combineRequest[K, V]{
@@ -157,13 +148,9 @@ func (db *DB[K, V]) tryQueueDeleteCombine(id K, beforeCommit []beforeCommitFunc[
 		db.combiner.fallbackDisabled.Add(1)
 		return nil, false
 	}
-	if db.closed.Load() {
+	if err := db.unavailableErr(); err != nil {
 		db.combiner.fallbackClosed.Add(1)
-		return ErrClosed, true
-	}
-	if !db.combiner.allowCallbacks && hasExecHooks(nil, beforeCommit) {
-		db.combiner.fallbackCallbacks.Add(1)
-		return nil, false
+		return err, true
 	}
 
 	req := &combineRequest[K, V]{
@@ -195,8 +182,6 @@ func (db *DB[K, V]) submitCombinedBatch(req *combineRequest[K, V]) (error, bool)
 		return nil, false
 	}
 
-	req.ticket = db.combiner.emitSeq
-	db.combiner.emitSeq++
 	db.combiner.queue = append(db.combiner.queue, req)
 	db.combiner.enqueued.Add(1)
 	atomicSetMax(&db.combiner.queueHighWater, uint64(len(db.combiner.queue)))
@@ -211,17 +196,7 @@ func (db *DB[K, V]) submitCombinedBatch(req *combineRequest[K, V]) (error, bool)
 		go db.runCombinerLoop()
 	}
 
-	err := <-req.done
-
-	db.combiner.mu.Lock()
-	for req.ticket != db.combiner.retSeq {
-		db.combiner.retCond.Wait()
-	}
-	db.combiner.retSeq++
-	db.combiner.retCond.Broadcast()
-	db.combiner.mu.Unlock()
-
-	return err, true
+	return <-req.done, true
 }
 
 func (db *DB[K, V]) runCombinerLoop() {
@@ -229,6 +204,10 @@ func (db *DB[K, V]) runCombinerLoop() {
 		batch := db.popCombinedBatch()
 		if len(batch) == 0 {
 			return
+		}
+		if err := db.unavailableErr(); err != nil {
+			db.failCombinedBatch(batch, err)
+			continue
 		}
 		db.executeCombinedBatch(batch)
 	}
@@ -281,21 +260,6 @@ func (db *DB[K, V]) popCombinedBatch() []*combineRequest[K, V] {
 		n = len(db.combiner.queue)
 	}
 
-	if n > 1 {
-		if !db.combiner.allowCallbacks {
-			for i := 0; i < n; i++ {
-				if !hasExecHooks(db.combiner.queue[i].beforeStore, db.combiner.queue[i].beforeCommit) {
-					continue
-				}
-				if i == 0 {
-					n = 1
-				} else {
-					n = i
-				}
-				break
-			}
-		}
-	}
 	if n > 1 {
 		lastByID := make(map[K]int, n)
 		for i := 0; i < n; i++ {
@@ -685,12 +649,12 @@ func (db *DB[K, V]) executeCombinedBatchAttempt(active []*combineRequest[K, V]) 
 	}()
 
 	db.mu.Lock()
-	if db.closed.Load() {
+	if err = db.unavailableErr(); err != nil {
 		rollbackCreated(prepared)
 		db.mu.Unlock()
 		for _, op := range prepared {
 			if op.req.err == nil {
-				op.req.err = ErrClosed
+				op.req.err = err
 			}
 		}
 		return nil, true, nil
@@ -797,10 +761,25 @@ func (db *DB[K, V]) executeCombinedBatchAttempt(active []*combineRequest[K, V]) 
 	}
 	committed = true
 	if len(accepted) == len(prepared) {
-		db.publishPreparedSnapshotWithAccumDeltaNoLock(txID, &preparedDelta)
-		preparedDeltaOwned = false
+		err = db.publishAfterCommitLocked(txID, "batch", func() {
+			db.publishPreparedSnapshotWithAccumDeltaNoLock(txID, &preparedDelta)
+		})
+		if err == nil {
+			preparedDeltaOwned = false
+		}
 	} else {
-		db.publishWriteDeltaBatch(txID, idxs, oldVals, newVals, modified)
+		err = db.publishAfterCommitLocked(txID, "batch", func() {
+			db.publishWriteDeltaBatch(txID, idxs, oldVals, newVals, modified)
+		})
+	}
+	if err != nil {
+		db.mu.Unlock()
+		for _, op := range accepted {
+			if op.req.err == nil {
+				op.req.err = err
+			}
+		}
+		return nil, true, nil
 	}
 	db.mu.Unlock()
 

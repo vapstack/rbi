@@ -180,7 +180,7 @@ func runStressCase(
 	caseCtx, cancel := context.WithTimeout(ctx, duration)
 	defer cancel()
 
-	bStats := db.BatchStats()
+	bStats := db.AutoBatchStats()
 
 	stop := make(chan struct{})
 	var stopOnce sync.Once
@@ -318,7 +318,7 @@ loop:
 			readOpsPerSec := float64(readTotal-lastRead) / intervalSec
 			writeOpsPerSec := float64(writeTotal-lastWrite) / intervalSec
 
-			wcNow := db.BatchStats()
+			wcNow := db.AutoBatchStats()
 			txDelta := uint64(0)
 			if wcNow.Batches >= lastBatch.Batches {
 				txDelta = wcNow.Batches - lastBatch.Batches
@@ -371,7 +371,7 @@ loop:
 	stopWorkers()
 	wg.Wait()
 	finishedAt := time.Now()
-	wcEnd := db.BatchStats()
+	wcEnd := db.AutoBatchStats()
 
 	readSamples, writeSamples, writeQueueSamples, writeServiceSamples, writeEndToEndSamples, opCounts := metrics.SnapshotFinalDetailed()
 	caseDurationSec := finishedAt.Sub(startedAt).Seconds()

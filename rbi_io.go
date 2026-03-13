@@ -342,7 +342,7 @@ func (db *DB[K, V]) Set(id K, newVal *V, execOpts ...ExecOption[K, V]) error {
 	defer db.endOp()
 	var err error
 
-	if db.combiner.enabled {
+	if db.combiner.enabled && !cfg.noAutoBatch {
 		if err, handled := db.tryQueueSetCombine(id, newVal, cfg.beforeStore, cfg.beforeCommit, cfg.cloneValue); handled {
 			return err
 		}
@@ -423,8 +423,8 @@ func (db *DB[K, V]) Set(id K, newVal *V, execOpts ...ExecOption[K, V]) error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 
-	if db.closed.Load() {
-		return ErrClosed
+	if err = db.unavailableErr(); err != nil {
+		return err
 	}
 
 	idx, idxCreated := db.idxFromIDWithCreated(id)
@@ -455,8 +455,12 @@ func (db *DB[K, V]) Set(id K, newVal *V, execOpts ...ExecOption[K, V]) error {
 		db.clearPending(txID)
 		return err
 	}
-	db.publishWriteDelta(txID, idx, oldVal, storedVal, modified)
 	cleanupOnErr = false
+	if err = db.publishAfterCommitLocked(txID, "set", func() {
+		db.publishWriteDelta(txID, idx, oldVal, storedVal, modified)
+	}); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -618,21 +622,17 @@ func (db *DB[K, V]) BatchSet(ids []K, newVals []*V, execOpts ...ExecOption[K, V]
 		if err = bucket.Put(key, payload); err != nil {
 			return fmt.Errorf("put: %w", err)
 		}
-	}
 
-	if len(cfg.beforeCommit) > 0 {
-		for i, id := range ids {
-			if err = runBeforeCommitHooks(tx, id, oldVals[i], storedVals[i], cfg.beforeCommit); err != nil {
-				return err
-			}
+		if err = runBeforeCommitHooks(tx, id, oldVals[i], storedVals[i], cfg.beforeCommit); err != nil {
+			return err
 		}
 	}
 
 	db.mu.Lock()
 	defer db.mu.Unlock()
 
-	if db.closed.Load() {
-		return ErrClosed
+	if err = db.unavailableErr(); err != nil {
+		return err
 	}
 
 	idxs, idxCreated := db.idxsFromIDWithCreated(ids)
@@ -680,8 +680,12 @@ func (db *DB[K, V]) BatchSet(ids []K, newVals []*V, execOpts ...ExecOption[K, V]
 		db.clearPending(txID)
 		return err
 	}
-	db.publishWriteDeltaBatch(txID, idxs, oldVals, storedVals, modified)
 	cleanupOnErr = false
+	if err = db.publishAfterCommitLocked(txID, "batch_set", func() {
+		db.publishWriteDeltaBatch(txID, idxs, oldVals, storedVals, modified)
+	}); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -718,7 +722,7 @@ func (db *DB[K, V]) patch(id K, fields []Field, execOpts ...ExecOption[K, V]) er
 	}
 	cfg := db.resolveExecOptions(execOpts)
 	ignoreUnknown := !cfg.patchStrict
-	if db.combiner.enabled {
+	if db.combiner.enabled && !cfg.noAutoBatch {
 		if err, handled := db.tryQueuePatchCombine(id, fields, ignoreUnknown, cfg.beforeProcess, cfg.beforeStore, cfg.beforeCommit); handled {
 			return err
 		}
@@ -793,8 +797,8 @@ func (db *DB[K, V]) patch(id K, fields []Field, execOpts ...ExecOption[K, V]) er
 	db.mu.Lock()
 	defer db.mu.Unlock()
 
-	if db.closed.Load() {
-		return ErrClosed
+	if err = db.unavailableErr(); err != nil {
+		return err
 	}
 
 	if db.hasUnique {
@@ -813,7 +817,11 @@ func (db *DB[K, V]) patch(id K, fields []Field, execOpts ...ExecOption[K, V]) er
 		db.clearPending(txID)
 		return err
 	}
-	db.publishPreparedSnapshotWithAccumDeltaNoLock(txID, &delta)
+	if err = db.publishAfterCommitLocked(txID, "patch", func() {
+		db.publishPreparedSnapshotWithAccumDeltaNoLock(txID, &delta)
+	}); err != nil {
+		return err
+	}
 	deltaOwned = false
 	return nil
 }
@@ -930,20 +938,16 @@ func (db *DB[K, V]) batchPatch(ids []K, patch []Field, execOpts ...ExecOption[K,
 			return err
 		}
 
+		if err = runBeforeCommitHooks(tx, id, oldVal, newVal, cfg.beforeCommit); err != nil {
+			return err
+		}
+
 		idxs = append(idxs, db.idxFromID(id))
 		foundIDs = append(foundIDs, id)
 	}
 
 	if len(foundIDs) == 0 {
 		return nil
-	}
-
-	if len(cfg.beforeCommit) > 0 {
-		for i, id := range foundIDs {
-			if err = runBeforeCommitHooks(tx, id, oldVals[i], newVals[i], cfg.beforeCommit); err != nil {
-				return err
-			}
-		}
 	}
 
 	modified := make([][]string, len(idxs))
@@ -961,8 +965,8 @@ func (db *DB[K, V]) batchPatch(ids []K, patch []Field, execOpts ...ExecOption[K,
 	db.mu.Lock()
 	defer db.mu.Unlock()
 
-	if db.closed.Load() {
-		return ErrClosed
+	if err = db.unavailableErr(); err != nil {
+		return err
 	}
 
 	if db.hasUnique {
@@ -981,7 +985,11 @@ func (db *DB[K, V]) batchPatch(ids []K, patch []Field, execOpts ...ExecOption[K,
 		db.clearPending(txID)
 		return err
 	}
-	db.publishPreparedSnapshotWithAccumDeltaNoLock(txID, &delta)
+	if err = db.publishAfterCommitLocked(txID, "batch_patch", func() {
+		db.publishPreparedSnapshotWithAccumDeltaNoLock(txID, &delta)
+	}); err != nil {
+		return err
+	}
 	deltaOwned = false
 	return nil
 }
@@ -1000,7 +1008,7 @@ func (db *DB[K, V]) Delete(id K, execOpts ...ExecOption[K, V]) error {
 
 	cfg := db.resolveExecOptions(execOpts)
 
-	if db.combiner.enabled {
+	if db.combiner.enabled && !cfg.noAutoBatch {
 		if err, handled := db.tryQueueDeleteCombine(id, cfg.beforeCommit); handled {
 			return err
 		}
@@ -1051,8 +1059,8 @@ func (db *DB[K, V]) Delete(id K, execOpts ...ExecOption[K, V]) error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 
-	if db.closed.Load() {
-		return ErrClosed
+	if err = db.unavailableErr(); err != nil {
+		return err
 	}
 
 	if err = advanceBucketSequence(bucket); err != nil {
@@ -1066,7 +1074,11 @@ func (db *DB[K, V]) Delete(id K, execOpts ...ExecOption[K, V]) error {
 		db.clearPending(txID)
 		return err
 	}
-	db.publishPreparedSnapshotWithAccumDeltaNoLock(txID, &delta)
+	if err = db.publishAfterCommitLocked(txID, "delete", func() {
+		db.publishPreparedSnapshotWithAccumDeltaNoLock(txID, &delta)
+	}); err != nil {
+		return err
+	}
 	deltaOwned = false
 	return nil
 }
@@ -1158,8 +1170,8 @@ func (db *DB[K, V]) BatchDelete(ids []K, execOpts ...ExecOption[K, V]) error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 
-	if db.closed.Load() {
-		return ErrClosed
+	if err = db.unavailableErr(); err != nil {
+		return err
 	}
 
 	if err = advanceBucketSequence(bucket); err != nil {
@@ -1173,7 +1185,11 @@ func (db *DB[K, V]) BatchDelete(ids []K, execOpts ...ExecOption[K, V]) error {
 		db.clearPending(txID)
 		return err
 	}
-	db.publishPreparedSnapshotWithAccumDeltaNoLock(txID, &delta)
+	if err = db.publishAfterCommitLocked(txID, "batch_delete", func() {
+		db.publishPreparedSnapshotWithAccumDeltaNoLock(txID, &delta)
+	}); err != nil {
+		return err
+	}
 	deltaOwned = false
 	return nil
 }

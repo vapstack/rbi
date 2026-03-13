@@ -494,21 +494,20 @@ func Benchmark_Write_Update_BeforeStore_BeforeCommit_MakePatch_Parallel(b *testi
 		opts Options
 	}{
 		{
-			name: "NoMicroBatching",
+			name: "NoAutoBatching",
 			opts: Options{
 				DisableIndexStore: true,
-				BatchWindow:       -1,
-				BatchMax:          1,
+				AutoBatchWindow:   -1,
+				AutoBatchMax:      1,
 			},
 		},
 		{
-			name: "WithMicroBatching",
+			name: "WithAutoBatching",
 			opts: Options{
-				DisableIndexStore:   true,
-				BatchWindow:         200 * time.Microsecond,
-				BatchMax:            16,
-				BatchMaxQueue:       1024,
-				BatchAllowCallbacks: true,
+				DisableIndexStore: true,
+				AutoBatchWindow:   200 * time.Microsecond,
+				AutoBatchMax:      16,
+				AutoBatchMaxQueue: 1024,
 			},
 		},
 	} {
@@ -565,7 +564,7 @@ func Benchmark_Write_Update_BeforeStore_BeforeCommit_MakePatch_Parallel(b *testi
 				b.Fatal(firstErr)
 			}
 
-			st := db.BatchStats()
+			st := db.AutoBatchStats()
 			b.ReportMetric(float64(st.CombinedBatches), "combined_batches")
 			b.ReportMetric(st.AvgBatchSize, "avg_batch")
 		})

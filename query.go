@@ -3,24 +3,11 @@ package rbi
 import (
 	"fmt"
 	"runtime"
-	"time"
 	"unsafe"
 
 	"github.com/vapstack/qx"
 	"go.etcd.io/bbolt"
 )
-
-const snapshotRetryBudgetMult = 30
-
-func snapshotPinWaitTimeout(v time.Duration) time.Duration {
-	if v == 0 {
-		return defaultOptionsSnapshotPinWaitTimeout
-	}
-	if v < 0 {
-		return 0
-	}
-	return v
-}
 
 // Query evaluates the given query against the index and returns all matching values.
 func (db *DB[K, V]) Query(q *qx.QX) ([]*V, error) {
@@ -36,71 +23,73 @@ func (db *DB[K, V]) Query(q *qx.QX) ([]*V, error) {
 	}
 	defer db.endOp()
 
-	retryBudget := db.snapshot.pinWait * snapshotRetryBudgetMult
-	deadline := time.Now().Add(retryBudget)
-
-	lastTxID := uint64(0)
 	for {
 		tx, txErr := db.bolt.Begin(false)
 		if txErr != nil {
 			return nil, fmt.Errorf("tx error: %w", txErr)
 		}
-
-		txID := uint64(tx.ID())
-		lastTxID = txID
-
-		if snap, ok := db.pinByTxID(txID); ok && snap != nil {
-			values, err := db.queryRecords(tx, snap, q)
-			db.unpinByTxID(txID)
-			_ = tx.Rollback()
-			if err != nil {
-				return nil, err
-			}
-			return values, nil
-		}
-
-		if db.isPending(txID) {
-			if snap, ok := db.pinByTxIDWait(txID, db.snapshot.pinWait); ok && snap != nil {
-				values, err := db.queryRecords(tx, snap, q)
-				db.unpinByTxID(txID)
-				_ = tx.Rollback()
-				if err != nil {
-					return nil, err
-				}
-				return values, nil
-			}
-		}
-
-		latest := db.getSnapshot()
-		if latest != nil && latest.txID <= txID {
-			values, err := db.queryRecords(tx, latest, q)
-			_ = tx.Rollback()
-			if err != nil {
-				return nil, err
-			}
-			return values, nil
-		}
-
-		if snap, floorTx, ok := db.pinFloorByTxID(txID); ok && snap != nil {
-			values, err := db.queryRecords(tx, snap, q)
-			db.unpinByTxID(floorTx)
-			_ = tx.Rollback()
-			if err != nil {
-				return nil, err
-			}
-			return values, nil
-		}
-
+		values, retry, err := db.queryWithTx(tx, q)
 		_ = tx.Rollback()
-
-		if db.closed.Load() {
-			return nil, ErrClosed
+		if err != nil {
+			return nil, err
 		}
-		if time.Now().After(deadline) {
-			return nil, fmt.Errorf("index snapshot is not available for txID=%v", lastTxID)
+		if !retry {
+			return values, nil
+		}
+		if err = db.unavailableErr(); err != nil {
+			return nil, err
 		}
 		runtime.Gosched()
 	}
+}
+
+func (db *DB[K, V]) queryWithTx(tx *bbolt.Tx, q *qx.QX) ([]*V, bool, error) {
+	txID := uint64(tx.ID())
+
+	if snap, ref, ok := db.pinSnapshotRefByTxID(txID); ok && snap != nil {
+		values, err := db.queryRecords(tx, snap, q)
+		db.unpinSnapshotRef(ref)
+		if err != nil {
+			return nil, false, err
+		}
+		return values, false, nil
+	}
+
+	exists, pending := db.snapshotRefStatus(txID)
+	if pending {
+		if snap, ref, ok := db.pinSnapshotRefByTxIDWait(txID); ok && snap != nil {
+			values, err := db.queryRecords(tx, snap, q)
+			db.unpinSnapshotRef(ref)
+			if err != nil {
+				return nil, false, err
+			}
+			return values, false, nil
+		}
+		if err := db.unavailableErr(); err != nil {
+			return nil, false, err
+		}
+		exists, pending = db.snapshotRefStatus(txID)
+		if pending {
+			return nil, true, nil
+		}
+	}
+
+	if err := db.unavailableErr(); err != nil {
+		return nil, false, err
+	}
+	latest := db.getSnapshot()
+	if latest == nil {
+		return nil, true, nil
+	}
+	if latest.txID == txID || (latest.txID < txID && !exists) {
+		values, err := db.queryRecords(tx, latest, q)
+		if err != nil {
+			return nil, false, err
+		}
+		return values, false, nil
+	}
+
+	return nil, true, nil
 }
 
 func (db *DB[K, V]) queryRecords(tx *bbolt.Tx, snap *indexSnapshot, q *qx.QX) ([]*V, error) {

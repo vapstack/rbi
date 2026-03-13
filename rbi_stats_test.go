@@ -76,14 +76,14 @@ func TestStats_ExposePlannerCalibrationAndSnapshotDiagnostics(t *testing.T) {
 		t.Fatalf("expected calibration multiplier for %q to be present", PlanOrdered)
 	}
 
-	if !st.Batch.Enabled {
-		t.Fatalf("expected write combine stats to report enabled")
+	if !st.AutoBatch.Enabled {
+		t.Fatalf("expected auto-batch stats to report enabled")
 	}
-	if st.Batch.Window <= 0 {
-		t.Fatalf("expected positive write combine window, got %v", st.Batch.Window)
+	if st.AutoBatch.Window <= 0 {
+		t.Fatalf("expected positive auto-batch window, got %v", st.AutoBatch.Window)
 	}
-	if st.Batch.Enqueued == 0 {
-		t.Fatalf("expected write combine stats to observe enqueued writes")
+	if st.AutoBatch.Enqueued == 0 {
+		t.Fatalf("expected auto-batch stats to observe enqueued writes")
 	}
 }
 
@@ -156,11 +156,11 @@ func TestStats_ComponentAccessors(t *testing.T) {
 		t.Fatalf("expected SnapshotStats.TxID > 0")
 	}
 
-	bs := db.BatchStats()
+	bs := db.AutoBatchStats()
 	if !bs.Enabled {
-		t.Fatalf("expected BatchStats.Enabled=true")
+		t.Fatalf("expected AutoBatchStats.Enabled=true")
 	}
 	if bs.Window <= 0 {
-		t.Fatalf("expected BatchStats.Window > 0")
+		t.Fatalf("expected AutoBatchStats.Window > 0")
 	}
 }

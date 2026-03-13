@@ -560,10 +560,9 @@ func TestMultiWrap_CloseBehavior(t *testing.T) {
 
 func TestClose_UnblocksQueuedBatchWriters(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
-		BatchWindow:         10 * time.Millisecond,
-		BatchMax:            16,
-		BatchMaxQueue:       1024,
-		BatchAllowCallbacks: true,
+		AutoBatchWindow:   10 * time.Millisecond,
+		AutoBatchMax:      16,
+		AutoBatchMaxQueue: 1024,
 	})
 
 	firstStarted := make(chan struct{})
@@ -664,7 +663,7 @@ func TestBatchSet_CommitFail_DoesNotGrowStrMap(t *testing.T) {
 		t.Fatalf("strmap grew after batch commit failure: initial=%d after=%d", initial, after)
 	}
 
-	bs := db.BatchStats()
+	bs := db.AutoBatchStats()
 	if bs.TxCommitErrors == 0 {
 		t.Fatalf("expected tx commit error in batch stats, got %+v", bs)
 	}
@@ -1692,8 +1691,8 @@ func TestConcurrentBatchWriters_ModelReplayConsistency(t *testing.T) {
 
 func TestBatchConcurrentSingleOps_ModelReplayConsistency(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
-		BatchMax:      32,
-		BatchMaxQueue: 0, // unlimited to avoid fallback due queue pressure
+		AutoBatchMax:      32,
+		AutoBatchMaxQueue: 0, // unlimited to avoid fallback due queue pressure
 	})
 
 	const (
@@ -1837,7 +1836,7 @@ func TestBatchConcurrentSingleOps_ModelReplayConsistency(t *testing.T) {
 		t.FailNow()
 	}
 
-	bs := db.BatchStats()
+	bs := db.AutoBatchStats()
 	if !bs.Enabled {
 		t.Fatalf("expected write-combiner to be enabled")
 	}
@@ -2199,7 +2198,7 @@ func TestWrap_DoubleOpenCheck(t *testing.T) {
 
 func TestFailpoint_CommitSetRollsBackAndKeepsState(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
-		BatchMax: 1,
+		AutoBatchMax: 1,
 	})
 
 	db.testHooks.beforeCommit = func(op string) error {
@@ -2231,9 +2230,9 @@ func TestFailpoint_CommitSetRollsBackAndKeepsState(t *testing.T) {
 
 func TestFailpoint_CommitBatchRollsBackAndKeepsState(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
-		BatchWindow:   10 * time.Millisecond,
-		BatchMax:      16,
-		BatchMaxQueue: 1024,
+		AutoBatchWindow:   10 * time.Millisecond,
+		AutoBatchMax:      16,
+		AutoBatchMaxQueue: 1024,
 	})
 
 	var once atomic.Bool
@@ -2258,8 +2257,95 @@ func TestFailpoint_CommitBatchRollsBackAndKeepsState(t *testing.T) {
 		t.Fatalf("expected no value after failed batch commit, got: %#v", v)
 	}
 
-	if st := db.BatchStats(); st.TxCommitErrors == 0 {
-		t.Fatalf("expected BatchStats.TxCommitErrors > 0 after failpoint commit")
+	if st := db.AutoBatchStats(); st.TxCommitErrors == 0 {
+		t.Fatalf("expected AutoBatchStats.TxCommitErrors > 0 after failpoint commit")
+	}
+}
+
+func TestFailpoint_PostCommitPublishSet_BreaksDBAndSkipsIndexStore(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{AutoBatchMax: 1})
+
+	db.testHooks.afterCommitPublish = func(op string) {
+		if op == "set" {
+			panic("failpoint: publish set")
+		}
+	}
+	err := db.Set(1, &Rec{Name: "alice", Age: 30})
+	if !errors.Is(err, ErrBroken) {
+		t.Fatalf("expected ErrBroken from post-commit publish panic, got: %v", err)
+	}
+
+	txID := db.currentBoltTxID()
+	db.snapshot.mu.RLock()
+	ref := db.snapshot.byTx[txID]
+	pending := ref != nil && ref.pending
+	db.snapshot.mu.RUnlock()
+	if pending {
+		t.Fatalf("expected pending ref to be cleared after broken publish path")
+	}
+
+	var got *Rec
+	if viewErr := db.bolt.View(func(tx *bbolt.Tx) error {
+		bucket := tx.Bucket(db.bucket)
+		if bucket == nil {
+			return fmt.Errorf("bucket does not exist")
+		}
+		raw := bucket.Get(db.keyFromID(1))
+		if raw == nil {
+			return fmt.Errorf("record not committed")
+		}
+		var err error
+		got, err = db.decode(raw)
+		return err
+	}); viewErr != nil {
+		t.Fatalf("bolt view after broken publish: %v", viewErr)
+	}
+	if got == nil || got.Name != "alice" || got.Age != 30 {
+		t.Fatalf("unexpected committed value after broken publish: %#v", got)
+	}
+
+	if err = db.Set(2, &Rec{Name: "bob", Age: 20}); !errors.Is(err, ErrBroken) {
+		t.Fatalf("expected DB to reject subsequent writes with ErrBroken, got: %v", err)
+	}
+	if _, err = db.Query(qx.Query(qx.EQ("name", "alice"))); !errors.Is(err, ErrBroken) {
+		t.Fatalf("expected Query to fail with ErrBroken after broken publish, got: %v", err)
+	}
+
+	db.testHooks.beforeStoreIndex = func() error {
+		return fmt.Errorf("storeIndex must be skipped for broken db")
+	}
+	if err = db.Close(); !errors.Is(err, ErrBroken) {
+		t.Fatalf("expected Close to return ErrBroken for broken db, got: %v", err)
+	}
+}
+
+func TestFailpoint_PostCommitPublishBatch_BreaksDBAndClearsPending(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{
+		AutoBatchWindow:   10 * time.Millisecond,
+		AutoBatchMax:      16,
+		AutoBatchMaxQueue: 1024,
+	})
+
+	db.testHooks.afterCommitPublish = func(op string) {
+		if op == "batch" {
+			panic("failpoint: publish batch")
+		}
+	}
+	err := db.Set(1, &Rec{Name: "alice", Age: 30})
+	if !errors.Is(err, ErrBroken) {
+		t.Fatalf("expected ErrBroken from auto-batch publish panic, got: %v", err)
+	}
+
+	db.snapshot.mu.RLock()
+	pending := 0
+	for _, ref := range db.snapshot.byTx {
+		if ref != nil && ref.pending {
+			pending++
+		}
+	}
+	db.snapshot.mu.RUnlock()
+	if pending != 0 {
+		t.Fatalf("expected no pending refs after broken auto-batch publish, got: %d", pending)
 	}
 }
 
@@ -2293,7 +2379,7 @@ func TestFailpoint_CommitTruncateRollsBackAndKeepsData(t *testing.T) {
 
 func TestFailpoint_CommitPatchAndDelete_RollbackAndNoPendingRefs(t *testing.T) {
 	t.Run("patch", func(t *testing.T) {
-		db, _ := openTempDBUint64(t, Options{BatchMax: 1})
+		db, _ := openTempDBUint64(t, Options{AutoBatchMax: 1})
 		if err := db.Set(1, &Rec{Name: "alice", Age: 30, Meta: Meta{Country: "NL"}}); err != nil {
 			t.Fatalf("Set(1): %v", err)
 		}
@@ -2323,7 +2409,7 @@ func TestFailpoint_CommitPatchAndDelete_RollbackAndNoPendingRefs(t *testing.T) {
 	})
 
 	t.Run("delete", func(t *testing.T) {
-		db, _ := openTempDBUint64(t, Options{BatchMax: 1})
+		db, _ := openTempDBUint64(t, Options{AutoBatchMax: 1})
 		if err := db.Set(1, &Rec{Name: "alice", Age: 30, Meta: Meta{Country: "NL"}}); err != nil {
 			t.Fatalf("Set(1): %v", err)
 		}
@@ -2458,7 +2544,7 @@ func TestFailpoint_CommitMultiWritePaths_RollbackAndNoPendingRefs(t *testing.T) 
 	for _, c := range cases {
 		c := c
 		t.Run(c.name, func(t *testing.T) {
-			db, _ := openTempDBUint64(t, Options{BatchMax: 1})
+			db, _ := openTempDBUint64(t, Options{AutoBatchMax: 1})
 			if c.setup != nil {
 				c.setup(t, db)
 			}
@@ -2485,7 +2571,7 @@ func TestFailpoint_CommitMultiWritePaths_RollbackAndNoPendingRefs(t *testing.T) 
 }
 
 func TestBatchSet_DuplicateIDs_LastWriteWinsAndIndexConsistent(t *testing.T) {
-	db, _ := openTempDBUint64(t, Options{BatchMax: 1})
+	db, _ := openTempDBUint64(t, Options{AutoBatchMax: 1})
 
 	if err := db.Set(1, &Rec{Name: "seed", Age: 21, Tags: []string{"go"}, Meta: Meta{Country: "NL"}}); err != nil {
 		t.Fatalf("seed Set: %v", err)
@@ -2542,8 +2628,47 @@ func TestBatchSet_DuplicateIDs_LastWriteWinsAndIndexConsistent(t *testing.T) {
 	}
 }
 
+func TestBatchSet_DuplicateIDs_BeforeCommit_SeesPerStepTxState(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{AutoBatchMax: 1})
+
+	if err := db.Set(1, &Rec{Name: "seed", Age: 21}); err != nil {
+		t.Fatalf("seed Set: %v", err)
+	}
+
+	var seen []string
+	err := db.BatchSet(
+		[]uint64{1, 1},
+		[]*Rec{
+			{Name: "first", Age: 30},
+			{Name: "second", Age: 40},
+		},
+		BeforeCommit(func(tx *bbolt.Tx, key uint64, oldValue, newValue *Rec) error {
+			raw := tx.Bucket(db.bucket).Get(db.keyFromID(key))
+			if raw == nil {
+				return fmt.Errorf("missing value for id=%d inside BeforeCommit", key)
+			}
+			current, err := db.decode(raw)
+			if err != nil {
+				return fmt.Errorf("decode current tx value: %w", err)
+			}
+			if current.Name != newValue.Name || current.Age != newValue.Age {
+				return fmt.Errorf("tx value mismatch: got=%#v want=%#v", current, newValue)
+			}
+			seen = append(seen, current.Name)
+			return nil
+		}),
+	)
+	if err != nil {
+		t.Fatalf("BatchSet duplicate ids with BeforeCommit: %v", err)
+	}
+
+	if !slices.Equal(seen, []string{"first", "second"}) {
+		t.Fatalf("unexpected BeforeCommit observation order: %v", seen)
+	}
+}
+
 func TestSet_NilValue_ReturnsErrNilValueAndNoWrites(t *testing.T) {
-	db, _ := openTempDBUint64(t, Options{BatchMax: 1})
+	db, _ := openTempDBUint64(t, Options{AutoBatchMax: 1})
 
 	err := db.Set(1, nil)
 	if err == nil || !errors.Is(err, ErrNilValue) {
@@ -2578,7 +2703,7 @@ func TestSet_NilValue_ReturnsErrNilValueAndNoWrites(t *testing.T) {
 }
 
 func TestBatchSet_NilValue_ReturnsErrNilValueAndAtomic(t *testing.T) {
-	db, _ := openTempDBUint64(t, Options{BatchMax: 1})
+	db, _ := openTempDBUint64(t, Options{AutoBatchMax: 1})
 
 	base := &Rec{Name: "base", Age: 21, Tags: []string{"go"}, Meta: Meta{Country: "NL"}}
 	if err := db.Set(1, base); err != nil {
@@ -2632,7 +2757,7 @@ func TestBatchSet_NilValue_ReturnsErrNilValueAndAtomic(t *testing.T) {
 }
 
 func TestBatchPatchBatchDelete_DuplicateIDs_IndexConsistency(t *testing.T) {
-	db, _ := openTempDBUint64(t, Options{BatchMax: 1})
+	db, _ := openTempDBUint64(t, Options{AutoBatchMax: 1})
 
 	if err := db.Set(1, &Rec{Name: "n1", Age: 10, Tags: []string{"go"}, Meta: Meta{Country: "NL"}}); err != nil {
 		t.Fatalf("Set(1): %v", err)
@@ -2711,8 +2836,50 @@ func TestBatchPatchBatchDelete_DuplicateIDs_IndexConsistency(t *testing.T) {
 	}
 }
 
+func TestBatchPatch_DuplicateIDs_BeforeCommit_SeesPerStepTxState(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{AutoBatchMax: 1})
+
+	if err := db.Set(1, &Rec{Name: "seed", Age: 21}); err != nil {
+		t.Fatalf("seed Set: %v", err)
+	}
+
+	call := 0
+	var seen []string
+	err := db.BatchPatch(
+		[]uint64{1, 1},
+		[]Field{{Name: "age", Value: 99}},
+		BeforeProcess(func(_ uint64, value *Rec) error {
+			call++
+			value.Name = fmt.Sprintf("patched-%d", call)
+			return nil
+		}),
+		BeforeCommit(func(tx *bbolt.Tx, key uint64, oldValue, newValue *Rec) error {
+			raw := tx.Bucket(db.bucket).Get(db.keyFromID(key))
+			if raw == nil {
+				return fmt.Errorf("missing value for id=%d inside BeforeCommit", key)
+			}
+			current, err := db.decode(raw)
+			if err != nil {
+				return fmt.Errorf("decode current tx value: %w", err)
+			}
+			if current.Name != newValue.Name || current.Age != newValue.Age {
+				return fmt.Errorf("tx value mismatch: got=%#v want=%#v", current, newValue)
+			}
+			seen = append(seen, current.Name)
+			return nil
+		}),
+	)
+	if err != nil {
+		t.Fatalf("BatchPatch duplicate ids with BeforeCommit: %v", err)
+	}
+
+	if !slices.Equal(seen, []string{"patched-1", "patched-2"}) {
+		t.Fatalf("unexpected BeforeCommit observation order: %v", seen)
+	}
+}
+
 func TestBatchPatch_DecodeError_RollsBackEarlierWrites(t *testing.T) {
-	db, _ := openTempDBUint64(t, Options{BatchMax: 1})
+	db, _ := openTempDBUint64(t, Options{AutoBatchMax: 1})
 
 	if err := db.Set(1, &Rec{Name: "a", Age: 10, Meta: Meta{Country: "NL"}}); err != nil {
 		t.Fatalf("Set(1): %v", err)
@@ -2784,7 +2951,7 @@ func TestBatchPatch_DecodeError_RollsBackEarlierWrites(t *testing.T) {
 }
 
 func TestBatchDelete_DecodeError_RollsBackEarlierDeletes(t *testing.T) {
-	db, _ := openTempDBUint64(t, Options{BatchMax: 1})
+	db, _ := openTempDBUint64(t, Options{AutoBatchMax: 1})
 
 	if err := db.Set(1, &Rec{Name: "a", Age: 10, Meta: Meta{Country: "NL"}}); err != nil {
 		t.Fatalf("Set(1): %v", err)
@@ -2900,7 +3067,7 @@ func TestMultiWrite_CallbackError_RollbackDataAndIndex(t *testing.T) {
 	for _, c := range cases {
 		c := c
 		t.Run(c.name, func(t *testing.T) {
-			db, _ := openTempDBUint64(t, Options{BatchMax: 1})
+			db, _ := openTempDBUint64(t, Options{AutoBatchMax: 1})
 
 			base := map[uint64]*Rec{
 				1: {Name: "base-1", Age: 21, Tags: []string{"go"}, Meta: Meta{Country: "NL"}},
@@ -2975,7 +3142,7 @@ func TestNew_DefaultExecOptions_ApplyToWrites(t *testing.T) {
 	var calls []string
 	db, err := New[uint64, Rec](
 		raw,
-		Options{BatchMax: 1},
+		Options{AutoBatchMax: 1},
 		PatchStrict,
 		BeforeProcess(func(_ uint64, value *Rec) error {
 			value.Name = "pre-" + value.Name
@@ -3040,7 +3207,7 @@ func TestNew_DefaultExecOptions_ApplyToWrites(t *testing.T) {
 }
 
 func TestMultiWrite_CallbackError_RandomizedAtomicRollback(t *testing.T) {
-	db, _ := openTempDBUint64(t, Options{BatchMax: 1})
+	db, _ := openTempDBUint64(t, Options{AutoBatchMax: 1})
 
 	r := newRand(20260327)
 	countries := []string{"NL", "PL", "DE", "US"}
@@ -3448,7 +3615,7 @@ func TestBatchPatch_WithPatchStrict_ValidationError_IsAtomic(t *testing.T) {
 	for _, c := range cases {
 		c := c
 		t.Run(c.name, func(t *testing.T) {
-			db, _ := openTempDBUint64(t, Options{BatchMax: 1})
+			db, _ := openTempDBUint64(t, Options{AutoBatchMax: 1})
 
 			if err := db.Set(1, &Rec{Name: "n1", Age: 10, Meta: Meta{Country: "NL"}}); err != nil {
 				t.Fatalf("Set(1): %v", err)
@@ -3671,8 +3838,7 @@ func openTempDBStringUnique(t *testing.T, options ...Options) (*DB[string, Strin
 }
 
 func TestBatchSet_CallbackError_DoesNotGrowStrMap(t *testing.T) {
-	opts := Options{BatchAllowCallbacks: true}
-	db, _ := openTempDBStringProduct(t, opts)
+	db, _ := openTempDBStringProduct(t)
 
 	if err := db.Set("p1", &Product{SKU: "p1", Price: 10}); err != nil {
 		t.Fatalf("seed Set: %v", err)
@@ -3695,7 +3861,7 @@ func TestBatchSet_CallbackError_DoesNotGrowStrMap(t *testing.T) {
 		t.Fatalf("strmap grew after batch callback rollback: initial=%d after=%d", initial, after)
 	}
 
-	bs := db.BatchStats()
+	bs := db.AutoBatchStats()
 	if bs.CallbackOps == 0 || bs.CallbackErrors == 0 {
 		t.Fatalf("expected callback error via batch path, stats=%+v", bs)
 	}
@@ -3722,7 +3888,7 @@ func TestBatchSet_UniqueReject_DoesNotGrowStrMap(t *testing.T) {
 		t.Fatalf("strmap grew after batch unique reject: initial=%d after=%d", initial, after)
 	}
 
-	bs := db.BatchStats()
+	bs := db.AutoBatchStats()
 	if bs.UniqueRejected == 0 {
 		t.Fatalf("expected unique rejection in batch stats, got %+v", bs)
 	}

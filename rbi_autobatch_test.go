@@ -13,7 +13,7 @@ import (
 )
 
 func TestBatch_BeforeCommit_CallbacksRunForSetPatchDelete(t *testing.T) {
-	db, _ := openTempDBUint64(t, Options{BatchAllowCallbacks: true})
+	db, _ := openTempDBUint64(t)
 
 	var (
 		mu     sync.Mutex
@@ -53,7 +53,7 @@ func TestBatch_BeforeCommit_CallbacksRunForSetPatchDelete(t *testing.T) {
 		t.Fatalf("unexpected callback events: got=%v want=%v", events, want)
 	}
 
-	bs := db.BatchStats()
+	bs := db.AutoBatchStats()
 	if bs.CallbackOps < 3 {
 		t.Fatalf("expected at least 3 callback ops in combiner stats, got %d", bs.CallbackOps)
 	}
@@ -61,12 +61,12 @@ func TestBatch_BeforeCommit_CallbacksRunForSetPatchDelete(t *testing.T) {
 
 func TestBatch_SequentialSet_DoesNotProduceCombinedBatches(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
-		BatchWindow:   5 * time.Millisecond,
-		BatchMax:      16,
-		BatchMaxQueue: 64,
+		AutoBatchWindow:   5 * time.Millisecond,
+		AutoBatchMax:      16,
+		AutoBatchMaxQueue: 64,
 	})
 
-	before := db.BatchStats()
+	before := db.AutoBatchStats()
 	for i := 1; i <= 64; i++ {
 		if err := db.Set(uint64(i), &Rec{
 			Name: fmt.Sprintf("seq-%03d", i),
@@ -75,7 +75,7 @@ func TestBatch_SequentialSet_DoesNotProduceCombinedBatches(t *testing.T) {
 			t.Fatalf("Set(%d): %v", i, err)
 		}
 	}
-	after := db.BatchStats()
+	after := db.AutoBatchStats()
 
 	enqueuedDelta := after.Enqueued - before.Enqueued
 	if enqueuedDelta != 64 {
@@ -91,11 +91,11 @@ func TestBatch_SequentialSet_DoesNotProduceCombinedBatches(t *testing.T) {
 
 func TestBatch_DisabledCombiner_SkipsCombinerPath(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
-		BatchWindow: 5 * time.Millisecond,
-		BatchMax:    1,
+		AutoBatchWindow: 5 * time.Millisecond,
+		AutoBatchMax:    1,
 	})
 
-	before := db.BatchStats()
+	before := db.AutoBatchStats()
 	if before.Enabled {
 		t.Fatalf("expected combiner to be disabled")
 	}
@@ -104,7 +104,7 @@ func TestBatch_DisabledCombiner_SkipsCombinerPath(t *testing.T) {
 		t.Fatalf("Set: %v", err)
 	}
 
-	after := db.BatchStats()
+	after := db.AutoBatchStats()
 	if after.Submitted != before.Submitted || after.Enqueued != before.Enqueued || after.Dequeued != before.Dequeued {
 		t.Fatalf("expected disabled combiner to skip queue path, before=%+v after=%+v", before, after)
 	}
@@ -113,16 +113,16 @@ func TestBatch_DisabledCombiner_SkipsCombinerPath(t *testing.T) {
 	}
 }
 
-func TestBatch_CallbacksBypassCombinerWhenDisabled(t *testing.T) {
+func TestBatch_NoAutoBatch_BypassesCombiner(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
-		BatchWindow:   5 * time.Millisecond,
-		BatchMax:      16,
-		BatchMaxQueue: 64,
+		AutoBatchWindow:   5 * time.Millisecond,
+		AutoBatchMax:      16,
+		AutoBatchMaxQueue: 64,
 	})
 
-	before := db.BatchStats()
+	before := db.AutoBatchStats()
 	calls := 0
-	err := db.Set(1, &Rec{Name: "alice", Age: 10}, BeforeCommit(func(_ *bbolt.Tx, _ uint64, _, _ *Rec) error {
+	err := db.Set(1, &Rec{Name: "alice", Age: 10}, NoAutoBatch[uint64, Rec], BeforeCommit(func(_ *bbolt.Tx, _ uint64, _, _ *Rec) error {
 		calls++
 		return nil
 	}))
@@ -133,53 +133,20 @@ func TestBatch_CallbacksBypassCombinerWhenDisabled(t *testing.T) {
 		t.Fatalf("expected callback to run exactly once, got %d", calls)
 	}
 
-	after := db.BatchStats()
-	if after.Enqueued != before.Enqueued {
-		t.Fatalf("expected callback write to bypass combiner queue, before=%+v after=%+v", before, after)
-	}
-	if after.FallbackCallbacks <= before.FallbackCallbacks {
-		t.Fatalf("expected fallback-callback counter increment, before=%+v after=%+v", before, after)
+	after := db.AutoBatchStats()
+	if after.Submitted != before.Submitted || after.Enqueued != before.Enqueued || after.Dequeued != before.Dequeued {
+		t.Fatalf("expected NoAutoBatch write to bypass combiner queue, before=%+v after=%+v", before, after)
 	}
 	if after.CallbackOps != before.CallbackOps {
 		t.Fatalf("expected no combiner callback executions on bypass path, before=%+v after=%+v", before, after)
 	}
 }
 
-func TestBatch_BeforeStoreBypassesCombinerWhenDisabled(t *testing.T) {
+func TestBatch_CallbackRequestsStayBatchable(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
-		BatchWindow:   5 * time.Millisecond,
-		BatchMax:      16,
-		BatchMaxQueue: 64,
-	})
-
-	before := db.BatchStats()
-	calls := 0
-	err := db.Set(1, &Rec{Name: "alice", Age: 10}, BeforeStore(func(_ uint64, _ *Rec, newValue *Rec) error {
-		calls++
-		newValue.Name = "mutated"
-		return nil
-	}))
-	if err != nil {
-		t.Fatalf("Set: %v", err)
-	}
-	if calls != 1 {
-		t.Fatalf("expected BeforeStore to run exactly once, got %d", calls)
-	}
-
-	after := db.BatchStats()
-	if after.Enqueued != before.Enqueued {
-		t.Fatalf("expected BeforeStore write to bypass combiner queue, before=%+v after=%+v", before, after)
-	}
-	if after.FallbackCallbacks <= before.FallbackCallbacks {
-		t.Fatalf("expected fallback-callback counter increment, before=%+v after=%+v", before, after)
-	}
-}
-
-func TestBatch_CallbackBarrier_RespectsBatchAllowCallbacks(t *testing.T) {
-	db, _ := openTempDBUint64(t, Options{
-		BatchWindow:   5 * time.Millisecond,
-		BatchMax:      16,
-		BatchMaxQueue: 64,
+		AutoBatchWindow:   5 * time.Millisecond,
+		AutoBatchMax:      16,
+		AutoBatchMaxQueue: 64,
 	})
 
 	cb := func(*bbolt.Tx, uint64, *Rec, *Rec) error { return nil }
@@ -191,33 +158,20 @@ func TestBatch_CallbackBarrier_RespectsBatchAllowCallbacks(t *testing.T) {
 		return req
 	}
 
-	loadQueue := func(allow bool) {
-		db.combiner.mu.Lock()
-		db.combiner.allowCallbacks = allow
-		db.combiner.window = 0
-		db.combiner.maxOps = 16
-		db.combiner.running = true
-		db.combiner.queue = []*combineRequest[uint64, Rec]{
-			makeReq(1, false),
-			makeReq(2, true),
-			makeReq(3, false),
-		}
-		db.combiner.mu.Unlock()
+	db.combiner.mu.Lock()
+	db.combiner.window = 0
+	db.combiner.maxOps = 16
+	db.combiner.running = true
+	db.combiner.queue = []*combineRequest[uint64, Rec]{
+		makeReq(1, false),
+		makeReq(2, true),
+		makeReq(3, false),
 	}
+	db.combiner.mu.Unlock()
 
-	loadQueue(false)
 	batch := db.popCombinedBatch()
-	if len(batch) != 1 {
-		t.Fatalf("expected callback barrier to cut batch to 1 when disabled, got %d", len(batch))
-	}
-	if len(batch[0].beforeCommit) != 0 {
-		t.Fatalf("expected first request without callbacks, got callbacks=%d", len(batch[0].beforeCommit))
-	}
-
-	loadQueue(true)
-	batch = db.popCombinedBatch()
 	if len(batch) != 3 {
-		t.Fatalf("expected callbacks to be batchable when enabled, got %d", len(batch))
+		t.Fatalf("expected callbacks to remain batchable, got %d", len(batch))
 	}
 	if len(batch[1].beforeCommit) == 0 {
 		t.Fatalf("expected middle request with callback to stay in combined batch")
@@ -226,9 +180,9 @@ func TestBatch_CallbackBarrier_RespectsBatchAllowCallbacks(t *testing.T) {
 
 func TestBatch_PatchUnique_QueuedIntoCombiner(t *testing.T) {
 	db, _ := openTempDBUint64Unique(t, Options{
-		BatchWindow:   5 * time.Millisecond,
-		BatchMax:      16,
-		BatchMaxQueue: 256,
+		AutoBatchWindow:   5 * time.Millisecond,
+		AutoBatchMax:      16,
+		AutoBatchMaxQueue: 256,
 	})
 
 	if err := db.Set(1, &UniqueTestRec{Email: "a@x", Code: 1}); err != nil {
@@ -238,11 +192,11 @@ func TestBatch_PatchUnique_QueuedIntoCombiner(t *testing.T) {
 		t.Fatalf("Set(2): %v", err)
 	}
 
-	before := db.BatchStats()
+	before := db.AutoBatchStats()
 	if err := db.Patch(1, []Field{{Name: "email", Value: "c@x"}}); err != nil {
 		t.Fatalf("Patch unique field should use combiner path: %v", err)
 	}
-	mid := db.BatchStats()
+	mid := db.AutoBatchStats()
 	if mid.Enqueued <= before.Enqueued {
 		t.Fatalf("expected patch to be enqueued into combiner, before=%+v after=%+v", before, mid)
 	}
@@ -266,9 +220,9 @@ func TestBatch_PatchUnique_QueuedIntoCombiner(t *testing.T) {
 
 func TestBatch_DuplicatePatchSameID_NonUniqueFieldsStayCombined(t *testing.T) {
 	db, _ := openTempDBUint64Unique(t, Options{
-		BatchWindow:   5 * time.Millisecond,
-		BatchMax:      16,
-		BatchMaxQueue: 64,
+		AutoBatchWindow:   5 * time.Millisecond,
+		AutoBatchMax:      16,
+		AutoBatchMaxQueue: 64,
 	})
 
 	if err := db.Set(1, &UniqueTestRec{Email: "a@x", Code: 1, Tags: []string{"seed"}}); err != nil {
@@ -339,9 +293,9 @@ func TestBatch_DuplicatePatchSameID_NonUniqueFieldsStayCombined(t *testing.T) {
 
 func TestBatch_DuplicatePatchSameID_UniqueFieldCutsBatch(t *testing.T) {
 	db, _ := openTempDBUint64Unique(t, Options{
-		BatchWindow:   5 * time.Millisecond,
-		BatchMax:      16,
-		BatchMaxQueue: 64,
+		AutoBatchWindow:   5 * time.Millisecond,
+		AutoBatchMax:      16,
+		AutoBatchMaxQueue: 64,
 	})
 
 	req1 := &combineRequest[uint64, UniqueTestRec]{
@@ -384,10 +338,9 @@ func TestBatch_DuplicatePatchSameID_UniqueFieldCutsBatch(t *testing.T) {
 
 func TestBatch_DuplicatePatchSameID_BeforeStoreOnUniqueDBCutsBatch(t *testing.T) {
 	db, _ := openTempDBUint64Unique(t, Options{
-		BatchWindow:         5 * time.Millisecond,
-		BatchMax:            16,
-		BatchMaxQueue:       64,
-		BatchAllowCallbacks: true,
+		AutoBatchWindow:   5 * time.Millisecond,
+		AutoBatchMax:      16,
+		AutoBatchMaxQueue: 64,
 	})
 
 	cb := func(_ uint64, _ *UniqueTestRec, newValue *UniqueTestRec) error {
@@ -443,10 +396,9 @@ func TestBatch_DuplicatePatchSameID_BeforeStoreOnUniqueDBCutsBatch(t *testing.T)
 
 func TestBatch_DuplicatePatchSameID_BeforeProcessOnUniqueDBCutsBatch(t *testing.T) {
 	db, _ := openTempDBUint64Unique(t, Options{
-		BatchWindow:         5 * time.Millisecond,
-		BatchMax:            16,
-		BatchMaxQueue:       64,
-		BatchAllowCallbacks: true,
+		AutoBatchWindow:   5 * time.Millisecond,
+		AutoBatchMax:      16,
+		AutoBatchMaxQueue: 64,
 	})
 
 	cb := func(_ uint64, newValue *UniqueTestRec) error {
@@ -502,9 +454,9 @@ func TestBatch_DuplicatePatchSameID_BeforeProcessOnUniqueDBCutsBatch(t *testing.
 
 func TestBatch_SetDeleteSameID_CoalescedToLastWrite(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
-		BatchWindow:   5 * time.Millisecond,
-		BatchMax:      16,
-		BatchMaxQueue: 64,
+		AutoBatchWindow:   5 * time.Millisecond,
+		AutoBatchMax:      16,
+		AutoBatchMaxQueue: 64,
 	})
 
 	if err := db.Set(1, &Rec{Name: "seed", Age: 11}); err != nil {
@@ -591,16 +543,16 @@ func TestBatch_SetDeleteSameID_CoalescedToLastWrite(t *testing.T) {
 		t.Fatalf("id=2 unexpected value: %#v", got2)
 	}
 
-	if st := db.BatchStats(); st.CoalescedSetDelete < 2 {
+	if st := db.AutoBatchStats(); st.CoalescedSetDelete < 2 {
 		t.Fatalf("expected at least 2 coalesced set/delete ops, got %d (stats=%+v)", st.CoalescedSetDelete, st)
 	}
 }
 
 func TestBatch_CoalescedChain_PropagatesTerminalError(t *testing.T) {
 	db, _ := openTempDBUint64Unique(t, Options{
-		BatchWindow:   5 * time.Millisecond,
-		BatchMax:      16,
-		BatchMaxQueue: 64,
+		AutoBatchWindow:   5 * time.Millisecond,
+		AutoBatchMax:      16,
+		AutoBatchMaxQueue: 64,
 	})
 
 	if err := db.Set(1, &UniqueTestRec{Email: "seed@x", Code: 1}); err != nil {
@@ -742,9 +694,9 @@ func TestBatch_CombinedPatchFailures_IsolateFailedRequest(t *testing.T) {
 		c := c
 		t.Run(c.name, func(t *testing.T) {
 			db, _ := openTempDBUint64(t, Options{
-				BatchWindow:   5 * time.Millisecond,
-				BatchMax:      16,
-				BatchMaxQueue: 64,
+				AutoBatchWindow:   5 * time.Millisecond,
+				AutoBatchMax:      16,
+				AutoBatchMaxQueue: 64,
 			})
 
 			if err := db.Set(1, &Rec{Name: "seed-1", Age: 10, Meta: Meta{Country: "NL"}}); err != nil {
@@ -806,12 +758,12 @@ func TestBatch_CombinedPatchFailures_IsolateFailedRequest(t *testing.T) {
 
 func TestBatch_QueueFullFallback_UsesDirectPath(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
-		BatchWindow:   5 * time.Millisecond,
-		BatchMax:      16,
-		BatchMaxQueue: 1,
+		AutoBatchWindow:   5 * time.Millisecond,
+		AutoBatchMax:      16,
+		AutoBatchMaxQueue: 1,
 	})
 
-	if st := db.BatchStats(); !st.Enabled {
+	if st := db.AutoBatchStats(); !st.Enabled {
 		t.Fatalf("expected combiner enabled")
 	}
 
@@ -828,11 +780,11 @@ func TestBatch_QueueFullFallback_UsesDirectPath(t *testing.T) {
 		db.combiner.mu.Unlock()
 	}()
 
-	before := db.BatchStats()
+	before := db.AutoBatchStats()
 	if err := db.Set(1, &Rec{Name: "fallback", Age: 42, Meta: Meta{Country: "US"}}); err != nil {
 		t.Fatalf("Set must succeed via direct fallback path, got: %v", err)
 	}
-	after := db.BatchStats()
+	after := db.AutoBatchStats()
 
 	if after.FallbackQueueFull <= before.FallbackQueueFull {
 		t.Fatalf("expected queue-full fallback accounting increment, before=%+v after=%+v", before, after)
@@ -870,8 +822,8 @@ func TestBatch_BeforeCommitError_RollsBack(t *testing.T) {
 	}
 }
 
-func TestBatch_BeforeCommitError_IsolatesFailedRequest_WhenCallbacksAllowed(t *testing.T) {
-	db, _ := openTempDBUint64(t, Options{BatchAllowCallbacks: true})
+func TestBatch_BeforeCommitError_IsolatesFailedRequest(t *testing.T) {
+	db, _ := openTempDBUint64(t)
 
 	encode := func(v *Rec) []byte {
 		t.Helper()
@@ -929,7 +881,7 @@ func TestBatch_BeforeCommitError_IsolatesFailedRequest_WhenCallbacksAllowed(t *t
 }
 
 func TestBatch_BeforeCommitError_Isolation_RechecksUniqueAfterRetry(t *testing.T) {
-	db, _ := openTempDBUint64Unique(t, Options{BatchAllowCallbacks: true})
+	db, _ := openTempDBUint64Unique(t)
 
 	encode := func(v *UniqueTestRec) []byte {
 		t.Helper()
@@ -987,7 +939,7 @@ func TestBatch_BeforeCommitError_Isolation_RechecksUniqueAfterRetry(t *testing.T
 }
 
 func TestBatch_BeforeStore_RerunsFromBaselineOnRetry(t *testing.T) {
-	db, _ := openTempDBUint64(t, Options{BatchAllowCallbacks: true})
+	db, _ := openTempDBUint64(t)
 
 	encode := func(v *Rec) []byte {
 		t.Helper()

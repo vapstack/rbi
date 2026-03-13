@@ -99,6 +99,18 @@ func inheritNumericRangeBucketCache(prev *indexSnapshot, reuse bool) *sync.Map {
 	return newNumericRangeBucketCache()
 }
 
+func (db *DB[K, V]) broadcastSnapshotWaitersLocked() {
+	if db.snapshot.wait != nil {
+		db.snapshot.wait.Broadcast()
+	}
+}
+
+func (db *DB[K, V]) broadcastSnapshotWaiters() {
+	db.snapshot.mu.Lock()
+	db.broadcastSnapshotWaitersLocked()
+	db.snapshot.mu.Unlock()
+}
+
 func (db *DB[K, V]) publishSnapshotNoLock(txID uint64) {
 	db.publishSnapshotWithTxDeltaNoLock(txID, nil, nil, nil, nil)
 }
@@ -319,7 +331,11 @@ func (db *DB[K, V]) stopSnapshotCompactor() {
 	if db.snapshot.compactStop == nil || db.snapshot.compactDone == nil {
 		return
 	}
-	close(db.snapshot.compactStop)
+	select {
+	case <-db.snapshot.compactStop:
+	default:
+		close(db.snapshot.compactStop)
+	}
 	<-db.snapshot.compactDone
 }
 
@@ -520,6 +536,10 @@ func (db *DB[K, V]) snapshotCompactorLoop() {
 	}
 
 	for {
+		if db.broken.Load() {
+			stopIdleTimer()
+			return
+		}
 		select {
 
 		case <-db.snapshot.compactStop:
@@ -536,6 +556,10 @@ func (db *DB[K, V]) snapshotCompactorLoop() {
 			continue
 
 		case <-db.snapshot.compactReq:
+		}
+		if db.broken.Load() {
+			stopIdleTimer()
+			return
 		}
 
 		force := db.snapshot.compactForcePending.Swap(false)
@@ -569,6 +593,9 @@ func (db *DB[K, V]) snapshotCompactorLoop() {
 }
 
 func (db *DB[K, V]) runSnapshotCompaction(force bool) bool {
+	if db.broken.Load() {
+		return false
+	}
 	maxIters := int(db.options.SnapshotCompactorMaxIterationsPerRun)
 	if maxIters <= 0 {
 		return false
@@ -2264,6 +2291,7 @@ func (db *DB[K, V]) registerSnapshot(s *indexSnapshot) {
 	ref.pending = false
 
 	db.pruneSnapshotsLocked()
+	db.broadcastSnapshotWaitersLocked()
 }
 
 func (db *DB[K, V]) markPending(txID uint64) {
@@ -2303,57 +2331,48 @@ func (db *DB[K, V]) clearPending(txID uint64) {
 		releaseSnapshotRef(ref)
 	}
 	db.pruneSnapshotsLocked()
+	db.broadcastSnapshotWaitersLocked()
 }
 
-func (db *DB[K, V]) isPending(txID uint64) bool {
+func (db *DB[K, V]) snapshotRefStatus(txID uint64) (exists, pending bool) {
 	db.snapshot.mu.RLock()
 	defer db.snapshot.mu.RUnlock()
 	ref := db.snapshot.byTx[txID]
-	return ref != nil && ref.pending
+	if ref == nil {
+		return false, false
+	}
+	return true, ref.pending
 }
 
-func (db *DB[K, V]) pinByTxID(txID uint64) (*indexSnapshot, bool) {
+func (db *DB[K, V]) pinSnapshotRefByTxID(txID uint64) (*indexSnapshot, *snapshotRef, bool) {
 	db.snapshot.mu.RLock()
 	defer db.snapshot.mu.RUnlock()
 
 	ref := db.snapshot.byTx[txID]
 	if ref == nil || ref.snap == nil {
-		return nil, false
+		return nil, nil, false
 	}
 	ref.refs.Add(1)
-	return ref.snap, true
+	return ref.snap, ref, true
 }
 
-func (db *DB[K, V]) pinFloorByTxID(txID uint64) (*indexSnapshot, uint64, bool) {
-	db.snapshot.mu.RLock()
-	defer db.snapshot.mu.RUnlock()
-
-	var (
-		bestTx  uint64
-		bestRef *snapshotRef
-	)
-	for sid, ref := range db.snapshot.byTx {
-		if sid > txID || ref == nil || ref.snap == nil {
-			continue
-		}
-		if bestRef == nil || sid > bestTx {
-			bestTx = sid
-			bestRef = ref
-		}
-	}
-	if bestRef == nil {
-		return nil, 0, false
-	}
-	bestRef.refs.Add(1)
-	return bestRef.snap, bestTx, true
+func (db *DB[K, V]) pinByTxID(txID uint64) (*indexSnapshot, bool) {
+	snap, _, ok := db.pinSnapshotRefByTxID(txID)
+	return snap, ok
 }
 
-func (db *DB[K, V]) pinByTxIDWait(txID uint64, timeout time.Duration) (*indexSnapshot, bool) {
-	deadline := time.Now().Add(timeout)
-	wait := 5 * time.Microsecond
+func (db *DB[K, V]) pinSnapshotRefByTxIDWait(txID uint64) (*indexSnapshot, *snapshotRef, bool) {
+	db.snapshot.mu.Lock()
+	defer db.snapshot.mu.Unlock()
+
 	for {
-		if snap, ok := db.pinByTxID(txID); ok {
-			return snap, true
+		ref := db.snapshot.byTx[txID]
+		if ref != nil && ref.snap != nil {
+			ref.refs.Add(1)
+			return ref.snap, ref, true
+		}
+		if db.unavailableErr() != nil {
+			return nil, nil, false
 		}
 		latestTx := uint64(0)
 		if latest := db.snapshot.current.Load(); latest != nil {
@@ -2364,32 +2383,27 @@ func (db *DB[K, V]) pinByTxIDWait(txID uint64, timeout time.Duration) (*indexSna
 			// Snapshot publish is monotonic by txID for this DB instance.
 			// If latest already moved past target txID and target is absent in
 			// registry, waiting for this txID is pointless.
-			return nil, false
+			return nil, nil, false
 		}
 
-		if !db.isPending(txID) {
+		if ref == nil || !ref.pending {
 			// Target txID is not pending:
 			// - latest < txID: external/non-indexed txID ahead of index writer.
 			// - latest == txID: registry hole for current txID.
 			// In both cases waiting is pointless; caller should retry/fallback.
-			return nil, false
+			return nil, nil, false
 		}
 
-		if time.Now().After(deadline) {
-			return nil, false
-		}
-		time.Sleep(wait)
-		if wait < 500*time.Microsecond {
-			wait *= 2
-		}
+		db.snapshot.wait.Wait()
 	}
 }
 
-func (db *DB[K, V]) unpinByTxID(txID uint64) {
-	db.snapshot.mu.RLock()
-	defer db.snapshot.mu.RUnlock()
+func (db *DB[K, V]) pinByTxIDWait(txID uint64) (*indexSnapshot, bool) {
+	snap, _, ok := db.pinSnapshotRefByTxIDWait(txID)
+	return snap, ok
+}
 
-	ref := db.snapshot.byTx[txID]
+func (db *DB[K, V]) unpinSnapshotRef(ref *snapshotRef) {
 	if ref == nil {
 		return
 	}
@@ -2399,6 +2413,13 @@ func (db *DB[K, V]) unpinByTxID(txID uint64) {
 	if refs <= 0 && db.snapshot.compactPinsBlocked.Load() {
 		db.noteSnapshotActivity()
 	}
+}
+
+func (db *DB[K, V]) unpinByTxID(txID uint64) {
+	db.snapshot.mu.RLock()
+	ref := db.snapshot.byTx[txID]
+	db.snapshot.mu.RUnlock()
+	db.unpinSnapshotRef(ref)
 }
 
 func (db *DB[K, V]) pruneSnapshotsLocked() {

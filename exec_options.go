@@ -2,15 +2,16 @@ package rbi
 
 import "go.etcd.io/bbolt"
 
+type beforeProcessFunc[K ~string | ~uint64, V any] = func(key K, value *V) error
 type beforeStoreFunc[K ~string | ~uint64, V any] = func(key K, oldValue, newValue *V) error
 type beforeCommitFunc[K ~string | ~uint64, V any] = func(tx *bbolt.Tx, key K, oldValue, newValue *V) error
-type beforeProcessFunc[K ~string | ~uint64, V any] = func(key K, value *V) error
 
 type execOptions[K ~string | ~uint64, V any] struct {
 	beforeProcess []beforeProcessFunc[K, V]
 	beforeStore   []beforeStoreFunc[K, V]
 	beforeCommit  []beforeCommitFunc[K, V]
 	cloneValue    func(K, *V) *V
+	noAutoBatch   bool
 	patchStrict   bool
 }
 
@@ -38,16 +39,13 @@ type ExecOption[K ~string | ~uint64, V any] func(*execOptions[K, V])
 //   - For Set/BatchSet, the caller must avoid concurrent mutations of the same
 //     value until the write returns.
 //   - For Patch/BatchPatch, the hook may be invoked more than once for the
-//     same logical operation when the micro-batcher retries a request.
+//     same logical operation when the auto-batcher retries a request.
 //   - Is ignored by Delete and BatchDelete.
 //
 // Because BeforeProcess may run on caller-owned values for Set/BatchSet, RBI
 // does not protect against aliasing, repeated pointers inside BatchSet, or
 // mutations remaining visible to the caller after a later write failure. Use
 // BeforeStore when isolation or oldValue access is required.
-//
-// BeforeProcess is part of value preparation and does not, by itself, force a
-// write to bypass the micro-batcher when BatchAllowCallbacks is false.
 //
 // BeforeProcess may be passed more than once. Hooks passed to New are invoked
 // before per-operation hooks.
@@ -58,6 +56,21 @@ func BeforeProcess[K ~string | ~uint64, V any](fn func(key K, value *V) error) E
 		}
 		cfg.beforeProcess = append(cfg.beforeProcess, fn)
 	}
+}
+
+// NoAutoBatch forces a single-record Set/Patch/Delete calls to bypass the
+// auto-batcher and execute directly.
+//
+// NoAutoBatch affects Set, Patch, and Delete. It is ignored by BatchSet,
+// BatchPatch, and BatchDelete because those methods already define an explicit
+// multi-record transaction boundary.
+//
+// Do not pass it to New, use Options to disable auto-batching.
+func NoAutoBatch[K ~string | ~uint64, V any](cfg *execOptions[K, V]) {
+	if cfg == nil {
+		return
+	}
+	cfg.noAutoBatch = true
 }
 
 // BeforeStore registers a callback invoked for every insert or update just

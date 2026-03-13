@@ -1002,10 +1002,9 @@ func TestRebuildIndex_ConcurrentCloseReturnsErrClosed(t *testing.T) {
 
 func TestRebuildIndex_WaitsForInFlightBatchedSet(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
-		BatchWindow:         5 * time.Millisecond,
-		BatchMax:            16,
-		BatchMaxQueue:       1024,
-		BatchAllowCallbacks: true,
+		AutoBatchWindow:   5 * time.Millisecond,
+		AutoBatchMax:      16,
+		AutoBatchMaxQueue: 1024,
 	})
 
 	setStarted := make(chan struct{})
@@ -1064,7 +1063,7 @@ func TestRebuildIndex_WaitsForInFlightBatchedSet(t *testing.T) {
 		t.Fatalf("RebuildIndex: %v", err)
 	}
 
-	if st := db.BatchStats(); st.Enqueued == 0 {
+	if st := db.AutoBatchStats(); st.Enqueued == 0 {
 		t.Fatalf("expected write-combine enqueue for Set path, got stats: %+v", st)
 	}
 
@@ -1087,9 +1086,9 @@ func TestRebuildIndex_WaitsForInFlightBatchedSet(t *testing.T) {
 
 func TestRebuildIndex_StormConcurrentMixedOps_FinalConsistency(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
-		BatchWindow:   2 * time.Millisecond,
-		BatchMax:      16,
-		BatchMaxQueue: 2048,
+		AutoBatchWindow:   2 * time.Millisecond,
+		AutoBatchMax:      16,
+		AutoBatchMaxQueue: 2048,
 	})
 
 	countries := []string{"NL", "PL", "DE", "US"}

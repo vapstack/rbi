@@ -598,7 +598,7 @@ func TestUnique_BatchPartialReject_PreservesAcceptedOpsAndIndex(t *testing.T) {
 
 func TestUnique_ExecuteBatch_MixedOps_MatchesSequentialModel(t *testing.T) {
 	dbBatch, _ := openTempDBUint64Unique(t)
-	dbSeq, _ := openTempDBUint64Unique(t, Options{BatchMax: 1})
+	dbSeq, _ := openTempDBUint64Unique(t, Options{AutoBatchMax: 1})
 
 	const idSpace = 32
 
@@ -849,7 +849,7 @@ func TestUnique_ExecuteBatch_MixedOps_MatchesSequentialModel(t *testing.T) {
 }
 
 func TestUnique_RandomMixedWrites_ModelConsistency(t *testing.T) {
-	db, _ := openTempDBUint64Unique(t, Options{BatchMax: 1})
+	db, _ := openTempDBUint64Unique(t, Options{AutoBatchMax: 1})
 
 	type modelRec struct {
 		Email string

@@ -162,7 +162,7 @@ func TestBeforeStore_Patch_MutatesFinalStoredValue(t *testing.T) {
 }
 
 func TestBeforeProcess_Set_MutatesCallerOwnedValue(t *testing.T) {
-	db, _ := openTempDBUint64(t, Options{BatchMax: 1})
+	db, _ := openTempDBUint64(t, Options{AutoBatchMax: 1})
 
 	input := &Rec{Name: "alice", Age: 10, Meta: Meta{Country: "NL"}}
 	calls := 0
@@ -248,7 +248,7 @@ func TestBeforeProcess_MissingPatch_IsNoOp(t *testing.T) {
 }
 
 func TestBeforeStore_BatchSet_SharedPointerUsesIndependentWorkingCopies(t *testing.T) {
-	db, _ := openTempDBUint64(t, Options{BatchMax: 1})
+	db, _ := openTempDBUint64(t, Options{AutoBatchMax: 1})
 
 	shared := &Rec{Name: "shared", Age: 10, Meta: Meta{Country: "NL"}}
 	err := db.BatchSet(
@@ -305,7 +305,7 @@ func TestBeforeStore_MissingPatch_IsNoOp(t *testing.T) {
 }
 
 func TestBeforeStore_CloneFunc_Set_AllowsNormalizationBeforeEncode(t *testing.T) {
-	db := openTempDBUint64BeforeStoreCloneRec(t, Options{BatchMax: 1})
+	db := openTempDBUint64BeforeStoreCloneRec(t, Options{AutoBatchMax: 1})
 
 	calls := 0
 	input := &beforeStoreCloneRec{}
@@ -349,7 +349,7 @@ func TestBeforeStore_CloneFunc_Set_AllowsNormalizationBeforeEncode(t *testing.T)
 }
 
 func TestBeforeStore_CloneFunc_BatchSet_AllowsNormalizationBeforeEncode(t *testing.T) {
-	db := openTempDBUint64BeforeStoreCloneRec(t, Options{BatchMax: 1})
+	db := openTempDBUint64BeforeStoreCloneRec(t, Options{AutoBatchMax: 1})
 
 	inputA := &beforeStoreCloneRec{}
 	inputB := &beforeStoreCloneRec{}
@@ -393,7 +393,7 @@ func TestBeforeStore_CloneFunc_BatchSet_AllowsNormalizationBeforeEncode(t *testi
 }
 
 func TestBeforeStore_CloneFunc_CombinedSet_AllowsNormalizationBeforeEncode(t *testing.T) {
-	db := openTempDBUint64BeforeStoreCloneRec(t, Options{BatchAllowCallbacks: true})
+	db := openTempDBUint64BeforeStoreCloneRec(t)
 
 	calls := 0
 	err := db.Set(
@@ -425,7 +425,7 @@ func TestBeforeStore_CloneFunc_CombinedSet_AllowsNormalizationBeforeEncode(t *te
 		t.Fatalf("unexpected stored value: %#v", got)
 	}
 
-	if st := db.BatchStats(); st.Enqueued == 0 {
+	if st := db.AutoBatchStats(); st.Enqueued == 0 {
 		t.Fatalf("expected Set with CloneFunc to use combiner path, stats=%+v", st)
 	}
 }

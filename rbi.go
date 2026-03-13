@@ -20,6 +20,7 @@ import (
 var (
 	ErrNotStructType     = errors.New("value is not a struct")
 	ErrClosed            = errors.New("database closed")
+	ErrBroken            = errors.New("index is broken")
 	ErrRebuildInProgress = errors.New("index rebuild in progress")
 	ErrInvalidQuery      = errors.New("invalid query")
 	ErrUniqueViolation   = errors.New("unique constraint violation")
@@ -32,7 +33,6 @@ var (
 
 const (
 	defaultOptionsAnalyzeInterval                   = time.Hour
-	defaultOptionsSnapshotPinWaitTimeout            = 1 * time.Second
 	defaultOptionsCalibrationSampleEvery            = 16
 	defaultBucketFillPercent                        = 0.8
 	defaultSnapshotMaterializedPredCacheMaxEntries  = 16
@@ -47,9 +47,9 @@ const (
 	defaultSnapshotCompactorMaxIterationsPerRun     = 2
 	defaultSnapshotCompactorRequestEveryNWrites     = 8
 	defaultSnapshotCompactorIdleInterval            = 2 * time.Second
-	defaultBatchWindow                              = 50 * time.Microsecond
-	defaultBatchMax                                 = 64
-	defaultBatchMaxQueue                            = 512
+	defaultAutoBatchWindow                          = 50 * time.Microsecond
+	defaultAutoBatchMax                             = 64
+	defaultAutoBatchMaxQueue                        = 512
 	defaultSnapshotDeltaCompactLargeBaseFieldKeys   = 128 << 10
 	defaultSnapshotDeltaCompactLargeBaseMinDeltaDiv = 32
 	defaultSnapshotDeltaCompactForceFieldOps        = 256 << 10
@@ -102,18 +102,6 @@ type Options struct {
 	//
 	// Default: 1
 	TraceSampleEvery int
-
-	// SnapshotPinWaitTimeout controls how long Query waits for a snapshot
-	// with matching Bolt txID to appear after opening a read transaction.
-	//
-	// Negative value disables waiting.
-	//
-	// Default: 1s
-	//
-	// Query retry budget is bounded by 30x this value.
-	// Too low can increase "snapshot is not available" errors under write bursts.
-	// Too high can increase tail latency when snapshot publication is delayed.
-	SnapshotPinWaitTimeout time.Duration
 
 	// CalibrationEnabled enables online self-calibration of planner
 	// cost coefficients using sampled query traces.
@@ -312,32 +300,36 @@ type Options struct {
 	// Higher values reduce background churn but keep layered state longer.
 	SnapshotCompactorIdleInterval time.Duration
 
-	// BatchWindow enables lightweight write micro-batching window for
+	// AutoBatchWindow enables lightweight automatic batching for parallel
 	// single-record Set/Patch/Delete operations.
 	//
-	// Negative value disables write combining.
+	// Negative value disables automatic batching.
 	//
 	// Default: 50us
 	//
 	// Typical range: 10us..500us
 	//
+	// AutoBatching is only useful when multiple goroutines issue single-record
+	// writes concurrently. Explicit BatchSet/BatchPatch/BatchDelete already
+	// control their own transaction boundaries and do not use this mechanism.
+	//
 	// Higher values can reduce write-path overhead under contention but may
 	// increase single-write latency at low load.
-	BatchWindow time.Duration
+	AutoBatchWindow time.Duration
 
-	// BatchMax limits max operations merged into one combined write tx.
+	// AutoBatchMax limits max operations merged into one combined write tx.
 	//
-	// Negative value disables effective batching.
-	// Value 1 also disables effective batching (single op per batch).
+	// Negative value disables effective auto-batching.
+	// Value 1 also disables effective auto-batching (single op per batch).
 	//
 	// Default: 64
 	//
 	// Typical range: 4..1024
 	//
 	// Very high values can create commit-size spikes and tail-latency variance.
-	BatchMax int
+	AutoBatchMax int
 
-	// BatchMaxQueue limits pending combined write requests.
+	// AutoBatchMaxQueue limits pending batch write requests.
 	//
 	// Negative value disables queue cap.
 	//
@@ -346,35 +338,7 @@ type Options struct {
 	// Typical range: 128..8192
 	//
 	// Larger values can increase memory usage under sustained overload.
-	BatchMaxQueue int
-
-	// BatchAllowCallbacks allows combiner batching for requests with one or more
-	// BeforeStore or BeforeCommit hooks.
-	//
-	// Default: false
-	//
-	// When false, any Set/Patch/Delete call with BeforeStore/BeforeCommit hooks
-	// bypasses combiner queue and is executed via direct single-write path.
-	//
-	// When true, hook-bearing requests may be combined with other writes.
-	// BeforeStore runs during request preparation; BeforeCommit runs inside the
-	// shared write transaction after the value has been written to Bolt.
-	//
-	// Limitations:
-	// - A BeforeStore error rejects only that request for the current attempt;
-	//   other requests may still proceed in the same combined transaction.
-	// - A BeforeCommit error aborts the current combined-transaction attempt.
-	//   The failed request is isolated and remaining requests are retried without it.
-	// - On such BeforeCommit abort, the whole current write transaction is
-	//   rolled back. Stored records and in-memory index state remain consistent;
-	//   no partial data/index changes from the failed attempt are published.
-	// - Non-callback transaction errors (put/delete/commit) still fail all
-	//   requests from the current combined batch.
-	// - Hook execution order follows operation order inside combined batch.
-	// - Because surviving requests can be retried after isolating a failed one,
-	//   their hooks may run more than once. Hook logic with side effects outside
-	//   this DB write transaction should be idempotent.
-	BatchAllowCallbacks bool
+	AutoBatchMaxQueue int
 
 	// NumericRangeBucketSize controls amount of sorted numeric keys grouped into one
 	// pre-aggregated bucket for range predicate acceleration.
@@ -407,9 +371,6 @@ func (o *Options) setDefaults() {
 	}
 	if o.TraceSampleEvery == 0 {
 		o.TraceSampleEvery = 1
-	}
-	if o.SnapshotPinWaitTimeout == 0 {
-		o.SnapshotPinWaitTimeout = defaultOptionsSnapshotPinWaitTimeout
 	}
 	if o.CalibrationSampleEvery == 0 {
 		o.CalibrationSampleEvery = defaultOptionsCalibrationSampleEvery
@@ -455,14 +416,14 @@ func (o *Options) setDefaults() {
 	if o.SnapshotCompactorIdleInterval == 0 {
 		o.SnapshotCompactorIdleInterval = defaultSnapshotCompactorIdleInterval
 	}
-	if o.BatchWindow == 0 {
-		o.BatchWindow = defaultBatchWindow
+	if o.AutoBatchWindow == 0 {
+		o.AutoBatchWindow = defaultAutoBatchWindow
 	}
-	if o.BatchMax == 0 {
-		o.BatchMax = defaultBatchMax
+	if o.AutoBatchMax == 0 {
+		o.AutoBatchMax = defaultAutoBatchMax
 	}
-	if o.BatchMaxQueue == 0 {
-		o.BatchMaxQueue = defaultBatchMaxQueue
+	if o.AutoBatchMaxQueue == 0 {
+		o.AutoBatchMaxQueue = defaultAutoBatchMaxQueue
 	}
 	if o.NumericRangeBucketSize == 0 {
 		o.NumericRangeBucketSize = defaultNumericRangeBucketSize
@@ -574,10 +535,7 @@ func New[K ~uint64 | ~string, V any](bolt *bbolt.DB, options Options, execOpts .
 
 		options:     &options,
 		execOptions: defaultExecOptions,
-
-		snapshot: snapshot{
-			pinWait: snapshotPinWaitTimeout(options.SnapshotPinWaitTimeout),
-		},
+		snapshot:    snapshot{},
 
 		planner: planner{
 			analyzer: analyzer{
@@ -596,6 +554,7 @@ func New[K ~uint64 | ~string, V any](bolt *bbolt.DB, options Options, execOpts .
 		},
 	}
 	db.rebuilder.cond = sync.NewCond(&db.rebuilder.mu)
+	db.snapshot.wait = sync.NewCond(&db.snapshot.mu)
 
 	var k K
 	if reflect.TypeOf(k).Kind() == reflect.String {
@@ -698,12 +657,12 @@ func (db *DB[K, V]) initIndexedFieldAccessors() {
 }
 
 func (db *DB[K, V]) initBatcher() {
-	maxOps := db.options.BatchMax
-	if maxOps <= 1 || db.options.BatchWindow <= 0 {
+	maxOps := db.options.AutoBatchMax
+	if maxOps <= 1 || db.options.AutoBatchWindow <= 0 {
 		db.combiner = combiner[K, V]{}
 		return
 	}
-	maxQueue := db.options.BatchMaxQueue
+	maxQueue := db.options.AutoBatchMaxQueue
 	if maxQueue < 0 {
 		maxQueue = 0
 	}
@@ -712,14 +671,12 @@ func (db *DB[K, V]) initBatcher() {
 		capHint = maxQueue
 	}
 	db.combiner = combiner[K, V]{
-		enabled:        true,
-		window:         db.options.BatchWindow,
-		maxOps:         maxOps,
-		maxQ:           maxQueue,
-		allowCallbacks: db.options.BatchAllowCallbacks,
-		queue:          make([]*combineRequest[K, V], 0, capHint),
+		enabled: true,
+		window:  db.options.AutoBatchWindow,
+		maxOps:  maxOps,
+		maxQ:    maxQueue,
+		queue:   make([]*combineRequest[K, V], 0, capHint),
 	}
-	db.combiner.retCond = sync.NewCond(&db.combiner.mu)
 }
 
 type planner struct {
@@ -764,8 +721,6 @@ type snapshot struct {
 	order []uint64
 	head  int
 
-	pinWait time.Duration
-
 	compactReq  chan struct{}
 	compactIdle chan struct{}
 	compactStop chan struct{}
@@ -784,7 +739,8 @@ type snapshot struct {
 	compactWriteSeq  atomic.Uint64
 	compactSkipUntil atomic.Uint64
 
-	mu sync.RWMutex
+	wait *sync.Cond
+	mu   sync.RWMutex
 }
 
 type indexedFieldAccessor struct {
@@ -794,18 +750,14 @@ type indexedFieldAccessor struct {
 }
 
 type combiner[K ~string | ~uint64, V any] struct {
-	enabled        bool
-	window         time.Duration
-	maxOps         int
-	maxQ           int
-	allowCallbacks bool
+	enabled bool
+	window  time.Duration
+	maxOps  int
+	maxQ    int
 
 	mu       sync.Mutex
-	retCond  *sync.Cond
 	running  bool
 	queue    []*combineRequest[K, V]
-	emitSeq  uint64
-	retSeq   uint64
 	hotUntil time.Time
 
 	submitted          atomic.Uint64
@@ -823,7 +775,6 @@ type combiner[K ~string | ~uint64, V any] struct {
 
 	fallbackDisabled    atomic.Uint64
 	fallbackQueueFull   atomic.Uint64
-	fallbackCallbacks   atomic.Uint64
 	fallbackPatchUnique atomic.Uint64
 	fallbackClosed      atomic.Uint64
 
@@ -842,8 +793,9 @@ type rebuilder struct {
 }
 
 type testHooks struct {
-	beforeCommit     func(op string) error
-	beforeStoreIndex func() error
+	beforeCommit       func(op string) error
+	afterCommitPublish func(op string)
+	beforeStoreIndex   func() error
 }
 
 type (
@@ -893,6 +845,7 @@ type (
 
 		mu     sync.RWMutex
 		closed atomic.Bool
+		broken atomic.Bool
 
 		stats Stats[K]
 
@@ -907,7 +860,7 @@ type (
 
 	// Stats is an aggregate diagnostic snapshot of DB state.
 	//
-	// It combines outputs of IndexStats, SnapshotStats, PlannerStats, CalibrationStats and BatchStats.
+	// It combines outputs of IndexStats, SnapshotStats, PlannerStats, CalibrationStats and AutoBatchStats.
 	//
 	// For scenario-specific telemetry, prefer calling the corresponding
 	// component method directly to avoid unnecessary work.
@@ -920,8 +873,8 @@ type (
 		Planner PlannerStats
 		// Calibration contains current online planner calibration state.
 		Calibration CalibrationStats
-		// Batch contains write-combiner queue/batch/fallback diagnostics.
-		Batch BatchStats
+		// AutoBatch contains auto-batcher queue/batch/fallback diagnostics.
+		AutoBatch AutoBatchStats
 	}
 
 	// PlannerStats contains planner snapshot metadata, per-field stats and sampling settings.
@@ -1005,18 +958,16 @@ type (
 		ApproxHeapBytes uint64
 	}
 
-	// BatchStats contains write-combiner queue/batch/fallback diagnostics.
-	BatchStats struct {
-		// Enabled reports whether write combining is enabled.
+	// AutoBatchStats contains auto-batcher queue/batch/fallback diagnostics.
+	AutoBatchStats struct {
+		// Enabled reports whether auto-batching is enabled.
 		Enabled bool
 		// Window is current coalescing window duration.
 		Window time.Duration
-		// MaxBatch is configured maximum combined batch size.
+		// MaxBatch is configured maximum auto-batch size.
 		MaxBatch int
 		// MaxQueue is configured maximum queue size (0 means unbounded).
 		MaxQueue int
-		// AllowCallbacks reports whether BeforeStore/BeforeCommit-bearing writes can be combined.
-		AllowCallbacks bool
 
 		// QueueLen is current pending requests in queue.
 		QueueLen int
@@ -1062,9 +1013,6 @@ type (
 		FallbackDisabled uint64
 		// FallbackQueueFull is number of write calls not queued because queue is full.
 		FallbackQueueFull uint64
-		// FallbackCallbacks is number of write calls not queued because callbacks
-		// are present and callback batching is disabled.
-		FallbackCallbacks uint64
 		// FallbackPatchUnique is a legacy counter of patch calls not queued due to
 		// potential unique-field touch (kept for compatibility; expected to stay 0).
 		FallbackPatchUnique uint64
@@ -1080,7 +1028,7 @@ type (
 		// TxCommitErrors is number of write tx commit failures.
 		TxCommitErrors uint64
 		// CallbackErrors is number of hook failures returned by BeforeStore or
-		// BeforeCommit hooks.
+		// BeforeCommit hooks inside auto-batched execution.
 		CallbackErrors uint64
 	}
 
@@ -1155,18 +1103,28 @@ func (db *DB[K, V]) EnableSync() {
 	_ = db.bolt.Sync()
 }
 
-func (db *DB[K, V]) beginOp() error {
+func (db *DB[K, V]) unavailableErr() error {
 	if db.closed.Load() {
 		return ErrClosed
+	}
+	if db.broken.Load() {
+		return ErrBroken
+	}
+	return nil
+}
+
+func (db *DB[K, V]) beginOp() error {
+	if err := db.unavailableErr(); err != nil {
+		return err
 	}
 	if db.rebuilder.active.Load() {
 		return ErrRebuildInProgress
 	}
 
 	db.rebuilder.inflight.Add(1)
-	if db.closed.Load() {
+	if err := db.unavailableErr(); err != nil {
 		db.endOp()
-		return ErrClosed
+		return err
 	}
 	if db.rebuilder.active.Load() {
 		db.endOp()
@@ -1177,12 +1135,12 @@ func (db *DB[K, V]) beginOp() error {
 
 func (db *DB[K, V]) beginOpWait() bool {
 	for {
-		if db.closed.Load() {
+		if db.unavailableErr() != nil {
 			return false
 		}
 		if !db.rebuilder.active.Load() {
 			db.rebuilder.inflight.Add(1)
-			if db.closed.Load() {
+			if db.unavailableErr() != nil {
 				db.endOp()
 				return false
 			}
@@ -1208,12 +1166,12 @@ func (db *DB[K, V]) endOp() {
 }
 
 func (db *DB[K, V]) beginRebuildSuspend() error {
-	if db.closed.Load() {
-		return ErrClosed
+	if err := db.unavailableErr(); err != nil {
+		return err
 	}
 	if !db.rebuilder.active.CompareAndSwap(false, true) {
-		if db.closed.Load() {
-			return ErrClosed
+		if err := db.unavailableErr(); err != nil {
+			return err
 		}
 		return ErrRebuildInProgress
 	}
@@ -1257,6 +1215,42 @@ func advanceBucketSequence(bucket *bbolt.Bucket) error {
 	return nil
 }
 
+func (db *DB[K, V]) tripBrokenLocked(op string, cause any) error {
+	if db.broken.CompareAndSwap(false, true) {
+		log.Printf("rbi: index entered broken state: post-commit snapshot publish failed (%v): %v", op, cause)
+		db.broadcastSnapshotWaiters()
+		if stop := db.planner.analyzer.stop; stop != nil {
+			select {
+			case <-stop:
+			default:
+				close(stop)
+			}
+		}
+		if stop := db.snapshot.compactStop; stop != nil {
+			select {
+			case <-stop:
+			default:
+				close(stop)
+			}
+		}
+	}
+	return ErrBroken
+}
+
+func (db *DB[K, V]) publishAfterCommitLocked(txID uint64, op string, publish func()) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = db.tripBrokenLocked(op, r)
+			db.clearPending(txID)
+		}
+	}()
+	if hook := db.testHooks.afterCommitPublish; hook != nil {
+		hook(op)
+	}
+	publish()
+	return nil
+}
+
 func (db *DB[K, V]) commit(tx *bbolt.Tx, op string) error {
 	if hook := db.testHooks.beforeCommit; hook != nil {
 		if err := hook(op); err != nil {
@@ -1281,8 +1275,8 @@ func (db *DB[K, V]) RebuildIndex() error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 
-	if db.closed.Load() {
-		return ErrClosed
+	if err := db.unavailableErr(); err != nil {
+		return err
 	}
 
 	if err := db.buildIndex(nil); err != nil {
@@ -1294,7 +1288,7 @@ func (db *DB[K, V]) RebuildIndex() error {
 }
 
 // Stats returns an aggregate diagnostic snapshot by combining results of
-// IndexStats, SnapshotStats, PlannerStats, CalibrationStats and BatchStats.
+// IndexStats, SnapshotStats, PlannerStats, CalibrationStats and AutoBatchStats.
 //
 // On large databases this can be expensive.
 //
@@ -1306,7 +1300,7 @@ func (db *DB[K, V]) Stats() Stats[K] {
 	s.Snapshot = db.SnapshotStats()
 	s.Planner = db.PlannerStats()
 	s.Calibration = db.CalibrationStats()
-	s.Batch = db.BatchStats()
+	s.AutoBatch = db.AutoBatchStats()
 	return s
 }
 
@@ -1427,14 +1421,13 @@ func (db *DB[K, V]) IndexStats() IndexStats[K] {
 	return idx
 }
 
-// BatchStats returns write-combiner queue/batch/fallback diagnostics.
-func (db *DB[K, V]) BatchStats() BatchStats {
-	out := BatchStats{
+// AutoBatchStats returns auto-batcher queue/batch/fallback diagnostics.
+func (db *DB[K, V]) AutoBatchStats() AutoBatchStats {
+	out := AutoBatchStats{
 		Enabled:             db.combiner.enabled,
 		Window:              db.combiner.window,
 		MaxBatch:            db.combiner.maxOps,
 		MaxQueue:            db.combiner.maxQ,
-		AllowCallbacks:      db.combiner.allowCallbacks,
 		Submitted:           db.combiner.submitted.Load(),
 		Enqueued:            db.combiner.enqueued.Load(),
 		Dequeued:            db.combiner.dequeued.Load(),
@@ -1449,7 +1442,6 @@ func (db *DB[K, V]) BatchStats() BatchStats {
 		CoalesceWaitTime:    time.Duration(db.combiner.coalesceWaitNanos.Load()),
 		FallbackDisabled:    db.combiner.fallbackDisabled.Load(),
 		FallbackQueueFull:   db.combiner.fallbackQueueFull.Load(),
-		FallbackCallbacks:   db.combiner.fallbackCallbacks.Load(),
 		FallbackPatchUnique: db.combiner.fallbackPatchUnique.Load(),
 		FallbackClosed:      db.combiner.fallbackClosed.Load(),
 		UniqueRejected:      db.combiner.uniqueRejected.Load(),
@@ -1527,6 +1519,9 @@ func (db *DB[K, V]) Close() error {
 	if !db.closed.CompareAndSwap(false, true) {
 		return nil
 	}
+	defer unregInstance(db.bolt.Path(), string(db.bucket))
+
+	db.broadcastSnapshotWaiters()
 
 	db.stopAnalyzeLoop()
 	db.stopSnapshotCompactor()
@@ -1534,11 +1529,9 @@ func (db *DB[K, V]) Close() error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 
-	unregInstance(db.bolt.Path(), string(db.bucket))
-
 	var err error
 
-	if !db.options.DisableIndexStore {
+	if !db.options.DisableIndexStore && !db.broken.Load() {
 		err = db.storeIndex()
 	}
 
@@ -1548,6 +1541,9 @@ func (db *DB[K, V]) Close() error {
 		} else {
 			log.Println("rbi: failed to persist planner calibration:", e)
 		}
+	}
+	if err == nil && db.broken.Load() {
+		err = ErrBroken
 	}
 
 	return err
@@ -1574,8 +1570,8 @@ func (db *DB[K, V]) Truncate() error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 
-	if db.closed.Load() {
-		return ErrClosed
+	if err := db.unavailableErr(); err != nil {
+		return err
 	}
 
 	if tx.Bucket(db.bucket) != nil {
@@ -1606,7 +1602,11 @@ func (db *DB[K, V]) Truncate() error {
 
 	// Keep previously published snapshots immutable for concurrent readers.
 	db.universe = roaring64.NewBitmap()
-	db.publishSnapshotNoLock(txID)
+	if err = db.publishAfterCommitLocked(txID, "truncate", func() {
+		db.publishSnapshotNoLock(txID)
+	}); err != nil {
+		return err
+	}
 
 	return nil
 }

@@ -102,8 +102,8 @@ func (db *DB[K, V]) refreshPlannerStatsWithBudget(softBudget time.Duration, useC
 }
 
 func (db *DB[K, V]) collectPlannerFieldNamesAndUniverse() (*indexSnapshot, []string, uint64, error) {
-	if db.closed.Load() {
-		return nil, nil, 0, ErrClosed
+	if err := db.unavailableErr(); err != nil {
+		return nil, nil, 0, err
 	}
 
 	s := db.getSnapshot()
@@ -137,8 +137,8 @@ func (s *indexSnapshot) universeCardinality() uint64 {
 }
 
 func (db *DB[K, V]) collectPlannerFieldStatsFromOverlay(s *indexSnapshot, fieldName string) (PlannerFieldStats, error) {
-	if db.closed.Load() {
-		return PlannerFieldStats{}, ErrClosed
+	if err := db.unavailableErr(); err != nil {
+		return PlannerFieldStats{}, err
 	}
 
 	ov := newFieldOverlay(s.fieldIndexSlice(fieldName), s.fieldDelta(fieldName))
@@ -265,7 +265,7 @@ func (db *DB[K, V]) runPlannerAnalyzeLoop(stop <-chan struct{}, done chan<- stru
 
 		err := db.refreshPlannerStatsPeriodic()
 		if err != nil {
-			if errors.Is(err, ErrClosed) {
+			if errors.Is(err, ErrClosed) || errors.Is(err, ErrBroken) {
 				return
 			}
 			if errors.Is(err, ErrRebuildInProgress) {

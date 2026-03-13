@@ -11,7 +11,6 @@ import (
 	"strconv"
 	"sync/atomic"
 	"syscall"
-	"time"
 
 	"github.com/vapstack/rbi"
 	bolt "go.etcd.io/bbolt"
@@ -31,18 +30,18 @@ func main() {
 		if stopProfiling == nil {
 			return
 		}
-		if err := stopProfiling(); err != nil {
-			log.Printf("Profiling finalize error: %v", err)
+		if err = stopProfiling(); err != nil {
+			log.Printf("Profiling finalize error: %v\n", err)
 		}
 	}()
 
 	db, rawBolt := openBenchDatabase(opts)
 	defer func() {
-		if err := db.Close(); err != nil {
-			log.Printf("Close error: %v", err)
+		if err = db.Close(); err != nil {
+			log.Printf("Close error: %v\n", err)
 		}
-		if err := rawBolt.Close(); err != nil {
-			log.Printf("Bolt close error: %v", err)
+		if err = rawBolt.Close(); err != nil {
+			log.Printf("Bolt close error: %v\n", err)
 		}
 	}()
 
@@ -134,10 +133,9 @@ func openBenchDatabase(opts benchOptions) (*rbi.DB[uint64, UserBench], *bolt.DB)
 		layerDepthLabel = strconv.Itoa(opts.snapshotDeltaLayerMaxDepth)
 	}
 
-	dbOpts.BatchMax = 1024
-	dbOpts.BatchWindow = 50 * time.Microsecond
-	dbOpts.BatchAllowCallbacks = true
-	// dbOpts.BatchMaxQueue = 2048
+	// dbOpts.AutoBatchMax = 1024
+	// dbOpts.AutoBatchWindow = 50 * time.Microsecond
+	// dbOpts.AutoBatchMaxQueue = 2048
 
 	log.Printf(
 		"Snapshot config: registry=%s field_keys=%s field_ops=%s max_fields_per_publish=%s universe_ops=%s layer_depth=%s analyze_interval=%s",

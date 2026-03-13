@@ -198,11 +198,8 @@ passed all filters and limits.
 
 `Query` runs against an index snapshot aligned with a bbolt read transaction.
 When an exact snapshot for transaction is not immediately available,
-it uses bounded waiting with a few fallbacks.
-If none of the available paths can provide a valid snapshot within the retry
-budget, `Query` returns an error.
-Retry budget is `30 * SnapshotPinWaitTimeout` (default: `30s`, because
-`SnapshotPinWaitTimeout` default is `1s`).
+it waits briefly for publication and retries with a fresh read transaction
+until a snapshot-safe path becomes available.
 
 ## Configuration
 
@@ -222,11 +219,10 @@ db, err := rbi.New[uint64, User](bolt, rbi.Options{
     CalibrationSampleEvery: 32, // 0 uses default (16), < 0 disables sampled calibration
     PersistCalibration: true, // optional auto load/save to .cal file
     
-    // Single-op write batcher settings
-    BatchWindow: 100 * time.Microsecond,
-    BatchMax: 32,
-    BatchMaxQueue: 512, // < 0 means unbounded queue, 0 uses default
-    BatchAllowCallbacks: true, // true allows combining ops with BeforeStore/BeforeCommit hooks
+    // Single-op auto-batcher settings
+    AutoBatchWindow: 100 * time.Microsecond,
+    AutoBatchMax: 128,
+    AutoBatchMaxQueue: 512, // < 0 means unbounded queue, 0 uses default
 })
 if err != nil {
     panic(err)
@@ -249,6 +245,8 @@ Available hooks/options:
 - `BeforeCommit` - runs inside the Bolt write transaction after the record
   has been written, but before commit. Useful for audit records and other
   writes to neighboring buckets.
+- `NoAutoBatch` - forces a single `Set`/`Patch`/`Delete` call to bypass the
+  auto-batcher and execute directly.
 - `CloneFunc` - optional helper for `Set`/`BatchSet` with `BeforeStore`.
   It can be used when the value becomes encodable only after normalization, or
   simply as a faster cloning path than RBI's fallback msgpack snapshotting.
@@ -259,12 +257,14 @@ Important notes:
 - `BeforeProcess` may run at different stages depending on the write method.
   Do not retain the value pointer after the hook returns.
 - For `Set`/`BatchSet`, `BeforeProcess` mutates the caller-owned value
-  directly. RBI does not protect against aliasing or restore the value if the
-  later write fails.
-- `BeforeProcess` is treated as value preparation; by itself it does not make
-  a write bypass the micro-batcher when `BatchAllowCallbacks=false`.
-- When `BatchAllowCallbacks` is `false`, writes with `BeforeStore` or
-  `BeforeCommit` bypass the micro-batcher and run directly.
+  directly. RBI does not protect against aliasing and does not restore the value 
+  if the later write fails.
+- Auto-batching is only useful for parallel single-record writes from multiple
+  goroutines. `BatchSet`/`BatchPatch`/`BatchDelete` already define their own
+  explicit transaction boundaries.
+- `BeforeProcess`, `BeforeStore`, and `BeforeCommit` remain auto-batchable by
+  default. Use `NoAutoBatch` when a specific single-record write should run
+  directly.
 - Under batching/retry, `BeforeProcess` on `Patch`/`BatchPatch`,
   `BeforeStore`, and `BeforeCommit` may run more than once for the same
   logical write, so external side effects should be idempotent.
