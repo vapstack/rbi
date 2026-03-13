@@ -19,7 +19,7 @@ const (
 	DefaultSweepDuration = 20 * time.Second
 	MaxLatencySampleSize = 250_000
 
-	DefaultCeilingStageDuration            = 10 * time.Second
+	DefaultCeilingStageDuration            = 20 * time.Second
 	DefaultCeilingDispatchQuantum          = 1 * time.Millisecond
 	DefaultCeilingQueueCap                 = 8192
 	DefaultCeilingReadFastWorkers          = 1024
@@ -27,7 +27,7 @@ const (
 	DefaultCeilingWriteUpdateWorkers       = 256
 	DefaultCeilingWriteInsertWorkers       = 16
 	DefaultCeilingReadFastGrid             = "50000,75000,100000,125000,150000,175000,200000"
-	DefaultCeilingWriteGrid                = "2000,3000,4000,5000,6000"
+	DefaultCeilingWriteGrid                = "10,100,1000,2000,3000,4000,5000"
 	DefaultCeilingReadSlowGrid             = "32,64,128,256"
 	DefaultCeilingLowWriteGrid             = "250,500,1000,1500"
 	DefaultCeilingMixedSlowOps             = 8.0
@@ -222,7 +222,7 @@ type StressCaseResult struct {
 	BatchEnqueued          uint64               `json:"batch_enqueued"`
 	BatchDequeued          uint64               `json:"batch_dequeued"`
 	BatchQueueHigh         uint64               `json:"batch_queue_high"`
-	BatchCoalesceOps       uint64               `json:"write_combine_coalesce_waits"`
+	BatchCoalesceOps       uint64               `json:"coalesce_waits"`
 }
 
 type StressWorkerResult struct {

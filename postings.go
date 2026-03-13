@@ -134,6 +134,16 @@ func (p postingList) ForEach(fn func(uint64) bool) bool {
 	return true
 }
 
+func (p postingList) Iter() roaringIter {
+	if p.IsEmpty() {
+		return emptyIter{}
+	}
+	if p.isSingleton() {
+		return newSingletonIter(p.single)
+	}
+	return p.bitmap().Iterator()
+}
+
 func (p postingList) IntersectsBitmap(other *roaring64.Bitmap) bool {
 	if other == nil || other.IsEmpty() {
 		return false
@@ -214,7 +224,7 @@ func (p *postingList) Add(id uint64) {
 	p.bm.Add(id)
 }
 
-func (p *postingList) OrPosting(other postingList) {
+func (p *postingList) Or(other postingList) {
 	if p == nil || other.IsEmpty() {
 		return
 	}
@@ -239,7 +249,7 @@ func (p *postingList) OrPosting(other postingList) {
 	p.bm.Or(other.bm)
 }
 
-func (p *postingList) RunOptimizeAdaptive() {
+func (p *postingList) OptimizeAdaptive() {
 	if p == nil || p.bm == nil || p.isSingleton() {
 		return
 	}

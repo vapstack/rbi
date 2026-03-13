@@ -55,11 +55,11 @@ func TestBatch_BeforeCommit_CallbacksRunForSetPatchDelete(t *testing.T) {
 
 	bs := db.AutoBatchStats()
 	if bs.CallbackOps < 3 {
-		t.Fatalf("expected at least 3 callback ops in combiner stats, got %d", bs.CallbackOps)
+		t.Fatalf("expected at least 3 callback ops in auto-batcher stats, got %d", bs.CallbackOps)
 	}
 }
 
-func TestBatch_SequentialSet_DoesNotProduceCombinedBatches(t *testing.T) {
+func TestBatch_SequentialSet_DoesNotProduceMultiRequestBatches(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
 		AutoBatchWindow:   5 * time.Millisecond,
 		AutoBatchMax:      16,
@@ -81,15 +81,15 @@ func TestBatch_SequentialSet_DoesNotProduceCombinedBatches(t *testing.T) {
 	if enqueuedDelta != 64 {
 		t.Fatalf("expected all sequential Set writes to be enqueued, delta=%d before=%+v after=%+v", enqueuedDelta, before, after)
 	}
-	if after.CombinedBatches != before.CombinedBatches {
-		t.Fatalf("expected no multi-request combined batches for sequential Set calls, before=%+v after=%+v", before, after)
+	if after.MultiRequestBatches != before.MultiRequestBatches {
+		t.Fatalf("expected no multi-request batches for sequential Set calls, before=%+v after=%+v", before, after)
 	}
 	if after.MaxBatchSeen > 1 {
 		t.Fatalf("expected max seen batch size to stay 1 for sequential Set calls, stats=%+v", after)
 	}
 }
 
-func TestBatch_DisabledCombiner_SkipsCombinerPath(t *testing.T) {
+func TestBatch_Disabled_SkipsBatcherPath(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
 		AutoBatchWindow: 5 * time.Millisecond,
 		AutoBatchMax:    1,
@@ -97,7 +97,7 @@ func TestBatch_DisabledCombiner_SkipsCombinerPath(t *testing.T) {
 
 	before := db.AutoBatchStats()
 	if before.Enabled {
-		t.Fatalf("expected combiner to be disabled")
+		t.Fatalf("expected auto-batcher to be disabled")
 	}
 
 	if err := db.Set(1, &Rec{Name: "alice", Age: 10}); err != nil {
@@ -106,14 +106,14 @@ func TestBatch_DisabledCombiner_SkipsCombinerPath(t *testing.T) {
 
 	after := db.AutoBatchStats()
 	if after.Submitted != before.Submitted || after.Enqueued != before.Enqueued || after.Dequeued != before.Dequeued {
-		t.Fatalf("expected disabled combiner to skip queue path, before=%+v after=%+v", before, after)
+		t.Fatalf("expected disabled auto-batcher to skip queue path, before=%+v after=%+v", before, after)
 	}
 	if after.FallbackDisabled != before.FallbackDisabled {
-		t.Fatalf("expected no disabled-fallback accounting when combiner is fully off, before=%+v after=%+v", before, after)
+		t.Fatalf("expected no disabled-fallback accounting when auto-batcher is fully off, before=%+v after=%+v", before, after)
 	}
 }
 
-func TestBatch_NoAutoBatch_BypassesCombiner(t *testing.T) {
+func TestBatch_NoAutoBatch_Bypass(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
 		AutoBatchWindow:   5 * time.Millisecond,
 		AutoBatchMax:      16,
@@ -135,10 +135,10 @@ func TestBatch_NoAutoBatch_BypassesCombiner(t *testing.T) {
 
 	after := db.AutoBatchStats()
 	if after.Submitted != before.Submitted || after.Enqueued != before.Enqueued || after.Dequeued != before.Dequeued {
-		t.Fatalf("expected NoAutoBatch write to bypass combiner queue, before=%+v after=%+v", before, after)
+		t.Fatalf("expected NoAutoBatch write to bypass auto-batcher queue, before=%+v after=%+v", before, after)
 	}
 	if after.CallbackOps != before.CallbackOps {
-		t.Fatalf("expected no combiner callback executions on bypass path, before=%+v after=%+v", before, after)
+		t.Fatalf("expected no auto-batcher callback executions on bypass path, before=%+v after=%+v", before, after)
 	}
 }
 
@@ -150,35 +150,35 @@ func TestBatch_CallbackRequestsStayBatchable(t *testing.T) {
 	})
 
 	cb := func(*bbolt.Tx, uint64, *Rec, *Rec) error { return nil }
-	makeReq := func(id uint64, withCB bool) *combineRequest[uint64, Rec] {
-		req := &combineRequest[uint64, Rec]{op: combineSet, id: id}
+	makeReq := func(id uint64, withCB bool) *autoBatchRequest[uint64, Rec] {
+		req := &autoBatchRequest[uint64, Rec]{op: autoBatchSet, id: id}
 		if withCB {
 			req.beforeCommit = []beforeCommitFunc[uint64, Rec]{cb}
 		}
 		return req
 	}
 
-	db.combiner.mu.Lock()
-	db.combiner.window = 0
-	db.combiner.maxOps = 16
-	db.combiner.running = true
-	db.combiner.queue = []*combineRequest[uint64, Rec]{
+	db.autoBatcher.mu.Lock()
+	db.autoBatcher.window = 0
+	db.autoBatcher.maxOps = 16
+	db.autoBatcher.running = true
+	db.autoBatcher.queue = []*autoBatchRequest[uint64, Rec]{
 		makeReq(1, false),
 		makeReq(2, true),
 		makeReq(3, false),
 	}
-	db.combiner.mu.Unlock()
+	db.autoBatcher.mu.Unlock()
 
-	batch := db.popCombinedBatch()
+	batch := db.popAutoBatch()
 	if len(batch) != 3 {
 		t.Fatalf("expected callbacks to remain batchable, got %d", len(batch))
 	}
 	if len(batch[1].beforeCommit) == 0 {
-		t.Fatalf("expected middle request with callback to stay in combined batch")
+		t.Fatalf("expected middle request with callback to stay in a multi-request batch")
 	}
 }
 
-func TestBatch_PatchUnique_QueuedIntoCombiner(t *testing.T) {
+func TestBatch_PatchUnique_QueuedIntoBatch(t *testing.T) {
 	db, _ := openTempDBUint64Unique(t, Options{
 		AutoBatchWindow:   5 * time.Millisecond,
 		AutoBatchMax:      16,
@@ -194,11 +194,11 @@ func TestBatch_PatchUnique_QueuedIntoCombiner(t *testing.T) {
 
 	before := db.AutoBatchStats()
 	if err := db.Patch(1, []Field{{Name: "email", Value: "c@x"}}); err != nil {
-		t.Fatalf("Patch unique field should use combiner path: %v", err)
+		t.Fatalf("Patch unique field should use auto-batcher path: %v", err)
 	}
 	mid := db.AutoBatchStats()
 	if mid.Enqueued <= before.Enqueued {
-		t.Fatalf("expected patch to be enqueued into combiner, before=%+v after=%+v", before, mid)
+		t.Fatalf("expected patch to be enqueued into auto-batcher, before=%+v after=%+v", before, mid)
 	}
 	if mid.FallbackPatchUnique != before.FallbackPatchUnique {
 		t.Fatalf("unique-patch fallback should not trigger, before=%+v after=%+v", before, mid)
@@ -218,7 +218,7 @@ func TestBatch_PatchUnique_QueuedIntoCombiner(t *testing.T) {
 	}
 }
 
-func TestBatch_DuplicatePatchSameID_NonUniqueFieldsStayCombined(t *testing.T) {
+func TestBatch_DuplicatePatchSameID_NonUniqueFieldsStayBatched(t *testing.T) {
 	db, _ := openTempDBUint64Unique(t, Options{
 		AutoBatchWindow:   5 * time.Millisecond,
 		AutoBatchMax:      16,
@@ -232,43 +232,43 @@ func TestBatch_DuplicatePatchSameID_NonUniqueFieldsStayCombined(t *testing.T) {
 		t.Fatalf("seed Set(2): %v", err)
 	}
 
-	req1 := &combineRequest[uint64, UniqueTestRec]{
-		op:                 combinePatch,
+	req1 := &autoBatchRequest[uint64, UniqueTestRec]{
+		op:                 autoBatchPatch,
 		id:                 1,
 		patch:              []Field{{Name: "tags", Value: []string{"x"}}},
 		patchIgnoreUnknown: true,
 		done:               make(chan error, 1),
 	}
-	req2 := &combineRequest[uint64, UniqueTestRec]{
-		op:                 combinePatch,
+	req2 := &autoBatchRequest[uint64, UniqueTestRec]{
+		op:                 autoBatchPatch,
 		id:                 1,
 		patch:              []Field{{Name: "tags", Value: []string{"y"}}},
 		patchIgnoreUnknown: true,
 		done:               make(chan error, 1),
 	}
-	req3 := &combineRequest[uint64, UniqueTestRec]{
-		op:                 combinePatch,
+	req3 := &autoBatchRequest[uint64, UniqueTestRec]{
+		op:                 autoBatchPatch,
 		id:                 2,
 		patch:              []Field{{Name: "tags", Value: []string{"z"}}},
 		patchIgnoreUnknown: true,
 		done:               make(chan error, 1),
 	}
 
-	db.combiner.mu.Lock()
-	db.combiner.window = 0
-	db.combiner.maxOps = 16
-	db.combiner.running = true
-	db.combiner.queue = []*combineRequest[uint64, UniqueTestRec]{req1, req2, req3}
-	db.combiner.mu.Unlock()
+	db.autoBatcher.mu.Lock()
+	db.autoBatcher.window = 0
+	db.autoBatcher.maxOps = 16
+	db.autoBatcher.running = true
+	db.autoBatcher.queue = []*autoBatchRequest[uint64, UniqueTestRec]{req1, req2, req3}
+	db.autoBatcher.mu.Unlock()
 
-	batch := db.popCombinedBatch()
+	batch := db.popAutoBatch()
 	if len(batch) != 3 {
-		t.Fatalf("expected repeated non-unique patches to stay combined, got=%d", len(batch))
+		t.Fatalf("expected repeated non-unique patches to stay batched, got=%d", len(batch))
 	}
 
-	db.executeCombinedBatch(batch)
+	db.executeAutoBatch(batch)
 
-	for i, req := range []*combineRequest[uint64, UniqueTestRec]{req1, req2, req3} {
+	for i, req := range []*autoBatchRequest[uint64, UniqueTestRec]{req1, req2, req3} {
 		if err := <-req.done; err != nil {
 			t.Fatalf("request #%d failed: %v", i+1, err)
 		}
@@ -298,36 +298,36 @@ func TestBatch_DuplicatePatchSameID_UniqueFieldCutsBatch(t *testing.T) {
 		AutoBatchMaxQueue: 64,
 	})
 
-	req1 := &combineRequest[uint64, UniqueTestRec]{
-		op:                 combinePatch,
+	req1 := &autoBatchRequest[uint64, UniqueTestRec]{
+		op:                 autoBatchPatch,
 		id:                 1,
 		patch:              []Field{{Name: "email", Value: "next@x"}},
 		patchIgnoreUnknown: true,
 		done:               make(chan error, 1),
 	}
-	req2 := &combineRequest[uint64, UniqueTestRec]{
-		op:                 combinePatch,
+	req2 := &autoBatchRequest[uint64, UniqueTestRec]{
+		op:                 autoBatchPatch,
 		id:                 1,
 		patch:              []Field{{Name: "tags", Value: []string{"y"}}},
 		patchIgnoreUnknown: true,
 		done:               make(chan error, 1),
 	}
-	req3 := &combineRequest[uint64, UniqueTestRec]{
-		op:                 combinePatch,
+	req3 := &autoBatchRequest[uint64, UniqueTestRec]{
+		op:                 autoBatchPatch,
 		id:                 2,
 		patch:              []Field{{Name: "tags", Value: []string{"z"}}},
 		patchIgnoreUnknown: true,
 		done:               make(chan error, 1),
 	}
 
-	db.combiner.mu.Lock()
-	db.combiner.window = 0
-	db.combiner.maxOps = 16
-	db.combiner.running = true
-	db.combiner.queue = []*combineRequest[uint64, UniqueTestRec]{req1, req2, req3}
-	db.combiner.mu.Unlock()
+	db.autoBatcher.mu.Lock()
+	db.autoBatcher.window = 0
+	db.autoBatcher.maxOps = 16
+	db.autoBatcher.running = true
+	db.autoBatcher.queue = []*autoBatchRequest[uint64, UniqueTestRec]{req1, req2, req3}
+	db.autoBatcher.mu.Unlock()
 
-	batch := db.popCombinedBatch()
+	batch := db.popAutoBatch()
 	if len(batch) != 1 {
 		t.Fatalf("expected repeated unique-touching patches to cut batch, got=%d", len(batch))
 	}
@@ -348,38 +348,38 @@ func TestBatch_DuplicatePatchSameID_BeforeStoreOnUniqueDBCutsBatch(t *testing.T)
 		return nil
 	}
 
-	req1 := &combineRequest[uint64, UniqueTestRec]{
-		op:                 combinePatch,
+	req1 := &autoBatchRequest[uint64, UniqueTestRec]{
+		op:                 autoBatchPatch,
 		id:                 1,
 		patch:              []Field{{Name: "tags", Value: []string{"x"}}},
 		patchIgnoreUnknown: true,
 		beforeStore:        []beforeStoreFunc[uint64, UniqueTestRec]{cb},
 		done:               make(chan error, 1),
 	}
-	req2 := &combineRequest[uint64, UniqueTestRec]{
-		op:                 combinePatch,
+	req2 := &autoBatchRequest[uint64, UniqueTestRec]{
+		op:                 autoBatchPatch,
 		id:                 1,
 		patch:              []Field{{Name: "tags", Value: []string{"y"}}},
 		patchIgnoreUnknown: true,
 		beforeStore:        []beforeStoreFunc[uint64, UniqueTestRec]{cb},
 		done:               make(chan error, 1),
 	}
-	req3 := &combineRequest[uint64, UniqueTestRec]{
-		op:                 combinePatch,
+	req3 := &autoBatchRequest[uint64, UniqueTestRec]{
+		op:                 autoBatchPatch,
 		id:                 2,
 		patch:              []Field{{Name: "email", Value: "other@x"}},
 		patchIgnoreUnknown: true,
 		done:               make(chan error, 1),
 	}
 
-	db.combiner.mu.Lock()
-	db.combiner.window = 0
-	db.combiner.maxOps = 16
-	db.combiner.running = true
-	db.combiner.queue = []*combineRequest[uint64, UniqueTestRec]{req1, req2, req3}
-	db.combiner.mu.Unlock()
+	db.autoBatcher.mu.Lock()
+	db.autoBatcher.window = 0
+	db.autoBatcher.maxOps = 16
+	db.autoBatcher.running = true
+	db.autoBatcher.queue = []*autoBatchRequest[uint64, UniqueTestRec]{req1, req2, req3}
+	db.autoBatcher.mu.Unlock()
 
-	batch := db.popCombinedBatch()
+	batch := db.popAutoBatch()
 	if len(batch) != 1 {
 		t.Fatalf("expected BeforeStore-bearing repeated same-id patch to cut batch on unique DB, got=%d", len(batch))
 	}
@@ -387,10 +387,10 @@ func TestBatch_DuplicatePatchSameID_BeforeStoreOnUniqueDBCutsBatch(t *testing.T)
 		t.Fatalf("expected first request to stay alone in batch")
 	}
 
-	db.combiner.mu.Lock()
-	defer db.combiner.mu.Unlock()
-	if len(db.combiner.queue) != 2 || db.combiner.queue[0] != req2 || db.combiner.queue[1] != req3 {
-		t.Fatalf("expected remaining requests to stay queued in order, queue=%+v", db.combiner.queue)
+	db.autoBatcher.mu.Lock()
+	defer db.autoBatcher.mu.Unlock()
+	if len(db.autoBatcher.queue) != 2 || db.autoBatcher.queue[0] != req2 || db.autoBatcher.queue[1] != req3 {
+		t.Fatalf("expected remaining requests to stay queued in order, queue=%+v", db.autoBatcher.queue)
 	}
 }
 
@@ -406,38 +406,38 @@ func TestBatch_DuplicatePatchSameID_BeforeProcessOnUniqueDBCutsBatch(t *testing.
 		return nil
 	}
 
-	req1 := &combineRequest[uint64, UniqueTestRec]{
-		op:                 combinePatch,
+	req1 := &autoBatchRequest[uint64, UniqueTestRec]{
+		op:                 autoBatchPatch,
 		id:                 1,
 		patch:              []Field{{Name: "tags", Value: []string{"x"}}},
 		patchIgnoreUnknown: true,
 		beforeProcess:      []beforeProcessFunc[uint64, UniqueTestRec]{cb},
 		done:               make(chan error, 1),
 	}
-	req2 := &combineRequest[uint64, UniqueTestRec]{
-		op:                 combinePatch,
+	req2 := &autoBatchRequest[uint64, UniqueTestRec]{
+		op:                 autoBatchPatch,
 		id:                 1,
 		patch:              []Field{{Name: "tags", Value: []string{"y"}}},
 		patchIgnoreUnknown: true,
 		beforeProcess:      []beforeProcessFunc[uint64, UniqueTestRec]{cb},
 		done:               make(chan error, 1),
 	}
-	req3 := &combineRequest[uint64, UniqueTestRec]{
-		op:                 combinePatch,
+	req3 := &autoBatchRequest[uint64, UniqueTestRec]{
+		op:                 autoBatchPatch,
 		id:                 2,
 		patch:              []Field{{Name: "email", Value: "other@x"}},
 		patchIgnoreUnknown: true,
 		done:               make(chan error, 1),
 	}
 
-	db.combiner.mu.Lock()
-	db.combiner.window = 0
-	db.combiner.maxOps = 16
-	db.combiner.running = true
-	db.combiner.queue = []*combineRequest[uint64, UniqueTestRec]{req1, req2, req3}
-	db.combiner.mu.Unlock()
+	db.autoBatcher.mu.Lock()
+	db.autoBatcher.window = 0
+	db.autoBatcher.maxOps = 16
+	db.autoBatcher.running = true
+	db.autoBatcher.queue = []*autoBatchRequest[uint64, UniqueTestRec]{req1, req2, req3}
+	db.autoBatcher.mu.Unlock()
 
-	batch := db.popCombinedBatch()
+	batch := db.popAutoBatch()
 	if len(batch) != 1 {
 		t.Fatalf("expected BeforeProcess-bearing repeated same-id patch to cut batch on unique DB, got=%d", len(batch))
 	}
@@ -445,10 +445,10 @@ func TestBatch_DuplicatePatchSameID_BeforeProcessOnUniqueDBCutsBatch(t *testing.
 		t.Fatalf("expected first request to stay alone in batch")
 	}
 
-	db.combiner.mu.Lock()
-	defer db.combiner.mu.Unlock()
-	if len(db.combiner.queue) != 2 || db.combiner.queue[0] != req2 || db.combiner.queue[1] != req3 {
-		t.Fatalf("expected remaining requests to stay queued in order, queue=%+v", db.combiner.queue)
+	db.autoBatcher.mu.Lock()
+	defer db.autoBatcher.mu.Unlock()
+	if len(db.autoBatcher.queue) != 2 || db.autoBatcher.queue[0] != req2 || db.autoBatcher.queue[1] != req3 {
+		t.Fatalf("expected remaining requests to stay queued in order, queue=%+v", db.autoBatcher.queue)
 	}
 }
 
@@ -478,41 +478,41 @@ func TestBatch_SetDeleteSameID_CoalescedToLastWrite(t *testing.T) {
 	setB := &Rec{Name: "B", Age: 30}
 	setOther := &Rec{Name: "X", Age: 40}
 
-	req1 := &combineRequest[uint64, Rec]{
-		op:         combineSet,
+	req1 := &autoBatchRequest[uint64, Rec]{
+		op:         autoBatchSet,
 		id:         1,
 		setValue:   setA,
 		setPayload: encodePayload(setA),
 		done:       make(chan error, 1),
 	}
-	req2 := &combineRequest[uint64, Rec]{
-		op:   combineDelete,
+	req2 := &autoBatchRequest[uint64, Rec]{
+		op:   autoBatchDelete,
 		id:   1,
 		done: make(chan error, 1),
 	}
-	req3 := &combineRequest[uint64, Rec]{
-		op:         combineSet,
+	req3 := &autoBatchRequest[uint64, Rec]{
+		op:         autoBatchSet,
 		id:         1,
 		setValue:   setB,
 		setPayload: encodePayload(setB),
 		done:       make(chan error, 1),
 	}
-	req4 := &combineRequest[uint64, Rec]{
-		op:         combineSet,
+	req4 := &autoBatchRequest[uint64, Rec]{
+		op:         autoBatchSet,
 		id:         2,
 		setValue:   setOther,
 		setPayload: encodePayload(setOther),
 		done:       make(chan error, 1),
 	}
 
-	db.combiner.mu.Lock()
-	db.combiner.window = 0
-	db.combiner.maxOps = 16
-	db.combiner.running = true
-	db.combiner.queue = []*combineRequest[uint64, Rec]{req1, req2, req3, req4}
-	db.combiner.mu.Unlock()
+	db.autoBatcher.mu.Lock()
+	db.autoBatcher.window = 0
+	db.autoBatcher.maxOps = 16
+	db.autoBatcher.running = true
+	db.autoBatcher.queue = []*autoBatchRequest[uint64, Rec]{req1, req2, req3, req4}
+	db.autoBatcher.mu.Unlock()
 
-	batch := db.popCombinedBatch()
+	batch := db.popAutoBatch()
 	if len(batch) != 4 {
 		t.Fatalf("unexpected popped batch size: got=%d want=4", len(batch))
 	}
@@ -520,9 +520,9 @@ func TestBatch_SetDeleteSameID_CoalescedToLastWrite(t *testing.T) {
 		t.Fatalf("unexpected coalesce chain: req1->%p req2->%p req3->%p", req1.coalescedTo, req2.coalescedTo, req3.coalescedTo)
 	}
 
-	db.executeCombinedBatch(batch)
+	db.executeAutoBatch(batch)
 
-	for i, req := range []*combineRequest[uint64, Rec]{req1, req2, req3, req4} {
+	for i, req := range []*autoBatchRequest[uint64, Rec]{req1, req2, req3, req4} {
 		if err := <-req.done; err != nil {
 			t.Fatalf("request #%d failed: %v", i+1, err)
 		}
@@ -574,41 +574,41 @@ func TestBatch_CoalescedChain_PropagatesTerminalError(t *testing.T) {
 		return out
 	}
 
-	req1 := &combineRequest[uint64, UniqueTestRec]{
-		op:         combineSet,
+	req1 := &autoBatchRequest[uint64, UniqueTestRec]{
+		op:         autoBatchSet,
 		id:         1,
 		setValue:   &UniqueTestRec{Email: "mid@x", Code: 10},
 		setPayload: encode(&UniqueTestRec{Email: "mid@x", Code: 10}),
 		done:       make(chan error, 1),
 	}
-	req2 := &combineRequest[uint64, UniqueTestRec]{
-		op:   combineDelete,
+	req2 := &autoBatchRequest[uint64, UniqueTestRec]{
+		op:   autoBatchDelete,
 		id:   1,
 		done: make(chan error, 1),
 	}
-	req3 := &combineRequest[uint64, UniqueTestRec]{
-		op:         combineSet,
+	req3 := &autoBatchRequest[uint64, UniqueTestRec]{
+		op:         autoBatchSet,
 		id:         1,
 		setValue:   &UniqueTestRec{Email: "taken@x", Code: 11},
 		setPayload: encode(&UniqueTestRec{Email: "taken@x", Code: 11}),
 		done:       make(chan error, 1),
 	}
-	req4 := &combineRequest[uint64, UniqueTestRec]{
-		op:         combineSet,
+	req4 := &autoBatchRequest[uint64, UniqueTestRec]{
+		op:         autoBatchSet,
 		id:         3,
 		setValue:   &UniqueTestRec{Email: "ok@x", Code: 3},
 		setPayload: encode(&UniqueTestRec{Email: "ok@x", Code: 3}),
 		done:       make(chan error, 1),
 	}
 
-	db.combiner.mu.Lock()
-	db.combiner.window = 0
-	db.combiner.maxOps = 16
-	db.combiner.running = true
-	db.combiner.queue = []*combineRequest[uint64, UniqueTestRec]{req1, req2, req3, req4}
-	db.combiner.mu.Unlock()
+	db.autoBatcher.mu.Lock()
+	db.autoBatcher.window = 0
+	db.autoBatcher.maxOps = 16
+	db.autoBatcher.running = true
+	db.autoBatcher.queue = []*autoBatchRequest[uint64, UniqueTestRec]{req1, req2, req3, req4}
+	db.autoBatcher.mu.Unlock()
 
-	batch := db.popCombinedBatch()
+	batch := db.popAutoBatch()
 	if len(batch) != 4 {
 		t.Fatalf("unexpected popped batch size: got=%d want=4", len(batch))
 	}
@@ -616,7 +616,7 @@ func TestBatch_CoalescedChain_PropagatesTerminalError(t *testing.T) {
 		t.Fatalf("unexpected coalesce chain: req1->%p req2->%p req3->%p", req1.coalescedTo, req2.coalescedTo, req3.coalescedTo)
 	}
 
-	db.executeCombinedBatch(batch)
+	db.executeAutoBatch(batch)
 
 	if err := <-req1.done; !errors.Is(err, ErrUniqueViolation) {
 		t.Fatalf("req1 expected ErrUniqueViolation via coalesced chain, got: %v", err)
@@ -654,19 +654,19 @@ func TestBatch_CoalescedChain_PropagatesTerminalError(t *testing.T) {
 	}
 }
 
-func TestBatch_CombinedPatchFailures_IsolateFailedRequest(t *testing.T) {
+func TestBatch_PatchFailures_IsolateFailedRequest(t *testing.T) {
 	type tc struct {
 		name       string
-		makeBadReq func() *combineRequest[uint64, Rec]
+		makeBadReq func() *autoBatchRequest[uint64, Rec]
 		checkErr   func(error) bool
 	}
 
 	cases := []tc{
 		{
 			name: "missing_record",
-			makeBadReq: func() *combineRequest[uint64, Rec] {
-				return &combineRequest[uint64, Rec]{
-					op:                 combinePatch,
+			makeBadReq: func() *autoBatchRequest[uint64, Rec] {
+				return &autoBatchRequest[uint64, Rec]{
+					op:                 autoBatchPatch,
 					id:                 999,
 					patch:              []Field{{Name: "age", Value: 77}},
 					patchIgnoreUnknown: true,
@@ -677,9 +677,9 @@ func TestBatch_CombinedPatchFailures_IsolateFailedRequest(t *testing.T) {
 		},
 		{
 			name: "invalid_patch",
-			makeBadReq: func() *combineRequest[uint64, Rec] {
-				return &combineRequest[uint64, Rec]{
-					op:                 combinePatch,
+			makeBadReq: func() *autoBatchRequest[uint64, Rec] {
+				return &autoBatchRequest[uint64, Rec]{
+					op:                 autoBatchPatch,
 					id:                 1,
 					patch:              []Field{{Name: "age", Value: "not-an-int"}},
 					patchIgnoreUnknown: true,
@@ -720,15 +720,15 @@ func TestBatch_CombinedPatchFailures_IsolateFailedRequest(t *testing.T) {
 
 			badReq := c.makeBadReq()
 			goodVal := &Rec{Name: "good-" + c.name, Age: 99, Meta: Meta{Country: "US"}}
-			goodReq := &combineRequest[uint64, Rec]{
-				op:         combineSet,
+			goodReq := &autoBatchRequest[uint64, Rec]{
+				op:         autoBatchSet,
 				id:         2,
 				setValue:   goodVal,
 				setPayload: encode(goodVal),
 				done:       make(chan error, 1),
 			}
 
-			db.executeCombinedBatch([]*combineRequest[uint64, Rec]{badReq, goodReq})
+			db.executeAutoBatch([]*autoBatchRequest[uint64, Rec]{badReq, goodReq})
 
 			if err := <-badReq.done; !c.checkErr(err) {
 				t.Fatalf("unexpected bad request error: %v", err)
@@ -764,20 +764,20 @@ func TestBatch_QueueFullFallback_UsesDirectPath(t *testing.T) {
 	})
 
 	if st := db.AutoBatchStats(); !st.Enabled {
-		t.Fatalf("expected combiner enabled")
+		t.Fatalf("expected auto-batcher enabled")
 	}
 
-	db.combiner.mu.Lock()
-	db.combiner.queue = []*combineRequest[uint64, Rec]{
-		{op: combineSet, id: 123, done: make(chan error, 1)},
+	db.autoBatcher.mu.Lock()
+	db.autoBatcher.queue = []*autoBatchRequest[uint64, Rec]{
+		{op: autoBatchSet, id: 123, done: make(chan error, 1)},
 	}
-	db.combiner.running = false
-	db.combiner.mu.Unlock()
+	db.autoBatcher.running = false
+	db.autoBatcher.mu.Unlock()
 	defer func() {
-		db.combiner.mu.Lock()
-		db.combiner.queue = nil
-		db.combiner.running = false
-		db.combiner.mu.Unlock()
+		db.autoBatcher.mu.Lock()
+		db.autoBatcher.queue = nil
+		db.autoBatcher.running = false
+		db.autoBatcher.mu.Unlock()
 	}()
 
 	before := db.AutoBatchStats()
@@ -841,8 +841,8 @@ func TestBatch_BeforeCommitError_IsolatesFailedRequest(t *testing.T) {
 	badVal := &Rec{Name: "bad", Age: 1}
 	goodVal := &Rec{Name: "good", Age: 2}
 
-	badReq := &combineRequest[uint64, Rec]{
-		op:         combineSet,
+	badReq := &autoBatchRequest[uint64, Rec]{
+		op:         autoBatchSet,
 		id:         1,
 		setValue:   badVal,
 		setPayload: encode(badVal),
@@ -851,15 +851,15 @@ func TestBatch_BeforeCommitError_IsolatesFailedRequest(t *testing.T) {
 		},
 		done: make(chan error, 1),
 	}
-	goodReq := &combineRequest[uint64, Rec]{
-		op:         combineSet,
+	goodReq := &autoBatchRequest[uint64, Rec]{
+		op:         autoBatchSet,
 		id:         2,
 		setValue:   goodVal,
 		setPayload: encode(goodVal),
 		done:       make(chan error, 1),
 	}
 
-	db.executeCombinedBatch([]*combineRequest[uint64, Rec]{badReq, goodReq})
+	db.executeAutoBatch([]*autoBatchRequest[uint64, Rec]{badReq, goodReq})
 
 	if err := <-badReq.done; !errors.Is(err, cbErr) {
 		t.Fatalf("bad request must fail with callback error, got: %v", err)
@@ -899,8 +899,8 @@ func TestBatch_BeforeCommitError_Isolation_RechecksUniqueAfterRetry(t *testing.T
 	badVal := &UniqueTestRec{Email: "shared@x", Code: 1}
 	goodVal := &UniqueTestRec{Email: "shared@x", Code: 2}
 
-	badReq := &combineRequest[uint64, UniqueTestRec]{
-		op:         combineSet,
+	badReq := &autoBatchRequest[uint64, UniqueTestRec]{
+		op:         autoBatchSet,
 		id:         1,
 		setValue:   badVal,
 		setPayload: encode(badVal),
@@ -909,15 +909,15 @@ func TestBatch_BeforeCommitError_Isolation_RechecksUniqueAfterRetry(t *testing.T
 		},
 		done: make(chan error, 1),
 	}
-	goodReq := &combineRequest[uint64, UniqueTestRec]{
-		op:         combineSet,
+	goodReq := &autoBatchRequest[uint64, UniqueTestRec]{
+		op:         autoBatchSet,
 		id:         2,
 		setValue:   goodVal,
 		setPayload: encode(goodVal),
 		done:       make(chan error, 1),
 	}
 
-	db.executeCombinedBatch([]*combineRequest[uint64, UniqueTestRec]{badReq, goodReq})
+	db.executeAutoBatch([]*autoBatchRequest[uint64, UniqueTestRec]{badReq, goodReq})
 
 	if err := <-badReq.done; !errors.Is(err, cbErr) {
 		t.Fatalf("bad request must fail with callback error, got: %v", err)
@@ -955,8 +955,8 @@ func TestBatch_BeforeStore_RerunsFromBaselineOnRetry(t *testing.T) {
 
 	beforeStoreCalls := 0
 	goodVal := &Rec{Name: "good", Age: 10}
-	goodReq := &combineRequest[uint64, Rec]{
-		op:         combineSet,
+	goodReq := &autoBatchRequest[uint64, Rec]{
+		op:         autoBatchSet,
 		id:         1,
 		setValue:   goodVal,
 		setPayload: encode(goodVal),
@@ -972,8 +972,8 @@ func TestBatch_BeforeStore_RerunsFromBaselineOnRetry(t *testing.T) {
 
 	cbErr := errors.New("before commit fail")
 	badVal := &Rec{Name: "bad", Age: 20}
-	badReq := &combineRequest[uint64, Rec]{
-		op:         combineSet,
+	badReq := &autoBatchRequest[uint64, Rec]{
+		op:         autoBatchSet,
 		id:         2,
 		setValue:   badVal,
 		setPayload: encode(badVal),
@@ -983,7 +983,7 @@ func TestBatch_BeforeStore_RerunsFromBaselineOnRetry(t *testing.T) {
 		done: make(chan error, 1),
 	}
 
-	db.executeCombinedBatch([]*combineRequest[uint64, Rec]{badReq, goodReq})
+	db.executeAutoBatch([]*autoBatchRequest[uint64, Rec]{badReq, goodReq})
 
 	if err := <-badReq.done; !errors.Is(err, cbErr) {
 		t.Fatalf("bad request must fail with BeforeCommit error, got: %v", err)
@@ -1025,8 +1025,8 @@ func TestBatch_StringKeyBeforeStoreError_DoesNotGrowStrMap(t *testing.T) {
 	}
 
 	hookErr := errors.New("before store fail")
-	req := &combineRequest[string, Product]{
-		op:         combineSet,
+	req := &autoBatchRequest[string, Product]{
+		op:         autoBatchSet,
 		id:         "ghost-before-store",
 		setValue:   &Product{SKU: "ghost-before-store", Price: 11},
 		setPayload: encode(&Product{SKU: "ghost-before-store", Price: 11}),
@@ -1036,7 +1036,7 @@ func TestBatch_StringKeyBeforeStoreError_DoesNotGrowStrMap(t *testing.T) {
 		done: make(chan error, 1),
 	}
 
-	db.executeCombinedBatch([]*combineRequest[string, Product]{req})
+	db.executeAutoBatch([]*autoBatchRequest[string, Product]{req})
 
 	if err := <-req.done; !errors.Is(err, hookErr) {
 		t.Fatalf("request must fail with BeforeStore error, got: %v", err)

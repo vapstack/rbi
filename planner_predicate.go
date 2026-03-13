@@ -90,7 +90,7 @@ func (p predicate) leadIterNeedsContainsCheck() bool {
 func (p predicate) newIter() roaringIter {
 	switch p.iterKind {
 	case predicateIterPosting:
-		return postingIterFromPosting(p.posting)
+		return p.posting.Iter()
 	case predicateIterPostsConcat:
 		return newPostingConcatIter(p.posts)
 	case predicateIterPostsUnion:
@@ -434,7 +434,7 @@ func (db *DB[K, V]) tryPlanCandidate(q *qx.QX, trace *queryTrace) ([]K, bool, er
 	if trace != nil {
 		trace.setPlan(PlanCandidateNoOrder)
 	}
-	return db.execPlanCandidateNoOrder(q, preds), true, nil
+	return db.execPlanLeadScanNoOrder(q, preds, nil), true, nil
 }
 
 func (db *DB[K, V]) shouldUseCandidateOrder(o qx.Order, leaves []qx.Expr) bool {
@@ -638,37 +638,6 @@ func (db *DB[K, V]) buildPredicateCandidate(e qx.Expr) (predicate, bool) {
 	}
 }
 
-func overlayLookupPostingRetained(ov fieldOverlay, key string) (postingList, *roaring64.Bitmap) {
-	var base postingList
-	if len(ov.base) > 0 {
-		if i := lowerBoundIndex(ov.base, key); i < len(ov.base) && indexKeyEqualsString(ov.base[i].Key, key) {
-			base = ov.base[i].IDs
-		}
-	}
-
-	if ov.delta == nil || !ov.delta.hasEntries() {
-		return base, nil
-	}
-	de, ok := ov.delta.get(key)
-	if !ok {
-		return base, nil
-	}
-
-	bm, owned := composePostingOwned(base, de, nil)
-	if !owned {
-		return postingFromBitmapViewAdaptive(bm), nil
-	}
-	if bm == nil || bm.IsEmpty() {
-		if bm != nil {
-			releaseRoaringBuf(bm)
-		}
-		return postingList{}, nil
-	}
-	p := postingFromBitmapOwned(bm)
-	keep := p.bitmap()
-	return p, keep
-}
-
 func releaseOwnedBitmapSlice(owned []*roaring64.Bitmap) {
 	for _, bm := range owned {
 		if bm != nil {
@@ -687,7 +656,7 @@ func (db *DB[K, V]) buildPredEqCandidate(e qx.Expr, fm *field, ov fieldOverlay) 
 		if isSlice {
 			return predicate{}, false
 		}
-		ids, owned := overlayLookupPostingRetained(ov, key)
+		ids, owned := ov.lookupPostingRetained(key)
 		var cleanup func()
 		if owned != nil {
 			keep := owned
@@ -800,7 +769,7 @@ func (db *DB[K, V]) buildPredInCandidate(e qx.Expr, fm *field, ov fieldOverlay) 
 
 	var est uint64
 	for _, v := range vals {
-		ids, keep := overlayLookupPostingRetained(ov, v)
+		ids, keep := ov.lookupPostingRetained(v)
 		if ids.IsEmpty() {
 			continue
 		}
@@ -888,7 +857,7 @@ func (db *DB[K, V]) buildPredHasCandidate(e qx.Expr, fm *field, ov fieldOverlay)
 	var minCard uint64
 
 	for _, v := range vals {
-		ids, keep := overlayLookupPostingRetained(ov, v)
+		ids, keep := ov.lookupPostingRetained(v)
 		if ids.IsEmpty() {
 			if len(owned) > 0 {
 				releaseOwnedBitmapSlice(owned)
@@ -970,7 +939,7 @@ func (db *DB[K, V]) buildPredHasAnyCandidate(e qx.Expr, fm *field, ov fieldOverl
 	var est uint64
 
 	for _, v := range vals {
-		ids, keep := overlayLookupPostingRetained(ov, v)
+		ids, keep := ov.lookupPostingRetained(v)
 		if ids.IsEmpty() {
 			continue
 		}
@@ -1550,7 +1519,7 @@ func (it *rangeIter) Next() uint64 {
 	return it.curIt.Next()
 }
 
-func (db *DB[K, V]) execPlanCandidateNoOrder(q *qx.QX, preds []predicate) []K {
+func (db *DB[K, V]) execPlanLeadScanNoOrder(q *qx.QX, preds []predicate, trace *queryTrace) []K {
 	skip := q.Offset
 	need := q.Limit
 
@@ -1580,6 +1549,13 @@ func (db *DB[K, V]) execPlanCandidateNoOrder(q *qx.QX, preds []predicate) []K {
 			defer releaseRoaringBuf(universe)
 		}
 		it = universe.Iterator()
+	}
+	if trace != nil {
+		if leadIdx >= 0 && best > 0 {
+			trace.addExamined(best)
+		} else {
+			trace.addExamined(db.snapshotUniverseCardinality())
+		}
 	}
 
 	out := make([]K, 0, need)
@@ -2062,7 +2038,7 @@ func (db *DB[K, V]) tryPlanOrdered(q *qx.QX, trace *queryTrace) ([]K, bool, erro
 	if trace != nil {
 		trace.setPlan(PlanOrderedNoOrder)
 	}
-	return db.execPlanOrderedNoOrder(q, preds, trace), true, nil
+	return db.execPlanLeadScanNoOrder(q, preds, trace), true, nil
 }
 
 func (p predicate) checkCost() int {
@@ -2738,87 +2714,6 @@ func (db *DB[K, V]) materializeProbeUnion(probe []postingList) *roaring64.Bitmap
 	return out
 }
 
-func (db *DB[K, V]) execPlanOrderedNoOrder(q *qx.QX, preds []predicate, trace *queryTrace) []K {
-	skip := q.Offset
-	need := q.Limit
-
-	var leadIdx = -1
-	var best uint64
-	for i := range preds {
-		p := preds[i]
-		if p.alwaysTrue || p.alwaysFalse || !p.hasIter() {
-			continue
-		}
-		if leadIdx == -1 || p.estCard < best {
-			leadIdx = i
-			best = p.estCard
-		}
-	}
-
-	var it roaringIter
-	var universe *roaring64.Bitmap
-	leadNeedsCheck := false
-	if leadIdx >= 0 {
-		it = preds[leadIdx].newIter()
-		leadNeedsCheck = preds[leadIdx].leadIterNeedsContainsCheck()
-	} else {
-		var owned bool
-		universe, owned = db.snapshotUniverseView()
-		if owned {
-			defer releaseRoaringBuf(universe)
-		}
-		it = universe.Iterator()
-	}
-	if trace != nil {
-		if leadIdx >= 0 && best > 0 {
-			trace.addExamined(best)
-		} else {
-			trace.addExamined(db.snapshotUniverseCardinality())
-		}
-	}
-
-	out := make([]K, 0, need)
-
-	for it.HasNext() {
-		idx := it.Next()
-
-		pass := true
-		for i := range preds {
-			if i == leadIdx && !leadNeedsCheck {
-				continue
-			}
-			p := preds[i]
-			if p.covered || p.alwaysTrue {
-				continue
-			}
-			if p.alwaysFalse {
-				pass = false
-				break
-			}
-			if !p.hasContains() || !p.matches(idx) {
-				pass = false
-				break
-			}
-		}
-		if !pass {
-			continue
-		}
-
-		if skip > 0 {
-			skip--
-			continue
-		}
-
-		out = append(out, db.idFromIdxNoLock(idx))
-		need--
-		if need == 0 {
-			break
-		}
-	}
-
-	return out
-}
-
 const (
 	plannerOrderedAnchorMinActive        = 2
 	plannerOrderedAnchorSpanMin          = 256
@@ -3102,7 +2997,7 @@ func (db *DB[K, V]) execPlanOrderedBasic(q *qx.QX, preds []predicate, trace *que
 
 		start, end := 0, len(s)
 		var rangeCovered []bool
-		if st, en, cov, ok := db.extractOrderRangeCoveragePreds(o.Field, preds, s); ok {
+		if st, en, cov, ok := db.extractOrderRangeCoverage(o.Field, preds, s); ok {
 			start, end = st, en
 			rangeCovered = cov
 		}
@@ -3143,7 +3038,7 @@ func (db *DB[K, V]) execPlanOrderedBasic(q *qx.QX, preds []predicate, trace *que
 		return db.execPlanOrderedBasicFallback(q, preds, active, start, end, s, trace), true
 	}
 
-	br, rangeCovered, ok := db.extractOrderRangeCoveragePredsOverlay(o.Field, preds, ov)
+	br, rangeCovered, ok := db.extractOrderRangeCoverageOverlay(o.Field, preds, ov)
 	if !ok {
 		return nil, false
 	}
@@ -3461,33 +3356,6 @@ func (db *DB[K, V]) execPlanOrderedBasicFallback(q *qx.QX, preds []predicate, ac
 	}
 
 	return out
-}
-
-func (db *DB[K, V]) extractOrderRangeCoveragePreds(field string, preds []predicate, s []index) (int, int, []bool, bool) {
-	rb, covered, has, ok := db.collectOrderRangeBounds(field, len(preds), func(i int) qx.Expr {
-		return preds[i].expr
-	})
-	if !ok {
-		return 0, 0, nil, false
-	}
-
-	if !has {
-		return 0, len(s), covered, true
-	}
-
-	st, en := applyBoundsToIndexRange(s, rb)
-	return st, en, covered, true
-}
-
-func (db *DB[K, V]) extractOrderRangeCoveragePredsOverlay(field string, preds []predicate, ov fieldOverlay) (overlayRange, []bool, bool) {
-	rb, covered, _, ok := db.collectOrderRangeBounds(field, len(preds), func(i int) qx.Expr {
-		return preds[i].expr
-	})
-	if !ok {
-		return overlayRange{}, nil, false
-	}
-
-	return ov.rangeForBounds(rb), covered, true
 }
 
 func (db *DB[K, V]) collectOrderRangeBounds(field string, n int, exprAt func(i int) qx.Expr) (rangeBounds, []bool, bool, bool) {

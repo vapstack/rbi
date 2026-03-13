@@ -392,7 +392,7 @@ func TestBeforeStore_CloneFunc_BatchSet_AllowsNormalizationBeforeEncode(t *testi
 	}
 }
 
-func TestBeforeStore_CloneFunc_CombinedSet_AllowsNormalizationBeforeEncode(t *testing.T) {
+func TestBeforeStore_CloneFunc_AutoBatch_AllowsNormalizationBeforeEncode(t *testing.T) {
 	db := openTempDBUint64BeforeStoreCloneRec(t)
 
 	calls := 0
@@ -411,7 +411,7 @@ func TestBeforeStore_CloneFunc_CombinedSet_AllowsNormalizationBeforeEncode(t *te
 		}),
 	)
 	if err != nil {
-		t.Fatalf("Set with CloneFunc via combiner: %v", err)
+		t.Fatalf("Set with CloneFunc via auto-batcher: %v", err)
 	}
 	if calls != 1 {
 		t.Fatalf("expected BeforeStore to run once, got %d", calls)
@@ -426,7 +426,7 @@ func TestBeforeStore_CloneFunc_CombinedSet_AllowsNormalizationBeforeEncode(t *te
 	}
 
 	if st := db.AutoBatchStats(); st.Enqueued == 0 {
-		t.Fatalf("expected Set with CloneFunc to use combiner path, stats=%+v", st)
+		t.Fatalf("expected Set with CloneFunc to use auto-batcher path, stats=%+v", st)
 	}
 }
 
@@ -730,8 +730,8 @@ func TestTruncate_NoDeadlock_WithConcurrentExecuteBatchWriter(t *testing.T) {
 	payload := append([]byte(nil), enc.Bytes()...)
 	releaseEncodeBuf(enc)
 
-	req := &combineRequest[uint64, Rec]{
-		op:         combineSet,
+	req := &autoBatchRequest[uint64, Rec]{
+		op:         autoBatchSet,
 		id:         1,
 		setValue:   newVal,
 		setPayload: payload,
@@ -740,14 +740,14 @@ func TestTruncate_NoDeadlock_WithConcurrentExecuteBatchWriter(t *testing.T) {
 
 	// Force lock-order contention window:
 	// 1) truncate goroutine waits on db.mu
-	// 2) executeCombinedBatch goroutine acquires writer tx and then waits on db.mu
+	// 2) executeAutoBatch goroutine acquires writer tx and then waits on db.mu
 	// 3) release db.mu and assert both operations complete.
 	db.mu.Lock()
 	truncateDone := make(chan error, 1)
 	go func() {
 		truncateDone <- db.Truncate()
 	}()
-	go db.executeCombinedBatch([]*combineRequest[uint64, Rec]{req})
+	go db.executeAutoBatch([]*autoBatchRequest[uint64, Rec]{req})
 	time.Sleep(20 * time.Millisecond)
 	db.mu.Unlock()
 
@@ -763,10 +763,10 @@ func TestTruncate_NoDeadlock_WithConcurrentExecuteBatchWriter(t *testing.T) {
 	select {
 	case err := <-req.done:
 		if err != nil {
-			t.Fatalf("executeCombinedBatch req error: %v", err)
+			t.Fatalf("executeAutoBatch req error: %v", err)
 		}
 	case <-time.After(2 * time.Second):
-		t.Fatalf("executeCombinedBatch timed out (possible deadlock)")
+		t.Fatalf("executeAutoBatch timed out (possible deadlock)")
 	}
 
 	if err := db.Close(); err != nil {

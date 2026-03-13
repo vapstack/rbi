@@ -346,8 +346,8 @@ func (db *DB[K, V]) Set(id K, newVal *V, execOpts ...ExecOption[K, V]) error {
 	defer db.endOp()
 	var err error
 
-	if db.combiner.enabled && !cfg.noAutoBatch {
-		if err, handled := db.tryQueueSetCombine(id, newVal, cfg.beforeStore, cfg.beforeCommit, cfg.cloneValue); handled {
+	if db.autoBatcher.enabled && !cfg.noAutoBatch {
+		if err, handled := db.trySetViaAutoBatch(id, newVal, cfg.beforeStore, cfg.beforeCommit, cfg.cloneValue); handled {
 			return err
 		}
 	}
@@ -726,8 +726,8 @@ func (db *DB[K, V]) patch(id K, fields []Field, execOpts ...ExecOption[K, V]) er
 	}
 	cfg := db.resolveExecOptions(execOpts)
 	ignoreUnknown := !cfg.patchStrict
-	if db.combiner.enabled && !cfg.noAutoBatch {
-		if err, handled := db.tryQueuePatchCombine(id, fields, ignoreUnknown, cfg.beforeProcess, cfg.beforeStore, cfg.beforeCommit); handled {
+	if db.autoBatcher.enabled && !cfg.noAutoBatch {
+		if err, handled := db.tryPatchViaAutoBatch(id, fields, ignoreUnknown, cfg.beforeProcess, cfg.beforeStore, cfg.beforeCommit); handled {
 			return err
 		}
 	}
@@ -1012,8 +1012,8 @@ func (db *DB[K, V]) Delete(id K, execOpts ...ExecOption[K, V]) error {
 
 	cfg := db.resolveExecOptions(execOpts)
 
-	if db.combiner.enabled && !cfg.noAutoBatch {
-		if err, handled := db.tryQueueDeleteCombine(id, cfg.beforeCommit); handled {
+	if db.autoBatcher.enabled && !cfg.noAutoBatch {
+		if err, handled := db.tryDeleteViaAutoBatch(id, cfg.beforeCommit); handled {
 			return err
 		}
 	}

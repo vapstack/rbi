@@ -565,7 +565,7 @@ func Benchmark_Write_Update_BeforeStore_BeforeCommit_MakePatch_Parallel(b *testi
 			}
 
 			st := db.AutoBatchStats()
-			b.ReportMetric(float64(st.CombinedBatches), "combined_batches")
+			b.ReportMetric(float64(st.MultiRequestBatches), "multi_request_batches")
 			b.ReportMetric(st.AvgBatchSize, "avg_batch")
 		})
 	}

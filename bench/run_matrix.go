@@ -10,7 +10,7 @@ import (
 	"github.com/vapstack/rbi"
 )
 
-func runCase(
+func runMatrixCase(
 	ctx context.Context,
 	db *rbi.DB[uint64, UserBench],
 	maxIDPtr *uint64,
@@ -51,10 +51,10 @@ func runCase(
 				opRoll := rng.Float64()
 
 				if opRoll < profile.ReadRatio {
-					kind, err := executeRead(db, rng, atomic.LoadUint64(maxIDPtr), emailSamples)
+					kind, err := runRandomReadScenario(db, rng, atomic.LoadUint64(maxIDPtr), emailSamples)
 					metrics.Record(workerID, kind, false, time.Since(start), err)
 				} else {
-					kind, err := executeWrite(db, rng, maxIDPtr)
+					kind, err := runRandomWriteScenario(db, rng, maxIDPtr)
 					metrics.Record(workerID, kind, true, time.Since(start), err)
 				}
 			}

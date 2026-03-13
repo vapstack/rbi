@@ -1064,7 +1064,7 @@ func TestRebuildIndex_WaitsForInFlightBatchedSet(t *testing.T) {
 	}
 
 	if st := db.AutoBatchStats(); st.Enqueued == 0 {
-		t.Fatalf("expected write-combine enqueue for Set path, got stats: %+v", st)
+		t.Fatalf("expected auto-batch enqueue for Set path, got stats: %+v", st)
 	}
 
 	v, err := db.Get(1)

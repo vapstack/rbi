@@ -213,7 +213,7 @@ func (db *DB[K, V]) tryCountByScalarInSplit(expr qx.Expr) (uint64, bool, error) 
 
 	var cnt uint64
 	for _, v := range vals {
-		ids, keep := overlayLookupPostingRetained(ov, v)
+		ids, keep := ov.lookupPostingRetained(v)
 		if ids.IsEmpty() {
 			continue
 		}

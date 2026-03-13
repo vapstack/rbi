@@ -191,7 +191,7 @@ func (db *DB[K, V]) buildIndex(skipFields map[string]struct{}) error {
 			gmap := global[i]
 			for val, lp := range fmap {
 				gp := gmap[val]
-				gp.OrPosting(lp)
+				gp.Or(lp)
 				gmap[val] = gp
 			}
 		}
@@ -205,7 +205,7 @@ func (db *DB[K, V]) buildIndex(skipFields map[string]struct{}) error {
 		fixed8 := active[i].fixed8
 		s := make([]index, 0, len(values))
 		for val, ids := range values {
-			ids.RunOptimizeAdaptive()
+			ids.OptimizeAdaptive()
 			if ids.IsEmpty() {
 				continue
 			}
@@ -376,7 +376,7 @@ func (db *DB[K, V]) buildLenIndex() {
 		}
 		result := make([]index, 0, resultCap)
 		for ln, ids := range lenMap {
-			ids.RunOptimizeAdaptive()
+			ids.OptimizeAdaptive()
 			if ids.IsEmpty() {
 				continue
 			}
@@ -386,7 +386,7 @@ func (db *DB[K, V]) buildLenIndex() {
 			})
 		}
 		if useZeroComplement {
-			nonEmptyPosting.RunOptimizeAdaptive()
+			nonEmptyPosting.OptimizeAdaptive()
 			if !nonEmptyPosting.IsEmpty() {
 				result = append(result, index{
 					Key: indexKeyFromString(lenIndexNonEmptyKey),

@@ -8,7 +8,7 @@ import (
 	"github.com/vapstack/rbi"
 )
 
-func executeRead(
+func runRandomReadScenario(
 	db *rbi.DB[uint64, UserBench],
 	rng *rand.Rand,
 	currentMaxID uint64,
@@ -20,7 +20,7 @@ func executeRead(
 
 	r := rng.Float64()
 	if r < 0.42 {
-		return runReadQueryByEmail(db, rng, currentMaxID, emailSamples)
+		return runReadUserLookupItems(db, rng, currentMaxID, emailSamples)
 	}
 	switch {
 	case r < 0.62:
@@ -46,9 +46,9 @@ func executeRead(
 	}
 }
 
-func allReadScenarios() []readScenario {
+func readScenarios() []readScenario {
 	return []readScenario{
-		{Name: "read_user_by_email_items", Weight: 4, Run: runReadQueryByEmail},
+		{Name: "read_user_by_email_items", Weight: 4, Run: runReadUserLookupItems},
 		{Name: "read_user_by_name_prefix_items", Weight: 2, Run: runReadUserByNamePrefixItems},
 		{Name: "read_user_community_frontpage_keys", Weight: 2, Run: runReadUserCommunityFrontpageKeys},
 		{Name: "read_user_online_region_items", Weight: 1, Run: runReadUserOnlineRegionItems},
@@ -62,7 +62,7 @@ func allReadScenarios() []readScenario {
 	}
 }
 
-func runReadQueryByEmail(
+func runReadUserLookupItems(
 	db *rbi.DB[uint64, UserBench],
 	rng *rand.Rand,
 	currentMaxID uint64,

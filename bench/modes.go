@@ -17,7 +17,7 @@ func buildSweepModeReport(
 	emailSamples []string,
 	opts benchOptions,
 ) BenchmarkReport {
-	scenarios := allReadScenarios()
+	scenarios := readScenarios()
 	log.Printf(
 		"Starting sweep mode: %d queries, workers=%v, duration=%s",
 		len(scenarios),
@@ -63,7 +63,7 @@ func buildStressModeReport(
 	includeRead := !opts.stressNoRead
 	includeWrite := !opts.stressNoWrite
 
-	workers := buildDedicatedWorkerRunners(allReadScenarios(), includeRead, includeWrite)
+	workers := buildDedicatedWorkerRunners(readScenarios(), includeRead, includeWrite)
 	if len(workers) == 0 {
 		log.Fatal("no workers configured for stress")
 	}
@@ -186,7 +186,7 @@ runLoop:
 				opts.caseDuration.String(),
 			)
 
-			res := runCase(
+			res := runMatrixCase(
 				ctx,
 				db,
 				maxIDPtr,

@@ -30,7 +30,7 @@ func collectIDsByTagDistinctLen(t *testing.T, db *DB[uint64, Rec], wantLen int) 
 		if rec == nil {
 			return true, nil
 		}
-		if distinctCount(rec.Tags) == wantLen {
+		if countDistinct(rec.Tags) == wantLen {
 			out = append(out, id)
 		}
 		db.ReleaseRecords(rec)

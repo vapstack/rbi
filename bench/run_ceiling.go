@@ -1375,7 +1375,7 @@ func runCeilingReadFast(
 	maxIDPtr *uint64,
 	emailSamples []string,
 ) (string, error) {
-	return runReadQueryByEmail(db, rng, atomic.LoadUint64(maxIDPtr), emailSamples)
+	return runReadUserLookupItems(db, rng, atomic.LoadUint64(maxIDPtr), emailSamples)
 }
 
 func runCeilingReadSlow(

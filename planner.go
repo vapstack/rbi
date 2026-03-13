@@ -1960,7 +1960,7 @@ func (db *DB[K, V]) execPlanOROrderKWay(q *qx.QX, branches plannerORBranches, tr
 	}
 
 	for i := range branches {
-		branchStart, branchEnd, covered, rangeOK := db.extractOrderRangeCoveragePreds(o.Field, branches[i].preds, s)
+		branchStart, branchEnd, covered, rangeOK := db.extractOrderRangeCoverage(o.Field, branches[i].preds, s)
 		if !rangeOK {
 			return nil, false, nil
 		}
@@ -2381,7 +2381,7 @@ func (db *DB[K, V]) collectOROrderFallbackBranchCandidates(
 		return 0, 0, 0, true
 	}
 
-	start, end, covered, rangeOK := db.extractOrderRangeCoveragePreds(order.Field, branch.preds, s)
+	start, end, covered, rangeOK := db.extractOrderRangeCoverage(order.Field, branch.preds, s)
 	if !rangeOK {
 		return 0, 0, 0, false
 	}

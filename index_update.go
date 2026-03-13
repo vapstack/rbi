@@ -139,7 +139,7 @@ func (db *DB[K, V]) checkUniqueBatchCandidateAndCollectSeen(
 		}
 	}
 
-	bm, releaseBM := lookupUniqueBitmap(db, acc.name, single)
+	bm, releaseBM := db.lookupUniqueBitmap(acc.name, single)
 	if bm == nil || bm.IsEmpty() {
 		releaseBM()
 		return append(seenWrites, uniqueSeenWrite{field: acc.name, key: single}), nil
@@ -255,7 +255,7 @@ func (db *DB[K, V]) checkUniqueBatchAppend(state uniqueBatchCheckState, idx uint
 
 func noReleaseUniqueBitmap() {}
 
-func lookupUniqueBitmap[K ~string | ~uint64, V any](db *DB[K, V], field, key string) (*roaring64.Bitmap, func()) {
+func (db *DB[K, V]) lookupUniqueBitmap(field, key string) (*roaring64.Bitmap, func()) {
 	bm, owned := db.fieldLookupOwned(field, key, nil)
 	if !owned {
 		return bm, noReleaseUniqueBitmap
@@ -309,7 +309,7 @@ func (db *DB[K, V]) applyDeltaFieldAccessor(
 		for _, sval := range multi {
 			addIdxToDeltaChangeMap(indexChanges, acc.name, sval, idx, isAdd)
 		}
-		n := distinctCount(multi)
+		n := countDistinct(multi)
 		useZeroComplement := db.lenZeroComplement[acc.name]
 		if !useZeroComplement || n > 0 {
 			addIdxToDeltaChangeMap(lenChanges, acc.name, uint64ByteStr(uint64(n)), idx, isAdd)
@@ -511,7 +511,7 @@ func (db *DB[K, V]) checkUniqueBatchCandidate(
 	}
 	sm[single] = idx
 
-	bm, releaseBM := lookupUniqueBitmap(db, acc.name, single)
+	bm, releaseBM := db.lookupUniqueBitmap(acc.name, single)
 	if bm == nil || bm.IsEmpty() {
 		releaseBM()
 		return nil
@@ -780,7 +780,7 @@ func (db *DB[K, V]) publishWriteDeltaBatch(txID uint64, idxs []uint64, oldVals, 
 	db.publishSnapshotWithAccumDeltaNoLock(txID, indexChanges, lenChanges, add, rem)
 }
 
-func distinctCount(s []string) int {
+func countDistinct(s []string) int {
 	n := len(s)
 	switch n {
 	case 0:
@@ -806,12 +806,12 @@ func distinctCount(s []string) int {
 		return 3
 	}
 	if n <= 8 {
-		return distinctCountLoop(s, n)
+		return countDistinctLinear(s, n)
 	}
 	return len(dedupStringsInplace(s))
 }
 
-func distinctCountLoop(s []string, n int) int {
+func countDistinctLinear(s []string, n int) int {
 	uniq := 0
 OUTER:
 	for i := 0; i < n; i++ {
@@ -860,7 +860,7 @@ func (db *DB[K, V]) checkUniqueSingleCandidate(idx uint64, ptr unsafe.Pointer, a
 		return nil // as in classic sql, multiple nulls are ok
 	}
 
-	bm, releaseBM := lookupUniqueBitmap(db, acc.name, single)
+	bm, releaseBM := db.lookupUniqueBitmap(acc.name, single)
 	if bm == nil || bm.IsEmpty() {
 		releaseBM()
 		return nil

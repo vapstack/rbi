@@ -661,7 +661,7 @@ func (db *DB[K, V]) initIndexedFieldAccessors() {
 func (db *DB[K, V]) initBatcher() {
 	maxOps := db.options.AutoBatchMax
 	if maxOps <= 1 || db.options.AutoBatchWindow <= 0 {
-		db.combiner = combiner[K, V]{}
+		db.autoBatcher = autoBatcher[K, V]{}
 		return
 	}
 	maxQueue := db.options.AutoBatchMaxQueue
@@ -672,12 +672,12 @@ func (db *DB[K, V]) initBatcher() {
 	if maxQueue > 0 && maxQueue < capHint {
 		capHint = maxQueue
 	}
-	db.combiner = combiner[K, V]{
+	db.autoBatcher = autoBatcher[K, V]{
 		enabled: true,
 		window:  db.options.AutoBatchWindow,
 		maxOps:  maxOps,
 		maxQ:    maxQueue,
-		queue:   make([]*combineRequest[K, V], 0, capHint),
+		queue:   make([]*autoBatchRequest[K, V], 0, capHint),
 	}
 }
 
@@ -751,7 +751,7 @@ type indexedFieldAccessor struct {
 	getter getterFn
 }
 
-type combiner[K ~string | ~uint64, V any] struct {
+type autoBatcher[K ~string | ~uint64, V any] struct {
 	enabled bool
 	window  time.Duration
 	maxOps  int
@@ -759,15 +759,15 @@ type combiner[K ~string | ~uint64, V any] struct {
 
 	mu       sync.Mutex
 	running  bool
-	queue    []*combineRequest[K, V]
+	queue    []*autoBatchRequest[K, V]
 	hotUntil time.Time
 
 	submitted          atomic.Uint64
 	enqueued           atomic.Uint64
 	dequeued           atomic.Uint64
-	batches            atomic.Uint64
-	combinedBatches    atomic.Uint64
-	combinedOps        atomic.Uint64
+	executedBatches    atomic.Uint64
+	multiReqBatches    atomic.Uint64
+	multiReqOps        atomic.Uint64
 	callbackOps        atomic.Uint64
 	coalescedSetDelete atomic.Uint64
 	maxBatchSeen       atomic.Uint64
@@ -832,10 +832,10 @@ type (
 		lenZeroComplement    map[string]bool
 		patchMap             map[string]*field
 
-		planner   planner
-		snapshot  snapshot
-		combiner  combiner[K, V]
-		rebuilder rebuilder
+		planner     planner
+		snapshot    snapshot
+		autoBatcher autoBatcher[K, V]
+		rebuilder   rebuilder
 
 		options     *Options
 		execOptions execOptions[K, V]
@@ -975,33 +975,33 @@ type (
 		QueueLen int
 		// QueueCap is current allocated queue capacity.
 		QueueCap int
-		// WorkerRunning reports whether combiner worker goroutine is active.
+		// WorkerRunning reports whether auto-batcher worker goroutine is active.
 		WorkerRunning bool
 		// HotWindowActive reports whether adaptive hot coalescing window is active.
 		HotWindowActive bool
 
 		// Submitted is number of submit attempts from eligible write calls.
 		Submitted uint64
-		// Enqueued is number of requests accepted into combiner queue.
+		// Enqueued is number of requests accepted into auto-batcher queue.
 		Enqueued uint64
 		// Dequeued is number of requests popped from queue for execution.
 		Dequeued uint64
 		// QueueHighWater is maximum observed queue length.
 		QueueHighWater uint64
 
-		// Batches is total executed combined-transaction batches.
-		Batches uint64
-		// CombinedBatches is number of batches containing more than one request.
-		CombinedBatches uint64
-		// CombinedOps is total requests executed inside multi-request batches.
-		CombinedOps uint64
+		// ExecutedBatches is total executed auto-batcher transactions.
+		ExecutedBatches uint64
+		// MultiRequestBatches is number of executed batches containing more than one request.
+		MultiRequestBatches uint64
+		// MultiRequestOps is total requests executed inside multi-request batches.
+		MultiRequestOps uint64
 		// AvgBatchSize is average requests per executed batch.
 		AvgBatchSize float64
 		// MaxBatchSeen is maximum observed executed batch size.
 		MaxBatchSeen uint64
 
 		// CallbackOps is number of requests with BeforeStore or BeforeCommit hooks
-		// executed by combiner.
+		// executed by auto-batcher.
 		CallbackOps uint64
 		// CoalescedSetDelete is number of Set/Delete requests collapsed into later Set/Delete of same ID.
 		CoalescedSetDelete uint64
@@ -1011,19 +1011,19 @@ type (
 		// CoalesceWaitTime is total time spent sleeping for coalescing.
 		CoalesceWaitTime time.Duration
 
-		// FallbackDisabled is number of write calls not queued because combiner is disabled.
+		// FallbackDisabled is number of write calls not queued because auto-batcher is disabled.
 		FallbackDisabled uint64
 		// FallbackQueueFull is number of write calls not queued because queue is full.
 		FallbackQueueFull uint64
 		// FallbackPatchUnique is a legacy counter of patch calls not queued due to
 		// potential unique-field touch (kept for compatibility; expected to stay 0).
 		FallbackPatchUnique uint64
-		// FallbackClosed is number of write calls rejected by combiner because DB is closed.
+		// FallbackClosed is number of write calls rejected by auto-batcher because DB is closed.
 		FallbackClosed uint64
 
 		// UniqueRejected is number of queued requests rejected by unique checks before commit.
 		UniqueRejected uint64
-		// TxBeginErrors is number of write tx begin failures inside combiner.
+		// TxBeginErrors is number of write tx begin failures inside auto-batcher.
 		TxBeginErrors uint64
 		// TxOpErrors is number of write tx operation failures before commit.
 		TxOpErrors uint64
@@ -1426,42 +1426,42 @@ func (db *DB[K, V]) IndexStats() IndexStats[K] {
 // AutoBatchStats returns auto-batcher queue/batch/fallback diagnostics.
 func (db *DB[K, V]) AutoBatchStats() AutoBatchStats {
 	out := AutoBatchStats{
-		Enabled:             db.combiner.enabled,
-		Window:              db.combiner.window,
-		MaxBatch:            db.combiner.maxOps,
-		MaxQueue:            db.combiner.maxQ,
-		Submitted:           db.combiner.submitted.Load(),
-		Enqueued:            db.combiner.enqueued.Load(),
-		Dequeued:            db.combiner.dequeued.Load(),
-		QueueHighWater:      db.combiner.queueHighWater.Load(),
-		Batches:             db.combiner.batches.Load(),
-		CombinedBatches:     db.combiner.combinedBatches.Load(),
-		CombinedOps:         db.combiner.combinedOps.Load(),
-		MaxBatchSeen:        db.combiner.maxBatchSeen.Load(),
-		CallbackOps:         db.combiner.callbackOps.Load(),
-		CoalescedSetDelete:  db.combiner.coalescedSetDelete.Load(),
-		CoalesceWaits:       db.combiner.coalesceWaits.Load(),
-		CoalesceWaitTime:    time.Duration(db.combiner.coalesceWaitNanos.Load()),
-		FallbackDisabled:    db.combiner.fallbackDisabled.Load(),
-		FallbackQueueFull:   db.combiner.fallbackQueueFull.Load(),
-		FallbackPatchUnique: db.combiner.fallbackPatchUnique.Load(),
-		FallbackClosed:      db.combiner.fallbackClosed.Load(),
-		UniqueRejected:      db.combiner.uniqueRejected.Load(),
-		TxBeginErrors:       db.combiner.txBeginErrors.Load(),
-		TxOpErrors:          db.combiner.txOpErrors.Load(),
-		TxCommitErrors:      db.combiner.txCommitErrors.Load(),
-		CallbackErrors:      db.combiner.callbackErrors.Load(),
+		Enabled:             db.autoBatcher.enabled,
+		Window:              db.autoBatcher.window,
+		MaxBatch:            db.autoBatcher.maxOps,
+		MaxQueue:            db.autoBatcher.maxQ,
+		Submitted:           db.autoBatcher.submitted.Load(),
+		Enqueued:            db.autoBatcher.enqueued.Load(),
+		Dequeued:            db.autoBatcher.dequeued.Load(),
+		QueueHighWater:      db.autoBatcher.queueHighWater.Load(),
+		ExecutedBatches:     db.autoBatcher.executedBatches.Load(),
+		MultiRequestBatches: db.autoBatcher.multiReqBatches.Load(),
+		MultiRequestOps:     db.autoBatcher.multiReqOps.Load(),
+		MaxBatchSeen:        db.autoBatcher.maxBatchSeen.Load(),
+		CallbackOps:         db.autoBatcher.callbackOps.Load(),
+		CoalescedSetDelete:  db.autoBatcher.coalescedSetDelete.Load(),
+		CoalesceWaits:       db.autoBatcher.coalesceWaits.Load(),
+		CoalesceWaitTime:    time.Duration(db.autoBatcher.coalesceWaitNanos.Load()),
+		FallbackDisabled:    db.autoBatcher.fallbackDisabled.Load(),
+		FallbackQueueFull:   db.autoBatcher.fallbackQueueFull.Load(),
+		FallbackPatchUnique: db.autoBatcher.fallbackPatchUnique.Load(),
+		FallbackClosed:      db.autoBatcher.fallbackClosed.Load(),
+		UniqueRejected:      db.autoBatcher.uniqueRejected.Load(),
+		TxBeginErrors:       db.autoBatcher.txBeginErrors.Load(),
+		TxOpErrors:          db.autoBatcher.txOpErrors.Load(),
+		TxCommitErrors:      db.autoBatcher.txCommitErrors.Load(),
+		CallbackErrors:      db.autoBatcher.callbackErrors.Load(),
 	}
 
-	db.combiner.mu.Lock()
-	out.QueueLen = len(db.combiner.queue)
-	out.QueueCap = cap(db.combiner.queue)
-	out.WorkerRunning = db.combiner.running
-	out.HotWindowActive = time.Now().Before(db.combiner.hotUntil)
-	db.combiner.mu.Unlock()
+	db.autoBatcher.mu.Lock()
+	out.QueueLen = len(db.autoBatcher.queue)
+	out.QueueCap = cap(db.autoBatcher.queue)
+	out.WorkerRunning = db.autoBatcher.running
+	out.HotWindowActive = time.Now().Before(db.autoBatcher.hotUntil)
+	db.autoBatcher.mu.Unlock()
 
-	if out.Batches > 0 {
-		out.AvgBatchSize = float64(out.Dequeued) / float64(out.Batches)
+	if out.ExecutedBatches > 0 {
+		out.AvgBatchSize = float64(out.Dequeued) / float64(out.ExecutedBatches)
 	}
 	return out
 }
@@ -1562,7 +1562,7 @@ func (db *DB[K, V]) Truncate() error {
 
 	// Keep writer lock order consistent with batched/single write paths:
 	// open bbolt write tx first, then take db.mu. This avoids tx<->mu inversion
-	// deadlocks against executeCombinedBatch (which already uses that order).
+	// deadlocks against executeAutoBatch (which already uses that order).
 	tx, err := db.bolt.Begin(true)
 	if err != nil {
 		return fmt.Errorf("tx error: %w", err)

@@ -320,8 +320,8 @@ loop:
 
 			wcNow := db.AutoBatchStats()
 			txDelta := uint64(0)
-			if wcNow.Batches >= lastBatch.Batches {
-				txDelta = wcNow.Batches - lastBatch.Batches
+			if wcNow.ExecutedBatches >= lastBatch.ExecutedBatches {
+				txDelta = wcNow.ExecutedBatches - lastBatch.ExecutedBatches
 			}
 			txOpsPerSec := float64(txDelta) / intervalSec
 
@@ -385,8 +385,8 @@ loop:
 		}
 		return after - before
 	}
-	writeTxCommits := delta(wcEnd.Batches, bStats.Batches)
-	batchedOps := delta(wcEnd.CombinedOps, bStats.CombinedOps)
+	writeTxCommits := delta(wcEnd.ExecutedBatches, bStats.ExecutedBatches)
+	batchedOps := delta(wcEnd.MultiRequestOps, bStats.MultiRequestOps)
 	writeDequeued := delta(wcEnd.Dequeued, bStats.Dequeued)
 	writeAvgBatch := 0.0
 	if writeTxCommits > 0 {

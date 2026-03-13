@@ -48,13 +48,13 @@ func (p leafPred) iterNew() roaringIter {
 	case leafPredKindEmpty:
 		return emptyIter{}
 	case leafPredKindPosting:
-		return postingIterFromPosting(p.posting)
+		return p.posting.Iter()
 	case leafPredKindPostsConcat:
 		return newPostingConcatIter(p.posts)
 	case leafPredKindPostsUnion:
 		return newPostingUnionIter(p.posts)
 	case leafPredKindPostsAll:
-		return postingIterFromPosting(p.posting)
+		return p.posting.Iter()
 	default:
 		return emptyIter{}
 	}
@@ -682,7 +682,7 @@ func (db *DB[K, V]) buildLeafPred(e qx.Expr) (leafPred, bool, error) {
 			return leafPred{}, false, nil
 		}
 
-		ids, keep := overlayLookupPostingRetained(ov, key)
+		ids, keep := ov.lookupPostingRetained(key)
 		if ids.IsEmpty() {
 			return emptyLeaf(), true, nil
 		}
@@ -713,7 +713,7 @@ func (db *DB[K, V]) buildLeafPred(e qx.Expr) (leafPred, bool, error) {
 			return leafPred{}, false, nil
 		}
 
-		posts, est, release := lookupManyOverlayPosting(ov, keys)
+		posts, est, release := ov.lookupPostings(keys)
 		if len(posts) == 0 {
 			if release != nil {
 				release()
@@ -748,7 +748,7 @@ func (db *DB[K, V]) buildLeafPred(e qx.Expr) (leafPred, bool, error) {
 		ownedBMs := ownedInline[:0]
 		var est uint64
 		for _, k := range keys {
-			ids, keep := overlayLookupPostingRetained(ov, k)
+			ids, keep := ov.lookupPostingRetained(k)
 			if ids.IsEmpty() {
 				if len(ownedBMs) > 0 {
 					releaseOwnedBitmapSlice(ownedBMs)
@@ -798,7 +798,7 @@ func (db *DB[K, V]) buildLeafPred(e qx.Expr) (leafPred, bool, error) {
 			return leafPred{}, false, nil
 		}
 
-		posts, est, release := lookupManyOverlayPosting(ov, keys)
+		posts, est, release := ov.lookupPostings(keys)
 		if len(posts) == 0 {
 			if release != nil {
 				release()
@@ -907,33 +907,6 @@ func appendExtractAndLeaves(dst []qx.Expr, e qx.Expr) ([]qx.Expr, bool) {
 	}
 }
 
-func lookupManyOverlayPosting(ov fieldOverlay, keys []string) ([]postingList, uint64, func()) {
-	postsBuf := getPostingListSliceBuf(len(keys))
-	posts := postsBuf.values
-	var ownedInline [8]*roaring64.Bitmap
-	ownedBMs := ownedInline[:0]
-	var est uint64
-	for _, k := range keys {
-		ids, keep := overlayLookupPostingRetained(ov, k)
-		if ids.IsEmpty() {
-			continue
-		}
-		posts = append(posts, ids)
-		if keep != nil {
-			ownedBMs = append(ownedBMs, keep)
-		}
-		est += ids.Cardinality()
-	}
-	cleanup := func() {
-		if len(ownedBMs) > 0 {
-			releaseOwnedBitmapSlice(ownedBMs)
-		}
-		postsBuf.values = posts
-		releasePostingListSliceBuf(postsBuf)
-	}
-	return posts, est, cleanup
-}
-
 func minCardPosting(posts []postingList) postingList {
 	if len(posts) == 0 {
 		return postingList{}
@@ -970,16 +943,6 @@ type emptyIter struct{}
 func (emptyIter) HasNext() bool { return false }
 func (emptyIter) Next() uint64  { return 0 }
 
-func postingIterFromPosting(ids postingList) roaringIter {
-	if ids.IsEmpty() {
-		return emptyIter{}
-	}
-	if ids.isSingleton() {
-		return newSingletonIter(ids.single)
-	}
-	return ids.bitmap().Iterator()
-}
-
 type postingConcatIter struct {
 	posts []postingList
 	i     int
@@ -1003,7 +966,7 @@ func (it *postingConcatIter) HasNext() bool {
 		if p.IsEmpty() {
 			continue
 		}
-		it.curIt = postingIterFromPosting(p)
+		it.curIt = p.Iter()
 	}
 }
 
@@ -1061,7 +1024,7 @@ func (u *postingUnionIter) HasNext() bool {
 		if p.IsEmpty() {
 			continue
 		}
-		u.curIt = postingIterFromPosting(p)
+		u.curIt = p.Iter()
 	}
 }
 

@@ -7,16 +7,16 @@ import (
 	"time"
 )
 
-type combineOp uint8
+type autoBatchOp uint8
 
 const (
-	combineSet combineOp = iota + 1
-	combinePatch
-	combineDelete
+	autoBatchSet autoBatchOp = iota + 1
+	autoBatchPatch
+	autoBatchDelete
 )
 
-type combineRequest[K ~string | ~uint64, V any] struct {
-	op combineOp
+type autoBatchRequest[K ~string | ~uint64, V any] struct {
+	op autoBatchOp
 	id K
 
 	setValue    *V
@@ -31,14 +31,14 @@ type combineRequest[K ~string | ~uint64, V any] struct {
 	beforeCommit  []beforeCommitFunc[K, V]
 	cloneValue    func(K, *V) *V
 
-	coalescedTo *combineRequest[K, V]
+	coalescedTo *autoBatchRequest[K, V]
 
 	err  error
 	done chan error
 }
 
-type combinedBatchPrepared[K ~string | ~uint64, V any] struct {
-	req *combineRequest[K, V]
+type autoBatchPrepared[K ~string | ~uint64, V any] struct {
+	req *autoBatchRequest[K, V]
 
 	key      []byte
 	payload  []byte
@@ -49,7 +49,7 @@ type combinedBatchPrepared[K ~string | ~uint64, V any] struct {
 	modified []string
 }
 
-type combinedBatchState[K ~string | ~uint64, V any] struct {
+type autoBatchState[K ~string | ~uint64, V any] struct {
 	key []byte
 
 	idx      uint64
@@ -60,7 +60,7 @@ type combinedBatchState[K ~string | ~uint64, V any] struct {
 	currentPayload []byte
 }
 
-func rollbackCreatedStrIdxIfNeeded[K ~string | ~uint64, V any](db *DB[K, V], op combinedBatchPrepared[K, V]) {
+func (db *DB[K, V]) rollbackCreatedStrIdxIfNeeded(op autoBatchPrepared[K, V]) {
 	if !db.strkey {
 		return
 	}
@@ -82,21 +82,21 @@ func atomicSetMax(dst *atomic.Uint64, v uint64) {
 	}
 }
 
-func (db *DB[K, V]) tryQueueSetCombine(id K, newVal *V, beforeStore []beforeStoreFunc[K, V], beforeCommit []beforeCommitFunc[K, V], cloneValue func(K, *V) *V) (error, bool) {
-	if !db.combiner.enabled {
-		db.combiner.fallbackDisabled.Add(1)
+func (db *DB[K, V]) trySetViaAutoBatch(id K, newVal *V, beforeStore []beforeStoreFunc[K, V], beforeCommit []beforeCommitFunc[K, V], cloneValue func(K, *V) *V) (error, bool) {
+	if !db.autoBatcher.enabled {
+		db.autoBatcher.fallbackDisabled.Add(1)
 		return nil, false
 	}
 	if newVal == nil {
 		return ErrNilValue, true
 	}
 	if err := db.unavailableErr(); err != nil {
-		db.combiner.fallbackClosed.Add(1)
+		db.autoBatcher.fallbackClosed.Add(1)
 		return err, true
 	}
 
-	req := &combineRequest[K, V]{
-		op:           combineSet,
+	req := &autoBatchRequest[K, V]{
+		op:           autoBatchSet,
 		id:           id,
 		beforeStore:  beforeStore,
 		beforeCommit: beforeCommit,
@@ -117,21 +117,21 @@ func (db *DB[K, V]) tryQueueSetCombine(id K, newVal *V, beforeStore []beforeStor
 		req.setValue = newVal
 		req.setPayload = append([]byte(nil), b.Bytes()...)
 	}
-	return db.submitCombinedBatch(req)
+	return db.submitAutoBatch(req)
 }
 
-func (db *DB[K, V]) tryQueuePatchCombine(id K, fields []Field, ignoreUnknown bool, beforeProcess []beforeProcessFunc[K, V], beforeStore []beforeStoreFunc[K, V], beforeCommit []beforeCommitFunc[K, V]) (error, bool) {
-	if !db.combiner.enabled {
-		db.combiner.fallbackDisabled.Add(1)
+func (db *DB[K, V]) tryPatchViaAutoBatch(id K, fields []Field, ignoreUnknown bool, beforeProcess []beforeProcessFunc[K, V], beforeStore []beforeStoreFunc[K, V], beforeCommit []beforeCommitFunc[K, V]) (error, bool) {
+	if !db.autoBatcher.enabled {
+		db.autoBatcher.fallbackDisabled.Add(1)
 		return nil, false
 	}
 	if err := db.unavailableErr(); err != nil {
-		db.combiner.fallbackClosed.Add(1)
+		db.autoBatcher.fallbackClosed.Add(1)
 		return err, true
 	}
 
-	req := &combineRequest[K, V]{
-		op:                 combinePatch,
+	req := &autoBatchRequest[K, V]{
+		op:                 autoBatchPatch,
 		id:                 id,
 		patch:              append([]Field(nil), fields...),
 		patchIgnoreUnknown: ignoreUnknown,
@@ -140,92 +140,92 @@ func (db *DB[K, V]) tryQueuePatchCombine(id K, fields []Field, ignoreUnknown boo
 		beforeCommit:       beforeCommit,
 		done:               make(chan error, 1),
 	}
-	return db.submitCombinedBatch(req)
+	return db.submitAutoBatch(req)
 }
 
-func (db *DB[K, V]) tryQueueDeleteCombine(id K, beforeCommit []beforeCommitFunc[K, V]) (error, bool) {
-	if !db.combiner.enabled {
-		db.combiner.fallbackDisabled.Add(1)
+func (db *DB[K, V]) tryDeleteViaAutoBatch(id K, beforeCommit []beforeCommitFunc[K, V]) (error, bool) {
+	if !db.autoBatcher.enabled {
+		db.autoBatcher.fallbackDisabled.Add(1)
 		return nil, false
 	}
 	if err := db.unavailableErr(); err != nil {
-		db.combiner.fallbackClosed.Add(1)
+		db.autoBatcher.fallbackClosed.Add(1)
 		return err, true
 	}
 
-	req := &combineRequest[K, V]{
-		op:           combineDelete,
+	req := &autoBatchRequest[K, V]{
+		op:           autoBatchDelete,
 		id:           id,
 		beforeCommit: beforeCommit,
 		done:         make(chan error, 1),
 	}
-	return db.submitCombinedBatch(req)
+	return db.submitAutoBatch(req)
 }
 
-func (db *DB[K, V]) submitCombinedBatch(req *combineRequest[K, V]) (error, bool) {
-	db.combiner.submitted.Add(1)
+func (db *DB[K, V]) submitAutoBatch(req *autoBatchRequest[K, V]) (error, bool) {
+	db.autoBatcher.submitted.Add(1)
 
 	startRunner := false
-	db.combiner.mu.Lock()
-	if db.combiner.maxQ > 0 && len(db.combiner.queue) >= db.combiner.maxQ {
-		db.combiner.mu.Unlock()
-		db.combiner.fallbackQueueFull.Add(1)
+	db.autoBatcher.mu.Lock()
+	if db.autoBatcher.maxQ > 0 && len(db.autoBatcher.queue) >= db.autoBatcher.maxQ {
+		db.autoBatcher.mu.Unlock()
+		db.autoBatcher.fallbackQueueFull.Add(1)
 		return nil, false
 	}
 
-	db.combiner.queue = append(db.combiner.queue, req)
-	db.combiner.enqueued.Add(1)
-	atomicSetMax(&db.combiner.queueHighWater, uint64(len(db.combiner.queue)))
+	db.autoBatcher.queue = append(db.autoBatcher.queue, req)
+	db.autoBatcher.enqueued.Add(1)
+	atomicSetMax(&db.autoBatcher.queueHighWater, uint64(len(db.autoBatcher.queue)))
 
-	if !db.combiner.running {
-		db.combiner.running = true
+	if !db.autoBatcher.running {
+		db.autoBatcher.running = true
 		startRunner = true
 	}
-	db.combiner.mu.Unlock()
+	db.autoBatcher.mu.Unlock()
 
 	if startRunner {
-		go db.runCombinerLoop()
+		go db.runAutoBatcherLoop()
 	}
 
 	return <-req.done, true
 }
 
-func (db *DB[K, V]) runCombinerLoop() {
+func (db *DB[K, V]) runAutoBatcherLoop() {
 	for {
-		batch := db.popCombinedBatch()
+		batch := db.popAutoBatch()
 		if len(batch) == 0 {
 			return
 		}
 		if err := db.unavailableErr(); err != nil {
-			db.failCombinedBatch(batch, err)
+			db.failAutoBatch(batch, err)
 			continue
 		}
-		db.executeCombinedBatch(batch)
+		db.executeAutoBatch(batch)
 	}
 }
 
-func (db *DB[K, V]) popCombinedBatch() []*combineRequest[K, V] {
+func (db *DB[K, V]) popAutoBatch() []*autoBatchRequest[K, V] {
 
-	db.combiner.mu.Lock()
-	if len(db.combiner.queue) == 0 {
-		db.combiner.running = false
-		db.combiner.mu.Unlock()
+	db.autoBatcher.mu.Lock()
+	if len(db.autoBatcher.queue) == 0 {
+		db.autoBatcher.running = false
+		db.autoBatcher.mu.Unlock()
 		return nil
 	}
 
 	waitDur := time.Duration(0)
-	if db.combiner.window > 0 && len(db.combiner.queue) < db.combiner.maxOps {
+	if db.autoBatcher.window > 0 && len(db.autoBatcher.queue) < db.autoBatcher.maxOps {
 		now := time.Now()
 		switch {
-		case len(db.combiner.queue) > 1:
-			waitDur = db.combiner.window
-			keepHot := 4 * db.combiner.window
+		case len(db.autoBatcher.queue) > 1:
+			waitDur = db.autoBatcher.window
+			keepHot := 4 * db.autoBatcher.window
 			if keepHot < 500*time.Microsecond {
 				keepHot = 500 * time.Microsecond
 			}
-			db.combiner.hotUntil = now.Add(keepHot)
-		case now.Before(db.combiner.hotUntil):
-			waitDur = db.combiner.window
+			db.autoBatcher.hotUntil = now.Add(keepHot)
+		case now.Before(db.autoBatcher.hotUntil):
+			waitDur = db.autoBatcher.window
 			if waitDur > 50*time.Microsecond {
 				waitDur /= 2
 			}
@@ -233,31 +233,31 @@ func (db *DB[K, V]) popCombinedBatch() []*combineRequest[K, V] {
 	}
 
 	if waitDur > 0 {
-		db.combiner.mu.Unlock()
+		db.autoBatcher.mu.Unlock()
 		start := time.Now()
 		time.Sleep(waitDur)
-		db.combiner.coalesceWaits.Add(1)
-		db.combiner.coalesceWaitNanos.Add(uint64(time.Since(start)))
-		db.combiner.mu.Lock()
-		if len(db.combiner.queue) == 0 {
-			db.combiner.running = false
-			db.combiner.mu.Unlock()
+		db.autoBatcher.coalesceWaits.Add(1)
+		db.autoBatcher.coalesceWaitNanos.Add(uint64(time.Since(start)))
+		db.autoBatcher.mu.Lock()
+		if len(db.autoBatcher.queue) == 0 {
+			db.autoBatcher.running = false
+			db.autoBatcher.mu.Unlock()
 			return nil
 		}
 	}
 
-	n := db.combiner.maxOps
-	if n <= 0 || n > len(db.combiner.queue) {
-		n = len(db.combiner.queue)
+	n := db.autoBatcher.maxOps
+	if n <= 0 || n > len(db.autoBatcher.queue) {
+		n = len(db.autoBatcher.queue)
 	}
 
 	if n > 1 {
 		lastByID := make(map[K]int, n)
 		for i := 0; i < n; i++ {
-			req := db.combiner.queue[i]
+			req := db.autoBatcher.queue[i]
 			prevIdx, seen := lastByID[req.id]
 			if seen {
-				prev := db.combiner.queue[prevIdx]
+				prev := db.autoBatcher.queue[prevIdx]
 				if !(canCoalesceSetDelete(req) && canCoalesceSetDelete(prev)) &&
 					!(db.canBatchRepeatedID(req) && db.canBatchRepeatedID(prev)) {
 					n = i
@@ -268,31 +268,31 @@ func (db *DB[K, V]) popCombinedBatch() []*combineRequest[K, V] {
 		}
 	}
 
-	batch := append([]*combineRequest[K, V](nil), db.combiner.queue[:n]...)
+	batch := append([]*autoBatchRequest[K, V](nil), db.autoBatcher.queue[:n]...)
 	if len(batch) > 1 {
 		db.coalesceSetDeleteBatch(batch)
 	}
-	db.combiner.queue = append(db.combiner.queue[:0], db.combiner.queue[n:]...)
-	db.combiner.dequeued.Add(uint64(len(batch)))
-	db.combiner.mu.Unlock()
+	db.autoBatcher.queue = append(db.autoBatcher.queue[:0], db.autoBatcher.queue[n:]...)
+	db.autoBatcher.dequeued.Add(uint64(len(batch)))
+	db.autoBatcher.mu.Unlock()
 	return batch
 }
 
-func canCoalesceSetDelete[K ~string | ~uint64, V any](req *combineRequest[K, V]) bool {
+func canCoalesceSetDelete[K ~string | ~uint64, V any](req *autoBatchRequest[K, V]) bool {
 	if req.coalescedTo != nil || hasExecHooks(req.beforeStore, req.beforeCommit) {
 		return false
 	}
-	return req.op == combineSet || req.op == combineDelete
+	return req.op == autoBatchSet || req.op == autoBatchDelete
 }
 
-func (db *DB[K, V]) canBatchRepeatedID(req *combineRequest[K, V]) bool {
+func (db *DB[K, V]) canBatchRepeatedID(req *autoBatchRequest[K, V]) bool {
 	if req.coalescedTo != nil {
 		return false
 	}
 	switch req.op {
-	case combineDelete:
+	case autoBatchDelete:
 		return true
-	case combinePatch:
+	case autoBatchPatch:
 		if db.hasUnique && (len(req.beforeProcess) > 0 || len(req.beforeStore) > 0) {
 			return false
 		}
@@ -326,7 +326,7 @@ func (db *DB[K, V]) patchTouchesUnique(patch []Field) bool {
 	return false
 }
 
-func (db *DB[K, V]) coalesceSetDeleteBatch(batch []*combineRequest[K, V]) {
+func (db *DB[K, V]) coalesceSetDeleteBatch(batch []*autoBatchRequest[K, V]) {
 	if len(batch) < 2 {
 		return
 	}
@@ -341,26 +341,26 @@ func (db *DB[K, V]) coalesceSetDeleteBatch(batch []*combineRequest[K, V]) {
 			prev := batch[prevIdx]
 			if canCoalesceSetDelete(prev) {
 				prev.coalescedTo = req
-				db.combiner.coalescedSetDelete.Add(1)
+				db.autoBatcher.coalescedSetDelete.Add(1)
 			}
 		}
 		lastByID[req.id] = i
 	}
 }
 
-func (db *DB[K, V]) executeCombinedBatch(batch []*combineRequest[K, V]) {
-	db.combiner.batches.Add(1)
+func (db *DB[K, V]) executeAutoBatch(batch []*autoBatchRequest[K, V]) {
+	db.autoBatcher.executedBatches.Add(1)
 	if len(batch) > 1 {
-		db.combiner.combinedBatches.Add(1)
-		db.combiner.combinedOps.Add(uint64(len(batch)))
+		db.autoBatcher.multiReqBatches.Add(1)
+		db.autoBatcher.multiReqOps.Add(uint64(len(batch)))
 	}
-	atomicSetMax(&db.combiner.maxBatchSeen, uint64(len(batch)))
+	atomicSetMax(&db.autoBatcher.maxBatchSeen, uint64(len(batch)))
 
 	for _, req := range batch {
 		req.err = nil
 	}
 
-	active := make([]*combineRequest[K, V], 0, len(batch))
+	active := make([]*autoBatchRequest[K, V], 0, len(batch))
 	for _, req := range batch {
 		if req.coalescedTo == nil {
 			active = append(active, req)
@@ -368,13 +368,13 @@ func (db *DB[K, V]) executeCombinedBatch(batch []*combineRequest[K, V]) {
 	}
 
 	for {
-		retryWithoutReq, done, fatalErr := db.executeCombinedBatchAttempt(active)
+		retryWithoutReq, done, fatalErr := db.executeAutoBatchAttempt(active)
 		if fatalErr != nil {
-			db.failCombinedBatch(batch, fatalErr)
+			db.failAutoBatch(batch, fatalErr)
 			return
 		}
 		if done {
-			db.finishCombinedBatch(batch)
+			db.finishAutoBatch(batch)
 			return
 		}
 
@@ -389,11 +389,11 @@ func (db *DB[K, V]) executeCombinedBatch(batch []*combineRequest[K, V]) {
 		}
 		active = out
 		if !removed {
-			db.failCombinedBatch(batch, fmt.Errorf("internal batch retry error: failed request not found"))
+			db.failAutoBatch(batch, fmt.Errorf("internal auto-batch retry error: failed request not found"))
 			return
 		}
 		if len(active) == 0 {
-			db.finishCombinedBatch(batch)
+			db.finishAutoBatch(batch)
 			return
 		}
 		for _, req := range active {
@@ -404,10 +404,10 @@ func (db *DB[K, V]) executeCombinedBatch(batch []*combineRequest[K, V]) {
 	}
 }
 
-func (db *DB[K, V]) executeCombinedBatchAttempt(active []*combineRequest[K, V]) (*combineRequest[K, V], bool, error) {
+func (db *DB[K, V]) executeAutoBatchAttempt(active []*autoBatchRequest[K, V]) (*autoBatchRequest[K, V], bool, error) {
 	tx, err := db.bolt.Begin(true)
 	if err != nil {
-		db.combiner.txBeginErrors.Add(1)
+		db.autoBatcher.txBeginErrors.Add(1)
 		return nil, true, fmt.Errorf("tx error: %w", err)
 	}
 
@@ -420,15 +420,15 @@ func (db *DB[K, V]) executeCombinedBatchAttempt(active []*combineRequest[K, V]) 
 
 	bucket := tx.Bucket(db.bucket)
 	if bucket == nil {
-		db.combiner.txOpErrors.Add(1)
+		db.autoBatcher.txOpErrors.Add(1)
 		return nil, true, fmt.Errorf("bucket does not exist")
 	}
 
 	bucket.FillPercent = db.options.BucketFillPercent
 
-	prepared := make([]combinedBatchPrepared[K, V], 0, len(active))
+	prepared := make([]autoBatchPrepared[K, V], 0, len(active))
 
-	rollbackCreated := func(ops []combinedBatchPrepared[K, V]) {
+	rollbackCreated := func(ops []autoBatchPrepared[K, V]) {
 		if !db.strkey {
 			return
 		}
@@ -441,12 +441,12 @@ func (db *DB[K, V]) executeCombinedBatchAttempt(active []*combineRequest[K, V]) 
 		}
 	}
 
-	states := make(map[K]*combinedBatchState[K, V], len(active))
+	states := make(map[K]*autoBatchState[K, V], len(active))
 
-	loadState := func(req *combineRequest[K, V], createIdx bool) (*combinedBatchState[K, V], error) {
+	loadState := func(req *autoBatchRequest[K, V], createIdx bool) (*autoBatchState[K, V], error) {
 		st := states[req.id]
 		if st == nil {
-			st = &combinedBatchState[K, V]{
+			st = &autoBatchState[K, V]{
 				key: db.keyFromID(req.id),
 			}
 			if prev := bucket.Get(st.key); prev != nil {
@@ -466,7 +466,7 @@ func (db *DB[K, V]) executeCombinedBatchAttempt(active []*combineRequest[K, V]) 
 		return st, nil
 	}
 
-	ensureIdx := func(req *combineRequest[K, V], st *combinedBatchState[K, V], create bool) {
+	ensureIdx := func(req *autoBatchRequest[K, V], st *autoBatchState[K, V], create bool) {
 		if st.idxKnown {
 			return
 		}
@@ -484,7 +484,7 @@ func (db *DB[K, V]) executeCombinedBatchAttempt(active []*combineRequest[K, V]) 
 		}
 
 		switch req.op {
-		case combineSet:
+		case autoBatchSet:
 			st, stErr := loadState(req, false)
 			if stErr != nil {
 				req.err = fmt.Errorf("decode: %w", stErr)
@@ -494,7 +494,7 @@ func (db *DB[K, V]) executeCombinedBatchAttempt(active []*combineRequest[K, V]) 
 			newVal := req.setValue
 			payload := req.setPayload
 			if len(req.beforeStore) > 0 {
-				db.combiner.callbackOps.Add(1)
+				db.autoBatcher.callbackOps.Add(1)
 				if req.cloneValue != nil {
 					var cloneErr error
 					if newVal, cloneErr = cloneBeforeStoreValue(req.id, req.setBaseline, req.cloneValue); cloneErr != nil {
@@ -511,7 +511,7 @@ func (db *DB[K, V]) executeCombinedBatchAttempt(active []*combineRequest[K, V]) 
 				}
 				if hookErr := runBeforeStoreHooks(req.id, oldVal, newVal, req.beforeStore); hookErr != nil {
 					req.err = hookErr
-					db.combiner.callbackErrors.Add(1)
+					db.autoBatcher.callbackErrors.Add(1)
 					continue
 				}
 
@@ -526,7 +526,7 @@ func (db *DB[K, V]) executeCombinedBatchAttempt(active []*combineRequest[K, V]) 
 			}
 			ensureIdx(req, st, true)
 
-			prepared = append(prepared, combinedBatchPrepared[K, V]{
+			prepared = append(prepared, autoBatchPrepared[K, V]{
 				req:      req,
 				key:      st.key,
 				payload:  payload,
@@ -539,7 +539,7 @@ func (db *DB[K, V]) executeCombinedBatchAttempt(active []*combineRequest[K, V]) 
 			st.current = newVal
 			st.currentPayload = payload
 
-		case combinePatch:
+		case autoBatchPatch:
 			st, stErr := loadState(req, false)
 			if stErr != nil {
 				req.err = fmt.Errorf("failed to decode existing value: %w", stErr)
@@ -572,10 +572,10 @@ func (db *DB[K, V]) executeCombinedBatchAttempt(active []*combineRequest[K, V]) 
 			}
 
 			if len(req.beforeStore) > 0 {
-				db.combiner.callbackOps.Add(1)
+				db.autoBatcher.callbackOps.Add(1)
 				if hookErr := runBeforeStoreHooks(req.id, oldVal, newVal, req.beforeStore); hookErr != nil {
 					req.err = hookErr
-					db.combiner.callbackErrors.Add(1)
+					db.autoBatcher.callbackErrors.Add(1)
 					continue
 				}
 			}
@@ -590,7 +590,7 @@ func (db *DB[K, V]) executeCombinedBatchAttempt(active []*combineRequest[K, V]) 
 			releaseEncodeBuf(b)
 			ensureIdx(req, st, false)
 
-			prepared = append(prepared, combinedBatchPrepared[K, V]{
+			prepared = append(prepared, autoBatchPrepared[K, V]{
 				req:      req,
 				key:      st.key,
 				payload:  payload,
@@ -603,7 +603,7 @@ func (db *DB[K, V]) executeCombinedBatchAttempt(active []*combineRequest[K, V]) 
 			st.current = newVal
 			st.currentPayload = payload
 
-		case combineDelete:
+		case autoBatchDelete:
 			st, stErr := loadState(req, false)
 			if stErr != nil {
 				req.err = fmt.Errorf("decode: %w", stErr)
@@ -615,7 +615,7 @@ func (db *DB[K, V]) executeCombinedBatchAttempt(active []*combineRequest[K, V]) 
 			oldVal := st.current
 			ensureIdx(req, st, false)
 
-			prepared = append(prepared, combinedBatchPrepared[K, V]{
+			prepared = append(prepared, autoBatchPrepared[K, V]{
 				req:      req,
 				key:      st.key,
 				idx:      st.idx,
@@ -665,14 +665,14 @@ func (db *DB[K, V]) executeCombinedBatchAttempt(active []*combineRequest[K, V]) 
 
 	accepted := prepared
 	if db.hasUnique {
-		accepted = make([]combinedBatchPrepared[K, V], 0, len(prepared))
+		accepted = make([]autoBatchPrepared[K, V], 0, len(prepared))
 		uniqueState := db.newUniqueBatchCheckState()
 		defer db.releaseUniqueBatchCheckState(uniqueState)
 		for _, op := range prepared {
 			if uerr := db.checkUniqueBatchAppend(uniqueState, op.idx, op.oldVal, op.newVal, op.modified); uerr != nil {
 				op.req.err = uerr
-				db.combiner.uniqueRejected.Add(1)
-				rollbackCreatedStrIdxIfNeeded(db, op)
+				db.autoBatcher.uniqueRejected.Add(1)
+				db.rollbackCreatedStrIdxIfNeeded(op)
 				continue
 			}
 			accepted = append(accepted, op)
@@ -685,22 +685,22 @@ func (db *DB[K, V]) executeCombinedBatchAttempt(active []*combineRequest[K, V]) 
 	}
 
 	var fatalErr error
-	var callbackFailedReq *combineRequest[K, V]
+	var callbackFailedReq *autoBatchRequest[K, V]
 	for _, op := range accepted {
 		switch op.req.op {
-		case combineSet, combinePatch:
+		case autoBatchSet, autoBatchPatch:
 			if err = bucket.Put(op.key, op.payload); err != nil {
 				fatalErr = fmt.Errorf("put: %w", err)
 			}
-		case combineDelete:
+		case autoBatchDelete:
 			if err = bucket.Delete(op.key); err != nil {
 				fatalErr = fmt.Errorf("delete: %w", err)
 			}
 		default:
-			fatalErr = fmt.Errorf("unknown combine op: %v", op.req.op)
+			fatalErr = fmt.Errorf("unknown auto-batch op: %v", op.req.op)
 		}
 		if fatalErr != nil {
-			db.combiner.txOpErrors.Add(1)
+			db.autoBatcher.txOpErrors.Add(1)
 			break
 		}
 
@@ -708,16 +708,16 @@ func (db *DB[K, V]) executeCombinedBatchAttempt(active []*combineRequest[K, V]) 
 			continue
 		}
 		if len(op.req.beforeStore) == 0 {
-			db.combiner.callbackOps.Add(1)
+			db.autoBatcher.callbackOps.Add(1)
 		}
 		if cbErr := runBeforeCommitHooks(tx, op.req.id, op.oldVal, op.newVal, op.req.beforeCommit); cbErr != nil {
 			op.req.err = cbErr
 			callbackFailedReq = op.req
-			db.combiner.callbackErrors.Add(1)
+			db.autoBatcher.callbackErrors.Add(1)
 			fatalErr = cbErr
 		}
 		if fatalErr != nil {
-			db.combiner.txOpErrors.Add(1)
+			db.autoBatcher.txOpErrors.Add(1)
 			break
 		}
 	}
@@ -731,7 +731,7 @@ func (db *DB[K, V]) executeCombinedBatchAttempt(active []*combineRequest[K, V]) 
 		return nil, true, fatalErr
 	}
 	if err = advanceBucketSequence(bucket); err != nil {
-		db.combiner.txOpErrors.Add(1)
+		db.autoBatcher.txOpErrors.Add(1)
 		rollbackCreated(accepted)
 		db.mu.Unlock()
 		return nil, true, err
@@ -751,7 +751,7 @@ func (db *DB[K, V]) executeCombinedBatchAttempt(active []*combineRequest[K, V]) 
 	txID := uint64(tx.ID())
 	db.markPending(txID)
 	if err = db.commit(tx, "batch"); err != nil {
-		db.combiner.txCommitErrors.Add(1)
+		db.autoBatcher.txCommitErrors.Add(1)
 		db.clearPending(txID)
 		rollbackCreated(accepted)
 		db.mu.Unlock()
@@ -789,16 +789,16 @@ func (db *DB[K, V]) executeCombinedBatchAttempt(active []*combineRequest[K, V]) 
 	return nil, true, nil
 }
 
-func (db *DB[K, V]) failCombinedBatch(batch []*combineRequest[K, V], err error) {
+func (db *DB[K, V]) failAutoBatch(batch []*autoBatchRequest[K, V], err error) {
 	for _, req := range batch {
 		if req.err == nil {
 			req.err = err
 		}
 	}
-	db.finishCombinedBatch(batch)
+	db.finishAutoBatch(batch)
 }
 
-func (db *DB[K, V]) finishCombinedBatch(batch []*combineRequest[K, V]) {
+func (db *DB[K, V]) finishAutoBatch(batch []*autoBatchRequest[K, V]) {
 	for _, req := range batch {
 		if req.coalescedTo != nil {
 			target := req.coalescedTo

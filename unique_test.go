@@ -463,20 +463,20 @@ func TestUnique_BatchDeleteThenSet_ReusesFreedValueInSameTx(t *testing.T) {
 	payload := append([]byte(nil), enc.Bytes()...)
 	releaseEncodeBuf(enc)
 
-	delReq := &combineRequest[uint64, UniqueTestRec]{
-		op:   combineDelete,
+	delReq := &autoBatchRequest[uint64, UniqueTestRec]{
+		op:   autoBatchDelete,
 		id:   1,
 		done: make(chan error, 1),
 	}
-	setReq := &combineRequest[uint64, UniqueTestRec]{
-		op:         combineSet,
+	setReq := &autoBatchRequest[uint64, UniqueTestRec]{
+		op:         autoBatchSet,
 		id:         2,
 		setValue:   newVal,
 		setPayload: payload,
 		done:       make(chan error, 1),
 	}
 
-	db.executeCombinedBatch([]*combineRequest[uint64, UniqueTestRec]{delReq, setReq})
+	db.executeAutoBatch([]*autoBatchRequest[uint64, UniqueTestRec]{delReq, setReq})
 
 	if err := <-delReq.done; err != nil {
 		t.Fatalf("batch delete request failed: %v", err)
@@ -541,22 +541,22 @@ func TestUnique_BatchPartialReject_PreservesAcceptedOpsAndIndex(t *testing.T) {
 	goodPayload := append([]byte(nil), goodEnc.Bytes()...)
 	releaseEncodeBuf(goodEnc)
 
-	badReq := &combineRequest[uint64, UniqueTestRec]{
-		op:         combineSet,
+	badReq := &autoBatchRequest[uint64, UniqueTestRec]{
+		op:         autoBatchSet,
 		id:         3,
 		setValue:   badVal,
 		setPayload: badPayload,
 		done:       make(chan error, 1),
 	}
-	goodReq := &combineRequest[uint64, UniqueTestRec]{
-		op:         combineSet,
+	goodReq := &autoBatchRequest[uint64, UniqueTestRec]{
+		op:         autoBatchSet,
 		id:         2,
 		setValue:   goodVal,
 		setPayload: goodPayload,
 		done:       make(chan error, 1),
 	}
 
-	db.executeCombinedBatch([]*combineRequest[uint64, UniqueTestRec]{badReq, goodReq})
+	db.executeAutoBatch([]*autoBatchRequest[uint64, UniqueTestRec]{badReq, goodReq})
 
 	if err := <-badReq.done; err == nil || !errors.Is(err, ErrUniqueViolation) {
 		t.Fatalf("bad request must fail with ErrUniqueViolation, got: %v", err)
@@ -781,7 +781,7 @@ func TestUnique_ExecuteBatch_MixedOps_MatchesSequentialModel(t *testing.T) {
 			}
 		}
 
-		reqs := make([]*combineRequest[uint64, UniqueTestRec], 0, len(ops))
+		reqs := make([]*autoBatchRequest[uint64, UniqueTestRec], 0, len(ops))
 		for _, op := range ops {
 			switch op.kind {
 			case 0:
@@ -792,31 +792,31 @@ func TestUnique_ExecuteBatch_MixedOps_MatchesSequentialModel(t *testing.T) {
 				}
 				payload := append([]byte(nil), buf.Bytes()...)
 				releaseEncodeBuf(buf)
-				reqs = append(reqs, &combineRequest[uint64, UniqueTestRec]{
-					op:         combineSet,
+				reqs = append(reqs, &autoBatchRequest[uint64, UniqueTestRec]{
+					op:         autoBatchSet,
 					id:         op.id,
 					setValue:   cloneUniqueRec(op.value),
 					setPayload: payload,
 					done:       make(chan error, 1),
 				})
 			case 1:
-				reqs = append(reqs, &combineRequest[uint64, UniqueTestRec]{
-					op:                 combinePatch,
+				reqs = append(reqs, &autoBatchRequest[uint64, UniqueTestRec]{
+					op:                 autoBatchPatch,
 					id:                 op.id,
 					patch:              cloneFields(op.patch),
 					patchIgnoreUnknown: true,
 					done:               make(chan error, 1),
 				})
 			default:
-				reqs = append(reqs, &combineRequest[uint64, UniqueTestRec]{
-					op:   combineDelete,
+				reqs = append(reqs, &autoBatchRequest[uint64, UniqueTestRec]{
+					op:   autoBatchDelete,
 					id:   op.id,
 					done: make(chan error, 1),
 				})
 			}
 		}
 
-		dbBatch.executeCombinedBatch(reqs)
+		dbBatch.executeAutoBatch(reqs)
 
 		batchErrs := make([]error, len(reqs))
 		for i := range reqs {

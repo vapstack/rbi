@@ -163,9 +163,9 @@ func TestOrderRangeCoverage_ConsistencyBetweenPredicateKinds(t *testing.T) {
 	if !ok1 {
 		t.Fatalf("extractOrderRangeCoverage failed")
 	}
-	st2, en2, cov2, ok2 := db.extractOrderRangeCoveragePreds("name", preds, s)
+	st2, en2, cov2, ok2 := db.extractOrderRangeCoverage("name", preds, s)
 	if !ok2 {
-		t.Fatalf("extractOrderRangeCoveragePreds failed")
+		t.Fatalf("extractOrderRangeCoverage failed")
 	}
 	if st1 != st2 || en1 != en2 {
 		t.Fatalf("range mismatch: candidate=(%d,%d) planner=(%d,%d)", st1, en1, st2, en2)
@@ -178,9 +178,9 @@ func TestOrderRangeCoverage_ConsistencyBetweenPredicateKinds(t *testing.T) {
 	if !okOv1 {
 		t.Fatalf("extractOrderRangeCoverageOverlay failed")
 	}
-	br2, covOv2, okOv2 := db.extractOrderRangeCoveragePredsOverlay("name", preds, ov)
+	br2, covOv2, okOv2 := db.extractOrderRangeCoverageOverlay("name", preds, ov)
 	if !okOv2 {
-		t.Fatalf("extractOrderRangeCoveragePredsOverlay failed")
+		t.Fatalf("extractOrderRangeCoverageOverlay failed")
 	}
 	if br1.baseStart != br2.baseStart || br1.baseEnd != br2.baseEnd || br1.deltaStart != br2.deltaStart || br1.deltaEnd != br2.deltaEnd {
 		t.Fatalf("overlay range mismatch: candidate=%+v planner=%+v", br1, br2)
@@ -1001,7 +1001,7 @@ func TestPlannerOrderedAnchor_MatchesBaseline(t *testing.T) {
 	}
 	s := *slice
 	start, end := 0, len(s)
-	if st, en, cov, ok := db.extractOrderRangeCoveragePreds(orderField, predsB, s); ok {
+	if st, en, cov, ok := db.extractOrderRangeCoverage(orderField, predsB, s); ok {
 		start, end = st, en
 		for i := range cov {
 			if cov[i] {

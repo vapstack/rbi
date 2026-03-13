@@ -128,7 +128,7 @@ func runDedicatedWriteDelete(
 	return "write_delete_account", db.Delete(id)
 }
 
-func executeWrite(db *rbi.DB[uint64, UserBench], rng *rand.Rand, maxIDPtr *uint64) (string, error) {
+func runRandomWriteScenario(db *rbi.DB[uint64, UserBench], rng *rand.Rand, maxIDPtr *uint64) (string, error) {
 	action := rng.Float64()
 
 	switch {

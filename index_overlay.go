@@ -125,6 +125,65 @@ func (o fieldOverlay) lookupCardinality(key string) uint64 {
 	return composePostingCardinality(base, de)
 }
 
+func (o fieldOverlay) lookupPostingRetained(key string) (postingList, *roaring64.Bitmap) {
+	var base postingList
+	if len(o.base) > 0 {
+		if i := lowerBoundIndex(o.base, key); i < len(o.base) && indexKeyEqualsString(o.base[i].Key, key) {
+			base = o.base[i].IDs
+		}
+	}
+
+	if o.delta == nil || !o.delta.hasEntries() {
+		return base, nil
+	}
+	de, ok := o.delta.get(key)
+	if !ok {
+		return base, nil
+	}
+
+	bm, owned := composePostingOwned(base, de, nil)
+	if !owned {
+		return postingFromBitmapViewAdaptive(bm), nil
+	}
+	if bm == nil || bm.IsEmpty() {
+		if bm != nil {
+			releaseRoaringBuf(bm)
+		}
+		return postingList{}, nil
+	}
+	p := postingFromBitmapOwned(bm)
+	return p, p.bitmap()
+}
+
+func (o fieldOverlay) lookupPostings(keys []string) ([]postingList, uint64, func()) {
+	postsBuf := getPostingListSliceBuf(len(keys))
+	posts := postsBuf.values
+	var ownedInline [8]*roaring64.Bitmap
+	ownedBMs := ownedInline[:0]
+	var est uint64
+
+	for _, key := range keys {
+		ids, keep := o.lookupPostingRetained(key)
+		if ids.IsEmpty() {
+			continue
+		}
+		posts = append(posts, ids)
+		if keep != nil {
+			ownedBMs = append(ownedBMs, keep)
+		}
+		est += ids.Cardinality()
+	}
+
+	cleanup := func() {
+		if len(ownedBMs) > 0 {
+			releaseOwnedBitmapSlice(ownedBMs)
+		}
+		postsBuf.values = posts
+		releasePostingListSliceBuf(postsBuf)
+	}
+	return posts, est, cleanup
+}
+
 func composePosting(base postingList, de indexDeltaEntry, scratch *roaring64.Bitmap) *roaring64.Bitmap {
 	bm, _ := composePostingOwned(base, de, scratch)
 	return bm

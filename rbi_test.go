@@ -1838,13 +1838,13 @@ func TestBatchConcurrentSingleOps_ModelReplayConsistency(t *testing.T) {
 
 	bs := db.AutoBatchStats()
 	if !bs.Enabled {
-		t.Fatalf("expected write-combiner to be enabled")
+		t.Fatalf("expected auto-batcher to be enabled")
 	}
 	if bs.FallbackQueueFull != 0 || bs.FallbackClosed != 0 || bs.FallbackDisabled != 0 || bs.FallbackPatchUnique != 0 {
-		t.Fatalf("unexpected combiner fallback stats: %+v", bs)
+		t.Fatalf("unexpected auto-batcher fallback stats: %+v", bs)
 	}
-	if bs.CombinedBatches == 0 {
-		t.Fatalf("expected at least one combined batch, stats=%+v", bs)
+	if bs.MultiRequestBatches == 0 {
+		t.Fatalf("expected at least one multi-request batch, stats=%+v", bs)
 	}
 
 	logMu.Lock()
