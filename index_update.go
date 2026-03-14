@@ -558,12 +558,9 @@ func releasePreparedFieldDelta(delta *fieldIndexDelta) {
 	if delta == nil {
 		return
 	}
-	if delta.singleSet {
-		releaseRoaringBuf(delta.singleEntry.add)
-		releaseRoaringBuf(delta.singleEntry.del)
-		return
-	}
-	releaseWriteDeltaInnerMap(delta.byKey)
+	delta.forEach(func(_ string, e indexDeltaEntry) {
+		releaseDeltaEntryBitmaps(e)
+	})
 }
 
 func releasePreparedFieldDeltaMap(delta map[string]*fieldIndexDelta) {

@@ -1131,6 +1131,9 @@ func TestPlannerRouting_PrefersExecutionForPrefixOrderLimit(t *testing.T) {
 	if ev.FallbackCost <= 0 {
 		t.Fatalf("expected fallback cost to be set")
 	}
+	if ev.RowsExamined == 0 {
+		t.Fatalf("expected rows examined to be set")
+	}
 }
 
 func TestPlannerRouting_PrefersExecutionForPrefixNoOrderLimit(t *testing.T) {

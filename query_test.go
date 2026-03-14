@@ -2986,7 +2986,7 @@ func TestRegression_MultiTermHAS_LeadSelfCheck_RouteAndCount(t *testing.T) {
 			assertQueryIDsEqual(t, tc.q, got, prepared)
 
 			expr, _ := normalizeExpr(tc.q.Expr)
-			cntPred, ok, err := db.tryCountByPredicates(expr)
+			cntPred, ok, err := db.tryCountByPredicates(expr, nil)
 			if err != nil {
 				t.Fatalf("tryCountByPredicates: %v", err)
 			}
@@ -3048,7 +3048,7 @@ func TestRegression_CountORByPredicates_MultiTermHASLead(t *testing.T) {
 	}
 
 	expr, _ := normalizeExpr(q.Expr)
-	cntFast, ok, err := db.tryCountORByPredicates(expr)
+	cntFast, ok, err := db.tryCountORByPredicates(expr, nil)
 	if err != nil {
 		t.Fatalf("tryCountORByPredicates: %v", err)
 	}

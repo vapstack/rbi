@@ -96,7 +96,7 @@ func (db *DB[K, V]) queryRecords(tx *bbolt.Tx, snap *indexSnapshot, q *qx.QX) ([
 	view := db.makeQueryView(snap)
 	defer db.releaseQueryView(view)
 
-	ids, err := view.execQuery(q, false, false)
+	ids, err := view.execQuery(q, true, false)
 	if err != nil {
 		return nil, err
 	}

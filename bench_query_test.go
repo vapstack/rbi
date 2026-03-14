@@ -5,6 +5,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"sync"
@@ -172,7 +173,7 @@ func buildBenchDBWithCaching(b *testing.B, n int, withCaching bool) *DB[uint64, 
 
 	b.StopTimer()
 	seedBenchData(b, db, n)
-	_, _ = db.QueryKeys(&qx.QX{Expr: qx.Expr{Op: qx.OpEQ, Field: "country", Value: "NL"}}) // warmup
+	warmBenchDBStateUint64(b, db)
 
 	// s := db.Stats()
 	// b.Logf("total size: %v", s.IndexSize)
@@ -187,6 +188,85 @@ func buildBenchDBWithCaching(b *testing.B, n int, withCaching bool) *DB[uint64, 
 	benchRaws[withCaching] = raw
 	benchDirs[withCaching] = dir
 	return db
+}
+
+func warmBenchDBStateUint64(b *testing.B, db *DB[uint64, UserBench]) {
+	b.Helper()
+
+	countWarmups := []*qx.QX{
+		qx.Query(qx.EQ("country", "NL")),
+		qx.Query(qx.EQ("status", "active")),
+		qx.Query(qx.PREFIX("email", "user1")),
+		qx.Query(qx.HASANY("roles", []string{"admin", "moderator"})),
+	}
+	for _, q := range countWarmups {
+		if _, err := db.Count(q); err != nil {
+			b.Fatalf("warmup Count(%+v): %v", q, err)
+		}
+	}
+
+	keyWarmups := []*qx.QX{
+		qx.Query().Max(100),
+		qx.Query(qx.IN("country", []string{"NL", "DE"})).Max(100),
+		qx.Query(qx.EQ("status", "active")).By("age", qx.ASC).Max(50),
+		qx.Query(
+			qx.OR(
+				qx.HAS("roles", []string{"admin"}),
+				qx.EQ("plan", "enterprise"),
+			),
+		).Max(100),
+	}
+	for _, q := range keyWarmups {
+		if _, err := db.QueryKeys(q); err != nil {
+			b.Fatalf("warmup QueryKeys(%+v): %v", q, err)
+		}
+	}
+
+	readWarmups := []*qx.QX{
+		qx.Query(qx.EQ("country", "US")).By("age", qx.DESC).Max(20),
+	}
+	for _, q := range readWarmups {
+		if _, err := db.Query(q); err != nil {
+			b.Fatalf("warmup Query(%+v): %v", q, err)
+		}
+	}
+
+	scanned := 0
+	if err := db.ScanKeys(0, func(_ uint64) (bool, error) {
+		scanned++
+		return scanned < 128, nil
+	}); err != nil {
+		b.Fatalf("warmup ScanKeys: %v", err)
+	}
+
+	runtime.GC()
+}
+
+func warmBenchCountOnceUint64(b *testing.B, db *DB[uint64, UserBench], q *qx.QX) {
+	b.Helper()
+	b.StopTimer()
+	defer b.StartTimer()
+	if _, err := db.Count(q); err != nil {
+		b.Fatal(err)
+	}
+}
+
+func warmBenchQueryKeysOnceUint64(b *testing.B, db *DB[uint64, UserBench], q *qx.QX) {
+	b.Helper()
+	b.StopTimer()
+	defer b.StartTimer()
+	if _, err := db.QueryKeys(q); err != nil {
+		b.Fatal(err)
+	}
+}
+
+func warmBenchReadQueryOnceUint64(b *testing.B, db *DB[uint64, UserBench], q *qx.QX) {
+	b.Helper()
+	b.StopTimer()
+	defer b.StartTimer()
+	if _, err := db.Query(q); err != nil {
+		b.Fatal(err)
+	}
 }
 
 func runBenchCacheModes(b *testing.B, fn func(*testing.B, bool)) {
@@ -1005,6 +1085,7 @@ func Benchmark_Query_Index_Keys_Gap_ArrayCountSort_MixedFilters_Offset_Limit(b *
 func runQueryKeysBench(b *testing.B, db *DB[uint64, UserBench], q *qx.QX) {
 	b.Helper()
 	b.ReportAllocs()
+	warmBenchQueryKeysOnceUint64(b, db, q)
 	b.ResetTimer()
 	for b.Loop() {
 		_, err := db.QueryKeys(q)
@@ -1017,6 +1098,7 @@ func runQueryKeysBench(b *testing.B, db *DB[uint64, UserBench], q *qx.QX) {
 func runCountBench(b *testing.B, db *DB[uint64, UserBench], q *qx.QX) {
 	b.Helper()
 	b.ReportAllocs()
+	warmBenchCountOnceUint64(b, db, q)
 	b.ResetTimer()
 	for b.Loop() {
 		_, err := db.Count(q)
@@ -1029,6 +1111,7 @@ func runCountBench(b *testing.B, db *DB[uint64, UserBench], q *qx.QX) {
 func runReadQueryBench(b *testing.B, db *DB[uint64, UserBench], q *qx.QX) {
 	b.Helper()
 	b.ReportAllocs()
+	warmBenchReadQueryOnceUint64(b, db, q)
 	b.ResetTimer()
 	for b.Loop() {
 		_, err := db.Query(q)

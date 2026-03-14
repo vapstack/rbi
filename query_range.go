@@ -198,13 +198,12 @@ func (db *DB[K, V]) tryEvalNumericRangeBuckets(field string, fm *field, ov field
 	if ov.delta != nil && br.deltaStart < br.deltaEnd {
 		// Apply delta removals before additions so ID moves between in-range keys
 		// preserve final membership.
-		dkeys := ov.delta.sortedKeys()
 		for i := br.deltaStart; i < br.deltaEnd; i++ {
-			de, _ := ov.delta.get(dkeys[i])
+			_, de, _ := ov.delta.orderedEntryAt(i)
 			deltaEntryApplyDelToBitmap(res, de)
 		}
 		for i := br.deltaStart; i < br.deltaEnd; i++ {
-			de, _ := ov.delta.get(dkeys[i])
+			_, de, _ := ov.delta.orderedEntryAt(i)
 			deltaEntryApplyAddToBitmap(res, de)
 		}
 	}

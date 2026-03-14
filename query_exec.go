@@ -18,7 +18,7 @@ func (db *DB[K, V]) tryExecutionPlan(q *qx.QX, trace *queryTrace) ([]K, bool, er
 	}
 
 	// optimized path for LIMIT without OFFSET
-	if out, ok, plan, err := db.tryLimitQuery(q); ok {
+	if out, ok, plan, err := db.tryLimitQuery(q, trace); ok {
 		if trace != nil {
 			trace.setPlan(plan)
 		}
@@ -26,7 +26,7 @@ func (db *DB[K, V]) tryExecutionPlan(q *qx.QX, trace *queryTrace) ([]K, bool, er
 	}
 
 	// optimization for simple ORDER + LIMIT without complex filters (and OFFSET)
-	if out, ok, err := db.tryQueryOrderBasicWithLimit(q); ok {
+	if out, ok, err := db.tryQueryOrderBasicWithLimit(q, trace); ok {
 		if trace != nil {
 			trace.setPlan(PlanLimitOrderBasic)
 		}
@@ -34,7 +34,7 @@ func (db *DB[K, V]) tryExecutionPlan(q *qx.QX, trace *queryTrace) ([]K, bool, er
 	}
 
 	// optimization for PREFIX + ORDER + LIMIT without complex filters
-	if out, ok, err := db.tryQueryOrderPrefixWithLimit(q); ok {
+	if out, ok, err := db.tryQueryOrderPrefixWithLimit(q, trace); ok {
 		if trace != nil {
 			trace.setPlan(PlanLimitOrderPrefix)
 		}
@@ -42,7 +42,7 @@ func (db *DB[K, V]) tryExecutionPlan(q *qx.QX, trace *queryTrace) ([]K, bool, er
 	}
 
 	// optimization for simple PREFIX + LIMIT without ORDER
-	if out, ok, err := db.tryQueryPrefixNoOrderWithLimit(q); ok {
+	if out, ok, err := db.tryQueryPrefixNoOrderWithLimit(q, trace); ok {
 		if trace != nil {
 			trace.setPlan(PlanLimitPrefixNoOrder)
 		}
@@ -50,7 +50,7 @@ func (db *DB[K, V]) tryExecutionPlan(q *qx.QX, trace *queryTrace) ([]K, bool, er
 	}
 
 	// optimization for simple range + LIMIT without ORDER
-	if out, ok, err := db.tryQueryRangeNoOrderWithLimit(q); ok {
+	if out, ok, err := db.tryQueryRangeNoOrderWithLimit(q, trace); ok {
 		if trace != nil {
 			trace.setPlan(PlanLimitRangeNoOrder)
 		}
@@ -161,7 +161,7 @@ func prefixRangeEndIndex(s []index, prefix string, start int) int {
 
 const iteratorThreshold = 2048 // 256
 
-func (db *DB[K, V]) tryQueryOrderBasicWithLimit(q *qx.QX) ([]K, bool, error) {
+func (db *DB[K, V]) tryQueryOrderBasicWithLimit(q *qx.QX, trace *queryTrace) ([]K, bool, error) {
 
 	if len(q.Order) != 1 || q.Limit == 0 {
 		return nil, false, nil
@@ -317,6 +317,10 @@ func (db *DB[K, V]) tryQueryOrderBasicWithLimit(q *qx.QX) ([]K, bool, error) {
 	}
 
 	keyCur := ov.newCursor(br, order.Desc)
+	var (
+		examined  uint64
+		scanWidth uint64
+	)
 	if ov.delta == nil {
 		for {
 			_, ids, _, ok := keyCur.next()
@@ -326,21 +330,30 @@ func (db *DB[K, V]) tryQueryOrderBasicWithLimit(q *qx.QX) ([]K, bool, error) {
 			if ids.IsEmpty() {
 				continue
 			}
+			scanWidth++
 
 			if card := ids.Cardinality(); card <= iteratorThreshold || (0 < cursor.need && cursor.need < 1000) {
 				if ids.isSingleton() {
 					idx := ids.single
+					examined++
 					if contains(idx) && cursor.emit(idx) {
+						trace.addExamined(examined)
+						trace.addOrderScanWidth(scanWidth)
+						trace.setEarlyStopReason("limit_reached")
 						return cursor.out, true, nil
 					}
 				} else {
 					it := ids.bitmap().Iterator()
 					for it.HasNext() {
 						idx := it.Next()
+						examined++
 						if !contains(idx) {
 							continue
 						}
 						if cursor.emit(idx) {
+							trace.addExamined(examined)
+							trace.addOrderScanWidth(scanWidth)
+							trace.setEarlyStopReason("limit_reached")
 							return cursor.out, true, nil
 						}
 					}
@@ -348,6 +361,7 @@ func (db *DB[K, V]) tryQueryOrderBasicWithLimit(q *qx.QX) ([]K, bool, error) {
 				continue
 			}
 
+			examined += ids.Cardinality()
 			if base.neg {
 				tmp.Xor(tmp)
 				ids.OrInto(tmp)
@@ -361,9 +375,15 @@ func (db *DB[K, V]) tryQueryOrderBasicWithLimit(q *qx.QX) ([]K, bool, error) {
 				continue
 			}
 			if cursor.emitBitmap(tmp) {
+				trace.addExamined(examined)
+				trace.addOrderScanWidth(scanWidth)
+				trace.setEarlyStopReason("limit_reached")
 				return cursor.out, true, nil
 			}
 		}
+		trace.addExamined(examined)
+		trace.addOrderScanWidth(scanWidth)
+		trace.setEarlyStopReason("input_exhausted")
 		return cursor.out, true, nil
 	}
 
@@ -379,20 +399,26 @@ func (db *DB[K, V]) tryQueryOrderBasicWithLimit(q *qx.QX) ([]K, bool, error) {
 			}
 			continue
 		}
+		scanWidth++
 
 		if card := bm.GetCardinality(); card <= iteratorThreshold || (0 < cursor.need && cursor.need < 1000) {
 			if card == 1 {
 				idx := bm.Minimum()
+				examined++
 				if contains(idx) && cursor.emit(idx) {
 					if owned && bm != scratch {
 						releaseRoaringBuf(bm)
 					}
+					trace.addExamined(examined)
+					trace.addOrderScanWidth(scanWidth)
+					trace.setEarlyStopReason("limit_reached")
 					return cursor.out, true, nil
 				}
 			} else {
 				it := bm.Iterator()
 				for it.HasNext() {
 					idx := it.Next()
+					examined++
 					if !contains(idx) {
 						continue
 					}
@@ -400,6 +426,9 @@ func (db *DB[K, V]) tryQueryOrderBasicWithLimit(q *qx.QX) ([]K, bool, error) {
 						if owned && bm != scratch {
 							releaseRoaringBuf(bm)
 						}
+						trace.addExamined(examined)
+						trace.addOrderScanWidth(scanWidth)
+						trace.setEarlyStopReason("limit_reached")
 						return cursor.out, true, nil
 					}
 				}
@@ -410,6 +439,7 @@ func (db *DB[K, V]) tryQueryOrderBasicWithLimit(q *qx.QX) ([]K, bool, error) {
 			continue
 		}
 
+		examined += bm.GetCardinality()
 		if base.neg {
 			tmp.Xor(tmp)
 			tmp.Or(bm)
@@ -426,14 +456,20 @@ func (db *DB[K, V]) tryQueryOrderBasicWithLimit(q *qx.QX) ([]K, bool, error) {
 			continue
 		}
 		if cursor.emitBitmap(tmp) {
+			trace.addExamined(examined)
+			trace.addOrderScanWidth(scanWidth)
+			trace.setEarlyStopReason("limit_reached")
 			return cursor.out, true, nil
 		}
 	}
 
+	trace.addExamined(examined)
+	trace.addOrderScanWidth(scanWidth)
+	trace.setEarlyStopReason("input_exhausted")
 	return cursor.out, true, nil
 }
 
-func (db *DB[K, V]) tryQueryOrderPrefixWithLimit(q *qx.QX) ([]K, bool, error) {
+func (db *DB[K, V]) tryQueryOrderPrefixWithLimit(q *qx.QX, trace *queryTrace) ([]K, bool, error) {
 
 	if len(q.Order) != 1 || q.Limit == 0 {
 		return nil, false, nil
@@ -573,6 +609,10 @@ func (db *DB[K, V]) tryQueryOrderPrefixWithLimit(q *qx.QX) ([]K, bool, error) {
 	}
 
 	keyCur := ov.newCursor(br, ord.Desc)
+	var (
+		examined  uint64
+		scanWidth uint64
+	)
 	if ov.delta == nil {
 		for {
 			_, ids, _, ok := keyCur.next()
@@ -582,8 +622,13 @@ func (db *DB[K, V]) tryQueryOrderPrefixWithLimit(q *qx.QX) ([]K, bool, error) {
 			if ids.IsEmpty() {
 				continue
 			}
+			scanWidth++
 			if ids.isSingleton() {
+				examined++
 				if contains(ids.single) && cursor.emit(ids.single) {
+					trace.addExamined(examined)
+					trace.addOrderScanWidth(scanWidth)
+					trace.setEarlyStopReason("limit_reached")
 					return cursor.out, true, nil
 				}
 				continue
@@ -591,14 +636,21 @@ func (db *DB[K, V]) tryQueryOrderPrefixWithLimit(q *qx.QX) ([]K, bool, error) {
 			iter := ids.bitmap().Iterator()
 			for iter.HasNext() {
 				idx := iter.Next()
+				examined++
 				if !contains(idx) {
 					continue
 				}
 				if cursor.emit(idx) {
+					trace.addExamined(examined)
+					trace.addOrderScanWidth(scanWidth)
+					trace.setEarlyStopReason("limit_reached")
 					return cursor.out, true, nil
 				}
 			}
 		}
+		trace.addExamined(examined)
+		trace.addOrderScanWidth(scanWidth)
+		trace.setEarlyStopReason("input_exhausted")
 		return cursor.out, true, nil
 	}
 
@@ -614,9 +666,11 @@ func (db *DB[K, V]) tryQueryOrderPrefixWithLimit(q *qx.QX) ([]K, bool, error) {
 			}
 			continue
 		}
+		scanWidth++
 		iter := bm.Iterator()
 		for iter.HasNext() {
 			idx := iter.Next()
+			examined++
 			if !contains(idx) {
 				continue
 			}
@@ -624,6 +678,9 @@ func (db *DB[K, V]) tryQueryOrderPrefixWithLimit(q *qx.QX) ([]K, bool, error) {
 				if owned && bm != scratch {
 					releaseRoaringBuf(bm)
 				}
+				trace.addExamined(examined)
+				trace.addOrderScanWidth(scanWidth)
+				trace.setEarlyStopReason("limit_reached")
 				return cursor.out, true, nil
 			}
 		}
@@ -632,10 +689,13 @@ func (db *DB[K, V]) tryQueryOrderPrefixWithLimit(q *qx.QX) ([]K, bool, error) {
 		}
 	}
 
+	trace.addExamined(examined)
+	trace.addOrderScanWidth(scanWidth)
+	trace.setEarlyStopReason("input_exhausted")
 	return cursor.out, true, nil
 }
 
-func (db *DB[K, V]) tryQueryRangeNoOrderWithLimit(q *qx.QX) ([]K, bool, error) {
+func (db *DB[K, V]) tryQueryRangeNoOrderWithLimit(q *qx.QX, trace *queryTrace) ([]K, bool, error) {
 
 	if len(q.Order) > 0 || q.Limit == 0 {
 		return nil, false, nil
@@ -712,6 +772,7 @@ func (db *DB[K, V]) tryQueryRangeNoOrderWithLimit(q *qx.QX) ([]K, bool, error) {
 	}
 
 	keyCur := ov.newCursor(br, false)
+	var examined uint64
 	if ov.delta == nil {
 		for {
 			_, ids, _, ok := keyCur.next()
@@ -722,18 +783,26 @@ func (db *DB[K, V]) tryQueryRangeNoOrderWithLimit(q *qx.QX) ([]K, bool, error) {
 				continue
 			}
 			if ids.isSingleton() {
+				examined++
 				if cursor.emit(ids.single) {
+					trace.addExamined(examined)
+					trace.setEarlyStopReason("limit_reached")
 					return cursor.out, true, nil
 				}
 				continue
 			}
 			it := ids.bitmap().Iterator()
 			for it.HasNext() {
+				examined++
 				if cursor.emit(it.Next()) {
+					trace.addExamined(examined)
+					trace.setEarlyStopReason("limit_reached")
 					return cursor.out, true, nil
 				}
 			}
 		}
+		trace.addExamined(examined)
+		trace.setEarlyStopReason("input_exhausted")
 		return cursor.out, true, nil
 	}
 
@@ -751,10 +820,13 @@ func (db *DB[K, V]) tryQueryRangeNoOrderWithLimit(q *qx.QX) ([]K, bool, error) {
 		}
 		it := bm.Iterator()
 		for it.HasNext() {
+			examined++
 			if cursor.emit(it.Next()) {
 				if owned && bm != scratch {
 					releaseRoaringBuf(bm)
 				}
+				trace.addExamined(examined)
+				trace.setEarlyStopReason("limit_reached")
 				return cursor.out, true, nil
 			}
 		}
@@ -763,10 +835,12 @@ func (db *DB[K, V]) tryQueryRangeNoOrderWithLimit(q *qx.QX) ([]K, bool, error) {
 		}
 	}
 
+	trace.addExamined(examined)
+	trace.setEarlyStopReason("input_exhausted")
 	return cursor.out, true, nil
 }
 
-func (db *DB[K, V]) tryQueryPrefixNoOrderWithLimit(q *qx.QX) ([]K, bool, error) {
+func (db *DB[K, V]) tryQueryPrefixNoOrderWithLimit(q *qx.QX, trace *queryTrace) ([]K, bool, error) {
 
 	if len(q.Order) > 0 || q.Limit == 0 {
 		return nil, false, nil
@@ -826,6 +900,7 @@ func (db *DB[K, V]) tryQueryPrefixNoOrderWithLimit(q *qx.QX) ([]K, bool, error) 
 	}
 
 	keyCur := ov.newCursor(br, false)
+	var examined uint64
 	if ov.delta == nil {
 		for {
 			_, ids, _, ok := keyCur.next()
@@ -836,18 +911,26 @@ func (db *DB[K, V]) tryQueryPrefixNoOrderWithLimit(q *qx.QX) ([]K, bool, error) 
 				continue
 			}
 			if ids.isSingleton() {
+				examined++
 				if cursor.emit(ids.single) {
+					trace.addExamined(examined)
+					trace.setEarlyStopReason("limit_reached")
 					return cursor.out, true, nil
 				}
 				continue
 			}
 			it := ids.bitmap().Iterator()
 			for it.HasNext() {
+				examined++
 				if cursor.emit(it.Next()) {
+					trace.addExamined(examined)
+					trace.setEarlyStopReason("limit_reached")
 					return cursor.out, true, nil
 				}
 			}
 		}
+		trace.addExamined(examined)
+		trace.setEarlyStopReason("input_exhausted")
 		return cursor.out, true, nil
 	}
 
@@ -865,10 +948,13 @@ func (db *DB[K, V]) tryQueryPrefixNoOrderWithLimit(q *qx.QX) ([]K, bool, error) 
 		}
 		it := bm.Iterator()
 		for it.HasNext() {
+			examined++
 			if cursor.emit(it.Next()) {
 				if owned && bm != scratch {
 					releaseRoaringBuf(bm)
 				}
+				trace.addExamined(examined)
+				trace.setEarlyStopReason("limit_reached")
 				return cursor.out, true, nil
 			}
 		}
@@ -877,5 +963,7 @@ func (db *DB[K, V]) tryQueryPrefixNoOrderWithLimit(q *qx.QX) ([]K, bool, error) 
 		}
 	}
 
+	trace.addExamined(examined)
+	trace.setEarlyStopReason("input_exhausted")
 	return cursor.out, true, nil
 }

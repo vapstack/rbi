@@ -600,7 +600,11 @@ func (db *DB[K, V]) runSnapshotCompaction(force bool) bool {
 	worked := false
 	lockMiss := false
 	for i := 0; i < maxIters; i++ {
+		if !db.beginOpWait() {
+			return false
+		}
 		applied, missed := db.compactLatestSnapshotOnce(force)
+		db.endOp()
 		if missed {
 			lockMiss = true
 			break
@@ -715,35 +719,44 @@ func (db *DB[K, V]) compactSnapshotRegistryIdleOnce() (changed bool, blocked boo
 
 func (db *DB[K, V]) compactLatestSnapshotOnce(force bool) (bool, bool) {
 	db.snapshot.compactAttempts.Add(1)
-	if !db.mu.TryLock() {
-		db.snapshot.compactLockMiss.Add(1)
-		seq := db.snapshot.compactWriteSeq.Load()
-		skip := uint64(max(0, db.options.SnapshotCompactorRequestEveryNWrites))
-		if skip < 4 {
-			skip = 4
+	const maxStaleRetries = 2
+	for attempt := 0; attempt < maxStaleRetries; attempt++ {
+		cur := db.snapshot.current.Load()
+		if cur == nil {
+			db.snapshot.compactNoChange.Add(1)
+			return false, false
 		}
-		db.snapshot.compactSkipUntil.Store(seq + skip)
-		return false, true
-	}
-	defer db.mu.Unlock()
+		next, ok := compactSnapshot(cur, db.options, force)
+		if !ok || next == nil {
+			db.snapshot.compactNoChange.Add(1)
+			return false, false
+		}
 
-	cur := db.snapshot.current.Load()
-	if cur == nil {
-		db.snapshot.compactNoChange.Add(1)
-		return false, false
+		if !db.mu.TryLock() {
+			db.snapshot.compactLockMiss.Add(1)
+			seq := db.snapshot.compactWriteSeq.Load()
+			skip := uint64(max(0, db.options.SnapshotCompactorRequestEveryNWrites))
+			if skip < 4 {
+				skip = 4
+			}
+			db.snapshot.compactSkipUntil.Store(seq + skip)
+			return false, true
+		}
+
+		latest := db.snapshot.current.Load()
+		if latest != cur {
+			db.mu.Unlock()
+			continue
+		}
+
+		db.snapshot.current.Store(next)
+		db.mu.Unlock()
+		db.registerSnapshot(next)
+		db.snapshot.compactSucceeded.Add(1)
+		db.snapshot.compactSkipUntil.Store(0)
+		return true, false
 	}
-	next, ok := compactSnapshot(cur, db.options, force)
-	if !ok || next == nil {
-		db.snapshot.compactNoChange.Add(1)
-		return false, false
-	}
-	// Under db.mu no concurrent writer can publish a new snapshot, so direct
-	// store avoids expensive CAS retry storms under sustained write load.
-	db.snapshot.current.Store(next)
-	db.registerSnapshot(next)
-	db.snapshot.compactSucceeded.Add(1)
-	db.snapshot.compactSkipUntil.Store(0)
-	return true, false
+	return false, false
 }
 
 func compactSnapshot(cur *indexSnapshot, opt *Options, force bool) (*indexSnapshot, bool) {
@@ -1457,7 +1470,7 @@ func flattenEffectiveDeltaLayerMap(layer *fieldDeltaLayer, capHint int) map[stri
 		if d == nil || !d.hasEntries() {
 			continue
 		}
-		out[f] = d
+		out[f] = freezeFieldIndexDelta(d)
 	}
 	if len(out) == 0 {
 		return nil
@@ -1476,6 +1489,7 @@ type deltaCompactFieldCandidate struct {
 	keys    int
 	ops     uint64
 	prevHad bool
+	delta   *fieldIndexDelta
 }
 
 func sortDeltaCompactPreCandidates(candidates []deltaCompactFieldPreCandidate) {
@@ -1504,9 +1518,11 @@ func sortDeltaCompactCandidates(candidates []deltaCompactFieldCandidate) {
 
 type layerFieldDeltaMergeScratch struct {
 	byKey        map[string]indexDeltaEntry
+	owned        map[string]struct{}
 	maxByKeyUsed int
 	stack        []*fieldIndexDelta
 	fixed8       bool
+	ops          uint64
 	deltaView    fieldIndexDelta
 }
 
@@ -1521,6 +1537,7 @@ var layerFieldDeltaMergeScratchPool = sync.Pool{
 	New: func() any {
 		return &layerFieldDeltaMergeScratch{
 			byKey: make(map[string]indexDeltaEntry, layerFieldDeltaMergeScratchInitCap),
+			owned: make(map[string]struct{}, 8),
 			stack: make([]*fieldIndexDelta, 0, 8),
 		}
 	},
@@ -1530,24 +1547,74 @@ func getLayerFieldDeltaMergeScratch() *layerFieldDeltaMergeScratch {
 	return layerFieldDeltaMergeScratchPool.Get().(*layerFieldDeltaMergeScratch)
 }
 
+func (s *layerFieldDeltaMergeScratch) resetMergedState(releaseOwned bool) {
+	if s == nil {
+		return
+	}
+	if releaseOwned && len(s.owned) > 0 {
+		for key := range s.owned {
+			if e, ok := s.byKey[key]; ok {
+				releaseDeltaEntryBitmaps(e)
+			}
+		}
+	}
+	if len(s.byKey) > 0 {
+		if s.maxByKeyUsed > layerFieldDeltaMergeScratchMaxMapLen {
+			s.byKey = make(map[string]indexDeltaEntry, layerFieldDeltaMergeScratchInitCap)
+		} else {
+			clear(s.byKey)
+		}
+	}
+	if len(s.owned) > 0 {
+		if len(s.owned) > layerFieldDeltaMergeScratchMaxMapLen {
+			s.owned = make(map[string]struct{}, 8)
+		} else {
+			clear(s.owned)
+		}
+	}
+	s.maxByKeyUsed = 0
+	s.fixed8 = false
+	s.ops = 0
+	s.deltaView = fieldIndexDelta{}
+}
+
 func releaseLayerFieldDeltaMergeScratch(s *layerFieldDeltaMergeScratch) {
 	if s == nil {
 		return
 	}
-	if s.maxByKeyUsed > layerFieldDeltaMergeScratchMaxMapLen {
-		s.byKey = make(map[string]indexDeltaEntry, layerFieldDeltaMergeScratchInitCap)
-	} else {
-		clear(s.byKey)
-	}
-	s.maxByKeyUsed = 0
-	s.fixed8 = false
-	s.deltaView = fieldIndexDelta{}
+	s.resetMergedState(true)
 	if cap(s.stack) > layerFieldDeltaMergeScratchMaxStack {
 		s.stack = make([]*fieldIndexDelta, 0, 8)
 	} else {
 		s.stack = s.stack[:0]
 	}
 	layerFieldDeltaMergeScratchPool.Put(s)
+}
+
+func detachMergedFieldDeltaFromScratch(scratch *layerFieldDeltaMergeScratch) *fieldIndexDelta {
+	if scratch == nil || len(scratch.byKey) == 0 {
+		return nil
+	}
+	fixed8 := scratch.fixed8
+	ops := scratch.ops
+	if len(scratch.byKey) == 1 {
+		for key, e := range scratch.byKey {
+			out := &fieldIndexDelta{
+				singleKey:   key,
+				singleEntry: e,
+				singleSet:   true,
+				fixed8:      fixed8,
+				ops:         ops,
+			}
+			scratch.resetMergedState(false)
+			return out
+		}
+	}
+	capHint := max(len(scratch.byKey), layerFieldDeltaMergeScratchInitCap)
+	out := freezeOwnedFieldIndexDeltaMap(scratch.byKey, fixed8, ops)
+	scratch.byKey = make(map[string]indexDeltaEntry, capHint)
+	scratch.resetMergedState(false)
+	return out
 }
 
 func collectLayerFieldDeltaStack(layer *fieldDeltaLayer, field string, scratch *layerFieldDeltaMergeScratch) []*fieldIndexDelta {
@@ -1576,10 +1643,7 @@ func mergeLayerFieldDeltaStackIntoScratch(stack []*fieldIndexDelta, scratch *lay
 	if scratch == nil {
 		return
 	}
-	scratch.fixed8 = false
-	if len(scratch.byKey) > 0 {
-		clear(scratch.byKey)
-	}
+	scratch.resetMergedState(true)
 	for i := len(stack) - 1; i >= 0; i-- {
 		d := stack[i]
 		if d == nil || !d.hasEntries() {
@@ -1588,15 +1652,9 @@ func mergeLayerFieldDeltaStackIntoScratch(stack []*fieldIndexDelta, scratch *lay
 		if d.fixed8 {
 			scratch.fixed8 = true
 		}
-		if d.byKey != nil {
-			for key, e := range d.byKey {
-				mergeLayerFieldDeltaEntryIntoScratch(scratch, key, e)
-			}
-			continue
-		}
-		if d.singleSet {
-			mergeLayerFieldDeltaEntryIntoScratch(scratch, d.singleKey, d.singleEntry)
-		}
+		d.forEach(func(key string, e indexDeltaEntry) {
+			mergeLayerFieldDeltaEntryIntoScratch(scratch, key, e)
+		})
 	}
 }
 
@@ -1605,18 +1663,33 @@ func mergeLayerFieldDeltaEntryIntoScratch(scratch *layerFieldDeltaMergeScratch, 
 		return
 	}
 	if prev, ok := scratch.byKey[key]; ok {
-		// Compactor scratch may carry entries that still alias immutable
-		// layer bitmaps; always use COW-safe merge to avoid mutating shared
-		// roaring containers observed by concurrent readers.
-		merged := deltaEntryMerge(prev, e)
+		oldOps := deltaEntryOps(prev)
+		if scratch.ops >= oldOps {
+			scratch.ops -= oldOps
+		} else {
+			scratch.ops = 0
+		}
+		_, owned := scratch.owned[key]
+		var merged indexDeltaEntry
+		if owned {
+			merged = deltaEntryMergeOwned(prev, e)
+		} else {
+			merged = deltaEntryMergeOwned(cloneDeltaEntryBitmaps(prev), e)
+		}
 		if deltaEntryIsEmpty(merged) {
 			delete(scratch.byKey, key)
+			if owned {
+				delete(scratch.owned, key)
+			}
 		} else {
 			scratch.byKey[key] = merged
+			scratch.owned[key] = struct{}{}
+			scratch.ops += deltaEntryOps(merged)
 		}
 		return
 	}
 	scratch.byKey[key] = e
+	scratch.ops += deltaEntryOps(e)
 	if n := len(scratch.byKey); n > scratch.maxByKeyUsed {
 		scratch.maxByKeyUsed = n
 	}
@@ -1645,10 +1718,7 @@ func lookupLayerFieldDeltaStatsWithScratch(layer *fieldDeltaLayer, field string,
 	if len(scratch.byKey) == 0 {
 		return 0, 0, false
 	}
-	for _, e := range scratch.byKey {
-		ops += deltaEntryOps(e)
-	}
-	return len(scratch.byKey), ops, true
+	return len(scratch.byKey), scratch.ops, true
 }
 
 func lookupLayerFieldDeltaWithScratch(layer *fieldDeltaLayer, field string, scratch *layerFieldDeltaMergeScratch) *fieldIndexDelta {
@@ -1662,7 +1732,7 @@ func lookupLayerFieldDeltaWithScratch(layer *fieldDeltaLayer, field string, scra
 	if d == nil || !d.hasEntries() || !borrowed {
 		return d
 	}
-	return cloneFieldIndexDeltaShallow(d)
+	return detachMergedFieldDeltaFromScratch(scratch)
 }
 
 func lookupLayerFieldDeltaBorrowedWithScratch(layer *fieldDeltaLayer, field string, scratch *layerFieldDeltaMergeScratch) (*fieldIndexDelta, bool) {
@@ -1690,19 +1760,15 @@ func lookupLayerFieldDeltaBorrowedWithScratch(layer *fieldDeltaLayer, field stri
 				singleEntry: e,
 				singleSet:   true,
 				fixed8:      scratch.fixed8,
-				ops:         deltaEntryOps(e),
+				ops:         scratch.ops,
 			}
 			return &scratch.deltaView, true
 		}
 	}
-	var ops uint64
-	for _, e := range scratch.byKey {
-		ops += deltaEntryOps(e)
-	}
 	scratch.deltaView = fieldIndexDelta{
 		byKey:  scratch.byKey,
 		fixed8: scratch.fixed8,
-		ops:    ops,
+		ops:    scratch.ops,
 	}
 	return &scratch.deltaView, true
 }
@@ -1724,11 +1790,12 @@ func compactDeltaLayerIntoBase(base map[string]*[]index, layer *fieldDeltaLayer,
 	}
 
 	updates := make(map[string]*[]index, limit)
-	updateScratch := getLayerFieldDeltaMergeScratch()
-	defer releaseLayerFieldDeltaMergeScratch(updateScratch)
 	for i := 0; i < limit; i++ {
 		c := candidates[i]
-		eff, _ := lookupLayerFieldDeltaBorrowedWithScratch(layer, c.field, updateScratch)
+		eff := c.delta
+		if eff == nil {
+			eff = lookupLayerFieldDelta(layer, c.field)
+		}
 		if eff == nil || !eff.hasEntries() {
 			continue
 		}
@@ -1851,10 +1918,11 @@ func collectLayerCompactCandidates(base map[string]*[]index, layer *fieldDeltaLa
 	defer releaseLayerFieldDeltaMergeScratch(scratch)
 	for i := 0; i < probeLimit; i++ {
 		f := pre[i].field
-		keys, ops, has := lookupLayerFieldDeltaStatsWithScratch(layer, f, scratch)
-		if !has || keys == 0 {
+		eff, borrowed := lookupLayerFieldDeltaBorrowedWithScratch(layer, f, scratch)
+		if eff == nil || !eff.hasEntries() {
 			continue
 		}
+		keys, ops := eff.keyCount(), eff.ops
 		if !force {
 			byKeys := opt.SnapshotDeltaCompactFieldKeys > 0 && keys >= opt.SnapshotDeltaCompactFieldKeys
 			byOps := opt.SnapshotDeltaCompactFieldOps > 0 && ops >= uint64(opt.SnapshotDeltaCompactFieldOps)
@@ -1879,10 +1947,14 @@ func collectLayerCompactCandidates(base map[string]*[]index, layer *fieldDeltaLa
 			}
 		}
 
+		if borrowed {
+			eff = detachMergedFieldDeltaFromScratch(scratch)
+		}
 		candidates = append(candidates, deltaCompactFieldCandidate{
 			field: f,
 			keys:  keys,
 			ops:   ops,
+			delta: eff,
 		})
 	}
 	return candidates

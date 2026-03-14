@@ -91,7 +91,7 @@ func TestQuery_LimitOrderAndRange_UnsatisfiableRest_ReturnEmpty(t *testing.T) {
 	if !ok || len(leaves) == 0 {
 		t.Fatalf("extractAndLeaves(order): ok=%v len=%d", ok, len(leaves))
 	}
-	out, used, err := db.tryLimitQueryOrderBasic(qOrder, leaves)
+	out, used, err := db.tryLimitQueryOrderBasic(qOrder, leaves, nil)
 	if err != nil {
 		t.Fatalf("tryLimitQueryOrderBasic: %v", err)
 	}
@@ -114,7 +114,7 @@ func TestQuery_LimitOrderAndRange_UnsatisfiableRest_ReturnEmpty(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected no-order range bounds to be recognized")
 	}
-	out, used, err = db.tryLimitQueryRangeNoOrderByField(qRange, f, bounds, rest)
+	out, used, err = db.tryLimitQueryRangeNoOrderByField(qRange, f, bounds, rest, nil)
 	if err != nil {
 		t.Fatalf("tryLimitQueryRangeNoOrderByField: %v", err)
 	}

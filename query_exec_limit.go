@@ -83,7 +83,7 @@ func (p leafPred) containsIdx(idx uint64) bool {
 	}
 }
 
-func (db *DB[K, V]) tryLimitQuery(q *qx.QX) ([]K, bool, PlanName, error) {
+func (db *DB[K, V]) tryLimitQuery(q *qx.QX, trace *queryTrace) ([]K, bool, PlanName, error) {
 	if q.Limit == 0 || q.Offset != 0 {
 		return nil, false, "", nil
 	}
@@ -97,7 +97,7 @@ func (db *DB[K, V]) tryLimitQuery(q *qx.QX) ([]K, bool, PlanName, error) {
 	}
 
 	if len(q.Order) == 1 && q.Order[0].Type == qx.OrderBasic {
-		out, used, err := db.tryLimitQueryOrderBasic(q, leaves)
+		out, used, err := db.tryLimitQueryOrderBasic(q, leaves, trace)
 		if !used {
 			return nil, false, "", err
 		}
@@ -113,14 +113,14 @@ func (db *DB[K, V]) tryLimitQuery(q *qx.QX) ([]K, bool, PlanName, error) {
 		return nil, false, "", err
 	}
 	if ok {
-		out, used, err := db.tryLimitQueryRangeNoOrderByField(q, f, bounds, rest)
+		out, used, err := db.tryLimitQueryRangeNoOrderByField(q, f, bounds, rest, trace)
 		if !used {
 			return nil, false, "", err
 		}
 		return out, true, PlanLimitRangeNoOrder, err
 	}
 
-	out, used, err := db.tryLimitQueryNoOrder(q, leaves)
+	out, used, err := db.tryLimitQueryNoOrder(q, leaves, trace)
 	if !used {
 		return nil, false, "", err
 	}
@@ -320,7 +320,7 @@ func hasPrefixBoundForField(leaves []qx.Expr, field string) bool {
 	return false
 }
 
-func (db *DB[K, V]) tryLimitQueryNoOrder(q *qx.QX, leaves []qx.Expr) ([]K, bool, error) {
+func (db *DB[K, V]) tryLimitQueryNoOrder(q *qx.QX, leaves []qx.Expr, trace *queryTrace) ([]K, bool, error) {
 
 	preds := make([]leafPred, 0, len(leaves))
 	defer func() { releaseLeafPreds(preds) }()
@@ -355,8 +355,10 @@ func (db *DB[K, V]) tryLimitQueryNoOrder(q *qx.QX, leaves []qx.Expr) ([]K, bool,
 	cursor := db.newQueryCursor(out, 0, q.Limit, false, nil)
 
 	iter := lead.iterNew()
+	var examined uint64
 	for iter.HasNext() {
 		idx := iter.Next()
+		examined++
 
 		pass := true
 		for i := range preds {
@@ -373,14 +375,18 @@ func (db *DB[K, V]) tryLimitQueryNoOrder(q *qx.QX, leaves []qx.Expr) ([]K, bool,
 		}
 
 		if cursor.emit(idx) {
+			trace.addExamined(examined)
+			trace.setEarlyStopReason("limit_reached")
 			return cursor.out, true, nil
 		}
 	}
 
+	trace.addExamined(examined)
+	trace.setEarlyStopReason("input_exhausted")
 	return cursor.out, true, nil
 }
 
-func (db *DB[K, V]) tryLimitQueryOrderBasic(q *qx.QX, leaves []qx.Expr) ([]K, bool, error) {
+func (db *DB[K, V]) tryLimitQueryOrderBasic(q *qx.QX, leaves []qx.Expr, trace *queryTrace) ([]K, bool, error) {
 	order := q.Order[0]
 
 	f := order.Field
@@ -425,10 +431,10 @@ func (db *DB[K, V]) tryLimitQueryOrderBasic(q *qx.QX, leaves []qx.Expr) ([]K, bo
 	if br.baseStart >= br.baseEnd && br.deltaStart >= br.deltaEnd {
 		return nil, true, nil
 	}
-	return db.scanLimitByOverlayBounds(q, ov, br, order.Desc, preds), true, nil
+	return db.scanLimitByOverlayBounds(q, ov, br, order.Desc, preds, trace), true, nil
 }
 
-func (db *DB[K, V]) tryLimitQueryRangeNoOrderByField(q *qx.QX, field string, bounds rangeBounds, rest []qx.Expr) ([]K, bool, error) {
+func (db *DB[K, V]) tryLimitQueryRangeNoOrderByField(q *qx.QX, field string, bounds rangeBounds, rest []qx.Expr, trace *queryTrace) ([]K, bool, error) {
 
 	fm := db.fields[field]
 	if fm == nil || fm.Slice {
@@ -458,7 +464,7 @@ func (db *DB[K, V]) tryLimitQueryRangeNoOrderByField(q *qx.QX, field string, bou
 	if br.baseStart >= br.baseEnd && br.deltaStart >= br.deltaEnd {
 		return nil, true, nil
 	}
-	return db.scanLimitByOverlayBounds(q, ov, br, false, preds), true, nil
+	return db.scanLimitByOverlayBounds(q, ov, br, false, preds, trace), true, nil
 }
 
 func (db *DB[K, V]) buildLeafPredsNoBounds(rest []qx.Expr) ([]leafPred, bool, error) {
@@ -482,10 +488,15 @@ func (db *DB[K, V]) buildLeafPredsNoBounds(rest []qx.Expr) ([]leafPred, bool, er
 	return preds, true, nil
 }
 
-func (db *DB[K, V]) scanLimitByOverlayBounds(q *qx.QX, ov fieldOverlay, br overlayRange, desc bool, preds []leafPred) []K {
+func (db *DB[K, V]) scanLimitByOverlayBounds(q *qx.QX, ov fieldOverlay, br overlayRange, desc bool, preds []leafPred, trace *queryTrace) []K {
 	limit := int(q.Limit)
 	out := make([]K, 0, limit)
 	cursor := db.newQueryCursor(out, 0, q.Limit, false, nil)
+	trackScanWidth := len(q.Order) == 1
+	var (
+		examined  uint64
+		scanWidth uint64
+	)
 
 	var scratch *roaring64.Bitmap
 	if ov.delta != nil {
@@ -494,6 +505,7 @@ func (db *DB[K, V]) scanLimitByOverlayBounds(q *qx.QX, ov fieldOverlay, br overl
 	}
 
 	emitCandidate := func(idx uint64) bool {
+		examined++
 		for _, p := range preds {
 			if !p.containsIdx(idx) {
 				return false
@@ -524,10 +536,21 @@ func (db *DB[K, V]) scanLimitByOverlayBounds(q *qx.QX, ov fieldOverlay, br overl
 			if !ok {
 				break
 			}
+			if trackScanWidth && !ids.IsEmpty() {
+				scanWidth++
+			}
 			if emitBucketPosting(ids) {
+				trace.addExamined(examined)
+				trace.addOrderScanWidth(scanWidth)
+				trace.setEarlyStopReason("limit_reached")
 				return cursor.out
 			}
 		}
+		trace.addExamined(examined)
+		if trackScanWidth {
+			trace.addOrderScanWidth(scanWidth)
+		}
+		trace.setEarlyStopReason("input_exhausted")
 		return cursor.out
 	}
 
@@ -543,12 +566,20 @@ func (db *DB[K, V]) scanLimitByOverlayBounds(q *qx.QX, ov fieldOverlay, br overl
 			}
 			continue
 		}
+		if trackScanWidth {
+			scanWidth++
+		}
 		it := bm.Iterator()
 		for it.HasNext() {
 			if emitCandidate(it.Next()) {
 				if owned && bm != scratch {
 					releaseRoaringBuf(bm)
 				}
+				trace.addExamined(examined)
+				if trackScanWidth {
+					trace.addOrderScanWidth(scanWidth)
+				}
+				trace.setEarlyStopReason("limit_reached")
 				return cursor.out
 			}
 		}
@@ -557,6 +588,11 @@ func (db *DB[K, V]) scanLimitByOverlayBounds(q *qx.QX, ov fieldOverlay, br overl
 		}
 	}
 
+	trace.addExamined(examined)
+	if trackScanWidth {
+		trace.addOrderScanWidth(scanWidth)
+	}
+	trace.setEarlyStopReason("input_exhausted")
 	return cursor.out
 }
 

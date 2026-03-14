@@ -275,6 +275,48 @@ func TestFieldIndexDelta_SortedKeysSingleton_Concurrent(t *testing.T) {
 	}
 }
 
+func TestFieldIndexDelta_FrozenRepresentation_ReadsAndThaws(t *testing.T) {
+	src := &fieldIndexDelta{
+		byKey: map[string]indexDeltaEntry{
+			"b": {add: toBM(2)},
+			"a": {add: toBM(1)},
+			"c": {del: toBM(3)},
+		},
+		ops: 4,
+	}
+
+	frozen := freezeFieldIndexDelta(src)
+	if frozen == nil || len(frozen.entries) != 3 {
+		t.Fatalf("expected multi-entry frozen delta")
+	}
+	if !slices.Equal(frozen.sortedKeys(), []string{"a", "b", "c"}) {
+		t.Fatalf("frozen keys mismatch: %v", frozen.sortedKeys())
+	}
+	if e, ok := frozen.get("b"); !ok || !slices.Equal(deltaEntryAddToArray(e), []uint64{2}) {
+		t.Fatalf("frozen get(b) mismatch: ok=%v add=%v", ok, deltaEntryAddToArray(e))
+	}
+	if got := frozen.lowerBound("b"); got != 1 {
+		t.Fatalf("lowerBound mismatch: %d", got)
+	}
+	if got := frozen.upperBound("b"); got != 2 {
+		t.Fatalf("upperBound mismatch: %d", got)
+	}
+	if got := frozen.prefixRangeEnd("b", frozen.lowerBound("b")); got != 2 {
+		t.Fatalf("prefixRangeEnd mismatch: %d", got)
+	}
+
+	frozen.set("d", indexDeltaEntry{addSingle: 4, addSingleSet: true})
+	if len(frozen.entries) != 0 {
+		t.Fatalf("expected thaw to drop frozen entries")
+	}
+	if e, ok := frozen.get("d"); !ok || !slices.Equal(deltaEntryAddToArray(e), []uint64{4}) {
+		t.Fatalf("thawed get(d) mismatch: ok=%v add=%v", ok, deltaEntryAddToArray(e))
+	}
+	if !slices.Equal(frozen.sortedKeys(), []string{"a", "b", "c", "d"}) {
+		t.Fatalf("thawed keys mismatch: %v", frozen.sortedKeys())
+	}
+}
+
 func collectOverlayKeys(ov fieldOverlay, b rangeBounds, desc bool) []string {
 	span := ov.rangeForBounds(b)
 	cur := ov.newCursor(span, desc)
@@ -378,6 +420,59 @@ func TestApplyFieldDelta_EmptyChangesReturnsPrev(t *testing.T) {
 	next := applyFieldDelta(prev, nil)
 	if next != prev {
 		t.Fatalf("expected same pointer for empty changes")
+	}
+}
+
+func TestLookupLayerFieldDeltaWithScratch_HandlesFrozenEntries(t *testing.T) {
+	layer := &fieldDeltaLayer{
+		fields: map[string]*fieldIndexDelta{
+			"tags": {
+				entries: []fieldDeltaKV{
+					{key: "db", entry: indexDeltaEntry{addSingle: 1, addSingleSet: true}},
+					{key: "rust", entry: indexDeltaEntry{addSingle: 2, addSingleSet: true}},
+				},
+				ops: 2,
+			},
+		},
+		depth: 1,
+	}
+
+	scratch := getLayerFieldDeltaMergeScratch()
+	defer releaseLayerFieldDeltaMergeScratch(scratch)
+
+	got := lookupLayerFieldDeltaWithScratch(layer, "tags", scratch)
+	if got == nil {
+		t.Fatalf("lookup returned nil")
+	}
+	if got.keyCount() != 2 {
+		t.Fatalf("keyCount mismatch: %d", got.keyCount())
+	}
+	dbEntry, ok := got.get("db")
+	if !ok || !dbEntry.addSingleSet || dbEntry.addSingle != 1 {
+		t.Fatalf("db entry mismatch: %+v ok=%v", dbEntry, ok)
+	}
+	rustEntry, ok := got.get("rust")
+	if !ok || !rustEntry.addSingleSet || rustEntry.addSingle != 2 {
+		t.Fatalf("rust entry mismatch: %+v ok=%v", rustEntry, ok)
+	}
+}
+
+func TestBuildFieldDeltaPatch_KeepsMultiKeyPatchMutable(t *testing.T) {
+	d := buildFieldDeltaPatch(map[string]indexDeltaEntry{
+		"rust": {addSingle: 2, addSingleSet: true},
+		"db":   {addSingle: 1, addSingleSet: true},
+	}, false)
+	if d == nil {
+		t.Fatalf("delta is nil")
+	}
+	if d.byKey == nil {
+		t.Fatalf("expected fresh multi-key patch to stay map-backed")
+	}
+	if len(d.entries) != 0 {
+		t.Fatalf("entries mismatch: %d", len(d.entries))
+	}
+	if got := d.sortedKeys(); !slices.Equal(got, []string{"db", "rust"}) {
+		t.Fatalf("keys mismatch: %v", got)
 	}
 }
 

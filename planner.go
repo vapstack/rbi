@@ -11,7 +11,13 @@ import (
 type PlanName string
 
 const (
-	PlanBitmap PlanName = "plan_bitmap"
+	PlanBitmap             PlanName = "plan_bitmap"
+	PlanCountBitmap        PlanName = "plan_count_bitmap"
+	PlanCountUniqueEq      PlanName = "plan_count_unique_eq"
+	PlanCountScalarLookup  PlanName = "plan_count_scalar_lookup"
+	PlanCountScalarInSplit PlanName = "plan_count_scalar_in_split"
+	PlanCountPredicates    PlanName = "plan_count_predicates"
+	PlanCountORPredicates  PlanName = "plan_count_or_predicates"
 
 	PlanCandidateNoOrder PlanName = "plan_candidate_no_order"
 	PlanCandidateOrder   PlanName = "plan_candidate_order"

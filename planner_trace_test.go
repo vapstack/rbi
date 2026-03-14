@@ -211,3 +211,104 @@ func TestTracer_OROrderMetrics(t *testing.T) {
 		t.Fatalf("expected early stop reason to be set")
 	}
 }
+
+func TestTracer_QueryValuesPathEmitsTrace(t *testing.T) {
+	var (
+		mu     sync.Mutex
+		events []TraceEvent
+	)
+
+	sink := func(ev TraceEvent) {
+		mu.Lock()
+		events = append(events, ev)
+		mu.Unlock()
+	}
+
+	db, _ := openTempDBUint64(t, Options{
+		AnalyzeInterval:  -1,
+		TraceSink:        sink,
+		TraceSampleEvery: 1,
+	})
+	_ = seedData(t, db, 20_000)
+
+	q := qx.Query(
+		qx.EQ("active", true),
+		qx.GTE("age", 22),
+		qx.LT("age", 45),
+	).By("age", qx.ASC).Max(80)
+
+	items, err := db.Query(q)
+	if err != nil {
+		t.Fatalf("Query: %v", err)
+	}
+	if len(items) == 0 {
+		t.Fatalf("expected non-empty items")
+	}
+	db.ReleaseRecords(items...)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(events) == 0 {
+		t.Fatalf("expected trace event")
+	}
+	ev := events[len(events)-1]
+	if ev.Plan != string(PlanLimitOrderBasic) {
+		t.Fatalf("expected %q plan, got %q", PlanLimitOrderBasic, ev.Plan)
+	}
+	if ev.RowsReturned != uint64(len(items)) {
+		t.Fatalf("rows returned mismatch: ev=%d items=%d", ev.RowsReturned, len(items))
+	}
+	if ev.RowsExamined == 0 {
+		t.Fatalf("expected rows examined to be recorded")
+	}
+}
+
+func TestTracer_CountPathEmitsTrace(t *testing.T) {
+	var (
+		mu     sync.Mutex
+		events []TraceEvent
+	)
+
+	sink := func(ev TraceEvent) {
+		mu.Lock()
+		events = append(events, ev)
+		mu.Unlock()
+	}
+
+	db, _ := openTempDBUint64(t, Options{
+		AnalyzeInterval:  -1,
+		TraceSink:        sink,
+		TraceSampleEvery: 1,
+	})
+	_ = seedData(t, db, 20_000)
+
+	q := qx.Query(
+		qx.EQ("active", true),
+		qx.IN("country", []string{"NL", "DE"}),
+		qx.GTE("age", 20),
+	)
+
+	cnt, err := db.Count(q)
+	if err != nil {
+		t.Fatalf("Count: %v", err)
+	}
+	if cnt == 0 {
+		t.Fatalf("expected non-zero count")
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(events) == 0 {
+		t.Fatalf("expected trace event")
+	}
+	ev := events[len(events)-1]
+	if !strings.HasPrefix(ev.Plan, "plan_count_") {
+		t.Fatalf("expected count plan, got %q", ev.Plan)
+	}
+	if ev.RowsReturned != cnt {
+		t.Fatalf("rows returned mismatch: ev=%d count=%d", ev.RowsReturned, cnt)
+	}
+	if ev.Duration <= 0 {
+		t.Fatalf("expected positive duration")
+	}
+}

@@ -2,6 +2,7 @@ package rbi
 
 import (
 	"sort"
+	"strings"
 	"sync"
 
 	"github.com/RoaringBitmap/roaring/v2/roaring64"
@@ -19,11 +20,17 @@ type indexDeltaEntry struct {
 	delSingleSet bool
 }
 
+type fieldDeltaKV struct {
+	key   string
+	entry indexDeltaEntry
+}
+
 // fieldIndexDelta is a compact immutable key overlay for one field.
 // keys must be sorted lexicographically.
 type fieldIndexDelta struct {
-	keys  []string
-	byKey map[string]indexDeltaEntry
+	keys    []string
+	byKey   map[string]indexDeltaEntry
+	entries []fieldDeltaKV
 	// Singleton delta entries are stored inline to avoid map overhead
 	// when only one key is present in the field delta.
 	singleKey   string
@@ -32,7 +39,9 @@ type fieldIndexDelta struct {
 	fixed8      bool
 	ops         uint64
 
-	keysOnce sync.Once
+	keysOnce       sync.Once
+	entryIndex     map[string]int
+	entryIndexOnce sync.Once
 }
 
 // fieldOverlay provides read helpers over base sorted index + optional delta
@@ -52,7 +61,6 @@ type overlayRange struct {
 type overlayKeyCursor struct {
 	base  []index
 	delta *fieldIndexDelta
-	keys  []string
 
 	b, be int
 	d, de int
@@ -448,10 +456,8 @@ func (o fieldOverlay) rangeForBounds(b rangeBounds) overlayRange {
 		deltaStart: 0,
 		deltaEnd:   0,
 	}
-	var dkeys []string
 	if o.delta != nil {
-		dkeys = o.delta.sortedKeys()
-		br.deltaEnd = len(dkeys)
+		br.deltaEnd = o.delta.keyCount()
 	}
 
 	if b.hasPrefix {
@@ -461,8 +467,8 @@ func (o fieldOverlay) rangeForBounds(b rangeBounds) overlayRange {
 		br.baseEnd = min(br.baseEnd, pe)
 
 		if o.delta != nil {
-			ds := lowerBoundStrings(dkeys, b.prefix)
-			de := prefixRangeEndStrings(dkeys, b.prefix, ds)
+			ds := o.delta.lowerBound(b.prefix)
+			de := o.delta.prefixRangeEnd(b.prefix, ds)
 			br.deltaStart = max(br.deltaStart, ds)
 			br.deltaEnd = min(br.deltaEnd, de)
 		}
@@ -476,8 +482,8 @@ func (o fieldOverlay) rangeForBounds(b rangeBounds) overlayRange {
 		br.baseStart = max(br.baseStart, bl)
 
 		if o.delta != nil {
-			dl := lowerBoundStrings(dkeys, b.loKey)
-			if !b.loInc && dl < len(dkeys) && dkeys[dl] == b.loKey {
+			dl := o.delta.lowerBound(b.loKey)
+			if !b.loInc && dl < o.delta.keyCount() && o.delta.orderedKeyAt(dl) == b.loKey {
 				dl++
 			}
 			br.deltaStart = max(br.deltaStart, dl)
@@ -496,9 +502,9 @@ func (o fieldOverlay) rangeForBounds(b rangeBounds) overlayRange {
 		if o.delta != nil {
 			var dh int
 			if b.hiInc {
-				dh = upperBoundStrings(dkeys, b.hiKey)
+				dh = o.delta.upperBound(b.hiKey)
 			} else {
-				dh = lowerBoundStrings(dkeys, b.hiKey)
+				dh = o.delta.lowerBound(b.hiKey)
 			}
 			br.deltaEnd = min(br.deltaEnd, dh)
 		}
@@ -518,8 +524,8 @@ func (o fieldOverlay) rangeForBounds(b rangeBounds) overlayRange {
 		if br.deltaStart < 0 {
 			br.deltaStart = 0
 		}
-		if br.deltaEnd > len(dkeys) {
-			br.deltaEnd = len(dkeys)
+		if br.deltaEnd > o.delta.keyCount() {
+			br.deltaEnd = o.delta.keyCount()
 		}
 		if br.deltaStart > br.deltaEnd {
 			br.deltaStart = br.deltaEnd
@@ -538,9 +544,6 @@ func (o fieldOverlay) newCursor(br overlayRange, desc bool) overlayKeyCursor {
 		delta:  o.delta,
 		desc:   desc,
 		fixed8: o.fixed8,
-	}
-	if o.delta != nil {
-		c.keys = o.delta.sortedKeys()
 	}
 
 	if !desc {
@@ -575,7 +578,7 @@ func (c *overlayKeyCursor) nextAsc() (indexKey, postingList, indexDeltaEntry, bo
 
 	if hasBase && hasDelta {
 		bk := c.base[c.b].Key
-		dk := c.keys[c.d]
+		dk, de, _ := c.delta.orderedEntryAt(c.d)
 		cmp := compareIndexKeyString(bk, dk)
 		switch {
 		case cmp < 0:
@@ -583,12 +586,10 @@ func (c *overlayKeyCursor) nextAsc() (indexKey, postingList, indexDeltaEntry, bo
 			c.b++
 			return bk, ids, indexDeltaEntry{}, true
 		case cmp > 0:
-			de, _ := c.delta.get(dk)
 			c.d++
 			return indexKeyFromStoredString(dk, c.fixed8), postingList{}, de, true
 		default:
 			ids := c.base[c.b].IDs
-			de, _ := c.delta.get(dk)
 			c.b++
 			c.d++
 			return bk, ids, de, true
@@ -602,8 +603,7 @@ func (c *overlayKeyCursor) nextAsc() (indexKey, postingList, indexDeltaEntry, bo
 		return bk, ids, indexDeltaEntry{}, true
 	}
 
-	dk := c.keys[c.d]
-	de, _ := c.delta.get(dk)
+	dk, de, _ := c.delta.orderedEntryAt(c.d)
 	c.d++
 	return indexKeyFromStoredString(dk, c.fixed8), postingList{}, de, true
 }
@@ -618,7 +618,7 @@ func (c *overlayKeyCursor) nextDesc() (indexKey, postingList, indexDeltaEntry, b
 
 	if hasBase && hasDelta {
 		bk := c.base[c.b].Key
-		dk := c.keys[c.d]
+		dk, de, _ := c.delta.orderedEntryAt(c.d)
 		cmp := compareIndexKeyString(bk, dk)
 		switch {
 		case cmp > 0:
@@ -626,12 +626,10 @@ func (c *overlayKeyCursor) nextDesc() (indexKey, postingList, indexDeltaEntry, b
 			c.b--
 			return bk, ids, indexDeltaEntry{}, true
 		case cmp < 0:
-			de, _ := c.delta.get(dk)
 			c.d--
 			return indexKeyFromStoredString(dk, c.fixed8), postingList{}, de, true
 		default:
 			ids := c.base[c.b].IDs
-			de, _ := c.delta.get(dk)
 			c.b--
 			c.d--
 			return bk, ids, de, true
@@ -645,8 +643,7 @@ func (c *overlayKeyCursor) nextDesc() (indexKey, postingList, indexDeltaEntry, b
 		return bk, ids, indexDeltaEntry{}, true
 	}
 
-	dk := c.keys[c.d]
-	de, _ := c.delta.get(dk)
+	dk, de, _ := c.delta.orderedEntryAt(c.d)
 	c.d--
 	return indexKeyFromStoredString(dk, c.fixed8), postingList{}, de, true
 }
@@ -656,6 +653,14 @@ func (d *fieldIndexDelta) sortedKeys() []string {
 		return nil
 	}
 	d.keysOnce.Do(func() {
+		if len(d.entries) > 0 {
+			keys := make([]string, len(d.entries))
+			for i := range d.entries {
+				keys[i] = d.entries[i].key
+			}
+			d.keys = keys
+			return
+		}
 		if d.byKey == nil {
 			d.keys = []string{d.singleKey}
 			return
@@ -676,11 +681,16 @@ func (d *fieldIndexDelta) invalidateSortedKeys() {
 	}
 	d.keys = nil
 	d.keysOnce = sync.Once{}
+	d.entryIndex = nil
+	d.entryIndexOnce = sync.Once{}
 }
 
 func (d *fieldIndexDelta) keyCount() int {
 	if d == nil {
 		return 0
+	}
+	if len(d.entries) > 0 {
+		return len(d.entries)
 	}
 	if d.byKey != nil {
 		return len(d.byKey)
@@ -695,9 +705,141 @@ func (d *fieldIndexDelta) hasEntries() bool {
 	return d.keyCount() > 0
 }
 
+const frozenFieldDeltaMapIndexMin = 32
+
+func (d *fieldIndexDelta) lookupEntryIndex(key string) (int, bool) {
+	if d == nil || len(d.entries) == 0 {
+		return 0, false
+	}
+	if len(d.entries) >= frozenFieldDeltaMapIndexMin {
+		d.entryIndexOnce.Do(func() {
+			idx := make(map[string]int, len(d.entries))
+			for i := range d.entries {
+				idx[d.entries[i].key] = i
+			}
+			d.entryIndex = idx
+		})
+		i, ok := d.entryIndex[key]
+		return i, ok
+	}
+	i := sort.Search(len(d.entries), func(i int) bool {
+		return d.entries[i].key >= key
+	})
+	if i < len(d.entries) && d.entries[i].key == key {
+		return i, true
+	}
+	return 0, false
+}
+
+func (d *fieldIndexDelta) orderedKeyAt(i int) string {
+	if d == nil || i < 0 {
+		return ""
+	}
+	if len(d.entries) > 0 {
+		if i >= len(d.entries) {
+			return ""
+		}
+		return d.entries[i].key
+	}
+	keys := d.sortedKeys()
+	if i >= len(keys) {
+		return ""
+	}
+	return keys[i]
+}
+
+func (d *fieldIndexDelta) orderedEntryAt(i int) (string, indexDeltaEntry, bool) {
+	if d == nil || i < 0 {
+		return "", indexDeltaEntry{}, false
+	}
+	if len(d.entries) > 0 {
+		if i >= len(d.entries) {
+			return "", indexDeltaEntry{}, false
+		}
+		kv := d.entries[i]
+		return kv.key, kv.entry, true
+	}
+	key := d.orderedKeyAt(i)
+	if key == "" {
+		return "", indexDeltaEntry{}, false
+	}
+	e, ok := d.get(key)
+	return key, e, ok
+}
+
+func (d *fieldIndexDelta) lowerBound(key string) int {
+	if d == nil {
+		return 0
+	}
+	if len(d.entries) > 0 {
+		return sort.Search(len(d.entries), func(i int) bool {
+			return d.entries[i].key >= key
+		})
+	}
+	return lowerBoundStrings(d.sortedKeys(), key)
+}
+
+func (d *fieldIndexDelta) upperBound(key string) int {
+	if d == nil {
+		return 0
+	}
+	if len(d.entries) > 0 {
+		return sort.Search(len(d.entries), func(i int) bool {
+			return d.entries[i].key > key
+		})
+	}
+	return upperBoundStrings(d.sortedKeys(), key)
+}
+
+func (d *fieldIndexDelta) prefixRangeEnd(prefix string, start int) int {
+	if d == nil {
+		return 0
+	}
+	if start < 0 {
+		start = 0
+	}
+	if len(d.entries) > 0 {
+		end := start
+		for end < len(d.entries) && strings.HasPrefix(d.entries[end].key, prefix) {
+			end++
+		}
+		return end
+	}
+	return prefixRangeEndStrings(d.sortedKeys(), prefix, start)
+}
+
+func (d *fieldIndexDelta) thawMutable() {
+	if d == nil || len(d.entries) == 0 {
+		return
+	}
+	if len(d.entries) == 1 {
+		kv := d.entries[0]
+		d.singleKey = kv.key
+		d.singleEntry = kv.entry
+		d.singleSet = true
+		d.entries = nil
+		d.invalidateSortedKeys()
+		return
+	}
+	byKey := make(map[string]indexDeltaEntry, len(d.entries))
+	for _, kv := range d.entries {
+		byKey[kv.key] = kv.entry
+	}
+	d.byKey = byKey
+	d.entries = nil
+	d.invalidateSortedKeys()
+}
+
 func (d *fieldIndexDelta) get(key string) (indexDeltaEntry, bool) {
 	if d == nil {
 		return indexDeltaEntry{}, false
+	}
+	if len(d.entries) > 0 {
+		i, ok := d.lookupEntryIndex(key)
+		if !ok {
+			return indexDeltaEntry{}, false
+		}
+		return d.entries[i].entry, true
 	}
 	if d.byKey != nil {
 		v, ok := d.byKey[key]
@@ -712,6 +854,9 @@ func (d *fieldIndexDelta) get(key string) (indexDeltaEntry, bool) {
 func (d *fieldIndexDelta) set(key string, e indexDeltaEntry) {
 	if d == nil {
 		return
+	}
+	if len(d.entries) > 0 {
+		d.thawMutable()
 	}
 	if d.byKey != nil {
 		d.byKey[key] = e
@@ -738,6 +883,9 @@ func (d *fieldIndexDelta) set(key string, e indexDeltaEntry) {
 func (d *fieldIndexDelta) remove(key string) {
 	if d == nil {
 		return
+	}
+	if len(d.entries) > 0 {
+		d.thawMutable()
 	}
 	if d.byKey != nil {
 		delete(d.byKey, key)
@@ -767,6 +915,12 @@ func (d *fieldIndexDelta) remove(key string) {
 
 func (d *fieldIndexDelta) forEach(fn func(string, indexDeltaEntry)) {
 	if d == nil || !d.hasEntries() || fn == nil {
+		return
+	}
+	if len(d.entries) > 0 {
+		for _, kv := range d.entries {
+			fn(kv.key, kv.entry)
+		}
 		return
 	}
 	if d.byKey != nil {
@@ -840,6 +994,26 @@ func deltaEntryHasDel(e indexDeltaEntry) bool {
 
 func deltaEntryIsEmpty(e indexDeltaEntry) bool {
 	return !deltaEntryHasAdd(e) && !deltaEntryHasDel(e)
+}
+
+func releaseDeltaEntryBitmaps(e indexDeltaEntry) {
+	if e.add != nil {
+		releaseRoaringBuf(e.add)
+	}
+	if e.del != nil {
+		releaseRoaringBuf(e.del)
+	}
+}
+
+func cloneDeltaEntryBitmaps(e indexDeltaEntry) indexDeltaEntry {
+	out := e
+	if e.add != nil {
+		out.add = cloneBitmap(e.add)
+	}
+	if e.del != nil {
+		out.del = cloneBitmap(e.del)
+	}
+	return out
 }
 
 func deltaEntryAddContains(e indexDeltaEntry, id uint64) bool {
@@ -1233,9 +1407,75 @@ func neutralizeMutableDeltaSides(add, del *mutableDeltaSide) {
 	del.normalize()
 }
 
+func freezeFieldIndexDelta(src *fieldIndexDelta) *fieldIndexDelta {
+	if src == nil || !src.hasEntries() || len(src.entries) > 0 || src.byKey == nil {
+		return src
+	}
+	if len(src.byKey) == 1 {
+		for key, e := range src.byKey {
+			return &fieldIndexDelta{
+				singleKey:   key,
+				singleEntry: e,
+				singleSet:   true,
+				fixed8:      src.fixed8,
+				ops:         src.ops,
+			}
+		}
+	}
+	entries := make([]fieldDeltaKV, 0, len(src.byKey))
+	for key, e := range src.byKey {
+		entries = append(entries, fieldDeltaKV{key: key, entry: e})
+	}
+	sort.Slice(entries, func(i, j int) bool {
+		return entries[i].key < entries[j].key
+	})
+	return &fieldIndexDelta{
+		entries: entries,
+		fixed8:  src.fixed8,
+		ops:     src.ops,
+	}
+}
+
+func freezeOwnedFieldIndexDeltaMap(byKey map[string]indexDeltaEntry, fixed8 bool, ops uint64) *fieldIndexDelta {
+	if len(byKey) == 0 {
+		return nil
+	}
+	if len(byKey) == 1 {
+		for key, e := range byKey {
+			return &fieldIndexDelta{
+				singleKey:   key,
+				singleEntry: e,
+				singleSet:   true,
+				fixed8:      fixed8,
+				ops:         ops,
+			}
+		}
+	}
+	entries := make([]fieldDeltaKV, 0, len(byKey))
+	for key, e := range byKey {
+		entries = append(entries, fieldDeltaKV{key: key, entry: e})
+	}
+	sort.Slice(entries, func(i, j int) bool {
+		return entries[i].key < entries[j].key
+	})
+	return &fieldIndexDelta{
+		entries: entries,
+		fixed8:  fixed8,
+		ops:     ops,
+	}
+}
+
 func cloneFieldIndexDeltaShallow(src *fieldIndexDelta) *fieldIndexDelta {
 	if src == nil {
 		return &fieldIndexDelta{}
+	}
+	if len(src.entries) > 0 {
+		return &fieldIndexDelta{
+			entries: src.entries,
+			fixed8:  src.fixed8,
+			ops:     src.ops,
+			keys:    src.keys,
+		}
 	}
 	if src.byKey == nil {
 		if !src.singleSet {

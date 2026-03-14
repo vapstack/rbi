@@ -24,10 +24,10 @@ func (db *DB[K, V]) Count(q *qx.QX) (uint64, error) {
 	defer db.endOp()
 	view := db.makeQueryView(db.getSnapshot())
 	defer db.releaseQueryView(view)
-	return view.countInternal(q)
+	return view.countInternal(q, true)
 }
 
-func (db *DB[K, V]) countInternal(q *qx.QX) (uint64, error) {
+func (db *DB[K, V]) countInternal(q *qx.QX, emitTrace bool) (out uint64, err error) {
 	if q == nil {
 		return db.snapshotUniverseCardinality(), nil
 	}
@@ -37,21 +37,30 @@ func (db *DB[K, V]) countInternal(q *qx.QX) (uint64, error) {
 	}
 
 	expr, _ := normalizeExpr(q.Expr)
+	var trace *queryTrace
+	if emitTrace && db.traceOrCalibrationSamplingEnabled() {
+		trace = db.beginTrace(&qx.QX{Expr: expr})
+		if trace != nil {
+			defer func() {
+				trace.finish(out, err)
+			}()
+		}
+	}
 
-	if cnt, ok, err := db.tryCountByUniqueEq(expr); ok || err != nil {
-		return cnt, err
+	if out, ok, err := db.tryCountByUniqueEq(expr, trace); ok || err != nil {
+		return out, err
 	}
-	if cnt, ok, err := db.tryCountByScalarLookup(expr); ok || err != nil {
-		return cnt, err
+	if out, ok, err := db.tryCountByScalarLookup(expr, trace); ok || err != nil {
+		return out, err
 	}
-	if cnt, ok, err := db.tryCountByScalarInSplit(expr); ok || err != nil {
-		return cnt, err
+	if out, ok, err := db.tryCountByScalarInSplit(expr, trace); ok || err != nil {
+		return out, err
 	}
-	if cnt, ok, err := db.tryCountByPredicates(expr); ok || err != nil {
-		return cnt, err
+	if out, ok, err := db.tryCountByPredicates(expr, trace); ok || err != nil {
+		return out, err
 	}
-	if cnt, ok, err := db.tryCountORByPredicates(expr); ok || err != nil {
-		return cnt, err
+	if out, ok, err := db.tryCountORByPredicates(expr, trace); ok || err != nil {
+		return out, err
 	}
 
 	b, err := db.evalExpr(expr)
@@ -60,10 +69,20 @@ func (db *DB[K, V]) countInternal(q *qx.QX) (uint64, error) {
 	}
 	defer b.release()
 
-	return db.countBitmapResult(b), nil
+	if trace != nil {
+		trace.setPlan(PlanCountBitmap)
+		if b.neg {
+			trace.addExamined(db.snapshotUniverseCardinality())
+		} else if b.bm != nil {
+			trace.addExamined(b.bm.GetCardinality())
+		}
+	}
+
+	out = db.countBitmapResult(b)
+	return out, nil
 }
 
-func (db *DB[K, V]) tryCountByScalarLookup(expr qx.Expr) (uint64, bool, error) {
+func (db *DB[K, V]) tryCountByScalarLookup(expr qx.Expr, trace *queryTrace) (uint64, bool, error) {
 	if expr.Field == "" {
 		return 0, false, nil
 	}
@@ -84,7 +103,12 @@ func (db *DB[K, V]) tryCountByScalarLookup(expr qx.Expr) (uint64, bool, error) {
 		if err != nil || isSlice {
 			return 0, false, err
 		}
-		return countScalarLookupComplement(db.snapshotUniverseCardinality(), ov.lookupCardinality(key), expr.Not), true, nil
+		hit := ov.lookupCardinality(key)
+		if trace != nil {
+			trace.setPlan(PlanCountScalarLookup)
+			trace.addExamined(hit)
+		}
+		return countScalarLookupComplement(db.snapshotUniverseCardinality(), hit, expr.Not), true, nil
 
 	case qx.OpIN:
 		vals, isSlice, err := db.exprValueToIdxOwned(expr)
@@ -96,6 +120,10 @@ func (db *DB[K, V]) tryCountByScalarLookup(expr qx.Expr) (uint64, bool, error) {
 		var sum uint64
 		for _, key := range vals {
 			sum += ov.lookupCardinality(key)
+		}
+		if trace != nil {
+			trace.setPlan(PlanCountScalarLookup)
+			trace.addExamined(sum)
 		}
 		return countScalarLookupComplement(db.snapshotUniverseCardinality(), sum, expr.Not), true, nil
 	}
@@ -115,7 +143,7 @@ func countScalarLookupComplement(universe, hit uint64, invert bool) uint64 {
 
 // tryCountByScalarInSplit accelerates flat AND counts with a positive scalar IN leaf:
 // it evaluates all non-IN leaves once and then sums per-value posting intersections.
-func (db *DB[K, V]) tryCountByScalarInSplit(expr qx.Expr) (uint64, bool, error) {
+func (db *DB[K, V]) tryCountByScalarInSplit(expr qx.Expr, trace *queryTrace) (uint64, bool, error) {
 	if expr.Not || expr.Op != qx.OpAND || len(expr.Operands) < 2 {
 		return 0, false, nil
 	}
@@ -212,11 +240,13 @@ func (db *DB[K, V]) tryCountByScalarInSplit(expr qx.Expr) (uint64, bool, error) 
 	}()
 
 	var cnt uint64
+	var examined uint64
 	for _, v := range vals {
 		ids, keep := ov.lookupPostingRetained(v)
 		if ids.IsEmpty() {
 			continue
 		}
+		examined += ids.Cardinality()
 		if keep != nil {
 			if ownedCount >= len(keepOwned) {
 				return 0, false, nil
@@ -229,6 +259,10 @@ func (db *DB[K, V]) tryCountByScalarInSplit(expr qx.Expr) (uint64, bool, error) 
 			continue
 		}
 		cnt += ids.Cardinality()
+	}
+	if trace != nil {
+		trace.setPlan(PlanCountScalarInSplit)
+		trace.addExamined(examined)
 	}
 
 	return cnt, true, nil
@@ -289,7 +323,7 @@ func (db *DB[K, V]) uniqueCountPathPrecheck(expr qx.Expr) (hasUnique bool, ok bo
 
 // tryCountByUniqueEq counts expressions anchored by a positive EQ predicate on
 // a unique scalar field, which bounds the candidate set to at most one row.
-func (db *DB[K, V]) tryCountByUniqueEq(expr qx.Expr) (uint64, bool, error) {
+func (db *DB[K, V]) tryCountByUniqueEq(expr qx.Expr, trace *queryTrace) (uint64, bool, error) {
 	hasUnique, ok := db.uniqueCountPathPrecheck(expr)
 	if !ok || !hasUnique {
 		return 0, false, nil
@@ -363,8 +397,10 @@ func (db *DB[K, V]) tryCountByUniqueEq(expr qx.Expr) (uint64, bool, error) {
 	}
 
 	var cnt uint64
+	var examined uint64
 	for it.HasNext() {
 		idx := it.Next()
+		examined++
 		pass := true
 		for _, ci := range checks {
 			if !preds[ci].matches(idx) {
@@ -375,6 +411,10 @@ func (db *DB[K, V]) tryCountByUniqueEq(expr qx.Expr) (uint64, bool, error) {
 		if pass {
 			cnt++
 		}
+	}
+	if trace != nil {
+		trace.setPlan(PlanCountUniqueEq)
+		trace.addExamined(examined)
 	}
 	return cnt, true, nil
 }
@@ -958,7 +998,7 @@ func (db *DB[K, V]) prepareCountPredicate(p *predicate, probeEst uint64, univers
 //
 // It exists to avoid materializing full bitmap intermediates when a lead can
 // cheaply prune the candidate space.
-func (db *DB[K, V]) tryCountByPredicates(expr qx.Expr) (uint64, bool, error) {
+func (db *DB[K, V]) tryCountByPredicates(expr qx.Expr, trace *queryTrace) (uint64, bool, error) {
 	if expr.Not || expr.Op != qx.OpAND || len(expr.Operands) < 2 {
 		return 0, false, nil
 	}
@@ -1068,7 +1108,11 @@ func (db *DB[K, V]) tryCountByPredicates(expr qx.Expr) (uint64, bool, error) {
 
 	// For range/prefix leads on stable base slices, count by buckets first:
 	// many buckets can be skipped (or fully counted) via bucketCount hooks.
-	if cnt, ok := db.tryCountByPredicatesLeadBuckets(preds, leadIdx, active); ok {
+	if cnt, examined, ok := db.tryCountByPredicatesLeadBuckets(preds, leadIdx, active); ok {
+		if trace != nil {
+			trace.setPlan(PlanCountPredicates)
+			trace.addExamined(examined)
+		}
 		return cnt, true, nil
 	}
 
@@ -1078,8 +1122,10 @@ func (db *DB[K, V]) tryCountByPredicates(expr qx.Expr) (uint64, bool, error) {
 	}
 
 	var cnt uint64
+	var examined uint64
 	for it.HasNext() {
 		idx := it.Next()
+		examined++
 		pass := true
 		for _, pi := range active {
 			if !preds[pi].matches(idx) {
@@ -1091,37 +1137,41 @@ func (db *DB[K, V]) tryCountByPredicates(expr qx.Expr) (uint64, bool, error) {
 			cnt++
 		}
 	}
+	if trace != nil {
+		trace.setPlan(PlanCountPredicates)
+		trace.addExamined(examined)
+	}
 	return cnt, true, nil
 }
 
-func (db *DB[K, V]) tryCountByPredicatesLeadBuckets(preds []predicate, leadIdx int, active []int) (uint64, bool) {
+func (db *DB[K, V]) tryCountByPredicatesLeadBuckets(preds []predicate, leadIdx int, active []int) (uint64, uint64, bool) {
 	if leadIdx < 0 || leadIdx >= len(preds) {
-		return 0, false
+		return 0, 0, false
 	}
 	lead := preds[leadIdx]
 	e := lead.expr
 	if e.Not {
-		return 0, false
+		return 0, 0, false
 	}
 	switch e.Op {
 	case qx.OpGT, qx.OpGTE, qx.OpLT, qx.OpLTE, qx.OpPREFIX:
 	default:
-		return 0, false
+		return 0, 0, false
 	}
 
 	fm := db.fields[e.Field]
 	if fm == nil || fm.Slice {
-		return 0, false
+		return 0, 0, false
 	}
 
 	snap := db.getSnapshot()
 	if snap == nil || snap.fieldDelta(e.Field) != nil {
-		return 0, false
+		return 0, 0, false
 	}
 
 	slice := snap.fieldIndexSlice(e.Field)
 	if slice == nil || len(*slice) == 0 {
-		return 0, false
+		return 0, 0, false
 	}
 
 	key, isSlice, err := db.exprValueToIdxScalar(qx.Expr{
@@ -1130,19 +1180,19 @@ func (db *DB[K, V]) tryCountByPredicatesLeadBuckets(preds []predicate, leadIdx i
 		Value: e.Value,
 	})
 	if err != nil || isSlice {
-		return 0, false
+		return 0, 0, false
 	}
 
 	s := *slice
 	start, end, ok := resolveRange(s, e.Op, key)
 	if !ok {
-		return 0, false
+		return 0, 0, false
 	}
 	if start >= end {
-		return 0, true
+		return 0, 0, true
 	}
 	if end-start < 4 {
-		return 0, false
+		return 0, 0, false
 	}
 
 	singleActive := -1
@@ -1151,6 +1201,7 @@ func (db *DB[K, V]) tryCountByPredicatesLeadBuckets(preds []predicate, leadIdx i
 	}
 
 	var cnt uint64
+	var examined uint64
 	var scratch *roaring64.Bitmap
 	if len(active) > 0 {
 		scratch = getRoaringBuf()
@@ -1167,6 +1218,7 @@ func (db *DB[K, V]) tryCountByPredicatesLeadBuckets(preds []predicate, leadIdx i
 		if ids.IsEmpty() {
 			continue
 		}
+		examined += ids.Cardinality()
 
 		if len(active) == 0 {
 			cnt += ids.Cardinality()
@@ -1259,7 +1311,7 @@ func (db *DB[K, V]) tryCountByPredicatesLeadBuckets(preds []predicate, leadIdx i
 		}
 	}
 
-	return cnt, true
+	return cnt, examined, true
 }
 
 func shouldTryCountORByPredicates(expr qx.Expr) bool {
@@ -1390,7 +1442,7 @@ func countLeadTooRisky(op qx.Op, est, universe uint64) bool {
 //
 // The path is intentionally conservative: it is enabled only for bounded OR
 // shapes where lead-driven probing is usually cheaper than full bitmap union.
-func (db *DB[K, V]) tryCountORByPredicates(expr qx.Expr) (uint64, bool, error) {
+func (db *DB[K, V]) tryCountORByPredicates(expr qx.Expr, trace *queryTrace) (uint64, bool, error) {
 	if !shouldTryCountORByPredicates(expr) {
 		return 0, false, nil
 	}
@@ -1577,6 +1629,15 @@ func (db *DB[K, V]) tryCountORByPredicates(expr qx.Expr) (uint64, bool, error) {
 	}
 
 	var cnt uint64
+	var examined uint64
+	var branchTrace []TraceORBranch
+	if trace != nil {
+		trace.setPlan(PlanCountORPredicates)
+		branchTrace = make([]TraceORBranch, len(branches))
+		for i := range branchTrace {
+			branchTrace[i].Index = i
+		}
+	}
 	for i := range branches {
 		br := branches[i]
 		it := br.preds[br.lead].newIter()
@@ -1586,6 +1647,10 @@ func (db *DB[K, V]) tryCountORByPredicates(expr qx.Expr) (uint64, bool, error) {
 
 		for it.HasNext() {
 			idx := it.Next()
+			examined++
+			if branchTrace != nil {
+				branchTrace[i].RowsExamined++
+			}
 
 			if useSeenDedup {
 				// OR union dedupe first to avoid repeated expensive predicate checks
@@ -1602,6 +1667,9 @@ func (db *DB[K, V]) tryCountORByPredicates(expr qx.Expr) (uint64, bool, error) {
 			if useSeenDedup {
 				if seen.CheckedAdd(idx) {
 					cnt++
+					if branchTrace != nil {
+						branchTrace[i].RowsEmitted++
+					}
 				}
 				continue
 			}
@@ -1615,8 +1683,15 @@ func (db *DB[K, V]) tryCountORByPredicates(expr qx.Expr) (uint64, bool, error) {
 			}
 			if !dup {
 				cnt++
+				if branchTrace != nil {
+					branchTrace[i].RowsEmitted++
+				}
 			}
 		}
+	}
+	if trace != nil {
+		trace.addExamined(examined)
+		trace.setORBranches(branchTrace)
 	}
 
 	return cnt, true, nil
