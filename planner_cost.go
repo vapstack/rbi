@@ -14,6 +14,11 @@ const (
 	plannerOROrderStreamGain  = 0.97
 
 	plannerORBranchFallbackDiv = 32
+
+	// Small delta overlays can afford an exact distinct-bucket correction by
+	// probing only touched keys. Larger deltas keep the cheap approximation to
+	// avoid reviving the old planner-time cliff from full overlay recounts.
+	plannerOverlayDistinctDeltaCorrectionMaxKeys = 256
 )
 
 type plannerOROrderPlan int
@@ -1582,7 +1587,7 @@ func (db *DB[K, V]) extractOrderRangeCoverageLeavesOverlay(orderField string, le
 	}
 
 	br := ov.rangeForBounds(rb)
-	in := overlayApproxDistinctRangeCount(br)
+	in := overlayApproxDistinctRangeCount(ov, br)
 	if in < 0 {
 		in = 0
 	}
@@ -1596,6 +1601,14 @@ func overlayApproxDistinctTotalCount(ov fieldOverlay) int {
 	if ov.delta == nil || !ov.delta.hasEntries() {
 		return len(ov.base)
 	}
+	if corrected, ok := overlayDeltaCorrectedDistinctCount(ov, overlayRange{
+		baseStart:  0,
+		baseEnd:    len(ov.base),
+		deltaStart: 0,
+		deltaEnd:   ov.delta.keyCount(),
+	}); ok {
+		return corrected
+	}
 	total := len(ov.base) + ov.delta.keyCount()
 	if total < len(ov.base) {
 		return len(ov.base)
@@ -1603,12 +1616,62 @@ func overlayApproxDistinctTotalCount(ov fieldOverlay) int {
 	return total
 }
 
-func overlayApproxDistinctRangeCount(br overlayRange) int {
+func overlayApproxDistinctRangeCount(ov fieldOverlay, br overlayRange) int {
+	if corrected, ok := overlayDeltaCorrectedDistinctCount(ov, br); ok {
+		return corrected
+	}
 	in := br.baseEnd - br.baseStart
 	if br.deltaEnd > br.deltaStart {
 		in += br.deltaEnd - br.deltaStart
 	}
 	return in
+}
+
+func overlayDeltaCorrectedDistinctCount(ov fieldOverlay, br overlayRange) (int, bool) {
+	if ov.delta == nil || !ov.delta.hasEntries() {
+		return br.baseEnd - br.baseStart, true
+	}
+	deltaSpan := br.deltaEnd - br.deltaStart
+	if deltaSpan <= 0 {
+		return br.baseEnd - br.baseStart, true
+	}
+	if deltaSpan > plannerOverlayDistinctDeltaCorrectionMaxKeys {
+		return 0, false
+	}
+
+	total := br.baseEnd - br.baseStart
+	baseRange := ov.base[br.baseStart:br.baseEnd]
+	for i := br.deltaStart; i < br.deltaEnd; i++ {
+		key, de, ok := ov.delta.orderedEntryAt(i)
+		if !ok {
+			break
+		}
+		baseIDs, basePresent := overlayDistinctBasePostingForKey(baseRange, key)
+		if composePostingCardinality(baseIDs, de) == 0 {
+			if basePresent {
+				total--
+			}
+			continue
+		}
+		if !basePresent {
+			total++
+		}
+	}
+	if total < 0 {
+		total = 0
+	}
+	return total, true
+}
+
+func overlayDistinctBasePostingForKey(base []index, key string) (postingList, bool) {
+	if len(base) == 0 {
+		return postingList{}, false
+	}
+	i := lowerBoundIndex(base, key)
+	if i < len(base) && indexKeyEqualsString(base[i].Key, key) {
+		return base[i].IDs, true
+	}
+	return postingList{}, false
 }
 
 func overlayDistinctTotalCount(ov fieldOverlay) int {

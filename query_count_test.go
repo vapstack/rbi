@@ -52,6 +52,122 @@ func TestCount_ByPredicates_BucketLead_MatchesBitmap(t *testing.T) {
 	}
 }
 
+func TestCount_ByPredicates_BucketLeadHasAnyResidual_MatchesBitmap(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{
+		AnalyzeInterval:                                  -1,
+		SnapshotMaterializedPredCacheMaxEntries:          -1,
+		SnapshotMaterializedPredCacheMaxEntriesWithDelta: -1,
+	})
+
+	tagSets := [][]string{
+		{"go"},
+		{"db"},
+		{"go", "db"},
+	}
+	seedGeneratedUint64Data(t, db, 66_000, func(i int) *Rec {
+		return &Rec{
+			Name:   fmt.Sprintf("u_%d", i),
+			Email:  fmt.Sprintf("user%05d@example.com", i),
+			Age:    i,
+			Score:  float64(i % 1_000),
+			Active: i%2 == 0,
+			Tags:   append([]string(nil), tagSets[i%len(tagSets)]...),
+			Meta: Meta{
+				Country: "US",
+			},
+		}
+	})
+	if err := db.RebuildIndex(); err != nil {
+		t.Fatalf("RebuildIndex: %v", err)
+	}
+
+	expr := qx.AND(
+		qx.GTE("age", 5_000),
+		qx.LT("age", 60_000),
+		qx.HASANY("tags", []string{"go", "db"}),
+	)
+	leaves, ok := collectAndLeaves(expr)
+	if !ok {
+		t.Fatalf("collectAndLeaves failed")
+	}
+	preds, ok := db.buildPredicatesWithMode(leaves, false)
+	if !ok {
+		t.Fatalf("buildPredicatesWithMode failed")
+	}
+	defer releasePredicates(preds)
+
+	leadIdx := -1
+	for i := range preds {
+		if preds[i].expr.Field == "age" && preds[i].expr.Op == qx.OpGTE {
+			leadIdx = i
+			break
+		}
+	}
+	if leadIdx < 0 {
+		t.Fatalf("expected age range lead predicate")
+	}
+
+	universe := db.snapshotUniverseCardinality()
+	leadEst := preds[leadIdx].estCard
+	if err := db.prepareCountPredicate(&preds[leadIdx], leadEst, universe); err != nil {
+		t.Fatalf("prepareCountPredicate(lead): %v", err)
+	}
+
+	activeBuf := getIntSliceBuf(len(preds))
+	active := activeBuf.values[:0]
+	defer func() {
+		activeBuf.values = active
+		releaseIntSliceBuf(activeBuf)
+	}()
+	for i := range preds {
+		if i == leadIdx {
+			continue
+		}
+		p := preds[i]
+		if p.covered || p.alwaysTrue {
+			continue
+		}
+		if p.alwaysFalse || !p.hasContains() {
+			t.Fatalf("unexpected residual predicate state: idx=%d kind=%v", i, p.kind)
+		}
+		active = append(active, i)
+	}
+	for _, pi := range active {
+		if err := db.prepareCountPredicate(&preds[pi], leadEst, universe); err != nil {
+			t.Fatalf("prepareCountPredicate(residual): %v", err)
+		}
+	}
+	sortActivePredicates(active, preds)
+
+	exactActiveBuf := getIntSliceBuf(len(active))
+	exactActive := buildBitmapFilterActive(exactActiveBuf.values, active, preds)
+	defer func() {
+		exactActiveBuf.values = exactActive
+		releaseIntSliceBuf(exactActiveBuf)
+	}()
+	if len(exactActive) != 0 {
+		t.Fatalf("expected HASANY residual to stay out of bitmap-filter subset, got=%v", exactActive)
+	}
+
+	extraExact := db.buildCountLeadResidualExactFilters(preds, active)
+	defer releaseCountLeadResidualExactFilters(extraExact)
+	if len(extraExact) != 1 {
+		t.Fatalf("expected one local HASANY exact residual filter, got=%d", len(extraExact))
+	}
+
+	got, examined, ok := db.tryCountByPredicatesLeadBuckets(preds, leadIdx, active)
+	if !ok {
+		t.Fatalf("expected bucket-lead count fast path")
+	}
+	if examined == 0 {
+		t.Fatalf("expected examined postings")
+	}
+	want := countByExprBitmap(t, db, expr)
+	if got != want {
+		t.Fatalf("count mismatch: got=%d want=%d", got, want)
+	}
+}
+
 func TestCount_ByPredicates_PostingsLead_MatchesBitmap(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
 

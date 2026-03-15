@@ -217,6 +217,69 @@ func TestOrderRangeCoverage_ConsistencyBetweenPredicateKinds(t *testing.T) {
 	}
 }
 
+func TestOverlayApproxDistinctTotalCount_CorrectsSmallDeltaShadowAndDelete(t *testing.T) {
+	base := []index{
+		{Key: indexKeyFromString("aa"), IDs: postingOf(1)},
+		{Key: indexKeyFromString("bb"), IDs: postingOf(2)},
+		{Key: indexKeyFromString("cc"), IDs: postingOf(3)},
+	}
+	ov := fieldOverlay{
+		base: base,
+		delta: &fieldIndexDelta{
+			entries: []fieldDeltaKV{
+				{key: "aa", entry: indexDeltaEntry{delSingle: 1, delSingleSet: true}},
+				{key: "bb", entry: indexDeltaEntry{addSingle: 22, addSingleSet: true}},
+				{key: "bc", entry: indexDeltaEntry{addSingle: 23, addSingleSet: true}},
+				{key: "zz", entry: indexDeltaEntry{addSingle: 99, addSingleSet: true, delSingle: 99, delSingleSet: true}},
+			},
+		},
+	}
+
+	rawApprox := len(base) + ov.delta.keyCount()
+	if rawApprox == 3 {
+		t.Fatalf("test setup must expose approximation drift")
+	}
+	if got := overlayApproxDistinctTotalCount(ov); got != 3 {
+		t.Fatalf("unexpected corrected total distinct count: got=%d want=3", got)
+	}
+}
+
+func TestOverlayApproxDistinctRangeCount_CorrectsSmallDeltaShadowAndDelete(t *testing.T) {
+	base := []index{
+		{Key: indexKeyFromString("aa"), IDs: postingOf(1)},
+		{Key: indexKeyFromString("bb"), IDs: postingOf(2)},
+		{Key: indexKeyFromString("cc"), IDs: postingOf(3)},
+	}
+	ov := fieldOverlay{
+		base: base,
+		delta: &fieldIndexDelta{
+			entries: []fieldDeltaKV{
+				{key: "aa", entry: indexDeltaEntry{delSingle: 1, delSingleSet: true}},
+				{key: "bb", entry: indexDeltaEntry{addSingle: 22, addSingleSet: true}},
+				{key: "bc", entry: indexDeltaEntry{addSingle: 23, addSingleSet: true}},
+				{key: "zz", entry: indexDeltaEntry{addSingle: 99, addSingleSet: true, delSingle: 99, delSingleSet: true}},
+			},
+		},
+	}
+
+	br := ov.rangeForBounds(rangeBounds{
+		has:   true,
+		hasLo: true,
+		loKey: "aa",
+		loInc: true,
+		hasHi: true,
+		hiKey: "bc",
+		hiInc: true,
+	})
+	rawApprox := (br.baseEnd - br.baseStart) + (br.deltaEnd - br.deltaStart)
+	if rawApprox == 2 {
+		t.Fatalf("test setup must expose approximation drift")
+	}
+	if got := overlayApproxDistinctRangeCount(ov, br); got != 2 {
+		t.Fatalf("unexpected corrected range distinct count: got=%d want=2", got)
+	}
+}
+
 func TestRangeContainsThresholds_Adaptive(t *testing.T) {
 	sparseSmall := rangeLinearContainsLimit(128, 128)
 	denseSmall := rangeLinearContainsLimit(128, 16_384)

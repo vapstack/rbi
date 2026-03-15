@@ -1481,7 +1481,6 @@ func (db *DB[K, V]) tryCountByPredicatesLeadBuckets(preds []predicate, leadIdx i
 		exactActiveBuf.values = exactActive
 		releaseIntSliceBuf(exactActiveBuf)
 	}()
-	allActiveExact := len(localActive) > 0 && len(exactActive) == len(localActive)
 	extraExact := db.buildCountLeadResidualExactFilters(preds, localActive)
 	defer releaseCountLeadResidualExactFilters(extraExact)
 
@@ -1529,7 +1528,7 @@ func (db *DB[K, V]) tryCountByPredicatesLeadBuckets(preds []predicate, leadIdx i
 			continue
 		}
 
-		if len(exactActive) == 0 {
+		if len(exactActive) == 0 && len(extraExact) == 0 {
 			ids.ForEach(func(idx uint64) bool {
 				pass := true
 				for _, pi := range localActive {
@@ -1554,6 +1553,8 @@ func (db *DB[K, V]) tryCountByPredicatesLeadBuckets(preds []predicate, leadIdx i
 			continue
 		}
 
+		current := bm
+		exactApplied := false
 		if len(exactActive) > 0 {
 			mode, exactBM, _ := plannerFilterBitmapByChecks(preds, exactActive, bm, bucketWork)
 			switch mode {
@@ -1563,69 +1564,61 @@ func (db *DB[K, V]) tryCountByPredicatesLeadBuckets(preds []predicate, leadIdx i
 				}
 				continue
 			case plannerPredicateBucketAll:
-				if allActiveExact {
-					cnt += bm.GetCardinality()
-					if owned && bm != scratch {
-						releaseRoaringBuf(bm)
-					}
-					continue
-				}
-				it := exactBM.Iterator()
-				for it.HasNext() {
-					idx := it.Next()
-					pass := true
-					for _, pi := range localActive {
-						if !preds[pi].matches(idx) {
-							pass = false
-							break
-						}
-					}
-					if pass {
-						cnt++
-					}
-				}
-				if owned && bm != scratch {
-					releaseRoaringBuf(bm)
-				}
-				continue
+				current = exactBM
+				exactApplied = true
 			case plannerPredicateBucketExact:
-				if exactBM.IsEmpty() {
+				if exactBM == nil || exactBM.IsEmpty() {
 					if owned && bm != scratch {
 						releaseRoaringBuf(bm)
 					}
 					continue
 				}
-				if allActiveExact {
-					cnt += exactBM.GetCardinality()
-					if owned && bm != scratch {
-						releaseRoaringBuf(bm)
-					}
-					continue
-				}
-				it := exactBM.Iterator()
-				for it.HasNext() {
-					idx := it.Next()
-					pass := true
-					for _, pi := range localActive {
-						if !preds[pi].matches(idx) {
-							pass = false
-							break
-						}
-					}
-					if pass {
-						cnt++
-					}
-				}
-				if owned && bm != scratch {
-					releaseRoaringBuf(bm)
-				}
-				continue
+				current = exactBM
+				exactApplied = true
 			}
 		}
 
-		ids.ForEach(func(idx uint64) bool {
+		extraApplied := false
+		if len(extraExact) > 0 {
+			filtered, ok := countApplyLeadResidualExactFilters(current, extraWork, extraExact)
+			if ok {
+				if filtered == nil || filtered.IsEmpty() {
+					if owned && bm != scratch {
+						releaseRoaringBuf(bm)
+					}
+					continue
+				}
+				current = filtered
+				extraApplied = true
+			}
+		}
+
+		appliedExact := 0
+		if exactApplied {
+			appliedExact += len(exactActive)
+		}
+		if extraApplied {
+			appliedExact += len(extraExact)
+		}
+		if len(localActive) > 0 && appliedExact == len(localActive) {
+			cnt += current.GetCardinality()
+			if owned && bm != scratch {
+				releaseRoaringBuf(bm)
+			}
+			continue
+		}
+
+		it := current.Iterator()
+		for it.HasNext() {
+			idx := it.Next()
 			pass := true
 			for _, pi := range localActive {
+				if exactApplied && countIndexSliceContains(exactActive, pi) {
+					continue
+				}
+				if extraApplied && countLeadResidualExactFiltersContain(extraExact, pi) {
+					continue
+				}
 				if !preds[pi].matches(idx) {
 					pass = false
 					break
@@ -1634,8 +1627,7 @@ func (db *DB[K, V]) tryCountByPredicatesLeadBuckets(preds []predicate, leadIdx i
 			if pass {
 				cnt++
 			}
-			return true
-		})
+		}
 		if owned && bm != scratch {
 			releaseRoaringBuf(bm)
 		}
