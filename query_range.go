@@ -2,9 +2,13 @@ package rbi
 
 import (
 	"reflect"
+	"sync"
+	"sync/atomic"
 
 	"github.com/RoaringBitmap/roaring/v2/roaring64"
 )
+
+const numericRangeFullSpanCacheMaxEntries = 4
 
 type numericRangeBucket struct {
 	start int
@@ -13,14 +17,157 @@ type numericRangeBucket struct {
 }
 
 type numericRangeBucketIndex struct {
-	bucketSize int
-	keyCount   int
-	buckets    []numericRangeBucket
+	bucketSize      int
+	keyCount        int
+	buckets         []numericRangeBucket
+	superBucketSpan int
+	superBuckets    []numericRangeBucket
 }
 
 type numericRangeBucketCacheEntry struct {
-	base *[]index
-	idx  *numericRangeBucketIndex
+	base          *[]index
+	idx           *numericRangeBucketIndex
+	fullSpanCache sync.Map
+	fullSpanCount atomic.Int32
+}
+
+func numericRangeFullSpanCacheKey(start, end int) uint64 {
+	return uint64(uint32(start))<<32 | uint64(uint32(end))
+}
+
+func (e *numericRangeBucketCacheEntry) loadFullSpan(start, end int) (*roaring64.Bitmap, bool) {
+	if e == nil {
+		return nil, false
+	}
+	v, ok := e.fullSpanCache.Load(numericRangeFullSpanCacheKey(start, end))
+	if !ok {
+		return nil, false
+	}
+	bm, ok := v.(*roaring64.Bitmap)
+	if !ok || bm == nil || bm.IsEmpty() {
+		return nil, false
+	}
+	return bm, true
+}
+
+func (e *numericRangeBucketCacheEntry) tryStoreFullSpan(start, end int, bm *roaring64.Bitmap, maxCardinality uint64) (*roaring64.Bitmap, bool) {
+	if e == nil || bm == nil || bm.IsEmpty() {
+		return nil, false
+	}
+	if maxCardinality > 0 && bm.GetCardinality() > maxCardinality {
+		return nil, false
+	}
+	key := numericRangeFullSpanCacheKey(start, end)
+	if cached, ok := e.loadFullSpan(start, end); ok {
+		return cached, true
+	}
+	for {
+		n := e.fullSpanCount.Load()
+		if n >= numericRangeFullSpanCacheMaxEntries {
+			return nil, false
+		}
+		if e.fullSpanCount.CompareAndSwap(n, n+1) {
+			actual, loaded := e.fullSpanCache.LoadOrStore(key, bm)
+			if loaded {
+				e.fullSpanCount.Add(-1)
+				cached, _ := actual.(*roaring64.Bitmap)
+				if cached != nil && !cached.IsEmpty() {
+					return cached, true
+				}
+				return nil, false
+			}
+			return bm, true
+		}
+	}
+}
+
+func (idx *numericRangeBucketIndex) fullBucketSpan(br overlayRange) (start, end int, ok bool) {
+	if idx == nil || idx.bucketSize <= 0 || len(idx.buckets) == 0 {
+		return 0, 0, false
+	}
+	if br.baseStart < 0 || br.baseStart >= br.baseEnd {
+		return 0, 0, false
+	}
+
+	startBucket := br.baseStart / idx.bucketSize
+	endBucket := (br.baseEnd - 1) / idx.bucketSize
+	if startBucket < 0 {
+		startBucket = 0
+	}
+	if endBucket >= len(idx.buckets) {
+		endBucket = len(idx.buckets) - 1
+	}
+	if startBucket > endBucket {
+		return 0, 0, false
+	}
+
+	start = startBucket
+	if idx.buckets[start].start < br.baseStart {
+		start++
+	}
+	end = endBucket
+	if end >= 0 && idx.buckets[end].end > br.baseEnd {
+		end--
+	}
+	if start > end {
+		return 0, 0, false
+	}
+	return start, end, true
+}
+
+func orBaseIndexRange(dst *roaring64.Bitmap, base []index, start, end int) {
+	if dst == nil || start >= end {
+		return
+	}
+	for i := start; i < end; i++ {
+		ids := base[i].IDs
+		if ids.IsEmpty() {
+			continue
+		}
+		if ids.isSingleton() {
+			dst.Add(ids.single)
+			continue
+		}
+		orBitmapAdaptive(dst, ids.bitmap())
+	}
+}
+
+func (idx *numericRangeBucketIndex) orFullBucketSpan(dst *roaring64.Bitmap, startFull, endFull int) {
+	if idx == nil || dst == nil || startFull > endFull {
+		return
+	}
+	if idx.superBucketSpan <= 1 || len(idx.superBuckets) == 0 {
+		for b := startFull; b <= endFull; b++ {
+			cur := idx.buckets[b]
+			if cur.ids != nil && !cur.ids.IsEmpty() {
+				orBitmapAdaptive(dst, cur.ids)
+			}
+		}
+		return
+	}
+
+	span := idx.superBucketSpan
+	b := startFull
+	for b <= endFull && b%span != 0 {
+		cur := idx.buckets[b]
+		if cur.ids != nil && !cur.ids.IsEmpty() {
+			orBitmapAdaptive(dst, cur.ids)
+		}
+		b++
+	}
+	for b+span-1 <= endFull {
+		sb := idx.superBuckets[b/span]
+		if sb.ids != nil && !sb.ids.IsEmpty() {
+			orBitmapAdaptive(dst, sb.ids)
+		}
+		b += span
+	}
+	for ; b <= endFull; b++ {
+		cur := idx.buckets[b]
+		if cur.ids != nil && !cur.ids.IsEmpty() {
+			orBitmapAdaptive(dst, cur.ids)
+		}
+	}
 }
 
 func isNumericScalarKind(kind reflect.Kind) bool {
@@ -77,37 +224,87 @@ func buildNumericRangeBucketIndex(base []index, bucketSize, minFieldKeys int) *n
 		})
 	}
 
+	out.buildSuperBuckets(16)
+
 	return out
 }
 
-func (s *indexSnapshot) getNumericRangeBucketIndex(field string, base *[]index, bucketSize, minFieldKeys int) *numericRangeBucketIndex {
+func (idx *numericRangeBucketIndex) buildSuperBuckets(span int) {
+	if idx == nil || span <= 1 || len(idx.buckets) < span {
+		return
+	}
+	fullGroups := len(idx.buckets) / span
+	if fullGroups <= 0 {
+		return
+	}
+
+	idx.superBucketSpan = span
+	idx.superBuckets = make([]numericRangeBucket, 0, fullGroups)
+	for g := 0; g < fullGroups; g++ {
+		startBucket := g * span
+		endBucket := startBucket + span
+
+		var ids *roaring64.Bitmap
+		for i := startBucket; i < endBucket; i++ {
+			src := idx.buckets[i].ids
+			if src == nil || src.IsEmpty() {
+				continue
+			}
+			if ids == nil {
+				ids = roaring64.NewBitmap()
+			}
+			orBitmapAdaptive(ids, src)
+		}
+		if ids != nil {
+			ids.RunOptimize()
+		}
+
+		idx.superBuckets = append(idx.superBuckets, numericRangeBucket{
+			start: idx.buckets[startBucket].start,
+			end:   idx.buckets[endBucket-1].end,
+			ids:   ids,
+		})
+	}
+}
+
+func (s *indexSnapshot) getNumericRangeBucketCacheEntry(field string, base *[]index, bucketSize, minFieldKeys int) *numericRangeBucketCacheEntry {
 	if s == nil || base == nil || len(*base) == 0 {
 		return nil
 	}
 	cache := s.numericRangeBucketCache
 	if cache == nil {
-		return buildNumericRangeBucketIndex(*base, bucketSize, minFieldKeys)
+		return &numericRangeBucketCacheEntry{
+			base: base,
+			idx:  buildNumericRangeBucketIndex(*base, bucketSize, minFieldKeys),
+		}
 	}
 
 	if cached, ok := cache.Load(field); ok {
 		if entry, ok := cached.(*numericRangeBucketCacheEntry); ok && entry != nil && entry.base == base {
-			return entry.idx
+			return entry
 		}
 	}
 
-	idx := buildNumericRangeBucketIndex(*base, bucketSize, minFieldKeys)
 	entry := &numericRangeBucketCacheEntry{
 		base: base,
-		idx:  idx,
+		idx:  buildNumericRangeBucketIndex(*base, bucketSize, minFieldKeys),
 	}
 	if actual, loaded := cache.LoadOrStore(field, entry); loaded {
 		if stored, ok := actual.(*numericRangeBucketCacheEntry); ok && stored != nil && stored.base == base {
-			return stored.idx
+			return stored
 		}
 		cache.Store(field, entry)
 	}
 
-	return idx
+	return entry
+}
+
+func (s *indexSnapshot) getNumericRangeBucketIndex(field string, base *[]index, bucketSize, minFieldKeys int) *numericRangeBucketIndex {
+	entry := s.getNumericRangeBucketCacheEntry(field, base, bucketSize, minFieldKeys)
+	if entry == nil {
+		return nil
+	}
+	return entry.idx
 }
 
 func (db *DB[K, V]) tryEvalNumericRangeBuckets(field string, fm *field, ov fieldOverlay, br overlayRange) (bitmap, bool) {
@@ -138,7 +335,11 @@ func (db *DB[K, V]) tryEvalNumericRangeBuckets(field string, fm *field, ov field
 		return bitmap{}, false
 	}
 
-	idx := snap.getNumericRangeBucketIndex(field, basePtr, bucketSize, minFieldKeys)
+	entry := snap.getNumericRangeBucketCacheEntry(field, basePtr, bucketSize, minFieldKeys)
+	if entry == nil || entry.idx == nil {
+		return bitmap{}, false
+	}
+	idx := entry.idx
 	if idx == nil || idx.bucketSize <= 0 || len(idx.buckets) == 0 {
 		return bitmap{}, false
 	}
@@ -147,52 +348,57 @@ func (db *DB[K, V]) tryEvalNumericRangeBuckets(field string, fm *field, ov field
 		return bitmap{}, false
 	}
 
-	startBucket := br.baseStart / idx.bucketSize
-	endBucket := (br.baseEnd - 1) / idx.bucketSize
-	if startBucket < 0 {
-		startBucket = 0
-	}
-	if endBucket >= len(idx.buckets) {
-		endBucket = len(idx.buckets) - 1
-	}
-	if startBucket > endBucket {
+	startFull, endFull, ok := idx.fullBucketSpan(br)
+	if !ok {
 		return bitmap{}, false
 	}
 
 	base := *basePtr
-	res := getRoaringBuf()
-	usedFullBucket := false
+	fullCacheKey := ""
+	if db.materializedPredCacheEnabled() {
+		fullCacheKey = materializedPredCacheKeyForNumericBucketSpan(field, startFull, endFull)
+	}
 
-	for b := startBucket; b <= endBucket; b++ {
-		cur := idx.buckets[b]
-		lo := max(br.baseStart, cur.start)
-		hi := min(br.baseEnd, cur.end)
-		if lo >= hi {
-			continue
+	var (
+		res      *roaring64.Bitmap
+		readonly bool
+	)
+	if cached, ok := entry.loadFullSpan(startFull, endFull); ok {
+		res = cached
+		readonly = true
+	}
+	if fullCacheKey != "" {
+		if cached, hit := snap.loadMaterializedPred(fullCacheKey); res == nil && hit && cached != nil && !cached.IsEmpty() {
+			res = cached
+			readonly = true
 		}
-
-		if cur.start >= br.baseStart && cur.end <= br.baseEnd {
-			usedFullBucket = true
-			if cur.ids != nil && !cur.ids.IsEmpty() {
-				orBitmapAdaptive(res, cur.ids)
+	}
+	if res == nil {
+		res = getRoaringBuf()
+		idx.orFullBucketSpan(res, startFull, endFull)
+		if cached, ok := entry.tryStoreFullSpan(startFull, endFull, res, snap.matPredCacheMaxBitmapCard); ok {
+			if cached != res {
+				releaseRoaringBuf(res)
 			}
-			continue
+			res = cached
+			readonly = true
 		}
-
-		for i := lo; i < hi; i++ {
-			bm := base[i].IDs
-			if bm.IsEmpty() {
-				continue
-			}
-			bm.OrInto(res)
+		if fullCacheKey != "" && db.tryShareMaterializedPred(fullCacheKey, res) {
+			readonly = true
 		}
 	}
 
-	// If there were no full buckets in the range, regular key-scan path is
-	// cheaper and avoids unnecessary bucket-index overhead.
-	if !usedFullBucket {
-		releaseRoaringBuf(res)
-		return bitmap{}, false
+	leftEnd := min(br.baseEnd, idx.buckets[startFull].start)
+	rightStart := max(br.baseStart, idx.buckets[endFull].end)
+	if (leftEnd > br.baseStart) || (rightStart < br.baseEnd) || (ov.delta != nil && br.deltaStart < br.deltaEnd) {
+		if readonly {
+			out := getRoaringBuf()
+			out.Or(res)
+			res = out
+			readonly = false
+		}
+		orBaseIndexRange(res, base, br.baseStart, leftEnd)
+		orBaseIndexRange(res, base, rightStart, br.baseEnd)
 	}
 
 	if ov.delta != nil && br.deltaStart < br.deltaEnd {
@@ -208,5 +414,5 @@ func (db *DB[K, V]) tryEvalNumericRangeBuckets(field string, fm *field, ov field
 		}
 	}
 
-	return bitmap{bm: res}, true
+	return bitmap{bm: res, readonly: readonly}, true
 }

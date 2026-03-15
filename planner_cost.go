@@ -135,7 +135,7 @@ func (db *DB[K, V]) decidePlanOROrder(q *qx.QX, branches plannerORBranches) plan
 	if !ov.hasData() {
 		return d
 	}
-	orderDistinct := uint64(overlayDistinctTotalCount(ov))
+	orderDistinct := uint64(overlayApproxDistinctTotalCount(ov))
 	if orderDistinct == 0 {
 		return d
 	}
@@ -546,10 +546,11 @@ const (
 	plannerOrderedFallbackProbeSkewMul = 0.14
 	plannerExecutionPreferGain         = 0.98
 
-	plannerExecutionOrderBaseFactor   = 0.92
-	plannerExecutionOrderCheckFactor  = 0.28
-	plannerExecutionOrderRangeFactor  = 0.78
-	plannerExecutionOrderPrefixFactor = 0.62
+	plannerExecutionOrderBaseFactor     = 0.92
+	plannerExecutionOrderCheckFactor    = 0.28
+	plannerExecutionOrderRangeFactor    = 0.78
+	plannerExecutionOrderPrefixFactor   = 0.62
+	plannerExecutionOrderBaseWorkFactor = 0.003
 
 	plannerExecutionNoOrderPrefixLeafMax   = 6
 	plannerExecutionNoOrderPrefixLimitMax  = 256
@@ -627,6 +628,8 @@ type plannerOrderedProfile struct {
 	hasPrefix        bool
 	fallbackWorkRows float64
 	orderRangeLeaves int
+	baseWorkRows     float64
+	baseRangeLeaves  int
 }
 
 type plannerOrderedDecision struct {
@@ -741,7 +744,7 @@ func (db *DB[K, V]) decideExecutionOrderByCost(q *qx.QX, leaves []qx.Expr) plann
 		if !ok {
 			return d
 		}
-		orderDistinct = uint64(overlayDistinctTotalCount(ov))
+		orderDistinct = uint64(overlayApproxDistinctTotalCount(ov))
 		if orderDistinct == 0 {
 			return d
 		}
@@ -792,6 +795,19 @@ func (db *DB[K, V]) decideExecutionOrderByCost(q *qx.QX, leaves []qx.Expr) plann
 	execRowFactor = plannerClampFloat(execRowFactor, 0.25, 6.0)
 
 	executionCost := expectedProbeRows*execRowFactor + float64(len(leaves))*12.0
+	if profile.baseWorkRows > 0 {
+		baseWorkCost := profile.baseWorkRows * plannerExecutionOrderBaseWorkFactor
+		if profile.activeChecks > 1 {
+			baseWorkCost *= 1.0 + float64(profile.activeChecks-1)*0.12
+		}
+		if profile.baseRangeLeaves > 0 {
+			baseWorkCost *= 1.0 + float64(profile.baseRangeLeaves)*0.35
+		}
+		if hasPrefix {
+			baseWorkCost *= 1.10
+		}
+		executionCost += baseWorkCost
+	}
 	executionCost *= db.plannerCostMultiplier(calPlan)
 
 	d.expectedProbeRows = uint64(expectedProbeRows)
@@ -1134,7 +1150,7 @@ func (db *DB[K, V]) decideOrderedByCost(q *qx.QX, leaves []qx.Expr) plannerOrder
 		if !ok {
 			return d
 		}
-		orderDistinct = uint64(overlayDistinctTotalCount(ov))
+		orderDistinct = uint64(overlayApproxDistinctTotalCount(ov))
 		if orderDistinct == 0 {
 			return d
 		}
@@ -1264,6 +1280,8 @@ func (db *DB[K, V]) estimateOrderedProfile(orderField string, leaves []qx.Expr, 
 	hasNeg := false
 	hasPrefix := false
 	orderRangeLeaves := 0
+	baseWork := 0.0
+	baseRangeLeaves := 0
 	orderHasBuckets := len(orderSlice) > 0
 
 	for i, e := range leaves {
@@ -1281,6 +1299,8 @@ func (db *DB[K, V]) estimateOrderedProfile(orderField string, leaves []qx.Expr, 
 				hasPrefix:        hasPrefix || leafHasPrefix,
 				fallbackWorkRows: fallbackWork + leafWork,
 				orderRangeLeaves: orderRangeLeaves + btoi(leafOrderRange),
+				baseWorkRows:     baseWork,
+				baseRangeLeaves:  baseRangeLeaves,
 			}, true
 		}
 
@@ -1307,6 +1327,10 @@ func (db *DB[K, V]) estimateOrderedProfile(orderField string, leaves []qx.Expr, 
 			continue
 		}
 		activeChecks++
+		baseWork += leafWork
+		if isBoundOp(e.Op) && e.Field != orderField {
+			baseRangeLeaves++
+		}
 	}
 
 	// AND conjunction cannot be broader than the most selective leaf
@@ -1336,6 +1360,8 @@ func (db *DB[K, V]) estimateOrderedProfile(orderField string, leaves []qx.Expr, 
 		hasPrefix:        hasPrefix,
 		fallbackWorkRows: fallbackWork,
 		orderRangeLeaves: orderRangeLeaves,
+		baseWorkRows:     baseWork,
+		baseRangeLeaves:  baseRangeLeaves,
 	}, true
 }
 
@@ -1367,6 +1393,8 @@ func (db *DB[K, V]) estimateOrderedProfileOverlay(orderField string, leaves []qx
 	hasNeg := false
 	hasPrefix := false
 	orderRangeLeaves := 0
+	baseWork := 0.0
+	baseRangeLeaves := 0
 	orderHasBuckets := totalBuckets > 0
 
 	for i, e := range leaves {
@@ -1384,6 +1412,8 @@ func (db *DB[K, V]) estimateOrderedProfileOverlay(orderField string, leaves []qx
 				hasPrefix:        hasPrefix || leafHasPrefix,
 				fallbackWorkRows: fallbackWork + leafWork,
 				orderRangeLeaves: orderRangeLeaves + btoi(leafOrderRange),
+				baseWorkRows:     baseWork,
+				baseRangeLeaves:  baseRangeLeaves,
 			}, true
 		}
 
@@ -1410,6 +1440,10 @@ func (db *DB[K, V]) estimateOrderedProfileOverlay(orderField string, leaves []qx
 			continue
 		}
 		activeChecks++
+		baseWork += leafWork
+		if isBoundOp(e.Op) && e.Field != orderField {
+			baseRangeLeaves++
+		}
 	}
 
 	selectivity := selProd
@@ -1437,6 +1471,8 @@ func (db *DB[K, V]) estimateOrderedProfileOverlay(orderField string, leaves []qx
 		hasPrefix:        hasPrefix,
 		fallbackWorkRows: fallbackWork,
 		orderRangeLeaves: orderRangeLeaves,
+		baseWorkRows:     baseWork,
+		baseRangeLeaves:  baseRangeLeaves,
 	}, true
 }
 
@@ -1536,7 +1572,7 @@ func (db *DB[K, V]) extractOrderRangeCoverageLeavesOverlay(orderField string, le
 		}
 	}
 
-	total := overlayDistinctTotalCount(ov)
+	total := overlayApproxDistinctTotalCount(ov)
 	if total == 0 {
 		return 0, 0, covered, true
 	}
@@ -1546,7 +1582,7 @@ func (db *DB[K, V]) extractOrderRangeCoverageLeavesOverlay(orderField string, le
 	}
 
 	br := ov.rangeForBounds(rb)
-	in := overlayDistinctRangeCount(ov, br)
+	in := overlayApproxDistinctRangeCount(br)
 	if in < 0 {
 		in = 0
 	}
@@ -1554,6 +1590,25 @@ func (db *DB[K, V]) extractOrderRangeCoverageLeavesOverlay(orderField string, le
 		in = total
 	}
 	return in, total, covered, true
+}
+
+func overlayApproxDistinctTotalCount(ov fieldOverlay) int {
+	if ov.delta == nil || !ov.delta.hasEntries() {
+		return len(ov.base)
+	}
+	total := len(ov.base) + ov.delta.keyCount()
+	if total < len(ov.base) {
+		return len(ov.base)
+	}
+	return total
+}
+
+func overlayApproxDistinctRangeCount(br overlayRange) int {
+	in := br.baseEnd - br.baseStart
+	if br.deltaEnd > br.deltaStart {
+		in += br.deltaEnd - br.deltaStart
+	}
+	return in
 }
 
 func overlayDistinctTotalCount(ov fieldOverlay) int {

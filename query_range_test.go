@@ -213,8 +213,8 @@ func TestCount_NumericRangeBuckets_MatchClassicPath(t *testing.T) {
 	if got != baseline {
 		t.Fatalf("count mismatch: baseline=%d got=%d", baseline, got)
 	}
-
-	_ = requireNumericRangeBucketCacheEntry(t, db.getSnapshot(), "age")
+	// Stable AND-count can stay on the lead-bucket count path, so cache
+	// population is not guaranteed here.
 }
 
 func TestCount_NumericRangeBuckets_WorksWithFieldDelta(t *testing.T) {
@@ -319,4 +319,294 @@ func TestNumericRangeBucketCache_ReusedAcrossDeltaSnapshotsWithSameBase(t *testi
 		t.Fatalf("expected numeric range cache reuse between snapshots with same base")
 	}
 	_ = requireNumericRangeBucketCacheEntry(t, snap2, "age")
+}
+
+func TestNumericRangeBucketSpanCache_ReusedForNearbyBounds(t *testing.T) {
+	db, _ := openTempDBUint64(t)
+
+	seedGeneratedUint64Data(t, db, 20_000, func(i int) *Rec {
+		return &Rec{
+			Name:  fmt.Sprintf("u_%d", i),
+			Age:   i,
+			Score: float64(i),
+		}
+	})
+	if err := db.RebuildIndex(); err != nil {
+		t.Fatalf("RebuildIndex: %v", err)
+	}
+
+	setNumericBucketKnobs(t, db, 128, 1, 1)
+
+	snap := db.getSnapshot()
+	fm := db.fields["age"]
+	if fm == nil {
+		t.Fatalf("expected age field metadata")
+	}
+	ov := db.fieldOverlay("age")
+	if !ov.hasData() {
+		t.Fatalf("expected age overlay data")
+	}
+
+	makeRange := func(v int) overlayRange {
+		t.Helper()
+		key, isSlice, err := db.exprValueToIdxScalar(qx.Expr{Op: qx.OpGTE, Field: "age", Value: v})
+		if err != nil {
+			t.Fatalf("exprValueToIdxScalar(%d): %v", v, err)
+		}
+		if isSlice {
+			t.Fatalf("unexpected slice key for age")
+		}
+		var rb rangeBounds
+		rb.applyLo(key, true)
+		return ov.rangeForBounds(rb)
+	}
+
+	br1 := makeRange(2500)
+	out1, ok := db.tryEvalNumericRangeBuckets("age", fm, ov, br1)
+	if !ok {
+		t.Fatalf("expected numeric range bucket path for first bound")
+	}
+	out1.release()
+
+	entry := requireNumericRangeBucketCacheEntry(t, snap, "age")
+	start1, end1, ok := entry.idx.fullBucketSpan(br1)
+	if !ok {
+		t.Fatalf("expected full bucket span for first bound")
+	}
+	cacheKey := materializedPredCacheKeyForNumericBucketSpan("age", start1, end1)
+	cached1, ok := snap.loadMaterializedPred(cacheKey)
+	if !ok || cached1 == nil || cached1.IsEmpty() {
+		t.Fatalf("expected cached full bucket span after first evaluation")
+	}
+	countAfterFirst := snap.matPredCacheCount.Load()
+
+	br2 := makeRange(2501)
+	start2, end2, ok := entry.idx.fullBucketSpan(br2)
+	if !ok {
+		t.Fatalf("expected full bucket span for second bound")
+	}
+	if start1 != start2 || end1 != end2 {
+		t.Fatalf("expected nearby bounds to share full bucket span: first=%d..%d second=%d..%d", start1, end1, start2, end2)
+	}
+	out2, ok := db.tryEvalNumericRangeBuckets("age", fm, ov, br2)
+	if !ok {
+		t.Fatalf("expected numeric range bucket path for second bound")
+	}
+	out2.release()
+	if got := snap.matPredCacheCount.Load(); got != countAfterFirst {
+		t.Fatalf("expected cached span reuse without new entries: before=%d after=%d", countAfterFirst, got)
+	}
+}
+
+func TestNumericRangeBucketSpanCache_PredicateReleaseKeepsSharedBitmap_Base(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{
+		SnapshotMaterializedPredCacheMaxEntries:          -1,
+		SnapshotMaterializedPredCacheMaxEntriesWithDelta: -1,
+	})
+
+	seedGeneratedUint64Data(t, db, 20_000, func(i int) *Rec {
+		return &Rec{
+			Name:  fmt.Sprintf("u_%d", i),
+			Age:   i,
+			Score: float64(i),
+		}
+	})
+	if err := db.RebuildIndex(); err != nil {
+		t.Fatalf("RebuildIndex: %v", err)
+	}
+
+	setNumericBucketKnobs(t, db, 128, 1, 1)
+
+	expr := qx.Expr{Op: qx.OpGTE, Field: "age", Value: 2_500}
+	ov := db.fieldOverlay("age")
+	if !ov.hasData() {
+		t.Fatal("expected age overlay data")
+	}
+
+	key, isSlice, err := db.exprValueToIdxScalar(expr)
+	if err != nil {
+		t.Fatalf("exprValueToIdxScalar: %v", err)
+	}
+	if isSlice {
+		t.Fatal("unexpected slice key for age")
+	}
+	var rb rangeBounds
+	rb.applyLo(key, true)
+	br := ov.rangeForBounds(rb)
+
+	pred, ok := db.buildPredicateWithMode(expr, true)
+	if !ok {
+		t.Fatal("expected range predicate build to succeed")
+	}
+	released := false
+	t.Cleanup(func() {
+		if !released {
+			releasePredicates([]predicate{pred})
+		}
+	})
+
+	entry := requireNumericRangeBucketCacheEntry(t, db.getSnapshot(), "age")
+	start, end, ok := entry.idx.fullBucketSpan(br)
+	if !ok {
+		t.Fatal("expected full bucket span")
+	}
+	cachedBefore, ok := entry.loadFullSpan(start, end)
+	if !ok || cachedBefore == nil || cachedBefore.IsEmpty() {
+		t.Fatal("expected cached full-span bitmap after predicate build")
+	}
+
+	releasePredicates([]predicate{pred})
+	released = true
+
+	cachedAfter, ok := entry.loadFullSpan(start, end)
+	if !ok || cachedAfter == nil || cachedAfter.IsEmpty() {
+		t.Fatal("expected cached full-span bitmap to survive predicate cleanup")
+	}
+	if cachedAfter != cachedBefore {
+		t.Fatal("expected predicate cleanup to preserve cached bitmap instance")
+	}
+}
+
+func TestNumericRangeBucketSpanCache_PredicateReleaseKeepsSharedBitmap_WithFieldDelta(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{
+		SnapshotCompactorRequestEveryNWrites:             1 << 30,
+		SnapshotCompactorIdleInterval:                    -1,
+		SnapshotDeltaLayerMaxDepth:                       1 << 30,
+		SnapshotMaterializedPredCacheMaxEntries:          -1,
+		SnapshotMaterializedPredCacheMaxEntriesWithDelta: -1,
+	})
+
+	seedGeneratedUint64Data(t, db, 8_000, func(i int) *Rec {
+		return &Rec{
+			Name:  fmt.Sprintf("u_%d", i),
+			Age:   i,
+			Score: float64(i),
+		}
+	})
+	if err := db.RebuildIndex(); err != nil {
+		t.Fatalf("RebuildIndex: %v", err)
+	}
+
+	// Keep age delta outside queried range so bucket fast-path can reuse a
+	// shared base full-span bitmap without cloning it.
+	for i := 1; i <= 128; i++ {
+		if err := db.Patch(uint64(i), []Field{{Name: "age", Value: 1_000 + i}}); err != nil {
+			t.Fatalf("Patch(%d): %v", i, err)
+		}
+	}
+
+	if db.getSnapshot().fieldDelta("age") == nil {
+		t.Fatal("expected active delta for age field")
+	}
+
+	setNumericBucketKnobs(t, db, 128, 1, 1)
+
+	expr := qx.Expr{Op: qx.OpGTE, Field: "age", Value: 2_500}
+	ov := db.fieldOverlay("age")
+	if ov.delta == nil {
+		t.Fatal("expected overlay delta for age")
+	}
+
+	key, isSlice, err := db.exprValueToIdxScalar(expr)
+	if err != nil {
+		t.Fatalf("exprValueToIdxScalar: %v", err)
+	}
+	if isSlice {
+		t.Fatal("unexpected slice key for age")
+	}
+	var rb rangeBounds
+	rb.applyLo(key, true)
+	br := ov.rangeForBounds(rb)
+	if br.deltaStart < br.deltaEnd {
+		t.Fatal("expected query range to avoid age delta entries")
+	}
+
+	pred, ok := db.buildPredicateWithMode(expr, true)
+	if !ok {
+		t.Fatal("expected range predicate build with field delta to succeed")
+	}
+	released := false
+	t.Cleanup(func() {
+		if !released {
+			releasePredicates([]predicate{pred})
+		}
+	})
+
+	entry := requireNumericRangeBucketCacheEntry(t, db.getSnapshot(), "age")
+	start, end, ok := entry.idx.fullBucketSpan(br)
+	if !ok {
+		t.Fatal("expected full bucket span")
+	}
+	cachedBefore, ok := entry.loadFullSpan(start, end)
+	if !ok || cachedBefore == nil || cachedBefore.IsEmpty() {
+		t.Fatal("expected cached full-span bitmap after delta predicate build")
+	}
+
+	releasePredicates([]predicate{pred})
+	released = true
+
+	cachedAfter, ok := entry.loadFullSpan(start, end)
+	if !ok || cachedAfter == nil || cachedAfter.IsEmpty() {
+		t.Fatal("expected cached full-span bitmap to survive delta predicate cleanup")
+	}
+	if cachedAfter != cachedBefore {
+		t.Fatal("expected predicate cleanup to preserve cached bitmap instance")
+	}
+}
+
+func TestNumericRangeBucketSpanCache_RespectsBitmapCardinalityGuard(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{
+		SnapshotMaterializedPredCacheMaxEntries:           -1,
+		SnapshotMaterializedPredCacheMaxEntriesWithDelta:  -1,
+		SnapshotMaterializedPredCacheMaxBitmapCardinality: 32,
+	})
+
+	seedGeneratedUint64Data(t, db, 2_000, func(i int) *Rec {
+		return &Rec{
+			Name:  fmt.Sprintf("u_%d", i),
+			Age:   i,
+			Score: float64(i),
+		}
+	})
+	if err := db.RebuildIndex(); err != nil {
+		t.Fatalf("RebuildIndex: %v", err)
+	}
+
+	setNumericBucketKnobs(t, db, 128, 1, 1)
+
+	snap := db.getSnapshot()
+	fm := db.fields["age"]
+	if fm == nil {
+		t.Fatalf("expected age field metadata")
+	}
+	ov := db.fieldOverlay("age")
+	if !ov.hasData() {
+		t.Fatalf("expected age overlay data")
+	}
+
+	key, isSlice, err := db.exprValueToIdxScalar(qx.Expr{Op: qx.OpGTE, Field: "age", Value: 0})
+	if err != nil {
+		t.Fatalf("exprValueToIdxScalar: %v", err)
+	}
+	if isSlice {
+		t.Fatal("unexpected slice key for age")
+	}
+	var rb rangeBounds
+	rb.applyLo(key, true)
+	br := ov.rangeForBounds(rb)
+
+	out, ok := db.tryEvalNumericRangeBuckets("age", fm, ov, br)
+	if !ok {
+		t.Fatal("expected numeric range bucket path")
+	}
+	out.release()
+
+	entry := requireNumericRangeBucketCacheEntry(t, snap, "age")
+	start, end, ok := entry.idx.fullBucketSpan(br)
+	if !ok {
+		t.Fatal("expected full bucket span")
+	}
+	if cached, ok := entry.loadFullSpan(start, end); ok && cached != nil {
+		t.Fatal("expected oversized full-span bitmap to be rejected by cache guard")
+	}
 }

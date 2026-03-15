@@ -28,9 +28,11 @@ type workerMetrics struct {
 	errors    atomic.Uint64
 	lastQuery atomic.Value
 
-	totalLat latencyReservoir
-	queries  map[string]*queryMetrics
-	queryCap int
+	totalLat          latencyReservoir
+	trackQueries      bool
+	trackQueryLatency bool
+	queries           map[string]*queryMetrics
+	queryCap          int
 }
 
 func newLatencyReservoir(capacity int, seed uint64) latencyReservoir {
@@ -64,18 +66,23 @@ func (r *latencyReservoir) next() uint64 {
 	return z ^ (z >> 31)
 }
 
-func newWorkerMetrics(totalCap, queryCap int, seed uint64) *workerMetrics {
+func newWorkerMetrics(totalCap, queryCap int, seed uint64, trackQueries, trackQueryLatency bool) *workerMetrics {
 	if totalCap < 32 {
 		totalCap = 32
 	}
 	if queryCap < 16 {
 		queryCap = 16
 	}
-	return &workerMetrics{
-		totalLat: newLatencyReservoir(totalCap, seed),
-		queries:  make(map[string]*queryMetrics, 8),
-		queryCap: queryCap,
+	out := &workerMetrics{
+		totalLat:          newLatencyReservoir(totalCap, seed),
+		trackQueries:      trackQueries,
+		trackQueryLatency: trackQueryLatency,
+		queryCap:          queryCap,
 	}
+	if trackQueries {
+		out.queries = make(map[string]*queryMetrics, 8)
+	}
+	return out
 }
 
 func (m *workerMetrics) observe(kind string, latencyNS float64, errCount uint64) {
@@ -91,14 +98,20 @@ func (m *workerMetrics) observe(kind string, latencyNS float64, errCount uint64)
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.totalLat.add(latencyNS)
+	if !m.trackQueries {
+		return
+	}
 	query := m.queries[kind]
 	if query == nil {
-		query = &queryMetrics{
-			lat: newLatencyReservoir(m.queryCap, uint64(len(m.queries)+1)*0x94d049bb133111eb),
+		query = &queryMetrics{}
+		if m.trackQueryLatency {
+			query.lat = newLatencyReservoir(m.queryCap, uint64(len(m.queries)+1)*0x94d049bb133111eb)
 		}
 		m.queries[kind] = query
 	}
-	query.lat.add(latencyNS)
+	if m.trackQueryLatency {
+		query.lat.add(latencyNS)
+	}
 	query.count.Add(1)
 	if errCount > 0 {
 		query.errors.Add(errCount)
@@ -149,7 +162,7 @@ func (m *workerMetrics) snapshot(includeLatency bool) workerMetricsSnapshot {
 			count:  query.count.Load(),
 			errors: query.errors.Load(),
 		}
-		if includeLatency {
+		if includeLatency && m.trackQueryLatency {
 			querySnap.latency = append([]float64(nil), query.lat.values...)
 		}
 		out.queries[name] = querySnap

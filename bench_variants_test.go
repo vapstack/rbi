@@ -14,11 +14,6 @@ import (
 
 const dynamicBenchN = 180_000
 
-const (
-	dynamicBenchSwitchRateThreshold    = 0.01
-	dynamicBenchFallbackRatioThreshold = 0.95
-)
-
 type dynamicBenchDistribution int
 
 const (
@@ -167,10 +162,6 @@ func openDynamicBenchDBWithCaching(b *testing.B, withCaching bool) (*DB[uint64, 
 	opts.AnalyzeInterval = -1
 	db, raw := openBoltAndNew[uint64, UserBench](b, path, opts)
 	return db, raw, path
-}
-
-func buildBenchDBDynamicProfile(b *testing.B, profile dynamicBenchProfile) *DB[uint64, UserBench] {
-	return buildBenchDBDynamicProfileWithCaching(b, profile, true)
 }
 
 func buildBenchDBDynamicProfileWithCaching(b *testing.B, profile dynamicBenchProfile, withCaching bool) *DB[uint64, UserBench] {
@@ -333,72 +324,6 @@ func seedBenchDataDynamicProfile(b *testing.B, db *DB[uint64, UserBench], profil
 	flush()
 }
 
-func runQueryKeysBenchWithPlanMetrics(b *testing.B, db *DB[uint64, UserBench], q *qx.QX) {
-	b.Helper()
-
-	var (
-		mu       sync.Mutex
-		total    uint64
-		switches uint64
-		lastPlan string
-		plans    = make(map[string]uint64)
-	)
-
-	sink := func(ev TraceEvent) {
-		mu.Lock()
-		defer mu.Unlock()
-		total++
-		plans[ev.Plan]++
-		if lastPlan != "" && ev.Plan != lastPlan {
-			switches++
-		}
-		lastPlan = ev.Plan
-	}
-
-	prevSink := db.planner.tracer.sink
-	prevEvery := db.planner.tracer.sampleEvery
-	db.planner.tracer.sink = sink
-	db.planner.tracer.sampleEvery = 1
-	b.Cleanup(func() {
-		db.planner.tracer.sink = prevSink
-		db.planner.tracer.sampleEvery = prevEvery
-	})
-
-	b.ReportAllocs()
-	b.ResetTimer()
-	for b.Loop() {
-		_, err := db.QueryKeys(q)
-		if err != nil {
-			b.Fatal(err)
-		}
-	}
-	b.StopTimer()
-
-	mu.Lock()
-	defer mu.Unlock()
-	if total == 0 {
-		return
-	}
-
-	bitmapRatio := float64(plans["plan_bitmap"]) / float64(total)
-	switchRate := float64(switches) / float64(total)
-
-	b.ReportMetric(float64(len(plans)), "plans")
-	b.ReportMetric(switchRate, "switch_rate")
-	b.ReportMetric(bitmapRatio, "bitmap_ratio")
-
-	if switchRate > dynamicBenchSwitchRateThreshold {
-		b.ReportMetric(1, "switch_regressed")
-	} else {
-		b.ReportMetric(0, "switch_regressed")
-	}
-	if bitmapRatio > dynamicBenchFallbackRatioThreshold {
-		b.ReportMetric(1, "bitmap_regressed")
-	} else {
-		b.ReportMetric(0, "bitmap_regressed")
-	}
-}
-
 func Benchmark_Query_Index_Keys_DynamicProfiles_Perf(b *testing.B) {
 	runBenchCacheModes(b, func(b *testing.B, withCaching bool) {
 		for _, profile := range dynamicBenchProfiles {
@@ -414,19 +339,4 @@ func Benchmark_Query_Index_Keys_DynamicProfiles_Perf(b *testing.B) {
 			})
 		}
 	})
-}
-
-func Benchmark_Query_Index_Keys_DynamicProfiles_PlanStability(b *testing.B) {
-	for _, profile := range dynamicBenchProfiles {
-		profile := profile
-		b.Run(profile.name, func(b *testing.B) {
-			db := buildBenchDBDynamicProfile(b, profile)
-			for _, qc := range dynamicBenchQueries {
-				qc := qc
-				b.Run(qc.name, func(b *testing.B) {
-					runQueryKeysBenchWithPlanMetrics(b, db, qc.query())
-				})
-			}
-		})
-	}
 }

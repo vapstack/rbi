@@ -21,6 +21,20 @@ Headless timed mode:
 go run ./stress -db bench.db -out stress_report.json -duration 30s -r_smp 32 -w_med 4
 ```
 
+Focused profiling run for one problematic query:
+
+```bash
+go run ./stress \
+  -db bench/bench.db \
+  -headless \
+  -duration 20s \
+  -class r_med \
+  -query read_signup_dashboard_count \
+  -r_med 32 \
+  -cpu-profile /tmp/stress-count.cpu.pprof \
+  -heap-profile /tmp/stress-count.heap.pprof
+```
+
 Headless until `Ctrl+C`:
 
 ```bash
@@ -31,11 +45,18 @@ go run ./stress -db bench.db -headless -out stress_report.json -r_idx 128 -w_fst
 
 - `-db` : path to Bolt DB file
 - `-out`, `-report` : output JSON report path
+- `-cpu-profile` : write CPU profile for the run
+- `-heap-profile` : write heap profile at shutdown, before `FreeOSMemory`
+- `-pprof-http` : expose `net/http/pprof`
 - `-duration` : fixed run duration; enables headless mode automatically
 - `-headless`, `-no-ui` : disable interactive UI
+- interactive mode shows per-query counters/TPS/latency by default
+- `-query-stats` : enable the same per-query breakdowns/latency collector in headless runs and reports
+- `-class` : keep only specific classes by alias/name, comma-separated
+- `-query` : keep only specific query names, comma-separated
 - `-refresh` : UI/stat counter refresh interval
 - `-telemetry` : memory / snapshot / autobatch sampling interval
-- `-trace-sample` : planner trace sampling (`-1` disable, `0` every query, `N` every Nth query)
+- `-trace-sample` : planner trace sampling (`-1` disable, `0` every query, `N` every Nth query); default is off
 - `-trace-top` : how many slowest sampled planner traces to keep in the report
 - `-bolt-no-sync` : open Bolt with `NoSync=true`
 - `-analyze-interval` : override `rbi.Options.AnalyzeInterval`
@@ -92,7 +113,9 @@ The final report is written to `stress_report.json` by default, or to the path g
 The report contains:
 
 - per-class stats
-- per-query stats inside each class
+- per-query stats inside each class in interactive mode by default
+- per-query latency breakdowns in reports when `-query-stats` is enabled
+- active class/query filters used for the run
 - per-worker stats
 - sampled planner diagnostics by class and query
 - slowest sampled planner traces with plan / rows examined / scan width / dedupe info
@@ -101,3 +124,5 @@ The report contains:
 - autobatch samples
 
 On `Ctrl+C`, the utility stops workers, writes the final report, runs `debug.FreeOSMemory()`, closes the DB, and exits.
+
+Only one `stress` process should target a given DB file at a time. `report saved` is not the end of DB ownership: the process still has to release OS memory and finish `DB.Close()`. The stress helper uses a fixed short open timeout internally to catch accidental parallel runs; do not start another `stress`/`bench` process until the prior one has fully exited and released the DB.

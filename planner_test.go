@@ -92,6 +92,33 @@ func TestPlannerCalibration_QueryPathUpdatesWithoutTracerSink(t *testing.T) {
 	}
 }
 
+func TestPlannerCalibration_QueryViewUsesRootSnapshot(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{
+		AnalyzeInterval:        -1,
+		CalibrationEnabled:     true,
+		CalibrationSampleEvery: -1,
+	})
+	if err := db.SetCalibrationSnapshot(CalibrationSnapshot{
+		UpdatedAt: time.Now(),
+		Multipliers: map[string]float64{
+			string(PlanOrdered):         0.73,
+			string(PlanLimitOrderBasic): 1.41,
+		},
+		Samples: map[string]uint64{
+			string(PlanOrdered):         3,
+			string(PlanLimitOrderBasic): 5,
+		},
+	}); err != nil {
+		t.Fatalf("SetCalibrationSnapshot: %v", err)
+	}
+
+	view := db.makeQueryView(db.getSnapshot())
+	defer db.releaseQueryView(view)
+
+	assertApproxMultiplier(t, view.plannerCostMultiplier(plannerCalOrdered), 0.73)
+	assertApproxMultiplier(t, view.plannerCostMultiplier(plannerCalLimitOrderBasic), 1.41)
+}
+
 func TestPlannerCalibration_SampleEveryNormalization(t *testing.T) {
 	dbEnabled, _ := openTempDBUint64(t, Options{
 		AnalyzeInterval:        -1,
@@ -873,6 +900,83 @@ func TestPlannerOROrderMergePaths_WithDeltaInsertDelete_MatchSeqScan(t *testing.
 	}
 }
 
+func TestPlannerOROrderMergePaths_MixedExactAndNonExactChecks_MatchSeqScan(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{
+		AnalyzeInterval: -1,
+	})
+	_ = seedData(t, db, 20_000)
+
+	q := normalizeQuery(qx.Query(
+		qx.OR(
+			qx.AND(
+				qx.EQ("active", true),
+				qx.HASANY("tags", []string{"go", "ops"}),
+				qx.GTE("score", 40.0),
+				qx.GTE("age", 25),
+			),
+			qx.AND(
+				qx.IN("country", []string{"NL", "DE", "PL"}),
+				qx.HASANY("tags", []string{"db", "rust"}),
+				qx.GTE("score", 30.0),
+			),
+			qx.AND(
+				qx.EQ("name", "alice"),
+				qx.GTE("age", 20),
+				qx.LTE("age", 45),
+			),
+		),
+	).By("score", qx.DESC).Max(120))
+
+	want, err := expectedKeysUint64(t, db, q)
+	if err != nil {
+		t.Fatalf("expectedKeysUint64: %v", err)
+	}
+	if len(want) == 0 {
+		t.Fatalf("expected non-empty result set")
+	}
+
+	branchesKWay, alwaysFalse, ok := db.buildORBranches(q.Expr.Operands)
+	if !ok {
+		t.Fatalf("buildORBranches kway: ok=false")
+	}
+	if alwaysFalse {
+		t.Fatalf("unexpected alwaysFalse for kway branches")
+	}
+	defer releaseORBranches(branchesKWay)
+
+	gotKWay, ok, err := db.execPlanOROrderKWay(q, branchesKWay, nil)
+	if err != nil {
+		t.Fatalf("execPlanOROrderKWay err: %v", err)
+	}
+	if !ok {
+		t.Fatalf("execPlanOROrderKWay: ok=false")
+	}
+
+	branchesFallback, alwaysFalse, ok := db.buildORBranches(q.Expr.Operands)
+	if !ok {
+		t.Fatalf("buildORBranches fallback: ok=false")
+	}
+	if alwaysFalse {
+		t.Fatalf("unexpected alwaysFalse for fallback branches")
+	}
+	defer releaseORBranches(branchesFallback)
+
+	gotFallback, ok, err := db.execPlanOROrderMergeFallback(q, branchesFallback, nil)
+	if err != nil {
+		t.Fatalf("execPlanOROrderMergeFallback err: %v", err)
+	}
+	if !ok {
+		t.Fatalf("execPlanOROrderMergeFallback: ok=false")
+	}
+
+	if !slices.Equal(gotKWay, want) {
+		t.Fatalf("kway/seqscan mismatch:\nkway=%v\nwant=%v", gotKWay, want)
+	}
+	if !slices.Equal(gotFallback, want) {
+		t.Fatalf("fallback/seqscan mismatch:\nfallback=%v\nwant=%v", gotFallback, want)
+	}
+}
+
 func TestPlannerORKWayShouldFallbackRuntime(t *testing.T) {
 	if plannerORKWayShouldFallbackRuntime(120, 16, 20, 300_000) {
 		t.Fatalf("unexpected fallback for too-small pop sample")
@@ -1525,6 +1629,170 @@ func TestPlannerRouting_PrefersExecutionForRangeOrderLimit(t *testing.T) {
 	}
 	if ev.FallbackCost <= 0 {
 		t.Fatalf("expected fallback cost to be set")
+	}
+}
+
+func TestPlannerRouting_OrderLimitWithSecondaryRange_MatchesSeqScan(t *testing.T) {
+	var (
+		mu     sync.Mutex
+		events []TraceEvent
+	)
+
+	sink := func(ev TraceEvent) {
+		mu.Lock()
+		events = append(events, ev)
+		mu.Unlock()
+	}
+
+	db, _ := openTempDBUint64(t, Options{
+		AnalyzeInterval:  -1,
+		TraceSink:        sink,
+		TraceSampleEvery: 1,
+	})
+	_ = seedData(t, db, 20_000)
+
+	q := normalizeQuery(qx.Query(
+		qx.EQ("active", true),
+		qx.GTE("score", 30.0),
+		qx.GTE("age", 22),
+	).By("score", qx.DESC).Max(80))
+
+	got, err := db.QueryKeys(q)
+	if err != nil {
+		t.Fatalf("QueryKeys: %v", err)
+	}
+	want, err := expectedKeysUint64(t, db, q)
+	if err != nil {
+		t.Fatalf("expectedKeysUint64: %v", err)
+	}
+	assertQueryIDsEqual(t, q, got, want)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(events) == 0 {
+		t.Fatalf("expected trace event")
+	}
+	ev := events[len(events)-1]
+	if ev.Plan == "" {
+		t.Fatal("expected plan name in trace event")
+	}
+	if ev.RowsReturned != uint64(len(got)) {
+		t.Fatalf("rows returned mismatch: ev=%d got=%d", ev.RowsReturned, len(got))
+	}
+	if ev.RowsExamined == 0 {
+		t.Fatalf("expected rows examined to be recorded")
+	}
+}
+
+func TestPlannerRouting_OrderLimitWithSecondaryRangeAndHasAny_MatchesSeqScan(t *testing.T) {
+	var (
+		mu     sync.Mutex
+		events []TraceEvent
+	)
+
+	sink := func(ev TraceEvent) {
+		mu.Lock()
+		events = append(events, ev)
+		mu.Unlock()
+	}
+
+	db, _ := openTempDBUint64(t, Options{
+		AnalyzeInterval:  -1,
+		TraceSink:        sink,
+		TraceSampleEvery: 1,
+	})
+	_ = seedData(t, db, 20_000)
+
+	q := normalizeQuery(qx.Query(
+		qx.EQ("active", true),
+		qx.HASANY("tags", []string{"go", "db", "ops"}),
+		qx.GTE("score", 30.0),
+		qx.GTE("age", 22),
+	).By("score", qx.DESC).Max(80))
+
+	got, err := db.QueryKeys(q)
+	if err != nil {
+		t.Fatalf("QueryKeys: %v", err)
+	}
+	want, err := expectedKeysUint64(t, db, q)
+	if err != nil {
+		t.Fatalf("expectedKeysUint64: %v", err)
+	}
+	assertQueryIDsEqual(t, q, got, want)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(events) == 0 {
+		t.Fatalf("expected trace event")
+	}
+	ev := events[len(events)-1]
+	if ev.Plan == "" {
+		t.Fatal("expected plan name in trace event")
+	}
+	if ev.RowsReturned != uint64(len(got)) {
+		t.Fatalf("rows returned mismatch: ev=%d got=%d", ev.RowsReturned, len(got))
+	}
+	if ev.RowsExamined == 0 {
+		t.Fatalf("expected rows examined to be recorded")
+	}
+}
+
+func TestPlannerRouting_OrderedNoOrderWithNegativeIN_MatchesSeqScan(t *testing.T) {
+	var (
+		mu     sync.Mutex
+		events []TraceEvent
+	)
+
+	sink := func(ev TraceEvent) {
+		mu.Lock()
+		events = append(events, ev)
+		mu.Unlock()
+	}
+
+	db, _ := openTempDBUint64(t, Options{
+		AnalyzeInterval:  -1,
+		TraceSink:        sink,
+		TraceSampleEvery: 1,
+	})
+	_ = seedData(t, db, 20_000)
+
+	q := normalizeQuery(qx.Query(
+		qx.LT("age", 35),
+		qx.NOTIN("country", []string{"NL", "DE"}),
+		qx.NOTIN("name", []string{"alice", "bob"}),
+		qx.LT("score", 50.0),
+	).Max(120))
+
+	got, err := db.QueryKeys(q)
+	if err != nil {
+		t.Fatalf("QueryKeys: %v", err)
+	}
+	fullQ := cloneQuery(q)
+	fullQ.Offset = 0
+	fullQ.Limit = 0
+	full, err := expectedKeysUint64(t, db, fullQ)
+	if err != nil {
+		t.Fatalf("expectedKeysUint64(full): %v", err)
+	}
+	assertNoOrderWindowSubset(t, q, got, full, "ordered_no_order")
+	if len(full) >= int(q.Limit) && len(got) != int(q.Limit) {
+		t.Fatalf("expected full page for ordered_no_order route: got=%d limit=%d full=%d", len(got), q.Limit, len(full))
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(events) == 0 {
+		t.Fatalf("expected trace event")
+	}
+	ev := events[len(events)-1]
+	if ev.Plan == "" {
+		t.Fatal("expected plan name in trace event")
+	}
+	if ev.RowsReturned != uint64(len(got)) {
+		t.Fatalf("rows returned mismatch: ev=%d got=%d", ev.RowsReturned, len(got))
+	}
+	if ev.RowsExamined == 0 {
+		t.Fatalf("expected rows examined to be recorded")
 	}
 }
 

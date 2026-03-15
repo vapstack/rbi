@@ -13,12 +13,12 @@ import (
 )
 
 const (
-	colorReset      = "\x1b[0m"
-	colorGray       = "\x1b[37m"
-	colorYellow     = "\x1b[33m"
-	colorRed        = "\x1b[31m"
-	colorGreen      = "\x1b[32m"
-	colorBrightCyan = "\x1b[96m"
+	colorReset  = "\x1b[0m"
+	colorGray   = "\x1b[37m"
+	colorYellow = "\x1b[33m"
+	colorRed    = "\x1b[31m"
+	colorGreen  = "\x1b[32m"
+	colorCyan   = "\x1b[36m"
 )
 
 type metricKind int
@@ -413,7 +413,7 @@ func colorFor(level severity, improved bool) string {
 		return colorRed
 	default:
 		if improved {
-			return colorBrightCyan
+			return colorCyan
 		}
 		return colorRed
 	}
@@ -432,11 +432,11 @@ func percentChange(previous float64, current float64) (float64, bool) {
 func formatMetricValue(kind metricKind, value float64) string {
 	switch kind {
 	case metricNS:
-		return formatScaledValue(value, 1000, 10000, []string{"ns/op", "us/op", "ms/op"})
+		return formatGroupedFloat(value) + "ns/op"
 	case metricBytes:
-		return formatScaledValue(value, 1000, 10000, []string{"B/op", "KB/op", "MB/op", "GB/op"})
+		return formatGroupedFloat(value) + "B/op"
 	default:
-		return formatFloat(value) + " allocs/op"
+		return formatGroupedFloat(value) + " allocs/op"
 	}
 }
 
@@ -468,6 +468,46 @@ func formatFloat(value float64) string {
 		return "0"
 	}
 	return text
+}
+
+func formatGroupedFloat(value float64) string {
+	text := formatFloat(value)
+
+	sign := ""
+	if strings.HasPrefix(text, "-") {
+		sign = "-"
+		text = text[1:]
+	}
+
+	whole, fractional, hasFraction := strings.Cut(text, ".")
+	if len(whole) > 3 {
+		var builder strings.Builder
+		builder.Grow(len(sign) + len(text) + (len(whole)-1)/3)
+		builder.WriteString(sign)
+
+		remainder := len(whole) % 3
+		if remainder == 0 {
+			remainder = 3
+		}
+
+		builder.WriteString(whole[:remainder])
+		for i := remainder; i < len(whole); i += 3 {
+			builder.WriteByte('_')
+			builder.WriteString(whole[i : i+3])
+		}
+
+		if hasFraction {
+			builder.WriteByte('.')
+			builder.WriteString(fractional)
+		}
+
+		return builder.String()
+	}
+
+	if sign == "" {
+		return text
+	}
+	return sign + text
 }
 
 func formatSignedValue(value float64) string {

@@ -28,6 +28,10 @@ type app struct {
 	refreshEvery   time.Duration
 	telemetryEvery time.Duration
 	reportPath     string
+	classFilter    []string
+	queryFilter    []string
+	queryBreakdown bool
+	queryLatency   bool
 	traces         *plannerTraceCollector
 
 	stopCh   chan struct{}
@@ -108,7 +112,7 @@ type workerCommand struct {
 	Value   int
 }
 
-func newApp(handle *DBHandle, catalog []*classDescriptor, refreshEvery, telemetryEvery time.Duration, reportPath string, traces *plannerTraceCollector) *app {
+func newApp(handle *DBHandle, catalog []*classDescriptor, refreshEvery, telemetryEvery time.Duration, reportPath string, classFilter, queryFilter []string, queryBreakdown, queryLatency bool, traces *plannerTraceCollector) *app {
 	workCtx := &WorkloadContext{
 		DB:           handle.DB,
 		MaxIDPtr:     &handle.MaxID,
@@ -120,6 +124,10 @@ func newApp(handle *DBHandle, catalog []*classDescriptor, refreshEvery, telemetr
 		refreshEvery:   refreshEvery,
 		telemetryEvery: telemetryEvery,
 		reportPath:     reportPath,
+		classFilter:    append([]string(nil), classFilter...),
+		queryFilter:    append([]string(nil), queryFilter...),
+		queryBreakdown: queryBreakdown,
+		queryLatency:   queryLatency,
 		traces:         traces,
 		stopCh:         make(chan struct{}),
 		classes:        make([]*classController, 0, len(catalog)),
@@ -248,6 +256,8 @@ func (a *app) buildReport(interrupted bool) stressReport {
 		DurationSec:       snap.CapturedAt.Sub(snap.StartedAt).Seconds(),
 		RefreshEverySec:   a.refreshEvery.Seconds(),
 		TelemetryEverySec: a.telemetryEvery.Seconds(),
+		ClassFilter:       append([]string(nil), a.classFilter...),
+		QueryFilter:       append([]string(nil), a.queryFilter...),
 		RecordsAtStart:    a.handle.StartRecords,
 		RecordsAtEnd:      currentRecordCount(a.handle.DB),
 		MaxIDAtStart:      a.startMaxID,
@@ -474,7 +484,7 @@ func (c *classController) setWorkers(target int) {
 				startedAt: time.Now(),
 				stop:      make(chan struct{}),
 			}
-			handle.metrics.Store(newWorkerMetrics(96, 48, uint64(handle.id)*0x9e3779b97f4a7c15))
+			handle.metrics.Store(newWorkerMetrics(96, 48, uint64(handle.id)*0x9e3779b97f4a7c15, c.app.queryBreakdown, c.app.queryLatency))
 			c.workers = append(c.workers, handle)
 			added = append(added, handle)
 		}
@@ -508,7 +518,7 @@ func (c *classController) resetMetrics() {
 	}
 	for i, worker := range workers {
 		seed := uint64(worker.id) + uint64(i+1)*0x94d049bb133111eb
-		worker.metrics.Store(newWorkerMetrics(totalCap, queryCap, seed))
+		worker.metrics.Store(newWorkerMetrics(totalCap, queryCap, seed, c.app.queryBreakdown, c.app.queryLatency))
 	}
 }
 
@@ -544,7 +554,10 @@ func (c *classController) capture(now time.Time, epoch *runEpoch, planner planne
 	var completed uint64
 	var errors uint64
 	classLatency := make([]float64, 0, len(workers)*128)
-	queryAgg := make(map[string]*queryAggregate, len(c.desc.Info.Queries)+4)
+	var queryAgg map[string]*queryAggregate
+	if c.app.queryBreakdown {
+		queryAgg = make(map[string]*queryAggregate, len(c.desc.Info.Queries)+4)
+	}
 
 	if includeWorkers {
 		report.Workers = make([]workerReport, 0, len(workers))
@@ -555,13 +568,14 @@ func (c *classController) capture(now time.Time, epoch *runEpoch, planner planne
 			continue
 		}
 		metricsSnapshot := metrics.snapshot(true)
-		workerReport, workerLatency := captureWorker(worker, metricsSnapshot)
 		completed += metricsSnapshot.total
 		errors += metricsSnapshot.errors
-		classLatency = append(classLatency, workerLatency...)
-		mergeQueryAggregates(queryAgg, metricsSnapshot)
+		classLatency = append(classLatency, metricsSnapshot.latency...)
+		if c.app.queryBreakdown {
+			mergeQueryAggregates(queryAgg, metricsSnapshot)
+		}
 		if includeWorkers {
-			report.Workers = append(report.Workers, workerReport)
+			report.Workers = append(report.Workers, captureWorker(worker, metricsSnapshot))
 		}
 	}
 
@@ -572,7 +586,9 @@ func (c *classController) capture(now time.Time, epoch *runEpoch, planner planne
 		Latency:      summarizeLatencies(classLatency),
 	}
 	report.Stats.CurrentTPS, report.Stats.MinTPS = epoch.observeScope("class:"+c.desc.Info.Name, completed, now)
-	report.Queries = buildQueryReports(c.desc, queryAgg, planner, epoch, now)
+	if c.app.queryBreakdown {
+		report.Queries = buildQueryReports(c.desc, queryAgg, planner, epoch, now)
+	}
 
 	return classCapture{report: report, latency: classLatency}
 }
@@ -709,7 +725,7 @@ type queryAggregate struct {
 	latency   []float64
 }
 
-func captureWorker(worker *workerHandle, metrics workerMetricsSnapshot) (workerReport, []float64) {
+func captureWorker(worker *workerHandle, metrics workerMetricsSnapshot) workerReport {
 	report := workerReport{
 		ID:        worker.id,
 		Name:      worker.name,
@@ -718,7 +734,6 @@ func captureWorker(worker *workerHandle, metrics workerMetricsSnapshot) (workerR
 	if stoppedAt := worker.stoppedAt.Load(); stoppedAt > 0 {
 		report.StoppedAt = time.Unix(0, stoppedAt).Format(time.RFC3339Nano)
 	}
-	latency := append([]float64(nil), metrics.latency...)
 	report.Completed = metrics.total
 	report.Errors = metrics.errors
 	report.LastQuery = metrics.lastQuery
@@ -729,7 +744,7 @@ func captureWorker(worker *workerHandle, metrics workerMetricsSnapshot) (workerR
 	for name, query := range metrics.queries {
 		report.QueryCounts[name] = query.count
 	}
-	return report, latency
+	return report
 }
 
 func mergeQueryAggregates(dst map[string]*queryAggregate, metrics workerMetricsSnapshot) {

@@ -205,15 +205,7 @@ func buildWriteBenchDBString(b *testing.B) *DB[string, UserBench] {
 func Benchmark_Query_Index_Count_Simple_EQ_Count_StringKeyDB(b *testing.B) {
 	db := buildBenchDBString(b, benchStringQueryN)
 	q := qx.Query(qx.EQ("country", "NL"))
-
-	b.ReportAllocs()
-	b.ResetTimer()
-	for b.Loop() {
-		_, err := db.Count(q)
-		if err != nil {
-			b.Fatal(err)
-		}
-	}
+	runStringCountBench(b, db, q)
 }
 
 func warmBenchDBStateString(b *testing.B, db *DB[string, UserBench]) {
@@ -252,9 +244,11 @@ func warmBenchDBStateString(b *testing.B, db *DB[string, UserBench]) {
 		qx.Query(qx.EQ("country", "US")).By("age", qx.DESC).Max(20),
 	}
 	for _, q := range readWarmups {
-		if _, err := db.Query(q); err != nil {
+		items, err := db.Query(q)
+		if err != nil {
 			b.Fatalf("warmup Query(%+v): %v", q, err)
 		}
+		db.ReleaseRecords(items...)
 	}
 
 	scanned := 0
@@ -274,6 +268,66 @@ func warmBenchCountOnceString(b *testing.B, db *DB[string, UserBench], q *qx.QX)
 	defer b.StartTimer()
 	if _, err := db.Count(q); err != nil {
 		b.Fatal(err)
+	}
+}
+
+func warmBenchQueryKeysOnceString(b *testing.B, db *DB[string, UserBench], q *qx.QX) {
+	b.Helper()
+	b.StopTimer()
+	defer b.StartTimer()
+	if _, err := db.QueryKeys(q); err != nil {
+		b.Fatal(err)
+	}
+}
+
+func warmBenchReadQueryOnceString(b *testing.B, db *DB[string, UserBench], q *qx.QX) {
+	b.Helper()
+	b.StopTimer()
+	defer b.StartTimer()
+	items, err := db.Query(q)
+	if err != nil {
+		b.Fatal(err)
+	}
+	db.ReleaseRecords(items...)
+}
+
+func runStringCountBench(b *testing.B, db *DB[string, UserBench], q *qx.QX) {
+	b.Helper()
+	b.ReportAllocs()
+	warmBenchCountOnceString(b, db, q)
+	b.ResetTimer()
+	for b.Loop() {
+		_, err := db.Count(q)
+		if err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func runStringQueryKeysBench(b *testing.B, db *DB[string, UserBench], q *qx.QX) {
+	b.Helper()
+	b.ReportAllocs()
+	warmBenchQueryKeysOnceString(b, db, q)
+	b.ResetTimer()
+	for b.Loop() {
+		_, err := db.QueryKeys(q)
+		if err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func runStringReadQueryBench(b *testing.B, db *DB[string, UserBench], q *qx.QX) {
+	b.Helper()
+	b.ReportAllocs()
+	warmBenchReadQueryOnceString(b, db, q)
+	b.ResetTimer()
+	for b.Loop() {
+		items, err := db.Query(q)
+		if err != nil {
+			b.Fatal(err)
+		}
+		db.ReleaseRecords(items...)
 	}
 }
 
@@ -321,30 +375,14 @@ func Benchmark_Query_Index_Count_Realistic_HeavyOR_StringKeyDB(b *testing.B) {
 func Benchmark_Query_Index_Keys_Medium_IN_Limit_StringKeyDB(b *testing.B) {
 	db := buildBenchDBString(b, benchStringQueryN)
 	q := qx.Query(qx.IN("country", []string{"NL", "DE"})).Max(100)
-
-	b.ReportAllocs()
-	b.ResetTimer()
-	for b.Loop() {
-		_, err := db.QueryKeys(q)
-		if err != nil {
-			b.Fatal(err)
-		}
-	}
+	runStringQueryKeysBench(b, db, q)
 }
 
 func Benchmark_Read_Query_Items_SingleByEmail_StringKeyDB(b *testing.B) {
 	db := buildBenchDBString(b, benchStringQueryN)
 	target := fmt.Sprintf("user%06d@example.com", benchStringQueryN/2)
 	q := qx.Query(qx.EQ("email", target)).Max(1)
-
-	b.ReportAllocs()
-	b.ResetTimer()
-	for b.Loop() {
-		_, err := db.Query(q)
-		if err != nil {
-			b.Fatal(err)
-		}
-	}
+	runStringReadQueryBench(b, db, q)
 }
 
 func Benchmark_Read_Index_Keys_Scan_All_StringKeyDB(b *testing.B) {

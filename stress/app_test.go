@@ -78,6 +78,12 @@ func TestParseOptionsDurationEnablesHeadless(t *testing.T) {
 		"stress",
 		"-duration", "15s",
 		"-out", "/tmp/custom-report.json",
+		"-cpu-profile", "/tmp/stress.cpu.pprof",
+		"-heap-profile", "/tmp/stress.heap.pprof",
+		"-pprof-http", ":6060",
+		"-class", "r_med,r_meh",
+		"-query", "read_leaderboard_top_items,read_moderation_queue_keys",
+		"-query-stats",
 		"-trace-sample", "64",
 		"-trace-top", "7",
 		"-r_smp", "7",
@@ -96,13 +102,31 @@ func TestParseOptionsDurationEnablesHeadless(t *testing.T) {
 	if opts.ReportPath != "/tmp/custom-report.json" {
 		t.Fatalf("ReportPath = %q, want /tmp/custom-report.json", opts.ReportPath)
 	}
+	if opts.CPUProfile != "/tmp/stress.cpu.pprof" {
+		t.Fatalf("CPUProfile = %q, want /tmp/stress.cpu.pprof", opts.CPUProfile)
+	}
+	if opts.HeapProfile != "/tmp/stress.heap.pprof" {
+		t.Fatalf("HeapProfile = %q, want /tmp/stress.heap.pprof", opts.HeapProfile)
+	}
+	if opts.PprofHTTP != ":6060" {
+		t.Fatalf("PprofHTTP = %q, want :6060", opts.PprofHTTP)
+	}
 	if opts.TraceSampleEvery != 64 {
 		t.Fatalf("TraceSampleEvery = %d, want 64", opts.TraceSampleEvery)
 	}
 	if opts.TraceTopN != 7 {
 		t.Fatalf("TraceTopN = %d, want 7", opts.TraceTopN)
 	}
+	if !opts.QueryStats {
+		t.Fatal("QueryStats = false, want true")
+	}
 	if opts.InitialWorkers["read_simple"] != 7 {
 		t.Fatalf("read_simple workers = %d, want 7", opts.InitialWorkers["read_simple"])
+	}
+	if len(opts.ClassFilter) != 2 || opts.ClassFilter[0] != "r_med" || opts.ClassFilter[1] != "r_meh" {
+		t.Fatalf("ClassFilter = %v, want [r_med r_meh]", opts.ClassFilter)
+	}
+	if len(opts.QueryFilter) != 2 || opts.QueryFilter[0] != "read_leaderboard_top_items" || opts.QueryFilter[1] != "read_moderation_queue_keys" {
+		t.Fatalf("QueryFilter = %v, want leaderboard/moderation", opts.QueryFilter)
 	}
 }

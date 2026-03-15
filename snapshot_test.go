@@ -668,6 +668,79 @@ func TestSnapshotDelta_UsesOROrderStreamPlanWithoutMaterializedFallback(t *testi
 	}
 }
 
+func TestSnapshotDelta_OrderedResidualBroadRange_UsesComplementBitmap(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{
+		AnalyzeInterval:                                  -1,
+		SnapshotCompactorRequestEveryNWrites:             1 << 30,
+		SnapshotCompactorIdleInterval:                    -1,
+		SnapshotDeltaLayerMaxDepth:                       1 << 30,
+		SnapshotMaterializedPredCacheMaxEntries:          -1,
+		SnapshotMaterializedPredCacheMaxEntriesWithDelta: -1,
+	})
+
+	seedGeneratedUint64Data(t, db, 80_000, func(i int) *Rec {
+		return &Rec{
+			Name:   fmt.Sprintf("u_%d", i),
+			Email:  fmt.Sprintf("user%05d@example.com", i),
+			Age:    i,
+			Score:  float64(i % 1_000),
+			Active: i%2 == 0,
+			Meta: Meta{
+				Country: "US",
+			},
+		}
+	})
+	if err := db.RebuildIndex(); err != nil {
+		t.Fatalf("RebuildIndex: %v", err)
+	}
+
+	for i := 1; i <= 512; i++ {
+		err := db.Patch(uint64(i), []Field{
+			{Name: "age", Value: 75_000 + i},
+		})
+		if err != nil {
+			t.Fatalf("Patch(%d): %v", i, err)
+		}
+	}
+
+	if db.getSnapshot().fieldDelta("age") == nil {
+		t.Fatalf("expected active age delta")
+	}
+
+	q := normalizeQuery(qx.Query(
+		qx.GTE("age", 1_000),
+	).By("score", qx.DESC).Max(50))
+
+	leaves, ok := collectAndLeaves(q.Expr)
+	if !ok {
+		t.Fatalf("collectAndLeaves: ok=false")
+	}
+	preds, ok := db.buildPredicatesOrderedWithMode(leaves, "score", false)
+	if !ok {
+		t.Fatalf("buildPredicatesOrderedWithMode: ok=false")
+	}
+	defer releasePredicates(preds)
+
+	if len(preds) != 1 {
+		t.Fatalf("unexpected predicate count: %d", len(preds))
+	}
+	if preds[0].kind != predicateKindBitmapNot {
+		t.Fatalf("expected ordered broad range to switch to bitmapNot complement, got kind=%v", preds[0].kind)
+	}
+
+	got, ok := db.execPlanOrderedBasic(q, preds, nil)
+	if !ok {
+		t.Fatalf("execPlanOrderedBasic: ok=false")
+	}
+	want, err := db.execQuery(q, true, false)
+	if err != nil {
+		t.Fatalf("execQuery: %v", err)
+	}
+	if !slices.Equal(got, want) {
+		t.Fatalf("ordered residual complement mismatch:\ngot=%v\nwant=%v", got, want)
+	}
+}
+
 func TestSnapshotDelta_UsesBitmapFallbackForSafeOverlayShape(t *testing.T) {
 	var events []TraceEvent
 	db, _ := openTempDBUint64(t, Options{
@@ -903,6 +976,30 @@ func TestSnapshotDelta_LayerDepthIsBounded(t *testing.T) {
 		s := db.getSnapshot()
 		return s.indexLayer == nil || s.indexLayer.depth <= maxDepth
 	})
+}
+
+func TestSnapshotDelta_LayerDepthIsBoundedWithoutCompactor(t *testing.T) {
+	maxDepth := 2
+	db, _ := openTempDBUint64(t, Options{
+		SnapshotDeltaLayerMaxDepth:              maxDepth,
+		SnapshotDeltaCompactMaxFieldsPerPublish: -1,
+		SnapshotCompactorRequestEveryNWrites:    1 << 30,
+		SnapshotCompactorIdleInterval:           -1,
+		SnapshotCompactorMaxIterationsPerRun:    -1,
+	})
+
+	for i := 0; i < 8; i++ {
+		if err := db.Set(1, &Rec{Name: string(rune('a' + i)), Age: 20 + i}); err != nil {
+			t.Fatalf("Set #%d: %v", i, err)
+		}
+		s := db.getSnapshot()
+		if s == nil || s.indexLayer == nil {
+			t.Fatalf("expected layered snapshot after write #%d", i)
+		}
+		if s.indexLayer.depth > maxDepth {
+			t.Fatalf("snapshot depth exceeded cap after write #%d: got=%d want<=%d", i, s.indexLayer.depth, maxDepth)
+		}
+	}
 }
 
 func TestSnapshotCompactor_IdleForceCompactsDelta(t *testing.T) {

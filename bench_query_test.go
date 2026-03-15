@@ -226,9 +226,11 @@ func warmBenchDBStateUint64(b *testing.B, db *DB[uint64, UserBench]) {
 		qx.Query(qx.EQ("country", "US")).By("age", qx.DESC).Max(20),
 	}
 	for _, q := range readWarmups {
-		if _, err := db.Query(q); err != nil {
+		items, err := db.Query(q)
+		if err != nil {
 			b.Fatalf("warmup Query(%+v): %v", q, err)
 		}
+		db.ReleaseRecords(items...)
 	}
 
 	scanned := 0
@@ -264,9 +266,11 @@ func warmBenchReadQueryOnceUint64(b *testing.B, db *DB[uint64, UserBench], q *qx
 	b.Helper()
 	b.StopTimer()
 	defer b.StartTimer()
-	if _, err := db.Query(q); err != nil {
+	items, err := db.Query(q)
+	if err != nil {
 		b.Fatal(err)
 	}
+	db.ReleaseRecords(items...)
 }
 
 func runBenchCacheModes(b *testing.B, fn func(*testing.B, bool)) {
@@ -305,16 +309,8 @@ func runReadQueryBenchCacheModes(b *testing.B, qf func() *qx.QX) {
 
 func Benchmark_Query_Index_Count_Simple_EQ_Count(b *testing.B) {
 	db := buildBenchDB(b, benchN)
-	b.ReportAllocs()
-
 	q := qx.Query(qx.EQ("country", "NL"))
-	b.ResetTimer()
-	for b.Loop() {
-		_, err := db.Count(q)
-		if err != nil {
-			b.Fatal(err)
-		}
-	}
+	runCountBench(b, db, q)
 }
 
 func Benchmark_Query_Index_Count_Simple_IN_Count(b *testing.B) {
@@ -475,17 +471,8 @@ func Benchmark_Query_Index_Count_Gap_HeavyOR_MultiBranch(b *testing.B) {
 
 func Benchmark_Query_Index_Keys_Simple_First100(b *testing.B) {
 	db := buildBenchDB(b, benchN)
-
 	q := qx.Query().Max(100)
-
-	b.ReportAllocs()
-	b.ResetTimer()
-	for b.Loop() {
-		_, err := db.QueryKeys(q)
-		if err != nil {
-			b.Fatal(err)
-		}
-	}
+	runQueryKeysBench(b, db, q)
 }
 
 func Benchmark_Read_Index_Keys_Scan_All_Uint64(b *testing.B) {
@@ -509,17 +496,8 @@ func Benchmark_Read_Index_Keys_Scan_All_Uint64(b *testing.B) {
 
 func Benchmark_Query_Index_Keys_Medium_IN_Limit(b *testing.B) {
 	db := buildBenchDB(b, benchN)
-	b.ReportAllocs()
-
 	q := qx.Query(qx.IN("country", []string{"NL", "DE"})).Max(100)
-
-	b.ResetTimer()
-	for b.Loop() {
-		_, err := db.QueryKeys(q)
-		if err != nil {
-			b.Fatal(err)
-		}
-	}
+	runQueryKeysBench(b, db, q)
 }
 
 func Benchmark_Query_Index_Keys_Heavy_Range_Order_Limit(b *testing.B) {
@@ -553,22 +531,13 @@ func Benchmark_Query_Index_Keys_Heavy_All(b *testing.B) {
 
 func Benchmark_Query_Index_Keys_Realistic_DashboardFilter_Limit(b *testing.B) {
 	db := buildBenchDB(b, benchN)
-	b.ReportAllocs()
-
 	// SELECT * FROM users WHERE status='active' AND plan='enterprise' AND country='US' LIMIT 100
 	q := qx.Query(
 		qx.EQ("status", "active"),
 		qx.EQ("plan", "enterprise"),
 		qx.EQ("country", "US"),
 	).Max(100)
-
-	b.ResetTimer()
-	for b.Loop() {
-		_, err := db.QueryKeys(q)
-		if err != nil {
-			b.Fatal(err)
-		}
-	}
+	runQueryKeysBench(b, db, q)
 }
 
 func Benchmark_Query_Index_Keys_Realistic_Analytics_Range_Order_Limit(b *testing.B) {
@@ -583,129 +552,66 @@ func Benchmark_Query_Index_Keys_Realistic_Analytics_Range_Order_Limit(b *testing
 
 func Benchmark_Query_Index_Keys_Realistic_LeaderBoard(b *testing.B) {
 	db := buildBenchDB(b, benchN)
-	b.ReportAllocs()
-
 	q := qx.Query().By("score", qx.DESC).Max(10)
-
-	b.ResetTimer()
-	for b.Loop() {
-		_, err := db.QueryKeys(q)
-		if err != nil {
-			b.Fatal(err)
-		}
-	}
+	runQueryKeysBench(b, db, q)
 }
 
 func Benchmark_Query_Index_Keys_Realistic_Permissions_HasAny_Limit(b *testing.B) {
 	db := buildBenchDB(b, benchN)
-	b.ReportAllocs()
-
 	// SELECT * FROM users WHERE roles && ['admin', 'moderator']
 	q := qx.Query(
 		qx.HASANY("roles", []string{"admin", "moderator"}),
 	).Max(100)
-
-	b.ResetTimer()
-	for b.Loop() {
-		_, err := db.QueryKeys(q)
-		if err != nil {
-			b.Fatal(err)
-		}
-	}
+	runQueryKeysBench(b, db, q)
 }
 
 func Benchmark_Query_Index_Keys_Realistic_Permissions_HasAny_All(b *testing.B) {
 	db := buildBenchDB(b, benchN)
-	b.ReportAllocs()
-
 	// SELECT * FROM users WHERE roles && ['admin', 'moderator']
 	q := qx.Query(
 		qx.HASANY("roles", []string{"admin", "moderator"}),
 	)
-
-	b.ResetTimer()
-	for b.Loop() {
-		_, err := db.QueryKeys(q)
-		if err != nil {
-			b.Fatal(err)
-		}
-	}
+	runQueryKeysBench(b, db, q)
 }
 
 func Benchmark_Query_Index_Keys_Realistic_Skills_HasAll_Limit(b *testing.B) {
 	db := buildBenchDB(b, benchN)
-	b.ReportAllocs()
-
 	// SELECT * FROM users WHERE tags @> ['go', 'db']
 	q := qx.Query(
 		qx.HAS("tags", []string{"go", "db"}),
 	).Max(100)
-
-	b.ResetTimer()
-	for b.Loop() {
-		_, err := db.QueryKeys(q)
-		if err != nil {
-			b.Fatal(err)
-		}
-	}
+	runQueryKeysBench(b, db, q)
 }
 
 func Benchmark_Query_Index_Keys_Realistic_Skills_HasAll_All(b *testing.B) {
 	db := buildBenchDB(b, benchN)
-	b.ReportAllocs()
-
 	// SELECT * FROM users WHERE tags @> ['go', 'db']
 	q := qx.Query(
 		qx.HAS("tags", []string{"go", "db"}),
 	)
-
-	b.ResetTimer()
-	for b.Loop() {
-		_, err := db.QueryKeys(q)
-		if err != nil {
-			b.Fatal(err)
-		}
-	}
+	runQueryKeysBench(b, db, q)
 }
 
 func Benchmark_Query_Index_Keys_Realistic_Exclusion_Limit(b *testing.B) {
 	db := buildBenchDB(b, benchN)
-	b.ReportAllocs()
-
 	// SELECT * FROM users WHERE status = 'active' AND plan != 'free' AND country NOT IN ('US', 'GB')
 	q := qx.Query(
 		qx.EQ("status", "active"),
 		qx.NE("plan", "free"),
 		qx.NOTIN("country", []string{"US", "GB"}),
 	).Max(100)
-
-	b.ResetTimer()
-	for b.Loop() {
-		_, err := db.QueryKeys(q)
-		if err != nil {
-			b.Fatal(err)
-		}
-	}
+	runQueryKeysBench(b, db, q)
 }
 
 func Benchmark_Query_Index_Keys_Realistic_Exclusion_All(b *testing.B) {
 	db := buildBenchDB(b, benchN)
-	b.ReportAllocs()
-
 	// SELECT * FROM users WHERE status = 'active' AND plan != 'free' AND country NOT IN ('US', 'GB')
 	q := qx.Query(
 		qx.EQ("status", "active"),
 		qx.NE("plan", "free"),
 		qx.NOTIN("country", []string{"US", "GB"}),
 	)
-
-	b.ResetTimer()
-	for b.Loop() {
-		_, err := db.QueryKeys(q)
-		if err != nil {
-			b.Fatal(err)
-		}
-	}
+	runQueryKeysBench(b, db, q)
 }
 
 func Benchmark_Query_Index_Keys_Realistic_Autocomplete_Prefix_Limit(b *testing.B) {
@@ -761,42 +667,24 @@ func Benchmark_Query_Index_Keys_Realistic_ComplexSegment_All(b *testing.B) {
 
 func Benchmark_Query_Index_Keys_Realistic_TopLevel_OR_Limit(b *testing.B) {
 	db := buildBenchDB(b, benchN)
-	b.ReportAllocs()
-
 	q := qx.Query(
 		qx.OR(
 			qx.HAS("roles", []string{"admin"}),
 			qx.EQ("plan", "enterprise"),
 		),
 	).Max(100)
-
-	b.ResetTimer()
-	for b.Loop() {
-		_, err := db.QueryKeys(q)
-		if err != nil {
-			b.Fatal(err)
-		}
-	}
+	runQueryKeysBench(b, db, q)
 }
 
 func Benchmark_Query_Index_Keys_Realistic_TopLevel_OR_All(b *testing.B) {
 	db := buildBenchDB(b, benchN)
-	b.ReportAllocs()
-
 	q := qx.Query(
 		qx.OR(
 			qx.HAS("roles", []string{"admin"}),
 			qx.EQ("plan", "enterprise"),
 		),
 	)
-
-	b.ResetTimer()
-	for b.Loop() {
-		_, err := db.QueryKeys(q)
-		if err != nil {
-			b.Fatal(err)
-		}
-	}
+	runQueryKeysBench(b, db, q)
 }
 
 func Benchmark_Query_Index_Keys_Sort_EarlyExit(b *testing.B) {
@@ -807,6 +695,7 @@ func Benchmark_Query_Index_Keys_Sort_EarlyExit(b *testing.B) {
 		qx.EQ("status", "active"),
 	).By("age", qx.ASC).Max(20)
 
+	warmBenchQueryKeysOnceUint64(b, db, q)
 	b.ResetTimer()
 	for b.Loop() {
 		ids, err := db.QueryKeys(q)
@@ -829,99 +718,43 @@ func Benchmark_Query_Index_Keys_Sort_DeepOffset_Limit(b *testing.B) {
 
 func Benchmark_Query_Index_Keys_Sort_Complex_Order_Limit(b *testing.B) {
 	db := buildBenchDB(b, benchN)
-	b.ReportAllocs()
-
 	q := qx.Query(
 		qx.EQ("country", "DE"),
 		qx.HASANY("tags", []string{"rust", "go"}),
 	).By("age", qx.DESC).Max(50)
-
-	b.ResetTimer()
-	for b.Loop() {
-		_, err := db.QueryKeys(q)
-		if err != nil {
-			b.Fatal(err)
-		}
-	}
+	runQueryKeysBench(b, db, q)
 }
 
 func Benchmark_Query_Index_Keys_Sort_ArrayPos_Limit(b *testing.B) {
 	db := buildBenchDB(b, benchN)
-	b.ReportAllocs()
-
 	priority := []string{"enterprise", "pro", "basic", "free"}
-
 	q := qx.Query(qx.EQ("status", "active")).ByArrayPos("plan", priority, qx.ASC).Max(50)
-
-	b.ResetTimer()
-	for b.Loop() {
-		_, err := db.QueryKeys(q)
-		if err != nil {
-			b.Fatal(err)
-		}
-	}
+	runQueryKeysBench(b, db, q)
 }
 
 func Benchmark_Query_Index_Keys_Sort_ArrayPos_All(b *testing.B) {
 	db := buildBenchDB(b, benchN)
-	b.ReportAllocs()
-
 	priority := []string{"enterprise", "pro", "basic", "free"}
-
 	q := qx.Query(qx.EQ("status", "active")).ByArrayPos("plan", priority, qx.ASC)
-
-	b.ResetTimer()
-	for b.Loop() {
-		_, err := db.QueryKeys(q)
-		if err != nil {
-			b.Fatal(err)
-		}
-	}
+	runQueryKeysBench(b, db, q)
 }
 
 func Benchmark_Query_Index_Keys_Sort_ArrayCount_Limit(b *testing.B) {
 	db := buildBenchDB(b, benchN)
-	b.ReportAllocs()
-
 	q := qx.Query(qx.EQ("status", "active")).ByArrayCount("roles", qx.DESC).Max(50)
-
-	b.ResetTimer()
-	for b.Loop() {
-		_, err := db.QueryKeys(q)
-		if err != nil {
-			b.Fatal(err)
-		}
-	}
+	runQueryKeysBench(b, db, q)
 }
 
 func Benchmark_Query_Index_Keys_Sort_ArrayCount_All(b *testing.B) {
 	db := buildBenchDB(b, benchN)
-	b.ReportAllocs()
-
 	q := qx.Query(qx.EQ("status", "active")).ByArrayCount("roles", qx.DESC)
-
-	b.ResetTimer()
-	for b.Loop() {
-		_, err := db.QueryKeys(q)
-		if err != nil {
-			b.Fatal(err)
-		}
-	}
+	runQueryKeysBench(b, db, q)
 }
 
 func Benchmark_Read_Query_Items_SimpleFetch(b *testing.B) {
 	db := buildBenchDB(b, benchN)
-	b.ReportAllocs()
-
 	q := qx.Query(qx.EQ("country", "US")).By("age", qx.DESC).Max(20)
-
-	b.ResetTimer()
-	for b.Loop() {
-		_, err := db.Query(q)
-		if err != nil {
-			b.Fatal(err)
-		}
-	}
+	runReadQueryBench(b, db, q)
 }
 
 func Benchmark_Read_Query_Items_HeavyFetch(b *testing.B) {
@@ -1114,10 +947,11 @@ func runReadQueryBench(b *testing.B, db *DB[uint64, UserBench], q *qx.QX) {
 	warmBenchReadQueryOnceUint64(b, db, q)
 	b.ResetTimer()
 	for b.Loop() {
-		_, err := db.Query(q)
+		items, err := db.Query(q)
 		if err != nil {
 			b.Fatal(err)
 		}
+		db.ReleaseRecords(items...)
 	}
 }
 

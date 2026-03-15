@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"math/rand/v2"
@@ -28,10 +29,21 @@ var (
 
 const randStreamMix uint64 = 0x9e3779b97f4a7c15
 
+const stressBoltOpenTimeout = 500 * time.Millisecond
+
+// Keep this timeout fixed and short in stress.
+// Do not make it user-configurable and do not increase it.
+// Stress/bench helpers must not run in parallel against the same DB file; agents
+// are expected to wait for full process exit and DB close instead of masking
+// that mistake with a long lock wait here.
+
 type DBConfig struct {
 	DBFile           string
+	OpenTimeout      time.Duration
 	BoltNoSync       bool
 	AnalyzeInterval  time.Duration
+	CalibrationOn    bool
+	CalibrationEvery int
 	TraceSink        func(rbi.TraceEvent)
 	TraceSampleEvery int
 }
@@ -49,6 +61,9 @@ func OpenBenchDB(cfg DBConfig, emailSampleN int) (*DBHandle, error) {
 	if cfg.DBFile == "" {
 		cfg.DBFile = DefaultDBFilename
 	}
+	if cfg.OpenTimeout <= 0 {
+		cfg.OpenTimeout = stressBoltOpenTimeout
+	}
 	if abs, err := filepath.Abs(cfg.DBFile); err == nil {
 		cfg.DBFile = abs
 	}
@@ -56,12 +71,26 @@ func OpenBenchDB(cfg DBConfig, emailSampleN int) (*DBHandle, error) {
 	if cfg.AnalyzeInterval != 0 {
 		dbOpts.AnalyzeInterval = cfg.AnalyzeInterval
 	}
+	if cfg.CalibrationOn {
+		dbOpts.CalibrationEnabled = true
+		dbOpts.CalibrationSampleEvery = cfg.CalibrationEvery
+	}
 	if cfg.TraceSink != nil {
 		dbOpts.TraceSink = cfg.TraceSink
 		dbOpts.TraceSampleEvery = cfg.TraceSampleEvery
 	}
-	rawBolt, err := bolt.Open(cfg.DBFile, 0o600, &bolt.Options{NoSync: cfg.BoltNoSync})
+	rawBolt, err := bolt.Open(cfg.DBFile, 0o600, &bolt.Options{
+		NoSync:  cfg.BoltNoSync,
+		Timeout: cfg.OpenTimeout,
+	})
 	if err != nil {
+		if errors.Is(err, bolt.ErrTimeout) {
+			return nil, fmt.Errorf(
+				"open bolt db: lock timeout after %s for %s (another stress or bench process is likely still using this DB)",
+				cfg.OpenTimeout,
+				cfg.DBFile,
+			)
+		}
 		return nil, fmt.Errorf("open bolt db: %w", err)
 	}
 	db, err := rbi.New[uint64, UserBench](rawBolt, dbOpts)

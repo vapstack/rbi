@@ -109,7 +109,7 @@ func TestCompareMetricUsesUnitStepsForSmallValues(t *testing.T) {
 	}
 
 	display = compareMetric(metricAllocs, 8, 4)
-	if display.Color != colorBrightCyan {
+	if display.Color != colorCyan {
 		t.Fatalf("unexpected color for large improvement: %q", display.Color)
 	}
 	if display.DeltaText != "-4" {
@@ -117,20 +117,75 @@ func TestCompareMetricUsesUnitStepsForSmallValues(t *testing.T) {
 	}
 }
 
-func TestFormatScaledValueKeepsBoundaryInSameUnit(t *testing.T) {
+func TestFormatMetricValueFormatsNSWithoutScaling(t *testing.T) {
 	t.Parallel()
 
-	if got := formatMetricValue(metricNS, 1200); got != "1200ns/op" {
+	if got := formatMetricValue(metricNS, 1200); got != "1_200ns/op" {
 		t.Fatalf("unexpected boundary format: %q", got)
 	}
-	if got := formatMetricValue(metricNS, 12000); got != "12us/op" {
-		t.Fatalf("unexpected scaled format: %q", got)
+	if got := formatMetricValue(metricNS, 12000); got != "12_000ns/op" {
+		t.Fatalf("unexpected grouped format: %q", got)
 	}
-	if got := formatMetricValue(metricBytes, 1200); got != "1200B/op" {
+	if got := formatMetricValue(metricNS, 1234567); got != "1_234_567ns/op" {
+		t.Fatalf("unexpected large grouped format: %q", got)
+	}
+}
+
+func TestFormatMetricValueFormatsBytesWithoutScaling(t *testing.T) {
+	t.Parallel()
+
+	if got := formatMetricValue(metricBytes, 1200); got != "1_200B/op" {
 		t.Fatalf("unexpected byte boundary format: %q", got)
 	}
-	if got := formatMetricValue(metricBytes, 12000); got != "12KB/op" {
-		t.Fatalf("unexpected scaled byte format: %q", got)
+	if got := formatMetricValue(metricBytes, 12000); got != "12_000B/op" {
+		t.Fatalf("unexpected grouped byte format: %q", got)
+	}
+	if got := formatMetricValue(metricBytes, 1234567); got != "1_234_567B/op" {
+		t.Fatalf("unexpected large grouped byte format: %q", got)
+	}
+}
+
+func TestFormatMetricValueFormatsAllocsWithGrouping(t *testing.T) {
+	t.Parallel()
+
+	if got := formatMetricValue(metricAllocs, 12); got != "12 allocs/op" {
+		t.Fatalf("unexpected alloc format: %q", got)
+	}
+	if got := formatMetricValue(metricAllocs, 12000); got != "12_000 allocs/op" {
+		t.Fatalf("unexpected grouped alloc format: %q", got)
+	}
+	if got := formatMetricValue(metricAllocs, 1234.5); got != "1_234 allocs/op" {
+		t.Fatalf("unexpected grouped fractional alloc format: %q", got)
+	}
+}
+
+func TestRenderRowsKeepsColumnsAlignedWithGroupedNSValues(t *testing.T) {
+	t.Parallel()
+
+	rows := []outputRow{
+		{
+			Plain:   []string{"LongBench", "100", "1_234_567ns/op", "+10%", "2_345_678B/op", "+2%", "12_345 allocs/op", "+4"},
+			Colored: []string{"LongBench", "100", "1_234_567ns/op", "+10%", "2_345_678B/op", "+2%", "12_345 allocs/op", "+4"},
+		},
+		{
+			Plain:   []string{"Short", "10", "900ns/op", "-10%", "2B/op", "-3%", "1 allocs/op", "-5"},
+			Colored: []string{"Short", "10", "900ns/op", "-10%", "2B/op", "-3%", "1 allocs/op", "-5"},
+		},
+	}
+
+	lines := strings.Split(renderRows(rows), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("unexpected row count: %d", len(lines))
+	}
+
+	if got, want := strings.Index(lines[0], "+10%"), strings.Index(lines[1], "-10%"); got != want {
+		t.Fatalf("delta column is not aligned:\n%s\n%s", lines[0], lines[1])
+	}
+	if got, want := strings.Index(lines[0], "+2%"), strings.Index(lines[1], "-3%"); got != want {
+		t.Fatalf("byte delta column is not aligned:\n%s\n%s", lines[0], lines[1])
+	}
+	if got, want := strings.Index(lines[0], "+4"), strings.Index(lines[1], "-5"); got != want {
+		t.Fatalf("alloc delta column is not aligned:\n%s\n%s", lines[0], lines[1])
 	}
 }
 
@@ -177,7 +232,7 @@ func TestRunCLIRendersOnlyMeaningfulRows(t *testing.T) {
 	expectedFragments := []string{
 		"Bar-16",
 		"100",
-		"1550ns/op",
+		"1_550ns/op",
 		"-22.5%",
 		"204B/op",
 		"+2.25%",

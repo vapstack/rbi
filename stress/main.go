@@ -29,15 +29,25 @@ func main() {
 		}
 		fatalf("parse options: %v", err)
 	}
+	catalog, _, _, err = loadFilteredClassCatalog(opts.ClassFilter, opts.QueryFilter)
+	if err != nil {
+		fatalf("apply stress filters: %v", err)
+	}
+	if err := validateInitialWorkersAgainstCatalog(catalog, opts.InitialWorkers); err != nil {
+		fatalf("invalid worker overrides: %v", err)
+	}
 
 	log.Printf(
-		"opening DB file=%s report=%s headless=%t duration=%s trace_sample=%d trace_top=%d",
+		"opening DB file=%s report=%s headless=%t duration=%s trace_sample=%d trace_top=%d query_stats=%t class_filter=%v query_filter=%v",
 		opts.DBFile,
 		opts.ReportPath,
 		opts.Headless,
 		opts.Duration,
 		opts.TraceSampleEvery,
 		opts.TraceTopN,
+		opts.QueryStats,
+		opts.ClassFilter,
+		opts.QueryFilter,
 	)
 	traceCollector := newPlannerTraceCollector(catalog, opts.TraceSampleEvery, opts.TraceTopN)
 	handle, err := OpenBenchDB(DBConfig{
@@ -58,7 +68,13 @@ func main() {
 		len(handle.EmailSamples),
 	)
 
-	app := newApp(handle, catalog, opts.RefreshEvery, opts.TelemetryEvery, opts.ReportPath, traceCollector)
+	queryBreakdown := !opts.Headless || opts.QueryStats
+	queryLatency := !opts.Headless || opts.QueryStats
+	app := newApp(handle, catalog, opts.RefreshEvery, opts.TelemetryEvery, opts.ReportPath, opts.ClassFilter, opts.QueryFilter, queryBreakdown, queryLatency, traceCollector)
+	stopProfiling, err := startStressProfiling(opts)
+	if err != nil {
+		fatalf("start profiling: %v", err)
+	}
 	app.applyInitialWorkers(opts.InitialWorkers)
 
 	baseCtx, cancel := context.WithCancel(context.Background())
@@ -127,6 +143,14 @@ func main() {
 	}
 	app.stopAllWorkers()
 	app.waitWorkers()
+	if stopProfiling != nil {
+		if interrupted.Load() && renderer != nil && reader != nil {
+			renderShutdownStatus(app, renderer, reader, "Workers stopped; saving profiles...")
+		}
+		if err := stopProfiling(); err != nil {
+			fatalf("stop profiling: %v", err)
+		}
+	}
 	log.Printf("workers stopped; building report")
 
 	if interrupted.Load() && renderer != nil && reader != nil {
@@ -139,7 +163,7 @@ func main() {
 	if err := saveReportFile(opts.ReportPath, report); err != nil {
 		fatalf("save report: %v", err)
 	}
-	log.Printf("report saved to %s", opts.ReportPath)
+	log.Printf("report file written to %s; DB close still pending", opts.ReportPath)
 	if interrupted.Load() && renderer != nil && reader != nil {
 		renderShutdownStatus(app, renderer, reader, "Report saved; releasing OS memory...")
 	}
@@ -160,7 +184,7 @@ func main() {
 		fatalf("close db: %v", closeErr)
 	}
 
-	fmt.Fprintf(os.Stdout, "\nreport saved to %s\n", opts.ReportPath)
+	fmt.Fprintf(os.Stdout, "\nreport saved to %s\nDB closed %s\n", opts.ReportPath, handle.DBFile)
 }
 
 func renderShutdownStatus(app *app, renderer *renderer, reader *lineReader, message string) {

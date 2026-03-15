@@ -1,6 +1,9 @@
 package main
 
-import "fmt"
+import (
+	"fmt"
+	"strings"
+)
 
 type stressQuerySpec struct {
 	info StressQueryInfo
@@ -30,25 +33,29 @@ func DefaultClassDefs() map[string]ClassDef {
 	specs := defaultStressClassSpecs()
 	out := make(map[string]ClassDef, len(specs))
 	for _, spec := range specs {
-		run := spec.run
-		if len(spec.queries) > 0 {
-			variants := make([]weightedWorkload, 0, len(spec.queries))
-			for _, query := range spec.queries {
-				variants = append(variants, weightedWorkload{
-					Weight: query.info.Weight,
-					Run:    query.run,
-				})
-			}
-			run = runWeighted(nil, variants...)
-		}
-		out[spec.info.Name] = ClassDef{
-			Name:    spec.info.Name,
-			Role:    spec.info.Role,
-			Workers: spec.info.DefaultWorkers,
-			Run:     run,
-		}
+		out[spec.info.Name] = buildClassDef(spec)
 	}
 	return out
+}
+
+func buildClassDef(spec stressClassSpec) ClassDef {
+	run := spec.run
+	if len(spec.queries) > 0 {
+		variants := make([]weightedWorkload, 0, len(spec.queries))
+		for _, query := range spec.queries {
+			variants = append(variants, weightedWorkload{
+				Weight: query.info.Weight,
+				Run:    query.run,
+			})
+		}
+		run = runWeighted(nil, variants...)
+	}
+	return ClassDef{
+		Name:    spec.info.Name,
+		Role:    spec.info.Role,
+		Workers: spec.info.DefaultWorkers,
+		Run:     run,
+	}
 }
 
 func defaultStressClassSpecs() []stressClassSpec {
@@ -271,6 +278,107 @@ func validateClassCatalog() error {
 	for _, info := range catalog {
 		if _, ok := defs[info.Name]; !ok {
 			return fmt.Errorf("missing class def for %q", info.Name)
+		}
+	}
+	return nil
+}
+
+func filterStressClassSpecs(specs []stressClassSpec, classFilter, queryFilter []string) ([]stressClassSpec, error) {
+	classFilter = dedupeStrings(classFilter)
+	queryFilter = dedupeStrings(queryFilter)
+	if len(classFilter) == 0 && len(queryFilter) == 0 {
+		return specs, nil
+	}
+
+	if err := validateStressFilterNames(specs, classFilter, queryFilter); err != nil {
+		return nil, err
+	}
+
+	classSet := make(map[string]struct{}, len(classFilter))
+	for _, name := range classFilter {
+		classSet[strings.ToLower(name)] = struct{}{}
+	}
+	querySet := make(map[string]struct{}, len(queryFilter))
+	for _, name := range queryFilter {
+		querySet[strings.ToLower(name)] = struct{}{}
+	}
+
+	filtered := make([]stressClassSpec, 0, len(specs))
+	for _, spec := range specs {
+		if len(classSet) > 0 {
+			if _, ok := classSet[strings.ToLower(spec.info.Name)]; !ok {
+				if _, ok := classSet[strings.ToLower(spec.info.Alias)]; !ok {
+					continue
+				}
+			}
+		}
+		if len(querySet) == 0 {
+			filtered = append(filtered, spec)
+			continue
+		}
+		if len(spec.queries) == 0 {
+			continue
+		}
+		keptQueries := make([]stressQuerySpec, 0, len(spec.queries))
+		totalWeight := 0.0
+		for _, query := range spec.queries {
+			if _, ok := querySet[strings.ToLower(query.info.Name)]; !ok {
+				continue
+			}
+			keptQueries = append(keptQueries, query)
+			totalWeight += query.info.Weight
+		}
+		if len(keptQueries) == 0 {
+			continue
+		}
+		if totalWeight <= 0 {
+			totalWeight = float64(len(keptQueries))
+			for i := range keptQueries {
+				keptQueries[i].info.Weight = 1
+			}
+		}
+		infoQueries := make([]StressQueryInfo, 0, len(keptQueries))
+		for i := range keptQueries {
+			keptQueries[i].info.Weight = keptQueries[i].info.Weight / totalWeight
+			infoQueries = append(infoQueries, keptQueries[i].info)
+		}
+		spec.info.Queries = infoQueries
+		spec.queries = keptQueries
+		filtered = append(filtered, spec)
+	}
+
+	if len(filtered) == 0 {
+		return nil, fmt.Errorf("no classes remain after applying stress filters")
+	}
+	return filtered, nil
+}
+
+func validateStressFilterNames(specs []stressClassSpec, classFilter, queryFilter []string) error {
+	if len(classFilter) > 0 {
+		knownClasses := make(map[string]struct{}, len(specs)*2)
+		for _, spec := range specs {
+			knownClasses[strings.ToLower(spec.info.Name)] = struct{}{}
+			knownClasses[strings.ToLower(spec.info.Alias)] = struct{}{}
+		}
+		for _, name := range classFilter {
+			if _, ok := knownClasses[strings.ToLower(name)]; ok {
+				continue
+			}
+			return fmt.Errorf("unknown stress class filter %q", name)
+		}
+	}
+	if len(queryFilter) > 0 {
+		knownQueries := make(map[string]struct{}, 32)
+		for _, spec := range specs {
+			for _, query := range spec.queries {
+				knownQueries[strings.ToLower(query.info.Name)] = struct{}{}
+			}
+		}
+		for _, name := range queryFilter {
+			if _, ok := knownQueries[strings.ToLower(name)]; ok {
+				continue
+			}
+			return fmt.Errorf("unknown stress query filter %q", name)
 		}
 	}
 	return nil

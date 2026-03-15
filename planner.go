@@ -147,6 +147,113 @@ func (b *plannerORBranch) matches(idx uint64) bool {
 	return true
 }
 
+func (b *plannerORBranch) buildMatchChecks(dst []int) []int {
+	dst = dst[:0]
+	if b.alwaysTrue {
+		return dst
+	}
+	for i := range b.preds {
+		p := b.preds[i]
+		if p.covered || p.alwaysTrue {
+			continue
+		}
+		dst = append(dst, i)
+	}
+	sortActivePredicates(dst, b.preds)
+	return dst
+}
+
+func (b *plannerORBranch) buildBitmapFilterChecks(dst []int, checks []int) []int {
+	dst = dst[:0]
+	if b.alwaysTrue {
+		return dst
+	}
+	for _, i := range checks {
+		if b.preds[i].supportsBitmapFilter() {
+			dst = append(dst, i)
+		}
+	}
+	return dst
+}
+
+func (b *plannerORBranch) matchesChecks(idx uint64, checks []int) bool {
+	if b.alwaysTrue {
+		return true
+	}
+	for _, i := range checks {
+		p := b.preds[i]
+		if p.alwaysFalse || !p.hasContains() || !p.matches(idx) {
+			return false
+		}
+	}
+	return true
+}
+
+type plannerPredicateBucketMode uint8
+
+const (
+	plannerPredicateBucketFallback plannerPredicateBucketMode = iota
+	plannerPredicateBucketEmpty
+	plannerPredicateBucketAll
+	plannerPredicateBucketExact
+)
+
+const plannerPredicateBucketExactMinCard = 32
+
+func plannerFilterBitmapByChecks(preds []predicate, checks []int, src, work *roaring64.Bitmap) (plannerPredicateBucketMode, *roaring64.Bitmap, uint64) {
+	if src == nil || src.IsEmpty() {
+		return plannerPredicateBucketEmpty, nil, 0
+	}
+	card := src.GetCardinality()
+	if len(checks) == 0 {
+		return plannerPredicateBucketAll, src, card
+	}
+
+	skipBucket := false
+	fullBucket := true
+	for _, pi := range checks {
+		cnt, ok := preds[pi].countBucket(src)
+		if !ok {
+			fullBucket = false
+			continue
+		}
+		if cnt == 0 {
+			skipBucket = true
+			break
+		}
+		if cnt != card {
+			fullBucket = false
+		}
+	}
+	if skipBucket {
+		return plannerPredicateBucketEmpty, nil, card
+	}
+	if fullBucket {
+		return plannerPredicateBucketAll, src, card
+	}
+	// Tiny buckets are cheaper to scan row-by-row than to clone into a scratch
+	// roaring bitmap for exact filtering. This keeps the OR-order hot path from
+	// paying large GC/alloc overhead on the common many-small-buckets shape.
+	if card <= plannerPredicateBucketExactMinCard {
+		return plannerPredicateBucketFallback, nil, card
+	}
+	if work == nil {
+		return plannerPredicateBucketFallback, nil, card
+	}
+
+	work.Clear()
+	work.Or(src)
+	for _, pi := range checks {
+		if !preds[pi].applyToBitmap(work) {
+			return plannerPredicateBucketFallback, nil, card
+		}
+		if work.IsEmpty() {
+			return plannerPredicateBucketEmpty, nil, card
+		}
+	}
+	return plannerPredicateBucketExact, work, card
+}
+
 func (b *plannerORBranch) matchesFromLead(idx uint64) bool {
 	if b.alwaysTrue {
 		return true
@@ -474,7 +581,7 @@ func (db *DB[K, V]) estimateOROrderMergeRouteCost(q *qx.QX, branches plannerORBr
 		return plannerOROrderRouteCost{}, false
 	}
 
-	unionCard, sumCard, _, _ := branches.unionCards(universe)
+	unionCard, sumCard, branchCards, _ := branches.unionCards(universe)
 	if unionCard == 0 {
 		return plannerOROrderRouteCost{}, false
 	}
@@ -499,13 +606,16 @@ func (db *DB[K, V]) estimateOROrderMergeRouteCost(q *qx.QX, branches plannerORBr
 
 	hasPrefixNonOrder := branches.hasPrefixOnNonOrderField(orderField)
 	hasSelectiveLead := branches.hasSelectiveLead(need)
-
-	kWayRows := float64(expectedRows) * overlap
+	offsetShare := 0.0
 	if need > 0 && q.Offset > 0 {
-		offsetShare := float64(q.Offset) / float64(need)
+		offsetShare = float64(q.Offset) / float64(need)
 		if offsetShare > 1 {
 			offsetShare = 1
 		}
+	}
+
+	kWayRows := float64(expectedRows) * overlap
+	if offsetShare > 0 {
 		kWayRows *= 1.0 + offsetShare*0.75
 	}
 	if hasPrefixNonOrder {
@@ -518,7 +628,27 @@ func (db *DB[K, V]) estimateOROrderMergeRouteCost(q *qx.QX, branches plannerORBr
 	// K-way pays per-pop merge + predicate checks; fallback pays branch collection
 	// and order ranking of merged candidates.
 	kWayCost := kWayRows * (1.0 + avgChecks*0.55)
-	fallbackCost := (float64(sumCard) + float64(expectedRows)) * (1.0 + avgChecks*0.18)
+	fallbackCollectRows := 0.0
+	activeBranches := 0
+	for _, card := range branchCards {
+		if card == 0 {
+			continue
+		}
+		activeBranches++
+		probes := float64(estimateRowsForNeed(uint64(need), card, universe))
+		if probes < float64(need) {
+			probes = float64(need)
+		}
+		if offsetShare > 0 {
+			probes *= 1.0 + offsetShare*0.35
+		}
+		fallbackCollectRows += probes
+	}
+	if activeBranches == 0 {
+		activeBranches = len(branches)
+	}
+	fallbackCandidates := float64(min(sumCard, uint64(need*activeBranches)))
+	fallbackCost := fallbackCollectRows*(1.0+avgChecks*0.22) + fallbackCandidates*(1.0+overlap*0.08)
 
 	return plannerOROrderRouteCost{
 		kWay:              kWayCost,
@@ -875,6 +1005,23 @@ func (db *DB[K, V]) execPlanOROrderBasic(q *qx.QX, branches plannerORBranches, t
 		}
 	}
 
+	var (
+		branchChecks [plannerORBranchLimit][]int
+		checkBufs    [plannerORBranchLimit]*intSliceBuf
+	)
+	defer func() {
+		for i := range branches {
+			if checkBufs[i] != nil {
+				checkBufs[i].values = branchChecks[i]
+				releaseIntSliceBuf(checkBufs[i])
+			}
+		}
+	}()
+	for i := range branches {
+		checkBufs[i] = getIntSliceBuf(len(branches[i].preds))
+		branchChecks[i] = branches[i].buildMatchChecks(checkBufs[i].values)
+	}
+
 	skip := q.Offset
 	need := int(q.Limit)
 	out := make([]K, 0, need)
@@ -892,7 +1039,8 @@ func (db *DB[K, V]) execPlanOROrderBasic(q *qx.QX, branches plannerORBranches, t
 			return true
 		}
 		for i := 0; i < branchEvalN; i++ {
-			if branches[branchEvalOrder[i]].matches(idx) {
+			bi := branchEvalOrder[i]
+			if branches[bi].matchesChecks(idx, branchChecks[bi]) {
 				return true
 			}
 		}
@@ -990,7 +1138,7 @@ func (db *DB[K, V]) execPlanOROrderBasic(q *qx.QX, branches plannerORBranches, t
 			matchedCount := 0
 			for i := range branches {
 				branchMetrics[i].RowsExamined++
-				if branches[i].matches(idx) {
+				if branches[i].matchesChecks(idx, branchChecks[i]) {
 					branchMetrics[i].RowsEmitted++
 					matchedCount++
 				}
@@ -1147,7 +1295,7 @@ func (db *DB[K, V]) execPlanOROrderBasic(q *qx.QX, branches plannerORBranches, t
 		matchedCount := 0
 		for i := range branches {
 			branchMetrics[i].RowsExamined++
-			if branches[i].matches(idx) {
+			if branches[i].matchesChecks(idx, branchChecks[i]) {
 				branchMetrics[i].RowsEmitted++
 				matchedCount++
 			}
@@ -1640,9 +1788,13 @@ func (h *plannerOROrderMergeHeap) down(i0 int) {
 }
 
 type plannerOROrderBranchIter struct {
-	branch  *plannerORBranch
-	buckets []index
-	desc    bool
+	branch         *plannerORBranch
+	checks         []int
+	exactChecks    []int
+	buckets        []index
+	desc           bool
+	single         int
+	allChecksExact bool
 
 	startBucket int
 	endBucket   int
@@ -1650,6 +1802,8 @@ type plannerOROrderBranchIter struct {
 	nextBucket int
 	curBucket  int
 	curIter    roaringIter
+	curExact   bool
+	bucketWork *roaring64.Bitmap
 
 	onBucketVisit func(int)
 
@@ -1758,10 +1912,27 @@ func (it *plannerOROrderBranchIter) init() {
 	it.curBucket = -1
 }
 
+func (it *plannerOROrderBranchIter) close() {
+	if it.bucketWork != nil {
+		releaseRoaringBuf(it.bucketWork)
+		it.bucketWork = nil
+	}
+}
+
 func (it *plannerOROrderBranchIter) advance() bool {
 	it.has = false
 	for {
 		if it.curIter != nil {
+			if it.curExact {
+				if it.curIter.HasNext() {
+					it.cur = it.curIter.Next()
+					it.has = true
+					return true
+				}
+				it.curIter = nil
+				it.curExact = false
+				continue
+			}
 			for it.curIter.HasNext() {
 				idx := it.curIter.Next()
 				if it.totalExamined != nil {
@@ -1770,7 +1941,7 @@ func (it *plannerOROrderBranchIter) advance() bool {
 				if it.branchExamined != nil {
 					*it.branchExamined = *it.branchExamined + 1
 				}
-				if it.branch.matches(idx) {
+				if it.branch.matchesChecks(idx, it.checks) {
 					it.cur = idx
 					it.has = true
 					if it.branchEmitted != nil {
@@ -1788,34 +1959,93 @@ func (it *plannerOROrderBranchIter) advance() bool {
 			}
 			b := it.nextBucket
 			it.nextBucket--
-			bm := it.buckets[b].IDs
-			if bm.IsEmpty() {
+			bucket := it.buckets[b].IDs
+			if bucket.IsEmpty() {
 				continue
 			}
 			if it.onBucketVisit != nil {
 				it.onBucketVisit(b)
 			}
 			it.curBucket = b
-			if bm.Cardinality() == 1 {
-				idx, _ := bm.Minimum()
+			if bucket.isSingleton() {
+				idx := bucket.single
 				if it.totalExamined != nil {
 					*it.totalExamined = *it.totalExamined + 1
 				}
 				if it.branchExamined != nil {
 					*it.branchExamined = *it.branchExamined + 1
 				}
-				if it.branch.matches(idx) {
-					it.cur = idx
-					it.has = true
-					if it.branchEmitted != nil {
-						*it.branchEmitted = *it.branchEmitted + 1
-					}
-					return true
+				matched := false
+				if it.single >= 0 {
+					matched = it.branch.preds[it.single].matches(idx)
+				} else {
+					matched = it.branch.matchesChecks(idx, it.checks)
 				}
-				continue
+				if !matched {
+					continue
+				}
+				it.cur = idx
+				it.has = true
+				if it.branchEmitted != nil {
+					*it.branchEmitted = *it.branchEmitted + 1
+				}
+				return true
 			}
-			bmRO, _ := bm.ToBitmapOwned(nil)
-			it.curIter = bmRO.Iterator()
+			bm := bucket.bitmap()
+			if len(it.exactChecks) > 0 && it.bucketWork == nil {
+				it.bucketWork = getRoaringBuf()
+			}
+			if len(it.exactChecks) > 0 {
+				mode, exactBM, card := plannerFilterBitmapByChecks(it.branch.preds, it.exactChecks, bm, it.bucketWork)
+				switch mode {
+				case plannerPredicateBucketEmpty:
+					if it.totalExamined != nil {
+						*it.totalExamined = *it.totalExamined + card
+					}
+					if it.branchExamined != nil {
+						*it.branchExamined = *it.branchExamined + card
+					}
+					continue
+				case plannerPredicateBucketAll:
+					if it.allChecksExact {
+						if it.totalExamined != nil {
+							*it.totalExamined = *it.totalExamined + card
+						}
+						if it.branchExamined != nil {
+							*it.branchExamined = *it.branchExamined + card
+						}
+						if it.branchEmitted != nil {
+							*it.branchEmitted = *it.branchEmitted + card
+						}
+						it.curIter = exactBM.Iterator()
+						it.curExact = true
+						continue
+					}
+					it.curIter = exactBM.Iterator()
+					it.curExact = false
+					continue
+				case plannerPredicateBucketExact:
+					if it.allChecksExact {
+						if it.totalExamined != nil {
+							*it.totalExamined = *it.totalExamined + card
+						}
+						if it.branchExamined != nil {
+							*it.branchExamined = *it.branchExamined + card
+						}
+						if it.branchEmitted != nil {
+							*it.branchEmitted = *it.branchEmitted + exactBM.GetCardinality()
+						}
+						it.curIter = exactBM.Iterator()
+						it.curExact = true
+						continue
+					}
+					it.curIter = exactBM.Iterator()
+					it.curExact = false
+					continue
+				}
+			}
+			it.curIter = bm.Iterator()
+			it.curExact = false
 			continue
 		}
 
@@ -1824,34 +2054,93 @@ func (it *plannerOROrderBranchIter) advance() bool {
 		}
 		b := it.nextBucket
 		it.nextBucket++
-		bm := it.buckets[b].IDs
-		if bm.IsEmpty() {
+		bucket := it.buckets[b].IDs
+		if bucket.IsEmpty() {
 			continue
 		}
 		if it.onBucketVisit != nil {
 			it.onBucketVisit(b)
 		}
 		it.curBucket = b
-		if bm.Cardinality() == 1 {
-			idx, _ := bm.Minimum()
+		if bucket.isSingleton() {
+			idx := bucket.single
 			if it.totalExamined != nil {
 				*it.totalExamined = *it.totalExamined + 1
 			}
 			if it.branchExamined != nil {
 				*it.branchExamined = *it.branchExamined + 1
 			}
-			if it.branch.matches(idx) {
-				it.cur = idx
-				it.has = true
-				if it.branchEmitted != nil {
-					*it.branchEmitted = *it.branchEmitted + 1
-				}
-				return true
+			matched := false
+			if it.single >= 0 {
+				matched = it.branch.preds[it.single].matches(idx)
+			} else {
+				matched = it.branch.matchesChecks(idx, it.checks)
 			}
-			continue
+			if !matched {
+				continue
+			}
+			it.cur = idx
+			it.has = true
+			if it.branchEmitted != nil {
+				*it.branchEmitted = *it.branchEmitted + 1
+			}
+			return true
 		}
-		bmRO, _ := bm.ToBitmapOwned(nil)
-		it.curIter = bmRO.Iterator()
+		bm := bucket.bitmap()
+		if len(it.exactChecks) > 0 && it.bucketWork == nil {
+			it.bucketWork = getRoaringBuf()
+		}
+		if len(it.exactChecks) > 0 {
+			mode, exactBM, card := plannerFilterBitmapByChecks(it.branch.preds, it.exactChecks, bm, it.bucketWork)
+			switch mode {
+			case plannerPredicateBucketEmpty:
+				if it.totalExamined != nil {
+					*it.totalExamined = *it.totalExamined + card
+				}
+				if it.branchExamined != nil {
+					*it.branchExamined = *it.branchExamined + card
+				}
+				continue
+			case plannerPredicateBucketAll:
+				if it.allChecksExact {
+					if it.totalExamined != nil {
+						*it.totalExamined = *it.totalExamined + card
+					}
+					if it.branchExamined != nil {
+						*it.branchExamined = *it.branchExamined + card
+					}
+					if it.branchEmitted != nil {
+						*it.branchEmitted = *it.branchEmitted + card
+					}
+					it.curIter = exactBM.Iterator()
+					it.curExact = true
+					continue
+				}
+				it.curIter = exactBM.Iterator()
+				it.curExact = false
+				continue
+			case plannerPredicateBucketExact:
+				if it.allChecksExact {
+					if it.totalExamined != nil {
+						*it.totalExamined = *it.totalExamined + card
+					}
+					if it.branchExamined != nil {
+						*it.branchExamined = *it.branchExamined + card
+					}
+					if it.branchEmitted != nil {
+						*it.branchEmitted = *it.branchEmitted + exactBM.GetCardinality()
+					}
+					it.curIter = exactBM.Iterator()
+					it.curExact = true
+					continue
+				}
+				it.curIter = exactBM.Iterator()
+				it.curExact = false
+				continue
+			}
+		}
+		it.curIter = bm.Iterator()
+		it.curExact = false
 	}
 }
 
@@ -1900,6 +2189,24 @@ func (db *DB[K, V]) execPlanOROrderKWay(q *qx.QX, branches plannerORBranches, tr
 		scanWidth     uint64
 		dedupe        uint64
 	)
+	var (
+		branchChecks      [plannerORBranchLimit][]int
+		branchExactChecks [plannerORBranchLimit][]int
+		checkBufs         [plannerORBranchLimit]*intSliceBuf
+		exactCheckBufs    [plannerORBranchLimit]*intSliceBuf
+	)
+	defer func() {
+		for i := range branches {
+			if checkBufs[i] != nil {
+				checkBufs[i].values = branchChecks[i]
+				releaseIntSliceBuf(checkBufs[i])
+			}
+			if exactCheckBufs[i] != nil {
+				exactCheckBufs[i].values = branchExactChecks[i]
+				releaseIntSliceBuf(exactCheckBufs[i])
+			}
+		}
+	}()
 	var examinedPtr *uint64
 	if trace != nil {
 		branchMetrics = make([]TraceORBranch, len(branches))
@@ -1959,6 +2266,11 @@ func (db *DB[K, V]) execPlanOROrderKWay(q *qx.QX, branches plannerORBranches, tr
 			releasePlannerOROrderMergeItemSliceBuf(mergeItemsBuf)
 		}()
 	}
+	defer func() {
+		for i := range iters {
+			iters[i].close()
+		}
+	}()
 
 	h := &plannerOROrderMergeHeap{
 		desc:  o.Desc,
@@ -1989,10 +2301,22 @@ func (db *DB[K, V]) execPlanOROrderKWay(q *qx.QX, branches plannerORBranches, tr
 			bePtr = &branchMetrics[i].RowsExamined
 			bmPtr = &branchMetrics[i].RowsEmitted
 		}
+		checkBufs[i] = getIntSliceBuf(len(branches[i].preds))
+		branchChecks[i] = branches[i].buildMatchChecks(checkBufs[i].values)
+		exactCheckBufs[i] = getIntSliceBuf(len(branchChecks[i]))
+		branchExactChecks[i] = branches[i].buildBitmapFilterChecks(exactCheckBufs[i].values, branchChecks[i])
+		singleCheck := -1
+		if len(branchChecks[i]) == 1 {
+			singleCheck = branchChecks[i][0]
+		}
 		iters[i] = plannerOROrderBranchIter{
 			branch:         &branches[i],
+			checks:         branchChecks[i],
+			exactChecks:    branchExactChecks[i],
 			buckets:        s,
 			desc:           o.Desc,
+			single:         singleCheck,
+			allChecksExact: len(branchChecks[i]) > 0 && len(branchExactChecks[i]) == len(branchChecks[i]),
 			startBucket:    branchStart,
 			endBucket:      branchEnd,
 			onBucketVisit:  markBucketVisited,
@@ -2400,10 +2724,67 @@ func (db *DB[K, V]) collectOROrderFallbackBranchCandidates(
 		return 0, 0, 0, true
 	}
 
+	checksBuf := getIntSliceBuf(len(branch.preds))
+	checks := branch.buildMatchChecks(checksBuf.values)
+	defer func() {
+		checksBuf.values = checks
+		releaseIntSliceBuf(checksBuf)
+	}()
+	exactChecksBuf := getIntSliceBuf(len(checks))
+	exactChecks := branch.buildBitmapFilterChecks(exactChecksBuf.values, checks)
+	defer func() {
+		exactChecksBuf.values = exactChecks
+		releaseIntSliceBuf(exactChecksBuf)
+	}()
+	singleCheck := -1
+	if len(checks) == 1 {
+		singleCheck = checks[0]
+	}
+	var bucketWork *roaring64.Bitmap
+	if len(exactChecks) > 0 {
+		bucketWork = getRoaringBuf()
+		defer releaseRoaringBuf(bucketWork)
+	}
+	allChecksExact := len(checks) > 0 && len(exactChecks) == len(checks)
 	limit := uint64(branchLimit)
-	emit := func(idx uint64) bool {
+	var emit func(uint64) bool
+
+	emitBitmapNoChecks := func(bm *roaring64.Bitmap, card uint64) bool {
+		examined += card
+		stop := false
+		it := bm.Iterator()
+		for it.HasNext() {
+			idx := it.Next()
+			emitted++
+			if !dst.CheckedAdd(idx) {
+				dedupe++
+			}
+			if emitted >= limit {
+				stop = true
+				break
+			}
+		}
+		return stop
+	}
+
+	emitBitmapChecked := func(bm *roaring64.Bitmap) bool {
+		stop := false
+		it := bm.Iterator()
+		for it.HasNext() {
+			if emit(it.Next()) {
+				stop = true
+				break
+			}
+		}
+		return stop
+	}
+	emit = func(idx uint64) bool {
 		examined++
-		if !branch.matches(idx) {
+		if singleCheck >= 0 {
+			if !branch.preds[singleCheck].matches(idx) {
+				return false
+			}
+		} else if !branch.matchesChecks(idx, checks) {
 			return false
 		}
 		emitted++
@@ -2415,18 +2796,38 @@ func (db *DB[K, V]) collectOROrderFallbackBranchCandidates(
 
 	if !order.Desc {
 		for i := start; i < end; i++ {
-			bm := s[i].IDs
-			if bm.IsEmpty() {
+			bucket := s[i].IDs
+			if bucket.IsEmpty() {
 				continue
 			}
-			if bm.isSingleton() {
-				if emit(bm.single) {
+			if bucket.isSingleton() {
+				if emit(bucket.single) {
 					return emitted, examined, dedupe, true
 				}
 				continue
 			}
+			bm := bucket.bitmap()
+			if len(exactChecks) > 0 {
+				mode, exactBM, card := plannerFilterBitmapByChecks(branch.preds, exactChecks, bm, bucketWork)
+				switch mode {
+				case plannerPredicateBucketEmpty:
+					examined += card
+					continue
+				case plannerPredicateBucketAll, plannerPredicateBucketExact:
+					if allChecksExact {
+						if emitBitmapNoChecks(exactBM, card) {
+							return emitted, examined, dedupe, true
+						}
+						continue
+					}
+					if emitBitmapChecked(exactBM) {
+						return emitted, examined, dedupe, true
+					}
+					continue
+				}
+			}
 			stop := false
-			bm.ForEach(func(idx uint64) bool {
+			bucket.ForEach(func(idx uint64) bool {
 				if emit(idx) {
 					stop = true
 					return false
@@ -2441,15 +2842,35 @@ func (db *DB[K, V]) collectOROrderFallbackBranchCandidates(
 	}
 
 	for i := end - 1; i >= start; i-- {
-		bm := s[i].IDs
-		if !bm.IsEmpty() {
-			if bm.isSingleton() {
-				if emit(bm.single) {
+		bucket := s[i].IDs
+		if !bucket.IsEmpty() {
+			if bucket.isSingleton() {
+				if emit(bucket.single) {
 					return emitted, examined, dedupe, true
 				}
 			} else {
+				bm := bucket.bitmap()
+				if len(exactChecks) > 0 {
+					mode, exactBM, card := plannerFilterBitmapByChecks(branch.preds, exactChecks, bm, bucketWork)
+					switch mode {
+					case plannerPredicateBucketEmpty:
+						examined += card
+						continue
+					case plannerPredicateBucketAll, plannerPredicateBucketExact:
+						if allChecksExact {
+							if emitBitmapNoChecks(exactBM, card) {
+								return emitted, examined, dedupe, true
+							}
+							continue
+						}
+						if emitBitmapChecked(exactBM) {
+							return emitted, examined, dedupe, true
+						}
+						continue
+					}
+				}
 				stop := false
-				bm.ForEach(func(idx uint64) bool {
+				bucket.ForEach(func(idx uint64) bool {
 					if emit(idx) {
 						stop = true
 						return false

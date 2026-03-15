@@ -292,6 +292,11 @@ func (db *DB[K, V]) tryQueryOrderBasicWithLimit(q *qx.QX, trace *queryTrace) ([]
 		return nil, true, nil
 	}
 
+	if len(baseOps) == 0 {
+		out, _ := db.scanOrderLimitWithPredicates(q, ov, br, order.Desc, nil, trace)
+		return out, true, nil
+	}
+
 	skip := q.Offset
 	need := q.Limit
 
@@ -467,6 +472,202 @@ func (db *DB[K, V]) tryQueryOrderBasicWithLimit(q *qx.QX, trace *queryTrace) ([]
 	trace.addOrderScanWidth(scanWidth)
 	trace.setEarlyStopReason("input_exhausted")
 	return cursor.out, true, nil
+}
+
+func (db *DB[K, V]) scanOrderLimitWithPredicates(q *qx.QX, ov fieldOverlay, br overlayRange, desc bool, preds []predicate, trace *queryTrace) ([]K, bool) {
+	activeBuf := getIntSliceBuf(len(preds))
+	active := activeBuf.values
+	defer func() {
+		activeBuf.values = active
+		releaseIntSliceBuf(activeBuf)
+	}()
+
+	for i := range preds {
+		p := preds[i]
+		if p.alwaysFalse {
+			if trace != nil {
+				trace.setEarlyStopReason("empty_predicate")
+			}
+			return nil, true
+		}
+		if p.covered || p.alwaysTrue {
+			continue
+		}
+		if !p.hasContains() {
+			return nil, false
+		}
+		active = append(active, i)
+	}
+	sortActivePredicates(active, preds)
+
+	out := make([]K, 0, q.Limit)
+	cursor := db.newQueryCursor(out, q.Offset, q.Limit, false, nil)
+
+	var (
+		examined  uint64
+		scanWidth uint64
+	)
+
+	var scratch *roaring64.Bitmap
+	if ov.delta != nil || len(active) > 0 {
+		scratch = getRoaringBuf()
+		defer releaseRoaringBuf(scratch)
+	}
+
+	emitCandidate := func(idx uint64) bool {
+		examined++
+		for _, pi := range active {
+			if !preds[pi].matches(idx) {
+				return false
+			}
+		}
+		return cursor.emit(idx)
+	}
+
+	emitBitmap := func(bm *roaring64.Bitmap, card uint64) bool {
+		examined += card
+		return cursor.emitBitmap(bm)
+	}
+
+	tryBucketBitmap := func(bm *roaring64.Bitmap) (handled bool, stop bool) {
+		if bm == nil || bm.IsEmpty() {
+			return true, false
+		}
+		card := bm.GetCardinality()
+		if len(active) == 0 {
+			return true, emitBitmap(bm, card)
+		}
+
+		skipBucket := false
+		fullBucket := true
+		for _, pi := range active {
+			bucketCnt, ok := preds[pi].countBucket(bm)
+			if !ok {
+				fullBucket = false
+				continue
+			}
+			if bucketCnt == 0 {
+				skipBucket = true
+				break
+			}
+			if bucketCnt != card {
+				fullBucket = false
+			}
+		}
+		if skipBucket {
+			examined += card
+			return true, false
+		}
+		if fullBucket {
+			return true, emitBitmap(bm, card)
+		}
+		return false, false
+	}
+
+	emitPosting := func(ids postingList) bool {
+		if ids.IsEmpty() {
+			return false
+		}
+		if ids.isSingleton() {
+			return emitCandidate(ids.single)
+		}
+
+		if bm := ids.bitmap(); bm != nil {
+			if handled, stop := tryBucketBitmap(bm); handled {
+				return stop
+			}
+		}
+
+		it := ids.Iter()
+		for it.HasNext() {
+			if emitCandidate(it.Next()) {
+				return true
+			}
+		}
+		return false
+	}
+
+	keyCur := ov.newCursor(br, desc)
+	if ov.delta == nil {
+		for {
+			_, ids, _, ok := keyCur.next()
+			if !ok {
+				break
+			}
+			if !ids.IsEmpty() {
+				scanWidth++
+			}
+			if emitPosting(ids) {
+				if trace != nil {
+					trace.addExamined(examined)
+					trace.addOrderScanWidth(scanWidth)
+					trace.setEarlyStopReason("limit_reached")
+				}
+				return cursor.out, true
+			}
+		}
+		if trace != nil {
+			trace.addExamined(examined)
+			trace.addOrderScanWidth(scanWidth)
+			trace.setEarlyStopReason("input_exhausted")
+		}
+		return cursor.out, true
+	}
+
+	for {
+		_, baseBM, de, ok := keyCur.next()
+		if !ok {
+			break
+		}
+		bm, owned := composePostingOwned(baseBM, de, scratch)
+		if bm == nil || bm.IsEmpty() {
+			if owned && bm != nil && bm != scratch {
+				releaseRoaringBuf(bm)
+			}
+			continue
+		}
+		scanWidth++
+
+		if handled, stop := tryBucketBitmap(bm); handled {
+			if owned && bm != scratch {
+				releaseRoaringBuf(bm)
+			}
+			if stop {
+				if trace != nil {
+					trace.addExamined(examined)
+					trace.addOrderScanWidth(scanWidth)
+					trace.setEarlyStopReason("limit_reached")
+				}
+				return cursor.out, true
+			}
+			continue
+		}
+
+		it := bm.Iterator()
+		for it.HasNext() {
+			if emitCandidate(it.Next()) {
+				if owned && bm != scratch {
+					releaseRoaringBuf(bm)
+				}
+				if trace != nil {
+					trace.addExamined(examined)
+					trace.addOrderScanWidth(scanWidth)
+					trace.setEarlyStopReason("limit_reached")
+				}
+				return cursor.out, true
+			}
+		}
+		if owned && bm != scratch {
+			releaseRoaringBuf(bm)
+		}
+	}
+
+	if trace != nil {
+		trace.addExamined(examined)
+		trace.addOrderScanWidth(scanWidth)
+		trace.setEarlyStopReason("input_exhausted")
+	}
+	return cursor.out, true
 }
 
 func (db *DB[K, V]) tryQueryOrderPrefixWithLimit(q *qx.QX, trace *queryTrace) ([]K, bool, error) {

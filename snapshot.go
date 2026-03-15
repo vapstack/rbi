@@ -181,6 +181,8 @@ func (db *DB[K, V]) publishPreparedSnapshotWithAccumDeltaNoLock(txID uint64, del
 	nextLenLayer := appendDeltaLayer(prevLenLayer, delta.lenDelta)
 	nextIndexCount := appendDeltaLayerFieldCount(prev.indexDeltaCount(), delta.indexDelta, len(baseIndex))
 	nextLenCount := appendDeltaLayerFieldCount(prev.lenDeltaCount(), delta.lenDelta, len(baseLenIndex))
+	nextIndexLayer, nextIndexCount = capPublishedDeltaLayerDepth(nextIndexLayer, nextIndexCount, db.options.SnapshotDeltaLayerMaxDepth)
+	nextLenLayer, nextLenCount = capPublishedDeltaLayerDepth(nextLenLayer, nextLenCount, db.options.SnapshotDeltaLayerMaxDepth)
 
 	nextUniverseAdd, nextUniverseRem := mergeUniverseDelta(nil, nil, delta.universeAdd, delta.universeRem)
 	if prev != nil {
@@ -249,6 +251,8 @@ func (db *DB[K, V]) publishSnapshotWithAccumDeltaNoLock(txID uint64, indexChange
 	nextLenLayer := appendDeltaLayer(prevLenLayer, lenDelta)
 	nextIndexCount := appendDeltaLayerFieldCount(prev.indexDeltaCount(), indexDelta, len(baseIndex))
 	nextLenCount := appendDeltaLayerFieldCount(prev.lenDeltaCount(), lenDelta, len(baseLenIndex))
+	nextIndexLayer, nextIndexCount = capPublishedDeltaLayerDepth(nextIndexLayer, nextIndexCount, db.options.SnapshotDeltaLayerMaxDepth)
+	nextLenLayer, nextLenCount = capPublishedDeltaLayerDepth(nextLenLayer, nextLenCount, db.options.SnapshotDeltaLayerMaxDepth)
 
 	nextUniverseAdd, nextUniverseRem := mergeUniverseDelta(nil, nil, add, rem)
 	if prev != nil {
@@ -311,6 +315,13 @@ func appendDeltaLayerFieldCount(prevCount int, delta map[string]*fieldIndexDelta
 		count = capFields
 	}
 	return count
+}
+
+func capPublishedDeltaLayerDepth(layer *fieldDeltaLayer, fieldCount int, maxDepth int) (*fieldDeltaLayer, int) {
+	if layer == nil || maxDepth <= 0 || layer.depth <= maxDepth {
+		return layer, fieldCount
+	}
+	return maybeFlattenDeltaLayerByDepth(layer, fieldCount, maxDepth)
 }
 
 func (db *DB[K, V]) startSnapshotCompactor() {

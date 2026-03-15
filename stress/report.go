@@ -19,8 +19,10 @@ type stressReport struct {
 	FinishedAt  string  `json:"finished_at"`
 	DurationSec float64 `json:"duration_sec"`
 
-	RefreshEverySec   float64 `json:"refresh_every_sec"`
-	TelemetryEverySec float64 `json:"telemetry_every_sec"`
+	RefreshEverySec   float64  `json:"refresh_every_sec"`
+	TelemetryEverySec float64  `json:"telemetry_every_sec"`
+	ClassFilter       []string `json:"class_filter,omitempty"`
+	QueryFilter       []string `json:"query_filter,omitempty"`
 
 	RecordsAtStart uint64 `json:"records_at_start"`
 	RecordsAtEnd   uint64 `json:"records_at_end"`
