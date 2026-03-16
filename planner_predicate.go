@@ -3352,7 +3352,90 @@ func (db *DB[K, V]) execPlanOrderedBasicFallback(q *qx.QX, preds []predicate, ac
 	return db.scanOrderedBaseSliceWithPredicates(q, preds, active, start, end, s, q.Order[0].Desc, trace)
 }
 
+func (db *DB[K, V]) scanOrderedBaseSliceNoPredicates(q *qx.QX, start, end int, s []index, desc bool, trace *queryTrace) []K {
+	out := make([]K, 0, int(q.Limit))
+	cursor := db.newQueryCursor(out, q.Offset, q.Limit, false, nil)
+
+	var scanWidth uint64
+
+	emitMatched := func(idx uint64) bool {
+		if trace != nil {
+			trace.addMatched(1)
+		}
+		return cursor.emit(idx)
+	}
+
+	emitMatchedBitmap := func(bm *roaring64.Bitmap, card uint64) bool {
+		if trace != nil {
+			trace.addMatched(card)
+		}
+		if cursor.skip >= card {
+			cursor.skip -= card
+			return false
+		}
+		return cursor.emitBitmap(bm)
+	}
+
+	emitBucket := func(bucket postingList) bool {
+		if bucket.IsEmpty() {
+			return false
+		}
+		scanWidth++
+		card := bucket.Cardinality()
+		if trace != nil {
+			trace.addExamined(card)
+		}
+		if bucket.isSingleton() {
+			return emitMatched(bucket.single)
+		}
+		if bm := bucket.bitmap(); bm != nil {
+			return emitMatchedBitmap(bm, card)
+		}
+		stop := false
+		bucket.ForEach(func(idx uint64) bool {
+			if emitMatched(idx) {
+				stop = true
+				return false
+			}
+			return true
+		})
+		return stop
+	}
+
+	if !desc {
+		for i := start; i < end; i++ {
+			if emitBucket(s[i].IDs) {
+				break
+			}
+		}
+	} else {
+		for i := end - 1; i >= start; i-- {
+			if emitBucket(s[i].IDs) {
+				break
+			}
+			if i == start {
+				break
+			}
+		}
+	}
+
+	if trace != nil {
+		trace.addOrderScanWidth(scanWidth)
+		if cursor.need == 0 {
+			trace.setEarlyStopReason("limit_reached")
+		} else {
+			trace.setEarlyStopReason("order_index_exhausted")
+		}
+	}
+
+	return cursor.out
+}
+
 func (db *DB[K, V]) scanOrderedBaseSliceWithPredicates(q *qx.QX, preds []predicate, active []int, start, end int, s []index, desc bool, trace *queryTrace) []K {
+	if len(active) == 0 {
+		return db.scanOrderedBaseSliceNoPredicates(q, start, end, s, desc, trace)
+	}
+
 	out := make([]K, 0, int(q.Limit))
 	cursor := db.newQueryCursor(out, q.Offset, q.Limit, false, nil)
 

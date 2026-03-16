@@ -1438,6 +1438,115 @@ func TestOrderedDeltaDeepOffset_SkipsUnaffectedSingletonCompose(t *testing.T) {
 	}
 }
 
+func TestOrderedDeltaCoveredOnly_UsesNoPredicateOverlayScan(t *testing.T) {
+	var (
+		mu     sync.Mutex
+		events []TraceEvent
+	)
+
+	sink := func(ev TraceEvent) {
+		mu.Lock()
+		events = append(events, ev)
+		mu.Unlock()
+	}
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test_ordered_delta_covered_only.db")
+	db, raw := openBoltAndNew[uint64, orderedDeltaRec](t, path, Options{
+		AnalyzeInterval:                         -1,
+		TraceSink:                               sink,
+		TraceSampleEvery:                        1,
+		SnapshotCompactorRequestEveryNWrites:    1 << 30,
+		SnapshotCompactorIdleInterval:           -1,
+		SnapshotDeltaLayerMaxDepth:              1 << 30,
+		SnapshotMaterializedPredCacheMaxEntries: -1,
+	})
+	t.Cleanup(func() {
+		_ = db.Close()
+		_ = raw.Close()
+	})
+
+	db.DisableSync()
+	defer db.EnableSync()
+
+	ids := make([]uint64, 256)
+	vals := make([]*orderedDeltaRec, 256)
+	for i := range ids {
+		ids[i] = uint64(i + 1)
+		vals[i] = &orderedDeltaRec{
+			Age:    i,
+			Score:  float64(i),
+			Active: true,
+		}
+	}
+	if err := db.BatchSet(ids, vals); err != nil {
+		t.Fatalf("BatchSet(seed): %v", err)
+	}
+	if err := db.RebuildIndex(); err != nil {
+		t.Fatalf("RebuildIndex: %v", err)
+	}
+	if err := db.Patch(250, []Field{{Name: "age", Value: 1000}}); err != nil {
+		t.Fatalf("Patch(age): %v", err)
+	}
+	if db.getSnapshot().fieldDelta("age") == nil {
+		t.Fatalf("expected active age delta")
+	}
+
+	q := normalizeQuery(qx.Query(
+		qx.GTE("age", 100),
+		qx.LT("age", 180),
+	).By("age", qx.ASC).Skip(5).Max(10))
+
+	leaves, ok := collectAndLeaves(q.Expr)
+	if !ok {
+		t.Fatalf("collectAndLeaves: ok=false")
+	}
+	preds, ok := db.buildPredicatesOrderedWithMode(leaves, "age", false, 0)
+	if !ok {
+		t.Fatalf("buildPredicatesOrderedWithMode: ok=false")
+	}
+	defer releasePredicates(preds)
+
+	active := 0
+	for i := range preds {
+		if !preds[i].covered && !preds[i].alwaysTrue {
+			active++
+		}
+	}
+	if active != 0 {
+		t.Fatalf("expected all ordered predicates to be covered, got active=%d", active)
+	}
+
+	tr := db.beginTrace(q)
+	if tr == nil {
+		t.Fatalf("expected trace to be enabled")
+	}
+	tr.setPlan(PlanOrdered)
+	got, ok := db.execPlanOrderedBasic(q, preds, tr)
+	if !ok {
+		t.Fatalf("execPlanOrderedBasic: ok=false")
+	}
+	tr.finish(uint64(len(got)), nil)
+
+	want := []uint64{106, 107, 108, 109, 110, 111, 112, 113, 114, 115}
+	if !slices.Equal(got, want) {
+		t.Fatalf("ordered covered-only mismatch:\ngot=%v\nwant=%v", got, want)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(events) == 0 {
+		t.Fatalf("expected trace event")
+	}
+	ev := events[len(events)-1]
+	if ev.BitmapMaterializations != 0 {
+		t.Fatalf("expected covered-only overlay scan to avoid bitmap compose, trace=%+v", ev)
+	}
+	if ev.RowsMatched == 0 || ev.OrderIndexScanWidth == 0 {
+		t.Fatalf("expected trace counters to be populated, trace=%+v", ev)
+	}
+}
+
 func TestPlannerRouting_PrefersExecutionForPrefixOrderLimit(t *testing.T) {
 	var (
 		mu     sync.Mutex

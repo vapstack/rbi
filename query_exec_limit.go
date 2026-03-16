@@ -1010,7 +1010,18 @@ type postingUnionIter struct {
 	has   bool
 }
 
+type postingSmallUnionIter struct {
+	posts []postingList
+	i     int
+	curIt roaringIter
+	next  uint64
+	has   bool
+}
+
 func newPostingUnionIter(posts []postingList) roaringIter {
+	if len(posts) > 1 && len(posts) <= 3 {
+		return &postingSmallUnionIter{posts: posts}
+	}
 	capHint := len(posts) * 16
 	if capHint < 64 {
 		capHint = 64
@@ -1022,6 +1033,50 @@ func newPostingUnionIter(posts []postingList) roaringIter {
 		posts: posts,
 		seen:  newU64Set(capHint),
 	}
+}
+
+func (u *postingSmallUnionIter) HasNext() bool {
+	if u.has {
+		return true
+	}
+	for {
+		if u.curIt != nil {
+			for u.curIt.HasNext() {
+				v := u.curIt.Next()
+				dup := false
+				for j := 0; j < u.i-1; j++ {
+					if u.posts[j].Contains(v) {
+						dup = true
+						break
+					}
+				}
+				if dup {
+					continue
+				}
+				u.next = v
+				u.has = true
+				return true
+			}
+			u.curIt = nil
+		}
+		if u.i >= len(u.posts) {
+			return false
+		}
+		p := u.posts[u.i]
+		u.i++
+		if p.IsEmpty() {
+			continue
+		}
+		u.curIt = p.Iter()
+	}
+}
+
+func (u *postingSmallUnionIter) Next() uint64 {
+	if !u.HasNext() {
+		return 0
+	}
+	u.has = false
+	return u.next
 }
 
 func (u *postingUnionIter) HasNext() bool {

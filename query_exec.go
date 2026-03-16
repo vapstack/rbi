@@ -174,6 +174,45 @@ func shouldTryOrderedPredicateExecutionBaseOps(orderField string, baseOps []qx.E
 	return false
 }
 
+func (db *DB[K, V]) shouldSkipOrderBasicLimitForHighCardNonOrderPrefix(orderField string, baseOps []qx.Expr) bool {
+	if len(baseOps) == 0 {
+		return false
+	}
+
+	snap := db.planner.stats.Load()
+	universe := snap.universeOr(db.snapshotUniverseCardinality())
+	if universe == 0 {
+		return false
+	}
+
+	ov := db.fieldOverlay(orderField)
+	if !ov.hasData() {
+		return false
+	}
+
+	var orderDistinct uint64
+	if ov.delta != nil {
+		orderDistinct = uint64(overlayApproxDistinctTotalCount(ov))
+	} else {
+		orderDistinct = uint64(len(ov.base))
+	}
+	if orderDistinct == 0 || orderDistinct*2 < universe {
+		return false
+	}
+
+	for _, op := range baseOps {
+		if op.Not || op.Field == "" || op.Field == orderField || op.Op != qx.OpPREFIX {
+			continue
+		}
+		sel, _, _, _, ok := db.estimateLeafOrderCost(op, snap, universe, orderField, orderDistinct > 0)
+		if ok && sel <= 0.10 {
+			return true
+		}
+	}
+
+	return false
+}
+
 func (db *DB[K, V]) tryQueryOrderBasicWithLimit(q *qx.QX, trace *queryTrace) ([]K, bool, error) {
 
 	if len(q.Order) != 1 || q.Limit == 0 {
@@ -259,6 +298,12 @@ func (db *DB[K, V]) tryQueryOrderBasicWithLimit(q *qx.QX, trace *queryTrace) ([]
 	br := ov.rangeForBounds(rb)
 	if br.baseStart >= br.baseEnd && br.deltaStart >= br.deltaEnd {
 		return nil, true, nil
+	}
+
+	if !rb.hasLo && !rb.hasHi && !rb.hasPrefix &&
+		q.Offset == 0 &&
+		db.shouldSkipOrderBasicLimitForHighCardNonOrderPrefix(f, baseOps) {
+		return nil, false, nil
 	}
 
 	if len(baseOps) > 0 && shouldTryOrderedPredicateExecutionBaseOps(f, baseOps) {
@@ -487,6 +532,121 @@ func (db *DB[K, V]) tryQueryOrderBasicWithLimit(q *qx.QX, trace *queryTrace) ([]
 	return cursor.out, true, nil
 }
 
+func (db *DB[K, V]) scanOrderLimitNoPredicates(q *qx.QX, ov fieldOverlay, br overlayRange, desc bool, trace *queryTrace) ([]K, bool) {
+	out := make([]K, 0, q.Limit)
+	cursor := db.newQueryCursor(out, q.Offset, q.Limit, false, nil)
+
+	var (
+		examined  uint64
+		scanWidth uint64
+	)
+
+	emitBitmap := func(bm *roaring64.Bitmap, card uint64) bool {
+		examined += card
+		if trace != nil {
+			trace.addMatched(card)
+		}
+		if cursor.skip >= card {
+			cursor.skip -= card
+			return false
+		}
+		return cursor.emitBitmap(bm)
+	}
+
+	emitPosting := func(ids postingList) bool {
+		if ids.IsEmpty() {
+			return false
+		}
+		if ids.isSingleton() {
+			examined++
+			if trace != nil {
+				trace.addMatched(1)
+			}
+			return cursor.emit(ids.single)
+		}
+		if bm := ids.bitmap(); bm != nil {
+			return emitBitmap(bm, ids.Cardinality())
+		}
+		stop := false
+		ids.ForEach(func(idx uint64) bool {
+			examined++
+			if trace != nil {
+				trace.addMatched(1)
+			}
+			if cursor.emit(idx) {
+				stop = true
+				return false
+			}
+			return true
+		})
+		return stop
+	}
+
+	keyCur := ov.newCursor(br, desc)
+	if ov.delta == nil {
+		for {
+			_, ids, _, ok := keyCur.next()
+			if !ok {
+				break
+			}
+			if ids.IsEmpty() {
+				continue
+			}
+			scanWidth++
+			if emitPosting(ids) {
+				if trace != nil {
+					trace.addExamined(examined)
+					trace.addOrderScanWidth(scanWidth)
+					trace.setEarlyStopReason("limit_reached")
+				}
+				return cursor.out, true
+			}
+		}
+		if trace != nil {
+			trace.addExamined(examined)
+			trace.addOrderScanWidth(scanWidth)
+			trace.setEarlyStopReason("input_exhausted")
+		}
+		return cursor.out, true
+	}
+
+	for {
+		_, baseBM, de, ok := keyCur.next()
+		if !ok {
+			break
+		}
+		ids, keep := composePostingRetained(baseBM, de)
+		if ids.IsEmpty() {
+			continue
+		}
+		scanWidth++
+		if keep != nil && trace != nil {
+			trace.addBitmapMaterialized(1)
+		}
+		if emitPosting(ids) {
+			if keep != nil {
+				releaseRoaringBuf(keep)
+			}
+			if trace != nil {
+				trace.addExamined(examined)
+				trace.addOrderScanWidth(scanWidth)
+				trace.setEarlyStopReason("limit_reached")
+			}
+			return cursor.out, true
+		}
+		if keep != nil {
+			releaseRoaringBuf(keep)
+		}
+	}
+
+	if trace != nil {
+		trace.addExamined(examined)
+		trace.addOrderScanWidth(scanWidth)
+		trace.setEarlyStopReason("input_exhausted")
+	}
+	return cursor.out, true
+}
+
 func (db *DB[K, V]) scanOrderLimitWithPredicates(q *qx.QX, ov fieldOverlay, br overlayRange, desc bool, preds []predicate, trace *queryTrace) ([]K, bool) {
 	activeBuf := getIntSliceBuf(len(preds))
 	active := activeBuf.values
@@ -510,6 +670,9 @@ func (db *DB[K, V]) scanOrderLimitWithPredicates(q *qx.QX, ov fieldOverlay, br o
 			return nil, false
 		}
 		active = append(active, i)
+	}
+	if len(active) == 0 {
+		return db.scanOrderLimitNoPredicates(q, ov, br, desc, trace)
 	}
 	sortActivePredicates(active, preds)
 

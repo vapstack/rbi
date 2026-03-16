@@ -19,7 +19,7 @@ const countPredBroadRangeComplementMaxCardCap = 131_072
 const countPredBroadRangeComplementFastProbeMin = 4_096
 const countPredBroadRangeComplementFastAvgPerBucketMax = 8
 const countPredBroadRangeComplementPostingMaxBuckets = predicatePostsAnyNotExactBitmapMaxTerms
-const countPredLeadResidualHasAnyExactMaxTerms = 2
+const countPredLeadResidualHasAnyExactMaxTerms = 3
 const countPredLeadResidualHasAnyExactMinCard = 65_536
 
 // Count evaluates the expression from the given query and returns the number of matching records.
@@ -154,8 +154,8 @@ type countLeadResidualExactFilter struct {
 	bm  *roaring64.Bitmap
 }
 
-func shouldUseCountLeadResidualHasAnyExactFilter(p predicate, cacheEnabled bool) bool {
-	if cacheEnabled || p.kind != predicateKindPostsAny || p.expr.Not || p.expr.Op != qx.OpHASANY {
+func shouldUseCountLeadResidualHasAnyExactFilter(p predicate) bool {
+	if p.kind != predicateKindPostsAny || p.expr.Not || p.expr.Op != qx.OpHASANY {
 		return false
 	}
 	if len(p.posts) < 2 || len(p.posts) > countPredLeadResidualHasAnyExactMaxTerms {
@@ -191,13 +191,28 @@ func releaseCountLeadResidualExactFilters(filters []countLeadResidualExactFilter
 }
 
 func (db *DB[K, V]) buildCountLeadResidualExactFilters(preds []predicate, active []int) []countLeadResidualExactFilter {
-	snap := db.getSnapshot()
-	cacheEnabled := snap != nil && snap.materializedPredCacheLimit() > 0
-
-	filters := make([]countLeadResidualExactFilter, 0, len(active))
+	candidates := make([]int, 0, len(active))
 	for _, pi := range active {
 		p := preds[pi]
-		if !shouldUseCountLeadResidualHasAnyExactFilter(p, cacheEnabled) {
+		if shouldUseCountLeadResidualHasAnyExactFilter(p) {
+			candidates = append(candidates, pi)
+		}
+	}
+	return db.buildCountLeadResidualExactFiltersByCandidates(preds, candidates)
+}
+
+func (db *DB[K, V]) buildCountLeadResidualExactFiltersByCandidates(preds []predicate, candidates []int) []countLeadResidualExactFilter {
+	if len(candidates) == 0 {
+		return nil
+	}
+
+	filters := make([]countLeadResidualExactFilter, 0, len(candidates))
+	for _, pi := range candidates {
+		if pi < 0 || pi >= len(preds) {
+			continue
+		}
+		p := preds[pi]
+		if p.kind != predicateKindPostsAny || p.expr.Not || p.expr.Op != qx.OpHASANY || len(p.posts) == 0 {
 			continue
 		}
 		bm := db.materializeProbeUnion(p.posts)
@@ -210,6 +225,17 @@ func (db *DB[K, V]) buildCountLeadResidualExactFilters(preds []predicate, active
 		filters = append(filters, countLeadResidualExactFilter{idx: pi, bm: bm})
 	}
 	return filters
+}
+
+func (db *DB[K, V]) collectCountLeadResidualExactCandidates(preds []predicate, active []int) []int {
+	out := make([]int, 0, len(active))
+	for _, pi := range active {
+		p := preds[pi]
+		if shouldUseCountLeadResidualHasAnyExactFilter(p) {
+			out = append(out, pi)
+		}
+	}
+	return out
 }
 
 func countApplyLeadResidualExactFilters(src, work *roaring64.Bitmap, filters []countLeadResidualExactFilter) (*roaring64.Bitmap, bool) {
@@ -576,6 +602,17 @@ type countORBranch struct {
 
 type countORBranches []countORBranch
 
+func countPredicateLeadPostings(p predicate) ([]postingList, bool) {
+	switch {
+	case p.iterKind == predicateIterPosting && !p.posting.IsEmpty():
+		return []postingList{p.posting}, true
+	case p.kind == predicateKindPostsAny && p.iterKind == predicateIterPostsConcat && len(p.posts) >= 2:
+		return p.posts, true
+	default:
+		return nil, false
+	}
+}
+
 func releaseCountORBranches(branches countORBranches) {
 	for i := range branches {
 		releasePredicates(branches[i].preds)
@@ -587,13 +624,27 @@ func releaseCountORBranches(branches countORBranches) {
 	}
 }
 
-func (br countORBranch) checksMatch(idx uint64) bool {
+func (br countORBranch) buildBitmapFilterChecks(dst []int) []int {
+	dst = dst[:0]
 	for _, pi := range br.checks {
-		if !br.preds[pi].matches(idx) {
+		if br.preds[pi].supportsBitmapFilter() {
+			dst = append(dst, pi)
+		}
+	}
+	return dst
+}
+
+func countPredicatesMatch(preds []predicate, checks []int, idx uint64) bool {
+	for _, pi := range checks {
+		if !preds[pi].matches(idx) {
 			return false
 		}
 	}
 	return true
+}
+
+func (br countORBranch) checksMatch(idx uint64) bool {
+	return countPredicatesMatch(br.preds, br.checks, idx)
 }
 
 func (br countORBranch) matches(idx uint64) bool {
@@ -757,6 +808,293 @@ func (branches countORBranches) shouldUseSeenDedup(universe uint64, expectedProb
 		return true
 	}
 	return expectedProbes >= sumEst
+}
+
+func countORSeenAddBitmap(seen, bm *roaring64.Bitmap) uint64 {
+	if seen == nil || bm == nil || bm.IsEmpty() {
+		return 0
+	}
+	before := seen.GetCardinality()
+	seen.Or(bm)
+	after := seen.GetCardinality()
+	if after <= before {
+		return 0
+	}
+	return after - before
+}
+
+func (db *DB[K, V]) tryCountORBranchLeadPostings(
+	branches countORBranches,
+	branchIdx int,
+	useSeenDedup bool,
+	seen *roaring64.Bitmap,
+	trace *TraceORBranch,
+) (uint64, uint64, bool) {
+	if branchIdx < 0 || branchIdx >= len(branches) {
+		return 0, 0, false
+	}
+
+	br := branches[branchIdx]
+	if br.lead < 0 || br.lead >= len(br.preds) {
+		return 0, 0, false
+	}
+
+	leadPosts, ok := countPredicateLeadPostings(br.preds[br.lead])
+	if !ok {
+		return 0, 0, false
+	}
+
+	exactChecksBuf := getIntSliceBuf(len(br.checks))
+	exactChecks := br.buildBitmapFilterChecks(exactChecksBuf.values)
+	defer func() {
+		exactChecksBuf.values = exactChecks
+		releaseIntSliceBuf(exactChecksBuf)
+	}()
+
+	extraExactCandidatesBuf := getIntSliceBuf(len(br.checks))
+	extraExactCandidates := extraExactCandidatesBuf.values[:0]
+	extraExactCandidates = append(extraExactCandidates, db.collectCountLeadResidualExactCandidates(br.preds, br.checks)...)
+	defer func() {
+		extraExactCandidatesBuf.values = extraExactCandidates
+		releaseIntSliceBuf(extraExactCandidatesBuf)
+	}()
+
+	residualExactBuf := getIntSliceBuf(len(br.checks))
+	residualAfterExact := residualExactBuf.values[:0]
+	defer func() {
+		residualExactBuf.values = residualAfterExact
+		releaseIntSliceBuf(residualExactBuf)
+	}()
+
+	residualBothBuf := getIntSliceBuf(len(br.checks))
+	residualAfterBoth := residualBothBuf.values[:0]
+	defer func() {
+		residualBothBuf.values = residualAfterBoth
+		releaseIntSliceBuf(residualBothBuf)
+	}()
+
+	for _, pi := range br.checks {
+		if countIndexSliceContains(exactChecks, pi) {
+			continue
+		}
+		residualAfterExact = append(residualAfterExact, pi)
+		residualAfterBoth = append(residualAfterBoth, pi)
+	}
+
+	var extraExact []countLeadResidualExactFilter
+	defer func() {
+		releaseCountLeadResidualExactFilters(extraExact)
+	}()
+	extraExactBuilt := len(extraExactCandidates) == 0
+
+	var scratch *roaring64.Bitmap
+	if len(exactChecks) > 0 || len(extraExactCandidates) > 0 {
+		scratch = getRoaringBuf()
+		defer releaseRoaringBuf(scratch)
+	}
+	var bucketWork *roaring64.Bitmap
+	if len(exactChecks) > 0 {
+		bucketWork = getRoaringBuf()
+		defer releaseRoaringBuf(bucketWork)
+	}
+	var extraWork *roaring64.Bitmap
+	defer func() {
+		if extraWork != nil {
+			releaseRoaringBuf(extraWork)
+		}
+	}()
+
+	ensureExtraExact := func() {
+		if extraExactBuilt {
+			return
+		}
+		extraExactBuilt = true
+		extraExact = db.buildCountLeadResidualExactFiltersByCandidates(br.preds, extraExactCandidates)
+		if len(extraExact) == 0 {
+			return
+		}
+		extraWork = getRoaringBuf()
+		residualAfterBoth = residualAfterBoth[:0]
+		for _, pi := range residualAfterExact {
+			if countLeadResidualExactFiltersContain(extraExact, pi) {
+				continue
+			}
+			residualAfterBoth = append(residualAfterBoth, pi)
+		}
+	}
+
+	var cnt uint64
+	var examined uint64
+	addAccepted := func(n uint64) {
+		if n == 0 {
+			return
+		}
+		cnt += n
+		if trace != nil {
+			trace.RowsEmitted += n
+		}
+	}
+	acceptBitmapNoChecks := func(bm *roaring64.Bitmap) {
+		if bm == nil || bm.IsEmpty() {
+			return
+		}
+		if useSeenDedup {
+			addAccepted(countORSeenAddBitmap(seen, bm))
+			return
+		}
+		if branchIdx == 0 {
+			addAccepted(bm.GetCardinality())
+			return
+		}
+		it := bm.Iterator()
+		for it.HasNext() {
+			idx := it.Next()
+			dup := false
+			for j := 0; j < branchIdx; j++ {
+				if branches[j].matches(idx) {
+					dup = true
+					break
+				}
+			}
+			if !dup {
+				addAccepted(1)
+			}
+		}
+	}
+	acceptIdx := func(idx uint64, checks []int) {
+		if useSeenDedup && seen != nil && seen.Contains(idx) {
+			return
+		}
+		if len(checks) > 0 && !countPredicatesMatch(br.preds, checks, idx) {
+			return
+		}
+		if useSeenDedup {
+			if seen != nil && seen.CheckedAdd(idx) {
+				addAccepted(1)
+			}
+			return
+		}
+		for j := 0; j < branchIdx; j++ {
+			if branches[j].matches(idx) {
+				return
+			}
+		}
+		addAccepted(1)
+	}
+
+	for _, ids := range leadPosts {
+		if ids.IsEmpty() {
+			continue
+		}
+		card := ids.Cardinality()
+		examined += card
+		if trace != nil {
+			trace.RowsExamined += card
+		}
+		if len(br.checks) == 0 {
+			if ids.isSingleton() {
+				acceptIdx(ids.single, nil)
+				continue
+			}
+			if bm := ids.bitmap(); bm != nil {
+				acceptBitmapNoChecks(bm)
+				continue
+			}
+			ids.ForEach(func(idx uint64) bool {
+				acceptIdx(idx, nil)
+				return true
+			})
+			continue
+		}
+
+		if ids.isSingleton() {
+			acceptIdx(ids.single, br.checks)
+			continue
+		}
+
+		if len(exactChecks) == 0 && len(extraExact) == 0 {
+			ids.ForEach(func(idx uint64) bool {
+				acceptIdx(idx, br.checks)
+				return true
+			})
+			continue
+		}
+
+		bm, owned := ids.ToBitmapOwned(scratch)
+		if bm == nil || bm.IsEmpty() {
+			if owned && bm != nil && bm != scratch {
+				releaseRoaringBuf(bm)
+			}
+			continue
+		}
+
+		current := bm
+		exactApplied := false
+		if len(exactChecks) > 0 {
+			mode, exactBM, _ := plannerFilterBitmapByChecks(br.preds, exactChecks, bm, bucketWork, true)
+			switch mode {
+			case plannerPredicateBucketEmpty:
+				if owned && bm != scratch {
+					releaseRoaringBuf(bm)
+				}
+				continue
+			case plannerPredicateBucketAll:
+				current = exactBM
+				exactApplied = true
+			case plannerPredicateBucketExact:
+				if exactBM == nil || exactBM.IsEmpty() {
+					if owned && bm != scratch {
+						releaseRoaringBuf(bm)
+					}
+					continue
+				}
+				current = exactBM
+				exactApplied = true
+			}
+		}
+
+		extraApplied := false
+		if !extraExactBuilt {
+			ensureExtraExact()
+		}
+		if len(extraExact) > 0 {
+			filtered, ok := countApplyLeadResidualExactFilters(current, extraWork, extraExact)
+			if ok {
+				if filtered == nil || filtered.IsEmpty() {
+					if owned && bm != scratch {
+						releaseRoaringBuf(bm)
+					}
+					continue
+				}
+				current = filtered
+				extraApplied = true
+			}
+		}
+
+		checks := br.checks
+		if extraApplied {
+			checks = residualAfterBoth
+		} else if exactApplied {
+			checks = residualAfterExact
+		}
+		if len(checks) == 0 {
+			acceptBitmapNoChecks(current)
+			if owned && bm != scratch {
+				releaseRoaringBuf(bm)
+			}
+			continue
+		}
+
+		it := current.Iterator()
+		for it.HasNext() {
+			acceptIdx(it.Next(), checks)
+		}
+		if owned && bm != scratch {
+			releaseRoaringBuf(bm)
+		}
+	}
+
+	return cnt, examined, true
 }
 
 func chainPredicateCleanup(prev, next func()) func() {
@@ -1547,6 +1885,21 @@ func (db *DB[K, V]) tryCountByPredicates(expr qx.Expr, trace *queryTrace) (uint6
 		}
 		active = append(active, i)
 	}
+	// Broad leads are only worth predicate scans when the remaining checks are
+	// few and cheap. Apply the conservative gate before residual preparation so
+	// bitmap fallback does not inherit avoidable setup/materialization cost.
+	if universe > 0 && leadEst > universe/2 {
+		cheapChecks := true
+		for _, pi := range active {
+			if preds[pi].checkCost() > 1 {
+				cheapChecks = false
+				break
+			}
+		}
+		if len(active) > 2 || !cheapChecks {
+			return 0, false, nil
+		}
+	}
 	for _, pi := range active {
 		if err := db.prepareCountPredicateWithTrace(&preds[pi], leadEst, universe, trace); err != nil {
 			return 0, true, err
@@ -1568,22 +1921,6 @@ func (db *DB[K, V]) tryCountByPredicates(expr qx.Expr, trace *queryTrace) (uint6
 	}
 	active = filtered
 	sortActivePredicates(active, preds)
-
-	// Keep path conservative for very broad leads unless remaining checks are
-	// few and cheap. This avoids scanning a large lead when bitmap fallback is
-	// expected to win.
-	if universe > 0 && leadEst > universe/2 {
-		cheapChecks := true
-		for _, pi := range active {
-			if preds[pi].checkCost() > 1 {
-				cheapChecks = false
-				break
-			}
-		}
-		if len(active) > 2 || !cheapChecks {
-			return 0, false, nil
-		}
-	}
 
 	// For range/prefix leads on stable base slices, count by buckets first:
 	// many buckets can be skipped (or fully counted) via bucketCount hooks.
@@ -1698,8 +2035,18 @@ func (db *DB[K, V]) tryCountByPredicatesLeadBuckets(preds []predicate, leadIdx i
 		exactActiveBuf.values = exactActive
 		releaseIntSliceBuf(exactActiveBuf)
 	}()
-	extraExact := db.buildCountLeadResidualExactFilters(preds, localActive)
-	defer releaseCountLeadResidualExactFilters(extraExact)
+	extraExactCandidatesBuf := getIntSliceBuf(len(localActive))
+	extraExactCandidates := extraExactCandidatesBuf.values[:0]
+	extraExactCandidates = append(extraExactCandidates, db.collectCountLeadResidualExactCandidates(preds, localActive)...)
+	defer func() {
+		extraExactCandidatesBuf.values = extraExactCandidates
+		releaseIntSliceBuf(extraExactCandidatesBuf)
+	}()
+	var extraExact []countLeadResidualExactFilter
+	defer func() {
+		releaseCountLeadResidualExactFilters(extraExact)
+	}()
+	extraExactBuilt := len(extraExactCandidates) == 0
 	residualExactBuf := getIntSliceBuf(len(localActive))
 	residualAfterExact := residualExactBuf.values[:0]
 	defer func() {
@@ -1717,16 +2064,13 @@ func (db *DB[K, V]) tryCountByPredicatesLeadBuckets(preds []predicate, leadIdx i
 			continue
 		}
 		residualAfterExact = append(residualAfterExact, pi)
-		if countLeadResidualExactFiltersContain(extraExact, pi) {
-			continue
-		}
 		residualAfterBoth = append(residualAfterBoth, pi)
 	}
 
 	var cnt uint64
 	var examined uint64
 	var scratch *roaring64.Bitmap
-	if len(exactActive) > 0 || len(extraExact) > 0 {
+	if len(exactActive) > 0 || len(extraExactCandidates) > 0 {
 		scratch = getRoaringBuf()
 		defer releaseRoaringBuf(scratch)
 	}
@@ -1736,9 +2080,29 @@ func (db *DB[K, V]) tryCountByPredicatesLeadBuckets(preds []predicate, leadIdx i
 		defer releaseRoaringBuf(bucketWork)
 	}
 	var extraWork *roaring64.Bitmap
-	if len(extraExact) > 0 {
+	defer func() {
+		if extraWork != nil {
+			releaseRoaringBuf(extraWork)
+		}
+	}()
+
+	ensureExtraExact := func() {
+		if extraExactBuilt {
+			return
+		}
+		extraExactBuilt = true
+		extraExact = db.buildCountLeadResidualExactFiltersByCandidates(preds, extraExactCandidates)
+		if len(extraExact) == 0 {
+			return
+		}
 		extraWork = getRoaringBuf()
-		defer releaseRoaringBuf(extraWork)
+		residualAfterBoth = residualAfterBoth[:0]
+		for _, pi := range residualAfterExact {
+			if countLeadResidualExactFiltersContain(extraExact, pi) {
+				continue
+			}
+			residualAfterBoth = append(residualAfterBoth, pi)
+		}
 	}
 
 	for i := start; i < end; i++ {
@@ -1818,6 +2182,9 @@ func (db *DB[K, V]) tryCountByPredicatesLeadBuckets(preds []predicate, leadIdx i
 		}
 
 		extraApplied := false
+		if !extraExactBuilt {
+			ensureExtraExact()
+		}
 		if len(extraExact) > 0 {
 			filtered, ok := countApplyLeadResidualExactFilters(current, extraWork, extraExact)
 			if ok {
@@ -1832,7 +2199,13 @@ func (db *DB[K, V]) tryCountByPredicatesLeadBuckets(preds []predicate, leadIdx i
 			}
 		}
 
-		if exactApplied && extraApplied && len(residualAfterBoth) == 0 {
+		checks := localActive
+		if extraApplied {
+			checks = residualAfterBoth
+		} else if exactApplied {
+			checks = residualAfterExact
+		}
+		if len(checks) == 0 {
 			cnt += current.GetCardinality()
 			if owned && bm != scratch {
 				releaseRoaringBuf(bm)
@@ -1843,13 +2216,6 @@ func (db *DB[K, V]) tryCountByPredicatesLeadBuckets(preds []predicate, leadIdx i
 		it := current.Iterator()
 		for it.HasNext() {
 			idx := it.Next()
-			checks := localActive
-			switch {
-			case exactApplied && extraApplied:
-				checks = residualAfterBoth
-			case exactApplied:
-				checks = residualAfterExact
-			}
 			pass := true
 			for _, pi := range checks {
 				if !preds[pi].matches(idx) {
@@ -1878,13 +2244,8 @@ func (db *DB[K, V]) tryCountByPredicatesLeadPostings(preds []predicate, leadIdx 
 		return 0, 0, false
 	}
 
-	var leadPosts []postingList
-	switch {
-	case lead.iterKind == predicateIterPosting && !lead.posting.IsEmpty():
-		leadPosts = []postingList{lead.posting}
-	case lead.kind == predicateKindPostsAny && lead.iterKind == predicateIterPostsConcat && len(lead.posts) >= 2:
-		leadPosts = lead.posts
-	default:
+	leadPosts, ok := countPredicateLeadPostings(lead)
+	if !ok {
 		return 0, 0, false
 	}
 
@@ -1902,8 +2263,18 @@ func (db *DB[K, V]) tryCountByPredicatesLeadPostings(preds []predicate, leadIdx 
 		exactActiveBuf.values = exactActive
 		releaseIntSliceBuf(exactActiveBuf)
 	}()
-	extraExact := db.buildCountLeadResidualExactFilters(preds, localActive)
-	defer releaseCountLeadResidualExactFilters(extraExact)
+	extraExactCandidatesBuf := getIntSliceBuf(len(localActive))
+	extraExactCandidates := extraExactCandidatesBuf.values[:0]
+	extraExactCandidates = append(extraExactCandidates, db.collectCountLeadResidualExactCandidates(preds, localActive)...)
+	defer func() {
+		extraExactCandidatesBuf.values = extraExactCandidates
+		releaseIntSliceBuf(extraExactCandidatesBuf)
+	}()
+	var extraExact []countLeadResidualExactFilter
+	defer func() {
+		releaseCountLeadResidualExactFilters(extraExact)
+	}()
+	extraExactBuilt := len(extraExactCandidates) == 0
 	residualExactBuf := getIntSliceBuf(len(localActive))
 	residualAfterExact := residualExactBuf.values[:0]
 	defer func() {
@@ -1921,16 +2292,13 @@ func (db *DB[K, V]) tryCountByPredicatesLeadPostings(preds []predicate, leadIdx 
 			continue
 		}
 		residualAfterExact = append(residualAfterExact, pi)
-		if countLeadResidualExactFiltersContain(extraExact, pi) {
-			continue
-		}
 		residualAfterBoth = append(residualAfterBoth, pi)
 	}
 
 	var cnt uint64
 	var examined uint64
 	var scratch *roaring64.Bitmap
-	if len(exactActive) > 0 || len(extraExact) > 0 {
+	if len(exactActive) > 0 || len(extraExactCandidates) > 0 {
 		scratch = getRoaringBuf()
 		defer releaseRoaringBuf(scratch)
 	}
@@ -1940,9 +2308,29 @@ func (db *DB[K, V]) tryCountByPredicatesLeadPostings(preds []predicate, leadIdx 
 		defer releaseRoaringBuf(bucketWork)
 	}
 	var extraWork *roaring64.Bitmap
-	if len(extraExact) > 0 {
+	defer func() {
+		if extraWork != nil {
+			releaseRoaringBuf(extraWork)
+		}
+	}()
+
+	ensureExtraExact := func() {
+		if extraExactBuilt {
+			return
+		}
+		extraExactBuilt = true
+		extraExact = db.buildCountLeadResidualExactFiltersByCandidates(preds, extraExactCandidates)
+		if len(extraExact) == 0 {
+			return
+		}
 		extraWork = getRoaringBuf()
-		defer releaseRoaringBuf(extraWork)
+		residualAfterBoth = residualAfterBoth[:0]
+		for _, pi := range residualAfterExact {
+			if countLeadResidualExactFiltersContain(extraExact, pi) {
+				continue
+			}
+			residualAfterBoth = append(residualAfterBoth, pi)
+		}
 	}
 
 	for _, ids := range leadPosts {
@@ -2021,6 +2409,9 @@ func (db *DB[K, V]) tryCountByPredicatesLeadPostings(preds []predicate, leadIdx 
 		}
 
 		extraApplied := false
+		if !extraExactBuilt {
+			ensureExtraExact()
+		}
 		if len(extraExact) > 0 {
 			filtered, ok := countApplyLeadResidualExactFilters(current, extraWork, extraExact)
 			if ok {
@@ -2035,7 +2426,13 @@ func (db *DB[K, V]) tryCountByPredicatesLeadPostings(preds []predicate, leadIdx 
 			}
 		}
 
-		if exactApplied && extraApplied && len(residualAfterBoth) == 0 {
+		checks := localActive
+		if extraApplied {
+			checks = residualAfterBoth
+		} else if exactApplied {
+			checks = residualAfterExact
+		}
+		if len(checks) == 0 {
 			cnt += current.GetCardinality()
 			if owned && bm != scratch {
 				releaseRoaringBuf(bm)
@@ -2046,13 +2443,6 @@ func (db *DB[K, V]) tryCountByPredicatesLeadPostings(preds []predicate, leadIdx 
 		it := current.Iterator()
 		for it.HasNext() {
 			idx := it.Next()
-			checks := localActive
-			switch {
-			case exactApplied && extraApplied:
-				checks = residualAfterBoth
-			case exactApplied:
-				checks = residualAfterExact
-			}
 			pass := true
 			for _, pi := range checks {
 				if !preds[pi].matches(idx) {
@@ -2417,6 +2807,16 @@ func (db *DB[K, V]) tryCountORByPredicates(expr qx.Expr, trace *queryTrace) (uin
 	}
 	for i := range branches {
 		br := branches[i]
+		var brTrace *TraceORBranch
+		if branchTrace != nil {
+			brTrace = &branchTrace[i]
+		}
+		if cntBranch, examinedBranch, ok := db.tryCountORBranchLeadPostings(branches, i, useSeenDedup, seen, brTrace); ok {
+			cnt += cntBranch
+			examined += examinedBranch
+			continue
+		}
+
 		it := br.preds[br.lead].newIter()
 		if it == nil {
 			return 0, false, nil

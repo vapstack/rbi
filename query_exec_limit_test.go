@@ -2,6 +2,7 @@ package rbi
 
 import (
 	"fmt"
+	"path/filepath"
 	"reflect"
 	"testing"
 
@@ -123,6 +124,85 @@ func TestQuery_LimitOrderAndRange_UnsatisfiableRest_ReturnEmpty(t *testing.T) {
 	}
 	if len(out) != 0 {
 		t.Fatalf("expected empty result from tryLimitQueryRangeNoOrderByField, got %v", out)
+	}
+}
+
+func TestPostingUnionIter_SmallUnionAvoidsDuplicates(t *testing.T) {
+	it := newPostingUnionIter([]postingList{
+		postingOf(1, 2, 5),
+		postingOf(2, 3),
+		postingOf(1, 4),
+	})
+
+	var got []uint64
+	for it.HasNext() {
+		got = append(got, it.Next())
+	}
+
+	want := []uint64{1, 2, 5, 3, 4}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("small union mismatch: got=%v want=%v", got, want)
+	}
+}
+
+type orderBasicHighCardPrefixRec struct {
+	Score  float64 `db:"score"`
+	Email  string  `db:"email"`
+	Status string  `db:"status"`
+	Plan   string  `db:"plan"`
+}
+
+func TestQuery_OrderBasicWithLimit_SkipsHighCardNonOrderPrefixShape(t *testing.T) {
+	dir := t.TempDir()
+	db, raw := openBoltAndNew[uint64, orderBasicHighCardPrefixRec](t, filepath.Join(dir, "test_order_basic_high_card.db"), Options{AnalyzeInterval: -1})
+	t.Cleanup(func() {
+		_ = db.Close()
+		_ = raw.Close()
+	})
+
+	for i := 1; i <= 2_000; i++ {
+		status := "paused"
+		if i%2 == 0 {
+			status = "active"
+		}
+		plan := "free"
+		if i%4 != 0 {
+			plan = "pro"
+		}
+		if err := db.Set(uint64(i), &orderBasicHighCardPrefixRec{
+			Score:  float64(i),
+			Email:  fmt.Sprintf("user%06d@example.com", i),
+			Status: status,
+			Plan:   plan,
+		}); err != nil {
+			t.Fatalf("Set(%d): %v", i, err)
+		}
+	}
+	if err := db.RebuildIndex(); err != nil {
+		t.Fatalf("RebuildIndex: %v", err)
+	}
+
+	q := qx.Query(
+		qx.PREFIX("email", "user0019"),
+		qx.EQ("status", "active"),
+		qx.NOTIN("plan", []string{"free"}),
+	).By("score", qx.DESC).Max(20)
+
+	out, used, err := db.tryQueryOrderBasicWithLimit(q, nil)
+	if err != nil {
+		t.Fatalf("tryQueryOrderBasicWithLimit: %v", err)
+	}
+	if used {
+		t.Fatalf("expected high-card non-order prefix shape to skip order-basic fast path, got %v", out)
+	}
+
+	got, err := db.QueryKeys(q)
+	if err != nil {
+		t.Fatalf("QueryKeys: %v", err)
+	}
+	want := []uint64{1998, 1994, 1990, 1986, 1982, 1978, 1974, 1970, 1966, 1962, 1958, 1954, 1950, 1946, 1942, 1938, 1934, 1930, 1926, 1922}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("ordered result mismatch: got=%v want=%v", got, want)
 	}
 }
 

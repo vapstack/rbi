@@ -2,6 +2,8 @@ package rbi
 
 import (
 	"fmt"
+	"path/filepath"
+	"sync"
 	"testing"
 
 	"github.com/RoaringBitmap/roaring/v2/roaring64"
@@ -16,6 +18,17 @@ func countByExprBitmap(t *testing.T, db *DB[uint64, Rec], expr qx.Expr) uint64 {
 	}
 	defer b.release()
 	return db.countBitmapResult(b)
+}
+
+type countORBenchRec struct {
+	Country string   `db:"country"`
+	Plan    string   `db:"plan"`
+	Status  string   `db:"status"`
+	Age     int      `db:"age"`
+	Score   float64  `db:"score"`
+	Email   string   `db:"email"`
+	Tags    []string `db:"tags"`
+	Roles   []string `db:"roles"`
 }
 
 func TestCount_ByPredicates_BucketLead_MatchesBitmap(t *testing.T) {
@@ -279,6 +292,167 @@ func TestCount_ByPredicates_PostingsLead_MatchesBitmap(t *testing.T) {
 	}
 }
 
+func TestCount_ByPredicates_BroadLeadFallbackSkipsResidualPreparation(t *testing.T) {
+	var (
+		mu     sync.Mutex
+		events []TraceEvent
+	)
+
+	sink := func(ev TraceEvent) {
+		mu.Lock()
+		events = append(events, ev)
+		mu.Unlock()
+	}
+
+	db, _ := openTempDBUint64(t, Options{
+		AnalyzeInterval:  -1,
+		TraceSink:        sink,
+		TraceSampleEvery: 1,
+	})
+
+	countries := []string{"US", "DE", "FR", "GB"}
+	seedGeneratedUint64Data(t, db, 160_000, func(i int) *Rec {
+		return &Rec{
+			Name:   fmt.Sprintf("u_%d", i),
+			Email:  fmt.Sprintf("user%06d@example.com", i),
+			Age:    i,
+			Score:  float64(i % 1_000),
+			Active: i%2 == 0,
+			Meta: Meta{
+				Country: countries[i%len(countries)],
+			},
+		}
+	})
+	if err := db.RebuildIndex(); err != nil {
+		t.Fatalf("RebuildIndex: %v", err)
+	}
+
+	q := qx.Query(
+		qx.IN("country", []string{"US", "DE", "FR"}),
+		qx.GTE("age", 1_000),
+		qx.LTE("age", 150_000),
+		qx.GTE("score", 10.0),
+	)
+
+	got, err := db.Count(q)
+	if err != nil {
+		t.Fatalf("Count: %v", err)
+	}
+	want := countByExprBitmap(t, db, q.Expr)
+	if got != want {
+		t.Fatalf("count mismatch: got=%d want=%d", got, want)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(events) == 0 {
+		t.Fatalf("expected trace event")
+	}
+	ev := events[len(events)-1]
+	if ev.Plan != string(PlanCountBitmap) {
+		t.Fatalf("expected broad-lead fallback to use %q, got %q", PlanCountBitmap, ev.Plan)
+	}
+	if ev.CountPredicatePreparations > 1 {
+		t.Fatalf("expected broad-lead fallback to avoid residual preparation, got %d total preparations", ev.CountPredicatePreparations)
+	}
+}
+
+func TestCount_ORByPredicates_PostingLeadResidualExactFilters_MatchesBitmap(t *testing.T) {
+	dir := t.TempDir()
+	db, raw := openBoltAndNew[uint64, countORBenchRec](t, filepath.Join(dir, "test_count_or.db"), Options{
+		AnalyzeInterval:                      -1,
+		SnapshotCompactorRequestEveryNWrites: 1 << 30,
+		SnapshotCompactorIdleInterval:        -1,
+		SnapshotDeltaLayerMaxDepth:           1 << 30,
+	})
+	t.Cleanup(func() {
+		_ = db.Close()
+		_ = raw.Close()
+	})
+	db.DisableSync()
+	defer db.EnableSync()
+
+	countries := []string{"US", "DE", "NL", "FR"}
+	plans := []string{"free", "pro", "enterprise", "basic"}
+	statuses := []string{"active", "trial", "paused", "banned"}
+	tagsPool := [][]string{
+		{"go", "db"},
+		{"security", "ops"},
+		{"go", "security"},
+		{"rust", "ops"},
+	}
+	rolesPool := [][]string{
+		{"admin", "support"},
+		{"admin", "moderator"},
+		{"support"},
+		{"moderator"},
+	}
+
+	const n = 100_000
+	ids := make([]uint64, n)
+	vals := make([]*countORBenchRec, n)
+	for i := 0; i < n; i++ {
+		ids[i] = uint64(i + 1)
+		vals[i] = &countORBenchRec{
+			Country: countries[i%len(countries)],
+			Plan:    plans[(i/2)%len(plans)],
+			Status:  statuses[(i/3)%len(statuses)],
+			Age:     18 + (i % 55),
+			Score:   float64(i % 200),
+			Email:   fmt.Sprintf("user%06d@example.com", i),
+			Tags:    append([]string(nil), tagsPool[i%len(tagsPool)]...),
+			Roles:   append([]string(nil), rolesPool[(i/5)%len(rolesPool)]...),
+		}
+	}
+	if err := db.BatchSet(ids, vals); err != nil {
+		t.Fatalf("BatchSet: %v", err)
+	}
+	if err := db.RebuildIndex(); err != nil {
+		t.Fatalf("RebuildIndex: %v", err)
+	}
+
+	expr := qx.OR(
+		qx.AND(
+			qx.PREFIX("email", "user09"),
+			qx.EQ("status", "active"),
+			qx.GTE("score", 60.0),
+		),
+		qx.AND(
+			qx.EQ("plan", "enterprise"),
+			qx.HASANY("roles", []string{"admin", "support"}),
+			qx.NOTIN("status", []string{"banned"}),
+		),
+		qx.AND(
+			qx.EQ("status", "active"),
+			qx.HASANY("tags", []string{"security", "ops"}),
+			qx.IN("country", []string{"US", "DE", "NL"}),
+		),
+		qx.AND(
+			qx.EQ("country", "US"),
+			qx.HASANY("roles", []string{"admin", "moderator"}),
+			qx.NOTIN("plan", []string{"free"}),
+		),
+	)
+
+	got, ok, err := db.tryCountORByPredicates(expr, nil)
+	if err != nil {
+		t.Fatalf("tryCountORByPredicates: %v", err)
+	}
+	if !ok {
+		t.Fatalf("expected count OR predicate fast path")
+	}
+
+	b, err := db.evalExpr(expr)
+	if err != nil {
+		t.Fatalf("evalExpr: %v", err)
+	}
+	defer b.release()
+	want := db.countBitmapResult(b)
+	if got != want {
+		t.Fatalf("count mismatch: got=%d want=%d", got, want)
+	}
+}
+
 func TestCount_ByPredicates_SinglePostingLead_MatchesBitmap(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
 
@@ -511,14 +685,19 @@ func TestCountPredicateMaterializationThresholds_Adaptive(t *testing.T) {
 	smallHasAnyResidual := predicate{
 		kind:    predicateKindPostsAny,
 		expr:    qx.Expr{Op: qx.OpHASANY, Field: "roles"},
-		posts:   make([]postingList, 2),
+		posts:   make([]postingList, 3),
 		estCard: 80_000,
 	}
-	if !shouldUseCountLeadResidualHasAnyExactFilter(smallHasAnyResidual, false) {
-		t.Fatalf("expected narrow no-cache HASANY residual exact filter above threshold")
+	if !shouldUseCountLeadResidualHasAnyExactFilter(smallHasAnyResidual) {
+		t.Fatalf("expected small HASANY residual exact filter above threshold")
 	}
-	if shouldUseCountLeadResidualHasAnyExactFilter(smallHasAnyResidual, true) {
-		t.Fatalf("unexpected residual exact filter with cache enabled")
+	if shouldUseCountLeadResidualHasAnyExactFilter(predicate{
+		kind:    predicateKindPostsAny,
+		expr:    qx.Expr{Op: qx.OpHASANY, Field: "roles"},
+		posts:   make([]postingList, 4),
+		estCard: 80_000,
+	}) {
+		t.Fatalf("unexpected residual exact filter beyond max term threshold")
 	}
 
 	if got := countSetMaterializeMinTerms(3_000, 32_000); got <= countPredSetMaterializeMinTermsBase {
