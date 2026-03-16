@@ -133,7 +133,7 @@ func formatMemoryLine(memory *MemorySnapshot) string {
 func formatSnapshotLine(sample snapshotSample) string {
 	stats := sample.Stats
 	return fmt.Sprintf(
-		"snap    pin=%d reg=%d depth=%d/%d ops=%s/%s cq=%d",
+		"snap    pin=%d reg=%d depth=%d/%d ops=%s/%s cq=%d miss=%s soft=%s skip=%s",
 		stats.PinnedRefs,
 		stats.RegistrySize,
 		stats.IndexLayerDepth,
@@ -141,6 +141,9 @@ func formatSnapshotLine(sample snapshotSample) string {
 		formatOps(float64(stats.IndexDeltaOps)),
 		formatOps(float64(stats.LenDeltaOps)),
 		stats.CompactorQueueLen,
+		formatOps(float64(stats.CompactorLockMiss)),
+		formatOps(float64(stats.CompactorSoftSkip)),
+		formatOps(float64(stats.CompactorSkippedWake)),
 	)
 }
 
@@ -148,11 +151,15 @@ func formatBatchLine(sample batchSample) string {
 	stats := sample.Stats
 	delta := sample.Delta
 	return fmt.Sprintf(
-		"batch   q=%d/%d exec=%s multi=%s avg=%.1f hot=%t fb=%d err=%d",
+		"batch   q=%d/%d exec=%s multi=%s dist=%d/%d/%d/%d avg=%.1f hot=%t fb=%d err=%d",
 		stats.QueueLen,
 		stats.MaxQueue,
 		formatOps(float64(delta.ExecutedBatches)),
 		formatOps(float64(delta.MultiRequestOps)),
+		delta.BatchSize1,
+		delta.BatchSize2To4,
+		delta.BatchSize5To8,
+		delta.BatchSize9Plus,
 		stats.AvgBatchSize,
 		stats.HotWindowActive,
 		delta.FallbackQueueFull,
@@ -168,13 +175,15 @@ func formatTraceLine(report *plannerTraceReport) string {
 		return fmt.Sprintf("trace   samp=%s seen=0", formatSampleEvery(report.SampleEvery))
 	}
 	return fmt.Sprintf(
-		"trace   samp=%s seen=%s avg=%s exam=%s scan=%s dedupe=%s fb=%d",
+		"trace   samp=%s seen=%s avg=%s exam=%s match=%s mat=%s exact=%s scan=%s fb=%d",
 		formatSampleEvery(report.SampleEvery),
 		formatOps(float64(report.Total.Sampled)),
 		formatLatency(report.Total.AvgDurationUs),
 		formatOps(report.Total.AvgRowsExamined),
+		formatOps(report.Total.AvgRowsMatched),
+		formatOps(report.Total.AvgBitmapMats),
+		formatOps(report.Total.AvgBitmapExact),
 		formatOps(report.Total.AvgOrderScanWidth),
-		formatOps(report.Total.AvgDedupeCount),
 		report.Total.RuntimeFallbacks,
 	)
 }
@@ -185,11 +194,12 @@ func formatTraceTopLine(report *plannerTraceReport) string {
 	}
 	top := report.TopSamples[0]
 	return fmt.Sprintf(
-		"toptr   %s %s plan=%s exam=%s ret=%s",
+		"toptr   %s %s plan=%s exam=%s match=%s ret=%s",
 		formatLatency(top.DurationUs),
 		compactQueryName(top.Query),
 		top.Plan,
 		formatOps(float64(top.RowsExamined)),
+		formatOps(float64(top.RowsMatched)),
 		formatOps(float64(top.RowsReturned)),
 	)
 }

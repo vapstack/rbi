@@ -57,12 +57,18 @@ type plannerTraceStats struct {
 	maxDurationNS        uint64
 	totalRowsExamined    uint64
 	maxRowsExamined      uint64
+	totalRowsMatched     uint64
+	maxRowsMatched       uint64
 	totalRowsReturned    uint64
 	maxRowsReturned      uint64
 	totalEstimatedRows   uint64
 	maxEstimatedRows     uint64
 	totalEstimatedCost   float64
 	totalFallbackCost    float64
+	totalBitmapMats      uint64
+	maxBitmapMats        uint64
+	totalBitmapExact     uint64
+	maxBitmapExact       uint64
 	totalOrderScanWidth  uint64
 	maxOrderScanWidth    uint64
 	totalDedupeCount     uint64
@@ -101,12 +107,18 @@ type plannerTraceScopeReport struct {
 	MaxDurationUs     float64           `json:"max_duration_us"`
 	AvgRowsExamined   float64           `json:"avg_rows_examined"`
 	MaxRowsExamined   uint64            `json:"max_rows_examined"`
+	AvgRowsMatched    float64           `json:"avg_rows_matched"`
+	MaxRowsMatched    uint64            `json:"max_rows_matched"`
 	AvgRowsReturned   float64           `json:"avg_rows_returned"`
 	MaxRowsReturned   uint64            `json:"max_rows_returned"`
 	AvgEstimatedRows  float64           `json:"avg_estimated_rows"`
 	MaxEstimatedRows  uint64            `json:"max_estimated_rows"`
 	AvgEstimatedCost  float64           `json:"avg_estimated_cost"`
 	AvgFallbackCost   float64           `json:"avg_fallback_cost"`
+	AvgBitmapMats     float64           `json:"avg_bitmap_materializations"`
+	MaxBitmapMats     uint64            `json:"max_bitmap_materializations"`
+	AvgBitmapExact    float64           `json:"avg_bitmap_exact_filters"`
+	MaxBitmapExact    uint64            `json:"max_bitmap_exact_filters"`
 	AvgOrderScanWidth float64           `json:"avg_order_scan_width"`
 	MaxOrderScanWidth uint64            `json:"max_order_scan_width"`
 	AvgDedupeCount    float64           `json:"avg_dedupe_count"`
@@ -142,7 +154,10 @@ type plannerTraceSample struct {
 	FallbackCost  float64 `json:"fallback_cost,omitempty"`
 
 	RowsExamined        uint64 `json:"rows_examined,omitempty"`
+	RowsMatched         uint64 `json:"rows_matched,omitempty"`
 	RowsReturned        uint64 `json:"rows_returned,omitempty"`
+	BitmapMats          uint64 `json:"bitmap_materializations,omitempty"`
+	BitmapExactFilters  uint64 `json:"bitmap_exact_filters,omitempty"`
 	OrderIndexScanWidth uint64 `json:"order_index_scan_width,omitempty"`
 	DedupeCount         uint64 `json:"dedupe_count,omitempty"`
 	EarlyStopReason     string `json:"early_stop_reason,omitempty"`
@@ -329,6 +344,10 @@ func (s *plannerTraceStats) observe(ev rbi.TraceEvent) {
 	if ev.RowsExamined > s.maxRowsExamined {
 		s.maxRowsExamined = ev.RowsExamined
 	}
+	s.totalRowsMatched += ev.RowsMatched
+	if ev.RowsMatched > s.maxRowsMatched {
+		s.maxRowsMatched = ev.RowsMatched
+	}
 	s.totalRowsReturned += ev.RowsReturned
 	if ev.RowsReturned > s.maxRowsReturned {
 		s.maxRowsReturned = ev.RowsReturned
@@ -339,6 +358,14 @@ func (s *plannerTraceStats) observe(ev rbi.TraceEvent) {
 	}
 	s.totalEstimatedCost += ev.EstimatedCost
 	s.totalFallbackCost += ev.FallbackCost
+	s.totalBitmapMats += ev.BitmapMaterializations
+	if ev.BitmapMaterializations > s.maxBitmapMats {
+		s.maxBitmapMats = ev.BitmapMaterializations
+	}
+	s.totalBitmapExact += ev.BitmapExactFilters
+	if ev.BitmapExactFilters > s.maxBitmapExact {
+		s.maxBitmapExact = ev.BitmapExactFilters
+	}
 	s.totalOrderScanWidth += ev.OrderIndexScanWidth
 	if ev.OrderIndexScanWidth > s.maxOrderScanWidth {
 		s.maxOrderScanWidth = ev.OrderIndexScanWidth
@@ -419,12 +446,18 @@ func (s *plannerTraceStats) report() plannerTraceScopeReport {
 		MaxDurationUs:     nsToUs(float64(s.maxDurationNS)),
 		AvgRowsExamined:   float64(s.totalRowsExamined) / n,
 		MaxRowsExamined:   s.maxRowsExamined,
+		AvgRowsMatched:    float64(s.totalRowsMatched) / n,
+		MaxRowsMatched:    s.maxRowsMatched,
 		AvgRowsReturned:   float64(s.totalRowsReturned) / n,
 		MaxRowsReturned:   s.maxRowsReturned,
 		AvgEstimatedRows:  float64(s.totalEstimatedRows) / n,
 		MaxEstimatedRows:  s.maxEstimatedRows,
 		AvgEstimatedCost:  s.totalEstimatedCost / n,
 		AvgFallbackCost:   s.totalFallbackCost / n,
+		AvgBitmapMats:     float64(s.totalBitmapMats) / n,
+		MaxBitmapMats:     s.maxBitmapMats,
+		AvgBitmapExact:    float64(s.totalBitmapExact) / n,
+		MaxBitmapExact:    s.maxBitmapExact,
 		AvgOrderScanWidth: float64(s.totalOrderScanWidth) / n,
 		MaxOrderScanWidth: s.maxOrderScanWidth,
 		AvgDedupeCount:    float64(s.totalDedupeCount) / n,
@@ -496,7 +529,10 @@ func plannerTraceSampleFromEvent(info plannerTraceScopeInfo, query string, ev rb
 		EstimatedCost:       ev.EstimatedCost,
 		FallbackCost:        ev.FallbackCost,
 		RowsExamined:        ev.RowsExamined,
+		RowsMatched:         ev.RowsMatched,
 		RowsReturned:        ev.RowsReturned,
+		BitmapMats:          ev.BitmapMaterializations,
+		BitmapExactFilters:  ev.BitmapExactFilters,
 		OrderIndexScanWidth: ev.OrderIndexScanWidth,
 		DedupeCount:         ev.DedupeCount,
 		EarlyStopReason:     ev.EarlyStopReason,

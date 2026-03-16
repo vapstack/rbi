@@ -15,6 +15,9 @@ const countPredSetMaterializeMinTermsBase = 6
 const countPredCustomMaterializeMinProbeBase = 4_096
 const countPredBroadRangeLazyMinCard = 65_536
 const countPredBroadRangeComplementMaxCard = 32_768
+const countPredBroadRangeComplementMaxCardCap = 131_072
+const countPredBroadRangeComplementFastProbeMin = 4_096
+const countPredBroadRangeComplementFastAvgPerBucketMax = 8
 const countPredLeadResidualHasAnyExactMaxTerms = 2
 const countPredLeadResidualHasAnyExactMinCard = 65_536
 
@@ -932,8 +935,11 @@ func shouldMaterializeCustomCountPredicate(p predicate, probeEst uint64, univers
 	}
 }
 
-func shouldUseCountBroadRangeComplementMaterialization(p predicate, universe uint64, cacheEnabled bool) bool {
-	if cacheEnabled || universe == 0 || p.kind != predicateKindCustom {
+func shouldUseCountBroadRangeComplementMaterialization(p predicate, leadProbeEst uint64, universe uint64) bool {
+	if universe == 0 || leadProbeEst == 0 || p.kind != predicateKindCustom {
+		return false
+	}
+	if leadProbeEst >= p.estCard {
 		return false
 	}
 	if p.expr.Not || p.estCard < countPredBroadRangeLazyMinCard {
@@ -948,15 +954,69 @@ func shouldUseCountBroadRangeComplementMaterialization(p predicate, universe uin
 	return p.estCard >= threshold
 }
 
-func (db *DB[K, V]) tryMaterializeBroadRangeComplementPredicateForCount(p *predicate, universe uint64) bool {
+func countBroadRangeComplementMaxCardinality(leadProbeEst, universe uint64) uint64 {
+	limit := uint64(countPredBroadRangeComplementMaxCard)
+	if leadProbeEst == 0 || universe == 0 {
+		return limit
+	}
+	// Only widen beyond the legacy cap when the chosen lead is already narrow
+	// relative to the full result universe; otherwise complement setup cost can
+	// dominate and broad AND-counts regress toward bitmap-first behavior.
+	if leadProbeEst > universe/4 {
+		return limit
+	}
+	dyn := leadProbeEst + leadProbeEst/4
+	if dyn > limit {
+		limit = dyn
+	}
+	theoreticalCap := universe / 4
+	if limit > theoreticalCap {
+		limit = theoreticalCap
+	}
+	if limit > uint64(countPredBroadRangeComplementMaxCardCap) {
+		limit = uint64(countPredBroadRangeComplementMaxCardCap)
+	}
+	return limit
+}
+
+func shouldUseFastCountBroadRangeComplementMaterialization(probe []postingList, est uint64) bool {
+	if len(probe) < countPredBroadRangeComplementFastProbeMin || est == 0 {
+		return false
+	}
+	avgPerBucket := est / uint64(len(probe))
+	if avgPerBucket == 0 {
+		avgPerBucket = 1
+	}
+	return avgPerBucket <= countPredBroadRangeComplementFastAvgPerBucketMax
+}
+
+func countBaseIndexRangeCardinality(s []index, start, end int) uint64 {
+	if start >= end {
+		return 0
+	}
+	var total uint64
+	for i := start; i < end; i++ {
+		ids := s[i].IDs
+		if ids.IsEmpty() {
+			continue
+		}
+		card := ids.Cardinality()
+		if ^uint64(0)-total < card {
+			return ^uint64(0)
+		}
+		total += card
+	}
+	return total
+}
+
+func (db *DB[K, V]) tryMaterializeBroadRangeComplementPredicateForCount(p *predicate, leadProbeEst uint64, universe uint64, trace *queryTrace) bool {
 	if p == nil {
 		return false
 	}
-	snap := db.getSnapshot()
-	cacheEnabled := snap != nil && snap.materializedPredCacheLimit() > 0
-	if !shouldUseCountBroadRangeComplementMaterialization(*p, universe, cacheEnabled) {
+	if !shouldUseCountBroadRangeComplementMaterialization(*p, leadProbeEst, universe) {
 		return false
 	}
+	snap := db.getSnapshot()
 	if snap == nil || snap.fieldDelta(p.expr.Field) != nil {
 		return false
 	}
@@ -968,6 +1028,44 @@ func (db *DB[K, V]) tryMaterializeBroadRangeComplementPredicateForCount(p *predi
 	key, isSlice, err := db.exprValueToIdxScalar(qx.Expr{Op: p.expr.Op, Field: p.expr.Field, Value: p.expr.Value})
 	if err != nil || isSlice {
 		return false
+	}
+	cacheKey := db.materializedPredComplementCacheKeyForScalar(p.expr.Field, p.expr.Op, key)
+	if cacheKey != "" {
+		if cached, ok := snap.loadMaterializedPred(cacheKey); ok {
+			if cached == nil || cached.IsEmpty() {
+				if trace != nil {
+					trace.addCountRangeComplementCacheHit(1)
+				}
+				p.kind = predicateKindCustom
+				p.iterKind = predicateIterNone
+				p.posting = postingList{}
+				p.posts = nil
+				p.bm = nil
+				p.contains = nil
+				p.iter = nil
+				p.bucketCount = nil
+				p.estCard = 0
+				p.alwaysTrue = true
+				p.alwaysFalse = false
+				return true
+			}
+
+			if trace != nil {
+				trace.addCountRangeComplementCacheHit(1)
+			}
+			p.kind = predicateKindBitmapNot
+			p.iterKind = predicateIterNone
+			p.posting = postingList{}
+			p.posts = nil
+			p.bm = cached
+			p.contains = nil
+			p.iter = nil
+			p.bucketCount = nil
+			p.estCard = 0
+			p.alwaysTrue = false
+			p.alwaysFalse = false
+			return true
+		}
 	}
 	slice := snap.fieldIndexSlice(p.expr.Field)
 	if slice == nil || len(*slice) == 0 {
@@ -983,41 +1081,108 @@ func (db *DB[K, V]) tryMaterializeBroadRangeComplementPredicateForCount(p *predi
 	if inBuckets <= 0 || outBuckets <= 0 || outBuckets >= inBuckets {
 		return false
 	}
+	if start == 0 || end == len(s) {
+		complementStart := 0
+		complementEnd := start
+		if start == 0 {
+			complementStart = end
+			complementEnd = len(s)
+		}
+		complementEst := countBaseIndexRangeCardinality(s, complementStart, complementEnd)
+		if complementEst == 0 || complementEst > countBroadRangeComplementMaxCardinality(leadProbeEst, universe) {
+			return false
+		}
 
-	probeBuf := getPostingListSliceBuf(max(outBuckets, 8))
-	probe := probeBuf.values[:0]
+		bm := getRoaringBuf()
+		orBaseIndexRange(bm, s, complementStart, complementEnd)
+		if bm.IsEmpty() {
+			releaseRoaringBuf(bm)
+			if cacheKey != "" {
+				snap.storeMaterializedPred(cacheKey, nil)
+			}
+			p.kind = predicateKindCustom
+			p.iterKind = predicateIterNone
+			p.posting = postingList{}
+			p.posts = nil
+			p.bm = nil
+			p.contains = nil
+			p.iter = nil
+			p.bucketCount = nil
+			p.estCard = 0
+			p.alwaysTrue = true
+			p.alwaysFalse = false
+			return true
+		}
+		if trace != nil {
+			trace.addCountRangeComplementBuild(bm.GetCardinality(), false)
+		}
+
+		readonly := false
+		if cacheKey != "" && db.tryShareMaterializedPred(cacheKey, bm) {
+			readonly = true
+		}
+		p.cleanup = chainPredicateCleanup(p.cleanup, func() {
+			if !readonly {
+				releaseRoaringBuf(bm)
+			}
+		})
+		p.kind = predicateKindBitmapNot
+		p.iterKind = predicateIterNone
+		p.posting = postingList{}
+		p.posts = nil
+		p.bm = bm
+		p.contains = nil
+		p.iter = nil
+		p.bucketCount = nil
+		p.estCard = 0
+		p.alwaysTrue = false
+		p.alwaysFalse = false
+		return true
+	}
+
+	complementBuf := getPostingListSliceBuf(max(outBuckets, 8))
+	complement := complementBuf.values[:0]
 	defer func() {
-		probeBuf.values = probe
-		releasePostingListSliceBuf(probeBuf)
+		complementBuf.values = complement
+		releasePostingListSliceBuf(complementBuf)
 	}()
 
-	probeEst := uint64(0)
-	appendProbe := func(ids postingList) {
+	complementEst := uint64(0)
+	appendComplement := func(ids postingList) {
 		if ids.IsEmpty() {
 			return
 		}
-		probe = append(probe, ids)
+		complement = append(complement, ids)
 		card := ids.Cardinality()
-		if ^uint64(0)-probeEst < card {
-			probeEst = ^uint64(0)
+		if ^uint64(0)-complementEst < card {
+			complementEst = ^uint64(0)
 		} else {
-			probeEst += card
+			complementEst += card
 		}
 	}
 	for i := 0; i < start; i++ {
-		appendProbe(s[i].IDs)
+		appendComplement(s[i].IDs)
 	}
 	for i := end; i < len(s); i++ {
-		appendProbe(s[i].IDs)
+		appendComplement(s[i].IDs)
 	}
-	if probeEst == 0 || probeEst > countPredBroadRangeComplementMaxCard {
+	if complementEst == 0 || complementEst > countBroadRangeComplementMaxCardinality(leadProbeEst, universe) {
 		return false
 	}
 
-	bm := db.materializeProbeUnion(probe)
+	var bm *roaring64.Bitmap
+	fastBuild := cacheKey != "" && shouldUseFastCountBroadRangeComplementMaterialization(complement, complementEst)
+	if fastBuild {
+		bm = materializeProbeFast(complement)
+	} else {
+		bm = db.materializeProbeUnion(complement)
+	}
 	if bm == nil || bm.IsEmpty() {
 		if bm != nil {
 			releaseRoaringBuf(bm)
+		}
+		if cacheKey != "" {
+			snap.storeMaterializedPred(cacheKey, nil)
 		}
 		p.kind = predicateKindCustom
 		p.iterKind = predicateIterNone
@@ -1032,9 +1197,18 @@ func (db *DB[K, V]) tryMaterializeBroadRangeComplementPredicateForCount(p *predi
 		p.alwaysFalse = false
 		return true
 	}
+	if trace != nil {
+		trace.addCountRangeComplementBuild(bm.GetCardinality(), fastBuild)
+	}
 
+	readonly := false
+	if cacheKey != "" && db.tryShareMaterializedPred(cacheKey, bm) {
+		readonly = true
+	}
 	p.cleanup = chainPredicateCleanup(p.cleanup, func() {
-		releaseRoaringBuf(bm)
+		if !readonly {
+			releaseRoaringBuf(bm)
+		}
 	})
 	p.kind = predicateKindBitmapNot
 	p.iterKind = predicateIterNone
@@ -1214,21 +1388,23 @@ func (db *DB[K, V]) materializeCustomPredicateForCount(p *predicate) error {
 }
 
 func (db *DB[K, V]) prepareCountPredicate(p *predicate, probeEst uint64, universe uint64) error {
+	return db.prepareCountPredicateWithTrace(p, probeEst, universe, nil)
+}
+
+func (db *DB[K, V]) prepareCountPredicateWithTrace(p *predicate, probeEst uint64, universe uint64, trace *queryTrace) error {
 	if p == nil || p.alwaysTrue || p.alwaysFalse || p.covered {
 		return nil
+	}
+	if trace != nil {
+		trace.addCountPredicatePreparation(1)
 	}
 
 	if shouldMaterializeCountSetPredicate(*p, probeEst, universe) {
 		db.materializeSetPredicateForCount(p)
 	}
 
-	cacheEnabled := false
-	if snap := db.getSnapshot(); snap != nil && snap.materializedPredCacheLimit() > 0 {
-		cacheEnabled = true
-	}
-
-	if shouldUseCountBroadRangeComplementMaterialization(*p, universe, cacheEnabled) &&
-		db.tryMaterializeBroadRangeComplementPredicateForCount(p, universe) {
+	if shouldUseCountBroadRangeComplementMaterialization(*p, probeEst, universe) &&
+		db.tryMaterializeBroadRangeComplementPredicateForCount(p, probeEst, universe, trace) {
 		return nil
 	}
 
@@ -1295,7 +1471,7 @@ func (db *DB[K, V]) tryCountByPredicates(expr qx.Expr, trace *queryTrace) (uint6
 	if leadIdx < 0 {
 		return 0, false, nil
 	}
-	if err := db.prepareCountPredicate(&preds[leadIdx], leadEst, universe); err != nil {
+	if err := db.prepareCountPredicateWithTrace(&preds[leadIdx], leadEst, universe, trace); err != nil {
 		return 0, true, err
 	}
 	if preds[leadIdx].alwaysFalse {
@@ -1330,7 +1506,7 @@ func (db *DB[K, V]) tryCountByPredicates(expr qx.Expr, trace *queryTrace) (uint6
 		active = append(active, i)
 	}
 	for _, pi := range active {
-		if err := db.prepareCountPredicate(&preds[pi], leadEst, universe); err != nil {
+		if err := db.prepareCountPredicateWithTrace(&preds[pi], leadEst, universe, trace); err != nil {
 			return 0, true, err
 		}
 	}
@@ -1483,6 +1659,28 @@ func (db *DB[K, V]) tryCountByPredicatesLeadBuckets(preds []predicate, leadIdx i
 	}()
 	extraExact := db.buildCountLeadResidualExactFilters(preds, localActive)
 	defer releaseCountLeadResidualExactFilters(extraExact)
+	residualExactBuf := getIntSliceBuf(len(localActive))
+	residualAfterExact := residualExactBuf.values[:0]
+	defer func() {
+		residualExactBuf.values = residualAfterExact
+		releaseIntSliceBuf(residualExactBuf)
+	}()
+	residualBothBuf := getIntSliceBuf(len(localActive))
+	residualAfterBoth := residualBothBuf.values[:0]
+	defer func() {
+		residualBothBuf.values = residualAfterBoth
+		releaseIntSliceBuf(residualBothBuf)
+	}()
+	for _, pi := range localActive {
+		if countIndexSliceContains(exactActive, pi) {
+			continue
+		}
+		residualAfterExact = append(residualAfterExact, pi)
+		if countLeadResidualExactFiltersContain(extraExact, pi) {
+			continue
+		}
+		residualAfterBoth = append(residualAfterBoth, pi)
+	}
 
 	var cnt uint64
 	var examined uint64
@@ -1556,7 +1754,7 @@ func (db *DB[K, V]) tryCountByPredicatesLeadBuckets(preds []predicate, leadIdx i
 		current := bm
 		exactApplied := false
 		if len(exactActive) > 0 {
-			mode, exactBM, _ := plannerFilterBitmapByChecks(preds, exactActive, bm, bucketWork)
+			mode, exactBM, _ := plannerFilterBitmapByChecks(preds, exactActive, bm, bucketWork, true)
 			switch mode {
 			case plannerPredicateBucketEmpty:
 				if owned && bm != scratch {
@@ -1593,14 +1791,7 @@ func (db *DB[K, V]) tryCountByPredicatesLeadBuckets(preds []predicate, leadIdx i
 			}
 		}
 
-		appliedExact := 0
-		if exactApplied {
-			appliedExact += len(exactActive)
-		}
-		if extraApplied {
-			appliedExact += len(extraExact)
-		}
-		if len(localActive) > 0 && appliedExact == len(localActive) {
+		if exactApplied && extraApplied && len(residualAfterBoth) == 0 {
 			cnt += current.GetCardinality()
 			if owned && bm != scratch {
 				releaseRoaringBuf(bm)
@@ -1611,14 +1802,15 @@ func (db *DB[K, V]) tryCountByPredicatesLeadBuckets(preds []predicate, leadIdx i
 		it := current.Iterator()
 		for it.HasNext() {
 			idx := it.Next()
+			checks := localActive
+			switch {
+			case exactApplied && extraApplied:
+				checks = residualAfterBoth
+			case exactApplied:
+				checks = residualAfterExact
+			}
 			pass := true
-			for _, pi := range localActive {
-				if exactApplied && countIndexSliceContains(exactActive, pi) {
-					continue
-				}
-				if extraApplied && countLeadResidualExactFiltersContain(extraExact, pi) {
-					continue
-				}
+			for _, pi := range checks {
 				if !preds[pi].matches(idx) {
 					pass = false
 					break
@@ -1664,6 +1856,28 @@ func (db *DB[K, V]) tryCountByPredicatesLeadPostings(preds []predicate, leadIdx 
 	}()
 	extraExact := db.buildCountLeadResidualExactFilters(preds, localActive)
 	defer releaseCountLeadResidualExactFilters(extraExact)
+	residualExactBuf := getIntSliceBuf(len(localActive))
+	residualAfterExact := residualExactBuf.values[:0]
+	defer func() {
+		residualExactBuf.values = residualAfterExact
+		releaseIntSliceBuf(residualExactBuf)
+	}()
+	residualBothBuf := getIntSliceBuf(len(localActive))
+	residualAfterBoth := residualBothBuf.values[:0]
+	defer func() {
+		residualBothBuf.values = residualAfterBoth
+		releaseIntSliceBuf(residualBothBuf)
+	}()
+	for _, pi := range localActive {
+		if countIndexSliceContains(exactActive, pi) {
+			continue
+		}
+		residualAfterExact = append(residualAfterExact, pi)
+		if countLeadResidualExactFiltersContain(extraExact, pi) {
+			continue
+		}
+		residualAfterBoth = append(residualAfterBoth, pi)
+	}
 
 	var cnt uint64
 	var examined uint64
@@ -1736,7 +1950,7 @@ func (db *DB[K, V]) tryCountByPredicatesLeadPostings(preds []predicate, leadIdx 
 		current := bm
 		exactApplied := false
 		if len(exactActive) > 0 {
-			mode, exactBM, _ := plannerFilterBitmapByChecks(preds, exactActive, bm, bucketWork)
+			mode, exactBM, _ := plannerFilterBitmapByChecks(preds, exactActive, bm, bucketWork, true)
 			switch mode {
 			case plannerPredicateBucketEmpty:
 				if owned && bm != scratch {
@@ -1773,14 +1987,7 @@ func (db *DB[K, V]) tryCountByPredicatesLeadPostings(preds []predicate, leadIdx 
 			}
 		}
 
-		appliedExact := 0
-		if exactApplied {
-			appliedExact += len(exactActive)
-		}
-		if extraApplied {
-			appliedExact += len(extraExact)
-		}
-		if len(localActive) > 0 && appliedExact == len(localActive) {
+		if exactApplied && extraApplied && len(residualAfterBoth) == 0 {
 			cnt += current.GetCardinality()
 			if owned && bm != scratch {
 				releaseRoaringBuf(bm)
@@ -1791,14 +1998,15 @@ func (db *DB[K, V]) tryCountByPredicatesLeadPostings(preds []predicate, leadIdx 
 		it := current.Iterator()
 		for it.HasNext() {
 			idx := it.Next()
+			checks := localActive
+			switch {
+			case exactApplied && extraApplied:
+				checks = residualAfterBoth
+			case exactApplied:
+				checks = residualAfterExact
+			}
 			pass := true
-			for _, pi := range localActive {
-				if exactApplied && countIndexSliceContains(exactActive, pi) {
-					continue
-				}
-				if extraApplied && countLeadResidualExactFiltersContain(extraExact, pi) {
-					continue
-				}
+			for _, pi := range checks {
 				if !preds[pi].matches(idx) {
 					pass = false
 					break

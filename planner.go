@@ -200,7 +200,7 @@ const (
 
 const plannerPredicateBucketExactMinCard = 32
 
-func plannerFilterBitmapByChecks(preds []predicate, checks []int, src, work *roaring64.Bitmap) (plannerPredicateBucketMode, *roaring64.Bitmap, uint64) {
+func plannerFilterBitmapByChecks(preds []predicate, checks []int, src, work *roaring64.Bitmap, allowExact bool) (plannerPredicateBucketMode, *roaring64.Bitmap, uint64) {
 	if src == nil || src.IsEmpty() {
 		return plannerPredicateBucketEmpty, nil, 0
 	}
@@ -234,7 +234,7 @@ func plannerFilterBitmapByChecks(preds []predicate, checks []int, src, work *roa
 	// Tiny buckets are cheaper to scan row-by-row than to clone into a scratch
 	// roaring bitmap for exact filtering. This keeps the OR-order hot path from
 	// paying large GC/alloc overhead on the common many-small-buckets shape.
-	if card <= plannerPredicateBucketExactMinCard {
+	if !allowExact || card <= plannerPredicateBucketExactMinCard {
 		return plannerPredicateBucketFallback, nil, card
 	}
 	if work == nil {
@@ -1996,7 +1996,7 @@ func (it *plannerOROrderBranchIter) advance() bool {
 				it.bucketWork = getRoaringBuf()
 			}
 			if len(it.exactChecks) > 0 {
-				mode, exactBM, card := plannerFilterBitmapByChecks(it.branch.preds, it.exactChecks, bm, it.bucketWork)
+				mode, exactBM, card := plannerFilterBitmapByChecks(it.branch.preds, it.exactChecks, bm, it.bucketWork, true)
 				switch mode {
 				case plannerPredicateBucketEmpty:
 					if it.totalExamined != nil {
@@ -2091,7 +2091,7 @@ func (it *plannerOROrderBranchIter) advance() bool {
 			it.bucketWork = getRoaringBuf()
 		}
 		if len(it.exactChecks) > 0 {
-			mode, exactBM, card := plannerFilterBitmapByChecks(it.branch.preds, it.exactChecks, bm, it.bucketWork)
+			mode, exactBM, card := plannerFilterBitmapByChecks(it.branch.preds, it.exactChecks, bm, it.bucketWork, true)
 			switch mode {
 			case plannerPredicateBucketEmpty:
 				if it.totalExamined != nil {
@@ -2808,7 +2808,7 @@ func (db *DB[K, V]) collectOROrderFallbackBranchCandidates(
 			}
 			bm := bucket.bitmap()
 			if len(exactChecks) > 0 {
-				mode, exactBM, card := plannerFilterBitmapByChecks(branch.preds, exactChecks, bm, bucketWork)
+				mode, exactBM, card := plannerFilterBitmapByChecks(branch.preds, exactChecks, bm, bucketWork, true)
 				switch mode {
 				case plannerPredicateBucketEmpty:
 					examined += card
@@ -2851,7 +2851,7 @@ func (db *DB[K, V]) collectOROrderFallbackBranchCandidates(
 			} else {
 				bm := bucket.bitmap()
 				if len(exactChecks) > 0 {
-					mode, exactBM, card := plannerFilterBitmapByChecks(branch.preds, exactChecks, bm, bucketWork)
+					mode, exactBM, card := plannerFilterBitmapByChecks(branch.preds, exactChecks, bm, bucketWork, true)
 					switch mode {
 					case plannerPredicateBucketEmpty:
 						examined += card

@@ -102,12 +102,16 @@ type snapshotSample struct {
 }
 
 type snapshotDelta struct {
-	CompactorRequested uint64 `json:"compactor_requested"`
-	CompactorRuns      uint64 `json:"compactor_runs"`
-	CompactorAttempts  uint64 `json:"compactor_attempts"`
-	CompactorSucceeded uint64 `json:"compactor_succeeded"`
-	CompactorLockMiss  uint64 `json:"compactor_lock_miss"`
-	CompactorNoChange  uint64 `json:"compactor_no_change"`
+	CompactorRequested   uint64 `json:"compactor_requested"`
+	CompactorRuns        uint64 `json:"compactor_runs"`
+	CompactorAttempts    uint64 `json:"compactor_attempts"`
+	CompactorSucceeded   uint64 `json:"compactor_succeeded"`
+	CompactorLockMiss    uint64 `json:"compactor_lock_miss"`
+	CompactorNoChange    uint64 `json:"compactor_no_change"`
+	CompactorSoftSkip    uint64 `json:"compactor_soft_skip"`
+	CompactorSkippedWake uint64 `json:"compactor_skipped_wake"`
+	CompactorIdleDefers  uint64 `json:"compactor_idle_defers"`
+	CompactorStaleRetry  uint64 `json:"compactor_stale_retry"`
 }
 
 type batchSample struct {
@@ -124,6 +128,10 @@ type batchDelta struct {
 	ExecutedBatches     uint64        `json:"executed_batches"`
 	MultiRequestBatches uint64        `json:"multi_request_batches"`
 	MultiRequestOps     uint64        `json:"multi_request_ops"`
+	BatchSize1          uint64        `json:"batch_size_1"`
+	BatchSize2To4       uint64        `json:"batch_size_2_4"`
+	BatchSize5To8       uint64        `json:"batch_size_5_8"`
+	BatchSize9Plus      uint64        `json:"batch_size_9_plus"`
 	MaxBatchSeen        uint64        `json:"max_batch_seen"`
 	CallbackOps         uint64        `json:"callback_ops"`
 	CoalescedSetDelete  uint64        `json:"coalesced_set_delete"`

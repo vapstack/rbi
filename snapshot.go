@@ -390,9 +390,11 @@ func (db *DB[K, V]) maybeRequestSnapshotCompaction(s *indexSnapshot, indexDelta,
 
 	seq := db.snapshot.compactWriteSeq.Add(1)
 	if until := db.snapshot.compactSkipUntil.Load(); until > 0 && seq < until {
+		db.snapshot.compactSkippedWake.Add(1)
 		return
 	}
 	if len(db.snapshot.compactReq) > 0 {
+		db.snapshot.compactSkippedWake.Add(1)
 		return
 	}
 
@@ -571,10 +573,14 @@ func (db *DB[K, V]) snapshotCompactorLoop() {
 		}
 
 		force := db.snapshot.compactForcePending.Swap(false)
-		if force && !db.snapshotCompactorIdleReady(idleInterval) {
-			force = false
-			resetIdleTimer()
+		deferForceUntilIdle := func() {
+			if force && !db.snapshotCompactorIdleReady(idleInterval) {
+				db.snapshot.compactIdleDefers.Add(1)
+				force = false
+				resetIdleTimer()
+			}
 		}
+		deferForceUntilIdle()
 		db.snapshot.compactRuns.Add(1)
 
 	DRAIN:
@@ -589,10 +595,7 @@ func (db *DB[K, V]) snapshotCompactorLoop() {
 			}
 		}
 
-		if force && !db.snapshotCompactorIdleReady(idleInterval) {
-			force = false
-			resetIdleTimer()
-		}
+		deferForceUntilIdle()
 
 		if db.runSnapshotCompaction(force) {
 			resetIdleTimer()
@@ -600,8 +603,62 @@ func (db *DB[K, V]) snapshotCompactorLoop() {
 	}
 }
 
+func (db *DB[K, V]) snapshotCompactorLockMissSkip(streak uint64) uint64 {
+	skip := uint64(max(0, db.options.SnapshotCompactorRequestEveryNWrites))
+	if skip < 4 {
+		skip = 4
+	}
+	if streak <= 1 {
+		return skip
+	}
+	maxSkip := skip * 32
+	for i := uint64(1); i < streak && skip < maxSkip; i++ {
+		skip *= 2
+		if skip < 4 {
+			skip = 4
+		}
+		if skip >= maxSkip {
+			return maxSkip
+		}
+	}
+	if skip > maxSkip {
+		return maxSkip
+	}
+	return skip
+}
+
+func snapshotCompactionWorthwhile(s *indexSnapshot, opt *Options) bool {
+	if s == nil || !s.hasAnyDeltaState() {
+		return false
+	}
+	if snapshotCompactionUrgent(s, opt) {
+		return true
+	}
+	if l := s.getIndexLayer(); l != nil && l.depth > 1 {
+		return true
+	}
+	if l := s.getLenLayer(); l != nil && l.depth > 1 {
+		return true
+	}
+	if opt.SnapshotDeltaCompactUniverseOps > 0 {
+		universeOps := snapshotUniverseDeltaOps(s.universeAdd, s.universeRem)
+		if universeOps >= uint64(max(1, opt.SnapshotDeltaCompactUniverseOps/4)) {
+			return true
+		}
+	}
+	fieldLimit := max(1, opt.SnapshotDeltaCompactMaxFieldsPerPublish)
+	if s.indexDeltaCount() > fieldLimit || s.lenDeltaCount() > fieldLimit {
+		return true
+	}
+	return false
+}
+
 func (db *DB[K, V]) runSnapshotCompaction(force bool) bool {
 	if db.broken.Load() {
+		return false
+	}
+	if !force && !snapshotCompactionWorthwhile(db.snapshot.current.Load(), db.options) {
+		db.snapshot.compactSoftSkip.Add(1)
 		return false
 	}
 	maxIters := int(db.options.SnapshotCompactorMaxIterationsPerRun)
@@ -735,21 +792,21 @@ func (db *DB[K, V]) compactLatestSnapshotOnce(force bool) (bool, bool) {
 		cur := db.snapshot.current.Load()
 		if cur == nil {
 			db.snapshot.compactNoChange.Add(1)
+			db.snapshot.compactMissStreak.Store(0)
 			return false, false
 		}
 		next, ok := compactSnapshot(cur, db.options, force)
 		if !ok || next == nil {
 			db.snapshot.compactNoChange.Add(1)
+			db.snapshot.compactMissStreak.Store(0)
 			return false, false
 		}
 
 		if !db.mu.TryLock() {
 			db.snapshot.compactLockMiss.Add(1)
+			streak := db.snapshot.compactMissStreak.Add(1)
 			seq := db.snapshot.compactWriteSeq.Load()
-			skip := uint64(max(0, db.options.SnapshotCompactorRequestEveryNWrites))
-			if skip < 4 {
-				skip = 4
-			}
+			skip := db.snapshotCompactorLockMissSkip(streak)
 			db.snapshot.compactSkipUntil.Store(seq + skip)
 			return false, true
 		}
@@ -757,6 +814,7 @@ func (db *DB[K, V]) compactLatestSnapshotOnce(force bool) (bool, bool) {
 		latest := db.snapshot.current.Load()
 		if latest != cur {
 			db.mu.Unlock()
+			db.snapshot.compactStaleRetry.Add(1)
 			continue
 		}
 
@@ -764,6 +822,7 @@ func (db *DB[K, V]) compactLatestSnapshotOnce(force bool) (bool, bool) {
 		db.mu.Unlock()
 		db.registerSnapshot(next)
 		db.snapshot.compactSucceeded.Add(1)
+		db.snapshot.compactMissStreak.Store(0)
 		db.snapshot.compactSkipUntil.Store(0)
 		return true, false
 	}
@@ -2557,16 +2616,20 @@ func (db *DB[K, V]) SnapshotStats() SnapshotStats {
 	s := db.getSnapshot()
 
 	diag := SnapshotStats{
-		TxID:               s.txID,
-		HasDelta:           s.hasAnyDeltaState(),
-		IndexDeltaFields:   s.indexDeltaCount(),
-		LenDeltaFields:     s.lenDeltaCount(),
-		CompactorRequested: db.snapshot.compactRequested.Load(),
-		CompactorRuns:      db.snapshot.compactRuns.Load(),
-		CompactorAttempts:  db.snapshot.compactAttempts.Load(),
-		CompactorSucceeded: db.snapshot.compactSucceeded.Load(),
-		CompactorLockMiss:  db.snapshot.compactLockMiss.Load(),
-		CompactorNoChange:  db.snapshot.compactNoChange.Load(),
+		TxID:                 s.txID,
+		HasDelta:             s.hasAnyDeltaState(),
+		IndexDeltaFields:     s.indexDeltaCount(),
+		LenDeltaFields:       s.lenDeltaCount(),
+		CompactorRequested:   db.snapshot.compactRequested.Load(),
+		CompactorRuns:        db.snapshot.compactRuns.Load(),
+		CompactorAttempts:    db.snapshot.compactAttempts.Load(),
+		CompactorSucceeded:   db.snapshot.compactSucceeded.Load(),
+		CompactorLockMiss:    db.snapshot.compactLockMiss.Load(),
+		CompactorNoChange:    db.snapshot.compactNoChange.Load(),
+		CompactorSoftSkip:    db.snapshot.compactSoftSkip.Load(),
+		CompactorSkippedWake: db.snapshot.compactSkippedWake.Load(),
+		CompactorIdleDefers:  db.snapshot.compactIdleDefers.Load(),
+		CompactorStaleRetry:  db.snapshot.compactStaleRetry.Load(),
 	}
 	diag.IndexDeltaKeys, diag.IndexDeltaOps = s.getIndexLayer().effectiveDeltaTotals()
 	diag.LenDeltaKeys, diag.LenDeltaOps = s.getLenLayer().effectiveDeltaTotals()

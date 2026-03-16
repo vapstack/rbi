@@ -1423,6 +1423,22 @@ func (db *DB[K, V]) materializedPredCacheKeyForScalar(field string, op qx.Op, ke
 	return materializedPredCacheKeyFromScalar(field, op, key)
 }
 
+func (db *DB[K, V]) materializedPredComplementCacheKeyForScalar(field string, op qx.Op, key string) string {
+	if !db.materializedPredCacheEnabled() {
+		return ""
+	}
+	switch op {
+	case qx.OpGT, qx.OpGTE, qx.OpLT, qx.OpLTE:
+	default:
+		return ""
+	}
+	if field == "" || key == "" {
+		return ""
+	}
+	return field + "\x1f" + "count_range_complement" + "\x1f" +
+		strconv.Itoa(int(op)) + "\x1f" + key
+}
+
 func (db *DB[K, V]) materializedPredCacheKey(e qx.Expr) string {
 	key, isSlice, err := db.exprValueToIdxScalar(qx.Expr{Op: e.Op, Field: e.Field, Value: e.Value})
 	if err != nil || isSlice {
@@ -2364,9 +2380,6 @@ func (db *DB[K, V]) buildPredicatesOrderedWithMode(leaves []qx.Expr, orderField 
 		var ov fieldOverlay
 		if !allowMaterialize {
 			ov = db.fieldOverlay(e.Field)
-			if ov.delta == nil {
-				predAllowMaterialize = true
-			}
 		}
 
 		p, ok := db.buildPredicateWithMode(e, predAllowMaterialize)
@@ -3011,6 +3024,15 @@ func orderedAnchorLeadOpWeight(op qx.Op) float64 {
 	}
 }
 
+func orderedPredicateIsRangeLike(p predicate) bool {
+	switch p.expr.Op {
+	case qx.OpGT, qx.OpGTE, qx.OpLT, qx.OpLTE, qx.OpPREFIX:
+		return true
+	default:
+		return false
+	}
+}
+
 func chooseOrderedAnchorLead(orderField string, preds []predicate, active []int) (int, bool) {
 	lead := -1
 	bestCard := uint64(0)
@@ -3061,7 +3083,23 @@ func (db *DB[K, V]) execPlanOrderedBasicAnchored(q *qx.QX, preds []predicate, ac
 		return nil, false
 	}
 
+	if orderedPredicateIsRangeLike(preds[leadIdx]) {
+		rangeLeadMax := uint64(max(needWindow*64, 65_536))
+		if preds[leadIdx].estCard > rangeLeadMax {
+			return nil, false
+		}
+	}
+
 	leadBudget, candidateCap := plannerOrderedAnchorBudgets(needWindow, len(active), preds[leadIdx].estCard)
+	if start == 0 && end == len(s) {
+		wideLeadMax := candidateCap * 8
+		if wideLeadMax < candidateCap {
+			wideLeadMax = ^uint64(0)
+		}
+		if preds[leadIdx].estCard > wideLeadMax {
+			return nil, false
+		}
+	}
 
 	leadIt := preds[leadIdx].newIter()
 	if leadIt == nil {
@@ -3280,6 +3318,28 @@ func (db *DB[K, V]) scanOrderedBaseSliceWithPredicates(q *qx.QX, preds []predica
 	out := make([]K, 0, int(q.Limit))
 	cursor := db.newQueryCursor(out, q.Offset, q.Limit, false, nil)
 
+	exactActiveBuf := getIntSliceBuf(len(active))
+	exactActive := buildBitmapFilterActive(exactActiveBuf.values, active, preds)
+	defer func() {
+		exactActiveBuf.values = exactActive
+		releaseIntSliceBuf(exactActiveBuf)
+	}()
+	exactOnly := len(active) > 0 && len(active) == len(exactActive)
+	residualActiveBuf := getIntSliceBuf(len(active))
+	residualActive := residualActiveBuf.values[:0]
+	defer func() {
+		residualActiveBuf.values = residualActive
+		releaseIntSliceBuf(residualActiveBuf)
+	}()
+	if len(exactActive) > 0 && len(exactActive) < len(active) {
+		for _, pi := range active {
+			if countIndexSliceContains(exactActive, pi) {
+				continue
+			}
+			residualActive = append(residualActive, pi)
+		}
+	}
+
 	singleActive := -1
 	if len(active) == 1 {
 		singleActive = active[0]
@@ -3287,8 +3347,31 @@ func (db *DB[K, V]) scanOrderedBaseSliceWithPredicates(q *qx.QX, preds []predica
 
 	bucketScratch := getRoaringBuf()
 	defer releaseRoaringBuf(bucketScratch)
+	var exactWork *roaring64.Bitmap
+	if len(exactActive) > 0 {
+		exactWork = getRoaringBuf()
+		defer releaseRoaringBuf(exactWork)
+	}
 
 	var scanWidth uint64
+
+	emitMatched := func(idx uint64) bool {
+		if trace != nil {
+			trace.addMatched(1)
+		}
+		return cursor.emit(idx)
+	}
+
+	emitMatchedBitmap := func(bm *roaring64.Bitmap, card uint64) bool {
+		if trace != nil {
+			trace.addMatched(card)
+		}
+		if cursor.skip >= card {
+			cursor.skip -= card
+			return false
+		}
+		return cursor.emitBitmap(bm)
+	}
 
 	emitBucket := func(bucket postingList) bool {
 		if bucket.IsEmpty() {
@@ -3302,14 +3385,14 @@ func (db *DB[K, V]) scanOrderedBaseSliceWithPredicates(q *qx.QX, preds []predica
 
 		if len(active) == 0 {
 			if bucket.isSingleton() {
-				return cursor.emit(bucket.single)
+				return emitMatched(bucket.single)
 			}
 			if bm := bucket.bitmap(); bm != nil {
-				return cursor.emitBitmap(bm)
+				return emitMatchedBitmap(bm, card)
 			}
 			stop := false
 			bucket.ForEach(func(idx uint64) bool {
-				if cursor.emit(idx) {
+				if emitMatched(idx) {
 					stop = true
 					return false
 				}
@@ -3326,7 +3409,7 @@ func (db *DB[K, V]) scanOrderedBaseSliceWithPredicates(q *qx.QX, preds []predica
 					return false
 				}
 			}
-			return cursor.emit(idx)
+			return emitMatched(idx)
 		}
 
 		var (
@@ -3339,6 +3422,9 @@ func (db *DB[K, V]) scanOrderedBaseSliceWithPredicates(q *qx.QX, preds []predica
 				return bucketBM
 			}
 			bucketBM, bucketOwned = bucket.ToBitmapOwned(bucketScratch)
+			if bucketOwned && trace != nil {
+				trace.addBitmapMaterialized(1)
+			}
 			bucketReady = true
 			return bucketBM
 		}
@@ -3348,45 +3434,53 @@ func (db *DB[K, V]) scanOrderedBaseSliceWithPredicates(q *qx.QX, preds []predica
 			}
 		}()
 
-		skipBucket := false
-		fullBucket := true
-		for _, pi := range active {
-			cnt, ok := preds[pi].countBucket(ensureBucketBM())
-			if !ok {
-				fullBucket = false
-				continue
+		exactApplied := false
+		iterSrc := bucket.Iter()
+		if len(exactActive) > 0 {
+			mode, exactBM, _ := plannerFilterBitmapByChecks(preds, exactActive, ensureBucketBM(), exactWork, cursor.skip > 0)
+			switch mode {
+			case plannerPredicateBucketEmpty:
+				return false
+			case plannerPredicateBucketAll:
+				if exactOnly {
+					return emitMatchedBitmap(exactBM, card)
+				}
+				iterSrc = exactBM.Iterator()
+				exactApplied = true
+			case plannerPredicateBucketExact:
+				if trace != nil {
+					trace.addBitmapExactFilter(1)
+				}
+				if exactBM == nil || exactBM.IsEmpty() {
+					return false
+				}
+				if exactOnly {
+					return emitMatchedBitmap(exactBM, exactBM.GetCardinality())
+				}
+				iterSrc = exactBM.Iterator()
+				exactApplied = true
 			}
-			if cnt == 0 {
-				skipBucket = true
-				break
-			}
-			if cnt != card {
-				fullBucket = false
-			}
-		}
-		if skipBucket {
-			return false
-		}
-		if fullBucket {
-			return cursor.emitBitmap(bucketBM)
 		}
 
-		if singleActive >= 0 && cursor.skip > 0 {
+		if !exactApplied && singleActive >= 0 && cursor.skip > 0 {
 			cnt, ok := preds[singleActive].countBucket(ensureBucketBM())
 			if ok && uint64(cnt) <= cursor.skip {
 				cursor.skip -= uint64(cnt)
+				if trace != nil {
+					trace.addMatched(uint64(cnt))
+				}
 				return false
 			}
 		}
 
-		if singleActive >= 0 {
+		if !exactApplied && singleActive >= 0 {
 			pred := preds[singleActive]
 			stop := false
 			bucket.ForEach(func(idx uint64) bool {
 				if !pred.hasContains() || !pred.matches(idx) {
 					return true
 				}
-				if cursor.emit(idx) {
+				if emitMatched(idx) {
 					stop = true
 					return false
 				}
@@ -3396,19 +3490,24 @@ func (db *DB[K, V]) scanOrderedBaseSliceWithPredicates(q *qx.QX, preds []predica
 		}
 
 		stop := false
-		bucket.ForEach(func(idx uint64) bool {
-			for _, pi := range active {
+		for iterSrc.HasNext() {
+			idx := iterSrc.Next()
+			checks := active
+			if exactApplied {
+				checks = residualActive
+			}
+			for _, pi := range checks {
 				p := preds[pi]
 				if !p.hasContains() || !p.matches(idx) {
-					return true
+					goto nextCandidate
 				}
 			}
-			if cursor.emit(idx) {
+			if emitMatched(idx) {
 				stop = true
-				return false
+				break
 			}
-			return true
-		})
+		nextCandidate:
+		}
 		return stop
 	}
 

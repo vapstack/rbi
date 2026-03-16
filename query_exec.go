@@ -161,6 +161,19 @@ func prefixRangeEndIndex(s []index, prefix string, start int) int {
 
 const iteratorThreshold = 2048 // 256
 
+func shouldTryOrderedPredicateExecutionBaseOps(orderField string, baseOps []qx.Expr) bool {
+	for _, op := range baseOps {
+		if op.Not || op.Field == orderField {
+			continue
+		}
+		switch op.Op {
+		case qx.OpGT, qx.OpGTE, qx.OpLT, qx.OpLTE:
+			return true
+		}
+	}
+	return false
+}
+
 func (db *DB[K, V]) tryQueryOrderBasicWithLimit(q *qx.QX, trace *queryTrace) ([]K, bool, error) {
 
 	if len(q.Order) != 1 || q.Limit == 0 {
@@ -209,10 +222,10 @@ func (db *DB[K, V]) tryQueryOrderBasicWithLimit(q *qx.QX, trace *queryTrace) ([]
 	}
 
 	for _, op := range ops {
-		if op.Not {
-			return nil, false, nil
-		}
 		if op.Field == f {
+			if op.Not {
+				return nil, false, nil
+			}
 			switch op.Op {
 			case qx.OpGT, qx.OpGTE, qx.OpLT, qx.OpLTE, qx.OpEQ:
 				k, isSlice, err := db.exprValueToIdxScalar(op)
@@ -290,6 +303,23 @@ func (db *DB[K, V]) tryQueryOrderBasicWithLimit(q *qx.QX, trace *queryTrace) ([]
 	br := ov.rangeForBounds(rb)
 	if br.baseStart >= br.baseEnd && br.deltaStart >= br.deltaEnd {
 		return nil, true, nil
+	}
+
+	if len(baseOps) > 0 && shouldTryOrderedPredicateExecutionBaseOps(f, baseOps) {
+		if leaves, ok := collectAndLeaves(q.Expr); ok {
+			preds, ok := db.buildPredicatesOrderedWithMode(leaves, f, false)
+			if ok {
+				defer releasePredicates(preds)
+				for i := range preds {
+					if preds[i].alwaysFalse {
+						return nil, true, nil
+					}
+				}
+				if out, ok := db.execPlanOrderedBasic(q, preds, trace); ok {
+					return out, true, nil
+				}
+			}
+		}
 	}
 
 	if len(baseOps) == 0 {
@@ -500,6 +530,28 @@ func (db *DB[K, V]) scanOrderLimitWithPredicates(q *qx.QX, ov fieldOverlay, br o
 	}
 	sortActivePredicates(active, preds)
 
+	exactActiveBuf := getIntSliceBuf(len(active))
+	exactActive := buildBitmapFilterActive(exactActiveBuf.values, active, preds)
+	defer func() {
+		exactActiveBuf.values = exactActive
+		releaseIntSliceBuf(exactActiveBuf)
+	}()
+	exactOnly := len(active) > 0 && len(active) == len(exactActive)
+	residualActiveBuf := getIntSliceBuf(len(active))
+	residualActive := residualActiveBuf.values[:0]
+	defer func() {
+		residualActiveBuf.values = residualActive
+		releaseIntSliceBuf(residualActiveBuf)
+	}()
+	if len(exactActive) > 0 && len(exactActive) < len(active) {
+		for _, pi := range active {
+			if countIndexSliceContains(exactActive, pi) {
+				continue
+			}
+			residualActive = append(residualActive, pi)
+		}
+	}
+
 	out := make([]K, 0, q.Limit)
 	cursor := db.newQueryCursor(out, q.Offset, q.Limit, false, nil)
 
@@ -513,6 +565,11 @@ func (db *DB[K, V]) scanOrderLimitWithPredicates(q *qx.QX, ov fieldOverlay, br o
 		scratch = getRoaringBuf()
 		defer releaseRoaringBuf(scratch)
 	}
+	var exactWork *roaring64.Bitmap
+	if len(exactActive) > 0 {
+		exactWork = getRoaringBuf()
+		defer releaseRoaringBuf(exactWork)
+	}
 
 	emitCandidate := func(idx uint64) bool {
 		examined++
@@ -521,47 +578,61 @@ func (db *DB[K, V]) scanOrderLimitWithPredicates(q *qx.QX, ov fieldOverlay, br o
 				return false
 			}
 		}
+		if trace != nil {
+			trace.addMatched(1)
+		}
 		return cursor.emit(idx)
 	}
 
 	emitBitmap := func(bm *roaring64.Bitmap, card uint64) bool {
 		examined += card
+		if trace != nil {
+			trace.addMatched(card)
+		}
+		if cursor.skip >= card {
+			cursor.skip -= card
+			return false
+		}
 		return cursor.emitBitmap(bm)
 	}
 
-	tryBucketBitmap := func(bm *roaring64.Bitmap) (handled bool, stop bool) {
+	tryBucketBitmap := func(bm *roaring64.Bitmap) (current *roaring64.Bitmap, exactApplied bool, handled bool, stop bool) {
 		if bm == nil || bm.IsEmpty() {
-			return true, false
+			return nil, false, true, false
 		}
 		card := bm.GetCardinality()
 		if len(active) == 0 {
-			return true, emitBitmap(bm, card)
+			return bm, false, true, emitBitmap(bm, card)
+		}
+		if len(exactActive) == 0 {
+			return bm, false, false, false
 		}
 
-		skipBucket := false
-		fullBucket := true
-		for _, pi := range active {
-			bucketCnt, ok := preds[pi].countBucket(bm)
-			if !ok {
-				fullBucket = false
-				continue
-			}
-			if bucketCnt == 0 {
-				skipBucket = true
-				break
-			}
-			if bucketCnt != card {
-				fullBucket = false
-			}
-		}
-		if skipBucket {
+		mode, exactBM, _ := plannerFilterBitmapByChecks(preds, exactActive, bm, exactWork, cursor.skip > 0)
+		switch mode {
+		case plannerPredicateBucketEmpty:
 			examined += card
-			return true, false
+			return nil, false, true, false
+		case plannerPredicateBucketAll:
+			if exactOnly {
+				return exactBM, true, true, emitBitmap(exactBM, card)
+			}
+			return exactBM, true, false, false
+		case plannerPredicateBucketExact:
+			if trace != nil {
+				trace.addBitmapExactFilter(1)
+			}
+			if exactBM == nil || exactBM.IsEmpty() {
+				examined += card
+				return nil, true, true, false
+			}
+			if exactOnly {
+				return exactBM, true, true, emitBitmap(exactBM, exactBM.GetCardinality())
+			}
+			return exactBM, true, false, false
+		default:
+			return bm, false, false, false
 		}
-		if fullBucket {
-			return true, emitBitmap(bm, card)
-		}
-		return false, false
 	}
 
 	emitPosting := func(ids postingList) bool {
@@ -572,15 +643,48 @@ func (db *DB[K, V]) scanOrderLimitWithPredicates(q *qx.QX, ov fieldOverlay, br o
 			return emitCandidate(ids.single)
 		}
 
-		if bm := ids.bitmap(); bm != nil {
-			if handled, stop := tryBucketBitmap(bm); handled {
+		iterSrc := ids.Iter()
+		exactApplied := false
+		if len(active) == 0 || len(exactActive) > 0 {
+			bm, owned := ids.ToBitmapOwned(scratch)
+			if owned && trace != nil {
+				trace.addBitmapMaterialized(1)
+			}
+			if current, applied, handled, stop := tryBucketBitmap(bm); handled {
+				if owned && bm != nil && bm != scratch {
+					releaseRoaringBuf(bm)
+				}
 				return stop
+			} else if applied && current != nil {
+				iterSrc = current.Iterator()
+				exactApplied = true
+			}
+			if owned && bm != nil && bm != scratch {
+				releaseRoaringBuf(bm)
 			}
 		}
 
-		it := ids.Iter()
-		for it.HasNext() {
-			if emitCandidate(it.Next()) {
+		for iterSrc.HasNext() {
+			idx := iterSrc.Next()
+			examined++
+			checks := active
+			if exactApplied {
+				checks = residualActive
+			}
+			pass := true
+			for _, pi := range checks {
+				if !preds[pi].matches(idx) {
+					pass = false
+					break
+				}
+			}
+			if !pass {
+				continue
+			}
+			if trace != nil {
+				trace.addMatched(1)
+			}
+			if cursor.emit(idx) {
 				return true
 			}
 		}
@@ -628,7 +732,12 @@ func (db *DB[K, V]) scanOrderLimitWithPredicates(q *qx.QX, ov fieldOverlay, br o
 		}
 		scanWidth++
 
-		if handled, stop := tryBucketBitmap(bm); handled {
+		if owned && trace != nil {
+			trace.addBitmapMaterialized(1)
+		}
+		iterSrc := bm.Iterator()
+		exactApplied := false
+		if current, applied, handled, stop := tryBucketBitmap(bm); handled {
 			if owned && bm != scratch {
 				releaseRoaringBuf(bm)
 			}
@@ -641,11 +750,32 @@ func (db *DB[K, V]) scanOrderLimitWithPredicates(q *qx.QX, ov fieldOverlay, br o
 				return cursor.out, true
 			}
 			continue
+		} else if applied && current != nil {
+			iterSrc = current.Iterator()
+			exactApplied = true
 		}
 
-		it := bm.Iterator()
-		for it.HasNext() {
-			if emitCandidate(it.Next()) {
+		for iterSrc.HasNext() {
+			idx := iterSrc.Next()
+			examined++
+			checks := active
+			if exactApplied {
+				checks = residualActive
+			}
+			pass := true
+			for _, pi := range checks {
+				if !preds[pi].matches(idx) {
+					pass = false
+					break
+				}
+			}
+			if !pass {
+				continue
+			}
+			if trace != nil {
+				trace.addMatched(1)
+			}
+			if cursor.emit(idx) {
 				if owned && bm != scratch {
 					releaseRoaringBuf(bm)
 				}
@@ -720,6 +850,9 @@ func (db *DB[K, V]) tryQueryOrderPrefixWithLimit(q *qx.QX, trace *queryTrace) ([
 			return nil, false, nil
 		}
 		if op.Field == f && op.Op == qx.OpPREFIX {
+			if op.Not {
+				return nil, false, nil
+			}
 			p, isSlice, err := db.exprValueToIdxScalar(op)
 			if err != nil {
 				return nil, true, err

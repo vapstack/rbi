@@ -663,7 +663,10 @@ func executionOrderShapeInfo(orderField string, leaves []qx.Expr) (hasPrefix boo
 			continue
 		}
 		if e.Not {
-			return false, false, false
+			if e.Field == "" || e.Field == orderField {
+				return false, false, false
+			}
+			continue
 		}
 		if e.Field == "" {
 			return false, false, false
@@ -760,10 +763,6 @@ func (db *DB[K, V]) decideExecutionOrderByCost(q *qx.QX, leaves []qx.Expr) plann
 			return d
 		}
 		orderDistinct = uint64(len(*orderSlice))
-	}
-
-	if profile.hasNeg {
-		return d
 	}
 
 	plan := PlanLimitOrderBasic

@@ -1247,6 +1247,90 @@ func TestPlannerRouting_PrefersOrderedAnchorForMixedPredicates(t *testing.T) {
 	}
 }
 
+func TestOrderedFallback_TracksMatchedRowsAndExactBitmapFilters(t *testing.T) {
+	var (
+		mu     sync.Mutex
+		events []TraceEvent
+	)
+
+	sink := func(ev TraceEvent) {
+		mu.Lock()
+		events = append(events, ev)
+		mu.Unlock()
+	}
+
+	db, _ := openTempDBUint64(t, Options{
+		AnalyzeInterval:  -1,
+		TraceSink:        sink,
+		TraceSampleEvery: 1,
+	})
+	_ = seedData(t, db, 20_000)
+
+	q := normalizeQuery(qx.Query(
+		qx.EQ("active", true),
+		qx.HAS("tags", []string{"go"}),
+	).By("country", qx.ASC).Skip(200).Max(40))
+
+	leaves, ok := collectAndLeaves(q.Expr)
+	if !ok {
+		t.Fatalf("collectAndLeaves: ok=false")
+	}
+	preds, ok := db.buildPredicatesOrdered(leaves, "country")
+	if !ok {
+		t.Fatalf("buildPredicatesOrdered: ok=false")
+	}
+	defer releasePredicates(preds)
+
+	slice := db.snapshotFieldIndexSlice("country")
+	if slice == nil || len(*slice) == 0 {
+		t.Fatalf("country slice must be present")
+	}
+
+	active := make([]int, 0, len(preds))
+	for i := range preds {
+		p := preds[i]
+		if p.covered || p.alwaysTrue {
+			continue
+		}
+		if p.alwaysFalse {
+			t.Fatalf("unexpected alwaysFalse predicate")
+		}
+		active = append(active, i)
+	}
+
+	tr := db.beginTrace(q)
+	if tr == nil {
+		t.Fatalf("expected trace to be enabled")
+	}
+	tr.setPlan(PlanOrdered)
+	got := db.execPlanOrderedBasicFallback(q, preds, active, 0, len(*slice), *slice, tr)
+	tr.finish(uint64(len(got)), nil)
+
+	want, err := expectedKeysUint64(t, db, q)
+	if err != nil {
+		t.Fatalf("expectedKeysUint64: %v", err)
+	}
+	if !slices.Equal(got, want) {
+		t.Fatalf("ordered fallback mismatch:\ngot=%v\nwant=%v", got, want)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(events) == 0 {
+		t.Fatalf("expected trace event")
+	}
+	ev := events[len(events)-1]
+	if ev.BitmapExactFilters == 0 {
+		t.Fatalf("expected exact bitmap bucket filtering to be used, trace=%+v", ev)
+	}
+	if ev.RowsMatched <= ev.RowsReturned {
+		t.Fatalf("expected matched rows to exceed returned rows under OFFSET, trace=%+v", ev)
+	}
+	if ev.OrderIndexScanWidth == 0 {
+		t.Fatalf("expected non-zero order scan width")
+	}
+}
+
 func TestPlannerRouting_PrefersExecutionForPrefixOrderLimit(t *testing.T) {
 	var (
 		mu     sync.Mutex
@@ -1745,6 +1829,9 @@ func TestPlannerRouting_OrderLimitWithSecondaryRange_MatchesSeqScan(t *testing.T
 	if ev.RowsExamined == 0 {
 		t.Fatalf("expected rows examined to be recorded")
 	}
+	if ev.RowsMatched == 0 {
+		t.Fatalf("expected rows matched to be recorded")
+	}
 }
 
 func TestPlannerRouting_OrderLimitWithSecondaryRangeAndHasAny_MatchesSeqScan(t *testing.T) {
@@ -1798,6 +1885,38 @@ func TestPlannerRouting_OrderLimitWithSecondaryRangeAndHasAny_MatchesSeqScan(t *
 	if ev.RowsExamined == 0 {
 		t.Fatalf("expected rows examined to be recorded")
 	}
+}
+
+func TestExecutionPlan_OrderLimitWithNegativeResidual_MatchesSeqScan(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{
+		AnalyzeInterval: -1,
+	})
+	_ = seedData(t, db, 20_000)
+
+	q := normalizeQuery(qx.Query(
+		qx.PREFIX("full_name", "FN-1"),
+		qx.EQ("active", true),
+		qx.NOTIN("country", []string{"NL", "DE"}),
+	).By("score", qx.DESC).Max(100))
+
+	got, err := db.QueryKeys(q)
+	if err != nil {
+		t.Fatalf("QueryKeys: %v", err)
+	}
+	want, err := expectedKeysUint64(t, db, q)
+	if err != nil {
+		t.Fatalf("expectedKeysUint64: %v", err)
+	}
+	assertQueryIDsEqual(t, q, got, want)
+
+	execOut, ok, err := db.tryExecutionPlan(q, nil)
+	if err != nil {
+		t.Fatalf("tryExecutionPlan: %v", err)
+	}
+	if !ok {
+		t.Fatalf("expected execution plan to be applicable")
+	}
+	assertQueryIDsEqual(t, q, execOut, want)
 }
 
 func TestPlannerRouting_OrderedNoOrderWithNegativeIN_MatchesSeqScan(t *testing.T) {

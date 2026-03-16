@@ -732,14 +732,19 @@ type snapshot struct {
 	compactPinsBlocked  atomic.Bool
 	compactLastActivity atomic.Int64
 
-	compactRequested atomic.Uint64
-	compactRuns      atomic.Uint64
-	compactAttempts  atomic.Uint64
-	compactSucceeded atomic.Uint64
-	compactLockMiss  atomic.Uint64
-	compactNoChange  atomic.Uint64
-	compactWriteSeq  atomic.Uint64
-	compactSkipUntil atomic.Uint64
+	compactRequested   atomic.Uint64
+	compactRuns        atomic.Uint64
+	compactAttempts    atomic.Uint64
+	compactSucceeded   atomic.Uint64
+	compactLockMiss    atomic.Uint64
+	compactNoChange    atomic.Uint64
+	compactSoftSkip    atomic.Uint64
+	compactSkippedWake atomic.Uint64
+	compactIdleDefers  atomic.Uint64
+	compactStaleRetry  atomic.Uint64
+	compactMissStreak  atomic.Uint64
+	compactWriteSeq    atomic.Uint64
+	compactSkipUntil   atomic.Uint64
 
 	wait *sync.Cond
 	mu   sync.RWMutex
@@ -768,6 +773,10 @@ type autoBatcher[K ~string | ~uint64, V any] struct {
 	executedBatches    atomic.Uint64
 	multiReqBatches    atomic.Uint64
 	multiReqOps        atomic.Uint64
+	batchSize1         atomic.Uint64
+	batchSize2To4      atomic.Uint64
+	batchSize5To8      atomic.Uint64
+	batchSize9Plus     atomic.Uint64
 	callbackOps        atomic.Uint64
 	coalescedSetDelete atomic.Uint64
 	maxBatchSeen       atomic.Uint64
@@ -995,6 +1004,14 @@ type (
 		MultiRequestBatches uint64
 		// MultiRequestOps is total requests executed inside multi-request batches.
 		MultiRequestOps uint64
+		// BatchSize1 is number of executed single-request batches.
+		BatchSize1 uint64
+		// BatchSize2To4 is number of executed batches sized 2..4.
+		BatchSize2To4 uint64
+		// BatchSize5To8 is number of executed batches sized 5..8.
+		BatchSize5To8 uint64
+		// BatchSize9Plus is number of executed batches sized 9+.
+		BatchSize9Plus uint64
 		// AvgBatchSize is average requests per executed batch.
 		AvgBatchSize float64
 		// MaxBatchSeen is maximum observed executed batch size.
@@ -1091,6 +1108,18 @@ type (
 		CompactorLockMiss uint64
 		// CompactorNoChange is total attempts that produced no effective changes.
 		CompactorNoChange uint64
+		// CompactorSoftSkip is number of non-force compactor runs skipped because
+		// current snapshot pressure was too low to justify merge work.
+		CompactorSoftSkip uint64
+		// CompactorSkippedWake is number of wake requests suppressed because
+		// compactor was already backoff-limited or already queued.
+		CompactorSkippedWake uint64
+		// CompactorIdleDefers is number of forced idle compactions deferred
+		// because the system was no longer idle by the time the run started.
+		CompactorIdleDefers uint64
+		// CompactorStaleRetry is number of stale compaction builds discarded
+		// because a newer snapshot was published before apply.
+		CompactorStaleRetry uint64
 	}
 )
 
@@ -1437,6 +1466,10 @@ func (db *DB[K, V]) AutoBatchStats() AutoBatchStats {
 		ExecutedBatches:     db.autoBatcher.executedBatches.Load(),
 		MultiRequestBatches: db.autoBatcher.multiReqBatches.Load(),
 		MultiRequestOps:     db.autoBatcher.multiReqOps.Load(),
+		BatchSize1:          db.autoBatcher.batchSize1.Load(),
+		BatchSize2To4:       db.autoBatcher.batchSize2To4.Load(),
+		BatchSize5To8:       db.autoBatcher.batchSize5To8.Load(),
+		BatchSize9Plus:      db.autoBatcher.batchSize9Plus.Load(),
 		MaxBatchSeen:        db.autoBatcher.maxBatchSeen.Load(),
 		CallbackOps:         db.autoBatcher.callbackOps.Load(),
 		CoalescedSetDelete:  db.autoBatcher.coalescedSetDelete.Load(),

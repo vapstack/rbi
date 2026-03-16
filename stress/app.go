@@ -32,6 +32,7 @@ type app struct {
 	queryFilter    []string
 	queryBreakdown bool
 	queryLatency   bool
+	jitter         bool
 	traces         *plannerTraceCollector
 
 	stopCh   chan struct{}
@@ -83,6 +84,7 @@ type runEpoch struct {
 
 type tpsState struct {
 	lastCount uint64
+	lastPause uint64
 	lastAt    time.Time
 	current   float64
 	min       float64
@@ -103,6 +105,8 @@ type viewSnapshot struct {
 type classCapture struct {
 	report  classReport
 	latency []float64
+	paused  uint64
+	workers int
 }
 
 type workerCommand struct {
@@ -112,7 +116,7 @@ type workerCommand struct {
 	Value   int
 }
 
-func newApp(handle *DBHandle, catalog []*classDescriptor, refreshEvery, telemetryEvery time.Duration, reportPath string, classFilter, queryFilter []string, queryBreakdown, queryLatency bool, traces *plannerTraceCollector) *app {
+func newApp(handle *DBHandle, catalog []*classDescriptor, refreshEvery, telemetryEvery time.Duration, reportPath string, classFilter, queryFilter []string, queryBreakdown, queryLatency, jitter bool, traces *plannerTraceCollector) *app {
 	workCtx := &WorkloadContext{
 		DB:           handle.DB,
 		MaxIDPtr:     &handle.MaxID,
@@ -128,6 +132,7 @@ func newApp(handle *DBHandle, catalog []*classDescriptor, refreshEvery, telemetr
 		queryFilter:    append([]string(nil), queryFilter...),
 		queryBreakdown: queryBreakdown,
 		queryLatency:   queryLatency,
+		jitter:         jitter,
 		traces:         traces,
 		stopCh:         make(chan struct{}),
 		classes:        make([]*classController, 0, len(catalog)),
@@ -283,21 +288,30 @@ func (a *app) sampleCounts(now time.Time) {
 
 	var readCompleted uint64
 	var writeCompleted uint64
+	var readPaused uint64
+	var writePaused uint64
+	var readWorkers int
+	var writeWorkers int
 
 	for _, class := range a.classes {
-		completed, _ := class.currentCounts()
-		_, _ = epoch.observeScope("class:"+class.desc.Info.Name, completed, now)
+		workers := class.workerCount()
+		completed, _, paused := class.currentCounts()
+		_, _ = epoch.observeScope("class:"+class.desc.Info.Name, completed, paused, workers, now)
 		switch class.desc.Info.Role {
 		case RoleRead:
 			readCompleted += completed
+			readPaused += paused
+			readWorkers += workers
 		case RoleWrite:
 			writeCompleted += completed
+			writePaused += paused
+			writeWorkers += workers
 		}
 	}
 
-	_, _ = epoch.observeScope("role:read", readCompleted, now)
-	_, _ = epoch.observeScope("role:write", writeCompleted, now)
-	_, _ = epoch.observeScope("role:total", readCompleted+writeCompleted, now)
+	_, _ = epoch.observeScope("role:read", readCompleted, readPaused, readWorkers, now)
+	_, _ = epoch.observeScope("role:write", writeCompleted, writePaused, writeWorkers, now)
+	_, _ = epoch.observeScope("role:total", readCompleted+writeCompleted, readPaused+writePaused, readWorkers+writeWorkers, now)
 }
 
 func (a *app) buildSnapshot(now time.Time, includeWorkers bool) viewSnapshot {
@@ -318,6 +332,10 @@ func (a *app) buildSnapshot(now time.Time, includeWorkers bool) viewSnapshot {
 	var readErrors uint64
 	var writeCompleted uint64
 	var writeErrors uint64
+	var readPaused uint64
+	var writePaused uint64
+	var readWorkers int
+	var writeWorkers int
 
 	for _, class := range a.classes {
 		capture := class.capture(now, epoch, planner, includeWorkers)
@@ -327,10 +345,14 @@ func (a *app) buildSnapshot(now time.Time, includeWorkers bool) viewSnapshot {
 		case RoleRead:
 			readCompleted += capture.report.Stats.CompletedOps
 			readErrors += capture.report.Stats.Errors
+			readPaused += capture.paused
+			readWorkers += capture.workers
 			readLatency = append(readLatency, capture.latency...)
 		case RoleWrite:
 			writeCompleted += capture.report.Stats.CompletedOps
 			writeErrors += capture.report.Stats.Errors
+			writePaused += capture.paused
+			writeWorkers += capture.workers
 			writeLatency = append(writeLatency, capture.latency...)
 		}
 	}
@@ -338,24 +360,24 @@ func (a *app) buildSnapshot(now time.Time, includeWorkers bool) viewSnapshot {
 	out.Totals.Read = scopeReport{
 		CompletedOps: readCompleted,
 		Errors:       readErrors,
-		AverageTPS:   averageTPS(readCompleted, epoch.startedAt, now),
+		AverageTPS:   averageTPS(readCompleted, epoch.startedAt, now, readPaused, readWorkers),
 		Latency:      summarizeLatencies(readLatency),
 	}
 	out.Totals.Write = scopeReport{
 		CompletedOps: writeCompleted,
 		Errors:       writeErrors,
-		AverageTPS:   averageTPS(writeCompleted, epoch.startedAt, now),
+		AverageTPS:   averageTPS(writeCompleted, epoch.startedAt, now, writePaused, writeWorkers),
 		Latency:      summarizeLatencies(writeLatency),
 	}
 	out.Totals.Total = scopeReport{
 		CompletedOps: readCompleted + writeCompleted,
 		Errors:       readErrors + writeErrors,
-		AverageTPS:   averageTPS(readCompleted+writeCompleted, epoch.startedAt, now),
+		AverageTPS:   averageTPS(readCompleted+writeCompleted, epoch.startedAt, now, readPaused+writePaused, readWorkers+writeWorkers),
 		Latency:      summarizeLatencies(totalLatency),
 	}
-	out.Totals.Read.CurrentTPS, out.Totals.Read.MinTPS = epoch.observeScope("role:read", readCompleted, now)
-	out.Totals.Write.CurrentTPS, out.Totals.Write.MinTPS = epoch.observeScope("role:write", writeCompleted, now)
-	out.Totals.Total.CurrentTPS, out.Totals.Total.MinTPS = epoch.observeScope("role:total", readCompleted+writeCompleted, now)
+	out.Totals.Read.CurrentTPS, out.Totals.Read.MinTPS = epoch.observeScope("role:read", readCompleted, readPaused, readWorkers, now)
+	out.Totals.Write.CurrentTPS, out.Totals.Write.MinTPS = epoch.observeScope("role:write", writeCompleted, writePaused, writeWorkers, now)
+	out.Totals.Total.CurrentTPS, out.Totals.Total.MinTPS = epoch.observeScope("role:total", readCompleted+writeCompleted, readPaused+writePaused, readWorkers+writeWorkers, now)
 
 	out.Memory, out.Snapshot, out.Batch = epoch.latestTelemetry()
 	return out
@@ -522,10 +544,11 @@ func (c *classController) resetMetrics() {
 	}
 }
 
-func (c *classController) currentCounts() (uint64, uint64) {
+func (c *classController) currentCounts() (uint64, uint64, uint64) {
 	workers := c.snapshotWorkers()
 	var completed uint64
 	var errors uint64
+	var paused uint64
 	for _, worker := range workers {
 		metrics := worker.metrics.Load()
 		if metrics == nil {
@@ -534,8 +557,9 @@ func (c *classController) currentCounts() (uint64, uint64) {
 		workerCompleted, workerErrors := metrics.counts()
 		completed += workerCompleted
 		errors += workerErrors
+		paused += metrics.jitterNS.Load()
 	}
-	return completed, errors
+	return completed, errors, paused
 }
 
 func (c *classController) capture(now time.Time, epoch *runEpoch, planner plannerTraceSnapshot, includeWorkers bool) classCapture {
@@ -553,6 +577,7 @@ func (c *classController) capture(now time.Time, epoch *runEpoch, planner planne
 
 	var completed uint64
 	var errors uint64
+	var paused uint64
 	classLatency := make([]float64, 0, len(workers)*128)
 	var queryAgg map[string]*queryAggregate
 	if c.app.queryBreakdown {
@@ -570,6 +595,7 @@ func (c *classController) capture(now time.Time, epoch *runEpoch, planner planne
 		metricsSnapshot := metrics.snapshot(true)
 		completed += metricsSnapshot.total
 		errors += metricsSnapshot.errors
+		paused += metricsSnapshot.jitterNS
 		classLatency = append(classLatency, metricsSnapshot.latency...)
 		if c.app.queryBreakdown {
 			mergeQueryAggregates(queryAgg, metricsSnapshot)
@@ -582,15 +608,15 @@ func (c *classController) capture(now time.Time, epoch *runEpoch, planner planne
 	report.Stats = scopeReport{
 		CompletedOps: completed,
 		Errors:       errors,
-		AverageTPS:   averageTPS(completed, epoch.startedAt, now),
+		AverageTPS:   averageTPS(completed, epoch.startedAt, now, paused, len(workers)),
 		Latency:      summarizeLatencies(classLatency),
 	}
-	report.Stats.CurrentTPS, report.Stats.MinTPS = epoch.observeScope("class:"+c.desc.Info.Name, completed, now)
+	report.Stats.CurrentTPS, report.Stats.MinTPS = epoch.observeScope("class:"+c.desc.Info.Name, completed, paused, len(workers), now)
 	if c.app.queryBreakdown {
-		report.Queries = buildQueryReports(c.desc, queryAgg, planner, epoch, now)
+		report.Queries = buildQueryReports(c.desc, queryAgg, planner, epoch, now, paused, len(workers))
 	}
 
-	return classCapture{report: report, latency: classLatency}
+	return classCapture{report: report, latency: classLatency, paused: paused, workers: len(workers)}
 }
 
 func (a *app) runWorker(class *classController, worker *workerHandle) {
@@ -624,10 +650,22 @@ func (a *app) runWorker(class *classController, worker *workerHandle) {
 		if err != nil {
 			errCount = 1
 		}
-		if metrics := worker.metrics.Load(); metrics != nil {
+		metrics := worker.metrics.Load()
+		if metrics != nil {
 			metrics.observe(kind, latencyNS, errCount)
 		}
+		if a.jitter {
+			jitterStarted := time.Now()
+			time.Sleep(jitterDelay(rng))
+			if metrics != nil {
+				metrics.addJitter(uint64(time.Since(jitterStarted)))
+			}
+		}
 	}
+}
+
+func jitterDelay(rng *rand.Rand) time.Duration {
+	return time.Duration(500+rng.IntN(501)) * time.Microsecond
 }
 
 func newRunEpoch(handle *DBHandle, traces *plannerTraceCollector) *runEpoch {
@@ -656,7 +694,7 @@ func newRunEpoch(handle *DBHandle, traces *plannerTraceCollector) *runEpoch {
 	}
 }
 
-func (e *runEpoch) observeScope(key string, completed uint64, now time.Time) (float64, float64) {
+func (e *runEpoch) observeScope(key string, completed uint64, paused uint64, workers int, now time.Time) (float64, float64) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
@@ -666,6 +704,9 @@ func (e *runEpoch) observeScope(key string, completed uint64, now time.Time) (fl
 		e.tps[key] = state
 	}
 	interval := now.Sub(state.lastAt).Seconds()
+	if workers > 0 && paused >= state.lastPause {
+		interval -= (float64(paused-state.lastPause) / float64(workers)) / float64(time.Second)
+	}
 	if interval <= 0 {
 		interval = 1
 	}
@@ -679,6 +720,7 @@ func (e *runEpoch) observeScope(key string, completed uint64, now time.Time) (fl
 		state.min = current
 	}
 	state.lastCount = completed
+	state.lastPause = paused
 	state.lastAt = now
 	state.seen = true
 	return state.current, state.min
@@ -760,7 +802,7 @@ func mergeQueryAggregates(dst map[string]*queryAggregate, metrics workerMetricsS
 	}
 }
 
-func buildQueryReports(desc *classDescriptor, agg map[string]*queryAggregate, planner plannerTraceSnapshot, epoch *runEpoch, now time.Time) []queryReport {
+func buildQueryReports(desc *classDescriptor, agg map[string]*queryAggregate, planner plannerTraceSnapshot, epoch *runEpoch, now time.Time, paused uint64, workers int) []queryReport {
 	names := make([]string, 0, len(desc.Info.Queries)+len(agg))
 	seen := make(map[string]struct{}, len(desc.Info.Queries)+len(agg))
 	for _, query := range desc.Info.Queries {
@@ -792,11 +834,11 @@ func buildQueryReports(desc *classDescriptor, agg map[string]*queryAggregate, pl
 		if queryAgg != nil {
 			stats.CompletedOps = queryAgg.completed
 			stats.Errors = queryAgg.errors
-			stats.AverageTPS = averageTPS(queryAgg.completed, epoch.startedAt, now)
+			stats.AverageTPS = averageTPS(queryAgg.completed, epoch.startedAt, now, paused, workers)
 			stats.Latency = summarizeLatencies(queryAgg.latency)
-			stats.CurrentTPS, stats.MinTPS = epoch.observeScope("query:"+desc.Info.Name+":"+name, queryAgg.completed, now)
+			stats.CurrentTPS, stats.MinTPS = epoch.observeScope("query:"+desc.Info.Name+":"+name, queryAgg.completed, paused, workers, now)
 		} else {
-			stats.CurrentTPS, stats.MinTPS = epoch.observeScope("query:"+desc.Info.Name+":"+name, 0, now)
+			stats.CurrentTPS, stats.MinTPS = epoch.observeScope("query:"+desc.Info.Name+":"+name, 0, paused, workers, now)
 		}
 		out = append(out, queryReport{
 			Name:    name,
@@ -873,8 +915,11 @@ func groupLabel(group string) string {
 	}
 }
 
-func averageTPS(completed uint64, startedAt, now time.Time) float64 {
+func averageTPS(completed uint64, startedAt, now time.Time, paused uint64, workers int) float64 {
 	seconds := now.Sub(startedAt).Seconds()
+	if workers > 0 {
+		seconds -= (float64(paused) / float64(workers)) / float64(time.Second)
+	}
 	if seconds <= 0 {
 		return 0
 	}
@@ -894,12 +939,16 @@ func makeSnapshotSample(now time.Time, baseline, current rbi.SnapshotStats) snap
 		CapturedAt: now.Format(time.RFC3339Nano),
 		Stats:      current,
 		Delta: snapshotDelta{
-			CompactorRequested: deltaUint64(current.CompactorRequested, baseline.CompactorRequested),
-			CompactorRuns:      deltaUint64(current.CompactorRuns, baseline.CompactorRuns),
-			CompactorAttempts:  deltaUint64(current.CompactorAttempts, baseline.CompactorAttempts),
-			CompactorSucceeded: deltaUint64(current.CompactorSucceeded, baseline.CompactorSucceeded),
-			CompactorLockMiss:  deltaUint64(current.CompactorLockMiss, baseline.CompactorLockMiss),
-			CompactorNoChange:  deltaUint64(current.CompactorNoChange, baseline.CompactorNoChange),
+			CompactorRequested:   deltaUint64(current.CompactorRequested, baseline.CompactorRequested),
+			CompactorRuns:        deltaUint64(current.CompactorRuns, baseline.CompactorRuns),
+			CompactorAttempts:    deltaUint64(current.CompactorAttempts, baseline.CompactorAttempts),
+			CompactorSucceeded:   deltaUint64(current.CompactorSucceeded, baseline.CompactorSucceeded),
+			CompactorLockMiss:    deltaUint64(current.CompactorLockMiss, baseline.CompactorLockMiss),
+			CompactorNoChange:    deltaUint64(current.CompactorNoChange, baseline.CompactorNoChange),
+			CompactorSoftSkip:    deltaUint64(current.CompactorSoftSkip, baseline.CompactorSoftSkip),
+			CompactorSkippedWake: deltaUint64(current.CompactorSkippedWake, baseline.CompactorSkippedWake),
+			CompactorIdleDefers:  deltaUint64(current.CompactorIdleDefers, baseline.CompactorIdleDefers),
+			CompactorStaleRetry:  deltaUint64(current.CompactorStaleRetry, baseline.CompactorStaleRetry),
 		},
 	}
 }
@@ -916,6 +965,10 @@ func makeBatchSample(now time.Time, baseline, current rbi.AutoBatchStats) batchS
 			ExecutedBatches:     deltaUint64(current.ExecutedBatches, baseline.ExecutedBatches),
 			MultiRequestBatches: deltaUint64(current.MultiRequestBatches, baseline.MultiRequestBatches),
 			MultiRequestOps:     deltaUint64(current.MultiRequestOps, baseline.MultiRequestOps),
+			BatchSize1:          deltaUint64(current.BatchSize1, baseline.BatchSize1),
+			BatchSize2To4:       deltaUint64(current.BatchSize2To4, baseline.BatchSize2To4),
+			BatchSize5To8:       deltaUint64(current.BatchSize5To8, baseline.BatchSize5To8),
+			BatchSize9Plus:      deltaUint64(current.BatchSize9Plus, baseline.BatchSize9Plus),
 			MaxBatchSeen:        deltaUint64(current.MaxBatchSeen, baseline.MaxBatchSeen),
 			CallbackOps:         deltaUint64(current.CallbackOps, baseline.CallbackOps),
 			CoalescedSetDelete:  deltaUint64(current.CoalescedSetDelete, baseline.CoalescedSetDelete),

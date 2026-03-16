@@ -26,6 +26,7 @@ type workerMetrics struct {
 
 	total     atomic.Uint64
 	errors    atomic.Uint64
+	jitterNS  atomic.Uint64
 	lastQuery atomic.Value
 
 	totalLat          latencyReservoir
@@ -122,9 +123,17 @@ func (m *workerMetrics) counts() (uint64, uint64) {
 	return m.total.Load(), m.errors.Load()
 }
 
+func (m *workerMetrics) addJitter(ns uint64) {
+	if ns == 0 {
+		return
+	}
+	m.jitterNS.Add(ns)
+}
+
 type workerMetricsSnapshot struct {
 	total     uint64
 	errors    uint64
+	jitterNS  uint64
 	lastQuery string
 	latency   []float64
 	queries   map[string]queryMetricsSnapshot
@@ -138,8 +147,9 @@ type queryMetricsSnapshot struct {
 
 func (m *workerMetrics) snapshot(includeLatency bool) workerMetricsSnapshot {
 	out := workerMetricsSnapshot{
-		total:  m.total.Load(),
-		errors: m.errors.Load(),
+		total:    m.total.Load(),
+		errors:   m.errors.Load(),
+		jitterNS: m.jitterNS.Load(),
 	}
 	if value := m.lastQuery.Load(); value != nil {
 		if s, ok := value.(string); ok {

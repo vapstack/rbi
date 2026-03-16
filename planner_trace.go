@@ -29,7 +29,34 @@ type TraceEvent struct {
 	FallbackCost  float64
 
 	RowsExamined uint64
+	RowsMatched  uint64
 	RowsReturned uint64
+
+	// BitmapMaterializations counts temporary bitmap materializations performed
+	// during execution (for example bucket composition or singleton expansion).
+	BitmapMaterializations uint64
+
+	// BitmapExactFilters counts per-bucket exact bitmap filter applications.
+	BitmapExactFilters uint64
+
+	// CountPredicatePreparations counts count-side predicate preparation steps.
+	CountPredicatePreparations uint64
+
+	// CountRangeComplementBuilds counts broad-range complement materializations
+	// performed during count predicate preparation.
+	CountRangeComplementBuilds uint64
+
+	// CountRangeComplementCacheHits counts count-side broad-range complement
+	// cache hits during predicate preparation.
+	CountRangeComplementCacheHits uint64
+
+	// CountRangeComplementFastBuilds counts broad-range complement builds that
+	// used the small-bucket fast path instead of generic bitmap union.
+	CountRangeComplementFastBuilds uint64
+
+	// CountRangeComplementRows is the total cardinality of materialized
+	// broad-range complement bitmaps built during count preparation.
+	CountRangeComplementRows uint64
 
 	// ORBranches contains per-branch runtime metrics for OR plans.
 	ORBranches []TraceORBranch
@@ -195,11 +222,57 @@ func (t *queryTrace) addExamined(n uint64) {
 	t.ev.RowsExamined += n
 }
 
+func (t *queryTrace) addMatched(n uint64) {
+	if t == nil || n == 0 {
+		return
+	}
+	t.ev.RowsMatched += n
+}
+
 func (t *queryTrace) addOrderScanWidth(n uint64) {
 	if t == nil || n == 0 {
 		return
 	}
 	t.ev.OrderIndexScanWidth += n
+}
+
+func (t *queryTrace) addBitmapMaterialized(n uint64) {
+	if t == nil || n == 0 {
+		return
+	}
+	t.ev.BitmapMaterializations += n
+}
+
+func (t *queryTrace) addBitmapExactFilter(n uint64) {
+	if t == nil || n == 0 {
+		return
+	}
+	t.ev.BitmapExactFilters += n
+}
+
+func (t *queryTrace) addCountPredicatePreparation(n uint64) {
+	if t == nil || n == 0 {
+		return
+	}
+	t.ev.CountPredicatePreparations += n
+}
+
+func (t *queryTrace) addCountRangeComplementCacheHit(n uint64) {
+	if t == nil || n == 0 {
+		return
+	}
+	t.ev.CountRangeComplementCacheHits += n
+}
+
+func (t *queryTrace) addCountRangeComplementBuild(rows uint64, fast bool) {
+	if t == nil {
+		return
+	}
+	t.ev.CountRangeComplementBuilds++
+	if fast {
+		t.ev.CountRangeComplementFastBuilds++
+	}
+	t.ev.CountRangeComplementRows += rows
 }
 
 func (t *queryTrace) addDedupe(n uint64) {

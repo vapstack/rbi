@@ -87,6 +87,66 @@ func TestBatch_SequentialSet_DoesNotProduceMultiRequestBatches(t *testing.T) {
 	if after.MaxBatchSeen > 1 {
 		t.Fatalf("expected max seen batch size to stay 1 for sequential Set calls, stats=%+v", after)
 	}
+	if after.BatchSize1 == 0 {
+		t.Fatalf("expected single-request batch distribution bucket to be tracked, stats=%+v", after)
+	}
+}
+
+func TestBatch_StatsTrackBatchSizeDistribution(t *testing.T) {
+	db, _ := openTempDBUint64(t)
+
+	encodePayload := func(v *Rec) []byte {
+		t.Helper()
+		b := getEncodeBuf()
+		if err := db.encode(v, b); err != nil {
+			releaseEncodeBuf(b)
+			t.Fatalf("encode: %v", err)
+		}
+		out := append([]byte(nil), b.Bytes()...)
+		releaseEncodeBuf(b)
+		return out
+	}
+
+	makeSetReq := func(id uint64, name string) *autoBatchRequest[uint64, Rec] {
+		rec := &Rec{Name: name, Age: int(id)}
+		return &autoBatchRequest[uint64, Rec]{
+			op:         autoBatchSet,
+			id:         id,
+			setValue:   rec,
+			setPayload: encodePayload(rec),
+			done:       make(chan error, 1),
+		}
+	}
+
+	single := makeSetReq(1, "single")
+	db.executeAutoBatch([]*autoBatchRequest[uint64, Rec]{single})
+	if err := <-single.done; err != nil {
+		t.Fatalf("single batch failed: %v", err)
+	}
+
+	reqs := []*autoBatchRequest[uint64, Rec]{
+		makeSetReq(2, "a"),
+		makeSetReq(3, "b"),
+		makeSetReq(4, "c"),
+		makeSetReq(5, "d"),
+	}
+	db.executeAutoBatch(reqs)
+	for i, req := range reqs {
+		if err := <-req.done; err != nil {
+			t.Fatalf("batch req #%d failed: %v", i+1, err)
+		}
+	}
+
+	st := db.AutoBatchStats()
+	if st.BatchSize1 == 0 {
+		t.Fatalf("expected single-request batch counter > 0, stats=%+v", st)
+	}
+	if st.BatchSize2To4 == 0 {
+		t.Fatalf("expected 2..4 batch counter > 0, stats=%+v", st)
+	}
+	if st.ExecutedBatches < st.BatchSize1+st.BatchSize2To4+st.BatchSize5To8+st.BatchSize9Plus {
+		t.Fatalf("batch size distribution exceeds executed batches, stats=%+v", st)
+	}
 }
 
 func TestBatch_Disabled_SkipsBatcherPath(t *testing.T) {

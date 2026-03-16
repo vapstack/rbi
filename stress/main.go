@@ -38,7 +38,7 @@ func main() {
 	}
 
 	log.Printf(
-		"opening DB file=%s report=%s headless=%t duration=%s trace_sample=%d trace_top=%d query_stats=%t class_filter=%v query_filter=%v",
+		"opening DB file=%s report=%s headless=%t duration=%s trace_sample=%d trace_top=%d query_stats=%t jitter=%t class_filter=%v query_filter=%v",
 		opts.DBFile,
 		opts.ReportPath,
 		opts.Headless,
@@ -46,6 +46,7 @@ func main() {
 		opts.TraceSampleEvery,
 		opts.TraceTopN,
 		opts.QueryStats,
+		opts.Jitter,
 		opts.ClassFilter,
 		opts.QueryFilter,
 	)
@@ -70,7 +71,7 @@ func main() {
 
 	queryBreakdown := !opts.Headless || opts.QueryStats
 	queryLatency := !opts.Headless || opts.QueryStats
-	app := newApp(handle, catalog, opts.RefreshEvery, opts.TelemetryEvery, opts.ReportPath, opts.ClassFilter, opts.QueryFilter, queryBreakdown, queryLatency, traceCollector)
+	app := newApp(handle, catalog, opts.RefreshEvery, opts.TelemetryEvery, opts.ReportPath, opts.ClassFilter, opts.QueryFilter, queryBreakdown, queryLatency, opts.Jitter, traceCollector)
 	stopProfiling, err := startStressProfiling(opts)
 	if err != nil {
 		fatalf("start profiling: %v", err)

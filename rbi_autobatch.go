@@ -354,6 +354,16 @@ func (db *DB[K, V]) executeAutoBatch(batch []*autoBatchRequest[K, V]) {
 		db.autoBatcher.multiReqBatches.Add(1)
 		db.autoBatcher.multiReqOps.Add(uint64(len(batch)))
 	}
+	switch {
+	case len(batch) <= 1:
+		db.autoBatcher.batchSize1.Add(1)
+	case len(batch) <= 4:
+		db.autoBatcher.batchSize2To4.Add(1)
+	case len(batch) <= 8:
+		db.autoBatcher.batchSize5To8.Add(1)
+	default:
+		db.autoBatcher.batchSize9Plus.Add(1)
+	}
 	atomicSetMax(&db.autoBatcher.maxBatchSeen, uint64(len(batch)))
 
 	for _, req := range batch {

@@ -618,3 +618,133 @@ func TestCount_PreparePredicate_UsesBroadRangeComplementWithoutCache(t *testing.
 		}
 	})
 }
+
+func TestCount_PreparePredicate_UsesProbeBoundedBroadRangeComplement(t *testing.T) {
+	makeDB := func(t *testing.T, withCache bool) *DB[uint64, Rec] {
+		t.Helper()
+		opts := Options{AnalyzeInterval: -1}
+		if !withCache {
+			opts.SnapshotMaterializedPredCacheMaxEntries = -1
+			opts.SnapshotMaterializedPredCacheMaxEntriesWithDelta = -1
+		}
+		db, _ := openTempDBUint64(t, opts)
+		seedGeneratedUint64Data(t, db, 160_000, func(i int) *Rec {
+			return &Rec{
+				Name:   fmt.Sprintf("u_%d", i),
+				Email:  fmt.Sprintf("user%05d@example.com", i),
+				Age:    i,
+				Score:  float64(i % 1_000),
+				Active: i%2 == 0,
+				Meta: Meta{
+					Country: "US",
+				},
+			}
+		})
+		if err := db.RebuildIndex(); err != nil {
+			t.Fatalf("RebuildIndex: %v", err)
+		}
+		return db
+	}
+
+	expr := qx.Expr{Op: qx.OpGTE, Field: "age", Value: 35_000}
+
+	for _, tc := range []struct {
+		name      string
+		withCache bool
+	}{
+		{name: "NoCache", withCache: false},
+		{name: "WithCache", withCache: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			db := makeDB(t, tc.withCache)
+			p, ok := db.buildPredicateWithMode(expr, false)
+			if !ok {
+				t.Fatalf("buildPredicateWithMode failed")
+			}
+			defer releasePredicates([]predicate{p})
+			if p.kind != predicateKindCustom {
+				t.Fatalf("expected initial custom predicate, got kind=%v", p.kind)
+			}
+
+			universe := db.snapshotUniverseCardinality()
+			leadProbeEst := uint64(40_000)
+			if err := db.prepareCountPredicate(&p, leadProbeEst, universe); err != nil {
+				t.Fatalf("prepareCountPredicate: %v", err)
+			}
+			if p.kind != predicateKindBitmapNot {
+				t.Fatalf("expected probe-bounded broad range to switch to bitmapNot complement, got kind=%v", p.kind)
+			}
+			if p.bm == nil {
+				t.Fatalf("expected complement bitmap")
+			}
+			if got := p.bm.GetCardinality(); got <= countPredBroadRangeComplementMaxCard {
+				t.Fatalf("expected complement wider than legacy cap, got=%d", got)
+			}
+			if tc.withCache {
+				key, isSlice, err := db.exprValueToIdxScalar(expr)
+				if err != nil || isSlice {
+					t.Fatalf("exprValueToIdxScalar: err=%v isSlice=%v", err, isSlice)
+				}
+				cacheKey := db.materializedPredComplementCacheKeyForScalar(expr.Field, expr.Op, key)
+				cached, ok := db.getSnapshot().loadMaterializedPred(cacheKey)
+				if !ok || cached == nil || cached != p.bm {
+					t.Fatalf("expected complement bitmap to be cached and shared")
+				}
+			}
+		})
+	}
+}
+
+func TestCount_PreparePredicate_KeepsLegacyCapForComparableBroadLead(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
+	seedGeneratedUint64Data(t, db, 160_000, func(i int) *Rec {
+		return &Rec{
+			Name:   fmt.Sprintf("u_%d", i),
+			Email:  fmt.Sprintf("user%05d@example.com", i),
+			Age:    i,
+			Score:  float64(i % 1_000),
+			Active: i%2 == 0,
+			Meta: Meta{
+				Country: "US",
+			},
+		}
+	})
+	if err := db.RebuildIndex(); err != nil {
+		t.Fatalf("RebuildIndex: %v", err)
+	}
+
+	expr := qx.Expr{Op: qx.OpGTE, Field: "age", Value: 35_000}
+	p, ok := db.buildPredicateWithMode(expr, false)
+	if !ok {
+		t.Fatalf("buildPredicateWithMode failed")
+	}
+	defer releasePredicates([]predicate{p})
+	if p.kind != predicateKindCustom {
+		t.Fatalf("expected initial custom predicate, got kind=%v", p.kind)
+	}
+
+	universe := db.snapshotUniverseCardinality()
+	leadProbeEst := uint64(80_000)
+	if err := db.prepareCountPredicate(&p, leadProbeEst, universe); err != nil {
+		t.Fatalf("prepareCountPredicate: %v", err)
+	}
+	if p.kind != predicateKindCustom {
+		t.Fatalf("expected comparable lead to keep legacy complement cap, got kind=%v", p.kind)
+	}
+}
+
+func TestCount_BroadRangeComplementFastMaterializationGate(t *testing.T) {
+	probe := make([]postingList, 0, 5_000)
+	for i := 0; i < 5_000; i++ {
+		probe = append(probe, postingList{bm: postingSingleFlag, single: uint64(i)})
+	}
+	if !shouldUseFastCountBroadRangeComplementMaterialization(probe, 5_000) {
+		t.Fatalf("expected many tiny buckets to use fast complement materialization")
+	}
+	if shouldUseFastCountBroadRangeComplementMaterialization(probe[:2_000], 2_000) {
+		t.Fatalf("expected short probe to keep regular complement materialization")
+	}
+	if shouldUseFastCountBroadRangeComplementMaterialization(probe, 90_000) {
+		t.Fatalf("expected dense buckets to keep regular complement materialization")
+	}
+}
