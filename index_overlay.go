@@ -148,19 +148,7 @@ func (o fieldOverlay) lookupPostingRetained(key string) (postingList, *roaring64
 	if !ok {
 		return base, nil
 	}
-
-	bm, owned := composePostingOwned(base, de, nil)
-	if !owned {
-		return postingFromBitmapViewAdaptive(bm), nil
-	}
-	if bm == nil || bm.IsEmpty() {
-		if bm != nil {
-			releaseRoaringBuf(bm)
-		}
-		return postingList{}, nil
-	}
-	p := postingFromBitmapOwned(bm)
-	return p, p.bitmap()
+	return composePostingRetained(base, de)
 }
 
 func (o fieldOverlay) lookupPostings(keys []string) ([]postingList, uint64, func()) {
@@ -195,6 +183,96 @@ func (o fieldOverlay) lookupPostings(keys []string) ([]postingList, uint64, func
 func composePosting(base postingList, de indexDeltaEntry, scratch *roaring64.Bitmap) *roaring64.Bitmap {
 	bm, _ := composePostingOwned(base, de, scratch)
 	return bm
+}
+
+func composePostingRetained(base postingList, de indexDeltaEntry) (postingList, *roaring64.Bitmap) {
+	if deltaEntryIsEmpty(de) {
+		return base, nil
+	}
+
+	if base.IsEmpty() {
+		if !deltaEntryHasAdd(de) {
+			return postingList{}, nil
+		}
+		if !deltaEntryHasDel(de) {
+			if de.addSingleSet {
+				return postingList{bm: postingSingleFlag, single: de.addSingle}, nil
+			}
+			if de.add != nil && !de.add.IsEmpty() {
+				return postingFromBitmapViewAdaptive(de.add), nil
+			}
+		}
+		return composePostingRetainedMaterialized(base, de)
+	}
+
+	if base.isSingleton() {
+		baseID := base.single
+		hasBase := !deltaEntryDelContains(de, baseID)
+		extraNovel := false
+		if de.addSingleSet && de.addSingle != baseID {
+			extraNovel = true
+		}
+		if !extraNovel && de.add != nil && !de.add.IsEmpty() {
+			addCard := de.add.GetCardinality()
+			switch {
+			case addCard == 0:
+			case addCard == 1 && de.add.Contains(baseID):
+			default:
+				extraNovel = true
+			}
+		}
+		if !extraNovel {
+			if hasBase {
+				return base, nil
+			}
+			return postingList{}, nil
+		}
+		return composePostingRetainedMaterialized(base, de)
+	}
+
+	baseBM := base.bitmap()
+	if baseBM == nil {
+		return composePostingRetainedMaterialized(base, de)
+	}
+
+	addNovel := false
+	if de.addSingleSet && !baseBM.Contains(de.addSingle) {
+		addNovel = true
+	}
+	if !addNovel && de.add != nil && !de.add.IsEmpty() {
+		if inter := baseBM.AndCardinality(de.add); inter < de.add.GetCardinality() {
+			addNovel = true
+		}
+	}
+
+	delHits := false
+	if de.delSingleSet && baseBM.Contains(de.delSingle) {
+		delHits = true
+	}
+	if !delHits && de.del != nil && !de.del.IsEmpty() && baseBM.Intersects(de.del) {
+		delHits = true
+	}
+
+	if !addNovel && !delHits {
+		return base, nil
+	}
+
+	return composePostingRetainedMaterialized(base, de)
+}
+
+func composePostingRetainedMaterialized(base postingList, de indexDeltaEntry) (postingList, *roaring64.Bitmap) {
+	bm, owned := composePostingOwned(base, de, nil)
+	if !owned {
+		return postingFromBitmapViewAdaptive(bm), nil
+	}
+	if bm == nil || bm.IsEmpty() {
+		if bm != nil {
+			releaseRoaringBuf(bm)
+		}
+		return postingList{}, nil
+	}
+	p := postingFromBitmapOwned(bm)
+	return p, p.bitmap()
 }
 
 func composePostingOwned(base postingList, de indexDeltaEntry, scratch *roaring64.Bitmap) (*roaring64.Bitmap, bool) {

@@ -256,50 +256,6 @@ func (db *DB[K, V]) tryQueryOrderBasicWithLimit(q *qx.QX, trace *queryTrace) ([]
 		baseOps = append(baseOps, op)
 	}
 
-	var base bitmap
-
-	if len(baseOps) == 0 {
-		bm := getRoaringBuf()
-		universe, owned := db.snapshotUniverseView()
-		bm.Or(universe)
-		if owned {
-			releaseRoaringBuf(universe)
-		}
-		base = bitmap{bm: bm}
-
-	} else if len(baseOps) == 1 {
-
-		b, err := db.evalExpr(baseOps[0])
-		if err != nil {
-			return nil, true, err
-		}
-		if b.bm == nil || b.bm.IsEmpty() {
-			b.release()
-			return nil, true, nil
-		}
-		base = b
-
-	} else {
-
-		b, err := db.evalExpr(qx.Expr{Op: qx.OpAND, Operands: baseOps})
-		if err != nil {
-			return nil, true, err
-		}
-		if b.bm == nil || b.bm.IsEmpty() {
-			b.release()
-			return nil, true, nil
-		}
-		base = b
-
-	}
-	defer base.release()
-
-	baseBM := base.bm
-	baseNegUniverse := base.neg && (baseBM == nil || baseBM.IsEmpty())
-	if !base.neg && (baseBM == nil || baseBM.IsEmpty()) {
-		return nil, true, nil
-	}
-
 	br := ov.rangeForBounds(rb)
 	if br.baseStart >= br.baseEnd && br.deltaStart >= br.deltaEnd {
 		return nil, true, nil
@@ -307,7 +263,8 @@ func (db *DB[K, V]) tryQueryOrderBasicWithLimit(q *qx.QX, trace *queryTrace) ([]
 
 	if len(baseOps) > 0 && shouldTryOrderedPredicateExecutionBaseOps(f, baseOps) {
 		if leaves, ok := collectAndLeaves(q.Expr); ok {
-			preds, ok := db.buildPredicatesOrderedWithMode(leaves, f, false)
+			window, _ := orderWindow(q)
+			preds, ok := db.buildPredicatesOrderedWithMode(leaves, f, false, window)
 			if ok {
 				defer releasePredicates(preds)
 				for i := range preds {
@@ -327,6 +284,37 @@ func (db *DB[K, V]) tryQueryOrderBasicWithLimit(q *qx.QX, trace *queryTrace) ([]
 		return out, true, nil
 	}
 
+	var base bitmap
+
+	if len(baseOps) == 1 {
+		b, err := db.evalExpr(baseOps[0])
+		if err != nil {
+			return nil, true, err
+		}
+		if b.bm == nil || b.bm.IsEmpty() {
+			b.release()
+			return nil, true, nil
+		}
+		base = b
+	} else {
+		b, err := db.evalExpr(qx.Expr{Op: qx.OpAND, Operands: baseOps})
+		if err != nil {
+			return nil, true, err
+		}
+		if b.bm == nil || b.bm.IsEmpty() {
+			b.release()
+			return nil, true, nil
+		}
+		base = b
+	}
+	defer base.release()
+
+	baseBM := base.bm
+	baseNegUniverse := base.neg && (baseBM == nil || baseBM.IsEmpty())
+	if !base.neg && (baseBM == nil || baseBM.IsEmpty()) {
+		return nil, true, nil
+	}
+
 	skip := q.Offset
 	need := q.Limit
 
@@ -335,11 +323,6 @@ func (db *DB[K, V]) tryQueryOrderBasicWithLimit(q *qx.QX, trace *queryTrace) ([]
 
 	tmp := getRoaringBuf()
 	defer releaseRoaringBuf(tmp)
-	var scratch *roaring64.Bitmap
-	if ov.delta != nil {
-		scratch = getRoaringBuf()
-		defer releaseRoaringBuf(scratch)
-	}
 
 	contains := func(idx uint64) bool {
 		if base.neg {
@@ -427,22 +410,22 @@ func (db *DB[K, V]) tryQueryOrderBasicWithLimit(q *qx.QX, trace *queryTrace) ([]
 		if !ok {
 			break
 		}
-		bm, owned := composePostingOwned(bucketIDs, de, scratch)
-		if bm == nil || bm.IsEmpty() {
-			if owned && bm != nil && bm != scratch {
-				releaseRoaringBuf(bm)
-			}
+		ids, keep := composePostingRetained(bucketIDs, de)
+		if ids.IsEmpty() {
 			continue
 		}
 		scanWidth++
+		if keep != nil && trace != nil {
+			trace.addBitmapMaterialized(1)
+		}
 
-		if card := bm.GetCardinality(); card <= iteratorThreshold || (0 < cursor.need && cursor.need < 1000) {
-			if card == 1 {
-				idx := bm.Minimum()
+		if card := ids.Cardinality(); card <= iteratorThreshold || (0 < cursor.need && cursor.need < 1000) {
+			if ids.isSingleton() {
+				idx := ids.single
 				examined++
 				if contains(idx) && cursor.emit(idx) {
-					if owned && bm != scratch {
-						releaseRoaringBuf(bm)
+					if keep != nil {
+						releaseRoaringBuf(keep)
 					}
 					trace.addExamined(examined)
 					trace.addOrderScanWidth(scanWidth)
@@ -450,7 +433,7 @@ func (db *DB[K, V]) tryQueryOrderBasicWithLimit(q *qx.QX, trace *queryTrace) ([]
 					return cursor.out, true, nil
 				}
 			} else {
-				it := bm.Iterator()
+				it := ids.bitmap().Iterator()
 				for it.HasNext() {
 					idx := it.Next()
 					examined++
@@ -458,8 +441,8 @@ func (db *DB[K, V]) tryQueryOrderBasicWithLimit(q *qx.QX, trace *queryTrace) ([]
 						continue
 					}
 					if cursor.emit(idx) {
-						if owned && bm != scratch {
-							releaseRoaringBuf(bm)
+						if keep != nil {
+							releaseRoaringBuf(keep)
 						}
 						trace.addExamined(examined)
 						trace.addOrderScanWidth(scanWidth)
@@ -468,24 +451,24 @@ func (db *DB[K, V]) tryQueryOrderBasicWithLimit(q *qx.QX, trace *queryTrace) ([]
 					}
 				}
 			}
-			if owned && bm != scratch {
-				releaseRoaringBuf(bm)
+			if keep != nil {
+				releaseRoaringBuf(keep)
 			}
 			continue
 		}
 
-		examined += bm.GetCardinality()
+		examined += ids.Cardinality()
 		if base.neg {
 			tmp.Xor(tmp)
-			tmp.Or(bm)
+			ids.OrInto(tmp)
 			if !baseNegUniverse {
 				tmp.AndNot(baseBM)
 			}
 		} else {
-			tmpORSmallestAND(tmp, bm, baseBM)
+			tmpORSmallestANDPosting(tmp, ids, baseBM)
 		}
-		if owned && bm != scratch {
-			releaseRoaringBuf(bm)
+		if keep != nil {
+			releaseRoaringBuf(keep)
 		}
 		if tmp.IsEmpty() {
 			continue
@@ -723,72 +706,27 @@ func (db *DB[K, V]) scanOrderLimitWithPredicates(q *qx.QX, ov fieldOverlay, br o
 		if !ok {
 			break
 		}
-		bm, owned := composePostingOwned(baseBM, de, scratch)
-		if bm == nil || bm.IsEmpty() {
-			if owned && bm != nil && bm != scratch {
-				releaseRoaringBuf(bm)
-			}
+		ids, keep := composePostingRetained(baseBM, de)
+		if ids.IsEmpty() {
 			continue
 		}
 		scanWidth++
-
-		if owned && trace != nil {
+		if keep != nil && trace != nil {
 			trace.addBitmapMaterialized(1)
 		}
-		iterSrc := bm.Iterator()
-		exactApplied := false
-		if current, applied, handled, stop := tryBucketBitmap(bm); handled {
-			if owned && bm != scratch {
-				releaseRoaringBuf(bm)
-			}
-			if stop {
-				if trace != nil {
-					trace.addExamined(examined)
-					trace.addOrderScanWidth(scanWidth)
-					trace.setEarlyStopReason("limit_reached")
-				}
-				return cursor.out, true
-			}
-			continue
-		} else if applied && current != nil {
-			iterSrc = current.Iterator()
-			exactApplied = true
-		}
-
-		for iterSrc.HasNext() {
-			idx := iterSrc.Next()
-			examined++
-			checks := active
-			if exactApplied {
-				checks = residualActive
-			}
-			pass := true
-			for _, pi := range checks {
-				if !preds[pi].matches(idx) {
-					pass = false
-					break
-				}
-			}
-			if !pass {
-				continue
+		if emitPosting(ids) {
+			if keep != nil {
+				releaseRoaringBuf(keep)
 			}
 			if trace != nil {
-				trace.addMatched(1)
+				trace.addExamined(examined)
+				trace.addOrderScanWidth(scanWidth)
+				trace.setEarlyStopReason("limit_reached")
 			}
-			if cursor.emit(idx) {
-				if owned && bm != scratch {
-					releaseRoaringBuf(bm)
-				}
-				if trace != nil {
-					trace.addExamined(examined)
-					trace.addOrderScanWidth(scanWidth)
-					trace.setEarlyStopReason("limit_reached")
-				}
-				return cursor.out, true
-			}
+			return cursor.out, true
 		}
-		if owned && bm != scratch {
-			releaseRoaringBuf(bm)
+		if keep != nil {
+			releaseRoaringBuf(keep)
 		}
 	}
 

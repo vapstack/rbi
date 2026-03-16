@@ -498,12 +498,6 @@ func (db *DB[K, V]) scanLimitByOverlayBounds(q *qx.QX, ov fieldOverlay, br overl
 		scanWidth uint64
 	)
 
-	var scratch *roaring64.Bitmap
-	if ov.delta != nil {
-		scratch = getRoaringBuf()
-		defer releaseRoaringBuf(scratch)
-	}
-
 	emitCandidate := func(idx uint64) bool {
 		examined++
 		for _, p := range preds {
@@ -559,32 +553,26 @@ func (db *DB[K, V]) scanLimitByOverlayBounds(q *qx.QX, ov fieldOverlay, br overl
 		if !ok {
 			break
 		}
-		bm, owned := composePostingOwned(baseBM, de, scratch)
-		if bm == nil || bm.IsEmpty() {
-			if owned && bm != nil && bm != scratch {
-				releaseRoaringBuf(bm)
-			}
+		ids, keep := composePostingRetained(baseBM, de)
+		if ids.IsEmpty() {
 			continue
 		}
 		if trackScanWidth {
 			scanWidth++
 		}
-		it := bm.Iterator()
-		for it.HasNext() {
-			if emitCandidate(it.Next()) {
-				if owned && bm != scratch {
-					releaseRoaringBuf(bm)
-				}
-				trace.addExamined(examined)
-				if trackScanWidth {
-					trace.addOrderScanWidth(scanWidth)
-				}
-				trace.setEarlyStopReason("limit_reached")
-				return cursor.out
+		if emitBucketPosting(ids) {
+			if keep != nil {
+				releaseRoaringBuf(keep)
 			}
+			trace.addExamined(examined)
+			if trackScanWidth {
+				trace.addOrderScanWidth(scanWidth)
+			}
+			trace.setEarlyStopReason("limit_reached")
+			return cursor.out
 		}
-		if owned && bm != scratch {
-			releaseRoaringBuf(bm)
+		if keep != nil {
+			releaseRoaringBuf(keep)
 		}
 	}
 

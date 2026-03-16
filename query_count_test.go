@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"testing"
 
+	"github.com/RoaringBitmap/roaring/v2/roaring64"
 	"github.com/vapstack/qx"
 )
 
@@ -268,6 +269,121 @@ func TestCount_ByPredicates_PostingsLead_MatchesBitmap(t *testing.T) {
 	got, examined, ok := db.tryCountByPredicatesLeadPostings(preds, leadIdx, active)
 	if !ok {
 		t.Fatalf("expected postings-lead count fast path")
+	}
+	if examined == 0 {
+		t.Fatalf("expected examined postings")
+	}
+	want := countByExprBitmap(t, db, expr)
+	if got != want {
+		t.Fatalf("count mismatch: got=%d want=%d", got, want)
+	}
+}
+
+func TestCount_ByPredicates_SinglePostingLead_MatchesBitmap(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
+
+	countries := []string{"US", "DE", "FR", "GB"}
+	tagSets := [][]string{
+		{"go"},
+		{"db"},
+		{"ops"},
+		{"go", "db"},
+		{"go", "ops"},
+	}
+	seedGeneratedUint64Data(t, db, 120_000, func(i int) *Rec {
+		return &Rec{
+			Name:   fmt.Sprintf("u_%d", i),
+			Email:  fmt.Sprintf("user%05d@example.com", i),
+			Age:    18 + (i % 60),
+			Score:  float64(i % 1_000),
+			Active: i%2 == 0,
+			Tags:   append([]string(nil), tagSets[i%len(tagSets)]...),
+			Meta: Meta{
+				Country: countries[i%len(countries)],
+			},
+		}
+	})
+	if err := db.RebuildIndex(); err != nil {
+		t.Fatalf("RebuildIndex: %v", err)
+	}
+
+	expr := qx.AND(
+		qx.EQ("country", "US"),
+		qx.NOTIN("active", []bool{false}),
+		qx.GTE("score", 120.0),
+		qx.HASANY("tags", []string{"go", "db"}),
+	)
+	leaves, ok := collectAndLeaves(expr)
+	if !ok {
+		t.Fatalf("collectAndLeaves failed")
+	}
+	preds, ok := db.buildPredicatesWithMode(leaves, false)
+	if !ok {
+		t.Fatalf("buildPredicatesWithMode failed")
+	}
+	defer releasePredicates(preds)
+
+	universe := db.snapshotUniverseCardinality()
+	leadIdx := -1
+	leadScore := 0.0
+	leadEst := uint64(0)
+	for i := range preds {
+		p := preds[i]
+		if p.alwaysFalse {
+			t.Fatalf("unexpected alwaysFalse predicate")
+		}
+		if p.alwaysTrue || p.covered || !p.hasIter() || p.estCard == 0 {
+			continue
+		}
+		if countLeadTooRisky(p.expr.Op, p.estCard, universe) {
+			continue
+		}
+		score := float64(p.estCard) * float64(countPredicateLeadWeight(p))
+		if leadIdx == -1 || score < leadScore {
+			leadIdx = i
+			leadEst = p.estCard
+			leadScore = score
+		}
+	}
+	if leadIdx < 0 {
+		t.Fatalf("expected iterable lead")
+	}
+	if preds[leadIdx].expr.Op != qx.OpEQ {
+		t.Fatalf("expected EQ lead, got %v", preds[leadIdx].expr.Op)
+	}
+	if err := db.prepareCountPredicate(&preds[leadIdx], leadEst, universe); err != nil {
+		t.Fatalf("prepareCountPredicate(lead): %v", err)
+	}
+
+	activeBuf := getIntSliceBuf(len(preds))
+	active := activeBuf.values[:0]
+	defer func() {
+		activeBuf.values = active
+		releaseIntSliceBuf(activeBuf)
+	}()
+	for i := range preds {
+		if i == leadIdx {
+			continue
+		}
+		p := preds[i]
+		if p.covered || p.alwaysTrue {
+			continue
+		}
+		if p.alwaysFalse || !p.hasContains() {
+			t.Fatalf("unexpected residual predicate state: idx=%d kind=%v", i, p.kind)
+		}
+		active = append(active, i)
+	}
+	for _, pi := range active {
+		if err := db.prepareCountPredicate(&preds[pi], leadEst, universe); err != nil {
+			t.Fatalf("prepareCountPredicate(residual): %v", err)
+		}
+	}
+	sortActivePredicates(active, preds)
+
+	got, examined, ok := db.tryCountByPredicatesLeadPostings(preds, leadIdx, active)
+	if !ok {
+		t.Fatalf("expected single-posting lead count fast path")
 	}
 	if examined == 0 {
 		t.Fatalf("expected examined postings")
@@ -617,6 +733,126 @@ func TestCount_PreparePredicate_UsesBroadRangeComplementWithoutCache(t *testing.
 			t.Fatalf("expected broad no-cache range to switch to bitmapNot complement, got kind=%v", p.kind)
 		}
 	})
+}
+
+func TestCount_PreparePredicate_UsesTinyPostingBroadRangeComplement(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{
+		AnalyzeInterval:                                  -1,
+		SnapshotMaterializedPredCacheMaxEntries:          -1,
+		SnapshotMaterializedPredCacheMaxEntriesWithDelta: -1,
+	})
+	seedGeneratedUint64Data(t, db, 120_000, func(i int) *Rec {
+		age := 7
+		switch {
+		case i < 2_000:
+			age = 0
+		case i < 4_000:
+			age = 1
+		case i < 23_000:
+			age = 2
+		case i < 42_000:
+			age = 3
+		case i < 61_000:
+			age = 4
+		case i < 80_000:
+			age = 5
+		case i < 100_000:
+			age = 6
+		}
+		return &Rec{
+			Name:   fmt.Sprintf("u_%d", i),
+			Email:  fmt.Sprintf("user%05d@example.com", i),
+			Age:    age,
+			Score:  float64(i % 1_000),
+			Active: i%2 == 0,
+			Meta: Meta{
+				Country: "US",
+			},
+		}
+	})
+	if err := db.RebuildIndex(); err != nil {
+		t.Fatalf("RebuildIndex: %v", err)
+	}
+
+	universe := db.snapshotUniverseCardinality()
+	if universe < 100_000 {
+		t.Fatalf("unexpected small universe=%d", universe)
+	}
+
+	for _, tc := range []struct {
+		name     string
+		expr     qx.Expr
+		wantKind predicateKind
+		wantLen  int
+	}{
+		{
+			name:     "SingleBucket",
+			expr:     qx.Expr{Op: qx.OpGTE, Field: "age", Value: 1},
+			wantKind: predicateKindPostingNot,
+			wantLen:  1,
+		},
+		{
+			name:     "TwoBuckets",
+			expr:     qx.Expr{Op: qx.OpGTE, Field: "age", Value: 2},
+			wantKind: predicateKindPostsAnyNot,
+			wantLen:  2,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p, ok := db.buildPredicateWithMode(tc.expr, false)
+			if !ok {
+				t.Fatalf("buildPredicateWithMode failed")
+			}
+			defer releasePredicates([]predicate{p})
+
+			if err := db.prepareCountPredicate(&p, 8_000, universe); err != nil {
+				t.Fatalf("prepareCountPredicate: %v", err)
+			}
+			if p.kind != tc.wantKind {
+				t.Fatalf("unexpected complement kind: got=%v want=%v", p.kind, tc.wantKind)
+			}
+			if p.bm != nil {
+				t.Fatalf("expected tiny complement to avoid bitmap materialization")
+			}
+			switch p.kind {
+			case predicateKindPostingNot:
+				if p.posting.IsEmpty() {
+					t.Fatalf("expected postingNot complement")
+				}
+			case predicateKindPostsAnyNot:
+				if len(p.posts) != tc.wantLen {
+					t.Fatalf("unexpected postsAnyNot len: got=%d want=%d", len(p.posts), tc.wantLen)
+				}
+			}
+			if !p.supportsBitmapFilter() {
+				t.Fatalf("expected tiny complement predicate to support exact bitmap filtering")
+			}
+
+			src := roaring64.NewBitmap()
+			src.AddRange(1, 45_001)
+			work := getRoaringBuf()
+			defer releaseRoaringBuf(work)
+
+			mode, exactBM, _ := plannerFilterBitmapByChecks([]predicate{p}, []int{0}, src, work, true)
+			if mode != plannerPredicateBucketExact {
+				t.Fatalf("expected exact bucket filtering, got mode=%v", mode)
+			}
+
+			var want uint64
+			for idx := uint64(1); idx <= 45_000; idx++ {
+				if p.matches(idx) {
+					want++
+				}
+			}
+			if exactBM == nil || exactBM.GetCardinality() != want {
+				got := uint64(0)
+				if exactBM != nil {
+					got = exactBM.GetCardinality()
+				}
+				t.Fatalf("unexpected exact cardinality: got=%d want=%d", got, want)
+			}
+		})
+	}
 }
 
 func TestCount_PreparePredicate_UsesProbeBoundedBroadRangeComplement(t *testing.T) {

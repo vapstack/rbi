@@ -127,7 +127,6 @@ func buildBenchDBStringWithCaching(b *testing.B, n int, withCaching bool) *DB[st
 	db, raw, dir := openBenchDBStringWithCaching(b, withCaching)
 	b.StopTimer()
 	seedBenchDataString(b, db, n)
-	warmBenchDBStateString(b, db)
 	b.StartTimer()
 
 	oneStringDBs[withCaching] = db
@@ -140,16 +139,7 @@ func runStringCountBenchCacheModes(b *testing.B, qf func() *qx.QX) {
 	b.Helper()
 	runBenchCacheModes(b, func(b *testing.B, withCaching bool) {
 		db := buildBenchDBStringWithCaching(b, benchStringQueryN, withCaching)
-		q := qf()
-		b.ReportAllocs()
-		warmBenchCountOnceString(b, db, q)
-		b.ResetTimer()
-		for b.Loop() {
-			_, err := db.Count(q)
-			if err != nil {
-				b.Fatal(err)
-			}
-		}
+		runStringCountBench(b, db, qf())
 	})
 }
 
@@ -294,6 +284,7 @@ func warmBenchReadQueryOnceString(b *testing.B, db *DB[string, UserBench], q *qx
 func runStringCountBench(b *testing.B, db *DB[string, UserBench], q *qx.QX) {
 	b.Helper()
 	b.ReportAllocs()
+	prepareReadBenchSnapshot(b, db)
 	warmBenchCountOnceString(b, db, q)
 	b.ResetTimer()
 	for b.Loop() {
@@ -307,6 +298,7 @@ func runStringCountBench(b *testing.B, db *DB[string, UserBench], q *qx.QX) {
 func runStringQueryKeysBench(b *testing.B, db *DB[string, UserBench], q *qx.QX) {
 	b.Helper()
 	b.ReportAllocs()
+	prepareReadBenchSnapshot(b, db)
 	warmBenchQueryKeysOnceString(b, db, q)
 	b.ResetTimer()
 	for b.Loop() {
@@ -320,6 +312,7 @@ func runStringQueryKeysBench(b *testing.B, db *DB[string, UserBench], q *qx.QX) 
 func runStringReadQueryBench(b *testing.B, db *DB[string, UserBench], q *qx.QX) {
 	b.Helper()
 	b.ReportAllocs()
+	prepareReadBenchSnapshot(b, db)
 	warmBenchReadQueryOnceString(b, db, q)
 	b.ResetTimer()
 	for b.Loop() {
@@ -389,6 +382,7 @@ func Benchmark_Read_Index_Keys_Scan_All_StringKeyDB(b *testing.B) {
 	db := buildBenchDBString(b, benchStringQueryN)
 
 	var count int
+	prepareReadBenchSnapshot(b, db)
 	b.ReportAllocs()
 	b.ResetTimer()
 
@@ -406,6 +400,7 @@ func Benchmark_Read_Index_Keys_Scan_All_StringKeyDB(b *testing.B) {
 
 func Benchmark_Write_Set_New_Indexed_StringKeyDB(b *testing.B) {
 	db := buildWriteBenchDBString(b)
+	prepareWriteBenchStableBase(b, db)
 	rec := &UserBench{Name: "new", Age: 20, Country: "DE"}
 
 	b.ReportAllocs()
@@ -423,6 +418,7 @@ func Benchmark_Write_Patch_Indexed_StringKeyDB(b *testing.B) {
 	target := "seed-001000"
 	patchA := []Field{{Name: "age", Value: 111}}
 	patchB := []Field{{Name: "age", Value: 222}}
+	prepareWriteBenchStableBase(b, db)
 
 	b.ReportAllocs()
 	b.ResetTimer()

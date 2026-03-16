@@ -715,7 +715,7 @@ func TestSnapshotDelta_OrderedResidualBroadRange_UsesComplementBitmap(t *testing
 	if !ok {
 		t.Fatalf("collectAndLeaves: ok=false")
 	}
-	preds, ok := db.buildPredicatesOrderedWithMode(leaves, "score", false)
+	preds, ok := db.buildPredicatesOrderedWithMode(leaves, "score", false, 0)
 	if !ok {
 		t.Fatalf("buildPredicatesOrderedWithMode: ok=false")
 	}
@@ -1032,6 +1032,225 @@ func TestSnapshotCompactor_IdleForceCompactsDelta(t *testing.T) {
 	}
 	if !slices.Equal(ids, []uint64{1}) {
 		t.Fatalf("query mismatch: got=%v want=[1]", ids)
+	}
+}
+
+func TestForceCompact_ClearsDeltaWithoutBackgroundCompactor(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{
+		SnapshotDeltaCompactMaxFieldsPerPublish: -1,
+		SnapshotCompactorRequestEveryNWrites:    -1,
+		SnapshotCompactorIdleInterval:           -1,
+		SnapshotCompactorMaxIterationsPerRun:    -1,
+	})
+
+	if err := db.Set(1, &Rec{Name: "alice", Age: 10}); err != nil {
+		t.Fatalf("Set #1: %v", err)
+	}
+	if err := db.Set(2, &Rec{Name: "bob", Age: 20}); err != nil {
+		t.Fatalf("Set #2: %v", err)
+	}
+	if err := db.Patch(1, []Field{{Name: "age", Value: 11}}); err != nil {
+		t.Fatalf("Patch: %v", err)
+	}
+
+	before := db.SnapshotStats()
+	if !before.HasDelta {
+		t.Fatalf("expected delta before ForceCompact, got %+v", before)
+	}
+
+	if err := db.ForceCompact(); err != nil {
+		t.Fatalf("ForceCompact: %v", err)
+	}
+
+	after := db.SnapshotStats()
+	if after.HasDelta || after.IndexDeltaFields != 0 || after.LenDeltaFields != 0 ||
+		after.IndexDeltaOps != 0 || after.LenDeltaOps != 0 ||
+		after.UniverseAddCard != 0 || after.UniverseRemCard != 0 {
+		t.Fatalf("expected clean snapshot after ForceCompact, got %+v", after)
+	}
+
+	ids, err := db.QueryKeys(qx.Query(qx.GTE("age", 11)))
+	if err != nil {
+		t.Fatalf("QueryKeys: %v", err)
+	}
+	slices.Sort(ids)
+	if !slices.Equal(ids, []uint64{1, 2}) {
+		t.Fatalf("query mismatch after ForceCompact: got=%v want=[1 2]", ids)
+	}
+}
+
+func TestForceCompact_CompactsStringKeySnapshotStrMap(t *testing.T) {
+	db, _ := openTempDBString(t, Options{
+		SnapshotDeltaCompactMaxFieldsPerPublish: -1,
+		SnapshotCompactorRequestEveryNWrites:    -1,
+		SnapshotCompactorIdleInterval:           -1,
+		SnapshotCompactorMaxIterationsPerRun:    -1,
+	})
+	db.strmap.compactAt = 1 << 30
+
+	if err := db.Set("k1", &Rec{Name: "alice", Age: 10}); err != nil {
+		t.Fatalf("Set k1: %v", err)
+	}
+	if err := db.Set("k2", &Rec{Name: "bob", Age: 20}); err != nil {
+		t.Fatalf("Set k2: %v", err)
+	}
+
+	before := db.getSnapshot()
+	if before == nil || before.strmap == nil {
+		t.Fatalf("expected string snapshot before ForceCompact")
+	}
+	if before.strmap.depth < 2 || before.strmap.base == nil {
+		t.Fatalf("expected layered strmap before ForceCompact, got depth=%d", before.strmap.depth)
+	}
+
+	if err := db.ForceCompact(); err != nil {
+		t.Fatalf("ForceCompact: %v", err)
+	}
+
+	after := db.getSnapshot()
+	if after == nil || after.strmap == nil {
+		t.Fatalf("expected string snapshot after ForceCompact")
+	}
+	if after.strmap.base != nil || after.strmap.depth != 1 {
+		t.Fatalf("expected compacted dense strmap after ForceCompact, got depth=%d base=%v", after.strmap.depth, after.strmap.base != nil)
+	}
+	if after.strmap.DenseStrs == nil || after.strmap.Strs != nil {
+		t.Fatalf("expected dense-only strmap after ForceCompact")
+	}
+	if db.snapshotHasAnyDelta() {
+		t.Fatalf("expected ForceCompact to clear latest snapshot delta")
+	}
+	if _, ok := after.strmap.getIdxNoLock("k1"); !ok {
+		t.Fatalf("compacted strmap lost k1 mapping")
+	}
+	if _, ok := after.strmap.getIdxNoLock("k2"); !ok {
+		t.Fatalf("compacted strmap lost k2 mapping")
+	}
+}
+
+func TestForceCompact_StringKeySnapshotIgnoresTransientLiveMappings(t *testing.T) {
+	db, _ := openTempDBString(t, Options{
+		SnapshotDeltaCompactMaxFieldsPerPublish: -1,
+		SnapshotCompactorRequestEveryNWrites:    -1,
+		SnapshotCompactorIdleInterval:           -1,
+		SnapshotCompactorMaxIterationsPerRun:    -1,
+	})
+	db.strmap.compactAt = 1 << 30
+
+	if err := db.Set("k1", &Rec{Name: "alice", Age: 10}); err != nil {
+		t.Fatalf("Set k1: %v", err)
+	}
+
+	before := db.getSnapshot()
+	if before == nil || before.strmap == nil {
+		t.Fatalf("expected published strmap before transient mapping")
+	}
+
+	ghostIdx, created := db.idxFromIDWithCreated("ghost")
+	if !created {
+		t.Fatalf("expected transient ghost idx to be newly created")
+	}
+	if ghostIdx <= before.strmap.Next {
+		t.Fatalf("expected transient idx to be outside published snapshot: idx=%d next=%d", ghostIdx, before.strmap.Next)
+	}
+	if _, ok := before.strmap.getIdxNoLock("ghost"); ok {
+		t.Fatalf("published snapshot must not observe transient ghost mapping")
+	}
+
+	if err := db.ForceCompact(); err != nil {
+		t.Fatalf("ForceCompact: %v", err)
+	}
+
+	compacted := db.getSnapshot()
+	if compacted == nil || compacted.strmap == nil {
+		t.Fatalf("expected compacted strmap after ForceCompact")
+	}
+	if _, ok := compacted.strmap.getIdxNoLock("ghost"); ok {
+		t.Fatalf("ForceCompact must not publish transient ghost mapping")
+	}
+
+	db.rollbackCreatedStrIdx("ghost", ghostIdx)
+
+	if err := db.Set("real", &Rec{Name: "bob", Age: 20}); err != nil {
+		t.Fatalf("Set real: %v", err)
+	}
+
+	after := db.getSnapshot()
+	if after == nil || after.strmap == nil {
+		t.Fatalf("expected published strmap after real write")
+	}
+	if got, ok := after.strmap.getStringNoLock(ghostIdx); !ok || got != "real" {
+		t.Fatalf("reused idx must resolve to real key, got=%q ok=%v idx=%d", got, ok, ghostIdx)
+	}
+
+	ids, err := db.QueryKeys(qx.Query(qx.EQ("age", 20)))
+	if err != nil {
+		t.Fatalf("QueryKeys: %v", err)
+	}
+	if !slices.Equal(ids, []string{"real"}) {
+		t.Fatalf("query mismatch after reused idx: got=%v want=[real]", ids)
+	}
+}
+
+func TestSnapshotCompactor_PreclaimBusySkipsBuildWhileWriterLockHeld(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{
+		SnapshotDeltaCompactFieldKeys:           1 << 20,
+		SnapshotDeltaCompactFieldOps:            1 << 20,
+		SnapshotDeltaCompactUniverseOps:         1 << 20,
+		SnapshotDeltaCompactMaxFieldsPerPublish: 64,
+		SnapshotCompactorRequestEveryNWrites:    8,
+		SnapshotCompactorIdleInterval:           -1,
+		SnapshotCompactorMaxIterationsPerRun:    1,
+	})
+
+	if err := db.Set(1, &Rec{Name: "alice", Age: 10}); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+	if !db.snapshotHasAnyDelta() {
+		t.Fatalf("expected delta before compaction")
+	}
+
+	locked := make(chan struct{})
+	releaseLock := make(chan struct{})
+	unlocked := make(chan struct{})
+	go func() {
+		db.mu.Lock()
+		close(locked)
+		<-releaseLock
+		db.mu.Unlock()
+		close(unlocked)
+	}()
+	<-locked
+
+	before := db.SnapshotStats()
+	applied, missed := db.compactLatestSnapshotOnce(false)
+	close(releaseLock)
+	<-unlocked
+
+	if applied {
+		t.Fatalf("expected no compaction apply while writer lock is held")
+	}
+	if !missed {
+		t.Fatalf("expected preclaim busy path to signal missed compaction")
+	}
+
+	afterBusy := db.SnapshotStats()
+	if afterBusy.CompactorPreclaimBusy <= before.CompactorPreclaimBusy {
+		t.Fatalf("expected preclaim busy counter to increase: before=%d after=%d", before.CompactorPreclaimBusy, afterBusy.CompactorPreclaimBusy)
+	}
+	if afterBusy.CompactorLockMiss != before.CompactorLockMiss {
+		t.Fatalf("expected preclaim busy skip to avoid lock-miss counter: before=%d after=%d", before.CompactorLockMiss, afterBusy.CompactorLockMiss)
+	}
+	if !db.snapshotHasAnyDelta() {
+		t.Fatalf("expected delta to remain after skipped compaction")
+	}
+
+	applied, missed = db.compactLatestSnapshotOnce(true)
+	if !applied || missed {
+		t.Fatalf("expected compaction to apply after writer lock release, applied=%v missed=%v", applied, missed)
+	}
+	if db.snapshotHasAnyDelta() {
+		t.Fatalf("expected delta to be cleared after successful compaction")
 	}
 }
 
@@ -1737,5 +1956,84 @@ func TestSnapshotMaterializedPredCache_OversizedHotSlotDisabledForDeltaSnapshot(
 	}
 	if _, ok := s.loadMaterializedPred("big"); ok {
 		t.Fatalf("unexpected cache hit for oversized bitmap on delta snapshot")
+	}
+}
+
+func TestSnapshotMaterializedPredCache_InheritsOnlyUnchangedFields(t *testing.T) {
+	scoreKey := materializedPredCacheKeyFromScalar("score", qx.OpLT, "000004000")
+	statusKey := materializedPredCacheKeyFromScalar("status", qx.OpPREFIX, "a")
+
+	prev := &indexSnapshot{
+		matPredCacheMaxEntries:          8,
+		matPredCacheMaxEntriesWithDelta: 8,
+		matPredCacheMaxBitmapCard:       0,
+	}
+	scoreBM := roaring64.BitmapOf(1, 2, 3)
+	statusBM := roaring64.BitmapOf(4, 5)
+	prev.storeMaterializedPred(scoreKey, scoreBM)
+	prev.storeMaterializedPred(statusKey, statusBM)
+
+	next := &indexSnapshot{
+		indexDCount: 1,
+		indexDelta: map[string]*fieldIndexDelta{
+			"status": {
+				byKey: map[string]indexDeltaEntry{
+					"x": {addSingle: 7, addSingleSet: true},
+				},
+			},
+		},
+		matPredCacheMaxEntries:          8,
+		matPredCacheMaxEntriesWithDelta: 8,
+		matPredCacheMaxBitmapCard:       0,
+	}
+	inheritMaterializedPredCache(next, prev, next.indexDelta)
+
+	gotScore, ok := next.loadMaterializedPred(scoreKey)
+	if !ok || gotScore != scoreBM {
+		t.Fatalf("expected unchanged field cache entry to be inherited")
+	}
+	if _, ok := next.loadMaterializedPred(statusKey); ok {
+		t.Fatalf("unexpected cache inheritance for changed non-range field")
+	}
+}
+
+func TestSnapshotMaterializedPredCache_UpdatesChangedScalarRangeEntries(t *testing.T) {
+	scoreKey := materializedPredCacheKeyFromScalar("score", qx.OpLT, "m")
+
+	prev := &indexSnapshot{
+		matPredCacheMaxEntries:          8,
+		matPredCacheMaxEntriesWithDelta: 8,
+		matPredCacheMaxBitmapCard:       0,
+	}
+	prev.storeMaterializedPred(scoreKey, roaring64.BitmapOf(1, 2))
+
+	next := &indexSnapshot{
+		indexDCount: 1,
+		indexDelta: map[string]*fieldIndexDelta{
+			"score": {
+				byKey: map[string]indexDeltaEntry{
+					"a": {addSingle: 7, addSingleSet: true, delSingle: 1, delSingleSet: true},
+					"z": {addSingle: 9, addSingleSet: true},
+				},
+			},
+		},
+		matPredCacheMaxEntries:          8,
+		matPredCacheMaxEntriesWithDelta: 8,
+		matPredCacheMaxBitmapCard:       0,
+	}
+	inheritMaterializedPredCache(next, prev, next.indexDelta)
+
+	got, ok := next.loadMaterializedPred(scoreKey)
+	if !ok || got == nil {
+		t.Fatalf("expected updated cache entry for changed scalar range")
+	}
+	if got.Contains(1) {
+		t.Fatalf("expected in-range delete to be applied")
+	}
+	if !got.Contains(2) || !got.Contains(7) {
+		t.Fatalf("expected unchanged and in-range added ids to remain")
+	}
+	if got.Contains(9) {
+		t.Fatalf("unexpected out-of-range delta application")
 	}
 }

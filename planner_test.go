@@ -17,6 +17,12 @@ func postingOf(ids ...uint64) postingList {
 	return postingFromBitmapViewAdaptive(roaring64.BitmapOf(ids...))
 }
 
+type orderedDeltaRec struct {
+	Age    int     `db:"age"`
+	Score  float64 `db:"score"`
+	Active bool    `db:"active"`
+}
+
 func TestPlannerCalibration_ObserveUpdatesMultiplier(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
 		AnalyzeInterval:        -1,
@@ -1325,6 +1331,107 @@ func TestOrderedFallback_TracksMatchedRowsAndExactBitmapFilters(t *testing.T) {
 	}
 	if ev.RowsMatched <= ev.RowsReturned {
 		t.Fatalf("expected matched rows to exceed returned rows under OFFSET, trace=%+v", ev)
+	}
+	if ev.OrderIndexScanWidth == 0 {
+		t.Fatalf("expected non-zero order scan width")
+	}
+}
+
+func TestOrderedDeltaDeepOffset_SkipsUnaffectedSingletonCompose(t *testing.T) {
+	var (
+		mu     sync.Mutex
+		events []TraceEvent
+	)
+
+	sink := func(ev TraceEvent) {
+		mu.Lock()
+		events = append(events, ev)
+		mu.Unlock()
+	}
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test_ordered_delta.db")
+	db, raw := openBoltAndNew[uint64, orderedDeltaRec](t, path, Options{
+		AnalyzeInterval:                         -1,
+		TraceSink:                               sink,
+		TraceSampleEvery:                        1,
+		SnapshotCompactorRequestEveryNWrites:    1 << 30,
+		SnapshotCompactorIdleInterval:           -1,
+		SnapshotDeltaLayerMaxDepth:              1 << 30,
+		SnapshotMaterializedPredCacheMaxEntries: -1,
+	})
+	t.Cleanup(func() {
+		_ = db.Close()
+		_ = raw.Close()
+	})
+
+	db.DisableSync()
+	defer db.EnableSync()
+
+	ids := make([]uint64, 256)
+	vals := make([]*orderedDeltaRec, 256)
+	for i := range ids {
+		ids[i] = uint64(i + 1)
+		vals[i] = &orderedDeltaRec{
+			Age:    i,
+			Score:  float64(i),
+			Active: true,
+		}
+	}
+	if err := db.BatchSet(ids, vals); err != nil {
+		t.Fatalf("BatchSet(seed): %v", err)
+	}
+	if err := db.RebuildIndex(); err != nil {
+		t.Fatalf("RebuildIndex: %v", err)
+	}
+	if err := db.Patch(250, []Field{{Name: "age", Value: 1000}}); err != nil {
+		t.Fatalf("Patch(age): %v", err)
+	}
+	if db.getSnapshot().fieldDelta("age") == nil {
+		t.Fatalf("expected active age delta")
+	}
+
+	q := normalizeQuery(qx.Query(
+		qx.LT("score", 180.0),
+	).By("age", qx.ASC).Skip(100).Max(20))
+
+	leaves, ok := collectAndLeaves(q.Expr)
+	if !ok {
+		t.Fatalf("collectAndLeaves: ok=false")
+	}
+	preds, ok := db.buildPredicatesOrderedWithMode(leaves, "age", false, 0)
+	if !ok {
+		t.Fatalf("buildPredicatesOrderedWithMode: ok=false")
+	}
+	defer releasePredicates(preds)
+
+	tr := db.beginTrace(q)
+	if tr == nil {
+		t.Fatalf("expected trace to be enabled")
+	}
+	tr.setPlan(PlanOrdered)
+	got, ok := db.execPlanOrderedBasic(q, preds, tr)
+	if !ok {
+		t.Fatalf("execPlanOrderedBasic: ok=false")
+	}
+	tr.finish(uint64(len(got)), nil)
+
+	want := make([]uint64, 20)
+	for i := range want {
+		want[i] = uint64(101 + i)
+	}
+	if !slices.Equal(got, want) {
+		t.Fatalf("ordered deep-offset mismatch:\ngot=%v\nwant=%v", got, want)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(events) == 0 {
+		t.Fatalf("expected trace event")
+	}
+	ev := events[len(events)-1]
+	if ev.BitmapMaterializations != 0 {
+		t.Fatalf("expected unaffected singleton delta buckets to avoid bitmap compose, trace=%+v", ev)
 	}
 	if ev.OrderIndexScanWidth == 0 {
 		t.Fatalf("expected non-zero order scan width")

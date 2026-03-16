@@ -133,7 +133,7 @@ func formatMemoryLine(memory *MemorySnapshot) string {
 func formatSnapshotLine(sample snapshotSample) string {
 	stats := sample.Stats
 	return fmt.Sprintf(
-		"snap    pin=%d reg=%d depth=%d/%d ops=%s/%s cq=%d miss=%s soft=%s skip=%s",
+		"snap    pin=%d reg=%d depth=%d/%d ops=%s/%s cq=%d busy=%s miss=%s soft=%s skip=%s",
 		stats.PinnedRefs,
 		stats.RegistrySize,
 		stats.IndexLayerDepth,
@@ -141,6 +141,7 @@ func formatSnapshotLine(sample snapshotSample) string {
 		formatOps(float64(stats.IndexDeltaOps)),
 		formatOps(float64(stats.LenDeltaOps)),
 		stats.CompactorQueueLen,
+		formatOps(float64(stats.CompactorPreclaimBusy)),
 		formatOps(float64(stats.CompactorLockMiss)),
 		formatOps(float64(stats.CompactorSoftSkip)),
 		formatOps(float64(stats.CompactorSkippedWake)),

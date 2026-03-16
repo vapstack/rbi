@@ -18,6 +18,7 @@ const countPredBroadRangeComplementMaxCard = 32_768
 const countPredBroadRangeComplementMaxCardCap = 131_072
 const countPredBroadRangeComplementFastProbeMin = 4_096
 const countPredBroadRangeComplementFastAvgPerBucketMax = 8
+const countPredBroadRangeComplementPostingMaxBuckets = predicatePostsAnyNotExactBitmapMaxTerms
 const countPredLeadResidualHasAnyExactMaxTerms = 2
 const countPredLeadResidualHasAnyExactMinCard = 65_536
 
@@ -1009,6 +1010,33 @@ func countBaseIndexRangeCardinality(s []index, start, end int) uint64 {
 	return total
 }
 
+func tryPrepareCountBroadRangeComplementPostingPredicate(p *predicate, complement []postingList) bool {
+	if p == nil || len(complement) == 0 || len(complement) > countPredBroadRangeComplementPostingMaxBuckets {
+		return false
+	}
+
+	p.iterKind = predicateIterNone
+	p.bm = nil
+	p.contains = nil
+	p.iter = nil
+	p.bucketCount = nil
+	p.estCard = 0
+	p.alwaysTrue = false
+	p.alwaysFalse = false
+
+	if len(complement) == 1 {
+		p.kind = predicateKindPostingNot
+		p.posting = complement[0]
+		p.posts = nil
+		return true
+	}
+
+	p.kind = predicateKindPostsAnyNot
+	p.posting = postingList{}
+	p.posts = append([]postingList(nil), complement...)
+	return true
+}
+
 func (db *DB[K, V]) tryMaterializeBroadRangeComplementPredicateForCount(p *predicate, leadProbeEst uint64, universe uint64, trace *queryTrace) bool {
 	if p == nil {
 		return false
@@ -1092,6 +1120,17 @@ func (db *DB[K, V]) tryMaterializeBroadRangeComplementPredicateForCount(p *predi
 		if complementEst == 0 || complementEst > countBroadRangeComplementMaxCardinality(leadProbeEst, universe) {
 			return false
 		}
+		if complementBuckets := complementEnd - complementStart; complementBuckets > 0 && complementBuckets <= countPredBroadRangeComplementPostingMaxBuckets {
+			complement := make([]postingList, 0, complementBuckets)
+			for i := complementStart; i < complementEnd; i++ {
+				if ids := s[i].IDs; !ids.IsEmpty() {
+					complement = append(complement, ids)
+				}
+			}
+			if tryPrepareCountBroadRangeComplementPostingPredicate(p, complement) {
+				return true
+			}
+		}
 
 		bm := getRoaringBuf()
 		orBaseIndexRange(bm, s, complementStart, complementEnd)
@@ -1168,6 +1207,9 @@ func (db *DB[K, V]) tryMaterializeBroadRangeComplementPredicateForCount(p *predi
 	}
 	if complementEst == 0 || complementEst > countBroadRangeComplementMaxCardinality(leadProbeEst, universe) {
 		return false
+	}
+	if tryPrepareCountBroadRangeComplementPostingPredicate(p, complement) {
+		return true
 	}
 
 	var bm *roaring64.Bitmap
@@ -1552,9 +1594,8 @@ func (db *DB[K, V]) tryCountByPredicates(expr qx.Expr, trace *queryTrace) (uint6
 		}
 		return cnt, true, nil
 	}
-	// Scalar IN leads iterate disjoint postings. Count them posting-by-posting so
-	// exact-capable residual predicates can prune whole posting bitmaps before
-	// row fallback.
+	// Posting-backed leads can count posting-by-posting so exact-capable
+	// residual predicates prune whole posting bitmaps before row fallback.
 	if cnt, examined, ok := db.tryCountByPredicatesLeadPostings(preds, leadIdx, active); ok {
 		if trace != nil {
 			trace.setPlan(PlanCountPredicates)
@@ -1833,10 +1874,17 @@ func (db *DB[K, V]) tryCountByPredicatesLeadPostings(preds []predicate, leadIdx 
 		return 0, 0, false
 	}
 	lead := preds[leadIdx]
-	if lead.expr.Not || lead.expr.Op != qx.OpIN {
+	if lead.expr.Not {
 		return 0, 0, false
 	}
-	if lead.kind != predicateKindPostsAny || lead.iterKind != predicateIterPostsConcat || len(lead.posts) < 2 {
+
+	var leadPosts []postingList
+	switch {
+	case lead.iterKind == predicateIterPosting && !lead.posting.IsEmpty():
+		leadPosts = []postingList{lead.posting}
+	case lead.kind == predicateKindPostsAny && lead.iterKind == predicateIterPostsConcat && len(lead.posts) >= 2:
+		leadPosts = lead.posts
+	default:
 		return 0, 0, false
 	}
 
@@ -1897,7 +1945,7 @@ func (db *DB[K, V]) tryCountByPredicatesLeadPostings(preds []predicate, leadIdx 
 		defer releaseRoaringBuf(extraWork)
 	}
 
-	for _, ids := range lead.posts {
+	for _, ids := range leadPosts {
 		if ids.IsEmpty() {
 			continue
 		}

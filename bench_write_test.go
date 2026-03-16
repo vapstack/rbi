@@ -17,6 +17,7 @@ import (
 
 const writeBenchSeedBatch = 50_000
 const writeBenchUserBatchSize = 1000
+const writeBenchDeltaHeavyChurn = 2048
 
 func buildWriteBenchDB(b *testing.B) (*DB[uint64, UserBench], *bbolt.DB, uint64) {
 	return buildWriteBenchDBWithOptions(b, Options{
@@ -246,24 +247,116 @@ func rawPatchBench(db *DB[uint64, UserBench], raw *bbolt.DB, id uint64, patch []
 	})
 }
 
-func Benchmark_Write_Set_New_Indexed(b *testing.B) {
-	db, _, startOffset := buildWriteBenchDB(b)
+func churnWriteBenchSetNewIndexed(b *testing.B, db *DB[uint64, UserBench], startOffset uint64) {
+	b.Helper()
 
-	rec := &UserBench{Name: "new", Age: 20, Country: "DE"}
+	ids := make([]uint64, 0, writeBenchUserBatchSize)
+	vals := make([]*UserBench, 0, writeBenchUserBatchSize)
+	recs := []*UserBench{
+		{Name: "delta-new-a", Age: 20, Country: "DE"},
+		{Name: "delta-new-b", Age: 21, Country: "US"},
+	}
 
-	b.ResetTimer()
-	b.ReportAllocs()
+	flush := func() {
+		if len(ids) == 0 {
+			return
+		}
+		if err := db.BatchSet(ids, vals); err != nil {
+			b.Fatalf("BatchSet(delta churn new): %v", err)
+		}
+		ids = ids[:0]
+		vals = vals[:0]
+	}
 
-	for i := 0; i < b.N; i++ {
-		id := startOffset + uint64(i) + 1
-		if err := db.Set(id, rec); err != nil {
-			b.Fatal(err)
+	for i := 0; i < writeBenchDeltaHeavyChurn; i++ {
+		ids = append(ids, startOffset+uint64(i)+1)
+		vals = append(vals, recs[i%len(recs)])
+		if len(ids) == writeBenchUserBatchSize {
+			flush()
 		}
 	}
+	flush()
+}
+
+func churnWriteBenchUpdateIndexed(b *testing.B, db *DB[uint64, UserBench], recA, recB *UserBench) {
+	b.Helper()
+
+	ids := make([]uint64, 0, writeBenchUserBatchSize)
+	vals := make([]*UserBench, 0, writeBenchUserBatchSize)
+
+	flush := func() {
+		if len(ids) == 0 {
+			return
+		}
+		if err := db.BatchSet(ids, vals); err != nil {
+			b.Fatalf("BatchSet(delta churn update): %v", err)
+		}
+		ids = ids[:0]
+		vals = vals[:0]
+	}
+
+	for i := 0; i < writeBenchDeltaHeavyChurn; i++ {
+		ids = append(ids, uint64(i+1))
+		vals = append(vals, benchWriteRecordForIteration(i, recA, recB))
+		if len(ids) == writeBenchUserBatchSize {
+			flush()
+		}
+	}
+	flush()
+}
+
+func churnWriteBenchPatchIndexed(b *testing.B, db *DB[uint64, UserBench], patch []Field) {
+	b.Helper()
+
+	ids := make([]uint64, 0, writeBenchDeltaHeavyChurn)
+	for i := 0; i < writeBenchDeltaHeavyChurn; i++ {
+		ids = append(ids, uint64(i+1))
+	}
+	if err := db.BatchPatch(ids, patch); err != nil {
+		b.Fatalf("BatchPatch(delta churn patch): %v", err)
+	}
+}
+
+func Benchmark_Write_Set_New_Indexed(b *testing.B) {
+	rec := &UserBench{Name: "new", Age: 20, Country: "DE"}
+
+	b.Run("StableBase", func(b *testing.B) {
+		db, _, startOffset := buildWriteBenchDB(b)
+		prepareWriteBenchStableBase(b, db)
+
+		b.ReportAllocs()
+		b.ResetTimer()
+
+		for i := 0; i < b.N; i++ {
+			id := startOffset + uint64(i) + 1
+			if err := db.Set(id, rec); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+
+	b.Run("DeltaHeavy", func(b *testing.B) {
+		db, _, startOffset := buildWriteBenchDB(b)
+		prepareWriteBenchDeltaHeavy(b, db, func(b *testing.B, db *DB[uint64, UserBench]) {
+			churnWriteBenchSetNewIndexed(b, db, startOffset)
+		})
+
+		startOffset += writeBenchDeltaHeavyChurn
+		b.ReportAllocs()
+		b.ResetTimer()
+
+		for i := 0; i < b.N; i++ {
+			id := startOffset + uint64(i) + 1
+			if err := db.Set(id, rec); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
 }
 
 func Benchmark_Write_Set_New_NoIndex(b *testing.B) {
 	db, raw, startOffset := buildWriteBenchDB(b)
+	prepareWriteBenchStableBase(b, db)
 
 	rec := &UserBench{Name: "new", Age: 20, Country: "DE"}
 
@@ -279,24 +372,45 @@ func Benchmark_Write_Set_New_NoIndex(b *testing.B) {
 }
 
 func Benchmark_Write_Update_Indexed(b *testing.B) {
-	db, _, _ := buildWriteBenchDB(b)
-	targetID := uint64(1000)
-
 	recA, recB := writeBenchUpdateRecords()
 
-	b.ResetTimer()
-	b.ReportAllocs()
+	b.Run("StableBase", func(b *testing.B) {
+		db, _, _ := buildWriteBenchDB(b)
+		targetID := uint64(1000)
+		prepareWriteBenchStableBase(b, db)
 
-	for i := 0; i < b.N; i++ {
-		if err := db.Set(targetID, benchWriteRecordForIteration(i, recA, recB)); err != nil {
-			b.Fatal(err)
+		b.ReportAllocs()
+		b.ResetTimer()
+
+		for i := 0; i < b.N; i++ {
+			if err := db.Set(targetID, benchWriteRecordForIteration(i, recA, recB)); err != nil {
+				b.Fatal(err)
+			}
 		}
-	}
+	})
+
+	b.Run("DeltaHeavy", func(b *testing.B) {
+		db, _, _ := buildWriteBenchDB(b)
+		targetID := uint64(1000)
+		prepareWriteBenchDeltaHeavy(b, db, func(b *testing.B, db *DB[uint64, UserBench]) {
+			churnWriteBenchUpdateIndexed(b, db, recA, recB)
+		})
+
+		b.ReportAllocs()
+		b.ResetTimer()
+
+		for i := 0; i < b.N; i++ {
+			if err := db.Set(targetID, benchWriteRecordForIteration(i, recA, recB)); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
 }
 
 func Benchmark_Write_Update_NoIndex(b *testing.B) {
 	db, raw, _ := buildWriteBenchDB(b)
 	targetID := uint64(1000)
+	prepareWriteBenchStableBase(b, db)
 
 	recA, recB := writeBenchUpdateRecords()
 
@@ -311,31 +425,58 @@ func Benchmark_Write_Update_NoIndex(b *testing.B) {
 }
 
 func Benchmark_Write_Patch_Indexed(b *testing.B) {
-	db, _, _ := buildWriteBenchDB(b)
-	targetID := uint64(2000)
-
 	patchA := []Field{{Name: "age", Value: 100}}
 	patchB := []Field{{Name: "age", Value: 200}}
 
-	b.ResetTimer()
-	b.ReportAllocs()
+	b.Run("StableBase", func(b *testing.B) {
+		db, _, _ := buildWriteBenchDB(b)
+		targetID := uint64(2000)
+		prepareWriteBenchStableBase(b, db)
 
-	for i := 0; i < b.N; i++ {
-		if i%2 == 0 {
-			if err := db.Patch(targetID, patchA); err != nil {
-				b.Fatal(err)
-			}
-		} else {
-			if err := db.Patch(targetID, patchB); err != nil {
-				b.Fatal(err)
+		b.ReportAllocs()
+		b.ResetTimer()
+
+		for i := 0; i < b.N; i++ {
+			if i%2 == 0 {
+				if err := db.Patch(targetID, patchA); err != nil {
+					b.Fatal(err)
+				}
+			} else {
+				if err := db.Patch(targetID, patchB); err != nil {
+					b.Fatal(err)
+				}
 			}
 		}
-	}
+	})
+
+	b.Run("DeltaHeavy", func(b *testing.B) {
+		db, _, _ := buildWriteBenchDB(b)
+		targetID := uint64(2000)
+		prepareWriteBenchDeltaHeavy(b, db, func(b *testing.B, db *DB[uint64, UserBench]) {
+			churnWriteBenchPatchIndexed(b, db, patchA)
+		})
+
+		b.ReportAllocs()
+		b.ResetTimer()
+
+		for i := 0; i < b.N; i++ {
+			if i%2 == 0 {
+				if err := db.Patch(targetID, patchA); err != nil {
+					b.Fatal(err)
+				}
+			} else {
+				if err := db.Patch(targetID, patchB); err != nil {
+					b.Fatal(err)
+				}
+			}
+		}
+	})
 }
 
 func Benchmark_Write_Patch_NoIndex(b *testing.B) {
 	db, raw, _ := buildWriteBenchDB(b)
 	targetID := uint64(2000)
+	prepareWriteBenchStableBase(b, db)
 
 	patchA := []Field{{Name: "age", Value: 100}}
 	patchB := []Field{{Name: "age", Value: 200}}
@@ -360,6 +501,7 @@ func Benchmark_Write_Update_BeforeStore(b *testing.B) {
 	db, _, _ := buildWriteBenchDB(b)
 	targetID := uint64(1000)
 	recA, recB := writeBenchUpdateRecords()
+	prepareWriteBenchStableBase(b, db)
 
 	var modifiedTS uint64
 	beforeStore := BeforeStore(func(_ uint64, _ *UserBench, newValue *UserBench) error {
@@ -383,6 +525,7 @@ func Benchmark_Write_Update_BeforeCommit(b *testing.B) {
 	targetID := uint64(1000)
 	recA, recB := writeBenchUpdateRecords()
 	auditBucket := ensureBenchSideBucket(b, raw, "bench_audit")
+	prepareWriteBenchStableBase(b, db)
 
 	beforeCommit := BeforeCommit(func(tx *bbolt.Tx, key uint64, _ *UserBench, newValue *UserBench) error {
 		return appendBenchAuditLog(tx, auditBucket, key, newValue)
@@ -403,6 +546,7 @@ func Benchmark_Write_Update_BeforeStore_BeforeCommit_MakePatch(b *testing.B) {
 	targetID := uint64(1000)
 	recA, recB := writeBenchUpdateRecords()
 	patchBucket := ensureBenchSideBucket(b, raw, "bench_patch_log")
+	prepareWriteBenchStableBase(b, db)
 
 	var modifiedTS uint64
 	beforeStore := BeforeStore(func(_ uint64, _ *UserBench, newValue *UserBench) error {
@@ -433,6 +577,7 @@ func Benchmark_Write_Update_BeforeStore_BeforeCommit_MakePatch_BatchSet(b *testi
 	db, raw, _ := buildWriteBenchDB(b)
 	ids, valsA, valsB := buildWriteBenchBatchUpdateInput(writeBenchUserBatchSize)
 	patchBucket := ensureBenchSideBucket(b, raw, "bench_patch_log")
+	prepareWriteBenchStableBase(b, db)
 
 	var modifiedTS uint64
 	beforeStore := BeforeStore(func(_ uint64, _ *UserBench, newValue *UserBench) error {
@@ -468,6 +613,7 @@ func Benchmark_Write_Update_BeforeCommit_BatchSet(b *testing.B) {
 	db, raw, _ := buildWriteBenchDB(b)
 	ids, valsA, valsB := buildWriteBenchBatchUpdateInput(writeBenchUserBatchSize)
 	auditBucket := ensureBenchSideBucket(b, raw, "bench_audit")
+	prepareWriteBenchStableBase(b, db)
 
 	beforeCommit := BeforeCommit(func(tx *bbolt.Tx, key uint64, _ *UserBench, newValue *UserBench) error {
 		return appendBenchAuditLog(tx, auditBucket, key, newValue)
@@ -516,6 +662,7 @@ func Benchmark_Write_Update_BeforeStore_BeforeCommit_MakePatch_Parallel(b *testi
 			db, raw, _ := buildWriteBenchDBWithOptions(b, tc.opts)
 			recA, recB := writeBenchUpdateRecords()
 			patchBucket := ensureBenchSideBucket(b, raw, "bench_patch_log")
+			prepareWriteBenchStableBase(b, db)
 
 			var modifiedTS atomic.Uint64
 			beforeStore := BeforeStore(func(_ uint64, _ *UserBench, newValue *UserBench) error {
@@ -569,4 +716,56 @@ func Benchmark_Write_Update_BeforeStore_BeforeCommit_MakePatch_Parallel(b *testi
 			b.ReportMetric(st.AvgBatchSize, "avg_batch")
 		})
 	}
+}
+
+/**/
+
+func forceCompactBenchSnapshot[K ~string | ~uint64](b *testing.B, db *DB[K, UserBench]) SnapshotStats {
+	b.Helper()
+	b.StopTimer()
+
+	if err := db.ForceCompact(); err != nil {
+		b.Fatalf("ForceCompact: %v", err)
+	}
+
+	return db.SnapshotStats()
+}
+
+func requireBenchSnapshotClean(b *testing.B, st SnapshotStats) {
+	b.Helper()
+
+	if st.HasDelta || st.IndexDeltaFields != 0 || st.LenDeltaFields != 0 ||
+		st.IndexDeltaOps != 0 || st.LenDeltaOps != 0 ||
+		st.UniverseAddCard != 0 || st.UniverseRemCard != 0 {
+		b.Fatalf("expected clean snapshot, got %+v", st)
+	}
+}
+
+func requireBenchSnapshotDelta(b *testing.B, st SnapshotStats) {
+	b.Helper()
+
+	if !st.HasDelta {
+		b.Fatalf("expected delta-heavy snapshot, got %+v", st)
+	}
+}
+
+func prepareReadBenchSnapshot[K ~string | ~uint64](b *testing.B, db *DB[K, UserBench]) {
+	b.Helper()
+	requireBenchSnapshotClean(b, forceCompactBenchSnapshot(b, db))
+	b.StartTimer()
+}
+
+func prepareWriteBenchStableBase[K ~string | ~uint64](b *testing.B, db *DB[K, UserBench]) {
+	b.Helper()
+	requireBenchSnapshotClean(b, forceCompactBenchSnapshot(b, db))
+	b.StartTimer()
+}
+
+func prepareWriteBenchDeltaHeavy[K ~string | ~uint64](b *testing.B, db *DB[K, UserBench], churn func(*testing.B, *DB[K, UserBench])) {
+	b.Helper()
+
+	requireBenchSnapshotClean(b, forceCompactBenchSnapshot(b, db))
+	churn(b, db)
+	requireBenchSnapshotDelta(b, db.SnapshotStats())
+	b.StartTimer()
 }

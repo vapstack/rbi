@@ -169,6 +169,169 @@ func TestQuery_NoOrder_UnboundedLimit_RespectsOffset(t *testing.T) {
 	}
 }
 
+func TestQuery_OrderBasic_RangeBaseOpsSkipsEagerBaseBitmapBeforeOrderedPredicates(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{
+		AnalyzeInterval:                                  -1,
+		SnapshotCompactorRequestEveryNWrites:             1 << 30,
+		SnapshotCompactorIdleInterval:                    -1,
+		SnapshotDeltaLayerMaxDepth:                       1 << 30,
+		SnapshotMaterializedPredCacheMaxEntries:          16,
+		SnapshotMaterializedPredCacheMaxEntriesWithDelta: 16,
+	})
+
+	setNumericBucketKnobs(t, db, 128, 1, 1)
+	seedGeneratedUint64Data(t, db, 5_000, func(i int) *Rec {
+		return &Rec{
+			Name:   fmt.Sprintf("u_%d", i),
+			Age:    i,
+			Score:  float64(i),
+			Active: true,
+		}
+	})
+	if err := db.RebuildIndex(); err != nil {
+		t.Fatalf("RebuildIndex: %v", err)
+	}
+	if err := db.Patch(1, []Field{{Name: "age", Value: 10_000}}); err != nil {
+		t.Fatalf("Patch(age): %v", err)
+	}
+
+	snap := db.getSnapshot()
+	if snap.fieldDelta("age") == nil {
+		t.Fatalf("expected active age delta")
+	}
+	if got := snap.matPredCacheCount.Load(); got != 0 {
+		t.Fatalf("unexpected materialized predicate cache before query: %d", got)
+	}
+
+	q := qx.Query(
+		qx.LT("score", 4_000.0),
+	).By("age", qx.ASC).Max(5)
+
+	got, err := db.QueryKeys(q)
+	if err != nil {
+		t.Fatalf("QueryKeys: %v", err)
+	}
+	want, err := expectedKeysUint64(t, db, q)
+	if err != nil {
+		t.Fatalf("expectedKeysUint64: %v", err)
+	}
+	assertSameSlice(t, got, want)
+
+	after := db.getSnapshot()
+	if got := after.matPredCacheCount.Load(); got != 0 {
+		t.Fatalf("expected ordered predicate path to avoid eager base bitmap materialization, cache entries=%d", got)
+	}
+}
+
+func TestQuery_OrderBasic_DeepWindowEagerMaterializesNonOrderNumericRange(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{
+		AnalyzeInterval:                                  -1,
+		SnapshotCompactorRequestEveryNWrites:             1 << 30,
+		SnapshotCompactorIdleInterval:                    -1,
+		SnapshotDeltaLayerMaxDepth:                       1 << 30,
+		SnapshotMaterializedPredCacheMaxEntries:          16,
+		SnapshotMaterializedPredCacheMaxEntriesWithDelta: 16,
+	})
+
+	setNumericBucketKnobs(t, db, 128, 1, 1)
+	seedGeneratedUint64Data(t, db, 5_000, func(i int) *Rec {
+		return &Rec{
+			Name:   fmt.Sprintf("u_%d", i),
+			Age:    i,
+			Score:  float64(i),
+			Active: true,
+		}
+	})
+	if err := db.RebuildIndex(); err != nil {
+		t.Fatalf("RebuildIndex: %v", err)
+	}
+
+	small := qx.Query(
+		qx.LT("score", 4_000.0),
+	).By("age", qx.ASC).Max(5)
+	if _, err := db.QueryKeys(small); err != nil {
+		t.Fatalf("small QueryKeys: %v", err)
+	}
+	if got := db.getSnapshot().matPredCacheCount.Load(); got != 0 {
+		t.Fatalf("unexpected materialized predicate cache for small ordered window: %d", got)
+	}
+
+	deep := qx.Query(
+		qx.LT("score", 4_000.0),
+	).By("age", qx.ASC).Skip(2_000).Max(10)
+	got, err := db.QueryKeys(deep)
+	if err != nil {
+		t.Fatalf("deep QueryKeys: %v", err)
+	}
+	want, err := expectedKeysUint64(t, db, deep)
+	if err != nil {
+		t.Fatalf("expectedKeysUint64: %v", err)
+	}
+	assertSameSlice(t, got, want)
+
+	if got := db.getSnapshot().matPredCacheCount.Load(); got == 0 {
+		t.Fatalf("expected deep ordered window to materialize numeric range predicate")
+	}
+}
+
+func TestQuery_OrderBasic_DeepWindowCachePersistsAcrossUnchangedFieldPatch(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{
+		AnalyzeInterval:                                  -1,
+		SnapshotCompactorRequestEveryNWrites:             1 << 30,
+		SnapshotCompactorIdleInterval:                    -1,
+		SnapshotDeltaLayerMaxDepth:                       1 << 30,
+		SnapshotMaterializedPredCacheMaxEntries:          16,
+		SnapshotMaterializedPredCacheMaxEntriesWithDelta: 16,
+	})
+
+	setNumericBucketKnobs(t, db, 128, 1, 1)
+	seedGeneratedUint64Data(t, db, 5_000, func(i int) *Rec {
+		return &Rec{
+			Name:   fmt.Sprintf("u_%d", i),
+			Age:    i,
+			Score:  float64(i),
+			Active: true,
+		}
+	})
+	if err := db.RebuildIndex(); err != nil {
+		t.Fatalf("RebuildIndex: %v", err)
+	}
+
+	q := qx.Query(
+		qx.LT("score", 4_000.0),
+	).By("age", qx.ASC).Skip(2_000).Max(10)
+	if _, err := db.QueryKeys(q); err != nil {
+		t.Fatalf("QueryKeys: %v", err)
+	}
+
+	keyValue, isSlice, err := db.exprValueToIdxScalar(qx.Expr{Op: qx.OpLT, Field: "score", Value: 4_000.0})
+	if err != nil {
+		t.Fatalf("exprValueToIdxScalar: %v", err)
+	}
+	if isSlice {
+		t.Fatalf("unexpected slice scalar key")
+	}
+	cacheKey := materializedPredCacheKeyFromScalar("score", qx.OpLT, keyValue)
+	prevSnap := db.getSnapshot()
+	prevBM, ok := prevSnap.loadMaterializedPred(cacheKey)
+	if !ok || prevBM == nil {
+		t.Fatalf("expected score range cache entry before unrelated patch")
+	}
+
+	if err := db.Patch(1, []Field{{Name: "active", Value: false}}); err != nil {
+		t.Fatalf("Patch(active): %v", err)
+	}
+
+	nextSnap := db.getSnapshot()
+	nextBM, ok := nextSnap.loadMaterializedPred(cacheKey)
+	if !ok || nextBM == nil {
+		t.Fatalf("expected score range cache entry after unrelated patch")
+	}
+	if nextBM != prevBM {
+		t.Fatalf("expected unchanged-field cache entry to be inherited across snapshot publish")
+	}
+}
+
 func TestQuery_NoOrder_UnboundedLimit_RandomizedOffsetConsistency(t *testing.T) {
 	db, _ := openTempDBUint64(t)
 	_ = seedData(t, db, 260)

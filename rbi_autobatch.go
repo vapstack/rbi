@@ -643,17 +643,7 @@ func (db *DB[K, V]) executeAutoBatchAttempt(active []*autoBatchRequest[K, V]) (*
 		return nil, true, nil
 	}
 
-	preparedIdxs := make([]uint64, len(prepared))
-	preparedOldVals := make([]*V, len(prepared))
-	preparedNewVals := make([]*V, len(prepared))
-	preparedModified := make([][]string, len(prepared))
-	for i, op := range prepared {
-		preparedIdxs[i] = op.idx
-		preparedOldVals[i] = op.oldVal
-		preparedNewVals[i] = op.newVal
-		preparedModified[i] = op.modified
-	}
-	preparedDelta := db.prepareSnapshotWriteDeltaBatch(preparedIdxs, preparedOldVals, preparedNewVals, preparedModified)
+	preparedDelta := db.prepareSnapshotWriteDeltaPrepared(prepared)
 	preparedDeltaOwned := true
 	defer func() {
 		if preparedDeltaOwned {
@@ -747,17 +737,6 @@ func (db *DB[K, V]) executeAutoBatchAttempt(active []*autoBatchRequest[K, V]) (*
 		return nil, true, err
 	}
 
-	idxs := make([]uint64, len(accepted))
-	oldVals := make([]*V, len(accepted))
-	newVals := make([]*V, len(accepted))
-	modified := make([][]string, len(accepted))
-	for i, op := range accepted {
-		idxs[i] = op.idx
-		oldVals[i] = op.oldVal
-		newVals[i] = op.newVal
-		modified[i] = op.modified
-	}
-
 	txID := uint64(tx.ID())
 	db.markPending(txID)
 	if err = db.commit(tx, "batch"); err != nil {
@@ -781,6 +760,16 @@ func (db *DB[K, V]) executeAutoBatchAttempt(active []*autoBatchRequest[K, V]) (*
 			preparedDeltaOwned = false
 		}
 	} else {
+		idxs := make([]uint64, len(accepted))
+		oldVals := make([]*V, len(accepted))
+		newVals := make([]*V, len(accepted))
+		modified := make([][]string, len(accepted))
+		for i, op := range accepted {
+			idxs[i] = op.idx
+			oldVals[i] = op.oldVal
+			newVals[i] = op.newVal
+			modified[i] = op.modified
+		}
 		err = db.publishAfterCommitLocked(txID, "batch", func() {
 			db.publishWriteDeltaBatch(txID, idxs, oldVals, newVals, modified)
 		})

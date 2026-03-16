@@ -173,7 +173,6 @@ func buildBenchDBWithCaching(b *testing.B, n int, withCaching bool) *DB[uint64, 
 
 	b.StopTimer()
 	seedBenchData(b, db, n)
-	warmBenchDBStateUint64(b, db)
 
 	// s := db.Stats()
 	// b.Logf("total size: %v", s.IndexSize)
@@ -479,6 +478,7 @@ func Benchmark_Read_Index_Keys_Scan_All_Uint64(b *testing.B) {
 	db := buildBenchDB(b, benchN)
 
 	var count int
+	prepareReadBenchSnapshot(b, db)
 	b.ReportAllocs()
 	b.ResetTimer()
 
@@ -695,6 +695,7 @@ func Benchmark_Query_Index_Keys_Sort_EarlyExit(b *testing.B) {
 		qx.EQ("status", "active"),
 	).By("age", qx.ASC).Max(20)
 
+	prepareReadBenchSnapshot(b, db)
 	warmBenchQueryKeysOnceUint64(b, db, q)
 	b.ResetTimer()
 	for b.Loop() {
@@ -918,6 +919,7 @@ func Benchmark_Query_Index_Keys_Gap_ArrayCountSort_MixedFilters_Offset_Limit(b *
 func runQueryKeysBench(b *testing.B, db *DB[uint64, UserBench], q *qx.QX) {
 	b.Helper()
 	b.ReportAllocs()
+	prepareReadBenchSnapshot(b, db)
 	warmBenchQueryKeysOnceUint64(b, db, q)
 	b.ResetTimer()
 	for b.Loop() {
@@ -931,6 +933,7 @@ func runQueryKeysBench(b *testing.B, db *DB[uint64, UserBench], q *qx.QX) {
 func runCountBench(b *testing.B, db *DB[uint64, UserBench], q *qx.QX) {
 	b.Helper()
 	b.ReportAllocs()
+	prepareReadBenchSnapshot(b, db)
 	warmBenchCountOnceUint64(b, db, q)
 	b.ResetTimer()
 	for b.Loop() {
@@ -944,6 +947,7 @@ func runCountBench(b *testing.B, db *DB[uint64, UserBench], q *qx.QX) {
 func runReadQueryBench(b *testing.B, db *DB[uint64, UserBench], q *qx.QX) {
 	b.Helper()
 	b.ReportAllocs()
+	prepareReadBenchSnapshot(b, db)
 	warmBenchReadQueryOnceUint64(b, db, q)
 	b.ResetTimer()
 	for b.Loop() {

@@ -102,16 +102,17 @@ type snapshotSample struct {
 }
 
 type snapshotDelta struct {
-	CompactorRequested   uint64 `json:"compactor_requested"`
-	CompactorRuns        uint64 `json:"compactor_runs"`
-	CompactorAttempts    uint64 `json:"compactor_attempts"`
-	CompactorSucceeded   uint64 `json:"compactor_succeeded"`
-	CompactorLockMiss    uint64 `json:"compactor_lock_miss"`
-	CompactorNoChange    uint64 `json:"compactor_no_change"`
-	CompactorSoftSkip    uint64 `json:"compactor_soft_skip"`
-	CompactorSkippedWake uint64 `json:"compactor_skipped_wake"`
-	CompactorIdleDefers  uint64 `json:"compactor_idle_defers"`
-	CompactorStaleRetry  uint64 `json:"compactor_stale_retry"`
+	CompactorRequested    uint64 `json:"compactor_requested"`
+	CompactorRuns         uint64 `json:"compactor_runs"`
+	CompactorAttempts     uint64 `json:"compactor_attempts"`
+	CompactorSucceeded    uint64 `json:"compactor_succeeded"`
+	CompactorPreclaimBusy uint64 `json:"compactor_preclaim_busy"`
+	CompactorLockMiss     uint64 `json:"compactor_lock_miss"`
+	CompactorNoChange     uint64 `json:"compactor_no_change"`
+	CompactorSoftSkip     uint64 `json:"compactor_soft_skip"`
+	CompactorSkippedWake  uint64 `json:"compactor_skipped_wake"`
+	CompactorIdleDefers   uint64 `json:"compactor_idle_defers"`
+	CompactorStaleRetry   uint64 `json:"compactor_stale_retry"`
 }
 
 type batchSample struct {

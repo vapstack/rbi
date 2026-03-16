@@ -2,11 +2,14 @@ package rbi
 
 import (
 	"sort"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/RoaringBitmap/roaring/v2/roaring64"
+	"github.com/vapstack/qx"
 )
 
 // indexSnapshot is an immutable read-view published atomically for query paths.
@@ -96,6 +99,153 @@ func inheritNumericRangeBucketCache(prev *indexSnapshot, reuse bool) *sync.Map {
 	return newNumericRangeBucketCache()
 }
 
+func materializedPredCacheFieldName(key string) string {
+	if key == "" {
+		return ""
+	}
+	if i := strings.IndexByte(key, '\x1f'); i >= 0 {
+		return key[:i]
+	}
+	return key
+}
+
+func parseMaterializedPredScalarRangeCacheKey(key string) (field string, op qx.Op, scalar string, ok bool) {
+	field, rest, ok := strings.Cut(key, "\x1f")
+	if !ok || field == "" {
+		return "", 0, "", false
+	}
+	opRaw, scalar, ok := strings.Cut(rest, "\x1f")
+	if !ok || scalar == "" || strings.Contains(scalar, "\x1f") {
+		return "", 0, "", false
+	}
+	opInt, err := strconv.Atoi(opRaw)
+	if err != nil {
+		return "", 0, "", false
+	}
+	op = qx.Op(opInt)
+	switch op {
+	case qx.OpGT, qx.OpGTE, qx.OpLT, qx.OpLTE:
+		return field, op, scalar, true
+	default:
+		return "", 0, "", false
+	}
+}
+
+func rangeBoundsMatchKey(rb rangeBounds, key string) bool {
+	if rb.hasPrefix && !strings.HasPrefix(key, rb.prefix) {
+		return false
+	}
+	if rb.hasLo {
+		cmp := strings.Compare(key, rb.loKey)
+		if cmp < 0 || (cmp == 0 && !rb.loInc) {
+			return false
+		}
+	}
+	if rb.hasHi {
+		cmp := strings.Compare(key, rb.hiKey)
+		if cmp > 0 || (cmp == 0 && !rb.hiInc) {
+			return false
+		}
+	}
+	return true
+}
+
+func updateMaterializedPredCacheEntryWithDelta(prev *materializedPredCacheEntry, delta *fieldIndexDelta, op qx.Op, scalar string) (*materializedPredCacheEntry, bool) {
+	if prev == nil || prev.bm == nil || delta == nil || !delta.hasEntries() {
+		return nil, false
+	}
+	rb, ok := rangeBoundsForOp(op, scalar)
+	if !ok {
+		return nil, false
+	}
+
+	bm := getRoaringBuf()
+	bm.Or(prev.bm)
+
+	delta.forEach(func(key string, e indexDeltaEntry) {
+		if !rangeBoundsMatchKey(rb, key) {
+			return
+		}
+		deltaEntryApplyDelToBitmap(bm, e)
+	})
+	delta.forEach(func(key string, e indexDeltaEntry) {
+		if !rangeBoundsMatchKey(rb, key) {
+			return
+		}
+		deltaEntryApplyAddToBitmap(bm, e)
+	})
+
+	return &materializedPredCacheEntry{bm: bm}, true
+}
+
+func inheritMaterializedPredCache(next, prev *indexSnapshot, changedFields map[string]*fieldIndexDelta) {
+	if next == nil || prev == nil {
+		return
+	}
+	limit := next.materializedPredCacheLimit()
+	if limit <= 0 || prev.matPredCacheCount.Load() == 0 {
+		return
+	}
+
+	var oversized int32
+	prev.matPredCache.Range(func(k, v any) bool {
+		if int(next.matPredCacheCount.Load()) >= limit {
+			return false
+		}
+		key, ok := k.(string)
+		if !ok || key == "" {
+			return true
+		}
+		field := materializedPredCacheFieldName(key)
+		if field == "" {
+			return true
+		}
+		entry, ok := v.(*materializedPredCacheEntry)
+		if !ok {
+			return true
+		}
+		if changedFields != nil {
+			if delta, touched := changedFields[field]; touched {
+				rangeField, op, scalar, ok := parseMaterializedPredScalarRangeCacheKey(key)
+				if !ok || rangeField != field {
+					return true
+				}
+				updated, ok := updateMaterializedPredCacheEntryWithDelta(entry, delta, op, scalar)
+				if !ok || updated == nil || updated.bm == nil {
+					return true
+				}
+				if next.matPredCacheMaxBitmapCard > 0 &&
+					updated.bm.GetCardinality() > next.matPredCacheMaxBitmapCard {
+					releaseRoaringBuf(updated.bm)
+					return true
+				}
+				if _, loaded := next.matPredCache.LoadOrStore(key, updated); loaded {
+					releaseRoaringBuf(updated.bm)
+					return true
+				}
+				next.matPredCacheCount.Add(1)
+				if next.matPredCacheMaxBitmapCard > 0 &&
+					updated.bm.GetCardinality() > next.matPredCacheMaxBitmapCard {
+					oversized++
+				}
+				return true
+			}
+		}
+		if _, loaded := next.matPredCache.LoadOrStore(key, entry); loaded {
+			return true
+		}
+		next.matPredCacheCount.Add(1)
+		if entry != nil && entry.bm != nil && next.matPredCacheMaxBitmapCard > 0 &&
+			entry.bm.GetCardinality() > next.matPredCacheMaxBitmapCard {
+			oversized++
+		}
+		return true
+	})
+	if oversized > 0 {
+		next.matPredCacheOversizedCount.Store(min(oversized, int32(matPredCacheOversizedMaxEntries)))
+	}
+}
+
 func (db *DB[K, V]) broadcastSnapshotWaitersLocked() {
 	if db.snapshot.wait != nil {
 		db.snapshot.wait.Broadcast()
@@ -146,6 +296,7 @@ func (db *DB[K, V]) publishSnapshotWithTxDeltaNoLock(txID uint64, indexChanges, 
 		matPredCacheMaxEntriesWithDelta: max(0, db.options.SnapshotMaterializedPredCacheMaxEntriesWithDelta),
 		matPredCacheMaxBitmapCard:       materializedPredCacheMaxBitmapCardinality(db.options.SnapshotMaterializedPredCacheMaxBitmapCardinality),
 	}
+	inheritMaterializedPredCache(s, prev, indexDelta)
 	db.snapshot.current.Store(s)
 	db.registerSnapshot(s)
 	db.noteSnapshotActivity()
@@ -213,6 +364,7 @@ func (db *DB[K, V]) publishPreparedSnapshotWithAccumDeltaNoLock(txID uint64, del
 		matPredCacheMaxEntriesWithDelta: max(0, db.options.SnapshotMaterializedPredCacheMaxEntriesWithDelta),
 		matPredCacheMaxBitmapCard:       materializedPredCacheMaxBitmapCardinality(db.options.SnapshotMaterializedPredCacheMaxBitmapCardinality),
 	}
+	inheritMaterializedPredCache(s, prev, delta.indexDelta)
 	db.snapshot.current.Store(s)
 	db.registerSnapshot(s)
 	if s.hasAnyDeltaState() {
@@ -283,6 +435,7 @@ func (db *DB[K, V]) publishSnapshotWithAccumDeltaNoLock(txID uint64, indexChange
 		matPredCacheMaxEntriesWithDelta: max(0, db.options.SnapshotMaterializedPredCacheMaxEntriesWithDelta),
 		matPredCacheMaxBitmapCard:       materializedPredCacheMaxBitmapCardinality(db.options.SnapshotMaterializedPredCacheMaxBitmapCardinality),
 	}
+	inheritMaterializedPredCache(s, prev, indexDelta)
 	db.snapshot.current.Store(s)
 	db.registerSnapshot(s)
 	if s.hasAnyDeltaState() {
@@ -627,6 +780,18 @@ func (db *DB[K, V]) snapshotCompactorLockMissSkip(streak uint64) uint64 {
 	return skip
 }
 
+func (db *DB[K, V]) noteSnapshotCompactorBusySkip(preclaim bool) {
+	if preclaim {
+		db.snapshot.compactPreclaimBusy.Add(1)
+	} else {
+		db.snapshot.compactLockMiss.Add(1)
+	}
+	streak := db.snapshot.compactMissStreak.Add(1)
+	seq := db.snapshot.compactWriteSeq.Load()
+	skip := db.snapshotCompactorLockMissSkip(streak)
+	db.snapshot.compactSkipUntil.Store(seq + skip)
+}
+
 func snapshotCompactionWorthwhile(s *indexSnapshot, opt *Options) bool {
 	if s == nil || !s.hasAnyDeltaState() {
 		return false
@@ -732,6 +897,49 @@ func (db *DB[K, V]) forceCompactionHasWork(s *indexSnapshot) bool {
 	return s.getIndexLayer() != nil || s.getLenLayer() != nil
 }
 
+// ForceCompact synchronously compacts the currently published snapshot into a
+// clean base view without layered snapshot deltas.
+//
+// It serializes with writers while compacting. Concurrent writes that start
+// after ForceCompact returns may publish new deltas again.
+func (db *DB[K, V]) ForceCompact() error {
+	if err := db.beginOp(); err != nil {
+		return err
+	}
+	defer db.endOp()
+
+	db.mu.Lock()
+	defer db.mu.Unlock()
+
+	if err := db.unavailableErr(); err != nil {
+		return err
+	}
+
+	cur := db.snapshot.current.Load()
+	if cur == nil {
+		return nil
+	}
+
+	nextStrMap := cur.strmap
+	if db.strkey {
+		nextStrMap = db.strmap.forceSnapshotPublished(cur.strmap)
+	}
+
+	next, changed := forceCompactSnapshot(cur, nextStrMap)
+	if changed {
+		db.snapshot.current.Store(next)
+		db.registerSnapshot(next)
+		db.noteSnapshotActivity()
+	}
+
+	_, blocked := db.compactSnapshotRegistryIdleOnce()
+	db.snapshot.compactPinsBlocked.Store(blocked)
+	db.snapshot.compactForcePending.Store(false)
+	db.snapshot.compactSkipUntil.Store(0)
+
+	return nil
+}
+
 func (db *DB[K, V]) compactSnapshotRegistryIdleOnce() (changed bool, blocked bool) {
 	db.snapshot.mu.Lock()
 	defer db.snapshot.mu.Unlock()
@@ -795,6 +1003,18 @@ func (db *DB[K, V]) compactLatestSnapshotOnce(force bool) (bool, bool) {
 			db.snapshot.compactMissStreak.Store(0)
 			return false, false
 		}
+
+		if !db.mu.TryRLock() {
+			db.noteSnapshotCompactorBusySkip(true)
+			return false, true
+		}
+		latest := db.snapshot.current.Load()
+		db.mu.RUnlock()
+		if latest != cur {
+			db.snapshot.compactStaleRetry.Add(1)
+			continue
+		}
+
 		next, ok := compactSnapshot(cur, db.options, force)
 		if !ok || next == nil {
 			db.snapshot.compactNoChange.Add(1)
@@ -803,15 +1023,11 @@ func (db *DB[K, V]) compactLatestSnapshotOnce(force bool) (bool, bool) {
 		}
 
 		if !db.mu.TryLock() {
-			db.snapshot.compactLockMiss.Add(1)
-			streak := db.snapshot.compactMissStreak.Add(1)
-			seq := db.snapshot.compactWriteSeq.Load()
-			skip := db.snapshotCompactorLockMissSkip(streak)
-			db.snapshot.compactSkipUntil.Store(seq + skip)
+			db.noteSnapshotCompactorBusySkip(false)
 			return false, true
 		}
 
-		latest := db.snapshot.current.Load()
+		latest = db.snapshot.current.Load()
 		if latest != cur {
 			db.mu.Unlock()
 			db.snapshot.compactStaleRetry.Add(1)
@@ -911,6 +1127,62 @@ func compactSnapshot(cur *indexSnapshot, opt *Options, force bool) (*indexSnapsh
 		universeRem:                     nextUniverseRem,
 		strmap:                          cur.strmap,
 		numericRangeBucketCache:         inheritNumericRangeBucketCache(cur, indexBaseUnchanged),
+		matPredCacheMaxEntries:          cur.matPredCacheMaxEntries,
+		matPredCacheMaxEntriesWithDelta: cur.matPredCacheMaxEntriesWithDelta,
+		matPredCacheMaxBitmapCard:       cur.matPredCacheMaxBitmapCard,
+	}, true
+}
+
+func forceCompactSnapshotFieldBase(base map[string]*[]index, layer *fieldDeltaLayer) (map[string]*[]index, bool) {
+	if layer == nil {
+		return base, false
+	}
+
+	updates := make(map[string]*[]index, layer.effectiveFieldCount())
+	forEachEffectiveLayerField(layer, func(field string, delta *fieldIndexDelta) {
+		if delta == nil || !delta.hasEntries() {
+			return
+		}
+		updates[field] = materializeFieldOverlay(newFieldOverlay(base[field], delta))
+	})
+	if len(updates) == 0 {
+		return base, false
+	}
+	return copyIndexMapWithOverrides(base, updates), true
+}
+
+func forceCompactSnapshot(cur *indexSnapshot, nextStrMap *strMapSnapshot) (*indexSnapshot, bool) {
+	if cur == nil {
+		return nil, false
+	}
+
+	indexLayer := cur.getIndexLayer()
+	lenLayer := cur.getLenLayer()
+
+	nextIndex, indexBaseChanged := forceCompactSnapshotFieldBase(cur.index, indexLayer)
+	nextLenIndex, _ := forceCompactSnapshotFieldBase(cur.lenIndex, lenLayer)
+
+	nextUniverse := cur.universe
+	universeDeltaCleared := cur.universeAdd != nil || cur.universeRem != nil
+	if universeDeltaCleared {
+		nextUniverse, _, _ = maybeCompactUniverseDelta(cur.universe, cur.universeAdd, cur.universeRem, 1, true)
+	}
+
+	indexDeltaCleared := indexLayer != nil || len(cur.indexDelta) > 0 || cur.indexDCount > 0
+	lenDeltaCleared := lenLayer != nil || len(cur.lenIdxDelta) > 0 || cur.lenDCount > 0
+	strMapCompacted := nextStrMap != cur.strmap
+
+	if !indexDeltaCleared && !lenDeltaCleared && !universeDeltaCleared && !strMapCompacted {
+		return cur, false
+	}
+
+	return &indexSnapshot{
+		txID:                            cur.txID,
+		index:                           nextIndex,
+		lenIndex:                        nextLenIndex,
+		universe:                        nextUniverse,
+		strmap:                          nextStrMap,
+		numericRangeBucketCache:         inheritNumericRangeBucketCache(cur, !indexBaseChanged),
 		matPredCacheMaxEntries:          cur.matPredCacheMaxEntries,
 		matPredCacheMaxEntriesWithDelta: cur.matPredCacheMaxEntriesWithDelta,
 		matPredCacheMaxBitmapCard:       cur.matPredCacheMaxBitmapCard,
@@ -2616,20 +2888,21 @@ func (db *DB[K, V]) SnapshotStats() SnapshotStats {
 	s := db.getSnapshot()
 
 	diag := SnapshotStats{
-		TxID:                 s.txID,
-		HasDelta:             s.hasAnyDeltaState(),
-		IndexDeltaFields:     s.indexDeltaCount(),
-		LenDeltaFields:       s.lenDeltaCount(),
-		CompactorRequested:   db.snapshot.compactRequested.Load(),
-		CompactorRuns:        db.snapshot.compactRuns.Load(),
-		CompactorAttempts:    db.snapshot.compactAttempts.Load(),
-		CompactorSucceeded:   db.snapshot.compactSucceeded.Load(),
-		CompactorLockMiss:    db.snapshot.compactLockMiss.Load(),
-		CompactorNoChange:    db.snapshot.compactNoChange.Load(),
-		CompactorSoftSkip:    db.snapshot.compactSoftSkip.Load(),
-		CompactorSkippedWake: db.snapshot.compactSkippedWake.Load(),
-		CompactorIdleDefers:  db.snapshot.compactIdleDefers.Load(),
-		CompactorStaleRetry:  db.snapshot.compactStaleRetry.Load(),
+		TxID:                  s.txID,
+		HasDelta:              s.hasAnyDeltaState(),
+		IndexDeltaFields:      s.indexDeltaCount(),
+		LenDeltaFields:        s.lenDeltaCount(),
+		CompactorRequested:    db.snapshot.compactRequested.Load(),
+		CompactorRuns:         db.snapshot.compactRuns.Load(),
+		CompactorAttempts:     db.snapshot.compactAttempts.Load(),
+		CompactorSucceeded:    db.snapshot.compactSucceeded.Load(),
+		CompactorPreclaimBusy: db.snapshot.compactPreclaimBusy.Load(),
+		CompactorLockMiss:     db.snapshot.compactLockMiss.Load(),
+		CompactorNoChange:     db.snapshot.compactNoChange.Load(),
+		CompactorSoftSkip:     db.snapshot.compactSoftSkip.Load(),
+		CompactorSkippedWake:  db.snapshot.compactSkippedWake.Load(),
+		CompactorIdleDefers:   db.snapshot.compactIdleDefers.Load(),
+		CompactorStaleRetry:   db.snapshot.compactStaleRetry.Load(),
 	}
 	diag.IndexDeltaKeys, diag.IndexDeltaOps = s.getIndexLayer().effectiveDeltaTotals()
 	diag.LenDeltaKeys, diag.LenDeltaOps = s.getLenLayer().effectiveDeltaTotals()

@@ -178,7 +178,6 @@ func buildBenchDBDynamicProfileWithCaching(b *testing.B, profile dynamicBenchPro
 
 	b.StopTimer()
 	seedBenchDataDynamicProfile(b, db, profile)
-	_, _ = db.QueryKeys(qx.Query(qx.EQ("country", "US")).Max(100)) // warm-up
 	b.StartTimer()
 
 	dynamicBenchDBs[key] = db

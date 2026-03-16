@@ -56,6 +56,8 @@ const (
 	predicateIterBitmap
 )
 
+const predicatePostsAnyNotExactBitmapMaxTerms = 2
+
 func (p predicate) hasContains() bool {
 	switch p.kind {
 	case predicateKindPosting,
@@ -95,8 +97,12 @@ func (p predicate) supportsBitmapFilter() bool {
 	case predicateKindPosting,
 		predicateKindPostingNot,
 		predicateKindPostsAll,
+		predicateKindPostsAnyNot,
 		predicateKindBitmap,
 		predicateKindBitmapNot:
+		if p.kind == predicateKindPostsAnyNot && len(p.posts) > predicatePostsAnyNotExactBitmapMaxTerms {
+			return false
+		}
 		return true
 	default:
 		return false
@@ -267,6 +273,18 @@ func (p predicate) applyToBitmap(dst *roaring64.Bitmap) bool {
 
 	case predicateKindPostingNot:
 		p.posting.AndNotFrom(dst)
+		return true
+
+	case predicateKindPostsAnyNot:
+		if len(p.posts) > predicatePostsAnyNotExactBitmapMaxTerms {
+			return false
+		}
+		for _, ids := range p.posts {
+			ids.AndNotFrom(dst)
+			if dst.IsEmpty() {
+				return true
+			}
+		}
 		return true
 
 	case predicateKindPostsAll:
@@ -1866,6 +1884,7 @@ const (
 	rangeHashSetMaxCard                     = 50_000
 	rangeBucketCountMaxProbe                = 64
 	rangeFastSinglesMinProbe                = 4096
+	orderedPredEagerMaterializeMinWindow    = 1024
 	orderedPredBroadRangeLazyMinCard        = 65_536
 	orderedPredBroadRangeComplementMaxCard  = 512_000
 	orderedPredBroadRangeComplementMaxSlots = 65_536
@@ -2030,7 +2049,8 @@ func (db *DB[K, V]) tryPlanOrdered(q *qx.QX, trace *queryTrace) ([]K, bool, erro
 			return nil, false, nil
 		}
 
-		preds, ok := db.buildPredicatesOrderedWithMode(leaves, o.Field, false)
+		window, _ := orderWindow(q)
+		preds, ok := db.buildPredicatesOrderedWithMode(leaves, o.Field, false, window)
 		if !ok {
 			return nil, false, nil
 		}
@@ -2209,7 +2229,7 @@ func isOrderRangeCoveredLeaf(orderField string, e qx.Expr) bool {
 }
 
 func (db *DB[K, V]) buildPredicatesOrdered(leaves []qx.Expr, orderField string) ([]predicate, bool) {
-	return db.buildPredicatesOrderedWithMode(leaves, orderField, true)
+	return db.buildPredicatesOrderedWithMode(leaves, orderField, true, 0)
 }
 
 func shouldUseOrderedBroadRangeComplementMaterialization(p predicate, ov fieldOverlay, universe uint64) bool {
@@ -2350,7 +2370,22 @@ func (db *DB[K, V]) tryMaterializeBroadRangeComplementPredicateForOrdered(p *pre
 	return true
 }
 
-func (db *DB[K, V]) buildPredicatesOrderedWithMode(leaves []qx.Expr, orderField string, allowMaterialize bool) ([]predicate, bool) {
+func shouldEagerMaterializeOrderedPredicate(e qx.Expr, orderField string, orderedWindow int) bool {
+	if orderedWindow < orderedPredEagerMaterializeMinWindow {
+		return false
+	}
+	if e.Not || e.Field == "" || e.Field == orderField {
+		return false
+	}
+	switch e.Op {
+	case qx.OpGT, qx.OpGTE, qx.OpLT, qx.OpLTE:
+		return true
+	default:
+		return false
+	}
+}
+
+func (db *DB[K, V]) buildPredicatesOrderedWithMode(leaves []qx.Expr, orderField string, allowMaterialize bool, orderedWindow int) ([]predicate, bool) {
 	if len(leaves) == 1 && leaves[0].Op == qx.OpNOOP && leaves[0].Not {
 		return []predicate{{alwaysFalse: true}}, true
 	}
@@ -2377,6 +2412,9 @@ func (db *DB[K, V]) buildPredicatesOrderedWithMode(leaves []qx.Expr, orderField 
 		}
 
 		predAllowMaterialize := allowMaterialize
+		if !predAllowMaterialize && shouldEagerMaterializeOrderedPredicate(e, orderField, orderedWindow) {
+			predAllowMaterialize = true
+		}
 		var ov fieldOverlay
 		if !allowMaterialize {
 			ov = db.fieldOverlay(e.Field)

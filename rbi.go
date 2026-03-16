@@ -732,19 +732,20 @@ type snapshot struct {
 	compactPinsBlocked  atomic.Bool
 	compactLastActivity atomic.Int64
 
-	compactRequested   atomic.Uint64
-	compactRuns        atomic.Uint64
-	compactAttempts    atomic.Uint64
-	compactSucceeded   atomic.Uint64
-	compactLockMiss    atomic.Uint64
-	compactNoChange    atomic.Uint64
-	compactSoftSkip    atomic.Uint64
-	compactSkippedWake atomic.Uint64
-	compactIdleDefers  atomic.Uint64
-	compactStaleRetry  atomic.Uint64
-	compactMissStreak  atomic.Uint64
-	compactWriteSeq    atomic.Uint64
-	compactSkipUntil   atomic.Uint64
+	compactRequested    atomic.Uint64
+	compactRuns         atomic.Uint64
+	compactAttempts     atomic.Uint64
+	compactSucceeded    atomic.Uint64
+	compactPreclaimBusy atomic.Uint64
+	compactLockMiss     atomic.Uint64
+	compactNoChange     atomic.Uint64
+	compactSoftSkip     atomic.Uint64
+	compactSkippedWake  atomic.Uint64
+	compactIdleDefers   atomic.Uint64
+	compactStaleRetry   atomic.Uint64
+	compactMissStreak   atomic.Uint64
+	compactWriteSeq     atomic.Uint64
+	compactSkipUntil    atomic.Uint64
 
 	wait *sync.Cond
 	mu   sync.RWMutex
@@ -1104,6 +1105,9 @@ type (
 		CompactorAttempts uint64
 		// CompactorSucceeded is total successful compactions applied.
 		CompactorSucceeded uint64
+		// CompactorPreclaimBusy is number of compactor runs skipped before build
+		// because writer lock contention was already visible via cheap pre-claim.
+		CompactorPreclaimBusy uint64
 		// CompactorLockMiss is total attempts skipped due to DB lock contention.
 		CompactorLockMiss uint64
 		// CompactorNoChange is total attempts that produced no effective changes.
@@ -1686,6 +1690,67 @@ type strMapSnapshot struct {
 	depth    int
 }
 
+func (s *strMapSnapshot) compact() *strMapSnapshot {
+	if s == nil {
+		return nil
+	}
+	if s.base == nil && s.DenseStrs != nil {
+		return s
+	}
+	if s.Next > uint64(^uint(0)>>1) {
+		panic(fmt.Errorf("strmap index overflows int: %v", s.Next))
+	}
+
+	layers := make([]*strMapSnapshot, 0, max(1, s.depth))
+	for cur := s; cur != nil; cur = cur.base {
+		layers = append(layers, cur)
+	}
+
+	size := int(s.Next) + 1
+	if size < 1 {
+		size = 1
+	}
+	strs := make([]string, size)
+	used := make([]bool, size)
+
+	for i := len(layers) - 1; i >= 0; i-- {
+		cur := layers[i]
+
+		limit := min(size, len(cur.DenseStrs), len(cur.DenseUsed))
+		for idx := 1; idx < limit; idx++ {
+			if !cur.DenseUsed[idx] {
+				continue
+			}
+			strs[idx] = cur.DenseStrs[idx]
+			used[idx] = true
+		}
+
+		for idx, key := range cur.Strs {
+			if idx == 0 || idx > s.Next || idx > uint64(^uint(0)>>1) {
+				continue
+			}
+			strs[int(idx)] = key
+			used[int(idx)] = true
+		}
+	}
+
+	keys := make(map[string]uint64, len(s.Keys))
+	for idx := 1; idx < len(strs); idx++ {
+		if !used[idx] {
+			continue
+		}
+		keys[strs[idx]] = uint64(idx)
+	}
+
+	return &strMapSnapshot{
+		Next:      s.Next,
+		Keys:      keys,
+		DenseStrs: strs,
+		DenseUsed: used,
+		depth:     1,
+	}
+}
+
 func (s *strMapSnapshot) getIdxNoLock(key string) (uint64, bool) {
 	for cur := s; cur != nil; cur = cur.base {
 		if cur.Keys == nil {
@@ -1819,6 +1884,23 @@ func (sm *strMapper) snapshot() *strMapSnapshot {
 	return sm.snapshotNoLock()
 }
 
+func (sm *strMapper) forceSnapshot() *strMapSnapshot {
+	sm.Lock()
+	defer sm.Unlock()
+	return sm.forceSnapshotNoLock()
+}
+
+func (sm *strMapper) forceSnapshotPublishedNoLock(published *strMapSnapshot) *strMapSnapshot {
+	sm.snap = published.compact()
+	return sm.snap
+}
+
+func (sm *strMapper) forceSnapshotPublished(published *strMapSnapshot) *strMapSnapshot {
+	sm.Lock()
+	defer sm.Unlock()
+	return sm.forceSnapshotPublishedNoLock(published)
+}
+
 func (sm *strMapper) snapshotNoLock() *strMapSnapshot {
 	if sm.snap == nil {
 		sm.snap = &strMapSnapshot{}
@@ -1857,6 +1939,23 @@ func (sm *strMapper) snapshotNoLock() *strMapSnapshot {
 		base:     sm.snap,
 		baseNext: baseNext,
 		depth:    nextDepth,
+	}
+	return sm.snap
+}
+
+func (sm *strMapper) forceSnapshotNoLock() *strMapSnapshot {
+	if sm.snap != nil && len(sm.deltaKeys) == 0 && sm.snap.base == nil && sm.snap.DenseStrs != nil {
+		return sm.snap
+	}
+
+	sm.deltaKeys = nil
+	sm.deltaStrs = nil
+	sm.snap = &strMapSnapshot{
+		Next:      sm.Next,
+		Keys:      maps.Clone(sm.Keys),
+		DenseStrs: slices.Clone(sm.Strs),
+		DenseUsed: slices.Clone(sm.strsUsed),
+		depth:     1,
 	}
 	return sm.snap
 }
