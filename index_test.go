@@ -533,9 +533,9 @@ func TestIndexPersistence(t *testing.T) {
 		t.Fatalf("expected [1], got %v", ids)
 	}
 
-	st := db2.Stats()
-	if st.Index.KeyCount != 2 {
-		t.Fatalf("expected Stats.Index.KeyCount=2, got %d", st.Index.KeyCount)
+	st := db2.IndexStats()
+	if st.KeyCount != 2 {
+		t.Fatalf("expected IndexStats.KeyCount=2, got %d", st.KeyCount)
 	}
 }
 
@@ -1395,9 +1395,9 @@ func TestRebuildIndex_StatsBlockUntilRebuildCompletes(t *testing.T) {
 		t.Fatal("expected rebuild to become active")
 	}
 
-	statsDone := make(chan Stats[uint64], 1)
+	statsDone := make(chan IndexStats[uint64], 1)
 	go func() {
-		statsDone <- db.Stats()
+		statsDone <- db.IndexStats()
 	}()
 
 	select {
@@ -1419,14 +1419,11 @@ func TestRebuildIndex_StatsBlockUntilRebuildCompletes(t *testing.T) {
 
 	select {
 	case st := <-statsDone:
-		if st.Index.Size == 0 {
-			t.Fatalf("expected IndexStats.Size > 0, got %+v", st.Index)
-		}
-		if st.Snapshot.TxID == 0 {
-			t.Fatalf("expected SnapshotStats.TxID > 0, got %+v", st.Snapshot)
+		if st.Size == 0 {
+			t.Fatalf("expected IndexStats.Size > 0, got %+v", st)
 		}
 	case <-time.After(2 * time.Second):
-		t.Fatal("Stats did not return after rebuild completion")
+		t.Fatal("IndexStats did not return after rebuild completion")
 	}
 }
 

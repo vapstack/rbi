@@ -1,3 +1,5 @@
+//go:build rbidebug
+
 package roaring64
 
 import (
@@ -118,8 +120,6 @@ var (
 	poolStatsResetBaseline PoolStats
 	poolStatsResetActive   bool
 )
-
-const maxPooledAddManyBatchCapacity = 128 << 10
 
 func GetPoolStats() PoolStats {
 	return PoolStats{

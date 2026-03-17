@@ -253,6 +253,7 @@ func (a *app) buildReport(interrupted bool) stressReport {
 	snap := a.buildSnapshot(now, true)
 	epoch := a.currentEpoch()
 	memoryBaseline, memoryFinal, memorySamples, poolBase, poolFinal, poolSamples, snapshotBase, snapshotFinal, snapshotSamples, batchBase, batchFinal, batchSamples := epoch.copyTelemetry()
+	reportPoolBase, reportPoolFinal, reportPoolSummary, reportPoolSamples := poolReportData(poolBase, poolFinal, poolSamples)
 	return stressReport{
 		Schema:            reportSchema,
 		Timestamp:         now.Format(time.RFC3339Nano),
@@ -277,10 +278,10 @@ func (a *app) buildReport(interrupted bool) stressReport {
 		MemoryFinal:       memoryFinal,
 		MemorySummary:     summarizeMemory(memorySamples, memoryFinal),
 		MemorySamples:     memorySamples,
-		PoolBaseline:      poolBase,
-		PoolFinal:         poolFinal,
-		PoolSummary:       summarizePools(poolSamples, poolFinal),
-		PoolSamples:       poolSamples,
+		PoolBaseline:      reportPoolBase,
+		PoolFinal:         reportPoolFinal,
+		PoolSummary:       reportPoolSummary,
+		PoolSamples:       reportPoolSamples,
 		SnapshotBaseline:  snapshotBase,
 		SnapshotFinal:     snapshotFinal,
 		SnapshotSamples:   snapshotSamples,
@@ -410,7 +411,7 @@ func (a *app) currentEpoch() *runEpoch {
 func (a *app) captureTelemetry(now time.Time) {
 	epoch := a.currentEpoch()
 	memory := CaptureMemorySnapshot(a.handle)
-	poolRaw := a.handle.DB.PoolStatsSinceReset()
+	poolRaw := poolStatsSinceReset(a.handle.DB)
 	snapRaw := a.handle.DB.SnapshotStats()
 	batchRaw := a.handle.DB.AutoBatchStats()
 	epoch.recordTelemetry(
@@ -680,8 +681,8 @@ func jitterDelay(rng *rand.Rand) time.Duration {
 func newRunEpoch(handle *DBHandle, traces *plannerTraceCollector) *runEpoch {
 	now := time.Now()
 	memory := CaptureMemorySnapshot(handle)
-	handle.DB.ResetPoolStats()
-	poolRaw := handle.DB.PoolStatsSinceReset()
+	resetPoolStatsWindow(handle.DB)
+	poolRaw := poolStatsSinceReset(handle.DB)
 	snapshotRaw := handle.DB.SnapshotStats()
 	batchRaw := handle.DB.AutoBatchStats()
 	pool := poolSample{

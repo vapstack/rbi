@@ -3882,7 +3882,7 @@ func TestBatchSet_UniqueReject_DoesNotGrowStrMap(t *testing.T) {
 
 /**/
 
-func TestStats_ExposePlannerCalibrationAndSnapshotDiagnostics(t *testing.T) {
+func TestComponentAccessors_ExposePlannerCalibrationAndSnapshotDiagnostics(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
 		CalibrationEnabled:     true,
 		CalibrationSampleEvery: 1,
@@ -3902,89 +3902,92 @@ func TestStats_ExposePlannerCalibrationAndSnapshotDiagnostics(t *testing.T) {
 		RowsExamined:  96,
 	})
 
-	st := db.Stats()
-
-	if st.Index.EntryCount == 0 {
+	idx := db.IndexStats()
+	if idx.EntryCount == 0 {
 		t.Fatalf("expected index diagnostics entry_count > 0")
 	}
-	if st.Index.ApproxHeapBytes < st.Index.Size {
-		t.Fatalf("expected approx heap bytes >= index size, got approx=%d index=%d", st.Index.ApproxHeapBytes, st.Index.Size)
+	if idx.ApproxHeapBytes < idx.Size {
+		t.Fatalf("expected approx heap bytes >= index size, got approx=%d index=%d", idx.ApproxHeapBytes, idx.Size)
 	}
 
-	if st.Snapshot.TxID == 0 {
+	snap := db.SnapshotStats()
+	if snap.TxID == 0 {
 		t.Fatalf("expected snapshot txID > 0")
 	}
-	if st.Snapshot.RegistrySize == 0 {
+	if snap.RegistrySize == 0 {
 		t.Fatalf("expected snapshot registry to be non-empty")
 	}
-	if st.Snapshot.UniverseBaseCard+st.Snapshot.UniverseAddCard == 0 {
+	if snap.UniverseBaseCard+snap.UniverseAddCard == 0 {
 		t.Fatalf("expected snapshot universe cardinality (base+add) > 0")
 	}
 
-	if st.Planner.Version == 0 {
+	pl := db.PlannerStats()
+	if pl.Version == 0 {
 		t.Fatalf("expected planner stats version > 0")
 	}
-	if st.Planner.GeneratedAt.IsZero() {
+	if pl.GeneratedAt.IsZero() {
 		t.Fatalf("expected planner generated_at to be set")
 	}
-	if st.Planner.FieldCount == 0 {
+	if pl.FieldCount == 0 {
 		t.Fatalf("expected planner field_count > 0")
 	}
-	if st.Planner.AnalyzeInterval != 0 {
-		t.Fatalf("expected disabled analyze interval (0), got %v", st.Planner.AnalyzeInterval)
+	if pl.AnalyzeInterval != 0 {
+		t.Fatalf("expected disabled analyze interval (0), got %v", pl.AnalyzeInterval)
 	}
 
-	if !st.Calibration.Enabled {
+	cal := db.CalibrationStats()
+	if !cal.Enabled {
 		t.Fatalf("expected calibration to be enabled in stats")
 	}
-	if st.Calibration.SampleEvery != 1 {
-		t.Fatalf("expected calibration sample_every=1, got %d", st.Calibration.SampleEvery)
+	if cal.SampleEvery != 1 {
+		t.Fatalf("expected calibration sample_every=1, got %d", cal.SampleEvery)
 	}
-	if st.Calibration.UpdatedAt.IsZero() {
+	if cal.UpdatedAt.IsZero() {
 		t.Fatalf("expected calibration updated_at to be set")
 	}
-	if st.Calibration.SamplesTotal == 0 {
+	if cal.SamplesTotal == 0 {
 		t.Fatalf("expected calibration samples_total > 0")
 	}
-	if st.Calibration.Samples[string(PlanOrdered)] == 0 {
+	if cal.Samples[string(PlanOrdered)] == 0 {
 		t.Fatalf("expected calibration samples for %q > 0", PlanOrdered)
 	}
-	if _, ok := st.Calibration.Multipliers[string(PlanOrdered)]; !ok {
+	if _, ok := cal.Multipliers[string(PlanOrdered)]; !ok {
 		t.Fatalf("expected calibration multiplier for %q to be present", PlanOrdered)
 	}
 
-	if !st.AutoBatch.Enabled {
+	bs := db.AutoBatchStats()
+	if !bs.Enabled {
 		t.Fatalf("expected auto-batch stats to report enabled")
 	}
-	if st.AutoBatch.Window <= 0 {
-		t.Fatalf("expected positive auto-batch window, got %v", st.AutoBatch.Window)
+	if bs.Window <= 0 {
+		t.Fatalf("expected positive auto-batch window, got %v", bs.Window)
 	}
-	if st.AutoBatch.Enqueued == 0 {
+	if bs.Enqueued == 0 {
 		t.Fatalf("expected auto-batch stats to observe enqueued writes")
 	}
 }
 
-func TestStats_PreservesIndexTimingFields(t *testing.T) {
+func TestIndexStats_PreservesIndexTimingFields(t *testing.T) {
 	db, _ := openTempDBUint64(t)
 
-	db.stats.Index.BuildTime = 123 * time.Millisecond
-	db.stats.Index.BuildRPS = 456
-	db.stats.Index.LoadTime = 789 * time.Millisecond
+	db.indexStats.BuildTime = 123 * time.Millisecond
+	db.indexStats.BuildRPS = 456
+	db.indexStats.LoadTime = 789 * time.Millisecond
 
-	st := db.Stats()
+	st := db.IndexStats()
 
-	if st.Index.BuildTime != db.stats.Index.BuildTime {
-		t.Fatalf("expected BuildTime=%v, got %v", db.stats.Index.BuildTime, st.Index.BuildTime)
+	if st.BuildTime != db.indexStats.BuildTime {
+		t.Fatalf("expected BuildTime=%v, got %v", db.indexStats.BuildTime, st.BuildTime)
 	}
-	if st.Index.BuildRPS != db.stats.Index.BuildRPS {
-		t.Fatalf("expected BuildRPS=%d, got %d", db.stats.Index.BuildRPS, st.Index.BuildRPS)
+	if st.BuildRPS != db.indexStats.BuildRPS {
+		t.Fatalf("expected BuildRPS=%d, got %d", db.indexStats.BuildRPS, st.BuildRPS)
 	}
-	if st.Index.LoadTime != db.stats.Index.LoadTime {
-		t.Fatalf("expected LoadTime=%v, got %v", db.stats.Index.LoadTime, st.Index.LoadTime)
+	if st.LoadTime != db.indexStats.LoadTime {
+		t.Fatalf("expected LoadTime=%v, got %v", db.indexStats.LoadTime, st.LoadTime)
 	}
 }
 
-func TestStats_ComponentAccessors(t *testing.T) {
+func TestComponentAccessors(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
 		CalibrationEnabled:     true,
 		CalibrationSampleEvery: 1,

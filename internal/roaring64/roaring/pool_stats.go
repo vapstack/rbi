@@ -1,3 +1,5 @@
+//go:build rbidebug
+
 package roaring
 
 import (

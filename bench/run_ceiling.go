@@ -396,7 +396,7 @@ func evaluateFastReadRegression(fast *CeilingClassResult, base ceilingFastBaseli
 		return nil
 	}
 
-	reg := &CeilingRegression{}
+	reg := new(CeilingRegression)
 	reasons := make([]string, 0, 2)
 
 	if fast.CompletedOpsPerSec < base.Throughput {

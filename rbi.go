@@ -859,7 +859,7 @@ type (
 		closed atomic.Bool
 		broken atomic.Bool
 
-		stats Stats[K]
+		indexStats IndexStats[K]
 
 		traceRoot *DB[K, V]
 		testHooks testHooks
@@ -868,27 +868,6 @@ type (
 	index struct {
 		Key indexKey
 		IDs postingList
-	}
-
-	// Stats is an aggregate diagnostic snapshot of DB state.
-	//
-	// It combines outputs of IndexStats, SnapshotStats, PlannerStats, CalibrationStats, AutoBatchStats and PoolStats.
-	//
-	// For scenario-specific telemetry, prefer calling the corresponding
-	// component method directly to avoid unnecessary work.
-	Stats[K ~uint64 | ~string] struct {
-		// Index contains additional index shape diagnostics useful for memory analysis.
-		Index IndexStats[K]
-		// Snapshot contains copy-on-write snapshot/compactor diagnostics.
-		Snapshot SnapshotStats
-		// Planner contains current planner statistics snapshot and settings.
-		Planner PlannerStats
-		// Calibration contains current online planner calibration state.
-		Calibration CalibrationStats
-		// AutoBatch contains auto-batcher queue/batch/fallback diagnostics.
-		AutoBatch AutoBatchStats
-		// Pools contains a process-wide snapshot of pool activity and retention.
-		Pools PoolStats
 	}
 
 	// PlannerStats contains planner snapshot metadata, per-field stats and sampling settings.
@@ -1324,52 +1303,6 @@ func (db *DB[K, V]) RebuildIndex() error {
 	return nil
 }
 
-// Stats returns an aggregate diagnostic snapshot by combining results of
-// IndexStats, SnapshotStats, PlannerStats, CalibrationStats, AutoBatchStats and PoolStats.
-//
-// On large databases this can be expensive.
-//
-// For specific use-cases, prefer calling the corresponding component method
-// directly to avoid collecting unrelated diagnostic data.
-func (db *DB[K, V]) Stats() Stats[K] {
-	var s Stats[K]
-	s.Index = db.IndexStats()
-	s.Snapshot = db.SnapshotStats()
-	s.Planner = db.PlannerStats()
-	s.Calibration = db.CalibrationStats()
-	s.AutoBatch = db.AutoBatchStats()
-	s.Pools = db.PoolStats()
-	return s
-}
-
-// PoolStats returns a process-wide snapshot of pool activity and retention.
-//
-// Pool counters are global to the current process and may include activity from
-// other DB instances sharing the same package-level pools.
-func (db *DB[K, V]) PoolStats() PoolStats {
-	_ = db
-	return snapshotPoolStats()
-}
-
-// PoolStatsSinceReset returns pool stats relative to the last ResetPoolStats call.
-//
-// This uses a process-wide baseline over the same global package-level pools as
-// PoolStats. Lifetime counters remain available through PoolStats().
-func (db *DB[K, V]) PoolStatsSinceReset() PoolStats {
-	_ = db
-	return snapshotPoolStatsSinceReset()
-}
-
-// ResetPoolStats starts a new process-wide pool stats window used by
-// PoolStatsSinceReset.
-//
-// This does not clear lifetime counters returned by PoolStats(); it only moves
-// the baseline used for reset-relative snapshots.
-func (db *DB[K, V]) ResetPoolStats() {
-	_ = db
-	resetPoolStats()
-}
-
 // IndexStats returns current index stats.
 // On large databases this can be expensive.
 func (db *DB[K, V]) IndexStats() IndexStats[K] {
@@ -1383,7 +1316,7 @@ func (db *DB[K, V]) IndexStats() IndexStats[K] {
 	// Preserve persistent index timings captured during build/load, while
 	// recalculating shape/size diagnostics from the current snapshot.
 	db.mu.RLock()
-	idx := db.stats.Index
+	idx := db.indexStats
 	db.mu.RUnlock()
 	idx.Size = 0
 	idx.FieldCount = 0

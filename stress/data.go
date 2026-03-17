@@ -140,8 +140,8 @@ func loadOrSeedDatabase(db *rbi.DB[uint64, UserBench]) (uint64, uint64, error) {
 	}
 	var maxID uint64
 	if count > 0 {
-		stats := db.Stats()
-		maxID = stats.Index.LastKey
+		stats := db.IndexStats()
+		maxID = stats.LastKey
 		if maxID == 0 {
 			maxID = scanMaxID(db)
 		}

@@ -1,4 +1,4 @@
-//go:build !rbidebug
+//go:build rbidebug
 
 package roaring
 
@@ -64,10 +64,12 @@ func pooledArrayContainerPutIndex(size int) int {
 
 func newBitmapContainer() *bitmapContainer {
 	if v := bitmapContainerPool.Get(); v != nil {
+		bitmapContainerPoolStats.onGetHit()
 		bc := v.(*bitmapContainer)
 		bc.cardinality = 0
 		return bc
 	}
+	bitmapContainerPoolStats.onGetMiss()
 	return &bitmapContainer{
 		bitmap: make([]uint64, bitmapContainerWords),
 	}
@@ -75,14 +77,17 @@ func newBitmapContainer() *bitmapContainer {
 
 func releaseBitmapContainer(bc *bitmapContainer) {
 	if bc == nil {
+		bitmapContainerPoolStats.onDropNil()
 		return
 	}
 	if len(bc.bitmap) != bitmapContainerWords {
+		bitmapContainerPoolStats.onDropRejected()
 		return
 	}
 	bc.cardinality = 0
 	clear(bc.bitmap)
 	bitmapContainerPool.Put(bc)
+	bitmapContainerPoolStats.onPut()
 }
 
 func newArrayContainer() *arrayContainer {
@@ -116,18 +121,25 @@ func acquireArrayContainer(capacity, length int) *arrayContainer {
 	if capacity < length {
 		capacity = length
 	}
+	arrayContainerClassPoolStats.noteRequestedCapacity(capacity)
 
 	idx := pooledArrayContainerIndex(capacity)
 	if idx < 0 {
+		arrayContainerPoolStats.onGetMiss()
+		arrayContainerClassPoolStats.noteDirectAlloc(capacity)
 		return &arrayContainer{content: make([]uint16, length, capacity)}
 	}
 
 	if v := arrayContainerClassPools[idx].Get(); v != nil {
 		ac := v.(*arrayContainer)
+		arrayContainerPoolStats.onGetHit()
+		arrayContainerClassStats[idx].onGetHit()
 		ac.content = ac.content[:length]
 		return ac
 	}
 
+	arrayContainerPoolStats.onGetMiss()
+	arrayContainerClassStats[idx].onGetMiss()
 	return &arrayContainer{
 		content: make([]uint16, pooledArrayContainerCapacities[idx])[:length],
 	}
@@ -135,21 +147,29 @@ func acquireArrayContainer(capacity, length int) *arrayContainer {
 
 func releaseArrayContainer(ac *arrayContainer) {
 	if ac == nil {
+		arrayContainerPoolStats.onDropNil()
 		return
 	}
 
 	capacity := cap(ac.content)
+	arrayContainerClassPoolStats.noteReturnedCapacity(capacity)
 	if capacity > maxPooledArrayContainerCapacity {
+		arrayContainerClassPoolStats.dropOutOfRange.Add(1)
+		arrayContainerPoolStats.onDropRejected()
 		return
 	}
 
 	idx := pooledArrayContainerPutIndex(capacity)
 	if idx < 0 {
+		arrayContainerClassPoolStats.dropBelowMinCapacity.Add(1)
+		arrayContainerPoolStats.onDropRejected()
 		return
 	}
 
 	ac.content = ac.content[:0]
 	arrayContainerClassPools[idx].Put(ac)
+	arrayContainerClassStats[idx].onPut()
+	arrayContainerPoolStats.onPut()
 }
 
 func replaceArrayContainerStorage(ac, donor *arrayContainer) {
@@ -195,10 +215,12 @@ var (
 
 func acquireIntIterator(a *Bitmap) *intIterator {
 	if v := intIteratorPool.Get(); v != nil {
+		bitmapIteratorPoolStats.onGetHit()
 		it := v.(*intIterator)
 		it.Initialize(a)
 		return it
 	}
+	bitmapIteratorPoolStats.onGetMiss()
 	it := &intIterator{}
 	it.Initialize(a)
 	return it
@@ -206,6 +228,7 @@ func acquireIntIterator(a *Bitmap) *intIterator {
 
 func releaseIntIterator(it *intIterator) {
 	if it == nil {
+		bitmapIteratorPoolStats.onDropNil()
 		return
 	}
 	it.pos = 0
@@ -216,14 +239,17 @@ func releaseIntIterator(it *intIterator) {
 	it.runIter = runIterator16{}
 	it.bitmapIter = bitmapContainerShortIterator{}
 	intIteratorPool.Put(it)
+	bitmapIteratorPoolStats.onPut()
 }
 
 func acquireManyIntIterator(a *Bitmap) *manyIntIterator {
 	if v := manyIntIteratorPool.Get(); v != nil {
+		manyBitmapIteratorPoolStats.onGetHit()
 		it := v.(*manyIntIterator)
 		it.Initialize(a)
 		return it
 	}
+	manyBitmapIteratorPoolStats.onGetMiss()
 	it := &manyIntIterator{}
 	it.Initialize(a)
 	return it
@@ -231,6 +257,7 @@ func acquireManyIntIterator(a *Bitmap) *manyIntIterator {
 
 func releaseManyIntIterator(it *manyIntIterator) {
 	if it == nil {
+		manyBitmapIteratorPoolStats.onDropNil()
 		return
 	}
 	it.pos = 0
@@ -241,6 +268,7 @@ func releaseManyIntIterator(it *manyIntIterator) {
 	it.runIter = runIterator16{}
 	it.bitmapIter = bitmapContainerManyIterator{}
 	manyIntIteratorPool.Put(it)
+	manyBitmapIteratorPoolStats.onPut()
 }
 
 func ReleaseIterator(it IntPeekable) {

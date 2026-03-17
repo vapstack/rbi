@@ -71,7 +71,7 @@ func main() {
 	if err = saveJSON(opts.outFile, report); err != nil {
 		log.Fatalf("Failed to save report: %v", err)
 	}
-	if err = saveJSON(opts.outFile+".stats.json", db.Stats()); err != nil {
+	if err = saveJSON(opts.outFile+".stats.json", collectBenchDiagnostics(db)); err != nil {
 		log.Fatalf("Failed to save stats: %v", err)
 	}
 	switch report.Mode {
@@ -171,8 +171,8 @@ func loadOrSeedDatabase(db *rbi.DB[uint64, UserBench]) (uint64, uint64) {
 	var maxID uint64
 
 	if count > 0 {
-		stats := db.Stats()
-		maxID = stats.Index.LastKey
+		stats := db.IndexStats()
+		maxID = stats.LastKey
 		if maxID == 0 {
 			maxID = scanMaxID(db)
 		}
@@ -194,7 +194,7 @@ func buildEmailSamples(db *rbi.DB[uint64, UserBench], maxID uint64, sampleN int)
 }
 
 func installSignalCancel(cancel context.CancelFunc) (*atomic.Bool, func()) {
-	interrupted := &atomic.Bool{}
+	interrupted := new(atomic.Bool)
 
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
