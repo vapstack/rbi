@@ -8,8 +8,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/RoaringBitmap/roaring/v2/roaring64"
 	"github.com/vapstack/qx"
+	"github.com/vapstack/rbi/internal/roaring64"
 )
 
 // indexSnapshot is an immutable read-view published atomically for query paths.

@@ -8,7 +8,7 @@ import (
 
 	"github.com/vapstack/qx"
 
-	"github.com/RoaringBitmap/roaring/v2/roaring64"
+	"github.com/vapstack/rbi/internal/roaring64"
 )
 
 const (

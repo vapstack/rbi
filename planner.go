@@ -3,8 +3,8 @@ package rbi
 import (
 	"math"
 
-	"github.com/RoaringBitmap/roaring/v2/roaring64"
 	"github.com/vapstack/qx"
+	"github.com/vapstack/rbi/internal/roaring64"
 )
 
 // PlanName is a stable plan identifier used by tracing and calibration.
@@ -126,25 +126,6 @@ func plannerORSortPredicates(preds []predicate) {
 		}
 		preds[j] = cur
 	}
-}
-
-func (b *plannerORBranch) matches(idx uint64) bool {
-	if b.alwaysTrue {
-		return true
-	}
-	for i := range b.preds {
-		p := b.preds[i]
-		if p.covered || p.alwaysTrue {
-			continue
-		}
-		if p.alwaysFalse {
-			return false
-		}
-		if !p.hasContains() || !p.matches(idx) {
-			return false
-		}
-	}
-	return true
 }
 
 func (b *plannerORBranch) buildMatchChecks(dst []int) []int {
@@ -708,6 +689,13 @@ type plannerORIter struct {
 	cur uint64
 }
 
+func (it *plannerORIter) Release() {
+	releaseRoaringIter(it.it)
+	it.it = nil
+	it.has = false
+	it.cur = 0
+}
+
 func (db *DB[K, V]) tryPlan(q *qx.QX, trace *queryTrace) ([]K, bool, error) {
 	if out, ok, err := db.tryPlanORMerge(q, trace); ok {
 		return out, true, err
@@ -1268,9 +1256,11 @@ func (db *DB[K, V]) execPlanOROrderBasic(q *qx.QX, branches plannerORBranches, t
 					if owned && bm != scratch {
 						releaseRoaringBuf(bm)
 					}
+					releaseRoaringBitmapIterator(it)
 					return out, true
 				}
 			}
+			releaseRoaringBitmapIterator(it)
 			if owned && bm != scratch {
 				releaseRoaringBuf(bm)
 			}
@@ -1341,9 +1331,11 @@ func (db *DB[K, V]) execPlanOROrderBasic(q *qx.QX, branches plannerORBranches, t
 				if owned && bm != scratch {
 					releaseRoaringBuf(bm)
 				}
+				releaseRoaringBitmapIterator(it)
 				return out, true
 			}
 		}
+		releaseRoaringBitmapIterator(it)
 		if owned && bm != scratch {
 			releaseRoaringBuf(bm)
 		}
@@ -1913,6 +1905,10 @@ func (it *plannerOROrderBranchIter) init() {
 }
 
 func (it *plannerOROrderBranchIter) close() {
+	if it.curIter != nil {
+		releaseRoaringIter(it.curIter)
+		it.curIter = nil
+	}
 	if it.bucketWork != nil {
 		releaseRoaringBuf(it.bucketWork)
 		it.bucketWork = nil
@@ -1929,6 +1925,7 @@ func (it *plannerOROrderBranchIter) advance() bool {
 					it.has = true
 					return true
 				}
+				releaseRoaringIter(it.curIter)
 				it.curIter = nil
 				it.curExact = false
 				continue
@@ -1950,6 +1947,7 @@ func (it *plannerOROrderBranchIter) advance() bool {
 					return true
 				}
 			}
+			releaseRoaringIter(it.curIter)
 			it.curIter = nil
 		}
 
@@ -2753,6 +2751,7 @@ func (db *DB[K, V]) collectOROrderFallbackBranchCandidates(
 		examined += card
 		stop := false
 		it := bm.Iterator()
+		defer releaseRoaringBitmapIterator(it)
 		for it.HasNext() {
 			idx := it.Next()
 			emitted++
@@ -2770,6 +2769,7 @@ func (db *DB[K, V]) collectOROrderFallbackBranchCandidates(
 	emitBitmapChecked := func(bm *roaring64.Bitmap) bool {
 		stop := false
 		it := bm.Iterator()
+		defer releaseRoaringBitmapIterator(it)
 		for it.HasNext() {
 			if emit(it.Next()) {
 				stop = true
@@ -3031,6 +3031,7 @@ func (db *DB[K, V]) countORBranchByUniqueLead(branch plannerORBranch) (uint64, b
 	if it == nil {
 		return 0, false
 	}
+	defer releaseRoaringIter(it)
 
 	var cnt uint64
 	for it.HasNext() {
@@ -3192,6 +3193,11 @@ func (db *DB[K, V]) execPlanORNoOrderAdaptive(q *qx.QX, branches plannerORBranch
 			branchEmitted:  branchEmittedPtr,
 		}
 	}
+	defer func() {
+		for i := range states {
+			states[i].iter.Release()
+		}
+	}()
 
 	plannerORNoOrderSortBranchOrder(order, states)
 
@@ -3443,6 +3449,11 @@ func (db *DB[K, V]) execPlanORNoOrderBaseline(q *qx.QX, branches plannerORBranch
 			branchEmitted:  branchEmittedPtr,
 		})
 	}
+	defer func() {
+		for i := range iters {
+			iters[i].Release()
+		}
+	}()
 	for i := range iters {
 		iters[i].advance()
 	}
@@ -3517,6 +3528,7 @@ func (db *DB[K, V]) execPlanORUniverseNoOrder(q *qx.QX, trace *queryTrace) []K {
 		defer releaseRoaringBuf(universe)
 	}
 	it := universe.Iterator()
+	defer releaseRoaringBitmapIterator(it)
 	for it.HasNext() {
 		idx := it.Next()
 		if skip > 0 {

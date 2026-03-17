@@ -1,6 +1,6 @@
 package rbi
 
-import "github.com/RoaringBitmap/roaring/v2/roaring64"
+import "github.com/vapstack/rbi/internal/roaring64"
 
 // postingList keeps posting ids in an adaptive representation:
 // singleton id for cardinality=1, roaring bitmap for larger sets.
@@ -126,6 +126,7 @@ func (p postingList) ForEach(fn func(uint64) bool) bool {
 		return fn(p.single)
 	}
 	it := p.bm.Iterator()
+	defer releaseRoaringBitmapIterator(it)
 	for it.HasNext() {
 		if !fn(it.Next()) {
 			return false

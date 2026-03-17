@@ -9,8 +9,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/RoaringBitmap/roaring/v2/roaring64"
 	"github.com/vapstack/qx"
+	"github.com/vapstack/rbi/internal/roaring64"
 	"go.etcd.io/bbolt"
 )
 
@@ -1555,7 +1555,7 @@ func TestQueryWithTx_DoesNotFallbackToOlderSnapshotWhilePending(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		time.Sleep(20 * time.Millisecond)
-		db.tripBrokenLocked("test", "synthetic pending publish failure")
+		_ = db.tripBrokenLocked("test", "synthetic pending publish failure")
 		db.clearPending(targetTxID)
 		close(done)
 	}()

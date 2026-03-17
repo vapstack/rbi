@@ -5,7 +5,7 @@ import (
 	"sync"
 	"unsafe"
 
-	"github.com/RoaringBitmap/roaring/v2/roaring64"
+	"github.com/vapstack/rbi/internal/roaring64"
 )
 
 func addIdxToDeltaChangeMap(m map[string]map[string]indexDeltaEntry, field, key string, idx uint64, isAdd bool) {
@@ -160,6 +160,7 @@ func (db *DB[K, V]) checkUniqueBatchCandidateAndCollectSeen(
 	}
 
 	iter := bm.Iterator()
+	defer releaseRoaringBitmapIterator(iter)
 	for iter.HasNext() {
 		other := iter.Next()
 		if other == idx {
@@ -532,6 +533,7 @@ func (db *DB[K, V]) checkUniqueBatchCandidate(
 	}
 
 	iter := bm.Iterator()
+	defer releaseRoaringBitmapIterator(iter)
 	for iter.HasNext() {
 		other := iter.Next()
 		if other == idx {
@@ -990,142 +992,170 @@ const (
 	pooledWriteDeltaInnerMaxLen = 2048
 )
 
-var uniqueLeavingOuterPool = sync.Pool{
-	New: func() any {
-		return make(map[string]map[string]*roaring64.Bitmap, 8)
-	},
-}
+var uniqueLeavingOuterPool sync.Pool
 
-var uniqueLeavingInnerPool = sync.Pool{
-	New: func() any {
-		return make(map[string]*roaring64.Bitmap, 8)
-	},
-}
+var uniqueLeavingInnerPool sync.Pool
 
-var uniqueSeenOuterPool = sync.Pool{
-	New: func() any {
-		return make(map[string]map[string]uint64, 8)
-	},
-}
+var uniqueSeenOuterPool sync.Pool
 
-var uniqueSeenInnerPool = sync.Pool{
-	New: func() any {
-		return make(map[string]uint64, 8)
-	},
-}
+var uniqueSeenInnerPool sync.Pool
 
 func getUniqueLeavingOuterMap() map[string]map[string]*roaring64.Bitmap {
-	return uniqueLeavingOuterPool.Get().(map[string]map[string]*roaring64.Bitmap)
+	if v := uniqueLeavingOuterPool.Get(); v != nil {
+		uniqueLeavingOuterMapStats.base.onGetHit()
+		return v.(map[string]map[string]*roaring64.Bitmap)
+	}
+	uniqueLeavingOuterMapStats.base.onGetMiss()
+	return make(map[string]map[string]*roaring64.Bitmap, 8)
 }
 
 func releaseUniqueLeavingOuterMap(m map[string]map[string]*roaring64.Bitmap) {
 	if m == nil {
+		uniqueLeavingOuterMapStats.base.onDropNil()
 		return
 	}
+	uniqueLeavingOuterMapStats.noteReturned(len(m))
 	oversized := len(m) > pooledUniqueOuterMaxLen
 	for _, inner := range m {
 		releaseUniqueLeavingInnerMap(inner)
 	}
 	clear(m)
 	if oversized {
+		uniqueLeavingOuterMapStats.base.onDropRejected()
 		return
 	}
 	uniqueLeavingOuterPool.Put(m)
+	uniqueLeavingOuterMapStats.base.onPut()
 }
 
 func getUniqueLeavingInnerMap() map[string]*roaring64.Bitmap {
-	return uniqueLeavingInnerPool.Get().(map[string]*roaring64.Bitmap)
+	if v := uniqueLeavingInnerPool.Get(); v != nil {
+		uniqueLeavingInnerMapStats.base.onGetHit()
+		return v.(map[string]*roaring64.Bitmap)
+	}
+	uniqueLeavingInnerMapStats.base.onGetMiss()
+	return make(map[string]*roaring64.Bitmap, 8)
 }
 
 func releaseUniqueLeavingInnerMap(m map[string]*roaring64.Bitmap) {
 	if m == nil {
+		uniqueLeavingInnerMapStats.base.onDropNil()
 		return
 	}
+	uniqueLeavingInnerMapStats.noteReturned(len(m))
 	oversized := len(m) > pooledUniqueInnerMaxLen
 	for _, bm := range m {
 		releaseRoaringBuf(bm)
 	}
 	clear(m)
 	if oversized {
+		uniqueLeavingInnerMapStats.base.onDropRejected()
 		return
 	}
 	uniqueLeavingInnerPool.Put(m)
+	uniqueLeavingInnerMapStats.base.onPut()
 }
 
 func getUniqueSeenOuterMap() map[string]map[string]uint64 {
-	return uniqueSeenOuterPool.Get().(map[string]map[string]uint64)
+	if v := uniqueSeenOuterPool.Get(); v != nil {
+		uniqueSeenOuterMapStats.base.onGetHit()
+		return v.(map[string]map[string]uint64)
+	}
+	uniqueSeenOuterMapStats.base.onGetMiss()
+	return make(map[string]map[string]uint64, 8)
 }
 
 func releaseUniqueSeenOuterMap(m map[string]map[string]uint64) {
 	if m == nil {
+		uniqueSeenOuterMapStats.base.onDropNil()
 		return
 	}
+	uniqueSeenOuterMapStats.noteReturned(len(m))
 	oversized := len(m) > pooledUniqueOuterMaxLen
 	for _, inner := range m {
 		releaseUniqueSeenInnerMap(inner)
 	}
 	clear(m)
 	if oversized {
+		uniqueSeenOuterMapStats.base.onDropRejected()
 		return
 	}
 	uniqueSeenOuterPool.Put(m)
+	uniqueSeenOuterMapStats.base.onPut()
 }
 
 func getUniqueSeenInnerMap() map[string]uint64 {
-	return uniqueSeenInnerPool.Get().(map[string]uint64)
+	if v := uniqueSeenInnerPool.Get(); v != nil {
+		uniqueSeenInnerMapStats.base.onGetHit()
+		return v.(map[string]uint64)
+	}
+	uniqueSeenInnerMapStats.base.onGetMiss()
+	return make(map[string]uint64, 8)
 }
 
 func releaseUniqueSeenInnerMap(m map[string]uint64) {
 	if m == nil {
+		uniqueSeenInnerMapStats.base.onDropNil()
 		return
 	}
+	uniqueSeenInnerMapStats.noteReturned(len(m))
 	oversized := len(m) > pooledUniqueInnerMaxLen
 	clear(m)
 	if oversized {
+		uniqueSeenInnerMapStats.base.onDropRejected()
 		return
 	}
 	uniqueSeenInnerPool.Put(m)
+	uniqueSeenInnerMapStats.base.onPut()
 }
 
-var writeDeltaOuterPool = sync.Pool{
-	New: func() any {
-		return make(map[string]map[string]indexDeltaEntry, 8)
-	},
-}
+var writeDeltaOuterPool sync.Pool
 
-var writeDeltaInnerPool = sync.Pool{
-	New: func() any {
-		return make(map[string]indexDeltaEntry, 8)
-	},
-}
+var writeDeltaInnerPool sync.Pool
 
 func getWriteDeltaOuterMap() map[string]map[string]indexDeltaEntry {
-	return writeDeltaOuterPool.Get().(map[string]map[string]indexDeltaEntry)
+	if v := writeDeltaOuterPool.Get(); v != nil {
+		writeDeltaOuterMapStats.base.onGetHit()
+		return v.(map[string]map[string]indexDeltaEntry)
+	}
+	writeDeltaOuterMapStats.base.onGetMiss()
+	return make(map[string]map[string]indexDeltaEntry, 8)
 }
 
 func releaseWriteDeltaOuterMap(m map[string]map[string]indexDeltaEntry) {
 	if m == nil {
+		writeDeltaOuterMapStats.base.onDropNil()
 		return
 	}
+	writeDeltaOuterMapStats.noteReturned(len(m))
 	oversized := len(m) > pooledWriteDeltaOuterMaxLen
 	for _, inner := range m {
 		releaseWriteDeltaInnerMap(inner)
 	}
 	clear(m)
 	if oversized {
+		writeDeltaOuterMapStats.base.onDropRejected()
 		return
 	}
 	writeDeltaOuterPool.Put(m)
+	writeDeltaOuterMapStats.base.onPut()
 }
 
 func getWriteDeltaInnerMap() map[string]indexDeltaEntry {
-	return writeDeltaInnerPool.Get().(map[string]indexDeltaEntry)
+	if v := writeDeltaInnerPool.Get(); v != nil {
+		writeDeltaInnerMapStats.base.onGetHit()
+		return v.(map[string]indexDeltaEntry)
+	}
+	writeDeltaInnerMapStats.base.onGetMiss()
+	return make(map[string]indexDeltaEntry, 8)
 }
 
 func releaseWriteDeltaInnerMap(m map[string]indexDeltaEntry) {
 	if m == nil {
+		writeDeltaInnerMapStats.base.onDropNil()
 		return
 	}
+	writeDeltaInnerMapStats.noteReturned(len(m))
 	oversized := len(m) > pooledWriteDeltaInnerMaxLen
 	for _, e := range m {
 		releaseRoaringBuf(e.add)
@@ -1133,7 +1163,9 @@ func releaseWriteDeltaInnerMap(m map[string]indexDeltaEntry) {
 	}
 	clear(m)
 	if oversized {
+		writeDeltaInnerMapStats.base.onDropRejected()
 		return
 	}
 	writeDeltaInnerPool.Put(m)
+	writeDeltaInnerMapStats.base.onPut()
 }

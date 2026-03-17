@@ -198,6 +198,7 @@ func (db *DB[K, V]) ScanKeys(seek K, fn func(K) (bool, error)) error {
 	}
 
 	iter := universe.Iterator()
+	defer releaseRoaringBitmapIterator(iter)
 
 	for iter.HasNext() {
 		idx := iter.Next()

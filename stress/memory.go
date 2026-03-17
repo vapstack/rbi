@@ -54,7 +54,7 @@ func CaptureMemorySnapshot(db *DBHandle) *MemorySnapshot {
 	return snap
 }
 
-func SummarizeMemory(samples []MemorySnapshot, final *MemorySnapshot) *MemorySummary {
+func summarizeMemory(samples []MemorySnapshot, final *MemorySnapshot) *MemorySummary {
 	if len(samples) == 0 && final == nil {
 		return nil
 	}
@@ -119,7 +119,7 @@ func parseProcRollup(path string) (map[string]uint64, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	out := make(map[string]uint64, 8)
 	scanner := bufio.NewScanner(f)
@@ -142,7 +142,7 @@ func parseProcMapRollup(path, matchPath string) (map[string]uint64, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	out := make(map[string]uint64, 8)
 	scanner := bufio.NewScanner(f)

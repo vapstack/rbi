@@ -5,7 +5,7 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"github.com/RoaringBitmap/roaring/v2/roaring64"
+	"github.com/vapstack/rbi/internal/roaring64"
 )
 
 const numericRangeFullSpanCacheMaxEntries = 4
@@ -297,14 +297,6 @@ func (s *indexSnapshot) getNumericRangeBucketCacheEntry(field string, base *[]in
 	}
 
 	return entry
-}
-
-func (s *indexSnapshot) getNumericRangeBucketIndex(field string, base *[]index, bucketSize, minFieldKeys int) *numericRangeBucketIndex {
-	entry := s.getNumericRangeBucketCacheEntry(field, base, bucketSize, minFieldKeys)
-	if entry == nil {
-		return nil
-	}
-	return entry.idx
 }
 
 func (db *DB[K, V]) tryEvalNumericRangeBuckets(field string, fm *field, ov fieldOverlay, br overlayRange) (bitmap, bool) {

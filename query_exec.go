@@ -4,8 +4,8 @@ import (
 	"fmt"
 	"unsafe"
 
-	"github.com/RoaringBitmap/roaring/v2/roaring64"
 	"github.com/vapstack/qx"
+	"github.com/vapstack/rbi/internal/roaring64"
 )
 
 func (db *DB[K, V]) tryExecutionPlan(q *qx.QX, trace *queryTrace) ([]K, bool, error) {
@@ -417,16 +417,18 @@ func (db *DB[K, V]) tryQueryOrderBasicWithLimit(q *qx.QX, trace *queryTrace) ([]
 							trace.addExamined(examined)
 							trace.addOrderScanWidth(scanWidth)
 							trace.setEarlyStopReason("limit_reached")
+							releaseRoaringBitmapIterator(it)
 							return cursor.out, true, nil
 						}
 					}
+					releaseRoaringBitmapIterator(it)
 				}
 				continue
 			}
 
 			examined += ids.Cardinality()
 			if base.neg {
-				tmp.Xor(tmp)
+				tmp.Clear()
 				ids.OrInto(tmp)
 				if !baseNegUniverse {
 					tmp.AndNot(baseBM)
@@ -492,9 +494,11 @@ func (db *DB[K, V]) tryQueryOrderBasicWithLimit(q *qx.QX, trace *queryTrace) ([]
 						trace.addExamined(examined)
 						trace.addOrderScanWidth(scanWidth)
 						trace.setEarlyStopReason("limit_reached")
+						releaseRoaringBitmapIterator(it)
 						return cursor.out, true, nil
 					}
 				}
+				releaseRoaringBitmapIterator(it)
 			}
 			if keep != nil {
 				releaseRoaringBuf(keep)
@@ -504,7 +508,7 @@ func (db *DB[K, V]) tryQueryOrderBasicWithLimit(q *qx.QX, trace *queryTrace) ([]
 
 		examined += ids.Cardinality()
 		if base.neg {
-			tmp.Xor(tmp)
+			tmp.Clear()
 			ids.OrInto(tmp)
 			if !baseNegUniverse {
 				tmp.AndNot(baseBM)
@@ -790,6 +794,9 @@ func (db *DB[K, V]) scanOrderLimitWithPredicates(q *qx.QX, ov fieldOverlay, br o
 		}
 
 		iterSrc := ids.Iter()
+		defer func() {
+			releaseRoaringIter(iterSrc)
+		}()
 		exactApplied := false
 		if len(active) == 0 || len(exactActive) > 0 {
 			bm, owned := ids.ToBitmapOwned(scratch)
@@ -802,6 +809,7 @@ func (db *DB[K, V]) scanOrderLimitWithPredicates(q *qx.QX, ov fieldOverlay, br o
 				}
 				return stop
 			} else if applied && current != nil {
+				releaseRoaringIter(iterSrc)
 				iterSrc = current.Iterator()
 				exactApplied = true
 			}
@@ -1079,9 +1087,11 @@ func (db *DB[K, V]) tryQueryOrderPrefixWithLimit(q *qx.QX, trace *queryTrace) ([
 					trace.addExamined(examined)
 					trace.addOrderScanWidth(scanWidth)
 					trace.setEarlyStopReason("limit_reached")
+					releaseRoaringBitmapIterator(iter)
 					return cursor.out, true, nil
 				}
 			}
+			releaseRoaringBitmapIterator(iter)
 		}
 		trace.addExamined(examined)
 		trace.addOrderScanWidth(scanWidth)
@@ -1116,9 +1126,11 @@ func (db *DB[K, V]) tryQueryOrderPrefixWithLimit(q *qx.QX, trace *queryTrace) ([
 				trace.addExamined(examined)
 				trace.addOrderScanWidth(scanWidth)
 				trace.setEarlyStopReason("limit_reached")
+				releaseRoaringBitmapIterator(iter)
 				return cursor.out, true, nil
 			}
 		}
+		releaseRoaringBitmapIterator(iter)
 		if owned && bm != scratch {
 			releaseRoaringBuf(bm)
 		}
@@ -1232,9 +1244,11 @@ func (db *DB[K, V]) tryQueryRangeNoOrderWithLimit(q *qx.QX, trace *queryTrace) (
 				if cursor.emit(it.Next()) {
 					trace.addExamined(examined)
 					trace.setEarlyStopReason("limit_reached")
+					releaseRoaringBitmapIterator(it)
 					return cursor.out, true, nil
 				}
 			}
+			releaseRoaringBitmapIterator(it)
 		}
 		trace.addExamined(examined)
 		trace.setEarlyStopReason("input_exhausted")
@@ -1262,9 +1276,11 @@ func (db *DB[K, V]) tryQueryRangeNoOrderWithLimit(q *qx.QX, trace *queryTrace) (
 				}
 				trace.addExamined(examined)
 				trace.setEarlyStopReason("limit_reached")
+				releaseRoaringBitmapIterator(it)
 				return cursor.out, true, nil
 			}
 		}
+		releaseRoaringBitmapIterator(it)
 		if owned && bm != scratch {
 			releaseRoaringBuf(bm)
 		}
@@ -1360,9 +1376,11 @@ func (db *DB[K, V]) tryQueryPrefixNoOrderWithLimit(q *qx.QX, trace *queryTrace) 
 				if cursor.emit(it.Next()) {
 					trace.addExamined(examined)
 					trace.setEarlyStopReason("limit_reached")
+					releaseRoaringBitmapIterator(it)
 					return cursor.out, true, nil
 				}
 			}
+			releaseRoaringBitmapIterator(it)
 		}
 		trace.addExamined(examined)
 		trace.setEarlyStopReason("input_exhausted")
@@ -1390,9 +1408,11 @@ func (db *DB[K, V]) tryQueryPrefixNoOrderWithLimit(q *qx.QX, trace *queryTrace) 
 				}
 				trace.addExamined(examined)
 				trace.setEarlyStopReason("limit_reached")
+				releaseRoaringBitmapIterator(it)
 				return cursor.out, true, nil
 			}
 		}
+		releaseRoaringBitmapIterator(it)
 		if owned && bm != scratch {
 			releaseRoaringBuf(bm)
 		}

@@ -3,7 +3,7 @@ package rbi
 import (
 	"github.com/vapstack/qx"
 
-	"github.com/RoaringBitmap/roaring/v2/roaring64"
+	"github.com/vapstack/rbi/internal/roaring64"
 )
 
 func forEachIntersectionContains(a, b *roaring64.Bitmap, fn func(uint64) bool) bool {
@@ -19,6 +19,7 @@ func forEachIntersectionContains(a, b *roaring64.Bitmap, fn func(uint64) bool) b
 	}
 
 	it := small.Iterator()
+	defer releaseRoaringBitmapIterator(it)
 	for it.HasNext() {
 		idx := it.Next()
 		if !large.Contains(idx) {
@@ -84,7 +85,7 @@ func tmpORSmallestAND(tmp, a, b *roaring64.Bitmap) {
 }
 
 func tmpORSmallestANDPosting(tmp *roaring64.Bitmap, a postingList, b *roaring64.Bitmap) {
-	tmp.Xor(tmp)
+	tmp.Clear()
 	if b == nil || b.IsEmpty() || a.IsEmpty() {
 		return
 	}
@@ -151,6 +152,7 @@ func (db *DB[K, V]) queryOrderBasic(result bitmap, ov fieldOverlay, o qx.Order, 
 			}
 
 			iter := ids.Iterator()
+			defer releaseRoaringBitmapIterator(iter)
 			for iter.HasNext() {
 				idx := iter.Next()
 				if !resultBM.Contains(idx) {
@@ -168,6 +170,7 @@ func (db *DB[K, V]) queryOrderBasic(result bitmap, ov fieldOverlay, o qx.Order, 
 			return false
 		}
 		iter := tmp.Iterator()
+		defer releaseRoaringBitmapIterator(iter)
 		for iter.HasNext() {
 			if cursor.emit(iter.Next()) {
 				return true
@@ -260,6 +263,7 @@ func (db *DB[K, V]) queryOrderBasicSlice(result bitmap, s *[]index, o qx.Order, 
 			return false
 		}
 		iter := tmp.Iterator()
+		defer releaseRoaringBitmapIterator(iter)
 		for iter.HasNext() {
 			if cursor.emit(iter.Next()) {
 				return true
@@ -333,6 +337,7 @@ func (db *DB[K, V]) queryOrderArrayPos(result bitmap, s *[]index, o qx.Order, sk
 
 		tmpORSmallestANDPosting(tmp, bm, resultBM)
 		it := tmp.Iterator()
+		defer releaseRoaringBitmapIterator(it)
 		for it.HasNext() {
 			idx := it.Next()
 			if seen.Contains(idx) {
@@ -362,6 +367,7 @@ func (db *DB[K, V]) queryOrderArrayPos(result bitmap, s *[]index, o qx.Order, sk
 
 	// process remaining items (those not in the priority list)
 	iter := resultBM.Iterator()
+	defer releaseRoaringBitmapIterator(iter)
 	for iter.HasNext() {
 		idx := iter.Next()
 		if seen.Contains(idx) {
@@ -456,6 +462,7 @@ func (db *DB[K, V]) queryOrderArrayPosScalar(result bitmap, s *[]index, vals []s
 
 		tmpORSmallestANDPosting(tmp, bm, resultBM)
 		it := tmp.Iterator()
+		defer releaseRoaringBitmapIterator(it)
 		for it.HasNext() {
 			if cursor.emit(it.Next()) {
 				return true
@@ -518,6 +525,7 @@ func (db *DB[K, V]) queryOrderArrayPosScalar(result bitmap, s *[]index, vals []s
 	}
 
 	iter := resultBM.Iterator()
+	defer releaseRoaringBitmapIterator(iter)
 	for iter.HasNext() {
 		idx := iter.Next()
 		if seen.Contains(idx) {
@@ -569,6 +577,7 @@ func (db *DB[K, V]) queryOrderArrayPosOverlay(result bitmap, ov fieldOverlay, o 
 
 		if shouldUseOnePassIntersection(bm, resultBM, cursor.need, cursor.all) {
 			it := bm.Iterator()
+			defer releaseRoaringBitmapIterator(it)
 			for it.HasNext() {
 				idx := it.Next()
 				if !resultBM.Contains(idx) {
@@ -598,6 +607,7 @@ func (db *DB[K, V]) queryOrderArrayPosOverlay(result bitmap, ov fieldOverlay, o 
 			releaseRoaringBuf(bm)
 		}
 		it := tmp.Iterator()
+		defer releaseRoaringBitmapIterator(it)
 		for it.HasNext() {
 			idx := it.Next()
 			if seen != nil {
@@ -628,6 +638,7 @@ func (db *DB[K, V]) queryOrderArrayPosOverlay(result bitmap, ov fieldOverlay, o 
 	}
 
 	iter := resultBM.Iterator()
+	defer releaseRoaringBitmapIterator(iter)
 	for iter.HasNext() {
 		idx := iter.Next()
 		if seen != nil {
@@ -683,6 +694,7 @@ func (db *DB[K, V]) queryOrderArrayCount(result bitmap, s []index, o qx.Order, s
 		zero.Or(resultBM)
 		nonEmpty.AndNotFrom(zero)
 		it := zero.Iterator()
+		defer releaseRoaringBitmapIterator(it)
 		for it.HasNext() {
 			if cursor.emit(it.Next()) {
 				releaseRoaringBuf(zero)
@@ -718,6 +730,7 @@ func (db *DB[K, V]) queryOrderArrayCount(result bitmap, s []index, o qx.Order, s
 
 			tmpORSmallestANDPosting(tmp, ix.IDs, resultBM)
 			it := tmp.Iterator()
+			defer releaseRoaringBitmapIterator(it)
 			for it.HasNext() {
 				if cursor.emit(it.Next()) {
 					return cursor.out, nil
@@ -748,6 +761,7 @@ func (db *DB[K, V]) queryOrderArrayCount(result bitmap, s []index, o qx.Order, s
 
 			tmpORSmallestANDPosting(tmp, ix.IDs, resultBM)
 			it := tmp.Iterator()
+			defer releaseRoaringBitmapIterator(it)
 			for it.HasNext() {
 				if cursor.emit(it.Next()) {
 					return cursor.out, nil
@@ -790,6 +804,7 @@ func (db *DB[K, V]) queryOrderArrayCountOverlay(result bitmap, ov fieldOverlay, 
 		}
 		tmpORSmallestAND(tmp, ids, resultBM)
 		it := tmp.Iterator()
+		defer releaseRoaringBitmapIterator(it)
 		for it.HasNext() {
 			if cursor.emit(it.Next()) {
 				return true

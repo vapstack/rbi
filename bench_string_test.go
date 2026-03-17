@@ -5,7 +5,6 @@ import (
 	"math"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strconv"
 	"sync"
 	"testing"
@@ -196,60 +195,6 @@ func Benchmark_Query_Index_Count_Simple_EQ_Count_StringKeyDB(b *testing.B) {
 	db := buildBenchDBString(b, benchStringQueryN)
 	q := qx.Query(qx.EQ("country", "NL"))
 	runStringCountBench(b, db, q)
-}
-
-func warmBenchDBStateString(b *testing.B, db *DB[string, UserBench]) {
-	b.Helper()
-
-	countWarmups := []*qx.QX{
-		qx.Query(qx.EQ("country", "NL")),
-		qx.Query(qx.EQ("status", "active")),
-		qx.Query(qx.PREFIX("email", "user1")),
-		qx.Query(qx.HASANY("roles", []string{"admin", "moderator"})),
-	}
-	for _, q := range countWarmups {
-		if _, err := db.Count(q); err != nil {
-			b.Fatalf("warmup Count(%+v): %v", q, err)
-		}
-	}
-
-	keyWarmups := []*qx.QX{
-		qx.Query().Max(100),
-		qx.Query(qx.IN("country", []string{"NL", "DE"})).Max(100),
-		qx.Query(qx.EQ("status", "active")).By("age", qx.ASC).Max(50),
-		qx.Query(
-			qx.OR(
-				qx.HAS("roles", []string{"admin"}),
-				qx.EQ("plan", "enterprise"),
-			),
-		).Max(100),
-	}
-	for _, q := range keyWarmups {
-		if _, err := db.QueryKeys(q); err != nil {
-			b.Fatalf("warmup QueryKeys(%+v): %v", q, err)
-		}
-	}
-
-	readWarmups := []*qx.QX{
-		qx.Query(qx.EQ("country", "US")).By("age", qx.DESC).Max(20),
-	}
-	for _, q := range readWarmups {
-		items, err := db.Query(q)
-		if err != nil {
-			b.Fatalf("warmup Query(%+v): %v", q, err)
-		}
-		db.ReleaseRecords(items...)
-	}
-
-	scanned := 0
-	if err := db.ScanKeys("", func(_ string) (bool, error) {
-		scanned++
-		return scanned < 128, nil
-	}); err != nil {
-		b.Fatalf("warmup ScanKeys: %v", err)
-	}
-
-	runtime.GC()
 }
 
 func warmBenchCountOnceString(b *testing.B, db *DB[string, UserBench], q *qx.QX) {

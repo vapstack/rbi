@@ -3,9 +3,11 @@ new.txt
 rbi.test
 mem.out
 bench/bench
+stress.test
 stress/stress
 bench.db
 bench.db.UserBench.rbi
+bench_*.txt
 bench_report*.json
 stress_report*.json
 result_*.json

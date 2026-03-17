@@ -6,8 +6,8 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/RoaringBitmap/roaring/v2/roaring64"
 	"github.com/vapstack/qx"
+	"github.com/vapstack/rbi/internal/roaring64"
 )
 
 func countByExprBitmap(t *testing.T, db *DB[uint64, Rec], expr qx.Expr) uint64 {

@@ -5,7 +5,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/RoaringBitmap/roaring/v2/roaring64"
+	"github.com/vapstack/rbi/internal/roaring64"
 )
 
 // indexDeltaEntry stores per-key delta changes relative to immutable base.

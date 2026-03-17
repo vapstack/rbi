@@ -1,8 +1,8 @@
 package rbi
 
 import (
-	"github.com/RoaringBitmap/roaring/v2/roaring64"
 	"github.com/vapstack/qx"
+	"github.com/vapstack/rbi/internal/roaring64"
 )
 
 type leafPred struct {
@@ -264,6 +264,7 @@ func (db *DB[K, V]) tryUniqueEqNoOrder(q *qx.QX, trace *queryTrace) ([]K, bool, 
 
 	lead := preds[uniqueLead]
 	iter := lead.iterNew()
+	defer releaseRoaringIter(iter)
 
 	if trace != nil {
 		trace.setPlan(PlanUniqueEq)
@@ -355,6 +356,7 @@ func (db *DB[K, V]) tryLimitQueryNoOrder(q *qx.QX, leaves []qx.Expr, trace *quer
 	cursor := db.newQueryCursor(out, 0, q.Limit, false, nil)
 
 	iter := lead.iterNew()
+	defer releaseRoaringIter(iter)
 	var examined uint64
 	for iter.HasNext() {
 		idx := iter.Next()
@@ -515,6 +517,7 @@ func (db *DB[K, V]) scanLimitByOverlayBounds(q *qx.QX, ov fieldOverlay, br overl
 			return emitCandidate(ids.single)
 		}
 		it := ids.bitmap().Iterator()
+		defer releaseRoaringBitmapIterator(it)
 		for it.HasNext() {
 			if emitCandidate(it.Next()) {
 				return true
@@ -982,6 +985,10 @@ func (it *postingConcatIter) HasNext() bool {
 		if it.curIt != nil && it.curIt.HasNext() {
 			return true
 		}
+		if it.curIt != nil {
+			releaseRoaringIter(it.curIt)
+			it.curIt = nil
+		}
 		if it.i >= len(it.posts) {
 			return false
 		}
@@ -999,6 +1006,15 @@ func (it *postingConcatIter) Next() uint64 {
 		return 0
 	}
 	return it.curIt.Next()
+}
+
+func (it *postingConcatIter) Release() {
+	if it.curIt != nil {
+		releaseRoaringIter(it.curIt)
+		it.curIt = nil
+	}
+	it.posts = nil
+	it.i = 0
 }
 
 type postingUnionIter struct {
@@ -1057,6 +1073,7 @@ func (u *postingSmallUnionIter) HasNext() bool {
 				u.has = true
 				return true
 			}
+			releaseRoaringIter(u.curIt)
 			u.curIt = nil
 		}
 		if u.i >= len(u.posts) {
@@ -1079,6 +1096,17 @@ func (u *postingSmallUnionIter) Next() uint64 {
 	return u.next
 }
 
+func (u *postingSmallUnionIter) Release() {
+	if u.curIt != nil {
+		releaseRoaringIter(u.curIt)
+		u.curIt = nil
+	}
+	u.posts = nil
+	u.i = 0
+	u.next = 0
+	u.has = false
+}
+
 func (u *postingUnionIter) HasNext() bool {
 	if u.has {
 		return true
@@ -1093,6 +1121,7 @@ func (u *postingUnionIter) HasNext() bool {
 					return true
 				}
 			}
+			releaseRoaringIter(u.curIt)
 			u.curIt = nil
 		}
 		if u.i >= len(u.posts) {
@@ -1113,6 +1142,18 @@ func (u *postingUnionIter) Next() uint64 {
 	}
 	u.has = false
 	return u.next
+}
+
+func (u *postingUnionIter) Release() {
+	if u.curIt != nil {
+		releaseRoaringIter(u.curIt)
+		u.curIt = nil
+	}
+	u.posts = nil
+	u.i = 0
+	u.seen = u64set{}
+	u.next = 0
+	u.has = false
 }
 
 type u64set struct {

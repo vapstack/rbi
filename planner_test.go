@@ -9,8 +9,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/RoaringBitmap/roaring/v2/roaring64"
 	"github.com/vapstack/qx"
+	"github.com/vapstack/rbi/internal/roaring64"
 )
 
 func postingOf(ids ...uint64) postingList {

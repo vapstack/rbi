@@ -1,8 +1,8 @@
 package rbi
 
 import (
-	"github.com/RoaringBitmap/roaring/v2/roaring64"
 	"github.com/vapstack/qx"
+	"github.com/vapstack/rbi/internal/roaring64"
 )
 
 const countPredicateScanMaxLeaves = 16
@@ -545,6 +545,7 @@ func (db *DB[K, V]) tryCountByUniqueEq(expr qx.Expr, trace *queryTrace) (uint64,
 	if it == nil {
 		return 0, false, nil
 	}
+	defer releaseRoaringIter(it)
 
 	var cnt uint64
 	var examined uint64
@@ -947,6 +948,7 @@ func (db *DB[K, V]) tryCountORBranchLeadPostings(
 			return
 		}
 		it := bm.Iterator()
+		defer releaseRoaringBitmapIterator(it)
 		for it.HasNext() {
 			idx := it.Next()
 			dup := false
@@ -1089,6 +1091,7 @@ func (db *DB[K, V]) tryCountORBranchLeadPostings(
 		for it.HasNext() {
 			acceptIdx(it.Next(), checks)
 		}
+		releaseRoaringBitmapIterator(it)
 		if owned && bm != scratch {
 			releaseRoaringBuf(bm)
 		}
@@ -1945,6 +1948,7 @@ func (db *DB[K, V]) tryCountByPredicates(expr qx.Expr, trace *queryTrace) (uint6
 	if it == nil {
 		return 0, false, nil
 	}
+	defer releaseRoaringIter(it)
 
 	var cnt uint64
 	var examined uint64
@@ -2227,6 +2231,7 @@ func (db *DB[K, V]) tryCountByPredicatesLeadBuckets(preds []predicate, leadIdx i
 				cnt++
 			}
 		}
+		releaseRoaringBitmapIterator(it)
 		if owned && bm != scratch {
 			releaseRoaringBuf(bm)
 		}
@@ -2454,6 +2459,7 @@ func (db *DB[K, V]) tryCountByPredicatesLeadPostings(preds []predicate, leadIdx 
 				cnt++
 			}
 		}
+		releaseRoaringBitmapIterator(it)
 		if owned && bm != scratch {
 			releaseRoaringBuf(bm)
 		}
@@ -2821,6 +2827,7 @@ func (db *DB[K, V]) tryCountORByPredicates(expr qx.Expr, trace *queryTrace) (uin
 		if it == nil {
 			return 0, false, nil
 		}
+		defer releaseRoaringIter(it)
 
 		for it.HasNext() {
 			idx := it.Next()

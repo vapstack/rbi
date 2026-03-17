@@ -5,8 +5,8 @@ import (
 	"strconv"
 	"sync"
 
-	"github.com/RoaringBitmap/roaring/v2/roaring64"
 	"github.com/vapstack/qx"
+	"github.com/vapstack/rbi/internal/roaring64"
 )
 
 type predicate struct {
@@ -1170,16 +1170,23 @@ func (it *overlayRangeIter) release() {
 		return
 	}
 	it.released = true
+	if it.curIt != nil {
+		releaseRoaringIter(it.curIt)
+		it.curIt = nil
+	}
 	if it.curOwned && it.curBM != nil && it.curBM != it.scratch {
 		releaseRoaringBuf(it.curBM)
 	}
 	it.curOwned = false
 	it.curBM = nil
-	it.curIt = nil
 	if it.scratch != nil {
 		releaseRoaringBuf(it.scratch)
 		it.scratch = nil
 	}
+}
+
+func (it *overlayRangeIter) Release() {
+	it.release()
 }
 
 func (it *overlayRangeIter) HasNext() bool {
@@ -1190,12 +1197,15 @@ func (it *overlayRangeIter) HasNext() bool {
 		if it.curIt != nil && it.curIt.HasNext() {
 			return true
 		}
+		if it.curIt != nil {
+			releaseRoaringIter(it.curIt)
+			it.curIt = nil
+		}
 		if it.curOwned && it.curBM != nil && it.curBM != it.scratch {
 			releaseRoaringBuf(it.curBM)
 		}
 		it.curOwned = false
 		it.curBM = nil
-		it.curIt = nil
 
 		_, baseBM, de, ok := it.cur.next()
 		if !ok {
@@ -1219,10 +1229,6 @@ func (it *overlayRangeIter) Next() uint64 {
 		return 0
 	}
 	return it.curIt.Next()
-}
-
-func (db *DB[K, V]) buildPredRangeCandidate(e qx.Expr, fm *field, ov fieldOverlay) (predicate, bool) {
-	return db.buildPredRangeCandidateWithMode(e, fm, ov, true)
 }
 
 func (db *DB[K, V]) buildPredRangeCandidateWithMode(e qx.Expr, fm *field, ov fieldOverlay, allowMaterialize bool) (predicate, bool) {
@@ -1591,6 +1597,10 @@ func (it *rangeIter) HasNext() bool {
 		if it.curIt != nil && it.curIt.HasNext() {
 			return true
 		}
+		if it.curIt != nil {
+			releaseRoaringIter(it.curIt)
+			it.curIt = nil
+		}
 		if it.i >= it.end {
 			return false
 		}
@@ -1607,6 +1617,20 @@ func (it *rangeIter) HasNext() bool {
 		bmRO := bm.bitmap()
 		it.curIt = bmRO.Iterator()
 	}
+}
+
+func (it *rangeIter) Release() {
+	if it.curIt != nil {
+		releaseRoaringIter(it.curIt)
+		it.curIt = nil
+	}
+	it.s = nil
+	it.i = 0
+	it.end = 0
+	it.single = struct {
+		set bool
+		v   uint64
+	}{}
 }
 
 func (it *rangeIter) Next() uint64 {
@@ -1648,6 +1672,7 @@ func (db *DB[K, V]) execPlanLeadScanNoOrder(q *qx.QX, preds []predicate, trace *
 		}
 		it = universe.Iterator()
 	}
+	defer releaseRoaringIter(it)
 	activeBuf := getIntSliceBuf(len(preds))
 	active := activeBuf.values
 	defer func() {
@@ -2433,10 +2458,6 @@ func (db *DB[K, V]) buildPredicatesOrderedWithMode(leaves []qx.Expr, orderField 
 	return preds, true
 }
 
-func (db *DB[K, V]) buildPredicate(e qx.Expr) (predicate, bool) {
-	return db.buildPredicateWithMode(e, true)
-}
-
 func (db *DB[K, V]) buildPredicateWithMode(e qx.Expr, allowMaterialize bool) (predicate, bool) {
 	if e.Op == qx.OpNOOP {
 		if e.Not {
@@ -2697,10 +2718,6 @@ func (db *DB[K, V]) buildPredRangeWithMode(e qx.Expr, fm *field, slice *[]index,
 		},
 		cleanup: cleanup,
 	}, true
-}
-
-func materializedRangePredicate(e qx.Expr, bm *roaring64.Bitmap) predicate {
-	return materializedRangePredicateWithMode(e, bm, false)
 }
 
 func materializedRangePredicateReadonly(e qx.Expr, bm *roaring64.Bitmap) predicate {
@@ -3140,6 +3157,7 @@ func (db *DB[K, V]) execPlanOrderedBasicAnchored(q *qx.QX, preds []predicate, ac
 	}
 
 	leadIt := preds[leadIdx].newIter()
+	defer releaseRoaringIter(leadIt)
 	if leadIt == nil {
 		return nil, false
 	}
@@ -3557,6 +3575,9 @@ func (db *DB[K, V]) scanOrderedBaseSliceWithPredicates(q *qx.QX, preds []predica
 
 		exactApplied := false
 		iterSrc := bucket.Iter()
+		defer func() {
+			releaseRoaringIter(iterSrc)
+		}()
 		if len(exactActive) > 0 {
 			mode, exactBM, _ := plannerFilterBitmapByChecks(preds, exactActive, ensureBucketBM(), exactWork, cursor.skip > 0)
 			switch mode {
@@ -3566,6 +3587,7 @@ func (db *DB[K, V]) scanOrderedBaseSliceWithPredicates(q *qx.QX, preds []predica
 				if exactOnly {
 					return emitMatchedBitmap(exactBM, card)
 				}
+				releaseRoaringIter(iterSrc)
 				iterSrc = exactBM.Iterator()
 				exactApplied = true
 			case plannerPredicateBucketExact:
@@ -3578,6 +3600,7 @@ func (db *DB[K, V]) scanOrderedBaseSliceWithPredicates(q *qx.QX, preds []predica
 				if exactOnly {
 					return emitMatchedBitmap(exactBM, exactBM.GetCardinality())
 				}
+				releaseRoaringIter(iterSrc)
 				iterSrc = exactBM.Iterator()
 				exactApplied = true
 			}

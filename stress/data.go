@@ -11,6 +11,7 @@ import (
 
 	"github.com/vapstack/rbi"
 	bolt "go.etcd.io/bbolt"
+	bolterrors "go.etcd.io/bbolt/errors"
 )
 
 var (
@@ -84,7 +85,7 @@ func OpenBenchDB(cfg DBConfig, emailSampleN int) (*DBHandle, error) {
 		Timeout: cfg.OpenTimeout,
 	})
 	if err != nil {
-		if errors.Is(err, bolt.ErrTimeout) {
+		if errors.Is(err, bolterrors.ErrTimeout) {
 			return nil, fmt.Errorf(
 				"open bolt db: lock timeout after %s for %s (another stress or bench process is likely still using this DB)",
 				cfg.OpenTimeout,

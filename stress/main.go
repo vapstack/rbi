@@ -185,7 +185,7 @@ func main() {
 		fatalf("close db: %v", closeErr)
 	}
 
-	fmt.Fprintf(os.Stdout, "\nreport saved to %s\nDB closed %s\n", opts.ReportPath, handle.DBFile)
+	_, _ = fmt.Fprintf(os.Stdout, "\nreport saved to %s\nDB closed %s\n", opts.ReportPath, handle.DBFile)
 }
 
 func renderShutdownStatus(app *app, renderer *renderer, reader *lineReader, message string) {

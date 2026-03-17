@@ -13,7 +13,7 @@ import (
 	"time"
 	"unsafe"
 
-	"github.com/RoaringBitmap/roaring/v2/roaring64"
+	"github.com/vapstack/rbi/internal/roaring64"
 	"go.etcd.io/bbolt"
 )
 
@@ -872,7 +872,7 @@ type (
 
 	// Stats is an aggregate diagnostic snapshot of DB state.
 	//
-	// It combines outputs of IndexStats, SnapshotStats, PlannerStats, CalibrationStats and AutoBatchStats.
+	// It combines outputs of IndexStats, SnapshotStats, PlannerStats, CalibrationStats, AutoBatchStats and PoolStats.
 	//
 	// For scenario-specific telemetry, prefer calling the corresponding
 	// component method directly to avoid unnecessary work.
@@ -887,6 +887,8 @@ type (
 		Calibration CalibrationStats
 		// AutoBatch contains auto-batcher queue/batch/fallback diagnostics.
 		AutoBatch AutoBatchStats
+		// Pools contains a process-wide snapshot of pool activity and retention.
+		Pools PoolStats
 	}
 
 	// PlannerStats contains planner snapshot metadata, per-field stats and sampling settings.
@@ -1323,7 +1325,7 @@ func (db *DB[K, V]) RebuildIndex() error {
 }
 
 // Stats returns an aggregate diagnostic snapshot by combining results of
-// IndexStats, SnapshotStats, PlannerStats, CalibrationStats and AutoBatchStats.
+// IndexStats, SnapshotStats, PlannerStats, CalibrationStats, AutoBatchStats and PoolStats.
 //
 // On large databases this can be expensive.
 //
@@ -1336,7 +1338,36 @@ func (db *DB[K, V]) Stats() Stats[K] {
 	s.Planner = db.PlannerStats()
 	s.Calibration = db.CalibrationStats()
 	s.AutoBatch = db.AutoBatchStats()
+	s.Pools = db.PoolStats()
 	return s
+}
+
+// PoolStats returns a process-wide snapshot of pool activity and retention.
+//
+// Pool counters are global to the current process and may include activity from
+// other DB instances sharing the same package-level pools.
+func (db *DB[K, V]) PoolStats() PoolStats {
+	_ = db
+	return snapshotPoolStats()
+}
+
+// PoolStatsSinceReset returns pool stats relative to the last ResetPoolStats call.
+//
+// This uses a process-wide baseline over the same global package-level pools as
+// PoolStats. Lifetime counters remain available through PoolStats().
+func (db *DB[K, V]) PoolStatsSinceReset() PoolStats {
+	_ = db
+	return snapshotPoolStatsSinceReset()
+}
+
+// ResetPoolStats starts a new process-wide pool stats window used by
+// PoolStatsSinceReset.
+//
+// This does not clear lifetime counters returned by PoolStats(); it only moves
+// the baseline used for reset-relative snapshots.
+func (db *DB[K, V]) ResetPoolStats() {
+	_ = db
+	resetPoolStats()
 }
 
 // IndexStats returns current index stats.
@@ -1884,12 +1915,6 @@ func (sm *strMapper) snapshot() *strMapSnapshot {
 	return sm.snapshotNoLock()
 }
 
-func (sm *strMapper) forceSnapshot() *strMapSnapshot {
-	sm.Lock()
-	defer sm.Unlock()
-	return sm.forceSnapshotNoLock()
-}
-
 func (sm *strMapper) forceSnapshotPublishedNoLock(published *strMapSnapshot) *strMapSnapshot {
 	sm.snap = published.compact()
 	return sm.snap
@@ -1939,23 +1964,6 @@ func (sm *strMapper) snapshotNoLock() *strMapSnapshot {
 		base:     sm.snap,
 		baseNext: baseNext,
 		depth:    nextDepth,
-	}
-	return sm.snap
-}
-
-func (sm *strMapper) forceSnapshotNoLock() *strMapSnapshot {
-	if sm.snap != nil && len(sm.deltaKeys) == 0 && sm.snap.base == nil && sm.snap.DenseStrs != nil {
-		return sm.snap
-	}
-
-	sm.deltaKeys = nil
-	sm.deltaStrs = nil
-	sm.snap = &strMapSnapshot{
-		Next:      sm.Next,
-		Keys:      maps.Clone(sm.Keys),
-		DenseStrs: slices.Clone(sm.Strs),
-		DenseUsed: slices.Clone(sm.strsUsed),
-		depth:     1,
 	}
 	return sm.snap
 }

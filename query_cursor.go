@@ -1,6 +1,6 @@
 package rbi
 
-import "github.com/RoaringBitmap/roaring/v2/roaring64"
+import "github.com/vapstack/rbi/internal/roaring64"
 
 type queryCursor[K ~uint64 | ~string, V any] struct {
 	db *DB[K, V]
@@ -49,6 +49,7 @@ func (c *queryCursor[K, V]) emitBitmap(bm *roaring64.Bitmap) bool {
 		return false
 	}
 	it := bm.Iterator()
+	defer releaseRoaringBitmapIterator(it)
 	for it.HasNext() {
 		if c.emit(it.Next()) {
 			return true

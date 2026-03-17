@@ -16,7 +16,7 @@ import (
 	"time"
 	"unsafe"
 
-	"github.com/RoaringBitmap/roaring/v2/roaring64"
+	"github.com/vapstack/rbi/internal/roaring64"
 	"go.etcd.io/bbolt"
 )
 

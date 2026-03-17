@@ -68,15 +68,18 @@ type runEpoch struct {
 	startedAt time.Time
 
 	memoryBaseline *MemorySnapshot
+	poolBase       poolSample
 	snapshotBase   snapshotSample
 	batchBase      batchSample
 	planner        *plannerTraceEpoch
 
 	mu              sync.Mutex
 	memorySamples   []MemorySnapshot
+	poolSamples     []poolSample
 	snapshotSamples []snapshotSample
 	batchSamples    []batchSample
 	lastMemory      *MemorySnapshot
+	lastPool        poolSample
 	lastSnapshot    snapshotSample
 	lastBatch       batchSample
 	tps             map[string]*tpsState
@@ -249,7 +252,7 @@ func (a *app) buildReport(interrupted bool) stressReport {
 	a.sampleCounts(now)
 	snap := a.buildSnapshot(now, true)
 	epoch := a.currentEpoch()
-	memoryBaseline, memoryFinal, memorySamples, snapshotBase, snapshotFinal, snapshotSamples, batchBase, batchFinal, batchSamples := epoch.copyTelemetry()
+	memoryBaseline, memoryFinal, memorySamples, poolBase, poolFinal, poolSamples, snapshotBase, snapshotFinal, snapshotSamples, batchBase, batchFinal, batchSamples := epoch.copyTelemetry()
 	return stressReport{
 		Schema:            reportSchema,
 		Timestamp:         now.Format(time.RFC3339Nano),
@@ -272,8 +275,12 @@ func (a *app) buildReport(interrupted bool) stressReport {
 		Planner:           snap.Planner,
 		MemoryBaseline:    memoryBaseline,
 		MemoryFinal:       memoryFinal,
-		MemorySummary:     SummarizeMemory(memorySamples, memoryFinal),
+		MemorySummary:     summarizeMemory(memorySamples, memoryFinal),
 		MemorySamples:     memorySamples,
+		PoolBaseline:      poolBase,
+		PoolFinal:         poolFinal,
+		PoolSummary:       summarizePools(poolSamples, poolFinal),
+		PoolSamples:       poolSamples,
 		SnapshotBaseline:  snapshotBase,
 		SnapshotFinal:     snapshotFinal,
 		SnapshotSamples:   snapshotSamples,
@@ -403,10 +410,12 @@ func (a *app) currentEpoch() *runEpoch {
 func (a *app) captureTelemetry(now time.Time) {
 	epoch := a.currentEpoch()
 	memory := CaptureMemorySnapshot(a.handle)
+	poolRaw := a.handle.DB.PoolStatsSinceReset()
 	snapRaw := a.handle.DB.SnapshotStats()
 	batchRaw := a.handle.DB.AutoBatchStats()
 	epoch.recordTelemetry(
 		memory,
+		makePoolSample(now.Format(time.RFC3339Nano), epoch.poolBase.Stats, poolRaw),
 		makeSnapshotSample(now, epoch.snapshotBase.Stats, snapRaw),
 		makeBatchSample(now, epoch.batchBase.Stats, batchRaw),
 	)
@@ -671,8 +680,14 @@ func jitterDelay(rng *rand.Rand) time.Duration {
 func newRunEpoch(handle *DBHandle, traces *plannerTraceCollector) *runEpoch {
 	now := time.Now()
 	memory := CaptureMemorySnapshot(handle)
+	handle.DB.ResetPoolStats()
+	poolRaw := handle.DB.PoolStatsSinceReset()
 	snapshotRaw := handle.DB.SnapshotStats()
 	batchRaw := handle.DB.AutoBatchStats()
+	pool := poolSample{
+		CapturedAt: now.Format(time.RFC3339Nano),
+		Stats:      poolRaw,
+	}
 	snapshot := snapshotSample{
 		CapturedAt: now.Format(time.RFC3339Nano),
 		Stats:      snapshotRaw,
@@ -684,10 +699,12 @@ func newRunEpoch(handle *DBHandle, traces *plannerTraceCollector) *runEpoch {
 	return &runEpoch{
 		startedAt:      now,
 		memoryBaseline: memory,
+		poolBase:       pool,
 		snapshotBase:   snapshot,
 		batchBase:      batch,
 		planner:        traces.newEpoch(),
 		lastMemory:     memory,
+		lastPool:       pool,
 		lastSnapshot:   snapshot,
 		lastBatch:      batch,
 		tps:            make(map[string]*tpsState, 32),
@@ -726,13 +743,15 @@ func (e *runEpoch) observeScope(key string, completed uint64, paused uint64, wor
 	return state.current, state.min
 }
 
-func (e *runEpoch) recordTelemetry(memory *MemorySnapshot, snapshot snapshotSample, batch batchSample) {
+func (e *runEpoch) recordTelemetry(memory *MemorySnapshot, pool poolSample, snapshot snapshotSample, batch batchSample) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if memory != nil {
 		e.lastMemory = memory
 		e.memorySamples = append(e.memorySamples, *memory)
 	}
+	e.lastPool = pool
+	e.poolSamples = append(e.poolSamples, pool)
 	e.lastSnapshot = snapshot
 	e.lastBatch = batch
 	e.snapshotSamples = append(e.snapshotSamples, snapshot)
@@ -745,13 +764,16 @@ func (e *runEpoch) latestTelemetry() (*MemorySnapshot, snapshotSample, batchSamp
 	return e.lastMemory, e.lastSnapshot, e.lastBatch
 }
 
-func (e *runEpoch) copyTelemetry() (*MemorySnapshot, *MemorySnapshot, []MemorySnapshot, snapshotSample, snapshotSample, []snapshotSample, batchSample, batchSample, []batchSample) {
+func (e *runEpoch) copyTelemetry() (*MemorySnapshot, *MemorySnapshot, []MemorySnapshot, *poolSample, *poolSample, []poolSample, snapshotSample, snapshotSample, []snapshotSample, batchSample, batchSample, []batchSample) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	memorySamples := append([]MemorySnapshot(nil), e.memorySamples...)
+	poolSamples := append([]poolSample(nil), e.poolSamples...)
 	snapshotSamples := append([]snapshotSample(nil), e.snapshotSamples...)
 	batchSamples := append([]batchSample(nil), e.batchSamples...)
-	return e.memoryBaseline, e.lastMemory, memorySamples, e.snapshotBase, e.lastSnapshot, snapshotSamples, e.batchBase, e.lastBatch, batchSamples
+	poolBase := e.poolBase
+	poolFinal := e.lastPool
+	return e.memoryBaseline, e.lastMemory, memorySamples, &poolBase, &poolFinal, poolSamples, e.snapshotBase, e.lastSnapshot, snapshotSamples, e.batchBase, e.lastBatch, batchSamples
 }
 
 func (e *runEpoch) plannerSnapshot() plannerTraceSnapshot {

@@ -82,19 +82,19 @@ func main() {
 
 func runCLI(args []string, stdout io.Writer, stderr io.Writer, useColor bool) int {
 	if len(args) != 2 {
-		fmt.Fprintln(stderr, "usage: benchprint <previous.txt> <current.txt>")
+		_, _ = fmt.Fprintln(stderr, "usage: benchprint <previous.txt> <current.txt>")
 		return 2
 	}
 
 	previous, err := parseBenchmarkFile(args[0])
 	if err != nil {
-		fmt.Fprintf(stderr, "read %s: %v\n", args[0], err)
+		_, _ = fmt.Fprintf(stderr, "read %s: %v\n", args[0], err)
 		return 1
 	}
 
 	current, err := parseBenchmarkFile(args[1])
 	if err != nil {
-		fmt.Fprintf(stderr, "read %s: %v\n", args[1], err)
+		_, _ = fmt.Fprintf(stderr, "read %s: %v\n", args[1], err)
 		return 1
 	}
 
@@ -105,7 +105,7 @@ func runCLI(args []string, stdout io.Writer, stderr io.Writer, useColor bool) in
 		return 0
 	}
 
-	fmt.Fprintln(stdout, renderRows(rows))
+	_, _ = fmt.Fprintln(stdout, renderRows(rows))
 	return 0
 }
 
@@ -118,7 +118,7 @@ func parseBenchmarkFile(path string) (benchmarkSet, error) {
 	if err != nil {
 		return benchmarkSet{}, err
 	}
-	defer file.Close()
+	defer func() { _ = file.Close() }()
 
 	set := benchmarkSet{
 		Order:      make([]string, 0),
@@ -438,15 +438,6 @@ func formatMetricValue(kind metricKind, value float64) string {
 	default:
 		return formatGroupedFloat(value) + " allocs/op"
 	}
-}
-
-func formatScaledValue(value float64, base float64, threshold float64, units []string) string {
-	unit := 0
-	for unit < len(units)-1 && value >= threshold {
-		value /= base
-		unit++
-	}
-	return formatFloat(value) + units[unit]
 }
 
 func formatFloat(value float64) string {

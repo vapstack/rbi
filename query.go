@@ -272,6 +272,7 @@ func (db *DB[K, V]) execQuery(q *qx.QX, emitTrace bool, prepared bool) (out []K,
 			defer releaseRoaringBuf(universe)
 		}
 		it := universe.Iterator()
+		defer releaseRoaringBitmapIterator(it)
 		for it.HasNext() {
 			idx := it.Next()
 			if ex != nil && ex.Contains(idx) {
@@ -367,6 +368,7 @@ func (db *DB[K, V]) execQuery(q *qx.QX, emitTrace bool, prepared bool) (out []K,
 	cursor := db.newQueryCursor(out, skip, need, needAll, nil)
 
 	iter := result.bm.Iterator()
+	defer releaseRoaringBitmapIterator(iter)
 	for iter.HasNext() {
 		if cursor.emit(iter.Next()) {
 			return cursor.out, nil
