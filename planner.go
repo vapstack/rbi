@@ -1109,14 +1109,18 @@ func (db *DB[K, V]) execPlanOROrderBasic(q *qx.QX, branches plannerORBranches, t
 			return out, true
 		}
 
-		branchMetrics := make([]TraceORBranch, len(branches))
-		for i := range branchMetrics {
-			branchMetrics[i].Index = i
+		fullTrace := trace.full()
+		var branchMetrics []TraceORBranch
+		if fullTrace {
+			branchMetrics = make([]TraceORBranch, len(branches))
+			for i := range branchMetrics {
+				branchMetrics[i].Index = i
+			}
 		}
 
 		matchWithMetrics := func(idx uint64) bool {
 			if alwaysTrue {
-				if alwaysTrueBranch >= 0 {
+				if fullTrace && alwaysTrueBranch >= 0 {
 					branchMetrics[alwaysTrueBranch].RowsExamined++
 					branchMetrics[alwaysTrueBranch].RowsEmitted++
 				}
@@ -1125,9 +1129,13 @@ func (db *DB[K, V]) execPlanOROrderBasic(q *qx.QX, branches plannerORBranches, t
 
 			matchedCount := 0
 			for i := range branches {
-				branchMetrics[i].RowsExamined++
+				if fullTrace {
+					branchMetrics[i].RowsExamined++
+				}
 				if branches[i].matchesChecks(idx, branchChecks[i]) {
-					branchMetrics[i].RowsEmitted++
+					if fullTrace {
+						branchMetrics[i].RowsEmitted++
+					}
 					matchedCount++
 				}
 			}
@@ -1268,14 +1276,18 @@ func (db *DB[K, V]) execPlanOROrderBasic(q *qx.QX, branches plannerORBranches, t
 		return out, true
 	}
 
-	branchMetrics := make([]TraceORBranch, len(branches))
-	for i := range branchMetrics {
-		branchMetrics[i].Index = i
+	fullTrace := trace.full()
+	var branchMetrics []TraceORBranch
+	if fullTrace {
+		branchMetrics = make([]TraceORBranch, len(branches))
+		for i := range branchMetrics {
+			branchMetrics[i].Index = i
+		}
 	}
 
 	matchWithMetrics := func(idx uint64) bool {
 		if alwaysTrue {
-			if alwaysTrueBranch >= 0 {
+			if fullTrace && alwaysTrueBranch >= 0 {
 				branchMetrics[alwaysTrueBranch].RowsExamined++
 				branchMetrics[alwaysTrueBranch].RowsEmitted++
 			}
@@ -1284,9 +1296,13 @@ func (db *DB[K, V]) execPlanOROrderBasic(q *qx.QX, branches plannerORBranches, t
 
 		matchedCount := 0
 		for i := range branches {
-			branchMetrics[i].RowsExamined++
+			if fullTrace {
+				branchMetrics[i].RowsExamined++
+			}
 			if branches[i].matchesChecks(idx, branchChecks[i]) {
-				branchMetrics[i].RowsEmitted++
+				if fullTrace {
+					branchMetrics[i].RowsEmitted++
+				}
 				matchedCount++
 			}
 		}
@@ -2181,6 +2197,7 @@ func (db *DB[K, V]) execPlanOROrderKWay(q *qx.QX, branches plannerORBranches, tr
 		}
 	}
 
+	fullTrace := trace.full()
 	var (
 		branchMetrics []TraceORBranch
 		examined      uint64
@@ -2207,19 +2224,21 @@ func (db *DB[K, V]) execPlanOROrderKWay(q *qx.QX, branches plannerORBranches, tr
 	}()
 	var examinedPtr *uint64
 	if trace != nil {
-		branchMetrics = make([]TraceORBranch, len(branches))
-		for i := range branchMetrics {
-			branchMetrics[i].Index = i
+		if fullTrace {
+			branchMetrics = make([]TraceORBranch, len(branches))
+			for i := range branchMetrics {
+				branchMetrics[i].Index = i
+			}
 		}
 		examinedPtr = &examined
 	}
 
 	var bucketSeen []bool
-	if trace != nil {
+	if fullTrace {
 		bucketSeen = make([]bool, len(s))
 	}
 	markBucketVisited := func(bucket int) {
-		if trace == nil || bucket < 0 || bucket >= len(bucketSeen) {
+		if !fullTrace || bucket < 0 || bucket >= len(bucketSeen) {
 			return
 		}
 		if bucketSeen[bucket] {
@@ -2286,7 +2305,7 @@ func (db *DB[K, V]) execPlanOROrderKWay(q *qx.QX, branches plannerORBranches, tr
 			}
 		}
 		if branchStart >= branchEnd {
-			if trace != nil {
+			if fullTrace {
 				branchMetrics[i].Skipped = true
 				branchMetrics[i].SkipReason = "order_range_empty"
 			}
@@ -2295,7 +2314,7 @@ func (db *DB[K, V]) execPlanOROrderKWay(q *qx.QX, branches plannerORBranches, tr
 
 		var bePtr *uint64
 		var bmPtr *uint64
-		if trace != nil {
+		if fullTrace {
 			bePtr = &branchMetrics[i].RowsExamined
 			bmPtr = &branchMetrics[i].RowsEmitted
 		}
@@ -2329,7 +2348,7 @@ func (db *DB[K, V]) execPlanOROrderKWay(q *qx.QX, branches plannerORBranches, tr
 				bucket: iters[i].curBucket,
 				idx:    iters[i].cur,
 			})
-		} else if trace != nil {
+		} else if fullTrace {
 			branchMetrics[i].Skipped = true
 			branchMetrics[i].SkipReason = "stream_empty"
 		}
@@ -2436,8 +2455,9 @@ func (db *DB[K, V]) execPlanOROrderMergeFallback(q *qx.QX, branches plannerORBra
 	candidateBM := getRoaringBuf()
 	defer releaseRoaringBuf(candidateBM)
 
+	fullTrace := trace.full()
 	var branchMetrics []TraceORBranch
-	if trace != nil {
+	if fullTrace {
 		branchMetrics = make([]TraceORBranch, len(branches))
 		for i := range branchMetrics {
 			branchMetrics[i].Index = i
@@ -2464,7 +2484,7 @@ func (db *DB[K, V]) execPlanOROrderMergeFallback(q *qx.QX, branches plannerORBra
 			return nil, true, err
 		}
 		if branchLimit <= 0 {
-			if trace != nil {
+			if fullTrace {
 				branchMetrics[i].Skipped = true
 				branchMetrics[i].SkipReason = "branch_limit_zero"
 			}
@@ -2479,6 +2499,8 @@ func (db *DB[K, V]) execPlanOROrderMergeFallback(q *qx.QX, branches plannerORBra
 				if trace != nil {
 					trace.addExamined(examined)
 					trace.addDedupe(dedupe)
+				}
+				if fullTrace {
 					branchMetrics[i].RowsExamined += examined
 					branchMetrics[i].RowsEmitted += emitted
 				}
@@ -2503,6 +2525,8 @@ func (db *DB[K, V]) execPlanOROrderMergeFallback(q *qx.QX, branches plannerORBra
 		}
 		if trace != nil {
 			trace.addExamined(uint64(len(ids)))
+		}
+		if fullTrace {
 			branchMetrics[i].RowsExamined += uint64(len(ids))
 			branchMetrics[i].RowsEmitted += uint64(len(ids))
 		}
@@ -3141,6 +3165,7 @@ func (db *DB[K, V]) execPlanORNoOrderAdaptive(q *qx.QX, branches plannerORBranch
 		return nil, true
 	}
 
+	fullTrace := trace.full()
 	var (
 		examined    uint64
 		examinedPtr *uint64
@@ -3148,9 +3173,11 @@ func (db *DB[K, V]) execPlanORNoOrderAdaptive(q *qx.QX, branches plannerORBranch
 	var branchMetrics []TraceORBranch
 	if trace != nil {
 		examinedPtr = &examined
-		branchMetrics = make([]TraceORBranch, len(branches))
-		for i := range branchMetrics {
-			branchMetrics[i].Index = i
+		if fullTrace {
+			branchMetrics = make([]TraceORBranch, len(branches))
+			for i := range branchMetrics {
+				branchMetrics[i].Index = i
+			}
 		}
 	}
 
@@ -3181,7 +3208,7 @@ func (db *DB[K, V]) execPlanORNoOrderAdaptive(q *qx.QX, branches plannerORBranch
 
 		var branchExaminedPtr *uint64
 		var branchEmittedPtr *uint64
-		if trace != nil {
+		if fullTrace {
 			branchExaminedPtr = &branchMetrics[i].RowsExamined
 			branchEmittedPtr = &branchMetrics[i].RowsEmitted
 		}
@@ -3385,7 +3412,7 @@ func (db *DB[K, V]) execPlanORNoOrderAdaptive(q *qx.QX, branches plannerORBranch
 	if trace != nil {
 		trace.addExamined(examined)
 
-		if len(top) == need {
+		if fullTrace && len(top) == need {
 			threshold := top[len(top)-1]
 			for i := range states {
 				st := &states[i]
@@ -3415,6 +3442,7 @@ func (db *DB[K, V]) execPlanORNoOrderAdaptive(q *qx.QX, branches plannerORBranch
 }
 
 func (db *DB[K, V]) execPlanORNoOrderBaseline(q *qx.QX, branches plannerORBranches, trace *queryTrace) ([]K, bool) {
+	fullTrace := trace.full()
 	var (
 		examined    uint64
 		examinedPtr *uint64
@@ -3422,9 +3450,11 @@ func (db *DB[K, V]) execPlanORNoOrderBaseline(q *qx.QX, branches plannerORBranch
 	var branchMetrics []TraceORBranch
 	if trace != nil {
 		examinedPtr = &examined
-		branchMetrics = make([]TraceORBranch, len(branches))
-		for i := range branchMetrics {
-			branchMetrics[i].Index = i
+		if fullTrace {
+			branchMetrics = make([]TraceORBranch, len(branches))
+			for i := range branchMetrics {
+				branchMetrics[i].Index = i
+			}
 		}
 	}
 	var iters []plannerORIter
@@ -3437,7 +3467,7 @@ func (db *DB[K, V]) execPlanORNoOrderBaseline(q *qx.QX, branches plannerORBranch
 	for i := range branches {
 		var branchExaminedPtr *uint64
 		var branchEmittedPtr *uint64
-		if trace != nil {
+		if fullTrace {
 			branchExaminedPtr = &branchMetrics[i].RowsExamined
 			branchEmittedPtr = &branchMetrics[i].RowsEmitted
 		}

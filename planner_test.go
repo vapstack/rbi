@@ -98,6 +98,70 @@ func TestPlannerCalibration_QueryPathUpdatesWithoutTracerSink(t *testing.T) {
 	}
 }
 
+func TestPlannerCalibration_BeginTraceUsesMinimalCollectorWithoutTracerSink(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{
+		AnalyzeInterval:        -1,
+		CalibrationEnabled:     true,
+		CalibrationSampleEvery: 1,
+	})
+
+	before, ok := db.GetCalibrationSnapshot()
+	if !ok {
+		t.Fatalf("expected initialized planner calibration snapshot")
+	}
+
+	q := qx.Query(
+		qx.OR(
+			qx.EQ("active", true),
+			qx.EQ("name", "alice"),
+		),
+	).By("age", qx.ASC).Skip(5).Max(10)
+
+	tr := db.beginTrace(q)
+	if tr == nil {
+		t.Fatalf("expected calibration-only trace collector")
+	}
+	if tr.full() {
+		t.Fatalf("expected calibration-only collector without TraceSink")
+	}
+	if !tr.ev.Timestamp.IsZero() {
+		t.Fatalf("expected zero timestamp in calibration-only mode, got=%v", tr.ev.Timestamp)
+	}
+	if tr.ev.Offset != 0 || tr.ev.Limit != 0 || tr.ev.HasOrder || tr.ev.LeafCount != 0 || tr.ev.HasNeg || tr.ev.HasPrefix {
+		t.Fatalf("expected trace-only query metadata to stay empty, got=%+v", tr.ev)
+	}
+
+	tr.setPlan(PlanOrdered)
+	tr.setEstimated(42, 12.5, 9.5)
+	tr.addExamined(7)
+	tr.finish(3, nil)
+
+	if tr.ev.Plan != string(PlanOrdered) {
+		t.Fatalf("unexpected plan: got=%q want=%q", tr.ev.Plan, PlanOrdered)
+	}
+	if tr.ev.EstimatedRows != 42 || tr.ev.RowsExamined != 7 || tr.ev.RowsReturned != 3 {
+		t.Fatalf(
+			"unexpected minimal calibration fields: estimated=%d examined=%d returned=%d",
+			tr.ev.EstimatedRows, tr.ev.RowsExamined, tr.ev.RowsReturned,
+		)
+	}
+	if tr.ev.EstimatedCost != 0 || tr.ev.FallbackCost != 0 || tr.ev.Duration != 0 || tr.ev.Error != "" || len(tr.ev.ORBranches) != 0 {
+		t.Fatalf("expected full-trace fields to remain empty, got=%+v", tr.ev)
+	}
+
+	after, ok := db.GetCalibrationSnapshot()
+	if !ok {
+		t.Fatalf("expected planner calibration snapshot after finish")
+	}
+	if after.Samples[string(PlanOrdered)] <= before.Samples[string(PlanOrdered)] {
+		t.Fatalf(
+			"expected calibration sample to increase from minimal collector: before=%d after=%d",
+			before.Samples[string(PlanOrdered)],
+			after.Samples[string(PlanOrdered)],
+		)
+	}
+}
+
 func TestPlannerCalibration_QueryViewUsesRootSnapshot(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
 		AnalyzeInterval:        -1,
@@ -1915,7 +1979,7 @@ func TestTracer_OROrderRouteDecision_WithOrderDelta(t *testing.T) {
 	}
 	defer releaseORBranches(branches)
 
-	trace := &queryTrace{}
+	trace := &queryTrace{sink: func(TraceEvent) {}}
 	_, _, err = db.execPlanOROrderMerge(q, branches, trace)
 	if err != nil {
 		t.Fatalf("execPlanOROrderMerge: %v", err)

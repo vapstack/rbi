@@ -2804,11 +2804,14 @@ func (db *DB[K, V]) tryCountORByPredicates(expr qx.Expr, trace *queryTrace) (uin
 	var cnt uint64
 	var examined uint64
 	var branchTrace []TraceORBranch
+	fullTrace := trace.full()
 	if trace != nil {
 		trace.setPlan(PlanCountORPredicates)
-		branchTrace = make([]TraceORBranch, len(branches))
-		for i := range branchTrace {
-			branchTrace[i].Index = i
+		if fullTrace {
+			branchTrace = make([]TraceORBranch, len(branches))
+			for i := range branchTrace {
+				branchTrace[i].Index = i
+			}
 		}
 	}
 	for i := range branches {

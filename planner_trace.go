@@ -118,6 +118,10 @@ type queryTrace struct {
 	ev       TraceEvent
 }
 
+func (t *queryTrace) full() bool {
+	return t != nil && t.sink != nil
+}
+
 func traceSampleEvery(sampleEvery int, sink func(TraceEvent)) uint64 {
 	if sink == nil {
 		return 0
@@ -162,35 +166,33 @@ func (db *DB[K, V]) beginTrace(q *qx.QX) *queryTrace {
 		return nil
 	}
 
-	ev := TraceEvent{
-		Timestamp: time.Now(),
-		Offset:    q.Offset,
-		Limit:     q.Limit,
-	}
-	if len(q.Order) > 0 {
-		ev.HasOrder = true
-		ev.OrderField = q.Order[0].Field
-		ev.OrderDesc = q.Order[0].Desc
-	}
+	tr := new(queryTrace)
+	if emitTrace {
+		tr.ev = TraceEvent{
+			Timestamp: time.Now(),
+			Offset:    q.Offset,
+			Limit:     q.Limit,
+		}
+		if len(q.Order) > 0 {
+			tr.ev.HasOrder = true
+			tr.ev.OrderField = q.Order[0].Field
+			tr.ev.OrderDesc = q.Order[0].Desc
+		}
 
-	leaves, ok := collectAndLeaves(q.Expr)
-	if ok {
-		ev.LeafCount = len(leaves)
-		for _, e := range leaves {
-			if e.Not {
-				ev.HasNeg = true
-			}
-			if e.Op == qx.OpPREFIX {
-				ev.HasPrefix = true
+		leaves, ok := collectAndLeaves(q.Expr)
+		if ok {
+			tr.ev.LeafCount = len(leaves)
+			for _, e := range leaves {
+				if e.Not {
+					tr.ev.HasNeg = true
+				}
+				if e.Op == qx.OpPREFIX {
+					tr.ev.HasPrefix = true
+				}
 			}
 		}
-	}
 
-	tr := &queryTrace{
-		start: ev.Timestamp,
-		ev:    ev,
-	}
-	if emitTrace {
+		tr.start = tr.ev.Timestamp
 		tr.sink = sink
 	}
 	if emitCalibration {
@@ -223,49 +225,49 @@ func (t *queryTrace) addExamined(n uint64) {
 }
 
 func (t *queryTrace) addMatched(n uint64) {
-	if t == nil || n == 0 {
+	if !t.full() || n == 0 {
 		return
 	}
 	t.ev.RowsMatched += n
 }
 
 func (t *queryTrace) addOrderScanWidth(n uint64) {
-	if t == nil || n == 0 {
+	if !t.full() || n == 0 {
 		return
 	}
 	t.ev.OrderIndexScanWidth += n
 }
 
 func (t *queryTrace) addBitmapMaterialized(n uint64) {
-	if t == nil || n == 0 {
+	if !t.full() || n == 0 {
 		return
 	}
 	t.ev.BitmapMaterializations += n
 }
 
 func (t *queryTrace) addBitmapExactFilter(n uint64) {
-	if t == nil || n == 0 {
+	if !t.full() || n == 0 {
 		return
 	}
 	t.ev.BitmapExactFilters += n
 }
 
 func (t *queryTrace) addCountPredicatePreparation(n uint64) {
-	if t == nil || n == 0 {
+	if !t.full() || n == 0 {
 		return
 	}
 	t.ev.CountPredicatePreparations += n
 }
 
 func (t *queryTrace) addCountRangeComplementCacheHit(n uint64) {
-	if t == nil || n == 0 {
+	if !t.full() || n == 0 {
 		return
 	}
 	t.ev.CountRangeComplementCacheHits += n
 }
 
 func (t *queryTrace) addCountRangeComplementBuild(rows uint64, fast bool) {
-	if t == nil {
+	if !t.full() {
 		return
 	}
 	t.ev.CountRangeComplementBuilds++
@@ -276,14 +278,14 @@ func (t *queryTrace) addCountRangeComplementBuild(rows uint64, fast bool) {
 }
 
 func (t *queryTrace) addDedupe(n uint64) {
-	if t == nil || n == 0 {
+	if !t.full() || n == 0 {
 		return
 	}
 	t.ev.DedupeCount += n
 }
 
 func (t *queryTrace) setEarlyStopReason(reason string) {
-	if t == nil || reason == "" {
+	if !t.full() || reason == "" {
 		return
 	}
 	if t.ev.EarlyStopReason != "" {
@@ -293,7 +295,7 @@ func (t *queryTrace) setEarlyStopReason(reason string) {
 }
 
 func (t *queryTrace) setORBranches(branches []TraceORBranch) {
-	if t == nil {
+	if !t.full() {
 		return
 	}
 	if len(branches) == 0 {
@@ -308,12 +310,15 @@ func (t *queryTrace) setEstimated(rows uint64, estCost, fallbackCost float64) {
 		return
 	}
 	t.ev.EstimatedRows = rows
+	if !t.full() {
+		return
+	}
 	t.ev.EstimatedCost = estCost
 	t.ev.FallbackCost = fallbackCost
 }
 
 func (t *queryTrace) setOROrderRouteDecision(route, reason string, cost plannerOROrderRouteCost, avgChecks float64, fallbackCollectFast bool) {
-	if t == nil {
+	if !t.full() {
 		return
 	}
 	t.ev.ORRoute.Route = route
@@ -328,7 +333,7 @@ func (t *queryTrace) setOROrderRouteDecision(route, reason string, cost plannerO
 }
 
 func (t *queryTrace) setOROrderRuntimeGuard(enabled bool, reason string) {
-	if t == nil {
+	if !t.full() {
 		return
 	}
 	t.ev.ORRoute.RuntimeGuardEnabled = enabled
@@ -341,7 +346,7 @@ func (t *queryTrace) setOROrderRuntimeFallback(
 	projectedExamined float64,
 	projectedExaminedMax float64,
 ) {
-	if t == nil {
+	if !t.full() {
 		return
 	}
 	t.ev.ORRoute.RuntimeFallbackTriggered = true
@@ -355,9 +360,11 @@ func (t *queryTrace) finish(rowsReturned uint64, err error) {
 	if t == nil {
 		return
 	}
-	t.ev.Duration = time.Since(t.start)
 	t.ev.RowsReturned = rowsReturned
-	if err != nil {
+	if t.full() {
+		t.ev.Duration = time.Since(t.start)
+	}
+	if t.full() && err != nil {
 		t.ev.Error = err.Error()
 	}
 	if t.onFinish != nil {
