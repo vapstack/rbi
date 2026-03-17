@@ -90,7 +90,10 @@ func main() {
 
 func openBenchDatabase(opts benchOptions) (*rbi.DB[uint64, UserBench], *bolt.DB) {
 	log.Println("Opening database...")
-	dbOpts := rbi.Options{}
+	dbOpts := rbi.Options{
+		EnableAutoBatchStats: true,
+		EnableSnapshotStats:  true,
+	}
 	if opts.analyzeInterval != 0 {
 		dbOpts.AnalyzeInterval = opts.analyzeInterval
 	}

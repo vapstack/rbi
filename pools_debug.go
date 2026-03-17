@@ -308,6 +308,8 @@ func releasePlannerOROrderMergeItemSliceBuf(buf *plannerOROrderMergeItemSliceBuf
 //
 // Pool counters are global to the current process and may include activity from
 // other DB instances sharing the same package-level pools.
+//
+// This method is available only in builds compiled with the `rbidebug` build tag.
 func (db *DB[K, V]) PoolStats() PoolStats {
 	_ = db
 	return snapshotPoolStats()

@@ -300,6 +300,12 @@ type Options struct {
 	// Higher values reduce background churn but keep layered state longer.
 	SnapshotCompactorIdleInterval time.Duration
 
+	// EnableSnapshotStats enables runtime collection of snapshot stats and
+	// compactor diagnostics.
+	//
+	// Default: false (disabled).
+	EnableSnapshotStats bool
+
 	// AutoBatchWindow enables lightweight automatic batching for parallel
 	// single-record Set/Patch/Delete operations.
 	//
@@ -339,6 +345,11 @@ type Options struct {
 	//
 	// Larger values can increase memory usage under sustained overload.
 	AutoBatchMaxQueue int
+
+	// EnableAutoBatchStats enables runtime collection of auto-batch stats.
+	//
+	// Default: false (disabled).
+	EnableAutoBatchStats bool
 
 	// NumericRangeBucketSize controls amount of sorted numeric keys grouped into one
 	// pre-aggregated bucket for range predicate acceleration.
@@ -536,7 +547,8 @@ func New[K ~uint64 | ~string, V any](bolt *bbolt.DB, options Options, execOpts .
 		options:     &options,
 		execOptions: defaultExecOptions,
 		snapshot: snapshot{
-			byTx: make(map[uint64]*snapshotRef, 128),
+			byTx:         make(map[uint64]*snapshotRef, 128),
+			statsEnabled: options.EnableSnapshotStats,
 		},
 
 		planner: planner{
@@ -673,11 +685,12 @@ func (db *DB[K, V]) initBatcher() {
 		capHint = maxQueue
 	}
 	db.autoBatcher = autoBatcher[K, V]{
-		enabled: true,
-		window:  db.options.AutoBatchWindow,
-		maxOps:  maxOps,
-		maxQ:    maxQueue,
-		queue:   make([]*autoBatchRequest[K, V], 0, capHint),
+		enabled:      true,
+		statsEnabled: db.options.EnableAutoBatchStats,
+		window:       db.options.AutoBatchWindow,
+		maxOps:       maxOps,
+		maxQ:         maxQueue,
+		queue:        make([]*autoBatchRequest[K, V], 0, capHint),
 	}
 }
 
@@ -717,7 +730,8 @@ type calibrator struct {
 }
 
 type snapshot struct {
-	current atomic.Pointer[indexSnapshot]
+	current      atomic.Pointer[indexSnapshot]
+	statsEnabled bool
 
 	byTx  map[uint64]*snapshotRef
 	order []uint64
@@ -758,10 +772,11 @@ type indexedFieldAccessor struct {
 }
 
 type autoBatcher[K ~string | ~uint64, V any] struct {
-	enabled bool
-	window  time.Duration
-	maxOps  int
-	maxQ    int
+	enabled      bool
+	statsEnabled bool
+	window       time.Duration
+	maxOps       int
+	maxQ         int
 
 	mu       sync.Mutex
 	running  bool
@@ -1303,8 +1318,12 @@ func (db *DB[K, V]) RebuildIndex() error {
 	return nil
 }
 
-// IndexStats returns current index stats.
+// IndexStats returns current index shape, size, and build/load timing stats.
+//
 // On large databases this can be expensive.
+//
+// If the DB is unavailable or already closed and the method cannot enter an
+// operation window, it returns a zero value.
 func (db *DB[K, V]) IndexStats() IndexStats[K] {
 	if !db.beginOpWait() {
 		return IndexStats[K]{}
@@ -1420,8 +1439,14 @@ func (db *DB[K, V]) IndexStats() IndexStats[K] {
 	return idx
 }
 
-// AutoBatchStats returns auto-batcher queue/batch/fallback diagnostics.
+// AutoBatchStats returns auto-batcher queue, batch, and fallback diagnostics.
+//
+// Runtime counters are collected only when Options.EnableAutoBatchStats
+// was enabled for this DB instance.
 func (db *DB[K, V]) AutoBatchStats() AutoBatchStats {
+	if !db.autoBatcher.statsEnabled {
+		return AutoBatchStats{}
+	}
 	out := AutoBatchStats{
 		Enabled:             db.autoBatcher.enabled,
 		Window:              db.autoBatcher.window,
@@ -1467,7 +1492,8 @@ func (db *DB[K, V]) AutoBatchStats() AutoBatchStats {
 	return out
 }
 
-// PlannerStats returns current planner stats.
+// PlannerStats returns the last published planner statistics snapshot together
+// with current planner analyze/trace settings.
 func (db *DB[K, V]) PlannerStats() PlannerStats {
 	out := PlannerStats{
 		Fields: make(map[string]PlannerFieldStats),
@@ -1491,7 +1517,13 @@ func (db *DB[K, V]) PlannerStats() PlannerStats {
 	return out
 }
 
-// CalibrationStats returns current planner calibration stats.
+// CalibrationStats returns current planner calibration settings and state.
+//
+// When planner calibration is enabled, it returns the current calibration
+// multipliers and sample counters.
+//
+// When calibration is disabled, or no calibration state has been initialized yet,
+// it returns the current settings with zeroed calibration data.
 func (db *DB[K, V]) CalibrationStats() CalibrationStats {
 	out := CalibrationStats{
 		Enabled:     db.planner.calibrator.enabled,

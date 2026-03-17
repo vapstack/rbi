@@ -71,6 +71,8 @@ func openBoltAndNew[K ~string | ~uint64, V any](tb testing.TB, path string, opti
 	if len(options) > 0 {
 		opts = options[0]
 	}
+	opts.EnableAutoBatchStats = true
+	opts.EnableSnapshotStats = true
 	db, err := New[K, V](raw, opts)
 	if err != nil {
 		_ = raw.Close()

@@ -68,7 +68,10 @@ func OpenBenchDB(cfg DBConfig, emailSampleN int) (*DBHandle, error) {
 	if abs, err := filepath.Abs(cfg.DBFile); err == nil {
 		cfg.DBFile = abs
 	}
-	dbOpts := rbi.Options{}
+	dbOpts := rbi.Options{
+		EnableAutoBatchStats: true,
+		EnableSnapshotStats:  true,
+	}
 	if cfg.AnalyzeInterval != 0 {
 		dbOpts.AnalyzeInterval = cfg.AnalyzeInterval
 	}

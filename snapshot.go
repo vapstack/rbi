@@ -504,7 +504,9 @@ func (db *DB[K, V]) requestSnapshotCompaction() {
 	if db.snapshot.compactReq == nil {
 		return
 	}
-	db.snapshot.compactRequested.Add(1)
+	if db.snapshot.statsEnabled {
+		db.snapshot.compactRequested.Add(1)
+	}
 	select {
 	case db.snapshot.compactReq <- struct{}{}:
 	default:
@@ -532,6 +534,7 @@ func (db *DB[K, V]) noteSnapshotActivity() {
 }
 
 func (db *DB[K, V]) maybeRequestSnapshotCompaction(s *indexSnapshot, indexDelta, lenDelta map[string]*fieldIndexDelta, add, rem *roaring64.Bitmap) {
+	stats := db.snapshot.statsEnabled
 	if db.snapshot.compactReq == nil || !s.hasAnyDeltaState() {
 		return
 	}
@@ -543,11 +546,15 @@ func (db *DB[K, V]) maybeRequestSnapshotCompaction(s *indexSnapshot, indexDelta,
 
 	seq := db.snapshot.compactWriteSeq.Add(1)
 	if until := db.snapshot.compactSkipUntil.Load(); until > 0 && seq < until {
-		db.snapshot.compactSkippedWake.Add(1)
+		if stats {
+			db.snapshot.compactSkippedWake.Add(1)
+		}
 		return
 	}
 	if len(db.snapshot.compactReq) > 0 {
-		db.snapshot.compactSkippedWake.Add(1)
+		if stats {
+			db.snapshot.compactSkippedWake.Add(1)
+		}
 		return
 	}
 
@@ -658,6 +665,8 @@ func snapshotUniverseDeltaOps(add, drop *roaring64.Bitmap) uint64 {
 }
 
 func (db *DB[K, V]) snapshotCompactorLoop() {
+	stats := db.snapshot.statsEnabled
+
 	defer close(db.snapshot.compactDone)
 
 	idleInterval := db.options.SnapshotCompactorIdleInterval
@@ -728,13 +737,17 @@ func (db *DB[K, V]) snapshotCompactorLoop() {
 		force := db.snapshot.compactForcePending.Swap(false)
 		deferForceUntilIdle := func() {
 			if force && !db.snapshotCompactorIdleReady(idleInterval) {
-				db.snapshot.compactIdleDefers.Add(1)
+				if stats {
+					db.snapshot.compactIdleDefers.Add(1)
+				}
 				force = false
 				resetIdleTimer()
 			}
 		}
 		deferForceUntilIdle()
-		db.snapshot.compactRuns.Add(1)
+		if stats {
+			db.snapshot.compactRuns.Add(1)
+		}
 
 	DRAIN:
 		for {
@@ -781,10 +794,13 @@ func (db *DB[K, V]) snapshotCompactorLockMissSkip(streak uint64) uint64 {
 }
 
 func (db *DB[K, V]) noteSnapshotCompactorBusySkip(preclaim bool) {
-	if preclaim {
-		db.snapshot.compactPreclaimBusy.Add(1)
-	} else {
-		db.snapshot.compactLockMiss.Add(1)
+	stats := db.snapshot.statsEnabled
+	if stats {
+		if preclaim {
+			db.snapshot.compactPreclaimBusy.Add(1)
+		} else {
+			db.snapshot.compactLockMiss.Add(1)
+		}
 	}
 	streak := db.snapshot.compactMissStreak.Add(1)
 	seq := db.snapshot.compactWriteSeq.Load()
@@ -823,7 +839,9 @@ func (db *DB[K, V]) runSnapshotCompaction(force bool) bool {
 		return false
 	}
 	if !force && !snapshotCompactionWorthwhile(db.snapshot.current.Load(), db.options) {
-		db.snapshot.compactSoftSkip.Add(1)
+		if db.snapshot.statsEnabled {
+			db.snapshot.compactSoftSkip.Add(1)
+		}
 		return false
 	}
 	maxIters := int(db.options.SnapshotCompactorMaxIterationsPerRun)
@@ -994,12 +1012,17 @@ func (db *DB[K, V]) compactSnapshotRegistryIdleOnce() (changed bool, blocked boo
 }
 
 func (db *DB[K, V]) compactLatestSnapshotOnce(force bool) (bool, bool) {
-	db.snapshot.compactAttempts.Add(1)
+	stats := db.snapshot.statsEnabled
+	if stats {
+		db.snapshot.compactAttempts.Add(1)
+	}
 	const maxStaleRetries = 2
 	for attempt := 0; attempt < maxStaleRetries; attempt++ {
 		cur := db.snapshot.current.Load()
 		if cur == nil {
-			db.snapshot.compactNoChange.Add(1)
+			if stats {
+				db.snapshot.compactNoChange.Add(1)
+			}
 			db.snapshot.compactMissStreak.Store(0)
 			return false, false
 		}
@@ -1011,13 +1034,17 @@ func (db *DB[K, V]) compactLatestSnapshotOnce(force bool) (bool, bool) {
 		latest := db.snapshot.current.Load()
 		db.mu.RUnlock()
 		if latest != cur {
-			db.snapshot.compactStaleRetry.Add(1)
+			if stats {
+				db.snapshot.compactStaleRetry.Add(1)
+			}
 			continue
 		}
 
 		next, ok := compactSnapshot(cur, db.options, force)
 		if !ok || next == nil {
-			db.snapshot.compactNoChange.Add(1)
+			if stats {
+				db.snapshot.compactNoChange.Add(1)
+			}
 			db.snapshot.compactMissStreak.Store(0)
 			return false, false
 		}
@@ -1030,14 +1057,18 @@ func (db *DB[K, V]) compactLatestSnapshotOnce(force bool) (bool, bool) {
 		latest = db.snapshot.current.Load()
 		if latest != cur {
 			db.mu.Unlock()
-			db.snapshot.compactStaleRetry.Add(1)
+			if stats {
+				db.snapshot.compactStaleRetry.Add(1)
+			}
 			continue
 		}
 
 		db.snapshot.current.Store(next)
 		db.mu.Unlock()
 		db.registerSnapshot(next)
-		db.snapshot.compactSucceeded.Add(1)
+		if stats {
+			db.snapshot.compactSucceeded.Add(1)
+		}
 		db.snapshot.compactMissStreak.Store(0)
 		db.snapshot.compactSkipUntil.Store(0)
 		return true, false
@@ -2878,8 +2909,14 @@ func (db *DB[K, V]) pruneSnapshotsLocked() {
 	}
 }
 
-// SnapshotStats returns current snapshot stats.
+// SnapshotStats returns current snapshot and compactor diagnostics.
+//
+// Runtime snapshot/compactor counters are collected only when
+// Options.EnableSnapshotStats was enabled for this DB instance.
 func (db *DB[K, V]) SnapshotStats() SnapshotStats {
+	if !db.snapshot.statsEnabled {
+		return SnapshotStats{}
+	}
 	if !db.beginOpWait() {
 		return SnapshotStats{}
 	}
