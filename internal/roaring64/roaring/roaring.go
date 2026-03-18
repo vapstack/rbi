@@ -36,12 +36,12 @@ func (rb *Bitmap) RunOptimize() {
 
 // NewBitmap creates a new empty Bitmap.
 func NewBitmap() *Bitmap {
-	return &Bitmap{}
+	return acquireBitmap()
 }
 
 // New creates a new empty Bitmap.
 func New() *Bitmap {
-	return &Bitmap{}
+	return acquireBitmap()
 }
 
 // Clear resets the Bitmap to be logically empty.
@@ -249,9 +249,14 @@ func (rb *Bitmap) ManyIterator() ManyIntIterable {
 
 // Clone creates a copy of the Bitmap.
 func (rb *Bitmap) Clone() *Bitmap {
-	ptr := new(Bitmap)
-	ptr.highlowcontainer = *rb.highlowcontainer.clone()
+	ptr := acquireBitmap()
+	ptr.highlowcontainer.copyFrom(&rb.highlowcontainer)
 	return ptr
+}
+
+// ReleaseBitmap returns a bitmap allocated by this package back to the pool.
+func ReleaseBitmap(rb *Bitmap) {
+	releaseBitmap(rb)
 }
 
 // Minimum gets the smallest value stored in this bitmap.

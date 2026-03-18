@@ -2371,6 +2371,7 @@ func (db *DB[K, V]) execPlanOROrderKWay(q *qx.QX, branches plannerORBranches, tr
 	out := make([]K, 0, outCap)
 
 	seen := newU64Set(max(64, needWindow*2))
+	defer releaseU64Set(&seen)
 	skip := q.Offset
 	needOut := q.Limit
 	stopReason := "input_exhausted"
@@ -3319,6 +3320,7 @@ func (db *DB[K, V]) execPlanORNoOrderAdaptive(q *qx.QX, branches plannerORBranch
 	seen := u64set{}
 	if !useLinearSeen {
 		seen = newU64Set(max(64, need*2))
+		defer releaseU64Set(&seen)
 	}
 	topBuf := getUint64SliceBuf(need)
 	top := topBuf.values

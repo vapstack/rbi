@@ -156,9 +156,24 @@ func (rb *Bitmap) Iterator() IntPeekable64 {
 
 // Clone creates a copy of the Bitmap
 func (rb *Bitmap) Clone() *Bitmap {
-	ptr := new(Bitmap)
-	ptr.highlowcontainer = *rb.highlowcontainer.clone()
-	return ptr
+	return rb.CloneInto(NewBitmap())
+}
+
+// CloneInto overwrites dst with a deep copy of rb and returns dst.
+func (rb *Bitmap) CloneInto(dst *Bitmap) *Bitmap {
+	if dst == rb {
+		return dst
+	}
+	if dst == nil {
+		dst = NewBitmap()
+	}
+	if dst.highlowcontainer.aliases(&rb.highlowcontainer) {
+		tmp := rb.Clone()
+		dst.highlowcontainer = tmp.highlowcontainer
+		return dst
+	}
+	dst.highlowcontainer.copyFrom(&rb.highlowcontainer)
+	return dst
 }
 
 // Minimum get the smallest value stored in this roaring bitmap, assumes that it is not empty

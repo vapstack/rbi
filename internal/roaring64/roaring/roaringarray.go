@@ -122,15 +122,39 @@ func (ra *roaringArray) releaseContainersInRange(start int) {
 }
 
 func (ra *roaringArray) clone() *roaringArray {
-	sa := roaringArray{}
-	sa.keys = make([]uint16, len(ra.keys))
-	copy(sa.keys, ra.keys)
+	sa := new(roaringArray)
+	sa.copyFrom(ra)
+	return sa
+}
 
-	sa.containers = make([]container, len(ra.containers))
-	for i := range sa.containers {
-		sa.containers[i] = ra.containers[i].clone()
+func (ra *roaringArray) copyFrom(src *roaringArray) {
+	if ra == src {
+		return
 	}
-	return &sa
+
+	ra.releaseContainersInRange(0)
+
+	if len(src.keys) == 0 {
+		ra.keys = ra.keys[:0]
+		ra.containers = ra.containers[:0]
+		return
+	}
+
+	if cap(ra.keys) >= len(src.keys) {
+		ra.keys = ra.keys[:len(src.keys)]
+	} else {
+		ra.keys = make([]uint16, len(src.keys))
+	}
+	copy(ra.keys, src.keys)
+
+	if cap(ra.containers) >= len(src.containers) {
+		ra.containers = ra.containers[:len(src.containers)]
+	} else {
+		ra.containers = make([]container, len(src.containers))
+	}
+	for i := range src.containers {
+		ra.containers[i] = src.containers[i].clone()
+	}
 }
 
 func (ra *roaringArray) getContainer(x uint16) container {

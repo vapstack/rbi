@@ -352,7 +352,7 @@ func (db *DB[K, V]) buildLenIndex() {
 			lenMap[ln] = p
 		}
 
-		empty := db.universe.Clone()
+		empty := cloneBitmap(db.universe)
 		empty.AndNot(nonEmpty)
 		useZeroComplement := false
 		var nonEmptyPosting postingList
@@ -360,14 +360,17 @@ func (db *DB[K, V]) buildLenIndex() {
 			emptyCard := empty.GetCardinality()
 			nonEmptyCard := nonEmpty.GetCardinality()
 			if nonEmptyCard > 0 && nonEmptyCard < emptyCard {
-				nonEmptyPosting = postingFromBitmapOwned(nonEmpty.Clone())
+				nonEmptyPosting = postingFromBitmapOwned(cloneBitmap(nonEmpty))
 				useZeroComplement = !nonEmptyPosting.IsEmpty()
 			}
 		}
 		if useZeroComplement {
 			db.lenZeroComplement[name] = true
+			releaseRoaringBuf(empty)
 		} else if !empty.IsEmpty() {
 			lenMap[0] = postingFromBitmapViewAdaptive(empty)
+		} else {
+			releaseRoaringBuf(empty)
 		}
 
 		resultCap := len(lenMap)

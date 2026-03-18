@@ -8,7 +8,9 @@ import (
 
 const bitmapContainerWords = maxCapacity / 64
 
+var bitmapPool sync.Pool
 var bitmapContainerPool sync.Pool
+var runContainerPool sync.Pool
 
 var pooledArrayContainerCapacities = [...]int{
 	32,
@@ -30,6 +32,8 @@ var pooledArrayContainerCapacities = [...]int{
 // maxPooledArrayContainerCapacity limits which arrayContainer capacities are
 // returned to the pool.
 var maxPooledArrayContainerCapacity = 4 * arrayDefaultMaxSize
+
+const maxPooledRunContainerCapacity = 4 * arrayDefaultMaxSize
 
 var arrayContainerClassPools [len(pooledArrayContainerCapacities)]sync.Pool
 
@@ -75,6 +79,25 @@ func newBitmapContainer() *bitmapContainer {
 	}
 }
 
+func acquireBitmap() *Bitmap {
+	if v := bitmapPool.Get(); v != nil {
+		bitmapPoolStats.onGetHit()
+		return v.(*Bitmap)
+	}
+	bitmapPoolStats.onGetMiss()
+	return &Bitmap{}
+}
+
+func releaseBitmap(rb *Bitmap) {
+	if rb == nil {
+		bitmapPoolStats.onDropNil()
+		return
+	}
+	rb.highlowcontainer.clear()
+	bitmapPool.Put(rb)
+	bitmapPoolStats.onPut()
+}
+
 func releaseBitmapContainer(bc *bitmapContainer) {
 	if bc == nil {
 		bitmapContainerPoolStats.onDropNil()
@@ -88,6 +111,43 @@ func releaseBitmapContainer(bc *bitmapContainer) {
 	clear(bc.bitmap)
 	bitmapContainerPool.Put(bc)
 	bitmapContainerPoolStats.onPut()
+}
+
+func acquireRunContainer16(capHint, length int) *runContainer16 {
+	if capHint < length {
+		capHint = length
+	}
+	runContainerPoolStats.noteRequested(capHint)
+
+	if v := runContainerPool.Get(); v != nil {
+		rc := v.(*runContainer16)
+		if cap(rc.iv) >= capHint {
+			runContainerPoolStats.base.onGetHit()
+			rc.iv = rc.iv[:length]
+			return rc
+		}
+		runContainerPoolStats.base.onGetMiss()
+		rc.iv = make([]interval16, length, capHint)
+		return rc
+	}
+
+	runContainerPoolStats.base.onGetMiss()
+	return &runContainer16{iv: make([]interval16, length, capHint)}
+}
+
+func releaseRunContainer16(rc *runContainer16) {
+	if rc == nil {
+		runContainerPoolStats.base.onDropNil()
+		return
+	}
+	runContainerPoolStats.noteReturned(cap(rc.iv))
+	if cap(rc.iv) > maxPooledRunContainerCapacity {
+		runContainerPoolStats.base.onDropRejected()
+		return
+	}
+	rc.iv = rc.iv[:0]
+	runContainerPool.Put(rc)
+	runContainerPoolStats.base.onPut()
 }
 
 func newArrayContainer() *arrayContainer {
@@ -181,6 +241,8 @@ func replaceArrayContainerStorage(ac, donor *arrayContainer) {
 
 func releaseContainer(c container) {
 	switch x := c.(type) {
+	case *runContainer16:
+		releaseRunContainer16(x)
 	case *arrayContainer:
 		releaseArrayContainer(x)
 	case *bitmapContainer:

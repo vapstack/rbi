@@ -32,7 +32,8 @@ func cloneBitmap(src *roaring64.Bitmap) *roaring64.Bitmap {
 	if src == nil {
 		return getRoaringBuf()
 	}
-	return src.Clone()
+	dst := getRoaringBuf()
+	return src.CloneInto(dst)
 }
 
 func releaseRoaringBitmapIterator(it roaring64.IntPeekable64) {

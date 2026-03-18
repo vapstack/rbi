@@ -1,10 +1,28 @@
 package roaring64
 
-import "github.com/vapstack/rbi/internal/roaring64/roaring"
+import (
+	"unsafe"
+
+	"github.com/vapstack/rbi/internal/roaring64/roaring"
+)
 
 type roaringArray64 struct {
 	keys       []uint32
 	containers []*roaring.Bitmap
+}
+
+func (ra *roaringArray64) aliases(other *roaringArray64) bool {
+	if ra == nil || other == nil {
+		return false
+	}
+	return slicesShareBacking(ra.keys, other.keys) || slicesShareBacking(ra.containers, other.containers)
+}
+
+func slicesShareBacking[T any](a, b []T) bool {
+	if cap(a) == 0 || cap(b) == 0 {
+		return false
+	}
+	return unsafe.SliceData(a) == unsafe.SliceData(b)
 }
 
 // runOptimize compresses the element containers to minimize space consumed.
@@ -55,7 +73,7 @@ func (ra *roaringArray64) releaseBitmapsInRange(start int) {
 	}
 	for i := start; i < len(ra.containers); i++ {
 		if c := ra.containers[i]; c != nil {
-			c.Clear()
+			roaring.ReleaseBitmap(c)
 			ra.clearContainerAtIndex(i)
 		}
 	}
@@ -71,16 +89,39 @@ func (ra *roaringArray64) serializedSizeInBytes() uint64 {
 }
 
 func (ra *roaringArray64) clone() *roaringArray64 {
-	sa := roaringArray64{}
-	sa.keys = make([]uint32, len(ra.keys))
-	copy(sa.keys, ra.keys)
+	sa := new(roaringArray64)
+	sa.copyFrom(ra)
+	return sa
+}
 
-	sa.containers = make([]*roaring.Bitmap, len(ra.containers))
-	for i := range sa.containers {
-		sa.containers[i] = ra.containers[i].Clone()
+func (ra *roaringArray64) copyFrom(src *roaringArray64) {
+	if ra == src {
+		return
 	}
 
-	return &sa
+	ra.releaseBitmapsInRange(0)
+
+	if len(src.keys) == 0 {
+		ra.keys = ra.keys[:0]
+		ra.containers = ra.containers[:0]
+		return
+	}
+
+	if cap(ra.keys) >= len(src.keys) {
+		ra.keys = ra.keys[:len(src.keys)]
+	} else {
+		ra.keys = make([]uint32, len(src.keys))
+	}
+	copy(ra.keys, src.keys)
+
+	if cap(ra.containers) >= len(src.containers) {
+		ra.containers = ra.containers[:len(src.containers)]
+	} else {
+		ra.containers = make([]*roaring.Bitmap, len(src.containers))
+	}
+	for i := range src.containers {
+		ra.containers[i] = src.containers[i].Clone()
+	}
 }
 
 func (ra *roaringArray64) getContainer(x uint32) *roaring.Bitmap {
@@ -132,13 +173,13 @@ func (ra *roaringArray64) removeAtIndex(i int) {
 	ra.keys = ra.keys[:last]
 	ra.containers = ra.containers[:last]
 	if removed != nil {
-		removed.Clear()
+		roaring.ReleaseBitmap(removed)
 	}
 }
 
 func (ra *roaringArray64) setContainerAtIndex(i int, c *roaring.Bitmap) {
 	if old := ra.containers[i]; old != nil && old != c {
-		old.Clear()
+		roaring.ReleaseBitmap(old)
 	}
 	ra.containers[i] = c
 }
@@ -146,7 +187,7 @@ func (ra *roaringArray64) setContainerAtIndex(i int, c *roaring.Bitmap) {
 func (ra *roaringArray64) replaceKeyAndContainerAtIndex(i int, key uint32, c *roaring.Bitmap) {
 	ra.keys[i] = key
 	if old := ra.containers[i]; old != nil && old != c {
-		old.Clear()
+		roaring.ReleaseBitmap(old)
 	}
 	ra.containers[i] = c
 }

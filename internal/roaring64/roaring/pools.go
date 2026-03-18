@@ -8,7 +8,9 @@ import (
 
 const bitmapContainerWords = maxCapacity / 64
 
+var bitmapPool sync.Pool
 var bitmapContainerPool sync.Pool
+var runContainerPool sync.Pool
 
 var pooledArrayContainerCapacities = [...]int{
 	32,
@@ -30,6 +32,8 @@ var pooledArrayContainerCapacities = [...]int{
 // maxPooledArrayContainerCapacity limits which arrayContainer capacities are
 // returned to the pool.
 var maxPooledArrayContainerCapacity = 4 * arrayDefaultMaxSize
+
+const maxPooledRunContainerCapacity = 4 * arrayDefaultMaxSize
 
 var arrayContainerClassPools [len(pooledArrayContainerCapacities)]sync.Pool
 
@@ -73,6 +77,21 @@ func newBitmapContainer() *bitmapContainer {
 	}
 }
 
+func acquireBitmap() *Bitmap {
+	if v := bitmapPool.Get(); v != nil {
+		return v.(*Bitmap)
+	}
+	return new(Bitmap)
+}
+
+func releaseBitmap(rb *Bitmap) {
+	if rb == nil {
+		return
+	}
+	rb.highlowcontainer.clear()
+	bitmapPool.Put(rb)
+}
+
 func releaseBitmapContainer(bc *bitmapContainer) {
 	if bc == nil {
 		return
@@ -83,6 +102,35 @@ func releaseBitmapContainer(bc *bitmapContainer) {
 	bc.cardinality = 0
 	clear(bc.bitmap)
 	bitmapContainerPool.Put(bc)
+}
+
+func acquireRunContainer16(capHint, length int) *runContainer16 {
+	if capHint < length {
+		capHint = length
+	}
+
+	if v := runContainerPool.Get(); v != nil {
+		rc := v.(*runContainer16)
+		if cap(rc.iv) >= capHint {
+			rc.iv = rc.iv[:length]
+			return rc
+		}
+		rc.iv = make([]interval16, length, capHint)
+		return rc
+	}
+
+	return &runContainer16{iv: make([]interval16, length, capHint)}
+}
+
+func releaseRunContainer16(rc *runContainer16) {
+	if rc == nil {
+		return
+	}
+	if cap(rc.iv) > maxPooledRunContainerCapacity {
+		return
+	}
+	rc.iv = rc.iv[:0]
+	runContainerPool.Put(rc)
 }
 
 func newArrayContainer() *arrayContainer {
@@ -161,6 +209,8 @@ func replaceArrayContainerStorage(ac, donor *arrayContainer) {
 
 func releaseContainer(c container) {
 	switch x := c.(type) {
+	case *runContainer16:
+		releaseRunContainer16(x)
 	case *arrayContainer:
 		releaseArrayContainer(x)
 	case *bitmapContainer:

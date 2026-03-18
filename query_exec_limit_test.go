@@ -145,6 +145,58 @@ func TestPostingUnionIter_SmallUnionAvoidsDuplicates(t *testing.T) {
 	}
 }
 
+func TestPostingUnionIter_ReusesScratchWithoutStaleState(t *testing.T) {
+	posts := []postingList{
+		postingOf(1, 2, 5),
+		postingOf(2, 3),
+		postingOf(1, 4),
+		postingOf(6, 7, 8),
+	}
+
+	drain := func() []uint64 {
+		it := newPostingUnionIter(posts)
+		defer releaseRoaringIter(it)
+		var out []uint64
+		for it.HasNext() {
+			out = append(out, it.Next())
+		}
+		return out
+	}
+
+	first := drain()
+	second := drain()
+	want := []uint64{1, 2, 5, 3, 4, 6, 7, 8}
+	if !reflect.DeepEqual(first, want) {
+		t.Fatalf("first union mismatch: got=%v want=%v", first, want)
+	}
+	if !reflect.DeepEqual(second, want) {
+		t.Fatalf("second union mismatch: got=%v want=%v", second, want)
+	}
+}
+
+func TestPostingUnionIter_AllocsPerRunStaysLowAfterWarmup(t *testing.T) {
+	posts := []postingList{
+		postingOf(1, 2, 5),
+		postingOf(2, 3),
+		postingOf(1, 4),
+		postingOf(6, 7, 8),
+	}
+
+	warm := newPostingUnionIter(posts)
+	releaseRoaringIter(warm)
+
+	allocs := testing.AllocsPerRun(100, func() {
+		it := newPostingUnionIter(posts)
+		for it.HasNext() {
+			_ = it.Next()
+		}
+		releaseRoaringIter(it)
+	})
+	if allocs > 0.2 {
+		t.Fatalf("unexpected allocs per run: got=%v want<=0.2", allocs)
+	}
+}
+
 type orderBasicHighCardPrefixRec struct {
 	Score  float64 `db:"score"`
 	Email  string  `db:"email"`

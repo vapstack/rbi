@@ -2888,6 +2888,10 @@ func (db *DB[K, V]) buildRangeContains(
 	}
 
 	cleanup := func() {
+		if set != nil {
+			releaseU64Set(set)
+			set = nil
+		}
 		if bm != nil && !bmReadonly {
 			releaseRoaringBuf(bm)
 		}

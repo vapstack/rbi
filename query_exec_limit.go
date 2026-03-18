@@ -1,6 +1,8 @@
 package rbi
 
 import (
+	"sync"
+
 	"github.com/vapstack/qx"
 	"github.com/vapstack/rbi/internal/roaring64"
 )
@@ -1034,6 +1036,19 @@ type postingSmallUnionIter struct {
 	has   bool
 }
 
+type u64setPoolBuf struct {
+	keys []uint64
+	used []byte
+}
+
+var u64setPool = sync.Pool{
+	New: func() any { return new(u64setPoolBuf) },
+}
+
+var postingUnionIterPool = sync.Pool{
+	New: func() any { return new(postingUnionIter) },
+}
+
 func newPostingUnionIter(posts []postingList) roaringIter {
 	if len(posts) > 1 && len(posts) <= 3 {
 		return &postingSmallUnionIter{posts: posts}
@@ -1045,10 +1060,12 @@ func newPostingUnionIter(posts []postingList) roaringIter {
 	if capHint > 1024 {
 		capHint = 1024
 	}
-	return &postingUnionIter{
+	it := postingUnionIterPool.Get().(*postingUnionIter)
+	*it = postingUnionIter{
 		posts: posts,
 		seen:  newU64Set(capHint),
 	}
+	return it
 }
 
 func (u *postingSmallUnionIter) HasNext() bool {
@@ -1149,30 +1166,65 @@ func (u *postingUnionIter) Release() {
 		releaseRoaringIter(u.curIt)
 		u.curIt = nil
 	}
+	releaseU64Set(&u.seen)
 	u.posts = nil
 	u.i = 0
-	u.seen = u64set{}
 	u.next = 0
 	u.has = false
+	postingUnionIterPool.Put(u)
 }
 
 type u64set struct {
-	keys []uint64
-	used []byte
-	mask uint64
-	n    int
+	keys   []uint64
+	used   []byte
+	mask   uint64
+	n      int
+	pooled *u64setPoolBuf
 }
 
 func newU64Set(capHint int) u64set {
+	return getU64Set(capHint)
+}
+
+func getU64Set(capHint int) u64set {
 	n := 1
 	for n < capHint*2 {
 		n <<= 1
 	}
-	return u64set{
-		keys: make([]uint64, n),
-		used: make([]byte, n),
-		mask: uint64(n - 1),
+	buf := u64setPool.Get().(*u64setPoolBuf)
+	size := cap(buf.keys)
+	if size < n || size != cap(buf.used) {
+		buf.keys = make([]uint64, n)
+		buf.used = make([]byte, n)
+		size = n
 	}
+	return u64set{
+		keys:   buf.keys[:size],
+		used:   buf.used[:size],
+		mask:   uint64(size - 1),
+		pooled: buf,
+	}
+}
+
+func releaseU64Set(s *u64set) {
+	if s == nil {
+		return
+	}
+	buf := s.pooled
+	size := cap(s.keys)
+	if buf != nil {
+		if size > 0 && size == cap(s.used) && size <= u64SetPoolMaxCap {
+			clear(s.used[:size])
+			buf.keys = s.keys[:size]
+			buf.used = s.used[:size]
+			u64setPool.Put(buf)
+		} else {
+			buf.keys = nil
+			buf.used = nil
+			u64setPool.Put(buf)
+		}
+	}
+	*s = u64set{}
 }
 
 func (s *u64set) Add(x uint64) bool {
@@ -1215,20 +1267,26 @@ func (s *u64set) Len() int {
 }
 
 func (s *u64set) grow() {
-	oldK := s.keys
-	oldU := s.used
-
-	n := len(oldK) << 1
-	s.keys = make([]uint64, n)
-	s.used = make([]byte, n)
-	s.mask = uint64(n - 1)
+	old := &u64set{
+		keys:   s.keys,
+		used:   s.used,
+		mask:   s.mask,
+		n:      s.n,
+		pooled: s.pooled,
+	}
+	next := getU64Set(len(old.keys))
+	s.keys = next.keys
+	s.used = next.used
+	s.mask = next.mask
 	s.n = 0
+	s.pooled = next.pooled
 
-	for i := 0; i < len(oldK); i++ {
-		if oldU[i] != 0 {
-			_ = s.Add(oldK[i])
+	for i := 0; i < len(old.keys); i++ {
+		if old.used[i] != 0 {
+			_ = s.Add(old.keys[i])
 		}
 	}
+	releaseU64Set(old)
 }
 
 func mix64(x uint64) uint64 {

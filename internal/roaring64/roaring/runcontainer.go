@@ -947,15 +947,13 @@ func (rc *runContainer16) AsSlice() []uint16 {
 
 // newRunContainer16 creates an empty run container.
 func newRunContainer16() *runContainer16 {
-	return &runContainer16{}
+	return acquireRunContainer16(0, 0)
 }
 
 // newRunContainer16CopyIv creates a run container, initializing
 // with a copy of the supplied iv slice.
 func newRunContainer16CopyIv(iv []interval16) *runContainer16 {
-	rc := &runContainer16{
-		iv: make([]interval16, len(iv)),
-	}
+	rc := acquireRunContainer16(len(iv), len(iv))
 	copy(rc.iv, iv)
 	return rc
 }
