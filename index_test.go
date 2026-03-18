@@ -533,9 +533,9 @@ func TestIndexPersistence(t *testing.T) {
 		t.Fatalf("expected [1], got %v", ids)
 	}
 
-	st := db2.IndexStats()
+	st := db2.Stats()
 	if st.KeyCount != 2 {
-		t.Fatalf("expected IndexStats.KeyCount=2, got %d", st.KeyCount)
+		t.Fatalf("expected Stats.KeyCount=2, got %d", st.KeyCount)
 	}
 }
 
@@ -1395,7 +1395,7 @@ func TestRebuildIndex_StatsBlockUntilRebuildCompletes(t *testing.T) {
 		t.Fatal("expected rebuild to become active")
 	}
 
-	statsDone := make(chan IndexStats[uint64], 1)
+	statsDone := make(chan IndexStats, 1)
 	go func() {
 		statsDone <- db.IndexStats()
 	}()

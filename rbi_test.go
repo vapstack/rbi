@@ -3902,6 +3902,23 @@ func TestComponentAccessors_ExposePlannerCalibrationAndSnapshotDiagnostics(t *te
 		RowsExamined:  96,
 	})
 
+	st := db.Stats()
+	if st.KeyCount != 2 {
+		t.Fatalf("expected Stats.KeyCount=2, got %d", st.KeyCount)
+	}
+	if st.LastKey != 2 {
+		t.Fatalf("expected Stats.LastKey=2, got %d", st.LastKey)
+	}
+	if st.FieldCount == 0 {
+		t.Fatalf("expected Stats.FieldCount > 0")
+	}
+	if st.AutoBatchCount == 0 {
+		t.Fatalf("expected stats auto-batch count > 0")
+	}
+	if st.SnapshotTxID == 0 {
+		t.Fatalf("expected stats snapshot txID > 0")
+	}
+
 	idx := db.IndexStats()
 	if idx.EntryCount == 0 {
 		t.Fatalf("expected index diagnostics entry_count > 0")
@@ -3967,23 +3984,23 @@ func TestComponentAccessors_ExposePlannerCalibrationAndSnapshotDiagnostics(t *te
 	}
 }
 
-func TestIndexStats_PreservesIndexTimingFields(t *testing.T) {
+func TestStats_PreservesIndexTimingFields(t *testing.T) {
 	db, _ := openTempDBUint64(t)
 
-	db.indexStats.BuildTime = 123 * time.Millisecond
-	db.indexStats.BuildRPS = 456
-	db.indexStats.LoadTime = 789 * time.Millisecond
+	db.stats.BuildTime = 123 * time.Millisecond
+	db.stats.BuildRPS = 456
+	db.stats.LoadTime = 789 * time.Millisecond
 
-	st := db.IndexStats()
+	st := db.Stats()
 
-	if st.BuildTime != db.indexStats.BuildTime {
-		t.Fatalf("expected BuildTime=%v, got %v", db.indexStats.BuildTime, st.BuildTime)
+	if st.BuildTime != db.stats.BuildTime {
+		t.Fatalf("expected BuildTime=%v, got %v", db.stats.BuildTime, st.BuildTime)
 	}
-	if st.BuildRPS != db.indexStats.BuildRPS {
-		t.Fatalf("expected BuildRPS=%d, got %d", db.indexStats.BuildRPS, st.BuildRPS)
+	if st.BuildRPS != db.stats.BuildRPS {
+		t.Fatalf("expected BuildRPS=%d, got %d", db.stats.BuildRPS, st.BuildRPS)
 	}
-	if st.LoadTime != db.indexStats.LoadTime {
-		t.Fatalf("expected LoadTime=%v, got %v", db.indexStats.LoadTime, st.LoadTime)
+	if st.LoadTime != db.stats.LoadTime {
+		t.Fatalf("expected LoadTime=%v, got %v", db.stats.LoadTime, st.LoadTime)
 	}
 }
 
@@ -4006,6 +4023,14 @@ func TestComponentAccessors(t *testing.T) {
 		EstimatedRows: 64,
 		RowsExamined:  96,
 	})
+
+	st := db.Stats()
+	if st.KeyCount != 2 {
+		t.Fatalf("expected Stats.KeyCount=2, got %d", st.KeyCount)
+	}
+	if st.SnapshotTxID == 0 {
+		t.Fatalf("expected Stats.Snapshot.TxID > 0")
+	}
 
 	idx := db.IndexStats()
 	if idx.Size == 0 {

@@ -630,6 +630,7 @@ func New[K ~uint64 | ~string, V any](bolt *bbolt.DB, options Options, execOpts .
 	for name := range db.fields {
 		db.fieldSlice = append(db.fieldSlice, name)
 	}
+	db.stats.FieldCount = len(db.fieldSlice)
 	db.publishSnapshotNoLock(db.currentBoltTxID())
 
 	if err = db.RefreshPlannerStats(); err != nil {
@@ -874,7 +875,7 @@ type (
 		closed atomic.Bool
 		broken atomic.Bool
 
-		indexStats IndexStats[K]
+		stats Stats[K]
 
 		traceRoot *DB[K, V]
 		testHooks testHooks
@@ -923,22 +924,47 @@ type (
 		Samples map[string]uint64
 	}
 
-	// IndexStats contains index build/load timings and current index shape metrics.
-	IndexStats[K ~uint64 | ~string] struct {
-		// IndexBuildTime is the duration of the last index rebuild.
+	// Stats is a lightweight database status snapshot.
+	Stats[K ~uint64 | ~string] struct {
+		// BuildTime is the duration of the last index rebuild.
 		BuildTime time.Duration
-		// IndexBuildRPS is an approximate throughput (records per second) of the last index rebuild.
+		// BuildRPS is an approximate throughput (records per second) of the last index rebuild.
 		BuildRPS int
-		// IndexLoadTime is the time spent loading a persisted index from disk on the last successful load.
+		// LoadTime is the time spent loading a persisted index from disk on the last successful load.
 		LoadTime time.Duration
 
-		// LastKey is the largest key present in the database according to the
-		// current universe bitmap. For string keys this is derived from the
-		// internal string mapping.
+		// LastKey is the largest live key according to the current universe bitmap.
+		// For string keys this is resolved through the internal string mapping, so
+		// it reflects the highest live internal string index rather than the
+		// lexicographically greatest key.
 		LastKey K
 		// KeyCount is the total number of keys currently present in the database.
 		KeyCount uint64
 
+		// FieldCount is the number of indexed fields configured for this DB.
+		FieldCount int
+
+		// AutoBatchQueueLen is the current pending request count.
+		AutoBatchQueueLen int
+		// AutoBatchQueueMax is the maximum observed queue length.
+		AutoBatchQueueMax uint64
+		// AutoBatchCount is the total executed auto-batcher transaction count.
+		AutoBatchCount uint64
+		// AutoBatchAvgSize is the average requests per executed batch.
+		AutoBatchAvgSize float64
+
+		// SnapshotHasDelta reports whether snapshot contains any delta state.
+		SnapshotHasDelta bool
+		// SnapshotIndexLayerDepth is depth of index delta layer chain.
+		SnapshotIndexLayerDepth int
+		// SnapshotLenLayerDepth is depth of length-index delta layer chain.
+		SnapshotLenLayerDepth int
+		// SnapshotTxID is the transaction ID of the published snapshot.
+		SnapshotTxID uint64
+	}
+
+	// IndexStats contains expensive index shape and memory diagnostics.
+	IndexStats struct {
 		// UniqueFieldKeys contains the number of unique index keys per indexed field name.
 		UniqueFieldKeys map[string]uint64
 		// IndexSize contains the total size of the index, in bytes.
@@ -949,9 +975,6 @@ type (
 		FieldKeyBytes map[string]uint64
 		// IndexFieldTotalCardinality contains sum of posting-list cardinalities per field.
 		FieldTotalCardinality map[string]uint64
-
-		// FieldCount is the number of indexed fields in the current snapshot.
-		FieldCount int
 
 		// EntryCount is the total number of non-empty index entries across fields.
 		EntryCount uint64
@@ -1318,39 +1341,127 @@ func (db *DB[K, V]) RebuildIndex() error {
 	return nil
 }
 
-// IndexStats returns current index shape, size, and build/load timing stats.
-//
-// On large databases this can be expensive.
+// Stats returns a lightweight database status snapshot.
 //
 // If the DB is unavailable or already closed and the method cannot enter an
 // operation window, it returns a zero value.
-func (db *DB[K, V]) IndexStats() IndexStats[K] {
+func (db *DB[K, V]) Stats() Stats[K] {
 	if !db.beginOpWait() {
-		return IndexStats[K]{}
+		return Stats[K]{}
 	}
 	defer db.endOp()
 
 	snap := db.getSnapshot()
 
-	// Preserve persistent index timings captured during build/load, while
-	// recalculating shape/size diagnostics from the current snapshot.
 	db.mu.RLock()
-	idx := db.indexStats
+	out := db.stats
 	db.mu.RUnlock()
+
+	out.KeyCount = snap.universeCardinality()
+	out.LastKey = db.statsLastKeyFromSnapshot(snap, out.KeyCount)
+
+	db.autoBatcher.mu.Lock()
+	out.AutoBatchQueueLen = len(db.autoBatcher.queue)
+	db.autoBatcher.mu.Unlock()
+	out.AutoBatchQueueMax = db.autoBatcher.queueHighWater.Load()
+
+	out.AutoBatchCount = db.autoBatcher.executedBatches.Load()
+	if out.AutoBatchCount > 0 {
+		out.AutoBatchAvgSize = float64(db.autoBatcher.dequeued.Load()) / float64(out.AutoBatchCount)
+	}
+
+	out.SnapshotTxID = snap.txID
+	out.SnapshotHasDelta = snap.hasAnyDeltaState()
+	if snap.indexLayer != nil {
+		out.SnapshotIndexLayerDepth = snap.indexLayer.depth
+	}
+	if snap.lenLayer != nil {
+		out.SnapshotLenLayerDepth = snap.lenLayer.depth
+	}
+
+	return out
+}
+
+func (db *DB[K, V]) statsLastKeyFromSnapshot(snap *indexSnapshot, keyCount uint64) K {
+	var zero K
+	if snap == nil || keyCount == 0 {
+		return zero
+	}
+
+	var maxIdx uint64
+	switch {
+	case snap.universeAdd == nil || snap.universeAdd.IsEmpty():
+		if snap.universe == nil || snap.universe.IsEmpty() {
+			return zero
+		}
+		if snap.universeRem == nil || snap.universeRem.IsEmpty() || !snap.universeRem.Contains(snap.universe.Maximum()) {
+			maxIdx = snap.universe.Maximum()
+			return db.statsKeyFromIdx(snap, maxIdx)
+		}
+		fallthrough
+	default:
+		universe := getRoaringBuf()
+		defer releaseRoaringBuf(universe)
+		if snap.universe != nil && !snap.universe.IsEmpty() {
+			universe.Or(snap.universe)
+		}
+		if snap.universeAdd != nil && !snap.universeAdd.IsEmpty() {
+			universe.Or(snap.universeAdd)
+		}
+		if snap.universeRem != nil && !snap.universeRem.IsEmpty() {
+			universe.AndNot(snap.universeRem)
+		}
+		if universe.IsEmpty() {
+			return zero
+		}
+		maxIdx = universe.Maximum()
+	}
+
+	return db.statsKeyFromIdx(snap, maxIdx)
+}
+
+func (db *DB[K, V]) statsKeyFromIdx(snap *indexSnapshot, idx uint64) K {
+	var zero K
+	if db.strkey {
+		if snap == nil || snap.strmap == nil {
+			return zero
+		}
+		if key, ok := snap.strmap.getStringNoLock(idx); ok {
+			return *(*K)(unsafe.Pointer(&key))
+		}
+		return zero
+	}
+	return *(*K)(unsafe.Pointer(&idx))
+}
+
+// IndexStats returns current expensive index shape and memory diagnostics.
+//
+// On large databases this can be expensive.
+//
+// If the DB is unavailable or already closed and the method cannot enter an
+// operation window, it returns a zero value.
+func (db *DB[K, V]) IndexStats() IndexStats {
+	if !db.beginOpWait() {
+		return IndexStats{}
+	}
+	defer db.endOp()
+
+	snap := db.getSnapshot()
+
+	idx := IndexStats{
+		UniqueFieldKeys:       make(map[string]uint64),
+		FieldSize:             make(map[string]uint64),
+		FieldKeyBytes:         make(map[string]uint64),
+		FieldTotalCardinality: make(map[string]uint64),
+	}
 	idx.Size = 0
-	idx.FieldCount = 0
 	idx.EntryCount = 0
 	idx.KeyBytes = 0
 	idx.BitmapCardinality = 0
 	idx.ApproxStructBytes = 0
 	idx.ApproxHeapBytes = 0
-	idx.UniqueFieldKeys = make(map[string]uint64)
-	idx.FieldSize = make(map[string]uint64)
-	idx.FieldKeyBytes = make(map[string]uint64)
-	idx.FieldTotalCardinality = make(map[string]uint64)
 
 	fields := snap.fieldNameSet()
-	idx.FieldCount = len(fields)
 
 	scratch := getRoaringBuf()
 	defer releaseRoaringBuf(scratch)
@@ -1414,28 +1525,6 @@ func (db *DB[K, V]) IndexStats() IndexStats[K] {
 	}
 	idx.ApproxStructBytes = idx.EntryCount * uint64(unsafe.Sizeof(index{}))
 	idx.ApproxHeapBytes = idx.Size + idx.KeyBytes + idx.ApproxStructBytes
-
-	universe := roaring64.NewBitmap()
-	if snap.universe != nil && !snap.universe.IsEmpty() {
-		universe.Or(snap.universe)
-	}
-	if snap.universeAdd != nil && !snap.universeAdd.IsEmpty() {
-		universe.Or(snap.universeAdd)
-	}
-	if snap.universeRem != nil && !snap.universeRem.IsEmpty() {
-		universe.AndNot(snap.universeRem)
-	}
-	idx.KeyCount = universe.GetCardinality()
-	if idx.KeyCount > 0 {
-		maxIdx := universe.Maximum()
-		if db.strkey {
-			if key, ok := snap.strmap.getStringNoLock(maxIdx); ok {
-				idx.LastKey = *(*K)(unsafe.Pointer(&key))
-			}
-		} else {
-			idx.LastKey = *(*K)(unsafe.Pointer(&maxIdx))
-		}
-	}
 	return idx
 }
 

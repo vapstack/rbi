@@ -228,8 +228,8 @@ func (db *DB[K, V]) buildIndex(skipFields map[string]struct{}) error {
 	}
 	recordCount := db.universe.GetCardinality()
 
-	db.indexStats.BuildTime = time.Since(start)
-	db.indexStats.BuildRPS = int(float64(recordCount) / max(time.Since(start).Seconds(), 1))
+	db.stats.BuildTime = time.Since(start)
+	db.stats.BuildRPS = int(float64(recordCount) / max(time.Since(start).Seconds(), 1))
 
 	db.buildLenIndex()
 	db.lenIndexLoaded = false
@@ -483,7 +483,7 @@ func (db *DB[K, V]) loadIndex() (skipFields map[string]struct{}, err error) {
 	}
 
 	db.lenIndexLoaded = lenLoaded
-	db.indexStats.LoadTime = time.Since(start)
+	db.stats.LoadTime = time.Since(start)
 	db.publishSnapshotNoLock(db.currentBoltTxID())
 	forceMemoryCleanup(true)
 

@@ -689,13 +689,13 @@ func TestTruncate(t *testing.T) {
 		t.Fatalf("expected no keys after truncate, got %v", ids)
 	}
 
-	st := db.IndexStats()
+	st := db.Stats()
 	if st.KeyCount != 0 {
-		t.Fatalf("expected IndexStats.KeyCount=0 after truncate, got %d", st.KeyCount)
+		t.Fatalf("expected Stats.KeyCount=0 after truncate, got %d", st.KeyCount)
 	}
 	var zero uint64
 	if st.LastKey != zero {
-		t.Fatalf("expected IndexStats.LastKey=%v after truncate, got %v", zero, st.LastKey)
+		t.Fatalf("expected Stats.LastKey=%v after truncate, got %v", zero, st.LastKey)
 	}
 
 	if err := db.Set(10, &UniqueTestRec{Email: "a@x", Code: 1}); err != nil {
