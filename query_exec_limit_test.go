@@ -175,6 +175,10 @@ func TestPostingUnionIter_ReusesScratchWithoutStaleState(t *testing.T) {
 }
 
 func TestPostingUnionIter_AllocsPerRunStaysLowAfterWarmup(t *testing.T) {
+	if testRaceEnabled {
+		t.Skip("testing.AllocsPerRun is not stable under -race")
+	}
+
 	posts := []postingList{
 		postingOf(1, 2, 5),
 		postingOf(2, 3),

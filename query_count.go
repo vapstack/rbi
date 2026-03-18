@@ -1321,15 +1321,19 @@ func countBroadRangeComplementMaxCardinality(leadProbeEst, universe uint64) uint
 	return limit
 }
 
-func shouldUseFastCountBroadRangeComplementMaterialization(probe []postingList, est uint64) bool {
-	if len(probe) < countPredBroadRangeComplementFastProbeMin || est == 0 {
+func shouldUseFastCountBroadRangeComplementMaterializationForShape(probeLen int, est uint64) bool {
+	if probeLen < countPredBroadRangeComplementFastProbeMin || est == 0 {
 		return false
 	}
-	avgPerBucket := est / uint64(len(probe))
+	avgPerBucket := est / uint64(probeLen)
 	if avgPerBucket == 0 {
 		avgPerBucket = 1
 	}
 	return avgPerBucket <= countPredBroadRangeComplementFastAvgPerBucketMax
+}
+
+func shouldUseFastCountBroadRangeComplementMaterialization(probe []postingList, est uint64) bool {
+	return shouldUseFastCountBroadRangeComplementMaterializationForShape(len(probe), est)
 }
 
 func countBaseIndexRangeCardinality(s []index, start, end int) uint64 {
@@ -1520,45 +1524,28 @@ func (db *DB[K, V]) tryMaterializeBroadRangeComplementPredicateForCount(p *predi
 		return true
 	}
 
-	complementBuf := getPostingListSliceBuf(max(outBuckets, 8))
-	complement := complementBuf.values[:0]
-	defer func() {
-		complementBuf.values = complement
-		releasePostingListSliceBuf(complementBuf)
-	}()
-
-	complementEst := uint64(0)
-	appendComplement := func(ids postingList) {
-		if ids.IsEmpty() {
-			return
-		}
-		complement = append(complement, ids)
-		card := ids.Cardinality()
-		if ^uint64(0)-complementEst < card {
-			complementEst = ^uint64(0)
-		} else {
-			complementEst += card
-		}
-	}
-	for i := 0; i < start; i++ {
-		appendComplement(s[i].IDs)
-	}
-	for i := end; i < len(s); i++ {
-		appendComplement(s[i].IDs)
-	}
+	complementProbe := newBaseRangeProbe(s, start, end, true)
+	complementEst := complementProbe.probeEst
 	if complementEst == 0 || complementEst > countBroadRangeComplementMaxCardinality(leadProbeEst, universe) {
 		return false
 	}
-	if tryPrepareCountBroadRangeComplementPostingPredicate(p, complement) {
-		return true
+	if complementProbe.probeLen > 0 && complementProbe.probeLen <= countPredBroadRangeComplementPostingMaxBuckets {
+		complement := make([]postingList, 0, complementProbe.probeLen)
+		complementProbe.forEachPosting(func(ids postingList) bool {
+			complement = append(complement, ids)
+			return true
+		})
+		if tryPrepareCountBroadRangeComplementPostingPredicate(p, complement) {
+			return true
+		}
 	}
 
 	var bm *roaring64.Bitmap
-	fastBuild := cacheKey != "" && shouldUseFastCountBroadRangeComplementMaterialization(complement, complementEst)
+	fastBuild := cacheKey != "" && shouldUseFastCountBroadRangeComplementMaterializationForShape(complementProbe.probeLen, complementEst)
 	if fastBuild {
-		bm = materializeProbeFast(complement)
+		bm = materializeBaseRangeProbeFast(complementProbe)
 	} else {
-		bm = db.materializeProbeUnion(complement)
+		bm = db.materializeBaseRangeProbeUnion(complementProbe)
 	}
 	if bm == nil || bm.IsEmpty() {
 		if bm != nil {

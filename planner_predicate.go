@@ -2597,53 +2597,7 @@ func (db *DB[K, V]) buildPredRangeWithMode(e qx.Expr, fm *field, slice *[]index,
 		est = uint64(inBuckets)
 	}
 
-	probeCap := inBuckets
-	if useComplement {
-		probeCap = outBuckets
-	}
-	probeBuf := getPostingListSliceBuf(max(probeCap, 8))
-	probe := probeBuf.values[:0]
-	probeEst := uint64(0)
-
-	if useComplement {
-		for i := 0; i < start; i++ {
-			ids := s[i].IDs
-			if !ids.IsEmpty() {
-				probe = append(probe, ids)
-				card := ids.Cardinality()
-				if ^uint64(0)-probeEst < card {
-					probeEst = ^uint64(0)
-				} else {
-					probeEst += card
-				}
-			}
-		}
-		for i := end; i < len(s); i++ {
-			ids := s[i].IDs
-			if !ids.IsEmpty() {
-				probe = append(probe, ids)
-				card := ids.Cardinality()
-				if ^uint64(0)-probeEst < card {
-					probeEst = ^uint64(0)
-				} else {
-					probeEst += card
-				}
-			}
-		}
-	} else {
-		for i := start; i < end; i++ {
-			ids := s[i].IDs
-			if !ids.IsEmpty() {
-				probe = append(probe, ids)
-				card := ids.Cardinality()
-				if ^uint64(0)-probeEst < card {
-					probeEst = ^uint64(0)
-				} else {
-					probeEst += card
-				}
-			}
-		}
-	}
+	probe := newBaseRangeProbe(s, start, end, useComplement)
 
 	var onMaterialized func(*roaring64.Bitmap) bool
 	if cacheKey != "" && !useComplement {
@@ -2651,38 +2605,16 @@ func (db *DB[K, V]) buildPredRangeWithMode(e qx.Expr, fm *field, slice *[]index,
 			return db.tryShareMaterializedPred(cacheKey, bm)
 		}
 	}
-	containsInRange, cleanupRange := db.buildRangeContains(probe, useComplement, probeEst, onMaterialized)
-	bucketCountMaxProbe := rangeBucketCountMaxProbeForShape(len(probe), est)
+	containsInRange, cleanupRange := db.buildRangeContains(probe, onMaterialized)
+	bucketCountMaxProbe := rangeBucketCountMaxProbeForShape(probe.probeLen, est)
 	cleanup := func() {
 		if cleanupRange != nil {
 			cleanupRange()
 		}
-		probeBuf.values = probe
-		releasePostingListSliceBuf(probeBuf)
 	}
 
 	countInRange := func(bucket *roaring64.Bitmap) (uint64, bool) {
-		if bucket == nil || bucket.IsEmpty() {
-			return 0, true
-		}
-		if len(probe) > bucketCountMaxProbe {
-			return 0, false
-		}
-
-		var hit uint64
-		for _, ids := range probe {
-			hit += ids.AndCardinalityBitmap(bucket)
-		}
-
-		if !useComplement {
-			return hit, true
-		}
-
-		bc := bucket.GetCardinality()
-		if hit >= bc {
-			return 0, true
-		}
-		return bc - hit, true
+		return probe.countBucket(bucket, bucketCountMaxProbe)
 	}
 
 	if e.Not {
@@ -2718,6 +2650,119 @@ func (db *DB[K, V]) buildPredRangeWithMode(e qx.Expr, fm *field, slice *[]index,
 		},
 		cleanup: cleanup,
 	}, true
+}
+
+type baseRangeProbe struct {
+	s              []index
+	start          int
+	end            int
+	useComplement  bool
+	probeLen       int
+	probeEst       uint64
+	singletonCount int
+}
+
+func newBaseRangeProbe(s []index, start, end int, useComplement bool) baseRangeProbe {
+	p := baseRangeProbe{
+		s:             s,
+		start:         start,
+		end:           end,
+		useComplement: useComplement,
+	}
+	p.scanStats()
+	return p
+}
+
+func (p *baseRangeProbe) scanStats() {
+	if p == nil {
+		return
+	}
+	p.forEachPosting(func(ids postingList) bool {
+		p.probeLen++
+		card := ids.Cardinality()
+		if card == 1 {
+			p.singletonCount++
+		}
+		if ^uint64(0)-p.probeEst < card {
+			p.probeEst = ^uint64(0)
+		} else {
+			p.probeEst += card
+		}
+		return true
+	})
+}
+
+func (p baseRangeProbe) forEachPosting(fn func(postingList) bool) bool {
+	if p.useComplement {
+		for i := 0; i < p.start; i++ {
+			if ids := p.s[i].IDs; !ids.IsEmpty() {
+				if !fn(ids) {
+					return false
+				}
+			}
+		}
+		for i := p.end; i < len(p.s); i++ {
+			if ids := p.s[i].IDs; !ids.IsEmpty() {
+				if !fn(ids) {
+					return false
+				}
+			}
+		}
+		return true
+	}
+
+	for i := p.start; i < p.end; i++ {
+		if ids := p.s[i].IDs; !ids.IsEmpty() {
+			if !fn(ids) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func (p baseRangeProbe) linearContains(idx uint64) bool {
+	hit := false
+	p.forEachPosting(func(ids postingList) bool {
+		if ids.Contains(idx) {
+			hit = true
+			return false
+		}
+		return true
+	})
+	return hit
+}
+
+func (p baseRangeProbe) countBucket(bucket *roaring64.Bitmap, maxProbe int) (uint64, bool) {
+	if bucket == nil || bucket.IsEmpty() {
+		return 0, true
+	}
+	if p.probeLen > maxProbe {
+		return 0, false
+	}
+
+	var hit uint64
+	p.forEachPosting(func(ids postingList) bool {
+		hit += ids.AndCardinalityBitmap(bucket)
+		return true
+	})
+
+	if !p.useComplement {
+		return hit, true
+	}
+
+	bc := bucket.GetCardinality()
+	if hit >= bc {
+		return 0, true
+	}
+	return bc - hit, true
+}
+
+func (p baseRangeProbe) singletonHeavy(minProbe int) bool {
+	if p.probeLen < minProbe || p.probeLen == 0 {
+		return false
+	}
+	return p.singletonCount*4 >= p.probeLen*3
 }
 
 func materializedRangePredicateReadonly(e qx.Expr, bm *roaring64.Bitmap) predicate {
@@ -2790,43 +2835,35 @@ func materializedRangePredicateWithMode(e qx.Expr, bm *roaring64.Bitmap, readonl
 // The checker starts cheap (linear Contains over probe buckets) and upgrades
 // to hash/bitmap materialization only after enough repeated calls.
 func (db *DB[K, V]) buildRangeContains(
-	probe []postingList,
-	invert bool,
-	est uint64,
+	probe baseRangeProbe,
 	onMaterialized func(*roaring64.Bitmap) bool,
 ) (func(uint64) bool, func()) {
-	if len(probe) == 0 {
-		if invert {
+	if probe.probeLen == 0 {
+		if probe.useComplement {
 			return func(uint64) bool { return true }, nil
 		}
 		return func(uint64) bool { return false }, nil
 	}
-	linearContainsMax := rangeLinearContainsLimit(len(probe), est)
-	materializeAfter := rangeMaterializeAfterForProbe(len(probe), est)
-	hashSetBucketsMin := rangeHashSetBucketsMinForProbe(len(probe), est)
-	hashSetMaxCard := rangeHashSetMaxCardForProbe(len(probe), est)
-	fastSinglesMinProbe := rangeFastSinglesMinProbeForShape(len(probe), est)
-	singleSampleN := rangeSingletonProbeSampleSize(len(probe))
+	linearContainsMax := rangeLinearContainsLimit(probe.probeLen, probe.probeEst)
+	materializeAfter := rangeMaterializeAfterForProbe(probe.probeLen, probe.probeEst)
+	hashSetBucketsMin := rangeHashSetBucketsMinForProbe(probe.probeLen, probe.probeEst)
+	hashSetMaxCard := rangeHashSetMaxCardForProbe(probe.probeLen, probe.probeEst)
+	fastSinglesMinProbe := rangeFastSinglesMinProbeForShape(probe.probeLen, probe.probeEst)
 
 	linearContains := func(idx uint64) bool {
-		for _, p := range probe {
-			if p.Contains(idx) {
-				return true
-			}
-		}
-		return false
+		return probe.linearContains(idx)
 	}
 
 	project := func(hit bool) bool {
 		// Invert is projected at the very end so all internal heuristics operate
 		// on the same positive-hit semantics.
-		if invert {
+		if probe.useComplement {
 			return !hit
 		}
 		return hit
 	}
 
-	if len(probe) <= linearContainsMax {
+	if probe.probeLen <= linearContainsMax {
 		return func(idx uint64) bool {
 			return project(linearContains(idx))
 		}, nil
@@ -2851,31 +2888,32 @@ func (db *DB[K, V]) buildRangeContains(
 		if calls >= materializeAfter {
 			// Hash-set representation wins when estimated cardinality is bounded;
 			// it avoids the high constant factor of huge roaring unions.
-			if len(probe) >= hashSetBucketsMin && est > 0 && est <= hashSetMaxCard {
-				capHint := int(est)
+			if probe.probeLen >= hashSetBucketsMin && probe.probeEst > 0 && probe.probeEst <= hashSetMaxCard {
+				capHint := int(probe.probeEst)
 				if capHint < 64 {
 					capHint = 64
 				}
 				hs := newU64Set(capHint)
-				for _, b := range probe {
+				probe.forEachPosting(func(b postingList) bool {
 					b.ForEach(func(v uint64) bool {
 						hs.Add(v)
 						return true
 					})
-				}
+					return true
+				})
 				set = &hs
 				return project(set.Has(idx))
 			}
 
-			if len(probe) > linearContainsMax {
+			if probe.probeLen > linearContainsMax {
 				// High-card ranges (e.g. score>=X on dense numeric fields) are
 				// often represented by a huge number of singleton buckets.
 				// Materializing such probes via OR across all buckets is expensive.
 				// Fast-path singleton-heavy probes through batched AddMany.
-				if isSingletonHeavyProbe(probe, fastSinglesMinProbe, singleSampleN) {
-					bm = materializeProbeFast(probe)
+				if probe.singletonHeavy(fastSinglesMinProbe) {
+					bm = materializeBaseRangeProbeFast(probe)
 				} else {
-					bm = db.materializeProbeUnion(probe)
+					bm = db.materializeBaseRangeProbeUnion(probe)
 				}
 				if bm != nil && onMaterialized != nil {
 					bmReadonly = onMaterialized(bm)
@@ -2898,6 +2936,71 @@ func (db *DB[K, V]) buildRangeContains(
 	}
 
 	return contains, cleanup
+}
+
+func materializeBaseRangeProbeFast(probe baseRangeProbe) *roaring64.Bitmap {
+	out := getRoaringBuf()
+	singles := getSingleIDsBuf()
+	defer releaseSingleIDs(singles)
+
+	flushSingles := func() {
+		if len(singles.values) == 0 {
+			return
+		}
+		out.AddMany(singles.values)
+		singles.values = singles.values[:0]
+	}
+
+	probe.forEachPosting(func(p postingList) bool {
+		if p.Cardinality() == 1 {
+			id, _ := p.Minimum()
+			singles.values = append(singles.values, id)
+			if len(singles.values) == cap(singles.values) {
+				flushSingles()
+			}
+			return true
+		}
+
+		flushSingles()
+		p.OrInto(out)
+		return true
+	})
+	flushSingles()
+	return out
+}
+
+func (db *DB[K, V]) materializeBaseRangeProbeUnion(probe baseRangeProbe) *roaring64.Bitmap {
+	bmBuf := getRoaringSliceBuf(probe.probeLen)
+	bitmaps := bmBuf.values
+	singles := getSingleIDsBuf()
+	defer releaseSingleIDs(singles)
+
+	probe.forEachPosting(func(p postingList) bool {
+		if p.isSingleton() {
+			singles.values = append(singles.values, p.single)
+			return true
+		}
+		bitmaps = append(bitmaps, p.bitmap())
+		return true
+	})
+
+	var out *roaring64.Bitmap
+	switch len(bitmaps) {
+	case 0:
+		out = getRoaringBuf()
+	case 1:
+		out = getRoaringBuf()
+		out.Or(bitmaps[0])
+	default:
+		out = db.unionBitmaps(bitmaps)
+	}
+	if len(singles.values) > 0 {
+		out.AddMany(singles.values)
+	}
+
+	bmBuf.values = bitmaps
+	releaseRoaringSliceBuf(bmBuf)
+	return out
 }
 
 func isSingletonHeavyProbe(probe []postingList, minProbe int, sampleN int) bool {
