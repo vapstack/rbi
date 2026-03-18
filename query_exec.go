@@ -758,7 +758,8 @@ func (db *DB[K, V]) scanOrderLimitWithPredicates(q *qx.QX, ov fieldOverlay, br o
 			return bm, false, false, false
 		}
 
-		mode, exactBM, _ := plannerFilterBitmapByChecks(preds, exactActive, bm, exactWork, cursor.skip > 0)
+		allowExact := plannerAllowOrderedExactBitmapFilter(cursor.skip, cursor.need, card, exactOnly, len(exactActive))
+		mode, exactBM, _ := plannerFilterBitmapByChecks(preds, exactActive, bm, exactWork, allowExact)
 		switch mode {
 		case plannerPredicateBucketEmpty:
 			examined += card

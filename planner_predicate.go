@@ -28,6 +28,10 @@ type predicate struct {
 
 	// exact bucket match count when known; ok=false means unknown.
 	bucketCount func(*roaring64.Bitmap) (uint64, bool)
+	// exact bitmap application when available without full predicate
+	// materialization.
+	bitmapFilter      func(*roaring64.Bitmap) bool
+	bitmapFilterCheap bool
 
 	cleanup func()
 }
@@ -105,7 +109,7 @@ func (p predicate) supportsBitmapFilter() bool {
 		}
 		return true
 	default:
-		return false
+		return p.bitmapFilter != nil
 	}
 }
 
@@ -331,6 +335,9 @@ func (p predicate) applyToBitmap(dst *roaring64.Bitmap) bool {
 		return true
 	}
 
+	if p.bitmapFilter != nil {
+		return p.bitmapFilter(dst)
+	}
 	return false
 }
 
@@ -1288,6 +1295,15 @@ func (db *DB[K, V]) buildPredRangeCandidateWithMode(e qx.Expr, fm *field, ov fie
 	}
 
 	var (
+		bitmapFilter      func(*roaring64.Bitmap) bool
+		bitmapFilterCheap bool
+	)
+	if filter, cheap, ok := buildOverlayNumericRangeBitmapFilter(e, fm, ov, br); ok {
+		bitmapFilter = filter
+		bitmapFilterCheap = cheap
+	}
+
+	var (
 		once sync.Once
 		bm   *roaring64.Bitmap
 		ro   bool
@@ -1329,7 +1345,9 @@ func (db *DB[K, V]) buildPredRangeCandidateWithMode(e qx.Expr, fm *field, ov fie
 			contains: func(idx uint64) bool {
 				return !contains(idx)
 			},
-			cleanup: cleanup,
+			bitmapFilter:      bitmapFilter,
+			bitmapFilterCheap: bitmapFilterCheap,
+			cleanup:           cleanup,
 		}, true
 	}
 
@@ -1342,9 +1360,11 @@ func (db *DB[K, V]) buildPredRangeCandidateWithMode(e qx.Expr, fm *field, ov fie
 			itMu.Unlock()
 			return it
 		},
-		contains: contains,
-		estCard:  est,
-		cleanup:  cleanup,
+		contains:          contains,
+		estCard:           est,
+		bitmapFilter:      bitmapFilter,
+		bitmapFilterCheap: bitmapFilterCheap,
+		cleanup:           cleanup,
 	}, true
 }
 
@@ -2600,6 +2620,7 @@ func (db *DB[K, V]) buildPredRangeWithMode(e qx.Expr, fm *field, slice *[]index,
 	}
 
 	probe := newBaseRangeProbe(s, start, end, useComplement)
+	bitmapFilter, bitmapFilterCheap, _ := buildBaseNumericRangeBitmapFilter(e, fm, probe)
 
 	var onMaterialized func(*roaring64.Bitmap) bool
 	if cacheKey != "" && !useComplement {
@@ -2636,7 +2657,9 @@ func (db *DB[K, V]) buildPredRangeWithMode(e qx.Expr, fm *field, slice *[]index,
 				}
 				return bc - in, true
 			},
-			cleanup: cleanup,
+			bitmapFilter:      bitmapFilter,
+			bitmapFilterCheap: bitmapFilterCheap,
+			cleanup:           cleanup,
 		}, true
 	}
 
@@ -2650,7 +2673,9 @@ func (db *DB[K, V]) buildPredRangeWithMode(e qx.Expr, fm *field, slice *[]index,
 		bucketCount: func(bucket *roaring64.Bitmap) (uint64, bool) {
 			return countInRange(bucket)
 		},
-		cleanup: cleanup,
+		bitmapFilter:      bitmapFilter,
+		bitmapFilterCheap: bitmapFilterCheap,
+		cleanup:           cleanup,
 	}, true
 }
 
@@ -2765,6 +2790,194 @@ func (p baseRangeProbe) singletonHeavy(minProbe int) bool {
 		return false
 	}
 	return p.singletonCount*4 >= p.probeLen*3
+}
+
+const (
+	rangeBitmapFilterKeepProbeMaxBuckets = 24
+	rangeBitmapFilterKeepRowsMaxCard     = 8_192
+)
+
+func shouldUseNumericRangeBitmapFilter(e qx.Expr, fm *field) bool {
+	if fm == nil || fm.Slice || !isNumericScalarKind(fm.Kind) {
+		return false
+	}
+	switch e.Op {
+	case qx.OpGT, qx.OpGTE, qx.OpLT, qx.OpLTE:
+		return true
+	default:
+		return false
+	}
+}
+
+func applyRangeProbeBitmapFilter(
+	dst *roaring64.Bitmap,
+	keepProbeHits bool,
+	probeLen int,
+	probeContains func(uint64) bool,
+	forEachPosting func(func(postingList) bool) bool,
+) bool {
+	if dst == nil {
+		return false
+	}
+	if dst.IsEmpty() {
+		return true
+	}
+	if probeLen == 0 {
+		if keepProbeHits {
+			dst.Clear()
+		}
+		return true
+	}
+	if !keepProbeHits {
+		forEachPosting(func(ids postingList) bool {
+			ids.AndNotFrom(dst)
+			return !dst.IsEmpty()
+		})
+		return true
+	}
+	if probeLen > rangeBitmapFilterKeepProbeMaxBuckets && dst.GetCardinality() > rangeBitmapFilterKeepRowsMaxCard {
+		return false
+	}
+
+	work := getRoaringBuf()
+	defer releaseRoaringBuf(work)
+
+	it := dst.Iterator()
+	for it.HasNext() {
+		idx := it.Next()
+		if probeContains(idx) {
+			work.Add(idx)
+		}
+	}
+	releaseRoaringBitmapIterator(it)
+
+	dst.Clear()
+	dst.Or(work)
+	return true
+}
+
+func buildBaseNumericRangeBitmapFilter(e qx.Expr, fm *field, probe baseRangeProbe) (func(*roaring64.Bitmap) bool, bool, bool) {
+	if !shouldUseNumericRangeBitmapFilter(e, fm) || probe.probeLen == 0 {
+		return nil, false, false
+	}
+	keepProbeHits := probe.useComplement == e.Not
+	return func(dst *roaring64.Bitmap) bool {
+		return applyRangeProbeBitmapFilter(dst, keepProbeHits, probe.probeLen, probe.linearContains, probe.forEachPosting)
+	}, !keepProbeHits, true
+}
+
+type overlayRangeProbe struct {
+	ov       fieldOverlay
+	spans    [2]overlayRange
+	spanCnt  int
+	probeLen int
+}
+
+func newOverlayRangeProbe(ov fieldOverlay, br overlayRange, useComplement bool) overlayRangeProbe {
+	p := overlayRangeProbe{ov: ov}
+	if useComplement {
+		before := overlayRange{
+			baseStart:  0,
+			baseEnd:    br.baseStart,
+			deltaStart: 0,
+			deltaEnd:   br.deltaStart,
+		}
+		after := overlayRange{
+			baseStart:  br.baseEnd,
+			baseEnd:    len(ov.base),
+			deltaStart: br.deltaEnd,
+			deltaEnd: func() int {
+				if ov.delta == nil {
+					return 0
+				}
+				return ov.delta.keyCount()
+			}(),
+		}
+		if !overlayRangeEmpty(before) {
+			p.spans[p.spanCnt] = before
+			p.spanCnt++
+		}
+		if !overlayRangeEmpty(after) {
+			p.spans[p.spanCnt] = after
+			p.spanCnt++
+		}
+	} else if !overlayRangeEmpty(br) {
+		p.spans[0] = br
+		p.spanCnt = 1
+	}
+	p.scanStats()
+	return p
+}
+
+func (p *overlayRangeProbe) scanStats() {
+	if p == nil {
+		return
+	}
+	p.forEachPosting(func(ids postingList) bool {
+		p.probeLen++
+		return true
+	})
+}
+
+func (p overlayRangeProbe) forEachPosting(fn func(postingList) bool) bool {
+	for i := 0; i < p.spanCnt; i++ {
+		cur := p.ov.newCursor(p.spans[i], false)
+		for {
+			_, baseIDs, de, ok := cur.next()
+			if !ok {
+				break
+			}
+			ids, keep := composePostingRetained(baseIDs, de)
+			if ids.IsEmpty() {
+				if keep != nil {
+					releaseRoaringBuf(keep)
+				}
+				continue
+			}
+			if !fn(ids) {
+				if keep != nil {
+					releaseRoaringBuf(keep)
+				}
+				return false
+			}
+			if keep != nil {
+				releaseRoaringBuf(keep)
+			}
+		}
+	}
+	return true
+}
+
+func (p overlayRangeProbe) contains(idx uint64) bool {
+	for i := 0; i < p.spanCnt; i++ {
+		if overlayRangeContains(p.ov, p.spans[i], idx) {
+			return true
+		}
+	}
+	return false
+}
+
+func buildOverlayNumericRangeBitmapFilter(e qx.Expr, fm *field, ov fieldOverlay, br overlayRange) (func(*roaring64.Bitmap) bool, bool, bool) {
+	if !shouldUseNumericRangeBitmapFilter(e, fm) {
+		return nil, false, false
+	}
+	totalBuckets := len(ov.base)
+	if ov.delta != nil {
+		totalBuckets += ov.delta.keyCount()
+	}
+	inBuckets := (br.baseEnd - br.baseStart) + (br.deltaEnd - br.deltaStart)
+	if totalBuckets <= 0 || inBuckets <= 0 || inBuckets >= totalBuckets {
+		return nil, false, false
+	}
+	useComplement := totalBuckets-inBuckets < inBuckets
+	probe := newOverlayRangeProbe(ov, br, useComplement)
+	if probe.probeLen == 0 {
+		return nil, false, false
+	}
+	keepProbeHits := useComplement == e.Not
+	return func(dst *roaring64.Bitmap) bool {
+		return applyRangeProbeBitmapFilter(dst, keepProbeHits, probe.probeLen, probe.contains, probe.forEachPosting)
+	}, !keepProbeHits, true
 }
 
 func materializedRangePredicateReadonly(e qx.Expr, bm *roaring64.Bitmap) predicate {
@@ -3688,7 +3901,8 @@ func (db *DB[K, V]) scanOrderedBaseSliceWithPredicates(q *qx.QX, preds []predica
 			releaseRoaringIter(iterSrc)
 		}()
 		if len(exactActive) > 0 {
-			mode, exactBM, _ := plannerFilterBitmapByChecks(preds, exactActive, ensureBucketBM(), exactWork, cursor.skip > 0)
+			allowExact := plannerAllowOrderedExactBitmapFilter(cursor.skip, cursor.need, card, exactOnly, len(exactActive))
+			mode, exactBM, _ := plannerFilterBitmapByChecks(preds, exactActive, ensureBucketBM(), exactWork, allowExact)
 			switch mode {
 			case plannerPredicateBucketEmpty:
 				return false

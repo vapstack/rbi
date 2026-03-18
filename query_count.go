@@ -7,6 +7,7 @@ import (
 
 const countPredicateScanMaxLeaves = 16
 const countORPredicateMaxBranchesBase = 5
+const countORHybridBitmapBranchMax = 3
 const countORSeenUnionThresholdBase = 64_000
 const countORSeenUniverseDiv = 16
 const countScalarInSplitMaxValues = 32
@@ -594,11 +595,18 @@ func shouldTryCountByPredicates(leaves []qx.Expr) bool {
 }
 
 type countORBranch struct {
+	index     int
 	preds     []predicate
 	lead      int
 	checks    []int
 	checksBuf *intSliceBuf
 	est       uint64
+}
+
+type countORBitmapBranch struct {
+	index int
+	expr  qx.Expr
+	est   uint64
 }
 
 type countORBranches []countORBranch
@@ -697,6 +705,51 @@ func (branches countORBranches) unionEstimate(universe uint64) uint64 {
 		union = 1
 	}
 	return union
+}
+
+func countORBranchEstimate(preds []predicate, active []int, leadEst uint64) uint64 {
+	est := leadEst
+	for _, pi := range active {
+		p := preds[pi]
+		if p.covered || p.alwaysTrue || p.estCard == 0 {
+			continue
+		}
+		if est == 0 || p.estCard < est {
+			est = p.estCard
+		}
+	}
+	if est == 0 {
+		return 1
+	}
+	return est
+}
+
+func shouldTryCountORHybridBitmapSpill(totalBranches int, scanBranches int, spillBranches int, expectedProbes uint64, spillEst uint64, universe uint64) bool {
+	if totalBranches < 4 || scanBranches == 0 || spillBranches == 0 {
+		return false
+	}
+	if spillBranches > countORHybridBitmapBranchMax {
+		return false
+	}
+	if universe == 0 {
+		return false
+	}
+	if spillBranches >= scanBranches && expectedProbes > universe {
+		return false
+	}
+	if spillBranches > 1 && spillEst > universe && expectedProbes > satMulUint64(universe, 3)/2 {
+		return false
+	}
+
+	budget := satAddUint64(expectedProbes, spillEst)
+	limit := satMulUint64(universe, 5) / 2
+	if spillBranches == 1 || scanBranches >= spillBranches+1 {
+		limit = satMulUint64(universe, 11) / 4
+	}
+	if limit < universe {
+		limit = universe
+	}
+	return budget <= limit
 }
 
 func countORSeenUnionThreshold(universe uint64, branches int, expectedProbes uint64) uint64 {
@@ -822,6 +875,57 @@ func countORSeenAddBitmap(seen, bm *roaring64.Bitmap) uint64 {
 		return 0
 	}
 	return after - before
+}
+
+func (db *DB[K, V]) countORBitmapSpillUnion(
+	branches []countORBitmapBranch,
+	seen *roaring64.Bitmap,
+	trace *queryTrace,
+	branchTrace []TraceORBranch,
+) (uint64, uint64, bool, error) {
+	if len(branches) == 0 {
+		return 0, 0, true, nil
+	}
+	if seen == nil {
+		return 0, 0, false, nil
+	}
+
+	var cnt uint64
+	var examined uint64
+	for _, br := range branches {
+		if branchTrace != nil {
+			branchTrace[br.index].Skipped = true
+			branchTrace[br.index].SkipReason = "bitmap_spill"
+		}
+
+		bmRes, err := db.evalExpr(br.expr)
+		if err != nil {
+			return 0, 0, true, err
+		}
+		if bmRes.neg {
+			bmRes.release()
+			return 0, 0, false, nil
+		}
+		if trace != nil {
+			trace.addBitmapMaterialized(1)
+		}
+		if bmRes.bm == nil || bmRes.bm.IsEmpty() {
+			bmRes.release()
+			continue
+		}
+
+		card := bmRes.bm.GetCardinality()
+		examined += card
+		added := countORSeenAddBitmap(seen, bmRes.bm)
+		cnt += added
+		if branchTrace != nil {
+			branchTrace[br.index].RowsExamined += card
+			branchTrace[br.index].RowsEmitted += added
+		}
+		bmRes.release()
+	}
+
+	return cnt, examined, true, nil
 }
 
 func (db *DB[K, V]) tryCountORBranchLeadPostings(
@@ -1411,7 +1515,7 @@ func (db *DB[K, V]) tryMaterializeBroadRangeComplementPredicateForCount(p *predi
 		return false
 	}
 	snap := db.getSnapshot()
-	if snap == nil || snap.fieldDelta(p.expr.Field) != nil {
+	if snap == nil {
 		return false
 	}
 
@@ -1463,6 +1567,139 @@ func (db *DB[K, V]) tryMaterializeBroadRangeComplementPredicateForCount(p *predi
 			p.alwaysFalse = false
 			return true
 		}
+	}
+
+	ov := db.fieldOverlay(p.expr.Field)
+	if !ov.hasData() {
+		return false
+	}
+	if ov.delta != nil {
+		rb, ok := rangeBoundsForOp(p.expr.Op, key)
+		if !ok {
+			return false
+		}
+		br := ov.rangeForBounds(rb)
+
+		totalDelta := 0
+		if ov.delta != nil {
+			totalDelta = ov.delta.keyCount()
+		}
+		before := overlayRange{
+			baseStart:  0,
+			baseEnd:    br.baseStart,
+			deltaStart: 0,
+			deltaEnd:   br.deltaStart,
+		}
+		after := overlayRange{
+			baseStart:  br.baseEnd,
+			baseEnd:    len(ov.base),
+			deltaStart: br.deltaEnd,
+			deltaEnd:   totalDelta,
+		}
+
+		complementEst := uint64(0)
+		addRangeStats := func(span overlayRange) {
+			if overlayRangeEmpty(span) {
+				return
+			}
+			_, est := overlayRangeStats(ov, span)
+			complementEst = satAddUint64(complementEst, est)
+		}
+		addRangeStats(before)
+		addRangeStats(after)
+		if complementEst == 0 {
+			if cacheKey != "" {
+				snap.storeMaterializedPred(cacheKey, nil)
+			}
+			p.kind = predicateKindCustom
+			p.iterKind = predicateIterNone
+			p.posting = postingList{}
+			p.posts = nil
+			p.bm = nil
+			p.contains = nil
+			p.iter = nil
+			p.bucketCount = nil
+			p.estCard = 0
+			p.alwaysTrue = true
+			p.alwaysFalse = false
+			return true
+		}
+		if complementEst > countBroadRangeComplementMaxCardinality(leadProbeEst, universe) {
+			return false
+		}
+
+		bm := getRoaringBuf()
+		appendComplement := func(span overlayRange) {
+			if overlayRangeEmpty(span) {
+				return
+			}
+			if out, ok := db.tryEvalNumericRangeBuckets(p.expr.Field, fm, ov, span); ok {
+				if out.bm != nil && !out.bm.IsEmpty() {
+					bm.Or(out.bm)
+				}
+				if out.bm != nil && !out.readonly {
+					releaseRoaringBuf(out.bm)
+				}
+				return
+			}
+			part := overlayUnionRange(ov, span)
+			if part == nil {
+				return
+			}
+			if !part.IsEmpty() {
+				bm.Or(part)
+			}
+			releaseRoaringBuf(part)
+		}
+		appendComplement(before)
+		appendComplement(after)
+		if bm.IsEmpty() {
+			releaseRoaringBuf(bm)
+			if cacheKey != "" {
+				snap.storeMaterializedPred(cacheKey, nil)
+			}
+			p.kind = predicateKindCustom
+			p.iterKind = predicateIterNone
+			p.posting = postingList{}
+			p.posts = nil
+			p.bm = nil
+			p.contains = nil
+			p.iter = nil
+			p.bucketCount = nil
+			p.estCard = 0
+			p.alwaysTrue = true
+			p.alwaysFalse = false
+			return true
+		}
+		if trace != nil {
+			trace.addCountRangeComplementBuild(bm.GetCardinality(), false)
+		}
+
+		readonly := false
+		if cacheKey != "" && db.tryShareMaterializedPred(cacheKey, bm) {
+			readonly = true
+		}
+		p.cleanup = chainPredicateCleanup(p.cleanup, func() {
+			if !readonly {
+				releaseRoaringBuf(bm)
+			}
+		})
+		p.kind = predicateKindBitmapNot
+		p.iterKind = predicateIterNone
+		p.posting = postingList{}
+		p.posts = nil
+		p.bm = bm
+		p.contains = nil
+		p.iter = nil
+		p.bucketCount = nil
+		p.estCard = 0
+		p.alwaysTrue = false
+		p.alwaysFalse = false
+		return true
+	}
+
+	if snap.fieldDelta(p.expr.Field) != nil {
+		return false
 	}
 	slice := snap.fieldIndexSlice(p.expr.Field)
 	if slice == nil || len(*slice) == 0 {
@@ -1812,7 +2049,12 @@ func (db *DB[K, V]) prepareCountPredicateWithTrace(p *predicate, probeEst uint64
 		db.materializeSetPredicateForCount(p)
 	}
 
-	if shouldUseCountBroadRangeComplementMaterialization(*p, probeEst, universe) &&
+	if db.shouldPreferLazyCountBitmapFilter(*p, probeEst, universe) {
+		return nil
+	}
+
+	if (shouldUseCountBroadRangeComplementMaterialization(*p, probeEst, universe) ||
+		shouldTryExactNumericCountBroadRangeComplement(*p, probeEst, universe)) &&
 		db.tryMaterializeBroadRangeComplementPredicateForCount(p, probeEst, universe, trace) {
 		return nil
 	}
@@ -2651,11 +2893,46 @@ func (db *DB[K, V]) countPredicateCanUseExactNumericComplement(p predicate, prob
 	if fm == nil || fm.Slice || !isNumericScalarKind(fm.Kind) {
 		return false
 	}
+	if p.bitmapFilterCheap {
+		return true
+	}
 	snap := db.getSnapshot()
-	if snap == nil || snap.fieldDelta(p.expr.Field) != nil {
+	if snap == nil {
 		return false
 	}
 	return true
+}
+
+func (db *DB[K, V]) shouldPreferLazyCountBitmapFilter(p predicate, probeEst uint64, universe uint64) bool {
+	if db.materializedPredCacheEnabled() {
+		return false
+	}
+	if p.kind != predicateKindCustom || !p.bitmapFilterCheap {
+		return false
+	}
+	return shouldUseCountBroadRangeComplementMaterialization(p, probeEst, universe) ||
+		db.countPredicateCanUseExactNumericComplement(p, probeEst, universe)
+}
+
+func (db *DB[K, V]) prepareCountORPredicateWithTrace(p *predicate, probeEst uint64, universe uint64, trace *queryTrace) error {
+	if p == nil || p.alwaysTrue || p.alwaysFalse || p.covered {
+		return nil
+	}
+	if trace != nil {
+		trace.addCountPredicatePreparation(1)
+	}
+
+	if db.shouldPreferLazyCountBitmapFilter(*p, probeEst, universe) {
+		return nil
+	}
+
+	if (shouldUseCountBroadRangeComplementMaterialization(*p, probeEst, universe) ||
+		shouldTryExactNumericCountBroadRangeComplement(*p, probeEst, universe)) &&
+		db.tryMaterializeBroadRangeComplementPredicateForCount(p, probeEst, universe, trace) {
+		return nil
+	}
+
+	return nil
 }
 
 func (db *DB[K, V]) countPredicateResidualCheckWeight(p predicate, probeEst, universe uint64) uint64 {
@@ -2713,6 +2990,49 @@ func (db *DB[K, V]) countPredicateResidualCheckWeight(p predicate, probeEst, uni
 	return weight
 }
 
+func (db *DB[K, V]) countORPredicateResidualCheckWeight(p predicate, probeEst, universe uint64) uint64 {
+	if p.alwaysTrue || p.covered {
+		return 0
+	}
+	if p.alwaysFalse {
+		return ^uint64(0) / 4
+	}
+	if p.supportsBitmapFilter() {
+		return 1
+	}
+	if shouldUseCountLeadResidualHasAnyExactFilter(p) {
+		return 1
+	}
+	if shouldUseCountBroadRangeComplementMaterialization(p, probeEst, universe) ||
+		db.countPredicateCanUseExactNumericComplement(p, probeEst, universe) {
+		return 1
+	}
+
+	var weight uint64
+	switch p.expr.Op {
+	case qx.OpEQ, qx.OpNOOP:
+		weight = 1
+	case qx.OpIN, qx.OpHAS:
+		weight = 2
+	case qx.OpHASANY:
+		weight = 3
+	case qx.OpGT, qx.OpGTE, qx.OpLT, qx.OpLTE:
+		weight = 4
+	case qx.OpPREFIX:
+		weight = 6
+	case qx.OpSUFFIX:
+		weight = 8
+	case qx.OpCONTAINS:
+		weight = 10
+	default:
+		weight = uint64(max(2, p.checkCost()+2))
+	}
+	if p.expr.Not {
+		weight++
+	}
+	return weight
+}
+
 func (db *DB[K, V]) countLeadResidualScore(p predicate, leadEst, universe uint64) uint64 {
 	if leadEst == 0 || p.alwaysTrue || p.covered {
 		return 0
@@ -2726,6 +3046,17 @@ func (db *DB[K, V]) countLeadResidualScore(p predicate, leadEst, universe uint64
 		effectiveRows = p.estCard
 	}
 	return satMulUint64(effectiveRows, weight)
+}
+
+func (db *DB[K, V]) countORLeadResidualScore(p predicate, leadEst, universe uint64) uint64 {
+	if leadEst == 0 || p.alwaysTrue || p.covered {
+		return 0
+	}
+	weight := db.countORPredicateResidualCheckWeight(p, leadEst, universe)
+	if weight == 0 {
+		return 0
+	}
+	return satMulUint64(leadEst, weight)
 }
 
 func (db *DB[K, V]) pickCountLeadPredicate(preds []predicate, universe uint64) (int, uint64, uint64) {
@@ -2762,6 +3093,40 @@ func (db *DB[K, V]) pickCountLeadPredicate(preds []predicate, universe uint64) (
 	return leadIdx, leadEst, leadScore
 }
 
+func (db *DB[K, V]) pickCountORLeadPredicate(preds []predicate, universe uint64) (int, uint64, uint64) {
+	leadIdx := -1
+	leadEst := uint64(0)
+	leadScore := uint64(0)
+
+	for i := range preds {
+		p := preds[i]
+		if p.alwaysTrue || p.covered || !p.hasIter() || p.estCard == 0 {
+			continue
+		}
+		if countLeadTooRisky(p.expr.Op, p.estCard, universe) {
+			continue
+		}
+
+		score := satMulUint64(p.estCard, countPredicateLeadScanWeight(p))
+		if p.leadIterNeedsContainsCheck() {
+			score = satAddUint64(score, db.countORLeadResidualScore(p, p.estCard, universe))
+		}
+		for j := range preds {
+			if j == i {
+				continue
+			}
+			score = satAddUint64(score, db.countORLeadResidualScore(preds[j], p.estCard, universe))
+		}
+
+		if leadIdx == -1 || score < leadScore {
+			leadIdx = i
+			leadEst = p.estCard
+			leadScore = score
+		}
+	}
+	return leadIdx, leadEst, leadScore
+}
+
 // tryCountORByPredicates counts top-level OR expressions via branch lead scans.
 //
 // The path is intentionally conservative: it is enabled only for bounded OR
@@ -2780,6 +3145,15 @@ func (db *DB[K, V]) tryCountORByPredicates(expr qx.Expr, trace *queryTrace) (uin
 		return 0, false, nil
 	}
 	strictWide := branchCount > 3
+	fullTrace := trace.full()
+
+	var branchTrace []TraceORBranch
+	if fullTrace {
+		branchTrace = make([]TraceORBranch, branchCount)
+		for i := range branchTrace {
+			branchTrace[i].Index = i
+		}
+	}
 
 	branchesBuf := getCountORBranchSliceBuf(len(expr.Operands))
 	branches := branchesBuf.values
@@ -2790,11 +3164,14 @@ func (db *DB[K, V]) tryCountORByPredicates(expr qx.Expr, trace *queryTrace) (uin
 	}()
 
 	var expectedProbes uint64
+	bitmapBranches := make([]countORBitmapBranch, 0, max(0, branchCount-1))
+	var bitmapBranchEst uint64
 
 	// Build branch plans first and estimate total probe budget before scanning.
 	// This prevents expensive partial work when the union is too broad.
 	var leafBuf [countPredicateScanMaxLeaves]qx.Expr
-	for _, op := range expr.Operands {
+branchLoop:
+	for branchIdx, op := range expr.Operands {
 		leaves, ok := collectAndLeavesFixed(op, leafBuf[:0])
 		if !ok {
 			return 0, false, nil
@@ -2809,11 +3186,16 @@ func (db *DB[K, V]) tryCountORByPredicates(expr qx.Expr, trace *queryTrace) (uin
 
 		activeBuf := getIntSliceBuf(len(preds))
 		active := activeBuf.values
-		leadIdx := -1
-		leadEst := uint64(0)
-		leadWeight := uint64(0)
-		leadScore := 0.0
 		branchFalse := false
+		releaseCurrentBranch := func(checksBuf *intSliceBuf, checks []int) {
+			if checksBuf != nil {
+				checksBuf.values = checks
+				releaseIntSliceBuf(checksBuf)
+			}
+			activeBuf.values = active
+			releaseIntSliceBuf(activeBuf)
+			releasePredicates(preds)
+		}
 
 		for i := range preds {
 			p := preds[i]
@@ -2825,16 +3207,6 @@ func (db *DB[K, V]) tryCountORByPredicates(expr qx.Expr, trace *queryTrace) (uin
 				continue
 			}
 			active = append(active, i)
-			if p.hasIter() && p.estCard > 0 {
-				w := countLeadOpWeight(p.expr.Op)
-				score := float64(p.estCard) * float64(w)
-				if leadIdx == -1 || score < leadScore {
-					leadIdx = i
-					leadEst = p.estCard
-					leadWeight = w
-					leadScore = score
-				}
-			}
 		}
 
 		if branchFalse {
@@ -2852,33 +3224,57 @@ func (db *DB[K, V]) tryCountORByPredicates(expr qx.Expr, trace *queryTrace) (uin
 			return uc, true, nil
 		}
 
+		leadIdx, leadEst, leadScore := db.pickCountORLeadPredicate(preds, uc)
+		branchEst := countORBranchEstimate(preds, active, leadEst)
+		leadWeight := uint64(0)
+		if leadIdx >= 0 {
+			leadWeight = countPredicateLeadScanWeight(preds[leadIdx])
+		}
+		spillBranch := func(reason string, checksBuf *intSliceBuf, checks []int) {
+			if branchTrace != nil {
+				branchTrace[branchIdx].Skipped = true
+				branchTrace[branchIdx].SkipReason = reason
+			}
+			bitmapBranches = append(bitmapBranches, countORBitmapBranch{
+				index: branchIdx,
+				expr:  op,
+				est:   branchEst,
+			})
+			bitmapBranchEst = satAddUint64(bitmapBranchEst, branchEst)
+			releaseCurrentBranch(checksBuf, checks)
+		}
+
 		// Cannot drive branch without iterable lead.
 		if leadIdx < 0 {
-			activeBuf.values = active
-			releaseIntSliceBuf(activeBuf)
-			releasePredicates(preds)
+			if strictWide {
+				spillBranch("bitmap_spill_no_lead", nil, nil)
+				continue
+			}
+			releaseCurrentBranch(nil, nil)
 			return 0, false, nil
 		}
 		// Keep OR path setup minimal: avoid eager predicate materialization here.
 		// Broad OR branches are sensitive to one-shot setup allocations.
 		if countLeadTooRisky(preds[leadIdx].expr.Op, leadEst, uc) {
-			activeBuf.values = active
-			releaseIntSliceBuf(activeBuf)
-			releasePredicates(preds)
+			if strictWide {
+				spillBranch("bitmap_spill_risky_lead", nil, nil)
+				continue
+			}
+			releaseCurrentBranch(nil, nil)
 			return 0, false, nil
 		}
 		if strictWide {
 			if leadWeight > 3 && leadEst > 2_048 && leadEst > uc/64 {
-				activeBuf.values = active
-				releaseIntSliceBuf(activeBuf)
-				releasePredicates(preds)
-				return 0, false, nil
+				spillBranch("bitmap_spill_expensive_lead", nil, nil)
+				continue branchLoop
+			}
+			if leadScore > uc && leadEst > 2_048 && leadEst > uc/32 {
+				spillBranch("bitmap_spill_expensive_branch_score", nil, nil)
+				continue branchLoop
 			}
 			if leadEst > uc/3 {
-				activeBuf.values = active
-				releaseIntSliceBuf(activeBuf)
-				releasePredicates(preds)
-				return 0, false, nil
+				spillBranch("bitmap_spill_broad_lead", nil, nil)
+				continue branchLoop
 			}
 		}
 
@@ -2898,23 +3294,50 @@ func (db *DB[K, V]) tryCountORByPredicates(expr qx.Expr, trace *queryTrace) (uin
 				break
 			}
 			if !p.hasContains() {
-				checksBuf.values = checks
-				releaseIntSliceBuf(checksBuf)
-				activeBuf.values = active
-				releaseIntSliceBuf(activeBuf)
-				releasePredicates(preds)
+				if strictWide {
+					spillBranch("bitmap_spill_no_contains", checksBuf, checks)
+					continue branchLoop
+				}
+				releaseCurrentBranch(checksBuf, checks)
 				return 0, false, nil
 			}
 			checks = append(checks, pi)
 		}
 		if branchFalse {
-			checksBuf.values = checks
-			releaseIntSliceBuf(checksBuf)
-			activeBuf.values = active
-			releaseIntSliceBuf(activeBuf)
-			releasePredicates(preds)
+			releaseCurrentBranch(checksBuf, checks)
 			continue
 		}
+		for _, pi := range checks {
+			if err := db.prepareCountORPredicateWithTrace(&preds[pi], leadEst, uc, trace); err != nil {
+				releaseCurrentBranch(checksBuf, checks)
+				return 0, true, err
+			}
+		}
+		filteredChecks := checks[:0]
+		for _, pi := range checks {
+			p := preds[pi]
+			if p.covered || p.alwaysTrue {
+				continue
+			}
+			if p.alwaysFalse {
+				branchFalse = true
+				break
+			}
+			if !p.hasContains() {
+				if strictWide {
+					spillBranch("bitmap_spill_post_prepare", checksBuf, checks)
+					continue branchLoop
+				}
+				releaseCurrentBranch(checksBuf, checks)
+				return 0, false, nil
+			}
+			filteredChecks = append(filteredChecks, pi)
+		}
+		if branchFalse {
+			releaseCurrentBranch(checksBuf, checks)
+			continue
+		}
+		checks = filteredChecks
 		sortActivePredicates(checks, preds)
 		activeBuf.values = active
 		releaseIntSliceBuf(activeBuf)
@@ -2925,6 +3348,7 @@ func (db *DB[K, V]) tryCountORByPredicates(expr qx.Expr, trace *queryTrace) (uin
 		}
 		expectedProbes += leadEst * leadWeight
 		branches = append(branches, countORBranch{
+			index:     branchIdx,
 			preds:     preds,
 			lead:      leadIdx,
 			checks:    checks,
@@ -2934,7 +3358,14 @@ func (db *DB[K, V]) tryCountORByPredicates(expr qx.Expr, trace *queryTrace) (uin
 	}
 
 	if len(branches) == 0 {
+		if len(bitmapBranches) > 0 {
+			return 0, false, nil
+		}
 		return 0, true, nil
+	}
+	useBitmapSpill := len(bitmapBranches) > 0
+	if useBitmapSpill && !shouldTryCountORHybridBitmapSpill(branchCount, len(branches), len(bitmapBranches), expectedProbes, bitmapBranchEst, uc) {
+		return 0, false, nil
 	}
 
 	// Guardrail: skip this path when projected probe volume approaches a broad
@@ -2943,11 +3374,11 @@ func (db *DB[K, V]) tryCountORByPredicates(expr qx.Expr, trace *queryTrace) (uin
 	if strictWide {
 		limit = uc
 	}
-	if expectedProbes > limit {
+	if !useBitmapSpill && expectedProbes > limit {
 		return 0, false, nil
 	}
 
-	useSeenDedup := branches.shouldUseSeenDedup(uc, expectedProbes)
+	useSeenDedup := useBitmapSpill || branches.shouldUseSeenDedup(uc, expectedProbes)
 	var seen *roaring64.Bitmap
 	if useSeenDedup {
 		seen = getRoaringBuf()
@@ -2956,22 +3387,29 @@ func (db *DB[K, V]) tryCountORByPredicates(expr qx.Expr, trace *queryTrace) (uin
 
 	var cnt uint64
 	var examined uint64
-	var branchTrace []TraceORBranch
-	fullTrace := trace.full()
 	if trace != nil {
-		trace.setPlan(PlanCountORPredicates)
-		if fullTrace {
-			branchTrace = make([]TraceORBranch, len(branches))
-			for i := range branchTrace {
-				branchTrace[i].Index = i
-			}
+		if useBitmapSpill {
+			trace.setPlan(PlanCountORHybrid)
+		} else {
+			trace.setPlan(PlanCountORPredicates)
 		}
+	}
+	if useBitmapSpill {
+		spillCnt, spillExamined, ok, err := db.countORBitmapSpillUnion(bitmapBranches, seen, trace, branchTrace)
+		if err != nil {
+			return 0, true, err
+		}
+		if !ok {
+			return 0, false, nil
+		}
+		cnt += spillCnt
+		examined += spillExamined
 	}
 	for i := range branches {
 		br := branches[i]
 		var brTrace *TraceORBranch
 		if branchTrace != nil {
-			brTrace = &branchTrace[i]
+			brTrace = &branchTrace[br.index]
 		}
 		if cntBranch, examinedBranch, ok := db.tryCountORBranchLeadPostings(branches, i, useSeenDedup, seen, brTrace); ok {
 			cnt += cntBranch
@@ -2988,8 +3426,8 @@ func (db *DB[K, V]) tryCountORByPredicates(expr qx.Expr, trace *queryTrace) (uin
 		for it.HasNext() {
 			idx := it.Next()
 			examined++
-			if branchTrace != nil {
-				branchTrace[i].RowsExamined++
+			if brTrace != nil {
+				brTrace.RowsExamined++
 			}
 
 			if useSeenDedup {
@@ -3007,8 +3445,8 @@ func (db *DB[K, V]) tryCountORByPredicates(expr qx.Expr, trace *queryTrace) (uin
 			if useSeenDedup {
 				if seen.CheckedAdd(idx) {
 					cnt++
-					if branchTrace != nil {
-						branchTrace[i].RowsEmitted++
+					if brTrace != nil {
+						brTrace.RowsEmitted++
 					}
 				}
 				continue
@@ -3023,8 +3461,8 @@ func (db *DB[K, V]) tryCountORByPredicates(expr qx.Expr, trace *queryTrace) (uin
 			}
 			if !dup {
 				cnt++
-				if branchTrace != nil {
-					branchTrace[i].RowsEmitted++
+				if brTrace != nil {
+					brTrace.RowsEmitted++
 				}
 			}
 		}

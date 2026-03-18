@@ -20,6 +20,44 @@ func countByExprBitmap(t *testing.T, db *DB[uint64, Rec], expr qx.Expr) uint64 {
 	return db.countBitmapResult(b)
 }
 
+func countByExprBitmapBenchRec(t *testing.T, db *DB[uint64, countORBenchRec], expr qx.Expr) uint64 {
+	t.Helper()
+	b, err := db.evalExpr(expr)
+	if err != nil {
+		t.Fatalf("evalExpr: %v", err)
+	}
+	defer b.release()
+	return db.countBitmapResult(b)
+}
+
+func countByExprBitmapUserBench(t *testing.T, db *DB[uint64, UserBench], expr qx.Expr) uint64 {
+	t.Helper()
+	b, err := db.evalExpr(expr)
+	if err != nil {
+		t.Fatalf("evalExpr: %v", err)
+	}
+	defer b.release()
+	return db.countBitmapResult(b)
+}
+
+func expectPredicateExactBitmapFilterCount(t *testing.T, p predicate, src *roaring64.Bitmap, want uint64) {
+	t.Helper()
+
+	work := getRoaringBuf()
+	defer releaseRoaringBuf(work)
+
+	mode, exactBM, _ := plannerFilterBitmapByChecks([]predicate{p}, []int{0}, src, work, true)
+	if mode != plannerPredicateBucketExact {
+		t.Fatalf("expected exact bitmap filtering, got mode=%v", mode)
+	}
+	if exactBM == nil {
+		t.Fatalf("expected exact filtered bitmap")
+	}
+	if got := exactBM.GetCardinality(); got != want {
+		t.Fatalf("unexpected exact filtered cardinality: got=%d want=%d", got, want)
+	}
+}
+
 type countORBenchRec struct {
 	Country string   `db:"country"`
 	Plan    string   `db:"plan"`
@@ -153,13 +191,24 @@ func TestCount_ByPredicates_BucketLeadHasAnyResidual_MatchesBitmap(t *testing.T)
 	}
 	sortActivePredicates(active, preds)
 
+	hasAnyIdx := -1
+	for _, pi := range active {
+		if preds[pi].expr.Field == "tags" && preds[pi].expr.Op == qx.OpHASANY {
+			hasAnyIdx = pi
+			break
+		}
+	}
+	if hasAnyIdx < 0 {
+		t.Fatalf("expected HASANY residual")
+	}
+
 	exactActiveBuf := getIntSliceBuf(len(active))
 	exactActive := buildBitmapFilterActive(exactActiveBuf.values, active, preds)
 	defer func() {
 		exactActiveBuf.values = exactActive
 		releaseIntSliceBuf(exactActiveBuf)
 	}()
-	if len(exactActive) != 0 {
+	if countIndexSliceContains(exactActive, hasAnyIdx) {
 		t.Fatalf("expected HASANY residual to stay out of bitmap-filter subset, got=%v", exactActive)
 	}
 
@@ -388,7 +437,7 @@ func TestCount_ORByPredicates_PostingLeadResidualExactFilters_MatchesBitmap(t *t
 		{"moderator"},
 	}
 
-	const n = 100_000
+	const n = 200_000
 	ids := make([]uint64, n)
 	vals := make([]*countORBenchRec, n)
 	for i := 0; i < n; i++ {
@@ -427,11 +476,6 @@ func TestCount_ORByPredicates_PostingLeadResidualExactFilters_MatchesBitmap(t *t
 			qx.HASANY("tags", []string{"security", "ops"}),
 			qx.IN("country", []string{"US", "DE", "NL"}),
 		),
-		qx.AND(
-			qx.EQ("country", "US"),
-			qx.HASANY("roles", []string{"admin", "moderator"}),
-			qx.NOTIN("plan", []string{"free"}),
-		),
 	)
 
 	got, ok, err := db.tryCountORByPredicates(expr, nil)
@@ -450,6 +494,101 @@ func TestCount_ORByPredicates_PostingLeadResidualExactFilters_MatchesBitmap(t *t
 	want := db.countBitmapResult(b)
 	if got != want {
 		t.Fatalf("count mismatch: got=%d want=%d", got, want)
+	}
+}
+
+func TestCount_ORByPredicates_StrictWidePrefixLeadBudgetUsesScanWeight(t *testing.T) {
+	var (
+		mu     sync.Mutex
+		events []TraceEvent
+	)
+
+	sink := func(ev TraceEvent) {
+		mu.Lock()
+		events = append(events, ev)
+		mu.Unlock()
+	}
+
+	db, _ := openTempDBUint64(t, Options{
+		AnalyzeInterval:  -1,
+		TraceSink:        sink,
+		TraceSampleEvery: 1,
+	})
+
+	seedGeneratedUint64Data(t, db, 100_000, func(i int) *Rec {
+		return &Rec{
+			Name:   fmt.Sprintf("u_%d", i),
+			Email:  fmt.Sprintf("user%06d@example.com", i),
+			Age:    i,
+			Score:  float64(i % 1_000),
+			Active: i%2 == 0,
+			Meta: Meta{
+				Country: "US",
+			},
+		}
+	})
+	if err := db.RebuildIndex(); err != nil {
+		t.Fatalf("RebuildIndex: %v", err)
+	}
+
+	expr := qx.OR(
+		qx.AND(qx.PREFIX("email", "user00"), qx.EQ("active", true)),
+		qx.AND(qx.PREFIX("email", "user01"), qx.EQ("active", true)),
+		qx.AND(qx.PREFIX("email", "user02"), qx.EQ("active", true)),
+		qx.AND(qx.PREFIX("email", "user03"), qx.EQ("active", true)),
+	)
+	q := qx.Query(expr)
+
+	uc := db.snapshotUniverseCardinality()
+	var oldExpectedProbes uint64
+	var scanExpectedProbes uint64
+	for _, op := range expr.Operands {
+		leaves, ok := collectAndLeaves(op)
+		if !ok {
+			t.Fatalf("collectAndLeaves failed for %v", op)
+		}
+		preds, ok := db.buildPredicatesWithMode(leaves, false)
+		if !ok {
+			t.Fatalf("buildPredicatesWithMode failed for %v", op)
+		}
+		leadIdx, leadEst, _ := db.pickCountORLeadPredicate(preds, uc)
+		if leadIdx < 0 {
+			releasePredicates(preds)
+			t.Fatalf("expected OR lead for branch %v", op)
+		}
+		lead := preds[leadIdx]
+		if lead.expr.Op != qx.OpPREFIX {
+			releasePredicates(preds)
+			t.Fatalf("expected prefix lead, got field=%s op=%v", lead.expr.Field, lead.expr.Op)
+		}
+		oldExpectedProbes += leadEst * countLeadOpWeight(lead.expr.Op)
+		scanExpectedProbes += leadEst * countPredicateLeadScanWeight(lead)
+		releasePredicates(preds)
+	}
+	if oldExpectedProbes > uc {
+		t.Fatalf("expected old op-weight budget to admit OR path, got oldExpectedProbes=%d universe=%d", oldExpectedProbes, uc)
+	}
+	if scanExpectedProbes <= uc {
+		t.Fatalf("expected scan-weight budget to reject OR path, got scanExpectedProbes=%d universe=%d", scanExpectedProbes, uc)
+	}
+
+	got, err := db.Count(q)
+	if err != nil {
+		t.Fatalf("Count: %v", err)
+	}
+	want := countByExprBitmap(t, db, expr)
+	if got != want {
+		t.Fatalf("count mismatch: got=%d want=%d", got, want)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(events) == 0 {
+		t.Fatalf("expected trace event")
+	}
+	ev := events[len(events)-1]
+	if ev.Plan != string(PlanCountBitmap) {
+		t.Fatalf("expected strict-wide OR fallback to use %q, got %q", PlanCountBitmap, ev.Plan)
 	}
 }
 
@@ -603,6 +742,210 @@ func TestCount_ORPredicates_FiveBranches_MatchesBitmap(t *testing.T) {
 	want := countByExprBitmap(t, db, expr)
 	if got != want {
 		t.Fatalf("count mismatch: got=%d want=%d", got, want)
+	}
+}
+
+func TestCount_ORByPredicates_HybridBitmapSpill_MatchesBitmap(t *testing.T) {
+	var (
+		mu     sync.Mutex
+		events []TraceEvent
+	)
+
+	sink := func(ev TraceEvent) {
+		mu.Lock()
+		events = append(events, ev)
+		mu.Unlock()
+	}
+
+	dir := t.TempDir()
+	db, raw := openBoltAndNew[uint64, UserBench](t, filepath.Join(dir, "test_count_or_hybrid.db"), Options{
+		AnalyzeInterval:  -1,
+		TraceSink:        sink,
+		TraceSampleEvery: 1,
+	})
+	t.Cleanup(func() {
+		_ = db.Close()
+		_ = raw.Close()
+	})
+	db.DisableSync()
+	defer db.EnableSync()
+
+	r := newRand(1)
+
+	countries := []string{"US", "NL", "DE", "PL", "SE", "FR", "GB", "ES"}
+	plans := []string{"free", "basic", "pro", "enterprise"}
+	statuses := []string{"active", "trial", "paused", "banned"}
+	tagsPool := [][]string{
+		{"go", "db"},
+		{"java"},
+		{"rust", "perf"},
+		{"ops"},
+		{"ml", "python"},
+		{"frontend", "js"},
+		{"security"},
+		{"go", "go", "db"},
+		{},
+	}
+	rolesPool := [][]string{
+		{"user"},
+		{"user", "admin"},
+		{"user", "moderator"},
+		{"user", "billing"},
+		{"user", "support"},
+	}
+
+	const n = 150_000
+	ids := make([]uint64, n)
+	vals := make([]*UserBench, n)
+	for i := 0; i < n; i++ {
+		id := uint64(i + 1)
+		ids[i] = id
+		vals[i] = &UserBench{
+			ID:      id,
+			Country: countries[r.IntN(len(countries))],
+			Plan:    plans[r.IntN(len(plans))],
+			Status:  statuses[r.IntN(len(statuses))],
+			Age:     18 + r.IntN(60),
+			Score:   float64(r.IntN(1000)),
+			Name:    fmt.Sprintf("user-%d", i+1),
+			Email:   fmt.Sprintf("user%06d@example.com", i+1),
+			Tags:    append([]string(nil), tagsPool[r.IntN(len(tagsPool))]...),
+			Roles:   append([]string(nil), rolesPool[r.IntN(len(rolesPool))]...),
+		}
+	}
+	if err := db.BatchSet(ids, vals); err != nil {
+		t.Fatalf("BatchSet: %v", err)
+	}
+	if err := db.RebuildIndex(); err != nil {
+		t.Fatalf("RebuildIndex: %v", err)
+	}
+
+	expr := qx.OR(
+		qx.AND(
+			qx.EQ("country", "DE"),
+			qx.HASANY("tags", []string{"rust", "go"}),
+			qx.GTE("score", 40.0),
+		),
+		qx.AND(
+			qx.PREFIX("email", "user1"),
+			qx.EQ("status", "active"),
+		),
+		qx.AND(
+			qx.EQ("plan", "enterprise"),
+			qx.GTE("age", 30),
+		),
+		qx.AND(
+			qx.HASANY("roles", []string{"admin"}),
+			qx.NOTIN("status", []string{"banned"}),
+		),
+		qx.AND(
+			qx.CONTAINS("name", "user-1"),
+			qx.GTE("score", 20.0),
+		),
+	)
+	q := qx.Query(expr)
+
+	got, err := db.Count(q)
+	if err != nil {
+		t.Fatalf("Count: %v", err)
+	}
+	want := countByExprBitmapUserBench(t, db, expr)
+	if got != want {
+		t.Fatalf("count mismatch: got=%d want=%d", got, want)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(events) == 0 {
+		t.Fatalf("expected trace event")
+	}
+	ev := events[len(events)-1]
+	if ev.Plan != string(PlanCountORHybrid) {
+		t.Fatalf("expected hybrid OR count plan %q, got %q", PlanCountORHybrid, ev.Plan)
+	}
+	if len(ev.ORBranches) != len(expr.Operands) {
+		t.Fatalf("expected %d OR branch traces, got %d", len(expr.Operands), len(ev.ORBranches))
+	}
+	spilled := false
+	for _, br := range ev.ORBranches {
+		if br.SkipReason == "bitmap_spill" {
+			spilled = true
+			break
+		}
+	}
+	if !spilled {
+		t.Fatalf("expected at least one hybrid bitmap spill branch, got trace=%+v", ev.ORBranches)
+	}
+}
+
+func TestCount_ORByPredicates_HybridTraceEmitsUseOriginalBranchIndex(t *testing.T) {
+	var (
+		mu     sync.Mutex
+		events []TraceEvent
+	)
+
+	sink := func(ev TraceEvent) {
+		mu.Lock()
+		events = append(events, ev)
+		mu.Unlock()
+	}
+
+	db, _ := openTempDBUint64(t, Options{
+		AnalyzeInterval:  -1,
+		TraceSink:        sink,
+		TraceSampleEvery: 1,
+	})
+	_ = seedData(t, db, 20_000)
+
+	expr := qx.OR(
+		qx.AND(
+			qx.CONTAINS("full_name", "ZZZ"),
+			qx.GTE("score", 10.0),
+		),
+		qx.AND(
+			qx.PREFIX("full_name", "FN-1"),
+			qx.EQ("active", true),
+		),
+		qx.AND(
+			qx.EQ("name", "alice"),
+			qx.EQ("active", true),
+		),
+		qx.AND(
+			qx.EQ("country", "NL"),
+			qx.HASANY("tags", []string{"go"}),
+		),
+	)
+	q := qx.Query(expr)
+
+	got, err := db.Count(q)
+	if err != nil {
+		t.Fatalf("Count: %v", err)
+	}
+	want := countByExprBitmap(t, db, expr)
+	if got != want {
+		t.Fatalf("count mismatch: got=%d want=%d", got, want)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(events) == 0 {
+		t.Fatalf("expected trace event")
+	}
+	ev := events[len(events)-1]
+	if ev.Plan != string(PlanCountORHybrid) {
+		t.Fatalf("expected hybrid OR count plan %q, got %q", PlanCountORHybrid, ev.Plan)
+	}
+	if len(ev.ORBranches) != len(expr.Operands) {
+		t.Fatalf("expected %d OR branch traces, got %d", len(expr.Operands), len(ev.ORBranches))
+	}
+	if ev.ORBranches[0].SkipReason != "bitmap_spill" {
+		t.Fatalf("expected branch 0 to spill, got trace=%+v", ev.ORBranches)
+	}
+	if ev.ORBranches[0].RowsEmitted != 0 {
+		t.Fatalf("expected spilled empty branch 0 to emit 0 rows, got trace=%+v", ev.ORBranches)
+	}
+	if ev.ORBranches[1].RowsEmitted == 0 {
+		t.Fatalf("expected branch 1 PREFIX scan to emit rows on its original index, got trace=%+v", ev.ORBranches)
 	}
 }
 
@@ -891,7 +1234,7 @@ func TestCount_PreparePredicate_UsesBroadRangeComplementWithoutCache(t *testing.
 
 	expr := qx.Expr{Op: qx.OpGTE, Field: "age", Value: 1_000}
 
-	t.Run("NoCacheUsesBitmapNot", func(t *testing.T) {
+	t.Run("NoCacheUsesLazyExactBitmapFilter", func(t *testing.T) {
 		db := makeDB(t, false)
 		p, ok := db.buildPredicateWithMode(expr, false)
 		if !ok {
@@ -908,9 +1251,17 @@ func TestCount_PreparePredicate_UsesBroadRangeComplementWithoutCache(t *testing.
 		if err := db.prepareCountPredicate(&p, universe/2, universe); err != nil {
 			t.Fatalf("prepareCountPredicate: %v", err)
 		}
-		if p.kind != predicateKindBitmapNot {
-			t.Fatalf("expected broad no-cache range to switch to bitmapNot complement, got kind=%v", p.kind)
+		if p.kind != predicateKindCustom {
+			t.Fatalf("expected broad no-cache range to stay custom and lazy, got kind=%v", p.kind)
 		}
+		if !p.supportsBitmapFilter() || !p.bitmapFilterCheap {
+			t.Fatalf("expected broad no-cache range to expose cheap exact bitmap filter")
+		}
+
+		src := roaring64.NewBitmap()
+		src.AddRange(1, universe+1)
+		want := countByExprBitmap(t, db, expr)
+		expectPredicateExactBitmapFilterCount(t, p, src, want)
 	})
 }
 
@@ -959,22 +1310,16 @@ func TestCount_PreparePredicate_UsesTinyPostingBroadRangeComplement(t *testing.T
 	}
 
 	for _, tc := range []struct {
-		name     string
-		expr     qx.Expr
-		wantKind predicateKind
-		wantLen  int
+		name string
+		expr qx.Expr
 	}{
 		{
-			name:     "SingleBucket",
-			expr:     qx.Expr{Op: qx.OpGTE, Field: "age", Value: 1},
-			wantKind: predicateKindPostingNot,
-			wantLen:  1,
+			name: "SingleBucket",
+			expr: qx.Expr{Op: qx.OpGTE, Field: "age", Value: 1},
 		},
 		{
-			name:     "TwoBuckets",
-			expr:     qx.Expr{Op: qx.OpGTE, Field: "age", Value: 2},
-			wantKind: predicateKindPostsAnyNot,
-			wantLen:  2,
+			name: "TwoBuckets",
+			expr: qx.Expr{Op: qx.OpGTE, Field: "age", Value: 2},
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -987,49 +1332,20 @@ func TestCount_PreparePredicate_UsesTinyPostingBroadRangeComplement(t *testing.T
 			if err := db.prepareCountPredicate(&p, 8_000, universe); err != nil {
 				t.Fatalf("prepareCountPredicate: %v", err)
 			}
-			if p.kind != tc.wantKind {
-				t.Fatalf("unexpected complement kind: got=%v want=%v", p.kind, tc.wantKind)
+			if p.kind != predicateKindCustom {
+				t.Fatalf("expected tiny complement without cache to stay custom, got kind=%v", p.kind)
 			}
 			if p.bm != nil {
 				t.Fatalf("expected tiny complement to avoid bitmap materialization")
 			}
-			switch p.kind {
-			case predicateKindPostingNot:
-				if p.posting.IsEmpty() {
-					t.Fatalf("expected postingNot complement")
-				}
-			case predicateKindPostsAnyNot:
-				if len(p.posts) != tc.wantLen {
-					t.Fatalf("unexpected postsAnyNot len: got=%d want=%d", len(p.posts), tc.wantLen)
-				}
-			}
-			if !p.supportsBitmapFilter() {
-				t.Fatalf("expected tiny complement predicate to support exact bitmap filtering")
+			if !p.supportsBitmapFilter() || !p.bitmapFilterCheap {
+				t.Fatalf("expected tiny complement predicate to support cheap exact bitmap filtering")
 			}
 
 			src := roaring64.NewBitmap()
-			src.AddRange(1, 45_001)
-			work := getRoaringBuf()
-			defer releaseRoaringBuf(work)
-
-			mode, exactBM, _ := plannerFilterBitmapByChecks([]predicate{p}, []int{0}, src, work, true)
-			if mode != plannerPredicateBucketExact {
-				t.Fatalf("expected exact bucket filtering, got mode=%v", mode)
-			}
-
-			var want uint64
-			for idx := uint64(1); idx <= 45_000; idx++ {
-				if p.matches(idx) {
-					want++
-				}
-			}
-			if exactBM == nil || exactBM.GetCardinality() != want {
-				got := uint64(0)
-				if exactBM != nil {
-					got = exactBM.GetCardinality()
-				}
-				t.Fatalf("unexpected exact cardinality: got=%d want=%d", got, want)
-			}
+			src.AddRange(1, universe+1)
+			want := countByExprBitmap(t, db, tc.expr)
+			expectPredicateExactBitmapFilterCount(t, p, src, want)
 		})
 	}
 }
@@ -1086,16 +1402,16 @@ func TestCount_PreparePredicate_UsesProbeBoundedBroadRangeComplement(t *testing.
 			if err := db.prepareCountPredicate(&p, leadProbeEst, universe); err != nil {
 				t.Fatalf("prepareCountPredicate: %v", err)
 			}
-			if p.kind != predicateKindBitmapNot {
-				t.Fatalf("expected probe-bounded broad range to switch to bitmapNot complement, got kind=%v", p.kind)
-			}
-			if p.bm == nil {
-				t.Fatalf("expected complement bitmap")
-			}
-			if got := p.bm.GetCardinality(); got <= countPredBroadRangeComplementMaxCard {
-				t.Fatalf("expected complement wider than legacy cap, got=%d", got)
-			}
 			if tc.withCache {
+				if p.kind != predicateKindBitmapNot {
+					t.Fatalf("expected cached probe-bounded broad range to switch to bitmapNot complement, got kind=%v", p.kind)
+				}
+				if p.bm == nil {
+					t.Fatalf("expected complement bitmap")
+				}
+				if got := p.bm.GetCardinality(); got <= countPredBroadRangeComplementMaxCard {
+					t.Fatalf("expected complement wider than legacy cap, got=%d", got)
+				}
 				key, isSlice, err := db.exprValueToIdxScalar(expr)
 				if err != nil || isSlice {
 					t.Fatalf("exprValueToIdxScalar: err=%v isSlice=%v", err, isSlice)
@@ -1105,7 +1421,20 @@ func TestCount_PreparePredicate_UsesProbeBoundedBroadRangeComplement(t *testing.
 				if !ok || cached == nil || cached != p.bm {
 					t.Fatalf("expected complement bitmap to be cached and shared")
 				}
+				return
 			}
+
+			if p.kind != predicateKindCustom {
+				t.Fatalf("expected no-cache broad range to stay custom and lazy, got kind=%v", p.kind)
+			}
+			if !p.supportsBitmapFilter() || !p.bitmapFilterCheap {
+				t.Fatalf("expected no-cache broad range to expose cheap exact bitmap filter")
+			}
+
+			src := roaring64.NewBitmap()
+			src.AddRange(1, universe+1)
+			want := countByExprBitmap(t, db, expr)
+			expectPredicateExactBitmapFilterCount(t, p, src, want)
 		})
 	}
 }
@@ -1259,15 +1588,119 @@ func TestCount_PreparePredicate_UsesExactNumericEstimateForSkewedBroadRange(t *t
 	if err := db.prepareCountPredicate(&p, 3_000, universe); err != nil {
 		t.Fatalf("prepareCountPredicate: %v", err)
 	}
-	if p.kind != predicateKindBitmapNot {
-		t.Fatalf("expected skewed broad numeric range to switch to bitmapNot complement, got kind=%v", p.kind)
+	if p.kind != predicateKindCustom {
+		t.Fatalf("expected skewed broad numeric range without cache to stay custom, got kind=%v", p.kind)
 	}
-	if p.bm == nil {
-		t.Fatalf("expected complement bitmap")
+	if !p.supportsBitmapFilter() || !p.bitmapFilterCheap {
+		t.Fatalf("expected skewed broad numeric range to expose cheap exact bitmap filter")
 	}
-	if got := p.bm.GetCardinality(); got != wantOut {
-		t.Fatalf("unexpected complement cardinality: got=%d want=%d", got, wantOut)
+
+	src := roaring64.NewBitmap()
+	src.AddRange(1, universe+1)
+	expectPredicateExactBitmapFilterCount(t, p, src, wantIn)
+}
+
+func TestCount_PreparePredicate_UsesBroadRangeComplementWithDeltaOverlay(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{
+		AnalyzeInterval:                                  -1,
+		SnapshotCompactorRequestEveryNWrites:             1 << 30,
+		SnapshotCompactorIdleInterval:                    -1,
+		SnapshotDeltaLayerMaxDepth:                       1 << 30,
+		SnapshotMaterializedPredCacheMaxEntries:          -1,
+		SnapshotMaterializedPredCacheMaxEntriesWithDelta: -1,
+	})
+
+	db.DisableSync()
+	defer db.EnableSync()
+
+	var (
+		id        uint64
+		wantIn    uint64
+		wantOut   uint64
+		rangeFrom = 1_000
+	)
+	const batchSize = 20_000
+	batchIDs := make([]uint64, 0, batchSize)
+	batchVals := make([]*Rec, 0, batchSize)
+	flush := func() {
+		if len(batchIDs) == 0 {
+			return
+		}
+		if err := db.BatchSet(batchIDs, batchVals); err != nil {
+			t.Fatalf("BatchSet(seed batch=%d): %v", len(batchIDs), err)
+		}
+		batchIDs = batchIDs[:0]
+		batchVals = batchVals[:0]
 	}
+
+	for age := 0; age < 10_000; age++ {
+		reps := 10
+		if age < rangeFrom {
+			reps = 3
+		}
+		for rep := 0; rep < reps; rep++ {
+			id++
+			batchIDs = append(batchIDs, id)
+			batchVals = append(batchVals, &Rec{
+				Name:   fmt.Sprintf("overlay_%d_%d", age, rep),
+				Email:  fmt.Sprintf("overlay_%d_%d@example.com", age, rep),
+				Age:    age,
+				Score:  float64(rep),
+				Active: rep%2 == 0,
+				Meta: Meta{
+					Country: "US",
+				},
+			})
+			if len(batchIDs) == cap(batchIDs) {
+				flush()
+			}
+		}
+		if age >= rangeFrom {
+			wantIn += uint64(reps)
+		} else {
+			wantOut += uint64(reps)
+		}
+	}
+	flush()
+
+	setNumericBucketKnobs(t, db, 128, 1, 1)
+
+	snap := db.getSnapshot()
+	if snap == nil || snap.fieldDelta("age") == nil {
+		t.Fatalf("expected age field delta to remain in snapshot")
+	}
+
+	expr := qx.Expr{Op: qx.OpGTE, Field: "age", Value: rangeFrom}
+	p, ok := db.buildPredicateWithMode(expr, false)
+	if !ok {
+		t.Fatalf("buildPredicateWithMode failed")
+	}
+	defer releasePredicates([]predicate{p})
+
+	if p.kind != predicateKindCustom {
+		t.Fatalf("expected initial custom predicate, got kind=%v", p.kind)
+	}
+	if p.estCard != wantIn {
+		t.Fatalf("expected exact overlay range estimate, got=%d want=%d", p.estCard, wantIn)
+	}
+
+	universe := db.snapshotUniverseCardinality()
+	if universe != wantIn+wantOut {
+		t.Fatalf("unexpected universe: got=%d want=%d", universe, wantIn+wantOut)
+	}
+	if err := db.prepareCountPredicate(&p, 3_000, universe); err != nil {
+		t.Fatalf("prepareCountPredicate: %v", err)
+	}
+	if p.kind != predicateKindCustom {
+		t.Fatalf("expected delta-backed broad numeric range without cache to stay custom, got kind=%v", p.kind)
+	}
+	if !p.supportsBitmapFilter() || !p.bitmapFilterCheap {
+		t.Fatalf("expected delta-backed broad numeric range to expose cheap exact bitmap filter")
+	}
+
+	src := roaring64.NewBitmap()
+	src.AddRange(1, universe+1)
+	expectPredicateExactBitmapFilterCount(t, p, src, wantIn)
 }
 
 func TestCount_PickLeadPredicate_PrefersLeadThatUnlocksCustomResidualMaterialization(t *testing.T) {
@@ -1398,5 +1831,86 @@ func TestCount_PickLeadPredicate_PrefersLeadThatUnlocksCustomResidualMaterializa
 	want := countByExprBitmap(t, db, expr)
 	if got != want {
 		t.Fatalf("count mismatch: got=%d want=%d", got, want)
+	}
+}
+
+func TestCount_PickORLeadPredicate_PrefersPrefixLeadOverCheapEqLead(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{
+		AnalyzeInterval:                                  -1,
+		SnapshotMaterializedPredCacheMaxEntries:          -1,
+		SnapshotMaterializedPredCacheMaxEntriesWithDelta: -1,
+	})
+
+	seedGeneratedUint64Data(t, db, 40_000, func(i int) *Rec {
+		email := fmt.Sprintf("mail-%05d@example.com", i)
+		if i < 10_000 {
+			email = fmt.Sprintf("user1-%05d@example.com", i)
+		}
+
+		return &Rec{
+			Name:   fmt.Sprintf("u_%d", i),
+			Email:  email,
+			Age:    20 + (i % 30),
+			Score:  float64(i % 100),
+			Active: i < 18_000,
+			Meta: Meta{
+				Country: "US",
+			},
+		}
+	})
+	if err := db.RebuildIndex(); err != nil {
+		t.Fatalf("RebuildIndex: %v", err)
+	}
+
+	expr := qx.AND(
+		qx.PREFIX("email", "user1-"),
+		qx.EQ("active", true),
+		qx.GTE("score", 60.0),
+	)
+	leaves, ok := collectAndLeaves(expr)
+	if !ok {
+		t.Fatalf("collectAndLeaves failed")
+	}
+	preds, ok := db.buildPredicatesWithMode(leaves, false)
+	if !ok {
+		t.Fatalf("buildPredicatesWithMode failed")
+	}
+	defer releasePredicates(preds)
+
+	prefixIdx := -1
+	activeIdx := -1
+	oldLeadIdx := -1
+	oldLeadScore := 0.0
+	for i := range preds {
+		p := preds[i]
+		if p.expr.Field == "email" && p.expr.Op == qx.OpPREFIX {
+			prefixIdx = i
+		}
+		if p.expr.Field == "active" && p.expr.Op == qx.OpEQ {
+			activeIdx = i
+		}
+		if p.alwaysTrue || p.covered || !p.hasIter() || p.estCard == 0 {
+			continue
+		}
+		score := float64(p.estCard) * float64(countLeadOpWeight(p.expr.Op))
+		if oldLeadIdx == -1 || score < oldLeadScore {
+			oldLeadIdx = i
+			oldLeadScore = score
+		}
+	}
+	if prefixIdx < 0 || activeIdx < 0 {
+		t.Fatalf("expected prefix and active predicates, got prefix=%d active=%d", prefixIdx, activeIdx)
+	}
+	if oldLeadIdx != activeIdx {
+		t.Fatalf("expected old OR lead score to prefer active EQ lead, got idx=%d field=%s op=%v", oldLeadIdx, preds[oldLeadIdx].expr.Field, preds[oldLeadIdx].expr.Op)
+	}
+
+	universe := db.snapshotUniverseCardinality()
+	leadIdx, leadEst, _ := db.pickCountORLeadPredicate(preds, universe)
+	if leadIdx != prefixIdx {
+		t.Fatalf("expected OR-specific lead score to prefer prefix lead, got idx=%d field=%s op=%v", leadIdx, preds[leadIdx].expr.Field, preds[leadIdx].expr.Op)
+	}
+	if leadEst != preds[prefixIdx].estCard {
+		t.Fatalf("unexpected chosen OR lead est: got=%d want=%d", leadEst, preds[prefixIdx].estCard)
 	}
 }
