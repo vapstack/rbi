@@ -610,3 +610,55 @@ func TestNumericRangeBucketSpanCache_RespectsBitmapCardinalityGuard(t *testing.T
 		t.Fatal("expected oversized full-span bitmap to be rejected by cache guard")
 	}
 }
+
+func TestNumericRangeBucketIndex_CountBaseRangeMatchesExact(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{
+		SnapshotMaterializedPredCacheMaxEntries:          -1,
+		SnapshotMaterializedPredCacheMaxEntriesWithDelta: -1,
+	})
+
+	seedGeneratedUint64Data(t, db, 6_000, func(i int) *Rec {
+		return &Rec{
+			Name:  fmt.Sprintf("u_%d", i),
+			Age:   i / 3,
+			Score: float64(i),
+		}
+	})
+	if err := db.RebuildIndex(); err != nil {
+		t.Fatalf("RebuildIndex: %v", err)
+	}
+
+	setNumericBucketKnobs(t, db, 128, 1, 1)
+
+	fm := db.fields["age"]
+	if fm == nil {
+		t.Fatalf("expected age field metadata")
+	}
+	slice := db.snapshotFieldIndexSlice("age")
+	if slice == nil {
+		t.Fatalf("expected age field index slice")
+	}
+
+	cases := []struct {
+		start int
+		end   int
+	}{
+		{start: 0, end: 2_000},
+		{start: 5, end: 137},
+		{start: 127, end: 513},
+		{start: 255, end: 1_001},
+		{start: 1_777, end: 2_000},
+	}
+	for _, tc := range cases {
+		got, ok := db.tryCountSnapshotNumericRange("age", fm, slice, tc.start, tc.end)
+		if !ok {
+			t.Fatalf("tryCountSnapshotNumericRange(%d,%d) failed", tc.start, tc.end)
+		}
+		want := countBaseIndexRangeCardinality(*slice, tc.start, tc.end)
+		if got != want {
+			t.Fatalf("range count mismatch for [%d:%d): got=%d want=%d", tc.start, tc.end, got, want)
+		}
+	}
+
+	_ = requireNumericRangeBucketCacheEntry(t, db.getSnapshot(), "age")
+}

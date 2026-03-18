@@ -1296,6 +1296,18 @@ func shouldUseCountBroadRangeComplementMaterialization(p predicate, leadProbeEst
 	return p.estCard >= threshold
 }
 
+func shouldTryExactNumericCountBroadRangeComplement(p predicate, leadProbeEst uint64, universe uint64) bool {
+	if universe == 0 || leadProbeEst == 0 || p.kind != predicateKindCustom || p.expr.Not {
+		return false
+	}
+	switch p.expr.Op {
+	case qx.OpGT, qx.OpGTE, qx.OpLT, qx.OpLTE:
+		return true
+	default:
+		return false
+	}
+}
+
 func countBroadRangeComplementMaxCardinality(leadProbeEst, universe uint64) uint64 {
 	limit := uint64(countPredBroadRangeComplementMaxCard)
 	if leadProbeEst == 0 || universe == 0 {
@@ -1355,6 +1367,13 @@ func countBaseIndexRangeCardinality(s []index, start, end int) uint64 {
 	return total
 }
 
+func (db *DB[K, V]) countBaseIndexRangeCardinalityExact(field string, fm *field, slice *[]index, start, end int) uint64 {
+	if exact, ok := db.tryCountSnapshotNumericRange(field, fm, slice, start, end); ok {
+		return exact
+	}
+	return countBaseIndexRangeCardinality(*slice, start, end)
+}
+
 func tryPrepareCountBroadRangeComplementPostingPredicate(p *predicate, complement []postingList) bool {
 	if p == nil || len(complement) == 0 || len(complement) > countPredBroadRangeComplementPostingMaxBuckets {
 		return false
@@ -1386,7 +1405,9 @@ func (db *DB[K, V]) tryMaterializeBroadRangeComplementPredicateForCount(p *predi
 	if p == nil {
 		return false
 	}
-	if !shouldUseCountBroadRangeComplementMaterialization(*p, leadProbeEst, universe) {
+	coarseEligible := shouldUseCountBroadRangeComplementMaterialization(*p, leadProbeEst, universe)
+	exactEligible := shouldTryExactNumericCountBroadRangeComplement(*p, leadProbeEst, universe)
+	if !coarseEligible && !exactEligible {
 		return false
 	}
 	snap := db.getSnapshot()
@@ -1396,6 +1417,9 @@ func (db *DB[K, V]) tryMaterializeBroadRangeComplementPredicateForCount(p *predi
 
 	fm := db.fields[p.expr.Field]
 	if fm == nil || fm.Slice {
+		return false
+	}
+	if !coarseEligible && !isNumericScalarKind(fm.Kind) {
 		return false
 	}
 	key, isSlice, err := db.exprValueToIdxScalar(qx.Expr{Op: p.expr.Op, Field: p.expr.Field, Value: p.expr.Value})
@@ -1461,7 +1485,7 @@ func (db *DB[K, V]) tryMaterializeBroadRangeComplementPredicateForCount(p *predi
 			complementStart = end
 			complementEnd = len(s)
 		}
-		complementEst := countBaseIndexRangeCardinality(s, complementStart, complementEnd)
+		complementEst := db.countBaseIndexRangeCardinalityExact(p.expr.Field, fm, slice, complementStart, complementEnd)
 		if complementEst == 0 || complementEst > countBroadRangeComplementMaxCardinality(leadProbeEst, universe) {
 			return false
 		}
@@ -1524,10 +1548,25 @@ func (db *DB[K, V]) tryMaterializeBroadRangeComplementPredicateForCount(p *predi
 		return true
 	}
 
-	complementProbe := newBaseRangeProbe(s, start, end, true)
-	complementEst := complementProbe.probeEst
+	var (
+		complementProbe baseRangeProbe
+		complementEst   uint64
+	)
+	if left, ok := db.tryCountSnapshotNumericRange(p.expr.Field, fm, slice, 0, start); ok {
+		right, ok := db.tryCountSnapshotNumericRange(p.expr.Field, fm, slice, end, len(s))
+		if !ok {
+			return false
+		}
+		complementEst = satAddUint64(left, right)
+	} else {
+		complementProbe = newBaseRangeProbe(s, start, end, true)
+		complementEst = complementProbe.probeEst
+	}
 	if complementEst == 0 || complementEst > countBroadRangeComplementMaxCardinality(leadProbeEst, universe) {
 		return false
+	}
+	if complementProbe.probeLen == 0 {
+		complementProbe = newBaseRangeProbe(s, start, end, true)
 	}
 	if complementProbe.probeLen > 0 && complementProbe.probeLen <= countPredBroadRangeComplementPostingMaxBuckets {
 		complement := make([]postingList, 0, complementProbe.probeLen)
@@ -1817,27 +1856,12 @@ func (db *DB[K, V]) tryCountByPredicates(expr qx.Expr, trace *queryTrace) (uint6
 
 	// Prefer leads that stay cheap under repeated predicate scans; broad
 	// HASANY unions are better left to bitmap fallback than to posts_union scans.
-	leadIdx := -1
-	leadEst := uint64(0)
-	leadScore := 0.0
 	for i := range preds {
-		p := preds[i]
-		if p.alwaysFalse {
+		if preds[i].alwaysFalse {
 			return 0, true, nil
 		}
-		if p.alwaysTrue || p.covered || !p.hasIter() || p.estCard == 0 {
-			continue
-		}
-		if countLeadTooRisky(p.expr.Op, p.estCard, universe) {
-			continue
-		}
-		score := float64(p.estCard) * float64(countPredicateLeadWeight(p))
-		if leadIdx == -1 || score < leadScore {
-			leadIdx = i
-			leadEst = p.estCard
-			leadScore = score
-		}
 	}
+	leadIdx, leadEst, _ := db.pickCountLeadPredicate(preds, universe)
 	if leadIdx < 0 {
 		return 0, false, nil
 	}
@@ -2579,6 +2603,16 @@ func countLeadTooRisky(op qx.Op, est, universe uint64) bool {
 	}
 }
 
+func satMulUint64(a, b uint64) uint64 {
+	if a == 0 || b == 0 {
+		return 0
+	}
+	if ^uint64(0)/a < b {
+		return ^uint64(0)
+	}
+	return a * b
+}
+
 func countPredicateLeadWeight(p predicate) uint64 {
 	switch p.expr.Op {
 	case qx.OpEQ:
@@ -2594,6 +2628,138 @@ func countPredicateLeadWeight(p predicate) uint64 {
 	default:
 		return countLeadOpWeight(p.expr.Op)
 	}
+}
+
+func countPredicateLeadScanWeight(p predicate) uint64 {
+	weight := countPredicateLeadWeight(p)
+	if p.kind != predicateKindCustom {
+		return weight
+	}
+	switch p.expr.Op {
+	case qx.OpGT, qx.OpGTE, qx.OpLT, qx.OpLTE, qx.OpPREFIX:
+		return satMulUint64(weight, 3)
+	default:
+		return weight
+	}
+}
+
+func (db *DB[K, V]) countPredicateCanUseExactNumericComplement(p predicate, probeEst, universe uint64) bool {
+	if !shouldTryExactNumericCountBroadRangeComplement(p, probeEst, universe) {
+		return false
+	}
+	fm := db.fields[p.expr.Field]
+	if fm == nil || fm.Slice || !isNumericScalarKind(fm.Kind) {
+		return false
+	}
+	snap := db.getSnapshot()
+	if snap == nil || snap.fieldDelta(p.expr.Field) != nil {
+		return false
+	}
+	return true
+}
+
+func (db *DB[K, V]) countPredicateResidualCheckWeight(p predicate, probeEst, universe uint64) uint64 {
+	if p.alwaysTrue || p.covered {
+		return 0
+	}
+	if p.alwaysFalse {
+		return ^uint64(0) / 4
+	}
+	if shouldUseCountLeadResidualHasAnyExactFilter(p) {
+		return 1
+	}
+	if shouldMaterializeCountSetPredicate(p, probeEst, universe) {
+		return 1
+	}
+	if shouldUseCountBroadRangeComplementMaterialization(p, probeEst, universe) ||
+		db.countPredicateCanUseExactNumericComplement(p, probeEst, universe) {
+		return 1
+	}
+	if shouldMaterializeCustomCountPredicate(p, probeEst, universe) {
+		switch p.expr.Op {
+		case qx.OpPREFIX:
+			return 1
+		case qx.OpSUFFIX:
+			return 2
+		case qx.OpCONTAINS:
+			return 2
+		default:
+			return 1
+		}
+	}
+
+	var weight uint64
+	switch p.expr.Op {
+	case qx.OpEQ, qx.OpNOOP:
+		weight = 1
+	case qx.OpIN, qx.OpHAS:
+		weight = 2
+	case qx.OpHASANY:
+		weight = 3
+	case qx.OpGT, qx.OpGTE, qx.OpLT, qx.OpLTE:
+		weight = 4
+	case qx.OpPREFIX:
+		weight = 6
+	case qx.OpSUFFIX:
+		weight = 8
+	case qx.OpCONTAINS:
+		weight = 10
+	default:
+		weight = uint64(max(2, p.checkCost()+2))
+	}
+	if p.expr.Not {
+		weight++
+	}
+	return weight
+}
+
+func (db *DB[K, V]) countLeadResidualScore(p predicate, leadEst, universe uint64) uint64 {
+	if leadEst == 0 || p.alwaysTrue || p.covered {
+		return 0
+	}
+	weight := db.countPredicateResidualCheckWeight(p, leadEst, universe)
+	if weight == 0 {
+		return 0
+	}
+	effectiveRows := leadEst
+	if p.estCard > 0 && p.estCard < effectiveRows {
+		effectiveRows = p.estCard
+	}
+	return satMulUint64(effectiveRows, weight)
+}
+
+func (db *DB[K, V]) pickCountLeadPredicate(preds []predicate, universe uint64) (int, uint64, uint64) {
+	leadIdx := -1
+	leadEst := uint64(0)
+	leadScore := uint64(0)
+
+	for i := range preds {
+		p := preds[i]
+		if p.alwaysTrue || p.covered || !p.hasIter() || p.estCard == 0 {
+			continue
+		}
+		if countLeadTooRisky(p.expr.Op, p.estCard, universe) {
+			continue
+		}
+
+		score := satMulUint64(p.estCard, countPredicateLeadScanWeight(p))
+		if p.leadIterNeedsContainsCheck() {
+			score = satAddUint64(score, db.countLeadResidualScore(p, p.estCard, universe))
+		}
+		for j := range preds {
+			if j == i {
+				continue
+			}
+			score = satAddUint64(score, db.countLeadResidualScore(preds[j], p.estCard, universe))
+		}
+
+		if leadIdx == -1 || score < leadScore {
+			leadIdx = i
+			leadEst = p.estCard
+			leadScore = score
+		}
+	}
+	return leadIdx, leadEst, leadScore
 }
 
 // tryCountORByPredicates counts top-level OR expressions via branch lead scans.

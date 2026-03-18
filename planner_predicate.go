@@ -2558,14 +2558,16 @@ func (db *DB[K, V]) buildPredRangeWithMode(e qx.Expr, fm *field, slice *[]index,
 	outBuckets := len(s) - inBuckets
 	useComplement := outBuckets < inBuckets
 
-	// estimation is only for lead selection;
-	// keep it cheap and avoid full-range cardinality scans
 	var est uint64
-	if inBuckets == 1 {
+	if exact, ok := db.tryCountSnapshotNumericRange(e.Field, fm, slice, start, end); ok {
+		est = exact
+	} else if inBuckets == 1 {
 		if ids := s[start].IDs; !ids.IsEmpty() {
 			est = ids.Cardinality()
 		}
 	} else {
+		// Fallback estimate is only for lead selection;
+		// keep it cheap when exact numeric stats are not available.
 		ix0 := start
 		ix1 := start + inBuckets/2
 		ix2 := end - 1

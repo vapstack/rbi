@@ -14,12 +14,14 @@ type numericRangeBucket struct {
 	start int
 	end   int
 	ids   *roaring64.Bitmap
+	rows  uint64
 }
 
 type numericRangeBucketIndex struct {
 	bucketSize      int
 	keyCount        int
 	buckets         []numericRangeBucket
+	prefixRows      []uint64
 	superBucketSpan int
 	superBuckets    []numericRangeBucket
 }
@@ -115,6 +117,56 @@ func (idx *numericRangeBucketIndex) fullBucketSpan(br overlayRange) (start, end 
 	return start, end, true
 }
 
+func satAddUint64(total, add uint64) uint64 {
+	if ^uint64(0)-total < add {
+		return ^uint64(0)
+	}
+	return total + add
+}
+
+func (idx *numericRangeBucketIndex) fullBucketRows(startFull, endFull int) uint64 {
+	if idx == nil || startFull < 0 || endFull < startFull || endFull >= len(idx.buckets) {
+		return 0
+	}
+	if len(idx.prefixRows) != len(idx.buckets)+1 {
+		return 0
+	}
+	return idx.prefixRows[endFull+1] - idx.prefixRows[startFull]
+}
+
+func (idx *numericRangeBucketIndex) countBaseRange(base []index, start, end int) (uint64, bool) {
+	if idx == nil || idx.bucketSize <= 0 || len(idx.buckets) == 0 {
+		return 0, false
+	}
+	if len(base) != idx.keyCount || start < 0 || start > end || end > len(base) {
+		return 0, false
+	}
+	if start >= end {
+		return 0, true
+	}
+
+	startFull := start / idx.bucketSize
+	if startFull < len(idx.buckets) && idx.buckets[startFull].start < start {
+		startFull++
+	}
+	endFull := (end - 1) / idx.bucketSize
+	if endFull >= 0 && endFull < len(idx.buckets) && idx.buckets[endFull].end > end {
+		endFull--
+	}
+
+	if startFull > endFull {
+		return countBaseIndexRangeCardinality(base, start, end), true
+	}
+
+	total := idx.fullBucketRows(startFull, endFull)
+	leftEnd := min(end, idx.buckets[startFull].start)
+	rightStart := max(start, idx.buckets[endFull].end)
+
+	total = satAddUint64(total, countBaseIndexRangeCardinality(base, start, leftEnd))
+	total = satAddUint64(total, countBaseIndexRangeCardinality(base, rightStart, end))
+	return total, true
+}
+
 func orBaseIndexRange(dst *roaring64.Bitmap, base []index, start, end int) {
 	if dst == nil || start >= end {
 		return
@@ -197,17 +249,20 @@ func buildNumericRangeBucketIndex(base []index, bucketSize, minFieldKeys int) *n
 		bucketSize: bucketSize,
 		keyCount:   len(base),
 		buckets:    make([]numericRangeBucket, 0, bucketCount),
+		prefixRows: make([]uint64, 1, bucketCount+1),
 	}
 
 	for start := 0; start < len(base); start += bucketSize {
 		end := min(start+bucketSize, len(base))
 
 		var ids *roaring64.Bitmap
+		rows := uint64(0)
 		for i := start; i < end; i++ {
 			src := base[i].IDs
 			if src.IsEmpty() {
 				continue
 			}
+			rows = satAddUint64(rows, src.Cardinality())
 			if ids == nil {
 				ids = roaring64.NewBitmap()
 			}
@@ -221,7 +276,9 @@ func buildNumericRangeBucketIndex(base []index, bucketSize, minFieldKeys int) *n
 			start: start,
 			end:   end,
 			ids:   ids,
+			rows:  rows,
 		})
+		out.prefixRows = append(out.prefixRows, satAddUint64(out.prefixRows[len(out.prefixRows)-1], rows))
 	}
 
 	out.buildSuperBuckets(16)
@@ -407,4 +464,23 @@ func (db *DB[K, V]) tryEvalNumericRangeBuckets(field string, fm *field, ov field
 	}
 
 	return bitmap{bm: res, readonly: readonly}, true
+}
+
+func (db *DB[K, V]) tryCountSnapshotNumericRange(field string, fm *field, base *[]index, start, end int) (uint64, bool) {
+	if fm == nil || fm.Slice || !isNumericScalarKind(fm.Kind) {
+		return 0, false
+	}
+	if base == nil || start < 0 || start > end || end > len(*base) {
+		return 0, false
+	}
+	snap := db.getSnapshot()
+	if snap == nil {
+		return 0, false
+	}
+
+	entry := snap.getNumericRangeBucketCacheEntry(field, base, db.options.NumericRangeBucketSize, db.options.NumericRangeBucketMinFieldKeys)
+	if entry == nil || entry.idx == nil {
+		return 0, false
+	}
+	return entry.idx.countBaseRange(*base, start, end)
 }

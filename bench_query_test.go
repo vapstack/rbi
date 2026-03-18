@@ -455,6 +455,25 @@ func Benchmark_Query_Index_Keys_Heavy_Range_Order_Limit(b *testing.B) {
 	})
 }
 
+func Benchmark_Query_Index_Keys_Heavy_Limit(b *testing.B) {
+	runQueryKeysBenchCacheModes(b, func() *qx.QX {
+		return qx.Query(
+			qx.OR(
+				qx.AND(
+					qx.EQ("country", "DE"),
+					qx.EQ("plan", "enterprise"),
+					qx.HASANY("tags", []string{"go", "security", "ops"}),
+				),
+				qx.AND(
+					qx.PREFIX("email", "user1"),
+					qx.LT("age", 25),
+				),
+				qx.HASNONE("roles", []string{"admin"}),
+			),
+		).Max(10)
+	})
+}
+
 func Benchmark_Query_Index_Keys_Heavy_All(b *testing.B) {
 	runQueryKeysBenchCacheModes(b, func() *qx.QX {
 		return qx.Query(

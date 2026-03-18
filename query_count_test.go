@@ -1163,3 +1163,240 @@ func TestCount_BroadRangeComplementFastMaterializationGate(t *testing.T) {
 		t.Fatalf("expected dense buckets to keep regular complement materialization")
 	}
 }
+
+func TestCount_PreparePredicate_UsesExactNumericEstimateForSkewedBroadRange(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{
+		AnalyzeInterval:                                  -1,
+		SnapshotCompactorRequestEveryNWrites:             1 << 30,
+		SnapshotCompactorIdleInterval:                    -1,
+		SnapshotDeltaLayerMaxDepth:                       1 << 30,
+		SnapshotMaterializedPredCacheMaxEntries:          -1,
+		SnapshotMaterializedPredCacheMaxEntriesWithDelta: -1,
+	})
+
+	db.DisableSync()
+	defer db.EnableSync()
+
+	var (
+		id        uint64
+		wantIn    uint64
+		wantOut   uint64
+		sampleA   = 1_000
+		sampleB   = 5_500
+		sampleC   = 9_999
+		rangeFrom = 1_000
+	)
+	const batchSize = 20_000
+	batchIDs := make([]uint64, 0, batchSize)
+	batchVals := make([]*Rec, 0, batchSize)
+	flush := func() {
+		if len(batchIDs) == 0 {
+			return
+		}
+		if err := db.BatchSet(batchIDs, batchVals); err != nil {
+			t.Fatalf("BatchSet(seed batch=%d): %v", len(batchIDs), err)
+		}
+		batchIDs = batchIDs[:0]
+		batchVals = batchVals[:0]
+	}
+
+	for age := 0; age < 10_000; age++ {
+		reps := 10
+		if age < rangeFrom {
+			reps = 3
+		}
+		if age == sampleA || age == sampleB || age == sampleC {
+			reps = 1
+		}
+		for rep := 0; rep < reps; rep++ {
+			id++
+			batchIDs = append(batchIDs, id)
+			batchVals = append(batchVals, &Rec{
+				Name:   fmt.Sprintf("u_%d_%d", age, rep),
+				Email:  fmt.Sprintf("user_%d_%d@example.com", age, rep),
+				Age:    age,
+				Score:  float64(rep),
+				Active: rep%2 == 0,
+				Meta: Meta{
+					Country: "US",
+				},
+			})
+			if len(batchIDs) == cap(batchIDs) {
+				flush()
+			}
+		}
+		if age >= rangeFrom {
+			wantIn += uint64(reps)
+		} else {
+			wantOut += uint64(reps)
+		}
+	}
+	flush()
+	if err := db.RebuildIndex(); err != nil {
+		t.Fatalf("RebuildIndex: %v", err)
+	}
+
+	setNumericBucketKnobs(t, db, 128, 1, 1)
+
+	expr := qx.Expr{Op: qx.OpGTE, Field: "age", Value: rangeFrom}
+	p, ok := db.buildPredicateWithMode(expr, false)
+	if !ok {
+		t.Fatalf("buildPredicateWithMode failed")
+	}
+	defer releasePredicates([]predicate{p})
+
+	if p.kind != predicateKindCustom {
+		t.Fatalf("expected initial custom predicate, got kind=%v", p.kind)
+	}
+	if p.estCard != wantIn {
+		t.Fatalf("expected exact numeric range estimate, got=%d want=%d", p.estCard, wantIn)
+	}
+
+	universe := db.snapshotUniverseCardinality()
+	if universe != wantIn+wantOut {
+		t.Fatalf("unexpected universe: got=%d want=%d", universe, wantIn+wantOut)
+	}
+	if err := db.prepareCountPredicate(&p, 3_000, universe); err != nil {
+		t.Fatalf("prepareCountPredicate: %v", err)
+	}
+	if p.kind != predicateKindBitmapNot {
+		t.Fatalf("expected skewed broad numeric range to switch to bitmapNot complement, got kind=%v", p.kind)
+	}
+	if p.bm == nil {
+		t.Fatalf("expected complement bitmap")
+	}
+	if got := p.bm.GetCardinality(); got != wantOut {
+		t.Fatalf("unexpected complement cardinality: got=%d want=%d", got, wantOut)
+	}
+}
+
+func TestCount_PickLeadPredicate_PrefersLeadThatUnlocksCustomResidualMaterialization(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{
+		AnalyzeInterval:                                  -1,
+		SnapshotMaterializedPredCacheMaxEntries:          -1,
+		SnapshotMaterializedPredCacheMaxEntriesWithDelta: -1,
+	})
+
+	seedGeneratedUint64Data(t, db, 40_000, func(i int) *Rec {
+		active := i <= 7_000
+
+		country := "FR"
+		switch {
+		case i <= 4_500 || (i > 20_000 && i <= 24_500):
+			country = "US"
+		case (i > 4_500 && i <= 9_000) || (i > 24_500 && i <= 29_000):
+			country = "DE"
+		}
+
+		name := fmt.Sprintf("user-%05d", i)
+		if i <= 30_000 {
+			name = "needle-" + name
+		}
+
+		return &Rec{
+			Name:   name,
+			Email:  fmt.Sprintf("user%05d@example.com", i),
+			Age:    20 + (i % 40),
+			Score:  float64(i % 1_000),
+			Active: active,
+			Meta: Meta{
+				Country: country,
+			},
+		}
+	})
+	if err := db.RebuildIndex(); err != nil {
+		t.Fatalf("RebuildIndex: %v", err)
+	}
+
+	expr := qx.AND(
+		qx.EQ("active", true),
+		qx.IN("country", []string{"US", "DE"}),
+		qx.CONTAINS("name", "needle"),
+	)
+	leaves, ok := collectAndLeaves(expr)
+	if !ok {
+		t.Fatalf("collectAndLeaves failed")
+	}
+	preds, ok := db.buildPredicatesWithMode(leaves, false)
+	if !ok {
+		t.Fatalf("buildPredicatesWithMode failed")
+	}
+	defer releasePredicates(preds)
+
+	activeIdx := -1
+	countryIdx := -1
+	containsIdx := -1
+	oldLeadIdx := -1
+	oldLeadEst := uint64(0)
+	oldLeadScore := 0.0
+	for i := range preds {
+		p := preds[i]
+		if p.expr.Field == "active" && p.expr.Op == qx.OpEQ {
+			activeIdx = i
+		}
+		if p.expr.Field == "country" && p.expr.Op == qx.OpIN {
+			countryIdx = i
+		}
+		if p.expr.Field == "name" && p.expr.Op == qx.OpCONTAINS {
+			containsIdx = i
+		}
+		if p.alwaysTrue || p.covered || !p.hasIter() || p.estCard == 0 {
+			continue
+		}
+		score := float64(p.estCard) * float64(countPredicateLeadWeight(p))
+		if oldLeadIdx == -1 || score < oldLeadScore {
+			oldLeadIdx = i
+			oldLeadEst = p.estCard
+			oldLeadScore = score
+		}
+	}
+	if activeIdx < 0 || countryIdx < 0 || containsIdx < 0 {
+		t.Fatalf("expected active/country/contains predicates, got active=%d country=%d contains=%d", activeIdx, countryIdx, containsIdx)
+	}
+	if oldLeadIdx != activeIdx {
+		t.Fatalf("expected baseline score to prefer active EQ lead, got idx=%d field=%s op=%v", oldLeadIdx, preds[oldLeadIdx].expr.Field, preds[oldLeadIdx].expr.Op)
+	}
+
+	universe := db.snapshotUniverseCardinality()
+	if universe == 0 {
+		t.Fatalf("expected non-empty universe")
+	}
+
+	containsWithOldLead := preds[containsIdx]
+	defer releasePredicates([]predicate{containsWithOldLead})
+	if err := db.prepareCountPredicate(&containsWithOldLead, oldLeadEst, universe); err != nil {
+		t.Fatalf("prepareCountPredicate(old lead): %v", err)
+	}
+	if containsWithOldLead.kind != predicateKindCustom {
+		t.Fatalf("expected old lead probe to keep CONTAINS residual custom, got kind=%v", containsWithOldLead.kind)
+	}
+
+	containsWithCountryLead := preds[containsIdx]
+	defer releasePredicates([]predicate{containsWithCountryLead})
+	if err := db.prepareCountPredicate(&containsWithCountryLead, preds[countryIdx].estCard, universe); err != nil {
+		t.Fatalf("prepareCountPredicate(country lead): %v", err)
+	}
+	if containsWithCountryLead.kind != predicateKindBitmap {
+		t.Fatalf("expected broader IN lead probe to materialize CONTAINS residual, got kind=%v", containsWithCountryLead.kind)
+	}
+
+	leadIdx, leadEst, _ := db.pickCountLeadPredicate(preds, universe)
+	if leadIdx != countryIdx {
+		t.Fatalf("expected residual-aware lead pick to prefer country IN, got idx=%d field=%s op=%v", leadIdx, preds[leadIdx].expr.Field, preds[leadIdx].expr.Op)
+	}
+	if leadEst != preds[countryIdx].estCard {
+		t.Fatalf("unexpected chosen lead est: got=%d want=%d", leadEst, preds[countryIdx].estCard)
+	}
+
+	got, ok, err := db.tryCountByPredicates(expr, nil)
+	if err != nil {
+		t.Fatalf("tryCountByPredicates: %v", err)
+	}
+	if !ok {
+		t.Fatalf("expected tryCountByPredicates fast path")
+	}
+	want := countByExprBitmap(t, db, expr)
+	if got != want {
+		t.Fatalf("count mismatch: got=%d want=%d", got, want)
+	}
+}
