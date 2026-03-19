@@ -2,14 +2,18 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"math"
 	"os"
+	"os/signal"
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 )
 
 const (
@@ -76,37 +80,94 @@ type outputRow struct {
 	Colored []string
 }
 
+type cliOptions struct {
+	follow bool
+}
+
+type followReader struct {
+	path        string
+	offset      int64
+	partial     string
+	pendingName string
+}
+
+var (
+	errFollowInterrupted = errors.New("follow interrupted")
+	errFileTruncated     = errors.New("followed file truncated")
+)
+
 func main() {
 	os.Exit(runCLI(os.Args[1:], os.Stdout, os.Stderr, shouldUseColor()))
 }
 
 func runCLI(args []string, stdout io.Writer, stderr io.Writer, useColor bool) int {
-	if len(args) != 2 {
-		_, _ = fmt.Fprintln(stderr, "usage: benchprint <previous.txt> <current.txt>")
-		return 2
+	options, paths, helpShown, code := parseCLIArgs(args, stderr)
+	if code != 0 {
+		return code
+	}
+	if helpShown {
+		return 0
 	}
 
-	previous, err := parseBenchmarkFile(args[0])
+	previous, err := parseBenchmarkFile(paths[0])
 	if err != nil {
-		_, _ = fmt.Fprintf(stderr, "read %s: %v\n", args[0], err)
-		return 1
-	}
-
-	current, err := parseBenchmarkFile(args[1])
-	if err != nil {
-		_, _ = fmt.Fprintf(stderr, "read %s: %v\n", args[1], err)
+		_, _ = fmt.Fprintf(stderr, "read %s: %v\n", paths[0], err)
 		return 1
 	}
 
 	previousSummaries := summarizeSet(previous)
+	if options.follow {
+		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+		defer stop()
+
+		err := runFollowCLI(previousSummaries, paths[1], stdout, useColor, time.Second, ctx.Done())
+		if err == nil {
+			return 0
+		}
+		if errors.Is(err, errFollowInterrupted) {
+			return 130
+		}
+		_, _ = fmt.Fprintf(stderr, "read %s: %v\n", paths[1], err)
+		return 1
+	}
+
+	current, err := parseBenchmarkFile(paths[1])
+	if err != nil {
+		_, _ = fmt.Fprintf(stderr, "read %s: %v\n", paths[1], err)
+		return 1
+	}
+
 	currentSummaries := summarizeSet(current)
-	rows := buildRows(previousSummaries, current, currentSummaries, useColor)
+	rows := buildRows(previousSummaries, current.Order, currentSummaries, useColor)
 	if len(rows) == 0 {
 		return 0
 	}
 
 	_, _ = fmt.Fprintln(stdout, renderRows(rows))
 	return 0
+}
+
+func parseCLIArgs(args []string, stderr io.Writer) (cliOptions, []string, bool, int) {
+	flags := flag.NewFlagSet("benchdiff", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+
+	options := cliOptions{}
+	flags.BoolVar(&options.follow, "f", false, "follow the current benchmark file")
+
+	if err := flags.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return cliOptions{}, nil, true, 0
+		}
+		return cliOptions{}, nil, false, 2
+	}
+
+	paths := flags.Args()
+	if len(paths) != 2 {
+		_, _ = fmt.Fprintln(stderr, "usage: benchdiff [-f] <previous.txt> <current.txt>")
+		return cliOptions{}, nil, false, 2
+	}
+
+	return options, paths, false, 0
 }
 
 func shouldUseColor() bool {
@@ -289,10 +350,10 @@ func median(values []float64) float64 {
 	return (sorted[middle-1] + sorted[middle]) / 2
 }
 
-func buildRows(previousSummaries map[string]benchmarkSummary, current benchmarkSet, currentSummaries map[string]benchmarkSummary, useColor bool) []outputRow {
-	rows := make([]outputRow, 0, len(current.Order))
+func buildRows(previousSummaries map[string]benchmarkSummary, order []string, currentSummaries map[string]benchmarkSummary, useColor bool) []outputRow {
+	rows := make([]outputRow, 0, len(order))
 
-	for _, name := range current.Order {
+	for _, name := range order {
 		currentSummary, ok := currentSummaries[name]
 		if !ok {
 			continue
@@ -337,6 +398,160 @@ func buildRows(previousSummaries map[string]benchmarkSummary, current benchmarkS
 	}
 
 	return rows
+}
+
+func runFollowCLI(previousSummaries map[string]benchmarkSummary, currentPath string, stdout io.Writer, useColor bool, pollInterval time.Duration, interrupted <-chan struct{}) error {
+	current := newBenchmarkSet()
+	reader := followReader{path: currentPath}
+	widths := estimateFollowWidths(previousSummaries)
+
+	ticker := time.NewTicker(pollInterval)
+	defer ticker.Stop()
+
+	for {
+		changedNames, stop, err := reader.poll(&current)
+		if err != nil {
+			if errors.Is(err, errFileTruncated) {
+				reader.reset()
+				current = newBenchmarkSet()
+				continue
+			}
+			return err
+		}
+
+		if len(changedNames) > 0 {
+			currentSummaries := summarizeSet(current)
+			rows := buildRows(previousSummaries, changedNames, currentSummaries, useColor)
+			if len(rows) > 0 {
+				_, _ = fmt.Fprintln(stdout, renderRowsWithWidths(rows, widths))
+			}
+		}
+
+		if stop {
+			return nil
+		}
+
+		select {
+		case <-interrupted:
+			return errFollowInterrupted
+		case <-ticker.C:
+		}
+	}
+}
+
+func newBenchmarkSet() benchmarkSet {
+	return benchmarkSet{
+		Order:      make([]string, 0),
+		Benchmarks: make(map[string]*benchmarkData),
+	}
+}
+
+func appendBenchmarkRun(set *benchmarkSet, name string, run benchRun) {
+	bench := set.Benchmarks[name]
+	if bench == nil {
+		bench = &benchmarkData{
+			Name:        name,
+			DisplayName: normalizeBenchmarkName(name),
+			Runs:        make([]benchRun, 0, 1),
+		}
+		set.Benchmarks[name] = bench
+		set.Order = append(set.Order, name)
+	}
+
+	bench.Runs = append(bench.Runs, run)
+}
+
+func (reader *followReader) poll(current *benchmarkSet) ([]string, bool, error) {
+	data, err := reader.readNew()
+	if err != nil {
+		return nil, false, err
+	}
+	if len(data) == 0 {
+		if reader.partial != "" && !strings.HasPrefix(strings.TrimSpace(reader.partial), "Benchmark") {
+			return reader.consume(current, "\n")
+		}
+		return nil, false, nil
+	}
+	return reader.consume(current, string(data))
+}
+
+func (reader *followReader) readNew() ([]byte, error) {
+	file, err := os.Open(reader.path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	defer func() { _ = file.Close() }()
+
+	info, err := file.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if info.Size() < reader.offset {
+		return nil, errFileTruncated
+	}
+	if _, err = file.Seek(reader.offset, io.SeekStart); err != nil {
+		return nil, err
+	}
+
+	data, err := io.ReadAll(file)
+	if err != nil {
+		return nil, err
+	}
+	reader.offset += int64(len(data))
+	return data, nil
+}
+
+func (reader *followReader) consume(current *benchmarkSet, chunk string) ([]string, bool, error) {
+	text := reader.partial + chunk
+	lines := strings.Split(text, "\n")
+
+	if strings.HasSuffix(text, "\n") {
+		reader.partial = ""
+		lines = lines[:len(lines)-1]
+	} else {
+		reader.partial = lines[len(lines)-1]
+		lines = lines[:len(lines)-1]
+	}
+
+	completedNames := make([]string, 0)
+
+	for _, rawLine := range lines {
+		line := strings.TrimSpace(rawLine)
+		name, run, ok := parseBenchmarkLine(line)
+		if !ok {
+			if reader.pendingName == "" && len(current.Order) == 0 {
+				continue
+			}
+			if reader.pendingName != "" {
+				completedNames = append(completedNames, reader.pendingName)
+				reader.pendingName = ""
+			}
+			return completedNames, true, nil
+		}
+
+		appendBenchmarkRun(current, name, run)
+		if reader.pendingName == "" {
+			reader.pendingName = name
+			continue
+		}
+		if name == reader.pendingName {
+			continue
+		}
+
+		completedNames = append(completedNames, reader.pendingName)
+		reader.pendingName = name
+	}
+
+	return completedNames, false, nil
+}
+
+func (reader *followReader) reset() {
+	reader.offset = 0
+	reader.partial = ""
+	reader.pendingName = ""
 }
 
 func compareMetric(kind metricKind, previous float64, current float64) metricDisplay {
@@ -533,16 +748,21 @@ func maybeColor(value string, color string, useColor bool) string {
 }
 
 func renderRows(rows []outputRow) string {
+	return renderRowsWithWidths(rows, nil)
+}
+
+func renderRowsWithWidths(rows []outputRow, minWidths []int) string {
 	if len(rows) == 0 {
 		return ""
 	}
 
-	widths := make([]int, len(rows[0].Plain))
-	for _, row := range rows {
-		for i, cell := range row.Plain {
-			if len(cell) > widths[i] {
-				widths[i] = len(cell)
-			}
+	widths := measureRowWidths(rows)
+	for i, width := range minWidths {
+		if i >= len(widths) {
+			break
+		}
+		if width > widths[i] {
+			widths[i] = width
 		}
 	}
 
@@ -564,6 +784,71 @@ func renderRows(rows []outputRow) string {
 	}
 
 	return builder.String()
+}
+
+func measureRowWidths(rows []outputRow) []int {
+	widths := make([]int, len(rows[0].Plain))
+	for _, row := range rows {
+		for i, cell := range row.Plain {
+			if len(cell) > widths[i] {
+				widths[i] = len(cell)
+			}
+		}
+	}
+	return widths
+}
+
+func estimateFollowWidths(previousSummaries map[string]benchmarkSummary) []int {
+	if len(previousSummaries) == 0 {
+		return nil
+	}
+
+	widths := make([]int, 8)
+	for _, summary := range previousSummaries {
+		cells := []string{
+			summary.DisplayName,
+			strconv.FormatInt(summary.Iterations, 10),
+			formatMetricValue(metricNS, summary.NSPerOp),
+			estimateDeltaText(metricNS, summary.NSPerOp),
+			formatMetricValue(metricBytes, summary.BytesPerOp),
+			estimateDeltaText(metricBytes, summary.BytesPerOp),
+			formatMetricValue(metricAllocs, summary.AllocsPerOp),
+			estimateDeltaText(metricAllocs, summary.AllocsPerOp),
+		}
+
+		for i, cell := range cells {
+			if len(cell) > widths[i] {
+				widths[i] = len(cell)
+			}
+		}
+	}
+
+	for i := range widths {
+		if widths[i] > 0 {
+			widths[i]++
+		}
+	}
+
+	return widths
+}
+
+func estimateDeltaText(kind metricKind, previous float64) string {
+	if useUnitSteps(kind, previous, previous) {
+		return formatSignedValue(previous)
+	}
+	if previous == 0 {
+		return "+inf%"
+	}
+
+	widest := ""
+	for _, current := range []float64{0, previous * 2} {
+		change, finite := percentChange(previous, current)
+		candidate := formatPercentChange(change, finite, current)
+		if len(candidate) > len(widest) {
+			widest = candidate
+		}
+	}
+	return widest
 }
 
 func padLeft(value string, visibleLen int, width int) string {
