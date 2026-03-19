@@ -238,7 +238,7 @@ func (db *DB[K, V]) tryQueryOrderBasicWithLimit(q *qx.QX, trace *queryTrace) ([]
 
 	f := order.Field
 	fm := db.fields[f]
-	if fm == nil || fm.Slice {
+	if fm == nil || fm.Slice || fm.Ptr {
 		return nil, false, nil
 	}
 
@@ -267,11 +267,11 @@ func (db *DB[K, V]) tryQueryOrderBasicWithLimit(q *qx.QX, trace *queryTrace) ([]
 			}
 			switch op.Op {
 			case qx.OpGT, qx.OpGTE, qx.OpLT, qx.OpLTE, qx.OpEQ:
-				k, isSlice, err := db.exprValueToIdxScalar(op)
+				k, isSlice, isNil, err := db.exprValueToIdxScalar(op)
 				if err != nil {
 					return nil, true, err
 				}
-				if isSlice {
+				if isSlice || isNil {
 					return nil, false, nil
 				}
 				switch op.Op {
@@ -926,7 +926,7 @@ func (db *DB[K, V]) tryQueryOrderPrefixWithLimit(q *qx.QX, trace *queryTrace) ([
 
 	f := ord.Field
 	fm := db.fields[f]
-	if fm == nil || fm.Slice {
+	if fm == nil || fm.Slice || fm.Ptr {
 		return nil, false, nil
 	}
 
@@ -963,11 +963,11 @@ func (db *DB[K, V]) tryQueryOrderPrefixWithLimit(q *qx.QX, trace *queryTrace) ([
 			if op.Not {
 				return nil, false, nil
 			}
-			p, isSlice, err := db.exprValueToIdxScalar(op)
+			p, isSlice, isNil, err := db.exprValueToIdxScalar(op)
 			if err != nil {
 				return nil, true, err
 			}
-			if isSlice {
+			if isSlice || isNil {
 				return nil, false, nil
 			}
 			hasPrefix = true
@@ -1179,7 +1179,7 @@ func (db *DB[K, V]) tryQueryRangeNoOrderWithLimit(q *qx.QX, trace *queryTrace) (
 		return nil, true, nil
 	}
 
-	key, isSlice, err := db.exprValueToIdxScalar(e)
+	key, isSlice, isNil, err := db.exprValueToIdxScalar(e)
 	if err != nil {
 		return nil, true, err
 	}
@@ -1209,6 +1209,42 @@ func (db *DB[K, V]) tryQueryRangeNoOrderWithLimit(q *qx.QX, trace *queryTrace) (
 
 	skip := q.Offset
 	need := q.Limit
+
+	if isNil {
+		if e.Op != qx.OpEQ {
+			return nil, true, nil
+		}
+		bm, owned := db.nilFieldLookupOwned(f, nil)
+		if bm == nil || bm.IsEmpty() {
+			if owned && bm != nil {
+				releaseRoaringBuf(bm)
+			}
+			return nil, true, nil
+		}
+		out := make([]K, 0, need)
+		cursor := db.newQueryCursor(out, skip, need, false, nil)
+		it := bm.Iterator()
+		var examined uint64
+		for it.HasNext() {
+			examined++
+			if cursor.emit(it.Next()) {
+				trace.addExamined(examined)
+				trace.setEarlyStopReason("limit_reached")
+				releaseRoaringBitmapIterator(it)
+				if owned {
+					releaseRoaringBuf(bm)
+				}
+				return cursor.out, true, nil
+			}
+		}
+		releaseRoaringBitmapIterator(it)
+		if owned {
+			releaseRoaringBuf(bm)
+		}
+		trace.addExamined(examined)
+		trace.setEarlyStopReason("input_exhausted")
+		return cursor.out, true, nil
+	}
 
 	out := make([]K, 0, need)
 	cursor := db.newQueryCursor(out, skip, need, false, nil)
@@ -1315,12 +1351,15 @@ func (db *DB[K, V]) tryQueryPrefixNoOrderWithLimit(q *qx.QX, trace *queryTrace) 
 		return nil, false, nil
 	}
 
-	prefix, isSlice, err := db.exprValueToIdxScalar(e)
+	prefix, isSlice, isNil, err := db.exprValueToIdxScalar(e)
 	if err != nil {
 		return nil, true, err
 	}
 	if isSlice {
 		return nil, false, nil
+	}
+	if isNil {
+		return nil, true, nil
 	}
 
 	ov := db.fieldOverlay(e.Field)

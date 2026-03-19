@@ -343,7 +343,7 @@ func (db *DB[K, V]) execQuery(q *qx.QX, emitTrace bool, prepared bool) (out []K,
 		if !ov.hasData() && !db.hasFieldIndex(order.Field) {
 			return nil, fmt.Errorf("cannot sort non-indexed field: %v", order.Field)
 		}
-		if ov.delta == nil && need > 0 && need <= 256 {
+		if fm := db.fields[order.Field]; ov.delta == nil && need > 0 && need <= 256 && fm != nil && !fm.Ptr {
 			slice := db.snapshotFieldIndexSlice(order.Field)
 			if slice == nil {
 				return nil, fmt.Errorf("cannot sort non-indexed field: %v", order.Field)

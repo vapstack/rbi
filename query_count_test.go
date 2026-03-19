@@ -1173,9 +1173,9 @@ func TestCount_BuildPredicates_DeferBroadRangeMaterialization(t *testing.T) {
 	if !ok {
 		t.Fatalf("collectAndLeaves failed")
 	}
-	rangeKey, isSlice, err := db.exprValueToIdxScalar(qx.Expr{Op: qx.OpGTE, Field: "age", Value: 1_000})
-	if err != nil || isSlice {
-		t.Fatalf("exprValueToIdxScalar failed: err=%v isSlice=%v", err, isSlice)
+	rangeKey, isSlice, isNil, err := db.exprValueToIdxScalar(qx.Expr{Op: qx.OpGTE, Field: "age", Value: 1_000})
+	if err != nil || isSlice || isNil {
+		t.Fatalf("exprValueToIdxScalar failed: err=%v isSlice=%v isNil=%v", err, isSlice, isNil)
 	}
 	cacheKey := db.materializedPredCacheKeyForScalar("age", qx.OpGTE, rangeKey)
 	if cacheKey == "" {
@@ -1412,9 +1412,9 @@ func TestCount_PreparePredicate_UsesProbeBoundedBroadRangeComplement(t *testing.
 				if got := p.bm.GetCardinality(); got <= countPredBroadRangeComplementMaxCard {
 					t.Fatalf("expected complement wider than legacy cap, got=%d", got)
 				}
-				key, isSlice, err := db.exprValueToIdxScalar(expr)
-				if err != nil || isSlice {
-					t.Fatalf("exprValueToIdxScalar: err=%v isSlice=%v", err, isSlice)
+				key, isSlice, isNil, err := db.exprValueToIdxScalar(expr)
+				if err != nil || isSlice || isNil {
+					t.Fatalf("exprValueToIdxScalar: err=%v isSlice=%v isNil=%v", err, isSlice, isNil)
 				}
 				cacheKey := db.materializedPredComplementCacheKeyForScalar(expr.Field, expr.Op, key)
 				cached, ok := db.getSnapshot().loadMaterializedPred(cacheKey)

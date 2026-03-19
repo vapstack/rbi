@@ -257,7 +257,7 @@ func (db *DB[K, V]) evalSimple(e qx.Expr) (bitmap, error) {
 	switch e.Op {
 	case qx.OpEQ:
 		if !f.Slice {
-			key, isSlice, err := db.exprValueToIdxScalar(e)
+			key, isSlice, isNil, err := db.exprValueToIdxScalar(e)
 			if err != nil {
 				return bitmap{}, err
 			}
@@ -265,14 +265,22 @@ func (db *DB[K, V]) evalSimple(e qx.Expr) (bitmap, error) {
 				return bitmap{}, fmt.Errorf("%w: %v expects a single value for scalar field %v", ErrInvalidQuery, e.Op, e.Field)
 			}
 
-			bm, owned := ov.lookupOwned(key, nil)
+			var (
+				bm    *roaring64.Bitmap
+				owned bool
+			)
+			if isNil {
+				bm, owned = db.nilFieldLookupOwned(e.Field, nil)
+			} else {
+				bm, owned = ov.lookupOwned(key, nil)
+			}
 			if bm != nil && !bm.IsEmpty() {
 				return bitmap{bm: bm, readonly: !owned}, nil
 			}
 			return bitmap{bm: getRoaringBuf()}, nil
 
 		} else {
-			vals, isSlice, err := db.exprValueToIdxOwned(e)
+			vals, isSlice, _, err := db.exprValueToIdxOwned(e)
 			if err != nil {
 				return bitmap{}, err
 			}
@@ -286,16 +294,17 @@ func (db *DB[K, V]) evalSimple(e qx.Expr) (bitmap, error) {
 		if f.Slice {
 			return bitmap{}, fmt.Errorf("%w: %v not supported on slice field %v", ErrInvalidQuery, e.Op, e.Field)
 		}
-		vals, isSlice, err := db.exprValueToIdx(e)
+		vals, isSlice, hasNil, err := db.exprValueToIdx(e)
 		if err != nil {
 			return bitmap{}, err
 		}
 		if !isSlice && e.Value != nil {
 			return bitmap{}, fmt.Errorf("%w: %v expects a slice", ErrInvalidQuery, e.Op)
 		}
-		if len(vals) == 0 {
+		if len(vals) == 0 && !hasNil {
 			return bitmap{}, fmt.Errorf("%v: %v: no values provided", ErrInvalidQuery, e.Op)
 		}
+		vals = dedupStringsInplace(vals)
 
 		res := getRoaringBuf()
 		var scratch *roaring64.Bitmap
@@ -314,13 +323,22 @@ func (db *DB[K, V]) evalSimple(e qx.Expr) (bitmap, error) {
 				releaseRoaringBuf(bm)
 			}
 		}
+		if hasNil {
+			bm, owned := db.nilFieldLookupOwned(e.Field, nil)
+			if bm != nil && !bm.IsEmpty() {
+				orBitmapAdaptive(res, bm)
+			}
+			if owned && bm != nil {
+				releaseRoaringBuf(bm)
+			}
+		}
 		return bitmap{bm: res}, nil
 
 	case qx.OpHASANY, qx.OpHAS:
 		if !f.Slice {
 			return bitmap{}, fmt.Errorf("%w: %v not supported on non-slice field %v", ErrInvalidQuery, e.Op, e.Field)
 		}
-		vals, isSlice, err := db.exprValueToIdx(e)
+		vals, isSlice, _, err := db.exprValueToIdx(e)
 		if err != nil {
 			return bitmap{}, err
 		}
@@ -387,12 +405,15 @@ func (db *DB[K, V]) evalSimple(e qx.Expr) (bitmap, error) {
 		return bitmap{bm: res}, nil
 
 	case qx.OpGT, qx.OpGTE, qx.OpLT, qx.OpLTE, qx.OpPREFIX:
-		key, isSlice, err := db.exprValueToIdxScalar(e)
+		key, isSlice, isNil, err := db.exprValueToIdxScalar(e)
 		if err != nil {
 			return bitmap{}, err
 		}
 		if isSlice {
 			return bitmap{}, fmt.Errorf("%w: %v expects a single value", ErrInvalidQuery, e.Op)
+		}
+		if isNil {
+			return bitmap{bm: getRoaringBuf()}, nil
 		}
 		cacheKey := db.materializedPredCacheKeyForScalar(e.Field, e.Op, key)
 		if cacheKey != "" {
@@ -525,12 +546,15 @@ func (db *DB[K, V]) evalSimple(e qx.Expr) (bitmap, error) {
 		return bitmap{bm: res}, nil
 
 	case qx.OpSUFFIX, qx.OpCONTAINS:
-		v, isSlice, err := db.exprValueToIdxScalar(e)
+		v, isSlice, isNil, err := db.exprValueToIdxScalar(e)
 		if err != nil {
 			return bitmap{}, err
 		}
 		if isSlice {
 			return bitmap{}, fmt.Errorf("%w: %v expects a single string value", ErrInvalidQuery, e.Op)
+		}
+		if isNil {
+			return bitmap{bm: getRoaringBuf()}, nil
 		}
 		cacheKey := db.materializedPredCacheKeyForScalar(e.Field, e.Op, v)
 		if cacheKey != "" {
@@ -869,30 +893,95 @@ func scalarValueToIdx(raw any, v reflect.Value) (string, error) {
 	}
 }
 
-func (db *DB[K, V]) exprValueToIdxScalar(expr qx.Expr) (string, bool, error) {
-	if expr.Value == nil {
-		switch expr.Op {
-		case qx.OpIN, qx.OpHAS, qx.OpHASANY:
-			return "", false, nil
-		default:
-			return nilValue, false, nil
+func sliceValueToIdxStrings(v reflect.Value) ([]string, bool, error) {
+	ixs := make([]string, 0, v.Len())
+	hasNil := false
+
+	for i := 0; i < v.Len(); i++ {
+		elem := v.Index(i)
+		raw := any(nil)
+		if elem.IsValid() && elem.CanInterface() {
+			raw = elem.Interface()
 		}
+
+		elem, elemNil := unwrapExprValue(elem)
+		if elemNil {
+			hasNil = true
+			continue
+		}
+		if elem.Kind() == reflect.Slice {
+			return nil, false, fmt.Errorf("unsupported slice element type: %v", elem.Type())
+		}
+
+		key, err := scalarValueToIdx(raw, elem)
+		if err != nil {
+			return nil, false, err
+		}
+		ixs = append(ixs, key)
+	}
+
+	return ixs, hasNil, nil
+}
+
+func (db *DB[K, V]) scalarLookupPostings(field string, keys []string, includeNil bool) ([]postingList, uint64, func()) {
+	postsBuf := getPostingListSliceBuf(len(keys) + btoi(includeNil))
+	posts := postsBuf.values
+	var ownedInline [8]*roaring64.Bitmap
+	owned := ownedInline[:0]
+	var est uint64
+
+	ov := db.fieldOverlay(field)
+	for _, key := range keys {
+		ids, keep := ov.lookupPostingRetained(key)
+		if ids.IsEmpty() {
+			continue
+		}
+		posts = append(posts, ids)
+		est += ids.Cardinality()
+		if keep != nil {
+			owned = append(owned, keep)
+		}
+	}
+	if includeNil {
+		ids, keep := db.nilFieldOverlay(field).lookupPostingRetained(nilIndexEntryKey)
+		if !ids.IsEmpty() {
+			posts = append(posts, ids)
+			est += ids.Cardinality()
+			if keep != nil {
+				owned = append(owned, keep)
+			}
+		}
+	}
+
+	cleanup := func() {
+		if len(owned) > 0 {
+			releaseOwnedBitmapSlice(owned)
+		}
+		postsBuf.values = posts
+		releasePostingListSliceBuf(postsBuf)
+	}
+	return posts, est, cleanup
+}
+
+func (db *DB[K, V]) exprValueToIdxScalar(expr qx.Expr) (string, bool, bool, error) {
+	if expr.Value == nil {
+		return "", false, true, nil
 	}
 
 	v := reflect.ValueOf(expr.Value)
 	v, isNil := unwrapExprValue(v)
 	if isNil {
-		return nilValue, false, nil
+		return "", false, true, nil
 	}
 	if v.Kind() == reflect.Slice {
-		return "", true, nil
+		return "", true, false, nil
 	}
 
 	key, err := scalarValueToIdx(expr.Value, v)
 	if err != nil {
-		return "", false, err
+		return "", false, false, err
 	}
-	return key, false, nil
+	return key, false, false, nil
 }
 
 func (db *DB[K, V]) diffBitmap(acc, sub bitmap) (bitmap, error) {
@@ -910,91 +999,58 @@ func (db *DB[K, V]) diffBitmap(acc, sub bitmap) (bitmap, error) {
 	return res, nil
 }
 
-func (db *DB[K, V]) exprValueToIdx(expr qx.Expr) ([]string, bool, error) {
+func (db *DB[K, V]) exprValueToIdx(expr qx.Expr) ([]string, bool, bool, error) {
 	return db.exprValueToIdxWithMode(expr, false)
 }
 
 // exprValueToIdxOwned returns a slice safe for in-place mutation by callers.
-func (db *DB[K, V]) exprValueToIdxOwned(expr qx.Expr) ([]string, bool, error) {
+func (db *DB[K, V]) exprValueToIdxOwned(expr qx.Expr) ([]string, bool, bool, error) {
 	return db.exprValueToIdxWithMode(expr, true)
 }
 
-func (db *DB[K, V]) exprValueToIdxWithMode(expr qx.Expr, cloneStringSlice bool) ([]string, bool, error) {
+func (db *DB[K, V]) exprValueToIdxWithMode(expr qx.Expr, cloneStringSlice bool) ([]string, bool, bool, error) {
 
 	if expr.Value == nil {
-		switch expr.Op {
-		case qx.OpIN, qx.OpHAS, qx.OpHASANY:
-			return nil, false, nil
-		default:
-			return []string{nilValue}, false, nil
+		if expr.Op == qx.OpIN {
+			return nil, true, false, nil
 		}
+		return nil, false, true, nil
 	}
 	switch v := expr.Value.(type) {
 	case []string:
 		if cloneStringSlice && len(v) > 1 {
-			return slices.Clone(v), true, nil
+			return slices.Clone(v), true, false, nil
 		}
-		return v, true, nil
+		return v, true, false, nil
 	case string:
-		return []string{v}, false, nil
+		return []string{v}, false, false, nil
 	}
 
 	v := reflect.ValueOf(expr.Value)
 	v, isNil := unwrapExprValue(v)
 	if isNil {
-		return []string{nilValue}, false, nil
+		if expr.Op == qx.OpIN {
+			return nil, true, false, nil
+		}
+		return nil, false, true, nil
 	}
 
 	if v.Kind() == reflect.Slice {
-
-		ixs := make([]string, v.Len())
-		etype := v.Type().Elem()
-
-		switch etype.Kind() {
-		case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
-			for i := 0; i < len(ixs); i++ {
-				ixs[i] = int64ByteStr(v.Index(i).Int())
-			}
-		case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
-			for i := 0; i < len(ixs); i++ {
-				ixs[i] = uint64ByteStr(v.Index(i).Uint())
-			}
-		case reflect.Float32, reflect.Float64:
-			for i := 0; i < len(ixs); i++ {
-				ixs[i] = float64ByteStr(v.Index(i).Float())
-			}
-		case reflect.String:
-			for i := 0; i < len(ixs); i++ {
-				ixs[i] = v.Index(i).String()
-			}
-		case reflect.Bool:
-			for i := 0; i < len(ixs); i++ {
-				if v.Index(i).Bool() {
-					ixs[i] = "1"
-				} else {
-					ixs[i] = "0"
-				}
-			}
-		default:
-			if etype.Implements(viType) {
-				for i := 0; i < len(ixs); i++ {
-					ixs[i] = v.Index(i).Interface().(ValueIndexer).IndexingValue()
-				}
-			} else {
-				return nil, true, fmt.Errorf("unsupported slice element type: %v", etype)
-			}
+		ixs, hasNil, err := sliceValueToIdxStrings(v)
+		if err != nil {
+			return nil, true, false, err
 		}
-		return ixs, true, nil
+		return ixs, true, hasNil, nil
 	}
 
 	key, err := scalarValueToIdx(expr.Value, v)
 	if err != nil {
-		return nil, false, err
+		return nil, false, false, err
 	}
 	ixs := make([]string, 1)
 	ixs[0] = key
 
-	return ixs, false, nil
+	return ixs, false, false, nil
 }
 
 type bitmap struct {

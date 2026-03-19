@@ -440,12 +440,12 @@ func TestQuery_OrderBasic_DeepWindowCachePersistsAcrossUnchangedFieldPatch(t *te
 		t.Fatalf("QueryKeys: %v", err)
 	}
 
-	keyValue, isSlice, err := db.exprValueToIdxScalar(qx.Expr{Op: qx.OpLT, Field: "score", Value: 4_000.0})
+	keyValue, isSlice, isNil, err := db.exprValueToIdxScalar(qx.Expr{Op: qx.OpLT, Field: "score", Value: 4_000.0})
 	if err != nil {
 		t.Fatalf("exprValueToIdxScalar: %v", err)
 	}
-	if isSlice {
-		t.Fatalf("unexpected slice scalar key")
+	if isSlice || isNil {
+		t.Fatalf("unexpected scalar flags: isSlice=%v isNil=%v", isSlice, isNil)
 	}
 	cacheKey := materializedPredCacheKeyFromScalar("score", qx.OpLT, keyValue)
 	prevSnap := db.getSnapshot()

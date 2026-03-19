@@ -184,11 +184,11 @@ func (db *DB[K, V]) extractNoOrderBoundsAndRest(leaves []qx.Expr) (string, range
 	bounds.has = true
 	for _, i := range positions {
 		e := leaves[i]
-		k, isSlice, err := db.exprValueToIdxScalar(e)
+		k, isSlice, isNil, err := db.exprValueToIdxScalar(e)
 		if err != nil {
 			return "", rangeBounds{}, nil, true, err
 		}
-		if isSlice {
+		if isSlice || isNil {
 			return "", rangeBounds{}, nil, false, nil
 		}
 		switch e.Op {
@@ -399,7 +399,7 @@ func (db *DB[K, V]) tryLimitQueryOrderBasic(q *qx.QX, leaves []qx.Expr, trace *q
 	}
 
 	fm := db.fields[f]
-	if fm == nil || fm.Slice {
+	if fm == nil || fm.Slice || fm.Ptr {
 		return nil, false, nil
 	}
 
@@ -614,11 +614,11 @@ func (db *DB[K, V]) extractBoundsForField(field string, leaves []qx.Expr) (range
 			return b, nil, false, nil
 		}
 
-		k, isSlice, err := db.exprValueToIdxScalar(e)
+		k, isSlice, isNil, err := db.exprValueToIdxScalar(e)
 		if err != nil {
 			return b, nil, true, err
 		}
-		if isSlice {
+		if isSlice || isNil {
 			return b, nil, false, nil
 		}
 
@@ -703,12 +703,31 @@ func (db *DB[K, V]) buildLeafPred(e qx.Expr) (leafPred, bool, error) {
 			return leafPred{}, false, nil
 		}
 
-		key, isSlice, err := db.exprValueToIdxScalar(e)
+		key, isSlice, isNil, err := db.exprValueToIdxScalar(e)
 		if err != nil {
 			return leafPred{}, true, err
 		}
 		if isSlice {
 			return leafPred{}, false, nil
+		}
+		if isNil {
+			ids, keep := db.nilFieldOverlay(e.Field).lookupPostingRetained(nilIndexEntryKey)
+			if ids.IsEmpty() {
+				return emptyLeaf(), true, nil
+			}
+
+			var release func()
+			if keep != nil {
+				retained := keep
+				release = func() { releaseRoaringBuf(retained) }
+			}
+
+			return leafPred{
+				kind:    leafPredKindPosting,
+				posting: ids,
+				estCard: ids.Cardinality(),
+				release: release,
+			}, true, nil
 		}
 
 		ids, keep := ov.lookupPostingRetained(key)
@@ -734,15 +753,16 @@ func (db *DB[K, V]) buildLeafPred(e qx.Expr) (leafPred, bool, error) {
 			return leafPred{}, false, nil
 		}
 
-		keys, isSlice, err := db.exprValueToIdx(e)
+		keys, isSlice, hasNil, err := db.exprValueToIdx(e)
 		if err != nil {
 			return leafPred{}, true, err
 		}
-		if !isSlice || len(keys) == 0 {
+		if !isSlice || (len(keys) == 0 && !hasNil) {
 			return leafPred{}, false, nil
 		}
+		keys = dedupStringsInplace(keys)
 
-		posts, est, release := ov.lookupPostings(keys)
+		posts, est, release := db.scalarLookupPostings(e.Field, keys, hasNil)
 		if len(posts) == 0 {
 			if release != nil {
 				release()
@@ -762,7 +782,7 @@ func (db *DB[K, V]) buildLeafPred(e qx.Expr) (leafPred, bool, error) {
 			return leafPred{}, false, nil
 		}
 
-		keys, isSlice, err := db.exprValueToIdx(e)
+		keys, isSlice, _, err := db.exprValueToIdx(e)
 		if err != nil {
 			return leafPred{}, true, err
 		}
@@ -819,7 +839,7 @@ func (db *DB[K, V]) buildLeafPred(e qx.Expr) (leafPred, bool, error) {
 			return leafPred{}, false, nil
 		}
 
-		keys, isSlice, err := db.exprValueToIdx(e)
+		keys, isSlice, _, err := db.exprValueToIdx(e)
 		if err != nil {
 			return leafPred{}, true, err
 		}

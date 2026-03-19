@@ -107,7 +107,7 @@ func (db *DB[K, V]) collectPlannerFieldNamesAndUniverse() (*indexSnapshot, []str
 	}
 
 	s := db.getSnapshot()
-	fields := s.fieldNameSet()
+	fields := s.indexedFieldNameSet()
 
 	fieldNames := make([]string, 0, len(fields))
 	for fieldName := range fields {
@@ -351,7 +351,7 @@ func (db *DB[K, V]) refreshPlannerStatsLocked() {
 
 func (db *DB[K, V]) buildPlannerStatsSnapshotLocked(version uint64) *plannerStatsSnapshot {
 	snap := db.getSnapshot()
-	fields := snap.fieldNameSet()
+	fields := snap.indexedFieldNameSet()
 
 	out := &plannerStatsSnapshot{
 		Version:             version,

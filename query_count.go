@@ -108,11 +108,16 @@ func (db *DB[K, V]) tryCountByScalarLookup(expr qx.Expr, trace *queryTrace) (uin
 
 	switch expr.Op {
 	case qx.OpEQ:
-		key, isSlice, err := db.exprValueToIdxScalar(expr)
+		key, isSlice, isNil, err := db.exprValueToIdxScalar(expr)
 		if err != nil || isSlice {
 			return 0, false, err
 		}
-		hit := ov.lookupCardinality(key)
+		hit := uint64(0)
+		if isNil {
+			hit = db.nilFieldOverlay(expr.Field).lookupCardinality(nilIndexEntryKey)
+		} else {
+			hit = ov.lookupCardinality(key)
+		}
 		if trace != nil {
 			trace.setPlan(PlanCountScalarLookup)
 			trace.addExamined(hit)
@@ -120,8 +125,8 @@ func (db *DB[K, V]) tryCountByScalarLookup(expr qx.Expr, trace *queryTrace) (uin
 		return countScalarLookupComplement(db.snapshotUniverseCardinality(), hit, expr.Not), true, nil
 
 	case qx.OpIN:
-		vals, isSlice, err := db.exprValueToIdxOwned(expr)
-		if err != nil || !isSlice || len(vals) == 0 {
+		vals, isSlice, hasNil, err := db.exprValueToIdxOwned(expr)
+		if err != nil || !isSlice || (len(vals) == 0 && !hasNil) {
 			return 0, false, err
 		}
 		vals = dedupStringsInplace(vals)
@@ -129,6 +134,9 @@ func (db *DB[K, V]) tryCountByScalarLookup(expr qx.Expr, trace *queryTrace) (uin
 		var sum uint64
 		for _, key := range vals {
 			sum += ov.lookupCardinality(key)
+		}
+		if hasNil {
+			sum += db.nilFieldOverlay(expr.Field).lookupCardinality(nilIndexEntryKey)
 		}
 		if trace != nil {
 			trace.setPlan(PlanCountScalarLookup)
@@ -307,11 +315,18 @@ func (db *DB[K, V]) tryCountByScalarInSplit(expr qx.Expr, trace *queryTrace) (ui
 		if fm == nil || fm.Slice {
 			continue
 		}
-		vals, isSlice, err := db.exprValueToIdxOwned(qx.Expr{Op: qx.OpIN, Field: e.Field, Value: e.Value})
-		if err != nil || !isSlice || len(vals) < 2 || len(vals) > countScalarInSplitMaxValues {
+		vals, isSlice, hasNil, err := db.exprValueToIdxOwned(qx.Expr{Op: qx.OpIN, Field: e.Field, Value: e.Value})
+		totalVals := len(vals)
+		if hasNil {
+			totalVals++
+		}
+		if err != nil || !isSlice || totalVals < 2 || totalVals > countScalarInSplitMaxValues {
 			continue
 		}
 		n := len(dedupStringsInplace(vals))
+		if hasNil {
+			n++
+		}
 		if n < 2 {
 			continue
 		}
@@ -330,12 +345,16 @@ func (db *DB[K, V]) tryCountByScalarInSplit(expr qx.Expr, trace *queryTrace) (ui
 		return 0, false, nil
 	}
 
-	vals, isSlice, err := db.exprValueToIdxOwned(qx.Expr{Op: qx.OpIN, Field: inLeaf.Field, Value: inLeaf.Value})
-	if err != nil || !isSlice || len(vals) < 2 {
+	vals, isSlice, hasNil, err := db.exprValueToIdxOwned(qx.Expr{Op: qx.OpIN, Field: inLeaf.Field, Value: inLeaf.Value})
+	if err != nil || !isSlice || (len(vals) == 0 && !hasNil) {
 		return 0, false, nil
 	}
 	vals = dedupStringsInplace(vals)
-	if len(vals) < 2 || len(vals) > countScalarInSplitMaxValues {
+	totalVals := len(vals)
+	if hasNil {
+		totalVals++
+	}
+	if totalVals < 2 || totalVals > countScalarInSplitMaxValues {
 		return 0, false, nil
 	}
 
@@ -408,6 +427,24 @@ func (db *DB[K, V]) tryCountByScalarInSplit(expr qx.Expr, trace *queryTrace) (ui
 			continue
 		}
 		cnt += ids.Cardinality()
+	}
+	if hasNil {
+		ids, keep := db.nilFieldOverlay(inLeaf.Field).lookupPostingRetained(nilIndexEntryKey)
+		if !ids.IsEmpty() {
+			examined += ids.Cardinality()
+			if keep != nil {
+				if ownedCount >= len(keepOwned) {
+					return 0, false, nil
+				}
+				keepOwned[ownedCount] = keep
+				ownedCount++
+			}
+			if useFilter {
+				cnt += ids.AndCardinalityBitmap(filter.bm)
+			} else {
+				cnt += ids.Cardinality()
+			}
+		}
 	}
 	if trace != nil {
 		trace.setPlan(PlanCountScalarInSplit)
@@ -1526,8 +1563,8 @@ func (db *DB[K, V]) tryMaterializeBroadRangeComplementPredicateForCount(p *predi
 	if !coarseEligible && !isNumericScalarKind(fm.Kind) {
 		return false
 	}
-	key, isSlice, err := db.exprValueToIdxScalar(qx.Expr{Op: p.expr.Op, Field: p.expr.Field, Value: p.expr.Value})
-	if err != nil || isSlice {
+	key, isSlice, isNil, err := db.exprValueToIdxScalar(qx.Expr{Op: p.expr.Op, Field: p.expr.Field, Value: p.expr.Value})
+	if err != nil || isSlice || isNil {
 		return false
 	}
 	cacheKey := db.materializedPredComplementCacheKeyForScalar(p.expr.Field, p.expr.Op, key)

@@ -182,10 +182,8 @@ func (db *DB[K, V]) populateFields(t reflect.Type, idx []int) error {
 	return nil
 }
 
-type getterFn func(ptr unsafe.Pointer) (string, []string, bool)
-type valueGetterFn func(fv reflect.Value) (string, []string, bool)
-
-const nilValue = "\xFFNIL"
+type getterFn func(ptr unsafe.Pointer) (string, []string, bool, bool)
+type valueGetterFn func(fv reflect.Value) (string, []string, bool, bool)
 
 func (db *DB[K, V]) makeGetter(f *field) (getterFn, error) {
 	sub, err := db.makeFieldValueGetter(f)
@@ -198,19 +196,19 @@ func (db *DB[K, V]) makeGetter(f *field) (getterFn, error) {
 func (db *DB[K, V]) makeFieldValueGetter(f *field) (valueGetterFn, error) {
 	if f.UseVI {
 		if f.Slice {
-			return func(fv reflect.Value) (single string, multi []string, ok bool) {
+			return func(fv reflect.Value) (single string, multi []string, ok bool, isNil bool) {
 				if fv.Len() == 0 {
-					return "", nil, true
+					return "", nil, true, false
 				}
 				s := make([]string, fv.Len())
 				for i := 0; i < len(s); i++ {
 					s[i] = fv.Index(i).Interface().(ValueIndexer).IndexingValue()
 				}
-				return "", s, true
+				return "", s, true, false
 			}, nil
 		} else {
-			return func(fv reflect.Value) (single string, multi []string, ok bool) {
-				return fv.Interface().(ValueIndexer).IndexingValue(), nil, true
+			return func(fv reflect.Value) (single string, multi []string, ok bool, isNil bool) {
+				return fv.Interface().(ValueIndexer).IndexingValue(), nil, true, false
 			}, nil
 		}
 	}
@@ -221,81 +219,81 @@ func (db *DB[K, V]) makeFieldValueGetter(f *field) (valueGetterFn, error) {
 
 	case reflect.String:
 		if f.Slice {
-			fn = func(fv reflect.Value) (string, []string, bool) {
+			fn = func(fv reflect.Value) (string, []string, bool, bool) {
 				if fv.Len() == 0 {
-					return "", nil, true
+					return "", nil, true, false
 				}
 				s := make([]string, fv.Len())
 				for i := 0; i < len(s); i++ {
 					s[i] = fv.Index(i).String()
 				}
-				return "", s, true
+				return "", s, true, false
 			}
 		} else {
-			fn = func(fv reflect.Value) (string, []string, bool) {
+			fn = func(fv reflect.Value) (string, []string, bool, bool) {
 				if f.Ptr {
 					if fv.IsNil() {
-						return nilValue, nil, true
+						return "", nil, true, true
 					}
 					fv = fv.Elem()
 				}
-				return fv.String(), nil, true
+				return fv.String(), nil, true, false
 			}
 		}
 
 	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
 		if f.Slice {
-			fn = func(fv reflect.Value) (string, []string, bool) {
+			fn = func(fv reflect.Value) (string, []string, bool, bool) {
 				if fv.Len() == 0 {
-					return "", nil, true
+					return "", nil, true, false
 				}
 				s := make([]string, fv.Len())
 				for i := 0; i < len(s); i++ {
 					s[i] = uint64ByteStr(fv.Index(i).Uint())
 				}
-				return "", s, true
+				return "", s, true, false
 			}
 		} else {
-			fn = func(fv reflect.Value) (string, []string, bool) {
+			fn = func(fv reflect.Value) (string, []string, bool, bool) {
 				if f.Ptr {
 					if fv.IsNil() {
-						return nilValue, nil, true
+						return "", nil, true, true
 					}
 					fv = fv.Elem()
 				}
-				return uint64ByteStr(fv.Uint()), nil, true
+				return uint64ByteStr(fv.Uint()), nil, true, false
 			}
 		}
 
 	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
 		if f.Slice {
-			fn = func(fv reflect.Value) (string, []string, bool) {
+			fn = func(fv reflect.Value) (string, []string, bool, bool) {
 				if fv.Len() == 0 {
-					return "", nil, true
+					return "", nil, true, false
 				}
 				s := make([]string, fv.Len())
 				for i := 0; i < len(s); i++ {
 					s[i] = int64ByteStr(fv.Index(i).Int())
 				}
-				return "", s, true
+				return "", s, true, false
 			}
 		} else {
-			fn = func(fv reflect.Value) (string, []string, bool) {
+			fn = func(fv reflect.Value) (string, []string, bool, bool) {
 				if f.Ptr {
 					if fv.IsNil() {
-						return nilValue, nil, true
+						return "", nil, true, true
 					}
 					fv = fv.Elem()
 				}
-				return int64ByteStr(fv.Int()), nil, true
+				return int64ByteStr(fv.Int()), nil, true, false
 			}
 		}
 
 	case reflect.Bool:
 		if f.Slice {
-			fn = func(fv reflect.Value) (string, []string, bool) {
+			fn = func(fv reflect.Value) (string, []string, bool, bool) {
 				if fv.Len() == 0 {
-					return "", nil, true
+					return "", nil, true, false
 				}
 				s := make([]string, fv.Len())
 				for i := 0; i < len(s); i++ {
@@ -305,45 +303,45 @@ func (db *DB[K, V]) makeFieldValueGetter(f *field) (valueGetterFn, error) {
 						s[i] = "0"
 					}
 				}
-				return "", s, true
+				return "", s, true, false
 			}
 		} else {
-			fn = func(fv reflect.Value) (string, []string, bool) {
+			fn = func(fv reflect.Value) (string, []string, bool, bool) {
 				if f.Ptr {
 					if fv.IsNil() {
-						return nilValue, nil, true
+						return "", nil, true, true
 					}
 					fv = fv.Elem()
 				}
 				if fv.Bool() {
-					return "1", nil, true
+					return "1", nil, true, false
 				} else {
-					return "0", nil, true
+					return "0", nil, true, false
 				}
 			}
 		}
 
 	case reflect.Float32, reflect.Float64:
 		if f.Slice {
-			fn = func(fv reflect.Value) (string, []string, bool) {
+			fn = func(fv reflect.Value) (string, []string, bool, bool) {
 				if fv.Len() == 0 {
-					return "", nil, true
+					return "", nil, true, false
 				}
 				s := make([]string, fv.Len())
 				for i := 0; i < len(s); i++ {
 					s[i] = float64ByteStr(fv.Index(i).Float())
 				}
-				return "", s, true
+				return "", s, true, false
 			}
 		} else {
-			fn = func(fv reflect.Value) (string, []string, bool) {
+			fn = func(fv reflect.Value) (string, []string, bool, bool) {
 				if f.Ptr {
 					if fv.IsNil() {
-						return nilValue, nil, true
+						return "", nil, true, true
 					}
 					fv = fv.Elem()
 				}
-				return float64ByteStr(fv.Float()), nil, true
+				return float64ByteStr(fv.Float()), nil, true, false
 			}
 		}
 
@@ -355,13 +353,13 @@ func (db *DB[K, V]) makeFieldValueGetter(f *field) (valueGetterFn, error) {
 }
 
 func (db *DB[K, V]) fieldGetter(idx []int, sub valueGetterFn) getterFn {
-	return func(ptr unsafe.Pointer) (string, []string, bool) {
+	return func(ptr unsafe.Pointer) (string, []string, bool, bool) {
 		if ptr == nil {
-			return "", nil, false
+			return "", nil, false, false
 		}
 		fv := reflect.NewAt(db.vtype, ptr).Elem()
 		if !fv.IsValid() {
-			return "", nil, false
+			return "", nil, false, false
 		}
 		return sub(fv.FieldByIndex(idx))
 	}

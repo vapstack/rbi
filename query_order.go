@@ -203,6 +203,21 @@ func (db *DB[K, V]) queryOrderBasic(result bitmap, ov fieldOverlay, o qx.Order, 
 			releaseRoaringBuf(bm)
 		}
 	}
+
+	if fm := db.fields[o.Field]; fm != nil && fm.Ptr {
+		nilBM, owned := db.nilFieldLookupOwned(o.Field, nil)
+		if nilBM != nil && !nilBM.IsEmpty() {
+			if processBucket(nilBM) {
+				if owned {
+					releaseRoaringBuf(nilBM)
+				}
+				return cursor.out, nil
+			}
+		}
+		if owned {
+			releaseRoaringBuf(nilBM)
+		}
+	}
 	return cursor.out, nil
 }
 
@@ -658,7 +673,7 @@ func (db *DB[K, V]) orderDataValues(v any) ([]string, error) {
 	if vals, ok := v.([]string); ok {
 		return vals, nil
 	}
-	vals, _, err := db.exprValueToIdx(qx.Expr{Op: qx.OpIN, Value: v})
+	vals, _, _, err := db.exprValueToIdx(qx.Expr{Op: qx.OpIN, Value: v})
 	if err != nil {
 		return nil, err
 	}

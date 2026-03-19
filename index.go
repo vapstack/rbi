@@ -71,14 +71,17 @@ func (db *DB[K, V]) buildIndex(skipFields map[string]struct{}) error {
 	)
 
 	global := make(interIndex, len(active))
+	nilGlobal := make(interIndex, len(active))
 	for i := range active {
 		global[i] = make(map[string]postingList, initialIndexLen)
+		nilGlobal[i] = make(map[string]postingList, 1)
 	}
 
 	jobs := make(chan rawdata, 10000)
 
 	workers := runtime.NumCPU()
 	locals := make([]interIndex, workers)
+	nilLocals := make([]interIndex, workers)
 	workerErrs := make([]error, workers)
 
 	localUniverse := make([]*roaring64.Bitmap, workers)
@@ -95,9 +98,12 @@ func (db *DB[K, V]) buildIndex(skipFields map[string]struct{}) error {
 
 			local := make(interIndex, len(active))
 			locals[widx] = local
+			nilLocal := make(interIndex, len(active))
+			nilLocals[widx] = nilLocal
 
 			for k := range active {
 				local[k] = make(map[string]postingList, 1024)
+				nilLocal[k] = make(map[string]postingList, 1)
 			}
 
 			lu := roaring64.NewBitmap()
@@ -123,8 +129,12 @@ func (db *DB[K, V]) buildIndex(skipFields map[string]struct{}) error {
 				lu.Add(idx)
 
 				for k, f := range active {
-					single, multi, ok := f.getter(rv.FieldByIndex(f.index))
+					single, multi, ok, isNil := f.getter(rv.FieldByIndex(f.index))
 					if !ok {
+						continue
+					}
+					if isNil {
+						addTo(nilLocal[k], nilIndexEntryKey, idx)
 						continue
 					}
 					if f.slice {
@@ -196,9 +206,25 @@ func (db *DB[K, V]) buildIndex(skipFields map[string]struct{}) error {
 			}
 		}
 	}
+	for _, local := range nilLocals {
+		if local == nil {
+			continue
+		}
+		for i, fmap := range local {
+			gmap := nilGlobal[i]
+			for val, lp := range fmap {
+				gp := gmap[val]
+				gp.Or(lp)
+				gmap[val] = gp
+			}
+		}
+	}
 
 	if db.index == nil {
 		db.index = make(map[string]*[]index)
+	}
+	if db.nilIndex == nil {
+		db.nilIndex = make(map[string]*[]index)
 	}
 
 	for i, values := range global {
@@ -219,6 +245,24 @@ func (db *DB[K, V]) buildIndex(skipFields map[string]struct{}) error {
 		})
 		db.index[active[i].name] = &s
 	}
+	for i, values := range nilGlobal {
+		s := make([]index, 0, len(values))
+		for val, ids := range values {
+			ids.OptimizeAdaptive()
+			if ids.IsEmpty() {
+				continue
+			}
+			s = append(s, index{
+				Key: indexKeyFromStoredString(val, false),
+				IDs: ids,
+			})
+		}
+		if len(s) == 0 {
+			delete(db.nilIndex, active[i].name)
+			continue
+		}
+		db.nilIndex[active[i].name] = &s
+	}
 
 	db.universe = roaring64.NewBitmap()
 	for _, lu := range localUniverse {
@@ -237,7 +281,9 @@ func (db *DB[K, V]) buildIndex(skipFields map[string]struct{}) error {
 
 	active = nil
 	global = nil
+	nilGlobal = nil
 	locals = nil
+	nilLocals = nil
 	localUniverse = nil
 	workerErrs = nil
 	forceMemoryCleanup(true)
@@ -442,6 +488,7 @@ const (
 	maxStoredAllocHint = 64 << 10
 	indexBuildGCStride = 1_000_000
 
+	nilIndexEntryKey    = ""
 	lenIndexNonEmptyKey = "\xFFNONEMPTY"
 
 	// Guard against pathological/sparse persisted strmap indices that could
@@ -473,8 +520,8 @@ func (db *DB[K, V]) loadIndex() (skipFields map[string]struct{}, err error) {
 
 	var lenLoaded bool
 	switch ver {
-	case 4:
-		skipFields, lenLoaded, err = db.loadIndexV4(reader)
+	case 5:
+		skipFields, lenLoaded, err = db.loadIndexV5(reader)
 	default:
 		return nil, fmt.Errorf("%w: unsupported persisted index version: %v", errPersistedIndexInvalid, ver)
 	}
@@ -493,7 +540,7 @@ func (db *DB[K, V]) loadIndex() (skipFields map[string]struct{}, err error) {
 	return skipFields, nil
 }
 
-func (db *DB[K, V]) loadIndexV4(reader *bufio.Reader) (map[string]struct{}, bool, error) {
+func (db *DB[K, V]) loadIndexV5(reader *bufio.Reader) (map[string]struct{}, bool, error) {
 	storedSeq, err := binary.ReadUvarint(reader)
 	if err != nil {
 		return nil, false, fmt.Errorf("decode: reading bucket sequence: %w", err)
@@ -544,6 +591,11 @@ func (db *DB[K, V]) loadIndexPayload(reader *bufio.Reader) (map[string]struct{},
 		return nil, false, fmt.Errorf("decode: reading index sections: %w", err)
 	}
 
+	nilIndexes, err := readIndexSections(reader, compatible, nil)
+	if err != nil {
+		return nil, false, fmt.Errorf("decode: reading nil index sections: %w", err)
+	}
+
 	lenIndexes, err := readIndexSections(reader, compatible, lenFieldFixed8)
 	if err != nil {
 		return nil, false, fmt.Errorf("decode: reading len index sections: %w", err)
@@ -551,7 +603,9 @@ func (db *DB[K, V]) loadIndexPayload(reader *bufio.Reader) (map[string]struct{},
 
 	skipFields := make(map[string]struct{})
 	for name := range db.fields {
-		if _, ok := indexes[name]; ok && compatible[name] {
+		_, hasRegular := indexes[name]
+		_, hasNil := nilIndexes[name]
+		if compatible[name] && (hasRegular || hasNil) {
 			skipFields[name] = struct{}{}
 		}
 	}
@@ -559,6 +613,7 @@ func (db *DB[K, V]) loadIndexPayload(reader *bufio.Reader) (map[string]struct{},
 	db.universe = universe
 	db.strmap = strmap
 	db.index = indexes
+	db.nilIndex = nilIndexes
 	db.lenIndex = lenIndexes
 	db.lenZeroComplement = detectLenZeroComplement(lenIndexes)
 
@@ -666,7 +721,7 @@ func (db *DB[K, V]) storeIndex() error {
 		return fmt.Errorf("store: reading bucket sequence: %w", err)
 	}
 
-	if err = db.storeIndexV4(buf, seq); err != nil {
+	if err = db.storeIndexV5(buf, seq); err != nil {
 		return err
 	}
 
@@ -689,8 +744,8 @@ func (db *DB[K, V]) storeIndex() error {
 	return nil
 }
 
-func (db *DB[K, V]) storeIndexV4(writer *bufio.Writer, bucketSeq uint64) error {
-	if err := writer.WriteByte(4); err != nil {
+func (db *DB[K, V]) storeIndexV5(writer *bufio.Writer, bucketSeq uint64) error {
+	if err := writer.WriteByte(5); err != nil {
 		return fmt.Errorf("store: writing version: %w", err)
 	}
 	if err := writeUvarint(writer, bucketSeq); err != nil {
@@ -723,6 +778,14 @@ func (db *DB[K, V]) storeIndexPayload(writer *bufio.Writer) error {
 
 	if err := writeIndexFamily(writer, fieldNames, scratch, func(field string) fieldOverlay {
 		return newFieldOverlay(snap.fieldIndexSlice(field), snap.fieldDelta(field))
+	}); err != nil {
+		return err
+	}
+
+	nilFieldNames := sortedFieldNames(snap.nilFieldNameSet())
+
+	if err := writeIndexFamily(writer, nilFieldNames, scratch, func(field string) fieldOverlay {
+		return newFieldOverlay(snap.nilFieldIndexSlice(field), snap.nilFieldDelta(field))
 	}); err != nil {
 		return err
 	}
@@ -1091,7 +1154,7 @@ LOOP:
 				continue
 			}
 			entries = append(entries, index{
-				Key: indexKeyFromStoredString(key, fixed8ByField[f]),
+				Key: indexKeyFromStoredString(key, fixed8ByField != nil && fixed8ByField[f]),
 				IDs: ids,
 			})
 		}
@@ -1168,9 +1231,6 @@ func readString(reader *bufio.Reader) (string, error) {
 		return "", err
 	}
 	s := unsafe.String(unsafe.SliceData(b), len(b))
-	if s == nilValue {
-		return nilValue, nil
-	}
 	return s, nil
 }
 

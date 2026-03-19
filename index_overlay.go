@@ -837,10 +837,11 @@ func (d *fieldIndexDelta) orderedEntryAt(i int) (string, indexDeltaEntry, bool) 
 		kv := d.entries[i]
 		return kv.key, kv.entry, true
 	}
-	key := d.orderedKeyAt(i)
-	if key == "" {
+	keys := d.sortedKeys()
+	if i >= len(keys) {
 		return "", indexDeltaEntry{}, false
 	}
+	key := keys[i]
 	e, ok := d.get(key)
 	return key, e, ok
 }

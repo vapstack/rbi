@@ -995,8 +995,8 @@ func (db *DB[K, V]) shouldPreferExecutionNoOrderPrefix(q *qx.QX, leaves []qx.Exp
 				return false
 			}
 
-			p, isSlice, err := db.exprValueToIdxScalar(e)
-			if err != nil || isSlice || p == "" {
+			p, isSlice, isNil, err := db.exprValueToIdxScalar(e)
+			if err != nil || isSlice || isNil || p == "" {
 				return false
 			}
 
@@ -1493,8 +1493,8 @@ func (db *DB[K, V]) extractOrderRangeCoverageLeaves(orderField string, leaves []
 
 		switch e.Op {
 		case qx.OpGT, qx.OpGTE, qx.OpLT, qx.OpLTE, qx.OpEQ:
-			k, isSlice, err := db.exprValueToIdxScalar(qx.Expr{Op: e.Op, Field: e.Field, Value: e.Value})
-			if err != nil || isSlice {
+			k, isSlice, isNil, err := db.exprValueToIdxScalar(qx.Expr{Op: e.Op, Field: e.Field, Value: e.Value})
+			if err != nil || isSlice || isNil {
 				return 0, 0, nil, false
 			}
 			switch e.Op {
@@ -1513,8 +1513,8 @@ func (db *DB[K, V]) extractOrderRangeCoverageLeaves(orderField string, leaves []
 			covered[i] = true
 			has = true
 		case qx.OpPREFIX:
-			p, isSlice, err := db.exprValueToIdxScalar(qx.Expr{Op: e.Op, Field: e.Field, Value: e.Value})
-			if err != nil || isSlice {
+			p, isSlice, isNil, err := db.exprValueToIdxScalar(qx.Expr{Op: e.Op, Field: e.Field, Value: e.Value})
+			if err != nil || isSlice || isNil {
 				return 0, 0, nil, false
 			}
 			rb.hasPrefix = true
@@ -1545,8 +1545,8 @@ func (db *DB[K, V]) extractOrderRangeCoverageLeavesOverlay(orderField string, le
 
 		switch e.Op {
 		case qx.OpGT, qx.OpGTE, qx.OpLT, qx.OpLTE, qx.OpEQ:
-			k, isSlice, err := db.exprValueToIdxScalar(qx.Expr{Op: e.Op, Field: e.Field, Value: e.Value})
-			if err != nil || isSlice {
+			k, isSlice, isNil, err := db.exprValueToIdxScalar(qx.Expr{Op: e.Op, Field: e.Field, Value: e.Value})
+			if err != nil || isSlice || isNil {
 				return 0, 0, nil, false
 			}
 			switch e.Op {
@@ -1565,8 +1565,8 @@ func (db *DB[K, V]) extractOrderRangeCoverageLeavesOverlay(orderField string, le
 			covered[i] = true
 			has = true
 		case qx.OpPREFIX:
-			p, isSlice, err := db.exprValueToIdxScalar(qx.Expr{Op: e.Op, Field: e.Field, Value: e.Value})
-			if err != nil || isSlice {
+			p, isSlice, isNil, err := db.exprValueToIdxScalar(qx.Expr{Op: e.Op, Field: e.Field, Value: e.Value})
+			if err != nil || isSlice || isNil {
 				return 0, 0, nil, false
 			}
 			rb.hasPrefix = true
@@ -1799,11 +1799,18 @@ func (db *DB[K, V]) estimateLeafOrderCost(
 }
 
 func (db *DB[K, V]) estimateEqSelectivity(field string, value any, universe uint64, stats PlannerFieldStats) (float64, bool) {
-	key, isSlice, err := db.exprValueToIdxScalar(qx.Expr{Op: qx.OpEQ, Field: field, Value: value})
+	key, isSlice, isNil, err := db.exprValueToIdxScalar(qx.Expr{Op: qx.OpEQ, Field: field, Value: value})
 	if err != nil || isSlice {
 		return 0, false
 	}
 
+	if isNil {
+		card := db.nilFieldOverlay(field).lookupCardinality(nilIndexEntryKey)
+		if card == 0 {
+			return 0, true
+		}
+		return float64(card) / float64(universe), true
+	}
 	ov := db.fieldOverlay(field)
 	if ov.hasData() {
 		card := ov.lookupCardinality(key)
@@ -1831,17 +1838,21 @@ func (db *DB[K, V]) estimateEqSelectivity(field string, value any, universe uint
 }
 
 func (db *DB[K, V]) estimateInLikeSelectivity(field string, value any, universe uint64, intersect bool) (float64, int, bool) {
-	vals, isSlice, err := db.exprValueToIdx(qx.Expr{Op: qx.OpIN, Field: field, Value: value})
-	if err != nil || !isSlice || len(vals) == 0 {
+	vals, isSlice, hasNil, err := db.exprValueToIdx(qx.Expr{Op: qx.OpIN, Field: field, Value: value})
+	if err != nil || !isSlice || (len(vals) == 0 && !hasNil) {
 		return 0, 0, false
 	}
+	vals = dedupStringsInplace(vals)
+	valueCount := len(vals)
 
 	sum := uint64(0)
 	minCard := uint64(0)
 
 	ov := db.fieldOverlay(field)
 	if !ov.hasData() {
-		return 0, 0, false
+		if !hasNil {
+			return 0, 0, false
+		}
 	}
 
 	for _, key := range vals {
@@ -1851,7 +1862,18 @@ func (db *DB[K, V]) estimateInLikeSelectivity(field string, value any, universe 
 			minCard = card
 		}
 		if intersect && card == 0 {
-			return 0, len(vals), true
+			return 0, valueCount, true
+		}
+	}
+	if fm := db.fields[field]; hasNil && fm != nil && !fm.Slice {
+		card := db.nilFieldOverlay(field).lookupCardinality(nilIndexEntryKey)
+		sum += card
+		if minCard == 0 || card < minCard {
+			minCard = card
+		}
+		valueCount++
+		if intersect && card == 0 {
+			return 0, valueCount, true
 		}
 	}
 
@@ -1860,13 +1882,13 @@ func (db *DB[K, V]) estimateInLikeSelectivity(field string, value any, universe 
 		if sel > 1 {
 			sel = 1
 		}
-		return sel, len(vals), true
+		return sel, valueCount, true
 	}
 
 	sel := float64(minCard) / float64(universe)
-	if len(vals) > 1 {
+	if valueCount > 1 {
 		decay := 1.0
-		for i := 1; i < len(vals); i++ {
+		for i := 1; i < valueCount; i++ {
 			decay *= 0.7
 		}
 		sel *= decay
@@ -1877,12 +1899,12 @@ func (db *DB[K, V]) estimateInLikeSelectivity(field string, value any, universe 
 	if sel > 1 {
 		sel = 1
 	}
-	return sel, len(vals), true
+	return sel, valueCount, true
 }
 
 func (db *DB[K, V]) estimateRangeSelectivity(e qx.Expr, universe uint64, stats PlannerFieldStats) (float64, bool) {
-	key, isSlice, err := db.exprValueToIdxScalar(qx.Expr{Op: e.Op, Field: e.Field, Value: e.Value})
-	if err != nil || isSlice {
+	key, isSlice, isNil, err := db.exprValueToIdxScalar(qx.Expr{Op: e.Op, Field: e.Field, Value: e.Value})
+	if err != nil || isSlice || isNil {
 		return 0, false
 	}
 

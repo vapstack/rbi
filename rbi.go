@@ -533,6 +533,7 @@ func New[K ~uint64 | ~string, V any](bolt *bbolt.DB, options Options, execOpts .
 		fields:            make(map[string]*field),
 		getters:           make(map[string]getterFn),
 		index:             make(map[string]*[]index),
+		nilIndex:          make(map[string]*[]index),
 		lenIndex:          make(map[string]*[]index),
 		lenZeroComplement: make(map[string]bool),
 
@@ -861,6 +862,7 @@ type (
 		indexedFieldByName   map[string]indexedFieldAccessor
 		uniqueFieldAccessors []indexedFieldAccessor
 		index                map[string]*[]index
+		nilIndex             map[string]*[]index
 		lenIndex             map[string]*[]index
 		lenZeroComplement    map[string]bool
 		patchMap             map[string]*field
@@ -1468,62 +1470,71 @@ func (db *DB[K, V]) IndexStats() IndexStats {
 	idx.ApproxStructBytes = 0
 	idx.ApproxHeapBytes = 0
 
-	fields := snap.fieldNameSet()
+	fields := snap.indexedFieldNameSet()
 
 	scratch := getRoaringBuf()
 	defer releaseRoaringBuf(scratch)
 
 	for name := range fields {
-		ov := newFieldOverlay(snap.fieldIndexSlice(name), snap.fieldDelta(name))
-		br := ov.rangeForBounds(rangeBounds{has: true})
-		if br.baseStart >= br.baseEnd && br.deltaStart >= br.deltaEnd {
-			continue
-		}
 		var (
 			unique uint64
 			size   uint64
 			keyLen uint64
 			card   uint64
 		)
-		cur := ov.newCursor(br, false)
-		for {
-			key, baseBM, de, ok := cur.next()
-			if !ok {
-				break
+		accumulate := func(ov fieldOverlay, countDistinct bool) {
+			br := ov.rangeForBounds(rangeBounds{has: true})
+			if br.baseStart >= br.baseEnd && br.deltaStart >= br.deltaEnd {
+				return
 			}
-			if deltaEntryIsEmpty(de) {
-				if baseBM.IsEmpty() {
+			cur := ov.newCursor(br, false)
+			for {
+				key, baseBM, de, ok := cur.next()
+				if !ok {
+					break
+				}
+				if deltaEntryIsEmpty(de) {
+					if baseBM.IsEmpty() {
+						continue
+					}
+					if countDistinct {
+						unique++
+						keyLen += uint64(key.byteLen())
+					}
+					size += baseBM.SizeInBytes()
+					curCard := baseBM.Cardinality()
+					card += curCard
+					idx.EntryCount++
+					idx.KeyBytes += uint64(key.byteLen())
+					idx.BitmapCardinality += curCard
 					continue
 				}
-				unique++
-				size += baseBM.SizeInBytes()
-				keyLen += uint64(key.byteLen())
-				curCard := baseBM.Cardinality()
+				bm, owned := composePostingOwned(baseBM, de, scratch)
+				if bm == nil || bm.IsEmpty() {
+					if owned && bm != nil && bm != scratch {
+						releaseRoaringBuf(bm)
+					}
+					continue
+				}
+				if countDistinct {
+					unique++
+					keyLen += uint64(key.byteLen())
+				}
+				size += bm.GetSizeInBytes()
+				curCard := bm.GetCardinality()
 				card += curCard
 				idx.EntryCount++
 				idx.KeyBytes += uint64(key.byteLen())
 				idx.BitmapCardinality += curCard
-				continue
-			}
-			bm, owned := composePostingOwned(baseBM, de, scratch)
-			if bm == nil || bm.IsEmpty() {
-				if owned && bm != nil && bm != scratch {
+				if owned && bm != scratch {
 					releaseRoaringBuf(bm)
 				}
-				continue
-			}
-			unique++
-			size += bm.GetSizeInBytes()
-			keyLen += uint64(key.byteLen())
-			curCard := bm.GetCardinality()
-			card += curCard
-			idx.EntryCount++
-			idx.KeyBytes += uint64(key.byteLen())
-			idx.BitmapCardinality += curCard
-			if owned && bm != scratch {
-				releaseRoaringBuf(bm)
 			}
 		}
+
+		accumulate(newFieldOverlay(snap.fieldIndexSlice(name), snap.fieldDelta(name)), true)
+		accumulate(newFieldOverlay(snap.nilFieldIndexSlice(name), snap.nilFieldDelta(name)), false)
+
 		idx.UniqueFieldKeys[name] = unique
 		idx.FieldSize[name] = size
 		idx.FieldKeyBytes[name] = keyLen

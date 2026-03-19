@@ -349,12 +349,12 @@ func TestNumericRangeBucketSpanCache_ReusedForNearbyBounds(t *testing.T) {
 
 	makeRange := func(v int) overlayRange {
 		t.Helper()
-		key, isSlice, err := db.exprValueToIdxScalar(qx.Expr{Op: qx.OpGTE, Field: "age", Value: v})
+		key, isSlice, isNil, err := db.exprValueToIdxScalar(qx.Expr{Op: qx.OpGTE, Field: "age", Value: v})
 		if err != nil {
 			t.Fatalf("exprValueToIdxScalar(%d): %v", v, err)
 		}
-		if isSlice {
-			t.Fatalf("unexpected slice key for age")
+		if isSlice || isNil {
+			t.Fatalf("unexpected scalar flags for age: isSlice=%v isNil=%v", isSlice, isNil)
 		}
 		var rb rangeBounds
 		rb.applyLo(key, true)
@@ -423,12 +423,12 @@ func TestNumericRangeBucketSpanCache_PredicateReleaseKeepsSharedBitmap_Base(t *t
 		t.Fatal("expected age overlay data")
 	}
 
-	key, isSlice, err := db.exprValueToIdxScalar(expr)
+	key, isSlice, isNil, err := db.exprValueToIdxScalar(expr)
 	if err != nil {
 		t.Fatalf("exprValueToIdxScalar: %v", err)
 	}
-	if isSlice {
-		t.Fatal("unexpected slice key for age")
+	if isSlice || isNil {
+		t.Fatalf("unexpected scalar flags for age: isSlice=%v isNil=%v", isSlice, isNil)
 	}
 	var rb rangeBounds
 	rb.applyLo(key, true)
@@ -507,12 +507,12 @@ func TestNumericRangeBucketSpanCache_PredicateReleaseKeepsSharedBitmap_WithField
 		t.Fatal("expected overlay delta for age")
 	}
 
-	key, isSlice, err := db.exprValueToIdxScalar(expr)
+	key, isSlice, isNil, err := db.exprValueToIdxScalar(expr)
 	if err != nil {
 		t.Fatalf("exprValueToIdxScalar: %v", err)
 	}
-	if isSlice {
-		t.Fatal("unexpected slice key for age")
+	if isSlice || isNil {
+		t.Fatalf("unexpected scalar flags for age: isSlice=%v isNil=%v", isSlice, isNil)
 	}
 	var rb rangeBounds
 	rb.applyLo(key, true)
@@ -584,12 +584,12 @@ func TestNumericRangeBucketSpanCache_RespectsBitmapCardinalityGuard(t *testing.T
 		t.Fatalf("expected age overlay data")
 	}
 
-	key, isSlice, err := db.exprValueToIdxScalar(qx.Expr{Op: qx.OpGTE, Field: "age", Value: 0})
+	key, isSlice, isNil, err := db.exprValueToIdxScalar(qx.Expr{Op: qx.OpGTE, Field: "age", Value: 0})
 	if err != nil {
 		t.Fatalf("exprValueToIdxScalar: %v", err)
 	}
-	if isSlice {
-		t.Fatal("unexpected slice key for age")
+	if isSlice || isNil {
+		t.Fatalf("unexpected scalar flags for age: isSlice=%v isNil=%v", isSlice, isNil)
 	}
 	var rb rangeBounds
 	rb.applyLo(key, true)

@@ -2,6 +2,7 @@ package rbi
 
 import (
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/vapstack/qx"
@@ -66,6 +67,105 @@ func TestQuery_PointerField_NilVsZeroValue(t *testing.T) {
 	if len(ids) != 1 || ids[0] != 2 {
 		t.Errorf("expected [2], got %v", ids)
 	}
+}
+
+func TestQuery_DeltaIterator_KeepsEmptyStringKey(t *testing.T) {
+	db, _ := openTempDBUint64(t)
+
+	if err := db.Set(1, &Rec{Name: "", Email: "empty@example.test"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Set(2, &Rec{Name: "a", Email: "a@example.test"}); err != nil {
+		t.Fatal(err)
+	}
+
+	tests := []struct {
+		name  string
+		q     *qx.QX
+		want  []uint64
+		count uint64
+	}{
+		{
+			name:  "prefix-empty",
+			q:     qx.Query(qx.PREFIX("name", "")),
+			want:  []uint64{1, 2},
+			count: 2,
+		},
+		{
+			name:  "suffix-empty",
+			q:     qx.Query(qx.SUFFIX("name", "")),
+			want:  []uint64{1, 2},
+			count: 2,
+		},
+		{
+			name:  "contains-empty",
+			q:     qx.Query(qx.CONTAINS("name", "")),
+			want:  []uint64{1, 2},
+			count: 2,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := db.QueryKeys(tc.q)
+			if err != nil {
+				t.Fatalf("QueryKeys(%s): %v", tc.name, err)
+			}
+			assertSameSlice(t, got, tc.want)
+
+			cnt, err := db.Count(tc.q)
+			if err != nil {
+				t.Fatalf("Count(%s): %v", tc.name, err)
+			}
+			if cnt != tc.count {
+				t.Fatalf("Count(%s): got=%d want=%d", tc.name, cnt, tc.count)
+			}
+
+			_, prepared, _, _ := assertPreparedRouteEquivalence(t, db, tc.q)
+			assertSameSlice(t, prepared, tc.want)
+		})
+	}
+}
+
+func TestQuery_INNilMatchesEmptyListSemantics(t *testing.T) {
+	db, _ := openTempDBUint64(t)
+
+	if err := db.Set(1, &Rec{Name: "alice"}); err != nil {
+		t.Fatal(err)
+	}
+
+	var nilStrings []string
+
+	tests := []struct {
+		name  string
+		value any
+	}{
+		{name: "nil", value: nil},
+		{name: "empty-slice", value: []string{}},
+		{name: "nil-slice", value: nilStrings},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			q := qx.Query(qx.IN("name", tc.value))
+
+			_, err := db.QueryKeys(q)
+			if err == nil || !strings.Contains(err.Error(), "no values provided") {
+				t.Fatalf("QueryKeys expected no-values error, got: %v", err)
+			}
+
+			_, err = db.Count(q)
+			if err == nil || !strings.Contains(err.Error(), "no values provided") {
+				t.Fatalf("Count expected no-values error, got: %v", err)
+			}
+		})
+	}
+
+	got, err := db.QueryKeys(qx.Query(qx.IN("name", []any{"alice", nil})))
+	if err != nil {
+		t.Fatalf("QueryKeys(mixed IN): %v", err)
+	}
+	assertSameSlice(t, got, []uint64{1})
 }
 
 func TestQueryPrefix_MatchingSemantics(t *testing.T) {

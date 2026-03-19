@@ -725,7 +725,7 @@ func releaseOwnedBitmapSlice(owned []*roaring64.Bitmap) {
 }
 
 func (db *DB[K, V]) buildPredEqCandidate(e qx.Expr, fm *field, ov fieldOverlay) (predicate, bool) {
-	key, isSlice, err := db.exprValueToIdxScalar(qx.Expr{Op: e.Op, Field: e.Field, Value: e.Value})
+	key, isSlice, isNil, err := db.exprValueToIdxScalar(qx.Expr{Op: e.Op, Field: e.Field, Value: e.Value})
 	if err != nil {
 		return predicate{}, false
 	}
@@ -734,7 +734,15 @@ func (db *DB[K, V]) buildPredEqCandidate(e qx.Expr, fm *field, ov fieldOverlay) 
 		if isSlice {
 			return predicate{}, false
 		}
-		ids, owned := ov.lookupPostingRetained(key)
+		var (
+			ids   postingList
+			owned *roaring64.Bitmap
+		)
+		if isNil {
+			ids, owned = db.nilFieldOverlay(e.Field).lookupPostingRetained(nilIndexEntryKey)
+		} else {
+			ids, owned = ov.lookupPostingRetained(key)
+		}
 		var cleanup func()
 		if owned != nil {
 			keep := owned
@@ -775,7 +783,7 @@ func (db *DB[K, V]) buildPredEqCandidate(e qx.Expr, fm *field, ov fieldOverlay) 
 		return predicate{}, false
 	}
 
-	vals, _, err := db.exprValueToIdxOwned(qx.Expr{Op: e.Op, Field: e.Field, Value: e.Value})
+	vals, _, _, err := db.exprValueToIdxOwned(qx.Expr{Op: e.Op, Field: e.Field, Value: e.Value})
 	if err != nil {
 		return predicate{}, false
 	}
@@ -830,40 +838,15 @@ func (db *DB[K, V]) buildPredInCandidate(e qx.Expr, fm *field, ov fieldOverlay) 
 		return predicate{}, false
 	}
 
-	vals, isSlice, err := db.exprValueToIdxOwned(qx.Expr{Op: e.Op, Field: e.Field, Value: e.Value})
+	vals, isSlice, hasNil, err := db.exprValueToIdxOwned(qx.Expr{Op: e.Op, Field: e.Field, Value: e.Value})
 	if err != nil {
 		return predicate{}, false
 	}
-	if !isSlice || len(vals) == 0 {
+	if !isSlice || (len(vals) == 0 && !hasNil) {
 		return predicate{}, false
 	}
 	vals = dedupStringsInplace(vals)
-
-	postsBuf := getPostingListSliceBuf(len(vals))
-	posts := postsBuf.values
-
-	var ownedInline [8]*roaring64.Bitmap
-	owned := ownedInline[:0]
-
-	var est uint64
-	for _, v := range vals {
-		ids, keep := ov.lookupPostingRetained(v)
-		if ids.IsEmpty() {
-			continue
-		}
-		posts = append(posts, ids)
-		est += ids.Cardinality()
-		if keep != nil {
-			owned = append(owned, keep)
-		}
-	}
-	cleanup := func() {
-		if len(owned) > 0 {
-			releaseOwnedBitmapSlice(owned)
-		}
-		postsBuf.values = posts
-		releasePostingListSliceBuf(postsBuf)
-	}
+	posts, est, cleanup := db.scalarLookupPostings(e.Field, vals, hasNil)
 
 	if e.Not {
 		if len(posts) == 0 {
@@ -917,7 +900,7 @@ func (db *DB[K, V]) buildPredHasCandidate(e qx.Expr, fm *field, ov fieldOverlay)
 		return predicate{}, false
 	}
 
-	vals, isSlice, err := db.exprValueToIdxOwned(qx.Expr{Op: e.Op, Field: e.Field, Value: e.Value})
+	vals, isSlice, _, err := db.exprValueToIdxOwned(qx.Expr{Op: e.Op, Field: e.Field, Value: e.Value})
 	if err != nil {
 		return predicate{}, false
 	}
@@ -999,7 +982,7 @@ func (db *DB[K, V]) buildPredHasAnyCandidate(e qx.Expr, fm *field, ov fieldOverl
 		return predicate{}, false
 	}
 
-	vals, isSlice, err := db.exprValueToIdxOwned(qx.Expr{Op: e.Op, Field: e.Field, Value: e.Value})
+	vals, isSlice, _, err := db.exprValueToIdxOwned(qx.Expr{Op: e.Op, Field: e.Field, Value: e.Value})
 	if err != nil {
 		return predicate{}, false
 	}
@@ -1251,11 +1234,11 @@ func (db *DB[K, V]) buildPredRangeCandidateWithMode(e qx.Expr, fm *field, ov fie
 		return p, true
 	}
 
-	key, isSlice, err := db.exprValueToIdxScalar(qx.Expr{Op: e.Op, Field: e.Field, Value: e.Value})
+	key, isSlice, isNil, err := db.exprValueToIdxScalar(qx.Expr{Op: e.Op, Field: e.Field, Value: e.Value})
 	if err != nil {
 		return predicate{}, false
 	}
-	if isSlice {
+	if isSlice || isNil {
 		return predicate{}, false
 	}
 	cacheKey := db.materializedPredCacheKeyForScalar(e.Field, e.Op, key)
@@ -1484,8 +1467,8 @@ func (db *DB[K, V]) materializedPredComplementCacheKeyForScalar(field string, op
 }
 
 func (db *DB[K, V]) materializedPredCacheKey(e qx.Expr) string {
-	key, isSlice, err := db.exprValueToIdxScalar(qx.Expr{Op: e.Op, Field: e.Field, Value: e.Value})
-	if err != nil || isSlice {
+	key, isSlice, isNil, err := db.exprValueToIdxScalar(qx.Expr{Op: e.Op, Field: e.Field, Value: e.Value})
+	if err != nil || isSlice || isNil {
 		return ""
 	}
 	return db.materializedPredCacheKeyForScalar(e.Field, e.Op, key)
@@ -1799,12 +1782,12 @@ func (db *DB[K, V]) tryExecLeadScanNoOrderBuckets(q *qx.QX, preds []predicate, l
 		return nil, true
 	}
 
-	key, isSlice, err := db.exprValueToIdxScalar(qx.Expr{
+	key, isSlice, isNil, err := db.exprValueToIdxScalar(qx.Expr{
 		Op:    e.Op,
 		Field: e.Field,
 		Value: e.Value,
 	})
-	if err != nil || isSlice {
+	if err != nil || isSlice || isNil {
 		return nil, false
 	}
 
@@ -2305,8 +2288,8 @@ func (db *DB[K, V]) tryMaterializeBroadRangeComplementPredicateForOrdered(p *pre
 		return false
 	}
 
-	key, isSlice, err := db.exprValueToIdxScalar(qx.Expr{Op: p.expr.Op, Field: p.expr.Field, Value: p.expr.Value})
-	if err != nil || isSlice {
+	key, isSlice, isNil, err := db.exprValueToIdxScalar(qx.Expr{Op: p.expr.Op, Field: p.expr.Field, Value: p.expr.Value})
+	if err != nil || isSlice || isNil {
 		return false
 	}
 	rb, ok := rangeBoundsForOp(p.expr.Op, key)
@@ -2444,8 +2427,8 @@ func (db *DB[K, V]) buildPredicatesOrderedWithMode(leaves []qx.Expr, orderField 
 		if isOrderRangeCoveredLeaf(orderField, e) {
 			// Keep conversion/typing validation, but avoid expensive predicate
 			// materialization for leaves that are fully covered by order range.
-			_, isSlice, err := db.exprValueToIdxScalar(qx.Expr{Op: e.Op, Field: e.Field, Value: e.Value})
-			if err != nil || isSlice {
+			_, isSlice, isNil, err := db.exprValueToIdxScalar(qx.Expr{Op: e.Op, Field: e.Field, Value: e.Value})
+			if err != nil || isSlice || isNil {
 				releasePredicates(preds)
 				return nil, false
 			}
@@ -2528,11 +2511,11 @@ func (db *DB[K, V]) buildPredRangeWithMode(e qx.Expr, fm *field, slice *[]index,
 		return predicate{}, false
 	}
 
-	key, isSlice, err := db.exprValueToIdxScalar(qx.Expr{Op: e.Op, Field: e.Field, Value: e.Value})
+	key, isSlice, isNil, err := db.exprValueToIdxScalar(qx.Expr{Op: e.Op, Field: e.Field, Value: e.Value})
 	if err != nil {
 		return predicate{}, false
 	}
-	if isSlice {
+	if isSlice || isNil {
 		return predicate{}, false
 	}
 	cacheKey := db.materializedPredCacheKeyForScalar(e.Field, e.Op, key)
@@ -4026,8 +4009,8 @@ func (db *DB[K, V]) collectOrderRangeBounds(field string, n int, exprAt func(i i
 
 		switch e.Op {
 		case qx.OpGT, qx.OpGTE, qx.OpLT, qx.OpLTE, qx.OpEQ:
-			k, isSlice, err := db.exprValueToIdxScalar(qx.Expr{Op: e.Op, Field: e.Field, Value: e.Value})
-			if err != nil || isSlice {
+			k, isSlice, isNil, err := db.exprValueToIdxScalar(qx.Expr{Op: e.Op, Field: e.Field, Value: e.Value})
+			if err != nil || isSlice || isNil {
 				return rangeBounds{}, nil, false, false
 			}
 			switch e.Op {
@@ -4046,8 +4029,8 @@ func (db *DB[K, V]) collectOrderRangeBounds(field string, n int, exprAt func(i i
 			markCovered(i)
 			has = true
 		case qx.OpPREFIX:
-			p, isSlice, err := db.exprValueToIdxScalar(qx.Expr{Op: e.Op, Field: e.Field, Value: e.Value})
-			if err != nil || isSlice {
+			p, isSlice, isNil, err := db.exprValueToIdxScalar(qx.Expr{Op: e.Op, Field: e.Field, Value: e.Value})
+			if err != nil || isSlice || isNil {
 				return rangeBounds{}, nil, false, false
 			}
 			rb.hasPrefix = true

@@ -5,6 +5,9 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"github.com/vapstack/qx"
+	"github.com/vapstack/rbi/internal/roaring64"
+	"go.etcd.io/bbolt"
 	"path/filepath"
 	"slices"
 	"sort"
@@ -13,17 +16,13 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
-	"unsafe"
-
-	"github.com/vapstack/qx"
-	"github.com/vapstack/rbi/internal/roaring64"
-	"go.etcd.io/bbolt"
 )
 
-func TestReadString_InternsNilValue(t *testing.T) {
+func TestReadString_RoundTrip(t *testing.T) {
 	var payload bytes.Buffer
 	writer := bufio.NewWriter(&payload)
-	if err := writeString(writer, nilValue); err != nil {
+	const want = "plain-string"
+	if err := writeString(writer, want); err != nil {
 		t.Fatalf("writeString: %v", err)
 	}
 	if err := writer.Flush(); err != nil {
@@ -34,11 +33,8 @@ func TestReadString_InternsNilValue(t *testing.T) {
 	if err != nil {
 		t.Fatalf("readString: %v", err)
 	}
-	if got != nilValue {
+	if got != want {
 		t.Fatalf("readString mismatch: got %q", got)
-	}
-	if unsafe.StringData(got) != unsafe.StringData(nilValue) {
-		t.Fatalf("readString must intern nilValue")
 	}
 }
 

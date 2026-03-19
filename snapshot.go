@@ -17,14 +17,19 @@ type indexSnapshot struct {
 	txID uint64
 
 	index        map[string]*[]index
+	nilIndex     map[string]*[]index
 	lenIndex     map[string]*[]index
 	indexView    map[string]*[]index
+	nilIndexView map[string]*[]index
 	lenIndexView map[string]*[]index
 	indexDelta   map[string]*fieldIndexDelta
+	nilDelta     map[string]*fieldIndexDelta
 	lenIdxDelta  map[string]*fieldIndexDelta
 	indexLayer   *fieldDeltaLayer
+	nilLayer     *fieldDeltaLayer
 	lenLayer     *fieldDeltaLayer
 	indexDCount  int
+	nilDCount    int
 	lenDCount    int
 	universe     *roaring64.Bitmap
 	universeAdd  *roaring64.Bitmap
@@ -32,6 +37,7 @@ type indexSnapshot struct {
 	strmap       *strMapSnapshot
 
 	indexDeltaCache sync.Map
+	nilDeltaCache   sync.Map
 	lenDeltaCache   sync.Map
 	// numericRangeBucketCache stores lazy-built per-field base bucket unions for
 	// numeric range acceleration; field deltas are applied on top at query time.
@@ -259,16 +265,18 @@ func (db *DB[K, V]) broadcastSnapshotWaiters() {
 }
 
 func (db *DB[K, V]) publishSnapshotNoLock(txID uint64) {
-	db.publishSnapshotWithTxDeltaNoLock(txID, nil, nil, nil, nil)
+	db.publishSnapshotWithTxDeltaNoLock(txID, nil, nil, nil, nil, nil)
 }
 
-func (db *DB[K, V]) publishSnapshotWithTxDeltaNoLock(txID uint64, indexChanges, lenChanges map[string]map[string]indexDeltaEntry, add, rem *roaring64.Bitmap) {
+func (db *DB[K, V]) publishSnapshotWithTxDeltaNoLock(txID uint64, indexChanges, nilChanges, lenChanges map[string]map[string]indexDeltaEntry, add, rem *roaring64.Bitmap) {
 	indexDelta := buildSnapshotDeltaMap(indexChanges, func(field string) bool {
 		return fieldUsesFixed8Keys(db.fields[field])
 	})
+	nilDelta := buildSnapshotDeltaMap(nilChanges, func(string) bool { return false })
 	lenDelta := buildSnapshotDeltaMap(lenChanges, func(string) bool { return true })
 	prev := db.snapshot.current.Load()
 	indexLayer := layerFromFlatDeltaMap(indexDelta)
+	nilLayer := layerFromFlatDeltaMap(nilDelta)
 	lenLayer := layerFromFlatDeltaMap(lenDelta)
 	var snapStrMap *strMapSnapshot
 	if db.strkey {
@@ -278,12 +286,16 @@ func (db *DB[K, V]) publishSnapshotWithTxDeltaNoLock(txID uint64, indexChanges, 
 	s := &indexSnapshot{
 		txID:        txID,
 		index:       db.index,
+		nilIndex:    db.nilIndex,
 		lenIndex:    db.lenIndex,
 		indexDelta:  indexDelta,
+		nilDelta:    nilDelta,
 		lenIdxDelta: lenDelta,
 		indexLayer:  indexLayer,
+		nilLayer:    nilLayer,
 		lenLayer:    lenLayer,
 		indexDCount: indexLayer.effectiveFieldCount(),
+		nilDCount:   nilLayer.effectiveFieldCount(),
 		lenDCount:   lenLayer.effectiveFieldCount(),
 		universe:    db.universe,
 		universeAdd: cloneIfNotEmpty(add),
@@ -304,13 +316,14 @@ func (db *DB[K, V]) publishSnapshotWithTxDeltaNoLock(txID uint64, indexChanges, 
 
 func (db *DB[K, V]) publishPreparedSnapshotWithAccumDeltaNoLock(txID uint64, delta *preparedSnapshotDelta) {
 	if delta == nil {
-		db.publishSnapshotWithAccumDeltaNoLock(txID, nil, nil, nil, nil)
+		db.publishSnapshotWithAccumDeltaNoLock(txID, nil, nil, nil, nil, nil)
 		return
 	}
 
 	prev := db.getSnapshot()
 
 	baseIndex := db.index
+	baseNilIndex := db.nilIndex
 	baseLenIndex := db.lenIndex
 	baseUniverse := db.universe
 	var baseStrMap *strMapSnapshot
@@ -319,6 +332,7 @@ func (db *DB[K, V]) publishPreparedSnapshotWithAccumDeltaNoLock(txID uint64, del
 	}
 	if prev != nil {
 		baseIndex = prev.index
+		baseNilIndex = prev.nilIndex
 		baseLenIndex = prev.lenIndex
 		baseUniverse = prev.universe
 		if !db.strkey {
@@ -326,13 +340,17 @@ func (db *DB[K, V]) publishPreparedSnapshotWithAccumDeltaNoLock(txID uint64, del
 		}
 	}
 	prevIndexLayer := prev.getIndexLayer()
+	prevNilLayer := prev.getNilLayer()
 	prevLenLayer := prev.getLenLayer()
 
 	nextIndexLayer := appendDeltaLayer(prevIndexLayer, delta.indexDelta)
+	nextNilLayer := appendDeltaLayer(prevNilLayer, delta.nilDelta)
 	nextLenLayer := appendDeltaLayer(prevLenLayer, delta.lenDelta)
 	nextIndexCount := appendDeltaLayerFieldCount(prev.indexDeltaCount(), delta.indexDelta, len(baseIndex))
+	nextNilCount := appendDeltaLayerFieldCount(prev.nilDeltaCount(), delta.nilDelta, len(baseNilIndex))
 	nextLenCount := appendDeltaLayerFieldCount(prev.lenDeltaCount(), delta.lenDelta, len(baseLenIndex))
 	nextIndexLayer, nextIndexCount = capPublishedDeltaLayerDepth(nextIndexLayer, nextIndexCount, db.options.SnapshotDeltaLayerMaxDepth)
+	nextNilLayer, nextNilCount = capPublishedDeltaLayerDepth(nextNilLayer, nextNilCount, db.options.SnapshotDeltaLayerMaxDepth)
 	nextLenLayer, nextLenCount = capPublishedDeltaLayerDepth(nextLenLayer, nextLenCount, db.options.SnapshotDeltaLayerMaxDepth)
 
 	nextUniverseAdd, nextUniverseRem := mergeUniverseDelta(nil, nil, delta.universeAdd, delta.universeRem)
@@ -341,17 +359,22 @@ func (db *DB[K, V]) publishPreparedSnapshotWithAccumDeltaNoLock(txID uint64, del
 	}
 
 	nextIndexDelta := maybeExposeFlatLayerMap(nextIndexLayer)
+	nextNilDelta := maybeExposeFlatLayerMap(nextNilLayer)
 	nextLenDelta := maybeExposeFlatLayerMap(nextLenLayer)
 
 	s := &indexSnapshot{
 		txID:        txID,
 		index:       baseIndex,
+		nilIndex:    baseNilIndex,
 		lenIndex:    baseLenIndex,
 		indexDelta:  nextIndexDelta,
+		nilDelta:    nextNilDelta,
 		lenIdxDelta: nextLenDelta,
 		indexLayer:  nextIndexLayer,
+		nilLayer:    nextNilLayer,
 		lenLayer:    nextLenLayer,
 		indexDCount: nextIndexCount,
+		nilDCount:   nextNilCount,
 		lenDCount:   nextLenCount,
 		universe:    baseUniverse,
 		universeAdd: nextUniverseAdd,
@@ -368,20 +391,22 @@ func (db *DB[K, V]) publishPreparedSnapshotWithAccumDeltaNoLock(txID uint64, del
 	db.snapshot.current.Store(s)
 	db.registerSnapshot(s)
 	if s.hasAnyDeltaState() {
-		db.maybeRequestSnapshotCompaction(s, delta.indexDelta, delta.lenDelta, delta.universeAdd, delta.universeRem)
+		db.maybeRequestSnapshotCompaction(s, delta.indexDelta, delta.nilDelta, delta.lenDelta, delta.universeAdd, delta.universeRem)
 	}
 	db.noteSnapshotActivity()
 	delta.releaseTransientUniverse()
 }
 
-func (db *DB[K, V]) publishSnapshotWithAccumDeltaNoLock(txID uint64, indexChanges, lenChanges map[string]map[string]indexDeltaEntry, add, rem *roaring64.Bitmap) {
+func (db *DB[K, V]) publishSnapshotWithAccumDeltaNoLock(txID uint64, indexChanges, nilChanges, lenChanges map[string]map[string]indexDeltaEntry, add, rem *roaring64.Bitmap) {
 	indexDelta := buildSnapshotDeltaMap(indexChanges, func(field string) bool {
 		return fieldUsesFixed8Keys(db.fields[field])
 	})
+	nilDelta := buildSnapshotDeltaMap(nilChanges, func(string) bool { return false })
 	lenDelta := buildSnapshotDeltaMap(lenChanges, func(string) bool { return true })
 	prev := db.getSnapshot()
 
 	baseIndex := db.index
+	baseNilIndex := db.nilIndex
 	baseLenIndex := db.lenIndex
 	baseUniverse := db.universe
 	var baseStrMap *strMapSnapshot
@@ -390,6 +415,7 @@ func (db *DB[K, V]) publishSnapshotWithAccumDeltaNoLock(txID uint64, indexChange
 	}
 	if prev != nil {
 		baseIndex = prev.index
+		baseNilIndex = prev.nilIndex
 		baseLenIndex = prev.lenIndex
 		baseUniverse = prev.universe
 		if !db.strkey {
@@ -397,13 +423,17 @@ func (db *DB[K, V]) publishSnapshotWithAccumDeltaNoLock(txID uint64, indexChange
 		}
 	}
 	prevIndexLayer := prev.getIndexLayer()
+	prevNilLayer := prev.getNilLayer()
 	prevLenLayer := prev.getLenLayer()
 
 	nextIndexLayer := appendDeltaLayer(prevIndexLayer, indexDelta)
+	nextNilLayer := appendDeltaLayer(prevNilLayer, nilDelta)
 	nextLenLayer := appendDeltaLayer(prevLenLayer, lenDelta)
 	nextIndexCount := appendDeltaLayerFieldCount(prev.indexDeltaCount(), indexDelta, len(baseIndex))
+	nextNilCount := appendDeltaLayerFieldCount(prev.nilDeltaCount(), nilDelta, len(baseNilIndex))
 	nextLenCount := appendDeltaLayerFieldCount(prev.lenDeltaCount(), lenDelta, len(baseLenIndex))
 	nextIndexLayer, nextIndexCount = capPublishedDeltaLayerDepth(nextIndexLayer, nextIndexCount, db.options.SnapshotDeltaLayerMaxDepth)
+	nextNilLayer, nextNilCount = capPublishedDeltaLayerDepth(nextNilLayer, nextNilCount, db.options.SnapshotDeltaLayerMaxDepth)
 	nextLenLayer, nextLenCount = capPublishedDeltaLayerDepth(nextLenLayer, nextLenCount, db.options.SnapshotDeltaLayerMaxDepth)
 
 	nextUniverseAdd, nextUniverseRem := mergeUniverseDelta(nil, nil, add, rem)
@@ -412,17 +442,22 @@ func (db *DB[K, V]) publishSnapshotWithAccumDeltaNoLock(txID uint64, indexChange
 	}
 
 	nextIndexDelta := maybeExposeFlatLayerMap(nextIndexLayer)
+	nextNilDelta := maybeExposeFlatLayerMap(nextNilLayer)
 	nextLenDelta := maybeExposeFlatLayerMap(nextLenLayer)
 
 	s := &indexSnapshot{
 		txID:        txID,
 		index:       baseIndex,
+		nilIndex:    baseNilIndex,
 		lenIndex:    baseLenIndex,
 		indexDelta:  nextIndexDelta,
+		nilDelta:    nextNilDelta,
 		lenIdxDelta: nextLenDelta,
 		indexLayer:  nextIndexLayer,
+		nilLayer:    nextNilLayer,
 		lenLayer:    nextLenLayer,
 		indexDCount: nextIndexCount,
+		nilDCount:   nextNilCount,
 		lenDCount:   nextLenCount,
 		universe:    baseUniverse,
 		universeAdd: nextUniverseAdd,
@@ -439,7 +474,7 @@ func (db *DB[K, V]) publishSnapshotWithAccumDeltaNoLock(txID uint64, indexChange
 	db.snapshot.current.Store(s)
 	db.registerSnapshot(s)
 	if s.hasAnyDeltaState() {
-		db.maybeRequestSnapshotCompaction(s, indexDelta, lenDelta, add, rem)
+		db.maybeRequestSnapshotCompaction(s, indexDelta, nilDelta, lenDelta, add, rem)
 	}
 	db.noteSnapshotActivity()
 }
@@ -533,12 +568,12 @@ func (db *DB[K, V]) noteSnapshotActivity() {
 	}
 }
 
-func (db *DB[K, V]) maybeRequestSnapshotCompaction(s *indexSnapshot, indexDelta, lenDelta map[string]*fieldIndexDelta, add, rem *roaring64.Bitmap) {
+func (db *DB[K, V]) maybeRequestSnapshotCompaction(s *indexSnapshot, indexDelta, nilDelta, lenDelta map[string]*fieldIndexDelta, add, rem *roaring64.Bitmap) {
 	stats := db.snapshot.statsEnabled
 	if db.snapshot.compactReq == nil || !s.hasAnyDeltaState() {
 		return
 	}
-	if snapshotCompactionUrgent(s, db.options) || txDeltaNeedsCompaction(indexDelta, lenDelta, add, rem, db.options) {
+	if snapshotCompactionUrgent(s, db.options) || txDeltaNeedsCompaction(indexDelta, nilDelta, lenDelta, add, rem, db.options) {
 		db.snapshot.compactSkipUntil.Store(0)
 		db.requestSnapshotCompaction()
 		return
@@ -581,6 +616,9 @@ func (db *DB[K, V]) compactorRequestEveryForSnapshot(s *indexSnapshot) uint64 {
 	if l := s.getIndexLayer(); l != nil {
 		maxDepth = l.depth
 	}
+	if l := s.getNilLayer(); l != nil && l.depth > maxDepth {
+		maxDepth = l.depth
+	}
 	if l := s.getLenLayer(); l != nil && l.depth > maxDepth {
 		maxDepth = l.depth
 	}
@@ -608,6 +646,9 @@ func snapshotCompactionUrgent(s *indexSnapshot, opt *Options) bool {
 		if l := s.getIndexLayer(); l != nil && l.depth > urgentDepth {
 			return true
 		}
+		if l := s.getNilLayer(); l != nil && l.depth > urgentDepth {
+			return true
+		}
 		if l := s.getLenLayer(); l != nil && l.depth > urgentDepth {
 			return true
 		}
@@ -619,7 +660,7 @@ func snapshotCompactionUrgent(s *indexSnapshot, opt *Options) bool {
 	return false
 }
 
-func txDeltaNeedsCompaction(indexDelta, lenDelta map[string]*fieldIndexDelta, add, rem *roaring64.Bitmap, opt *Options) bool {
+func txDeltaNeedsCompaction(indexDelta, nilDelta, lenDelta map[string]*fieldIndexDelta, add, rem *roaring64.Bitmap, opt *Options) bool {
 	opsThr := uint64(0)
 	if opt.SnapshotDeltaCompactFieldOps > 0 {
 		opsThr = uint64(opt.SnapshotDeltaCompactFieldOps)
@@ -629,6 +670,7 @@ func txDeltaNeedsCompaction(indexDelta, lenDelta map[string]*fieldIndexDelta, ad
 		return true
 	}
 	return fieldDeltaPatchNeedsCompaction(indexDelta, opt.SnapshotDeltaCompactFieldKeys, opsThr) ||
+		fieldDeltaPatchNeedsCompaction(nilDelta, opt.SnapshotDeltaCompactFieldKeys, opsThr) ||
 		fieldDeltaPatchNeedsCompaction(lenDelta, opt.SnapshotDeltaCompactFieldKeys, opsThr)
 }
 
@@ -818,6 +860,9 @@ func snapshotCompactionWorthwhile(s *indexSnapshot, opt *Options) bool {
 	if l := s.getIndexLayer(); l != nil && l.depth > 1 {
 		return true
 	}
+	if l := s.getNilLayer(); l != nil && l.depth > 1 {
+		return true
+	}
 	if l := s.getLenLayer(); l != nil && l.depth > 1 {
 		return true
 	}
@@ -828,7 +873,7 @@ func snapshotCompactionWorthwhile(s *indexSnapshot, opt *Options) bool {
 		}
 	}
 	fieldLimit := max(1, opt.SnapshotDeltaCompactMaxFieldsPerPublish)
-	if s.indexDeltaCount() > fieldLimit || s.lenDeltaCount() > fieldLimit {
+	if s.indexDeltaCount() > fieldLimit || s.nilDeltaCount() > fieldLimit || s.lenDeltaCount() > fieldLimit {
 		return true
 	}
 	return false
@@ -1082,10 +1127,13 @@ func compactSnapshot(cur *indexSnapshot, opt *Options, force bool) (*indexSnapsh
 	}
 
 	baseIndex := cur.index
+	baseNilIndex := cur.nilIndex
 	baseLenIndex := cur.lenIndex
 	indexLayer := cur.getIndexLayer()
+	nilLayer := cur.getNilLayer()
 	lenLayer := cur.getLenLayer()
 	indexCount := cur.indexDCount
+	nilCount := cur.nilDCount
 	lenCount := cur.lenDCount
 	changed := false
 
@@ -1098,6 +1146,16 @@ func compactSnapshot(cur *indexSnapshot, opt *Options, force bool) (*indexSnapsh
 		indexCount -= compacted
 		if indexCount < 0 {
 			indexCount = 0
+		}
+	}
+	nilBaseUnchanged := true
+	baseNilIndex, nilLayer, compacted = compactDeltaLayerIntoBase(baseNilIndex, nilLayer, opt, force)
+	if compacted > 0 {
+		nilBaseUnchanged = false
+		changed = true
+		nilCount -= compacted
+		if nilCount < 0 {
+			nilCount = 0
 		}
 	}
 	baseLenIndex, lenLayer, compacted = compactDeltaLayerIntoBase(baseLenIndex, lenLayer, opt, force)
@@ -1113,6 +1171,11 @@ func compactSnapshot(cur *indexSnapshot, opt *Options, force bool) (*indexSnapsh
 	} else if indexCount == 0 {
 		indexCount = indexLayer.effectiveFieldCount()
 	}
+	if nilLayer == nil {
+		nilCount = 0
+	} else if nilCount == 0 {
+		nilCount = nilLayer.effectiveFieldCount()
+	}
 	if lenLayer == nil {
 		lenCount = 0
 	} else if lenCount == 0 {
@@ -1121,6 +1184,10 @@ func compactSnapshot(cur *indexSnapshot, opt *Options, force bool) (*indexSnapsh
 
 	nextIndexLayer, nextIndexCount := maybeFlattenDeltaLayerByDepth(indexLayer, indexCount, opt.SnapshotDeltaLayerMaxDepth)
 	if nextIndexLayer != indexLayer || nextIndexCount != indexCount {
+		changed = true
+	}
+	nextNilLayer, nextNilCount := maybeFlattenDeltaLayerByDepth(nilLayer, nilCount, opt.SnapshotDeltaLayerMaxDepth)
+	if nextNilLayer != nilLayer || nextNilCount != nilCount {
 		changed = true
 	}
 	nextLenLayer, nextLenCount := maybeFlattenDeltaLayerByDepth(lenLayer, lenCount, opt.SnapshotDeltaLayerMaxDepth)
@@ -1146,18 +1213,22 @@ func compactSnapshot(cur *indexSnapshot, opt *Options, force bool) (*indexSnapsh
 	return &indexSnapshot{
 		txID:                            cur.txID,
 		index:                           baseIndex,
+		nilIndex:                        baseNilIndex,
 		lenIndex:                        baseLenIndex,
 		indexDelta:                      maybeExposeFlatLayerMap(nextIndexLayer),
+		nilDelta:                        maybeExposeFlatLayerMap(nextNilLayer),
 		lenIdxDelta:                     maybeExposeFlatLayerMap(nextLenLayer),
 		indexLayer:                      nextIndexLayer,
+		nilLayer:                        nextNilLayer,
 		lenLayer:                        nextLenLayer,
 		indexDCount:                     nextIndexCount,
+		nilDCount:                       nextNilCount,
 		lenDCount:                       nextLenCount,
 		universe:                        nextUniverse,
 		universeAdd:                     nextUniverseAdd,
 		universeRem:                     nextUniverseRem,
 		strmap:                          cur.strmap,
-		numericRangeBucketCache:         inheritNumericRangeBucketCache(cur, indexBaseUnchanged),
+		numericRangeBucketCache:         inheritNumericRangeBucketCache(cur, indexBaseUnchanged && nilBaseUnchanged),
 		matPredCacheMaxEntries:          cur.matPredCacheMaxEntries,
 		matPredCacheMaxEntriesWithDelta: cur.matPredCacheMaxEntriesWithDelta,
 		matPredCacheMaxBitmapCard:       cur.matPredCacheMaxBitmapCard,
@@ -1188,9 +1259,11 @@ func forceCompactSnapshot(cur *indexSnapshot, nextStrMap *strMapSnapshot) (*inde
 	}
 
 	indexLayer := cur.getIndexLayer()
+	nilLayer := cur.getNilLayer()
 	lenLayer := cur.getLenLayer()
 
 	nextIndex, indexBaseChanged := forceCompactSnapshotFieldBase(cur.index, indexLayer)
+	nextNilIndex, nilBaseChanged := forceCompactSnapshotFieldBase(cur.nilIndex, nilLayer)
 	nextLenIndex, _ := forceCompactSnapshotFieldBase(cur.lenIndex, lenLayer)
 
 	nextUniverse := cur.universe
@@ -1200,20 +1273,22 @@ func forceCompactSnapshot(cur *indexSnapshot, nextStrMap *strMapSnapshot) (*inde
 	}
 
 	indexDeltaCleared := indexLayer != nil || len(cur.indexDelta) > 0 || cur.indexDCount > 0
+	nilDeltaCleared := nilLayer != nil || len(cur.nilDelta) > 0 || cur.nilDCount > 0
 	lenDeltaCleared := lenLayer != nil || len(cur.lenIdxDelta) > 0 || cur.lenDCount > 0
 	strMapCompacted := nextStrMap != cur.strmap
 
-	if !indexDeltaCleared && !lenDeltaCleared && !universeDeltaCleared && !strMapCompacted {
+	if !indexDeltaCleared && !nilDeltaCleared && !lenDeltaCleared && !universeDeltaCleared && !strMapCompacted {
 		return cur, false
 	}
 
 	return &indexSnapshot{
 		txID:                            cur.txID,
 		index:                           nextIndex,
+		nilIndex:                        nextNilIndex,
 		lenIndex:                        nextLenIndex,
 		universe:                        nextUniverse,
 		strmap:                          nextStrMap,
-		numericRangeBucketCache:         inheritNumericRangeBucketCache(cur, !indexBaseChanged),
+		numericRangeBucketCache:         inheritNumericRangeBucketCache(cur, !indexBaseChanged && !nilBaseChanged),
 		matPredCacheMaxEntries:          cur.matPredCacheMaxEntries,
 		matPredCacheMaxEntriesWithDelta: cur.matPredCacheMaxEntriesWithDelta,
 		matPredCacheMaxBitmapCard:       cur.matPredCacheMaxBitmapCard,
@@ -1226,6 +1301,7 @@ func (db *DB[K, V]) getSnapshot() *indexSnapshot {
 	}
 	return &indexSnapshot{
 		index:                           db.index,
+		nilIndex:                        db.nilIndex,
 		lenIndex:                        db.lenIndex,
 		universe:                        db.universe,
 		strmap:                          db.strmap.snapshot(),
@@ -1344,6 +1420,16 @@ func (s *indexSnapshot) getIndexLayer() *fieldDeltaLayer {
 	return layerFromFlatDeltaMap(s.indexDelta)
 }
 
+func (s *indexSnapshot) getNilLayer() *fieldDeltaLayer {
+	if s == nil {
+		return nil
+	}
+	if s.nilLayer != nil {
+		return s.nilLayer
+	}
+	return layerFromFlatDeltaMap(s.nilDelta)
+}
+
 func (s *indexSnapshot) getLenLayer() *fieldDeltaLayer {
 	if s == nil {
 		return nil
@@ -1362,6 +1448,16 @@ func (s *indexSnapshot) indexDeltaCount() int {
 		return len(s.indexDelta)
 	}
 	return s.indexDCount
+}
+
+func (s *indexSnapshot) nilDeltaCount() int {
+	if s == nil {
+		return 0
+	}
+	if len(s.nilDelta) > 0 {
+		return len(s.nilDelta)
+	}
+	return s.nilDCount
 }
 
 func (s *indexSnapshot) lenDeltaCount() int {
@@ -1384,6 +1480,18 @@ func (s *indexSnapshot) fieldIndexSlice(field string) *[]index {
 		}
 	}
 	return s.index[field]
+}
+
+func (s *indexSnapshot) nilFieldIndexSlice(field string) *[]index {
+	if s == nil {
+		return nil
+	}
+	if s.nilIndexView != nil {
+		if v, ok := s.nilIndexView[field]; ok {
+			return v
+		}
+	}
+	return s.nilIndex[field]
 }
 
 func (s *indexSnapshot) lenFieldIndexSlice(field string) *[]index {
@@ -1420,12 +1528,38 @@ func (s *indexSnapshot) fieldDelta(field string) *fieldIndexDelta {
 	return d
 }
 
+func (s *indexSnapshot) nilFieldDelta(field string) *fieldIndexDelta {
+	if s == nil {
+		return nil
+	}
+	if len(s.nilDelta) > 0 {
+		d := s.nilDelta[field]
+		if d == nil || !d.hasEntries() {
+			return nil
+		}
+		return d
+	}
+	if s.nilLayer == nil {
+		return nil
+	}
+	if cached, ok := s.nilDeltaCache.Load(field); ok {
+		return cached.(*fieldIndexDelta)
+	}
+	d := lookupLayerFieldDelta(s.nilLayer, field)
+	s.nilDeltaCache.Store(field, d)
+	return d
+}
+
 func (s *indexSnapshot) fieldDeltaEntry(field, key string) (indexDeltaEntry, bool) {
+	return s.familyDeltaEntry(s.indexDelta, s.indexLayer, field, key)
+}
+
+func (s *indexSnapshot) familyDeltaEntry(flat map[string]*fieldIndexDelta, layer *fieldDeltaLayer, field, key string) (indexDeltaEntry, bool) {
 	if s == nil {
 		return indexDeltaEntry{}, false
 	}
-	if len(s.indexDelta) > 0 {
-		d := s.indexDelta[field]
+	if len(flat) > 0 {
+		d := flat[field]
 		if d == nil {
 			return indexDeltaEntry{}, false
 		}
@@ -1435,10 +1569,14 @@ func (s *indexSnapshot) fieldDeltaEntry(field, key string) (indexDeltaEntry, boo
 		}
 		return e, true
 	}
-	if s.indexLayer == nil {
+	if layer == nil {
 		return indexDeltaEntry{}, false
 	}
-	return lookupLayerFieldDeltaEntry(s.indexLayer, field, key)
+	return lookupLayerFieldDeltaEntry(layer, field, key)
+}
+
+func (s *indexSnapshot) nilFieldDeltaEntry(field string) (indexDeltaEntry, bool) {
+	return s.familyDeltaEntry(s.nilDelta, s.nilLayer, field, nilIndexEntryKey)
 }
 
 func (s *indexSnapshot) lenFieldDelta(field string) *fieldIndexDelta {
@@ -1463,6 +1601,26 @@ func (s *indexSnapshot) lenFieldDelta(field string) *fieldIndexDelta {
 	return d
 }
 
+func (s *indexSnapshot) nilFieldNameSet() map[string]struct{} {
+	if s == nil {
+		return nil
+	}
+	fields := make(map[string]struct{}, len(s.nilIndex)+s.nilDeltaCount())
+	for f := range s.nilIndex {
+		fields[f] = struct{}{}
+	}
+	if len(s.nilDelta) > 0 {
+		for f := range s.nilDelta {
+			fields[f] = struct{}{}
+		}
+		return fields
+	}
+	forEachEffectiveLayerField(s.nilLayer, func(field string, _ *fieldIndexDelta) {
+		fields[field] = struct{}{}
+	})
+	return fields
+}
+
 func (s *indexSnapshot) fieldNameSet() map[string]struct{} {
 	if s == nil {
 		return nil
@@ -1480,6 +1638,24 @@ func (s *indexSnapshot) fieldNameSet() map[string]struct{} {
 	forEachEffectiveLayerField(s.indexLayer, func(field string, _ *fieldIndexDelta) {
 		fields[field] = struct{}{}
 	})
+	return fields
+}
+
+func (s *indexSnapshot) indexedFieldNameSet() map[string]struct{} {
+	if s == nil {
+		return nil
+	}
+	fields := s.fieldNameSet()
+	nilFields := s.nilFieldNameSet()
+	if len(fields) == 0 {
+		if len(nilFields) == 0 {
+			return nil
+		}
+		return nilFields
+	}
+	for field := range nilFields {
+		fields[field] = struct{}{}
+	}
 	return fields
 }
 
@@ -1593,6 +1769,23 @@ func (s *indexSnapshot) fieldLookupOwned(field, key string, scratch *roaring64.B
 	return composePostingOwned(base, de, scratch)
 }
 
+func (s *indexSnapshot) nilFieldLookupOwned(field string, scratch *roaring64.Bitmap) (*roaring64.Bitmap, bool) {
+	if s == nil {
+		return nil, false
+	}
+
+	var base postingList
+	if baseSlice := s.nilFieldIndexSlice(field); baseSlice != nil && len(*baseSlice) > 0 {
+		base = (*baseSlice)[0].IDs
+	}
+
+	de, ok := s.nilFieldDeltaEntry(field)
+	if !ok {
+		return base.ToBitmapOwned(scratch)
+	}
+	return composePostingOwned(base, de, scratch)
+}
+
 type layerUpperStats struct {
 	// keys is an upper-bound estimate of effective delta keys.
 	keys int
@@ -1646,6 +1839,10 @@ func lookupLayerFieldUpperStats(layer *fieldDeltaLayer, field string) (keys int,
 
 func (db *DB[K, V]) snapshotFieldIndexSlice(field string) *[]index {
 	return db.getSnapshot().fieldIndexSlice(field)
+}
+
+func (db *DB[K, V]) snapshotNilFieldIndexSlice(field string) *[]index {
+	return db.getSnapshot().nilFieldIndexSlice(field)
 }
 
 func (db *DB[K, V]) snapshotLenFieldIndexSlice(field string) *[]index {
@@ -2657,6 +2854,15 @@ func (db *DB[K, V]) fieldLookupOwned(field, key string, scratch *roaring64.Bitma
 	return db.getSnapshot().fieldLookupOwned(field, key, scratch)
 }
 
+func (db *DB[K, V]) nilFieldOverlay(field string) fieldOverlay {
+	s := db.getSnapshot()
+	return newFieldOverlay(s.nilFieldIndexSlice(field), s.nilFieldDelta(field))
+}
+
+func (db *DB[K, V]) nilFieldLookupOwned(field string, scratch *roaring64.Bitmap) (*roaring64.Bitmap, bool) {
+	return db.getSnapshot().nilFieldLookupOwned(field, scratch)
+}
+
 func (db *DB[K, V]) lenFieldOverlay(field string) fieldOverlay {
 	s := db.getSnapshot()
 	return newFieldOverlay(s.lenFieldIndexSlice(field), s.lenFieldDelta(field))
@@ -2668,6 +2874,12 @@ func (db *DB[K, V]) hasFieldIndex(field string) bool {
 		return true
 	}
 	if s.fieldDelta(field) != nil {
+		return true
+	}
+	if s.nilFieldIndexSlice(field) != nil {
+		return true
+	}
+	if s.nilFieldDelta(field) != nil {
 		return true
 	}
 	return false
@@ -2692,10 +2904,10 @@ func (s *indexSnapshot) hasAnyDeltaState() bool {
 	if s == nil {
 		return false
 	}
-	if s.indexDCount > 0 || s.lenDCount > 0 {
+	if s.indexDCount > 0 || s.nilDCount > 0 || s.lenDCount > 0 {
 		return true
 	}
-	if len(s.indexDelta) > 0 || len(s.lenIdxDelta) > 0 {
+	if len(s.indexDelta) > 0 || len(s.nilDelta) > 0 || len(s.lenIdxDelta) > 0 {
 		return true
 	}
 	if s.universeAdd != nil && !s.universeAdd.IsEmpty() {

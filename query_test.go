@@ -310,6 +310,159 @@ func asInt(v any) (int64, bool) {
 	}
 }
 
+func compareOrderedFieldValues(va, vb any, desc bool) int {
+	switch {
+	case va == nil && vb == nil:
+		return 0
+	case va == nil:
+		return 1
+	case vb == nil:
+		return -1
+	}
+
+	switch xa := va.(type) {
+	case int:
+		xb, ok := vb.(int)
+		if !ok {
+			return 0
+		}
+		switch {
+		case xa < xb:
+			if desc {
+				return 1
+			}
+			return -1
+		case xa > xb:
+			if desc {
+				return -1
+			}
+			return 1
+		default:
+			return 0
+		}
+	case float64:
+		xb, ok := vb.(float64)
+		if !ok {
+			return 0
+		}
+		switch {
+		case xa < xb:
+			if desc {
+				return 1
+			}
+			return -1
+		case xa > xb:
+			if desc {
+				return -1
+			}
+			return 1
+		default:
+			return 0
+		}
+	case string:
+		xb, ok := vb.(string)
+		if !ok {
+			return 0
+		}
+		switch {
+		case xa < xb:
+			if desc {
+				return 1
+			}
+			return -1
+		case xa > xb:
+			if desc {
+				return -1
+			}
+			return 1
+		default:
+			return 0
+		}
+	case bool:
+		xb, ok := vb.(bool)
+		if !ok {
+			return 0
+		}
+		switch {
+		case !xa && xb:
+			if desc {
+				return 1
+			}
+			return -1
+		case xa && !xb:
+			if desc {
+				return -1
+			}
+			return 1
+		default:
+			return 0
+		}
+	default:
+		return 0
+	}
+}
+
+func queryValueEqualsScalar(value any, want any) (bool, error) {
+	switch w := want.(type) {
+	case nil:
+		return value == nil, nil
+	case int:
+		i, ok := asInt(value)
+		return ok && i == int64(w), nil
+	case float64:
+		f, ok := asFloat(value)
+		return ok && f == w, nil
+	case bool:
+		b, ok := value.(bool)
+		return ok && b == w, nil
+	case string:
+		s, ok := asString(value)
+		return ok && s == w, nil
+	default:
+		return false, fmt.Errorf("test harness: unsupported scalar query value %T", want)
+	}
+}
+
+func querySliceContainsScalar(values any, want any) (bool, error) {
+	if values == nil {
+		return false, nil
+	}
+	v := reflect.ValueOf(values)
+	v, isNil := unwrapExprValue(v)
+	if isNil {
+		return want == nil, nil
+	}
+	if v.Kind() != reflect.Slice {
+		return false, fmt.Errorf("test harness: IN expects a slice, got %T", values)
+	}
+
+	for i := 0; i < v.Len(); i++ {
+		elem := v.Index(i)
+		raw := any(nil)
+		if elem.IsValid() && elem.CanInterface() {
+			raw = elem.Interface()
+		}
+		elem, elemNil := unwrapExprValue(elem)
+		if elemNil {
+			if want == nil {
+				return true, nil
+			}
+			continue
+		}
+		if elem.IsValid() && elem.CanInterface() {
+			raw = elem.Interface()
+		}
+		match, err := queryValueEqualsScalar(raw, want)
+		if err != nil {
+			return false, err
+		}
+		if match {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 // evalExprBool tries to implement the query logic to serve as a reference implementation
 func evalExprBool(rec *Rec, e qx.Expr) (bool, error) {
 
@@ -392,49 +545,10 @@ func evalExprBool(rec *Rec, e qx.Expr) (bool, error) {
 		}
 
 	case qx.OpIN:
-		if e.Value == nil {
-			out = false
-			break
-		}
-		switch v := fv.(type) {
-		case int:
-			vals, ok2 := e.Value.([]int)
-			if ok2 {
-				out = false
-				for _, x := range vals {
-					if x == v {
-						out = true
-						break
-					}
-				}
-				break
-			}
-			vals64, ok3 := e.Value.([]int64)
-			if ok3 {
-				out = false
-				for _, x := range vals64 {
-					if int64(v) == x {
-						out = true
-						break
-					}
-				}
-				break
-			}
-			return false, fmt.Errorf("test harness: IN expects []int/[]int64 for int field")
-		case string:
-			vals, ok2 := e.Value.([]string)
-			if !ok2 {
-				return false, fmt.Errorf("test harness: IN expects []string for string field")
-			}
-			out = false
-			for _, x := range vals {
-				if x == v {
-					out = true
-					break
-				}
-			}
-		default:
-			return false, fmt.Errorf("test harness: unsupported IN field type %T", fv)
+		var err error
+		out, err = querySliceContainsScalar(e.Value, fv)
+		if err != nil {
+			return false, err
 		}
 
 	case qx.OpGT, qx.OpGTE, qx.OpLT, qx.OpLTE:
@@ -493,6 +607,10 @@ func evalExprBool(rec *Rec, e qx.Expr) (bool, error) {
 		}
 
 	case qx.OpPREFIX:
+		if fv == nil || e.Value == nil {
+			out = false
+			break
+		}
 		s, ok2 := asString(fv)
 		if !ok2 {
 			return false, fmt.Errorf("test harness: PREFIX only for string fields")
@@ -504,6 +622,10 @@ func evalExprBool(rec *Rec, e qx.Expr) (bool, error) {
 		out = strings.HasPrefix(s, p)
 
 	case qx.OpSUFFIX:
+		if fv == nil || e.Value == nil {
+			out = false
+			break
+		}
 		s, ok2 := asString(fv)
 		if !ok2 {
 			return false, fmt.Errorf("test harness: SUFFIX only for string fields")
@@ -515,6 +637,10 @@ func evalExprBool(rec *Rec, e qx.Expr) (bool, error) {
 		out = strings.HasSuffix(s, p)
 
 	case qx.OpCONTAINS:
+		if fv == nil || e.Value == nil {
+			out = false
+			break
+		}
 		s, ok2 := asString(fv)
 		if !ok2 {
 			return false, fmt.Errorf("test harness: CONTAINS only for string fields")
@@ -595,41 +721,11 @@ func expectedKeysUint64(t *testing.T, db *DB[uint64, Rec], q *qx.QX) ([]uint64, 
 			less := func(a, b row) bool {
 				va := fieldValue(a.rec, f)
 				vb := fieldValue(b.rec, f)
-
-				switch xa := va.(type) {
-				case int:
-					xb := vb.(int)
-					if xa == xb {
-						return a.id < b.id
-					}
-					if o.Desc {
-						return xa > xb
-					}
-					return xa < xb
-				case float64:
-					xb := vb.(float64)
-					if xa == xb {
-						return a.id < b.id
-					}
-					if o.Desc {
-						return xa > xb
-					}
-					return xa < xb
-				case string:
-					xb := vb.(string)
-					if xa == xb {
-						return a.id < b.id
-					}
-					if o.Desc {
-						return xa > xb
-					}
-					return xa < xb
-				default:
-					if o.Desc {
-						return a.id > b.id
-					}
+				cmp := compareOrderedFieldValues(va, vb, o.Desc)
+				if cmp == 0 {
 					return a.id < b.id
 				}
+				return cmp < 0
 			}
 			sort.Slice(rows, func(i, j int) bool { return less(rows[i], rows[j]) })
 
@@ -752,41 +848,11 @@ func expectedKeysString(t testing.TB, db *DB[string, Rec], q *qx.QX) ([]string, 
 			less := func(a, b row) bool {
 				va := fieldValue(a.rec, f)
 				vb := fieldValue(b.rec, f)
-
-				switch xa := va.(type) {
-				case int:
-					xb := vb.(int)
-					if xa == xb {
-						return a.idx < b.idx
-					}
-					if o.Desc {
-						return xa > xb
-					}
-					return xa < xb
-				case float64:
-					xb := vb.(float64)
-					if xa == xb {
-						return a.idx < b.idx
-					}
-					if o.Desc {
-						return xa > xb
-					}
-					return xa < xb
-				case string:
-					xb := vb.(string)
-					if xa == xb {
-						return a.idx < b.idx
-					}
-					if o.Desc {
-						return xa > xb
-					}
-					return xa < xb
-				default:
-					if o.Desc {
-						return a.idx > b.idx
-					}
+				cmp := compareOrderedFieldValues(va, vb, o.Desc)
+				if cmp == 0 {
 					return a.idx < b.idx
 				}
+				return cmp < 0
 			}
 			sort.Slice(rows, func(i, j int) bool { return less(rows[i], rows[j]) })
 
