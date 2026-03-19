@@ -1878,31 +1878,41 @@ func (db *DB[K, V]) execPlanCandidateOrderBasic(q *qx.QX, preds []predicate) []K
 	return out
 }
 
-func (db *DB[K, V]) extractOrderRangeCoverage(field string, preds []predicate, s []index) (int, int, []bool, bool) {
+func (db *DB[K, V]) extractOrderRangeCoverageWithBounds(field string, preds []predicate, s []index) (rangeBounds, int, int, []bool, bool) {
 	rb, covered, has, ok := db.collectOrderRangeBounds(field, len(preds), func(i int) qx.Expr {
 		return preds[i].expr
 	})
 	if !ok {
-		return 0, 0, nil, false
+		return rangeBounds{}, 0, 0, nil, false
 	}
 
 	if !has {
-		return 0, len(s), covered, true
+		return rb, 0, len(s), covered, true
 	}
 
 	st, en := applyBoundsToIndexRange(s, rb)
-	return st, en, covered, true
+	return rb, st, en, covered, true
 }
 
-func (db *DB[K, V]) extractOrderRangeCoverageOverlay(field string, preds []predicate, ov fieldOverlay) (overlayRange, []bool, bool) {
+func (db *DB[K, V]) extractOrderRangeCoverage(field string, preds []predicate, s []index) (int, int, []bool, bool) {
+	_, st, en, covered, ok := db.extractOrderRangeCoverageWithBounds(field, preds, s)
+	return st, en, covered, ok
+}
+
+func (db *DB[K, V]) extractOrderRangeCoverageOverlayWithBounds(field string, preds []predicate, ov fieldOverlay) (rangeBounds, overlayRange, []bool, bool) {
 	rb, covered, _, ok := db.collectOrderRangeBounds(field, len(preds), func(i int) qx.Expr {
 		return preds[i].expr
 	})
 	if !ok {
-		return overlayRange{}, nil, false
+		return rangeBounds{}, overlayRange{}, nil, false
 	}
 
-	return ov.rangeForBounds(rb), covered, true
+	return rb, ov.rangeForBounds(rb), covered, true
+}
+
+func (db *DB[K, V]) extractOrderRangeCoverageOverlay(field string, preds []predicate, ov fieldOverlay) (overlayRange, []bool, bool) {
+	_, br, covered, ok := db.extractOrderRangeCoverageOverlayWithBounds(field, preds, ov)
+	return br, covered, ok
 }
 
 const (
@@ -3596,24 +3606,20 @@ func (db *DB[K, V]) execPlanOrderedBasic(q *qx.QX, preds []predicate, trace *que
 		return nil, false
 	}
 	ov := db.fieldOverlay(o.Field)
-	if !ov.hasData() {
+	nilOV := db.nilFieldOverlay(o.Field)
+	if !ov.hasData() && !nilOV.hasData() {
 		return nil, false
 	}
 
 	// Fast base-only path preserves anchored/fallback heuristics.
 	if ov.delta == nil {
 		s := ov.base
-		if len(s) == 0 {
-			return nil, true
+		rb, start, end, rangeCovered, ok := db.extractOrderRangeCoverageWithBounds(o.Field, preds, s)
+		if !ok {
+			return nil, false
 		}
-
-		start, end := 0, len(s)
-		var rangeCovered []bool
-		if st, en, cov, ok := db.extractOrderRangeCoverage(o.Field, preds, s); ok {
-			start, end = st, en
-			rangeCovered = cov
-		}
-		if start >= end {
+		nilTailField := orderNilTailField(fm, o.Field, rb)
+		if start >= end && nilTailField == "" {
 			return nil, true
 		}
 		for i := range rangeCovered {
@@ -3639,22 +3645,25 @@ func (db *DB[K, V]) execPlanOrderedBasic(q *qx.QX, preds []predicate, trace *que
 			active = append(active, i)
 		}
 
-		if out, ok := db.execPlanOrderedBasicAnchored(q, preds, active, start, end, s, trace); ok {
-			if trace != nil {
-				trace.setPlan(PlanOrderedAnchor)
+		if !fm.Ptr {
+			if out, ok := db.execPlanOrderedBasicAnchored(q, preds, active, start, end, s, trace); ok {
+				if trace != nil {
+					trace.setPlan(PlanOrderedAnchor)
+				}
+				return out, true
 			}
-			return out, true
 		}
 
 		sortActivePredicates(active, preds)
-		return db.execPlanOrderedBasicFallback(q, preds, active, start, end, s, trace), true
+		return db.execPlanOrderedBasicFallbackWithNilTail(q, preds, active, start, end, s, nilTailField, trace), true
 	}
 
-	br, rangeCovered, ok := db.extractOrderRangeCoverageOverlay(o.Field, preds, ov)
+	rb, br, rangeCovered, ok := db.extractOrderRangeCoverageOverlayWithBounds(o.Field, preds, ov)
 	if !ok {
 		return nil, false
 	}
-	if br.baseStart >= br.baseEnd && br.deltaStart >= br.deltaEnd {
+	nilTailField := orderNilTailField(fm, o.Field, rb)
+	if br.baseStart >= br.baseEnd && br.deltaStart >= br.deltaEnd && nilTailField == "" {
 		return nil, true
 	}
 	for i := range rangeCovered {
@@ -3662,7 +3671,7 @@ func (db *DB[K, V]) execPlanOrderedBasic(q *qx.QX, preds []predicate, trace *que
 			preds[i].covered = true
 		}
 	}
-	out, ok := db.scanOrderLimitWithPredicates(q, ov, br, o.Desc, preds, "", trace)
+	out, ok := db.scanOrderLimitWithPredicates(q, ov, br, o.Desc, preds, nilTailField, trace)
 	if !ok {
 		return nil, false
 	}
@@ -3672,10 +3681,18 @@ func (db *DB[K, V]) execPlanOrderedBasic(q *qx.QX, preds []predicate, trace *que
 // execPlanOrderedBasicFallback scans ordered buckets and applies remaining
 // predicates when ordered-anchor shortcuts are not available.
 func (db *DB[K, V]) execPlanOrderedBasicFallback(q *qx.QX, preds []predicate, active []int, start, end int, s []index, trace *queryTrace) []K {
-	return db.scanOrderedBaseSliceWithPredicates(q, preds, active, start, end, s, q.Order[0].Desc, trace)
+	return db.execPlanOrderedBasicFallbackWithNilTail(q, preds, active, start, end, s, "", trace)
+}
+
+func (db *DB[K, V]) execPlanOrderedBasicFallbackWithNilTail(q *qx.QX, preds []predicate, active []int, start, end int, s []index, nilTailField string, trace *queryTrace) []K {
+	return db.scanOrderedBaseSliceWithPredicatesWithNilTail(q, preds, active, start, end, s, q.Order[0].Desc, nilTailField, trace)
 }
 
 func (db *DB[K, V]) scanOrderedBaseSliceNoPredicates(q *qx.QX, start, end int, s []index, desc bool, trace *queryTrace) []K {
+	return db.scanOrderedBaseSliceNoPredicatesWithNilTail(q, start, end, s, desc, "", trace)
+}
+
+func (db *DB[K, V]) scanOrderedBaseSliceNoPredicatesWithNilTail(q *qx.QX, start, end int, s []index, desc bool, nilTailField string, trace *queryTrace) []K {
 	out := make([]K, 0, int(q.Limit))
 	cursor := db.newQueryCursor(out, q.Offset, q.Limit, false, nil)
 
@@ -3742,6 +3759,20 @@ func (db *DB[K, V]) scanOrderedBaseSliceNoPredicates(q *qx.QX, start, end int, s
 		}
 	}
 
+	if cursor.need > 0 && nilTailField != "" {
+		ids, keep := db.nilFieldOverlay(nilTailField).lookupPostingRetained(nilIndexEntryKey)
+		if keep != nil && trace != nil {
+			trace.addBitmapMaterialized(1)
+		}
+		if emitBucket(ids) {
+			if keep != nil {
+				releaseRoaringBuf(keep)
+			}
+		} else if keep != nil {
+			releaseRoaringBuf(keep)
+		}
+	}
+
 	if trace != nil {
 		trace.addOrderScanWidth(scanWidth)
 		if cursor.need == 0 {
@@ -3755,8 +3786,12 @@ func (db *DB[K, V]) scanOrderedBaseSliceNoPredicates(q *qx.QX, start, end int, s
 }
 
 func (db *DB[K, V]) scanOrderedBaseSliceWithPredicates(q *qx.QX, preds []predicate, active []int, start, end int, s []index, desc bool, trace *queryTrace) []K {
+	return db.scanOrderedBaseSliceWithPredicatesWithNilTail(q, preds, active, start, end, s, desc, "", trace)
+}
+
+func (db *DB[K, V]) scanOrderedBaseSliceWithPredicatesWithNilTail(q *qx.QX, preds []predicate, active []int, start, end int, s []index, desc bool, nilTailField string, trace *queryTrace) []K {
 	if len(active) == 0 {
-		return db.scanOrderedBaseSliceNoPredicates(q, start, end, s, desc, trace)
+		return db.scanOrderedBaseSliceNoPredicatesWithNilTail(q, start, end, s, desc, nilTailField, trace)
 	}
 
 	out := make([]K, 0, int(q.Limit))
@@ -3975,6 +4010,20 @@ func (db *DB[K, V]) scanOrderedBaseSliceWithPredicates(q *qx.QX, preds []predica
 			if i == start {
 				break
 			}
+		}
+	}
+
+	if cursor.need > 0 && nilTailField != "" {
+		ids, keep := db.nilFieldOverlay(nilTailField).lookupPostingRetained(nilIndexEntryKey)
+		if keep != nil && trace != nil {
+			trace.addBitmapMaterialized(1)
+		}
+		if emitBucket(ids) {
+			if keep != nil {
+				releaseRoaringBuf(keep)
+			}
+		} else if keep != nil {
+			releaseRoaringBuf(keep)
 		}
 	}
 

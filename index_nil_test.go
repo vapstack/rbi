@@ -4,6 +4,7 @@ import (
 	"path/filepath"
 	"slices"
 	"testing"
+	"time"
 
 	"github.com/vapstack/qx"
 	"go.etcd.io/bbolt"
@@ -415,4 +416,110 @@ func TestPointerNil_OrderSmallSlice_AllNilField(t *testing.T) {
 		t.Fatalf("QueryKeys: %v", err)
 	}
 	assertSameSlice(t, got, []uint64{1, 2})
+}
+
+func TestPointerNil_ExecPlanOrderedBasic_BaseNilTail(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
+
+	rows := map[uint64]*Rec{
+		1: {Name: "nil", Opt: nil, Active: true},
+		2: {Name: "empty", Opt: strPtr(""), Active: true},
+		3: {Name: "alpha", Opt: strPtr("alpha"), Active: false},
+		4: {Name: "nilish", Opt: strPtr("nilish"), Active: true},
+		5: {Name: "beta", Opt: strPtr("beta"), Active: false},
+	}
+	for id, rec := range rows {
+		if err := db.Set(id, rec); err != nil {
+			t.Fatalf("Set(%d): %v", id, err)
+		}
+	}
+	if err := db.RebuildIndex(); err != nil {
+		t.Fatalf("RebuildIndex: %v", err)
+	}
+
+	q := normalizeQueryForTest(qx.Query(
+		qx.NOT(qx.EQ("active", false)),
+	).By("opt", qx.ASC).Skip(1).Max(3))
+
+	leaves, ok := collectAndLeaves(q.Expr)
+	if !ok {
+		t.Fatalf("collectAndLeaves: ok=false")
+	}
+	window, _ := orderWindow(q)
+	preds, ok := db.buildPredicatesOrderedWithMode(leaves, "opt", false, window)
+	if !ok {
+		t.Fatalf("buildPredicatesOrderedWithMode: ok=false")
+	}
+	defer releasePredicates(preds)
+
+	got, ok := db.execPlanOrderedBasic(q, preds, nil)
+	if !ok {
+		t.Fatalf("execPlanOrderedBasic: ok=false")
+	}
+	want, err := db.execPreparedQuery(q)
+	if err != nil {
+		t.Fatalf("execPreparedQuery: %v", err)
+	}
+	assertSameSlice(t, got, want)
+}
+
+func TestPointerNil_TryPlanOrdered_AllowsPointerSortField(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{
+		AnalyzeInterval:        -1,
+		CalibrationEnabled:     true,
+		CalibrationSampleEvery: -1,
+	})
+
+	rows := map[uint64]*Rec{
+		1: {Name: "nil", Opt: nil, Active: true},
+		2: {Name: "empty", Opt: strPtr(""), Active: true},
+		3: {Name: "alpha", Opt: strPtr("alpha"), Active: false},
+		4: {Name: "nilish", Opt: strPtr("nilish"), Active: true},
+		5: {Name: "beta", Opt: strPtr("beta"), Active: false},
+	}
+	for id, rec := range rows {
+		if err := db.Set(id, rec); err != nil {
+			t.Fatalf("Set(%d): %v", id, err)
+		}
+	}
+	if err := db.RebuildIndex(); err != nil {
+		t.Fatalf("RebuildIndex: %v", err)
+	}
+	if err := db.Patch(1, []Field{{Name: "opt", Value: "zeta"}}); err != nil {
+		t.Fatalf("Patch(1 opt=zeta): %v", err)
+	}
+	if err := db.Patch(2, []Field{{Name: "opt", Value: (*string)(nil)}}); err != nil {
+		t.Fatalf("Patch(2 opt=nil): %v", err)
+	}
+
+	if err := db.SetCalibrationSnapshot(CalibrationSnapshot{
+		UpdatedAt: time.Now(),
+		Multipliers: map[string]float64{
+			string(PlanOrdered):         0.01,
+			string(PlanLimitOrderBasic): 100,
+		},
+		Samples: map[string]uint64{
+			string(PlanOrdered):         1,
+			string(PlanLimitOrderBasic): 1,
+		},
+	}); err != nil {
+		t.Fatalf("SetCalibrationSnapshot: %v", err)
+	}
+
+	q := normalizeQueryForTest(qx.Query(
+		qx.NOT(qx.EQ("active", false)),
+	).By("opt", qx.DESC).Skip(1).Max(2))
+
+	got, ok, err := db.tryPlan(q, nil)
+	if err != nil {
+		t.Fatalf("tryPlan: %v", err)
+	}
+	if !ok {
+		t.Fatalf("expected tryPlan to use ordered planner path for pointer sort field")
+	}
+	want, err := db.execPreparedQuery(q)
+	if err != nil {
+		t.Fatalf("execPreparedQuery: %v", err)
+	}
+	assertSameSlice(t, got, want)
 }

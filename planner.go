@@ -753,9 +753,11 @@ func (db *DB[K, V]) tryPlan(q *qx.QX, trace *queryTrace) ([]K, bool, error) {
 		if out, ok, err := db.tryPlanORMerge(q, trace); ok {
 			return out, true, err
 		}
-		if out, ok, err := db.tryPlanOrdered(q, trace); ok {
-			return out, true, err
-		}
+	}
+	if out, ok, err := db.tryPlanOrdered(q, trace); ok {
+		return out, true, err
+	}
+	if !orderedPtr {
 		if out, ok, err := db.tryPlanCandidate(q, trace); ok {
 			return out, true, err
 		}
