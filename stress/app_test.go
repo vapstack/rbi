@@ -83,6 +83,7 @@ func TestParseOptionsDurationEnablesHeadless(t *testing.T) {
 		"-pprof-http", ":6060",
 		"-class", "r_med,r_meh",
 		"-query", "read_leaderboard_top_items,read_moderation_queue_keys",
+		"-minimize-delta",
 		"-query-stats",
 		"-trace-sample", "64",
 		"-trace-top", "7",
@@ -110,6 +111,9 @@ func TestParseOptionsDurationEnablesHeadless(t *testing.T) {
 	}
 	if opts.PprofHTTP != ":6060" {
 		t.Fatalf("PprofHTTP = %q, want :6060", opts.PprofHTTP)
+	}
+	if !opts.MinimizeDelta {
+		t.Fatal("MinimizeDelta = false, want true")
 	}
 	if opts.TraceSampleEvery != 64 {
 		t.Fatalf("TraceSampleEvery = %d, want 64", opts.TraceSampleEvery)

@@ -38,11 +38,12 @@ func main() {
 	}
 
 	log.Printf(
-		"opening DB file=%s report=%s headless=%t duration=%s trace_sample=%d trace_top=%d query_stats=%t jitter=%t class_filter=%v query_filter=%v",
+		"opening DB file=%s report=%s headless=%t duration=%s minimize_delta=%t trace_sample=%d trace_top=%d query_stats=%t jitter=%t class_filter=%v query_filter=%v",
 		opts.DBFile,
 		opts.ReportPath,
 		opts.Headless,
 		opts.Duration,
+		opts.MinimizeDelta,
 		opts.TraceSampleEvery,
 		opts.TraceTopN,
 		opts.QueryStats,
@@ -54,6 +55,7 @@ func main() {
 	handle, err := OpenBenchDB(DBConfig{
 		DBFile:           opts.DBFile,
 		BoltNoSync:       opts.BoltNoSync,
+		MinimizeDelta:    opts.MinimizeDelta,
 		AnalyzeInterval:  opts.AnalyzeInterval,
 		TraceSink:        traceCollector.traceSink(),
 		TraceSampleEvery: opts.TraceSampleEvery,

@@ -16,6 +16,7 @@ type options struct {
 	PprofHTTP        string
 	EmailSampleN     int
 	BoltNoSync       bool
+	MinimizeDelta    bool
 	AnalyzeInterval  time.Duration
 	RefreshEvery     time.Duration
 	TelemetryEvery   time.Duration
@@ -53,6 +54,7 @@ func parseOptions(catalog []*classDescriptor) (options, error) {
 	fs.StringVar(&opts.PprofHTTP, "pprof-http", "", "listen address for net/http/pprof (e.g. :6060)")
 	fs.IntVar(&opts.EmailSampleN, "email-sample", opts.EmailSampleN, "how many existing emails to sample for indexed reads")
 	fs.BoolVar(&opts.BoltNoSync, "bolt-no-sync", false, "open bbolt with NoSync=true (unsafe)")
+	fs.BoolVar(&opts.MinimizeDelta, "minimize-delta", false, "use aggressive snapshot delta compaction/flattening settings and force-compact on startup")
 	fs.DurationVar(&opts.AnalyzeInterval, "analyze-interval", 0, "rbi analyze interval (0=default, <0 disable)")
 	fs.DurationVar(&opts.RefreshEvery, "refresh", opts.RefreshEvery, "table refresh interval")
 	fs.DurationVar(&opts.TelemetryEvery, "telemetry", opts.TelemetryEvery, "memory/snapshot/batch sampling interval")

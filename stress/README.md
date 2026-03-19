@@ -59,6 +59,7 @@ go run ./stress -db bench.db -headless -out stress_report.json -r_idx 128 -w_fst
 - `-trace-sample` : planner trace sampling (`-1` disable, `0` every query, `N` every Nth query); default is off
 - `-trace-top` : how many slowest sampled planner traces to keep in the report
 - `-bolt-no-sync` : open Bolt with `NoSync=true`
+- `-minimize-delta` : apply aggressive delta compaction/flattening settings and `ForceCompact()` the snapshot at startup
 - `-analyze-interval` : override `rbi.Options.AnalyzeInterval`
 
 Per-class initial worker counts can be set by alias or full class name.
