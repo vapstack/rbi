@@ -171,7 +171,7 @@ func TestWrap_FailedPopulateFields_DoesNotLeakRegistry(t *testing.T) {
 	rawDB, _ := openRawBolt(t)
 	defer func() { _ = rawDB.Close() }()
 
-	const bucket = "registry-cleanup-check"
+	const bucket = "registry_cleanup_check"
 
 	_, err := New[uint64, invalidUniqueSliceRec](rawDB, Options{BucketName: bucket})
 	if err == nil {
@@ -189,7 +189,7 @@ func TestWrap_BuildIndexError_DoesNotCloseCallerBolt(t *testing.T) {
 	rawDB, _ := openRawBolt(t)
 	defer func() { _ = rawDB.Close() }()
 
-	const bucket = "broken-wrap-bucket"
+	const bucket = "broken_wrap_bucket"
 	if err := rawDB.Update(func(tx *bbolt.Tx) error {
 		b, err := tx.CreateBucketIfNotExists([]byte(bucket))
 		if err != nil {
@@ -214,6 +214,29 @@ func TestWrap_BuildIndexError_DoesNotCloseCallerBolt(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("raw bbolt must stay open after Wrap error, got: %v", err)
 	}
+}
+
+func TestWrap_InvalidBucketName_RejectsUnsafeCharacters(t *testing.T) {
+	rawDB, _ := openRawBolt(t)
+	defer func() { _ = rawDB.Close() }()
+
+	for _, bucket := range []string{
+		"bad-name",
+		"bad.name",
+		"bad name",
+		"1bucket",
+	} {
+		_, err := New[uint64, Rec](rawDB, Options{BucketName: bucket})
+		if !errors.Is(err, ErrInvalidBucketName) {
+			t.Fatalf("bucket=%q: expected ErrInvalidBucketName, got=%v", bucket, err)
+		}
+	}
+
+	db, err := New[uint64, Rec](rawDB, Options{BucketName: "bucket_name_ok"})
+	if err != nil {
+		t.Fatalf("expected valid bucket name to succeed, got: %v", err)
+	}
+	defer func() { _ = db.Close() }()
 }
 
 func TestWrap_CorruptedPersistedIndex_RebuildsInsteadOfPanicking(t *testing.T) {

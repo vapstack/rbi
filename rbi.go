@@ -23,6 +23,7 @@ var (
 	ErrBroken            = errors.New("index is broken")
 	ErrRebuildInProgress = errors.New("index rebuild in progress")
 	ErrInvalidQuery      = errors.New("invalid query")
+	ErrInvalidBucketName = errors.New("invalid bucket name")
 	ErrUniqueViolation   = errors.New("unique constraint violation")
 	ErrNoValidKeyIndex   = errors.New("no valid key for index")
 	ErrNilValue          = errors.New("value is nil")
@@ -77,6 +78,9 @@ type Options struct {
 
 	// BucketName overrides the default bucket name.
 	// By default, bucket name is derived from the name of the value type V.
+	//
+	// The bucket name must use identifier-safe ASCII characters only:
+	// `[A-Za-z_][A-Za-z0-9_]*`.
 	BucketName string
 
 	// AnalyzeInterval configures how often planner statistics should be
@@ -127,8 +131,8 @@ type Options struct {
 	// PersistCalibration enables automatic load/save of planner calibration
 	// state in a sidecar JSON file next to the Bolt DB.
 	//
-	// File name is derived from the Bolt path and bucket name, using the
-	// same pattern as the index sidecar but with ".cal" extension.
+	// File name is derived from the Bolt path and validated bucket name,
+	// using the same pattern as the index sidecar but with ".cal" extension.
 	//
 	// Default: false (disabled).
 	PersistCalibration bool
@@ -494,6 +498,9 @@ func New[K ~uint64 | ~string, V any](bolt *bbolt.DB, options Options, execOpts .
 	if vname == "" {
 		return nil, fmt.Errorf("cannot resolve value name of %v", vtype)
 	}
+	if err = validateBucketName(vname); err != nil {
+		return nil, err
+	}
 	if bolt == nil {
 		return nil, fmt.Errorf("bolt instance is nil")
 	}
@@ -514,7 +521,7 @@ func New[K ~uint64 | ~string, V any](bolt *bbolt.DB, options Options, execOpts .
 
 	calPath := ""
 	if options.PersistCalibration {
-		calPath = bolt.Path() + "." + sanitizeSuffix(vname) + ".cal"
+		calPath = bolt.Path() + "." + vname + ".cal"
 	}
 
 	db = &DB[K, V]{
@@ -531,7 +538,7 @@ func New[K ~uint64 | ~string, V any](bolt *bbolt.DB, options Options, execOpts .
 
 		universe: roaring64.NewBitmap(),
 
-		rbiFile: bolt.Path() + "." + sanitizeSuffix(vname) + ".rbi",
+		rbiFile: bolt.Path() + "." + vname + ".rbi",
 
 		recPool: sync.Pool{
 			New: func() any {

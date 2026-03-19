@@ -321,33 +321,32 @@ func syncDir(path string) error {
 	return f.Sync()
 }
 
-func sanitizeSuffix(s string) string {
-	out := make([]rune, 0, len(s))
-	dot := false
-
-	for _, r := range s {
-		switch {
-		case r >= 'a' && r <= 'z':
-			out = append(out, r)
-			dot = false
-		case r >= 'A' && r <= 'Z':
-			out = append(out, r)
-			dot = false
-		case r >= '0' && r <= '9':
-			out = append(out, r)
-			dot = false
-		case r == '_':
-			out = append(out, r)
-			dot = false
-		case r == '.':
-			if !dot {
-				out = append(out, r)
-			}
-			dot = true
-		default:
-		}
+func validateBucketName(name string) error {
+	if name == "" {
+		return fmt.Errorf("%w: empty", ErrInvalidBucketName)
 	}
-	return strings.Trim(string(out), ".")
+	for i := 0; i < len(name); i++ {
+		c := name[i]
+		if i == 0 {
+			if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_' {
+				continue
+			}
+			return fmt.Errorf(
+				"%w %q: allowed pattern is [A-Za-z_][A-Za-z0-9_]*",
+				ErrInvalidBucketName,
+				name,
+			)
+		}
+		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' {
+			continue
+		}
+		return fmt.Errorf(
+			"%w %q: allowed pattern is [A-Za-z_][A-Za-z0-9_]*",
+			ErrInvalidBucketName,
+			name,
+		)
+	}
+	return nil
 }
 
 func dedupStringsInplace(s []string) []string {
