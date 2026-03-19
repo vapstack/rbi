@@ -399,16 +399,8 @@ func (db *DB[K, V]) tryLimitQueryOrderBasic(q *qx.QX, leaves []qx.Expr, trace *q
 	}
 
 	fm := db.fields[f]
-	if fm == nil || fm.Slice || fm.Ptr {
+	if fm == nil || fm.Slice {
 		return nil, false, nil
-	}
-
-	ov := db.fieldOverlay(f)
-	if !ov.hasData() {
-		if !db.hasFieldIndex(f) {
-			return nil, false, nil
-		}
-		return nil, true, nil
 	}
 
 	bounds, rest, ok, err := db.extractBoundsForField(f, leaves)
@@ -417,6 +409,14 @@ func (db *DB[K, V]) tryLimitQueryOrderBasic(q *qx.QX, leaves []qx.Expr, trace *q
 	}
 	if !ok {
 		return nil, false, nil
+	}
+	nilTailField := orderNilTailField(fm, f, bounds)
+	ov := db.fieldOverlay(f)
+	if !ov.hasData() && nilTailField == "" {
+		if !db.hasFieldIndex(f) {
+			return nil, false, nil
+		}
+		return nil, true, nil
 	}
 
 	preds, ok, err := db.buildLeafPredsNoBounds(rest)
@@ -432,10 +432,10 @@ func (db *DB[K, V]) tryLimitQueryOrderBasic(q *qx.QX, leaves []qx.Expr, trace *q
 	}
 
 	br := ov.rangeForBounds(bounds)
-	if br.baseStart >= br.baseEnd && br.deltaStart >= br.deltaEnd {
+	if br.baseStart >= br.baseEnd && br.deltaStart >= br.deltaEnd && nilTailField == "" {
 		return nil, true, nil
 	}
-	return db.scanLimitByOverlayBounds(q, ov, br, order.Desc, preds, trace), true, nil
+	return db.scanLimitByOverlayBounds(q, ov, br, order.Desc, preds, nilTailField, trace), true, nil
 }
 
 func (db *DB[K, V]) tryLimitQueryRangeNoOrderByField(q *qx.QX, field string, bounds rangeBounds, rest []qx.Expr, trace *queryTrace) ([]K, bool, error) {
@@ -468,7 +468,7 @@ func (db *DB[K, V]) tryLimitQueryRangeNoOrderByField(q *qx.QX, field string, bou
 	if br.baseStart >= br.baseEnd && br.deltaStart >= br.deltaEnd {
 		return nil, true, nil
 	}
-	return db.scanLimitByOverlayBounds(q, ov, br, false, preds, trace), true, nil
+	return db.scanLimitByOverlayBounds(q, ov, br, false, preds, "", trace), true, nil
 }
 
 func (db *DB[K, V]) buildLeafPredsNoBounds(rest []qx.Expr) ([]leafPred, bool, error) {
@@ -492,7 +492,7 @@ func (db *DB[K, V]) buildLeafPredsNoBounds(rest []qx.Expr) ([]leafPred, bool, er
 	return preds, true, nil
 }
 
-func (db *DB[K, V]) scanLimitByOverlayBounds(q *qx.QX, ov fieldOverlay, br overlayRange, desc bool, preds []leafPred, trace *queryTrace) []K {
+func (db *DB[K, V]) scanLimitByOverlayBounds(q *qx.QX, ov fieldOverlay, br overlayRange, desc bool, preds []leafPred, nilTailField string, trace *queryTrace) []K {
 	limit := int(q.Limit)
 	out := make([]K, 0, limit)
 	cursor := db.newQueryCursor(out, 0, q.Limit, false, nil)
@@ -545,6 +545,31 @@ func (db *DB[K, V]) scanLimitByOverlayBounds(q *qx.QX, ov fieldOverlay, br overl
 				return cursor.out
 			}
 		}
+		if nilTailField != "" {
+			ids, keep := db.nilFieldOverlay(nilTailField).lookupPostingRetained(nilIndexEntryKey)
+			if !ids.IsEmpty() {
+				if trackScanWidth {
+					scanWidth++
+				}
+				if keep != nil && trace != nil {
+					trace.addBitmapMaterialized(1)
+				}
+				if emitBucketPosting(ids) {
+					if keep != nil {
+						releaseRoaringBuf(keep)
+					}
+					trace.addExamined(examined)
+					if trackScanWidth {
+						trace.addOrderScanWidth(scanWidth)
+					}
+					trace.setEarlyStopReason("limit_reached")
+					return cursor.out
+				}
+				if keep != nil {
+					releaseRoaringBuf(keep)
+				}
+			}
+		}
 		trace.addExamined(examined)
 		if trackScanWidth {
 			trace.addOrderScanWidth(scanWidth)
@@ -578,6 +603,32 @@ func (db *DB[K, V]) scanLimitByOverlayBounds(q *qx.QX, ov fieldOverlay, br overl
 		}
 		if keep != nil {
 			releaseRoaringBuf(keep)
+		}
+	}
+
+	if nilTailField != "" {
+		ids, keep := db.nilFieldOverlay(nilTailField).lookupPostingRetained(nilIndexEntryKey)
+		if !ids.IsEmpty() {
+			if trackScanWidth {
+				scanWidth++
+			}
+			if keep != nil && trace != nil {
+				trace.addBitmapMaterialized(1)
+			}
+			if emitBucketPosting(ids) {
+				if keep != nil {
+					releaseRoaringBuf(keep)
+				}
+				trace.addExamined(examined)
+				if trackScanWidth {
+					trace.addOrderScanWidth(scanWidth)
+				}
+				trace.setEarlyStopReason("limit_reached")
+				return cursor.out
+			}
+			if keep != nil {
+				releaseRoaringBuf(keep)
+			}
 		}
 	}
 

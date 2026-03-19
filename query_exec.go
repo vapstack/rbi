@@ -91,6 +91,16 @@ func (rb *rangeBounds) applyHi(key string, inc bool) {
 	}
 }
 
+func orderNilTailField(fm *field, field string, bounds rangeBounds) string {
+	if fm == nil || !fm.Ptr || field == "" {
+		return ""
+	}
+	if bounds.hasLo || bounds.hasHi || bounds.hasPrefix {
+		return ""
+	}
+	return field
+}
+
 func lowerBoundIndex(s []index, key string) int {
 	lo, hi := 0, len(s)
 	for lo < hi {
@@ -230,7 +240,9 @@ func (db *DB[K, V]) tryQueryOrderBasicWithLimit(q *qx.QX, trace *queryTrace) ([]
 
 	ops := q.Expr.Operands
 
-	if q.Expr.Op != qx.OpAND {
+	if isTrueConst(q.Expr) {
+		ops = nil
+	} else if q.Expr.Op != qx.OpAND {
 		var single [1]qx.Expr
 		single[0] = q.Expr
 		ops = single[:]
@@ -238,16 +250,8 @@ func (db *DB[K, V]) tryQueryOrderBasicWithLimit(q *qx.QX, trace *queryTrace) ([]
 
 	f := order.Field
 	fm := db.fields[f]
-	if fm == nil || fm.Slice || fm.Ptr {
+	if fm == nil || fm.Slice {
 		return nil, false, nil
-	}
-
-	ov := db.fieldOverlay(f)
-	if !ov.hasData() {
-		if !db.hasFieldIndex(f) {
-			return nil, false, nil
-		}
-		return nil, true, nil
 	}
 
 	var rb rangeBounds
@@ -295,8 +299,17 @@ func (db *DB[K, V]) tryQueryOrderBasicWithLimit(q *qx.QX, trace *queryTrace) ([]
 		baseOps = append(baseOps, op)
 	}
 
+	nilTailField := orderNilTailField(fm, f, rb)
+	ov := db.fieldOverlay(f)
+	if !ov.hasData() && nilTailField == "" {
+		if !db.hasFieldIndex(f) {
+			return nil, false, nil
+		}
+		return nil, true, nil
+	}
+
 	br := ov.rangeForBounds(rb)
-	if br.baseStart >= br.baseEnd && br.deltaStart >= br.deltaEnd {
+	if br.baseStart >= br.baseEnd && br.deltaStart >= br.deltaEnd && nilTailField == "" {
 		return nil, true, nil
 	}
 
@@ -306,7 +319,7 @@ func (db *DB[K, V]) tryQueryOrderBasicWithLimit(q *qx.QX, trace *queryTrace) ([]
 		return nil, false, nil
 	}
 
-	if len(baseOps) > 0 && shouldTryOrderedPredicateExecutionBaseOps(f, baseOps) {
+	if !fm.Ptr && len(baseOps) > 0 && shouldTryOrderedPredicateExecutionBaseOps(f, baseOps) {
 		if leaves, ok := collectAndLeaves(q.Expr); ok {
 			window, _ := orderWindow(q)
 			preds, ok := db.buildPredicatesOrderedWithMode(leaves, f, false, window)
@@ -325,7 +338,7 @@ func (db *DB[K, V]) tryQueryOrderBasicWithLimit(q *qx.QX, trace *queryTrace) ([]
 	}
 
 	if len(baseOps) == 0 {
-		out, _ := db.scanOrderLimitWithPredicates(q, ov, br, order.Desc, nil, trace)
+		out, _ := db.scanOrderLimitWithPredicates(q, ov, br, order.Desc, nil, nilTailField, trace)
 		return out, true, nil
 	}
 
@@ -384,6 +397,69 @@ func (db *DB[K, V]) tryQueryOrderBasicWithLimit(q *qx.QX, trace *queryTrace) ([]
 		examined  uint64
 		scanWidth uint64
 	)
+	nilOV := db.nilFieldOverlay(nilTailField)
+	emitFilteredPosting := func(ids postingList, keep *roaring64.Bitmap) bool {
+		if ids.IsEmpty() {
+			if keep != nil {
+				releaseRoaringBuf(keep)
+			}
+			return false
+		}
+		if keep != nil && trace != nil {
+			trace.addBitmapMaterialized(1)
+		}
+
+		if card := ids.Cardinality(); card <= iteratorThreshold || (0 < cursor.need && cursor.need < 1000) {
+			if ids.isSingleton() {
+				idx := ids.single
+				examined++
+				if keep != nil {
+					releaseRoaringBuf(keep)
+				}
+				return contains(idx) && cursor.emit(idx)
+			}
+
+			it := ids.bitmap().Iterator()
+			for it.HasNext() {
+				idx := it.Next()
+				examined++
+				if !contains(idx) {
+					continue
+				}
+				if cursor.emit(idx) {
+					releaseRoaringBitmapIterator(it)
+					if keep != nil {
+						releaseRoaringBuf(keep)
+					}
+					return true
+				}
+			}
+			releaseRoaringBitmapIterator(it)
+			if keep != nil {
+				releaseRoaringBuf(keep)
+			}
+			return false
+		}
+
+		examined += ids.Cardinality()
+		if base.neg {
+			tmp.Clear()
+			ids.OrInto(tmp)
+			if !baseNegUniverse {
+				tmp.AndNot(baseBM)
+			}
+		} else {
+			tmpORSmallestANDPosting(tmp, ids, baseBM)
+		}
+		if keep != nil {
+			releaseRoaringBuf(keep)
+		}
+		if tmp.IsEmpty() {
+			return false
+		}
+		return cursor.emitBitmap(tmp)
+	}
+
 	if ov.delta == nil {
 		for {
 			_, ids, _, ok := keyCur.next()
@@ -394,56 +470,23 @@ func (db *DB[K, V]) tryQueryOrderBasicWithLimit(q *qx.QX, trace *queryTrace) ([]
 				continue
 			}
 			scanWidth++
-
-			if card := ids.Cardinality(); card <= iteratorThreshold || (0 < cursor.need && cursor.need < 1000) {
-				if ids.isSingleton() {
-					idx := ids.single
-					examined++
-					if contains(idx) && cursor.emit(idx) {
-						trace.addExamined(examined)
-						trace.addOrderScanWidth(scanWidth)
-						trace.setEarlyStopReason("limit_reached")
-						return cursor.out, true, nil
-					}
-				} else {
-					it := ids.bitmap().Iterator()
-					for it.HasNext() {
-						idx := it.Next()
-						examined++
-						if !contains(idx) {
-							continue
-						}
-						if cursor.emit(idx) {
-							trace.addExamined(examined)
-							trace.addOrderScanWidth(scanWidth)
-							trace.setEarlyStopReason("limit_reached")
-							releaseRoaringBitmapIterator(it)
-							return cursor.out, true, nil
-						}
-					}
-					releaseRoaringBitmapIterator(it)
-				}
-				continue
-			}
-
-			examined += ids.Cardinality()
-			if base.neg {
-				tmp.Clear()
-				ids.OrInto(tmp)
-				if !baseNegUniverse {
-					tmp.AndNot(baseBM)
-				}
-			} else {
-				tmpORSmallestANDPosting(tmp, ids, baseBM)
-			}
-			if tmp.IsEmpty() {
-				continue
-			}
-			if cursor.emitBitmap(tmp) {
+			if emitFilteredPosting(ids, nil) {
 				trace.addExamined(examined)
 				trace.addOrderScanWidth(scanWidth)
 				trace.setEarlyStopReason("limit_reached")
 				return cursor.out, true, nil
+			}
+		}
+		if nilTailField != "" {
+			ids, keep := nilOV.lookupPostingRetained(nilIndexEntryKey)
+			if !ids.IsEmpty() {
+				scanWidth++
+				if emitFilteredPosting(ids, keep) {
+					trace.addExamined(examined)
+					trace.addOrderScanWidth(scanWidth)
+					trace.setEarlyStopReason("limit_reached")
+					return cursor.out, true, nil
+				}
 			}
 		}
 		trace.addExamined(examined)
@@ -462,71 +505,24 @@ func (db *DB[K, V]) tryQueryOrderBasicWithLimit(q *qx.QX, trace *queryTrace) ([]
 			continue
 		}
 		scanWidth++
-		if keep != nil && trace != nil {
-			trace.addBitmapMaterialized(1)
-		}
-
-		if card := ids.Cardinality(); card <= iteratorThreshold || (0 < cursor.need && cursor.need < 1000) {
-			if ids.isSingleton() {
-				idx := ids.single
-				examined++
-				if contains(idx) && cursor.emit(idx) {
-					if keep != nil {
-						releaseRoaringBuf(keep)
-					}
-					trace.addExamined(examined)
-					trace.addOrderScanWidth(scanWidth)
-					trace.setEarlyStopReason("limit_reached")
-					return cursor.out, true, nil
-				}
-			} else {
-				it := ids.bitmap().Iterator()
-				for it.HasNext() {
-					idx := it.Next()
-					examined++
-					if !contains(idx) {
-						continue
-					}
-					if cursor.emit(idx) {
-						if keep != nil {
-							releaseRoaringBuf(keep)
-						}
-						trace.addExamined(examined)
-						trace.addOrderScanWidth(scanWidth)
-						trace.setEarlyStopReason("limit_reached")
-						releaseRoaringBitmapIterator(it)
-						return cursor.out, true, nil
-					}
-				}
-				releaseRoaringBitmapIterator(it)
-			}
-			if keep != nil {
-				releaseRoaringBuf(keep)
-			}
-			continue
-		}
-
-		examined += ids.Cardinality()
-		if base.neg {
-			tmp.Clear()
-			ids.OrInto(tmp)
-			if !baseNegUniverse {
-				tmp.AndNot(baseBM)
-			}
-		} else {
-			tmpORSmallestANDPosting(tmp, ids, baseBM)
-		}
-		if keep != nil {
-			releaseRoaringBuf(keep)
-		}
-		if tmp.IsEmpty() {
-			continue
-		}
-		if cursor.emitBitmap(tmp) {
+		if emitFilteredPosting(ids, keep) {
 			trace.addExamined(examined)
 			trace.addOrderScanWidth(scanWidth)
 			trace.setEarlyStopReason("limit_reached")
 			return cursor.out, true, nil
+		}
+	}
+
+	if nilTailField != "" {
+		ids, keep := nilOV.lookupPostingRetained(nilIndexEntryKey)
+		if !ids.IsEmpty() {
+			scanWidth++
+			if emitFilteredPosting(ids, keep) {
+				trace.addExamined(examined)
+				trace.addOrderScanWidth(scanWidth)
+				trace.setEarlyStopReason("limit_reached")
+				return cursor.out, true, nil
+			}
 		}
 	}
 
@@ -536,7 +532,7 @@ func (db *DB[K, V]) tryQueryOrderBasicWithLimit(q *qx.QX, trace *queryTrace) ([]
 	return cursor.out, true, nil
 }
 
-func (db *DB[K, V]) scanOrderLimitNoPredicates(q *qx.QX, ov fieldOverlay, br overlayRange, desc bool, trace *queryTrace) ([]K, bool) {
+func (db *DB[K, V]) scanOrderLimitNoPredicates(q *qx.QX, ov fieldOverlay, br overlayRange, desc bool, nilTailField string, trace *queryTrace) ([]K, bool) {
 	out := make([]K, 0, q.Limit)
 	cursor := db.newQueryCursor(out, q.Offset, q.Limit, false, nil)
 
@@ -606,6 +602,29 @@ func (db *DB[K, V]) scanOrderLimitNoPredicates(q *qx.QX, ov fieldOverlay, br ove
 				return cursor.out, true
 			}
 		}
+		if nilTailField != "" {
+			ids, keep := db.nilFieldOverlay(nilTailField).lookupPostingRetained(nilIndexEntryKey)
+			if !ids.IsEmpty() {
+				scanWidth++
+				if keep != nil && trace != nil {
+					trace.addBitmapMaterialized(1)
+				}
+				if emitPosting(ids) {
+					if keep != nil {
+						releaseRoaringBuf(keep)
+					}
+					if trace != nil {
+						trace.addExamined(examined)
+						trace.addOrderScanWidth(scanWidth)
+						trace.setEarlyStopReason("limit_reached")
+					}
+					return cursor.out, true
+				}
+				if keep != nil {
+					releaseRoaringBuf(keep)
+				}
+			}
+		}
 		if trace != nil {
 			trace.addExamined(examined)
 			trace.addOrderScanWidth(scanWidth)
@@ -643,6 +662,30 @@ func (db *DB[K, V]) scanOrderLimitNoPredicates(q *qx.QX, ov fieldOverlay, br ove
 		}
 	}
 
+	if nilTailField != "" {
+		ids, keep := db.nilFieldOverlay(nilTailField).lookupPostingRetained(nilIndexEntryKey)
+		if !ids.IsEmpty() {
+			scanWidth++
+			if keep != nil && trace != nil {
+				trace.addBitmapMaterialized(1)
+			}
+			if emitPosting(ids) {
+				if keep != nil {
+					releaseRoaringBuf(keep)
+				}
+				if trace != nil {
+					trace.addExamined(examined)
+					trace.addOrderScanWidth(scanWidth)
+					trace.setEarlyStopReason("limit_reached")
+				}
+				return cursor.out, true
+			}
+			if keep != nil {
+				releaseRoaringBuf(keep)
+			}
+		}
+	}
+
 	if trace != nil {
 		trace.addExamined(examined)
 		trace.addOrderScanWidth(scanWidth)
@@ -651,7 +694,7 @@ func (db *DB[K, V]) scanOrderLimitNoPredicates(q *qx.QX, ov fieldOverlay, br ove
 	return cursor.out, true
 }
 
-func (db *DB[K, V]) scanOrderLimitWithPredicates(q *qx.QX, ov fieldOverlay, br overlayRange, desc bool, preds []predicate, trace *queryTrace) ([]K, bool) {
+func (db *DB[K, V]) scanOrderLimitWithPredicates(q *qx.QX, ov fieldOverlay, br overlayRange, desc bool, preds []predicate, nilTailField string, trace *queryTrace) ([]K, bool) {
 	activeBuf := getIntSliceBuf(len(preds))
 	active := activeBuf.values
 	defer func() {
@@ -676,7 +719,7 @@ func (db *DB[K, V]) scanOrderLimitWithPredicates(q *qx.QX, ov fieldOverlay, br o
 		active = append(active, i)
 	}
 	if len(active) == 0 {
-		return db.scanOrderLimitNoPredicates(q, ov, br, desc, trace)
+		return db.scanOrderLimitNoPredicates(q, ov, br, desc, nilTailField, trace)
 	}
 	sortActivePredicates(active, preds)
 
@@ -865,6 +908,29 @@ func (db *DB[K, V]) scanOrderLimitWithPredicates(q *qx.QX, ov fieldOverlay, br o
 				return cursor.out, true
 			}
 		}
+		if nilTailField != "" {
+			ids, keep := db.nilFieldOverlay(nilTailField).lookupPostingRetained(nilIndexEntryKey)
+			if !ids.IsEmpty() {
+				scanWidth++
+				if keep != nil && trace != nil {
+					trace.addBitmapMaterialized(1)
+				}
+				if emitPosting(ids) {
+					if keep != nil {
+						releaseRoaringBuf(keep)
+					}
+					if trace != nil {
+						trace.addExamined(examined)
+						trace.addOrderScanWidth(scanWidth)
+						trace.setEarlyStopReason("limit_reached")
+					}
+					return cursor.out, true
+				}
+				if keep != nil {
+					releaseRoaringBuf(keep)
+				}
+			}
+		}
 		if trace != nil {
 			trace.addExamined(examined)
 			trace.addOrderScanWidth(scanWidth)
@@ -902,6 +968,30 @@ func (db *DB[K, V]) scanOrderLimitWithPredicates(q *qx.QX, ov fieldOverlay, br o
 		}
 	}
 
+	if nilTailField != "" {
+		ids, keep := db.nilFieldOverlay(nilTailField).lookupPostingRetained(nilIndexEntryKey)
+		if !ids.IsEmpty() {
+			scanWidth++
+			if keep != nil && trace != nil {
+				trace.addBitmapMaterialized(1)
+			}
+			if emitPosting(ids) {
+				if keep != nil {
+					releaseRoaringBuf(keep)
+				}
+				if trace != nil {
+					trace.addExamined(examined)
+					trace.addOrderScanWidth(scanWidth)
+					trace.setEarlyStopReason("limit_reached")
+				}
+				return cursor.out, true
+			}
+			if keep != nil {
+				releaseRoaringBuf(keep)
+			}
+		}
+	}
+
 	if trace != nil {
 		trace.addExamined(examined)
 		trace.addOrderScanWidth(scanWidth)
@@ -926,7 +1016,7 @@ func (db *DB[K, V]) tryQueryOrderPrefixWithLimit(q *qx.QX, trace *queryTrace) ([
 
 	f := ord.Field
 	fm := db.fields[f]
-	if fm == nil || fm.Slice || fm.Ptr {
+	if fm == nil || fm.Slice {
 		return nil, false, nil
 	}
 

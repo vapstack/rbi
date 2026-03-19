@@ -335,3 +335,84 @@ func TestPlanCandidateOrder_SkipsPointerSortField(t *testing.T) {
 		t.Fatalf("expected tryPlan to skip pointer ORDER fast paths, got %v", planOut)
 	}
 }
+
+func TestPointerNil_OrderExecutionFastPaths(t *testing.T) {
+	db, _ := openTempDBUint64(t)
+
+	rows := map[uint64]*Rec{
+		1: {Name: "nil", Opt: nil, Active: true},
+		2: {Name: "empty", Opt: strPtr(""), Active: true},
+		3: {Name: "alpha", Opt: strPtr("alpha"), Active: false},
+		4: {Name: "nilish", Opt: strPtr("nilish"), Active: true},
+		5: {Name: "beta", Opt: strPtr("beta"), Active: false},
+	}
+	for id, rec := range rows {
+		if err := db.Set(id, rec); err != nil {
+			t.Fatalf("Set(%d): %v", id, err)
+		}
+	}
+
+	qLimit := qx.Query(qx.EQ("active", true)).By("opt", qx.ASC).Max(3)
+	limitLeaves := mustExtractAndLeaves(t, qLimit.Expr)
+	out, used, err := db.tryLimitQueryOrderBasic(qLimit, limitLeaves, nil)
+	if err != nil {
+		t.Fatalf("tryLimitQueryOrderBasic: %v", err)
+	}
+	if !used {
+		t.Fatalf("expected tryLimitQueryOrderBasic to be used")
+	}
+	want, err := expectedKeysUint64(t, db, qLimit)
+	if err != nil {
+		t.Fatalf("expectedKeysUint64(limit): %v", err)
+	}
+	assertSameSlice(t, out, want)
+
+	qOffset := qx.Query(qx.EQ("active", true)).By("opt", qx.ASC).Skip(1).Max(2)
+	out, used, err = db.tryQueryOrderBasicWithLimit(qOffset, nil)
+	if err != nil {
+		t.Fatalf("tryQueryOrderBasicWithLimit: %v", err)
+	}
+	if !used {
+		t.Fatalf("expected tryQueryOrderBasicWithLimit to be used")
+	}
+	want, err = expectedKeysUint64(t, db, qOffset)
+	if err != nil {
+		t.Fatalf("expectedKeysUint64(offset): %v", err)
+	}
+	assertSameSlice(t, out, want)
+
+	qPrefix := qx.Query(qx.PREFIX("opt", "")).By("opt", qx.ASC).Skip(1).Max(2)
+	out, used, err = db.tryQueryOrderPrefixWithLimit(qPrefix, nil)
+	if err != nil {
+		t.Fatalf("tryQueryOrderPrefixWithLimit: %v", err)
+	}
+	if !used {
+		t.Fatalf("expected tryQueryOrderPrefixWithLimit to be used")
+	}
+	want, err = expectedKeysUint64(t, db, qPrefix)
+	if err != nil {
+		t.Fatalf("expectedKeysUint64(prefix): %v", err)
+	}
+	assertSameSlice(t, out, want)
+}
+
+func TestPointerNil_OrderSmallSlice_AllNilField(t *testing.T) {
+	db, _ := openTempDBUint64PtrInt(t)
+
+	if err := db.Set(1, &PtrIntRec{Name: "a", Rank: nil}); err != nil {
+		t.Fatalf("Set(1): %v", err)
+	}
+	if err := db.Set(2, &PtrIntRec{Name: "b", Rank: nil}); err != nil {
+		t.Fatalf("Set(2): %v", err)
+	}
+	if err := db.RebuildIndex(); err != nil {
+		t.Fatalf("RebuildIndex: %v", err)
+	}
+
+	q := qx.Query().By("rank", qx.ASC).Max(2)
+	got, err := db.QueryKeys(q)
+	if err != nil {
+		t.Fatalf("QueryKeys: %v", err)
+	}
+	assertSameSlice(t, got, []uint64{1, 2})
+}

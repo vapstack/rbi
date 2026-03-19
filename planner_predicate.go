@@ -1871,7 +1871,7 @@ func (db *DB[K, V]) execPlanCandidateOrderBasic(q *qx.QX, preds []predicate) []K
 		}
 	}
 
-	out, ok := db.scanOrderLimitWithPredicates(q, ov, br, o.Desc, preds, nil)
+	out, ok := db.scanOrderLimitWithPredicates(q, ov, br, o.Desc, preds, "", nil)
 	if !ok {
 		return nil
 	}
@@ -3662,7 +3662,7 @@ func (db *DB[K, V]) execPlanOrderedBasic(q *qx.QX, preds []predicate, trace *que
 			preds[i].covered = true
 		}
 	}
-	out, ok := db.scanOrderLimitWithPredicates(q, ov, br, o.Desc, preds, trace)
+	out, ok := db.scanOrderLimitWithPredicates(q, ov, br, o.Desc, preds, "", trace)
 	if !ok {
 		return nil, false
 	}

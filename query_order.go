@@ -226,10 +226,16 @@ func (db *DB[K, V]) queryOrderBasicSlice(result bitmap, s *[]index, o qx.Order, 
 		return nil, nil
 	}
 	resultBM := result.bm
+	var base []index
+	if s != nil {
+		base = *s
+	}
 
 	isSliceOrderField := false
-	if fm := db.fields[o.Field]; fm != nil && fm.Slice {
-		isSliceOrderField = true
+	isPtrOrderField := false
+	if fm := db.fields[o.Field]; fm != nil {
+		isSliceOrderField = fm.Slice
+		isPtrOrderField = fm.Ptr
 	}
 
 	var seen *roaring64.Bitmap
@@ -288,19 +294,34 @@ func (db *DB[K, V]) queryOrderBasicSlice(result bitmap, s *[]index, o qx.Order, 
 	}
 
 	if !o.Desc {
-		for _, ix := range *s {
+		for _, ix := range base {
 			if processBucket(ix.IDs) {
 				return cursor.out, nil
 			}
 		}
-		return cursor.out, nil
-	}
-
-	for i := len(*s) - 1; i >= 0; i-- {
-		if processBucket((*s)[i].IDs) {
-			return cursor.out, nil
+	} else {
+		for i := len(base) - 1; i >= 0; i-- {
+			if processBucket(base[i].IDs) {
+				return cursor.out, nil
+			}
 		}
 	}
+
+	if isPtrOrderField {
+		nilBM, owned := db.nilFieldLookupOwned(o.Field, nil)
+		if nilBM != nil && !nilBM.IsEmpty() {
+			if processBucket(postingFromBitmapViewAdaptive(nilBM)) {
+				if owned {
+					releaseRoaringBuf(nilBM)
+				}
+				return cursor.out, nil
+			}
+		}
+		if owned {
+			releaseRoaringBuf(nilBM)
+		}
+	}
+
 	return cursor.out, nil
 }
 
