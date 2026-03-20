@@ -18,7 +18,8 @@ import (
 
 const (
 	colorReset  = "\x1b[0m"
-	colorGray   = "\x1b[37m"
+	colorGray   = "\x1b[90m"
+	colorWhite  = "\x1b[97m"
 	colorYellow = "\x1b[33m"
 	colorRed    = "\x1b[31m"
 	colorGreen  = "\x1b[32m"
@@ -361,6 +362,7 @@ func buildRows(previousSummaries map[string]benchmarkSummary, order []string, cu
 
 		previousSummary, ok := previousSummaries[name]
 		if !ok {
+			rows = append(rows, buildNewBenchmarkRow(currentSummary, useColor))
 			continue
 		}
 
@@ -398,6 +400,32 @@ func buildRows(previousSummaries map[string]benchmarkSummary, order []string, cu
 	}
 
 	return rows
+}
+
+func buildNewBenchmarkRow(currentSummary benchmarkSummary, useColor bool) outputRow {
+	plain := []string{
+		currentSummary.DisplayName,
+		strconv.FormatInt(currentSummary.Iterations, 10),
+		formatMetricValue(metricNS, currentSummary.NSPerOp),
+		"0%",
+		formatMetricValue(metricBytes, currentSummary.BytesPerOp),
+		"0%",
+		formatMetricValue(metricAllocs, currentSummary.AllocsPerOp),
+		"0%",
+	}
+
+	colored := []string{
+		plain[0],
+		plain[1],
+		maybeColor(plain[2], colorWhite, useColor),
+		maybeColor(plain[3], colorGray, useColor),
+		maybeColor(plain[4], colorWhite, useColor),
+		maybeColor(plain[5], colorGray, useColor),
+		maybeColor(plain[6], colorWhite, useColor),
+		maybeColor(plain[7], colorGray, useColor),
+	}
+
+	return outputRow{Plain: plain, Colored: colored}
 }
 
 func runFollowCLI(previousSummaries map[string]benchmarkSummary, currentPath string, stdout io.Writer, useColor bool, pollInterval time.Duration, interrupted <-chan struct{}) error {

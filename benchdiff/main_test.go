@@ -301,6 +301,98 @@ func TestRunCLIRendersOnlyMeaningfulRows(t *testing.T) {
 	}
 }
 
+func TestBuildRowsRendersNewBenchmarkWithNeutralDeltas(t *testing.T) {
+	t.Parallel()
+
+	currentSummaries := map[string]benchmarkSummary{
+		"Benchmark__Bar-16": {
+			Name:        "Benchmark__Bar-16",
+			DisplayName: "Bar-16",
+			Iterations:  100,
+			NSPerOp:     1500,
+			BytesPerOp:  205,
+			AllocsPerOp: 1,
+		},
+	}
+
+	rows := buildRows(nil, []string{"Benchmark__Bar-16"}, currentSummaries, true)
+	if len(rows) != 1 {
+		t.Fatalf("unexpected row count: %d", len(rows))
+	}
+
+	row := rows[0]
+	wantPlain := []string{"Bar-16", "100", "1_500ns/op", "0%", "205B/op", "0%", "1 allocs/op", "0%"}
+	if got := strings.Join(row.Plain, "|"); got != strings.Join(wantPlain, "|") {
+		t.Fatalf("unexpected plain row: %q", got)
+	}
+
+	wantColored := []string{
+		"Bar-16",
+		"100",
+		colorWhite + "1_500ns/op" + colorReset,
+		colorGray + "0%" + colorReset,
+		colorWhite + "205B/op" + colorReset,
+		colorGray + "0%" + colorReset,
+		colorWhite + "1 allocs/op" + colorReset,
+		colorGray + "0%" + colorReset,
+	}
+	if got := strings.Join(row.Colored, "|"); got != strings.Join(wantColored, "|") {
+		t.Fatalf("unexpected colored row: %q", got)
+	}
+}
+
+func TestRunCLIRendersNewBenchmarksWithZeroDeltas(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	previous := filepath.Join(dir, "previous.txt")
+	current := filepath.Join(dir, "current.txt")
+
+	previousText := "Benchmark__Foo-16 100 1000 ns/op 100 B/op 1 allocs/op"
+	currentText := strings.Join([]string{
+		"Benchmark__Foo-16 100 1000 ns/op 100 B/op 1 allocs/op",
+		"Benchmark__Bar-16 100 1500 ns/op 205 B/op 1 allocs/op",
+	}, "\n")
+
+	if err := os.WriteFile(previous, []byte(previousText), 0o644); err != nil {
+		t.Fatalf("write previous: %v", err)
+	}
+	if err := os.WriteFile(current, []byte(currentText), 0o644); err != nil {
+		t.Fatalf("write current: %v", err)
+	}
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	code := runCLI([]string{previous, current}, &stdout, &stderr, false)
+	if code != 0 {
+		t.Fatalf("unexpected exit code %d, stderr=%q", code, stderr.String())
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("unexpected stderr: %q", stderr.String())
+	}
+
+	output := stdout.String()
+	expectedFragments := []string{
+		"Bar-16",
+		"100",
+		"1_500ns/op",
+		"0%",
+		"205B/op",
+		"1 allocs/op",
+	}
+	for _, fragment := range expectedFragments {
+		if !strings.Contains(output, fragment) {
+			t.Fatalf("expected output to contain %q, got %q", fragment, output)
+		}
+	}
+	if strings.Contains(output, "Foo-16") {
+		t.Fatalf("expected unchanged baseline benchmark to stay filtered out: %q", output)
+	}
+	if strings.Count(output, "0%") != 3 {
+		t.Fatalf("expected three neutral deltas, got %q", output)
+	}
+}
+
 func TestFollowReaderStopsOnPassAndKeepsParsedRows(t *testing.T) {
 	t.Parallel()
 
