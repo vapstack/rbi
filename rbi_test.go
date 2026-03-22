@@ -109,6 +109,27 @@ func readBucketSequence(tb testing.TB, raw *bbolt.DB, bucket []byte) uint64 {
 	return seq
 }
 
+func assertNoFutureSnapshotRefs[K ~uint64 | ~string, V any](tb testing.TB, db *DB[K, V]) {
+	tb.Helper()
+
+	current := db.getSnapshot()
+	currentSeq := uint64(0)
+	if current != nil {
+		currentSeq = current.seq
+	}
+
+	db.snapshot.mu.RLock()
+	defer db.snapshot.mu.RUnlock()
+	for seq, ref := range db.snapshot.bySeq {
+		if ref == nil || ref.snap == nil {
+			tb.Fatalf("snapshot registry contains nil entry for seq=%d", seq)
+		}
+		if seq > currentSeq {
+			tb.Fatalf("staged snapshot leaked into registry: seq=%d current=%d", seq, currentSeq)
+		}
+	}
+}
+
 func TestMultiWrap_DifferentStructs(t *testing.T) {
 	rawDB, path := openRawBolt(t)
 
@@ -2284,14 +2305,7 @@ func TestFailpoint_PostCommitPublishSet_BreaksDBAndSkipsIndexStore(t *testing.T)
 		t.Fatalf("expected ErrBroken from post-commit publish panic, got: %v", err)
 	}
 
-	txID := db.currentBoltTxID()
-	db.snapshot.mu.RLock()
-	ref := db.snapshot.byTx[txID]
-	pending := ref != nil && ref.pending
-	db.snapshot.mu.RUnlock()
-	if pending {
-		t.Fatalf("expected pending ref to be cleared after broken publish path")
-	}
+	assertNoFutureSnapshotRefs(t, db)
 
 	var got *Rec
 	if viewErr := db.bolt.View(func(tx *bbolt.Tx) error {
@@ -2328,7 +2342,7 @@ func TestFailpoint_PostCommitPublishSet_BreaksDBAndSkipsIndexStore(t *testing.T)
 	}
 }
 
-func TestFailpoint_PostCommitPublishBatch_BreaksDBAndClearsPending(t *testing.T) {
+func TestFailpoint_PostCommitPublishBatch_BreaksDBAndClearsStagedSnapshot(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
 		AutoBatchWindow:   10 * time.Millisecond,
 		AutoBatchMax:      16,
@@ -2345,17 +2359,7 @@ func TestFailpoint_PostCommitPublishBatch_BreaksDBAndClearsPending(t *testing.T)
 		t.Fatalf("expected ErrBroken from auto-batch publish panic, got: %v", err)
 	}
 
-	db.snapshot.mu.RLock()
-	pending := 0
-	for _, ref := range db.snapshot.byTx {
-		if ref != nil && ref.pending {
-			pending++
-		}
-	}
-	db.snapshot.mu.RUnlock()
-	if pending != 0 {
-		t.Fatalf("expected no pending refs after broken auto-batch publish, got: %d", pending)
-	}
+	assertNoFutureSnapshotRefs(t, db)
 }
 
 func TestFailpoint_CommitTruncateRollsBackAndKeepsData(t *testing.T) {
@@ -2386,7 +2390,75 @@ func TestFailpoint_CommitTruncateRollsBackAndKeepsData(t *testing.T) {
 	}
 }
 
-func TestFailpoint_CommitPatchAndDelete_RollbackAndNoPendingRefs(t *testing.T) {
+func TestTruncate_PreservesSequenceMonotonicityAcrossBucketRecreate(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "truncate_sequence.db")
+
+	db1, raw1 := openBoltAndNew[uint64, Rec](t, path)
+	if err := db1.Set(1, &Rec{Name: "alice", Age: 30}); err != nil {
+		t.Fatalf("Set(1): %v", err)
+	}
+
+	persistedPath := path + ".Rec.rbi"
+	initialSeq := readBucketSequence(t, raw1, db1.bucket)
+	if initialSeq == 0 {
+		t.Fatalf("expected sequence to advance after write, got %d", initialSeq)
+	}
+	if err := db1.Close(); err != nil {
+		t.Fatalf("Close(db1): %v", err)
+	}
+	if err := raw1.Close(); err != nil {
+		t.Fatalf("Close(raw1): %v", err)
+	}
+
+	storedSeq := readPersistedIndexSequence(t, persistedPath)
+	if storedSeq != initialSeq {
+		t.Fatalf("persisted sequence mismatch: stored=%d bucket=%d", storedSeq, initialSeq)
+	}
+
+	db2, raw2 := openBoltAndNew[uint64, Rec](t, path, Options{DisableIndexStore: true})
+	if err := db2.Truncate(); err != nil {
+		t.Fatalf("Truncate: %v", err)
+	}
+
+	truncateSeq := readBucketSequence(t, raw2, db2.bucket)
+	if truncateSeq <= storedSeq {
+		t.Fatalf("truncate must preserve monotonic sequence: stored=%d truncate=%d", storedSeq, truncateSeq)
+	}
+	if err := db2.Close(); err != nil {
+		t.Fatalf("Close(db2): %v", err)
+	}
+	if err := raw2.Close(); err != nil {
+		t.Fatalf("Close(raw2): %v", err)
+	}
+
+	if got := readPersistedIndexSequence(t, persistedPath); got != storedSeq {
+		t.Fatalf("DisableIndexStore should keep old sidecar untouched: got=%d want=%d", got, storedSeq)
+	}
+
+	db3, raw3 := openBoltAndNew[uint64, Rec](t, path)
+	defer func() { _ = db3.Close() }()
+	defer func() { _ = raw3.Close() }()
+
+	if got := readBucketSequence(t, raw3, db3.bucket); got != truncateSeq {
+		t.Fatalf("reopened bucket sequence mismatch: got=%d want=%d", got, truncateSeq)
+	}
+	if snap := db3.getSnapshot(); snap == nil || snap.seq != truncateSeq {
+		if snap == nil {
+			t.Fatalf("expected published snapshot after reopen")
+		}
+		t.Fatalf("snapshot sequence mismatch after reopen: got=%d want=%d", snap.seq, truncateSeq)
+	}
+
+	ids, err := db3.QueryKeys(&qx.QX{Expr: qx.Expr{Op: qx.OpEQ, Field: "age", Value: 30}})
+	if err != nil {
+		t.Fatalf("QueryKeys(after reopen): %v", err)
+	}
+	if len(ids) != 0 {
+		t.Fatalf("expected rebuilt empty index after truncate, got ids=%v", ids)
+	}
+}
+
+func TestFailpoint_CommitPatchAndDelete_RollbackAndNoStagedSnapshots(t *testing.T) {
 	t.Run("patch", func(t *testing.T) {
 		db, _ := openTempDBUint64(t, Options{AutoBatchMax: 1})
 		if err := db.Set(1, &Rec{Name: "alice", Age: 30, Meta: Meta{Country: "NL"}}); err != nil {
@@ -2405,9 +2477,7 @@ func TestFailpoint_CommitPatchAndDelete_RollbackAndNoPendingRefs(t *testing.T) {
 		}
 		db.testHooks.beforeCommit = nil
 
-		if st := db.SnapshotStats(); st.PendingRefs != 0 {
-			t.Fatalf("expected no pending refs after failed patch commit, got %+v", st)
-		}
+		assertNoFutureSnapshotRefs(t, db)
 		v, err := db.Get(1)
 		if err != nil {
 			t.Fatalf("Get(1): %v", err)
@@ -2435,9 +2505,7 @@ func TestFailpoint_CommitPatchAndDelete_RollbackAndNoPendingRefs(t *testing.T) {
 		}
 		db.testHooks.beforeCommit = nil
 
-		if st := db.SnapshotStats(); st.PendingRefs != 0 {
-			t.Fatalf("expected no pending refs after failed delete commit, got %+v", st)
-		}
+		assertNoFutureSnapshotRefs(t, db)
 		v, err := db.Get(1)
 		if err != nil {
 			t.Fatalf("Get(1): %v", err)
@@ -2448,7 +2516,7 @@ func TestFailpoint_CommitPatchAndDelete_RollbackAndNoPendingRefs(t *testing.T) {
 	})
 }
 
-func TestFailpoint_CommitMultiWritePaths_RollbackAndNoPendingRefs(t *testing.T) {
+func TestFailpoint_CommitMultiWritePaths_RollbackAndNoStagedSnapshots(t *testing.T) {
 	type tc struct {
 		name   string
 		op     string
@@ -2570,9 +2638,7 @@ func TestFailpoint_CommitMultiWritePaths_RollbackAndNoPendingRefs(t *testing.T) 
 			}
 			db.testHooks.beforeCommit = nil
 
-			if st := db.SnapshotStats(); st.PendingRefs != 0 {
-				t.Fatalf("expected no pending snapshot refs after failed %s commit, got %+v", c.op, st)
-			}
+			assertNoFutureSnapshotRefs(t, db)
 
 			c.verify(t, db)
 		})
@@ -2706,9 +2772,7 @@ func TestSet_NilValue_ReturnsErrNilValueAndNoWrites(t *testing.T) {
 		t.Fatalf("expected no indexed ids, got %v", ids)
 	}
 
-	if st := db.SnapshotStats(); st.PendingRefs != 0 {
-		t.Fatalf("expected no pending refs after rejected Set(nil), got %+v", st)
-	}
+	assertNoFutureSnapshotRefs(t, db)
 }
 
 func TestBatchSet_NilValue_ReturnsErrNilValueAndAtomic(t *testing.T) {
@@ -2760,9 +2824,7 @@ func TestBatchSet_NilValue_ReturnsErrNilValueAndAtomic(t *testing.T) {
 		t.Fatalf("expected Count=1 after rejected BatchSet, got %d", cnt)
 	}
 
-	if st := db.SnapshotStats(); st.PendingRefs != 0 {
-		t.Fatalf("expected no pending refs after rejected BatchSet(nil), got %+v", st)
-	}
+	assertNoFutureSnapshotRefs(t, db)
 }
 
 func TestBatchPatchBatchDelete_DuplicateIDs_IndexConsistency(t *testing.T) {
@@ -3104,9 +3166,7 @@ func TestMultiWrite_CallbackError_RollbackDataAndIndex(t *testing.T) {
 				t.Fatalf("expected callback to be called at least once")
 			}
 
-			if st := db.SnapshotStats(); st.PendingRefs != 0 {
-				t.Fatalf("expected no pending refs after callback rollback, got %+v", st)
-			}
+			assertNoFutureSnapshotRefs(t, db)
 
 			if cnt, err := db.Count(nil); err != nil {
 				t.Fatalf("Count: %v", err)
@@ -3354,9 +3414,7 @@ func TestMultiWrite_CallbackError_RandomizedAtomicRollback(t *testing.T) {
 				t.Fatalf("step=%d expected callback error, got: %v (cbCalls=%d)", step, opErr, cbCalls)
 			}
 		}
-		if st := db.SnapshotStats(); st.PendingRefs != 0 {
-			t.Fatalf("step=%d pending refs leak after rollback: %+v", step, st)
-		}
+		assertNoFutureSnapshotRefs(t, db)
 
 		verifyStateEquals(fmt.Sprintf("step=%d", step), before)
 	}
@@ -3938,8 +3996,8 @@ func TestComponentAccessors_ExposePlannerCalibrationAndSnapshotDiagnostics(t *te
 	if st.AutoBatchCount == 0 {
 		t.Fatalf("expected stats auto-batch count > 0")
 	}
-	if st.SnapshotTxID == 0 {
-		t.Fatalf("expected stats snapshot txID > 0")
+	if st.SnapshotSequence == 0 {
+		t.Fatalf("expected stats snapshot sequence > 0")
 	}
 
 	idx := db.IndexStats()
@@ -3951,8 +4009,8 @@ func TestComponentAccessors_ExposePlannerCalibrationAndSnapshotDiagnostics(t *te
 	}
 
 	snap := db.SnapshotStats()
-	if snap.TxID == 0 {
-		t.Fatalf("expected snapshot txID > 0")
+	if snap.Sequence == 0 {
+		t.Fatalf("expected snapshot sequence > 0")
 	}
 	if snap.RegistrySize == 0 {
 		t.Fatalf("expected snapshot registry to be non-empty")
@@ -4051,8 +4109,8 @@ func TestComponentAccessors(t *testing.T) {
 	if st.KeyCount != 2 {
 		t.Fatalf("expected Stats.KeyCount=2, got %d", st.KeyCount)
 	}
-	if st.SnapshotTxID == 0 {
-		t.Fatalf("expected Stats.Snapshot.TxID > 0")
+	if st.SnapshotSequence == 0 {
+		t.Fatalf("expected Stats.SnapshotSequence > 0")
 	}
 
 	idx := db.IndexStats()
@@ -4080,8 +4138,8 @@ func TestComponentAccessors(t *testing.T) {
 	}
 
 	snap := db.SnapshotStats()
-	if snap.TxID == 0 {
-		t.Fatalf("expected SnapshotStats.TxID > 0")
+	if snap.Sequence == 0 {
+		t.Fatalf("expected SnapshotStats.Sequence > 0")
 	}
 
 	bs := db.AutoBatchStats()

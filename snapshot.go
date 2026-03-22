@@ -14,7 +14,7 @@ import (
 
 // indexSnapshot is an immutable read-view published atomically for query paths.
 type indexSnapshot struct {
-	txID uint64
+	seq uint64
 
 	index        map[string]*[]index
 	nilIndex     map[string]*[]index
@@ -67,9 +67,8 @@ type fieldDeltaLayer struct {
 }
 
 type snapshotRef struct {
-	snap    *indexSnapshot
-	refs    atomic.Int64
-	pending bool
+	snap *indexSnapshot
+	refs atomic.Int64
 }
 
 var snapshotRefPool = sync.Pool{
@@ -82,7 +81,6 @@ func getSnapshotRef() *snapshotRef {
 
 func releaseSnapshotRef(ref *snapshotRef) {
 	ref.snap = nil
-	ref.pending = false
 	ref.refs.Store(0)
 	snapshotRefPool.Put(ref)
 }
@@ -252,23 +250,24 @@ func inheritMaterializedPredCache(next, prev *indexSnapshot, changedFields map[s
 	}
 }
 
-func (db *DB[K, V]) broadcastSnapshotWaitersLocked() {
-	if db.snapshot.wait != nil {
-		db.snapshot.wait.Broadcast()
+func (db *DB[K, V]) publishSnapshotNoLock(seq uint64) {
+	s, indexDelta, nilDelta, lenDelta := db.buildSnapshotWithTxDeltaNoLock(seq, nil, nil, nil, nil, nil)
+	db.finishSnapshotPublishNoLock(s, indexDelta, nilDelta, lenDelta, nil, nil)
+}
+
+func (db *DB[K, V]) finishSnapshotPublishNoLock(s *indexSnapshot, indexDelta, nilDelta, lenDelta map[string]*fieldIndexDelta, add, rem *roaring64.Bitmap) {
+	if s == nil {
+		return
 	}
+	db.snapshot.current.Store(s)
+	db.registerSnapshot(s)
+	if s.hasAnyDeltaState() {
+		db.maybeRequestSnapshotCompaction(s, indexDelta, nilDelta, lenDelta, add, rem)
+	}
+	db.noteSnapshotActivity()
 }
 
-func (db *DB[K, V]) broadcastSnapshotWaiters() {
-	db.snapshot.mu.Lock()
-	db.broadcastSnapshotWaitersLocked()
-	db.snapshot.mu.Unlock()
-}
-
-func (db *DB[K, V]) publishSnapshotNoLock(txID uint64) {
-	db.publishSnapshotWithTxDeltaNoLock(txID, nil, nil, nil, nil, nil)
-}
-
-func (db *DB[K, V]) publishSnapshotWithTxDeltaNoLock(txID uint64, indexChanges, nilChanges, lenChanges map[string]map[string]indexDeltaEntry, add, rem *roaring64.Bitmap) {
+func (db *DB[K, V]) buildSnapshotWithTxDeltaNoLock(seq uint64, indexChanges, nilChanges, lenChanges map[string]map[string]indexDeltaEntry, add, rem *roaring64.Bitmap) (*indexSnapshot, map[string]*fieldIndexDelta, map[string]*fieldIndexDelta, map[string]*fieldIndexDelta) {
 	indexDelta := buildSnapshotDeltaMap(indexChanges, func(field string) bool {
 		return fieldUsesFixed8Keys(db.fields[field])
 	})
@@ -284,7 +283,7 @@ func (db *DB[K, V]) publishSnapshotWithTxDeltaNoLock(txID uint64, indexChanges, 
 	}
 
 	s := &indexSnapshot{
-		txID:        txID,
+		seq:         seq,
 		index:       db.index,
 		nilIndex:    db.nilIndex,
 		lenIndex:    db.lenIndex,
@@ -309,15 +308,17 @@ func (db *DB[K, V]) publishSnapshotWithTxDeltaNoLock(txID uint64, indexChanges, 
 		matPredCacheMaxBitmapCard:       materializedPredCacheMaxBitmapCardinality(db.options.SnapshotMaterializedPredCacheMaxBitmapCardinality),
 	}
 	inheritMaterializedPredCache(s, prev, indexDelta)
-	db.snapshot.current.Store(s)
-	db.registerSnapshot(s)
-	db.noteSnapshotActivity()
+	return s, indexDelta, nilDelta, lenDelta
 }
 
-func (db *DB[K, V]) publishPreparedSnapshotWithAccumDeltaNoLock(txID uint64, delta *preparedSnapshotDelta) {
+func (db *DB[K, V]) publishSnapshotWithTxDeltaNoLock(seq uint64, indexChanges, nilChanges, lenChanges map[string]map[string]indexDeltaEntry, add, rem *roaring64.Bitmap) {
+	s, indexDelta, nilDelta, lenDelta := db.buildSnapshotWithTxDeltaNoLock(seq, indexChanges, nilChanges, lenChanges, add, rem)
+	db.finishSnapshotPublishNoLock(s, indexDelta, nilDelta, lenDelta, add, rem)
+}
+
+func (db *DB[K, V]) buildPreparedSnapshotWithAccumDeltaNoLock(seq uint64, delta *preparedSnapshotDelta) *indexSnapshot {
 	if delta == nil {
-		db.publishSnapshotWithAccumDeltaNoLock(txID, nil, nil, nil, nil, nil)
-		return
+		return db.buildSnapshotWithAccumDeltaNoLock(seq, nil, nil, nil, nil, nil)
 	}
 
 	prev := db.getSnapshot()
@@ -363,7 +364,7 @@ func (db *DB[K, V]) publishPreparedSnapshotWithAccumDeltaNoLock(txID uint64, del
 	nextLenDelta := maybeExposeFlatLayerMap(nextLenLayer)
 
 	s := &indexSnapshot{
-		txID:        txID,
+		seq:         seq,
 		index:       baseIndex,
 		nilIndex:    baseNilIndex,
 		lenIndex:    baseLenIndex,
@@ -388,16 +389,20 @@ func (db *DB[K, V]) publishPreparedSnapshotWithAccumDeltaNoLock(txID uint64, del
 		matPredCacheMaxBitmapCard:       materializedPredCacheMaxBitmapCardinality(db.options.SnapshotMaterializedPredCacheMaxBitmapCardinality),
 	}
 	inheritMaterializedPredCache(s, prev, delta.indexDelta)
-	db.snapshot.current.Store(s)
-	db.registerSnapshot(s)
-	if s.hasAnyDeltaState() {
-		db.maybeRequestSnapshotCompaction(s, delta.indexDelta, delta.nilDelta, delta.lenDelta, delta.universeAdd, delta.universeRem)
+	return s
+}
+
+func (db *DB[K, V]) publishPreparedSnapshotWithAccumDeltaNoLock(seq uint64, delta *preparedSnapshotDelta) {
+	s := db.buildPreparedSnapshotWithAccumDeltaNoLock(seq, delta)
+	if delta == nil {
+		db.finishSnapshotPublishNoLock(s, nil, nil, nil, nil, nil)
+		return
 	}
-	db.noteSnapshotActivity()
+	db.finishSnapshotPublishNoLock(s, delta.indexDelta, delta.nilDelta, delta.lenDelta, delta.universeAdd, delta.universeRem)
 	delta.releaseTransientUniverse()
 }
 
-func (db *DB[K, V]) publishSnapshotWithAccumDeltaNoLock(txID uint64, indexChanges, nilChanges, lenChanges map[string]map[string]indexDeltaEntry, add, rem *roaring64.Bitmap) {
+func (db *DB[K, V]) buildSnapshotWithAccumDeltaNoLock(seq uint64, indexChanges, nilChanges, lenChanges map[string]map[string]indexDeltaEntry, add, rem *roaring64.Bitmap) *indexSnapshot {
 	indexDelta := buildSnapshotDeltaMap(indexChanges, func(field string) bool {
 		return fieldUsesFixed8Keys(db.fields[field])
 	})
@@ -446,7 +451,7 @@ func (db *DB[K, V]) publishSnapshotWithAccumDeltaNoLock(txID uint64, indexChange
 	nextLenDelta := maybeExposeFlatLayerMap(nextLenLayer)
 
 	s := &indexSnapshot{
-		txID:        txID,
+		seq:         seq,
 		index:       baseIndex,
 		nilIndex:    baseNilIndex,
 		lenIndex:    baseLenIndex,
@@ -471,12 +476,85 @@ func (db *DB[K, V]) publishSnapshotWithAccumDeltaNoLock(txID uint64, indexChange
 		matPredCacheMaxBitmapCard:       materializedPredCacheMaxBitmapCardinality(db.options.SnapshotMaterializedPredCacheMaxBitmapCardinality),
 	}
 	inheritMaterializedPredCache(s, prev, indexDelta)
-	db.snapshot.current.Store(s)
-	db.registerSnapshot(s)
-	if s.hasAnyDeltaState() {
-		db.maybeRequestSnapshotCompaction(s, indexDelta, nilDelta, lenDelta, add, rem)
+	return s
+}
+
+func (db *DB[K, V]) publishSnapshotWithAccumDeltaNoLock(seq uint64, indexChanges, nilChanges, lenChanges map[string]map[string]indexDeltaEntry, add, rem *roaring64.Bitmap) {
+	indexDelta := buildSnapshotDeltaMap(indexChanges, func(field string) bool {
+		return fieldUsesFixed8Keys(db.fields[field])
+	})
+	nilDelta := buildSnapshotDeltaMap(nilChanges, func(string) bool { return false })
+	lenDelta := buildSnapshotDeltaMap(lenChanges, func(string) bool { return true })
+
+	prev := db.getSnapshot()
+
+	baseIndex := db.index
+	baseNilIndex := db.nilIndex
+	baseLenIndex := db.lenIndex
+	baseUniverse := db.universe
+	var baseStrMap *strMapSnapshot
+	if db.strkey {
+		baseStrMap = db.strmap.snapshot()
 	}
-	db.noteSnapshotActivity()
+	if prev != nil {
+		baseIndex = prev.index
+		baseNilIndex = prev.nilIndex
+		baseLenIndex = prev.lenIndex
+		baseUniverse = prev.universe
+		if !db.strkey {
+			baseStrMap = prev.strmap
+		}
+	}
+	prevIndexLayer := prev.getIndexLayer()
+	prevNilLayer := prev.getNilLayer()
+	prevLenLayer := prev.getLenLayer()
+
+	nextIndexLayer := appendDeltaLayer(prevIndexLayer, indexDelta)
+	nextNilLayer := appendDeltaLayer(prevNilLayer, nilDelta)
+	nextLenLayer := appendDeltaLayer(prevLenLayer, lenDelta)
+	nextIndexCount := appendDeltaLayerFieldCount(prev.indexDeltaCount(), indexDelta, len(baseIndex))
+	nextNilCount := appendDeltaLayerFieldCount(prev.nilDeltaCount(), nilDelta, len(baseNilIndex))
+	nextLenCount := appendDeltaLayerFieldCount(prev.lenDeltaCount(), lenDelta, len(baseLenIndex))
+	nextIndexLayer, nextIndexCount = capPublishedDeltaLayerDepth(nextIndexLayer, nextIndexCount, db.options.SnapshotDeltaLayerMaxDepth)
+	nextNilLayer, nextNilCount = capPublishedDeltaLayerDepth(nextNilLayer, nextNilCount, db.options.SnapshotDeltaLayerMaxDepth)
+	nextLenLayer, nextLenCount = capPublishedDeltaLayerDepth(nextLenLayer, nextLenCount, db.options.SnapshotDeltaLayerMaxDepth)
+
+	nextUniverseAdd, nextUniverseRem := mergeUniverseDelta(nil, nil, add, rem)
+	if prev != nil {
+		nextUniverseAdd, nextUniverseRem = mergeUniverseDelta(prev.universeAdd, prev.universeRem, add, rem)
+	}
+
+	nextIndexDelta := maybeExposeFlatLayerMap(nextIndexLayer)
+	nextNilDelta := maybeExposeFlatLayerMap(nextNilLayer)
+	nextLenDelta := maybeExposeFlatLayerMap(nextLenLayer)
+
+	s := &indexSnapshot{
+		seq:         seq,
+		index:       baseIndex,
+		nilIndex:    baseNilIndex,
+		lenIndex:    baseLenIndex,
+		indexDelta:  nextIndexDelta,
+		nilDelta:    nextNilDelta,
+		lenIdxDelta: nextLenDelta,
+		indexLayer:  nextIndexLayer,
+		nilLayer:    nextNilLayer,
+		lenLayer:    nextLenLayer,
+		indexDCount: nextIndexCount,
+		nilDCount:   nextNilCount,
+		lenDCount:   nextLenCount,
+		universe:    baseUniverse,
+		universeAdd: nextUniverseAdd,
+		universeRem: nextUniverseRem,
+		strmap:      baseStrMap,
+
+		numericRangeBucketCache: inheritNumericRangeBucketCache(prev, prev != nil),
+
+		matPredCacheMaxEntries:          max(0, db.options.SnapshotMaterializedPredCacheMaxEntries),
+		matPredCacheMaxEntriesWithDelta: max(0, db.options.SnapshotMaterializedPredCacheMaxEntriesWithDelta),
+		matPredCacheMaxBitmapCard:       materializedPredCacheMaxBitmapCardinality(db.options.SnapshotMaterializedPredCacheMaxBitmapCardinality),
+	}
+	inheritMaterializedPredCache(s, prev, indexDelta)
+	db.finishSnapshotPublishNoLock(s, indexDelta, nilDelta, lenDelta, add, rem)
 }
 
 func appendDeltaLayer(prev *fieldDeltaLayer, delta map[string]*fieldIndexDelta) *fieldDeltaLayer {
@@ -1007,7 +1085,7 @@ func (db *DB[K, V]) compactSnapshotRegistryIdleOnce() (changed bool, blocked boo
 	db.snapshot.mu.Lock()
 	defer db.snapshot.mu.Unlock()
 
-	if len(db.snapshot.byTx) == 0 {
+	if len(db.snapshot.bySeq) == 0 {
 		if len(db.snapshot.order) > 0 || db.snapshot.head != 0 {
 			db.snapshot.order = db.snapshot.order[:0]
 			db.snapshot.head = 0
@@ -1016,35 +1094,35 @@ func (db *DB[K, V]) compactSnapshotRegistryIdleOnce() (changed bool, blocked boo
 		return false, false
 	}
 
-	latestTx := uint64(0)
+	latestSeq := uint64(0)
 	if latest := db.snapshot.current.Load(); latest != nil {
-		latestTx = latest.txID
+		latestSeq = latest.seq
 	}
 
-	for txID, ref := range db.snapshot.byTx {
-		if txID == latestTx {
+	for seq, ref := range db.snapshot.bySeq {
+		if seq == latestSeq {
 			continue
 		}
-		if ref.pending || ref.refs.Load() > 0 {
+		if ref.refs.Load() > 0 {
 			blocked = true
 			continue
 		}
-		delete(db.snapshot.byTx, txID)
+		delete(db.snapshot.bySeq, seq)
 		releaseSnapshotRef(ref)
 		changed = true
 	}
 
-	ids := make([]uint64, 0, len(db.snapshot.byTx))
-	for txID := range db.snapshot.byTx {
-		ids = append(ids, txID)
+	ids := make([]uint64, 0, len(db.snapshot.bySeq))
+	for seq := range db.snapshot.bySeq {
+		ids = append(ids, seq)
 	}
 	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
 
 	if len(db.snapshot.order) != len(ids) || db.snapshot.head != 0 {
 		changed = true
 	} else {
-		for i, txID := range ids {
-			if db.snapshot.order[i] != txID {
+		for i, seq := range ids {
+			if db.snapshot.order[i] != seq {
 				changed = true
 				break
 			}
@@ -1211,7 +1289,7 @@ func compactSnapshot(cur *indexSnapshot, opt *Options, force bool) (*indexSnapsh
 	}
 
 	return &indexSnapshot{
-		txID:                            cur.txID,
+		seq:                             cur.seq,
 		index:                           baseIndex,
 		nilIndex:                        baseNilIndex,
 		lenIndex:                        baseLenIndex,
@@ -1282,7 +1360,7 @@ func forceCompactSnapshot(cur *indexSnapshot, nextStrMap *strMapSnapshot) (*inde
 	}
 
 	return &indexSnapshot{
-		txID:                            cur.txID,
+		seq:                             cur.seq,
 		index:                           nextIndex,
 		nilIndex:                        nextNilIndex,
 		lenIndex:                        nextLenIndex,
@@ -2920,115 +2998,64 @@ func (s *indexSnapshot) hasAnyDeltaState() bool {
 }
 
 func (db *DB[K, V]) registerSnapshot(s *indexSnapshot) {
+	if s == nil {
+		return
+	}
 	db.snapshot.mu.Lock()
 	defer db.snapshot.mu.Unlock()
 
-	ref, exists := db.snapshot.byTx[s.txID]
+	ref, exists := db.snapshot.bySeq[s.seq]
 	if !exists {
-		db.snapshot.order = append(db.snapshot.order, s.txID)
+		db.snapshot.order = append(db.snapshot.order, s.seq)
 		ref = getSnapshotRef()
-		db.snapshot.byTx[s.txID] = ref
+		db.snapshot.bySeq[s.seq] = ref
 	}
 	ref.snap = s
-	ref.pending = false
 
 	db.pruneSnapshotsLocked()
-	db.broadcastSnapshotWaitersLocked()
 }
 
-func (db *DB[K, V]) markPending(txID uint64) {
-	if txID == 0 {
+func (db *DB[K, V]) stageSnapshot(s *indexSnapshot) {
+	if s == nil {
 		return
 	}
 	db.snapshot.mu.Lock()
 	defer db.snapshot.mu.Unlock()
 
-	ref, exists := db.snapshot.byTx[txID]
+	ref, exists := db.snapshot.bySeq[s.seq]
 	if !exists {
-		db.snapshot.order = append(db.snapshot.order, txID)
+		db.snapshot.order = append(db.snapshot.order, s.seq)
 		ref = getSnapshotRef()
-		db.snapshot.byTx[txID] = ref
+		db.snapshot.bySeq[s.seq] = ref
 	}
-	ref.pending = true
+	ref.snap = s
 }
 
-func (db *DB[K, V]) clearPending(txID uint64) {
-	if txID == 0 {
-		return
-	}
+func (db *DB[K, V]) dropStagedSnapshot(seq uint64) {
 	db.snapshot.mu.Lock()
 	defer db.snapshot.mu.Unlock()
 
-	ref := db.snapshot.byTx[txID]
+	ref := db.snapshot.bySeq[seq]
 	if ref == nil {
 		return
 	}
-	ref.pending = false
+	ref.snap = nil
 	if ref.snap == nil && ref.refs.Load() <= 0 {
-		delete(db.snapshot.byTx, txID)
+		delete(db.snapshot.bySeq, seq)
 		releaseSnapshotRef(ref)
 	}
-	db.pruneSnapshotsLocked()
-	db.broadcastSnapshotWaitersLocked()
 }
 
-func (db *DB[K, V]) snapshotRefStatus(txID uint64) (exists, pending bool) {
-	db.snapshot.mu.RLock()
-	defer db.snapshot.mu.RUnlock()
-	ref := db.snapshot.byTx[txID]
-	if ref == nil {
-		return false, false
-	}
-	return true, ref.pending
-}
-
-func (db *DB[K, V]) pinSnapshotRefByTxID(txID uint64) (*indexSnapshot, *snapshotRef, bool) {
+func (db *DB[K, V]) pinSnapshotRefBySeq(seq uint64) (*indexSnapshot, *snapshotRef, bool) {
 	db.snapshot.mu.RLock()
 	defer db.snapshot.mu.RUnlock()
 
-	ref := db.snapshot.byTx[txID]
+	ref := db.snapshot.bySeq[seq]
 	if ref == nil || ref.snap == nil {
 		return nil, nil, false
 	}
 	ref.refs.Add(1)
 	return ref.snap, ref, true
-}
-
-func (db *DB[K, V]) pinSnapshotRefByTxIDWait(txID uint64) (*indexSnapshot, *snapshotRef, bool) {
-	db.snapshot.mu.Lock()
-	defer db.snapshot.mu.Unlock()
-
-	for {
-		ref := db.snapshot.byTx[txID]
-		if ref != nil && ref.snap != nil {
-			ref.refs.Add(1)
-			return ref.snap, ref, true
-		}
-		if db.unavailableErr() != nil {
-			return nil, nil, false
-		}
-		latestTx := uint64(0)
-		if latest := db.snapshot.current.Load(); latest != nil {
-			latestTx = latest.txID
-		}
-
-		if latestTx > txID {
-			// Snapshot publish is monotonic by txID for this DB instance.
-			// If latest already moved past target txID and target is absent in
-			// registry, waiting for this txID is pointless.
-			return nil, nil, false
-		}
-
-		if ref == nil || !ref.pending {
-			// Target txID is not pending:
-			// - latest < txID: external/non-indexed txID ahead of index writer.
-			// - latest == txID: registry hole for current txID.
-			// In both cases waiting is pointless; caller should retry/fallback.
-			return nil, nil, false
-		}
-
-		db.snapshot.wait.Wait()
-	}
 }
 
 func (db *DB[K, V]) unpinSnapshotRef(ref *snapshotRef) {
@@ -3042,24 +3069,24 @@ func (db *DB[K, V]) unpinSnapshotRef(ref *snapshotRef) {
 
 func (db *DB[K, V]) pruneSnapshotsLocked() {
 	latest := db.snapshot.current.Load()
-	latestTx := uint64(0)
+	latestSeq := uint64(0)
 	if latest != nil {
-		latestTx = latest.txID
+		latestSeq = latest.seq
 	}
 
 	// If the order log grows much larger than the active registry, rebuild it
-	// from active tx IDs. This prevents O(total-ever-seen-tx) scans when an old
-	// pinned snapshot keeps snapHead at the front under mixed load.
+	// from active snapshot sequences. This prevents O(total-ever-seen-seq) scans
+	// when an old pinned snapshot keeps snapHead at the front under mixed load.
 	maxRegistry := int(db.options.SnapshotRegistryMax)
 	if len(db.snapshot.order) > maxRegistry*4 {
-		active := len(db.snapshot.byTx)
+		active := len(db.snapshot.bySeq)
 		if active < 1 {
 			active = 1
 		}
 		if len(db.snapshot.order) > active*4 {
-			ids := make([]uint64, 0, len(db.snapshot.byTx))
-			for txID := range db.snapshot.byTx {
-				ids = append(ids, txID)
+			ids := make([]uint64, 0, len(db.snapshot.bySeq))
+			for seq := range db.snapshot.bySeq {
+				ids = append(ids, seq)
 			}
 			sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
 			db.snapshot.order = ids
@@ -3074,27 +3101,24 @@ func (db *DB[K, V]) pruneSnapshotsLocked() {
 		db.snapshot.head = len(db.snapshot.order)
 	}
 
-	for len(db.snapshot.byTx) > maxRegistry && db.snapshot.head < len(db.snapshot.order) {
+	for len(db.snapshot.bySeq) > maxRegistry && db.snapshot.head < len(db.snapshot.order) {
 		removedAny := false
-		for i := db.snapshot.head; i < len(db.snapshot.order) && len(db.snapshot.byTx) > maxRegistry; i++ {
-			txID := db.snapshot.order[i]
-			ref, ok := db.snapshot.byTx[txID]
+		for i := db.snapshot.head; i < len(db.snapshot.order) && len(db.snapshot.bySeq) > maxRegistry; i++ {
+			seq := db.snapshot.order[i]
+			ref, ok := db.snapshot.bySeq[seq]
 			if !ok {
 				if i == db.snapshot.head {
 					db.snapshot.head++
 				}
 				continue
 			}
-			if ref.pending {
-				continue
-			}
-			if txID == latestTx || ref.refs.Load() > 0 {
+			if seq == latestSeq || ref.refs.Load() > 0 {
 				// Do not stop pruning on first pinned snapshot: continue scanning
 				// and reclaim later unpinned snapshots to keep map size bounded.
 				continue
 			}
 
-			delete(db.snapshot.byTx, txID)
+			delete(db.snapshot.bySeq, seq)
 			releaseSnapshotRef(ref)
 			removedAny = true
 			if i == db.snapshot.head {
@@ -3107,8 +3131,8 @@ func (db *DB[K, V]) pruneSnapshotsLocked() {
 	}
 
 	for db.snapshot.head < len(db.snapshot.order) {
-		txID := db.snapshot.order[db.snapshot.head]
-		if _, ok := db.snapshot.byTx[txID]; ok {
+		seq := db.snapshot.order[db.snapshot.head]
+		if _, ok := db.snapshot.bySeq[seq]; ok {
 			break
 		}
 		db.snapshot.head++
@@ -3137,7 +3161,7 @@ func (db *DB[K, V]) SnapshotStats() SnapshotStats {
 	s := db.getSnapshot()
 
 	diag := SnapshotStats{
-		TxID:                  s.txID,
+		Sequence:              s.seq,
 		HasDelta:              s.hasAnyDeltaState(),
 		IndexDeltaFields:      s.indexDeltaCount(),
 		LenDeltaFields:        s.lenDeltaCount(),
@@ -3175,13 +3199,10 @@ func (db *DB[K, V]) SnapshotStats() SnapshotStats {
 	}
 
 	db.snapshot.mu.RLock()
-	diag.RegistrySize = len(db.snapshot.byTx)
+	diag.RegistrySize = len(db.snapshot.bySeq)
 	diag.RegistryOrderLen = len(db.snapshot.order)
 	diag.RegistryHead = db.snapshot.head
-	for _, ref := range db.snapshot.byTx {
-		if ref.pending {
-			diag.PendingRefs++
-		}
+	for _, ref := range db.snapshot.bySeq {
 		if ref.refs.Load() > 0 {
 			diag.PinnedRefs++
 		}
@@ -3210,14 +3231,4 @@ func (layer *fieldDeltaLayer) effectiveDeltaTotals() (keys int, ops uint64) {
 		ops += o
 	}
 	return keys, ops
-}
-
-func (db *DB[K, V]) currentBoltTxID() uint64 {
-	tx, err := db.bolt.Begin(false)
-	if err != nil {
-		return 0
-	}
-	id := uint64(tx.ID())
-	_ = tx.Rollback()
-	return id
 }

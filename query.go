@@ -2,7 +2,6 @@ package rbi
 
 import (
 	"fmt"
-	"runtime"
 	"unsafe"
 
 	"github.com/vapstack/qx"
@@ -23,30 +22,58 @@ func (db *DB[K, V]) Query(q *qx.QX) ([]*V, error) {
 	}
 	defer db.endOp()
 
-	for {
-		tx, txErr := db.bolt.Begin(false)
-		if txErr != nil {
-			return nil, fmt.Errorf("tx error: %w", txErr)
-		}
-		values, retry, err := db.queryWithTx(tx, q)
-		_ = tx.Rollback()
-		if err != nil {
-			return nil, err
-		}
-		if !retry {
-			return values, nil
-		}
-		if err = db.unavailableErr(); err != nil {
-			return nil, err
-		}
-		runtime.Gosched()
+	tx, snap, ref, err := db.beginQueryTxSnapshot()
+	if err != nil {
+		return nil, err
 	}
+	defer rollback(tx)
+	defer db.unpinSnapshotRef(ref)
+
+	return db.queryRecords(tx, snap, q)
+}
+
+func (db *DB[K, V]) beginQueryTxSnapshot() (*bbolt.Tx, *indexSnapshot, *snapshotRef, error) {
+	// Hold the registry read lock across Begin(false) -> Sequence() -> pin so a
+	// writer cannot publish/prune away the exact snapshot needed by this read tx
+	// in the gap between opening the tx and pinning its sequence-aligned snapshot.
+	db.snapshot.mu.RLock()
+	tx, err := db.bolt.Begin(false)
+	if err != nil {
+		db.snapshot.mu.RUnlock()
+		return nil, nil, nil, fmt.Errorf("tx error: %w", err)
+	}
+
+	bucket := tx.Bucket(db.bucket)
+	if bucket == nil {
+		db.snapshot.mu.RUnlock()
+		_ = tx.Rollback()
+		return nil, nil, nil, fmt.Errorf("bucket does not exist")
+	}
+
+	seq := bucket.Sequence()
+	ref := db.snapshot.bySeq[seq]
+	if ref == nil || ref.snap == nil {
+		db.snapshot.mu.RUnlock()
+		_ = tx.Rollback()
+		if err = db.unavailableErr(); err != nil {
+			return nil, nil, nil, err
+		}
+		return nil, nil, nil, fmt.Errorf("snapshot sequence %d is not available", seq)
+	}
+	ref.refs.Add(1)
+	snap := ref.snap
+	db.snapshot.mu.RUnlock()
+	return tx, snap, ref, nil
 }
 
 func (db *DB[K, V]) queryWithTx(tx *bbolt.Tx, q *qx.QX) ([]*V, bool, error) {
-	txID := uint64(tx.ID())
+	bucket := tx.Bucket(db.bucket)
+	if bucket == nil {
+		return nil, false, fmt.Errorf("bucket does not exist")
+	}
 
-	if snap, ref, ok := db.pinSnapshotRefByTxID(txID); ok && snap != nil {
+	seq := bucket.Sequence()
+	if snap, ref, ok := db.pinSnapshotRefBySeq(seq); ok && snap != nil {
 		values, err := db.queryRecords(tx, snap, q)
 		db.unpinSnapshotRef(ref)
 		if err != nil {
@@ -55,41 +82,10 @@ func (db *DB[K, V]) queryWithTx(tx *bbolt.Tx, q *qx.QX) ([]*V, bool, error) {
 		return values, false, nil
 	}
 
-	exists, pending := db.snapshotRefStatus(txID)
-	if pending {
-		if snap, ref, ok := db.pinSnapshotRefByTxIDWait(txID); ok && snap != nil {
-			values, err := db.queryRecords(tx, snap, q)
-			db.unpinSnapshotRef(ref)
-			if err != nil {
-				return nil, false, err
-			}
-			return values, false, nil
-		}
-		if err := db.unavailableErr(); err != nil {
-			return nil, false, err
-		}
-		exists, pending = db.snapshotRefStatus(txID)
-		if pending {
-			return nil, true, nil
-		}
-	}
-
 	if err := db.unavailableErr(); err != nil {
 		return nil, false, err
 	}
-	latest := db.getSnapshot()
-	if latest == nil {
-		return nil, true, nil
-	}
-	if latest.txID == txID || (latest.txID < txID && !exists) {
-		values, err := db.queryRecords(tx, latest, q)
-		if err != nil {
-			return nil, false, err
-		}
-		return values, false, nil
-	}
-
-	return nil, true, nil
+	return nil, false, fmt.Errorf("snapshot sequence %d is not available", seq)
 }
 
 func (db *DB[K, V]) queryRecords(tx *bbolt.Tx, snap *indexSnapshot, q *qx.QX) ([]*V, error) {

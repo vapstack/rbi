@@ -92,7 +92,6 @@ type SnapshotMemoryStats struct {
 	HasDelta          bool   `json:"has_delta"`
 	RegistrySize      int    `json:"registry_size"`
 	PinnedRefs        int    `json:"pinned_refs"`
-	PendingRefs       int    `json:"pending_refs"`
 	IndexLayerDepth   int    `json:"index_layer_depth"`
 	LenLayerDepth     int    `json:"len_layer_depth"`
 	IndexDeltaFields  int    `json:"index_delta_fields"`

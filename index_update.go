@@ -605,7 +605,10 @@ func (delta *preparedSnapshotDelta) releaseTransientUniverse() {
 func (db *DB[K, V]) prepareSnapshotWriteDeltaPrepared(prepared []autoBatchPrepared[K, V]) preparedSnapshotDelta {
 	db.mu.RLock()
 	defer db.mu.RUnlock()
+	return db.prepareSnapshotWriteDeltaPreparedNoLock(prepared)
+}
 
+func (db *DB[K, V]) prepareSnapshotWriteDeltaPreparedNoLock(prepared []autoBatchPrepared[K, V]) preparedSnapshotDelta {
 	indexChanges := getWriteDeltaOuterMap()
 	nilChanges := getWriteDeltaOuterMap()
 	lenChanges := getWriteDeltaOuterMap()
@@ -670,7 +673,10 @@ func (db *DB[K, V]) prepareSnapshotWriteDeltaPrepared(prepared []autoBatchPrepar
 func (db *DB[K, V]) prepareSnapshotWriteDeltaBatch(idxs []uint64, oldVals, newVals []*V, modified [][]string) preparedSnapshotDelta {
 	db.mu.RLock()
 	defer db.mu.RUnlock()
+	return db.prepareSnapshotWriteDeltaBatchNoLock(idxs, oldVals, newVals, modified)
+}
 
+func (db *DB[K, V]) prepareSnapshotWriteDeltaBatchNoLock(idxs []uint64, oldVals, newVals []*V, modified [][]string) preparedSnapshotDelta {
 	indexChanges := getWriteDeltaOuterMap()
 	nilChanges := getWriteDeltaOuterMap()
 	lenChanges := getWriteDeltaOuterMap()
@@ -741,7 +747,10 @@ func (db *DB[K, V]) prepareSnapshotWriteDeltaBatch(idxs []uint64, oldVals, newVa
 func (db *DB[K, V]) prepareSnapshotWriteDelta(idx uint64, oldVal, newVal *V, modified []string) preparedSnapshotDelta {
 	db.mu.RLock()
 	defer db.mu.RUnlock()
+	return db.prepareSnapshotWriteDeltaNoLock(idx, oldVal, newVal, modified)
+}
 
+func (db *DB[K, V]) prepareSnapshotWriteDeltaNoLock(idx uint64, oldVal, newVal *V, modified []string) preparedSnapshotDelta {
 	indexChanges := getWriteDeltaOuterMap()
 	nilChanges := getWriteDeltaOuterMap()
 	lenChanges := getWriteDeltaOuterMap()
@@ -791,7 +800,7 @@ func (db *DB[K, V]) prepareSnapshotWriteDelta(idx uint64, oldVal, newVal *V, mod
 	return delta
 }
 
-func (db *DB[K, V]) publishWriteDeltaBatch(txID uint64, idxs []uint64, oldVals, newVals []*V, modified [][]string) {
+func (db *DB[K, V]) publishWriteDeltaBatch(seq uint64, idxs []uint64, oldVals, newVals []*V, modified [][]string) {
 	indexChanges := getWriteDeltaOuterMap()
 	defer releaseWriteDeltaOuterMap(indexChanges)
 	nilChanges := getWriteDeltaOuterMap()
@@ -852,7 +861,7 @@ func (db *DB[K, V]) publishWriteDeltaBatch(txID uint64, idxs []uint64, oldVals, 
 		}
 	}
 
-	db.publishSnapshotWithAccumDeltaNoLock(txID, indexChanges, nilChanges, lenChanges, add, rem)
+	db.publishSnapshotWithAccumDeltaNoLock(seq, indexChanges, nilChanges, lenChanges, add, rem)
 }
 
 func countDistinct(s []string) int {
@@ -949,7 +958,7 @@ func (db *DB[K, V]) checkUniqueSingleCandidate(idx uint64, ptr unsafe.Pointer, a
 	return fmt.Errorf("%w: value for field %v already exists", ErrUniqueViolation, acc.name)
 }
 
-func (db *DB[K, V]) publishWriteDelta(txID uint64, idx uint64, oldVal, newVal *V, modified []string) {
+func (db *DB[K, V]) publishWriteDelta(seq uint64, idx uint64, oldVal, newVal *V, modified []string) {
 	indexChanges := getWriteDeltaOuterMap()
 	defer releaseWriteDeltaOuterMap(indexChanges)
 	nilChanges := getWriteDeltaOuterMap()
@@ -993,7 +1002,7 @@ func (db *DB[K, V]) publishWriteDelta(txID uint64, idx uint64, oldVal, newVal *V
 	}
 
 	db.publishSnapshotWithAccumDeltaNoLock(
-		txID,
+		seq,
 		indexChanges,
 		nilChanges,
 		lenChanges,

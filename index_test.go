@@ -699,7 +699,7 @@ func TestReadMethods_ReturnErrorWhenBucketMissing(t *testing.T) {
 	expectBucketErr("Query", err)
 }
 
-func TestQuery_MissingBucket_EmptyIndexResultSkipsBucketRead(t *testing.T) {
+func TestQuery_MissingBucket_EmptyIndexResultStillRequiresSequenceTx(t *testing.T) {
 	db, _ := openTempDBUint64(t)
 	if err := db.Set(1, &Rec{Name: "alice", Age: 30}); err != nil {
 		t.Fatalf("Set: %v", err)
@@ -715,11 +715,8 @@ func TestQuery_MissingBucket_EmptyIndexResultSkipsBucketRead(t *testing.T) {
 	}
 
 	items, err := db.Query(qx.Query(qx.EQ("age", 999_999)))
-	if err != nil {
-		t.Fatalf("Query(empty result on missing bucket): %v", err)
-	}
-	if len(items) != 0 {
-		t.Fatalf("expected empty items, got: %#v", items)
+	if err == nil {
+		t.Fatalf("expected missing bucket error, got items=%#v", items)
 	}
 }
 

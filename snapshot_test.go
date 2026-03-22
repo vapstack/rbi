@@ -1,7 +1,6 @@
 package rbi
 
 import (
-	"errors"
 	"fmt"
 	"path/filepath"
 	"slices"
@@ -50,61 +49,71 @@ func snapshotTestWaitTimeout(timeout time.Duration) time.Duration {
 	return scaled
 }
 
-func TestSnapshotTxID_PublishedOnWrite(t *testing.T) {
+func mustCurrentBucketSequence(t *testing.T, db *DB[uint64, Rec]) uint64 {
+	t.Helper()
+
+	seq, err := db.currentBucketSequence()
+	if err != nil {
+		t.Fatalf("currentBucketSequence: %v", err)
+	}
+	return seq
+}
+
+func TestSnapshotSequence_PublishedOnWrite(t *testing.T) {
 	db, _ := openTempDBUint64(t)
 
-	before := db.getSnapshot().txID
+	before := db.getSnapshot().seq
 
 	if err := db.Set(1, &Rec{Name: "alice", Age: 30}); err != nil {
 		t.Fatalf("Set: %v", err)
 	}
 
-	after := db.getSnapshot().txID
+	after := db.getSnapshot().seq
 	if after <= before {
-		t.Fatalf("snapshot txID did not advance: before=%d after=%d", before, after)
+		t.Fatalf("snapshot sequence did not advance: before=%d after=%d", before, after)
 	}
 
-	cur := db.currentBoltTxID()
+	cur := mustCurrentBucketSequence(t, db)
 	if after != cur {
-		t.Fatalf("snapshot txID mismatch with bolt txID: snapshot=%d bolt=%d", after, cur)
+		t.Fatalf("snapshot sequence mismatch with bolt seq: snapshot=%d bolt=%d", after, cur)
 	}
 }
 
-func TestSnapshotTxID_PreviousTxRemainsPinable(t *testing.T) {
+func TestSnapshotSequence_PreviousTxRemainsPinable(t *testing.T) {
 	db, _ := openTempDBUint64(t)
 
 	if err := db.Set(1, &Rec{Name: "seed", Age: 10}); err != nil {
 		t.Fatalf("seed Set: %v", err)
 	}
 
-	oldTxID := db.getSnapshot().txID
+	oldSequence := db.getSnapshot().seq
 
 	if err := db.Set(2, &Rec{Name: "new", Age: 20}); err != nil {
 		t.Fatalf("concurrent Set: %v", err)
 	}
 
-	latest := db.getSnapshot().txID
-	if latest <= oldTxID {
-		t.Fatalf("latest txID did not advance: old=%d latest=%d", oldTxID, latest)
+	latest := db.getSnapshot().seq
+	if latest <= oldSequence {
+		t.Fatalf("latest sequence did not advance: old=%d latest=%d", oldSequence, latest)
 	}
 
-	if _, ref, ok := db.pinSnapshotRefByTxID(oldTxID); !ok {
-		t.Fatalf("previous snapshot disappeared: txID=%d", oldTxID)
+	if _, ref, ok := db.pinSnapshotRefBySeq(oldSequence); !ok {
+		t.Fatalf("previous snapshot disappeared: sequence=%d", oldSequence)
 	} else {
 		db.unpinSnapshotRef(ref)
 	}
 }
 
-func TestSnapshotTxID_AdvancesOnWrite(t *testing.T) {
+func TestSnapshotSequence_AdvancesOnWrite(t *testing.T) {
 	db, _ := openTempDBUint64(t)
 
-	before := db.getSnapshot().txID
+	before := db.getSnapshot().seq
 	if err := db.Set(1, &Rec{Name: "x", Age: 1}); err != nil {
 		t.Fatalf("Set: %v", err)
 	}
-	after := db.getSnapshot().txID
+	after := db.getSnapshot().seq
 	if after <= before {
-		t.Fatalf("snapshot txID did not advance on write: before=%d after=%d", before, after)
+		t.Fatalf("snapshot sequence did not advance on write: before=%d after=%d", before, after)
 	}
 }
 
@@ -833,7 +842,7 @@ func TestSnapshotDelta_DecideOrderedByCost_UsesOverlayWhenBaseOrderSliceEmpty(t 
 
 	emptyAgeBase := []index{}
 	viewSnap := &indexSnapshot{
-		txID:         s.txID,
+		seq:          s.seq,
 		index:        s.index,
 		indexView:    map[string]*[]index{"age": &emptyAgeBase},
 		lenIndex:     s.lenIndex,
@@ -1276,11 +1285,11 @@ func TestSnapshotCompactor_IdlePrunesRegistryToLatest(t *testing.T) {
 		db.snapshot.mu.RLock()
 		defer db.snapshot.mu.RUnlock()
 
-		if len(db.snapshot.byTx) != 1 {
+		if len(db.snapshot.bySeq) != 1 {
 			return false
 		}
-		latest := db.getSnapshot().txID
-		ref := db.snapshot.byTx[latest]
+		latest := db.getSnapshot().seq
+		ref := db.snapshot.bySeq[latest]
 		return ref != nil && ref.snap != nil && ref.refs.Load() == 0
 	})
 }
@@ -1300,10 +1309,10 @@ func TestSnapshotCompactor_IdlePrunesAfterPinnedSnapshotReleased(t *testing.T) {
 	if err := db.Set(1, &Rec{Name: "u-1", Age: 1}); err != nil {
 		t.Fatalf("Set #1: %v", err)
 	}
-	pinnedTx := db.getSnapshot().txID
-	_, ref, ok := db.pinSnapshotRefByTxID(pinnedTx)
+	pinnedTx := db.getSnapshot().seq
+	_, ref, ok := db.pinSnapshotRefBySeq(pinnedTx)
 	if !ok {
-		t.Fatalf("pinByTxID(%d) failed", pinnedTx)
+		t.Fatalf("pinBySequence(%d) failed", pinnedTx)
 	}
 
 	if err := db.Set(2, &Rec{Name: "u-2", Age: 2}); err != nil {
@@ -1318,8 +1327,8 @@ func TestSnapshotCompactor_IdlePrunesAfterPinnedSnapshotReleased(t *testing.T) {
 	waitForSnapshotState(t, 700*time.Millisecond, "registry pruned after pinned release", func() bool {
 		db.snapshot.mu.RLock()
 		defer db.snapshot.mu.RUnlock()
-		latest := db.getSnapshot().txID
-		return len(db.snapshot.byTx) == 1 && db.snapshot.byTx[pinnedTx] == nil && db.snapshot.byTx[latest] != nil
+		latest := db.getSnapshot().seq
+		return len(db.snapshot.bySeq) == 1 && db.snapshot.bySeq[pinnedTx] == nil && db.snapshot.bySeq[latest] != nil
 	})
 }
 
@@ -1377,67 +1386,54 @@ func TestOverlayDistinctCount_ExcludesFullyDeletedBucket(t *testing.T) {
 	}
 }
 
-func TestPinSnapshotByTxIDWait_FailsFastWhenLatestPassedTarget(t *testing.T) {
+func TestPinSnapshotBySequenceWait_FailsFastWhenLatestPassedTarget(t *testing.T) {
 	db, _ := openTempDBUint64(t)
 	if err := db.Set(1, &Rec{Name: "a", Age: 10}); err != nil {
 		t.Fatalf("Set 1: %v", err)
 	}
-	targetTx := db.getSnapshot().txID
+	targetTx := db.getSnapshot().seq
 
 	if err := db.Set(2, &Rec{Name: "b", Age: 20}); err != nil {
 		t.Fatalf("Set 2: %v", err)
 	}
-	latestTx := db.getSnapshot().txID
+	latestTx := db.getSnapshot().seq
 	if latestTx <= targetTx {
-		t.Fatalf("expected latest txID > target txID, got latest=%d target=%d", latestTx, targetTx)
+		t.Fatalf("expected latest sequence > target sequence, got latest=%d target=%d", latestTx, targetTx)
 	}
 
 	db.snapshot.mu.Lock()
-	delete(db.snapshot.byTx, targetTx)
+	delete(db.snapshot.bySeq, targetTx)
 	db.snapshot.mu.Unlock()
 
 	start := time.Now()
-	snap, _, ok := db.pinSnapshotRefByTxIDWait(targetTx)
+	snap, _, ok := db.pinSnapshotRefBySeq(targetTx)
 	elapsed := time.Since(start)
 	if ok || snap != nil {
-		t.Fatalf("expected pin wait to fail for missing old txID=%d", targetTx)
+		t.Fatalf("expected pin wait to fail for missing old sequence=%d", targetTx)
 	}
 	if elapsed >= 250*time.Millisecond {
 		t.Fatalf("expected fast failure, elapsed=%v", elapsed)
 	}
 }
 
-func TestQuery_RetriesWithNewTxWhenSnapshotMissingForCurrentTx(t *testing.T) {
+func TestQuery_FailsWhenSnapshotMissingForCurrentSequence(t *testing.T) {
 	db, _ := openTempDBUint64(t)
 	if err := db.Set(1, &Rec{Name: "alice", Age: 10}); err != nil {
 		t.Fatalf("Set seed: %v", err)
 	}
 
-	missingTx := db.getSnapshot().txID
+	missingSeq := db.getSnapshot().seq
 	db.snapshot.mu.Lock()
-	delete(db.snapshot.byTx, missingTx)
+	delete(db.snapshot.bySeq, missingSeq)
 	db.snapshot.mu.Unlock()
 
-	writeErr := make(chan error, 1)
-	go func() {
-		time.Sleep(20 * time.Millisecond)
-		writeErr <- db.Set(2, &Rec{Name: "bob", Age: 30})
-	}()
-
 	items, err := db.Query(qx.Query(qx.EQ("name", "alice")))
-	if err != nil {
-		t.Fatalf("Query: %v", err)
-	}
-	if len(items) != 1 || items[0] == nil || items[0].Name != "alice" {
-		t.Fatalf("unexpected Query result: %#v", items)
-	}
-
-	if err = <-writeErr; err != nil {
-		t.Fatalf("writer Set: %v", err)
+	if err == nil {
+		t.Fatalf("expected snapshot sequence error, got items=%#v", items)
 	}
 }
 
-func TestQuery_UsesLatestSnapshotWhenBoltTxAheadAndNotPending(t *testing.T) {
+func TestQuery_IgnoresExternalWritesToOtherBuckets(t *testing.T) {
 	db, _ := openTempDBUint64(t)
 	if err := db.Set(1, &Rec{Name: "alice", Age: 10}); err != nil {
 		t.Fatalf("Set seed: %v", err)
@@ -1464,11 +1460,11 @@ func TestQuery_UsesLatestSnapshotWhenBoltTxAheadAndNotPending(t *testing.T) {
 		t.Fatalf("unexpected Query result: %#v", items)
 	}
 	if elapsed >= 150*time.Millisecond {
-		t.Fatalf("expected fast fallback, elapsed=%v", elapsed)
+		t.Fatalf("expected fast query independent of external bucket writes, elapsed=%v", elapsed)
 	}
 }
 
-func TestQuery_UsesLatestSnapshotWhenRegistryHasHoleForCurrentTx(t *testing.T) {
+func TestQuery_FailsWhenRegistryHasHoleForCurrentSequence(t *testing.T) {
 	db, _ := openTempDBUint64(t)
 	if err := db.Set(1, &Rec{Name: "alice", Age: 10}); err != nil {
 		t.Fatalf("Set alice: %v", err)
@@ -1476,28 +1472,19 @@ func TestQuery_UsesLatestSnapshotWhenRegistryHasHoleForCurrentTx(t *testing.T) {
 	if err := db.Set(2, &Rec{Name: "bob", Age: 20}); err != nil {
 		t.Fatalf("Set bob: %v", err)
 	}
-	targetTx := db.getSnapshot().txID
+	targetSeq := db.getSnapshot().seq
 
 	db.snapshot.mu.Lock()
-	delete(db.snapshot.byTx, targetTx)
+	delete(db.snapshot.bySeq, targetSeq)
 	db.snapshot.mu.Unlock()
 
-	start := time.Now()
 	items, err := db.Query(qx.Query(qx.EQ("name", "bob")))
-	elapsed := time.Since(start)
-
-	if err != nil {
-		t.Fatalf("Query: %v", err)
-	}
-	if len(items) != 1 || items[0] == nil || items[0].Name != "bob" {
-		t.Fatalf("unexpected Query result: %#v", items)
-	}
-	if elapsed >= 150*time.Millisecond {
-		t.Fatalf("expected fast fallback for registry hole, elapsed=%v", elapsed)
+	if err == nil {
+		t.Fatalf("expected snapshot sequence error, got items=%#v", items)
 	}
 }
 
-func TestQueryWithTx_RetriesWhenSnapshotMissingAndLatestIsNewer(t *testing.T) {
+func TestQueryWithTx_FailsWhenSnapshotMissingAndLatestIsNewer(t *testing.T) {
 	db, _ := openTempDBUint64(t)
 	if err := db.Set(1, &Rec{Name: "alice", Age: 10}); err != nil {
 		t.Fatalf("Set alice: %v", err)
@@ -1509,28 +1496,22 @@ func TestQueryWithTx_RetriesWhenSnapshotMissingAndLatestIsNewer(t *testing.T) {
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	oldTxID := uint64(tx.ID())
-	next := &indexSnapshot{txID: oldTxID + 1}
+	oldSeq := tx.Bucket(db.bucket).Sequence()
+	next := &indexSnapshot{seq: oldSeq + 1}
 	db.registerSnapshot(next)
 	db.snapshot.current.Store(next)
 
 	db.snapshot.mu.Lock()
-	delete(db.snapshot.byTx, oldTxID)
+	delete(db.snapshot.bySeq, oldSeq)
 	db.snapshot.mu.Unlock()
 
 	items, retry, err := db.queryWithTx(tx, qx.Query(qx.EQ("name", "alice")))
-	if err != nil {
-		t.Fatalf("queryWithTx: %v", err)
-	}
-	if !retry {
-		t.Fatalf("expected retry instead of stale snapshot fallback, items=%#v", items)
-	}
-	if items != nil {
-		t.Fatalf("expected no result payload on retry, got %#v", items)
+	if err == nil {
+		t.Fatalf("expected snapshot sequence error, got items=%#v retry=%v", items, retry)
 	}
 }
 
-func TestQueryWithTx_DoesNotFallbackToOlderSnapshotWhilePending(t *testing.T) {
+func TestQueryWithTx_UsesPendingSequenceSnapshotWithoutWaiting(t *testing.T) {
 	db, raw := openBoltAndNew[uint64, Rec](t, filepath.Join(t.TempDir(), "pending-stale.db"))
 	defer func() { _ = raw.Close() }()
 
@@ -1538,6 +1519,7 @@ func TestQueryWithTx_DoesNotFallbackToOlderSnapshotWhilePending(t *testing.T) {
 	if err := db.Set(1, &Rec{Name: "alice", Age: 10}); err != nil {
 		t.Fatalf("Set alice: %v", err)
 	}
+	latest := db.getSnapshot()
 
 	tx, err := raw.Begin(false)
 	if err != nil {
@@ -1545,94 +1527,76 @@ func TestQueryWithTx_DoesNotFallbackToOlderSnapshotWhilePending(t *testing.T) {
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	targetTxID := uint64(tx.ID())
+	targetSeq := tx.Bucket(db.bucket).Sequence()
+	if latest.seq != targetSeq {
+		t.Fatalf("snapshot sequence mismatch: latest=%d tx=%d", latest.seq, targetSeq)
+	}
 	db.snapshot.current.Store(stale)
-	db.snapshot.mu.Lock()
-	delete(db.snapshot.byTx, targetTxID)
-	db.snapshot.mu.Unlock()
-	db.markPending(targetTxID)
-
-	done := make(chan struct{})
-	go func() {
-		time.Sleep(20 * time.Millisecond)
-		_ = db.tripBrokenLocked("test", "synthetic pending publish failure")
-		db.clearPending(targetTxID)
-		close(done)
-	}()
+	db.stageSnapshot(latest)
 
 	items, retry, err := db.queryWithTx(tx, qx.Query(qx.EQ("name", "alice")))
-	if !errors.Is(err, ErrBroken) {
-		t.Fatalf("expected ErrBroken instead of stale fallback, got items=%#v retry=%v err=%v", items, retry, err)
+	if err != nil {
+		t.Fatalf("expected staged sequence snapshot to be used, got items=%#v retry=%v err=%v", items, retry, err)
 	}
 	if retry {
-		t.Fatalf("expected broken state to fail queryWithTx, not request retry")
+		t.Fatalf("expected no retry for staged sequence snapshot")
 	}
-	if items != nil {
-		t.Fatalf("expected no items on broken state, got %#v", items)
+	if len(items) != 1 || items[0] == nil || items[0].Name != "alice" {
+		t.Fatalf("unexpected items: %#v", items)
 	}
-	<-done
 }
 
-func TestPinSnapshotByTxIDWait_FailsFastWhenTargetAheadAndNotPending(t *testing.T) {
+func TestPinSnapshotBySequenceWait_FailsFastWhenTargetAheadAndNotPending(t *testing.T) {
 	db, _ := openTempDBUint64(t)
 	if err := db.Set(1, &Rec{Name: "seed", Age: 10}); err != nil {
 		t.Fatalf("Set: %v", err)
 	}
-	latest := db.getSnapshot().txID
+	latest := db.getSnapshot().seq
 	target := latest + 100
 
 	start := time.Now()
-	snap, _, ok := db.pinSnapshotRefByTxIDWait(target)
+	snap, _, ok := db.pinSnapshotRefBySeq(target)
 	elapsed := time.Since(start)
 	if ok || snap != nil {
-		t.Fatalf("expected fast fail for non-pending future txID=%d", target)
+		t.Fatalf("expected fast fail for non-existent future sequence=%d", target)
 	}
 	if elapsed >= 250*time.Millisecond {
 		t.Fatalf("expected fast failure, elapsed=%v", elapsed)
 	}
 }
 
-func TestPinSnapshotByTxIDWait_WaitsForPendingAndSucceeds(t *testing.T) {
+func TestPinSnapshotBySequenceWait_PinsPendingSnapshotImmediately(t *testing.T) {
 	db, _ := openTempDBUint64(t)
 	if err := db.Set(1, &Rec{Name: "seed", Age: 10}); err != nil {
 		t.Fatalf("Set: %v", err)
 	}
-	latest := db.getSnapshot().txID
+	latest := db.getSnapshot().seq
 	target := latest + 1
-	db.markPending(target)
-	defer db.clearPending(target)
+	db.stageSnapshot(&indexSnapshot{seq: target})
 
-	done := make(chan struct{})
-	go func() {
-		time.Sleep(30 * time.Millisecond)
-		db.registerSnapshot(&indexSnapshot{txID: target})
-		close(done)
-	}()
-
-	snap, ref, ok := db.pinSnapshotRefByTxIDWait(target)
+	snap, ref, ok := db.pinSnapshotRefBySeq(target)
 	if !ok || snap == nil {
-		t.Fatalf("expected pending txID pin to succeed")
+		t.Fatalf("expected staged sequence pin to succeed immediately")
 	}
 	db.unpinSnapshotRef(ref)
-	<-done
 }
 
-func TestPinSnapshotByTxIDWait_FailsFastWhenLatestEqualsTargetButRegistryMissing(t *testing.T) {
+func TestPinSnapshotBySequenceWait_FailsFastWhenLatestEqualsTargetButRegistryMissing(t *testing.T) {
 	db, _ := openTempDBUint64(t)
 	if err := db.Set(1, &Rec{Name: "seed", Age: 10}); err != nil {
 		t.Fatalf("Set: %v", err)
 	}
-	target := db.getSnapshot().txID
+	target := db.getSnapshot().seq
 
 	db.snapshot.mu.Lock()
-	delete(db.snapshot.byTx, target)
+	delete(db.snapshot.bySeq, target)
 	db.snapshot.mu.Unlock()
 
 	start := time.Now()
-	snap, _, ok := db.pinSnapshotRefByTxIDWait(target)
+	snap, _, ok := db.pinSnapshotRefBySeq(target)
 	elapsed := time.Since(start)
 	if ok || snap != nil {
-		t.Fatalf("expected fast fail for missing current txID=%d", target)
+		t.Fatalf("expected fast fail for missing current sequence=%d", target)
 	}
 	if elapsed >= 250*time.Millisecond {
 		t.Fatalf("expected fast failure, elapsed=%v", elapsed)
@@ -1647,9 +1611,9 @@ func TestSnapshotRegistry_PrunesPastPinnedHead(t *testing.T) {
 	if err := db.Set(1, &Rec{Name: "seed", Age: 10}); err != nil {
 		t.Fatalf("seed Set: %v", err)
 	}
-	pinnedTx := db.getSnapshot().txID
-	if _, ref, ok := db.pinSnapshotRefByTxID(pinnedTx); !ok {
-		t.Fatalf("failed to pin snapshot txID=%d", pinnedTx)
+	pinnedTx := db.getSnapshot().seq
+	if _, ref, ok := db.pinSnapshotRefBySeq(pinnedTx); !ok {
+		t.Fatalf("failed to pin snapshot sequence=%d", pinnedTx)
 	} else {
 		defer db.unpinSnapshotRef(ref)
 	}
@@ -1661,12 +1625,12 @@ func TestSnapshotRegistry_PrunesPastPinnedHead(t *testing.T) {
 	}
 
 	db.snapshot.mu.Lock()
-	mapLen := len(db.snapshot.byTx)
-	_, pinnedStillExists := db.snapshot.byTx[pinnedTx]
+	mapLen := len(db.snapshot.bySeq)
+	_, pinnedStillExists := db.snapshot.bySeq[pinnedTx]
 	db.snapshot.mu.Unlock()
 
 	if !pinnedStillExists {
-		t.Fatalf("pinned snapshot disappeared: txID=%d", pinnedTx)
+		t.Fatalf("pinned snapshot disappeared: sequence=%d", pinnedTx)
 	}
 	if mapLen > maxRegistry+2 {
 		t.Fatalf("snapshot registry grew unexpectedly: len=%d max=%d", mapLen, maxRegistry)
@@ -1680,7 +1644,7 @@ func TestSnapshotRegistry_CompactsHugeOrderWithPinnedHead(t *testing.T) {
 	})
 
 	db.snapshot.mu.Lock()
-	db.snapshot.byTx = make(map[uint64]*snapshotRef, 8)
+	db.snapshot.bySeq = make(map[uint64]*snapshotRef, 8)
 	db.snapshot.order = db.snapshot.order[:0]
 	db.snapshot.head = 0
 
@@ -1688,19 +1652,19 @@ func TestSnapshotRegistry_CompactsHugeOrderWithPinnedHead(t *testing.T) {
 		db.snapshot.order = append(db.snapshot.order, tx)
 	}
 
-	head := &snapshotRef{snap: &indexSnapshot{txID: 1}}
+	head := &snapshotRef{snap: &indexSnapshot{seq: 1}}
 	head.refs.Add(1) // keep head pinned
-	db.snapshot.byTx[1] = head
-	db.snapshot.byTx[2045] = &snapshotRef{snap: &indexSnapshot{txID: 2045}}
-	db.snapshot.byTx[2046] = &snapshotRef{snap: &indexSnapshot{txID: 2046}}
-	db.snapshot.byTx[2047] = &snapshotRef{snap: &indexSnapshot{txID: 2047}}
-	db.snapshot.byTx[2048] = &snapshotRef{snap: &indexSnapshot{txID: 2048}}
-	db.snapshot.current.Store(&indexSnapshot{txID: 2048})
+	db.snapshot.bySeq[1] = head
+	db.snapshot.bySeq[2045] = &snapshotRef{snap: &indexSnapshot{seq: 2045}}
+	db.snapshot.bySeq[2046] = &snapshotRef{snap: &indexSnapshot{seq: 2046}}
+	db.snapshot.bySeq[2047] = &snapshotRef{snap: &indexSnapshot{seq: 2047}}
+	db.snapshot.bySeq[2048] = &snapshotRef{snap: &indexSnapshot{seq: 2048}}
+	db.snapshot.current.Store(&indexSnapshot{seq: 2048})
 
 	before := len(db.snapshot.order)
 	db.pruneSnapshotsLocked()
 	after := len(db.snapshot.order)
-	mapLen := len(db.snapshot.byTx)
+	mapLen := len(db.snapshot.bySeq)
 	db.snapshot.mu.Unlock()
 
 	if before < 2000 {

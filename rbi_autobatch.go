@@ -793,13 +793,28 @@ func (db *DB[K, V]) executeAutoBatchAttempt(active []*autoBatchRequest[K, V]) (*
 		return nil, true, err
 	}
 
-	txID := uint64(tx.ID())
-	db.markPending(txID)
+	publishDelta := &preparedDelta
+	publishDeltaOwned := false
+	var acceptedDelta preparedSnapshotDelta
+	if len(accepted) != len(prepared) {
+		acceptedDelta = db.prepareSnapshotWriteDeltaPreparedNoLock(accepted)
+		publishDelta = &acceptedDelta
+		publishDeltaOwned = true
+	}
+	defer func() {
+		if publishDeltaOwned {
+			acceptedDelta.release()
+		}
+	}()
+
+	seq := bucket.Sequence()
+	snap := db.buildPreparedSnapshotWithAccumDeltaNoLock(seq, publishDelta)
+	db.stageSnapshot(snap)
 	if err = db.commit(tx, "batch"); err != nil {
 		if stats {
 			db.autoBatcher.txCommitErrors.Add(1)
 		}
-		db.clearPending(txID)
+		db.dropStagedSnapshot(seq)
 		rollbackCreated(accepted)
 		db.mu.Unlock()
 		for _, op := range accepted {
@@ -810,27 +825,16 @@ func (db *DB[K, V]) executeAutoBatchAttempt(active []*autoBatchRequest[K, V]) (*
 		return nil, true, nil
 	}
 	committed = true
-	if len(accepted) == len(prepared) {
-		err = db.publishAfterCommitLocked(txID, "batch", func() {
-			db.publishPreparedSnapshotWithAccumDeltaNoLock(txID, &preparedDelta)
-		})
-		if err == nil {
+	err = db.publishAfterCommitLocked(seq, "batch", func() {
+		db.finishSnapshotPublishNoLock(snap, publishDelta.indexDelta, publishDelta.nilDelta, publishDelta.lenDelta, publishDelta.universeAdd, publishDelta.universeRem)
+		publishDelta.releaseTransientUniverse()
+	})
+	if err == nil {
+		if len(accepted) == len(prepared) {
 			preparedDeltaOwned = false
+		} else {
+			publishDeltaOwned = false
 		}
-	} else {
-		idxs := make([]uint64, len(accepted))
-		oldVals := make([]*V, len(accepted))
-		newVals := make([]*V, len(accepted))
-		modified := make([][]string, len(accepted))
-		for i, op := range accepted {
-			idxs[i] = op.idx
-			oldVals[i] = op.oldVal
-			newVals[i] = op.newVal
-			modified[i] = op.modified
-		}
-		err = db.publishAfterCommitLocked(txID, "batch", func() {
-			db.publishWriteDeltaBatch(txID, idxs, oldVals, newVals, modified)
-		})
 	}
 	if err != nil {
 		db.mu.Unlock()

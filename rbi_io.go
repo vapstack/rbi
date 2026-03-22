@@ -449,23 +449,33 @@ func (db *DB[K, V]) Set(id K, newVal *V, execOpts ...ExecOption[K, V]) error {
 			return err
 		}
 	}
+	delta := db.prepareSnapshotWriteDeltaNoLock(idx, oldVal, storedVal, modified)
+	deltaOwned := true
+	defer func() {
+		if deltaOwned {
+			delta.release()
+		}
+	}()
 	if err = advanceBucketSequence(bucket); err != nil {
 		return err
 	}
 
-	txID := uint64(tx.ID())
-	db.markPending(txID)
+	seq := bucket.Sequence()
+	snap := db.buildPreparedSnapshotWithAccumDeltaNoLock(seq, &delta)
+	db.stageSnapshot(snap)
 
 	if err = db.commit(tx, "set"); err != nil {
-		db.clearPending(txID)
+		db.dropStagedSnapshot(seq)
 		return err
 	}
 	cleanupOnErr = false
-	if err = db.publishAfterCommitLocked(txID, "set", func() {
-		db.publishWriteDelta(txID, idx, oldVal, storedVal, modified)
+	if err = db.publishAfterCommitLocked(seq, "set", func() {
+		db.finishSnapshotPublishNoLock(snap, delta.indexDelta, delta.nilDelta, delta.lenDelta, delta.universeAdd, delta.universeRem)
+		delta.releaseTransientUniverse()
 	}); err != nil {
 		return err
 	}
+	deltaOwned = false
 	return nil
 }
 
@@ -674,23 +684,33 @@ func (db *DB[K, V]) BatchSet(ids []K, newVals []*V, execOpts ...ExecOption[K, V]
 			return err
 		}
 	}
+	delta := db.prepareSnapshotWriteDeltaBatchNoLock(idxs, oldVals, storedVals, modified)
+	deltaOwned := true
+	defer func() {
+		if deltaOwned {
+			delta.release()
+		}
+	}()
 	if err = advanceBucketSequence(bucket); err != nil {
 		return err
 	}
 
-	txID := uint64(tx.ID())
-	db.markPending(txID)
+	seq := bucket.Sequence()
+	snap := db.buildPreparedSnapshotWithAccumDeltaNoLock(seq, &delta)
+	db.stageSnapshot(snap)
 
 	if err = db.commit(tx, "batch_set"); err != nil {
-		db.clearPending(txID)
+		db.dropStagedSnapshot(seq)
 		return err
 	}
 	cleanupOnErr = false
-	if err = db.publishAfterCommitLocked(txID, "batch_set", func() {
-		db.publishWriteDeltaBatch(txID, idxs, oldVals, storedVals, modified)
+	if err = db.publishAfterCommitLocked(seq, "batch_set", func() {
+		db.finishSnapshotPublishNoLock(snap, delta.indexDelta, delta.nilDelta, delta.lenDelta, delta.universeAdd, delta.universeRem)
+		delta.releaseTransientUniverse()
 	}); err != nil {
 		return err
 	}
+	deltaOwned = false
 	return nil
 }
 
@@ -815,15 +835,17 @@ func (db *DB[K, V]) patch(id K, fields []Field, execOpts ...ExecOption[K, V]) er
 		return err
 	}
 
-	txID := uint64(tx.ID())
-	db.markPending(txID)
+	seq := bucket.Sequence()
+	snap := db.buildPreparedSnapshotWithAccumDeltaNoLock(seq, &delta)
+	db.stageSnapshot(snap)
 
 	if err = db.commit(tx, "patch"); err != nil {
-		db.clearPending(txID)
+		db.dropStagedSnapshot(seq)
 		return err
 	}
-	if err = db.publishAfterCommitLocked(txID, "patch", func() {
-		db.publishPreparedSnapshotWithAccumDeltaNoLock(txID, &delta)
+	if err = db.publishAfterCommitLocked(seq, "patch", func() {
+		db.finishSnapshotPublishNoLock(snap, delta.indexDelta, delta.nilDelta, delta.lenDelta, delta.universeAdd, delta.universeRem)
+		delta.releaseTransientUniverse()
 	}); err != nil {
 		return err
 	}
@@ -983,15 +1005,17 @@ func (db *DB[K, V]) batchPatch(ids []K, patch []Field, execOpts ...ExecOption[K,
 		return err
 	}
 
-	txID := uint64(tx.ID())
-	db.markPending(txID)
+	seq := bucket.Sequence()
+	snap := db.buildPreparedSnapshotWithAccumDeltaNoLock(seq, &delta)
+	db.stageSnapshot(snap)
 
 	if err = db.commit(tx, "batch_patch"); err != nil {
-		db.clearPending(txID)
+		db.dropStagedSnapshot(seq)
 		return err
 	}
-	if err = db.publishAfterCommitLocked(txID, "batch_patch", func() {
-		db.publishPreparedSnapshotWithAccumDeltaNoLock(txID, &delta)
+	if err = db.publishAfterCommitLocked(seq, "batch_patch", func() {
+		db.finishSnapshotPublishNoLock(snap, delta.indexDelta, delta.nilDelta, delta.lenDelta, delta.universeAdd, delta.universeRem)
+		delta.releaseTransientUniverse()
 	}); err != nil {
 		return err
 	}
@@ -1072,15 +1096,17 @@ func (db *DB[K, V]) Delete(id K, execOpts ...ExecOption[K, V]) error {
 		return err
 	}
 
-	txID := uint64(tx.ID())
-	db.markPending(txID)
+	seq := bucket.Sequence()
+	snap := db.buildPreparedSnapshotWithAccumDeltaNoLock(seq, &delta)
+	db.stageSnapshot(snap)
 
 	if err = db.commit(tx, "delete"); err != nil {
-		db.clearPending(txID)
+		db.dropStagedSnapshot(seq)
 		return err
 	}
-	if err = db.publishAfterCommitLocked(txID, "delete", func() {
-		db.publishPreparedSnapshotWithAccumDeltaNoLock(txID, &delta)
+	if err = db.publishAfterCommitLocked(seq, "delete", func() {
+		db.finishSnapshotPublishNoLock(snap, delta.indexDelta, delta.nilDelta, delta.lenDelta, delta.universeAdd, delta.universeRem)
+		delta.releaseTransientUniverse()
 	}); err != nil {
 		return err
 	}
@@ -1183,15 +1209,17 @@ func (db *DB[K, V]) BatchDelete(ids []K, execOpts ...ExecOption[K, V]) error {
 		return err
 	}
 
-	txID := uint64(tx.ID())
-	db.markPending(txID)
+	seq := bucket.Sequence()
+	snap := db.buildPreparedSnapshotWithAccumDeltaNoLock(seq, &delta)
+	db.stageSnapshot(snap)
 
 	if err = db.commit(tx, "batch_delete"); err != nil {
-		db.clearPending(txID)
+		db.dropStagedSnapshot(seq)
 		return err
 	}
-	if err = db.publishAfterCommitLocked(txID, "batch_delete", func() {
-		db.publishPreparedSnapshotWithAccumDeltaNoLock(txID, &delta)
+	if err = db.publishAfterCommitLocked(seq, "batch_delete", func() {
+		db.finishSnapshotPublishNoLock(snap, delta.indexDelta, delta.nilDelta, delta.lenDelta, delta.universeAdd, delta.universeRem)
+		delta.releaseTransientUniverse()
 	}); err != nil {
 		return err
 	}

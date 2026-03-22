@@ -36,7 +36,6 @@ func CaptureMemorySnapshot(db *DBHandle) *MemorySnapshot {
 				HasDelta:          stats.HasDelta,
 				RegistrySize:      stats.RegistrySize,
 				PinnedRefs:        stats.PinnedRefs,
-				PendingRefs:       stats.PendingRefs,
 				IndexLayerDepth:   stats.IndexLayerDepth,
 				LenLayerDepth:     stats.LenLayerDepth,
 				IndexDeltaFields:  stats.IndexDeltaFields,

@@ -338,9 +338,9 @@ loop:
 			if EnableSnapshotDiagnosticsLogs {
 				d := db.SnapshotStats()
 				log.Printf(
-					"[snapshot gate=%v] tx=%v depth(idx=%v len=%v) delta(idx=%v len=%v) universe(add=%v drop=%v) registry(size=%v order=%v head=%v) compactor(queue=%v req=%v run=%v try=%v ok=%v lock_miss=%v no_change=%v)",
+					"[snapshot gate=%v] seq=%v depth(idx=%v len=%v) delta(idx=%v len=%v) universe(add=%v drop=%v) registry(size=%v order=%v head=%v) compactor(queue=%v req=%v run=%v try=%v ok=%v lock_miss=%v no_change=%v)",
 					writeGateEveryN,
-					d.TxID,
+					d.Sequence,
 					d.IndexLayerDepth,
 					d.LenLayerDepth,
 					d.IndexDeltaFields,

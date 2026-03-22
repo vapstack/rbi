@@ -186,7 +186,7 @@ type Options struct {
 	// usage for broad predicates.
 	SnapshotMaterializedPredCacheMaxBitmapCardinality int
 
-	// SnapshotRegistryMax limits amount of snapshots tracked for txID pinning/floor fallback.
+	// SnapshotRegistryMax limits amount of snapshots tracked for sequence pinning.
 	//
 	// Negative value disables the cap.
 	//
@@ -555,7 +555,7 @@ func New[K ~uint64 | ~string, V any](bolt *bbolt.DB, options Options, execOpts .
 		options:     &options,
 		execOptions: defaultExecOptions,
 		snapshot: snapshot{
-			byTx:         make(map[uint64]*snapshotRef, 128),
+			bySeq:        make(map[uint64]*snapshotRef, 128),
 			statsEnabled: options.EnableSnapshotStats,
 		},
 
@@ -576,7 +576,6 @@ func New[K ~uint64 | ~string, V any](bolt *bbolt.DB, options Options, execOpts .
 		},
 	}
 	db.rebuilder.cond = sync.NewCond(&db.rebuilder.mu)
-	db.snapshot.wait = sync.NewCond(&db.snapshot.mu)
 
 	var k K
 	if reflect.TypeOf(k).Kind() == reflect.String {
@@ -639,7 +638,9 @@ func New[K ~uint64 | ~string, V any](bolt *bbolt.DB, options Options, execOpts .
 		db.fieldSlice = append(db.fieldSlice, name)
 	}
 	db.stats.FieldCount = len(db.fieldSlice)
-	db.publishSnapshotNoLock(db.currentBoltTxID())
+	if err = db.publishCurrentSequenceSnapshotNoLock(); err != nil {
+		return nil, fmt.Errorf("failed to publish initial snapshot: %w", err)
+	}
 
 	if err = db.RefreshPlannerStats(); err != nil {
 		return nil, fmt.Errorf("failed to build planner stats snapshot: %w", err)
@@ -742,7 +743,7 @@ type snapshot struct {
 	current      atomic.Pointer[indexSnapshot]
 	statsEnabled bool
 
-	byTx  map[uint64]*snapshotRef
+	bySeq map[uint64]*snapshotRef
 	order []uint64
 	head  int
 
@@ -770,8 +771,7 @@ type snapshot struct {
 	compactWriteSeq     atomic.Uint64
 	compactSkipUntil    atomic.Uint64
 
-	wait *sync.Cond
-	mu   sync.RWMutex
+	mu sync.RWMutex
 }
 
 type indexedFieldAccessor struct {
@@ -968,8 +968,8 @@ type (
 		SnapshotIndexLayerDepth int
 		// SnapshotLenLayerDepth is depth of length-index delta layer chain.
 		SnapshotLenLayerDepth int
-		// SnapshotTxID is the transaction ID of the published snapshot.
-		SnapshotTxID uint64
+		// SnapshotSequence is the bucket sequence of the published snapshot.
+		SnapshotSequence uint64
 	}
 
 	// IndexStats contains expensive index shape and memory diagnostics.
@@ -1082,8 +1082,8 @@ type (
 
 	// SnapshotStats contains copy-on-write snapshot and compactor diagnostics.
 	SnapshotStats struct {
-		// TxID is the transaction ID of the published snapshot.
-		TxID uint64
+		// Sequence is the bucket sequence of the published snapshot.
+		Sequence uint64
 
 		// HasDelta reports whether snapshot contains any delta state.
 		HasDelta bool
@@ -1107,9 +1107,9 @@ type (
 		// LenDeltaOps is total effective operations in length delta layers.
 		LenDeltaOps uint64
 
-		// UniverseAddCard is cardinality of pending universe additions.
+		// UniverseAddCard is cardinality of staged universe additions in delta state.
 		UniverseAddCard uint64
-		// UniverseRemCard is cardinality of pending universe removals.
+		// UniverseRemCard is cardinality of staged universe removals in delta state.
 		UniverseRemCard uint64
 
 		// RegistrySize is number of snapshot entries tracked in registry map.
@@ -1120,8 +1120,6 @@ type (
 		RegistryHead int
 		// PinnedRefs is number of registry snapshots with active pins.
 		PinnedRefs int
-		// PendingRefs is number of registry snapshots marked pending.
-		PendingRefs int
 
 		// CompactorQueueLen is current compactor request queue length.
 		CompactorQueueLen int
@@ -1271,6 +1269,15 @@ func (db *DB[K, V]) currentBucketSequence() (uint64, error) {
 	return seq, nil
 }
 
+func (db *DB[K, V]) publishCurrentSequenceSnapshotNoLock() error {
+	seq, err := db.currentBucketSequence()
+	if err != nil {
+		return err
+	}
+	db.publishSnapshotNoLock(seq)
+	return nil
+}
+
 func advanceBucketSequence(bucket *bbolt.Bucket) error {
 	if _, err := bucket.NextSequence(); err != nil {
 		return fmt.Errorf("advance bucket sequence: %w", err)
@@ -1281,7 +1288,6 @@ func advanceBucketSequence(bucket *bbolt.Bucket) error {
 func (db *DB[K, V]) tripBrokenLocked(op string, cause any) error {
 	if db.broken.CompareAndSwap(false, true) {
 		log.Printf("rbi: index entered broken state: post-commit snapshot publish failed (%v): %v", op, cause)
-		db.broadcastSnapshotWaiters()
 		if stop := db.planner.analyzer.stop; stop != nil {
 			select {
 			case <-stop:
@@ -1300,11 +1306,11 @@ func (db *DB[K, V]) tripBrokenLocked(op string, cause any) error {
 	return ErrBroken
 }
 
-func (db *DB[K, V]) publishAfterCommitLocked(txID uint64, op string, publish func()) (err error) {
+func (db *DB[K, V]) publishAfterCommitLocked(seq uint64, op string, publish func()) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			err = db.tripBrokenLocked(op, r)
-			db.clearPending(txID)
+			db.dropStagedSnapshot(seq)
 		}
 	}()
 	if hook := db.testHooks.afterCommitPublish; hook != nil {
@@ -1379,7 +1385,7 @@ func (db *DB[K, V]) Stats() Stats[K] {
 		out.AutoBatchAvgSize = float64(db.autoBatcher.dequeued.Load()) / float64(out.AutoBatchCount)
 	}
 
-	out.SnapshotTxID = snap.txID
+	out.SnapshotSequence = snap.seq
 	out.SnapshotHasDelta = snap.hasAnyDeltaState()
 	if snap.indexLayer != nil {
 		out.SnapshotIndexLayerDepth = snap.indexLayer.depth
@@ -1663,8 +1669,6 @@ func (db *DB[K, V]) Close() error {
 	}
 	defer unregInstance(db.bolt.Path(), string(db.bucket))
 
-	db.broadcastSnapshotWaiters()
-
 	db.stopAnalyzeLoop()
 	db.stopSnapshotCompactor()
 
@@ -1712,11 +1716,13 @@ func (db *DB[K, V]) Truncate() error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 
-	if err := db.unavailableErr(); err != nil {
+	if err = db.unavailableErr(); err != nil {
 		return err
 	}
 
-	if tx.Bucket(db.bucket) != nil {
+	prevSeq := uint64(0)
+	if bucket := tx.Bucket(db.bucket); bucket != nil {
+		prevSeq = bucket.Sequence()
 		if err = tx.DeleteBucket(db.bucket); err != nil {
 			return fmt.Errorf("error deleting bucket: %w", err)
 		}
@@ -1726,26 +1732,50 @@ func (db *DB[K, V]) Truncate() error {
 	if err != nil {
 		return fmt.Errorf("error creating bucket: %w", err)
 	}
+	if err = bucket.SetSequence(prevSeq); err != nil {
+		return fmt.Errorf("restore bucket sequence: %w", err)
+	}
 	if err = advanceBucketSequence(bucket); err != nil {
 		return err
 	}
 
-	txID := uint64(tx.ID())
-	db.markPending(txID)
+	seq := bucket.Sequence()
+	nextIndex := make(map[string]*[]index)
+	nextNilIndex := make(map[string]*[]index)
+	nextLenIndex := make(map[string]*[]index)
+	nextUniverse := roaring64.NewBitmap()
+	var nextStrMap *strMapSnapshot
+	if db.strkey {
+		nextStrMap = &strMapSnapshot{}
+	}
+	snap := &indexSnapshot{
+		seq:                             seq,
+		index:                           nextIndex,
+		nilIndex:                        nextNilIndex,
+		lenIndex:                        nextLenIndex,
+		universe:                        nextUniverse,
+		strmap:                          nextStrMap,
+		numericRangeBucketCache:         newNumericRangeBucketCache(),
+		matPredCacheMaxEntries:          max(0, db.options.SnapshotMaterializedPredCacheMaxEntries),
+		matPredCacheMaxEntriesWithDelta: max(0, db.options.SnapshotMaterializedPredCacheMaxEntriesWithDelta),
+		matPredCacheMaxBitmapCard:       materializedPredCacheMaxBitmapCardinality(db.options.SnapshotMaterializedPredCacheMaxBitmapCardinality),
+	}
+	db.stageSnapshot(snap)
 	if err = db.commit(tx, "truncate"); err != nil {
-		db.clearPending(txID)
+		db.dropStagedSnapshot(seq)
 		return fmt.Errorf("commit error: %w", err)
 	}
 
 	db.strmap.truncate()
-	db.index = make(map[string]*[]index)
-	db.lenIndex = make(map[string]*[]index)
+	db.index = nextIndex
+	db.nilIndex = nextNilIndex
+	db.lenIndex = nextLenIndex
 	db.lenZeroComplement = make(map[string]bool)
 
 	// Keep previously published snapshots immutable for concurrent readers.
-	db.universe = roaring64.NewBitmap()
-	if err = db.publishAfterCommitLocked(txID, "truncate", func() {
-		db.publishSnapshotNoLock(txID)
+	db.universe = nextUniverse
+	if err = db.publishAfterCommitLocked(seq, "truncate", func() {
+		db.finishSnapshotPublishNoLock(snap, nil, nil, nil, nil, nil)
 	}); err != nil {
 		return err
 	}

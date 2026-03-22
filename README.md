@@ -199,9 +199,10 @@ For `Query`, record values are fetched from bbolt only for IDs that have
 passed all filters and limits.
 
 `Query` runs against an index snapshot aligned with a bbolt read transaction.
-When an exact snapshot for transaction is not immediately available,
-it waits briefly for publication and retries with a fresh read transaction
-until a snapshot-safe path becomes available.
+Readers open a bbolt read transaction, read the managed bucket sequence, and
+pin the snapshot registered for that exact sequence. RBI pre-registers the next
+snapshot before commit, so readers do not wait for post-commit publication and
+are not affected by unrelated writes to other bbolt buckets.
 
 ## Configuration
 
@@ -508,15 +509,11 @@ enumeration, global deduplication, expensive ordering, and/or large materializat
   - Often requires scanning many index keys/buckets before filtering
   - Little opportunity for early pruning without additional anchors
 
-> For heavy and data-dependent classes, benchmark with your real data distribution.\
-> Synthetic uniform datasets often hide worst-case behavior.
-
 ### Write performance
 
 Write speed depends on how many index entries are touched per operation
 (changed fields, slice fan-out, uniqueness checks), and on bbolt fsync/IO.
-Insertions are typically more expensive than updates. 
-`Patch*` is usually faster than full `Set*` when only a subset of indexed fields changes.
+Insertions are typically more expensive than updates.
 
 Batch APIs (`BatchSet`, `BatchPatch`, `BatchDelete`) significantly reduce per-record overhead.
 

@@ -277,7 +277,9 @@ func (db *DB[K, V]) buildIndex(skipFields map[string]struct{}) error {
 
 	db.buildLenIndex()
 	db.lenIndexLoaded = false
-	db.publishSnapshotNoLock(db.currentBoltTxID())
+	if err = db.publishCurrentSequenceSnapshotNoLock(); err != nil {
+		return fmt.Errorf("publish snapshot: %w", err)
+	}
 
 	active = nil
 	global = nil
@@ -534,7 +536,9 @@ func (db *DB[K, V]) loadIndex() (skipFields map[string]struct{}, err error) {
 
 	db.lenIndexLoaded = lenLoaded
 	db.stats.LoadTime = time.Since(start)
-	db.publishSnapshotNoLock(db.currentBoltTxID())
+	if err = db.publishCurrentSequenceSnapshotNoLock(); err != nil {
+		return nil, fmt.Errorf("publish snapshot: %w", err)
+	}
 	forceMemoryCleanup(true)
 
 	return skipFields, nil
