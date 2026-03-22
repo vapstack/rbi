@@ -1722,7 +1722,7 @@ func TestConcurrentBatchWriters_ModelReplayConsistency(t *testing.T) {
 func TestBatchConcurrentSingleOps_ModelReplayConsistency(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
 		AutoBatchMax:      32,
-		AutoBatchMaxQueue: 0, // unlimited to avoid fallback due queue pressure
+		AutoBatchMaxQueue: 0, // unlimited to avoid queue backpressure in the test
 	})
 
 	const (
@@ -1867,10 +1867,7 @@ func TestBatchConcurrentSingleOps_ModelReplayConsistency(t *testing.T) {
 	}
 
 	bs := db.AutoBatchStats()
-	if !bs.Enabled {
-		t.Fatalf("expected auto-batcher to be enabled")
-	}
-	if bs.FallbackQueueFull != 0 || bs.FallbackClosed != 0 || bs.FallbackDisabled != 0 || bs.FallbackPatchUnique != 0 {
+	if bs.FallbackClosed != 0 {
 		t.Fatalf("unexpected auto-batcher fallback stats: %+v", bs)
 	}
 	if bs.MultiRequestBatches == 0 {
@@ -4054,9 +4051,6 @@ func TestComponentAccessors_ExposePlannerCalibrationAndSnapshotDiagnostics(t *te
 	}
 
 	bs := db.AutoBatchStats()
-	if !bs.Enabled {
-		t.Fatalf("expected auto-batch stats to report enabled")
-	}
 	if bs.Window <= 0 {
 		t.Fatalf("expected positive auto-batch window, got %v", bs.Window)
 	}
@@ -4143,9 +4137,6 @@ func TestComponentAccessors(t *testing.T) {
 	}
 
 	bs := db.AutoBatchStats()
-	if !bs.Enabled {
-		t.Fatalf("expected AutoBatchStats.Enabled=true")
-	}
 	if bs.Window <= 0 {
 		t.Fatalf("expected AutoBatchStats.Window > 0")
 	}

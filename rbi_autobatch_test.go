@@ -12,6 +12,13 @@ import (
 	"go.etcd.io/bbolt"
 )
 
+func queuedSingleJob[K ~string | ~uint64, V any](req *autoBatchRequest[K, V]) *autoBatchJob[K, V] {
+	return &autoBatchJob[K, V]{
+		reqs: []*autoBatchRequest[K, V]{req},
+		done: req.done,
+	}
+}
+
 func TestBatch_BeforeCommit_CallbacksRunForSetPatchDelete(t *testing.T) {
 	db, _ := openTempDBUint64(t)
 
@@ -149,40 +156,79 @@ func TestBatch_StatsTrackBatchSizeDistribution(t *testing.T) {
 	}
 }
 
-func TestBatch_Disabled_SkipsBatcherPath(t *testing.T) {
+func TestBatch_OpNamesMatchExecutionMode(t *testing.T) {
+	makeReq := func(op autoBatchOp) *autoBatchRequest[uint64, Rec] {
+		return &autoBatchRequest[uint64, Rec]{op: op, id: 1}
+	}
+
+	sharedDB, _ := openTempDBUint64(t)
+	if got := sharedDB.autoBatchOpName([]*autoBatchRequest[uint64, Rec]{makeReq(autoBatchSet)}, false); got != "batch" {
+		t.Fatalf("shared single request op = %q, want batch", got)
+	}
+	if got := sharedDB.autoBatchOpName([]*autoBatchRequest[uint64, Rec]{makeReq(autoBatchSet)}, true); got != "set" {
+		t.Fatalf("isolated single request op = %q, want set", got)
+	}
+	if got := sharedDB.autoBatchOpName([]*autoBatchRequest[uint64, Rec]{makeReq(autoBatchSet), makeReq(autoBatchSet)}, true); got != "batch_set" {
+		t.Fatalf("isolated multi set op = %q, want batch_set", got)
+	}
+
+	soloDB, _ := openTempDBUint64(t, Options{AutoBatchMax: 1})
+	if got := soloDB.autoBatchOpName([]*autoBatchRequest[uint64, Rec]{makeReq(autoBatchPatch)}, false); got != "patch" {
+		t.Fatalf("single-only patch op = %q, want patch", got)
+	}
+}
+
+func TestBatch_MaxOne_StillUsesBatcher(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
 		AutoBatchWindow: 5 * time.Millisecond,
 		AutoBatchMax:    1,
 	})
 
 	before := db.AutoBatchStats()
-	if before.Enabled {
-		t.Fatalf("expected auto-batcher to be disabled")
-	}
 
 	if err := db.Set(1, &Rec{Name: "alice", Age: 10}); err != nil {
 		t.Fatalf("Set: %v", err)
 	}
 
 	after := db.AutoBatchStats()
-	if after.Submitted != before.Submitted || after.Enqueued != before.Enqueued || after.Dequeued != before.Dequeued {
-		t.Fatalf("expected disabled auto-batcher to skip queue path, before=%+v after=%+v", before, after)
+	if after.Submitted != before.Submitted+1 || after.Enqueued != before.Enqueued+1 || after.Dequeued != before.Dequeued+1 {
+		t.Fatalf("expected AutoBatchMax=1 write to still use queue path, before=%+v after=%+v", before, after)
 	}
-	if after.FallbackDisabled != before.FallbackDisabled {
-		t.Fatalf("expected no disabled-fallback accounting when auto-batcher is fully off, before=%+v after=%+v", before, after)
+	if after.BatchSize1 != before.BatchSize1+1 || after.MultiRequestBatches != before.MultiRequestBatches {
+		t.Fatalf("expected AutoBatchMax=1 to execute as a single-request internal batch, before=%+v after=%+v", before, after)
 	}
 }
 
-func TestBatch_NoAutoBatch_Bypass(t *testing.T) {
+func TestBatch_NoBatch_IsolatesRequestInsideBatcher(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
 		AutoBatchWindow:   5 * time.Millisecond,
 		AutoBatchMax:      16,
 		AutoBatchMaxQueue: 64,
 	})
 
+	seed := &Rec{Name: "seed", Age: 7}
+	b := getEncodeBuf()
+	if err := db.encode(seed, b); err != nil {
+		releaseEncodeBuf(b)
+		t.Fatalf("encode(seed): %v", err)
+	}
+	seedReq := &autoBatchRequest[uint64, Rec]{
+		op:         autoBatchSet,
+		id:         100,
+		setValue:   seed,
+		setPayload: append([]byte(nil), b.Bytes()...),
+		done:       make(chan error, 1),
+	}
+	releaseEncodeBuf(b)
+
 	before := db.AutoBatchStats()
+	db.autoBatcher.mu.Lock()
+	db.autoBatcher.queue = []*autoBatchJob[uint64, Rec]{queuedSingleJob(seedReq)}
+	db.autoBatcher.running = false
+	db.autoBatcher.mu.Unlock()
+
 	calls := 0
-	err := db.Set(1, &Rec{Name: "alice", Age: 10}, NoAutoBatch[uint64, Rec], BeforeCommit(func(_ *bbolt.Tx, _ uint64, _, _ *Rec) error {
+	err := db.Set(1, &Rec{Name: "alice", Age: 10}, NoBatch[uint64, Rec], BeforeCommit(func(_ *bbolt.Tx, _ uint64, _, _ *Rec) error {
 		calls++
 		return nil
 	}))
@@ -194,11 +240,98 @@ func TestBatch_NoAutoBatch_Bypass(t *testing.T) {
 	}
 
 	after := db.AutoBatchStats()
-	if after.Submitted != before.Submitted || after.Enqueued != before.Enqueued || after.Dequeued != before.Dequeued {
-		t.Fatalf("expected NoAutoBatch write to bypass auto-batcher queue, before=%+v after=%+v", before, after)
+	if after.Submitted != before.Submitted+1 || after.Enqueued != before.Enqueued+1 || after.Dequeued != before.Dequeued+2 {
+		t.Fatalf("expected NoBatch write to use queued internal path and stay isolated, before=%+v after=%+v", before, after)
 	}
-	if after.CallbackOps != before.CallbackOps {
-		t.Fatalf("expected no auto-batcher callback executions on bypass path, before=%+v after=%+v", before, after)
+	if after.BatchSize1 != before.BatchSize1+2 || after.MultiRequestBatches != before.MultiRequestBatches {
+		t.Fatalf("expected queued seed request and NoBatch request to execute as separate single-request batches, before=%+v after=%+v", before, after)
+	}
+	if after.CallbackOps != before.CallbackOps+1 {
+		t.Fatalf("expected NoBatch callback to run through internal batcher, before=%+v after=%+v", before, after)
+	}
+}
+
+func TestBatch_PopSkipsCoalescingWindowForIsolatedHead(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{
+		AutoBatchWindow:   25 * time.Millisecond,
+		AutoBatchMax:      16,
+		AutoBatchMaxQueue: 64,
+	})
+
+	isolatedReq := &autoBatchRequest[uint64, Rec]{op: autoBatchSet, id: 1, done: make(chan error, 1)}
+	followerReq := &autoBatchRequest[uint64, Rec]{op: autoBatchSet, id: 2, done: make(chan error, 1)}
+
+	db.autoBatcher.mu.Lock()
+	db.autoBatcher.running = true
+	db.autoBatcher.hotUntil = time.Time{}
+	db.autoBatcher.queue = []*autoBatchJob[uint64, Rec]{
+		{
+			reqs:     []*autoBatchRequest[uint64, Rec]{isolatedReq},
+			isolated: true,
+			done:     isolatedReq.done,
+		},
+		queuedSingleJob(followerReq),
+	}
+	db.autoBatcher.mu.Unlock()
+
+	before := db.AutoBatchStats()
+	batch := db.popAutoBatch()
+	after := db.AutoBatchStats()
+
+	if len(batch) != 1 || len(batch[0].reqs) != 1 || batch[0].reqs[0] != isolatedReq {
+		t.Fatalf("expected isolated head to pop immediately alone, got=%+v", batch)
+	}
+	if after.CoalesceWaits != before.CoalesceWaits {
+		t.Fatalf("isolated head must skip coalescing wait, before=%+v after=%+v", before, after)
+	}
+
+	db.autoBatcher.mu.Lock()
+	defer db.autoBatcher.mu.Unlock()
+	if !db.autoBatcher.hotUntil.IsZero() {
+		t.Fatalf("isolated head must not arm hot window, hotUntil=%v", db.autoBatcher.hotUntil)
+	}
+}
+
+func TestBatch_PopSkipsCoalescingWindowBeforeIsolatedFollower(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{
+		AutoBatchWindow:   25 * time.Millisecond,
+		AutoBatchMax:      16,
+		AutoBatchMaxQueue: 64,
+	})
+
+	headReq := &autoBatchRequest[uint64, Rec]{op: autoBatchSet, id: 1, done: make(chan error, 1)}
+	isolatedReq := &autoBatchRequest[uint64, Rec]{op: autoBatchSet, id: 2, done: make(chan error, 1)}
+	tailReq := &autoBatchRequest[uint64, Rec]{op: autoBatchSet, id: 3, done: make(chan error, 1)}
+
+	db.autoBatcher.mu.Lock()
+	db.autoBatcher.running = true
+	db.autoBatcher.hotUntil = time.Time{}
+	db.autoBatcher.queue = []*autoBatchJob[uint64, Rec]{
+		queuedSingleJob(headReq),
+		{
+			reqs:     []*autoBatchRequest[uint64, Rec]{isolatedReq},
+			isolated: true,
+			done:     isolatedReq.done,
+		},
+		queuedSingleJob(tailReq),
+	}
+	db.autoBatcher.mu.Unlock()
+
+	before := db.AutoBatchStats()
+	batch := db.popAutoBatch()
+	after := db.AutoBatchStats()
+
+	if len(batch) != 1 || len(batch[0].reqs) != 1 || batch[0].reqs[0] != headReq {
+		t.Fatalf("expected head request before isolated follower to pop immediately alone, got=%+v", batch)
+	}
+	if after.CoalesceWaits != before.CoalesceWaits {
+		t.Fatalf("isolated follower must prevent coalescing wait, before=%+v after=%+v", before, after)
+	}
+
+	db.autoBatcher.mu.Lock()
+	defer db.autoBatcher.mu.Unlock()
+	if !db.autoBatcher.hotUntil.IsZero() {
+		t.Fatalf("isolated follower must not arm hot window for the preceding request, hotUntil=%v", db.autoBatcher.hotUntil)
 	}
 }
 
@@ -222,10 +355,10 @@ func TestBatch_CallbackRequestsStayBatchable(t *testing.T) {
 	db.autoBatcher.window = 0
 	db.autoBatcher.maxOps = 16
 	db.autoBatcher.running = true
-	db.autoBatcher.queue = []*autoBatchRequest[uint64, Rec]{
-		makeReq(1, false),
-		makeReq(2, true),
-		makeReq(3, false),
+	db.autoBatcher.queue = []*autoBatchJob[uint64, Rec]{
+		queuedSingleJob(makeReq(1, false)),
+		queuedSingleJob(makeReq(2, true)),
+		queuedSingleJob(makeReq(3, false)),
 	}
 	db.autoBatcher.mu.Unlock()
 
@@ -233,7 +366,7 @@ func TestBatch_CallbackRequestsStayBatchable(t *testing.T) {
 	if len(batch) != 3 {
 		t.Fatalf("expected callbacks to remain batchable, got %d", len(batch))
 	}
-	if len(batch[1].beforeCommit) == 0 {
+	if len(batch[1].reqs) != 1 || len(batch[1].reqs[0].beforeCommit) == 0 {
 		t.Fatalf("expected middle request with callback to stay in a multi-request batch")
 	}
 }
@@ -259,9 +392,6 @@ func TestBatch_PatchUnique_QueuedIntoBatch(t *testing.T) {
 	mid := db.AutoBatchStats()
 	if mid.Enqueued <= before.Enqueued {
 		t.Fatalf("expected patch to be enqueued into auto-batcher, before=%+v after=%+v", before, mid)
-	}
-	if mid.FallbackPatchUnique != before.FallbackPatchUnique {
-		t.Fatalf("unique-patch fallback should not trigger, before=%+v after=%+v", before, mid)
 	}
 
 	err := db.Patch(1, []Field{{Name: "email", Value: "b@x"}})
@@ -318,7 +448,11 @@ func TestBatch_DuplicatePatchSameID_NonUniqueFieldsStayBatched(t *testing.T) {
 	db.autoBatcher.window = 0
 	db.autoBatcher.maxOps = 16
 	db.autoBatcher.running = true
-	db.autoBatcher.queue = []*autoBatchRequest[uint64, UniqueTestRec]{req1, req2, req3}
+	db.autoBatcher.queue = []*autoBatchJob[uint64, UniqueTestRec]{
+		queuedSingleJob(req1),
+		queuedSingleJob(req2),
+		queuedSingleJob(req3),
+	}
 	db.autoBatcher.mu.Unlock()
 
 	batch := db.popAutoBatch()
@@ -326,7 +460,7 @@ func TestBatch_DuplicatePatchSameID_NonUniqueFieldsStayBatched(t *testing.T) {
 		t.Fatalf("expected repeated non-unique patches to stay batched, got=%d", len(batch))
 	}
 
-	db.executeAutoBatch(batch)
+	db.executeAutoBatchJobs(batch)
 
 	for i, req := range []*autoBatchRequest[uint64, UniqueTestRec]{req1, req2, req3} {
 		if err := <-req.done; err != nil {
@@ -384,14 +518,18 @@ func TestBatch_DuplicatePatchSameID_UniqueFieldCutsBatch(t *testing.T) {
 	db.autoBatcher.window = 0
 	db.autoBatcher.maxOps = 16
 	db.autoBatcher.running = true
-	db.autoBatcher.queue = []*autoBatchRequest[uint64, UniqueTestRec]{req1, req2, req3}
+	db.autoBatcher.queue = []*autoBatchJob[uint64, UniqueTestRec]{
+		queuedSingleJob(req1),
+		queuedSingleJob(req2),
+		queuedSingleJob(req3),
+	}
 	db.autoBatcher.mu.Unlock()
 
 	batch := db.popAutoBatch()
 	if len(batch) != 1 {
 		t.Fatalf("expected repeated unique-touching patches to cut batch, got=%d", len(batch))
 	}
-	if batch[0] != req1 {
+	if len(batch[0].reqs) != 1 || batch[0].reqs[0] != req1 {
 		t.Fatalf("expected first request to stay alone in batch")
 	}
 }
@@ -436,20 +574,26 @@ func TestBatch_DuplicatePatchSameID_BeforeStoreOnUniqueDBCutsBatch(t *testing.T)
 	db.autoBatcher.window = 0
 	db.autoBatcher.maxOps = 16
 	db.autoBatcher.running = true
-	db.autoBatcher.queue = []*autoBatchRequest[uint64, UniqueTestRec]{req1, req2, req3}
+	db.autoBatcher.queue = []*autoBatchJob[uint64, UniqueTestRec]{
+		queuedSingleJob(req1),
+		queuedSingleJob(req2),
+		queuedSingleJob(req3),
+	}
 	db.autoBatcher.mu.Unlock()
 
 	batch := db.popAutoBatch()
 	if len(batch) != 1 {
 		t.Fatalf("expected BeforeStore-bearing repeated same-id patch to cut batch on unique DB, got=%d", len(batch))
 	}
-	if batch[0] != req1 {
+	if len(batch[0].reqs) != 1 || batch[0].reqs[0] != req1 {
 		t.Fatalf("expected first request to stay alone in batch")
 	}
 
 	db.autoBatcher.mu.Lock()
 	defer db.autoBatcher.mu.Unlock()
-	if len(db.autoBatcher.queue) != 2 || db.autoBatcher.queue[0] != req2 || db.autoBatcher.queue[1] != req3 {
+	if len(db.autoBatcher.queue) != 2 ||
+		len(db.autoBatcher.queue[0].reqs) != 1 || db.autoBatcher.queue[0].reqs[0] != req2 ||
+		len(db.autoBatcher.queue[1].reqs) != 1 || db.autoBatcher.queue[1].reqs[0] != req3 {
 		t.Fatalf("expected remaining requests to stay queued in order, queue=%+v", db.autoBatcher.queue)
 	}
 }
@@ -494,20 +638,26 @@ func TestBatch_DuplicatePatchSameID_BeforeProcessOnUniqueDBCutsBatch(t *testing.
 	db.autoBatcher.window = 0
 	db.autoBatcher.maxOps = 16
 	db.autoBatcher.running = true
-	db.autoBatcher.queue = []*autoBatchRequest[uint64, UniqueTestRec]{req1, req2, req3}
+	db.autoBatcher.queue = []*autoBatchJob[uint64, UniqueTestRec]{
+		queuedSingleJob(req1),
+		queuedSingleJob(req2),
+		queuedSingleJob(req3),
+	}
 	db.autoBatcher.mu.Unlock()
 
 	batch := db.popAutoBatch()
 	if len(batch) != 1 {
 		t.Fatalf("expected BeforeProcess-bearing repeated same-id patch to cut batch on unique DB, got=%d", len(batch))
 	}
-	if batch[0] != req1 {
+	if len(batch[0].reqs) != 1 || batch[0].reqs[0] != req1 {
 		t.Fatalf("expected first request to stay alone in batch")
 	}
 
 	db.autoBatcher.mu.Lock()
 	defer db.autoBatcher.mu.Unlock()
-	if len(db.autoBatcher.queue) != 2 || db.autoBatcher.queue[0] != req2 || db.autoBatcher.queue[1] != req3 {
+	if len(db.autoBatcher.queue) != 2 ||
+		len(db.autoBatcher.queue[0].reqs) != 1 || db.autoBatcher.queue[0].reqs[0] != req2 ||
+		len(db.autoBatcher.queue[1].reqs) != 1 || db.autoBatcher.queue[1].reqs[0] != req3 {
 		t.Fatalf("expected remaining requests to stay queued in order, queue=%+v", db.autoBatcher.queue)
 	}
 }
@@ -569,7 +719,12 @@ func TestBatch_SetDeleteSameID_CoalescedToLastWrite(t *testing.T) {
 	db.autoBatcher.window = 0
 	db.autoBatcher.maxOps = 16
 	db.autoBatcher.running = true
-	db.autoBatcher.queue = []*autoBatchRequest[uint64, Rec]{req1, req2, req3, req4}
+	db.autoBatcher.queue = []*autoBatchJob[uint64, Rec]{
+		queuedSingleJob(req1),
+		queuedSingleJob(req2),
+		queuedSingleJob(req3),
+		queuedSingleJob(req4),
+	}
 	db.autoBatcher.mu.Unlock()
 
 	batch := db.popAutoBatch()
@@ -580,7 +735,7 @@ func TestBatch_SetDeleteSameID_CoalescedToLastWrite(t *testing.T) {
 		t.Fatalf("unexpected coalesce chain: req1->%p req2->%p req3->%p", req1.coalescedTo, req2.coalescedTo, req3.coalescedTo)
 	}
 
-	db.executeAutoBatch(batch)
+	db.executeAutoBatchJobs(batch)
 
 	for i, req := range []*autoBatchRequest[uint64, Rec]{req1, req2, req3, req4} {
 		if err := <-req.done; err != nil {
@@ -665,7 +820,12 @@ func TestBatch_CoalescedChain_PropagatesTerminalError(t *testing.T) {
 	db.autoBatcher.window = 0
 	db.autoBatcher.maxOps = 16
 	db.autoBatcher.running = true
-	db.autoBatcher.queue = []*autoBatchRequest[uint64, UniqueTestRec]{req1, req2, req3, req4}
+	db.autoBatcher.queue = []*autoBatchJob[uint64, UniqueTestRec]{
+		queuedSingleJob(req1),
+		queuedSingleJob(req2),
+		queuedSingleJob(req3),
+		queuedSingleJob(req4),
+	}
 	db.autoBatcher.mu.Unlock()
 
 	batch := db.popAutoBatch()
@@ -676,7 +836,7 @@ func TestBatch_CoalescedChain_PropagatesTerminalError(t *testing.T) {
 		t.Fatalf("unexpected coalesce chain: req1->%p req2->%p req3->%p", req1.coalescedTo, req2.coalescedTo, req3.coalescedTo)
 	}
 
-	db.executeAutoBatch(batch)
+	db.executeAutoBatchJobs(batch)
 
 	if err := <-req1.done; !errors.Is(err, ErrUniqueViolation) {
 		t.Fatalf("req1 expected ErrUniqueViolation via coalesced chain, got: %v", err)
@@ -816,21 +976,30 @@ func TestBatch_PatchFailures_IsolateFailedRequest(t *testing.T) {
 	}
 }
 
-func TestBatch_QueueFullFallback_UsesDirectPath(t *testing.T) {
+func TestBatch_QueueFull_WaitsAndStaysQueued(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
 		AutoBatchWindow:   5 * time.Millisecond,
 		AutoBatchMax:      16,
 		AutoBatchMaxQueue: 1,
 	})
 
-	if st := db.AutoBatchStats(); !st.Enabled {
-		t.Fatalf("expected auto-batcher enabled")
+	blocked := &Rec{Name: "queued", Age: 11, Meta: Meta{Country: "NL"}}
+	b := getEncodeBuf()
+	if err := db.encode(blocked, b); err != nil {
+		releaseEncodeBuf(b)
+		t.Fatalf("encode(blocked): %v", err)
 	}
+	blockedReq := &autoBatchRequest[uint64, Rec]{
+		op:         autoBatchSet,
+		id:         123,
+		setValue:   blocked,
+		setPayload: append([]byte(nil), b.Bytes()...),
+		done:       make(chan error, 1),
+	}
+	releaseEncodeBuf(b)
 
 	db.autoBatcher.mu.Lock()
-	db.autoBatcher.queue = []*autoBatchRequest[uint64, Rec]{
-		{op: autoBatchSet, id: 123, done: make(chan error, 1)},
-	}
+	db.autoBatcher.queue = []*autoBatchJob[uint64, Rec]{queuedSingleJob(blockedReq)}
 	db.autoBatcher.running = false
 	db.autoBatcher.mu.Unlock()
 	defer func() {
@@ -842,15 +1011,12 @@ func TestBatch_QueueFullFallback_UsesDirectPath(t *testing.T) {
 
 	before := db.AutoBatchStats()
 	if err := db.Set(1, &Rec{Name: "fallback", Age: 42, Meta: Meta{Country: "US"}}); err != nil {
-		t.Fatalf("Set must succeed via direct fallback path, got: %v", err)
+		t.Fatalf("Set must succeed after queued wait, got: %v", err)
 	}
 	after := db.AutoBatchStats()
 
-	if after.FallbackQueueFull <= before.FallbackQueueFull {
-		t.Fatalf("expected queue-full fallback accounting increment, before=%+v after=%+v", before, after)
-	}
-	if after.Enqueued != before.Enqueued {
-		t.Fatalf("queue-full fallback must bypass queue enqueue, before=%+v after=%+v", before, after)
+	if after.Submitted != before.Submitted+1 || after.Enqueued != before.Enqueued+1 {
+		t.Fatalf("expected queue-full path to remain queued instead of falling back, before=%+v after=%+v", before, after)
 	}
 
 	got, err := db.Get(1)
@@ -858,7 +1024,7 @@ func TestBatch_QueueFullFallback_UsesDirectPath(t *testing.T) {
 		t.Fatalf("Get(1): %v", err)
 	}
 	if got == nil || got.Name != "fallback" || got.Age != 42 || got.Country != "US" {
-		t.Fatalf("unexpected value after queue-full direct fallback write: %#v", got)
+		t.Fatalf("unexpected value after queue-full queued write: %#v", got)
 	}
 }
 

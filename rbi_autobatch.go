@@ -37,6 +37,12 @@ type autoBatchRequest[K ~string | ~uint64, V any] struct {
 	done chan error
 }
 
+type autoBatchJob[K ~string | ~uint64, V any] struct {
+	reqs     []*autoBatchRequest[K, V]
+	isolated bool
+	done     chan error
+}
+
 type autoBatchPrepared[K ~string | ~uint64, V any] struct {
 	req *autoBatchRequest[K, V]
 
@@ -82,21 +88,9 @@ func atomicSetMax(dst *atomic.Uint64, v uint64) {
 	}
 }
 
-func (db *DB[K, V]) trySetViaAutoBatch(id K, newVal *V, beforeStore []beforeStoreFunc[K, V], beforeCommit []beforeCommitFunc[K, V], cloneValue func(K, *V) *V) (error, bool) {
-	if !db.autoBatcher.enabled {
-		if db.autoBatcher.statsEnabled {
-			db.autoBatcher.fallbackDisabled.Add(1)
-		}
-		return nil, false
-	}
+func (db *DB[K, V]) buildSetAutoBatchRequest(id K, newVal *V, beforeStore []beforeStoreFunc[K, V], beforeCommit []beforeCommitFunc[K, V], cloneValue func(K, *V) *V) (*autoBatchRequest[K, V], error) {
 	if newVal == nil {
-		return ErrNilValue, true
-	}
-	if err := db.unavailableErr(); err != nil {
-		if db.autoBatcher.statsEnabled {
-			db.autoBatcher.fallbackClosed.Add(1)
-		}
-		return err, true
+		return nil, ErrNilValue
 	}
 
 	req := &autoBatchRequest[K, V]{
@@ -110,35 +104,22 @@ func (db *DB[K, V]) trySetViaAutoBatch(id K, newVal *V, beforeStore []beforeStor
 	if len(beforeStore) > 0 && cloneValue != nil {
 		var err error
 		if req.setBaseline, err = cloneBeforeStoreValue(id, newVal, cloneValue); err != nil {
-			return err, true
+			return nil, err
 		}
 	} else {
 		b := getEncodeBuf()
 		defer releaseEncodeBuf(b)
 		if err := db.encode(newVal, b); err != nil {
-			return fmt.Errorf("encode: %w", err), true
+			return nil, fmt.Errorf("encode: %w", err)
 		}
 		req.setValue = newVal
 		req.setPayload = append([]byte(nil), b.Bytes()...)
 	}
-	return db.submitAutoBatch(req)
+	return req, nil
 }
 
-func (db *DB[K, V]) tryPatchViaAutoBatch(id K, fields []Field, ignoreUnknown bool, beforeProcess []beforeProcessFunc[K, V], beforeStore []beforeStoreFunc[K, V], beforeCommit []beforeCommitFunc[K, V]) (error, bool) {
-	if !db.autoBatcher.enabled {
-		if db.autoBatcher.statsEnabled {
-			db.autoBatcher.fallbackDisabled.Add(1)
-		}
-		return nil, false
-	}
-	if err := db.unavailableErr(); err != nil {
-		if db.autoBatcher.statsEnabled {
-			db.autoBatcher.fallbackClosed.Add(1)
-		}
-		return err, true
-	}
-
-	req := &autoBatchRequest[K, V]{
+func (db *DB[K, V]) buildPatchAutoBatchRequest(id K, fields []Field, ignoreUnknown bool, beforeProcess []beforeProcessFunc[K, V], beforeStore []beforeStoreFunc[K, V], beforeCommit []beforeCommitFunc[K, V]) *autoBatchRequest[K, V] {
+	return &autoBatchRequest[K, V]{
 		op:                 autoBatchPatch,
 		id:                 id,
 		patch:              append([]Field(nil), fields...),
@@ -146,67 +127,68 @@ func (db *DB[K, V]) tryPatchViaAutoBatch(id K, fields []Field, ignoreUnknown boo
 		beforeProcess:      beforeProcess,
 		beforeStore:        beforeStore,
 		beforeCommit:       beforeCommit,
-		done:               make(chan error, 1),
 	}
-	return db.submitAutoBatch(req)
 }
 
-func (db *DB[K, V]) tryDeleteViaAutoBatch(id K, beforeCommit []beforeCommitFunc[K, V]) (error, bool) {
-	if !db.autoBatcher.enabled {
-		if db.autoBatcher.statsEnabled {
-			db.autoBatcher.fallbackDisabled.Add(1)
-		}
-		return nil, false
-	}
-	if err := db.unavailableErr(); err != nil {
-		if db.autoBatcher.statsEnabled {
-			db.autoBatcher.fallbackClosed.Add(1)
-		}
-		return err, true
-	}
-
-	req := &autoBatchRequest[K, V]{
+func (db *DB[K, V]) buildDeleteAutoBatchRequest(id K, beforeCommit []beforeCommitFunc[K, V]) *autoBatchRequest[K, V] {
+	return &autoBatchRequest[K, V]{
 		op:           autoBatchDelete,
 		id:           id,
 		beforeCommit: beforeCommit,
-		done:         make(chan error, 1),
 	}
-	return db.submitAutoBatch(req)
 }
 
-func (db *DB[K, V]) submitAutoBatch(req *autoBatchRequest[K, V]) (error, bool) {
+func (db *DB[K, V]) submitAutoBatchRequests(reqs []*autoBatchRequest[K, V], isolated bool) error {
+	if len(reqs) == 0 {
+		return nil
+	}
 	stats := db.autoBatcher.statsEnabled
 	if stats {
 		db.autoBatcher.submitted.Add(1)
 	}
-
-	startRunner := false
-	db.autoBatcher.mu.Lock()
-	if db.autoBatcher.maxQ > 0 && len(db.autoBatcher.queue) >= db.autoBatcher.maxQ {
-		db.autoBatcher.mu.Unlock()
+	if err := db.unavailableErr(); err != nil {
 		if stats {
-			db.autoBatcher.fallbackQueueFull.Add(1)
+			db.autoBatcher.fallbackClosed.Add(1)
 		}
-		return nil, false
+		return err
 	}
 
-	db.autoBatcher.queue = append(db.autoBatcher.queue, req)
+	job := &autoBatchJob[K, V]{
+		reqs:     reqs,
+		isolated: isolated || len(reqs) != 1,
+		done:     make(chan error, 1),
+	}
+	if len(reqs) == 1 {
+		reqs[0].done = job.done
+	}
+
+	db.autoBatcher.mu.Lock()
+	for {
+		if err := db.unavailableErr(); err != nil {
+			db.autoBatcher.mu.Unlock()
+			if stats {
+				db.autoBatcher.fallbackClosed.Add(1)
+			}
+			return err
+		}
+		if !db.autoBatcher.running {
+			db.autoBatcher.running = true
+			go db.runAutoBatcherLoop()
+		}
+		if db.autoBatcher.maxQ <= 0 || len(db.autoBatcher.queue) < db.autoBatcher.maxQ {
+			break
+		}
+		db.autoBatcher.cond.Wait()
+	}
+
+	db.autoBatcher.queue = append(db.autoBatcher.queue, job)
 	if stats {
 		db.autoBatcher.enqueued.Add(1)
 		atomicSetMax(&db.autoBatcher.queueHighWater, uint64(len(db.autoBatcher.queue)))
 	}
-
-	if !db.autoBatcher.running {
-		db.autoBatcher.running = true
-		startRunner = true
-	}
 	db.autoBatcher.mu.Unlock()
 
-	if startRunner {
-		go db.runAutoBatcherLoop()
-	}
-
-	return <-req.done, true
+	return <-job.done
 }
 
 func (db *DB[K, V]) runAutoBatcherLoop() {
@@ -216,14 +198,32 @@ func (db *DB[K, V]) runAutoBatcherLoop() {
 			return
 		}
 		if err := db.unavailableErr(); err != nil {
-			db.failAutoBatch(batch, err)
+			db.failAutoBatchJobs(batch, err)
 			continue
 		}
-		db.executeAutoBatch(batch)
+		db.executeAutoBatchJobs(batch)
 	}
 }
 
-func (db *DB[K, V]) popAutoBatch() []*autoBatchRequest[K, V] {
+func autoBatchFrontLimit[K ~string | ~uint64, V any](queue []*autoBatchJob[K, V], limit int) int {
+	if limit <= 0 || limit > len(queue) {
+		limit = len(queue)
+	}
+	if limit <= 1 {
+		return limit
+	}
+	if queue[0].isolated {
+		return 1
+	}
+	for i := 1; i < limit; i++ {
+		if queue[i].isolated {
+			return i
+		}
+	}
+	return limit
+}
+
+func (db *DB[K, V]) popAutoBatch() []*autoBatchJob[K, V] {
 	stats := db.autoBatcher.statsEnabled
 
 	db.autoBatcher.mu.Lock()
@@ -234,17 +234,18 @@ func (db *DB[K, V]) popAutoBatch() []*autoBatchRequest[K, V] {
 	}
 
 	waitDur := time.Duration(0)
+	frontLimit := autoBatchFrontLimit(db.autoBatcher.queue, db.autoBatcher.maxOps)
 	if db.autoBatcher.window > 0 && len(db.autoBatcher.queue) < db.autoBatcher.maxOps {
 		now := time.Now()
 		switch {
-		case len(db.autoBatcher.queue) > 1:
+		case frontLimit > 1:
 			waitDur = db.autoBatcher.window
 			keepHot := 4 * db.autoBatcher.window
 			if keepHot < 500*time.Microsecond {
 				keepHot = 500 * time.Microsecond
 			}
 			db.autoBatcher.hotUntil = now.Add(keepHot)
-		case now.Before(db.autoBatcher.hotUntil):
+		case len(db.autoBatcher.queue) == 1 && now.Before(db.autoBatcher.hotUntil):
 			waitDur = db.autoBatcher.window
 			if waitDur > 50*time.Microsecond {
 				waitDur /= 2
@@ -268,18 +269,14 @@ func (db *DB[K, V]) popAutoBatch() []*autoBatchRequest[K, V] {
 		}
 	}
 
-	n := db.autoBatcher.maxOps
-	if n <= 0 || n > len(db.autoBatcher.queue) {
-		n = len(db.autoBatcher.queue)
-	}
-
+	n := autoBatchFrontLimit(db.autoBatcher.queue, db.autoBatcher.maxOps)
 	if n > 1 {
 		lastByID := make(map[K]int, n)
 		for i := 0; i < n; i++ {
-			req := db.autoBatcher.queue[i]
+			req := db.autoBatcher.queue[i].reqs[0]
 			prevIdx, seen := lastByID[req.id]
 			if seen {
-				prev := db.autoBatcher.queue[prevIdx]
+				prev := db.autoBatcher.queue[prevIdx].reqs[0]
 				if !(canCoalesceSetDelete(req) && canCoalesceSetDelete(prev)) &&
 					!(db.canBatchRepeatedID(req) && db.canBatchRepeatedID(prev)) {
 					n = i
@@ -290,16 +287,45 @@ func (db *DB[K, V]) popAutoBatch() []*autoBatchRequest[K, V] {
 		}
 	}
 
-	batch := append([]*autoBatchRequest[K, V](nil), db.autoBatcher.queue[:n]...)
+	batch := append([]*autoBatchJob[K, V](nil), db.autoBatcher.queue[:n]...)
 	if len(batch) > 1 {
-		db.coalesceSetDeleteBatch(batch)
+		reqs := make([]*autoBatchRequest[K, V], len(batch))
+		for i := range batch {
+			reqs[i] = batch[i].reqs[0]
+		}
+		db.coalesceSetDeleteBatch(reqs)
 	}
 	db.autoBatcher.queue = append(db.autoBatcher.queue[:0], db.autoBatcher.queue[n:]...)
 	if stats {
 		db.autoBatcher.dequeued.Add(uint64(len(batch)))
 	}
+	if db.autoBatcher.cond != nil {
+		db.autoBatcher.cond.Broadcast()
+	}
 	db.autoBatcher.mu.Unlock()
 	return batch
+}
+
+func (db *DB[K, V]) recordExecutedAutoBatchStats(size int) {
+	if !db.autoBatcher.statsEnabled {
+		return
+	}
+	db.autoBatcher.executedBatches.Add(1)
+	if size > 1 {
+		db.autoBatcher.multiReqBatches.Add(1)
+		db.autoBatcher.multiReqOps.Add(uint64(size))
+	}
+	switch {
+	case size <= 1:
+		db.autoBatcher.batchSize1.Add(1)
+	case size <= 4:
+		db.autoBatcher.batchSize2To4.Add(1)
+	case size <= 8:
+		db.autoBatcher.batchSize5To8.Add(1)
+	default:
+		db.autoBatcher.batchSize9Plus.Add(1)
+	}
+	atomicSetMax(&db.autoBatcher.maxBatchSeen, uint64(size))
 }
 
 func canCoalesceSetDelete[K ~string | ~uint64, V any](req *autoBatchRequest[K, V]) bool {
@@ -375,27 +401,36 @@ func (db *DB[K, V]) coalesceSetDeleteBatch(batch []*autoBatchRequest[K, V]) {
 	}
 }
 
-func (db *DB[K, V]) executeAutoBatch(batch []*autoBatchRequest[K, V]) {
-	stats := db.autoBatcher.statsEnabled
-	if stats {
-		db.autoBatcher.executedBatches.Add(1)
-		if len(batch) > 1 {
-			db.autoBatcher.multiReqBatches.Add(1)
-			db.autoBatcher.multiReqOps.Add(uint64(len(batch)))
-		}
-		switch {
-		case len(batch) <= 1:
-			db.autoBatcher.batchSize1.Add(1)
-		case len(batch) <= 4:
-			db.autoBatcher.batchSize2To4.Add(1)
-		case len(batch) <= 8:
-			db.autoBatcher.batchSize5To8.Add(1)
-		default:
-			db.autoBatcher.batchSize9Plus.Add(1)
-		}
-		atomicSetMax(&db.autoBatcher.maxBatchSeen, uint64(len(batch)))
+func (db *DB[K, V]) executeAutoBatchJobs(batch []*autoBatchJob[K, V]) {
+	db.recordExecutedAutoBatchStats(len(batch))
+
+	if len(batch) == 1 && batch[0].isolated {
+		batch[0].done <- db.executeAutoBatchAtomic(batch[0].reqs)
+		return
 	}
 
+	reqs := make([]*autoBatchRequest[K, V], 0, len(batch))
+	for _, job := range batch {
+		if len(job.reqs) != 1 {
+			job.done <- fmt.Errorf("internal auto-batch error: mixed grouped request in shared batch")
+			continue
+		}
+		req := job.reqs[0]
+		req.done = job.done
+		reqs = append(reqs, req)
+	}
+	if len(reqs) == 0 {
+		return
+	}
+	db.executeAutoBatchNoStats(reqs)
+}
+
+func (db *DB[K, V]) executeAutoBatch(batch []*autoBatchRequest[K, V]) {
+	db.recordExecutedAutoBatchStats(len(batch))
+	db.executeAutoBatchNoStats(batch)
+}
+
+func (db *DB[K, V]) executeAutoBatchNoStats(batch []*autoBatchRequest[K, V]) {
 	for _, req := range batch {
 		req.err = nil
 	}
@@ -408,7 +443,7 @@ func (db *DB[K, V]) executeAutoBatch(batch []*autoBatchRequest[K, V]) {
 	}
 
 	for {
-		retryWithoutReq, done, fatalErr := db.executeAutoBatchAttempt(active)
+		retryWithoutReq, done, fatalErr := db.executeAutoBatchAttempt(active, false)
 		if fatalErr != nil {
 			db.failAutoBatch(batch, fatalErr)
 			return
@@ -444,8 +479,81 @@ func (db *DB[K, V]) executeAutoBatch(batch []*autoBatchRequest[K, V]) {
 	}
 }
 
-func (db *DB[K, V]) executeAutoBatchAttempt(active []*autoBatchRequest[K, V]) (*autoBatchRequest[K, V], bool, error) {
+func firstAutoBatchRequestErr[K ~string | ~uint64, V any](reqs []*autoBatchRequest[K, V]) error {
+	for _, req := range reqs {
+		if req != nil && req.err != nil {
+			return req.err
+		}
+	}
+	return nil
+}
+
+func singleAutoBatchOpName[K ~string | ~uint64, V any](req *autoBatchRequest[K, V]) string {
+	if req == nil {
+		return "batch"
+	}
+	switch req.op {
+	case autoBatchSet:
+		return "set"
+	case autoBatchPatch:
+		return "patch"
+	case autoBatchDelete:
+		return "delete"
+	default:
+		return "batch"
+	}
+}
+
+func batchAutoBatchOpName[K ~string | ~uint64, V any](req *autoBatchRequest[K, V]) string {
+	if req == nil {
+		return "batch"
+	}
+	switch req.op {
+	case autoBatchSet:
+		return "batch_set"
+	case autoBatchPatch:
+		return "batch_patch"
+	case autoBatchDelete:
+		return "batch_delete"
+	default:
+		return "batch"
+	}
+}
+
+func (db *DB[K, V]) autoBatchOpName(reqs []*autoBatchRequest[K, V], atomicAll bool) string {
+	if len(reqs) == 0 {
+		return "batch"
+	}
+	if !atomicAll {
+		if len(reqs) == 1 && db.autoBatcher.maxOps <= 1 {
+			return singleAutoBatchOpName(reqs[0])
+		}
+		return "batch"
+	}
+	if len(reqs) == 1 {
+		return singleAutoBatchOpName(reqs[0])
+	}
+	return batchAutoBatchOpName(reqs[0])
+}
+
+func (db *DB[K, V]) executeAutoBatchAtomic(batch []*autoBatchRequest[K, V]) error {
+	for _, req := range batch {
+		req.err = nil
+		req.coalescedTo = nil
+	}
+	_, done, fatalErr := db.executeAutoBatchAttempt(batch, true)
+	if fatalErr != nil {
+		return fatalErr
+	}
+	if !done {
+		return fmt.Errorf("internal auto-batch atomic retry error")
+	}
+	return firstAutoBatchRequestErr(batch)
+}
+
+func (db *DB[K, V]) executeAutoBatchAttempt(active []*autoBatchRequest[K, V], atomicAll bool) (*autoBatchRequest[K, V], bool, error) {
 	stats := db.autoBatcher.statsEnabled
+	opName := db.autoBatchOpName(active, atomicAll)
 
 	tx, err := db.bolt.Begin(true)
 	if err != nil {
@@ -683,6 +791,13 @@ func (db *DB[K, V]) executeAutoBatchAttempt(active []*autoBatchRequest[K, V]) (*
 		}
 	}
 
+	if atomicAll {
+		if reqErr := firstAutoBatchRequestErr(active); reqErr != nil {
+			rollbackCreated(prepared)
+			return nil, true, reqErr
+		}
+	}
+
 	if len(prepared) == 0 {
 		return nil, true, nil
 	}
@@ -708,21 +823,50 @@ func (db *DB[K, V]) executeAutoBatchAttempt(active []*autoBatchRequest[K, V]) (*
 	}
 
 	accepted := prepared
+	var atomicErr error
 	if db.hasUnique {
-		accepted = make([]autoBatchPrepared[K, V], 0, len(prepared))
-		uniqueState := db.newUniqueBatchCheckState()
-		defer db.releaseUniqueBatchCheckState(uniqueState)
-		for _, op := range prepared {
-			if uerr := db.checkUniqueBatchAppend(uniqueState, op.idx, op.oldVal, op.newVal, op.modified); uerr != nil {
-				op.req.err = uerr
+		if atomicAll {
+			idxs := make([]uint64, len(prepared))
+			oldVals := make([]*V, len(prepared))
+			newVals := make([]*V, len(prepared))
+			modified := make([][]string, len(prepared))
+			for i := range prepared {
+				op := prepared[i]
+				idxs[i] = op.idx
+				oldVals[i] = op.oldVal
+				newVals[i] = op.newVal
+				modified[i] = op.modified
+			}
+			if uerr := db.checkUniqueOnWriteMulti(idxs, oldVals, newVals, modified); uerr != nil {
 				if stats {
 					db.autoBatcher.uniqueRejected.Add(1)
 				}
-				db.rollbackCreatedStrIdxIfNeeded(op)
-				continue
+				for _, op := range prepared {
+					op.req.err = uerr
+				}
+				atomicErr = uerr
 			}
-			accepted = append(accepted, op)
+		} else {
+			accepted = make([]autoBatchPrepared[K, V], 0, len(prepared))
+			uniqueState := db.newUniqueBatchCheckState()
+			defer db.releaseUniqueBatchCheckState(uniqueState)
+			for _, op := range prepared {
+				if uerr := db.checkUniqueBatchAppend(uniqueState, op.idx, op.oldVal, op.newVal, op.modified); uerr != nil {
+					op.req.err = uerr
+					if stats {
+						db.autoBatcher.uniqueRejected.Add(1)
+					}
+					db.rollbackCreatedStrIdxIfNeeded(op)
+					continue
+				}
+				accepted = append(accepted, op)
+			}
 		}
+	}
+	if atomicErr != nil {
+		rollbackCreated(prepared)
+		db.mu.Unlock()
+		return nil, true, atomicErr
 	}
 
 	if len(accepted) == 0 {
@@ -779,7 +923,7 @@ func (db *DB[K, V]) executeAutoBatchAttempt(active []*autoBatchRequest[K, V]) (*
 	if fatalErr != nil {
 		rollbackCreated(accepted)
 		db.mu.Unlock()
-		if callbackFailedReq != nil {
+		if callbackFailedReq != nil && !atomicAll {
 			return callbackFailedReq, false, nil
 		}
 		return nil, true, fatalErr
@@ -810,7 +954,7 @@ func (db *DB[K, V]) executeAutoBatchAttempt(active []*autoBatchRequest[K, V]) (*
 	seq := bucket.Sequence()
 	snap := db.buildPreparedSnapshotWithAccumDeltaNoLock(seq, publishDelta)
 	db.stageSnapshot(snap)
-	if err = db.commit(tx, "batch"); err != nil {
+	if err = db.commit(tx, opName); err != nil {
 		if stats {
 			db.autoBatcher.txCommitErrors.Add(1)
 		}
@@ -825,7 +969,7 @@ func (db *DB[K, V]) executeAutoBatchAttempt(active []*autoBatchRequest[K, V]) (*
 		return nil, true, nil
 	}
 	committed = true
-	err = db.publishAfterCommitLocked(seq, "batch", func() {
+	err = db.publishAfterCommitLocked(seq, opName, func() {
 		db.finishSnapshotPublishNoLock(snap, publishDelta.indexDelta, publishDelta.nilDelta, publishDelta.lenDelta, publishDelta.universeAdd, publishDelta.universeRem)
 		publishDelta.releaseTransientUniverse()
 	})
@@ -848,6 +992,12 @@ func (db *DB[K, V]) executeAutoBatchAttempt(active []*autoBatchRequest[K, V]) (*
 	db.mu.Unlock()
 
 	return nil, true, nil
+}
+
+func (db *DB[K, V]) failAutoBatchJobs(batch []*autoBatchJob[K, V], err error) {
+	for _, job := range batch {
+		job.done <- err
+	}
 }
 
 func (db *DB[K, V]) failAutoBatch(batch []*autoBatchRequest[K, V], err error) {

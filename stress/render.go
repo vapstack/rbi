@@ -152,7 +152,7 @@ func formatBatchLine(sample batchSample) string {
 	stats := sample.Stats
 	delta := sample.Delta
 	return fmt.Sprintf(
-		"batch   q=%d/%d exec=%s multi=%s dist=%d/%d/%d/%d avg=%.1f hot=%t fb=%d err=%d",
+		"batch   q=%d/%d exec=%s multi=%s dist=%d/%d/%d/%d avg=%.1f hot=%t err=%d",
 		stats.QueueLen,
 		stats.MaxQueue,
 		formatOps(float64(delta.ExecutedBatches)),
@@ -163,7 +163,6 @@ func formatBatchLine(sample batchSample) string {
 		delta.BatchSize9Plus,
 		stats.AvgBatchSize,
 		stats.HotWindowActive,
-		delta.FallbackQueueFull,
 		delta.TxCommitErrors+delta.TxOpErrors+delta.TxBeginErrors+delta.CallbackErrors,
 	)
 }

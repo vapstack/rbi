@@ -251,8 +251,8 @@ Available hooks/options:
   has been written, but before commit. Useful for audit records and other
   writes to neighboring buckets.
 
-* `NoAutoBatch` - forces a single `Set`/`Patch`/`Delete` call to bypass the
-  auto-batcher and execute directly.
+* `NoBatch` - forces a write call to execute in its own internal batch. For
+  `Batch*` methods this is redundant because they are already isolated.
 
 - `CloneFunc` - optional helper for `Set`/`BatchSet` with `BeforeStore`.
   It can be used when the value becomes encodable only after normalization, or
@@ -266,8 +266,8 @@ Important notes:
   Do not retain the value pointer after the hook returns. With `Set`/`BatchSet`, 
   it mutates the caller-owned value directly. RBI does not protect against 
   aliasing and does not restore the value if the later write fails.
-- Auto-batching is only useful for parallel single-record writes from multiple
-  goroutines. `Batch*` methods already define their own explicit transaction boundaries.
+- All writes go through the internal batcher. `Batch*` methods keep their
+  explicit per-call isolation and are never merged with neighboring writes.
 - Under batching/retry, `BeforeProcess` on `Patch`/`BatchPatch`,
   `BeforeStore`, and `BeforeCommit` may run more than once for the same
   logical write, so external side effects should be idempotent.

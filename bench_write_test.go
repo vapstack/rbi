@@ -640,7 +640,7 @@ func Benchmark_Write_Update_BeforeStore_BeforeCommit_MakePatch_Parallel(b *testi
 		opts Options
 	}{
 		{
-			name: "NoAutoBatching",
+			name: "SingleRequestBatches",
 			opts: Options{
 				DisableIndexStore: true,
 				AutoBatchWindow:   -1,

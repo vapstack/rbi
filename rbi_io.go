@@ -1,7 +1,6 @@
 package rbi
 
 import (
-	"bytes"
 	"fmt"
 
 	"go.etcd.io/bbolt"
@@ -47,34 +46,6 @@ func cloneBeforeStoreValue[K ~string | ~uint64, V any](id K, v *V, cloneFn func(
 		return nil, fmt.Errorf("clone func returned nil")
 	}
 	return cloned, nil
-}
-
-func (db *DB[K, V]) snapshotValueBytes(v *V) ([]byte, error) {
-	b := getEncodeBuf()
-	defer releaseEncodeBuf(b)
-
-	if err := db.encode(v, b); err != nil {
-		return nil, fmt.Errorf("encode: %w", err)
-	}
-	return append([]byte(nil), b.Bytes()...), nil
-}
-
-func (db *DB[K, V]) rebuildStoredValueFromBaseline(id K, oldVal *V, baseline []byte, hooks []beforeStoreFunc[K, V]) (*V, []byte, error) {
-	newVal, err := db.decode(baseline)
-	if err != nil {
-		return nil, nil, fmt.Errorf("decode prepared value: %w", err)
-	}
-	if err = runBeforeStoreHooks(id, oldVal, newVal, hooks); err != nil {
-		return nil, nil, err
-	}
-
-	b := getEncodeBuf()
-	defer releaseEncodeBuf(b)
-
-	if err = db.encode(newVal, b); err != nil {
-		return nil, nil, fmt.Errorf("encode: %w", err)
-	}
-	return newVal, append([]byte(nil), b.Bytes()...), nil
 }
 
 // Get returns the value stored by id or nil if key was not found.
@@ -345,138 +316,12 @@ func (db *DB[K, V]) Set(id K, newVal *V, execOpts ...ExecOption[K, V]) error {
 		return err
 	}
 	defer db.endOp()
-	var err error
 
-	if db.autoBatcher.enabled && !cfg.noAutoBatch {
-		if err, handled := db.trySetViaAutoBatch(id, newVal, cfg.beforeStore, cfg.beforeCommit, cfg.cloneValue); handled {
-			return err
-		}
-	}
-
-	var (
-		storedVal = newVal
-		payload   []byte
-		baseline  []byte
-	)
-	if len(cfg.beforeStore) == 0 {
-		b := getEncodeBuf()
-		defer releaseEncodeBuf(b)
-		if err := db.encode(newVal, b); err != nil {
-			return fmt.Errorf("encode: %w", err)
-		}
-		payload = b.Bytes()
-	} else {
-		if cfg.cloneValue != nil {
-			if storedVal, err = cloneBeforeStoreValue(id, newVal, cfg.cloneValue); err != nil {
-				return err
-			}
-		} else {
-			if baseline, err = db.snapshotValueBytes(newVal); err != nil {
-				return err
-			}
-		}
-	}
-
-	tx, err := db.bolt.Begin(true)
+	req, err := db.buildSetAutoBatchRequest(id, newVal, cfg.beforeStore, cfg.beforeCommit, cfg.cloneValue)
 	if err != nil {
-		return fmt.Errorf("tx error: %w", err)
-	}
-	defer rollback(tx)
-
-	key := db.keyFromID(id)
-
-	bucket := tx.Bucket(db.bucket)
-	if bucket == nil {
-		return fmt.Errorf("bucket does not exist")
-	}
-
-	var oldVal *V
-	if prev := bucket.Get(key); prev != nil {
-		if oldVal, err = db.decode(prev); err != nil {
-			return fmt.Errorf("decode: %w", err)
-		}
-	}
-
-	if len(cfg.beforeStore) > 0 {
-		if cfg.cloneValue != nil {
-			if err = runBeforeStoreHooks(id, oldVal, storedVal, cfg.beforeStore); err != nil {
-				return err
-			}
-			b := getEncodeBuf()
-			defer releaseEncodeBuf(b)
-			if err = db.encode(storedVal, b); err != nil {
-				return fmt.Errorf("encode: %w", err)
-			}
-			payload = b.Bytes()
-		} else {
-			if storedVal, payload, err = db.rebuildStoredValueFromBaseline(id, oldVal, baseline, cfg.beforeStore); err != nil {
-				return err
-			}
-		}
-	}
-
-	bucket.FillPercent = db.options.BucketFillPercent
-
-	if err = bucket.Put(key, payload); err != nil {
-		return fmt.Errorf("put: %w", err)
-	}
-
-	if err = runBeforeCommitHooks(tx, id, oldVal, storedVal, cfg.beforeCommit); err != nil {
 		return err
 	}
-
-	db.mu.Lock()
-	defer db.mu.Unlock()
-
-	if err = db.unavailableErr(); err != nil {
-		return err
-	}
-
-	idx, idxCreated := db.idxFromIDWithCreated(id)
-	cleanupCreated := db.strkey && idxCreated && oldVal == nil
-	cleanupOnErr := true
-	if cleanupCreated {
-		defer func() {
-			if cleanupOnErr {
-				db.rollbackCreatedStrIdx(id, idx)
-			}
-		}()
-	}
-
-	modified := db.getModifiedIndexedFields(oldVal, storedVal)
-	if db.hasUnique {
-		if err = db.checkUniqueOnWrite(idx, oldVal, storedVal, modified); err != nil {
-			return err
-		}
-	}
-	delta := db.prepareSnapshotWriteDeltaNoLock(idx, oldVal, storedVal, modified)
-	deltaOwned := true
-	defer func() {
-		if deltaOwned {
-			delta.release()
-		}
-	}()
-	if err = advanceBucketSequence(bucket); err != nil {
-		return err
-	}
-
-	seq := bucket.Sequence()
-	snap := db.buildPreparedSnapshotWithAccumDeltaNoLock(seq, &delta)
-	db.stageSnapshot(snap)
-
-	if err = db.commit(tx, "set"); err != nil {
-		db.dropStagedSnapshot(seq)
-		return err
-	}
-	cleanupOnErr = false
-	if err = db.publishAfterCommitLocked(seq, "set", func() {
-		db.finishSnapshotPublishNoLock(snap, delta.indexDelta, delta.nilDelta, delta.lenDelta, delta.universeAdd, delta.universeRem)
-		delta.releaseTransientUniverse()
-	}); err != nil {
-		return err
-	}
-	deltaOwned = false
-	return nil
+	return db.submitAutoBatchRequests([]*autoBatchRequest[K, V]{req}, cfg.noBatch)
 }
 
 // BatchSet stores multiple values under the provided IDs in a single write
@@ -505,9 +350,6 @@ func (db *DB[K, V]) BatchSet(ids []K, newVals []*V, execOpts ...ExecOption[K, V]
 	if len(ids) == 0 {
 		return nil
 	}
-	if len(ids) == 1 {
-		return db.Set(ids[0], newVals[0], execOpts...)
-	}
 
 	for i := range newVals {
 		if newVals[i] == nil {
@@ -525,193 +367,16 @@ func (db *DB[K, V]) BatchSet(ids []K, newVals []*V, execOpts ...ExecOption[K, V]
 		return err
 	}
 	defer db.endOp()
-	var err error
 
-	var getbuf func() *bytes.Buffer
-	var payloads [][]byte
-	storedVals := newVals
-	if len(cfg.beforeStore) == 0 || cfg.cloneValue != nil {
-		// bbolt requires that value (bytes) remain valid for the life of the transaction
-
-		bufs := make([]*bytes.Buffer, 0, len(ids))
-
-		if len(ids) < 1024 {
-			defer func() {
-				for _, buf := range bufs {
-					if buf != nil {
-						releaseEncodeBuf(buf)
-					}
-				}
-			}()
-			getbuf = func() *bytes.Buffer {
-				b := getEncodeBuf()
-				bufs = append(bufs, b)
-				return b
-			}
-
-		} else {
-			getbuf = func() *bytes.Buffer {
-				b := new(bytes.Buffer)
-				bufs = append(bufs, b)
-				return b
-			}
-		}
-
-		if len(cfg.beforeStore) == 0 {
-			for _, v := range newVals {
-				b := getbuf()
-				if err := db.encode(v, b); err != nil {
-					return fmt.Errorf("encode: %w", err)
-				}
-			}
-
-			payloads = make([][]byte, len(bufs))
-			for i := range bufs {
-				payloads[i] = bufs[i].Bytes()
-			}
-		} else {
-			storedVals = make([]*V, len(newVals))
-			for i, v := range newVals {
-				if storedVals[i], err = cloneBeforeStoreValue(ids[i], v, cfg.cloneValue); err != nil {
-					return err
-				}
-			}
-		}
-	} else {
-		payloads = make([][]byte, len(newVals))
-		storedVals = make([]*V, len(newVals))
-		for i, v := range newVals {
-			if payloads[i], err = db.snapshotValueBytes(v); err != nil {
-				return err
-			}
-		}
-	}
-
-	tx, txerr := db.bolt.Begin(true)
-	if txerr != nil {
-		return fmt.Errorf("tx error: %w", txerr)
-	}
-	defer rollback(tx)
-
-	oldVals := make([]*V, len(ids))
-
-	bucket := tx.Bucket(db.bucket)
-	if bucket == nil {
-		return fmt.Errorf("bucket does not exist")
-	}
-	bucket.FillPercent = db.options.BucketFillPercent
-
-	for i, id := range ids {
-
-		key := db.keyFromID(id)
-
-		var oldVal *V
-		if prev := bucket.Get(key); prev != nil {
-			if oldVal, err = db.decode(prev); err != nil {
-				return fmt.Errorf("decode: %w", err)
-			}
-		}
-		oldVals[i] = oldVal
-
-		var payload []byte
-		if len(payloads) > 0 {
-			payload = payloads[i]
-		}
-		if len(cfg.beforeStore) > 0 {
-			if cfg.cloneValue != nil {
-				if err = runBeforeStoreHooks(id, oldVal, storedVals[i], cfg.beforeStore); err != nil {
-					return err
-				}
-				b := getbuf()
-				if err = db.encode(storedVals[i], b); err != nil {
-					return fmt.Errorf("encode: %w", err)
-				}
-				payload = b.Bytes()
-			} else {
-				if storedVals[i], payload, err = db.rebuildStoredValueFromBaseline(id, oldVal, payloads[i], cfg.beforeStore); err != nil {
-					return err
-				}
-			}
-		}
-
-		if err = bucket.Put(key, payload); err != nil {
-			return fmt.Errorf("put: %w", err)
-		}
-
-		if err = runBeforeCommitHooks(tx, id, oldVals[i], storedVals[i], cfg.beforeCommit); err != nil {
+	reqs := make([]*autoBatchRequest[K, V], len(ids))
+	for i := range ids {
+		req, err := db.buildSetAutoBatchRequest(ids[i], newVals[i], cfg.beforeStore, cfg.beforeCommit, cfg.cloneValue)
+		if err != nil {
 			return err
 		}
+		reqs[i] = req
 	}
-
-	db.mu.Lock()
-	defer db.mu.Unlock()
-
-	if err = db.unavailableErr(); err != nil {
-		return err
-	}
-
-	idxs, idxCreated := db.idxsFromIDWithCreated(ids)
-	var cleanupCreated map[uint64]K
-	if db.strkey {
-		cleanupCreated = make(map[uint64]K, len(ids))
-		for i := range idxs {
-			if idxCreated[i] && oldVals[i] == nil {
-				if _, seen := cleanupCreated[idxs[i]]; !seen {
-					cleanupCreated[idxs[i]] = ids[i]
-				}
-			}
-		}
-	}
-	cleanupOnErr := true
-	if len(cleanupCreated) > 0 {
-		defer func() {
-			if !cleanupOnErr {
-				return
-			}
-			for idx, id := range cleanupCreated {
-				db.rollbackCreatedStrIdx(id, idx)
-			}
-		}()
-	}
-
-	modified := make([][]string, len(idxs))
-	for i := range idxs {
-		modified[i] = db.getModifiedIndexedFields(oldVals[i], storedVals[i])
-	}
-
-	if db.hasUnique {
-		if err = db.checkUniqueOnWriteMulti(idxs, oldVals, storedVals, modified); err != nil {
-			return err
-		}
-	}
-	delta := db.prepareSnapshotWriteDeltaBatchNoLock(idxs, oldVals, storedVals, modified)
-	deltaOwned := true
-	defer func() {
-		if deltaOwned {
-			delta.release()
-		}
-	}()
-	if err = advanceBucketSequence(bucket); err != nil {
-		return err
-	}
-
-	seq := bucket.Sequence()
-	snap := db.buildPreparedSnapshotWithAccumDeltaNoLock(seq, &delta)
-	db.stageSnapshot(snap)
-
-	if err = db.commit(tx, "batch_set"); err != nil {
-		db.dropStagedSnapshot(seq)
-		return err
-	}
-	cleanupOnErr = false
-	if err = db.publishAfterCommitLocked(seq, "batch_set", func() {
-		db.finishSnapshotPublishNoLock(snap, delta.indexDelta, delta.nilDelta, delta.lenDelta, delta.universeAdd, delta.universeRem)
-		delta.releaseTransientUniverse()
-	}); err != nil {
-		return err
-	}
-	deltaOwned = false
-	return nil
+	return db.submitAutoBatchRequests(reqs, true)
 }
 
 // Patch applies a partial update to the value stored under the given id,
@@ -737,120 +402,18 @@ func (db *DB[K, V]) Patch(id K, patch []Field, execOpts ...ExecOption[K, V]) err
 
 // patch handles patch.
 func (db *DB[K, V]) patch(id K, fields []Field, execOpts ...ExecOption[K, V]) error {
-	if err := db.beginOp(); err != nil {
-		return err
-	}
-	defer db.endOp()
-
 	if len(fields) == 0 {
 		return nil
 	}
 	cfg := db.resolveExecOptions(execOpts)
 	ignoreUnknown := !cfg.patchStrict
-	if db.autoBatcher.enabled && !cfg.noAutoBatch {
-		if err, handled := db.tryPatchViaAutoBatch(id, fields, ignoreUnknown, cfg.beforeProcess, cfg.beforeStore, cfg.beforeCommit); handled {
-			return err
-		}
-	}
-
-	tx, err := db.bolt.Begin(true)
-	if err != nil {
+	if err := db.beginOp(); err != nil {
 		return err
 	}
-	defer rollback(tx)
+	defer db.endOp()
 
-	bucket := tx.Bucket(db.bucket)
-	if bucket == nil {
-		return fmt.Errorf("bucket does not exist")
-	}
-
-	key := db.keyFromID(id)
-
-	var oldVal *V
-	oldBytes := bucket.Get(key)
-	if oldBytes == nil {
-		return nil
-	}
-	idx := db.idxFromID(id)
-
-	if oldVal, err = db.decode(oldBytes); err != nil {
-		return fmt.Errorf("failed to decode existing value: %w", err)
-	}
-
-	newVal, err := db.decode(oldBytes)
-	if err != nil {
-		return fmt.Errorf("failed to re-decode value for patching: %w", err)
-	}
-
-	if err = db.applyPatch(newVal, fields, ignoreUnknown); err != nil {
-		return fmt.Errorf("failed to apply patch: %w", err)
-	}
-	if err = runBeforeProcessHooks(id, newVal, cfg.beforeProcess); err != nil {
-		return err
-	}
-
-	if err = runBeforeStoreHooks(id, oldVal, newVal, cfg.beforeStore); err != nil {
-		return err
-	}
-
-	b := getEncodeBuf()
-	defer releaseEncodeBuf(b)
-
-	if err = db.encode(newVal, b); err != nil {
-		return fmt.Errorf("encode: %w", err)
-	}
-
-	bucket.FillPercent = db.options.BucketFillPercent
-
-	if err = bucket.Put(key, b.Bytes()); err != nil {
-		return fmt.Errorf("put: %w", err)
-	}
-
-	if err = runBeforeCommitHooks(tx, id, oldVal, newVal, cfg.beforeCommit); err != nil {
-		return err
-	}
-
-	modified := db.getModifiedIndexedFields(oldVal, newVal)
-	delta := db.prepareSnapshotWriteDelta(idx, oldVal, newVal, modified)
-	deltaOwned := true
-	defer func() {
-		if deltaOwned {
-			delta.release()
-		}
-	}()
-
-	db.mu.Lock()
-	defer db.mu.Unlock()
-
-	if err = db.unavailableErr(); err != nil {
-		return err
-	}
-
-	if db.hasUnique {
-		if err = db.checkUniqueOnWrite(idx, oldVal, newVal, modified); err != nil {
-			return err
-		}
-	}
-	if err = advanceBucketSequence(bucket); err != nil {
-		return err
-	}
-
-	seq := bucket.Sequence()
-	snap := db.buildPreparedSnapshotWithAccumDeltaNoLock(seq, &delta)
-	db.stageSnapshot(snap)
-
-	if err = db.commit(tx, "patch"); err != nil {
-		db.dropStagedSnapshot(seq)
-		return err
-	}
-	if err = db.publishAfterCommitLocked(seq, "patch", func() {
-		db.finishSnapshotPublishNoLock(snap, delta.indexDelta, delta.nilDelta, delta.lenDelta, delta.universeAdd, delta.universeRem)
-		delta.releaseTransientUniverse()
-	}); err != nil {
-		return err
-	}
-	deltaOwned = false
-	return nil
+	req := db.buildPatchAutoBatchRequest(id, fields, ignoreUnknown, cfg.beforeProcess, cfg.beforeStore, cfg.beforeCommit)
+	return db.submitAutoBatchRequests([]*autoBatchRequest[K, V]{req}, cfg.noBatch)
 }
 
 // BatchPatch applies the same patch to all values stored under the given IDs
@@ -871,9 +434,6 @@ func (db *DB[K, V]) batchPatch(ids []K, patch []Field, execOpts ...ExecOption[K,
 	if len(ids) == 0 || len(patch) == 0 {
 		return nil
 	}
-	if len(ids) == 1 {
-		return db.patch(ids[0], patch, execOpts...)
-	}
 	if err := db.beginOp(); err != nil {
 		return err
 	}
@@ -882,145 +442,11 @@ func (db *DB[K, V]) batchPatch(ids []K, patch []Field, execOpts ...ExecOption[K,
 	cfg := db.resolveExecOptions(execOpts)
 	ignoreUnknown := !cfg.patchStrict
 
-	var getbuf func() *bytes.Buffer
-
-	// bbolt requires that value (bytes) remain valid for the life of the transaction
-
-	if len(ids) < 1024 {
-
-		bufs := make([]*bytes.Buffer, 0, len(ids))
-		defer func() {
-			for _, buf := range bufs {
-				if buf != nil {
-					releaseEncodeBuf(buf)
-				}
-			}
-		}()
-		getbuf = func() *bytes.Buffer {
-			b := getEncodeBuf()
-			bufs = append(bufs, b)
-			return b
-		}
-
-	} else {
-		getbuf = func() *bytes.Buffer { return new(bytes.Buffer) }
+	reqs := make([]*autoBatchRequest[K, V], len(ids))
+	for i := range ids {
+		reqs[i] = db.buildPatchAutoBatchRequest(ids[i], patch, ignoreUnknown, cfg.beforeProcess, cfg.beforeStore, cfg.beforeCommit)
 	}
-
-	tx, txerr := db.bolt.Begin(true)
-	if txerr != nil {
-		return fmt.Errorf("tx error: %w", txerr)
-	}
-	defer rollback(tx)
-
-	oldVals := make([]*V, 0, len(ids))
-	newVals := make([]*V, 0, len(ids))
-	idxs := make([]uint64, 0, len(ids))
-	foundIDs := make([]K, 0, len(ids))
-
-	bucket := tx.Bucket(db.bucket)
-	if bucket == nil {
-		return fmt.Errorf("bucket does not exist")
-	}
-	bucket.FillPercent = db.options.BucketFillPercent
-
-	var err error
-	for _, id := range ids {
-		key := db.keyFromID(id)
-
-		oldBytes := bucket.Get(key)
-		if oldBytes == nil {
-			continue
-		}
-
-		var (
-			oldVal *V
-			newVal *V
-		)
-		if oldVal, err = db.decode(oldBytes); err != nil {
-			return fmt.Errorf("failed to decode existing value for id %v: %w", id, err)
-		}
-		oldVals = append(oldVals, oldVal)
-
-		if newVal, err = db.decode(oldBytes); err != nil {
-			return fmt.Errorf("failed to re-decode value for patching id %v: %w", id, err)
-		}
-
-		if err = db.applyPatch(newVal, patch, ignoreUnknown); err != nil {
-			return fmt.Errorf("failed to apply patch for id %v: %w", id, err)
-		}
-		if err = runBeforeProcessHooks(id, newVal, cfg.beforeProcess); err != nil {
-			return err
-		}
-
-		if err = runBeforeStoreHooks(id, oldVal, newVal, cfg.beforeStore); err != nil {
-			return err
-		}
-		newVals = append(newVals, newVal)
-
-		b := getbuf()
-		if err = db.encode(newVal, b); err != nil {
-			return fmt.Errorf("encode: %w", err)
-		}
-		if err = bucket.Put(key, b.Bytes()); err != nil {
-			return err
-		}
-
-		if err = runBeforeCommitHooks(tx, id, oldVal, newVal, cfg.beforeCommit); err != nil {
-			return err
-		}
-
-		idxs = append(idxs, db.idxFromID(id))
-		foundIDs = append(foundIDs, id)
-	}
-
-	if len(foundIDs) == 0 {
-		return nil
-	}
-
-	modified := make([][]string, len(idxs))
-	for i := range idxs {
-		modified[i] = db.getModifiedIndexedFields(oldVals[i], newVals[i])
-	}
-	delta := db.prepareSnapshotWriteDeltaBatch(idxs, oldVals, newVals, modified)
-	deltaOwned := true
-	defer func() {
-		if deltaOwned {
-			delta.release()
-		}
-	}()
-
-	db.mu.Lock()
-	defer db.mu.Unlock()
-
-	if err = db.unavailableErr(); err != nil {
-		return err
-	}
-
-	if db.hasUnique {
-		if err = db.checkUniqueOnWriteMulti(idxs, oldVals, newVals, modified); err != nil {
-			return err
-		}
-	}
-	if err = advanceBucketSequence(bucket); err != nil {
-		return err
-	}
-
-	seq := bucket.Sequence()
-	snap := db.buildPreparedSnapshotWithAccumDeltaNoLock(seq, &delta)
-	db.stageSnapshot(snap)
-
-	if err = db.commit(tx, "batch_patch"); err != nil {
-		db.dropStagedSnapshot(seq)
-		return err
-	}
-	if err = db.publishAfterCommitLocked(seq, "batch_patch", func() {
-		db.finishSnapshotPublishNoLock(snap, delta.indexDelta, delta.nilDelta, delta.lenDelta, delta.universeAdd, delta.universeRem)
-		delta.releaseTransientUniverse()
-	}); err != nil {
-		return err
-	}
-	deltaOwned = false
-	return nil
+	return db.submitAutoBatchRequests(reqs, true)
 }
 
 // Delete removes the value stored under the given id, if any.
@@ -1036,82 +462,8 @@ func (db *DB[K, V]) Delete(id K, execOpts ...ExecOption[K, V]) error {
 	defer db.endOp()
 
 	cfg := db.resolveExecOptions(execOpts)
-
-	if db.autoBatcher.enabled && !cfg.noAutoBatch {
-		if err, handled := db.tryDeleteViaAutoBatch(id, cfg.beforeCommit); handled {
-			return err
-		}
-	}
-
-	tx, err := db.bolt.Begin(true)
-	if err != nil {
-		return fmt.Errorf("tx error: %w", err)
-	}
-	defer rollback(tx)
-
-	bucket := tx.Bucket(db.bucket)
-	if bucket == nil {
-		return fmt.Errorf("bucket does not exist")
-	}
-	bucket.FillPercent = db.options.BucketFillPercent
-
-	key := db.keyFromID(id)
-
-	var oldVal *V
-	if prev := bucket.Get(key); prev != nil {
-		if oldVal, err = db.decode(prev); err != nil {
-			return fmt.Errorf("decode: %w", err)
-		}
-	} else {
-		return nil
-	}
-
-	idx := db.idxFromID(id)
-
-	if err = bucket.Delete(key); err != nil {
-		return fmt.Errorf("delete: %w", err)
-	}
-
-	if err = runBeforeCommitHooks(tx, id, oldVal, nil, cfg.beforeCommit); err != nil {
-		return err
-	}
-
-	modified := db.getModifiedIndexedFields(oldVal, nil)
-	delta := db.prepareSnapshotWriteDelta(idx, oldVal, nil, modified)
-	deltaOwned := true
-	defer func() {
-		if deltaOwned {
-			delta.release()
-		}
-	}()
-
-	db.mu.Lock()
-	defer db.mu.Unlock()
-
-	if err = db.unavailableErr(); err != nil {
-		return err
-	}
-
-	if err = advanceBucketSequence(bucket); err != nil {
-		return err
-	}
-
-	seq := bucket.Sequence()
-	snap := db.buildPreparedSnapshotWithAccumDeltaNoLock(seq, &delta)
-	db.stageSnapshot(snap)
-
-	if err = db.commit(tx, "delete"); err != nil {
-		db.dropStagedSnapshot(seq)
-		return err
-	}
-	if err = db.publishAfterCommitLocked(seq, "delete", func() {
-		db.finishSnapshotPublishNoLock(snap, delta.indexDelta, delta.nilDelta, delta.lenDelta, delta.universeAdd, delta.universeRem)
-		delta.releaseTransientUniverse()
-	}); err != nil {
-		return err
-	}
-	deltaOwned = false
-	return nil
+	req := db.buildDeleteAutoBatchRequest(id, cfg.beforeCommit)
+	return db.submitAutoBatchRequests([]*autoBatchRequest[K, V]{req}, cfg.noBatch)
 }
 
 // BatchDelete removes all values stored under the provided ids in a single
@@ -1125,9 +477,6 @@ func (db *DB[K, V]) BatchDelete(ids []K, execOpts ...ExecOption[K, V]) error {
 	if len(ids) == 0 {
 		return nil
 	}
-	if len(ids) == 1 {
-		return db.Delete(ids[0], execOpts...)
-	}
 	if err := db.beginOp(); err != nil {
 		return err
 	}
@@ -1135,94 +484,9 @@ func (db *DB[K, V]) BatchDelete(ids []K, execOpts ...ExecOption[K, V]) error {
 
 	cfg := db.resolveExecOptions(execOpts)
 
-	tx, txerr := db.bolt.Begin(true)
-	if txerr != nil {
-		return fmt.Errorf("tx error: %w", txerr)
+	reqs := make([]*autoBatchRequest[K, V], len(ids))
+	for i := range ids {
+		reqs[i] = db.buildDeleteAutoBatchRequest(ids[i], cfg.beforeCommit)
 	}
-	defer rollback(tx)
-
-	oldVals := make([]*V, 0, len(ids))
-	idxs := make([]uint64, 0, len(ids))
-	foundIDs := make([]K, 0, len(ids))
-
-	bucket := tx.Bucket(db.bucket)
-	if bucket == nil {
-		return fmt.Errorf("bucket does not exist")
-	}
-	bucket.FillPercent = db.options.BucketFillPercent
-
-	var err error
-	for _, id := range ids {
-
-		key := db.keyFromID(id)
-
-		var oldVal *V
-		if prev := bucket.Get(key); prev != nil {
-			if oldVal, err = db.decode(prev); err != nil {
-				return fmt.Errorf("decode: %w", err)
-			}
-		} else {
-			continue
-		}
-		oldVals = append(oldVals, oldVal)
-
-		if err = bucket.Delete(key); err != nil {
-			return fmt.Errorf("delete: %w", err)
-		}
-
-		idxs = append(idxs, db.idxFromID(id))
-		foundIDs = append(foundIDs, id)
-	}
-
-	if len(foundIDs) == 0 {
-		return nil
-	}
-
-	if len(cfg.beforeCommit) > 0 {
-		for i, id := range foundIDs {
-			if err = runBeforeCommitHooks(tx, id, oldVals[i], nil, cfg.beforeCommit); err != nil {
-				return err
-			}
-		}
-	}
-
-	modified := make([][]string, len(idxs))
-	for i := range idxs {
-		modified[i] = db.getModifiedIndexedFields(oldVals[i], nil)
-	}
-	delta := db.prepareSnapshotWriteDeltaBatch(idxs, oldVals, nil, modified)
-	deltaOwned := true
-	defer func() {
-		if deltaOwned {
-			delta.release()
-		}
-	}()
-
-	db.mu.Lock()
-	defer db.mu.Unlock()
-
-	if err = db.unavailableErr(); err != nil {
-		return err
-	}
-
-	if err = advanceBucketSequence(bucket); err != nil {
-		return err
-	}
-
-	seq := bucket.Sequence()
-	snap := db.buildPreparedSnapshotWithAccumDeltaNoLock(seq, &delta)
-	db.stageSnapshot(snap)
-
-	if err = db.commit(tx, "batch_delete"); err != nil {
-		db.dropStagedSnapshot(seq)
-		return err
-	}
-	if err = db.publishAfterCommitLocked(seq, "batch_delete", func() {
-		db.finishSnapshotPublishNoLock(snap, delta.indexDelta, delta.nilDelta, delta.lenDelta, delta.universeAdd, delta.universeRem)
-		delta.releaseTransientUniverse()
-	}); err != nil {
-		return err
-	}
-	deltaOwned = false
-	return nil
+	return db.submitAutoBatchRequests(reqs, true)
 }

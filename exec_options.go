@@ -11,7 +11,7 @@ type execOptions[K ~string | ~uint64, V any] struct {
 	beforeStore   []beforeStoreFunc[K, V]
 	beforeCommit  []beforeCommitFunc[K, V]
 	cloneValue    func(K, *V) *V
-	noAutoBatch   bool
+	noBatch       bool
 	patchStrict   bool
 }
 
@@ -58,19 +58,18 @@ func BeforeProcess[K ~string | ~uint64, V any](fn func(key K, value *V) error) E
 	}
 }
 
-// NoAutoBatch forces a single-record Set/Patch/Delete calls to bypass the
-// auto-batcher and execute directly.
+// NoBatch forces a write call to execute in its own internal batch.
 //
-// NoAutoBatch affects Set, Patch, and Delete. It is ignored by BatchSet,
-// BatchPatch, and BatchDelete because those methods already define an explicit
-// multi-record transaction boundary.
+// For Set, Patch, and Delete it keeps the request from being coalesced with
+// neighboring writes.
 //
-// Do not pass it to New, use Options to disable auto-batching.
-func NoAutoBatch[K ~string | ~uint64, V any](cfg *execOptions[K, V]) {
+// For BatchSet, BatchPatch, and BatchDelete it is redundant because those
+// methods already execute as isolated internal batches.
+func NoBatch[K ~string | ~uint64, V any](cfg *execOptions[K, V]) {
 	if cfg == nil {
 		return
 	}
-	cfg.noAutoBatch = true
+	cfg.noBatch = true
 }
 
 // BeforeStore registers a callback invoked for every insert or update just

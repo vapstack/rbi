@@ -310,10 +310,11 @@ type Options struct {
 	// Default: false (disabled).
 	EnableSnapshotStats bool
 
-	// AutoBatchWindow enables lightweight automatic batching for parallel
+	// AutoBatchWindow configures the coalescing window for parallel
 	// single-record Set/Patch/Delete operations.
 	//
-	// Negative value disables automatic batching.
+	// Negative value forces the batcher to process one API write request
+	// per Bolt transaction.
 	//
 	// Default: 50us
 	//
@@ -329,8 +330,8 @@ type Options struct {
 
 	// AutoBatchMax limits max operations merged into one combined write tx.
 	//
-	// Negative value disables effective auto-batching.
-	// Value 1 also disables effective auto-batching (single op per batch).
+	// Negative value forces the batcher to process one API write request
+	// per Bolt transaction.
 	//
 	// Default: 64
 	//
@@ -682,9 +683,10 @@ func (db *DB[K, V]) initIndexedFieldAccessors() {
 
 func (db *DB[K, V]) initBatcher() {
 	maxOps := db.options.AutoBatchMax
-	if maxOps <= 1 || db.options.AutoBatchWindow <= 0 {
-		db.autoBatcher = autoBatcher[K, V]{}
-		return
+	window := db.options.AutoBatchWindow
+	if maxOps <= 1 || window <= 0 {
+		maxOps = 1
+		window = 0
 	}
 	maxQueue := db.options.AutoBatchMaxQueue
 	if maxQueue < 0 {
@@ -695,13 +697,13 @@ func (db *DB[K, V]) initBatcher() {
 		capHint = maxQueue
 	}
 	db.autoBatcher = autoBatcher[K, V]{
-		enabled:      true,
 		statsEnabled: db.options.EnableAutoBatchStats,
-		window:       db.options.AutoBatchWindow,
+		window:       window,
 		maxOps:       maxOps,
 		maxQ:         maxQueue,
-		queue:        make([]*autoBatchRequest[K, V], 0, capHint),
+		queue:        make([]*autoBatchJob[K, V], 0, capHint),
 	}
+	db.autoBatcher.cond = sync.NewCond(&db.autoBatcher.mu)
 }
 
 type planner struct {
@@ -781,15 +783,15 @@ type indexedFieldAccessor struct {
 }
 
 type autoBatcher[K ~string | ~uint64, V any] struct {
-	enabled      bool
 	statsEnabled bool
 	window       time.Duration
 	maxOps       int
 	maxQ         int
 
 	mu       sync.Mutex
+	cond     *sync.Cond
 	running  bool
-	queue    []*autoBatchRequest[K, V]
+	queue    []*autoBatchJob[K, V]
 	hotUntil time.Time
 
 	submitted          atomic.Uint64
@@ -809,10 +811,7 @@ type autoBatcher[K ~string | ~uint64, V any] struct {
 	coalesceWaits      atomic.Uint64
 	coalesceWaitNanos  atomic.Uint64
 
-	fallbackDisabled    atomic.Uint64
-	fallbackQueueFull   atomic.Uint64
-	fallbackPatchUnique atomic.Uint64
-	fallbackClosed      atomic.Uint64
+	fallbackClosed atomic.Uint64
 
 	uniqueRejected atomic.Uint64
 	txBeginErrors  atomic.Uint64
@@ -998,10 +997,8 @@ type (
 		ApproxHeapBytes uint64
 	}
 
-	// AutoBatchStats contains auto-batcher queue/batch/fallback diagnostics.
+	// AutoBatchStats contains write-batcher queue, batch, and error diagnostics.
 	AutoBatchStats struct {
-		// Enabled reports whether auto-batching is enabled.
-		Enabled bool
 		// Window is current coalescing window duration.
 		Window time.Duration
 		// MaxBatch is configured maximum auto-batch size.
@@ -1057,13 +1054,6 @@ type (
 		// CoalesceWaitTime is total time spent sleeping for coalescing.
 		CoalesceWaitTime time.Duration
 
-		// FallbackDisabled is number of write calls not queued because auto-batcher is disabled.
-		FallbackDisabled uint64
-		// FallbackQueueFull is number of write calls not queued because queue is full.
-		FallbackQueueFull uint64
-		// FallbackPatchUnique is a legacy counter of patch calls not queued due to
-		// potential unique-field touch (kept for compatibility; expected to stay 0).
-		FallbackPatchUnique uint64
 		// FallbackClosed is number of write calls rejected by auto-batcher because DB is closed.
 		FallbackClosed uint64
 
@@ -1552,7 +1542,7 @@ func (db *DB[K, V]) IndexStats() IndexStats {
 	return idx
 }
 
-// AutoBatchStats returns auto-batcher queue, batch, and fallback diagnostics.
+// AutoBatchStats returns auto-batcher queue, batch, and availability diagnostics.
 //
 // Runtime counters are collected only when Options.EnableAutoBatchStats
 // was enabled for this DB instance.
@@ -1561,7 +1551,6 @@ func (db *DB[K, V]) AutoBatchStats() AutoBatchStats {
 		return AutoBatchStats{}
 	}
 	out := AutoBatchStats{
-		Enabled:             db.autoBatcher.enabled,
 		Window:              db.autoBatcher.window,
 		MaxBatch:            db.autoBatcher.maxOps,
 		MaxQueue:            db.autoBatcher.maxQ,
@@ -1581,9 +1570,6 @@ func (db *DB[K, V]) AutoBatchStats() AutoBatchStats {
 		CoalescedSetDelete:  db.autoBatcher.coalescedSetDelete.Load(),
 		CoalesceWaits:       db.autoBatcher.coalesceWaits.Load(),
 		CoalesceWaitTime:    time.Duration(db.autoBatcher.coalesceWaitNanos.Load()),
-		FallbackDisabled:    db.autoBatcher.fallbackDisabled.Load(),
-		FallbackQueueFull:   db.autoBatcher.fallbackQueueFull.Load(),
-		FallbackPatchUnique: db.autoBatcher.fallbackPatchUnique.Load(),
 		FallbackClosed:      db.autoBatcher.fallbackClosed.Load(),
 		UniqueRejected:      db.autoBatcher.uniqueRejected.Load(),
 		TxBeginErrors:       db.autoBatcher.txBeginErrors.Load(),
@@ -1671,6 +1657,12 @@ func (db *DB[K, V]) Close() error {
 
 	db.stopAnalyzeLoop()
 	db.stopSnapshotCompactor()
+
+	db.autoBatcher.mu.Lock()
+	if db.autoBatcher.cond != nil {
+		db.autoBatcher.cond.Broadcast()
+	}
+	db.autoBatcher.mu.Unlock()
 
 	db.mu.Lock()
 	defer db.mu.Unlock()
