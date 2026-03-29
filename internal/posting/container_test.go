@@ -230,7 +230,7 @@ func TestLowLevelSetKernelsAndSearchHelpers(t *testing.T) {
 		t.Fatalf("exclusiveUnion2by2 mismatch: got=%v want=%v", unionBuf[:n], []uint16{1, 4, 7, 8, 9, 2048})
 	}
 
-	interBuf := make([]uint16, minOfInt(len(set1), len(set2)))
+	interBuf := make([]uint16, min(len(set1), len(set2)))
 	if n := intersection2by2(set1, set2, interBuf); !slices.Equal(interBuf[:n], []uint16{3, 5, 11, 1024}) {
 		t.Fatalf("intersection2by2 mismatch: got=%v want=%v", interBuf[:n], []uint16{3, 5, 11, 1024})
 	}

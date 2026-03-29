@@ -1231,7 +1231,7 @@ func (ri *runIterator16) nextMany(hs uint32, buf []uint32) int {
 
 		if ri.rc.iv[ri.curIndex].length >= ri.curPosInIndex {
 			// add as many as you can from this seq
-			moreVals = minOfInt(int(ri.rc.iv[ri.curIndex].length-ri.curPosInIndex)+1, len(buf)-n)
+			moreVals = min(int(ri.rc.iv[ri.curIndex].length-ri.curPosInIndex)+1, len(buf)-n)
 			base := uint32(ri.rc.iv[ri.curIndex].start+ri.curPosInIndex) | hs
 
 			// allows BCE
@@ -1272,7 +1272,7 @@ func (ri *runIterator16) nextMany64(hs uint64, buf []uint64) int {
 
 		if ri.rc.iv[ri.curIndex].length >= ri.curPosInIndex {
 			// add as many as you can from this seq
-			moreVals = minOfInt(int(ri.rc.iv[ri.curIndex].length-ri.curPosInIndex)+1, len(buf)-n)
+			moreVals = min(int(ri.rc.iv[ri.curIndex].length-ri.curPosInIndex)+1, len(buf)-n)
 			base := uint64(ri.rc.iv[ri.curIndex].start+ri.curPosInIndex) | hs
 
 			// allows BCE
@@ -2558,7 +2558,7 @@ func (rc *containerRun) toEfficientContainer() container16 {
 	sizeAsBitmapContainer := containerBitmapSizeInBytes()
 	card := rc.getCardinality()
 	sizeAsArrayContainer := containerArraySizeInBytes(card)
-	if sizeAsRunContainer < minOfInt(sizeAsBitmapContainer, sizeAsArrayContainer) {
+	if sizeAsRunContainer < min(sizeAsBitmapContainer, sizeAsArrayContainer) {
 		return rc
 	}
 	if card <= arrayDefaultMaxSize {
@@ -2572,7 +2572,7 @@ func (rc *containerRun) toEfficientContainerFromCardinality(card int) container1
 	sizeAsRunContainer := rc.getSizeInBytes()
 	sizeAsBitmapContainer := containerBitmapSizeInBytes()
 	sizeAsArrayContainer := containerArraySizeInBytes(card)
-	if sizeAsRunContainer < minOfInt(sizeAsBitmapContainer, sizeAsArrayContainer) {
+	if sizeAsRunContainer < min(sizeAsBitmapContainer, sizeAsArrayContainer) {
 		return rc
 	}
 	if card <= arrayDefaultMaxSize {

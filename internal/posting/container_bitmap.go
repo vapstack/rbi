@@ -1218,7 +1218,7 @@ func (bc *containerBitmap) toEfficientContainer() container16 {
 	card := bc.getCardinality()
 	sizeAsArrayContainer := containerArraySizeInBytes(card)
 
-	if sizeAsRunContainer < minOfInt(sizeAsBitmapContainer, sizeAsArrayContainer) {
+	if sizeAsRunContainer < min(sizeAsBitmapContainer, sizeAsArrayContainer) {
 		return newContainerRunFromBitmapWithRuns(bc, numRuns)
 	}
 	if card <= arrayDefaultMaxSize {

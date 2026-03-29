@@ -528,13 +528,6 @@ func lowbits(x uint32) uint16 {
 
 const maxLowBit = 0xFFFF
 
-func minOfInt(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
-
 type shortIterable interface {
 	hasNext() bool
 	next() uint16

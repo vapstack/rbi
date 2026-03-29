@@ -1010,7 +1010,7 @@ func TestContainerRunIntersectOutputCanExceedMinInputRuns(t *testing.T) {
 	if len(got.iv) != 3 {
 		t.Fatalf("intersect run count mismatch: got=%d want=3", len(got.iv))
 	}
-	if len(got.iv) <= minOfInt(len(left.iv), len(right.iv)) {
+	if len(got.iv) <= min(len(left.iv), len(right.iv)) {
 		t.Fatalf("intersect must be able to produce more than min input runs: left=%d right=%d got=%d", len(left.iv), len(right.iv), len(got.iv))
 	}
 }

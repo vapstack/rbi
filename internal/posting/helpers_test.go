@@ -273,7 +273,7 @@ func unionUint64(a, b []uint64) []uint64 {
 func intersectUint64(a, b []uint64) []uint64 {
 	a = canonicalUint64s(a)
 	b = canonicalUint64s(b)
-	out := make([]uint64, 0, minOfInt(len(a), len(b)))
+	out := make([]uint64, 0, min(len(a), len(b)))
 	i, j := 0, 0
 	for i < len(a) && j < len(b) {
 		switch {
@@ -319,7 +319,7 @@ func unionUint16(a, b []uint16) []uint16 {
 func intersectUint16(a, b []uint16) []uint16 {
 	a = canonicalUint16s(a)
 	b = canonicalUint16s(b)
-	out := make([]uint16, 0, minOfInt(len(a), len(b)))
+	out := make([]uint16, 0, min(len(a), len(b)))
 	i, j := 0, 0
 	for i < len(a) && j < len(b) {
 		switch {
@@ -370,7 +370,7 @@ func unionUint32(a, b []uint32) []uint32 {
 func intersectUint32(a, b []uint32) []uint32 {
 	a = canonicalUint32s(a)
 	b = canonicalUint32s(b)
-	out := make([]uint32, 0, minOfInt(len(a), len(b)))
+	out := make([]uint32, 0, min(len(a), len(b)))
 	i, j := 0, 0
 	for i < len(a) && j < len(b) {
 		switch {

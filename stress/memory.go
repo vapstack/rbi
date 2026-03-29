@@ -51,15 +51,15 @@ func summarizeMemory(samples []MemorySnapshot, final *MemorySnapshot) *MemorySum
 		if s == nil {
 			return
 		}
-		maxUint64(&out.MaxHeapAllocBytes, s.Go.HeapAllocBytes)
-		maxUint64(&out.MaxHeapInuseBytes, s.Go.HeapInuseBytes)
-		maxUint64(&out.MaxRSSBytes, s.Process.RSSBytes)
-		maxUint64(&out.MaxAnonymousBytes, s.Process.AnonymousBytes)
-		maxUint64(&out.MaxPrivateDirtyBytes, s.Process.PrivateDirtyBytes)
-		maxUint64(&out.MaxBenchDBMapRSSBytes, s.Process.BenchDBMapRSSBytes)
-		maxInt(&out.MaxPinnedRefs, s.Snapshot.PinnedRefs)
-		maxInt(&out.MaxRegistrySize, s.Snapshot.RegistrySize)
-		maxUint64(&out.MaxUniverseCard, s.Snapshot.UniverseCard)
+		out.MaxHeapAllocBytes = max(out.MaxHeapAllocBytes, s.Go.HeapAllocBytes)
+		out.MaxHeapInuseBytes = max(out.MaxHeapInuseBytes, s.Go.HeapInuseBytes)
+		out.MaxRSSBytes = max(out.MaxRSSBytes, s.Process.RSSBytes)
+		out.MaxAnonymousBytes = max(out.MaxAnonymousBytes, s.Process.AnonymousBytes)
+		out.MaxPrivateDirtyBytes = max(out.MaxPrivateDirtyBytes, s.Process.PrivateDirtyBytes)
+		out.MaxBenchDBMapRSSBytes = max(out.MaxBenchDBMapRSSBytes, s.Process.BenchDBMapRSSBytes)
+		out.MaxPinnedRefs = max(out.MaxPinnedRefs, s.Snapshot.PinnedRefs)
+		out.MaxRegistrySize = max(out.MaxRegistrySize, s.Snapshot.RegistrySize)
+		out.MaxUniverseCard = max(out.MaxUniverseCard, s.Snapshot.UniverseCard)
 	}
 	for i := range samples {
 		apply(&samples[i])
@@ -198,16 +198,4 @@ func parseProcKVLine(line string) (string, uint64, bool) {
 		n *= procKB
 	}
 	return key, n, true
-}
-
-func maxUint64(dst *uint64, value uint64) {
-	if value > *dst {
-		*dst = value
-	}
-}
-
-func maxInt(dst *int, value int) {
-	if value > *dst {
-		*dst = value
-	}
 }

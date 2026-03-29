@@ -739,7 +739,7 @@ func (ac *containerArray) isFull() bool {
 }
 
 func (ac *containerArray) andArray(value2 *containerArray) container16 {
-	desiredcapacity := minOfInt(ac.getCardinality(), value2.getCardinality())
+	desiredcapacity := min(ac.getCardinality(), value2.getCardinality())
 	answer := newContainerArrayCapacity(desiredcapacity)
 	length := intersection2by2(
 		ac.content,
@@ -854,7 +854,7 @@ func (ac *containerArray) toEfficientContainer() container16 {
 	sizeAsBitmapContainer := containerBitmapSizeInBytes()
 	card := ac.getCardinality()
 	sizeAsArrayContainer := containerArraySizeInBytes(card)
-	if sizeAsRunContainer < minOfInt(sizeAsBitmapContainer, sizeAsArrayContainer) {
+	if sizeAsRunContainer < min(sizeAsBitmapContainer, sizeAsArrayContainer) {
 		return newContainerRunFromArrayWithRuns(ac, numRuns)
 	}
 	if card <= arrayDefaultMaxSize {
