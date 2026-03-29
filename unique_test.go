@@ -185,19 +185,6 @@ func TestUnique_Set_DuplicateRejected(t *testing.T) {
 	}
 }
 
-func TestUnique_Set_DuplicateRejected_WithSnapshotDelta(t *testing.T) {
-	db, _ := openTempDBUint64Unique(t)
-
-	if err := db.Set(1, &UniqueTestRec{Email: "a@x", Code: 1}); err != nil {
-		t.Fatalf("Set: %v", err)
-	}
-
-	err := db.Set(2, &UniqueTestRec{Email: "a@x", Code: 2})
-	if err == nil || !errors.Is(err, ErrUniqueViolation) {
-		t.Fatalf("expected ErrUniqueViolation, got: %v", err)
-	}
-}
-
 func TestUnique_Set_SameRecordUpdateAllowed(t *testing.T) {
 	db, _ := openTempDBUint64Unique(t)
 

@@ -135,9 +135,6 @@ func (db *DB[K, V]) shouldSampleCalibration() bool {
 
 func (db *DB[K, V]) plannerCostMultiplier(plan plannerCalPlan) float64 {
 	root := db.plannerCalibrationRoot()
-	if !root.planner.calibrator.enabled {
-		return 1.0
-	}
 	cur := root.planner.calibrator.state.Load()
 	if cur == nil {
 		return 1.0
@@ -247,10 +244,7 @@ func calibrationStateFromSnapshot(s CalibrationSnapshot) (*calibration, error) {
 }
 
 func (db *DB[K, V]) initCalibration() {
-	if !db.planner.calibrator.enabled {
-		return
-	}
-	if db.planner.calibrator.state.Load() == nil {
+	if db.planner.calibrator.enabled && db.planner.calibrator.state.Load() == nil {
 		db.planner.calibrator.state.Store(newCalibration())
 	}
 
@@ -265,11 +259,11 @@ func (db *DB[K, V]) initCalibration() {
 }
 
 func (db *DB[K, V]) persistCalibrationOnClose() error {
-	if !db.planner.calibrator.enabled {
-		return nil
-	}
 	path := db.planner.calibrator.persistPath
 	if path == "" {
+		return nil
+	}
+	if db.planner.calibrator.state.Load() == nil {
 		return nil
 	}
 	return db.SaveCalibration(path)
@@ -288,6 +282,9 @@ func (db *DB[K, V]) GetCalibrationSnapshot() (CalibrationSnapshot, bool) {
 
 // SetCalibrationSnapshot replaces planner calibration state with the provided snapshot.
 func (db *DB[K, V]) SetCalibrationSnapshot(s CalibrationSnapshot) error {
+	if err := db.unavailableErr(); err != nil {
+		return err
+	}
 	root := db.plannerCalibrationRoot()
 	state, err := calibrationStateFromSnapshot(s)
 	if err != nil {
@@ -321,6 +318,9 @@ func (db *DB[K, V]) SaveCalibration(path string) error {
 
 // LoadCalibration reads planner calibration snapshot from a JSON file.
 func (db *DB[K, V]) LoadCalibration(path string) error {
+	if err := db.unavailableErr(); err != nil {
+		return err
+	}
 	if path == "" {
 		return errors.New("planner calibration path is empty")
 	}

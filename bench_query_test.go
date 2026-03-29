@@ -42,36 +42,46 @@ const (
 )
 
 type benchCacheMode struct {
-	suffix      string
-	withCaching bool
+	suffix                       string
+	clearSnapshotCachesEachQuery bool
 }
 
 var benchCacheModes = []benchCacheMode{
-	{suffix: "WithCaching", withCaching: true},
-	{suffix: "NoCaching", withCaching: false},
+	{suffix: "WithCaching"},
+	{suffix: "NoCaching", clearSnapshotCachesEachQuery: true},
 }
 
-func benchOptions(withCaching bool) Options {
-	opts := Options{
+func benchOptions() Options {
+	return Options{
 		DisableIndexLoad:  true,
 		DisableIndexStore: true,
 	}
-	if !withCaching {
-		opts.SnapshotMaterializedPredCacheMaxEntries = -1
-		opts.SnapshotMaterializedPredCacheMaxEntriesWithDelta = -1
-	}
-	return opts
 }
 
-func openBenchDBWithCaching(b *testing.B, withCaching bool) (*DB[uint64, UserBench], *bbolt.DB, string) {
+func openBenchDB(b *testing.B) (*DB[uint64, UserBench], *bbolt.DB, string) {
 	b.Helper()
 	dir, err := os.MkdirTemp("", "rbi-bench-*")
 	if err != nil {
 		b.Fatalf("os.MkdirTemp: %v", err)
 	}
 
-	db, raw := openBoltAndNew[uint64, UserBench](b, filepath.Join(dir, "bench.db"), benchOptions(withCaching))
+	db, raw := openBoltAndNew[uint64, UserBench](b, filepath.Join(dir, "bench.db"), benchOptions())
 	return db, raw, dir
+}
+
+func clearBenchSnapshotCachesIfNeeded[K ~string | ~uint64, V any](db *DB[K, V], mode benchCacheMode) {
+	if mode.clearSnapshotCachesEachQuery {
+		db.clearCurrentSnapshotCachesForTesting()
+	}
+}
+
+func prepareReadBenchWithMode[K ~string | ~uint64, V any](b *testing.B, db *DB[K, V], mode benchCacheMode, warm func()) {
+	b.Helper()
+	prepareReadBenchSnapshot(b, db)
+	if !mode.clearSnapshotCachesEachQuery {
+		warm()
+	}
+	b.ResetTimer()
 }
 
 func seedBenchData(b *testing.B, db *DB[uint64, UserBench], n int) {
@@ -150,25 +160,25 @@ func seedBenchData(b *testing.B, db *DB[uint64, UserBench], n int) {
 }
 
 var (
-	benchDBs  = make(map[bool]*DB[uint64, UserBench])
-	benchRaws = make(map[bool]*bbolt.DB)
-	benchDirs = make(map[bool]string)
+	benchDBs  = make(map[string]*DB[uint64, UserBench])
+	benchRaws = make(map[string]*bbolt.DB)
+	benchDirs = make(map[string]string)
 	oneMu     sync.Mutex
 )
 
 func buildBenchDB(b *testing.B, n int) *DB[uint64, UserBench] {
-	return buildBenchDBWithCaching(b, n, true)
+	return buildBenchDBWithCaching(b, n, benchCacheModes[0])
 }
 
-func buildBenchDBWithCaching(b *testing.B, n int, withCaching bool) *DB[uint64, UserBench] {
+func buildBenchDBWithCaching(b *testing.B, n int, mode benchCacheMode) *DB[uint64, UserBench] {
 	b.Helper()
 	oneMu.Lock()
 	defer oneMu.Unlock()
-	if db := benchDBs[withCaching]; db != nil && !db.closed.Load() {
+	if db := benchDBs[mode.suffix]; db != nil && !db.closed.Load() {
 		return db
 	}
 
-	db, raw, dir := openBenchDBWithCaching(b, withCaching)
+	db, raw, dir := openBenchDB(b)
 
 	b.StopTimer()
 	seedBenchData(b, db, n)
@@ -182,9 +192,9 @@ func buildBenchDBWithCaching(b *testing.B, n int, withCaching bool) *DB[uint64, 
 	// b.Logf("unique field keys: %v", s.UniqueFieldKeys)
 
 	b.StartTimer()
-	benchDBs[withCaching] = db
-	benchRaws[withCaching] = raw
-	benchDirs[withCaching] = dir
+	benchDBs[mode.suffix] = db
+	benchRaws[mode.suffix] = raw
+	benchDirs[mode.suffix] = dir
 	return db
 }
 
@@ -217,37 +227,37 @@ func warmBenchReadQueryOnceUint64(b *testing.B, db *DB[uint64, UserBench], q *qx
 	db.ReleaseRecords(items...)
 }
 
-func runBenchCacheModes(b *testing.B, fn func(*testing.B, bool)) {
+func runBenchCacheModes(b *testing.B, fn func(*testing.B, benchCacheMode)) {
 	b.Helper()
 	for _, mode := range benchCacheModes {
 		mode := mode
 		b.Run(mode.suffix, func(b *testing.B) {
-			fn(b, mode.withCaching)
+			fn(b, mode)
 		})
 	}
 }
 
 func runCountBenchCacheModes(b *testing.B, qf func() *qx.QX) {
 	b.Helper()
-	runBenchCacheModes(b, func(b *testing.B, withCaching bool) {
-		db := buildBenchDBWithCaching(b, benchN, withCaching)
-		runCountBench(b, db, qf())
+	runBenchCacheModes(b, func(b *testing.B, mode benchCacheMode) {
+		db := buildBenchDBWithCaching(b, benchN, mode)
+		runCountBenchWithMode(b, db, qf(), mode)
 	})
 }
 
 func runQueryKeysBenchCacheModes(b *testing.B, qf func() *qx.QX) {
 	b.Helper()
-	runBenchCacheModes(b, func(b *testing.B, withCaching bool) {
-		db := buildBenchDBWithCaching(b, benchN, withCaching)
-		runQueryKeysBench(b, db, qf())
+	runBenchCacheModes(b, func(b *testing.B, mode benchCacheMode) {
+		db := buildBenchDBWithCaching(b, benchN, mode)
+		runQueryKeysBenchWithMode(b, db, qf(), mode)
 	})
 }
 
 func runReadQueryBenchCacheModes(b *testing.B, qf func() *qx.QX) {
 	b.Helper()
-	runBenchCacheModes(b, func(b *testing.B, withCaching bool) {
-		db := buildBenchDBWithCaching(b, benchN, withCaching)
-		runReadQueryBench(b, db, qf())
+	runBenchCacheModes(b, func(b *testing.B, mode benchCacheMode) {
+		db := buildBenchDBWithCaching(b, benchN, mode)
+		runReadQueryBenchWithMode(b, db, qf(), mode)
 	})
 }
 
@@ -557,25 +567,23 @@ func Benchmark_Query_Index_Keys_Realistic_Skills_HasAll_All(b *testing.B) {
 }
 
 func Benchmark_Query_Index_Keys_Realistic_Exclusion_Limit(b *testing.B) {
-	db := buildBenchDB(b, benchN)
-	// SELECT * FROM users WHERE status = 'active' AND plan != 'free' AND country NOT IN ('US', 'GB')
-	q := qx.Query(
-		qx.EQ("status", "active"),
-		qx.NE("plan", "free"),
-		qx.NOTIN("country", []string{"US", "GB"}),
-	).Max(100)
-	runQueryKeysBench(b, db, q)
+	runQueryKeysBenchCacheModes(b, func() *qx.QX {
+		return qx.Query(
+			qx.EQ("status", "active"),
+			qx.NE("plan", "free"),
+			qx.NOTIN("country", []string{"US", "GB"}),
+		).Max(100)
+	})
 }
 
 func Benchmark_Query_Index_Keys_Realistic_Exclusion_All(b *testing.B) {
-	db := buildBenchDB(b, benchN)
-	// SELECT * FROM users WHERE status = 'active' AND plan != 'free' AND country NOT IN ('US', 'GB')
-	q := qx.Query(
-		qx.EQ("status", "active"),
-		qx.NE("plan", "free"),
-		qx.NOTIN("country", []string{"US", "GB"}),
-	)
-	runQueryKeysBench(b, db, q)
+	runQueryKeysBenchCacheModes(b, func() *qx.QX {
+		return qx.Query(
+			qx.EQ("status", "active"),
+			qx.NE("plan", "free"),
+			qx.NOTIN("country", []string{"US", "GB"}),
+		)
+	})
 }
 
 func Benchmark_Query_Index_Keys_Realistic_Autocomplete_Prefix_Limit(b *testing.B) {
@@ -630,25 +638,25 @@ func Benchmark_Query_Index_Keys_Realistic_ComplexSegment_All(b *testing.B) {
 }
 
 func Benchmark_Query_Index_Keys_Realistic_TopLevel_OR_Limit(b *testing.B) {
-	db := buildBenchDB(b, benchN)
-	q := qx.Query(
-		qx.OR(
-			qx.HAS("roles", []string{"admin"}),
-			qx.EQ("plan", "enterprise"),
-		),
-	).Max(100)
-	runQueryKeysBench(b, db, q)
+	runQueryKeysBenchCacheModes(b, func() *qx.QX {
+		return qx.Query(
+			qx.OR(
+				qx.HAS("roles", []string{"admin"}),
+				qx.EQ("plan", "enterprise"),
+			),
+		).Max(100)
+	})
 }
 
 func Benchmark_Query_Index_Keys_Realistic_TopLevel_OR_All(b *testing.B) {
-	db := buildBenchDB(b, benchN)
-	q := qx.Query(
-		qx.OR(
-			qx.HAS("roles", []string{"admin"}),
-			qx.EQ("plan", "enterprise"),
-		),
-	)
-	runQueryKeysBench(b, db, q)
+	runQueryKeysBenchCacheModes(b, func() *qx.QX {
+		return qx.Query(
+			qx.OR(
+				qx.HAS("roles", []string{"admin"}),
+				qx.EQ("plan", "enterprise"),
+			),
+		)
+	})
 }
 
 func Benchmark_Query_Index_Keys_Sort_EarlyExit(b *testing.B) {
@@ -881,12 +889,17 @@ func Benchmark_Query_Index_Keys_Gap_ArrayCountSort_MixedFilters_Offset_Limit(b *
 }
 
 func runQueryKeysBench(b *testing.B, db *DB[uint64, UserBench], q *qx.QX) {
+	runQueryKeysBenchWithMode(b, db, q, benchCacheModes[0])
+}
+
+func runQueryKeysBenchWithMode(b *testing.B, db *DB[uint64, UserBench], q *qx.QX, mode benchCacheMode) {
 	b.Helper()
 	b.ReportAllocs()
-	prepareReadBenchSnapshot(b, db)
-	warmBenchQueryKeysOnceUint64(b, db, q)
-	b.ResetTimer()
+	prepareReadBenchWithMode(b, db, mode, func() {
+		warmBenchQueryKeysOnceUint64(b, db, q)
+	})
 	for b.Loop() {
+		clearBenchSnapshotCachesIfNeeded(db, mode)
 		_, err := db.QueryKeys(q)
 		if err != nil {
 			b.Fatal(err)
@@ -895,12 +908,17 @@ func runQueryKeysBench(b *testing.B, db *DB[uint64, UserBench], q *qx.QX) {
 }
 
 func runCountBench(b *testing.B, db *DB[uint64, UserBench], q *qx.QX) {
+	runCountBenchWithMode(b, db, q, benchCacheModes[0])
+}
+
+func runCountBenchWithMode(b *testing.B, db *DB[uint64, UserBench], q *qx.QX, mode benchCacheMode) {
 	b.Helper()
 	b.ReportAllocs()
-	prepareReadBenchSnapshot(b, db)
-	warmBenchCountOnceUint64(b, db, q)
-	b.ResetTimer()
+	prepareReadBenchWithMode(b, db, mode, func() {
+		warmBenchCountOnceUint64(b, db, q)
+	})
 	for b.Loop() {
+		clearBenchSnapshotCachesIfNeeded(db, mode)
 		_, err := db.Count(q)
 		if err != nil {
 			b.Fatal(err)
@@ -909,12 +927,17 @@ func runCountBench(b *testing.B, db *DB[uint64, UserBench], q *qx.QX) {
 }
 
 func runReadQueryBench(b *testing.B, db *DB[uint64, UserBench], q *qx.QX) {
+	runReadQueryBenchWithMode(b, db, q, benchCacheModes[0])
+}
+
+func runReadQueryBenchWithMode(b *testing.B, db *DB[uint64, UserBench], q *qx.QX, mode benchCacheMode) {
 	b.Helper()
 	b.ReportAllocs()
-	prepareReadBenchSnapshot(b, db)
-	warmBenchReadQueryOnceUint64(b, db, q)
-	b.ResetTimer()
+	prepareReadBenchWithMode(b, db, mode, func() {
+		warmBenchReadQueryOnceUint64(b, db, q)
+	})
 	for b.Loop() {
+		clearBenchSnapshotCachesIfNeeded(db, mode)
 		items, err := db.Query(q)
 		if err != nil {
 			b.Fatal(err)

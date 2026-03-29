@@ -2,8 +2,8 @@
 
 Interactive and headless DB stress utility for `rbi`.
 
-It opens a benchmark database, starts worker groups by workload class, collects lightweight runtime stats, shows a live table in interactive mode, and writes a final JSON report on exit.
-The workload catalog, query mix, seeding helpers, and telemetry code are self-contained in `stress/` and do not depend on `bench/runner`.
+It opens a benchmark database, starts worker groups by workload class, collects lightweight runtime stats, 
+shows a live table in interactive mode, and writes a final JSON report on exit.
 
 If the target DB is empty, the runner seeds it with the standard benchmark dataset.
 
@@ -12,7 +12,7 @@ If the target DB is empty, the runner seeds it with the standard benchmark datas
 Interactive mode:
 
 ```bash
-go run ./stress -db bench.db -r_smp 32 -w_med 4
+go run ./stress -db bench.db
 ```
 
 Headless timed mode:
@@ -59,10 +59,13 @@ go run ./stress -db bench.db -headless -out stress_report.json -r_idx 128 -w_fst
 - `-trace-sample` : planner trace sampling (`-1` disable, `0` every query, `N` every Nth query); default is off
 - `-trace-top` : how many slowest sampled planner traces to keep in the report
 - `-bolt-no-sync` : open Bolt with `NoSync=true`
-- `-minimize-delta` : apply aggressive delta compaction/flattening settings and `ForceCompact()` the snapshot at startup
 - `-analyze-interval` : override `rbi.Options.AnalyzeInterval`
+- `-a` : set the same initial worker count for all classes
+- `-r` : set the same initial worker count for all read classes
+- `-w` : set the same initial worker count for all write classes
 
-Per-class initial worker counts can be set by alias or full class name.
+Per-class initial worker counts can be set by alias or full class name. Group flags are resolved after class/query filters:
+`-a` applies first, then `-r` / `-w`, and per-class flags override group values.
 
 Aliases:
 
@@ -79,8 +82,10 @@ Aliases:
 Examples:
 
 ```bash
-go run ./stress -db bench.db -r_idx 256 -w_fst 32
-go run ./stress -db bench.db -read_simple 64 -write_medium 8
+go run ./stress -db bench.db -r 32 -w 4
+go run ./stress -db bench.db -a 2 -r 24 -w_hvy 1
+go run ./stress -db bench.db -r_idx 32 -w_fst 4
+go run ./stress -db bench.db -read_simple 16 -write_medium 8
 ```
 
 ## Interactive Commands
@@ -94,18 +99,8 @@ In interactive mode, worker counts can be changed at runtime:
 - `w <count>` : set all write classes to the same worker count
 - `a <count>` : set all classes to the same worker count
 
-Examples:
-
-```text
-3 10
-1+5
-7-2
-r 1
-w 4
-a 0
-```
-
 After each command, the current stats window is reset and counting starts from zero again.
+The final JSON report now also stores these windows as `phases`: the initial phase plus one phase per manual command, with per-phase class/query/totals and telemetry samples.
 
 ## Output
 
@@ -123,6 +118,7 @@ The report contains:
 - memory samples
 - snapshot samples
 - autobatch samples
+- `phases`: archived stats windows between manual interactive commands
 
 On `Ctrl+C`, the utility stops workers, writes the final report, runs `debug.FreeOSMemory()`, closes the DB, and exits.
 

@@ -7,8 +7,12 @@ import (
 	"testing"
 
 	"github.com/vapstack/qx"
-	"github.com/vapstack/rbi/internal/roaring64"
+	"github.com/vapstack/rbi/internal/posting"
 )
+
+func queryCountSingleton(id uint64) posting.List {
+	return (posting.List{}).BuildAdded(id)
+}
 
 func countByExprBitmap(t *testing.T, db *DB[uint64, Rec], expr qx.Expr) uint64 {
 	t.Helper()
@@ -17,17 +21,7 @@ func countByExprBitmap(t *testing.T, db *DB[uint64, Rec], expr qx.Expr) uint64 {
 		t.Fatalf("evalExpr: %v", err)
 	}
 	defer b.release()
-	return db.countBitmapResult(b)
-}
-
-func countByExprBitmapBenchRec(t *testing.T, db *DB[uint64, countORBenchRec], expr qx.Expr) uint64 {
-	t.Helper()
-	b, err := db.evalExpr(expr)
-	if err != nil {
-		t.Fatalf("evalExpr: %v", err)
-	}
-	defer b.release()
-	return db.countBitmapResult(b)
+	return db.countPostingResult(b)
 }
 
 func countByExprBitmapUserBench(t *testing.T, db *DB[uint64, UserBench], expr qx.Expr) uint64 {
@@ -37,25 +31,30 @@ func countByExprBitmapUserBench(t *testing.T, db *DB[uint64, UserBench], expr qx
 		t.Fatalf("evalExpr: %v", err)
 	}
 	defer b.release()
-	return db.countBitmapResult(b)
+	return db.countPostingResult(b)
 }
 
-func expectPredicateExactBitmapFilterCount(t *testing.T, p predicate, src *roaring64.Bitmap, want uint64) {
+func expectPredicateExactPostingFilterCount(t *testing.T, p predicate, src posting.List, want uint64) {
 	t.Helper()
 
-	work := getRoaringBuf()
-	defer releaseRoaringBuf(work)
+	work := src.Clone()
+	defer work.Release()
 
-	mode, exactBM, _ := plannerFilterBitmapByChecks([]predicate{p}, []int{0}, src, work, true)
+	mode, exact, _ := plannerFilterPostingByChecks([]predicate{p}, []int{0}, src, &work, true)
 	if mode != plannerPredicateBucketExact {
-		t.Fatalf("expected exact bitmap filtering, got mode=%v", mode)
+		t.Fatalf("expected exact posting filtering, got mode=%v", mode)
 	}
-	if exactBM == nil {
-		t.Fatalf("expected exact filtered bitmap")
+	if exact.IsEmpty() {
+		t.Fatalf("expected exact filtered posting")
 	}
-	if got := exactBM.GetCardinality(); got != want {
-		t.Fatalf("unexpected exact filtered cardinality: got=%d want=%d", got, want)
+	if got := exact.Cardinality(); got != want {
+		t.Fatalf("unexpected exact filtered posting cardinality: got=%d want=%d", got, want)
 	}
+}
+
+func cloneSnapshotUniverse(t *testing.T, db *DB[uint64, Rec]) posting.List {
+	t.Helper()
+	return db.snapshotUniverseView().Clone()
 }
 
 type countORBenchRec struct {
@@ -106,9 +105,8 @@ func TestCount_ByPredicates_BucketLead_MatchesBitmap(t *testing.T) {
 
 func TestCount_ByPredicates_BucketLeadHasAnyResidual_MatchesBitmap(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
-		AnalyzeInterval:                                  -1,
-		SnapshotMaterializedPredCacheMaxEntries:          -1,
-		SnapshotMaterializedPredCacheMaxEntriesWithDelta: -1,
+		AnalyzeInterval:                         -1,
+		SnapshotMaterializedPredCacheMaxEntries: -1,
 	})
 
 	tagSets := [][]string{
@@ -203,13 +201,13 @@ func TestCount_ByPredicates_BucketLeadHasAnyResidual_MatchesBitmap(t *testing.T)
 	}
 
 	exactActiveBuf := getIntSliceBuf(len(active))
-	exactActive := buildBitmapFilterActive(exactActiveBuf.values, active, preds)
+	exactActive := buildPostingFilterActive(exactActiveBuf.values, active, preds)
 	defer func() {
 		exactActiveBuf.values = exactActive
 		releaseIntSliceBuf(exactActiveBuf)
 	}()
 	if countIndexSliceContains(exactActive, hasAnyIdx) {
-		t.Fatalf("expected HASANY residual to stay out of bitmap-filter subset, got=%v", exactActive)
+		t.Fatalf("expected HASANY residual to stay out of postingResult-filter subset, got=%v", exactActive)
 	}
 
 	extraExact := db.buildCountLeadResidualExactFilters(preds, active)
@@ -341,6 +339,54 @@ func TestCount_ByPredicates_PostingsLead_MatchesBitmap(t *testing.T) {
 	}
 }
 
+func TestCount_ByPredicates_BucketLead_ContradictoryPrefixesReturnZero(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
+
+	seedGeneratedUint64Data(t, db, 20_000, func(i int) *Rec {
+		return &Rec{
+			Name:   fmt.Sprintf("u_%d", i),
+			Email:  fmt.Sprintf("user%05d@example.com", i),
+			Age:    i,
+			Score:  float64(i % 1_000),
+			Active: i%2 == 0,
+			Meta: Meta{
+				Country: "US",
+			},
+		}
+	})
+	if err := db.RebuildIndex(); err != nil {
+		t.Fatalf("RebuildIndex: %v", err)
+	}
+
+	expr := qx.AND(
+		qx.PREFIX("email", "user01"),
+		qx.PREFIX("email", "user02"),
+	)
+	leaves, ok := collectAndLeaves(expr)
+	if !ok {
+		t.Fatalf("collectAndLeaves failed")
+	}
+	preds, ok := db.buildPredicatesWithMode(leaves, false)
+	if !ok {
+		t.Fatalf("buildPredicatesWithMode failed")
+	}
+	defer releasePredicates(preds)
+
+	active := []int{0, 1}
+	got, examined, ok := db.tryCountByPredicatesLeadBuckets(preds, 0, active)
+	if !ok {
+		t.Fatalf("expected bucket-lead count fast path")
+	}
+	if examined != 0 {
+		t.Fatalf("expected zero examined rows for empty prefix intersection, got=%d", examined)
+	}
+
+	want := countByExprBitmap(t, db, expr)
+	if got != want {
+		t.Fatalf("count mismatch: got=%d want=%d", got, want)
+	}
+}
+
 func TestCount_ByPredicates_BroadLeadFallbackSkipsResidualPreparation(t *testing.T) {
 	var (
 		mu     sync.Mutex
@@ -398,8 +444,8 @@ func TestCount_ByPredicates_BroadLeadFallbackSkipsResidualPreparation(t *testing
 		t.Fatalf("expected trace event")
 	}
 	ev := events[len(events)-1]
-	if ev.Plan != string(PlanCountBitmap) {
-		t.Fatalf("expected broad-lead fallback to use %q, got %q", PlanCountBitmap, ev.Plan)
+	if ev.Plan != string(PlanCountMaterialized) {
+		t.Fatalf("expected broad-lead fallback to use %q, got %q", PlanCountMaterialized, ev.Plan)
 	}
 	if ev.CountPredicatePreparations > 1 {
 		t.Fatalf("expected broad-lead fallback to avoid residual preparation, got %d total preparations", ev.CountPredicatePreparations)
@@ -409,10 +455,7 @@ func TestCount_ByPredicates_BroadLeadFallbackSkipsResidualPreparation(t *testing
 func TestCount_ORByPredicates_PostingLeadResidualExactFilters_MatchesBitmap(t *testing.T) {
 	dir := t.TempDir()
 	db, raw := openBoltAndNew[uint64, countORBenchRec](t, filepath.Join(dir, "test_count_or.db"), Options{
-		AnalyzeInterval:                      -1,
-		SnapshotCompactorRequestEveryNWrites: 1 << 30,
-		SnapshotCompactorIdleInterval:        -1,
-		SnapshotDeltaLayerMaxDepth:           1 << 30,
+		AnalyzeInterval: -1,
 	})
 	t.Cleanup(func() {
 		_ = db.Close()
@@ -491,7 +534,7 @@ func TestCount_ORByPredicates_PostingLeadResidualExactFilters_MatchesBitmap(t *t
 		t.Fatalf("evalExpr: %v", err)
 	}
 	defer b.release()
-	want := db.countBitmapResult(b)
+	want := db.countPostingResult(b)
 	if got != want {
 		t.Fatalf("count mismatch: got=%d want=%d", got, want)
 	}
@@ -587,8 +630,8 @@ func TestCount_ORByPredicates_StrictWidePrefixLeadBudgetUsesScanWeight(t *testin
 		t.Fatalf("expected trace event")
 	}
 	ev := events[len(events)-1]
-	if ev.Plan != string(PlanCountBitmap) {
-		t.Fatalf("expected strict-wide OR fallback to use %q, got %q", PlanCountBitmap, ev.Plan)
+	if ev.Plan != string(PlanCountMaterialized) {
+		t.Fatalf("expected strict-wide OR fallback to use %q, got %q", PlanCountMaterialized, ev.Plan)
 	}
 }
 
@@ -745,7 +788,7 @@ func TestCount_ORPredicates_FiveBranches_MatchesBitmap(t *testing.T) {
 	}
 }
 
-func TestCount_ORByPredicates_HybridBitmapSpill_MatchesBitmap(t *testing.T) {
+func TestCount_ORByPredicates_HybridMaterializedSpill_MatchesBitmap(t *testing.T) {
 	var (
 		mu     sync.Mutex
 		events []TraceEvent
@@ -868,13 +911,13 @@ func TestCount_ORByPredicates_HybridBitmapSpill_MatchesBitmap(t *testing.T) {
 	}
 	spilled := false
 	for _, br := range ev.ORBranches {
-		if br.SkipReason == "bitmap_spill" {
+		if br.SkipReason == "materialized_spill" {
 			spilled = true
 			break
 		}
 	}
 	if !spilled {
-		t.Fatalf("expected at least one hybrid bitmap spill branch, got trace=%+v", ev.ORBranches)
+		t.Fatalf("expected at least one hybrid postingResult spill branch, got trace=%+v", ev.ORBranches)
 	}
 }
 
@@ -938,7 +981,7 @@ func TestCount_ORByPredicates_HybridTraceEmitsUseOriginalBranchIndex(t *testing.
 	if len(ev.ORBranches) != len(expr.Operands) {
 		t.Fatalf("expected %d OR branch traces, got %d", len(expr.Operands), len(ev.ORBranches))
 	}
-	if ev.ORBranches[0].SkipReason != "bitmap_spill" {
+	if ev.ORBranches[0].SkipReason != "materialized_spill" {
 		t.Fatalf("expected branch 0 to spill, got trace=%+v", ev.ORBranches)
 	}
 	if ev.ORBranches[0].RowsEmitted != 0 {
@@ -1004,7 +1047,7 @@ func TestCountORPredicateBranchLimit_Adaptive(t *testing.T) {
 func TestCountPredicateMaterializationThresholds_Adaptive(t *testing.T) {
 	setPred := predicate{
 		kind:  predicateKindPostsAny,
-		posts: make([]postingList, 12),
+		posts: make([]posting.List, 12),
 	}
 	if shouldMaterializeCountSetPredicate(setPred, 500, 500_000) {
 		t.Fatalf("set predicate should not materialize on low probe estimate")
@@ -1028,7 +1071,7 @@ func TestCountPredicateMaterializationThresholds_Adaptive(t *testing.T) {
 	smallHasAnyResidual := predicate{
 		kind:    predicateKindPostsAny,
 		expr:    qx.Expr{Op: qx.OpHASANY, Field: "roles"},
-		posts:   make([]postingList, 3),
+		posts:   make([]posting.List, 3),
 		estCard: 80_000,
 	}
 	if !shouldUseCountLeadResidualHasAnyExactFilter(smallHasAnyResidual) {
@@ -1037,7 +1080,7 @@ func TestCountPredicateMaterializationThresholds_Adaptive(t *testing.T) {
 	if shouldUseCountLeadResidualHasAnyExactFilter(predicate{
 		kind:    predicateKindPostsAny,
 		expr:    qx.Expr{Op: qx.OpHASANY, Field: "roles"},
-		posts:   make([]postingList, 4),
+		posts:   make([]posting.List, 4),
 		estCard: 80_000,
 	}) {
 		t.Fatalf("unexpected residual exact filter beyond max term threshold")
@@ -1085,13 +1128,8 @@ func TestCount_ScalarINSplit_MatchesBitmap(t *testing.T) {
 	}
 }
 
-func TestCount_ScalarINSplit_WorksWithFieldDelta(t *testing.T) {
-	db, _ := openTempDBUint64(t, Options{
-		SnapshotCompactorRequestEveryNWrites: 1 << 30,
-		SnapshotCompactorIdleInterval:        -1,
-		SnapshotDeltaLayerMaxDepth:           1 << 30,
-		AnalyzeInterval:                      -1,
-	})
+func TestCount_ScalarINSplit_WorksAfterPatches(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
 
 	countries := []string{"US", "DE", "FR", "IN", "NL"}
 	seedGeneratedUint64Data(t, db, 12_000, func(i int) *Rec {
@@ -1122,10 +1160,6 @@ func TestCount_ScalarINSplit_WorksWithFieldDelta(t *testing.T) {
 		}
 	}
 
-	if db.getSnapshot().fieldDelta("country") == nil {
-		t.Fatalf("expected active country delta")
-	}
-
 	expr := qx.AND(
 		qx.GTE("age", 7_500),
 		qx.NOTIN("active", []bool{false}),
@@ -1139,7 +1173,7 @@ func TestCount_ScalarINSplit_WorksWithFieldDelta(t *testing.T) {
 	}
 	want := countByExprBitmap(t, db, expr)
 	if got != want {
-		t.Fatalf("count mismatch with delta: got=%d want=%d", got, want)
+		t.Fatalf("count mismatch after patches: got=%d want=%d", got, want)
 	}
 }
 
@@ -1200,7 +1234,7 @@ func TestCount_BuildPredicates_DeferBroadRangeMaterialization(t *testing.T) {
 	}
 	releasePredicates(predsDefault)
 	cached, ok := db.getSnapshot().loadMaterializedPred(cacheKey)
-	if !ok || cached == nil || cached.IsEmpty() {
+	if !ok || cached.IsEmpty() {
 		t.Fatalf("expected default predicate build to populate numeric range cache")
 	}
 }
@@ -1211,7 +1245,6 @@ func TestCount_PreparePredicate_UsesBroadRangeComplementWithoutCache(t *testing.
 		opts := Options{AnalyzeInterval: -1}
 		if !withCache {
 			opts.SnapshotMaterializedPredCacheMaxEntries = -1
-			opts.SnapshotMaterializedPredCacheMaxEntriesWithDelta = -1
 		}
 		db, _ := openTempDBUint64(t, opts)
 		seedGeneratedUint64Data(t, db, 80_000, func(i int) *Rec {
@@ -1234,7 +1267,7 @@ func TestCount_PreparePredicate_UsesBroadRangeComplementWithoutCache(t *testing.
 
 	expr := qx.Expr{Op: qx.OpGTE, Field: "age", Value: 1_000}
 
-	t.Run("NoCacheUsesLazyExactBitmapFilter", func(t *testing.T) {
+	t.Run("NoCacheUsesLazyExactPostingFilter", func(t *testing.T) {
 		db := makeDB(t, false)
 		p, ok := db.buildPredicateWithMode(expr, false)
 		if !ok {
@@ -1254,22 +1287,21 @@ func TestCount_PreparePredicate_UsesBroadRangeComplementWithoutCache(t *testing.
 		if p.kind != predicateKindCustom {
 			t.Fatalf("expected broad no-cache range to stay custom and lazy, got kind=%v", p.kind)
 		}
-		if !p.supportsBitmapFilter() || !p.bitmapFilterCheap {
-			t.Fatalf("expected broad no-cache range to expose cheap exact bitmap filter")
+		if !p.supportsPostingFilter() || !p.postingFilterCheap {
+			t.Fatalf("expected broad no-cache range to expose cheap exact posting filter")
 		}
 
-		src := roaring64.NewBitmap()
-		src.AddRange(1, universe+1)
+		src := cloneSnapshotUniverse(t, db)
+		defer src.Release()
 		want := countByExprBitmap(t, db, expr)
-		expectPredicateExactBitmapFilterCount(t, p, src, want)
+		expectPredicateExactPostingFilterCount(t, p, src, want)
 	})
 }
 
 func TestCount_PreparePredicate_UsesTinyPostingBroadRangeComplement(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
-		AnalyzeInterval:                                  -1,
-		SnapshotMaterializedPredCacheMaxEntries:          -1,
-		SnapshotMaterializedPredCacheMaxEntriesWithDelta: -1,
+		AnalyzeInterval:                         -1,
+		SnapshotMaterializedPredCacheMaxEntries: -1,
 	})
 	seedGeneratedUint64Data(t, db, 120_000, func(i int) *Rec {
 		age := 7
@@ -1335,17 +1367,17 @@ func TestCount_PreparePredicate_UsesTinyPostingBroadRangeComplement(t *testing.T
 			if p.kind != predicateKindCustom {
 				t.Fatalf("expected tiny complement without cache to stay custom, got kind=%v", p.kind)
 			}
-			if p.bm != nil {
-				t.Fatalf("expected tiny complement to avoid bitmap materialization")
+			if !p.ids.IsEmpty() {
+				t.Fatalf("expected tiny complement to avoid postingResult materialization")
 			}
-			if !p.supportsBitmapFilter() || !p.bitmapFilterCheap {
-				t.Fatalf("expected tiny complement predicate to support cheap exact bitmap filtering")
+			if !p.supportsPostingFilter() || !p.postingFilterCheap {
+				t.Fatalf("expected tiny complement predicate to support cheap exact posting filtering")
 			}
 
-			src := roaring64.NewBitmap()
-			src.AddRange(1, universe+1)
+			src := cloneSnapshotUniverse(t, db)
+			defer src.Release()
 			want := countByExprBitmap(t, db, tc.expr)
-			expectPredicateExactBitmapFilterCount(t, p, src, want)
+			expectPredicateExactPostingFilterCount(t, p, src, want)
 		})
 	}
 }
@@ -1356,7 +1388,7 @@ func TestCount_PreparePredicate_UsesProbeBoundedBroadRangeComplement(t *testing.
 		opts := Options{AnalyzeInterval: -1}
 		if !withCache {
 			opts.SnapshotMaterializedPredCacheMaxEntries = -1
-			opts.SnapshotMaterializedPredCacheMaxEntriesWithDelta = -1
+			opts.SnapshotMaterializedPredCacheMaxEntries = -1
 		}
 		db, _ := openTempDBUint64(t, opts)
 		seedGeneratedUint64Data(t, db, 160_000, func(i int) *Rec {
@@ -1403,13 +1435,13 @@ func TestCount_PreparePredicate_UsesProbeBoundedBroadRangeComplement(t *testing.
 				t.Fatalf("prepareCountPredicate: %v", err)
 			}
 			if tc.withCache {
-				if p.kind != predicateKindBitmapNot {
+				if p.kind != predicateKindMaterializedNot {
 					t.Fatalf("expected cached probe-bounded broad range to switch to bitmapNot complement, got kind=%v", p.kind)
 				}
-				if p.bm == nil {
-					t.Fatalf("expected complement bitmap")
+				if p.ids.IsEmpty() {
+					t.Fatalf("expected complement postingResult")
 				}
-				if got := p.bm.GetCardinality(); got <= countPredBroadRangeComplementMaxCard {
+				if got := p.ids.Cardinality(); got <= countPredBroadRangeComplementMaxCard {
 					t.Fatalf("expected complement wider than legacy cap, got=%d", got)
 				}
 				key, isSlice, isNil, err := db.exprValueToIdxScalar(expr)
@@ -1418,8 +1450,8 @@ func TestCount_PreparePredicate_UsesProbeBoundedBroadRangeComplement(t *testing.
 				}
 				cacheKey := db.materializedPredComplementCacheKeyForScalar(expr.Field, expr.Op, key)
 				cached, ok := db.getSnapshot().loadMaterializedPred(cacheKey)
-				if !ok || cached == nil || cached != p.bm {
-					t.Fatalf("expected complement bitmap to be cached and shared")
+				if !ok || cached.IsEmpty() {
+					t.Fatalf("expected complement postingResult to be cached")
 				}
 				return
 			}
@@ -1427,14 +1459,264 @@ func TestCount_PreparePredicate_UsesProbeBoundedBroadRangeComplement(t *testing.
 			if p.kind != predicateKindCustom {
 				t.Fatalf("expected no-cache broad range to stay custom and lazy, got kind=%v", p.kind)
 			}
-			if !p.supportsBitmapFilter() || !p.bitmapFilterCheap {
-				t.Fatalf("expected no-cache broad range to expose cheap exact bitmap filter")
+			if !p.supportsPostingFilter() || !p.postingFilterCheap {
+				t.Fatalf("expected no-cache broad range to expose cheap exact posting filter")
 			}
 
-			src := roaring64.NewBitmap()
-			src.AddRange(1, universe+1)
+			src := cloneSnapshotUniverse(t, db)
+			defer src.Release()
 			want := countByExprBitmap(t, db, expr)
-			expectPredicateExactBitmapFilterCount(t, p, src, want)
+			expectPredicateExactPostingFilterCount(t, p, src, want)
+		})
+	}
+}
+
+func seedBroadRangeComplementOptData(t *testing.T, db *DB[uint64, Rec], lowCount, highCount, nilCount int) {
+	t.Helper()
+
+	total := lowCount + highCount + nilCount
+	ids := make([]uint64, 0, 1000)
+	vals := make([]*Rec, 0, 1000)
+	flush := func() {
+		t.Helper()
+		if len(ids) == 0 {
+			return
+		}
+		if err := db.BatchSet(ids, vals); err != nil {
+			t.Fatalf("BatchSet(seed broad range opt): %v", err)
+		}
+		ids = ids[:0]
+		vals = vals[:0]
+	}
+
+	for i := 0; i < total; i++ {
+		var opt *string
+		switch {
+		case i < lowCount:
+			v := fmt.Sprintf("a_%05d", i)
+			opt = &v
+		case i < lowCount+highCount:
+			v := fmt.Sprintf("z_%05d", i)
+			opt = &v
+		}
+
+		rec := &Rec{
+			Name:   fmt.Sprintf("u_%d", i),
+			Email:  fmt.Sprintf("user%05d@example.com", i),
+			Age:    i,
+			Score:  float64(i % 1000),
+			Active: i%2 == 0,
+			Meta: Meta{
+				Country: "US",
+			},
+			Opt: opt,
+		}
+		ids = append(ids, uint64(i+1))
+		vals = append(vals, rec)
+		if len(ids) == cap(ids) {
+			flush()
+		}
+	}
+	flush()
+	if err := db.RebuildIndex(); err != nil {
+		t.Fatalf("RebuildIndex: %v", err)
+	}
+}
+
+func prepareBroadRangeComplementPredicate(t *testing.T, db *DB[uint64, Rec], expr qx.Expr, leadProbeEst uint64) (predicate, string) {
+	t.Helper()
+
+	p, ok := db.buildPredicateWithMode(expr, false)
+	if !ok {
+		t.Fatalf("buildPredicateWithMode failed")
+	}
+	universe := db.snapshotUniverseCardinality()
+	if err := db.prepareCountPredicate(&p, leadProbeEst, universe); err != nil {
+		releasePredicates([]predicate{p})
+		t.Fatalf("prepareCountPredicate: %v", err)
+	}
+	if p.kind != predicateKindMaterializedNot {
+		releasePredicates([]predicate{p})
+		t.Fatalf("expected broad range predicate to materialize complement postingResult, got kind=%v", p.kind)
+	}
+
+	key, isSlice, isNil, err := db.exprValueToIdxScalar(expr)
+	if err != nil || isSlice || isNil {
+		releasePredicates([]predicate{p})
+		t.Fatalf("exprValueToIdxScalar: err=%v isSlice=%v isNil=%v", err, isSlice, isNil)
+	}
+	cacheKey := db.materializedPredComplementCacheKeyForScalar(expr.Field, expr.Op, key)
+	if cacheKey == "" {
+		releasePredicates([]predicate{p})
+		t.Fatalf("expected non-empty complement cache key")
+	}
+	return p, cacheKey
+}
+
+func TestCount_PreparePredicate_BroadRangeComplementIncludesNilRows(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
+	seedBroadRangeComplementOptData(t, db, 4_000, 72_000, 4_000)
+
+	expr := qx.Expr{Op: qx.OpGTE, Field: "opt", Value: "m"}
+	p, _ := prepareBroadRangeComplementPredicate(t, db, expr, 3_000)
+	defer releasePredicates([]predicate{p})
+
+	src := cloneSnapshotUniverse(t, db)
+	defer src.Release()
+	want := countByExprBitmap(t, db, expr)
+	expectPredicateExactPostingFilterCount(t, p, src, want)
+}
+
+func TestCount_PreparePredicate_BroadRangeComplementCacheInvalidatedByNilFieldWrites(t *testing.T) {
+	expr := qx.Expr{Op: qx.OpGTE, Field: "opt", Value: "m"}
+
+	t.Run("InsertOnly", func(t *testing.T) {
+		db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
+		seedBroadRangeComplementOptData(t, db, 4_000, 76_000, 0)
+
+		p, cacheKey := prepareBroadRangeComplementPredicate(t, db, expr, 3_000)
+		prevSnap := db.getSnapshot()
+		prevCached, ok := prevSnap.loadMaterializedPred(cacheKey)
+		if !ok || prevCached.IsEmpty() {
+			releasePredicates([]predicate{p})
+			t.Fatalf("expected cached complement postingResult before nil insert")
+		}
+		releasePredicates([]predicate{p})
+
+		if err := db.Set(90_001, &Rec{
+			Name:   "nil_insert",
+			Email:  "nil_insert@example.test",
+			Age:    90_001,
+			Score:  1,
+			Active: true,
+			Meta: Meta{
+				Country: "US",
+			},
+			Opt: nil,
+		}); err != nil {
+			t.Fatalf("Set(nil insert): %v", err)
+		}
+
+		if _, ok := db.getSnapshot().loadMaterializedPred(cacheKey); ok {
+			t.Fatalf("expected nil-only insert to invalidate inherited complement cache")
+		}
+
+		p, _ = prepareBroadRangeComplementPredicate(t, db, expr, 3_000)
+		defer releasePredicates([]predicate{p})
+		nextCached, ok := db.getSnapshot().loadMaterializedPred(cacheKey)
+		if !ok || nextCached.IsEmpty() {
+			t.Fatalf("expected complement cache to be rebuilt after nil insert")
+		}
+		if nextCached == prevCached {
+			t.Fatalf("expected nil-only insert to rebuild complement cache instead of reusing previous postingResult")
+		}
+
+		src := cloneSnapshotUniverse(t, db)
+		defer src.Release()
+		want := countByExprBitmap(t, db, expr)
+		expectPredicateExactPostingFilterCount(t, p, src, want)
+	})
+
+	t.Run("Delete", func(t *testing.T) {
+		db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
+		seedBroadRangeComplementOptData(t, db, 4_000, 72_000, 4_000)
+
+		p, cacheKey := prepareBroadRangeComplementPredicate(t, db, expr, 3_000)
+		prevSnap := db.getSnapshot()
+		prevCached, ok := prevSnap.loadMaterializedPred(cacheKey)
+		if !ok || prevCached.IsEmpty() {
+			releasePredicates([]predicate{p})
+			t.Fatalf("expected cached complement postingResult before nil delete")
+		}
+		releasePredicates([]predicate{p})
+
+		nilID := uint64(80_000)
+		if err := db.Delete(nilID); err != nil {
+			t.Fatalf("Delete(nil row): %v", err)
+		}
+
+		if _, ok := db.getSnapshot().loadMaterializedPred(cacheKey); ok {
+			t.Fatalf("expected nil-only delete to invalidate inherited complement cache")
+		}
+
+		p, _ = prepareBroadRangeComplementPredicate(t, db, expr, 3_000)
+		defer releasePredicates([]predicate{p})
+		nextCached, ok := db.getSnapshot().loadMaterializedPred(cacheKey)
+		if !ok || nextCached.IsEmpty() {
+			t.Fatalf("expected complement cache to be rebuilt after nil delete")
+		}
+		if nextCached == prevCached {
+			t.Fatalf("expected nil-only delete to rebuild complement cache instead of reusing previous postingResult")
+		}
+
+		src := cloneSnapshotUniverse(t, db)
+		defer src.Release()
+		want := countByExprBitmap(t, db, expr)
+		expectPredicateExactPostingFilterCount(t, p, src, want)
+	})
+}
+
+func TestCount_PreparePredicate_BroadRangeComplementMatchesChunkedRangeAfterChurn(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
+
+	indexExtBatchSetGenerated(t, db, 1, 500, func(i int) *Rec {
+		return &Rec{
+			Name:   fmt.Sprintf("cnt/%03d", i),
+			Age:    1000 + i,
+			Active: i%3 == 0,
+		}
+	})
+
+	for _, id := range []uint64{110, 111, 112, 113, 114, 115} {
+		if err := db.Delete(id); err != nil {
+			t.Fatalf("Delete(%d): %v", id, err)
+		}
+	}
+	for _, tc := range []struct {
+		id     uint64
+		age    int
+		active bool
+	}{
+		{id: 30, age: 1100, active: true},
+		{id: 31, age: 1099, active: true},
+		{id: 32, age: 1260, active: true},
+		{id: 33, age: 1259, active: false},
+		{id: 34, age: 1180, active: true},
+	} {
+		if err := db.Patch(tc.id, []Field{
+			{Name: "age", Value: tc.age},
+			{Name: "active", Value: tc.active},
+		}); err != nil {
+			t.Fatalf("Patch(%d): %v", tc.id, err)
+		}
+	}
+
+	if db.fieldOverlay("age").chunked == nil {
+		t.Fatalf("expected age field to use chunked storage")
+	}
+
+	src := cloneSnapshotUniverse(t, db)
+	defer src.Release()
+
+	for _, tc := range []struct {
+		name string
+		expr qx.Expr
+	}{
+		{
+			name: "GTE",
+			expr: qx.Expr{Op: qx.OpGTE, Field: "age", Value: 1100},
+		},
+		{
+			name: "LT",
+			expr: qx.Expr{Op: qx.OpLT, Field: "age", Value: 1260},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p, _ := prepareBroadRangeComplementPredicate(t, db, tc.expr, 166)
+			defer releasePredicates([]predicate{p})
+
+			want := countByExprBitmap(t, db, tc.expr)
+			expectPredicateExactPostingFilterCount(t, p, src, want)
 		})
 	}
 }
@@ -1478,29 +1760,25 @@ func TestCount_PreparePredicate_KeepsLegacyCapForComparableBroadLead(t *testing.
 }
 
 func TestCount_BroadRangeComplementFastMaterializationGate(t *testing.T) {
-	probe := make([]postingList, 0, 5_000)
+	probe := make([]posting.List, 0, 5_000)
 	for i := 0; i < 5_000; i++ {
-		probe = append(probe, postingList{bm: postingSingleFlag, single: uint64(i)})
+		probe = append(probe, queryCountSingleton(uint64(i)))
 	}
-	if !shouldUseFastCountBroadRangeComplementMaterialization(probe, 5_000) {
+	if !shouldUseFastCountBroadRangeComplementMaterializationForShape(len(probe), 5_000) {
 		t.Fatalf("expected many tiny buckets to use fast complement materialization")
 	}
-	if shouldUseFastCountBroadRangeComplementMaterialization(probe[:2_000], 2_000) {
+	if shouldUseFastCountBroadRangeComplementMaterializationForShape(len(probe[:2_000]), 2_000) {
 		t.Fatalf("expected short probe to keep regular complement materialization")
 	}
-	if shouldUseFastCountBroadRangeComplementMaterialization(probe, 90_000) {
+	if shouldUseFastCountBroadRangeComplementMaterializationForShape(len(probe), 90_000) {
 		t.Fatalf("expected dense buckets to keep regular complement materialization")
 	}
 }
 
 func TestCount_PreparePredicate_UsesExactNumericEstimateForSkewedBroadRange(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
-		AnalyzeInterval:                                  -1,
-		SnapshotCompactorRequestEveryNWrites:             1 << 30,
-		SnapshotCompactorIdleInterval:                    -1,
-		SnapshotDeltaLayerMaxDepth:                       1 << 30,
-		SnapshotMaterializedPredCacheMaxEntries:          -1,
-		SnapshotMaterializedPredCacheMaxEntriesWithDelta: -1,
+		AnalyzeInterval:                         -1,
+		SnapshotMaterializedPredCacheMaxEntries: -1,
 	})
 
 	db.DisableSync()
@@ -1515,7 +1793,7 @@ func TestCount_PreparePredicate_UsesExactNumericEstimateForSkewedBroadRange(t *t
 		sampleC   = 9_999
 		rangeFrom = 1_000
 	)
-	const batchSize = 20_000
+	const batchSize = 32 << 10
 	batchIDs := make([]uint64, 0, batchSize)
 	batchVals := make([]*Rec, 0, batchSize)
 	flush := func() {
@@ -1591,23 +1869,19 @@ func TestCount_PreparePredicate_UsesExactNumericEstimateForSkewedBroadRange(t *t
 	if p.kind != predicateKindCustom {
 		t.Fatalf("expected skewed broad numeric range without cache to stay custom, got kind=%v", p.kind)
 	}
-	if !p.supportsBitmapFilter() || !p.bitmapFilterCheap {
-		t.Fatalf("expected skewed broad numeric range to expose cheap exact bitmap filter")
+	if !p.supportsPostingFilter() || !p.postingFilterCheap {
+		t.Fatalf("expected skewed broad numeric range to expose cheap exact posting filter")
 	}
 
-	src := roaring64.NewBitmap()
-	src.AddRange(1, universe+1)
-	expectPredicateExactBitmapFilterCount(t, p, src, wantIn)
+	src := cloneSnapshotUniverse(t, db)
+	defer src.Release()
+	expectPredicateExactPostingFilterCount(t, p, src, wantIn)
 }
 
-func TestCount_PreparePredicate_UsesBroadRangeComplementWithDeltaOverlay(t *testing.T) {
+func TestCount_PreparePredicate_UsesBroadRangeComplementOnFullSnapshot(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
-		AnalyzeInterval:                                  -1,
-		SnapshotCompactorRequestEveryNWrites:             1 << 30,
-		SnapshotCompactorIdleInterval:                    -1,
-		SnapshotDeltaLayerMaxDepth:                       1 << 30,
-		SnapshotMaterializedPredCacheMaxEntries:          -1,
-		SnapshotMaterializedPredCacheMaxEntriesWithDelta: -1,
+		AnalyzeInterval:                         -1,
+		SnapshotMaterializedPredCacheMaxEntries: -1,
 	})
 
 	db.DisableSync()
@@ -1619,7 +1893,7 @@ func TestCount_PreparePredicate_UsesBroadRangeComplementWithDeltaOverlay(t *test
 		wantOut   uint64
 		rangeFrom = 1_000
 	)
-	const batchSize = 20_000
+	const batchSize = 32 << 10
 	batchIDs := make([]uint64, 0, batchSize)
 	batchVals := make([]*Rec, 0, batchSize)
 	flush := func() {
@@ -1665,11 +1939,6 @@ func TestCount_PreparePredicate_UsesBroadRangeComplementWithDeltaOverlay(t *test
 
 	setNumericBucketKnobs(t, db, 128, 1, 1)
 
-	snap := db.getSnapshot()
-	if snap == nil || snap.fieldDelta("age") == nil {
-		t.Fatalf("expected age field delta to remain in snapshot")
-	}
-
 	expr := qx.Expr{Op: qx.OpGTE, Field: "age", Value: rangeFrom}
 	p, ok := db.buildPredicateWithMode(expr, false)
 	if !ok {
@@ -1692,22 +1961,21 @@ func TestCount_PreparePredicate_UsesBroadRangeComplementWithDeltaOverlay(t *test
 		t.Fatalf("prepareCountPredicate: %v", err)
 	}
 	if p.kind != predicateKindCustom {
-		t.Fatalf("expected delta-backed broad numeric range without cache to stay custom, got kind=%v", p.kind)
+		t.Fatalf("expected broad numeric range without cache to stay custom, got kind=%v", p.kind)
 	}
-	if !p.supportsBitmapFilter() || !p.bitmapFilterCheap {
-		t.Fatalf("expected delta-backed broad numeric range to expose cheap exact bitmap filter")
+	if !p.supportsPostingFilter() || !p.postingFilterCheap {
+		t.Fatalf("expected broad numeric range to expose cheap exact posting filter")
 	}
 
-	src := roaring64.NewBitmap()
-	src.AddRange(1, universe+1)
-	expectPredicateExactBitmapFilterCount(t, p, src, wantIn)
+	src := cloneSnapshotUniverse(t, db)
+	defer src.Release()
+	expectPredicateExactPostingFilterCount(t, p, src, wantIn)
 }
 
 func TestCount_PickLeadPredicate_PrefersLeadThatUnlocksCustomResidualMaterialization(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
-		AnalyzeInterval:                                  -1,
-		SnapshotMaterializedPredCacheMaxEntries:          -1,
-		SnapshotMaterializedPredCacheMaxEntriesWithDelta: -1,
+		AnalyzeInterval:                         -1,
+		SnapshotMaterializedPredCacheMaxEntries: -1,
 	})
 
 	seedGeneratedUint64Data(t, db, 40_000, func(i int) *Rec {
@@ -1809,7 +2077,7 @@ func TestCount_PickLeadPredicate_PrefersLeadThatUnlocksCustomResidualMaterializa
 	if err := db.prepareCountPredicate(&containsWithCountryLead, preds[countryIdx].estCard, universe); err != nil {
 		t.Fatalf("prepareCountPredicate(country lead): %v", err)
 	}
-	if containsWithCountryLead.kind != predicateKindBitmap {
+	if containsWithCountryLead.kind != predicateKindMaterialized {
 		t.Fatalf("expected broader IN lead probe to materialize CONTAINS residual, got kind=%v", containsWithCountryLead.kind)
 	}
 
@@ -1836,9 +2104,8 @@ func TestCount_PickLeadPredicate_PrefersLeadThatUnlocksCustomResidualMaterializa
 
 func TestCount_PickORLeadPredicate_PrefersPrefixLeadOverCheapEqLead(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
-		AnalyzeInterval:                                  -1,
-		SnapshotMaterializedPredCacheMaxEntries:          -1,
-		SnapshotMaterializedPredCacheMaxEntriesWithDelta: -1,
+		AnalyzeInterval:                         -1,
+		SnapshotMaterializedPredCacheMaxEntries: -1,
 	})
 
 	seedGeneratedUint64Data(t, db, 40_000, func(i int) *Rec {
@@ -1912,5 +2179,28 @@ func TestCount_PickORLeadPredicate_PrefersPrefixLeadOverCheapEqLead(t *testing.T
 	}
 	if leadEst != preds[prefixIdx].estCard {
 		t.Fatalf("unexpected chosen OR lead est: got=%d want=%d", leadEst, preds[prefixIdx].estCard)
+	}
+}
+
+func TestCountLeavesForUniquePath_ReusesScratchForSingleLeaf(t *testing.T) {
+	expr := qx.EQ("email", "a@x")
+	var buf [4]qx.Expr
+
+	leaves, ok := countLeavesForUniquePath(expr, buf[:0])
+	if !ok {
+		t.Fatalf("countLeavesForUniquePath: ok=false")
+	}
+	if len(leaves) != 1 {
+		t.Fatalf("unexpected leaves len: %d", len(leaves))
+	}
+	if cap(leaves) != len(buf) {
+		t.Fatalf("expected scratch-backed slice cap=%d, got %d", len(buf), cap(leaves))
+	}
+	if leaves[0].Op != expr.Op || leaves[0].Field != expr.Field || leaves[0].Value != expr.Value || leaves[0].Not != expr.Not {
+		t.Fatalf("unexpected leaf: got=%v want=%v", leaves[0], expr)
+	}
+	leaves[0].Field = "other"
+	if buf[0].Field != "other" {
+		t.Fatalf("expected returned slice to reuse caller scratch")
 	}
 }

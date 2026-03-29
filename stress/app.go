@@ -41,6 +41,10 @@ type app struct {
 
 	epoch atomic.Pointer[runEpoch]
 
+	phaseMu        sync.Mutex
+	archivedPhases []phaseReport
+	nextPhaseIndex int
+
 	statusMu sync.Mutex
 	status   string
 }
@@ -66,20 +70,21 @@ type workerHandle struct {
 
 type runEpoch struct {
 	startedAt time.Time
+	phaseIdx  int
+	phaseKind string
+
+	startedByCommand string
 
 	memoryBaseline *MemorySnapshot
-	poolBase       poolSample
 	snapshotBase   snapshotSample
 	batchBase      batchSample
 	planner        *plannerTraceEpoch
 
 	mu              sync.Mutex
 	memorySamples   []MemorySnapshot
-	poolSamples     []poolSample
 	snapshotSamples []snapshotSample
 	batchSamples    []batchSample
 	lastMemory      *MemorySnapshot
-	lastPool        poolSample
 	lastSnapshot    snapshotSample
 	lastBatch       batchSample
 	tps             map[string]*tpsState
@@ -140,6 +145,7 @@ func newApp(handle *DBHandle, catalog []*classDescriptor, refreshEvery, telemetr
 		stopCh:         make(chan struct{}),
 		classes:        make([]*classController, 0, len(catalog)),
 		byID:           make(map[int]*classController, len(catalog)),
+		nextPhaseIndex: 1,
 	}
 	for _, desc := range catalog {
 		ctrl := &classController{
@@ -150,7 +156,7 @@ func newApp(handle *DBHandle, catalog []*classDescriptor, refreshEvery, telemetr
 		a.classes = append(a.classes, ctrl)
 		a.byID[desc.Info.ID] = ctrl
 	}
-	a.resetEpoch()
+	a.resetEpochWithMeta("initial", "")
 	return a
 }
 
@@ -233,7 +239,7 @@ func (a *app) applyInitialWorkers(initial map[string]int) {
 			class.setWorkers(n)
 		}
 	}
-	a.resetEpoch()
+	a.resetEpochWithMeta("initial", "")
 }
 
 func (a *app) stopAllWorkers() {
@@ -248,12 +254,12 @@ func (a *app) waitWorkers() {
 
 func (a *app) buildReport(interrupted bool) stressReport {
 	now := time.Now()
-	a.captureTelemetry(now)
-	a.sampleCounts(now)
-	snap := a.buildSnapshot(now, true)
 	epoch := a.currentEpoch()
-	memoryBaseline, memoryFinal, memorySamples, poolBase, poolFinal, poolSamples, snapshotBase, snapshotFinal, snapshotSamples, batchBase, batchFinal, batchSamples := epoch.copyTelemetry()
-	reportPoolBase, reportPoolFinal, reportPoolSummary, reportPoolSamples := poolReportData(poolBase, poolFinal, poolSamples)
+	a.captureTelemetryForEpoch(epoch, now)
+	a.sampleCountsForEpoch(epoch, now)
+	snap := a.buildSnapshotForEpoch(epoch, now, true)
+	phases := a.phaseReports(now)
+	memoryBaseline, memoryFinal, memorySamples, snapshotBase, snapshotFinal, snapshotSamples, batchBase, batchFinal, batchSamples := epoch.copyTelemetry()
 	return stressReport{
 		Schema:            reportSchema,
 		Timestamp:         now.Format(time.RFC3339Nano),
@@ -274,14 +280,11 @@ func (a *app) buildReport(interrupted bool) stressReport {
 		Classes:           snap.Classes,
 		Totals:            snap.Totals,
 		Planner:           snap.Planner,
+		Phases:            phases,
 		MemoryBaseline:    memoryBaseline,
 		MemoryFinal:       memoryFinal,
 		MemorySummary:     summarizeMemory(memorySamples, memoryFinal),
 		MemorySamples:     memorySamples,
-		PoolBaseline:      reportPoolBase,
-		PoolFinal:         reportPoolFinal,
-		PoolSummary:       reportPoolSummary,
-		PoolSamples:       reportPoolSamples,
 		SnapshotBaseline:  snapshotBase,
 		SnapshotFinal:     snapshotFinal,
 		SnapshotSamples:   snapshotSamples,
@@ -292,8 +295,13 @@ func (a *app) buildReport(interrupted bool) stressReport {
 }
 
 func (a *app) sampleCounts(now time.Time) {
-	epoch := a.currentEpoch()
+	a.sampleCountsForEpoch(a.currentEpoch(), now)
+}
 
+func (a *app) sampleCountsForEpoch(epoch *runEpoch, now time.Time) {
+	if epoch == nil {
+		return
+	}
 	var readCompleted uint64
 	var writeCompleted uint64
 	var readPaused uint64
@@ -323,7 +331,13 @@ func (a *app) sampleCounts(now time.Time) {
 }
 
 func (a *app) buildSnapshot(now time.Time, includeWorkers bool) viewSnapshot {
-	epoch := a.currentEpoch()
+	return a.buildSnapshotForEpoch(a.currentEpoch(), now, includeWorkers)
+}
+
+func (a *app) buildSnapshotForEpoch(epoch *runEpoch, now time.Time, includeWorkers bool) viewSnapshot {
+	if epoch == nil {
+		epoch = &runEpoch{startedAt: now}
+	}
 	planner := epoch.plannerSnapshot()
 	out := viewSnapshot{
 		StartedAt:  epoch.startedAt,
@@ -391,11 +405,11 @@ func (a *app) buildSnapshot(now time.Time, includeWorkers bool) viewSnapshot {
 	return out
 }
 
-func (a *app) resetEpoch() {
+func (a *app) resetEpochWithMeta(kind, startedByCommand string) {
 	for _, class := range a.classes {
 		class.resetMetrics()
 	}
-	a.epoch.Store(newRunEpoch(a.handle, a.traces))
+	a.epoch.Store(newRunEpoch(a.handle, a.traces, a.nextPhaseID(), kind, startedByCommand))
 }
 
 func (a *app) currentEpoch() *runEpoch {
@@ -403,20 +417,89 @@ func (a *app) currentEpoch() *runEpoch {
 	if epoch != nil {
 		return epoch
 	}
-	epoch = newRunEpoch(a.handle, a.traces)
+	epoch = newRunEpoch(a.handle, a.traces, a.nextPhaseID(), "initial", "")
 	a.epoch.Store(epoch)
 	return epoch
 }
 
-func (a *app) captureTelemetry(now time.Time) {
+func (a *app) nextPhaseID() int {
+	a.phaseMu.Lock()
+	defer a.phaseMu.Unlock()
+	id := a.nextPhaseIndex
+	a.nextPhaseIndex++
+	return id
+}
+
+func (a *app) archivePhase(phase phaseReport) {
+	a.phaseMu.Lock()
+	defer a.phaseMu.Unlock()
+	a.archivedPhases = append(a.archivedPhases, phase)
+}
+
+func (a *app) buildPhaseReport(epoch *runEpoch, now time.Time, endedByCommand string) phaseReport {
+	if epoch == nil {
+		epoch = &runEpoch{startedAt: now}
+	}
+	snap := a.buildSnapshotForEpoch(epoch, now, false)
+	memoryBaseline, memoryFinal, memorySamples, snapshotBase, snapshotFinal, snapshotSamples, batchBase, batchFinal, batchSamples := epoch.copyTelemetry()
+	return phaseReport{
+		Index:            epoch.phaseIdx,
+		Kind:             epoch.phaseKind,
+		StartedAt:        snap.StartedAt.Format(time.RFC3339Nano),
+		FinishedAt:       snap.CapturedAt.Format(time.RFC3339Nano),
+		DurationSec:      snap.CapturedAt.Sub(snap.StartedAt).Seconds(),
+		StartedByCommand: epoch.startedByCommand,
+		EndedByCommand:   endedByCommand,
+		Classes:          snap.Classes,
+		Totals:           snap.Totals,
+		Planner:          snap.Planner,
+		MemoryBaseline:   memoryBaseline,
+		MemoryFinal:      memoryFinal,
+		MemorySummary:    summarizeMemory(memorySamples, memoryFinal),
+		MemorySamples:    memorySamples,
+		SnapshotBaseline: snapshotBase,
+		SnapshotFinal:    snapshotFinal,
+		SnapshotSamples:  snapshotSamples,
+		BatchBaseline:    batchBase,
+		BatchFinal:       batchFinal,
+		BatchSamples:     batchSamples,
+	}
+}
+
+func (a *app) finalizeCurrentPhase(endedByCommand string) {
 	epoch := a.currentEpoch()
+	now := time.Now()
+	a.captureTelemetryForEpoch(epoch, now)
+	a.sampleCountsForEpoch(epoch, now)
+	a.archivePhase(a.buildPhaseReport(epoch, now, endedByCommand))
+}
+
+func (a *app) phaseReports(now time.Time) []phaseReport {
+	epoch := a.currentEpoch()
+	a.phaseMu.Lock()
+	phases := append([]phaseReport(nil), a.archivedPhases...)
+	a.phaseMu.Unlock()
+	phases = append(phases, a.buildPhaseReport(epoch, now, ""))
+	return phases
+}
+
+func (a *app) captureTelemetry(now time.Time) {
+	a.captureTelemetryForEpoch(a.currentEpoch(), now)
+}
+
+func (a *app) captureTelemetryForEpoch(epoch *runEpoch, now time.Time) {
+	if epoch == nil {
+		return
+	}
 	memory := CaptureMemorySnapshot(a.handle)
-	poolRaw := poolStatsSinceReset(a.handle.DB)
-	snapRaw := a.handle.DB.SnapshotStats()
-	batchRaw := a.handle.DB.AutoBatchStats()
+	var snapRaw rbi.SnapshotStats
+	var batchRaw rbi.AutoBatchStats
+	if a.handle != nil && a.handle.DB != nil {
+		snapRaw = a.handle.DB.SnapshotStats()
+		batchRaw = a.handle.DB.AutoBatchStats()
+	}
 	epoch.recordTelemetry(
 		memory,
-		makePoolSample(now.Format(time.RFC3339Nano), epoch.poolBase.Stats, poolRaw),
 		makeSnapshotSample(now, epoch.snapshotBase.Stats, snapRaw),
 		makeBatchSample(now, epoch.batchBase.Stats, batchRaw),
 	)
@@ -430,26 +513,24 @@ func (a *app) applyCommand(line string) error {
 	if cmd.Group != "" {
 		updated := 0
 		for _, class := range a.classes {
-			switch cmd.Group {
-			case "r":
-				if class.desc.Info.Role != RoleRead {
-					continue
-				}
-			case "w":
-				if class.desc.Info.Role != RoleWrite {
-					continue
-				}
-			case "a":
-			default:
-				return fmt.Errorf("unknown class group %q", cmd.Group)
+			if !workerGroupMatchesRole(class.desc.Info.Role, cmd.Group) {
+				continue
 			}
-			class.setWorkers(cmd.Value)
 			updated++
 		}
 		if updated == 0 {
 			return fmt.Errorf("no classes matched group %q", cmd.Group)
 		}
-		a.resetEpoch()
+		a.finalizeCurrentPhase(line)
+		updated = 0
+		for _, class := range a.classes {
+			if !workerGroupMatchesRole(class.desc.Info.Role, cmd.Group) {
+				continue
+			}
+			class.setWorkers(cmd.Value)
+			updated++
+		}
+		a.resetEpochWithMeta("manual", line)
 		a.setStatus(fmt.Sprintf("%s workers=%d for %d classes; stats reset", groupLabel(cmd.Group), cmd.Value, updated))
 		return nil
 	}
@@ -458,7 +539,7 @@ func (a *app) applyCommand(line string) error {
 		return fmt.Errorf("unknown class %d", cmd.ClassID)
 	}
 	current := class.workerCount()
-	target := current
+	var target int
 	switch cmd.Op {
 	case "set":
 		target = cmd.Value
@@ -472,8 +553,9 @@ func (a *app) applyCommand(line string) error {
 	default:
 		return fmt.Errorf("unknown op %q", cmd.Op)
 	}
+	a.finalizeCurrentPhase(line)
 	class.setWorkers(target)
-	a.resetEpoch()
+	a.resetEpochWithMeta("manual", line)
 	a.setStatus(fmt.Sprintf("%s workers=%d; stats reset", class.desc.Info.Alias, target))
 	return nil
 }
@@ -678,16 +760,14 @@ func jitterDelay(rng *rand.Rand) time.Duration {
 	return time.Duration(500+rng.IntN(501)) * time.Microsecond
 }
 
-func newRunEpoch(handle *DBHandle, traces *plannerTraceCollector) *runEpoch {
+func newRunEpoch(handle *DBHandle, traces *plannerTraceCollector, phaseIdx int, phaseKind, startedByCommand string) *runEpoch {
 	now := time.Now()
 	memory := CaptureMemorySnapshot(handle)
-	resetPoolStatsWindow(handle.DB)
-	poolRaw := poolStatsSinceReset(handle.DB)
-	snapshotRaw := handle.DB.SnapshotStats()
-	batchRaw := handle.DB.AutoBatchStats()
-	pool := poolSample{
-		CapturedAt: now.Format(time.RFC3339Nano),
-		Stats:      poolRaw,
+	var snapshotRaw rbi.SnapshotStats
+	var batchRaw rbi.AutoBatchStats
+	if handle != nil && handle.DB != nil {
+		snapshotRaw = handle.DB.SnapshotStats()
+		batchRaw = handle.DB.AutoBatchStats()
 	}
 	snapshot := snapshotSample{
 		CapturedAt: now.Format(time.RFC3339Nano),
@@ -697,18 +777,23 @@ func newRunEpoch(handle *DBHandle, traces *plannerTraceCollector) *runEpoch {
 		CapturedAt: now.Format(time.RFC3339Nano),
 		Stats:      batchRaw,
 	}
+	var planner *plannerTraceEpoch
+	if traces != nil {
+		planner = traces.newEpoch()
+	}
 	return &runEpoch{
-		startedAt:      now,
-		memoryBaseline: memory,
-		poolBase:       pool,
-		snapshotBase:   snapshot,
-		batchBase:      batch,
-		planner:        traces.newEpoch(),
-		lastMemory:     memory,
-		lastPool:       pool,
-		lastSnapshot:   snapshot,
-		lastBatch:      batch,
-		tps:            make(map[string]*tpsState, 32),
+		startedAt:        now,
+		phaseIdx:         phaseIdx,
+		phaseKind:        phaseKind,
+		startedByCommand: startedByCommand,
+		memoryBaseline:   memory,
+		snapshotBase:     snapshot,
+		batchBase:        batch,
+		planner:          planner,
+		lastMemory:       memory,
+		lastSnapshot:     snapshot,
+		lastBatch:        batch,
+		tps:              make(map[string]*tpsState, 32),
 	}
 }
 
@@ -744,15 +829,13 @@ func (e *runEpoch) observeScope(key string, completed uint64, paused uint64, wor
 	return state.current, state.min
 }
 
-func (e *runEpoch) recordTelemetry(memory *MemorySnapshot, pool poolSample, snapshot snapshotSample, batch batchSample) {
+func (e *runEpoch) recordTelemetry(memory *MemorySnapshot, snapshot snapshotSample, batch batchSample) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if memory != nil {
 		e.lastMemory = memory
 		e.memorySamples = append(e.memorySamples, *memory)
 	}
-	e.lastPool = pool
-	e.poolSamples = append(e.poolSamples, pool)
 	e.lastSnapshot = snapshot
 	e.lastBatch = batch
 	e.snapshotSamples = append(e.snapshotSamples, snapshot)
@@ -765,16 +848,13 @@ func (e *runEpoch) latestTelemetry() (*MemorySnapshot, snapshotSample, batchSamp
 	return e.lastMemory, e.lastSnapshot, e.lastBatch
 }
 
-func (e *runEpoch) copyTelemetry() (*MemorySnapshot, *MemorySnapshot, []MemorySnapshot, *poolSample, *poolSample, []poolSample, snapshotSample, snapshotSample, []snapshotSample, batchSample, batchSample, []batchSample) {
+func (e *runEpoch) copyTelemetry() (*MemorySnapshot, *MemorySnapshot, []MemorySnapshot, snapshotSample, snapshotSample, []snapshotSample, batchSample, batchSample, []batchSample) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	memorySamples := append([]MemorySnapshot(nil), e.memorySamples...)
-	poolSamples := append([]poolSample(nil), e.poolSamples...)
 	snapshotSamples := append([]snapshotSample(nil), e.snapshotSamples...)
 	batchSamples := append([]batchSample(nil), e.batchSamples...)
-	poolBase := e.poolBase
-	poolFinal := e.lastPool
-	return e.memoryBaseline, e.lastMemory, memorySamples, &poolBase, &poolFinal, poolSamples, e.snapshotBase, e.lastSnapshot, snapshotSamples, e.batchBase, e.lastBatch, batchSamples
+	return e.memoryBaseline, e.lastMemory, memorySamples, e.snapshotBase, e.lastSnapshot, snapshotSamples, e.batchBase, e.lastBatch, batchSamples
 }
 
 func (e *runEpoch) plannerSnapshot() plannerTraceSnapshot {
@@ -938,6 +1018,19 @@ func groupLabel(group string) string {
 	}
 }
 
+func workerGroupMatchesRole(role, group string) bool {
+	switch group {
+	case "r":
+		return role == RoleRead
+	case "w":
+		return role == RoleWrite
+	case "a":
+		return true
+	default:
+		return false
+	}
+}
+
 func averageTPS(completed uint64, startedAt, now time.Time, paused uint64, workers int) float64 {
 	seconds := now.Sub(startedAt).Seconds()
 	if workers > 0 {
@@ -961,19 +1054,6 @@ func makeSnapshotSample(now time.Time, baseline, current rbi.SnapshotStats) snap
 	return snapshotSample{
 		CapturedAt: now.Format(time.RFC3339Nano),
 		Stats:      current,
-		Delta: snapshotDelta{
-			CompactorRequested:    deltaUint64(current.CompactorRequested, baseline.CompactorRequested),
-			CompactorRuns:         deltaUint64(current.CompactorRuns, baseline.CompactorRuns),
-			CompactorAttempts:     deltaUint64(current.CompactorAttempts, baseline.CompactorAttempts),
-			CompactorSucceeded:    deltaUint64(current.CompactorSucceeded, baseline.CompactorSucceeded),
-			CompactorPreclaimBusy: deltaUint64(current.CompactorPreclaimBusy, baseline.CompactorPreclaimBusy),
-			CompactorLockMiss:     deltaUint64(current.CompactorLockMiss, baseline.CompactorLockMiss),
-			CompactorNoChange:     deltaUint64(current.CompactorNoChange, baseline.CompactorNoChange),
-			CompactorSoftSkip:     deltaUint64(current.CompactorSoftSkip, baseline.CompactorSoftSkip),
-			CompactorSkippedWake:  deltaUint64(current.CompactorSkippedWake, baseline.CompactorSkippedWake),
-			CompactorIdleDefers:   deltaUint64(current.CompactorIdleDefers, baseline.CompactorIdleDefers),
-			CompactorStaleRetry:   deltaUint64(current.CompactorStaleRetry, baseline.CompactorStaleRetry),
-		},
 	}
 }
 

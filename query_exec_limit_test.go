@@ -4,9 +4,11 @@ import (
 	"fmt"
 	"path/filepath"
 	"reflect"
+	"sync"
 	"testing"
 
 	"github.com/vapstack/qx"
+	"github.com/vapstack/rbi/internal/posting"
 )
 
 func TestQuery_LimitNoOrder_UnsatisfiableLeafs_ReturnEmpty(t *testing.T) {
@@ -108,14 +110,15 @@ func TestQuery_LimitOrderAndRange_UnsatisfiableRest_ReturnEmpty(t *testing.T) {
 		qx.LT("age", 40),
 		qx.EQ("email", "missing@example.com"),
 	).Max(10)
-	f, bounds, rest, ok, err := db.extractNoOrderBoundsAndRest(mustExtractAndLeaves(t, qRange.Expr))
+	rangeLeaves := mustExtractAndLeaves(t, qRange.Expr)
+	f, bounds, ok, err := db.extractNoOrderBounds(rangeLeaves)
 	if err != nil {
-		t.Fatalf("extractNoOrderBoundsAndRest: %v", err)
+		t.Fatalf("extractNoOrderBounds: %v", err)
 	}
 	if !ok {
 		t.Fatalf("expected no-order range bounds to be recognized")
 	}
-	out, used, err = db.tryLimitQueryRangeNoOrderByField(qRange, f, bounds, rest, nil)
+	out, used, err = db.tryLimitQueryRangeNoOrderByField(qRange, f, bounds, rangeLeaves, nil)
 	if err != nil {
 		t.Fatalf("tryLimitQueryRangeNoOrderByField: %v", err)
 	}
@@ -127,8 +130,45 @@ func TestQuery_LimitOrderAndRange_UnsatisfiableRest_ReturnEmpty(t *testing.T) {
 	}
 }
 
+func TestApplyBoundsToIndexRange_PrefixIntersectsRange(t *testing.T) {
+	s := []index{
+		{Key: indexKeyFromString("aa")},
+		{Key: indexKeyFromString("ab")},
+		{Key: indexKeyFromString("ac")},
+		{Key: indexKeyFromString("ad")},
+		{Key: indexKeyFromString("b0")},
+	}
+
+	rb := rangeBounds{has: true}
+	rb.applyPrefix("a")
+	rb.applyLo("ab", true)
+	rb.applyHi("ad", false)
+
+	start, end := applyBoundsToIndexRange(s, rb)
+	if start != 1 || end != 3 {
+		t.Fatalf("unexpected range: start=%d end=%d", start, end)
+	}
+
+	got := make([]string, 0, end-start)
+	for _, ent := range s[start:end] {
+		got = append(got, ent.Key.asUnsafeString())
+	}
+	want := []string{"ab", "ac"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("keys mismatch: got=%v want=%v", got, want)
+	}
+
+	empty := rangeBounds{has: true}
+	empty.applyPrefix("b")
+	empty.applyHi("aa", true)
+	start, end = applyBoundsToIndexRange(s, empty)
+	if start != 0 || end != 0 {
+		t.Fatalf("expected empty range, got start=%d end=%d", start, end)
+	}
+}
+
 func TestPostingUnionIter_SmallUnionAvoidsDuplicates(t *testing.T) {
-	it := newPostingUnionIter([]postingList{
+	it := newPostingUnionIter([]posting.List{
 		postingOf(1, 2, 5),
 		postingOf(2, 3),
 		postingOf(1, 4),
@@ -146,7 +186,7 @@ func TestPostingUnionIter_SmallUnionAvoidsDuplicates(t *testing.T) {
 }
 
 func TestPostingUnionIter_ReusesScratchWithoutStaleState(t *testing.T) {
-	posts := []postingList{
+	posts := []posting.List{
 		postingOf(1, 2, 5),
 		postingOf(2, 3),
 		postingOf(1, 4),
@@ -155,7 +195,9 @@ func TestPostingUnionIter_ReusesScratchWithoutStaleState(t *testing.T) {
 
 	drain := func() []uint64 {
 		it := newPostingUnionIter(posts)
-		defer releaseRoaringIter(it)
+		if it != nil {
+			defer it.Release()
+		}
 		var out []uint64
 		for it.HasNext() {
 			out = append(out, it.Next())
@@ -179,7 +221,7 @@ func TestPostingUnionIter_AllocsPerRunStaysLowAfterWarmup(t *testing.T) {
 		t.Skip("testing.AllocsPerRun is not stable under -race")
 	}
 
-	posts := []postingList{
+	posts := []posting.List{
 		postingOf(1, 2, 5),
 		postingOf(2, 3),
 		postingOf(1, 4),
@@ -187,14 +229,18 @@ func TestPostingUnionIter_AllocsPerRunStaysLowAfterWarmup(t *testing.T) {
 	}
 
 	warm := newPostingUnionIter(posts)
-	releaseRoaringIter(warm)
+	if warm != nil {
+		warm.Release()
+	}
 
 	allocs := testing.AllocsPerRun(100, func() {
 		it := newPostingUnionIter(posts)
 		for it.HasNext() {
 			_ = it.Next()
 		}
-		releaseRoaringIter(it)
+		if it != nil {
+			it.Release()
+		}
 	})
 	if allocs > 0.2 {
 		t.Fatalf("unexpected allocs per run: got=%v want<=0.2", allocs)
@@ -305,14 +351,537 @@ func TestQuery_NoOrder_UnboundedLimit_RespectsOffset(t *testing.T) {
 	}
 }
 
-func TestQuery_OrderBasic_RangeBaseOpsSkipsEagerBaseBitmapBeforeOrderedPredicates(t *testing.T) {
+func legacyEmitAcceptedPostingNoOrder[K ~uint64 | ~string, V any](cursor *queryCursor[K, V], ids posting.List, examined *uint64) bool {
+	if ids.IsEmpty() {
+		return false
+	}
+	stop := false
+	ids.ForEach(func(idx uint64) bool {
+		*examined++
+		if cursor.emit(idx) {
+			stop = true
+			return false
+		}
+		return true
+	})
+	return stop
+}
+
+func (qv *queryView[K, V]) legacyTryQueryRangeNoOrderWithLimit(q *qx.QX) ([]K, bool, error) {
+	if len(q.Order) > 0 || q.Limit == 0 {
+		return nil, false, nil
+	}
+	if q.Expr.Not {
+		return nil, false, nil
+	}
+
+	e := q.Expr
+	if e.Op == qx.OpAND || e.Op == qx.OpOR || len(e.Operands) != 0 {
+		return nil, false, nil
+	}
+
+	switch e.Op {
+	case qx.OpGT, qx.OpGTE, qx.OpLT, qx.OpLTE, qx.OpEQ:
+	default:
+		return nil, false, nil
+	}
+
+	f := e.Field
+	if f == "" {
+		return nil, false, nil
+	}
+
+	fm := qv.fields[f]
+	if fm == nil || fm.Slice {
+		return nil, false, nil
+	}
+
+	ov := qv.fieldOverlay(f)
+	if !ov.hasData() {
+		return nil, true, nil
+	}
+
+	isNil := false
+	rb := rangeBounds{has: true}
+	if e.Op == qx.OpEQ {
+		key, isSlice, eqNil, err := qv.exprValueToIdxScalar(e)
+		if err != nil {
+			return nil, true, err
+		}
+		if isSlice {
+			return nil, false, nil
+		}
+		isNil = eqNil
+		rb.applyLo(key, true)
+		rb.applyHi(key, true)
+	} else {
+		bound, isSlice, err := qv.exprValueToNormalizedScalarBound(e)
+		if err != nil {
+			return nil, true, err
+		}
+		if isSlice {
+			return nil, false, nil
+		}
+		applyNormalizedScalarBound(&rb, bound)
+	}
+
+	br := ov.rangeForBounds(rb)
+	if overlayRangeEmpty(br) {
+		return nil, true, nil
+	}
+
+	out := make([]K, 0, q.Limit)
+	cursor := qv.newQueryCursor(out, q.Offset, q.Limit, false, nil)
+
+	if isNil {
+		if e.Op != qx.OpEQ {
+			return nil, true, nil
+		}
+		ids := qv.nilFieldLookupPostingRetained(f)
+		if ids.IsEmpty() {
+			return nil, true, nil
+		}
+		var examined uint64
+		emitAcceptedPostingNoOrder(&cursor, ids, &examined)
+		return cursor.out, true, nil
+	}
+
+	keyCur := ov.newCursor(br, false)
+	var examined uint64
+	for {
+		_, ids, ok := keyCur.next()
+		if !ok {
+			break
+		}
+		if ids.IsEmpty() {
+			continue
+		}
+		if legacyEmitAcceptedPostingNoOrder(&cursor, ids, &examined) {
+			return cursor.out, true, nil
+		}
+	}
+	return cursor.out, true, nil
+}
+
+func (qv *queryView[K, V]) legacyTryQueryPrefixNoOrderWithLimit(q *qx.QX) ([]K, bool, error) {
+	if len(q.Order) > 0 || q.Limit == 0 {
+		return nil, false, nil
+	}
+	if q.Expr.Not {
+		return nil, false, nil
+	}
+
+	e := q.Expr
+	if e.Op != qx.OpPREFIX || e.Field == "" {
+		return nil, false, nil
+	}
+	if len(e.Operands) != 0 {
+		return nil, false, nil
+	}
+
+	fm := qv.fields[e.Field]
+	if fm == nil || fm.Slice {
+		return nil, false, nil
+	}
+
+	bound, isSlice, err := qv.exprValueToNormalizedScalarBound(e)
+	if err != nil {
+		return nil, true, err
+	}
+	if isSlice {
+		return nil, false, nil
+	}
+	if bound.empty || bound.full {
+		return nil, true, nil
+	}
+
+	ov := qv.fieldOverlay(e.Field)
+	if !ov.hasData() {
+		if !qv.hasFieldIndex(e.Field) {
+			return nil, true, fmt.Errorf("no index for field: %v", e.Field)
+		}
+		return nil, true, nil
+	}
+
+	br := ov.rangeForBounds(rangeBounds{
+		has:       true,
+		hasPrefix: true,
+		prefix:    bound.key,
+	})
+	if overlayRangeEmpty(br) {
+		return nil, true, nil
+	}
+
+	out := make([]K, 0, q.Limit)
+	cursor := qv.newQueryCursor(out, q.Offset, q.Limit, false, nil)
+
+	keyCur := ov.newCursor(br, false)
+	var examined uint64
+	for {
+		_, ids, ok := keyCur.next()
+		if !ok {
+			break
+		}
+		if ids.IsEmpty() {
+			continue
+		}
+		if legacyEmitAcceptedPostingNoOrder(&cursor, ids, &examined) {
+			return cursor.out, true, nil
+		}
+	}
+	return cursor.out, true, nil
+}
+
+func legacyScanLimitByOverlayBounds[K ~uint64 | ~string, V any](db *queryView[K, V], q *qx.QX, ov fieldOverlay, br overlayRange, desc bool, preds []leafPred, nilTailField string) []K {
+	limit := int(q.Limit)
+	out := make([]K, 0, limit)
+	cursor := db.newQueryCursor(out, 0, q.Limit, false, nil)
+
+	emitCandidate := func(idx uint64) bool {
+		for _, p := range preds {
+			if !p.containsIdx(idx) {
+				return false
+			}
+		}
+		return cursor.emit(idx)
+	}
+
+	emitBucketPosting := func(ids posting.List) bool {
+		if ids.IsEmpty() {
+			return false
+		}
+		if idx, ok := ids.TrySingle(); ok {
+			return emitCandidate(idx)
+		}
+		it := ids.Iter()
+		defer it.Release()
+		for it.HasNext() {
+			if emitCandidate(it.Next()) {
+				return true
+			}
+		}
+		return false
+	}
+
+	keyCur := ov.newCursor(br, desc)
+	for {
+		_, ids, ok := keyCur.next()
+		if !ok {
+			break
+		}
+		if ids.IsEmpty() {
+			continue
+		}
+		if emitBucketPosting(ids) {
+			return cursor.out
+		}
+	}
+
+	if nilTailField != "" {
+		ids := db.nilFieldOverlay(nilTailField).lookupPostingRetained(nilIndexEntryKey)
+		if !ids.IsEmpty() && emitBucketPosting(ids) {
+			return cursor.out
+		}
+	}
+
+	return cursor.out
+}
+
+func TestQuery_RangeNoOrderWithLimit_DeepOffset_MatchesExpected(t *testing.T) {
+	db, _ := openTempDBUint64(t)
+	seedGeneratedUint64Data(t, db, 10_000, func(i int) *Rec {
+		return &Rec{
+			Name:   fmt.Sprintf("u_%d", i),
+			Email:  fmt.Sprintf("u_%d@example.test", i),
+			Age:    i % 64,
+			Score:  float64(i),
+			Active: i%2 == 0,
+		}
+	})
+	if err := db.RebuildIndex(); err != nil {
+		t.Fatalf("RebuildIndex: %v", err)
+	}
+
+	q := qx.Query(qx.GTE("age", 20)).Skip(4_000).Max(25)
+
+	got, used, err := db.tryQueryRangeNoOrderWithLimit(q, nil)
+	if err != nil {
+		t.Fatalf("tryQueryRangeNoOrderWithLimit: %v", err)
+	}
+	if !used {
+		t.Fatalf("expected range no-order fast path to be used")
+	}
+
+	want, used, err := db.currentQueryViewForTests().legacyTryQueryRangeNoOrderWithLimit(q)
+	if err != nil {
+		t.Fatalf("legacyTryQueryRangeNoOrderWithLimit: %v", err)
+	}
+	if !used {
+		t.Fatalf("expected legacy range no-order fast path to be used")
+	}
+	assertSameSlice(t, got, want)
+}
+
+func TestQuery_PrefixNoOrderWithLimit_DeepOffset_MatchesExpected(t *testing.T) {
+	db, _ := openTempDBUint64(t)
+	seedGeneratedUint64Data(t, db, 10_000, func(i int) *Rec {
+		return &Rec{
+			Name:     fmt.Sprintf("u_%d", i),
+			Email:    fmt.Sprintf("u_%d@example.test", i),
+			Age:      i % 64,
+			Score:    float64(i),
+			Active:   i%2 == 0,
+			FullName: fmt.Sprintf("grp-%02d", i%100),
+		}
+	})
+	if err := db.RebuildIndex(); err != nil {
+		t.Fatalf("RebuildIndex: %v", err)
+	}
+
+	q := qx.Query(qx.PREFIX("full_name", "grp-1")).Skip(750).Max(30)
+
+	got, used, err := db.tryQueryPrefixNoOrderWithLimit(q, nil)
+	if err != nil {
+		t.Fatalf("tryQueryPrefixNoOrderWithLimit: %v", err)
+	}
+	if !used {
+		t.Fatalf("expected prefix no-order fast path to be used")
+	}
+
+	want, used, err := db.currentQueryViewForTests().legacyTryQueryPrefixNoOrderWithLimit(q)
+	if err != nil {
+		t.Fatalf("legacyTryQueryPrefixNoOrderWithLimit: %v", err)
+	}
+	if !used {
+		t.Fatalf("expected legacy prefix no-order fast path to be used")
+	}
+	assertSameSlice(t, got, want)
+}
+
+func TestQuery_RangeNoOrderWithLimit_NilEQDeepOffset_MatchesExpected(t *testing.T) {
+	db, _ := openTempDBUint64(t)
+	seedGeneratedUint64Data(t, db, 9_000, func(i int) *Rec {
+		var opt *string
+		if i%3 == 0 {
+			v := fmt.Sprintf("v-%d", i%17)
+			opt = &v
+		}
+		return &Rec{
+			Name:   fmt.Sprintf("u_%d", i),
+			Email:  fmt.Sprintf("u_%d@example.test", i),
+			Age:    i % 64,
+			Score:  float64(i),
+			Active: i%2 == 0,
+			Opt:    opt,
+		}
+	})
+	if err := db.RebuildIndex(); err != nil {
+		t.Fatalf("RebuildIndex: %v", err)
+	}
+
+	q := qx.Query(qx.EQ("opt", nil)).Skip(2_500).Max(40)
+
+	got, used, err := db.tryQueryRangeNoOrderWithLimit(q, nil)
+	if err != nil {
+		t.Fatalf("tryQueryRangeNoOrderWithLimit(nil EQ): %v", err)
+	}
+	if !used {
+		t.Fatalf("expected nil-equality range fast path to be used")
+	}
+
+	want, used, err := db.currentQueryViewForTests().legacyTryQueryRangeNoOrderWithLimit(q)
+	if err != nil {
+		t.Fatalf("legacyTryQueryRangeNoOrderWithLimit(nil EQ): %v", err)
+	}
+	if !used {
+		t.Fatalf("expected legacy nil-equality range fast path to be used")
+	}
+	assertSameSlice(t, got, want)
+}
+
+func TestQuery_LimitRangeNoOrder_ResidualsUseBucketExactFilter(t *testing.T) {
+	var (
+		mu     sync.Mutex
+		events []TraceEvent
+	)
+
 	db, _ := openTempDBUint64(t, Options{
-		AnalyzeInterval:                                  -1,
-		SnapshotCompactorRequestEveryNWrites:             1 << 30,
-		SnapshotCompactorIdleInterval:                    -1,
-		SnapshotDeltaLayerMaxDepth:                       1 << 30,
-		SnapshotMaterializedPredCacheMaxEntries:          16,
-		SnapshotMaterializedPredCacheMaxEntriesWithDelta: 16,
+		TraceSink: func(ev TraceEvent) {
+			mu.Lock()
+			events = append(events, ev)
+			mu.Unlock()
+		},
+		TraceSampleEvery: 1,
+	})
+
+	seedGeneratedUint64Data(t, db, 12_000, func(i int) *Rec {
+		countries := [...]string{"NL", "DE", "US", "GB"}
+		group := (i - 1) / 64
+		return &Rec{
+			Name:     fmt.Sprintf("u_%d", i),
+			Email:    fmt.Sprintf("u_%d@example.test", i),
+			Age:      i % 64,
+			Active:   group%2 == 0,
+			Score:    float64(i),
+			Meta:     Meta{Country: countries[group%len(countries)]},
+			FullName: fmt.Sprintf("grp-%02d", i%64),
+		}
+	})
+	if err := db.RebuildIndex(); err != nil {
+		t.Fatalf("RebuildIndex: %v", err)
+	}
+
+	q := qx.Query(
+		qx.GTE("age", 0),
+		qx.LT("age", 64),
+		qx.IN("country", []string{"NL", "DE"}),
+		qx.EQ("active", true),
+	).Max(25)
+
+	leaves := mustExtractAndLeaves(t, q.Expr)
+	f, bounds, ok, err := db.extractNoOrderBounds(leaves)
+	if err != nil {
+		t.Fatalf("extractNoOrderBounds: %v", err)
+	}
+	if !ok {
+		t.Fatalf("expected no-order bounds to be recognized")
+	}
+
+	view := db.currentQueryViewForTests()
+	preds, ok, err := view.buildLeafPredsExcludingBounds(leaves, f)
+	if err != nil {
+		t.Fatalf("buildLeafPredsExcludingBounds: %v", err)
+	}
+	if !ok {
+		t.Fatalf("expected residual leaf preds to be supported")
+	}
+	defer releaseLeafPreds(preds)
+
+	br := view.fieldOverlay(f).rangeForBounds(bounds)
+	want := legacyScanLimitByOverlayBounds(view, q, view.fieldOverlay(f), br, false, preds, "")
+
+	tr := db.beginTrace(q)
+	if tr == nil {
+		t.Fatalf("expected trace to be enabled")
+	}
+	got, used, err := db.tryLimitQueryRangeNoOrderByField(q, f, bounds, leaves, tr)
+	tr.finish(uint64(len(got)), err)
+	if err != nil {
+		t.Fatalf("tryLimitQueryRangeNoOrderByField: %v", err)
+	}
+	if !used {
+		t.Fatalf("expected range limit fast path to be used")
+	}
+	assertSameSlice(t, got, want)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(events) == 0 {
+		t.Fatalf("expected trace event")
+	}
+	ev := events[len(events)-1]
+	if ev.PostingExactFilters == 0 {
+		t.Fatalf("expected exact bucket filter usage, trace=%+v", ev)
+	}
+	if ev.RowsExamined == 0 || ev.RowsMatched == 0 {
+		t.Fatalf("expected non-zero trace counters, trace=%+v", ev)
+	}
+}
+
+func TestQuery_LimitOrderBasic_ResidualsUseBucketExactFilter(t *testing.T) {
+	var (
+		mu     sync.Mutex
+		events []TraceEvent
+	)
+
+	db, _ := openTempDBUint64(t, Options{
+		TraceSink: func(ev TraceEvent) {
+			mu.Lock()
+			events = append(events, ev)
+			mu.Unlock()
+		},
+		TraceSampleEvery: 1,
+	})
+
+	seedGeneratedUint64Data(t, db, 12_000, func(i int) *Rec {
+		countries := [...]string{"NL", "DE", "US", "GB"}
+		group := (i - 1) / 64
+		return &Rec{
+			Name:     fmt.Sprintf("u_%d", i),
+			Email:    fmt.Sprintf("u_%d@example.test", i),
+			Age:      i % 64,
+			Active:   group%2 == 0,
+			Score:    float64(i),
+			Meta:     Meta{Country: countries[group%len(countries)]},
+			FullName: fmt.Sprintf("grp-%02d", i%64),
+		}
+	})
+	if err := db.RebuildIndex(); err != nil {
+		t.Fatalf("RebuildIndex: %v", err)
+	}
+
+	q := qx.Query(
+		qx.GTE("age", 0),
+		qx.LT("age", 64),
+		qx.EQ("active", true),
+		qx.EQ("country", "NL"),
+	).By("age", qx.ASC).Max(20)
+
+	leaves := mustExtractAndLeaves(t, q.Expr)
+	view := db.currentQueryViewForTests()
+	bounds, ok, err := view.extractBoundsForField("age", leaves)
+	if err != nil {
+		t.Fatalf("extractBoundsForField: %v", err)
+	}
+	if !ok {
+		t.Fatalf("expected order bounds to be recognized")
+	}
+
+	preds, ok, err := view.buildLeafPredsExcludingBounds(leaves, "age")
+	if err != nil {
+		t.Fatalf("buildLeafPredsExcludingBounds: %v", err)
+	}
+	if !ok {
+		t.Fatalf("expected residual leaf preds to be supported")
+	}
+	defer releaseLeafPreds(preds)
+
+	ov := view.fieldOverlay("age")
+	br := ov.rangeForBounds(bounds)
+	want := legacyScanLimitByOverlayBounds(view, q, ov, br, false, preds, "")
+
+	tr := db.beginTrace(q)
+	if tr == nil {
+		t.Fatalf("expected trace to be enabled")
+	}
+	got, used, err := db.tryLimitQueryOrderBasic(q, leaves, tr)
+	tr.finish(uint64(len(got)), err)
+	if err != nil {
+		t.Fatalf("tryLimitQueryOrderBasic: %v", err)
+	}
+	if !used {
+		t.Fatalf("expected order-basic limit fast path to be used")
+	}
+	assertSameSlice(t, got, want)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(events) == 0 {
+		t.Fatalf("expected trace event")
+	}
+	ev := events[len(events)-1]
+	if ev.PostingExactFilters == 0 {
+		t.Fatalf("expected exact bucket filter usage, trace=%+v", ev)
+	}
+	if ev.OrderIndexScanWidth == 0 {
+		t.Fatalf("expected non-zero order scan width, trace=%+v", ev)
+	}
+}
+
+func TestQuery_OrderBasic_RangeBaseOpsSkipsEagerBaseBitmapBeforeOrderedPredicatesAfterPatch(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{
+		AnalyzeInterval:                         -1,
+		SnapshotMaterializedPredCacheMaxEntries: 16,
 	})
 
 	setNumericBucketKnobs(t, db, 128, 1, 1)
@@ -331,11 +900,7 @@ func TestQuery_OrderBasic_RangeBaseOpsSkipsEagerBaseBitmapBeforeOrderedPredicate
 		t.Fatalf("Patch(age): %v", err)
 	}
 
-	snap := db.getSnapshot()
-	if snap.fieldDelta("age") == nil {
-		t.Fatalf("expected active age delta")
-	}
-	if got := snap.matPredCacheCount.Load(); got != 0 {
+	if got := db.getSnapshot().matPredCacheCount.Load(); got != 0 {
 		t.Fatalf("unexpected materialized predicate cache before query: %d", got)
 	}
 
@@ -361,12 +926,8 @@ func TestQuery_OrderBasic_RangeBaseOpsSkipsEagerBaseBitmapBeforeOrderedPredicate
 
 func TestQuery_OrderBasic_DeepWindowEagerMaterializesNonOrderNumericRange(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
-		AnalyzeInterval:                                  -1,
-		SnapshotCompactorRequestEveryNWrites:             1 << 30,
-		SnapshotCompactorIdleInterval:                    -1,
-		SnapshotDeltaLayerMaxDepth:                       1 << 30,
-		SnapshotMaterializedPredCacheMaxEntries:          16,
-		SnapshotMaterializedPredCacheMaxEntriesWithDelta: 16,
+		AnalyzeInterval:                         -1,
+		SnapshotMaterializedPredCacheMaxEntries: 16,
 	})
 
 	setNumericBucketKnobs(t, db, 128, 1, 1)
@@ -412,12 +973,8 @@ func TestQuery_OrderBasic_DeepWindowEagerMaterializesNonOrderNumericRange(t *tes
 
 func TestQuery_OrderBasic_DeepWindowCachePersistsAcrossUnchangedFieldPatch(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
-		AnalyzeInterval:                                  -1,
-		SnapshotCompactorRequestEveryNWrites:             1 << 30,
-		SnapshotCompactorIdleInterval:                    -1,
-		SnapshotDeltaLayerMaxDepth:                       1 << 30,
-		SnapshotMaterializedPredCacheMaxEntries:          16,
-		SnapshotMaterializedPredCacheMaxEntriesWithDelta: 16,
+		AnalyzeInterval:                         -1,
+		SnapshotMaterializedPredCacheMaxEntries: 16,
 	})
 
 	setNumericBucketKnobs(t, db, 128, 1, 1)
@@ -450,7 +1007,7 @@ func TestQuery_OrderBasic_DeepWindowCachePersistsAcrossUnchangedFieldPatch(t *te
 	cacheKey := materializedPredCacheKeyFromScalar("score", qx.OpLT, keyValue)
 	prevSnap := db.getSnapshot()
 	prevBM, ok := prevSnap.loadMaterializedPred(cacheKey)
-	if !ok || prevBM == nil {
+	if !ok || prevBM.IsEmpty() {
 		t.Fatalf("expected score range cache entry before unrelated patch")
 	}
 
@@ -460,7 +1017,7 @@ func TestQuery_OrderBasic_DeepWindowCachePersistsAcrossUnchangedFieldPatch(t *te
 
 	nextSnap := db.getSnapshot()
 	nextBM, ok := nextSnap.loadMaterializedPred(cacheKey)
-	if !ok || nextBM == nil {
+	if !ok || nextBM.IsEmpty() {
 		t.Fatalf("expected score range cache entry after unrelated patch")
 	}
 	if nextBM != prevBM {

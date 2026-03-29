@@ -110,12 +110,49 @@ func TestLenIndex_ZeroComplement_BaseQueryAndOrder(t *testing.T) {
 	assertSameSlice(t, gotDesc, wantDesc)
 }
 
-func TestLenIndex_ZeroComplement_WorksWithFieldDelta(t *testing.T) {
-	db, _ := openTempDBUint64(t, Options{
-		SnapshotCompactorRequestEveryNWrites: 1 << 30,
-		SnapshotCompactorIdleInterval:        -1,
-		SnapshotDeltaLayerMaxDepth:           1 << 30,
-	})
+func TestQuery_ByArrayCount_ZeroComplementSkipWholeBucket(t *testing.T) {
+	db, _ := openTempDBUint64(t)
+
+	for i := 1; i <= 240; i++ {
+		rec := &Rec{
+			Name:   fmt.Sprintf("u_%d", i),
+			Email:  fmt.Sprintf("u_%d@example.test", i),
+			Age:    i,
+			Active: i%2 == 0,
+		}
+		switch {
+		case i%6 == 0:
+			rec.Tags = []string{"go", "db"}
+		case i%11 == 0:
+			rec.Tags = []string{"rust"}
+		default:
+			rec.Tags = nil
+		}
+		if err := db.Set(uint64(i), rec); err != nil {
+			t.Fatalf("Set(%d): %v", i, err)
+		}
+	}
+	if err := db.RebuildIndex(); err != nil {
+		t.Fatalf("RebuildIndex: %v", err)
+	}
+
+	zeroCount := len(collectIDsByTagDistinctLen(t, db, 0))
+	q := qx.Query().ByArrayCount("tags", qx.ASC).Skip(zeroCount + 5).Max(80)
+
+	got, err := db.QueryKeys(q)
+	if err != nil {
+		t.Fatalf("QueryKeys: %v", err)
+	}
+
+	want, err := expectedKeysUint64(t, db, q)
+	if err != nil {
+		t.Fatalf("expectedKeysUint64: %v", err)
+	}
+	assertSameSlice(t, got, want)
+}
+
+func TestLenIndex_ZeroComplement_WorksAfterPatches(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{})
 
 	for i := 1; i <= 220; i++ {
 		rec := &Rec{
@@ -153,11 +190,6 @@ func TestLenIndex_ZeroComplement_WorksWithFieldDelta(t *testing.T) {
 		}
 	}
 
-	s := db.getSnapshot()
-	if s.lenFieldDelta("tags") == nil {
-		t.Fatalf("expected len delta for tags")
-	}
-
 	emptyQ := qx.Query(qx.EQ("tags", []string{}))
 	gotEmpty, err := db.QueryKeys(emptyQ)
 	if err != nil {
@@ -188,12 +220,95 @@ func TestLenIndex_ZeroComplement_WorksWithFieldDelta(t *testing.T) {
 	}
 	assertSameSlice(t, gotDesc, wantDesc)
 }
+
+func TestLenIndex_ZeroComplement_WorksAfterInsertAndDelete(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{})
+
+	for i := 1; i <= 180; i++ {
+		rec := &Rec{
+			Name:   fmt.Sprintf("u_%d", i),
+			Email:  fmt.Sprintf("u_%d@example.test", i),
+			Age:    i,
+			Active: i%2 == 0,
+		}
+		switch {
+		case i%8 == 0:
+			rec.Tags = []string{"go", "db"}
+		case i%13 == 0:
+			rec.Tags = []string{"rust"}
+		default:
+			rec.Tags = nil
+		}
+		if err := db.Set(uint64(i), rec); err != nil {
+			t.Fatalf("Set(%d): %v", i, err)
+		}
+	}
+	if err := db.RebuildIndex(); err != nil {
+		t.Fatalf("RebuildIndex: %v", err)
+	}
+	if !db.isLenZeroComplementField("tags") {
+		t.Fatalf("expected zero-complement mode for tags after rebuild")
+	}
+
+	if err := db.Set(1001, &Rec{
+		Name:   "u_1001",
+		Email:  "u_1001@example.test",
+		Age:    1001,
+		Active: true,
+		Tags:   nil,
+	}); err != nil {
+		t.Fatalf("Set(1001): %v", err)
+	}
+	if err := db.Set(1002, &Rec{
+		Name:   "u_1002",
+		Email:  "u_1002@example.test",
+		Age:    1002,
+		Active: false,
+		Tags:   []string{"go"},
+	}); err != nil {
+		t.Fatalf("Set(1002): %v", err)
+	}
+	if err := db.Delete(1); err != nil {
+		t.Fatalf("Delete(1): %v", err)
+	}
+
+	emptyQ := qx.Query(qx.EQ("tags", []string{}))
+	gotEmpty, err := db.QueryKeys(emptyQ)
+	if err != nil {
+		t.Fatalf("QueryKeys(empty tags): %v", err)
+	}
+	wantEmpty := collectIDsByTagDistinctLen(t, db, 0)
+	assertSameSlice(t, gotEmpty, wantEmpty)
+
+	ascQ := qx.Query(qx.EQ("active", true)).ByArrayCount("tags", qx.ASC).Skip(1).Max(120)
+	gotAsc, err := db.QueryKeys(ascQ)
+	if err != nil {
+		t.Fatalf("QueryKeys(ASC array count insert/delete): %v", err)
+	}
+	wantAsc, err := expectedKeysUint64(t, db, ascQ)
+	if err != nil {
+		t.Fatalf("expectedKeysUint64(ASC array count insert/delete): %v", err)
+	}
+	assertSameSlice(t, gotAsc, wantAsc)
+
+	descQ := qx.Query(qx.EQ("active", false)).ByArrayCount("tags", qx.DESC).Skip(2).Max(120)
+	gotDesc, err := db.QueryKeys(descQ)
+	if err != nil {
+		t.Fatalf("QueryKeys(DESC array count insert/delete): %v", err)
+	}
+	wantDesc, err := expectedKeysUint64(t, db, descQ)
+	if err != nil {
+		t.Fatalf("expectedKeysUint64(DESC array count insert/delete): %v", err)
+	}
+	assertSameSlice(t, gotDesc, wantDesc)
+}
+
 func TestQuery_OrderBy_WithNegationAndLimit(t *testing.T) {
 	db, _ := openTempDBUint64(t)
 	_ = seedData(t, db, 200)
 
 	// order + NOT branch
-	// this forces the "negative + ordering" path to materialize (universe AND NOT set)
+	// exercise the negative ordered path directly without forcing universe materialization
 	q := qx.Query(
 		qx.NOT(qx.EQ("country", "NL")),
 	).By("age", qx.ASC).Skip(3).Max(25)
@@ -270,6 +385,27 @@ func TestQuery_ByArrayPos_WithLimitAndNegation(t *testing.T) {
 	assertSameSlice(t, got, want)
 }
 
+func TestQuery_ByArrayPos_WithNegation_NoLimit(t *testing.T) {
+	db, _ := openTempDBUint64(t)
+	_ = seedData(t, db, 220)
+
+	priority := []string{"go", "java", "ops"}
+	q := qx.Query(
+		qx.NOT(qx.CONTAINS("country", "land")),
+	).ByArrayPos("tags", priority, qx.ASC)
+
+	got, err := db.QueryKeys(q)
+	if err != nil {
+		t.Fatalf("QueryKeys: %v", err)
+	}
+
+	want, err := expectedKeysUint64(t, db, q)
+	if err != nil {
+		t.Fatalf("expectedKeysUint64: %v", err)
+	}
+	assertSameSlice(t, got, want)
+}
+
 func TestQuery_ByArrayCount_WithLimitAndNegation(t *testing.T) {
 	db, _ := openTempDBUint64(t)
 	_ = seedData(t, db, 220)
@@ -290,11 +426,31 @@ func TestQuery_ByArrayCount_WithLimitAndNegation(t *testing.T) {
 	assertSameSlice(t, got, want)
 }
 
+func TestQuery_ByArrayCount_WithNegation_NoLimit(t *testing.T) {
+	db, _ := openTempDBUint64(t)
+	_ = seedData(t, db, 220)
+
+	q := qx.Query(
+		qx.NOT(qx.EQ("active", true)),
+	).ByArrayCount("tags", qx.DESC)
+
+	got, err := db.QueryKeys(q)
+	if err != nil {
+		t.Fatalf("QueryKeys: %v", err)
+	}
+
+	want, err := expectedKeysUint64(t, db, q)
+	if err != nil {
+		t.Fatalf("expectedKeysUint64: %v", err)
+	}
+	assertSameSlice(t, got, want)
+}
+
 func TestQuery_SortWithNegativeResult_NoDuplicates(t *testing.T) {
 	db, _ := openTempDBUint64(t)
 	_ = seedData(t, db, 300)
 
-	// negative result + ORDER triggers materialization path; ensure no duplicates in output
+	// negative result + ORDER must preserve ordered output without duplicates
 	q := qx.Query(
 		qx.NOT(qx.EQ("country", "NL")),
 	).By("age", qx.ASC).Max(120)

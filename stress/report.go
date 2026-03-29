@@ -6,7 +6,7 @@ import (
 	"github.com/vapstack/rbi"
 )
 
-const reportSchema = "rbi.stress_report/v4"
+const reportSchema = "rbi.stress_report/v6"
 
 type stressReport struct {
 	Schema      string `json:"schema"`
@@ -32,16 +32,12 @@ type stressReport struct {
 	Classes []classReport       `json:"classes"`
 	Totals  totalsReport        `json:"totals"`
 	Planner *plannerTraceReport `json:"planner,omitempty"`
+	Phases  []phaseReport       `json:"phases,omitempty"`
 
 	MemoryBaseline *MemorySnapshot  `json:"memory_baseline,omitempty"`
 	MemoryFinal    *MemorySnapshot  `json:"memory_final,omitempty"`
 	MemorySummary  *MemorySummary   `json:"memory_summary,omitempty"`
 	MemorySamples  []MemorySnapshot `json:"memory_samples,omitempty"`
-
-	PoolBaseline *poolSample  `json:"pool_baseline,omitempty"`
-	PoolFinal    *poolSample  `json:"pool_final,omitempty"`
-	PoolSummary  *poolSummary `json:"pool_summary,omitempty"`
-	PoolSamples  []poolSample `json:"pool_samples,omitempty"`
 
 	SnapshotBaseline snapshotSample   `json:"snapshot_baseline"`
 	SnapshotFinal    snapshotSample   `json:"snapshot_final"`
@@ -91,6 +87,33 @@ type totalsReport struct {
 	Total scopeReport `json:"total"`
 }
 
+type phaseReport struct {
+	Index            int     `json:"index"`
+	Kind             string  `json:"kind"`
+	StartedAt        string  `json:"started_at"`
+	FinishedAt       string  `json:"finished_at"`
+	DurationSec      float64 `json:"duration_sec"`
+	StartedByCommand string  `json:"started_by_command,omitempty"`
+	EndedByCommand   string  `json:"ended_by_command,omitempty"`
+
+	Classes []classReport       `json:"classes"`
+	Totals  totalsReport        `json:"totals"`
+	Planner *plannerTraceReport `json:"planner,omitempty"`
+
+	MemoryBaseline *MemorySnapshot  `json:"memory_baseline,omitempty"`
+	MemoryFinal    *MemorySnapshot  `json:"memory_final,omitempty"`
+	MemorySummary  *MemorySummary   `json:"memory_summary,omitempty"`
+	MemorySamples  []MemorySnapshot `json:"memory_samples,omitempty"`
+
+	SnapshotBaseline snapshotSample   `json:"snapshot_baseline"`
+	SnapshotFinal    snapshotSample   `json:"snapshot_final"`
+	SnapshotSamples  []snapshotSample `json:"snapshot_samples,omitempty"`
+
+	BatchBaseline batchSample   `json:"batch_baseline"`
+	BatchFinal    batchSample   `json:"batch_final"`
+	BatchSamples  []batchSample `json:"batch_samples,omitempty"`
+}
+
 type scopeReport struct {
 	CompletedOps uint64         `json:"completed_ops"`
 	Errors       uint64         `json:"errors"`
@@ -103,21 +126,6 @@ type scopeReport struct {
 type snapshotSample struct {
 	CapturedAt string            `json:"captured_at"`
 	Stats      rbi.SnapshotStats `json:"stats"`
-	Delta      snapshotDelta     `json:"delta"`
-}
-
-type snapshotDelta struct {
-	CompactorRequested    uint64 `json:"compactor_requested"`
-	CompactorRuns         uint64 `json:"compactor_runs"`
-	CompactorAttempts     uint64 `json:"compactor_attempts"`
-	CompactorSucceeded    uint64 `json:"compactor_succeeded"`
-	CompactorPreclaimBusy uint64 `json:"compactor_preclaim_busy"`
-	CompactorLockMiss     uint64 `json:"compactor_lock_miss"`
-	CompactorNoChange     uint64 `json:"compactor_no_change"`
-	CompactorSoftSkip     uint64 `json:"compactor_soft_skip"`
-	CompactorSkippedWake  uint64 `json:"compactor_skipped_wake"`
-	CompactorIdleDefers   uint64 `json:"compactor_idle_defers"`
-	CompactorStaleRetry   uint64 `json:"compactor_stale_retry"`
 }
 
 type batchSample struct {

@@ -133,18 +133,11 @@ func formatMemoryLine(memory *MemorySnapshot) string {
 func formatSnapshotLine(sample snapshotSample) string {
 	stats := sample.Stats
 	return fmt.Sprintf(
-		"snap    pin=%d reg=%d depth=%d/%d ops=%s/%s cq=%d busy=%s miss=%s soft=%s skip=%s",
+		"snap    seq=%d pin=%d reg=%d uni=%d",
+		stats.Sequence,
 		stats.PinnedRefs,
 		stats.RegistrySize,
-		stats.IndexLayerDepth,
-		stats.LenLayerDepth,
-		formatOps(float64(stats.IndexDeltaOps)),
-		formatOps(float64(stats.LenDeltaOps)),
-		stats.CompactorQueueLen,
-		formatOps(float64(stats.CompactorPreclaimBusy)),
-		formatOps(float64(stats.CompactorLockMiss)),
-		formatOps(float64(stats.CompactorSoftSkip)),
-		formatOps(float64(stats.CompactorSkippedWake)),
+		stats.UniverseCard,
 	)
 }
 
@@ -181,8 +174,8 @@ func formatTraceLine(report *plannerTraceReport) string {
 		formatLatency(report.Total.AvgDurationUs),
 		formatOps(report.Total.AvgRowsExamined),
 		formatOps(report.Total.AvgRowsMatched),
-		formatOps(report.Total.AvgBitmapMats),
-		formatOps(report.Total.AvgBitmapExact),
+		formatOps(report.Total.AvgPostingMats),
+		formatOps(report.Total.AvgPostingExact),
 		formatOps(report.Total.AvgOrderScanWidth),
 		report.Total.RuntimeFallbacks,
 	)

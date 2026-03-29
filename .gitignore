@@ -2,6 +2,7 @@ old.txt
 new.txt
 rbi.test
 mem.out
+benchdiff
 bench/bench
 stress.test
 stress/stress
@@ -11,3 +12,4 @@ bench_*.txt
 bench_report*.json
 stress_report*.json
 result_*.json
+testdata

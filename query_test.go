@@ -12,6 +12,7 @@ import (
 	"testing"
 
 	"github.com/vapstack/qx"
+	"github.com/vapstack/rbi/internal/normalize"
 	"go.etcd.io/bbolt"
 )
 
@@ -89,7 +90,7 @@ func seedData(t *testing.T, db *DB[uint64, Rec], n int) []uint64 {
 
 	r := newRand(1)
 	ids := make([]uint64, 0, n)
-	batchSize := 8192
+	batchSize := 32 << 10
 	if n > 0 && n < batchSize {
 		batchSize = n
 	}
@@ -151,7 +152,7 @@ func seedGeneratedUint64Data(t *testing.T, db *DB[uint64, Rec], n int, gen func(
 	db.DisableSync()
 	defer db.EnableSync()
 
-	batchSize := 20_000
+	batchSize := 32 << 10
 	if n > 0 && n < batchSize {
 		batchSize = n
 	}
@@ -186,6 +187,37 @@ func mustExtractAndLeaves(t testing.TB, e qx.Expr) []qx.Expr {
 		t.Fatalf("extractAndLeaves failed: ok=%v len=%d", ok, len(leaves))
 	}
 	return leaves
+}
+
+func TestExtractAndLeavesRejectsNegatedAndGroup(t *testing.T) {
+	e := qx.AND(
+		qx.NOT(qx.AND(
+			qx.EQ("email", "a@example.com"),
+			qx.EQ("age", 42),
+		)),
+		qx.EQ("active", true),
+	)
+
+	leaves, ok := extractAndLeaves(e)
+	if ok || leaves != nil {
+		t.Fatalf("expected negated AND group to be rejected, got ok=%v leaves=%v", ok, leaves)
+	}
+}
+
+func TestCollectAndLeavesFixedRejectsNegatedAndGroup(t *testing.T) {
+	e := qx.AND(
+		qx.NOT(qx.AND(
+			qx.EQ("email", "a@example.com"),
+			qx.EQ("age", 42),
+		)),
+		qx.EQ("active", true),
+	)
+
+	var buf [4]qx.Expr
+	leaves, ok := collectAndLeavesFixed(e, buf[:0])
+	if ok || leaves != nil {
+		t.Fatalf("expected negated AND group to be rejected, got ok=%v leaves=%v", ok, leaves)
+	}
 }
 
 func containsAll(haystack []string, needles []string) bool {
@@ -345,13 +377,13 @@ func compareOrderedFieldValues(va, vb any, desc bool) int {
 		if !ok {
 			return 0
 		}
-		switch {
-		case xa < xb:
+		switch cmp := compareFloat64QuerySemantics(xa, xb); {
+		case cmp < 0:
 			if desc {
 				return 1
 			}
 			return -1
-		case xa > xb:
+		case cmp > 0:
 			if desc {
 				return -1
 			}
@@ -411,7 +443,7 @@ func queryValueEqualsScalar(value any, want any) (bool, error) {
 		return ok && i == int64(w), nil
 	case float64:
 		f, ok := asFloat(value)
-		return ok && f == w, nil
+		return ok && compareFloat64QuerySemantics(f, w) == 0, nil
 	case bool:
 		b, ok := value.(bool)
 		return ok && b == w, nil
@@ -531,7 +563,7 @@ func evalExprBool(rec *Rec, e qx.Expr) (bool, error) {
 			out = ok2 && int64(v) == i
 		case float64:
 			f, ok2 := asFloat(e.Value)
-			out = ok2 && v == f
+			out = ok2 && compareFloat64QuerySemantics(v, f) == 0
 		case bool:
 			b, ok2 := e.Value.(bool)
 			out = ok2 && v == b
@@ -577,15 +609,16 @@ func evalExprBool(rec *Rec, e qx.Expr) (bool, error) {
 			if !ok2 {
 				return false, fmt.Errorf("test harness: bad float value for %v", e.Op)
 			}
+			cmp := compareFloat64QuerySemantics(v, f)
 			switch e.Op {
 			case qx.OpGT:
-				out = v > f
+				out = cmp > 0
 			case qx.OpGTE:
-				out = v >= f
+				out = cmp >= 0
 			case qx.OpLT:
-				out = v < f
+				out = cmp < 0
 			case qx.OpLTE:
-				out = v <= f
+				out = cmp <= 0
 			}
 		case string:
 			s, ok2 := asString(e.Value)
@@ -1172,16 +1205,32 @@ func queryStringIDsEqual(q *qx.QX, a, b []string) bool {
 	return slices.Equal(sortedStringIDs(a), sortedStringIDs(b))
 }
 
+type preparedRouteEqUint64 interface {
+	rootDB() *DB[uint64, Rec]
+	checkUsedQuery(*qx.QX) error
+	execPreparedQuery(*qx.QX) ([]uint64, error)
+	tryExecutionPlan(*qx.QX, *queryTrace) ([]uint64, bool, error)
+	tryPlan(*qx.QX, *queryTrace) ([]uint64, bool, error)
+}
+
+type preparedRouteEqString interface {
+	rootDB() *DB[string, Rec]
+	checkUsedQuery(*qx.QX) error
+	execPreparedQuery(*qx.QX) ([]string, error)
+	tryExecutionPlan(*qx.QX, *queryTrace) ([]string, bool, error)
+	tryPlan(*qx.QX, *queryTrace) ([]string, bool, error)
+}
+
 func assertPreparedRouteEquivalenceString(
 	t testing.TB,
-	db *DB[string, Rec],
+	db preparedRouteEqString,
 	q *qx.QX,
 ) (nq *qx.QX, ref []string, usedExecution bool, usedPlanner bool) {
 	t.Helper()
 
 	nq = normalizeQueryForTest(q)
-	if err := db.checkUsedFields(nq); err != nil {
-		t.Fatalf("checkUsedFields(%+v): %v", nq, err)
+	if err := db.checkUsedQuery(nq); err != nil {
+		t.Fatalf("checkUsedQuery(%+v): %v", nq, err)
 	}
 
 	ref, err := db.execPreparedQuery(nq)
@@ -1212,7 +1261,7 @@ func assertPreparedRouteEquivalenceString(
 		assertNoDuplicateStringIDs(t, "execution", execOut)
 		if strictEqual {
 			if !queryStringIDsEqual(nq, ref, execOut) {
-				want, werr := expectedKeysString(t, db, q)
+				want, werr := expectedKeysString(t, db.rootDB(), q)
 				if werr != nil {
 					t.Fatalf(
 						"execution route mismatch:\nq=%+v\nnq=%+v\nref=%v\nexecution=%v\nseqscan_err=%v",
@@ -1238,7 +1287,7 @@ func assertPreparedRouteEquivalenceString(
 		assertNoDuplicateStringIDs(t, "planner", planOut)
 		if strictEqual {
 			if !queryStringIDsEqual(nq, ref, planOut) {
-				want, werr := expectedKeysString(t, db, q)
+				want, werr := expectedKeysString(t, db.rootDB(), q)
 				if werr != nil {
 					t.Fatalf(
 						"planner route mismatch:\nq=%+v\nnq=%+v\nref=%v\nplanner=%v\nseqscan_err=%v",
@@ -1619,11 +1668,11 @@ func TestQuery_NegativeNoOrder_ExcludesCorrectly_WithPaging(t *testing.T) {
 	assertSameSlice(t, got, want)
 }
 
-func TestQuery_OrderVariants_BaseAndDelta_MatchSeqScanModel(t *testing.T) {
+func TestQuery_OrderVariants_AcrossSnapshots_MatchSeqScanModel(t *testing.T) {
 	db, _ := openTempDBUint64(t)
 	_ = seedData(t, db, 320)
 
-	// Force a clean base snapshot (without field deltas) to exercise base order paths.
+	// Force a clean snapshot before mutations to exercise the initial order paths.
 	if err := db.RebuildIndex(); err != nil {
 		t.Fatalf("RebuildIndex(base): %v", err)
 	}
@@ -1661,7 +1710,7 @@ func TestQuery_OrderVariants_BaseAndDelta_MatchSeqScanModel(t *testing.T) {
 	}
 	runChecks("base", baseQueries)
 
-	// Introduce deltas for basic/slice/scalar order fields.
+	// Mutate basic/slice/scalar order fields and verify subsequent snapshots.
 	if err := db.Patch(1, []Field{{Name: "age", Value: 99}}); err != nil {
 		t.Fatalf("Patch(age): %v", err)
 	}
@@ -1673,21 +1722,21 @@ func TestQuery_OrderVariants_BaseAndDelta_MatchSeqScanModel(t *testing.T) {
 	}
 	if err := db.Set(1001, &Rec{
 		Meta:     Meta{Country: "DE"},
-		Name:     "delta-user",
-		Email:    "delta-user@example.com",
+		Name:     "mutated-user",
+		Email:    "mutated-user@example.com",
 		Age:      37,
 		Score:    77.7,
 		Active:   true,
 		Tags:     []string{"java", "ops"},
-		FullName: "delta-user",
+		FullName: "mutated-user",
 	}); err != nil {
-		t.Fatalf("Set(delta): %v", err)
+		t.Fatalf("Set(mutated): %v", err)
 	}
 	if err := db.Delete(4); err != nil {
-		t.Fatalf("Delete(delta): %v", err)
+		t.Fatalf("Delete(mutated): %v", err)
 	}
 
-	deltaQueries := []*qx.QX{
+	mutatedQueries := []*qx.QX{
 		qx.Query(qx.GTE("age", 20)).By("age", qx.ASC).Max(64),
 		qx.Query(qx.GTE("age", 20)).By("age", qx.DESC).Skip(7).Max(41),
 		qx.Query(qx.NOT(qx.EQ("active", false))).ByArrayPos("tags", []string{"go", "java", "ops"}, qx.DESC).Skip(3).Max(33),
@@ -1695,7 +1744,7 @@ func TestQuery_OrderVariants_BaseAndDelta_MatchSeqScanModel(t *testing.T) {
 		qx.Query().ByArrayPos("country", []string{"NL", "DE", "PL"}, qx.ASC).Max(60),
 		qx.Query().ByArrayPos("country", []string{"NL", "DE", "PL"}, qx.DESC),
 	}
-	runChecks("delta", deltaQueries)
+	runChecks("mutated", mutatedQueries)
 }
 
 func TestQuery_ArrayOrder_RandomMutations_MatchSeqScan(t *testing.T) {
@@ -1892,16 +1941,35 @@ func TestQuery_ArrayOrder_RandomMutations_MatchSeqScan(t *testing.T) {
 								vals, _ := q.Order[0].Data.([]string)
 								var bits []string
 								for _, tag := range vals {
-									bm, owned := db.fieldLookupOwned("tags", tag, nil)
-									gHas := bm != nil && bm.Contains(gid)
-									wHas := bm != nil && bm.Contains(wid)
-									if owned && bm != nil {
-										releaseRoaringBuf(bm)
-									}
+									ids := db.fieldLookupPostingRetained("tags", tag)
+									gHas := ids.Contains(gid)
+									wHas := ids.Contains(wid)
 									bits = append(bits, fmt.Sprintf("%s:g=%v,w=%v", tag, gHas, wHas))
 								}
 								extra = fmt.Sprintf(
 									"\nfirst_mismatch=%d gotID=%d wantID=%d\ngotRec=%#v\nwantRec=%#v\ntagMembership={%s}",
+									first,
+									gid,
+									wid,
+									gv,
+									wv,
+									strings.Join(bits, ", "),
+								)
+							} else if q.Order[0].Type == qx.OrderByArrayPos && q.Order[0].Field == "country" {
+								gid := got[first]
+								wid := want[first]
+								gv, _ := db.Get(gid)
+								wv, _ := db.Get(wid)
+								vals, _ := q.Order[0].Data.([]string)
+								var bits []string
+								for _, country := range vals {
+									ids := db.fieldLookupPostingRetained("country", country)
+									gHas := ids.Contains(gid)
+									wHas := ids.Contains(wid)
+									bits = append(bits, fmt.Sprintf("%s:g=%v,w=%v", country, gHas, wHas))
+								}
+								extra = fmt.Sprintf(
+									"\nfirst_mismatch=%d gotID=%d wantID=%d\ngotRec=%#v\nwantRec=%#v\ncountryMembership={%s}",
 									first,
 									gid,
 									wid,
@@ -2132,28 +2200,67 @@ func TestQuery_RandomMixedMultiWrites_MatchSeqScanModel(t *testing.T) {
 					wid := wantKeys[first]
 					gv, _ := db.Get(gid)
 					wv, _ := db.Get(wid)
-					var gl, wl int
-					if gv != nil {
-						gl = distinctCountStrings(gv.Tags)
-					}
-					if wv != nil {
-						wl = distinctCountStrings(wv.Tags)
-					}
-					var gm, wm []string
-					for _, tag := range []string{"rust", "java", "infra", "go", "db"} {
-						bm, owned := db.fieldLookupOwned("tags", tag, nil)
-						gHas := bm != nil && bm.Contains(gid)
-						wHas := bm != nil && bm.Contains(wid)
-						if owned && bm != nil {
-							releaseRoaringBuf(bm)
+					if len(q.Order) > 0 && q.Order[0].Type == qx.OrderByArrayPos && q.Order[0].Field == "country" {
+						vals, _ := q.Order[0].Data.([]string)
+						var gm, wm []string
+						for _, country := range vals {
+							ids := db.fieldLookupPostingRetained("country", country)
+							gHas := ids.Contains(gid)
+							wHas := ids.Contains(wid)
+							gm = append(gm, fmt.Sprintf("%s=%v", country, gHas))
+							wm = append(wm, fmt.Sprintf("%s=%v", country, wHas))
 						}
-						gm = append(gm, fmt.Sprintf("%s=%v", tag, gHas))
-						wm = append(wm, fmt.Sprintf("%s=%v", tag, wHas))
+						countryDebug := func(country string) string {
+							qSimple := qx.Query(qx.AND(
+								qx.EQ("active", true),
+								qx.EQ("country", country),
+							))
+							gotIDs, gerr := db.QueryKeys(qSimple)
+							wantIDs, werr := expectedKeysUint64(t, db, qSimple)
+							if gerr != nil || werr != nil {
+								return fmt.Sprintf("%s: gotErr=%v wantErr=%v", country, gerr, werr)
+							}
+							if len(gotIDs) > 8 {
+								gotIDs = gotIDs[:8]
+							}
+							if len(wantIDs) > 8 {
+								wantIDs = wantIDs[:8]
+							}
+							return fmt.Sprintf("%s: got=%v want=%v", country, gotIDs, wantIDs)
+						}
+						extra = fmt.Sprintf(
+							"\nfirst_mismatch=%d gotID=%d wantID=%d\ngotRec=%#v countryMembership={%s}\nwantRec=%#v countryMembership={%s}\ncountryDebug:\n%s\n%s",
+							first,
+							gid,
+							wid,
+							gv,
+							strings.Join(gm, ","),
+							wv,
+							strings.Join(wm, ","),
+							countryDebug("NL"),
+							countryDebug("Finland"),
+						)
+					} else {
+						var gl, wl int
+						if gv != nil {
+							gl = distinctCountStrings(gv.Tags)
+						}
+						if wv != nil {
+							wl = distinctCountStrings(wv.Tags)
+						}
+						var gm, wm []string
+						for _, tag := range []string{"rust", "java", "infra", "go", "db"} {
+							ids := db.fieldLookupPostingRetained("tags", tag)
+							gHas := ids.Contains(gid)
+							wHas := ids.Contains(wid)
+							gm = append(gm, fmt.Sprintf("%s=%v", tag, gHas))
+							wm = append(wm, fmt.Sprintf("%s=%v", tag, wHas))
+						}
+						extra = fmt.Sprintf(
+							"\nfirst_mismatch=%d gotID=%d wantID=%d\ngotRec=%#v gotDistinctTags=%d tagMembership={%s}\nwantRec=%#v wantDistinctTags=%d tagMembership={%s}",
+							first, gid, wid, gv, gl, strings.Join(gm, ","), wv, wl, strings.Join(wm, ","),
+						)
 					}
-					extra = fmt.Sprintf(
-						"\nfirst_mismatch=%d gotID=%d wantID=%d\ngotRec=%#v gotDistinctTags=%d tagMembership={%s}\nwantRec=%#v wantDistinctTags=%d tagMembership={%s}",
-						first, gid, wid, gv, gl, strings.Join(gm, ","), wv, wl, strings.Join(wm, ","),
-					)
 				}
 				t.Fatalf("step=%d qi=%d keys mismatch q=%+v got=%v want=%v%s\nops:\n%s", step, qi, q, gotKeys, wantKeys, extra, strings.Join(opsLog, "\n"))
 			}
@@ -2222,6 +2329,8 @@ func TestQuery_ByArrayPos_Scalar_DuplicatePriority_BaseAndOverlay(t *testing.T) 
 
 	baseQ := qx.Query(qx.EQ("active", false)).ByArrayPos("country", []string{"NL", "NL", "PL"}, qx.ASC).Skip(3).Max(120)
 	check("base", baseQ)
+	baseDescQ := qx.Query(qx.EQ("active", false)).ByArrayPos("country", []string{"NL", "NL", "PL"}, qx.DESC).Skip(3).Max(120)
+	check("base-desc", baseDescQ)
 
 	if err := db.Patch(5, []Field{{Name: "country", Value: "NL"}}); err != nil {
 		t.Fatalf("Patch(5 country): %v", err)
@@ -2244,6 +2353,8 @@ func TestQuery_ByArrayPos_Scalar_DuplicatePriority_BaseAndOverlay(t *testing.T) 
 
 	overlayQ := qx.Query(qx.EQ("active", false)).ByArrayPos("country", []string{"NL", "NL", "PL"}, qx.ASC).Skip(3).Max(120)
 	check("overlay", overlayQ)
+	overlayDescQ := qx.Query(qx.EQ("active", false)).ByArrayPos("country", []string{"NL", "NL", "PL"}, qx.DESC).Skip(3).Max(120)
+	check("overlay-desc", overlayDescQ)
 }
 
 func runQueryKeysChecked(t *testing.T, db *DB[uint64, Rec], q *qx.QX) []uint64 {
@@ -2322,16 +2433,12 @@ func assertNoOrderWindowSubset(t testing.TB, q *qx.QX, got, full []uint64, label
 	}
 }
 
-func assertPreparedRouteEquivalence(
-	t testing.TB,
-	db *DB[uint64, Rec],
-	q *qx.QX,
-) (nq *qx.QX, ref []uint64, usedExecution bool, usedPlanner bool) {
+func assertPreparedRouteEquivalence(t testing.TB, db preparedRouteEqUint64, q *qx.QX) (nq *qx.QX, ref []uint64, usedExecution bool, usedPlanner bool) {
 	t.Helper()
 
 	nq = normalizeQueryForTest(q)
-	if err := db.checkUsedFields(nq); err != nil {
-		t.Fatalf("checkUsedFields(%+v): %v", nq, err)
+	if err := db.checkUsedQuery(nq); err != nil {
+		t.Fatalf("checkUsedQuery(%+v): %v", nq, err)
 	}
 
 	ref, err := db.execPreparedQuery(nq)
@@ -2363,7 +2470,7 @@ func assertPreparedRouteEquivalence(
 		if strictEqual {
 			if !queryIDsEqual(nq, ref, execOut) {
 				if tt, ok := t.(*testing.T); ok {
-					want, werr := expectedKeysUint64(tt, db, q)
+					want, werr := expectedKeysUint64(tt, db.rootDB(), q)
 					if werr != nil {
 						t.Fatalf("execution route mismatch:\nq=%+v\nnq=%+v\nref=%v\nexecution=%v\nseqscan_err=%v", q, nq, ref, execOut, werr)
 					}
@@ -2386,7 +2493,7 @@ func assertPreparedRouteEquivalence(
 		if strictEqual {
 			if !queryIDsEqual(nq, ref, planOut) {
 				if tt, ok := t.(*testing.T); ok {
-					want, werr := expectedKeysUint64(tt, db, q)
+					want, werr := expectedKeysUint64(tt, db.rootDB(), q)
 					if werr != nil {
 						t.Fatalf("planner route mismatch:\nq=%+v\nnq=%+v\nref=%v\nplanner=%v\nseqscan_err=%v", q, nq, ref, planOut, werr)
 					}
@@ -2416,7 +2523,7 @@ func cloneQuery(q *qx.QX) *qx.QX {
 
 func normalizeQueryForTest(q *qx.QX) *qx.QX {
 	n := cloneQuery(q)
-	n = normalizeQuery(n)
+	n = normalize.Query(n)
 	return n
 }
 
@@ -2567,7 +2674,7 @@ func seedMetamorphicDataProfile(t *testing.T, db *DB[uint64, Rec], n int, p meta
 	countries := []string{"NL", "PL", "DE", "Finland", "Iceland", "Thailand", "Switzerland", "US", "JP"}
 	names := []string{"alice", "albert", "bob", "bobby", "carol", "dave", "eve", "zoe", "nik"}
 	tagPool := []string{"go", "db", "ops", "rust", "java", "ml", "devops", "api", "infra"}
-	batchSize := 8192
+	batchSize := 32 << 10
 	if n > 0 && n < batchSize {
 		batchSize = n
 	}
@@ -3053,7 +3160,7 @@ func TestRegression_MultiTermHAS_LeadSelfCheck_RouteAndCount(t *testing.T) {
 			_, prepared, _, _ := assertPreparedRouteEquivalence(t, db, tc.q)
 			assertQueryIDsEqual(t, tc.q, got, prepared)
 
-			expr, _ := normalizeExpr(tc.q.Expr)
+			expr, _ := normalize.Expr(tc.q.Expr)
 			cntPred, ok, err := db.tryCountByPredicates(expr, nil)
 			if err != nil {
 				t.Fatalf("tryCountByPredicates: %v", err)
@@ -3115,7 +3222,7 @@ func TestRegression_CountORByPredicates_MultiTermHASLead(t *testing.T) {
 		t.Fatalf("expectedKeysUint64: %v", err)
 	}
 
-	expr, _ := normalizeExpr(q.Expr)
+	expr, _ := normalize.Expr(q.Expr)
 	cntFast, ok, err := db.tryCountORByPredicates(expr, nil)
 	if err != nil {
 		t.Fatalf("tryCountORByPredicates: %v", err)
@@ -3136,7 +3243,7 @@ func TestRegression_CountORByPredicates_MultiTermHASLead(t *testing.T) {
 	}
 }
 
-func TestQuery_RouteEquivalence_PreparedExecutionPlanner_BaseAndDelta(t *testing.T) {
+func TestQuery_RouteEquivalence_PreparedExecutionPlanner_BaseAndMutated(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
 	_ = seedData(t, db, 8_000)
 
@@ -3269,22 +3376,118 @@ func TestQuery_RouteEquivalence_PreparedExecutionPlanner_BaseAndDelta(t *testing
 				FullName: fmt.Sprintf("FN-%05d", 1+r.IntN(15_000)),
 			}
 			if err := db.Set(id, rec); err != nil {
-				t.Fatalf("delta Set(id=%d): %v", id, err)
+				t.Fatalf("mutated Set(id=%d): %v", id, err)
 			}
 		case 1:
 			patch := []Field{{Name: "age", Value: float64(18 + r.IntN(65))}}
 			if err := db.Patch(id, patch); err != nil {
-				t.Fatalf("delta Patch(id=%d): %v", id, err)
+				t.Fatalf("mutated Patch(id=%d): %v", id, err)
 			}
 		default:
 			if err := db.Delete(id); err != nil {
-				t.Fatalf("delta Delete(id=%d): %v", id, err)
+				t.Fatalf("mutated Delete(id=%d): %v", id, err)
 			}
 		}
 	}
-	if !db.snapshotHasAnyDelta() {
-		t.Fatalf("expected active snapshot delta after mutation phase")
+
+	runChecks("mutated")
+}
+
+/**/
+
+func TestNormalize_WrappedQueryMatchesDirectResults(t *testing.T) {
+	db, _ := openTempDBUint64(t)
+	_ = seedData(t, db, 10_000)
+
+	direct := qx.Query(
+		qx.GTE("age", 18),
+		qx.EQ("active", true),
+	).By("score", qx.DESC).Skip(500).Max(100)
+
+	wrapped := &qx.QX{
+		Expr: qx.Expr{
+			Op: qx.OpOR,
+			Operands: []qx.Expr{
+				direct.Expr,
+				{Op: qx.OpNOOP, Not: true},
+			},
+		},
+		Order:  direct.Order,
+		Offset: direct.Offset,
+		Limit:  direct.Limit,
 	}
 
-	runChecks("delta")
+	gotDirect, err := db.QueryKeys(direct)
+	if err != nil {
+		t.Fatalf("QueryKeys(direct): %v", err)
+	}
+	gotWrapped, err := db.QueryKeys(wrapped)
+	if err != nil {
+		t.Fatalf("QueryKeys(wrapped): %v", err)
+	}
+
+	if !slices.Equal(gotWrapped, gotDirect) {
+		t.Fatalf("results mismatch:\n wrapped=%v\n direct=%v", gotWrapped, gotDirect)
+	}
+}
+
+func TestNormalizeExpr_AlreadyCanonicalAND_AllocsPerRunStayZero(t *testing.T) {
+	if testRaceEnabled {
+		t.Skip("testing.AllocsPerRun is not stable under -race")
+	}
+
+	expr := qx.Expr{
+		Op: qx.OpAND,
+		Operands: []qx.Expr{
+			{Op: qx.OpEQ, Field: "active", Value: true},
+			{Op: qx.OpIN, Field: "country", Value: []string{"DE", "NL"}},
+			{Op: qx.OpHASANY, Field: "tags", Value: []string{"go", "ops"}},
+			{Op: qx.OpGTE, Field: "age", Value: 21},
+		},
+	}
+
+	out, changed := normalize.Expr(expr)
+	if changed {
+		t.Fatalf("expected canonical AND to stay unchanged")
+	}
+	if !reflect.DeepEqual(out, expr) {
+		t.Fatalf("unexpected normalize result:\n got=%+v\nwant=%+v", out, expr)
+	}
+
+	allocs := testing.AllocsPerRun(100, func() {
+		_, _ = normalize.Expr(expr)
+	})
+	if allocs > 0 {
+		t.Fatalf("unexpected allocs per run: got=%v want=0", allocs)
+	}
+}
+
+func TestNormalizeExpr_AlreadyCanonicalOR_AllocsPerRunStayZero(t *testing.T) {
+	if testRaceEnabled {
+		t.Skip("testing.AllocsPerRun is not stable under -race")
+	}
+
+	expr := qx.Expr{
+		Op: qx.OpOR,
+		Operands: []qx.Expr{
+			{Op: qx.OpEQ, Field: "active", Value: true},
+			{Op: qx.OpIN, Field: "country", Value: []string{"DE", "NL"}},
+			{Op: qx.OpPREFIX, Field: "email", Value: "ali"},
+		},
+	}
+
+	out, changed := normalize.Expr(expr)
+	if changed {
+		t.Fatalf("expected canonical OR to stay unchanged")
+	}
+	if !reflect.DeepEqual(out, expr) {
+		t.Fatalf("unexpected normalize result:\n got=%+v\nwant=%+v", out, expr)
+	}
+
+	allocs := testing.AllocsPerRun(100, func() {
+		_, _ = normalize.Expr(expr)
+	})
+	if allocs > 0 {
+		t.Fatalf("unexpected allocs per run: got=%v want=0", allocs)
+	}
 }

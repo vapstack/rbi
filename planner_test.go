@@ -10,17 +10,31 @@ import (
 	"time"
 
 	"github.com/vapstack/qx"
-	"github.com/vapstack/rbi/internal/roaring64"
+	"github.com/vapstack/rbi/internal/normalize"
+	"github.com/vapstack/rbi/internal/posting"
 )
 
-func postingOf(ids ...uint64) postingList {
-	return postingFromBitmapViewAdaptive(roaring64.BitmapOf(ids...))
+func postingOf(ids ...uint64) posting.List {
+	var out posting.List
+	for _, id := range ids {
+		out = out.BuildAdded(id)
+	}
+	return out
 }
 
-type orderedDeltaRec struct {
-	Age    int     `db:"age"`
-	Score  float64 `db:"score"`
-	Active bool    `db:"active"`
+func flattenOverlayForTest(ov fieldOverlay) []index {
+	if !ov.hasData() {
+		return nil
+	}
+	out := make([]index, 0, ov.keyCount())
+	cur := ov.newCursor(ov.rangeByRanks(0, ov.keyCount()), false)
+	for {
+		key, ids, ok := cur.next()
+		if !ok {
+			return out
+		}
+		out = append(out, index{Key: key, IDs: ids})
+	}
 }
 
 func TestPlannerCalibration_ObserveUpdatesMultiplier(t *testing.T) {
@@ -185,8 +199,55 @@ func TestPlannerCalibration_QueryViewUsesRootSnapshot(t *testing.T) {
 	view := db.makeQueryView(db.getSnapshot())
 	defer db.releaseQueryView(view)
 
-	assertApproxMultiplier(t, view.plannerCostMultiplier(plannerCalOrdered), 0.73)
-	assertApproxMultiplier(t, view.plannerCostMultiplier(plannerCalLimitOrderBasic), 1.41)
+	assertApproxMultiplier(t, view.root.plannerCostMultiplier(plannerCalOrdered), 0.73)
+	assertApproxMultiplier(t, view.root.plannerCostMultiplier(plannerCalLimitOrderBasic), 1.41)
+}
+
+func TestPlannerCalibration_DisabledUsesManualSnapshot(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{
+		AnalyzeInterval:        -1,
+		CalibrationEnabled:     false,
+		CalibrationSampleEvery: 1,
+	})
+	if err := db.SetCalibrationSnapshot(CalibrationSnapshot{
+		UpdatedAt: time.Now(),
+		Multipliers: map[string]float64{
+			string(PlanOrdered):         0.73,
+			string(PlanLimitOrderBasic): 1.41,
+		},
+		Samples: map[string]uint64{
+			string(PlanOrdered):         3,
+			string(PlanLimitOrderBasic): 5,
+		},
+	}); err != nil {
+		t.Fatalf("SetCalibrationSnapshot: %v", err)
+	}
+
+	view := db.makeQueryView(db.getSnapshot())
+	defer db.releaseQueryView(view)
+
+	assertApproxMultiplier(t, view.root.plannerCostMultiplier(plannerCalOrdered), 0.73)
+	assertApproxMultiplier(t, view.root.plannerCostMultiplier(plannerCalLimitOrderBasic), 1.41)
+	if db.traceOrCalibrationSamplingEnabled() {
+		t.Fatalf("expected online calibration sampling to remain disabled")
+	}
+}
+
+func TestPlannerCalibration_DisabledWithoutSnapshotUsesIdentityMultiplier(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{
+		AnalyzeInterval:        -1,
+		CalibrationEnabled:     false,
+		CalibrationSampleEvery: 1,
+	})
+
+	view := db.makeQueryView(db.getSnapshot())
+	defer db.releaseQueryView(view)
+
+	assertApproxMultiplier(t, view.root.plannerCostMultiplier(plannerCalOrdered), 1.0)
+	assertApproxMultiplier(t, view.root.plannerCostMultiplier(plannerCalLimitOrderBasic), 1.0)
+	if _, ok := db.GetCalibrationSnapshot(); ok {
+		t.Fatalf("expected no calibration snapshot when online calibration is disabled and nothing was loaded")
+	}
 }
 
 func TestPlannerCalibration_SampleEveryNormalization(t *testing.T) {
@@ -227,6 +288,17 @@ func TestTraceAndCalibrationDisabled_BeginTraceReturnsNil(t *testing.T) {
 	}
 }
 
+func TestPlannerResidualChecks_RemovesExactChecksByMembershipOrder(t *testing.T) {
+	checks := []int{3, 1, 4, 2}
+	exactChecks := []int{1, 2}
+
+	got := plannerResidualChecks(nil, checks, exactChecks)
+	want := []int{3, 4}
+	if !slices.Equal(got, want) {
+		t.Fatalf("unexpected residual checks: got=%v want=%v", got, want)
+	}
+}
+
 func TestOrderRangeCoverage_ConsistencyBetweenPredicateKinds(t *testing.T) {
 	db, _ := openTempDBUint64(t)
 
@@ -235,12 +307,7 @@ func TestOrderRangeCoverage_ConsistencyBetweenPredicateKinds(t *testing.T) {
 		{Key: indexKeyFromString("alina"), IDs: postingOf(2)},
 		{Key: indexKeyFromString("bob"), IDs: postingOf(3)},
 	}
-	delta := &fieldIndexDelta{
-		byKey: map[string]indexDeltaEntry{
-			"albert": {addSingle: 10, addSingleSet: true},
-		},
-	}
-	ov := newFieldOverlay(&s, delta)
+	ov := newFieldOverlay(&s)
 
 	exprs := []qx.Expr{
 		{Op: qx.OpPREFIX, Field: "name", Value: "al"},
@@ -279,74 +346,11 @@ func TestOrderRangeCoverage_ConsistencyBetweenPredicateKinds(t *testing.T) {
 	if !okOv2 {
 		t.Fatalf("extractOrderRangeCoverageOverlay failed")
 	}
-	if br1.baseStart != br2.baseStart || br1.baseEnd != br2.baseEnd || br1.deltaStart != br2.deltaStart || br1.deltaEnd != br2.deltaEnd {
+	if br1.baseStart != br2.baseStart || br1.baseEnd != br2.baseEnd {
 		t.Fatalf("overlay range mismatch: candidate=%+v planner=%+v", br1, br2)
 	}
 	if !slices.Equal(covOv1, covOv2) {
 		t.Fatalf("overlay covered mismatch: candidate=%v planner=%v", covOv1, covOv2)
-	}
-}
-
-func TestOverlayApproxDistinctTotalCount_CorrectsSmallDeltaShadowAndDelete(t *testing.T) {
-	base := []index{
-		{Key: indexKeyFromString("aa"), IDs: postingOf(1)},
-		{Key: indexKeyFromString("bb"), IDs: postingOf(2)},
-		{Key: indexKeyFromString("cc"), IDs: postingOf(3)},
-	}
-	ov := fieldOverlay{
-		base: base,
-		delta: &fieldIndexDelta{
-			entries: []fieldDeltaKV{
-				{key: "aa", entry: indexDeltaEntry{delSingle: 1, delSingleSet: true}},
-				{key: "bb", entry: indexDeltaEntry{addSingle: 22, addSingleSet: true}},
-				{key: "bc", entry: indexDeltaEntry{addSingle: 23, addSingleSet: true}},
-				{key: "zz", entry: indexDeltaEntry{addSingle: 99, addSingleSet: true, delSingle: 99, delSingleSet: true}},
-			},
-		},
-	}
-
-	rawApprox := len(base) + ov.delta.keyCount()
-	if rawApprox == 3 {
-		t.Fatalf("test setup must expose approximation drift")
-	}
-	if got := overlayApproxDistinctTotalCount(ov); got != 3 {
-		t.Fatalf("unexpected corrected total distinct count: got=%d want=3", got)
-	}
-}
-
-func TestOverlayApproxDistinctRangeCount_CorrectsSmallDeltaShadowAndDelete(t *testing.T) {
-	base := []index{
-		{Key: indexKeyFromString("aa"), IDs: postingOf(1)},
-		{Key: indexKeyFromString("bb"), IDs: postingOf(2)},
-		{Key: indexKeyFromString("cc"), IDs: postingOf(3)},
-	}
-	ov := fieldOverlay{
-		base: base,
-		delta: &fieldIndexDelta{
-			entries: []fieldDeltaKV{
-				{key: "aa", entry: indexDeltaEntry{delSingle: 1, delSingleSet: true}},
-				{key: "bb", entry: indexDeltaEntry{addSingle: 22, addSingleSet: true}},
-				{key: "bc", entry: indexDeltaEntry{addSingle: 23, addSingleSet: true}},
-				{key: "zz", entry: indexDeltaEntry{addSingle: 99, addSingleSet: true, delSingle: 99, delSingleSet: true}},
-			},
-		},
-	}
-
-	br := ov.rangeForBounds(rangeBounds{
-		has:   true,
-		hasLo: true,
-		loKey: "aa",
-		loInc: true,
-		hasHi: true,
-		hiKey: "bc",
-		hiInc: true,
-	})
-	rawApprox := (br.baseEnd - br.baseStart) + (br.deltaEnd - br.deltaStart)
-	if rawApprox == 2 {
-		t.Fatalf("test setup must expose approximation drift")
-	}
-	if got := overlayApproxDistinctRangeCount(ov, br); got != 2 {
-		t.Fatalf("unexpected corrected range distinct count: got=%d want=2", got)
 	}
 }
 
@@ -574,6 +578,62 @@ func TestPlannerCalibration_AutoPersist(t *testing.T) {
 	}
 }
 
+func TestPlannerCalibration_AutoPersist_DisabledUsesFrozenState(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "auto_persist_disabled.db")
+
+	opts := Options{
+		AnalyzeInterval:    -1,
+		CalibrationEnabled: false,
+		PersistCalibration: true,
+	}
+
+	db, raw := openBoltAndNew[uint64, Rec](t, dbPath, opts)
+	calPath := db.planner.calibrator.persistPath
+
+	if err := db.SetCalibrationSnapshot(CalibrationSnapshot{
+		UpdatedAt: time.Now(),
+		Multipliers: map[string]float64{
+			"plan_ordered": 1.42,
+		},
+		Samples: map[string]uint64{
+			"plan_ordered": 12,
+		},
+	}); err != nil {
+		t.Fatalf("SetCalibrationSnapshot: %v", err)
+	}
+
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatalf("raw close: %v", err)
+	}
+	if _, err := os.Stat(calPath); err != nil {
+		t.Fatalf("expected persisted calibration file %q: %v", calPath, err)
+	}
+
+	db2, raw2 := openBoltAndNew[uint64, Rec](t, dbPath, opts)
+	defer func() { _ = db2.Close() }()
+	defer func() { _ = raw2.Close() }()
+
+	snap, ok := db2.GetCalibrationSnapshot()
+	if !ok {
+		t.Fatalf("expected snapshot after reopen")
+	}
+	assertApproxMultiplier(t, snap.Multipliers["plan_ordered"], 1.42)
+	if snap.Samples["plan_ordered"] != 12 {
+		t.Fatalf("unexpected sample count after reopen: %d", snap.Samples["plan_ordered"])
+	}
+
+	view := db2.makeQueryView(db2.getSnapshot())
+	defer db2.releaseQueryView(view)
+	assertApproxMultiplier(t, view.root.plannerCostMultiplier(plannerCalOrdered), 1.42)
+	if db2.traceOrCalibrationSamplingEnabled() {
+		t.Fatalf("expected online calibration sampling to remain disabled")
+	}
+}
+
 func TestPlannerCalibration_SupportsExecutionPlanNames(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
 		AnalyzeInterval:    -1,
@@ -623,7 +683,7 @@ func makeORBranchForCalibrationDecisionTest(estCard uint64, extraChecks int) pla
 	preds := make([]predicate, 0, 1+extraChecks)
 	preds = append(preds, predicate{
 		estCard:  estCard,
-		iter:     func() roaringIter { return roaring64.NewBitmap().Iterator() },
+		iter:     func() posting.Iterator { return (posting.List{}).Iter() },
 		contains: func(uint64) bool { return true },
 	})
 	for i := 0; i < extraChecks; i++ {
@@ -730,7 +790,7 @@ func TestPlannerORNoOrderAdaptive_MatchesBaseline(t *testing.T) {
 			qx.EQ("country", "NL"),
 		),
 	).Max(150)
-	q = normalizeQuery(q)
+	q = normalize.Query(q)
 
 	branchesAdaptive, alwaysFalse, ok := db.buildORBranches(q.Expr.Operands)
 	if !ok {
@@ -784,7 +844,7 @@ func TestPlannerOROrderKWay_MatchesFallbackMerge(t *testing.T) {
 			qx.PREFIX("full_name", "FN-1"),
 		),
 	).By("age", qx.ASC).Skip(30).Max(120)
-	q = normalizeQuery(q)
+	q = normalize.Query(q)
 
 	branchesKWay, alwaysFalse, ok := db.buildORBranches(q.Expr.Operands)
 	if !ok {
@@ -825,211 +885,366 @@ func TestPlannerOROrderKWay_MatchesFallbackMerge(t *testing.T) {
 	}
 }
 
-func TestPlannerOROrderMergePaths_MatchBasic_WithOrderDelta(t *testing.T) {
+func TestPlannerORBranchesOrdered_CoversOrderRangeLeaves(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
 		AnalyzeInterval: -1,
 	})
 	_ = seedData(t, db, 20_000)
 
-	rec, err := db.Get(1)
-	if err != nil {
-		t.Fatalf("Get(1): %v", err)
-	}
-	rec.Age++
-	if err := db.Set(1, rec); err != nil {
-		t.Fatalf("Set(1): %v", err)
-	}
-
-	ov := db.fieldOverlay("age")
-	if ov.delta == nil {
-		t.Fatalf("expected non-nil age delta overlay")
-	}
-
-	q := normalizeQuery(qx.Query(
+	q := normalize.Query(qx.Query(
 		qx.OR(
 			qx.AND(
+				qx.GTE("age", 25),
 				qx.EQ("active", true),
-				qx.EQ("country", "NL"),
 			),
 			qx.AND(
-				qx.EQ("name", "alice"),
-				qx.GTE("age", 25),
+				qx.LTE("age", 45),
+				qx.EQ("country", "NL"),
 			),
-			qx.PREFIX("full_name", "FN-1"),
 		),
-	).By("age", qx.ASC).Skip(30).Max(120))
+	).By("age", qx.ASC).Max(120))
 
-	branchesKWay, alwaysFalse, ok := db.buildORBranches(q.Expr.Operands)
+	window, _ := orderWindow(q)
+	branches, alwaysFalse, ok := db.buildORBranchesOrdered(q.Expr.Operands, "age", window)
 	if !ok {
-		t.Fatalf("buildORBranches kway: ok=false")
+		t.Fatalf("buildORBranchesOrdered: ok=false")
 	}
 	if alwaysFalse {
-		t.Fatalf("unexpected alwaysFalse for kway branches")
+		t.Fatalf("unexpected alwaysFalse for ordered OR branches")
 	}
-	defer releaseORBranches(branchesKWay)
+	defer releaseORBranches(branches)
 
-	gotKWay, ok, err := db.execPlanOROrderKWay(q, branchesKWay, nil)
-	if err != nil {
-		t.Fatalf("execPlanOROrderKWay err: %v", err)
+	covered := 0
+	for _, branch := range branches {
+		for _, p := range branch.preds {
+			if p.covered && p.expr.Field == "age" {
+				covered++
+			}
+		}
 	}
-	if !ok {
-		t.Fatalf("execPlanOROrderKWay: ok=false")
-	}
-
-	branchesFallback, alwaysFalse, ok := db.buildORBranches(q.Expr.Operands)
-	if !ok {
-		t.Fatalf("buildORBranches fallback: ok=false")
-	}
-	if alwaysFalse {
-		t.Fatalf("unexpected alwaysFalse for fallback branches")
-	}
-	defer releaseORBranches(branchesFallback)
-
-	gotFallback, ok, err := db.execPlanOROrderMergeFallback(q, branchesFallback, nil)
-	if err != nil {
-		t.Fatalf("execPlanOROrderMergeFallback err: %v", err)
-	}
-	if !ok {
-		t.Fatalf("execPlanOROrderMergeFallback: ok=false")
+	if covered == 0 {
+		t.Fatalf("expected ordered OR branches to cover order-field range leaves")
 	}
 
-	branchesBasic, alwaysFalse, ok := db.buildORBranches(q.Expr.Operands)
-	if !ok {
-		t.Fatalf("buildORBranches basic: ok=false")
-	}
-	if alwaysFalse {
-		t.Fatalf("unexpected alwaysFalse for basic branches")
-	}
-	defer releaseORBranches(branchesBasic)
-
-	gotBasic, ok := db.execPlanOROrderBasic(q, branchesBasic, nil)
+	got, ok := db.execPlanOROrderBasic(q, branches, nil)
 	if !ok {
 		t.Fatalf("execPlanOROrderBasic: ok=false")
 	}
-
-	if !slices.Equal(gotKWay, gotBasic) {
-		t.Fatalf("kway/basic mismatch with order delta:\nkway=%v\nbasic=%v", gotKWay, gotBasic)
+	want, err := db.QueryKeys(q)
+	if err != nil {
+		t.Fatalf("QueryKeys(%+v): %v", q, err)
 	}
-	if !slices.Equal(gotFallback, gotBasic) {
-		t.Fatalf("fallback/basic mismatch with order delta:\nfallback=%v\nbasic=%v", gotFallback, gotBasic)
+	if !slices.Equal(got, want) {
+		t.Fatalf("ordered OR basic mismatch:\ngot=%v\nwant=%v", got, want)
 	}
 }
 
-func TestPlannerOROrderMergePaths_WithDeltaInsertDelete_MatchSeqScan(t *testing.T) {
+func TestPlannerOROrderDecision_PrefersStreamWhenAllBranchesAreOrderBounded(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
 		AnalyzeInterval: -1,
 	})
 	_ = seedData(t, db, 20_000)
 
-	// Create order-field delta with both insertion and tombstone scenarios.
-	idTop := uint64(30_001)
-	if err := db.Set(idTop, &Rec{
-		Meta:     Meta{Country: "NL"},
-		Name:     "alice",
-		Email:    "delta-top@example.test",
-		Age:      34,
-		Score:    9_999.9,
-		Active:   true,
-		Tags:     []string{"go", "ops"},
-		FullName: "FN-DELTA-TOP",
-	}); err != nil {
-		t.Fatalf("Set(idTop): %v", err)
-	}
-
-	idGone := uint64(30_002)
-	if err := db.Set(idGone, &Rec{
-		Meta:     Meta{Country: "DE"},
-		Name:     "alice",
-		Email:    "delta-gone@example.test",
-		Age:      31,
-		Score:    9_995.7,
-		Active:   true,
-		Tags:     []string{"go", "ops"},
-		FullName: "FN-DELTA-GONE",
-	}); err != nil {
-		t.Fatalf("Set(idGone): %v", err)
-	}
-	if err := db.Delete(idGone); err != nil {
-		t.Fatalf("Delete(idGone): %v", err)
-	}
-
-	ov := db.fieldOverlay("score")
-	if ov.delta == nil {
-		t.Fatalf("expected non-nil score delta overlay")
-	}
-
-	q := normalizeQuery(qx.Query(
+	q := normalize.Query(qx.Query(
 		qx.OR(
 			qx.AND(
-				qx.EQ("active", true),
-				qx.IN("country", []string{"NL", "DE", "PL"}),
-				qx.HASANY("tags", []string{"go", "ops"}),
-				qx.GTE("score", 40.0),
+				qx.GTE("age", 25),
+				qx.EQ("country", "NL"),
 			),
 			qx.AND(
-				qx.EQ("name", "alice"),
-				qx.GTE("age", 20),
 				qx.LTE("age", 45),
-			),
-			qx.AND(
-				qx.HASANY("tags", []string{"rust", "db"}),
-				qx.GTE("score", 30.0),
+				qx.EQ("name", "alice"),
 			),
 		),
-	).By("score", qx.DESC).Max(120))
+	).By("age", qx.ASC).Max(120))
+
+	view := db.currentQueryViewForTests()
+	window, _ := orderWindow(q)
+	branches, alwaysFalse, ok := view.buildORBranchesOrdered(q.Expr.Operands, "age", window)
+	if !ok {
+		t.Fatalf("buildORBranchesOrdered: ok=false")
+	}
+	if alwaysFalse {
+		t.Fatalf("unexpected alwaysFalse for ordered OR branches")
+	}
+	defer releaseORBranches(branches)
+
+	decision := view.decidePlanOROrder(q, branches)
+	if decision.plan != plannerOROrderStream {
+		t.Fatalf("expected ordered OR stream plan for fully order-bounded branches, got=%v", decision.plan)
+	}
+}
+
+func TestPlannerORBranchesOrdered_BoundedCoveredOnlyBranchNotAlwaysTrue(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{
+		AnalyzeInterval: -1,
+	})
+	_ = seedData(t, db, 20_000)
+
+	q := normalize.Query(qx.Query(
+		qx.OR(
+			qx.AND(
+				qx.NOTIN("country", []string{"Finland", "Switzerland", "Iceland"}),
+				qx.LT("score", 50.0),
+			),
+			qx.AND(
+				qx.HASANY("tags", []string{"ops"}),
+				qx.EQ("country", "Switzerland"),
+				qx.NOTIN("country", []string{"Switzerland"}),
+			),
+			qx.EQ("name", "carol"),
+			qx.GTE("age", 20),
+		),
+	).By("age", qx.ASC).Max(9))
+
+	view := db.currentQueryViewForTests()
+	window, _ := orderWindow(q)
+	branches, alwaysFalse, ok := view.buildORBranchesOrdered(q.Expr.Operands, "age", window)
+	if !ok {
+		t.Fatalf("buildORBranchesOrdered: ok=false")
+	}
+	if alwaysFalse {
+		t.Fatalf("unexpected alwaysFalse for ordered OR branches")
+	}
+	defer releaseORBranches(branches)
+
+	foundAgeRange := false
+	snap := view.planner.stats.Load()
+	universe := snap.universeOr(view.snapshotUniverseCardinality())
+	ov := view.fieldOverlay("age")
+	for i := range branches {
+		if branches[i].expr.Op == qx.OpGTE && branches[i].expr.Field == "age" {
+			foundAgeRange = true
+			if branches[i].alwaysTrue {
+				t.Fatalf("bounded covered-only age branch must not become alwaysTrue")
+			}
+			if !branches[i].coveredRangeBounded {
+				t.Fatalf("bounded covered-only age branch must retain covered range metadata")
+			}
+			br, _, ok := view.extractOrderRangeCoverageOverlay("age", branches[i].preds, ov)
+			if !ok {
+				t.Fatalf("extractOrderRangeCoverageOverlay: ok=false")
+			}
+			_, wantCard := overlayRangeStats(ov, br)
+			mergeStats := view.orderMergeBranchStats("age", branches, ov)
+			if mergeStats[i].rangeRows != wantCard {
+				t.Fatalf("rangeRows=%d, want %d", mergeStats[i].rangeRows, wantCard)
+			}
+			if branches[i].estimatedCard(universe) != wantCard {
+				t.Fatalf("estimatedCard=%d, want rangeRows=%d", branches[i].estimatedCard(universe), wantCard)
+			}
+		}
+	}
+	if !foundAgeRange {
+		t.Fatalf("expected bounded age branch in ordered OR branches")
+	}
 
 	want, err := expectedKeysUint64(t, db, q)
 	if err != nil {
-		t.Fatalf("expectedKeysUint64: %v", err)
+		t.Fatalf("expectedKeysUint64(%+v): %v", q, err)
 	}
-	if len(want) == 0 || want[0] != idTop {
-		t.Fatalf("expected delta-top id as first result, got=%v", want)
+	got, err := db.QueryKeys(q)
+	if err != nil {
+		t.Fatalf("QueryKeys(%+v): %v", q, err)
 	}
-	for _, id := range want {
-		if id == idGone {
-			t.Fatalf("deleted id leaked into expected set: %d", idGone)
+	if !queryIDsEqual(q, got, want) {
+		t.Fatalf("ordered OR public planner mismatch:\ngot=%v\nwant=%v", got, want)
+	}
+}
+
+func TestPlannerORBranchesOrdered_EmptyCoveredOnlyBranchKeepsZeroEstimatedCard(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{
+		AnalyzeInterval: -1,
+	})
+	_ = seedData(t, db, 20_000)
+
+	q := normalize.Query(qx.Query(
+		qx.OR(
+			qx.LT("age", -1),
+			qx.EQ("name", "alice"),
+		),
+	).By("age", qx.ASC).Max(9))
+
+	view := db.currentQueryViewForTests()
+	window, _ := orderWindow(q)
+	branches, alwaysFalse, ok := view.buildORBranchesOrdered(q.Expr.Operands, "age", window)
+	if !ok {
+		t.Fatalf("buildORBranchesOrdered: ok=false")
+	}
+	if alwaysFalse {
+		t.Fatalf("unexpected alwaysFalse for ordered OR branches")
+	}
+	defer releaseORBranches(branches)
+
+	snap := view.planner.stats.Load()
+	universe := snap.universeOr(view.snapshotUniverseCardinality())
+	foundAgeRange := false
+	for i := range branches {
+		if branches[i].expr.Op != qx.OpLT || branches[i].expr.Field != "age" {
+			continue
+		}
+		foundAgeRange = true
+		if branches[i].alwaysTrue {
+			t.Fatalf("empty covered-only age branch must not become alwaysTrue")
+		}
+		if !branches[i].estKnown {
+			t.Fatalf("empty covered-only age branch must keep known zero cardinality")
+		}
+		if got := branches[i].estimatedCard(universe); got != 0 {
+			t.Fatalf("estimatedCard=%d, want 0", got)
 		}
 	}
+	if !foundAgeRange {
+		t.Fatalf("expected empty age branch in ordered OR branches")
+	}
+}
 
-	branchesKWay, alwaysFalse, ok := db.buildORBranches(q.Expr.Operands)
+func TestPlannerOROrderDecision_PrefersMergeWhenRouteEstimatorBeatsStream(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{
+		AnalyzeInterval: -1,
+	})
+	_ = seedData(t, db, 20_000)
+
+	q := normalize.Query(qx.Query(
+		qx.OR(
+			qx.AND(
+				qx.EQ("country", "DE"),
+				qx.HASANY("tags", []string{"rust", "go"}),
+				qx.GTE("score", 40.0),
+			),
+			qx.PREFIX("email", "user1"),
+			qx.GTE("age", 30),
+		),
+	).By("score", qx.DESC).Max(120))
+
+	view := db.currentQueryViewForTests()
+	window, _ := orderWindow(q)
+	branches, alwaysFalse, ok := view.buildORBranchesOrdered(q.Expr.Operands, "score", window)
 	if !ok {
-		t.Fatalf("buildORBranches kway: ok=false")
+		t.Fatalf("buildORBranchesOrdered: ok=false")
 	}
 	if alwaysFalse {
-		t.Fatalf("unexpected alwaysFalse for kway branches")
+		t.Fatalf("unexpected alwaysFalse for ordered OR branches")
 	}
-	defer releaseORBranches(branchesKWay)
+	defer releaseORBranches(branches)
 
-	gotKWay, ok, err := db.execPlanOROrderKWay(q, branchesKWay, nil)
-	if err != nil {
-		t.Fatalf("execPlanOROrderKWay err: %v", err)
+	snap := view.planner.stats.Load()
+	universe := snap.universeOr(view.snapshotUniverseCardinality())
+	if universe == 0 {
+		t.Fatalf("unexpected zero universe")
 	}
+	ov := view.fieldOverlay("score")
+	orderDistinct := uint64(overlayApproxDistinctTotalCount(ov))
+	if orderDistinct == 0 {
+		t.Fatalf("unexpected zero order distinct")
+	}
+	unionCard, _, _, hasAlwaysTrue := branches.unionCards(universe)
+	if hasAlwaysTrue || unionCard == 0 {
+		t.Fatalf("unexpected OR shape metrics: alwaysTrue=%v unionCard=%d", hasAlwaysTrue, unionCard)
+	}
+	expectedRows := estimateRowsForNeed(uint64(window), unionCard, universe)
+	mergeStats := view.orderMergeBranchStats("score", branches, ov)
+	streamChecks := branches.orderStreamChecksByBranch(false, mergeStats)
+	orderStats := view.plannerOrderFieldStats("score", snap, universe, orderDistinct)
+	streamCost := float64(expectedRows) * streamChecks * orderStats.skew()
+
+	routeCost, ok := view.estimateOROrderMergeRouteCost(q, branches, window, mergeStats)
 	if !ok {
-		t.Fatalf("execPlanOROrderKWay: ok=false")
+		t.Fatalf("estimateOROrderMergeRouteCost: ok=false")
+	}
+	if routeCost.kWay >= streamCost {
+		t.Fatalf("expected merge route estimate to beat stream: kway=%v stream=%v", routeCost.kWay, streamCost)
 	}
 
-	branchesFallback, alwaysFalse, ok := db.buildORBranches(q.Expr.Operands)
+	decision := view.decidePlanOROrder(q, branches)
+	if decision.plan != plannerOROrderMerge {
+		t.Fatalf("expected ordered OR merge plan when route estimator beats stream, got=%v", decision.plan)
+	}
+}
+
+func TestPlannerORBranchesOrdered_AvoidsMaterializingDeferredOrderRangeLeaves(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{
+		AnalyzeInterval: -1,
+	})
+	seedGeneratedUint64Data(t, db, 20_000, func(i int) *Rec {
+		return &Rec{
+			Name:  "u",
+			Age:   i,
+			Score: float64(i),
+		}
+	})
+	if err := db.RebuildIndex(); err != nil {
+		t.Fatalf("RebuildIndex: %v", err)
+	}
+
+	scoreExpr := qx.GTE("score", 500.0)
+	ageExpr := qx.GTE("age", 500)
+	leaves := []qx.Expr{
+		scoreExpr,
+		ageExpr,
+	}
+
+	preds, ok := db.buildPredicatesOrderedWithMode(leaves, "score", false, 4096, false, true)
 	if !ok {
-		t.Fatalf("buildORBranches fallback: ok=false")
+		t.Fatalf("buildPredicatesOrderedWithMode: ok=false")
+	}
+	defer releasePredicates(preds)
+
+	if len(preds) != 2 {
+		t.Fatalf("unexpected preds len: %d", len(preds))
+	}
+	if preds[0].expr.Field != "score" || preds[1].expr.Field != "age" {
+		t.Fatalf("unexpected predicate order: %+v", preds)
+	}
+	if preds[0].kind == predicateKindMaterialized || preds[0].kind == predicateKindMaterializedNot {
+		t.Fatalf("expected deferred order-field range to avoid materialization, got kind=%v", preds[0].kind)
+	}
+	if preds[1].covered {
+		t.Fatalf("unexpected covered residual predicate")
+	}
+	if !preds[1].hasContains() {
+		t.Fatalf("expected residual non-order range to remain active predicate")
+	}
+
+	ageKey := db.materializedPredCacheKey(ageExpr)
+	_ = ageKey
+	scoreKey := db.materializedPredCacheKey(scoreExpr)
+	if scoreKey != "" {
+		if _, ok := db.getSnapshot().loadMaterializedPred(scoreKey); ok {
+			t.Fatalf("unexpected materialized cache entry for deferred order-field range")
+		}
+	}
+}
+
+func TestPlannerOROrderMergeBranchStats_SkipFullSpanRowCountingWithoutOrderBounds(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{
+		AnalyzeInterval: -1,
+	})
+	_ = seedData(t, db, 20_000)
+
+	q := normalize.Query(qx.Query(
+		qx.OR(
+			qx.EQ("country", "NL"),
+			qx.EQ("name", "alice"),
+		),
+	).By("age", qx.ASC).Max(120))
+
+	view := db.currentQueryViewForTests()
+	window, _ := orderWindow(q)
+	branches, alwaysFalse, ok := view.buildORBranchesOrdered(q.Expr.Operands, "age", window)
+	if !ok {
+		t.Fatalf("buildORBranchesOrdered: ok=false")
 	}
 	if alwaysFalse {
-		t.Fatalf("unexpected alwaysFalse for fallback branches")
+		t.Fatalf("unexpected alwaysFalse for ordered OR branches")
 	}
-	defer releaseORBranches(branchesFallback)
+	defer releaseORBranches(branches)
 
-	gotFallback, ok, err := db.execPlanOROrderMergeFallback(q, branchesFallback, nil)
-	if err != nil {
-		t.Fatalf("execPlanOROrderMergeFallback err: %v", err)
-	}
-	if !ok {
-		t.Fatalf("execPlanOROrderMergeFallback: ok=false")
-	}
-
-	if !slices.Equal(gotKWay, want) {
-		t.Fatalf("kway/seqscan mismatch:\nkway=%v\nwant=%v", gotKWay, want)
-	}
-	if !slices.Equal(gotFallback, want) {
-		t.Fatalf("fallback/seqscan mismatch:\nfallback=%v\nwant=%v", gotFallback, want)
+	stats := view.orderMergeBranchStats("age", branches, view.fieldOverlay("age"))
+	for i := range branches {
+		if stats[i].rangeRows != 0 {
+			t.Fatalf("expected no full-span row counting for branch %d without order bounds, got rangeRows=%d", i, stats[i].rangeRows)
+		}
 	}
 }
 
@@ -1039,7 +1254,7 @@ func TestPlannerOROrderMergePaths_MixedExactAndNonExactChecks_MatchSeqScan(t *te
 	})
 	_ = seedData(t, db, 20_000)
 
-	q := normalizeQuery(qx.Query(
+	q := normalize.Query(qx.Query(
 		qx.OR(
 			qx.AND(
 				qx.EQ("active", true),
@@ -1137,7 +1352,7 @@ func TestPlannerOROrderKWayRuntimeFallbackEnable(t *testing.T) {
 	})
 	_ = seedData(t, db, 20_000)
 
-	qPrefix := normalizeQuery(qx.Query(
+	qPrefix := normalize.Query(qx.Query(
 		qx.OR(
 			qx.AND(
 				qx.EQ("active", true),
@@ -1169,7 +1384,7 @@ func TestPlannerOROrderKWayRuntimeFallbackEnable(t *testing.T) {
 		t.Fatalf("expected runtime fallback guard to be enabled for prefix/non-order shape")
 	}
 
-	qSimple := normalizeQuery(qx.Query(
+	qSimple := normalize.Query(qx.Query(
 		qx.OR(
 			qx.EQ("country", "NL"),
 			qx.EQ("name", "alice"),
@@ -1206,7 +1421,7 @@ func TestPlannerOrderedAnchor_MatchesBaseline(t *testing.T) {
 		qx.GTE("age", 30),
 		qx.NOTIN("name", []string{"alice"}),
 	).By("full_name", qx.ASC).Skip(20).Max(80)
-	q = normalizeQuery(q)
+	q = normalize.Query(q)
 
 	leaves, ok := collectAndLeaves(q.Expr)
 	if !ok {
@@ -1232,11 +1447,7 @@ func TestPlannerOrderedAnchor_MatchesBaseline(t *testing.T) {
 
 	orderField := q.Order[0].Field
 	ov := db.fieldOverlay(orderField)
-	slice := materializeFieldOverlay(ov)
-	if slice == nil {
-		t.Fatalf("materialized order slice is nil")
-	}
-	s := *slice
+	s := flattenOverlayForTest(ov)
 	start, end := 0, len(s)
 	if st, en, cov, ok := db.extractOrderRangeCoverage(orderField, predsB, s); ok {
 		start, end = st, en
@@ -1336,7 +1547,7 @@ func TestOrderedFallback_TracksMatchedRowsAndExactBitmapFilters(t *testing.T) {
 	})
 	_ = seedData(t, db, 20_000)
 
-	q := normalizeQuery(qx.Query(
+	q := normalize.Query(qx.Query(
 		qx.EQ("active", true),
 		qx.HAS("tags", []string{"go"}),
 	).By("country", qx.ASC).Skip(200).Max(40))
@@ -1390,7 +1601,7 @@ func TestOrderedFallback_TracksMatchedRowsAndExactBitmapFilters(t *testing.T) {
 		t.Fatalf("expected trace event")
 	}
 	ev := events[len(events)-1]
-	if ev.BitmapExactFilters == 0 {
+	if ev.PostingExactFilters == 0 {
 		t.Fatalf("expected exact bitmap bucket filtering to be used, trace=%+v", ev)
 	}
 	if ev.RowsMatched <= ev.RowsReturned {
@@ -1398,216 +1609,6 @@ func TestOrderedFallback_TracksMatchedRowsAndExactBitmapFilters(t *testing.T) {
 	}
 	if ev.OrderIndexScanWidth == 0 {
 		t.Fatalf("expected non-zero order scan width")
-	}
-}
-
-func TestOrderedDeltaDeepOffset_SkipsUnaffectedSingletonCompose(t *testing.T) {
-	var (
-		mu     sync.Mutex
-		events []TraceEvent
-	)
-
-	sink := func(ev TraceEvent) {
-		mu.Lock()
-		events = append(events, ev)
-		mu.Unlock()
-	}
-
-	dir := t.TempDir()
-	path := filepath.Join(dir, "test_ordered_delta.db")
-	db, raw := openBoltAndNew[uint64, orderedDeltaRec](t, path, Options{
-		AnalyzeInterval:                         -1,
-		TraceSink:                               sink,
-		TraceSampleEvery:                        1,
-		SnapshotCompactorRequestEveryNWrites:    1 << 30,
-		SnapshotCompactorIdleInterval:           -1,
-		SnapshotDeltaLayerMaxDepth:              1 << 30,
-		SnapshotMaterializedPredCacheMaxEntries: -1,
-	})
-	t.Cleanup(func() {
-		_ = db.Close()
-		_ = raw.Close()
-	})
-
-	db.DisableSync()
-	defer db.EnableSync()
-
-	ids := make([]uint64, 256)
-	vals := make([]*orderedDeltaRec, 256)
-	for i := range ids {
-		ids[i] = uint64(i + 1)
-		vals[i] = &orderedDeltaRec{
-			Age:    i,
-			Score:  float64(i),
-			Active: true,
-		}
-	}
-	if err := db.BatchSet(ids, vals); err != nil {
-		t.Fatalf("BatchSet(seed): %v", err)
-	}
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
-	}
-	if err := db.Patch(250, []Field{{Name: "age", Value: 1000}}); err != nil {
-		t.Fatalf("Patch(age): %v", err)
-	}
-	if db.getSnapshot().fieldDelta("age") == nil {
-		t.Fatalf("expected active age delta")
-	}
-
-	q := normalizeQuery(qx.Query(
-		qx.LT("score", 180.0),
-	).By("age", qx.ASC).Skip(100).Max(20))
-
-	leaves, ok := collectAndLeaves(q.Expr)
-	if !ok {
-		t.Fatalf("collectAndLeaves: ok=false")
-	}
-	preds, ok := db.buildPredicatesOrderedWithMode(leaves, "age", false, 0)
-	if !ok {
-		t.Fatalf("buildPredicatesOrderedWithMode: ok=false")
-	}
-	defer releasePredicates(preds)
-
-	tr := db.beginTrace(q)
-	if tr == nil {
-		t.Fatalf("expected trace to be enabled")
-	}
-	tr.setPlan(PlanOrdered)
-	got, ok := db.execPlanOrderedBasic(q, preds, tr)
-	if !ok {
-		t.Fatalf("execPlanOrderedBasic: ok=false")
-	}
-	tr.finish(uint64(len(got)), nil)
-
-	want := make([]uint64, 20)
-	for i := range want {
-		want[i] = uint64(101 + i)
-	}
-	if !slices.Equal(got, want) {
-		t.Fatalf("ordered deep-offset mismatch:\ngot=%v\nwant=%v", got, want)
-	}
-
-	mu.Lock()
-	defer mu.Unlock()
-	if len(events) == 0 {
-		t.Fatalf("expected trace event")
-	}
-	ev := events[len(events)-1]
-	if ev.BitmapMaterializations != 0 {
-		t.Fatalf("expected unaffected singleton delta buckets to avoid bitmap compose, trace=%+v", ev)
-	}
-	if ev.OrderIndexScanWidth == 0 {
-		t.Fatalf("expected non-zero order scan width")
-	}
-}
-
-func TestOrderedDeltaCoveredOnly_UsesNoPredicateOverlayScan(t *testing.T) {
-	var (
-		mu     sync.Mutex
-		events []TraceEvent
-	)
-
-	sink := func(ev TraceEvent) {
-		mu.Lock()
-		events = append(events, ev)
-		mu.Unlock()
-	}
-
-	dir := t.TempDir()
-	path := filepath.Join(dir, "test_ordered_delta_covered_only.db")
-	db, raw := openBoltAndNew[uint64, orderedDeltaRec](t, path, Options{
-		AnalyzeInterval:                         -1,
-		TraceSink:                               sink,
-		TraceSampleEvery:                        1,
-		SnapshotCompactorRequestEveryNWrites:    1 << 30,
-		SnapshotCompactorIdleInterval:           -1,
-		SnapshotDeltaLayerMaxDepth:              1 << 30,
-		SnapshotMaterializedPredCacheMaxEntries: -1,
-	})
-	t.Cleanup(func() {
-		_ = db.Close()
-		_ = raw.Close()
-	})
-
-	db.DisableSync()
-	defer db.EnableSync()
-
-	ids := make([]uint64, 256)
-	vals := make([]*orderedDeltaRec, 256)
-	for i := range ids {
-		ids[i] = uint64(i + 1)
-		vals[i] = &orderedDeltaRec{
-			Age:    i,
-			Score:  float64(i),
-			Active: true,
-		}
-	}
-	if err := db.BatchSet(ids, vals); err != nil {
-		t.Fatalf("BatchSet(seed): %v", err)
-	}
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
-	}
-	if err := db.Patch(250, []Field{{Name: "age", Value: 1000}}); err != nil {
-		t.Fatalf("Patch(age): %v", err)
-	}
-	if db.getSnapshot().fieldDelta("age") == nil {
-		t.Fatalf("expected active age delta")
-	}
-
-	q := normalizeQuery(qx.Query(
-		qx.GTE("age", 100),
-		qx.LT("age", 180),
-	).By("age", qx.ASC).Skip(5).Max(10))
-
-	leaves, ok := collectAndLeaves(q.Expr)
-	if !ok {
-		t.Fatalf("collectAndLeaves: ok=false")
-	}
-	preds, ok := db.buildPredicatesOrderedWithMode(leaves, "age", false, 0)
-	if !ok {
-		t.Fatalf("buildPredicatesOrderedWithMode: ok=false")
-	}
-	defer releasePredicates(preds)
-
-	active := 0
-	for i := range preds {
-		if !preds[i].covered && !preds[i].alwaysTrue {
-			active++
-		}
-	}
-	if active != 0 {
-		t.Fatalf("expected all ordered predicates to be covered, got active=%d", active)
-	}
-
-	tr := db.beginTrace(q)
-	if tr == nil {
-		t.Fatalf("expected trace to be enabled")
-	}
-	tr.setPlan(PlanOrdered)
-	got, ok := db.execPlanOrderedBasic(q, preds, tr)
-	if !ok {
-		t.Fatalf("execPlanOrderedBasic: ok=false")
-	}
-	tr.finish(uint64(len(got)), nil)
-
-	want := []uint64{106, 107, 108, 109, 110, 111, 112, 113, 114, 115}
-	if !slices.Equal(got, want) {
-		t.Fatalf("ordered covered-only mismatch:\ngot=%v\nwant=%v", got, want)
-	}
-
-	mu.Lock()
-	defer mu.Unlock()
-	if len(events) == 0 {
-		t.Fatalf("expected trace event")
-	}
-	ev := events[len(events)-1]
-	if ev.BitmapMaterializations != 0 {
-		t.Fatalf("expected covered-only overlay scan to avoid bitmap compose, trace=%+v", ev)
-	}
-	if ev.RowsMatched == 0 || ev.OrderIndexScanWidth == 0 {
-		t.Fatalf("expected trace counters to be populated, trace=%+v", ev)
 	}
 }
 
@@ -1743,7 +1744,7 @@ func TestPlannerRouting_PrefersExecutionForWidePrefixNoOrderLimit(t *testing.T) 
 		t.Fatalf("expected non-empty ids")
 	}
 
-	nq := normalizeQuery(q)
+	nq := normalize.Query(q)
 	leaves, ok := extractAndLeaves(nq.Expr)
 	if !ok || len(leaves) == 0 {
 		t.Fatalf("extractAndLeaves: ok=%v len=%d", ok, len(leaves))
@@ -1769,7 +1770,7 @@ func TestPlannerRouting_AvoidsExecutionForWidePrefixLowHitRate(t *testing.T) {
 	})
 	_ = seedData(t, db, 20_000)
 
-	q := normalizeQuery(qx.Query(
+	q := normalize.Query(qx.Query(
 		qx.PREFIX("full_name", "FN-"),
 		qx.EQ("full_name", "FN-10000"),
 	).Max(15))
@@ -1789,7 +1790,7 @@ func TestPlannerRouting_AvoidsExecutionForWidePrefixZeroHitRate(t *testing.T) {
 	})
 	_ = seedData(t, db, 20_000)
 
-	q := normalizeQuery(qx.Query(
+	q := normalize.Query(qx.Query(
 		qx.PREFIX("full_name", "FN-"),
 		qx.EQ("full_name", "FN-999999999"),
 	).Max(15))
@@ -1809,7 +1810,7 @@ func TestPlannerOROrderMergeFallbackFirst_ComplexOffset(t *testing.T) {
 	})
 	_ = seedData(t, db, 20_000)
 
-	qComplex := normalizeQuery(qx.Query(
+	qComplex := normalize.Query(qx.Query(
 		qx.OR(
 			qx.AND(
 				qx.EQ("active", true),
@@ -1848,7 +1849,7 @@ func TestPlannerOROrderMergeFallbackFirst_ComplexOffset(t *testing.T) {
 		}
 	}
 
-	qLight := normalizeQuery(qx.Query(
+	qLight := normalize.Query(qx.Query(
 		qx.OR(
 			qx.AND(
 				qx.EQ("active", true),
@@ -1873,135 +1874,6 @@ func TestPlannerOROrderMergeFallbackFirst_ComplexOffset(t *testing.T) {
 
 	if db.shouldPreferOROrderFallbackFirst(qLight, branchesLight) {
 		t.Fatalf("unexpected fallback-first preference for light ordered OR")
-	}
-}
-
-func TestPlannerOROrderMergeFallbackFirst_DisabledWithOrderDelta(t *testing.T) {
-	db, _ := openTempDBUint64(t, Options{
-		AnalyzeInterval: -1,
-	})
-	_ = seedData(t, db, 20_000)
-
-	rec, err := db.Get(1)
-	if err != nil {
-		t.Fatalf("Get(1): %v", err)
-	}
-	rec.Score += 0.314159
-	if err := db.Set(1, rec); err != nil {
-		t.Fatalf("Set(1): %v", err)
-	}
-
-	ov := db.fieldOverlay("score")
-	if ov.delta == nil {
-		t.Fatalf("expected non-nil score delta overlay")
-	}
-
-	q := normalizeQuery(qx.Query(
-		qx.OR(
-			qx.AND(
-				qx.EQ("active", true),
-				qx.IN("country", []string{"NL", "DE", "PL"}),
-				qx.HASANY("tags", []string{"go", "ops"}),
-				qx.GTE("score", 40.0),
-			),
-			qx.AND(
-				qx.EQ("name", "alice"),
-				qx.GTE("age", 20),
-				qx.LTE("age", 45),
-			),
-			qx.AND(
-				qx.HASANY("tags", []string{"rust", "db"}),
-				qx.GTE("score", 30.0),
-			),
-		),
-	).By("score", qx.DESC).Skip(500).Max(100))
-
-	branches, alwaysFalse, ok := db.buildORBranches(q.Expr.Operands)
-	if !ok {
-		t.Fatalf("buildORBranches: ok=false")
-	}
-	if alwaysFalse {
-		t.Fatalf("unexpected alwaysFalse branches")
-	}
-	defer releaseORBranches(branches)
-
-	if db.shouldPreferOROrderFallbackFirst(q, branches) {
-		t.Fatalf("fallback-first must stay disabled when order field overlay has delta")
-	}
-}
-
-func TestTracer_OROrderRouteDecision_WithOrderDelta(t *testing.T) {
-	db, _ := openTempDBUint64(t, Options{
-		AnalyzeInterval: -1,
-	})
-	_ = seedData(t, db, 20_000)
-
-	rec, err := db.Get(1)
-	if err != nil {
-		t.Fatalf("Get(1): %v", err)
-	}
-	rec.Score += 0.271828
-	if err := db.Set(1, rec); err != nil {
-		t.Fatalf("Set(1): %v", err)
-	}
-
-	ov := db.fieldOverlay("score")
-	if ov.delta == nil {
-		t.Fatalf("expected non-nil score delta overlay")
-	}
-
-	q := normalizeQuery(qx.Query(
-		qx.OR(
-			qx.AND(
-				qx.EQ("active", true),
-				qx.IN("country", []string{"NL", "DE", "PL"}),
-				qx.HASANY("tags", []string{"go", "ops"}),
-				qx.GTE("score", 40.0),
-			),
-			qx.AND(
-				qx.EQ("name", "alice"),
-				qx.GTE("age", 20),
-				qx.LTE("age", 45),
-			),
-			qx.AND(
-				qx.HASANY("tags", []string{"rust", "db"}),
-				qx.GTE("score", 30.0),
-			),
-		),
-	).By("score", qx.DESC).Skip(500).Max(100))
-
-	branches, alwaysFalse, ok := db.buildORBranches(q.Expr.Operands)
-	if !ok {
-		t.Fatalf("buildORBranches: ok=false")
-	}
-	if alwaysFalse {
-		t.Fatalf("unexpected alwaysFalse branches")
-	}
-	defer releaseORBranches(branches)
-
-	trace := &queryTrace{sink: func(TraceEvent) {}}
-	_, _, err = db.execPlanOROrderMerge(q, branches, trace)
-	if err != nil {
-		t.Fatalf("execPlanOROrderMerge: %v", err)
-	}
-
-	if trace.ev.ORRoute.Route != "kway_first" {
-		t.Fatalf("expected kway_first route, got %q", trace.ev.ORRoute.Route)
-	}
-	if trace.ev.ORRoute.Reason != "order_delta_present" {
-		t.Fatalf("expected route reason order_delta_present, got %q", trace.ev.ORRoute.Reason)
-	}
-	if trace.ev.ORRoute.FallbackCollectFast {
-		t.Fatalf("expected fallbackCollectFast=false with order delta")
-	}
-	if trace.ev.ORRoute.KWayCost <= 0 || trace.ev.ORRoute.FallbackCost <= 0 {
-		t.Fatalf(
-			"expected positive route costs: kway=%v fallback=%v",
-			trace.ev.ORRoute.KWayCost, trace.ev.ORRoute.FallbackCost,
-		)
-	}
-	if trace.ev.ORRoute.RuntimeGuardReason == "" {
-		t.Fatalf("expected runtime guard reason in OR route trace")
 	}
 }
 
@@ -2078,7 +1950,7 @@ func TestPlannerRouting_OrderLimitWithSecondaryRange_MatchesSeqScan(t *testing.T
 	})
 	_ = seedData(t, db, 20_000)
 
-	q := normalizeQuery(qx.Query(
+	q := normalize.Query(qx.Query(
 		qx.EQ("active", true),
 		qx.GTE("score", 30.0),
 		qx.GTE("age", 22),
@@ -2133,7 +2005,7 @@ func TestPlannerRouting_OrderLimitWithSecondaryRangeAndHasAny_MatchesSeqScan(t *
 	})
 	_ = seedData(t, db, 20_000)
 
-	q := normalizeQuery(qx.Query(
+	q := normalize.Query(qx.Query(
 		qx.EQ("active", true),
 		qx.HASANY("tags", []string{"go", "db", "ops"}),
 		qx.GTE("score", 30.0),
@@ -2173,7 +2045,7 @@ func TestExecutionPlan_OrderLimitWithNegativeResidual_MatchesSeqScan(t *testing.
 	})
 	_ = seedData(t, db, 20_000)
 
-	q := normalizeQuery(qx.Query(
+	q := normalize.Query(qx.Query(
 		qx.PREFIX("full_name", "FN-1"),
 		qx.EQ("active", true),
 		qx.NOTIN("country", []string{"NL", "DE"}),
@@ -2218,7 +2090,7 @@ func TestPlannerRouting_OrderedNoOrderWithNegativeIN_MatchesSeqScan(t *testing.T
 	})
 	_ = seedData(t, db, 20_000)
 
-	q := normalizeQuery(qx.Query(
+	q := normalize.Query(qx.Query(
 		qx.LT("age", 35),
 		qx.NOTIN("country", []string{"NL", "DE"}),
 		qx.NOTIN("name", []string{"alice", "bob"}),
@@ -2264,7 +2136,7 @@ func TestPlannerCandidateOrder_MatchesSeqScan(t *testing.T) {
 	})
 	_ = seedData(t, db, 20_000)
 
-	q := normalizeQuery(qx.Query(
+	q := normalize.Query(qx.Query(
 		qx.EQ("active", true),
 		qx.NOTIN("country", []string{"NL", "DE"}),
 		qx.IN("name", []string{"alice", "bob", "carol"}),
@@ -2299,7 +2171,7 @@ func TestPlannerCandidateNoOrder_RespectsWindowAndPredicateSet(t *testing.T) {
 	})
 	_ = seedData(t, db, 20_000)
 
-	q := normalizeQuery(qx.Query(
+	q := normalize.Query(qx.Query(
 		qx.EQ("active", true),
 		qx.NOTIN("country", []string{"NL", "DE"}),
 		qx.IN("name", []string{"alice", "bob", "carol"}),

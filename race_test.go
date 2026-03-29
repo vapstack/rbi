@@ -159,7 +159,7 @@ func TestRace_ConcurrentReadersAndWriters(t *testing.T) {
 	}
 }
 
-func TestRace_ConcurrentReadersAndWriters_SnapshotDelta(t *testing.T) {
+func TestRace_ConcurrentReadersAndWriters_Snapshots(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
 	_ = seedData(t, db, 200)
 

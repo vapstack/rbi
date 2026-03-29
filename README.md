@@ -3,7 +3,7 @@
 [![GoDoc](https://pkg.go.dev/badge/github.com/vapstack/rbi.svg)](https://pkg.go.dev/github.com/vapstack/rbi)
 [![License](https://img.shields.io/badge/license-Apache2-blue.svg)](https://raw.githubusercontent.com/vapstack/rbi/master/LICENSE)
 
-> This package should be considered experimental.
+> **This package should be considered experimental**
 
 ## Roaring Bolt Indexer
 
@@ -11,8 +11,8 @@ A secondary index layer for [bbolt](https://github.com/etcd-io/bbolt).
 
 It turns a key-value store into a document-oriented database with rich
 query capabilities, while preserving bbolt’s ACID guarantees for data storage.
-Indexes are kept fully in memory and built on top of
-[roaring64](https://github.com/RoaringBitmap/roaring) for fast set operations.
+Indexes are kept fully in memory and built on a heavily reworked fork of
+[roaring64](https://github.com/RoaringBitmap/roaring) for compact memory layout and fast set operations.
 
 ### Properties
 
@@ -389,16 +389,10 @@ Memory usage is roughly proportional to:
 * cardinality and distribution of indexed values.
 
 Memory usage can also grow in these cases:
-- High write rate with slow compaction (larger snapshot-delta overlays)
-- Larger snapshot registry and deeper delta chains
-- Large delta compact thresholds combined with write bursts
+- High write rate combined with large updates
 - Long-lived readers that keep old snapshots pinned (delays snapshot cleanup)
 
-Memory stabilizes when write rate, compaction throughput, and
-snapshot retention are balanced. It grows when write churn consistently outruns
-compaction/cleanup.
-
-Careful index and snapshot configuration is recommended for large datasets.
+Careful index configuration is recommended for large datasets.
 
 ## Multiple instances
 

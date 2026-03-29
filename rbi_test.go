@@ -1995,7 +1995,7 @@ func TestBatchConcurrentSingleOps_ModelReplayConsistency(t *testing.T) {
 			t.Fatalf("id=%d expected nil, got %#v", id, got)
 		case want != nil && got == nil:
 			t.Fatalf("id=%d expected value, got nil", id)
-		case want != nil && got != nil:
+		case want != nil:
 			if !reflect.DeepEqual(*got, *want) {
 				t.Fatalf("id=%d payload mismatch\n got=%#v\nwant=%#v", id, got, want)
 			}
@@ -4012,8 +4012,8 @@ func TestComponentAccessors_ExposePlannerCalibrationAndSnapshotDiagnostics(t *te
 	if snap.RegistrySize == 0 {
 		t.Fatalf("expected snapshot registry to be non-empty")
 	}
-	if snap.UniverseBaseCard+snap.UniverseAddCard == 0 {
-		t.Fatalf("expected snapshot universe cardinality (base+add) > 0")
+	if snap.UniverseCard == 0 {
+		t.Fatalf("expected snapshot universe cardinality > 0")
 	}
 
 	pl := db.PlannerStats()

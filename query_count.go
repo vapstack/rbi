@@ -2,12 +2,13 @@ package rbi
 
 import (
 	"github.com/vapstack/qx"
-	"github.com/vapstack/rbi/internal/roaring64"
+	"github.com/vapstack/rbi/internal/normalize"
+	"github.com/vapstack/rbi/internal/posting"
 )
 
 const countPredicateScanMaxLeaves = 16
 const countORPredicateMaxBranchesBase = 5
-const countORHybridBitmapBranchMax = 3
+const countORHybridMaterializedBranchMax = 3
 const countORSeenUnionThresholdBase = 64_000
 const countORSeenUniverseDiv = 16
 const countScalarInSplitMaxValues = 32
@@ -19,7 +20,6 @@ const countPredBroadRangeComplementMaxCard = 32_768
 const countPredBroadRangeComplementMaxCardCap = 131_072
 const countPredBroadRangeComplementFastProbeMin = 4_096
 const countPredBroadRangeComplementFastAvgPerBucketMax = 8
-const countPredBroadRangeComplementPostingMaxBuckets = predicatePostsAnyNotExactBitmapMaxTerms
 const countPredLeadResidualHasAnyExactMaxTerms = 3
 const countPredLeadResidualHasAnyExactMinCard = 65_536
 
@@ -36,85 +36,85 @@ func (db *DB[K, V]) Count(q *qx.QX) (uint64, error) {
 	return view.countInternal(q, true)
 }
 
-func (db *DB[K, V]) countInternal(q *qx.QX, emitTrace bool) (out uint64, err error) {
+func (qv *queryView[K, V]) countInternal(q *qx.QX, emitTrace bool) (out uint64, err error) {
 	if q == nil {
-		return db.snapshotUniverseCardinality(), nil
+		return qv.snapshotUniverseCardinality(), nil
 	}
 
-	if err := db.checkUsedFields(q); err != nil {
+	if err = qv.checkUsedExpr(q.Expr); err != nil {
 		return 0, err
 	}
 
-	expr, _ := normalizeExpr(q.Expr)
+	expr, _ := normalize.Expr(q.Expr)
 	var trace *queryTrace
-	if emitTrace && db.traceOrCalibrationSamplingEnabled() {
-		trace = db.beginTrace(&qx.QX{Expr: expr})
+	if emitTrace && qv.root.traceOrCalibrationSamplingEnabled() {
+		trace = qv.root.beginTrace(&qx.QX{Expr: expr})
 		if trace != nil {
 			defer func() {
 				trace.finish(out, err)
 			}()
 		}
 	}
+	var ok bool
 
-	if out, ok, err := db.tryCountByUniqueEq(expr, trace); ok || err != nil {
+	if out, ok, err = qv.tryCountByUniqueEq(expr, trace); ok || err != nil {
 		return out, err
 	}
-	if out, ok, err := db.tryCountByScalarLookup(expr, trace); ok || err != nil {
+	if out, ok, err = qv.tryCountByScalarLookup(expr, trace); ok || err != nil {
 		return out, err
 	}
-	if out, ok, err := db.tryCountByScalarInSplit(expr, trace); ok || err != nil {
+	if out, ok, err = qv.tryCountByScalarInSplit(expr, trace); ok || err != nil {
 		return out, err
 	}
-	if out, ok, err := db.tryCountByPredicates(expr, trace); ok || err != nil {
+	if out, ok, err = qv.tryCountByPredicates(expr, trace); ok || err != nil {
 		return out, err
 	}
-	if out, ok, err := db.tryCountORByPredicates(expr, trace); ok || err != nil {
+	if out, ok, err = qv.tryCountORByPredicates(expr, trace); ok || err != nil {
 		return out, err
 	}
 
-	b, err := db.evalExpr(expr)
+	b, err := qv.evalExpr(expr)
 	if err != nil {
 		return 0, err
 	}
 	defer b.release()
 
 	if trace != nil {
-		trace.setPlan(PlanCountBitmap)
+		trace.setPlan(PlanCountMaterialized)
 		if b.neg {
-			trace.addExamined(db.snapshotUniverseCardinality())
-		} else if b.bm != nil {
-			trace.addExamined(b.bm.GetCardinality())
+			trace.addExamined(qv.snapshotUniverseCardinality())
+		} else if !b.ids.IsEmpty() {
+			trace.addExamined(b.ids.Cardinality())
 		}
 	}
 
-	out = db.countBitmapResult(b)
-	return out, nil
+	return qv.countPostingResult(b), nil
 }
 
-func (db *DB[K, V]) tryCountByScalarLookup(expr qx.Expr, trace *queryTrace) (uint64, bool, error) {
+func (qv *queryView[K, V]) tryCountByScalarLookup(expr qx.Expr, trace *queryTrace) (uint64, bool, error) {
 	if expr.Field == "" {
 		return 0, false, nil
 	}
 
-	f := db.fields[expr.Field]
+	f := qv.fields[expr.Field]
 	if f == nil || f.Slice {
 		return 0, false, nil
 	}
 
-	ov := db.fieldOverlay(expr.Field)
-	if !ov.hasData() && !db.hasFieldIndex(expr.Field) {
+	ov := qv.fieldOverlay(expr.Field)
+	if !ov.hasData() && !qv.hasFieldIndex(expr.Field) {
 		return 0, false, nil
 	}
 
 	switch expr.Op {
 	case qx.OpEQ:
-		key, isSlice, isNil, err := db.exprValueToIdxScalar(expr)
+		key, isSlice, isNil, err := qv.exprValueToIdxScalar(expr)
 		if err != nil || isSlice {
 			return 0, false, err
 		}
 		hit := uint64(0)
 		if isNil {
-			hit = db.nilFieldOverlay(expr.Field).lookupCardinality(nilIndexEntryKey)
+			hit = qv.nilFieldOverlay(expr.Field).lookupCardinality(nilIndexEntryKey)
 		} else {
 			hit = ov.lookupCardinality(key)
 		}
@@ -122,27 +122,26 @@ func (db *DB[K, V]) tryCountByScalarLookup(expr qx.Expr, trace *queryTrace) (uin
 			trace.setPlan(PlanCountScalarLookup)
 			trace.addExamined(hit)
 		}
-		return countScalarLookupComplement(db.snapshotUniverseCardinality(), hit, expr.Not), true, nil
+		return countScalarLookupComplement(qv.snapshotUniverseCardinality(), hit, expr.Not), true, nil
 
 	case qx.OpIN:
-		vals, isSlice, hasNil, err := db.exprValueToIdxOwned(expr)
+		vals, isSlice, hasNil, err := qv.exprValueToDistinctIdxOwned(expr)
 		if err != nil || !isSlice || (len(vals) == 0 && !hasNil) {
 			return 0, false, err
 		}
-		vals = dedupStringsInplace(vals)
 
 		var sum uint64
 		for _, key := range vals {
 			sum += ov.lookupCardinality(key)
 		}
 		if hasNil {
-			sum += db.nilFieldOverlay(expr.Field).lookupCardinality(nilIndexEntryKey)
+			sum += qv.nilFieldOverlay(expr.Field).lookupCardinality(nilIndexEntryKey)
 		}
 		if trace != nil {
 			trace.setPlan(PlanCountScalarLookup)
 			trace.addExamined(sum)
 		}
-		return countScalarLookupComplement(db.snapshotUniverseCardinality(), sum, expr.Not), true, nil
+		return countScalarLookupComplement(qv.snapshotUniverseCardinality(), sum, expr.Not), true, nil
 	}
 
 	return 0, false, nil
@@ -160,7 +159,7 @@ func countScalarLookupComplement(universe, hit uint64, invert bool) uint64 {
 
 type countLeadResidualExactFilter struct {
 	idx int
-	bm  *roaring64.Bitmap
+	ids posting.List
 }
 
 func shouldUseCountLeadResidualHasAnyExactFilter(p predicate) bool {
@@ -193,13 +192,11 @@ func countIndexSliceContains(active []int, idx int) bool {
 
 func releaseCountLeadResidualExactFilters(filters []countLeadResidualExactFilter) {
 	for _, f := range filters {
-		if f.bm != nil {
-			releaseRoaringBuf(f.bm)
-		}
+		f.ids.Release()
 	}
 }
 
-func (db *DB[K, V]) buildCountLeadResidualExactFilters(preds []predicate, active []int) []countLeadResidualExactFilter {
+func (qv *queryView[K, V]) buildCountLeadResidualExactFilters(preds []predicate, active []int) []countLeadResidualExactFilter {
 	candidates := make([]int, 0, len(active))
 	for _, pi := range active {
 		p := preds[pi]
@@ -207,10 +204,10 @@ func (db *DB[K, V]) buildCountLeadResidualExactFilters(preds []predicate, active
 			candidates = append(candidates, pi)
 		}
 	}
-	return db.buildCountLeadResidualExactFiltersByCandidates(preds, candidates)
+	return qv.buildCountLeadResidualExactFiltersByCandidates(preds, candidates)
 }
 
-func (db *DB[K, V]) buildCountLeadResidualExactFiltersByCandidates(preds []predicate, candidates []int) []countLeadResidualExactFilter {
+func (qv *queryView[K, V]) buildCountLeadResidualExactFiltersByCandidates(preds []predicate, candidates []int) []countLeadResidualExactFilter {
 	if len(candidates) == 0 {
 		return nil
 	}
@@ -224,19 +221,16 @@ func (db *DB[K, V]) buildCountLeadResidualExactFiltersByCandidates(preds []predi
 		if p.kind != predicateKindPostsAny || p.expr.Not || p.expr.Op != qx.OpHASANY || len(p.posts) == 0 {
 			continue
 		}
-		bm := db.materializeProbeUnion(p.posts)
-		if bm == nil || bm.IsEmpty() {
-			if bm != nil {
-				releaseRoaringBuf(bm)
-			}
+		ids := qv.materializeProbeUnion(p.posts)
+		if ids.IsEmpty() {
 			continue
 		}
-		filters = append(filters, countLeadResidualExactFilter{idx: pi, bm: bm})
+		filters = append(filters, countLeadResidualExactFilter{idx: pi, ids: ids})
 	}
 	return filters
 }
 
-func (db *DB[K, V]) collectCountLeadResidualExactCandidates(preds []predicate, active []int) []int {
+func (qv *queryView[K, V]) collectCountLeadResidualExactCandidates(preds []predicate, active []int) []int {
 	out := make([]int, 0, len(active))
 	for _, pi := range active {
 		p := preds[pi]
@@ -247,30 +241,30 @@ func (db *DB[K, V]) collectCountLeadResidualExactCandidates(preds []predicate, a
 	return out
 }
 
-func countApplyLeadResidualExactFilters(src, work *roaring64.Bitmap, filters []countLeadResidualExactFilter) (*roaring64.Bitmap, bool) {
-	if src == nil || src.IsEmpty() {
-		return nil, true
+func countApplyLeadResidualExactFilters(src posting.List, work *posting.List, filters []countLeadResidualExactFilter) (posting.List, bool) {
+	if src.IsEmpty() {
+		return posting.List{}, true
 	}
 	if len(filters) == 0 {
 		return src, true
 	}
 	if work == nil {
-		return nil, false
+		return posting.List{}, false
 	}
 
 	work.Clear()
-	work.Or(src)
+	*work = src.Clone()
 	for _, f := range filters {
-		if f.bm == nil {
+		if f.ids.IsEmpty() {
 			work.Clear()
 			break
 		}
-		work.And(f.bm)
+		work.AndInPlace(f.ids)
 		if work.IsEmpty() {
 			break
 		}
 	}
-	return work, true
+	return *work, true
 }
 
 func canUseScalarInSplitSupportLeaf(e qx.Expr, dbFields map[string]*field) bool {
@@ -291,12 +285,13 @@ func canUseScalarInSplitSupportLeaf(e qx.Expr, dbFields map[string]*field) bool 
 
 // tryCountByScalarInSplit accelerates flat AND counts with a positive scalar IN leaf:
 // it evaluates all non-IN leaves once and then sums per-value posting intersections.
-func (db *DB[K, V]) tryCountByScalarInSplit(expr qx.Expr, trace *queryTrace) (uint64, bool, error) {
+func (qv *queryView[K, V]) tryCountByScalarInSplit(expr qx.Expr, trace *queryTrace) (uint64, bool, error) {
 	if expr.Not || expr.Op != qx.OpAND || len(expr.Operands) < 2 {
 		return 0, false, nil
 	}
 
-	leaves, ok := collectAndLeaves(expr)
+	var leavesBuf [countPredicateScanMaxLeaves]qx.Expr
+	leaves, ok := collectAndLeavesScratch(expr, leavesBuf[:0])
 	if !ok || len(leaves) < 2 || len(leaves) > countPredicateScanMaxLeaves {
 		return 0, false, nil
 	}
@@ -311,11 +306,11 @@ func (db *DB[K, V]) tryCountByScalarInSplit(expr qx.Expr, trace *queryTrace) (ui
 		if e.Not || e.Op != qx.OpIN || e.Field == "" {
 			continue
 		}
-		fm := db.fields[e.Field]
+		fm := qv.fields[e.Field]
 		if fm == nil || fm.Slice {
 			continue
 		}
-		vals, isSlice, hasNil, err := db.exprValueToIdxOwned(qx.Expr{Op: qx.OpIN, Field: e.Field, Value: e.Value})
+		vals, isSlice, hasNil, err := qv.exprValueToDistinctIdxOwned(qx.Expr{Op: qx.OpIN, Field: e.Field, Value: e.Value})
 		totalVals := len(vals)
 		if hasNil {
 			totalVals++
@@ -323,7 +318,7 @@ func (db *DB[K, V]) tryCountByScalarInSplit(expr qx.Expr, trace *queryTrace) (ui
 		if err != nil || !isSlice || totalVals < 2 || totalVals > countScalarInSplitMaxValues {
 			continue
 		}
-		n := len(dedupStringsInplace(vals))
+		n := len(vals)
 		if hasNil {
 			n++
 		}
@@ -340,16 +335,15 @@ func (db *DB[K, V]) tryCountByScalarInSplit(expr qx.Expr, trace *queryTrace) (ui
 	}
 
 	inLeaf := leaves[lead]
-	ov := db.fieldOverlay(inLeaf.Field)
+	ov := qv.fieldOverlay(inLeaf.Field)
 	if !ov.hasData() {
 		return 0, false, nil
 	}
 
-	vals, isSlice, hasNil, err := db.exprValueToIdxOwned(qx.Expr{Op: qx.OpIN, Field: inLeaf.Field, Value: inLeaf.Value})
+	vals, isSlice, hasNil, err := qv.exprValueToDistinctIdxOwned(qx.Expr{Op: qx.OpIN, Field: inLeaf.Field, Value: inLeaf.Value})
 	if err != nil || !isSlice || (len(vals) == 0 && !hasNil) {
 		return 0, false, nil
 	}
-	vals = dedupStringsInplace(vals)
 	totalVals := len(vals)
 	if hasNil {
 		totalVals++
@@ -362,28 +356,17 @@ func (db *DB[K, V]) tryCountByScalarInSplit(expr qx.Expr, trace *queryTrace) (ui
 		if i == lead {
 			continue
 		}
-		if !canUseScalarInSplitSupportLeaf(leaves[i], db.fields) {
+		if !canUseScalarInSplitSupportLeaf(leaves[i], qv.fields) {
 			return 0, false, nil
 		}
 	}
 
 	var (
-		filter    bitmap
+		filter    postingResult
 		useFilter bool
 	)
 	if len(leaves) > 1 {
-		others := make([]qx.Expr, 0, len(leaves)-1)
-		for i := range leaves {
-			if i == lead {
-				continue
-			}
-			others = append(others, leaves[i])
-		}
-		if len(others) == 1 {
-			filter, err = db.evalExpr(others[0])
-		} else {
-			filter, err = db.evalExpr(qx.Expr{Op: qx.OpAND, Operands: others})
-		}
+		filter, err = qv.evalAndOperandsExcept(leaves, lead)
 		if err != nil {
 			return 0, true, err
 		}
@@ -393,54 +376,32 @@ func (db *DB[K, V]) tryCountByScalarInSplit(expr qx.Expr, trace *queryTrace) (ui
 		if filter.neg {
 			return 0, false, nil
 		}
-		if filter.bm == nil || filter.bm.IsEmpty() {
+		if filter.ids.IsEmpty() {
 			return 0, true, nil
 		}
 		useFilter = true
 	}
 
-	var keepOwned [countScalarInSplitMaxValues]*roaring64.Bitmap
-	ownedCount := 0
-	defer func() {
-		if ownedCount > 0 {
-			releaseOwnedBitmapSlice(keepOwned[:ownedCount])
-		}
-	}()
-
 	var cnt uint64
 	var examined uint64
 	for _, v := range vals {
-		ids, keep := ov.lookupPostingRetained(v)
+		ids := ov.lookupPostingRetained(v)
 		if ids.IsEmpty() {
 			continue
 		}
 		examined += ids.Cardinality()
-		if keep != nil {
-			if ownedCount >= len(keepOwned) {
-				return 0, false, nil
-			}
-			keepOwned[ownedCount] = keep
-			ownedCount++
-		}
 		if useFilter {
-			cnt += ids.AndCardinalityBitmap(filter.bm)
+			cnt += ids.AndCardinality(filter.ids)
 			continue
 		}
 		cnt += ids.Cardinality()
 	}
 	if hasNil {
-		ids, keep := db.nilFieldOverlay(inLeaf.Field).lookupPostingRetained(nilIndexEntryKey)
+		ids := qv.nilFieldOverlay(inLeaf.Field).lookupPostingRetained(nilIndexEntryKey)
 		if !ids.IsEmpty() {
 			examined += ids.Cardinality()
-			if keep != nil {
-				if ownedCount >= len(keepOwned) {
-					return 0, false, nil
-				}
-				keepOwned[ownedCount] = keep
-				ownedCount++
-			}
 			if useFilter {
-				cnt += ids.AndCardinalityBitmap(filter.bm)
+				cnt += ids.AndCardinality(filter.ids)
 			} else {
 				cnt += ids.Cardinality()
 			}
@@ -454,20 +415,20 @@ func (db *DB[K, V]) tryCountByScalarInSplit(expr qx.Expr, trace *queryTrace) (ui
 	return cnt, true, nil
 }
 
-func (db *DB[K, V]) isPositiveUniqueEqExpr(e qx.Expr) bool {
+func (qv *queryView[K, V]) isPositiveUniqueEqExpr(e qx.Expr) bool {
 	if e.Not || e.Op != qx.OpEQ || e.Field == "" {
 		return false
 	}
-	fm := db.fields[e.Field]
+	fm := qv.fields[e.Field]
 	return fm != nil && !fm.Slice && fm.Unique
 }
 
-func countLeavesForUniquePath(expr qx.Expr) ([]qx.Expr, bool) {
+func countLeavesForUniquePath(expr qx.Expr, dst []qx.Expr) ([]qx.Expr, bool) {
 	if expr.Not {
 		return nil, false
 	}
 	if expr.Op == qx.OpAND {
-		leaves, ok := collectAndLeaves(expr)
+		leaves, ok := collectAndLeavesScratch(expr, dst)
 		if !ok || len(leaves) == 0 {
 			return nil, false
 		}
@@ -476,10 +437,15 @@ func countLeavesForUniquePath(expr qx.Expr) ([]qx.Expr, bool) {
 	if expr.Op == qx.OpOR || expr.Op == qx.OpNOOP || len(expr.Operands) != 0 {
 		return nil, false
 	}
-	return []qx.Expr{expr}, true
+	if cap(dst) == 0 {
+		return []qx.Expr{expr}, true
+	}
+	dst = dst[:1]
+	dst[0] = expr
+	return dst, true
 }
 
-func (db *DB[K, V]) uniqueCountPathPrecheck(expr qx.Expr) (hasUnique bool, ok bool) {
+func (qv *queryView[K, V]) uniqueCountPathPrecheck(expr qx.Expr) (hasUnique bool, ok bool) {
 	if expr.Not {
 		return false, false
 	}
@@ -490,7 +456,7 @@ func (db *DB[K, V]) uniqueCountPathPrecheck(expr qx.Expr) (hasUnique bool, ok bo
 		}
 		var found bool
 		for i := range expr.Operands {
-			childHasUnique, childOK := db.uniqueCountPathPrecheck(expr.Operands[i])
+			childHasUnique, childOK := qv.uniqueCountPathPrecheck(expr.Operands[i])
 			if !childOK {
 				return false, false
 			}
@@ -504,25 +470,26 @@ func (db *DB[K, V]) uniqueCountPathPrecheck(expr qx.Expr) (hasUnique bool, ok bo
 	if expr.Op == qx.OpOR || expr.Op == qx.OpNOOP || len(expr.Operands) != 0 {
 		return false, false
 	}
-	return db.isPositiveUniqueEqExpr(expr), true
+	return qv.isPositiveUniqueEqExpr(expr), true
 }
 
 // tryCountByUniqueEq counts expressions anchored by a positive EQ predicate on
 // a unique scalar field, which bounds the candidate set to at most one row.
-func (db *DB[K, V]) tryCountByUniqueEq(expr qx.Expr, trace *queryTrace) (uint64, bool, error) {
-	hasUnique, ok := db.uniqueCountPathPrecheck(expr)
+func (qv *queryView[K, V]) tryCountByUniqueEq(expr qx.Expr, trace *queryTrace) (uint64, bool, error) {
+	hasUnique, ok := qv.uniqueCountPathPrecheck(expr)
 	if !ok || !hasUnique {
 		return 0, false, nil
 	}
 
-	leaves, ok := countLeavesForUniquePath(expr)
+	var leavesBuf [countPredicateScanMaxLeaves]qx.Expr
+	leaves, ok := countLeavesForUniquePath(expr, leavesBuf[:0])
 	if !ok {
 		return 0, false, nil
 	}
 
 	// Count paths defer broad numeric-range materialization until a lead is
 	// chosen; otherwise NoCaching runs can rebuild huge range bitmaps per query.
-	preds, ok := db.buildPredicatesWithMode(leaves, false)
+	preds, ok := qv.buildPredicatesWithMode(leaves, false)
 	if !ok {
 		return 0, false, nil
 	}
@@ -538,7 +505,7 @@ func (db *DB[K, V]) tryCountByUniqueEq(expr qx.Expr, trace *queryTrace) (uint64,
 		if p.alwaysTrue || p.covered || !p.hasIter() {
 			continue
 		}
-		if !db.isPositiveUniqueEqExpr(p.expr) {
+		if !qv.isPositiveUniqueEqExpr(p.expr) {
 			continue
 		}
 		if leadIdx == -1 || p.estCard < leadEst {
@@ -583,7 +550,7 @@ func (db *DB[K, V]) tryCountByUniqueEq(expr qx.Expr, trace *queryTrace) (uint64,
 	if it == nil {
 		return 0, false, nil
 	}
-	defer releaseRoaringIter(it)
+	defer it.Release()
 
 	var cnt uint64
 	var examined uint64
@@ -640,7 +607,7 @@ type countORBranch struct {
 	est       uint64
 }
 
-type countORBitmapBranch struct {
+type countORMaterializedBranch struct {
 	index int
 	expr  qx.Expr
 	est   uint64
@@ -648,10 +615,10 @@ type countORBitmapBranch struct {
 
 type countORBranches []countORBranch
 
-func countPredicateLeadPostings(p predicate) ([]postingList, bool) {
+func countPredicateLeadPostings(p predicate) ([]posting.List, bool) {
 	switch {
 	case p.iterKind == predicateIterPosting && !p.posting.IsEmpty():
-		return []postingList{p.posting}, true
+		return []posting.List{p.posting}, true
 	case p.kind == predicateKindPostsAny && p.iterKind == predicateIterPostsConcat && len(p.posts) >= 2:
 		return p.posts, true
 	default:
@@ -670,10 +637,10 @@ func releaseCountORBranches(branches countORBranches) {
 	}
 }
 
-func (br countORBranch) buildBitmapFilterChecks(dst []int) []int {
+func (br countORBranch) buildPostingFilterChecks(dst []int) []int {
 	dst = dst[:0]
 	for _, pi := range br.checks {
-		if br.preds[pi].supportsBitmapFilter() {
+		if br.preds[pi].supportsPostingFilter() {
 			dst = append(dst, pi)
 		}
 	}
@@ -761,11 +728,11 @@ func countORBranchEstimate(preds []predicate, active []int, leadEst uint64) uint
 	return est
 }
 
-func shouldTryCountORHybridBitmapSpill(totalBranches int, scanBranches int, spillBranches int, expectedProbes uint64, spillEst uint64, universe uint64) bool {
+func shouldTryCountORHybridMaterializedSpill(totalBranches int, scanBranches int, spillBranches int, expectedProbes uint64, spillEst uint64, universe uint64) bool {
 	if totalBranches < 4 || scanBranches == 0 || spillBranches == 0 {
 		return false
 	}
-	if spillBranches > countORHybridBitmapBranchMax {
+	if spillBranches > countORHybridMaterializedBranchMax {
 		return false
 	}
 	if universe == 0 {
@@ -901,22 +868,24 @@ func (branches countORBranches) shouldUseSeenDedup(universe uint64, expectedProb
 	return expectedProbes >= sumEst
 }
 
-func countORSeenAddBitmap(seen, bm *roaring64.Bitmap) uint64 {
-	if seen == nil || bm == nil || bm.IsEmpty() {
+func countORSeenAddPosting(seen *posting.List, ids posting.List) uint64 {
+	if seen == nil || ids.IsEmpty() {
 		return 0
 	}
-	before := seen.GetCardinality()
-	seen.Or(bm)
-	after := seen.GetCardinality()
-	if after <= before {
-		return 0
+	var added uint64
+	it := ids.Iter()
+	defer it.Release()
+	for it.HasNext() {
+		if seen.CheckedAdd(it.Next()) {
+			added++
+		}
 	}
-	return after - before
+	return added
 }
 
-func (db *DB[K, V]) countORBitmapSpillUnion(
-	branches []countORBitmapBranch,
-	seen *roaring64.Bitmap,
+func (qv *queryView[K, V]) countORMaterializedSpillUnion(
+	branches []countORMaterializedBranch,
+	seen *posting.List,
 	trace *queryTrace,
 	branchTrace []TraceORBranch,
 ) (uint64, uint64, bool, error) {
@@ -932,44 +901,44 @@ func (db *DB[K, V]) countORBitmapSpillUnion(
 	for _, br := range branches {
 		if branchTrace != nil {
 			branchTrace[br.index].Skipped = true
-			branchTrace[br.index].SkipReason = "bitmap_spill"
+			branchTrace[br.index].SkipReason = "materialized_spill"
 		}
 
-		bmRes, err := db.evalExpr(br.expr)
+		res, err := qv.evalExpr(br.expr)
 		if err != nil {
 			return 0, 0, true, err
 		}
-		if bmRes.neg {
-			bmRes.release()
+		if res.neg {
+			res.release()
 			return 0, 0, false, nil
 		}
 		if trace != nil {
-			trace.addBitmapMaterialized(1)
+			trace.addPostingMaterialization(1)
 		}
-		if bmRes.bm == nil || bmRes.bm.IsEmpty() {
-			bmRes.release()
+		if res.ids.IsEmpty() {
+			res.release()
 			continue
 		}
 
-		card := bmRes.bm.GetCardinality()
+		card := res.ids.Cardinality()
 		examined += card
-		added := countORSeenAddBitmap(seen, bmRes.bm)
+		added := countORSeenAddPosting(seen, res.ids)
 		cnt += added
 		if branchTrace != nil {
 			branchTrace[br.index].RowsExamined += card
 			branchTrace[br.index].RowsEmitted += added
 		}
-		bmRes.release()
+		res.release()
 	}
 
 	return cnt, examined, true, nil
 }
 
-func (db *DB[K, V]) tryCountORBranchLeadPostings(
+func (qv *queryView[K, V]) tryCountORBranchLeadPostings(
 	branches countORBranches,
 	branchIdx int,
 	useSeenDedup bool,
-	seen *roaring64.Bitmap,
+	seen *posting.List,
 	trace *TraceORBranch,
 ) (uint64, uint64, bool) {
 	if branchIdx < 0 || branchIdx >= len(branches) {
@@ -987,7 +956,7 @@ func (db *DB[K, V]) tryCountORBranchLeadPostings(
 	}
 
 	exactChecksBuf := getIntSliceBuf(len(br.checks))
-	exactChecks := br.buildBitmapFilterChecks(exactChecksBuf.values)
+	exactChecks := br.buildPostingFilterChecks(exactChecksBuf.values)
 	defer func() {
 		exactChecksBuf.values = exactChecks
 		releaseIntSliceBuf(exactChecksBuf)
@@ -995,7 +964,7 @@ func (db *DB[K, V]) tryCountORBranchLeadPostings(
 
 	extraExactCandidatesBuf := getIntSliceBuf(len(br.checks))
 	extraExactCandidates := extraExactCandidatesBuf.values[:0]
-	extraExactCandidates = append(extraExactCandidates, db.collectCountLeadResidualExactCandidates(br.preds, br.checks)...)
+	extraExactCandidates = append(extraExactCandidates, qv.collectCountLeadResidualExactCandidates(br.preds, br.checks)...)
 	defer func() {
 		extraExactCandidatesBuf.values = extraExactCandidates
 		releaseIntSliceBuf(extraExactCandidatesBuf)
@@ -1029,33 +998,21 @@ func (db *DB[K, V]) tryCountORBranchLeadPostings(
 	}()
 	extraExactBuilt := len(extraExactCandidates) == 0
 
-	var scratch *roaring64.Bitmap
-	if len(exactChecks) > 0 || len(extraExactCandidates) > 0 {
-		scratch = getRoaringBuf()
-		defer releaseRoaringBuf(scratch)
-	}
-	var bucketWork *roaring64.Bitmap
-	if len(exactChecks) > 0 {
-		bucketWork = getRoaringBuf()
-		defer releaseRoaringBuf(bucketWork)
-	}
-	var extraWork *roaring64.Bitmap
-	defer func() {
-		if extraWork != nil {
-			releaseRoaringBuf(extraWork)
-		}
-	}()
+	var bucketWork posting.List
+	defer bucketWork.Release()
+	var extraWork posting.List
+	defer extraWork.Release()
 
 	ensureExtraExact := func() {
 		if extraExactBuilt {
 			return
 		}
 		extraExactBuilt = true
-		extraExact = db.buildCountLeadResidualExactFiltersByCandidates(br.preds, extraExactCandidates)
+		extraExact = qv.buildCountLeadResidualExactFiltersByCandidates(br.preds, extraExactCandidates)
 		if len(extraExact) == 0 {
 			return
 		}
-		extraWork = getRoaringBuf()
+		extraWork.Release()
 		residualAfterBoth = residualAfterBoth[:0]
 		for _, pi := range residualAfterExact {
 			if countLeadResidualExactFiltersContain(extraExact, pi) {
@@ -1076,35 +1033,17 @@ func (db *DB[K, V]) tryCountORBranchLeadPostings(
 			trace.RowsEmitted += n
 		}
 	}
-	acceptBitmapNoChecks := func(bm *roaring64.Bitmap) {
-		if bm == nil || bm.IsEmpty() {
+	var acceptIdx func(uint64, []int)
+	acceptPostingNoChecks := func(ids posting.List) {
+		if ids.IsEmpty() {
 			return
 		}
-		if useSeenDedup {
-			addAccepted(countORSeenAddBitmap(seen, bm))
-			return
-		}
-		if branchIdx == 0 {
-			addAccepted(bm.GetCardinality())
-			return
-		}
-		it := bm.Iterator()
-		defer releaseRoaringBitmapIterator(it)
-		for it.HasNext() {
-			idx := it.Next()
-			dup := false
-			for j := 0; j < branchIdx; j++ {
-				if branches[j].matches(idx) {
-					dup = true
-					break
-				}
-			}
-			if !dup {
-				addAccepted(1)
-			}
-		}
+		ids.ForEach(func(idx uint64) bool {
+			acceptIdx(idx, nil)
+			return true
+		})
 	}
-	acceptIdx := func(idx uint64, checks []int) {
+	acceptIdx = func(idx uint64, checks []int) {
 		if useSeenDedup && seen != nil && seen.Contains(idx) {
 			return
 		}
@@ -1135,12 +1074,8 @@ func (db *DB[K, V]) tryCountORBranchLeadPostings(
 			trace.RowsExamined += card
 		}
 		if len(br.checks) == 0 {
-			if ids.isSingleton() {
-				acceptIdx(ids.single, nil)
-				continue
-			}
-			if bm := ids.bitmap(); bm != nil {
-				acceptBitmapNoChecks(bm)
+			if idx, ok := ids.TrySingle(); ok {
+				acceptIdx(idx, nil)
 				continue
 			}
 			ids.ForEach(func(idx uint64) bool {
@@ -1150,8 +1085,8 @@ func (db *DB[K, V]) tryCountORBranchLeadPostings(
 			continue
 		}
 
-		if ids.isSingleton() {
-			acceptIdx(ids.single, br.checks)
+		if idx, ok := ids.TrySingle(); ok {
+			acceptIdx(idx, br.checks)
 			continue
 		}
 
@@ -1163,35 +1098,21 @@ func (db *DB[K, V]) tryCountORBranchLeadPostings(
 			continue
 		}
 
-		bm, owned := ids.ToBitmapOwned(scratch)
-		if bm == nil || bm.IsEmpty() {
-			if owned && bm != nil && bm != scratch {
-				releaseRoaringBuf(bm)
-			}
-			continue
-		}
-
-		current := bm
+		current := ids
 		exactApplied := false
 		if len(exactChecks) > 0 {
-			mode, exactBM, _ := plannerFilterBitmapByChecks(br.preds, exactChecks, bm, bucketWork, true)
+			mode, exactIDs, _ := plannerFilterPostingByChecks(br.preds, exactChecks, ids, &bucketWork, true)
 			switch mode {
 			case plannerPredicateBucketEmpty:
-				if owned && bm != scratch {
-					releaseRoaringBuf(bm)
-				}
 				continue
 			case plannerPredicateBucketAll:
-				current = exactBM
+				current = exactIDs
 				exactApplied = true
 			case plannerPredicateBucketExact:
-				if exactBM == nil || exactBM.IsEmpty() {
-					if owned && bm != scratch {
-						releaseRoaringBuf(bm)
-					}
+				if exactIDs.IsEmpty() {
 					continue
 				}
-				current = exactBM
+				current = exactIDs
 				exactApplied = true
 			}
 		}
@@ -1201,12 +1122,9 @@ func (db *DB[K, V]) tryCountORBranchLeadPostings(
 			ensureExtraExact()
 		}
 		if len(extraExact) > 0 {
-			filtered, ok := countApplyLeadResidualExactFilters(current, extraWork, extraExact)
+			filtered, ok := countApplyLeadResidualExactFilters(current, &extraWork, extraExact)
 			if ok {
-				if filtered == nil || filtered.IsEmpty() {
-					if owned && bm != scratch {
-						releaseRoaringBuf(bm)
-					}
+				if filtered.IsEmpty() {
 					continue
 				}
 				current = filtered
@@ -1221,21 +1139,15 @@ func (db *DB[K, V]) tryCountORBranchLeadPostings(
 			checks = residualAfterExact
 		}
 		if len(checks) == 0 {
-			acceptBitmapNoChecks(current)
-			if owned && bm != scratch {
-				releaseRoaringBuf(bm)
-			}
+			acceptPostingNoChecks(current)
 			continue
 		}
 
-		it := current.Iterator()
+		it := current.Iter()
 		for it.HasNext() {
 			acceptIdx(it.Next(), checks)
 		}
-		releaseRoaringBitmapIterator(it)
-		if owned && bm != scratch {
-			releaseRoaringBuf(bm)
-		}
+		it.Release()
 	}
 
 	return cnt, examined, true
@@ -1456,7 +1368,7 @@ func countBroadRangeComplementMaxCardinality(leadProbeEst, universe uint64) uint
 	}
 	// Only widen beyond the legacy cap when the chosen lead is already narrow
 	// relative to the full result universe; otherwise complement setup cost can
-	// dominate and broad AND-counts regress toward bitmap-first behavior.
+	// dominate and broad AND-counts regress toward postingResult-first behavior.
 	if leadProbeEst > universe/4 {
 		return limit
 	}
@@ -1485,10 +1397,6 @@ func shouldUseFastCountBroadRangeComplementMaterializationForShape(probeLen int,
 	return avgPerBucket <= countPredBroadRangeComplementFastAvgPerBucketMax
 }
 
-func shouldUseFastCountBroadRangeComplementMaterialization(probe []postingList, est uint64) bool {
-	return shouldUseFastCountBroadRangeComplementMaterializationForShape(len(probe), est)
-}
-
 func countBaseIndexRangeCardinality(s []index, start, end int) uint64 {
 	if start >= end {
 		return 0
@@ -1508,41 +1416,7 @@ func countBaseIndexRangeCardinality(s []index, start, end int) uint64 {
 	return total
 }
 
-func (db *DB[K, V]) countBaseIndexRangeCardinalityExact(field string, fm *field, slice *[]index, start, end int) uint64 {
-	if exact, ok := db.tryCountSnapshotNumericRange(field, fm, slice, start, end); ok {
-		return exact
-	}
-	return countBaseIndexRangeCardinality(*slice, start, end)
-}
-
-func tryPrepareCountBroadRangeComplementPostingPredicate(p *predicate, complement []postingList) bool {
-	if p == nil || len(complement) == 0 || len(complement) > countPredBroadRangeComplementPostingMaxBuckets {
-		return false
-	}
-
-	p.iterKind = predicateIterNone
-	p.bm = nil
-	p.contains = nil
-	p.iter = nil
-	p.bucketCount = nil
-	p.estCard = 0
-	p.alwaysTrue = false
-	p.alwaysFalse = false
-
-	if len(complement) == 1 {
-		p.kind = predicateKindPostingNot
-		p.posting = complement[0]
-		p.posts = nil
-		return true
-	}
-
-	p.kind = predicateKindPostsAnyNot
-	p.posting = postingList{}
-	p.posts = append([]postingList(nil), complement...)
-	return true
-}
-
-func (db *DB[K, V]) tryMaterializeBroadRangeComplementPredicateForCount(p *predicate, leadProbeEst uint64, universe uint64, trace *queryTrace) bool {
+func (qv *queryView[K, V]) tryMaterializeBroadRangeComplementPredicateForCount(p *predicate, leadProbeEst uint64, universe uint64, trace *queryTrace) bool {
 	if p == nil {
 		return false
 	}
@@ -1551,34 +1425,33 @@ func (db *DB[K, V]) tryMaterializeBroadRangeComplementPredicateForCount(p *predi
 	if !coarseEligible && !exactEligible {
 		return false
 	}
-	snap := db.getSnapshot()
-	if snap == nil {
-		return false
-	}
 
-	fm := db.fields[p.expr.Field]
+	fm := qv.fields[p.expr.Field]
 	if fm == nil || fm.Slice {
 		return false
 	}
 	if !coarseEligible && !isNumericScalarKind(fm.Kind) {
 		return false
 	}
-	key, isSlice, isNil, err := db.exprValueToIdxScalar(qx.Expr{Op: p.expr.Op, Field: p.expr.Field, Value: p.expr.Value})
-	if err != nil || isSlice || isNil {
+	bound, isSlice, err := qv.exprValueToNormalizedScalarBound(qx.Expr{Op: p.expr.Op, Field: p.expr.Field, Value: p.expr.Value})
+	if err != nil || isSlice || bound.empty {
 		return false
 	}
-	cacheKey := db.materializedPredComplementCacheKeyForScalar(p.expr.Field, p.expr.Op, key)
+	cacheKey := ""
+	if !bound.full {
+		cacheKey = qv.materializedPredComplementCacheKeyForScalar(p.expr.Field, bound.op, bound.key)
+	}
 	if cacheKey != "" {
-		if cached, ok := snap.loadMaterializedPred(cacheKey); ok {
-			if cached == nil || cached.IsEmpty() {
+		if cached, ok := qv.snap.loadMaterializedPred(cacheKey); ok {
+			if cached.IsEmpty() {
 				if trace != nil {
 					trace.addCountRangeComplementCacheHit(1)
 				}
 				p.kind = predicateKindCustom
 				p.iterKind = predicateIterNone
-				p.posting = postingList{}
+				p.posting = posting.List{}
 				p.posts = nil
-				p.bm = nil
+				p.ids = posting.List{}
 				p.contains = nil
 				p.iter = nil
 				p.bucketCount = nil
@@ -1591,11 +1464,11 @@ func (db *DB[K, V]) tryMaterializeBroadRangeComplementPredicateForCount(p *predi
 			if trace != nil {
 				trace.addCountRangeComplementCacheHit(1)
 			}
-			p.kind = predicateKindBitmapNot
+			p.kind = predicateKindMaterializedNot
 			p.iterKind = predicateIterNone
-			p.posting = postingList{}
+			p.posting = posting.List{}
 			p.posts = nil
-			p.bm = cached
+			p.ids = cached
 			p.contains = nil
 			p.iter = nil
 			p.bucketCount = nil
@@ -1606,272 +1479,74 @@ func (db *DB[K, V]) tryMaterializeBroadRangeComplementPredicateForCount(p *predi
 		}
 	}
 
-	ov := db.fieldOverlay(p.expr.Field)
+	ov := qv.fieldOverlay(p.expr.Field)
 	if !ov.hasData() {
 		return false
 	}
-	if ov.delta != nil {
-		rb, ok := rangeBoundsForOp(p.expr.Op, key)
-		if !ok {
-			return false
-		}
-		br := ov.rangeForBounds(rb)
+	rb := rangeBounds{has: true}
+	applyNormalizedScalarBound(&rb, bound)
+	br := ov.rangeForBounds(rb)
+	before, after := overlayComplementRangeSpans(ov, br)
+	nilPosting := qv.nilFieldOverlay(p.expr.Field).lookupPostingRetained(nilIndexEntryKey)
 
-		totalDelta := 0
-		if ov.delta != nil {
-			totalDelta = ov.delta.keyCount()
+	complementEst := uint64(0)
+	addRangeStats := func(span overlayRange) {
+		if overlayRangeEmpty(span) {
+			return
 		}
-		before := overlayRange{
-			baseStart:  0,
-			baseEnd:    br.baseStart,
-			deltaStart: 0,
-			deltaEnd:   br.deltaStart,
-		}
-		after := overlayRange{
-			baseStart:  br.baseEnd,
-			baseEnd:    len(ov.base),
-			deltaStart: br.deltaEnd,
-			deltaEnd:   totalDelta,
-		}
-
-		complementEst := uint64(0)
-		addRangeStats := func(span overlayRange) {
-			if overlayRangeEmpty(span) {
-				return
-			}
-			_, est := overlayRangeStats(ov, span)
-			complementEst = satAddUint64(complementEst, est)
-		}
-		addRangeStats(before)
-		addRangeStats(after)
-		if complementEst == 0 {
-			if cacheKey != "" {
-				snap.storeMaterializedPred(cacheKey, nil)
-			}
-			p.kind = predicateKindCustom
-			p.iterKind = predicateIterNone
-			p.posting = postingList{}
-			p.posts = nil
-			p.bm = nil
-			p.contains = nil
-			p.iter = nil
-			p.bucketCount = nil
-			p.estCard = 0
-			p.alwaysTrue = true
-			p.alwaysFalse = false
-			return true
-		}
-		if complementEst > countBroadRangeComplementMaxCardinality(leadProbeEst, universe) {
-			return false
-		}
-
-		bm := getRoaringBuf()
-		appendComplement := func(span overlayRange) {
-			if overlayRangeEmpty(span) {
-				return
-			}
-			if out, ok := db.tryEvalNumericRangeBuckets(p.expr.Field, fm, ov, span); ok {
-				if out.bm != nil && !out.bm.IsEmpty() {
-					bm.Or(out.bm)
-				}
-				if out.bm != nil && !out.readonly {
-					releaseRoaringBuf(out.bm)
-				}
-				return
-			}
-			part := overlayUnionRange(ov, span)
-			if part == nil {
-				return
-			}
-			if !part.IsEmpty() {
-				bm.Or(part)
-			}
-			releaseRoaringBuf(part)
-		}
-		appendComplement(before)
-		appendComplement(after)
-		if bm.IsEmpty() {
-			releaseRoaringBuf(bm)
-			if cacheKey != "" {
-				snap.storeMaterializedPred(cacheKey, nil)
-			}
-			p.kind = predicateKindCustom
-			p.iterKind = predicateIterNone
-			p.posting = postingList{}
-			p.posts = nil
-			p.bm = nil
-			p.contains = nil
-			p.iter = nil
-			p.bucketCount = nil
-			p.estCard = 0
-			p.alwaysTrue = true
-			p.alwaysFalse = false
-			return true
-		}
-		if trace != nil {
-			trace.addCountRangeComplementBuild(bm.GetCardinality(), false)
-		}
-
-		readonly := false
-		if cacheKey != "" && db.tryShareMaterializedPred(cacheKey, bm) {
-			readonly = true
-		}
-		p.cleanup = chainPredicateCleanup(p.cleanup, func() {
-			if !readonly {
-				releaseRoaringBuf(bm)
-			}
-		})
-		p.kind = predicateKindBitmapNot
-		p.iterKind = predicateIterNone
-		p.posting = postingList{}
-		p.posts = nil
-		p.bm = bm
-		p.contains = nil
-		p.iter = nil
-		p.bucketCount = nil
-		p.estCard = 0
-		p.alwaysTrue = false
-		p.alwaysFalse = false
-		return true
+		_, est := overlayRangeStats(ov, span)
+		complementEst = satAddUint64(complementEst, est)
 	}
-
-	if snap.fieldDelta(p.expr.Field) != nil {
-		return false
-	}
-	slice := snap.fieldIndexSlice(p.expr.Field)
-	if slice == nil || len(*slice) == 0 {
-		return false
-	}
-	s := *slice
-	start, end, ok := resolveRange(s, p.expr.Op, key)
-	if !ok {
-		return false
-	}
-	inBuckets := end - start
-	outBuckets := len(s) - inBuckets
-	if inBuckets <= 0 || outBuckets <= 0 || outBuckets >= inBuckets {
-		return false
-	}
-	if start == 0 || end == len(s) {
-		complementStart := 0
-		complementEnd := start
-		if start == 0 {
-			complementStart = end
-			complementEnd = len(s)
-		}
-		complementEst := db.countBaseIndexRangeCardinalityExact(p.expr.Field, fm, slice, complementStart, complementEnd)
-		if complementEst == 0 || complementEst > countBroadRangeComplementMaxCardinality(leadProbeEst, universe) {
-			return false
-		}
-		if complementBuckets := complementEnd - complementStart; complementBuckets > 0 && complementBuckets <= countPredBroadRangeComplementPostingMaxBuckets {
-			complement := make([]postingList, 0, complementBuckets)
-			for i := complementStart; i < complementEnd; i++ {
-				if ids := s[i].IDs; !ids.IsEmpty() {
-					complement = append(complement, ids)
-				}
-			}
-			if tryPrepareCountBroadRangeComplementPostingPredicate(p, complement) {
-				return true
-			}
-		}
-
-		bm := getRoaringBuf()
-		orBaseIndexRange(bm, s, complementStart, complementEnd)
-		if bm.IsEmpty() {
-			releaseRoaringBuf(bm)
-			if cacheKey != "" {
-				snap.storeMaterializedPred(cacheKey, nil)
-			}
-			p.kind = predicateKindCustom
-			p.iterKind = predicateIterNone
-			p.posting = postingList{}
-			p.posts = nil
-			p.bm = nil
-			p.contains = nil
-			p.iter = nil
-			p.bucketCount = nil
-			p.estCard = 0
-			p.alwaysTrue = true
-			p.alwaysFalse = false
-			return true
-		}
-		if trace != nil {
-			trace.addCountRangeComplementBuild(bm.GetCardinality(), false)
-		}
-
-		readonly := false
-		if cacheKey != "" && db.tryShareMaterializedPred(cacheKey, bm) {
-			readonly = true
-		}
-		p.cleanup = chainPredicateCleanup(p.cleanup, func() {
-			if !readonly {
-				releaseRoaringBuf(bm)
-			}
-		})
-		p.kind = predicateKindBitmapNot
-		p.iterKind = predicateIterNone
-		p.posting = postingList{}
-		p.posts = nil
-		p.bm = bm
-		p.contains = nil
-		p.iter = nil
-		p.bucketCount = nil
-		p.estCard = 0
-		p.alwaysTrue = false
-		p.alwaysFalse = false
-		return true
-	}
-
-	var (
-		complementProbe baseRangeProbe
-		complementEst   uint64
-	)
-	if left, ok := db.tryCountSnapshotNumericRange(p.expr.Field, fm, slice, 0, start); ok {
-		right, ok := db.tryCountSnapshotNumericRange(p.expr.Field, fm, slice, end, len(s))
-		if !ok {
-			return false
-		}
-		complementEst = satAddUint64(left, right)
-	} else {
-		complementProbe = newBaseRangeProbe(s, start, end, true)
-		complementEst = complementProbe.probeEst
-	}
-	if complementEst == 0 || complementEst > countBroadRangeComplementMaxCardinality(leadProbeEst, universe) {
-		return false
-	}
-	if complementProbe.probeLen == 0 {
-		complementProbe = newBaseRangeProbe(s, start, end, true)
-	}
-	if complementProbe.probeLen > 0 && complementProbe.probeLen <= countPredBroadRangeComplementPostingMaxBuckets {
-		complement := make([]postingList, 0, complementProbe.probeLen)
-		complementProbe.forEachPosting(func(ids postingList) bool {
-			complement = append(complement, ids)
-			return true
-		})
-		if tryPrepareCountBroadRangeComplementPostingPredicate(p, complement) {
-			return true
-		}
-	}
-
-	var bm *roaring64.Bitmap
-	fastBuild := cacheKey != "" && shouldUseFastCountBroadRangeComplementMaterializationForShape(complementProbe.probeLen, complementEst)
-	if fastBuild {
-		bm = materializeBaseRangeProbeFast(complementProbe)
-	} else {
-		bm = db.materializeBaseRangeProbeUnion(complementProbe)
-	}
-	if bm == nil || bm.IsEmpty() {
-		if bm != nil {
-			releaseRoaringBuf(bm)
-		}
+	addRangeStats(before)
+	addRangeStats(after)
+	complementEst = satAddUint64(complementEst, nilPosting.Cardinality())
+	if complementEst == 0 {
 		if cacheKey != "" {
-			snap.storeMaterializedPred(cacheKey, nil)
+			qv.snap.storeMaterializedPred(cacheKey, posting.List{})
 		}
 		p.kind = predicateKindCustom
 		p.iterKind = predicateIterNone
-		p.posting = postingList{}
+		p.posting = posting.List{}
 		p.posts = nil
-		p.bm = nil
+		p.ids = posting.List{}
+		p.contains = nil
+		p.iter = nil
+		p.bucketCount = nil
+		p.estCard = 0
+		p.alwaysTrue = true
+		p.alwaysFalse = false
+		return true
+	}
+	if complementEst > countBroadRangeComplementMaxCardinality(leadProbeEst, universe) {
+		return false
+	}
+
+	var ids posting.List
+	appendComplement := func(span overlayRange) {
+		if overlayRangeEmpty(span) {
+			return
+		}
+		if out, ok := qv.tryEvalNumericRangeBuckets(p.expr.Field, fm, ov, span); ok {
+			out.ids.OrInto(&ids)
+			out.ids.Release()
+			return
+		}
+		part := overlayUnionRange(ov, span)
+		part.OrInto(&ids)
+		part.Release()
+	}
+	appendComplement(before)
+	appendComplement(after)
+	nilPosting.OrInto(&ids)
+	if ids.IsEmpty() {
+		if cacheKey != "" {
+			qv.snap.storeMaterializedPred(cacheKey, posting.List{})
+		}
+		p.kind = predicateKindCustom
+		p.iterKind = predicateIterNone
+		p.posting = posting.List{}
+		p.posts = nil
+		p.ids = posting.List{}
 		p.contains = nil
 		p.iter = nil
 		p.bucketCount = nil
@@ -1881,23 +1556,20 @@ func (db *DB[K, V]) tryMaterializeBroadRangeComplementPredicateForCount(p *predi
 		return true
 	}
 	if trace != nil {
-		trace.addCountRangeComplementBuild(bm.GetCardinality(), fastBuild)
+		trace.addCountRangeComplementBuild(ids.Cardinality(), false)
 	}
 
-	readonly := false
-	if cacheKey != "" && db.tryShareMaterializedPred(cacheKey, bm) {
-		readonly = true
+	if cacheKey != "" {
+		qv.tryShareMaterializedPred(cacheKey, &ids)
 	}
 	p.cleanup = chainPredicateCleanup(p.cleanup, func() {
-		if !readonly {
-			releaseRoaringBuf(bm)
-		}
+		ids.Release()
 	})
-	p.kind = predicateKindBitmapNot
+	p.kind = predicateKindMaterializedNot
 	p.iterKind = predicateIterNone
-	p.posting = postingList{}
+	p.posting = posting.List{}
 	p.posts = nil
-	p.bm = bm
+	p.ids = ids
 	p.contains = nil
 	p.iter = nil
 	p.bucketCount = nil
@@ -1907,9 +1579,9 @@ func (db *DB[K, V]) tryMaterializeBroadRangeComplementPredicateForCount(p *predi
 	return true
 }
 
-func (db *DB[K, V]) materializePostingIntersection(posts []postingList) *roaring64.Bitmap {
+func (qv *queryView[K, V]) materializePostingIntersection(posts []posting.List) posting.List {
 	if len(posts) == 0 {
-		return getRoaringBuf()
+		return posting.List{}
 	}
 
 	seed := -1
@@ -1918,7 +1590,7 @@ func (db *DB[K, V]) materializePostingIntersection(posts []postingList) *roaring
 		p := posts[i]
 		c := p.Cardinality()
 		if c == 0 {
-			return getRoaringBuf()
+			return posting.List{}
 		}
 		if seed == -1 || c < seedCard {
 			seed = i
@@ -1926,61 +1598,41 @@ func (db *DB[K, V]) materializePostingIntersection(posts []postingList) *roaring
 		}
 	}
 
-	out := getRoaringBuf()
-	posts[seed].OrInto(out)
+	out := posts[seed].Clone()
 	for i := range posts {
 		if i == seed || out.IsEmpty() {
 			continue
 		}
-		p := posts[i]
-		if p.isSingleton() {
-			if !out.Contains(p.single) {
-				out.Clear()
-				break
-			}
-			if out.GetCardinality() != 1 {
-				out.Clear()
-				out.Add(p.single)
-			}
-			continue
-		}
-		if bm := p.bitmap(); bm != nil {
-			out.And(bm)
-			continue
-		}
-		out.Clear()
-		break
+		out.AndInPlace(posts[i])
 	}
+	out.Optimize()
 	return out
 }
 
-func (db *DB[K, V]) materializeSetPredicateForCount(p *predicate) bool {
+func (qv *queryView[K, V]) materializeSetPredicateForCount(p *predicate) bool {
 	if p == nil {
 		return false
 	}
 
 	origKind := p.kind
-	var bm *roaring64.Bitmap
+	var ids posting.List
 
 	switch origKind {
 	case predicateKindPostsAny, predicateKindPostsAnyNot:
-		bm = db.materializeProbeUnion(p.posts)
+		ids = qv.materializeProbeUnion(p.posts)
 	case predicateKindPostsAll, predicateKindPostsAllNot:
-		bm = db.materializePostingIntersection(p.posts)
+		ids = qv.materializePostingIntersection(p.posts)
 	default:
 		return false
 	}
 
 	isNot := origKind == predicateKindPostsAnyNot || origKind == predicateKindPostsAllNot
-	if bm == nil || bm.IsEmpty() {
-		if bm != nil {
-			releaseRoaringBuf(bm)
-		}
+	if ids.IsEmpty() {
 		p.kind = predicateKindCustom
 		p.iterKind = predicateIterNone
-		p.posting = postingList{}
+		p.posting = posting.List{}
 		p.posts = nil
-		p.bm = nil
+		p.ids = posting.List{}
 		p.contains = nil
 		p.iter = nil
 		p.bucketCount = nil
@@ -1991,48 +1643,48 @@ func (db *DB[K, V]) materializeSetPredicateForCount(p *predicate) bool {
 	}
 
 	p.cleanup = chainPredicateCleanup(p.cleanup, func() {
-		releaseRoaringBuf(bm)
+		ids.Release()
 	})
-	p.posting = postingList{}
+	p.posting = posting.List{}
 	p.posts = nil
-	p.bm = bm
+	p.ids = ids
 	p.contains = nil
 	p.iter = nil
 	p.bucketCount = nil
-	p.estCard = bm.GetCardinality()
+	p.estCard = ids.Cardinality()
 	p.alwaysTrue = false
 	p.alwaysFalse = false
 
 	switch origKind {
 	case predicateKindPostsAny, predicateKindPostsAll:
-		p.kind = predicateKindBitmap
-		p.iterKind = predicateIterBitmap
+		p.kind = predicateKindMaterialized
+		p.iterKind = predicateIterMaterialized
 	case predicateKindPostsAnyNot, predicateKindPostsAllNot:
-		p.kind = predicateKindBitmapNot
+		p.kind = predicateKindMaterializedNot
 		p.iterKind = predicateIterNone
 	}
 	return true
 }
 
-func (db *DB[K, V]) materializeCustomPredicateForCount(p *predicate) error {
+func (qv *queryView[K, V]) materializeCustomPredicateForCount(p *predicate) error {
 	if p == nil {
 		return nil
 	}
 
 	raw := p.expr
 	raw.Not = false
-	b, err := db.evalSimple(raw)
+	b, err := qv.evalSimple(raw)
 	if err != nil {
 		return err
 	}
 
-	if b.bm == nil || b.bm.IsEmpty() {
+	if b.ids.IsEmpty() {
 		b.release()
 		p.kind = predicateKindCustom
 		p.iterKind = predicateIterNone
-		p.posting = postingList{}
+		p.posting = posting.List{}
 		p.posts = nil
-		p.bm = nil
+		p.ids = posting.List{}
 		p.contains = nil
 		p.iter = nil
 		p.bucketCount = nil
@@ -2042,39 +1694,37 @@ func (db *DB[K, V]) materializeCustomPredicateForCount(p *predicate) error {
 		return nil
 	}
 
-	bm := b.bm
-	if !b.readonly {
-		p.cleanup = chainPredicateCleanup(p.cleanup, func() {
-			releaseRoaringBuf(bm)
-		})
-	}
+	ids := b.ids
+	p.cleanup = chainPredicateCleanup(p.cleanup, func() {
+		ids.Release()
+	})
 
-	p.posting = postingList{}
+	p.posting = posting.List{}
 	p.posts = nil
 	p.contains = nil
 	p.iter = nil
 	p.bucketCount = nil
-	p.bm = bm
+	p.ids = ids
 	p.alwaysTrue = false
 	p.alwaysFalse = false
 
 	if p.expr.Not {
-		p.kind = predicateKindBitmapNot
+		p.kind = predicateKindMaterializedNot
 		p.iterKind = predicateIterNone
 		p.estCard = 0
 	} else {
-		p.kind = predicateKindBitmap
-		p.iterKind = predicateIterBitmap
-		p.estCard = bm.GetCardinality()
+		p.kind = predicateKindMaterialized
+		p.iterKind = predicateIterMaterialized
+		p.estCard = ids.Cardinality()
 	}
 	return nil
 }
 
-func (db *DB[K, V]) prepareCountPredicate(p *predicate, probeEst uint64, universe uint64) error {
-	return db.prepareCountPredicateWithTrace(p, probeEst, universe, nil)
+func (qv *queryView[K, V]) prepareCountPredicate(p *predicate, probeEst uint64, universe uint64) error {
+	return qv.prepareCountPredicateWithTrace(p, probeEst, universe, nil)
 }
 
-func (db *DB[K, V]) prepareCountPredicateWithTrace(p *predicate, probeEst uint64, universe uint64, trace *queryTrace) error {
+func (qv *queryView[K, V]) prepareCountPredicateWithTrace(p *predicate, probeEst uint64, universe uint64, trace *queryTrace) error {
 	if p == nil || p.alwaysTrue || p.alwaysFalse || p.covered {
 		return nil
 	}
@@ -2083,21 +1733,21 @@ func (db *DB[K, V]) prepareCountPredicateWithTrace(p *predicate, probeEst uint64
 	}
 
 	if shouldMaterializeCountSetPredicate(*p, probeEst, universe) {
-		db.materializeSetPredicateForCount(p)
+		qv.materializeSetPredicateForCount(p)
 	}
 
-	if db.shouldPreferLazyCountBitmapFilter(*p, probeEst, universe) {
+	if qv.shouldPreferLazyCountPostingFilter(*p, probeEst, universe) {
 		return nil
 	}
 
 	if (shouldUseCountBroadRangeComplementMaterialization(*p, probeEst, universe) ||
 		shouldTryExactNumericCountBroadRangeComplement(*p, probeEst, universe)) &&
-		db.tryMaterializeBroadRangeComplementPredicateForCount(p, probeEst, universe, trace) {
+		qv.tryMaterializeBroadRangeComplementPredicateForCount(p, probeEst, universe, trace) {
 		return nil
 	}
 
 	if shouldMaterializeCustomCountPredicate(*p, probeEst, universe) {
-		if err := db.materializeCustomPredicateForCount(p); err != nil {
+		if err := qv.materializeCustomPredicateForCount(p); err != nil {
 			return err
 		}
 	}
@@ -2108,43 +1758,44 @@ func (db *DB[K, V]) prepareCountPredicateWithTrace(p *predicate, probeEst uint64
 // tryCountByPredicates counts AND expressions by scanning a selective lead
 // predicate and validating remaining predicates via contains checks.
 //
-// It exists to avoid materializing full bitmap intermediates when a lead can
+// It exists to avoid materializing full postingResult intermediates when a lead can
 // cheaply prune the candidate space.
-func (db *DB[K, V]) tryCountByPredicates(expr qx.Expr, trace *queryTrace) (uint64, bool, error) {
+func (qv *queryView[K, V]) tryCountByPredicates(expr qx.Expr, trace *queryTrace) (uint64, bool, error) {
 	if expr.Not || expr.Op != qx.OpAND || len(expr.Operands) < 2 {
 		return 0, false, nil
 	}
 
-	leaves, ok := collectAndLeaves(expr)
+	var leavesBuf [countPredicateScanMaxLeaves]qx.Expr
+	leaves, ok := collectAndLeavesScratch(expr, leavesBuf[:0])
 	if !ok || !shouldTryCountByPredicates(leaves) {
 		return 0, false, nil
 	}
 
 	// Count paths defer broad numeric-range materialization until a lead is
 	// chosen; otherwise NoCaching runs can rebuild huge range bitmaps per query.
-	preds, ok := db.buildPredicatesWithMode(leaves, false)
+	preds, ok := qv.buildPredicatesWithMode(leaves, false)
 	if !ok {
 		return 0, false, nil
 	}
 	defer releasePredicates(preds)
 
-	universe := db.snapshotUniverseCardinality()
+	universe := qv.snapshotUniverseCardinality()
 	if universe == 0 {
 		return 0, true, nil
 	}
 
 	// Prefer leads that stay cheap under repeated predicate scans; broad
-	// HASANY unions are better left to bitmap fallback than to posts_union scans.
+	// HASANY unions are better left to postingResult fallback than to posts_union scans.
 	for i := range preds {
 		if preds[i].alwaysFalse {
 			return 0, true, nil
 		}
 	}
-	leadIdx, leadEst, _ := db.pickCountLeadPredicate(preds, universe)
+	leadIdx, leadEst, _ := qv.pickCountLeadPredicate(preds, universe)
 	if leadIdx < 0 {
 		return 0, false, nil
 	}
-	if err := db.prepareCountPredicateWithTrace(&preds[leadIdx], leadEst, universe, trace); err != nil {
+	if err := qv.prepareCountPredicateWithTrace(&preds[leadIdx], leadEst, universe, trace); err != nil {
 		return 0, true, err
 	}
 	if preds[leadIdx].alwaysFalse {
@@ -2180,7 +1831,7 @@ func (db *DB[K, V]) tryCountByPredicates(expr qx.Expr, trace *queryTrace) (uint6
 	}
 	// Broad leads are only worth predicate scans when the remaining checks are
 	// few and cheap. Apply the conservative gate before residual preparation so
-	// bitmap fallback does not inherit avoidable setup/materialization cost.
+	// postingResult fallback does not inherit avoidable setup/materialization cost.
 	if universe > 0 && leadEst > universe/2 {
 		cheapChecks := true
 		for _, pi := range active {
@@ -2194,7 +1845,7 @@ func (db *DB[K, V]) tryCountByPredicates(expr qx.Expr, trace *queryTrace) (uint6
 		}
 	}
 	for _, pi := range active {
-		if err := db.prepareCountPredicateWithTrace(&preds[pi], leadEst, universe, trace); err != nil {
+		if err := qv.prepareCountPredicateWithTrace(&preds[pi], leadEst, universe, trace); err != nil {
 			return 0, true, err
 		}
 	}
@@ -2217,7 +1868,7 @@ func (db *DB[K, V]) tryCountByPredicates(expr qx.Expr, trace *queryTrace) (uint6
 
 	// For range/prefix leads on stable base slices, count by buckets first:
 	// many buckets can be skipped (or fully counted) via bucketCount hooks.
-	if cnt, examined, ok := db.tryCountByPredicatesLeadBuckets(preds, leadIdx, active); ok {
+	if cnt, examined, ok := qv.tryCountByPredicatesLeadBuckets(preds, leadIdx, active); ok {
 		if trace != nil {
 			trace.setPlan(PlanCountPredicates)
 			trace.addExamined(examined)
@@ -2226,7 +1877,7 @@ func (db *DB[K, V]) tryCountByPredicates(expr qx.Expr, trace *queryTrace) (uint6
 	}
 	// Posting-backed leads can count posting-by-posting so exact-capable
 	// residual predicates prune whole posting bitmaps before row fallback.
-	if cnt, examined, ok := db.tryCountByPredicatesLeadPostings(preds, leadIdx, active); ok {
+	if cnt, examined, ok := qv.tryCountByPredicatesLeadPostings(preds, leadIdx, active); ok {
 		if trace != nil {
 			trace.setPlan(PlanCountPredicates)
 			trace.addExamined(examined)
@@ -2238,7 +1889,7 @@ func (db *DB[K, V]) tryCountByPredicates(expr qx.Expr, trace *queryTrace) (uint6
 	if it == nil {
 		return 0, false, nil
 	}
-	defer releaseRoaringIter(it)
+	defer it.Release()
 
 	var cnt uint64
 	var examined uint64
@@ -2263,7 +1914,7 @@ func (db *DB[K, V]) tryCountByPredicates(expr qx.Expr, trace *queryTrace) (uint6
 	return cnt, true, nil
 }
 
-func (db *DB[K, V]) tryCountByPredicatesLeadBuckets(preds []predicate, leadIdx int, active []int) (uint64, uint64, bool) {
+func (qv *queryView[K, V]) tryCountByPredicatesLeadBuckets(preds []predicate, leadIdx int, active []int) (uint64, uint64, bool) {
 	if leadIdx < 0 || leadIdx >= len(preds) {
 		return 0, 0, false
 	}
@@ -2278,24 +1929,219 @@ func (db *DB[K, V]) tryCountByPredicatesLeadBuckets(preds []predicate, leadIdx i
 		return 0, 0, false
 	}
 
-	fm := db.fields[e.Field]
+	fm := qv.fields[e.Field]
 	if fm == nil || fm.Slice {
 		return 0, 0, false
 	}
 
-	snap := db.getSnapshot()
-	if snap == nil || snap.fieldDelta(e.Field) != nil {
-		return 0, 0, false
+	ov := qv.fieldOverlay(e.Field)
+	if ov.chunked != nil {
+		rb, covered, hasBounds, ok := qv.collectOrderRangeBounds(e.Field, len(preds), func(i int) qx.Expr {
+			return preds[i].expr
+		})
+		if !ok || !hasBounds {
+			return 0, 0, false
+		}
+		br := ov.rangeForBounds(rb)
+		if overlayRangeEmpty(br) {
+			return 0, 0, true
+		}
+		if br.baseEnd-br.baseStart < 4 {
+			return 0, 0, false
+		}
+
+		activeBuf := getIntSliceBuf(len(active))
+		localActive := activeBuf.values[:0]
+		defer func() {
+			activeBuf.values = localActive
+			releaseIntSliceBuf(activeBuf)
+		}()
+		for _, pi := range active {
+			if pi >= 0 && pi < len(covered) && covered[pi] {
+				continue
+			}
+			localActive = append(localActive, pi)
+		}
+
+		exactActiveBuf := getIntSliceBuf(len(localActive))
+		exactActive := buildPostingFilterActive(exactActiveBuf.values, localActive, preds)
+		defer func() {
+			exactActiveBuf.values = exactActive
+			releaseIntSliceBuf(exactActiveBuf)
+		}()
+		extraExactCandidatesBuf := getIntSliceBuf(len(localActive))
+		extraExactCandidates := extraExactCandidatesBuf.values[:0]
+		extraExactCandidates = append(extraExactCandidates, qv.collectCountLeadResidualExactCandidates(preds, localActive)...)
+		defer func() {
+			extraExactCandidatesBuf.values = extraExactCandidates
+			releaseIntSliceBuf(extraExactCandidatesBuf)
+		}()
+		var extraExact []countLeadResidualExactFilter
+		defer func() {
+			releaseCountLeadResidualExactFilters(extraExact)
+		}()
+		extraExactBuilt := len(extraExactCandidates) == 0
+		residualExactBuf := getIntSliceBuf(len(localActive))
+		residualAfterExact := residualExactBuf.values[:0]
+		defer func() {
+			residualExactBuf.values = residualAfterExact
+			releaseIntSliceBuf(residualExactBuf)
+		}()
+		residualBothBuf := getIntSliceBuf(len(localActive))
+		residualAfterBoth := residualBothBuf.values[:0]
+		defer func() {
+			residualBothBuf.values = residualAfterBoth
+			releaseIntSliceBuf(residualBothBuf)
+		}()
+		for _, pi := range localActive {
+			if countIndexSliceContains(exactActive, pi) {
+				continue
+			}
+			residualAfterExact = append(residualAfterExact, pi)
+			residualAfterBoth = append(residualAfterBoth, pi)
+		}
+
+		var cnt uint64
+		var examined uint64
+		var bucketWork posting.List
+		defer bucketWork.Release()
+		var extraWork posting.List
+		defer extraWork.Release()
+
+		ensureExtraExact := func() {
+			if extraExactBuilt {
+				return
+			}
+			extraExactBuilt = true
+			extraExact = qv.buildCountLeadResidualExactFiltersByCandidates(preds, extraExactCandidates)
+			if len(extraExact) == 0 {
+				return
+			}
+			extraWork.Release()
+			residualAfterBoth = residualAfterBoth[:0]
+			for _, pi := range residualAfterExact {
+				if countLeadResidualExactFiltersContain(extraExact, pi) {
+					continue
+				}
+				residualAfterBoth = append(residualAfterBoth, pi)
+			}
+		}
+
+		cur := ov.newCursor(br, false)
+		for {
+			_, ids, ok := cur.next()
+			if !ok {
+				break
+			}
+			if ids.IsEmpty() {
+				continue
+			}
+			examined += ids.Cardinality()
+
+			if len(localActive) == 0 {
+				cnt += ids.Cardinality()
+				continue
+			}
+			if idx, ok := ids.TrySingle(); ok {
+				pass := true
+				for _, pi := range localActive {
+					if !preds[pi].matches(idx) {
+						pass = false
+						break
+					}
+				}
+				if pass {
+					cnt++
+				}
+				continue
+			}
+
+			if len(exactActive) == 0 && len(extraExact) == 0 {
+				ids.ForEach(func(idx uint64) bool {
+					pass := true
+					for _, pi := range localActive {
+						if !preds[pi].matches(idx) {
+							pass = false
+							break
+						}
+					}
+					if pass {
+						cnt++
+					}
+					return true
+				})
+				continue
+			}
+
+			current := ids
+			exactApplied := false
+			if len(exactActive) > 0 {
+				mode, exactIDs, _ := plannerFilterPostingByChecks(preds, exactActive, ids, &bucketWork, true)
+				switch mode {
+				case plannerPredicateBucketEmpty:
+					continue
+				case plannerPredicateBucketAll:
+					current = exactIDs
+					exactApplied = true
+				case plannerPredicateBucketExact:
+					if exactIDs.IsEmpty() {
+						continue
+					}
+					current = exactIDs
+					exactApplied = true
+				}
+			}
+
+			extraApplied := false
+			if !extraExactBuilt {
+				ensureExtraExact()
+			}
+			if len(extraExact) > 0 {
+				filtered, ok := countApplyLeadResidualExactFilters(current, &extraWork, extraExact)
+				if ok {
+					if filtered.IsEmpty() {
+						continue
+					}
+					current = filtered
+					extraApplied = true
+				}
+			}
+
+			checks := localActive
+			if extraApplied {
+				checks = residualAfterBoth
+			} else if exactApplied {
+				checks = residualAfterExact
+			}
+			if len(checks) == 0 {
+				cnt += current.Cardinality()
+				continue
+			}
+
+			it := current.Iter()
+			for it.HasNext() {
+				idx := it.Next()
+				pass := true
+				for _, pi := range checks {
+					if !preds[pi].matches(idx) {
+						pass = false
+						break
+					}
+				}
+				if pass {
+					cnt++
+				}
+			}
+			it.Release()
+		}
+
+		return cnt, examined, true
 	}
 
-	slice := snap.fieldIndexSlice(e.Field)
-	if slice == nil || len(*slice) == 0 {
+	if !ov.hasData() {
 		return 0, 0, false
 	}
-
-	s := *slice
-	ov := fieldOverlay{base: s}
-	rb, covered, hasBounds, ok := db.collectOrderRangeBounds(e.Field, len(preds), func(i int) qx.Expr {
+	rb, covered, hasBounds, ok := qv.collectOrderRangeBounds(e.Field, len(preds), func(i int) qx.Expr {
 		return preds[i].expr
 	})
 	if !ok || !hasBounds {
@@ -2324,14 +2170,14 @@ func (db *DB[K, V]) tryCountByPredicatesLeadBuckets(preds []predicate, leadIdx i
 	}
 
 	exactActiveBuf := getIntSliceBuf(len(localActive))
-	exactActive := buildBitmapFilterActive(exactActiveBuf.values, localActive, preds)
+	exactActive := buildPostingFilterActive(exactActiveBuf.values, localActive, preds)
 	defer func() {
 		exactActiveBuf.values = exactActive
 		releaseIntSliceBuf(exactActiveBuf)
 	}()
 	extraExactCandidatesBuf := getIntSliceBuf(len(localActive))
 	extraExactCandidates := extraExactCandidatesBuf.values[:0]
-	extraExactCandidates = append(extraExactCandidates, db.collectCountLeadResidualExactCandidates(preds, localActive)...)
+	extraExactCandidates = append(extraExactCandidates, qv.collectCountLeadResidualExactCandidates(preds, localActive)...)
 	defer func() {
 		extraExactCandidatesBuf.values = extraExactCandidates
 		releaseIntSliceBuf(extraExactCandidatesBuf)
@@ -2363,33 +2209,21 @@ func (db *DB[K, V]) tryCountByPredicatesLeadBuckets(preds []predicate, leadIdx i
 
 	var cnt uint64
 	var examined uint64
-	var scratch *roaring64.Bitmap
-	if len(exactActive) > 0 || len(extraExactCandidates) > 0 {
-		scratch = getRoaringBuf()
-		defer releaseRoaringBuf(scratch)
-	}
-	var bucketWork *roaring64.Bitmap
-	if len(exactActive) > 0 {
-		bucketWork = getRoaringBuf()
-		defer releaseRoaringBuf(bucketWork)
-	}
-	var extraWork *roaring64.Bitmap
-	defer func() {
-		if extraWork != nil {
-			releaseRoaringBuf(extraWork)
-		}
-	}()
+	var bucketWork posting.List
+	defer bucketWork.Release()
+	var extraWork posting.List
+	defer extraWork.Release()
 
 	ensureExtraExact := func() {
 		if extraExactBuilt {
 			return
 		}
 		extraExactBuilt = true
-		extraExact = db.buildCountLeadResidualExactFiltersByCandidates(preds, extraExactCandidates)
+		extraExact = qv.buildCountLeadResidualExactFiltersByCandidates(preds, extraExactCandidates)
 		if len(extraExact) == 0 {
 			return
 		}
-		extraWork = getRoaringBuf()
+		extraWork.Release()
 		residualAfterBoth = residualAfterBoth[:0]
 		for _, pi := range residualAfterExact {
 			if countLeadResidualExactFiltersContain(extraExact, pi) {
@@ -2399,8 +2233,12 @@ func (db *DB[K, V]) tryCountByPredicatesLeadBuckets(preds []predicate, leadIdx i
 		}
 	}
 
-	for i := start; i < end; i++ {
-		ids := s[i].IDs
+	cur := ov.newCursor(ov.rangeByRanks(start, end), false)
+	for {
+		_, ids, ok := cur.next()
+		if !ok {
+			break
+		}
 		if ids.IsEmpty() {
 			continue
 		}
@@ -2410,8 +2248,7 @@ func (db *DB[K, V]) tryCountByPredicatesLeadBuckets(preds []predicate, leadIdx i
 			cnt += ids.Cardinality()
 			continue
 		}
-		if ids.isSingleton() {
-			idx := ids.single
+		if idx, ok := ids.TrySingle(); ok {
 			pass := true
 			for _, pi := range localActive {
 				if !preds[pi].matches(idx) {
@@ -2442,35 +2279,21 @@ func (db *DB[K, V]) tryCountByPredicatesLeadBuckets(preds []predicate, leadIdx i
 			continue
 		}
 
-		bm, owned := ids.ToBitmapOwned(scratch)
-		if bm == nil || bm.IsEmpty() {
-			if owned && bm != nil && bm != scratch {
-				releaseRoaringBuf(bm)
-			}
-			continue
-		}
-
-		current := bm
+		current := ids
 		exactApplied := false
 		if len(exactActive) > 0 {
-			mode, exactBM, _ := plannerFilterBitmapByChecks(preds, exactActive, bm, bucketWork, true)
+			mode, exactIDs, _ := plannerFilterPostingByChecks(preds, exactActive, ids, &bucketWork, true)
 			switch mode {
 			case plannerPredicateBucketEmpty:
-				if owned && bm != scratch {
-					releaseRoaringBuf(bm)
-				}
 				continue
 			case plannerPredicateBucketAll:
-				current = exactBM
+				current = exactIDs
 				exactApplied = true
 			case plannerPredicateBucketExact:
-				if exactBM == nil || exactBM.IsEmpty() {
-					if owned && bm != scratch {
-						releaseRoaringBuf(bm)
-					}
+				if exactIDs.IsEmpty() {
 					continue
 				}
-				current = exactBM
+				current = exactIDs
 				exactApplied = true
 			}
 		}
@@ -2480,12 +2303,9 @@ func (db *DB[K, V]) tryCountByPredicatesLeadBuckets(preds []predicate, leadIdx i
 			ensureExtraExact()
 		}
 		if len(extraExact) > 0 {
-			filtered, ok := countApplyLeadResidualExactFilters(current, extraWork, extraExact)
+			filtered, ok := countApplyLeadResidualExactFilters(current, &extraWork, extraExact)
 			if ok {
-				if filtered == nil || filtered.IsEmpty() {
-					if owned && bm != scratch {
-						releaseRoaringBuf(bm)
-					}
+				if filtered.IsEmpty() {
 					continue
 				}
 				current = filtered
@@ -2500,14 +2320,11 @@ func (db *DB[K, V]) tryCountByPredicatesLeadBuckets(preds []predicate, leadIdx i
 			checks = residualAfterExact
 		}
 		if len(checks) == 0 {
-			cnt += current.GetCardinality()
-			if owned && bm != scratch {
-				releaseRoaringBuf(bm)
-			}
+			cnt += current.Cardinality()
 			continue
 		}
 
-		it := current.Iterator()
+		it := current.Iter()
 		for it.HasNext() {
 			idx := it.Next()
 			pass := true
@@ -2521,16 +2338,13 @@ func (db *DB[K, V]) tryCountByPredicatesLeadBuckets(preds []predicate, leadIdx i
 				cnt++
 			}
 		}
-		releaseRoaringBitmapIterator(it)
-		if owned && bm != scratch {
-			releaseRoaringBuf(bm)
-		}
+		it.Release()
 	}
 
 	return cnt, examined, true
 }
 
-func (db *DB[K, V]) tryCountByPredicatesLeadPostings(preds []predicate, leadIdx int, active []int) (uint64, uint64, bool) {
+func (qv *queryView[K, V]) tryCountByPredicatesLeadPostings(preds []predicate, leadIdx int, active []int) (uint64, uint64, bool) {
 	if leadIdx < 0 || leadIdx >= len(preds) {
 		return 0, 0, false
 	}
@@ -2553,14 +2367,14 @@ func (db *DB[K, V]) tryCountByPredicatesLeadPostings(preds []predicate, leadIdx 
 	localActive = append(localActive, active...)
 
 	exactActiveBuf := getIntSliceBuf(len(localActive))
-	exactActive := buildBitmapFilterActive(exactActiveBuf.values, localActive, preds)
+	exactActive := buildPostingFilterActive(exactActiveBuf.values, localActive, preds)
 	defer func() {
 		exactActiveBuf.values = exactActive
 		releaseIntSliceBuf(exactActiveBuf)
 	}()
 	extraExactCandidatesBuf := getIntSliceBuf(len(localActive))
 	extraExactCandidates := extraExactCandidatesBuf.values[:0]
-	extraExactCandidates = append(extraExactCandidates, db.collectCountLeadResidualExactCandidates(preds, localActive)...)
+	extraExactCandidates = append(extraExactCandidates, qv.collectCountLeadResidualExactCandidates(preds, localActive)...)
 	defer func() {
 		extraExactCandidatesBuf.values = extraExactCandidates
 		releaseIntSliceBuf(extraExactCandidatesBuf)
@@ -2592,33 +2406,21 @@ func (db *DB[K, V]) tryCountByPredicatesLeadPostings(preds []predicate, leadIdx 
 
 	var cnt uint64
 	var examined uint64
-	var scratch *roaring64.Bitmap
-	if len(exactActive) > 0 || len(extraExactCandidates) > 0 {
-		scratch = getRoaringBuf()
-		defer releaseRoaringBuf(scratch)
-	}
-	var bucketWork *roaring64.Bitmap
-	if len(exactActive) > 0 {
-		bucketWork = getRoaringBuf()
-		defer releaseRoaringBuf(bucketWork)
-	}
-	var extraWork *roaring64.Bitmap
-	defer func() {
-		if extraWork != nil {
-			releaseRoaringBuf(extraWork)
-		}
-	}()
+	var bucketWork posting.List
+	defer bucketWork.Release()
+	var extraWork posting.List
+	defer extraWork.Release()
 
 	ensureExtraExact := func() {
 		if extraExactBuilt {
 			return
 		}
 		extraExactBuilt = true
-		extraExact = db.buildCountLeadResidualExactFiltersByCandidates(preds, extraExactCandidates)
+		extraExact = qv.buildCountLeadResidualExactFiltersByCandidates(preds, extraExactCandidates)
 		if len(extraExact) == 0 {
 			return
 		}
-		extraWork = getRoaringBuf()
+		extraWork.Release()
 		residualAfterBoth = residualAfterBoth[:0]
 		for _, pi := range residualAfterExact {
 			if countLeadResidualExactFiltersContain(extraExact, pi) {
@@ -2638,8 +2440,7 @@ func (db *DB[K, V]) tryCountByPredicatesLeadPostings(preds []predicate, leadIdx 
 			cnt += ids.Cardinality()
 			continue
 		}
-		if ids.isSingleton() {
-			idx := ids.single
+		if idx, ok := ids.TrySingle(); ok {
 			pass := true
 			for _, pi := range localActive {
 				if !preds[pi].matches(idx) {
@@ -2670,35 +2471,21 @@ func (db *DB[K, V]) tryCountByPredicatesLeadPostings(preds []predicate, leadIdx 
 			continue
 		}
 
-		bm, owned := ids.ToBitmapOwned(scratch)
-		if bm == nil || bm.IsEmpty() {
-			if owned && bm != nil && bm != scratch {
-				releaseRoaringBuf(bm)
-			}
-			continue
-		}
-
-		current := bm
+		current := ids
 		exactApplied := false
 		if len(exactActive) > 0 {
-			mode, exactBM, _ := plannerFilterBitmapByChecks(preds, exactActive, bm, bucketWork, true)
+			mode, exactIDs, _ := plannerFilterPostingByChecks(preds, exactActive, ids, &bucketWork, true)
 			switch mode {
 			case plannerPredicateBucketEmpty:
-				if owned && bm != scratch {
-					releaseRoaringBuf(bm)
-				}
 				continue
 			case plannerPredicateBucketAll:
-				current = exactBM
+				current = exactIDs
 				exactApplied = true
 			case plannerPredicateBucketExact:
-				if exactBM == nil || exactBM.IsEmpty() {
-					if owned && bm != scratch {
-						releaseRoaringBuf(bm)
-					}
+				if exactIDs.IsEmpty() {
 					continue
 				}
-				current = exactBM
+				current = exactIDs
 				exactApplied = true
 			}
 		}
@@ -2708,12 +2495,9 @@ func (db *DB[K, V]) tryCountByPredicatesLeadPostings(preds []predicate, leadIdx 
 			ensureExtraExact()
 		}
 		if len(extraExact) > 0 {
-			filtered, ok := countApplyLeadResidualExactFilters(current, extraWork, extraExact)
+			filtered, ok := countApplyLeadResidualExactFilters(current, &extraWork, extraExact)
 			if ok {
-				if filtered == nil || filtered.IsEmpty() {
-					if owned && bm != scratch {
-						releaseRoaringBuf(bm)
-					}
+				if filtered.IsEmpty() {
 					continue
 				}
 				current = filtered
@@ -2728,14 +2512,11 @@ func (db *DB[K, V]) tryCountByPredicatesLeadPostings(preds []predicate, leadIdx 
 			checks = residualAfterExact
 		}
 		if len(checks) == 0 {
-			cnt += current.GetCardinality()
-			if owned && bm != scratch {
-				releaseRoaringBuf(bm)
-			}
+			cnt += current.Cardinality()
 			continue
 		}
 
-		it := current.Iterator()
+		it := current.Iter()
 		for it.HasNext() {
 			idx := it.Next()
 			pass := true
@@ -2749,10 +2530,7 @@ func (db *DB[K, V]) tryCountByPredicatesLeadPostings(preds []predicate, leadIdx 
 				cnt++
 			}
 		}
-		releaseRoaringBitmapIterator(it)
-		if owned && bm != scratch {
-			releaseRoaringBuf(bm)
-		}
+		it.Release()
 	}
 
 	return cnt, examined, true
@@ -2780,13 +2558,15 @@ func countORPredicateBranchLimit(universe uint64) int {
 	case universe > 0 && universe <= 128_000:
 		limit = 4
 	}
-	if limit < 3 {
-		limit = 3
-	}
-	if limit > 8 {
-		limit = 8
-	}
-	return limit
+	/*
+		if limit < 3 {
+			limit = 3
+		}
+		if limit > 8 {
+			limit = 8
+		}
+	*/
+	return min(max(limit, 3), 8)
 }
 
 func countORHasPrefixLikeBranch(expr qx.Expr) bool {
@@ -2812,43 +2592,6 @@ func countORHasPrefixLikeBranch(expr qx.Expr) bool {
 		}
 	}
 	return false
-}
-
-func forEachAndLeaf(e qx.Expr, fn func(qx.Expr) bool) bool {
-	switch e.Op {
-	case qx.OpNOOP:
-		return false
-	case qx.OpAND:
-		if len(e.Operands) == 0 {
-			return false
-		}
-		for _, ch := range e.Operands {
-			if !forEachAndLeaf(ch, fn) {
-				return false
-			}
-		}
-		return true
-	default:
-		if e.Op == qx.OpOR || len(e.Operands) != 0 {
-			return false
-		}
-		return fn(e)
-	}
-}
-
-func collectAndLeavesFixed(e qx.Expr, dst []qx.Expr) ([]qx.Expr, bool) {
-	dst = dst[:0]
-	ok := forEachAndLeaf(e, func(leaf qx.Expr) bool {
-		if len(dst) >= cap(dst) {
-			return false
-		}
-		dst = append(dst, leaf)
-		return true
-	})
-	if !ok || len(dst) == 0 {
-		return nil, false
-	}
-	return dst, true
 }
 
 func countLeadOpWeight(op qx.Op) uint64 {
@@ -2922,36 +2665,32 @@ func countPredicateLeadScanWeight(p predicate) uint64 {
 	}
 }
 
-func (db *DB[K, V]) countPredicateCanUseExactNumericComplement(p predicate, probeEst, universe uint64) bool {
+func (qv *queryView[K, V]) countPredicateCanUseExactNumericComplement(p predicate, probeEst, universe uint64) bool {
 	if !shouldTryExactNumericCountBroadRangeComplement(p, probeEst, universe) {
 		return false
 	}
-	fm := db.fields[p.expr.Field]
+	fm := qv.fields[p.expr.Field]
 	if fm == nil || fm.Slice || !isNumericScalarKind(fm.Kind) {
 		return false
 	}
-	if p.bitmapFilterCheap {
+	if p.postingFilterCheap {
 		return true
-	}
-	snap := db.getSnapshot()
-	if snap == nil {
-		return false
 	}
 	return true
 }
 
-func (db *DB[K, V]) shouldPreferLazyCountBitmapFilter(p predicate, probeEst uint64, universe uint64) bool {
-	if db.materializedPredCacheEnabled() {
+func (qv *queryView[K, V]) shouldPreferLazyCountPostingFilter(p predicate, probeEst uint64, universe uint64) bool {
+	if qv.materializedPredCacheEnabled() {
 		return false
 	}
-	if p.kind != predicateKindCustom || !p.bitmapFilterCheap {
+	if p.kind != predicateKindCustom || !p.postingFilterCheap {
 		return false
 	}
 	return shouldUseCountBroadRangeComplementMaterialization(p, probeEst, universe) ||
-		db.countPredicateCanUseExactNumericComplement(p, probeEst, universe)
+		qv.countPredicateCanUseExactNumericComplement(p, probeEst, universe)
 }
 
-func (db *DB[K, V]) prepareCountORPredicateWithTrace(p *predicate, probeEst uint64, universe uint64, trace *queryTrace) error {
+func (qv *queryView[K, V]) prepareCountORPredicateWithTrace(p *predicate, probeEst uint64, universe uint64, trace *queryTrace) error {
 	if p == nil || p.alwaysTrue || p.alwaysFalse || p.covered {
 		return nil
 	}
@@ -2959,20 +2698,20 @@ func (db *DB[K, V]) prepareCountORPredicateWithTrace(p *predicate, probeEst uint
 		trace.addCountPredicatePreparation(1)
 	}
 
-	if db.shouldPreferLazyCountBitmapFilter(*p, probeEst, universe) {
+	if qv.shouldPreferLazyCountPostingFilter(*p, probeEst, universe) {
 		return nil
 	}
 
 	if (shouldUseCountBroadRangeComplementMaterialization(*p, probeEst, universe) ||
 		shouldTryExactNumericCountBroadRangeComplement(*p, probeEst, universe)) &&
-		db.tryMaterializeBroadRangeComplementPredicateForCount(p, probeEst, universe, trace) {
+		qv.tryMaterializeBroadRangeComplementPredicateForCount(p, probeEst, universe, trace) {
 		return nil
 	}
 
 	return nil
 }
 
-func (db *DB[K, V]) countPredicateResidualCheckWeight(p predicate, probeEst, universe uint64) uint64 {
+func (qv *queryView[K, V]) countPredicateResidualCheckWeight(p predicate, probeEst, universe uint64) uint64 {
 	if p.alwaysTrue || p.covered {
 		return 0
 	}
@@ -2986,7 +2725,7 @@ func (db *DB[K, V]) countPredicateResidualCheckWeight(p predicate, probeEst, uni
 		return 1
 	}
 	if shouldUseCountBroadRangeComplementMaterialization(p, probeEst, universe) ||
-		db.countPredicateCanUseExactNumericComplement(p, probeEst, universe) {
+		qv.countPredicateCanUseExactNumericComplement(p, probeEst, universe) {
 		return 1
 	}
 	if shouldMaterializeCustomCountPredicate(p, probeEst, universe) {
@@ -3027,21 +2766,21 @@ func (db *DB[K, V]) countPredicateResidualCheckWeight(p predicate, probeEst, uni
 	return weight
 }
 
-func (db *DB[K, V]) countORPredicateResidualCheckWeight(p predicate, probeEst, universe uint64) uint64 {
+func (qv *queryView[K, V]) countORPredicateResidualCheckWeight(p predicate, probeEst, universe uint64) uint64 {
 	if p.alwaysTrue || p.covered {
 		return 0
 	}
 	if p.alwaysFalse {
 		return ^uint64(0) / 4
 	}
-	if p.supportsBitmapFilter() {
+	if p.supportsPostingFilter() {
 		return 1
 	}
 	if shouldUseCountLeadResidualHasAnyExactFilter(p) {
 		return 1
 	}
 	if shouldUseCountBroadRangeComplementMaterialization(p, probeEst, universe) ||
-		db.countPredicateCanUseExactNumericComplement(p, probeEst, universe) {
+		qv.countPredicateCanUseExactNumericComplement(p, probeEst, universe) {
 		return 1
 	}
 
@@ -3070,11 +2809,11 @@ func (db *DB[K, V]) countORPredicateResidualCheckWeight(p predicate, probeEst, u
 	return weight
 }
 
-func (db *DB[K, V]) countLeadResidualScore(p predicate, leadEst, universe uint64) uint64 {
+func (qv *queryView[K, V]) countLeadResidualScore(p predicate, leadEst, universe uint64) uint64 {
 	if leadEst == 0 || p.alwaysTrue || p.covered {
 		return 0
 	}
-	weight := db.countPredicateResidualCheckWeight(p, leadEst, universe)
+	weight := qv.countPredicateResidualCheckWeight(p, leadEst, universe)
 	if weight == 0 {
 		return 0
 	}
@@ -3085,18 +2824,18 @@ func (db *DB[K, V]) countLeadResidualScore(p predicate, leadEst, universe uint64
 	return satMulUint64(effectiveRows, weight)
 }
 
-func (db *DB[K, V]) countORLeadResidualScore(p predicate, leadEst, universe uint64) uint64 {
+func (qv *queryView[K, V]) countORLeadResidualScore(p predicate, leadEst, universe uint64) uint64 {
 	if leadEst == 0 || p.alwaysTrue || p.covered {
 		return 0
 	}
-	weight := db.countORPredicateResidualCheckWeight(p, leadEst, universe)
+	weight := qv.countORPredicateResidualCheckWeight(p, leadEst, universe)
 	if weight == 0 {
 		return 0
 	}
 	return satMulUint64(leadEst, weight)
 }
 
-func (db *DB[K, V]) pickCountLeadPredicate(preds []predicate, universe uint64) (int, uint64, uint64) {
+func (qv *queryView[K, V]) pickCountLeadPredicate(preds []predicate, universe uint64) (int, uint64, uint64) {
 	leadIdx := -1
 	leadEst := uint64(0)
 	leadScore := uint64(0)
@@ -3112,13 +2851,13 @@ func (db *DB[K, V]) pickCountLeadPredicate(preds []predicate, universe uint64) (
 
 		score := satMulUint64(p.estCard, countPredicateLeadScanWeight(p))
 		if p.leadIterNeedsContainsCheck() {
-			score = satAddUint64(score, db.countLeadResidualScore(p, p.estCard, universe))
+			score = satAddUint64(score, qv.countLeadResidualScore(p, p.estCard, universe))
 		}
 		for j := range preds {
 			if j == i {
 				continue
 			}
-			score = satAddUint64(score, db.countLeadResidualScore(preds[j], p.estCard, universe))
+			score = satAddUint64(score, qv.countLeadResidualScore(preds[j], p.estCard, universe))
 		}
 
 		if leadIdx == -1 || score < leadScore {
@@ -3130,7 +2869,7 @@ func (db *DB[K, V]) pickCountLeadPredicate(preds []predicate, universe uint64) (
 	return leadIdx, leadEst, leadScore
 }
 
-func (db *DB[K, V]) pickCountORLeadPredicate(preds []predicate, universe uint64) (int, uint64, uint64) {
+func (qv *queryView[K, V]) pickCountORLeadPredicate(preds []predicate, universe uint64) (int, uint64, uint64) {
 	leadIdx := -1
 	leadEst := uint64(0)
 	leadScore := uint64(0)
@@ -3146,13 +2885,13 @@ func (db *DB[K, V]) pickCountORLeadPredicate(preds []predicate, universe uint64)
 
 		score := satMulUint64(p.estCard, countPredicateLeadScanWeight(p))
 		if p.leadIterNeedsContainsCheck() {
-			score = satAddUint64(score, db.countORLeadResidualScore(p, p.estCard, universe))
+			score = satAddUint64(score, qv.countORLeadResidualScore(p, p.estCard, universe))
 		}
 		for j := range preds {
 			if j == i {
 				continue
 			}
-			score = satAddUint64(score, db.countORLeadResidualScore(preds[j], p.estCard, universe))
+			score = satAddUint64(score, qv.countORLeadResidualScore(preds[j], p.estCard, universe))
 		}
 
 		if leadIdx == -1 || score < leadScore {
@@ -3167,13 +2906,13 @@ func (db *DB[K, V]) pickCountORLeadPredicate(preds []predicate, universe uint64)
 // tryCountORByPredicates counts top-level OR expressions via branch lead scans.
 //
 // The path is intentionally conservative: it is enabled only for bounded OR
-// shapes where lead-driven probing is usually cheaper than full bitmap union.
-func (db *DB[K, V]) tryCountORByPredicates(expr qx.Expr, trace *queryTrace) (uint64, bool, error) {
+// shapes where lead-driven probing is usually cheaper than full postingResult union.
+func (qv *queryView[K, V]) tryCountORByPredicates(expr qx.Expr, trace *queryTrace) (uint64, bool, error) {
 	if !shouldTryCountORByPredicates(expr) {
 		return 0, false, nil
 	}
 
-	uc := db.snapshotUniverseCardinality()
+	uc := qv.snapshotUniverseCardinality()
 	if uc == 0 {
 		return 0, true, nil
 	}
@@ -3201,8 +2940,8 @@ func (db *DB[K, V]) tryCountORByPredicates(expr qx.Expr, trace *queryTrace) (uin
 	}()
 
 	var expectedProbes uint64
-	bitmapBranches := make([]countORBitmapBranch, 0, max(0, branchCount-1))
-	var bitmapBranchEst uint64
+	materializedBranches := make([]countORMaterializedBranch, 0, max(0, branchCount-1))
+	var materializedBranchEst uint64
 
 	// Build branch plans first and estimate total probe budget before scanning.
 	// This prevents expensive partial work when the union is too broad.
@@ -3216,7 +2955,7 @@ branchLoop:
 
 		// Count paths defer broad numeric-range materialization until a lead is
 		// chosen; otherwise NoCaching runs can rebuild huge range bitmaps per query.
-		preds, ok := db.buildPredicatesWithMode(leaves, false)
+		preds, ok := qv.buildPredicatesWithMode(leaves, false)
 		if !ok {
 			return 0, false, nil
 		}
@@ -3261,7 +3000,7 @@ branchLoop:
 			return uc, true, nil
 		}
 
-		leadIdx, leadEst, leadScore := db.pickCountORLeadPredicate(preds, uc)
+		leadIdx, leadEst, leadScore := qv.pickCountORLeadPredicate(preds, uc)
 		branchEst := countORBranchEstimate(preds, active, leadEst)
 		leadWeight := uint64(0)
 		if leadIdx >= 0 {
@@ -3272,19 +3011,19 @@ branchLoop:
 				branchTrace[branchIdx].Skipped = true
 				branchTrace[branchIdx].SkipReason = reason
 			}
-			bitmapBranches = append(bitmapBranches, countORBitmapBranch{
+			materializedBranches = append(materializedBranches, countORMaterializedBranch{
 				index: branchIdx,
 				expr:  op,
 				est:   branchEst,
 			})
-			bitmapBranchEst = satAddUint64(bitmapBranchEst, branchEst)
+			materializedBranchEst = satAddUint64(materializedBranchEst, branchEst)
 			releaseCurrentBranch(checksBuf, checks)
 		}
 
 		// Cannot drive branch without iterable lead.
 		if leadIdx < 0 {
 			if strictWide {
-				spillBranch("bitmap_spill_no_lead", nil, nil)
+				spillBranch("materialized_spill_no_lead", nil, nil)
 				continue
 			}
 			releaseCurrentBranch(nil, nil)
@@ -3294,7 +3033,7 @@ branchLoop:
 		// Broad OR branches are sensitive to one-shot setup allocations.
 		if countLeadTooRisky(preds[leadIdx].expr.Op, leadEst, uc) {
 			if strictWide {
-				spillBranch("bitmap_spill_risky_lead", nil, nil)
+				spillBranch("materialized_spill_risky_lead", nil, nil)
 				continue
 			}
 			releaseCurrentBranch(nil, nil)
@@ -3302,15 +3041,15 @@ branchLoop:
 		}
 		if strictWide {
 			if leadWeight > 3 && leadEst > 2_048 && leadEst > uc/64 {
-				spillBranch("bitmap_spill_expensive_lead", nil, nil)
+				spillBranch("materialized_spill_expensive_lead", nil, nil)
 				continue branchLoop
 			}
 			if leadScore > uc && leadEst > 2_048 && leadEst > uc/32 {
-				spillBranch("bitmap_spill_expensive_branch_score", nil, nil)
+				spillBranch("materialized_spill_expensive_branch_score", nil, nil)
 				continue branchLoop
 			}
 			if leadEst > uc/3 {
-				spillBranch("bitmap_spill_broad_lead", nil, nil)
+				spillBranch("materialized_spill_broad_lead", nil, nil)
 				continue branchLoop
 			}
 		}
@@ -3332,7 +3071,7 @@ branchLoop:
 			}
 			if !p.hasContains() {
 				if strictWide {
-					spillBranch("bitmap_spill_no_contains", checksBuf, checks)
+					spillBranch("materialized_spill_no_contains", checksBuf, checks)
 					continue branchLoop
 				}
 				releaseCurrentBranch(checksBuf, checks)
@@ -3345,7 +3084,7 @@ branchLoop:
 			continue
 		}
 		for _, pi := range checks {
-			if err := db.prepareCountORPredicateWithTrace(&preds[pi], leadEst, uc, trace); err != nil {
+			if err := qv.prepareCountORPredicateWithTrace(&preds[pi], leadEst, uc, trace); err != nil {
 				releaseCurrentBranch(checksBuf, checks)
 				return 0, true, err
 			}
@@ -3362,7 +3101,7 @@ branchLoop:
 			}
 			if !p.hasContains() {
 				if strictWide {
-					spillBranch("bitmap_spill_post_prepare", checksBuf, checks)
+					spillBranch("materialized_spill_post_prepare", checksBuf, checks)
 					continue branchLoop
 				}
 				releaseCurrentBranch(checksBuf, checks)
@@ -3395,44 +3134,45 @@ branchLoop:
 	}
 
 	if len(branches) == 0 {
-		if len(bitmapBranches) > 0 {
+		if len(materializedBranches) > 0 {
 			return 0, false, nil
 		}
 		return 0, true, nil
 	}
-	useBitmapSpill := len(bitmapBranches) > 0
-	if useBitmapSpill && !shouldTryCountORHybridBitmapSpill(branchCount, len(branches), len(bitmapBranches), expectedProbes, bitmapBranchEst, uc) {
+	useMaterializedSpill := len(materializedBranches) > 0
+	if useMaterializedSpill && !shouldTryCountORHybridMaterializedSpill(branchCount, len(branches), len(materializedBranches), expectedProbes, materializedBranchEst, uc) {
 		return 0, false, nil
 	}
 
 	// Guardrail: skip this path when projected probe volume approaches a broad
-	// union, where bitmap materialization is typically cheaper overall.
+	// union, where postingResult materialization is typically cheaper overall.
 	limit := uc * 2
 	if strictWide {
 		limit = uc
 	}
-	if !useBitmapSpill && expectedProbes > limit {
+	if !useMaterializedSpill && expectedProbes > limit {
 		return 0, false, nil
 	}
 
-	useSeenDedup := useBitmapSpill || branches.shouldUseSeenDedup(uc, expectedProbes)
-	var seen *roaring64.Bitmap
+	useSeenDedup := useMaterializedSpill || branches.shouldUseSeenDedup(uc, expectedProbes)
+	var seen posting.List
+	var seenRef *posting.List
 	if useSeenDedup {
-		seen = getRoaringBuf()
-		defer releaseRoaringBuf(seen)
+		seenRef = &seen
+		defer seen.Release()
 	}
 
 	var cnt uint64
 	var examined uint64
 	if trace != nil {
-		if useBitmapSpill {
+		if useMaterializedSpill {
 			trace.setPlan(PlanCountORHybrid)
 		} else {
 			trace.setPlan(PlanCountORPredicates)
 		}
 	}
-	if useBitmapSpill {
-		spillCnt, spillExamined, ok, err := db.countORBitmapSpillUnion(bitmapBranches, seen, trace, branchTrace)
+	if useMaterializedSpill {
+		spillCnt, spillExamined, ok, err := qv.countORMaterializedSpillUnion(materializedBranches, seenRef, trace, branchTrace)
 		if err != nil {
 			return 0, true, err
 		}
@@ -3448,7 +3188,7 @@ branchLoop:
 		if branchTrace != nil {
 			brTrace = &branchTrace[br.index]
 		}
-		if cntBranch, examinedBranch, ok := db.tryCountORBranchLeadPostings(branches, i, useSeenDedup, seen, brTrace); ok {
+		if cntBranch, examinedBranch, ok := qv.tryCountORBranchLeadPostings(branches, i, useSeenDedup, seenRef, brTrace); ok {
 			cnt += cntBranch
 			examined += examinedBranch
 			continue
@@ -3458,7 +3198,6 @@ branchLoop:
 		if it == nil {
 			return 0, false, nil
 		}
-		defer releaseRoaringIter(it)
 
 		for it.HasNext() {
 			idx := it.Next()
@@ -3470,7 +3209,7 @@ branchLoop:
 			if useSeenDedup {
 				// OR union dedupe first to avoid repeated expensive predicate checks
 				// for ids that were already accepted by previous branches.
-				if seen.Contains(idx) {
+				if seenRef.Contains(idx) {
 					continue
 				}
 			}
@@ -3480,7 +3219,7 @@ branchLoop:
 			}
 
 			if useSeenDedup {
-				if seen.CheckedAdd(idx) {
+				if seenRef.CheckedAdd(idx) {
 					cnt++
 					if brTrace != nil {
 						brTrace.RowsEmitted++
@@ -3503,6 +3242,7 @@ branchLoop:
 				}
 			}
 		}
+		it.Release()
 	}
 	if trace != nil {
 		trace.addExamined(examined)
@@ -3512,18 +3252,18 @@ branchLoop:
 	return cnt, true, nil
 }
 
-func (db *DB[K, V]) countPreparedExpr(expr qx.Expr) (uint64, error) {
-	if cnt, ok, err := db.tryCountPreparedAndReordered(expr); ok || err != nil {
+func (qv *queryView[K, V]) countPreparedExpr(expr qx.Expr) (uint64, error) {
+	if cnt, ok, err := qv.tryCountPreparedAndReordered(expr); ok || err != nil {
 		return cnt, err
 	}
 
-	b, err := db.evalExpr(expr)
+	b, err := qv.evalExpr(expr)
 	if err != nil {
 		return 0, err
 	}
 	defer b.release()
 
-	return db.countBitmapResult(b), nil
+	return qv.countPostingResult(b), nil
 }
 
 type countLeafPlan struct {
@@ -3583,17 +3323,18 @@ func sortCountLeafPlanOrder(plans []countLeafPlan, ids []int) {
 	}
 }
 
-func (db *DB[K, V]) tryCountPreparedAndReordered(expr qx.Expr) (uint64, bool, error) {
+func (qv *queryView[K, V]) tryCountPreparedAndReordered(expr qx.Expr) (uint64, bool, error) {
 	if expr.Not || expr.Op != qx.OpAND || len(expr.Operands) < 2 {
 		return 0, false, nil
 	}
 
-	leaves, ok := collectAndLeaves(expr)
+	var leavesBuf [countPredicateScanMaxLeaves]qx.Expr
+	leaves, ok := collectAndLeavesScratch(expr, leavesBuf[:0])
 	if !ok || len(leaves) < 2 || len(leaves) > countPredicateScanMaxLeaves {
 		return 0, false, nil
 	}
 
-	universe := db.snapshotUniverseCardinality()
+	universe := qv.snapshotUniverseCardinality()
 	if universe == 0 {
 		return 0, true, nil
 	}
@@ -3617,7 +3358,7 @@ func (db *DB[K, V]) tryCountPreparedAndReordered(expr qx.Expr) (uint64, bool, er
 	for i := range leaves {
 		e := leaves[i]
 		plans[i] = countLeafPlan{expr: e}
-		if sel, _, _, _, ok := db.estimateLeafOrderCost(e, nil, universe, "", false); ok {
+		if sel, _, _, _, ok := qv.estimateLeafOrderCost(e, nil, universe, "", false); ok {
 			if sel < 0 {
 				sel = 0
 			}
@@ -3643,16 +3384,16 @@ func (db *DB[K, V]) tryCountPreparedAndReordered(expr qx.Expr) (uint64, bool, er
 	sortCountLeafPlanOrder(plans, neg)
 
 	var (
-		acc    bitmap
+		acc    postingResult
 		hasAcc bool
 	)
 
 	apply := func(idx int) (bool, error) {
-		b, err := db.evalExpr(plans[idx].expr)
+		b, err := qv.evalExpr(plans[idx].expr)
 		if err != nil {
 			return false, err
 		}
-		if !b.neg && (b.bm == nil || b.bm.IsEmpty()) {
+		if !b.neg && b.ids.IsEmpty() {
 			b.release()
 			if hasAcc {
 				acc.release()
@@ -3664,12 +3405,12 @@ func (db *DB[K, V]) tryCountPreparedAndReordered(expr qx.Expr) (uint64, bool, er
 			hasAcc = true
 			return false, nil
 		}
-		acc, err = db.andBitmap(acc, b)
+		acc, err = qv.andPostingResult(acc, b)
 		if err != nil {
 			acc.release()
 			return false, err
 		}
-		if !acc.neg && (acc.bm == nil || acc.bm.IsEmpty()) {
+		if !acc.neg && acc.ids.IsEmpty() {
 			acc.release()
 			return true, nil
 		}
@@ -3699,25 +3440,25 @@ func (db *DB[K, V]) tryCountPreparedAndReordered(expr qx.Expr) (uint64, bool, er
 		return 0, true, nil
 	}
 
-	cnt := db.countBitmapResult(acc)
+	cnt := qv.countPostingResult(acc)
 	acc.release()
 	return cnt, true, nil
 }
 
-func (db *DB[K, V]) countBitmapResult(b bitmap) uint64 {
+func (qv *queryView[K, V]) countPostingResult(b postingResult) uint64 {
 	if b.neg {
-		if b.bm == nil {
-			return db.snapshotUniverseCardinality()
+		if b.ids.IsEmpty() {
+			return qv.snapshotUniverseCardinality()
 		}
-		ex := b.bm.GetCardinality()
-		uc := db.snapshotUniverseCardinality()
+		ex := b.ids.Cardinality()
+		uc := qv.snapshotUniverseCardinality()
 		if ex >= uc {
 			return 0
 		}
 		return uc - ex
 	}
-	if b.bm == nil {
+	if b.ids.IsEmpty() {
 		return 0
 	}
-	return b.bm.GetCardinality()
+	return b.ids.Cardinality()
 }

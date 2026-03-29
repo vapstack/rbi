@@ -32,12 +32,12 @@ type TraceEvent struct {
 	RowsMatched  uint64
 	RowsReturned uint64
 
-	// BitmapMaterializations counts temporary bitmap materializations performed
+	// PostingMaterializations counts temporary posting materializations performed
 	// during execution (for example bucket composition or singleton expansion).
-	BitmapMaterializations uint64
+	PostingMaterializations uint64
 
-	// BitmapExactFilters counts per-bucket exact bitmap filter applications.
-	BitmapExactFilters uint64
+	// PostingExactFilters counts per-bucket exact posting filter applications.
+	PostingExactFilters uint64
 
 	// CountPredicatePreparations counts count-side predicate preparation steps.
 	CountPredicatePreparations uint64
@@ -179,7 +179,8 @@ func (db *DB[K, V]) beginTrace(q *qx.QX) *queryTrace {
 			tr.ev.OrderDesc = q.Order[0].Desc
 		}
 
-		leaves, ok := collectAndLeaves(q.Expr)
+		var leavesBuf [8]qx.Expr
+		leaves, ok := collectAndLeavesScratch(q.Expr, leavesBuf[:0])
 		if ok {
 			tr.ev.LeafCount = len(leaves)
 			for _, e := range leaves {
@@ -238,18 +239,18 @@ func (t *queryTrace) addOrderScanWidth(n uint64) {
 	t.ev.OrderIndexScanWidth += n
 }
 
-func (t *queryTrace) addBitmapMaterialized(n uint64) {
+func (t *queryTrace) addPostingMaterialization(n uint64) {
 	if !t.full() || n == 0 {
 		return
 	}
-	t.ev.BitmapMaterializations += n
+	t.ev.PostingMaterializations += n
 }
 
-func (t *queryTrace) addBitmapExactFilter(n uint64) {
+func (t *queryTrace) addPostingExactFilter(n uint64) {
 	if !t.full() || n == 0 {
 		return
 	}
-	t.ev.BitmapExactFilters += n
+	t.ev.PostingExactFilters += n
 }
 
 func (t *queryTrace) addCountPredicatePreparation(n uint64) {

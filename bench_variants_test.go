@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"math/rand/v2"
 	"path/filepath"
-	"strconv"
 	"sync"
 	"testing"
 
@@ -153,28 +152,28 @@ var (
 	dynamicBenchRaws = make(map[string]*bbolt.DB)
 )
 
-func openDynamicBenchDBWithCaching(b *testing.B, withCaching bool) (*DB[uint64, UserBench], *bbolt.DB, string) {
+func openDynamicBenchDB(b *testing.B) (*DB[uint64, UserBench], *bbolt.DB, string) {
 	b.Helper()
 	dir := b.TempDir()
 	path := filepath.Join(dir, "dynamic_bench.db")
 
-	opts := benchOptions(withCaching)
+	opts := benchOptions()
 	opts.AnalyzeInterval = -1
 	db, raw := openBoltAndNew[uint64, UserBench](b, path, opts)
 	return db, raw, path
 }
 
-func buildBenchDBDynamicProfileWithCaching(b *testing.B, profile dynamicBenchProfile, withCaching bool) *DB[uint64, UserBench] {
+func buildBenchDBDynamicProfileWithMode(b *testing.B, profile dynamicBenchProfile, mode benchCacheMode) *DB[uint64, UserBench] {
 	b.Helper()
 	dynamicBenchMu.Lock()
 	defer dynamicBenchMu.Unlock()
 
-	key := profile.name + "/" + strconv.FormatBool(withCaching)
+	key := profile.name + "/" + mode.suffix
 	if db := dynamicBenchDBs[key]; db != nil {
 		return db
 	}
 
-	db, raw, _ := openDynamicBenchDBWithCaching(b, withCaching)
+	db, raw, _ := openDynamicBenchDB(b)
 
 	b.StopTimer()
 	seedBenchDataDynamicProfile(b, db, profile)
@@ -324,15 +323,15 @@ func seedBenchDataDynamicProfile(b *testing.B, db *DB[uint64, UserBench], profil
 }
 
 func Benchmark_Query_Index_Keys_DynamicProfiles_Perf(b *testing.B) {
-	runBenchCacheModes(b, func(b *testing.B, withCaching bool) {
+	runBenchCacheModes(b, func(b *testing.B, mode benchCacheMode) {
 		for _, profile := range dynamicBenchProfiles {
 			profile := profile
 			b.Run(profile.name, func(b *testing.B) {
-				db := buildBenchDBDynamicProfileWithCaching(b, profile, withCaching)
+				db := buildBenchDBDynamicProfileWithMode(b, profile, mode)
 				for _, qc := range dynamicBenchQueries {
 					qc := qc
 					b.Run(qc.name, func(b *testing.B) {
-						runQueryKeysBench(b, db, qc.query())
+						runQueryKeysBenchWithMode(b, db, qc.query(), mode)
 					})
 				}
 			})

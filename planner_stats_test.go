@@ -1,6 +1,7 @@
 package rbi
 
 import (
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -194,5 +195,128 @@ func TestPlannerStats_RefreshAndVersion(t *testing.T) {
 	s2 := db.PlannerStats()
 	if s2.Fields["country"].DistinctKeys == 0 {
 		t.Fatalf("snapshot was mutated by caller")
+	}
+}
+
+func TestPlannerStats_PersistedIndexLoadRestoresSnapshot(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "planner_stats_persist.db")
+
+	db, raw := openBoltAndNew[uint64, Rec](t, path, Options{AnalyzeInterval: -1})
+	_ = seedData(t, db, 2_000)
+	if err := db.RefreshPlannerStats(); err != nil {
+		t.Fatalf("RefreshPlannerStats: %v", err)
+	}
+
+	db.mu.RLock()
+	want := db.buildPlannerStatsSnapshotLocked(1)
+	db.mu.RUnlock()
+
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatalf("raw.Close: %v", err)
+	}
+
+	db2, raw2 := openBoltAndNew[uint64, Rec](t, path, Options{AnalyzeInterval: -1})
+	t.Cleanup(func() {
+		_ = db2.Close()
+		_ = raw2.Close()
+	})
+
+	got := db2.PlannerStats()
+	if got.Version == 0 {
+		t.Fatalf("expected planner stats version > 0 after persisted load")
+	}
+	if got.GeneratedAt.IsZero() {
+		t.Fatalf("expected planner stats generated_at after persisted load")
+	}
+	if got.UniverseCardinality != want.UniverseCardinality {
+		t.Fatalf("universe mismatch after persisted load: got=%d want=%d", got.UniverseCardinality, want.UniverseCardinality)
+	}
+	if got.FieldCount != len(want.Fields) {
+		t.Fatalf("field count mismatch after persisted load: got=%d want=%d", got.FieldCount, len(want.Fields))
+	}
+	for field, wantStats := range want.Fields {
+		gotStats, ok := got.Fields[field]
+		if !ok {
+			t.Fatalf("missing persisted planner stats for %q", field)
+		}
+		if gotStats != wantStats {
+			t.Fatalf("persisted planner stats mismatch for %q: got=%+v want=%+v", field, gotStats, wantStats)
+		}
+	}
+}
+
+func TestPlannerStats_ClosePersistsPublishedSnapshotWithoutRebuild(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "planner_stats_persist_reuse.db")
+
+	db, raw := openBoltAndNew[uint64, Rec](t, path, Options{AnalyzeInterval: -1})
+	_ = seedData(t, db, 256)
+
+	if err := db.RefreshPlannerStats(); err != nil {
+		t.Fatalf("RefreshPlannerStats: %v", err)
+	}
+
+	before := db.PlannerStats()
+
+	if err := db.Set(10_001, &Rec{
+		Meta:     Meta{Country: "ZZ"},
+		Name:     "planner-persist-new",
+		Email:    "planner-persist-new@example.com",
+		Age:      99,
+		Score:    999.99,
+		Active:   true,
+		Tags:     []string{"planner-persist-new"},
+		FullName: "Planner Persist New",
+	}); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatalf("raw.Close: %v", err)
+	}
+
+	db2, raw2 := openBoltAndNew[uint64, Rec](t, path, Options{AnalyzeInterval: -1})
+	t.Cleanup(func() {
+		_ = db2.Close()
+		_ = raw2.Close()
+	})
+
+	got := db2.PlannerStats()
+
+	if got.Version <= before.Version {
+		t.Fatalf("expected persisted planner stats version to advance: got=%d before=%d", got.Version, before.Version)
+	}
+	if !got.GeneratedAt.After(before.GeneratedAt) {
+		t.Fatalf("expected persisted generated_at to advance: got=%v before=%v", got.GeneratedAt, before.GeneratedAt)
+	}
+	if got.UniverseCardinality != before.UniverseCardinality+1 {
+		t.Fatalf("unexpected persisted universe cardinality: got=%d want=%d", got.UniverseCardinality, before.UniverseCardinality+1)
+	}
+	if len(got.Fields) != len(before.Fields) {
+		t.Fatalf("field count mismatch after persisted reuse: got=%d want=%d", len(got.Fields), len(before.Fields))
+	}
+	for field, wantStats := range before.Fields {
+		gotStats, ok := got.Fields[field]
+		if !ok {
+			t.Fatalf("missing persisted planner stats for %q", field)
+		}
+		if gotStats != wantStats {
+			t.Fatalf("persisted planner stats changed for %q: got=%+v want=%+v", field, gotStats, wantStats)
+		}
+	}
+}
+
+func TestP2Quantile_WarmupKeepsExactPercentileAtFiveSamples(t *testing.T) {
+	q := newP2Quantile(0.95)
+	for _, v := range []uint64{1, 2, 3, 4, 100} {
+		q.observe(v)
+	}
+	if got := q.value(); got != 100 {
+		t.Fatalf("unexpected p95 during warmup: got=%d want=100", got)
 	}
 }

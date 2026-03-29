@@ -35,6 +35,49 @@ func TestEmptySliceQueries(t *testing.T) {
 	}
 }
 
+func TestQuery_SliceEQ_EmptyDBAndAfterLastDelete(t *testing.T) {
+	db, _ := openTempDBUint64(t)
+
+	q := qx.Query(qx.EQ("tags", []string{}))
+
+	got, err := db.QueryKeys(q)
+	if err != nil {
+		t.Fatalf("QueryKeys(empty db): %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("expected empty result on empty db, got %v", got)
+	}
+	cnt, err := db.Count(q)
+	if err != nil {
+		t.Fatalf("Count(empty db): %v", err)
+	}
+	if cnt != 0 {
+		t.Fatalf("expected zero count on empty db, got %d", cnt)
+	}
+
+	if err := db.Set(1, &Rec{Name: "u1", Tags: []string{"go"}}); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+	if err := db.Delete(1); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+
+	got, err = db.QueryKeys(q)
+	if err != nil {
+		t.Fatalf("QueryKeys(after last delete): %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("expected empty result after last delete, got %v", got)
+	}
+	cnt, err = db.Count(q)
+	if err != nil {
+		t.Fatalf("Count(after last delete): %v", err)
+	}
+	if cnt != 0 {
+		t.Fatalf("expected zero count after last delete, got %d", cnt)
+	}
+}
+
 func TestQuery_PointerField_NilVsZeroValue(t *testing.T) {
 	db, _ := openTempDBUint64(t)
 
@@ -69,7 +112,7 @@ func TestQuery_PointerField_NilVsZeroValue(t *testing.T) {
 	}
 }
 
-func TestQuery_DeltaIterator_KeepsEmptyStringKey(t *testing.T) {
+func TestQuery_Iterator_KeepsEmptyStringKey(t *testing.T) {
 	db, _ := openTempDBUint64(t)
 
 	if err := db.Set(1, &Rec{Name: "", Email: "empty@example.test"}); err != nil {

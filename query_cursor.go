@@ -1,27 +1,32 @@
 package rbi
 
-import "github.com/vapstack/rbi/internal/roaring64"
+import (
+	"unsafe"
+
+	"github.com/vapstack/rbi/internal/posting"
+)
 
 type queryCursor[K ~uint64 | ~string, V any] struct {
-	db *DB[K, V]
-
 	out []K
 
 	skip uint64
 	need uint64
 	all  bool
 
-	seen *roaring64.Bitmap
+	seen   *posting.List
+	strkey bool
+	strmap *strMapSnapshot
 }
 
-func (db *DB[K, V]) newQueryCursor(out []K, skip, need uint64, all bool, seen *roaring64.Bitmap) queryCursor[K, V] {
+func (qv *queryView[K, V]) newQueryCursor(out []K, skip, need uint64, all bool, seen *posting.List) queryCursor[K, V] {
 	return queryCursor[K, V]{
-		db:   db,
-		out:  out,
-		skip: skip,
-		need: need,
-		all:  all,
-		seen: seen,
+		out:    out,
+		skip:   skip,
+		need:   need,
+		all:    all,
+		seen:   seen,
+		strkey: qv.strkey,
+		strmap: qv.strmapView,
 	}
 }
 
@@ -36,7 +41,15 @@ func (c *queryCursor[K, V]) emit(idx uint64) bool {
 		c.skip--
 		return false
 	}
-	c.out = append(c.out, c.db.idFromIdxNoLock(idx))
+	if c.strkey {
+		s, ok := c.strmap.getStringNoLock(idx)
+		if !ok {
+			panic("rbi: no string key associated with snapshot idx")
+		}
+		c.out = append(c.out, *(*K)(unsafe.Pointer(&s)))
+	} else {
+		c.out = append(c.out, *(*K)(unsafe.Pointer(&idx)))
+	}
 	if !c.all {
 		c.need--
 		return c.need == 0
@@ -44,12 +57,15 @@ func (c *queryCursor[K, V]) emit(idx uint64) bool {
 	return false
 }
 
-func (c *queryCursor[K, V]) emitBitmap(bm *roaring64.Bitmap) bool {
-	if bm == nil || bm.IsEmpty() {
+func (c *queryCursor[K, V]) emitPosting(ids posting.List) bool {
+	if ids.IsEmpty() {
 		return false
 	}
-	it := bm.Iterator()
-	defer releaseRoaringBitmapIterator(it)
+	if idx, ok := ids.TrySingle(); ok {
+		return c.emit(idx)
+	}
+	it := ids.Iter()
+	defer it.Release()
 	for it.HasNext() {
 		if c.emit(it.Next()) {
 			return true

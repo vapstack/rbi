@@ -65,10 +65,10 @@ type plannerTraceStats struct {
 	maxEstimatedRows     uint64
 	totalEstimatedCost   float64
 	totalFallbackCost    float64
-	totalBitmapMats      uint64
-	maxBitmapMats        uint64
-	totalBitmapExact     uint64
-	maxBitmapExact       uint64
+	totalPostingMats     uint64
+	maxPostingMats       uint64
+	totalPostingExact    uint64
+	maxPostingExact      uint64
 	totalOrderScanWidth  uint64
 	maxOrderScanWidth    uint64
 	totalDedupeCount     uint64
@@ -115,10 +115,10 @@ type plannerTraceScopeReport struct {
 	MaxEstimatedRows  uint64            `json:"max_estimated_rows"`
 	AvgEstimatedCost  float64           `json:"avg_estimated_cost"`
 	AvgFallbackCost   float64           `json:"avg_fallback_cost"`
-	AvgBitmapMats     float64           `json:"avg_bitmap_materializations"`
-	MaxBitmapMats     uint64            `json:"max_bitmap_materializations"`
-	AvgBitmapExact    float64           `json:"avg_bitmap_exact_filters"`
-	MaxBitmapExact    uint64            `json:"max_bitmap_exact_filters"`
+	AvgPostingMats    float64           `json:"avg_posting_materializations"`
+	MaxPostingMats    uint64            `json:"max_posting_materializations"`
+	AvgPostingExact   float64           `json:"avg_posting_exact_filters"`
+	MaxPostingExact   uint64            `json:"max_posting_exact_filters"`
 	AvgOrderScanWidth float64           `json:"avg_order_scan_width"`
 	MaxOrderScanWidth uint64            `json:"max_order_scan_width"`
 	AvgDedupeCount    float64           `json:"avg_dedupe_count"`
@@ -156,8 +156,8 @@ type plannerTraceSample struct {
 	RowsExamined        uint64 `json:"rows_examined,omitempty"`
 	RowsMatched         uint64 `json:"rows_matched,omitempty"`
 	RowsReturned        uint64 `json:"rows_returned,omitempty"`
-	BitmapMats          uint64 `json:"bitmap_materializations,omitempty"`
-	BitmapExactFilters  uint64 `json:"bitmap_exact_filters,omitempty"`
+	PostingMats         uint64 `json:"posting_materializations,omitempty"`
+	PostingExactFilters uint64 `json:"posting_exact_filters,omitempty"`
 	OrderIndexScanWidth uint64 `json:"order_index_scan_width,omitempty"`
 	DedupeCount         uint64 `json:"dedupe_count,omitempty"`
 	EarlyStopReason     string `json:"early_stop_reason,omitempty"`
@@ -358,13 +358,13 @@ func (s *plannerTraceStats) observe(ev rbi.TraceEvent) {
 	}
 	s.totalEstimatedCost += ev.EstimatedCost
 	s.totalFallbackCost += ev.FallbackCost
-	s.totalBitmapMats += ev.BitmapMaterializations
-	if ev.BitmapMaterializations > s.maxBitmapMats {
-		s.maxBitmapMats = ev.BitmapMaterializations
+	s.totalPostingMats += ev.PostingMaterializations
+	if ev.PostingMaterializations > s.maxPostingMats {
+		s.maxPostingMats = ev.PostingMaterializations
 	}
-	s.totalBitmapExact += ev.BitmapExactFilters
-	if ev.BitmapExactFilters > s.maxBitmapExact {
-		s.maxBitmapExact = ev.BitmapExactFilters
+	s.totalPostingExact += ev.PostingExactFilters
+	if ev.PostingExactFilters > s.maxPostingExact {
+		s.maxPostingExact = ev.PostingExactFilters
 	}
 	s.totalOrderScanWidth += ev.OrderIndexScanWidth
 	if ev.OrderIndexScanWidth > s.maxOrderScanWidth {
@@ -454,10 +454,10 @@ func (s *plannerTraceStats) report() plannerTraceScopeReport {
 		MaxEstimatedRows:  s.maxEstimatedRows,
 		AvgEstimatedCost:  s.totalEstimatedCost / n,
 		AvgFallbackCost:   s.totalFallbackCost / n,
-		AvgBitmapMats:     float64(s.totalBitmapMats) / n,
-		MaxBitmapMats:     s.maxBitmapMats,
-		AvgBitmapExact:    float64(s.totalBitmapExact) / n,
-		MaxBitmapExact:    s.maxBitmapExact,
+		AvgPostingMats:    float64(s.totalPostingMats) / n,
+		MaxPostingMats:    s.maxPostingMats,
+		AvgPostingExact:   float64(s.totalPostingExact) / n,
+		MaxPostingExact:   s.maxPostingExact,
 		AvgOrderScanWidth: float64(s.totalOrderScanWidth) / n,
 		MaxOrderScanWidth: s.maxOrderScanWidth,
 		AvgDedupeCount:    float64(s.totalDedupeCount) / n,
@@ -531,8 +531,8 @@ func plannerTraceSampleFromEvent(info plannerTraceScopeInfo, query string, ev rb
 		RowsExamined:        ev.RowsExamined,
 		RowsMatched:         ev.RowsMatched,
 		RowsReturned:        ev.RowsReturned,
-		BitmapMats:          ev.BitmapMaterializations,
-		BitmapExactFilters:  ev.BitmapExactFilters,
+		PostingMats:         ev.PostingMaterializations,
+		PostingExactFilters: ev.PostingExactFilters,
 		OrderIndexScanWidth: ev.OrderIndexScanWidth,
 		DedupeCount:         ev.DedupeCount,
 		EarlyStopReason:     ev.EarlyStopReason,

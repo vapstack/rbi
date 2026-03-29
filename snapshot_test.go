@@ -1,53 +1,18 @@
 package rbi
 
 import (
+	"errors"
 	"fmt"
-	"path/filepath"
+	"runtime"
 	"slices"
-	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
-	"time"
+	"unsafe"
 
 	"github.com/vapstack/qx"
-	"github.com/vapstack/rbi/internal/roaring64"
-	"go.etcd.io/bbolt"
+	"github.com/vapstack/rbi/internal/posting"
 )
-
-func waitForSnapshotState(t *testing.T, timeout time.Duration, reason string, fn func() bool) {
-	t.Helper()
-	timeout = snapshotTestWaitTimeout(timeout)
-	deadline := time.Now().Add(timeout)
-	for {
-		if fn() {
-			return
-		}
-		if time.Now().After(deadline) {
-			break
-		}
-		time.Sleep(2 * time.Millisecond)
-	}
-	// One final check avoids edge misses right at deadline.
-	if fn() {
-		return
-	}
-	t.Fatalf("timeout waiting for snapshot state: %s", reason)
-}
-
-func snapshotTestWaitTimeout(timeout time.Duration) time.Duration {
-	if timeout <= 0 {
-		return timeout
-	}
-	if !testRaceEnabled {
-		return timeout
-	}
-
-	scaled := timeout * 4
-	const minRaceTimeout = 2 * time.Second
-	if scaled < minRaceTimeout {
-		return minRaceTimeout
-	}
-	return scaled
-}
 
 func mustCurrentBucketSequence(t *testing.T, db *DB[uint64, Rec]) uint64 {
 	t.Helper()
@@ -57,6 +22,18 @@ func mustCurrentBucketSequence(t *testing.T, db *DB[uint64, Rec]) uint64 {
 		t.Fatalf("currentBucketSequence: %v", err)
 	}
 	return seq
+}
+
+func snapshotPostingContainsAll(t *testing.T, ids posting.List, want ...uint64) {
+	t.Helper()
+	if ids.IsEmpty() {
+		t.Fatalf("posting is empty")
+	}
+	for _, id := range want {
+		if !ids.Contains(id) {
+			t.Fatalf("posting is missing id=%d", id)
+		}
+	}
 }
 
 func TestSnapshotSequence_PublishedOnWrite(t *testing.T) {
@@ -79,7 +56,7 @@ func TestSnapshotSequence_PublishedOnWrite(t *testing.T) {
 	}
 }
 
-func TestSnapshotSequence_PreviousTxRemainsPinable(t *testing.T) {
+func TestSnapshotSequence_PreviousSnapshotIsRetiredAfterPublishWithoutPins(t *testing.T) {
 	db, _ := openTempDBUint64(t)
 
 	if err := db.Set(1, &Rec{Name: "seed", Age: 10}); err != nil {
@@ -97,10 +74,8 @@ func TestSnapshotSequence_PreviousTxRemainsPinable(t *testing.T) {
 		t.Fatalf("latest sequence did not advance: old=%d latest=%d", oldSequence, latest)
 	}
 
-	if _, ref, ok := db.pinSnapshotRefBySeq(oldSequence); !ok {
-		t.Fatalf("previous snapshot disappeared: sequence=%d", oldSequence)
-	} else {
-		db.unpinSnapshotRef(ref)
+	if _, _, ok := db.pinSnapshotRefBySeq(oldSequence); ok {
+		t.Fatalf("previous snapshot unexpectedly remained pinable: sequence=%d", oldSequence)
 	}
 }
 
@@ -117,7 +92,7 @@ func TestSnapshotSequence_AdvancesOnWrite(t *testing.T) {
 	}
 }
 
-func TestSnapshotDelta_PublishedOnSet(t *testing.T) {
+func TestSnapshot_PublishedAsFullState(t *testing.T) {
 	db, _ := openTempDBUint64(t)
 
 	if err := db.Set(1, &Rec{Name: "alice", Tags: []string{"go", "db"}}); err != nil {
@@ -125,1879 +100,1859 @@ func TestSnapshotDelta_PublishedOnSet(t *testing.T) {
 	}
 
 	s := db.getSnapshot()
-	if s.indexDeltaCount() == 0 {
-		t.Fatalf("index delta is empty")
-	}
-	if s.universeAdd == nil || !s.universeAdd.Contains(1) {
-		t.Fatalf("universeAdd must contain id=1")
-	}
+	nameIDs := s.fieldLookupPostingRetained("name", "alice")
+	snapshotPostingContainsAll(t, nameIDs, 1)
 
-	nameDelta := s.fieldDelta("name")
-	if nameDelta == nil {
-		t.Fatalf("name delta is nil")
-	}
-	nameEntry, ok := nameDelta.get("alice")
-	if !ok {
-		t.Fatalf("name/alice delta is missing")
-	}
-	if !deltaEntryAddContains(nameEntry, 1) {
-		t.Fatalf("name add delta must contain id=1")
-	}
+	tagsIDs := s.fieldLookupPostingRetained("tags", "go")
+	snapshotPostingContainsAll(t, tagsIDs, 1)
 
-	tagsDelta := s.fieldDelta("tags")
-	if tagsDelta == nil {
-		t.Fatalf("tags delta is nil")
-	}
-	e, ok := tagsDelta.get("go")
-	if !ok || !deltaEntryAddContains(e, 1) {
-		t.Fatalf("tags/go add delta must contain id=1")
-	}
-	e, ok = tagsDelta.get("db")
-	if !ok || !deltaEntryAddContains(e, 1) {
-		t.Fatalf("tags/db add delta must contain id=1")
-	}
-
-	if s.lenDeltaCount() == 0 {
-		t.Fatalf("len delta is empty")
-	}
-	tagsLenDelta := s.lenFieldDelta("tags")
-	if tagsLenDelta == nil {
-		t.Fatalf("tags len delta is nil")
-	}
-	key := uint64ByteStr(2)
-	e, ok = tagsLenDelta.get(key)
-	if !ok || !deltaEntryAddContains(e, 1) {
-		t.Fatalf("tags len add delta must contain id=1")
-	}
+	lenIDs := db.lenFieldOverlay("tags").lookupPostingRetained(uint64ByteStr(2))
+	snapshotPostingContainsAll(t, lenIDs, 1)
 }
 
-func TestSnapshotDelta_UpdateNeutralizesLenNoop(t *testing.T) {
+func TestSnapshot_PreviousSnapshotRemainsImmutable(t *testing.T) {
 	db, _ := openTempDBUint64(t)
 
-	if err := db.Set(1, &Rec{Name: "alice", Tags: []string{"go"}}); err != nil {
+	if err := db.Set(1, &Rec{Name: "alice"}); err != nil {
 		t.Fatalf("seed Set: %v", err)
 	}
-	if err := db.Set(1, &Rec{Name: "alice", Tags: []string{"rust"}}); err != nil {
-		t.Fatalf("update Set: %v", err)
+	s1 := db.getSnapshot()
+
+	if err := db.Set(2, &Rec{Name: "bob"}); err != nil {
+		t.Fatalf("second Set: %v", err)
+	}
+	s2 := db.getSnapshot()
+	if s1 == s2 {
+		t.Fatalf("expected a newly published snapshot instance")
 	}
 
-	s := db.getSnapshot()
-	if s.indexDeltaCount() == 0 {
-		t.Fatalf("index delta is empty")
-	}
-	tagsDelta := s.fieldDelta("tags")
-	if tagsDelta == nil {
-		t.Fatalf("tags delta is nil")
-	}
-	e, _ := tagsDelta.get("go")
-	if !deltaEntryIsEmpty(e) {
-		t.Fatalf("tags/go must be neutralized in accumulated delta")
-	}
-	e, ok := tagsDelta.get("rust")
-	if !ok || !deltaEntryAddContains(e, 1) {
-		t.Fatalf("tags/rust add delta must contain id=1")
+	oldBob := s1.fieldLookupPostingRetained("name", "bob")
+	if !oldBob.IsEmpty() {
+		t.Fatalf("old snapshot unexpectedly sees future write")
 	}
 
-	// net state relative to empty base still has id=1 in len=1 bucket.
-	d := s.lenFieldDelta("tags")
-	if d == nil {
-		t.Fatalf("tags len delta is nil")
-	}
-	keyLen1 := uint64ByteStr(1)
-	e, ok = d.get(keyLen1)
-	if !ok || !deltaEntryAddContains(e, 1) {
-		t.Fatalf("expected len(tags)=1 add delta to contain id=1, got entry=%+v", e)
-	}
-}
-
-func TestSnapshotDelta_WritePublishesDeltaByDefault(t *testing.T) {
-	db, _ := openTempDBUint64(t)
-	if err := db.Set(1, &Rec{Name: "alice", Age: 10}); err != nil {
-		t.Fatalf("Set: %v", err)
-	}
-	s := db.getSnapshot()
-	if s.indexDeltaCount() == 0 && s.lenDeltaCount() == 0 && (s.universeAdd == nil || s.universeAdd.IsEmpty()) {
-		t.Fatalf("expected snapshot delta to be present after write")
-	}
+	newBob := s2.fieldLookupPostingRetained("name", "bob")
+	snapshotPostingContainsAll(t, newBob, 2)
 }
 
 func TestSnapshotStrMap_OldSnapshotDoesNotSeeFutureKeyMappings(t *testing.T) {
 	db, _ := openTempDBString(t)
 
-	if err := db.Set("k1", &Rec{Name: "a", Age: 10}); err != nil {
-		t.Fatalf("Set k1: %v", err)
-	}
-	oldSnap := db.getSnapshot()
-	if oldSnap == nil || oldSnap.strmap == nil {
-		t.Fatalf("old snapshot strmap is nil")
-	}
-	if _, ok := oldSnap.strmap.getIdxNoLock("k1"); !ok {
-		t.Fatalf("old snapshot must contain k1 mapping")
-	}
-	if _, ok := oldSnap.strmap.getIdxNoLock("k2"); ok {
-		t.Fatalf("old snapshot must not contain k2 mapping before write")
-	}
-
-	if err := db.Set("k2", &Rec{Name: "b", Age: 20}); err != nil {
-		t.Fatalf("Set k2: %v", err)
-	}
-
-	if _, ok := oldSnap.strmap.getIdxNoLock("k2"); ok {
-		t.Fatalf("old snapshot unexpectedly observed future mapping k2")
-	}
-
-	newSnap := db.getSnapshot()
-	if newSnap == nil || newSnap.strmap == nil {
-		t.Fatalf("new snapshot strmap is nil")
-	}
-	if _, ok := newSnap.strmap.getIdxNoLock("k2"); !ok {
-		t.Fatalf("new snapshot must contain k2 mapping")
-	}
-}
-
-func TestSnapshotStrMap_CompactsOverlayDepth(t *testing.T) {
-	db, _ := openTempDBString(t)
-	db.strmap.compactAt = 2
-
-	if err := db.Set("k1", &Rec{Name: "a", Age: 10}); err != nil {
-		t.Fatalf("Set k1: %v", err)
+	if err := db.Set("k1", &Rec{Name: "one"}); err != nil {
+		t.Fatalf("Set(k1): %v", err)
 	}
 	s1 := db.getSnapshot()
-	if s1 == nil || s1.strmap == nil {
-		t.Fatalf("snapshot after k1 is nil")
-	}
-	if s1.strmap.depth < 1 {
-		t.Fatalf("unexpected snapshot depth after k1: %d", s1.strmap.depth)
-	}
-	if s1.strmap.DenseStrs != nil {
-		t.Fatalf("first snapshot should stay delta-backed before compaction")
-	}
-	if len(s1.strmap.Strs) == 0 {
-		t.Fatalf("first snapshot must contain sparse delta entries")
+	idx1, ok := s1.strmap.getIdxNoLock("k1")
+	if !ok || idx1 == 0 {
+		t.Fatalf("expected k1 in first snapshot")
 	}
 
-	if err := db.Set("k2", &Rec{Name: "b", Age: 20}); err != nil {
-		t.Fatalf("Set k2: %v", err)
+	if err := db.Set("k2", &Rec{Name: "two"}); err != nil {
+		t.Fatalf("Set(k2): %v", err)
 	}
 	s2 := db.getSnapshot()
-	if s2 == nil || s2.strmap == nil {
-		t.Fatalf("snapshot after k2 is nil")
+	if _, ok := s1.strmap.getIdxNoLock("k2"); ok {
+		t.Fatalf("old snapshot unexpectedly sees k2 mapping")
 	}
-	if s2.strmap.depth != 1 {
-		t.Fatalf("expected compacted depth=1, got %d", s2.strmap.depth)
+
+	idx2, ok := s2.strmap.getIdxNoLock("k2")
+	if !ok || idx2 == 0 {
+		t.Fatalf("expected k2 in latest snapshot")
 	}
-	if _, ok := s2.strmap.getIdxNoLock("k1"); !ok {
-		t.Fatalf("compacted snapshot lost k1 mapping")
+	if got, ok := s1.strmap.getStringNoLock(idx1); !ok || got != "k1" {
+		t.Fatalf("old snapshot lost k1 mapping: got=%q ok=%v", got, ok)
 	}
-	if _, ok := s2.strmap.getIdxNoLock("k2"); !ok {
-		t.Fatalf("compacted snapshot lost k2 mapping")
-	}
-	if len(s2.strmap.DenseStrs) == 0 {
-		t.Fatalf("compacted snapshot must be dense-backed")
-	}
-	if s2.strmap.Strs != nil {
-		t.Fatalf("compacted snapshot should not keep sparse str map")
+	if got, ok := s2.strmap.getStringNoLock(idx2); !ok || got != "k2" {
+		t.Fatalf("latest snapshot missing k2 mapping: got=%q ok=%v", got, ok)
 	}
 }
 
-func TestSnapshotStrMap_DeltaOverDenseBaseLookup(t *testing.T) {
+func TestSnapshotStrMap_LatestSnapshotRetainsOldMappingsAcrossChain(t *testing.T) {
 	db, _ := openTempDBString(t)
-	db.strmap.compactAt = 3
 
-	if err := db.Set("k1", &Rec{Name: "a", Age: 10}); err != nil {
-		t.Fatalf("Set k1: %v", err)
+	if err := db.Set("k1", &Rec{Name: "one"}); err != nil {
+		t.Fatalf("Set(k1): %v", err)
 	}
-	if err := db.Set("k2", &Rec{Name: "b", Age: 11}); err != nil {
-		t.Fatalf("Set k2: %v", err)
-	}
-	if err := db.Set("k3", &Rec{Name: "c", Age: 12}); err != nil {
-		t.Fatalf("Set k3: %v", err)
-	}
-	s3 := db.getSnapshot()
-	if s3 == nil || s3.strmap == nil {
-		t.Fatalf("snapshot after k3 is nil")
-	}
-	if s3.strmap.depth != 1 {
-		t.Fatalf("expected compacted depth=1 after k3, got %d", s3.strmap.depth)
-	}
-	if s3.strmap.DenseStrs == nil {
-		t.Fatalf("snapshot after compaction must be dense-backed")
+	idx1, ok := db.getSnapshot().strmap.getIdxNoLock("k1")
+	if !ok || idx1 == 0 {
+		t.Fatalf("expected k1 mapping in first snapshot")
 	}
 
-	if err := db.Set("k4", &Rec{Name: "d", Age: 13}); err != nil {
-		t.Fatalf("Set k4: %v", err)
-	}
-	s4 := db.getSnapshot()
-	if s4 == nil || s4.strmap == nil {
-		t.Fatalf("snapshot after k4 is nil")
-	}
-	if s4.strmap.depth != 2 {
-		t.Fatalf("expected delta-over-dense chain depth=2, got %d", s4.strmap.depth)
-	}
-	if s4.strmap.DenseStrs != nil {
-		t.Fatalf("top snapshot layer should stay sparse delta-backed")
-	}
-	if len(s4.strmap.Strs) == 0 {
-		t.Fatalf("top snapshot delta layer must contain sparse entries")
-	}
-	if s4.strmap.base == nil || s4.strmap.base.DenseStrs == nil {
-		t.Fatalf("base layer must be dense-backed")
+	for i := 2; i <= 12; i++ {
+		key := fmt.Sprintf("k%d", i)
+		if err := db.Set(key, &Rec{Name: key}); err != nil {
+			t.Fatalf("Set(%s): %v", key, err)
+		}
 	}
 
-	idx1, ok := s4.strmap.getIdxNoLock("k1")
-	if !ok {
-		t.Fatalf("missing idx for k1")
+	latest := db.getSnapshot().strmap
+	if got, ok := latest.getIdxNoLock("k1"); !ok || got != idx1 {
+		t.Fatalf("latest snapshot lost k1 idx: got=%d ok=%v want=%d", got, ok, idx1)
 	}
-	idx4, ok := s4.strmap.getIdxNoLock("k4")
-	if !ok {
-		t.Fatalf("missing idx for k4")
-	}
-
-	if got, ok := s4.strmap.getStringNoLock(idx1); !ok || got != "k1" {
-		t.Fatalf("idx1 lookup mismatch: got=%q ok=%v", got, ok)
-	}
-	if got, ok := s4.strmap.getStringNoLock(idx4); !ok || got != "k4" {
-		t.Fatalf("idx4 lookup mismatch: got=%q ok=%v", got, ok)
+	if got, ok := latest.getStringNoLock(idx1); !ok || got != "k1" {
+		t.Fatalf("latest snapshot lost k1 reverse mapping: got=%q ok=%v", got, ok)
 	}
 }
 
-func TestStrMapSnapshot_DenseLookupHonorsUsedBits(t *testing.T) {
-	s := &strMapSnapshot{
-		Next:      3,
-		DenseStrs: []string{"", "k1", "", ""},
-		DenseUsed: []bool{false, true, false, true},
+func TestSnapshot_EmptyBaseWriteInvalidatesTouchedMaterializedPredicateCache(t *testing.T) {
+	db, _ := openTempDBUint64(t)
+
+	expr := qx.Expr{Op: qx.OpPREFIX, Field: "email", Value: "user"}
+	cacheKey := db.materializedPredCacheKey(expr)
+	if cacheKey == "" {
+		t.Fatalf("expected materialized predicate cache key for prefix predicate")
 	}
 
-	if got, ok := s.getStringNoLock(1); !ok || got != "k1" {
-		t.Fatalf("idx=1 mismatch: got=%q ok=%v", got, ok)
+	emptySnap := db.getSnapshot()
+	emptySnap.storeMaterializedPred(cacheKey, posting.List{})
+	if _, ok := emptySnap.loadMaterializedPred(cacheKey); !ok {
+		t.Fatalf("expected cached negative predicate result on empty snapshot")
 	}
-	if got, ok := s.getStringNoLock(2); ok || got != "" {
-		t.Fatalf("idx=2 should be missing hole, got=%q ok=%v", got, ok)
+
+	if err := db.Set(1, &Rec{
+		Name:  "alice",
+		Email: "user1@example.com",
+	}); err != nil {
+		t.Fatalf("Set(first row): %v", err)
 	}
-	if got, ok := s.getStringNoLock(3); !ok || got != "" {
-		t.Fatalf("idx=3 should resolve to empty-string key, got=%q ok=%v", got, ok)
+
+	if _, ok := db.getSnapshot().loadMaterializedPred(cacheKey); ok {
+		t.Fatalf("expected first write from empty base to invalidate touched predicate cache")
+	}
+
+	items, err := db.Query(qx.Query(expr))
+	if err != nil {
+		t.Fatalf("Query(prefix): %v", err)
+	}
+	if len(items) != 1 || items[0] == nil || items[0].Email != "user1@example.com" {
+		t.Fatalf("unexpected query result after empty-base cache invalidation: %#v", items)
 	}
 }
 
-func TestSnapshotDelta_StoreIndexPersistsOverlayState(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "persist_snapshot_delta.db")
+func TestSnapshot_EmptyBaseBatchSetBuildsDistinctLenIndex(t *testing.T) {
+	db, _ := openTempDBUint64(t, snapshotExtOptions())
 
-	db, raw := openBoltAndNew[uint64, Rec](t, path)
-
-	if err := db.Set(1, &Rec{Name: "alice", Age: 10}); err != nil {
-		_ = db.Close()
-		t.Fatalf("Set alice: %v", err)
+	ids := []uint64{1, 2, 3, 4}
+	vals := []*Rec{
+		{Name: "u1", Tags: nil},
+		{Name: "u2", Tags: []string{}},
+		{Name: "u3", Tags: []string{"go", "go"}},
+		{Name: "u4", Tags: []string{"go", "db", "db"}},
 	}
-	if err := db.Set(1, &Rec{Name: "bob", Age: 11}); err != nil {
-		_ = db.Close()
-		t.Fatalf("Set bob: %v", err)
-	}
-	if err := db.Close(); err != nil {
-		t.Fatalf("Close 1: %v", err)
-	}
-	if err := raw.Close(); err != nil {
-		t.Fatalf("raw close 1: %v", err)
+	if err := db.BatchSet(ids, vals); err != nil {
+		t.Fatalf("BatchSet: %v", err)
 	}
 
-	opts := Options{}
-	db2, raw2 := openBoltAndNew[uint64, Rec](t, path, opts)
-	defer func() {
-		_ = db2.Close()
-		_ = raw2.Close()
+	s := db.getSnapshot()
+	if s.lenZeroComplement["tags"] {
+		t.Fatalf("unexpected zero-complement mode for balanced empty/non-empty tags")
+	}
+	if !snapshotExtLenContainsID(t, s, "tags", 0, 1) || !snapshotExtLenContainsID(t, s, "tags", 0, 2) {
+		t.Fatalf("expected len=0 bucket to contain ids 1 and 2")
+	}
+	if !snapshotExtLenContainsID(t, s, "tags", 1, 3) {
+		t.Fatalf("expected len=1 bucket to contain id 3")
+	}
+	if !snapshotExtLenContainsID(t, s, "tags", 2, 4) {
+		t.Fatalf("expected len=2 bucket to contain id 4")
+	}
+
+	emptyQ := qx.Query(qx.EQ("tags", []string{}))
+	gotEmpty, err := db.QueryKeys(emptyQ)
+	if err != nil {
+		t.Fatalf("QueryKeys(empty tags): %v", err)
+	}
+	if want := []uint64{1, 2}; !slices.Equal(gotEmpty, want) {
+		t.Fatalf("unexpected empty-tags result: got=%v want=%v", gotEmpty, want)
+	}
+
+	orderQ := qx.Query().ByArrayCount("tags", qx.ASC)
+	gotOrder, err := db.QueryKeys(orderQ)
+	if err != nil {
+		t.Fatalf("QueryKeys(array count): %v", err)
+	}
+	wantOrder, err := expectedKeysUint64(t, db, orderQ)
+	if err != nil {
+		t.Fatalf("expectedKeysUint64(array count): %v", err)
+	}
+	if !slices.Equal(gotOrder, wantOrder) {
+		t.Fatalf("unexpected array-count order: got=%v want=%v", gotOrder, wantOrder)
+	}
+}
+
+func TestSnapshot_UnpinPrunesRegistryWhenLastReaderExits(t *testing.T) {
+	db, _ := openTempDBUint64(t)
+
+	if err := db.Set(1, &Rec{Name: "seed", Age: 10}); err != nil {
+		t.Fatalf("seed Set: %v", err)
+	}
+	oldSeq := db.getSnapshot().seq
+
+	if _, ref, ok := db.pinSnapshotRefBySeq(oldSeq); !ok {
+		t.Fatalf("expected to pin previous snapshot")
+	} else {
+		if err := db.Set(2, &Rec{Name: "next", Age: 20}); err != nil {
+			t.Fatalf("second Set: %v", err)
+		}
+
+		latestSeq := db.getSnapshot().seq
+		db.snapshot.mu.RLock()
+		_, oldPresentWhilePinned := db.snapshot.bySeq[oldSeq]
+		registryWhilePinned := len(db.snapshot.bySeq)
+		db.snapshot.mu.RUnlock()
+		if !oldPresentWhilePinned || registryWhilePinned < 2 {
+			t.Fatalf("expected pinned snapshot to keep registry entry alive before unpin")
+		}
+
+		db.unpinSnapshotRef(oldSeq, ref)
+
+		db.snapshot.mu.RLock()
+		_, oldPresentAfterUnpin := db.snapshot.bySeq[oldSeq]
+		_, latestPresent := db.snapshot.bySeq[latestSeq]
+		registryAfterUnpin := len(db.snapshot.bySeq)
+		db.snapshot.mu.RUnlock()
+
+		if oldPresentAfterUnpin {
+			t.Fatalf("expected old snapshot to be pruned after last unpin")
+		}
+		if !latestPresent {
+			t.Fatalf("expected latest snapshot to remain registered after prune")
+		}
+		if registryAfterUnpin != 1 {
+			t.Fatalf("expected registry to retain only latest snapshot after idle unpin, got=%d", registryAfterUnpin)
+		}
+	}
+}
+
+/**/
+
+func snapshotExtOptions() Options {
+	return Options{
+		AutoBatchMax:    1,
+		AnalyzeInterval: -1,
+	}
+}
+
+func snapshotExtPosting(ids ...uint64) posting.List {
+	var out posting.List
+	for _, id := range ids {
+		out.Add(id)
+	}
+	return out
+}
+
+func snapshotExtSyncMapLen(m *sync.Map) int {
+	if m == nil {
+		return 0
+	}
+	var n int
+	m.Range(func(_, _ any) bool {
+		n++
+		return true
+	})
+	return n
+}
+
+func snapshotExtStorage(keys ...string) fieldIndexStorage {
+	if len(keys) == 0 {
+		return fieldIndexStorage{}
+	}
+	m := getPostingMap()
+	for i, key := range keys {
+		m[key] = (posting.List{}).BuildAdded(uint64(i + 1))
+	}
+	return newFlatFieldIndexStorageFromPostingMapOwned(m, false)
+}
+
+func snapshotExtFieldContainsID(tb testing.TB, s *indexSnapshot, field, key string, id uint64) bool {
+	tb.Helper()
+	return s.fieldLookupPostingRetained(field, key).Contains(id)
+}
+
+func snapshotExtNilContainsID(tb testing.TB, s *indexSnapshot, field string, id uint64) bool {
+	tb.Helper()
+	return newFieldOverlay(s.nilFieldIndexSlice(field)).lookupPostingRetained(nilIndexEntryKey).Contains(id)
+}
+
+func snapshotExtLenContainsID(tb testing.TB, s *indexSnapshot, field string, ln uint64, id uint64) bool {
+	tb.Helper()
+	return newFieldOverlayStorage(s.lenIndex[field]).lookupPostingRetained(uint64ByteStr(ln)).Contains(id)
+}
+
+func snapshotExtLenNonEmptyContainsID(tb testing.TB, s *indexSnapshot, field string, id uint64) bool {
+	tb.Helper()
+	return newFieldOverlayStorage(s.lenIndex[field]).lookupPostingRetained(lenIndexNonEmptyKey).Contains(id)
+}
+
+func snapshotExtRunConcurrent(n int, fn func(i int)) {
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	wg.Add(n)
+	for i := 0; i < n; i++ {
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			runtime.Gosched()
+			fn(i)
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+}
+
+func snapshotExtEvalNumericRangeBuckets(t *testing.T, db *DB[uint64, Rec], expr qx.Expr) {
+	t.Helper()
+
+	fm := db.fields[expr.Field]
+	if fm == nil {
+		t.Fatalf("expected %q field metadata", expr.Field)
+	}
+	ov := db.fieldOverlay(expr.Field)
+	if !ov.hasData() {
+		t.Fatalf("expected %q field index data", expr.Field)
+	}
+
+	key, isSlice, isNil, err := db.exprValueToIdxScalar(expr)
+	if err != nil {
+		t.Fatalf("exprValueToIdxScalar(%s): %v", expr.Field, err)
+	}
+	if isSlice || isNil {
+		t.Fatalf("unexpected scalar flags: isSlice=%v isNil=%v", isSlice, isNil)
+	}
+
+	rb, ok := rangeBoundsForOp(expr.Op, key)
+	if !ok {
+		t.Fatalf("rangeBoundsForOp(%v) failed", expr.Op)
+	}
+
+	out, ok := db.tryEvalNumericRangeBuckets(expr.Field, fm, ov, ov.rangeForBounds(rb))
+	if !ok {
+		t.Fatalf("expected numeric range bucket path for %q", expr.Field)
+	}
+	out.release()
+}
+
+type snapshotReorderedSliceRec struct {
+	Tags   []string `db:"tags"`
+	Scores []int    `db:"scores"`
+}
+
+func TestSnapshotExt_CollectSnapshotBatchDiff_ReorderedSliceValuesProduceNoDeltas(t *testing.T) {
+	db := openTempDBUint64Reflect[snapshotReorderedSliceRec](t, "snapshot_reordered_slice_diff.db", snapshotExtOptions())
+
+	oldVal := &snapshotReorderedSliceRec{
+		Tags:   []string{"go", "db", "go"},
+		Scores: []int{3, 1, 3},
+	}
+	newVal := &snapshotReorderedSliceRec{
+		Tags:   []string{"db", "go"},
+		Scores: []int{1, 3},
+	}
+
+	for _, field := range []string{"tags", "scores"} {
+		acc, ok := db.indexedFieldByName[field]
+		if !ok {
+			t.Fatalf("missing accessor for %q", field)
+		}
+
+		var state snapshotFieldBatchState
+		acc.collectSnapshotBatchDiff(1, unsafe.Pointer(oldVal), unsafe.Pointer(newVal), false, &state)
+
+		if state.changed {
+			t.Fatalf("%s: reorder-only diff unexpectedly marked field as changed", field)
+		}
+		if state.index != nil {
+			t.Fatalf("%s: reorder-only diff produced string deltas: %#v", field, state.index)
+		}
+		if state.fixed != nil {
+			t.Fatalf("%s: reorder-only diff produced fixed deltas: %#v", field, state.fixed)
+		}
+		if state.nils != nil {
+			t.Fatalf("%s: reorder-only diff produced nil deltas: %#v", field, state.nils)
+		}
+		if state.lengths != nil {
+			t.Fatalf("%s: reorder-only diff produced len deltas: %#v", field, state.lengths)
+		}
+	}
+}
+
+func TestSnapshotExt_PublishSameSeqReusesRefAndUpdatesCurrent(t *testing.T) {
+	db, _ := openTempDBUint64(t, snapshotExtOptions())
+
+	first := &indexSnapshot{seq: 7, universe: posting.List{}}
+	db.publishSnapshotRef(first)
+
+	gotFirst, ref, ok := db.pinSnapshotRefBySeq(first.seq)
+	if !ok || gotFirst != first {
+		t.Fatalf("expected first snapshot to be pinnable")
+	}
+
+	second := &indexSnapshot{seq: first.seq, universe: posting.List{}}
+	db.publishSnapshotRef(second)
+
+	if got := db.getSnapshot(); got != second {
+		t.Fatalf("expected current snapshot to be replaced on same-seq publish")
+	}
+
+	db.snapshot.mu.RLock()
+	held := db.snapshot.bySeq[first.seq]
+	registrySize := len(db.snapshot.bySeq)
+	db.snapshot.mu.RUnlock()
+
+	if held != ref {
+		t.Fatalf("expected registry entry to reuse existing ref")
+	}
+	if registrySize != 1 {
+		t.Fatalf("expected single registry entry after same-seq publish, got=%d", registrySize)
+	}
+
+	gotSecond, ref2, ok := db.pinSnapshotRefBySeq(first.seq)
+	if !ok || gotSecond != second || ref2 != ref {
+		t.Fatalf("expected second snapshot to reuse same ref")
+	}
+
+	db.unpinSnapshotRef(first.seq, ref)
+	db.unpinSnapshotRef(first.seq, ref2)
+
+	db.snapshot.mu.RLock()
+	_, stillPresent := db.snapshot.bySeq[first.seq]
+	db.snapshot.mu.RUnlock()
+	if !stillPresent {
+		t.Fatalf("expected current same-seq snapshot to remain registered after unpin")
+	}
+}
+
+func TestSnapshotExt_DropStagedSnapshotPinnedEntryBecomesUnpinnableUntilUnpin(t *testing.T) {
+	db, _ := openTempDBUint64(t, snapshotExtOptions())
+
+	staged := &indexSnapshot{seq: 11}
+	db.stageSnapshot(staged)
+
+	got, ref, ok := db.pinSnapshotRefBySeq(staged.seq)
+	if !ok || got != staged {
+		t.Fatalf("expected staged snapshot to be pinnable before drop")
+	}
+
+	db.dropStagedSnapshot(staged.seq)
+
+	db.snapshot.mu.RLock()
+	held := db.snapshot.bySeq[staged.seq]
+	db.snapshot.mu.RUnlock()
+	if held != ref || held == nil || held.snap != nil {
+		t.Fatalf("expected dropped pinned staged snapshot to keep ref but clear snap")
+	}
+
+	if _, _, ok := db.pinSnapshotRefBySeq(staged.seq); ok {
+		t.Fatalf("expected dropped staged snapshot to become unpinnable")
+	}
+
+	db.unpinSnapshotRef(staged.seq, ref)
+
+	db.snapshot.mu.RLock()
+	_, stillPresent := db.snapshot.bySeq[staged.seq]
+	db.snapshot.mu.RUnlock()
+	if stillPresent {
+		t.Fatalf("expected staged snapshot registry entry to be pruned after last unpin")
+	}
+}
+
+func TestSnapshotExt_DropStagedSnapshotUnpinnedDeletesEntry(t *testing.T) {
+	db, _ := openTempDBUint64(t, snapshotExtOptions())
+
+	staged := &indexSnapshot{seq: 12}
+	db.stageSnapshot(staged)
+	db.dropStagedSnapshot(staged.seq)
+
+	db.snapshot.mu.RLock()
+	_, present := db.snapshot.bySeq[staged.seq]
+	db.snapshot.mu.RUnlock()
+	if present {
+		t.Fatalf("expected unpinned staged snapshot to be removed immediately")
+	}
+}
+
+func TestSnapshotExt_RetirePinnedPublishedSnapshotNilsEntryUntilUnpin(t *testing.T) {
+	db, _ := openTempDBUint64(t, snapshotExtOptions())
+
+	first := &indexSnapshot{seq: 1, universe: posting.List{}}
+	second := &indexSnapshot{seq: 2, universe: posting.List{}}
+	db.publishSnapshotRef(first)
+
+	got, ref, ok := db.pinSnapshotRefBySeq(first.seq)
+	if !ok || got != first {
+		t.Fatalf("expected first snapshot to be pinnable")
+	}
+
+	db.publishSnapshotRef(second)
+
+	db.snapshot.mu.RLock()
+	oldHeld := db.snapshot.bySeq[first.seq]
+	_, nextPresent := db.snapshot.bySeq[second.seq]
+	db.snapshot.mu.RUnlock()
+
+	if oldHeld != ref || oldHeld == nil || oldHeld.snap != nil {
+		t.Fatalf("expected pinned retired snapshot to keep ref with nil snap")
+	}
+	if !nextPresent {
+		t.Fatalf("expected latest snapshot to remain registered")
+	}
+	if _, _, ok := db.pinSnapshotRefBySeq(first.seq); ok {
+		t.Fatalf("expected retired pinned snapshot to stop accepting new pins")
+	}
+
+	db.unpinSnapshotRef(first.seq, ref)
+
+	db.snapshot.mu.RLock()
+	_, oldPresent := db.snapshot.bySeq[first.seq]
+	_, nextPresent = db.snapshot.bySeq[second.seq]
+	db.snapshot.mu.RUnlock()
+	if oldPresent {
+		t.Fatalf("expected retired snapshot to be pruned after last unpin")
+	}
+	if !nextPresent {
+		t.Fatalf("expected latest snapshot to survive old-snapshot prune")
+	}
+}
+
+func TestSnapshotExt_SnapshotStatsTracksPinnedRefAcrossPublish(t *testing.T) {
+	db, _ := openTempDBUint64(t, snapshotExtOptions())
+
+	if err := db.Set(1, &Rec{Name: "alice", Age: 30}); err != nil {
+		t.Fatalf("Set(1): %v", err)
+	}
+	oldSeq := db.getSnapshot().seq
+	if _, ref, ok := db.pinSnapshotRefBySeq(oldSeq); !ok {
+		t.Fatalf("expected current snapshot to be pinnable")
+	} else {
+		before := db.SnapshotStats()
+		if before.Sequence != oldSeq || before.RegistrySize != 1 || before.PinnedRefs != 1 {
+			t.Fatalf("unexpected stats before publish: %+v", before)
+		}
+
+		if err := db.Set(2, &Rec{Name: "bob", Age: 20}); err != nil {
+			t.Fatalf("Set(2): %v", err)
+		}
+
+		mid := db.SnapshotStats()
+		if mid.Sequence != db.getSnapshot().seq || mid.Sequence <= oldSeq {
+			t.Fatalf("expected stats sequence to advance after publish: %+v", mid)
+		}
+		if mid.RegistrySize != 2 || mid.PinnedRefs != 1 {
+			t.Fatalf("unexpected stats with pinned retired snapshot: %+v", mid)
+		}
+
+		db.unpinSnapshotRef(oldSeq, ref)
+
+		after := db.SnapshotStats()
+		if after.RegistrySize != 1 || after.PinnedRefs != 0 {
+			t.Fatalf("unexpected stats after last unpin: %+v", after)
+		}
+	}
+}
+
+func TestSnapshotExt_BeginQueryTxSnapshotIgnoresStagedFutureSnapshot(t *testing.T) {
+	db, _ := openTempDBUint64(t, snapshotExtOptions())
+
+	if err := db.Set(1, &Rec{Name: "alice", Age: 30}); err != nil {
+		t.Fatalf("Set(1): %v", err)
+	}
+
+	current := db.getSnapshot()
+	staged := &indexSnapshot{seq: current.seq + 1}
+	db.stageSnapshot(staged)
+	defer db.dropStagedSnapshot(staged.seq)
+
+	tx, snap, seq, ref, err := db.beginQueryTxSnapshot()
+	if err != nil {
+		t.Fatalf("beginQueryTxSnapshot: %v", err)
+	}
+	defer rollback(tx)
+	defer db.unpinSnapshotRef(seq, ref)
+
+	if seq != current.seq {
+		t.Fatalf("query tx pinned wrong sequence: got=%d want=%d", seq, current.seq)
+	}
+	if snap != current {
+		t.Fatalf("query tx pinned staged future snapshot instead of current snapshot")
+	}
+}
+
+func TestSnapshotExt_BeginQueryTxSnapshotSeesOldStateWhileNewSnapshotPublished(t *testing.T) {
+	db, _ := openTempDBUint64(t, snapshotExtOptions())
+
+	if err := db.Set(1, &Rec{Name: "alice", Age: 30}); err != nil {
+		t.Fatalf("Set(1): %v", err)
+	}
+
+	tx, snap, seq, ref, err := db.beginQueryTxSnapshot()
+	if err != nil {
+		t.Fatalf("beginQueryTxSnapshot: %v", err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		done <- db.Set(2, &Rec{Name: "bob", Age: 20})
 	}()
 
-	ids, err := db2.QueryKeys(qx.Query(qx.EQ("name", "bob")))
+	oldItems, err := db.queryRecords(tx, snap, qx.Query(qx.EQ("name", "bob")))
 	if err != nil {
-		t.Fatalf("Query bob: %v", err)
+		t.Fatalf("queryRecords(old snapshot): %v", err)
 	}
-	if !slices.Equal(ids, []uint64{1}) {
-		t.Fatalf("expected bob -> [1], got %v", ids)
+	if len(oldItems) != 0 {
+		t.Fatalf("old tx/snapshot unexpectedly sees future write: %#v", oldItems)
 	}
 
-	ids, err = db2.QueryKeys(qx.Query(qx.EQ("name", "alice")))
+	oldItems, err = db.queryRecords(tx, snap, qx.Query(qx.EQ("name", "alice")))
 	if err != nil {
-		t.Fatalf("Query alice: %v", err)
+		t.Fatalf("queryRecords(old snapshot for alice): %v", err)
 	}
-	if len(ids) != 0 {
-		t.Fatalf("expected alice to be absent after reopen, got %v", ids)
+	if len(oldItems) != 1 || oldItems[0] == nil || oldItems[0].Name != "alice" {
+		t.Fatalf("unexpected old snapshot query result: %#v", oldItems)
+	}
+
+	rollback(tx)
+	db.unpinSnapshotRef(seq, ref)
+
+	if err := <-done; err != nil {
+		t.Fatalf("Set(2): %v", err)
+	}
+
+	currentItems, err := db.Query(qx.Query(qx.EQ("name", "bob")))
+	if err != nil {
+		t.Fatalf("Query(current snapshot): %v", err)
+	}
+	if len(currentItems) != 1 || currentItems[0] == nil || currentItems[0].Name != "bob" {
+		t.Fatalf("unexpected current snapshot query result: %#v", currentItems)
 	}
 }
 
-func TestQueryWorksWhenSnapshotDeltaEnabled(t *testing.T) {
-	db, _ := openTempDBUint64(t)
-	if err := db.Set(1, &Rec{Name: "alice", Age: 20, Tags: []string{"go", "db"}}); err != nil {
-		t.Fatalf("Set 1: %v", err)
+func TestSnapshotExt_OldSnapshotFieldLookupImmutableAcrossSetUpdate(t *testing.T) {
+	db, _ := openTempDBUint64(t, snapshotExtOptions())
+
+	if err := db.Set(1, &Rec{Name: "alice", Age: 30}); err != nil {
+		t.Fatalf("Set(1): %v", err)
 	}
-	if err := db.Set(2, &Rec{Name: "albert", Age: 30, Tags: []string{"go"}}); err != nil {
-		t.Fatalf("Set 2: %v", err)
-	}
-	if err := db.Set(3, &Rec{Name: "bob", Age: 40, Tags: []string{"rust"}}); err != nil {
-		t.Fatalf("Set 3: %v", err)
+	if err := db.Set(2, &Rec{Name: "bob", Age: 20}); err != nil {
+		t.Fatalf("Set(2): %v", err)
 	}
 
-	if !db.snapshotHasAnyDelta() {
-		t.Fatalf("expected snapshot delta to be present")
+	s1 := db.getSnapshot()
+
+	if err := db.Set(2, &Rec{Name: "charlie", Age: 20}); err != nil {
+		t.Fatalf("Set(update): %v", err)
 	}
 
-	eq, err := db.QueryKeys(qx.Query(qx.EQ("name", "alice")))
-	if err != nil {
-		t.Fatalf("eq query: %v", err)
+	s2 := db.getSnapshot()
+	if !snapshotExtFieldContainsID(t, s1, "name", "bob", 2) {
+		t.Fatalf("old snapshot lost original scalar posting")
 	}
-	if !slices.Equal(eq, []uint64{1}) {
-		t.Fatalf("eq mismatch: %v", eq)
+	if snapshotExtFieldContainsID(t, s1, "name", "charlie", 2) {
+		t.Fatalf("old snapshot unexpectedly sees updated scalar posting")
 	}
-
-	prefix, err := db.QueryKeys(qx.Query(qx.PREFIX("name", "al")).By("name", qx.ASC).Max(10))
-	if err != nil {
-		t.Fatalf("prefix query: %v", err)
+	if !snapshotExtFieldContainsID(t, s2, "name", "charlie", 2) {
+		t.Fatalf("new snapshot is missing updated scalar posting")
 	}
-	if !slices.Equal(prefix, []uint64{2, 1}) && !slices.Equal(prefix, []uint64{1, 2}) {
-		t.Fatalf("prefix mismatch: %v", prefix)
-	}
-
-	rng, err := db.QueryKeys(qx.Query(qx.GTE("age", 30)).By("age", qx.ASC).Max(10))
-	if err != nil {
-		t.Fatalf("range query: %v", err)
-	}
-	if !slices.Equal(rng, []uint64{2, 3}) && !slices.Equal(rng, []uint64{3, 2}) {
-		t.Fatalf("range mismatch: %v", rng)
-	}
-
-	has, err := db.QueryKeys(qx.Query(qx.HAS("tags", []string{"go", "db"})).Max(10))
-	if err != nil {
-		t.Fatalf("has query: %v", err)
-	}
-	if !slices.Equal(has, []uint64{1}) {
-		t.Fatalf("has mismatch: %v", has)
-	}
-
-	hasAny, err := db.QueryKeys(qx.Query(qx.HASANY("tags", []string{"db", "rust"})).Max(10))
-	if err != nil {
-		t.Fatalf("hasany query: %v", err)
-	}
-	if !slices.Equal(hasAny, []uint64{1, 3}) && !slices.Equal(hasAny, []uint64{3, 1}) {
-		t.Fatalf("hasany mismatch: %v", hasAny)
+	if snapshotExtFieldContainsID(t, s2, "name", "bob", 2) {
+		t.Fatalf("new snapshot kept stale scalar posting")
 	}
 }
 
-func TestSnapshotDelta_UsesCandidateOrderWithoutMaterializedFallback(t *testing.T) {
-	var events []TraceEvent
-	db, _ := openTempDBUint64(t, Options{
-		TraceSink: func(ev TraceEvent) {
-			events = append(events, ev)
-		},
-		TraceSampleEvery: 1,
-	})
+func TestSnapshotExt_OldSnapshotLenIndexImmutableAcrossSetUpdate(t *testing.T) {
+	db, _ := openTempDBUint64(t, snapshotExtOptions())
 
-	if err := db.Set(1, &Rec{Meta: Meta{Country: "NL"}, Active: true, Age: 30}); err != nil {
-		t.Fatalf("Set 1: %v", err)
-	}
-	if err := db.Set(2, &Rec{Meta: Meta{Country: "DE"}, Active: true, Age: 20}); err != nil {
-		t.Fatalf("Set 2: %v", err)
-	}
-	if err := db.Set(3, &Rec{Meta: Meta{Country: "NL"}, Active: false, Age: 10}); err != nil {
-		t.Fatalf("Set 3: %v", err)
-	}
-	if err := db.Set(4, &Rec{Meta: Meta{Country: "US"}, Active: true, Age: 40}); err != nil {
-		t.Fatalf("Set 4: %v", err)
+	if err := db.Set(1, &Rec{Name: "alice", Tags: []string{"go", "db"}}); err != nil {
+		t.Fatalf("Set(1): %v", err)
 	}
 
-	q := qx.Query(
-		qx.NOT(qx.EQ("country", "NL")),
-		qx.EQ("active", true),
-	).By("age", qx.ASC).Max(10)
+	s1 := db.getSnapshot()
 
-	ids, err := db.execQuery(q, true, false)
-	if err != nil {
-		t.Fatalf("query: %v", err)
-	}
-	if !slices.Equal(ids, []uint64{2, 4}) {
-		t.Fatalf("query mismatch: %v", ids)
+	if err := db.Set(1, &Rec{Name: "alice", Tags: []string{"go"}}); err != nil {
+		t.Fatalf("Set(update): %v", err)
 	}
 
-	if len(events) == 0 {
-		t.Fatalf("expected trace event")
+	s2 := db.getSnapshot()
+	if !snapshotExtLenContainsID(t, s1, "tags", 2, 1) {
+		t.Fatalf("old snapshot lost original len posting")
 	}
-	gotPlan := events[len(events)-1].Plan
-	if gotPlan != string(PlanCandidateOrder) {
-		t.Fatalf("unexpected plan: got=%q want=%q", gotPlan, PlanCandidateOrder)
+	if snapshotExtLenContainsID(t, s1, "tags", 1, 1) {
+		t.Fatalf("old snapshot unexpectedly sees updated len posting")
+	}
+	if !snapshotExtLenContainsID(t, s2, "tags", 1, 1) {
+		t.Fatalf("new snapshot is missing updated len posting")
+	}
+	if snapshotExtLenContainsID(t, s2, "tags", 2, 1) {
+		t.Fatalf("new snapshot kept stale len posting")
 	}
 }
 
-func TestSnapshotDelta_UsesOrderedPlanWithoutMaterializedFallback(t *testing.T) {
-	db, _ := openTempDBUint64(t)
+func TestSnapshotExt_ZeroComplementLenIndexImmutableAcrossPatchToEmpty(t *testing.T) {
+	db, _ := openTempDBUint64(t, snapshotExtOptions())
 
-	if err := db.Set(1, &Rec{Meta: Meta{Country: "NL"}, Age: 30}); err != nil {
-		t.Fatalf("Set 1: %v", err)
+	ids := []uint64{1, 2, 3, 4}
+	vals := []*Rec{
+		{Name: "u1", Tags: []string{"go"}},
+		{Name: "u2"},
+		{Name: "u3"},
+		{Name: "u4"},
 	}
-	if err := db.Set(2, &Rec{Meta: Meta{Country: "DE"}, Age: 20}); err != nil {
-		t.Fatalf("Set 2: %v", err)
-	}
-	if err := db.Set(3, &Rec{Meta: Meta{Country: "NL"}, Age: 10}); err != nil {
-		t.Fatalf("Set 3: %v", err)
-	}
-	if err := db.Set(4, &Rec{Meta: Meta{Country: "US"}, Age: 40}); err != nil {
-		t.Fatalf("Set 4: %v", err)
-	}
-	if err := db.Set(5, &Rec{Meta: Meta{Country: "US"}, Age: 50}); err != nil {
-		t.Fatalf("Set 5: %v", err)
+	if err := db.BatchSet(ids, vals); err != nil {
+		t.Fatalf("BatchSet: %v", err)
 	}
 
-	q := qx.Query(
-		qx.NOT(qx.EQ("country", "NL")),
-		qx.GTE("age", 15),
-		qx.LTE("age", 45),
-	).By("age", qx.ASC).Max(10)
-
-	leaves, ok := collectAndLeaves(q.Expr)
-	if !ok {
-		t.Fatalf("collectAndLeaves failed")
+	s1 := db.getSnapshot()
+	if !s1.lenZeroComplement["tags"] {
+		t.Fatalf("expected zero-complement len index for sparse non-empty tags")
 	}
-	preds, ok := db.buildPredicates(leaves)
-	if !ok {
-		t.Fatalf("buildPredicates failed")
-	}
-	defer releasePredicates(preds)
-
-	ids, ok := db.execPlanOrderedBasic(q, preds, nil)
-	if !ok {
-		t.Fatalf("execPlanOrderedBasic must be applicable")
-	}
-	if !slices.Equal(ids, []uint64{2, 4}) {
-		t.Fatalf("ordered basic mismatch: %v", ids)
+	if !snapshotExtLenNonEmptyContainsID(t, s1, "tags", 1) {
+		t.Fatalf("expected old snapshot non-empty sentinel to include id=1")
 	}
 
-	ids2, err := db.execQuery(q, true, false)
-	if err != nil {
-		t.Fatalf("query: %v", err)
+	if err := db.Patch(1, []Field{{Name: "tags", Value: []string{}}}); err != nil {
+		t.Fatalf("Patch(tags): %v", err)
 	}
-	if !slices.Equal(ids2, []uint64{2, 4}) {
-		t.Fatalf("query mismatch: %v", ids2)
+
+	s2 := db.getSnapshot()
+	if !snapshotExtLenNonEmptyContainsID(t, s1, "tags", 1) {
+		t.Fatalf("old snapshot lost non-empty sentinel membership")
+	}
+	if snapshotExtLenNonEmptyContainsID(t, s2, "tags", 1) {
+		t.Fatalf("new snapshot kept stale non-empty sentinel membership")
 	}
 }
 
-func TestSnapshotDelta_UsesORNoOrderPlanWithoutMaterializedFallback(t *testing.T) {
-	var events []TraceEvent
-	db, _ := openTempDBUint64(t, Options{
-		AnalyzeInterval:  -1,
-		TraceSink:        func(ev TraceEvent) { events = append(events, ev) },
-		TraceSampleEvery: 1,
-	})
-	_ = seedData(t, db, 5_000)
+func TestSnapshotExt_OldSnapshotNilIndexImmutableAcrossPatch(t *testing.T) {
+	db, _ := openTempDBUint64(t, snapshotExtOptions())
 
-	// Force fresh delta on top of loaded base to ensure delta-safe pipeline is used.
-	if err := db.Set(9_001, &Rec{Meta: Meta{Country: "NL"}, Name: "alice", Active: true, Age: 33}); err != nil {
-		t.Fatalf("Set: %v", err)
-	}
-	if !db.snapshotHasAnyDelta() {
-		t.Fatalf("expected snapshot delta to be present")
+	if err := db.Set(1, &Rec{Name: "alice", Email: "alice@example.com", Opt: nil}); err != nil {
+		t.Fatalf("Set(1): %v", err)
 	}
 
-	q := qx.Query(
-		qx.OR(
-			qx.EQ("active", true),
-			qx.EQ("name", "alice"),
-		),
-	).Max(120)
+	s1 := db.getSnapshot()
+	val := "zzz"
+	if err := db.Patch(1, []Field{{Name: "opt", Value: &val}}); err != nil {
+		t.Fatalf("Patch(opt): %v", err)
+	}
 
-	ids, err := db.execQuery(q, true, false)
-	if err != nil {
-		t.Fatalf("query: %v", err)
+	s2 := db.getSnapshot()
+	if !snapshotExtNilContainsID(t, s1, "opt", 1) {
+		t.Fatalf("old snapshot lost nil-index membership")
 	}
-	if len(ids) == 0 {
-		t.Fatalf("expected non-empty result")
+	if snapshotExtNilContainsID(t, s2, "opt", 1) {
+		t.Fatalf("new snapshot kept stale nil-index membership")
 	}
-	if len(events) == 0 {
-		t.Fatalf("expected trace event")
-	}
-	plan := events[len(events)-1].Plan
-	if !strings.HasPrefix(plan, "plan_or_merge_") {
-		t.Fatalf("unexpected plan: got=%q want prefix %q", plan, "plan_or_merge_")
+	if !snapshotExtFieldContainsID(t, s2, "opt", val, 1) {
+		t.Fatalf("new snapshot is missing updated opt posting")
 	}
 }
 
-func TestSnapshotDelta_UsesOROrderStreamPlanWithoutMaterializedFallback(t *testing.T) {
-	var events []TraceEvent
-	db, _ := openTempDBUint64(t, Options{
-		AnalyzeInterval:        -1,
-		CalibrationEnabled:     true,
-		CalibrationSampleEvery: 1,
-		TraceSink:              func(ev TraceEvent) { events = append(events, ev) },
-		TraceSampleEvery:       1,
-	})
+func TestSnapshotExt_OldSnapshotUniverseImmutableAcrossDelete(t *testing.T) {
+	db, _ := openTempDBUint64(t, snapshotExtOptions())
 
-	if err := db.Set(1, &Rec{Name: "alice", Meta: Meta{Country: "NL"}, Age: 30}); err != nil {
-		t.Fatalf("Set 1: %v", err)
+	if err := db.Set(1, &Rec{Name: "alice", Age: 30}); err != nil {
+		t.Fatalf("Set(1): %v", err)
 	}
-	if err := db.Set(2, &Rec{Name: "bob", Meta: Meta{Country: "DE"}, Age: 20}); err != nil {
-		t.Fatalf("Set 2: %v", err)
-	}
-	if err := db.Set(3, &Rec{Name: "alina", Meta: Meta{Country: "US"}, Age: 10}); err != nil {
-		t.Fatalf("Set 3: %v", err)
-	}
-	if err := db.Set(4, &Rec{Name: "tom", Meta: Meta{Country: "RU"}, Age: 40}); err != nil {
-		t.Fatalf("Set 4: %v", err)
-	}
-	if !db.snapshotHasAnyDelta() {
-		t.Fatalf("expected snapshot delta to be present")
+	if err := db.Set(2, &Rec{Name: "bob", Age: 20}); err != nil {
+		t.Fatalf("Set(2): %v", err)
 	}
 
-	err := db.SetCalibrationSnapshot(CalibrationSnapshot{
-		UpdatedAt: time.Now(),
-		Multipliers: map[string]float64{
-			string(PlanORMergeOrderStream): 0.05,
-			string(PlanORMergeOrderMerge):  3.0,
-		},
-	})
-	if err != nil {
-		t.Fatalf("SetCalibrationSnapshot: %v", err)
+	s1 := db.getSnapshot()
+	if err := db.Delete(2); err != nil {
+		t.Fatalf("Delete(2): %v", err)
 	}
 
-	q := qx.Query(
-		qx.OR(
-			qx.PREFIX("name", "ali"),
-			qx.EQ("country", "DE"),
-		),
-	).By("age", qx.ASC).Max(10)
-
-	ids, err := db.execQuery(q, true, false)
-	if err != nil {
-		t.Fatalf("query: %v", err)
+	s2 := db.getSnapshot()
+	if !s1.universe.Contains(2) || s1.universe.Cardinality() != 2 {
+		t.Fatalf("old snapshot universe mutated after delete")
 	}
-	if !slices.Equal(ids, []uint64{3, 2, 1}) {
-		t.Fatalf("query mismatch: %v", ids)
-	}
-	if len(events) == 0 {
-		t.Fatalf("expected trace event")
-	}
-	plan := events[len(events)-1].Plan
-	if plan != string(PlanORMergeOrderStream) {
-		t.Fatalf("unexpected plan: got=%q want=%q", plan, PlanORMergeOrderStream)
+	if s2.universe.Contains(2) || s2.universe.Cardinality() != 1 {
+		t.Fatalf("new snapshot universe is inconsistent after delete")
 	}
 }
 
-func TestSnapshotDelta_OrderedResidualBroadRange_UsesComplementBitmap(t *testing.T) {
-	db, _ := openTempDBUint64(t, Options{
-		AnalyzeInterval:                                  -1,
-		SnapshotCompactorRequestEveryNWrites:             1 << 30,
-		SnapshotCompactorIdleInterval:                    -1,
-		SnapshotDeltaLayerMaxDepth:                       1 << 30,
-		SnapshotMaterializedPredCacheMaxEntries:          -1,
-		SnapshotMaterializedPredCacheMaxEntriesWithDelta: -1,
-	})
+func TestSnapshotExt_PinnedSnapshotSurvivesTruncateAndPrunesAfterUnpin(t *testing.T) {
+	db, _ := openTempDBUint64(t, snapshotExtOptions())
 
-	seedGeneratedUint64Data(t, db, 80_000, func(i int) *Rec {
+	if err := db.Set(1, &Rec{Name: "alice", Age: 30}); err != nil {
+		t.Fatalf("Set(1): %v", err)
+	}
+	if err := db.Set(2, &Rec{Name: "bob", Age: 20}); err != nil {
+		t.Fatalf("Set(2): %v", err)
+	}
+
+	old := db.getSnapshot()
+	oldSeq := old.seq
+	pinned, ref, ok := db.pinSnapshotRefBySeq(oldSeq)
+	if !ok || pinned != old {
+		t.Fatalf("expected current snapshot to be pinnable before truncate")
+	}
+
+	if err := db.Truncate(); err != nil {
+		t.Fatalf("Truncate: %v", err)
+	}
+
+	current := db.getSnapshot()
+	if current.seq <= oldSeq {
+		t.Fatalf("expected truncate to publish newer snapshot: old=%d new=%d", oldSeq, current.seq)
+	}
+	if !current.universe.IsEmpty() {
+		t.Fatalf("expected truncate snapshot universe to be empty")
+	}
+	if pinned.universe.Cardinality() != 2 {
+		t.Fatalf("pinned pre-truncate snapshot lost universe")
+	}
+	if !snapshotExtFieldContainsID(t, pinned, "name", "alice", 1) {
+		t.Fatalf("pinned pre-truncate snapshot lost field postings")
+	}
+
+	keys, err := db.QueryKeys(qx.Query(qx.EQ("name", "alice")))
+	if err != nil {
+		t.Fatalf("QueryKeys(after truncate): %v", err)
+	}
+	if len(keys) != 0 {
+		t.Fatalf("expected current snapshot to be empty after truncate, got=%v", keys)
+	}
+
+	db.unpinSnapshotRef(oldSeq, ref)
+
+	db.snapshot.mu.RLock()
+	_, oldPresent := db.snapshot.bySeq[oldSeq]
+	registrySize := len(db.snapshot.bySeq)
+	db.snapshot.mu.RUnlock()
+	if oldPresent {
+		t.Fatalf("expected pinned pre-truncate snapshot to be pruned after unpin")
+	}
+	if registrySize != 1 {
+		t.Fatalf("expected registry to retain only latest snapshot after truncate prune, got=%d", registrySize)
+	}
+}
+
+func TestSnapshotExt_StringKeyPinnedSnapshotStrMapSurvivesTruncate(t *testing.T) {
+	db, _ := openTempDBString(t, snapshotExtOptions())
+
+	if err := db.Set("k1", &Rec{Name: "one"}); err != nil {
+		t.Fatalf("Set(k1): %v", err)
+	}
+	if err := db.Set("k2", &Rec{Name: "two"}); err != nil {
+		t.Fatalf("Set(k2): %v", err)
+	}
+
+	old := db.getSnapshot()
+	idx1, ok := old.strmap.getIdxNoLock("k1")
+	if !ok || idx1 == 0 {
+		t.Fatalf("expected k1 mapping before truncate")
+	}
+	pinned, ref, ok := db.pinSnapshotRefBySeq(old.seq)
+	if !ok || pinned != old {
+		t.Fatalf("expected pre-truncate snapshot to be pinnable")
+	}
+
+	if err := db.Truncate(); err != nil {
+		t.Fatalf("Truncate: %v", err)
+	}
+
+	current := db.getSnapshot()
+	if _, ok := current.strmap.getIdxNoLock("k1"); ok {
+		t.Fatalf("current truncated snapshot unexpectedly retained k1 mapping")
+	}
+	if got, ok := pinned.strmap.getStringNoLock(idx1); !ok || got != "k1" {
+		t.Fatalf("pinned pre-truncate snapshot lost k1 mapping: got=%q ok=%v", got, ok)
+	}
+
+	db.unpinSnapshotRef(old.seq, ref)
+}
+
+func TestSnapshotExt_StringKeyOldSnapshotMappingsSurviveDeleteAndNewKeys(t *testing.T) {
+	db, _ := openTempDBString(t, snapshotExtOptions())
+
+	if err := db.Set("k1", &Rec{Name: "one"}); err != nil {
+		t.Fatalf("Set(k1): %v", err)
+	}
+	if err := db.Set("k2", &Rec{Name: "two"}); err != nil {
+		t.Fatalf("Set(k2): %v", err)
+	}
+
+	s1 := db.getSnapshot()
+	idx1, ok := s1.strmap.getIdxNoLock("k1")
+	if !ok || idx1 == 0 {
+		t.Fatalf("expected k1 mapping in old snapshot")
+	}
+
+	if err := db.Delete("k1"); err != nil {
+		t.Fatalf("Delete(k1): %v", err)
+	}
+	for i := 3; i <= 10; i++ {
+		key := fmt.Sprintf("k%d", i)
+		if err := db.Set(key, &Rec{Name: key}); err != nil {
+			t.Fatalf("Set(%s): %v", key, err)
+		}
+	}
+
+	s2 := db.getSnapshot()
+	if _, ok := s1.strmap.getIdxNoLock("k3"); ok {
+		t.Fatalf("old snapshot unexpectedly sees future string key mapping")
+	}
+	if got, ok := s1.strmap.getStringNoLock(idx1); !ok || got != "k1" {
+		t.Fatalf("old snapshot lost original reverse mapping: got=%q ok=%v", got, ok)
+	}
+	if _, ok := s2.strmap.getIdxNoLock("k3"); !ok {
+		t.Fatalf("new snapshot is missing future string key mapping")
+	}
+}
+
+func TestSnapshotExt_PatchUnchangedFieldInheritsPositiveMaterializedPredCache(t *testing.T) {
+	db, _ := openTempDBUint64(t, snapshotExtOptions())
+
+	if err := db.Set(1, &Rec{Name: "alice", Email: "alice@example.com", Age: 30}); err != nil {
+		t.Fatalf("Set(1): %v", err)
+	}
+
+	key := db.materializedPredCacheKey(qx.Expr{Op: qx.OpPREFIX, Field: "email", Value: "ali"})
+	if key == "" {
+		t.Fatalf("expected non-empty cache key")
+	}
+
+	prev := db.getSnapshot()
+	ids := snapshotExtPosting(1)
+	prev.storeMaterializedPred(key, ids)
+
+	if err := db.Patch(1, []Field{{Name: "age", Value: 31}}); err != nil {
+		t.Fatalf("Patch(age): %v", err)
+	}
+
+	next := db.getSnapshot()
+	cached, ok := next.loadMaterializedPred(key)
+	if !ok || cached != ids {
+		t.Fatalf("expected positive untouched cache entry to be inherited")
+	}
+}
+
+func TestSnapshotExt_PatchUnchangedFieldInheritsNegativeMaterializedPredCache(t *testing.T) {
+	db, _ := openTempDBUint64(t, snapshotExtOptions())
+
+	if err := db.Set(1, &Rec{Name: "alice", Email: "alice@example.com", Age: 30}); err != nil {
+		t.Fatalf("Set(1): %v", err)
+	}
+
+	key := db.materializedPredCacheKey(qx.Expr{Op: qx.OpPREFIX, Field: "email", Value: "zz"})
+	if key == "" {
+		t.Fatalf("expected non-empty cache key")
+	}
+
+	prev := db.getSnapshot()
+	prev.storeMaterializedPred(key, posting.List{})
+
+	if err := db.Patch(1, []Field{{Name: "age", Value: 31}}); err != nil {
+		t.Fatalf("Patch(age): %v", err)
+	}
+
+	next := db.getSnapshot()
+	cached, ok := next.loadMaterializedPred(key)
+	if !ok || !cached.IsEmpty() {
+		t.Fatalf("expected negative untouched cache entry to be inherited")
+	}
+}
+
+func TestSnapshotExt_PatchTouchedFieldDropsOnlyTouchedMaterializedPredCache(t *testing.T) {
+	db, _ := openTempDBUint64(t, snapshotExtOptions())
+
+	if err := db.Set(1, &Rec{Name: "alice", Email: "alice@example.com"}); err != nil {
+		t.Fatalf("Set(1): %v", err)
+	}
+
+	nameKey := db.materializedPredCacheKey(qx.Expr{Op: qx.OpPREFIX, Field: "name", Value: "ali"})
+	emailKey := db.materializedPredCacheKey(qx.Expr{Op: qx.OpPREFIX, Field: "email", Value: "ali"})
+	if nameKey == "" || emailKey == "" {
+		t.Fatalf("expected non-empty cache keys")
+	}
+
+	prev := db.getSnapshot()
+	nameIDs := snapshotExtPosting(1)
+	emailIDs := snapshotExtPosting(1)
+	prev.storeMaterializedPred(nameKey, nameIDs)
+	prev.storeMaterializedPred(emailKey, emailIDs)
+
+	if err := db.Patch(1, []Field{{Name: "name", Value: "alicia"}}); err != nil {
+		t.Fatalf("Patch(name): %v", err)
+	}
+
+	next := db.getSnapshot()
+	if _, ok := next.loadMaterializedPred(nameKey); ok {
+		t.Fatalf("expected touched field cache entry to be dropped")
+	}
+	cached, ok := next.loadMaterializedPred(emailKey)
+	if !ok || cached != emailIDs {
+		t.Fatalf("expected untouched field cache entry to be inherited")
+	}
+}
+
+func TestSnapshotExt_PatchDuplicateTouchedFieldStillDropsTouchedCacheAndKeepsOthers(t *testing.T) {
+	db, _ := openTempDBUint64(t, snapshotExtOptions())
+
+	if err := db.Set(1, &Rec{Name: "alice", Email: "alice@example.com"}); err != nil {
+		t.Fatalf("Set(1): %v", err)
+	}
+
+	nameKey := db.materializedPredCacheKey(qx.Expr{Op: qx.OpPREFIX, Field: "name", Value: "ali"})
+	emailKey := db.materializedPredCacheKey(qx.Expr{Op: qx.OpPREFIX, Field: "email", Value: "ali"})
+	if nameKey == "" || emailKey == "" {
+		t.Fatalf("expected non-empty cache keys")
+	}
+
+	prev := db.getSnapshot()
+	emailIDs := snapshotExtPosting(1)
+	prev.storeMaterializedPred(nameKey, snapshotExtPosting(1))
+	prev.storeMaterializedPred(emailKey, emailIDs)
+
+	if err := db.Patch(1, []Field{
+		{Name: "name", Value: "alicia"},
+		{Name: "name", Value: "ally"},
+	}); err != nil {
+		t.Fatalf("Patch(duplicate name): %v", err)
+	}
+
+	next := db.getSnapshot()
+	if _, ok := next.loadMaterializedPred(nameKey); ok {
+		t.Fatalf("expected duplicate touched field cache entry to be dropped")
+	}
+	cached, ok := next.loadMaterializedPred(emailKey)
+	if !ok || cached != emailIDs {
+		t.Fatalf("expected duplicate touched patch to keep unrelated cache entry")
+	}
+}
+
+func TestSnapshotExt_PatchTouchedNilFieldDropsNilPredicateCache(t *testing.T) {
+	db, _ := openTempDBUint64(t, snapshotExtOptions())
+
+	if err := db.Set(1, &Rec{Name: "alice", Email: "alice@example.com", Opt: nil}); err != nil {
+		t.Fatalf("Set(1): %v", err)
+	}
+
+	optKey := db.materializedPredCacheKey(qx.Expr{Op: qx.OpPREFIX, Field: "opt", Value: "z"})
+	emailKey := db.materializedPredCacheKey(qx.Expr{Op: qx.OpPREFIX, Field: "email", Value: "ali"})
+	if optKey == "" || emailKey == "" {
+		t.Fatalf("expected non-empty cache keys")
+	}
+
+	prev := db.getSnapshot()
+	emailIDs := snapshotExtPosting(1)
+	prev.storeMaterializedPred(optKey, posting.List{})
+	prev.storeMaterializedPred(emailKey, emailIDs)
+
+	val := "zzz"
+	if err := db.Patch(1, []Field{{Name: "opt", Value: &val}}); err != nil {
+		t.Fatalf("Patch(opt): %v", err)
+	}
+
+	next := db.getSnapshot()
+	if _, ok := next.loadMaterializedPred(optKey); ok {
+		t.Fatalf("expected touched nil-field cache entry to be dropped")
+	}
+	cached, ok := next.loadMaterializedPred(emailKey)
+	if !ok || cached != emailIDs {
+		t.Fatalf("expected untouched cache entry to survive opt patch")
+	}
+}
+
+func TestSnapshotExt_ClearRuntimeCachesForTestingClearsCurrentSnapshotCaches(t *testing.T) {
+	opts := snapshotExtOptions()
+	opts.SnapshotMaterializedPredCacheMaxEntries = 64
+
+	db, _ := openTempDBUint64(t, opts)
+	seedGeneratedUint64Data(t, db, 2_000, func(i int) *Rec {
 		return &Rec{
-			Name:   fmt.Sprintf("u_%d", i),
-			Email:  fmt.Sprintf("user%05d@example.com", i),
-			Age:    i,
-			Score:  float64(i % 1_000),
-			Active: i%2 == 0,
-			Meta: Meta{
-				Country: "US",
-			},
+			Name:  fmt.Sprintf("u_%d", i),
+			Age:   i,
+			Score: float64(i),
 		}
 	})
 	if err := db.RebuildIndex(); err != nil {
 		t.Fatalf("RebuildIndex: %v", err)
 	}
 
-	for i := 1; i <= 512; i++ {
-		err := db.Patch(uint64(i), []Field{
-			{Name: "age", Value: 75_000 + i},
+	setNumericBucketKnobs(t, db, 128, 1, 1)
+	snap := db.getSnapshot()
+	snapshotExtEvalNumericRangeBuckets(t, db, qx.Expr{Op: qx.OpGTE, Field: "age", Value: 500})
+	if snap.numericRangeBucketCache == nil || snapshotExtSyncMapLen(snap.numericRangeBucketCache) == 0 {
+		t.Fatalf("expected numeric range bucket cache entries after evaluation")
+	}
+	expr := qx.Expr{Op: qx.OpPREFIX, Field: "name", Value: "u_1"}
+	cacheKey := db.materializedPredCacheKey(expr)
+	if cacheKey == "" {
+		t.Fatalf("expected non-empty materialized predicate cache key")
+	}
+	out, err := db.evalSimple(expr)
+	if err != nil {
+		t.Fatalf("evalSimple(prefix): %v", err)
+	}
+	out.release()
+	if _, ok := snap.loadMaterializedPred(cacheKey); !ok {
+		t.Fatalf("expected materialized predicate cache entry after evalSimple")
+	}
+	if got := snap.matPredCacheCount.Load(); got == 0 {
+		t.Fatalf("expected materialized predicate cache count > 0")
+	}
+
+	db.clearCurrentSnapshotCachesForTesting()
+
+	if db.getSnapshot() != snap {
+		t.Fatalf("expected cache clear to keep current snapshot published")
+	}
+	if got := snapshotExtSyncMapLen(snap.numericRangeBucketCache); got != 0 {
+		t.Fatalf("expected numeric range bucket cache to be empty after clear, got=%d", got)
+	}
+	if got := snapshotExtSyncMapLen(&snap.matPredCache); got != 0 {
+		t.Fatalf("expected materialized predicate cache to be empty after clear, got=%d", got)
+	}
+	if got := snap.matPredCacheCount.Load(); got != 0 {
+		t.Fatalf("expected materialized predicate cache count reset, got=%d", got)
+	}
+	if got := snap.matPredCacheOversizedCount.Load(); got != 0 {
+		t.Fatalf("expected oversized materialized predicate cache count reset, got=%d", got)
+	}
+	if _, ok := snap.loadMaterializedPred(cacheKey); ok {
+		t.Fatalf("expected cleared materialized predicate cache entry to be absent")
+	}
+}
+
+func TestSnapshotExt_StoreMaterializedPredConcurrentDistinctKeysRespectsLimit(t *testing.T) {
+	n := max(16, runtime.GOMAXPROCS(0)*8)
+	for round := 0; round < 16; round++ {
+		s := &indexSnapshot{matPredCacheMaxEntries: 1}
+		snapshotExtRunConcurrent(n, func(i int) {
+			s.storeMaterializedPred(fmt.Sprintf("email\x1f%d\x1f%d", qx.OpPREFIX, i), posting.List{})
 		})
-		if err != nil {
-			t.Fatalf("Patch(%d): %v", i, err)
+		if got := s.matPredCacheCount.Load(); got > 1 {
+			t.Fatalf("round=%d materialized cache count exceeded limit: got=%d", round, got)
+		}
+		if got := snapshotExtSyncMapLen(&s.matPredCache); got > 1 {
+			t.Fatalf("round=%d materialized cache entries exceeded limit: got=%d", round, got)
 		}
 	}
+}
 
-	if db.getSnapshot().fieldDelta("age") == nil {
-		t.Fatalf("expected active age delta")
-	}
+func TestSnapshotExt_StoreMaterializedPredConcurrentSameKeyStoresSingleEntry(t *testing.T) {
+	n := max(16, runtime.GOMAXPROCS(0)*8)
+	s := &indexSnapshot{matPredCacheMaxEntries: 8}
 
-	q := normalizeQuery(qx.Query(
-		qx.GTE("age", 1_000),
-	).By("score", qx.DESC).Max(50))
+	snapshotExtRunConcurrent(n, func(i int) {
+		s.storeMaterializedPred("email\x1f1\x1fsame", snapshotExtPosting(uint64(i+1)))
+	})
 
-	leaves, ok := collectAndLeaves(q.Expr)
-	if !ok {
-		t.Fatalf("collectAndLeaves: ok=false")
+	if got := s.matPredCacheCount.Load(); got != 1 {
+		t.Fatalf("expected single cache count for duplicate key, got=%d", got)
 	}
-	preds, ok := db.buildPredicatesOrderedWithMode(leaves, "score", false, 0)
-	if !ok {
-		t.Fatalf("buildPredicatesOrderedWithMode: ok=false")
-	}
-	defer releasePredicates(preds)
-
-	if len(preds) != 1 {
-		t.Fatalf("unexpected predicate count: %d", len(preds))
-	}
-	if preds[0].kind != predicateKindBitmapNot {
-		t.Fatalf("expected ordered broad range to switch to bitmapNot complement, got kind=%v", preds[0].kind)
-	}
-
-	got, ok := db.execPlanOrderedBasic(q, preds, nil)
-	if !ok {
-		t.Fatalf("execPlanOrderedBasic: ok=false")
-	}
-	want, err := db.execQuery(q, true, false)
-	if err != nil {
-		t.Fatalf("execQuery: %v", err)
-	}
-	if !slices.Equal(got, want) {
-		t.Fatalf("ordered residual complement mismatch:\ngot=%v\nwant=%v", got, want)
+	if got := snapshotExtSyncMapLen(&s.matPredCache); got != 1 {
+		t.Fatalf("expected single cache entry for duplicate key, got=%d", got)
 	}
 }
 
-func TestSnapshotDelta_UsesBitmapFallbackForSafeOverlayShape(t *testing.T) {
-	var events []TraceEvent
-	db, _ := openTempDBUint64(t, Options{
-		AnalyzeInterval:  -1,
-		TraceSink:        func(ev TraceEvent) { events = append(events, ev) },
-		TraceSampleEvery: 1,
-	})
-
-	if err := db.Set(1, &Rec{Meta: Meta{Country: "NL"}, Age: 10}); err != nil {
-		t.Fatalf("Set 1: %v", err)
-	}
-	if err := db.Set(2, &Rec{Meta: Meta{Country: "DE"}, Age: 20}); err != nil {
-		t.Fatalf("Set 2: %v", err)
-	}
-	if !db.snapshotHasAnyDelta() {
-		t.Fatalf("expected snapshot delta to be present")
-	}
-
-	ids, err := db.execQuery(qx.Query(qx.EQ("country", "NL")), true, false)
-	if err != nil {
-		t.Fatalf("query: %v", err)
-	}
-	if !slices.Equal(ids, []uint64{1}) {
-		t.Fatalf("query mismatch: %v", ids)
-	}
-	if len(events) == 0 {
-		t.Fatalf("expected trace event")
-	}
-	plan := events[len(events)-1].Plan
-	if plan != string(PlanBitmap) {
-		t.Fatalf("unexpected plan: got=%q want=%q", plan, PlanBitmap)
-	}
-}
-
-func TestSnapshotDelta_UsesBitmapFallbackForArrayOrder(t *testing.T) {
-	var events []TraceEvent
-	db, _ := openTempDBUint64(t, Options{
-		AnalyzeInterval:  -1,
-		TraceSink:        func(ev TraceEvent) { events = append(events, ev) },
-		TraceSampleEvery: 1,
-	})
-
-	if err := db.Set(1, &Rec{Name: "alice", Tags: []string{"go"}, Age: 10}); err != nil {
-		t.Fatalf("Set 1: %v", err)
-	}
-	if err := db.Set(2, &Rec{Name: "bob", Tags: []string{"go", "db"}, Age: 20}); err != nil {
-		t.Fatalf("Set 2: %v", err)
-	}
-	if !db.snapshotHasAnyDelta() {
-		t.Fatalf("expected snapshot delta to be present")
-	}
-
-	q := qx.Query(qx.GTE("age", 0)).ByArrayCount("tags", qx.DESC)
-	ids, err := db.execQuery(q, true, false)
-	if err != nil {
-		t.Fatalf("query: %v", err)
-	}
-	if !slices.Equal(ids, []uint64{2, 1}) {
-		t.Fatalf("query mismatch: %v", ids)
-	}
-	if len(events) == 0 {
-		t.Fatalf("expected trace event")
-	}
-	plan := events[len(events)-1].Plan
-	if plan != string(PlanBitmap) {
-		t.Fatalf("unexpected plan: got=%q want=%q", plan, PlanBitmap)
-	}
-}
-
-func TestSnapshotDelta_DecideOrderedByCost_UsesOverlayWhenBaseOrderSliceEmpty(t *testing.T) {
-	db, _ := openTempDBUint64(t, Options{
-		AnalyzeInterval: -1,
-	})
-
-	if err := db.Set(1, &Rec{Meta: Meta{Country: "NL"}, Age: 10}); err != nil {
-		t.Fatalf("Set 1: %v", err)
-	}
-	if err := db.Set(2, &Rec{Meta: Meta{Country: "DE"}, Age: 20}); err != nil {
-		t.Fatalf("Set 2: %v", err)
-	}
-	if !db.snapshotHasAnyDelta() {
-		t.Fatalf("expected snapshot delta to be present")
-	}
-
-	s := db.getSnapshot()
-	ageDelta := s.fieldDelta("age")
-	if ageDelta == nil || ageDelta.keyCount() == 0 {
-		t.Fatalf("expected non-empty age delta")
-	}
-
-	emptyAgeBase := []index{}
-	viewSnap := &indexSnapshot{
-		seq:          s.seq,
-		index:        s.index,
-		indexView:    map[string]*[]index{"age": &emptyAgeBase},
-		lenIndex:     s.lenIndex,
-		lenIndexView: s.lenIndexView,
-		indexDelta:   s.indexDelta,
-		lenIdxDelta:  s.lenIdxDelta,
-		indexLayer:   s.indexLayer,
-		lenLayer:     s.lenLayer,
-		indexDCount:  s.indexDCount,
-		lenDCount:    s.lenDCount,
-		universe:     s.universe,
-		universeAdd:  s.universeAdd,
-		universeRem:  s.universeRem,
-		strmap:       s.strmap,
-
-		matPredCacheMaxEntries:          s.matPredCacheMaxEntries,
-		matPredCacheMaxEntriesWithDelta: s.matPredCacheMaxEntriesWithDelta,
-		matPredCacheMaxBitmapCard:       s.matPredCacheMaxBitmapCard,
-	}
-	view := db.makeQueryView(viewSnap)
-
-	q := qx.Query(
-		qx.NOT(qx.EQ("country", "US")),
-		qx.GTE("age", 5),
-		qx.LTE("age", 30),
-	).By("age", qx.ASC).Max(10)
-	leaves, ok := collectAndLeaves(q.Expr)
-	if !ok {
-		t.Fatalf("collectAndLeaves failed")
-	}
-
-	decision := view.decideOrderedByCost(q, leaves)
-	if !decision.use && decision.orderedCost == 0 && decision.fallbackCost == 0 && decision.expectedProbeRows == 0 {
-		t.Fatalf("expected non-zero ordered decision with overlay delta and empty base order slice")
-	}
-}
-
-func TestSnapshotDelta_CompactionIntoBase(t *testing.T) {
-	opts := Options{
-		SnapshotDeltaCompactFieldKeys:           1,
-		SnapshotDeltaCompactMaxFieldsPerPublish: 16,
-		SnapshotDeltaCompactUniverseOps:         1,
-	}
-
-	db, _ := openTempDBUint64(t, opts)
-
-	waitForSnapshotState(t, 500*time.Millisecond, "options propagated", func() bool {
-		return db.options.SnapshotDeltaCompactFieldKeys == 1 &&
-			db.options.SnapshotDeltaCompactMaxFieldsPerPublish == 16 &&
-			db.options.SnapshotDeltaCompactUniverseOps == 1
-	})
-
-	if err := db.Set(1, &Rec{Name: "alice", Age: 10}); err != nil {
-		t.Fatalf("Set 1: %v", err)
-	}
-	if err := db.Set(1, &Rec{Name: "bob", Age: 20}); err != nil {
-		t.Fatalf("Set 2: %v", err)
-	}
-
-	waitForSnapshotState(t, 500*time.Millisecond, "delta compacted into base", func() bool {
-		s := db.getSnapshot()
-		if s.index["name"] == nil {
-			return false
+func TestSnapshotExt_TryStoreMaterializedPredOversizedConcurrentDistinctKeysRespectsTotalLimit(t *testing.T) {
+	n := max(16, runtime.GOMAXPROCS(0)*8)
+	bm := snapshotExtPosting(1, 2)
+	for round := 0; round < 16; round++ {
+		s := &indexSnapshot{
+			matPredCacheMaxEntries: 1,
+			matPredCacheMaxCard:    1,
 		}
-		bm := findIndex(s.index["name"], "bob")
-		if bm.IsEmpty() || !bm.Contains(1) {
-			return false
+		snapshotExtRunConcurrent(n, func(i int) {
+			s.tryStoreMaterializedPredOversized(fmt.Sprintf("age\x1frange_bucket\x1f%d", i), bm)
+		})
+		if got := s.matPredCacheCount.Load(); got > 1 {
+			t.Fatalf("round=%d oversized cache count exceeded limit: got=%d", round, got)
 		}
-		if bm := findIndex(s.index["name"], "alice"); !bm.IsEmpty() && bm.Contains(1) {
-			return false
+		if got := snapshotExtSyncMapLen(&s.matPredCache); got > 1 {
+			t.Fatalf("round=%d oversized cache entries exceeded limit: got=%d", round, got)
 		}
-		if d := s.fieldDelta("name"); d != nil && d.keyCount() > 0 {
-			return false
-		}
-		return s.universeAdd == nil && s.universeRem == nil
-	})
-
-	ids, err := db.QueryKeys(qx.Query(qx.EQ("name", "bob")))
-	if err != nil {
-		t.Fatalf("query: %v", err)
-	}
-	if !slices.Equal(ids, []uint64{1}) {
-		t.Fatalf("query mismatch: %v", ids)
-	}
-}
-
-func TestSnapshotDelta_UniverseBasePreservedAcrossNonUniverseWriteAfterCompaction(t *testing.T) {
-	db, _ := openTempDBUint64(t, Options{
-		SnapshotDeltaCompactUniverseOps: 1,
-	})
-	if err := db.Set(1, &Rec{Name: "a", Age: 10}); err != nil {
-		t.Fatalf("Set insert: %v", err)
-	}
-
-	if got, err := db.Count(nil); err != nil {
-		t.Fatalf("Count after insert: %v", err)
-	} else if got != 1 {
-		t.Fatalf("count after insert mismatch: got=%d want=1", got)
-	}
-
-	if err := db.Set(1, &Rec{Name: "b", Age: 10}); err != nil {
-		t.Fatalf("Set update: %v", err)
-	}
-
-	if got, err := db.Count(nil); err != nil {
-		t.Fatalf("Count after update: %v", err)
-	} else if got != 1 {
-		t.Fatalf("count after update mismatch: got=%d want=1", got)
-	}
-
-	ids, err := db.QueryKeys(qx.Query(qx.EQ("name", "b")))
-	if err != nil {
-		t.Fatalf("Query name=b: %v", err)
-	}
-	if !slices.Equal(ids, []uint64{1}) {
-		t.Fatalf("expected keys(name=b)=[1], got %v", ids)
-	}
-}
-
-func TestSnapshotDelta_DefaultLimitsEnabled(t *testing.T) {
-	db, _ := openTempDBUint64(t)
-	if db.options.SnapshotDeltaLayerMaxDepth <= 0 {
-		t.Fatalf("SnapshotDeltaLayerMaxDepth must be enabled by default")
-	}
-}
-
-func TestSnapshotDelta_LayerDepthIsBounded(t *testing.T) {
-	maxDepth := 2
-	db, _ := openTempDBUint64(t, Options{
-		SnapshotDeltaLayerMaxDepth:              maxDepth,
-		SnapshotDeltaCompactMaxFieldsPerPublish: -1,
-	})
-	for i := 0; i < 6; i++ {
-		if err := db.Set(1, &Rec{Name: string(rune('a' + i)), Age: 20}); err != nil {
-			t.Fatalf("Set #%d: %v", i, err)
+		if got := s.matPredCacheOversizedCount.Load(); got > 1 {
+			t.Fatalf("round=%d oversized counter exceeded total limit: got=%d", round, got)
 		}
 	}
-
-	waitForSnapshotState(t, 500*time.Millisecond, "delta layer depth compaction", func() bool {
-		s := db.getSnapshot()
-		return s.indexLayer == nil || s.indexLayer.depth <= maxDepth
-	})
 }
 
-func TestSnapshotDelta_LayerDepthIsBoundedWithoutCompactor(t *testing.T) {
-	maxDepth := 2
-	db, _ := openTempDBUint64(t, Options{
-		SnapshotDeltaLayerMaxDepth:              maxDepth,
-		SnapshotDeltaCompactMaxFieldsPerPublish: -1,
-		SnapshotCompactorRequestEveryNWrites:    1 << 30,
-		SnapshotCompactorIdleInterval:           -1,
-		SnapshotCompactorMaxIterationsPerRun:    -1,
+func TestSnapshotExt_TryStoreMaterializedPredOversizedConcurrentSameKeyDoesNotLeakCounters(t *testing.T) {
+	n := max(16, runtime.GOMAXPROCS(0)*8)
+	bm := snapshotExtPosting(1, 2)
+	s := &indexSnapshot{
+		matPredCacheMaxEntries: 8,
+		matPredCacheMaxCard:    1,
+	}
+
+	snapshotExtRunConcurrent(n, func(i int) {
+		s.tryStoreMaterializedPredOversized("age\x1frange_bucket\x1fsame", bm)
 	})
+
+	if got := s.matPredCacheCount.Load(); got != 1 {
+		t.Fatalf("expected single oversized cache count for duplicate key, got=%d", got)
+	}
+	if got := snapshotExtSyncMapLen(&s.matPredCache); got != 1 {
+		t.Fatalf("expected single oversized cache entry for duplicate key, got=%d", got)
+	}
+	if got := s.matPredCacheOversizedCount.Load(); got != 1 {
+		t.Fatalf("expected oversized counter to settle at 1, got=%d", got)
+	}
+}
+
+func TestSnapshotExt_MaterializedPredCacheOversizedAdmissionTurnsOverEntries(t *testing.T) {
+	s := &indexSnapshot{
+		matPredCacheMaxEntries: 8,
+		matPredCacheMaxCard:    1,
+	}
+
+	small := snapshotExtPosting(1)
+	large := snapshotExtPosting(1, 2)
 
 	for i := 0; i < 8; i++ {
-		if err := db.Set(1, &Rec{Name: string(rune('a' + i)), Age: 20 + i}); err != nil {
-			t.Fatalf("Set #%d: %v", i, err)
+		s.storeMaterializedPred(fmt.Sprintf("email\x1f%d\x1f%d", qx.OpPREFIX, i), small)
+	}
+	if got := s.matPredCacheCount.Load(); got != 8 {
+		t.Fatalf("expected regular cache to fill total limit, got=%d", got)
+	}
+	if got := snapshotExtSyncMapLen(&s.matPredCache); got != 8 {
+		t.Fatalf("expected eight regular cache entries before oversized admission, got=%d", got)
+	}
+
+	if !s.tryStoreMaterializedPredOversized("age\x1frange_bucket\x1f0", large) {
+		t.Fatalf("expected first oversized cache entry to replace an older entry")
+	}
+	if !s.tryStoreMaterializedPredOversized("age\x1frange_bucket\x1f1", large) {
+		t.Fatalf("expected second oversized cache entry to replace an older entry")
+	}
+	if !s.tryStoreMaterializedPredOversized("age\x1frange_bucket\x1f2", large) {
+		t.Fatalf("expected oversized cache admission to replace an older oversized entry at limit")
+	}
+
+	if got := s.matPredCacheCount.Load(); got != 8 {
+		t.Fatalf("expected total cache count to remain bounded by limit, got=%d", got)
+	}
+	if got := snapshotExtSyncMapLen(&s.matPredCache); got != 8 {
+		t.Fatalf("expected total cache entries to remain bounded by limit, got=%d", got)
+	}
+	if got := s.matPredCacheOversizedCount.Load(); got != 2 {
+		t.Fatalf("expected oversized counter to settle at 2, got=%d", got)
+	}
+	if _, ok := s.loadMaterializedPred("age\x1frange_bucket\x1f2"); !ok {
+		t.Fatalf("expected newest oversized entry to remain cached")
+	}
+	kept := 0
+	for _, key := range []string{
+		"age\x1frange_bucket\x1f0",
+		"age\x1frange_bucket\x1f1",
+		"age\x1frange_bucket\x1f2",
+	} {
+		if _, ok := s.loadMaterializedPred(key); ok {
+			kept++
 		}
-		s := db.getSnapshot()
-		if s == nil || s.indexLayer == nil {
-			t.Fatalf("expected layered snapshot after write #%d", i)
-		}
-		if s.indexLayer.depth > maxDepth {
-			t.Fatalf("snapshot depth exceeded cap after write #%d: got=%d want<=%d", i, s.indexLayer.depth, maxDepth)
-		}
+	}
+	if kept != 2 {
+		t.Fatalf("expected oversized cache to keep exactly two entries after replacement, got=%d", kept)
 	}
 }
 
-func TestSnapshotCompactor_IdleForceCompactsDelta(t *testing.T) {
-	db, _ := openTempDBUint64(t, Options{
-		SnapshotDeltaCompactFieldKeys:                    1 << 20,
-		SnapshotDeltaCompactFieldOps:                     1 << 20,
-		SnapshotDeltaCompactUniverseOps:                  1 << 20,
-		SnapshotDeltaCompactMaxFieldsPerPublish:          64,
-		SnapshotCompactorRequestEveryNWrites:             1_000_000,
-		SnapshotCompactorIdleInterval:                    20 * time.Millisecond,
-		SnapshotCompactorMaxIterationsPerRun:             4,
-		SnapshotMaterializedPredCacheMaxEntries:          -1,
-		SnapshotMaterializedPredCacheMaxEntriesWithDelta: -1,
-	})
-
-	if err := db.Set(1, &Rec{Name: "alice", Age: 10}); err != nil {
-		t.Fatalf("Set 1: %v", err)
-	}
-	if !db.snapshotHasAnyDelta() {
-		t.Fatalf("expected layered delta right after write")
+func TestSnapshotExt_MaterializedPredCacheRegularAdmissionTurnsOverOlderRegularEntries(t *testing.T) {
+	s := &indexSnapshot{
+		matPredCacheMaxEntries: 8,
+		matPredCacheMaxCard:    1,
 	}
 
-	waitForSnapshotState(t, 500*time.Millisecond, "idle force-drain compaction", func() bool {
-		return !db.snapshotHasAnyDelta()
+	small := snapshotExtPosting(1)
+	large := snapshotExtPosting(1, 2)
+
+	for i := 0; i < 8; i++ {
+		s.storeMaterializedPred(fmt.Sprintf("email\x1f%d\x1f%d", qx.OpPREFIX, i), small)
+	}
+	if !s.tryStoreMaterializedPredOversized("age\x1frange_bucket\x1f0", large) {
+		t.Fatalf("expected first oversized cache entry to be admitted")
+	}
+	if !s.tryStoreMaterializedPredOversized("age\x1frange_bucket\x1f1", large) {
+		t.Fatalf("expected second oversized cache entry to be admitted")
+	}
+
+	s.storeMaterializedPred("email\x1f1\x1flate", small)
+
+	if got := s.matPredCacheCount.Load(); got != 8 {
+		t.Fatalf("expected total cache count to remain bounded by limit, got=%d", got)
+	}
+	if got := snapshotExtSyncMapLen(&s.matPredCache); got != 8 {
+		t.Fatalf("expected total cache entries to remain bounded by limit, got=%d", got)
+	}
+	if got := s.matPredCacheOversizedCount.Load(); got != 2 {
+		t.Fatalf("expected regular turnover to keep oversized entries resident, got=%d", got)
+	}
+	if _, ok := s.loadMaterializedPred("email\x1f1\x1flate"); !ok {
+		t.Fatalf("expected newest regular entry to replace an older regular entry")
+	}
+}
+
+func TestSnapshotExt_InheritMaterializedPredCacheSkipsChangedFieldsAndKeepsOthers(t *testing.T) {
+	prev := &indexSnapshot{matPredCacheMaxEntries: 8}
+	nameIDs := snapshotExtPosting(1)
+	emailIDs := snapshotExtPosting(2)
+	prev.matPredCache.Store("name\x1f1\x1fa", &materializedPredCacheEntry{ids: nameIDs})
+	prev.matPredCache.Store("email\x1f1\x1fb", &materializedPredCacheEntry{ids: emailIDs})
+	prev.matPredCacheCount.Store(2)
+
+	next := &indexSnapshot{matPredCacheMaxEntries: 8}
+	inheritMaterializedPredCache(next, prev, map[string]struct{}{
+		"name": {},
 	})
 
-	ids, err := db.QueryKeys(qx.Query(qx.EQ("name", "alice")))
+	if _, ok := next.loadMaterializedPred("name\x1f1\x1fa"); ok {
+		t.Fatalf("expected changed-field cache entry to be skipped")
+	}
+	cached, ok := next.loadMaterializedPred("email\x1f1\x1fb")
+	if !ok || cached != emailIDs {
+		t.Fatalf("expected untouched-field cache entry to be inherited")
+	}
+}
+
+func TestSnapshotExt_InheritMaterializedPredCacheSkipsMalformedKeysAndBadEntries(t *testing.T) {
+	prev := &indexSnapshot{matPredCacheMaxEntries: 8}
+	prev.matPredCache.Store("", &materializedPredCacheEntry{ids: snapshotExtPosting(1)})
+	prev.matPredCache.Store("\x1fbroken", &materializedPredCacheEntry{ids: snapshotExtPosting(1)})
+	prev.matPredCache.Store(123, &materializedPredCacheEntry{ids: snapshotExtPosting(1)})
+	prev.matPredCache.Store("email\x1f1\x1fa", "bad")
+	prev.matPredCache.Store("name\x1f1\x1fb", &materializedPredCacheEntry{ids: posting.List{}})
+	prev.matPredCacheCount.Store(5)
+
+	next := &indexSnapshot{matPredCacheMaxEntries: 8}
+	inheritMaterializedPredCache(next, prev, nil)
+
+	if got := next.matPredCacheCount.Load(); got != 1 {
+		t.Fatalf("expected exactly one valid inherited entry, got=%d", got)
+	}
+	cached, ok := next.loadMaterializedPred("name\x1f1\x1fb")
+	if !ok || !cached.IsEmpty() {
+		t.Fatalf("expected valid negative cache entry to survive malformed-entry filtering")
+	}
+}
+
+func TestSnapshotExt_InheritMaterializedPredCacheClampsOversizedCount(t *testing.T) {
+	prev := &indexSnapshot{matPredCacheMaxEntries: 8}
+	oversized := snapshotExtPosting(1, 2)
+	prev.matPredCache.Store("a\x1f1\x1f1", &materializedPredCacheEntry{ids: oversized})
+	prev.matPredCache.Store("b\x1f1\x1f2", &materializedPredCacheEntry{ids: oversized})
+	prev.matPredCache.Store("c\x1f1\x1f3", &materializedPredCacheEntry{ids: oversized})
+	prev.matPredCacheCount.Store(3)
+
+	next := &indexSnapshot{
+		matPredCacheMaxEntries: 8,
+		matPredCacheMaxCard:    1,
+	}
+	inheritMaterializedPredCache(next, prev, nil)
+
+	if got := next.matPredCacheCount.Load(); got != 3 {
+		t.Fatalf("expected all entries to be inherited before oversized clamp, got=%d", got)
+	}
+	if want, got := materializedPredCacheOversizedLimit(next.matPredCacheMaxEntries), next.matPredCacheOversizedCount.Load(); got != want {
+		t.Fatalf("expected oversized counter clamp to %d, got=%d", want, got)
+	}
+}
+
+func TestSnapshotExt_InheritMaterializedPredCachePreservesRecencyStamps(t *testing.T) {
+	prev := &indexSnapshot{matPredCacheMaxEntries: 8}
+	a := &materializedPredCacheEntry{ids: snapshotExtPosting(1)}
+	a.stamp.Store(7)
+	b := &materializedPredCacheEntry{ids: snapshotExtPosting(2)}
+	b.stamp.Store(13)
+	prev.matPredCache.Store("email\x1f1\x1fa", a)
+	prev.matPredCache.Store("name\x1f1\x1fb", b)
+	prev.matPredCacheCount.Store(2)
+	prev.matPredCacheClock.Store(13)
+
+	next := &indexSnapshot{matPredCacheMaxEntries: 8}
+	inheritMaterializedPredCache(next, prev, nil)
+
+	va, ok := next.matPredCache.Load("email\x1f1\x1fa")
+	if !ok {
+		t.Fatalf("expected first cache entry to be inherited")
+	}
+	gotA, _ := va.(*materializedPredCacheEntry)
+	if gotA == nil || gotA.stamp.Load() != 7 {
+		t.Fatalf("expected first inherited stamp to stay at 7, got=%d", gotA.stamp.Load())
+	}
+
+	vb, ok := next.matPredCache.Load("name\x1f1\x1fb")
+	if !ok {
+		t.Fatalf("expected second cache entry to be inherited")
+	}
+	gotB, _ := vb.(*materializedPredCacheEntry)
+	if gotB == nil || gotB.stamp.Load() != 13 {
+		t.Fatalf("expected second inherited stamp to stay at 13, got=%d", gotB.stamp.Load())
+	}
+
+	if got := next.matPredCacheClock.Load(); got != 13 {
+		t.Fatalf("expected next snapshot clock to continue from max inherited stamp, got=%d", got)
+	}
+}
+
+func TestSnapshotExt_InheritNumericRangeBucketCacheCopiesOnlyMatchingStorage(t *testing.T) {
+	shared := snapshotExtStorage("10", "20")
+	prevChanged := snapshotExtStorage("30")
+	nextChanged := snapshotExtStorage("30")
+
+	ageEntry := &numericRangeBucketCacheEntry{
+		storage: shared,
+		idx: &numericRangeBucketIndex{
+			bucketSize: 1,
+			buckets:    []numericRangeBucket{{start: 0, end: 1}},
+		},
+	}
+	scoreEntry := &numericRangeBucketCacheEntry{
+		storage: prevChanged,
+		idx: &numericRangeBucketIndex{
+			bucketSize: 1,
+			buckets:    []numericRangeBucket{{start: 0, end: 1}},
+		},
+	}
+
+	prev := &indexSnapshot{
+		index:                   map[string]fieldIndexStorage{"age": shared, "score": prevChanged},
+		numericRangeBucketCache: newNumericRangeBucketCache(),
+	}
+	prev.numericRangeBucketCache.Store("age", ageEntry)
+	prev.numericRangeBucketCache.Store("score", scoreEntry)
+
+	next := &indexSnapshot{
+		index: map[string]fieldIndexStorage{"age": shared, "score": nextChanged},
+	}
+	inheritNumericRangeBucketCache(next, prev)
+
+	if next.numericRangeBucketCache == nil {
+		t.Fatalf("expected next snapshot to own a numeric range cache map")
+	}
+	if got := snapshotExtSyncMapLen(next.numericRangeBucketCache); got != 1 {
+		t.Fatalf("expected exactly one inherited numeric range entry, got=%d", got)
+	}
+	raw, ok := next.numericRangeBucketCache.Load("age")
+	if !ok || raw != ageEntry {
+		t.Fatalf("expected matching-storage entry to be inherited by pointer")
+	}
+	if _, ok := next.numericRangeBucketCache.Load("score"); ok {
+		t.Fatalf("expected changed-storage entry to be skipped")
+	}
+}
+
+func TestSnapshotExt_InheritNumericRangeBucketCacheSkipsMalformedAndEmptyEntries(t *testing.T) {
+	valid := snapshotExtStorage("10")
+	validEntry := &numericRangeBucketCacheEntry{
+		storage: valid,
+		idx: &numericRangeBucketIndex{
+			bucketSize: 1,
+			buckets:    []numericRangeBucket{{start: 0, end: 1}},
+		},
+	}
+
+	prev := &indexSnapshot{
+		index:                   map[string]fieldIndexStorage{"age": valid},
+		numericRangeBucketCache: newNumericRangeBucketCache(),
+	}
+	prev.numericRangeBucketCache.Store("", validEntry)
+	prev.numericRangeBucketCache.Store(123, validEntry)
+	prev.numericRangeBucketCache.Store("score", &numericRangeBucketCacheEntry{
+		storage: fieldIndexStorage{},
+		idx: &numericRangeBucketIndex{
+			bucketSize: 1,
+			buckets:    []numericRangeBucket{{start: 0, end: 1}},
+		},
+	})
+	prev.numericRangeBucketCache.Store("age", validEntry)
+
+	next := &indexSnapshot{
+		index: map[string]fieldIndexStorage{"age": valid},
+	}
+	inheritNumericRangeBucketCache(next, prev)
+
+	if next.numericRangeBucketCache == nil {
+		t.Fatalf("expected next snapshot to own numeric cache map")
+	}
+	if got := snapshotExtSyncMapLen(next.numericRangeBucketCache); got != 1 {
+		t.Fatalf("expected malformed/empty entries to be filtered, got=%d", got)
+	}
+	raw, ok := next.numericRangeBucketCache.Load("age")
+	if !ok || raw != validEntry {
+		t.Fatalf("expected only valid age entry to survive filtering")
+	}
+}
+
+/**/
+
+func TestSpanshotExt_ScanKeysStringShouldStayOnSingleSnapshotAcrossTruncate(t *testing.T) {
+	db, _ := openTempDBString(t, snapshotExtOptions())
+
+	if err := db.Set("k1", &Rec{Name: "one"}); err != nil {
+		t.Fatalf("Set(k1): %v", err)
+	}
+	if err := db.Set("k2", &Rec{Name: "two"}); err != nil {
+		t.Fatalf("Set(k2): %v", err)
+	}
+
+	old := db.getSnapshot()
+	if old == nil || old.strmap == nil {
+		t.Fatalf("expected published string-key snapshot")
+	}
+
+	var want []string
+	iterOld := old.universe.Iter()
+	defer iterOld.Release()
+	for iterOld.HasNext() {
+		idx := iterOld.Next()
+		key, ok := old.strmap.getStringNoLock(idx)
+		if !ok {
+			t.Fatalf("old snapshot lost key mapping for idx=%d", idx)
+		}
+		want = append(want, key)
+	}
+	if !slices.Equal(want, []string{"k1", "k2"}) {
+		t.Fatalf("unexpected old snapshot key order: %v", want)
+	}
+
+	universe := db.snapshotUniverseView()
+	iter := universe.Iter()
+	defer iter.Release()
+
+	if err := db.Truncate(); err != nil {
+		t.Fatalf("Truncate: %v", err)
+	}
+
+	var got []string
+	err := db.scanStringKeys(old.strmap, universe, iter, "", func(id string) (bool, error) {
+		got = append(got, id)
+		return true, nil
+	})
 	if err != nil {
-		t.Fatalf("QueryKeys: %v", err)
+		t.Fatalf("string ScanKeys split snapshot across truncate: err=%v want=%v got=%v", err, want, got)
 	}
-	if !slices.Equal(ids, []uint64{1}) {
-		t.Fatalf("query mismatch: got=%v want=[1]", ids)
+	if !slices.Equal(got, want) {
+		t.Fatalf("string ScanKeys mixed snapshots: got=%v want=%v", got, want)
 	}
 }
 
-func TestForceCompact_ClearsDeltaWithoutBackgroundCompactor(t *testing.T) {
-	db, _ := openTempDBUint64(t, Options{
-		SnapshotDeltaCompactMaxFieldsPerPublish: -1,
-		SnapshotCompactorRequestEveryNWrites:    -1,
-		SnapshotCompactorIdleInterval:           -1,
-		SnapshotCompactorMaxIterationsPerRun:    -1,
-	})
+func TestSpanshotExt_ScanKeysStringSplitSnapshotMustNotEmitFutureKeysAfterTruncateReuse(t *testing.T) {
+	db, _ := openTempDBString(t, snapshotExtOptions())
 
-	if err := db.Set(1, &Rec{Name: "alice", Age: 10}); err != nil {
-		t.Fatalf("Set #1: %v", err)
+	if err := db.Set("k1", &Rec{Name: "one"}); err != nil {
+		t.Fatalf("Set(k1): %v", err)
+	}
+	if err := db.Set("k2", &Rec{Name: "two"}); err != nil {
+		t.Fatalf("Set(k2): %v", err)
+	}
+
+	old := db.getSnapshot()
+	universe := db.snapshotUniverseView()
+	iter := universe.Iter()
+	defer iter.Release()
+
+	if err := db.Truncate(); err != nil {
+		t.Fatalf("Truncate: %v", err)
+	}
+	if err := db.Set("future", &Rec{Name: "future"}); err != nil {
+		t.Fatalf("Set(future): %v", err)
+	}
+
+	var got []string
+	err := db.scanStringKeys(old.strmap, universe, iter, "", func(id string) (bool, error) {
+		got = append(got, id)
+		return true, nil
+	})
+	if err != nil {
+		t.Fatalf("split snapshot emitted inconsistent string scan state: err=%v got=%v oldSeq=%d currentSeq=%d", err, got, old.seq, db.getSnapshot().seq)
+	}
+	if slices.Contains(got, "future") {
+		t.Fatalf("string scan leaked future key from newer snapshot: got=%v", got)
+	}
+	if !slices.Equal(got, []string{"k1", "k2"}) {
+		t.Fatalf("unexpected string scan result from old snapshot: got=%v", got)
+	}
+}
+
+func TestSpanshotExt_BeginQueryTxSnapshotSurvivesConcurrentTruncate(t *testing.T) {
+	db, _ := openTempDBUint64(t, snapshotExtOptions())
+
+	if err := db.Set(1, &Rec{Name: "alice", Age: 30}); err != nil {
+		t.Fatalf("Set(1): %v", err)
 	}
 	if err := db.Set(2, &Rec{Name: "bob", Age: 20}); err != nil {
-		t.Fatalf("Set #2: %v", err)
-	}
-	if err := db.Patch(1, []Field{{Name: "age", Value: 11}}); err != nil {
-		t.Fatalf("Patch: %v", err)
-	}
-
-	before := db.SnapshotStats()
-	if !before.HasDelta {
-		t.Fatalf("expected delta before ForceCompact, got %+v", before)
-	}
-
-	if err := db.ForceCompact(); err != nil {
-		t.Fatalf("ForceCompact: %v", err)
-	}
-
-	after := db.SnapshotStats()
-	if after.HasDelta || after.IndexDeltaFields != 0 || after.LenDeltaFields != 0 ||
-		after.IndexDeltaOps != 0 || after.LenDeltaOps != 0 ||
-		after.UniverseAddCard != 0 || after.UniverseRemCard != 0 {
-		t.Fatalf("expected clean snapshot after ForceCompact, got %+v", after)
-	}
-
-	ids, err := db.QueryKeys(qx.Query(qx.GTE("age", 11)))
-	if err != nil {
-		t.Fatalf("QueryKeys: %v", err)
-	}
-	slices.Sort(ids)
-	if !slices.Equal(ids, []uint64{1, 2}) {
-		t.Fatalf("query mismatch after ForceCompact: got=%v want=[1 2]", ids)
-	}
-}
-
-func TestForceCompact_CompactsStringKeySnapshotStrMap(t *testing.T) {
-	db, _ := openTempDBString(t, Options{
-		SnapshotDeltaCompactMaxFieldsPerPublish: -1,
-		SnapshotCompactorRequestEveryNWrites:    -1,
-		SnapshotCompactorIdleInterval:           -1,
-		SnapshotCompactorMaxIterationsPerRun:    -1,
-	})
-	db.strmap.compactAt = 1 << 30
-
-	if err := db.Set("k1", &Rec{Name: "alice", Age: 10}); err != nil {
-		t.Fatalf("Set k1: %v", err)
-	}
-	if err := db.Set("k2", &Rec{Name: "bob", Age: 20}); err != nil {
-		t.Fatalf("Set k2: %v", err)
+		t.Fatalf("Set(2): %v", err)
 	}
 
 	before := db.getSnapshot()
-	if before == nil || before.strmap == nil {
-		t.Fatalf("expected string snapshot before ForceCompact")
-	}
-	if before.strmap.depth < 2 || before.strmap.base == nil {
-		t.Fatalf("expected layered strmap before ForceCompact, got depth=%d", before.strmap.depth)
-	}
-
-	if err := db.ForceCompact(); err != nil {
-		t.Fatalf("ForceCompact: %v", err)
-	}
-
-	after := db.getSnapshot()
-	if after == nil || after.strmap == nil {
-		t.Fatalf("expected string snapshot after ForceCompact")
-	}
-	if after.strmap.base != nil || after.strmap.depth != 1 {
-		t.Fatalf("expected compacted dense strmap after ForceCompact, got depth=%d base=%v", after.strmap.depth, after.strmap.base != nil)
-	}
-	if after.strmap.DenseStrs == nil || after.strmap.Strs != nil {
-		t.Fatalf("expected dense-only strmap after ForceCompact")
-	}
-	if db.snapshotHasAnyDelta() {
-		t.Fatalf("expected ForceCompact to clear latest snapshot delta")
-	}
-	if _, ok := after.strmap.getIdxNoLock("k1"); !ok {
-		t.Fatalf("compacted strmap lost k1 mapping")
-	}
-	if _, ok := after.strmap.getIdxNoLock("k2"); !ok {
-		t.Fatalf("compacted strmap lost k2 mapping")
-	}
-}
-
-func TestForceCompact_StringKeySnapshotIgnoresTransientLiveMappings(t *testing.T) {
-	db, _ := openTempDBString(t, Options{
-		SnapshotDeltaCompactMaxFieldsPerPublish: -1,
-		SnapshotCompactorRequestEveryNWrites:    -1,
-		SnapshotCompactorIdleInterval:           -1,
-		SnapshotCompactorMaxIterationsPerRun:    -1,
-	})
-	db.strmap.compactAt = 1 << 30
-
-	if err := db.Set("k1", &Rec{Name: "alice", Age: 10}); err != nil {
-		t.Fatalf("Set k1: %v", err)
-	}
-
-	before := db.getSnapshot()
-	if before == nil || before.strmap == nil {
-		t.Fatalf("expected published strmap before transient mapping")
-	}
-
-	ghostIdx, created := db.idxFromIDWithCreated("ghost")
-	if !created {
-		t.Fatalf("expected transient ghost idx to be newly created")
-	}
-	if ghostIdx <= before.strmap.Next {
-		t.Fatalf("expected transient idx to be outside published snapshot: idx=%d next=%d", ghostIdx, before.strmap.Next)
-	}
-	if _, ok := before.strmap.getIdxNoLock("ghost"); ok {
-		t.Fatalf("published snapshot must not observe transient ghost mapping")
-	}
-
-	if err := db.ForceCompact(); err != nil {
-		t.Fatalf("ForceCompact: %v", err)
-	}
-
-	compacted := db.getSnapshot()
-	if compacted == nil || compacted.strmap == nil {
-		t.Fatalf("expected compacted strmap after ForceCompact")
-	}
-	if _, ok := compacted.strmap.getIdxNoLock("ghost"); ok {
-		t.Fatalf("ForceCompact must not publish transient ghost mapping")
-	}
-
-	db.rollbackCreatedStrIdx("ghost", ghostIdx)
-
-	if err := db.Set("real", &Rec{Name: "bob", Age: 20}); err != nil {
-		t.Fatalf("Set real: %v", err)
-	}
-
-	after := db.getSnapshot()
-	if after == nil || after.strmap == nil {
-		t.Fatalf("expected published strmap after real write")
-	}
-	if got, ok := after.strmap.getStringNoLock(ghostIdx); !ok || got != "real" {
-		t.Fatalf("reused idx must resolve to real key, got=%q ok=%v idx=%d", got, ok, ghostIdx)
-	}
-
-	ids, err := db.QueryKeys(qx.Query(qx.EQ("age", 20)))
+	tx, snap, seq, ref, err := db.beginQueryTxSnapshot()
 	if err != nil {
-		t.Fatalf("QueryKeys: %v", err)
-	}
-	if !slices.Equal(ids, []string{"real"}) {
-		t.Fatalf("query mismatch after reused idx: got=%v want=[real]", ids)
-	}
-}
-
-func TestSnapshotCompactor_PreclaimBusySkipsBuildWhileWriterLockHeld(t *testing.T) {
-	db, _ := openTempDBUint64(t, Options{
-		SnapshotDeltaCompactFieldKeys:           1 << 20,
-		SnapshotDeltaCompactFieldOps:            1 << 20,
-		SnapshotDeltaCompactUniverseOps:         1 << 20,
-		SnapshotDeltaCompactMaxFieldsPerPublish: 64,
-		SnapshotCompactorRequestEveryNWrites:    8,
-		SnapshotCompactorIdleInterval:           -1,
-		SnapshotCompactorMaxIterationsPerRun:    1,
-	})
-
-	if err := db.Set(1, &Rec{Name: "alice", Age: 10}); err != nil {
-		t.Fatalf("Set: %v", err)
-	}
-	if !db.snapshotHasAnyDelta() {
-		t.Fatalf("expected delta before compaction")
+		t.Fatalf("beginQueryTxSnapshot: %v", err)
 	}
 
-	locked := make(chan struct{})
-	releaseLock := make(chan struct{})
-	unlocked := make(chan struct{})
+	done := make(chan error, 1)
 	go func() {
-		db.mu.Lock()
-		close(locked)
-		<-releaseLock
-		db.mu.Unlock()
-		close(unlocked)
+		done <- db.Truncate()
 	}()
-	<-locked
 
-	before := db.SnapshotStats()
-	applied, missed := db.compactLatestSnapshotOnce(false)
-	close(releaseLock)
-	<-unlocked
-
-	if applied {
-		t.Fatalf("expected no compaction apply while writer lock is held")
-	}
-	if !missed {
-		t.Fatalf("expected preclaim busy path to signal missed compaction")
-	}
-
-	afterBusy := db.SnapshotStats()
-	if afterBusy.CompactorPreclaimBusy <= before.CompactorPreclaimBusy {
-		t.Fatalf("expected preclaim busy counter to increase: before=%d after=%d", before.CompactorPreclaimBusy, afterBusy.CompactorPreclaimBusy)
-	}
-	if afterBusy.CompactorLockMiss != before.CompactorLockMiss {
-		t.Fatalf("expected preclaim busy skip to avoid lock-miss counter: before=%d after=%d", before.CompactorLockMiss, afterBusy.CompactorLockMiss)
-	}
-	if !db.snapshotHasAnyDelta() {
-		t.Fatalf("expected delta to remain after skipped compaction")
-	}
-
-	applied, missed = db.compactLatestSnapshotOnce(true)
-	if !applied || missed {
-		t.Fatalf("expected compaction to apply after writer lock release, applied=%v missed=%v", applied, missed)
-	}
-	if db.snapshotHasAnyDelta() {
-		t.Fatalf("expected delta to be cleared after successful compaction")
-	}
-}
-
-func TestSnapshotCompactor_IdlePrunesRegistryToLatest(t *testing.T) {
-	db, _ := openTempDBUint64(t, Options{
-		SnapshotDeltaCompactFieldKeys:           1 << 20,
-		SnapshotDeltaCompactFieldOps:            1 << 20,
-		SnapshotDeltaCompactUniverseOps:         1 << 20,
-		SnapshotDeltaCompactMaxFieldsPerPublish: 64,
-		SnapshotCompactorRequestEveryNWrites:    1_000_000,
-		SnapshotCompactorIdleInterval:           20 * time.Millisecond,
-		SnapshotCompactorMaxIterationsPerRun:    4,
-		SnapshotRegistryMax:                     1024,
-	})
-
-	for i := 1; i <= 8; i++ {
-		if err := db.Set(uint64(i), &Rec{Name: fmt.Sprintf("u-%d", i), Age: i}); err != nil {
-			t.Fatalf("Set #%d: %v", i, err)
-		}
-	}
-
-	waitForSnapshotState(t, 700*time.Millisecond, "registry collapsed to latest snapshot", func() bool {
-		db.snapshot.mu.RLock()
-		defer db.snapshot.mu.RUnlock()
-
-		if len(db.snapshot.bySeq) != 1 {
-			return false
-		}
-		latest := db.getSnapshot().seq
-		ref := db.snapshot.bySeq[latest]
-		return ref != nil && ref.snap != nil && ref.refs.Load() == 0
-	})
-}
-
-func TestSnapshotCompactor_IdlePrunesAfterPinnedSnapshotReleased(t *testing.T) {
-	db, _ := openTempDBUint64(t, Options{
-		SnapshotDeltaCompactFieldKeys:           1 << 20,
-		SnapshotDeltaCompactFieldOps:            1 << 20,
-		SnapshotDeltaCompactUniverseOps:         1 << 20,
-		SnapshotDeltaCompactMaxFieldsPerPublish: 64,
-		SnapshotCompactorRequestEveryNWrites:    1_000_000,
-		SnapshotCompactorIdleInterval:           20 * time.Millisecond,
-		SnapshotCompactorMaxIterationsPerRun:    4,
-		SnapshotRegistryMax:                     1024,
-	})
-
-	if err := db.Set(1, &Rec{Name: "u-1", Age: 1}); err != nil {
-		t.Fatalf("Set #1: %v", err)
-	}
-	pinnedTx := db.getSnapshot().seq
-	_, ref, ok := db.pinSnapshotRefBySeq(pinnedTx)
-	if !ok {
-		t.Fatalf("pinBySequence(%d) failed", pinnedTx)
-	}
-
-	if err := db.Set(2, &Rec{Name: "u-2", Age: 2}); err != nil {
-		t.Fatalf("Set #2: %v", err)
-	}
-
-	waitForSnapshotState(t, 700*time.Millisecond, "force pass observed pinned snapshot", func() bool {
-		return db.snapshot.compactPinsBlocked.Load()
-	})
-	db.unpinSnapshotRef(ref)
-
-	waitForSnapshotState(t, 700*time.Millisecond, "registry pruned after pinned release", func() bool {
-		db.snapshot.mu.RLock()
-		defer db.snapshot.mu.RUnlock()
-		latest := db.getSnapshot().seq
-		return len(db.snapshot.bySeq) == 1 && db.snapshot.bySeq[pinnedTx] == nil && db.snapshot.bySeq[latest] != nil
-	})
-}
-
-func TestMergeUniverseDelta_DoesNotMutatePreviousBitmaps(t *testing.T) {
-	prevAdd := roaring64.BitmapOf(1)
-	prevDrop := roaring64.BitmapOf(3)
-	add := roaring64.BitmapOf(2, 3)
-	drop := roaring64.BitmapOf(1, 4)
-
-	gotAdd, gotDrop := mergeUniverseDelta(prevAdd, prevDrop, add, drop)
-
-	if !gotAdd.Equals(roaring64.BitmapOf(2)) {
-		t.Fatalf("unexpected add bitmap: %v", gotAdd.ToArray())
-	}
-	if !gotDrop.Equals(roaring64.BitmapOf(4)) {
-		t.Fatalf("unexpected drop bitmap: %v", gotDrop.ToArray())
-	}
-
-	if !prevAdd.Equals(roaring64.BitmapOf(1)) {
-		t.Fatalf("prevAdd mutated: %v", prevAdd.ToArray())
-	}
-	if !prevDrop.Equals(roaring64.BitmapOf(3)) {
-		t.Fatalf("prevDrop mutated: %v", prevDrop.ToArray())
-	}
-}
-
-func TestOverlayDistinctCount_ExcludesFullyDeletedBucket(t *testing.T) {
-	base := []index{
-		{Key: indexKeyFromString("a"), IDs: postingOf(1)},
-		{Key: indexKeyFromString("b"), IDs: postingOf(2)},
-	}
-	delta := &fieldIndexDelta{
-		byKey: map[string]indexDeltaEntry{
-			"a": {delSingle: 1, delSingleSet: true},
-		},
-	}
-	ov := newFieldOverlay(&base, delta)
-
-	total := overlayDistinctTotalCount(ov)
-	if total != 1 {
-		t.Fatalf("total distinct mismatch: got=%d want=1", total)
-	}
-
-	rangeA := ov.rangeForBounds(rangeBounds{
-		has:   true,
-		hasLo: true,
-		loKey: "a",
-		loInc: true,
-		hasHi: true,
-		hiKey: "a",
-		hiInc: true,
-	})
-	if got := overlayDistinctRangeCount(ov, rangeA); got != 0 {
-		t.Fatalf("range distinct for key=a mismatch: got=%d want=0", got)
-	}
-}
-
-func TestPinSnapshotBySequenceWait_FailsFastWhenLatestPassedTarget(t *testing.T) {
-	db, _ := openTempDBUint64(t)
-	if err := db.Set(1, &Rec{Name: "a", Age: 10}); err != nil {
-		t.Fatalf("Set 1: %v", err)
-	}
-	targetTx := db.getSnapshot().seq
-
-	if err := db.Set(2, &Rec{Name: "b", Age: 20}); err != nil {
-		t.Fatalf("Set 2: %v", err)
-	}
-	latestTx := db.getSnapshot().seq
-	if latestTx <= targetTx {
-		t.Fatalf("expected latest sequence > target sequence, got latest=%d target=%d", latestTx, targetTx)
-	}
-
-	db.snapshot.mu.Lock()
-	delete(db.snapshot.bySeq, targetTx)
-	db.snapshot.mu.Unlock()
-
-	start := time.Now()
-	snap, _, ok := db.pinSnapshotRefBySeq(targetTx)
-	elapsed := time.Since(start)
-	if ok || snap != nil {
-		t.Fatalf("expected pin wait to fail for missing old sequence=%d", targetTx)
-	}
-	if elapsed >= 250*time.Millisecond {
-		t.Fatalf("expected fast failure, elapsed=%v", elapsed)
-	}
-}
-
-func TestQuery_FailsWhenSnapshotMissingForCurrentSequence(t *testing.T) {
-	db, _ := openTempDBUint64(t)
-	if err := db.Set(1, &Rec{Name: "alice", Age: 10}); err != nil {
-		t.Fatalf("Set seed: %v", err)
-	}
-
-	missingSeq := db.getSnapshot().seq
-	db.snapshot.mu.Lock()
-	delete(db.snapshot.bySeq, missingSeq)
-	db.snapshot.mu.Unlock()
-
-	items, err := db.Query(qx.Query(qx.EQ("name", "alice")))
-	if err == nil {
-		t.Fatalf("expected snapshot sequence error, got items=%#v", items)
-	}
-}
-
-func TestQuery_IgnoresExternalWritesToOtherBuckets(t *testing.T) {
-	db, _ := openTempDBUint64(t)
-	if err := db.Set(1, &Rec{Name: "alice", Age: 10}); err != nil {
-		t.Fatalf("Set seed: %v", err)
-	}
-
-	if err := db.bolt.Update(func(tx *bbolt.Tx) error {
-		b, err := tx.CreateBucketIfNotExists([]byte("__ext_tx__"))
-		if err != nil {
-			return err
-		}
-		return b.Put([]byte("k"), []byte("v"))
-	}); err != nil {
-		t.Fatalf("external update: %v", err)
-	}
-
-	start := time.Now()
-	items, err := db.Query(qx.Query(qx.EQ("name", "alice")))
-	elapsed := time.Since(start)
-
+	alice, err := db.queryRecords(tx, snap, qx.Query(qx.EQ("name", "alice")))
 	if err != nil {
-		t.Fatalf("Query: %v", err)
+		t.Fatalf("queryRecords(old snapshot alice): %v", err)
 	}
-	if len(items) != 1 || items[0] == nil || items[0].Name != "alice" {
-		t.Fatalf("unexpected Query result: %#v", items)
+	if len(alice) != 1 || alice[0] == nil || alice[0].Name != "alice" {
+		t.Fatalf("unexpected old snapshot alice result: %#v", alice)
 	}
-	if elapsed >= 150*time.Millisecond {
-		t.Fatalf("expected fast query independent of external bucket writes, elapsed=%v", elapsed)
+
+	all, err := db.queryRecords(tx, snap, qx.Query())
+	if err != nil {
+		t.Fatalf("queryRecords(old snapshot all): %v", err)
+	}
+	if len(all) != 2 {
+		t.Fatalf("old tx/snapshot lost rows across truncate: %#v", all)
+	}
+
+	rollback(tx)
+	db.unpinSnapshotRef(seq, ref)
+
+	if err := <-done; err != nil {
+		t.Fatalf("Truncate: %v", err)
+	}
+
+	after := db.getSnapshot()
+	if after.seq <= before.seq {
+		t.Fatalf("truncate did not publish newer snapshot: before=%d after=%d", before.seq, after.seq)
+	}
+
+	current, err := db.Query(qx.Query())
+	if err != nil {
+		t.Fatalf("Query(current after truncate): %v", err)
+	}
+	if len(current) != 0 {
+		t.Fatalf("current snapshot should be empty after truncate, got=%#v", current)
 	}
 }
 
-func TestQuery_FailsWhenRegistryHasHoleForCurrentSequence(t *testing.T) {
-	db, _ := openTempDBUint64(t)
-	if err := db.Set(1, &Rec{Name: "alice", Age: 10}); err != nil {
-		t.Fatalf("Set alice: %v", err)
+func TestSpanshotExt_BeginQueryTxSnapshotSurvivesBrokenTruncatePublish(t *testing.T) {
+	db, _ := openTempDBUint64(t, snapshotExtOptions())
+
+	if err := db.Set(1, &Rec{Name: "alice", Age: 30}); err != nil {
+		t.Fatalf("Set(1): %v", err)
 	}
 	if err := db.Set(2, &Rec{Name: "bob", Age: 20}); err != nil {
-		t.Fatalf("Set bob: %v", err)
-	}
-	targetSeq := db.getSnapshot().seq
-
-	db.snapshot.mu.Lock()
-	delete(db.snapshot.bySeq, targetSeq)
-	db.snapshot.mu.Unlock()
-
-	items, err := db.Query(qx.Query(qx.EQ("name", "bob")))
-	if err == nil {
-		t.Fatalf("expected snapshot sequence error, got items=%#v", items)
-	}
-}
-
-func TestQueryWithTx_FailsWhenSnapshotMissingAndLatestIsNewer(t *testing.T) {
-	db, _ := openTempDBUint64(t)
-	if err := db.Set(1, &Rec{Name: "alice", Age: 10}); err != nil {
-		t.Fatalf("Set alice: %v", err)
+		t.Fatalf("Set(2): %v", err)
 	}
 
-	tx, err := db.bolt.Begin(false)
+	before := db.getSnapshot()
+	tx, snap, seq, ref, err := db.beginQueryTxSnapshot()
 	if err != nil {
-		t.Fatalf("Begin read tx: %v", err)
-	}
-	defer func() { _ = tx.Rollback() }()
-
-	oldSeq := tx.Bucket(db.bucket).Sequence()
-	next := &indexSnapshot{seq: oldSeq + 1}
-	db.registerSnapshot(next)
-	db.snapshot.current.Store(next)
-
-	db.snapshot.mu.Lock()
-	delete(db.snapshot.bySeq, oldSeq)
-	db.snapshot.mu.Unlock()
-
-	items, retry, err := db.queryWithTx(tx, qx.Query(qx.EQ("name", "alice")))
-	if err == nil {
-		t.Fatalf("expected snapshot sequence error, got items=%#v retry=%v", items, retry)
-	}
-}
-
-func TestQueryWithTx_UsesPendingSequenceSnapshotWithoutWaiting(t *testing.T) {
-	db, raw := openBoltAndNew[uint64, Rec](t, filepath.Join(t.TempDir(), "pending-stale.db"))
-	defer func() { _ = raw.Close() }()
-
-	stale := db.getSnapshot()
-	if err := db.Set(1, &Rec{Name: "alice", Age: 10}); err != nil {
-		t.Fatalf("Set alice: %v", err)
-	}
-	latest := db.getSnapshot()
-
-	tx, err := raw.Begin(false)
-	if err != nil {
-		t.Fatalf("Begin read tx: %v", err)
-	}
-	defer func() { _ = tx.Rollback() }()
-
-	targetSeq := tx.Bucket(db.bucket).Sequence()
-	if latest.seq != targetSeq {
-		t.Fatalf("snapshot sequence mismatch: latest=%d tx=%d", latest.seq, targetSeq)
-	}
-	db.snapshot.current.Store(stale)
-	db.stageSnapshot(latest)
-
-	items, retry, err := db.queryWithTx(tx, qx.Query(qx.EQ("name", "alice")))
-	if err != nil {
-		t.Fatalf("expected staged sequence snapshot to be used, got items=%#v retry=%v err=%v", items, retry, err)
-	}
-	if retry {
-		t.Fatalf("expected no retry for staged sequence snapshot")
-	}
-	if len(items) != 1 || items[0] == nil || items[0].Name != "alice" {
-		t.Fatalf("unexpected items: %#v", items)
-	}
-}
-
-func TestPinSnapshotBySequenceWait_FailsFastWhenTargetAheadAndNotPending(t *testing.T) {
-	db, _ := openTempDBUint64(t)
-	if err := db.Set(1, &Rec{Name: "seed", Age: 10}); err != nil {
-		t.Fatalf("Set: %v", err)
-	}
-	latest := db.getSnapshot().seq
-	target := latest + 100
-
-	start := time.Now()
-	snap, _, ok := db.pinSnapshotRefBySeq(target)
-	elapsed := time.Since(start)
-	if ok || snap != nil {
-		t.Fatalf("expected fast fail for non-existent future sequence=%d", target)
-	}
-	if elapsed >= 250*time.Millisecond {
-		t.Fatalf("expected fast failure, elapsed=%v", elapsed)
-	}
-}
-
-func TestPinSnapshotBySequenceWait_PinsPendingSnapshotImmediately(t *testing.T) {
-	db, _ := openTempDBUint64(t)
-	if err := db.Set(1, &Rec{Name: "seed", Age: 10}); err != nil {
-		t.Fatalf("Set: %v", err)
-	}
-	latest := db.getSnapshot().seq
-	target := latest + 1
-	db.stageSnapshot(&indexSnapshot{seq: target})
-
-	snap, ref, ok := db.pinSnapshotRefBySeq(target)
-	if !ok || snap == nil {
-		t.Fatalf("expected staged sequence pin to succeed immediately")
-	}
-	db.unpinSnapshotRef(ref)
-}
-
-func TestPinSnapshotBySequenceWait_FailsFastWhenLatestEqualsTargetButRegistryMissing(t *testing.T) {
-	db, _ := openTempDBUint64(t)
-	if err := db.Set(1, &Rec{Name: "seed", Age: 10}); err != nil {
-		t.Fatalf("Set: %v", err)
-	}
-	target := db.getSnapshot().seq
-
-	db.snapshot.mu.Lock()
-	delete(db.snapshot.bySeq, target)
-	db.snapshot.mu.Unlock()
-
-	start := time.Now()
-	snap, _, ok := db.pinSnapshotRefBySeq(target)
-	elapsed := time.Since(start)
-	if ok || snap != nil {
-		t.Fatalf("expected fast fail for missing current sequence=%d", target)
-	}
-	if elapsed >= 250*time.Millisecond {
-		t.Fatalf("expected fast failure, elapsed=%v", elapsed)
-	}
-}
-
-func TestSnapshotRegistry_PrunesPastPinnedHead(t *testing.T) {
-	maxRegistry := 8
-	db, _ := openTempDBUint64(t, Options{
-		SnapshotRegistryMax: maxRegistry,
-	})
-	if err := db.Set(1, &Rec{Name: "seed", Age: 10}); err != nil {
-		t.Fatalf("seed Set: %v", err)
-	}
-	pinnedTx := db.getSnapshot().seq
-	if _, ref, ok := db.pinSnapshotRefBySeq(pinnedTx); !ok {
-		t.Fatalf("failed to pin snapshot sequence=%d", pinnedTx)
-	} else {
-		defer db.unpinSnapshotRef(ref)
+		t.Fatalf("beginQueryTxSnapshot: %v", err)
 	}
 
-	for i := 2; i <= 220; i++ {
-		if err := db.Set(uint64(i), &Rec{Name: "u", Age: i}); err != nil {
-			t.Fatalf("Set #%d: %v", i, err)
+	db.testHooks.afterCommitPublish = func(op string) {
+		if op == "truncate" {
+			panic("failpoint: publish truncate")
 		}
 	}
-
-	db.snapshot.mu.Lock()
-	mapLen := len(db.snapshot.bySeq)
-	_, pinnedStillExists := db.snapshot.bySeq[pinnedTx]
-	db.snapshot.mu.Unlock()
-
-	if !pinnedStillExists {
-		t.Fatalf("pinned snapshot disappeared: sequence=%d", pinnedTx)
-	}
-	if mapLen > maxRegistry+2 {
-		t.Fatalf("snapshot registry grew unexpectedly: len=%d max=%d", mapLen, maxRegistry)
-	}
-}
-
-func TestSnapshotRegistry_CompactsHugeOrderWithPinnedHead(t *testing.T) {
-	maxRegistry := 4
-	db, _ := openTempDBUint64(t, Options{
-		SnapshotRegistryMax: maxRegistry,
+	t.Cleanup(func() {
+		db.testHooks.afterCommitPublish = nil
 	})
 
-	db.snapshot.mu.Lock()
-	db.snapshot.bySeq = make(map[uint64]*snapshotRef, 8)
-	db.snapshot.order = db.snapshot.order[:0]
-	db.snapshot.head = 0
+	done := make(chan error, 1)
+	go func() {
+		done <- db.Truncate()
+	}()
 
-	for tx := uint64(1); tx <= 2048; tx++ {
-		db.snapshot.order = append(db.snapshot.order, tx)
+	all, err := db.queryRecords(tx, snap, qx.Query())
+	if err != nil {
+		t.Fatalf("queryRecords(old snapshot all): %v", err)
+	}
+	if len(all) != 2 {
+		t.Fatalf("old tx/snapshot lost rows during broken truncate publish: %#v", all)
 	}
 
-	head := &snapshotRef{snap: &indexSnapshot{seq: 1}}
-	head.refs.Add(1) // keep head pinned
-	db.snapshot.bySeq[1] = head
-	db.snapshot.bySeq[2045] = &snapshotRef{snap: &indexSnapshot{seq: 2045}}
-	db.snapshot.bySeq[2046] = &snapshotRef{snap: &indexSnapshot{seq: 2046}}
-	db.snapshot.bySeq[2047] = &snapshotRef{snap: &indexSnapshot{seq: 2047}}
-	db.snapshot.bySeq[2048] = &snapshotRef{snap: &indexSnapshot{seq: 2048}}
-	db.snapshot.current.Store(&indexSnapshot{seq: 2048})
+	rollback(tx)
+	db.unpinSnapshotRef(seq, ref)
 
-	before := len(db.snapshot.order)
-	db.pruneSnapshotsLocked()
-	after := len(db.snapshot.order)
-	mapLen := len(db.snapshot.bySeq)
-	db.snapshot.mu.Unlock()
+	err = <-done
+	if !errors.Is(err, ErrBroken) {
+		t.Fatalf("expected ErrBroken from truncate publish failpoint, got: %v", err)
+	}
 
-	if before < 2000 {
-		t.Fatalf("unexpected setup: before=%d", before)
-	}
-	if after > mapLen+1 {
-		t.Fatalf("snapshot order was not compacted enough: before=%d after=%d map=%d", before, after, mapLen)
-	}
-	if mapLen > maxRegistry+1 {
-		t.Fatalf("snapshot map too large after prune: len=%d max=%d", mapLen, maxRegistry)
+	assertNoFutureSnapshotRefs(t, db)
+	if got := db.getSnapshot(); got != before {
+		t.Fatalf("broken truncate publish should keep previously published snapshot current")
 	}
 }
 
-func TestAccumulateDeltaLayerState_SkipsCompactionForLargeBaseSmallDelta(t *testing.T) {
-	opt := Options{
-		SnapshotDeltaCompactFieldKeys:           1,
-		SnapshotDeltaCompactMaxFieldsPerPublish: 4,
-	}
+func TestSpanshotExt_MaterializedPredMixedRegularAndOversizedConcurrentRespectsGlobalLimit(t *testing.T) {
+	n := max(16, runtime.GOMAXPROCS(0)*8)
+	small := snapshotExtPosting(1)
+	large := snapshotExtPosting(1, 2)
 
-	baseSlice := make([]index, 0, defaultSnapshotDeltaCompactLargeBaseFieldKeys+1)
-	for i := 0; i <= defaultSnapshotDeltaCompactLargeBaseFieldKeys; i++ {
-		baseSlice = append(baseSlice, index{Key: indexKeyFromU64(uint64(i + 1))})
-	}
-	base := map[string]*[]index{"hot": &baseSlice}
-	origPtr := base["hot"]
+	for round := 0; round < 32; round++ {
+		s := &indexSnapshot{
+			matPredCacheMaxEntries: 1,
+			matPredCacheMaxCard:    1,
+		}
+		snapshotExtRunConcurrent(n, func(i int) {
+			if i%2 == 0 {
+				s.storeMaterializedPred(fmt.Sprintf("email\x1f%d\x1f%d", qx.OpPREFIX, i), small)
+				return
+			}
+			s.tryStoreMaterializedPredOversized(fmt.Sprintf("age\x1frange_bucket\x1f%d", i), large)
+		})
 
-	changes := map[string]map[string]indexDeltaEntry{
-		"hot": {
-			"k999": {addSingle: 999, addSingleSet: true},
-		},
-	}
-
-	nextBase, nextLayer, _ := accumulateDeltaLayerState(base, nil, 0, changes, &opt)
-	if nextBase["hot"] != origPtr {
-		t.Fatalf("expected no base compaction for large base with tiny delta")
-	}
-
-	d := lookupLayerFieldDelta(nextLayer, "hot")
-	if d == nil || d.keyCount() == 0 {
-		t.Fatalf("expected delta to remain layered for large base")
+		if got := s.matPredCacheCount.Load(); got > 1 {
+			t.Fatalf("round=%d mixed cache count exceeded global limit: got=%d", round, got)
+		}
+		if got := snapshotExtSyncMapLen(&s.matPredCache); got > 1 {
+			t.Fatalf("round=%d mixed cache entries exceeded global limit: got=%d", round, got)
+		}
 	}
 }
 
-func TestAccumulateDeltaLayerState_ForceCompactionByOps(t *testing.T) {
-	opt := Options{
-		SnapshotDeltaCompactFieldKeys:           1,
-		SnapshotDeltaCompactFieldOps:            1,
-		SnapshotDeltaCompactMaxFieldsPerPublish: 4,
+func TestIndexSnapshotMaterializedPredCacheDetachedLoadsUnderConcurrency(t *testing.T) {
+	snap := &indexSnapshot{matPredCacheMaxEntries: 8}
+
+	base := snapshotExtPosting()
+	for i := uint64(1); i <= 40; i++ {
+		base.Add(i * 5)
+	}
+	want := base.ToArray()
+
+	snap.storeMaterializedPred("email\x1f1\xfal", base.Borrow())
+	base.Release()
+
+	remove := snapshotExtPosting(want[0], want[1], want[2])
+	add := snapshotExtPosting(1<<32|3, 1<<32|7)
+	defer remove.Release()
+	defer add.Release()
+
+	var failed atomic.Pointer[string]
+	setFailed := func(msg string) {
+		if failed.Load() != nil {
+			return
+		}
+		copyMsg := msg
+		failed.CompareAndSwap(nil, &copyMsg)
 	}
 
-	baseSlice := make([]index, 0, defaultSnapshotDeltaCompactLargeBaseFieldKeys+1)
-	for i := 0; i <= defaultSnapshotDeltaCompactLargeBaseFieldKeys; i++ {
-		baseSlice = append(baseSlice, index{Key: indexKeyFromU64(uint64(i + 1))})
-	}
-	base := map[string]*[]index{"hot": &baseSlice}
-	origPtr := base["hot"]
+	start := make(chan struct{})
+	var wg sync.WaitGroup
 
-	forceOps := roaring64.NewBitmap()
-	forceOps.AddRange(1, defaultSnapshotDeltaCompactForceFieldOps+1)
-
-	changes := map[string]map[string]indexDeltaEntry{
-		"hot": {
-			"k999": {add: forceOps},
-		},
-	}
-
-	nextBase, nextLayer, _ := accumulateDeltaLayerState(base, nil, 0, changes, &opt)
-	if nextBase["hot"] == origPtr {
-		t.Fatalf("expected force-compaction to materialize new base field")
-	}
-	if d := lookupLayerFieldDelta(nextLayer, "hot"); d != nil {
-		t.Fatalf("expected no effective layered delta after force-compaction")
-	}
-}
-
-func TestLookupLayerFieldDeltaWithScratch_MaterializedResultIndependentFromScratch(t *testing.T) {
-	baseHot := buildFieldDeltaPatch(map[string]indexDeltaEntry{
-		"a": {addSingle: 1, addSingleSet: true},
-	}, false)
-	topHot := buildFieldDeltaPatch(map[string]indexDeltaEntry{
-		"b": {addSingle: 2, addSingleSet: true},
-	}, false)
-	baseCold := buildFieldDeltaPatch(map[string]indexDeltaEntry{
-		"x": {addSingle: 10, addSingleSet: true},
-	}, false)
-	topCold := buildFieldDeltaPatch(map[string]indexDeltaEntry{
-		"y": {addSingle: 20, addSingleSet: true},
-	}, false)
-
-	layer := &fieldDeltaLayer{
-		fields: map[string]*fieldIndexDelta{
-			"hot":  baseHot,
-			"cold": baseCold,
-		},
-		depth: 1,
-	}
-	layer = &fieldDeltaLayer{
-		parent: layer,
-		fields: map[string]*fieldIndexDelta{
-			"hot":  topHot,
-			"cold": topCold,
-		},
-		depth: 2,
+	for g := 0; g < 6; g++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			for i := 0; i < 1000; i++ {
+				cached, ok := snap.loadMaterializedPred("email\x1f1\xfal")
+				if !ok {
+					setFailed("cache entry unexpectedly missing")
+					return
+				}
+				if !slices.Equal(cached.ToArray(), want) {
+					setFailed(fmt.Sprintf("cached view mismatch: got=%v want=%v", cached.ToArray(), want))
+					return
+				}
+				cached.Release()
+			}
+		}()
 	}
 
-	scratch := getLayerFieldDeltaMergeScratch()
-	defer releaseLayerFieldDeltaMergeScratch(scratch)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		<-start
+		for i := 0; i < 300; i++ {
+			cached, ok := snap.loadMaterializedPred("email\x1f1\xfal")
+			if !ok {
+				setFailed("writer load unexpectedly missed cache")
+				return
+			}
+			cached.AndNotInPlace(remove)
+			cached.OrInPlace(add)
+			cached.Add(6<<32 | uint64(i))
+			cached.Optimize()
+			cached.Release()
+		}
+	}()
 
-	materialized := lookupLayerFieldDeltaWithScratch(layer, "hot", scratch)
-	if materialized == nil || materialized.keyCount() != 2 {
-		t.Fatalf("expected merged materialized delta for hot")
-	}
-	if _, ok := materialized.get("a"); !ok {
-		t.Fatalf("expected key a in materialized delta")
-	}
-	if _, ok := materialized.get("b"); !ok {
-		t.Fatalf("expected key b in materialized delta")
+	close(start)
+	wg.Wait()
+	if msg := failed.Load(); msg != nil {
+		t.Fatal(*msg)
 	}
 
-	_, _ = lookupLayerFieldDeltaBorrowedWithScratch(layer, "cold", scratch)
-	if _, ok := materialized.get("a"); !ok {
-		t.Fatalf("materialized delta unexpectedly changed after scratch reuse")
-	}
-	if _, ok := materialized.get("b"); !ok {
-		t.Fatalf("materialized delta unexpectedly changed after scratch reuse")
-	}
-}
-
-func TestSnapshotMaterializedPredCache_DeltaSnapshotUsesReducedLimit(t *testing.T) {
-	s := &indexSnapshot{
-		indexDCount: 1,
-		indexDelta: map[string]*fieldIndexDelta{
-			"f": {
-				byKey: map[string]indexDeltaEntry{
-					"x": {addSingle: 1, addSingleSet: true},
-				},
-			},
-		},
-		matPredCacheMaxEntries:          4,
-		matPredCacheMaxEntriesWithDelta: 1,
-		matPredCacheMaxBitmapCard:       0,
-	}
-	s.storeMaterializedPred("k1", roaring64.BitmapOf(1))
-	s.storeMaterializedPred("k2", roaring64.BitmapOf(2))
-
-	if _, ok := s.loadMaterializedPred("k1"); !ok {
-		t.Fatalf("expected cache hit for first entry")
-	}
-	if _, ok := s.loadMaterializedPred("k2"); ok {
-		t.Fatalf("unexpected cache hit beyond delta cache limit")
-	}
-}
-
-func TestSnapshotMaterializedPredCache_EnabledWhenNoDelta(t *testing.T) {
-	s := &indexSnapshot{
-		matPredCacheMaxEntries:          4,
-		matPredCacheMaxEntriesWithDelta: 1,
-		matPredCacheMaxBitmapCard:       0,
-	}
-	bm := roaring64.BitmapOf(1, 2, 3)
-
-	s.storeMaterializedPred("k", bm)
-	got, ok := s.loadMaterializedPred("k")
-	if !ok || got == nil {
-		t.Fatalf("expected cache hit for stable snapshot")
-	}
-	if got.GetCardinality() != 3 {
-		t.Fatalf("unexpected cached cardinality: %d", got.GetCardinality())
-	}
-}
-
-func TestSnapshotMaterializedPredCache_StoresNilOnFirstTouch(t *testing.T) {
-	s := &indexSnapshot{
-		matPredCacheMaxEntries:          4,
-		matPredCacheMaxEntriesWithDelta: 1,
-		matPredCacheMaxBitmapCard:       0,
-	}
-	s.storeMaterializedPred("empty", nil)
-
-	got, ok := s.loadMaterializedPred("empty")
+	cached, ok := snap.loadMaterializedPred("email\x1f1\xfal")
 	if !ok {
-		t.Fatalf("expected nil marker to be cached immediately")
+		t.Fatalf("cache entry missing after concurrent mutation")
 	}
-	if got != nil {
-		t.Fatalf("expected nil marker in cache, got non-nil bitmap")
-	}
+	defer cached.Release()
+	assertPostingConsumerSet(t, cached, want)
 }
 
-func TestSnapshotMaterializedPredCache_SkipsHugeBitmap(t *testing.T) {
-	s := &indexSnapshot{
-		matPredCacheMaxEntries:          4,
-		matPredCacheMaxEntriesWithDelta: 1,
-		matPredCacheMaxBitmapCard:       2,
+func TestApplyBatchPostingDeltaOwnedDetachedBorrowedBase(t *testing.T) {
+	base := snapshotExtPosting()
+	for i := uint64(1); i <= 48; i++ {
+		base.Add(i * 2)
 	}
-	s.storeMaterializedPred("big", roaring64.BitmapOf(1, 2, 3))
-	if _, ok := s.loadMaterializedPred("big"); ok {
-		t.Fatalf("unexpected cache hit for oversized bitmap")
+	wantBase := base.ToArray()
+
+	removeIDs := []uint64{wantBase[0], wantBase[1], wantBase[2], wantBase[3]}
+	addIDs := []uint64{1<<32 | 5, 1<<32 | 9, 2<<32 | 11}
+
+	expected := make([]uint64, 0, len(wantBase))
+	removeSet := make(map[uint64]struct{}, len(removeIDs))
+	for _, id := range removeIDs {
+		removeSet[id] = struct{}{}
 	}
+	for _, id := range wantBase {
+		if _, drop := removeSet[id]; !drop {
+			expected = append(expected, id)
+		}
+	}
+	expected = append(expected, addIDs...)
+	slices.Sort(expected)
+
+	var failed atomic.Pointer[string]
+	setFailed := func(msg string) {
+		if failed.Load() != nil {
+			return
+		}
+		copyMsg := msg
+		failed.CompareAndSwap(nil, &copyMsg)
+	}
+
+	var wg sync.WaitGroup
+	for g := 0; g < 4; g++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < 200; i++ {
+				delta := batchPostingDelta{
+					remove: snapshotExtPosting(removeIDs...),
+					add:    snapshotExtPosting(addIDs...),
+				}
+				out := applyBatchPostingDeltaOwned(base.Borrow(), &delta)
+				if !slices.Equal(out.ToArray(), expected) {
+					setFailed(fmt.Sprintf("delta result mismatch: got=%v want=%v", out.ToArray(), expected))
+					out.Release()
+					return
+				}
+				if !delta.add.IsEmpty() || !delta.remove.IsEmpty() {
+					setFailed("applyBatchPostingDeltaOwned must consume delta buffers")
+					out.Release()
+					return
+				}
+				out.Release()
+			}
+		}()
+	}
+
+	wg.Wait()
+	if msg := failed.Load(); msg != nil {
+		t.Fatal(*msg)
+	}
+
+	defer base.Release()
+	assertPostingConsumerSet(t, base, wantBase)
 }
 
-func TestSnapshotMaterializedPredCache_OversizedHotSlotStoresBoundedStableEntries(t *testing.T) {
-	s := &indexSnapshot{
-		matPredCacheMaxEntries:          4,
-		matPredCacheMaxEntriesWithDelta: 1,
-		matPredCacheMaxBitmapCard:       2,
-	}
-	big1 := roaring64.BitmapOf(1, 2, 3)
-	big2 := roaring64.BitmapOf(4, 5, 6)
-	big3 := roaring64.BitmapOf(7, 8, 9)
-
-	if !s.tryStoreMaterializedPredOversized("big1", big1) {
-		t.Fatalf("expected first oversized bitmap to be accepted into hot-slot cache")
-	}
-	got1, ok := s.loadMaterializedPred("big1")
-	if !ok || got1 != big1 {
-		t.Fatalf("expected cached oversized bitmap for first hot slot entry")
-	}
-
-	if !s.tryStoreMaterializedPredOversized("big2", big2) {
-		t.Fatalf("expected second oversized bitmap to be accepted into hot-slot cache")
-	}
-	got2, ok := s.loadMaterializedPred("big2")
-	if !ok || got2 != big2 {
-		t.Fatalf("expected cached oversized bitmap for second hot-slot entry")
-	}
-
-	if s.tryStoreMaterializedPredOversized("big3", big3) {
-		t.Fatalf("expected oversized hot-slot cache to reject entries beyond the bounded limit")
-	}
-	if _, ok := s.loadMaterializedPred("big3"); ok {
-		t.Fatalf("unexpected cache hit beyond oversized hot-slot limit")
-	}
-}
-
-func TestSnapshotMaterializedPredCache_OversizedHotSlotDisabledForDeltaSnapshot(t *testing.T) {
-	s := &indexSnapshot{
-		indexDCount: 1,
-		indexDelta: map[string]*fieldIndexDelta{
-			"f": {
-				byKey: map[string]indexDeltaEntry{
-					"x": {addSingle: 1, addSingleSet: true},
-				},
-			},
-		},
-		matPredCacheMaxEntries:          4,
-		matPredCacheMaxEntriesWithDelta: 1,
-		matPredCacheMaxBitmapCard:       2,
-	}
-	big := roaring64.BitmapOf(1, 2, 3)
-
-	if s.tryStoreMaterializedPredOversized("big", big) {
-		t.Fatalf("unexpected oversized hot-slot store for delta snapshot")
-	}
-	if _, ok := s.loadMaterializedPred("big"); ok {
-		t.Fatalf("unexpected cache hit for oversized bitmap on delta snapshot")
-	}
-}
-
-func TestSnapshotMaterializedPredCache_InheritsOnlyUnchangedFields(t *testing.T) {
-	scoreKey := materializedPredCacheKeyFromScalar("score", qx.OpLT, "000004000")
-	statusKey := materializedPredCacheKeyFromScalar("status", qx.OpPREFIX, "a")
-
-	prev := &indexSnapshot{
-		matPredCacheMaxEntries:          8,
-		matPredCacheMaxEntriesWithDelta: 8,
-		matPredCacheMaxBitmapCard:       0,
-	}
-	scoreBM := roaring64.BitmapOf(1, 2, 3)
-	statusBM := roaring64.BitmapOf(4, 5)
-	prev.storeMaterializedPred(scoreKey, scoreBM)
-	prev.storeMaterializedPred(statusKey, statusBM)
-
-	next := &indexSnapshot{
-		indexDCount: 1,
-		indexDelta: map[string]*fieldIndexDelta{
-			"status": {
-				byKey: map[string]indexDeltaEntry{
-					"x": {addSingle: 7, addSingleSet: true},
-				},
-			},
-		},
-		matPredCacheMaxEntries:          8,
-		matPredCacheMaxEntriesWithDelta: 8,
-		matPredCacheMaxBitmapCard:       0,
-	}
-	inheritMaterializedPredCache(next, prev, next.indexDelta)
-
-	gotScore, ok := next.loadMaterializedPred(scoreKey)
-	if !ok || gotScore != scoreBM {
-		t.Fatalf("expected unchanged field cache entry to be inherited")
-	}
-	if _, ok := next.loadMaterializedPred(statusKey); ok {
-		t.Fatalf("unexpected cache inheritance for changed non-range field")
-	}
-}
-
-func TestSnapshotMaterializedPredCache_UpdatesChangedScalarRangeEntries(t *testing.T) {
-	scoreKey := materializedPredCacheKeyFromScalar("score", qx.OpLT, "m")
-
-	prev := &indexSnapshot{
-		matPredCacheMaxEntries:          8,
-		matPredCacheMaxEntriesWithDelta: 8,
-		matPredCacheMaxBitmapCard:       0,
-	}
-	prev.storeMaterializedPred(scoreKey, roaring64.BitmapOf(1, 2))
-
-	next := &indexSnapshot{
-		indexDCount: 1,
-		indexDelta: map[string]*fieldIndexDelta{
-			"score": {
-				byKey: map[string]indexDeltaEntry{
-					"a": {addSingle: 7, addSingleSet: true, delSingle: 1, delSingleSet: true},
-					"z": {addSingle: 9, addSingleSet: true},
-				},
-			},
-		},
-		matPredCacheMaxEntries:          8,
-		matPredCacheMaxEntriesWithDelta: 8,
-		matPredCacheMaxBitmapCard:       0,
-	}
-	inheritMaterializedPredCache(next, prev, next.indexDelta)
-
-	got, ok := next.loadMaterializedPred(scoreKey)
-	if !ok || got == nil {
-		t.Fatalf("expected updated cache entry for changed scalar range")
-	}
-	if got.Contains(1) {
-		t.Fatalf("expected in-range delete to be applied")
-	}
-	if !got.Contains(2) || !got.Contains(7) {
-		t.Fatalf("expected unchanged and in-range added ids to remain")
-	}
-	if got.Contains(9) {
-		t.Fatalf("unexpected out-of-range delta application")
+func assertPostingConsumerSet(t *testing.T, got posting.List, want []uint64) {
+	t.Helper()
+	gotIDs := got.ToArray()
+	if !slices.Equal(gotIDs, want) {
+		t.Fatalf("posting mismatch: got=%v want=%v", gotIDs, want)
 	}
 }

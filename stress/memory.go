@@ -33,20 +33,9 @@ func CaptureMemorySnapshot(db *DBHandle) *MemorySnapshot {
 		if db.DB != nil {
 			stats := db.DB.SnapshotStats()
 			snap.Snapshot = SnapshotMemoryStats{
-				HasDelta:          stats.HasDelta,
-				RegistrySize:      stats.RegistrySize,
-				PinnedRefs:        stats.PinnedRefs,
-				IndexLayerDepth:   stats.IndexLayerDepth,
-				LenLayerDepth:     stats.LenLayerDepth,
-				IndexDeltaFields:  stats.IndexDeltaFields,
-				LenDeltaFields:    stats.LenDeltaFields,
-				IndexDeltaKeys:    stats.IndexDeltaKeys,
-				LenDeltaKeys:      stats.LenDeltaKeys,
-				IndexDeltaOps:     stats.IndexDeltaOps,
-				LenDeltaOps:       stats.LenDeltaOps,
-				UniverseAddCard:   stats.UniverseAddCard,
-				UniverseRemCard:   stats.UniverseRemCard,
-				CompactorQueueLen: stats.CompactorQueueLen,
+				RegistrySize: stats.RegistrySize,
+				PinnedRefs:   stats.PinnedRefs,
+				UniverseCard: stats.UniverseCard,
 			}
 		}
 	}
@@ -70,10 +59,7 @@ func summarizeMemory(samples []MemorySnapshot, final *MemorySnapshot) *MemorySum
 		maxUint64(&out.MaxBenchDBMapRSSBytes, s.Process.BenchDBMapRSSBytes)
 		maxInt(&out.MaxPinnedRefs, s.Snapshot.PinnedRefs)
 		maxInt(&out.MaxRegistrySize, s.Snapshot.RegistrySize)
-		maxInt(&out.MaxIndexLayerDepth, s.Snapshot.IndexLayerDepth)
-		maxInt(&out.MaxLenLayerDepth, s.Snapshot.LenLayerDepth)
-		maxUint64(&out.MaxIndexDeltaOps, s.Snapshot.IndexDeltaOps)
-		maxUint64(&out.MaxLenDeltaOps, s.Snapshot.LenDeltaOps)
+		maxUint64(&out.MaxUniverseCard, s.Snapshot.UniverseCard)
 	}
 	for i := range samples {
 		apply(&samples[i])

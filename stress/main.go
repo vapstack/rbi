@@ -33,17 +33,17 @@ func main() {
 	if err != nil {
 		fatalf("apply stress filters: %v", err)
 	}
-	if err := validateInitialWorkersAgainstCatalog(catalog, opts.InitialWorkers); err != nil {
+	initialWorkers, err := resolveInitialWorkers(catalog, opts.InitialWorkers, opts.WorkerGroups)
+	if err != nil {
 		fatalf("invalid worker overrides: %v", err)
 	}
 
 	log.Printf(
-		"opening DB file=%s report=%s headless=%t duration=%s minimize_delta=%t trace_sample=%d trace_top=%d query_stats=%t jitter=%t class_filter=%v query_filter=%v",
+		"opening DB file=%s report=%s headless=%t duration=%s trace_sample=%d trace_top=%d query_stats=%t jitter=%t class_filter=%v query_filter=%v",
 		opts.DBFile,
 		opts.ReportPath,
 		opts.Headless,
 		opts.Duration,
-		opts.MinimizeDelta,
 		opts.TraceSampleEvery,
 		opts.TraceTopN,
 		opts.QueryStats,
@@ -51,11 +51,14 @@ func main() {
 		opts.ClassFilter,
 		opts.QueryFilter,
 	)
+	stopProfiling, err := startStressProfiling(opts)
+	if err != nil {
+		fatalf("start profiling: %v", err)
+	}
 	traceCollector := newPlannerTraceCollector(catalog, opts.TraceSampleEvery, opts.TraceTopN)
 	handle, err := OpenBenchDB(DBConfig{
 		DBFile:           opts.DBFile,
 		BoltNoSync:       opts.BoltNoSync,
-		MinimizeDelta:    opts.MinimizeDelta,
 		AnalyzeInterval:  opts.AnalyzeInterval,
 		TraceSink:        traceCollector.traceSink(),
 		TraceSampleEvery: opts.TraceSampleEvery,
@@ -74,11 +77,7 @@ func main() {
 	queryBreakdown := !opts.Headless || opts.QueryStats
 	queryLatency := !opts.Headless || opts.QueryStats
 	app := newApp(handle, catalog, opts.RefreshEvery, opts.TelemetryEvery, opts.ReportPath, opts.ClassFilter, opts.QueryFilter, queryBreakdown, queryLatency, opts.Jitter, traceCollector)
-	stopProfiling, err := startStressProfiling(opts)
-	if err != nil {
-		fatalf("start profiling: %v", err)
-	}
-	app.applyInitialWorkers(opts.InitialWorkers)
+	app.applyInitialWorkers(initialWorkers)
 
 	baseCtx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -204,6 +203,6 @@ func saveReportFile(path string, report stressReport) error {
 }
 
 func fatalf(format string, args ...any) {
-	fmt.Fprintf(os.Stderr, format+"\n", args...)
+	_, _ = fmt.Fprintf(os.Stderr, format+"\n", args...)
 	os.Exit(1)
 }

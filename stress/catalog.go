@@ -71,3 +71,46 @@ func validateInitialWorkersAgainstCatalog(catalog []*classDescriptor, initial ma
 	}
 	return nil
 }
+
+func resolveInitialWorkers(catalog []*classDescriptor, explicit map[string]int, groups workerGroupOverrides) (map[string]int, error) {
+	if err := validateInitialWorkersAgainstCatalog(catalog, explicit); err != nil {
+		return nil, err
+	}
+	if groups.All.Set && countWorkerGroupMatches(catalog, "a") == 0 {
+		return nil, fmt.Errorf("worker override for group %q matched no active classes", groupLabel("a"))
+	}
+	if groups.Read.Set && countWorkerGroupMatches(catalog, "r") == 0 {
+		return nil, fmt.Errorf("worker override for group %q matched no active classes", groupLabel("r"))
+	}
+	if groups.Write.Set && countWorkerGroupMatches(catalog, "w") == 0 {
+		return nil, fmt.Errorf("worker override for group %q matched no active classes", groupLabel("w"))
+	}
+
+	resolved := make(map[string]int, len(catalog))
+	for _, class := range catalog {
+		name := class.Info.Name
+		if groups.All.Set {
+			resolved[name] = groups.All.Value
+		}
+		if groups.Read.Set && workerGroupMatchesRole(class.Info.Role, "r") {
+			resolved[name] = groups.Read.Value
+		}
+		if groups.Write.Set && workerGroupMatchesRole(class.Info.Role, "w") {
+			resolved[name] = groups.Write.Value
+		}
+		if value, ok := explicit[name]; ok {
+			resolved[name] = value
+		}
+	}
+	return resolved, nil
+}
+
+func countWorkerGroupMatches(catalog []*classDescriptor, group string) int {
+	count := 0
+	for _, class := range catalog {
+		if workerGroupMatchesRole(class.Info.Role, group) {
+			count++
+		}
+	}
+	return count
+}

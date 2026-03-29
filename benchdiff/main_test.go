@@ -142,6 +142,106 @@ func TestCompareMetricUsesUnitStepsForSmallValues(t *testing.T) {
 	}
 }
 
+func TestCompareMetricUsesRaisedPercentInsignificanceForNSAndBytes(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name string
+		kind metricKind
+	}{
+		{name: "ns", kind: metricNS},
+		{name: "bytes", kind: metricBytes},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			display := compareMetric(tc.kind, 100, 100.9)
+			if display.Significant {
+				t.Fatal("expected difference to stay insignificant below one percent")
+			}
+			if display.Color != colorGray {
+				t.Fatalf("unexpected color: %q", display.Color)
+			}
+			if display.DeltaText != "+0.9%" {
+				t.Fatalf("unexpected delta text: %q", display.DeltaText)
+			}
+		})
+	}
+}
+
+func TestCompareMetricUsesNeutralBandForNSAndBytes(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name      string
+		kind      metricKind
+		previous  float64
+		current   float64
+		deltaText string
+	}{
+		{name: "ns", kind: metricNS, previous: 100, current: 103, deltaText: "+3%"},
+		{name: "bytes", kind: metricBytes, previous: 100, current: 97, deltaText: "-3%"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			display := compareMetric(tc.kind, tc.previous, tc.current)
+			if !display.Significant {
+				t.Fatal("expected difference in neutral band to be significant")
+			}
+			if display.Color != "" {
+				t.Fatalf("unexpected color: %q", display.Color)
+			}
+			if display.DeltaText != tc.deltaText {
+				t.Fatalf("unexpected delta text: %q", display.DeltaText)
+			}
+		})
+	}
+}
+
+func TestCompareMetricUsesUpdatedSeverityBandsForNSAndBytes(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name      string
+		kind      metricKind
+		previous  float64
+		current   float64
+		wantColor string
+	}{
+		{name: "ns mild", kind: metricNS, previous: 100, current: 112, wantColor: colorYellow},
+		{name: "bytes high", kind: metricBytes, previous: 100, current: 120, wantColor: colorRed},
+		{name: "ns extreme", kind: metricNS, previous: 100, current: 126, wantColor: colorRed},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			display := compareMetric(tc.kind, tc.previous, tc.current)
+			if !display.Significant {
+				t.Fatal("expected difference to be significant")
+			}
+			if display.Color != tc.wantColor {
+				t.Fatalf("unexpected color: %q", display.Color)
+			}
+		})
+	}
+}
+
+func TestCompareMetricKeepsPercentSensitivityForAllocs(t *testing.T) {
+	t.Parallel()
+
+	display := compareMetric(metricAllocs, 100, 100.75)
+	if !display.Significant {
+		t.Fatal("expected allocs difference above half percent to stay significant")
+	}
+	if display.Color != colorGray {
+		t.Fatalf("unexpected color: %q", display.Color)
+	}
+	if display.DeltaText != "+0.75%" {
+		t.Fatalf("unexpected delta text: %q", display.DeltaText)
+	}
+}
+
 func TestFormatMetricValueFormatsNSWithoutScaling(t *testing.T) {
 	t.Parallel()
 
@@ -256,7 +356,7 @@ func TestRunCLIRendersOnlyMeaningfulRows(t *testing.T) {
 		"Benchmark__Bar-16 100 2000 ns/op 200 B/op 2 allocs/op",
 	}, "\n")
 	currentText := strings.Join([]string{
-		"Benchmark__Foo-16 120 1004 ns/op 100 B/op 1 allocs/op",
+		"Benchmark__Foo-16 120 1009 ns/op 100 B/op 1 allocs/op",
 		"Benchmark__Bar-16 90 1600 ns/op 204 B/op 1 allocs/op",
 		"Benchmark__Bar-16 110 1700 ns/op 206 B/op 1 allocs/op",
 		"Benchmark__Bar-16 100 1500 ns/op 205 B/op 1 allocs/op",
@@ -335,6 +435,51 @@ func TestBuildRowsRendersNewBenchmarkWithNeutralDeltas(t *testing.T) {
 		colorGray + "0%" + colorReset,
 		colorWhite + "1 allocs/op" + colorReset,
 		colorGray + "0%" + colorReset,
+	}
+	if got := strings.Join(row.Colored, "|"); got != strings.Join(wantColored, "|") {
+		t.Fatalf("unexpected colored row: %q", got)
+	}
+}
+
+func TestBuildRowsLeavesNeutralBandUncolored(t *testing.T) {
+	t.Parallel()
+
+	previousSummaries := map[string]benchmarkSummary{
+		"Benchmark__Bar-16": {
+			Name:        "Benchmark__Bar-16",
+			DisplayName: "Bar-16",
+			Iterations:  100,
+			NSPerOp:     1000,
+			BytesPerOp:  100,
+			AllocsPerOp: 1,
+		},
+	}
+	currentSummaries := map[string]benchmarkSummary{
+		"Benchmark__Bar-16": {
+			Name:        "Benchmark__Bar-16",
+			DisplayName: "Bar-16",
+			Iterations:  100,
+			NSPerOp:     1030,
+			BytesPerOp:  97,
+			AllocsPerOp: 1,
+		},
+	}
+
+	rows := buildRows(previousSummaries, []string{"Benchmark__Bar-16"}, currentSummaries, true)
+	if len(rows) != 1 {
+		t.Fatalf("unexpected row count: %d", len(rows))
+	}
+
+	row := rows[0]
+	wantColored := []string{
+		"Bar-16",
+		"100",
+		"1_030ns/op",
+		"+3%",
+		"97B/op",
+		"-3%",
+		colorGray + "1 allocs/op" + colorReset,
+		colorGray + "0" + colorReset,
 	}
 	if got := strings.Join(row.Colored, "|"); got != strings.Join(wantColored, "|") {
 		t.Fatalf("unexpected colored row: %q", got)

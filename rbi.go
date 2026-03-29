@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"maps"
+	"math"
 	"os"
 	"reflect"
 	"slices"
@@ -13,7 +14,7 @@ import (
 	"time"
 	"unsafe"
 
-	"github.com/vapstack/rbi/internal/roaring64"
+	"github.com/vapstack/rbi/internal/posting"
 	"go.etcd.io/bbolt"
 )
 
@@ -33,32 +34,18 @@ var (
 )
 
 const (
-	defaultOptionsAnalyzeInterval                   = time.Hour
-	defaultOptionsCalibrationSampleEvery            = 16
-	defaultBucketFillPercent                        = 0.8
-	defaultSnapshotMaterializedPredCacheMaxEntries  = 16
-	defaultSnapshotMatPredCacheEntriesWithDelta     = 2
-	defaultSnapshotMatPredCacheMaxBitmapCardinality = 32 << 10
-	defaultSnapshotRegistryMax                      = 16
-	defaultSnapshotDeltaCompactFieldKeys            = 256
-	defaultSnapshotDeltaCompactFieldOps             = 4 << 10
-	defaultSnapshotDeltaCompactMaxFieldsPerPublish  = 3
-	defaultSnapshotDeltaCompactUniverseOps          = 4 << 10
-	defaultSnapshotDeltaLayerMaxDepth               = 6
-	defaultSnapshotCompactorMaxIterationsPerRun     = 2
-	defaultSnapshotCompactorRequestEveryNWrites     = 8
-	defaultSnapshotCompactorIdleInterval            = 2 * time.Second
-	defaultAutoBatchWindow                          = 50 * time.Microsecond
-	defaultAutoBatchMax                             = 64
-	defaultAutoBatchMaxQueue                        = 512
-	defaultSnapshotDeltaCompactLargeBaseFieldKeys   = 128 << 10
-	defaultSnapshotDeltaCompactLargeBaseMinDeltaDiv = 32
-	defaultSnapshotDeltaCompactForceFieldOps        = 256 << 10
-	defaultSnapshotCompactorUrgentDepthSlack        = 4
-	defaultSnapshotStrMapCompactDepth               = 256
-	defaultNumericRangeBucketSize                   = 512
-	defaultNumericRangeBucketMinFieldKeys           = 8192
-	defaultNumericRangeBucketMinSpanKeys            = 2048
+	defaultOptionsAnalyzeInterval                  = time.Hour
+	defaultOptionsCalibrationSampleEvery           = 16
+	defaultBucketFillPercent                       = 0.8
+	defaultSnapshotMaterializedPredCacheMaxEntries = 16
+	defaultSnapshotMatPredCacheMaxCardinality      = 32 << 10
+	defaultAutoBatchWindow                         = 50 * time.Microsecond
+	defaultAutoBatchMax                            = 64
+	defaultAutoBatchMaxQueue                       = 512
+	defaultSnapshotStrMapCompactDepth              = 256
+	defaultNumericRangeBucketSize                  = 512
+	defaultNumericRangeBucketMinFieldKeys          = 8192
+	defaultNumericRangeBucketMinSpanKeys           = 2048
 )
 
 // Options configures indexer and how it works with a bbolt database.
@@ -152,9 +139,9 @@ type Options struct {
 	BucketFillPercent float64
 
 	// SnapshotMaterializedPredCacheMaxEntries controls max number of cached
-	// materialized predicate bitmaps for stable snapshots (without deltas).
+	// materialized predicate bitmaps per published snapshot.
 	//
-	// Negative value disables cache for stable snapshots.
+	// Negative value disables cache.
 	//
 	// Default: 16
 	//
@@ -163,20 +150,8 @@ type Options struct {
 	// High values on diverse workloads can cause sharp memory growth.
 	SnapshotMaterializedPredCacheMaxEntries int
 
-	// SnapshotMaterializedPredCacheMaxEntriesWithDelta controls max cached
-	// materialized predicate bitmaps for snapshots with active deltas.
-	//
-	// Negative value disables cache for delta snapshots.
-	//
-	// Default: 2
-	//
-	// Typical range: 2..64
-	//
-	// High values can increase GC pressure under write-heavy workloads.
-	SnapshotMaterializedPredCacheMaxEntriesWithDelta int
-
-	// SnapshotMaterializedPredCacheMaxBitmapCardinality skips caching very large
-	// bitmaps to reduce retained heap and GC pressure.
+	// SnapshotMaterializedPredCacheMaxCardinality skips caching very large
+	// materialized postings to reduce retained heap and GC pressure.
 	//
 	// Negative value disables the guard.
 	//
@@ -184,128 +159,9 @@ type Options struct {
 	//
 	// Negative (disabled) or very large values can significantly increase memory
 	// usage for broad predicates.
-	SnapshotMaterializedPredCacheMaxBitmapCardinality int
+	SnapshotMaterializedPredCacheMaxCardinality int
 
-	// SnapshotRegistryMax limits amount of snapshots tracked for sequence pinning.
-	//
-	// Negative value disables the cap.
-	//
-	// Default: 16
-	//
-	// Typical range: 32..512
-	//
-	// Higher values retain more snapshots (higher memory).
-	// Too low values can increase snapshot misses for long readers.
-	SnapshotRegistryMax int
-
-	// SnapshotDeltaCompactFieldKeys is a per-field threshold for accumulated
-	// delta keys; above it field delta is compacted into base index.
-	//
-	// Negative value disables key-count trigger.
-	//
-	// Default: 256
-	//
-	// Typical range: 128..2048
-	//
-	// Too high can increase delta memory/read CPU.
-	// Too low can increase compaction frequency and hurt write latency.
-	SnapshotDeltaCompactFieldKeys int
-
-	// SnapshotDeltaCompactFieldOps is a per-field threshold for accumulated
-	// add/del cardinality across delta entries.
-	//
-	// Negative value disables ops-count trigger.
-	//
-	// Default: 4096
-	//
-	// Typical range: 2K..64K
-	//
-	// Too high delays compaction (delta growth, read overhead).
-	// Too low can force frequent compaction and hurt write throughput.
-	SnapshotDeltaCompactFieldOps int
-
-	// SnapshotDeltaCompactMaxFieldsPerPublish limits how many fields can be
-	// compacted from delta into base in one publish pass.
-	//
-	// Negative value disables field compaction in publish path.
-	//
-	// Default: 3
-	//
-	// High values can create severe write-latency spikes.
-	SnapshotDeltaCompactMaxFieldsPerPublish int
-
-	// SnapshotDeltaCompactUniverseOps is a threshold for universe add/drop
-	// cardinality sum; above it universe delta is compacted into base.
-	//
-	// Negative value disables universe compaction trigger.
-	//
-	// Default: 4096
-	//
-	// Typical values: 2K..64K
-	//
-	// Too high values can increase overlay growth/read cost.
-	// Too low values can increase write-path compaction work.
-	SnapshotDeltaCompactUniverseOps int
-
-	// SnapshotDeltaLayerMaxDepth limits per-field delta layer depth.
-	// Once exceeded, layered delta is flattened into one layer.
-	//
-	// Negative value disables depth-based flattening.
-	//
-	// Default: 6
-	//
-	// Typical range: 4..64
-	//
-	// Very high/disabled values can increase read-path CPU and memory.
-	// Very low values can increase flattening overhead on writes.
-	SnapshotDeltaLayerMaxDepth int
-
-	// SnapshotCompactorMaxIterationsPerRun limits background compaction work per wake-up.
-	//
-	// Negative value disables compaction passes.
-	//
-	// Default: 2
-	//
-	// Typical range: 1..8
-	//
-	// High values increase contention with writers and can degrade throughput.
-	SnapshotCompactorMaxIterationsPerRun int
-
-	// SnapshotCompactorRequestEveryNWrites controls best-effort compactor
-	// wakeups under steady write load.
-	//
-	// Negative value disables periodic write-triggered compactor requests.
-	//
-	// Default: 8
-	//
-	// Typical range: 4..64
-	//
-	// Lower values improve delta control but increase write contention.
-	// Higher values reduce contention but can increase delta memory/read cost.
-	//
-	// Value 1 can cause sustained compactor/writer contention and write
-	// throughput degradation on heavy write workloads.
-	SnapshotCompactorRequestEveryNWrites int
-
-	// SnapshotCompactorIdleInterval configures one-shot idle debounce for
-	// force-drain compaction when snapshot activity stops.
-	// After this pause without new snapshot publication, compactor performs a
-	// bounded force pass to collapse remaining deltas and aggressively prune
-	// snapshot registry for best read-path locality.
-	//
-	// Negative value disables idle force-drain mode.
-	//
-	// Default: 2s
-	//
-	// Typical range: 500ms..10s
-	//
-	// Lower values converge faster after write bursts but can increase
-	// compactor/writer contention on bursty workloads.
-	// Higher values reduce background churn but keep layered state longer.
-	SnapshotCompactorIdleInterval time.Duration
-
-	// EnableSnapshotStats enables runtime collection of snapshot stats and
-	// compactor diagnostics.
+	// EnableSnapshotStats enables runtime collection of snapshot diagnostics.
 	//
 	// Default: false (disabled).
 	EnableSnapshotStats bool
@@ -397,40 +253,8 @@ func (o *Options) setDefaults() {
 	if o.SnapshotMaterializedPredCacheMaxEntries == 0 {
 		o.SnapshotMaterializedPredCacheMaxEntries = defaultSnapshotMaterializedPredCacheMaxEntries
 	}
-	if o.SnapshotMaterializedPredCacheMaxEntriesWithDelta == 0 {
-		o.SnapshotMaterializedPredCacheMaxEntriesWithDelta = defaultSnapshotMatPredCacheEntriesWithDelta
-	}
-	if o.SnapshotMaterializedPredCacheMaxBitmapCardinality == 0 {
-		o.SnapshotMaterializedPredCacheMaxBitmapCardinality = defaultSnapshotMatPredCacheMaxBitmapCardinality
-	}
-	if o.SnapshotRegistryMax == 0 {
-		o.SnapshotRegistryMax = defaultSnapshotRegistryMax
-	} else if o.SnapshotRegistryMax < 0 {
-		o.SnapshotRegistryMax = int(^uint(0) >> 1)
-	}
-	if o.SnapshotDeltaCompactFieldKeys == 0 {
-		o.SnapshotDeltaCompactFieldKeys = defaultSnapshotDeltaCompactFieldKeys
-	}
-	if o.SnapshotDeltaCompactFieldOps == 0 {
-		o.SnapshotDeltaCompactFieldOps = defaultSnapshotDeltaCompactFieldOps
-	}
-	if o.SnapshotDeltaCompactMaxFieldsPerPublish == 0 {
-		o.SnapshotDeltaCompactMaxFieldsPerPublish = defaultSnapshotDeltaCompactMaxFieldsPerPublish
-	}
-	if o.SnapshotDeltaCompactUniverseOps == 0 {
-		o.SnapshotDeltaCompactUniverseOps = defaultSnapshotDeltaCompactUniverseOps
-	}
-	if o.SnapshotDeltaLayerMaxDepth == 0 {
-		o.SnapshotDeltaLayerMaxDepth = defaultSnapshotDeltaLayerMaxDepth
-	}
-	if o.SnapshotCompactorMaxIterationsPerRun == 0 {
-		o.SnapshotCompactorMaxIterationsPerRun = defaultSnapshotCompactorMaxIterationsPerRun
-	}
-	if o.SnapshotCompactorRequestEveryNWrites == 0 {
-		o.SnapshotCompactorRequestEveryNWrites = defaultSnapshotCompactorRequestEveryNWrites
-	}
-	if o.SnapshotCompactorIdleInterval == 0 {
-		o.SnapshotCompactorIdleInterval = defaultSnapshotCompactorIdleInterval
+	if o.SnapshotMaterializedPredCacheMaxCardinality == 0 {
+		o.SnapshotMaterializedPredCacheMaxCardinality = defaultSnapshotMatPredCacheMaxCardinality
 	}
 	if o.AutoBatchWindow == 0 {
 		o.AutoBatchWindow = defaultAutoBatchWindow
@@ -450,6 +274,13 @@ func (o *Options) setDefaults() {
 	if o.NumericRangeBucketMinSpanKeys == 0 {
 		o.NumericRangeBucketMinSpanKeys = defaultNumericRangeBucketMinSpanKeys
 	}
+}
+
+func (o Options) validate() error {
+	if math.IsNaN(o.BucketFillPercent) || o.BucketFillPercent < 0 || o.BucketFillPercent > 1 {
+		return fmt.Errorf("invalid BucketFillPercent: %v", o.BucketFillPercent)
+	}
+	return nil
 }
 
 // Field represents a single field assignment used by Patch and BatchPatch.
@@ -489,6 +320,9 @@ func New[K ~uint64 | ~string, V any](bolt *bbolt.DB, options Options, execOpts .
 	}
 	if vtype.Kind() != reflect.Struct {
 		return nil, ErrNotStructType
+	}
+	if err = options.validate(); err != nil {
+		return nil, err
 	}
 	options.setDefaults()
 
@@ -532,13 +366,12 @@ func New[K ~uint64 | ~string, V any](bolt *bbolt.DB, options Options, execOpts .
 		bucket: []byte(vname),
 
 		fields:            make(map[string]*field),
-		getters:           make(map[string]getterFn),
-		index:             make(map[string]*[]index),
-		nilIndex:          make(map[string]*[]index),
-		lenIndex:          make(map[string]*[]index),
+		index:             make(map[string]fieldIndexStorage),
+		nilIndex:          make(map[string]fieldIndexStorage),
+		lenIndex:          make(map[string]fieldIndexStorage),
 		lenZeroComplement: make(map[string]bool),
 
-		universe: roaring64.NewBitmap(),
+		universe: posting.List{},
 
 		rbiFile: bolt.Path() + "." + vname + ".rbi",
 
@@ -549,7 +382,7 @@ func New[K ~uint64 | ~string, V any](bolt *bbolt.DB, options Options, execOpts .
 		},
 		viewPool: sync.Pool{
 			New: func() any {
-				return new(DB[K, V])
+				return new(queryView[K, V])
 			},
 		},
 
@@ -586,13 +419,9 @@ func New[K ~uint64 | ~string, V any](bolt *bbolt.DB, options Options, execOpts .
 	if err = db.populateFields(vtype, nil); err != nil {
 		return nil, fmt.Errorf("failed to populate index fields: %w", err)
 	}
-
-	for _, f := range db.fields {
-		if db.getters[f.DBName], err = db.makeGetter(f); err != nil {
-			return nil, fmt.Errorf("failed to create accessor func for %v: %w", f.Name, err)
-		}
+	if err = db.initIndexedFieldAccessors(); err != nil {
+		return nil, fmt.Errorf("failed to initialize field accessors: %w", err)
 	}
-	db.initIndexedFieldAccessors()
 	db.initBatcher()
 
 	err = bolt.Update(func(tx *bbolt.Tx) error {
@@ -604,15 +433,16 @@ func New[K ~uint64 | ~string, V any](bolt *bbolt.DB, options Options, execOpts .
 	}
 
 	var (
-		skipFields    map[string]struct{}
-		rebuildReason string
+		loadedPlannerStats *plannerStatsSnapshot
+		skipFields         map[string]struct{}
+		rebuildReason      string
 	)
 
 	if _, err = os.Stat(db.rbiFile); err == nil {
 		if options.DisableIndexLoad {
 			rebuildReason = "persisted index load disabled"
 		} else {
-			skipFields, err = db.loadIndex()
+			skipFields, loadedPlannerStats, err = db.loadIndex()
 			if err != nil {
 				rebuildReason = fmt.Sprintf("persisted index unavailable (%v)", err)
 			}
@@ -634,6 +464,7 @@ func New[K ~uint64 | ~string, V any](bolt *bbolt.DB, options Options, execOpts .
 	if err = db.populatePatcher(vtype, nil); err != nil {
 		return nil, fmt.Errorf("failed to populate patch fields: %w", err)
 	}
+	db.initPatchFieldAccessors()
 
 	for name := range db.fields {
 		db.fieldSlice = append(db.fieldSlice, name)
@@ -643,24 +474,27 @@ func New[K ~uint64 | ~string, V any](bolt *bbolt.DB, options Options, execOpts .
 		return nil, fmt.Errorf("failed to publish initial snapshot: %w", err)
 	}
 
-	if err = db.RefreshPlannerStats(); err != nil {
-		return nil, fmt.Errorf("failed to build planner stats snapshot: %w", err)
+	if loadedPlannerStats != nil && len(skipFields) == len(db.fields) {
+		db.publishLoadedPlannerStats(loadedPlannerStats)
+	} else {
+		if err = db.RefreshPlannerStats(); err != nil {
+			return nil, fmt.Errorf("failed to build planner stats snapshot: %w", err)
+		}
 	}
 
 	db.initCalibration()
 
 	db.startPlannerAnalyzeLoop()
-	db.startSnapshotCompactor()
 
 	return db, nil
 }
 
-func (db *DB[K, V]) initIndexedFieldAccessors() {
+func (db *DB[K, V]) initIndexedFieldAccessors() error {
 	if len(db.fields) == 0 {
 		db.indexedFieldAccess = nil
 		db.indexedFieldByName = nil
 		db.uniqueFieldAccessors = nil
-		return
+		return nil
 	}
 
 	db.indexedFieldAccess = make([]indexedFieldAccessor, 0, len(db.fields))
@@ -668,17 +502,64 @@ func (db *DB[K, V]) initIndexedFieldAccessors() {
 	db.uniqueFieldAccessors = make([]indexedFieldAccessor, 0, 4)
 
 	for _, f := range db.fields {
-		acc := indexedFieldAccessor{
-			name:   f.DBName,
-			field:  f,
-			getter: db.getters[f.DBName],
+		acc, err := db.makeIndexedFieldAccessor(f)
+		if err != nil {
+			return err
 		}
+		acc.ordinal = len(db.indexedFieldAccess)
 		db.indexedFieldAccess = append(db.indexedFieldAccess, acc)
 		db.indexedFieldByName[f.DBName] = acc
 		if f.Unique && !f.Slice {
 			db.uniqueFieldAccessors = append(db.uniqueFieldAccessors, acc)
 		}
 	}
+	return nil
+}
+
+func (db *DB[K, V]) initPatchFieldAccessors() {
+	if len(db.patchMap) == 0 {
+		db.patchFieldAccess = nil
+		db.patchFieldOrdinal = nil
+		return
+	}
+
+	db.patchFieldAccess = make([]patchFieldAccessor, 0, len(db.patchMap))
+	db.patchFieldOrdinal = make(map[string]int, len(db.patchMap))
+
+	for patchKey, f := range db.patchMap {
+		if patchKey != f.Name {
+			continue
+		}
+
+		acc := patchFieldAccessor{field: f}
+		fieldType, offset := resolveFieldTypeAndOffset(db.vtype, f.Index)
+		acc.valueEqual = buildPatchValueEqualFn(f, fieldType, offset)
+		acc.copyValue = buildPatchValueCopyFn(f, fieldType, offset)
+
+		ordinal := len(db.patchFieldAccess)
+		db.patchFieldAccess = append(db.patchFieldAccess, acc)
+		db.patchFieldOrdinal[f.Name] = ordinal
+	}
+
+	for i := range db.indexedFieldAccess {
+		ordinal, ok := db.patchFieldOrdinal[db.indexedFieldAccess[i].field.Name]
+		if !ok {
+			db.indexedFieldAccess[i].patchOrdinal = -1
+			continue
+		}
+		db.indexedFieldAccess[i].patchOrdinal = ordinal
+	}
+}
+
+func (db *DB[K, V]) initSnapshotRuntimeCaches(s *indexSnapshot) {
+	if s == nil {
+		return
+	}
+	s.numericRangeBucketCache = newNumericRangeBucketCache()
+	s.matPredCacheMaxEntries = max(0, db.options.SnapshotMaterializedPredCacheMaxEntries)
+	s.matPredCacheMaxCard = materializedPredCacheMaxCardinality(
+		db.options.SnapshotMaterializedPredCacheMaxCardinality,
+	)
 }
 
 func (db *DB[K, V]) initBatcher() {
@@ -701,7 +582,7 @@ func (db *DB[K, V]) initBatcher() {
 		window:       window,
 		maxOps:       maxOps,
 		maxQ:         maxQueue,
-		queue:        make([]*autoBatchJob[K, V], 0, capHint),
+		queue:        make([]*autoBatchJob[K, V], capHint),
 	}
 	db.autoBatcher.cond = sync.NewCond(&db.autoBatcher.mu)
 }
@@ -746,40 +627,24 @@ type snapshot struct {
 	statsEnabled bool
 
 	bySeq map[uint64]*snapshotRef
-	order []uint64
-	head  int
-
-	compactReq  chan struct{}
-	compactIdle chan struct{}
-	compactStop chan struct{}
-	compactDone chan struct{}
-
-	compactForcePending atomic.Bool
-	compactPinsBlocked  atomic.Bool
-	compactLastActivity atomic.Int64
-
-	compactRequested    atomic.Uint64
-	compactRuns         atomic.Uint64
-	compactAttempts     atomic.Uint64
-	compactSucceeded    atomic.Uint64
-	compactPreclaimBusy atomic.Uint64
-	compactLockMiss     atomic.Uint64
-	compactNoChange     atomic.Uint64
-	compactSoftSkip     atomic.Uint64
-	compactSkippedWake  atomic.Uint64
-	compactIdleDefers   atomic.Uint64
-	compactStaleRetry   atomic.Uint64
-	compactMissStreak   atomic.Uint64
-	compactWriteSeq     atomic.Uint64
-	compactSkipUntil    atomic.Uint64
 
 	mu sync.RWMutex
 }
 
 type indexedFieldAccessor struct {
-	name   string
-	field  *field
-	getter getterFn
+	ordinal      int
+	patchOrdinal int
+	name         string
+	field        *field
+	uniqueGetter uniqueScalarGetterFn
+	write        fieldWriteAccessorFn
+	modified     fieldModifiedFn
+}
+
+type patchFieldAccessor struct {
+	field      *field
+	valueEqual patchValueEqualFn
+	copyValue  patchValueCopyFn
 }
 
 type autoBatcher[K ~string | ~uint64, V any] struct {
@@ -788,11 +653,16 @@ type autoBatcher[K ~string | ~uint64, V any] struct {
 	maxOps       int
 	maxQ         int
 
-	mu       sync.Mutex
-	cond     *sync.Cond
-	running  bool
-	queue    []*autoBatchJob[K, V]
-	hotUntil time.Time
+	mu                 sync.Mutex
+	cond               *sync.Cond
+	running            bool
+	queue              []*autoBatchJob[K, V]
+	queueHead          int
+	queueSize          int
+	batchScratch       []*autoBatchJob[K, V]
+	repeatIDScratch    map[K]int
+	repeatIDScratchCap int
+	hotUntil           time.Time
 
 	submitted          atomic.Uint64
 	enqueued           atomic.Uint64
@@ -845,26 +715,26 @@ type (
 
 		bucket []byte
 
-		strkey     bool
-		strmap     *strMapper
-		strmapView *strMapSnapshot
+		strkey bool
+		strmap *strMapper
 
-		universe *roaring64.Bitmap
+		universe posting.List
 
 		fields         map[string]*field
 		fieldSlice     []string
 		hasUnique      bool
 		lenIndexLoaded bool
 
-		getters              map[string]getterFn
 		indexedFieldAccess   []indexedFieldAccessor
 		indexedFieldByName   map[string]indexedFieldAccessor
 		uniqueFieldAccessors []indexedFieldAccessor
-		index                map[string]*[]index
-		nilIndex             map[string]*[]index
-		lenIndex             map[string]*[]index
+		index                map[string]fieldIndexStorage
+		nilIndex             map[string]fieldIndexStorage
+		lenIndex             map[string]fieldIndexStorage
 		lenZeroComplement    map[string]bool
 		patchMap             map[string]*field
+		patchFieldAccess     []patchFieldAccessor
+		patchFieldOrdinal    map[string]int
 
 		planner     planner
 		snapshot    snapshot
@@ -891,7 +761,7 @@ type (
 
 	index struct {
 		Key indexKey
-		IDs postingList
+		IDs posting.List
 	}
 
 	// PlannerStats contains planner snapshot metadata, per-field stats and sampling settings.
@@ -961,12 +831,6 @@ type (
 		// AutoBatchAvgSize is the average requests per executed batch.
 		AutoBatchAvgSize float64
 
-		// SnapshotHasDelta reports whether snapshot contains any delta state.
-		SnapshotHasDelta bool
-		// SnapshotIndexLayerDepth is depth of index delta layer chain.
-		SnapshotIndexLayerDepth int
-		// SnapshotLenLayerDepth is depth of length-index delta layer chain.
-		SnapshotLenLayerDepth int
 		// SnapshotSequence is the bucket sequence of the published snapshot.
 		SnapshotSequence uint64
 	}
@@ -988,8 +852,8 @@ type (
 		EntryCount uint64
 		// KeyBytes is the total byte length of index keys across entries.
 		KeyBytes uint64
-		// BitmapCardinality is the sum of posting bitmap cardinalities across entries.
-		BitmapCardinality uint64
+		// PostingCardinality is the sum of posting cardinalities across entries.
+		PostingCardinality uint64
 
 		// ApproxStructBytes is approximate memory used by index entry structs.
 		ApproxStructBytes uint64
@@ -1070,76 +934,18 @@ type (
 		CallbackErrors uint64
 	}
 
-	// SnapshotStats contains copy-on-write snapshot and compactor diagnostics.
+	// SnapshotStats contains published snapshot diagnostics.
 	SnapshotStats struct {
 		// Sequence is the bucket sequence of the published snapshot.
 		Sequence uint64
 
-		// HasDelta reports whether snapshot contains any delta state.
-		HasDelta bool
-		// UniverseBaseCard is cardinality of the base universe bitmap.
-		UniverseBaseCard uint64
-		// IndexLayerDepth is depth of index delta layer chain.
-		IndexLayerDepth int
-		// LenLayerDepth is depth of length-index delta layer chain.
-		LenLayerDepth int
-
-		// IndexDeltaFields is number of fields with effective index delta.
-		IndexDeltaFields int
-		// LenDeltaFields is number of fields with effective length delta.
-		LenDeltaFields int
-		// IndexDeltaKeys is total effective keys in index delta layers.
-		IndexDeltaKeys int
-		// LenDeltaKeys is total effective keys in length delta layers.
-		LenDeltaKeys int
-		// IndexDeltaOps is total effective operations in index delta layers.
-		IndexDeltaOps uint64
-		// LenDeltaOps is total effective operations in length delta layers.
-		LenDeltaOps uint64
-
-		// UniverseAddCard is cardinality of staged universe additions in delta state.
-		UniverseAddCard uint64
-		// UniverseRemCard is cardinality of staged universe removals in delta state.
-		UniverseRemCard uint64
+		// UniverseCard is cardinality of the published universe bitmap.
+		UniverseCard uint64
 
 		// RegistrySize is number of snapshot entries tracked in registry map.
 		RegistrySize int
-		// RegistryOrderLen is length of registry order buffer.
-		RegistryOrderLen int
-		// RegistryHead is current head offset inside registry order buffer.
-		RegistryHead int
 		// PinnedRefs is number of registry snapshots with active pins.
 		PinnedRefs int
-
-		// CompactorQueueLen is current compactor request queue length.
-		CompactorQueueLen int
-		// CompactorRequested is total number of compaction requests.
-		CompactorRequested uint64
-		// CompactorRuns is total number of compactor loop runs.
-		CompactorRuns uint64
-		// CompactorAttempts is total latest-snapshot compaction attempts.
-		CompactorAttempts uint64
-		// CompactorSucceeded is total successful compactions applied.
-		CompactorSucceeded uint64
-		// CompactorPreclaimBusy is number of compactor runs skipped before build
-		// because writer lock contention was already visible via cheap pre-claim.
-		CompactorPreclaimBusy uint64
-		// CompactorLockMiss is total attempts skipped due to DB lock contention.
-		CompactorLockMiss uint64
-		// CompactorNoChange is total attempts that produced no effective changes.
-		CompactorNoChange uint64
-		// CompactorSoftSkip is number of non-force compactor runs skipped because
-		// current snapshot pressure was too low to justify merge work.
-		CompactorSoftSkip uint64
-		// CompactorSkippedWake is number of wake requests suppressed because
-		// compactor was already backoff-limited or already queued.
-		CompactorSkippedWake uint64
-		// CompactorIdleDefers is number of forced idle compactions deferred
-		// because the system was no longer idle by the time the run started.
-		CompactorIdleDefers uint64
-		// CompactorStaleRetry is number of stale compaction builds discarded
-		// because a newer snapshot was published before apply.
-		CompactorStaleRetry uint64
 	}
 )
 
@@ -1268,24 +1074,10 @@ func (db *DB[K, V]) publishCurrentSequenceSnapshotNoLock() error {
 	return nil
 }
 
-func advanceBucketSequence(bucket *bbolt.Bucket) error {
-	if _, err := bucket.NextSequence(); err != nil {
-		return fmt.Errorf("advance bucket sequence: %w", err)
-	}
-	return nil
-}
-
 func (db *DB[K, V]) tripBrokenLocked(op string, cause any) error {
 	if db.broken.CompareAndSwap(false, true) {
 		log.Printf("rbi: index entered broken state: post-commit snapshot publish failed (%v): %v", op, cause)
 		if stop := db.planner.analyzer.stop; stop != nil {
-			select {
-			case <-stop:
-			default:
-				close(stop)
-			}
-		}
-		if stop := db.snapshot.compactStop; stop != nil {
 			select {
 			case <-stop:
 			default:
@@ -1366,7 +1158,7 @@ func (db *DB[K, V]) Stats() Stats[K] {
 	out.LastKey = db.statsLastKeyFromSnapshot(snap, out.KeyCount)
 
 	db.autoBatcher.mu.Lock()
-	out.AutoBatchQueueLen = len(db.autoBatcher.queue)
+	out.AutoBatchQueueLen = db.autoBatcher.queueSize
 	db.autoBatcher.mu.Unlock()
 	out.AutoBatchQueueMax = db.autoBatcher.queueHighWater.Load()
 
@@ -1376,13 +1168,6 @@ func (db *DB[K, V]) Stats() Stats[K] {
 	}
 
 	out.SnapshotSequence = snap.seq
-	out.SnapshotHasDelta = snap.hasAnyDeltaState()
-	if snap.indexLayer != nil {
-		out.SnapshotIndexLayerDepth = snap.indexLayer.depth
-	}
-	if snap.lenLayer != nil {
-		out.SnapshotLenLayerDepth = snap.lenLayer.depth
-	}
 
 	return out
 }
@@ -1394,33 +1179,10 @@ func (db *DB[K, V]) statsLastKeyFromSnapshot(snap *indexSnapshot, keyCount uint6
 	}
 
 	var maxIdx uint64
-	switch {
-	case snap.universeAdd == nil || snap.universeAdd.IsEmpty():
-		if snap.universe == nil || snap.universe.IsEmpty() {
-			return zero
-		}
-		if snap.universeRem == nil || snap.universeRem.IsEmpty() || !snap.universeRem.Contains(snap.universe.Maximum()) {
-			maxIdx = snap.universe.Maximum()
-			return db.statsKeyFromIdx(snap, maxIdx)
-		}
-		fallthrough
-	default:
-		universe := getRoaringBuf()
-		defer releaseRoaringBuf(universe)
-		if snap.universe != nil && !snap.universe.IsEmpty() {
-			universe.Or(snap.universe)
-		}
-		if snap.universeAdd != nil && !snap.universeAdd.IsEmpty() {
-			universe.Or(snap.universeAdd)
-		}
-		if snap.universeRem != nil && !snap.universeRem.IsEmpty() {
-			universe.AndNot(snap.universeRem)
-		}
-		if universe.IsEmpty() {
-			return zero
-		}
-		maxIdx = universe.Maximum()
+	if snap.universe.IsEmpty() {
+		return zero
 	}
+	maxIdx, _ = snap.universe.Maximum()
 
 	return db.statsKeyFromIdx(snap, maxIdx)
 }
@@ -1462,14 +1224,11 @@ func (db *DB[K, V]) IndexStats() IndexStats {
 	idx.Size = 0
 	idx.EntryCount = 0
 	idx.KeyBytes = 0
-	idx.BitmapCardinality = 0
+	idx.PostingCardinality = 0
 	idx.ApproxStructBytes = 0
 	idx.ApproxHeapBytes = 0
 
 	fields := snap.indexedFieldNameSet()
-
-	scratch := getRoaringBuf()
-	defer releaseRoaringBuf(scratch)
 
 	for name := range fields {
 		var (
@@ -1480,56 +1239,33 @@ func (db *DB[K, V]) IndexStats() IndexStats {
 		)
 		accumulate := func(ov fieldOverlay, countDistinct bool) {
 			br := ov.rangeForBounds(rangeBounds{has: true})
-			if br.baseStart >= br.baseEnd && br.deltaStart >= br.deltaEnd {
+			if br.baseStart >= br.baseEnd {
 				return
 			}
 			cur := ov.newCursor(br, false)
 			for {
-				key, baseBM, de, ok := cur.next()
+				key, ids, ok := cur.next()
 				if !ok {
 					break
 				}
-				if deltaEntryIsEmpty(de) {
-					if baseBM.IsEmpty() {
-						continue
-					}
-					if countDistinct {
-						unique++
-						keyLen += uint64(key.byteLen())
-					}
-					size += baseBM.SizeInBytes()
-					curCard := baseBM.Cardinality()
-					card += curCard
-					idx.EntryCount++
-					idx.KeyBytes += uint64(key.byteLen())
-					idx.BitmapCardinality += curCard
-					continue
-				}
-				bm, owned := composePostingOwned(baseBM, de, scratch)
-				if bm == nil || bm.IsEmpty() {
-					if owned && bm != nil && bm != scratch {
-						releaseRoaringBuf(bm)
-					}
+				if ids.IsEmpty() {
 					continue
 				}
 				if countDistinct {
 					unique++
 					keyLen += uint64(key.byteLen())
 				}
-				size += bm.GetSizeInBytes()
-				curCard := bm.GetCardinality()
+				size += ids.SizeInBytes()
+				curCard := ids.Cardinality()
 				card += curCard
 				idx.EntryCount++
 				idx.KeyBytes += uint64(key.byteLen())
-				idx.BitmapCardinality += curCard
-				if owned && bm != scratch {
-					releaseRoaringBuf(bm)
-				}
+				idx.PostingCardinality += curCard
 			}
 		}
 
-		accumulate(newFieldOverlay(snap.fieldIndexSlice(name), snap.fieldDelta(name)), true)
-		accumulate(newFieldOverlay(snap.nilFieldIndexSlice(name), snap.nilFieldDelta(name)), false)
+		accumulate(newFieldOverlayStorage(snap.index[name]), true)
+		accumulate(newFieldOverlayStorage(snap.nilIndex[name]), false)
 
 		idx.UniqueFieldKeys[name] = unique
 		idx.FieldSize[name] = size
@@ -1579,7 +1315,7 @@ func (db *DB[K, V]) AutoBatchStats() AutoBatchStats {
 	}
 
 	db.autoBatcher.mu.Lock()
-	out.QueueLen = len(db.autoBatcher.queue)
+	out.QueueLen = db.autoBatcher.queueSize
 	out.QueueCap = cap(db.autoBatcher.queue)
 	out.WorkerRunning = db.autoBatcher.running
 	out.HotWindowActive = time.Now().Before(db.autoBatcher.hotUntil)
@@ -1656,7 +1392,6 @@ func (db *DB[K, V]) Close() error {
 	defer unregInstance(db.bolt.Path(), string(db.bucket))
 
 	db.stopAnalyzeLoop()
-	db.stopSnapshotCompactor()
 
 	db.autoBatcher.mu.Lock()
 	if db.autoBatcher.cond != nil {
@@ -1727,31 +1462,28 @@ func (db *DB[K, V]) Truncate() error {
 	if err = bucket.SetSequence(prevSeq); err != nil {
 		return fmt.Errorf("restore bucket sequence: %w", err)
 	}
-	if err = advanceBucketSequence(bucket); err != nil {
-		return err
+	seq, err := bucket.NextSequence()
+	if err != nil {
+		return fmt.Errorf("advance bucket sequence: %w", err)
 	}
 
-	seq := bucket.Sequence()
-	nextIndex := make(map[string]*[]index)
-	nextNilIndex := make(map[string]*[]index)
-	nextLenIndex := make(map[string]*[]index)
-	nextUniverse := roaring64.NewBitmap()
+	nextIndex := make(map[string]fieldIndexStorage)
+	nextNilIndex := make(map[string]fieldIndexStorage)
+	nextLenIndex := make(map[string]fieldIndexStorage)
+	nextUniverse := posting.List{}
 	var nextStrMap *strMapSnapshot
 	if db.strkey {
 		nextStrMap = &strMapSnapshot{}
 	}
 	snap := &indexSnapshot{
-		seq:                             seq,
-		index:                           nextIndex,
-		nilIndex:                        nextNilIndex,
-		lenIndex:                        nextLenIndex,
-		universe:                        nextUniverse,
-		strmap:                          nextStrMap,
-		numericRangeBucketCache:         newNumericRangeBucketCache(),
-		matPredCacheMaxEntries:          max(0, db.options.SnapshotMaterializedPredCacheMaxEntries),
-		matPredCacheMaxEntriesWithDelta: max(0, db.options.SnapshotMaterializedPredCacheMaxEntriesWithDelta),
-		matPredCacheMaxBitmapCard:       materializedPredCacheMaxBitmapCardinality(db.options.SnapshotMaterializedPredCacheMaxBitmapCardinality),
+		seq:      seq,
+		index:    nextIndex,
+		nilIndex: nextNilIndex,
+		lenIndex: nextLenIndex,
+		universe: nextUniverse,
+		strmap:   nextStrMap,
 	}
+	db.initSnapshotRuntimeCaches(snap)
 	db.stageSnapshot(snap)
 	if err = db.commit(tx, "truncate"); err != nil {
 		db.dropStagedSnapshot(seq)
@@ -1767,7 +1499,7 @@ func (db *DB[K, V]) Truncate() error {
 	// Keep previously published snapshots immutable for concurrent readers.
 	db.universe = nextUniverse
 	if err = db.publishAfterCommitLocked(seq, "truncate", func() {
-		db.finishSnapshotPublishNoLock(snap, nil, nil, nil, nil, nil)
+		db.finishSnapshotPublishNoLock(snap)
 	}); err != nil {
 		return err
 	}
@@ -1777,7 +1509,10 @@ func (db *DB[K, V]) Truncate() error {
 
 // ReleaseRecords returns records to the record pool.
 //
-// Make sure that the passed records are no longer used or held.
+// The caller transfers ownership of each passed pointer back to DB.
+// Passed records must not be used after this call.
+// There is no internal protection against double-release.
+// If unsure about record ownership or lifecycle, do not use this method.
 func (db *DB[K, V]) ReleaseRecords(v ...*V) {
 	var zero V
 	for _, rec := range v {
@@ -1801,79 +1536,42 @@ func (db *DB[K, V]) BucketName() []byte {
 }
 
 type strMapSnapshot struct {
-	Next uint64
-	Keys map[string]uint64
-	Strs map[uint64]string
-
-	// DenseStrs/DenseUsed store compact base snapshots.
-	// Delta layers keep sparse Strs map to avoid full-slice copies per publish.
+	Next      uint64
+	Keys      map[string]uint64
+	Strs      map[uint64]string
 	DenseStrs []string
 	DenseUsed []bool
-
-	base     *strMapSnapshot
-	baseNext uint64
-	depth    int
+	base      *strMapSnapshot
+	anchor    *strMapSnapshot
+	depth     int
 }
 
-func (s *strMapSnapshot) compact() *strMapSnapshot {
-	if s == nil {
-		return nil
+func (s *strMapSnapshot) baseNextNoLock() uint64 {
+	if s == nil || s.base == nil {
+		return 0
 	}
-	if s.base == nil && s.DenseStrs != nil {
-		return s
-	}
-	if s.Next > uint64(^uint(0)>>1) {
-		panic(fmt.Errorf("strmap index overflows int: %v", s.Next))
-	}
+	return s.base.Next
+}
 
-	layers := make([]*strMapSnapshot, 0, max(1, s.depth))
-	for cur := s; cur != nil; cur = cur.base {
-		layers = append(layers, cur)
+func (s *strMapSnapshot) getOwnStringNoLock(idx uint64) (string, bool) {
+	if s == nil || idx > s.Next {
+		return "", false
 	}
-
-	size := int(s.Next) + 1
-	if size < 1 {
-		size = 1
-	}
-	strs := make([]string, size)
-	used := make([]bool, size)
-
-	for i := len(layers) - 1; i >= 0; i-- {
-		cur := layers[i]
-
-		limit := min(size, len(cur.DenseStrs), len(cur.DenseUsed))
-		for idx := 1; idx < limit; idx++ {
-			if !cur.DenseUsed[idx] {
-				continue
-			}
-			strs[idx] = cur.DenseStrs[idx]
-			used[idx] = true
+	if len(s.DenseStrs) > 0 || len(s.DenseUsed) > 0 {
+		if idx > uint64(^uint(0)>>1) {
+			return "", false
 		}
-
-		for idx, key := range cur.Strs {
-			if idx == 0 || idx > s.Next || idx > uint64(^uint(0)>>1) {
-				continue
-			}
-			strs[int(idx)] = key
-			used[int(idx)] = true
+		i := int(idx)
+		if i < len(s.DenseStrs) && i < len(s.DenseUsed) && s.DenseUsed[i] {
+			return s.DenseStrs[i], true
 		}
+		return "", false
 	}
-
-	keys := make(map[string]uint64, len(s.Keys))
-	for idx := 1; idx < len(strs); idx++ {
-		if !used[idx] {
-			continue
-		}
-		keys[strs[idx]] = uint64(idx)
+	if s.Strs == nil {
+		return "", false
 	}
-
-	return &strMapSnapshot{
-		Next:      s.Next,
-		Keys:      keys,
-		DenseStrs: strs,
-		DenseUsed: used,
-		depth:     1,
-	}
+	v, ok := s.Strs[idx]
+	return v, ok
 }
 
 func (s *strMapSnapshot) getIdxNoLock(key string) (uint64, bool) {
@@ -1889,26 +1587,49 @@ func (s *strMapSnapshot) getIdxNoLock(key string) (uint64, bool) {
 }
 
 func (s *strMapSnapshot) getStringNoLock(idx uint64) (string, bool) {
-	for cur := s; cur != nil; cur = cur.base {
-		if cur.base != nil && idx <= cur.baseNext {
-			continue
+	for cur := s; cur != nil; {
+		if idx > cur.Next {
+			return "", false
 		}
-
-		if cur.DenseStrs != nil {
-			if idx <= uint64(^uint(0)>>1) {
-				i := int(idx)
-				if i < len(cur.DenseStrs) && i < len(cur.DenseUsed) && cur.DenseUsed[i] {
-					return cur.DenseStrs[i], true
-				}
+		if len(cur.DenseStrs) > 0 || len(cur.DenseUsed) > 0 {
+			if idx > uint64(^uint(0)>>1) {
+				return "", false
 			}
-			continue
+			i := int(idx)
+			if i < len(cur.DenseStrs) && i < len(cur.DenseUsed) && cur.DenseUsed[i] {
+				return cur.DenseStrs[i], true
+			}
+			if cur.base == nil {
+				return "", false
+			}
+			if idx <= cur.base.Next {
+				if cur.anchor != nil && cur.anchor != cur.base && idx <= cur.anchor.Next {
+					cur = cur.anchor
+				} else {
+					cur = cur.base
+				}
+				continue
+			}
+			return "", false
 		}
-
 		if cur.Strs != nil {
-			if v, ok := cur.Strs[idx]; ok {
+			v, ok := cur.Strs[idx]
+			if ok {
 				return v, true
 			}
 		}
+		if cur.base == nil {
+			return "", false
+		}
+		if idx <= cur.base.Next {
+			if cur.anchor != nil && cur.anchor != cur.base && idx <= cur.anchor.Next {
+				cur = cur.anchor
+			} else {
+				cur = cur.base
+			}
+			continue
+		}
+		return "", false
 	}
 	return "", false
 }
@@ -1918,12 +1639,11 @@ type strMapper struct {
 	Keys map[string]uint64
 	Strs []string
 
-	strsUsed []bool
-
-	deltaKeys map[string]uint64
-	deltaStrs map[uint64]string
-	snap      *strMapSnapshot
-	compactAt int
+	sparseStrs map[uint64]string
+	strsUsed   []bool
+	snap       *strMapSnapshot
+	dirty      bool
+	compactAt  int
 
 	sync.Mutex
 }
@@ -1951,11 +1671,11 @@ func (sm *strMapper) truncate() {
 	sm.Keys = make(map[string]uint64)
 	sm.Strs = sm.Strs[:1]
 	sm.Strs[0] = ""
+	sm.sparseStrs = nil
 	sm.strsUsed = sm.strsUsed[:1]
 	sm.strsUsed[0] = false
-	sm.deltaKeys = nil
-	sm.deltaStrs = nil
 	sm.snap = &strMapSnapshot{}
+	sm.dirty = false
 }
 
 func (sm *strMapper) createIdxNoLock(s string) uint64 {
@@ -1965,6 +1685,11 @@ func (sm *strMapper) createIdxNoLock(s string) uint64 {
 	sm.Next++
 	idx := sm.Next
 	sm.Keys[s] = idx
+	if sm.sparseStrs != nil {
+		sm.sparseStrs[idx] = s
+		sm.dirty = true
+		return idx
+	}
 	if idx > uint64(^uint(0)>>1) {
 		panic(fmt.Errorf("strmap index overflows int: %v", idx))
 	}
@@ -1976,31 +1701,44 @@ func (sm *strMapper) createIdxNoLock(s string) uint64 {
 	}
 	sm.Strs[int(idx)] = s
 	sm.strsUsed[int(idx)] = true
-	if sm.deltaKeys == nil {
-		sm.deltaKeys = make(map[string]uint64, 4)
-		sm.deltaStrs = make(map[uint64]string, 4)
-	}
-	sm.deltaKeys[s] = idx
-	sm.deltaStrs[idx] = s
+	sm.dirty = true
 	return idx
 }
 
-func (sm *strMapper) replaceAllNoLock(keys map[string]uint64, strs []string, used []bool, next uint64) {
+func (sm *strMapper) replaceAllDenseNoLock(keys map[string]uint64, strs []string, used []bool, next uint64) {
 	sm.Next = next
 	sm.Keys = keys
 	sm.Strs = strs
+	sm.sparseStrs = nil
 	sm.strsUsed = used
-	sm.deltaKeys = nil
-	sm.deltaStrs = nil
 	keysCopy := maps.Clone(keys)
 	sm.snap = &strMapSnapshot{
 		Next:      next,
 		Keys:      keysCopy,
+		Strs:      nil,
 		DenseStrs: slices.Clone(strs),
 		DenseUsed: slices.Clone(used),
-		baseNext:  0,
 		depth:     1,
 	}
+	sm.dirty = false
+}
+
+func (sm *strMapper) replaceAllSparseNoLock(keys map[string]uint64, strs map[uint64]string, next uint64) {
+	sm.Next = next
+	sm.Keys = keys
+	sm.Strs = nil
+	sm.sparseStrs = strs
+	sm.strsUsed = nil
+	keysCopy := maps.Clone(keys)
+	sm.snap = &strMapSnapshot{
+		Next:      next,
+		Keys:      keysCopy,
+		Strs:      maps.Clone(strs),
+		DenseStrs: nil,
+		DenseUsed: nil,
+		depth:     1,
+	}
+	sm.dirty = false
 }
 
 func (sm *strMapper) snapshot() *strMapSnapshot {
@@ -2009,55 +1747,110 @@ func (sm *strMapper) snapshot() *strMapSnapshot {
 	return sm.snapshotNoLock()
 }
 
-func (sm *strMapper) forceSnapshotPublishedNoLock(published *strMapSnapshot) *strMapSnapshot {
-	sm.snap = published.compact()
-	return sm.snap
-}
-
-func (sm *strMapper) forceSnapshotPublished(published *strMapSnapshot) *strMapSnapshot {
-	sm.Lock()
-	defer sm.Unlock()
-	return sm.forceSnapshotPublishedNoLock(published)
-}
-
 func (sm *strMapper) snapshotNoLock() *strMapSnapshot {
 	if sm.snap == nil {
 		sm.snap = &strMapSnapshot{}
 	}
-	if len(sm.deltaKeys) == 0 {
+	if !sm.dirty {
 		return sm.snap
 	}
-	keys := sm.deltaKeys
-	strs := sm.deltaStrs
-	sm.deltaKeys = nil
-	sm.deltaStrs = nil
-	nextDepth := 1
-	if sm.snap != nil {
-		nextDepth = sm.snap.depth + 1
-	}
-	if sm.compactAt > 0 && nextDepth >= sm.compactAt {
-		keysCopy := maps.Clone(sm.Keys)
-		sm.snap = &strMapSnapshot{
-			Next:      sm.Next,
-			Keys:      keysCopy,
-			DenseStrs: slices.Clone(sm.Strs),
-			DenseUsed: slices.Clone(sm.strsUsed),
-			baseNext:  0,
-			depth:     1,
-		}
+	if next, ok := sm.deltaSnapshotNoLock(sm.snap); ok {
+		sm.snap = next
+		sm.dirty = false
 		return sm.snap
 	}
-	var baseNext uint64
-	if sm.snap != nil {
-		baseNext = sm.snap.Next
-	}
-	sm.snap = &strMapSnapshot{
-		Next:     sm.Next,
-		Keys:     keys,
-		Strs:     strs,
-		base:     sm.snap,
-		baseNext: baseNext,
-		depth:    nextDepth,
-	}
+	sm.snap = sm.fullSnapshotNoLock()
+	sm.dirty = false
 	return sm.snap
+}
+
+func (sm *strMapper) fullSnapshotNoLock() *strMapSnapshot {
+	snap := &strMapSnapshot{
+		Next:  sm.Next,
+		Keys:  maps.Clone(sm.Keys),
+		depth: 1,
+	}
+	if sm.sparseStrs != nil {
+		snap.Strs = maps.Clone(sm.sparseStrs)
+		return snap
+	}
+	snap.DenseStrs = slices.Clone(sm.Strs)
+	snap.DenseUsed = slices.Clone(sm.strsUsed)
+	return snap
+}
+
+func (sm *strMapper) deltaSnapshotNoLock(base *strMapSnapshot) (*strMapSnapshot, bool) {
+	if base == nil {
+		return nil, false
+	}
+	if sm.compactAt > 0 && base.depth >= sm.compactAt {
+		return nil, false
+	}
+	if sm.Next < base.Next {
+		return nil, false
+	}
+	if sm.Next == base.Next {
+		return base, true
+	}
+
+	start := base.Next + 1
+	count := 0
+	if sm.sparseStrs != nil {
+		for idx := start; idx <= sm.Next; idx++ {
+			if _, ok := sm.sparseStrs[idx]; ok {
+				count++
+			}
+		}
+	} else {
+		if sm.Next > uint64(^uint(0)>>1) {
+			return nil, false
+		}
+		end := int(sm.Next)
+		for i := int(start); i <= end; i++ {
+			if i < len(sm.strsUsed) && sm.strsUsed[i] {
+				count++
+			}
+		}
+	}
+	if count == 0 {
+		return base, true
+	}
+
+	keys := make(map[string]uint64, count)
+	strs := make(map[uint64]string, count)
+	if sm.sparseStrs != nil {
+		for idx := start; idx <= sm.Next; idx++ {
+			s, ok := sm.sparseStrs[idx]
+			if !ok {
+				continue
+			}
+			keys[s] = idx
+			strs[idx] = s
+		}
+	} else {
+		end := int(sm.Next)
+		for i := int(start); i <= end; i++ {
+			if i >= len(sm.strsUsed) || !sm.strsUsed[i] {
+				continue
+			}
+			s := sm.Strs[i]
+			idx := uint64(i)
+			keys[s] = idx
+			strs[idx] = s
+		}
+	}
+
+	anchor := base
+	if anchor.depth > 1 && anchor.anchor != nil {
+		anchor = anchor.anchor
+	}
+
+	return &strMapSnapshot{
+		Next:   sm.Next,
+		Keys:   keys,
+		Strs:   strs,
+		base:   base,
+		anchor: anchor,
+		depth:  base.depth + 1,
+	}, true
 }

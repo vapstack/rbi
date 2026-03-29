@@ -53,14 +53,32 @@ func (db *DB[K, V]) MakePatchInto(oldVal, newVal *V, dst []Field) []Field {
 	return db.makePatch(oldVal, newVal, dst)
 }
 
-var patchMapPool = sync.Pool{
+type patchScratch struct {
+	seen []bool
+}
+
+var patchScratchPool = sync.Pool{
 	New: func() any {
-		return make(map[string]struct{})
+		return new(patchScratch)
 	},
 }
 
-func (db *DB[K, V]) makePatch(oldVal, newVal *V, target []Field) []Field {
+func acquirePatchScratch(n int) *patchScratch {
+	scratch := patchScratchPool.Get().(*patchScratch)
+	if cap(scratch.seen) < n {
+		scratch.seen = make([]bool, n)
+	} else {
+		scratch.seen = scratch.seen[:n]
+	}
+	return scratch
+}
 
+func releasePatchScratch(scratch *patchScratch) {
+	clear(scratch.seen)
+	patchScratchPool.Put(scratch)
+}
+
+func (db *DB[K, V]) makePatch(oldVal, newVal *V, target []Field) []Field {
 	target = target[:0]
 
 	if newVal == nil {
@@ -73,51 +91,65 @@ func (db *DB[K, V]) makePatch(oldVal, newVal *V, target []Field) []Field {
 	}
 	rvNew = reflect.ValueOf(newVal).Elem()
 
-	processed := patchMapPool.Get().(map[string]struct{})
-	clear(processed)
-	defer patchMapPool.Put(processed)
+	scratch := acquirePatchScratch(len(db.patchFieldAccess))
+	defer releasePatchScratch(scratch)
 
-	mods := db.getModifiedIndexedFields(oldVal, newVal)
+	newPtr := unsafe.Pointer(newVal)
+	oldPtr := unsafe.Pointer(nil)
+	if oldVal != nil {
+		oldPtr = unsafe.Pointer(oldVal)
+	}
 
-	for _, dbname := range mods {
-		f := db.fields[dbname]
+	db.forEachModifiedIndexedField(oldVal, newVal, func(acc indexedFieldAccessor) bool {
+		if acc.patchOrdinal < 0 {
+			return true
+		}
+		patchAcc := db.patchFieldAccess[acc.patchOrdinal]
+		var value any
+		if patchAcc.copyValue != nil {
+			value = patchAcc.copyValue(newPtr)
+		} else {
+			value = deepCopyValue(rvNew.FieldByIndex(patchAcc.field.Index).Interface())
+		}
+		scratch.seen[acc.patchOrdinal] = true
+		target = append(target, Field{
+			Name:  patchAcc.field.Name,
+			Value: value,
+		})
+		return true
+	})
 
-		processed[f.Name] = struct{}{}
+	for ordinal, patchAcc := range db.patchFieldAccess {
+		if scratch.seen[ordinal] {
+			continue
+		}
 
 		var newValue any
-		if rvNew.IsValid() {
-			newValue = rvNew.FieldByIndex(f.Index).Interface()
+		if rvOld.IsValid() {
+			if patchAcc.valueEqual != nil {
+				if patchAcc.valueEqual(oldPtr, newPtr) {
+					continue
+				}
+			} else {
+				oldValue := rvOld.FieldByIndex(patchAcc.field.Index).Interface()
+				newValue = rvNew.FieldByIndex(patchAcc.field.Index).Interface()
+				if reflect.DeepEqual(oldValue, newValue) {
+					continue
+				}
+			}
+		}
+		if patchAcc.copyValue != nil {
+			newValue = patchAcc.copyValue(newPtr)
+		} else if newValue == nil {
+			newValue = deepCopyValue(rvNew.FieldByIndex(patchAcc.field.Index).Interface())
+		} else {
+			newValue = deepCopyValue(newValue)
 		}
 
 		target = append(target, Field{
-			Name:  f.Name,
-			Value: deepCopyValue(newValue),
+			Name:  patchAcc.field.Name,
+			Value: newValue,
 		})
-	}
-
-	for patchKey, f := range db.patchMap {
-		if patchKey != f.Name {
-			continue
-		}
-		if _, ok := processed[f.Name]; ok {
-			continue
-		}
-
-		var v1, v2 any
-		if rvOld.IsValid() {
-			v1 = rvOld.FieldByIndex(f.Index).Interface()
-		}
-		if rvNew.IsValid() {
-			v2 = rvNew.FieldByIndex(f.Index).Interface()
-		}
-
-		if !reflect.DeepEqual(v1, v2) {
-			target = append(target, Field{
-				Name:  f.Name,
-				Value: deepCopyValue(v2),
-			})
-		}
-		processed[f.Name] = struct{}{}
 	}
 
 	return target
@@ -161,26 +193,6 @@ func (db *DB[K, V]) idxFromIDWithCreated(id K) (uint64, bool) {
 	return *(*uint64)(unsafe.Pointer(&id)), false
 }
 
-func (db *DB[K, V]) idxsFromIDWithCreated(ids []K) ([]uint64, []bool) {
-	if db.strkey {
-		s := *(*[]string)(unsafe.Pointer(&ids))
-		idxs := make([]uint64, len(s))
-		created := make([]bool, len(s))
-		db.strmap.Lock()
-		for i := range s {
-			if idx, ok := db.strmap.Keys[s[i]]; ok {
-				idxs[i] = idx
-				continue
-			}
-			idxs[i] = db.strmap.createIdxNoLock(s[i])
-			created[i] = true
-		}
-		db.strmap.Unlock()
-		return idxs, created
-	}
-	return *(*[]uint64)(unsafe.Pointer(&ids)), nil
-}
-
 func (db *DB[K, V]) rollbackCreatedStrIdx(id K, idx uint64) {
 	if !db.strkey || idx == 0 {
 		return
@@ -196,7 +208,9 @@ func (db *DB[K, V]) rollbackCreatedStrIdx(id K, idx uint64) {
 	}
 
 	delete(db.strmap.Keys, s)
-	if idx <= uint64(^uint(0)>>1) {
+	if db.strmap.sparseStrs != nil {
+		delete(db.strmap.sparseStrs, idx)
+	} else if idx <= uint64(^uint(0)>>1) {
 		i := int(idx)
 		if i < len(db.strmap.Strs) {
 			db.strmap.Strs[i] = ""
@@ -208,6 +222,13 @@ func (db *DB[K, V]) rollbackCreatedStrIdx(id K, idx uint64) {
 
 	if idx <= db.strmap.Next {
 		for db.strmap.Next > 0 {
+			if db.strmap.sparseStrs != nil {
+				if _, ok := db.strmap.sparseStrs[db.strmap.Next]; ok {
+					break
+				}
+				db.strmap.Next--
+				continue
+			}
 			if db.strmap.Next > uint64(^uint(0)>>1) {
 				db.strmap.Next = 0
 				break
@@ -219,29 +240,20 @@ func (db *DB[K, V]) rollbackCreatedStrIdx(id K, idx uint64) {
 			db.strmap.Next--
 		}
 
-		trim := int(db.strmap.Next) + 1
-		if trim < len(db.strmap.Strs) {
-			clear(db.strmap.Strs[trim:])
-			db.strmap.Strs = db.strmap.Strs[:trim]
-		}
-		if trim < len(db.strmap.strsUsed) {
-			clear(db.strmap.strsUsed[trim:])
-			db.strmap.strsUsed = db.strmap.strsUsed[:trim]
+		if db.strmap.sparseStrs == nil {
+			trim := int(db.strmap.Next) + 1
+			if trim < len(db.strmap.Strs) {
+				clear(db.strmap.Strs[trim:])
+				db.strmap.Strs = db.strmap.Strs[:trim]
+			}
+			if trim < len(db.strmap.strsUsed) {
+				clear(db.strmap.strsUsed[trim:])
+				db.strmap.strsUsed = db.strmap.strsUsed[:trim]
+			}
 		}
 	}
 
-	if db.strmap.deltaKeys != nil {
-		delete(db.strmap.deltaKeys, s)
-		if len(db.strmap.deltaKeys) == 0 {
-			db.strmap.deltaKeys = nil
-		}
-	}
-	if db.strmap.deltaStrs != nil {
-		delete(db.strmap.deltaStrs, idx)
-		if len(db.strmap.deltaStrs) == 0 {
-			db.strmap.deltaStrs = nil
-		}
-	}
+	db.strmap.dirty = true
 }
 
 func (db *DB[K, V]) forEachIdxFromID(ids []K, fn func(uint64)) {
@@ -266,12 +278,17 @@ func (db *DB[K, V]) forEachIdxFromID(ids []K, fn func(uint64)) {
 
 var msgpackEncPool = sync.Pool{New: func() any { return msgpack.NewEncoder(io.Discard) }}
 var msgpackDecPool = sync.Pool{New: func() any { return msgpack.NewDecoder(strings.NewReader("")) }}
+var msgpackReaderPool = sync.Pool{New: func() any { return bytes.NewReader(nil) }}
 
 func (db *DB[K, V]) decode(b []byte) (*V, error) {
 	v := db.recPool.Get().(*V)
 	dec := msgpackDecPool.Get().(*msgpack.Decoder)
-	dec.Reset(bytes.NewReader(b))
+	reader := msgpackReaderPool.Get().(*bytes.Reader)
+	reader.Reset(b)
+	dec.Reset(reader)
 	err := dec.Decode(v)
+	reader.Reset(nil)
+	msgpackReaderPool.Put(reader)
 	msgpackDecPool.Put(dec)
 	if err != nil {
 		db.ReleaseRecords(v)
@@ -379,15 +396,52 @@ func int64ByteStr(v int64) string {
 	return uint64ByteStr(uint64(v) ^ (uint64(1) << 63))
 }
 
-func float64ByteStr(f float64) string {
-	u := math.Float64bits(f)
+const canonicalFloat64NaNBits uint64 = 0x7ff8000000000001
+
+func canonicalizeFloat64ForIndex(f float64) float64 {
+	switch {
+	case math.IsNaN(f):
+		return math.Float64frombits(canonicalFloat64NaNBits)
+	case f == 0:
+		return 0
+	default:
+		return f
+	}
+}
+
+func orderedFloat64Key(f float64) uint64 {
+	u := math.Float64bits(canonicalizeFloat64ForIndex(f))
 	const sign = uint64(1) << 63
 	if u&sign != 0 {
-		u = ^u // negative: flip all bits
-	} else {
-		u ^= sign // non-negative (includes +0): flip sign bit
+		return ^u
 	}
-	return uint64ByteStr(u)
+	return u ^ sign
+}
+
+func compareFloat64QuerySemantics(a, b float64) int {
+	a = canonicalizeFloat64ForIndex(a)
+	b = canonicalizeFloat64ForIndex(b)
+
+	aNaN := math.IsNaN(a)
+	bNaN := math.IsNaN(b)
+	switch {
+	case aNaN && bNaN:
+		return 0
+	case aNaN:
+		return 1
+	case bNaN:
+		return -1
+	case a < b:
+		return -1
+	case a > b:
+		return 1
+	default:
+		return 0
+	}
+}
+
+func float64ByteStr(f float64) string {
+	return uint64ByteStr(orderedFloat64Key(f))
 }
 
 var (

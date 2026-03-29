@@ -9,15 +9,23 @@ import (
 )
 
 type field struct {
-	Name   string
-	Unique bool
-	Kind   reflect.Kind
-	Ptr    bool
-	Slice  bool
-	UseVI  bool
-	DBName string
-	Index  []int
+	Name    string
+	Unique  bool
+	Kind    reflect.Kind
+	Ptr     bool
+	Slice   bool
+	UseVI   bool
+	KeyKind fieldWriteKeyKind
+	DBName  string
+	Index   []int
 }
+
+type fieldWriteKeyKind uint8
+
+const (
+	fieldWriteKeysString fieldWriteKeyKind = iota
+	fieldWriteKeysOrderedU64
+)
 
 // ValueIndexer defines how a field value is converted into a canonical string
 // representation used as an index key in rbi.
@@ -39,6 +47,20 @@ type ValueIndexer interface {
 }
 
 var viType = reflect.TypeFor[ValueIndexer]()
+
+func inferFieldWriteKeyKind(kind reflect.Kind, useVI bool) fieldWriteKeyKind {
+	if useVI {
+		return fieldWriteKeysString
+	}
+	switch kind {
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64,
+		reflect.Float32, reflect.Float64:
+		return fieldWriteKeysOrderedU64
+	default:
+		return fieldWriteKeysString
+	}
+}
 
 func (db *DB[K, V]) populateFields(t reflect.Type, idx []int) error {
 
@@ -82,7 +104,34 @@ func (db *DB[K, V]) populateFields(t reflect.Type, idx []int) error {
 
 		useVI = f.Type.Implements(viType)
 
-		if !useVI {
+		if kind == reflect.Slice && !useVI {
+			slice = true
+			elem := f.Type.Elem()
+			kind = elem.Kind()
+			useVI = elem.Implements(viType)
+			if !useVI {
+				switch kind {
+				case reflect.Bool,
+					reflect.Int,
+					reflect.Int8,
+					reflect.Int16,
+					reflect.Int32,
+					reflect.Int64,
+					reflect.Uint,
+					reflect.Uint8,
+					reflect.Uint16,
+					reflect.Uint32,
+					reflect.Uint64,
+					reflect.Uintptr,
+					reflect.Float32,
+					reflect.Float64,
+					reflect.String:
+					// OK
+				default:
+					return fmt.Errorf("slice elements must either be of a simple type or implement the ValueIndexer interface")
+				}
+			}
+		} else if !useVI {
 
 			switch kind {
 
@@ -124,33 +173,6 @@ func (db *DB[K, V]) populateFields(t reflect.Type, idx []int) error {
 					return fmt.Errorf("cannot index field %v of type %v", f.Name, f.Type)
 				}
 
-			case reflect.Slice:
-				slice = true
-				elem := f.Type.Elem()
-				kind = elem.Kind()
-				switch kind {
-				case reflect.Bool,
-					reflect.Int,
-					reflect.Int8,
-					reflect.Int16,
-					reflect.Int32,
-					reflect.Int64,
-					reflect.Uint,
-					reflect.Uint8,
-					reflect.Uint16,
-					reflect.Uint32,
-					reflect.Uint64,
-					reflect.Uintptr,
-					reflect.Float32,
-					reflect.Float64,
-					reflect.String:
-					// OK
-				default:
-					useVI = elem.Implements(viType)
-					if !useVI {
-						return fmt.Errorf("slice elements must either be of a simple type or implement the ValueIndexer interface")
-					}
-				}
 			}
 		}
 
@@ -169,319 +191,76 @@ func (db *DB[K, V]) populateFields(t reflect.Type, idx []int) error {
 		}
 
 		db.fields[dbname] = &field{ // last wins
-			Name:   f.Name,
-			Unique: unique,
-			Kind:   kind,
-			Ptr:    ptr,
-			Slice:  slice,
-			UseVI:  useVI,
-			DBName: dbname,
-			Index:  append(append([]int{}, idx...), i),
+			Name:    f.Name,
+			Unique:  unique,
+			Kind:    kind,
+			Ptr:     ptr,
+			Slice:   slice,
+			UseVI:   useVI,
+			KeyKind: inferFieldWriteKeyKind(kind, useVI),
+			DBName:  dbname,
+			Index:   append(append([]int{}, idx...), i),
 		}
 	}
 	return nil
 }
 
-type getterFn func(ptr unsafe.Pointer) (string, []string, bool, bool)
-type valueGetterFn func(fv reflect.Value) (string, []string, bool, bool)
+type uniqueScalarGetterFn func(ptr unsafe.Pointer) (string, bool, bool)
+type fieldWriteAccessorFn func(ptr unsafe.Pointer, sink fieldWriteSink)
 
-func (db *DB[K, V]) makeGetter(f *field) (getterFn, error) {
-	sub, err := db.makeFieldValueGetter(f)
-	if err != nil {
-		return nil, err
-	}
-	return db.fieldGetter(f.Index, sub), nil
+type fieldWriteSink interface {
+	setNil()
+	setLen(int)
+	addString(string)
+	addFixed(uint64)
 }
 
-func (db *DB[K, V]) makeFieldValueGetter(f *field) (valueGetterFn, error) {
-	if f.UseVI {
-		if f.Slice {
-			return func(fv reflect.Value) (single string, multi []string, ok bool, isNil bool) {
-				if fv.Len() == 0 {
-					return "", nil, true, false
-				}
-				s := make([]string, fv.Len())
-				for i := 0; i < len(s); i++ {
-					s[i] = fv.Index(i).Interface().(ValueIndexer).IndexingValue()
-				}
-				return "", s, true, false
-			}, nil
-		} else {
-			return func(fv reflect.Value) (single string, multi []string, ok bool, isNil bool) {
-				return fv.Interface().(ValueIndexer).IndexingValue(), nil, true, false
-			}, nil
+func (db *DB[K, V]) forEachModifiedAccessor(accessors []indexedFieldAccessor, v1 *V, v2 *V, fn func(indexedFieldAccessor) bool) {
+	if fn == nil {
+		return
+	}
+	if len(accessors) == 0 {
+		return
+	}
+	if v1 == nil || v2 == nil {
+		for _, acc := range accessors {
+			if !fn(acc) {
+				return
+			}
+		}
+		return
+	}
+	ptr1 := unsafe.Pointer(v1)
+	ptr2 := unsafe.Pointer(v2)
+	for _, acc := range accessors {
+		if acc.modified != nil && acc.modified(ptr1, ptr2) && !fn(acc) {
+			return
 		}
 	}
-
-	var fn valueGetterFn
-
-	switch f.Kind {
-
-	case reflect.String:
-		if f.Slice {
-			fn = func(fv reflect.Value) (string, []string, bool, bool) {
-				if fv.Len() == 0 {
-					return "", nil, true, false
-				}
-				s := make([]string, fv.Len())
-				for i := 0; i < len(s); i++ {
-					s[i] = fv.Index(i).String()
-				}
-				return "", s, true, false
-			}
-		} else {
-			fn = func(fv reflect.Value) (string, []string, bool, bool) {
-				if f.Ptr {
-					if fv.IsNil() {
-						return "", nil, true, true
-					}
-					fv = fv.Elem()
-				}
-				return fv.String(), nil, true, false
-			}
-		}
-
-	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
-		if f.Slice {
-			fn = func(fv reflect.Value) (string, []string, bool, bool) {
-				if fv.Len() == 0 {
-					return "", nil, true, false
-				}
-				s := make([]string, fv.Len())
-				for i := 0; i < len(s); i++ {
-					s[i] = uint64ByteStr(fv.Index(i).Uint())
-				}
-				return "", s, true, false
-			}
-		} else {
-			fn = func(fv reflect.Value) (string, []string, bool, bool) {
-				if f.Ptr {
-					if fv.IsNil() {
-						return "", nil, true, true
-					}
-					fv = fv.Elem()
-				}
-				return uint64ByteStr(fv.Uint()), nil, true, false
-			}
-		}
-
-	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
-		if f.Slice {
-			fn = func(fv reflect.Value) (string, []string, bool, bool) {
-				if fv.Len() == 0 {
-					return "", nil, true, false
-				}
-				s := make([]string, fv.Len())
-				for i := 0; i < len(s); i++ {
-					s[i] = int64ByteStr(fv.Index(i).Int())
-				}
-				return "", s, true, false
-			}
-		} else {
-			fn = func(fv reflect.Value) (string, []string, bool, bool) {
-				if f.Ptr {
-					if fv.IsNil() {
-						return "", nil, true, true
-					}
-					fv = fv.Elem()
-				}
-				return int64ByteStr(fv.Int()), nil, true, false
-			}
-		}
-
-	case reflect.Bool:
-		if f.Slice {
-			fn = func(fv reflect.Value) (string, []string, bool, bool) {
-				if fv.Len() == 0 {
-					return "", nil, true, false
-				}
-				s := make([]string, fv.Len())
-				for i := 0; i < len(s); i++ {
-					if fv.Index(i).Bool() {
-						s[i] = "1"
-					} else {
-						s[i] = "0"
-					}
-				}
-				return "", s, true, false
-			}
-		} else {
-			fn = func(fv reflect.Value) (string, []string, bool, bool) {
-				if f.Ptr {
-					if fv.IsNil() {
-						return "", nil, true, true
-					}
-					fv = fv.Elem()
-				}
-				if fv.Bool() {
-					return "1", nil, true, false
-				} else {
-					return "0", nil, true, false
-				}
-			}
-		}
-
-	case reflect.Float32, reflect.Float64:
-		if f.Slice {
-			fn = func(fv reflect.Value) (string, []string, bool, bool) {
-				if fv.Len() == 0 {
-					return "", nil, true, false
-				}
-				s := make([]string, fv.Len())
-				for i := 0; i < len(s); i++ {
-					s[i] = float64ByteStr(fv.Index(i).Float())
-				}
-				return "", s, true, false
-			}
-		} else {
-			fn = func(fv reflect.Value) (string, []string, bool, bool) {
-				if f.Ptr {
-					if fv.IsNil() {
-						return "", nil, true, true
-					}
-					fv = fv.Elem()
-				}
-				return float64ByteStr(fv.Float()), nil, true, false
-			}
-		}
-
-	default:
-		return nil, fmt.Errorf("unknown or unsupported field kind: %v", f.Kind)
-	}
-
-	return fn, nil
 }
 
-func (db *DB[K, V]) fieldGetter(idx []int, sub valueGetterFn) getterFn {
-	return func(ptr unsafe.Pointer) (string, []string, bool, bool) {
-		if ptr == nil {
-			return "", nil, false, false
-		}
-		fv := reflect.NewAt(db.vtype, ptr).Elem()
-		if !fv.IsValid() {
-			return "", nil, false, false
-		}
-		return sub(fv.FieldByIndex(idx))
-	}
+func (db *DB[K, V]) forEachModifiedIndexedField(v1 *V, v2 *V, fn func(indexedFieldAccessor) bool) {
+	db.forEachModifiedAccessor(db.indexedFieldAccess, v1, v2, fn)
 }
 
 func (db *DB[K, V]) getModifiedIndexedFields(v1 *V, v2 *V) []string {
+	var modified []string
+	db.forEachModifiedIndexedField(v1, v2, func(acc indexedFieldAccessor) bool {
+		modified = append(modified, acc.name)
+		return true
+	})
+	return modified
+}
 
-	if v1 == nil || v2 == nil {
-		return db.fieldSlice
+func (db *DB[K, V]) getModifiedUniqueFields(v1 *V, v2 *V) []string {
+	if len(db.uniqueFieldAccessors) == 0 {
+		return nil
 	}
-
-	rv1 := reflect.ValueOf(v1).Elem()
-	rv2 := reflect.ValueOf(v2).Elem()
-
-	modified := make([]string, 0, len(db.fields))
-	for _, f := range db.fields {
-
-		fv1 := rv1.FieldByIndex(f.Index)
-		fv2 := rv2.FieldByIndex(f.Index)
-
-		if f.Slice {
-			l := fv1.Len()
-			if l != fv2.Len() {
-				modified = append(modified, f.DBName)
-			} else {
-				for i := 0; i < l; i++ {
-					sv1 := fv1.Index(i)
-					sv2 := fv2.Index(i)
-
-					if f.UseVI {
-						if sv1.Interface().(ValueIndexer).IndexingValue() != sv2.Interface().(ValueIndexer).IndexingValue() {
-							modified = append(modified, f.DBName)
-							break
-						}
-					} else {
-						switch f.Kind {
-						case reflect.String:
-							if sv1.String() != sv2.String() {
-								modified = append(modified, f.DBName)
-								break
-							}
-						case reflect.Bool:
-							if sv1.Bool() != sv2.Bool() {
-								modified = append(modified, f.DBName)
-								break
-							}
-						case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
-							if sv1.Int() != sv2.Int() {
-								modified = append(modified, f.DBName)
-								break
-							}
-						case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
-							if sv1.Uint() != sv2.Uint() {
-								modified = append(modified, f.DBName)
-								break
-							}
-						case reflect.Float32, reflect.Float64:
-							if sv1.Float() != sv2.Float() {
-								modified = append(modified, f.DBName)
-								break
-							}
-						default:
-							// should not be, but anyway
-							if !reflect.DeepEqual(sv1.Interface(), sv2.Interface()) {
-								modified = append(modified, f.DBName)
-								break
-							}
-						}
-					}
-				}
-			}
-			continue
-		}
-
-		if f.UseVI {
-			if fv1.Interface().(ValueIndexer).IndexingValue() != fv2.Interface().(ValueIndexer).IndexingValue() {
-				modified = append(modified, f.DBName)
-			}
-			continue
-		}
-
-		if f.Ptr {
-			v1nil := fv1.IsNil()
-			v2nil := fv2.IsNil()
-			if v1nil != v2nil {
-				modified = append(modified, f.DBName)
-				continue
-			}
-			if v1nil && v2nil {
-				continue
-			}
-			fv1 = fv1.Elem()
-			fv2 = fv2.Elem()
-		}
-
-		switch f.Kind {
-		case reflect.String:
-			if fv1.String() != fv2.String() {
-				modified = append(modified, f.DBName)
-			}
-		case reflect.Bool:
-			if fv1.Bool() != fv2.Bool() {
-				modified = append(modified, f.DBName)
-			}
-		case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
-			if fv1.Int() != fv2.Int() {
-				modified = append(modified, f.DBName)
-			}
-		case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
-			if fv1.Uint() != fv2.Uint() {
-				modified = append(modified, f.DBName)
-			}
-		case reflect.Float32, reflect.Float64:
-			if fv1.Float() != fv2.Float() {
-				modified = append(modified, f.DBName)
-			}
-		default:
-			if !reflect.DeepEqual(fv1.Interface(), fv2.Interface()) {
-				modified = append(modified, f.DBName)
-			}
-		}
-	}
+	var modified []string
+	db.forEachModifiedAccessor(db.uniqueFieldAccessors, v1, v2, func(acc indexedFieldAccessor) bool {
+		modified = append(modified, acc.name)
+		return true
+	})
 	return modified
 }
 
@@ -588,66 +367,8 @@ func (db *DB[K, V]) setReflectValue(fv reflect.Value, val any) error {
 	srcKind := sv.Kind()
 	dstKind := fv.Kind()
 
-	if srcKind == reflect.Float32 || srcKind == reflect.Float64 {
-		f64 := sv.Float()
-
-		if dstKind >= reflect.Int && dstKind <= reflect.Int64 {
-
-			if f64 != math.Trunc(f64) {
-				return fmt.Errorf("cannot assign float %v to int field (loss of precision)", f64)
-			}
-			i64 := int64(f64)
-			if fv.OverflowInt(i64) {
-				return fmt.Errorf("value %v overflows int field (%v)", i64, fv.Type())
-			}
-
-			fv.SetInt(i64)
-
-			return nil
-		}
-
-		if dstKind >= reflect.Uint && dstKind <= reflect.Uint64 {
-
-			if f64 < 0 || f64 != math.Trunc(f64) {
-				return fmt.Errorf("cannot assign float %v to uint field", f64)
-			}
-			u64 := uint64(f64)
-			if fv.OverflowUint(u64) {
-				return fmt.Errorf("value %v overflows uint field (%v)", u64, fv.Type())
-			}
-
-			fv.SetUint(u64)
-
-			return nil
-		}
-	}
-
-	if srcKind >= reflect.Int && srcKind <= reflect.Int64 {
-
-		if dstKind == reflect.Float32 || dstKind == reflect.Float64 {
-			f64 := float64(sv.Int())
-			if fv.OverflowFloat(f64) {
-				return fmt.Errorf("value %v overflows float field (%v)", f64, fv.Type())
-			}
-
-			fv.SetFloat(f64)
-
-			return nil
-		}
-	}
-
-	if srcKind >= reflect.Uint && srcKind <= reflect.Uint64 {
-
-		if dstKind == reflect.Float32 || dstKind == reflect.Float64 {
-			f64 := float64(sv.Uint())
-			if fv.OverflowFloat(f64) {
-				return fmt.Errorf("value %v overflows float field (%v)", f64, fv.Type())
-			}
-
-			fv.SetFloat(f64)
-
-			return nil
-		}
+	if handled, err := setReflectNumericValue(fv, sv, srcKind, dstKind); handled {
+		return err
 	}
 
 	if sv.Type().ConvertibleTo(fv.Type()) {
@@ -656,6 +377,153 @@ func (db *DB[K, V]) setReflectValue(fv reflect.Value, val any) error {
 	}
 
 	return fmt.Errorf("type mismatch: cannot convert %v to %v", sv.Type(), fv.Type())
+}
+
+func setReflectNumericValue(fv, sv reflect.Value, srcKind, dstKind reflect.Kind) (bool, error) {
+	if !isReflectNumericKind(srcKind) || !isReflectNumericKind(dstKind) {
+		return false, nil
+	}
+
+	switch {
+	case isReflectFloatKind(srcKind):
+		f64 := sv.Float()
+
+		if isReflectFloatKind(dstKind) {
+			if fv.OverflowFloat(f64) {
+				return true, fmt.Errorf("value %v overflows float field (%v)", f64, fv.Type())
+			}
+			fv.SetFloat(f64)
+			return true, nil
+		}
+
+		if math.IsNaN(f64) || math.IsInf(f64, 0) {
+			return true, fmt.Errorf("cannot assign float %v to %v field", f64, dstKind)
+		}
+
+		if f64 != math.Trunc(f64) {
+			if isReflectIntKind(dstKind) {
+				return true, fmt.Errorf("cannot assign float %v to int field (loss of precision)", f64)
+			}
+			return true, fmt.Errorf("cannot assign float %v to uint field", f64)
+		}
+
+		if isReflectIntKind(dstKind) {
+			minInt := -math.Ldexp(1, fv.Type().Bits()-1)
+			maxIntExclusive := math.Ldexp(1, fv.Type().Bits()-1)
+			if f64 < minInt || f64 >= maxIntExclusive {
+				return true, fmt.Errorf("value %v overflows int field (%v)", f64, fv.Type())
+			}
+
+			i64 := int64(f64)
+			if fv.OverflowInt(i64) {
+				return true, fmt.Errorf("value %v overflows int field (%v)", i64, fv.Type())
+			}
+
+			fv.SetInt(i64)
+			return true, nil
+		}
+
+		if f64 < 0 {
+			return true, fmt.Errorf("cannot assign float %v to uint field", f64)
+		}
+
+		maxUintExclusive := math.Ldexp(1, fv.Type().Bits())
+		if f64 >= maxUintExclusive {
+			return true, fmt.Errorf("value %v overflows uint field (%v)", f64, fv.Type())
+		}
+
+		u64 := uint64(f64)
+		if fv.OverflowUint(u64) {
+			return true, fmt.Errorf("value %v overflows uint field (%v)", u64, fv.Type())
+		}
+
+		fv.SetUint(u64)
+		return true, nil
+
+	case isReflectIntKind(srcKind):
+		i64 := sv.Int()
+
+		if isReflectFloatKind(dstKind) {
+			f64 := float64(i64)
+			if fv.OverflowFloat(f64) {
+				return true, fmt.Errorf("value %v overflows float field (%v)", f64, fv.Type())
+			}
+
+			fv.SetFloat(f64)
+			return true, nil
+		}
+
+		if isReflectIntKind(dstKind) {
+			if fv.OverflowInt(i64) {
+				return true, fmt.Errorf("value %v overflows int field (%v)", i64, fv.Type())
+			}
+
+			fv.SetInt(i64)
+			return true, nil
+		}
+
+		if i64 < 0 {
+			return true, fmt.Errorf("cannot assign negative int %v to uint field", i64)
+		}
+
+		u64 := uint64(i64)
+		if fv.OverflowUint(u64) {
+			return true, fmt.Errorf("value %v overflows uint field (%v)", u64, fv.Type())
+		}
+
+		fv.SetUint(u64)
+		return true, nil
+
+	default:
+		u64 := sv.Uint()
+
+		if isReflectFloatKind(dstKind) {
+			f64 := float64(u64)
+			if fv.OverflowFloat(f64) {
+				return true, fmt.Errorf("value %v overflows float field (%v)", f64, fv.Type())
+			}
+
+			fv.SetFloat(f64)
+			return true, nil
+		}
+
+		if isReflectUintKind(dstKind) {
+			if fv.OverflowUint(u64) {
+				return true, fmt.Errorf("value %v overflows uint field (%v)", u64, fv.Type())
+			}
+
+			fv.SetUint(u64)
+			return true, nil
+		}
+
+		if u64 > math.MaxInt64 {
+			return true, fmt.Errorf("value %v overflows int field (%v)", u64, fv.Type())
+		}
+
+		i64 := int64(u64)
+		if fv.OverflowInt(i64) {
+			return true, fmt.Errorf("value %v overflows int field (%v)", i64, fv.Type())
+		}
+
+		fv.SetInt(i64)
+		return true, nil
+	}
+}
+
+func isReflectNumericKind(kind reflect.Kind) bool {
+	return isReflectIntKind(kind) || isReflectUintKind(kind) || isReflectFloatKind(kind)
+}
+
+func isReflectIntKind(kind reflect.Kind) bool {
+	return kind >= reflect.Int && kind <= reflect.Int64
+}
+
+func isReflectUintKind(kind reflect.Kind) bool {
+	return kind >= reflect.Uint && kind <= reflect.Uint64
+}
+
+func isReflectFloatKind(kind reflect.Kind) bool {
+	return kind == reflect.Float32 || kind == reflect.Float64
 }
 
 func (db *DB[K, V]) populatePatcher(t reflect.Type, idx []int) error {
@@ -684,9 +552,20 @@ func (db *DB[K, V]) populatePatcher(t reflect.Type, idx []int) error {
 			Index:  append(append([]int{}, idx...), i),
 		}
 
+		f.UseVI = rf.Type.Implements(viType)
+
+		if f.Kind == reflect.Slice && !f.UseVI {
+			f.Slice = true
+			elem := rf.Type.Elem()
+			f.Kind = elem.Kind()
+			f.UseVI = elem.Implements(viType)
+		}
+
 		if f.Kind == reflect.Pointer {
 			f.Ptr = true
-			f.Kind = rf.Type.Elem().Kind()
+			elem := rf.Type.Elem()
+			f.Kind = elem.Kind()
+			f.UseVI = elem.Implements(viType)
 		}
 
 		db.patchMap[rf.Name] = f
@@ -772,22 +651,25 @@ func deepCopy(origin reflect.Value, visited map[uintptr]reflect.Value) reflect.V
 		reflect.Complex64, reflect.Complex128:
 		return origin
 
+	case reflect.Struct:
+		s := reflect.New(origin.Type()).Elem()
+		s.Set(origin)
+		for i := 0; i < origin.NumField(); i++ {
+			sf := s.Field(i)
+			if !sf.CanSet() {
+				continue
+			}
+			clone := deepCopy(origin.Field(i), visited)
+			sf.Set(clone)
+		}
+		return s
+
 	case reflect.Ptr:
 		ptr := reflect.New(origin.Elem().Type())
 		visited[origin.Pointer()] = ptr
 		clone := deepCopy(origin.Elem(), visited)
 		ptr.Elem().Set(clone)
 		return ptr
-
-	case reflect.Struct:
-		s := reflect.New(origin.Type()).Elem()
-		for i := 0; i < origin.NumField(); i++ {
-			if s.Field(i).CanSet() {
-				clone := deepCopy(origin.Field(i), visited)
-				s.Field(i).Set(clone)
-			}
-		}
-		return s
 
 	case reflect.Slice:
 		s := reflect.MakeSlice(origin.Type(), origin.Len(), origin.Cap())

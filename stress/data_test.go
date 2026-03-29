@@ -34,9 +34,8 @@ func TestOpenBenchDBFailsFastOnLockedDB(t *testing.T) {
 	}
 }
 
-func TestBuildRBIOptionsMinimizeDeltaProfile(t *testing.T) {
+func TestBuildRBIOptions(t *testing.T) {
 	opts := buildRBIOptions(DBConfig{
-		MinimizeDelta:    true,
 		AnalyzeInterval:  -1,
 		CalibrationOn:    true,
 		CalibrationEvery: -1,
@@ -55,29 +54,5 @@ func TestBuildRBIOptionsMinimizeDeltaProfile(t *testing.T) {
 	}
 	if opts.TraceSink == nil || opts.TraceSampleEvery != 17 {
 		t.Fatalf("trace = sink:%v every:%d, want non-nil/17", opts.TraceSink == nil, opts.TraceSampleEvery)
-	}
-	if opts.SnapshotDeltaCompactFieldKeys != minimizeDeltaCompactFieldKeys {
-		t.Fatalf("SnapshotDeltaCompactFieldKeys = %d, want %d", opts.SnapshotDeltaCompactFieldKeys, minimizeDeltaCompactFieldKeys)
-	}
-	if opts.SnapshotDeltaCompactFieldOps != minimizeDeltaCompactFieldOps {
-		t.Fatalf("SnapshotDeltaCompactFieldOps = %d, want %d", opts.SnapshotDeltaCompactFieldOps, minimizeDeltaCompactFieldOps)
-	}
-	if opts.SnapshotDeltaCompactMaxFieldsPerPublish != minimizeDeltaCompactMaxFieldsPublish {
-		t.Fatalf("SnapshotDeltaCompactMaxFieldsPerPublish = %d, want %d", opts.SnapshotDeltaCompactMaxFieldsPerPublish, minimizeDeltaCompactMaxFieldsPublish)
-	}
-	if opts.SnapshotDeltaCompactUniverseOps != minimizeDeltaCompactUniverseOps {
-		t.Fatalf("SnapshotDeltaCompactUniverseOps = %d, want %d", opts.SnapshotDeltaCompactUniverseOps, minimizeDeltaCompactUniverseOps)
-	}
-	if opts.SnapshotDeltaLayerMaxDepth != minimizeDeltaLayerMaxDepth {
-		t.Fatalf("SnapshotDeltaLayerMaxDepth = %d, want %d", opts.SnapshotDeltaLayerMaxDepth, minimizeDeltaLayerMaxDepth)
-	}
-	if opts.SnapshotCompactorMaxIterationsPerRun != minimizeDeltaCompactorMaxIters {
-		t.Fatalf("SnapshotCompactorMaxIterationsPerRun = %d, want %d", opts.SnapshotCompactorMaxIterationsPerRun, minimizeDeltaCompactorMaxIters)
-	}
-	if opts.SnapshotCompactorRequestEveryNWrites != minimizeDeltaCompactorEveryNWrites {
-		t.Fatalf("SnapshotCompactorRequestEveryNWrites = %d, want %d", opts.SnapshotCompactorRequestEveryNWrites, minimizeDeltaCompactorEveryNWrites)
-	}
-	if opts.SnapshotCompactorIdleInterval != minimizeDeltaCompactorIdleInterval {
-		t.Fatalf("SnapshotCompactorIdleInterval = %s, want %s", opts.SnapshotCompactorIdleInterval, minimizeDeltaCompactorIdleInterval)
 	}
 }

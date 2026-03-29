@@ -37,11 +37,20 @@ const (
 type severity int
 
 const (
-	severityGray severity = iota
+	severityMuted severity = iota
+	severityNeutral
 	severityMild
 	severityHigh
 	severityExtreme
 )
+
+type severityThresholds struct {
+	significant float64
+	mutedMax    float64
+	neutralMax  float64
+	mildMax     float64
+	highMax     float64
+}
 
 type benchRun struct {
 	Iterations  int64
@@ -586,23 +595,25 @@ func compareMetric(kind metricKind, previous float64, current float64) metricDis
 	if useUnitSteps(kind, previous, current) {
 		delta := current - previous
 		magnitude := math.Abs(delta)
+		thresholds := stepThresholds()
 		return metricDisplay{
-			Significant: magnitude >= 0.5,
-			Color:       colorFor(stepSeverity(magnitude), current < previous),
+			Significant: magnitude >= thresholds.significant,
+			Color:       colorFor(severityFor(magnitude, thresholds), current < previous),
 			DeltaText:   formatSignedValue(delta),
 		}
 	}
 
 	change, finite := percentChange(previous, current)
 	magnitude := math.Abs(change)
-	significant := magnitude >= 0.5
+	thresholds := percentThresholds(kind)
+	significant := magnitude >= thresholds.significant
 	if !finite {
 		significant = previous != current
 	}
 
 	return metricDisplay{
 		Significant: significant,
-		Color:       colorFor(percentSeverity(magnitude), current < previous),
+		Color:       colorFor(severityFor(magnitude, thresholds), current < previous),
 		DeltaText:   formatPercentChange(change, finite, current),
 	}
 }
@@ -614,26 +625,46 @@ func useUnitSteps(kind metricKind, previous float64, current float64) bool {
 	return math.Max(previous, current) <= 10
 }
 
-func stepSeverity(delta float64) severity {
-	switch {
-	case delta < 1.5:
-		return severityGray
-	case delta < 2.5:
-		return severityMild
-	case delta < 3.5:
-		return severityHigh
-	default:
-		return severityExtreme
+func stepThresholds() severityThresholds {
+	return severityThresholds{
+		significant: 0.5,
+		mutedMax:    1.5,
+		neutralMax:  1.5,
+		mildMax:     2.5,
+		highMax:     3.5,
 	}
 }
 
-func percentSeverity(delta float64) severity {
+func percentThresholds(kind metricKind) severityThresholds {
+	switch kind {
+	case metricNS, metricBytes:
+		return severityThresholds{
+			significant: 1,
+			mutedMax:    2.5,
+			neutralMax:  5,
+			mildMax:     15,
+			highMax:     25,
+		}
+	default:
+		return severityThresholds{
+			significant: 0.5,
+			mutedMax:    1,
+			neutralMax:  1,
+			mildMax:     10,
+			highMax:     20,
+		}
+	}
+}
+
+func severityFor(delta float64, thresholds severityThresholds) severity {
 	switch {
-	case delta < 1:
-		return severityGray
-	case delta < 10:
+	case delta < thresholds.mutedMax:
+		return severityMuted
+	case delta < thresholds.neutralMax:
+		return severityNeutral
+	case delta < thresholds.mildMax:
 		return severityMild
-	case delta <= 20:
+	case delta <= thresholds.highMax:
 		return severityHigh
 	default:
 		return severityExtreme
@@ -642,8 +673,10 @@ func percentSeverity(delta float64) severity {
 
 func colorFor(level severity, improved bool) string {
 	switch level {
-	case severityGray:
+	case severityMuted:
 		return colorGray
+	case severityNeutral:
+		return ""
 	case severityMild:
 		if improved {
 			return colorGreen

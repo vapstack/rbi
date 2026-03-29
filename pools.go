@@ -1,50 +1,27 @@
-//go:build !rbidebug
-
 package rbi
 
 import (
+	"slices"
 	"sync"
 
-	"github.com/vapstack/rbi/internal/roaring64"
+	"github.com/vapstack/rbi/internal/posting"
 )
 
-var roaringPool sync.Pool
-
-func getRoaringBuf() *roaring64.Bitmap {
-	if v := roaringPool.Get(); v != nil {
-		return v.(*roaring64.Bitmap)
-	}
-	return roaring64.New()
-}
-
-func releaseRoaringBuf(bm *roaring64.Bitmap) {
-	if bm == nil {
-		return
-	}
-	if bm == postingSingleFlag {
-		return
-	}
-	bm.Clear()
-	roaringPool.Put(bm)
-}
-
-func cloneBitmap(src *roaring64.Bitmap) *roaring64.Bitmap {
-	if src == nil {
-		return getRoaringBuf()
-	}
-	dst := getRoaringBuf()
-	return src.CloneInto(dst)
-}
-
-func releaseRoaringBitmapIterator(it roaring64.IntPeekable64) {
-	roaring64.ReleaseIterator(it)
-}
-
-func releaseRoaringIter(it any) {
-	if releasable, ok := it.(interface{ Release() }); ok {
-		releasable.Release()
-	}
-}
+const (
+	intSlicePoolMaxCap                 = 4 << 10
+	uint64SlicePoolMaxCap              = 4 << 10
+	stringSlicePoolMaxCap              = 64 << 10
+	stringSetPoolMaxLen                = 4 << 10
+	u64SetPoolMaxCap                   = 16 << 10
+	postingSlicePoolMaxCap             = 4 << 10
+	postingMapPoolMaxLen               = 4 << 10
+	batchPostingDeltaMapPoolMaxLen     = 4 << 10
+	keyedBatchPostingDeltaSliceMaxCap  = 4 << 10
+	bitmapResultSlicePoolMaxCap        = 2 << 10
+	countORBranchSlicePoolMaxCap       = 512
+	plannerOROrderIterSlicePoolMaxCap  = 512
+	plannerOROrderMergeItemSliceMaxCap = 512
+)
 
 /**/
 
@@ -54,7 +31,11 @@ var intSlicePool sync.Pool
 
 func getIntSliceBuf(capHint int) *intSliceBuf {
 	if v := intSlicePool.Get(); v != nil {
-		return v.(*intSliceBuf)
+		buf := v.(*intSliceBuf)
+		if cap(buf.values) < capHint {
+			buf.values = slices.Grow(buf.values, capHint)
+		}
+		return buf
 	}
 	return &intSliceBuf{values: make([]int, 0, max(capHint, 64))}
 }
@@ -78,12 +59,16 @@ var uint64SlicePool sync.Pool
 
 func getUint64SliceBuf(capHint int) *uint64SliceBuf {
 	if v := uint64SlicePool.Get(); v != nil {
-		return v.(*uint64SliceBuf)
+		buf := v.(*uint64SliceBuf)
+		if cap(buf.values) < capHint {
+			buf.values = slices.Grow(buf.values, capHint)
+		}
+		return buf
 	}
 	return &uint64SliceBuf{values: make([]uint64, 0, max(capHint, 64))}
 }
 
-func releaseUint64SliceBuffer(buf *uint64SliceBuf) {
+func releaseUint64SliceBuf(buf *uint64SliceBuf) {
 	if buf == nil {
 		return
 	}
@@ -96,71 +81,242 @@ func releaseUint64SliceBuffer(buf *uint64SliceBuf) {
 
 /**/
 
-type roaringSliceBuf struct{ values []*roaring64.Bitmap }
+type stringSliceBuf struct{ values []string }
 
-var roaringSlicePool sync.Pool
+var stringSlicePool sync.Pool
 
-func getRoaringSliceBuf(capHint int) *roaringSliceBuf {
-	if v := roaringSlicePool.Get(); v != nil {
-		return v.(*roaringSliceBuf)
+func getStringSliceBuf(capHint int) *stringSliceBuf {
+	if v := stringSlicePool.Get(); v != nil {
+		buf := v.(*stringSliceBuf)
+		if cap(buf.values) < capHint {
+			buf.values = slices.Grow(buf.values, capHint)
+		}
+		return buf
 	}
-	return &roaringSliceBuf{values: make([]*roaring64.Bitmap, 0, max(capHint, 32))}
+	return &stringSliceBuf{values: make([]string, 0, max(capHint, 64))}
 }
 
-func releaseRoaringSliceBuf(buf *roaringSliceBuf) {
+func releaseStringSliceBuf(buf *stringSliceBuf) {
 	if buf == nil {
 		return
 	}
-	if cap(buf.values) > roaringSlicePoolMaxCap {
+	if cap(buf.values) > stringSlicePoolMaxCap {
 		return
 	}
 	clear(buf.values)
 	buf.values = buf.values[:0]
-	roaringSlicePool.Put(buf)
+	stringSlicePool.Put(buf)
 }
 
 /**/
 
-type postingListSliceBuf struct{ values []postingList }
+var stringSetPool sync.Pool
 
-var postingListSlicePool sync.Pool
-
-func getPostingListSliceBuf(capHint int) *postingListSliceBuf {
-	if v := postingListSlicePool.Get(); v != nil {
-		return v.(*postingListSliceBuf)
+func getStringSet(capHint int) map[string]struct{} {
+	if v := stringSetPool.Get(); v != nil {
+		return v.(map[string]struct{})
 	}
-	return &postingListSliceBuf{values: make([]postingList, 0, max(capHint, 16))}
+	return make(map[string]struct{}, max(capHint, 8))
 }
 
-func releasePostingListSliceBuf(buf *postingListSliceBuf) {
+func releaseStringSet(m map[string]struct{}) {
+	if m == nil {
+		return
+	}
+	oversized := len(m) > stringSetPoolMaxLen
+	clear(m)
+	if oversized {
+		return
+	}
+	stringSetPool.Put(m)
+}
+
+/**/
+
+type postingSliceBuf struct{ values []posting.List }
+
+var postingSlicePool sync.Pool
+var postingMapPool sync.Pool
+var fixedPostingMapPool sync.Pool
+
+func getPostingSliceBuf(capHint int) *postingSliceBuf {
+	if v := postingSlicePool.Get(); v != nil {
+		buf := v.(*postingSliceBuf)
+		if cap(buf.values) < capHint {
+			buf.values = slices.Grow(buf.values, capHint)
+		}
+		return buf
+	}
+	return &postingSliceBuf{values: make([]posting.List, 0, max(capHint, 16))}
+}
+
+func releasePostingSliceBuf(buf *postingSliceBuf) {
 	if buf == nil {
 		return
 	}
-	if cap(buf.values) > postingListSlicePoolMaxCap {
+	if cap(buf.values) > postingSlicePoolMaxCap {
 		return
 	}
 	clear(buf.values)
 	buf.values = buf.values[:0]
-	postingListSlicePool.Put(buf)
+	postingSlicePool.Put(buf)
+}
+
+func getPostingMap() map[string]posting.List {
+	if v := postingMapPool.Get(); v != nil {
+		return v.(map[string]posting.List)
+	}
+	return make(map[string]posting.List, 8)
+}
+
+func getFixedPostingMap() map[uint64]posting.List {
+	if v := fixedPostingMapPool.Get(); v != nil {
+		return v.(map[uint64]posting.List)
+	}
+	return make(map[uint64]posting.List, 8)
+}
+
+func releasePostingMap(m map[string]posting.List) {
+	if m == nil {
+		return
+	}
+	oversized := len(m) > postingMapPoolMaxLen
+	clear(m)
+	if oversized {
+		return
+	}
+	postingMapPool.Put(m)
+}
+
+func releaseFixedPostingMap(m map[uint64]posting.List) {
+	if m == nil {
+		return
+	}
+	oversized := len(m) > postingMapPoolMaxLen
+	clear(m)
+	if oversized {
+		return
+	}
+	fixedPostingMapPool.Put(m)
+}
+
+func releasePostingMapOwned(m map[string]posting.List) {
+	if m == nil {
+		return
+	}
+	oversized := len(m) > postingMapPoolMaxLen
+	for _, ids := range m {
+		ids.Release()
+	}
+	clear(m)
+	if oversized {
+		return
+	}
+	postingMapPool.Put(m)
+}
+
+func releaseFixedPostingMapOwned(m map[uint64]posting.List) {
+	if m == nil {
+		return
+	}
+	oversized := len(m) > postingMapPoolMaxLen
+	for _, ids := range m {
+		ids.Release()
+	}
+	clear(m)
+	if oversized {
+		return
+	}
+	fixedPostingMapPool.Put(m)
 }
 
 /**/
 
-type bitmapResultSliceBuf struct{ values []bitmap }
+type keyedBatchPostingDeltaSliceBuf struct{ values []keyedBatchPostingDelta }
+
+var keyedBatchPostingDeltaSlicePool sync.Pool
+var batchPostingDeltaMapPool sync.Pool
+var fixedBatchPostingDeltaMapPool sync.Pool
+
+func getKeyedBatchPostingDeltaSliceBuf(capHint int) *keyedBatchPostingDeltaSliceBuf {
+	if v := keyedBatchPostingDeltaSlicePool.Get(); v != nil {
+		buf := v.(*keyedBatchPostingDeltaSliceBuf)
+		if cap(buf.values) < capHint {
+			buf.values = slices.Grow(buf.values, capHint)
+		}
+		return buf
+	}
+	return &keyedBatchPostingDeltaSliceBuf{values: make([]keyedBatchPostingDelta, 0, max(capHint, 16))}
+}
+
+func releaseKeyedBatchPostingDeltaSliceBuf(buf *keyedBatchPostingDeltaSliceBuf) {
+	if buf == nil {
+		return
+	}
+	if cap(buf.values) > keyedBatchPostingDeltaSliceMaxCap {
+		return
+	}
+	clear(buf.values)
+	buf.values = buf.values[:0]
+	keyedBatchPostingDeltaSlicePool.Put(buf)
+}
+
+func getBatchPostingDeltaMap() map[string]batchPostingDelta {
+	if v := batchPostingDeltaMapPool.Get(); v != nil {
+		return v.(map[string]batchPostingDelta)
+	}
+	return make(map[string]batchPostingDelta, 8)
+}
+
+func getFixedBatchPostingDeltaMap() map[uint64]batchPostingDelta {
+	if v := fixedBatchPostingDeltaMapPool.Get(); v != nil {
+		return v.(map[uint64]batchPostingDelta)
+	}
+	return make(map[uint64]batchPostingDelta, 8)
+}
+
+func releaseBatchPostingDeltaMap(m map[string]batchPostingDelta) {
+	if m == nil {
+		return
+	}
+	oversized := len(m) > batchPostingDeltaMapPoolMaxLen
+	clear(m)
+	if oversized {
+		return
+	}
+	batchPostingDeltaMapPool.Put(m)
+}
+
+func releaseFixedBatchPostingDeltaMap(m map[uint64]batchPostingDelta) {
+	if m == nil {
+		return
+	}
+	oversized := len(m) > batchPostingDeltaMapPoolMaxLen
+	clear(m)
+	if oversized {
+		return
+	}
+	fixedBatchPostingDeltaMapPool.Put(m)
+}
+
+/**/
+
+type postingResultSliceBuf struct{ values []postingResult }
 
 var bitmapResultSlicePool sync.Pool
 
-func getBitmapResultSliceBuf(capHint int) *bitmapResultSliceBuf {
+func getPostingResultSliceBuf(capHint int) *postingResultSliceBuf {
 	if v := bitmapResultSlicePool.Get(); v != nil {
-		return v.(*bitmapResultSliceBuf)
+		buf := v.(*postingResultSliceBuf)
+		if cap(buf.values) < capHint {
+			buf.values = slices.Grow(buf.values, capHint)
+		}
+		return buf
 	}
-	return &bitmapResultSliceBuf{values: make([]bitmap, 0, max(capHint, 16))}
+	return &postingResultSliceBuf{values: make([]postingResult, 0, max(capHint, 16))}
 }
 
-func releaseBitmapResultSliceBuf(buf *bitmapResultSliceBuf) {
-	if buf == nil {
-		return
-	}
+func releasePostingResultSliceBuf(buf *postingResultSliceBuf) {
 	if cap(buf.values) > bitmapResultSlicePoolMaxCap {
 		return
 	}
@@ -177,7 +333,11 @@ var countORBranchSlicePool sync.Pool
 
 func getCountORBranchSliceBuf(capHint int) *countORBranchSliceBuf {
 	if v := countORBranchSlicePool.Get(); v != nil {
-		return v.(*countORBranchSliceBuf)
+		buf := v.(*countORBranchSliceBuf)
+		if cap(buf.values) < capHint {
+			buf.values = slices.Grow(buf.values, capHint)
+		}
+		return buf
 	}
 	return &countORBranchSliceBuf{values: make(countORBranches, 0, max(capHint, 8))}
 }
@@ -202,7 +362,11 @@ var plannerOROrderIterSlicePool sync.Pool
 
 func getPlannerOROrderIterSliceBuf(capHint int) *plannerOROrderIterSliceBuf {
 	if v := plannerOROrderIterSlicePool.Get(); v != nil {
-		return v.(*plannerOROrderIterSliceBuf)
+		buf := v.(*plannerOROrderIterSliceBuf)
+		if cap(buf.values) < capHint {
+			buf.values = slices.Grow(buf.values, capHint)
+		}
+		return buf
 	}
 	return &plannerOROrderIterSliceBuf{values: make([]plannerOROrderBranchIter, 0, max(capHint, 16))}
 }
@@ -227,7 +391,11 @@ var plannerOROrderMergeItemSlicePool sync.Pool
 
 func getPlannerOROrderMergeItemSliceBuf(capHint int) *plannerOROrderMergeItemSliceBuf {
 	if v := plannerOROrderMergeItemSlicePool.Get(); v != nil {
-		return v.(*plannerOROrderMergeItemSliceBuf)
+		buf := v.(*plannerOROrderMergeItemSliceBuf)
+		if cap(buf.values) < capHint {
+			buf.values = slices.Grow(buf.values, capHint)
+		}
+		return buf
 	}
 	return &plannerOROrderMergeItemSliceBuf{values: make([]plannerOROrderMergeItem, 0, max(capHint, 16))}
 }
@@ -254,14 +422,14 @@ var uniqueSeenOuterPool sync.Pool
 
 var uniqueSeenInnerPool sync.Pool
 
-func getUniqueLeavingOuterMap() map[string]map[string]*roaring64.Bitmap {
+func getUniqueLeavingOuterMap() map[string]map[string]posting.List {
 	if v := uniqueLeavingOuterPool.Get(); v != nil {
-		return v.(map[string]map[string]*roaring64.Bitmap)
+		return v.(map[string]map[string]posting.List)
 	}
-	return make(map[string]map[string]*roaring64.Bitmap, 8)
+	return make(map[string]map[string]posting.List, 8)
 }
 
-func releaseUniqueLeavingOuterMap(m map[string]map[string]*roaring64.Bitmap) {
+func releaseUniqueLeavingOuterMap(m map[string]map[string]posting.List) {
 	if m == nil {
 		return
 	}
@@ -276,20 +444,20 @@ func releaseUniqueLeavingOuterMap(m map[string]map[string]*roaring64.Bitmap) {
 	uniqueLeavingOuterPool.Put(m)
 }
 
-func getUniqueLeavingInnerMap() map[string]*roaring64.Bitmap {
+func getUniqueLeavingInnerMap() map[string]posting.List {
 	if v := uniqueLeavingInnerPool.Get(); v != nil {
-		return v.(map[string]*roaring64.Bitmap)
+		return v.(map[string]posting.List)
 	}
-	return make(map[string]*roaring64.Bitmap, 8)
+	return make(map[string]posting.List, 8)
 }
 
-func releaseUniqueLeavingInnerMap(m map[string]*roaring64.Bitmap) {
+func releaseUniqueLeavingInnerMap(m map[string]posting.List) {
 	if m == nil {
 		return
 	}
 	oversized := len(m) > pooledUniqueInnerMaxLen
-	for _, bm := range m {
-		releaseRoaringBuf(bm)
+	for _, ids := range m {
+		ids.Release()
 	}
 	clear(m)
 	if oversized {
@@ -337,53 +505,4 @@ func releaseUniqueSeenInnerMap(m map[string]uint64) {
 		return
 	}
 	uniqueSeenInnerPool.Put(m)
-}
-
-var writeDeltaOuterPool sync.Pool
-
-var writeDeltaInnerPool sync.Pool
-
-func getWriteDeltaOuterMap() map[string]map[string]indexDeltaEntry {
-	if v := writeDeltaOuterPool.Get(); v != nil {
-		return v.(map[string]map[string]indexDeltaEntry)
-	}
-	return make(map[string]map[string]indexDeltaEntry, 8)
-}
-
-func releaseWriteDeltaOuterMap(m map[string]map[string]indexDeltaEntry) {
-	if m == nil {
-		return
-	}
-	oversized := len(m) > pooledWriteDeltaOuterMaxLen
-	for _, inner := range m {
-		releaseWriteDeltaInnerMap(inner)
-	}
-	clear(m)
-	if oversized {
-		return
-	}
-	writeDeltaOuterPool.Put(m)
-}
-
-func getWriteDeltaInnerMap() map[string]indexDeltaEntry {
-	if v := writeDeltaInnerPool.Get(); v != nil {
-		return v.(map[string]indexDeltaEntry)
-	}
-	return make(map[string]indexDeltaEntry, 8)
-}
-
-func releaseWriteDeltaInnerMap(m map[string]indexDeltaEntry) {
-	if m == nil {
-		return
-	}
-	oversized := len(m) > pooledWriteDeltaInnerMaxLen
-	for _, e := range m {
-		releaseRoaringBuf(e.add)
-		releaseRoaringBuf(e.del)
-	}
-	clear(m)
-	if oversized {
-		return
-	}
-	writeDeltaInnerPool.Put(m)
 }

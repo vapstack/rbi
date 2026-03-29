@@ -89,20 +89,9 @@ type ProcessMemoryStats struct {
 }
 
 type SnapshotMemoryStats struct {
-	HasDelta          bool   `json:"has_delta"`
-	RegistrySize      int    `json:"registry_size"`
-	PinnedRefs        int    `json:"pinned_refs"`
-	IndexLayerDepth   int    `json:"index_layer_depth"`
-	LenLayerDepth     int    `json:"len_layer_depth"`
-	IndexDeltaFields  int    `json:"index_delta_fields"`
-	LenDeltaFields    int    `json:"len_delta_fields"`
-	IndexDeltaKeys    int    `json:"index_delta_keys"`
-	LenDeltaKeys      int    `json:"len_delta_keys"`
-	IndexDeltaOps     uint64 `json:"index_delta_ops"`
-	LenDeltaOps       uint64 `json:"len_delta_ops"`
-	UniverseAddCard   uint64 `json:"universe_add_card"`
-	UniverseRemCard   uint64 `json:"universe_rem_card"`
-	CompactorQueueLen int    `json:"compactor_queue_len"`
+	RegistrySize int    `json:"registry_size"`
+	PinnedRefs   int    `json:"pinned_refs"`
+	UniverseCard uint64 `json:"universe_card"`
 }
 
 type MemorySummary struct {
@@ -114,10 +103,7 @@ type MemorySummary struct {
 	MaxBenchDBMapRSSBytes uint64 `json:"max_bench_db_map_rss_bytes"`
 	MaxPinnedRefs         int    `json:"max_pinned_refs"`
 	MaxRegistrySize       int    `json:"max_registry_size"`
-	MaxIndexLayerDepth    int    `json:"max_index_layer_depth"`
-	MaxLenLayerDepth      int    `json:"max_len_layer_depth"`
-	MaxIndexDeltaOps      uint64 `json:"max_index_delta_ops"`
-	MaxLenDeltaOps        uint64 `json:"max_len_delta_ops"`
+	MaxUniverseCard       uint64 `json:"max_universe_card"`
 }
 
 type StressQueryInfo struct {

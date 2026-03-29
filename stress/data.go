@@ -42,7 +42,6 @@ type DBConfig struct {
 	DBFile           string
 	OpenTimeout      time.Duration
 	BoltNoSync       bool
-	MinimizeDelta    bool
 	AnalyzeInterval  time.Duration
 	CalibrationOn    bool
 	CalibrationEvery int
@@ -58,17 +57,6 @@ type DBHandle struct {
 	EmailSamples []string
 	DBFile       string
 }
-
-const (
-	minimizeDeltaCompactFieldKeys        = 1
-	minimizeDeltaCompactFieldOps         = 1
-	minimizeDeltaCompactMaxFieldsPublish = 64
-	minimizeDeltaCompactUniverseOps      = 1
-	minimizeDeltaLayerMaxDepth           = 1
-	minimizeDeltaCompactorMaxIters       = 64
-	minimizeDeltaCompactorEveryNWrites   = 1
-	minimizeDeltaCompactorIdleInterval   = 10 * time.Millisecond
-)
 
 func buildRBIOptions(cfg DBConfig) rbi.Options {
 	dbOpts := rbi.Options{
@@ -86,24 +74,7 @@ func buildRBIOptions(cfg DBConfig) rbi.Options {
 		dbOpts.TraceSink = cfg.TraceSink
 		dbOpts.TraceSampleEvery = cfg.TraceSampleEvery
 	}
-	if cfg.MinimizeDelta {
-		applyMinimizeDeltaProfile(&dbOpts)
-	}
 	return dbOpts
-}
-
-func applyMinimizeDeltaProfile(opts *rbi.Options) {
-	if opts == nil {
-		return
-	}
-	opts.SnapshotDeltaCompactFieldKeys = minimizeDeltaCompactFieldKeys
-	opts.SnapshotDeltaCompactFieldOps = minimizeDeltaCompactFieldOps
-	opts.SnapshotDeltaCompactMaxFieldsPerPublish = minimizeDeltaCompactMaxFieldsPublish
-	opts.SnapshotDeltaCompactUniverseOps = minimizeDeltaCompactUniverseOps
-	opts.SnapshotDeltaLayerMaxDepth = minimizeDeltaLayerMaxDepth
-	opts.SnapshotCompactorMaxIterationsPerRun = minimizeDeltaCompactorMaxIters
-	opts.SnapshotCompactorRequestEveryNWrites = minimizeDeltaCompactorEveryNWrites
-	opts.SnapshotCompactorIdleInterval = minimizeDeltaCompactorIdleInterval
 }
 
 func OpenBenchDB(cfg DBConfig, emailSampleN int) (*DBHandle, error) {
@@ -117,19 +88,6 @@ func OpenBenchDB(cfg DBConfig, emailSampleN int) (*DBHandle, error) {
 		cfg.DBFile = abs
 	}
 	dbOpts := buildRBIOptions(cfg)
-	if cfg.MinimizeDelta {
-		log.Printf(
-			"minimize-delta enabled: field_keys=%d field_ops=%d max_fields=%d universe_ops=%d layer_depth=%d compactor_every_writes=%d compactor_max_iters=%d compactor_idle=%s",
-			dbOpts.SnapshotDeltaCompactFieldKeys,
-			dbOpts.SnapshotDeltaCompactFieldOps,
-			dbOpts.SnapshotDeltaCompactMaxFieldsPerPublish,
-			dbOpts.SnapshotDeltaCompactUniverseOps,
-			dbOpts.SnapshotDeltaLayerMaxDepth,
-			dbOpts.SnapshotCompactorRequestEveryNWrites,
-			dbOpts.SnapshotCompactorMaxIterationsPerRun,
-			dbOpts.SnapshotCompactorIdleInterval,
-		)
-	}
 	rawBolt, err := bolt.Open(cfg.DBFile, 0o600, &bolt.Options{
 		NoSync:  cfg.BoltNoSync,
 		Timeout: cfg.OpenTimeout,
@@ -155,14 +113,6 @@ func OpenBenchDB(cfg DBConfig, emailSampleN int) (*DBHandle, error) {
 		_ = db.Close()
 		_ = rawBolt.Close()
 		return nil, err
-	}
-	if cfg.MinimizeDelta {
-		log.Printf("minimize-delta enabled: force-compacting published snapshot before workload start")
-		if err = db.ForceCompact(); err != nil {
-			_ = db.Close()
-			_ = rawBolt.Close()
-			return nil, fmt.Errorf("force compact initial snapshot: %w", err)
-		}
 	}
 	emailSamples := buildEmailSample(db, maxID, emailSampleN)
 	return &DBHandle{

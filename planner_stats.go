@@ -107,11 +107,9 @@ func (db *DB[K, V]) collectPlannerFieldNamesAndUniverse() (*indexSnapshot, []str
 	}
 
 	s := db.getSnapshot()
-	fields := s.indexedFieldNameSet()
-
-	fieldNames := make([]string, 0, len(fields))
-	for fieldName := range fields {
-		fieldNames = append(fieldNames, fieldName)
+	fieldNames := make([]string, 0, len(db.indexedFieldAccess))
+	for _, acc := range db.indexedFieldAccess {
+		fieldNames = append(fieldNames, acc.name)
 	}
 	sort.Strings(fieldNames)
 
@@ -119,21 +117,10 @@ func (db *DB[K, V]) collectPlannerFieldNamesAndUniverse() (*indexSnapshot, []str
 }
 
 func (s *indexSnapshot) universeCardinality() uint64 {
-	base := uint64(0)
-	if s.universe != nil {
-		base = s.universe.GetCardinality()
+	if s == nil {
+		return 0
 	}
-	if s.universeAdd != nil {
-		base += s.universeAdd.GetCardinality()
-	}
-	if s.universeRem != nil {
-		drop := s.universeRem.GetCardinality()
-		if drop >= base {
-			return 0
-		}
-		base -= drop
-	}
-	return base
+	return s.universe.Cardinality()
 }
 
 func (db *DB[K, V]) collectPlannerFieldStatsFromOverlay(s *indexSnapshot, fieldName string) (PlannerFieldStats, error) {
@@ -141,7 +128,7 @@ func (db *DB[K, V]) collectPlannerFieldStatsFromOverlay(s *indexSnapshot, fieldN
 		return PlannerFieldStats{}, err
 	}
 
-	ov := newFieldOverlay(s.fieldIndexSlice(fieldName), s.fieldDelta(fieldName))
+	ov := newFieldOverlayStorage(s.index[fieldName])
 	if !ov.hasData() {
 		return PlannerFieldStats{}, nil
 	}
@@ -149,30 +136,29 @@ func (db *DB[K, V]) collectPlannerFieldStatsFromOverlay(s *indexSnapshot, fieldN
 }
 
 func (ov fieldOverlay) fieldStats() PlannerFieldStats {
-	cardBuf := getUint64SliceBuf(64)
-	cards := cardBuf.values[:0]
-	defer func() {
-		cardBuf.values = cards
-		releaseUint64SliceBuffer(cardBuf)
-	}()
 	var (
 		total    uint64
 		maxCard  uint64
 		nonEmpty uint64
+		distinct uint64
 	)
 	br := ov.rangeForBounds(rangeBounds{has: true})
-	if br.baseStart >= br.baseEnd && br.deltaStart >= br.deltaEnd {
+	if br.baseStart >= br.baseEnd {
 		return PlannerFieldStats{}
 	}
 
+	q50 := newP2Quantile(0.50)
+	q95 := newP2Quantile(0.95)
 	cur := ov.newCursor(br, false)
 	for {
-		_, baseIDs, de, ok := cur.next()
+		_, ids, ok := cur.next()
 		if !ok {
 			break
 		}
-		card := composePostingCardinality(baseIDs, de)
-		cards = append(cards, card)
+		card := ids.Cardinality()
+		q50.observe(card)
+		q95.observe(card)
+		distinct++
 		total += card
 		if card > maxCard {
 			maxCard = card
@@ -182,22 +168,18 @@ func (ov fieldOverlay) fieldStats() PlannerFieldStats {
 		}
 	}
 
-	if len(cards) == 0 {
+	if distinct == 0 {
 		return PlannerFieldStats{}
 	}
 
-	sort.Slice(cards, func(i, j int) bool {
-		return cards[i] < cards[j]
-	})
-
 	return PlannerFieldStats{
-		DistinctKeys:    uint64(len(cards)),
+		DistinctKeys:    distinct,
 		NonEmptyKeys:    nonEmpty,
 		TotalBucketCard: total,
-		AvgBucketCard:   float64(total) / float64(len(cards)),
+		AvgBucketCard:   float64(total) / float64(distinct),
 		MaxBucketCard:   maxCard,
-		P50BucketCard:   percentileSortedU64(cards, 0.50),
-		P95BucketCard:   percentileSortedU64(cards, 0.95),
+		P50BucketCard:   q50.value(),
+		P95BucketCard:   q95.value(),
 	}
 }
 
@@ -349,26 +331,210 @@ func (db *DB[K, V]) refreshPlannerStatsLocked() {
 	db.planner.stats.Store(s)
 }
 
+func (db *DB[K, V]) plannerStatsSnapshotForPersistLocked(version uint64) *plannerStatsSnapshot {
+	current := db.planner.stats.Load()
+	if current == nil {
+		return db.buildPlannerStatsSnapshotLocked(version)
+	}
+
+	return &plannerStatsSnapshot{
+		Version:             version,
+		GeneratedAt:         time.Now(),
+		UniverseCardinality: db.getSnapshot().universeCardinality(),
+		Fields:              current.Fields,
+	}
+}
+
 func (db *DB[K, V]) buildPlannerStatsSnapshotLocked(version uint64) *plannerStatsSnapshot {
 	snap := db.getSnapshot()
-	fields := snap.indexedFieldNameSet()
+	fields := db.sortedPlannerFieldNames()
 
 	out := &plannerStatsSnapshot{
 		Version:             version,
 		GeneratedAt:         time.Now(),
-		UniverseCardinality: db.snapshotUniverseCardinality(),
+		UniverseCardinality: snap.universeCardinality(),
 		Fields:              make(map[string]PlannerFieldStats, len(fields)),
 	}
 
-	for fieldName := range fields {
-		ov := newFieldOverlay(snap.fieldIndexSlice(fieldName), snap.fieldDelta(fieldName))
+	for _, fieldName := range fields {
+		ov := newFieldOverlayStorage(snap.index[fieldName])
 		out.Fields[fieldName] = ov.fieldStats()
 	}
 
 	return out
 }
 
-func percentileSortedU64(sorted []uint64, q float64) uint64 {
+func (db *DB[K, V]) sortedPlannerFieldNames() []string {
+	if len(db.indexedFieldAccess) == 0 {
+		return nil
+	}
+	fields := make([]string, 0, len(db.indexedFieldAccess))
+	for _, acc := range db.indexedFieldAccess {
+		fields = append(fields, acc.name)
+	}
+	sort.Strings(fields)
+	return fields
+}
+
+func (db *DB[K, V]) publishLoadedPlannerStats(s *plannerStatsSnapshot) {
+	if s == nil {
+		return
+	}
+	out := &plannerStatsSnapshot{
+		Version:             s.Version,
+		GeneratedAt:         s.GeneratedAt,
+		UniverseCardinality: db.getSnapshot().universeCardinality(),
+		Fields:              make(map[string]PlannerFieldStats, len(db.indexedFieldAccess)),
+	}
+	if out.Version == 0 {
+		out.Version = 1
+	}
+	if out.GeneratedAt.IsZero() {
+		out.GeneratedAt = time.Now()
+	}
+	for _, field := range db.sortedPlannerFieldNames() {
+		out.Fields[field] = s.Fields[field]
+	}
+	db.planner.statsVersion.Store(out.Version)
+	db.planner.stats.Store(out)
+}
+
+type p2Quantile struct {
+	q     float64
+	count int
+	init  [5]uint64
+	n     [5]int
+	np    [5]float64
+	dn    [5]float64
+	h     [5]float64
+}
+
+func newP2Quantile(q float64) p2Quantile {
+	return p2Quantile{
+		q: q,
+		dn: [5]float64{
+			0,
+			q / 2,
+			q,
+			(1 + q) / 2,
+			1,
+		},
+	}
+}
+
+func (q *p2Quantile) observe(v uint64) {
+	if q.count < len(q.init) {
+		q.init[q.count] = v
+		q.count++
+		if q.count == len(q.init) {
+			sortSmallU64(q.init[:])
+			for i := range q.h {
+				q.h[i] = float64(q.init[i])
+				q.n[i] = i + 1
+			}
+			q.np[0] = 1
+			q.np[1] = 1 + 2*q.q
+			q.np[2] = 1 + 4*q.q
+			q.np[3] = 3 + 2*q.q
+			q.np[4] = 5
+		}
+		return
+	}
+
+	q.count++
+
+	var k int
+	switch {
+	case float64(v) < q.h[0]:
+		q.h[0] = float64(v)
+		k = 0
+	case float64(v) < q.h[1]:
+		k = 0
+	case float64(v) < q.h[2]:
+		k = 1
+	case float64(v) < q.h[3]:
+		k = 2
+	case float64(v) <= q.h[4]:
+		k = 3
+	default:
+		q.h[4] = float64(v)
+		k = 3
+	}
+
+	for i := k + 1; i < len(q.n); i++ {
+		q.n[i]++
+	}
+	for i := range q.np {
+		q.np[i] += q.dn[i]
+	}
+
+	for i := 1; i <= 3; i++ {
+		d := q.np[i] - float64(q.n[i])
+		if d >= 1 && q.n[i+1]-q.n[i] > 1 {
+			q.adjust(i, 1)
+			continue
+		}
+		if d <= -1 && q.n[i-1]-q.n[i] < -1 {
+			q.adjust(i, -1)
+		}
+	}
+}
+
+func (q *p2Quantile) value() uint64 {
+	if q.count == 0 {
+		return 0
+	}
+	if q.count < len(q.init) {
+		var tmp [5]uint64
+		copy(tmp[:], q.init[:q.count])
+		sortSmallU64(tmp[:q.count])
+		return percentileSmallU64(tmp[:q.count], q.q)
+	}
+	if q.count == len(q.init) {
+		return percentileSmallU64(q.init[:], q.q)
+	}
+	if q.h[2] <= 0 {
+		return 0
+	}
+	return uint64(q.h[2] + 0.5)
+}
+
+func (q *p2Quantile) adjust(i, step int) {
+	next := q.parabolic(i, step)
+	if q.h[i-1] < next && next < q.h[i+1] {
+		q.h[i] = next
+	} else {
+		q.h[i] = q.linear(i, step)
+	}
+	q.n[i] += step
+}
+
+func (q *p2Quantile) parabolic(i, step int) float64 {
+	nim1 := float64(q.n[i-1])
+	ni := float64(q.n[i])
+	nip1 := float64(q.n[i+1])
+	stepf := float64(step)
+	return q.h[i] + stepf/(nip1-nim1)*((ni-nim1+stepf)*(q.h[i+1]-q.h[i])/(nip1-ni)+(nip1-ni-stepf)*(q.h[i]-q.h[i-1])/(ni-nim1))
+}
+
+func (q *p2Quantile) linear(i, step int) float64 {
+	j := i + step
+	return q.h[i] + float64(step)*(q.h[j]-q.h[i])/float64(q.n[j]-q.n[i])
+}
+
+func sortSmallU64(v []uint64) {
+	for i := 1; i < len(v); i++ {
+		x := v[i]
+		j := i
+		for j > 0 && v[j-1] > x {
+			v[j] = v[j-1]
+			j--
+		}
+		v[j] = x
+	}
+}
+
+func percentileSmallU64(sorted []uint64, q float64) uint64 {
 	n := len(sorted)
 	if n == 0 {
 		return 0
@@ -379,8 +545,6 @@ func percentileSortedU64(sorted []uint64, q float64) uint64 {
 	if q >= 1 {
 		return sorted[n-1]
 	}
-
-	// nearest-rank percentile with 0-based index
 	pos := int(math.Ceil(q*float64(n))) - 1
 	if pos < 0 {
 		pos = 0

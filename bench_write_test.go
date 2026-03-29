@@ -17,7 +17,7 @@ import (
 
 const writeBenchSeedBatch = 50_000
 const writeBenchUserBatchSize = 1000
-const writeBenchDeltaHeavyChurn = 2048
+const writeBenchHighChurnOps = 2048
 
 func buildWriteBenchDB(b *testing.B) (*DB[uint64, UserBench], *bbolt.DB, uint64) {
 	return buildWriteBenchDBWithOptions(b, Options{
@@ -253,8 +253,8 @@ func churnWriteBenchSetNewIndexed(b *testing.B, db *DB[uint64, UserBench], start
 	ids := make([]uint64, 0, writeBenchUserBatchSize)
 	vals := make([]*UserBench, 0, writeBenchUserBatchSize)
 	recs := []*UserBench{
-		{Name: "delta-new-a", Age: 20, Country: "DE"},
-		{Name: "delta-new-b", Age: 21, Country: "US"},
+		{Name: "new-a", Age: 20, Country: "DE"},
+		{Name: "new-b", Age: 21, Country: "US"},
 	}
 
 	flush := func() {
@@ -262,13 +262,13 @@ func churnWriteBenchSetNewIndexed(b *testing.B, db *DB[uint64, UserBench], start
 			return
 		}
 		if err := db.BatchSet(ids, vals); err != nil {
-			b.Fatalf("BatchSet(delta churn new): %v", err)
+			b.Fatalf("BatchSet(high churn new): %v", err)
 		}
 		ids = ids[:0]
 		vals = vals[:0]
 	}
 
-	for i := 0; i < writeBenchDeltaHeavyChurn; i++ {
+	for i := 0; i < writeBenchHighChurnOps; i++ {
 		ids = append(ids, startOffset+uint64(i)+1)
 		vals = append(vals, recs[i%len(recs)])
 		if len(ids) == writeBenchUserBatchSize {
@@ -289,13 +289,13 @@ func churnWriteBenchUpdateIndexed(b *testing.B, db *DB[uint64, UserBench], recA,
 			return
 		}
 		if err := db.BatchSet(ids, vals); err != nil {
-			b.Fatalf("BatchSet(delta churn update): %v", err)
+			b.Fatalf("BatchSet(high churn update): %v", err)
 		}
 		ids = ids[:0]
 		vals = vals[:0]
 	}
 
-	for i := 0; i < writeBenchDeltaHeavyChurn; i++ {
+	for i := 0; i < writeBenchHighChurnOps; i++ {
 		ids = append(ids, uint64(i+1))
 		vals = append(vals, benchWriteRecordForIteration(i, recA, recB))
 		if len(ids) == writeBenchUserBatchSize {
@@ -308,12 +308,12 @@ func churnWriteBenchUpdateIndexed(b *testing.B, db *DB[uint64, UserBench], recA,
 func churnWriteBenchPatchIndexed(b *testing.B, db *DB[uint64, UserBench], patch []Field) {
 	b.Helper()
 
-	ids := make([]uint64, 0, writeBenchDeltaHeavyChurn)
-	for i := 0; i < writeBenchDeltaHeavyChurn; i++ {
+	ids := make([]uint64, 0, writeBenchHighChurnOps)
+	for i := 0; i < writeBenchHighChurnOps; i++ {
 		ids = append(ids, uint64(i+1))
 	}
 	if err := db.BatchPatch(ids, patch); err != nil {
-		b.Fatalf("BatchPatch(delta churn patch): %v", err)
+		b.Fatalf("BatchPatch(high churn patch): %v", err)
 	}
 }
 
@@ -335,13 +335,13 @@ func Benchmark_Write_Set_New_Indexed(b *testing.B) {
 		}
 	})
 
-	b.Run("DeltaHeavy", func(b *testing.B) {
+	b.Run("HighChurn", func(b *testing.B) {
 		db, _, startOffset := buildWriteBenchDB(b)
-		prepareWriteBenchDeltaHeavy(b, db, func(b *testing.B, db *DB[uint64, UserBench]) {
+		prepareWriteBenchHighChurn(b, db, func(b *testing.B, db *DB[uint64, UserBench]) {
 			churnWriteBenchSetNewIndexed(b, db, startOffset)
 		})
 
-		startOffset += writeBenchDeltaHeavyChurn
+		startOffset += writeBenchHighChurnOps
 		b.ReportAllocs()
 		b.ResetTimer()
 
@@ -389,10 +389,10 @@ func Benchmark_Write_Update_Indexed(b *testing.B) {
 		}
 	})
 
-	b.Run("DeltaHeavy", func(b *testing.B) {
+	b.Run("HighChurn", func(b *testing.B) {
 		db, _, _ := buildWriteBenchDB(b)
 		targetID := uint64(1000)
-		prepareWriteBenchDeltaHeavy(b, db, func(b *testing.B, db *DB[uint64, UserBench]) {
+		prepareWriteBenchHighChurn(b, db, func(b *testing.B, db *DB[uint64, UserBench]) {
 			churnWriteBenchUpdateIndexed(b, db, recA, recB)
 		})
 
@@ -449,10 +449,10 @@ func Benchmark_Write_Patch_Indexed(b *testing.B) {
 		}
 	})
 
-	b.Run("DeltaHeavy", func(b *testing.B) {
+	b.Run("HighChurn", func(b *testing.B) {
 		db, _, _ := buildWriteBenchDB(b)
 		targetID := uint64(2000)
-		prepareWriteBenchDeltaHeavy(b, db, func(b *testing.B, db *DB[uint64, UserBench]) {
+		prepareWriteBenchHighChurn(b, db, func(b *testing.B, db *DB[uint64, UserBench]) {
 			churnWriteBenchPatchIndexed(b, db, patchA)
 		})
 
@@ -720,52 +720,36 @@ func Benchmark_Write_Update_BeforeStore_BeforeCommit_MakePatch_Parallel(b *testi
 
 /**/
 
-func forceCompactBenchSnapshot[K ~string | ~uint64](b *testing.B, db *DB[K, UserBench]) SnapshotStats {
+func currentBenchSnapshot[K ~string | ~uint64, V any](b *testing.B, db *DB[K, V]) SnapshotStats {
 	b.Helper()
 	b.StopTimer()
-
-	if err := db.ForceCompact(); err != nil {
-		b.Fatalf("ForceCompact: %v", err)
-	}
-
 	return db.SnapshotStats()
 }
 
-func requireBenchSnapshotClean(b *testing.B, st SnapshotStats) {
+func requireBenchSnapshotPublished(b *testing.B, st SnapshotStats) {
 	b.Helper()
-
-	if st.HasDelta || st.IndexDeltaFields != 0 || st.LenDeltaFields != 0 ||
-		st.IndexDeltaOps != 0 || st.LenDeltaOps != 0 ||
-		st.UniverseAddCard != 0 || st.UniverseRemCard != 0 {
-		b.Fatalf("expected clean snapshot, got %+v", st)
+	if st.Sequence == 0 || st.RegistrySize == 0 {
+		b.Fatalf("expected published snapshot, got %+v", st)
 	}
 }
 
-func requireBenchSnapshotDelta(b *testing.B, st SnapshotStats) {
+func prepareReadBenchSnapshot[K ~string | ~uint64, V any](b *testing.B, db *DB[K, V]) {
 	b.Helper()
-
-	if !st.HasDelta {
-		b.Fatalf("expected delta-heavy snapshot, got %+v", st)
-	}
-}
-
-func prepareReadBenchSnapshot[K ~string | ~uint64](b *testing.B, db *DB[K, UserBench]) {
-	b.Helper()
-	requireBenchSnapshotClean(b, forceCompactBenchSnapshot(b, db))
+	requireBenchSnapshotPublished(b, currentBenchSnapshot(b, db))
 	b.StartTimer()
 }
 
-func prepareWriteBenchStableBase[K ~string | ~uint64](b *testing.B, db *DB[K, UserBench]) {
+func prepareWriteBenchStableBase[K ~string | ~uint64, V any](b *testing.B, db *DB[K, V]) {
 	b.Helper()
-	requireBenchSnapshotClean(b, forceCompactBenchSnapshot(b, db))
+	requireBenchSnapshotPublished(b, currentBenchSnapshot(b, db))
 	b.StartTimer()
 }
 
-func prepareWriteBenchDeltaHeavy[K ~string | ~uint64](b *testing.B, db *DB[K, UserBench], churn func(*testing.B, *DB[K, UserBench])) {
+func prepareWriteBenchHighChurn[K ~string | ~uint64, V any](b *testing.B, db *DB[K, V], churn func(*testing.B, *DB[K, V])) {
 	b.Helper()
 
-	requireBenchSnapshotClean(b, forceCompactBenchSnapshot(b, db))
+	requireBenchSnapshotPublished(b, currentBenchSnapshot(b, db))
 	churn(b, db)
-	requireBenchSnapshotDelta(b, db.SnapshotStats())
+	requireBenchSnapshotPublished(b, db.SnapshotStats())
 	b.StartTimer()
 }

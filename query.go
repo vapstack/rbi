@@ -5,6 +5,7 @@ import (
 	"unsafe"
 
 	"github.com/vapstack/qx"
+	"github.com/vapstack/rbi/internal/normalize"
 	"go.etcd.io/bbolt"
 )
 
@@ -22,32 +23,32 @@ func (db *DB[K, V]) Query(q *qx.QX) ([]*V, error) {
 	}
 	defer db.endOp()
 
-	tx, snap, ref, err := db.beginQueryTxSnapshot()
+	tx, snap, seq, ref, err := db.beginQueryTxSnapshot()
 	if err != nil {
 		return nil, err
 	}
+	defer db.unpinSnapshotRef(seq, ref)
 	defer rollback(tx)
-	defer db.unpinSnapshotRef(ref)
 
 	return db.queryRecords(tx, snap, q)
 }
 
-func (db *DB[K, V]) beginQueryTxSnapshot() (*bbolt.Tx, *indexSnapshot, *snapshotRef, error) {
+func (db *DB[K, V]) beginQueryTxSnapshot() (*bbolt.Tx, *indexSnapshot, uint64, *snapshotRef, error) {
 	// Hold the registry read lock across Begin(false) -> Sequence() -> pin so a
-	// writer cannot publish/prune away the exact snapshot needed by this read tx
+	// writer cannot publish/retire away the exact snapshot needed by this read tx
 	// in the gap between opening the tx and pinning its sequence-aligned snapshot.
 	db.snapshot.mu.RLock()
 	tx, err := db.bolt.Begin(false)
 	if err != nil {
 		db.snapshot.mu.RUnlock()
-		return nil, nil, nil, fmt.Errorf("tx error: %w", err)
+		return nil, nil, 0, nil, fmt.Errorf("tx error: %w", err)
 	}
 
 	bucket := tx.Bucket(db.bucket)
 	if bucket == nil {
 		db.snapshot.mu.RUnlock()
 		_ = tx.Rollback()
-		return nil, nil, nil, fmt.Errorf("bucket does not exist")
+		return nil, nil, 0, nil, fmt.Errorf("bucket does not exist")
 	}
 
 	seq := bucket.Sequence()
@@ -56,36 +57,14 @@ func (db *DB[K, V]) beginQueryTxSnapshot() (*bbolt.Tx, *indexSnapshot, *snapshot
 		db.snapshot.mu.RUnlock()
 		_ = tx.Rollback()
 		if err = db.unavailableErr(); err != nil {
-			return nil, nil, nil, err
+			return nil, nil, 0, nil, err
 		}
-		return nil, nil, nil, fmt.Errorf("snapshot sequence %d is not available", seq)
+		return nil, nil, 0, nil, fmt.Errorf("snapshot sequence %d is not available", seq)
 	}
 	ref.refs.Add(1)
 	snap := ref.snap
 	db.snapshot.mu.RUnlock()
-	return tx, snap, ref, nil
-}
-
-func (db *DB[K, V]) queryWithTx(tx *bbolt.Tx, q *qx.QX) ([]*V, bool, error) {
-	bucket := tx.Bucket(db.bucket)
-	if bucket == nil {
-		return nil, false, fmt.Errorf("bucket does not exist")
-	}
-
-	seq := bucket.Sequence()
-	if snap, ref, ok := db.pinSnapshotRefBySeq(seq); ok && snap != nil {
-		values, err := db.queryRecords(tx, snap, q)
-		db.unpinSnapshotRef(ref)
-		if err != nil {
-			return nil, false, err
-		}
-		return values, false, nil
-	}
-
-	if err := db.unavailableErr(); err != nil {
-		return nil, false, err
-	}
-	return nil, false, fmt.Errorf("snapshot sequence %d is not available", seq)
+	return tx, snap, seq, ref, nil
 }
 
 func (db *DB[K, V]) queryRecords(tx *bbolt.Tx, snap *indexSnapshot, q *qx.QX) ([]*V, error) {
@@ -127,10 +106,12 @@ func (db *DB[K, V]) QueryKeys(q *qx.QX) ([]K, error) {
 // execPreparedQuery skips normalize/field-validation and tracing for internal
 // callers that already operate on validated/normalized QX.
 func (db *DB[K, V]) execPreparedQuery(q *qx.QX) ([]K, error) {
-	return db.execQuery(q, false, true)
+	view := db.makeQueryView(db.getSnapshot())
+	defer db.releaseQueryView(view)
+	return view.execPreparedQuery(q)
 }
 
-func shouldSkipPlannerInDeltaMode(q *qx.QX) bool {
+func shouldSkipPlannerForArrayOrderShape(q *qx.QX) bool {
 	if q == nil || len(q.Order) != 1 {
 		return false
 	}
@@ -142,26 +123,26 @@ func shouldSkipPlannerInDeltaMode(q *qx.QX) bool {
 	}
 }
 
-func (db *DB[K, V]) makeQueryView(snap *indexSnapshot) *DB[K, V] {
+func (db *DB[K, V]) makeQueryView(snap *indexSnapshot) *queryView[K, V] {
 	root := db
 	if db.traceRoot != nil {
 		root = db.traceRoot
 	}
-	view := root.viewPool.Get().(*DB[K, V])
-	*view = DB[K, V]{
-		strkey:     root.strkey,
-		strmap:     root.strmap,
-		strmapView: snap.strmap,
-		traceRoot:  root,
-		fields:     root.fields,
-		getters:    root.getters,
-		options:    root.options,
+	view := root.viewPool.Get().(*queryView[K, V])
+	*view = queryView[K, V]{
+		root:              root,
+		snap:              snap,
+		strkey:            root.strkey,
+		strmapView:        snap.strmap,
+		fields:            root.fields,
+		planner:           &root.planner,
+		options:           root.options,
+		lenZeroComplement: snap.lenZeroComplement,
 	}
-	view.snapshot.current.Store(snap)
 	return view
 }
 
-func (db *DB[K, V]) releaseQueryView(view *DB[K, V]) {
+func (db *DB[K, V]) releaseQueryView(view *queryView[K, V]) {
 	if view == nil {
 		return
 	}
@@ -169,25 +150,29 @@ func (db *DB[K, V]) releaseQueryView(view *DB[K, V]) {
 	if db.traceRoot != nil {
 		root = db.traceRoot
 	}
-	*view = DB[K, V]{}
+	*view = queryView[K, V]{}
 	root.viewPool.Put(view)
+}
+
+func (qv *queryView[K, V]) execPreparedQuery(q *qx.QX) ([]K, error) {
+	return qv.execQuery(q, false, true)
 }
 
 // execQuery runs the full query pipeline against one snapshot view.
 //
 // The method keeps all routing decisions in one place so fast-path/planner
 // selection remains consistent across QueryKeys and Query callers.
-func (db *DB[K, V]) execQuery(q *qx.QX, emitTrace bool, prepared bool) (out []K, err error) {
+func (qv *queryView[K, V]) execQuery(q *qx.QX, emitTrace bool, prepared bool) (out []K, err error) {
 
 	// Normalization is intentionally skipped for pre-normalized internal calls
 	// to avoid duplicate AST rewrites in hot paths.
 	if !prepared {
-		q = normalizeQuery(q)
+		q = normalize.Query(q)
 	}
 
 	var trace *queryTrace
-	if emitTrace && db.traceOrCalibrationSamplingEnabled() {
-		trace = db.beginTrace(q)
+	if emitTrace && qv.root.traceOrCalibrationSamplingEnabled() {
+		trace = qv.root.beginTrace(q)
 		if trace != nil {
 			defer func() {
 				trace.finish(uint64(len(out)), err)
@@ -196,52 +181,52 @@ func (db *DB[K, V]) execQuery(q *qx.QX, emitTrace bool, prepared bool) (out []K,
 	}
 
 	if !prepared {
-		if err = db.checkUsedFields(q); err != nil {
+		if err = qv.checkUsedQuery(q); err != nil {
 			return nil, err
 		}
 	}
 
 	var ok bool
 
-	if out, ok, err = db.tryUniqueEqNoOrder(q, trace); ok {
+	if out, ok, err = qv.tryUniqueEqNoOrder(q, trace); ok {
 		return out, err
 	}
 
-	// Planner/execution fast-paths are attempted before bitmap fallback because
+	// Planner/execution fast-paths are attempted before postingResult fallback because
 	// they can short-circuit large scans when query shape matches known patterns.
-	if !shouldSkipPlannerInDeltaMode(q) {
-		if db.shouldPreferExecutionPlan(q, trace) {
-			if out, ok, err = db.tryExecutionPlan(q, trace); ok {
+	if !shouldSkipPlannerForArrayOrderShape(q) {
+		if qv.shouldPreferExecutionPlan(q, trace) {
+			if out, ok, err = qv.tryExecutionPlan(q, trace); ok {
 				return out, err
 			}
-			if out, ok, err = db.tryPlan(q, trace); ok {
+			if out, ok, err = qv.tryPlan(q, trace); ok {
 				return out, err
 			}
 		} else {
-			if out, ok, err = db.tryPlan(q, trace); ok {
+			if out, ok, err = qv.tryPlan(q, trace); ok {
 				return out, err
 			}
-			if out, ok, err = db.tryExecutionPlan(q, trace); ok {
+			if out, ok, err = qv.tryExecutionPlan(q, trace); ok {
 				return out, err
 			}
 		}
 	}
 
 	if trace != nil {
-		trace.setPlan(PlanBitmap)
+		trace.setPlan(PlanMaterialized)
 	}
 
-	result, err := db.evalExpr(q.Expr)
+	result, err := qv.evalExpr(q.Expr)
 	if err != nil {
 		return nil, err
 	}
 	if !result.neg {
-		if result.bm == nil || result.bm.IsEmpty() {
+		if result.ids.IsEmpty() {
 			result.release()
 			return nil, nil
 		}
 	} else {
-		if db.snapshotUniverseCardinality() == 0 {
+		if qv.snapshotUniverseCardinality() == 0 {
 			result.release()
 			return nil, nil
 		}
@@ -256,22 +241,19 @@ func (db *DB[K, V]) execQuery(q *qx.QX, emitTrace bool, prepared bool) (out []K,
 	if len(q.Order) == 0 && result.neg {
 		out = make([]K, 0, func() uint64 {
 			if needAll {
-				return db.snapshotUniverseCardinality()
+				return qv.snapshotUniverseCardinality()
 			}
 			return need
 		}())
-		cursor := db.newQueryCursor(out, skip, need, needAll, nil)
+		cursor := qv.newQueryCursor(out, skip, need, needAll, nil)
 
-		ex := result.bm
-		universe, owned := db.snapshotUniverseView()
-		if owned {
-			defer releaseRoaringBuf(universe)
-		}
-		it := universe.Iterator()
-		defer releaseRoaringBitmapIterator(it)
+		ex := result.ids
+		universe := qv.snapshotUniverseView()
+		it := universe.Iter()
+		defer it.Release()
 		for it.HasNext() {
 			idx := it.Next()
-			if ex != nil && ex.Contains(idx) {
+			if ex.Contains(idx) {
 				continue
 			}
 			if cursor.emit(idx) {
@@ -281,90 +263,55 @@ func (db *DB[K, V]) execQuery(q *qx.QX, emitTrace bool, prepared bool) (out []K,
 		return cursor.out, nil
 	}
 
-	// case 2: ordering with negative result:
-	// materialize into a positive bitmap once, because order executors work on
-	// concrete candidate sets and cannot stream complement sets directly.
-	if len(q.Order) > 0 && result.neg {
-		prev := result
-		mat := getRoaringBuf()
-		universe, owned := db.snapshotUniverseView()
-		mat.Or(universe)
-		if owned {
-			releaseRoaringBuf(universe)
-		}
-		if prev.bm != nil {
-			mat.AndNot(prev.bm)
-		}
-		result = bitmap{bm: mat}
-		prev.release()
-	}
-
-	// case 3: ordering with positive result
+	// case 2: ordering
 	if len(q.Order) > 0 {
 		order := q.Order[0]
 
 		switch order.Type {
 
 		case qx.OrderByArrayPos:
-			ov := db.fieldOverlay(order.Field)
-			if !ov.hasData() && !db.hasFieldIndex(order.Field) {
+			ov := qv.fieldOverlay(order.Field)
+			if !ov.hasData() && !qv.hasFieldIndex(order.Field) {
 				return nil, fmt.Errorf("cannot sort non-indexed field: %v", order.Field)
 			}
-			if ov.delta != nil {
-				return db.queryOrderArrayPosOverlay(result, ov, order, skip, need, needAll)
-			}
-			slice := db.snapshotFieldIndexSlice(order.Field)
-			if slice == nil {
-				return nil, fmt.Errorf("cannot sort non-indexed field: %v", order.Field)
-			}
-			return db.queryOrderArrayPos(result, slice, order, skip, need, needAll)
+			return qv.queryOrderArrayPosOverlay(result, ov, order, skip, need, needAll)
 
 		case qx.OrderByArrayCount:
-			lenOV := db.lenFieldOverlay(order.Field)
-			useZeroComplement := db.isLenZeroComplementField(order.Field)
-			if !lenOV.hasData() && !db.hasLenFieldIndex(order.Field) {
+			lenOV := qv.lenFieldOverlay(order.Field)
+			useZeroComplement := qv.isLenZeroComplementField(order.Field)
+			if !lenOV.hasData() && !qv.hasLenFieldIndex(order.Field) {
 				return nil, fmt.Errorf("cannot sort non-indexed field: %v", order.Field)
 			}
-			if lenOV.delta != nil {
-				return db.queryOrderArrayCountOverlay(result, lenOV, order, skip, need, needAll, useZeroComplement)
-			}
-			slice := db.snapshotLenFieldIndexSlice(order.Field)
+			slice := qv.snapshotLenFieldIndexSlice(order.Field)
 			if slice == nil {
 				return nil, fmt.Errorf("cannot sort non-indexed field: %v", order.Field)
 			}
-			return db.queryOrderArrayCount(result, *slice, order, skip, need, needAll, useZeroComplement)
+			return qv.queryOrderArrayCount(result, *slice, order, skip, need, needAll, useZeroComplement)
 		}
 
-		ov := db.fieldOverlay(order.Field)
-		if !ov.hasData() && !db.hasFieldIndex(order.Field) {
+		ov := qv.fieldOverlay(order.Field)
+		if !ov.hasData() && !qv.hasFieldIndex(order.Field) {
 			return nil, fmt.Errorf("cannot sort non-indexed field: %v", order.Field)
 		}
-		if fm := db.fields[order.Field]; ov.delta == nil && need > 0 && need <= 256 && fm != nil {
-			slice := db.snapshotFieldIndexSlice(order.Field)
-			if slice == nil && !fm.Ptr {
-				return nil, fmt.Errorf("cannot sort non-indexed field: %v", order.Field)
-			}
-			return db.queryOrderBasicSlice(result, slice, order, skip, need, needAll)
-		}
-		return db.queryOrderBasic(result, ov, order, skip, need, needAll)
+		return qv.queryOrderBasic(result, ov, order, skip, need, needAll)
 	}
 
-	// case 4: no ordering, positive result:
+	// case 3: no ordering, positive result:
 	// for numeric keys and unbounded result, return a zero-copy reinterpretation
 	// to avoid an extra allocation/copy in the hottest read path.
 
 	// Fast-path only when unbounded query also has no offset.
 	// Offset requires cursor-based pagination logic.
-	if !db.strkey && needAll && skip == 0 {
-		ids := result.bm.ToArray()
+	if !qv.strkey && needAll && skip == 0 {
+		ids := result.ids.ToArray()
 		return unsafe.Slice((*K)(unsafe.Pointer(&ids[0])), len(ids)), nil
 	}
 
-	out = makeOutSlice[K](result.bm, need)
-	cursor := db.newQueryCursor(out, skip, need, needAll, nil)
+	out = makeOutSlice[K](result.ids.Cardinality(), need)
+	cursor := qv.newQueryCursor(out, skip, need, needAll, nil)
 
-	iter := result.bm.Iterator()
-	defer releaseRoaringBitmapIterator(iter)
+	iter := result.ids.Iter()
+	defer iter.Release()
 	for iter.HasNext() {
 		if cursor.emit(iter.Next()) {
 			return cursor.out, nil
