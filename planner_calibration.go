@@ -270,7 +270,13 @@ func (db *DB[K, V]) persistCalibrationOnClose() error {
 }
 
 // GetCalibrationSnapshot returns a copy of current planner calibration state.
+//
 // The bool result is false if state was not initialized yet.
+//
+// In indexed mode startup initializes calibration state when calibration is
+// enabled. In transparent mode startup does not initialize planner state, so
+// this method usually returns (zero, false) unless state was explicitly set
+// through SetCalibrationSnapshot or loaded manually.
 func (db *DB[K, V]) GetCalibrationSnapshot() (CalibrationSnapshot, bool) {
 	root := db.plannerCalibrationRoot()
 	cur := root.planner.calibrator.state.Load()
@@ -281,6 +287,10 @@ func (db *DB[K, V]) GetCalibrationSnapshot() (CalibrationSnapshot, bool) {
 }
 
 // SetCalibrationSnapshot replaces planner calibration state with the provided snapshot.
+//
+// The method is allowed in both indexed and transparent modes. In transparent
+// mode it only updates stored calibration state for future use; no planner
+// execution paths consume that state while indexing is disabled.
 func (db *DB[K, V]) SetCalibrationSnapshot(s CalibrationSnapshot) error {
 	if err := db.unavailableErr(); err != nil {
 		return err

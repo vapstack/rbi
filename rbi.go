@@ -22,6 +22,7 @@ var (
 	ErrNotStructType     = errors.New("value is not a struct")
 	ErrClosed            = errors.New("database closed")
 	ErrBroken            = errors.New("index is broken")
+	ErrNoIndex           = errors.New("index is disabled (transparent mode)")
 	ErrRebuildInProgress = errors.New("index rebuild in progress")
 	ErrInvalidQuery      = errors.New("invalid query")
 	ErrInvalidBucketName = errors.New("invalid bucket name")
@@ -422,6 +423,14 @@ func New[K ~uint64 | ~string, V any](bolt *bbolt.DB, options Options, execOpts .
 	if err = db.initIndexedFieldAccessors(); err != nil {
 		return nil, fmt.Errorf("failed to initialize field accessors: %w", err)
 	}
+	db.transparent = len(db.indexedFieldAccess) == 0
+	if db.transparent {
+		db.strmap = nil
+		db.index = nil
+		db.nilIndex = nil
+		db.lenIndex = nil
+		db.lenZeroComplement = nil
+	}
 	db.initBatcher()
 
 	err = bolt.Update(func(tx *bbolt.Tx) error {
@@ -434,30 +443,36 @@ func New[K ~uint64 | ~string, V any](bolt *bbolt.DB, options Options, execOpts .
 
 	var (
 		loadedPlannerStats *plannerStatsSnapshot
-		skipFields         map[string]struct{}
-		rebuildReason      string
+		loadedFieldCount   int
 	)
+	if !db.transparent {
+		var (
+			skipFields    map[string]struct{}
+			rebuildReason string
+		)
 
-	if _, err = os.Stat(db.rbiFile); err == nil {
-		if options.DisableIndexLoad {
-			rebuildReason = "persisted index load disabled"
-		} else {
-			skipFields, loadedPlannerStats, err = db.loadIndex()
-			if err != nil {
-				rebuildReason = fmt.Sprintf("persisted index unavailable (%v)", err)
+		if _, err = os.Stat(db.rbiFile); err == nil {
+			if options.DisableIndexLoad {
+				rebuildReason = "persisted index load disabled"
+			} else {
+				skipFields, loadedPlannerStats, err = db.loadIndex()
+				if err != nil {
+					rebuildReason = fmt.Sprintf("persisted index unavailable (%v)", err)
+				}
 			}
+		} else if !os.IsNotExist(err) {
+			rebuildReason = fmt.Sprintf("persisted index stat failed (%v)", err)
 		}
-	} else if !os.IsNotExist(err) {
-		rebuildReason = fmt.Sprintf("persisted index stat failed (%v)", err)
-	}
 
-	if rebuildReason != "" {
-		log.Printf("rbi: %s", rebuildReason)
-		log.Printf("rbi: rebuilding index from bbolt")
-	}
+		if rebuildReason != "" {
+			log.Printf("rbi: %s", rebuildReason)
+			log.Printf("rbi: rebuilding index from bbolt")
+		}
 
-	if err = db.buildIndex(skipFields); err != nil {
-		return nil, fmt.Errorf("error building index: %w", err)
+		if err = db.buildIndex(skipFields); err != nil {
+			return nil, fmt.Errorf("error building index: %w", err)
+		}
+		loadedFieldCount = len(skipFields)
 	}
 
 	db.patchMap = make(map[string]*field)
@@ -470,21 +485,22 @@ func New[K ~uint64 | ~string, V any](bolt *bbolt.DB, options Options, execOpts .
 		db.fieldSlice = append(db.fieldSlice, name)
 	}
 	db.stats.FieldCount = len(db.fieldSlice)
-	if err = db.publishCurrentSequenceSnapshotNoLock(); err != nil {
-		return nil, fmt.Errorf("failed to publish initial snapshot: %w", err)
-	}
-
-	if loadedPlannerStats != nil && len(skipFields) == len(db.fields) {
-		db.publishLoadedPlannerStats(loadedPlannerStats)
-	} else {
-		if err = db.RefreshPlannerStats(); err != nil {
-			return nil, fmt.Errorf("failed to build planner stats snapshot: %w", err)
+	if !db.transparent {
+		if err = db.publishCurrentSequenceSnapshotNoLock(); err != nil {
+			return nil, fmt.Errorf("failed to publish initial snapshot: %w", err)
 		}
+
+		if loadedPlannerStats != nil && loadedFieldCount == len(db.fields) {
+			db.publishLoadedPlannerStats(loadedPlannerStats)
+		} else {
+			if err = db.RefreshPlannerStats(); err != nil {
+				return nil, fmt.Errorf("failed to build planner stats snapshot: %w", err)
+			}
+		}
+
+		db.initCalibration()
+		db.startPlannerAnalyzeLoop()
 	}
-
-	db.initCalibration()
-
-	db.startPlannerAnalyzeLoop()
 
 	return db, nil
 }
@@ -715,8 +731,9 @@ type (
 
 		bucket []byte
 
-		strkey bool
-		strmap *strMapper
+		strkey      bool
+		transparent bool
+		strmap      *strMapper
 
 		universe posting.List
 
@@ -1129,9 +1146,12 @@ func (db *DB[K, V]) RebuildIndex() error {
 	if err := db.unavailableErr(); err != nil {
 		return err
 	}
+	if db.transparent {
+		return ErrNoIndex
+	}
 
 	if err := db.buildIndex(nil); err != nil {
-		return err
+		return fmt.Errorf("error building index: %w", err)
 	}
 
 	db.refreshPlannerStatsLocked()
@@ -1139,6 +1159,15 @@ func (db *DB[K, V]) RebuildIndex() error {
 }
 
 // Stats returns a lightweight database status snapshot.
+//
+// In indexed mode it reports the last rebuild/load timings together with the
+// current published snapshot cardinality and last key.
+//
+// In transparent mode no runtime index snapshot is maintained, so fields that
+// depend on indexed state remain zero-valued: BuildTime, BuildRPS, LoadTime,
+// KeyCount, LastKey, and SnapshotSequence. FieldCount also stays zero because
+// no indexed fields exist in that mode. Auto-batcher fields remain meaningful
+// in both modes.
 //
 // If the DB is unavailable or already closed and the method cannot enter an
 // operation window, it returns a zero value.
@@ -1203,7 +1232,12 @@ func (db *DB[K, V]) statsKeyFromIdx(snap *indexSnapshot, idx uint64) K {
 
 // IndexStats returns current expensive index shape and memory diagnostics.
 //
-// On large databases this can be expensive.
+// In indexed mode it walks the published index snapshot and reports per-field
+// entry counts, key bytes, posting cardinalities, and approximate memory
+// usage. On large databases this can be expensive.
+//
+// In transparent mode it returns a zero-valued IndexStats because no secondary
+// indexes, universe bitmap, or string-key runtime mapping are maintained.
 //
 // If the DB is unavailable or already closed and the method cannot enter an
 // operation window, it returns a zero value.
@@ -1280,8 +1314,12 @@ func (db *DB[K, V]) IndexStats() IndexStats {
 
 // AutoBatchStats returns auto-batcher queue, batch, and availability diagnostics.
 //
-// Runtime counters are collected only when Options.EnableAutoBatchStats
-// was enabled for this DB instance.
+// Runtime counters are collected only when Options.EnableAutoBatchStats was
+// enabled for this DB instance; otherwise the method returns a zero value.
+//
+// The method is independent of indexed versus transparent mode. Write-path
+// batching remains active in both modes, so when stats collection is enabled
+// the returned counters and queue state reflect the current write workload.
 func (db *DB[K, V]) AutoBatchStats() AutoBatchStats {
 	if !db.autoBatcher.statsEnabled {
 		return AutoBatchStats{}
@@ -1329,6 +1367,16 @@ func (db *DB[K, V]) AutoBatchStats() AutoBatchStats {
 
 // PlannerStats returns the last published planner statistics snapshot together
 // with current planner analyze/trace settings.
+//
+// In indexed mode the returned payload reflects the most recently published
+// planner stats snapshot, whether it was loaded from a persisted sidecar or
+// rebuilt in memory.
+//
+// In transparent mode planner stats are not built or refreshed automatically,
+// so the returned planner payload stays zero-valued: Version,
+// UniverseCardinality, FieldCount, GeneratedAt, and per-field stats are all
+// unset. AnalyzeInterval and TraceSampleEvery still reflect the configured
+// options.
 func (db *DB[K, V]) PlannerStats() PlannerStats {
 	out := PlannerStats{
 		Fields: make(map[string]PlannerFieldStats),
@@ -1359,6 +1407,12 @@ func (db *DB[K, V]) PlannerStats() PlannerStats {
 //
 // When calibration is disabled, or no calibration state has been initialized yet,
 // it returns the current settings with zeroed calibration data.
+//
+// In indexed mode calibration state is initialized on startup when
+// calibration is enabled. In transparent mode startup skips calibration
+// initialization, so this method usually returns configured settings with zero
+// calibration payload unless state was explicitly injected through
+// SetCalibrationSnapshot.
 func (db *DB[K, V]) CalibrationStats() CalibrationStats {
 	out := CalibrationStats{
 		Enabled:     db.planner.calibrator.enabled,
@@ -1404,7 +1458,7 @@ func (db *DB[K, V]) Close() error {
 
 	var err error
 
-	if !db.options.DisableIndexStore && !db.broken.Load() {
+	if !db.transparent && !db.options.DisableIndexStore && !db.broken.Load() {
 		err = db.storeIndex()
 	}
 
@@ -1461,6 +1515,15 @@ func (db *DB[K, V]) Truncate() error {
 	}
 	if err = bucket.SetSequence(prevSeq); err != nil {
 		return fmt.Errorf("restore bucket sequence: %w", err)
+	}
+	if db.transparent {
+		if _, err = bucket.NextSequence(); err != nil {
+			return fmt.Errorf("advance bucket sequence: %w", err)
+		}
+		if err = db.commit(tx, "truncate"); err != nil {
+			return fmt.Errorf("commit error: %w", err)
+		}
+		return nil
 	}
 	seq, err := bucket.NextSequence()
 	if err != nil {

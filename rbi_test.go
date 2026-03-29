@@ -37,6 +37,20 @@ type schemaSubsetRec struct {
 	Age  int    `db:"age"`
 }
 
+type plannerStatsPartialBaseRec struct {
+	Name string `db:"name"`
+}
+
+type plannerStatsPartialNextRec struct {
+	Name string `db:"name"`
+	Age  int    `db:"age"`
+}
+
+type noIndexRec struct {
+	Name string `rbi:"-"`
+	Age  int    `rbi:"-"`
+}
+
 func openTempDBStringProduct(t *testing.T, options ...Options) (*DB[string, Product], string) {
 	t.Helper()
 	dir := t.TempDir()
@@ -78,6 +92,333 @@ func readPersistedIndexSequence(tb testing.TB, path string) uint64 {
 		tb.Fatalf("read persisted index sequence: %v", err)
 	}
 	return seq
+}
+
+func TestTransparentMode_IgnoresPersistedIndexAndDoesNotStoreSidecar(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "transparent_ignored_sidecar.db")
+	sidecar := path + ".noIndexRec.rbi"
+	if err := os.WriteFile(sidecar, []byte("invalid-sidecar"), 0o600); err != nil {
+		t.Fatalf("write invalid sidecar: %v", err)
+	}
+
+	var logBuf bytes.Buffer
+	prevLogWriter := log.Writer()
+	prevLogFlags := log.Flags()
+	log.SetOutput(&logBuf)
+	log.SetFlags(0)
+	defer func() {
+		log.SetOutput(prevLogWriter)
+		log.SetFlags(prevLogFlags)
+	}()
+
+	db, raw := openBoltAndNew[uint64, noIndexRec](t, path)
+	defer func() {
+		if db != nil {
+			_ = db.Close()
+		}
+		if raw != nil {
+			_ = raw.Close()
+		}
+	}()
+
+	if err := db.Set(1, &noIndexRec{Name: "one", Age: 10}); err != nil {
+		t.Fatalf("Set(1): %v", err)
+	}
+	if err := db.Set(2, &noIndexRec{Name: "two", Age: 20}); err != nil {
+		t.Fatalf("Set(2): %v", err)
+	}
+
+	if !db.transparent {
+		t.Fatal("expected transparent mode")
+	}
+	if db.strmap != nil {
+		t.Fatalf("transparent mode must not allocate strmap: %#v", db.strmap)
+	}
+	if db.snapshot.current.Load() != nil {
+		t.Fatal("transparent mode must not publish snapshots")
+	}
+	if strings.Contains(logBuf.String(), "persisted index") {
+		t.Fatalf("transparent mode must ignore sidecar load/store logs, got %q", logBuf.String())
+	}
+
+	if got, err := db.Get(2); err != nil {
+		t.Fatalf("Get(2): %v", err)
+	} else if got == nil || got.Name != "two" || got.Age != 20 {
+		t.Fatalf("Get(2)=%#v", got)
+	}
+
+	if err := db.Patch(2, []Field{{Name: "Age", Value: 21}}); err != nil {
+		t.Fatalf("Patch(2): %v", err)
+	}
+	if got, err := db.Get(2); err != nil {
+		t.Fatalf("Get(2 after patch): %v", err)
+	} else if got == nil || got.Age != 21 {
+		t.Fatalf("patched Get(2)=%#v", got)
+	}
+	if err := db.Delete(1); err != nil {
+		t.Fatalf("Delete(1): %v", err)
+	}
+	if got, err := db.Get(1); err != nil {
+		t.Fatalf("Get(1 after delete): %v", err)
+	} else if got != nil {
+		t.Fatalf("Get(1)=%#v want nil", got)
+	}
+	if db.snapshot.current.Load() != nil {
+		t.Fatal("transparent writes must not publish snapshots")
+	}
+
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	db = nil
+	if err := raw.Close(); err != nil {
+		t.Fatalf("raw close: %v", err)
+	}
+	raw = nil
+
+	data, err := os.ReadFile(sidecar)
+	if err != nil {
+		t.Fatalf("read sidecar: %v", err)
+	}
+	if got := string(data); got != "invalid-sidecar" {
+		t.Fatalf("transparent close rewrote sidecar: %q", got)
+	}
+	if strings.Contains(logBuf.String(), "persisted index") {
+		t.Fatalf("transparent close must not emit sidecar logs, got %q", logBuf.String())
+	}
+}
+
+func TestTransparentMode_DisablesIndexedAPIsAndUsesDirectBoltSeqScans(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "transparent_scan.db")
+
+	db, raw := openBoltAndNew[string, noIndexRec](t, path)
+	defer func() {
+		_ = db.Close()
+		_ = raw.Close()
+	}()
+
+	for _, key := range []string{"k-02", "k-10", "k-01"} {
+		if err := db.Set(key, &noIndexRec{Name: key, Age: len(key)}); err != nil {
+			t.Fatalf("Set(%q): %v", key, err)
+		}
+	}
+
+	if _, err := db.Query(qx.Query()); !errors.Is(err, ErrNoIndex) {
+		t.Fatalf("Query(all) err=%v want %v", err, ErrNoIndex)
+	}
+	if _, err := db.QueryKeys(qx.Query()); !errors.Is(err, ErrNoIndex) {
+		t.Fatalf("QueryKeys(all) err=%v want %v", err, ErrNoIndex)
+	}
+	if _, err := db.Count(nil); !errors.Is(err, ErrNoIndex) {
+		t.Fatalf("Count(nil) err=%v want %v", err, ErrNoIndex)
+	}
+	if err := db.RebuildIndex(); !errors.Is(err, ErrNoIndex) {
+		t.Fatalf("RebuildIndex err=%v want %v", err, ErrNoIndex)
+	}
+	if err := db.RefreshPlannerStats(); !errors.Is(err, ErrNoIndex) {
+		t.Fatalf("RefreshPlannerStats err=%v want %v", err, ErrNoIndex)
+	}
+
+	var seq []string
+	if err := db.SeqScan("k-02", func(id string, v *noIndexRec) (bool, error) {
+		seq = append(seq, fmt.Sprintf("%s:%s", id, v.Name))
+		return true, nil
+	}); err != nil {
+		t.Fatalf("SeqScan: %v", err)
+	}
+	if !slices.Equal(seq, []string{"k-02:k-02", "k-10:k-10"}) {
+		t.Fatalf("SeqScan=%v", seq)
+	}
+
+	var rawSeq []string
+	if err := db.SeqScanRaw("k-02", func(id string, raw []byte) (bool, error) {
+		rawSeq = append(rawSeq, id)
+		if len(raw) == 0 {
+			t.Fatal("SeqScanRaw returned empty payload")
+		}
+		return true, nil
+	}); err != nil {
+		t.Fatalf("SeqScanRaw: %v", err)
+	}
+	if !slices.Equal(rawSeq, []string{"k-02", "k-10"}) {
+		t.Fatalf("SeqScanRaw=%v", rawSeq)
+	}
+
+	if err := raw.Update(func(tx *bbolt.Tx) error {
+		bucket := tx.Bucket(db.bucket)
+		if bucket == nil {
+			return fmt.Errorf("bucket does not exist")
+		}
+		if err := bucket.Delete([]byte("k-02")); err != nil {
+			return err
+		}
+		buf := getEncodeBuf()
+		if err := db.encode(&noIndexRec{Name: "k-03", Age: 4}, buf); err != nil {
+			releaseEncodeBuf(buf)
+			return err
+		}
+		payload := append([]byte(nil), buf.Bytes()...)
+		releaseEncodeBuf(buf)
+		return bucket.Put([]byte("k-03"), payload)
+	}); err != nil {
+		t.Fatalf("out-of-band mutate: %v", err)
+	}
+
+	seq = seq[:0]
+	if err := db.SeqScan("k-02", func(id string, v *noIndexRec) (bool, error) {
+		seq = append(seq, fmt.Sprintf("%s:%s", id, v.Name))
+		return true, nil
+	}); err != nil {
+		t.Fatalf("SeqScan(after mutate): %v", err)
+	}
+	if !slices.Equal(seq, []string{"k-03:k-03", "k-10:k-10"}) {
+		t.Fatalf("SeqScan(after mutate)=%v want [k-03:k-03 k-10:k-10]", seq)
+	}
+
+	rawSeq = rawSeq[:0]
+	if err := db.SeqScanRaw("k-02", func(id string, raw []byte) (bool, error) {
+		rawSeq = append(rawSeq, id)
+		if len(raw) == 0 {
+			t.Fatal("SeqScanRaw(after mutate) returned empty payload")
+		}
+		return true, nil
+	}); err != nil {
+		t.Fatalf("SeqScanRaw(after mutate): %v", err)
+	}
+	if !slices.Equal(rawSeq, []string{"k-03", "k-10"}) {
+		t.Fatalf("SeqScanRaw(after mutate)=%v want [k-03 k-10]", rawSeq)
+	}
+
+	if err := db.ScanKeys("", func(id string) (bool, error) {
+		return true, nil
+	}); !errors.Is(err, ErrNoIndex) {
+		t.Fatalf("ScanKeys err=%v want %v", err, ErrNoIndex)
+	}
+}
+
+func TestTransparentMode_WritesAdvanceBucketSequenceAndInvalidateStaleSidecar(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "transparent_write_seq.db")
+	opts := Options{BucketName: "transparent_write_seq"}
+
+	dbIndexed, rawIndexed := openBoltAndNew[uint64, schemaSubsetRec](t, path, opts)
+	if err := dbIndexed.Set(1, &schemaSubsetRec{Name: "one", Age: 10}); err != nil {
+		t.Fatalf("indexed Set(1): %v", err)
+	}
+	if err := dbIndexed.Set(2, &schemaSubsetRec{Name: "two", Age: 20}); err != nil {
+		t.Fatalf("indexed Set(2): %v", err)
+	}
+	sidecar := dbIndexed.rbiFile
+	if err := dbIndexed.Close(); err != nil {
+		t.Fatalf("indexed Close: %v", err)
+	}
+	if err := rawIndexed.Close(); err != nil {
+		t.Fatalf("indexed raw Close: %v", err)
+	}
+
+	storedSeq := readPersistedIndexSequence(t, sidecar)
+
+	dbTransparent, rawTransparent := openBoltAndNew[uint64, noIndexRec](t, path, opts)
+	if err := dbTransparent.Delete(1); err != nil {
+		t.Fatalf("transparent Delete(1): %v", err)
+	}
+	if err := dbTransparent.Set(3, &noIndexRec{Name: "three", Age: 30}); err != nil {
+		t.Fatalf("transparent Set(3): %v", err)
+	}
+	if err := dbTransparent.Close(); err != nil {
+		t.Fatalf("transparent Close: %v", err)
+	}
+	if err := rawTransparent.Close(); err != nil {
+		t.Fatalf("transparent raw Close: %v", err)
+	}
+
+	if got := readPersistedIndexSequence(t, sidecar); got != storedSeq {
+		t.Fatalf("transparent mode rewrote sidecar sequence: got=%d want=%d", got, storedSeq)
+	}
+
+	dbReopen, rawReopen := openBoltAndNew[uint64, schemaSubsetRec](t, path, opts)
+	defer func() {
+		_ = dbReopen.Close()
+		_ = rawReopen.Close()
+	}()
+
+	currentSeq := readBucketSequence(t, rawReopen, dbReopen.bucket)
+	if currentSeq <= storedSeq {
+		t.Fatalf("bucket sequence did not advance across transparent writes: current=%d stored=%d", currentSeq, storedSeq)
+	}
+
+	keys, err := dbReopen.QueryKeys(qx.Query())
+	if err != nil {
+		t.Fatalf("reopen QueryKeys(all): %v", err)
+	}
+	if !slices.Equal(keys, []uint64{2, 3}) {
+		t.Fatalf("reopen QueryKeys(all)=%v want [2 3]", keys)
+	}
+}
+
+func TestTransparentMode_TruncateAdvancesBucketSequenceAndInvalidatesStaleSidecar(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "transparent_truncate_seq.db")
+	opts := Options{BucketName: "transparent_truncate_seq"}
+
+	dbIndexed, rawIndexed := openBoltAndNew[uint64, schemaSubsetRec](t, path, opts)
+	if err := dbIndexed.Set(1, &schemaSubsetRec{Name: "one", Age: 10}); err != nil {
+		t.Fatalf("indexed Set(1): %v", err)
+	}
+	if err := dbIndexed.Set(2, &schemaSubsetRec{Name: "two", Age: 20}); err != nil {
+		t.Fatalf("indexed Set(2): %v", err)
+	}
+	sidecar := dbIndexed.rbiFile
+	if err := dbIndexed.Close(); err != nil {
+		t.Fatalf("indexed Close: %v", err)
+	}
+	if err := rawIndexed.Close(); err != nil {
+		t.Fatalf("indexed raw Close: %v", err)
+	}
+
+	storedSeq := readPersistedIndexSequence(t, sidecar)
+
+	dbTransparent, rawTransparent := openBoltAndNew[uint64, noIndexRec](t, path, opts)
+	if err := dbTransparent.Truncate(); err != nil {
+		t.Fatalf("transparent Truncate: %v", err)
+	}
+	if err := dbTransparent.Close(); err != nil {
+		t.Fatalf("transparent Close: %v", err)
+	}
+	if err := rawTransparent.Close(); err != nil {
+		t.Fatalf("transparent raw Close: %v", err)
+	}
+
+	if got := readPersistedIndexSequence(t, sidecar); got != storedSeq {
+		t.Fatalf("transparent mode rewrote sidecar sequence: got=%d want=%d", got, storedSeq)
+	}
+
+	dbReopen, rawReopen := openBoltAndNew[uint64, schemaSubsetRec](t, path, opts)
+	defer func() {
+		_ = dbReopen.Close()
+		_ = rawReopen.Close()
+	}()
+
+	currentSeq := readBucketSequence(t, rawReopen, dbReopen.bucket)
+	if currentSeq <= storedSeq {
+		t.Fatalf("bucket sequence did not advance across transparent truncate: current=%d stored=%d", currentSeq, storedSeq)
+	}
+
+	if cnt, err := dbReopen.Count(nil); err != nil {
+		t.Fatalf("reopen Count(nil): %v", err)
+	} else if cnt != 0 {
+		t.Fatalf("reopen Count(nil)=%d want 0", cnt)
+	}
+
+	keys, err := dbReopen.QueryKeys(qx.Query())
+	if err != nil {
+		t.Fatalf("reopen QueryKeys(all): %v", err)
+	}
+	if len(keys) != 0 {
+		t.Fatalf("reopen QueryKeys(all)=%v want empty", keys)
+	}
 }
 
 func readPersistedIndexFormatByte(tb testing.TB, path string) byte {
@@ -413,6 +754,70 @@ func TestWrap_PersistedIndexSchemaNarrowing_ReusesCompatibleIndexes(t *testing.T
 	}
 	if !slices.Equal(ids, []uint64{1}) {
 		t.Fatalf("unexpected rebuilt query result: got=%v want=[1]", ids)
+	}
+}
+
+func TestWrap_PartialPersistedLoad_RefreshesPlannerStats(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "planner_partial.db")
+
+	const bucket = "planner_partial"
+
+	rawDB, err := bbolt.Open(path, 0o600, nil)
+	if err != nil {
+		t.Fatalf("bbolt.Open: %v", err)
+	}
+
+	db, err := New[uint64, plannerStatsPartialBaseRec](rawDB, Options{
+		AnalyzeInterval: -1,
+		BucketName:      bucket,
+	})
+	if err != nil {
+		t.Fatalf("initial New: %v", err)
+	}
+	if err := db.Set(1, &plannerStatsPartialBaseRec{Name: "alice"}); err != nil {
+		t.Fatalf("seed Set(1): %v", err)
+	}
+	if err := db.Set(2, &plannerStatsPartialBaseRec{Name: "bob"}); err != nil {
+		t.Fatalf("seed Set(2): %v", err)
+	}
+	if err := db.RefreshPlannerStats(); err != nil {
+		t.Fatalf("initial RefreshPlannerStats: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("initial Close: %v", err)
+	}
+	if err := rawDB.Close(); err != nil {
+		t.Fatalf("initial raw Close: %v", err)
+	}
+
+	rawDB2, err := bbolt.Open(path, 0o600, nil)
+	if err != nil {
+		t.Fatalf("reopen bbolt.Open: %v", err)
+	}
+	defer func() { _ = rawDB2.Close() }()
+
+	db2, err := New[uint64, plannerStatsPartialNextRec](rawDB2, Options{
+		AnalyzeInterval: -1,
+		BucketName:      bucket,
+	})
+	if err != nil {
+		t.Fatalf("reopen New: %v", err)
+	}
+	defer func() { _ = db2.Close() }()
+
+	got := db2.PlannerStats()
+	if got.UniverseCardinality != 2 {
+		t.Fatalf("planner universe=%d want=2", got.UniverseCardinality)
+	}
+	if got.FieldCount != 2 {
+		t.Fatalf("planner field count=%d want=2", got.FieldCount)
+	}
+	if stats, ok := got.Fields["name"]; !ok || stats.DistinctKeys != 2 {
+		t.Fatalf("planner name stats=%+v want distinct=2", stats)
+	}
+	if stats, ok := got.Fields["age"]; !ok || stats.DistinctKeys == 0 {
+		t.Fatalf("planner age stats=%+v want non-zero rebuilt stats", stats)
 	}
 }
 

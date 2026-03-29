@@ -676,6 +676,7 @@ func (db *DB[K, V]) executeAutoBatchAtomic(batch []*autoBatchRequest[K, V]) erro
 func (db *DB[K, V]) executeAutoBatchAttempt(active []*autoBatchRequest[K, V], atomicAll bool) (*autoBatchRequest[K, V], bool, error) {
 	stats := db.autoBatcher.statsEnabled
 	opName := db.autoBatchOpName(active, atomicAll)
+	transparent := db.transparent
 
 	tx, err := db.bolt.Begin(true)
 	if err != nil {
@@ -804,7 +805,9 @@ func (db *DB[K, V]) executeAutoBatchAttempt(active []*autoBatchRequest[K, V], at
 				payload = append([]byte(nil), b.Bytes()...)
 				releaseEncodeBuf(b)
 			}
-			ensureIdx(req, st, true)
+			if !transparent {
+				ensureIdx(req, st, true)
+			}
 
 			prepared = append(prepared, autoBatchPrepared[K, V]{
 				req:      req,
@@ -872,7 +875,9 @@ func (db *DB[K, V]) executeAutoBatchAttempt(active []*autoBatchRequest[K, V], at
 			}
 			payload := append([]byte(nil), b.Bytes()...)
 			releaseEncodeBuf(b)
-			ensureIdx(req, st, false)
+			if !transparent {
+				ensureIdx(req, st, false)
+			}
 
 			prepared = append(prepared, autoBatchPrepared[K, V]{
 				req:      req,
@@ -897,7 +902,9 @@ func (db *DB[K, V]) executeAutoBatchAttempt(active []*autoBatchRequest[K, V], at
 				continue
 			}
 			oldVal := st.current
-			ensureIdx(req, st, false)
+			if !transparent {
+				ensureIdx(req, st, false)
+			}
 
 			prepared = append(prepared, autoBatchPrepared[K, V]{
 				req:      req,
@@ -1041,6 +1048,32 @@ func (db *DB[K, V]) executeAutoBatchAttempt(active []*autoBatchRequest[K, V], at
 			return callbackFailedReq, false, nil
 		}
 		return nil, true, fatalErr
+	}
+
+	if transparent {
+		if _, err = bucket.NextSequence(); err != nil {
+			if stats {
+				db.autoBatcher.txOpErrors.Add(1)
+			}
+			rollbackCreated(accepted)
+			db.mu.Unlock()
+			return nil, true, fmt.Errorf("advance bucket sequence: %w", err)
+		}
+		if err = db.commit(tx, opName); err != nil {
+			if stats {
+				db.autoBatcher.txCommitErrors.Add(1)
+			}
+			db.mu.Unlock()
+			for _, op := range accepted {
+				if op.req.err == nil {
+					op.req.err = err
+				}
+			}
+			return nil, true, nil
+		}
+		committed = true
+		db.mu.Unlock()
+		return nil, true, nil
 	}
 
 	seq, err := bucket.NextSequence()

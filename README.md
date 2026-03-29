@@ -34,6 +34,7 @@ Indexes are kept fully in memory and built on a heavily reworked fork of
 * Partial updates (`Patch*`) with minimal index churn
 * Batch and auto-batched writes
 * Uniqueness constraints
+* Optional transparent mode for typed/generic work with plain bbolt db when index is not needed
 * Optional runtime diagnostics: query tracing, planner/snapshot/auto-batch stats, and online
   calibration
 
@@ -172,6 +173,17 @@ Query methods:
 * `SeqScan` - performs a sequential scan over all records starting at the given key
 * `ScanKeys` – iterate the current in-memory key set without opening a Bolt read transaction
 
+## Transparent mode
+
+If a value type has no indexed fields, RBI automatically switches to a
+transparent mode. This is useful when you want a strongly-typed generic API 
+over a bbolt bucket without maintaining secondary indexes.
+
+In transparent mode:
+- read/write/scan methods continue to work (except `ScanKeys`)
+- query/count methods return `ErrNoIndex`
+- minimal overhead (no index maintenance) 
+
 ## Query execution model
 
 Queries run entirely in-memory; stored records are never scanned.
@@ -229,9 +241,6 @@ db, err := rbi.New[uint64, User](bolt, rbi.Options{
     AutoBatchMax: 128,
     AutoBatchMaxQueue: 512, // < 0 means unbounded queue, 0 uses default
 })
-if err != nil {
-    panic(err)
-}
 ```
 
 ### Hooks
@@ -383,6 +392,8 @@ built from and is loaded only when the current bucket sequence matches.
 
 After a successful `Close`, a fresh `.rbi` file is written from the current
 in-memory snapshot and can be reused on the next open.
+
+Transparent mode does not load or write `.rbi` files.
 
 ## Memory usage
 

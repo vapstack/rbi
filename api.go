@@ -128,6 +128,8 @@ func (db *DB[K, V]) batchGetTxCompact(tx *bbolt.Tx, ids []K) ([]*V, error) {
 // ScanKeys iterates over keys in the in-memory index snapshot and calls fn for
 // each key greater than or equal to seek.
 //
+// In transparent mode it returns ErrNoIndex.
+//
 // The scan stops when fn returns false or a non-nil error. The scan does not
 // open a Bolt transaction and may not reflect concurrent writes.
 //
@@ -142,6 +144,10 @@ func (db *DB[K, V]) ScanKeys(seek K, fn func(K) (bool, error)) error {
 		return err
 	}
 	defer db.endOp()
+
+	if db.transparent {
+		return ErrNoIndex
+	}
 
 	snap := db.getSnapshot()
 	universe := snap.universe

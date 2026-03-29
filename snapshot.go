@@ -317,6 +317,10 @@ func inheritMaterializedPredCache(next, prev *indexSnapshot, changedFields map[s
 }
 
 func (db *DB[K, V]) buildPublishedSnapshotNoLock(seq uint64) *indexSnapshot {
+	var strmap *strMapSnapshot
+	if db.strkey && db.strmap != nil {
+		strmap = db.strmap.snapshot()
+	}
 	snap := &indexSnapshot{
 		seq:               seq,
 		index:             db.index,
@@ -324,7 +328,7 @@ func (db *DB[K, V]) buildPublishedSnapshotNoLock(seq uint64) *indexSnapshot {
 		lenIndex:          db.lenIndex,
 		lenZeroComplement: db.lenZeroComplement,
 		universe:          db.universe,
-		strmap:            db.strmap.snapshot(),
+		strmap:            strmap,
 	}
 	db.initSnapshotRuntimeCaches(snap)
 	return snap
@@ -758,6 +762,18 @@ func (db *DB[K, V]) retireSnapshotLocked(seq uint64) {
 	releaseSnapshotRef(ref)
 }
 
+// SnapshotStats returns diagnostics for published index snapshots.
+//
+// Runtime snapshot diagnostics are collected only when
+// Options.EnableSnapshotStats was enabled for this DB instance; otherwise the
+// method returns a zero value.
+//
+// In indexed mode it reports the current published snapshot sequence,
+// universe cardinality, registry size, and pin counts.
+//
+// In transparent mode no published index snapshots are maintained, so the
+// returned diagnostics remain zero-valued even when snapshot stats collection
+// is enabled.
 func (db *DB[K, V]) SnapshotStats() SnapshotStats {
 	if !db.snapshot.statsEnabled {
 		return SnapshotStats{}

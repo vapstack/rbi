@@ -11,17 +11,20 @@ import (
 
 // Query evaluates the given query against the index and returns all matching values.
 func (db *DB[K, V]) Query(q *qx.QX) ([]*V, error) {
+	if err := db.beginOp(); err != nil {
+		return nil, err
+	}
+	defer db.endOp()
 
+	if db.transparent {
+		return nil, ErrNoIndex
+	}
 	if q == nil {
 		return nil, fmt.Errorf("QX is nil")
 	}
 	if len(q.Order) > 1 {
 		return nil, fmt.Errorf("rbi does not support multi-column ordering")
 	}
-	if err := db.beginOp(); err != nil {
-		return nil, err
-	}
-	defer db.endOp()
 
 	tx, snap, seq, ref, err := db.beginQueryTxSnapshot()
 	if err != nil {
@@ -87,16 +90,20 @@ func (db *DB[K, V]) queryRecords(tx *bbolt.Tx, snap *indexSnapshot, q *qx.QX) ([
 
 // QueryKeys evaluates the given query against the index and returns all matching ids.
 func (db *DB[K, V]) QueryKeys(q *qx.QX) ([]K, error) {
+	if err := db.beginOp(); err != nil {
+		return nil, err
+	}
+	defer db.endOp()
+
+	if db.transparent {
+		return nil, ErrNoIndex
+	}
 	if q == nil {
 		return nil, fmt.Errorf("QX is nil")
 	}
 	if len(q.Order) > 1 {
 		return nil, fmt.Errorf("rbi does not support multi-column ordering")
 	}
-	if err := db.beginOp(); err != nil {
-		return nil, err
-	}
-	defer db.endOp()
 
 	view := db.makeQueryView(db.getSnapshot())
 	defer db.releaseQueryView(view)

@@ -15,7 +15,14 @@ const (
 )
 
 // RefreshPlannerStats rebuilds planner statistics from the current in-memory index.
+//
 // This is a synchronous, full refresh intended for explicit/manual calls.
+//
+// In indexed mode it scans the current published index snapshot and replaces
+// the planner stats payload atomically.
+//
+// In transparent mode planner stats are disabled because no runtime index
+// exists; the method returns ErrNoIndex.
 func (db *DB[K, V]) RefreshPlannerStats() error {
 	return db.refreshPlannerStatsWithBudget(0, false)
 }
@@ -29,6 +36,10 @@ func (db *DB[K, V]) refreshPlannerStatsWithBudget(softBudget time.Duration, useC
 		return err
 	}
 	defer db.endOp()
+
+	if db.transparent {
+		return ErrNoIndex
+	}
 
 	db.planner.analyzer.Lock()
 	defer db.planner.analyzer.Unlock()

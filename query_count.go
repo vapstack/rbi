@@ -31,6 +31,11 @@ func (db *DB[K, V]) Count(q *qx.QX) (uint64, error) {
 		return 0, err
 	}
 	defer db.endOp()
+
+	if db.transparent {
+		return 0, ErrNoIndex
+	}
+
 	view := db.makeQueryView(db.getSnapshot())
 	defer db.releaseQueryView(view)
 	return view.countInternal(q, true)
