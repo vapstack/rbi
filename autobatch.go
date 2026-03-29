@@ -3,6 +3,7 @@ package rbi
 import (
 	"errors"
 	"fmt"
+	"slices"
 	"sync/atomic"
 	"time"
 
@@ -116,16 +117,7 @@ func (ab *autoBatcher[K, V]) enqueue(job *autoBatchJob[K, V]) {
 }
 
 func (ab *autoBatcher[K, V]) dequeueFrontScratch(n int) []*autoBatchJob[K, V] {
-	scratch := ab.batchScratch
-	oldLen := len(scratch)
-	if cap(scratch) < n {
-		scratch = make([]*autoBatchJob[K, V], n)
-		oldLen = 0
-	}
-	if oldLen > n {
-		clear(scratch[n:oldLen])
-	}
-	batch := scratch[:n]
+	batch := slices.Grow(ab.batchScratch[:0], n)[:n]
 	for i := 0; i < n; i++ {
 		idx := ab.queueIndex(i)
 		batch[i] = ab.queue[idx]

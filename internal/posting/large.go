@@ -308,9 +308,7 @@ func (lp *largePosting) addMany(dat []uint64) {
 		hi := highbits64(dat[end])
 		if hi != batchHighBits {
 			batchLen := end - start
-			if cap(batchBuf.values) < batchLen {
-				batchBuf.values = make([]uint32, batchLen)
-			}
+			batchBuf.values = slices.Grow(batchBuf.values[:0], batchLen)
 			batch := batchBuf.values[:batchLen]
 			for i := 0; i < batchLen; i++ {
 				batch[i] = lowbits64(dat[start+i])
@@ -322,9 +320,7 @@ func (lp *largePosting) addMany(dat []uint64) {
 	}
 
 	batchLen := len(dat) - start
-	if cap(batchBuf.values) < batchLen {
-		batchBuf.values = make([]uint32, batchLen)
-	}
+	batchBuf.values = slices.Grow(batchBuf.values[:0], batchLen)
 	batch := batchBuf.values[:batchLen]
 	for i := 0; i < batchLen; i++ {
 		batch[i] = lowbits64(dat[start+i])
@@ -357,9 +353,7 @@ func (lp *largePosting) addSortedHighBitsBatch(hb uint32, dat []uint64) {
 	}
 
 	batchBuf := acquireAddManyBatch(len(dat))
-	if cap(batchBuf.values) < len(dat) {
-		batchBuf.values = make([]uint32, len(dat))
-	}
+	batchBuf.values = slices.Grow(batchBuf.values[:0], len(dat))
 	batch := batchBuf.values[:len(dat)]
 	for i := range dat {
 		batch[i] = lowbits64(dat[i])
@@ -1024,10 +1018,8 @@ func (la *largeArray) moveKeyValueAt(src, dst int) {
 }
 
 func (la *largeArray) resize(newsize int) {
-	for k := newsize; k < len(la.containers); k++ {
-		la.keys[k] = 0
-		la.containers[k] = nil
-	}
+	clear(la.keys[newsize:])
+	clear(la.containers[newsize:])
 
 	la.keys = la.keys[:newsize]
 	la.containers = la.containers[:newsize]

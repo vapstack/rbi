@@ -193,10 +193,8 @@ func countUnionKeys[T ~uint16 | ~uint32](left, right []T) int {
 }
 
 func (ra *containerIndex) resize(newsize int) {
-	for k := newsize; k < len(ra.containers); k++ {
-		ra.keys[k] = 0
-		ra.containers[k] = nil
-	}
+	clear(ra.keys[newsize:])
+	clear(ra.containers[newsize:])
 	ra.keys = ra.keys[:newsize]
 	ra.containers = ra.containers[:newsize]
 }

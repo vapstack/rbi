@@ -65,11 +65,7 @@ var patchScratchPool = sync.Pool{
 
 func acquirePatchScratch(n int) *patchScratch {
 	scratch := patchScratchPool.Get().(*patchScratch)
-	if cap(scratch.seen) < n {
-		scratch.seen = make([]bool, n)
-	} else {
-		scratch.seen = scratch.seen[:n]
-	}
+	scratch.seen = slices.Grow(scratch.seen[:0], n)[:n]
 	return scratch
 }
 

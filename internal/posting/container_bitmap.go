@@ -134,9 +134,7 @@ func resetBitmapRange(bitmap []uint64, start int, end int) {
 		return
 	}
 	bitmap[firstword] &= ^(^uint64(0) << uint(start%64))
-	for i := firstword + 1; i < endword; i++ {
-		bitmap[i] = 0
-	}
+	clear(bitmap[firstword+1 : endword])
 	bitmap[endword] &= ^(^uint64(0) >> (uint(-end) % 64))
 }
 

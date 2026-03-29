@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math"
 	"reflect"
+	"slices"
 	"strings"
 	"unsafe"
 )
@@ -72,7 +73,7 @@ func (db *DB[K, V]) populateFields(t reflect.Type, idx []int) error {
 		}
 		if f.Anonymous {
 			if f.Type.Kind() == reflect.Struct {
-				newIdx := append(append([]int{}, idx...), i)
+				newIdx := append(slices.Clone(idx), i)
 				if err := db.populateFields(f.Type, newIdx); err != nil {
 					return err
 				}
@@ -199,7 +200,7 @@ func (db *DB[K, V]) populateFields(t reflect.Type, idx []int) error {
 			UseVI:   useVI,
 			KeyKind: inferFieldWriteKeyKind(kind, useVI),
 			DBName:  dbname,
-			Index:   append(append([]int{}, idx...), i),
+			Index:   append(slices.Clone(idx), i),
 		}
 	}
 	return nil
@@ -537,7 +538,7 @@ func (db *DB[K, V]) populatePatcher(t reflect.Type, idx []int) error {
 
 		if rf.Anonymous {
 			if rf.Type.Kind() == reflect.Struct {
-				nidx := append(append([]int{}, idx...), i)
+				nidx := append(slices.Clone(idx), i)
 				if err := db.populatePatcher(rf.Type, nidx); err != nil {
 					return err
 				}
@@ -549,7 +550,7 @@ func (db *DB[K, V]) populatePatcher(t reflect.Type, idx []int) error {
 			Name:   rf.Name,
 			DBName: rf.Name,
 			Kind:   rf.Type.Kind(),
-			Index:  append(append([]int{}, idx...), i),
+			Index:  append(slices.Clone(idx), i),
 		}
 
 		f.UseVI = rf.Type.Implements(viType)

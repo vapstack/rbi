@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"maps"
 	"runtime"
 	"slices"
 	"strconv"
@@ -420,7 +421,9 @@ func (e *plannerTraceEpoch) snapshot() plannerTraceSnapshot {
 		total:       e.total.report(),
 		classes:     make(map[string]plannerTraceScopeReport, len(e.classes)),
 		queries:     make(map[string]plannerTraceScopeReport, len(e.queries)),
-		top:         append([]plannerTraceSample(nil), e.top...),
+	}
+	if len(e.top) > 0 {
+		out.top = slices.Clone(e.top)
 	}
 	for name, stats := range e.classes {
 		out.classes[name] = stats.report()
@@ -480,7 +483,7 @@ func (s plannerTraceSnapshot) rootReport() *plannerTraceReport {
 		Total:       s.total,
 	}
 	if len(s.top) > 0 {
-		out.TopSamples = append([]plannerTraceSample(nil), s.top...)
+		out.TopSamples = slices.Clone(s.top)
 	}
 	return out
 }
@@ -585,11 +588,7 @@ func cloneStringCounts(src map[string]uint64) map[string]uint64 {
 	if len(src) == 0 {
 		return nil
 	}
-	out := make(map[string]uint64, len(src))
-	for k, v := range src {
-		out[k] = v
-	}
-	return out
+	return maps.Clone(src)
 }
 
 func plannerTraceQueryKey(className, query string) string {

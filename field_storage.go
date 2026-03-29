@@ -806,7 +806,7 @@ func (b *fieldIndexChunkBuilder) flushPendingPage() {
 	if b == nil || len(b.pendingRefs) == 0 {
 		return
 	}
-	refs := append([]fieldIndexChunkRef(nil), b.pendingRefs...)
+	refs := slices.Clone(b.pendingRefs)
 	b.pages = append(b.pages, newFieldIndexChunkDirPage(refs))
 	b.pendingRefs = b.pendingRefs[:0]
 }

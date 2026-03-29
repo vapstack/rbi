@@ -3,6 +3,7 @@ package rbi
 import (
 	"fmt"
 	"reflect"
+	"slices"
 	"unsafe"
 )
 
@@ -60,15 +61,6 @@ func ptrFieldValue[T any](ptr unsafe.Pointer, offset uintptr) *T {
 func sliceFieldValue[T any](ptr unsafe.Pointer, offset uintptr) []T {
 	hdr := *(*unsafeSliceHeader)(unsafe.Add(ptr, offset))
 	return unsafe.Slice((*T)(hdr.data), hdr.len)
-}
-
-func cloneSliceValue[T any](src []T) []T {
-	if src == nil {
-		return nil
-	}
-	dst := make([]T, len(src))
-	copy(dst, src)
-	return dst
 }
 
 func slicesEqualExact[T comparable](lhs, rhs []T) bool {
@@ -699,59 +691,59 @@ func buildPatchValueCopyFn(f *field, fieldType reflect.Type, offset uintptr) pat
 		switch fieldType {
 		case reflect.TypeFor[[]string]():
 			return func(root unsafe.Pointer) any {
-				return cloneSliceValue(sliceFieldValue[string](root, offset))
+				return slices.Clone(sliceFieldValue[string](root, offset))
 			}
 		case reflect.TypeFor[[]bool]():
 			return func(root unsafe.Pointer) any {
-				return cloneSliceValue(sliceFieldValue[bool](root, offset))
+				return slices.Clone(sliceFieldValue[bool](root, offset))
 			}
 		case reflect.TypeFor[[]int]():
 			return func(root unsafe.Pointer) any {
-				return cloneSliceValue(sliceFieldValue[int](root, offset))
+				return slices.Clone(sliceFieldValue[int](root, offset))
 			}
 		case reflect.TypeFor[[]int8]():
 			return func(root unsafe.Pointer) any {
-				return cloneSliceValue(sliceFieldValue[int8](root, offset))
+				return slices.Clone(sliceFieldValue[int8](root, offset))
 			}
 		case reflect.TypeFor[[]int16]():
 			return func(root unsafe.Pointer) any {
-				return cloneSliceValue(sliceFieldValue[int16](root, offset))
+				return slices.Clone(sliceFieldValue[int16](root, offset))
 			}
 		case reflect.TypeFor[[]int32]():
 			return func(root unsafe.Pointer) any {
-				return cloneSliceValue(sliceFieldValue[int32](root, offset))
+				return slices.Clone(sliceFieldValue[int32](root, offset))
 			}
 		case reflect.TypeFor[[]int64]():
 			return func(root unsafe.Pointer) any {
-				return cloneSliceValue(sliceFieldValue[int64](root, offset))
+				return slices.Clone(sliceFieldValue[int64](root, offset))
 			}
 		case reflect.TypeFor[[]uint]():
 			return func(root unsafe.Pointer) any {
-				return cloneSliceValue(sliceFieldValue[uint](root, offset))
+				return slices.Clone(sliceFieldValue[uint](root, offset))
 			}
 		case reflect.TypeFor[[]uint8]():
 			return func(root unsafe.Pointer) any {
-				return cloneSliceValue(sliceFieldValue[uint8](root, offset))
+				return slices.Clone(sliceFieldValue[uint8](root, offset))
 			}
 		case reflect.TypeFor[[]uint16]():
 			return func(root unsafe.Pointer) any {
-				return cloneSliceValue(sliceFieldValue[uint16](root, offset))
+				return slices.Clone(sliceFieldValue[uint16](root, offset))
 			}
 		case reflect.TypeFor[[]uint32]():
 			return func(root unsafe.Pointer) any {
-				return cloneSliceValue(sliceFieldValue[uint32](root, offset))
+				return slices.Clone(sliceFieldValue[uint32](root, offset))
 			}
 		case reflect.TypeFor[[]uint64]():
 			return func(root unsafe.Pointer) any {
-				return cloneSliceValue(sliceFieldValue[uint64](root, offset))
+				return slices.Clone(sliceFieldValue[uint64](root, offset))
 			}
 		case reflect.TypeFor[[]float32]():
 			return func(root unsafe.Pointer) any {
-				return cloneSliceValue(sliceFieldValue[float32](root, offset))
+				return slices.Clone(sliceFieldValue[float32](root, offset))
 			}
 		case reflect.TypeFor[[]float64]():
 			return func(root unsafe.Pointer) any {
-				return cloneSliceValue(sliceFieldValue[float64](root, offset))
+				return slices.Clone(sliceFieldValue[float64](root, offset))
 			}
 		default:
 			if typeHasMutableReferencePayload(fieldType.Elem()) {
