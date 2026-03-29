@@ -102,7 +102,7 @@ func (qv *queryView[K, V]) tryCountByScalarLookup(expr qx.Expr, trace *queryTrac
 	}
 
 	ov := qv.fieldOverlay(expr.Field)
-	if !ov.hasData() && !qv.hasFieldIndex(expr.Field) {
+	if !ov.hasData() && !qv.hasIndexedField(expr.Field) {
 		return 0, false, nil
 	}
 
@@ -1366,7 +1366,7 @@ func countBroadRangeComplementMaxCardinality(leadProbeEst, universe uint64) uint
 	if leadProbeEst == 0 || universe == 0 {
 		return limit
 	}
-	// Only widen beyond the legacy cap when the chosen lead is already narrow
+	// Only widen beyond the base cap when the chosen lead is already narrow
 	// relative to the full result universe; otherwise complement setup cost can
 	// dominate and broad AND-counts regress toward postingResult-first behavior.
 	if leadProbeEst > universe/4 {

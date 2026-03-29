@@ -449,29 +449,29 @@ func TestSnapshotExt_CollectSnapshotBatchDiff_ReorderedSliceValuesProduceNoDelta
 		Scores: []int{1, 3},
 	}
 
-	for _, field := range []string{"tags", "scores"} {
-		acc, ok := db.indexedFieldByName[field]
+	for _, f := range []string{"tags", "scores"} {
+		acc, ok := db.indexedFieldByName[f]
 		if !ok {
-			t.Fatalf("missing accessor for %q", field)
+			t.Fatalf("missing accessor for %q", f)
 		}
 
 		var state snapshotFieldBatchState
 		acc.collectSnapshotBatchDiff(1, unsafe.Pointer(oldVal), unsafe.Pointer(newVal), false, &state)
 
 		if state.changed {
-			t.Fatalf("%s: reorder-only diff unexpectedly marked field as changed", field)
+			t.Fatalf("%s: reorder-only diff unexpectedly marked field as changed", f)
 		}
 		if state.index != nil {
-			t.Fatalf("%s: reorder-only diff produced string deltas: %#v", field, state.index)
+			t.Fatalf("%s: reorder-only diff produced string deltas: %#v", f, state.index)
 		}
 		if state.fixed != nil {
-			t.Fatalf("%s: reorder-only diff produced fixed deltas: %#v", field, state.fixed)
+			t.Fatalf("%s: reorder-only diff produced fixed deltas: %#v", f, state.fixed)
 		}
 		if state.nils != nil {
-			t.Fatalf("%s: reorder-only diff produced nil deltas: %#v", field, state.nils)
+			t.Fatalf("%s: reorder-only diff produced nil deltas: %#v", f, state.nils)
 		}
 		if state.lengths != nil {
-			t.Fatalf("%s: reorder-only diff produced len deltas: %#v", field, state.lengths)
+			t.Fatalf("%s: reorder-only diff produced len deltas: %#v", f, state.lengths)
 		}
 	}
 }
@@ -1422,6 +1422,24 @@ func TestSnapshotExt_InheritMaterializedPredCacheSkipsMalformedKeysAndBadEntries
 	cached, ok := next.loadMaterializedPred("name\x1f1\x1fb")
 	if !ok || !cached.IsEmpty() {
 		t.Fatalf("expected valid negative cache entry to survive malformed-entry filtering")
+	}
+}
+
+func TestSnapshotExt_InheritMaterializedPredCacheAllowsTypedNilEntries(t *testing.T) {
+	prev := &indexSnapshot{matPredCacheMaxEntries: 8}
+	var nilEntry *materializedPredCacheEntry
+	prev.matPredCache.Store("name\x1f1\x1fa", nilEntry)
+	prev.matPredCacheCount.Store(1)
+
+	next := &indexSnapshot{matPredCacheMaxEntries: 8}
+	inheritMaterializedPredCache(next, prev, nil)
+
+	if got := next.matPredCacheCount.Load(); got != 1 {
+		t.Fatalf("expected typed-nil entry to be inherited as negative cache entry, got=%d", got)
+	}
+	cached, ok := next.loadMaterializedPred("name\x1f1\x1fa")
+	if !ok || !cached.IsEmpty() {
+		t.Fatalf("expected typed-nil entry to survive as empty negative cache entry")
 	}
 }
 

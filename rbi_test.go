@@ -32,6 +32,11 @@ type invalidUniqueSliceRec struct {
 	Tags []string `rbi:"unique"`
 }
 
+type schemaSubsetRec struct {
+	Name string `db:"name"`
+	Age  int    `db:"age"`
+}
+
 func openTempDBStringProduct(t *testing.T, options ...Options) (*DB[string, Product], string) {
 	t.Helper()
 	dir := t.TempDir()
@@ -335,6 +340,79 @@ func TestWrap_CorruptedPersistedIndex_RebuildsInsteadOfPanicking(t *testing.T) {
 	}
 	if got == nil || got.Name != "alice" || got.Age != 30 {
 		t.Fatalf("expected rebuilt record after corrupted persisted index, got %#v", got)
+	}
+}
+
+func TestWrap_PersistedIndexSchemaNarrowing_ReusesCompatibleIndexes(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "schema_mismatch.db")
+
+	const bucket = "schema_mismatch"
+
+	rawDB, err := bbolt.Open(path, 0o600, nil)
+	if err != nil {
+		t.Fatalf("bbolt.Open: %v", err)
+	}
+
+	db, err := New[uint64, Rec](rawDB, Options{
+		AnalyzeInterval: -1,
+		BucketName:      bucket,
+	})
+	if err != nil {
+		t.Fatalf("initial New: %v", err)
+	}
+	if err := db.Set(1, &Rec{Name: "alice", Age: 30, Email: "alice@example.test"}); err != nil {
+		t.Fatalf("seed Set: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("initial Close: %v", err)
+	}
+	if err := rawDB.Close(); err != nil {
+		t.Fatalf("initial raw Close: %v", err)
+	}
+
+	rawDB2, err := bbolt.Open(path, 0o600, nil)
+	if err != nil {
+		t.Fatalf("reopen bbolt.Open: %v", err)
+	}
+	defer func() { _ = rawDB2.Close() }()
+
+	var logBuf bytes.Buffer
+	prevLogWriter := log.Writer()
+	log.SetOutput(&logBuf)
+	defer log.SetOutput(prevLogWriter)
+
+	db2, err := New[uint64, schemaSubsetRec](rawDB2, Options{
+		AnalyzeInterval: -1,
+		BucketName:      bucket,
+	})
+	if err != nil {
+		t.Fatalf("reopen New: %v", err)
+	}
+	defer func() { _ = db2.Close() }()
+
+	gotLog := logBuf.String()
+	if strings.Contains(gotLog, "persisted index unavailable") {
+		t.Fatalf("expected compatible field indexes to be reused, got log: %q", gotLog)
+	}
+	if strings.Contains(gotLog, "rbi: rebuilding index from bbolt") {
+		t.Fatalf("expected schema narrowing to avoid full rebuild, got log: %q", gotLog)
+	}
+
+	got, err := db2.Get(1)
+	if err != nil {
+		t.Fatalf("Get(1): %v", err)
+	}
+	if got == nil || got.Name != "alice" || got.Age != 30 {
+		t.Fatalf("expected record after partial persisted load, got %#v", got)
+	}
+
+	ids, err := db2.QueryKeys(qx.Query(qx.EQ("age", 30)))
+	if err != nil {
+		t.Fatalf("QueryKeys(age=30): %v", err)
+	}
+	if !slices.Equal(ids, []uint64{1}) {
+		t.Fatalf("unexpected rebuilt query result: got=%v want=[1]", ids)
 	}
 }
 

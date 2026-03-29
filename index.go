@@ -316,9 +316,6 @@ func newBuildIndexFieldLocalState(numeric bool, slice bool) buildIndexFieldLocal
 }
 
 func (s *buildIndexFieldLocalState) addValue(key string, idx uint64) {
-	if s == nil {
-		return
-	}
 	if s.vals == nil {
 		s.vals = getPostingMap()
 	}
@@ -326,9 +323,6 @@ func (s *buildIndexFieldLocalState) addValue(key string, idx uint64) {
 }
 
 func (s *buildIndexFieldLocalState) addFixedValue(key uint64, idx uint64) {
-	if s == nil {
-		return
-	}
 	if s.fixed == nil {
 		s.fixed = make(map[uint64]posting.List, 8)
 	}
@@ -336,14 +330,11 @@ func (s *buildIndexFieldLocalState) addFixedValue(key uint64, idx uint64) {
 }
 
 func (s *buildIndexFieldLocalState) addNil(idx uint64) {
-	if s == nil {
-		return
-	}
 	s.nils = s.nils.BuildAdded(idx)
 }
 
 func (s *buildIndexFieldLocalState) addLen(length int, idx uint64) {
-	if s == nil || length < 0 {
+	if length < 0 {
 		return
 	}
 	if s.lenMap == nil {
@@ -354,9 +345,6 @@ func (s *buildIndexFieldLocalState) addLen(length int, idx uint64) {
 }
 
 func (s *buildIndexFieldLocalState) shouldFlushRegular() bool {
-	if s == nil {
-		return false
-	}
 	if s.numeric {
 		return len(s.fixed) >= buildIndexRunTargetEntries()
 	}
@@ -1007,7 +995,7 @@ func (db *DB[K, V]) buildIndex(skipFields map[string]struct{}) error {
 	db.stats.BuildRPS = int(float64(recordCount) / max(time.Since(start).Seconds(), 1))
 
 	for name, f := range db.fields {
-		if f != nil && f.Slice {
+		if f.Slice {
 			if _, ok := db.lenIndex[name]; !ok {
 				db.buildLenIndex()
 				break
@@ -1067,30 +1055,18 @@ type buildFieldWriteSink struct {
 }
 
 func (s buildFieldWriteSink) setNil() {
-	if s.state == nil {
-		return
-	}
 	s.state.addNil(s.idx)
 }
 
 func (s buildFieldWriteSink) setLen(length int) {
-	if s.state == nil {
-		return
-	}
 	s.state.addLen(length, s.idx)
 }
 
 func (s buildFieldWriteSink) addString(key string) {
-	if s.state == nil {
-		return
-	}
 	s.state.addValue(key, s.idx)
 }
 
 func (s buildFieldWriteSink) addFixed(key uint64) {
-	if s.state == nil {
-		return
-	}
 	s.state.addFixedValue(key, s.idx)
 }
 
@@ -1253,7 +1229,7 @@ func (db *DB[K, V]) loadIndexPayload(reader *bufio.Reader) (map[string]struct{},
 		return nil, nil, false, fmt.Errorf("decode: reading planner stats: %w", err)
 	}
 
-	skipFields := make(map[string]struct{})
+	skipFields := make(map[string]struct{}, len(db.fields))
 	for name := range db.fields {
 		_, hasRegular := indexes[name]
 		_, hasNil := nilIndexes[name]
@@ -1315,24 +1291,30 @@ func (db *DB[K, V]) readFieldCompatibility(reader *bufio.Reader) (map[string]boo
 	if err != nil {
 		return nil, fmt.Errorf("decode: reading fields len: %w", err)
 	}
-
-	compat := make(map[string]bool, max(0, min(int(count), len(db.fields))))
+	if count > uint64(^uint(0)>>1) {
+		return nil, fmt.Errorf("decode: stored field count overflows int: %v", count)
+	}
+	compatible := make(map[string]bool, max(0, min(int(count), len(db.fields))))
+	seen := make(map[string]struct{}, max(0, min(int(count), len(db.fields))))
 
 	for i := uint64(0); i < count; i++ {
 		name, stored, err := readField(reader)
 		if err != nil {
 			return nil, fmt.Errorf("decode: reading field: %w", err)
 		}
+		if _, exists := seen[name]; exists {
+			return nil, fmt.Errorf("decode: duplicate field %q", name)
+		}
+		seen[name] = struct{}{}
 		cur := db.fields[name]
-		if fieldsEqual(cur, stored) {
-			compat[name] = true
+		if sameFieldDefinition(cur, stored) {
+			compatible[name] = true
 		}
 	}
-
-	return compat, nil
+	return compatible, nil
 }
 
-func fieldsEqual(a, b *field) bool {
+func sameFieldDefinition(a, b *field) bool {
 	if a == nil || b == nil {
 		return false
 	}
@@ -1411,7 +1393,7 @@ func (db *DB[K, V]) storeIndexV24(writer *bufio.Writer, bucketSeq uint64) error 
 
 func (db *DB[K, V]) storeIndexPayload(writer *bufio.Writer) error {
 	snap := db.getSnapshot()
-	universe := snapshotUniverseView(snap)
+	universe := snap.universe.Borrow()
 
 	if err := universe.WriteTo(writer); err != nil {
 		return fmt.Errorf("encode: writing universe: %w", err)
@@ -1636,9 +1618,6 @@ func writeFields(writer *bufio.Writer, fields map[string]*field) error {
 func writeField(writer *bufio.Writer, name string, f *field) error {
 	if err := writeString(writer, name); err != nil {
 		return err
-	}
-	if f == nil {
-		f = new(field)
 	}
 	if err := writeBool(writer, f.Unique); err != nil {
 		return err
@@ -2116,12 +2095,12 @@ func writePlannerStatsSnapshot(writer *bufio.Writer, s *plannerStatsSnapshot) er
 	if err := writeUvarint(writer, uint64(len(fields))); err != nil {
 		return fmt.Errorf("encode: writing planner stats field count: %w", err)
 	}
-	for _, field := range fields {
-		if err := writeString(writer, field); err != nil {
+	for _, f := range fields {
+		if err := writeString(writer, f); err != nil {
 			return fmt.Errorf("encode: writing planner stats field name: %w", err)
 		}
-		if err := writePlannerFieldStats(writer, s.Fields[field]); err != nil {
-			return fmt.Errorf("encode: writing planner stats field %q: %w", field, err)
+		if err := writePlannerFieldStats(writer, s.Fields[f]); err != nil {
+			return fmt.Errorf("encode: writing planner stats field %q: %w", f, err)
 		}
 	}
 	return nil
@@ -2147,31 +2126,33 @@ func readPlannerStatsSnapshot(reader *bufio.Reader, compatible map[string]bool) 
 	if fieldCount > uint64(^uint(0)>>1) {
 		return nil, fmt.Errorf("decode: planner stats field count overflows int: %v", fieldCount)
 	}
+	if version == 0 && generatedAtNanos == 0 && universe == 0 && fieldCount == 0 {
+		return nil, nil
+	}
 
 	fields := make(map[string]PlannerFieldStats, min(int(fieldCount), len(compatible)))
 	for i := uint64(0); i < fieldCount; i++ {
-		field, err := readString(reader)
+		f, err := readString(reader)
 		if err != nil {
 			return nil, fmt.Errorf("decode: reading planner stats field name: %w", err)
 		}
 		stats, err := readPlannerFieldStats(reader)
 		if err != nil {
-			return nil, fmt.Errorf("decode: reading planner stats field %q: %w", field, err)
+			return nil, fmt.Errorf("decode: reading planner stats field %q: %w", f, err)
 		}
-		if compatible[field] {
-			if _, exists := fields[field]; exists {
-				return nil, fmt.Errorf("decode: duplicate planner stats field %q", field)
+		if compatible[f] {
+			if _, exists := fields[f]; exists {
+				return nil, fmt.Errorf("decode: duplicate planner stats field %q", f)
 			}
-			fields[field] = stats
+			fields[f] = stats
 		}
 	}
-
 	if version == 0 && generatedAtNanos == 0 && universe == 0 && len(fields) == 0 {
 		return nil, nil
 	}
-	for field := range compatible {
-		if _, ok := fields[field]; !ok {
-			return nil, fmt.Errorf("decode: missing planner stats field %q", field)
+	for f := range compatible {
+		if _, ok := fields[f]; !ok {
+			return nil, fmt.Errorf("decode: missing planner stats field %q", f)
 		}
 	}
 
@@ -2253,8 +2234,8 @@ func sortedMapFieldNames[T any](m map[string]T) []string {
 		return nil
 	}
 	out := make([]string, 0, len(m))
-	for field := range m {
-		out = append(out, field)
+	for f := range m {
+		out = append(out, f)
 	}
 	sort.Strings(out)
 	return out
@@ -2273,13 +2254,16 @@ func readIndexSections(
 	}
 
 	out := make(map[string]fieldIndexStorage, min(int(count), len(compatible)))
-
-LOOP:
+	seen := make(map[string]struct{}, min(int(count), len(compatible)))
 	for i := uint64(0); i < count; i++ {
 		f, err := readString(reader)
 		if err != nil {
 			return nil, fmt.Errorf("reading field name: %w", err)
 		}
+		if _, exists := seen[f]; exists {
+			return nil, fmt.Errorf("duplicate field %q", f)
+		}
+		seen[f] = struct{}{}
 
 		keep := compatible[f]
 		storage, err := readFieldIndexStorage(reader, keep)
@@ -2289,7 +2273,6 @@ LOOP:
 		if keep && storage.keyCount() > 0 {
 			out[f] = storage
 		}
-		continue LOOP
 	}
 
 	return out, nil
@@ -2346,7 +2329,6 @@ func readFieldIndexStorage(reader *bufio.Reader, keep bool) (fieldIndexStorage, 
 			}
 			return fieldIndexStorage{}, nil
 		}
-
 		builder := newFieldIndexChunkBuilder(0)
 		for i := uint64(0); i < pageCount; i++ {
 			refCount, err := binary.ReadUvarint(reader)
@@ -2572,8 +2554,8 @@ func sortedFieldNames(set map[string]struct{}) []string {
 		return nil
 	}
 	out := make([]string, 0, len(set))
-	for field := range set {
-		out = append(out, field)
+	for f := range set {
+		out = append(out, f)
 	}
 	sort.Strings(out)
 	return out
@@ -2656,13 +2638,6 @@ func skipString(reader *bufio.Reader) error {
 		return err
 	}
 	return nil
-}
-
-func snapshotUniverseView(snap *indexSnapshot) posting.List {
-	if snap == nil {
-		return posting.List{}
-	}
-	return snap.universe.Borrow()
 }
 
 // fieldOverlay provides read helpers over one immutable sorted index slice.
@@ -3026,11 +3001,9 @@ func (c *overlayKeyCursor) next() (indexKey, posting.List, bool) {
 		if c.pos < c.end {
 			return indexKey{}, posting.List{}, false
 		}
-		if c.chunked == nil {
-			ent := c.base[c.pos]
-			c.pos--
-			return ent.Key, ent.IDs, true
-		}
+		ent := c.base[c.pos]
+		c.pos--
+		return ent.Key, ent.IDs, true
 	}
 	if c.chunked != nil {
 		if c.remaining <= 0 || c.chunk == nil {
@@ -3061,10 +3034,7 @@ func (c *overlayKeyCursor) next() (indexKey, posting.List, bool) {
 	if c.pos >= c.end {
 		return indexKey{}, posting.List{}, false
 	}
-	if c.chunked == nil {
-		ent := c.base[c.pos]
-		c.pos++
-		return ent.Key, ent.IDs, true
-	}
-	return indexKey{}, posting.List{}, false
+	ent := c.base[c.pos]
+	c.pos++
+	return ent.Key, ent.IDs, true
 }

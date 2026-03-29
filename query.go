@@ -271,7 +271,7 @@ func (qv *queryView[K, V]) execQuery(q *qx.QX, emitTrace bool, prepared bool) (o
 
 		case qx.OrderByArrayPos:
 			ov := qv.fieldOverlay(order.Field)
-			if !ov.hasData() && !qv.hasFieldIndex(order.Field) {
+			if !ov.hasData() && !qv.hasIndexedField(order.Field) {
 				return nil, fmt.Errorf("cannot sort non-indexed field: %v", order.Field)
 			}
 			return qv.queryOrderArrayPosOverlay(result, ov, order, skip, need, needAll)
@@ -279,7 +279,7 @@ func (qv *queryView[K, V]) execQuery(q *qx.QX, emitTrace bool, prepared bool) (o
 		case qx.OrderByArrayCount:
 			lenOV := qv.lenFieldOverlay(order.Field)
 			useZeroComplement := qv.isLenZeroComplementField(order.Field)
-			if !lenOV.hasData() && !qv.hasLenFieldIndex(order.Field) {
+			if !lenOV.hasData() && !qv.hasIndexedLenField(order.Field) {
 				return nil, fmt.Errorf("cannot sort non-indexed field: %v", order.Field)
 			}
 			slice := qv.snapshotLenFieldIndexSlice(order.Field)
@@ -290,7 +290,7 @@ func (qv *queryView[K, V]) execQuery(q *qx.QX, emitTrace bool, prepared bool) (o
 		}
 
 		ov := qv.fieldOverlay(order.Field)
-		if !ov.hasData() && !qv.hasFieldIndex(order.Field) {
+		if !ov.hasData() && !qv.hasIndexedField(order.Field) {
 			return nil, fmt.Errorf("cannot sort non-indexed field: %v", order.Field)
 		}
 		return qv.queryOrderBasic(result, ov, order, skip, need, needAll)

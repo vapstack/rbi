@@ -400,7 +400,7 @@ func (qv *queryView[K, V]) tryQueryOrderBasicWithLimit(q *qx.QX, trace *queryTra
 	nilTailField := orderNilTailField(fm, f, rb)
 	ov := qv.fieldOverlay(f)
 	if !ov.hasData() && nilTailField == "" {
-		if !qv.hasFieldIndex(f) {
+		if !qv.hasIndexedField(f) {
 			return nil, false, nil
 		}
 		return nil, true, nil
@@ -1214,7 +1214,7 @@ func (qv *queryView[K, V]) tryQueryPrefixNoOrderWithLimit(q *qx.QX, trace *query
 
 	ov := qv.fieldOverlay(e.Field)
 	if !ov.hasData() {
-		if !qv.hasFieldIndex(e.Field) {
+		if !qv.hasIndexedField(e.Field) {
 			return nil, true, fmt.Errorf("no index for field: %v", e.Field)
 		}
 		return nil, true, nil

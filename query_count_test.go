@@ -1442,7 +1442,7 @@ func TestCount_PreparePredicate_UsesProbeBoundedBroadRangeComplement(t *testing.
 					t.Fatalf("expected complement postingResult")
 				}
 				if got := p.ids.Cardinality(); got <= countPredBroadRangeComplementMaxCard {
-					t.Fatalf("expected complement wider than legacy cap, got=%d", got)
+					t.Fatalf("expected complement wider than base cap, got=%d", got)
 				}
 				key, isSlice, isNil, err := db.exprValueToIdxScalar(expr)
 				if err != nil || isSlice || isNil {
@@ -1755,7 +1755,7 @@ func TestCount_PreparePredicate_KeepsLegacyCapForComparableBroadLead(t *testing.
 		t.Fatalf("prepareCountPredicate: %v", err)
 	}
 	if p.kind != predicateKindCustom {
-		t.Fatalf("expected comparable lead to keep legacy complement cap, got kind=%v", p.kind)
+		t.Fatalf("expected comparable lead to keep base complement cap, got kind=%v", p.kind)
 	}
 }
 

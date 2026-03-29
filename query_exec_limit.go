@@ -440,7 +440,7 @@ func (qv *queryView[K, V]) tryLimitQueryOrderBasic(q *qx.QX, leaves []qx.Expr, t
 	nilTailField := orderNilTailField(fm, f, bounds)
 	ov := qv.fieldOverlay(f)
 	if !ov.hasData() && nilTailField == "" {
-		if !qv.hasFieldIndex(f) {
+		if !qv.hasIndexedField(f) {
 			return nil, false, nil
 		}
 		return nil, true, nil
@@ -473,7 +473,7 @@ func (qv *queryView[K, V]) tryLimitQueryRangeNoOrderByField(q *qx.QX, field stri
 	}
 	ov := qv.fieldOverlay(field)
 	if !ov.hasData() {
-		if !qv.hasFieldIndex(field) {
+		if !qv.hasIndexedField(field) {
 			return nil, false, nil
 		}
 		return nil, true, nil
@@ -840,7 +840,7 @@ func (qv *queryView[K, V]) buildLeafPred(e qx.Expr) (leafPred, bool, error) {
 	}
 
 	ov := qv.fieldOverlay(e.Field)
-	if !ov.hasData() && !qv.hasFieldIndex(e.Field) {
+	if !ov.hasData() && !qv.hasIndexedField(e.Field) {
 		return leafPred{}, false, nil
 	}
 

@@ -392,8 +392,8 @@ func (db *DB[K, V]) publishLoadedPlannerStats(s *plannerStatsSnapshot) {
 	if out.GeneratedAt.IsZero() {
 		out.GeneratedAt = time.Now()
 	}
-	for _, field := range db.sortedPlannerFieldNames() {
-		out.Fields[field] = s.Fields[field]
+	for _, f := range db.sortedPlannerFieldNames() {
+		out.Fields[f] = s.Fields[f]
 	}
 	db.planner.statsVersion.Store(out.Version)
 	db.planner.stats.Store(out)

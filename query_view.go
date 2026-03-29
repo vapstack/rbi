@@ -48,12 +48,12 @@ func (qv *queryView[K, V]) lenFieldOverlay(field string) fieldOverlay {
 	return newFieldOverlayStorage(qv.snap.lenIndex[field])
 }
 
-func (qv *queryView[K, V]) hasFieldIndex(field string) bool {
+func (qv *queryView[K, V]) hasIndexedField(field string) bool {
 	_, ok := qv.fields[field]
 	return ok
 }
 
-func (qv *queryView[K, V]) hasLenFieldIndex(field string) bool {
+func (qv *queryView[K, V]) hasIndexedLenField(field string) bool {
 	f := qv.fields[field]
 	return f != nil && f.Slice
 }

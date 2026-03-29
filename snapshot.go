@@ -115,9 +115,9 @@ func (s *indexSnapshot) evictMaterializedPred(mode materializedPredCacheEvictMod
 	}
 	for {
 		var evictKey any
-		var evictStamp uint64 = ^uint64(0)
 		var fallbackKey any
-		var fallbackStamp uint64 = ^uint64(0)
+		evictStamp := ^uint64(0)
+		fallbackStamp := ^uint64(0)
 		s.matPredCache.Range(func(k, v any) bool {
 			entry, _ := v.(*materializedPredCacheEntry)
 			stamp := uint64(0)
@@ -266,12 +266,12 @@ func inheritMaterializedPredCache(next, prev *indexSnapshot, changedFields map[s
 		if !ok || key == "" {
 			return true
 		}
-		field := materializedPredCacheFieldName(key)
-		if field == "" {
+		f := materializedPredCacheFieldName(key)
+		if f == "" {
 			return true
 		}
 		if changedFields != nil {
-			if _, touched := changedFields[field]; touched {
+			if _, touched := changedFields[f]; touched {
 				return true
 			}
 		}
@@ -279,10 +279,17 @@ func inheritMaterializedPredCache(next, prev *indexSnapshot, changedFields map[s
 		if !ok {
 			return true
 		}
-		oversizedEntry := entry != nil && !entry.ids.IsEmpty() && next.matPredCacheMaxCard > 0 &&
-			entry.ids.Cardinality() > next.matPredCacheMaxCard
+		var (
+			cachedIDs      posting.List
+			oversizedEntry bool
+		)
+		if entry != nil {
+			cachedIDs = entry.ids
+			oversizedEntry = !entry.ids.IsEmpty() && next.matPredCacheMaxCard > 0 &&
+				entry.ids.Cardinality() > next.matPredCacheMaxCard
+		}
 		copied := &materializedPredCacheEntry{
-			ids:       entry.ids,
+			ids:       cachedIDs,
 			oversized: oversizedEntry,
 		}
 		if entry != nil {
@@ -625,8 +632,8 @@ func (s *indexSnapshot) indexedFieldNameSet() map[string]struct{} {
 		return nil
 	}
 	fields := s.fieldNameSet()
-	for field := range s.nilFieldNameSet() {
-		fields[field] = struct{}{}
+	for f := range s.nilFieldNameSet() {
+		fields[f] = struct{}{}
 	}
 	return fields
 }
@@ -939,9 +946,8 @@ func (db *DB[K, V]) buildPreparedSnapshotFromEmptyBaseNoLock(seq uint64, prev *i
 
 	nextIndex := make(map[string]fieldIndexStorage, len(db.indexedFieldAccess))
 	for i, acc := range db.indexedFieldAccess {
-		field := acc.name
 		if storage := acc.materializeSnapshotOverlayStorageOwned(&fieldStates[i]); storage.keyCount() > 0 {
-			nextIndex[field] = storage
+			nextIndex[acc.name] = storage
 		}
 	}
 
@@ -1122,19 +1128,19 @@ func (db *DB[K, V]) buildPreparedSnapshotInsertOnlyNoLock(seq uint64, prev *inde
 
 	changedCount := 0
 	for i, acc := range db.indexedFieldAccess {
-		field := acc.name
-		if storage := acc.mergeSnapshotInsertStorageOwned(next.index[field], &fieldStates[i], true); storage.keyCount() > 0 {
-			next.index[field] = storage
+		f := acc.name
+		if storage := acc.mergeSnapshotInsertStorageOwned(next.index[f], &fieldStates[i], true); storage.keyCount() > 0 {
+			next.index[f] = storage
 		} else {
-			delete(next.index, field)
+			delete(next.index, f)
 		}
-		if storage := acc.mergeSnapshotInsertNilStorageOwned(next.nilIndex[field], &fieldStates[i]); storage.keyCount() > 0 {
-			next.nilIndex[field] = storage
+		if storage := acc.mergeSnapshotInsertNilStorageOwned(next.nilIndex[f], &fieldStates[i]); storage.keyCount() > 0 {
+			next.nilIndex[f] = storage
 		} else {
-			delete(next.nilIndex, field)
+			delete(next.nilIndex, f)
 		}
 		if fieldStates[i].lengths != nil {
-			next.lenIndex[field] = applyLenFieldPostingDiffStorageOwned(next.lenIndex[field], fieldStates[i].lengths)
+			next.lenIndex[f] = applyLenFieldPostingDiffStorageOwned(next.lenIndex[f], fieldStates[i].lengths)
 			fieldStates[i].lengths = nil
 		}
 		if fieldStates[i].changed {

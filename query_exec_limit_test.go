@@ -351,7 +351,7 @@ func TestQuery_NoOrder_UnboundedLimit_RespectsOffset(t *testing.T) {
 	}
 }
 
-func legacyEmitAcceptedPostingNoOrder[K ~uint64 | ~string, V any](cursor *queryCursor[K, V], ids posting.List, examined *uint64) bool {
+func baselineEmitAcceptedPostingNoOrder[K ~uint64 | ~string, V any](cursor *queryCursor[K, V], ids posting.List, examined *uint64) bool {
 	if ids.IsEmpty() {
 		return false
 	}
@@ -367,7 +367,7 @@ func legacyEmitAcceptedPostingNoOrder[K ~uint64 | ~string, V any](cursor *queryC
 	return stop
 }
 
-func (qv *queryView[K, V]) legacyTryQueryRangeNoOrderWithLimit(q *qx.QX) ([]K, bool, error) {
+func (qv *queryView[K, V]) baselineTryQueryRangeNoOrderWithLimit(q *qx.QX) ([]K, bool, error) {
 	if len(q.Order) > 0 || q.Limit == 0 {
 		return nil, false, nil
 	}
@@ -456,14 +456,14 @@ func (qv *queryView[K, V]) legacyTryQueryRangeNoOrderWithLimit(q *qx.QX) ([]K, b
 		if ids.IsEmpty() {
 			continue
 		}
-		if legacyEmitAcceptedPostingNoOrder(&cursor, ids, &examined) {
+		if baselineEmitAcceptedPostingNoOrder(&cursor, ids, &examined) {
 			return cursor.out, true, nil
 		}
 	}
 	return cursor.out, true, nil
 }
 
-func (qv *queryView[K, V]) legacyTryQueryPrefixNoOrderWithLimit(q *qx.QX) ([]K, bool, error) {
+func (qv *queryView[K, V]) baselineTryQueryPrefixNoOrderWithLimit(q *qx.QX) ([]K, bool, error) {
 	if len(q.Order) > 0 || q.Limit == 0 {
 		return nil, false, nil
 	}
@@ -497,7 +497,7 @@ func (qv *queryView[K, V]) legacyTryQueryPrefixNoOrderWithLimit(q *qx.QX) ([]K, 
 
 	ov := qv.fieldOverlay(e.Field)
 	if !ov.hasData() {
-		if !qv.hasFieldIndex(e.Field) {
+		if !qv.hasIndexedField(e.Field) {
 			return nil, true, fmt.Errorf("no index for field: %v", e.Field)
 		}
 		return nil, true, nil
@@ -525,14 +525,14 @@ func (qv *queryView[K, V]) legacyTryQueryPrefixNoOrderWithLimit(q *qx.QX) ([]K, 
 		if ids.IsEmpty() {
 			continue
 		}
-		if legacyEmitAcceptedPostingNoOrder(&cursor, ids, &examined) {
+		if baselineEmitAcceptedPostingNoOrder(&cursor, ids, &examined) {
 			return cursor.out, true, nil
 		}
 	}
 	return cursor.out, true, nil
 }
 
-func legacyScanLimitByOverlayBounds[K ~uint64 | ~string, V any](db *queryView[K, V], q *qx.QX, ov fieldOverlay, br overlayRange, desc bool, preds []leafPred, nilTailField string) []K {
+func baselineScanLimitByOverlayBounds[K ~uint64 | ~string, V any](db *queryView[K, V], q *qx.QX, ov fieldOverlay, br overlayRange, desc bool, preds []leafPred, nilTailField string) []K {
 	limit := int(q.Limit)
 	out := make([]K, 0, limit)
 	cursor := db.newQueryCursor(out, 0, q.Limit, false, nil)
@@ -612,12 +612,12 @@ func TestQuery_RangeNoOrderWithLimit_DeepOffset_MatchesExpected(t *testing.T) {
 		t.Fatalf("expected range no-order fast path to be used")
 	}
 
-	want, used, err := db.currentQueryViewForTests().legacyTryQueryRangeNoOrderWithLimit(q)
+	want, used, err := db.currentQueryViewForTests().baselineTryQueryRangeNoOrderWithLimit(q)
 	if err != nil {
-		t.Fatalf("legacyTryQueryRangeNoOrderWithLimit: %v", err)
+		t.Fatalf("baselineTryQueryRangeNoOrderWithLimit: %v", err)
 	}
 	if !used {
-		t.Fatalf("expected legacy range no-order fast path to be used")
+		t.Fatalf("expected baseline range no-order fast path to be used")
 	}
 	assertSameSlice(t, got, want)
 }
@@ -648,12 +648,12 @@ func TestQuery_PrefixNoOrderWithLimit_DeepOffset_MatchesExpected(t *testing.T) {
 		t.Fatalf("expected prefix no-order fast path to be used")
 	}
 
-	want, used, err := db.currentQueryViewForTests().legacyTryQueryPrefixNoOrderWithLimit(q)
+	want, used, err := db.currentQueryViewForTests().baselineTryQueryPrefixNoOrderWithLimit(q)
 	if err != nil {
-		t.Fatalf("legacyTryQueryPrefixNoOrderWithLimit: %v", err)
+		t.Fatalf("baselineTryQueryPrefixNoOrderWithLimit: %v", err)
 	}
 	if !used {
-		t.Fatalf("expected legacy prefix no-order fast path to be used")
+		t.Fatalf("expected baseline prefix no-order fast path to be used")
 	}
 	assertSameSlice(t, got, want)
 }
@@ -689,12 +689,12 @@ func TestQuery_RangeNoOrderWithLimit_NilEQDeepOffset_MatchesExpected(t *testing.
 		t.Fatalf("expected nil-equality range fast path to be used")
 	}
 
-	want, used, err := db.currentQueryViewForTests().legacyTryQueryRangeNoOrderWithLimit(q)
+	want, used, err := db.currentQueryViewForTests().baselineTryQueryRangeNoOrderWithLimit(q)
 	if err != nil {
-		t.Fatalf("legacyTryQueryRangeNoOrderWithLimit(nil EQ): %v", err)
+		t.Fatalf("baselineTryQueryRangeNoOrderWithLimit(nil EQ): %v", err)
 	}
 	if !used {
-		t.Fatalf("expected legacy nil-equality range fast path to be used")
+		t.Fatalf("expected baseline nil-equality range fast path to be used")
 	}
 	assertSameSlice(t, got, want)
 }
@@ -758,7 +758,7 @@ func TestQuery_LimitRangeNoOrder_ResidualsUseBucketExactFilter(t *testing.T) {
 	defer releaseLeafPreds(preds)
 
 	br := view.fieldOverlay(f).rangeForBounds(bounds)
-	want := legacyScanLimitByOverlayBounds(view, q, view.fieldOverlay(f), br, false, preds, "")
+	want := baselineScanLimitByOverlayBounds(view, q, view.fieldOverlay(f), br, false, preds, "")
 
 	tr := db.beginTrace(q)
 	if tr == nil {
@@ -848,7 +848,7 @@ func TestQuery_LimitOrderBasic_ResidualsUseBucketExactFilter(t *testing.T) {
 
 	ov := view.fieldOverlay("age")
 	br := ov.rangeForBounds(bounds)
-	want := legacyScanLimitByOverlayBounds(view, q, ov, br, false, preds, "")
+	want := baselineScanLimitByOverlayBounds(view, q, ov, br, false, preds, "")
 
 	tr := db.beginTrace(q)
 	if tr == nil {

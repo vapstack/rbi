@@ -281,7 +281,7 @@ func (qv *queryView[K, V]) evalAndOperandsExcept(ops []qx.Expr, skip int) (posti
 // immutable snapshot indexes.
 func (qv *queryView[K, V]) evalSimple(e qx.Expr) (postingResult, error) {
 	ov := qv.fieldOverlay(e.Field)
-	if !ov.hasData() && !qv.hasFieldIndex(e.Field) {
+	if !ov.hasData() && !qv.hasIndexedField(e.Field) {
 		return postingResult{}, fmt.Errorf("no index for field: %v", e.Field)
 	}
 
