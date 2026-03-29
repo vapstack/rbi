@@ -910,3 +910,899 @@ func TestQueryExt_ConcurrentWriter_RootExecPreparedQuery_ReturnsHybridResults(t 
 		t.Fatalf("root execPreparedQuery returned hybrid result under concurrent writes: got=%v wantA=%v wantB=%v", got, wantA, wantB)
 	}
 }
+
+func assertQueryExtraPublicReadPathsMatchExpected(t *testing.T, db *DB[uint64, Rec], q *qx.QX) {
+	t.Helper()
+
+	assertQueryExtIDsMatchExpected(t, db, q)
+	assertQueryExtItemsMatchExpected(t, db, q)
+	assertQueryExtCountMatchesBaseQuery(t, db, q)
+}
+
+func runQueryKeysStringChecked(t *testing.T, db *DB[string, Rec], q *qx.QX) []string {
+	t.Helper()
+
+	ids, err := db.QueryKeys(q)
+	if err != nil {
+		t.Fatalf("QueryKeys(%+v): %v", q, err)
+	}
+	return ids
+}
+
+func assertQueryExtraStringPublicReadPathsMatchExpected(t *testing.T, db *DB[string, Rec], q *qx.QX) {
+	t.Helper()
+
+	got := runQueryKeysStringChecked(t, db, q)
+	want, err := expectedKeysString(t, db, q)
+	if err != nil {
+		t.Fatalf("expectedKeysString(%+v): %v", q, err)
+	}
+	if !queryStringIDsEqual(q, got, want) {
+		t.Fatalf("QueryKeys mismatch: got=%v want=%v q=%+v", got, want, q)
+	}
+
+	wantItems, err := db.BatchGet(want...)
+	if err != nil {
+		t.Fatalf("BatchGet(want): %v", err)
+	}
+	gotItems, err := db.Query(q)
+	if err != nil {
+		t.Fatalf("Query(%+v): %v", q, err)
+	}
+	if len(gotItems) != len(wantItems) {
+		t.Fatalf("Query len mismatch: got=%d want=%d q=%+v", len(gotItems), len(wantItems), q)
+	}
+	for i := range wantItems {
+		if gotItems[i] == nil || wantItems[i] == nil || !reflect.DeepEqual(*gotItems[i], *wantItems[i]) {
+			t.Fatalf("Query item mismatch at i=%d: got=%#v want=%#v q=%+v", i, gotItems[i], wantItems[i], q)
+		}
+	}
+
+	base := cloneQuery(q)
+	base.Order = nil
+	base.Offset = 0
+	base.Limit = 0
+	wantCount, err := db.Count(base)
+	if err != nil {
+		t.Fatalf("Count(base %+v): %v", base, err)
+	}
+	gotCount, err := db.Count(q)
+	if err != nil {
+		t.Fatalf("Count(%+v): %v", q, err)
+	}
+	if gotCount != wantCount {
+		t.Fatalf("Count mismatch: got=%d want=%d q=%+v", gotCount, wantCount, q)
+	}
+}
+
+func TestQueryExt_OrderBasicPointerBounds_DoNotLeakNilTail(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
+
+	rows := map[uint64]*Rec{
+		1: {Name: "nil-a", Opt: nil, Active: true},
+		2: {Name: "empty", Opt: strPtr(""), Active: true},
+		3: {Name: "aa-a", Opt: strPtr("aa"), Active: true},
+		4: {Name: "ab-a", Opt: strPtr("ab"), Active: true},
+		5: {Name: "ac-off", Opt: strPtr("ac"), Active: false},
+		6: {Name: "ba-a", Opt: strPtr("ba"), Active: true},
+		7: {Name: "nil-b", Opt: nil, Active: true},
+		8: {Name: "aa-off", Opt: strPtr("aa"), Active: false},
+	}
+	for id, rec := range rows {
+		if err := db.Set(id, rec); err != nil {
+			t.Fatalf("Set(%d): %v", id, err)
+		}
+	}
+
+	tests := []struct {
+		name string
+		q    *qx.QX
+	}{
+		{
+			name: "gt_asc",
+			q:    qx.Query(qx.GT("opt", "aa")).By("opt", qx.ASC).Max(8),
+		},
+		{
+			name: "lte_active_desc",
+			q:    qx.Query(qx.LTE("opt", "aa"), qx.EQ("active", true)).By("opt", qx.DESC).Max(8),
+		},
+		{
+			name: "gte_window",
+			q:    qx.Query(qx.GTE("opt", "ab")).By("opt", qx.ASC).Skip(1).Max(2),
+		},
+	}
+
+	check := func(step string) {
+		for _, tc := range tests {
+			t.Run(step+"_"+tc.name, func(t *testing.T) {
+				assertQueryExtraPublicReadPathsMatchExpected(t, db, tc.q)
+			})
+		}
+	}
+
+	check("initial")
+
+	if err := db.Patch(1, []Field{{Name: "opt", Value: "ad"}}); err != nil {
+		t.Fatalf("Patch(1 opt=ad): %v", err)
+	}
+	if err := db.Patch(4, []Field{{Name: "opt", Value: (*string)(nil)}}); err != nil {
+		t.Fatalf("Patch(4 opt=nil): %v", err)
+	}
+	if err := db.Patch(7, []Field{{Name: "opt", Value: "aa"}}); err != nil {
+		t.Fatalf("Patch(7 opt=aa): %v", err)
+	}
+
+	check("after_patch")
+}
+
+func TestQueryExt_PrefixRangeIntersections_StayExactAcrossBoundaryChurn(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
+
+	rows := map[uint64]*Rec{
+		1: {Name: "aa", Active: true},
+		2: {Name: "aa/", Active: true},
+		3: {Name: "aa/0", Active: true},
+		4: {Name: "aa/00", Active: true},
+		5: {Name: "aa/9", Active: true},
+		6: {Name: "aa0", Active: true},
+		7: {Name: "aa1", Active: true},
+		8: {Name: "ab", Active: true},
+		9: {Name: "b", Active: true},
+	}
+	for id, rec := range rows {
+		if err := db.Set(id, rec); err != nil {
+			t.Fatalf("Set(%d): %v", id, err)
+		}
+	}
+
+	tests := []struct {
+		name string
+		q    *qx.QX
+	}{
+		{
+			name: "bounded_prefix_window",
+			q: qx.Query(
+				qx.PREFIX("name", "aa/"),
+				qx.GTE("name", "aa/0"),
+				qx.LT("name", "aa0"),
+			).By("name", qx.ASC).Max(10),
+		},
+		{
+			name: "prefix_singleton_upper_edge",
+			q: qx.Query(
+				qx.PREFIX("name", "aa/"),
+				qx.LTE("name", "aa/"),
+			).By("name", qx.ASC).Max(10),
+		},
+		{
+			name: "prefix_empty_after_crossing_upper",
+			q: qx.Query(
+				qx.PREFIX("name", "aa/"),
+				qx.GTE("name", "aa0"),
+			).By("name", qx.ASC).Max(10),
+		},
+		{
+			name: "bounded_prefix_desc_window",
+			q: qx.Query(
+				qx.PREFIX("name", "aa/"),
+				qx.GT("name", "aa/"),
+				qx.LTE("name", "aa/zz"),
+			).By("name", qx.DESC).Skip(1).Max(3),
+		},
+	}
+
+	check := func(step string) {
+		for _, tc := range tests {
+			t.Run(step+"_"+tc.name, func(t *testing.T) {
+				assertQueryExtraPublicReadPathsMatchExpected(t, db, tc.q)
+			})
+		}
+	}
+
+	check("initial")
+
+	if err := db.Patch(6, []Field{{Name: "name", Value: "aa/zz"}}); err != nil {
+		t.Fatalf("Patch(6 name=aa/zz): %v", err)
+	}
+	if err := db.Delete(3); err != nil {
+		t.Fatalf("Delete(3): %v", err)
+	}
+	if err := db.Set(10, &Rec{Name: "aa/5", Active: true}); err != nil {
+		t.Fatalf("Set(10): %v", err)
+	}
+
+	check("after_patch")
+}
+
+func TestQueryExt_MixedCaching_NumericRangesRemainExactAcrossClearAndPublish(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{
+		AnalyzeInterval:                         -1,
+		SnapshotMaterializedPredCacheMaxEntries: 8,
+	})
+
+	seedGeneratedUint64Data(t, db, 20_000, func(i int) *Rec {
+		countries := []string{"US", "DE", "FR", "NL"}
+		return &Rec{
+			Name:   fmt.Sprintf("user-%05d", i),
+			Age:    i,
+			Score:  float64(i),
+			Active: i%2 == 0,
+			Meta: Meta{
+				Country: countries[i%len(countries)],
+			},
+		}
+	})
+	if err := db.RebuildIndex(); err != nil {
+		t.Fatalf("RebuildIndex: %v", err)
+	}
+
+	setNumericBucketKnobs(t, db, 128, 1, 1)
+
+	queries := []*qx.QX{
+		qx.Query(
+			qx.LT("score", 15_000.0),
+			qx.EQ("active", true),
+		).By("age", qx.ASC).Skip(3_500).Max(80),
+		qx.Query(
+			qx.LT("score", 15_001.0),
+			qx.EQ("active", true),
+		).By("age", qx.ASC).Skip(3_500).Max(80),
+		qx.Query(
+			qx.GTE("score", 6_000.0),
+			qx.LT("score", 17_000.0),
+			qx.EQ("country", "US"),
+		).By("age", qx.DESC).Skip(900).Max(60),
+	}
+
+	checkQueries := func(step string) {
+		for i, q := range queries {
+			t.Run(fmt.Sprintf("%s_q%d", step, i), func(t *testing.T) {
+				assertQueryExtraPublicReadPathsMatchExpected(t, db, q)
+			})
+		}
+	}
+
+	checkQueries("warm")
+	if got := db.getSnapshot().matPredCacheCount.Load(); got == 0 {
+		t.Fatalf("expected shared runtime caches to warm up")
+	}
+
+	for i := 1; i <= 12; i++ {
+		if err := db.Patch(uint64(i), []Field{{Name: "name", Value: fmt.Sprintf("mut-%d", i)}}); err != nil {
+			t.Fatalf("Patch(%d name): %v", i, err)
+		}
+	}
+	checkQueries("after_unrelated_publish")
+
+	db.clearCurrentSnapshotCachesForTesting()
+	snap := db.getSnapshot()
+	if got := snap.matPredCacheCount.Load(); got != 0 {
+		t.Fatalf("expected cleared materialized predicate cache, got=%d", got)
+	}
+
+	checkQueries("after_clear")
+	if got := db.getSnapshot().matPredCacheCount.Load(); got == 0 {
+		t.Fatalf("expected caches to repopulate after cold queries")
+	}
+}
+
+func TestQueryExt_ConcurrentEvictingMaterializedPredicates_RemainStable(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{
+		AnalyzeInterval:                         -1,
+		SnapshotMaterializedPredCacheMaxEntries: 1,
+	})
+
+	setNumericBucketKnobs(t, db, 128, 1, 1)
+	seedGeneratedUint64Data(t, db, 5_000, func(i int) *Rec {
+		return &Rec{
+			Name:  fmt.Sprintf("u_%05d", i),
+			Age:   i,
+			Score: float64(i),
+		}
+	})
+	if err := db.RebuildIndex(); err != nil {
+		t.Fatalf("RebuildIndex: %v", err)
+	}
+
+	type expectation struct {
+		q     *qx.QX
+		ids   []uint64
+		items []*Rec
+		count uint64
+	}
+
+	queries := []*qx.QX{
+		qx.Query(qx.LT("score", 4_000.0)).By("age", qx.ASC).Skip(2_000).Max(40),
+		qx.Query(qx.LT("score", 4_001.0)).By("age", qx.ASC).Skip(2_000).Max(40),
+		qx.Query(qx.LT("score", 3_999.0)).By("age", qx.ASC).Skip(2_000).Max(40),
+	}
+	expects := make([]expectation, len(queries))
+	for i, q := range queries {
+		ids, err := expectedKeysUint64(t, db, q)
+		if err != nil {
+			t.Fatalf("expectedKeysUint64(q%d): %v", i, err)
+		}
+		items, err := db.BatchGet(ids...)
+		if err != nil {
+			t.Fatalf("BatchGet(q%d): %v", i, err)
+		}
+		countQ := cloneQuery(q)
+		countQ.Order = nil
+		countQ.Offset = 0
+		countQ.Limit = 0
+		count, err := db.Count(countQ)
+		if err != nil {
+			t.Fatalf("Count(q%d base): %v", i, err)
+		}
+		expects[i] = expectation{
+			q:     q,
+			ids:   ids,
+			items: items,
+			count: count,
+		}
+	}
+
+	if _, err := db.QueryKeys(queries[0]); err != nil {
+		t.Fatalf("warm QueryKeys: %v", err)
+	}
+	if got := db.getSnapshot().matPredCacheCount.Load(); got == 0 {
+		t.Fatalf("expected deep ordered window to materialize a predicate cache entry")
+	}
+
+	var wg sync.WaitGroup
+	errCh := make(chan error, 16)
+
+	for g := 0; g < 8; g++ {
+		wg.Add(1)
+		go func(gid int) {
+			defer wg.Done()
+			for i := 0; i < 120; i++ {
+				exp := expects[(gid+i)%len(expects)]
+
+				gotKeys, err := db.QueryKeys(exp.q)
+				if err != nil {
+					errCh <- fmt.Errorf("g=%d i=%d QueryKeys: %w", gid, i, err)
+					return
+				}
+				if !queryIDsEqual(exp.q, gotKeys, exp.ids) {
+					errCh <- fmt.Errorf("g=%d i=%d QueryKeys mismatch: got=%v want=%v", gid, i, gotKeys, exp.ids)
+					return
+				}
+
+				gotItems, err := db.Query(exp.q)
+				if err != nil {
+					errCh <- fmt.Errorf("g=%d i=%d Query: %w", gid, i, err)
+					return
+				}
+				if len(gotItems) != len(exp.items) {
+					errCh <- fmt.Errorf("g=%d i=%d Query len mismatch: got=%d want=%d", gid, i, len(gotItems), len(exp.items))
+					return
+				}
+				for j := range exp.items {
+					if gotItems[j] == nil || exp.items[j] == nil || !reflect.DeepEqual(*gotItems[j], *exp.items[j]) {
+						errCh <- fmt.Errorf("g=%d i=%d Query item mismatch at j=%d", gid, i, j)
+						return
+					}
+				}
+
+				gotCount, err := db.Count(exp.q)
+				if err != nil {
+					errCh <- fmt.Errorf("g=%d i=%d Count: %w", gid, i, err)
+					return
+				}
+				if gotCount != exp.count {
+					errCh <- fmt.Errorf("g=%d i=%d Count mismatch: got=%d want=%d", gid, i, gotCount, exp.count)
+					return
+				}
+			}
+		}(g)
+	}
+
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		t.Fatal(err)
+	}
+
+	if got := db.getSnapshot().matPredCacheCount.Load(); got > 1 {
+		t.Fatalf("materialized predicate cache exceeded configured bound: got=%d", got)
+	}
+}
+
+func TestQueryExt_StringKeys_ConcurrentPrefixRangeSnapshotConsistency(t *testing.T) {
+	db, _ := openTempDBString(t, Options{AnalyzeInterval: -1})
+
+	ids := []string{"id-1", "id-2", "id-3", "id-4", "id-5", "id-6", "id-7"}
+	stateA := []*Rec{
+		{Name: "aa/00", Active: true},
+		{Name: "aa/01", Active: true},
+		{Name: "aa/02", Active: false},
+		{Name: "aa/zz", Active: true},
+		{Name: "ab/00", Active: true},
+		{Name: "aa0", Active: true},
+		{Name: "aa/05", Active: true},
+	}
+	stateB := []*Rec{
+		{Name: "aa/00", Active: false},
+		{Name: "aa/03", Active: true},
+		{Name: "aa/yy", Active: true},
+		{Name: "aa/zz", Active: false},
+		{Name: "aa/05", Active: true},
+		{Name: "aa0", Active: true},
+		{Name: "aa/04", Active: true},
+	}
+
+	setState := func(vals []*Rec) error {
+		return db.BatchSet(ids, vals)
+	}
+
+	q := qx.Query(
+		qx.PREFIX("name", "aa/"),
+		qx.GT("name", "aa/00"),
+		qx.LTE("name", "aa/zz"),
+		qx.EQ("active", true),
+	).By("name", qx.DESC).Skip(1).Max(3)
+
+	if err := setState(stateA); err != nil {
+		t.Fatalf("BatchSet(stateA): %v", err)
+	}
+	wantA, err := expectedKeysString(t, db, q)
+	if err != nil {
+		t.Fatalf("expectedKeysString(stateA): %v", err)
+	}
+	itemsA, err := db.Query(q)
+	if err != nil {
+		t.Fatalf("Query(stateA): %v", err)
+	}
+	namesA := queryExtItemNames(t, itemsA)
+	countA, err := db.Count(q)
+	if err != nil {
+		t.Fatalf("Count(stateA): %v", err)
+	}
+
+	if err := setState(stateB); err != nil {
+		t.Fatalf("BatchSet(stateB): %v", err)
+	}
+	wantB, err := expectedKeysString(t, db, q)
+	if err != nil {
+		t.Fatalf("expectedKeysString(stateB): %v", err)
+	}
+	itemsB, err := db.Query(q)
+	if err != nil {
+		t.Fatalf("Query(stateB): %v", err)
+	}
+	namesB := queryExtItemNames(t, itemsB)
+	countB, err := db.Count(q)
+	if err != nil {
+		t.Fatalf("Count(stateB): %v", err)
+	}
+
+	if err := setState(stateA); err != nil {
+		t.Fatalf("BatchSet(stateA reset): %v", err)
+	}
+
+	var wg sync.WaitGroup
+	errCh := make(chan error, 16)
+	start := make(chan struct{})
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		<-start
+		for i := 0; i < 120; i++ {
+			vals := stateB
+			if i%2 == 1 {
+				vals = stateA
+			}
+			if err := setState(vals); err != nil {
+				errCh <- fmt.Errorf("writer: %w", err)
+				return
+			}
+		}
+	}()
+
+	for g := 0; g < 8; g++ {
+		wg.Add(1)
+		go func(gid int) {
+			defer wg.Done()
+			<-start
+			for i := 0; i < 160; i++ {
+				gotKeys, err := db.QueryKeys(q)
+				if err != nil {
+					errCh <- fmt.Errorf("g=%d i=%d QueryKeys: %w", gid, i, err)
+					return
+				}
+				if !queryStringIDsEqual(q, gotKeys, wantA) && !queryStringIDsEqual(q, gotKeys, wantB) {
+					errCh <- fmt.Errorf("g=%d i=%d QueryKeys hybrid snapshot: got=%v wantA=%v wantB=%v", gid, i, gotKeys, wantA, wantB)
+					return
+				}
+
+				gotItems, err := db.Query(q)
+				if err != nil {
+					errCh <- fmt.Errorf("g=%d i=%d Query: %w", gid, i, err)
+					return
+				}
+				gotNames, ok := queryExtItemNamesOK(gotItems)
+				if !ok {
+					errCh <- fmt.Errorf("g=%d i=%d Query returned nil item: %#v", gid, i, gotItems)
+					return
+				}
+				if !reflect.DeepEqual(gotNames, namesA) && !reflect.DeepEqual(gotNames, namesB) {
+					errCh <- fmt.Errorf("g=%d i=%d Query hybrid snapshot: got=%v wantA=%v wantB=%v", gid, i, gotNames, namesA, namesB)
+					return
+				}
+
+				gotCount, err := db.Count(q)
+				if err != nil {
+					errCh <- fmt.Errorf("g=%d i=%d Count: %w", gid, i, err)
+					return
+				}
+				if gotCount != countA && gotCount != countB {
+					errCh <- fmt.Errorf("g=%d i=%d Count hybrid snapshot: got=%d wantA=%d wantB=%d", gid, i, gotCount, countA, countB)
+					return
+				}
+			}
+		}(g)
+	}
+
+	close(start)
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		t.Fatal(err)
+	}
+}
+
+func TestQueryExt_NumericRangeFieldMutation_DoesNotReuseStaleCaches(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{
+		AnalyzeInterval:                         -1,
+		SnapshotMaterializedPredCacheMaxEntries: 8,
+	})
+
+	seedGeneratedUint64Data(t, db, 15_000, func(i int) *Rec {
+		return &Rec{
+			Name:   fmt.Sprintf("user-%05d", i),
+			Age:    i,
+			Score:  float64(i),
+			Active: i%2 == 0,
+		}
+	})
+	if err := db.RebuildIndex(); err != nil {
+		t.Fatalf("RebuildIndex: %v", err)
+	}
+
+	setNumericBucketKnobs(t, db, 128, 1, 1)
+
+	queries := []*qx.QX{
+		qx.Query(
+			qx.GTE("age", 2_500),
+			qx.EQ("active", true),
+		).By("age", qx.ASC).Skip(120).Max(80),
+		qx.Query(
+			qx.GTE("age", 2_501),
+			qx.EQ("active", true),
+		).By("age", qx.ASC).Skip(120).Max(80),
+		qx.Query(
+			qx.GTE("age", 2_400),
+			qx.LT("age", 2_650),
+		).By("age", qx.ASC).Max(120),
+	}
+
+	checkQueries := func(step string) {
+		for i, q := range queries {
+			t.Run(fmt.Sprintf("%s_q%d", step, i), func(t *testing.T) {
+				assertQueryExtraPublicReadPathsMatchExpected(t, db, q)
+			})
+		}
+	}
+
+	checkQueries("warm")
+	if got := db.getSnapshot().matPredCacheCount.Load(); got == 0 {
+		t.Fatalf("expected warmed numeric-range query to populate predicate cache")
+	}
+
+	for i := 2400; i <= 2480; i++ {
+		if err := db.Patch(uint64(i), []Field{{Name: "age", Value: 9_000 + i}, {Name: "active", Value: true}}); err != nil {
+			t.Fatalf("Patch(%d high): %v", i, err)
+		}
+	}
+	for i := 14900; i <= 14980; i++ {
+		if err := db.Patch(uint64(i), []Field{{Name: "age", Value: 2_430 + (i - 14900)}}); err != nil {
+			t.Fatalf("Patch(%d low): %v", i, err)
+		}
+	}
+
+	checkQueries("after_field_publish")
+	db.clearCurrentSnapshotCachesForTesting()
+	checkQueries("after_clear")
+}
+
+func TestQueryExt_OrderedOROverlap_DeduplicatesAcrossMutations(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
+
+	seedGeneratedUint64Data(t, db, 4_000, func(i int) *Rec {
+		group := "grp-b"
+		if i%2 == 0 {
+			group = "grp-a"
+		}
+		country := "US"
+		if i%5 == 0 {
+			country = "NL"
+		}
+		return &Rec{
+			Name:   fmt.Sprintf("u-%04d", i),
+			Email:  fmt.Sprintf("%s/%04d@example.test", group, i),
+			Age:    18 + (i % 70),
+			Score:  float64(i % 100),
+			Active: i%3 == 0,
+			Meta: Meta{
+				Country: country,
+			},
+		}
+	})
+	if err := db.RebuildIndex(); err != nil {
+		t.Fatalf("RebuildIndex: %v", err)
+	}
+
+	q := qx.Query(
+		qx.OR(
+			qx.AND(qx.PREFIX("email", "grp-a/"), qx.EQ("active", true)),
+			qx.AND(qx.PREFIX("email", "grp-a/"), qx.GTE("age", 40)),
+			qx.AND(qx.PREFIX("email", "grp-b/"), qx.EQ("country", "NL")),
+			qx.AND(qx.PREFIX("email", "grp-a/"), qx.LTE("score", 15.0)),
+		),
+	).By("score", qx.DESC).Skip(10).Max(120)
+
+	assertQueryExtraPublicReadPathsMatchExpected(t, db, q)
+
+	for _, id := range []uint64{12, 48, 96, 144, 192, 384} {
+		if err := db.Patch(id, []Field{
+			{Name: "email", Value: fmt.Sprintf("grp-b/%04d@example.test", id)},
+			{Name: "country", Value: "NL"},
+			{Name: "active", Value: false},
+			{Name: "score", Value: 7.0},
+		}); err != nil {
+			t.Fatalf("Patch(%d demote): %v", id, err)
+		}
+	}
+	for _, id := range []uint64{11, 33, 55, 77, 99, 121} {
+		if err := db.Patch(id, []Field{
+			{Name: "email", Value: fmt.Sprintf("grp-a/%04d@example.test", id)},
+			{Name: "age", Value: 63},
+			{Name: "active", Value: true},
+			{Name: "score", Value: 99.0},
+		}); err != nil {
+			t.Fatalf("Patch(%d promote): %v", id, err)
+		}
+	}
+
+	assertQueryExtraPublicReadPathsMatchExpected(t, db, q)
+}
+
+func TestQueryExt_OrderBasicPointerPrefixWithNegativeBaseOps_RemainsExact(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
+
+	rows := map[uint64]*Rec{
+		1:  {Name: "nil-a", Opt: nil, Active: true},
+		2:  {Name: "aa-on", Opt: strPtr("aa"), Active: true},
+		3:  {Name: "ab-off", Opt: strPtr("ab"), Active: false},
+		4:  {Name: "ac-on", Opt: strPtr("ac"), Active: true},
+		5:  {Name: "ad-off", Opt: strPtr("ad"), Active: false},
+		6:  {Name: "ba-off", Opt: strPtr("ba"), Active: false},
+		7:  {Name: "empty-off", Opt: strPtr(""), Active: false},
+		8:  {Name: "az-on", Opt: strPtr("az"), Active: true},
+		9:  {Name: "nil-b", Opt: nil, Active: false},
+		10: {Name: "ax-off", Opt: strPtr("ax"), Active: false},
+	}
+	for id, rec := range rows {
+		if err := db.Set(id, rec); err != nil {
+			t.Fatalf("Set(%d): %v", id, err)
+		}
+	}
+
+	tests := []struct {
+		name string
+		q    *qx.QX
+	}{
+		{
+			name: "prefix_not_active_asc",
+			q: qx.Query(
+				qx.PREFIX("opt", "a"),
+				qx.NOT(qx.EQ("active", true)),
+			).By("opt", qx.ASC).Skip(1).Max(4),
+		},
+		{
+			name: "prefix_not_active_desc",
+			q: qx.Query(
+				qx.PREFIX("opt", "a"),
+				qx.NOT(qx.EQ("active", true)),
+			).By("opt", qx.DESC).Max(5),
+		},
+		{
+			name: "prefix_not_name",
+			q: qx.Query(
+				qx.PREFIX("opt", "a"),
+				qx.NOT(qx.EQ("name", "ax-off")),
+			).By("opt", qx.ASC).Max(6),
+		},
+	}
+
+	check := func(step string) {
+		for _, tc := range tests {
+			t.Run(step+"_"+tc.name, func(t *testing.T) {
+				assertQueryExtraPublicReadPathsMatchExpected(t, db, tc.q)
+			})
+		}
+	}
+
+	check("initial")
+
+	if err := db.Patch(1, []Field{{Name: "opt", Value: "ae"}, {Name: "active", Value: false}}); err != nil {
+		t.Fatalf("Patch(1): %v", err)
+	}
+	if err := db.Patch(4, []Field{{Name: "opt", Value: (*string)(nil)}}); err != nil {
+		t.Fatalf("Patch(4): %v", err)
+	}
+	if err := db.Patch(8, []Field{{Name: "active", Value: false}}); err != nil {
+		t.Fatalf("Patch(8): %v", err)
+	}
+	if err := db.Set(11, &Rec{Name: "af-off", Opt: strPtr("af"), Active: false}); err != nil {
+		t.Fatalf("Set(11): %v", err)
+	}
+
+	check("after_patch")
+}
+
+func TestQueryExt_ConcurrentAtomicBatchSetSnapshotConsistency_OnNumericRangeOrder(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{
+		AnalyzeInterval:                         -1,
+		SnapshotMaterializedPredCacheMaxEntries: 8,
+	})
+
+	setNumericBucketKnobs(t, db, 64, 1, 1)
+
+	ids := make([]uint64, 0, 64)
+	stateA := make([]*Rec, 0, 64)
+	stateB := make([]*Rec, 0, 64)
+	for i := 1; i <= 64; i++ {
+		id := uint64(i)
+		ids = append(ids, id)
+		stateA = append(stateA, &Rec{
+			Name:   fmt.Sprintf("A-%02d", i),
+			Age:    100 + i*3,
+			Score:  float64(100 + i*3),
+			Active: i%3 != 0,
+		})
+		stateB = append(stateB, &Rec{
+			Name:   fmt.Sprintf("B-%02d", i),
+			Age:    200 + i*5,
+			Score:  float64(200 + i*5),
+			Active: i%4 != 0,
+		})
+	}
+
+	setState := func(vals []*Rec) error {
+		return db.BatchSet(ids, vals)
+	}
+
+	q := qx.Query(
+		qx.GTE("age", 130),
+		qx.LT("age", 420),
+		qx.EQ("active", true),
+	).By("age", qx.ASC).Skip(4).Max(18)
+
+	if err := setState(stateA); err != nil {
+		t.Fatalf("BatchSet(stateA): %v", err)
+	}
+	if _, err := db.QueryKeys(q); err != nil {
+		t.Fatalf("warm QueryKeys(stateA): %v", err)
+	}
+	wantA, err := expectedKeysUint64(t, db, q)
+	if err != nil {
+		t.Fatalf("expectedKeysUint64(stateA): %v", err)
+	}
+	itemsA, err := db.Query(q)
+	if err != nil {
+		t.Fatalf("Query(stateA): %v", err)
+	}
+	namesA := queryExtItemNames(t, itemsA)
+	countA, err := db.Count(q)
+	if err != nil {
+		t.Fatalf("Count(stateA): %v", err)
+	}
+
+	if err = setState(stateB); err != nil {
+		t.Fatalf("BatchSet(stateB): %v", err)
+	}
+	if _, err := db.QueryKeys(q); err != nil {
+		t.Fatalf("warm QueryKeys(stateB): %v", err)
+	}
+	wantB, err := expectedKeysUint64(t, db, q)
+	if err != nil {
+		t.Fatalf("expectedKeysUint64(stateB): %v", err)
+	}
+	itemsB, err := db.Query(q)
+	if err != nil {
+		t.Fatalf("Query(stateB): %v", err)
+	}
+	namesB := queryExtItemNames(t, itemsB)
+	countB, err := db.Count(q)
+	if err != nil {
+		t.Fatalf("Count(stateB): %v", err)
+	}
+
+	if err := setState(stateA); err != nil {
+		t.Fatalf("BatchSet(stateA reset): %v", err)
+	}
+
+	var wg sync.WaitGroup
+	errCh := make(chan error, 16)
+	start := make(chan struct{})
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		<-start
+		for i := 0; i < 120; i++ {
+			vals := stateB
+			if i%2 == 1 {
+				vals = stateA
+			}
+			if err := setState(vals); err != nil {
+				errCh <- fmt.Errorf("writer: %w", err)
+				return
+			}
+		}
+	}()
+
+	for g := 0; g < 8; g++ {
+		wg.Add(1)
+		go func(gid int) {
+			defer wg.Done()
+			<-start
+			for i := 0; i < 160; i++ {
+				gotKeys, err := db.QueryKeys(q)
+				if err != nil {
+					errCh <- fmt.Errorf("g=%d i=%d QueryKeys: %w", gid, i, err)
+					return
+				}
+				if !queryIDsEqual(q, gotKeys, wantA) && !queryIDsEqual(q, gotKeys, wantB) {
+					errCh <- fmt.Errorf("g=%d i=%d QueryKeys hybrid snapshot: got=%v wantA=%v wantB=%v", gid, i, gotKeys, wantA, wantB)
+					return
+				}
+
+				gotItems, err := db.Query(q)
+				if err != nil {
+					errCh <- fmt.Errorf("g=%d i=%d Query: %w", gid, i, err)
+					return
+				}
+				gotNames, ok := queryExtItemNamesOK(gotItems)
+				if !ok {
+					errCh <- fmt.Errorf("g=%d i=%d Query returned nil item: %#v", gid, i, gotItems)
+					return
+				}
+				if !reflect.DeepEqual(gotNames, namesA) && !reflect.DeepEqual(gotNames, namesB) {
+					errCh <- fmt.Errorf("g=%d i=%d Query hybrid snapshot: got=%v wantA=%v wantB=%v", gid, i, gotNames, namesA, namesB)
+					return
+				}
+
+				gotCount, err := db.Count(q)
+				if err != nil {
+					errCh <- fmt.Errorf("g=%d i=%d Count: %w", gid, i, err)
+					return
+				}
+				if gotCount != countA && gotCount != countB {
+					errCh <- fmt.Errorf("g=%d i=%d Count hybrid snapshot: got=%d wantA=%d wantB=%d", gid, i, gotCount, countA, countB)
+					return
+				}
+			}
+		}(g)
+	}
+
+	close(start)
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		t.Fatal(err)
+	}
+}

@@ -194,6 +194,7 @@ func (db *DB[K, V]) rollbackCreatedStrIdx(id K, idx uint64) {
 		return
 	}
 	s := *(*string)(unsafe.Pointer(&id))
+	current := db.snapshot.current.Load()
 
 	db.strmap.Lock()
 	defer db.strmap.Unlock()
@@ -249,6 +250,15 @@ func (db *DB[K, V]) rollbackCreatedStrIdx(id K, idx uint64) {
 		}
 	}
 
+	// Failed pre-commit snapshot staging may already have advanced sm.snap to a
+	// delta snapshot that includes this transient key. Restore the cached base
+	// to the currently published snapshot so the next successful publish cannot
+	// reuse a stale idx->string mapping after idx reuse.
+	if current != nil {
+		db.strmap.snap = current.strmap
+	} else {
+		db.strmap.snap = nil
+	}
 	db.strmap.dirty = true
 }
 
