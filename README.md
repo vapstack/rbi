@@ -26,14 +26,16 @@ Indexes are kept fully in memory and built on a heavily reworked fork of
 * Automatic indexing of exported struct fields
 * Fine-grained control via struct tags (`db`, `dbi`, `rbi`)
 * Efficient query building via [qx package](https://github.com/vapstack/qx):
-    - comparisons: `EQ`, `GT`, `GTE`, `LT`, `LTE`
-    - slices: `IN`, `HAS`, `HASANY`
-    - strings: `PREFIX`, `SUFFIX`, `CONTAINS`
-    - logical: `AND`, `OR`, `NOT`
-* Index-based ordering with offset / limit
+  - comparisons: `EQ`, `GT`, `GTE`, `LT`, `LTE`
+  - slices: `IN`, `HAS`, `HASANY`
+  - strings: `PREFIX`, `SUFFIX`, `CONTAINS`
+  - logical: `AND`, `OR`, `NOT`
+* Index-based ordering with offset / limit, including `ByArrayPos` and `ByArrayCount`
 * Partial updates (`Patch*`) with minimal index churn
-* Batch writes (`BatchSet`, `BatchPatch`, `BatchDelete`)
+* Batch and auto-batched writes
 * Uniqueness constraints
+* Optional runtime diagnostics: query tracing, planner/snapshot/auto-batch stats, and online
+  calibration
 
 ### LLM notice
 Starting from v0.7, parts of the code, documentation and tests were created 
@@ -390,11 +392,7 @@ Memory usage is roughly proportional to:
 * number of records,
 * cardinality and distribution of indexed values.
 
-Memory usage can also grow in these cases:
-- High write rate combined with large updates
-- Long-lived readers that keep old snapshots pinned (delays snapshot cleanup)
-
-Careful index configuration is recommended for large datasets.
+Careful index configuration is recommended for very large datasets.
 
 ## Multiple instances
 
@@ -457,43 +455,47 @@ suitable for many workloads.
 
 ### Query performance
 
-Query performance is shape-dependent. Some classes are fast by design,
-some are highly data-dependent, and some are inherently expensive.
+Query performance is shape-dependent. Current code has several specialized
+fast paths, but broader shapes depend on data distribution, chosen execution
+path, and whether snapshot-local runtime caches are already warm.
 
-#### 1. Fast-by-design classes
+#### 1. Usually fast
 
-These classes are consistently fast when predicates are selective and `LIMIT` is small.
-Typical behavior is low-microsecond to sub-microsecond in the current benchmark profile.
+These classes have dedicated execution paths or strong early-stop behavior.
+On the current synthetic benchmark profile, pure point/top-N/autocomplete
+shapes are typically sub- to low-single-microsecond.
 
-- Unique/equality point query with `LIMIT 1`
-  - `O(1)` index lookup + `O(1)` result extraction
-- Top-N on ordered field (`ORDER BY field LIMIT N`, small `N`)
-  - `O(N)` in best case (early stop on first buckets)
-- Selective `IN`/`HAS`/`HASANY` with `LIMIT`
-  - approximately `O(k + N)`, where `k` is number of touched postings
-- Selective prefix with small limit
-  - `O(log M + span(prefix) + N)`
-- Selective range + order + limit
-  - `O(scanned_buckets + checked_rows)` with early stop
+- Positive `EQ` on a unique scalar field, with or without explicit `LIMIT 1`
+  - Candidate set is bounded to at most one row.
+- Small top-N on an indexed scalar field (`ORDER BY field LIMIT N`)
+  - Ordered scan can stop as soon as enough rows are found.
+- Narrow `PREFIX ... LIMIT` without extra ordering, or `PREFIX` on the order field
+  - Binary-search into the matching key span, then scan until limit.
+- Selective conjunctions of `EQ` / `IN` / `HAS` / `HASANY` with small `LIMIT`
+  - Usually lead-posting iteration plus candidate checks.
 
-#### 2. Data-dependent classes
+#### 2. Data-dependent or cache-sensitive
 
-These can differ by one to two orders of magnitude for the same query shape.
-The main reason is that planner/executor cost is dominated by data distribution.
+These can differ by one or more orders of magnitude for the same query shape.
+The main reason is that planner/executor cost is dominated by span width,
+cardinality, overlap, ordering, and cache warmth.
 
-- Range queries (`GT/GTE/LT/LTE`)
-- Prefix/text-like filters (`PREFIX`, `SUFFIX`, `CONTAINS`)
+- Numeric range queries (`GT/GTE/LT/LTE`), especially with another `ORDER BY` field
+  - Current code uses numeric-range bucket reuse plus bounded materialized-predicate caching, so warm snapshots can be much faster than cold-cache runs.
+- Broad `PREFIX` on a non-order field, especially with a different `ORDER BY`
+- Prefix/text-like filters (`SUFFIX`, `CONTAINS`)
 - Moderate `OR` expressions with mixed predicates
 
 What mostly determines runtime:
 - Predicate selectivity and field cardinality
-- Overlap between OR branches (high overlap increases redundant checks + dedupe work)
-- Order-field cardinality/skew (high-cardinality order can increase scan/probe cost)
-- Prefix span size (short/broad prefix can degenerate into near full-range scan)
-- Offset depth (deep skip forces extra scanning even with small limit)
+- Overlap between `OR` branches (high overlap increases redundant checks + dedupe work)
+- Order-field cardinality/skew
+- Prefix/range span size
+- Offset depth / requested window
+- Whether bounded snapshot caches already contain reusable materialized spans
 - Negative predicates (`NOT*`) that reduce early-stop opportunities
 
-#### 3. Inherently heavy classes
+#### 3. Usually heavy
 
 These are expensive in almost any workload because they force broad candidate
 enumeration, global deduplication, expensive ordering, and/or large materialization.
@@ -504,6 +506,8 @@ enumeration, global deduplication, expensive ordering, and/or large materializat
 - Broad text scans (`CONTAINS` / `SUFFIX`) without a selective anchor:
   - Often requires scanning many index keys/buckets before filtering
   - Little opportunity for early pruning without additional anchors
+- Queries that need most or all matches rather than a small prefix of results:
+  - Early-stop advantages disappear and materialization cost starts to dominate
 
 ### Write performance
 
