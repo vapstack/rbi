@@ -5,6 +5,7 @@ import "go.etcd.io/bbolt"
 type beforeProcessFunc[K ~string | ~uint64, V any] = func(key K, value *V) error
 type beforeStoreFunc[K ~string | ~uint64, V any] = func(key K, oldValue, newValue *V) error
 type beforeCommitFunc[K ~string | ~uint64, V any] = func(tx *bbolt.Tx, key K, oldValue, newValue *V) error
+type cloneMethodValue[V any] interface{ Clone() *V }
 
 type execOptions[K ~string | ~uint64, V any] struct {
 	beforeProcess []beforeProcessFunc[K, V]
@@ -93,7 +94,8 @@ func NoBatch[K ~string | ~uint64, V any](cfg *execOptions[K, V]) {
 // encode/decode before BeforeStore runs so it can safely isolate retries and
 // caller-owned objects. If the value only becomes encodable after BeforeStore
 // normalizes it, or if the caller can produce an independent copy faster than
-// RBI's fallback msgpack snapshotting, pass CloneFunc.
+// RBI's fallback msgpack snapshotting, pass CloneFunc. If CloneFunc is not
+// provided and *V implements Clone() *V, RBI uses that method automatically.
 //
 // BeforeStore may be passed more than once. Hooks passed to New are invoked
 // before per-operation hooks.
@@ -123,7 +125,8 @@ func BeforeStore[K ~string | ~uint64, V any](fn func(key K, oldValue, newValue *
 //   - Must return non-nil for non-nil input.
 //   - Must be deterministic and free of external side effects.
 //
-// If CloneFunc is not provided, RBI falls back to msgpack snapshotting before
+// If CloneFunc is not provided and *V implements Clone() *V, RBI uses that
+// method automatically. Otherwise RBI falls back to msgpack snapshotting before
 // BeforeStore for Set/BatchSet. Patch/BatchPatch ignore CloneFunc because they
 // already rebuild a fresh working copy from stored bytes.
 //
@@ -189,7 +192,23 @@ func applyExecOptions[K ~string | ~uint64, V any](cfg *execOptions[K, V], opts [
 	}
 }
 
+func defaultCloneValue[K ~string | ~uint64, V any]() func(K, *V) *V {
+	probe := new(V)
+	if _, ok := any(probe).(cloneMethodValue[V]); !ok {
+		return nil
+	}
+	return func(_ K, v *V) *V {
+		if v == nil {
+			return nil
+		}
+		return any(v).(cloneMethodValue[V]).Clone()
+	}
+}
+
 func freezeExecOptions[K ~string | ~uint64, V any](cfg execOptions[K, V]) execOptions[K, V] {
+	if cfg.cloneValue == nil {
+		cfg.cloneValue = defaultCloneValue[K, V]()
+	}
 	if len(cfg.beforeProcess) > 0 {
 		cfg.beforeProcess = append([]beforeProcessFunc[K, V](nil), cfg.beforeProcess...)
 		cfg.beforeProcess = cfg.beforeProcess[:len(cfg.beforeProcess):len(cfg.beforeProcess)]

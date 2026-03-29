@@ -257,6 +257,8 @@ Available hooks/options:
 - `CloneFunc` - optional helper for `Set`/`BatchSet` with `BeforeStore`.
   It can be used when the value becomes encodable only after normalization, or
   simply as a faster cloning path than RBI's fallback msgpack snapshotting.
+  If `CloneFunc` is omitted and `*V` implements `Clone() *V`, RBI uses that
+  method automatically.
 
 * `PatchStrict` - makes `Patch`/`BatchPatch` reject unknown fields.
 

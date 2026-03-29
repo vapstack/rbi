@@ -24,6 +24,14 @@ type beforeStoreCloneRec struct {
 	Ready bool   `db:"ready"`
 }
 
+func (r *beforeStoreCloneRec) Clone() *beforeStoreCloneRec {
+	if r == nil {
+		return nil
+	}
+	cp := *r
+	return &cp
+}
+
 func (r *beforeStoreCloneRec) MarshalMsgpack() ([]byte, error) {
 	if !r.Ready {
 		return nil, errors.New("beforeStoreCloneRec: not ready")
@@ -354,6 +362,46 @@ func TestBeforeStore_CloneFunc_Set_AllowsNormalizationBeforeEncode(t *testing.T)
 	}
 }
 
+func TestBeforeStore_AutoCloneMethod_Set_AllowsNormalizationBeforeEncode(t *testing.T) {
+	db := openTempDBUint64BeforeStoreCloneRec(t, Options{AutoBatchMax: 1})
+
+	calls := 0
+	input := &beforeStoreCloneRec{}
+	err := db.Set(
+		1,
+		input,
+		BeforeStore(func(key uint64, oldValue, newValue *beforeStoreCloneRec) error {
+			calls++
+			if key != 1 {
+				t.Fatalf("unexpected key: %d", key)
+			}
+			if oldValue != nil {
+				t.Fatalf("expected insert oldValue=nil, got %#v", oldValue)
+			}
+			newValue.Name = "normalized"
+			newValue.Ready = true
+			return nil
+		}),
+	)
+	if err != nil {
+		t.Fatalf("Set with Clone() method: %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("expected BeforeStore to run once, got %d", calls)
+	}
+	if input.Name != "" || input.Ready {
+		t.Fatalf("caller-owned input was mutated: %#v", input)
+	}
+
+	got, err := db.Get(1)
+	if err != nil {
+		t.Fatalf("Get(1): %v", err)
+	}
+	if got == nil || got.Name != "normalized" || !got.Ready {
+		t.Fatalf("unexpected stored value: %#v", got)
+	}
+}
+
 func TestBeforeStore_CloneFunc_BatchSet_AllowsNormalizationBeforeEncode(t *testing.T) {
 	db := openTempDBUint64BeforeStoreCloneRec(t, Options{AutoBatchMax: 1})
 
@@ -377,6 +425,46 @@ func TestBeforeStore_CloneFunc_BatchSet_AllowsNormalizationBeforeEncode(t *testi
 	)
 	if err != nil {
 		t.Fatalf("BatchSet with CloneFunc: %v", err)
+	}
+	if inputA.Name != "" || inputA.Ready || inputB.Name != "" || inputB.Ready {
+		t.Fatalf("caller-owned inputs were mutated: %#v %#v", inputA, inputB)
+	}
+
+	got1, err := db.Get(1)
+	if err != nil {
+		t.Fatalf("Get(1): %v", err)
+	}
+	got2, err := db.Get(2)
+	if err != nil {
+		t.Fatalf("Get(2): %v", err)
+	}
+	if got1 == nil || got1.Name != "normalized-1" || !got1.Ready {
+		t.Fatalf("unexpected stored value for id=1: %#v", got1)
+	}
+	if got2 == nil || got2.Name != "normalized-2" || !got2.Ready {
+		t.Fatalf("unexpected stored value for id=2: %#v", got2)
+	}
+}
+
+func TestBeforeStore_AutoCloneMethod_BatchSet_AllowsNormalizationBeforeEncode(t *testing.T) {
+	db := openTempDBUint64BeforeStoreCloneRec(t, Options{AutoBatchMax: 1})
+
+	inputA := &beforeStoreCloneRec{}
+	inputB := &beforeStoreCloneRec{}
+	err := db.BatchSet(
+		[]uint64{1, 2},
+		[]*beforeStoreCloneRec{inputA, inputB},
+		BeforeStore(func(key uint64, oldValue, newValue *beforeStoreCloneRec) error {
+			if oldValue != nil {
+				t.Fatalf("expected insert oldValue=nil, got %#v", oldValue)
+			}
+			newValue.Name = fmt.Sprintf("normalized-%d", key)
+			newValue.Ready = true
+			return nil
+		}),
+	)
+	if err != nil {
+		t.Fatalf("BatchSet with Clone() method: %v", err)
 	}
 	if inputA.Name != "" || inputA.Ready || inputB.Name != "" || inputB.Ready {
 		t.Fatalf("caller-owned inputs were mutated: %#v %#v", inputA, inputB)
@@ -433,6 +521,64 @@ func TestBeforeStore_CloneFunc_AutoBatch_AllowsNormalizationBeforeEncode(t *test
 
 	if st := db.AutoBatchStats(); st.Enqueued == 0 {
 		t.Fatalf("expected Set with CloneFunc to use auto-batcher path, stats=%+v", st)
+	}
+}
+
+func TestBeforeStore_AutoCloneMethod_AutoBatch_AllowsNormalizationBeforeEncode(t *testing.T) {
+	db := openTempDBUint64BeforeStoreCloneRec(t)
+
+	calls := 0
+	err := db.Set(
+		1,
+		&beforeStoreCloneRec{},
+		BeforeStore(func(_ uint64, _ *beforeStoreCloneRec, newValue *beforeStoreCloneRec) error {
+			calls++
+			newValue.Name = "combined"
+			newValue.Ready = true
+			return nil
+		}),
+	)
+	if err != nil {
+		t.Fatalf("Set with Clone() method via auto-batcher: %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("expected BeforeStore to run once, got %d", calls)
+	}
+
+	got, err := db.Get(1)
+	if err != nil {
+		t.Fatalf("Get(1): %v", err)
+	}
+	if got == nil || got.Name != "combined" || !got.Ready {
+		t.Fatalf("unexpected stored value: %#v", got)
+	}
+
+	if st := db.AutoBatchStats(); st.Enqueued == 0 {
+		t.Fatalf("expected Set with Clone() method to use auto-batcher path, stats=%+v", st)
+	}
+}
+
+func TestBeforeStore_CloneFunc_OverridesAutoCloneMethod(t *testing.T) {
+	db := openTempDBUint64BeforeStoreCloneRec(t, Options{AutoBatchMax: 1})
+
+	err := db.Set(
+		1,
+		&beforeStoreCloneRec{},
+		CloneFunc(func(_ uint64, v *beforeStoreCloneRec) *beforeStoreCloneRec {
+			cp := *v
+			cp.Name = "clone-func"
+			return &cp
+		}),
+		BeforeStore(func(_ uint64, _ *beforeStoreCloneRec, newValue *beforeStoreCloneRec) error {
+			if newValue.Name != "clone-func" {
+				t.Fatalf("expected explicit CloneFunc to win, got name=%q", newValue.Name)
+			}
+			newValue.Ready = true
+			return nil
+		}),
+	)
+	if err != nil {
+		t.Fatalf("Set with explicit CloneFunc override: %v", err)
 	}
 }
 

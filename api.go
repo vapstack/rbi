@@ -23,7 +23,7 @@ func cloneBeforeStoreValue[K ~string | ~uint64, V any](id K, v *V, cloneFn func(
 	}
 	cloned := cloneFn(id, v)
 	if cloned == nil {
-		return nil, fmt.Errorf("clone func returned nil")
+		return nil, fmt.Errorf("clone returned nil")
 	}
 	return cloned, nil
 }
@@ -364,11 +364,13 @@ func (db *DB[K, V]) SeqScanRaw(seek K, fn func(K, []byte) (bool, error)) error {
 // transaction. Any existing value for the key is decoded and passed as oldValue
 // to BeforeStore and BeforeCommit hooks. BeforeStore may modify the stored
 // value before it is encoded. If BeforeStore is used and CloneFunc is not
-// provided, the input value must already be msgpack-encodable because RBI
-// falls back to encode/decode snapshotting before the hook runs. CloneFunc can
-// also be used as a faster cloning path when the caller can produce an
-// independent copy more cheaply than msgpack snapshotting. If any hook returns
-// an error, the transaction is rolled back and the error is returned.
+// provided, RBI first checks whether *V implements Clone() *V and uses it when
+// available. Otherwise the input value must already be msgpack-encodable
+// because RBI falls back to encode/decode snapshotting before the hook runs.
+// CloneFunc can also be used as a faster cloning path when the caller can
+// produce an independent copy more cheaply than msgpack snapshotting. If any
+// hook returns an error, the transaction is rolled back and the error is
+// returned.
 func (db *DB[K, V]) Set(id K, newVal *V, execOpts ...ExecOption[K, V]) error {
 	if newVal == nil {
 		return ErrNilValue
@@ -399,11 +401,12 @@ func (db *DB[K, V]) Set(id K, newVal *V, execOpts ...ExecOption[K, V]) error {
 // For each key, any existing value is decoded and passed as oldValue to all
 // configured BeforeStore and BeforeCommit hooks. If an error is encountered during any of
 // the processing steps, the transaction is rolled back and the error is returned.
-// If BeforeStore is used and CloneFunc is not provided, each input value must
-// already be msgpack-encodable because RBI falls back to encode/decode
-// snapshotting before the hook runs. CloneFunc can also be used as a faster
-// cloning path when the caller can produce an independent copy more cheaply
-// than msgpack snapshotting.
+// If BeforeStore is used and CloneFunc is not provided, RBI first checks
+// whether *V implements Clone() *V and uses it when available. Otherwise each
+// input value must already be msgpack-encodable because RBI falls back to
+// encode/decode snapshotting before the hook runs. CloneFunc can also be used
+// as a faster cloning path when the caller can produce an independent copy
+// more cheaply than msgpack snapshotting.
 //
 // After a successful commit, the in-memory index is updated for all modified keys.
 //
