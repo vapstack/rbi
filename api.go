@@ -176,30 +176,6 @@ func (db *DB[K, V]) scanStringKeys(snap *strMapSnapshot, universe posting.List, 
 
 	seekStr := *(*string)(unsafe.Pointer(&seek))
 
-	depth := 0
-	for cur := snap; cur != nil; cur = cur.base {
-		depth++
-	}
-	if depth == 0 {
-		return nil
-	}
-	var chainInline [32]*strMapSnapshot
-	var chain []*strMapSnapshot
-	if depth <= len(chainInline) {
-		chain = chainInline[:depth]
-	} else {
-		chain = make([]*strMapSnapshot, depth)
-	}
-	i := depth
-	for cur := snap; cur != nil; cur = cur.base {
-		i--
-		chain[i] = cur
-	}
-	chain = chain[i:]
-	if len(chain) == 0 {
-		return nil
-	}
-
 	emit := func(s string) (bool, error) {
 		if s < seekStr {
 			return true, nil
@@ -212,10 +188,32 @@ func (db *DB[K, V]) scanStringKeys(snap *strMapSnapshot, universe posting.List, 
 	minIdx, hasMin := universe.Minimum()
 	maxIdx, hasMax := universe.Maximum()
 	if card == snap.Next && card > 0 && hasMin && hasMax && minIdx == 1 && maxIdx == snap.Next {
-		for _, node := range chain {
-			start := node.baseNextNoLock() + 1
-			for idx := start; idx <= node.Next; idx++ {
-				s, ok := node.getOwnStringNoLock(idx)
+		if len(snap.readDirs) == 0 {
+			for idx := uint64(1); idx <= snap.Next; idx++ {
+				s, ok := snap.getStringNoLock(idx)
+				if !ok {
+					return fmt.Errorf("%w: %v", ErrNoValidKeyIndex, idx)
+				}
+				cont, err := emit(s)
+				if err != nil {
+					return err
+				}
+				if !cont {
+					return nil
+				}
+			}
+			return nil
+		}
+
+		pageCount := strMapReadPageCount(snap.Next)
+		for page := 0; page < pageCount; page++ {
+			readPage := snap.readPageAtNoLock(page)
+			if readPage == nil {
+				pageStart, _ := strMapReadPageBounds(page, snap.Next)
+				return fmt.Errorf("%w: %v", ErrNoValidKeyIndex, pageStart)
+			}
+			for idx := readPage.Start; idx <= readPage.Next; idx++ {
+				s, ok := readPage.getStringNoLock(idx)
 				if !ok {
 					return fmt.Errorf("%w: %v", ErrNoValidKeyIndex, idx)
 				}
@@ -231,14 +229,24 @@ func (db *DB[K, V]) scanStringKeys(snap *strMapSnapshot, universe posting.List, 
 		return nil
 	}
 
-	chainPos := 0
+	var (
+		pageIdx  = -1
+		readPage *strMapReadPage
+	)
 	for iter.HasNext() {
 		idx := iter.Next()
-		for chainPos+1 < len(chain) && idx > chain[chainPos].Next {
-			chainPos++
+		s := ""
+		ok := false
+		if len(snap.readDirs) > 0 {
+			curPage := strMapReadPageIndex(idx)
+			if curPage != pageIdx {
+				pageIdx = curPage
+				readPage = snap.readPageAtNoLock(curPage)
+			}
+			if readPage != nil {
+				s, ok = readPage.getStringNoLock(idx)
+			}
 		}
-
-		s, ok := chain[chainPos].getOwnStringNoLock(idx)
 		if !ok {
 			s, ok = snap.getStringNoLock(idx)
 		}

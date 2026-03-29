@@ -1722,7 +1722,7 @@ func writeStrMapSnapshot(writer *bufio.Writer, sm *strMapSnapshot) error {
 	}
 
 	var chainInline [32]strMapSnapshotPersistNode
-	chain, usedCount := strMapSnapshotPersistChain(sm, chainInline[:0])
+	chain, usedCount := strMapSnapshotPersistNodes(sm, chainInline[:0])
 
 	if strMapSnapshotShouldPersistSparse(sm, usedCount) {
 		if err := writer.WriteByte(strMapEncodingSparse); err != nil {
@@ -1785,12 +1785,43 @@ func writeStrMapSnapshot(writer *bufio.Writer, sm *strMapSnapshot) error {
 }
 
 type strMapSnapshotPersistNode struct {
-	snap *strMapSnapshot
+	start     uint64
+	next      uint64
+	strs      map[uint64]string
+	denseStrs []string
+	denseUsed []bool
 }
 
-func strMapSnapshotPersistChain(sm *strMapSnapshot, inline []strMapSnapshotPersistNode) ([]strMapSnapshotPersistNode, int) {
+func strMapSnapshotPersistNodes(sm *strMapSnapshot, inline []strMapSnapshotPersistNode) ([]strMapSnapshotPersistNode, int) {
 	if sm == nil {
 		return nil, 0
+	}
+	if len(sm.readDirs) > 0 {
+		var nodes []strMapSnapshotPersistNode
+		usedCount := 0
+		pageCount := strMapReadPageCount(sm.Next)
+		for page := 0; page < pageCount; page++ {
+			readPage := sm.readPageAtNoLock(page)
+			if readPage == nil {
+				continue
+			}
+			nodes = append(nodes, strMapSnapshotPersistNode{
+				start:     readPage.Start,
+				next:      readPage.Next,
+				strs:      readPage.Strs,
+				denseStrs: readPage.DenseStrs,
+				denseUsed: readPage.DenseUsed,
+			})
+			usedCount += readPage.usedCountNoLock()
+		}
+		if len(nodes) == 0 {
+			return nil, usedCount
+		}
+		if len(nodes) <= cap(inline) {
+			copy(inline[:len(nodes)], nodes)
+			nodes = inline[:len(nodes)]
+		}
+		return nodes, usedCount
 	}
 
 	depth := 0
@@ -1799,19 +1830,33 @@ func strMapSnapshotPersistChain(sm *strMapSnapshot, inline []strMapSnapshotPersi
 		depth++
 		usedCount += strMapSnapshotOwnUsedCount(cur)
 	}
+	if depth == 0 {
+		return nil, 0
+	}
 
-	var chain []strMapSnapshotPersistNode
+	var nodes []strMapSnapshotPersistNode
 	if depth <= cap(inline) {
-		chain = inline[:depth]
+		nodes = inline[:depth]
 	} else {
-		chain = make([]strMapSnapshotPersistNode, depth)
+		nodes = make([]strMapSnapshotPersistNode, depth)
 	}
 	i := depth
 	for cur := sm; cur != nil; cur = cur.base {
 		i--
-		chain[i] = strMapSnapshotPersistNode{snap: cur}
+		start := cur.baseNextNoLock() + 1
+		if cur.base == nil {
+			start = 1
+		}
+		denseStrs, denseUsed := strMapDenseWindowNoLock(cur.DenseStrs, cur.DenseUsed, start, cur.Next)
+		nodes[i] = strMapSnapshotPersistNode{
+			start:     start,
+			next:      cur.Next,
+			strs:      cur.Strs,
+			denseStrs: denseStrs,
+			denseUsed: denseUsed,
+		}
 	}
-	return chain, usedCount
+	return nodes, usedCount
 }
 
 type strMapSnapshotPersistIter struct {
@@ -1828,14 +1873,15 @@ func (it *strMapSnapshotPersistIter) next() (uint64, string, bool) {
 	for it.node < len(it.chain) {
 		switch it.mode {
 		case 1:
-			cur := it.chain[it.node].snap
+			node := it.chain[it.node]
 			for it.densePos < it.denseLimit {
-				idx := it.densePos
+				idx := uint64(it.densePos)
 				it.densePos++
-				if !cur.DenseUsed[idx] {
+				pos := int(idx - node.start)
+				if pos < 0 || pos >= len(node.denseUsed) || !node.denseUsed[pos] {
 					continue
 				}
-				return uint64(idx), cur.DenseStrs[idx], true
+				return idx, node.denseStrs[pos], true
 			}
 			it.mode = 0
 			it.node++
@@ -1853,13 +1899,10 @@ func (it *strMapSnapshotPersistIter) next() (uint64, string, bool) {
 			continue
 		}
 
-		cur := it.chain[it.node].snap
-		if len(cur.DenseStrs) > 0 || len(cur.DenseUsed) > 0 {
-			start := int(cur.baseNextNoLock() + 1)
-			if start < 1 {
-				start = 1
-			}
-			limit := min(len(cur.DenseStrs), len(cur.DenseUsed))
+		node := it.chain[it.node]
+		if len(node.denseStrs) > 0 || len(node.denseUsed) > 0 {
+			start := int(node.start)
+			limit := start + min(len(node.denseStrs), len(node.denseUsed))
 			if start >= limit {
 				it.node++
 				continue
@@ -1869,13 +1912,16 @@ func (it *strMapSnapshotPersistIter) next() (uint64, string, bool) {
 			it.mode = 1
 			continue
 		}
-		if len(cur.Strs) == 0 {
+		if len(node.strs) == 0 {
 			it.node++
 			continue
 		}
 
 		it.sparse = it.sparse[:0]
-		for idx, value := range cur.Strs {
+		for idx, value := range node.strs {
+			if idx < node.start || idx > node.next {
+				continue
+			}
 			it.sparse = append(it.sparse, strMapSparseEntry{idx: idx, value: value})
 		}
 		slices.SortFunc(it.sparse, func(a, b strMapSparseEntry) int {

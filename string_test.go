@@ -273,6 +273,176 @@ func TestStringExt_SharedAutoBatchUniqueRejectHolePersistsAcrossReopen(t *testin
 	assertHole("reopen")
 }
 
+func TestStringExt_RollbackCreatedStrIdxRestoresCommittedSnapshotBase(t *testing.T) {
+	db, _ := openTempDBStringUnique(t)
+
+	seed := []struct {
+		key   string
+		email string
+		code  int
+	}{
+		{key: "seed-a", email: "a@x", code: 1},
+		{key: "seed-b", email: "b@x", code: 2},
+		{key: "seed-c", email: "c@x", code: 3},
+	}
+	for _, item := range seed {
+		if err := db.Set(item.key, &StringUniqueTestRec{Email: item.email, Code: item.code}); err != nil {
+			t.Fatalf("seed Set(%q): %v", item.key, err)
+		}
+	}
+
+	db.strmap.Lock()
+	before := db.strmap.committed
+	beforePublished := db.strmap.committedPub
+	db.strmap.Unlock()
+	if before == nil || before.Next != uint64(len(seed)) {
+		t.Fatalf("unexpected committed base before reject: %#v", before)
+	}
+	if beforePublished == nil || beforePublished.Next != before.Next {
+		t.Fatalf("unexpected committed published snapshot before reject: %#v", beforePublished)
+	}
+
+	err := db.Set("ghost-dup", &StringUniqueTestRec{Email: "a@x", Code: 99})
+	if !errors.Is(err, ErrUniqueViolation) {
+		t.Fatalf("duplicate Set error = %v, want %v", err, ErrUniqueViolation)
+	}
+
+	db.strmap.Lock()
+	if db.strmap.snap != before {
+		db.strmap.Unlock()
+		t.Fatalf("rollback did not restore committed state snapshot base")
+	}
+	if db.strmap.published != beforePublished {
+		db.strmap.Unlock()
+		t.Fatalf("rollback did not restore committed published snapshot")
+	}
+	if db.strmap.pubSource != before {
+		db.strmap.Unlock()
+		t.Fatalf("rollback did not restore committed publish source")
+	}
+	if db.strmap.dirty {
+		db.strmap.Unlock()
+		t.Fatalf("rollback left strmap dirty")
+	}
+	db.strmap.Unlock()
+
+	if err := db.Set("real-ok", &StringUniqueTestRec{Email: "real@x", Code: 100}); err != nil {
+		t.Fatalf("good Set: %v", err)
+	}
+
+	db.strmap.Lock()
+	latest := db.strmap.snap
+	db.strmap.Unlock()
+	if latest == nil {
+		t.Fatalf("missing latest state snapshot after successful insert")
+	}
+	if latest.base != before {
+		t.Fatalf("next successful publish did not reuse committed base: got=%p want=%p", latest.base, before)
+	}
+	if latest.baseNextNoLock() != before.Next {
+		t.Fatalf("latest delta base next = %d, want %d", latest.baseNextNoLock(), before.Next)
+	}
+	if got := strMapSnapshotOwnUsedCount(latest); got != 1 {
+		t.Fatalf("latest delta own used count = %d, want 1", got)
+	}
+	if got, ok := latest.getStringNoLock(before.Next + 1); !ok || got != "real-ok" {
+		t.Fatalf("latest delta reverse mapping mismatch: got=%q ok=%v", got, ok)
+	}
+}
+
+func TestStringExt_ConcurrentLazySnapshotKeyLookup(t *testing.T) {
+	db, _ := openTempDBString(t)
+
+	const n = 64
+	keys := make([]string, 0, n)
+	for i := 0; i < n; i++ {
+		key := fmt.Sprintf("key-%02d", i)
+		keys = append(keys, key)
+		if err := db.Set(key, &Rec{Name: key}); err != nil {
+			t.Fatalf("Set(%q): %v", key, err)
+		}
+	}
+
+	snap := db.getSnapshot()
+	if snap == nil || snap.strmap == nil {
+		t.Fatalf("expected published string snapshot")
+	}
+	if snap.strmap.Keys != nil {
+		t.Fatalf("expected lazy Keys materialization on published snapshot")
+	}
+
+	start := make(chan struct{})
+	errCh := make(chan error, len(keys))
+	var wg sync.WaitGroup
+	for _, key := range keys {
+		key := key
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			idx, ok := snap.strmap.getIdxNoLock(key)
+			if !ok {
+				errCh <- fmt.Errorf("missing idx for %q", key)
+				return
+			}
+			back, ok := snap.strmap.getStringNoLock(idx)
+			if !ok || back != key {
+				errCh <- fmt.Errorf("round-trip mismatch for %q: idx=%d back=%q ok=%v", key, idx, back, ok)
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(errCh)
+
+	for err := range errCh {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if snap.strmap.Keys == nil {
+		t.Fatalf("expected concurrent lookup to materialize Keys")
+	}
+}
+
+func TestStringExt_PublishedReadPagesPreserveQueryAndScanOrder(t *testing.T) {
+	db, _ := openTempDBString(t)
+
+	const n = 320
+	want := make([]string, 0, n)
+	for i := 0; i < n; i++ {
+		key := fmt.Sprintf("key-%03d", i)
+		want = append(want, key)
+		if err := db.Set(key, &Rec{Name: key, Age: i}); err != nil {
+			t.Fatalf("Set(%q): %v", key, err)
+		}
+	}
+
+	snap := db.getSnapshot()
+	if snap == nil || snap.strmap == nil {
+		t.Fatalf("expected published string snapshot")
+	}
+	if len(snap.strmap.readDirs) == 0 {
+		t.Fatalf("expected multi-page published read layout")
+	}
+
+	gotKeys, err := db.QueryKeys(&qx.QX{Expr: qx.Expr{Op: qx.OpNOOP}})
+	if err != nil {
+		t.Fatalf("QueryKeys(NOOP): %v", err)
+	}
+	if !slices.Equal(gotKeys, want) {
+		t.Fatalf("query order mismatch: got=%v want=%v", gotKeys[:min(len(gotKeys), 8)], want[:8])
+	}
+
+	gotScan, err := stringTestScanSnapshotKeys(db, snap, "")
+	if err != nil {
+		t.Fatalf("scan snapshot keys: %v", err)
+	}
+	if !slices.Equal(gotScan, want) {
+		t.Fatalf("scan order mismatch: got=%v want=%v", gotScan[:min(len(gotScan), 8)], want[:8])
+	}
+}
+
 func TestStringExt_BeginQueryTxSnapshotScanAndQueryStayConsistentDuringDeleteReinsertChurn(t *testing.T) {
 	db, _ := openTempDBString(t)
 

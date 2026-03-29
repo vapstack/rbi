@@ -344,6 +344,9 @@ func (db *DB[K, V]) finishSnapshotPublishNoLock(s *indexSnapshot) {
 	db.lenZeroComplement = s.lenZeroComplement
 	db.universe = s.universe
 	db.publishSnapshotRef(s)
+	if db.strkey && db.strmap != nil {
+		db.strmap.markCommittedPublished(s.strmap)
+	}
 }
 
 func (db *DB[K, V]) getSnapshot() *indexSnapshot {

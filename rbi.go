@@ -1544,6 +1544,28 @@ type strMapSnapshot struct {
 	base      *strMapSnapshot
 	anchor    *strMapSnapshot
 	depth     int
+	readDirs  []*strMapReadDir
+	keysOnce  sync.Once
+}
+
+const (
+	strMapReadPageShift = 8
+	strMapReadPageSize  = 1 << strMapReadPageShift
+	strMapReadDirShift  = 8
+	strMapReadDirSize   = 1 << strMapReadDirShift
+	strMapReadDirMask   = strMapReadDirSize - 1
+)
+
+type strMapReadDir struct {
+	Pages [strMapReadDirSize]*strMapReadPage
+}
+
+type strMapReadPage struct {
+	Start     uint64
+	Next      uint64
+	Strs      map[uint64]string
+	DenseStrs []string
+	DenseUsed []bool
 }
 
 func (s *strMapSnapshot) baseNextNoLock() uint64 {
@@ -1574,8 +1596,299 @@ func (s *strMapSnapshot) getOwnStringNoLock(idx uint64) (string, bool) {
 	return v, ok
 }
 
-func (s *strMapSnapshot) getIdxNoLock(key string) (uint64, bool) {
+func strMapDenseWindowNoLock(strs []string, used []bool, start, next uint64) ([]string, []bool) {
+	if start > next || start > uint64(^uint(0)>>1) {
+		return nil, nil
+	}
+	limit := min(len(strs), len(used))
+	if limit == 0 {
+		return nil, nil
+	}
+	pos := int(start)
+	if pos < 0 || pos >= limit {
+		return nil, nil
+	}
+	end := limit
+	if next < uint64(^uint(0)>>1) {
+		maxPos := int(next) + 1
+		if maxPos < end {
+			end = maxPos
+		}
+	}
+	if pos >= end {
+		return nil, nil
+	}
+	return strs[pos:end], used[pos:end]
+}
+
+func newStrMapReadPageNoLock(node *strMapSnapshot, start, next uint64) *strMapReadPage {
+	if node == nil || start > next {
+		return nil
+	}
+	if len(node.DenseStrs) > 0 || len(node.DenseUsed) > 0 {
+		denseStrs, denseUsed := strMapDenseWindowNoLock(node.DenseStrs, node.DenseUsed, start, next)
+		if len(denseStrs) == 0 && len(denseUsed) == 0 {
+			return nil
+		}
+		return &strMapReadPage{
+			Start:     start,
+			Next:      next,
+			DenseStrs: denseStrs,
+			DenseUsed: denseUsed,
+		}
+	}
+	if node.Strs == nil {
+		return nil
+	}
+	return &strMapReadPage{
+		Start: start,
+		Next:  next,
+		Strs:  node.Strs,
+	}
+}
+
+func materializeStrMapReadPageNoLock(prefix *strMapReadPage, delta *strMapSnapshot, deltaStart, start, next uint64) *strMapReadPage {
+	if start > next || start > uint64(^uint(0)>>1) {
+		return nil
+	}
+	size := int(next-start) + 1
+	denseStrs := make([]string, size)
+	denseUsed := make([]bool, size)
+	if prefix != nil {
+		prefixNext := min(next, deltaStart-1)
+		for idx := start; idx <= prefixNext; idx++ {
+			value, ok := prefix.getStringNoLock(idx)
+			if !ok {
+				continue
+			}
+			pos := int(idx - start)
+			denseStrs[pos] = value
+			denseUsed[pos] = true
+		}
+	}
+	if delta != nil {
+		deltaPos := max(start, deltaStart)
+		for idx := deltaPos; idx <= next; idx++ {
+			value, ok := delta.getOwnStringNoLock(idx)
+			if !ok {
+				continue
+			}
+			pos := int(idx - start)
+			denseStrs[pos] = value
+			denseUsed[pos] = true
+		}
+	}
+	return &strMapReadPage{
+		Start:     start,
+		Next:      next,
+		DenseStrs: denseStrs,
+		DenseUsed: denseUsed,
+	}
+}
+
+func buildStrMapSparsePageMapsNoLock(strs map[uint64]string, start, next uint64) map[int]map[uint64]string {
+	if len(strs) == 0 || start > next {
+		return nil
+	}
+	pageMaps := make(map[int]map[uint64]string)
+	for idx, value := range strs {
+		if idx < start || idx > next {
+			continue
+		}
+		page := strMapReadPageIndex(idx)
+		pageStrs := pageMaps[page]
+		if pageStrs == nil {
+			pageStrs = make(map[uint64]string)
+			pageMaps[page] = pageStrs
+		}
+		pageStrs[idx] = value
+	}
+	return pageMaps
+}
+
+func (page *strMapReadPage) getStringNoLock(idx uint64) (string, bool) {
+	if page == nil || idx < page.Start || idx > page.Next {
+		return "", false
+	}
+	if len(page.DenseStrs) > 0 || len(page.DenseUsed) > 0 {
+		if idx-page.Start > uint64(^uint(0)>>1) {
+			return "", false
+		}
+		i := int(idx - page.Start)
+		if i < len(page.DenseStrs) && i < len(page.DenseUsed) && page.DenseUsed[i] {
+			return page.DenseStrs[i], true
+		}
+		return "", false
+	}
+	if page.Strs == nil {
+		return "", false
+	}
+	v, ok := page.Strs[idx]
+	return v, ok
+}
+
+func (page *strMapReadPage) appendKeysNoLock(dst map[string]uint64) {
+	if page == nil {
+		return
+	}
+	if page.Strs != nil {
+		for idx, value := range page.Strs {
+			if idx >= page.Start && idx <= page.Next {
+				dst[value] = idx
+			}
+		}
+		return
+	}
+	limit := min(len(page.DenseStrs), len(page.DenseUsed))
+	for i := 0; i < limit; i++ {
+		if !page.DenseUsed[i] {
+			continue
+		}
+		dst[page.DenseStrs[i]] = page.Start + uint64(i)
+	}
+}
+
+func (page *strMapReadPage) usedCountNoLock() int {
+	if page == nil {
+		return 0
+	}
+	if page.Strs != nil {
+		count := 0
+		for idx := range page.Strs {
+			if idx >= page.Start && idx <= page.Next {
+				count++
+			}
+		}
+		return count
+	}
+	limit := min(len(page.DenseStrs), len(page.DenseUsed))
+	count := 0
+	for i := 0; i < limit; i++ {
+		if !page.DenseUsed[i] {
+			continue
+		}
+		count++
+	}
+	return count
+}
+
+func strMapReadPageCount(next uint64) int {
+	if next == 0 {
+		return 0
+	}
+	return int(((next - 1) >> strMapReadPageShift) + 1)
+}
+
+func strMapReadPageIndex(idx uint64) int {
+	return int((idx - 1) >> strMapReadPageShift)
+}
+
+func strMapReadPageBounds(page int, next uint64) (uint64, uint64) {
+	start := uint64(page)<<strMapReadPageShift + 1
+	end := start + strMapReadPageSize - 1
+	if end > next {
+		end = next
+	}
+	return start, end
+}
+
+func (s *strMapSnapshot) readPageAtNoLock(page int) *strMapReadPage {
+	if s == nil || page < 0 || len(s.readDirs) == 0 {
+		return nil
+	}
+	dirIdx := page >> strMapReadDirShift
+	if dirIdx >= len(s.readDirs) {
+		return nil
+	}
+	dir := s.readDirs[dirIdx]
+	if dir == nil {
+		return nil
+	}
+	return dir.Pages[page&strMapReadDirMask]
+}
+
+func (s *strMapSnapshot) readPageNoLock(idx uint64) *strMapReadPage {
+	if s == nil || idx == 0 || idx > s.Next {
+		return nil
+	}
+	return s.readPageAtNoLock(strMapReadPageIndex(idx))
+}
+
+func (s *strMapSnapshot) buildKeysNoLock() map[string]uint64 {
+	if s == nil || s.Next == 0 {
+		return nil
+	}
+	usedCount := strMapSnapshotUsedCountNoLock(s)
+	if usedCount == 0 {
+		return nil
+	}
+	keys := make(map[string]uint64, usedCount)
+	if len(s.readDirs) > 0 {
+		for _, dir := range s.readDirs {
+			if dir == nil {
+				continue
+			}
+			for i := range dir.Pages {
+				dir.Pages[i].appendKeysNoLock(keys)
+			}
+		}
+		return keys
+	}
+	if s.base == nil {
+		newStrMapReadPageNoLock(s, 1, s.Next).appendKeysNoLock(keys)
+		return keys
+	}
 	for cur := s; cur != nil; cur = cur.base {
+		start := cur.baseNextNoLock() + 1
+		if cur.base == nil {
+			start = 1
+		}
+		newStrMapReadPageNoLock(cur, start, cur.Next).appendKeysNoLock(keys)
+	}
+	return keys
+}
+
+func (s *strMapSnapshot) ensureKeysNoLock() map[string]uint64 {
+	if s == nil {
+		return nil
+	}
+	s.keysOnce.Do(func() {
+		if s.Keys == nil {
+			s.Keys = s.buildKeysNoLock()
+		}
+	})
+	return s.Keys
+}
+
+func (s *strMapSnapshot) getIdxNoLock(key string) (uint64, bool) {
+	if s == nil {
+		return 0, false
+	}
+	if len(s.readDirs) > 0 {
+		keys := s.ensureKeysNoLock()
+		if keys == nil {
+			return 0, false
+		}
+		v, ok := keys[key]
+		return v, ok
+	}
+	if s.base == nil {
+		keys := s.ensureKeysNoLock()
+		if keys == nil {
+			return 0, false
+		}
+		v, ok := keys[key]
+		return v, ok
+	}
+	for cur := s; cur != nil; cur = cur.base {
+		if cur.base == nil {
+			keys := cur.ensureKeysNoLock()
+			if keys == nil {
+				return 0, false
+			}
+			v, ok := keys[key]
+			return v, ok
+		}
 		if cur.Keys == nil {
 			continue
 		}
@@ -1587,17 +1900,23 @@ func (s *strMapSnapshot) getIdxNoLock(key string) (uint64, bool) {
 }
 
 func (s *strMapSnapshot) getStringNoLock(idx uint64) (string, bool) {
-	for cur := s; cur != nil; {
-		if idx > cur.Next {
+	if s == nil || idx == 0 || idx > s.Next {
+		return "", false
+	}
+	if len(s.readDirs) > 0 {
+		page := s.readPageNoLock(idx)
+		if page == nil {
 			return "", false
 		}
+		return page.getStringNoLock(idx)
+	}
+	if s.base == nil {
+		return s.getOwnStringNoLock(idx)
+	}
+	for cur := s; cur != nil; {
 		if len(cur.DenseStrs) > 0 || len(cur.DenseUsed) > 0 {
-			if idx > uint64(^uint(0)>>1) {
-				return "", false
-			}
-			i := int(idx)
-			if i < len(cur.DenseStrs) && i < len(cur.DenseUsed) && cur.DenseUsed[i] {
-				return cur.DenseStrs[i], true
+			if value, ok := cur.getOwnStringNoLock(idx); ok {
+				return value, true
 			}
 			if cur.base == nil {
 				return "", false
@@ -1639,11 +1958,15 @@ type strMapper struct {
 	Keys map[string]uint64
 	Strs []string
 
-	sparseStrs map[uint64]string
-	strsUsed   []bool
-	snap       *strMapSnapshot
-	dirty      bool
-	compactAt  int
+	sparseStrs   map[uint64]string
+	strsUsed     []bool
+	snap         *strMapSnapshot
+	published    *strMapSnapshot
+	pubSource    *strMapSnapshot
+	committed    *strMapSnapshot
+	committedPub *strMapSnapshot
+	dirty        bool
+	compactAt    int
 
 	sync.Mutex
 }
@@ -1659,7 +1982,12 @@ func newStrMapper(size uint64, compactAt int) *strMapper {
 		strsUsed:  make([]bool, 1, capHint),
 		compactAt: compactAt,
 	}
-	sm.snap = new(strMapSnapshot)
+	empty := new(strMapSnapshot)
+	sm.snap = empty
+	sm.published = empty
+	sm.pubSource = empty
+	sm.committed = empty
+	sm.committedPub = empty
 	return sm
 }
 
@@ -1674,7 +2002,12 @@ func (sm *strMapper) truncate() {
 	sm.sparseStrs = nil
 	sm.strsUsed = sm.strsUsed[:1]
 	sm.strsUsed[0] = false
-	sm.snap = &strMapSnapshot{}
+	empty := &strMapSnapshot{}
+	sm.snap = empty
+	sm.published = empty
+	sm.pubSource = empty
+	sm.committed = empty
+	sm.committedPub = empty
 	sm.dirty = false
 }
 
@@ -1711,15 +2044,21 @@ func (sm *strMapper) replaceAllDenseNoLock(keys map[string]uint64, strs []string
 	sm.Strs = strs
 	sm.sparseStrs = nil
 	sm.strsUsed = used
-	keysCopy := maps.Clone(keys)
 	sm.snap = &strMapSnapshot{
 		Next:      next,
-		Keys:      keysCopy,
 		Strs:      nil,
 		DenseStrs: slices.Clone(strs),
 		DenseUsed: slices.Clone(used),
 		depth:     1,
 	}
+	sm.published = &strMapSnapshot{
+		Next:      next,
+		DenseStrs: sm.snap.DenseStrs,
+		DenseUsed: sm.snap.DenseUsed,
+	}
+	sm.pubSource = sm.snap
+	sm.committed = sm.snap
+	sm.committedPub = sm.published
 	sm.dirty = false
 }
 
@@ -1729,15 +2068,20 @@ func (sm *strMapper) replaceAllSparseNoLock(keys map[string]uint64, strs map[uin
 	sm.Strs = nil
 	sm.sparseStrs = strs
 	sm.strsUsed = nil
-	keysCopy := maps.Clone(keys)
 	sm.snap = &strMapSnapshot{
 		Next:      next,
-		Keys:      keysCopy,
 		Strs:      maps.Clone(strs),
 		DenseStrs: nil,
 		DenseUsed: nil,
 		depth:     1,
 	}
+	sm.published = &strMapSnapshot{
+		Next: next,
+		Strs: sm.snap.Strs,
+	}
+	sm.pubSource = sm.snap
+	sm.committed = sm.snap
+	sm.committedPub = sm.published
 	sm.dirty = false
 }
 
@@ -1748,6 +2092,16 @@ func (sm *strMapper) snapshot() *strMapSnapshot {
 }
 
 func (sm *strMapper) snapshotNoLock() *strMapSnapshot {
+	base := sm.stateSnapshotNoLock()
+	if sm.published != nil && sm.pubSource == base {
+		return sm.published
+	}
+	sm.published = buildPublishedStrMapSnapshot(base, sm.pubSource, sm.published)
+	sm.pubSource = base
+	return sm.published
+}
+
+func (sm *strMapper) stateSnapshotNoLock() *strMapSnapshot {
 	if sm.snap == nil {
 		sm.snap = &strMapSnapshot{}
 	}
@@ -1757,7 +2111,7 @@ func (sm *strMapper) snapshotNoLock() *strMapSnapshot {
 	if next, ok := sm.deltaSnapshotNoLock(sm.snap); ok {
 		sm.snap = next
 		sm.dirty = false
-		return sm.snap
+		return next
 	}
 	sm.snap = sm.fullSnapshotNoLock()
 	sm.dirty = false
@@ -1767,7 +2121,6 @@ func (sm *strMapper) snapshotNoLock() *strMapSnapshot {
 func (sm *strMapper) fullSnapshotNoLock() *strMapSnapshot {
 	snap := &strMapSnapshot{
 		Next:  sm.Next,
-		Keys:  maps.Clone(sm.Keys),
 		depth: 1,
 	}
 	if sm.sparseStrs != nil {
@@ -1816,7 +2169,6 @@ func (sm *strMapper) deltaSnapshotNoLock(base *strMapSnapshot) (*strMapSnapshot,
 		return base, true
 	}
 
-	keys := make(map[string]uint64, count)
 	strs := make(map[uint64]string, count)
 	if sm.sparseStrs != nil {
 		for idx := start; idx <= sm.Next; idx++ {
@@ -1824,7 +2176,6 @@ func (sm *strMapper) deltaSnapshotNoLock(base *strMapSnapshot) (*strMapSnapshot,
 			if !ok {
 				continue
 			}
-			keys[s] = idx
 			strs[idx] = s
 		}
 	} else {
@@ -1835,7 +2186,6 @@ func (sm *strMapper) deltaSnapshotNoLock(base *strMapSnapshot) (*strMapSnapshot,
 			}
 			s := sm.Strs[i]
 			idx := uint64(i)
-			keys[s] = idx
 			strs[idx] = s
 		}
 	}
@@ -1847,10 +2197,252 @@ func (sm *strMapper) deltaSnapshotNoLock(base *strMapSnapshot) (*strMapSnapshot,
 
 	return &strMapSnapshot{
 		Next:   sm.Next,
-		Keys:   keys,
 		Strs:   strs,
 		base:   base,
 		anchor: anchor,
 		depth:  base.depth + 1,
 	}, true
+}
+
+func (sm *strMapper) restoreCommittedNoLock() {
+	baseNext := uint64(0)
+	if sm.committed != nil {
+		baseNext = sm.committed.Next
+	}
+	if sm.committed == nil {
+		base := &strMapSnapshot{}
+		sm.snap = base
+		sm.published = base
+		sm.pubSource = base
+		sm.committed = base
+		sm.committedPub = base
+		sm.dirty = sm.Next != 0
+		return
+	}
+	sm.snap = sm.committed
+	sm.published = sm.committedPub
+	sm.pubSource = sm.committed
+	sm.dirty = sm.Next != baseNext
+}
+
+func (sm *strMapper) markCommittedPublished(published *strMapSnapshot) {
+	sm.Lock()
+	defer sm.Unlock()
+	sm.markCommittedPublishedNoLock(published)
+}
+
+func (sm *strMapper) markCommittedPublishedNoLock(published *strMapSnapshot) {
+	if sm.published == published && sm.pubSource != nil {
+		sm.committed = sm.pubSource
+		sm.committedPub = published
+		return
+	}
+	if sm.snap != nil && !sm.dirty {
+		sm.committed = sm.snap
+		if published != nil {
+			sm.committedPub = published
+			return
+		}
+		sm.committedPub = buildPublishedStrMapSnapshot(sm.snap, nil, nil)
+	}
+}
+
+type strMapReadBuilder struct {
+	dirs   []*strMapReadDir
+	shared []*strMapReadDir
+}
+
+func newStrMapReadBuilder(pageCount int, shared []*strMapReadDir) strMapReadBuilder {
+	dirCount := (pageCount + strMapReadDirSize - 1) >> strMapReadDirShift
+	dirs := make([]*strMapReadDir, dirCount)
+	if len(shared) > 0 {
+		copy(dirs, shared[:min(len(shared), len(dirs))])
+	}
+	return strMapReadBuilder{
+		dirs:   dirs,
+		shared: shared,
+	}
+}
+
+func (b *strMapReadBuilder) pageAtNoLock(page int) *strMapReadPage {
+	if b == nil || page < 0 {
+		return nil
+	}
+	dirIdx := page >> strMapReadDirShift
+	if dirIdx >= len(b.dirs) {
+		return nil
+	}
+	dir := b.dirs[dirIdx]
+	if dir == nil {
+		return nil
+	}
+	return dir.Pages[page&strMapReadDirMask]
+}
+
+func (b *strMapReadBuilder) setPageNoLock(page int, readPage *strMapReadPage) {
+	if b == nil || page < 0 {
+		return
+	}
+	dirIdx := page >> strMapReadDirShift
+	if dirIdx >= len(b.dirs) {
+		return
+	}
+	dir := b.dirs[dirIdx]
+	if dir == nil {
+		dir = &strMapReadDir{}
+		b.dirs[dirIdx] = dir
+	} else if dirIdx < len(b.shared) && dir == b.shared[dirIdx] {
+		cloned := *dir
+		dir = &cloned
+		b.dirs[dirIdx] = dir
+	}
+	dir.Pages[page&strMapReadDirMask] = readPage
+}
+
+func appendStrMapReadPagesNoLock(builder *strMapReadBuilder, node *strMapSnapshot, start, next uint64) {
+	if builder == nil || node == nil || start > next || next == 0 {
+		return
+	}
+
+	firstPage := strMapReadPageIndex(start)
+	lastPage := strMapReadPageIndex(next)
+	if node.Strs == nil {
+		for page := firstPage; page <= lastPage; page++ {
+			pageStart, pageNext := strMapReadPageBounds(page, next)
+			if pageStart < start {
+				existing := builder.pageAtNoLock(page)
+				if existing != nil {
+					builder.setPageNoLock(page, materializeStrMapReadPageNoLock(existing, node, start, pageStart, pageNext))
+				} else {
+					builder.setPageNoLock(page, newStrMapReadPageNoLock(node, start, pageNext))
+				}
+				continue
+			}
+			builder.setPageNoLock(page, newStrMapReadPageNoLock(node, pageStart, pageNext))
+		}
+		return
+	}
+
+	if firstPage == lastPage {
+		pageStart, pageNext := strMapReadPageBounds(firstPage, next)
+		if pageStart < start {
+			existing := builder.pageAtNoLock(firstPage)
+			if existing != nil {
+				builder.setPageNoLock(firstPage, materializeStrMapReadPageNoLock(existing, node, start, pageStart, pageNext))
+				return
+			}
+			pageStart = start
+		}
+		builder.setPageNoLock(firstPage, newStrMapReadPageNoLock(node, pageStart, pageNext))
+		return
+	}
+
+	pageMaps := buildStrMapSparsePageMapsNoLock(node.Strs, start, next)
+	for page := firstPage; page <= lastPage; page++ {
+		pageStart, pageNext := strMapReadPageBounds(page, next)
+		if pageStart < start {
+			existing := builder.pageAtNoLock(page)
+			if existing != nil {
+				builder.setPageNoLock(page, materializeStrMapReadPageNoLock(existing, node, start, pageStart, pageNext))
+				continue
+			}
+			pageStart = start
+		}
+		pageStrs := pageMaps[page]
+		if len(pageStrs) == 0 {
+			continue
+		}
+		builder.setPageNoLock(page, &strMapReadPage{
+			Start: pageStart,
+			Next:  pageNext,
+			Strs:  pageStrs,
+		})
+	}
+}
+
+func buildPublishedStrMapSnapshotFromChain(state *strMapSnapshot) *strMapSnapshot {
+	if state == nil || state.Next == 0 {
+		return &strMapSnapshot{}
+	}
+	depth := 0
+	for cur := state; cur != nil; cur = cur.base {
+		depth++
+	}
+	chain := make([]*strMapSnapshot, depth)
+	i := depth
+	for cur := state; cur != nil; cur = cur.base {
+		i--
+		chain[i] = cur
+	}
+	chain = chain[i:]
+
+	builder := newStrMapReadBuilder(strMapReadPageCount(state.Next), nil)
+	for _, node := range chain {
+		start := node.baseNextNoLock() + 1
+		if node.base == nil {
+			start = 1
+		}
+		if node.Next == 0 || start > node.Next {
+			continue
+		}
+		appendStrMapReadPagesNoLock(&builder, node, start, node.Next)
+	}
+	return &strMapSnapshot{
+		Next:     state.Next,
+		readDirs: builder.dirs,
+	}
+}
+
+func buildPublishedStrMapSnapshotFromDelta(state *strMapSnapshot, prev *strMapSnapshot) *strMapSnapshot {
+	if state == nil || state.Next == 0 {
+		return &strMapSnapshot{}
+	}
+	if prev == nil || state.base == nil {
+		return buildPublishedStrMapSnapshotFromChain(state)
+	}
+
+	builder := newStrMapReadBuilder(strMapReadPageCount(state.Next), prev.readDirs)
+	start := state.baseNextNoLock() + 1
+	appendStrMapReadPagesNoLock(&builder, state, start, state.Next)
+	return &strMapSnapshot{
+		Next:     state.Next,
+		readDirs: builder.dirs,
+	}
+}
+
+func buildPublishedStrMapSnapshot(state, prevSource, prevPublished *strMapSnapshot) *strMapSnapshot {
+	if state == nil || state.Next == 0 {
+		return &strMapSnapshot{}
+	}
+	if state.base == nil {
+		return &strMapSnapshot{
+			Next:      state.Next,
+			Strs:      state.Strs,
+			DenseStrs: state.DenseStrs,
+			DenseUsed: state.DenseUsed,
+		}
+	}
+	if prevPublished != nil && prevSource == state.base && len(prevPublished.readDirs) > 0 {
+		return buildPublishedStrMapSnapshotFromDelta(state, prevPublished)
+	}
+	return buildPublishedStrMapSnapshotFromChain(state)
+}
+
+func strMapSnapshotUsedCountNoLock(s *strMapSnapshot) int {
+	if s == nil {
+		return 0
+	}
+	if len(s.readDirs) > 0 {
+		count := 0
+		for _, dir := range s.readDirs {
+			if dir == nil {
+				continue
+			}
+			for i := range dir.Pages {
+				count += dir.Pages[i].usedCountNoLock()
+			}
+		}
+		return count
+	}
+	return strMapSnapshotOwnUsedCount(s)
 }

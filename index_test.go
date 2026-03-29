@@ -484,6 +484,157 @@ func TestWriteStrMapSnapshot_SparseDeltaChainRoundTrip(t *testing.T) {
 	}
 }
 
+func TestWriteStrMapSnapshot_PublishedReadPagesRoundTrip(t *testing.T) {
+	const baseNext = 250
+
+	baseDenseStrs := make([]string, baseNext+1)
+	baseDenseUsed := make([]bool, baseNext+1)
+	for i := 1; i <= baseNext; i++ {
+		key := fmt.Sprintf("k%03d", i)
+		baseDenseStrs[i] = key
+		baseDenseUsed[i] = true
+	}
+
+	base := &strMapSnapshot{
+		Next:      baseNext,
+		DenseStrs: baseDenseStrs,
+		DenseUsed: baseDenseUsed,
+		depth:     1,
+	}
+	sm := &strMapSnapshot{
+		Next: 260,
+		Strs: map[uint64]string{
+			251: "k251",
+			253: "k253",
+			257: "k257",
+			260: "k260",
+		},
+		base:  base,
+		depth: 2,
+	}
+
+	published := buildPublishedStrMapSnapshot(sm, nil, nil)
+	if len(published.readDirs) == 0 {
+		t.Fatal("expected published read pages for delta snapshot")
+	}
+
+	var payload bytes.Buffer
+	writer := bufio.NewWriter(&payload)
+	if err := writeStrMapSnapshot(writer, published); err != nil {
+		t.Fatalf("writeStrMapSnapshot: %v", err)
+	}
+	if err := writer.Flush(); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+
+	got, err := readStrMap(bufio.NewReader(bytes.NewReader(payload.Bytes())), 0)
+	if err != nil {
+		t.Fatalf("readStrMap: %v", err)
+	}
+
+	for _, tc := range []struct {
+		idx uint64
+		key string
+	}{
+		{idx: 250, key: "k250"},
+		{idx: 251, key: "k251"},
+		{idx: 253, key: "k253"},
+		{idx: 257, key: "k257"},
+		{idx: 260, key: "k260"},
+	} {
+		gotKey, ok := got.snapshotNoLock().getStringNoLock(tc.idx)
+		if !ok || gotKey != tc.key {
+			t.Fatalf("reverse mapping mismatch at %d: got=%q ok=%v want=%q", tc.idx, gotKey, ok, tc.key)
+		}
+		gotIdx, ok := got.snapshotNoLock().getIdxNoLock(tc.key)
+		if !ok || gotIdx != tc.idx {
+			t.Fatalf("forward mapping mismatch for %q: got=%d ok=%v want=%d", tc.key, gotIdx, ok, tc.idx)
+		}
+	}
+
+	for _, hole := range []uint64{252, 254, 255, 256, 258, 259} {
+		if gotKey, ok := got.snapshotNoLock().getStringNoLock(hole); ok {
+			t.Fatalf("expected hole at %d, got %q", hole, gotKey)
+		}
+	}
+}
+
+func TestBuildPublishedStrMapSnapshot_SparseBasePagesStayPageLocalAfterDelta(t *testing.T) {
+	baseStrs := map[uint64]string{
+		1:   "k001",
+		255: "k255",
+		260: "k260",
+		511: "k511",
+		515: "k515",
+	}
+	baseKeys := map[string]uint64{
+		"k001": 1,
+		"k255": 255,
+		"k260": 260,
+		"k511": 511,
+		"k515": 515,
+	}
+
+	sm := newStrMapper(uint64(len(baseStrs)), defaultSnapshotStrMapCompactDepth)
+	sm.replaceAllSparseNoLock(baseKeys, baseStrs, 600)
+
+	if idx := sm.createIdxNoLock("k601"); idx != 601 {
+		t.Fatalf("unexpected appended idx: got=%d want=601", idx)
+	}
+
+	published := sm.snapshotNoLock()
+	if len(published.readDirs) == 0 {
+		t.Fatal("expected published read pages after sparse-base delta publish")
+	}
+
+	base := sm.snap.base
+	if base == nil || base.Strs == nil {
+		t.Fatalf("expected sparse base snapshot after append: %#v", base)
+	}
+
+	for _, tc := range []struct {
+		page      int
+		wantLen   int
+		absentIdx uint64
+	}{
+		{page: 0, wantLen: 2, absentIdx: 260},
+		{page: 1, wantLen: 2, absentIdx: 1},
+	} {
+		readPage := published.readPageAtNoLock(tc.page)
+		if readPage == nil || readPage.Strs == nil {
+			t.Fatalf("page %d missing sparse read page", tc.page)
+		}
+		if len(readPage.Strs) != tc.wantLen {
+			t.Fatalf("page %d sparse len = %d, want %d", tc.page, len(readPage.Strs), tc.wantLen)
+		}
+		if _, ok := readPage.Strs[tc.absentIdx]; ok {
+			t.Fatalf("page %d unexpectedly retained idx %d from another page", tc.page, tc.absentIdx)
+		}
+	}
+
+	if got := strMapSnapshotUsedCountNoLock(published); got != 6 {
+		t.Fatalf("published used count = %d, want 6", got)
+	}
+	for _, tc := range []struct {
+		key string
+		idx uint64
+	}{
+		{key: "k001", idx: 1},
+		{key: "k260", idx: 260},
+		{key: "k515", idx: 515},
+		{key: "k601", idx: 601},
+	} {
+		gotIdx, ok := published.getIdxNoLock(tc.key)
+		if !ok || gotIdx != tc.idx {
+			t.Fatalf("forward mismatch for %q: got=%d ok=%v want=%d", tc.key, gotIdx, ok, tc.idx)
+		}
+		gotKey, ok := published.getStringNoLock(tc.idx)
+		if !ok || gotKey != tc.key {
+			t.Fatalf("reverse mismatch for %d: got=%q ok=%v want=%q", tc.idx, gotKey, ok, tc.key)
+		}
+	}
+}
+
 func toPosting(ids ...uint64) posting.List {
 	var out posting.List
 	for _, id := range ids {
