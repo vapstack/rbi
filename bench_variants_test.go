@@ -168,7 +168,7 @@ func buildBenchDBDynamicProfileWithMode(b *testing.B, profile dynamicBenchProfil
 	dynamicBenchMu.Lock()
 	defer dynamicBenchMu.Unlock()
 
-	key := profile.name + "/" + mode.suffix
+	key := fmt.Sprintf("%s/%d/%s", profile.name, profile.n, mode.suffix)
 	if db := dynamicBenchDBs[key]; db != nil {
 		return db
 	}

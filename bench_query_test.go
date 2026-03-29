@@ -166,6 +166,10 @@ var (
 	oneMu     sync.Mutex
 )
 
+func benchDBCacheKey(mode benchCacheMode, n int) string {
+	return mode.suffix + "/" + strconv.Itoa(n)
+}
+
 func buildBenchDB(b *testing.B, n int) *DB[uint64, UserBench] {
 	return buildBenchDBWithCaching(b, n, benchCacheModes[0])
 }
@@ -174,7 +178,8 @@ func buildBenchDBWithCaching(b *testing.B, n int, mode benchCacheMode) *DB[uint6
 	b.Helper()
 	oneMu.Lock()
 	defer oneMu.Unlock()
-	if db := benchDBs[mode.suffix]; db != nil && !db.closed.Load() {
+	key := benchDBCacheKey(mode, n)
+	if db := benchDBs[key]; db != nil && !db.closed.Load() {
 		return db
 	}
 
@@ -192,9 +197,9 @@ func buildBenchDBWithCaching(b *testing.B, n int, mode benchCacheMode) *DB[uint6
 	// b.Logf("unique field keys: %v", s.UniqueFieldKeys)
 
 	b.StartTimer()
-	benchDBs[mode.suffix] = db
-	benchRaws[mode.suffix] = raw
-	benchDirs[mode.suffix] = dir
+	benchDBs[key] = db
+	benchRaws[key] = raw
+	benchDirs[key] = dir
 	return db
 }
 

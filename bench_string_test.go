@@ -13,12 +13,6 @@ import (
 	"go.etcd.io/bbolt"
 )
 
-const (
-	benchStringQueryN     = 300_000
-	benchStringQueryBatch = 20_000
-	benchStringWriteSeed  = 120_000
-)
-
 var (
 	oneStringDBs  = make(map[string]*DB[string, UserBench])
 	oneStringRaws = make(map[string]*bbolt.DB)
@@ -67,8 +61,8 @@ func seedBenchDataString(b *testing.B, db *DB[string, UserBench], n int) {
 		{"user", "support"},
 	}
 
-	ids := make([]string, 0, benchStringQueryBatch)
-	vals := make([]*UserBench, 0, benchStringQueryBatch)
+	ids := make([]string, 0, benchBatch)
+	vals := make([]*UserBench, 0, benchBatch)
 
 	flush := func() {
 		if len(ids) == 0 {
@@ -103,7 +97,7 @@ func seedBenchDataString(b *testing.B, db *DB[string, UserBench], n int) {
 
 		ids = append(ids, key)
 		vals = append(vals, rec)
-		if len(ids) == benchStringQueryBatch {
+		if len(ids) == benchBatch {
 			flush()
 		}
 	}
@@ -119,7 +113,8 @@ func buildBenchDBStringWithCaching(b *testing.B, n int, mode benchCacheMode) *DB
 	oneStringMu.Lock()
 	defer oneStringMu.Unlock()
 
-	if db := oneStringDBs[mode.suffix]; db != nil && !db.closed.Load() {
+	key := benchDBCacheKey(mode, n)
+	if db := oneStringDBs[key]; db != nil && !db.closed.Load() {
 		return db
 	}
 
@@ -128,16 +123,16 @@ func buildBenchDBStringWithCaching(b *testing.B, n int, mode benchCacheMode) *DB
 	seedBenchDataString(b, db, n)
 	b.StartTimer()
 
-	oneStringDBs[mode.suffix] = db
-	oneStringRaws[mode.suffix] = raw
-	oneStringDirs[mode.suffix] = dir
+	oneStringDBs[key] = db
+	oneStringRaws[key] = raw
+	oneStringDirs[key] = dir
 	return db
 }
 
 func runStringCountBenchCacheModes(b *testing.B, qf func() *qx.QX) {
 	b.Helper()
 	runBenchCacheModes(b, func(b *testing.B, mode benchCacheMode) {
-		db := buildBenchDBStringWithCaching(b, benchStringQueryN, mode)
+		db := buildBenchDBStringWithCaching(b, benchN, mode)
 		runStringCountBenchWithMode(b, db, qf(), mode)
 	})
 }
@@ -161,7 +156,7 @@ func buildWriteBenchDBString(b *testing.B) *DB[string, UserBench] {
 
 	ids := make([]string, 0, writeBenchSeedBatch)
 	vals := make([]*UserBench, 0, writeBenchSeedBatch)
-	for i := 1; i <= benchStringWriteSeed; i++ {
+	for i := 1; i <= writeBenchSeedCount; i++ {
 		key := fmt.Sprintf("seed-%06d", i)
 		rec := &UserBench{
 			Country: countries[r.IntN(len(countries))],
@@ -192,7 +187,7 @@ func buildWriteBenchDBString(b *testing.B) *DB[string, UserBench] {
 }
 
 func Benchmark_Query_Index_Count_Simple_EQ_Count_StringKeyDB(b *testing.B) {
-	db := buildBenchDBString(b, benchStringQueryN)
+	db := buildBenchDBString(b, benchN)
 	q := qx.Query(qx.EQ("country", "NL"))
 	runStringCountBench(b, db, q)
 }
@@ -326,20 +321,20 @@ func Benchmark_Query_Index_Count_Realistic_HeavyOR_StringKeyDB(b *testing.B) {
 }
 
 func Benchmark_Query_Index_Keys_Medium_IN_Limit_StringKeyDB(b *testing.B) {
-	db := buildBenchDBString(b, benchStringQueryN)
+	db := buildBenchDBString(b, benchN)
 	q := qx.Query(qx.IN("country", []string{"NL", "DE"})).Max(100)
 	runStringQueryKeysBench(b, db, q)
 }
 
 func Benchmark_Read_Query_Items_SingleByEmail_StringKeyDB(b *testing.B) {
-	db := buildBenchDBString(b, benchStringQueryN)
-	target := fmt.Sprintf("user%06d@example.com", benchStringQueryN/2)
+	db := buildBenchDBString(b, benchN)
+	target := fmt.Sprintf("user%06d@example.com", benchN/2)
 	q := qx.Query(qx.EQ("email", target)).Max(1)
 	runStringReadQueryBench(b, db, q)
 }
 
 func Benchmark_Read_Index_Keys_Scan_All_StringKeyDB(b *testing.B) {
-	db := buildBenchDBString(b, benchStringQueryN)
+	db := buildBenchDBString(b, benchN)
 
 	var count int
 	prepareReadBenchSnapshot(b, db)

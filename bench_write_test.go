@@ -16,6 +16,7 @@ import (
 )
 
 const writeBenchSeedBatch = 50_000
+const writeBenchSeedCount = 200_000
 const writeBenchUserBatchSize = 1000
 const writeBenchHighChurnOps = 2048
 
@@ -38,8 +39,6 @@ func buildWriteBenchDBWithOptions(b *testing.B, opts Options) (*DB[uint64, UserB
 	})
 	db.DisableSync()
 
-	seedCount := 200_000
-
 	r := newRand(42)
 	countries := []string{"US", "NL", "DE", "PL", "SE", "FR", "GB", "ES"}
 	plans := []string{"free", "basic", "pro", "enterprise"}
@@ -47,7 +46,7 @@ func buildWriteBenchDBWithOptions(b *testing.B, opts Options) (*DB[uint64, UserB
 	ids := make([]uint64, 0, writeBenchSeedBatch)
 	vals := make([]*UserBench, 0, writeBenchSeedBatch)
 
-	for i := 1; i <= seedCount; i++ {
+	for i := 1; i <= writeBenchSeedCount; i++ {
 		rec := &UserBench{
 			Country: countries[r.IntN(len(countries))],
 			Plan:    plans[r.IntN(len(plans))],
@@ -75,7 +74,7 @@ func buildWriteBenchDBWithOptions(b *testing.B, opts Options) (*DB[uint64, UserB
 
 	db.EnableSync()
 
-	return db, raw, uint64(seedCount)
+	return db, raw, uint64(writeBenchSeedCount)
 }
 
 func ensureBenchSideBucket(b *testing.B, raw *bbolt.DB, name string) []byte {

@@ -70,7 +70,8 @@ func buildBenchStressDBWithCaching(b *testing.B, n int, mode benchCacheMode) *DB
 	benchStressMu.Lock()
 	defer benchStressMu.Unlock()
 
-	if db := benchStressDBs[mode.suffix]; db != nil && !db.closed.Load() {
+	key := benchDBCacheKey(mode, n)
+	if db := benchStressDBs[key]; db != nil && !db.closed.Load() {
 		return db
 	}
 
@@ -79,9 +80,9 @@ func buildBenchStressDBWithCaching(b *testing.B, n int, mode benchCacheMode) *DB
 	seedBenchStressData(b, db, n)
 	b.StartTimer()
 
-	benchStressDBs[mode.suffix] = db
-	benchStressRaws[mode.suffix] = raw
-	benchStressDirs[mode.suffix] = dir
+	benchStressDBs[key] = db
+	benchStressRaws[key] = raw
+	benchStressDirs[key] = dir
 	return db
 }
 
