@@ -1,11 +1,14 @@
 package rbi
 
-import "go.etcd.io/bbolt"
+import (
+	"reflect"
+
+	"go.etcd.io/bbolt"
+)
 
 type beforeProcessFunc[K ~string | ~uint64, V any] = func(key K, value *V) error
 type beforeStoreFunc[K ~string | ~uint64, V any] = func(key K, oldValue, newValue *V) error
 type beforeCommitFunc[K ~string | ~uint64, V any] = func(tx *bbolt.Tx, key K, oldValue, newValue *V) error
-type cloneMethodValue[V any] interface{ Clone() *V }
 
 type execOptions[K ~string | ~uint64, V any] struct {
 	beforeProcess []beforeProcessFunc[K, V]
@@ -193,15 +196,19 @@ func applyExecOptions[K ~string | ~uint64, V any](cfg *execOptions[K, V], opts [
 }
 
 func defaultCloneValue[K ~string | ~uint64, V any]() func(K, *V) *V {
-	probe := new(V)
-	if _, ok := any(probe).(cloneMethodValue[V]); !ok {
+	method, ok := reflect.TypeFor[*V]().MethodByName("Clone")
+	if !ok {
+		return nil
+	}
+	clone, ok := method.Func.Interface().(func(*V) *V)
+	if !ok {
 		return nil
 	}
 	return func(_ K, v *V) *V {
 		if v == nil {
 			return nil
 		}
-		return any(v).(cloneMethodValue[V]).Clone()
+		return clone(v)
 	}
 }
 
