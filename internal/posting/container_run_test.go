@@ -5,6 +5,13 @@ import (
 	"testing"
 )
 
+func ownContainerRun(rc *containerRun) *containerRun {
+	if rc != nil {
+		rc.refs.Store(1)
+	}
+	return rc
+}
+
 func containerRangeUint16(start, endx int) []uint16 {
 	if start >= endx {
 		return nil

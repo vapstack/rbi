@@ -62,7 +62,7 @@ func listFromUint64Slice(ids []uint64) List {
 }
 
 func bitmap32FromUint32Slice(ids []uint32) *bitmap32 {
-	rb := newBitmap32()
+	rb := newBitmap()
 	rb.addMany(ids)
 	return rb
 }
@@ -185,7 +185,7 @@ func FuzzBitmap32WireRead(f *testing.F) {
 	f.Fuzz(func(t *testing.T, data []byte) {
 		ids := fuzzUint32s(data)
 		src := bitmap32FromUint32Slice(ids)
-		defer releaseBitmap32(src)
+		defer releaseBitmap(src)
 
 		var payload bytes.Buffer
 		if _, err := src.WriteTo(&payload); err != nil {
@@ -198,7 +198,7 @@ func FuzzBitmap32WireRead(f *testing.F) {
 		}
 
 		receiver := bitmap32FromUint32Slice([]uint32{7, 9, 11})
-		defer releaseBitmap32(receiver)
+		defer releaseBitmap(receiver)
 		_, err := receiver.ReadFrom(bytes.NewReader(mutated))
 		if err != nil {
 			got := bitmap32ToSlice(receiver)

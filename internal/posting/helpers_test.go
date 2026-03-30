@@ -233,7 +233,7 @@ func releaseContainerPair(base, result container16) {
 }
 
 func buildBitmap32(ids ...uint32) *bitmap32 {
-	rb := newBitmap32()
+	rb := newBitmap()
 	rb.addMany(canonicalUint32s(ids))
 	return rb
 }

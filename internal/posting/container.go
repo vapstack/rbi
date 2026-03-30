@@ -593,27 +593,6 @@ func (si *shortIterator) nextMany64(hs uint64, buf []uint64) int {
 	return n
 }
 
-func ownContainerArray(ac *containerArray) *containerArray {
-	if ac != nil {
-		ac.refs.Store(1)
-	}
-	return ac
-}
-
-func ownContainerBitmap(bc *containerBitmap) *containerBitmap {
-	if bc != nil {
-		bc.refs.Store(1)
-	}
-	return bc
-}
-
-func ownContainerRun(rc *containerRun) *containerRun {
-	if rc != nil {
-		rc.refs.Store(1)
-	}
-	return rc
-}
-
 func retainContainer(c container16) container16 {
 	switch x := c.(type) {
 	case *containerRun:
@@ -1193,17 +1172,6 @@ func acquireBitmap() *bitmap32 {
 	rb := new(bitmap32)
 	rb.refs.Store(1)
 	return rb
-}
-
-func releaseBitmap(rb *bitmap32) {
-	if rb == nil {
-		return
-	}
-	if rb.refs.Add(-1) != 0 {
-		return
-	}
-	rb.highlowcontainer.clear()
-	bitmapPool.Put(rb)
 }
 
 func acquireContainerRun(capHint, length int) *containerRun {

@@ -94,7 +94,7 @@ func (lp *largePosting) ReadFrom(stream io.Reader) (p int64, err error) {
 		}
 		prevKey = key
 		lp.highlowcontainer.keys[i] = key
-		lp.highlowcontainer.containers[i] = newBitmap32()
+		lp.highlowcontainer.containers[i] = newBitmap()
 		n64, readErr := lp.highlowcontainer.containers[i].ReadFrom(stream)
 		p += n64
 		if n64 == 0 || readErr != nil {
@@ -261,7 +261,7 @@ func (lp *largePosting) add(x uint64) {
 		la.getWritableContainerAtIndex(i).add(lowbits64(x))
 		return
 	}
-	next := newBitmap32()
+	next := newBitmap()
 	next.add(lowbits64(x))
 	la.insertNewKeyValueAt(-i-1, hb, next)
 }
@@ -272,7 +272,7 @@ func (lp *largePosting) checkedAdd(x uint64) bool {
 	if i >= 0 {
 		return lp.highlowcontainer.getWritableContainerAtIndex(i).checkedAdd(lowbits64(x))
 	}
-	next := newBitmap32()
+	next := newBitmap()
 	next.add(lowbits64(x))
 	lp.highlowcontainer.insertNewKeyValueAt(-i-1, hb, next)
 	return true
@@ -346,7 +346,7 @@ func (lp *largePosting) addSortedHighBitsBatch(hb uint32, dat []uint64) {
 	la := &lp.highlowcontainer
 	i := la.getIndex(hb)
 	if i < 0 {
-		next := newBitmap32()
+		next := newBitmap()
 		next.loadManySorted64(dat)
 		la.insertNewKeyValueAt(-i-1, hb, next)
 		return
@@ -391,7 +391,7 @@ func (lp *largePosting) getOrCreateContainer(hb uint32) *bitmap32 {
 	if i >= 0 {
 		return la.getWritableContainerAtIndex(i)
 	}
-	next := newBitmap32()
+	next := newBitmap()
 	la.insertNewKeyValueAt(-i-1, hb, next)
 	return next
 }
@@ -1041,7 +1041,7 @@ func (la *largeArray) releaseContainersInRange(start int) {
 	}
 	for i := start; i < len(la.containers); i++ {
 		if c := la.containers[i]; c != nil {
-			releaseBitmap32(c)
+			releaseBitmap(c)
 			la.clearContainerAtIndex(i)
 		}
 	}
@@ -1147,8 +1147,8 @@ func (la *largeArray) getWritableContainerAtIndex(i int) *bitmap32 {
 	if current.isUniquelyOwned() {
 		return current
 	}
-	cloned := current.cloneSharedInto(newBitmap32())
-	releaseBitmap32(current)
+	cloned := current.cloneSharedInto(newBitmap())
+	releaseBitmap(current)
 	la.containers[i] = cloned
 	return cloned
 }
@@ -1199,13 +1199,13 @@ func (la *largeArray) removeAtIndex(i int) {
 	la.keys = la.keys[:last]
 	la.containers = la.containers[:last]
 	if removed != nil {
-		releaseBitmap32(removed)
+		releaseBitmap(removed)
 	}
 }
 
 func (la *largeArray) setContainerAtIndex(i int, c *bitmap32) {
 	if old := la.containers[i]; old != nil && old != c {
-		releaseBitmap32(old)
+		releaseBitmap(old)
 	}
 	la.containers[i] = c
 }
@@ -1213,7 +1213,7 @@ func (la *largeArray) setContainerAtIndex(i int, c *bitmap32) {
 func (la *largeArray) replaceKeyAndContainerAtIndex(i int, key uint32, c *bitmap32) {
 	la.keys[i] = key
 	if old := la.containers[i]; old != nil && old != c {
-		releaseBitmap32(old)
+		releaseBitmap(old)
 	}
 	la.containers[i] = c
 }

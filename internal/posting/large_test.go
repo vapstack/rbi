@@ -143,6 +143,65 @@ func TestLargePostingCloneSharedIntoAliasedDestinationKeepsSourceIntact(t *testi
 	}
 }
 
+func TestLargePostingSharedCloneInvariant_SourceReleaseAndPoolReuse(t *testing.T) {
+	cases := []struct {
+		name   string
+		fill   func(*largePosting)
+		poison []uint64
+	}{
+		{
+			name: "SparseAcrossHighBits",
+			fill: func(lp *largePosting) {
+				lp.add(1)
+				lp.add(3)
+				lp.add((1 << 32) | 7)
+				lp.add((2 << 32) | 11)
+				lp.add((5 << 32) | 9)
+			},
+			poison: []uint64{77, (7 << 32) | 13},
+		},
+		{
+			name: "DenseRunOptimized",
+			fill: func(lp *largePosting) {
+				lp.addRange(10, 90)
+				lp.addRange((1<<32)|3, (1<<32)|40)
+				lp.addRange((2<<32)|100, (2<<32)|180)
+				lp.runOptimize()
+			},
+			poison: []uint64{5, (3 << 32) | 1, (8 << 32) | 15},
+		},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			src := getLargePosting()
+			tc.fill(src)
+			want := src.toArray()
+
+			clone := src.cloneSharedInto(newLargePosting())
+			releaseLargePosting(src)
+
+			reused := getLargePosting()
+			for _, id := range tc.poison {
+				reused.add(id)
+			}
+			releaseLargePosting(reused)
+
+			if got := clone.toArray(); !slices.Equal(got, want) {
+				t.Fatalf("shared clone changed after source release and pool reuse: got=%v want=%v", got, want)
+			}
+			for _, id := range tc.poison {
+				if clone.contains(id) {
+					t.Fatalf("shared clone was corrupted by pooled reuse id=%d", id)
+				}
+			}
+
+			releaseLargePosting(clone)
+		})
+	}
+}
+
 func TestLargePostingOrInterleavedSharedCloneKeepsSource(t *testing.T) {
 	src := newLargePosting()
 	defer releaseLargePosting(src)
@@ -632,7 +691,7 @@ func TestLargeHelpersClearAndSetContainerAtIndex(t *testing.T) {
 	if !rb.isEmpty() {
 		t.Fatalf("bitmap32.clear must reset bitmap")
 	}
-	releaseBitmap32(rb)
+	releaseBitmap(rb)
 
 	la := &largeArray{
 		keys:       []uint32{7},

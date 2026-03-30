@@ -298,6 +298,65 @@ func TestReadFromReusedReceiverReleasesPreviousSmallPayload(t *testing.T) {
 	}
 }
 
+func TestCompactPostingPools_ReacquireCanonicalState(t *testing.T) {
+	t.Run("SmallPosting", func(t *testing.T) {
+		sp := acquireSmallPosting()
+		sp.n = 3
+		sp.ids[0] = 11
+		sp.ids[1] = 22
+		sp.ids[2] = 33
+		releaseSmallPosting(sp)
+
+		reused := acquireSmallPosting()
+		if !testRaceEnabled && reused != sp {
+			t.Fatalf("small posting pool did not reuse instance")
+		}
+		if reused.n != 0 {
+			t.Fatalf("reacquired small posting not in canonical state: n=%d", reused.n)
+		}
+		releaseSmallPosting(reused)
+	})
+
+	t.Run("MidPosting", func(t *testing.T) {
+		mp := acquireMidPosting()
+		mp.n = 5
+		mp.ids[0] = 5
+		mp.ids[1] = 10
+		mp.ids[2] = 15
+		mp.ids[3] = 20
+		mp.ids[4] = 25
+		releaseMidPosting(mp)
+
+		reused := acquireMidPosting()
+		if !testRaceEnabled && reused != mp {
+			t.Fatalf("mid posting pool did not reuse instance")
+		}
+		if reused.n != 0 {
+			t.Fatalf("reacquired mid posting not in canonical state: n=%d", reused.n)
+		}
+		releaseMidPosting(reused)
+	})
+}
+
+func TestCompactPostingIteratorPool_ReacquireCanonicalState(t *testing.T) {
+	it := getArrayIter()
+	it.ids = []uint64{3, 7, 11}
+	it.i = 2
+	it.Release()
+
+	reused := getArrayIter()
+	if !testRaceEnabled && reused != it {
+		t.Fatalf("compact posting iterator pool did not reuse iterator")
+	}
+	if reused.ids != nil {
+		t.Fatalf("reacquired iterator leaked previous slice")
+	}
+	if reused.i != 0 {
+		t.Fatalf("reacquired iterator leaked previous position: %d", reused.i)
+	}
+	reused.Release()
+}
+
 func TestWriteReadPostingMidRoundTrip(t *testing.T) {
 	var ids List
 	for i := uint64(1); i <= MidCap; i++ {
@@ -475,6 +534,83 @@ func TestBorrowedLargeMutationDetaches(t *testing.T) {
 
 	borrowed.Release()
 	base.Release()
+}
+
+func TestBorrowedMutationInvariant_SourceRemainsStable(t *testing.T) {
+	buildLarge := func() List {
+		var out List
+		for i := uint64(1); i <= MidCap+8; i++ {
+			out = out.BuildAdded(i)
+		}
+		return out
+	}
+
+	cases := []struct {
+		name         string
+		makeBase     func() List
+		mutate       func(*List)
+		wantBorrowed []uint64
+	}{
+		{
+			name:     "SmallAdd",
+			makeBase: func() List { return postingFromIDs(3, 7, 11, 19) },
+			mutate: func(ids *List) {
+				ids.Add(23)
+			},
+			wantBorrowed: []uint64{3, 7, 11, 19, 23},
+		},
+		{
+			name:     "MidAndNotInPlace",
+			makeBase: func() List { return postingFromIDs(2, 4, 6, 8, 10, 12, 14, 16, 18, 20) },
+			mutate: func(ids *List) {
+				mask := postingFromIDs(6, 8, 20)
+				ids.AndNotInPlace(mask)
+				mask.Release()
+			},
+			wantBorrowed: []uint64{2, 4, 10, 12, 14, 16, 18},
+		},
+		{
+			name:     "LargeAndInPlace",
+			makeBase: buildLarge,
+			mutate: func(ids *List) {
+				keep := postingFromIDs(2, 4, 6, 8, 10, 12)
+				ids.AndInPlace(keep)
+				keep.Release()
+			},
+			wantBorrowed: []uint64{2, 4, 6, 8, 10, 12},
+		},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			base := tc.makeBase()
+			wantBase := base.ToArray()
+
+			borrowed := base.Borrow()
+			if !borrowed.IsBorrowed() {
+				t.Fatalf("expected borrowed handle")
+			}
+			if !borrowed.SharesPayload(base) {
+				t.Fatalf("borrowed handle must start as an alias")
+			}
+
+			tc.mutate(&borrowed)
+
+			if gotBase := base.ToArray(); !slices.Equal(gotBase, wantBase) {
+				t.Fatalf("borrowed mutation changed source: got=%v want=%v", gotBase, wantBase)
+			}
+			if gotBorrowed := borrowed.ToArray(); !slices.Equal(gotBorrowed, tc.wantBorrowed) {
+				t.Fatalf("borrowed mutation result mismatch: got=%v want=%v", gotBorrowed, tc.wantBorrowed)
+			}
+			if borrowed.SharesPayload(base) {
+				t.Fatalf("mutated borrowed handle still shares source payload")
+			}
+
+			borrowed.Release()
+			base.Release()
+		})
+	}
 }
 
 func TestOrInPlaceEmptyClonesBorrowedSource(t *testing.T) {

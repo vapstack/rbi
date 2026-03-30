@@ -5,6 +5,20 @@ import (
 	"testing"
 )
 
+func ownContainerArray(ac *containerArray) *containerArray {
+	if ac != nil {
+		ac.refs.Store(1)
+	}
+	return ac
+}
+
+func ownContainerBitmap(bc *containerBitmap) *containerBitmap {
+	if bc != nil {
+		bc.refs.Store(1)
+	}
+	return bc
+}
+
 func TestArrayContainerPool_ReusedSizedContainerLeaksOldContent(t *testing.T) {
 	ac := newContainerArraySize(4)
 	copy(ac.content, []uint16{11, 22, 33, 44})

@@ -18,8 +18,8 @@ func (rb *bitmap32) runOptimize() {
 	rb.highlowcontainer.runOptimize()
 }
 
-// newBitmap32 creates a new empty bitmap32.
-func newBitmap32() *bitmap32 {
+// newBitmap creates a new empty bitmap32.
+func newBitmap() *bitmap32 {
 	return acquireBitmap()
 }
 
@@ -231,7 +231,7 @@ func (rb *bitmap32) clone() *bitmap32 {
 // cloneSharedInto overwrites dst with a copy-on-write clone of rb and returns dst.
 func (rb *bitmap32) cloneSharedInto(dst *bitmap32) *bitmap32 {
 	if dst == nil {
-		dst = newBitmap32()
+		dst = newBitmap()
 	}
 	if dst == rb {
 		return dst
@@ -257,9 +257,16 @@ func (rb *bitmap32) isUniquelyOwned() bool {
 	return rb.uniquelyOwned()
 }
 
-// releaseBitmap32 returns a bitmap allocated by this package back to the pool.
-func releaseBitmap32(rb *bitmap32) {
-	releaseBitmap(rb)
+// releaseBitmap returns a bitmap allocated by this package back to the pool.
+func releaseBitmap(rb *bitmap32) {
+	if rb == nil {
+		return
+	}
+	if rb.refs.Add(-1) != 0 {
+		return
+	}
+	rb.highlowcontainer.clear()
+	bitmapPool.Put(rb)
 }
 
 // minimum gets the smallest value stored in this bitmap.
