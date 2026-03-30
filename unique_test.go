@@ -442,13 +442,7 @@ func TestUnique_BatchDeleteThenSet_ReusesFreedValueInSameTx(t *testing.T) {
 	}
 
 	newVal := &UniqueTestRec{Email: "a@x", Code: 2}
-	enc := getEncodeBuf()
-	if err := db.encode(newVal, enc); err != nil {
-		releaseEncodeBuf(enc)
-		t.Fatalf("encode set payload: %v", err)
-	}
-	payload := append([]byte(nil), enc.Bytes()...)
-	releaseEncodeBuf(enc)
+	payload := mustEncodeAutoBatchPayload(t, db, newVal)
 
 	delReq := &autoBatchRequest[uint64, UniqueTestRec]{
 		op:   autoBatchDelete,
@@ -511,22 +505,10 @@ func TestUnique_BatchPartialReject_PreservesAcceptedOpsAndIndex(t *testing.T) {
 	}
 
 	badVal := &UniqueTestRec{Email: "a@x", Code: 3}
-	badEnc := getEncodeBuf()
-	if err := db.encode(badVal, badEnc); err != nil {
-		releaseEncodeBuf(badEnc)
-		t.Fatalf("encode bad payload: %v", err)
-	}
-	badPayload := append([]byte(nil), badEnc.Bytes()...)
-	releaseEncodeBuf(badEnc)
+	badPayload := mustEncodeAutoBatchPayload(t, db, badVal)
 
 	goodVal := &UniqueTestRec{Email: "d@x", Code: 2}
-	goodEnc := getEncodeBuf()
-	if err := db.encode(goodVal, goodEnc); err != nil {
-		releaseEncodeBuf(goodEnc)
-		t.Fatalf("encode good payload: %v", err)
-	}
-	goodPayload := append([]byte(nil), goodEnc.Bytes()...)
-	releaseEncodeBuf(goodEnc)
+	goodPayload := mustEncodeAutoBatchPayload(t, db, goodVal)
 
 	badReq := &autoBatchRequest[uint64, UniqueTestRec]{
 		op:         autoBatchSet,
@@ -772,18 +754,11 @@ func TestUnique_ExecuteBatch_MixedOps_MatchesSequentialModel(t *testing.T) {
 		for _, op := range ops {
 			switch op.kind {
 			case 0:
-				buf := getEncodeBuf()
-				if err := dbBatch.encode(op.value, buf); err != nil {
-					releaseEncodeBuf(buf)
-					t.Fatalf("step=%d encode set value: %v", step, err)
-				}
-				payload := append([]byte(nil), buf.Bytes()...)
-				releaseEncodeBuf(buf)
 				reqs = append(reqs, &autoBatchRequest[uint64, UniqueTestRec]{
 					op:         autoBatchSet,
 					id:         op.id,
 					setValue:   cloneUniqueRec(op.value),
-					setPayload: payload,
+					setPayload: mustEncodeAutoBatchPayload(t, dbBatch, op.value),
 					done:       make(chan error, 1),
 				})
 			case 1:

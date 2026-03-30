@@ -455,6 +455,7 @@ func (db *DB[K, V]) BatchSet(ids []K, newVals []*V, execOpts ...ExecOption[K, V]
 	for i := range ids {
 		req, err := db.buildSetAutoBatchRequest(ids[i], newVals[i], cfg.beforeStore, cfg.beforeCommit, cfg.cloneValue)
 		if err != nil {
+			releaseAutoBatchRequestResources(reqs[:i])
 			return err
 		}
 		reqs[i] = req

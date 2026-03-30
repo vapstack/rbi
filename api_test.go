@@ -903,13 +903,7 @@ func TestTruncate_NoDeadlock_WithConcurrentExecuteBatchWriter(t *testing.T) {
 	}
 
 	newVal := &Rec{Name: "after", Age: 2}
-	enc := getEncodeBuf()
-	if err := db.encode(newVal, enc); err != nil {
-		releaseEncodeBuf(enc)
-		t.Fatalf("encode payload: %v", err)
-	}
-	payload := append([]byte(nil), enc.Bytes()...)
-	releaseEncodeBuf(enc)
+	payload := mustEncodeAutoBatchPayload(t, db, newVal)
 
 	req := &autoBatchRequest[uint64, Rec]{
 		op:         autoBatchSet,

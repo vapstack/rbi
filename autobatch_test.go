@@ -1,6 +1,7 @@
 package rbi
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"slices"
@@ -18,6 +19,37 @@ func queuedSingleJob[K ~string | ~uint64, V any](req *autoBatchRequest[K, V]) *a
 		reqs: []*autoBatchRequest[K, V]{req},
 		done: req.done,
 	}
+}
+
+func mustEncodeAutoBatchPayload[K ~string | ~uint64, V any](tb testing.TB, db *DB[K, V], v *V) *bytes.Buffer {
+	tb.Helper()
+	b := getEncodeBuf()
+	if err := db.encode(v, b); err != nil {
+		releaseEncodeBuf(b)
+		tb.Fatalf("encode: %v", err)
+	}
+	return b
+}
+
+func rawAutoBatchPayload(tb testing.TB, payload []byte) *bytes.Buffer {
+	tb.Helper()
+	b := getEncodeBuf()
+	if _, err := b.Write(payload); err != nil {
+		releaseEncodeBuf(b)
+		tb.Fatalf("write payload: %v", err)
+	}
+	return b
+}
+
+func replaceAutoBatchPayloadForTest[K ~string | ~uint64, V any](req *autoBatchRequest[K, V], payload *bytes.Buffer) {
+	if req == nil {
+		releaseEncodeBuf(payload)
+		return
+	}
+	if req.setPayload != nil {
+		releaseEncodeBuf(req.setPayload)
+	}
+	req.setPayload = payload
 }
 
 func TestBatch_BeforeCommit_CallbacksRunForSetPatchDelete(t *testing.T) {
@@ -178,25 +210,13 @@ func TestBatch_RepeatedPatchIDMaintainsIndexConsistency(t *testing.T) {
 func TestBatch_StatsTrackBatchSizeDistribution(t *testing.T) {
 	db, _ := openTempDBUint64(t)
 
-	encodePayload := func(v *Rec) []byte {
-		t.Helper()
-		b := getEncodeBuf()
-		if err := db.encode(v, b); err != nil {
-			releaseEncodeBuf(b)
-			t.Fatalf("encode: %v", err)
-		}
-		out := append([]byte(nil), b.Bytes()...)
-		releaseEncodeBuf(b)
-		return out
-	}
-
 	makeSetReq := func(id uint64, name string) *autoBatchRequest[uint64, Rec] {
 		rec := &Rec{Name: name, Age: int(id)}
 		return &autoBatchRequest[uint64, Rec]{
 			op:         autoBatchSet,
 			id:         id,
 			setValue:   rec,
-			setPayload: encodePayload(rec),
+			setPayload: mustEncodeAutoBatchPayload(t, db, rec),
 			done:       make(chan error, 1),
 		}
 	}
@@ -292,10 +312,9 @@ func TestBatch_NoBatch_IsolatesRequestInsideBatcher(t *testing.T) {
 		op:         autoBatchSet,
 		id:         100,
 		setValue:   seed,
-		setPayload: append([]byte(nil), b.Bytes()...),
+		setPayload: b,
 		done:       make(chan error, 1),
 	}
-	releaseEncodeBuf(b)
 
 	before := db.AutoBatchStats()
 	db.autoBatcher.mu.Lock()
@@ -865,17 +884,6 @@ func TestBatch_SetDeleteSameID_CoalescedToLastWrite(t *testing.T) {
 		t.Fatalf("seed Set(1): %v", err)
 	}
 
-	encodePayload := func(v *Rec) []byte {
-		b := getEncodeBuf()
-		if err := db.encode(v, b); err != nil {
-			releaseEncodeBuf(b)
-			t.Fatalf("encode payload: %v", err)
-		}
-		out := append([]byte(nil), b.Bytes()...)
-		releaseEncodeBuf(b)
-		return out
-	}
-
 	setA := &Rec{Name: "A", Age: 20}
 	setB := &Rec{Name: "B", Age: 30}
 	setOther := &Rec{Name: "X", Age: 40}
@@ -884,7 +892,7 @@ func TestBatch_SetDeleteSameID_CoalescedToLastWrite(t *testing.T) {
 		op:         autoBatchSet,
 		id:         1,
 		setValue:   setA,
-		setPayload: encodePayload(setA),
+		setPayload: mustEncodeAutoBatchPayload(t, db, setA),
 		done:       make(chan error, 1),
 	}
 	req2 := &autoBatchRequest[uint64, Rec]{
@@ -896,14 +904,14 @@ func TestBatch_SetDeleteSameID_CoalescedToLastWrite(t *testing.T) {
 		op:         autoBatchSet,
 		id:         1,
 		setValue:   setB,
-		setPayload: encodePayload(setB),
+		setPayload: mustEncodeAutoBatchPayload(t, db, setB),
 		done:       make(chan error, 1),
 	}
 	req4 := &autoBatchRequest[uint64, Rec]{
 		op:         autoBatchSet,
 		id:         2,
 		setValue:   setOther,
-		setPayload: encodePayload(setOther),
+		setPayload: mustEncodeAutoBatchPayload(t, db, setOther),
 		done:       make(chan error, 1),
 	}
 
@@ -969,23 +977,11 @@ func TestBatch_CoalescedChain_PropagatesTerminalError(t *testing.T) {
 		t.Fatalf("seed Set(2): %v", err)
 	}
 
-	encode := func(v *UniqueTestRec) []byte {
-		t.Helper()
-		b := getEncodeBuf()
-		if err := db.encode(v, b); err != nil {
-			releaseEncodeBuf(b)
-			t.Fatalf("encode: %v", err)
-		}
-		out := append([]byte(nil), b.Bytes()...)
-		releaseEncodeBuf(b)
-		return out
-	}
-
 	req1 := &autoBatchRequest[uint64, UniqueTestRec]{
 		op:         autoBatchSet,
 		id:         1,
 		setValue:   &UniqueTestRec{Email: "mid@x", Code: 10},
-		setPayload: encode(&UniqueTestRec{Email: "mid@x", Code: 10}),
+		setPayload: mustEncodeAutoBatchPayload(t, db, &UniqueTestRec{Email: "mid@x", Code: 10}),
 		done:       make(chan error, 1),
 	}
 	req2 := &autoBatchRequest[uint64, UniqueTestRec]{
@@ -997,14 +993,14 @@ func TestBatch_CoalescedChain_PropagatesTerminalError(t *testing.T) {
 		op:         autoBatchSet,
 		id:         1,
 		setValue:   &UniqueTestRec{Email: "taken@x", Code: 11},
-		setPayload: encode(&UniqueTestRec{Email: "taken@x", Code: 11}),
+		setPayload: mustEncodeAutoBatchPayload(t, db, &UniqueTestRec{Email: "taken@x", Code: 11}),
 		done:       make(chan error, 1),
 	}
 	req4 := &autoBatchRequest[uint64, UniqueTestRec]{
 		op:         autoBatchSet,
 		id:         3,
 		setValue:   &UniqueTestRec{Email: "ok@x", Code: 3},
-		setPayload: encode(&UniqueTestRec{Email: "ok@x", Code: 3}),
+		setPayload: mustEncodeAutoBatchPayload(t, db, &UniqueTestRec{Email: "ok@x", Code: 3}),
 		done:       make(chan error, 1),
 	}
 
@@ -1118,25 +1114,13 @@ func TestBatch_PatchFailures_IsolateFailedRequest(t *testing.T) {
 				t.Fatalf("seed Set(2): %v", err)
 			}
 
-			encode := func(v *Rec) []byte {
-				t.Helper()
-				b := getEncodeBuf()
-				if err := db.encode(v, b); err != nil {
-					releaseEncodeBuf(b)
-					t.Fatalf("encode: %v", err)
-				}
-				out := append([]byte(nil), b.Bytes()...)
-				releaseEncodeBuf(b)
-				return out
-			}
-
 			badReq := c.makeBadReq()
 			goodVal := &Rec{Name: "good-" + c.name, Age: 99, Meta: Meta{Country: "US"}}
 			goodReq := &autoBatchRequest[uint64, Rec]{
 				op:         autoBatchSet,
 				id:         2,
 				setValue:   goodVal,
-				setPayload: encode(goodVal),
+				setPayload: mustEncodeAutoBatchPayload(t, db, goodVal),
 				done:       make(chan error, 1),
 			}
 
@@ -1185,10 +1169,9 @@ func TestBatch_QueueFull_WaitsAndStaysQueued(t *testing.T) {
 		op:         autoBatchSet,
 		id:         123,
 		setValue:   blocked,
-		setPayload: append([]byte(nil), b.Bytes()...),
+		setPayload: b,
 		done:       make(chan error, 1),
 	}
-	releaseEncodeBuf(b)
 
 	db.autoBatcher.mu.Lock()
 	setAutoBatchQueueJobsForTest(db, queuedSingleJob(blockedReq))
@@ -1245,18 +1228,6 @@ func TestBatch_BeforeCommitError_RollsBack(t *testing.T) {
 func TestBatch_BeforeCommitError_IsolatesFailedRequest(t *testing.T) {
 	db, _ := openTempDBUint64(t)
 
-	encode := func(v *Rec) []byte {
-		t.Helper()
-		b := getEncodeBuf()
-		if err := db.encode(v, b); err != nil {
-			releaseEncodeBuf(b)
-			t.Fatalf("encode: %v", err)
-		}
-		out := append([]byte(nil), b.Bytes()...)
-		releaseEncodeBuf(b)
-		return out
-	}
-
 	cbErr := errors.New("callback fail")
 	badVal := &Rec{Name: "bad", Age: 1}
 	goodVal := &Rec{Name: "good", Age: 2}
@@ -1265,7 +1236,7 @@ func TestBatch_BeforeCommitError_IsolatesFailedRequest(t *testing.T) {
 		op:         autoBatchSet,
 		id:         1,
 		setValue:   badVal,
-		setPayload: encode(badVal),
+		setPayload: mustEncodeAutoBatchPayload(t, db, badVal),
 		beforeCommit: []beforeCommitFunc[uint64, Rec]{
 			func(_ *bbolt.Tx, _ uint64, _, _ *Rec) error { return cbErr },
 		},
@@ -1275,7 +1246,7 @@ func TestBatch_BeforeCommitError_IsolatesFailedRequest(t *testing.T) {
 		op:         autoBatchSet,
 		id:         2,
 		setValue:   goodVal,
-		setPayload: encode(goodVal),
+		setPayload: mustEncodeAutoBatchPayload(t, db, goodVal),
 		done:       make(chan error, 1),
 	}
 
@@ -1303,18 +1274,6 @@ func TestBatch_BeforeCommitError_IsolatesFailedRequest(t *testing.T) {
 func TestBatch_BeforeCommitError_Isolation_RechecksUniqueAfterRetry(t *testing.T) {
 	db, _ := openTempDBUint64Unique(t)
 
-	encode := func(v *UniqueTestRec) []byte {
-		t.Helper()
-		b := getEncodeBuf()
-		if err := db.encode(v, b); err != nil {
-			releaseEncodeBuf(b)
-			t.Fatalf("encode: %v", err)
-		}
-		out := append([]byte(nil), b.Bytes()...)
-		releaseEncodeBuf(b)
-		return out
-	}
-
 	cbErr := errors.New("callback fail")
 	badVal := &UniqueTestRec{Email: "shared@x", Code: 1}
 	goodVal := &UniqueTestRec{Email: "shared@x", Code: 2}
@@ -1323,7 +1282,7 @@ func TestBatch_BeforeCommitError_Isolation_RechecksUniqueAfterRetry(t *testing.T
 		op:         autoBatchSet,
 		id:         1,
 		setValue:   badVal,
-		setPayload: encode(badVal),
+		setPayload: mustEncodeAutoBatchPayload(t, db, badVal),
 		beforeCommit: []beforeCommitFunc[uint64, UniqueTestRec]{
 			func(_ *bbolt.Tx, _ uint64, _, _ *UniqueTestRec) error { return cbErr },
 		},
@@ -1333,7 +1292,7 @@ func TestBatch_BeforeCommitError_Isolation_RechecksUniqueAfterRetry(t *testing.T
 		op:         autoBatchSet,
 		id:         2,
 		setValue:   goodVal,
-		setPayload: encode(goodVal),
+		setPayload: mustEncodeAutoBatchPayload(t, db, goodVal),
 		done:       make(chan error, 1),
 	}
 
@@ -1361,25 +1320,13 @@ func TestBatch_BeforeCommitError_Isolation_RechecksUniqueAfterRetry(t *testing.T
 func TestBatch_BeforeStore_RerunsFromBaselineOnRetry(t *testing.T) {
 	db, _ := openTempDBUint64(t)
 
-	encode := func(v *Rec) []byte {
-		t.Helper()
-		b := getEncodeBuf()
-		if err := db.encode(v, b); err != nil {
-			releaseEncodeBuf(b)
-			t.Fatalf("encode: %v", err)
-		}
-		out := append([]byte(nil), b.Bytes()...)
-		releaseEncodeBuf(b)
-		return out
-	}
-
 	beforeStoreCalls := 0
 	goodVal := &Rec{Name: "good", Age: 10}
 	goodReq := &autoBatchRequest[uint64, Rec]{
 		op:         autoBatchSet,
 		id:         1,
 		setValue:   goodVal,
-		setPayload: encode(goodVal),
+		setPayload: mustEncodeAutoBatchPayload(t, db, goodVal),
 		beforeStore: []beforeStoreFunc[uint64, Rec]{
 			func(_ uint64, _ *Rec, newValue *Rec) error {
 				beforeStoreCalls++
@@ -1396,7 +1343,7 @@ func TestBatch_BeforeStore_RerunsFromBaselineOnRetry(t *testing.T) {
 		op:         autoBatchSet,
 		id:         2,
 		setValue:   badVal,
-		setPayload: encode(badVal),
+		setPayload: mustEncodeAutoBatchPayload(t, db, badVal),
 		beforeCommit: []beforeCommitFunc[uint64, Rec]{
 			func(_ *bbolt.Tx, _ uint64, _, _ *Rec) error { return cbErr },
 		},
@@ -1432,24 +1379,12 @@ func TestBatch_StringKeyBeforeStoreError_DoesNotGrowStrMap(t *testing.T) {
 	}
 	initial := len(db.strmap.Keys)
 
-	encode := func(v *Product) []byte {
-		t.Helper()
-		b := getEncodeBuf()
-		if err := db.encode(v, b); err != nil {
-			releaseEncodeBuf(b)
-			t.Fatalf("encode: %v", err)
-		}
-		out := append([]byte(nil), b.Bytes()...)
-		releaseEncodeBuf(b)
-		return out
-	}
-
 	hookErr := errors.New("before store fail")
 	req := &autoBatchRequest[string, Product]{
 		op:         autoBatchSet,
 		id:         "ghost-before-store",
 		setValue:   &Product{SKU: "ghost-before-store", Price: 11},
-		setPayload: encode(&Product{SKU: "ghost-before-store", Price: 11}),
+		setPayload: mustEncodeAutoBatchPayload(t, db, &Product{SKU: "ghost-before-store", Price: 11}),
 		beforeStore: []beforeStoreFunc[string, Product]{
 			func(_ string, _ *Product, _ *Product) error { return hookErr },
 		},
@@ -1468,6 +1403,51 @@ func TestBatch_StringKeyBeforeStoreError_DoesNotGrowStrMap(t *testing.T) {
 	}
 	if after := len(db.strmap.Keys); after != initial {
 		t.Fatalf("strmap grew after BeforeStore failure: initial=%d after=%d", initial, after)
+	}
+}
+
+func TestBatch_CompletedRequest_ReleasesResources(t *testing.T) {
+	db, _ := openTempDBUint64(t)
+
+	req := mustBuildSetAutoReq(
+		t,
+		db,
+		1,
+		&Rec{Name: "cleanup", Age: 11},
+		[]beforeStoreFunc[uint64, Rec]{
+			func(_ uint64, _ *Rec, _ *Rec) error { return nil },
+		},
+		[]beforeCommitFunc[uint64, Rec]{
+			func(_ *bbolt.Tx, _ uint64, _ *Rec, _ *Rec) error { return nil },
+		},
+		nil,
+	)
+	if req.setPayload == nil {
+		t.Fatal("expected prepared payload before execution")
+	}
+
+	db.executeAutoBatch([]*autoBatchRequest[uint64, Rec]{req})
+
+	if err := mustAutoBatchErr(t, req); err != nil {
+		t.Fatalf("req error = %v", err)
+	}
+	if req.setPayload != nil {
+		t.Fatal("set payload buffer must be released after completion")
+	}
+	if req.setValue != nil || req.setBaseline != nil {
+		t.Fatalf("set values must be cleared after completion: value=%#v baseline=%#v", req.setValue, req.setBaseline)
+	}
+	if req.patch != nil {
+		t.Fatalf("patch slice must be cleared after completion: %#v", req.patch)
+	}
+	if req.beforeProcess != nil || req.beforeStore != nil || req.beforeCommit != nil {
+		t.Fatalf("callbacks must be cleared after completion: beforeProcess=%v beforeStore=%v beforeCommit=%v", req.beforeProcess, req.beforeStore, req.beforeCommit)
+	}
+	if req.cloneValue != nil {
+		t.Fatal("cloneValue must be cleared after completion")
+	}
+	if req.coalescedTo != nil {
+		t.Fatalf("coalescedTo must be cleared after completion: %p", req.coalescedTo)
 	}
 }
 
@@ -1621,7 +1601,7 @@ func TestAutoBatchExt_SharedSet_DecodePreparedValueError_IsolatesFailedRequest(t
 		nil,
 		nil,
 	)
-	badReq.setPayload = []byte{0xc1}
+	replaceAutoBatchPayloadForTest(badReq, rawAutoBatchPayload(t, []byte{0xc1}))
 
 	goodReq := mustBuildSetAutoReq(t, db, 2, &Rec{Name: "good", Age: 22}, nil, nil, nil)
 
@@ -2414,7 +2394,7 @@ func TestAutoBatchExt_SharedStringSet_DecodePreparedValueErrorWithNeighbor_DoesN
 		nil,
 		nil,
 	)
-	badReq.setPayload = []byte{0xc1}
+	replaceAutoBatchPayloadForTest(badReq, rawAutoBatchPayload(t, []byte{0xc1}))
 	goodReq := mustBuildSetAutoReq(t, db, "p2", &Product{SKU: "p2", Price: 22}, nil, nil, nil)
 
 	db.executeAutoBatch([]*autoBatchRequest[string, Product]{badReq, goodReq})

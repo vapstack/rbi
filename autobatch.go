@@ -1,6 +1,7 @@
 package rbi
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"slices"
@@ -24,9 +25,10 @@ type autoBatchRequest[K ~string | ~uint64, V any] struct {
 
 	setValue    *V
 	setBaseline *V
-	setPayload  []byte
+	setPayload  *bytes.Buffer
 
-	patch              []Field
+	patch []Field
+
 	patchIgnoreUnknown bool
 
 	beforeProcess []beforeProcessFunc[K, V]
@@ -65,8 +67,55 @@ type autoBatchState[K ~string | ~uint64, V any] struct {
 	idxKnown bool
 	idxNew   bool
 
-	current        *V
-	currentPayload []byte
+	current  *V
+	owned    *bytes.Buffer
+	borrowed []byte
+}
+
+func (req *autoBatchRequest[K, V]) payloadBytes() []byte {
+	if req.setPayload == nil {
+		return nil
+	}
+	return req.setPayload.Bytes()
+}
+
+func (req *autoBatchRequest[K, V]) releaseResources() {
+	if req.setPayload != nil {
+		releaseEncodeBuf(req.setPayload)
+		req.setPayload = nil
+	}
+	req.setValue = nil
+	req.setBaseline = nil
+	req.patch = nil
+	req.patchIgnoreUnknown = false
+	req.beforeProcess = nil
+	req.beforeStore = nil
+	req.beforeCommit = nil
+	req.cloneValue = nil
+	req.coalescedTo = nil
+}
+
+func releaseAutoBatchRequestResources[K ~string | ~uint64, V any](reqs []*autoBatchRequest[K, V]) {
+	for i := range reqs {
+		reqs[i].releaseResources()
+	}
+}
+
+func (st *autoBatchState[K, V]) payloadBytes() []byte {
+	if st.owned != nil {
+		return st.owned.Bytes()
+	}
+	return st.borrowed
+}
+
+func (st *autoBatchState[K, V]) setOwnedPayload(buf *bytes.Buffer) {
+	st.owned = buf
+	st.borrowed = nil
+}
+
+func (st *autoBatchState[K, V]) setBorrowedPayload(payload []byte) {
+	st.owned = nil
+	st.borrowed = payload
 }
 
 func (ab *autoBatcher[K, V]) queueLen() int {
@@ -231,12 +280,12 @@ func (db *DB[K, V]) buildSetAutoBatchRequest(id K, newVal *V, beforeStore []befo
 		}
 	} else {
 		b := getEncodeBuf()
-		defer releaseEncodeBuf(b)
 		if err := db.encode(newVal, b); err != nil {
+			releaseEncodeBuf(b)
 			return nil, fmt.Errorf("encode: %w", err)
 		}
 		req.setValue = newVal
-		req.setPayload = append([]byte(nil), b.Bytes()...)
+		req.setPayload = b
 	}
 	return req, nil
 }
@@ -270,6 +319,7 @@ func (db *DB[K, V]) submitAutoBatchRequests(reqs []*autoBatchRequest[K, V], isol
 		db.autoBatcher.submitted.Add(1)
 	}
 	if err := db.unavailableErr(); err != nil {
+		releaseAutoBatchRequestResources(reqs)
 		if stats {
 			db.autoBatcher.fallbackClosed.Add(1)
 		}
@@ -289,6 +339,7 @@ func (db *DB[K, V]) submitAutoBatchRequests(reqs []*autoBatchRequest[K, V], isol
 	for {
 		if err := db.unavailableErr(); err != nil {
 			db.autoBatcher.mu.Unlock()
+			releaseAutoBatchRequestResources(reqs)
 			if stats {
 				db.autoBatcher.fallbackClosed.Add(1)
 			}
@@ -535,6 +586,7 @@ func (db *DB[K, V]) executeAutoBatchJobs(batch []*autoBatchJob[K, V]) {
 	for _, job := range batch {
 		if len(job.reqs) != 1 {
 			job.done <- fmt.Errorf("internal auto-batch error: mixed grouped request in shared batch")
+			releaseAutoBatchRequestResources(job.reqs)
 			continue
 		}
 		req := job.reqs[0]
@@ -659,6 +711,7 @@ func (db *DB[K, V]) autoBatchOpName(reqs []*autoBatchRequest[K, V], atomicAll bo
 }
 
 func (db *DB[K, V]) executeAutoBatchAtomic(batch []*autoBatchRequest[K, V]) error {
+	defer releaseAutoBatchRequestResources(batch)
 	for _, req := range batch {
 		req.err = nil
 		req.coalescedTo = nil
@@ -676,7 +729,6 @@ func (db *DB[K, V]) executeAutoBatchAtomic(batch []*autoBatchRequest[K, V]) erro
 func (db *DB[K, V]) executeAutoBatchAttempt(active []*autoBatchRequest[K, V], atomicAll bool) (*autoBatchRequest[K, V], bool, error) {
 	stats := db.autoBatcher.statsEnabled
 	opName := db.autoBatchOpName(active, atomicAll)
-	transparent := db.transparent
 
 	tx, err := db.bolt.Begin(true)
 	if err != nil {
@@ -685,13 +737,7 @@ func (db *DB[K, V]) executeAutoBatchAttempt(active []*autoBatchRequest[K, V], at
 		}
 		return nil, true, fmt.Errorf("tx error: %w", err)
 	}
-
-	committed := false
-	defer func() {
-		if !committed {
-			rollback(tx)
-		}
-	}()
+	defer rollback(tx)
 
 	bucket := tx.Bucket(db.bucket)
 	if bucket == nil {
@@ -704,6 +750,15 @@ func (db *DB[K, V]) executeAutoBatchAttempt(active []*autoBatchRequest[K, V], at
 	bucket.FillPercent = db.options.BucketFillPercent
 
 	prepared := make([]autoBatchPrepared[K, V], 0, len(active))
+	var buffers []*bytes.Buffer
+	defer func() {
+		for _, v := range buffers {
+			if v != nil {
+				releaseEncodeBuf(v)
+			}
+		}
+		clear(buffers)
+	}()
 
 	rollbackCreated := func(ops []autoBatchPrepared[K, V]) {
 		if !db.strkey {
@@ -732,7 +787,7 @@ func (db *DB[K, V]) executeAutoBatchAttempt(active []*autoBatchRequest[K, V], at
 					return nil, decErr
 				}
 				st.current = oldVal
-				st.currentPayload = prev
+				st.setBorrowedPayload(prev)
 			}
 			states[req.id] = st
 		}
@@ -769,7 +824,8 @@ func (db *DB[K, V]) executeAutoBatchAttempt(active []*autoBatchRequest[K, V], at
 			}
 			oldVal := st.current
 			newVal := req.setValue
-			payload := req.setPayload
+			payload := req.payloadBytes()
+			var owned *bytes.Buffer
 			if len(req.beforeStore) > 0 {
 				if stats {
 					db.autoBatcher.callbackOps.Add(1)
@@ -781,7 +837,7 @@ func (db *DB[K, V]) executeAutoBatchAttempt(active []*autoBatchRequest[K, V], at
 						continue
 					}
 				} else {
-					decodedVal, decErr := db.decode(req.setPayload)
+					decodedVal, decErr := db.decode(req.payloadBytes())
 					if decErr != nil {
 						req.err = fmt.Errorf("decode prepared value: %w", decErr)
 						continue
@@ -802,10 +858,11 @@ func (db *DB[K, V]) executeAutoBatchAttempt(active []*autoBatchRequest[K, V], at
 					req.err = fmt.Errorf("encode: %w", encErr)
 					continue
 				}
-				payload = append([]byte(nil), b.Bytes()...)
-				releaseEncodeBuf(b)
+				owned = b
+				buffers = append(buffers, b)
+				payload = b.Bytes()
 			}
-			if !transparent {
+			if !db.transparent {
 				ensureIdx(req, st, true)
 			}
 
@@ -820,7 +877,11 @@ func (db *DB[K, V]) executeAutoBatchAttempt(active []*autoBatchRequest[K, V], at
 				modified: db.getModifiedUniqueFields(oldVal, newVal),
 			})
 			st.current = newVal
-			st.currentPayload = payload
+			if owned != nil {
+				st.setOwnedPayload(owned)
+			} else {
+				st.setOwnedPayload(req.setPayload)
+			}
 
 		case autoBatchPatch:
 			st, stErr := loadState(req, false)
@@ -833,11 +894,11 @@ func (db *DB[K, V]) executeAutoBatchAttempt(active []*autoBatchRequest[K, V], at
 			}
 
 			oldVal := st.current
-			if st.currentPayload == nil {
+			if st.owned == nil && st.borrowed == nil {
 				req.err = fmt.Errorf("failed to re-decode value for patching: source payload is empty")
 				continue
 			}
-			newVal, decErr := db.decode(st.currentPayload)
+			newVal, decErr := db.decode(st.payloadBytes())
 			if decErr != nil {
 				req.err = fmt.Errorf("failed to re-decode value for patching: %w", decErr)
 				continue
@@ -873,9 +934,10 @@ func (db *DB[K, V]) executeAutoBatchAttempt(active []*autoBatchRequest[K, V], at
 				req.err = fmt.Errorf("encode: %w", encErr)
 				continue
 			}
-			payload := append([]byte(nil), b.Bytes()...)
-			releaseEncodeBuf(b)
-			if !transparent {
+			buffers = append(buffers, b)
+			payload := b.Bytes()
+
+			if !db.transparent {
 				ensureIdx(req, st, false)
 			}
 
@@ -890,7 +952,7 @@ func (db *DB[K, V]) executeAutoBatchAttempt(active []*autoBatchRequest[K, V], at
 				modified: db.getModifiedUniqueFields(oldVal, newVal),
 			})
 			st.current = newVal
-			st.currentPayload = payload
+			st.setOwnedPayload(b)
 
 		case autoBatchDelete:
 			st, stErr := loadState(req, false)
@@ -902,7 +964,7 @@ func (db *DB[K, V]) executeAutoBatchAttempt(active []*autoBatchRequest[K, V], at
 				continue
 			}
 			oldVal := st.current
-			if !transparent {
+			if !db.transparent {
 				ensureIdx(req, st, false)
 			}
 
@@ -916,7 +978,8 @@ func (db *DB[K, V]) executeAutoBatchAttempt(active []*autoBatchRequest[K, V], at
 				modified: db.getModifiedUniqueFields(oldVal, nil),
 			})
 			st.current = nil
-			st.currentPayload = nil
+			st.owned = nil
+			st.borrowed = nil
 		}
 	}
 
@@ -997,6 +1060,7 @@ func (db *DB[K, V]) executeAutoBatchAttempt(active []*autoBatchRequest[K, V], at
 
 	var fatalErr error
 	var callbackFailedReq *autoBatchRequest[K, V]
+
 	for _, op := range accepted {
 		switch op.req.op {
 		case autoBatchSet, autoBatchPatch:
@@ -1020,8 +1084,9 @@ func (db *DB[K, V]) executeAutoBatchAttempt(active []*autoBatchRequest[K, V], at
 		if len(op.req.beforeCommit) == 0 {
 			continue
 		}
-		if len(op.req.beforeStore) == 0 {
-			if stats {
+
+		if stats {
+			if len(op.req.beforeStore) == 0 {
 				db.autoBatcher.callbackOps.Add(1)
 			}
 		}
@@ -1050,7 +1115,7 @@ func (db *DB[K, V]) executeAutoBatchAttempt(active []*autoBatchRequest[K, V], at
 		return nil, true, fatalErr
 	}
 
-	if transparent {
+	if db.transparent {
 		if _, err = bucket.NextSequence(); err != nil {
 			if stats {
 				db.autoBatcher.txOpErrors.Add(1)
@@ -1071,7 +1136,6 @@ func (db *DB[K, V]) executeAutoBatchAttempt(active []*autoBatchRequest[K, V], at
 			}
 			return nil, true, nil
 		}
-		committed = true
 		db.mu.Unlock()
 		return nil, true, nil
 	}
@@ -1088,6 +1152,7 @@ func (db *DB[K, V]) executeAutoBatchAttempt(active []*autoBatchRequest[K, V], at
 
 	snap := db.buildPreparedSnapshotNoLock(seq, accepted)
 	db.stageSnapshot(snap)
+
 	if err = db.commit(tx, opName); err != nil {
 		if stats {
 			db.autoBatcher.txCommitErrors.Add(1)
@@ -1102,7 +1167,7 @@ func (db *DB[K, V]) executeAutoBatchAttempt(active []*autoBatchRequest[K, V], at
 		}
 		return nil, true, nil
 	}
-	committed = true
+
 	err = db.publishAfterCommitLocked(seq, opName, func() {
 		db.finishSnapshotPublishNoLock(snap)
 	})
@@ -1122,7 +1187,13 @@ func (db *DB[K, V]) executeAutoBatchAttempt(active []*autoBatchRequest[K, V], at
 
 func (db *DB[K, V]) failAutoBatchJobs(batch []*autoBatchJob[K, V], err error) {
 	for _, job := range batch {
+		for _, req := range job.reqs {
+			if req != nil && req.err == nil {
+				req.err = err
+			}
+		}
 		job.done <- err
+		releaseAutoBatchRequestResources(job.reqs)
 	}
 }
 
@@ -1146,4 +1217,5 @@ func (db *DB[K, V]) finishAutoBatch(batch []*autoBatchRequest[K, V]) {
 		}
 		req.done <- req.err
 	}
+	releaseAutoBatchRequestResources(batch)
 }
