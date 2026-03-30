@@ -41,7 +41,7 @@ Indexes are kept fully in memory and built on a heavily reworked fork of
 ### LLM notice
 Starting from v0.7, parts of the code, documentation and tests were created 
 or improved with the assistance of LLM. Code created with LLM has been tested 
-and verified, but may still contain inefficiencies.
+and verified, but may still contain minor inefficiencies or style issues.
 
 ## Usage
 

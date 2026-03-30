@@ -678,6 +678,10 @@ type autoBatcher[K ~string | ~uint64, V any] struct {
 	batchScratch       []*autoBatchJob[K, V]
 	repeatIDScratch    map[K]int
 	repeatIDScratchCap int
+	requestScratchPool sync.Pool
+	attemptStatePool   sync.Pool
+	requestPool        sync.Pool
+	jobPool            sync.Pool
 	hotUntil           time.Time
 
 	submitted          atomic.Uint64

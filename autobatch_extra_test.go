@@ -71,8 +71,8 @@ func drainCurrentAutoBatchQueue[K ~string | ~uint64, V any](
 }
 
 func terminalAutoBatchReq[K ~string | ~uint64, V any](req *autoBatchRequest[K, V]) *autoBatchRequest[K, V] {
-	for req != nil && req.coalescedTo != nil {
-		req = req.coalescedTo
+	for req != nil && req.replacedBy != nil {
+		req = req.replacedBy
 	}
 	return req
 }
@@ -603,7 +603,7 @@ func TestAutoBatchExtra_MixedQueuedOps_MatchSequentialModel(t *testing.T) {
 		drainQueuedAutoBatchStep(t, dbBatch, reqs, func(batch []*autoBatchJob[uint64, Rec]) {
 			for _, job := range batch {
 				req := job.reqs[0]
-				if req.coalescedTo != nil {
+				if req.replacedBy != nil {
 					continue
 				}
 				idx := reqIndex[req]
@@ -611,7 +611,7 @@ func TestAutoBatchExtra_MixedQueuedOps_MatchSequentialModel(t *testing.T) {
 			}
 			for _, job := range batch {
 				req := job.reqs[0]
-				if req.coalescedTo == nil {
+				if req.replacedBy == nil {
 					continue
 				}
 				term := terminalAutoBatchReq(req)
@@ -797,7 +797,7 @@ func TestAutoBatchExtra_UniqueMixedQueuedOps_MatchSequentialModel(t *testing.T) 
 		drainQueuedAutoBatchStep(t, dbBatch, reqs, func(batch []*autoBatchJob[uint64, UniqueTestRec]) {
 			for _, job := range batch {
 				req := job.reqs[0]
-				if req.coalescedTo != nil {
+				if req.replacedBy != nil {
 					continue
 				}
 				idx := reqIndex[req]
@@ -805,7 +805,7 @@ func TestAutoBatchExtra_UniqueMixedQueuedOps_MatchSequentialModel(t *testing.T) 
 			}
 			for _, job := range batch {
 				req := job.reqs[0]
-				if req.coalescedTo == nil {
+				if req.replacedBy == nil {
 					continue
 				}
 				term := terminalAutoBatchReq(req)
@@ -877,8 +877,8 @@ func TestAutoBatchExtra_GrowQueuePreservesRingOrderAndCoalesceAcrossWrap(t *test
 	if len(batch) != 5 {
 		t.Fatalf("popped batch size = %d, want 5", len(batch))
 	}
-	if req1.coalescedTo != req2 || req2.coalescedTo != req5 || req5.coalescedTo != nil {
-		t.Fatalf("unexpected coalesce chain after grow: req1->%p req2->%p req5->%p", req1.coalescedTo, req2.coalescedTo, req5.coalescedTo)
+	if req1.replacedBy != req2 || req2.replacedBy != req5 || req5.replacedBy != nil {
+		t.Fatalf("unexpected coalesce chain after grow: req1->%p req2->%p req5->%p", req1.replacedBy, req2.replacedBy, req5.replacedBy)
 	}
 
 	db.executeAutoBatchJobs(batch)

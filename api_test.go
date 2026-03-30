@@ -486,6 +486,51 @@ func TestBeforeStore_AutoCloneMethod_BatchSet_AllowsNormalizationBeforeEncode(t 
 	}
 }
 
+func TestBatchSet_FailedBuild_ReleasesPreparedRequestsBeforePooling(t *testing.T) {
+	db := openTempDBUint64BeforeStoreCloneRec(t, Options{AutoBatchMax: 1})
+
+	err := db.BatchSet(
+		[]uint64{1, 2},
+		[]*beforeStoreCloneRec{
+			{Name: "ok", Ready: true},
+			{Name: "bad", Ready: false},
+		},
+	)
+	if err == nil || !strings.Contains(err.Error(), "encode") {
+		t.Fatalf("BatchSet build error = %v, want encode failure", err)
+	}
+
+	req, err := db.buildSetAutoBatchRequest(
+		3,
+		&beforeStoreCloneRec{Name: "hooked", Ready: true},
+		nil,
+		[]beforeCommitFunc[uint64, beforeStoreCloneRec]{
+			func(_ *bbolt.Tx, _ uint64, _ *beforeStoreCloneRec, _ *beforeStoreCloneRec) error { return nil },
+		},
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("buildSetAutoBatchRequest after failed BatchSet: %v", err)
+	}
+	defer func() {
+		req.releaseOwnedState()
+		db.autoBatcher.releaseRequest(req)
+	}()
+
+	if req.policy != 0 {
+		t.Fatalf("request policy after failed BatchSet = %08b, want 0", req.policy)
+	}
+	if req.canCoalesceSetDelete() {
+		t.Fatal("hooked set request inherited coalescing flag after failed BatchSet")
+	}
+	if req.hasPolicy(autoBatchReqRepeatIDSafeShared) {
+		t.Fatal("hooked set request inherited repeated-id flag after failed BatchSet")
+	}
+	if req.beforeCommit == nil {
+		t.Fatal("beforeCommit hooks were not attached")
+	}
+}
+
 func TestBeforeStore_CloneFunc_AutoBatch_AllowsNormalizationBeforeEncode(t *testing.T) {
 	db := openTempDBUint64BeforeStoreCloneRec(t)
 

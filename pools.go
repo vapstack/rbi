@@ -12,6 +12,7 @@ const (
 	uint64SlicePoolMaxCap              = 4 << 10
 	stringSlicePoolMaxCap              = 64 << 10
 	stringSetPoolMaxLen                = 4 << 10
+	uint64IntMapPoolMaxLen             = 16 << 10
 	u64SetPoolMaxCap                   = 16 << 10
 	postingSlicePoolMaxCap             = 4 << 10
 	postingMapPoolMaxLen               = 4 << 10
@@ -129,6 +130,25 @@ func releaseStringSet(m map[string]struct{}) {
 		return
 	}
 	stringSetPool.Put(m)
+}
+
+/**/
+
+var uint64IntMapPool sync.Pool
+
+func getUint64IntMap(capHint int) map[uint64]int {
+	if v := uint64IntMapPool.Get(); v != nil {
+		return v.(map[uint64]int)
+	}
+	return make(map[uint64]int, max(capHint, 8))
+}
+
+func releaseUint64IntMap(m map[uint64]int) {
+	if len(m) > uint64IntMapPoolMaxLen {
+		return
+	}
+	clear(m)
+	uint64IntMapPool.Put(m)
 }
 
 /**/
@@ -414,13 +434,12 @@ func releasePlannerOROrderMergeItemSliceBuf(buf *plannerOROrderMergeItemSliceBuf
 
 /**/
 
-var uniqueLeavingOuterPool sync.Pool
-
-var uniqueLeavingInnerPool sync.Pool
-
-var uniqueSeenOuterPool sync.Pool
-
-var uniqueSeenInnerPool sync.Pool
+var (
+	uniqueLeavingOuterPool sync.Pool
+	uniqueLeavingInnerPool sync.Pool
+	uniqueSeenOuterPool    sync.Pool
+	uniqueSeenInnerPool    sync.Pool
+)
 
 func getUniqueLeavingOuterMap() map[string]map[string]posting.List {
 	if v := uniqueLeavingOuterPool.Get(); v != nil {

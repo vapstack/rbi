@@ -137,7 +137,7 @@ func (db *DB[K, V]) checkUniqueBatchCandidateAndCollectSeen(
 	return append(seenWrites, uniqueSeenWrite{field: acc.name, key: single}), nil
 }
 
-func (db *DB[K, V]) checkUniqueBatchAppend(state uniqueBatchCheckState, idx uint64, oldVal, newVal *V, modified []string) error {
+func (db *DB[K, V]) checkUniqueBatchAppend(state uniqueBatchCheckState, idx uint64, oldVal, newVal *V) error {
 	if len(db.uniqueFieldAccessors) == 0 {
 		return nil
 	}
@@ -156,9 +156,9 @@ func (db *DB[K, V]) checkUniqueBatchAppend(state uniqueBatchCheckState, idx uint
 				touched = db.appendUniqueBatchLeavingTouch(state, touched, acc.name, single, idx)
 			}
 		} else {
-			for _, name := range modified {
-				acc, ok := db.indexedFieldByName[name]
-				if !ok || !acc.field.Unique || acc.field.Slice {
+			ptrNew := unsafe.Pointer(newVal)
+			for _, acc := range db.uniqueFieldAccessors {
+				if acc.modified == nil || !acc.modified(ptrOld, ptrNew) {
 					continue
 				}
 				single, ok, isNil := acc.uniqueGetter(ptrOld)
@@ -190,9 +190,9 @@ func (db *DB[K, V]) checkUniqueBatchAppend(state uniqueBatchCheckState, idx uint
 			}
 		}
 	} else {
-		for _, name := range modified {
-			acc, ok := db.indexedFieldByName[name]
-			if !ok || !acc.field.Unique || acc.field.Slice {
+		ptrOld := unsafe.Pointer(oldVal)
+		for _, acc := range db.uniqueFieldAccessors {
+			if acc.modified == nil || !acc.modified(ptrOld, ptrNew) {
 				continue
 			}
 			var err error
@@ -215,74 +215,43 @@ func (db *DB[K, V]) checkUniqueBatchAppend(state uniqueBatchCheckState, idx uint
 	return nil
 }
 
-func (db *DB[K, V]) checkUniqueOnWriteMulti(idxs []uint64, oldVals, newVals []*V, modified [][]string) error {
+func collapseUniqueWriteMulti[V any](idxs []uint64, oldVals, newVals []*V, pos map[uint64]int) ([]uint64, []*V, []*V) {
+	n := 0
+	for i, idx := range idxs {
+		p := pos[idx]
+		if p != 0 {
+			if newVals != nil {
+				newVals[p-1] = newVals[i]
+			}
+			continue
+		}
+		pos[idx] = n + 1
+		if n != i {
+			idxs[n] = idx
+			oldVals[n] = oldVals[i]
+			if newVals != nil {
+				newVals[n] = newVals[i]
+			}
+		}
+		n++
+	}
+	idxs = idxs[:n]
+	oldVals = oldVals[:n]
+	if newVals != nil {
+		newVals = newVals[:n]
+	}
+	return idxs, oldVals, newVals
+}
+
+func (db *DB[K, V]) checkUniqueOnWriteMulti(idxs []uint64, oldVals, newVals []*V) error {
 	if len(idxs) == 0 || len(db.uniqueFieldAccessors) == 0 {
 		return nil
 	}
 
-	// Collapse duplicate ids to their net old->new state within this tx.
-	// Uniqueness should be validated against final committed state, not
-	// transient intermediate values inside one BatchSet/BatchPatch call.
-	collapseNeeded := false
-	seenIdx := make(map[uint64]struct{}, len(idxs))
-	for _, idx := range idxs {
-		if _, ok := seenIdx[idx]; ok {
-			collapseNeeded = true
-			break
-		}
-		seenIdx[idx] = struct{}{}
-	}
+	pos := getUint64IntMap(len(idxs))
+	defer releaseUint64IntMap(pos)
 
-	if collapseNeeded {
-		type uniqueAgg struct {
-			idx uint64
-			old *V
-			new *V
-		}
-
-		order := make([]uniqueAgg, 0, len(idxs))
-		pos := make(map[uint64]int, len(idxs))
-		for i, idx := range idxs {
-			p, ok := pos[idx]
-			if !ok {
-				p = len(order)
-				pos[idx] = p
-				order = append(order, uniqueAgg{
-					idx: idx,
-					old: oldVals[i],
-				})
-			}
-			if newVals != nil {
-				order[p].new = newVals[i]
-			}
-		}
-
-		collapsedIdxs := make([]uint64, 0, len(order))
-		collapsedOld := make([]*V, 0, len(order))
-		var collapsedNew []*V
-		if newVals != nil {
-			collapsedNew = make([]*V, 0, len(order))
-		}
-		collapsedModified := make([][]string, 0, len(order))
-
-		for _, it := range order {
-			collapsedIdxs = append(collapsedIdxs, it.idx)
-			collapsedOld = append(collapsedOld, it.old)
-			if newVals != nil {
-				collapsedNew = append(collapsedNew, it.new)
-			}
-			if it.old != nil && it.new != nil {
-				collapsedModified = append(collapsedModified, db.getModifiedUniqueFields(it.old, it.new))
-			} else {
-				collapsedModified = append(collapsedModified, nil)
-			}
-		}
-
-		idxs = collapsedIdxs
-		oldVals = collapsedOld
-		newVals = collapsedNew
-		modified = collapsedModified
-	}
+	idxs, oldVals, newVals = collapseUniqueWriteMulti(idxs, oldVals, newVals, pos)
 
 	leaving := getUniqueLeavingOuterMap()
 	defer releaseUniqueLeavingOuterMap(leaving)
@@ -322,9 +291,9 @@ func (db *DB[K, V]) checkUniqueOnWriteMulti(idxs []uint64, oldVals, newVals []*V
 			continue
 		}
 
-		for _, name := range modified[i] {
-			acc, ok := db.indexedFieldByName[name]
-			if !ok || !acc.field.Unique || acc.field.Slice {
+		ptrNew := unsafe.Pointer(newVal)
+		for _, acc := range db.uniqueFieldAccessors {
+			if acc.modified == nil || !acc.modified(ptr, ptrNew) {
 				continue
 			}
 			single, ok, isNil := acc.uniqueGetter(ptr)
@@ -363,9 +332,9 @@ func (db *DB[K, V]) checkUniqueOnWriteMulti(idxs []uint64, oldVals, newVals []*V
 			continue
 		}
 
-		for _, name := range modified[i] {
-			acc, ok := db.indexedFieldByName[name]
-			if !ok || !acc.field.Unique || acc.field.Slice {
+		ptrOld := unsafe.Pointer(oldVals[i])
+		for _, acc := range db.uniqueFieldAccessors {
+			if acc.modified == nil || !acc.modified(ptrOld, ptr) {
 				continue
 			}
 			if err := db.checkUniqueBatchCandidate(idx, ptr, acc, seen, leaving); err != nil {

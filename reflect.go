@@ -253,18 +253,6 @@ func (db *DB[K, V]) getModifiedIndexedFields(v1 *V, v2 *V) []string {
 	return modified
 }
 
-func (db *DB[K, V]) getModifiedUniqueFields(v1 *V, v2 *V) []string {
-	if len(db.uniqueFieldAccessors) == 0 {
-		return nil
-	}
-	var modified []string
-	db.forEachModifiedAccessor(db.uniqueFieldAccessors, v1, v2, func(acc indexedFieldAccessor) bool {
-		modified = append(modified, acc.name)
-		return true
-	})
-	return modified
-}
-
 func (db *DB[K, V]) applyPatch(v *V, patch []Field, ignoreUnknown bool) error {
 	rv := reflect.ValueOf(v).Elem()
 

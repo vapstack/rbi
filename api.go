@@ -379,7 +379,7 @@ func (db *DB[K, V]) SeqScanRaw(seek K, fn func(K, []byte) (bool, error)) error {
 // to BeforeStore and BeforeCommit hooks. BeforeStore may modify the stored
 // value before it is encoded. If BeforeStore is used and CloneFunc is not
 // provided, RBI first checks whether *V implements Clone() *V and uses it when
-// available. Otherwise the input value must already be msgpack-encodable
+// available. Otherwise, the input value must already be msgpack-encodable
 // because RBI falls back to encode/decode snapshotting before the hook runs.
 // CloneFunc can also be used as a faster cloning path when the caller can
 // produce an independent copy more cheaply than msgpack snapshotting. If any
@@ -403,7 +403,12 @@ func (db *DB[K, V]) Set(id K, newVal *V, execOpts ...ExecOption[K, V]) error {
 	if err != nil {
 		return err
 	}
-	return db.submitAutoBatchRequests([]*autoBatchRequest[K, V]{req}, cfg.noBatch)
+	reqScratch := db.autoBatcher.acquireRequestScratch(1)
+	defer db.autoBatcher.releaseRequestScratch(reqScratch)
+
+	reqScratch.reqs = append(reqScratch.reqs, req)
+
+	return db.submitAutoBatchRequests(reqScratch.reqs, cfg.noBatch)
 }
 
 // BatchSet stores multiple values under the provided IDs in a single write
@@ -451,15 +456,22 @@ func (db *DB[K, V]) BatchSet(ids []K, newVals []*V, execOpts ...ExecOption[K, V]
 	}
 	defer db.endOp()
 
-	reqs := make([]*autoBatchRequest[K, V], len(ids))
+	reqScratch := db.autoBatcher.acquireRequestScratch(len(ids))
+	defer db.autoBatcher.releaseRequestScratch(reqScratch)
+
+	reqs := reqScratch.reqs
 	for i := range ids {
 		req, err := db.buildSetAutoBatchRequest(ids[i], newVals[i], cfg.beforeStore, cfg.beforeCommit, cfg.cloneValue)
 		if err != nil {
-			releaseAutoBatchRequestResources(reqs[:i])
+			reqScratch.reqs = reqs
+			releaseAutoBatchRequestsState(reqs)
+			db.autoBatcher.releaseRequests(reqs)
 			return err
 		}
-		reqs[i] = req
+		reqs = append(reqs, req)
 	}
+	reqScratch.reqs = reqs
+
 	return db.submitAutoBatchRequests(reqs, true)
 }
 
@@ -497,7 +509,12 @@ func (db *DB[K, V]) patch(id K, fields []Field, execOpts ...ExecOption[K, V]) er
 	defer db.endOp()
 
 	req := db.buildPatchAutoBatchRequest(id, fields, ignoreUnknown, cfg.beforeProcess, cfg.beforeStore, cfg.beforeCommit)
-	return db.submitAutoBatchRequests([]*autoBatchRequest[K, V]{req}, cfg.noBatch)
+
+	reqScratch := db.autoBatcher.acquireRequestScratch(1)
+	defer db.autoBatcher.releaseRequestScratch(reqScratch)
+
+	reqScratch.reqs = append(reqScratch.reqs, req)
+	return db.submitAutoBatchRequests(reqScratch.reqs, cfg.noBatch)
 }
 
 // BatchPatch applies the same patch to all values stored under the given IDs
@@ -526,10 +543,15 @@ func (db *DB[K, V]) batchPatch(ids []K, patch []Field, execOpts ...ExecOption[K,
 	cfg := db.resolveExecOptions(execOpts)
 	ignoreUnknown := !cfg.patchStrict
 
-	reqs := make([]*autoBatchRequest[K, V], len(ids))
+	reqScratch := db.autoBatcher.acquireRequestScratch(len(ids))
+	defer db.autoBatcher.releaseRequestScratch(reqScratch)
+
+	reqs := reqScratch.reqs
 	for i := range ids {
-		reqs[i] = db.buildPatchAutoBatchRequest(ids[i], patch, ignoreUnknown, cfg.beforeProcess, cfg.beforeStore, cfg.beforeCommit)
+		reqs = append(reqs, db.buildPatchAutoBatchRequest(ids[i], patch, ignoreUnknown, cfg.beforeProcess, cfg.beforeStore, cfg.beforeCommit))
 	}
+	reqScratch.reqs = reqs
+
 	return db.submitAutoBatchRequests(reqs, true)
 }
 
@@ -547,7 +569,13 @@ func (db *DB[K, V]) Delete(id K, execOpts ...ExecOption[K, V]) error {
 
 	cfg := db.resolveExecOptions(execOpts)
 	req := db.buildDeleteAutoBatchRequest(id, cfg.beforeCommit)
-	return db.submitAutoBatchRequests([]*autoBatchRequest[K, V]{req}, cfg.noBatch)
+
+	reqScratch := db.autoBatcher.acquireRequestScratch(1)
+	defer db.autoBatcher.releaseRequestScratch(reqScratch)
+
+	reqScratch.reqs = append(reqScratch.reqs, req)
+
+	return db.submitAutoBatchRequests(reqScratch.reqs, cfg.noBatch)
 }
 
 // BatchDelete removes all values stored under the provided ids in a single
@@ -568,9 +596,14 @@ func (db *DB[K, V]) BatchDelete(ids []K, execOpts ...ExecOption[K, V]) error {
 
 	cfg := db.resolveExecOptions(execOpts)
 
-	reqs := make([]*autoBatchRequest[K, V], len(ids))
+	reqScratch := db.autoBatcher.acquireRequestScratch(len(ids))
+	defer db.autoBatcher.releaseRequestScratch(reqScratch)
+
+	reqs := reqScratch.reqs
 	for i := range ids {
-		reqs[i] = db.buildDeleteAutoBatchRequest(ids[i], cfg.beforeCommit)
+		reqs = append(reqs, db.buildDeleteAutoBatchRequest(ids[i], cfg.beforeCommit))
 	}
+	reqScratch.reqs = reqs
+
 	return db.submitAutoBatchRequests(reqs, true)
 }

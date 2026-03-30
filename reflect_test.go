@@ -483,8 +483,13 @@ func TestReflectExt_ModifiedIndexedFields_EmbeddedUnsafeAccessorPaths(t *testing
 	if mods := db.getModifiedIndexedFields(base, same); len(mods) != 0 {
 		t.Fatalf("expected no modified indexed fields, got %v", mods)
 	}
-	if mods := db.getModifiedUniqueFields(base, same); len(mods) != 0 {
-		t.Fatalf("expected no modified unique fields, got %v", mods)
+	var uniqueMods []string
+	db.forEachModifiedAccessor(db.uniqueFieldAccessors, base, same, func(acc indexedFieldAccessor) bool {
+		uniqueMods = append(uniqueMods, acc.name)
+		return true
+	})
+	if len(uniqueMods) != 0 {
+		t.Fatalf("expected no modified unique fields, got %v", uniqueMods)
 	}
 
 	nextCount := uint64(9)

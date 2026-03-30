@@ -494,7 +494,7 @@ func TestBatch_RepeatIDScratch_UsesBatchSizeInsteadOfAutoBatchMax(t *testing.T) 
 	}
 }
 
-func TestBatch_RepeatIDScratch_ShrinksAfterLargeBurst(t *testing.T) {
+func TestBatch_RepeatIDScratch_RetainsCapacityAfterLargeBurst(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
 		AutoBatchWindow:   5 * time.Millisecond,
 		AutoBatchMax:      128,
@@ -542,8 +542,8 @@ func TestBatch_RepeatIDScratch_ShrinksAfterLargeBurst(t *testing.T) {
 
 	db.autoBatcher.mu.Lock()
 	defer db.autoBatcher.mu.Unlock()
-	if db.autoBatcher.repeatIDScratchCap != 8 {
-		t.Fatalf("repeatID scratch cap after shrink = %d, want 8", db.autoBatcher.repeatIDScratchCap)
+	if db.autoBatcher.repeatIDScratchCap != len(burst) {
+		t.Fatalf("repeatID scratch cap after reuse = %d, want %d", db.autoBatcher.repeatIDScratchCap, len(burst))
 	}
 }
 
@@ -638,6 +638,7 @@ func TestBatch_DuplicatePatchSameID_NonUniqueFieldsStayBatched(t *testing.T) {
 		id:                 1,
 		patch:              []Field{{Name: "tags", Value: []string{"x"}}},
 		patchIgnoreUnknown: true,
+		policy:             db.autoBatchPatchRequestPolicy([]Field{{Name: "tags", Value: []string{"x"}}}, nil, nil),
 		done:               make(chan error, 1),
 	}
 	req2 := &autoBatchRequest[uint64, UniqueTestRec]{
@@ -645,6 +646,7 @@ func TestBatch_DuplicatePatchSameID_NonUniqueFieldsStayBatched(t *testing.T) {
 		id:                 1,
 		patch:              []Field{{Name: "tags", Value: []string{"y"}}},
 		patchIgnoreUnknown: true,
+		policy:             db.autoBatchPatchRequestPolicy([]Field{{Name: "tags", Value: []string{"y"}}}, nil, nil),
 		done:               make(chan error, 1),
 	}
 	req3 := &autoBatchRequest[uint64, UniqueTestRec]{
@@ -652,6 +654,7 @@ func TestBatch_DuplicatePatchSameID_NonUniqueFieldsStayBatched(t *testing.T) {
 		id:                 2,
 		patch:              []Field{{Name: "tags", Value: []string{"z"}}},
 		patchIgnoreUnknown: true,
+		policy:             db.autoBatchPatchRequestPolicy([]Field{{Name: "tags", Value: []string{"z"}}}, nil, nil),
 		done:               make(chan error, 1),
 	}
 
@@ -693,6 +696,48 @@ func TestBatch_DuplicatePatchSameID_NonUniqueFieldsStayBatched(t *testing.T) {
 	}
 	if got2 == nil || !slices.Equal(got2.Tags, []string{"z"}) {
 		t.Fatalf("id=2 must persist independent patch, got: %#v", got2)
+	}
+}
+
+func TestBatch_DuplicatePatchSameID_DecodeFailurePropagatesToLaterRequests(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{
+		AutoBatchWindow:   5 * time.Millisecond,
+		AutoBatchMax:      16,
+		AutoBatchMaxQueue: 64,
+	})
+
+	if err := db.bolt.Update(func(tx *bbolt.Tx) error {
+		b := tx.Bucket(db.bucket)
+		if b == nil {
+			return fmt.Errorf("bucket does not exist")
+		}
+		return b.Put(db.keyFromID(1), []byte{0xc1})
+	}); err != nil {
+		t.Fatalf("seed invalid payload: %v", err)
+	}
+
+	req1 := &autoBatchRequest[uint64, Rec]{
+		op:                 autoBatchPatch,
+		id:                 1,
+		patch:              []Field{{Name: "age", Value: 31}},
+		patchIgnoreUnknown: true,
+		done:               make(chan error, 1),
+	}
+	req2 := &autoBatchRequest[uint64, Rec]{
+		op:                 autoBatchPatch,
+		id:                 1,
+		patch:              []Field{{Name: "age", Value: 32}},
+		patchIgnoreUnknown: true,
+		done:               make(chan error, 1),
+	}
+
+	db.executeAutoBatch([]*autoBatchRequest[uint64, Rec]{req1, req2})
+
+	if err := <-req1.done; err == nil || !strings.Contains(err.Error(), "failed to decode existing value") {
+		t.Fatalf("req1 error = %v, want decode existing value", err)
+	}
+	if err := <-req2.done; err == nil || !strings.Contains(err.Error(), "failed to decode existing value") {
+		t.Fatalf("req2 error = %v, want decode existing value", err)
 	}
 }
 
@@ -891,18 +936,21 @@ func TestBatch_SetDeleteSameID_CoalescedToLastWrite(t *testing.T) {
 	req1 := &autoBatchRequest[uint64, Rec]{
 		op:         autoBatchSet,
 		id:         1,
+		policy:     db.autoBatchSetRequestPolicy(nil, nil),
 		setValue:   setA,
 		setPayload: mustEncodeAutoBatchPayload(t, db, setA),
 		done:       make(chan error, 1),
 	}
 	req2 := &autoBatchRequest[uint64, Rec]{
-		op:   autoBatchDelete,
-		id:   1,
-		done: make(chan error, 1),
+		op:     autoBatchDelete,
+		id:     1,
+		policy: db.autoBatchDeleteRequestPolicy(nil),
+		done:   make(chan error, 1),
 	}
 	req3 := &autoBatchRequest[uint64, Rec]{
 		op:         autoBatchSet,
 		id:         1,
+		policy:     db.autoBatchSetRequestPolicy(nil, nil),
 		setValue:   setB,
 		setPayload: mustEncodeAutoBatchPayload(t, db, setB),
 		done:       make(chan error, 1),
@@ -910,6 +958,7 @@ func TestBatch_SetDeleteSameID_CoalescedToLastWrite(t *testing.T) {
 	req4 := &autoBatchRequest[uint64, Rec]{
 		op:         autoBatchSet,
 		id:         2,
+		policy:     db.autoBatchSetRequestPolicy(nil, nil),
 		setValue:   setOther,
 		setPayload: mustEncodeAutoBatchPayload(t, db, setOther),
 		done:       make(chan error, 1),
@@ -931,8 +980,8 @@ func TestBatch_SetDeleteSameID_CoalescedToLastWrite(t *testing.T) {
 	if len(batch) != 4 {
 		t.Fatalf("unexpected popped batch size: got=%d want=4", len(batch))
 	}
-	if req1.coalescedTo != req2 || req2.coalescedTo != req3 || req3.coalescedTo != nil {
-		t.Fatalf("unexpected coalesce chain: req1->%p req2->%p req3->%p", req1.coalescedTo, req2.coalescedTo, req3.coalescedTo)
+	if req1.replacedBy != req2 || req2.replacedBy != req3 || req3.replacedBy != nil {
+		t.Fatalf("unexpected coalesce chain: req1->%p req2->%p req3->%p", req1.replacedBy, req2.replacedBy, req3.replacedBy)
 	}
 
 	db.executeAutoBatchJobs(batch)
@@ -980,18 +1029,21 @@ func TestBatch_CoalescedChain_PropagatesTerminalError(t *testing.T) {
 	req1 := &autoBatchRequest[uint64, UniqueTestRec]{
 		op:         autoBatchSet,
 		id:         1,
+		policy:     db.autoBatchSetRequestPolicy(nil, nil),
 		setValue:   &UniqueTestRec{Email: "mid@x", Code: 10},
 		setPayload: mustEncodeAutoBatchPayload(t, db, &UniqueTestRec{Email: "mid@x", Code: 10}),
 		done:       make(chan error, 1),
 	}
 	req2 := &autoBatchRequest[uint64, UniqueTestRec]{
-		op:   autoBatchDelete,
-		id:   1,
-		done: make(chan error, 1),
+		op:     autoBatchDelete,
+		id:     1,
+		policy: db.autoBatchDeleteRequestPolicy(nil),
+		done:   make(chan error, 1),
 	}
 	req3 := &autoBatchRequest[uint64, UniqueTestRec]{
 		op:         autoBatchSet,
 		id:         1,
+		policy:     db.autoBatchSetRequestPolicy(nil, nil),
 		setValue:   &UniqueTestRec{Email: "taken@x", Code: 11},
 		setPayload: mustEncodeAutoBatchPayload(t, db, &UniqueTestRec{Email: "taken@x", Code: 11}),
 		done:       make(chan error, 1),
@@ -999,6 +1051,7 @@ func TestBatch_CoalescedChain_PropagatesTerminalError(t *testing.T) {
 	req4 := &autoBatchRequest[uint64, UniqueTestRec]{
 		op:         autoBatchSet,
 		id:         3,
+		policy:     db.autoBatchSetRequestPolicy(nil, nil),
 		setValue:   &UniqueTestRec{Email: "ok@x", Code: 3},
 		setPayload: mustEncodeAutoBatchPayload(t, db, &UniqueTestRec{Email: "ok@x", Code: 3}),
 		done:       make(chan error, 1),
@@ -1020,8 +1073,8 @@ func TestBatch_CoalescedChain_PropagatesTerminalError(t *testing.T) {
 	if len(batch) != 4 {
 		t.Fatalf("unexpected popped batch size: got=%d want=4", len(batch))
 	}
-	if req1.coalescedTo != req2 || req2.coalescedTo != req3 || req3.coalescedTo != nil {
-		t.Fatalf("unexpected coalesce chain: req1->%p req2->%p req3->%p", req1.coalescedTo, req2.coalescedTo, req3.coalescedTo)
+	if req1.replacedBy != req2 || req2.replacedBy != req3 || req3.replacedBy != nil {
+		t.Fatalf("unexpected coalesce chain: req1->%p req2->%p req3->%p", req1.replacedBy, req2.replacedBy, req3.replacedBy)
 	}
 
 	db.executeAutoBatchJobs(batch)
@@ -1446,8 +1499,8 @@ func TestBatch_CompletedRequest_ReleasesResources(t *testing.T) {
 	if req.cloneValue != nil {
 		t.Fatal("cloneValue must be cleared after completion")
 	}
-	if req.coalescedTo != nil {
-		t.Fatalf("coalescedTo must be cleared after completion: %p", req.coalescedTo)
+	if req.replacedBy != nil {
+		t.Fatalf("replacedBy must be cleared after completion: %p", req.replacedBy)
 	}
 }
 
@@ -2177,11 +2230,11 @@ func TestAutoBatchExt_CoalescedInterleavedChains_PreserveFinalState(t *testing.T
 	if len(batch) != 6 {
 		t.Fatalf("popped batch size = %d, want 6", len(batch))
 	}
-	if req1.coalescedTo != req3 || req3.coalescedTo != req5 {
-		t.Fatalf("unexpected id=1 coalesce chain: req1->%p req3->%p", req1.coalescedTo, req3.coalescedTo)
+	if req1.replacedBy != req3 || req3.replacedBy != req5 {
+		t.Fatalf("unexpected id=1 coalesce chain: req1->%p req3->%p", req1.replacedBy, req3.replacedBy)
 	}
-	if req2.coalescedTo != req4 || req4.coalescedTo != req6 {
-		t.Fatalf("unexpected id=2 coalesce chain: req2->%p req4->%p", req2.coalescedTo, req4.coalescedTo)
+	if req2.replacedBy != req4 || req4.replacedBy != req6 {
+		t.Fatalf("unexpected id=2 coalesce chain: req2->%p req4->%p", req2.replacedBy, req4.replacedBy)
 	}
 
 	db.executeAutoBatchJobs(batch)
@@ -2302,8 +2355,8 @@ func TestAutoBatchExt_CoalescedChain_NeighborCallbackFailureDoesNotPoisonChain(t
 	if len(batch) != 3 {
 		t.Fatalf("popped batch size = %d, want 3", len(batch))
 	}
-	if req1.coalescedTo != req3 {
-		t.Fatalf("expected req1 to coalesce to req3, got %p", req1.coalescedTo)
+	if req1.replacedBy != req3 {
+		t.Fatalf("expected req1 to coalesce to req3, got %p", req1.replacedBy)
 	}
 
 	db.executeAutoBatchJobs(batch)
