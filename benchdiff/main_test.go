@@ -43,7 +43,7 @@ func TestRunCLIHelpExitsCleanly(t *testing.T) {
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
 
-	code := runCLI([]string{"-h"}, &stdout, &stderr, false)
+	code := runCLI([]string{"-help"}, &stdout, &stderr, false)
 	if code != 0 {
 		t.Fatalf("unexpected exit code: %d", code)
 	}
@@ -52,7 +52,7 @@ func TestRunCLIHelpExitsCleanly(t *testing.T) {
 	}
 
 	help := stderr.String()
-	for _, fragment := range []string{"Usage of benchdiff:", "-f", "follow the current benchmark file"} {
+	for _, fragment := range []string{"Usage of benchdiff:", "-f", "follow the current benchmark file", "-h", "hide insignificant rows"} {
 		if !strings.Contains(help, fragment) {
 			t.Fatalf("expected help to contain %q, got %q", fragment, help)
 		}
@@ -344,7 +344,7 @@ func TestRenderRowsWithWidthsKeepsSingleRowsAligned(t *testing.T) {
 	}
 }
 
-func TestRunCLIRendersOnlyMeaningfulRows(t *testing.T) {
+func TestRunCLIRendersAllRowsByDefault(t *testing.T) {
 	t.Parallel()
 
 	dir := t.TempDir()
@@ -380,11 +380,17 @@ func TestRunCLIRendersOnlyMeaningfulRows(t *testing.T) {
 	}
 
 	output := stdout.String()
-	if strings.Contains(output, "Foo-16") {
-		t.Fatalf("expected insignificant benchmark to be filtered out: %q", output)
+	if !strings.Contains(output, "Foo-16") {
+		t.Fatalf("expected insignificant benchmark to stay visible by default: %q", output)
 	}
 
 	expectedFragments := []string{
+		"Foo-16",
+		"120",
+		"1_009ns/op",
+		"+0.9%",
+		"100B/op",
+		"1 allocs/op",
 		"Bar-16",
 		"100",
 		"1_550ns/op",
@@ -398,6 +404,50 @@ func TestRunCLIRendersOnlyMeaningfulRows(t *testing.T) {
 		if !strings.Contains(output, fragment) {
 			t.Fatalf("expected output to contain %q, got %q", fragment, output)
 		}
+	}
+}
+
+func TestRunCLIHidesInsignificantRowsWithHideFlag(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	previous := filepath.Join(dir, "previous.txt")
+	current := filepath.Join(dir, "current.txt")
+
+	previousText := strings.Join([]string{
+		"Benchmark__Foo-16 100 1000 ns/op 100 B/op 1 allocs/op",
+		"Benchmark__Bar-16 100 2000 ns/op 200 B/op 2 allocs/op",
+	}, "\n")
+	currentText := strings.Join([]string{
+		"Benchmark__Foo-16 120 1009 ns/op 100 B/op 1 allocs/op",
+		"Benchmark__Bar-16 90 1600 ns/op 204 B/op 1 allocs/op",
+		"Benchmark__Bar-16 110 1700 ns/op 206 B/op 1 allocs/op",
+		"Benchmark__Bar-16 100 1500 ns/op 205 B/op 1 allocs/op",
+	}, "\n")
+
+	if err := os.WriteFile(previous, []byte(previousText), 0o644); err != nil {
+		t.Fatalf("write previous: %v", err)
+	}
+	if err := os.WriteFile(current, []byte(currentText), 0o644); err != nil {
+		t.Fatalf("write current: %v", err)
+	}
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	code := runCLI([]string{"-h", previous, current}, &stdout, &stderr, false)
+	if code != 0 {
+		t.Fatalf("unexpected exit code %d, stderr=%q", code, stderr.String())
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("unexpected stderr: %q", stderr.String())
+	}
+
+	output := stdout.String()
+	if strings.Contains(output, "Foo-16") {
+		t.Fatalf("expected insignificant benchmark to be filtered out with -h: %q", output)
+	}
+	if !strings.Contains(output, "Bar-16") {
+		t.Fatalf("expected significant benchmark to stay visible with -h: %q", output)
 	}
 }
 
@@ -415,7 +465,7 @@ func TestBuildRowsRendersNewBenchmarkWithNeutralDeltas(t *testing.T) {
 		},
 	}
 
-	rows := buildRows(nil, []string{"Benchmark__Bar-16"}, currentSummaries, true)
+	rows := buildRows(nil, []string{"Benchmark__Bar-16"}, currentSummaries, false, true)
 	if len(rows) != 1 {
 		t.Fatalf("unexpected row count: %d", len(rows))
 	}
@@ -465,7 +515,7 @@ func TestBuildRowsLeavesNeutralBandUncolored(t *testing.T) {
 		},
 	}
 
-	rows := buildRows(previousSummaries, []string{"Benchmark__Bar-16"}, currentSummaries, true)
+	rows := buildRows(previousSummaries, []string{"Benchmark__Bar-16"}, currentSummaries, false, true)
 	if len(rows) != 1 {
 		t.Fatalf("unexpected row count: %d", len(rows))
 	}
@@ -518,8 +568,10 @@ func TestRunCLIRendersNewBenchmarksWithZeroDeltas(t *testing.T) {
 
 	output := stdout.String()
 	expectedFragments := []string{
+		"Foo-16",
 		"Bar-16",
 		"100",
+		"1_000ns/op",
 		"1_500ns/op",
 		"0%",
 		"205B/op",
@@ -530,11 +582,11 @@ func TestRunCLIRendersNewBenchmarksWithZeroDeltas(t *testing.T) {
 			t.Fatalf("expected output to contain %q, got %q", fragment, output)
 		}
 	}
-	if strings.Contains(output, "Foo-16") {
-		t.Fatalf("expected unchanged baseline benchmark to stay filtered out: %q", output)
+	if !strings.Contains(output, "Foo-16") {
+		t.Fatalf("expected unchanged baseline benchmark to stay visible by default: %q", output)
 	}
-	if strings.Count(output, "0%") != 3 {
-		t.Fatalf("expected three neutral deltas, got %q", output)
+	if strings.Count(output, "0%") != 5 {
+		t.Fatalf("expected five percent-based neutral deltas, got %q", output)
 	}
 }
 
@@ -623,7 +675,7 @@ func TestRunFollowCLIRendersRowsAndStopsOnPass(t *testing.T) {
 	var stdout bytes.Buffer
 	done := make(chan error, 1)
 	go func() {
-		done <- runFollowCLI(summarizeSet(previousSet), current, &stdout, false, 5*time.Millisecond, nil)
+		done <- runFollowCLI(summarizeSet(previousSet), current, &stdout, false, false, 5*time.Millisecond, nil)
 	}()
 
 	if err := appendText(current, "Benchmark__Foo-16 100 800 ns/op 100 B/op 1 allocs/op\n"); err != nil {
@@ -684,7 +736,7 @@ func TestRunFollowCLIUsesPreviousWidthsAcrossSeparateRenders(t *testing.T) {
 	var stdout bytes.Buffer
 	done := make(chan error, 1)
 	go func() {
-		done <- runFollowCLI(summarizeSet(previousSet), current, &stdout, false, 5*time.Millisecond, nil)
+		done <- runFollowCLI(summarizeSet(previousSet), current, &stdout, false, false, 5*time.Millisecond, nil)
 	}()
 
 	if err := appendText(current, "Benchmark__VeryLongBenchmarkName-16 100 900 ns/op 100 B/op 1 allocs/op\n"); err != nil {
@@ -748,7 +800,7 @@ func TestRunFollowCLIHandlesCompletedGoTestOutput(t *testing.T) {
 	}
 
 	var stdout bytes.Buffer
-	err = runFollowCLI(summarizeSet(previousSet), current, &stdout, false, 5*time.Millisecond, nil)
+	err = runFollowCLI(summarizeSet(previousSet), current, &stdout, false, false, 5*time.Millisecond, nil)
 	if err != nil {
 		t.Fatalf("runFollowCLI: %v", err)
 	}
@@ -783,7 +835,7 @@ func TestRunFollowCLIWaitsForCountSeriesBeforeRendering(t *testing.T) {
 	var stdout bytes.Buffer
 	done := make(chan error, 1)
 	go func() {
-		done <- runFollowCLI(summarizeSet(previousSet), current, &stdout, false, 5*time.Millisecond, nil)
+		done <- runFollowCLI(summarizeSet(previousSet), current, &stdout, false, false, 5*time.Millisecond, nil)
 	}()
 
 	if err := appendText(current, strings.Join([]string{
@@ -827,7 +879,7 @@ func TestRunFollowCLIStopsOnInterrupt(t *testing.T) {
 	interrupted := make(chan struct{})
 	done := make(chan error, 1)
 	go func() {
-		done <- runFollowCLI(nil, current, io.Discard, false, 5*time.Millisecond, interrupted)
+		done <- runFollowCLI(nil, current, io.Discard, false, false, 5*time.Millisecond, interrupted)
 	}()
 
 	time.Sleep(20 * time.Millisecond)

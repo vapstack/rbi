@@ -92,6 +92,7 @@ type outputRow struct {
 
 type cliOptions struct {
 	follow bool
+	hide   bool
 }
 
 type followReader struct {
@@ -130,7 +131,7 @@ func runCLI(args []string, stdout io.Writer, stderr io.Writer, useColor bool) in
 		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 		defer stop()
 
-		err := runFollowCLI(previousSummaries, paths[1], stdout, useColor, time.Second, ctx.Done())
+		err = runFollowCLI(previousSummaries, paths[1], stdout, options.hide, useColor, time.Second, ctx.Done())
 		if err == nil {
 			return 0
 		}
@@ -148,7 +149,7 @@ func runCLI(args []string, stdout io.Writer, stderr io.Writer, useColor bool) in
 	}
 
 	currentSummaries := summarizeSet(current)
-	rows := buildRows(previousSummaries, current.Order, currentSummaries, useColor)
+	rows := buildRows(previousSummaries, current.Order, currentSummaries, options.hide, useColor)
 	if len(rows) == 0 {
 		return 0
 	}
@@ -163,6 +164,7 @@ func parseCLIArgs(args []string, stderr io.Writer) (cliOptions, []string, bool, 
 
 	options := cliOptions{}
 	flags.BoolVar(&options.follow, "f", false, "follow the current benchmark file")
+	flags.BoolVar(&options.hide, "h", false, "hide insignificant rows")
 
 	if err := flags.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -173,7 +175,7 @@ func parseCLIArgs(args []string, stderr io.Writer) (cliOptions, []string, bool, 
 
 	paths := flags.Args()
 	if len(paths) != 2 {
-		_, _ = fmt.Fprintln(stderr, "usage: benchdiff [-f] <previous.txt> <current.txt>")
+		_, _ = fmt.Fprintln(stderr, "usage: benchdiff [-f] [-h] <previous.txt> <current.txt>")
 		return cliOptions{}, nil, false, 2
 	}
 
@@ -360,7 +362,7 @@ func median(values []float64) float64 {
 	return (sorted[middle-1] + sorted[middle]) / 2
 }
 
-func buildRows(previousSummaries map[string]benchmarkSummary, order []string, currentSummaries map[string]benchmarkSummary, useColor bool) []outputRow {
+func buildRows(previousSummaries map[string]benchmarkSummary, order []string, currentSummaries map[string]benchmarkSummary, hideInsignificant bool, useColor bool) []outputRow {
 	rows := make([]outputRow, 0, len(order))
 
 	for _, name := range order {
@@ -379,7 +381,7 @@ func buildRows(previousSummaries map[string]benchmarkSummary, order []string, cu
 		bytesDisplay := compareMetric(metricBytes, previousSummary.BytesPerOp, currentSummary.BytesPerOp)
 		allocsDisplay := compareMetric(metricAllocs, previousSummary.AllocsPerOp, currentSummary.AllocsPerOp)
 
-		if !nsDisplay.Significant && !bytesDisplay.Significant && !allocsDisplay.Significant {
+		if hideInsignificant && !nsDisplay.Significant && !bytesDisplay.Significant && !allocsDisplay.Significant {
 			continue
 		}
 
@@ -437,7 +439,7 @@ func buildNewBenchmarkRow(currentSummary benchmarkSummary, useColor bool) output
 	return outputRow{Plain: plain, Colored: colored}
 }
 
-func runFollowCLI(previousSummaries map[string]benchmarkSummary, currentPath string, stdout io.Writer, useColor bool, pollInterval time.Duration, interrupted <-chan struct{}) error {
+func runFollowCLI(previousSummaries map[string]benchmarkSummary, currentPath string, stdout io.Writer, hideInsignificant bool, useColor bool, pollInterval time.Duration, interrupted <-chan struct{}) error {
 	current := newBenchmarkSet()
 	reader := followReader{path: currentPath}
 	widths := estimateFollowWidths(previousSummaries)
@@ -458,7 +460,7 @@ func runFollowCLI(previousSummaries map[string]benchmarkSummary, currentPath str
 
 		if len(changedNames) > 0 {
 			currentSummaries := summarizeSet(current)
-			rows := buildRows(previousSummaries, changedNames, currentSummaries, useColor)
+			rows := buildRows(previousSummaries, changedNames, currentSummaries, hideInsignificant, useColor)
 			if len(rows) > 0 {
 				_, _ = fmt.Fprintln(stdout, renderRowsWithWidths(rows, widths))
 			}
