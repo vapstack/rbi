@@ -653,7 +653,10 @@ type indexedFieldAccessor struct {
 	name         string
 	field        *field
 	uniqueGetter uniqueScalarGetterFn
-	write        fieldWriteAccessorFn
+	writeBuild   buildFieldWriteAccessorFn
+	writeOverlay overlayFieldWriteAccessorFn
+	writeInsert  insertFieldWriteAccessorFn
+	writeScratch scratchFieldWriteAccessorFn
 	modified     fieldModifiedFn
 }
 

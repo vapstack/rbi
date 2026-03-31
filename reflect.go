@@ -206,15 +206,13 @@ func (db *DB[K, V]) populateFields(t reflect.Type, idx []int) error {
 	return nil
 }
 
-type uniqueScalarGetterFn func(ptr unsafe.Pointer) (string, bool, bool)
-type fieldWriteAccessorFn func(ptr unsafe.Pointer, sink fieldWriteSink)
-
-type fieldWriteSink interface {
-	setNil()
-	setLen(int)
-	addString(string)
-	addFixed(uint64)
-}
+type (
+	uniqueScalarGetterFn        func(ptr unsafe.Pointer) (string, bool, bool)
+	buildFieldWriteAccessorFn   func(ptr unsafe.Pointer, sink buildFieldWriteSink)
+	overlayFieldWriteAccessorFn func(ptr unsafe.Pointer, sink snapshotOverlayWriteSink)
+	insertFieldWriteAccessorFn  func(ptr unsafe.Pointer, sink snapshotInsertWriteSink)
+	scratchFieldWriteAccessorFn func(ptr unsafe.Pointer, sink *fieldWriteScratch)
+)
 
 func (db *DB[K, V]) forEachModifiedAccessor(accessors []indexedFieldAccessor, v1 *V, v2 *V, fn func(indexedFieldAccessor) bool) {
 	if fn == nil {

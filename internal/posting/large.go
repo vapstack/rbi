@@ -947,6 +947,16 @@ const maxLargeLowBit = uint32(0xFFFFFFFF)
 type largeArray struct {
 	keys       []uint32
 	containers []*bitmap32
+	inlineKeys [4]uint32
+	inlineVals [4]*bitmap32
+}
+
+func (la *largeArray) ensureInline() {
+	if la == nil || la.keys != nil || la.containers != nil {
+		return
+	}
+	la.keys = la.inlineKeys[:0]
+	la.containers = la.inlineVals[:0]
 }
 
 func (la *largeArray) aliases(other *largeArray) bool {
@@ -970,6 +980,7 @@ func (la *largeArray) runOptimize() {
 }
 
 func (la *largeArray) appendContainer(key uint32, value *bitmap32) {
+	la.ensureInline()
 	la.keys = append(la.keys, key)
 	la.containers = append(la.containers, value)
 }
@@ -988,12 +999,18 @@ func (la *largeArray) grow(newsize int) {
 	if newsize <= len(la.keys) {
 		return
 	}
+	la.ensureInline()
 	oldSize := len(la.keys)
 	if cap(la.keys) >= newsize {
 		la.keys = la.keys[:newsize]
 		clear(la.keys[oldSize:])
 	} else {
-		keys := make([]uint32, newsize)
+		var keys []uint32
+		if newsize <= len(la.inlineKeys) {
+			keys = la.inlineKeys[:newsize]
+		} else {
+			keys = make([]uint32, newsize)
+		}
 		copy(keys, la.keys)
 		la.keys = keys
 	}
@@ -1001,7 +1018,12 @@ func (la *largeArray) grow(newsize int) {
 		la.containers = la.containers[:newsize]
 		clear(la.containers[oldSize:])
 	} else {
-		containers := make([]*bitmap32, newsize)
+		var containers []*bitmap32
+		if newsize <= len(la.inlineVals) {
+			containers = la.inlineVals[:newsize]
+		} else {
+			containers = make([]*bitmap32, newsize)
+		}
 		copy(containers, la.containers)
 		la.containers = containers
 	}
@@ -1076,17 +1098,26 @@ func (la *largeArray) copyFrom(src *largeArray) {
 		return
 	}
 
+	la.ensureInline()
 	if cap(la.keys) >= len(src.keys) {
 		la.keys = la.keys[:len(src.keys)]
 	} else {
-		la.keys = make([]uint32, len(src.keys))
+		if len(src.keys) <= len(la.inlineKeys) {
+			la.keys = la.inlineKeys[:len(src.keys)]
+		} else {
+			la.keys = make([]uint32, len(src.keys))
+		}
 	}
 	copy(la.keys, src.keys)
 
 	if cap(la.containers) >= len(src.containers) {
 		la.containers = la.containers[:len(src.containers)]
 	} else {
-		la.containers = make([]*bitmap32, len(src.containers))
+		if len(src.containers) <= len(la.inlineVals) {
+			la.containers = la.inlineVals[:len(src.containers)]
+		} else {
+			la.containers = make([]*bitmap32, len(src.containers))
+		}
 	}
 	for i := range src.containers {
 		la.containers[i] = src.containers[i].clone()
@@ -1113,17 +1144,26 @@ func (la *largeArray) copySharedFrom(src *largeArray) {
 		return
 	}
 
+	la.ensureInline()
 	if cap(la.keys) >= len(src.keys) {
 		la.keys = la.keys[:len(src.keys)]
 	} else {
-		la.keys = make([]uint32, len(src.keys))
+		if len(src.keys) <= len(la.inlineKeys) {
+			la.keys = la.inlineKeys[:len(src.keys)]
+		} else {
+			la.keys = make([]uint32, len(src.keys))
+		}
 	}
 	copy(la.keys, src.keys)
 
 	if cap(la.containers) >= len(src.containers) {
 		la.containers = la.containers[:len(src.containers)]
 	} else {
-		la.containers = make([]*bitmap32, len(src.containers))
+		if len(src.containers) <= len(la.inlineVals) {
+			la.containers = la.inlineVals[:len(src.containers)]
+		} else {
+			la.containers = make([]*bitmap32, len(src.containers))
+		}
 	}
 	for i := range src.containers {
 		la.containers[i] = retainBitmap32(src.containers[i])
@@ -1173,6 +1213,7 @@ func (la *largeArray) getKeyAtIndex(i int) uint32 {
 }
 
 func (la *largeArray) insertNewKeyValueAt(i int, key uint32, value *bitmap32) {
+	la.ensureInline()
 	if i == len(la.keys) {
 		la.keys = append(la.keys, key)
 		la.containers = append(la.containers, value)

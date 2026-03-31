@@ -189,11 +189,25 @@ func getPostingMap() map[string]posting.List {
 	return make(map[string]posting.List, 8)
 }
 
+func getPostingMapHint(capHint int) map[string]posting.List {
+	if capHint >= 64 {
+		return make(map[string]posting.List, min(capHint, postingMapPoolMaxLen))
+	}
+	return getPostingMap()
+}
+
 func getFixedPostingMap() map[uint64]posting.List {
 	if v := fixedPostingMapPool.Get(); v != nil {
 		return v.(map[uint64]posting.List)
 	}
 	return make(map[uint64]posting.List, 8)
+}
+
+func getFixedPostingMapHint(capHint int) map[uint64]posting.List {
+	if capHint >= 64 {
+		return make(map[uint64]posting.List, min(capHint, postingMapPoolMaxLen))
+	}
+	return getFixedPostingMap()
 }
 
 func releasePostingMap(m map[string]posting.List) {
@@ -295,6 +309,13 @@ func getFixedBatchPostingDeltaMap() map[uint64]batchPostingDelta {
 	return make(map[uint64]batchPostingDelta, 8)
 }
 
+func getFixedBatchPostingDeltaMapHint(capHint int) map[uint64]batchPostingDelta {
+	if capHint >= 64 {
+		return make(map[uint64]batchPostingDelta, min(capHint, batchPostingDeltaMapPoolMaxLen))
+	}
+	return getFixedBatchPostingDeltaMap()
+}
+
 func releaseBatchPostingDeltaMap(m map[string]batchPostingDelta) {
 	if m == nil {
 		return
@@ -312,6 +333,22 @@ func releaseFixedBatchPostingDeltaMap(m map[uint64]batchPostingDelta) {
 		return
 	}
 	oversized := len(m) > batchPostingDeltaMapPoolMaxLen
+	clear(m)
+	if oversized {
+		return
+	}
+	fixedBatchPostingDeltaMapPool.Put(m)
+}
+
+func releaseFixedBatchPostingDeltaMapOwned(m map[uint64]batchPostingDelta) {
+	if m == nil {
+		return
+	}
+	oversized := len(m) > batchPostingDeltaMapPoolMaxLen
+	for _, delta := range m {
+		delta.add.Release()
+		delta.remove.Release()
+	}
 	clear(m)
 	if oversized {
 		return

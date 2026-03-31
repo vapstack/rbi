@@ -876,7 +876,7 @@ func (db *DB[K, V]) buildIndex(skipFields map[string]struct{}) error {
 				lu.Add(idx)
 
 				for k := range active {
-					active[k].acc.write(ptr, buildFieldWriteSink{state: &localStates[k], idx: idx})
+					active[k].acc.writeBuild(ptr, buildFieldWriteSink{state: &localStates[k], idx: idx})
 					if localStates[k].shouldFlushRegular() {
 						localStates[k].flushRegularInto(fieldStates[k])
 					}

@@ -3359,26 +3359,72 @@ func TestIndexExt_MergeInsertOnlyFieldStorageOwnedUnionsExistingKeysAndKeepsSort
 	baseStorage := newRegularFieldIndexStorage(&baseEntries)
 	expected := indexExtExpectedMapFromEntries(baseFix.entries)
 
-	adds := getPostingMap()
+	adds := getInsertPostingMap()
+	var arena *insertPostingAccumArena
 	for i, rank := range []int{1, 189, 190, 191, 389} {
 		key := baseFix.keys[rank]
 		addIDs := indexExtPostingIDs(indexExtPosting(uint64(400_000+i*16), 3+i))
-		adds[key] = indexExtPostingFromIDs(addIDs)
 		expected[key] = append(append([]uint64(nil), expected[key]...), addIDs...)
+		for j := len(addIDs) - 1; j >= 0; j-- {
+			adds = addInsertPostingAccum(adds, &arena, key, addIDs[j], 0)
+		}
+		adds = addInsertPostingAccum(adds, &arena, key, addIDs[0], 0)
 	}
 	for i := 0; i < 20; i++ {
 		key := fmt.Sprintf("bb/new/%03d", i)
 		addIDs := indexExtPostingIDs(indexExtPosting(uint64(410_000+i*16), 1+i%4))
-		adds[key] = indexExtPostingFromIDs(addIDs)
 		expected[key] = addIDs
+		for j := len(addIDs) - 1; j >= 0; j-- {
+			adds = addInsertPostingAccum(adds, &arena, key, addIDs[j], 0)
+		}
+		adds = addInsertPostingAccum(adds, &arena, key, addIDs[len(addIDs)-1], 0)
 	}
 	for key := range expected {
 		slices.Sort(expected[key])
 	}
 
-	out := mergeInsertOnlyFieldStorageOwned(baseStorage, adds, false, true)
+	out := mergeInsertOnlyFieldStorageOwned(baseStorage, adds, arena, false, true)
+	releaseInsertPostingAccumArena(arena)
 	if !out.isChunked() {
 		t.Fatalf("expected chunked storage after insert-only merge")
+	}
+	indexExtAssertStorageMatchesExpected(t, out, expected)
+}
+
+func TestIndexExt_MergeInsertOnlyFieldStorageOwnedDedupsAccumulatorAdds(t *testing.T) {
+	adds := getInsertPostingMap()
+	var arena *insertPostingAccumArena
+	for _, id := range []uint64{30, 10, 30, 20, 10} {
+		adds = addInsertPostingAccum(adds, &arena, "dup", id, 0)
+	}
+	for _, id := range []uint64{9, 7, 8} {
+		adds = addInsertPostingAccum(adds, &arena, "other", id, 0)
+	}
+
+	out := mergeInsertOnlyFieldStorageOwned(fieldIndexStorage{}, adds, arena, false, false)
+	releaseInsertPostingAccumArena(arena)
+	expected := map[string][]uint64{
+		"dup":   {10, 20, 30},
+		"other": {7, 8, 9},
+	}
+	indexExtAssertStorageMatchesExpected(t, out, expected)
+}
+
+func TestIndexExt_MergeInsertOnlyFixedFieldStorageOwnedDedupsAccumulatorAdds(t *testing.T) {
+	adds := getFixedInsertPostingMap()
+	var arena *insertPostingAccumArena
+	for _, id := range []uint64{4, 2, 4, 9} {
+		adds = addFixedInsertPostingAccum(adds, &arena, 7, id, 0)
+	}
+	for _, id := range []uint64{18, 11, 18, 12} {
+		adds = addFixedInsertPostingAccum(adds, &arena, 3, id, 0)
+	}
+
+	out := mergeInsertOnlyFixedFieldStorageOwned(fieldIndexStorage{}, adds, arena, false)
+	releaseInsertPostingAccumArena(arena)
+	expected := map[string][]uint64{
+		uint64ByteStr(3): {11, 12, 18},
+		uint64ByteStr(7): {2, 4, 9},
 	}
 	indexExtAssertStorageMatchesExpected(t, out, expected)
 }

@@ -2,11 +2,14 @@ package rbi
 
 import (
 	"bytes"
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"math/bits"
 	"slices"
 	"sync/atomic"
 	"time"
+	"unsafe"
 
 	"go.etcd.io/bbolt"
 )
@@ -108,7 +111,8 @@ type autoBatchPrepared[K ~string | ~uint64, V any] struct {
 }
 
 type autoBatchState[K ~string | ~uint64, V any] struct {
-	key []byte
+	key    []byte
+	keyBuf [8]byte
 
 	idx      uint64
 	idxKnown bool
@@ -206,6 +210,16 @@ func (st *autoBatchState[K, V]) clearPayload() {
 	st.borrowedPayload = nil
 }
 
+func (st *autoBatchState[K, V]) setKeyFromID(db *DB[K, V], id K) {
+	if db.strkey {
+		s := *(*string)(unsafe.Pointer(&id))
+		st.key = unsafe.Slice(unsafe.StringData(s), len(s))
+		return
+	}
+	binary.BigEndian.PutUint64(st.keyBuf[:], *(*uint64)(unsafe.Pointer(&id)))
+	st.key = st.keyBuf[:]
+}
+
 func (st *autoBatchAttemptState[K, V]) rollbackCreated(ops []autoBatchPrepared[K, V]) {
 	if !st.db.strkey {
 		return
@@ -224,22 +238,22 @@ func (st *autoBatchAttemptState[K, V]) loadState(req *autoBatchRequest[K, V]) (*
 		return &st.states[pos], nil
 	}
 
-	state := autoBatchState[K, V]{
-		key: st.db.keyFromID(req.id),
-	}
+	pos := len(st.states)
+	st.states = append(st.states, autoBatchState[K, V]{})
+	state := &st.states[pos]
+	state.setKeyFromID(st.db, req.id)
 	if prev := st.bucket.Get(state.key); prev != nil {
 		oldVal, err := st.db.decode(prev)
 		if err != nil {
+			st.states = st.states[:pos]
 			return nil, err
 		}
 		state.value = oldVal
 		state.setBorrowedPayload(prev)
 	}
 
-	pos := len(st.states)
-	st.states = append(st.states, state)
 	st.stateByID[req.id] = pos
-	return &st.states[pos], nil
+	return state, nil
 }
 
 func (st *autoBatchAttemptState[K, V]) ensureIdx(id K, state *autoBatchState[K, V], create bool) {
@@ -438,6 +452,7 @@ func (ab *autoBatcher[K, V]) acquireAttemptState(db *DB[K, V], bucket *bbolt.Buc
 	if hint < 1 {
 		hint = 1
 	}
+	capHint := roundedAutoBatchHint(hint)
 
 	var st *autoBatchAttemptState[K, V]
 	if v := ab.attemptStatePool.Get(); v != nil {
@@ -450,38 +465,35 @@ func (ab *autoBatcher[K, V]) acquireAttemptState(db *DB[K, V], bucket *bbolt.Buc
 	st.bucket = bucket
 	st.statsEnabled = db.autoBatcher.statsEnabled
 
-	if cap(st.prepared) < hint {
-		st.prepared = slices.Grow(st.prepared, hint)
+	if cap(st.prepared) < capHint {
+		st.prepared = slices.Grow(st.prepared, capHint)
 	}
-	if cap(st.accepted) < hint {
-		st.accepted = slices.Grow(st.accepted, hint)
+	if cap(st.accepted) < capHint {
+		st.accepted = slices.Grow(st.accepted, capHint)
 	}
-	if cap(st.ownedPayloads) < hint {
-		st.ownedPayloads = slices.Grow(st.ownedPayloads, hint)
+	if cap(st.ownedPayloads) < capHint {
+		st.ownedPayloads = slices.Grow(st.ownedPayloads, capHint)
 	}
-	if cap(st.states) < hint {
-		st.states = slices.Grow(st.states, hint)
+	if cap(st.states) < capHint {
+		st.states = slices.Grow(st.states, capHint)
 	}
-	if cap(st.uniqueIdxs) < hint {
-		st.uniqueIdxs = slices.Grow(st.uniqueIdxs, hint)
+	if cap(st.uniqueIdxs) < capHint {
+		st.uniqueIdxs = slices.Grow(st.uniqueIdxs, capHint)
 	}
-	if cap(st.uniqueOldVals) < hint {
-		st.uniqueOldVals = slices.Grow(st.uniqueOldVals, hint)
+	if cap(st.uniqueOldVals) < capHint {
+		st.uniqueOldVals = slices.Grow(st.uniqueOldVals, capHint)
 	}
-	if cap(st.uniqueNewVals) < hint {
-		st.uniqueNewVals = slices.Grow(st.uniqueNewVals, hint)
+	if cap(st.uniqueNewVals) < capHint {
+		st.uniqueNewVals = slices.Grow(st.uniqueNewVals, capHint)
 	}
 
-	if hint < 8 {
-		hint = 8
-	}
 	switch {
 	case st.stateByID == nil:
-		st.stateByID = make(map[K]int, hint)
-		st.stateByIDCap = hint
-	case hint > st.stateByIDCap:
-		st.stateByID = make(map[K]int, hint)
-		st.stateByIDCap = hint
+		st.stateByID = make(map[K]int, capHint)
+		st.stateByIDCap = capHint
+	case capHint > st.stateByIDCap:
+		st.stateByID = make(map[K]int, capHint)
+		st.stateByIDCap = capHint
 	}
 	return st
 }
@@ -609,6 +621,13 @@ func assignAutoBatchRequestErr[K ~string | ~uint64, V any](reqs []*autoBatchRequ
 			req.err = err
 		}
 	}
+}
+
+func roundedAutoBatchHint(hint int) int {
+	if hint <= 8 {
+		return 8
+	}
+	return 1 << bits.Len(uint(hint-1))
 }
 
 func collectActiveAutoBatchRequests[K ~string | ~uint64, V any](active, batch []*autoBatchRequest[K, V]) []*autoBatchRequest[K, V] {

@@ -3,6 +3,8 @@ package rbi
 import (
 	"maps"
 	"slices"
+	"sort"
+	"sync"
 	"unsafe"
 
 	"github.com/vapstack/rbi/internal/posting"
@@ -25,11 +27,64 @@ type keyedBatchPostingDelta struct {
 	delta batchPostingDelta
 }
 
+type keyedBatchPostingDeltaOrder []keyedBatchPostingDelta
+
+func (s keyedBatchPostingDeltaOrder) Len() int      { return len(s) }
+func (s keyedBatchPostingDeltaOrder) Swap(i, j int) { s[i], s[j] = s[j], s[i] }
+func (s keyedBatchPostingDeltaOrder) Less(i, j int) bool {
+	return compareIndexKeys(s[i].key, s[j].key) < 0
+}
+
 type batchLenDiff struct {
 	oldExists bool
 	oldLen    int
 	newExists bool
 	newLen    int
+}
+
+type lenFieldPostingDelta struct {
+	lengths     map[uint64]batchPostingDelta
+	nonEmpty    batchPostingDelta
+	hasNonEmpty bool
+}
+
+var lenFieldPostingDeltaPool sync.Pool
+
+func getLenFieldPostingDelta(capHint int) *lenFieldPostingDelta {
+	if v := lenFieldPostingDeltaPool.Get(); v != nil {
+		return v.(*lenFieldPostingDelta)
+	}
+	return &lenFieldPostingDelta{
+		lengths: getFixedBatchPostingDeltaMapHint(capHint),
+	}
+}
+
+func putLenFieldPostingDelta(delta *lenFieldPostingDelta) {
+	if delta == nil {
+		return
+	}
+	if delta.lengths != nil {
+		releaseFixedBatchPostingDeltaMap(delta.lengths)
+		delta.lengths = nil
+	}
+	delta.nonEmpty = batchPostingDelta{}
+	delta.hasNonEmpty = false
+	lenFieldPostingDeltaPool.Put(delta)
+}
+
+func releaseLenFieldPostingDeltaOwned(delta *lenFieldPostingDelta) {
+	if delta == nil {
+		return
+	}
+	if delta.lengths != nil {
+		releaseFixedBatchPostingDeltaMapOwned(delta.lengths)
+		delta.lengths = nil
+	}
+	delta.nonEmpty.add.Release()
+	delta.nonEmpty.remove.Release()
+	delta.nonEmpty = batchPostingDelta{}
+	delta.hasNonEmpty = false
+	lenFieldPostingDeltaPool.Put(delta)
 }
 
 type indexedFieldBatchDeltas struct {
@@ -117,7 +172,12 @@ func addFixedFieldBatchPostingDelta(fieldDelta map[uint64]batchPostingDelta, key
 	return fieldDelta
 }
 
-func collectFieldBatchPostingDiff(fieldDelta map[string]batchPostingDelta, idx uint64, oldVals, newVals []string) (map[string]batchPostingDelta, bool) {
+func collectFieldBatchPostingDiff(
+	fieldDelta map[string]uint32,
+	arena **batchPostingAccumArena,
+	idx uint64,
+	oldVals, newVals []string,
+) (map[string]uint32, bool) {
 	if len(oldVals) == 0 && len(newVals) == 0 {
 		return fieldDelta, false
 	}
@@ -127,11 +187,11 @@ func collectFieldBatchPostingDiff(fieldDelta map[string]batchPostingDelta, idx u
 	for i < len(oldVals) && j < len(newVals) {
 		switch {
 		case oldVals[i] < newVals[j]:
-			fieldDelta = addFieldBatchPostingDelta(fieldDelta, oldVals[i], idx, false)
+			fieldDelta = addFieldBatchPostingAccum(fieldDelta, arena, oldVals[i], idx, false, 0)
 			changed = true
 			i++
 		case oldVals[i] > newVals[j]:
-			fieldDelta = addFieldBatchPostingDelta(fieldDelta, newVals[j], idx, true)
+			fieldDelta = addFieldBatchPostingAccum(fieldDelta, arena, newVals[j], idx, true, 0)
 			changed = true
 			j++
 		default:
@@ -140,17 +200,22 @@ func collectFieldBatchPostingDiff(fieldDelta map[string]batchPostingDelta, idx u
 		}
 	}
 	for ; i < len(oldVals); i++ {
-		fieldDelta = addFieldBatchPostingDelta(fieldDelta, oldVals[i], idx, false)
+		fieldDelta = addFieldBatchPostingAccum(fieldDelta, arena, oldVals[i], idx, false, 0)
 		changed = true
 	}
 	for ; j < len(newVals); j++ {
-		fieldDelta = addFieldBatchPostingDelta(fieldDelta, newVals[j], idx, true)
+		fieldDelta = addFieldBatchPostingAccum(fieldDelta, arena, newVals[j], idx, true, 0)
 		changed = true
 	}
 	return fieldDelta, changed
 }
 
-func collectFixedFieldBatchPostingDiff(fieldDelta map[uint64]batchPostingDelta, idx uint64, oldVals, newVals []uint64) (map[uint64]batchPostingDelta, bool) {
+func collectFixedFieldBatchPostingDiff(
+	fieldDelta map[uint64]uint32,
+	arena **batchPostingAccumArena,
+	idx uint64,
+	oldVals, newVals []uint64,
+) (map[uint64]uint32, bool) {
 	if len(oldVals) == 0 && len(newVals) == 0 {
 		return fieldDelta, false
 	}
@@ -160,11 +225,11 @@ func collectFixedFieldBatchPostingDiff(fieldDelta map[uint64]batchPostingDelta, 
 	for i < len(oldVals) && j < len(newVals) {
 		switch {
 		case oldVals[i] < newVals[j]:
-			fieldDelta = addFixedFieldBatchPostingDelta(fieldDelta, oldVals[i], idx, false)
+			fieldDelta = addFixedFieldBatchPostingAccum(fieldDelta, arena, oldVals[i], idx, false, 0)
 			changed = true
 			i++
 		case oldVals[i] > newVals[j]:
-			fieldDelta = addFixedFieldBatchPostingDelta(fieldDelta, newVals[j], idx, true)
+			fieldDelta = addFixedFieldBatchPostingAccum(fieldDelta, arena, newVals[j], idx, true, 0)
 			changed = true
 			j++
 		default:
@@ -173,37 +238,38 @@ func collectFixedFieldBatchPostingDiff(fieldDelta map[uint64]batchPostingDelta, 
 		}
 	}
 	for ; i < len(oldVals); i++ {
-		fieldDelta = addFixedFieldBatchPostingDelta(fieldDelta, oldVals[i], idx, false)
+		fieldDelta = addFixedFieldBatchPostingAccum(fieldDelta, arena, oldVals[i], idx, false, 0)
 		changed = true
 	}
 	for ; j < len(newVals); j++ {
-		fieldDelta = addFixedFieldBatchPostingDelta(fieldDelta, newVals[j], idx, true)
+		fieldDelta = addFixedFieldBatchPostingAccum(fieldDelta, arena, newVals[j], idx, true, 0)
 		changed = true
 	}
 	return fieldDelta, changed
 }
 
 func collectScalarFieldBatchPostingDiff(
-	fieldDelta map[string]batchPostingDelta,
+	fieldDelta map[string]uint32,
+	arena **batchPostingAccumArena,
 	idx uint64,
 	oldOK bool,
 	oldVal string,
 	newOK bool,
 	newVal string,
-) (map[string]batchPostingDelta, bool) {
+) (map[string]uint32, bool) {
 	switch {
 	case oldOK && newOK:
 		if oldVal == newVal {
 			return fieldDelta, false
 		}
-		fieldDelta = addFieldBatchPostingDelta(fieldDelta, oldVal, idx, false)
-		fieldDelta = addFieldBatchPostingDelta(fieldDelta, newVal, idx, true)
+		fieldDelta = addFieldBatchPostingAccum(fieldDelta, arena, oldVal, idx, false, 0)
+		fieldDelta = addFieldBatchPostingAccum(fieldDelta, arena, newVal, idx, true, 0)
 		return fieldDelta, true
 	case oldOK:
-		fieldDelta = addFieldBatchPostingDelta(fieldDelta, oldVal, idx, false)
+		fieldDelta = addFieldBatchPostingAccum(fieldDelta, arena, oldVal, idx, false, 0)
 		return fieldDelta, true
 	case newOK:
-		fieldDelta = addFieldBatchPostingDelta(fieldDelta, newVal, idx, true)
+		fieldDelta = addFieldBatchPostingAccum(fieldDelta, arena, newVal, idx, true, 0)
 		return fieldDelta, true
 	default:
 		return fieldDelta, false
@@ -211,26 +277,27 @@ func collectScalarFieldBatchPostingDiff(
 }
 
 func collectScalarFixedFieldBatchPostingDiff(
-	fieldDelta map[uint64]batchPostingDelta,
+	fieldDelta map[uint64]uint32,
+	arena **batchPostingAccumArena,
 	idx uint64,
 	oldOK bool,
 	oldVal uint64,
 	newOK bool,
 	newVal uint64,
-) (map[uint64]batchPostingDelta, bool) {
+) (map[uint64]uint32, bool) {
 	switch {
 	case oldOK && newOK:
 		if oldVal == newVal {
 			return fieldDelta, false
 		}
-		fieldDelta = addFixedFieldBatchPostingDelta(fieldDelta, oldVal, idx, false)
-		fieldDelta = addFixedFieldBatchPostingDelta(fieldDelta, newVal, idx, true)
+		fieldDelta = addFixedFieldBatchPostingAccum(fieldDelta, arena, oldVal, idx, false, 0)
+		fieldDelta = addFixedFieldBatchPostingAccum(fieldDelta, arena, newVal, idx, true, 0)
 		return fieldDelta, true
 	case oldOK:
-		fieldDelta = addFixedFieldBatchPostingDelta(fieldDelta, oldVal, idx, false)
+		fieldDelta = addFixedFieldBatchPostingAccum(fieldDelta, arena, oldVal, idx, false, 0)
 		return fieldDelta, true
 	case newOK:
-		fieldDelta = addFixedFieldBatchPostingDelta(fieldDelta, newVal, idx, true)
+		fieldDelta = addFixedFieldBatchPostingAccum(fieldDelta, arena, newVal, idx, true, 0)
 		return fieldDelta, true
 	default:
 		return fieldDelta, false
@@ -238,11 +305,11 @@ func collectScalarFixedFieldBatchPostingDiff(
 }
 
 func collectFieldBatchLenDiff(
-	fieldDelta map[string]batchPostingDelta,
+	fieldDelta *lenFieldPostingDelta,
 	idx uint64,
 	diff batchLenDiff,
 	useZeroComplement bool,
-) (map[string]batchPostingDelta, bool) {
+) (*lenFieldPostingDelta, bool) {
 	logicalChange := diff.oldExists != diff.newExists || diff.oldLen != diff.newLen
 	if !logicalChange {
 		return fieldDelta, false
@@ -250,11 +317,22 @@ func collectFieldBatchLenDiff(
 
 	var changed bool
 	addLenBucketDelta := func(length int, isAdd bool) {
-		fieldDelta = addFieldBatchPostingDelta(fieldDelta, uint64ByteStr(uint64(length)), idx, isAdd)
+		if fieldDelta == nil {
+			fieldDelta = getLenFieldPostingDelta(0)
+		}
+		fieldDelta.lengths = addFixedFieldBatchPostingDelta(fieldDelta.lengths, uint64(length), idx, isAdd)
 		changed = true
 	}
 	addNonEmptyDelta := func(isAdd bool) {
-		fieldDelta = addFieldBatchPostingDelta(fieldDelta, lenIndexNonEmptyKey, idx, isAdd)
+		if fieldDelta == nil {
+			fieldDelta = getLenFieldPostingDelta(0)
+		}
+		fieldDelta.hasNonEmpty = true
+		if isAdd {
+			fieldDelta.nonEmpty.add = fieldDelta.nonEmpty.add.BuildAdded(idx)
+		} else {
+			fieldDelta.nonEmpty.remove = fieldDelta.nonEmpty.remove.BuildAdded(idx)
+		}
 		changed = true
 	}
 
@@ -383,15 +461,20 @@ func applyBatchPostingDeltaOwned(base posting.List, delta *batchPostingDelta) po
 	return out
 }
 
-func sortedBatchPostingDeltasBufOwned(deltas map[string]batchPostingDelta, fixed8 bool) *keyedBatchPostingDeltaSliceBuf {
+func sortedBatchPostingDeltasBufOwned(
+	deltas map[string]uint32,
+	arena *batchPostingAccumArena,
+	fixed8 bool,
+) *keyedBatchPostingDeltaSliceBuf {
 	if len(deltas) == 0 {
-		releaseBatchPostingDeltaMap(deltas)
+		releaseBatchPostingAccumMap(deltas)
 		return nil
 	}
 
 	buf := getKeyedBatchPostingDeltaSliceBuf(len(deltas))
 
-	for raw, delta := range deltas {
+	for raw, ref := range deltas {
+		delta := arena.accum(ref).materializeOwned()
 		if delta.add.IsEmpty() && delta.remove.IsEmpty() {
 			continue
 		}
@@ -400,27 +483,29 @@ func sortedBatchPostingDeltasBufOwned(deltas map[string]batchPostingDelta, fixed
 			delta: delta,
 		})
 	}
-	releaseBatchPostingDeltaMap(deltas)
+	releaseBatchPostingAccumMap(deltas)
 	if len(buf.values) == 0 {
 		releaseKeyedBatchPostingDeltaSliceBuf(buf)
 		return nil
 	}
 
-	slices.SortFunc(buf.values, func(a, b keyedBatchPostingDelta) int {
-		return compareIndexKeys(a.key, b.key)
-	})
+	sort.Sort(keyedBatchPostingDeltaOrder(buf.values))
 	return buf
 }
 
-func sortedFixedBatchPostingDeltasBufOwned(deltas map[uint64]batchPostingDelta) *keyedBatchPostingDeltaSliceBuf {
+func sortedFixedBatchPostingDeltasBufOwned(
+	deltas map[uint64]uint32,
+	arena *batchPostingAccumArena,
+) *keyedBatchPostingDeltaSliceBuf {
 	if len(deltas) == 0 {
-		releaseFixedBatchPostingDeltaMap(deltas)
+		releaseFixedBatchPostingAccumMap(deltas)
 		return nil
 	}
 
 	buf := getKeyedBatchPostingDeltaSliceBuf(len(deltas))
 
-	for raw, delta := range deltas {
+	for raw, ref := range deltas {
+		delta := arena.accum(ref).materializeOwned()
 		if delta.add.IsEmpty() && delta.remove.IsEmpty() {
 			continue
 		}
@@ -429,21 +514,22 @@ func sortedFixedBatchPostingDeltasBufOwned(deltas map[uint64]batchPostingDelta) 
 			delta: delta,
 		})
 	}
-	releaseFixedBatchPostingDeltaMap(deltas)
+	releaseFixedBatchPostingAccumMap(deltas)
 	if len(buf.values) == 0 {
 		releaseKeyedBatchPostingDeltaSliceBuf(buf)
 		return nil
 	}
 
-	slices.SortFunc(buf.values, func(a, b keyedBatchPostingDelta) int {
-		return compareIndexKeys(a.key, b.key)
-	})
+	sort.Sort(keyedBatchPostingDeltaOrder(buf.values))
 	return buf
 }
 
 func applyFieldPostingDiffSorted(base *[]index, deltaKeys []keyedBatchPostingDelta) *[]index {
 	if len(deltaKeys) == 0 {
 		return base
+	}
+	if len(deltaKeys) == 1 {
+		return applySingleFieldPostingDiffSorted(base, deltaKeys[0])
 	}
 
 	var src []index
@@ -490,6 +576,50 @@ func applyFieldPostingDiffSorted(base *[]index, deltaKeys []keyedBatchPostingDel
 	if len(out) == 0 {
 		return nil
 	}
+	return &out
+}
+
+func applySingleFieldPostingDiffSorted(base *[]index, delta keyedBatchPostingDelta) *[]index {
+	var src []index
+	if base != nil {
+		src = *base
+	}
+	if len(src) == 0 {
+		ids := applyBatchPostingDeltaOwned(posting.List{}, &delta.delta)
+		if ids.IsEmpty() {
+			return nil
+		}
+		out := []index{{Key: delta.key, IDs: ids}}
+		return &out
+	}
+
+	pos := lowerBoundIndexEntriesKey(src, delta.key)
+	if pos >= len(src) || compareIndexKeys(src[pos].Key, delta.key) > 0 {
+		ids := applyBatchPostingDeltaOwned(posting.List{}, &delta.delta)
+		if ids.IsEmpty() {
+			return base
+		}
+		out := make([]index, len(src)+1)
+		copy(out, src[:pos])
+		out[pos] = index{Key: delta.key, IDs: ids}
+		copy(out[pos+1:], src[pos:])
+		return &out
+	}
+
+	ids := applyBatchPostingDeltaOwned(src[pos].IDs, &delta.delta)
+	if ids.IsEmpty() {
+		if len(src) == 1 {
+			return nil
+		}
+		out := make([]index, len(src)-1)
+		copy(out, src[:pos])
+		copy(out[pos:], src[pos+1:])
+		return &out
+	}
+
+	out := make([]index, len(src))
+	copy(out, src)
+	out[pos].IDs = ids
 	return &out
 }
 
@@ -661,11 +791,12 @@ func appendFieldPostingDiffChunkRangeSorted(
 
 func applyFieldPostingDiffStorageOwned(
 	base fieldIndexStorage,
-	deltas map[string]batchPostingDelta,
+	deltas map[string]uint32,
+	arena *batchPostingAccumArena,
 	fixed8 bool,
 	allowChunk bool,
 ) fieldIndexStorage {
-	buf := sortedBatchPostingDeltasBufOwned(deltas, fixed8)
+	buf := sortedBatchPostingDeltasBufOwned(deltas, arena, fixed8)
 	if buf == nil {
 		return base
 	}
@@ -690,10 +821,11 @@ func applyFieldPostingDiffStorageOwned(
 
 func applyFixedFieldPostingDiffStorageOwned(
 	base fieldIndexStorage,
-	deltas map[uint64]batchPostingDelta,
+	deltas map[uint64]uint32,
+	arena *batchPostingAccumArena,
 	allowChunk bool,
 ) fieldIndexStorage {
-	buf := sortedFixedBatchPostingDeltasBufOwned(deltas)
+	buf := sortedFixedBatchPostingDeltasBufOwned(deltas, arena)
 	if buf == nil {
 		return base
 	}
@@ -716,13 +848,163 @@ func applyFixedFieldPostingDiffStorageOwned(
 	return newRegularFieldIndexStorage(applyFieldPostingDiffSorted(flat, deltaKeys))
 }
 
-func applyLenFieldPostingDiffStorageOwned(base fieldIndexStorage, deltas map[string]batchPostingDelta) fieldIndexStorage {
-	storage := applyFieldPostingDiffStorageOwned(base, deltas, false, false)
+func sortedLenFieldPostingDeltasBufOwned(deltas *lenFieldPostingDelta) *keyedBatchPostingDeltaSliceBuf {
+	if deltas == nil {
+		return nil
+	}
+	count := len(deltas.lengths)
+	if deltas.hasNonEmpty {
+		count++
+	}
+	if count == 0 {
+		putLenFieldPostingDelta(deltas)
+		return nil
+	}
+
+	buf := getKeyedBatchPostingDeltaSliceBuf(count)
+	for raw, delta := range deltas.lengths {
+		if delta.add.IsEmpty() && delta.remove.IsEmpty() {
+			continue
+		}
+		buf.values = append(buf.values, keyedBatchPostingDelta{
+			key:   indexKeyFromU64(raw),
+			delta: delta,
+		})
+	}
+	if deltas.hasNonEmpty && (!deltas.nonEmpty.add.IsEmpty() || !deltas.nonEmpty.remove.IsEmpty()) {
+		buf.values = append(buf.values, keyedBatchPostingDelta{
+			key:   indexKeyFromString(lenIndexNonEmptyKey),
+			delta: deltas.nonEmpty,
+		})
+	}
+	putLenFieldPostingDelta(deltas)
+	if len(buf.values) == 0 {
+		releaseKeyedBatchPostingDeltaSliceBuf(buf)
+		return nil
+	}
+	sort.Sort(keyedBatchPostingDeltaOrder(buf.values))
+	return buf
+}
+
+func lenFieldPostingDeltaCount(deltas *lenFieldPostingDelta) int {
+	if deltas == nil {
+		return 0
+	}
+	count := 0
+	for _, delta := range deltas.lengths {
+		if delta.add.IsEmpty() && delta.remove.IsEmpty() {
+			continue
+		}
+		count++
+	}
+	if deltas.hasNonEmpty && (!deltas.nonEmpty.add.IsEmpty() || !deltas.nonEmpty.remove.IsEmpty()) {
+		count++
+	}
+	return count
+}
+
+func takeLenFieldPostingDeltasOwned(deltas *lenFieldPostingDelta, dst []keyedBatchPostingDelta) int {
+	if deltas == nil || len(dst) == 0 {
+		return 0
+	}
+	n := 0
+	for raw, delta := range deltas.lengths {
+		if delta.add.IsEmpty() && delta.remove.IsEmpty() {
+			continue
+		}
+		dst[n] = keyedBatchPostingDelta{
+			key:   indexKeyFromU64(raw),
+			delta: delta,
+		}
+		n++
+		if n == len(dst) {
+			break
+		}
+	}
+	if n < len(dst) && deltas.hasNonEmpty && (!deltas.nonEmpty.add.IsEmpty() || !deltas.nonEmpty.remove.IsEmpty()) {
+		dst[n] = keyedBatchPostingDelta{
+			key:   indexKeyFromString(lenIndexNonEmptyKey),
+			delta: deltas.nonEmpty,
+		}
+		n++
+	}
+	putLenFieldPostingDelta(deltas)
+	return n
+}
+
+func applyLenFieldPostingDiffStorageOwned(base fieldIndexStorage, deltas *lenFieldPostingDelta) fieldIndexStorage {
+	count := lenFieldPostingDeltaCount(deltas)
+	if count == 0 {
+		putLenFieldPostingDelta(deltas)
+		return base
+	}
+	if count == 1 {
+		delta, ok := takeSingleLenFieldPostingDeltaOwned(deltas)
+		if !ok {
+			return base
+		}
+		var storage fieldIndexStorage
+		if base.chunked != nil {
+			storage = applySingleFieldPostingDiffChunked(base.chunked, delta)
+		} else {
+			storage = newFlatFieldIndexStorage(applySingleFieldPostingDiffSorted(base.flatSlice(), delta))
+		}
+		if storage.flat != nil || storage.chunked != nil {
+			return storage
+		}
+		empty := make([]index, 0)
+		return newFlatFieldIndexStorage(&empty)
+	}
+	var deltaKeys []keyedBatchPostingDelta
+	var inline [2]keyedBatchPostingDelta
+	var buf *keyedBatchPostingDeltaSliceBuf
+	if count <= len(inline) {
+		n := takeLenFieldPostingDeltasOwned(deltas, inline[:count])
+		deltaKeys = inline[:n]
+		if len(deltaKeys) > 1 && compareIndexKeys(deltaKeys[0].key, deltaKeys[1].key) > 0 {
+			deltaKeys[0], deltaKeys[1] = deltaKeys[1], deltaKeys[0]
+		}
+	} else {
+		buf = sortedLenFieldPostingDeltasBufOwned(deltas)
+		if buf == nil {
+			return base
+		}
+		defer releaseKeyedBatchPostingDeltaSliceBuf(buf)
+		deltaKeys = buf.values
+	}
+
+	storage := newFlatFieldIndexStorage(applyFieldPostingDiffSorted(base.flatSlice(), deltaKeys))
 	if storage.flat != nil || storage.chunked != nil {
 		return storage
 	}
 	empty := make([]index, 0)
 	return newFlatFieldIndexStorage(&empty)
+}
+
+func takeSingleLenFieldPostingDeltaOwned(deltas *lenFieldPostingDelta) (keyedBatchPostingDelta, bool) {
+	if deltas == nil {
+		return keyedBatchPostingDelta{}, false
+	}
+	for raw, delta := range deltas.lengths {
+		if delta.add.IsEmpty() && delta.remove.IsEmpty() {
+			continue
+		}
+		putLenFieldPostingDelta(deltas)
+		return keyedBatchPostingDelta{
+			key:   indexKeyFromU64(raw),
+			delta: delta,
+		}, true
+	}
+	if deltas.hasNonEmpty && (!deltas.nonEmpty.add.IsEmpty() || !deltas.nonEmpty.remove.IsEmpty()) {
+		delta := deltas.nonEmpty
+		putLenFieldPostingDelta(deltas)
+		return keyedBatchPostingDelta{
+			key:   indexKeyFromString(lenIndexNonEmptyKey),
+			delta: delta,
+		}, true
+	}
+	putLenFieldPostingDelta(deltas)
+	return keyedBatchPostingDelta{}, false
 }
 
 func applyFieldPostingDiffChunked(
@@ -734,6 +1016,9 @@ func applyFieldPostingDiffChunked(
 	}
 	if len(deltaKeys) == 0 {
 		return newChunkedFieldIndexStorage(base)
+	}
+	if len(deltaKeys) == 1 {
+		return applySingleFieldPostingDiffChunked(base, deltaKeys[0])
 	}
 
 	builder := newFieldIndexChunkBuilder(base.keyCount + len(deltaKeys))
@@ -781,16 +1066,302 @@ func applyFieldPostingDiffChunked(
 	return newChunkedFieldIndexStorage(root)
 }
 
-func sortedPostingAddsBufOwned(adds map[string]posting.List, fixed8 bool) *keyedBatchPostingDeltaSliceBuf {
+func fieldIndexChunkEntriesBorrowed(chunk *fieldIndexChunk) []index {
+	if chunk == nil || chunk.keyCount() == 0 {
+		return nil
+	}
+	entries := make([]index, 0, chunk.keyCount())
+	for i := 0; i < chunk.keyCount(); i++ {
+		entries = append(entries, index{
+			Key: chunk.keyAt(i),
+			IDs: chunk.postingAt(i),
+		})
+	}
+	return entries
+}
+
+func applyRowDeltaSuffix(rows []uint64, start int, delta int64) {
+	if delta == 0 {
+		return
+	}
+	if delta > 0 {
+		add := uint64(delta)
+		for i := start; i < len(rows); i++ {
+			rows[i] += add
+		}
+		return
+	}
+	sub := uint64(-delta)
+	for i := start; i < len(rows); i++ {
+		rows[i] -= sub
+	}
+}
+
+func applyIntDeltaSuffix(values []int, start, delta int) {
+	if delta == 0 {
+		return
+	}
+	for i := start; i < len(values); i++ {
+		values[i] += delta
+	}
+}
+
+func rebuildChunkedRootWithPageRefsReplaced(
+	base *fieldIndexChunkedRoot,
+	page int,
+	replRefs []fieldIndexChunkRef,
+) *fieldIndexChunkedRoot {
+	if base == nil || page < 0 || page >= len(base.pages) {
+		return nil
+	}
+	est := base.keyCount - base.pages[page].keyCount()
+	for i := range replRefs {
+		if replRefs[i].chunk != nil {
+			est += replRefs[i].chunk.keyCount()
+		}
+	}
+	if est < 0 {
+		est = 0
+	}
+	builder := newFieldIndexChunkBuilder(est)
+	for i := 0; i < page; i++ {
+		builder.appendPage(base.pages[i])
+	}
+	builder.appendRefSlice(replRefs)
+	for i := page + 1; i < len(base.pages); i++ {
+		builder.appendPage(base.pages[i])
+	}
+	return builder.root()
+}
+
+func applySingleFieldPostingDiffChunked(base *fieldIndexChunkedRoot, delta keyedBatchPostingDelta) fieldIndexStorage {
+	if base == nil || base.keyCount == 0 {
+		return applyFieldPostingDiffFlatMaybeChunked(nil, []keyedBatchPostingDelta{delta})
+	}
+
+	touchIdx := base.touchChunkIndexFrom(0, delta.key)
+	if touchIdx < 0 {
+		return newChunkedFieldIndexStorage(base)
+	}
+	page, off := base.pagePosForChunk(touchIdx)
+	if page >= len(base.pages) {
+		return newChunkedFieldIndexStorage(base)
+	}
+
+	ref, ok := base.refAtChunk(touchIdx)
+	if !ok || ref.chunk == nil {
+		return newChunkedFieldIndexStorage(base)
+	}
+	entryIdx := lowerBoundFieldIndexChunkKey(ref.chunk, delta.key)
+	if delta.delta.remove.IsEmpty() &&
+		!delta.delta.add.IsEmpty() &&
+		entryIdx < ref.chunk.keyCount() &&
+		compareIndexKeys(ref.chunk.keyAt(entryIdx), delta.key) == 0 {
+		baseIDs := ref.chunk.postingAt(entryIdx)
+		updatedIDs := applyBatchPostingDeltaOwned(baseIDs, &delta.delta)
+		if updatedIDs.SharesPayload(baseIDs) {
+			return newChunkedFieldIndexStorage(base)
+		}
+		rowsDelta := int64(updatedIDs.Cardinality()) - int64(baseIDs.Cardinality())
+		rows := ref.chunk.rows
+		if rowsDelta > 0 {
+			rows += uint64(rowsDelta)
+		} else if rowsDelta < 0 {
+			rows -= uint64(-rowsDelta)
+		}
+		posts := make([]posting.List, len(ref.chunk.posts))
+		copyBorrowedPostingSlice(posts, ref.chunk.posts)
+		posts[entryIdx] = updatedIDs
+		chunk := &fieldIndexChunk{
+			posts: posts,
+			rows:  rows,
+		}
+		if ref.chunk.numeric != nil {
+			chunk.numeric = ref.chunk.numeric
+		} else {
+			chunk.stringRefs = ref.chunk.stringRefs
+			chunk.stringData = ref.chunk.stringData
+		}
+
+		refs := slices.Clone(base.pages[page].refs)
+		refs[off] = fieldIndexChunkRef{
+			last:  ref.last,
+			chunk: chunk,
+		}
+		pageRowPrefix := base.pages[page].rowPrefix
+		if rowsDelta != 0 {
+			pageRowPrefix = slices.Clone(pageRowPrefix)
+			applyRowDeltaSuffix(pageRowPrefix, off+1, rowsDelta)
+		}
+		pages := slices.Clone(base.pages)
+		pages[page] = fieldIndexChunkDirPage{
+			refs:      refs,
+			prefix:    base.pages[page].prefix,
+			rowPrefix: pageRowPrefix,
+		}
+		rootRowPrefix := base.rowPrefix
+		if rowsDelta != 0 {
+			rootRowPrefix = slices.Clone(rootRowPrefix)
+			applyRowDeltaSuffix(rootRowPrefix, page+1, rowsDelta)
+		}
+		return newChunkedFieldIndexStorage(&fieldIndexChunkedRoot{
+			pages:       pages,
+			chunkPrefix: base.chunkPrefix,
+			prefix:      base.prefix,
+			rowPrefix:   rootRowPrefix,
+			keyCount:    base.keyCount,
+			chunkCount:  base.chunkCount,
+		})
+	}
+	if delta.delta.remove.IsEmpty() && !delta.delta.add.IsEmpty() {
+		replRefs := newFieldIndexChunkRefsWithInsertedEntry(ref, entryIdx, index{
+			Key: delta.key,
+			IDs: delta.delta.add,
+		})
+		if len(replRefs) > 0 {
+			if len(replRefs) == 1 {
+				repl := replRefs[0]
+				keyDelta := repl.chunk.keyCount() - ref.chunk.keyCount()
+				rowsDelta := int64(repl.chunk.rowCount()) - int64(ref.chunk.rowCount())
+
+				refs := slices.Clone(base.pages[page].refs)
+				refs[off] = repl
+
+				pagePrefix := base.pages[page].prefix
+				if keyDelta != 0 {
+					pagePrefix = slices.Clone(pagePrefix)
+					applyIntDeltaSuffix(pagePrefix, off+1, keyDelta)
+				}
+
+				pageRowPrefix := base.pages[page].rowPrefix
+				if rowsDelta != 0 {
+					pageRowPrefix = slices.Clone(pageRowPrefix)
+					applyRowDeltaSuffix(pageRowPrefix, off+1, rowsDelta)
+				}
+
+				pages := slices.Clone(base.pages)
+				pages[page] = fieldIndexChunkDirPage{
+					refs:      refs,
+					prefix:    pagePrefix,
+					rowPrefix: pageRowPrefix,
+				}
+
+				rootPrefix := base.prefix
+				if keyDelta != 0 {
+					rootPrefix = slices.Clone(rootPrefix)
+					applyIntDeltaSuffix(rootPrefix, page+1, keyDelta)
+				}
+
+				rootRowPrefix := base.rowPrefix
+				if rowsDelta != 0 {
+					rootRowPrefix = slices.Clone(rootRowPrefix)
+					applyRowDeltaSuffix(rootRowPrefix, page+1, rowsDelta)
+				}
+
+				return newChunkedFieldIndexStorage(&fieldIndexChunkedRoot{
+					pages:       pages,
+					chunkPrefix: base.chunkPrefix,
+					prefix:      rootPrefix,
+					rowPrefix:   rootRowPrefix,
+					keyCount:    base.keyCount + keyDelta,
+					chunkCount:  base.chunkCount,
+				})
+			}
+
+			oldPage := base.pages[page]
+			newPageRefs := make([]fieldIndexChunkRef, 0, len(oldPage.refs)-1+len(replRefs))
+			newPageRefs = append(newPageRefs, oldPage.refs[:off]...)
+			newPageRefs = append(newPageRefs, replRefs...)
+			newPageRefs = append(newPageRefs, oldPage.refs[off+1:]...)
+
+			pagesCap := len(base.pages)
+			if len(newPageRefs) == 0 {
+				pagesCap--
+			}
+			if len(newPageRefs) > fieldIndexDirPageTargetRefs {
+				root := rebuildChunkedRootWithPageRefsReplaced(base, page, newPageRefs)
+				if root == nil {
+					return fieldIndexStorage{}
+				}
+				if !shouldUseChunkedFieldIndex(root.keyCount) {
+					return newFlatFieldIndexStorage(flattenChunkedFieldIndexRoot(root))
+				}
+				return newChunkedFieldIndexStorage(root)
+			}
+			pages := make([]fieldIndexChunkDirPage, 0, max(pagesCap, 0))
+			pages = append(pages, base.pages[:page]...)
+			if len(newPageRefs) > 0 {
+				pages = append(pages, newFieldIndexChunkDirPage(newPageRefs))
+			}
+			pages = append(pages, base.pages[page+1:]...)
+
+			root := newFieldIndexChunkedRootFromPages(pages)
+			if root == nil {
+				return fieldIndexStorage{}
+			}
+			if !shouldUseChunkedFieldIndex(root.keyCount) {
+				return newFlatFieldIndexStorage(flattenChunkedFieldIndexRoot(root))
+			}
+			return newChunkedFieldIndexStorage(root)
+		}
+	}
+
+	entries := fieldIndexChunkEntriesBorrowed(ref.chunk)
+	updated := applySingleFieldPostingDiffSorted(&entries, delta)
+	var replRefs []fieldIndexChunkRef
+	if updated != nil {
+		replRefs = newFieldIndexChunkRefsFromEntries(*updated)
+	}
+
+	oldPage := base.pages[page]
+	newPageRefs := make([]fieldIndexChunkRef, 0, len(oldPage.refs)-1+len(replRefs))
+	newPageRefs = append(newPageRefs, oldPage.refs[:off]...)
+	newPageRefs = append(newPageRefs, replRefs...)
+	newPageRefs = append(newPageRefs, oldPage.refs[off+1:]...)
+
+	pagesCap := len(base.pages)
+	if len(newPageRefs) == 0 {
+		pagesCap--
+	}
+	if len(newPageRefs) > fieldIndexDirPageTargetRefs {
+		root := rebuildChunkedRootWithPageRefsReplaced(base, page, newPageRefs)
+		if root == nil {
+			return fieldIndexStorage{}
+		}
+		if !shouldUseChunkedFieldIndex(root.keyCount) {
+			return newFlatFieldIndexStorage(flattenChunkedFieldIndexRoot(root))
+		}
+		return newChunkedFieldIndexStorage(root)
+	}
+	pages := make([]fieldIndexChunkDirPage, 0, max(pagesCap, 0))
+	pages = append(pages, base.pages[:page]...)
+	if len(newPageRefs) > 0 {
+		pages = append(pages, newFieldIndexChunkDirPage(newPageRefs))
+	}
+	pages = append(pages, base.pages[page+1:]...)
+
+	root := newFieldIndexChunkedRootFromPages(pages)
+	if root == nil {
+		return fieldIndexStorage{}
+	}
+	if !shouldUseChunkedFieldIndex(root.keyCount) {
+		return newFlatFieldIndexStorage(flattenChunkedFieldIndexRoot(root))
+	}
+	return newChunkedFieldIndexStorage(root)
+}
+
+func sortedInsertPostingAddsBufOwned(
+	adds map[string]uint32,
+	arena *insertPostingAccumArena,
+	fixed8 bool,
+) *keyedBatchPostingDeltaSliceBuf {
 	if len(adds) == 0 {
-		releasePostingMap(adds)
+		releaseInsertPostingMap(adds)
 		return nil
 	}
 	buf := getKeyedBatchPostingDeltaSliceBuf(len(adds))
-	for raw, ids := range adds {
-		if ids.IsEmpty() {
-			continue
-		}
+	for raw, ref := range adds {
+		ids := arena.accum(ref).materializeOwned()
 		buf.values = append(buf.values, keyedBatchPostingDelta{
 			key: indexKeyFromStoredString(raw, fixed8),
 			delta: batchPostingDelta{
@@ -798,27 +1369,22 @@ func sortedPostingAddsBufOwned(adds map[string]posting.List, fixed8 bool) *keyed
 			},
 		})
 	}
-	releasePostingMap(adds)
-	if len(buf.values) == 0 {
-		releaseKeyedBatchPostingDeltaSliceBuf(buf)
-		return nil
-	}
-	slices.SortFunc(buf.values, func(a, b keyedBatchPostingDelta) int {
-		return compareIndexKeys(a.key, b.key)
-	})
+	releaseInsertPostingMap(adds)
+	sort.Sort(keyedBatchPostingDeltaOrder(buf.values))
 	return buf
 }
 
-func sortedFixedPostingAddsBufOwned(adds map[uint64]posting.List) *keyedBatchPostingDeltaSliceBuf {
+func sortedFixedInsertPostingAddsBufOwned(
+	adds map[uint64]uint32,
+	arena *insertPostingAccumArena,
+) *keyedBatchPostingDeltaSliceBuf {
 	if len(adds) == 0 {
-		releaseFixedPostingMap(adds)
+		releaseFixedInsertPostingMap(adds)
 		return nil
 	}
 	buf := getKeyedBatchPostingDeltaSliceBuf(len(adds))
-	for raw, ids := range adds {
-		if ids.IsEmpty() {
-			continue
-		}
+	for raw, ref := range adds {
+		ids := arena.accum(ref).materializeOwned()
 		buf.values = append(buf.values, keyedBatchPostingDelta{
 			key: indexKeyFromU64(raw),
 			delta: batchPostingDelta{
@@ -826,35 +1392,42 @@ func sortedFixedPostingAddsBufOwned(adds map[uint64]posting.List) *keyedBatchPos
 			},
 		})
 	}
-	releaseFixedPostingMap(adds)
-	if len(buf.values) == 0 {
-		releaseKeyedBatchPostingDeltaSliceBuf(buf)
-		return nil
-	}
-	slices.SortFunc(buf.values, func(a, b keyedBatchPostingDelta) int {
-		return compareIndexKeys(a.key, b.key)
-	})
+	releaseFixedInsertPostingMap(adds)
+	sort.Sort(keyedBatchPostingDeltaOrder(buf.values))
 	return buf
 }
 
 func mergeInsertOnlyFieldStorageOwned(
 	base fieldIndexStorage,
-	adds map[string]posting.List,
+	adds map[string]uint32,
+	arena *insertPostingAccumArena,
 	fixed8 bool,
 	allowChunk bool,
 ) fieldIndexStorage {
 	if len(adds) == 0 {
-		releasePostingMap(adds)
+		releaseInsertPostingMap(adds)
 		return base
 	}
 	if base.flat == nil && base.chunked == nil {
 		if allowChunk {
-			return newRegularFieldIndexStorageFromPostingMapOwned(adds, fixed8)
+			return newRegularFieldIndexStorageFromInsertPostingAccumsOwned(adds, arena, fixed8)
 		}
-		return newFlatFieldIndexStorageFromPostingMapOwned(adds, fixed8)
+		return newFlatFieldIndexStorageFromInsertPostingAccumsOwned(adds, arena, fixed8)
 	}
 	if allowChunk && base.chunked != nil {
-		buf := sortedPostingAddsBufOwned(adds, fixed8)
+		if len(adds) == 1 {
+			for raw, ref := range adds {
+				add := keyedBatchPostingDelta{
+					key: indexKeyFromStoredString(raw, fixed8),
+					delta: batchPostingDelta{
+						add: arena.accum(ref).materializeOwned(),
+					},
+				}
+				releaseInsertPostingMap(adds)
+				return applySingleFieldPostingDiffChunked(base.chunked, add)
+			}
+		}
+		buf := sortedInsertPostingAddsBufOwned(adds, arena, fixed8)
 		if buf == nil {
 			return base
 		}
@@ -862,14 +1435,14 @@ func mergeInsertOnlyFieldStorageOwned(
 		return applyFieldPostingDiffChunked(base.chunked, buf.values)
 	}
 	if allowChunk && base.flat != nil && shouldUseChunkedFieldIndex(len(*base.flat)+len(adds)) {
-		buf := sortedPostingAddsBufOwned(adds, fixed8)
+		buf := sortedInsertPostingAddsBufOwned(adds, arena, fixed8)
 		if buf == nil {
 			return base
 		}
 		defer releaseKeyedBatchPostingDeltaSliceBuf(buf)
 		return applyFieldPostingDiffChunked(buildChunkedFieldIndexRoot(*base.flat), buf.values)
 	}
-	slice := mergeInsertOnlyFieldSliceOwned(base.flatSlice(), adds, fixed8)
+	slice := mergeInsertOnlyFieldSliceOwned(base.flatSlice(), adds, arena, fixed8)
 	if !allowChunk {
 		return newFlatFieldIndexStorage(slice)
 	}
@@ -878,21 +1451,34 @@ func mergeInsertOnlyFieldStorageOwned(
 
 func mergeInsertOnlyFixedFieldStorageOwned(
 	base fieldIndexStorage,
-	adds map[uint64]posting.List,
+	adds map[uint64]uint32,
+	arena *insertPostingAccumArena,
 	allowChunk bool,
 ) fieldIndexStorage {
 	if len(adds) == 0 {
-		releaseFixedPostingMap(adds)
+		releaseFixedInsertPostingMap(adds)
 		return base
 	}
 	if base.flat == nil && base.chunked == nil {
 		if allowChunk {
-			return newRegularFieldIndexStorageFromFixedPostingMapOwned(adds)
+			return newRegularFieldIndexStorageFromFixedInsertPostingAccumsOwned(adds, arena)
 		}
-		return newFlatFieldIndexStorageFromFixedPostingMapOwned(adds)
+		return newFlatFieldIndexStorageFromFixedInsertPostingAccumsOwned(adds, arena)
 	}
 	if allowChunk && base.chunked != nil {
-		buf := sortedFixedPostingAddsBufOwned(adds)
+		if len(adds) == 1 {
+			for raw, ref := range adds {
+				add := keyedBatchPostingDelta{
+					key: indexKeyFromU64(raw),
+					delta: batchPostingDelta{
+						add: arena.accum(ref).materializeOwned(),
+					},
+				}
+				releaseFixedInsertPostingMap(adds)
+				return applySingleFieldPostingDiffChunked(base.chunked, add)
+			}
+		}
+		buf := sortedFixedInsertPostingAddsBufOwned(adds, arena)
 		if buf == nil {
 			return base
 		}
@@ -900,14 +1486,14 @@ func mergeInsertOnlyFixedFieldStorageOwned(
 		return applyFieldPostingDiffChunked(base.chunked, buf.values)
 	}
 	if allowChunk && base.flat != nil && shouldUseChunkedFieldIndex(len(*base.flat)+len(adds)) {
-		buf := sortedFixedPostingAddsBufOwned(adds)
+		buf := sortedFixedInsertPostingAddsBufOwned(adds, arena)
 		if buf == nil {
 			return base
 		}
 		defer releaseKeyedBatchPostingDeltaSliceBuf(buf)
 		return applyFieldPostingDiffChunked(buildChunkedFieldIndexRoot(*base.flat), buf.values)
 	}
-	slice := mergeInsertOnlyFixedFieldSliceOwned(base.flatSlice(), adds)
+	slice := mergeInsertOnlyFixedFieldSliceOwned(base.flatSlice(), adds, arena)
 	if !allowChunk {
 		return newFlatFieldIndexStorage(slice)
 	}
@@ -981,14 +1567,38 @@ func (db *DB[K, V]) buildPreparedSnapshotAggregatedNoLock(
 	next := &indexSnapshot{
 		seq: seq,
 
-		index:             maps.Clone(prev.index),
-		nilIndex:          maps.Clone(prev.nilIndex),
-		lenIndex:          maps.Clone(prev.lenIndex),
-		lenZeroComplement: maps.Clone(prev.lenZeroComplement),
+		index:             prev.index,
+		nilIndex:          prev.nilIndex,
+		lenIndex:          prev.lenIndex,
+		lenZeroComplement: prev.lenZeroComplement,
 		universe:          prev.universe,
 		strmap:            db.strmap.snapshot(),
 	}
 	db.initSnapshotRuntimeCaches(next)
+	indexCloned := false
+	nilIndexCloned := false
+	lenIndexCloned := false
+	ensureIndex := func() map[string]fieldIndexStorage {
+		if !indexCloned {
+			next.index = maps.Clone(prev.index)
+			indexCloned = true
+		}
+		return next.index
+	}
+	ensureNilIndex := func() map[string]fieldIndexStorage {
+		if !nilIndexCloned {
+			next.nilIndex = maps.Clone(prev.nilIndex)
+			nilIndexCloned = true
+		}
+		return next.nilIndex
+	}
+	ensureLenIndex := func() map[string]fieldIndexStorage {
+		if !lenIndexCloned {
+			next.lenIndex = maps.Clone(prev.lenIndex)
+			lenIndexCloned = true
+		}
+		return next.lenIndex
+	}
 
 	normalized := normalizePreparedBatchForSnapshot(prepared)
 	deltas := indexedFieldBatchDeltas{
@@ -1020,36 +1630,46 @@ func (db *DB[K, V]) buildPreparedSnapshotAggregatedNoLock(
 	for i, acc := range db.indexedFieldAccess {
 		f := acc.name
 		state := &deltas.fields[i]
-		if storage := acc.applySnapshotBatchStorageOwned(next.index[f], state, true); storage.keyCount() == 0 {
-			delete(next.index, f)
-		} else {
-			next.index[f] = storage
+		baseIndex := next.index[f]
+		if storage := acc.applySnapshotBatchStorageOwned(baseIndex, state, true); storage.keyCount() == 0 {
+			if baseIndex.keyCount() > 0 {
+				delete(ensureIndex(), f)
+			}
+		} else if storage != baseIndex {
+			ensureIndex()[f] = storage
 		}
-		if storage := acc.applySnapshotBatchNilStorageOwned(next.nilIndex[f], state); storage.keyCount() == 0 {
-			delete(next.nilIndex, f)
-		} else {
-			next.nilIndex[f] = storage
+		baseNil := next.nilIndex[f]
+		if storage := acc.applySnapshotBatchNilStorageOwned(baseNil, state); storage.keyCount() == 0 {
+			if baseNil.keyCount() > 0 {
+				delete(ensureNilIndex(), f)
+			}
+		} else if storage != baseNil {
+			ensureNilIndex()[f] = storage
 		}
 		if state.lengths != nil {
-			next.lenIndex[f] = applyLenFieldPostingDiffStorageOwned(next.lenIndex[f], state.lengths)
+			baseLen := next.lenIndex[f]
+			if storage := applyLenFieldPostingDiffStorageOwned(baseLen, state.lengths); storage != baseLen {
+				ensureLenIndex()[f] = storage
+			}
 			state.lengths = nil
 		}
 		if state.changed {
 			changedCount++
 		}
+		state.releaseOwned()
 	}
 
 	inheritNumericRangeBucketCache(next, prev)
 	if changedCount > 0 {
-		changedIndexFields := make(map[string]struct{}, changedCount)
+		changed := make([]bool, len(db.indexedFieldAccess))
 		for i := range deltas.fields {
 			if deltas.fields[i].changed {
-				changedIndexFields[db.indexedFieldAccess[i].name] = struct{}{}
+				changed[i] = true
 			}
 		}
-		inheritMaterializedPredCache(next, prev, changedIndexFields)
+		inheritMaterializedPredCache(db, next, prev, changed)
 	} else {
-		inheritMaterializedPredCache(next, prev, nil)
+		inheritMaterializedPredCache(db, next, prev, nil)
 	}
 
 	return next

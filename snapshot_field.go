@@ -16,11 +16,17 @@ type snapshotFieldOverlayState struct {
 }
 
 type snapshotFieldInsertState struct {
-	index   map[string]posting.List
-	fixed   map[uint64]posting.List
-	nils    map[string]posting.List
-	lengths map[string]batchPostingDelta
+	index   map[string]uint32
+	fixed   map[uint64]uint32
+	nils    map[string]uint32
+	arena   *insertPostingAccumArena
+	lengths *lenFieldPostingDelta
 	changed bool
+
+	indexHint   int
+	fixedHint   int
+	nilsHint    int
+	lengthsHint int
 }
 
 type fieldWriteScratch struct {
@@ -32,10 +38,11 @@ type fieldWriteScratch struct {
 }
 
 type snapshotFieldBatchState struct {
-	index   map[string]batchPostingDelta
-	fixed   map[uint64]batchPostingDelta
-	nils    map[string]batchPostingDelta
-	lengths map[string]batchPostingDelta
+	index   map[string]uint32
+	fixed   map[uint64]uint32
+	nils    map[string]uint32
+	arena   *batchPostingAccumArena
+	lengths *lenFieldPostingDelta
 	changed bool
 	old     fieldWriteScratch
 	new     fieldWriteScratch
@@ -152,7 +159,7 @@ func (s snapshotInsertWriteSink) setNil() {
 	if s.state == nil {
 		return
 	}
-	s.state.nils = addFieldPostingList(s.state.nils, nilIndexEntryKey, s.idx)
+	s.state.nils = addInsertPostingAccum(s.state.nils, &s.state.arena, nilIndexEntryKey, s.idx, s.state.nilsHint)
 	s.state.changed = true
 }
 
@@ -174,7 +181,7 @@ func (s snapshotInsertWriteSink) addString(key string) {
 	if s.state == nil {
 		return
 	}
-	s.state.index = addFieldPostingList(s.state.index, key, s.idx)
+	s.state.index = addInsertPostingAccum(s.state.index, &s.state.arena, key, s.idx, s.state.indexHint)
 	s.state.changed = true
 }
 
@@ -182,15 +189,15 @@ func (s snapshotInsertWriteSink) addFixed(key uint64) {
 	if s.state == nil {
 		return
 	}
-	s.state.fixed = addFixedFieldPostingList(s.state.fixed, key, s.idx)
+	s.state.fixed = addFixedInsertPostingAccum(s.state.fixed, &s.state.arena, key, s.idx, s.state.fixedHint)
 	s.state.changed = true
 }
 
 func (acc indexedFieldAccessor) collectSnapshotOverlayValue(ptr unsafe.Pointer, idx uint64, state *snapshotFieldOverlayState) {
-	if state == nil || acc.write == nil {
+	if state == nil || acc.writeOverlay == nil {
 		return
 	}
-	acc.write(ptr, snapshotOverlayWriteSink{state: state, idx: idx})
+	acc.writeOverlay(ptr, snapshotOverlayWriteSink{state: state, idx: idx})
 }
 
 func (acc indexedFieldAccessor) collectSnapshotInsertValue(
@@ -199,14 +206,48 @@ func (acc indexedFieldAccessor) collectSnapshotInsertValue(
 	useZeroComplement bool,
 	state *snapshotFieldInsertState,
 ) {
-	if state == nil || acc.write == nil {
+	if state == nil || acc.writeInsert == nil {
 		return
 	}
-	acc.write(ptr, snapshotInsertWriteSink{
+	acc.writeInsert(ptr, snapshotInsertWriteSink{
 		state:             state,
 		idx:               idx,
 		useZeroComplement: useZeroComplement,
 	})
+}
+
+func initSnapshotFieldInsertStateHints(states []snapshotFieldInsertState, access []indexedFieldAccessor, prev *indexSnapshot, batchHint int) {
+	if prev == nil || batchHint <= 0 {
+		return
+	}
+	for i := range access {
+		acc := access[i]
+		state := &states[i]
+		indexHint := snapshotFieldStorageHint(prev.index[acc.name], batchHint)
+		if acc.field != nil && acc.field.KeyKind == fieldWriteKeysOrderedU64 {
+			state.fixedHint = indexHint
+		} else {
+			state.indexHint = indexHint
+		}
+		state.nilsHint = snapshotFieldStorageHint(prev.nilIndex[acc.name], batchHint)
+		if acc.field != nil && acc.field.Slice {
+			state.lengthsHint = snapshotFieldStorageHint(prev.lenIndex[acc.name], batchHint)
+		}
+	}
+}
+
+func snapshotFieldStorageHint(base fieldIndexStorage, batchHint int) int {
+	if batchHint <= 0 {
+		return 0
+	}
+	hint := base.keyCount()
+	if hint < 8 {
+		hint = 8
+	}
+	if hint > batchHint {
+		hint = batchHint
+	}
+	return hint
 }
 
 func (acc indexedFieldAccessor) materializeSnapshotOverlayStorageOwned(state *snapshotFieldOverlayState) fieldIndexStorage {
@@ -243,11 +284,11 @@ func (acc indexedFieldAccessor) mergeSnapshotInsertStorageOwned(
 	if acc.field != nil && acc.field.KeyKind == fieldWriteKeysOrderedU64 {
 		fixed := state.fixed
 		state.fixed = nil
-		return mergeInsertOnlyFixedFieldStorageOwned(base, fixed, allowChunk)
+		return mergeInsertOnlyFixedFieldStorageOwned(base, fixed, state.arena, allowChunk)
 	}
 	i := state.index
 	state.index = nil
-	return mergeInsertOnlyFieldStorageOwned(base, i, false, allowChunk)
+	return mergeInsertOnlyFieldStorageOwned(base, i, state.arena, false, allowChunk)
 }
 
 func (acc indexedFieldAccessor) mergeSnapshotInsertNilStorageOwned(base fieldIndexStorage, state *snapshotFieldInsertState) fieldIndexStorage {
@@ -256,7 +297,22 @@ func (acc indexedFieldAccessor) mergeSnapshotInsertNilStorageOwned(base fieldInd
 	}
 	nils := state.nils
 	state.nils = nil
-	return mergeInsertOnlyFieldStorageOwned(base, nils, false, false)
+	return mergeInsertOnlyFieldStorageOwned(base, nils, state.arena, false, false)
+}
+
+func (state *snapshotFieldInsertState) releaseOwned() {
+	releaseInsertPostingMap(state.index)
+	releaseFixedInsertPostingMap(state.fixed)
+	releaseInsertPostingMap(state.nils)
+	state.index = nil
+	state.fixed = nil
+	state.nils = nil
+	releaseInsertPostingAccumArena(state.arena)
+	state.arena = nil
+	if state.lengths != nil {
+		releaseLenFieldPostingDeltaOwned(state.lengths)
+		state.lengths = nil
+	}
 }
 
 func (acc indexedFieldAccessor) collectSnapshotBatchDiff(
@@ -265,27 +321,27 @@ func (acc indexedFieldAccessor) collectSnapshotBatchDiff(
 	useZeroComplement bool,
 	state *snapshotFieldBatchState,
 ) {
-	if state == nil || acc.write == nil {
+	if state == nil || acc.writeScratch == nil {
 		return
 	}
 
 	state.old.reset()
 	state.new.reset()
 	if oldPtr != nil {
-		acc.write(oldPtr, &state.old)
+		acc.writeScratch(oldPtr, &state.old)
 	}
 	if newPtr != nil {
-		acc.write(newPtr, &state.new)
+		acc.writeScratch(newPtr, &state.new)
 	}
 	state.old.sortForField(acc.field)
 	state.new.sortForField(acc.field)
 
 	if state.old.isNil != state.new.isNil {
 		if state.old.isNil {
-			state.nils = addFieldBatchPostingDelta(state.nils, nilIndexEntryKey, idx, false)
+			state.nils = addFieldBatchPostingAccum(state.nils, &state.arena, nilIndexEntryKey, idx, false, 0)
 		}
 		if state.new.isNil {
-			state.nils = addFieldBatchPostingDelta(state.nils, nilIndexEntryKey, idx, true)
+			state.nils = addFieldBatchPostingAccum(state.nils, &state.arena, nilIndexEntryKey, idx, true, 0)
 		}
 		state.changed = true
 	}
@@ -303,7 +359,7 @@ func (acc indexedFieldAccessor) collectSnapshotBatchDiff(
 			if newOK {
 				newMulti = state.new.fixed
 			}
-			state.fixed, changed = collectFixedFieldBatchPostingDiff(state.fixed, idx, oldMulti, newMulti)
+			state.fixed, changed = collectFixedFieldBatchPostingDiff(state.fixed, &state.arena, idx, oldMulti, newMulti)
 		} else {
 			var oldSingle, newSingle uint64
 			if oldOK && len(state.old.fixed) > 0 {
@@ -314,6 +370,7 @@ func (acc indexedFieldAccessor) collectSnapshotBatchDiff(
 			}
 			state.fixed, changed = collectScalarFixedFieldBatchPostingDiff(
 				state.fixed,
+				&state.arena,
 				idx,
 				oldOK,
 				oldSingle,
@@ -329,7 +386,7 @@ func (acc indexedFieldAccessor) collectSnapshotBatchDiff(
 		if newOK {
 			newMulti = state.new.strings
 		}
-		state.index, changed = collectFieldBatchPostingDiff(state.index, idx, oldMulti, newMulti)
+		state.index, changed = collectFieldBatchPostingDiff(state.index, &state.arena, idx, oldMulti, newMulti)
 	} else {
 		var oldSingle, newSingle string
 		if oldOK && len(state.old.strings) > 0 {
@@ -340,6 +397,7 @@ func (acc indexedFieldAccessor) collectSnapshotBatchDiff(
 		}
 		state.index, changed = collectScalarFieldBatchPostingDiff(
 			state.index,
+			&state.arena,
 			idx,
 			oldOK,
 			oldSingle,
@@ -377,11 +435,11 @@ func (acc indexedFieldAccessor) applySnapshotBatchStorageOwned(
 	if acc.field != nil && acc.field.KeyKind == fieldWriteKeysOrderedU64 {
 		deltas := state.fixed
 		state.fixed = nil
-		return applyFixedFieldPostingDiffStorageOwned(base, deltas, allowChunk)
+		return applyFixedFieldPostingDiffStorageOwned(base, deltas, state.arena, allowChunk)
 	}
 	deltas := state.index
 	state.index = nil
-	return applyFieldPostingDiffStorageOwned(base, deltas, false, allowChunk)
+	return applyFieldPostingDiffStorageOwned(base, deltas, state.arena, false, allowChunk)
 }
 
 func (acc indexedFieldAccessor) applySnapshotBatchNilStorageOwned(base fieldIndexStorage, state *snapshotFieldBatchState) fieldIndexStorage {
@@ -390,5 +448,20 @@ func (acc indexedFieldAccessor) applySnapshotBatchNilStorageOwned(base fieldInde
 	}
 	deltas := state.nils
 	state.nils = nil
-	return applyFieldPostingDiffStorageOwned(base, deltas, false, false)
+	return applyFieldPostingDiffStorageOwned(base, deltas, state.arena, false, false)
+}
+
+func (state *snapshotFieldBatchState) releaseOwned() {
+	releaseBatchPostingAccumMap(state.index)
+	releaseFixedBatchPostingAccumMap(state.fixed)
+	releaseBatchPostingAccumMap(state.nils)
+	state.index = nil
+	state.fixed = nil
+	state.nils = nil
+	releaseBatchPostingAccumArena(state.arena)
+	state.arena = nil
+	if state.lengths != nil {
+		releaseLenFieldPostingDeltaOwned(state.lengths)
+		state.lengths = nil
+	}
 }

@@ -78,6 +78,16 @@ func equalArrayRun(ac *containerArray, rc *containerRun) bool {
 type containerIndex struct {
 	keys       []uint16
 	containers []container16 `msg:"-"`
+	inlineKeys [4]uint16
+	inlineVals [4]container16
+}
+
+func (ra *containerIndex) ensureInline() {
+	if ra == nil || ra.keys != nil || ra.containers != nil {
+		return
+	}
+	ra.keys = ra.inlineKeys[:0]
+	ra.containers = ra.inlineVals[:0]
 }
 
 func (ra *containerIndex) aliases(other *containerIndex) bool {
@@ -125,6 +135,7 @@ func (ra *containerIndex) runOptimize() {
 }
 
 func (ra *containerIndex) appendContainer(key uint16, value container16) {
+	ra.ensureInline()
 	ra.keys = append(ra.keys, key)
 	ra.containers = append(ra.containers, value)
 }
@@ -143,12 +154,18 @@ func (ra *containerIndex) grow(newsize int) {
 	if newsize <= len(ra.keys) {
 		return
 	}
+	ra.ensureInline()
 	oldSize := len(ra.keys)
 	if cap(ra.keys) >= newsize {
 		ra.keys = ra.keys[:newsize]
 		clear(ra.keys[oldSize:])
 	} else {
-		keys := make([]uint16, newsize)
+		var keys []uint16
+		if newsize <= len(ra.inlineKeys) {
+			keys = ra.inlineKeys[:newsize]
+		} else {
+			keys = make([]uint16, newsize)
+		}
 		copy(keys, ra.keys)
 		ra.keys = keys
 	}
@@ -156,7 +173,12 @@ func (ra *containerIndex) grow(newsize int) {
 		ra.containers = ra.containers[:newsize]
 		clear(ra.containers[oldSize:])
 	} else {
-		containers := make([]container16, newsize)
+		var containers []container16
+		if newsize <= len(ra.inlineVals) {
+			containers = ra.inlineVals[:newsize]
+		} else {
+			containers = make([]container16, newsize)
+		}
 		copy(containers, ra.containers)
 		ra.containers = containers
 	}
@@ -234,17 +256,26 @@ func (ra *containerIndex) copyFrom(src *containerIndex) {
 		return
 	}
 
+	ra.ensureInline()
 	if cap(ra.keys) >= len(src.keys) {
 		ra.keys = ra.keys[:len(src.keys)]
 	} else {
-		ra.keys = make([]uint16, len(src.keys))
+		if len(src.keys) <= len(ra.inlineKeys) {
+			ra.keys = ra.inlineKeys[:len(src.keys)]
+		} else {
+			ra.keys = make([]uint16, len(src.keys))
+		}
 	}
 	copy(ra.keys, src.keys)
 
 	if cap(ra.containers) >= len(src.containers) {
 		ra.containers = ra.containers[:len(src.containers)]
 	} else {
-		ra.containers = make([]container16, len(src.containers))
+		if len(src.containers) <= len(ra.inlineVals) {
+			ra.containers = ra.inlineVals[:len(src.containers)]
+		} else {
+			ra.containers = make([]container16, len(src.containers))
+		}
 	}
 	for i := range src.containers {
 		ra.containers[i] = src.containers[i].clone()
@@ -272,17 +303,26 @@ func (ra *containerIndex) copySharedFrom(src *containerIndex) {
 		return
 	}
 
+	ra.ensureInline()
 	if cap(ra.keys) >= len(src.keys) {
 		ra.keys = ra.keys[:len(src.keys)]
 	} else {
-		ra.keys = make([]uint16, len(src.keys))
+		if len(src.keys) <= len(ra.inlineKeys) {
+			ra.keys = ra.inlineKeys[:len(src.keys)]
+		} else {
+			ra.keys = make([]uint16, len(src.keys))
+		}
 	}
 	copy(ra.keys, src.keys)
 
 	if cap(ra.containers) >= len(src.containers) {
 		ra.containers = ra.containers[:len(src.containers)]
 	} else {
-		ra.containers = make([]container16, len(src.containers))
+		if len(src.containers) <= len(ra.inlineVals) {
+			ra.containers = ra.inlineVals[:len(src.containers)]
+		} else {
+			ra.containers = make([]container16, len(src.containers))
+		}
 	}
 	for i := range src.containers {
 		ra.containers[i] = retainContainer(src.containers[i])
@@ -336,6 +376,7 @@ func (ra *containerIndex) getKeyAtIndex(i int) uint16 {
 }
 
 func (ra *containerIndex) insertNewKeyValueAt(i int, key uint16, value container16) {
+	ra.ensureInline()
 	if i == len(ra.keys) {
 		ra.keys = append(ra.keys, key)
 		ra.containers = append(ra.containers, value)

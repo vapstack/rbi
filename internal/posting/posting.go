@@ -145,6 +145,33 @@ func compactListFromSorted(ids []uint64) List {
 	return midValue(mp)
 }
 
+func BuildFromSorted(ids []uint64) List {
+	switch len(ids) {
+	case 0:
+		return List{}
+	case 1:
+		return singleton(ids[0])
+	case 2, 3, 4, 5, 6, 7, 8:
+		sp := acquireSmallPosting()
+		sp.n = uint8(len(ids))
+		copy(sp.ids[:len(ids)], ids)
+		return smallValue(sp)
+	case 9, 10, 11, 12, 13, 14, 15, 16,
+		17, 18, 19, 20, 21, 22, 23, 24,
+		25, 26, 27, 28, 29, 30, 31, 32:
+		mp := acquireMidPosting()
+		mp.n = uint8(len(ids))
+		copy(mp.ids[:len(ids)], ids)
+		return midValue(mp)
+	default:
+		lp := getLargePosting()
+		lp.addMany(ids)
+		out := largeValue(lp)
+		out.Optimize()
+		return out
+	}
+}
+
 func (p List) isSmall() bool {
 	return p.ptr != nil && p.ptr != singleSentinelPtr && p.kind() == postingKindSmall
 }

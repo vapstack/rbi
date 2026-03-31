@@ -3,6 +3,7 @@ package rbi
 import (
 	"maps"
 	"slices"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -50,6 +51,14 @@ const (
 type snapshotRef struct {
 	snap *indexSnapshot
 	refs atomic.Int64
+}
+
+type indexKeyOrder []index
+
+func (s indexKeyOrder) Len() int      { return len(s) }
+func (s indexKeyOrder) Swap(i, j int) { s[i], s[j] = s[j], s[i] }
+func (s indexKeyOrder) Less(i, j int) bool {
+	return compareIndexKeys(s[i].Key, s[j].Key) < 0
 }
 
 var snapshotRefPool = sync.Pool{
@@ -247,7 +256,7 @@ func materializedPredCacheFieldName(key string) string {
 	return key
 }
 
-func inheritMaterializedPredCache(next, prev *indexSnapshot, changedFields map[string]struct{}) {
+func inheritMaterializedPredCache[K ~string | ~uint64, V any](db *DB[K, V], next, prev *indexSnapshot, changedFields []bool) {
 	if next == nil || prev == nil {
 		return
 	}
@@ -271,7 +280,8 @@ func inheritMaterializedPredCache(next, prev *indexSnapshot, changedFields map[s
 			return true
 		}
 		if changedFields != nil {
-			if _, touched := changedFields[f]; touched {
+			acc, ok := db.indexedFieldByName[f]
+			if !ok || changedFields[acc.ordinal] {
 				return true
 			}
 		}
@@ -907,8 +917,12 @@ func rebuildLenIndexField(universe posting.List, fieldOV fieldOverlay) (*[]index
 }
 
 func addFieldPostingList(fieldMap map[string]posting.List, key string, idx uint64) map[string]posting.List {
+	return addFieldPostingListHint(fieldMap, key, idx, 0)
+}
+
+func addFieldPostingListHint(fieldMap map[string]posting.List, key string, idx uint64, capHint int) map[string]posting.List {
 	if fieldMap == nil {
-		fieldMap = getPostingMap()
+		fieldMap = getPostingMapHint(capHint)
 	}
 	p := fieldMap[key]
 	p.Add(idx)
@@ -917,8 +931,12 @@ func addFieldPostingList(fieldMap map[string]posting.List, key string, idx uint6
 }
 
 func addFixedFieldPostingList(fieldMap map[uint64]posting.List, key uint64, idx uint64) map[uint64]posting.List {
+	return addFixedFieldPostingListHint(fieldMap, key, idx, 0)
+}
+
+func addFixedFieldPostingListHint(fieldMap map[uint64]posting.List, key uint64, idx uint64, capHint int) map[uint64]posting.List {
 	if fieldMap == nil {
-		fieldMap = getFixedPostingMap()
+		fieldMap = getFixedPostingMapHint(capHint)
 	}
 	p := fieldMap[key]
 	p.Add(idx)
@@ -1010,73 +1028,115 @@ func (db *DB[K, V]) buildPreparedSnapshotFromEmptyBaseNoLock(seq uint64, prev *i
 		}
 	}
 	if changedCount > 0 {
-		changed := make(map[string]struct{}, changedCount)
+		changed := make([]bool, len(db.indexedFieldAccess))
 		for i := range fieldStates {
 			if fieldStates[i].changed {
-				changed[db.indexedFieldAccess[i].name] = struct{}{}
+				changed[i] = true
 			}
 		}
-		inheritMaterializedPredCache(snap, prev, changed)
+		inheritMaterializedPredCache(db, snap, prev, changed)
 	} else {
-		inheritMaterializedPredCache(snap, prev, nil)
+		inheritMaterializedPredCache(db, snap, prev, nil)
 	}
 	return snap, true
 }
 
-func mergeInsertOnlyFieldSliceOwned(base *[]index, adds map[string]posting.List, fixed8 bool) *[]index {
+func mergeInsertOnlyFieldSliceOwned(
+	base *[]index,
+	adds map[string]uint32,
+	arena *insertPostingAccumArena,
+	fixed8 bool,
+) *[]index {
 	if len(adds) == 0 {
-		releasePostingMap(adds)
+		releaseInsertPostingMap(adds)
 		return base
+	}
+	if len(adds) == 1 {
+		var add index
+		for key, ref := range adds {
+			add = index{
+				Key: indexKeyFromStoredString(key, fixed8),
+				IDs: arena.accum(ref).materializeOwned(),
+			}
+		}
+		releaseInsertPostingMap(adds)
+		return mergeInsertOnlySingleFieldEntry(base, add)
 	}
 
 	addSlice := make([]index, 0, len(adds))
-	for key, ids := range adds {
-		ids.Optimize()
-		if ids.IsEmpty() {
-			continue
-		}
+	for key, ref := range adds {
+		ids := arena.accum(ref).materializeOwned()
 		addSlice = append(addSlice, index{
 			Key: indexKeyFromStoredString(key, fixed8),
 			IDs: ids,
 		})
 	}
-	releasePostingMap(adds)
-	if len(addSlice) == 0 {
-		return base
-	}
+	releaseInsertPostingMap(adds)
 
 	return mergeInsertOnlyFieldEntries(base, addSlice)
 }
 
-func mergeInsertOnlyFixedFieldSliceOwned(base *[]index, adds map[uint64]posting.List) *[]index {
+func mergeInsertOnlyFixedFieldSliceOwned(
+	base *[]index,
+	adds map[uint64]uint32,
+	arena *insertPostingAccumArena,
+) *[]index {
 	if len(adds) == 0 {
-		releaseFixedPostingMap(adds)
+		releaseFixedInsertPostingMap(adds)
 		return base
+	}
+	if len(adds) == 1 {
+		var add index
+		for key, ref := range adds {
+			add = index{
+				Key: indexKeyFromU64(key),
+				IDs: arena.accum(ref).materializeOwned(),
+			}
+		}
+		releaseFixedInsertPostingMap(adds)
+		return mergeInsertOnlySingleFieldEntry(base, add)
 	}
 
 	addSlice := make([]index, 0, len(adds))
-	for key, ids := range adds {
-		ids.Optimize()
-		if ids.IsEmpty() {
-			continue
-		}
+	for key, ref := range adds {
+		ids := arena.accum(ref).materializeOwned()
 		addSlice = append(addSlice, index{
 			Key: indexKeyFromU64(key),
 			IDs: ids,
 		})
 	}
-	releaseFixedPostingMap(adds)
-	if len(addSlice) == 0 {
-		return base
-	}
+	releaseFixedInsertPostingMap(adds)
 
 	return mergeInsertOnlyFieldEntries(base, addSlice)
 }
 
+func mergeInsertOnlySingleFieldEntry(base *[]index, add index) *[]index {
+	if add.IDs.IsEmpty() {
+		return base
+	}
+	if base == nil || len(*base) == 0 {
+		out := []index{add}
+		return &out
+	}
+
+	src := *base
+	pos := lowerBoundIndexEntriesKey(src, add.Key)
+	if pos < len(src) && compareIndexKeys(src[pos].Key, add.Key) == 0 {
+		out := make([]index, len(src))
+		copy(out, src)
+		out[pos].IDs = unionPostingListsOwned(src[pos].IDs, add.IDs)
+		return &out
+	}
+
+	out := make([]index, len(src)+1)
+	copy(out, src[:pos])
+	out[pos] = add
+	copy(out[pos+1:], src[pos:])
+	return &out
+}
+
 func mergeInsertOnlyFieldEntries(base *[]index, addSlice []index) *[]index {
-	slices.SortFunc(addSlice, func(a, b index) int {
-		return compareIndexKeys(a.Key, b.Key)
-	})
+	sort.Sort(indexKeyOrder(addSlice))
 
 	if base == nil || len(*base) == 0 {
 		return &addSlice
@@ -1124,16 +1184,41 @@ func (db *DB[K, V]) buildPreparedSnapshotInsertOnlyNoLock(seq uint64, prev *inde
 	next := &indexSnapshot{
 		seq: seq,
 
-		index:             maps.Clone(prev.index),
-		nilIndex:          maps.Clone(prev.nilIndex),
-		lenIndex:          maps.Clone(prev.lenIndex),
-		lenZeroComplement: maps.Clone(prev.lenZeroComplement),
+		index:             prev.index,
+		nilIndex:          prev.nilIndex,
+		lenIndex:          prev.lenIndex,
+		lenZeroComplement: prev.lenZeroComplement,
 		universe:          prev.universe.Clone(),
 		strmap:            db.strmap.snapshot(),
 	}
 	db.initSnapshotRuntimeCaches(next)
+	indexCloned := false
+	nilIndexCloned := false
+	lenIndexCloned := false
+	ensureIndex := func() map[string]fieldIndexStorage {
+		if !indexCloned {
+			next.index = maps.Clone(prev.index)
+			indexCloned = true
+		}
+		return next.index
+	}
+	ensureNilIndex := func() map[string]fieldIndexStorage {
+		if !nilIndexCloned {
+			next.nilIndex = maps.Clone(prev.nilIndex)
+			nilIndexCloned = true
+		}
+		return next.nilIndex
+	}
+	ensureLenIndex := func() map[string]fieldIndexStorage {
+		if !lenIndexCloned {
+			next.lenIndex = maps.Clone(prev.lenIndex)
+			lenIndexCloned = true
+		}
+		return next.lenIndex
+	}
 
 	fieldStates := make([]snapshotFieldInsertState, len(db.indexedFieldAccess))
+	initSnapshotFieldInsertStateHints(fieldStates, db.indexedFieldAccess, prev, len(prepared))
 
 	for i := range prepared {
 		op := prepared[i]
@@ -1148,36 +1233,46 @@ func (db *DB[K, V]) buildPreparedSnapshotInsertOnlyNoLock(seq uint64, prev *inde
 	changedCount := 0
 	for i, acc := range db.indexedFieldAccess {
 		f := acc.name
-		if storage := acc.mergeSnapshotInsertStorageOwned(next.index[f], &fieldStates[i], true); storage.keyCount() > 0 {
-			next.index[f] = storage
-		} else {
-			delete(next.index, f)
+		baseIndex := next.index[f]
+		if storage := acc.mergeSnapshotInsertStorageOwned(baseIndex, &fieldStates[i], true); storage.keyCount() > 0 {
+			if storage != baseIndex {
+				ensureIndex()[f] = storage
+			}
+		} else if baseIndex.keyCount() > 0 {
+			delete(ensureIndex(), f)
 		}
-		if storage := acc.mergeSnapshotInsertNilStorageOwned(next.nilIndex[f], &fieldStates[i]); storage.keyCount() > 0 {
-			next.nilIndex[f] = storage
-		} else {
-			delete(next.nilIndex, f)
+		baseNil := next.nilIndex[f]
+		if storage := acc.mergeSnapshotInsertNilStorageOwned(baseNil, &fieldStates[i]); storage.keyCount() > 0 {
+			if storage != baseNil {
+				ensureNilIndex()[f] = storage
+			}
+		} else if baseNil.keyCount() > 0 {
+			delete(ensureNilIndex(), f)
 		}
 		if fieldStates[i].lengths != nil {
-			next.lenIndex[f] = applyLenFieldPostingDiffStorageOwned(next.lenIndex[f], fieldStates[i].lengths)
+			baseLen := next.lenIndex[f]
+			if storage := applyLenFieldPostingDiffStorageOwned(baseLen, fieldStates[i].lengths); storage != baseLen {
+				ensureLenIndex()[f] = storage
+			}
 			fieldStates[i].lengths = nil
 		}
 		if fieldStates[i].changed {
 			changedCount++
 		}
+		fieldStates[i].releaseOwned()
 	}
 	inheritNumericRangeBucketCache(next, prev)
 
 	if changedCount > 0 {
-		changed := make(map[string]struct{}, changedCount)
+		changed := make([]bool, len(db.indexedFieldAccess))
 		for i := range fieldStates {
 			if fieldStates[i].changed {
-				changed[db.indexedFieldAccess[i].name] = struct{}{}
+				changed[i] = true
 			}
 		}
-		inheritMaterializedPredCache(next, prev, changed)
+		inheritMaterializedPredCache(db, next, prev, changed)
 	} else {
-		inheritMaterializedPredCache(next, prev, nil)
+		inheritMaterializedPredCache(db, next, prev, nil)
 	}
 
 	return next, true

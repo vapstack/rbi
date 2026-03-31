@@ -1391,9 +1391,13 @@ func TestSnapshotExt_InheritMaterializedPredCacheSkipsChangedFieldsAndKeepsOther
 	prev.matPredCacheCount.Store(2)
 
 	next := &indexSnapshot{matPredCacheMaxEntries: 8}
-	inheritMaterializedPredCache(next, prev, map[string]struct{}{
-		"name": {},
-	})
+	db := &DB[uint64, struct{}]{
+		indexedFieldByName: map[string]indexedFieldAccessor{
+			"name":  {ordinal: 0},
+			"email": {ordinal: 1},
+		},
+	}
+	inheritMaterializedPredCache(db, next, prev, []bool{true, false})
 
 	if _, ok := next.loadMaterializedPred("name\x1f1\x1fa"); ok {
 		t.Fatalf("expected changed-field cache entry to be skipped")
@@ -1414,7 +1418,7 @@ func TestSnapshotExt_InheritMaterializedPredCacheSkipsMalformedKeysAndBadEntries
 	prev.matPredCacheCount.Store(5)
 
 	next := &indexSnapshot{matPredCacheMaxEntries: 8}
-	inheritMaterializedPredCache(next, prev, nil)
+	inheritMaterializedPredCache[uint64, struct{}](nil, next, prev, nil)
 
 	if got := next.matPredCacheCount.Load(); got != 1 {
 		t.Fatalf("expected exactly one valid inherited entry, got=%d", got)
@@ -1432,7 +1436,7 @@ func TestSnapshotExt_InheritMaterializedPredCacheAllowsTypedNilEntries(t *testin
 	prev.matPredCacheCount.Store(1)
 
 	next := &indexSnapshot{matPredCacheMaxEntries: 8}
-	inheritMaterializedPredCache(next, prev, nil)
+	inheritMaterializedPredCache[uint64, struct{}](nil, next, prev, nil)
 
 	if got := next.matPredCacheCount.Load(); got != 1 {
 		t.Fatalf("expected typed-nil entry to be inherited as negative cache entry, got=%d", got)
@@ -1455,7 +1459,7 @@ func TestSnapshotExt_InheritMaterializedPredCacheClampsOversizedCount(t *testing
 		matPredCacheMaxEntries: 8,
 		matPredCacheMaxCard:    1,
 	}
-	inheritMaterializedPredCache(next, prev, nil)
+	inheritMaterializedPredCache[uint64, struct{}](nil, next, prev, nil)
 
 	if got := next.matPredCacheCount.Load(); got != 3 {
 		t.Fatalf("expected all entries to be inherited before oversized clamp, got=%d", got)
@@ -1477,7 +1481,7 @@ func TestSnapshotExt_InheritMaterializedPredCachePreservesRecencyStamps(t *testi
 	prev.matPredCacheClock.Store(13)
 
 	next := &indexSnapshot{matPredCacheMaxEntries: 8}
-	inheritMaterializedPredCache(next, prev, nil)
+	inheritMaterializedPredCache[uint64, struct{}](nil, next, prev, nil)
 
 	va, ok := next.matPredCache.Load("email\x1f1\x1fa")
 	if !ok {
