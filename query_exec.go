@@ -1008,13 +1008,9 @@ func (qv *queryView[K, V]) tryQueryOrderBasicWithLimit(q *qx.QX, trace *queryTra
 	var base postingResult
 	var residualPreds []predicate
 	var residualPredsBuf *predicateSliceBuf
-	var residualActive []int
 	var residualActiveBuf *intSliceBuf
 	defer func() {
-		if residualActiveBuf != nil {
-			residualActiveBuf.values = residualActive
-			releaseIntSliceBuf(residualActiveBuf)
-		}
+		releaseIntSliceBuf(residualActiveBuf)
 		if residualPreds != nil || residualPredsBuf != nil {
 			releasePredicates(residualPreds, residualPredsBuf)
 		}
@@ -1022,9 +1018,8 @@ func (qv *queryView[K, V]) tryQueryOrderBasicWithLimit(q *qx.QX, trace *queryTra
 
 	if hasWarmBaseOps {
 		residualOpsBuf := getExprSliceBuf(len(baseOps))
-		residualOps := residualOpsBuf.values[:0]
+		residualOpsBuf.values = residualOpsBuf.values[:0]
 		defer func() {
-			residualOpsBuf.values = residualOps
 			releaseExprSliceBuf(residualOpsBuf)
 		}()
 		var loadedCoreBuf *boolSliceBuf
@@ -1057,14 +1052,14 @@ func (qv *queryView[K, V]) tryQueryOrderBasicWithLimit(q *qx.QX, trace *queryTra
 			if loadedCoreBuf.values[baseRawCoreIdxBuf.values[i]] {
 				continue
 			}
-			residualOps = append(residualOps, op)
+			residualOpsBuf.values = append(residualOpsBuf.values, op)
 		}
 		if !baseBuilt {
 			hasWarmBaseOps = false
-		} else if len(residualOps) > 0 {
+		} else if len(residualOpsBuf.values) > 0 {
 			window, _ := orderWindow(q)
 			var ok bool
-			residualPreds, residualPredsBuf, ok = qv.buildPredicatesOrderedWithMode(residualOps, f, false, window, false, true)
+			residualPreds, residualPredsBuf, ok = qv.buildPredicatesOrderedWithMode(residualOpsBuf.values, f, false, window, false, true)
 			if !ok {
 				base.release()
 				base = postingResult{}
@@ -1076,7 +1071,6 @@ func (qv *queryView[K, V]) tryQueryOrderBasicWithLimit(q *qx.QX, trace *queryTra
 				}
 			} else {
 				residualActiveBuf = getIntSliceBuf(len(residualPreds))
-				residualActive = residualActiveBuf.values[:0]
 				for i := range residualPreds {
 					if residualPreds[i].alwaysFalse {
 						base.release()
@@ -1085,7 +1079,7 @@ func (qv *queryView[K, V]) tryQueryOrderBasicWithLimit(q *qx.QX, trace *queryTra
 					if residualPreds[i].covered || residualPreds[i].alwaysTrue {
 						continue
 					}
-					residualActive = append(residualActive, i)
+					residualActiveBuf.values = append(residualActiveBuf.values, i)
 				}
 			}
 		}
@@ -1122,6 +1116,7 @@ func (qv *queryView[K, V]) tryQueryOrderBasicWithLimit(q *qx.QX, trace *queryTra
 	if !base.neg && baseBM.IsEmpty() {
 		return nil, true, nil
 	}
+	hasResidualActive := residualActiveBuf != nil && len(residualActiveBuf.values) > 0
 
 	skip := q.Offset
 	need := q.Limit
@@ -1135,7 +1130,10 @@ func (qv *queryView[K, V]) tryQueryOrderBasicWithLimit(q *qx.QX, trace *queryTra
 	contains := func(idx uint64) bool {
 		if base.neg {
 			if baseNegUniverse {
-				return predicatesMatchActive(residualPreds, residualActive, idx)
+				if !hasResidualActive {
+					return true
+				}
+				return predicatesMatchActive(residualPreds, residualActiveBuf.values, idx)
 			}
 			if baseBM.Contains(idx) {
 				return false
@@ -1143,10 +1141,16 @@ func (qv *queryView[K, V]) tryQueryOrderBasicWithLimit(q *qx.QX, trace *queryTra
 		} else if !baseBM.Contains(idx) {
 			return false
 		}
-		return predicatesMatchActive(residualPreds, residualActive, idx)
+		if !hasResidualActive {
+			return true
+		}
+		return predicatesMatchActive(residualPreds, residualActiveBuf.values, idx)
 	}
 	residualMatches := func(idx uint64) bool {
-		return predicatesMatchActive(residualPreds, residualActive, idx)
+		if !hasResidualActive {
+			return true
+		}
+		return predicatesMatchActive(residualPreds, residualActiveBuf.values, idx)
 	}
 
 	keyCur := ov.newCursor(br, order.Desc)
@@ -1196,7 +1200,7 @@ func (qv *queryView[K, V]) tryQueryOrderBasicWithLimit(q *qx.QX, trace *queryTra
 		if tmp.IsEmpty() {
 			return false
 		}
-		if len(residualActive) == 0 {
+		if !hasResidualActive {
 			return cursor.emitPosting(tmp)
 		}
 		it := tmp.Iter()
@@ -1373,9 +1377,8 @@ func (qv *queryView[K, V]) scanOrderLimitWithPredicates(q *qx.QX, ov fieldOverla
 	}()
 	exactOnly := len(active) > 0 && len(active) == len(exactActive)
 	residualActiveBuf := getIntSliceBuf(len(active))
-	residualActive := residualActiveBuf.values[:0]
+	residualActiveBuf.values = residualActiveBuf.values[:0]
 	defer func() {
-		residualActiveBuf.values = residualActive
 		releaseIntSliceBuf(residualActiveBuf)
 	}()
 	if len(exactActive) > 0 && len(exactActive) < len(active) {
@@ -1383,7 +1386,7 @@ func (qv *queryView[K, V]) scanOrderLimitWithPredicates(q *qx.QX, ov fieldOverla
 			if countIndexSliceContains(exactActive, pi) {
 				continue
 			}
-			residualActive = append(residualActive, pi)
+			residualActiveBuf.values = append(residualActiveBuf.values, pi)
 		}
 	}
 
@@ -1502,7 +1505,7 @@ func (qv *queryView[K, V]) scanOrderLimitWithPredicates(q *qx.QX, ov fieldOverla
 			examined++
 			checks := active
 			if exactApplied {
-				checks = residualActive
+				checks = residualActiveBuf.values
 			}
 			pass := true
 			for _, pi := range checks {

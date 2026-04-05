@@ -2168,15 +2168,14 @@ func (qv *queryView[K, V]) tryPlanOrdered(q *qx.QX, trace *queryTrace) ([]K, boo
 		}
 		needWindow, _ := orderWindow(q)
 		baseOpsBuf := getExprSliceBuf(len(leaves))
-		baseOps := baseOpsBuf.values[:0]
+		baseOpsBuf.values = baseOpsBuf.values[:0]
 		for _, op := range leaves {
 			if op.Field == o.Field {
 				continue
 			}
-			baseOps = append(baseOps, op)
+			baseOpsBuf.values = append(baseOpsBuf.values, op)
 		}
-		qv.promoteOrderBasicLimitMaterializedBaseOps(o.Field, baseOps, execTrace.ev.RowsExamined-observedStart, uint64(needWindow))
-		baseOpsBuf.values = baseOps
+		qv.promoteOrderBasicLimitMaterializedBaseOps(o.Field, baseOpsBuf.values, execTrace.ev.RowsExamined-observedStart, uint64(needWindow))
 		releaseExprSliceBuf(baseOpsBuf)
 		return out, true, nil
 	}
@@ -3316,22 +3315,19 @@ func (qv *queryView[K, V]) execPlanOrderedBasicAnchored(q *qx.QX, preds []predic
 	leadNeedsCheck := preds[leadIdx].leadIterNeedsContainsCheck()
 
 	exactChecksBuf := getIntSliceBuf(len(active))
-	exactChecks := exactChecksBuf.values[:0]
+	exactChecksBuf.values = exactChecksBuf.values[:0]
 	defer func() {
-		exactChecksBuf.values = exactChecks
 		releaseIntSliceBuf(exactChecksBuf)
 	}()
 
 	residualChecksBuf := getIntSliceBuf(len(active))
-	residualChecks := residualChecksBuf.values[:0]
+	residualChecksBuf.values = residualChecksBuf.values[:0]
 	defer func() {
-		residualChecksBuf.values = residualChecks
 		releaseIntSliceBuf(residualChecksBuf)
 	}()
 	deferredChecksBuf := getIntSliceBuf(len(active))
-	deferredChecks := deferredChecksBuf.values[:0]
+	deferredChecksBuf.values = deferredChecksBuf.values[:0]
 	defer func() {
-		deferredChecksBuf.values = deferredChecks
 		releaseIntSliceBuf(deferredChecksBuf)
 	}()
 
@@ -3340,17 +3336,17 @@ func (qv *queryView[K, V]) execPlanOrderedBasicAnchored(q *qx.QX, preds []predic
 		if pi == leadIdx && !leadNeedsCheck {
 			continue
 		}
-		deferredChecks = append(deferredChecks, pi)
+		deferredChecksBuf.values = append(deferredChecksBuf.values, pi)
 	}
-	exactChecks = buildExactBucketPostingFilterActive(exactChecks[:0], deferredChecks, preds)
-	for _, pi := range exactChecks {
+	exactChecksBuf.values = buildExactBucketPostingFilterActive(exactChecksBuf.values[:0], deferredChecksBuf.values, preds)
+	for _, pi := range exactChecksBuf.values {
 		if preds[pi].prefersExactBucketPostingFilter() {
 			orderedExactPreferred = true
 			break
 		}
 	}
-	residualChecks = plannerResidualChecks(residualChecks[:0], deferredChecks, exactChecks)
-	useExactPosting := len(exactChecks) > 0 && (len(residualChecks) == 0 || orderedExactPreferred)
+	residualChecksBuf.values = plannerResidualChecks(residualChecksBuf.values[:0], deferredChecksBuf.values, exactChecksBuf.values)
+	useExactPosting := len(exactChecksBuf.values) > 0 && (len(residualChecksBuf.values) == 0 || orderedExactPreferred)
 
 	var candidates posting.List
 
@@ -3455,7 +3451,7 @@ func (qv *queryView[K, V]) execPlanOrderedBasicAnchored(q *qx.QX, preds []predic
 	if useExactPosting {
 		exactApplied := false
 		exactWork := posting.List{}
-		mode, exactIDs, exactWork, _ := plannerFilterPostingByChecks(preds, exactChecks, candidates, exactWork, true)
+		mode, exactIDs, exactWork, _ := plannerFilterPostingByChecks(preds, exactChecksBuf.values, candidates, exactWork, true)
 		defer exactWork.Release()
 		switch mode {
 		case plannerPredicateBucketEmpty:
@@ -3481,11 +3477,11 @@ func (qv *queryView[K, V]) execPlanOrderedBasicAnchored(q *qx.QX, preds []predic
 			}
 			return nil, true
 		}
-		if exactApplied && len(residualChecks) > 0 {
+		if exactApplied && len(residualChecksBuf.values) > 0 {
 			builder := newPostingUnionBuilder(postingBatchSinglesEnabled(candidateIDs.Cardinality()))
 			candidateIDs.ForEach(func(idx uint64) bool {
 				pass := true
-				for _, pi := range residualChecks {
+				for _, pi := range residualChecksBuf.values {
 					p := preds[pi]
 					if !p.hasContains() || !p.matches(idx) {
 						pass = false
@@ -3507,7 +3503,7 @@ func (qv *queryView[K, V]) execPlanOrderedBasicAnchored(q *qx.QX, preds []predic
 			candidateIDs = filtered
 		}
 		if exactApplied {
-			deferredChecks = deferredChecks[:0]
+			deferredChecksBuf.values = deferredChecksBuf.values[:0]
 		}
 		if candidateIDs.Cardinality() > candidateCap {
 			return nil, false
@@ -3522,8 +3518,8 @@ func (qv *queryView[K, V]) execPlanOrderedBasicAnchored(q *qx.QX, preds []predic
 	seenCandidates := uint64(0)
 	scanWidth := uint64(0)
 	singleDeferred := -1
-	if len(deferredChecks) == 1 {
-		singleDeferred = deferredChecks[0]
+	if len(deferredChecksBuf.values) == 1 {
+		singleDeferred = deferredChecksBuf.values[0]
 	}
 
 	emitBucket := func(ids posting.List) bool {
@@ -3547,7 +3543,7 @@ func (qv *queryView[K, V]) execPlanOrderedBasicAnchored(q *qx.QX, preds []predic
 					return true
 				}
 			} else {
-				for _, pi := range deferredChecks {
+				for _, pi := range deferredChecksBuf.values {
 					p := preds[pi]
 					if !p.hasContains() || !p.matches(idx) {
 						return true

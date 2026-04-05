@@ -1915,8 +1915,9 @@ func (qv *queryView[K, V]) tryCountByPredicates(expr qx.Expr, trace *queryTrace)
 			return 0, true, err
 		}
 	}
-	filtered := activeBuf.values[:0]
-	for _, pi := range activeBuf.values {
+	write := 0
+	for read := 0; read < len(activeBuf.values); read++ {
+		pi := activeBuf.values[read]
 		p := preds[pi]
 		if p.covered || p.alwaysTrue {
 			continue
@@ -1927,9 +1928,10 @@ func (qv *queryView[K, V]) tryCountByPredicates(expr qx.Expr, trace *queryTrace)
 		if !p.hasContains() {
 			return 0, false, nil
 		}
-		filtered = append(filtered, pi)
+		activeBuf.values[write] = pi
+		write++
 	}
-	activeBuf.values = filtered
+	activeBuf.values = activeBuf.values[:write]
 	sortActivePredicates(activeBuf.values, preds)
 
 	// For range/prefix leads on stable base slices, count by buckets first:
@@ -3038,8 +3040,9 @@ branchLoop:
 				return 0, true, err
 			}
 		}
-		filteredChecks := checksBuf.values[:0]
-		for _, pi := range checksBuf.values {
+		write := 0
+		for read := 0; read < len(checksBuf.values); read++ {
+			pi := checksBuf.values[read]
 			p := preds[pi]
 			if p.covered || p.alwaysTrue {
 				continue
@@ -3056,13 +3059,14 @@ branchLoop:
 				releaseCurrentBranch(checksBuf)
 				return 0, false, nil
 			}
-			filteredChecks = append(filteredChecks, pi)
+			checksBuf.values[write] = pi
+			write++
 		}
 		if branchFalse {
 			releaseCurrentBranch(checksBuf)
 			continue
 		}
-		checksBuf.values = filteredChecks
+		checksBuf.values = checksBuf.values[:write]
 		sortActivePredicates(checksBuf.values, preds)
 		releaseIntSliceBuf(activeBuf)
 

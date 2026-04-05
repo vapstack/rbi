@@ -690,23 +690,20 @@ func (qv *queryView[K, V]) orderMergeBranchStats(orderField string, branches pla
 				_, stats[i].rangeRows = overlayRangeStats(ov, br)
 			}
 			checksBuf := getIntSliceBuf(len(branches[i].preds))
-			checks := branches[i].buildMatchChecks(checksBuf.values[:0])
-			exactChecksBuf := getIntSliceBuf(len(checks))
-			exactChecks := branches[i].buildPostingFilterChecks(exactChecksBuf.values[:0], checks)
-			residualChecksBuf := getIntSliceBuf(len(checks))
-			residualChecks := plannerResidualChecks(residualChecksBuf.values[:0], checks, exactChecks)
-			stats[i].streamChecks = len(checks)
-			stats[i].mergeChecks = len(residualChecks)
-			exactChecksBuf.values = exactChecks
+			checksBuf.values = branches[i].buildMatchChecks(checksBuf.values[:0])
+			exactChecksBuf := getIntSliceBuf(len(checksBuf.values))
+			exactChecksBuf.values = branches[i].buildPostingFilterChecks(exactChecksBuf.values[:0], checksBuf.values)
+			residualChecksBuf := getIntSliceBuf(len(checksBuf.values))
+			residualChecksBuf.values = plannerResidualChecks(residualChecksBuf.values[:0], checksBuf.values, exactChecksBuf.values)
+			stats[i].streamChecks = len(checksBuf.values)
+			stats[i].mergeChecks = len(residualChecksBuf.values)
 			releaseIntSliceBuf(exactChecksBuf)
-			residualChecksBuf.values = residualChecks
 			releaseIntSliceBuf(residualChecksBuf)
-			checksBuf.values = checks
 			releaseIntSliceBuf(checksBuf)
 			continue
 		}
 		checksBuf := getIntSliceBuf(len(branches[i].preds))
-		checks := checksBuf.values[:0]
+		checksBuf.values = checksBuf.values[:0]
 		for pi := range branches[i].preds {
 			p := branches[i].preds[pi]
 			if p.alwaysTrue || p.alwaysFalse || !p.hasContains() {
@@ -715,19 +712,16 @@ func (qv *queryView[K, V]) orderMergeBranchStats(orderField string, branches pla
 			if pi < len(covered) && covered[pi] {
 				continue
 			}
-			checks = append(checks, pi)
+			checksBuf.values = append(checksBuf.values, pi)
 		}
-		exactChecksBuf := getIntSliceBuf(len(checks))
-		exactChecks := branches[i].buildPostingFilterChecks(exactChecksBuf.values[:0], checks)
-		residualChecksBuf := getIntSliceBuf(len(checks))
-		residualChecks := plannerResidualChecks(residualChecksBuf.values[:0], checks, exactChecks)
-		stats[i].streamChecks = len(checks)
-		stats[i].mergeChecks = len(residualChecks)
-		exactChecksBuf.values = exactChecks
+		exactChecksBuf := getIntSliceBuf(len(checksBuf.values))
+		exactChecksBuf.values = branches[i].buildPostingFilterChecks(exactChecksBuf.values[:0], checksBuf.values)
+		residualChecksBuf := getIntSliceBuf(len(checksBuf.values))
+		residualChecksBuf.values = plannerResidualChecks(residualChecksBuf.values[:0], checksBuf.values, exactChecksBuf.values)
+		stats[i].streamChecks = len(checksBuf.values)
+		stats[i].mergeChecks = len(residualChecksBuf.values)
 		releaseIntSliceBuf(exactChecksBuf)
-		residualChecksBuf.values = residualChecks
 		releaseIntSliceBuf(residualChecksBuf)
-		checksBuf.values = checks
 		releaseIntSliceBuf(checksBuf)
 		if br.baseStart == 0 && br.baseEnd == ov.keyCount() {
 			continue
@@ -1501,51 +1495,43 @@ func (qv *queryView[K, V]) promoteOrderedORMaterializedBaseOps(
 	}
 
 	baseOpsBuf := getExprSliceBuf(len(branches) * 4)
-	baseOps := baseOpsBuf.values[:0]
+	baseOpsBuf.values = baseOpsBuf.values[:0]
 	defer func() {
-		baseOpsBuf.values = baseOps
 		releaseExprSliceBuf(baseOpsBuf)
 	}()
 	cacheKeysBuf := getStringSliceBuf(len(branches) * 4)
-	cacheKeys := cacheKeysBuf.values[:0]
+	cacheKeysBuf.values = cacheKeysBuf.values[:0]
 	defer func() {
-		cacheKeysBuf.values = cacheKeys
 		releaseStringSliceBuf(cacheKeysBuf)
 	}()
 	buildWorksBuf := getUint64SliceBuf(len(branches) * 4)
-	buildWorks := buildWorksBuf.values[:0]
+	buildWorksBuf.values = buildWorksBuf.values[:0]
 	defer func() {
-		buildWorksBuf.values = buildWorks
 		releaseUint64SliceBuf(buildWorksBuf)
 	}()
 	checkWorksBuf := getUint64SliceBuf(len(branches) * 4)
-	checkWorks := checkWorksBuf.values[:0]
+	checkWorksBuf.values = checkWorksBuf.values[:0]
 	defer func() {
-		checkWorksBuf.values = checkWorks
 		releaseUint64SliceBuf(checkWorksBuf)
 	}()
 	cachedCheckWorksBuf := getUint64SliceBuf(len(branches) * 4)
-	cachedCheckWorks := cachedCheckWorksBuf.values[:0]
+	cachedCheckWorksBuf.values = cachedCheckWorksBuf.values[:0]
 	defer func() {
-		cachedCheckWorksBuf.values = cachedCheckWorks
 		releaseUint64SliceBuf(cachedCheckWorksBuf)
 	}()
 	prefixFlagsBuf := getBoolSliceBuf(len(branches) * 4)
-	prefixFlags := prefixFlagsBuf.values[:0]
+	prefixFlagsBuf.values = prefixFlagsBuf.values[:0]
 	defer func() {
-		prefixFlagsBuf.values = prefixFlags
 		releaseBoolSliceBuf(prefixFlagsBuf)
 	}()
 	expectedChecksBuf := getUint64SliceBuf(len(branches) * 4)
-	expectedChecks := expectedChecksBuf.values[:0]
+	expectedChecksBuf.values = expectedChecksBuf.values[:0]
 	defer func() {
-		expectedChecksBuf.values = expectedChecks
 		releaseUint64SliceBuf(expectedChecksBuf)
 	}()
 	observedWorksBuf := getUint64SliceBuf(len(branches) * 4)
-	observedWorks := observedWorksBuf.values[:0]
+	observedWorksBuf.values = observedWorksBuf.values[:0]
 	defer func() {
-		observedWorksBuf.values = observedWorks
 		releaseUint64SliceBuf(observedWorksBuf)
 	}()
 
@@ -1572,55 +1558,56 @@ func (qv *queryView[K, V]) promoteOrderedORMaterializedBaseOps(
 				cachedCheckWork = 0
 				isPrefix = true
 			}
-			for slot := range cacheKeys {
-				if cacheKeys[slot] == cacheKey {
-					expectedChecks[slot] = satAddUint64(expectedChecks[slot], leafChecks)
+			for slot := range cacheKeysBuf.values {
+				if cacheKeysBuf.values[slot] == cacheKey {
+					expectedChecksBuf.values[slot] = satAddUint64(expectedChecksBuf.values[slot], leafChecks)
 					if isPrefix {
-						observedWorks[slot] = satAddUint64(observedWorks[slot], leafChecks)
+						observedWorksBuf.values[slot] = satAddUint64(observedWorksBuf.values[slot], leafChecks)
 					} else if checkWork > cachedCheckWork {
-						observedWorks[slot] = satAddUint64(observedWorks[slot], satMulUint64(leafChecks, checkWork-cachedCheckWork))
+						observedWorksBuf.values[slot] = satAddUint64(observedWorksBuf.values[slot], satMulUint64(leafChecks, checkWork-cachedCheckWork))
 					}
 					goto nextPred
 				}
 			}
-			cacheKeys = append(cacheKeys, cacheKey)
-			baseOps = append(baseOps, p.expr)
-			buildWorks = append(buildWorks, buildWork)
-			checkWorks = append(checkWorks, checkWork)
-			cachedCheckWorks = append(cachedCheckWorks, cachedCheckWork)
-			prefixFlags = append(prefixFlags, isPrefix)
-			expectedChecks = append(expectedChecks, leafChecks)
+			cacheKeysBuf.values = append(cacheKeysBuf.values, cacheKey)
+			baseOpsBuf.values = append(baseOpsBuf.values, p.expr)
+			buildWorksBuf.values = append(buildWorksBuf.values, buildWork)
+			checkWorksBuf.values = append(checkWorksBuf.values, checkWork)
+			cachedCheckWorksBuf.values = append(cachedCheckWorksBuf.values, cachedCheckWork)
+			prefixFlagsBuf.values = append(prefixFlagsBuf.values, isPrefix)
+			expectedChecksBuf.values = append(expectedChecksBuf.values, leafChecks)
 			if isPrefix {
-				observedWorks = append(observedWorks, leafChecks)
+				observedWorksBuf.values = append(observedWorksBuf.values, leafChecks)
 			} else if checkWork > cachedCheckWork {
-				observedWorks = append(observedWorks, satMulUint64(leafChecks, checkWork-cachedCheckWork))
+				observedWorksBuf.values = append(observedWorksBuf.values, satMulUint64(leafChecks, checkWork-cachedCheckWork))
 			} else {
-				observedWorks = append(observedWorks, 0)
+				observedWorksBuf.values = append(observedWorksBuf.values, 0)
 			}
 		nextPred:
 		}
 	}
-	if len(baseOps) == 0 {
+	if len(baseOpsBuf.values) == 0 {
 		return
 	}
-	filtered := baseOps[:0]
-	for i := range baseOps {
-		if observedWorks[i] == 0 {
+	write := 0
+	for i := range baseOpsBuf.values {
+		if observedWorksBuf.values[i] == 0 {
 			continue
 		}
-		if _, ok := qv.snap.loadMaterializedPred(cacheKeys[i]); ok {
+		if _, ok := qv.snap.loadMaterializedPred(cacheKeysBuf.values[i]); ok {
 			continue
 		}
-		if !qv.snap.shouldPromoteObservedOrderedORMaterializedPred(cacheKeys[i], observedWorks[i], buildWorks[i]) {
+		if !qv.snap.shouldPromoteObservedOrderedORMaterializedPred(cacheKeysBuf.values[i], observedWorksBuf.values[i], buildWorksBuf.values[i]) {
 			continue
 		}
-		filtered = append(filtered, baseOps[i])
+		baseOpsBuf.values[write] = baseOpsBuf.values[i]
+		write++
 	}
-	baseOps = filtered
-	if len(baseOps) == 0 {
+	baseOpsBuf.values = baseOpsBuf.values[:write]
+	if len(baseOpsBuf.values) == 0 {
 		return
 	}
-	qv.materializeOrderMaterializedBaseOps(orderField, baseOps)
+	qv.materializeOrderMaterializedBaseOps(orderField, baseOpsBuf.values)
 }
 
 func releaseORBranches(branches plannerORBranches) {
@@ -4087,15 +4074,13 @@ func (qv *queryView[K, V]) execPlanORNoOrderBaselineCore(q *qx.QX, branches plan
 	}
 	useLinearSeen := needWindow <= plannerORNoOrderLinearSeenNeedMax
 	var (
-		seen       u64set
-		seenLinear []uint64
-		seenBuf    *uint64SliceBuf
+		seen    u64set
+		seenBuf *uint64SliceBuf
 	)
 	if useLinearSeen {
 		seenBuf = getUint64SliceBuf(needWindow)
-		seenLinear = seenBuf.values[:0]
+		seenBuf.values = seenBuf.values[:0]
 		defer func() {
-			seenBuf.values = seenLinear
 			releaseUint64SliceBuf(seenBuf)
 		}()
 	} else {
@@ -4134,7 +4119,7 @@ func (qv *queryView[K, V]) execPlanORNoOrderBaselineCore(q *qx.QX, branches plan
 
 		if useLinearSeen {
 			dup := false
-			for _, existing := range seenLinear {
+			for _, existing := range seenBuf.values {
 				if existing == minIdx {
 					dup = true
 					break
@@ -4146,7 +4131,7 @@ func (qv *queryView[K, V]) execPlanORNoOrderBaselineCore(q *qx.QX, branches plan
 				}
 				continue
 			}
-			seenLinear = append(seenLinear, minIdx)
+			seenBuf.values = append(seenBuf.values, minIdx)
 		} else {
 			// No-order branch leads are only required to be iterable, not globally
 			// monotone by idx. Identical ids may therefore surface again long after

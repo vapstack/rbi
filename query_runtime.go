@@ -754,13 +754,12 @@ func materializePostingUnionBaseRange(probe baseRangeProbe) posting.List {
 		return posting.List{}
 	}
 	postsBuf := getPostingSliceBuf(probe.probeLen)
-	posts := postsBuf.values[:0]
+	postsBuf.values = postsBuf.values[:0]
 	probe.forEachPosting(func(ids posting.List) bool {
-		posts = append(posts, ids)
+		postsBuf.values = append(postsBuf.values, ids)
 		return true
 	})
-	out := materializePostingUnionOwned(posts)
-	postsBuf.values = posts
+	out := materializePostingUnionOwned(postsBuf.values)
 	releasePostingSliceBuf(postsBuf)
 	return out
 }
