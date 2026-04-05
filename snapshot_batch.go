@@ -144,20 +144,6 @@ func normalizePreparedBatchForSnapshot[K ~string | ~uint64, V any](prepared []au
 	return out[:n]
 }
 
-func addFieldBatchPostingDelta(fieldDelta map[string]batchPostingDelta, key string, idx uint64, isAdd bool) map[string]batchPostingDelta {
-	if fieldDelta == nil {
-		fieldDelta = getBatchPostingDeltaMap()
-	}
-	delta := fieldDelta[key]
-	if isAdd {
-		delta.add = delta.add.BuildAdded(idx)
-	} else {
-		delta.remove = delta.remove.BuildAdded(idx)
-	}
-	fieldDelta[key] = delta
-	return fieldDelta
-}
-
 func addFixedFieldBatchPostingDelta(fieldDelta map[uint64]batchPostingDelta, key uint64, idx uint64, isAdd bool) map[uint64]batchPostingDelta {
 	if fieldDelta == nil {
 		fieldDelta = getFixedBatchPostingDeltaMap()
@@ -429,7 +415,7 @@ func applyBatchPostingDeltaOwned(base posting.List, delta *batchPostingDelta) po
 
 	if !deltaValue.remove.IsEmpty() && !out.IsEmpty() {
 		out = out.Clone()
-		out.AndNotInPlace(deltaValue.remove)
+		out = out.BuildAndNot(deltaValue.remove)
 		changed = true
 	}
 
@@ -443,12 +429,12 @@ func applyBatchPostingDeltaOwned(base posting.List, delta *batchPostingDelta) po
 				out = out.Clone()
 				changed = true
 			}
-			out.OrInPlace(deltaValue.add)
+			out = out.BuildOr(deltaValue.add)
 		}
 	}
 
 	if changed && shouldOptimizeAfterBatchDelta(base, deltaValue, out) {
-		out.Optimize()
+		out = out.BuildOptimized()
 	}
 	if releaseRemove {
 		deltaValue.remove.Release()
@@ -1606,22 +1592,23 @@ func (db *DB[K, V]) buildPreparedSnapshotAggregatedNoLock(
 	}
 
 	universeOwned := false
-	ensureUniverse := func() *posting.List {
+	ensureUniverseOwned := func() {
 		if universeOwned {
-			return &next.universe
+			return
 		}
 		next.universe = next.universe.Clone()
 		universeOwned = true
-		return &next.universe
 	}
 
 	for i := range normalized {
 		op := normalized[i]
 		switch {
 		case op.oldVal == nil && op.newVal != nil:
-			ensureUniverse().Add(op.idx)
+			ensureUniverseOwned()
+			next.universe = next.universe.BuildAdded(op.idx)
 		case op.oldVal != nil && op.newVal == nil:
-			ensureUniverse().Remove(op.idx)
+			ensureUniverseOwned()
+			next.universe = next.universe.BuildRemoved(op.idx)
 		}
 		db.collectSnapshotBatchEntryDiffs(op, &deltas, prev.lenZeroComplement)
 	}

@@ -11,6 +11,13 @@ import (
 	"github.com/vapstack/rbi/internal/posting"
 )
 
+var (
+	_ preparedRouteEqUint64 = (*DB[uint64, Rec])(nil)
+	_ preparedRouteEqString = (*DB[string, Rec])(nil)
+	_ preparedRouteEqUint64 = (*queryView[uint64, Rec])(nil)
+	_ preparedRouteEqString = (*queryView[string, Rec])(nil)
+)
+
 func (db *DB[K, V]) rootDB() *DB[K, V] { return db }
 
 func (db *DB[K, V]) currentQueryViewForTests() *queryView[K, V] {
@@ -141,7 +148,8 @@ func (db *DB[K, V]) tryQueryPrefixNoOrderWithLimit(q *qx.QX, trace *queryTrace) 
 }
 
 func (db *DB[K, V]) buildPredicatesOrderedWithMode(leaves []qx.Expr, orderField string, allowMaterialize bool, orderedWindow int, coverOrderRange bool, allowOrderedEagerMaterialize bool) ([]predicate, bool) {
-	return db.currentQueryViewForTests().buildPredicatesOrderedWithMode(leaves, orderField, allowMaterialize, orderedWindow, coverOrderRange, allowOrderedEagerMaterialize)
+	preds, owner, ok := db.currentQueryViewForTests().buildPredicatesOrderedWithMode(leaves, orderField, allowMaterialize, orderedWindow, coverOrderRange, allowOrderedEagerMaterialize)
+	return detachPredicatesForTests(preds, owner), ok
 }
 
 func (db *DB[K, V]) execPlanOrderedBasic(q *qx.QX, preds []predicate, trace *queryTrace) ([]K, bool) {
@@ -169,7 +177,7 @@ func (db *DB[K, V]) execPlanORNoOrderBaseline(q *qx.QX, branches plannerORBranch
 }
 
 func (db *DB[K, V]) execPlanOROrderBasic(q *qx.QX, branches plannerORBranches, trace *queryTrace) ([]K, bool) {
-	return db.currentQueryViewForTests().execPlanOROrderBasic(q, branches, trace)
+	return db.currentQueryViewForTests().execPlanOROrderBasic(q, branches, trace, nil)
 }
 
 func (db *DB[K, V]) execPlanOROrderMergeFallback(q *qx.QX, branches plannerORBranches, trace *queryTrace) ([]K, bool, error) {
@@ -213,11 +221,13 @@ func (db *DB[K, V]) shouldUseOROrderKWayRuntimeFallback(q *qx.QX, branches plann
 }
 
 func (db *DB[K, V]) buildPredicates(leaves []qx.Expr) ([]predicate, bool) {
-	return db.currentQueryViewForTests().buildPredicates(leaves)
+	preds, owner, ok := db.currentQueryViewForTests().buildPredicates(leaves)
+	return detachPredicatesForTests(preds, owner), ok
 }
 
 func (db *DB[K, V]) buildPredicatesOrdered(leaves []qx.Expr, orderField string) ([]predicate, bool) {
-	return db.currentQueryViewForTests().buildPredicatesOrdered(leaves, orderField)
+	preds, owner, ok := db.currentQueryViewForTests().buildPredicatesOrdered(leaves, orderField)
+	return detachPredicatesForTests(preds, owner), ok
 }
 
 func (db *DB[K, V]) shouldPreferExecutionNoOrderPrefix(q *qx.QX, leaves []qx.Expr) bool {
@@ -237,7 +247,33 @@ func (db *DB[K, V]) countPostingResult(b postingResult) uint64 {
 }
 
 func (db *DB[K, V]) buildPredicatesWithMode(leaves []qx.Expr, allowMaterialize bool) ([]predicate, bool) {
-	return db.currentQueryViewForTests().buildPredicatesWithMode(leaves, allowMaterialize)
+	preds, owner, ok := db.currentQueryViewForTests().buildPredicatesWithMode(leaves, allowMaterialize)
+	return detachPredicatesForTests(preds, owner), ok
+}
+
+func (db *DB[K, V]) buildCountPredicatesWithMode(leaves []qx.Expr, allowMaterialize bool) ([]predicate, bool) {
+	preds, owner, ok := db.currentQueryViewForTests().buildCountPredicatesWithMode(leaves, allowMaterialize)
+	return detachPredicatesForTests(preds, owner), ok
+}
+
+func detachPredicatesForTests(preds []predicate, owner *predicateSliceBuf) []predicate {
+	if owner == nil {
+		return preds
+	}
+	out := append(make([]predicate, 0, len(preds)), preds...)
+	owner.values = preds
+	releasePredicateSliceBuf(owner)
+	return out
+}
+
+func detachCountLeadResidualExactFiltersForTests(filters []countLeadResidualExactFilter, owner *countLeadResidualExactFilterSliceBuf) []countLeadResidualExactFilter {
+	if owner == nil {
+		return filters
+	}
+	out := append(make([]countLeadResidualExactFilter, 0, len(filters)), filters...)
+	owner.values = filters
+	releaseCountLeadResidualExactFilterSliceBuf(owner)
+	return out
 }
 
 func (db *DB[K, V]) prepareCountPredicate(p *predicate, probeEst uint64, universe uint64) error {
@@ -245,7 +281,19 @@ func (db *DB[K, V]) prepareCountPredicate(p *predicate, probeEst uint64, univers
 }
 
 func (db *DB[K, V]) buildCountLeadResidualExactFilters(preds []predicate, active []int) []countLeadResidualExactFilter {
-	return db.currentQueryViewForTests().buildCountLeadResidualExactFilters(preds, active)
+	qv := db.currentQueryViewForTests()
+	candidatesBuf := getIntSliceBuf(len(active))
+	candidates := qv.collectCountLeadResidualExactCandidatesInto(candidatesBuf.values[:0], preds, active, nil)
+	defer func() {
+		candidatesBuf.values = candidates
+		releaseIntSliceBuf(candidatesBuf)
+	}()
+	if len(candidates) == 0 {
+		return nil
+	}
+	filtersBuf := getCountLeadResidualExactFilterSliceBuf(len(candidates))
+	filters := qv.buildCountLeadResidualExactFiltersByCandidatesInto(filtersBuf.values[:0], preds, candidates)
+	return detachCountLeadResidualExactFiltersForTests(filters, filtersBuf)
 }
 
 func (db *DB[K, V]) tryCountByPredicatesLeadBuckets(preds []predicate, leadIdx int, active []int) (uint64, uint64, bool) {
@@ -329,24 +377,19 @@ func unionPostingConsumerSets(src []posting.List) []uint64 {
 }
 
 func TestQueryViewParallelBatchedPostingUnionKeepsInputsStable(t *testing.T) {
-	view := (&DB[uint64, Rec]{
-		fields:  map[string]*field{},
-		options: &Options{},
-	}).currentQueryViewForTests()
-
 	sources := make([]posting.List, 0, 320)
 	sourceWants := make([][]uint64, 0, 320)
 	for i := 0; i < 320; i++ {
 		var ids posting.List
 		base := uint64(i * 16)
-		ids.Add(base + 1)
-		ids.Add(base + 3)
-		ids.Add(base + 5)
+		ids = ids.BuildAdded(base + 1)
+		ids = ids.BuildAdded(base + 3)
+		ids = ids.BuildAdded(base + 5)
 		if i%3 == 0 {
-			ids.Add(1 << 32)
+			ids = ids.BuildAdded(1 << 32)
 		}
 		if i%7 == 0 {
-			ids.Add(2<<32 | uint64(i))
+			ids = ids.BuildAdded(2<<32 | uint64(i))
 		}
 		sourceWants = append(sourceWants, ids.ToArray())
 		sources = append(sources, ids)
@@ -373,13 +416,13 @@ func TestQueryViewParallelBatchedPostingUnionKeepsInputsStable(t *testing.T) {
 		wg.Add(1)
 		go func(id uint64) {
 			defer wg.Done()
-			out := view.parallelBatchedPostingUnion(posts)
+			out := parallelBatchedPostingUnionOwned(posts)
 			if !slices.Equal(out.ToArray(), want) {
 				setFailed(fmt.Sprintf("union mismatch: got=%v want=%v", out.ToArray(), want))
 				out.Release()
 				return
 			}
-			out.Add(9<<32 | id)
+			out = out.BuildAdded(9<<32 | id)
 			out.Release()
 		}(uint64(g))
 	}

@@ -36,11 +36,12 @@ func TestOpenBenchDBFailsFastOnLockedDB(t *testing.T) {
 
 func TestBuildRBIOptions(t *testing.T) {
 	opts := buildRBIOptions(DBConfig{
-		AnalyzeInterval:  -1,
-		CalibrationOn:    true,
-		CalibrationEvery: -1,
-		TraceSink:        func(rbi.TraceEvent) {},
-		TraceSampleEvery: 17,
+		AnalyzeInterval:      -1,
+		CalibrationOn:        true,
+		CalibrationEvery:     -1,
+		DisableRuntimeCaches: true,
+		TraceSink:            func(rbi.TraceEvent) {},
+		TraceSampleEvery:     17,
 	})
 
 	if !opts.EnableAutoBatchStats || !opts.EnableSnapshotStats {
@@ -51,6 +52,18 @@ func TestBuildRBIOptions(t *testing.T) {
 	}
 	if !opts.CalibrationEnabled || opts.CalibrationSampleEvery != -1 {
 		t.Fatalf("calibration = enabled:%t every:%d, want true/-1", opts.CalibrationEnabled, opts.CalibrationSampleEvery)
+	}
+	if opts.SnapshotMaterializedPredCacheMaxEntries != -1 {
+		t.Fatalf("SnapshotMaterializedPredCacheMaxEntries = %d, want -1", opts.SnapshotMaterializedPredCacheMaxEntries)
+	}
+	if opts.NumericRangeBucketSize != -1 {
+		t.Fatalf("NumericRangeBucketSize = %d, want -1", opts.NumericRangeBucketSize)
+	}
+	if opts.NumericRangeBucketMinFieldKeys != -1 {
+		t.Fatalf("NumericRangeBucketMinFieldKeys = %d, want -1", opts.NumericRangeBucketMinFieldKeys)
+	}
+	if opts.NumericRangeBucketMinSpanKeys != -1 {
+		t.Fatalf("NumericRangeBucketMinSpanKeys = %d, want -1", opts.NumericRangeBucketMinSpanKeys)
 	}
 	if opts.TraceSink == nil || opts.TraceSampleEvery != 17 {
 		t.Fatalf("trace = sink:%v every:%d, want non-nil/17", opts.TraceSink == nil, opts.TraceSampleEvery)

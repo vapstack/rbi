@@ -15,13 +15,17 @@ func writeUvarint(writer *bufio.Writer, v uint64) error {
 	return err
 }
 
-// List keeps posting ids in an adaptive representation:
+// List is a 16-byte value handle over adaptive posting payloads.
+// Production code must keep it value-shaped: pass and return List by value,
+// never as *List.
+//
+// It keeps posting ids in an adaptive representation:
 // singleton id for cardinality=1, inline small posting for tiny sets,
 // large posting for larger sets.
 //
 // Encoding:
 //   - ptr == nil: empty
-//   - ptr == singleSentinelPtr: single value (in single)
+//   - ptr == singleValue: single value (in single)
 //   - ptr != nil && single metadata says small: small
 //   - ptr != nil && single metadata says mid: mid
 //   - ptr != nil && single metadata says large: large posting
@@ -30,9 +34,7 @@ type List struct {
 	single uint64
 }
 
-var singleSentinel byte
-
-var singleSentinelPtr = unsafe.Pointer(&singleSentinel)
+var singleValue = unsafe.Pointer(new(byte))
 
 const (
 	postingMetaBorrowed uint64 = 1 << 63
@@ -87,7 +89,7 @@ func cloneMidPosting(mp *midPosting) *midPosting {
 
 func singleton(id uint64) List {
 	return List{
-		ptr:    singleSentinelPtr,
+		ptr:    singleValue,
 		single: id,
 	}
 }
@@ -167,17 +169,16 @@ func BuildFromSorted(ids []uint64) List {
 		lp := getLargePosting()
 		lp.addMany(ids)
 		out := largeValue(lp)
-		out.Optimize()
-		return out
+		return out.BuildOptimized()
 	}
 }
 
 func (p List) isSmall() bool {
-	return p.ptr != nil && p.ptr != singleSentinelPtr && p.kind() == postingKindSmall
+	return p.ptr != nil && p.ptr != singleValue && p.kind() == postingKindSmall
 }
 
 func (p List) isMid() bool {
-	return p.ptr != nil && p.ptr != singleSentinelPtr && p.kind() == postingKindMid
+	return p.ptr != nil && p.ptr != singleValue && p.kind() == postingKindMid
 }
 
 func (p List) small() *smallPosting {
@@ -215,7 +216,7 @@ func (it *arrayIter) Next() uint64 {
 	return v
 }
 
-func (p List) isSingleton() bool { return p.ptr == singleSentinelPtr }
+func (p List) isSingleton() bool { return p.ptr == singleValue }
 
 func (p List) kind() uint64 {
 	return p.single & postingMetaKindMask
@@ -244,19 +245,9 @@ func (p List) SharesPayload(other List) bool {
 	}
 }
 
-func (p *List) ensureOwned() {
-	if p == nil || !p.IsBorrowed() {
-		return
-	}
-	*p = p.Clone()
-}
-
-func (p *List) compactFilterByMembership(other List, keepMatches bool) {
-	if p == nil {
-		return
-	}
-	if sp := p.small(); sp != nil {
-		if p.IsBorrowed() {
+func compactFilterByMembership(ids List, other List, keepMatches bool) List {
+	if sp := ids.small(); sp != nil {
+		if ids.IsBorrowed() {
 			var kept [SmallCap]uint64
 			n := 0
 			for i := 0; i < int(sp.n); i++ {
@@ -266,8 +257,7 @@ func (p *List) compactFilterByMembership(other List, keepMatches bool) {
 					n++
 				}
 			}
-			*p = compactListFromSorted(kept[:n])
-			return
+			return compactListFromSorted(kept[:n])
 		}
 		n := 0
 		for i := 0; i < int(sp.n); i++ {
@@ -281,18 +271,18 @@ func (p *List) compactFilterByMembership(other List, keepMatches bool) {
 		switch n {
 		case 0:
 			releaseSmallPosting(sp)
-			*p = List{}
+			return List{}
 		case 1:
 			keep := sp.ids[0]
 			releaseSmallPosting(sp)
-			*p = singleton(keep)
+			return singleton(keep)
 		default:
 			sp.n = uint8(n)
+			return ids
 		}
-		return
 	}
-	if mp := p.mid(); mp != nil {
-		if p.IsBorrowed() {
+	if mp := ids.mid(); mp != nil {
+		if ids.IsBorrowed() {
 			var kept [MidCap]uint64
 			n := 0
 			for i := 0; i < int(mp.n); i++ {
@@ -302,8 +292,7 @@ func (p *List) compactFilterByMembership(other List, keepMatches bool) {
 					n++
 				}
 			}
-			*p = compactListFromSorted(kept[:n])
-			return
+			return compactListFromSorted(kept[:n])
 		}
 		n := 0
 		for i := 0; i < int(mp.n); i++ {
@@ -317,21 +306,23 @@ func (p *List) compactFilterByMembership(other List, keepMatches bool) {
 		switch {
 		case n == 0:
 			releaseMidPosting(mp)
-			*p = List{}
+			return List{}
 		case n == 1:
 			keep := mp.ids[0]
 			releaseMidPosting(mp)
-			*p = singleton(keep)
+			return singleton(keep)
 		case n <= SmallCap:
 			sp := acquireSmallPosting()
 			sp.n = uint8(n)
 			copy(sp.ids[:n], mp.ids[:n])
 			releaseMidPosting(mp)
-			*p = smallValue(sp)
+			return smallValue(sp)
 		default:
 			mp.n = uint8(n)
+			return ids
 		}
 	}
+	return ids
 }
 
 func (p List) largeRef() *largePosting {
@@ -430,14 +421,6 @@ func (p List) Cardinality() uint64 {
 	return p.largeRef().cardinality()
 }
 
-func (p *List) Clear() {
-	if p == nil || p.IsEmpty() {
-		return
-	}
-	p.Release()
-	*p = List{}
-}
-
 func (p List) Contains(id uint64) bool {
 	if p.ptr == nil {
 		return false
@@ -470,67 +453,6 @@ func (p List) Contains(id uint64) bool {
 	return p.largeRef().contains(id)
 }
 
-func (p *List) CheckedAdd(id uint64) bool {
-	if p == nil {
-		return false
-	}
-	next, added := buildAddedChecked(*p, id)
-	if added {
-		*p = next
-	}
-	return added
-}
-
-func (p *List) AddMany(ids []uint64) {
-	if p == nil || len(ids) == 0 {
-		return
-	}
-
-	if lp := p.largeRef(); lp != nil {
-		if p.IsBorrowed() {
-			*p = p.Clone()
-			lp = p.largeRef()
-		}
-		lp.addMany(ids)
-		return
-	}
-
-	if len(ids) <= MidCap {
-		for _, id := range ids {
-			p.Add(id)
-		}
-		return
-	}
-
-	current := *p
-	lp := getLargePosting()
-	switch {
-	case current.IsEmpty():
-	case current.isSingleton():
-		lp.add(current.single)
-	case current.isSmall():
-		sp := current.small()
-		for i := 0; i < int(sp.n); i++ {
-			lp.add(sp.ids[i])
-		}
-		if !current.IsBorrowed() {
-			releaseSmallPosting(sp)
-		}
-	case current.isMid():
-		mp := current.mid()
-		for i := 0; i < int(mp.n); i++ {
-			lp.add(mp.ids[i])
-		}
-		if !current.IsBorrowed() {
-			releaseMidPosting(mp)
-		}
-	default:
-		panic("unsupported posting representation")
-	}
-	lp.addMany(ids)
-	*p = fromLargeOwned(lp)
-}
-
 func isNonDecreasingU64(dat []uint64) bool {
 	for i := 1; i < len(dat); i++ {
 		if dat[i] < dat[i-1] {
@@ -538,13 +460,6 @@ func isNonDecreasingU64(dat []uint64) bool {
 		}
 	}
 	return true
-}
-
-func (p *List) Remove(id uint64) {
-	if p == nil || p.IsEmpty() {
-		return
-	}
-	*p = buildRemoved(*p, id)
 }
 
 func (p List) Minimum() (uint64, bool) {
@@ -765,17 +680,6 @@ func (p List) ForEachIntersecting(other List, fn func(uint64) bool) bool {
 	return stop
 }
 
-func (p List) OrInto(dst *List) {
-	dst.OrInPlace(p)
-}
-
-func (p List) AndNotFrom(dst *List) {
-	if dst == nil || dst.IsEmpty() || p.IsEmpty() {
-		return
-	}
-	dst.AndNotInPlace(p)
-}
-
 func (p List) Iter() Iterator {
 	if p.IsEmpty() {
 		return emptyIterator()
@@ -848,40 +752,6 @@ func (p List) andIntoLarge(dst *largePosting) {
 	dst.and(p.largeRef())
 }
 
-func (p *List) AndInPlace(other List) {
-	if p == nil {
-		return
-	}
-	if p.SharesPayload(other) {
-		return
-	}
-	if p.IsEmpty() || other.IsEmpty() {
-		p.Release()
-		*p = List{}
-		return
-	}
-	if id, ok := p.TrySingle(); ok {
-		if !other.Contains(id) {
-			*p = List{}
-		}
-		return
-	}
-	if lp := p.largeRef(); lp != nil {
-		if p.IsBorrowed() {
-			*p = p.Clone()
-			lp = p.largeRef()
-		}
-		other.andIntoLarge(lp)
-		if lp.isEmpty() {
-			releaseLargePosting(lp)
-			*p = List{}
-			return
-		}
-		return
-	}
-	p.compactFilterByMembership(other, true)
-}
-
 func (p List) Clone() List {
 	if p.IsEmpty() || p.isSingleton() {
 		return p
@@ -895,75 +765,41 @@ func (p List) Clone() List {
 	return largeValue(cloneLargeShared(p.largeRef()))
 }
 
-func (p *List) Add(id uint64) {
-	if p == nil {
-		return
+func (p List) CloneInto(dst List) List {
+	if dst.SharesPayload(p) {
+		return p.Clone()
 	}
-	*p = buildAdded(*p, id)
-}
-
-func (p *List) OrInPlace(other List) {
-	if p == nil || other.IsEmpty() {
-		return
-	}
-	if p.IsEmpty() {
-		*p = other.Clone()
-		return
-	}
-	if p.SharesPayload(other) {
-		return
-	}
-	if other.isSingleton() {
-		p.Add(other.single)
-		return
-	}
-	if sp := other.small(); sp != nil {
-		for i := 0; i < int(sp.n); i++ {
-			p.Add(sp.ids[i])
-		}
-		return
-	}
-	if mp := other.mid(); mp != nil {
-		for i := 0; i < int(mp.n); i++ {
-			p.Add(mp.ids[i])
-		}
-		return
-	}
-	if p.isSingleton() {
-		lp := getLargePosting()
-		lp.add(p.single)
-		lp.or(other.largeRef())
-		*p = largeValue(lp)
-		return
+	if p.IsEmpty() || p.isSingleton() {
+		dst.Release()
+		return p
 	}
 	if sp := p.small(); sp != nil {
-		lp := getLargePosting()
-		for i := 0; i < int(sp.n); i++ {
-			lp.add(sp.ids[i])
+		if cur := dst.small(); cur != nil && !dst.IsBorrowed() {
+			*cur = *sp
+			return smallValue(cur)
 		}
-		lp.or(other.largeRef())
-		if !p.IsBorrowed() {
-			releaseSmallPosting(sp)
-		}
-		*p = largeValue(lp)
-		return
+		dst.Release()
+		return smallValue(cloneSmallPosting(sp))
 	}
 	if mp := p.mid(); mp != nil {
-		lp := getLargePosting()
-		for i := 0; i < int(mp.n); i++ {
-			lp.add(mp.ids[i])
+		if cur := dst.mid(); cur != nil && !dst.IsBorrowed() {
+			*cur = *mp
+			return midValue(cur)
 		}
-		lp.or(other.largeRef())
-		if !p.IsBorrowed() {
-			releaseMidPosting(mp)
-		}
-		*p = largeValue(lp)
-		return
+		dst.Release()
+		return midValue(cloneMidPosting(mp))
 	}
-	if p.IsBorrowed() {
-		*p = p.Clone()
+	src := p.largeRef()
+	if src == nil {
+		dst.Release()
+		return List{}
 	}
-	p.largeRef().or(other.largeRef())
+	if cur := dst.largeRef(); cur != nil && !dst.IsBorrowed() {
+		src.cloneSharedInto(cur)
+		return largeValue(cur)
+	}
+	dst.Release()
+	return largeValue(src.cloneSharedInto(newLargePosting()))
 }
 
 func (p List) BuildRemoved(idx uint64) List {
@@ -1089,6 +925,60 @@ func buildRemoved(ids List, idx uint64) List {
 
 func (p List) BuildAdded(idx uint64) List {
 	return buildAdded(p, idx)
+}
+
+func (p List) BuildAddedChecked(idx uint64) (List, bool) {
+	return buildAddedChecked(p, idx)
+}
+
+func (p List) BuildAddedMany(ids []uint64) List {
+	if len(ids) == 0 {
+		return p
+	}
+
+	if lp := p.largeRef(); lp != nil {
+		if p.IsBorrowed() {
+			p = p.Clone()
+			lp = p.largeRef()
+		}
+		lp.addMany(ids)
+		return p
+	}
+
+	if len(ids) <= MidCap {
+		for _, id := range ids {
+			p = buildAdded(p, id)
+		}
+		return p
+	}
+
+	current := p
+	lp := getLargePosting()
+	switch {
+	case current.IsEmpty():
+	case current.isSingleton():
+		lp.add(current.single)
+	case current.isSmall():
+		sp := current.small()
+		for i := 0; i < int(sp.n); i++ {
+			lp.add(sp.ids[i])
+		}
+		if !current.IsBorrowed() {
+			releaseSmallPosting(sp)
+		}
+	case current.isMid():
+		mp := current.mid()
+		for i := 0; i < int(mp.n); i++ {
+			lp.add(mp.ids[i])
+		}
+		if !current.IsBorrowed() {
+			releaseMidPosting(mp)
+		}
+	default:
+		panic("unsupported posting representation")
+	}
+	lp.addMany(ids)
+	return fromLargeOwned(lp)
 }
 
 func buildAddedChecked(ids List, idx uint64) (List, bool) {
@@ -1274,84 +1164,154 @@ func buildAdded(ids List, idx uint64) List {
 	}
 }
 
-func (p *List) AndNotInPlace(other List) {
-	if p == nil || p.IsEmpty() || other.IsEmpty() {
-		return
+func (p List) BuildAnd(other List) List {
+	if p.SharesPayload(other) {
+		return p
+	}
+	if p.IsEmpty() || other.IsEmpty() {
+		p.Release()
+		return List{}
+	}
+	if id, ok := p.TrySingle(); ok {
+		if !other.Contains(id) {
+			p.Release()
+			return List{}
+		}
+		return p
+	}
+	if lp := p.largeRef(); lp != nil {
+		if p.IsBorrowed() {
+			p = p.Clone()
+			lp = p.largeRef()
+		}
+		other.andIntoLarge(lp)
+		if lp.isEmpty() {
+			releaseLargePosting(lp)
+			return List{}
+		}
+		return p
+	}
+	return compactFilterByMembership(p, other, true)
+}
+
+func (p List) BuildOr(other List) List {
+	if other.IsEmpty() {
+		return p
+	}
+	if p.IsEmpty() {
+		return other.Clone()
+	}
+	if p.SharesPayload(other) {
+		return p
+	}
+	if other.isSingleton() {
+		return buildAdded(p, other.single)
+	}
+	if sp := other.small(); sp != nil {
+		for i := 0; i < int(sp.n); i++ {
+			p = buildAdded(p, sp.ids[i])
+		}
+		return p
+	}
+	if mp := other.mid(); mp != nil {
+		for i := 0; i < int(mp.n); i++ {
+			p = buildAdded(p, mp.ids[i])
+		}
+		return p
+	}
+	if p.isSingleton() {
+		lp := getLargePosting()
+		lp.add(p.single)
+		lp.or(other.largeRef())
+		return largeValue(lp)
+	}
+	if sp := p.small(); sp != nil {
+		lp := getLargePosting()
+		for i := 0; i < int(sp.n); i++ {
+			lp.add(sp.ids[i])
+		}
+		lp.or(other.largeRef())
+		if !p.IsBorrowed() {
+			releaseSmallPosting(sp)
+		}
+		return largeValue(lp)
+	}
+	if mp := p.mid(); mp != nil {
+		lp := getLargePosting()
+		for i := 0; i < int(mp.n); i++ {
+			lp.add(mp.ids[i])
+		}
+		lp.or(other.largeRef())
+		if !p.IsBorrowed() {
+			releaseMidPosting(mp)
+		}
+		return largeValue(lp)
+	}
+	if p.IsBorrowed() {
+		p = p.Clone()
+	}
+	p.largeRef().or(other.largeRef())
+	return p
+}
+
+func (p List) BuildAndNot(other List) List {
+	if p.IsEmpty() || other.IsEmpty() {
+		return p
 	}
 	if p.SharesPayload(other) {
 		p.Release()
-		*p = List{}
-		return
+		return List{}
 	}
 	if id, ok := p.TrySingle(); ok {
 		if other.Contains(id) {
-			*p = List{}
+			p.Release()
+			return List{}
 		}
-		return
+		return p
 	}
 	if p.isSmall() || p.isMid() {
-		p.compactFilterByMembership(other, false)
-		return
+		return compactFilterByMembership(p, other, false)
 	}
 	if sp := other.small(); sp != nil {
 		for i := 0; i < int(sp.n) && !p.IsEmpty(); i++ {
-			*p = buildRemoved(*p, sp.ids[i])
+			p = buildRemoved(p, sp.ids[i])
 		}
-		return
+		return p
 	}
 	if mp := other.mid(); mp != nil {
 		for i := 0; i < int(mp.n) && !p.IsEmpty(); i++ {
-			*p = buildRemoved(*p, mp.ids[i])
+			p = buildRemoved(p, mp.ids[i])
 		}
-		return
-	}
-	if p.isSmall() {
-		out := *p
-		other.ForEach(func(idx uint64) bool {
-			out = buildRemoved(out, idx)
-			return !out.IsEmpty()
-		})
-		*p = out
-		return
-	}
-	if p.isMid() {
-		out := *p
-		other.ForEach(func(idx uint64) bool {
-			out = buildRemoved(out, idx)
-			return !out.IsEmpty()
-		})
-		*p = out
-		return
+		return p
 	}
 	if id, ok := other.TrySingle(); ok {
-		*p = buildRemoved(*p, id)
-		return
+		return buildRemoved(p, id)
 	}
 	if p.IsBorrowed() {
-		*p = p.Clone()
+		p = p.Clone()
 	}
 	p.largeRef().andNot(other.largeRef())
 	if p.largeRef().isEmpty() {
 		releaseLargePosting(p.largeRef())
-		*p = List{}
-		return
+		return List{}
 	}
+	return p
 }
 
-func (p *List) Optimize() {
-	if p == nil || p.ptr == nil || p.isSingleton() || p.isSmall() || p.isMid() {
-		return
+func (p List) BuildOptimized() List {
+	if p.ptr == nil || p.isSingleton() || p.isSmall() || p.isMid() {
+		return p
 	}
 	if p.IsBorrowed() {
-		*p = p.Clone()
+		p = p.Clone()
 	}
 	lp := p.largeRef()
 	card := lp.cardinality()
 	if card <= MidCap {
-		*p = fromLargeOwnedWithCardinality(lp, card)
-		return
+		return fromLargeOwnedWithCardinality(lp, card)
 	}
 	lp.runOptimize()
+	return p
 }
 
 func (p List) WriteTo(writer *bufio.Writer) error {
@@ -1436,7 +1396,7 @@ func readCompactPostingValues(reader *bufio.Reader, ids []uint64, kind string) e
 	return nil
 }
 
-func readFrom(reader *bufio.Reader) (List, error) {
+func ReadFrom(reader *bufio.Reader) (List, error) {
 	tag, err := reader.ReadByte()
 	if err != nil {
 		return List{}, err
@@ -1502,20 +1462,6 @@ func readFrom(reader *bufio.Reader) (List, error) {
 	}
 }
 
-func (p *List) ReadFrom(reader *bufio.Reader) error {
-	if p == nil {
-		return fmt.Errorf("nil List receiver")
-	}
-	next, err := readFrom(reader)
-	if err != nil {
-		return err
-	}
-	prev := *p
-	*p = next
-	releaseOwned(prev)
-	return nil
-}
-
 func (p List) Release() {
 	releaseOwned(p)
 }
@@ -1554,20 +1500,21 @@ func ClearMapOwned[K comparable](m map[K]List) {
 	clear(m)
 }
 
-func (p *List) MergeOwned(add List) {
-	mergeOwned(p, add)
-}
-
-func mergeOwned(dst *List, add List) {
-	if dst == nil || add.IsEmpty() {
-		return
+func (p List) BuildMergedOwned(add List) List {
+	if add.IsEmpty() {
+		return p
 	}
-	if dst.IsEmpty() {
-		*dst = add
-		return
+	if p.IsEmpty() {
+		return add
 	}
-	dst.OrInPlace(add)
-	releaseOwned(add)
+	if p.SharesPayload(add) {
+		return p
+	}
+	out := p.BuildOr(add)
+	if !out.SharesPayload(add) {
+		releaseOwned(add)
+	}
+	return out
 }
 
 func Skip(reader *bufio.Reader) error {

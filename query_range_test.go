@@ -472,12 +472,12 @@ func TestNumericRangeBucketSpanCache_ReusedForNearbyBounds(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected full bucket span for first bound")
 	}
-	cacheKey := materializedPredCacheKeyForNumericBucketSpan("age", start1, end1)
-	cached1, ok := snap.loadMaterializedPred(cacheKey)
+	cached1, ok := entry.loadFullSpan(start1, end1)
 	if !ok || cached1.IsEmpty() {
-		t.Fatalf("expected cached full bucket span after first evaluation")
+		t.Fatalf("expected local cached full bucket span after first evaluation")
 	}
-	countAfterFirst := snap.matPredCacheCount.Load()
+	cached1.Release()
+	countAfterFirst := entry.fullSpanCount.Load()
 
 	br2 := makeRange(2501)
 	start2, end2, ok := entry.idx.fullBucketSpan(br2)
@@ -492,8 +492,8 @@ func TestNumericRangeBucketSpanCache_ReusedForNearbyBounds(t *testing.T) {
 		t.Fatalf("expected numeric range bucket path for second bound")
 	}
 	out2.release()
-	if got := snap.matPredCacheCount.Load(); got != countAfterFirst {
-		t.Fatalf("expected cached span reuse without new entries: before=%d after=%d", countAfterFirst, got)
+	if got := entry.fullSpanCount.Load(); got != countAfterFirst {
+		t.Fatalf("expected cached local full span reuse without new entries: before=%d after=%d", countAfterFirst, got)
 	}
 }
 
@@ -550,11 +550,11 @@ func TestNumericRangeBucketSpanCache_ReusedFullSpanStillMergesEdgeBuckets(t *tes
 	if !ok {
 		t.Fatalf("expected full bucket span for first bound")
 	}
-	cacheKey := materializedPredCacheKeyForNumericBucketSpan("age", start1, end1)
-	cached, ok := snap.loadMaterializedPred(cacheKey)
+	cached, ok := entry.loadFullSpan(start1, end1)
 	if !ok || cached.IsEmpty() {
-		t.Fatalf("expected cached full bucket span after first evaluation")
+		t.Fatalf("expected local cached full bucket span after first evaluation")
 	}
+	cached.Release()
 
 	br2 := makeRange(2501)
 	start2, end2, ok := entry.idx.fullBucketSpan(br2)

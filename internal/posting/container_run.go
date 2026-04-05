@@ -87,18 +87,6 @@ func deleteInterval16At(iv []interval16, idx int) []interval16 {
 	return iv[:last]
 }
 
-func appendMergedInterval16(iv []interval16, next interval16) []interval16 {
-	if len(iv) == 0 {
-		return append(iv, next)
-	}
-	last := len(iv) - 1
-	if !canMerge16(iv[last], next) {
-		return append(iv, next)
-	}
-	iv[last] = mergeInterval16s(iv[last], next)
-	return iv
-}
-
 func appendMergedInterval16AndCardinality(iv []interval16, card int, next interval16) ([]interval16, int) {
 	if len(iv) == 0 {
 		return append(iv, next), next.runlen()

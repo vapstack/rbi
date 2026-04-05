@@ -9,26 +9,37 @@ import (
 
 type leafPred struct {
 	kind          leafPredKind
+	pred          predicate
+	baseCore      orderBasicBaseCore
+	hasBaseCore   bool
 	posting       posting.List
 	posts         []posting.List
 	estCard       uint64
-	postingFilter func(*posting.List) bool
-	release       func()
+	postingFilter func(posting.List) (posting.List, bool)
+	postsBuf      *postingSliceBuf
+	postsAnyState *postsAnyFilterState
 }
 
 type leafPredKind uint8
 
 const (
 	leafPredKindEmpty leafPredKind = iota
+	leafPredKindPredicate
 	leafPredKindPosting
 	leafPredKindPostsConcat
 	leafPredKindPostsUnion
 	leafPredKindPostsAll
 )
 
+const leafPredSlicePoolMinLen = 3
+
 func (p leafPred) hasIter() bool {
 	switch p.kind {
-	case leafPredKindEmpty, leafPredKindPosting, leafPredKindPostsConcat, leafPredKindPostsUnion, leafPredKindPostsAll:
+	case leafPredKindEmpty:
+		return true
+	case leafPredKindPredicate:
+		return p.pred.hasIter()
+	case leafPredKindPosting, leafPredKindPostsConcat, leafPredKindPostsUnion, leafPredKindPostsAll:
 		return true
 	default:
 		return false
@@ -36,6 +47,9 @@ func (p leafPred) hasIter() bool {
 }
 
 func (p leafPred) leadIterNeedsContainsCheck() bool {
+	if p.kind == leafPredKindPredicate {
+		return p.pred.leadIterNeedsContainsCheck()
+	}
 	// HAS(list) uses one posting as iterator seed and must still validate
 	// remaining terms for each candidate.
 	return p.kind == leafPredKindPostsAll && len(p.posts) > 1
@@ -45,6 +59,8 @@ func (p leafPred) iterNew() posting.Iterator {
 	switch p.kind {
 	case leafPredKindEmpty:
 		return emptyIter{}
+	case leafPredKindPredicate:
+		return p.pred.newIter()
 	case leafPredKindPosting:
 		return p.posting.Iter()
 	case leafPredKindPostsConcat:
@@ -60,6 +76,8 @@ func (p leafPred) iterNew() posting.Iterator {
 
 func (p leafPred) containsIdx(idx uint64) bool {
 	switch p.kind {
+	case leafPredKindPredicate:
+		return p.pred.matches(idx)
 	case leafPredKindPosting:
 		return p.posting.Contains(idx)
 	case leafPredKindPostsConcat, leafPredKindPostsUnion:
@@ -83,10 +101,12 @@ func (p leafPred) containsIdx(idx uint64) bool {
 
 func (p leafPred) supportsExactBucketPostingFilter() bool {
 	switch p.kind {
+	case leafPredKindPredicate:
+		return p.pred.supportsExactBucketPostingFilter()
 	case leafPredKindPosting, leafPredKindPostsAll:
 		return true
 	case leafPredKindPostsConcat, leafPredKindPostsUnion:
-		return p.postingFilter != nil
+		return p.postsAnyState != nil || p.postingFilter != nil
 	default:
 		return false
 	}
@@ -96,6 +116,8 @@ func (p leafPred) countBucket(bucket posting.List) (uint64, bool) {
 	switch p.kind {
 	case leafPredKindEmpty:
 		return 0, true
+	case leafPredKindPredicate:
+		return p.pred.countBucket(bucket)
 	case leafPredKindPosting:
 		return p.posting.AndCardinality(bucket), true
 	case leafPredKindPostsConcat, leafPredKindPostsUnion:
@@ -107,43 +129,49 @@ func (p leafPred) countBucket(bucket posting.List) (uint64, bool) {
 	}
 }
 
-func (p leafPred) applyToPosting(dst *posting.List) bool {
-	if dst == nil {
-		return false
-	}
+func (p leafPred) applyToPosting(dst posting.List) (posting.List, bool) {
 	switch p.kind {
 	case leafPredKindEmpty:
-		dst.Clear()
-		return true
+		dst.Release()
+		return posting.List{}, true
+
+	case leafPredKindPredicate:
+		return p.pred.applyToPosting(dst)
 
 	case leafPredKindPosting:
-		dst.AndInPlace(p.posting)
-		return true
+		return dst.BuildAnd(p.posting), true
 
 	case leafPredKindPostsConcat, leafPredKindPostsUnion:
-		if p.postingFilter == nil {
-			return false
+		if p.postsAnyState != nil {
+			return p.postsAnyState.apply(dst)
 		}
-		return p.postingFilter(dst)
+		if p.postingFilter == nil {
+			return posting.List{}, false
+		}
+		next, ok := p.postingFilter(dst)
+		if !ok {
+			return posting.List{}, false
+		}
+		return next, true
 
 	case leafPredKindPostsAll:
 		if len(p.posts) == 0 {
-			dst.Clear()
-			return true
+			dst.Release()
+			return posting.List{}, true
 		}
 		for _, ids := range p.posts {
 			if ids.IsEmpty() {
-				dst.Clear()
-				return true
+				dst.Release()
+				return posting.List{}, true
 			}
-			dst.AndInPlace(ids)
+			dst = dst.BuildAnd(ids)
 			if dst.IsEmpty() {
-				return true
+				return dst, true
 			}
 		}
-		return true
+		return dst, true
 	}
-	return false
+	return posting.List{}, false
 }
 
 func (qv *queryView[K, V]) tryLimitQuery(q *qx.QX, trace *queryTrace) ([]K, bool, PlanName, error) {
@@ -154,10 +182,19 @@ func (qv *queryView[K, V]) tryLimitQuery(q *qx.QX, trace *queryTrace) ([]K, bool
 		return nil, false, "", nil
 	}
 
-	var leavesBuf [8]qx.Expr
-	leaves, ok := extractAndLeavesScratch(q.Expr, leavesBuf[:0])
+	leavesBuf := getExprSliceBuf(8)
+	defer releaseExprSliceBuf(leavesBuf)
+	leaves, ok := extractAndLeavesScratch(q.Expr, leavesBuf.values[:0])
 	if !ok || len(leaves) == 0 {
 		return nil, false, "", nil
+	}
+
+	if len(q.Order) == 0 && len(leaves) == 1 && isPositiveScalarPrefixLeaf(leaves[0]) {
+		out, used, err := qv.tryQueryPrefixNoOrderWithLimit(q, trace)
+		if !used {
+			return nil, false, "", err
+		}
+		return out, true, PlanLimitPrefixNoOrder, err
 	}
 
 	if len(q.Order) == 1 && q.Order[0].Type == qx.OrderBasic {
@@ -244,14 +281,33 @@ func (qv *queryView[K, V]) tryUniqueEqNoOrder(q *qx.QX, trace *queryTrace) ([]K,
 		return nil, false, nil
 	}
 
-	var leavesBuf [8]qx.Expr
-	leaves, ok := extractAndLeavesScratch(q.Expr, leavesBuf[:0])
+	leavesBuf := getExprSliceBuf(8)
+	defer releaseExprSliceBuf(leavesBuf)
+	leaves, ok := extractAndLeavesScratch(q.Expr, leavesBuf.values[:0])
 	if !ok || len(leaves) == 0 {
 		return nil, false, nil
 	}
 
-	preds := make([]leafPred, 0, len(leaves))
-	defer func() { releaseLeafPreds(preds) }()
+	hasUniqueLead := false
+	for _, e := range leaves {
+		if qv.isPositiveUniqueEqExpr(e) {
+			hasUniqueLead = true
+			break
+		}
+	}
+	if !hasUniqueLead {
+		return nil, false, nil
+	}
+
+	var predsBuf *leafPredSliceBuf
+	var preds []leafPred
+	if len(leaves) >= leafPredSlicePoolMinLen {
+		predsBuf = getLeafPredSliceBuf(len(leaves))
+		preds = predsBuf.values[:0]
+	} else {
+		preds = make([]leafPred, 0, len(leaves))
+	}
+	defer func() { releaseLeafPreds(preds, predsBuf) }()
 
 	uniqueLead := -1
 	sawEmpty := false
@@ -300,7 +356,7 @@ func (qv *queryView[K, V]) tryUniqueEqNoOrder(q *qx.QX, trace *queryTrace) ([]K,
 
 	needAll := q.Limit == 0
 	out := make([]K, 0, 1)
-	cursor := qv.newQueryCursor(out, 0, q.Limit, needAll, nil)
+	cursor := qv.newQueryCursor(out, 0, q.Limit, needAll, 0)
 
 	var examined uint64
 	for iter.HasNext() {
@@ -351,8 +407,15 @@ func hasPrefixBoundForField(leaves []qx.Expr, field string) bool {
 
 func (qv *queryView[K, V]) tryLimitQueryNoOrder(q *qx.QX, leaves []qx.Expr, trace *queryTrace) ([]K, bool, error) {
 
-	preds := make([]leafPred, 0, len(leaves))
-	defer func() { releaseLeafPreds(preds) }()
+	var predsBuf *leafPredSliceBuf
+	var preds []leafPred
+	if len(leaves) >= leafPredSlicePoolMinLen {
+		predsBuf = getLeafPredSliceBuf(len(leaves))
+		preds = predsBuf.values[:0]
+	} else {
+		preds = make([]leafPred, 0, len(leaves))
+	}
+	defer func() { releaseLeafPreds(preds, predsBuf) }()
 
 	for _, e := range leaves {
 		if isBoundOp(e.Op) {
@@ -381,7 +444,7 @@ func (qv *queryView[K, V]) tryLimitQueryNoOrder(q *qx.QX, leaves []qx.Expr, trac
 
 	limit := int(q.Limit)
 	out := make([]K, 0, limit)
-	cursor := qv.newQueryCursor(out, 0, q.Limit, false, nil)
+	cursor := qv.newQueryCursor(out, 0, q.Limit, false, 0)
 
 	iter := lead.iterNew()
 	defer iter.Release()
@@ -419,6 +482,7 @@ func (qv *queryView[K, V]) tryLimitQueryNoOrder(q *qx.QX, leaves []qx.Expr, trac
 
 func (qv *queryView[K, V]) tryLimitQueryOrderBasic(q *qx.QX, leaves []qx.Expr, trace *queryTrace) ([]K, bool, error) {
 	order := q.Order[0]
+	needWindow, _ := orderWindow(q)
 
 	f := order.Field
 	if f == "" {
@@ -446,23 +510,70 @@ func (qv *queryView[K, V]) tryLimitQueryOrderBasic(q *qx.QX, leaves []qx.Expr, t
 		return nil, true, nil
 	}
 
-	preds, ok, err := qv.buildLeafPredsExcludingBounds(leaves, f)
+	preds, predsBuf, ok, err := qv.buildLeafPredsExcludingBounds(leaves, f, needWindow)
 	if err != nil {
 		return nil, true, err
 	}
-	if !ok {
-		return nil, false, nil
-	}
-	defer func() { releaseLeafPreds(preds) }()
-	if hasEmptyLeafPred(preds) {
-		return nil, true, nil
-	}
-
 	br := ov.rangeForBounds(bounds)
 	if overlayRangeEmpty(br) && nilTailField == "" {
 		return nil, true, nil
 	}
-	return qv.scanLimitByOverlayBounds(q, ov, br, order.Desc, preds, nilTailField, trace), true, nil
+	if ok {
+		defer func() { releaseLeafPreds(preds, predsBuf) }()
+		if hasEmptyLeafPred(preds) {
+			return nil, true, nil
+		}
+		universe := qv.snapshotUniverseCardinality()
+		for i := range preds {
+			if preds[i].kind != leafPredKindPredicate || preds[i].pred.baseRangeState == nil {
+				continue
+			}
+			preds[i].pred.setExpectedContainsCalls(
+				orderedBaseRangeExpectedContainsCalls(preds[i].pred.baseRangeState, needWindow, universe),
+			)
+		}
+		execTrace := trace
+		var observedTrace queryTrace
+		observedStart := uint64(0)
+		if execTrace == nil {
+			execTrace = &observedTrace
+		} else {
+			observedStart = execTrace.ev.RowsExamined
+		}
+		out := qv.scanLimitByOverlayBounds(q, ov, br, order.Desc, preds, nilTailField, execTrace)
+		qv.promoteObservedLimitLeafPreds(f, preds, execTrace.ev.RowsExamined-observedStart, q.Limit)
+		return out, true, nil
+	}
+
+	window := needWindow
+	if window <= 0 {
+		return nil, false, nil
+	}
+	residualLeavesBuf := getExprSliceBuf(len(leaves))
+	defer releaseExprSliceBuf(residualLeavesBuf)
+	residualLeavesBuf.values = residualLeavesBuf.values[:0]
+	for _, e := range leaves {
+		if isBoundOp(e.Op) && !e.Not && e.Field == f {
+			continue
+		}
+		residualLeavesBuf.values = append(residualLeavesBuf.values, e)
+	}
+	if len(residualLeavesBuf.values) == 0 {
+		out, _ := qv.scanOrderLimitNoPredicates(q, ov, br, order.Desc, nilTailField, trace)
+		return out, true, nil
+	}
+	fullPreds, fullPredsBuf, ok := qv.buildPredicatesOrderedWithMode(residualLeavesBuf.values, f, false, window, false, true)
+	if !ok {
+		return nil, false, nil
+	}
+	defer releasePredicates(fullPreds, fullPredsBuf)
+	for i := range fullPreds {
+		if fullPreds[i].alwaysFalse {
+			return nil, true, nil
+		}
+	}
+	out, _ := qv.scanOrderLimitWithPredicates(q, ov, br, order.Desc, fullPreds, nilTailField, trace)
+	return out, true, nil
 }
 
 func (qv *queryView[K, V]) tryLimitQueryRangeNoOrderByField(q *qx.QX, field string, bounds rangeBounds, leaves []qx.Expr, trace *queryTrace) ([]K, bool, error) {
@@ -479,14 +590,14 @@ func (qv *queryView[K, V]) tryLimitQueryRangeNoOrderByField(q *qx.QX, field stri
 		return nil, true, nil
 	}
 
-	preds, ok, err := qv.buildLeafPredsExcludingBounds(leaves, field)
+	preds, predsBuf, ok, err := qv.buildLeafPredsExcludingBounds(leaves, field, 0)
 	if err != nil {
 		return nil, true, err
 	}
 	if !ok {
 		return nil, false, nil
 	}
-	defer func() { releaseLeafPreds(preds) }()
+	defer func() { releaseLeafPreds(preds, predsBuf) }()
 	if hasEmptyLeafPred(preds) {
 		return nil, true, nil
 	}
@@ -498,35 +609,78 @@ func (qv *queryView[K, V]) tryLimitQueryRangeNoOrderByField(q *qx.QX, field stri
 	return qv.scanLimitByOverlayBounds(q, ov, br, false, preds, "", trace), true, nil
 }
 
-func (qv *queryView[K, V]) buildLeafPredsExcludingBounds(leaves []qx.Expr, field string) ([]leafPred, bool, error) {
-	preds := make([]leafPred, 0, len(leaves))
-	for _, e := range leaves {
-		if isBoundOp(e.Op) {
-			if e.Not || e.Field == "" || e.Field != field {
-				releaseLeafPreds(preds)
-				return nil, false, nil
-			}
+func (qv *queryView[K, V]) buildLeafPredsExcludingBounds(leaves []qx.Expr, field string, orderedWindow int) ([]leafPred, *leafPredSliceBuf, bool, error) {
+	var predsBuf *leafPredSliceBuf
+	var preds []leafPred
+	if len(leaves) >= leafPredSlicePoolMinLen {
+		predsBuf = getLeafPredSliceBuf(len(leaves))
+		preds = predsBuf.values[:0]
+	} else {
+		preds = make([]leafPred, 0, len(leaves))
+	}
+	var mergedRangesBuf *orderedMergedScalarRangeFieldSliceBuf
+	var mergedRanges []orderedMergedScalarRangeField
+	if len(leaves) > 1 {
+		mergedRangesBuf = getOrderedMergedScalarRangeFieldSliceBuf(len(leaves))
+		var ok bool
+		mergedRanges, ok = qv.collectMergedNumericRangeFields(leaves, mergedRangesBuf.values[:0])
+		if !ok {
+			releaseLeafPreds(preds, predsBuf)
+			releaseOrderedMergedScalarRangeFieldSliceBuf(mergedRangesBuf)
+			return nil, nil, false, nil
+		}
+		defer func() {
+			mergedRangesBuf.values = mergedRanges
+			releaseOrderedMergedScalarRangeFieldSliceBuf(mergedRangesBuf)
+		}()
+	}
+	for i, e := range leaves {
+		if isBoundOp(e.Op) && !e.Not && e.Field == field {
 			continue
 		}
-		p, ok, err := qv.buildLeafPred(e)
+		if qv.isPositiveMergedNumericRangeLeaf(e) {
+			idx := findOrderedMergedScalarRangeField(mergedRanges, e.Field)
+			if idx >= 0 && mergedRanges[idx].count > 1 {
+				if mergedRanges[idx].first != i {
+					continue
+				}
+				p, ok, err := qv.buildMergedLimitLeafPred(mergedRanges[idx].expr, mergedRanges[idx].bounds, orderedWindow)
+				if err != nil {
+					releaseLeafPreds(preds, predsBuf)
+					return nil, nil, true, err
+				}
+				if !ok {
+					releaseLeafPreds(preds, predsBuf)
+					return nil, nil, false, nil
+				}
+				qv.attachLeafPredPostingFilter(&p)
+				preds = append(preds, p)
+				continue
+			}
+		}
+		p, ok, err := qv.buildLimitLeafPred(e, orderedWindow)
 		if err != nil {
-			releaseLeafPreds(preds)
-			return nil, true, err
+			releaseLeafPreds(preds, predsBuf)
+			return nil, nil, true, err
 		}
 		if !ok {
-			releaseLeafPreds(preds)
-			return nil, false, nil
+			releaseLeafPreds(preds, predsBuf)
+			return nil, nil, false, nil
 		}
 		qv.attachLeafPredPostingFilter(&p)
 		preds = append(preds, p)
 	}
-	return preds, true, nil
+	if len(preds) == 0 {
+		releaseLeafPreds(preds, predsBuf)
+		return nil, nil, true, nil
+	}
+	return preds, predsBuf, true, nil
 }
 
 func (qv *queryView[K, V]) scanLimitByOverlayBounds(q *qx.QX, ov fieldOverlay, br overlayRange, desc bool, preds []leafPred, nilTailField string, trace *queryTrace) []K {
 	limit := int(q.Limit)
 	out := make([]K, 0, limit)
-	cursor := qv.newQueryCursor(out, 0, q.Limit, false, nil)
+	cursor := qv.newQueryCursor(out, 0, q.Limit, false, 0)
 	trackScanWidth := len(q.Order) == 1
 	var (
 		examined  uint64
@@ -609,7 +763,8 @@ func (qv *queryView[K, V]) scanLimitByOverlayBounds(q *qx.QX, ov fieldOverlay, b
 		}
 
 		allowExact := plannerAllowExactBucketFilter(0, cursor.need, card, exactOnly, len(exactActive))
-		mode, exactIDs, _ := plannerFilterPostingByChecks(preds, exactActive, ids, &exactWork, allowExact)
+		mode, exactIDs, nextExactWork, _ := plannerFilterPostingByChecks(preds, exactActive, ids, exactWork, allowExact)
+		exactWork = nextExactWork
 		switch mode {
 		case plannerPredicateBucketEmpty:
 			examined += card
@@ -760,6 +915,7 @@ func isBoundOp(op qx.Op) bool {
 
 func (qv *queryView[K, V]) extractBoundsForField(field string, leaves []qx.Expr) (rangeBounds, bool, error) {
 	var b rangeBounds
+	found := false
 
 	for _, e := range leaves {
 		if !isBoundOp(e.Op) {
@@ -769,7 +925,7 @@ func (qv *queryView[K, V]) extractBoundsForField(field string, leaves []qx.Expr)
 			return b, false, nil
 		}
 		if e.Field != field {
-			return b, false, nil
+			continue
 		}
 
 		bound, isSlice, err := qv.exprValueToNormalizedScalarBound(e)
@@ -780,9 +936,10 @@ func (qv *queryView[K, V]) extractBoundsForField(field string, leaves []qx.Expr)
 			return b, false, nil
 		}
 		applyNormalizedScalarBound(&b, bound)
+		found = true
 	}
 
-	return b, true, nil
+	return b, found, nil
 }
 
 func applyBoundsToIndexRange(s []index, b rangeBounds) (start, end int) {
@@ -900,19 +1057,29 @@ func (qv *queryView[K, V]) buildLeafPred(e qx.Expr) (leafPred, bool, error) {
 			return leafPred{}, false, nil
 		}
 
-		posts, est, release := qv.scalarLookupPostings(e.Field, keys, hasNil)
+		posts, est, postsBuf := qv.scalarLookupPostings(e.Field, keys, hasNil)
 		if len(posts) == 0 {
-			if release != nil {
-				release()
+			if postsBuf != nil {
+				releasePostingSliceBuf(postsBuf)
 			}
 			return emptyLeaf(), true, nil
 		}
+		if len(posts) == 1 {
+			ids := posts[0]
+			return leafPred{
+				kind:     leafPredKindPosting,
+				posting:  ids,
+				estCard:  ids.Cardinality(),
+				posts:    posts,
+				postsBuf: postsBuf,
+			}, true, nil
+		}
 
 		return leafPred{
-			kind:    leafPredKindPostsConcat,
-			posts:   posts,
-			estCard: est,
-			release: release,
+			kind:     leafPredKindPostsConcat,
+			posts:    posts,
+			estCard:  est,
+			postsBuf: postsBuf,
 		}, true, nil
 
 	case qx.OpHAS:
@@ -947,18 +1114,12 @@ func (qv *queryView[K, V]) buildLeafPred(e qx.Expr) (leafPred, bool, error) {
 		}
 
 		lead := minCardPosting(posts)
-		var release func()
-		release = func() {
-			postsBuf.values = posts
-			releasePostingSliceBuf(postsBuf)
-		}
-
 		return leafPred{
-			kind:    leafPredKindPostsAll,
-			posting: lead,
-			posts:   posts,
-			estCard: est,
-			release: release,
+			kind:     leafPredKindPostsAll,
+			posting:  lead,
+			posts:    posts,
+			estCard:  est,
+			postsBuf: postsBuf,
 		}, true, nil
 
 	case qx.OpHASANY:
@@ -974,27 +1135,170 @@ func (qv *queryView[K, V]) buildLeafPred(e qx.Expr) (leafPred, bool, error) {
 			return leafPred{}, false, nil
 		}
 
-		posts, est, release := ov.lookupPostings(keys)
+		posts, est, postsBuf := ov.lookupPostings(keys)
 		if len(posts) == 0 {
-			if release != nil {
-				release()
+			if postsBuf != nil {
+				releasePostingSliceBuf(postsBuf)
 			}
 			return emptyLeaf(), true, nil
 		}
+		if len(posts) == 1 {
+			ids := posts[0]
+			return leafPred{
+				kind:     leafPredKindPosting,
+				posting:  ids,
+				estCard:  ids.Cardinality(),
+				posts:    posts,
+				postsBuf: postsBuf,
+			}, true, nil
+		}
 
 		return leafPred{
-			kind:    leafPredKindPostsUnion,
-			posts:   posts,
-			estCard: est,
-			release: release,
+			kind:     leafPredKindPostsUnion,
+			posts:    posts,
+			estCard:  est,
+			postsBuf: postsBuf,
+		}, true, nil
+
+	case qx.OpGT, qx.OpGTE, qx.OpLT, qx.OpLTE, qx.OpPREFIX:
+		p, ok := qv.buildPredicateWithMode(e, false)
+		if !ok {
+			return leafPred{}, false, nil
+		}
+		if p.alwaysFalse {
+			releasePredicateOwnedState(&p)
+			return emptyLeaf(), true, nil
+		}
+		return leafPred{
+			kind:    leafPredKindPredicate,
+			pred:    p,
+			estCard: p.estCard,
 		}, true, nil
 	}
 
 	return leafPred{}, false, nil
 }
 
+func (qv *queryView[K, V]) buildLimitLeafPred(e qx.Expr, orderedWindow int) (leafPred, bool, error) {
+	if orderedWindow > 0 && isSimpleScalarRangeOrPrefixLeaf(e) && !e.Not {
+		if candidate, ok := qv.prepareScalarRangeRoutingCandidate(e); ok &&
+			candidate.plan.orderedEagerMaterializeUseful(orderedWindow, qv.snapshotUniverseCardinality()) {
+			p, ok := qv.buildPredicateWithMode(e, true)
+			if ok {
+				if p.alwaysFalse {
+					releasePredicateOwnedState(&p)
+					return emptyLeaf(), true, nil
+				}
+				return leafPred{
+					kind:        leafPredKindPredicate,
+					pred:        p,
+					hasBaseCore: true,
+					baseCore: orderBasicBaseCore{
+						kind: orderBasicBaseCoreRawExpr,
+						expr: e,
+					},
+					estCard: p.estCard,
+				}, true, nil
+			}
+		}
+	}
+	return qv.buildLeafPred(e)
+}
+
+func (qv *queryView[K, V]) buildMergedLimitLeafPred(e qx.Expr, bounds rangeBounds, orderedWindow int) (leafPred, bool, error) {
+	fm := qv.fields[e.Field]
+	if fm == nil || fm.Slice {
+		return leafPred{}, false, nil
+	}
+	allowMaterialize := false
+	if orderedWindow > 0 {
+		core := qv.prepareExactScalarRangePredicate(e, fm, bounds)
+		allowMaterialize = core.orderedEagerMaterializeUseful(orderedWindow)
+	}
+	p, ok := qv.buildMergedNumericRangePredicate(e, bounds, allowMaterialize)
+	if !ok {
+		return leafPred{}, false, nil
+	}
+	if p.alwaysFalse {
+		releasePredicateOwnedState(&p)
+		return emptyLeaf(), true, nil
+	}
+	return leafPred{
+		kind:        leafPredKindPredicate,
+		pred:        p,
+		hasBaseCore: true,
+		baseCore: orderBasicBaseCore{
+			kind: orderBasicBaseCoreCollapsedRange,
+			collapsed: preparedScalarExactRange{
+				field:  e.Field,
+				bounds: bounds,
+			},
+		},
+		estCard: p.estCard,
+	}, true, nil
+}
+
+func (qv *queryView[K, V]) supportsLimitLeafPredExpr(e qx.Expr) bool {
+	if e.Not || e.Field == "" {
+		return false
+	}
+	fm := qv.fields[e.Field]
+	if fm == nil {
+		return false
+	}
+	if !qv.fieldOverlay(e.Field).hasData() && !qv.hasIndexedField(e.Field) {
+		return false
+	}
+	switch e.Op {
+	case qx.OpEQ:
+		return !fm.Slice
+	case qx.OpIN:
+		return !fm.Slice
+	case qx.OpHAS, qx.OpHASANY:
+		return fm.Slice
+	case qx.OpGT, qx.OpGTE, qx.OpLT, qx.OpLTE, qx.OpPREFIX:
+		return true
+	default:
+		return false
+	}
+}
+
+func (qv *queryView[K, V]) supportsLimitLeafPredsExcludingBounds(leaves []qx.Expr, field string) bool {
+	hasResidual := false
+	for _, e := range leaves {
+		if isBoundOp(e.Op) && !e.Not && e.Field == field {
+			continue
+		}
+		hasResidual = true
+		if !qv.supportsLimitLeafPredExpr(e) {
+			return false
+		}
+	}
+	return hasResidual
+}
+
+func (qv *queryView[K, V]) hasWarmScalarLimitLeafPredsExcludingBounds(leaves []qx.Expr, field string) bool {
+	for _, e := range leaves {
+		if isBoundOp(e.Op) && !e.Not && e.Field == field {
+			continue
+		}
+		if !isSimpleScalarRangeOrPrefixLeaf(e) {
+			continue
+		}
+		candidate, ok := qv.prepareScalarRangeRoutingCandidate(e)
+		if !ok {
+			continue
+		}
+		if hit, ok := candidate.core.loadWarmScalarPostingResult(); ok {
+			hit.release()
+			return true
+		}
+	}
+	return false
+}
+
 func (qv *queryView[K, V]) attachLeafPredPostingFilter(p *leafPred) {
-	if p == nil {
+	if p == nil || len(p.posts) <= 1 {
 		return
 	}
 	switch p.kind {
@@ -1002,20 +1306,7 @@ func (qv *queryView[K, V]) attachLeafPredPostingFilter(p *leafPred) {
 	default:
 		return
 	}
-	filter, cleanup := qv.buildPostsAnyPostingFilter(p.posts)
-	p.postingFilter = filter
-	if cleanup == nil {
-		return
-	}
-	prev := p.release
-	if prev == nil {
-		p.release = cleanup
-		return
-	}
-	p.release = func() {
-		cleanup()
-		prev()
-	}
+	p.postsAnyState = acquirePostsAnyFilterState(p.posts)
 }
 
 func pickLeadIndex(ps []leafPred) int {
@@ -1062,15 +1353,30 @@ func emptyLeaf() leafPred {
 	return leafPred{
 		kind:    leafPredKindEmpty,
 		estCard: 0,
-		release: nil,
 	}
 }
 
-func releaseLeafPreds(preds []leafPred) {
+func releaseLeafPreds(preds []leafPred, owner ...*leafPredSliceBuf) {
+	var buf *leafPredSliceBuf
+	if len(owner) != 0 {
+		buf = owner[0]
+	}
 	for i := range preds {
-		if preds[i].release != nil {
-			preds[i].release()
+		if preds[i].kind == leafPredKindPredicate {
+			releasePredicateOwnedState(&preds[i].pred)
 		}
+		if preds[i].postsAnyState != nil {
+			releasePostsAnyFilterState(preds[i].postsAnyState)
+		}
+		if preds[i].postsBuf != nil {
+			preds[i].postsBuf.values = preds[i].posts
+			releasePostingSliceBuf(preds[i].postsBuf)
+		}
+		preds[i] = leafPred{}
+	}
+	if buf != nil {
+		buf.values = preds
+		releaseLeafPredSliceBuf(buf)
 	}
 }
 

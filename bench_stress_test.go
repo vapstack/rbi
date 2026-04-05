@@ -37,7 +37,6 @@ const (
 
 var (
 	benchStressCountries = []string{"US", "CA", "GB", "DE", "FR", "NL", "PL", "SE", "JP", "IN", "BR", "AU"}
-	benchStressPlans     = []string{"free", "starter", "pro", "enterprise"}
 	benchStressAllTags   = []string{
 		"technology", "programming", "golang", "rust", "linux", "webdev", "frontend", "backend",
 		"databases", "ai", "machine-learning", "datascience", "security", "devops", "cloud", "kubernetes",
@@ -86,8 +85,8 @@ func buildBenchStressDBWithCaching(b *testing.B, n int, mode benchCacheMode) *DB
 	return db
 }
 
-func seedBenchStressData(b *testing.B, db *DB[uint64, StressBenchUser], n int) {
-	b.Helper()
+func seedBenchStressData(tb testing.TB, db *DB[uint64, StressBenchUser], n int) {
+	tb.Helper()
 
 	db.DisableSync()
 	defer db.EnableSync()
@@ -103,7 +102,7 @@ func seedBenchStressData(b *testing.B, db *DB[uint64, StressBenchUser], n int) {
 			return
 		}
 		if err := db.BatchSet(ids, vals); err != nil {
-			b.Fatalf("BatchSet(seed stress): %v", err)
+			tb.Fatalf("BatchSet(seed stress): %v", err)
 		}
 		ids = ids[:0]
 		vals = vals[:0]

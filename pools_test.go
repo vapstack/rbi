@@ -177,6 +177,67 @@ func TestPostingUnionIterPool_ReusedIteratorDoesNotLeakSeenState(t *testing.T) {
 	}
 }
 
+func TestCountLeadResidualExactFilterSliceBufReleaseClearsFullCapacity(t *testing.T) {
+	buf := getCountLeadResidualExactFilterSliceBuf(2)
+	used := append(buf.values[:0],
+		countLeadResidualExactFilter{idx: 1, ids: poolsSmall(3, 7, 11)},
+		countLeadResidualExactFilter{idx: 2, ids: poolsSmall(5, 9, 13)},
+	)
+
+	releaseCountLeadResidualExactFilters(used)
+	releaseCountLeadResidualExactFilterSliceBuf(buf)
+
+	raw := buf.values[:cap(buf.values)]
+	if len(raw) < 2 {
+		t.Fatalf("unexpected pooled capacity: got=%d", len(raw))
+	}
+	for i := 0; i < 2; i++ {
+		if raw[i].idx != 0 || !raw[i].ids.IsEmpty() {
+			t.Fatalf("pooled extraExact buffer retained stale entry at %d: %+v", i, raw[i])
+		}
+	}
+}
+
+func TestLeafPredSliceBufReleaseClearsFullCapacity(t *testing.T) {
+	buf := getLeafPredSliceBuf(2)
+	stale := append(buf.values[:0],
+		leafPred{
+			kind:          leafPredKindPostsUnion,
+			posts:         []posting.List{poolsSmall(1, 2)},
+			postingFilter: func(ids posting.List) (posting.List, bool) { return ids, true },
+			postsBuf:      &postingSliceBuf{},
+			postsAnyState: &postsAnyFilterState{},
+		},
+		leafPred{
+			kind:          leafPredKindPostsAll,
+			posting:       poolsSingleton(3),
+			posts:         []posting.List{poolsSmall(3)},
+			estCard:       1,
+			postingFilter: func(ids posting.List) (posting.List, bool) { return ids, true },
+			postsBuf:      &postingSliceBuf{},
+			postsAnyState: &postsAnyFilterState{},
+		},
+	)
+	buf.values = stale[:0]
+
+	releaseLeafPredSliceBuf(buf)
+
+	raw := buf.values[:cap(buf.values)]
+	if len(raw) < 2 {
+		t.Fatalf("unexpected pooled capacity: got=%d", len(raw))
+	}
+	for i := 0; i < 2; i++ {
+		if raw[i].kind != leafPredKindEmpty ||
+			!raw[i].posting.IsEmpty() ||
+			len(raw[i].posts) != 0 ||
+			raw[i].estCard != 0 ||
+			raw[i].postingFilter != nil ||
+			raw[i].postsBuf != nil ||
+			raw[i].postsAnyState != nil {
+			t.Fatalf("pooled leafPred buffer retained stale entry at %d", i)
+		}
+	}
+}
 func TestBuildIndexFieldLocalStateReleaseClearsVals(t *testing.T) {
 	state := newBuildIndexFieldLocalState(false, false)
 	for i := 1; i <= posting.MidCap+1; i++ {

@@ -1557,11 +1557,6 @@ func (db *DB[K, V]) failAutoBatchJobs(batch []*autoBatchJob[K, V], err error) {
 	db.finishAutoBatchJobs(batch)
 }
 
-func (db *DB[K, V]) failAutoBatch(batch []*autoBatchRequest[K, V], err error) {
-	assignAutoBatchRequestErr(batch, err)
-	db.finishAutoBatch(batch)
-}
-
 func (db *DB[K, V]) finishAutoBatch(batch []*autoBatchRequest[K, V]) {
 	resolveAutoBatchRequestErrs(batch)
 	releaseAutoBatchRequestsState(batch)

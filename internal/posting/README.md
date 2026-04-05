@@ -14,7 +14,8 @@ Any work here should be triple-checked.
 Memory management and ownership:
 
 - `List` is a small value wrapper over one of four payload forms: empty, singleton, compact (small/mid), or large.
-- empty and singleton values are inline. They do not allocate and are not pooled.
+- Production code must keep `List` value-shaped: no `*posting.List`, no pointer-receiver API, no optional-state through `*List`.
+- Empty and singleton values are inline. They do not allocate and are not pooled.
 - `List.Borrow` returns a non-owning view for non-inline payloads.
   The borrowed state is encoded in `List` metadata, not in the payload itself.
 - Borrowed `List` must not release the payload. `List.Release` is a no-op for borrowed values.

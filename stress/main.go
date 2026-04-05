@@ -39,11 +39,12 @@ func main() {
 	}
 
 	log.Printf(
-		"opening DB file=%s report=%s headless=%t duration=%s trace_sample=%d trace_top=%d query_stats=%t jitter=%t class_filter=%v query_filter=%v",
+		"opening DB file=%s report=%s headless=%t duration=%s no_cache=%t trace_sample=%d trace_top=%d query_stats=%t jitter=%t class_filter=%v query_filter=%v",
 		opts.DBFile,
 		opts.ReportPath,
 		opts.Headless,
 		opts.Duration,
+		opts.NoCache,
 		opts.TraceSampleEvery,
 		opts.TraceTopN,
 		opts.QueryStats,
@@ -57,11 +58,12 @@ func main() {
 	}
 	traceCollector := newPlannerTraceCollector(catalog, opts.TraceSampleEvery, opts.TraceTopN)
 	handle, err := OpenBenchDB(DBConfig{
-		DBFile:           opts.DBFile,
-		BoltNoSync:       opts.BoltNoSync,
-		AnalyzeInterval:  opts.AnalyzeInterval,
-		TraceSink:        traceCollector.traceSink(),
-		TraceSampleEvery: opts.TraceSampleEvery,
+		DBFile:               opts.DBFile,
+		BoltNoSync:           opts.BoltNoSync,
+		AnalyzeInterval:      opts.AnalyzeInterval,
+		DisableRuntimeCaches: opts.NoCache,
+		TraceSink:            traceCollector.traceSink(),
+		TraceSampleEvery:     opts.TraceSampleEvery,
 	}, opts.EmailSampleN)
 	if err != nil {
 		fatalf("open db: %v", err)

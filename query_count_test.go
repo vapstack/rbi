@@ -34,13 +34,22 @@ func countByExprBitmapUserBench(t *testing.T, db *DB[uint64, UserBench], expr qx
 	return db.countPostingResult(b)
 }
 
+func countByExprBitmapCountORBench(t *testing.T, db *DB[uint64, countORBenchRec], expr qx.Expr) uint64 {
+	t.Helper()
+	b, err := db.evalExpr(expr)
+	if err != nil {
+		t.Fatalf("evalExpr: %v", err)
+	}
+	defer b.release()
+	return db.countPostingResult(b)
+}
+
 func expectPredicateExactPostingFilterCount(t *testing.T, p predicate, src posting.List, want uint64) {
 	t.Helper()
 
 	work := src.Clone()
+	mode, exact, work, _ := plannerFilterPostingByChecks([]predicate{p}, []int{0}, src, work, true)
 	defer work.Release()
-
-	mode, exact, _ := plannerFilterPostingByChecks([]predicate{p}, []int{0}, src, &work, true)
 	if mode != plannerPredicateBucketExact {
 		t.Fatalf("expected exact posting filtering, got mode=%v", mode)
 	}
@@ -66,6 +75,183 @@ type countORBenchRec struct {
 	Email   string   `db:"email"`
 	Tags    []string `db:"tags"`
 	Roles   []string `db:"roles"`
+}
+
+func TestCount_ScalarInSplit_MixedResiduals_UsesPlan(t *testing.T) {
+	var (
+		mu     sync.Mutex
+		events []TraceEvent
+	)
+
+	sink := func(ev TraceEvent) {
+		mu.Lock()
+		events = append(events, ev)
+		mu.Unlock()
+	}
+
+	dir := t.TempDir()
+	db, raw := openBoltAndNew[uint64, countORBenchRec](t, filepath.Join(dir, "test_count_scalar_in_split_mixed.db"), Options{
+		AnalyzeInterval:  -1,
+		TraceSink:        sink,
+		TraceSampleEvery: 1,
+	})
+	t.Cleanup(func() {
+		_ = db.Close()
+		_ = raw.Close()
+	})
+	db.DisableSync()
+	defer db.EnableSync()
+
+	countries := []string{"US", "DE", "NL", "FR"}
+	plans := []string{"free", "pro", "enterprise", "basic"}
+	statuses := []string{"active", "trial", "paused", "banned"}
+	tagsPool := [][]string{
+		{"go", "db"},
+		{"security", "ops"},
+		{"go", "security"},
+		{"rust", "ops"},
+	}
+	rolesPool := [][]string{
+		{"admin", "support"},
+		{"admin", "moderator"},
+		{"support"},
+		{"moderator"},
+	}
+
+	const n = 180_000
+	ids := make([]uint64, n)
+	vals := make([]*countORBenchRec, n)
+	for i := 0; i < n; i++ {
+		ids[i] = uint64(i + 1)
+		vals[i] = &countORBenchRec{
+			Country: countries[i%len(countries)],
+			Plan:    plans[(i/2)%len(plans)],
+			Status:  statuses[(i/3)%len(statuses)],
+			Age:     18 + (i % 55),
+			Score:   float64(i % 200),
+			Email:   fmt.Sprintf("user%06d@example.com", i),
+			Tags:    append([]string(nil), tagsPool[i%len(tagsPool)]...),
+			Roles:   append([]string(nil), rolesPool[(i/5)%len(rolesPool)]...),
+		}
+	}
+	if err := db.BatchSet(ids, vals); err != nil {
+		t.Fatalf("BatchSet: %v", err)
+	}
+	if err := db.RebuildIndex(); err != nil {
+		t.Fatalf("RebuildIndex: %v", err)
+	}
+
+	q := qx.Query(
+		qx.IN("country", []string{"US", "DE", "NL"}),
+		qx.NOTIN("status", []string{"banned"}),
+		qx.HASANY("tags", []string{"security", "ops"}),
+		qx.GTE("age", 24),
+		qx.GTE("score", 60.0),
+	)
+
+	got, err := db.Count(q)
+	if err != nil {
+		t.Fatalf("Count: %v", err)
+	}
+	want := countByExprBitmapCountORBench(t, db, q.Expr)
+	if got != want {
+		t.Fatalf("count mismatch: got=%d want=%d", got, want)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(events) == 0 {
+		t.Fatalf("expected trace event")
+	}
+	ev := events[len(events)-1]
+	if ev.Plan != string(PlanCountScalarInSplit) {
+		t.Fatalf("expected %q, got %q", PlanCountScalarInSplit, ev.Plan)
+	}
+}
+
+func TestCount_ScalarInSplit_CohortShape_MatchesBitmap(t *testing.T) {
+	var (
+		mu     sync.Mutex
+		events []TraceEvent
+	)
+
+	sink := func(ev TraceEvent) {
+		mu.Lock()
+		events = append(events, ev)
+		mu.Unlock()
+	}
+
+	dir := t.TempDir()
+	db, raw := openBoltAndNew[uint64, countORBenchRec](t, filepath.Join(dir, "test_count_scalar_in_split_cohort.db"), Options{
+		AnalyzeInterval:  -1,
+		TraceSink:        sink,
+		TraceSampleEvery: 1,
+	})
+	t.Cleanup(func() {
+		_ = db.Close()
+		_ = raw.Close()
+	})
+	db.DisableSync()
+	defer db.EnableSync()
+
+	countries := []string{"NL", "DE", "PL", "SE", "FR", "ES", "GB", "US"}
+	statuses := []string{"active", "trial", "paused", "banned"}
+	tagsPool := [][]string{
+		{"go", "db"},
+		{"security", "ops"},
+		{"go", "security"},
+		{"rust", "ops"},
+		{"db", "security"},
+	}
+
+	const n = 220_000
+	ids := make([]uint64, n)
+	vals := make([]*countORBenchRec, n)
+	for i := 0; i < n; i++ {
+		ids[i] = uint64(i + 1)
+		vals[i] = &countORBenchRec{
+			Country: countries[i%len(countries)],
+			Status:  statuses[(i/4)%len(statuses)],
+			Age:     18 + (i % 55),
+			Score:   float64(i % 120),
+			Email:   fmt.Sprintf("user%06d@example.com", i),
+			Tags:    append([]string(nil), tagsPool[i%len(tagsPool)]...),
+		}
+	}
+	if err := db.BatchSet(ids, vals); err != nil {
+		t.Fatalf("BatchSet: %v", err)
+	}
+	if err := db.RebuildIndex(); err != nil {
+		t.Fatalf("RebuildIndex: %v", err)
+	}
+
+	q := qx.Query(
+		qx.NOTIN("status", []string{"banned"}),
+		qx.IN("country", []string{"NL", "DE", "PL", "SE", "FR", "ES", "GB"}),
+		qx.GTE("age", 25),
+		qx.LTE("age", 45),
+		qx.HASANY("tags", []string{"go", "db", "security"}),
+		qx.GTE("score", 80.0),
+	)
+
+	got, err := db.Count(q)
+	if err != nil {
+		t.Fatalf("Count: %v", err)
+	}
+	want := countByExprBitmapCountORBench(t, db, q.Expr)
+	if got != want {
+		t.Fatalf("count mismatch: got=%d want=%d", got, want)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(events) == 0 {
+		t.Fatalf("expected trace event")
+	}
+	ev := events[len(events)-1]
+	if ev.Plan != string(PlanCountScalarInSplit) {
+		t.Fatalf("expected %q, got %q", PlanCountScalarInSplit, ev.Plan)
+	}
 }
 
 func TestCount_ByPredicates_BucketLead_MatchesBitmap(t *testing.T) {
@@ -201,7 +387,7 @@ func TestCount_ByPredicates_BucketLeadHasAnyResidual_MatchesBitmap(t *testing.T)
 	}
 
 	exactActiveBuf := getIntSliceBuf(len(active))
-	exactActive := buildPostingFilterActive(exactActiveBuf.values, active, preds)
+	exactActive := buildPostingApplyActive(exactActiveBuf.values, active, preds)
 	defer func() {
 		exactActiveBuf.values = exactActive
 		releaseIntSliceBuf(exactActiveBuf)
@@ -387,7 +573,7 @@ func TestCount_ByPredicates_BucketLead_ContradictoryPrefixesReturnZero(t *testin
 	}
 }
 
-func TestCount_ByPredicates_BroadLeadFallbackSkipsResidualPreparation(t *testing.T) {
+func TestCount_BroadLeadWithSmallIN_PrefersScalarInSplit(t *testing.T) {
 	var (
 		mu     sync.Mutex
 		events []TraceEvent
@@ -444,11 +630,11 @@ func TestCount_ByPredicates_BroadLeadFallbackSkipsResidualPreparation(t *testing
 		t.Fatalf("expected trace event")
 	}
 	ev := events[len(events)-1]
-	if ev.Plan != string(PlanCountMaterialized) {
-		t.Fatalf("expected broad-lead fallback to use %q, got %q", PlanCountMaterialized, ev.Plan)
+	if ev.Plan != string(PlanCountScalarInSplit) {
+		t.Fatalf("expected small-IN broad-lead query to use %q, got %q", PlanCountScalarInSplit, ev.Plan)
 	}
-	if ev.CountPredicatePreparations > 1 {
-		t.Fatalf("expected broad-lead fallback to avoid residual preparation, got %d total preparations", ev.CountPredicatePreparations)
+	if ev.CountPredicatePreparations != 0 {
+		t.Fatalf("expected scalar-in-split path to avoid predicate preparation, got %d total preparations", ev.CountPredicatePreparations)
 	}
 }
 
@@ -1032,6 +1218,33 @@ func TestCountORDedupThresholds_Adaptive(t *testing.T) {
 	}
 }
 
+func TestCountORSeenStrategy_Adaptive(t *testing.T) {
+	small := countORBranches{
+		{est: 2_000},
+		{est: 1_800},
+		{est: 1_600},
+		{est: 1_400},
+	}
+	seenSmall := newCountORSeen(small, 0, 10_000)
+	defer seenSmall.release()
+	if seenSmall.mode != countORSeenModeHash {
+		t.Fatalf("expected hash seen set for small adaptive cap, got mode=%d", seenSmall.mode)
+	}
+
+	large := countORBranches{
+		{est: 150_000},
+		{est: 140_000},
+		{est: 130_000},
+		{est: 120_000},
+		{est: 110_000},
+	}
+	seenLarge := newCountORSeen(large, 60_000, 500_000)
+	defer seenLarge.release()
+	if seenLarge.mode != countORSeenModePosting {
+		t.Fatalf("expected posting seen set for large adaptive cap, got mode=%d", seenLarge.mode)
+	}
+}
+
 func TestCountORPredicateBranchLimit_Adaptive(t *testing.T) {
 	if got := countORPredicateBranchLimit(0); got != countORPredicateMaxBranchesBase {
 		t.Fatalf("expected base branch limit for unknown universe, got=%d", got)
@@ -1219,9 +1432,9 @@ func TestCount_BuildPredicates_DeferBroadRangeMaterialization(t *testing.T) {
 		t.Fatalf("expected empty materialized cache before building predicates")
 	}
 
-	predsCount, ok := db.buildPredicatesWithMode(leaves, false)
+	predsCount, ok := db.buildCountPredicatesWithMode(leaves, false)
 	if !ok {
-		t.Fatalf("buildPredicatesWithMode failed")
+		t.Fatalf("buildCountPredicatesWithMode failed")
 	}
 	releasePredicates(predsCount)
 	if _, ok := db.getSnapshot().loadMaterializedPred(cacheKey); ok {
@@ -1236,6 +1449,51 @@ func TestCount_BuildPredicates_DeferBroadRangeMaterialization(t *testing.T) {
 	cached, ok := db.getSnapshot().loadMaterializedPred(cacheKey)
 	if !ok || cached.IsEmpty() {
 		t.Fatalf("expected default predicate build to populate numeric range cache")
+	}
+}
+
+func TestCount_BuildPredicates_MergesPositiveNumericRangesSameField(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
+	seedGeneratedUint64Data(t, db, 20_000, func(i int) *Rec {
+		return &Rec{
+			Name:   fmt.Sprintf("u_%d", i),
+			Email:  fmt.Sprintf("user%05d@example.com", i),
+			Age:    i,
+			Score:  float64(i % 1_000),
+			Active: i%2 == 0,
+			Meta: Meta{
+				Country: "US",
+			},
+		}
+	})
+	if err := db.RebuildIndex(); err != nil {
+		t.Fatalf("RebuildIndex: %v", err)
+	}
+
+	expr := qx.AND(
+		qx.GTE("age", 1_000),
+		qx.LTE("age", 15_000),
+		qx.IN("country", []string{"US"}),
+		qx.NOTIN("active", []bool{false}),
+	)
+	leaves, ok := collectAndLeaves(expr)
+	if !ok {
+		t.Fatalf("collectAndLeaves failed")
+	}
+	preds, ok := db.buildCountPredicatesWithMode(leaves, false)
+	if !ok {
+		t.Fatalf("buildCountPredicatesWithMode failed")
+	}
+	defer releasePredicates(preds)
+
+	agePreds := 0
+	for i := range preds {
+		if preds[i].expr.Field == "age" {
+			agePreds++
+		}
+	}
+	if agePreds != 1 {
+		t.Fatalf("expected merged age predicate, got %d age predicates in %+v", agePreds, preds)
 	}
 }
 
@@ -1287,7 +1545,7 @@ func TestCount_PreparePredicate_UsesBroadRangeComplementWithoutCache(t *testing.
 		if p.kind != predicateKindCustom {
 			t.Fatalf("expected broad no-cache range to stay custom and lazy, got kind=%v", p.kind)
 		}
-		if !p.supportsPostingFilter() || !p.postingFilterCheap {
+		if !p.supportsPostingApply() || !p.supportsCheapPostingApply() {
 			t.Fatalf("expected broad no-cache range to expose cheap exact posting filter")
 		}
 
@@ -1370,7 +1628,7 @@ func TestCount_PreparePredicate_UsesTinyPostingBroadRangeComplement(t *testing.T
 			if !p.ids.IsEmpty() {
 				t.Fatalf("expected tiny complement to avoid postingResult materialization")
 			}
-			if !p.supportsPostingFilter() || !p.postingFilterCheap {
+			if !p.supportsPostingApply() || !p.supportsCheapPostingApply() {
 				t.Fatalf("expected tiny complement predicate to support cheap exact posting filtering")
 			}
 
@@ -1459,7 +1717,7 @@ func TestCount_PreparePredicate_UsesProbeBoundedBroadRangeComplement(t *testing.
 			if p.kind != predicateKindCustom {
 				t.Fatalf("expected no-cache broad range to stay custom and lazy, got kind=%v", p.kind)
 			}
-			if !p.supportsPostingFilter() || !p.postingFilterCheap {
+			if !p.supportsPostingApply() || !p.supportsCheapPostingApply() {
 				t.Fatalf("expected no-cache broad range to expose cheap exact posting filter")
 			}
 
@@ -1869,7 +2127,7 @@ func TestCount_PreparePredicate_UsesExactNumericEstimateForSkewedBroadRange(t *t
 	if p.kind != predicateKindCustom {
 		t.Fatalf("expected skewed broad numeric range without cache to stay custom, got kind=%v", p.kind)
 	}
-	if !p.supportsPostingFilter() || !p.postingFilterCheap {
+	if !p.supportsPostingApply() || !p.supportsCheapPostingApply() {
 		t.Fatalf("expected skewed broad numeric range to expose cheap exact posting filter")
 	}
 
@@ -1963,7 +2221,7 @@ func TestCount_PreparePredicate_UsesBroadRangeComplementOnFullSnapshot(t *testin
 	if p.kind != predicateKindCustom {
 		t.Fatalf("expected broad numeric range without cache to stay custom, got kind=%v", p.kind)
 	}
-	if !p.supportsPostingFilter() || !p.postingFilterCheap {
+	if !p.supportsPostingApply() || !p.supportsCheapPostingApply() {
 		t.Fatalf("expected broad numeric range to expose cheap exact posting filter")
 	}
 

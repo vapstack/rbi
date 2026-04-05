@@ -1540,7 +1540,8 @@ func TestPlannerExt_PlannerFilterPostingByChecksExactMode(t *testing.T) {
 		{kind: predicateKindMaterializedNot, ids: excludePosting},
 	}
 
-	mode, exact, card := plannerFilterPostingByChecks(preds, []int{0, 1}, srcPosting, &workPosting, true)
+	mode, exact, workPosting, card := plannerFilterPostingByChecks(preds, []int{0, 1}, srcPosting, workPosting, true)
+	defer workPosting.Release()
 	if mode != plannerPredicateBucketExact {
 		t.Fatalf("unexpected mode: got=%v", mode)
 	}

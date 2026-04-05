@@ -397,7 +397,7 @@ func buildIndexStringRunFromPostingMap(m map[string]posting.List) buildIndexFiel
 	keyBuf := getStringSliceBuf(len(m))
 	keys := keyBuf.values[:0]
 	for key, ids := range m {
-		ids.Optimize()
+		ids = ids.BuildOptimized()
 		if ids.IsEmpty() {
 			delete(m, key)
 			continue
@@ -433,7 +433,7 @@ func buildIndexFixedRunFromPostingMap(m map[uint64]posting.List) buildIndexField
 	keyBuf := getUint64SliceBuf(len(m))
 	keys := keyBuf.values[:0]
 	for key, ids := range m {
-		ids.Optimize()
+		ids = ids.BuildOptimized()
 		if ids.IsEmpty() {
 			delete(m, key)
 			continue
@@ -494,7 +494,7 @@ func (s *buildIndexFieldLocalState) flushAllInto(dst *buildIndexFieldState) {
 	if !s.nils.IsEmpty() {
 		dst.nilMu.Lock()
 		ids := dst.nils
-		ids.MergeOwned(s.nils)
+		ids = ids.BuildMergedOwned(s.nils)
 		dst.nils = ids
 		dst.nilMu.Unlock()
 		s.nils = posting.List{}
@@ -503,7 +503,7 @@ func (s *buildIndexFieldLocalState) flushAllInto(dst *buildIndexFieldState) {
 		dst.lenMu.Lock()
 		for ln, ids := range s.lenMap {
 			merged := dst.lenMap[ln]
-			merged.MergeOwned(ids)
+			merged = merged.BuildMergedOwned(ids)
 			dst.lenMap[ln] = merged
 		}
 		dst.lenMu.Unlock()
@@ -655,11 +655,11 @@ func (s *buildIndexFieldState) materializeStorage() fieldIndexStorage {
 			}
 			item = h.pop()
 			run = &h.runs[item.run]
-			merged.MergeOwned(run.posts[item.pos])
+			merged = merged.BuildMergedOwned(run.posts[item.pos])
 			run.posts[item.pos] = posting.List{}
 			h.push(item.run, item.pos+1)
 		}
-		merged.Optimize()
+		merged = merged.BuildOptimized()
 		if !chunked {
 			entries = append(entries, index{Key: key, IDs: merged})
 			if len(entries) >= fieldIndexChunkThreshold {
@@ -707,7 +707,7 @@ func (s *buildIndexFieldState) materializeNilStorage() fieldIndexStorage {
 	}
 	ids := s.nils
 	s.nils = posting.List{}
-	ids.Optimize()
+	ids = ids.BuildOptimized()
 	if ids.IsEmpty() {
 		return fieldIndexStorage{}
 	}
@@ -745,7 +745,7 @@ func materializeLenFieldStorageOwned(universe posting.List, lenMap map[uint32]po
 		if useZeroComplement && ln == 0 {
 			continue
 		}
-		ids.Optimize()
+		ids = ids.BuildOptimized()
 		if ids.IsEmpty() {
 			continue
 		}
@@ -757,9 +757,9 @@ func materializeLenFieldStorageOwned(universe posting.List, lenMap map[uint32]po
 	if useZeroComplement {
 		nonEmptyPosting := universe.Clone()
 		if !empty.IsEmpty() {
-			nonEmptyPosting.AndNotInPlace(empty)
+			nonEmptyPosting = nonEmptyPosting.BuildAndNot(empty)
 		}
-		nonEmptyPosting.Optimize()
+		nonEmptyPosting = nonEmptyPosting.BuildOptimized()
 		if !nonEmptyPosting.IsEmpty() {
 			entries = append(entries, index{
 				Key: indexKeyFromString(lenIndexNonEmptyKey),
@@ -850,8 +850,9 @@ func (db *DB[K, V]) buildIndex(skipFields map[string]struct{}) error {
 		go func(widx int) {
 			defer wg.Done()
 
-			lu := &localUniverse[widx]
-			lu.Clear()
+			lu := localUniverse[widx]
+			lu.Release()
+			lu = posting.List{}
 			localStates := make([]buildIndexFieldLocalState, len(active))
 			for i := range active {
 				localStates[i] = newBuildIndexFieldLocalState(active[i].numeric, active[i].slice)
@@ -866,6 +867,7 @@ func (db *DB[K, V]) buildIndex(skipFields map[string]struct{}) error {
 			for kv := range jobs {
 				val, err := db.decode(kv.v)
 				if err != nil {
+					localUniverse[widx] = lu
 					workerErrs[widx] = err
 					cancel()
 					return
@@ -873,7 +875,7 @@ func (db *DB[K, V]) buildIndex(skipFields map[string]struct{}) error {
 				ptr := unsafe.Pointer(val)
 				idx := kv.idx
 
-				lu.Add(idx)
+				lu = lu.BuildAdded(idx)
 
 				for k := range active {
 					active[k].acc.writeBuild(ptr, buildFieldWriteSink{state: &localStates[k], idx: idx})
@@ -887,6 +889,7 @@ func (db *DB[K, V]) buildIndex(skipFields map[string]struct{}) error {
 			for i := range localStates {
 				localStates[i].flushAllInto(fieldStates[i])
 			}
+			localUniverse[widx] = lu
 		}(i)
 	}
 
@@ -951,7 +954,7 @@ func (db *DB[K, V]) buildIndex(skipFields map[string]struct{}) error {
 		if localUniverse[i].IsEmpty() {
 			continue
 		}
-		db.universe.MergeOwned(localUniverse[i])
+		db.universe = db.universe.BuildMergedOwned(localUniverse[i])
 	}
 
 	for i := range fieldStates {
@@ -1195,7 +1198,8 @@ func (db *DB[K, V]) loadIndexV24(reader *bufio.Reader) (map[string]struct{}, *pl
 func (db *DB[K, V]) loadIndexPayload(reader *bufio.Reader) (map[string]struct{}, *plannerStatsSnapshot, bool, error) {
 
 	var universe posting.List
-	if err := universe.ReadFrom(reader); err != nil {
+	universe, err := posting.ReadFrom(reader)
+	if err != nil {
 		return nil, nil, false, fmt.Errorf("decode: reading universe: %w", err)
 	}
 
@@ -2432,8 +2436,8 @@ func readFieldIndexChunk(reader *bufio.Reader) (*fieldIndexChunk, error) {
 				return nil, fmt.Errorf("reading numeric chunk key: %w", err)
 			}
 			keys[i] = binary.BigEndian.Uint64(buf[:])
-			var ids posting.List
-			if err := ids.ReadFrom(reader); err != nil {
+			ids, err := posting.ReadFrom(reader)
+			if err != nil {
 				return nil, fmt.Errorf("reading numeric chunk posting: %w", err)
 			}
 			posts[i] = ids
@@ -2472,8 +2476,8 @@ func readFieldIndexChunk(reader *bufio.Reader) (*fieldIndexChunk, error) {
 				}
 			}
 			refs[i] = fieldIndexStringRef{off: uint32(start), len: uint32(keyLen)}
-			var ids posting.List
-			if err := ids.ReadFrom(reader); err != nil {
+			ids, err := posting.ReadFrom(reader)
+			if err != nil {
 				return nil, fmt.Errorf("reading string chunk posting: %w", err)
 			}
 			posts[i] = ids
@@ -2542,8 +2546,8 @@ func readIndexEntry(reader *bufio.Reader) (index, error) {
 	if err != nil {
 		return index{}, err
 	}
-	var ids posting.List
-	if err := ids.ReadFrom(reader); err != nil {
+	ids, err := posting.ReadFrom(reader)
+	if err != nil {
 		return index{}, err
 	}
 	return index{Key: key, IDs: ids}, nil
@@ -2796,7 +2800,7 @@ func (o fieldOverlay) postingAt(rank int) posting.List {
 	return o.base[rank].IDs.Borrow()
 }
 
-func (o fieldOverlay) lookupPostings(keys []string) ([]posting.List, uint64, func()) {
+func (o fieldOverlay) lookupPostings(keys []string) ([]posting.List, uint64, *postingSliceBuf) {
 	postsBuf := getPostingSliceBuf(len(keys))
 	posts := postsBuf.values
 	var est uint64
@@ -2809,12 +2813,8 @@ func (o fieldOverlay) lookupPostings(keys []string) ([]posting.List, uint64, fun
 		posts = append(posts, ids)
 		est += ids.Cardinality()
 	}
-
-	cleanup := func() {
-		postsBuf.values = posts
-		releasePostingSliceBuf(postsBuf)
-	}
-	return posts, est, cleanup
+	postsBuf.values = posts
+	return posts, est, postsBuf
 }
 
 func (o fieldOverlay) rangeForBounds(b rangeBounds) overlayRange {

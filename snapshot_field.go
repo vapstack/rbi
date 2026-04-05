@@ -115,7 +115,7 @@ func (s snapshotOverlayWriteSink) setNil() {
 	if s.state == nil {
 		return
 	}
-	s.state.nils = addFieldPostingList(s.state.nils, nilIndexEntryKey, s.idx)
+	s.state.nils = addFieldPostingListHint(s.state.nils, nilIndexEntryKey, s.idx, 0)
 	s.state.changed = true
 }
 
@@ -128,7 +128,7 @@ func (s snapshotOverlayWriteSink) setLen(length int) {
 	}
 	ln := uint32(length)
 	ids := s.state.lengths[ln]
-	ids.Add(s.idx)
+	ids = ids.BuildAdded(s.idx)
 	s.state.lengths[ln] = ids
 	s.state.changed = true
 }
@@ -137,7 +137,7 @@ func (s snapshotOverlayWriteSink) addString(key string) {
 	if s.state == nil {
 		return
 	}
-	s.state.index = addFieldPostingList(s.state.index, key, s.idx)
+	s.state.index = addFieldPostingListHint(s.state.index, key, s.idx, 0)
 	s.state.changed = true
 }
 
@@ -145,7 +145,7 @@ func (s snapshotOverlayWriteSink) addFixed(key uint64) {
 	if s.state == nil {
 		return
 	}
-	s.state.fixed = addFixedFieldPostingList(s.state.fixed, key, s.idx)
+	s.state.fixed = addFixedFieldPostingListHint(s.state.fixed, key, s.idx, 0)
 	s.state.changed = true
 }
 

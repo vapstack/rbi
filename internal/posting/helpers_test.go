@@ -173,8 +173,8 @@ func mustWriteListPayload(t *testing.T, list List) []byte {
 
 func mustReadListPayload(t *testing.T, payload []byte) List {
 	t.Helper()
-	var out List
-	if err := out.ReadFrom(bufio.NewReader(bytes.NewReader(payload))); err != nil {
+	out, err := ReadFrom(bufio.NewReader(bytes.NewReader(payload)))
+	if err != nil {
 		t.Fatalf("ReadFrom: %v", err)
 	}
 	return out

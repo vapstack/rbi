@@ -293,7 +293,7 @@ func TestContainerRunInotReusesWritableStorage(t *testing.T) {
 }
 
 func TestContainerRunInotReplacesStorageWhenCapacityIsTight(t *testing.T) {
-	rc := ownContainerRun(&containerRun{iv: make([]interval16, 2, 2)})
+	rc := ownContainerRun(&containerRun{iv: make([]interval16, 2)})
 	rc.iv[0] = newInterval16Range(10, 12)
 	rc.iv[1] = newInterval16Range(20, 22)
 

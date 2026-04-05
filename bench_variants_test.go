@@ -221,8 +221,8 @@ func scoreForDynamicProfile(r *rand.Rand, i int, p dynamicBenchProfile, scoreZip
 	}
 }
 
-func seedBenchDataDynamicProfile(b *testing.B, db *DB[uint64, UserBench], profile dynamicBenchProfile) {
-	b.Helper()
+func seedBenchDataDynamicProfile(tb testing.TB, db *DB[uint64, UserBench], profile dynamicBenchProfile) {
+	tb.Helper()
 
 	db.DisableSync()
 	defer db.EnableSync()
@@ -280,7 +280,7 @@ func seedBenchDataDynamicProfile(b *testing.B, db *DB[uint64, UserBench], profil
 			return
 		}
 		if err := db.BatchSet(ids, vals); err != nil {
-			b.Fatalf("BatchSet(seed dynamic): %v", err)
+			tb.Fatalf("BatchSet(seed dynamic): %v", err)
 		}
 		ids = ids[:0]
 		vals = vals[:0]

@@ -27,7 +27,7 @@ func TestCloneOwnedSmallIsIndependent(t *testing.T) {
 	base = base.BuildAdded(17)
 	clone := base.Clone()
 
-	clone.Add(40)
+	clone = clone.BuildAdded(40)
 
 	if base.Cardinality() != 3 {
 		t.Fatalf("base cardinality changed: got %d want 3", base.Cardinality())
@@ -46,22 +46,44 @@ func TestCloneOwnedSmallIsIndependent(t *testing.T) {
 	clone.Release()
 }
 
-func TestOrInPlaceEmptyClonesOwnedSource(t *testing.T) {
-	src := postingFromIDs(3, 7, 11, 19)
-
-	var dst List
-	dst.OrInPlace(src)
-	dst.Add(23)
-
-	if src.Contains(23) {
-		t.Fatalf("empty-dst OrInPlace mutated owned source payload")
+func TestCloneIntoLargeKeepsSharedContainerClone(t *testing.T) {
+	var (
+		src  List
+		want []uint64
+	)
+	for i := uint64(0); i < 96; i++ {
+		id := (i << 1) + 1
+		src = src.BuildAdded(id)
+		want = append(want, id)
 	}
-	if src.SharesPayload(dst) {
-		t.Fatalf("empty-dst OrInPlace still shares owned source payload")
+	defer src.Release()
+
+	dst := postingFromIDs(999, 1001, 1003)
+	defer dst.Release()
+
+	dst = src.CloneInto(dst)
+
+	srcLarge := src.largeRef()
+	dstLarge := dst.largeRef()
+	if srcLarge == nil || dstLarge == nil {
+		t.Fatalf("expected large postings on CloneInto path")
+	}
+	if len(srcLarge.highlowcontainer.containers) == 0 || len(dstLarge.highlowcontainer.containers) == 0 {
+		t.Fatalf("expected populated large posting containers")
+	}
+	if srcLarge.highlowcontainer.containers[0] != dstLarge.highlowcontainer.containers[0] {
+		t.Fatalf("large CloneInto must preserve shared/COW container clone semantics")
 	}
 
-	dst.Release()
-	src.Release()
+	dst = dst.BuildAdded(513)
+
+	assertSameListSet(t, src, want)
+	if src.Contains(513) {
+		t.Fatalf("CloneInto mutation leaked into source")
+	}
+	if !dst.Contains(513) {
+		t.Fatalf("CloneInto destination lost local mutation")
+	}
 }
 
 func TestBuildRemovedTwoElementPostingBecomesSingleton(t *testing.T) {
@@ -146,7 +168,7 @@ func TestAdaptiveLifecycle(t *testing.T) {
 	if ids.largeRef() == nil || ids.mid() != nil {
 		t.Fatalf("expected large representation to stay after lazy downshift")
 	}
-	ids.Optimize()
+	ids = ids.BuildOptimized()
 	if ids.largeRef() != nil || ids.mid() == nil {
 		t.Fatalf("expected explicit optimize to collapse large representation into mid")
 	}
@@ -196,8 +218,8 @@ func TestWriteReadPostingCompactRoundTrip(t *testing.T) {
 		t.Fatalf("Flush: %v", err)
 	}
 
-	var got List
-	if err := got.ReadFrom(bufio.NewReader(bytes.NewReader(payload.Bytes()))); err != nil {
+	got, err := ReadFrom(bufio.NewReader(bytes.NewReader(payload.Bytes())))
+	if err != nil {
 		t.Fatalf("ReadFrom: %v", err)
 	}
 	if got.small() == nil || got.largeRef() != nil {
@@ -225,8 +247,8 @@ func TestWriteReadPostingEmptyRoundTrip(t *testing.T) {
 		t.Fatalf("Flush: %v", err)
 	}
 
-	var got List
-	if err := got.ReadFrom(bufio.NewReader(bytes.NewReader(payload.Bytes()))); err != nil {
+	got, err := ReadFrom(bufio.NewReader(bytes.NewReader(payload.Bytes())))
+	if err != nil {
 		t.Fatalf("ReadFrom: %v", err)
 	}
 	if !got.IsEmpty() {
@@ -250,8 +272,8 @@ func TestReadSmallPostingSingletonCanonicalizes(t *testing.T) {
 		t.Fatalf("Flush: %v", err)
 	}
 
-	var got List
-	if err := got.ReadFrom(bufio.NewReader(bytes.NewReader(payload.Bytes()))); err != nil {
+	got, err := ReadFrom(bufio.NewReader(bytes.NewReader(payload.Bytes())))
+	if err != nil {
 		t.Fatalf("ReadFrom: %v", err)
 	}
 	if !got.isSingleton() {
@@ -284,9 +306,13 @@ func TestReadFromReusedReceiverReleasesPreviousSmallPayload(t *testing.T) {
 		t.Fatalf("Flush: %v", err)
 	}
 
-	if err := ids.ReadFrom(bufio.NewReader(bytes.NewReader(payload.Bytes()))); err != nil {
+	next, err := ReadFrom(bufio.NewReader(bytes.NewReader(payload.Bytes())))
+	if err != nil {
 		t.Fatalf("ReadFrom: %v", err)
 	}
+	prevValue := ids
+	ids = next
+	prevValue.Release()
 	if got, ok := ids.TrySingle(); !ok || got != 77 {
 		t.Fatalf("unexpected singleton contents after reuse: got=%d ok=%v", got, ok)
 	}
@@ -375,8 +401,8 @@ func TestWriteReadPostingMidRoundTrip(t *testing.T) {
 		t.Fatalf("Flush: %v", err)
 	}
 
-	var got List
-	if err := got.ReadFrom(bufio.NewReader(bytes.NewReader(payload.Bytes()))); err != nil {
+	got, err := ReadFrom(bufio.NewReader(bytes.NewReader(payload.Bytes())))
+	if err != nil {
 		t.Fatalf("ReadFrom: %v", err)
 	}
 	if got.Cardinality() != ids.Cardinality() {
@@ -401,7 +427,7 @@ func TestWriteReadPostingLargeRoundTrip(t *testing.T) {
 	for i := uint64(0); i < 5000; i++ {
 		ids = ids.BuildAdded(2<<32 | (i << 1))
 	}
-	ids.Optimize()
+	ids = ids.BuildOptimized()
 
 	if ids.kind() != postingKindLarge {
 		t.Fatalf("expected large-backed posting before round-trip")
@@ -416,8 +442,8 @@ func TestWriteReadPostingLargeRoundTrip(t *testing.T) {
 		t.Fatalf("Flush: %v", err)
 	}
 
-	var got List
-	if err := got.ReadFrom(bufio.NewReader(bytes.NewReader(payload.Bytes()))); err != nil {
+	got, err := ReadFrom(bufio.NewReader(bytes.NewReader(payload.Bytes())))
+	if err != nil {
 		t.Fatalf("ReadFrom: %v", err)
 	}
 	if got.kind() != postingKindLarge {
@@ -427,7 +453,7 @@ func TestWriteReadPostingLargeRoundTrip(t *testing.T) {
 		t.Fatalf("cardinality mismatch: got %d want %d", got.Cardinality(), ids.Cardinality())
 	}
 
-	for _, id := range []uint64{0, 255, 1<<32 | 9, 2<<32 | 0, 2<<32 | ((5000 - 1) << 1)} {
+	for _, id := range []uint64{0, 255, 1<<32 | 9, 2 << 32, 2<<32 | ((5000 - 1) << 1)} {
 		if !got.Contains(id) {
 			t.Fatalf("round-trip posting missing id=%d", id)
 		}
@@ -485,7 +511,7 @@ func TestBorrowedSmallMutationDetaches(t *testing.T) {
 		t.Fatalf("expected borrowed alias to share payload with base")
 	}
 
-	borrowed.Add(23)
+	borrowed = borrowed.BuildAdded(23)
 
 	if base.Contains(23) {
 		t.Fatalf("borrowed add mutated base payload")
@@ -518,7 +544,9 @@ func TestBorrowedLargeMutationDetaches(t *testing.T) {
 		t.Fatalf("expected borrowed large handle to share payload with base")
 	}
 
-	borrowed.AndNotInPlace(postingFromIDs(1, 2, 3))
+	mask := postingFromIDs(1, 2, 3)
+	borrowed = borrowed.BuildAndNot(mask)
+	mask.Release()
 
 	for _, id := range []uint64{1, 2, 3} {
 		if !base.Contains(id) {
@@ -548,34 +576,36 @@ func TestBorrowedMutationInvariant_SourceRemainsStable(t *testing.T) {
 	cases := []struct {
 		name         string
 		makeBase     func() List
-		mutate       func(*List)
+		mutate       func(List) List
 		wantBorrowed []uint64
 	}{
 		{
 			name:     "SmallAdd",
 			makeBase: func() List { return postingFromIDs(3, 7, 11, 19) },
-			mutate: func(ids *List) {
-				ids.Add(23)
+			mutate: func(ids List) List {
+				return ids.BuildAdded(23)
 			},
 			wantBorrowed: []uint64{3, 7, 11, 19, 23},
 		},
 		{
 			name:     "MidAndNotInPlace",
 			makeBase: func() List { return postingFromIDs(2, 4, 6, 8, 10, 12, 14, 16, 18, 20) },
-			mutate: func(ids *List) {
+			mutate: func(ids List) List {
 				mask := postingFromIDs(6, 8, 20)
-				ids.AndNotInPlace(mask)
+				ids = ids.BuildAndNot(mask)
 				mask.Release()
+				return ids
 			},
 			wantBorrowed: []uint64{2, 4, 10, 12, 14, 16, 18},
 		},
 		{
 			name:     "LargeAndInPlace",
 			makeBase: buildLarge,
-			mutate: func(ids *List) {
+			mutate: func(ids List) List {
 				keep := postingFromIDs(2, 4, 6, 8, 10, 12)
-				ids.AndInPlace(keep)
+				ids = ids.BuildAnd(keep)
 				keep.Release()
+				return ids
 			},
 			wantBorrowed: []uint64{2, 4, 6, 8, 10, 12},
 		},
@@ -595,7 +625,7 @@ func TestBorrowedMutationInvariant_SourceRemainsStable(t *testing.T) {
 				t.Fatalf("borrowed handle must start as an alias")
 			}
 
-			tc.mutate(&borrowed)
+			borrowed = tc.mutate(borrowed)
 
 			if gotBase := base.ToArray(); !slices.Equal(gotBase, wantBase) {
 				t.Fatalf("borrowed mutation changed source: got=%v want=%v", gotBase, wantBase)
@@ -611,29 +641,6 @@ func TestBorrowedMutationInvariant_SourceRemainsStable(t *testing.T) {
 			base.Release()
 		})
 	}
-}
-
-func TestOrInPlaceEmptyClonesBorrowedSource(t *testing.T) {
-	var base List
-	for i := uint64(1); i <= MidCap+1; i++ {
-		base = base.BuildAdded(i)
-	}
-	src := base.Borrow()
-
-	var dst List
-	dst.OrInPlace(src)
-	dst.Remove(1)
-
-	if !base.Contains(1) {
-		t.Fatalf("empty-dst OrInPlace mutated borrowed source payload")
-	}
-	if src.SharesPayload(dst) {
-		t.Fatalf("empty-dst OrInPlace still shares borrowed source payload")
-	}
-
-	dst.Release()
-	src.Release()
-	base.Release()
 }
 
 func TestLargePostingPoolReleaseDoesNotCorruptSharedClone(t *testing.T) {
@@ -855,23 +862,20 @@ func TestListReadOnlyAPIAcrossRepresentations(t *testing.T) {
 	}
 }
 
-func TestListCheckedAddAddManyAndIteratorWrappers(t *testing.T) {
+func TestListCheckedAddAddManyAndIterators(t *testing.T) {
 	var list List
-	if !list.CheckedAdd(7) {
+	var added bool
+	list, added = list.BuildAddedChecked(7)
+	if !added {
 		t.Fatalf("CheckedAdd must report newly added id")
 	}
-	if list.CheckedAdd(7) {
+	list, added = list.BuildAddedChecked(7)
+	if added {
 		t.Fatalf("CheckedAdd must reject duplicate id")
 	}
-	list.AddMany([]uint64{9, 3, 5, 7, 9, 11})
+	list = list.BuildAddedMany([]uint64{9, 3, 5, 7, 9, 11})
 	defer list.Release()
 	assertSameListSet(t, list, []uint64{3, 5, 7, 9, 11})
-
-	var nilList *List
-	if nilList.CheckedAdd(1) {
-		t.Fatalf("nil CheckedAdd must return false")
-	}
-	nilList.AddMany([]uint64{1, 2, 3})
 
 	emptyIt := (List{}).Iter()
 	if emptyIt.HasNext() {
@@ -911,13 +915,16 @@ func TestListCheckedAddBorrowedDuplicateNoDetach(t *testing.T) {
 		borrowed := base.Borrow()
 		defer borrowed.Release()
 
-		if borrowed.CheckedAdd(11) {
+		var added bool
+		borrowed, added = borrowed.BuildAddedChecked(11)
+		if added {
 			t.Fatalf("CheckedAdd must reject duplicate id")
 		}
 		if !borrowed.SharesPayload(base) {
 			t.Fatalf("duplicate CheckedAdd detached borrowed small payload")
 		}
-		if !borrowed.CheckedAdd(23) {
+		borrowed, added = borrowed.BuildAddedChecked(23)
+		if !added {
 			t.Fatalf("CheckedAdd must report newly added borrowed small id")
 		}
 		if borrowed.SharesPayload(base) {
@@ -930,21 +937,24 @@ func TestListCheckedAddBorrowedDuplicateNoDetach(t *testing.T) {
 	t.Run("large", func(t *testing.T) {
 		var base List
 		for i := uint64(1); i <= MidCap+4; i++ {
-			base.Add(i * 2)
+			base = base.BuildAdded(i * 2)
 		}
 		defer base.Release()
 
 		borrowed := base.Borrow()
 		defer borrowed.Release()
 
-		if borrowed.CheckedAdd(8) {
+		var added bool
+		borrowed, added = borrowed.BuildAddedChecked(8)
+		if added {
 			t.Fatalf("CheckedAdd must reject duplicate large id")
 		}
 		if !borrowed.SharesPayload(base) {
 			t.Fatalf("duplicate CheckedAdd detached borrowed large payload")
 		}
 		extra := uint64(9)<<32 | 1
-		if !borrowed.CheckedAdd(extra) {
+		borrowed, added = borrowed.BuildAddedChecked(extra)
+		if !added {
 			t.Fatalf("CheckedAdd must report newly added borrowed large id")
 		}
 		if borrowed.SharesPayload(base) {
@@ -962,7 +972,7 @@ func TestListCheckedAddBorrowedDuplicateNoDetach(t *testing.T) {
 func TestListAddManySortedLargeBatchDetachesBorrowedLarge(t *testing.T) {
 	var base List
 	for i := uint64(0); i < MidCap+8; i++ {
-		base.Add(i*2 + 1)
+		base = base.BuildAdded(i*2 + 1)
 	}
 	defer base.Release()
 
@@ -972,7 +982,7 @@ func TestListAddManySortedLargeBatchDetachesBorrowedLarge(t *testing.T) {
 		extra[i] = (1 << 32) | uint64(i)
 	}
 
-	borrowed.AddMany(extra)
+	borrowed = borrowed.BuildAddedMany(extra)
 	defer borrowed.Release()
 
 	if borrowed.SharesPayload(base) {
@@ -989,7 +999,7 @@ func TestListAddManySortedLargeBatchDetachesBorrowedLarge(t *testing.T) {
 func TestListAddManyUnsortedLargeBatchDetachesBorrowedLarge(t *testing.T) {
 	var base List
 	for i := uint64(0); i < MidCap+8; i++ {
-		base.Add(i*2 + 1)
+		base = base.BuildAdded(i*2 + 1)
 	}
 	defer base.Release()
 
@@ -1003,7 +1013,7 @@ func TestListAddManyUnsortedLargeBatchDetachesBorrowedLarge(t *testing.T) {
 		7,
 	}
 
-	borrowed.AddMany(extra)
+	borrowed = borrowed.BuildAddedMany(extra)
 	defer borrowed.Release()
 
 	if borrowed.SharesPayload(base) {
@@ -1017,23 +1027,7 @@ func TestListAddManyUnsortedLargeBatchDetachesBorrowedLarge(t *testing.T) {
 	assertSameListSet(t, borrowed, want)
 }
 
-func TestListEnsureOwnedAndFromLargeOwnedHelpers(t *testing.T) {
-	base := postingFromIDs(3, 7, 11, 19, 23, 29, 31, 37, 41)
-	defer base.Release()
-
-	borrowed := base.Borrow()
-	if !borrowed.IsBorrowed() {
-		t.Fatalf("expected borrowed list")
-	}
-	borrowed.ensureOwned()
-	if borrowed.IsBorrowed() {
-		t.Fatalf("ensureOwned must detach borrowed list")
-	}
-	if borrowed.SharesPayload(base) {
-		t.Fatalf("ensureOwned must stop sharing payload")
-	}
-	borrowed.Release()
-
+func TestListFromLargeOwnedHelpers(t *testing.T) {
 	emptyLarge := getLargePosting()
 	defer releaseLargePosting(emptyLarge)
 	if got := fromLargeOwned(emptyLarge); !got.IsEmpty() {
@@ -1061,7 +1055,7 @@ func TestListBorrowDoesNotAllocate(t *testing.T) {
 
 	large := postingFromIDs()
 	for i := uint64(0); i < MidCap+8; i++ {
-		large.Add(i*3 + 1)
+		large = large.BuildAdded(i*3 + 1)
 	}
 	defer large.Release()
 
@@ -1139,35 +1133,35 @@ func TestListSetOpsMatrix(t *testing.T) {
 
 				unionList := postingFromIDs(lhs.ids...)
 				unionRight := postingFromIDs(rhs.ids...)
-				unionList.OrInPlace(unionRight)
+				unionList = unionList.BuildOr(unionRight)
 				assertSameListSet(t, unionList, wantUnion)
 				unionList.Release()
 				unionRight.Release()
 
 				intersectionList := postingFromIDs(lhs.ids...)
 				intersectionRight := postingFromIDs(rhs.ids...)
-				intersectionList.AndInPlace(intersectionRight)
+				intersectionList = intersectionList.BuildAnd(intersectionRight)
 				assertSameListSet(t, intersectionList, wantIntersection)
 				intersectionList.Release()
 				intersectionRight.Release()
 
 				diffList := postingFromIDs(lhs.ids...)
 				diffRight := postingFromIDs(rhs.ids...)
-				diffList.AndNotInPlace(diffRight)
+				diffList = diffList.BuildAndNot(diffRight)
 				assertSameListSet(t, diffList, wantDiff)
 				diffList.Release()
 				diffRight.Release()
 
 				var dst List
 				src := postingFromIDs(lhs.ids...)
-				src.OrInto(&dst)
+				dst = dst.BuildOr(src)
 				assertSameListSet(t, dst, lhs.ids)
 				src.Release()
 				dst.Release()
 
 				dst = postingFromIDs(lhs.ids...)
 				src = postingFromIDs(rhs.ids...)
-				src.AndNotFrom(&dst)
+				dst = dst.BuildAndNot(src)
 				assertSameListSet(t, dst, wantDiff)
 				src.Release()
 				dst.Release()
@@ -1187,13 +1181,13 @@ func TestListAlgebraicExpectations(t *testing.T) {
 
 	unionAB := postingFromIDs(aIDs...)
 	unionABRight := postingFromIDs(bIDs...)
-	unionAB.OrInPlace(unionABRight)
+	unionAB = unionAB.BuildOr(unionABRight)
 	unionABRight.Release()
 	defer unionAB.Release()
 
 	unionBA := postingFromIDs(bIDs...)
 	unionBARight := postingFromIDs(aIDs...)
-	unionBA.OrInPlace(unionBARight)
+	unionBA = unionBA.BuildOr(unionBARight)
 	unionBARight.Release()
 	defer unionBA.Release()
 
@@ -1202,13 +1196,13 @@ func TestListAlgebraicExpectations(t *testing.T) {
 
 	interAB := postingFromIDs(aIDs...)
 	interABRight := postingFromIDs(bIDs...)
-	interAB.AndInPlace(interABRight)
+	interAB = interAB.BuildAnd(interABRight)
 	interABRight.Release()
 	defer interAB.Release()
 
 	interBA := postingFromIDs(bIDs...)
 	interBARight := postingFromIDs(aIDs...)
-	interBA.AndInPlace(interBARight)
+	interBA = interBA.BuildAnd(interBARight)
 	interBARight.Release()
 	defer interBA.Release()
 
@@ -1217,7 +1211,7 @@ func TestListAlgebraicExpectations(t *testing.T) {
 
 	diff := postingFromIDs(aIDs...)
 	diffRight := postingFromIDs(aIDs...)
-	diff.AndNotInPlace(diffRight)
+	diff = diff.BuildAndNot(diffRight)
 	diffRight.Release()
 	defer diff.Release()
 	if !diff.IsEmpty() {
@@ -1321,7 +1315,7 @@ func TestListMixedIntersectionLazyLargeDownshift(t *testing.T) {
 		if _, ok := keepSet[id]; ok {
 			continue
 		}
-		large.Remove(id)
+		large = large.BuildRemoved(id)
 	}
 
 	assertListRepresentation(t, large, "large")
@@ -1397,7 +1391,7 @@ func TestListLifecycleHelpers(t *testing.T) {
 			t.Fatalf("borrowed list must share payload with base")
 		}
 
-		borrowed.Add(43)
+		borrowed = borrowed.BuildAdded(43)
 		assertSameListSet(t, base, []uint64{3, 7, 11, 19, 23, 29, 31, 37, 41})
 		assertSameListSet(t, borrowed, []uint64{3, 7, 11, 19, 23, 29, 31, 37, 41, 43})
 		if borrowed.SharesPayload(base) {
@@ -1415,7 +1409,7 @@ func TestListLifecycleHelpers(t *testing.T) {
 		if base.SharesPayload(clone) {
 			t.Fatalf("small clone unexpectedly shares payload")
 		}
-		clone.Add(99)
+		clone = clone.BuildAdded(99)
 		assertSameListSet(t, base, []uint64{5, 9, 17, 33})
 		assertSameListSet(t, clone, []uint64{5, 9, 17, 33, 99})
 	})
@@ -1423,7 +1417,8 @@ func TestListLifecycleHelpers(t *testing.T) {
 	t.Run("ClearReleasesAndZeroesHandle", func(t *testing.T) {
 		list := postingFromIDs(1, 2, 3, 4)
 		prev := list.small()
-		list.Clear()
+		list.Release()
+		list = List{}
 		if !list.IsEmpty() {
 			t.Fatalf("Clear must reset list to empty")
 		}
@@ -1478,7 +1473,7 @@ func TestListLifecycleHelpers(t *testing.T) {
 		var dst List
 		add := postingFromIDs(4, 8, 12, 16)
 		addPtr := add.small()
-		dst.MergeOwned(add)
+		dst = dst.BuildMergedOwned(add)
 		assertSameListSet(t, dst, []uint64{4, 8, 12, 16})
 		if dst.small() != addPtr {
 			t.Fatalf("empty MergeOwned must adopt payload directly")
@@ -1488,7 +1483,7 @@ func TestListLifecycleHelpers(t *testing.T) {
 		dst = postingFromIDs(1, 3, 5, 7)
 		add = postingFromIDs(9, 11, 13, 15)
 		addPtr = add.small()
-		dst.MergeOwned(add)
+		dst = dst.BuildMergedOwned(add)
 		assertSameListSet(t, dst, []uint64{1, 3, 5, 7, 9, 11, 13, 15})
 
 		reused := postingFromIDs(21, 23, 25, 27)
@@ -1508,7 +1503,7 @@ func TestBorrowedReceiverSetOpsAndMergeOwnedDetach(t *testing.T) {
 		orAdd := postingFromIDs(23, 29)
 		defer orAdd.Release()
 		orDst := base.Borrow()
-		orDst.OrInPlace(orAdd)
+		orDst = orDst.BuildOr(orAdd)
 		defer orDst.Release()
 		assertSameListSet(t, base, []uint64{3, 7, 11, 19})
 		assertSameListSet(t, orDst, []uint64{3, 7, 11, 19, 23, 29})
@@ -1519,7 +1514,7 @@ func TestBorrowedReceiverSetOpsAndMergeOwnedDetach(t *testing.T) {
 		andMask := postingFromIDs(7, 19, 23)
 		defer andMask.Release()
 		andDst := base.Borrow()
-		andDst.AndInPlace(andMask)
+		andDst = andDst.BuildAnd(andMask)
 		defer andDst.Release()
 		assertSameListSet(t, base, []uint64{3, 7, 11, 19})
 		assertSameListSet(t, andDst, []uint64{7, 19})
@@ -1530,7 +1525,7 @@ func TestBorrowedReceiverSetOpsAndMergeOwnedDetach(t *testing.T) {
 		diffMask := postingFromIDs(7, 19)
 		defer diffMask.Release()
 		diffDst := base.Borrow()
-		diffDst.AndNotInPlace(diffMask)
+		diffDst = diffDst.BuildAndNot(diffMask)
 		defer diffDst.Release()
 		assertSameListSet(t, base, []uint64{3, 7, 11, 19})
 		assertSameListSet(t, diffDst, []uint64{3, 11})
@@ -1552,7 +1547,7 @@ func TestBorrowedReceiverSetOpsAndMergeOwnedDetach(t *testing.T) {
 		orAdd := postingFromIDs(orAddIDs...)
 		defer orAdd.Release()
 		orDst := base.Borrow()
-		orDst.OrInPlace(orAdd)
+		orDst = orDst.BuildOr(orAdd)
 		defer orDst.Release()
 		assertSameListSet(t, base, baseIDs)
 		assertSameListSet(t, orDst, unionUint64(baseIDs, orAddIDs))
@@ -1564,7 +1559,7 @@ func TestBorrowedReceiverSetOpsAndMergeOwnedDetach(t *testing.T) {
 		andMask := postingFromIDs(andMaskIDs...)
 		defer andMask.Release()
 		andDst := base.Borrow()
-		andDst.AndInPlace(andMask)
+		andDst = andDst.BuildAnd(andMask)
 		defer andDst.Release()
 		assertSameListSet(t, base, baseIDs)
 		assertSameListSet(t, andDst, intersectUint64(baseIDs, andMaskIDs))
@@ -1576,7 +1571,7 @@ func TestBorrowedReceiverSetOpsAndMergeOwnedDetach(t *testing.T) {
 		diffMask := postingFromIDs(diffMaskIDs...)
 		defer diffMask.Release()
 		diffDst := base.Borrow()
-		diffDst.AndNotInPlace(diffMask)
+		diffDst = diffDst.BuildAndNot(diffMask)
 		defer diffDst.Release()
 		assertSameListSet(t, base, baseIDs)
 		assertSameListSet(t, diffDst, differenceUint64(baseIDs, diffMaskIDs))
@@ -1592,7 +1587,7 @@ func TestBorrowedReceiverSetOpsAndMergeOwnedDetach(t *testing.T) {
 		dst := base.Borrow()
 		add := postingFromIDs(9, 11, 13, 15)
 		addPtr := add.small()
-		dst.MergeOwned(add)
+		dst = dst.BuildMergedOwned(add)
 		defer dst.Release()
 
 		assertSameListSet(t, base, []uint64{1, 3, 5, 7})
@@ -1621,7 +1616,7 @@ func TestBorrowedReceiverSetOpsAndMergeOwnedDetach(t *testing.T) {
 		dst := base.Borrow()
 		add := postingFromIDs(addIDs...)
 		addPtr := add.largeRef()
-		dst.MergeOwned(add)
+		dst = dst.BuildMergedOwned(add)
 		defer dst.Release()
 
 		assertSameListSet(t, base, baseIDs)
@@ -1654,7 +1649,7 @@ func TestBorrowedCompactSetOpsAgainstLargeDetach(t *testing.T) {
 		defer base.Release()
 
 		andDst := base.Borrow()
-		andDst.AndInPlace(large)
+		andDst = andDst.BuildAnd(large)
 		defer andDst.Release()
 		assertSameListSet(t, base, []uint64{3, 7, 11, 19})
 		assertSameListSet(t, andDst, []uint64{7, 19})
@@ -1663,7 +1658,7 @@ func TestBorrowedCompactSetOpsAgainstLargeDetach(t *testing.T) {
 		}
 
 		diffDst := base.Borrow()
-		diffDst.AndNotInPlace(large)
+		diffDst = diffDst.BuildAndNot(large)
 		defer diffDst.Release()
 		assertSameListSet(t, base, []uint64{3, 7, 11, 19})
 		assertSameListSet(t, diffDst, []uint64{3, 11})
@@ -1677,7 +1672,7 @@ func TestBorrowedCompactSetOpsAgainstLargeDetach(t *testing.T) {
 		defer base.Release()
 
 		andDst := base.Borrow()
-		andDst.AndInPlace(large)
+		andDst = andDst.BuildAnd(large)
 		defer andDst.Release()
 		assertSameListSet(t, base, []uint64{4, 8, 12, 16, 20, 24, 28, 32, 36})
 		assertSameListSet(t, andDst, []uint64{4, 8, 12, 16, 24, 28, 32, 36})
@@ -1687,7 +1682,7 @@ func TestBorrowedCompactSetOpsAgainstLargeDetach(t *testing.T) {
 		}
 
 		diffDst := base.Borrow()
-		diffDst.AndNotInPlace(large)
+		diffDst = diffDst.BuildAndNot(large)
 		defer diffDst.Release()
 		assertSameListSet(t, base, []uint64{4, 8, 12, 16, 20, 24, 28, 32, 36})
 		assertSameListSet(t, diffDst, []uint64{20})
@@ -1726,9 +1721,12 @@ func TestListSerializationRoundTripSkipAndReuse(t *testing.T) {
 			assertSameListSet(t, got, tc.ids)
 
 			receiver := postingFromIDs(100, 101, 102, 103)
-			if err := receiver.ReadFrom(bufio.NewReader(bytes.NewReader(payload))); err != nil {
+			next, err := ReadFrom(bufio.NewReader(bytes.NewReader(payload)))
+			if err != nil {
 				t.Fatalf("ReadFrom(reuse): %v", err)
 			}
+			receiver.Release()
+			receiver = next
 			assertSameListSet(t, receiver, tc.ids)
 			receiver.Release()
 		})
@@ -1750,8 +1748,8 @@ func TestListSerializationRoundTripSkipAndReuse(t *testing.T) {
 			}
 			continue
 		}
-		var got List
-		if err := got.ReadFrom(reader); err != nil {
+		got, err := ReadFrom(reader)
+		if err != nil {
 			t.Fatalf("ReadFrom(%s): %v", tc.name, err)
 		}
 		assertSameListSet(t, got, tc.ids)
@@ -1821,8 +1819,9 @@ func TestListReadFromRejectsInvalidPayloads(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			receiver := postingFromIDs(3, 9, 17, 40)
 			defer receiver.Release()
-			err := receiver.ReadFrom(bufio.NewReader(bytes.NewReader(tc.payload)))
+			next, err := ReadFrom(bufio.NewReader(bytes.NewReader(tc.payload)))
 			if err == nil {
+				next.Release()
 				t.Fatalf("expected error")
 			}
 			if !bytes.Contains([]byte(err.Error()), []byte(tc.wantErrSub)) {
@@ -1910,11 +1909,11 @@ func TestListConcurrentReadOnlyAndDetachedMutation(t *testing.T) {
 		mask := postingFromIDs(2, 4, 8, 13, 16, 21, 34, 1<<32|9, 2<<32|17, 3<<32|1)
 		defer mask.Release()
 
-		mutated.OrInPlace(added)
-		mutated.AndNotInPlace(removed)
-		mutated.AndInPlace(mask)
-		mutated.Add(5<<32 | 7)
-		mutated.Optimize()
+		mutated = mutated.BuildOr(added)
+		mutated = mutated.BuildAndNot(removed)
+		mutated = mutated.BuildAnd(mask)
+		mutated = mutated.BuildAdded(5<<32 | 7)
+		mutated = mutated.BuildOptimized()
 		writerDone <- mutated
 	}()
 
@@ -1969,14 +1968,6 @@ func TestSkipRejectsInvalidAndTruncatedInputs(t *testing.T) {
 	}
 }
 
-func TestListReadFromNilReceiver(t *testing.T) {
-	var list *List
-	err := list.ReadFrom(bufio.NewReader(bytes.NewReader([]byte{encodingEmpty})))
-	if err == nil || err.Error() != "nil List receiver" {
-		t.Fatalf("unexpected error: %v", err)
-	}
-}
-
 func TestWriteToReadFromMultiplePayloadsAlternatingSkip(t *testing.T) {
 	values := []List{
 		postingFromIDs(1),
@@ -2015,8 +2006,8 @@ func TestWriteToReadFromMultiplePayloadsAlternatingSkip(t *testing.T) {
 			}
 			continue
 		}
-		var got List
-		if err := got.ReadFrom(reader); err != nil {
+		got, err := ReadFrom(reader)
+		if err != nil {
 			t.Fatalf("ReadFrom #%d: %v", i, err)
 		}
 		assertSameListSet(t, got, values[i].ToArray())
@@ -2106,7 +2097,7 @@ func priorityApplyBatchPostingDeltaOwned(base List, delta *priorityBatchPostingD
 
 	if !deltaValue.remove.IsEmpty() && !out.IsEmpty() {
 		out = out.Clone()
-		out.AndNotInPlace(deltaValue.remove)
+		out = out.BuildAndNot(deltaValue.remove)
 		changed = true
 	}
 
@@ -2120,12 +2111,12 @@ func priorityApplyBatchPostingDeltaOwned(base List, delta *priorityBatchPostingD
 				out = out.Clone()
 				changed = true
 			}
-			out.OrInPlace(deltaValue.add)
+			out = out.BuildOr(deltaValue.add)
 		}
 	}
 
 	if changed {
-		out.Optimize()
+		out = out.BuildOptimized()
 	}
 	if releaseRemove {
 		deltaValue.remove.Release()
@@ -2154,10 +2145,9 @@ func priorityLinearPostingUnion(posts []List) List {
 		if i == bestIdx {
 			continue
 		}
-		out.OrInPlace(posts[i])
+		out = out.BuildOr(posts[i])
 	}
-	out.Optimize()
-	return out
+	return out.BuildOptimized()
 }
 
 func priorityParallelBatchedPostingUnion(posts []List) List {
@@ -2196,10 +2186,9 @@ func priorityParallelBatchedPostingUnion(posts []List) List {
 
 	final := results[0]
 	for i := 1; i < len(results); i++ {
-		final.MergeOwned(results[i])
+		final = final.BuildMergedOwned(results[i])
 	}
-	final.Optimize()
-	return final
+	return final.BuildOptimized()
 }
 
 func prioritySetFailed(failed *atomic.Pointer[string], msg string) {
@@ -2304,10 +2293,10 @@ func TestFieldPostingBorrowPatternDetachedUnderConcurrency(t *testing.T) {
 		<-start
 		for i := 0; i < 300; i++ {
 			ids := slot.postingAt()
-			ids.AndNotInPlace(remove)
-			ids.OrInPlace(add)
-			ids.Add(6<<32 | uint64(i))
-			ids.Optimize()
+			ids = ids.BuildAndNot(remove)
+			ids = ids.BuildOr(add)
+			ids = ids.BuildAdded(6<<32 | uint64(i))
+			ids = ids.BuildOptimized()
 			if slot.ids.Contains(6<<32 | uint64(i)) {
 				prioritySetFailed(&failed, "mutated borrowed slot view changed source")
 				ids.Release()
@@ -2375,10 +2364,10 @@ func TestMaterializedPredCacheBorrowPatternDetachedUnderConcurrency(t *testing.T
 				prioritySetFailed(&failed, "writer unexpectedly missed cache entry")
 				return
 			}
-			cached.AndNotInPlace(remove)
-			cached.OrInPlace(add)
-			cached.Add(7<<32 | uint64(i))
-			cached.Optimize()
+			cached = cached.BuildAndNot(remove)
+			cached = cached.BuildOr(add)
+			cached = cached.BuildAdded(7<<32 | uint64(i))
+			cached = cached.BuildOptimized()
 			cached.Release()
 		}
 	}()
@@ -2403,14 +2392,14 @@ func TestParallelBatchedPostingUnionBorrowedInputsStayStable(t *testing.T) {
 	for i := 0; i < 320; i++ {
 		var ids List
 		base := uint64(i * 16)
-		ids.Add(base + 1)
-		ids.Add(base + 3)
-		ids.Add(base + 5)
+		ids = ids.BuildAdded(base + 1)
+		ids = ids.BuildAdded(base + 3)
+		ids = ids.BuildAdded(base + 5)
 		if i%3 == 0 {
-			ids.Add(1 << 32)
+			ids = ids.BuildAdded(1 << 32)
 		}
 		if i%7 == 0 {
-			ids.Add(2<<32 | uint64(i))
+			ids = ids.BuildAdded(2<<32 | uint64(i))
 		}
 		sourceWant = append(sourceWant, ids.ToArray())
 		sources = append(sources, ids)
@@ -2441,7 +2430,7 @@ func TestParallelBatchedPostingUnionBorrowedInputsStayStable(t *testing.T) {
 				out.Release()
 				return
 			}
-			out.Add(9<<32 | id)
+			out = out.BuildAdded(9<<32 | id)
 			out.Release()
 		}(uint64(g))
 	}
@@ -2459,7 +2448,7 @@ func TestParallelBatchedPostingUnionBorrowedInputsStayStable(t *testing.T) {
 func TestApplyBatchPostingDeltaOwnedBorrowedBaseStaysStable(t *testing.T) {
 	base := postingFromIDs()
 	for i := uint64(1); i <= 48; i++ {
-		base.Add(i * 2)
+		base = base.BuildAdded(i * 2)
 	}
 	defer base.Release()
 
@@ -2525,7 +2514,7 @@ func TestListAddManySortedLargeFastPaths(t *testing.T) {
 			list := postingFromIDs(tc.base...)
 			defer list.Release()
 
-			list.AddMany(batch)
+			list = list.BuildAddedMany(batch)
 
 			want := unionUint64(tc.base, batch)
 			assertSameListSet(t, list, want)
@@ -2557,7 +2546,7 @@ func TestListAddManyUnsortedLargeFastPaths(t *testing.T) {
 			list := postingFromIDs(tc.base...)
 			defer list.Release()
 
-			list.AddMany(batch)
+			list = list.BuildAddedMany(batch)
 
 			want := unionUint64(tc.base, batch)
 			assertSameListSet(t, list, want)
@@ -2569,7 +2558,7 @@ func TestListAddManyUnsortedLargeFastPaths(t *testing.T) {
 func TestListOptimizeBorrowedLargeCollapsesToCompactRepresentations(t *testing.T) {
 	base := postingFromIDs(priorityLargeBaseIDs()...)
 	for i := uint64(0); i < MidCap+16; i++ {
-		base.Add(8<<32 | i)
+		base = base.BuildAdded(8<<32 | i)
 	}
 	defer base.Release()
 	baseWant := base.ToArray()
@@ -2577,8 +2566,8 @@ func TestListOptimizeBorrowedLargeCollapsesToCompactRepresentations(t *testing.T
 	midKeep := postingFromIDs(base.ToArray()[:MidCap]...)
 	defer midKeep.Release()
 	midBorrowed := base.Borrow()
-	midBorrowed.AndInPlace(midKeep)
-	midBorrowed.Optimize()
+	midBorrowed = midBorrowed.BuildAnd(midKeep)
+	midBorrowed = midBorrowed.BuildOptimized()
 	defer midBorrowed.Release()
 
 	assertListRepresentation(t, midBorrowed, "mid")
@@ -2590,8 +2579,8 @@ func TestListOptimizeBorrowedLargeCollapsesToCompactRepresentations(t *testing.T
 	smallKeep := postingFromIDs(base.ToArray()[:SmallCap]...)
 	defer smallKeep.Release()
 	smallBorrowed := base.Borrow()
-	smallBorrowed.AndInPlace(smallKeep)
-	smallBorrowed.Optimize()
+	smallBorrowed = smallBorrowed.BuildAnd(smallKeep)
+	smallBorrowed = smallBorrowed.BuildOptimized()
 	defer smallBorrowed.Release()
 
 	assertListRepresentation(t, smallBorrowed, "small")

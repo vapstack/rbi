@@ -252,7 +252,7 @@ func (qv *queryView[K, V]) execQuery(q *qx.QX, emitTrace bool, prepared bool) (o
 			}
 			return need
 		}())
-		cursor := qv.newQueryCursor(out, skip, need, needAll, nil)
+		cursor := qv.newQueryCursor(out, skip, need, needAll, 0)
 
 		ex := result.ids
 		universe := qv.snapshotUniverseView()
@@ -315,7 +315,7 @@ func (qv *queryView[K, V]) execQuery(q *qx.QX, emitTrace bool, prepared bool) (o
 	}
 
 	out = makeOutSlice[K](result.ids.Cardinality(), need)
-	cursor := qv.newQueryCursor(out, skip, need, needAll, nil)
+	cursor := qv.newQueryCursor(out, skip, need, needAll, 0)
 
 	iter := result.ids.Iter()
 	defer iter.Release()

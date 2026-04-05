@@ -13,29 +13,69 @@ type queryCursor[K ~uint64 | ~string, V any] struct {
 	need uint64
 	all  bool
 
-	seen   *posting.List
+	seen   u64set
+	dedupe bool
 	strkey bool
 	strmap *strMapSnapshot
 }
 
-func (qv *queryView[K, V]) newQueryCursor(out []K, skip, need uint64, all bool, seen *posting.List) queryCursor[K, V] {
-	return queryCursor[K, V]{
+func (qv *queryView[K, V]) newQueryCursor(out []K, skip, need uint64, all bool, dedupeCap uint64) queryCursor[K, V] {
+	c := queryCursor[K, V]{
 		out:    out,
 		skip:   skip,
 		need:   need,
 		all:    all,
-		seen:   seen,
 		strkey: qv.strkey,
 		strmap: qv.strmapView,
 	}
+	if dedupeCap > 0 {
+		c.seen = newU64Set(clampUint64ToInt(dedupeCap))
+		c.dedupe = true
+	}
+	return c
+}
+
+func queryCursorDedupeCap(cardinality, skip, need uint64, all bool) uint64 {
+	if cardinality == 0 {
+		return 0
+	}
+	if all {
+		return cardinality
+	}
+	window := need
+	if skip > 0 {
+		maxNeed := ^uint64(0) - skip
+		if need > maxNeed {
+			window = ^uint64(0)
+		} else {
+			window += skip
+		}
+	}
+	if window > cardinality {
+		return cardinality
+	}
+	return window
+}
+
+func clampUint64ToInt(v uint64) int {
+	maxInt := int(^uint(0) >> 1)
+	if v > uint64(maxInt) {
+		return maxInt
+	}
+	return int(v)
+}
+
+func (c *queryCursor[K, V]) release() {
+	if c == nil || !c.dedupe {
+		return
+	}
+	releaseU64Set(&c.seen)
+	c.dedupe = false
 }
 
 func (c *queryCursor[K, V]) emit(idx uint64) bool {
-	if c.seen != nil {
-		if c.seen.Contains(idx) {
-			return false
-		}
-		c.seen.Add(idx)
+	if c.dedupe && !c.seen.Add(idx) {
+		return false
 	}
 	if c.skip > 0 {
 		c.skip--

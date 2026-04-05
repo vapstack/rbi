@@ -106,15 +106,19 @@ func emitArrayCountZeroBucket[K ~uint64 | ~string, V any](cursor *queryCursor[K,
 	return false
 }
 
-func tmpIntersectPosting(tmp *posting.List, a posting.List, b posting.List) {
-	tmp.Clear()
+func tmpIntersectPosting(tmp posting.List, a posting.List, b posting.List) posting.List {
+	tmp.Release()
+	tmp = posting.List{}
 	if a.IsEmpty() || b.IsEmpty() {
-		return
+		return tmp
 	}
+	upper := min(a.Cardinality(), b.Cardinality())
+	builder := newPostingUnionBuilder(upper > posting.SmallCap && upper <= singleAdaptiveMaxLen)
 	a.ForEachIntersecting(b, func(idx uint64) bool {
-		tmp.Add(idx)
+		builder.addSingle(idx)
 		return false
 	})
+	return builder.finish(false)
 }
 
 func makeOutSlice[K ~int64 | ~uint64 | ~string](cardinality, limit uint64) []K {
@@ -258,18 +262,16 @@ func (qv *queryView[K, V]) queryOrderBasic(result postingResult, ov fieldOverlay
 		isSliceOrderField = true
 	}
 
-	var seen posting.List
-	var seenRef *posting.List
-	if isSliceOrderField {
-		seenRef = &seen
-		defer seen.Release()
-	}
-
 	var tmp posting.List
 	defer tmp.Release()
 
 	out := makeOutSlice[K](resultCard, need)
-	cursor := qv.newQueryCursor(out, skip, need, all, seenRef)
+	dedupeCap := uint64(0)
+	if isSliceOrderField {
+		dedupeCap = queryCursorDedupeCap(resultCard, skip, need, all)
+	}
+	cursor := qv.newQueryCursor(out, skip, need, all, dedupeCap)
+	defer cursor.release()
 
 	processBucket := func(ids posting.List) bool {
 		if ids.IsEmpty() {
@@ -286,7 +288,7 @@ func (qv *queryView[K, V]) queryOrderBasic(result postingResult, ov fieldOverlay
 				return cursor.emit(idx)
 			})
 		}
-		tmpIntersectPosting(&tmp, ids, result.ids)
+		tmp = tmpIntersectPosting(tmp, ids, result.ids)
 		return cursor.emitPosting(tmp)
 	}
 
@@ -405,11 +407,10 @@ func (qv *queryView[K, V]) queryOrderArrayPosOverlay(result postingResult, ov fi
 	}
 
 	out := makeOutSlice[K](resultCard, need)
-	var seen posting.List
-	defer seen.Release()
 	var tmp posting.List
 	defer tmp.Release()
-	cursor := qv.newQueryCursor(out, skip, need, all, nil)
+	cursor := qv.newQueryCursor(out, skip, need, all, queryCursorDedupeCap(resultCard, skip, need, all))
+	defer cursor.release()
 
 	doValue := func(key string) bool {
 		bm := ov.lookupPostingRetained(key)
@@ -419,23 +420,15 @@ func (qv *queryView[K, V]) queryOrderArrayPosOverlay(result postingResult, ov fi
 
 		if shouldUseOnePassPostingResultFilter(bm, result, cursor.need, cursor.all) {
 			return qv.forEachPostingResultBucket(bm, result, func(idx uint64) bool {
-				if seen.Contains(idx) {
-					return false
-				}
-				seen.Add(idx)
 				return cursor.emit(idx)
 			})
 		}
 
-		tmpIntersectPosting(&tmp, bm, result.ids)
+		tmp = tmpIntersectPosting(tmp, bm, result.ids)
 		it := tmp.Iter()
 		defer it.Release()
 		for it.HasNext() {
 			idx := it.Next()
-			if seen.Contains(idx) {
-				continue
-			}
-			seen.Add(idx)
 			if cursor.emit(idx) {
 				return true
 			}
@@ -458,9 +451,6 @@ func (qv *queryView[K, V]) queryOrderArrayPosOverlay(result postingResult, ov fi
 	}
 
 	qv.forEachPostingResultAll(result, func(idx uint64) bool {
-		if seen.Contains(idx) {
-			return false
-		}
 		return cursor.emit(idx)
 	})
 
@@ -484,23 +474,15 @@ func (qv *queryView[K, V]) queryOrderArrayPosScalarOverlay(result postingResult,
 	needSeen := needFallback && len(orderedVals) > 0
 
 	out := makeOutSlice[K](resultCard, need)
-	cursor := qv.newQueryCursor(out, skip, need, all, nil)
-	var seen posting.List
-	var seenEnabled bool
-	defer func() {
-		seen.Release()
-	}()
+	dedupeCap := uint64(0)
+	if needSeen {
+		dedupeCap = queryCursorDedupeCap(resultCard, skip, need, all)
+	}
+	cursor := qv.newQueryCursor(out, skip, need, all, dedupeCap)
+	defer cursor.release()
 
 	var tmp posting.List
 	defer tmp.Release()
-
-	enableSeen := func() {
-		if !needSeen || seenEnabled {
-			return
-		}
-		seenEnabled = true
-		cursor.seen = &seen
-	}
 
 	emitPriority := func(key string) bool {
 		bm := ov.lookupPostingRetained(key)
@@ -510,16 +492,14 @@ func (qv *queryView[K, V]) queryOrderArrayPosScalarOverlay(result postingResult,
 
 		if shouldUseOnePassPostingResultFilter(bm, result, cursor.need, cursor.all) {
 			return qv.forEachPostingResultBucket(bm, result, func(idx uint64) bool {
-				enableSeen()
 				return cursor.emit(idx)
 			})
 		}
 
-		tmpIntersectPosting(&tmp, bm, result.ids)
+		tmp = tmpIntersectPosting(tmp, bm, result.ids)
 		it := tmp.Iter()
 		defer it.Release()
 		for it.HasNext() {
-			enableSeen()
 			if cursor.emit(it.Next()) {
 				return true
 			}
@@ -568,7 +548,8 @@ func (qv *queryView[K, V]) queryOrderArrayCount(result postingResult, s []index,
 	var tmp posting.List
 	defer tmp.Release()
 
-	cursor := qv.newQueryCursor(out, skip, need, all, nil)
+	cursor := qv.newQueryCursor(out, skip, need, all, 0)
+	defer cursor.release()
 	var nonEmpty posting.List
 	if useZeroComplement {
 		for _, ix := range s {
@@ -609,7 +590,7 @@ func (qv *queryView[K, V]) queryOrderArrayCount(result postingResult, s []index,
 				continue
 			}
 
-			tmpIntersectPosting(&tmp, ix.IDs, result.ids)
+			tmp = tmpIntersectPosting(tmp, ix.IDs, result.ids)
 			it := tmp.Iter()
 			for it.HasNext() {
 				if cursor.emit(it.Next()) {
@@ -641,7 +622,7 @@ func (qv *queryView[K, V]) queryOrderArrayCount(result postingResult, s []index,
 				continue
 			}
 
-			tmpIntersectPosting(&tmp, ix.IDs, result.ids)
+			tmp = tmpIntersectPosting(tmp, ix.IDs, result.ids)
 			it := tmp.Iter()
 			for it.HasNext() {
 				if cursor.emit(it.Next()) {

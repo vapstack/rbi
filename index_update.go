@@ -48,7 +48,9 @@ func (db *DB[K, V]) markUniqueBatchLeaving(state uniqueBatchCheckState, field, k
 		state.leaving[field] = fm
 	}
 	bm := fm[key]
-	if !bm.CheckedAdd(idx) {
+	var added bool
+	bm, added = bm.BuildAddedChecked(idx)
+	if !added {
 		return false
 	}
 	fm[key] = bm
@@ -74,7 +76,7 @@ func rollbackUniqueBatchLeaving(state uniqueBatchCheckState, touched []uniqueLea
 		if ids.IsEmpty() {
 			continue
 		}
-		ids.Remove(idx)
+		ids = ids.BuildRemoved(idx)
 		if ids.IsEmpty() {
 			delete(fm, t.key)
 		} else {
@@ -285,7 +287,7 @@ func (db *DB[K, V]) checkUniqueOnWriteMulti(idxs []uint64, oldVals, newVals []*V
 					leaving[acc.name] = m
 				}
 				ids := m[single]
-				ids.Add(idx)
+				ids = ids.BuildAdded(idx)
 				m[single] = ids
 			}
 			continue
@@ -306,7 +308,7 @@ func (db *DB[K, V]) checkUniqueOnWriteMulti(idxs []uint64, oldVals, newVals []*V
 				leaving[acc.name] = m
 			}
 			ids := m[single]
-			ids.Add(idx)
+			ids = ids.BuildAdded(idx)
 			m[single] = ids
 		}
 	}

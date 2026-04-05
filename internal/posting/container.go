@@ -642,6 +642,8 @@ func retainContainer(c container16) container16 {
 		x.refs.Add(1)
 	case *containerBitmap:
 		x.refs.Add(1)
+	default:
+		panic("unsupported container16 type")
 	}
 	return c
 }
@@ -655,7 +657,7 @@ func containerUniquelyOwned(c container16) bool {
 	case *containerBitmap:
 		return x.refs.Load() == 1
 	default:
-		return true
+		panic("unsupported container16 type")
 	}
 }
 
@@ -1223,14 +1225,10 @@ func acquireContainerRun(capHint, length int) *containerRun {
 	if v := runContainerPool.Get(); v != nil {
 		rc := v.(*containerRun)
 		rc.refs.Store(1)
-		oldLen := len(rc.iv)
 		if cap(rc.iv) < capHint {
 			rc.iv = slices.Grow(rc.iv, capHint)
 		}
 		rc.iv = rc.iv[:length]
-		if length > oldLen {
-			clear(rc.iv[oldLen:length])
-		}
 		return rc
 	}
 
@@ -1296,11 +1294,7 @@ func acquireContainerArray(capacity, length int) *containerArray {
 	if v := containerArrayClassPools[idx].Get(); v != nil {
 		ac := v.(*containerArray)
 		ac.refs.Store(1)
-		oldLen := len(ac.content)
 		ac.content = ac.content[:length]
-		if length > oldLen {
-			clear(ac.content[oldLen:length])
-		}
 		return ac
 	}
 
@@ -1356,6 +1350,8 @@ func releaseContainer(c container16) {
 		releaseContainerArray(x)
 	case *containerBitmap:
 		releaseContainerBitmap(x)
+	default:
+		panic("unsupported container16 type")
 	}
 }
 

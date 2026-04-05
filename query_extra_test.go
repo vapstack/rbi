@@ -919,62 +919,6 @@ func assertQueryExtraPublicReadPathsMatchExpected(t *testing.T, db *DB[uint64, R
 	assertQueryExtCountMatchesBaseQuery(t, db, q)
 }
 
-func runQueryKeysStringChecked(t *testing.T, db *DB[string, Rec], q *qx.QX) []string {
-	t.Helper()
-
-	ids, err := db.QueryKeys(q)
-	if err != nil {
-		t.Fatalf("QueryKeys(%+v): %v", q, err)
-	}
-	return ids
-}
-
-func assertQueryExtraStringPublicReadPathsMatchExpected(t *testing.T, db *DB[string, Rec], q *qx.QX) {
-	t.Helper()
-
-	got := runQueryKeysStringChecked(t, db, q)
-	want, err := expectedKeysString(t, db, q)
-	if err != nil {
-		t.Fatalf("expectedKeysString(%+v): %v", q, err)
-	}
-	if !queryStringIDsEqual(q, got, want) {
-		t.Fatalf("QueryKeys mismatch: got=%v want=%v q=%+v", got, want, q)
-	}
-
-	wantItems, err := db.BatchGet(want...)
-	if err != nil {
-		t.Fatalf("BatchGet(want): %v", err)
-	}
-	gotItems, err := db.Query(q)
-	if err != nil {
-		t.Fatalf("Query(%+v): %v", q, err)
-	}
-	if len(gotItems) != len(wantItems) {
-		t.Fatalf("Query len mismatch: got=%d want=%d q=%+v", len(gotItems), len(wantItems), q)
-	}
-	for i := range wantItems {
-		if gotItems[i] == nil || wantItems[i] == nil || !reflect.DeepEqual(*gotItems[i], *wantItems[i]) {
-			t.Fatalf("Query item mismatch at i=%d: got=%#v want=%#v q=%+v", i, gotItems[i], wantItems[i], q)
-		}
-	}
-
-	base := cloneQuery(q)
-	base.Order = nil
-	base.Offset = 0
-	base.Limit = 0
-	wantCount, err := db.Count(base)
-	if err != nil {
-		t.Fatalf("Count(base %+v): %v", base, err)
-	}
-	gotCount, err := db.Count(q)
-	if err != nil {
-		t.Fatalf("Count(%+v): %v", q, err)
-	}
-	if gotCount != wantCount {
-		t.Fatalf("Count mismatch: got=%d want=%d q=%+v", gotCount, wantCount, q)
-	}
-}
-
 func TestQueryExt_OrderBasicPointerBounds_DoNotLeakNilTail(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
 

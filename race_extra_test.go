@@ -191,7 +191,7 @@ func raceExtraRequireNumericRangeBucketCacheEntry(t *testing.T, snap *indexSnaps
 func raceExtraPosting(ids ...uint64) posting.List {
 	var out posting.List
 	for _, id := range ids {
-		out.Add(id)
+		out = out.BuildAdded(id)
 	}
 	return out
 }
@@ -226,12 +226,14 @@ func TestRaceExtra_NumericRangeBucketSpanCacheDetachedLoadsUnderConcurrency(t *t
 
 	base := raceExtraPosting()
 	for i := uint64(1); i <= 48; i++ {
-		base.Add(i * 5)
+		base = base.BuildAdded(i * 5)
 	}
 	want := base.ToArray()
 
 	stored := base.Borrow()
-	if !entry.tryStoreFullSpan(11, 23, &stored) {
+	var ok bool
+	stored, ok = entry.tryStoreFullSpan(11, 23, stored)
+	if !ok {
 		t.Fatal("expected initial full-span store to succeed")
 	}
 	stored.Release()
@@ -286,10 +288,10 @@ func TestRaceExtra_NumericRangeBucketSpanCacheDetachedLoadsUnderConcurrency(t *t
 				setFailed("writer unexpectedly missed full-span cache entry")
 				return
 			}
-			cached.AndNotInPlace(remove)
-			cached.OrInPlace(add)
-			cached.Add(6<<32 | uint64(i))
-			cached.Optimize()
+			cached = cached.BuildAndNot(remove)
+			cached = cached.BuildOr(add)
+			cached = cached.BuildAdded(6<<32 | uint64(i))
+			cached = cached.BuildOptimized()
 			cached.Release()
 		}
 	}()
@@ -313,7 +315,7 @@ func TestRaceExtra_MaterializedPredBorrowedViewSurvivesConcurrentEviction(t *tes
 
 	base := raceExtraPosting()
 	for i := uint64(1); i <= 48; i++ {
-		base.Add(i * 7)
+		base = base.BuildAdded(i * 7)
 	}
 	want := base.ToArray()
 
@@ -377,12 +379,13 @@ func TestRaceExtra_NumericRangeFullSpanBorrowedViewSurvivesConcurrentEviction(t 
 
 	base := raceExtraPosting()
 	for i := uint64(1); i <= 48; i++ {
-		base.Add(i * 9)
+		base = base.BuildAdded(i * 9)
 	}
 	want := base.ToArray()
 
 	stored := base.Borrow()
-	if !entry.tryStoreFullSpan(0, 0, &stored) {
+	stored, ok := entry.tryStoreFullSpan(0, 0, stored)
+	if !ok {
 		t.Fatal("expected initial full-span store to succeed")
 	}
 	stored.Release()
@@ -427,9 +430,13 @@ func TestRaceExtra_NumericRangeFullSpanBorrowedViewSurvivesConcurrentEviction(t 
 		<-start
 		for i := 1; i <= 256; i++ {
 			ids := raceExtraPosting(uint64(i), 1<<32|uint64(i))
-			if !entry.tryStoreFullSpan(i, i, &ids) {
-				continue
+			var ok bool
+			ids, ok = entry.tryStoreFullSpan(i, i, ids)
+			if !ok {
+				setFailed(fmt.Sprintf("tryStoreFullSpan(%d,%d) failed", i, i))
+				return
 			}
+			ids.Release()
 		}
 	}()
 

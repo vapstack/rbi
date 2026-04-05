@@ -179,8 +179,8 @@ func (db *DB[K, V]) beginTrace(q *qx.QX) *queryTrace {
 			tr.ev.OrderDesc = q.Order[0].Desc
 		}
 
-		var leavesBuf [8]qx.Expr
-		leaves, ok := collectAndLeavesScratch(q.Expr, leavesBuf[:0])
+		leavesBuf := getExprSliceBuf(8)
+		leaves, ok := collectAndLeavesScratch(q.Expr, leavesBuf.values[:0])
 		if ok {
 			tr.ev.LeafCount = len(leaves)
 			for _, e := range leaves {
@@ -192,6 +192,7 @@ func (db *DB[K, V]) beginTrace(q *qx.QX) *queryTrace {
 				}
 			}
 		}
+		releaseExprSliceBuf(leavesBuf)
 
 		tr.start = tr.ev.Timestamp
 		tr.sink = sink
@@ -328,7 +329,7 @@ func (t *queryTrace) setOROrderRouteDecision(route, reason string, cost plannerO
 	t.ev.ORRoute.FallbackCost = cost.fallback
 	t.ev.ORRoute.Overlap = cost.overlap
 	t.ev.ORRoute.AvgChecks = avgChecks
-	t.ev.ORRoute.HasPrefixNonOrder = cost.hasPrefixNonOrder
+	t.ev.ORRoute.HasPrefixNonOrder = cost.hasPrefixTailRisk
 	t.ev.ORRoute.HasSelectiveLead = cost.hasSelectiveLead
 	t.ev.ORRoute.FallbackCollectFast = fallbackCollectFast
 }

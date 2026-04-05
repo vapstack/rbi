@@ -4,25 +4,151 @@ import (
 	"slices"
 	"sync"
 
+	"github.com/vapstack/qx"
 	"github.com/vapstack/rbi/internal/posting"
 )
 
 const (
-	intSlicePoolMaxCap                 = 4 << 10
-	uint64SlicePoolMaxCap              = 4 << 10
-	stringSlicePoolMaxCap              = 64 << 10
-	stringSetPoolMaxLen                = 4 << 10
-	uint64IntMapPoolMaxLen             = 16 << 10
-	u64SetPoolMaxCap                   = 16 << 10
-	postingSlicePoolMaxCap             = 4 << 10
-	postingMapPoolMaxLen               = 4 << 10
-	batchPostingDeltaMapPoolMaxLen     = 4 << 10
-	keyedBatchPostingDeltaSliceMaxCap  = 4 << 10
-	bitmapResultSlicePoolMaxCap        = 2 << 10
-	countORBranchSlicePoolMaxCap       = 512
-	plannerOROrderIterSlicePoolMaxCap  = 512
-	plannerOROrderMergeItemSliceMaxCap = 512
+	intSlicePoolMaxCap                      = 4 << 10
+	uint64SlicePoolMaxCap                   = 4 << 10
+	stringSlicePoolMaxCap                   = 64 << 10
+	stringSetPoolMaxLen                     = 4 << 10
+	uint64IntMapPoolMaxLen                  = 16 << 10
+	u64SetPoolMaxCap                        = 16 << 10
+	exprSlicePoolMaxCap                     = 256
+	boolSlicePoolMaxCap                     = 256
+	postingSlicePoolMaxCap                  = 4 << 10
+	postingMapPoolMaxLen                    = 4 << 10
+	batchPostingDeltaMapPoolMaxLen          = 4 << 10
+	keyedBatchPostingDeltaSliceMaxCap       = 4 << 10
+	bitmapResultSlicePoolMaxCap             = 2 << 10
+	countORBranchSlicePoolMaxCap            = 512
+	countLeadResidualExactFilterPoolMaxCap  = 512
+	predicateSlicePoolMaxCap                = 256
+	leafPredSlicePoolMaxCap                 = 256
+	plannerOROrderIterSlicePoolMaxCap       = 512
+	plannerOROrderMergeItemSliceMaxCap      = 512
+	orderBasicBaseCoreSlicePoolMaxCap       = 128
+	orderedMergedScalarRangeFieldPoolMaxCap = 64
 )
+
+/**/
+
+type exprSliceBuf struct{ values []qx.Expr }
+
+var exprSlicePool sync.Pool
+
+func getExprSliceBuf(capHint int) *exprSliceBuf {
+	if v := exprSlicePool.Get(); v != nil {
+		buf := v.(*exprSliceBuf)
+		if cap(buf.values) < capHint {
+			buf.values = slices.Grow(buf.values, capHint)
+		}
+		return buf
+	}
+	return &exprSliceBuf{values: make([]qx.Expr, 0, max(capHint, 8))}
+}
+
+func releaseExprSliceBuf(buf *exprSliceBuf) {
+	if buf == nil {
+		return
+	}
+	if cap(buf.values) > exprSlicePoolMaxCap {
+		return
+	}
+	clear(buf.values[:cap(buf.values)])
+	buf.values = buf.values[:0]
+	exprSlicePool.Put(buf)
+}
+
+/**/
+
+type boolSliceBuf struct{ values []bool }
+
+var boolSlicePool sync.Pool
+
+func getBoolSliceBuf(capHint int) *boolSliceBuf {
+	if v := boolSlicePool.Get(); v != nil {
+		buf := v.(*boolSliceBuf)
+		if cap(buf.values) < capHint {
+			buf.values = slices.Grow(buf.values, capHint)
+		}
+		return buf
+	}
+	return &boolSliceBuf{values: make([]bool, 0, max(capHint, 8))}
+}
+
+func releaseBoolSliceBuf(buf *boolSliceBuf) {
+	if buf == nil {
+		return
+	}
+	if cap(buf.values) > boolSlicePoolMaxCap {
+		return
+	}
+	clear(buf.values[:cap(buf.values)])
+	buf.values = buf.values[:0]
+	boolSlicePool.Put(buf)
+}
+
+/**/
+
+type orderBasicBaseCoreSliceBuf struct{ values []orderBasicBaseCore }
+
+var orderBasicBaseCoreSlicePool sync.Pool
+
+func getOrderBasicBaseCoreSliceBuf(capHint int) *orderBasicBaseCoreSliceBuf {
+	if v := orderBasicBaseCoreSlicePool.Get(); v != nil {
+		buf := v.(*orderBasicBaseCoreSliceBuf)
+		if cap(buf.values) < capHint {
+			buf.values = slices.Grow(buf.values, capHint)
+		}
+		return buf
+	}
+	return &orderBasicBaseCoreSliceBuf{values: make([]orderBasicBaseCore, 0, max(capHint, 4))}
+}
+
+func releaseOrderBasicBaseCoreSliceBuf(buf *orderBasicBaseCoreSliceBuf) {
+	if buf == nil {
+		return
+	}
+	if cap(buf.values) > orderBasicBaseCoreSlicePoolMaxCap {
+		return
+	}
+	clear(buf.values[:cap(buf.values)])
+	buf.values = buf.values[:0]
+	orderBasicBaseCoreSlicePool.Put(buf)
+}
+
+/**/
+
+type orderedMergedScalarRangeFieldSliceBuf struct {
+	values []orderedMergedScalarRangeField
+}
+
+var orderedMergedScalarRangeFieldSlicePool sync.Pool
+
+func getOrderedMergedScalarRangeFieldSliceBuf(capHint int) *orderedMergedScalarRangeFieldSliceBuf {
+	if v := orderedMergedScalarRangeFieldSlicePool.Get(); v != nil {
+		buf := v.(*orderedMergedScalarRangeFieldSliceBuf)
+		if cap(buf.values) < capHint {
+			buf.values = slices.Grow(buf.values, capHint)
+		}
+		return buf
+	}
+	return &orderedMergedScalarRangeFieldSliceBuf{values: make([]orderedMergedScalarRangeField, 0, max(capHint, 4))}
+}
+
+func releaseOrderedMergedScalarRangeFieldSliceBuf(buf *orderedMergedScalarRangeFieldSliceBuf) {
+	if buf == nil {
+		return
+	}
+	if cap(buf.values) > orderedMergedScalarRangeFieldPoolMaxCap {
+		return
+	}
+	clear(buf.values[:cap(buf.values)])
+	buf.values = buf.values[:0]
+	orderedMergedScalarRangeFieldSlicePool.Put(buf)
+}
 
 /**/
 
@@ -104,7 +230,7 @@ func releaseStringSliceBuf(buf *stringSliceBuf) {
 	if cap(buf.values) > stringSlicePoolMaxCap {
 		return
 	}
-	clear(buf.values)
+	clear(buf.values[:cap(buf.values)])
 	buf.values = buf.values[:0]
 	stringSlicePool.Put(buf)
 }
@@ -234,42 +360,9 @@ func releaseFixedPostingMap(m map[uint64]posting.List) {
 	fixedPostingMapPool.Put(m)
 }
 
-func releasePostingMapOwned(m map[string]posting.List) {
-	if m == nil {
-		return
-	}
-	oversized := len(m) > postingMapPoolMaxLen
-	for _, ids := range m {
-		ids.Release()
-	}
-	clear(m)
-	if oversized {
-		return
-	}
-	postingMapPool.Put(m)
-}
-
-func releaseFixedPostingMapOwned(m map[uint64]posting.List) {
-	if m == nil {
-		return
-	}
-	oversized := len(m) > postingMapPoolMaxLen
-	for _, ids := range m {
-		ids.Release()
-	}
-	clear(m)
-	if oversized {
-		return
-	}
-	fixedPostingMapPool.Put(m)
-}
-
-/**/
-
 type keyedBatchPostingDeltaSliceBuf struct{ values []keyedBatchPostingDelta }
 
 var keyedBatchPostingDeltaSlicePool sync.Pool
-var batchPostingDeltaMapPool sync.Pool
 var fixedBatchPostingDeltaMapPool sync.Pool
 
 func getKeyedBatchPostingDeltaSliceBuf(capHint int) *keyedBatchPostingDeltaSliceBuf {
@@ -295,13 +388,6 @@ func releaseKeyedBatchPostingDeltaSliceBuf(buf *keyedBatchPostingDeltaSliceBuf) 
 	keyedBatchPostingDeltaSlicePool.Put(buf)
 }
 
-func getBatchPostingDeltaMap() map[string]batchPostingDelta {
-	if v := batchPostingDeltaMapPool.Get(); v != nil {
-		return v.(map[string]batchPostingDelta)
-	}
-	return make(map[string]batchPostingDelta, 8)
-}
-
 func getFixedBatchPostingDeltaMap() map[uint64]batchPostingDelta {
 	if v := fixedBatchPostingDeltaMapPool.Get(); v != nil {
 		return v.(map[uint64]batchPostingDelta)
@@ -314,18 +400,6 @@ func getFixedBatchPostingDeltaMapHint(capHint int) map[uint64]batchPostingDelta 
 		return make(map[uint64]batchPostingDelta, min(capHint, batchPostingDeltaMapPoolMaxLen))
 	}
 	return getFixedBatchPostingDeltaMap()
-}
-
-func releaseBatchPostingDeltaMap(m map[string]batchPostingDelta) {
-	if m == nil {
-		return
-	}
-	oversized := len(m) > batchPostingDeltaMapPoolMaxLen
-	clear(m)
-	if oversized {
-		return
-	}
-	batchPostingDeltaMapPool.Put(m)
 }
 
 func releaseFixedBatchPostingDeltaMap(m map[uint64]batchPostingDelta) {
@@ -412,6 +486,95 @@ func releaseCountORBranchSliceBuf(buf *countORBranchSliceBuf) {
 }
 
 /**/
+
+type countLeadResidualExactFilterSliceBuf struct {
+	values []countLeadResidualExactFilter
+}
+
+var countLeadResidualExactFilterSlicePool sync.Pool
+
+func getCountLeadResidualExactFilterSliceBuf(capHint int) *countLeadResidualExactFilterSliceBuf {
+	if v := countLeadResidualExactFilterSlicePool.Get(); v != nil {
+		buf := v.(*countLeadResidualExactFilterSliceBuf)
+		if cap(buf.values) < capHint {
+			buf.values = slices.Grow(buf.values, capHint)
+		}
+		return buf
+	}
+	return &countLeadResidualExactFilterSliceBuf{
+		values: make([]countLeadResidualExactFilter, 0, max(capHint, 8)),
+	}
+}
+
+func releaseCountLeadResidualExactFilterSliceBuf(buf *countLeadResidualExactFilterSliceBuf) {
+	if buf == nil {
+		return
+	}
+	if cap(buf.values) > countLeadResidualExactFilterPoolMaxCap {
+		return
+	}
+	clear(buf.values[:cap(buf.values)])
+	buf.values = buf.values[:0]
+	countLeadResidualExactFilterSlicePool.Put(buf)
+}
+
+/**/
+
+type predicateSliceBuf struct{ values []predicate }
+
+var predicateSlicePool sync.Pool
+
+func getPredicateSliceBuf(capHint int) *predicateSliceBuf {
+	if v := predicateSlicePool.Get(); v != nil {
+		buf := v.(*predicateSliceBuf)
+		if cap(buf.values) < capHint {
+			buf.values = slices.Grow(buf.values, capHint)
+		}
+		return buf
+	}
+	return &predicateSliceBuf{values: make([]predicate, 0, max(capHint, 8))}
+}
+
+func releasePredicateSliceBuf(buf *predicateSliceBuf) {
+	if buf == nil {
+		return
+	}
+	if cap(buf.values) > predicateSlicePoolMaxCap {
+		return
+	}
+	clear(buf.values[:cap(buf.values)])
+	buf.values = buf.values[:0]
+	predicateSlicePool.Put(buf)
+}
+
+/**/
+
+type leafPredSliceBuf struct{ values []leafPred }
+
+var leafPredSlicePool sync.Pool
+
+func getLeafPredSliceBuf(capHint int) *leafPredSliceBuf {
+	if v := leafPredSlicePool.Get(); v != nil {
+		buf := v.(*leafPredSliceBuf)
+		if cap(buf.values) < capHint {
+			buf.values = slices.Grow(buf.values, capHint)
+		}
+		return buf
+	}
+	return &leafPredSliceBuf{values: make([]leafPred, 0, max(capHint, 8))}
+}
+
+func releaseLeafPredSliceBuf(buf *leafPredSliceBuf) {
+	if buf == nil {
+		return
+	}
+	if cap(buf.values) > leafPredSlicePoolMaxCap {
+		return
+	}
+	clear(buf.values[:cap(buf.values)])
+	buf.values = buf.values[:0]
+	leafPredSlicePool.Put(buf)
+}
 
 type plannerOROrderIterSliceBuf struct{ values []plannerOROrderBranchIter }
 

@@ -84,8 +84,8 @@ func prepareReadBenchWithMode[K ~string | ~uint64, V any](b *testing.B, db *DB[K
 	b.ResetTimer()
 }
 
-func seedBenchData(b *testing.B, db *DB[uint64, UserBench], n int) {
-	b.Helper()
+func seedBenchData(tb testing.TB, db *DB[uint64, UserBench], n int) {
+	tb.Helper()
 
 	db.DisableSync()
 	defer db.EnableSync()
@@ -123,7 +123,7 @@ func seedBenchData(b *testing.B, db *DB[uint64, UserBench], n int) {
 			return
 		}
 		if err := db.BatchSet(ids, vals); err != nil {
-			b.Fatalf("BatchSet(seed): %v", err)
+			tb.Fatalf("BatchSet(seed): %v", err)
 		}
 		ids = ids[:0]
 		vals = vals[:0]

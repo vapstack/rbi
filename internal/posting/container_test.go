@@ -53,7 +53,7 @@ func TestRunContainerPool_ReusedSizedContainerLeaksOldIntervals(t *testing.T) {
 	}
 }
 
-func TestRunContainerPool_ReusedLargerLengthClearsTail(t *testing.T) {
+func TestRunContainerPool_ReusedLargerLengthPreservesUnreleasedTail(t *testing.T) {
 	rc := acquireContainerRun(4, 4)
 	rc.iv[0] = interval16{start: 10, length: 1}
 	rc.iv[1] = interval16{start: 20, length: 2}
@@ -67,13 +67,19 @@ func TestRunContainerPool_ReusedLargerLengthClearsTail(t *testing.T) {
 	if !testRaceEnabled && reused != rc {
 		t.Fatalf("run container pool did not reuse container")
 	}
-	zero := make([]interval16, 4)
-	if !slices.Equal(reused.iv, zero) {
-		t.Fatalf("reused larger run container leaked old tail: %v", reused.iv)
+	zero := make([]interval16, 2)
+	if !slices.Equal(reused.iv[:2], zero) {
+		t.Fatalf("reused larger run container leaked released prefix: %v", reused.iv)
+	}
+	if !testRaceEnabled && !slices.Equal(reused.iv[2:], []interval16{
+		{start: 30, length: 3},
+		{start: 40, length: 4},
+	}) {
+		t.Fatalf("reused larger run container unexpectedly normalized unreleased tail: %v", reused.iv)
 	}
 }
 
-func TestArrayContainerPool_ReusedLargerLengthClearsTail(t *testing.T) {
+func TestArrayContainerPool_ReusedLargerLengthPreservesUnreleasedTail(t *testing.T) {
 	ac := newContainerArraySize(4)
 	copy(ac.content, []uint16{11, 22, 33, 44})
 	ac.content = ac.content[:2]
@@ -84,8 +90,33 @@ func TestArrayContainerPool_ReusedLargerLengthClearsTail(t *testing.T) {
 	if !testRaceEnabled && reused != ac {
 		t.Fatalf("array container pool did not reuse container")
 	}
-	if !slices.Equal(reused.content, []uint16{0, 0, 0, 0}) {
-		t.Fatalf("reused larger array container leaked old tail: %v", reused.content)
+	if !slices.Equal(reused.content[:2], []uint16{0, 0}) {
+		t.Fatalf("reused larger array container leaked released prefix: %v", reused.content)
+	}
+	if !testRaceEnabled && !slices.Equal(reused.content[2:], []uint16{33, 44}) {
+		t.Fatalf("reused larger array container unexpectedly normalized unreleased tail: %v", reused.content)
+	}
+}
+
+func TestContainerOwnershipHelpersRejectNil(t *testing.T) {
+	panicCases := []struct {
+		name string
+		fn   func()
+	}{
+		{name: "Retain", fn: func() { retainContainer(nil) }},
+		{name: "UniquelyOwned", fn: func() { containerUniquelyOwned(nil) }},
+		{name: "Release", fn: func() { releaseContainer(nil) }},
+	}
+
+	for _, tc := range panicCases {
+		t.Run(tc.name, func(t *testing.T) {
+			defer func() {
+				if recover() == nil {
+					t.Fatalf("expected panic")
+				}
+			}()
+			tc.fn()
+		})
 	}
 }
 

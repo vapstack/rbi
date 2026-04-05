@@ -56,7 +56,7 @@ func fuzzUint32s(data []byte) []uint32 {
 func listFromUint64Slice(ids []uint64) List {
 	var out List
 	for _, id := range ids {
-		out.Add(id)
+		out = out.BuildAdded(id)
 	}
 	return out
 }
@@ -89,8 +89,8 @@ func FuzzListRoundTrip(f *testing.F) {
 		if err := Skip(reader); err != nil {
 			t.Fatalf("Skip: %v", err)
 		}
-		var next List
-		if err := next.ReadFrom(reader); err != nil {
+		next, err := ReadFrom(reader)
+		if err != nil {
 			t.Fatalf("ReadFrom: %v", err)
 		}
 		defer next.Release()
@@ -113,21 +113,21 @@ func FuzzListSetOps(f *testing.F) {
 
 		union := listFromUint64Slice(leftIDs)
 		unionRight := listFromUint64Slice(rightIDs)
-		union.OrInPlace(unionRight)
+		union = union.BuildOr(unionRight)
 		unionRight.Release()
 		defer union.Release()
 		assertSameListSet(t, union, unionUint64(leftIDs, rightIDs))
 
 		intersection := listFromUint64Slice(leftIDs)
 		intersectionRight := listFromUint64Slice(rightIDs)
-		intersection.AndInPlace(intersectionRight)
+		intersection = intersection.BuildAnd(intersectionRight)
 		intersectionRight.Release()
 		defer intersection.Release()
 		assertSameListSet(t, intersection, intersectUint64(leftIDs, rightIDs))
 
 		diff := listFromUint64Slice(leftIDs)
 		diffRight := listFromUint64Slice(rightIDs)
-		diff.AndNotInPlace(diffRight)
+		diff = diff.BuildAndNot(diffRight)
 		diffRight.Release()
 		defer diff.Release()
 		assertSameListSet(t, diff, differenceUint64(leftIDs, rightIDs))

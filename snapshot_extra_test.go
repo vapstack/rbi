@@ -172,7 +172,7 @@ func snapshotExtraAssertNoFutureSnapshotRefs[K ~uint64 | ~string, V any](tb test
 func snapshotExtraPosting(ids ...uint64) posting.List {
 	var out posting.List
 	for _, id := range ids {
-		out.Add(id)
+		out = out.BuildAdded(id)
 	}
 	return out
 }
@@ -365,7 +365,6 @@ func TestSnapshotExtra_BeginQueryTxSnapshotIgnoresRealStagedSetBeforeCommit(t *t
 	}
 
 	db.unpinSnapshotRef(old.seq, holdRef)
-	holdRef = nil
 	snapshotExtraAssertNoFutureSnapshotRefs(t, db)
 }
 
@@ -475,7 +474,6 @@ func TestSnapshotExtra_BeginQueryTxSnapshotSurvivesRealStagedSetRollback(t *test
 	}
 
 	db.unpinSnapshotRef(old.seq, holdRef)
-	holdRef = nil
 	snapshotExtraAssertNoFutureSnapshotRefs(t, db)
 }
 
@@ -596,7 +594,6 @@ func TestSnapshotExtra_BeginQueryTxSnapshotIgnoresRealStagedBatchSetBeforeCommit
 	}
 
 	db.unpinSnapshotRef(old.seq, holdRef)
-	holdRef = nil
 	snapshotExtraAssertNoFutureSnapshotRefs(t, db)
 }
 
@@ -745,7 +742,6 @@ func TestSnapshotExtra_StringKeyPinnedSnapshotDoesNotSeeRealStagedFutureKey(t *t
 	}
 
 	db.unpinSnapshotRef(old.seq, holdRef)
-	holdRef = nil
 	snapshotExtraAssertNoFutureSnapshotRefs(t, db)
 }
 
@@ -879,7 +875,6 @@ func TestSnapshotExtra_StringKeyRollbackRemovesLiveCreatedIdxAndReusesIt(t *test
 	}
 
 	db.unpinSnapshotRef(old.seq, holdRef)
-	holdRef = nil
 	snapshotExtraAssertNoFutureSnapshotRefs(t, db)
 }
 
@@ -1053,7 +1048,6 @@ func TestSnapshotExtra_StringKeyBatchRollbackRemovesAllLiveCreatedIdxs(t *testin
 	}
 
 	db.unpinSnapshotRef(old.seq, holdRef)
-	holdRef = nil
 	snapshotExtraAssertNoFutureSnapshotRefs(t, db)
 }
 

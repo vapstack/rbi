@@ -12,37 +12,6 @@ import (
 	"github.com/vapstack/rbi/internal/posting"
 )
 
-const (
-	singleChunkCap       = 32768
-	singleAdaptiveMaxLen = 200_000
-)
-
-var singleIDsPool = sync.Pool{
-	New: func() any {
-		return &singleIDsBuffer{
-			values: make([]uint64, 0, singleChunkCap),
-		}
-	},
-}
-
-type singleIDsBuffer struct {
-	values []uint64
-}
-
-func getSingleIDsBuf() *singleIDsBuffer {
-	buf := singleIDsPool.Get().(*singleIDsBuffer)
-	buf.values = buf.values[:0]
-	return buf
-}
-
-func releaseSingleIDs(buf *singleIDsBuffer) {
-	if buf == nil || cap(buf.values) != singleChunkCap {
-		return
-	}
-	buf.values = buf.values[:0]
-	singleIDsPool.Put(buf)
-}
-
 func (qv *queryView[K, V]) checkUsedQuery(q *qx.QX) error {
 	for _, o := range q.Order {
 		if _, ok := qv.fields[o.Field]; !ok {
@@ -338,22 +307,26 @@ func (qv *queryView[K, V]) evalSimple(e qx.Expr) (postingResult, error) {
 			return postingResult{}, fmt.Errorf("%v: %v: no values provided", ErrInvalidQuery, e.Op)
 		}
 
-		var res posting.List
-
+		capHint := len(vals)
+		if hasNil {
+			capHint++
+		}
+		builder := newPostingUnionBuilder(postingBatchSinglesEnabled(uint64(capHint)))
+		defer builder.release()
 		for _, v := range vals {
 			ids := ov.lookupPostingRetained(v)
 			if ids.IsEmpty() {
 				continue
 			}
-			ids.OrInto(&res)
+			builder.addPosting(ids)
 		}
 		if hasNil {
 			ids := qv.nilFieldOverlay(e.Field).lookupPostingRetained(nilIndexEntryKey)
 			if !ids.IsEmpty() {
-				ids.OrInto(&res)
+				builder.addPosting(ids)
 			}
 		}
-		return postingResult{ids: res}, nil
+		return postingResult{ids: builder.finish(false)}, nil
 
 	case qx.OpHASANY, qx.OpHAS:
 		if !f.Slice {
@@ -382,7 +355,7 @@ func (qv *queryView[K, V]) evalSimple(e qx.Expr) (postingResult, error) {
 				if acc.IsEmpty() {
 					acc = ids.Clone()
 				} else {
-					acc.AndInPlace(ids)
+					acc = acc.BuildAnd(ids)
 				}
 				if acc.IsEmpty() {
 					return postingResult{ids: acc}, nil
@@ -392,16 +365,16 @@ func (qv *queryView[K, V]) evalSimple(e qx.Expr) (postingResult, error) {
 		}
 
 		// HASANY - OR logic
-		var res posting.List
-
+		builder := newPostingUnionBuilder(postingBatchSinglesEnabled(uint64(len(vals))))
+		defer builder.release()
 		for _, v := range vals {
 			ids := ov.lookupPostingRetained(v)
 			if ids.IsEmpty() {
 				continue
 			}
-			ids.OrInto(&res)
+			builder.addPosting(ids)
 		}
-		return postingResult{ids: res}, nil
+		return postingResult{ids: builder.finish(false)}, nil
 
 	case qx.OpGT, qx.OpGTE, qx.OpLT, qx.OpLTE, qx.OpPREFIX:
 		bound, isSlice, err := qv.exprValueToNormalizedScalarBound(e)
@@ -414,110 +387,8 @@ func (qv *queryView[K, V]) evalSimple(e qx.Expr) (postingResult, error) {
 		if bound.empty {
 			return postingResult{}, nil
 		}
-		cacheKey := ""
-		if !bound.full {
-			cacheKey = qv.materializedPredCacheKeyForScalar(e.Field, bound.op, bound.key)
-		}
-		if cacheKey != "" {
-			if cached, ok := qv.snap.loadMaterializedPred(cacheKey); ok {
-				if cached.IsEmpty() {
-					return postingResult{}, nil
-				}
-				return postingResult{ids: cached}, nil
-			}
-		}
-
-		rb := rangeBounds{has: true}
-		if bound.full {
-			rb = rangeBounds{has: true}
-		} else {
-			switch bound.op {
-			case qx.OpGT:
-				rb.applyLo(bound.key, false)
-			case qx.OpGTE:
-				rb.applyLo(bound.key, true)
-			case qx.OpLT:
-				rb.applyHi(bound.key, false)
-			case qx.OpLTE:
-				rb.applyHi(bound.key, true)
-			case qx.OpPREFIX:
-				rb.hasPrefix = true
-				rb.prefix = bound.key
-			case qx.OpEQ:
-				rb.applyLo(bound.key, true)
-				rb.applyHi(bound.key, true)
-			}
-		}
-
-		br := ov.rangeForBounds(rb)
-		if overlayRangeEmpty(br) {
-			if cacheKey != "" {
-				qv.snap.storeMaterializedPred(cacheKey, posting.List{})
-			}
-			return postingResult{}, nil
-		}
-
-		// Prefix keeps its dedicated path; other numeric ranges can use bucket
-		// routing regardless of predicate cache sharing.
-		if e.Op != qx.OpPREFIX {
-			if out, ok := qv.tryEvalNumericRangeBuckets(e.Field, f, ov, br); ok {
-				if cacheKey != "" {
-					qv.tryShareMaterializedPred(cacheKey, &out.ids)
-				}
-				return out, nil
-			}
-		}
-
-		var res posting.List
-		spanLen := br.baseEnd - br.baseStart
-		bulkSingles := spanLen > 0 && spanLen <= singleAdaptiveMaxLen
-
-		var singles *singleIDsBuffer
-		if bulkSingles {
-			singles = getSingleIDsBuf()
-			defer releaseSingleIDs(singles)
-		}
-
-		flushSingles := func() {
-			if singles == nil || len(singles.values) == 0 {
-				return
-			}
-			slices.Sort(singles.values)
-			res.AddMany(singles.values)
-			singles.values = singles.values[:0]
-		}
-
-		cur := ov.newCursor(br, false)
-		for {
-			_, ids, ok := cur.next()
-			if !ok {
-				break
-			}
-			if ids.IsEmpty() {
-				continue
-			}
-
-			// Singleton-heavy ranges are accumulated via batched AddMany
-			// because repeated OR of tiny bitmaps is much more expensive.
-			if idx, ok := ids.TrySingle(); ok {
-				if bulkSingles {
-					singles.values = append(singles.values, idx)
-					if len(singles.values) == cap(singles.values) {
-						flushSingles()
-					}
-				} else {
-					res.Add(idx)
-				}
-				continue
-			}
-
-			flushSingles()
-			ids.OrInto(&res)
-		}
-
-		flushSingles()
-		qv.tryShareMaterializedPred(cacheKey, &res)
-		return postingResult{ids: res}, nil
+		core := qv.prepareScalarRangePredicateFromBound(e, f, bound)
+		return core.evalMaterializedPostingResult(ov), nil
 
 	case qx.OpSUFFIX, qx.OpCONTAINS:
 		v, isSlice, isNil, err := qv.exprValueToIdxScalar(e)
@@ -540,25 +411,10 @@ func (qv *queryView[K, V]) evalSimple(e qx.Expr) (postingResult, error) {
 			}
 		}
 
-		var res posting.List
 		full := ov.rangeForBounds(rangeBounds{has: true})
 		spanLen := full.baseEnd - full.baseStart
-		bulkSingles := spanLen > 0 && spanLen <= singleAdaptiveMaxLen
-
-		var singles *singleIDsBuffer
-		if bulkSingles {
-			singles = getSingleIDsBuf()
-			defer releaseSingleIDs(singles)
-		}
-
-		flushSingles := func() {
-			if singles == nil || len(singles.values) == 0 {
-				return
-			}
-			slices.Sort(singles.values)
-			res.AddMany(singles.values)
-			singles.values = singles.values[:0]
-		}
+		builder := newPostingUnionBuilder(spanLen > 0 && spanLen <= singleAdaptiveMaxLen)
+		defer builder.release()
 
 		cur := ov.newCursor(full, false)
 		for {
@@ -577,22 +433,10 @@ func (qv *queryView[K, V]) evalSimple(e qx.Expr) (postingResult, error) {
 
 			// Same singleton optimization for suffix/contains scans over wide
 			// dictionary spans.
-			if idx, ok := ids.TrySingle(); ok {
-				if bulkSingles {
-					singles.values = append(singles.values, idx)
-					if len(singles.values) == cap(singles.values) {
-						flushSingles()
-					}
-				} else {
-					res.Add(idx)
-				}
-				continue
-			}
-			flushSingles()
-			ids.OrInto(&res)
+			builder.addPosting(ids)
 		}
-		flushSingles()
-		qv.tryShareMaterializedPred(cacheKey, &res)
+		res := builder.finish(false)
+		res = qv.tryShareMaterializedPred(cacheKey, res)
 		return postingResult{ids: res}, nil
 
 	default:
@@ -600,7 +444,7 @@ func (qv *queryView[K, V]) evalSimple(e qx.Expr) (postingResult, error) {
 	}
 }
 
-func (qv *queryView[K, V]) unionPostings(posts []posting.List) posting.List {
+func materializePostingUnionOwned(posts []posting.List) posting.List {
 	dst := posts[:0]
 	for _, ids := range posts {
 		if ids.IsEmpty() {
@@ -619,12 +463,12 @@ func (qv *queryView[K, V]) unionPostings(posts []posting.List) posting.List {
 
 	// Few postings do not justify goroutine overhead.
 	if n < 256 {
-		return qv.linearPostingUnion(posts)
+		return linearPostingUnionOwned(posts)
 	}
-	return qv.parallelBatchedPostingUnion(posts)
+	return parallelBatchedPostingUnionOwned(posts)
 }
 
-func (qv *queryView[K, V]) linearPostingUnion(posts []posting.List) posting.List {
+func linearPostingUnionOwned(posts []posting.List) posting.List {
 	bestIdx := 0
 	maxCard := posts[0].Cardinality()
 	for i := 1; i < len(posts); i++ {
@@ -640,13 +484,12 @@ func (qv *queryView[K, V]) linearPostingUnion(posts []posting.List) posting.List
 		if i == bestIdx {
 			continue
 		}
-		res.OrInPlace(ids)
+		res = res.BuildOr(ids)
 	}
-	res.Optimize()
-	return res
+	return res.BuildOptimized()
 }
 
-func (qv *queryView[K, V]) parallelBatchedPostingUnion(posts []posting.List) posting.List {
+func parallelBatchedPostingUnionOwned(posts []posting.List) posting.List {
 	n := len(posts)
 
 	workers := 8
@@ -654,11 +497,12 @@ func (qv *queryView[K, V]) parallelBatchedPostingUnion(posts []posting.List) pos
 		workers = n / 2
 	}
 	if workers < 2 {
-		return qv.linearPostingUnion(posts)
+		return linearPostingUnionOwned(posts)
 	}
 
 	chunkSize := (n + workers - 1) / workers
-	results := make([]posting.List, workers)
+	var resultsArr [8]posting.List
+	results := resultsArr[:workers]
 
 	var wg sync.WaitGroup
 	for i := 0; i < workers; i++ {
@@ -674,7 +518,7 @@ func (qv *queryView[K, V]) parallelBatchedPostingUnion(posts []posting.List) pos
 		wg.Add(1)
 		go func(idx int, part []posting.List) {
 			defer wg.Done()
-			results[idx] = qv.linearPostingUnion(part)
+			results[idx] = linearPostingUnionOwned(part)
 		}(i, posts[start:end])
 	}
 
@@ -682,10 +526,9 @@ func (qv *queryView[K, V]) parallelBatchedPostingUnion(posts []posting.List) pos
 
 	final := results[0]
 	for i := 1; i < len(results); i++ {
-		final.MergeOwned(results[i])
+		final = final.BuildMergedOwned(results[i])
 	}
-	final.Optimize()
-	return final
+	return final.BuildOptimized()
 }
 
 // evalSliceEQ evaluates equality for slice fields by intersecting member
@@ -706,7 +549,7 @@ func (qv *queryView[K, V]) evalSliceEQ(field string, vals []string) (postingResu
 	if useZeroComplement {
 		nonEmpty := lenOV.lookupPostingRetained(lenIndexNonEmptyKey)
 		lenBM = qv.snapshotUniverseView().Clone()
-		lenBM.AndNotInPlace(nonEmpty)
+		lenBM = lenBM.BuildAndNot(nonEmpty)
 	} else {
 		lenKey := uint64ByteStr(uint64(len(vals)))
 		lenBM = lenOV.lookupPostingRetained(lenKey)
@@ -723,7 +566,7 @@ func (qv *queryView[K, V]) evalSliceEQ(field string, vals []string) (postingResu
 			acc.Release()
 			return postingResult{}, nil
 		}
-		acc.AndInPlace(ids)
+		acc = acc.BuildAnd(ids)
 		if acc.IsEmpty() {
 			return postingResult{ids: acc}, nil
 		}
@@ -1162,7 +1005,7 @@ func sliceValueToIdxStrings(v reflect.Value, fm *field) ([]string, bool, error) 
 	return ixs, hasNil, nil
 }
 
-func (qv *queryView[K, V]) scalarLookupPostings(field string, keys []string, includeNil bool) ([]posting.List, uint64, func()) {
+func (qv *queryView[K, V]) scalarLookupPostings(field string, keys []string, includeNil bool) ([]posting.List, uint64, *postingSliceBuf) {
 	postsBuf := getPostingSliceBuf(len(keys) + btoi(includeNil))
 	posts := postsBuf.values
 	var est uint64
@@ -1183,12 +1026,8 @@ func (qv *queryView[K, V]) scalarLookupPostings(field string, keys []string, inc
 			est += ids.Cardinality()
 		}
 	}
-
-	cleanup := func() {
-		postsBuf.values = posts
-		releasePostingSliceBuf(postsBuf)
-	}
-	return posts, est, cleanup
+	postsBuf.values = posts
+	return posts, est, postsBuf
 }
 
 func (qv *queryView[K, V]) exprValueToIdxScalar(expr qx.Expr) (string, bool, bool, error) {
@@ -1214,7 +1053,7 @@ func (qv *queryView[K, V]) exprValueToIdxScalar(expr qx.Expr) (string, bool, boo
 }
 
 func (qv *queryView[K, V]) diffPostingResult(acc, sub postingResult) (postingResult, error) {
-	acc.ids.AndNotInPlace(sub.ids)
+	acc.ids = acc.ids.BuildAndNot(sub.ids)
 	sub.release()
 	return acc, nil
 }
@@ -1301,17 +1140,10 @@ func (b postingResult) release() {
 	b.ids.Release()
 }
 
-func (b postingResult) clone() postingResult {
-	if b.ids.IsEmpty() {
-		return b
-	}
-	return postingResult{ids: b.ids.Clone(), neg: b.neg}
-}
-
 func diffOwned(a, b posting.List) posting.List {
 	res := a.Clone()
 	if !b.IsEmpty() {
-		b.AndNotFrom(&res)
+		res = res.BuildAndNot(b)
 	}
 	return res
 }
@@ -1333,22 +1165,22 @@ func (qv *queryView[K, V]) andPostingResult(a, b postingResult) (postingResult, 
 
 	case !a.neg && !b.neg:
 		if a.ids.Cardinality() <= b.ids.Cardinality() {
-			a.ids.AndInPlace(b.ids)
+			a.ids = a.ids.BuildAnd(b.ids)
 			b.release()
 			return a, nil
 		}
-		b.ids.AndInPlace(a.ids)
+		b.ids = b.ids.BuildAnd(a.ids)
 		a.release()
 		return b, nil
 
 	case a.neg && b.neg:
 		if a.ids.Cardinality() >= b.ids.Cardinality() {
-			a.ids.OrInPlace(b.ids)
+			a.ids = a.ids.BuildOr(b.ids)
 			b.release()
 			a.neg = true
 			return a, nil
 		}
-		b.ids.OrInPlace(a.ids)
+		b.ids = b.ids.BuildOr(a.ids)
 		a.release()
 		b.neg = true
 		return b, nil
@@ -1392,22 +1224,22 @@ func (qv *queryView[K, V]) orPostingResult(a, b postingResult) postingResult {
 
 	case !a.neg && !b.neg:
 		if a.ids.Cardinality() >= b.ids.Cardinality() {
-			a.ids.OrInPlace(b.ids)
+			a.ids = a.ids.BuildOr(b.ids)
 			b.release()
 			return a
 		}
-		b.ids.OrInPlace(a.ids)
+		b.ids = b.ids.BuildOr(a.ids)
 		a.release()
 		return b
 
 	case a.neg && b.neg:
 		if a.ids.Cardinality() <= b.ids.Cardinality() {
-			a.ids.AndInPlace(b.ids)
+			a.ids = a.ids.BuildAnd(b.ids)
 			b.release()
 			a.neg = true
 			return a
 		}
-		b.ids.AndInPlace(a.ids)
+		b.ids = b.ids.BuildAnd(a.ids)
 		a.release()
 		b.neg = true
 		return b

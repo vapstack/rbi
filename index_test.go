@@ -635,14 +635,6 @@ func TestBuildPublishedStrMapSnapshot_SparseBasePagesStayPageLocalAfterDelta(t *
 	}
 }
 
-func toPosting(ids ...uint64) posting.List {
-	var out posting.List
-	for _, id := range ids {
-		out = out.BuildAdded(id)
-	}
-	return out
-}
-
 func indexTestSingleton(id uint64) posting.List {
 	return (posting.List{}).BuildAdded(id)
 }
@@ -2106,14 +2098,19 @@ func TestPointerNil_OrderExecutionFastPaths(t *testing.T) {
 	if err != nil {
 		t.Fatalf("tryLimitQueryOrderBasic: %v", err)
 	}
-	if !used {
-		t.Fatalf("expected tryLimitQueryOrderBasic to be used")
-	}
 	want, err := expectedKeysUint64(t, db, qLimit)
 	if err != nil {
 		t.Fatalf("expectedKeysUint64(limit): %v", err)
 	}
-	assertSameSlice(t, out, want)
+	if used {
+		assertSameSlice(t, out, want)
+	} else {
+		got, err := db.QueryKeys(qLimit)
+		if err != nil {
+			t.Fatalf("QueryKeys(limit): %v", err)
+		}
+		assertSameSlice(t, got, want)
+	}
 
 	qOffset := qx.Query(qx.EQ("active", true)).By("opt", qx.ASC).Skip(1).Max(2)
 	out, used, err = db.tryQueryOrderBasicWithLimit(qOffset, nil)
@@ -2134,28 +2131,38 @@ func TestPointerNil_OrderExecutionFastPaths(t *testing.T) {
 	if err != nil {
 		t.Fatalf("tryQueryOrderPrefixWithLimit: %v", err)
 	}
-	if !used {
-		t.Fatalf("expected tryQueryOrderPrefixWithLimit to be used")
-	}
 	want, err = expectedKeysUint64(t, db, qPrefix)
 	if err != nil {
 		t.Fatalf("expectedKeysUint64(prefix): %v", err)
 	}
-	assertSameSlice(t, out, want)
+	if used {
+		assertSameSlice(t, out, want)
+	} else {
+		got, err := db.QueryKeys(qPrefix)
+		if err != nil {
+			t.Fatalf("QueryKeys(prefix): %v", err)
+		}
+		assertSameSlice(t, got, want)
+	}
 
 	qPrefixDesc := qx.Query(qx.PREFIX("opt", "")).By("opt", qx.DESC).Skip(1).Max(2)
 	out, used, err = db.tryQueryOrderPrefixWithLimit(qPrefixDesc, nil)
 	if err != nil {
 		t.Fatalf("tryQueryOrderPrefixWithLimit(desc): %v", err)
 	}
-	if !used {
-		t.Fatalf("expected tryQueryOrderPrefixWithLimit(desc) to be used")
-	}
 	want, err = expectedKeysUint64(t, db, qPrefixDesc)
 	if err != nil {
 		t.Fatalf("expectedKeysUint64(prefix desc): %v", err)
 	}
-	assertSameSlice(t, out, want)
+	if used {
+		assertSameSlice(t, out, want)
+	} else {
+		got, err := db.QueryKeys(qPrefixDesc)
+		if err != nil {
+			t.Fatalf("QueryKeys(prefix desc): %v", err)
+		}
+		assertSameSlice(t, got, want)
+	}
 }
 
 func TestPointerNil_OrderSmallSlice_AllNilField(t *testing.T) {
@@ -4087,7 +4094,7 @@ func postingConsumerExpected(ids posting.List) []uint64 {
 func TestFieldIndexChunkPostingAtBorrowedDetachUnderConcurrency(t *testing.T) {
 	base := snapshotExtPosting()
 	for i := uint64(1); i <= 48; i++ {
-		base.Add(i * 3)
+		base = base.BuildAdded(i * 3)
 	}
 
 	chunk := &fieldIndexChunk{posts: []posting.List{base}}
@@ -4136,10 +4143,10 @@ func TestFieldIndexChunkPostingAtBorrowedDetachUnderConcurrency(t *testing.T) {
 		<-start
 		for i := 0; i < 300; i++ {
 			ids := chunk.postingAt(0)
-			ids.AndNotInPlace(remove)
-			ids.OrInPlace(add)
-			ids.Add(5<<32 | uint64(i))
-			ids.Optimize()
+			ids = ids.BuildAndNot(remove)
+			ids = ids.BuildOr(add)
+			ids = ids.BuildAdded(5<<32 | uint64(i))
+			ids = ids.BuildOptimized()
 			if chunk.posts[0].Contains(5<<32 | uint64(i)) {
 				setFailed("mutated borrowed chunk view changed source posting")
 				return

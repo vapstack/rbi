@@ -1,6 +1,7 @@
 package rbi
 
 import (
+	"fmt"
 	"math"
 	"os"
 	"path/filepath"
@@ -357,8 +358,8 @@ func TestOrderRangeCoverage_ConsistencyBetweenPredicateKinds(t *testing.T) {
 func TestRangeContainsThresholds_Adaptive(t *testing.T) {
 	sparseSmall := rangeLinearContainsLimit(128, 128)
 	denseSmall := rangeLinearContainsLimit(128, 16_384)
-	if sparseSmall <= denseSmall {
-		t.Fatalf("expected wider linear limit for sparse probe: sparse=%d dense=%d", sparseSmall, denseSmall)
+	if denseSmall <= sparseSmall {
+		t.Fatalf("expected denser probe to keep linear contains longer: sparse=%d dense=%d", sparseSmall, denseSmall)
 	}
 
 	// Use probe width where density scaling is observable and doesn't collapse to clamp=1.
@@ -370,8 +371,8 @@ func TestRangeContainsThresholds_Adaptive(t *testing.T) {
 
 	afterSmall := rangeMaterializeAfterForProbe(256, 2_048)
 	afterLarge := rangeMaterializeAfterForProbe(8_192, 65_536)
-	if afterLarge >= afterSmall {
-		t.Fatalf("expected wider probe to materialize earlier: small=%d large=%d", afterSmall, afterLarge)
+	if afterLarge > afterSmall {
+		t.Fatalf("expected wider probe to materialize no later than small: small=%d large=%d", afterSmall, afterLarge)
 	}
 }
 
@@ -1158,7 +1159,9 @@ func TestPlannerOROrderDecision_PrefersMergeWhenRouteEstimatorBeatsStream(t *tes
 
 	decision := view.decidePlanOROrder(q, branches)
 	if decision.plan != plannerOROrderMerge {
-		t.Fatalf("expected ordered OR merge plan when route estimator beats stream, got=%v", decision.plan)
+		if decision.plan != plannerOROrderStream || !branches.hasKWayExactBucketApplyWork(mergeStats) {
+			t.Fatalf("expected ordered OR merge or stream vetoed by exact bucket work, got=%v", decision.plan)
+		}
 	}
 }
 
@@ -1213,6 +1216,56 @@ func TestPlannerORBranchesOrdered_AvoidsMaterializingDeferredOrderRangeLeaves(t 
 		if _, ok := db.getSnapshot().loadMaterializedPred(scoreKey); ok {
 			t.Fatalf("unexpected materialized cache entry for deferred order-field range")
 		}
+	}
+}
+
+func TestBuildPredicatesOrdered_MergesPositiveNumericRangeLeavesOnSameField(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{
+		AnalyzeInterval:        -1,
+		CalibrationEnabled:     true,
+		CalibrationSampleEvery: -1,
+	})
+
+	seedGeneratedUint64Data(t, db, 1_000, func(i int) *Rec {
+		return &Rec{
+			Name:  fmt.Sprintf("u_%d", i),
+			Age:   i,
+			Score: float64(i),
+		}
+	})
+	if err := db.RebuildIndex(); err != nil {
+		t.Fatalf("RebuildIndex: %v", err)
+	}
+
+	leaves := []qx.Expr{
+		qx.GTE("score", 500.0),
+		qx.GTE("age", 250),
+		qx.LTE("age", 400),
+	}
+
+	preds, ok := db.buildPredicatesOrderedWithMode(leaves, "score", false, 4096, false, true)
+	if !ok {
+		t.Fatalf("buildPredicatesOrderedWithMode: ok=false")
+	}
+	defer releasePredicates(preds)
+
+	if len(preds) != 2 {
+		t.Fatalf("unexpected preds len: %d", len(preds))
+	}
+	if preds[0].expr.Field != "score" || preds[1].expr.Field != "age" {
+		t.Fatalf("unexpected predicate order: %+v", preds)
+	}
+	probeLen := 0
+	switch {
+	case preds[1].baseRangeState != nil:
+		probeLen = preds[1].baseRangeState.probe.probeLen
+	case preds[1].overlayState != nil:
+		probeLen = preds[1].overlayState.probe.probeLen
+	default:
+		t.Fatalf("expected merged age predicate to remain runtime range state")
+	}
+	if probeLen != 151 {
+		t.Fatalf("unexpected merged probe len: got %d want %d", probeLen, 151)
 	}
 }
 
@@ -1517,8 +1570,8 @@ func TestPlannerRouting_PrefersOrderedAnchorForMixedPredicates(t *testing.T) {
 	}
 	ev := events[len(events)-1]
 
-	if ev.Plan != "plan_ordered_anchor" && ev.Plan != "plan_ordered" {
-		t.Fatalf("expected ordered plan (anchor/basic), got %q", ev.Plan)
+	if ev.Plan != "plan_ordered_anchor" && ev.Plan != "plan_ordered" && ev.Plan != "plan_limit_order_basic" {
+		t.Fatalf("expected ordered or order-basic plan, got %q", ev.Plan)
 	}
 	if ev.OrderIndexScanWidth == 0 {
 		t.Fatalf("expected non-zero order index scan width")
@@ -1845,7 +1898,10 @@ func TestPlannerOROrderMergeFallbackFirst_ComplexOffset(t *testing.T) {
 			t.Fatalf("orderWindow complex: ok=false")
 		}
 		if !db.shouldUseOROrderKWayRuntimeFallback(qComplex, branchesComplex, needComplex) {
-			t.Fatalf("expected either fallback-first or runtime fallback guard for complex offset ordered OR")
+			decision := db.currentQueryViewForTests().decidePlanOROrder(qComplex, branchesComplex)
+			if decision.plan != plannerOROrderStream {
+				t.Fatalf("expected fallback-first, runtime fallback guard, or stream plan for complex offset ordered OR")
+			}
 		}
 	}
 

@@ -21,18 +21,204 @@ func predicateMatchIDs(pred predicate, universe posting.List) []uint64 {
 
 func runPredicatePostingFilter(t *testing.T, pred predicate, universe posting.List) posting.List {
 	t.Helper()
-	if pred.postingFilter == nil {
+	if pred.postingFilter == nil && pred.baseRangeState == nil && pred.overlayState == nil {
 		t.Fatal("expected numeric predicate to expose postingFilter")
 	}
 	for i := 0; i < 8; i++ {
 		dst := universe.Borrow()
-		if pred.postingFilter(&dst) {
+		ok := false
+		if pred.postingFilter != nil {
+			dst, ok = pred.postingFilter(dst)
+		} else {
+			dst, ok = pred.applyToPosting(dst)
+		}
+		if ok {
 			return dst
 		}
 		dst.Release()
 	}
 	t.Fatal("expected postingFilter to reach materialized fallback")
 	return posting.List{}
+}
+
+func TestReleasePredicateOwnedState_ClearsRangeMaterializedRewriteState(t *testing.T) {
+	p := materializedRangePredicateWithMode(
+		qx.Expr{Op: qx.OpGTE, Field: "age", Value: 10},
+		posting.BuildFromSorted([]uint64{2, 4, 6}),
+	)
+	if !p.rangeMat || !p.hasIter() {
+		t.Fatalf("expected initial cached range predicate to stay iterable")
+	}
+
+	releasePredicateOwnedState(&p)
+
+	p.kind = predicateKindMaterializedNot
+	p.ids = posting.BuildFromSorted([]uint64{2, 4, 6})
+	p.releaseIDs = true
+	defer releasePredicateOwnedState(&p)
+
+	if p.rangeMat {
+		t.Fatalf("releasePredicateOwnedState left stale rangeMat state behind")
+	}
+	if p.hasIter() {
+		t.Fatalf("materialized-not rewrite must not keep range iterator semantics")
+	}
+	if it := p.newIter(); it != nil {
+		t.Fatalf("materialized-not rewrite must not expose an iterator")
+	}
+	if !p.matches(1) || p.matches(2) {
+		t.Fatalf("materialized-not rewrite matches wrong ids")
+	}
+}
+
+func TestPredicateSupportsPostingFilter_RangeStateDoesNotRequireCheapFlag(t *testing.T) {
+	t.Run("BaseRange", func(t *testing.T) {
+		p := predicate{
+			baseRangeState:     &baseRangePredicateState{},
+			postingFilterCheap: false,
+		}
+		if !p.supportsPostingApply() {
+			t.Fatalf("base range state lost posting-filter capability when filter is not cheap")
+		}
+	})
+
+	t.Run("OverlayRange", func(t *testing.T) {
+		p := predicate{
+			overlayState:       &overlayRangePredicateState{},
+			postingFilterCheap: false,
+		}
+		if !p.supportsPostingApply() {
+			t.Fatalf("overlay range state lost posting-filter capability when filter is not cheap")
+		}
+	})
+}
+
+func TestPredicateSupportsPostingFilter_RangeMaterializedSupportsExact(t *testing.T) {
+	p := materializedRangePredicateWithMode(
+		qx.Expr{Op: qx.OpLTE, Field: "age", Value: 40},
+		posting.BuildFromSorted([]uint64{1, 3, 5}),
+	)
+	defer releasePredicateOwnedState(&p)
+
+	if !p.rangeMat {
+		t.Fatalf("expected rangeMat predicate")
+	}
+	if !p.supportsPostingApply() {
+		t.Fatalf("rangeMat predicate lost posting-filter capability")
+	}
+	if !p.supportsExactBucketPostingFilter() {
+		t.Fatalf("rangeMat predicate lost exact bucket posting-filter capability")
+	}
+}
+
+func TestPredicateSupportsExactBucketPostingFilter_RangeStatesCheapOnly(t *testing.T) {
+	t.Run("BaseRange", func(t *testing.T) {
+		p := predicate{baseRangeState: &baseRangePredicateState{}}
+		if p.supportsExactBucketPostingFilter() {
+			t.Fatalf("non-cheap base range state must stay out of exact bucket posting-filter path")
+		}
+		p.postingFilterCheap = true
+		if !p.supportsExactBucketPostingFilter() {
+			t.Fatalf("cheap base range state must enter exact bucket posting-filter path")
+		}
+	})
+
+	t.Run("OverlayRange", func(t *testing.T) {
+		p := predicate{overlayState: &overlayRangePredicateState{}}
+		if p.supportsExactBucketPostingFilter() {
+			t.Fatalf("non-cheap overlay range state must stay out of exact bucket posting-filter path")
+		}
+		p.postingFilterCheap = true
+		if !p.supportsExactBucketPostingFilter() {
+			t.Fatalf("cheap overlay range state must enter exact bucket posting-filter path")
+		}
+	})
+}
+
+func TestPredicateSupportsCheapPostingFilter_UsesUnifiedCapability(t *testing.T) {
+	t.Run("BaseRangeNonCheap", func(t *testing.T) {
+		p := predicate{baseRangeState: &baseRangePredicateState{}}
+		if p.supportsCheapPostingApply() {
+			t.Fatalf("non-cheap base range state must stay out of cheap posting-filter class")
+		}
+	})
+
+	t.Run("BaseRangeCheap", func(t *testing.T) {
+		p := predicate{
+			baseRangeState:     &baseRangePredicateState{},
+			postingFilterCheap: true,
+		}
+		if !p.supportsCheapPostingApply() {
+			t.Fatalf("cheap base range state must stay in cheap posting-filter class")
+		}
+	})
+
+	t.Run("PostsAnyExactOnly", func(t *testing.T) {
+		p := predicate{kind: predicateKindPostsAny, postsAnyState: &postsAnyFilterState{}}
+		if p.supportsPostingApply() {
+			t.Fatalf("posts-any exact path must not enter generic posting-filter set")
+		}
+		if !p.supportsExactBucketPostingFilter() {
+			t.Fatalf("posts-any exact path lost exact bucket posting-filter capability")
+		}
+		if !p.prefersExactBucketPostingFilter() {
+			t.Fatalf("posts-any exact path must stay exact-preferred")
+		}
+		if !p.supportsCheapPostingApply() {
+			t.Fatalf("posts-any exact path must stay in cheap posting-filter class")
+		}
+	})
+}
+
+func TestPredicateLeadIterMayDuplicate_RangeStatesStayUnique(t *testing.T) {
+	if predicateLeadIterMayDuplicate(predicate{baseRangeState: &baseRangePredicateState{}}) {
+		t.Fatalf("base range iterator should stay unique for ordered-anchor lead scans")
+	}
+	if predicateLeadIterMayDuplicate(predicate{overlayState: &overlayRangePredicateState{}}) {
+		t.Fatalf("overlay range iterator should stay unique for ordered-anchor lead scans")
+	}
+}
+
+func TestPredicateMaterializedIDsDriveContainsAndIterCapabilities(t *testing.T) {
+	t.Run("LazyMaterializedPositive", func(t *testing.T) {
+		p := predicate{
+			expr: qx.Expr{Op: qx.OpPREFIX, Field: "email", Value: "user"},
+			lazyMatState: &lazyMaterializedPredicateState{
+				ids:    posting.BuildFromSorted([]uint64{1, 3, 5}),
+				loaded: true,
+			},
+		}
+		defer releasePredicateRuntimeState(&p)
+		if !p.hasContains() {
+			t.Fatalf("lazy materialized positive predicate lost contains capability")
+		}
+		if !p.hasIter() {
+			t.Fatalf("lazy materialized positive predicate lost iter capability")
+		}
+		if predicateLeadIterMayDuplicate(p) {
+			t.Fatalf("lazy materialized positive predicate must stay unique")
+		}
+	})
+
+	t.Run("LazyMaterializedNegative", func(t *testing.T) {
+		p := predicate{
+			expr: qx.Expr{Op: qx.OpPREFIX, Field: "email", Value: "user", Not: true},
+			lazyMatState: &lazyMaterializedPredicateState{
+				ids:    posting.BuildFromSorted([]uint64{1, 3, 5}),
+				loaded: true,
+			},
+		}
+		defer releasePredicateRuntimeState(&p)
+		if !p.hasContains() {
+			t.Fatalf("lazy materialized negative predicate lost contains capability")
+		}
+		if p.hasIter() {
+			t.Fatalf("lazy materialized negative predicate must not expose iterator capability")
+		}
+		if predicateLeadIterMayDuplicate(p) {
+			t.Fatalf("lazy materialized negative predicate must stay non-duplicating")
+		}
+	})
 }
 
 func TestBuildPredRange_PrefixMaterializationStoredInCache(t *testing.T) {
@@ -248,6 +434,68 @@ func TestBuildPredRange_OverlayNumericPostingFilter_NotComplementMaterializedFal
 	assertPostingConsumerSet(t, got, want)
 }
 
+func TestBuildPredRange_OverlayNumericPostingFilter_ComplementMaterializedFallback(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
+
+	seedGeneratedUint64Data(t, db, 20_000, func(i int) *Rec {
+		return &Rec{
+			Name:  fmt.Sprintf("u_%d", i),
+			Age:   i,
+			Score: float64(i),
+		}
+	})
+	if err := db.RebuildIndex(); err != nil {
+		t.Fatalf("RebuildIndex: %v", err)
+	}
+	fm := db.fields["age"]
+	if fm == nil {
+		t.Fatalf("expected field metadata for age")
+	}
+	ov := db.fieldOverlay("age")
+	if ov.chunked == nil {
+		t.Fatalf("expected chunked overlay path for age")
+	}
+
+	expr := qx.Expr{Op: qx.OpGTE, Field: "age", Value: 1_000}
+	bound, isSlice, err := db.currentQueryViewForTests().exprValueToNormalizedScalarBound(qx.Expr{
+		Op:    expr.Op,
+		Field: expr.Field,
+		Value: expr.Value,
+	})
+	if err != nil {
+		t.Fatalf("exprValueToNormalizedScalarBound: %v", err)
+	}
+	if isSlice {
+		t.Fatalf("unexpected slice bound for %v", expr)
+	}
+	rb := rangeBounds{has: true}
+	applyNormalizedScalarBound(&rb, bound)
+	br := ov.rangeForBounds(rb)
+	bucketCount, _ := overlayRangeStats(ov, br)
+	totalBuckets := ov.keyCount()
+	if totalBuckets-bucketCount >= bucketCount {
+		t.Fatalf("expected complement probe, buckets=%d total=%d", bucketCount, totalBuckets)
+	}
+
+	predExpected, ok := db.buildPredicateWithMode(expr, false)
+	if !ok {
+		t.Fatal("expected overlay numeric predicate to build")
+	}
+	defer releasePredicates([]predicate{predExpected})
+
+	predFilter, ok := db.buildPredicateWithMode(expr, false)
+	if !ok {
+		t.Fatal("expected overlay numeric predicate to build for postingFilter")
+	}
+	defer releasePredicates([]predicate{predFilter})
+
+	snap := db.getSnapshot()
+	want := predicateMatchIDs(predExpected, snap.universe)
+	got := runPredicatePostingFilter(t, predFilter, snap.universe)
+	defer got.Release()
+	assertPostingConsumerSet(t, got, want)
+}
+
 func TestOverlayRangeStats_ChunkedMatchesCursorScanOnSeededScore(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
 	seedGeneratedUint64Data(t, db, 120_000, func(i int) *Rec {
@@ -363,7 +611,7 @@ func TestBuildPredRangeCandidate_ChunkedRangeMatchesBitmapBaseline(t *testing.T)
 	var got posting.List
 	it := p.newIter()
 	for it.HasNext() {
-		got.Add(it.Next())
+		got = got.BuildAdded(it.Next())
 	}
 	it.Release()
 	defer got.Release()
@@ -371,6 +619,226 @@ func TestBuildPredRangeCandidate_ChunkedRangeMatchesBitmapBaseline(t *testing.T)
 	wantCount := countByExprBitmap(t, db, expr)
 	if got.Cardinality() != wantCount {
 		t.Fatalf("range predicate mismatch: got=%d want=%d", got.Cardinality(), wantCount)
+	}
+}
+
+func TestBuildPredicateWithMode_RuntimeNumericRangeMaterializationKeepsScalarCacheLocal(t *testing.T) {
+	t.Run("OverlayState", func(t *testing.T) {
+		db, _ := openTempDBUint64(t, Options{
+			AnalyzeInterval:                         -1,
+			SnapshotMaterializedPredCacheMaxEntries: 16,
+		})
+		seedGeneratedUint64Data(t, db, 120_000, func(i int) *Rec {
+			return &Rec{
+				Name:   fmt.Sprintf("u_%d", i),
+				Email:  fmt.Sprintf("user%05d@example.com", i),
+				Age:    i,
+				Score:  float64(i),
+				Active: i%2 == 0,
+			}
+		})
+		if err := db.RebuildIndex(); err != nil {
+			t.Fatalf("RebuildIndex: %v", err)
+		}
+
+		expr := qx.Expr{Op: qx.OpGT, Field: "age", Value: 110_000}
+		cacheKey := db.materializedPredCacheKey(expr)
+		p, ok := db.buildPredicateWithMode(expr, false)
+		if !ok {
+			t.Fatalf("expected predicate build to succeed")
+		}
+		defer releasePredicates([]predicate{p})
+
+		if p.overlayState == nil {
+			t.Fatalf("expected chunked numeric range to stay on overlay runtime state")
+		}
+		if got := db.getSnapshot().matPredCacheCount.Load(); got != 0 {
+			t.Fatalf("unexpected shared materialized predicate cache before runtime materialization: %d", got)
+		}
+		_ = p.matches(1)
+		if !p.overlayState.rangeMaterialized || p.overlayState.rangeIDs.IsEmpty() {
+			t.Fatalf("expected runtime overlay state to materialize locally")
+		}
+		if got := db.getSnapshot().matPredCacheCount.Load(); got != 0 {
+			t.Fatalf("unexpected shared scalar cache entry from runtime overlay materialization: %d", got)
+		}
+		if cached, ok := db.getSnapshot().loadMaterializedPred(cacheKey); ok && !cached.IsEmpty() {
+			t.Fatalf("unexpected shared scalar cache entry from runtime overlay materialization")
+		}
+	})
+
+	t.Run("BaseState", func(t *testing.T) {
+		db, _ := openTempDBUint64(t, Options{
+			AnalyzeInterval:                         -1,
+			SnapshotMaterializedPredCacheMaxEntries: 16,
+		})
+		seedGeneratedUint64Data(t, db, 256, func(i int) *Rec {
+			return &Rec{
+				Name:   fmt.Sprintf("u_%d", i),
+				Email:  fmt.Sprintf("user%05d@example.com", i),
+				Age:    18 + (i % 60),
+				Score:  float64(i),
+				Active: i%2 == 0,
+			}
+		})
+		if err := db.RebuildIndex(); err != nil {
+			t.Fatalf("RebuildIndex: %v", err)
+		}
+
+		expr := qx.Expr{Op: qx.OpGT, Field: "score", Value: 220.0}
+		cacheKey := db.materializedPredCacheKey(expr)
+		p, ok := db.buildPredicateWithMode(expr, false)
+		if !ok {
+			t.Fatalf("expected predicate build to succeed")
+		}
+		defer releasePredicates([]predicate{p})
+
+		if p.baseRangeState == nil {
+			t.Fatalf("expected flat numeric range to stay on base runtime state")
+		}
+		if got := db.getSnapshot().matPredCacheCount.Load(); got != 0 {
+			t.Fatalf("unexpected shared materialized predicate cache before runtime materialization: %d", got)
+		}
+		for i := 1; i <= 128; i++ {
+			_ = p.matches(uint64(i))
+		}
+		if p.baseRangeState.ids.IsEmpty() && !p.baseRangeState.hasSet {
+			t.Fatalf("expected runtime base state to build local membership state")
+		}
+		if got := db.getSnapshot().matPredCacheCount.Load(); got != 0 {
+			t.Fatalf("unexpected shared scalar cache entry from runtime base materialization: %d", got)
+		}
+		if cached, ok := db.getSnapshot().loadMaterializedPred(cacheKey); ok && !cached.IsEmpty() {
+			t.Fatalf("unexpected shared scalar cache entry from runtime base materialization")
+		}
+	})
+}
+
+func TestBuildPredRange_BroadPositiveRuntimeKeepsComplementCacheLocal(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{
+		AnalyzeInterval:                         -1,
+		SnapshotMaterializedPredCacheMaxEntries: 16,
+	})
+	seedGeneratedUint64Data(t, db, 256, func(i int) *Rec {
+		return &Rec{
+			Name:   fmt.Sprintf("u_%d", i),
+			Email:  fmt.Sprintf("user%05d@example.com", i),
+			Age:    18 + i,
+			Score:  float64(i),
+			Active: i%2 == 0,
+		}
+	})
+	if err := db.RebuildIndex(); err != nil {
+		t.Fatalf("RebuildIndex: %v", err)
+	}
+
+	expr := qx.Expr{Op: qx.OpGTE, Field: "age", Value: 40}
+	view := db.currentQueryViewForTests()
+	defer db.releaseQueryView(view)
+	bound, isSlice, err := view.exprValueToNormalizedScalarBound(expr)
+	if err != nil {
+		t.Fatalf("exprValueToNormalizedScalarBound: %v", err)
+	}
+	if isSlice || bound.full || bound.empty {
+		t.Fatalf("unexpected normalized bound state: slice=%v full=%v empty=%v", isSlice, bound.full, bound.empty)
+	}
+	fullCacheKey := db.materializedPredCacheKey(expr)
+	complementCacheKey := db.materializedPredComplementCacheKeyForScalar(expr.Field, bound.op, bound.key)
+	if fullCacheKey == "" || complementCacheKey == "" {
+		t.Fatalf("expected non-empty scalar and complement cache keys")
+	}
+
+	p, ok := db.buildPredicateWithMode(expr, false)
+	if !ok {
+		t.Fatalf("expected predicate build to succeed")
+	}
+	defer releasePredicates([]predicate{p})
+
+	if p.baseRangeState == nil {
+		t.Fatalf("expected flat numeric range to stay on base runtime state")
+	}
+	if !p.baseRangeState.probe.useComplement {
+		t.Fatalf("expected broad positive range to use complement probe")
+	}
+	if got := db.getSnapshot().matPredCacheCount.Load(); got != 0 {
+		t.Fatalf("unexpected shared materialized predicate cache before runtime materialization: %d", got)
+	}
+
+	for i := 1; i <= 160; i++ {
+		_ = p.matches(uint64(i))
+	}
+
+	if got := db.getSnapshot().matPredCacheCount.Load(); got != 0 {
+		t.Fatalf("expected complement-backed runtime matches to stay local, cacheCount=%d", got)
+	}
+	if _, ok := db.getSnapshot().loadMaterializedPred(fullCacheKey); ok {
+		t.Fatalf("unexpected positive scalar cache entry for complement-backed runtime state")
+	}
+	if _, ok := db.getSnapshot().loadMaterializedPred(complementCacheKey); ok {
+		t.Fatalf("unexpected shared complement cache entry from runtime base materialization")
+	}
+}
+
+func TestBuildPredRange_BroadPositivePostingFilterKeepsComplementCacheLocal(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{
+		AnalyzeInterval:                         -1,
+		SnapshotMaterializedPredCacheMaxEntries: 16,
+	})
+	seedGeneratedUint64Data(t, db, 256, func(i int) *Rec {
+		return &Rec{
+			Name:   fmt.Sprintf("u_%d", i),
+			Email:  fmt.Sprintf("user%05d@example.com", i),
+			Age:    18 + i,
+			Score:  float64(i),
+			Active: i%2 == 0,
+		}
+	})
+	if err := db.RebuildIndex(); err != nil {
+		t.Fatalf("RebuildIndex: %v", err)
+	}
+
+	view := db.currentQueryViewForTests()
+	defer db.releaseQueryView(view)
+	expr := qx.Expr{Op: qx.OpGTE, Field: "age", Value: 40}
+	bound, isSlice, err := view.exprValueToNormalizedScalarBound(expr)
+	if err != nil {
+		t.Fatalf("exprValueToNormalizedScalarBound: %v", err)
+	}
+	if isSlice || bound.full || bound.empty {
+		t.Fatalf("unexpected normalized bound state: slice=%v full=%v empty=%v", isSlice, bound.full, bound.empty)
+	}
+	complementCacheKey := view.materializedPredComplementCacheKeyForScalar(expr.Field, bound.op, bound.key)
+
+	p, ok := view.buildPredicateWithMode(expr, false)
+	if !ok {
+		t.Fatalf("expected predicate build to succeed")
+	}
+	defer releasePredicates([]predicate{p})
+	if p.baseRangeState == nil || !p.baseRangeState.probe.useComplement {
+		t.Fatalf("expected broad positive base range state with complement probe")
+	}
+
+	var universe posting.List
+	defer universe.Release()
+	for i := 1; i <= 256; i++ {
+		universe = universe.BuildAdded(uint64(i))
+	}
+
+	for i := 0; i < 64; i++ {
+		dst := universe.Borrow()
+		next, ok := p.applyToPosting(dst)
+		if !ok {
+			dst.Release()
+			t.Fatalf("expected posting filter to stay evaluable")
+		}
+		next.Release()
+	}
+
+	if got := db.getSnapshot().matPredCacheCount.Load(); got != 0 {
+		t.Fatalf("expected complement-backed posting filters to stay local, cacheCount=%d", got)
+	}
+	if _, ok := db.getSnapshot().loadMaterializedPred(complementCacheKey); ok {
+		t.Fatalf("unexpected shared complement cache entry from posting-filter path")
 	}
 }
 

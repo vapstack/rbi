@@ -336,7 +336,7 @@ func snapshotExtOptions() Options {
 func snapshotExtPosting(ids ...uint64) posting.List {
 	var out posting.List
 	for _, id := range ids {
-		out.Add(id)
+		out = out.BuildAdded(id)
 	}
 	return out
 }
@@ -1174,6 +1174,9 @@ func TestSnapshotExt_ClearRuntimeCachesForTestingClearsCurrentSnapshotCaches(t *
 	if snap.numericRangeBucketCache == nil || snapshotExtSyncMapLen(snap.numericRangeBucketCache) == 0 {
 		t.Fatalf("expected numeric range bucket cache entries after evaluation")
 	}
+	if got := snap.matPredCacheCount.Load(); got != 0 {
+		t.Fatalf("expected numeric range bucket helper to keep shared materialized predicate cache empty, got=%d", got)
+	}
 	expr := qx.Expr{Op: qx.OpPREFIX, Field: "name", Value: "u_1"}
 	cacheKey := db.materializedPredCacheKey(expr)
 	if cacheKey == "" {
@@ -1189,6 +1192,12 @@ func TestSnapshotExt_ClearRuntimeCachesForTestingClearsCurrentSnapshotCaches(t *
 	}
 	if got := snap.matPredCacheCount.Load(); got == 0 {
 		t.Fatalf("expected materialized predicate cache count > 0")
+	}
+	if snap.shouldPromoteRuntimeMaterializedPred("age\x1f5\x1f500") {
+		t.Fatalf("expected first runtime promotion sight to stay local")
+	}
+	if got := snapshotExtSyncMapLen(&snap.runtimeMatPredSeen.keys); got != 1 {
+		t.Fatalf("expected one runtime seen-key entry before clear, got=%d", got)
 	}
 
 	db.clearCurrentSnapshotCachesForTesting()
@@ -1210,6 +1219,52 @@ func TestSnapshotExt_ClearRuntimeCachesForTestingClearsCurrentSnapshotCaches(t *
 	}
 	if _, ok := snap.loadMaterializedPred(cacheKey); ok {
 		t.Fatalf("expected cleared materialized predicate cache entry to be absent")
+	}
+	if got := snapshotExtSyncMapLen(&snap.runtimeMatPredSeen.keys); got != 0 {
+		t.Fatalf("expected runtime seen-key cache to be empty after clear, got=%d", got)
+	}
+	if got := snapshotExtSyncMapLen(&snap.orderORMatPredObserved.keys); got != 0 {
+		t.Fatalf("expected ordered OR observed-work cache to be empty after clear, got=%d", got)
+	}
+}
+
+func TestSnapshotExt_RuntimeSeenPromotionBounded(t *testing.T) {
+	s := &indexSnapshot{matPredCacheMaxEntries: 2}
+	limit := recentKeyCacheLimit(s.matPredCacheMaxEntries)
+	if limit <= 0 {
+		t.Fatalf("expected positive recent-key limit")
+	}
+
+	for i := 0; i < limit+6; i++ {
+		key := fmt.Sprintf("age\x1f5\x1f%d", i)
+		if s.shouldPromoteRuntimeMaterializedPred(key) {
+			t.Fatalf("expected first runtime sight for %q to stay local", key)
+		}
+	}
+	if got := snapshotExtSyncMapLen(&s.runtimeMatPredSeen.keys); got > limit {
+		t.Fatalf("runtime seen-key cache exceeded limit: got=%d want<=%d", got, limit)
+	}
+
+	lastKey := fmt.Sprintf("age\x1f5\x1f%d", limit+5)
+	if !s.shouldPromoteRuntimeMaterializedPred(lastKey) {
+		t.Fatalf("expected recent runtime key %q to promote on second sight", lastKey)
+	}
+}
+
+func TestSnapshotExt_OrderedORObservedPromotionAccumulates(t *testing.T) {
+	s := &indexSnapshot{matPredCacheMaxEntries: 2}
+	key := "age\x1fcount_range_complement\x1f5\x1f30"
+	if s.shouldPromoteObservedOrderedORMaterializedPred(key, 10, 25) {
+		t.Fatalf("expected first observed work below threshold to stay local")
+	}
+	if got := snapshotExtSyncMapLen(&s.orderORMatPredObserved.keys); got != 1 {
+		t.Fatalf("expected one ordered OR observed-work entry, got=%d", got)
+	}
+	if !s.shouldPromoteObservedOrderedORMaterializedPred(key, 15, 25) {
+		t.Fatalf("expected accumulated observed work to trigger promotion")
+	}
+	if got := snapshotExtSyncMapLen(&s.orderORMatPredObserved.keys); got != 0 {
+		t.Fatalf("expected promoted ordered OR observed-work entry to be removed, got=%d", got)
 	}
 }
 
@@ -1528,7 +1583,7 @@ func TestSnapshotExt_InheritNumericRangeBucketCacheCopiesOnlyMatchingStorage(t *
 
 	prev := &indexSnapshot{
 		index:                   map[string]fieldIndexStorage{"age": shared, "score": prevChanged},
-		numericRangeBucketCache: newNumericRangeBucketCache(),
+		numericRangeBucketCache: &sync.Map{},
 	}
 	prev.numericRangeBucketCache.Store("age", ageEntry)
 	prev.numericRangeBucketCache.Store("score", scoreEntry)
@@ -1565,7 +1620,7 @@ func TestSnapshotExt_InheritNumericRangeBucketCacheSkipsMalformedAndEmptyEntries
 
 	prev := &indexSnapshot{
 		index:                   map[string]fieldIndexStorage{"age": valid},
-		numericRangeBucketCache: newNumericRangeBucketCache(),
+		numericRangeBucketCache: &sync.Map{},
 	}
 	prev.numericRangeBucketCache.Store("", validEntry)
 	prev.numericRangeBucketCache.Store(123, validEntry)
@@ -1828,7 +1883,7 @@ func TestIndexSnapshotMaterializedPredCacheDetachedLoadsUnderConcurrency(t *test
 
 	base := snapshotExtPosting()
 	for i := uint64(1); i <= 40; i++ {
-		base.Add(i * 5)
+		base = base.BuildAdded(i * 5)
 	}
 	want := base.ToArray()
 
@@ -1882,10 +1937,10 @@ func TestIndexSnapshotMaterializedPredCacheDetachedLoadsUnderConcurrency(t *test
 				setFailed("writer load unexpectedly missed cache")
 				return
 			}
-			cached.AndNotInPlace(remove)
-			cached.OrInPlace(add)
-			cached.Add(6<<32 | uint64(i))
-			cached.Optimize()
+			cached = cached.BuildAndNot(remove)
+			cached = cached.BuildOr(add)
+			cached = cached.BuildAdded(6<<32 | uint64(i))
+			cached = cached.BuildOptimized()
 			cached.Release()
 		}
 	}()
@@ -1907,7 +1962,7 @@ func TestIndexSnapshotMaterializedPredCacheDetachedLoadsUnderConcurrency(t *test
 func TestApplyBatchPostingDeltaOwnedDetachedBorrowedBase(t *testing.T) {
 	base := snapshotExtPosting()
 	for i := uint64(1); i <= 48; i++ {
-		base.Add(i * 2)
+		base = base.BuildAdded(i * 2)
 	}
 	wantBase := base.ToArray()
 

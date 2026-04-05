@@ -178,7 +178,7 @@ func newFlatFieldIndexStorageFromPostingMapOwned(m map[string]posting.List, fixe
 	}
 	keys := make([]string, 0, len(m))
 	for key, ids := range m {
-		ids.Optimize()
+		ids = ids.BuildOptimized()
 		if ids.IsEmpty() {
 			continue
 		}
@@ -233,7 +233,7 @@ func newRegularFieldIndexStorageFromPostingMapOwned(m map[string]posting.List, f
 	}
 	keys := make([]string, 0, len(m))
 	for key, ids := range m {
-		ids.Optimize()
+		ids = ids.BuildOptimized()
 		if ids.IsEmpty() {
 			continue
 		}
@@ -374,36 +374,6 @@ func newRegularFieldIndexStorageFromInsertPostingAccumsOwned(
 	return newChunkedFieldIndexStorage(builder.root())
 }
 
-func newFlatFieldIndexStorageFromFixedPostingMapOwned(m map[uint64]posting.List) fieldIndexStorage {
-	if len(m) == 0 {
-		releaseFixedPostingMap(m)
-		return fieldIndexStorage{}
-	}
-	keys := make([]uint64, 0, len(m))
-	for key, ids := range m {
-		ids.Optimize()
-		if ids.IsEmpty() {
-			continue
-		}
-		m[key] = ids
-		keys = append(keys, key)
-	}
-	if len(keys) == 0 {
-		releaseFixedPostingMap(m)
-		return fieldIndexStorage{}
-	}
-	slices.Sort(keys)
-	entries := make([]index, 0, len(keys))
-	for i := range keys {
-		entries = append(entries, index{
-			Key: indexKeyFromU64(keys[i]),
-			IDs: m[keys[i]],
-		})
-	}
-	releaseFixedPostingMap(m)
-	return newFlatFieldIndexStorage(&entries)
-}
-
 func newFlatFieldIndexStorageFromFixedInsertPostingAccumsOwned(
 	m map[uint64]uint32,
 	arena *insertPostingAccumArena,
@@ -435,7 +405,7 @@ func newRegularFieldIndexStorageFromFixedPostingMapOwned(m map[uint64]posting.Li
 	}
 	keys := make([]uint64, 0, len(m))
 	for key, ids := range m {
-		ids.Optimize()
+		ids = ids.BuildOptimized()
 		if ids.IsEmpty() {
 			continue
 		}
@@ -1757,13 +1727,6 @@ func (r *fieldIndexChunkedRoot) prefixRangeEnd(prefix string, start int) int {
 	startRank := start
 	_, endRank := r.prefixRangeEndPos(prefix, startPos, startRank)
 	return endRank
-}
-
-func (r *fieldIndexChunkedRoot) chunkRangeLen(start, end int) int {
-	if r == nil || start < 0 || end < start || end > r.chunkCount {
-		return 0
-	}
-	return r.entryPrefixForChunk(end) - r.entryPrefixForChunk(start)
 }
 
 func (r *fieldIndexChunkedRoot) touchChunkIndexFrom(start int, key indexKey) int {

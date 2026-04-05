@@ -27,6 +27,7 @@ type options struct {
 	HeapProfile      string
 	PprofHTTP        string
 	EmailSampleN     int
+	NoCache          bool
 	BoltNoSync       bool
 	AnalyzeInterval  time.Duration
 	RefreshEvery     time.Duration
@@ -65,6 +66,7 @@ func parseOptions(catalog []*classDescriptor) (options, error) {
 	fs.StringVar(&opts.HeapProfile, "heap-profile", "", "write heap profile to file at process end")
 	fs.StringVar(&opts.PprofHTTP, "pprof-http", "", "listen address for net/http/pprof (e.g. :6060)")
 	fs.IntVar(&opts.EmailSampleN, "email-sample", opts.EmailSampleN, "how many existing emails to sample for indexed reads")
+	fs.BoolVar(&opts.NoCache, "no-cache", false, "disable rbi runtime caches and numeric range bucket acceleration")
 	fs.BoolVar(&opts.BoltNoSync, "bolt-no-sync", false, "open bbolt with NoSync=true (unsafe)")
 	fs.DurationVar(&opts.AnalyzeInterval, "analyze-interval", 0, "rbi analyze interval (0=default, <0 disable)")
 	fs.DurationVar(&opts.RefreshEvery, "refresh", opts.RefreshEvery, "table refresh interval")

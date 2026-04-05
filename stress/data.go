@@ -39,14 +39,15 @@ const stressBoltOpenTimeout = 500 * time.Millisecond
 // that mistake with a long lock wait here.
 
 type DBConfig struct {
-	DBFile           string
-	OpenTimeout      time.Duration
-	BoltNoSync       bool
-	AnalyzeInterval  time.Duration
-	CalibrationOn    bool
-	CalibrationEvery int
-	TraceSink        func(rbi.TraceEvent)
-	TraceSampleEvery int
+	DBFile               string
+	OpenTimeout          time.Duration
+	BoltNoSync           bool
+	AnalyzeInterval      time.Duration
+	CalibrationOn        bool
+	CalibrationEvery     int
+	DisableRuntimeCaches bool
+	TraceSink            func(rbi.TraceEvent)
+	TraceSampleEvery     int
 }
 
 type DBHandle struct {
@@ -62,6 +63,12 @@ func buildRBIOptions(cfg DBConfig) rbi.Options {
 	dbOpts := rbi.Options{
 		EnableAutoBatchStats: true,
 		EnableSnapshotStats:  true,
+	}
+	if cfg.DisableRuntimeCaches {
+		dbOpts.SnapshotMaterializedPredCacheMaxEntries = -1
+		dbOpts.NumericRangeBucketSize = -1
+		dbOpts.NumericRangeBucketMinFieldKeys = -1
+		dbOpts.NumericRangeBucketMinSpanKeys = -1
 	}
 	if cfg.AnalyzeInterval != 0 {
 		dbOpts.AnalyzeInterval = cfg.AnalyzeInterval

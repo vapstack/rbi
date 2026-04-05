@@ -38,15 +38,15 @@ const (
 	defaultOptionsAnalyzeInterval                  = time.Hour
 	defaultOptionsCalibrationSampleEvery           = 16
 	defaultBucketFillPercent                       = 0.8
-	defaultSnapshotMaterializedPredCacheMaxEntries = 16
-	defaultSnapshotMatPredCacheMaxCardinality      = 32 << 10
+	defaultSnapshotMaterializedPredCacheMaxEntries = 24
+	defaultSnapshotMatPredCacheMaxCardinality      = 64 << 10
 	defaultAutoBatchWindow                         = 50 * time.Microsecond
 	defaultAutoBatchMax                            = 64
 	defaultAutoBatchMaxQueue                       = 512
 	defaultSnapshotStrMapCompactDepth              = 256
 	defaultNumericRangeBucketSize                  = 512
 	defaultNumericRangeBucketMinFieldKeys          = 8192
-	defaultNumericRangeBucketMinSpanKeys           = 2048
+	defaultNumericRangeBucketMinSpanKeys           = 1024
 )
 
 // Options configures indexer and how it works with a bbolt database.
@@ -144,7 +144,7 @@ type Options struct {
 	//
 	// Negative value disables cache.
 	//
-	// Default: 16
+	// Default: 24
 	//
 	// Typical range: 16..256
 	//
@@ -156,7 +156,7 @@ type Options struct {
 	//
 	// Negative value disables the guard.
 	//
-	// Default: 32K
+	// Default: 64K
 	//
 	// Negative (disabled) or very large values can significantly increase memory
 	// usage for broad predicates.
@@ -234,7 +234,7 @@ type Options struct {
 	//
 	// Negative value disables numeric bucket acceleration.
 	//
-	// Default: 2048
+	// Default: 1024
 	NumericRangeBucketMinSpanKeys int
 }
 
@@ -571,7 +571,7 @@ func (db *DB[K, V]) initSnapshotRuntimeCaches(s *indexSnapshot) {
 	if s == nil {
 		return
 	}
-	s.numericRangeBucketCache = newNumericRangeBucketCache()
+	s.numericRangeBucketCache = &sync.Map{}
 	s.matPredCacheMaxEntries = max(0, db.options.SnapshotMaterializedPredCacheMaxEntries)
 	s.matPredCacheMaxCard = materializedPredCacheMaxCardinality(
 		db.options.SnapshotMaterializedPredCacheMaxCardinality,

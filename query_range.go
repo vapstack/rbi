@@ -48,20 +48,19 @@ func (e *numericRangeBucketCacheEntry) loadFullSpan(start, end int) (posting.Lis
 	return ids.Borrow(), true
 }
 
-func (e *numericRangeBucketCacheEntry) tryStoreFullSpan(start, end int, ids *posting.List) bool {
-	if e == nil || ids == nil || ids.IsEmpty() {
-		return false
+func (e *numericRangeBucketCacheEntry) tryStoreFullSpan(start, end int, ids posting.List) (posting.List, bool) {
+	if e == nil || ids.IsEmpty() {
+		return ids, false
 	}
 	key := numericRangeFullSpanCacheKey(start, end)
 	if cached, ok := e.loadFullSpan(start, end); ok {
 		ids.Release()
-		*ids = cached
-		return true
+		return cached, true
 	}
 	if e.maxCard > 0 && ids.Cardinality() > e.maxCard {
-		return false
+		return ids, false
 	}
-	stored := *ids
+	stored := ids
 	if stored.IsBorrowed() {
 		stored = stored.Clone()
 	}
@@ -74,10 +73,10 @@ func (e *numericRangeBucketCacheEntry) tryStoreFullSpan(start, end int, ids *pos
 				return false
 			})
 			if evictKey == nil {
-				if !stored.SharesPayload(*ids) {
+				if !stored.SharesPayload(ids) {
 					stored.Release()
 				}
-				return false
+				return ids, false
 			}
 			actual, deleted := e.fullSpanCache.LoadAndDelete(evictKey)
 			if !deleted {
@@ -95,20 +94,17 @@ func (e *numericRangeBucketCacheEntry) tryStoreFullSpan(start, end int, ids *pos
 			actual, loaded := e.fullSpanCache.LoadOrStore(key, stored)
 			if loaded {
 				e.fullSpanCount.Add(-1)
-				if !stored.SharesPayload(*ids) {
+				if !stored.SharesPayload(ids) {
 					stored.Release()
 				}
 				ids.Release()
 				cached, _ := actual.(posting.List)
 				if !cached.IsEmpty() {
-					*ids = cached.Borrow()
-					return true
+					return cached.Borrow(), true
 				}
-				*ids = posting.List{}
-				return false
+				return posting.List{}, false
 			}
-			*ids = stored.Borrow()
-			return true
+			return stored.Borrow(), true
 		}
 	}
 }
@@ -154,53 +150,21 @@ func satAddUint64(total, add uint64) uint64 {
 	return total + add
 }
 
-func mergeOverlayRangeInto(dst *posting.List, ov fieldOverlay, br overlayRange) {
-	if dst == nil || br.baseStart >= br.baseEnd {
-		return
-	}
-	cur := ov.newCursor(br, false)
-	for {
-		_, ids, ok := cur.next()
-		if !ok {
-			return
-		}
-		if ids.IsEmpty() {
-			continue
-		}
-		ids.OrInto(dst)
-	}
-}
-
-func countOverlayRangeCardinality(ov fieldOverlay, br overlayRange) uint64 {
+func mergeOverlayRangeInto(dst posting.List, ov fieldOverlay, br overlayRange) posting.List {
 	if br.baseStart >= br.baseEnd {
-		return 0
+		return dst
 	}
-	var total uint64
 	cur := ov.newCursor(br, false)
 	for {
 		_, ids, ok := cur.next()
 		if !ok {
-			return total
+			return dst
 		}
 		if ids.IsEmpty() {
 			continue
 		}
-		card := ids.Cardinality()
-		if ^uint64(0)-total < card {
-			return ^uint64(0)
-		}
-		total += card
+		dst = dst.BuildOr(ids)
 	}
-}
-
-func (idx *numericRangeBucketIndex) mergeFullBucketSpanInto(dst *posting.List, ov fieldOverlay, startFull, endFull int) {
-	if idx == nil || dst == nil || startFull > endFull {
-		return
-	}
-	if !ov.hasData() || startFull < 0 || endFull >= len(idx.buckets) {
-		return
-	}
-	mergeOverlayRangeInto(dst, ov, ov.rangeByRanks(idx.buckets[startFull].start, idx.buckets[endFull].end))
 }
 
 func isNumericScalarKind(kind reflect.Kind) bool {
@@ -358,33 +322,98 @@ func (qv *queryView[K, V]) tryEvalNumericRangeBuckets(field string, fm *field, o
 		return postingResult{}, false
 	}
 
-	fullCacheKey := ""
-	if qv.materializedPredCacheEnabled() {
-		fullCacheKey = materializedPredCacheKeyForNumericBucketSpan(field, startFull, endFull)
-	}
+	fullSpanReuse := newMaterializedPredReadOnlyReuse(
+		qv.snap,
+		materializedPredCacheKeyForNumericBucketSpan(field, startFull, endFull),
+	)
 
 	var res posting.List
 	if cached, ok := entry.loadFullSpan(startFull, endFull); ok {
 		res = cached
 	}
-	if res.IsEmpty() && fullCacheKey != "" {
-		if cached, hit := qv.snap.loadMaterializedPred(fullCacheKey); hit && !cached.IsEmpty() {
+	if res.IsEmpty() {
+		if cached, ok := fullSpanReuse.load(); ok && !cached.IsEmpty() {
 			res = cached
 		}
 	}
 	if res.IsEmpty() {
-		idx.mergeFullBucketSpanInto(&res, ov, startFull, endFull)
-		entry.tryStoreFullSpan(startFull, endFull, &res)
-		if fullCacheKey != "" {
-			qv.tryShareMaterializedPred(fullCacheKey, &res)
-		}
+		res = mergeOverlayRangeInto(res, ov, ov.rangeByRanks(idx.buckets[startFull].start, idx.buckets[endFull].end))
+		res, _ = entry.tryStoreFullSpan(startFull, endFull, res)
 	}
 
 	leftEnd := min(br.baseEnd, idx.buckets[startFull].start)
 	rightStart := max(br.baseStart, idx.buckets[endFull].end)
 	if (leftEnd > br.baseStart) || (rightStart < br.baseEnd) {
-		mergeOverlayRangeInto(&res, ov, ov.rangeByRanks(br.baseStart, leftEnd))
-		mergeOverlayRangeInto(&res, ov, ov.rangeByRanks(rightStart, br.baseEnd))
+		res = mergeOverlayRangeInto(res, ov, ov.rangeByRanks(br.baseStart, leftEnd))
+		res = mergeOverlayRangeInto(res, ov, ov.rangeByRanks(rightStart, br.baseEnd))
+	}
+
+	return postingResult{ids: res}, true
+}
+
+func (qv *queryView[K, V]) tryLoadNumericRangeBuckets(field string, fm *field, ov fieldOverlay, br overlayRange) (postingResult, bool) {
+	if fm == nil || fm.Slice || !isNumericScalarKind(fm.Kind) {
+		return postingResult{}, false
+	}
+
+	bucketSize := qv.options.NumericRangeBucketSize
+	minFieldKeys := qv.options.NumericRangeBucketMinFieldKeys
+	minSpan := qv.options.NumericRangeBucketMinSpanKeys
+	if bucketSize <= 0 || minFieldKeys <= 0 || minSpan <= 0 {
+		return postingResult{}, false
+	}
+	span := br.baseEnd - br.baseStart
+	if span < minSpan {
+		return postingResult{}, false
+	}
+	if br.baseStart >= br.baseEnd || ov.keyCount() == 0 {
+		return postingResult{}, false
+	}
+
+	storage, ok := qv.snap.fieldIndexStorage(field)
+	if !ok || storage.keyCount() == 0 {
+		return postingResult{}, false
+	}
+	entry := qv.snap.getNumericRangeBucketCacheEntry(field, storage, bucketSize, minFieldKeys)
+	if entry == nil || entry.idx == nil {
+		return postingResult{}, false
+	}
+	idx := entry.idx
+	if idx == nil || idx.bucketSize <= 0 || len(idx.buckets) == 0 {
+		return postingResult{}, false
+	}
+	if idx.keyCount != ov.keyCount() {
+		return postingResult{}, false
+	}
+
+	startFull, endFull, ok := idx.fullBucketSpan(br)
+	if !ok {
+		return postingResult{}, false
+	}
+
+	fullSpanReuse := newMaterializedPredReadOnlyReuse(
+		qv.snap,
+		materializedPredCacheKeyForNumericBucketSpan(field, startFull, endFull),
+	)
+
+	var res posting.List
+	if cached, ok := entry.loadFullSpan(startFull, endFull); ok {
+		res = cached
+	}
+	if res.IsEmpty() {
+		if cached, ok := fullSpanReuse.load(); ok && !cached.IsEmpty() {
+			res = cached
+		}
+	}
+	if res.IsEmpty() {
+		return postingResult{}, false
+	}
+
+	leftEnd := min(br.baseEnd, idx.buckets[startFull].start)
+	rightStart := max(br.baseStart, idx.buckets[endFull].end)
+	if (leftEnd > br.baseStart) || (rightStart < br.baseEnd) {
+		res = mergeOverlayRangeInto(res, ov, ov.rangeByRanks(br.baseStart, leftEnd))
+		res = mergeOverlayRangeInto(res, ov, ov.rangeByRanks(rightStart, br.baseEnd))
 	}
 
 	return postingResult{ids: res}, true

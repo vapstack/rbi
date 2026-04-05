@@ -181,33 +181,6 @@ func addDistinctFixedKeys(n int, keyAt func(int) uint64, add func(uint64)) int {
 	return distinct
 }
 
-func addDistinctBoolValues(vals []bool, add func(string)) int {
-	if len(vals) == 0 {
-		return 0
-	}
-	seenFalse := false
-	seenTrue := false
-	distinct := 0
-	for i := range vals {
-		if vals[i] {
-			if seenTrue {
-				continue
-			}
-			seenTrue = true
-			distinct++
-			add("1")
-			continue
-		}
-		if seenFalse {
-			continue
-		}
-		seenFalse = true
-		distinct++
-		add("0")
-	}
-	return distinct
-}
-
 func addDistinctStringsToSink[S stringValueSink](vals []string, sink S) int {
 	if len(vals) == 0 {
 		return 0
