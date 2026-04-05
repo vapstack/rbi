@@ -179,6 +179,78 @@ func TestPredicateLeadIterMayDuplicate_RangeStatesStayUnique(t *testing.T) {
 	}
 }
 
+func TestOverlayRangeProbe_CountBucket_ComplementProbe(t *testing.T) {
+	probeIDs := posting.BuildFromSorted([]uint64{2, 4})
+	defer probeIDs.Release()
+	bucket := posting.BuildFromSorted([]uint64{1, 2, 3, 4})
+	defer bucket.Release()
+
+	probe := overlayRangeProbe{
+		ov:            fieldOverlay{base: []index{{IDs: probeIDs.Borrow()}}},
+		spanCnt:       1,
+		useComplement: true,
+		probeLen:      1,
+		probeEst:      2,
+	}
+	probe.spans[0] = overlayRange{baseStart: 0, baseEnd: 1}
+
+	in, ok := probe.countBucket(bucket.Borrow())
+	if !ok {
+		t.Fatalf("expected overlay complement probe to support countBucket")
+	}
+	if in != 2 {
+		t.Fatalf("countBucket = %d, want 2", in)
+	}
+}
+
+func TestOverlayRangePredicateState_Matches_MaterializedComplementProbe(t *testing.T) {
+	state := &overlayRangePredicateState{
+		probe: overlayRangeProbe{
+			useComplement: true,
+		},
+		keepProbeHits:     false,
+		probeMaterialized: true,
+		probeIDs:          posting.BuildFromSorted([]uint64{2, 4}),
+	}
+	defer releaseOverlayRangePredicateState(state)
+
+	if state.matches(2) {
+		t.Fatalf("complement probe hit must be excluded from positive broad range")
+	}
+	if !state.matches(3) {
+		t.Fatalf("non-probe id must stay matched for positive broad range")
+	}
+}
+
+func TestPredicateSetExpectedContainsCalls_UpdatesOverlayRangeState(t *testing.T) {
+	state := acquireOverlayRangePredicateState(
+		fieldOverlay{base: []index{{Key: indexKeyFromString("a")}, {Key: indexKeyFromString("b")}, {Key: indexKeyFromString("c")}}},
+		overlayRange{baseStart: 0, baseEnd: 3},
+		overlayRangeProbe{
+			ov:       fieldOverlay{base: []index{{Key: indexKeyFromString("a")}, {Key: indexKeyFromString("b")}, {Key: indexKeyFromString("c")}}},
+			spans:    [2]overlayRange{{baseStart: 0, baseEnd: 3}},
+			spanCnt:  1,
+			probeLen: 32,
+			probeEst: 2048,
+		},
+		3,
+		2048,
+		false,
+		materializedPredReuse{},
+		false,
+	)
+	defer releaseOverlayRangePredicateState(state)
+
+	p := predicate{overlayState: state}
+	p.setExpectedContainsCalls(1)
+	if state.expectedContainsCalls != 1 {
+		t.Fatalf("expected overlay expectedContainsCalls=1, got %d", state.expectedContainsCalls)
+	}
+	if state.containsMode != baseRangeContainsLinear {
+		t.Fatalf("expected overlay contains mode to stay linear for single call, got %v", state.containsMode)
+	}
+}
+
 func TestPredicateMaterializedIDsDriveContainsAndIterCapabilities(t *testing.T) {
 	t.Run("LazyMaterializedPositive", func(t *testing.T) {
 		p := predicate{

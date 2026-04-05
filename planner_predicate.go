@@ -109,10 +109,15 @@ func (p *predicate) isCustomUnmaterialized() bool {
 }
 
 func (p *predicate) setExpectedContainsCalls(expected int) {
-	if p == nil || p.baseRangeState == nil {
+	if p == nil {
 		return
 	}
-	p.baseRangeState.setExpectedContainsCalls(expected)
+	if p.baseRangeState != nil {
+		p.baseRangeState.setExpectedContainsCalls(expected)
+	}
+	if p.overlayState != nil {
+		p.overlayState.setExpectedContainsCalls(expected)
+	}
 }
 
 func (p *predicate) runtimeRangeIter() (posting.Iterator, bool) {
@@ -138,6 +143,10 @@ func (p *predicate) runtimeRangeMatches(idx uint64) (bool, bool) {
 func (p *predicate) runtimeRangeCountBucket(bucket posting.List) (uint64, bool, bool) {
 	if p.baseRangeState != nil {
 		in, ok := p.baseRangeState.countBucket(bucket)
+		return in, ok, true
+	}
+	if p.overlayState != nil {
+		in, ok := p.overlayState.countBucket(bucket)
 		return in, ok, true
 	}
 	return 0, false, false
@@ -3046,6 +3055,31 @@ func (p overlayRangeProbe) linearContains(idx uint64) bool {
 		}
 	}
 	return false
+}
+
+func (p overlayRangeProbe) countBucket(bucket posting.List) (uint64, bool) {
+	if bucket.IsEmpty() {
+		return 0, true
+	}
+	if !rangeCountBucketUseful(p.probeLen, p.probeEst, bucket.Cardinality()) {
+		return 0, false
+	}
+
+	var hit uint64
+	p.forEachPosting(func(ids posting.List) bool {
+		hit += ids.AndCardinality(bucket)
+		return true
+	})
+
+	if !p.useComplement {
+		return hit, true
+	}
+
+	bc := bucket.Cardinality()
+	if hit >= bc {
+		return 0, true
+	}
+	return bc - hit, true
 }
 
 func materializedRangePredicateWithMode(e qx.Expr, ids posting.List) predicate {

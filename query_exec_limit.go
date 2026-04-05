@@ -112,6 +112,19 @@ func (p leafPred) supportsExactBucketPostingFilter() bool {
 	}
 }
 
+func (p leafPred) supportsPostingApply() bool {
+	switch p.kind {
+	case leafPredKindPredicate:
+		return p.pred.supportsPostingApply()
+	case leafPredKindPosting, leafPredKindPostsAll:
+		return true
+	case leafPredKindPostsConcat, leafPredKindPostsUnion:
+		return p.postsAnyState != nil || p.postingFilter != nil
+	default:
+		return false
+	}
+}
+
 func (p leafPred) countBucket(bucket posting.List) (uint64, bool) {
 	switch p.kind {
 	case leafPredKindEmpty:
@@ -711,9 +724,20 @@ func (qv *queryView[K, V]) scanLimitByOverlayBounds(q *qx.QX, ov fieldOverlay, b
 		residualActiveBuf.values = residualActive
 		releaseIntSliceBuf(residualActiveBuf)
 	}()
+	residualApplyOnly := len(residualActive) > 0
+	if residualApplyOnly {
+		for _, pi := range residualActive {
+			if !preds[pi].supportsPostingApply() {
+				residualApplyOnly = false
+				break
+			}
+		}
+	}
 
 	var exactWork posting.List
 	defer exactWork.Release()
+	var applyWork posting.List
+	defer applyWork.Release()
 
 	emitCandidate := func(idx uint64, checks []int) bool {
 		examined++
@@ -765,6 +789,8 @@ func (qv *queryView[K, V]) scanLimitByOverlayBounds(q *qx.QX, ov fieldOverlay, b
 		allowExact := plannerAllowExactBucketFilter(0, cursor.need, card, exactOnly, len(exactActive))
 		mode, exactIDs, nextExactWork, _ := plannerFilterPostingByChecks(preds, exactActive, ids, exactWork, allowExact)
 		exactWork = nextExactWork
+		current = ids
+		currentCard := card
 		switch mode {
 		case plannerPredicateBucketEmpty:
 			examined += card
@@ -773,7 +799,8 @@ func (qv *queryView[K, V]) scanLimitByOverlayBounds(q *qx.QX, ov fieldOverlay, b
 			if exactOnly {
 				return exactIDs, true, true, emitMatchedPosting(exactIDs, card)
 			}
-			return exactIDs, true, false, false
+			current = exactIDs
+			exactApplied = true
 		case plannerPredicateBucketExact:
 			if trace != nil {
 				trace.addPostingExactFilter(1)
@@ -782,13 +809,33 @@ func (qv *queryView[K, V]) scanLimitByOverlayBounds(q *qx.QX, ov fieldOverlay, b
 				examined += card
 				return posting.List{}, true, true, false
 			}
+			current = exactIDs
+			currentCard = exactIDs.Cardinality()
+			exactApplied = true
 			if exactOnly {
-				return exactIDs, true, true, emitMatchedPosting(exactIDs, exactIDs.Cardinality())
+				return exactIDs, true, true, emitMatchedPosting(exactIDs, currentCard)
 			}
-			return exactIDs, true, false, false
 		default:
 			return ids, false, false, false
 		}
+		if residualApplyOnly {
+			allowApply := currentCard > plannerPredicateBucketExactMinCardForChecks(len(residualActive))
+			mode, applyIDs, nextApplyWork, _ := plannerFilterPostingByChecks(preds, residualActive, current, applyWork, allowApply)
+			applyWork = nextApplyWork
+			switch mode {
+			case plannerPredicateBucketEmpty:
+				examined += currentCard
+				return posting.List{}, exactApplied, true, false
+			case plannerPredicateBucketAll:
+				return current, exactApplied, true, emitMatchedPosting(current, currentCard)
+			case plannerPredicateBucketExact:
+				return applyIDs, true, true, emitMatchedPosting(applyIDs, applyIDs.Cardinality())
+			}
+		}
+		if exactApplied {
+			return current, true, false, false
+		}
+		return ids, false, false, false
 	}
 
 	emitBucketPosting := func(ids posting.List) bool {

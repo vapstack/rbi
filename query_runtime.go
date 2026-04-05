@@ -278,24 +278,29 @@ func (state *lazyMaterializedPredicateState) materialize() posting.List {
 var overlayRangeIterPool sync.Pool
 
 type overlayRangePredicateState struct {
-	ov                 fieldOverlay
-	br                 overlayRange
-	probe              overlayRangeProbe
-	reuse              materializedPredReuse
-	neg                bool
-	keepProbeHits      bool
-	bucketCount        int
-	probePostingFilter bool
-	postingFilterCheap bool
-	probeMaterializeAt int
-	rangeMaterializeAt int
-	postingFilterCalls int
-	rangeMaterialized  bool
-	probeMaterialized  bool
-	linearPostsBuf     *postingSliceBuf
-	linearPosts        []posting.List
-	rangeIDs           posting.List
-	probeIDs           posting.List
+	ov                    fieldOverlay
+	br                    overlayRange
+	probe                 overlayRangeProbe
+	reuse                 materializedPredReuse
+	neg                   bool
+	keepProbeHits         bool
+	bucketCount           int
+	linearContainsMax     int
+	materializeAfter      int
+	expectedContainsCalls int
+	containsCalls         int
+	containsMode          baseRangeContainsMode
+	probePostingFilter    bool
+	postingFilterCheap    bool
+	probeMaterializeAt    int
+	rangeMaterializeAt    int
+	postingFilterCalls    int
+	rangeMaterialized     bool
+	probeMaterialized     bool
+	linearPostsBuf        *postingSliceBuf
+	linearPosts           []posting.List
+	rangeIDs              posting.List
+	probeIDs              posting.List
 }
 
 var overlayRangePredicateStatePool sync.Pool
@@ -310,6 +315,8 @@ func acquireOverlayRangePredicateState(
 	reuse materializedPredReuse,
 	usePostingFilter bool,
 ) *overlayRangePredicateState {
+	linearContainsMax := rangeLinearContainsLimit(probe.probeLen, probe.probeEst)
+	materializeAfter := rangeMaterializeAfterForProbe(probe.probeLen, probe.probeEst)
 	rangeMaterializeAt := rangePostingFilterMaterializeAfterForProbe(bucketCount, est)
 	var state *overlayRangePredicateState
 	if v := overlayRangePredicateStatePool.Get(); v != nil {
@@ -323,7 +330,12 @@ func acquireOverlayRangePredicateState(
 	state.reuse = reuse
 	state.neg = neg
 	state.bucketCount = bucketCount
+	state.linearContainsMax = linearContainsMax
+	state.materializeAfter = materializeAfter
 	state.rangeMaterializeAt = rangeMaterializeAt
+	state.probePostingFilter = false
+	state.postingFilterCheap = false
+	state.probeMaterializeAt = 0
 	if usePostingFilter {
 		totalBuckets := probe.ov.keyCount()
 		inBuckets := 0
@@ -340,7 +352,35 @@ func acquireOverlayRangePredicateState(
 			state.probeMaterializeAt = rangePostingFilterMaterializeAfterForProbe(probe.probeLen, probe.probeEst)
 		}
 	}
+	state.setExpectedContainsCalls(materializeAfter)
 	return state
+}
+
+func (state *overlayRangePredicateState) setExpectedContainsCalls(expectedCalls int) {
+	if state == nil {
+		return
+	}
+	if expectedCalls <= 0 {
+		expectedCalls = state.materializeAfter
+	}
+	if expectedCalls <= 0 {
+		expectedCalls = 1
+	}
+	state.expectedContainsCalls = expectedCalls
+	state.containsMode = chooseBaseRangeContainsMode(
+		state.probe.probeLen,
+		state.probe.probeEst,
+		state.expectedContainsCalls,
+		0,
+		state.materializeAfter,
+	)
+}
+
+func (state *overlayRangePredicateState) growContainsMode(expectedCalls int) {
+	if state == nil || expectedCalls <= state.expectedContainsCalls {
+		return
+	}
+	state.setExpectedContainsCalls(expectedCalls)
 }
 
 func (state *overlayRangePredicateState) releaseLinearPosts() {
@@ -435,24 +475,92 @@ func (state *overlayRangePredicateState) materializeProbe() posting.List {
 		state.probeIDs = state.probeIDs.BuildMergedOwned(part)
 	}
 	state.probeMaterialized = true
+	state.releaseLinearPosts()
 	return state.probeIDs
 }
 
-func (state *overlayRangePredicateState) matches(idx uint64) bool {
-	hit := false
+func (state *overlayRangePredicateState) rawHit(idx uint64) bool {
+	if state == nil {
+		return false
+	}
 	if state.rangeMaterialized {
-		hit = state.rangeIDs.Contains(idx)
-	} else {
-		if state.bucketCount <= 16 {
-			hit = state.linearContains(idx)
-		} else {
-			hit = state.materializeRange().Contains(idx)
+		return state.rangeIDs.Contains(idx)
+	}
+	if state.probeMaterialized {
+		return state.probeIDs.Contains(idx)
+	}
+	if state.probe.probeLen <= state.linearContainsMax {
+		return state.linearContains(idx)
+	}
+	state.containsCalls++
+	if state.containsMode == baseRangeContainsLinear && state.materializeAfter > 0 &&
+		state.containsCalls >= state.materializeAfter {
+		state.growContainsMode(state.containsCalls)
+	}
+	if state.containsMode == baseRangeContainsPosting &&
+		state.materializeAfter > 0 &&
+		state.containsCalls >= state.materializeAfter {
+		return state.materializeProbe().Contains(idx)
+	}
+	return state.linearContains(idx)
+}
+
+func (state *overlayRangePredicateState) matches(idx uint64) bool {
+	if state == nil {
+		return false
+	}
+	if state.rangeMaterialized {
+		hit := state.rangeIDs.Contains(idx)
+		if state.neg {
+			return !hit
 		}
+		return hit
 	}
-	if state.neg {
-		return !hit
+	hit := state.rawHit(idx)
+	if state.keepProbeHits {
+		return hit
 	}
-	return hit
+	return !hit
+}
+
+func (state *overlayRangePredicateState) countBucket(bucket posting.List) (uint64, bool) {
+	if state == nil {
+		return 0, false
+	}
+	if state.rangeMaterialized {
+		in := bucket.AndCardinality(state.rangeIDs)
+		if !state.neg {
+			return in, true
+		}
+		bc := bucket.Cardinality()
+		if in >= bc {
+			return 0, true
+		}
+		return bc - in, true
+	}
+	if state.probeMaterialized {
+		in := bucket.AndCardinality(state.probeIDs)
+		if state.keepProbeHits {
+			return in, true
+		}
+		bc := bucket.Cardinality()
+		if in >= bc {
+			return 0, true
+		}
+		return bc - in, true
+	}
+	in, ok := state.probe.countBucket(bucket)
+	if !ok {
+		return 0, false
+	}
+	if !state.neg {
+		return in, true
+	}
+	bc := bucket.Cardinality()
+	if in >= bc {
+		return 0, true
+	}
+	return bc - in, true
 }
 
 func (state *overlayRangePredicateState) applyToPosting(dst posting.List) (posting.List, bool) {
