@@ -632,32 +632,28 @@ func (qv *queryView[K, V]) buildLeafPredsExcludingBounds(leaves []qx.Expr, field
 		preds = make([]leafPred, 0, len(leaves))
 	}
 	var mergedRangesBuf *orderedMergedScalarRangeFieldSliceBuf
-	var mergedRanges []orderedMergedScalarRangeField
 	if len(leaves) > 1 {
 		mergedRangesBuf = getOrderedMergedScalarRangeFieldSliceBuf(len(leaves))
-		var ok bool
-		mergedRanges, ok = qv.collectMergedNumericRangeFields(leaves, mergedRangesBuf.values[:0])
+		mergedRanges, ok := qv.collectMergedNumericRangeFields(leaves, mergedRangesBuf.values)
 		if !ok {
 			releaseLeafPreds(preds, predsBuf)
 			releaseOrderedMergedScalarRangeFieldSliceBuf(mergedRangesBuf)
 			return nil, nil, false, nil
 		}
-		defer func() {
-			mergedRangesBuf.values = mergedRanges
-			releaseOrderedMergedScalarRangeFieldSliceBuf(mergedRangesBuf)
-		}()
+		mergedRangesBuf.values = mergedRanges
+		defer releaseOrderedMergedScalarRangeFieldSliceBuf(mergedRangesBuf)
 	}
 	for i, e := range leaves {
 		if isBoundOp(e.Op) && !e.Not && e.Field == field {
 			continue
 		}
-		if qv.isPositiveMergedNumericRangeLeaf(e) {
-			idx := findOrderedMergedScalarRangeField(mergedRanges, e.Field)
-			if idx >= 0 && mergedRanges[idx].count > 1 {
-				if mergedRanges[idx].first != i {
+		if mergedRangesBuf != nil && qv.isPositiveMergedNumericRangeLeaf(e) {
+			idx := findOrderedMergedScalarRangeField(mergedRangesBuf.values, e.Field)
+			if idx >= 0 && mergedRangesBuf.values[idx].count > 1 {
+				if mergedRangesBuf.values[idx].first != i {
 					continue
 				}
-				p, ok, err := qv.buildMergedLimitLeafPred(mergedRanges[idx].expr, mergedRanges[idx].bounds, orderedWindow)
+				p, ok, err := qv.buildMergedLimitLeafPred(mergedRangesBuf.values[idx].expr, mergedRangesBuf.values[idx].bounds, orderedWindow)
 				if err != nil {
 					releaseLeafPreds(preds, predsBuf)
 					return nil, nil, true, err
@@ -701,32 +697,22 @@ func (qv *queryView[K, V]) scanLimitByOverlayBounds(q *qx.QX, ov fieldOverlay, b
 	)
 
 	activeBuf := getIntSliceBuf(len(preds))
-	active := activeBuf.values[:0]
-	defer func() {
-		activeBuf.values = active
-		releaseIntSliceBuf(activeBuf)
-	}()
+	defer releaseIntSliceBuf(activeBuf)
 	for i := range preds {
-		active = append(active, i)
+		activeBuf.values = append(activeBuf.values, i)
 	}
 
-	exactActiveBuf := getIntSliceBuf(len(active))
-	exactActive := buildExactBucketPostingFilterActive(exactActiveBuf.values, active, preds)
-	defer func() {
-		exactActiveBuf.values = exactActive
-		releaseIntSliceBuf(exactActiveBuf)
-	}()
-	exactOnly := len(active) > 0 && len(active) == len(exactActive)
+	exactActiveBuf := getIntSliceBuf(len(activeBuf.values))
+	exactActiveBuf.values = buildExactBucketPostingFilterActive(exactActiveBuf.values, activeBuf.values, preds)
+	defer releaseIntSliceBuf(exactActiveBuf)
+	exactOnly := len(activeBuf.values) > 0 && len(activeBuf.values) == len(exactActiveBuf.values)
 
-	residualActiveBuf := getIntSliceBuf(len(active))
-	residualActive := plannerResidualChecks(residualActiveBuf.values[:0], active, exactActive)
-	defer func() {
-		residualActiveBuf.values = residualActive
-		releaseIntSliceBuf(residualActiveBuf)
-	}()
-	residualApplyOnly := len(residualActive) > 0
+	residualActiveBuf := getIntSliceBuf(len(activeBuf.values))
+	residualActiveBuf.values = plannerResidualChecks(residualActiveBuf.values, activeBuf.values, exactActiveBuf.values)
+	defer releaseIntSliceBuf(residualActiveBuf)
+	residualApplyOnly := len(residualActiveBuf.values) > 0
 	if residualApplyOnly {
-		for _, pi := range residualActive {
+		for _, pi := range residualActiveBuf.values {
 			if !preds[pi].supportsPostingApply() {
 				residualApplyOnly = false
 				break
@@ -779,15 +765,15 @@ func (qv *queryView[K, V]) scanLimitByOverlayBounds(q *qx.QX, ov fieldOverlay, b
 			return posting.List{}, false, true, false
 		}
 		card := ids.Cardinality()
-		if len(active) == 0 {
+		if len(activeBuf.values) == 0 {
 			return ids, false, true, emitMatchedPosting(ids, card)
 		}
-		if len(exactActive) == 0 {
+		if len(exactActiveBuf.values) == 0 {
 			return ids, false, false, false
 		}
 
-		allowExact := plannerAllowExactBucketFilter(0, cursor.need, card, exactOnly, len(exactActive))
-		mode, exactIDs, nextExactWork, _ := plannerFilterPostingByChecks(preds, exactActive, ids, exactWork, allowExact)
+		allowExact := plannerAllowExactBucketFilter(0, cursor.need, card, exactOnly, len(exactActiveBuf.values))
+		mode, exactIDs, nextExactWork, _ := plannerFilterPostingByChecks(preds, exactActiveBuf.values, ids, exactWork, allowExact)
 		exactWork = nextExactWork
 		current = ids
 		currentCard := card
@@ -819,8 +805,8 @@ func (qv *queryView[K, V]) scanLimitByOverlayBounds(q *qx.QX, ov fieldOverlay, b
 			return ids, false, false, false
 		}
 		if residualApplyOnly {
-			allowApply := currentCard > plannerPredicateBucketExactMinCardForChecks(len(residualActive))
-			mode, applyIDs, nextApplyWork, _ := plannerFilterPostingByChecks(preds, residualActive, current, applyWork, allowApply)
+			allowApply := currentCard > plannerPredicateBucketExactMinCardForChecks(len(residualActiveBuf.values))
+			mode, applyIDs, nextApplyWork, _ := plannerFilterPostingByChecks(preds, residualActiveBuf.values, current, applyWork, allowApply)
 			applyWork = nextApplyWork
 			switch mode {
 			case plannerPredicateBucketEmpty:
@@ -842,7 +828,7 @@ func (qv *queryView[K, V]) scanLimitByOverlayBounds(q *qx.QX, ov fieldOverlay, b
 		if ids.IsEmpty() {
 			return false
 		}
-		if len(active) == 0 {
+		if len(activeBuf.values) == 0 {
 			if idx, ok := ids.TrySingle(); ok {
 				if trace != nil {
 					trace.addMatched(1)
@@ -871,7 +857,7 @@ func (qv *queryView[K, V]) scanLimitByOverlayBounds(q *qx.QX, ov fieldOverlay, b
 			return stop
 		}
 		if idx, ok := ids.TrySingle(); ok {
-			return emitCandidate(idx, active)
+			return emitCandidate(idx, activeBuf.values)
 		}
 
 		iterSrc := ids.Iter()
@@ -882,7 +868,7 @@ func (qv *queryView[K, V]) scanLimitByOverlayBounds(q *qx.QX, ov fieldOverlay, b
 		}()
 
 		exactApplied := false
-		if len(exactActive) > 0 {
+		if len(exactActiveBuf.values) > 0 {
 			if current, applied, handled, stop := tryBucketPosting(ids); handled {
 				return stop
 			} else if applied && !current.IsEmpty() {
@@ -892,9 +878,9 @@ func (qv *queryView[K, V]) scanLimitByOverlayBounds(q *qx.QX, ov fieldOverlay, b
 			}
 		}
 
-		checks := active
+		checks := activeBuf.values
 		if exactApplied {
-			checks = residualActive
+			checks = residualActiveBuf.values
 		}
 		for iterSrc.HasNext() {
 			if emitCandidate(iterSrc.Next(), checks) {

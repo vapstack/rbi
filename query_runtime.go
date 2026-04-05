@@ -333,6 +333,7 @@ func acquireOverlayRangePredicateState(
 	state.linearContainsMax = linearContainsMax
 	state.materializeAfter = materializeAfter
 	state.rangeMaterializeAt = rangeMaterializeAt
+	state.keepProbeHits = probe.useComplement == neg
 	state.probePostingFilter = false
 	state.postingFilterCheap = false
 	state.probeMaterializeAt = 0
@@ -346,7 +347,6 @@ func acquireOverlayRangePredicateState(
 			inBuckets = totalBuckets - inBuckets
 		}
 		if totalBuckets > 0 && inBuckets > 0 && inBuckets < totalBuckets && probe.probeLen > 0 {
-			state.keepProbeHits = probe.useComplement == neg
 			state.probePostingFilter = true
 			state.postingFilterCheap = !state.keepProbeHits
 			state.probeMaterializeAt = rangePostingFilterMaterializeAfterForProbe(probe.probeLen, probe.probeEst)

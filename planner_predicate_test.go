@@ -251,6 +251,30 @@ func TestPredicateSetExpectedContainsCalls_UpdatesOverlayRangeState(t *testing.T
 	}
 }
 
+func TestAcquireOverlayRangePredicateState_PositiveDirectProbeKeepsProbeHitsWithoutPostingFilter(t *testing.T) {
+	state := acquireOverlayRangePredicateState(
+		fieldOverlay{base: []index{{Key: indexKeyFromString("a")}, {Key: indexKeyFromString("b")}}},
+		overlayRange{baseStart: 0, baseEnd: 1},
+		overlayRangeProbe{
+			ov:       fieldOverlay{base: []index{{Key: indexKeyFromString("a")}, {Key: indexKeyFromString("b")}}},
+			spans:    [2]overlayRange{{baseStart: 0, baseEnd: 1}},
+			spanCnt:  1,
+			probeLen: 1,
+			probeEst: 1,
+		},
+		1,
+		1,
+		false,
+		materializedPredReuse{},
+		false,
+	)
+	defer releaseOverlayRangePredicateState(state)
+
+	if !state.keepProbeHits {
+		t.Fatalf("positive direct overlay probe must keep probe hits even when posting filter is disabled")
+	}
+}
+
 func TestPredicateMaterializedIDsDriveContainsAndIterCapabilities(t *testing.T) {
 	t.Run("LazyMaterializedPositive", func(t *testing.T) {
 		p := predicate{
@@ -727,9 +751,18 @@ func TestBuildPredicateWithMode_RuntimeNumericRangeMaterializationKeepsScalarCac
 		if got := db.getSnapshot().matPredCacheCount.Load(); got != 0 {
 			t.Fatalf("unexpected shared materialized predicate cache before runtime materialization: %d", got)
 		}
-		_ = p.matches(1)
-		if !p.overlayState.rangeMaterialized || p.overlayState.rangeIDs.IsEmpty() {
-			t.Fatalf("expected runtime overlay state to materialize locally")
+		matchCalls := max(128, p.overlayState.materializeAfter+1)
+		for i := 1; i <= matchCalls; i++ {
+			_ = p.matches(uint64(i))
+		}
+		if !p.overlayState.rangeMaterialized && !p.overlayState.probeMaterialized {
+			t.Fatalf("expected runtime overlay state to build local membership state")
+		}
+		if p.overlayState.rangeMaterialized && p.overlayState.rangeIDs.IsEmpty() {
+			t.Fatalf("expected locally materialized overlay range ids")
+		}
+		if p.overlayState.probeMaterialized && p.overlayState.probeIDs.IsEmpty() {
+			t.Fatalf("expected locally materialized overlay probe ids")
 		}
 		if got := db.getSnapshot().matPredCacheCount.Load(); got != 0 {
 			t.Fatalf("unexpected shared scalar cache entry from runtime overlay materialization: %d", got)

@@ -517,11 +517,7 @@ func (qv *queryView[K, V]) tryCountByUniqueEq(expr qx.Expr, trace *queryTrace) (
 	}
 
 	checksBuf := getIntSliceBuf(len(preds))
-	checks := checksBuf.values
-	defer func() {
-		checksBuf.values = checks
-		releaseIntSliceBuf(checksBuf)
-	}()
+	defer releaseIntSliceBuf(checksBuf)
 	for i := range preds {
 		if i == leadIdx {
 			continue
@@ -536,9 +532,9 @@ func (qv *queryView[K, V]) tryCountByUniqueEq(expr qx.Expr, trace *queryTrace) (
 		if !p.hasContains() {
 			return 0, false, nil
 		}
-		checks = append(checks, i)
+		checksBuf.values = append(checksBuf.values, i)
 	}
-	sortActivePredicates(checks, preds)
+	sortActivePredicates(checksBuf.values, preds)
 
 	it := preds[leadIdx].newIter()
 	if it == nil {
@@ -552,7 +548,7 @@ func (qv *queryView[K, V]) tryCountByUniqueEq(expr qx.Expr, trace *queryTrace) (
 		idx := it.Next()
 		examined++
 		pass := true
-		for _, ci := range checks {
+		for _, ci := range checksBuf.values {
 			if !preds[ci].matches(idx) {
 				pass = false
 				break
@@ -640,30 +636,26 @@ func (qv *queryView[K, V]) buildCountPredicatesWithMode(leaves []qx.Expr, allowM
 	}
 
 	var mergedRangesBuf *orderedMergedScalarRangeFieldSliceBuf
-	var mergedRanges []orderedMergedScalarRangeField
 	if len(leaves) > 1 {
 		mergedRangesBuf = getOrderedMergedScalarRangeFieldSliceBuf(len(leaves))
-		var ok bool
-		mergedRanges, ok = qv.collectMergedNumericRangeFields(leaves, mergedRangesBuf.values[:0])
+		mergedRanges, ok := qv.collectMergedNumericRangeFields(leaves, mergedRangesBuf.values)
 		if !ok {
 			releasePredicates(preds, predsBuf)
 			releaseOrderedMergedScalarRangeFieldSliceBuf(mergedRangesBuf)
 			return nil, nil, false
 		}
-		defer func() {
-			mergedRangesBuf.values = mergedRanges
-			releaseOrderedMergedScalarRangeFieldSliceBuf(mergedRangesBuf)
-		}()
+		mergedRangesBuf.values = mergedRanges
+		defer releaseOrderedMergedScalarRangeFieldSliceBuf(mergedRangesBuf)
 	}
 
 	for i, e := range leaves {
-		if qv.isPositiveMergedNumericRangeLeaf(e) {
-			idx := findOrderedMergedScalarRangeField(mergedRanges, e.Field)
-			if idx >= 0 && mergedRanges[idx].count > 1 {
-				if mergedRanges[idx].first != i {
+		if mergedRangesBuf != nil && qv.isPositiveMergedNumericRangeLeaf(e) {
+			idx := findOrderedMergedScalarRangeField(mergedRangesBuf.values, e.Field)
+			if idx >= 0 && mergedRangesBuf.values[idx].count > 1 {
+				if mergedRangesBuf.values[idx].first != i {
 					continue
 				}
-				p, ok := qv.buildMergedNumericRangePredicate(mergedRanges[idx].expr, mergedRanges[idx].bounds, allowMaterialize)
+				p, ok := qv.buildMergedNumericRangePredicate(mergedRangesBuf.values[idx].expr, mergedRangesBuf.values[idx].bounds, allowMaterialize)
 				if !ok {
 					releasePredicates(preds, predsBuf)
 					return nil, nil, false
@@ -684,13 +676,12 @@ func (qv *queryView[K, V]) buildCountPredicatesWithMode(leaves []qx.Expr, allowM
 }
 
 type countORBranch struct {
-	index     int
-	preds     []predicate
-	predsBuf  *predicateSliceBuf
-	lead      int
-	checks    []int
-	checksBuf *intSliceBuf
-	est       uint64
+	index    int
+	preds    []predicate
+	predsBuf *predicateSliceBuf
+	lead     int
+	checks   *intSliceBuf
+	est      uint64
 }
 
 type countORMaterializedBranch struct {
@@ -731,17 +722,21 @@ func countPredicateLeadPostings(p predicate) ([]posting.List, bool) {
 func releaseCountORBranches(branches countORBranches) {
 	for i := range branches {
 		releasePredicates(branches[i].preds, branches[i].predsBuf)
-		if branches[i].checksBuf != nil {
-			branches[i].checksBuf.values = branches[i].checks
-			releaseIntSliceBuf(branches[i].checksBuf)
-		}
+		releaseIntSliceBuf(branches[i].checks)
 		branches[i] = countORBranch{}
 	}
 }
 
+func (br countORBranch) checkIndexes() []int {
+	if br.checks == nil {
+		return nil
+	}
+	return br.checks.values
+}
+
 func (br countORBranch) buildPostingFilterChecks(dst []int) []int {
 	dst = dst[:0]
-	for _, pi := range br.checks {
+	for _, pi := range br.checkIndexes() {
 		if br.preds[pi].supportsPostingApply() {
 			dst = append(dst, pi)
 		}
@@ -759,7 +754,7 @@ func countPredicatesMatch(preds []predicate, checks []int, idx uint64) bool {
 }
 
 func (br countORBranch) checksMatch(idx uint64) bool {
-	return countPredicatesMatch(br.preds, br.checks, idx)
+	return countPredicatesMatch(br.preds, br.checkIndexes(), idx)
 }
 
 func (br countORBranch) matches(idx uint64) bool {
@@ -1123,36 +1118,37 @@ func (qv *queryView[K, V]) tryCountORBranchLeadPostings(
 		return 0, 0, false
 	}
 
-	exactChecksBuf := getIntSliceBuf(len(br.checks))
+	checks := br.checkIndexes()
+	exactChecksBuf := getIntSliceBuf(len(checks))
 	exactChecks := br.buildPostingFilterChecks(exactChecksBuf.values)
 	defer func() {
 		exactChecksBuf.values = exactChecks
 		releaseIntSliceBuf(exactChecksBuf)
 	}()
 
-	extraExactCandidatesBuf := getIntSliceBuf(len(br.checks))
-	extraExactCandidates := extraExactCandidatesBuf.values[:0]
-	extraExactCandidates = qv.collectCountLeadResidualExactCandidatesInto(extraExactCandidates, br.preds, br.checks, exactChecks)
+	extraExactCandidatesBuf := getIntSliceBuf(len(checks))
+	extraExactCandidates := extraExactCandidatesBuf.values
+	extraExactCandidates = qv.collectCountLeadResidualExactCandidatesInto(extraExactCandidates, br.preds, checks, exactChecks)
 	defer func() {
 		extraExactCandidatesBuf.values = extraExactCandidates
 		releaseIntSliceBuf(extraExactCandidatesBuf)
 	}()
 
-	residualExactBuf := getIntSliceBuf(len(br.checks))
-	residualAfterExact := residualExactBuf.values[:0]
+	residualExactBuf := getIntSliceBuf(len(checks))
+	residualAfterExact := residualExactBuf.values
 	defer func() {
 		residualExactBuf.values = residualAfterExact
 		releaseIntSliceBuf(residualExactBuf)
 	}()
 
-	residualBothBuf := getIntSliceBuf(len(br.checks))
-	residualAfterBoth := residualBothBuf.values[:0]
+	residualBothBuf := getIntSliceBuf(len(checks))
+	residualAfterBoth := residualBothBuf.values
 	defer func() {
 		residualBothBuf.values = residualAfterBoth
 		releaseIntSliceBuf(residualBothBuf)
 	}()
 
-	for _, pi := range br.checks {
+	for _, pi := range checks {
 		if countIndexSliceContains(exactChecks, pi) {
 			continue
 		}
@@ -1249,7 +1245,7 @@ func (qv *queryView[K, V]) tryCountORBranchLeadPostings(
 		if trace != nil {
 			trace.RowsExamined += card
 		}
-		if len(br.checks) == 0 {
+		if len(checks) == 0 {
 			if idx, ok := ids.TrySingle(); ok {
 				acceptIdx(idx, nil)
 				continue
@@ -1262,13 +1258,13 @@ func (qv *queryView[K, V]) tryCountORBranchLeadPostings(
 		}
 
 		if idx, ok := ids.TrySingle(); ok {
-			acceptIdx(idx, br.checks)
+			acceptIdx(idx, checks)
 			continue
 		}
 
 		if len(exactChecks) == 0 && len(extraExact) == 0 {
 			ids.ForEach(func(idx uint64) bool {
-				acceptIdx(idx, br.checks)
+				acceptIdx(idx, checks)
 				return true
 			})
 			continue
@@ -1308,7 +1304,7 @@ func (qv *queryView[K, V]) tryCountORBranchLeadPostings(
 			extraApplied = true
 		}
 
-		checks := br.checks
+		checks := br.checkIndexes()
 		if extraApplied {
 			checks = residualAfterBoth
 		} else if exactApplied {
@@ -1885,11 +1881,7 @@ func (qv *queryView[K, V]) tryCountByPredicates(expr qx.Expr, trace *queryTrace)
 
 	// remaining predicates are ordered by expected check cost/selectivity so we fail fast on likely negatives.
 	activeBuf := getIntSliceBuf(len(preds))
-	active := activeBuf.values
-	defer func() {
-		activeBuf.values = active
-		releaseIntSliceBuf(activeBuf)
-	}()
+	defer releaseIntSliceBuf(activeBuf)
 	for i := range preds {
 		if i == leadIdx && !leadNeedsCheck {
 			continue
@@ -1901,30 +1893,30 @@ func (qv *queryView[K, V]) tryCountByPredicates(expr qx.Expr, trace *queryTrace)
 		if p.alwaysFalse {
 			return 0, true, nil
 		}
-		active = append(active, i)
+		activeBuf.values = append(activeBuf.values, i)
 	}
 	// Broad leads are only worth predicate scans when the remaining checks are
 	// few and cheap. Apply the conservative gate before residual preparation so
 	// postingResult fallback does not inherit avoidable setup/materialization cost.
 	if universe > 0 && leadEst > universe/2 {
 		cheapChecks := true
-		for _, pi := range active {
+		for _, pi := range activeBuf.values {
 			if preds[pi].checkCost() > 1 {
 				cheapChecks = false
 				break
 			}
 		}
-		if len(active) > 2 || !cheapChecks {
+		if len(activeBuf.values) > 2 || !cheapChecks {
 			return 0, false, nil
 		}
 	}
-	for _, pi := range active {
+	for _, pi := range activeBuf.values {
 		if err := qv.prepareCountPredicateWithTrace(&preds[pi], leadEst, universe, trace); err != nil {
 			return 0, true, err
 		}
 	}
-	filtered := active[:0]
-	for _, pi := range active {
+	filtered := activeBuf.values[:0]
+	for _, pi := range activeBuf.values {
 		p := preds[pi]
 		if p.covered || p.alwaysTrue {
 			continue
@@ -1937,12 +1929,12 @@ func (qv *queryView[K, V]) tryCountByPredicates(expr qx.Expr, trace *queryTrace)
 		}
 		filtered = append(filtered, pi)
 	}
-	active = filtered
-	sortActivePredicates(active, preds)
+	activeBuf.values = filtered
+	sortActivePredicates(activeBuf.values, preds)
 
 	// For range/prefix leads on stable base slices, count by buckets first:
 	// many buckets can be skipped (or fully counted) via bucketCount hooks.
-	if cnt, examined, ok := qv.tryCountByPredicatesLeadBuckets(preds, leadIdx, active); ok {
+	if cnt, examined, ok := qv.tryCountByPredicatesLeadBuckets(preds, leadIdx, activeBuf.values); ok {
 		if trace != nil {
 			trace.setPlan(PlanCountPredicates)
 			trace.addExamined(examined)
@@ -1951,7 +1943,7 @@ func (qv *queryView[K, V]) tryCountByPredicates(expr qx.Expr, trace *queryTrace)
 	}
 	// Posting-backed leads can count posting-by-posting so exact-capable
 	// residual predicates prune whole posting bitmaps before row fallback.
-	if cnt, examined, ok := qv.tryCountByPredicatesLeadPostings(preds, leadIdx, active); ok {
+	if cnt, examined, ok := qv.tryCountByPredicatesLeadPostings(preds, leadIdx, activeBuf.values); ok {
 		if trace != nil {
 			trace.setPlan(PlanCountPredicates)
 			trace.addExamined(examined)
@@ -1971,7 +1963,7 @@ func (qv *queryView[K, V]) tryCountByPredicates(expr qx.Expr, trace *queryTrace)
 		idx := it.Next()
 		examined++
 		pass := true
-		for _, pi := range active {
+		for _, pi := range activeBuf.values {
 			if !preds[pi].matches(idx) {
 				pass = false
 				break
@@ -2013,31 +2005,20 @@ func (qv *queryView[K, V]) tryCountByPredicatesLeadBuckets(preds []predicate, le
 		}
 
 		activeBuf := getIntSliceBuf(len(active))
-		localActive := activeBuf.values[:0]
-		defer func() {
-			activeBuf.values = localActive
-			releaseIntSliceBuf(activeBuf)
-		}()
+		defer releaseIntSliceBuf(activeBuf)
 		for _, pi := range active {
 			if pi >= 0 && pi < len(covered) && covered[pi] {
 				continue
 			}
-			localActive = append(localActive, pi)
+			activeBuf.values = append(activeBuf.values, pi)
 		}
 
-		exactActiveBuf := getIntSliceBuf(len(localActive))
-		exactActive := buildPostingApplyActive(exactActiveBuf.values, localActive, preds)
-		defer func() {
-			exactActiveBuf.values = exactActive
-			releaseIntSliceBuf(exactActiveBuf)
-		}()
-		extraExactCandidatesBuf := getIntSliceBuf(len(localActive))
-		extraExactCandidates := extraExactCandidatesBuf.values[:0]
-		extraExactCandidates = qv.collectCountLeadResidualExactCandidatesInto(extraExactCandidates, preds, localActive, exactActive)
-		defer func() {
-			extraExactCandidatesBuf.values = extraExactCandidates
-			releaseIntSliceBuf(extraExactCandidatesBuf)
-		}()
+		exactActiveBuf := getIntSliceBuf(len(activeBuf.values))
+		exactActiveBuf.values = buildPostingApplyActive(exactActiveBuf.values, activeBuf.values, preds)
+		defer releaseIntSliceBuf(exactActiveBuf)
+		extraExactCandidatesBuf := getIntSliceBuf(len(activeBuf.values))
+		extraExactCandidatesBuf.values = qv.collectCountLeadResidualExactCandidatesInto(extraExactCandidatesBuf.values, preds, activeBuf.values, exactActiveBuf.values)
+		defer releaseIntSliceBuf(extraExactCandidatesBuf)
 		var (
 			extraExact    []countLeadResidualExactFilter
 			extraExactBuf *countLeadResidualExactFilterSliceBuf
@@ -2049,25 +2030,17 @@ func (qv *queryView[K, V]) tryCountByPredicatesLeadBuckets(preds []predicate, le
 			}
 			releaseCountLeadResidualExactFilterSliceBuf(extraExactBuf)
 		}()
-		extraExactBuilt := len(extraExactCandidates) == 0
-		residualExactBuf := getIntSliceBuf(len(localActive))
-		residualAfterExact := residualExactBuf.values[:0]
-		defer func() {
-			residualExactBuf.values = residualAfterExact
-			releaseIntSliceBuf(residualExactBuf)
-		}()
-		residualBothBuf := getIntSliceBuf(len(localActive))
-		residualAfterBoth := residualBothBuf.values[:0]
-		defer func() {
-			residualBothBuf.values = residualAfterBoth
-			releaseIntSliceBuf(residualBothBuf)
-		}()
-		for _, pi := range localActive {
-			if countIndexSliceContains(exactActive, pi) {
+		extraExactBuilt := len(extraExactCandidatesBuf.values) == 0
+		residualExactBuf := getIntSliceBuf(len(activeBuf.values))
+		defer releaseIntSliceBuf(residualExactBuf)
+		residualBothBuf := getIntSliceBuf(len(activeBuf.values))
+		defer releaseIntSliceBuf(residualBothBuf)
+		for _, pi := range activeBuf.values {
+			if countIndexSliceContains(exactActiveBuf.values, pi) {
 				continue
 			}
-			residualAfterExact = append(residualAfterExact, pi)
-			residualAfterBoth = append(residualAfterBoth, pi)
+			residualExactBuf.values = append(residualExactBuf.values, pi)
+			residualBothBuf.values = append(residualBothBuf.values, pi)
 		}
 
 		var cnt uint64
@@ -2082,18 +2055,18 @@ func (qv *queryView[K, V]) tryCountByPredicatesLeadBuckets(preds []predicate, le
 				return
 			}
 			extraExactBuilt = true
-			extraExactBuf = getCountLeadResidualExactFilterSliceBuf(len(extraExactCandidates))
-			extraExact = qv.buildCountLeadResidualExactFiltersByCandidatesInto(extraExactBuf.values[:0], preds, extraExactCandidates)
+			extraExactBuf = getCountLeadResidualExactFilterSliceBuf(len(extraExactCandidatesBuf.values))
+			extraExact = qv.buildCountLeadResidualExactFiltersByCandidatesInto(extraExactBuf.values[:0], preds, extraExactCandidatesBuf.values)
 			if len(extraExact) == 0 {
 				return
 			}
 			extraWork.Release()
-			residualAfterBoth = residualAfterBoth[:0]
-			for _, pi := range residualAfterExact {
+			residualBothBuf.values = residualBothBuf.values[:0]
+			for _, pi := range residualExactBuf.values {
 				if countLeadResidualExactFiltersContain(extraExact, pi) {
 					continue
 				}
-				residualAfterBoth = append(residualAfterBoth, pi)
+				residualBothBuf.values = append(residualBothBuf.values, pi)
 			}
 		}
 
@@ -2108,13 +2081,13 @@ func (qv *queryView[K, V]) tryCountByPredicatesLeadBuckets(preds []predicate, le
 			}
 			examined += ids.Cardinality()
 
-			if len(localActive) == 0 {
+			if len(activeBuf.values) == 0 {
 				cnt += ids.Cardinality()
 				continue
 			}
 			if idx, ok := ids.TrySingle(); ok {
 				pass := true
-				for _, pi := range localActive {
+				for _, pi := range activeBuf.values {
 					if !preds[pi].matches(idx) {
 						pass = false
 						break
@@ -2126,10 +2099,10 @@ func (qv *queryView[K, V]) tryCountByPredicatesLeadBuckets(preds []predicate, le
 				continue
 			}
 
-			if len(exactActive) == 0 && len(extraExact) == 0 {
+			if len(exactActiveBuf.values) == 0 && len(extraExact) == 0 {
 				ids.ForEach(func(idx uint64) bool {
 					pass := true
-					for _, pi := range localActive {
+					for _, pi := range activeBuf.values {
 						if !preds[pi].matches(idx) {
 							pass = false
 							break
@@ -2145,8 +2118,8 @@ func (qv *queryView[K, V]) tryCountByPredicatesLeadBuckets(preds []predicate, le
 
 			current := ids
 			exactApplied := false
-			if len(exactActive) > 0 {
-				mode, exactIDs, nextBucketWork, _ := plannerFilterPostingByChecks(preds, exactActive, ids, bucketWork, true)
+			if len(exactActiveBuf.values) > 0 {
+				mode, exactIDs, nextBucketWork, _ := plannerFilterPostingByChecks(preds, exactActiveBuf.values, ids, bucketWork, true)
 				bucketWork = nextBucketWork
 				switch mode {
 				case plannerPredicateBucketEmpty:
@@ -2177,11 +2150,11 @@ func (qv *queryView[K, V]) tryCountByPredicatesLeadBuckets(preds []predicate, le
 				extraApplied = true
 			}
 
-			checks := localActive
+			checks := activeBuf.values
 			if extraApplied {
-				checks = residualAfterBoth
+				checks = residualBothBuf.values
 			} else if exactApplied {
-				checks = residualAfterExact
+				checks = residualExactBuf.values
 			}
 			if len(checks) == 0 {
 				cnt += current.Cardinality()
@@ -2225,31 +2198,20 @@ func (qv *queryView[K, V]) tryCountByPredicatesLeadBuckets(preds []predicate, le
 	}
 
 	activeBuf := getIntSliceBuf(len(active))
-	localActive := activeBuf.values[:0]
-	defer func() {
-		activeBuf.values = localActive
-		releaseIntSliceBuf(activeBuf)
-	}()
+	defer releaseIntSliceBuf(activeBuf)
 	for _, pi := range active {
 		if pi >= 0 && pi < len(covered) && covered[pi] {
 			continue
 		}
-		localActive = append(localActive, pi)
+		activeBuf.values = append(activeBuf.values, pi)
 	}
 
-	exactActiveBuf := getIntSliceBuf(len(localActive))
-	exactActive := buildPostingApplyActive(exactActiveBuf.values, localActive, preds)
-	defer func() {
-		exactActiveBuf.values = exactActive
-		releaseIntSliceBuf(exactActiveBuf)
-	}()
-	extraExactCandidatesBuf := getIntSliceBuf(len(localActive))
-	extraExactCandidates := extraExactCandidatesBuf.values[:0]
-	extraExactCandidates = qv.collectCountLeadResidualExactCandidatesInto(extraExactCandidates, preds, localActive, exactActive)
-	defer func() {
-		extraExactCandidatesBuf.values = extraExactCandidates
-		releaseIntSliceBuf(extraExactCandidatesBuf)
-	}()
+	exactActiveBuf := getIntSliceBuf(len(activeBuf.values))
+	exactActiveBuf.values = buildPostingApplyActive(exactActiveBuf.values, activeBuf.values, preds)
+	defer releaseIntSliceBuf(exactActiveBuf)
+	extraExactCandidatesBuf := getIntSliceBuf(len(activeBuf.values))
+	extraExactCandidatesBuf.values = qv.collectCountLeadResidualExactCandidatesInto(extraExactCandidatesBuf.values, preds, activeBuf.values, exactActiveBuf.values)
+	defer releaseIntSliceBuf(extraExactCandidatesBuf)
 	var (
 		extraExact    []countLeadResidualExactFilter
 		extraExactBuf *countLeadResidualExactFilterSliceBuf
@@ -2261,25 +2223,17 @@ func (qv *queryView[K, V]) tryCountByPredicatesLeadBuckets(preds []predicate, le
 		}
 		releaseCountLeadResidualExactFilterSliceBuf(extraExactBuf)
 	}()
-	extraExactBuilt := len(extraExactCandidates) == 0
-	residualExactBuf := getIntSliceBuf(len(localActive))
-	residualAfterExact := residualExactBuf.values[:0]
-	defer func() {
-		residualExactBuf.values = residualAfterExact
-		releaseIntSliceBuf(residualExactBuf)
-	}()
-	residualBothBuf := getIntSliceBuf(len(localActive))
-	residualAfterBoth := residualBothBuf.values[:0]
-	defer func() {
-		residualBothBuf.values = residualAfterBoth
-		releaseIntSliceBuf(residualBothBuf)
-	}()
-	for _, pi := range localActive {
-		if countIndexSliceContains(exactActive, pi) {
+	extraExactBuilt := len(extraExactCandidatesBuf.values) == 0
+	residualExactBuf := getIntSliceBuf(len(activeBuf.values))
+	defer releaseIntSliceBuf(residualExactBuf)
+	residualBothBuf := getIntSliceBuf(len(activeBuf.values))
+	defer releaseIntSliceBuf(residualBothBuf)
+	for _, pi := range activeBuf.values {
+		if countIndexSliceContains(exactActiveBuf.values, pi) {
 			continue
 		}
-		residualAfterExact = append(residualAfterExact, pi)
-		residualAfterBoth = append(residualAfterBoth, pi)
+		residualExactBuf.values = append(residualExactBuf.values, pi)
+		residualBothBuf.values = append(residualBothBuf.values, pi)
 	}
 
 	var cnt uint64
@@ -2294,18 +2248,18 @@ func (qv *queryView[K, V]) tryCountByPredicatesLeadBuckets(preds []predicate, le
 			return
 		}
 		extraExactBuilt = true
-		extraExactBuf = getCountLeadResidualExactFilterSliceBuf(len(extraExactCandidates))
-		extraExact = qv.buildCountLeadResidualExactFiltersByCandidatesInto(extraExactBuf.values[:0], preds, extraExactCandidates)
+		extraExactBuf = getCountLeadResidualExactFilterSliceBuf(len(extraExactCandidatesBuf.values))
+		extraExact = qv.buildCountLeadResidualExactFiltersByCandidatesInto(extraExactBuf.values[:0], preds, extraExactCandidatesBuf.values)
 		if len(extraExact) == 0 {
 			return
 		}
 		extraWork.Release()
-		residualAfterBoth = residualAfterBoth[:0]
-		for _, pi := range residualAfterExact {
+		residualBothBuf.values = residualBothBuf.values[:0]
+		for _, pi := range residualExactBuf.values {
 			if countLeadResidualExactFiltersContain(extraExact, pi) {
 				continue
 			}
-			residualAfterBoth = append(residualAfterBoth, pi)
+			residualBothBuf.values = append(residualBothBuf.values, pi)
 		}
 	}
 
@@ -2320,13 +2274,13 @@ func (qv *queryView[K, V]) tryCountByPredicatesLeadBuckets(preds []predicate, le
 		}
 		examined += ids.Cardinality()
 
-		if len(localActive) == 0 {
+		if len(activeBuf.values) == 0 {
 			cnt += ids.Cardinality()
 			continue
 		}
 		if idx, ok := ids.TrySingle(); ok {
 			pass := true
-			for _, pi := range localActive {
+			for _, pi := range activeBuf.values {
 				if !preds[pi].matches(idx) {
 					pass = false
 					break
@@ -2338,10 +2292,10 @@ func (qv *queryView[K, V]) tryCountByPredicatesLeadBuckets(preds []predicate, le
 			continue
 		}
 
-		if len(exactActive) == 0 && len(extraExact) == 0 {
+		if len(exactActiveBuf.values) == 0 && len(extraExact) == 0 {
 			ids.ForEach(func(idx uint64) bool {
 				pass := true
-				for _, pi := range localActive {
+				for _, pi := range activeBuf.values {
 					if !preds[pi].matches(idx) {
 						pass = false
 						break
@@ -2357,8 +2311,8 @@ func (qv *queryView[K, V]) tryCountByPredicatesLeadBuckets(preds []predicate, le
 
 		current := ids
 		exactApplied := false
-		if len(exactActive) > 0 {
-			mode, exactIDs, nextBucketWork, _ := plannerFilterPostingByChecks(preds, exactActive, ids, bucketWork, true)
+		if len(exactActiveBuf.values) > 0 {
+			mode, exactIDs, nextBucketWork, _ := plannerFilterPostingByChecks(preds, exactActiveBuf.values, ids, bucketWork, true)
 			bucketWork = nextBucketWork
 			switch mode {
 			case plannerPredicateBucketEmpty:
@@ -2389,11 +2343,11 @@ func (qv *queryView[K, V]) tryCountByPredicatesLeadBuckets(preds []predicate, le
 			extraApplied = true
 		}
 
-		checks := localActive
+		checks := activeBuf.values
 		if extraApplied {
-			checks = residualAfterBoth
+			checks = residualBothBuf.values
 		} else if exactApplied {
-			checks = residualAfterExact
+			checks = residualExactBuf.values
 		}
 		if len(checks) == 0 {
 			cnt += current.Cardinality()
@@ -2435,26 +2389,15 @@ func (qv *queryView[K, V]) tryCountByPredicatesLeadPostings(preds []predicate, l
 	}
 
 	activeBuf := getIntSliceBuf(len(active))
-	localActive := activeBuf.values[:0]
-	defer func() {
-		activeBuf.values = localActive
-		releaseIntSliceBuf(activeBuf)
-	}()
-	localActive = append(localActive, active...)
+	defer releaseIntSliceBuf(activeBuf)
+	activeBuf.values = append(activeBuf.values, active...)
 
-	exactActiveBuf := getIntSliceBuf(len(localActive))
-	exactActive := buildPostingApplyActive(exactActiveBuf.values, localActive, preds)
-	defer func() {
-		exactActiveBuf.values = exactActive
-		releaseIntSliceBuf(exactActiveBuf)
-	}()
-	extraExactCandidatesBuf := getIntSliceBuf(len(localActive))
-	extraExactCandidates := extraExactCandidatesBuf.values[:0]
-	extraExactCandidates = qv.collectCountLeadResidualExactCandidatesInto(extraExactCandidates, preds, localActive, exactActive)
-	defer func() {
-		extraExactCandidatesBuf.values = extraExactCandidates
-		releaseIntSliceBuf(extraExactCandidatesBuf)
-	}()
+	exactActiveBuf := getIntSliceBuf(len(activeBuf.values))
+	exactActiveBuf.values = buildPostingApplyActive(exactActiveBuf.values, activeBuf.values, preds)
+	defer releaseIntSliceBuf(exactActiveBuf)
+	extraExactCandidatesBuf := getIntSliceBuf(len(activeBuf.values))
+	extraExactCandidatesBuf.values = qv.collectCountLeadResidualExactCandidatesInto(extraExactCandidatesBuf.values, preds, activeBuf.values, exactActiveBuf.values)
+	defer releaseIntSliceBuf(extraExactCandidatesBuf)
 	var (
 		extraExact    []countLeadResidualExactFilter
 		extraExactBuf *countLeadResidualExactFilterSliceBuf
@@ -2466,25 +2409,17 @@ func (qv *queryView[K, V]) tryCountByPredicatesLeadPostings(preds []predicate, l
 		}
 		releaseCountLeadResidualExactFilterSliceBuf(extraExactBuf)
 	}()
-	extraExactBuilt := len(extraExactCandidates) == 0
-	residualExactBuf := getIntSliceBuf(len(localActive))
-	residualAfterExact := residualExactBuf.values[:0]
-	defer func() {
-		residualExactBuf.values = residualAfterExact
-		releaseIntSliceBuf(residualExactBuf)
-	}()
-	residualBothBuf := getIntSliceBuf(len(localActive))
-	residualAfterBoth := residualBothBuf.values[:0]
-	defer func() {
-		residualBothBuf.values = residualAfterBoth
-		releaseIntSliceBuf(residualBothBuf)
-	}()
-	for _, pi := range localActive {
-		if countIndexSliceContains(exactActive, pi) {
+	extraExactBuilt := len(extraExactCandidatesBuf.values) == 0
+	residualExactBuf := getIntSliceBuf(len(activeBuf.values))
+	defer releaseIntSliceBuf(residualExactBuf)
+	residualBothBuf := getIntSliceBuf(len(activeBuf.values))
+	defer releaseIntSliceBuf(residualBothBuf)
+	for _, pi := range activeBuf.values {
+		if countIndexSliceContains(exactActiveBuf.values, pi) {
 			continue
 		}
-		residualAfterExact = append(residualAfterExact, pi)
-		residualAfterBoth = append(residualAfterBoth, pi)
+		residualExactBuf.values = append(residualExactBuf.values, pi)
+		residualBothBuf.values = append(residualBothBuf.values, pi)
 	}
 
 	var cnt uint64
@@ -2499,18 +2434,18 @@ func (qv *queryView[K, V]) tryCountByPredicatesLeadPostings(preds []predicate, l
 			return
 		}
 		extraExactBuilt = true
-		extraExactBuf = getCountLeadResidualExactFilterSliceBuf(len(extraExactCandidates))
-		extraExact = qv.buildCountLeadResidualExactFiltersByCandidatesInto(extraExactBuf.values[:0], preds, extraExactCandidates)
+		extraExactBuf = getCountLeadResidualExactFilterSliceBuf(len(extraExactCandidatesBuf.values))
+		extraExact = qv.buildCountLeadResidualExactFiltersByCandidatesInto(extraExactBuf.values[:0], preds, extraExactCandidatesBuf.values)
 		if len(extraExact) == 0 {
 			return
 		}
 		extraWork.Release()
-		residualAfterBoth = residualAfterBoth[:0]
-		for _, pi := range residualAfterExact {
+		residualBothBuf.values = residualBothBuf.values[:0]
+		for _, pi := range residualExactBuf.values {
 			if countLeadResidualExactFiltersContain(extraExact, pi) {
 				continue
 			}
-			residualAfterBoth = append(residualAfterBoth, pi)
+			residualBothBuf.values = append(residualBothBuf.values, pi)
 		}
 	}
 
@@ -2520,13 +2455,13 @@ func (qv *queryView[K, V]) tryCountByPredicatesLeadPostings(preds []predicate, l
 		}
 		examined += ids.Cardinality()
 
-		if len(localActive) == 0 {
+		if len(activeBuf.values) == 0 {
 			cnt += ids.Cardinality()
 			continue
 		}
 		if idx, ok := ids.TrySingle(); ok {
 			pass := true
-			for _, pi := range localActive {
+			for _, pi := range activeBuf.values {
 				if !preds[pi].matches(idx) {
 					pass = false
 					break
@@ -2538,10 +2473,10 @@ func (qv *queryView[K, V]) tryCountByPredicatesLeadPostings(preds []predicate, l
 			continue
 		}
 
-		if len(exactActive) == 0 && len(extraExact) == 0 {
+		if len(exactActiveBuf.values) == 0 && len(extraExact) == 0 {
 			ids.ForEach(func(idx uint64) bool {
 				pass := true
-				for _, pi := range localActive {
+				for _, pi := range activeBuf.values {
 					if !preds[pi].matches(idx) {
 						pass = false
 						break
@@ -2557,8 +2492,8 @@ func (qv *queryView[K, V]) tryCountByPredicatesLeadPostings(preds []predicate, l
 
 		current := ids
 		exactApplied := false
-		if len(exactActive) > 0 {
-			mode, exactIDs, nextBucketWork, _ := plannerFilterPostingByChecks(preds, exactActive, ids, bucketWork, true)
+		if len(exactActiveBuf.values) > 0 {
+			mode, exactIDs, nextBucketWork, _ := plannerFilterPostingByChecks(preds, exactActiveBuf.values, ids, bucketWork, true)
 			bucketWork = nextBucketWork
 			switch mode {
 			case plannerPredicateBucketEmpty:
@@ -2589,11 +2524,11 @@ func (qv *queryView[K, V]) tryCountByPredicatesLeadPostings(preds []predicate, l
 			extraApplied = true
 		}
 
-		checks := localActive
+		checks := activeBuf.values
 		if extraApplied {
-			checks = residualAfterBoth
+			checks = residualBothBuf.values
 		} else if exactApplied {
-			checks = residualAfterExact
+			checks = residualExactBuf.values
 		}
 		if len(checks) == 0 {
 			cnt += current.Cardinality()
@@ -2983,14 +2918,9 @@ branchLoop:
 		}
 
 		activeBuf := getIntSliceBuf(len(preds))
-		active := activeBuf.values
 		branchFalse := false
-		releaseCurrentBranch := func(checksBuf *intSliceBuf, checks []int) {
-			if checksBuf != nil {
-				checksBuf.values = checks
-				releaseIntSliceBuf(checksBuf)
-			}
-			activeBuf.values = active
+		releaseCurrentBranch := func(checksBuf *intSliceBuf) {
+			releaseIntSliceBuf(checksBuf)
 			releaseIntSliceBuf(activeBuf)
 			releasePredicates(preds, predsBuf)
 		}
@@ -3004,31 +2934,29 @@ branchLoop:
 			if p.covered || p.alwaysTrue {
 				continue
 			}
-			active = append(active, i)
+			activeBuf.values = append(activeBuf.values, i)
 		}
 
 		if branchFalse {
-			activeBuf.values = active
 			releaseIntSliceBuf(activeBuf)
 			releasePredicates(preds, predsBuf)
 			continue
 		}
 
 		// Branch is tautology: OR result equals universe.
-		if len(active) == 0 {
-			activeBuf.values = active
+		if len(activeBuf.values) == 0 {
 			releaseIntSliceBuf(activeBuf)
 			releasePredicates(preds, predsBuf)
 			return uc, true, nil
 		}
 
 		leadIdx, leadEst, leadScore := qv.pickCountORLeadPredicate(preds, uc)
-		branchEst := countORBranchEstimate(preds, active, leadEst)
+		branchEst := countORBranchEstimate(preds, activeBuf.values, leadEst)
 		leadWeight := uint64(0)
 		if leadIdx >= 0 {
 			leadWeight = countPredicateLeadScanWeight(preds[leadIdx])
 		}
-		spillBranch := func(reason string, checksBuf *intSliceBuf, checks []int) {
+		spillBranch := func(reason string, checksBuf *intSliceBuf) {
 			if branchTrace != nil {
 				branchTrace[branchIdx].Skipped = true
 				branchTrace[branchIdx].SkipReason = reason
@@ -3039,47 +2967,46 @@ branchLoop:
 				est:   branchEst,
 			})
 			materializedBranchEst = satAddUint64(materializedBranchEst, branchEst)
-			releaseCurrentBranch(checksBuf, checks)
+			releaseCurrentBranch(checksBuf)
 		}
 
 		// Cannot drive branch without iterable lead.
 		if leadIdx < 0 {
 			if strictWide {
-				spillBranch("materialized_spill_no_lead", nil, nil)
+				spillBranch("materialized_spill_no_lead", nil)
 				continue
 			}
-			releaseCurrentBranch(nil, nil)
+			releaseCurrentBranch(nil)
 			return 0, false, nil
 		}
 		// Keep OR path setup minimal: avoid eager predicate materialization here.
 		// Broad OR branches are sensitive to one-shot setup allocations.
 		if countLeadTooRisky(preds[leadIdx].expr.Op, leadEst, uc) {
 			if strictWide {
-				spillBranch("materialized_spill_risky_lead", nil, nil)
+				spillBranch("materialized_spill_risky_lead", nil)
 				continue
 			}
-			releaseCurrentBranch(nil, nil)
+			releaseCurrentBranch(nil)
 			return 0, false, nil
 		}
 		if strictWide {
 			if leadWeight > 3 && leadEst > 2_048 && leadEst > uc/64 {
-				spillBranch("materialized_spill_expensive_lead", nil, nil)
+				spillBranch("materialized_spill_expensive_lead", nil)
 				continue branchLoop
 			}
 			if leadScore > uc && leadEst > 2_048 && leadEst > uc/32 {
-				spillBranch("materialized_spill_expensive_branch_score", nil, nil)
+				spillBranch("materialized_spill_expensive_branch_score", nil)
 				continue branchLoop
 			}
 			if leadEst > uc/3 {
-				spillBranch("materialized_spill_broad_lead", nil, nil)
+				spillBranch("materialized_spill_broad_lead", nil)
 				continue branchLoop
 			}
 		}
 
-		checksBuf := getIntSliceBuf(len(active))
-		checks := checksBuf.values
+		checksBuf := getIntSliceBuf(len(activeBuf.values))
 		leadNeedsCheck := preds[leadIdx].leadIterNeedsContainsCheck()
-		for _, pi := range active {
+		for _, pi := range activeBuf.values {
 			if pi == leadIdx && !leadNeedsCheck {
 				continue
 			}
@@ -3093,26 +3020,26 @@ branchLoop:
 			}
 			if !p.hasContains() {
 				if strictWide {
-					spillBranch("materialized_spill_no_contains", checksBuf, checks)
+					spillBranch("materialized_spill_no_contains", checksBuf)
 					continue branchLoop
 				}
-				releaseCurrentBranch(checksBuf, checks)
+				releaseCurrentBranch(checksBuf)
 				return 0, false, nil
 			}
-			checks = append(checks, pi)
+			checksBuf.values = append(checksBuf.values, pi)
 		}
 		if branchFalse {
-			releaseCurrentBranch(checksBuf, checks)
+			releaseCurrentBranch(checksBuf)
 			continue
 		}
-		for _, pi := range checks {
+		for _, pi := range checksBuf.values {
 			if err := qv.prepareCountORPredicateWithTrace(&preds[pi], leadEst, uc, trace); err != nil {
-				releaseCurrentBranch(checksBuf, checks)
+				releaseCurrentBranch(checksBuf)
 				return 0, true, err
 			}
 		}
-		filteredChecks := checks[:0]
-		for _, pi := range checks {
+		filteredChecks := checksBuf.values[:0]
+		for _, pi := range checksBuf.values {
 			p := preds[pi]
 			if p.covered || p.alwaysTrue {
 				continue
@@ -3123,21 +3050,20 @@ branchLoop:
 			}
 			if !p.hasContains() {
 				if strictWide {
-					spillBranch("materialized_spill_post_prepare", checksBuf, checks)
+					spillBranch("materialized_spill_post_prepare", checksBuf)
 					continue branchLoop
 				}
-				releaseCurrentBranch(checksBuf, checks)
+				releaseCurrentBranch(checksBuf)
 				return 0, false, nil
 			}
 			filteredChecks = append(filteredChecks, pi)
 		}
 		if branchFalse {
-			releaseCurrentBranch(checksBuf, checks)
+			releaseCurrentBranch(checksBuf)
 			continue
 		}
-		checks = filteredChecks
-		sortActivePredicates(checks, preds)
-		activeBuf.values = active
+		checksBuf.values = filteredChecks
+		sortActivePredicates(checksBuf.values, preds)
 		releaseIntSliceBuf(activeBuf)
 
 		if leadEst == 0 || leadWeight == 0 {
@@ -3146,13 +3072,12 @@ branchLoop:
 		}
 		expectedProbes += leadEst * leadWeight
 		branches = append(branches, countORBranch{
-			index:     branchIdx,
-			preds:     preds,
-			predsBuf:  predsBuf,
-			lead:      leadIdx,
-			checks:    checks,
-			checksBuf: checksBuf,
-			est:       leadEst,
+			index:    branchIdx,
+			preds:    preds,
+			predsBuf: predsBuf,
+			lead:     leadIdx,
+			checks:   checksBuf,
+			est:      leadEst,
 		})
 	}
 
@@ -3396,18 +3321,10 @@ func (qv *queryView[K, V]) tryCountPreparedAndReordered(expr qx.Expr) (uint64, b
 	plans := make([]countLeafPlan, len(leaves))
 
 	posBuf := getIntSliceBuf(len(plans))
-	pos := posBuf.values[:0]
-	defer func() {
-		posBuf.values = pos
-		releaseIntSliceBuf(posBuf)
-	}()
+	defer releaseIntSliceBuf(posBuf)
 
 	negBuf := getIntSliceBuf(len(plans))
-	neg := negBuf.values[:0]
-	defer func() {
-		negBuf.values = neg
-		releaseIntSliceBuf(negBuf)
-	}()
+	defer releaseIntSliceBuf(negBuf)
 
 	for i := range leaves {
 		e := leaves[i]
@@ -3423,19 +3340,19 @@ func (qv *queryView[K, V]) tryCountPreparedAndReordered(expr qx.Expr) (uint64, b
 			plans[i].hasSel = true
 		}
 		if e.Not {
-			neg = append(neg, i)
+			negBuf.values = append(negBuf.values, i)
 			continue
 		}
-		pos = append(pos, i)
+		posBuf.values = append(posBuf.values, i)
 	}
 
 	// Pure-NOT conjunctions are rare and don't benefit from this path.
-	if len(pos) == 0 {
+	if len(posBuf.values) == 0 {
 		return 0, false, nil
 	}
 
-	sortCountLeafPlanOrder(plans, pos)
-	sortCountLeafPlanOrder(plans, neg)
+	sortCountLeafPlanOrder(plans, posBuf.values)
+	sortCountLeafPlanOrder(plans, negBuf.values)
 
 	var (
 		acc    postingResult
@@ -3471,7 +3388,7 @@ func (qv *queryView[K, V]) tryCountPreparedAndReordered(expr qx.Expr) (uint64, b
 		return false, nil
 	}
 
-	for _, pi := range pos {
+	for _, pi := range posBuf.values {
 		done, err := apply(pi)
 		if err != nil {
 			return 0, true, err
@@ -3480,7 +3397,7 @@ func (qv *queryView[K, V]) tryCountPreparedAndReordered(expr qx.Expr) (uint64, b
 			return 0, true, nil
 		}
 	}
-	for _, ni := range neg {
+	for _, ni := range negBuf.values {
 		done, err := apply(ni)
 		if err != nil {
 			return 0, true, err
