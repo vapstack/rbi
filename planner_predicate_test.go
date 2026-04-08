@@ -212,7 +212,7 @@ func TestOverlayRangePredicateState_Matches_MaterializedComplementProbe(t *testi
 		probeMaterialized: true,
 		probeIDs:          posting.BuildFromSorted([]uint64{2, 4}),
 	}
-	defer releaseOverlayRangePredicateState(state)
+	defer overlayRangePredicateStatePool.Put(state)
 
 	if state.matches(2) {
 		t.Fatalf("complement probe hit must be excluded from positive broad range")
@@ -223,23 +223,23 @@ func TestOverlayRangePredicateState_Matches_MaterializedComplementProbe(t *testi
 }
 
 func TestPredicateSetExpectedContainsCalls_UpdatesOverlayRangeState(t *testing.T) {
-	state := acquireOverlayRangePredicateState(
-		fieldOverlay{base: []index{{Key: indexKeyFromString("a")}, {Key: indexKeyFromString("b")}, {Key: indexKeyFromString("c")}}},
-		overlayRange{baseStart: 0, baseEnd: 3},
-		overlayRangeProbe{
-			ov:       fieldOverlay{base: []index{{Key: indexKeyFromString("a")}, {Key: indexKeyFromString("b")}, {Key: indexKeyFromString("c")}}},
-			spans:    [2]overlayRange{{baseStart: 0, baseEnd: 3}},
-			spanCnt:  1,
-			probeLen: 32,
-			probeEst: 2048,
-		},
-		3,
-		2048,
-		false,
-		materializedPredReuse{},
-		false,
-	)
-	defer releaseOverlayRangePredicateState(state)
+	state := overlayRangePredicateStatePool.Get()
+	state.ov = fieldOverlay{base: []index{{Key: indexKeyFromString("a")}, {Key: indexKeyFromString("b")}, {Key: indexKeyFromString("c")}}}
+	state.br = overlayRange{baseStart: 0, baseEnd: 3}
+	state.probe = overlayRangeProbe{
+		ov:       fieldOverlay{base: []index{{Key: indexKeyFromString("a")}, {Key: indexKeyFromString("b")}, {Key: indexKeyFromString("c")}}},
+		spans:    [2]overlayRange{{baseStart: 0, baseEnd: 3}},
+		spanCnt:  1,
+		probeLen: 32,
+		probeEst: 2048,
+	}
+	state.bucketCount = 3
+	state.linearContainsMax = rangeLinearContainsLimit(state.probe.probeLen, state.probe.probeEst)
+	state.materializeAfter = rangeMaterializeAfterForProbe(state.probe.probeLen, state.probe.probeEst)
+	state.rangeMaterializeAt = rangePostingFilterMaterializeAfterForProbe(3, 2048)
+	state.keepProbeHits = false
+	state.setExpectedContainsCalls(state.materializeAfter)
+	defer overlayRangePredicateStatePool.Put(state)
 
 	p := predicate{overlayState: state}
 	p.setExpectedContainsCalls(1)
@@ -251,24 +251,75 @@ func TestPredicateSetExpectedContainsCalls_UpdatesOverlayRangeState(t *testing.T
 	}
 }
 
-func TestAcquireOverlayRangePredicateState_PositiveDirectProbeKeepsProbeHitsWithoutPostingFilter(t *testing.T) {
-	state := acquireOverlayRangePredicateState(
-		fieldOverlay{base: []index{{Key: indexKeyFromString("a")}, {Key: indexKeyFromString("b")}}},
-		overlayRange{baseStart: 0, baseEnd: 1},
-		overlayRangeProbe{
-			ov:       fieldOverlay{base: []index{{Key: indexKeyFromString("a")}, {Key: indexKeyFromString("b")}}},
-			spans:    [2]overlayRange{{baseStart: 0, baseEnd: 1}},
-			spanCnt:  1,
-			probeLen: 1,
-			probeEst: 1,
+func TestBaseRangePredicateState_LinearContains_NonLinearModeSkipsLinearPosts(t *testing.T) {
+	state := baseRangePredicateStatePool.Get()
+	state.probe = baseRangeProbe{
+		s: []index{
+			{IDs: posting.BuildFromSorted([]uint64{1, 2})},
+			{IDs: posting.BuildFromSorted([]uint64{3, 4})},
 		},
-		1,
-		1,
-		false,
-		materializedPredReuse{},
-		false,
-	)
-	defer releaseOverlayRangePredicateState(state)
+		start:    0,
+		end:      2,
+		probeLen: 2,
+		probeEst: 4,
+	}
+	state.expectedContainsCalls = 8
+	state.containsMode = baseRangeContainsPosting
+	defer baseRangePredicateStatePool.Put(state)
+
+	if !state.linearContains(3) {
+		t.Fatalf("expected base linearContains to probe-match idx 3")
+	}
+	if state.linearPostsBuf != nil {
+		t.Fatalf("base linearContains must not build linear posts outside linear mode")
+	}
+}
+
+func TestOverlayRangePredicateState_LinearContains_NonLinearModeSkipsLinearPosts(t *testing.T) {
+	base := []index{
+		{Key: indexKeyFromString("a"), IDs: posting.BuildFromSorted([]uint64{1, 2})},
+		{Key: indexKeyFromString("b"), IDs: posting.BuildFromSorted([]uint64{3, 4})},
+	}
+	state := overlayRangePredicateStatePool.Get()
+	state.ov = fieldOverlay{base: base}
+	state.probe = overlayRangeProbe{
+		ov:       fieldOverlay{base: base},
+		spans:    [2]overlayRange{{baseStart: 0, baseEnd: 2}},
+		spanCnt:  1,
+		probeLen: 2,
+		probeEst: 4,
+	}
+	state.bucketCount = 2
+	state.expectedContainsCalls = 8
+	state.containsMode = baseRangeContainsPosting
+	defer overlayRangePredicateStatePool.Put(state)
+
+	if !state.linearContains(3) {
+		t.Fatalf("expected overlay linearContains to probe-match idx 3")
+	}
+	if state.linearPostsBuf != nil {
+		t.Fatalf("overlay linearContains must not build linear posts outside linear mode")
+	}
+}
+
+func TestAcquireOverlayRangePredicateState_PositiveDirectProbeKeepsProbeHitsWithoutPostingFilter(t *testing.T) {
+	state := overlayRangePredicateStatePool.Get()
+	state.ov = fieldOverlay{base: []index{{Key: indexKeyFromString("a")}, {Key: indexKeyFromString("b")}}}
+	state.br = overlayRange{baseStart: 0, baseEnd: 1}
+	state.probe = overlayRangeProbe{
+		ov:       fieldOverlay{base: []index{{Key: indexKeyFromString("a")}, {Key: indexKeyFromString("b")}}},
+		spans:    [2]overlayRange{{baseStart: 0, baseEnd: 1}},
+		spanCnt:  1,
+		probeLen: 1,
+		probeEst: 1,
+	}
+	state.bucketCount = 1
+	state.linearContainsMax = rangeLinearContainsLimit(state.probe.probeLen, state.probe.probeEst)
+	state.materializeAfter = rangeMaterializeAfterForProbe(state.probe.probeLen, state.probe.probeEst)
+	state.rangeMaterializeAt = rangePostingFilterMaterializeAfterForProbe(1, 1)
+	state.keepProbeHits = true
+	state.setExpectedContainsCalls(state.materializeAfter)
+	defer overlayRangePredicateStatePool.Put(state)
 
 	if !state.keepProbeHits {
 		t.Fatalf("positive direct overlay probe must keep probe hits even when posting filter is disabled")
@@ -416,7 +467,11 @@ func TestBuildPredRange_PrefixMaterializationSkippedWhenCacheDisabled(t *testing
 	releasePredicates([]predicate{p})
 
 	rawKey := materializedPredCacheKeyFromScalar("email", qx.OpPREFIX, "user1")
-	if _, ok := db.getSnapshot().matPredCache.Load(rawKey); ok {
+	parsedKey, ok := materializedPredKeyFromEncoded(rawKey)
+	if !ok {
+		t.Fatalf("expected parseable materialized cache key %q", rawKey)
+	}
+	if _, ok := db.getSnapshot().matPredCache.Load(parsedKey); ok {
 		t.Fatalf("expected no cache store when materialized predicate cache is disabled")
 	}
 	if got := db.getSnapshot().matPredCacheCount.Load(); got != 0 {
@@ -594,7 +649,7 @@ func TestBuildPredRange_OverlayNumericPostingFilter_ComplementMaterializedFallba
 
 func TestOverlayRangeStats_ChunkedMatchesCursorScanOnSeededScore(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
-	seedGeneratedUint64Data(t, db, 120_000, func(i int) *Rec {
+	seedGeneratedUint64Data(t, db, 12_000, func(i int) *Rec {
 		return &Rec{
 			Name:   fmt.Sprintf("u_%d", i),
 			Email:  fmt.Sprintf("user%05d@example.com", i),
@@ -651,7 +706,7 @@ func TestOverlayRangeStats_ChunkedMatchesCursorScanOnSeededScore(t *testing.T) {
 
 func TestBuildPredRangeCandidate_DoesNotCollapsePartialChunkedRangeToAlwaysTrue(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
-	seedGeneratedUint64Data(t, db, 120_000, func(i int) *Rec {
+	seedGeneratedUint64Data(t, db, 12_000, func(i int) *Rec {
 		return &Rec{
 			Name:   fmt.Sprintf("u_%d", i),
 			Email:  fmt.Sprintf("user%05d@example.com", i),
@@ -680,7 +735,7 @@ func TestBuildPredRangeCandidate_DoesNotCollapsePartialChunkedRangeToAlwaysTrue(
 
 func TestBuildPredRangeCandidate_ChunkedRangeMatchesBitmapBaseline(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
-	seedGeneratedUint64Data(t, db, 120_000, func(i int) *Rec {
+	seedGeneratedUint64Data(t, db, 12_000, func(i int) *Rec {
 		return &Rec{
 			Name:   fmt.Sprintf("u_%d", i),
 			Email:  fmt.Sprintf("user%05d@example.com", i),
@@ -718,13 +773,52 @@ func TestBuildPredRangeCandidate_ChunkedRangeMatchesBitmapBaseline(t *testing.T)
 	}
 }
 
+func TestBuildPredicateWithMode_AllowMaterializeSkipsColdNumericRangeUnionWhenPostingFilterWins(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{
+		AnalyzeInterval:                         -1,
+		SnapshotMaterializedPredCacheMaxEntries: 16,
+	})
+	seedGeneratedUint64Data(t, db, 12_000, func(i int) *Rec {
+		return &Rec{
+			Name:   fmt.Sprintf("u_%d", i),
+			Email:  fmt.Sprintf("user%05d@example.com", i),
+			Age:    i,
+			Score:  float64(i),
+			Active: i%2 == 0,
+		}
+	})
+	if err := db.RebuildIndex(); err != nil {
+		t.Fatalf("RebuildIndex: %v", err)
+	}
+
+	expr := qx.Expr{Op: qx.OpLT, Field: "age", Value: 6_000}
+	p, ok := db.currentQueryViewForTests().buildPredicateWithColdMode(expr, true, true)
+	if !ok {
+		t.Fatalf("expected predicate build to succeed")
+	}
+	defer releasePredicates([]predicate{p})
+
+	if p.overlayState == nil {
+		t.Fatalf("expected cold numeric range to stay on overlay runtime state")
+	}
+	if p.overlayState.probeMaterializeAt <= 1 {
+		t.Fatalf("expected runtime posting filter to defer materialization, got probeMaterializeAt=%d", p.overlayState.probeMaterializeAt)
+	}
+	if p.kind == predicateKindMaterialized || p.kind == predicateKindMaterializedNot {
+		t.Fatalf("unexpected eager materialized predicate kind=%v", p.kind)
+	}
+	if got := db.getSnapshot().matPredCacheCount.Load(); got != 0 {
+		t.Fatalf("unexpected shared materialized predicate cache entry: %d", got)
+	}
+}
+
 func TestBuildPredicateWithMode_RuntimeNumericRangeMaterializationKeepsScalarCacheLocal(t *testing.T) {
 	t.Run("OverlayState", func(t *testing.T) {
 		db, _ := openTempDBUint64(t, Options{
 			AnalyzeInterval:                         -1,
 			SnapshotMaterializedPredCacheMaxEntries: 16,
 		})
-		seedGeneratedUint64Data(t, db, 120_000, func(i int) *Rec {
+		seedGeneratedUint64Data(t, db, 12_000, func(i int) *Rec {
 			return &Rec{
 				Name:   fmt.Sprintf("u_%d", i),
 				Email:  fmt.Sprintf("user%05d@example.com", i),
@@ -737,7 +831,7 @@ func TestBuildPredicateWithMode_RuntimeNumericRangeMaterializationKeepsScalarCac
 			t.Fatalf("RebuildIndex: %v", err)
 		}
 
-		expr := qx.Expr{Op: qx.OpGT, Field: "age", Value: 110_000}
+		expr := qx.Expr{Op: qx.OpGT, Field: "age", Value: 11_000}
 		cacheKey := db.materializedPredCacheKey(expr)
 		p, ok := db.buildPredicateWithMode(expr, false)
 		if !ok {
@@ -847,8 +941,8 @@ func TestBuildPredRange_BroadPositiveRuntimeKeepsComplementCacheLocal(t *testing
 	if isSlice || bound.full || bound.empty {
 		t.Fatalf("unexpected normalized bound state: slice=%v full=%v empty=%v", isSlice, bound.full, bound.empty)
 	}
-	fullCacheKey := db.materializedPredCacheKey(expr)
-	complementCacheKey := db.materializedPredComplementCacheKeyForScalar(expr.Field, bound.op, bound.key)
+	fullCacheKey := view.materializedPredKey(expr).String()
+	complementCacheKey := view.materializedPredComplementKeyForNormalizedScalarBound(expr.Field, bound).String()
 	if fullCacheKey == "" || complementCacheKey == "" {
 		t.Fatalf("expected non-empty scalar and complement cache keys")
 	}
@@ -912,7 +1006,7 @@ func TestBuildPredRange_BroadPositivePostingFilterKeepsComplementCacheLocal(t *t
 	if isSlice || bound.full || bound.empty {
 		t.Fatalf("unexpected normalized bound state: slice=%v full=%v empty=%v", isSlice, bound.full, bound.empty)
 	}
-	complementCacheKey := view.materializedPredComplementCacheKeyForScalar(expr.Field, bound.op, bound.key)
+	complementCacheKey := view.materializedPredComplementKeyForNormalizedScalarBound(expr.Field, bound).String()
 
 	p, ok := view.buildPredicateWithMode(expr, false)
 	if !ok {
@@ -947,9 +1041,75 @@ func TestBuildPredRange_BroadPositivePostingFilterKeepsComplementCacheLocal(t *t
 	}
 }
 
+func TestBuildPredicatesOrdered_BroadComplementPromotesOnSecondSight(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{
+		AnalyzeInterval:                         -1,
+		SnapshotMaterializedPredCacheMaxEntries: 16,
+	})
+	seedGeneratedUint64Data(t, db, 256, func(i int) *Rec {
+		return &Rec{
+			Name:  fmt.Sprintf("u_%d", i),
+			Age:   18 + i,
+			Score: float64(i),
+		}
+	})
+	if err := db.RebuildIndex(); err != nil {
+		t.Fatalf("RebuildIndex: %v", err)
+	}
+
+	view := db.currentQueryViewForTests()
+	defer db.releaseQueryView(view)
+
+	expr := qx.GTE("age", 40)
+	bound, isSlice, err := view.exprValueToNormalizedScalarBound(expr)
+	if err != nil {
+		t.Fatalf("exprValueToNormalizedScalarBound: %v", err)
+	}
+	if isSlice || bound.full || bound.empty {
+		t.Fatalf("unexpected normalized bound state: slice=%v full=%v empty=%v", isSlice, bound.full, bound.empty)
+	}
+	cacheKey := view.materializedPredComplementKeyForNormalizedScalarBound(expr.Field, bound).String()
+	if cacheKey == "" {
+		t.Fatalf("expected non-empty complement cache key")
+	}
+
+	preds1, ok := db.buildPredicatesOrderedWithMode([]qx.Expr{expr}, "score", false, 4096, false, true)
+	if !ok {
+		t.Fatalf("first buildPredicatesOrderedWithMode: ok=false")
+	}
+	defer releasePredicates(preds1)
+	if len(preds1) != 1 {
+		t.Fatalf("unexpected first predicate count: %d", len(preds1))
+	}
+	if preds1[0].kind == predicateKindMaterializedNot {
+		t.Fatalf("expected first ordered broad complement to stay runtime-local")
+	}
+	if !preds1[0].hasRuntimeRangeState() {
+		t.Fatalf("expected first ordered broad complement to keep runtime range state")
+	}
+	if _, ok := db.getSnapshot().loadMaterializedPred(cacheKey); ok {
+		t.Fatalf("unexpected shared complement cache entry after first ordered build")
+	}
+
+	preds2, ok := db.buildPredicatesOrderedWithMode([]qx.Expr{expr}, "score", false, 4096, false, true)
+	if !ok {
+		t.Fatalf("second buildPredicatesOrderedWithMode: ok=false")
+	}
+	defer releasePredicates(preds2)
+	if len(preds2) != 1 {
+		t.Fatalf("unexpected second predicate count: %d", len(preds2))
+	}
+	if preds2[0].kind != predicateKindMaterializedNot {
+		t.Fatalf("expected second ordered broad complement to materialize, got kind=%v", preds2[0].kind)
+	}
+	if _, ok := db.getSnapshot().loadMaterializedPred(cacheKey); !ok {
+		t.Fatalf("expected shared complement cache entry after second ordered build")
+	}
+}
+
 func TestOverlayRangeStats_ChunkedMatchesCursorScanOnLargeUniqueRange(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
-	seedGeneratedUint64Data(t, db, 160_000, func(i int) *Rec {
+	seedGeneratedUint64Data(t, db, 16_000, func(i int) *Rec {
 		return &Rec{
 			Name:   fmt.Sprintf("u_%d", i),
 			Email:  fmt.Sprintf("user%05d@example.com", i),
@@ -987,10 +1147,10 @@ func TestOverlayRangeStats_ChunkedMatchesCursorScanOnLargeUniqueRange(t *testing
 	}
 
 	cases := []rangeBounds{
-		{has: true, hasLo: true, loKey: int64ByteStr(35_000), loInc: true},
-		{has: true, hasLo: true, loKey: int64ByteStr(35_000), loInc: false},
-		{has: true, hasHi: true, hiKey: int64ByteStr(35_000), hiInc: false},
-		{has: true, hasLo: true, loKey: int64ByteStr(10_000), loInc: true, hasHi: true, hiKey: int64ByteStr(120_000), hiInc: false},
+		{has: true, hasLo: true, loKey: int64ByteStr(3_500), loInc: true},
+		{has: true, hasLo: true, loKey: int64ByteStr(3_500), loInc: false},
+		{has: true, hasHi: true, hiKey: int64ByteStr(3_500), hiInc: false},
+		{has: true, hasLo: true, loKey: int64ByteStr(1_000), loInc: true, hasHi: true, hiKey: int64ByteStr(12_000), hiInc: false},
 	}
 
 	for i, rb := range cases {

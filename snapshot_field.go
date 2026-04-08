@@ -301,9 +301,9 @@ func (acc indexedFieldAccessor) mergeSnapshotInsertNilStorageOwned(base fieldInd
 }
 
 func (state *snapshotFieldInsertState) releaseOwned() {
-	releaseInsertPostingMap(state.index)
-	releaseFixedInsertPostingMap(state.fixed)
-	releaseInsertPostingMap(state.nils)
+	insertPostingMapPool.Put(state.index)
+	fixedInsertPostingMapPool.Put(state.fixed)
+	insertPostingMapPool.Put(state.nils)
 	state.index = nil
 	state.fixed = nil
 	state.nils = nil
@@ -452,9 +452,9 @@ func (acc indexedFieldAccessor) applySnapshotBatchNilStorageOwned(base fieldInde
 }
 
 func (state *snapshotFieldBatchState) releaseOwned() {
-	releaseBatchPostingAccumMap(state.index)
-	releaseFixedBatchPostingAccumMap(state.fixed)
-	releaseBatchPostingAccumMap(state.nils)
+	batchPostingAccumMapPool.Put(state.index)
+	fixedBatchPostingAccumMapPool.Put(state.fixed)
+	batchPostingAccumMapPool.Put(state.nils)
 	state.index = nil
 	state.fixed = nil
 	state.nils = nil

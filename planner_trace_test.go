@@ -363,33 +363,44 @@ func TestTracer_CountPathTracksBroadRangePrepareMetrics(t *testing.T) {
 	if err != nil {
 		t.Fatalf("second Count: %v", err)
 	}
-	if first == 0 || second != first {
-		t.Fatalf("unexpected counts: first=%d second=%d", first, second)
+	third, err := db.Count(q)
+	if err != nil {
+		t.Fatalf("third Count: %v", err)
+	}
+	if first == 0 || second != first || third != first {
+		t.Fatalf("unexpected counts: first=%d second=%d third=%d", first, second, third)
 	}
 
 	mu.Lock()
 	defer mu.Unlock()
-	if len(events) < 2 {
-		t.Fatalf("expected at least two trace events, got %d", len(events))
+	if len(events) < 3 {
+		t.Fatalf("expected at least three trace events, got %d", len(events))
 	}
-	ev1 := events[len(events)-2]
-	ev2 := events[len(events)-1]
+	ev1 := events[len(events)-3]
+	ev2 := events[len(events)-2]
+	ev3 := events[len(events)-1]
 	if ev1.Plan != string(PlanCountPredicates) {
 		t.Fatalf("expected first plan %q, got %q", PlanCountPredicates, ev1.Plan)
 	}
 	if ev1.CountPredicatePreparations == 0 {
 		t.Fatalf("expected first trace to record count predicate preparation")
 	}
-	if ev1.CountRangeComplementBuilds == 0 {
-		t.Fatalf("expected first trace to record complement build")
+	if ev1.CountRangeComplementBuilds != 0 {
+		t.Fatalf("expected first trace to keep complement local, got %d builds", ev1.CountRangeComplementBuilds)
 	}
 	if ev1.CountRangeComplementCacheHits != 0 {
 		t.Fatalf("expected first trace to have no complement cache hit, got %d", ev1.CountRangeComplementCacheHits)
 	}
-	if ev2.CountRangeComplementCacheHits == 0 {
-		t.Fatalf("expected second trace to record complement cache hit")
+	if ev2.CountRangeComplementBuilds == 0 {
+		t.Fatalf("expected second trace to record complement build after promotion")
 	}
-	if ev2.CountRangeComplementBuilds != 0 {
-		t.Fatalf("expected second trace to skip complement rebuild, got %d builds", ev2.CountRangeComplementBuilds)
+	if ev2.CountRangeComplementCacheHits != 0 {
+		t.Fatalf("expected second trace to avoid complement cache hit, got %d", ev2.CountRangeComplementCacheHits)
+	}
+	if ev3.CountRangeComplementCacheHits == 0 {
+		t.Fatalf("expected third trace to record complement cache hit")
+	}
+	if ev3.CountRangeComplementBuilds != 0 {
+		t.Fatalf("expected third trace to skip complement rebuild, got %d builds", ev3.CountRangeComplementBuilds)
 	}
 }

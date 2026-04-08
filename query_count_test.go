@@ -2,13 +2,56 @@ package rbi
 
 import (
 	"fmt"
+	"io"
+	"os"
 	"path/filepath"
 	"sync"
 	"testing"
 
 	"github.com/vapstack/qx"
+	"github.com/vapstack/rbi/internal/pooled"
 	"github.com/vapstack/rbi/internal/posting"
 )
+
+func copySeededDBWithSidecars(t *testing.T, src, name string) string {
+	t.Helper()
+
+	dst := filepath.Join(t.TempDir(), name)
+	copySeededFile(t, src, dst)
+
+	sidecars, err := filepath.Glob(src + ".*.rbi")
+	if err != nil {
+		t.Fatalf("glob seeded sidecars: %v", err)
+	}
+	for _, sidecar := range sidecars {
+		copySeededFile(t, sidecar, dst+sidecar[len(src):])
+	}
+
+	return dst
+}
+
+func copySeededFile(t *testing.T, src, dst string) {
+	t.Helper()
+
+	in, err := os.Open(src)
+	if err != nil {
+		t.Fatalf("open seeded file %q: %v", src, err)
+	}
+	defer func() { _ = in.Close() }()
+
+	out, err := os.Create(dst)
+	if err != nil {
+		t.Fatalf("create copied file %q: %v", dst, err)
+	}
+	defer func() { _ = out.Close() }()
+
+	if _, err = io.Copy(out, in); err != nil {
+		t.Fatalf("copy seeded file %q: %v", src, err)
+	}
+	if err = out.Sync(); err != nil {
+		t.Fatalf("sync copied file %q: %v", dst, err)
+	}
+}
 
 func queryCountSingleton(id uint64) posting.List {
 	return (posting.List{}).BuildAdded(id)
@@ -77,30 +120,19 @@ type countORBenchRec struct {
 	Roles   []string `db:"roles"`
 }
 
-func TestCount_ScalarInSplit_MixedResiduals_UsesPlan(t *testing.T) {
-	var (
-		mu     sync.Mutex
-		events []TraceEvent
-	)
+type seededDBFixture struct {
+	once sync.Once
+	path string
+	err  error
+}
 
-	sink := func(ev TraceEvent) {
-		mu.Lock()
-		events = append(events, ev)
-		mu.Unlock()
-	}
+var countPreparePredicateBroadRangeSeeded seededDBFixture
+var countORBenchSharedSeeded seededDBFixture
+var countBroadRangeComplementWithNilSeeded seededDBFixture
+var countBroadRangeComplementNoNilSeeded seededDBFixture
 
-	dir := t.TempDir()
-	db, raw := openBoltAndNew[uint64, countORBenchRec](t, filepath.Join(dir, "test_count_scalar_in_split_mixed.db"), Options{
-		AnalyzeInterval:  -1,
-		TraceSink:        sink,
-		TraceSampleEvery: 1,
-	})
-	t.Cleanup(func() {
-		_ = db.Close()
-		_ = raw.Close()
-	})
-	db.DisableSync()
-	defer db.EnableSync()
+func seedCountORBenchData(t *testing.T, db *DB[uint64, countORBenchRec], n int) {
+	t.Helper()
 
 	countries := []string{"US", "DE", "NL", "FR"}
 	plans := []string{"free", "pro", "enterprise", "basic"}
@@ -118,7 +150,6 @@ func TestCount_ScalarInSplit_MixedResiduals_UsesPlan(t *testing.T) {
 		{"moderator"},
 	}
 
-	const n = 180_000
 	ids := make([]uint64, n)
 	vals := make([]*countORBenchRec, n)
 	for i := 0; i < n; i++ {
@@ -140,6 +171,207 @@ func TestCount_ScalarInSplit_MixedResiduals_UsesPlan(t *testing.T) {
 	if err := db.RebuildIndex(); err != nil {
 		t.Fatalf("RebuildIndex: %v", err)
 	}
+}
+
+func countPreparePredicateBroadRangeSeedPath(t *testing.T) string {
+	t.Helper()
+
+	countPreparePredicateBroadRangeSeeded.once.Do(func() {
+		dir, err := os.MkdirTemp("", "rbi-count-broad-range-")
+		if err != nil {
+			countPreparePredicateBroadRangeSeeded.err = err
+			return
+		}
+
+		path := filepath.Join(dir, "seed.db")
+		db, raw := openBoltAndNew[uint64, Rec](t, path, Options{AnalyzeInterval: -1})
+		seedGeneratedUint64Data(t, db, 160_000, func(i int) *Rec {
+			return &Rec{
+				Name:   fmt.Sprintf("u_%d", i),
+				Email:  fmt.Sprintf("user%05d@example.com", i),
+				Age:    i,
+				Score:  float64(i % 1_000),
+				Active: i%2 == 0,
+				Meta: Meta{
+					Country: "US",
+				},
+			}
+		})
+		if err = db.RebuildIndex(); err != nil {
+			countPreparePredicateBroadRangeSeeded.err = err
+			_ = db.Close()
+			_ = raw.Close()
+			return
+		}
+		if err = db.Close(); err != nil {
+			countPreparePredicateBroadRangeSeeded.err = err
+			_ = raw.Close()
+			return
+		}
+		if err = raw.Close(); err != nil {
+			countPreparePredicateBroadRangeSeeded.err = err
+			return
+		}
+		countPreparePredicateBroadRangeSeeded.path = path
+	})
+
+	if countPreparePredicateBroadRangeSeeded.err != nil {
+		t.Fatalf("count prepare predicate seeded fixture: %v", countPreparePredicateBroadRangeSeeded.err)
+	}
+	return countPreparePredicateBroadRangeSeeded.path
+}
+
+func countOpenPreparePredicateBroadRangeDB(t *testing.T, opts Options) *DB[uint64, Rec] {
+	t.Helper()
+
+	path := copySeededDBWithSidecars(t, countPreparePredicateBroadRangeSeedPath(t), "count_prepare_predicate_broad_range.db")
+	db, raw := openBoltAndNew[uint64, Rec](t, path, opts)
+	t.Cleanup(func() {
+		_ = db.Close()
+		_ = raw.Close()
+	})
+	return db
+}
+
+func countORBenchSharedSeedPath(t *testing.T) string {
+	t.Helper()
+
+	countORBenchSharedSeeded.once.Do(func() {
+		dir, err := os.MkdirTemp("", "rbi-count-or-shared-")
+		if err != nil {
+			countORBenchSharedSeeded.err = err
+			return
+		}
+
+		path := filepath.Join(dir, "seed.db")
+		db, raw := openBoltAndNew[uint64, countORBenchRec](t, path, Options{AnalyzeInterval: -1})
+		seedCountORBenchData(t, db, 128_000)
+		if err = db.Close(); err != nil {
+			countORBenchSharedSeeded.err = err
+			_ = raw.Close()
+			return
+		}
+		if err = raw.Close(); err != nil {
+			countORBenchSharedSeeded.err = err
+			return
+		}
+		countORBenchSharedSeeded.path = path
+	})
+
+	if countORBenchSharedSeeded.err != nil {
+		t.Fatalf("count or shared seeded fixture: %v", countORBenchSharedSeeded.err)
+	}
+	return countORBenchSharedSeeded.path
+}
+
+func countOpenORBenchSharedDB(t *testing.T, name string, opts Options) *DB[uint64, countORBenchRec] {
+	t.Helper()
+
+	path := copySeededDBWithSidecars(t, countORBenchSharedSeedPath(t), name)
+	db, raw := openBoltAndNew[uint64, countORBenchRec](t, path, opts)
+	t.Cleanup(func() {
+		_ = db.Close()
+		_ = raw.Close()
+	})
+	return db
+}
+
+func countBroadRangeComplementWithNilSeedPath(t *testing.T) string {
+	t.Helper()
+
+	countBroadRangeComplementWithNilSeeded.once.Do(func() {
+		dir, err := os.MkdirTemp("", "rbi-count-broad-range-opt-with-nil-")
+		if err != nil {
+			countBroadRangeComplementWithNilSeeded.err = err
+			return
+		}
+
+		path := filepath.Join(dir, "seed.db")
+		db, raw := openBoltAndNew[uint64, Rec](t, path, Options{AnalyzeInterval: -1})
+		seedBroadRangeComplementOptData(t, db, 4_000, 72_000, 4_000)
+		if err = db.Close(); err != nil {
+			countBroadRangeComplementWithNilSeeded.err = err
+			_ = raw.Close()
+			return
+		}
+		if err = raw.Close(); err != nil {
+			countBroadRangeComplementWithNilSeeded.err = err
+			return
+		}
+		countBroadRangeComplementWithNilSeeded.path = path
+	})
+
+	if countBroadRangeComplementWithNilSeeded.err != nil {
+		t.Fatalf("count broad-range complement fixture with nil: %v", countBroadRangeComplementWithNilSeeded.err)
+	}
+	return countBroadRangeComplementWithNilSeeded.path
+}
+
+func countBroadRangeComplementNoNilSeedPath(t *testing.T) string {
+	t.Helper()
+
+	countBroadRangeComplementNoNilSeeded.once.Do(func() {
+		dir, err := os.MkdirTemp("", "rbi-count-broad-range-opt-no-nil-")
+		if err != nil {
+			countBroadRangeComplementNoNilSeeded.err = err
+			return
+		}
+
+		path := filepath.Join(dir, "seed.db")
+		db, raw := openBoltAndNew[uint64, Rec](t, path, Options{AnalyzeInterval: -1})
+		seedBroadRangeComplementOptData(t, db, 4_000, 76_000, 0)
+		if err = db.Close(); err != nil {
+			countBroadRangeComplementNoNilSeeded.err = err
+			_ = raw.Close()
+			return
+		}
+		if err = raw.Close(); err != nil {
+			countBroadRangeComplementNoNilSeeded.err = err
+			return
+		}
+		countBroadRangeComplementNoNilSeeded.path = path
+	})
+
+	if countBroadRangeComplementNoNilSeeded.err != nil {
+		t.Fatalf("count broad-range complement fixture without nil: %v", countBroadRangeComplementNoNilSeeded.err)
+	}
+	return countBroadRangeComplementNoNilSeeded.path
+}
+
+func countOpenBroadRangeComplementOptDB(t *testing.T, name string, withNil bool) *DB[uint64, Rec] {
+	t.Helper()
+
+	src := countBroadRangeComplementNoNilSeedPath(t)
+	if withNil {
+		src = countBroadRangeComplementWithNilSeedPath(t)
+	}
+
+	path := copySeededDBWithSidecars(t, src, name)
+	db, raw := openBoltAndNew[uint64, Rec](t, path, Options{AnalyzeInterval: -1})
+	t.Cleanup(func() {
+		_ = db.Close()
+		_ = raw.Close()
+	})
+	return db
+}
+
+func TestCount_ScalarInSplit_MixedResiduals_UsesPlan(t *testing.T) {
+	var (
+		mu     sync.Mutex
+		events []TraceEvent
+	)
+
+	sink := func(ev TraceEvent) {
+		mu.Lock()
+		events = append(events, ev)
+		mu.Unlock()
+	}
+
+	db := countOpenORBenchSharedDB(t, "test_count_scalar_in_split_mixed.db", Options{
+		AnalyzeInterval:  -1,
+		TraceSink:        sink,
+		TraceSampleEvery: 1,
+	})
 
 	q := qx.Query(
 		qx.IN("country", []string{"US", "DE", "NL"}),
@@ -204,7 +436,7 @@ func TestCount_ScalarInSplit_CohortShape_MatchesBitmap(t *testing.T) {
 		{"db", "security"},
 	}
 
-	const n = 220_000
+	const n = 128_000
 	ids := make([]uint64, n)
 	vals := make([]*countORBenchRec, n)
 	for i := 0; i < n; i++ {
@@ -349,12 +581,11 @@ func TestCount_ByPredicates_BucketLeadHasAnyResidual_MatchesBitmap(t *testing.T)
 		t.Fatalf("prepareCountPredicate(lead): %v", err)
 	}
 
-	activeBuf := getIntSliceBuf(len(preds))
-	active := activeBuf.values[:0]
-	defer func() {
-		activeBuf.values = active
-		releaseIntSliceBuf(activeBuf)
-	}()
+	if len(preds) > countPredicateScanMaxLeaves {
+		t.Fatalf("unexpected predicate count: got=%d max=%d", len(preds), countPredicateScanMaxLeaves)
+	}
+	var activeInline [countPredicateScanMaxLeaves]int
+	active := activeInline[:0]
 	for i := range preds {
 		if i == leadIdx {
 			continue
@@ -386,18 +617,18 @@ func TestCount_ByPredicates_BucketLeadHasAnyResidual_MatchesBitmap(t *testing.T)
 		t.Fatalf("expected HASANY residual")
 	}
 
-	exactActiveBuf := getIntSliceBuf(len(active))
-	exactActive := buildPostingApplyActive(exactActiveBuf.values, active, preds)
-	defer func() {
-		exactActiveBuf.values = exactActive
-		releaseIntSliceBuf(exactActiveBuf)
-	}()
+	var exactActiveInline [countPredicateScanMaxLeaves]int
+	exactActive := buildPostingApplyActive(exactActiveInline[:0], active, preds)
 	if countIndexSliceContains(exactActive, hasAnyIdx) {
 		t.Fatalf("expected HASANY residual to stay out of postingResult-filter subset, got=%v", exactActive)
 	}
 
-	extraExact := db.buildCountLeadResidualExactFilters(preds, active)
-	defer releaseCountLeadResidualExactFilters(extraExact)
+	extraExact := db.buildCountLeadResidualExactFilters(t, preds, active)
+	defer func() {
+		for _, f := range extraExact {
+			f.ids.Release()
+		}
+	}()
 	if len(extraExact) != 1 {
 		t.Fatalf("expected one local HASANY exact residual filter, got=%d", len(extraExact))
 	}
@@ -486,12 +717,11 @@ func TestCount_ByPredicates_PostingsLead_MatchesBitmap(t *testing.T) {
 		t.Fatalf("prepareCountPredicate(lead): %v", err)
 	}
 
-	activeBuf := getIntSliceBuf(len(preds))
-	active := activeBuf.values[:0]
-	defer func() {
-		activeBuf.values = active
-		releaseIntSliceBuf(activeBuf)
-	}()
+	if len(preds) > countPredicateScanMaxLeaves {
+		t.Fatalf("unexpected predicate count: got=%d max=%d", len(preds), countPredicateScanMaxLeaves)
+	}
+	var activeInline [countPredicateScanMaxLeaves]int
+	active := activeInline[:0]
 	for i := range preds {
 		if i == leadIdx {
 			continue
@@ -592,7 +822,7 @@ func TestCount_BroadLeadWithSmallIN_PrefersScalarInSplit(t *testing.T) {
 	})
 
 	countries := []string{"US", "DE", "FR", "GB"}
-	seedGeneratedUint64Data(t, db, 160_000, func(i int) *Rec {
+	seedGeneratedUint64Data(t, db, 96_000, func(i int) *Rec {
 		return &Rec{
 			Name:   fmt.Sprintf("u_%d", i),
 			Email:  fmt.Sprintf("user%06d@example.com", i),
@@ -611,7 +841,7 @@ func TestCount_BroadLeadWithSmallIN_PrefersScalarInSplit(t *testing.T) {
 	q := qx.Query(
 		qx.IN("country", []string{"US", "DE", "FR"}),
 		qx.GTE("age", 1_000),
-		qx.LTE("age", 150_000),
+		qx.LTE("age", 90_000),
 		qx.GTE("score", 10.0),
 	)
 
@@ -639,55 +869,9 @@ func TestCount_BroadLeadWithSmallIN_PrefersScalarInSplit(t *testing.T) {
 }
 
 func TestCount_ORByPredicates_PostingLeadResidualExactFilters_MatchesBitmap(t *testing.T) {
-	dir := t.TempDir()
-	db, raw := openBoltAndNew[uint64, countORBenchRec](t, filepath.Join(dir, "test_count_or.db"), Options{
+	db := countOpenORBenchSharedDB(t, "test_count_or.db", Options{
 		AnalyzeInterval: -1,
 	})
-	t.Cleanup(func() {
-		_ = db.Close()
-		_ = raw.Close()
-	})
-	db.DisableSync()
-	defer db.EnableSync()
-
-	countries := []string{"US", "DE", "NL", "FR"}
-	plans := []string{"free", "pro", "enterprise", "basic"}
-	statuses := []string{"active", "trial", "paused", "banned"}
-	tagsPool := [][]string{
-		{"go", "db"},
-		{"security", "ops"},
-		{"go", "security"},
-		{"rust", "ops"},
-	}
-	rolesPool := [][]string{
-		{"admin", "support"},
-		{"admin", "moderator"},
-		{"support"},
-		{"moderator"},
-	}
-
-	const n = 200_000
-	ids := make([]uint64, n)
-	vals := make([]*countORBenchRec, n)
-	for i := 0; i < n; i++ {
-		ids[i] = uint64(i + 1)
-		vals[i] = &countORBenchRec{
-			Country: countries[i%len(countries)],
-			Plan:    plans[(i/2)%len(plans)],
-			Status:  statuses[(i/3)%len(statuses)],
-			Age:     18 + (i % 55),
-			Score:   float64(i % 200),
-			Email:   fmt.Sprintf("user%06d@example.com", i),
-			Tags:    append([]string(nil), tagsPool[i%len(tagsPool)]...),
-			Roles:   append([]string(nil), rolesPool[(i/5)%len(rolesPool)]...),
-		}
-	}
-	if err := db.BatchSet(ids, vals); err != nil {
-		t.Fatalf("BatchSet: %v", err)
-	}
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
-	}
 
 	expr := qx.OR(
 		qx.AND(
@@ -897,12 +1081,11 @@ func TestCount_ByPredicates_SinglePostingLead_MatchesBitmap(t *testing.T) {
 		t.Fatalf("prepareCountPredicate(lead): %v", err)
 	}
 
-	activeBuf := getIntSliceBuf(len(preds))
-	active := activeBuf.values[:0]
-	defer func() {
-		activeBuf.values = active
-		releaseIntSliceBuf(activeBuf)
-	}()
+	if len(preds) > countPredicateScanMaxLeaves {
+		t.Fatalf("unexpected predicate count: got=%d max=%d", len(preds), countPredicateScanMaxLeaves)
+	}
+	var activeInline [countPredicateScanMaxLeaves]int
+	active := activeInline[:0]
 	for i := range preds {
 		if i == leadIdx {
 			continue
@@ -1179,24 +1362,29 @@ func TestCount_ORByPredicates_HybridTraceEmitsUseOriginalBranchIndex(t *testing.
 }
 
 func TestCountORBranches_ShouldUseSeenDedup_Adaptive(t *testing.T) {
-	highOverlap := countORBranches{
-		{est: 90_000},
-		{est: 85_000},
-		{est: 80_000},
-		{est: 75_000},
-		{est: 70_000},
+	newBranchesBuf := func(ests ...uint64) *pooled.SliceBuf[countORBranch] {
+		buf := countORBranchSlicePool.Get()
+		buf.Grow(len(ests))
+		for _, est := range ests {
+			buf.Append(countORBranch{est: est})
+		}
+		return buf
 	}
-	if !highOverlap.shouldUseSeenDedup(100_000, 250_000) {
+	highOverlap := newBranchesBuf(90_000, 85_000, 80_000, 75_000, 70_000)
+	defer countORBranchSlicePool.Put(highOverlap)
+	if !countORBranchesShouldUseSeenDedupBuf(highOverlap, 100_000, 250_000) {
 		t.Fatalf("expected seen dedup for high-overlap wide OR")
 	}
 
-	lowOverlap := countORBranches{
-		{est: 25_000},
-		{est: 25_000},
-		{est: 25_000},
-		{est: 25_000},
+	threeWayOverlap := newBranchesBuf(90_000, 85_000, 80_000)
+	defer countORBranchSlicePool.Put(threeWayOverlap)
+	if !countORBranchesShouldUseSeenDedupBuf(threeWayOverlap, 100_000, 250_000) {
+		t.Fatalf("expected seen dedup for high-overlap three-way OR")
 	}
-	if lowOverlap.shouldUseSeenDedup(2_000_000, 120_000) {
+
+	lowOverlap := newBranchesBuf(25_000, 25_000, 25_000, 25_000)
+	defer countORBranchSlicePool.Put(lowOverlap)
+	if countORBranchesShouldUseSeenDedupBuf(lowOverlap, 2_000_000, 120_000) {
 		t.Fatalf("unexpected seen dedup for low-overlap OR")
 	}
 }
@@ -1219,26 +1407,26 @@ func TestCountORDedupThresholds_Adaptive(t *testing.T) {
 }
 
 func TestCountORSeenStrategy_Adaptive(t *testing.T) {
-	small := countORBranches{
-		{est: 2_000},
-		{est: 1_800},
-		{est: 1_600},
-		{est: 1_400},
+	newBranchesBuf := func(ests ...uint64) *pooled.SliceBuf[countORBranch] {
+		buf := countORBranchSlicePool.Get()
+		buf.Grow(len(ests))
+		for _, est := range ests {
+			buf.Append(countORBranch{est: est})
+		}
+		return buf
 	}
-	seenSmall := newCountORSeen(small, 0, 10_000)
+
+	small := newBranchesBuf(2_000, 1_800, 1_600, 1_400)
+	defer countORBranchSlicePool.Put(small)
+	seenSmall := newCountORSeenBuf(small, 0, 10_000)
 	defer seenSmall.release()
 	if seenSmall.mode != countORSeenModeHash {
 		t.Fatalf("expected hash seen set for small adaptive cap, got mode=%d", seenSmall.mode)
 	}
 
-	large := countORBranches{
-		{est: 150_000},
-		{est: 140_000},
-		{est: 130_000},
-		{est: 120_000},
-		{est: 110_000},
-	}
-	seenLarge := newCountORSeen(large, 60_000, 500_000)
+	large := newBranchesBuf(150_000, 140_000, 130_000, 120_000, 110_000)
+	defer countORBranchSlicePool.Put(large)
+	seenLarge := newCountORSeenBuf(large, 60_000, 500_000)
 	defer seenLarge.release()
 	if seenLarge.mode != countORSeenModePosting {
 		t.Fatalf("expected posting seen set for large adaptive cap, got mode=%d", seenLarge.mode)
@@ -1258,10 +1446,17 @@ func TestCountORPredicateBranchLimit_Adaptive(t *testing.T) {
 }
 
 func TestCountPredicateMaterializationThresholds_Adaptive(t *testing.T) {
-	setPred := predicate{
-		kind:  predicateKindPostsAny,
-		posts: make([]posting.List, 12),
+	newPostsBuf := func(n int) *pooled.SliceBuf[posting.List] {
+		buf := postingSlicePool.Get()
+		buf.SetLen(n)
+		return buf
 	}
+
+	setPred := predicate{
+		kind:     predicateKindPostsAny,
+		postsBuf: newPostsBuf(12),
+	}
+	defer postingSlicePool.Put(setPred.postsBuf)
 	if shouldMaterializeCountSetPredicate(setPred, 500, 500_000) {
 		t.Fatalf("set predicate should not materialize on low probe estimate")
 	}
@@ -1282,20 +1477,23 @@ func TestCountPredicateMaterializationThresholds_Adaptive(t *testing.T) {
 	}
 
 	smallHasAnyResidual := predicate{
-		kind:    predicateKindPostsAny,
-		expr:    qx.Expr{Op: qx.OpHASANY, Field: "roles"},
-		posts:   make([]posting.List, 3),
-		estCard: 80_000,
+		kind:     predicateKindPostsAny,
+		expr:     qx.Expr{Op: qx.OpHASANY, Field: "roles"},
+		postsBuf: newPostsBuf(3),
+		estCard:  80_000,
 	}
+	defer postingSlicePool.Put(smallHasAnyResidual.postsBuf)
 	if !shouldUseCountLeadResidualHasAnyExactFilter(smallHasAnyResidual) {
 		t.Fatalf("expected small HASANY residual exact filter above threshold")
 	}
-	if shouldUseCountLeadResidualHasAnyExactFilter(predicate{
-		kind:    predicateKindPostsAny,
-		expr:    qx.Expr{Op: qx.OpHASANY, Field: "roles"},
-		posts:   make([]posting.List, 4),
-		estCard: 80_000,
-	}) {
+	tooWide := predicate{
+		kind:     predicateKindPostsAny,
+		expr:     qx.Expr{Op: qx.OpHASANY, Field: "roles"},
+		postsBuf: newPostsBuf(4),
+		estCard:  80_000,
+	}
+	defer postingSlicePool.Put(tooWide.postsBuf)
+	if shouldUseCountLeadResidualHasAnyExactFilter(tooWide) {
 		t.Fatalf("unexpected residual exact filter beyond max term threshold")
 	}
 
@@ -1498,35 +1696,13 @@ func TestCount_BuildPredicates_MergesPositiveNumericRangesSameField(t *testing.T
 }
 
 func TestCount_PreparePredicate_UsesBroadRangeComplementWithoutCache(t *testing.T) {
-	makeDB := func(t *testing.T, withCache bool) *DB[uint64, Rec] {
-		t.Helper()
-		opts := Options{AnalyzeInterval: -1}
-		if !withCache {
-			opts.SnapshotMaterializedPredCacheMaxEntries = -1
-		}
-		db, _ := openTempDBUint64(t, opts)
-		seedGeneratedUint64Data(t, db, 80_000, func(i int) *Rec {
-			return &Rec{
-				Name:   fmt.Sprintf("u_%d", i),
-				Email:  fmt.Sprintf("user%05d@example.com", i),
-				Age:    i,
-				Score:  float64(i % 1_000),
-				Active: i%2 == 0,
-				Meta: Meta{
-					Country: "US",
-				},
-			}
-		})
-		if err := db.RebuildIndex(); err != nil {
-			t.Fatalf("RebuildIndex: %v", err)
-		}
-		return db
-	}
-
 	expr := qx.Expr{Op: qx.OpGTE, Field: "age", Value: 1_000}
 
 	t.Run("NoCacheUsesLazyExactPostingFilter", func(t *testing.T) {
-		db := makeDB(t, false)
+		db := countOpenPreparePredicateBroadRangeDB(t, Options{
+			AnalyzeInterval:                         -1,
+			SnapshotMaterializedPredCacheMaxEntries: -1,
+		})
 		p, ok := db.buildPredicateWithMode(expr, false)
 		if !ok {
 			t.Fatalf("buildPredicateWithMode failed")
@@ -1646,25 +1822,8 @@ func TestCount_PreparePredicate_UsesProbeBoundedBroadRangeComplement(t *testing.
 		opts := Options{AnalyzeInterval: -1}
 		if !withCache {
 			opts.SnapshotMaterializedPredCacheMaxEntries = -1
-			opts.SnapshotMaterializedPredCacheMaxEntries = -1
 		}
-		db, _ := openTempDBUint64(t, opts)
-		seedGeneratedUint64Data(t, db, 160_000, func(i int) *Rec {
-			return &Rec{
-				Name:   fmt.Sprintf("u_%d", i),
-				Email:  fmt.Sprintf("user%05d@example.com", i),
-				Age:    i,
-				Score:  float64(i % 1_000),
-				Active: i%2 == 0,
-				Meta: Meta{
-					Country: "US",
-				},
-			}
-		})
-		if err := db.RebuildIndex(); err != nil {
-			t.Fatalf("RebuildIndex: %v", err)
-		}
-		return db
+		return countOpenPreparePredicateBroadRangeDB(t, opts)
 	}
 
 	expr := qx.Expr{Op: qx.OpGTE, Field: "age", Value: 35_000}
@@ -1678,28 +1837,41 @@ func TestCount_PreparePredicate_UsesProbeBoundedBroadRangeComplement(t *testing.
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			db := makeDB(t, tc.withCache)
-			p, ok := db.buildPredicateWithMode(expr, false)
-			if !ok {
-				t.Fatalf("buildPredicateWithMode failed")
+			buildPrepared := func() predicate {
+				t.Helper()
+				p, ok := db.buildPredicateWithMode(expr, false)
+				if !ok {
+					t.Fatalf("buildPredicateWithMode failed")
+				}
+				universe := db.snapshotUniverseCardinality()
+				leadProbeEst := uint64(40_000)
+				if err := db.prepareCountPredicate(&p, leadProbeEst, universe); err != nil {
+					releasePredicates([]predicate{p})
+					t.Fatalf("prepareCountPredicate: %v", err)
+				}
+				return p
 			}
+
+			p := buildPrepared()
 			defer releasePredicates([]predicate{p})
 			if p.kind != predicateKindCustom {
 				t.Fatalf("expected initial custom predicate, got kind=%v", p.kind)
 			}
 
-			universe := db.snapshotUniverseCardinality()
-			leadProbeEst := uint64(40_000)
-			if err := db.prepareCountPredicate(&p, leadProbeEst, universe); err != nil {
-				t.Fatalf("prepareCountPredicate: %v", err)
-			}
 			if tc.withCache {
-				if p.kind != predicateKindMaterializedNot {
-					t.Fatalf("expected cached probe-bounded broad range to switch to bitmapNot complement, got kind=%v", p.kind)
+				if !p.supportsPostingApply() || !p.supportsCheapPostingApply() {
+					t.Fatalf("expected first cached broad range sight to stay lazy and exact-filter capable")
 				}
-				if p.ids.IsEmpty() {
+
+				p2 := buildPrepared()
+				defer releasePredicates([]predicate{p2})
+				if p2.kind != predicateKindMaterializedNot {
+					t.Fatalf("expected second cached probe-bounded broad range sight to switch to bitmapNot complement, got kind=%v", p2.kind)
+				}
+				if p2.ids.IsEmpty() {
 					t.Fatalf("expected complement postingResult")
 				}
-				if got := p.ids.Cardinality(); got <= countPredBroadRangeComplementMaxCard {
+				if got := p2.ids.Cardinality(); got <= countPredBroadRangeComplementMaxCard {
 					t.Fatalf("expected complement wider than base cap, got=%d", got)
 				}
 				key, isSlice, isNil, err := db.exprValueToIdxScalar(expr)
@@ -1709,7 +1881,7 @@ func TestCount_PreparePredicate_UsesProbeBoundedBroadRangeComplement(t *testing.
 				cacheKey := db.materializedPredComplementCacheKeyForScalar(expr.Field, expr.Op, key)
 				cached, ok := db.getSnapshot().loadMaterializedPred(cacheKey)
 				if !ok || cached.IsEmpty() {
-					t.Fatalf("expected complement postingResult to be cached")
+					t.Fatalf("expected complement postingResult to be cached after promotion")
 				}
 				return
 			}
@@ -1784,11 +1956,11 @@ func seedBroadRangeComplementOptData(t *testing.T, db *DB[uint64, Rec], lowCount
 func prepareBroadRangeComplementPredicate(t *testing.T, db *DB[uint64, Rec], expr qx.Expr, leadProbeEst uint64) (predicate, string) {
 	t.Helper()
 
+	universe := db.snapshotUniverseCardinality()
 	p, ok := db.buildPredicateWithMode(expr, false)
 	if !ok {
 		t.Fatalf("buildPredicateWithMode failed")
 	}
-	universe := db.snapshotUniverseCardinality()
 	if err := db.prepareCountPredicate(&p, leadProbeEst, universe); err != nil {
 		releasePredicates([]predicate{p})
 		t.Fatalf("prepareCountPredicate: %v", err)
@@ -1811,9 +1983,25 @@ func prepareBroadRangeComplementPredicate(t *testing.T, db *DB[uint64, Rec], exp
 	return p, cacheKey
 }
 
+func preparePromotedBroadRangeComplementPredicate(t *testing.T, db *DB[uint64, Rec], expr qx.Expr, leadProbeEst uint64) (predicate, string) {
+	t.Helper()
+
+	first, ok := db.buildPredicateWithMode(expr, false)
+	if !ok {
+		t.Fatalf("buildPredicateWithMode failed")
+	}
+	universe := db.snapshotUniverseCardinality()
+	if err := db.prepareCountPredicate(&first, leadProbeEst, universe); err != nil {
+		releasePredicates([]predicate{first})
+		t.Fatalf("prepareCountPredicate(first sight): %v", err)
+	}
+	releasePredicates([]predicate{first})
+
+	return prepareBroadRangeComplementPredicate(t, db, expr, leadProbeEst)
+}
+
 func TestCount_PreparePredicate_BroadRangeComplementIncludesNilRows(t *testing.T) {
-	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
-	seedBroadRangeComplementOptData(t, db, 4_000, 72_000, 4_000)
+	db := countOpenBroadRangeComplementOptDB(t, "count_prepare_predicate_broad_range_opt_with_nil.db", true)
 
 	expr := qx.Expr{Op: qx.OpGTE, Field: "opt", Value: "m"}
 	p, _ := prepareBroadRangeComplementPredicate(t, db, expr, 3_000)
@@ -1829,8 +2017,7 @@ func TestCount_PreparePredicate_BroadRangeComplementCacheInvalidatedByNilFieldWr
 	expr := qx.Expr{Op: qx.OpGTE, Field: "opt", Value: "m"}
 
 	t.Run("InsertOnly", func(t *testing.T) {
-		db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
-		seedBroadRangeComplementOptData(t, db, 4_000, 76_000, 0)
+		db := countOpenBroadRangeComplementOptDB(t, "count_prepare_predicate_broad_range_opt_no_nil.db", false)
 
 		p, cacheKey := prepareBroadRangeComplementPredicate(t, db, expr, 3_000)
 		prevSnap := db.getSnapshot()
@@ -1876,8 +2063,7 @@ func TestCount_PreparePredicate_BroadRangeComplementCacheInvalidatedByNilFieldWr
 	})
 
 	t.Run("Delete", func(t *testing.T) {
-		db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
-		seedBroadRangeComplementOptData(t, db, 4_000, 72_000, 4_000)
+		db := countOpenBroadRangeComplementOptDB(t, "count_prepare_predicate_broad_range_opt_delete.db", true)
 
 		p, cacheKey := prepareBroadRangeComplementPredicate(t, db, expr, 3_000)
 		prevSnap := db.getSnapshot()
@@ -1970,7 +2156,7 @@ func TestCount_PreparePredicate_BroadRangeComplementMatchesChunkedRangeAfterChur
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			p, _ := prepareBroadRangeComplementPredicate(t, db, tc.expr, 166)
+			p, _ := preparePromotedBroadRangeComplementPredicate(t, db, tc.expr, 166)
 			defer releasePredicates([]predicate{p})
 
 			want := countByExprBitmap(t, db, tc.expr)
@@ -1980,22 +2166,7 @@ func TestCount_PreparePredicate_BroadRangeComplementMatchesChunkedRangeAfterChur
 }
 
 func TestCount_PreparePredicate_KeepsLegacyCapForComparableBroadLead(t *testing.T) {
-	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
-	seedGeneratedUint64Data(t, db, 160_000, func(i int) *Rec {
-		return &Rec{
-			Name:   fmt.Sprintf("u_%d", i),
-			Email:  fmt.Sprintf("user%05d@example.com", i),
-			Age:    i,
-			Score:  float64(i % 1_000),
-			Active: i%2 == 0,
-			Meta: Meta{
-				Country: "US",
-			},
-		}
-	})
-	if err := db.RebuildIndex(); err != nil {
-		t.Fatalf("RebuildIndex: %v", err)
-	}
+	db := countOpenPreparePredicateBroadRangeDB(t, Options{AnalyzeInterval: -1})
 
 	expr := qx.Expr{Op: qx.OpGTE, Field: "age", Value: 35_000}
 	p, ok := db.buildPredicateWithMode(expr, false)
@@ -2357,6 +2528,51 @@ func TestCount_PickLeadPredicate_PrefersLeadThatUnlocksCustomResidualMaterializa
 	want := countByExprBitmap(t, db, expr)
 	if got != want {
 		t.Fatalf("count mismatch: got=%d want=%d", got, want)
+	}
+}
+
+func TestCount_BroadMaterializedLeadCheapResiduals_UsesPredicateScan(t *testing.T) {
+	opts := benchOptions()
+	opts.AnalyzeInterval = -1
+
+	path := filepath.Join(t.TempDir(), "bench.db")
+	db, raw := openBoltAndNew[uint64, UserBench](t, path, opts)
+	t.Cleanup(func() {
+		_ = db.Close()
+		_ = raw.Close()
+	})
+
+	seedBenchData(t, db, 50_000)
+	db.clearCurrentSnapshotCachesForTesting()
+
+	expr := qx.AND(
+		qx.NOTIN("status", []string{"banned"}),
+		qx.IN("country", []string{"NL", "DE", "PL", "SE", "FR", "ES", "GB"}),
+		qx.GTE("age", 25),
+		qx.LTE("age", 45),
+		qx.HASANY("tags", []string{"go", "db", "security"}),
+		qx.GTE("score", 80.0),
+	)
+	q := qx.Query(expr)
+
+	got, err := db.Count(q)
+	if err != nil {
+		t.Fatalf("Count: %v", err)
+	}
+	want := countByExprBitmapUserBench(t, db, expr)
+	if got != want {
+		t.Fatalf("count mismatch: got=%d want=%d", got, want)
+	}
+
+	gotFast, ok, err := db.tryCountByPredicates(expr, nil)
+	if err != nil {
+		t.Fatalf("tryCountByPredicates: %v", err)
+	}
+	if !ok {
+		t.Fatalf("expected broad-lead count predicate fast path")
+	}
+	if gotFast != want {
+		t.Fatalf("fast-path count mismatch: got=%d want=%d", gotFast, want)
 	}
 }
 

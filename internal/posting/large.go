@@ -5,9 +5,11 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"math/bits"
 	"slices"
-	"sync"
 	"unsafe"
+
+	"github.com/vapstack/rbi/internal/pooled"
 )
 
 type largePosting struct {
@@ -69,17 +71,7 @@ func (lp *largePosting) ReadFrom(stream io.Reader) (p int64, err error) {
 
 	size := binary.LittleEndian.Uint64(sizeBuf[:])
 	lp.highlowcontainer.clear()
-
-	if cap(lp.highlowcontainer.keys) >= int(size) {
-		lp.highlowcontainer.keys = lp.highlowcontainer.keys[:size]
-	} else {
-		lp.highlowcontainer.keys = make([]uint32, size)
-	}
-	if cap(lp.highlowcontainer.containers) >= int(size) {
-		lp.highlowcontainer.containers = lp.highlowcontainer.containers[:size]
-	} else {
-		lp.highlowcontainer.containers = make([]*bitmap32, size)
-	}
+	lp.highlowcontainer.setSize(int(size))
 
 	keyBuf := sizeBuf[:4]
 	for i := uint64(0); i < size; i++ {
@@ -94,7 +86,7 @@ func (lp *largePosting) ReadFrom(stream io.Reader) (p int64, err error) {
 		}
 		prevKey = key
 		lp.highlowcontainer.keys[i] = key
-		lp.highlowcontainer.containers[i] = newBitmap()
+		lp.highlowcontainer.containers[i] = bitmapPool.Get()
 		n64, readErr := lp.highlowcontainer.containers[i].ReadFrom(stream)
 		p += n64
 		if n64 == 0 || readErr != nil {
@@ -193,8 +185,16 @@ func (lp *largePosting) serializedSizeInBytes() uint64 {
 }
 
 func (lp *largePosting) iterator() *largeIterator {
-	return newLargeIterator(lp)
+	it := largeIteratorPool.Get()
+	it.initialize(lp)
+	return it
 }
+
+func (lp *largePosting) release() {
+	largePostingPool.Put(lp)
+}
+
+func (lp *largePosting) Release() { lp.release() }
 
 func (lp *largePosting) clone() *largePosting {
 	return lp.cloneInto(newLargePosting())
@@ -261,7 +261,7 @@ func (lp *largePosting) add(x uint64) {
 		la.getWritableContainerAtIndex(i).add(lowbits64(x))
 		return
 	}
-	next := newBitmap()
+	next := bitmapPool.Get()
 	next.add(lowbits64(x))
 	la.insertNewKeyValueAt(-i-1, hb, next)
 }
@@ -272,7 +272,7 @@ func (lp *largePosting) checkedAdd(x uint64) bool {
 	if i >= 0 {
 		return lp.highlowcontainer.getWritableContainerAtIndex(i).checkedAdd(lowbits64(x))
 	}
-	next := newBitmap()
+	next := bitmapPool.Get()
 	next.add(lowbits64(x))
 	lp.highlowcontainer.insertNewKeyValueAt(-i-1, hb, next)
 	return true
@@ -299,33 +299,17 @@ func (lp *largePosting) addMany(dat []uint64) {
 		return
 	}
 
-	batchBuf := acquireAddManyBatch(len(dat))
-	defer releaseAddManyBatch(batchBuf)
-
 	start := 0
 	batchHighBits := highbits64(dat[0])
 	for end := 1; end < len(dat); end++ {
 		hi := highbits64(dat[end])
 		if hi != batchHighBits {
-			batchLen := end - start
-			batchBuf.values = slices.Grow(batchBuf.values[:0], batchLen)
-			batch := batchBuf.values[:batchLen]
-			for i := 0; i < batchLen; i++ {
-				batch[i] = lowbits64(dat[start+i])
-			}
-			lp.getOrCreateContainer(batchHighBits).addMany(batch)
+			lp.getOrCreateContainer(batchHighBits).addMany64Low(dat[start:end])
 			batchHighBits = hi
 			start = end
 		}
 	}
-
-	batchLen := len(dat) - start
-	batchBuf.values = slices.Grow(batchBuf.values[:0], batchLen)
-	batch := batchBuf.values[:batchLen]
-	for i := 0; i < batchLen; i++ {
-		batch[i] = lowbits64(dat[start+i])
-	}
-	lp.getOrCreateContainer(batchHighBits).addMany(batch)
+	lp.getOrCreateContainer(batchHighBits).addMany64Low(dat[start:])
 }
 
 func (lp *largePosting) addManySorted(dat []uint64) {
@@ -346,20 +330,12 @@ func (lp *largePosting) addSortedHighBitsBatch(hb uint32, dat []uint64) {
 	la := &lp.highlowcontainer
 	i := la.getIndex(hb)
 	if i < 0 {
-		next := newBitmap()
+		next := bitmapPool.Get()
 		next.loadManySorted64(dat)
 		la.insertNewKeyValueAt(-i-1, hb, next)
 		return
 	}
-
-	batchBuf := acquireAddManyBatch(len(dat))
-	batchBuf.values = slices.Grow(batchBuf.values[:0], len(dat))
-	batch := batchBuf.values[:len(dat)]
-	for i := range dat {
-		batch[i] = lowbits64(dat[i])
-	}
-	la.getWritableContainerAtIndex(i).addMany(batch)
-	releaseAddManyBatch(batchBuf)
+	la.getWritableContainerAtIndex(i).addManySorted64Low(dat)
 }
 
 func (lp *largePosting) addRange(rangeStart, rangeEnd uint64) {
@@ -391,7 +367,7 @@ func (lp *largePosting) getOrCreateContainer(hb uint32) *bitmap32 {
 	if i >= 0 {
 		return la.getWritableContainerAtIndex(i)
 	}
-	next := newBitmap()
+	next := bitmapPool.Get()
 	la.insertNewKeyValueAt(-i-1, hb, next)
 	return next
 }
@@ -554,10 +530,10 @@ main:
 
 func (lp *largePosting) forEachIntersecting(other *largePosting, fn func(uint64) bool) bool {
 	it := lp.iterator()
-	defer releaseLargeIterator(it)
+	defer it.Release()
 
 	otherIt := other.iterator()
-	defer releaseLargeIterator(otherIt)
+	defer otherIt.Release()
 
 	for it.HasNext() && otherIt.HasNext() {
 		v := it.peekNext()
@@ -720,7 +696,7 @@ func (it *largeIterator) HasNext() bool {
 
 func (it *largeIterator) init() {
 	if it.iter != nil {
-		releaseIterator(it.iter)
+		it.iter.release()
 		it.iter = nil
 	}
 	if it.highlowcontainer.size() > it.pos {
@@ -769,11 +745,7 @@ func (it *largeIterator) initialize(lp *largePosting) {
 }
 
 func (it *largeIterator) Release() {
-	releaseLargeIterator(it)
-}
-
-func newLargeIterator(lp *largePosting) *largeIterator {
-	return acquireLargeIterator(lp)
+	largeIteratorPool.Put(it)
 }
 
 func writeLarge(writer *bufio.Writer, lp *largePosting) error {
@@ -804,32 +776,34 @@ func readLarge(reader *bufio.Reader) (lp *largePosting, err error) {
 		return nil, err
 	}
 	if size == 0 {
-		lp = getLargePosting()
+		lp = largePostingPool.Get()
 		return lp, nil
 	}
 	if size > (^uint64(0) >> 1) {
 		return nil, fmt.Errorf("large posting size overflows int64: %v", size)
 	}
-	lp = getLargePosting()
+	lp = largePostingPool.Get()
 	lp.clear()
-	defer func() {
-		if r := recover(); r != nil {
-			releaseLargePosting(lp)
-			lp = nil
-			err = fmt.Errorf("corrupted large posting payload: %v", r)
-		}
-	}()
+	defer recoverLargeRead(&lp, &err)
 	var n int64
 	n, err = lp.ReadFrom(reader)
 	if err != nil {
-		releaseLargePosting(lp)
+		lp.release()
 		return nil, err
 	}
 	if uint64(n) != size {
-		releaseLargePosting(lp)
+		lp.release()
 		return nil, fmt.Errorf("large posting read size mismatch: read %v, expected %v", n, size)
 	}
 	return lp, nil
+}
+
+func recoverLargeRead(lp **largePosting, err *error) {
+	if r := recover(); r != nil {
+		(*lp).release()
+		*lp = nil
+		*err = fmt.Errorf("corrupted large posting payload: %v", r)
+	}
 }
 
 func skipLarge(reader *bufio.Reader) error {
@@ -848,90 +822,42 @@ func skipLarge(reader *bufio.Reader) error {
 }
 
 var (
-	largePostingPool  sync.Pool
-	largeIteratorPool sync.Pool
-	addManyBatchPool  sync.Pool
+	largePostingPool = pooled.Pointers[largePosting]{
+		Cleanup: func(lp *largePosting) {
+			lp.clear()
+		},
+	}
+	largeIteratorPool = pooled.Pointers[largeIterator]{
+		Cleanup: func(it *largeIterator) {
+			if it.iter != nil {
+				it.iter.release()
+			}
+			it.pos = 0
+			it.hs = 0
+			it.iter = nil
+			it.highlowcontainer = nil
+		},
+	}
 )
 
-type addManyBatch struct {
-	values []uint32
-}
-
-const maxPooledAddManyBatchCapacity = 128 << 10
-
-func getLargePosting() *largePosting {
-	if v := largePostingPool.Get(); v != nil {
-		return v.(*largePosting)
-	}
-	return newLargePosting()
-}
-
-func releaseLargePosting(lp *largePosting) {
-	if lp == nil {
-		return
-	}
-	lp.clear()
-	largePostingPool.Put(lp)
-}
-
-func cloneLargeShared(src *largePosting) *largePosting {
-	dst := getLargePosting()
-	if src == nil {
-		return dst
-	}
-	return src.cloneSharedInto(dst)
-}
-
-func acquireLargeIterator(lp *largePosting) *largeIterator {
-	if v := largeIteratorPool.Get(); v != nil {
-		it := v.(*largeIterator)
-		it.initialize(lp)
-		return it
-	}
-	it := &largeIterator{}
-	it.initialize(lp)
-	return it
-}
-
-func releaseLargeIterator(it *largeIterator) {
-	if it == nil {
-		return
-	}
-	if it.iter != nil {
-		releaseIterator(it.iter)
-	}
-	it.pos = 0
-	it.hs = 0
-	it.iter = nil
-	it.highlowcontainer = nil
-	largeIteratorPool.Put(it)
-}
-
-func acquireAddManyBatch(capHint int) *addManyBatch {
-	if capHint < 32 {
-		capHint = 32
-	}
-
-	if v := addManyBatchPool.Get(); v != nil {
-		buf := v.(*addManyBatch)
-		if cap(buf.values) < capHint {
-			buf.values = slices.Grow(buf.values, capHint)
+func init() {
+	for i, maxcap := range largeArrayPoolCapacities {
+		c := maxcap
+		largeArrayStoragePools[i] = pooled.Pointers[largeArrayStorage]{
+			New: func() *largeArrayStorage {
+				return &largeArrayStorage{
+					keys:       make([]uint32, 0, c),
+					containers: make([]*bitmap32, 0, c),
+				}
+			},
+			Cleanup: func(storage *largeArrayStorage) {
+				clear(storage.keys[:cap(storage.keys)])
+				storage.keys = storage.keys[:0]
+				clear(storage.containers[:cap(storage.containers)])
+				storage.containers = storage.containers[:0]
+			},
 		}
-		return buf
 	}
-
-	return &addManyBatch{values: make([]uint32, 0, capHint)}
-}
-
-func releaseAddManyBatch(buf *addManyBatch) {
-	if buf == nil {
-		return
-	}
-	if cap(buf.values) > maxPooledAddManyBatchCapacity {
-		return
-	}
-	buf.values = buf.values[:0]
-	addManyBatchPool.Put(buf)
 }
 
 func highbits64(x uint64) uint32 {
@@ -947,9 +873,40 @@ const maxLargeLowBit = uint32(0xFFFFFFFF)
 type largeArray struct {
 	keys       []uint32
 	containers []*bitmap32
+	storage    *largeArrayStorage
 	inlineKeys [4]uint32
 	inlineVals [4]*bitmap32
 }
+
+type largeArrayStorage struct {
+	keys       []uint32
+	containers []*bitmap32
+}
+
+var largeArrayPoolCapacities = [...]int{
+	8,
+	16,
+	32,
+	64,
+	128,
+	256,
+	512,
+	1024,
+	2048,
+	4096,
+	8192,
+	16384,
+	32768,
+	65536,
+	131072,
+	262144,
+	524288,
+	1048576,
+}
+
+const maxPooledLargeArrayCapacity = 1 << 20
+
+var largeArrayStoragePools [len(largeArrayPoolCapacities)]pooled.Pointers[largeArrayStorage]
 
 func (la *largeArray) ensureInline() {
 	if la == nil || la.keys != nil || la.containers != nil {
@@ -957,6 +914,44 @@ func (la *largeArray) ensureInline() {
 	}
 	la.keys = la.inlineKeys[:0]
 	la.containers = la.inlineVals[:0]
+}
+
+func largeArrayPoolIndex(size int) int {
+	if size <= largeArrayPoolCapacities[0] {
+		return 0
+	}
+	if size > maxPooledLargeArrayCapacity {
+		return -1
+	}
+	return bits.Len(uint(size-1)) - 3
+}
+
+func getLargeArrayStorageWithLen(l int) *largeArrayStorage {
+	if l <= 0 {
+		l = largeArrayPoolCapacities[0]
+	}
+	idx := largeArrayPoolIndex(l)
+	if idx < 0 {
+		return &largeArrayStorage{
+			keys:       make([]uint32, l),
+			containers: make([]*bitmap32, l),
+		}
+	}
+	out := largeArrayStoragePools[idx].Get()
+	out.keys = out.keys[:l]
+	out.containers = out.containers[:l]
+	return out
+}
+
+func putLargeArrayStorage(storage *largeArrayStorage) {
+	if storage == nil {
+		return
+	}
+	idx := largeArrayPoolIndex(cap(storage.keys))
+	if idx < 0 {
+		return
+	}
+	largeArrayStoragePools[idx].Put(storage)
 }
 
 func (la *largeArray) aliases(other *largeArray) bool {
@@ -980,9 +975,10 @@ func (la *largeArray) runOptimize() {
 }
 
 func (la *largeArray) appendContainer(key uint32, value *bitmap32) {
-	la.ensureInline()
-	la.keys = append(la.keys, key)
-	la.containers = append(la.containers, value)
+	i := len(la.keys)
+	la.setSize(i + 1)
+	la.keys[i] = key
+	la.containers[i] = value
 }
 
 func (la *largeArray) appendCopy(src largeArray, idx int) {
@@ -995,38 +991,108 @@ func (la *largeArray) appendCopyMany(src largeArray, start, end int) {
 	}
 }
 
+func (la *largeArray) releaseBacking() {
+	if la.storage != nil {
+		putLargeArrayStorage(la.storage)
+		la.storage = nil
+	}
+	la.keys = nil
+	la.containers = nil
+}
+
+func (la *largeArray) setSize(newsize int) {
+	la.ensureInline()
+	oldLen := len(la.keys)
+	if cap(la.keys) >= newsize {
+		if newsize > oldLen {
+			la.keys = la.keys[:newsize]
+			clear(la.keys[oldLen:newsize])
+			la.containers = la.containers[:newsize]
+			clear(la.containers[oldLen:newsize])
+		} else {
+			clear(la.keys[newsize:oldLen])
+			clear(la.containers[newsize:oldLen])
+			la.keys = la.keys[:newsize]
+			la.containers = la.containers[:newsize]
+		}
+		return
+	}
+
+	oldKeys := la.keys
+	oldContainers := la.containers
+	oldStorage := la.storage
+
+	if newsize <= len(la.inlineKeys) {
+		la.storage = nil
+		la.keys = la.inlineKeys[:newsize]
+		la.containers = la.inlineVals[:newsize]
+	} else {
+		next := getLargeArrayStorageWithLen(newsize)
+		la.storage = next
+		la.keys = next.keys[:newsize]
+		la.containers = next.containers[:newsize]
+	}
+
+	copied := min(len(oldKeys), newsize)
+	copy(la.keys, oldKeys[:copied])
+	copy(la.containers, oldContainers[:copied])
+	clear(la.keys[copied:newsize])
+	clear(la.containers[copied:newsize])
+
+	if oldStorage != nil {
+		putLargeArrayStorage(oldStorage)
+	}
+}
+
+func (la *largeArray) copyAliasedFrom(src *largeArray, retain bool) {
+	n := len(src.keys)
+	if n == 0 {
+		la.storage = nil
+		la.keys = la.inlineKeys[:0]
+		la.containers = la.inlineVals[:0]
+		return
+	}
+
+	if n <= len(la.inlineKeys) {
+		var keys [4]uint32
+		var containers [4]*bitmap32
+		copy(keys[:n], src.keys)
+		for i := 0; i < n; i++ {
+			if retain {
+				containers[i] = src.containers[i].retain()
+			} else {
+				containers[i] = src.containers[i].clone()
+			}
+		}
+
+		la.storage = nil
+		la.keys = la.inlineKeys[:n]
+		la.containers = la.inlineVals[:n]
+		copy(la.keys, keys[:n])
+		copy(la.containers, containers[:n])
+		return
+	}
+
+	next := getLargeArrayStorageWithLen(n)
+	copy(next.keys, src.keys)
+	for i := 0; i < n; i++ {
+		if retain {
+			next.containers[i] = src.containers[i].retain()
+		} else {
+			next.containers[i] = src.containers[i].clone()
+		}
+	}
+
+	la.storage = next
+	la.keys = next.keys[:n]
+	la.containers = next.containers[:n]
+}
+
 func (la *largeArray) grow(newsize int) {
 	if newsize <= len(la.keys) {
 		return
 	}
-	la.ensureInline()
-	oldSize := len(la.keys)
-	if cap(la.keys) >= newsize {
-		la.keys = la.keys[:newsize]
-		clear(la.keys[oldSize:])
-	} else {
-		var keys []uint32
-		if newsize <= len(la.inlineKeys) {
-			keys = la.inlineKeys[:newsize]
-		} else {
-			keys = make([]uint32, newsize)
-		}
-		copy(keys, la.keys)
-		la.keys = keys
-	}
-	if cap(la.containers) >= newsize {
-		la.containers = la.containers[:newsize]
-		clear(la.containers[oldSize:])
-	} else {
-		var containers []*bitmap32
-		if newsize <= len(la.inlineVals) {
-			containers = la.inlineVals[:newsize]
-		} else {
-			containers = make([]*bitmap32, newsize)
-		}
-		copy(containers, la.containers)
-		la.containers = containers
-	}
+	la.setSize(newsize)
 }
 
 func (la *largeArray) moveKeyValueAt(src, dst int) {
@@ -1063,7 +1129,7 @@ func (la *largeArray) releaseContainersInRange(start int) {
 	}
 	for i := start; i < len(la.containers); i++ {
 		if c := la.containers[i]; c != nil {
-			releaseBitmap(c)
+			c.release()
 			la.clearContainerAtIndex(i)
 		}
 	}
@@ -1083,42 +1149,19 @@ func (la *largeArray) copyFrom(src *largeArray) {
 		return
 	}
 	if la.aliases(src) {
-		tmp := new(largeArray)
-		tmp.copyFrom(src)
-		la.keys = tmp.keys
-		la.containers = tmp.containers
+		la.copyAliasedFrom(src, false)
 		return
 	}
 
 	la.releaseContainersInRange(0)
 
 	if len(src.keys) == 0 {
-		la.keys = la.keys[:0]
-		la.containers = la.containers[:0]
+		la.setSize(0)
 		return
 	}
 
-	la.ensureInline()
-	if cap(la.keys) >= len(src.keys) {
-		la.keys = la.keys[:len(src.keys)]
-	} else {
-		if len(src.keys) <= len(la.inlineKeys) {
-			la.keys = la.inlineKeys[:len(src.keys)]
-		} else {
-			la.keys = make([]uint32, len(src.keys))
-		}
-	}
+	la.setSize(len(src.keys))
 	copy(la.keys, src.keys)
-
-	if cap(la.containers) >= len(src.containers) {
-		la.containers = la.containers[:len(src.containers)]
-	} else {
-		if len(src.containers) <= len(la.inlineVals) {
-			la.containers = la.inlineVals[:len(src.containers)]
-		} else {
-			la.containers = make([]*bitmap32, len(src.containers))
-		}
-	}
 	for i := range src.containers {
 		la.containers[i] = src.containers[i].clone()
 	}
@@ -1129,44 +1172,21 @@ func (la *largeArray) copySharedFrom(src *largeArray) {
 		return
 	}
 	if la.aliases(src) {
-		tmp := new(largeArray)
-		tmp.copySharedFrom(src)
-		la.keys = tmp.keys
-		la.containers = tmp.containers
+		la.copyAliasedFrom(src, true)
 		return
 	}
 
 	la.releaseContainersInRange(0)
 
 	if len(src.keys) == 0 {
-		la.keys = la.keys[:0]
-		la.containers = la.containers[:0]
+		la.setSize(0)
 		return
 	}
 
-	la.ensureInline()
-	if cap(la.keys) >= len(src.keys) {
-		la.keys = la.keys[:len(src.keys)]
-	} else {
-		if len(src.keys) <= len(la.inlineKeys) {
-			la.keys = la.inlineKeys[:len(src.keys)]
-		} else {
-			la.keys = make([]uint32, len(src.keys))
-		}
-	}
+	la.setSize(len(src.keys))
 	copy(la.keys, src.keys)
-
-	if cap(la.containers) >= len(src.containers) {
-		la.containers = la.containers[:len(src.containers)]
-	} else {
-		if len(src.containers) <= len(la.inlineVals) {
-			la.containers = la.inlineVals[:len(src.containers)]
-		} else {
-			la.containers = make([]*bitmap32, len(src.containers))
-		}
-	}
 	for i := range src.containers {
-		la.containers[i] = retainBitmap32(src.containers[i])
+		la.containers[i] = src.containers[i].retain()
 	}
 }
 
@@ -1187,8 +1207,8 @@ func (la *largeArray) getWritableContainerAtIndex(i int) *bitmap32 {
 	if current.isUniquelyOwned() {
 		return current
 	}
-	cloned := current.cloneSharedInto(newBitmap())
-	releaseBitmap(current)
+	cloned := current.cloneSharedInto(bitmapPool.Get())
+	current.release()
 	la.containers[i] = cloned
 	return cloned
 }
@@ -1213,18 +1233,15 @@ func (la *largeArray) getKeyAtIndex(i int) uint32 {
 }
 
 func (la *largeArray) insertNewKeyValueAt(i int, key uint32, value *bitmap32) {
-	la.ensureInline()
 	if i == len(la.keys) {
-		la.keys = append(la.keys, key)
-		la.containers = append(la.containers, value)
+		la.appendContainer(key, value)
 		return
 	}
 
-	la.keys = append(la.keys, 0)
-	la.containers = append(la.containers, nil)
-
-	copy(la.keys[i+1:], la.keys[i:])
-	copy(la.containers[i+1:], la.containers[i:])
+	oldLen := len(la.keys)
+	la.setSize(oldLen + 1)
+	copy(la.keys[i+1:], la.keys[i:oldLen])
+	copy(la.containers[i+1:], la.containers[i:oldLen])
 
 	la.keys[i] = key
 	la.containers[i] = value
@@ -1240,13 +1257,13 @@ func (la *largeArray) removeAtIndex(i int) {
 	la.keys = la.keys[:last]
 	la.containers = la.containers[:last]
 	if removed != nil {
-		releaseBitmap(removed)
+		removed.release()
 	}
 }
 
 func (la *largeArray) setContainerAtIndex(i int, c *bitmap32) {
 	if old := la.containers[i]; old != nil && old != c {
-		releaseBitmap(old)
+		old.release()
 	}
 	la.containers[i] = c
 }
@@ -1254,7 +1271,7 @@ func (la *largeArray) setContainerAtIndex(i int, c *bitmap32) {
 func (la *largeArray) replaceKeyAndContainerAtIndex(i int, key uint32, c *bitmap32) {
 	la.keys[i] = key
 	if old := la.containers[i]; old != nil && old != c {
-		releaseBitmap(old)
+		old.release()
 	}
 	la.containers[i] = c
 }

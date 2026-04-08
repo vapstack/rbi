@@ -173,7 +173,7 @@ func releaseFieldIndexStorageMapOwned(m map[string]fieldIndexStorage) {
 
 func newFlatFieldIndexStorageFromPostingMapOwned(m map[string]posting.List, fixed8 bool) fieldIndexStorage {
 	if len(m) == 0 {
-		releasePostingMap(m)
+		postingMapPool.Put(m)
 		return fieldIndexStorage{}
 	}
 	keys := make([]string, 0, len(m))
@@ -186,7 +186,7 @@ func newFlatFieldIndexStorageFromPostingMapOwned(m map[string]posting.List, fixe
 		keys = append(keys, key)
 	}
 	if len(keys) == 0 {
-		releasePostingMap(m)
+		postingMapPool.Put(m)
 		return fieldIndexStorage{}
 	}
 	sort.Strings(keys)
@@ -197,7 +197,7 @@ func newFlatFieldIndexStorageFromPostingMapOwned(m map[string]posting.List, fixe
 			IDs: m[keys[i]],
 		})
 	}
-	releasePostingMap(m)
+	postingMapPool.Put(m)
 	return newFlatFieldIndexStorage(&entries)
 }
 
@@ -207,7 +207,7 @@ func newFlatFieldIndexStorageFromInsertPostingAccumsOwned(
 	fixed8 bool,
 ) fieldIndexStorage {
 	if len(m) == 0 {
-		releaseInsertPostingMap(m)
+		insertPostingMapPool.Put(m)
 		return fieldIndexStorage{}
 	}
 	keys := make([]string, 0, len(m))
@@ -222,13 +222,13 @@ func newFlatFieldIndexStorageFromInsertPostingAccumsOwned(
 			IDs: arena.accum(m[keys[i]]).materializeOwned(),
 		})
 	}
-	releaseInsertPostingMap(m)
+	insertPostingMapPool.Put(m)
 	return newFlatFieldIndexStorage(&entries)
 }
 
 func newRegularFieldIndexStorageFromPostingMapOwned(m map[string]posting.List, fixed8 bool) fieldIndexStorage {
 	if len(m) == 0 {
-		releasePostingMap(m)
+		postingMapPool.Put(m)
 		return fieldIndexStorage{}
 	}
 	keys := make([]string, 0, len(m))
@@ -241,7 +241,7 @@ func newRegularFieldIndexStorageFromPostingMapOwned(m map[string]posting.List, f
 		keys = append(keys, key)
 	}
 	if len(keys) == 0 {
-		releasePostingMap(m)
+		postingMapPool.Put(m)
 		return fieldIndexStorage{}
 	}
 	sort.Strings(keys)
@@ -253,7 +253,7 @@ func newRegularFieldIndexStorageFromPostingMapOwned(m map[string]posting.List, f
 				IDs: m[keys[i]],
 			})
 		}
-		releasePostingMap(m)
+		postingMapPool.Put(m)
 		return newFlatFieldIndexStorage(&entries)
 	}
 
@@ -297,7 +297,7 @@ func newRegularFieldIndexStorageFromPostingMapOwned(m map[string]posting.List, f
 		}
 		start = end
 	}
-	releasePostingMap(m)
+	postingMapPool.Put(m)
 	return newChunkedFieldIndexStorage(builder.root())
 }
 
@@ -307,7 +307,7 @@ func newRegularFieldIndexStorageFromInsertPostingAccumsOwned(
 	fixed8 bool,
 ) fieldIndexStorage {
 	if len(m) == 0 {
-		releaseInsertPostingMap(m)
+		insertPostingMapPool.Put(m)
 		return fieldIndexStorage{}
 	}
 	keys := make([]string, 0, len(m))
@@ -323,7 +323,7 @@ func newRegularFieldIndexStorageFromInsertPostingAccumsOwned(
 				IDs: arena.accum(m[keys[i]]).materializeOwned(),
 			})
 		}
-		releaseInsertPostingMap(m)
+		insertPostingMapPool.Put(m)
 		return newFlatFieldIndexStorage(&entries)
 	}
 
@@ -369,7 +369,7 @@ func newRegularFieldIndexStorageFromInsertPostingAccumsOwned(
 		start = end
 	}
 
-	releaseInsertPostingMap(m)
+	insertPostingMapPool.Put(m)
 
 	return newChunkedFieldIndexStorage(builder.root())
 }
@@ -379,7 +379,7 @@ func newFlatFieldIndexStorageFromFixedInsertPostingAccumsOwned(
 	arena *insertPostingAccumArena,
 ) fieldIndexStorage {
 	if len(m) == 0 {
-		releaseFixedInsertPostingMap(m)
+		fixedInsertPostingMapPool.Put(m)
 		return fieldIndexStorage{}
 	}
 	keys := make([]uint64, 0, len(m))
@@ -394,13 +394,13 @@ func newFlatFieldIndexStorageFromFixedInsertPostingAccumsOwned(
 			IDs: arena.accum(m[keys[i]]).materializeOwned(),
 		})
 	}
-	releaseFixedInsertPostingMap(m)
+	fixedInsertPostingMapPool.Put(m)
 	return newFlatFieldIndexStorage(&entries)
 }
 
 func newRegularFieldIndexStorageFromFixedPostingMapOwned(m map[uint64]posting.List) fieldIndexStorage {
 	if len(m) == 0 {
-		releaseFixedPostingMap(m)
+		fixedPostingMapPool.Put(m)
 		return fieldIndexStorage{}
 	}
 	keys := make([]uint64, 0, len(m))
@@ -413,7 +413,7 @@ func newRegularFieldIndexStorageFromFixedPostingMapOwned(m map[uint64]posting.Li
 		keys = append(keys, key)
 	}
 	if len(keys) == 0 {
-		releaseFixedPostingMap(m)
+		fixedPostingMapPool.Put(m)
 		return fieldIndexStorage{}
 	}
 	slices.Sort(keys)
@@ -425,7 +425,7 @@ func newRegularFieldIndexStorageFromFixedPostingMapOwned(m map[uint64]posting.Li
 				IDs: m[keys[i]],
 			})
 		}
-		releaseFixedPostingMap(m)
+		fixedPostingMapPool.Put(m)
 		return newFlatFieldIndexStorage(&entries)
 	}
 
@@ -446,7 +446,7 @@ func newRegularFieldIndexStorageFromFixedPostingMapOwned(m map[uint64]posting.Li
 		})
 		start = end
 	}
-	releaseFixedPostingMap(m)
+	fixedPostingMapPool.Put(m)
 	return newChunkedFieldIndexStorage(builder.root())
 }
 
@@ -455,7 +455,7 @@ func newRegularFieldIndexStorageFromFixedInsertPostingAccumsOwned(
 	arena *insertPostingAccumArena,
 ) fieldIndexStorage {
 	if len(m) == 0 {
-		releaseFixedInsertPostingMap(m)
+		fixedInsertPostingMapPool.Put(m)
 		return fieldIndexStorage{}
 	}
 	keys := make([]uint64, 0, len(m))
@@ -472,7 +472,7 @@ func newRegularFieldIndexStorageFromFixedInsertPostingAccumsOwned(
 				IDs: arena.accum(m[keys[i]]).materializeOwned(),
 			})
 		}
-		releaseFixedInsertPostingMap(m)
+		fixedInsertPostingMapPool.Put(m)
 		return newFlatFieldIndexStorage(&entries)
 	}
 
@@ -494,7 +494,7 @@ func newRegularFieldIndexStorageFromFixedInsertPostingAccumsOwned(
 		start = end
 	}
 
-	releaseFixedInsertPostingMap(m)
+	fixedInsertPostingMapPool.Put(m)
 
 	return newChunkedFieldIndexStorage(builder.root())
 }
@@ -683,6 +683,19 @@ func lowerBoundIndexEntriesKey(entries []index, key indexKey) int {
 	return lo
 }
 
+func upperBoundIndexEntriesKey(entries []index, key indexKey) int {
+	lo, hi := 0, len(entries)
+	for lo < hi {
+		mid := (lo + hi) >> 1
+		if compareIndexKeys(entries[mid].Key, key) <= 0 {
+			lo = mid + 1
+		} else {
+			hi = mid
+		}
+	}
+	return lo
+}
+
 func searchChunkPageAfterChunk(prefix []int, chunk int) int {
 	lo, hi := 0, len(prefix)-1
 	for lo < hi {
@@ -740,6 +753,32 @@ func upperBoundFieldIndexChunk(chunk *fieldIndexChunk, key string) int {
 	for lo < hi {
 		mid := (lo + hi) >> 1
 		if compareIndexKeyString(chunk.keyAt(mid), key) <= 0 {
+			lo = mid + 1
+		} else {
+			hi = mid
+		}
+	}
+	return lo
+}
+
+func upperBoundFieldIndexChunkKey(chunk *fieldIndexChunk, key indexKey) int {
+	lo, hi := 0, chunk.keyCount()
+	for lo < hi {
+		mid := (lo + hi) >> 1
+		if compareIndexKeys(chunk.keyAt(mid), key) <= 0 {
+			lo = mid + 1
+		} else {
+			hi = mid
+		}
+	}
+	return lo
+}
+
+func lowerBoundFieldIndexChunkPrefixUpperBound(chunk *fieldIndexChunk, upper prefixUpperBound) int {
+	lo, hi := 0, chunk.keyCount()
+	for lo < hi {
+		mid := (lo + hi) >> 1
+		if compareIndexKeyPrefixUpperBound(chunk.keyAt(mid), upper) < 0 {
 			lo = mid + 1
 		} else {
 			hi = mid
@@ -1659,6 +1698,96 @@ func (r *fieldIndexChunkedRoot) upperBoundPos(key string) (fieldIndexChunkPos, i
 	return fieldIndexChunkPos{chunk: r.chunkPrefix[page] + refIdx, entry: entryIdx}, rank
 }
 
+func (r *fieldIndexChunkedRoot) lowerBoundPosKey(key indexKey) (fieldIndexChunkPos, int) {
+	if r == nil || r.chunkCount == 0 {
+		return fieldIndexChunkPos{}, 0
+	}
+	page := sort.Search(len(r.pages), func(i int) bool {
+		return compareIndexKeys(r.pages[i].lastKey(), key) >= 0
+	})
+	if page >= len(r.pages) {
+		return r.endPos(), r.keyCount
+	}
+	refs := r.pages[page].refs
+	refIdx := sort.Search(len(refs), func(i int) bool {
+		return compareIndexKeys(refs[i].last, key) >= 0
+	})
+	if refIdx >= len(refs) {
+		return r.endPos(), r.keyCount
+	}
+	chunk := refs[refIdx].chunk
+	entryIdx := lowerBoundFieldIndexChunkKey(chunk, key)
+	rank := r.prefix[page] + r.pages[page].prefix[refIdx] + entryIdx
+	if entryIdx >= chunk.keyCount() {
+		nextChunk := r.chunkPrefix[page] + refIdx + 1
+		if nextChunk >= r.chunkCount {
+			return r.endPos(), r.keyCount
+		}
+		return fieldIndexChunkPos{chunk: nextChunk}, rank
+	}
+	return fieldIndexChunkPos{chunk: r.chunkPrefix[page] + refIdx, entry: entryIdx}, rank
+}
+
+func (r *fieldIndexChunkedRoot) upperBoundPosKey(key indexKey) (fieldIndexChunkPos, int) {
+	if r == nil || r.chunkCount == 0 {
+		return fieldIndexChunkPos{}, 0
+	}
+	page := sort.Search(len(r.pages), func(i int) bool {
+		return compareIndexKeys(r.pages[i].lastKey(), key) > 0
+	})
+	if page >= len(r.pages) {
+		return r.endPos(), r.keyCount
+	}
+	refs := r.pages[page].refs
+	refIdx := sort.Search(len(refs), func(i int) bool {
+		return compareIndexKeys(refs[i].last, key) > 0
+	})
+	if refIdx >= len(refs) {
+		return r.endPos(), r.keyCount
+	}
+	chunk := refs[refIdx].chunk
+	entryIdx := upperBoundFieldIndexChunkKey(chunk, key)
+	rank := r.prefix[page] + r.pages[page].prefix[refIdx] + entryIdx
+	if entryIdx >= chunk.keyCount() {
+		nextChunk := r.chunkPrefix[page] + refIdx + 1
+		if nextChunk >= r.chunkCount {
+			return r.endPos(), r.keyCount
+		}
+		return fieldIndexChunkPos{chunk: nextChunk}, rank
+	}
+	return fieldIndexChunkPos{chunk: r.chunkPrefix[page] + refIdx, entry: entryIdx}, rank
+}
+
+func (r *fieldIndexChunkedRoot) lowerBoundPosPrefixUpperBound(upper prefixUpperBound) (fieldIndexChunkPos, int) {
+	if r == nil || r.chunkCount == 0 {
+		return fieldIndexChunkPos{}, 0
+	}
+	page := sort.Search(len(r.pages), func(i int) bool {
+		return compareIndexKeyPrefixUpperBound(r.pages[i].lastKey(), upper) >= 0
+	})
+	if page >= len(r.pages) {
+		return r.endPos(), r.keyCount
+	}
+	refs := r.pages[page].refs
+	refIdx := sort.Search(len(refs), func(i int) bool {
+		return compareIndexKeyPrefixUpperBound(refs[i].last, upper) >= 0
+	})
+	if refIdx >= len(refs) {
+		return r.endPos(), r.keyCount
+	}
+	chunk := refs[refIdx].chunk
+	entryIdx := lowerBoundFieldIndexChunkPrefixUpperBound(chunk, upper)
+	rank := r.prefix[page] + r.pages[page].prefix[refIdx] + entryIdx
+	if entryIdx >= chunk.keyCount() {
+		nextChunk := r.chunkPrefix[page] + refIdx + 1
+		if nextChunk >= r.chunkCount {
+			return r.endPos(), r.keyCount
+		}
+		return fieldIndexChunkPos{chunk: nextChunk}, rank
+	}
+	return fieldIndexChunkPos{chunk: r.chunkPrefix[page] + refIdx, entry: entryIdx}, rank
+}
+
 // prefixRangeEndPos returns the first position after prefix when start/startRank
 // already points inside the prefix range; otherwise it returns the input pair.
 func (r *fieldIndexChunkedRoot) prefixRangeEndPos(prefix string, start fieldIndexChunkPos, startRank int) (fieldIndexChunkPos, int) {
@@ -1668,20 +1797,11 @@ func (r *fieldIndexChunkedRoot) prefixRangeEndPos(prefix string, start fieldInde
 	if key, ok := r.posKey(start); !ok || compareIndexKeyString(key, prefix) < 0 || !indexKeyHasPrefixString(key, prefix) {
 		return start, startRank
 	}
-	if upper, ok := nextPrefixUpperBound(prefix); ok {
-		return r.lowerBoundPos(upper)
+	upper, ok := newPrefixUpperBound(prefix)
+	if !ok {
+		return r.endPos(), r.keyCount
 	}
-	pos := start
-	rank := startRank
-	for !r.isEndPos(pos) {
-		key, ok := r.posKey(pos)
-		if !ok || !indexKeyHasPrefixString(key, prefix) {
-			return pos, rank
-		}
-		pos = r.advancePos(pos)
-		rank++
-	}
-	return pos, rank
+	return r.lowerBoundPosPrefixUpperBound(upper)
 }
 
 func (r *fieldIndexChunkedRoot) lookupPostingRetained(key string) posting.List {

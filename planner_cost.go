@@ -4,6 +4,7 @@ import (
 	"math"
 
 	"github.com/vapstack/qx"
+	"github.com/vapstack/rbi/internal/pooled"
 )
 
 // Cost model margins. Values below 1 require measurable advantage
@@ -55,7 +56,8 @@ func (qv *queryView[K, V]) decidePlanORNoOrder(q *qx.QX, branches plannerORBranc
 			d.expectedRows = uint64(need)
 			return d
 		}
-		if branches[i].lead == nil || !branches[i].lead.hasIter() {
+		lead := branches[i].leadPtr()
+		if lead == nil || !lead.hasIter() {
 			return d
 		}
 	}
@@ -66,7 +68,8 @@ func (qv *queryView[K, V]) decidePlanORNoOrder(q *qx.QX, branches plannerORBranc
 		return d
 	}
 
-	unionCard, sumCard, branchCards, hasAlwaysTrue := branches.unionCards(universe)
+	var branchCards [plannerORBranchLimit]uint64
+	unionCard, sumCard, branchCount, hasAlwaysTrue := branches.unionCards(universe, &branchCards)
 	if hasAlwaysTrue {
 		d.use = true
 		d.expectedRows = uint64(need)
@@ -79,7 +82,7 @@ func (qv *queryView[K, V]) decidePlanORNoOrder(q *qx.QX, branches plannerORBranc
 	// expectedRows models how many ids we need to inspect before collecting N
 	// unique outputs from a union with the given cardinality.
 	expectedRows := estimateRowsForNeed(uint64(need), unionCard, universe)
-	avgChecks := branches.noOrderChecks(branchCards)
+	avgChecks := branches.noOrderChecks(&branchCards, branchCount)
 	costKWay := float64(expectedRows) * (1.0 + avgChecks)
 	costKWay *= qv.root.plannerCostMultiplier(plannerCalORNoOrder)
 
@@ -98,8 +101,8 @@ func (qv *queryView[K, V]) decidePlanORNoOrder(q *qx.QX, branches plannerORBranc
 
 func (branches plannerORBranches) hasNonOrderPrefixTailRisk(orderField string) bool {
 	for i := range branches {
-		for pi := range branches[i].preds {
-			p := branches[i].preds[pi]
+		for pi := 0; pi < branches[i].predLen(); pi++ {
+			p := branches[i].pred(pi)
 			if isPositiveNonOrderScalarPrefixLeaf(orderField, p.expr) && !p.isMaterializedLike() {
 				return true
 			}
@@ -145,7 +148,8 @@ func (qv *queryView[K, V]) decidePlanOROrder(q *qx.QX, branches plannerORBranche
 	}
 
 	mergeStats := qv.orderMergeBranchStats(o.Field, branches, ov)
-	unionCard, sumCard, branchCards, hasAlwaysTrue := branches.unionCards(universe)
+	var branchCards [plannerORBranchLimit]uint64
+	unionCard, sumCard, branchCount, hasAlwaysTrue := branches.unionCards(universe, &branchCards)
 	if unionCard == 0 {
 		return d
 	}
@@ -169,7 +173,7 @@ func (qv *queryView[K, V]) decidePlanOROrder(q *qx.QX, branches plannerORBranche
 	mergeNeedLimit := plannerOROrderMergeNeedLimit(need, len(branches), unionCard, sumCard, q.Offset)
 	mergeAllowed := !hasAlwaysTrue && need <= mergeNeedLimit
 	if mergeAllowed {
-		costMerge := branches.orderMergeCost(uint64(need), branchCards, unionCard, sumCard, universe, orderStats, mergeStats)
+		costMerge := branches.orderMergeCost(uint64(need), &branchCards, branchCount, unionCard, sumCard, universe, orderStats, mergeStats)
 		if routeOK && routeCost.kWay > 0 && routeCost.kWay < costMerge &&
 			branches.hasFullSpanOrderBranch(mergeStats) &&
 			!routeCost.hasPrefixTailRisk &&
@@ -196,22 +200,30 @@ func (qv *queryView[K, V]) decidePlanOROrder(q *qx.QX, branches plannerORBranche
 }
 
 // unionCards estimates planner metrics for OR union cardinalities.
-func (branches plannerORBranches) unionCards(universe uint64) (uint64, uint64, []uint64, bool) {
+func (branches plannerORBranches) unionCards(universe uint64, branchCards *[plannerORBranchLimit]uint64) (uint64, uint64, int, bool) {
 	if universe == 0 {
-		return 0, 0, nil, false
+		return 0, 0, 0, false
 	}
 
-	branchCards := make([]uint64, 0, len(branches))
+	n := len(branches)
+	if n > plannerORBranchLimit {
+		n = plannerORBranchLimit
+	}
 	sumCard := uint64(0)
 	remainProb := 1.0
 
-	for i := range branches {
+	for i := 0; i < n; i++ {
 		if branches[i].alwaysTrue {
-			return universe, universe, append(branchCards, universe), true
+			if branchCards != nil {
+				branchCards[i] = universe
+			}
+			return universe, universe, n, true
 		}
 
 		card := branches[i].estimatedCard(universe)
-		branchCards = append(branchCards, card)
+		if branchCards != nil {
+			branchCards[i] = card
+		}
 		sumCard += card
 
 		p := float64(card) / float64(universe)
@@ -231,7 +243,7 @@ func (branches plannerORBranches) unionCards(universe uint64) (uint64, uint64, [
 	if unionCard == 0 && sumCard > 0 {
 		unionCard = 1
 	}
-	return unionCard, sumCard, branchCards, false
+	return unionCard, sumCard, n, false
 }
 
 func (branch plannerORBranch) estimatedCard(universe uint64) uint64 {
@@ -250,8 +262,8 @@ func (branch plannerORBranch) estimatedCard(universe uint64) uint64 {
 
 	minEst := uint64(0)
 	active := 0
-	for i := range branch.preds {
-		p := branch.preds[i]
+	for i := 0; i < branch.predLen(); i++ {
+		p := branch.pred(i)
 		if p.alwaysFalse {
 			return 0
 		}
@@ -268,8 +280,8 @@ func (branch plannerORBranch) estimatedCard(universe uint64) uint64 {
 	}
 
 	if minEst == 0 {
-		if branch.lead != nil && branch.lead.estCard > 0 {
-			minEst = branch.lead.estCard
+		if lead := branch.leadPtr(); lead != nil && lead.estCard > 0 {
+			minEst = lead.estCard
 			active = 1
 		} else {
 			minEst = max(1, universe/plannerORBranchFallbackDiv)
@@ -313,7 +325,7 @@ func estimateRowsForNeed(need, card, universe uint64) uint64 {
 	return uint64(rows)
 }
 
-func (branches plannerORBranches) noOrderChecks(branchCards []uint64) float64 {
+func (branches plannerORBranches) noOrderChecks(branchCards *[plannerORBranchLimit]uint64, branchCount int) float64 {
 	if len(branches) == 0 {
 		return 1.0
 	}
@@ -321,18 +333,22 @@ func (branches plannerORBranches) noOrderChecks(branchCards []uint64) float64 {
 	totalWeight := float64(0)
 	totalChecks := float64(0)
 
-	for i := range branches {
+	n := len(branches)
+	if branchCount > 0 && branchCount < n {
+		n = branchCount
+	}
+	for i := 0; i < n; i++ {
 		weight := float64(1)
-		if i < len(branchCards) && branchCards[i] > 0 {
+		if branchCards != nil && branchCards[i] > 0 {
 			weight = float64(branchCards[i])
 		}
 
 		checks := 0
-		for pi := range branches[i].preds {
+		for pi := 0; pi < branches[i].predLen(); pi++ {
 			if pi == branches[i].leadIdx {
 				continue
 			}
-			p := branches[i].preds[pi]
+			p := branches[i].pred(pi)
 			if p.alwaysTrue || p.alwaysFalse {
 				continue
 			}
@@ -390,7 +406,8 @@ func (branches plannerORBranches) orderStreamChecksByBranch(
 
 func (branches plannerORBranches) orderMergeCost(
 	need uint64,
-	branchCards []uint64,
+	branchCards *[plannerORBranchLimit]uint64,
+	branchCount int,
 	unionCard uint64,
 	sumCard uint64,
 	universe uint64,
@@ -404,10 +421,11 @@ func (branches plannerORBranches) orderMergeCost(
 	subRows := float64(0)
 	candidateUpper := uint64(0)
 
-	for i := range branches {
-		if i >= len(branchCards) {
-			break
-		}
+	n := len(branches)
+	if branchCount > 0 && branchCount < n {
+		n = branchCount
+	}
+	for i := 0; i < n; i++ {
 		card := branchCards[i]
 		if card == 0 {
 			continue
@@ -693,6 +711,44 @@ func (qv *queryView[K, V]) collectMergedBaseScalarRangeFields(
 	return dst, true
 }
 
+func (qv *queryView[K, V]) collectMergedBaseScalarRangeFieldsBuf(
+	orderField string,
+	leaves *pooled.SliceBuf[qx.Expr],
+	dst []mergedBaseScalarRangeField,
+) ([]mergedBaseScalarRangeField, bool) {
+	for i := 0; i < leaves.Len(); i++ {
+		e := leaves.Get(i)
+		if e.Not || e.Field == "" || e.Field == orderField || len(e.Operands) != 0 || !isScalarRangeEqOp(e.Op) {
+			continue
+		}
+		fm := qv.fields[e.Field]
+		if fm == nil || fm.Slice {
+			continue
+		}
+		nextRB, ok, err := qv.rangeBoundsForScalarExpr(e)
+		if err != nil || !ok {
+			return nil, false
+		}
+		merged := false
+		for j := range dst {
+			if dst[j].field != e.Field {
+				continue
+			}
+			mergeRangeBounds(&dst[j].bounds, nextRB)
+			merged = true
+			break
+		}
+		if merged {
+			continue
+		}
+		dst = append(dst, mergedBaseScalarRangeField{
+			field:  e.Field,
+			bounds: nextRB,
+		})
+	}
+	return dst, true
+}
+
 func (qv *queryView[K, V]) estimateMergedScalarRangeOrderCost(
 	field string,
 	bounds rangeBounds,
@@ -755,6 +811,37 @@ func (qv *queryView[K, V]) estimateMergedScalarRangeOrderCost(
 
 func executionOrderShapeInfo(orderField string, leaves []qx.Expr) (hasOrderPrefix bool, compatible bool) {
 	for _, e := range leaves {
+		if e.Op == qx.OpNOOP {
+			if e.Not {
+				return false, false
+			}
+			continue
+		}
+		if e.Not {
+			if e.Field == "" || e.Field == orderField {
+				return false, false
+			}
+			continue
+		}
+		if e.Field == "" {
+			return false, false
+		}
+		switch classifyOrderFieldScalarLeaf(orderField, e) {
+		case orderFieldScalarLeafOther:
+			continue
+		case orderFieldScalarLeafRange:
+		case orderFieldScalarLeafPrefix:
+			hasOrderPrefix = true
+		case orderFieldScalarLeafInvalid:
+			return false, false
+		}
+	}
+	return hasOrderPrefix, true
+}
+
+func executionOrderShapeInfoBuf(orderField string, leaves *pooled.SliceBuf[qx.Expr]) (hasOrderPrefix bool, compatible bool) {
+	for i := 0; i < leaves.Len(); i++ {
+		e := leaves.Get(i)
 		if e.Op == qx.OpNOOP {
 			if e.Not {
 				return false, false
@@ -910,6 +997,133 @@ func (qv *queryView[K, V]) decideExecutionOrderByCost(q *qx.QX, leaves []qx.Expr
 	return d
 }
 
+func (qv *queryView[K, V]) decideExecutionOrderByCostBuf(q *qx.QX, leaves *pooled.SliceBuf[qx.Expr]) plannerExecutionOrderDecision {
+	var d plannerExecutionOrderDecision
+
+	if q.Expr.Not {
+		return d
+	}
+	if len(q.Order) != 1 {
+		return d
+	}
+	if q.Limit == 0 {
+		return d
+	}
+	if leaves == nil || leaves.Len() == 0 {
+		return d
+	}
+
+	need, ok := orderWindow(q)
+	if !ok || need <= 0 {
+		return d
+	}
+
+	o := q.Order[0]
+	if o.Type != qx.OrderBasic || o.Field == "" {
+		return d
+	}
+
+	fm := qv.fields[o.Field]
+	if fm == nil || fm.Slice {
+		return d
+	}
+
+	ov := qv.fieldOverlay(o.Field)
+	useOverlayProfile := ov.hasData()
+
+	var orderSlice *[]index
+	if !useOverlayProfile {
+		orderSlice = qv.snapshotFieldIndexSlice(o.Field)
+		if orderSlice == nil || len(*orderSlice) == 0 {
+			return d
+		}
+	}
+
+	hasOrderPrefix, compatible := executionOrderShapeInfoBuf(o.Field, leaves)
+	if !compatible {
+		return d
+	}
+
+	snap := qv.planner.stats.Load()
+	universe := snap.universeOr(qv.snapshotUniverseCardinality())
+	if universe == 0 {
+		return d
+	}
+
+	var profile plannerOrderedProfile
+	orderDistinct := uint64(0)
+
+	if useOverlayProfile {
+		profile, ok = qv.estimateOrderedProfileOverlayBuf(o.Field, leaves, ov, snap, universe)
+		if !ok {
+			return d
+		}
+		orderDistinct = uint64(overlayApproxDistinctTotalCount(ov))
+		if orderDistinct == 0 {
+			return d
+		}
+	} else {
+		profile, ok = qv.estimateOrderedProfileBuf(o.Field, leaves, *orderSlice, snap, universe)
+		if !ok {
+			return d
+		}
+		orderDistinct = uint64(len(*orderSlice))
+	}
+
+	plan := PlanLimitOrderBasic
+	calPlan := plannerCalLimitOrderBasic
+	if hasOrderPrefix {
+		plan = PlanLimitOrderPrefix
+		calPlan = plannerCalLimitOrderPrefix
+	}
+
+	d.use = true
+	d.plan = plan
+
+	if profile.selectivity <= 0 {
+		d.expectedProbeRows = 0
+		d.executionCost = 1.0 * qv.root.plannerCostMultiplier(calPlan)
+		return d
+	}
+
+	orderStats := qv.plannerOrderFieldStats(o.Field, snap, universe, orderDistinct)
+	orderSkew := orderStats.skew()
+	expectedProbeRows := estimateOrderExpectedProbes(float64(need), float64(universe), profile.selectivity, profile.coverage, orderSkew)
+
+	baseFactor, checkFactor, rangeFactor, prefixFactor := plannerExecutionOrderFactors(profile, orderSkew, universe)
+	execRowFactor := baseFactor + float64(profile.activeChecks)*checkFactor
+	if profile.orderRangeLeaves > 0 {
+		execRowFactor *= rangeFactor
+	}
+	if hasOrderPrefix {
+		execRowFactor *= prefixFactor
+	}
+	if q.Offset > 0 {
+		execRowFactor *= 0.95
+	}
+	execRowFactor = plannerClampFloat(execRowFactor, 0.25, 6.0)
+
+	executionCost := expectedProbeRows*execRowFactor + float64(leaves.Len())*12.0
+	if profile.baseWorkRows > 0 {
+		baseWorkCost := profile.baseWorkRows * plannerExecutionOrderBaseWorkFactor
+		if profile.activeChecks > 1 {
+			baseWorkCost *= 1.0 + float64(profile.activeChecks-1)*0.12
+		}
+		if profile.baseRangeLeaves > 0 {
+			baseWorkCost *= 1.0 + float64(profile.baseRangeLeaves)*0.35
+		}
+		if hasOrderPrefix {
+			baseWorkCost *= 1.10
+		}
+		executionCost += baseWorkCost
+	}
+	executionCost *= qv.root.plannerCostMultiplier(calPlan)
+
+	d.expectedProbeRows = uint64(expectedProbeRows)
+	d.executionCost = executionCost
+	return d
+}
+
 func (qv *queryView[K, V]) shouldPreferExecutionPlan(q *qx.QX, trace *queryTrace) bool {
 	if plannerObviousExecutionFastPath(q) {
 		if trace != nil {
@@ -918,9 +1132,8 @@ func (qv *queryView[K, V]) shouldPreferExecutionPlan(q *qx.QX, trace *queryTrace
 		return true
 	}
 
-	leavesBuf := getExprSliceBuf(8)
-	defer releaseExprSliceBuf(leavesBuf)
-	leaves, ok := collectAndLeavesScratch(q.Expr, leavesBuf.values[:0])
+	var leavesBuf [8]qx.Expr
+	leaves, ok := collectAndLeavesScratch(q.Expr, leavesBuf[:0])
 	if !ok || len(leaves) == 0 {
 		return false
 	}
@@ -1375,11 +1588,11 @@ func (qv *queryView[K, V]) estimateOrderedProfile(orderField string, leaves []qx
 		return plannerOrderedProfile{}, false
 	}
 
-	start, end, coveredBuf, covered, ok := qv.extractOrderRangeCoverageLeaves(orderField, leaves, orderSlice)
+	start, end, coveredBuf, ok := qv.extractOrderRangeCoverageLeaves(orderField, leaves, orderSlice)
 	if !ok {
 		return plannerOrderedProfile{}, false
 	}
-	defer releaseBoolSliceBuf(coveredBuf)
+	defer boolSlicePool.Put(coveredBuf)
 
 	coverage := 1.0
 	if len(orderSlice) > 0 {
@@ -1450,7 +1663,7 @@ func (qv *queryView[K, V]) estimateOrderedProfile(orderField string, leaves []qx
 		if e.Op == qx.OpNOOP && !e.Not {
 			continue
 		}
-		if i < len(covered) && covered[i] {
+		if coveredBuf.Get(i) {
 			continue
 		}
 		activeChecks++
@@ -1521,16 +1734,166 @@ func (qv *queryView[K, V]) estimateOrderedProfile(orderField string, leaves []qx
 	}, true
 }
 
+func (qv *queryView[K, V]) estimateOrderedProfileBuf(orderField string, leaves *pooled.SliceBuf[qx.Expr], orderSlice []index, snap *plannerStatsSnapshot, universe uint64) (plannerOrderedProfile, bool) {
+	if universe == 0 {
+		return plannerOrderedProfile{}, false
+	}
+
+	start, end, coveredBuf, ok := qv.extractOrderRangeCoverageLeavesBuf(orderField, leaves, orderSlice)
+	if !ok {
+		return plannerOrderedProfile{}, false
+	}
+	defer boolSlicePool.Put(coveredBuf)
+
+	coverage := 1.0
+	if len(orderSlice) > 0 {
+		coverage = float64(end-start) / float64(len(orderSlice))
+		if coverage < 0 {
+			coverage = 0
+		}
+		if coverage > 1 {
+			coverage = 1
+		}
+	}
+
+	selProd := 1.0
+	selMin := 1.0
+	fallbackWork := 0.0
+	activeChecks := 0
+	hasNeg := false
+	hasPrefix := false
+	orderRangeLeaves := 0
+	baseWork := 0.0
+	baseRangeLeaves := 0
+	orderHasBuckets := len(orderSlice) > 0
+	var mergedBaseRangesArr [plannerOrderedLeafMax]mergedBaseScalarRangeField
+	mergedBaseRanges, ok := qv.collectMergedBaseScalarRangeFieldsBuf(orderField, leaves, mergedBaseRangesArr[:0])
+	if !ok {
+		return plannerOrderedProfile{}, false
+	}
+
+	for i := 0; i < leaves.Len(); i++ {
+		e := leaves.Get(i)
+		if !e.Not && e.Field != "" && e.Field != orderField && len(e.Operands) == 0 && isScalarRangeEqOp(e.Op) {
+			continue
+		}
+		leafSel, leafWork, leafOrderRange, leafHasPrefix, ok := qv.estimateLeafOrderCost(e, snap, universe, orderField, orderHasBuckets)
+		if !ok {
+			return plannerOrderedProfile{}, false
+		}
+
+		if leafSel <= 0 {
+			return plannerOrderedProfile{
+				selectivity:      0,
+				coverage:         coverage,
+				activeChecks:     0,
+				hasNeg:           hasNeg || e.Not,
+				hasPrefix:        hasPrefix || leafHasPrefix,
+				fallbackWorkRows: fallbackWork + leafWork,
+				orderRangeLeaves: orderRangeLeaves + btoi(leafOrderRange),
+				baseWorkRows:     baseWork,
+				baseRangeLeaves:  baseRangeLeaves,
+			}, true
+		}
+
+		selProd *= leafSel
+		if leafSel < selMin {
+			selMin = leafSel
+		}
+
+		fallbackWork += leafWork
+		if e.Not {
+			hasNeg = true
+		}
+		if leafHasPrefix {
+			hasPrefix = true
+		}
+		if leafOrderRange {
+			orderRangeLeaves++
+		}
+
+		if e.Op == qx.OpNOOP && !e.Not {
+			continue
+		}
+		if coveredBuf.Get(i) {
+			continue
+		}
+		activeChecks++
+		baseWork += leafWork
+		if isBoundOp(e.Op) && e.Field != orderField {
+			baseRangeLeaves++
+		}
+	}
+
+	for _, merged := range mergedBaseRanges {
+		fieldStats := qv.plannerFieldStats(merged.field, snap, universe)
+		leafSel, leafWork, ok := qv.estimateMergedScalarRangeOrderCost(merged.field, merged.bounds, universe, fieldStats)
+		if !ok {
+			return plannerOrderedProfile{}, false
+		}
+		if leafSel <= 0 {
+			return plannerOrderedProfile{
+				selectivity:      0,
+				coverage:         coverage,
+				activeChecks:     0,
+				hasNeg:           hasNeg,
+				hasPrefix:        hasPrefix,
+				fallbackWorkRows: fallbackWork + leafWork,
+				orderRangeLeaves: orderRangeLeaves,
+				baseWorkRows:     baseWork,
+				baseRangeLeaves:  baseRangeLeaves,
+			}, true
+		}
+		selProd *= leafSel
+		if leafSel < selMin {
+			selMin = leafSel
+		}
+		fallbackWork += leafWork
+		activeChecks++
+		baseWork += leafWork
+		baseRangeLeaves++
+	}
+
+	selectivity := selProd
+	if selectivity > selMin {
+		selectivity = selMin
+	}
+
+	minSel := selMin * 0.06
+	universeFloor := 1.0 / float64(universe)
+	if minSel < universeFloor {
+		minSel = universeFloor
+	}
+	if selectivity < minSel {
+		selectivity = minSel
+	}
+	if selectivity > 1 {
+		selectivity = 1
+	}
+
+	return plannerOrderedProfile{
+		selectivity:      selectivity,
+		coverage:         coverage,
+		activeChecks:     activeChecks,
+		hasNeg:           hasNeg,
+		hasPrefix:        hasPrefix,
+		fallbackWorkRows: fallbackWork,
+		orderRangeLeaves: orderRangeLeaves,
+		baseWorkRows:     baseWork,
+		baseRangeLeaves:  baseRangeLeaves,
+	}, true
+}
+
 func (qv *queryView[K, V]) estimateOrderedProfileOverlay(orderField string, leaves []qx.Expr, ov fieldOverlay, snap *plannerStatsSnapshot, universe uint64) (plannerOrderedProfile, bool) {
 	if universe == 0 {
 		return plannerOrderedProfile{}, false
 	}
 
-	inBuckets, totalBuckets, coveredBuf, covered, ok := qv.extractOrderRangeCoverageLeavesOverlay(orderField, leaves, ov)
+	inBuckets, totalBuckets, coveredBuf, ok := qv.extractOrderRangeCoverageLeavesOverlay(orderField, leaves, ov)
 	if !ok {
 		return plannerOrderedProfile{}, false
 	}
-	defer releaseBoolSliceBuf(coveredBuf)
+	defer boolSlicePool.Put(coveredBuf)
 
 	coverage := 1.0
 	if totalBuckets > 0 {
@@ -1601,7 +1964,7 @@ func (qv *queryView[K, V]) estimateOrderedProfileOverlay(orderField string, leav
 		if e.Op == qx.OpNOOP && !e.Not {
 			continue
 		}
-		if i < len(covered) && covered[i] {
+		if coveredBuf.Get(i) {
 			continue
 		}
 		activeChecks++
@@ -1670,10 +2033,160 @@ func (qv *queryView[K, V]) estimateOrderedProfileOverlay(orderField string, leav
 	}, true
 }
 
-func (qv *queryView[K, V]) extractOrderRangeCoverageLeaves(orderField string, leaves []qx.Expr, orderSlice []index) (int, int, *boolSliceBuf, []bool, bool) {
+func (qv *queryView[K, V]) estimateOrderedProfileOverlayBuf(orderField string, leaves *pooled.SliceBuf[qx.Expr], ov fieldOverlay, snap *plannerStatsSnapshot, universe uint64) (plannerOrderedProfile, bool) {
+	if universe == 0 {
+		return plannerOrderedProfile{}, false
+	}
+
+	inBuckets, totalBuckets, coveredBuf, ok := qv.extractOrderRangeCoverageLeavesOverlayBuf(orderField, leaves, ov)
+	if !ok {
+		return plannerOrderedProfile{}, false
+	}
+	defer boolSlicePool.Put(coveredBuf)
+
+	coverage := 1.0
+	if totalBuckets > 0 {
+		coverage = float64(inBuckets) / float64(totalBuckets)
+		if coverage < 0 {
+			coverage = 0
+		}
+		if coverage > 1 {
+			coverage = 1
+		}
+	}
+
+	selProd := 1.0
+	selMin := 1.0
+	fallbackWork := 0.0
+	activeChecks := 0
+	hasNeg := false
+	hasPrefix := false
+	orderRangeLeaves := 0
+	baseWork := 0.0
+	baseRangeLeaves := 0
+	orderHasBuckets := totalBuckets > 0
+	var mergedBaseRangesArr [plannerOrderedLeafMax]mergedBaseScalarRangeField
+	mergedBaseRanges, ok := qv.collectMergedBaseScalarRangeFieldsBuf(orderField, leaves, mergedBaseRangesArr[:0])
+	if !ok {
+		return plannerOrderedProfile{}, false
+	}
+
+	for i := 0; i < leaves.Len(); i++ {
+		e := leaves.Get(i)
+		if !e.Not && e.Field != "" && e.Field != orderField && len(e.Operands) == 0 && isScalarRangeEqOp(e.Op) {
+			continue
+		}
+		leafSel, leafWork, leafOrderRange, leafHasPrefix, ok := qv.estimateLeafOrderCost(e, snap, universe, orderField, orderHasBuckets)
+		if !ok {
+			return plannerOrderedProfile{}, false
+		}
+
+		if leafSel <= 0 {
+			return plannerOrderedProfile{
+				selectivity:      0,
+				coverage:         coverage,
+				activeChecks:     0,
+				hasNeg:           hasNeg || e.Not,
+				hasPrefix:        hasPrefix || leafHasPrefix,
+				fallbackWorkRows: fallbackWork + leafWork,
+				orderRangeLeaves: orderRangeLeaves + btoi(leafOrderRange),
+				baseWorkRows:     baseWork,
+				baseRangeLeaves:  baseRangeLeaves,
+			}, true
+		}
+
+		selProd *= leafSel
+		if leafSel < selMin {
+			selMin = leafSel
+		}
+
+		fallbackWork += leafWork
+		if e.Not {
+			hasNeg = true
+		}
+		if leafHasPrefix {
+			hasPrefix = true
+		}
+		if leafOrderRange {
+			orderRangeLeaves++
+		}
+
+		if e.Op == qx.OpNOOP && !e.Not {
+			continue
+		}
+		if coveredBuf.Get(i) {
+			continue
+		}
+		activeChecks++
+		baseWork += leafWork
+		if isBoundOp(e.Op) && e.Field != orderField {
+			baseRangeLeaves++
+		}
+	}
+
+	for _, merged := range mergedBaseRanges {
+		fieldStats := qv.plannerFieldStats(merged.field, snap, universe)
+		leafSel, leafWork, ok := qv.estimateMergedScalarRangeOrderCost(merged.field, merged.bounds, universe, fieldStats)
+		if !ok {
+			return plannerOrderedProfile{}, false
+		}
+		if leafSel <= 0 {
+			return plannerOrderedProfile{
+				selectivity:      0,
+				coverage:         coverage,
+				activeChecks:     0,
+				hasNeg:           hasNeg,
+				hasPrefix:        hasPrefix,
+				fallbackWorkRows: fallbackWork + leafWork,
+				orderRangeLeaves: orderRangeLeaves,
+				baseWorkRows:     baseWork,
+				baseRangeLeaves:  baseRangeLeaves,
+			}, true
+		}
+		selProd *= leafSel
+		if leafSel < selMin {
+			selMin = leafSel
+		}
+		fallbackWork += leafWork
+		activeChecks++
+		baseWork += leafWork
+		baseRangeLeaves++
+	}
+
+	selectivity := selProd
+	if selectivity > selMin {
+		selectivity = selMin
+	}
+
+	minSel := selMin * 0.06
+	universeFloor := 1.0 / float64(universe)
+	if minSel < universeFloor {
+		minSel = universeFloor
+	}
+	if selectivity < minSel {
+		selectivity = minSel
+	}
+	if selectivity > 1 {
+		selectivity = 1
+	}
+
+	return plannerOrderedProfile{
+		selectivity:      selectivity,
+		coverage:         coverage,
+		activeChecks:     activeChecks,
+		hasNeg:           hasNeg,
+		hasPrefix:        hasPrefix,
+		fallbackWorkRows: fallbackWork,
+		orderRangeLeaves: orderRangeLeaves,
+		baseWorkRows:     baseWork,
+		baseRangeLeaves:  baseRangeLeaves,
+	}, true
+}
+
+func (qv *queryView[K, V]) extractOrderRangeCoverageLeaves(orderField string, leaves []qx.Expr, orderSlice []index) (int, int, *pooled.SliceBuf[bool], bool) {
 	rb := rangeBounds{}
-	coveredBuf := getBoolSliceBuf(len(leaves))
-	covered := coveredBuf.values[:len(leaves)]
+	coveredBuf := boolSlicePool.Get()
+	coveredBuf.SetLen(len(leaves))
 
 	has := false
 	for i := range leaves {
@@ -1682,26 +2195,54 @@ func (qv *queryView[K, V]) extractOrderRangeCoverageLeaves(orderField string, le
 			continue
 		}
 		if applied, ok := qv.applyScalarExprToRangeBounds(e, &rb); !ok {
-			releaseBoolSliceBuf(coveredBuf)
-			return 0, 0, nil, nil, false
+			boolSlicePool.Put(coveredBuf)
+			return 0, 0, nil, false
 		} else if applied {
-			covered[i] = true
+			coveredBuf.Set(i, true)
 			has = true
 		}
 	}
 
 	if !has {
-		return 0, len(orderSlice), coveredBuf, covered, true
+		return 0, len(orderSlice), coveredBuf, true
 	}
 
 	st, en := applyBoundsToIndexRange(orderSlice, rb)
-	return st, en, coveredBuf, covered, true
+	return st, en, coveredBuf, true
 }
 
-func (qv *queryView[K, V]) extractOrderRangeCoverageLeavesOverlay(orderField string, leaves []qx.Expr, ov fieldOverlay) (int, int, *boolSliceBuf, []bool, bool) {
+func (qv *queryView[K, V]) extractOrderRangeCoverageLeavesBuf(orderField string, leaves *pooled.SliceBuf[qx.Expr], orderSlice []index) (int, int, *pooled.SliceBuf[bool], bool) {
 	rb := rangeBounds{}
-	coveredBuf := getBoolSliceBuf(len(leaves))
-	covered := coveredBuf.values[:len(leaves)]
+	coveredBuf := boolSlicePool.Get()
+	coveredBuf.SetLen(leaves.Len())
+
+	has := false
+	for i := 0; i < leaves.Len(); i++ {
+		e := leaves.Get(i)
+		if e.Not || e.Field != orderField {
+			continue
+		}
+		if applied, ok := qv.applyScalarExprToRangeBounds(e, &rb); !ok {
+			boolSlicePool.Put(coveredBuf)
+			return 0, 0, nil, false
+		} else if applied {
+			coveredBuf.Set(i, true)
+			has = true
+		}
+	}
+
+	if !has {
+		return 0, len(orderSlice), coveredBuf, true
+	}
+
+	st, en := applyBoundsToIndexRange(orderSlice, rb)
+	return st, en, coveredBuf, true
+}
+
+func (qv *queryView[K, V]) extractOrderRangeCoverageLeavesOverlay(orderField string, leaves []qx.Expr, ov fieldOverlay) (int, int, *pooled.SliceBuf[bool], bool) {
+	rb := rangeBounds{}
+	coveredBuf := boolSlicePool.Get()
+	coveredBuf.SetLen(len(leaves))
 
 	has := false
 	for i := range leaves {
@@ -1710,21 +2251,21 @@ func (qv *queryView[K, V]) extractOrderRangeCoverageLeavesOverlay(orderField str
 			continue
 		}
 		if applied, ok := qv.applyScalarExprToRangeBounds(e, &rb); !ok {
-			releaseBoolSliceBuf(coveredBuf)
-			return 0, 0, nil, nil, false
+			boolSlicePool.Put(coveredBuf)
+			return 0, 0, nil, false
 		} else if applied {
-			covered[i] = true
+			coveredBuf.Set(i, true)
 			has = true
 		}
 	}
 
 	total := overlayApproxDistinctTotalCount(ov)
 	if total == 0 {
-		return 0, 0, coveredBuf, covered, true
+		return 0, 0, coveredBuf, true
 	}
 
 	if !has {
-		return total, total, coveredBuf, covered, true
+		return total, total, coveredBuf, true
 	}
 
 	br := ov.rangeForBounds(rb)
@@ -1735,7 +2276,47 @@ func (qv *queryView[K, V]) extractOrderRangeCoverageLeavesOverlay(orderField str
 	if in > total {
 		in = total
 	}
-	return in, total, coveredBuf, covered, true
+	return in, total, coveredBuf, true
+}
+
+func (qv *queryView[K, V]) extractOrderRangeCoverageLeavesOverlayBuf(orderField string, leaves *pooled.SliceBuf[qx.Expr], ov fieldOverlay) (int, int, *pooled.SliceBuf[bool], bool) {
+	rb := rangeBounds{}
+	coveredBuf := boolSlicePool.Get()
+	coveredBuf.SetLen(leaves.Len())
+
+	has := false
+	for i := 0; i < leaves.Len(); i++ {
+		e := leaves.Get(i)
+		if e.Not || e.Field != orderField {
+			continue
+		}
+		if applied, ok := qv.applyScalarExprToRangeBounds(e, &rb); !ok {
+			boolSlicePool.Put(coveredBuf)
+			return 0, 0, nil, false
+		} else if applied {
+			coveredBuf.Set(i, true)
+			has = true
+		}
+	}
+
+	total := overlayApproxDistinctTotalCount(ov)
+	if total == 0 {
+		return 0, 0, coveredBuf, true
+	}
+
+	if !has {
+		return total, total, coveredBuf, true
+	}
+
+	br := ov.rangeForBounds(rb)
+	in := overlayApproxDistinctRangeCount(ov, br)
+	if in < 0 {
+		in = 0
+	}
+	if in > total {
+		in = total
+	}
+	return in, total, coveredBuf, true
 }
 
 func overlayApproxDistinctTotalCount(ov fieldOverlay) int {
@@ -1887,11 +2468,17 @@ func (qv *queryView[K, V]) estimateEqSelectivity(field string, value any, univer
 }
 
 func (qv *queryView[K, V]) estimateInLikeSelectivity(field string, value any, universe uint64, intersect bool) (float64, int, bool) {
-	vals, isSlice, hasNil, err := qv.exprValueToDistinctIdxOwned(qx.Expr{Op: qx.OpIN, Field: field, Value: value})
-	if err != nil || !isSlice || (len(vals) == 0 && !hasNil) {
+	valsBuf, isSlice, hasNil, err := qv.exprValueToDistinctIdxBuf(qx.Expr{Op: qx.OpIN, Field: field, Value: value})
+	if valsBuf != nil {
+		defer stringSlicePool.Put(valsBuf)
+	}
+	valueCount := 0
+	if valsBuf != nil {
+		valueCount = valsBuf.Len()
+	}
+	if err != nil || !isSlice || (valueCount == 0 && !hasNil) {
 		return 0, 0, false
 	}
-	valueCount := len(vals)
 
 	sum := uint64(0)
 	minCard := uint64(0)
@@ -1903,8 +2490,8 @@ func (qv *queryView[K, V]) estimateInLikeSelectivity(field string, value any, un
 		}
 	}
 
-	for _, key := range vals {
-		card := ov.lookupCardinality(key)
+	for i := 0; i < valueCount; i++ {
+		card := ov.lookupCardinality(valsBuf.Get(i))
 		sum += card
 		if minCard == 0 || card < minCard {
 			minCard = card

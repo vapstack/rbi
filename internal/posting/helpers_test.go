@@ -49,7 +49,7 @@ func bitmap32ToSlice(rb *bitmap32) []uint32 {
 		return nil
 	}
 	it := rb.iterator()
-	defer releaseIterator(it)
+	defer it.release()
 
 	out := make([]uint32, 0, rb.cardinality())
 	for it.hasNext() {
@@ -221,39 +221,55 @@ func encodeLargePayload(keys []uint32, payloads [][]byte) []byte {
 	return append(payload, body...)
 }
 
-func releaseContainerPair(base, result container16) {
+func cleanupContainerPair(base, result container16) {
 	if result == nil {
-		releaseContainer(base)
+		base.release()
 		return
 	}
 	if result != base {
-		releaseContainer(base)
+		base.release()
 	}
-	releaseContainer(result)
+	result.release()
 }
 
 func buildBitmap32(ids ...uint32) *bitmap32 {
-	rb := newBitmap()
+	rb := bitmapPool.Get()
 	rb.addMany(canonicalUint32s(ids))
 	return rb
 }
 
+func releaseContainerIndexForTest(ci *containerIndex) {
+	if ci == nil {
+		return
+	}
+	ci.releaseContainersInRange(0)
+	ci.releaseBacking()
+}
+
+func releaseLargeArrayForTest(la *largeArray) {
+	if la == nil {
+		return
+	}
+	la.releaseContainersInRange(0)
+	la.releaseBacking()
+}
+
 func buildContainerArray(ids []uint16) container16 {
-	return newContainerArrayFromSlice(canonicalUint16s(ids))
+	return getContainerArrayFromSlice(canonicalUint16s(ids))
 }
 
 func buildContainerBitmap(ids []uint16) container16 {
 	bc := newContainerBitmap()
-	ac := newContainerArrayFromSlice(canonicalUint16s(ids))
+	ac := getContainerArrayFromSlice(canonicalUint16s(ids))
 	bc.loadData(ac)
-	releaseContainerArray(ac)
+	ac.Release()
 	return bc
 }
 
 func buildContainerRun(ids []uint16) container16 {
-	ac := newContainerArrayFromSlice(canonicalUint16s(ids))
+	ac := getContainerArrayFromSlice(canonicalUint16s(ids))
 	rc := newContainerRunFromArray(ac)
-	releaseContainerArray(ac)
+	ac.Release()
 	return rc
 }
 

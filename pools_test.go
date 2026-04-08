@@ -178,62 +178,88 @@ func TestPostingUnionIterPool_ReusedIteratorDoesNotLeakSeenState(t *testing.T) {
 }
 
 func TestCountLeadResidualExactFilterSliceBufReleaseClearsFullCapacity(t *testing.T) {
-	buf := getCountLeadResidualExactFilterSliceBuf(2)
-	used := append(buf.values[:0],
-		countLeadResidualExactFilter{idx: 1, ids: poolsSmall(3, 7, 11)},
-		countLeadResidualExactFilter{idx: 2, ids: poolsSmall(5, 9, 13)},
-	)
+	buf := countLeadResidualExactFilterSlicePool.Get()
+	buf.Append(countLeadResidualExactFilter{idx: 1, ids: poolsSmall(3, 7, 11)})
+	buf.Append(countLeadResidualExactFilter{idx: 2, ids: poolsSmall(5, 9, 13)})
+	countLeadResidualExactFilterSlicePool.Put(buf)
 
-	releaseCountLeadResidualExactFilters(used)
-	releaseCountLeadResidualExactFilterSliceBuf(buf)
-
-	raw := buf.values[:cap(buf.values)]
-	if len(raw) < 2 {
-		t.Fatalf("unexpected pooled capacity: got=%d", len(raw))
+	buf = countLeadResidualExactFilterSlicePool.Get()
+	defer countLeadResidualExactFilterSlicePool.Put(buf)
+	if buf.Cap() < 2 {
+		t.Fatalf("unexpected pooled capacity: got=%d", buf.Cap())
 	}
+	buf.SetLen(2)
 	for i := 0; i < 2; i++ {
-		if raw[i].idx != 0 || !raw[i].ids.IsEmpty() {
-			t.Fatalf("pooled extraExact buffer retained stale entry at %d: %+v", i, raw[i])
+		entry := buf.Get(i)
+		if entry.idx != 0 || !entry.ids.IsEmpty() {
+			t.Fatalf("pooled extraExact buffer retained stale entry at %d: %+v", i, entry)
 		}
 	}
 }
 
-func TestLeafPredSliceBufReleaseClearsFullCapacity(t *testing.T) {
-	buf := getLeafPredSliceBuf(2)
-	stale := append(buf.values[:0],
-		leafPred{
-			kind:          leafPredKindPostsUnion,
-			posts:         []posting.List{poolsSmall(1, 2)},
-			postingFilter: func(ids posting.List) (posting.List, bool) { return ids, true },
-			postsBuf:      &postingSliceBuf{},
-			postsAnyState: &postsAnyFilterState{},
-		},
-		leafPred{
-			kind:          leafPredKindPostsAll,
-			posting:       poolsSingleton(3),
-			posts:         []posting.List{poolsSmall(3)},
-			estCard:       1,
-			postingFilter: func(ids posting.List) (posting.List, bool) { return ids, true },
-			postsBuf:      &postingSliceBuf{},
-			postsAnyState: &postsAnyFilterState{},
-		},
-	)
-	buf.values = stale[:0]
+func TestCountORBranchSliceBufReleaseClearsFullCapacity(t *testing.T) {
+	preds := newPredicateSet(1)
+	preds.Append(predicate{
+		kind:     predicateKindPostsAny,
+		postsBuf: postingSlicePool.Get(),
+	})
+	var checks [countPredicateScanMaxLeaves]int
+	checks[0] = 7
 
-	releaseLeafPredSliceBuf(buf)
+	buf := countORBranchSlicePool.Get()
+	buf.Append(newCountORBranch(3, preds, 1, checks[:1], 42))
+	countORBranchSlicePool.Put(buf)
 
-	raw := buf.values[:cap(buf.values)]
-	if len(raw) < 2 {
-		t.Fatalf("unexpected pooled capacity: got=%d", len(raw))
+	buf = countORBranchSlicePool.Get()
+	defer countORBranchSlicePool.Put(buf)
+	if buf.Cap() < 1 {
+		t.Fatalf("unexpected pooled capacity: got=%d", buf.Cap())
 	}
+	buf.SetLen(1)
+	entry := buf.Get(0)
+	if entry.index != 0 ||
+		entry.preds.Len() != 0 ||
+		entry.preds.owner != nil ||
+		entry.lead != 0 ||
+		entry.checksLen != 0 ||
+		entry.checks[0] != 0 ||
+		entry.est != 0 {
+		t.Fatalf("pooled countORBranch buffer retained stale entry: %+v", entry)
+	}
+}
+
+func TestLeafPredSliceBufReleaseClearsFullCapacity(t *testing.T) {
+	buf := leafPredSlicePool.Get()
+	buf.Append(leafPred{
+		kind:          leafPredKindPostsUnion,
+		postingFilter: func(ids posting.List) (posting.List, bool) { return ids, true },
+		postsBuf:      postingSlicePool.Get(),
+		postsAnyState: postsAnyFilterStatePool.Get(),
+	})
+	buf.Append(leafPred{
+		kind:          leafPredKindPostsAll,
+		posting:       poolsSingleton(3),
+		estCard:       1,
+		postingFilter: func(ids posting.List) (posting.List, bool) { return ids, true },
+		postsBuf:      postingSlicePool.Get(),
+		postsAnyState: postsAnyFilterStatePool.Get(),
+	})
+	leafPredSlicePool.Put(buf)
+
+	buf = leafPredSlicePool.Get()
+	defer leafPredSlicePool.Put(buf)
+	if buf.Cap() < 2 {
+		t.Fatalf("unexpected pooled capacity: got=%d", buf.Cap())
+	}
+	buf.SetLen(2)
 	for i := 0; i < 2; i++ {
-		if raw[i].kind != leafPredKindEmpty ||
-			!raw[i].posting.IsEmpty() ||
-			len(raw[i].posts) != 0 ||
-			raw[i].estCard != 0 ||
-			raw[i].postingFilter != nil ||
-			raw[i].postsBuf != nil ||
-			raw[i].postsAnyState != nil {
+		entry := buf.Get(i)
+		if entry.kind != leafPredKindEmpty ||
+			!entry.posting.IsEmpty() ||
+			entry.estCard != 0 ||
+			entry.postingFilter != nil ||
+			entry.postsBuf != nil ||
+			entry.postsAnyState != nil {
 			t.Fatalf("pooled leafPred buffer retained stale entry at %d", i)
 		}
 	}
@@ -323,11 +349,11 @@ func TestBuildIndexFieldLocalStateFlushAllIntoMergesLenSource(t *testing.T) {
 }
 
 func TestBuildIndexFieldStateMaterializeStorageMergesRunSource(t *testing.T) {
-	left := getPostingMap()
+	left := postingMapPool.Get()
 	left["name"] = left["name"].BuildAdded(777)
 	runLeft := buildIndexStringRunFromPostingMap(left)
 
-	right := getPostingMap()
+	right := postingMapPool.Get()
 	for i := 1; i <= posting.MidCap+1; i++ {
 		right["name"] = right["name"].BuildAdded(uint64(i))
 	}
@@ -346,7 +372,7 @@ func TestBuildIndexFieldStateMaterializeStorageMergesRunSource(t *testing.T) {
 }
 
 func TestBuildIndexFieldStateReleaseClearsRuns(t *testing.T) {
-	m := getPostingMap()
+	m := postingMapPool.Get()
 	for i := 1; i <= posting.MidCap+1; i++ {
 		m["name"] = m["name"].BuildAdded(uint64(i))
 	}

@@ -2,7 +2,6 @@ package rbi
 
 import (
 	"fmt"
-	"io"
 	"math/rand/v2"
 	"os"
 	"path/filepath"
@@ -27,6 +26,8 @@ var (
 	plannerExtTags      = []string{"go", "db", "java", "rust", "ops"}
 	plannerExtPrefixes  = []string{"FN-", "FN-0", "FN-1", "FN-2", "FN-3", "FN-7", "FN-9", "FN-10", "FN-99"}
 )
+
+const plannerExtPropertyCases = 128
 
 func plannerExtSeedPath(t *testing.T) string {
 	t.Helper()
@@ -63,28 +64,7 @@ func plannerExtSeedPath(t *testing.T) string {
 func plannerExtCopyDB(t *testing.T, src string) string {
 	t.Helper()
 
-	dst := filepath.Join(t.TempDir(), "planner_ext.db")
-
-	in, err := os.Open(src)
-	if err != nil {
-		t.Fatalf("open seeded db: %v", err)
-	}
-	defer func() { _ = in.Close() }()
-
-	out, err := os.Create(dst)
-	if err != nil {
-		t.Fatalf("create copied db: %v", err)
-	}
-	defer func() { _ = out.Close() }()
-
-	if _, err = io.Copy(out, in); err != nil {
-		t.Fatalf("copy seeded db: %v", err)
-	}
-	if err = out.Sync(); err != nil {
-		t.Fatalf("sync copied db: %v", err)
-	}
-
-	return dst
+	return copySeededDBWithSidecars(t, src, "planner_ext.db")
 }
 
 func plannerExtOpenSeededDB(t *testing.T, opts Options) *DB[uint64, Rec] {
@@ -1101,7 +1081,7 @@ func TestPlannerExt_Bug_ExecPlanORNoOrderAdaptive_PanicsOnAlwaysTrueBranch(t *te
 	if len(branches) != 3 {
 		t.Fatalf("unexpected branch count: got=%d want=3", len(branches))
 	}
-	if !branches[2].alwaysTrue || branches[2].lead != nil {
+	if !branches[2].alwaysTrue || branches[2].hasLead() || branches[2].leadPtr() != nil {
 		t.Fatalf("expected broad prefix branch to collapse to alwaysTrue without lead: branch=%+v", branches[2])
 	}
 
@@ -1139,7 +1119,7 @@ func TestPlannerExt_Bug_ExecPlanORNoOrderBaseline_PanicsOnAlwaysTrueBranch(t *te
 	if len(branches) != 3 {
 		t.Fatalf("unexpected branch count: got=%d want=3", len(branches))
 	}
-	if !branches[2].alwaysTrue || branches[2].lead != nil {
+	if !branches[2].alwaysTrue || branches[2].hasLead() || branches[2].leadPtr() != nil {
 		t.Fatalf("expected broad prefix branch to collapse to alwaysTrue without lead: branch=%+v", branches[2])
 	}
 
@@ -1164,7 +1144,7 @@ func TestPlannerExt_Property_OrderedORInternalPlansMatchSeqScan(t *testing.T) {
 		sawKWay     int
 	)
 
-	for i := 0; i < 200; i++ {
+	for i := 0; i < plannerExtPropertyCases; i++ {
 		q := plannerExtRandomORQuery(t, r, true, true, true)
 
 		want, err := expectedKeysUint64(t, db, q)
@@ -1263,7 +1243,7 @@ func TestPlannerExt_Property_NoOrderORInternalPlansPreserveWindow(t *testing.T) 
 		skippedBase int
 	)
 
-	for i := 0; i < 200; i++ {
+	for i := 0; i < plannerExtPropertyCases; i++ {
 		q := plannerExtRandomORQuery(t, r, false, false, false)
 		fullQ := cloneQuery(q)
 		fullQ.Offset = 0
@@ -1298,7 +1278,7 @@ func TestPlannerExt_Property_NoOrderORInternalPlansPreserveWindow(t *testing.T) 
 		}
 		skipAdaptive := false
 		for bi := range branchesAdaptive {
-			if branchesAdaptive[bi].lead == nil {
+			if branchesAdaptive[bi].leadPtr() == nil {
 				skipAdaptive = true
 				skippedLead++
 				break
@@ -1330,7 +1310,7 @@ func TestPlannerExt_Property_NoOrderORInternalPlansPreserveWindow(t *testing.T) 
 		}
 		skipBaseline := false
 		for bi := range branchesBaseline {
-			if branchesBaseline[bi].lead == nil {
+			if branchesBaseline[bi].leadPtr() == nil {
 				skipBaseline = true
 				skippedBase++
 				break
@@ -1419,17 +1399,18 @@ func TestPlannerExt_NextAnalyzeDelayCapsBackoffAtEightX(t *testing.T) {
 }
 
 func TestPlannerExt_PlannerORNoOrderInsertTopNStaysSortedAndCapped(t *testing.T) {
-	var top []uint64
+	top := uint64SlicePool.Get()
+	defer uint64SlicePool.Put(top)
 	for _, id := range []uint64{5, 2, 4, 1, 3} {
-		top = plannerORNoOrderInsertTopN(top, id, 3)
+		plannerORNoOrderInsertTopN(top, id, 3)
 	}
 	want := []uint64{1, 2, 3}
-	if len(top) != len(want) {
-		t.Fatalf("unexpected len(top): got=%d want=%d", len(top), len(want))
+	if top.Len() != len(want) {
+		t.Fatalf("unexpected len(top): got=%d want=%d", top.Len(), len(want))
 	}
 	for i := range want {
-		if top[i] != want[i] {
-			t.Fatalf("unexpected top[%d]: got=%d want=%d full=%v", i, top[i], want[i], top)
+		if top.Get(i) != want[i] {
+			t.Fatalf("unexpected top[%d]: got=%d want=%d", i, top.Get(i), want[i])
 		}
 	}
 }
@@ -1492,24 +1473,23 @@ func TestPlannerExt_BuildORBranches_KeepsNegativeOnlyBranchWithoutLead(t *testin
 	if branches[0].alwaysTrue {
 		t.Fatalf("negative-only branch must not collapse to alwaysTrue")
 	}
-	if branches[0].lead != nil || branches[0].leadIdx != -1 {
-		t.Fatalf("negative-only branch must not synthesize lead iterator: lead=%v leadIdx=%d", branches[0].lead, branches[0].leadIdx)
+	if branches[0].hasLead() || branches[0].leadPtr() != nil || branches[0].leadIdx != -1 {
+		t.Fatalf("negative-only branch must not synthesize lead iterator: lead=%v leadIdx=%d", branches[0].leadPtr(), branches[0].leadIdx)
 	}
-	if branches[1].lead == nil {
+	if branches[1].leadPtr() == nil {
 		t.Fatalf("positive branch must retain lead iterator")
 	}
 
-	checkBuf := getIntSliceBuf(len(branches[0].preds))
-	checks := branches[0].buildMatchChecks(checkBuf.values)
-	defer func() {
-		checkBuf.values = checks
-		releaseIntSliceBuf(checkBuf)
-	}()
+	if branches[0].predLen() > plannerPredicateFastPathMaxLeaves {
+		t.Fatalf("unexpected predicate count: got=%d max=%d", branches[0].predLen(), plannerPredicateFastPathMaxLeaves)
+	}
+	var checksInline [plannerPredicateFastPathMaxLeaves]int
+	checks := branches[0].buildMatchChecks(checksInline[:0])
 	if len(checks) == 0 {
 		t.Fatalf("negative-only branch must still emit residual checks")
 	}
 	for _, idx := range checks {
-		if !branches[0].preds[idx].hasContains() {
+		if !branches[0].predPtr(idx).hasContains() {
 			t.Fatalf("negative-only branch check %d must stay matchable", idx)
 		}
 	}

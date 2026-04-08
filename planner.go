@@ -4,6 +4,7 @@ import (
 	"math"
 
 	"github.com/vapstack/qx"
+	"github.com/vapstack/rbi/internal/pooled"
 	"github.com/vapstack/rbi/internal/posting"
 )
 
@@ -79,131 +80,139 @@ const (
 type plannerORBranch struct {
 	expr qx.Expr
 
-	preds               []predicate
-	predsBuf            *predicateSliceBuf
+	preds               predicateSet
 	alwaysTrue          bool
 	estCard             uint64
 	estKnown            bool
 	coveredRangeBounded bool
 	coveredRangeStart   int
 	coveredRangeEnd     int
-	lead                *predicate
 	leadIdx             int
 }
 
 type plannerORBranches []plannerORBranch
 
-func plannerORSortPredicates(preds []predicate) {
-	if len(preds) <= 1 {
-		return
+func plannerORPredicateLess(a, b predicate) bool {
+	if a.alwaysFalse != b.alwaysFalse {
+		return a.alwaysFalse
 	}
+	// Unknown cardinality does not help selectivity ordering.
+	ca := a.estCard
+	cb := b.estCard
+	if ca == 0 {
+		ca = math.MaxUint64
+	}
+	if cb == 0 {
+		cb = math.MaxUint64
+	}
+	if ca != cb {
+		return ca < cb
+	}
+	return false
+}
 
-	less := func(a, b predicate) bool {
-		if a.alwaysFalse != b.alwaysFalse {
-			return a.alwaysFalse
-		}
-		// Unknown cardinality does not help selectivity ordering.
-		ca := a.estCard
-		cb := b.estCard
-		if ca == 0 {
-			ca = math.MaxUint64
-		}
-		if cb == 0 {
-			cb = math.MaxUint64
-		}
-		if ca != cb {
-			return ca < cb
-		}
-		return false
+func plannerORSortPredicates(preds *predicateSet) {
+	if preds == nil || preds.Len() <= 1 {
+		return
 	}
 
 	// Predicate lists are tiny in practice; insertion sort avoids allocations
 	// and keeps hot-path overhead minimal.
-	for i := 1; i < len(preds); i++ {
-		cur := preds[i]
+	for i := 1; i < preds.Len(); i++ {
+		cur := preds.Get(i)
 		j := i
-		for j > 0 && less(cur, preds[j-1]) {
-			preds[j] = preds[j-1]
+		for j > 0 && plannerORPredicateLess(cur, preds.Get(j-1)) {
+			preds.Set(j, preds.Get(j-1))
 			j--
 		}
-		preds[j] = cur
+		preds.Set(j, cur)
 	}
 }
 
-func (qv *queryView[K, V]) buildORBranchesWithBuilder(
-	ops []qx.Expr,
-	build func([]qx.Expr) ([]predicate, *predicateSliceBuf, bool),
-) (plannerORBranches, bool, bool) {
-	out := make(plannerORBranches, 0, len(ops))
-	leavesBuf := getExprSliceBuf(8)
-	defer releaseExprSliceBuf(leavesBuf)
+func buildPlannerORBranch(op qx.Expr, preds predicateSet) (plannerORBranch, bool, bool) {
+	plannerORSortPredicates(&preds)
 
-	for _, op := range ops {
-		leaves, ok := collectAndLeavesScratch(op, leavesBuf.values[:0])
-		if !ok {
-			releaseORBranches(out)
-			return nil, false, false
+	branch := newPlannerORBranch(op, preds)
+
+	hasFalse := false
+	allTrue := true
+	leadIdx := -1
+
+	for i := 0; i < preds.Len(); i++ {
+		p := preds.GetPtr(i)
+		if p.alwaysFalse {
+			hasFalse = true
+			break
 		}
-
-		preds, predsBuf, ok := build(leaves)
-		if !ok {
-			releaseORBranches(out)
-			return nil, false, false
-		}
-		plannerORSortPredicates(preds)
-
-		branch := plannerORBranch{
-			expr:     op,
-			preds:    preds,
-			predsBuf: predsBuf,
-		}
-
-		hasFalse := false
-		allTrue := true
-		leadIdx := -1
-
-		for i := range preds {
-			p := &preds[i]
-			if p.alwaysFalse {
-				hasFalse = true
-				break
-			}
-			if p.alwaysTrue || p.covered {
-				continue
-			}
-			allTrue = false
-			if !p.hasContains() {
-				releasePredicates(preds, predsBuf)
-				releaseORBranches(out)
-				return nil, false, false
-			}
-			if p.hasIter() {
-				if leadIdx == -1 || p.estCard < preds[leadIdx].estCard {
-					leadIdx = i
-				}
-			}
-		}
-
-		if hasFalse {
-			releasePredicates(preds, predsBuf)
+		if p.alwaysTrue || p.covered {
 			continue
 		}
-		if allTrue {
-			branch.alwaysTrue = true
-		} else {
-			branch.leadIdx = leadIdx
-			if leadIdx >= 0 {
-				branch.lead = &preds[leadIdx]
+		allTrue = false
+		if !p.hasContains() {
+			preds.Release()
+			return plannerORBranch{}, false, false
+		}
+		if p.hasIter() {
+			if leadIdx == -1 || p.estCard < preds.Get(leadIdx).estCard {
+				leadIdx = i
 			}
 		}
-		out = append(out, branch)
 	}
 
-	if len(out) == 0 {
-		return nil, true, true
+	if hasFalse {
+		preds.Release()
+		return plannerORBranch{}, false, true
+	}
+	if allTrue {
+		branch.alwaysTrue = true
+	} else {
+		branch.leadIdx = leadIdx
 	}
 
-	return out, false, true
+	return branch, true, true
+}
+
+func newPlannerORBranch(op qx.Expr, preds predicateSet) plannerORBranch {
+	br := plannerORBranch{
+		expr:    op,
+		preds:   preds,
+		leadIdx: -1,
+	}
+	return br
+}
+
+func (b plannerORBranch) predLen() int {
+	return b.preds.Len()
+}
+
+func (b plannerORBranch) pred(i int) predicate {
+	return b.preds.Get(i)
+}
+
+func (b *plannerORBranch) predPtr(i int) *predicate {
+	if b == nil {
+		return nil
+	}
+	return b.preds.GetPtr(i)
+}
+
+func (b plannerORBranch) hasLead() bool {
+	return b.leadIdx >= 0 && b.leadIdx < b.predLen()
+}
+
+func (b plannerORBranch) leadPred() predicate {
+	return b.pred(b.leadIdx)
+}
+
+func (b *plannerORBranch) leadPtr() *predicate {
+	if b == nil || !b.hasLead() {
+		return nil
+	}
+	return b.predPtr(b.leadIdx)
+}
+
+func releasePlannerORBranchPredicates(br plannerORBranch) {
+	br.preds.Release()
 }
 
 func (b *plannerORBranch) buildMatchChecks(dst []int) []int {
@@ -211,15 +220,30 @@ func (b *plannerORBranch) buildMatchChecks(dst []int) []int {
 	if b.alwaysTrue {
 		return dst
 	}
-	for i := range b.preds {
-		p := b.preds[i]
+	for i := 0; i < b.predLen(); i++ {
+		p := b.pred(i)
 		if p.covered || p.alwaysTrue {
 			continue
 		}
 		dst = append(dst, i)
 	}
-	sortActivePredicates(dst, b.preds)
+	sortActivePredicatesReader(dst, b.preds)
 	return dst
+}
+
+func (b *plannerORBranch) buildMatchChecksBuf(dst *pooled.SliceBuf[int]) {
+	dst.Truncate()
+	if b.alwaysTrue {
+		return
+	}
+	for i := 0; i < b.predLen(); i++ {
+		p := b.pred(i)
+		if p.covered || p.alwaysTrue {
+			continue
+		}
+		dst.Append(i)
+	}
+	sortActivePredicatesBufReader(dst, b.preds)
 }
 
 func (b *plannerORBranch) buildPostingFilterChecks(dst []int, checks []int) []int {
@@ -228,11 +252,64 @@ func (b *plannerORBranch) buildPostingFilterChecks(dst []int, checks []int) []in
 		return dst
 	}
 	for _, i := range checks {
-		if b.preds[i].supportsExactBucketPostingFilter() {
+		if b.pred(i).supportsExactBucketPostingFilter() {
 			dst = append(dst, i)
 		}
 	}
 	return dst
+}
+
+func (b *plannerORBranch) matchesChecksBuf(idx uint64, checks *pooled.SliceBuf[int]) bool {
+	if b.alwaysTrue {
+		return true
+	}
+	switch checks.Len() {
+	case 0:
+		return true
+	case 1:
+		p0 := b.predPtr(checks.Get(0))
+		return !p0.alwaysFalse && p0.hasContains() && p0.matches(idx)
+	case 2:
+		p0 := b.predPtr(checks.Get(0))
+		if p0.alwaysFalse || !p0.hasContains() || !p0.matches(idx) {
+			return false
+		}
+		p1 := b.predPtr(checks.Get(1))
+		return !p1.alwaysFalse && p1.hasContains() && p1.matches(idx)
+	case 3:
+		p0 := b.predPtr(checks.Get(0))
+		if p0.alwaysFalse || !p0.hasContains() || !p0.matches(idx) {
+			return false
+		}
+		p1 := b.predPtr(checks.Get(1))
+		if p1.alwaysFalse || !p1.hasContains() || !p1.matches(idx) {
+			return false
+		}
+		p2 := b.predPtr(checks.Get(2))
+		return !p2.alwaysFalse && p2.hasContains() && p2.matches(idx)
+	case 4:
+		p0 := b.predPtr(checks.Get(0))
+		if p0.alwaysFalse || !p0.hasContains() || !p0.matches(idx) {
+			return false
+		}
+		p1 := b.predPtr(checks.Get(1))
+		if p1.alwaysFalse || !p1.hasContains() || !p1.matches(idx) {
+			return false
+		}
+		p2 := b.predPtr(checks.Get(2))
+		if p2.alwaysFalse || !p2.hasContains() || !p2.matches(idx) {
+			return false
+		}
+		p3 := b.predPtr(checks.Get(3))
+		return !p3.alwaysFalse && p3.hasContains() && p3.matches(idx)
+	}
+	for i := 0; i < checks.Len(); i++ {
+		p := b.predPtr(checks.Get(i))
+		if p.alwaysFalse || !p.hasContains() || !p.matches(idx) {
+			return false
+		}
+	}
+	return true
 }
 
 func plannerResidualChecks(dst []int, checks []int, exactChecks []int) []int {
@@ -254,6 +331,84 @@ func plannerResidualChecks(dst []int, checks []int, exactChecks []int) []int {
 	return dst
 }
 
+func plannerResidualChecksBuf(dst, checks, exactChecks *pooled.SliceBuf[int]) {
+	dst.Truncate()
+	if checks.Len() == 0 {
+		return
+	}
+	if exactChecks.Len() == 0 {
+		for i := 0; i < checks.Len(); i++ {
+			dst.Append(checks.Get(i))
+		}
+		return
+	}
+	ei := 0
+	for i := 0; i < checks.Len(); i++ {
+		check := checks.Get(i)
+		if ei < exactChecks.Len() && exactChecks.Get(ei) == check {
+			ei++
+			continue
+		}
+		dst.Append(check)
+	}
+}
+
+func plannerORBranchCheckCounts(branch plannerORBranch, covered *pooled.SliceBuf[bool]) (int, int) {
+	if branch.predLen() <= plannerPredicateFastPathMaxLeaves {
+		var checksInline [plannerPredicateFastPathMaxLeaves]int
+		checks := checksInline[:0]
+		if covered == nil {
+			checks = branch.buildMatchChecks(checks)
+		} else {
+			for pi := 0; pi < branch.predLen(); pi++ {
+				p := branch.pred(pi)
+				if p.alwaysTrue || p.alwaysFalse || !p.hasContains() {
+					continue
+				}
+				if pi < covered.Len() && covered.Get(pi) {
+					continue
+				}
+				checks = append(checks, pi)
+			}
+		}
+		var exactChecksInline [plannerPredicateFastPathMaxLeaves]int
+		var residualChecksInline [plannerPredicateFastPathMaxLeaves]int
+		exactChecks := branch.buildPostingFilterChecks(exactChecksInline[:0], checks)
+		residualChecks := plannerResidualChecks(residualChecksInline[:0], checks, exactChecks)
+		return len(checks), len(residualChecks)
+	}
+
+	checksBuf := predicateCheckSlicePool.Get()
+	checksBuf.Grow(branch.predLen())
+	if covered == nil {
+		branch.buildMatchChecksBuf(checksBuf)
+	} else {
+		for pi := 0; pi < branch.predLen(); pi++ {
+			p := branch.pred(pi)
+			if p.alwaysTrue || p.alwaysFalse || !p.hasContains() {
+				continue
+			}
+			if pi < covered.Len() && covered.Get(pi) {
+				continue
+			}
+			checksBuf.Append(pi)
+		}
+		sortActivePredicatesBufReader(checksBuf, branch.preds)
+	}
+	exactChecksBuf := predicateCheckSlicePool.Get()
+	exactChecksBuf.Grow(checksBuf.Len())
+	buildExactBucketPostingFilterActiveBufReader(exactChecksBuf, checksBuf, branch.preds)
+	residualChecksBuf := predicateCheckSlicePool.Get()
+	residualChecksBuf.Grow(checksBuf.Len())
+	plannerResidualChecksBuf(residualChecksBuf, checksBuf, exactChecksBuf)
+	streamChecks := checksBuf.Len()
+	mergeChecks := residualChecksBuf.Len()
+	predicateCheckSlicePool.Put(residualChecksBuf)
+	predicateCheckSlicePool.Put(exactChecksBuf)
+	predicateCheckSlicePool.Put(checksBuf)
+	return streamChecks, mergeChecks
+}
+
 func (b *plannerORBranch) matchesChecks(idx uint64, checks []int) bool {
 	if b.alwaysTrue {
 		return true
@@ -262,44 +417,44 @@ func (b *plannerORBranch) matchesChecks(idx uint64, checks []int) bool {
 	case 0:
 		return true
 	case 1:
-		p0 := &b.preds[checks[0]]
+		p0 := b.predPtr(checks[0])
 		return !p0.alwaysFalse && p0.hasContains() && p0.matches(idx)
 	case 2:
-		p0 := &b.preds[checks[0]]
+		p0 := b.predPtr(checks[0])
 		if p0.alwaysFalse || !p0.hasContains() || !p0.matches(idx) {
 			return false
 		}
-		p1 := &b.preds[checks[1]]
+		p1 := b.predPtr(checks[1])
 		return !p1.alwaysFalse && p1.hasContains() && p1.matches(idx)
 	case 3:
-		p0 := &b.preds[checks[0]]
+		p0 := b.predPtr(checks[0])
 		if p0.alwaysFalse || !p0.hasContains() || !p0.matches(idx) {
 			return false
 		}
-		p1 := &b.preds[checks[1]]
+		p1 := b.predPtr(checks[1])
 		if p1.alwaysFalse || !p1.hasContains() || !p1.matches(idx) {
 			return false
 		}
-		p2 := &b.preds[checks[2]]
+		p2 := b.predPtr(checks[2])
 		return !p2.alwaysFalse && p2.hasContains() && p2.matches(idx)
 	case 4:
-		p0 := &b.preds[checks[0]]
+		p0 := b.predPtr(checks[0])
 		if p0.alwaysFalse || !p0.hasContains() || !p0.matches(idx) {
 			return false
 		}
-		p1 := &b.preds[checks[1]]
+		p1 := b.predPtr(checks[1])
 		if p1.alwaysFalse || !p1.hasContains() || !p1.matches(idx) {
 			return false
 		}
-		p2 := &b.preds[checks[2]]
+		p2 := b.predPtr(checks[2])
 		if p2.alwaysFalse || !p2.hasContains() || !p2.matches(idx) {
 			return false
 		}
-		p3 := &b.preds[checks[3]]
+		p3 := b.predPtr(checks[3])
 		return !p3.alwaysFalse && p3.hasContains() && p3.matches(idx)
 	}
 	for _, i := range checks {
-		p := &b.preds[i]
+		p := b.predPtr(i)
 		if p.alwaysFalse || !p.hasContains() || !p.matches(idx) {
 			return false
 		}
@@ -307,85 +462,91 @@ func (b *plannerORBranch) matchesChecks(idx uint64, checks []int) bool {
 	return true
 }
 
-func (b *plannerORBranch) matchesChecksObserved(idx uint64, checks []int, observed []uint64, candidates []bool) bool {
+func (b *plannerORBranch) matchesChecksObservedBuf(idx uint64, branch int, checks *pooled.SliceBuf[int], observed *orderedORObservedStats) bool {
 	if b.alwaysTrue {
 		return true
 	}
-	switch len(checks) {
+	offset := 0
+	if observed != nil {
+		offset = observed.offsets[branch]
+	}
+	switch checks.Len() {
 	case 0:
 		return true
 	case 1:
-		if len(observed) > 0 && len(candidates) > 0 && candidates[0] {
-			observed[0]++
+		if observed != nil && observed.candidatesBuf.Get(offset) {
+			observed.countsBuf.Set(offset, observed.countsBuf.Get(offset)+1)
 		}
-		p0 := &b.preds[checks[0]]
+		p0 := b.predPtr(checks.Get(0))
 		return !p0.alwaysFalse && p0.hasContains() && p0.matches(idx)
 	case 2:
-		if len(observed) > 0 && len(candidates) > 0 && candidates[0] {
-			observed[0]++
+		if observed != nil && observed.candidatesBuf.Get(offset) {
+			observed.countsBuf.Set(offset, observed.countsBuf.Get(offset)+1)
 		}
-		p0 := &b.preds[checks[0]]
+		p0 := b.predPtr(checks.Get(0))
 		if p0.alwaysFalse || !p0.hasContains() || !p0.matches(idx) {
 			return false
 		}
-		if len(observed) > 1 && len(candidates) > 1 && candidates[1] {
-			observed[1]++
+		if observed != nil && observed.candidatesBuf.Get(offset+1) {
+			observed.countsBuf.Set(offset+1, observed.countsBuf.Get(offset+1)+1)
 		}
-		p1 := &b.preds[checks[1]]
+		p1 := b.predPtr(checks.Get(1))
 		return !p1.alwaysFalse && p1.hasContains() && p1.matches(idx)
 	case 3:
-		if len(observed) > 0 && len(candidates) > 0 && candidates[0] {
-			observed[0]++
+		if observed != nil && observed.candidatesBuf.Get(offset) {
+			observed.countsBuf.Set(offset, observed.countsBuf.Get(offset)+1)
 		}
-		p0 := &b.preds[checks[0]]
+		p0 := b.predPtr(checks.Get(0))
 		if p0.alwaysFalse || !p0.hasContains() || !p0.matches(idx) {
 			return false
 		}
-		if len(observed) > 1 && len(candidates) > 1 && candidates[1] {
-			observed[1]++
+		if observed != nil && observed.candidatesBuf.Get(offset+1) {
+			observed.countsBuf.Set(offset+1, observed.countsBuf.Get(offset+1)+1)
 		}
-		p1 := &b.preds[checks[1]]
+		p1 := b.predPtr(checks.Get(1))
 		if p1.alwaysFalse || !p1.hasContains() || !p1.matches(idx) {
 			return false
 		}
-		if len(observed) > 2 && len(candidates) > 2 && candidates[2] {
-			observed[2]++
+		if observed != nil && observed.candidatesBuf.Get(offset+2) {
+			observed.countsBuf.Set(offset+2, observed.countsBuf.Get(offset+2)+1)
 		}
-		p2 := &b.preds[checks[2]]
+		p2 := b.predPtr(checks.Get(2))
 		return !p2.alwaysFalse && p2.hasContains() && p2.matches(idx)
 	case 4:
-		if len(observed) > 0 && len(candidates) > 0 && candidates[0] {
-			observed[0]++
+		if observed != nil && observed.candidatesBuf.Get(offset) {
+			observed.countsBuf.Set(offset, observed.countsBuf.Get(offset)+1)
 		}
-		p0 := &b.preds[checks[0]]
+		p0 := b.predPtr(checks.Get(0))
 		if p0.alwaysFalse || !p0.hasContains() || !p0.matches(idx) {
 			return false
 		}
-		if len(observed) > 1 && len(candidates) > 1 && candidates[1] {
-			observed[1]++
+		if observed != nil && observed.candidatesBuf.Get(offset+1) {
+			observed.countsBuf.Set(offset+1, observed.countsBuf.Get(offset+1)+1)
 		}
-		p1 := &b.preds[checks[1]]
+		p1 := b.predPtr(checks.Get(1))
 		if p1.alwaysFalse || !p1.hasContains() || !p1.matches(idx) {
 			return false
 		}
-		if len(observed) > 2 && len(candidates) > 2 && candidates[2] {
-			observed[2]++
+		if observed != nil && observed.candidatesBuf.Get(offset+2) {
+			observed.countsBuf.Set(offset+2, observed.countsBuf.Get(offset+2)+1)
 		}
-		p2 := &b.preds[checks[2]]
+		p2 := b.predPtr(checks.Get(2))
 		if p2.alwaysFalse || !p2.hasContains() || !p2.matches(idx) {
 			return false
 		}
-		if len(observed) > 3 && len(candidates) > 3 && candidates[3] {
-			observed[3]++
+		if observed != nil && observed.candidatesBuf.Get(offset+3) {
+			observed.countsBuf.Set(offset+3, observed.countsBuf.Get(offset+3)+1)
 		}
-		p3 := &b.preds[checks[3]]
+		p3 := b.predPtr(checks.Get(3))
 		return !p3.alwaysFalse && p3.hasContains() && p3.matches(idx)
 	}
-	for ci, i := range checks {
-		if ci < len(observed) && ci < len(candidates) && candidates[ci] {
-			observed[ci]++
+	for ci := 0; ci < checks.Len(); ci++ {
+		if observed != nil && observed.candidatesBuf.Get(offset+ci) {
+			slot := offset + ci
+			observed.countsBuf.Set(slot, observed.countsBuf.Get(slot)+1)
 		}
-		p := &b.preds[i]
+		i := checks.Get(ci)
+		p := b.predPtr(i)
 		if p.alwaysFalse || !p.hasContains() || !p.matches(idx) {
 			return false
 		}
@@ -505,16 +666,253 @@ func plannerFilterPostingByChecks[T plannerBucketPostingFilterPredicate](
 	return plannerPredicateBucketExact, work, work, card
 }
 
+func plannerFilterPostingByChecksBuf[T plannerBucketPostingFilterPredicate](
+	preds []T,
+	checks *pooled.SliceBuf[int],
+	src posting.List,
+	work posting.List,
+	allowExact bool,
+) (plannerPredicateBucketMode, posting.List, posting.List, uint64) {
+	if src.IsEmpty() {
+		return plannerPredicateBucketEmpty, posting.List{}, work, 0
+	}
+	card := src.Cardinality()
+	if checks.Len() == 0 {
+		return plannerPredicateBucketAll, src, work, card
+	}
+
+	if !allowExact || card <= plannerPredicateBucketExactMinCardForChecks(checks.Len()) {
+		skipBucket := false
+		fullBucket := true
+		for i := 0; i < checks.Len(); i++ {
+			pi := checks.Get(i)
+			cnt, ok := preds[pi].countBucket(src)
+			if !ok {
+				fullBucket = false
+				continue
+			}
+			if cnt == 0 {
+				skipBucket = true
+				break
+			}
+			if cnt != card {
+				fullBucket = false
+			}
+		}
+		if skipBucket {
+			return plannerPredicateBucketEmpty, posting.List{}, work, card
+		}
+		if fullBucket {
+			return plannerPredicateBucketAll, src, work, card
+		}
+		return plannerPredicateBucketFallback, posting.List{}, work, card
+	}
+
+	work = src.CloneInto(work)
+	for i := 0; i < checks.Len(); i++ {
+		pi := checks.Get(i)
+		var ok bool
+		work, ok = preds[pi].applyToPosting(work)
+		if !ok {
+			return plannerPredicateBucketFallback, posting.List{}, work, card
+		}
+		if work.IsEmpty() {
+			return plannerPredicateBucketEmpty, posting.List{}, work, card
+		}
+	}
+	if work.Cardinality() == card {
+		return plannerPredicateBucketAll, src, work, card
+	}
+	return plannerPredicateBucketExact, work, work, card
+}
+
+func plannerFilterPostingByPredicateChecks(
+	preds predicateReader,
+	checks []int,
+	src posting.List,
+	work posting.List,
+	allowExact bool,
+) (plannerPredicateBucketMode, posting.List, posting.List, uint64) {
+	if src.IsEmpty() {
+		return plannerPredicateBucketEmpty, posting.List{}, work, 0
+	}
+	card := src.Cardinality()
+	if len(checks) == 0 {
+		return plannerPredicateBucketAll, src, work, card
+	}
+
+	if !allowExact || card <= plannerPredicateBucketExactMinCardForChecks(len(checks)) {
+		skipBucket := false
+		fullBucket := true
+		for _, pi := range checks {
+			cnt, ok := preds.Get(pi).countBucket(src)
+			if !ok {
+				fullBucket = false
+				continue
+			}
+			if cnt == 0 {
+				skipBucket = true
+				break
+			}
+			if cnt != card {
+				fullBucket = false
+			}
+		}
+		if skipBucket {
+			return plannerPredicateBucketEmpty, posting.List{}, work, card
+		}
+		if fullBucket {
+			return plannerPredicateBucketAll, src, work, card
+		}
+		return plannerPredicateBucketFallback, posting.List{}, work, card
+	}
+
+	work = src.CloneInto(work)
+	for _, pi := range checks {
+		var ok bool
+		work, ok = preds.Get(pi).applyToPosting(work)
+		if !ok {
+			return plannerPredicateBucketFallback, posting.List{}, work, card
+		}
+		if work.IsEmpty() {
+			return plannerPredicateBucketEmpty, posting.List{}, work, card
+		}
+	}
+	if work.Cardinality() == card {
+		return plannerPredicateBucketAll, src, work, card
+	}
+	return plannerPredicateBucketExact, work, work, card
+}
+
+func plannerFilterPostingByPredicateSetChecks(
+	preds predicateSet,
+	checks []int,
+	src posting.List,
+	work posting.List,
+	allowExact bool,
+) (plannerPredicateBucketMode, posting.List, posting.List, uint64) {
+	if src.IsEmpty() {
+		return plannerPredicateBucketEmpty, posting.List{}, work, 0
+	}
+	card := src.Cardinality()
+	if len(checks) == 0 {
+		return plannerPredicateBucketAll, src, work, card
+	}
+
+	if !allowExact || card <= plannerPredicateBucketExactMinCardForChecks(len(checks)) {
+		skipBucket := false
+		fullBucket := true
+		for _, pi := range checks {
+			cnt, ok := preds.Get(pi).countBucket(src)
+			if !ok {
+				fullBucket = false
+				continue
+			}
+			if cnt == 0 {
+				skipBucket = true
+				break
+			}
+			if cnt != card {
+				fullBucket = false
+			}
+		}
+		if skipBucket {
+			return plannerPredicateBucketEmpty, posting.List{}, work, card
+		}
+		if fullBucket {
+			return plannerPredicateBucketAll, src, work, card
+		}
+		return plannerPredicateBucketFallback, posting.List{}, work, card
+	}
+
+	work = src.CloneInto(work)
+	for _, pi := range checks {
+		var ok bool
+		work, ok = preds.Get(pi).applyToPosting(work)
+		if !ok {
+			return plannerPredicateBucketFallback, posting.List{}, work, card
+		}
+		if work.IsEmpty() {
+			return plannerPredicateBucketEmpty, posting.List{}, work, card
+		}
+	}
+	if work.Cardinality() == card {
+		return plannerPredicateBucketAll, src, work, card
+	}
+	return plannerPredicateBucketExact, work, work, card
+}
+
+func plannerFilterPostingByPredicateChecksBuf(
+	preds predicateReader,
+	checks *pooled.SliceBuf[int],
+	src posting.List,
+	work posting.List,
+	allowExact bool,
+) (plannerPredicateBucketMode, posting.List, posting.List, uint64) {
+	if src.IsEmpty() {
+		return plannerPredicateBucketEmpty, posting.List{}, work, 0
+	}
+	card := src.Cardinality()
+	if checks.Len() == 0 {
+		return plannerPredicateBucketAll, src, work, card
+	}
+
+	if !allowExact || card <= plannerPredicateBucketExactMinCardForChecks(checks.Len()) {
+		skipBucket := false
+		fullBucket := true
+		for i := 0; i < checks.Len(); i++ {
+			pi := checks.Get(i)
+			cnt, ok := preds.Get(pi).countBucket(src)
+			if !ok {
+				fullBucket = false
+				continue
+			}
+			if cnt == 0 {
+				skipBucket = true
+				break
+			}
+			if cnt != card {
+				fullBucket = false
+			}
+		}
+		if skipBucket {
+			return plannerPredicateBucketEmpty, posting.List{}, work, card
+		}
+		if fullBucket {
+			return plannerPredicateBucketAll, src, work, card
+		}
+		return plannerPredicateBucketFallback, posting.List{}, work, card
+	}
+
+	work = src.CloneInto(work)
+	for i := 0; i < checks.Len(); i++ {
+		pi := checks.Get(i)
+		var ok bool
+		work, ok = preds.Get(pi).applyToPosting(work)
+		if !ok {
+			return plannerPredicateBucketFallback, posting.List{}, work, card
+		}
+		if work.IsEmpty() {
+			return plannerPredicateBucketEmpty, posting.List{}, work, card
+		}
+	}
+	if work.Cardinality() == card {
+		return plannerPredicateBucketAll, src, work, card
+	}
+	return plannerPredicateBucketExact, work, work, card
+}
+
 func (b *plannerORBranch) matchesFromLead(idx uint64) bool {
 	if b.alwaysTrue {
 		return true
 	}
-	leadNeedsCheck := b.lead != nil && b.lead.leadIterNeedsContainsCheck()
-	for i := range b.preds {
+	lead := b.leadPtr()
+	leadNeedsCheck := lead != nil && lead.leadIterNeedsContainsCheck()
+	for i := 0; i < b.predLen(); i++ {
 		if i == b.leadIdx && !leadNeedsCheck {
 			continue
 		}
-		p := b.preds[i]
+		p := b.pred(i)
 		if p.covered || p.alwaysTrue {
 			continue
 		}
@@ -533,8 +931,8 @@ func (b plannerORBranch) containsChecks() int {
 		return 0
 	}
 	checks := 0
-	for i := range b.preds {
-		p := b.preds[i]
+	for i := 0; i < b.predLen(); i++ {
+		p := b.pred(i)
 		if p.alwaysTrue || p.alwaysFalse || !p.hasContains() {
 			continue
 		}
@@ -559,11 +957,11 @@ func (b plannerORBranch) evalScore() float64 {
 		} else {
 			est = b.estCard
 		}
-	} else if b.lead != nil && b.lead.estCard > 0 {
-		est = b.lead.estCard
+	} else if b.hasLead() && b.leadPred().estCard > 0 {
+		est = b.leadPred().estCard
 	} else {
-		for i := range b.preds {
-			if c := b.preds[i].estCard; c > est {
+		for i := 0; i < b.predLen(); i++ {
+			if c := b.pred(i).estCard; c > est {
 				est = c
 			}
 		}
@@ -576,15 +974,15 @@ func (b plannerORBranch) noOrderScore() float64 {
 		return 0
 	}
 	leadEst := uint64(1)
-	if b.lead != nil && b.lead.estCard > 0 {
-		leadEst = b.lead.estCard
+	if b.hasLead() && b.leadPred().estCard > 0 {
+		leadEst = b.leadPred().estCard
 	}
 	extraChecks := 1.0
-	for i := range b.preds {
+	for i := 0; i < b.predLen(); i++ {
 		if i == b.leadIdx {
 			continue
 		}
-		p := b.preds[i]
+		p := b.pred(i)
 		if p.alwaysTrue {
 			continue
 		}
@@ -599,8 +997,8 @@ func (b plannerORBranch) noOrderBudget(need int) uint64 {
 	}
 
 	leadEst := uint64(0)
-	if b.lead != nil {
-		leadEst = b.lead.estCard
+	if b.hasLead() {
+		leadEst = b.leadPred().estCard
 	}
 	if leadEst == 0 {
 		leadEst = plannerORNoOrderMinBranchBudget
@@ -683,46 +1081,20 @@ func (qv *queryView[K, V]) orderMergeBranchStats(orderField string, branches pla
 		if orderField == "" || !ov.hasData() {
 			continue
 		}
-		br, covered, ok := qv.extractOrderRangeCoverageOverlay(orderField, branches[i].preds, ov)
-		if !ok || len(covered) == 0 {
+		br, covered, ok := qv.extractOrderRangeCoverageOverlayReader(orderField, branches[i].preds, ov)
+		if !ok || covered.Len() == 0 {
 			if ok && (br.baseStart != 0 || br.baseEnd != ov.keyCount()) {
 				stats[i].rangeBounded = true
 				_, stats[i].rangeRows = overlayRangeStats(ov, br)
 			}
-			checksBuf := getIntSliceBuf(len(branches[i].preds))
-			checksBuf.values = branches[i].buildMatchChecks(checksBuf.values[:0])
-			exactChecksBuf := getIntSliceBuf(len(checksBuf.values))
-			exactChecksBuf.values = branches[i].buildPostingFilterChecks(exactChecksBuf.values[:0], checksBuf.values)
-			residualChecksBuf := getIntSliceBuf(len(checksBuf.values))
-			residualChecksBuf.values = plannerResidualChecks(residualChecksBuf.values[:0], checksBuf.values, exactChecksBuf.values)
-			stats[i].streamChecks = len(checksBuf.values)
-			stats[i].mergeChecks = len(residualChecksBuf.values)
-			releaseIntSliceBuf(exactChecksBuf)
-			releaseIntSliceBuf(residualChecksBuf)
-			releaseIntSliceBuf(checksBuf)
+			stats[i].streamChecks, stats[i].mergeChecks = plannerORBranchCheckCounts(branches[i], nil)
+			if ok {
+				boolSlicePool.Put(covered)
+			}
 			continue
 		}
-		checksBuf := getIntSliceBuf(len(branches[i].preds))
-		checksBuf.values = checksBuf.values[:0]
-		for pi := range branches[i].preds {
-			p := branches[i].preds[pi]
-			if p.alwaysTrue || p.alwaysFalse || !p.hasContains() {
-				continue
-			}
-			if pi < len(covered) && covered[pi] {
-				continue
-			}
-			checksBuf.values = append(checksBuf.values, pi)
-		}
-		exactChecksBuf := getIntSliceBuf(len(checksBuf.values))
-		exactChecksBuf.values = branches[i].buildPostingFilterChecks(exactChecksBuf.values[:0], checksBuf.values)
-		residualChecksBuf := getIntSliceBuf(len(checksBuf.values))
-		residualChecksBuf.values = plannerResidualChecks(residualChecksBuf.values[:0], checksBuf.values, exactChecksBuf.values)
-		stats[i].streamChecks = len(checksBuf.values)
-		stats[i].mergeChecks = len(residualChecksBuf.values)
-		releaseIntSliceBuf(exactChecksBuf)
-		releaseIntSliceBuf(residualChecksBuf)
-		releaseIntSliceBuf(checksBuf)
+		stats[i].streamChecks, stats[i].mergeChecks = plannerORBranchCheckCounts(branches[i], covered)
+		boolSlicePool.Put(covered)
 		if br.baseStart == 0 && br.baseEnd == ov.keyCount() {
 			continue
 		}
@@ -770,11 +1142,10 @@ func (bs plannerORBranches) hasSelectiveLead(need int) bool {
 		threshold = 1
 	}
 	for i := range bs {
-		lead := bs[i].lead
-		if lead == nil || lead.estCard == 0 {
+		if !bs[i].hasLead() || bs[i].leadPred().estCard == 0 {
 			continue
 		}
-		if lead.estCard <= threshold {
+		if bs[i].leadPred().estCard <= threshold {
 			return true
 		}
 	}
@@ -965,7 +1336,8 @@ func (qv *queryView[K, V]) estimateOROrderMergeRouteCost(
 	orderDistinct := uint64(overlayApproxDistinctTotalCount(orderOV))
 	orderStats := qv.plannerOrderFieldStats(orderField, snap, universe, orderDistinct)
 
-	unionCard, sumCard, branchCards, _ := branches.unionCards(universe)
+	var branchCards [plannerORBranchLimit]uint64
+	unionCard, sumCard, _, _ := branches.unionCards(universe, &branchCards)
 	if unionCard == 0 {
 		return plannerOROrderRouteCost{}, false
 	}
@@ -1112,10 +1484,6 @@ type plannerORIter struct {
 	it     posting.Iterator
 	branch *plannerORBranch
 
-	examined       *uint64
-	branchExamined *uint64
-	branchEmitted  *uint64
-
 	has bool
 	cur uint64
 }
@@ -1127,6 +1495,18 @@ func (it *plannerORIter) Release() {
 	it.it = nil
 	it.has = false
 	it.cur = 0
+}
+
+func releasePlannerORNoOrderStateIters(states []plannerORNoOrderBranchState) {
+	for i := range states {
+		states[i].iter.Release()
+	}
+}
+
+func releasePlannerORIters(iters []plannerORIter) {
+	for i := range iters {
+		iters[i].Release()
+	}
 }
 
 func (qv *queryView[K, V]) tryPlan(q *qx.QX, trace *queryTrace) ([]K, bool, error) {
@@ -1152,35 +1532,27 @@ func (qv *queryView[K, V]) tryPlan(q *qx.QX, trace *queryTrace) ([]K, bool, erro
 	return nil, false, nil
 }
 
-func (it *plannerORIter) advance() {
-	it.advanceWithBudget(0)
+func (it *plannerORIter) advance() (uint64, uint64) {
+	examinedDelta, emittedDelta, _ := it.advanceWithBudget(0)
+	return examinedDelta, emittedDelta
 }
 
-func (it *plannerORIter) advanceWithBudget(budget uint64) (budgetHit bool) {
+func (it *plannerORIter) advanceWithBudget(budget uint64) (uint64, uint64, bool) {
 	it.has = false
 	var scanned uint64
 	for it.it.HasNext() {
 		if budget > 0 && scanned >= budget {
-			return true
+			return scanned, 0, true
 		}
 		idx := it.it.Next()
 		scanned++
-		if it.examined != nil {
-			*it.examined = *it.examined + 1
-		}
-		if it.branchExamined != nil {
-			*it.branchExamined = *it.branchExamined + 1
-		}
 		if it.branch.matchesFromLead(idx) {
 			it.cur = idx
 			it.has = true
-			if it.branchEmitted != nil {
-				*it.branchEmitted = *it.branchEmitted + 1
-			}
-			return false
+			return scanned, 1, false
 		}
 	}
-	return false
+	return scanned, 0, false
 }
 
 // tryPlanORMergeMode plans top-level OR queries with bounded branch count.
@@ -1314,79 +1686,83 @@ func (qv *queryView[K, V]) tryPlanORMergeMode(q *qx.QX, trace *queryTrace) ([]K,
 }
 
 type orderedORObservedStats struct {
-	countsBuf     *uint64SliceBuf
-	counts        []uint64
-	candidatesBuf *boolSliceBuf
-	candidates    []bool
+	countsBuf     *pooled.SliceBuf[uint64]
+	candidatesBuf *pooled.SliceBuf[bool]
 	offsets       [plannerORBranchLimit + 1]int
 	active        bool
 }
 
-func (s *orderedORObservedStats) init(branches plannerORBranches, branchChecks [plannerORBranchLimit][]int, shouldObserve func(qx.Expr) bool) {
-	if s == nil {
+func initOrderedORObservedStats[K ~string | ~uint64, V any](
+	qv *queryView[K, V],
+	field string,
+	observed *orderedORObservedStats,
+	branches plannerORBranches,
+	branchChecks [plannerORBranchLimit]*pooled.SliceBuf[int],
+) {
+	if observed == nil {
 		return
 	}
 	total := 0
-	s.offsets[0] = 0
+	observed.offsets[0] = 0
 	branchCount := len(branches)
 	if branchCount > plannerORBranchLimit {
 		branchCount = plannerORBranchLimit
 	}
 	for i := 0; i < branchCount; i++ {
-		total += len(branchChecks[i])
-		s.offsets[i+1] = total
+		total += branchChecks[i].Len()
+		observed.offsets[i+1] = total
 	}
 	if total == 0 {
-		s.counts = nil
-		s.countsBuf = nil
-		s.candidates = nil
-		s.candidatesBuf = nil
-		s.active = false
+		observed.countsBuf = nil
+		observed.candidatesBuf = nil
+		observed.active = false
 		return
 	}
 	active := 0
 	for bi := 0; bi < branchCount; bi++ {
-		for _, pi := range branchChecks[bi] {
-			if shouldObserve(branches[bi].preds[pi].expr) {
+		checks := branchChecks[bi]
+		for ci := 0; ci < checks.Len(); ci++ {
+			pi := checks.Get(ci)
+			if qv.shouldObserveOrderedORLeaf(field, branches[bi].pred(pi).expr) {
 				active++
 			}
 		}
 	}
 	if active == 0 {
-		s.counts = nil
-		s.countsBuf = nil
-		s.candidates = nil
-		s.candidatesBuf = nil
-		s.active = false
+		observed.countsBuf = nil
+		observed.candidatesBuf = nil
+		observed.active = false
 		return
 	}
-	s.countsBuf = getUint64SliceBuf(total)
-	s.counts = s.countsBuf.values[:total]
-	clear(s.counts)
-	s.candidatesBuf = getBoolSliceBuf(total)
-	s.candidates = s.candidatesBuf.values[:total]
-	clear(s.candidates)
-	s.active = true
+	observed.countsBuf = uint64SlicePool.Get()
+	observed.countsBuf.SetLen(total)
+	observed.countsBuf.Clear()
+
+	observed.candidatesBuf = boolSlicePool.Get()
+	observed.candidatesBuf.SetLen(total)
+	observed.active = true
 	for bi := 0; bi < branchCount; bi++ {
-		start := s.offsets[bi]
-		for ci, pi := range branchChecks[bi] {
-			if shouldObserve(branches[bi].preds[pi].expr) {
-				s.candidates[start+ci] = true
+		start := observed.offsets[bi]
+		checks := branchChecks[bi]
+		for ci := 0; ci < checks.Len(); ci++ {
+			pi := checks.Get(ci)
+			if qv.shouldObserveOrderedORLeaf(field, branches[bi].pred(pi).expr) {
+				observed.candidatesBuf.Set(start+ci, true)
 			}
 		}
 	}
 }
 
-func (s *orderedORObservedStats) branchObserved(branch int) ([]uint64, []bool) {
+func (s *orderedORObservedStats) branchRange(branch int) (int, int, bool) {
 	if s == nil || branch < 0 || branch >= plannerORBranchLimit {
-		return nil, nil
+		return 0, 0, false
 	}
 	start := s.offsets[branch]
 	end := s.offsets[branch+1]
-	if start >= end || end > len(s.counts) {
-		return nil, nil
+	if start >= end || s.countsBuf == nil || end > s.countsBuf.Len() {
+		return 0, 0, false
 	}
-	return s.counts[start:end], s.candidates[start:end]
+	return start, end, true
 }
 
 func (s *orderedORObservedStats) release() {
@@ -1394,28 +1770,130 @@ func (s *orderedORObservedStats) release() {
 		return
 	}
 	if s.countsBuf != nil {
-		s.countsBuf.values = s.counts
-		releaseUint64SliceBuf(s.countsBuf)
+		uint64SlicePool.Put(s.countsBuf)
 	}
 	if s.candidatesBuf != nil {
-		s.candidatesBuf.values = s.candidates
-		releaseBoolSliceBuf(s.candidatesBuf)
+		boolSlicePool.Put(s.candidatesBuf)
 	}
 	*s = orderedORObservedStats{}
+}
+
+func releasePlannerOROrderBasicCheckBufs(
+	branchCount int,
+	checkBufs *[plannerORBranchLimit]*pooled.SliceBuf[int],
+) {
+	if branchCount > plannerORBranchLimit {
+		branchCount = plannerORBranchLimit
+	}
+	for i := 0; i < branchCount; i++ {
+		if checkBufs[i] == nil {
+			continue
+		}
+		predicateCheckSlicePool.Put(checkBufs[i])
+		checkBufs[i] = nil
+	}
+}
+
+func plannerOROrderBasicMatches(
+	branches plannerORBranches,
+	branchEvalOrder *[plannerORBranchLimit]int,
+	branchEvalN int,
+	branchStart *[plannerORBranchLimit]int,
+	branchEnd *[plannerORBranchLimit]int,
+	branchChecks *[plannerORBranchLimit]*pooled.SliceBuf[int],
+	idx uint64,
+	bucket int,
+) bool {
+	for i := 0; i < branchEvalN; i++ {
+		bi := branchEvalOrder[i]
+		if bucket < branchStart[bi] || bucket >= branchEnd[bi] {
+			continue
+		}
+		if branches[bi].matchesChecksBuf(idx, branchChecks[bi]) {
+			return true
+		}
+	}
+	return false
+}
+
+func plannerOROrderBasicMatchesObserved(
+	branches plannerORBranches,
+	branchEvalOrder *[plannerORBranchLimit]int,
+	branchEvalN int,
+	branchStart *[plannerORBranchLimit]int,
+	branchEnd *[plannerORBranchLimit]int,
+	branchChecks *[plannerORBranchLimit]*pooled.SliceBuf[int],
+	idx uint64,
+	bucket int,
+	observed *orderedORObservedStats,
+) bool {
+	for i := 0; i < branchEvalN; i++ {
+		bi := branchEvalOrder[i]
+		if bucket < branchStart[bi] || bucket >= branchEnd[bi] {
+			continue
+		}
+		if branches[bi].matchesChecksObservedBuf(idx, bi, branchChecks[bi], observed) {
+			return true
+		}
+	}
+	return false
+}
+
+func plannerOROrderBasicMatchWithMetrics(
+	branches plannerORBranches,
+	branchStart *[plannerORBranchLimit]int,
+	branchEnd *[plannerORBranchLimit]int,
+	branchChecks *[plannerORBranchLimit]*pooled.SliceBuf[int],
+	branchMetrics []TraceORBranch,
+	idx uint64,
+	bucket int,
+	alwaysTrue bool,
+	alwaysTrueBranch int,
+) int {
+	if alwaysTrue {
+		if alwaysTrueBranch >= 0 {
+			branchMetrics[alwaysTrueBranch].RowsExamined++
+			branchMetrics[alwaysTrueBranch].RowsEmitted++
+		}
+		return 1
+	}
+
+	matchedCount := 0
+	for i := range branches {
+		if bucket < branchStart[i] || bucket >= branchEnd[i] {
+			continue
+		}
+		branchMetrics[i].RowsExamined++
+		if branches[i].matchesChecksBuf(idx, branchChecks[i]) {
+			branchMetrics[i].RowsEmitted++
+			matchedCount++
+		}
+	}
+	return matchedCount
+}
+
+func setOROrderMergeFallbackTrace(trace *queryTrace, examined, scanWidth uint64, branchMetrics []TraceORBranch, stopReason string) {
+	if trace == nil {
+		return
+	}
+	trace.addExamined(examined)
+	trace.addOrderScanWidth(scanWidth)
+	trace.setORBranches(branchMetrics)
+	trace.setEarlyStopReason(stopReason)
 }
 
 func (qv *queryView[K, V]) orderedORMaterializedRangeLeafCosts(
 	orderField string,
 	leaf qx.Expr,
-) (string, uint64, uint64, uint64, bool) {
+) (materializedPredKey, uint64, uint64, uint64, bool) {
 	candidate, ok := qv.prepareScalarRangeRoutingCandidate(leaf)
 	if !ok || !candidate.numeric || leaf.Field == orderField {
-		return "", 0, 0, 0, false
+		return materializedPredKey{}, 0, 0, 0, false
 	}
 	core := candidate.core
 	plan := candidate.plan
 	if core.bound.full || plan.bucketCount == 0 || plan.est == 0 {
-		return "", 0, 0, 0, false
+		return materializedPredKey{}, 0, 0, 0, false
 	}
 	if !plan.useComplement {
 		return core.sharedReuse.cacheKey,
@@ -1427,7 +1905,7 @@ func (qv *queryView[K, V]) orderedORMaterializedRangeLeafCosts(
 
 	compPlan, ok := core.prepareComplementMaterialization()
 	if !ok || compPlan.buckets == 0 || compPlan.est == 0 {
-		return "", 0, 0, 0, false
+		return materializedPredKey{}, 0, 0, 0, false
 	}
 	checkBuckets := compPlan.buckets
 	checkEst := compPlan.est
@@ -1443,7 +1921,7 @@ func (qv *queryView[K, V]) orderedORMaterializedRangeLeafCosts(
 		}
 	}
 	if checkBuckets == 0 || checkEst == 0 {
-		return "", 0, 0, 0, false
+		return materializedPredKey{}, 0, 0, 0, false
 	}
 	return compPlan.sharedReuse.cacheKey,
 		rangeProbeMaterializeWork(compPlan.buckets, compPlan.est),
@@ -1455,27 +1933,27 @@ func (qv *queryView[K, V]) orderedORMaterializedRangeLeafCosts(
 func (qv *queryView[K, V]) orderedORMaterializedPrefixLeafBuildWork(
 	orderField string,
 	leaf qx.Expr,
-) (string, uint64, bool) {
+) (materializedPredKey, uint64, bool) {
 	if !isPositiveNonOrderScalarPrefixLeaf(orderField, leaf) {
-		return "", 0, false
+		return materializedPredKey{}, 0, false
 	}
 	candidate, ok := qv.prepareScalarRangeRoutingCandidate(leaf)
-	if !ok || candidate.core.sharedReuse.cacheKey == "" {
-		return "", 0, false
+	if !ok || candidate.core.sharedReuse.cacheKey.isZero() {
+		return materializedPredKey{}, 0, false
 	}
 	core := candidate.core
 	snap := qv.planner.stats.Load()
 	universe := max(qv.snapshotUniverseCardinality(), uint64(1))
 	sel, _, _, _, ok := qv.estimateLeafOrderCost(leaf, snap, universe, orderField, qv.fieldOverlay(orderField).hasData())
 	if !ok || sel <= 0 {
-		return "", 0, false
+		return materializedPredKey{}, 0, false
 	}
 	estCard := uint64(sel*float64(universe) + 0.5)
 	if estCard == 0 {
 		estCard = 1
 	}
 	if qv.snap.matPredCacheMaxCard > 0 && estCard > qv.snap.matPredCacheMaxCard {
-		return "", 0, false
+		return materializedPredKey{}, 0, false
 	}
 	return core.sharedReuse.cacheKey, estCard, true
 }
@@ -1483,7 +1961,7 @@ func (qv *queryView[K, V]) orderedORMaterializedPrefixLeafBuildWork(
 func (qv *queryView[K, V]) promoteOrderedORMaterializedBaseOps(
 	q *qx.QX,
 	branches plannerORBranches,
-	branchChecks [plannerORBranchLimit][]int,
+	branchChecks [plannerORBranchLimit]*pooled.SliceBuf[int],
 	observed *orderedORObservedStats,
 ) {
 	if q == nil || len(branches) == 0 || qv.snap == nil || len(q.Order) != 1 || observed == nil {
@@ -1494,141 +1972,128 @@ func (qv *queryView[K, V]) promoteOrderedORMaterializedBaseOps(
 		return
 	}
 
-	baseOpsBuf := getExprSliceBuf(len(branches) * 4)
-	baseOpsBuf.values = baseOpsBuf.values[:0]
-	defer func() {
-		releaseExprSliceBuf(baseOpsBuf)
-	}()
-	cacheKeysBuf := getStringSliceBuf(len(branches) * 4)
-	cacheKeysBuf.values = cacheKeysBuf.values[:0]
-	defer func() {
-		releaseStringSliceBuf(cacheKeysBuf)
-	}()
-	buildWorksBuf := getUint64SliceBuf(len(branches) * 4)
-	buildWorksBuf.values = buildWorksBuf.values[:0]
-	defer func() {
-		releaseUint64SliceBuf(buildWorksBuf)
-	}()
-	checkWorksBuf := getUint64SliceBuf(len(branches) * 4)
-	checkWorksBuf.values = checkWorksBuf.values[:0]
-	defer func() {
-		releaseUint64SliceBuf(checkWorksBuf)
-	}()
-	cachedCheckWorksBuf := getUint64SliceBuf(len(branches) * 4)
-	cachedCheckWorksBuf.values = cachedCheckWorksBuf.values[:0]
-	defer func() {
-		releaseUint64SliceBuf(cachedCheckWorksBuf)
-	}()
-	prefixFlagsBuf := getBoolSliceBuf(len(branches) * 4)
-	prefixFlagsBuf.values = prefixFlagsBuf.values[:0]
-	defer func() {
-		releaseBoolSliceBuf(prefixFlagsBuf)
-	}()
-	expectedChecksBuf := getUint64SliceBuf(len(branches) * 4)
-	expectedChecksBuf.values = expectedChecksBuf.values[:0]
-	defer func() {
-		releaseUint64SliceBuf(expectedChecksBuf)
-	}()
-	observedWorksBuf := getUint64SliceBuf(len(branches) * 4)
-	observedWorksBuf.values = observedWorksBuf.values[:0]
-	defer func() {
-		releaseUint64SliceBuf(observedWorksBuf)
-	}()
+	baseOpsBuf := exprSlicePool.Get()
+	baseOpsBuf.Grow(len(branches) * 4)
+	defer exprSlicePool.Put(baseOpsBuf)
+	cacheKeysBuf := materializedPredKeySlicePool.Get()
+	cacheKeysBuf.Grow(len(branches) * 4)
+	defer materializedPredKeySlicePool.Put(cacheKeysBuf)
+	buildWorksBuf := uint64SlicePool.Get()
+	buildWorksBuf.Grow(len(branches) * 4)
+	defer uint64SlicePool.Put(buildWorksBuf)
+	checkWorksBuf := uint64SlicePool.Get()
+	checkWorksBuf.Grow(len(branches) * 4)
+	defer uint64SlicePool.Put(checkWorksBuf)
+	cachedCheckWorksBuf := uint64SlicePool.Get()
+	cachedCheckWorksBuf.Grow(len(branches) * 4)
+	defer uint64SlicePool.Put(cachedCheckWorksBuf)
+	expectedChecksBuf := uint64SlicePool.Get()
+	expectedChecksBuf.Grow(len(branches) * 4)
+	defer uint64SlicePool.Put(expectedChecksBuf)
+	observedWorksBuf := uint64SlicePool.Get()
+	observedWorksBuf.Grow(len(branches) * 4)
+	defer uint64SlicePool.Put(observedWorksBuf)
 
 	for bi, branch := range branches {
 		checks := branchChecks[bi]
-		checked, candidates := observed.branchObserved(bi)
-		for ci, pi := range checks {
-			p := branch.preds[pi]
+		start, end, ok := observed.branchRange(bi)
+		if !ok {
+			continue
+		}
+		for ci := 0; ci < checks.Len(); ci++ {
+			pi := checks.Get(ci)
+			p := branch.pred(pi)
 			if p.alwaysFalse || p.covered || p.alwaysTrue {
 				continue
 			}
-			if ci >= len(checked) || ci >= len(candidates) || !candidates[ci] || checked[ci] == 0 {
+			if start+ci >= end || !observed.candidatesBuf.Get(start+ci) {
 				continue
 			}
-			leafChecks := checked[ci]
+			leafChecks := observed.countsBuf.Get(start + ci)
+			if leafChecks == 0 {
+				continue
+			}
 			cacheKey, buildWork, checkWork, cachedCheckWork, ok := qv.orderedORMaterializedRangeLeafCosts(orderField, p.expr)
 			isPrefix := false
-			if !ok || cacheKey == "" || buildWork == 0 || checkWork == 0 {
+			if !ok || cacheKey.isZero() || buildWork == 0 || checkWork == 0 {
 				cacheKey, buildWork, ok = qv.orderedORMaterializedPrefixLeafBuildWork(orderField, p.expr)
-				if !ok || cacheKey == "" || buildWork == 0 {
+				if !ok || cacheKey.isZero() || buildWork == 0 {
 					goto nextPred
 				}
 				checkWork = 0
 				cachedCheckWork = 0
 				isPrefix = true
 			}
-			for slot := range cacheKeysBuf.values {
-				if cacheKeysBuf.values[slot] == cacheKey {
-					expectedChecksBuf.values[slot] = satAddUint64(expectedChecksBuf.values[slot], leafChecks)
+			for slot := 0; slot < cacheKeysBuf.Len(); slot++ {
+				if cacheKeysBuf.Get(slot) == cacheKey {
+					expectedChecksBuf.Set(slot, satAddUint64(expectedChecksBuf.Get(slot), leafChecks))
 					if isPrefix {
-						observedWorksBuf.values[slot] = satAddUint64(observedWorksBuf.values[slot], leafChecks)
+						observedWorksBuf.Set(slot, satAddUint64(observedWorksBuf.Get(slot), leafChecks))
 					} else if checkWork > cachedCheckWork {
-						observedWorksBuf.values[slot] = satAddUint64(observedWorksBuf.values[slot], satMulUint64(leafChecks, checkWork-cachedCheckWork))
+						observedWorksBuf.Set(slot, satAddUint64(observedWorksBuf.Get(slot), satMulUint64(leafChecks, checkWork-cachedCheckWork)))
 					}
 					goto nextPred
 				}
 			}
-			cacheKeysBuf.values = append(cacheKeysBuf.values, cacheKey)
-			baseOpsBuf.values = append(baseOpsBuf.values, p.expr)
-			buildWorksBuf.values = append(buildWorksBuf.values, buildWork)
-			checkWorksBuf.values = append(checkWorksBuf.values, checkWork)
-			cachedCheckWorksBuf.values = append(cachedCheckWorksBuf.values, cachedCheckWork)
-			prefixFlagsBuf.values = append(prefixFlagsBuf.values, isPrefix)
-			expectedChecksBuf.values = append(expectedChecksBuf.values, leafChecks)
+			cacheKeysBuf.Append(cacheKey)
+			baseOpsBuf.Append(p.expr)
+			buildWorksBuf.Append(buildWork)
+			checkWorksBuf.Append(checkWork)
+			cachedCheckWorksBuf.Append(cachedCheckWork)
+			expectedChecksBuf.Append(leafChecks)
 			if isPrefix {
-				observedWorksBuf.values = append(observedWorksBuf.values, leafChecks)
+				observedWorksBuf.Append(leafChecks)
 			} else if checkWork > cachedCheckWork {
-				observedWorksBuf.values = append(observedWorksBuf.values, satMulUint64(leafChecks, checkWork-cachedCheckWork))
+				observedWorksBuf.Append(satMulUint64(leafChecks, checkWork-cachedCheckWork))
 			} else {
-				observedWorksBuf.values = append(observedWorksBuf.values, 0)
+				observedWorksBuf.Append(0)
 			}
 		nextPred:
 		}
 	}
-	if len(baseOpsBuf.values) == 0 {
+	if baseOpsBuf.Len() == 0 {
 		return
 	}
 	write := 0
-	for i := range baseOpsBuf.values {
-		if observedWorksBuf.values[i] == 0 {
+	for i := 0; i < baseOpsBuf.Len(); i++ {
+		if observedWorksBuf.Get(i) == 0 {
 			continue
 		}
-		if _, ok := qv.snap.loadMaterializedPred(cacheKeysBuf.values[i]); ok {
+		if _, ok := qv.snap.loadMaterializedPredKey(cacheKeysBuf.Get(i)); ok {
 			continue
 		}
-		if !qv.snap.shouldPromoteObservedOrderedORMaterializedPred(cacheKeysBuf.values[i], observedWorksBuf.values[i], buildWorksBuf.values[i]) {
+		if !qv.snap.shouldPromoteObservedOrderedORMaterializedPredKey(cacheKeysBuf.Get(i), observedWorksBuf.Get(i), buildWorksBuf.Get(i)) {
 			continue
 		}
-		baseOpsBuf.values[write] = baseOpsBuf.values[i]
+		baseOpsBuf.Set(write, baseOpsBuf.Get(i))
 		write++
 	}
-	baseOpsBuf.values = baseOpsBuf.values[:write]
-	if len(baseOpsBuf.values) == 0 {
+	baseOpsBuf.SetLen(write)
+	if baseOpsBuf.Len() == 0 {
 		return
 	}
-	qv.materializeOrderMaterializedBaseOps(orderField, baseOpsBuf.values)
+	qv.materializeOrderMaterializedBaseOpsBuf(orderField, baseOpsBuf)
 }
 
 func releaseORBranches(branches plannerORBranches) {
 	for i := range branches {
-		releasePredicates(branches[i].preds, branches[i].predsBuf)
+		releasePlannerORBranchPredicates(branches[i])
 	}
 }
 
 func (qv *queryView[K, V]) shouldObserveOrderedORLeaf(orderField string, expr qx.Expr) bool {
 	cacheKey, buildWork, checkWork, _, ok := qv.orderedORMaterializedRangeLeafCosts(orderField, expr)
-	if ok && cacheKey != "" && buildWork != 0 && checkWork != 0 {
-		if _, hit := qv.snap.loadMaterializedPred(cacheKey); hit {
+	if ok && !cacheKey.isZero() && buildWork != 0 && checkWork != 0 {
+		if _, hit := qv.snap.loadMaterializedPredKey(cacheKey); hit {
 			return false
 		}
 		return true
 	}
 	cacheKey, buildWork, ok = qv.orderedORMaterializedPrefixLeafBuildWork(orderField, expr)
-	if !ok || cacheKey == "" || buildWork == 0 {
+	if !ok || cacheKey.isZero() || buildWork == 0 {
 		return false
 	}
-	if _, hit := qv.snap.loadMaterializedPred(cacheKey); hit {
+	if _, hit := qv.snap.loadMaterializedPredKey(cacheKey); hit {
 		return false
 	}
 	return true
@@ -1668,7 +2133,36 @@ func branchHasPositiveLeafOR(e qx.Expr) bool {
 // buildORBranches compiles each OR branch into planner predicates and optional
 // lead iterators used by OR execution strategies.
 func (qv *queryView[K, V]) buildORBranches(ops []qx.Expr) (plannerORBranches, bool, bool) {
-	return qv.buildORBranchesWithBuilder(ops, qv.buildPredicates)
+	out := make(plannerORBranches, 0, len(ops))
+	var leavesBuf [8]qx.Expr
+
+	for _, op := range ops {
+		leaves, ok := collectAndLeavesScratch(op, leavesBuf[:0])
+		if !ok {
+			releaseORBranches(out)
+			return nil, false, false
+		}
+
+		preds, ok := qv.buildPredicates(leaves)
+		if !ok {
+			releaseORBranches(out)
+			return nil, false, false
+		}
+		branch, keep, ok := buildPlannerORBranch(op, preds)
+		if !ok {
+			releaseORBranches(out)
+			return nil, false, false
+		}
+		if keep {
+			out = append(out, branch)
+		}
+	}
+
+	if len(out) == 0 {
+		return nil, true, true
+	}
+
+	return out, false, true
 }
 
 func (qv *queryView[K, V]) buildORBranchesOrdered(
@@ -1676,26 +2170,51 @@ func (qv *queryView[K, V]) buildORBranchesOrdered(
 	orderField string,
 	orderedWindow int,
 ) (plannerORBranches, bool, bool) {
-	branches, alwaysFalse, ok := qv.buildORBranchesWithBuilder(ops, func(leaves []qx.Expr) ([]predicate, *predicateSliceBuf, bool) {
-		return qv.buildPredicatesOrderedWithMode(leaves, orderField, false, orderedWindow, true, true)
-	})
-	if !ok || alwaysFalse {
-		return branches, alwaysFalse, ok
+	out := make(plannerORBranches, 0, len(ops))
+	var leavesBuf [8]qx.Expr
+
+	for _, op := range ops {
+		leaves, ok := collectAndLeavesScratch(op, leavesBuf[:0])
+		if !ok {
+			releaseORBranches(out)
+			return nil, false, false
+		}
+
+		preds, ok := qv.buildPredicatesOrderedWithMode(leaves, orderField, false, orderedWindow, true, true)
+		if !ok {
+			releaseORBranches(out)
+			return nil, false, false
+		}
+		branch, keep, ok := buildPlannerORBranch(op, preds)
+		if !ok {
+			releaseORBranches(out)
+			return nil, false, false
+		}
+		if keep {
+			out = append(out, branch)
+		}
 	}
+
+	if len(out) == 0 {
+		return nil, true, true
+	}
+
+	branches := out
 	ov := qv.fieldOverlay(orderField)
 	if !ov.hasData() {
 		return branches, false, true
 	}
 	for i := range branches {
-		if !branches[i].alwaysTrue || len(branches[i].preds) == 0 {
+		if !branches[i].alwaysTrue || branches[i].predLen() == 0 {
 			continue
 		}
-		br, covered, rangeOK := qv.extractOrderRangeCoverageOverlay(orderField, branches[i].preds, ov)
+		br, covered, rangeOK := qv.extractOrderRangeCoverageOverlayReader(orderField, branches[i].preds, ov)
 		if !rangeOK {
 			releaseORBranches(branches)
 			return nil, false, false
 		}
-		if len(covered) == 0 {
+		if covered.Len() == 0 {
+			boolSlicePool.Put(covered)
 			continue
 		}
 		if br.baseStart != 0 || br.baseEnd != ov.keyCount() {
@@ -1708,6 +2227,7 @@ func (qv *queryView[K, V]) buildORBranchesOrdered(
 				branches[i].estKnown = true
 			}
 		}
+		boolSlicePool.Put(covered)
 	}
 	return branches, false, true
 }
@@ -1743,47 +2263,33 @@ func (qv *queryView[K, V]) execPlanOROrderBasic(q *qx.QX, branches plannerORBran
 		}
 	}
 
+	branchCount := len(branches)
 	var (
-		branchChecks [plannerORBranchLimit][]int
-		checkBufs    [plannerORBranchLimit]*intSliceBuf
+		branchChecks [plannerORBranchLimit]*pooled.SliceBuf[int]
 		branchStart  [plannerORBranchLimit]int
 		branchEnd    [plannerORBranchLimit]int
 	)
-	defer func() {
-		for i := range branches {
-			if checkBufs[i] != nil {
-				checkBufs[i].values = branchChecks[i]
-				releaseIntSliceBuf(checkBufs[i])
-			}
-		}
-	}()
 	for i := range branches {
-		br, covered, ok := qv.extractOrderRangeCoverageOverlay(f, branches[i].preds, ov)
+		br, covered, ok := qv.extractOrderRangeCoverageOverlayReader(f, branches[i].preds, ov)
 		if !ok {
+			releasePlannerOROrderBasicCheckBufs(branchCount, &branchChecks)
 			return nil, false
 		}
 		branchStart[i], branchEnd[i] = br.baseStart, br.baseEnd
-		for pi := range covered {
-			if covered[pi] {
-				branches[i].preds[pi].covered = true
+		for pi := 0; pi < covered.Len(); pi++ {
+			if covered.Get(pi) {
+				branches[i].predPtr(pi).covered = true
 			}
 		}
-		checkBufs[i] = getIntSliceBuf(len(branches[i].preds))
-		branchChecks[i] = branches[i].buildMatchChecks(checkBufs[i].values)
+		boolSlicePool.Put(covered)
+		branchChecks[i] = predicateCheckSlicePool.Get()
+		branches[i].buildMatchChecksBuf(branchChecks[i])
 	}
-	var (
-		branchObservedCounts     [plannerORBranchLimit][]uint64
-		branchObservedCandidates [plannerORBranchLimit][]bool
-	)
+	promoteObserved := false
 	if observed != nil {
-		observed.init(branches, branchChecks, func(expr qx.Expr) bool {
-			return qv.shouldObserveOrderedORLeaf(f, expr)
-		})
+		initOrderedORObservedStats(qv, f, observed, branches, branchChecks)
 		if observed.active {
-			for i := range branches {
-				branchObservedCounts[i], branchObservedCandidates[i] = observed.branchObserved(i)
-			}
-			defer qv.promoteOrderedORMaterializedBaseOps(q, branches, branchChecks, observed)
+			promoteObserved = true
 		} else {
 			observed = nil
 		}
@@ -1801,27 +2307,7 @@ func (qv *queryView[K, V]) execPlanOROrderBasic(q *qx.QX, branches plannerORBran
 		branchEvalOrder, branchEvalN = branches.evalOrder()
 	}
 
-	matches := func(idx uint64, bucket int) bool {
-		if alwaysTrue {
-			return true
-		}
-		for i := 0; i < branchEvalN; i++ {
-			bi := branchEvalOrder[i]
-			if bucket < branchStart[bi] || bucket >= branchEnd[bi] {
-				continue
-			}
-			if branches[bi].matchesChecks(idx, branchChecks[bi]) {
-				return true
-			}
-		}
-		return false
-	}
-
-	if !ov.hasData() {
-		return nil, true
-	}
 	br := ov.rangeForBounds(rangeBounds{has: true})
-
 	fullTrace := trace.full()
 
 	if !fullTrace {
@@ -1830,7 +2316,7 @@ func (qv *queryView[K, V]) execPlanOROrderBasic(q *qx.QX, branches plannerORBran
 		if o.Desc {
 			bucket = ov.keyCount() - 1
 		}
-		for {
+		for need > 0 {
 			_, bm, ok := cur.next()
 			if !ok {
 				break
@@ -1847,92 +2333,110 @@ func (qv *queryView[K, V]) execPlanOROrderBasic(q *qx.QX, branches plannerORBran
 			if trace != nil {
 				trace.addExamined(bm.Cardinality())
 			}
-			stop := false
-			bm.ForEach(func(idx uint64) bool {
-				if observed != nil {
-					matched := false
-					if alwaysTrue {
-						matched = true
+
+			if idx, ok := bm.TrySingle(); ok {
+				matched := alwaysTrue
+				if !matched {
+					if observed != nil {
+						matched = plannerOROrderBasicMatchesObserved(
+							branches,
+							&branchEvalOrder,
+							branchEvalN,
+							&branchStart,
+							&branchEnd,
+							&branchChecks,
+							idx,
+							curBucket,
+							observed,
+						)
 					} else {
-						for i := 0; i < branchEvalN; i++ {
-							bi := branchEvalOrder[i]
-							if curBucket < branchStart[bi] || curBucket >= branchEnd[bi] {
-								continue
-							}
-							if branches[bi].matchesChecksObserved(idx, branchChecks[bi], branchObservedCounts[bi], branchObservedCandidates[bi]) {
-								matched = true
-								break
-							}
-						}
+						matched = plannerOROrderBasicMatches(
+							branches,
+							&branchEvalOrder,
+							branchEvalN,
+							&branchStart,
+							&branchEnd,
+							&branchChecks,
+							idx,
+							curBucket,
+						)
 					}
-					if !matched {
-						return true
-					}
-				} else if !matches(idx, curBucket) {
-					return true
+				}
+				if !matched {
+					continue
 				}
 				if skip > 0 {
 					skip--
-					return true
+					continue
 				}
 				out = append(out, qv.idFromIdxNoLock(idx))
 				need--
-				if need == 0 {
-					stop = true
-					return false
-				}
-				return true
-			})
-			if stop {
-				return out, true
+				continue
 			}
+
+			it := bm.Iter()
+			for need > 0 && it.HasNext() {
+				idx := it.Next()
+				matched := alwaysTrue
+				if !matched {
+					if observed != nil {
+						matched = plannerOROrderBasicMatchesObserved(
+							branches,
+							&branchEvalOrder,
+							branchEvalN,
+							&branchStart,
+							&branchEnd,
+							&branchChecks,
+							idx,
+							curBucket,
+							observed,
+						)
+					} else {
+						matched = plannerOROrderBasicMatches(
+							branches,
+							&branchEvalOrder,
+							branchEvalN,
+							&branchStart,
+							&branchEnd,
+							&branchChecks,
+							idx,
+							curBucket,
+						)
+					}
+				}
+				if !matched {
+					continue
+				}
+				if skip > 0 {
+					skip--
+					continue
+				}
+				out = append(out, qv.idFromIdxNoLock(idx))
+				need--
+			}
+			it.Release()
 		}
+		if promoteObserved {
+			qv.promoteOrderedORMaterializedBaseOps(q, branches, branchChecks, observed)
+		}
+		releasePlannerOROrderBasicCheckBufs(branchCount, &branchChecks)
 		return out, true
 	}
 
-	branchMetrics := make([]TraceORBranch, len(branches))
+	var branchMetricsInline [plannerORBranchLimit]TraceORBranch
+	branchMetrics := branchMetricsInline[:len(branches)]
 	for i := range branchMetrics {
 		branchMetrics[i].Index = i
 	}
-
-	matchWithMetrics := func(idx uint64, bucket int) bool {
-		if alwaysTrue {
-			if fullTrace && alwaysTrueBranch >= 0 {
-				branchMetrics[alwaysTrueBranch].RowsExamined++
-				branchMetrics[alwaysTrueBranch].RowsEmitted++
-			}
-			return true
-		}
-
-		matchedCount := 0
-		for i := range branches {
-			if bucket < branchStart[i] || bucket >= branchEnd[i] {
-				continue
-			}
-			if fullTrace {
-				branchMetrics[i].RowsExamined++
-			}
-			if branches[i].matchesChecks(idx, branchChecks[i]) {
-				if fullTrace {
-					branchMetrics[i].RowsEmitted++
-				}
-				matchedCount++
-			}
-		}
-		if matchedCount > 1 {
-			trace.addDedupe(uint64(matchedCount - 1))
-		}
-		return matchedCount > 0
-	}
-
 	scanWidth := uint64(0)
+	stopReason := "input_exhausted"
 
 	cur := ov.newCursor(br, o.Desc)
 	bucket := 0
 	if o.Desc {
 		bucket = ov.keyCount() - 1
 	}
-	for {
+	for need > 0 {
 		_, bm, ok := cur.next()
 		if !ok {
 			break
@@ -1948,34 +2452,76 @@ func (qv *queryView[K, V]) execPlanOROrderBasic(q *qx.QX, branches plannerORBran
 		}
 		scanWidth++
 		trace.addExamined(bm.Cardinality())
-		stop := false
-		bm.ForEach(func(idx uint64) bool {
-			if !matchWithMetrics(idx, curBucket) {
-				return true
+		if idx, ok := bm.TrySingle(); ok {
+			matchedCount := plannerOROrderBasicMatchWithMetrics(
+				branches,
+				&branchStart,
+				&branchEnd,
+				&branchChecks,
+				branchMetrics,
+				idx,
+				curBucket,
+				alwaysTrue,
+				alwaysTrueBranch,
+			)
+			if matchedCount == 0 {
+				continue
+			}
+			if matchedCount > 1 {
+				trace.addDedupe(uint64(matchedCount - 1))
 			}
 			if skip > 0 {
 				skip--
-				return true
+				continue
 			}
 			out = append(out, qv.idFromIdxNoLock(idx))
 			need--
 			if need == 0 {
-				trace.addOrderScanWidth(scanWidth)
-				trace.setORBranches(branchMetrics)
-				trace.setEarlyStopReason("limit_reached")
-				stop = true
-				return false
+				stopReason = "limit_reached"
 			}
-			return true
-		})
-		if stop {
-			return out, true
+			continue
 		}
+
+		it := bm.Iter()
+		for need > 0 && it.HasNext() {
+			idx := it.Next()
+			matchedCount := plannerOROrderBasicMatchWithMetrics(
+				branches,
+				&branchStart,
+				&branchEnd,
+				&branchChecks,
+				branchMetrics,
+				idx,
+				curBucket,
+				alwaysTrue,
+				alwaysTrueBranch,
+			)
+			if matchedCount == 0 {
+				continue
+			}
+			if matchedCount > 1 {
+				trace.addDedupe(uint64(matchedCount - 1))
+			}
+			if skip > 0 {
+				skip--
+				continue
+			}
+			out = append(out, qv.idFromIdxNoLock(idx))
+			need--
+			if need == 0 {
+				stopReason = "limit_reached"
+			}
+		}
+		it.Release()
 	}
 
 	trace.addOrderScanWidth(scanWidth)
 	trace.setORBranches(branchMetrics)
-	trace.setEarlyStopReason("input_exhausted")
+	trace.setEarlyStopReason(stopReason)
+	if promoteObserved {
+		qv.promoteOrderedORMaterializedBaseOps(q, branches, branchChecks, observed)
+	}
+	releasePlannerOROrderBasicCheckBufs(branchCount, &branchChecks)
 	return out, true
 }
 
@@ -2342,15 +2888,36 @@ type plannerOROrderMergeItem struct {
 }
 
 type plannerOROrderMergeHeap struct {
-	desc  bool
-	items []plannerOROrderMergeItem
+	desc     bool
+	items    []plannerOROrderMergeItem
+	itemsBuf *pooled.SliceBuf[plannerOROrderMergeItem]
 }
 
-func (h *plannerOROrderMergeHeap) len() int { return len(h.items) }
+func (h *plannerOROrderMergeHeap) len() int {
+	if h.itemsBuf != nil {
+		return h.itemsBuf.Len()
+	}
+	return len(h.items)
+}
+
+func (h *plannerOROrderMergeHeap) item(i int) plannerOROrderMergeItem {
+	if h.itemsBuf != nil {
+		return h.itemsBuf.Get(i)
+	}
+	return h.items[i]
+}
+
+func (h *plannerOROrderMergeHeap) setItem(i int, item plannerOROrderMergeItem) {
+	if h.itemsBuf != nil {
+		h.itemsBuf.Set(i, item)
+		return
+	}
+	h.items[i] = item
+}
 
 func (h *plannerOROrderMergeHeap) less(i, j int) bool {
-	a := h.items[i]
-	b := h.items[j]
+	a := h.item(i)
+	b := h.item(j)
 	if a.bucket != b.bucket {
 		if h.desc {
 			return a.bucket > b.bucket
@@ -2364,19 +2931,33 @@ func (h *plannerOROrderMergeHeap) less(i, j int) bool {
 	return a.branch < b.branch
 }
 
-func (h *plannerOROrderMergeHeap) swap(i, j int) { h.items[i], h.items[j] = h.items[j], h.items[i] }
+func (h *plannerOROrderMergeHeap) swap(i, j int) {
+	a := h.item(i)
+	b := h.item(j)
+	h.setItem(i, b)
+	h.setItem(j, a)
+}
 
 func (h *plannerOROrderMergeHeap) push(x plannerOROrderMergeItem) {
+	if h.itemsBuf != nil {
+		h.itemsBuf.Append(x)
+		h.up(h.itemsBuf.Len() - 1)
+		return
+	}
 	h.items = append(h.items, x)
 	h.up(len(h.items) - 1)
 }
 
 func (h *plannerOROrderMergeHeap) pop() plannerOROrderMergeItem {
-	n := len(h.items) - 1
+	n := h.len() - 1
 	h.swap(0, n)
-	x := h.items[n]
-	h.items = h.items[:n]
-	if len(h.items) > 0 {
+	x := h.item(n)
+	if h.itemsBuf != nil {
+		h.itemsBuf.SetLen(n)
+	} else {
+		h.items = h.items[:n]
+	}
+	if h.len() > 0 {
 		h.down(0)
 	}
 	return x
@@ -2394,7 +2975,7 @@ func (h *plannerOROrderMergeHeap) up(j int) {
 }
 
 func (h *plannerOROrderMergeHeap) down(i0 int) {
-	n := len(h.items)
+	n := h.len()
 	i := i0
 	for {
 		j1 := 2*i + 1
@@ -2413,11 +2994,37 @@ func (h *plannerOROrderMergeHeap) down(i0 int) {
 	}
 }
 
+type plannerOROrderIterStore struct {
+	inline [8]plannerOROrderBranchIter
+	buf    *pooled.SliceBuf[plannerOROrderBranchIter]
+}
+
+func (s *plannerOROrderIterStore) get(i int) plannerOROrderBranchIter {
+	if s.buf != nil {
+		return s.buf.Get(i)
+	}
+	return s.inline[i]
+}
+
+func (s *plannerOROrderIterStore) set(i int, iter plannerOROrderBranchIter) {
+	if s.buf != nil {
+		s.buf.Set(i, iter)
+		return
+	}
+	s.inline[i] = iter
+}
+
+func closePlannerOROrderInlineIters(iters *[8]plannerOROrderBranchIter, n int) {
+	for i := 0; i < n; i++ {
+		iters[i].close()
+	}
+}
+
 type plannerOROrderBranchIter struct {
 	branch         *plannerORBranch
-	checks         []int
-	exactChecks    []int
-	residualChecks []int
+	checks         *pooled.SliceBuf[int]
+	exactChecks    *pooled.SliceBuf[int]
+	residualChecks *pooled.SliceBuf[int]
 	overlay        fieldOverlay
 	desc           bool
 	single         int
@@ -2431,15 +3038,10 @@ type plannerOROrderBranchIter struct {
 	curBucket  int
 	curIter    posting.Iterator
 	curExact   bool
-	curChecks  []int
+	curChecks  *pooled.SliceBuf[int]
 	curSingle  int
 	bucketWork posting.List
-
-	onBucketVisit func(int)
-
-	totalExamined  *uint64
-	branchExamined *uint64
-	branchEmitted  *uint64
+	bucketSeen []bool
 
 	has bool
 	cur uint64
@@ -2490,9 +3092,24 @@ func (it *plannerOROrderBranchIter) close() {
 	}
 	it.bucketWork.Release()
 	it.bucketWork = posting.List{}
+	if it.checks != nil {
+		predicateCheckSlicePool.Put(it.checks)
+		it.checks = nil
+	}
+	if it.exactChecks != nil {
+		predicateCheckSlicePool.Put(it.exactChecks)
+		it.exactChecks = nil
+	}
+	if it.residualChecks != nil {
+		predicateCheckSlicePool.Put(it.residualChecks)
+		it.residualChecks = nil
+	}
+	it.curChecks = nil
 }
 
-func (it *plannerOROrderBranchIter) advance() bool {
+func (it *plannerOROrderBranchIter) advance() (uint64, uint64, bool) {
+	examinedDelta := uint64(0)
+	emittedDelta := uint64(0)
 	it.has = false
 	for {
 		if it.curIter != nil {
@@ -2500,7 +3117,7 @@ func (it *plannerOROrderBranchIter) advance() bool {
 				if it.curIter.HasNext() {
 					it.cur = it.curIter.Next()
 					it.has = true
-					return true
+					return examinedDelta, emittedDelta, true
 				}
 				it.curIter.Release()
 				it.curIter = nil
@@ -2509,25 +3126,18 @@ func (it *plannerOROrderBranchIter) advance() bool {
 			}
 			for it.curIter.HasNext() {
 				idx := it.curIter.Next()
-				if it.totalExamined != nil {
-					*it.totalExamined = *it.totalExamined + 1
-				}
-				if it.branchExamined != nil {
-					*it.branchExamined = *it.branchExamined + 1
-				}
+				examinedDelta++
 				matched := false
 				if it.curSingle >= 0 {
-					matched = it.branch.preds[it.curSingle].matches(idx)
+					matched = it.branch.predPtr(it.curSingle).matches(idx)
 				} else {
-					matched = it.branch.matchesChecks(idx, it.curChecks)
+					matched = it.branch.matchesChecksBuf(idx, it.curChecks)
 				}
 				if matched {
 					it.cur = idx
 					it.has = true
-					if it.branchEmitted != nil {
-						*it.branchEmitted = *it.branchEmitted + 1
-					}
-					return true
+					emittedDelta++
+					return examinedDelta, emittedDelta, true
 				}
 			}
 			it.curIter.Release()
@@ -2536,7 +3146,7 @@ func (it *plannerOROrderBranchIter) advance() bool {
 
 		if it.desc {
 			if it.nextBucket < it.startBucket {
-				return false
+				return examinedDelta, emittedDelta, false
 			}
 			b := it.nextBucket
 			it.nextBucket--
@@ -2544,56 +3154,37 @@ func (it *plannerOROrderBranchIter) advance() bool {
 			if bucket.IsEmpty() {
 				continue
 			}
-			if it.onBucketVisit != nil {
-				it.onBucketVisit(b)
+			if it.bucketSeen != nil && !it.bucketSeen[b] {
+				it.bucketSeen[b] = true
 			}
 			it.curBucket = b
 			if idx, ok := bucket.TrySingle(); ok {
-				if it.totalExamined != nil {
-					*it.totalExamined = *it.totalExamined + 1
-				}
-				if it.branchExamined != nil {
-					*it.branchExamined = *it.branchExamined + 1
-				}
+				examinedDelta++
 				matched := false
 				if it.single >= 0 {
-					matched = it.branch.preds[it.single].matches(idx)
+					matched = it.branch.predPtr(it.single).matches(idx)
 				} else {
-					matched = it.branch.matchesChecks(idx, it.checks)
+					matched = it.branch.matchesChecksBuf(idx, it.checks)
 				}
 				if !matched {
 					continue
 				}
 				it.cur = idx
 				it.has = true
-				if it.branchEmitted != nil {
-					*it.branchEmitted = *it.branchEmitted + 1
-				}
-				return true
+				emittedDelta++
+				return examinedDelta, emittedDelta, true
 			}
-			if len(it.exactChecks) > 0 {
-				mode, exactIDs, nextBucketWork, card := plannerFilterPostingByChecks(it.branch.preds, it.exactChecks, bucket, it.bucketWork, true)
+			if it.exactChecks.Len() > 0 {
+				mode, exactIDs, nextBucketWork, card := plannerFilterPostingByPredicateChecksBuf(it.branch.preds, it.exactChecks, bucket, it.bucketWork, true)
 				it.bucketWork = nextBucketWork
 				switch mode {
 				case plannerPredicateBucketEmpty:
-					if it.totalExamined != nil {
-						*it.totalExamined = *it.totalExamined + card
-					}
-					if it.branchExamined != nil {
-						*it.branchExamined = *it.branchExamined + card
-					}
+					examinedDelta += card
 					continue
 				case plannerPredicateBucketAll:
 					if it.allChecksExact {
-						if it.totalExamined != nil {
-							*it.totalExamined = *it.totalExamined + card
-						}
-						if it.branchExamined != nil {
-							*it.branchExamined = *it.branchExamined + card
-						}
-						if it.branchEmitted != nil {
-							*it.branchEmitted = *it.branchEmitted + card
-						}
+						examinedDelta += card
+						emittedDelta += card
 						it.curIter = exactIDs.Iter()
 						it.curExact = true
 						it.curChecks = nil
@@ -2607,15 +3198,8 @@ func (it *plannerOROrderBranchIter) advance() bool {
 					continue
 				case plannerPredicateBucketExact:
 					if it.allChecksExact {
-						if it.totalExamined != nil {
-							*it.totalExamined = *it.totalExamined + card
-						}
-						if it.branchExamined != nil {
-							*it.branchExamined = *it.branchExamined + card
-						}
-						if it.branchEmitted != nil {
-							*it.branchEmitted = *it.branchEmitted + exactIDs.Cardinality()
-						}
+						examinedDelta += card
+						emittedDelta += exactIDs.Cardinality()
 						it.curIter = exactIDs.Iter()
 						it.curExact = true
 						it.curChecks = nil
@@ -2637,7 +3221,7 @@ func (it *plannerOROrderBranchIter) advance() bool {
 		}
 
 		if it.nextBucket >= it.endBucket {
-			return false
+			return examinedDelta, emittedDelta, false
 		}
 		b := it.nextBucket
 		it.nextBucket++
@@ -2645,56 +3229,37 @@ func (it *plannerOROrderBranchIter) advance() bool {
 		if bucket.IsEmpty() {
 			continue
 		}
-		if it.onBucketVisit != nil {
-			it.onBucketVisit(b)
+		if it.bucketSeen != nil && !it.bucketSeen[b] {
+			it.bucketSeen[b] = true
 		}
 		it.curBucket = b
 		if idx, ok := bucket.TrySingle(); ok {
-			if it.totalExamined != nil {
-				*it.totalExamined = *it.totalExamined + 1
-			}
-			if it.branchExamined != nil {
-				*it.branchExamined = *it.branchExamined + 1
-			}
+			examinedDelta++
 			matched := false
 			if it.single >= 0 {
-				matched = it.branch.preds[it.single].matches(idx)
+				matched = it.branch.predPtr(it.single).matches(idx)
 			} else {
-				matched = it.branch.matchesChecks(idx, it.checks)
+				matched = it.branch.matchesChecksBuf(idx, it.checks)
 			}
 			if !matched {
 				continue
 			}
 			it.cur = idx
 			it.has = true
-			if it.branchEmitted != nil {
-				*it.branchEmitted = *it.branchEmitted + 1
-			}
-			return true
+			emittedDelta++
+			return examinedDelta, emittedDelta, true
 		}
-		if len(it.exactChecks) > 0 {
-			mode, exactIDs, nextBucketWork, card := plannerFilterPostingByChecks(it.branch.preds, it.exactChecks, bucket, it.bucketWork, true)
+		if it.exactChecks.Len() > 0 {
+			mode, exactIDs, nextBucketWork, card := plannerFilterPostingByPredicateChecksBuf(it.branch.preds, it.exactChecks, bucket, it.bucketWork, true)
 			it.bucketWork = nextBucketWork
 			switch mode {
 			case plannerPredicateBucketEmpty:
-				if it.totalExamined != nil {
-					*it.totalExamined = *it.totalExamined + card
-				}
-				if it.branchExamined != nil {
-					*it.branchExamined = *it.branchExamined + card
-				}
+				examinedDelta += card
 				continue
 			case plannerPredicateBucketAll:
 				if it.allChecksExact {
-					if it.totalExamined != nil {
-						*it.totalExamined = *it.totalExamined + card
-					}
-					if it.branchExamined != nil {
-						*it.branchExamined = *it.branchExamined + card
-					}
-					if it.branchEmitted != nil {
-						*it.branchEmitted = *it.branchEmitted + card
-					}
+					examinedDelta += card
+					emittedDelta += card
 					it.curIter = exactIDs.Iter()
 					it.curExact = true
 					it.curChecks = nil
@@ -2708,15 +3273,8 @@ func (it *plannerOROrderBranchIter) advance() bool {
 				continue
 			case plannerPredicateBucketExact:
 				if it.allChecksExact {
-					if it.totalExamined != nil {
-						*it.totalExamined = *it.totalExamined + card
-					}
-					if it.branchExamined != nil {
-						*it.branchExamined = *it.branchExamined + card
-					}
-					if it.branchEmitted != nil {
-						*it.branchEmitted = *it.branchEmitted + exactIDs.Cardinality()
-					}
+					examinedDelta += card
+					emittedDelta += exactIDs.Cardinality()
 					it.curIter = exactIDs.Iter()
 					it.curExact = true
 					it.curChecks = nil
@@ -2778,111 +3336,57 @@ func (qv *queryView[K, V]) execPlanOROrderKWay(q *qx.QX, branches plannerORBranc
 
 	fullTrace := trace.full()
 	var (
-		branchMetrics []TraceORBranch
-		examined      uint64
-		scanWidth     uint64
-		dedupe        uint64
+		branchMetrics       []TraceORBranch
+		branchMetricsInline [plannerORBranchLimit]TraceORBranch
+		examined            uint64
+		scanWidth           uint64
+		dedupe              uint64
 	)
-	var (
-		branchChecks      [plannerORBranchLimit][]int
-		branchExactChecks [plannerORBranchLimit][]int
-		branchResidual    [plannerORBranchLimit][]int
-		checkBufs         [plannerORBranchLimit]*intSliceBuf
-		exactCheckBufs    [plannerORBranchLimit]*intSliceBuf
-		residualCheckBufs [plannerORBranchLimit]*intSliceBuf
-	)
-	defer func() {
-		for i := range branches {
-			if checkBufs[i] != nil {
-				checkBufs[i].values = branchChecks[i]
-				releaseIntSliceBuf(checkBufs[i])
-			}
-			if exactCheckBufs[i] != nil {
-				exactCheckBufs[i].values = branchExactChecks[i]
-				releaseIntSliceBuf(exactCheckBufs[i])
-			}
-			if residualCheckBufs[i] != nil {
-				residualCheckBufs[i].values = branchResidual[i]
-				releaseIntSliceBuf(residualCheckBufs[i])
-			}
-		}
-	}()
-	var examinedPtr *uint64
 	if trace != nil {
 		if fullTrace {
-			branchMetrics = make([]TraceORBranch, len(branches))
+			branchMetrics = branchMetricsInline[:len(branches)]
 			for i := range branchMetrics {
 				branchMetrics[i].Index = i
 			}
 		}
-		examinedPtr = &examined
 	}
 
 	var bucketSeen []bool
 	if fullTrace {
 		bucketSeen = make([]bool, ov.keyCount())
 	}
-	markBucketVisited := func(bucket int) {
-		if !fullTrace || bucket < 0 || bucket >= len(bucketSeen) {
-			return
-		}
-		if bucketSeen[bucket] {
-			return
-		}
-		bucketSeen[bucket] = true
-		scanWidth++
-	}
 
 	var (
-		iters         []plannerOROrderBranchIter
-		itersBuf      *plannerOROrderIterSliceBuf
-		mergeItems    []plannerOROrderMergeItem
-		mergeItemsBuf *plannerOROrderMergeItemSliceBuf
+		iters         plannerOROrderIterStore
+		mergeItemsBuf *pooled.SliceBuf[plannerOROrderMergeItem]
 	)
-	if len(branches) <= 8 {
-		var itersInline [8]plannerOROrderBranchIter
-		iters = itersInline[:len(branches)]
-		var mergeItemsInline [8]plannerOROrderMergeItem
-		mergeItems = mergeItemsInline[:0]
+	if len(branches) <= len(iters.inline) {
+		defer closePlannerOROrderInlineIters(&iters.inline, len(branches))
 	} else {
-		itersBuf = getPlannerOROrderIterSliceBuf(len(branches))
-		iters = itersBuf.values[:len(branches)]
-		clear(iters)
-		defer func() {
-			clear(iters)
-			itersBuf.values = iters[:0]
-			releasePlannerOROrderIterSliceBuf(itersBuf)
-		}()
-
-		mergeItemsBuf = getPlannerOROrderMergeItemSliceBuf(len(branches))
-		mergeItems = mergeItemsBuf.values[:0]
-		defer func() {
-			clear(mergeItems)
-			mergeItemsBuf.values = mergeItems[:0]
-			releasePlannerOROrderMergeItemSliceBuf(mergeItemsBuf)
-		}()
+		iters.buf = plannerOROrderIterSlicePool.Get()
+		iters.buf.SetLen(len(branches))
+		defer plannerOROrderIterSlicePool.Put(iters.buf)
 	}
-	defer func() {
-		for i := range iters {
-			iters[i].close()
-		}
-	}()
+	mergeItemsBuf = plannerOROrderMergeItemSlicePool.Get()
+	mergeItemsBuf.Grow(len(branches))
+	defer plannerOROrderMergeItemSlicePool.Put(mergeItemsBuf)
 
-	h := &plannerOROrderMergeHeap{
-		desc:  o.Desc,
-		items: mergeItems,
+	h := plannerOROrderMergeHeap{
+		desc:     o.Desc,
+		itemsBuf: mergeItemsBuf,
 	}
 
 	for i := range branches {
-		br, covered, rangeOK := qv.extractOrderRangeCoverageOverlay(o.Field, branches[i].preds, ov)
+		br, covered, rangeOK := qv.extractOrderRangeCoverageOverlayReader(o.Field, branches[i].preds, ov)
 		if !rangeOK {
 			return nil, false, nil
 		}
-		for pi := range covered {
-			if covered[pi] {
-				branches[i].preds[pi].covered = true
+		for pi := 0; pi < covered.Len(); pi++ {
+			if covered.Get(pi) {
+				branches[i].predPtr(pi).covered = true
 			}
 		}
+		boolSlicePool.Put(covered)
 		branchStart, branchEnd := br.baseStart, br.baseEnd
 		if branchStart >= branchEnd {
 			if fullTrace {
@@ -2892,58 +3396,68 @@ func (qv *queryView[K, V]) execPlanOROrderKWay(q *qx.QX, branches plannerORBranc
 			continue
 		}
 
-		var bePtr *uint64
-		var bmPtr *uint64
-		if fullTrace {
-			bePtr = &branchMetrics[i].RowsExamined
-			bmPtr = &branchMetrics[i].RowsEmitted
-		}
-		checkBufs[i] = getIntSliceBuf(len(branches[i].preds))
-		branchChecks[i] = branches[i].buildMatchChecks(checkBufs[i].values)
-		exactCheckBufs[i] = getIntSliceBuf(len(branchChecks[i]))
-		branchExactChecks[i] = branches[i].buildPostingFilterChecks(exactCheckBufs[i].values, branchChecks[i])
-		residualCheckBufs[i] = getIntSliceBuf(len(branchChecks[i]))
-		branchResidual[i] = plannerResidualChecks(residualCheckBufs[i].values, branchChecks[i], branchExactChecks[i])
+		checksBuf := predicateCheckSlicePool.Get()
+		branches[i].buildMatchChecksBuf(checksBuf)
+		exactChecksBuf := predicateCheckSlicePool.Get()
+		exactChecksBuf.Grow(checksBuf.Len())
+		buildExactBucketPostingFilterActiveBufReader(exactChecksBuf, checksBuf, branches[i].preds)
+		residualChecksBuf := predicateCheckSlicePool.Get()
+		residualChecksBuf.Grow(checksBuf.Len())
+		plannerResidualChecksBuf(residualChecksBuf, checksBuf, exactChecksBuf)
 		singleCheck := -1
-		if len(branchChecks[i]) == 1 {
-			singleCheck = branchChecks[i][0]
+		if checksBuf.Len() == 1 {
+			singleCheck = checksBuf.Get(0)
 		}
 		residualSingle := -1
-		if len(branchResidual[i]) == 1 {
-			residualSingle = branchResidual[i][0]
+		if residualChecksBuf.Len() == 1 {
+			residualSingle = residualChecksBuf.Get(0)
 		}
-		iters[i] = plannerOROrderBranchIter{
+		iter := plannerOROrderBranchIter{
 			branch:         &branches[i],
-			checks:         branchChecks[i],
-			exactChecks:    branchExactChecks[i],
-			residualChecks: branchResidual[i],
+			checks:         checksBuf,
+			exactChecks:    exactChecksBuf,
+			residualChecks: residualChecksBuf,
 			overlay:        ov,
 			desc:           o.Desc,
 			single:         singleCheck,
 			residualSingle: residualSingle,
-			allChecksExact: len(branchChecks[i]) > 0 && len(branchExactChecks[i]) == len(branchChecks[i]),
+			allChecksExact: checksBuf.Len() > 0 && exactChecksBuf.Len() == checksBuf.Len(),
 			startBucket:    branchStart,
 			endBucket:      branchEnd,
-			onBucketVisit:  markBucketVisited,
-			totalExamined:  examinedPtr,
-			branchExamined: bePtr,
-			branchEmitted:  bmPtr,
+			bucketSeen:     bucketSeen,
 		}
-		iters[i].init()
-		if iters[i].advance() {
+		iter.init()
+		examinedDelta, emittedDelta, ok := iter.advance()
+		examined += examinedDelta
+		if fullTrace {
+			branchMetrics[i].RowsExamined += examinedDelta
+			branchMetrics[i].RowsEmitted += emittedDelta
+		}
+		if ok {
+			iters.set(i, iter)
 			h.push(plannerOROrderMergeItem{
 				branch: i,
-				bucket: iters[i].curBucket,
-				idx:    iters[i].cur,
+				bucket: iter.curBucket,
+				idx:    iter.cur,
 			})
 		} else if fullTrace {
+			iters.set(i, iter)
 			branchMetrics[i].Skipped = true
 			branchMetrics[i].SkipReason = "stream_empty"
+		} else {
+			iters.set(i, iter)
 		}
 	}
 
 	if h.len() == 0 {
 		if trace != nil {
+			if fullTrace {
+				for i := range bucketSeen {
+					if bucketSeen[i] {
+						scanWidth++
+					}
+				}
+			}
 			trace.addExamined(examined)
 			trace.addOrderScanWidth(scanWidth)
 			trace.setORBranches(branchMetrics)
@@ -2971,12 +3485,22 @@ func (qv *queryView[K, V]) execPlanOROrderKWay(q *qx.QX, branches plannerORBranc
 		bi := item.branch
 		pops++
 
-		if iters[bi].advance() {
+		iter := iters.get(bi)
+		examinedDelta, emittedDelta, ok := iter.advance()
+		examined += examinedDelta
+		if fullTrace {
+			branchMetrics[bi].RowsExamined += examinedDelta
+			branchMetrics[bi].RowsEmitted += emittedDelta
+		}
+		if ok {
+			iters.set(bi, iter)
 			h.push(plannerOROrderMergeItem{
 				branch: bi,
-				bucket: iters[bi].curBucket,
-				idx:    iters[bi].cur,
+				bucket: iter.curBucket,
+				idx:    iter.cur,
 			})
+		} else {
+			iters.set(bi, iter)
 		}
 
 		if !seen.Add(item.idx) {
@@ -3026,6 +3550,13 @@ func (qv *queryView[K, V]) execPlanOROrderKWay(q *qx.QX, branches plannerORBranc
 	}
 
 	if trace != nil {
+		if fullTrace {
+			for i := range bucketSeen {
+				if bucketSeen[i] {
+					scanWidth++
+				}
+			}
+		}
 		trace.addExamined(examined)
 		trace.addDedupe(dedupe)
 		trace.addOrderScanWidth(scanWidth)
@@ -3041,15 +3572,13 @@ func (qv *queryView[K, V]) execPlanOROrderMergeFallback(q *qx.QX, branches plann
 		return nil, false, nil
 	}
 
-	var candidateIDs posting.List
-	defer candidateIDs.Release()
 	candidateSet := newPostingLazySetBuilder(satMulUint64(uint64(need), uint64(len(branches))))
-	defer candidateSet.release()
 
 	fullTrace := trace.full()
 	var branchMetrics []TraceORBranch
+	var branchMetricsInline [plannerORBranchLimit]TraceORBranch
 	if fullTrace {
-		branchMetrics = make([]TraceORBranch, len(branches))
+		branchMetrics = branchMetricsInline[:len(branches)]
 		for i := range branchMetrics {
 			branchMetrics[i].Index = i
 		}
@@ -3066,11 +3595,13 @@ func (qv *queryView[K, V]) execPlanOROrderMergeFallback(q *qx.QX, branches plann
 	for i := range branches {
 		branch := branches[i]
 		if branch.alwaysTrue {
+			candidateSet.release()
 			return nil, false, nil
 		}
 
 		branchLimit, branchExhaustive, err := qv.planOROrderMergeBranchLimit(branch, need)
 		if err != nil {
+			candidateSet.release()
 			return nil, true, err
 		}
 		if branchLimit <= 0 {
@@ -3111,6 +3642,7 @@ func (qv *queryView[K, V]) execPlanOROrderMergeFallback(q *qx.QX, branches plann
 
 		ids, err := qv.execPreparedQuery(subQ)
 		if err != nil {
+			candidateSet.release()
 			return nil, true, err
 		}
 		if trace != nil {
@@ -3124,17 +3656,12 @@ func (qv *queryView[K, V]) execPlanOROrderMergeFallback(q *qx.QX, branches plann
 			continue
 		}
 
-		qv.root.forEachIdxFromID(ids, func(idx uint64) {
-			if candidateSet.addChecked(idx) {
-				return
-			}
-			if trace != nil {
-				trace.addDedupe(1)
-			}
-		})
+		if dedupe := qv.root.addCheckedIdxsFromIDs(ids, &candidateSet); dedupe > 0 && trace != nil {
+			trace.addDedupe(dedupe)
+		}
 	}
 
-	candidateIDs = candidateSet.finish(false)
+	candidateIDs := candidateSet.finish(false)
 
 	if candidateIDs.IsEmpty() {
 		if trace != nil {
@@ -3147,21 +3674,26 @@ func (qv *queryView[K, V]) execPlanOROrderMergeFallback(q *qx.QX, branches plann
 	o := q.Order[0]
 	fm := qv.fields[o.Field]
 	if fm == nil || fm.Slice {
+		candidateIDs.Release()
 		return nil, false, nil
 	}
 	orderView, ok := qv.plannerOrderIndexSnapshotView(o.Field)
 	if !ok {
+		candidateIDs.Release()
 		return nil, false, nil
 	}
-	defer orderView.close()
 	ov := orderView.overlay
 	if !ov.hasData() {
+		orderView.close()
+		candidateIDs.Release()
 		return nil, true, nil
 	}
 
 	skip := q.Offset
 	needOut := q.Limit
 	if needOut == 0 {
+		orderView.close()
+		candidateIDs.Release()
 		return nil, true, nil
 	}
 
@@ -3170,20 +3702,6 @@ func (qv *queryView[K, V]) execPlanOROrderMergeFallback(q *qx.QX, branches plann
 
 	seenCandidates := uint64(0)
 	scanWidth := uint64(0)
-
-	emit := func(idx uint64) bool {
-		if !candidateIDs.Contains(idx) {
-			return false
-		}
-		seenCandidates++
-		if skip > 0 {
-			skip--
-			return false
-		}
-		out = append(out, qv.idFromIdxNoLock(idx))
-		needOut--
-		return needOut == 0
-	}
 
 	cur := ov.newCursor(ov.rangeForBounds(rangeBounds{has: true}), o.Desc)
 	for {
@@ -3197,35 +3715,47 @@ func (qv *queryView[K, V]) execPlanOROrderMergeFallback(q *qx.QX, branches plann
 		scanWidth++
 		if bm.Cardinality() == 1 {
 			idx, _ := bm.Minimum()
-			if emit(idx) {
-				if trace != nil {
-					trace.addExamined(seenCandidates)
-					trace.addOrderScanWidth(scanWidth)
-					trace.setORBranches(branchMetrics)
-					trace.setEarlyStopReason("limit_reached")
+			if !candidateIDs.Contains(idx) {
+				continue
+			}
+			seenCandidates++
+			if skip > 0 {
+				skip--
+			} else {
+				out = append(out, qv.idFromIdxNoLock(idx))
+				needOut--
+				if needOut == 0 {
+					setOROrderMergeFallbackTrace(trace, seenCandidates, scanWidth, branchMetrics, "limit_reached")
+					orderView.close()
+					candidateIDs.Release()
+					return out, true, nil
 				}
-				return out, true, nil
 			}
 			if seenCandidates == totalCandidates {
 				break
 			}
 			continue
 		}
-		stop := false
-		bm.ForEach(func(idx uint64) bool {
-			if emit(idx) {
-				if trace != nil {
-					trace.addExamined(seenCandidates)
-					trace.addOrderScanWidth(scanWidth)
-					trace.setORBranches(branchMetrics)
-					trace.setEarlyStopReason("limit_reached")
-				}
-				stop = true
-				return false
+
+		it := bm.Iter()
+		for needOut > 0 && it.HasNext() {
+			idx := it.Next()
+			if !candidateIDs.Contains(idx) {
+				continue
 			}
-			return true
-		})
-		if stop {
+			seenCandidates++
+			if skip > 0 {
+				skip--
+				continue
+			}
+			out = append(out, qv.idFromIdxNoLock(idx))
+			needOut--
+		}
+		it.Release()
+		if needOut == 0 {
+			setOROrderMergeFallbackTrace(trace, seenCandidates, scanWidth, branchMetrics, "limit_reached")
+			orderView.close()
+			candidateIDs.Release()
 			return out, true, nil
 		}
 		if seenCandidates == totalCandidates {
@@ -3233,16 +3763,13 @@ func (qv *queryView[K, V]) execPlanOROrderMergeFallback(q *qx.QX, branches plann
 		}
 	}
 
-	if trace != nil {
-		trace.addExamined(seenCandidates)
-		trace.addOrderScanWidth(scanWidth)
-		trace.setORBranches(branchMetrics)
-		if seenCandidates == totalCandidates {
-			trace.setEarlyStopReason("candidates_exhausted")
-		} else {
-			trace.setEarlyStopReason("order_index_exhausted")
-		}
+	stopReason := "order_index_exhausted"
+	if seenCandidates == totalCandidates {
+		stopReason = "candidates_exhausted"
 	}
+	setOROrderMergeFallbackTrace(trace, seenCandidates, scanWidth, branchMetrics, stopReason)
+	orderView.close()
+	candidateIDs.Release()
 	return out, true, nil
 }
 
@@ -3251,6 +3778,19 @@ type plannerOROrderFallbackAccumulator struct {
 	dst            *postingLazySetBuilder
 	checks         []int
 	residualChecks []int
+	singleCheck    int
+	residualSingle int
+	limit          uint64
+	emitted        uint64
+	examined       uint64
+	dedupe         uint64
+}
+
+type plannerOROrderFallbackAccumulatorBuf struct {
+	branch         *plannerORBranch
+	dst            *postingLazySetBuilder
+	checks         *pooled.SliceBuf[int]
+	residualChecks *pooled.SliceBuf[int]
 	singleCheck    int
 	residualSingle int
 	limit          uint64
@@ -3301,7 +3841,7 @@ func (c *plannerOROrderFallbackAccumulator) emitPostingChecked(ids posting.List)
 func (c *plannerOROrderFallbackAccumulator) emit(idx uint64) bool {
 	c.examined++
 	if c.singleCheck >= 0 {
-		if !c.branch.preds[c.singleCheck].matches(idx) {
+		if !c.branch.predPtr(c.singleCheck).matches(idx) {
 			return false
 		}
 	} else if !c.branch.matchesChecks(idx, c.checks) {
@@ -3313,13 +3853,230 @@ func (c *plannerOROrderFallbackAccumulator) emit(idx uint64) bool {
 func (c *plannerOROrderFallbackAccumulator) emitExact(idx uint64) bool {
 	c.examined++
 	if c.residualSingle >= 0 {
-		if !c.branch.preds[c.residualSingle].matches(idx) {
+		if !c.branch.predPtr(c.residualSingle).matches(idx) {
 			return false
 		}
 	} else if !c.branch.matchesChecks(idx, c.residualChecks) {
 		return false
 	}
 	return c.add(idx)
+}
+
+func (c *plannerOROrderFallbackAccumulatorBuf) add(idx uint64) bool {
+	c.emitted++
+	if !c.dst.addChecked(idx) {
+		c.dedupe++
+	}
+	return c.emitted >= c.limit
+}
+
+func (c *plannerOROrderFallbackAccumulatorBuf) emitPostingNoChecks(ids posting.List, card uint64) bool {
+	c.examined += card
+	if idx, ok := ids.TrySingle(); ok {
+		return c.add(idx)
+	}
+	it := ids.Iter()
+	for it.HasNext() {
+		if c.add(it.Next()) {
+			it.Release()
+			return true
+		}
+	}
+	it.Release()
+	return false
+}
+
+func (c *plannerOROrderFallbackAccumulatorBuf) emitPostingChecked(ids posting.List) bool {
+	if idx, ok := ids.TrySingle(); ok {
+		return c.emitExact(idx)
+	}
+	it := ids.Iter()
+	for it.HasNext() {
+		if c.emitExact(it.Next()) {
+			it.Release()
+			return true
+		}
+	}
+	it.Release()
+	return false
+}
+
+func (c *plannerOROrderFallbackAccumulatorBuf) emit(idx uint64) bool {
+	c.examined++
+	if c.singleCheck >= 0 {
+		if !c.branch.predPtr(c.singleCheck).matches(idx) {
+			return false
+		}
+	} else if !c.branch.matchesChecksBuf(idx, c.checks) {
+		return false
+	}
+	return c.add(idx)
+}
+
+func (c *plannerOROrderFallbackAccumulatorBuf) emitExact(idx uint64) bool {
+	c.examined++
+	if c.residualSingle >= 0 {
+		if !c.branch.predPtr(c.residualSingle).matches(idx) {
+			return false
+		}
+	} else if !c.branch.matchesChecksBuf(idx, c.residualChecks) {
+		return false
+	}
+	return c.add(idx)
+}
+
+func (qv *queryView[K, V]) collectOROrderFallbackBranchCandidatesWithChecks(
+	branch *plannerORBranch,
+	branchLimit int,
+	ov fieldOverlay,
+	desc bool,
+	start, end int,
+	dst *postingLazySetBuilder,
+	checks, exactChecks, residualChecks []int,
+) (uint64, uint64, uint64) {
+	singleCheck := -1
+	if len(checks) == 1 {
+		singleCheck = checks[0]
+	}
+	residualSingle := -1
+	if len(residualChecks) == 1 {
+		residualSingle = residualChecks[0]
+	}
+	var bucketWork posting.List
+	defer bucketWork.Release()
+	allChecksExact := len(checks) > 0 && len(exactChecks) == len(checks)
+	acc := plannerOROrderFallbackAccumulator{
+		branch:         branch,
+		dst:            dst,
+		checks:         checks,
+		residualChecks: residualChecks,
+		singleCheck:    singleCheck,
+		residualSingle: residualSingle,
+		limit:          uint64(branchLimit),
+	}
+
+	cur := ov.newCursor(ov.rangeByRanks(start, end), desc)
+	for {
+		_, bucket, ok := cur.next()
+		if !ok {
+			break
+		}
+		if bucket.IsEmpty() {
+			continue
+		}
+		if idx, ok := bucket.TrySingle(); ok {
+			if acc.emit(idx) {
+				break
+			}
+			continue
+		}
+		if len(exactChecks) > 0 {
+			mode, exactIDs, nextBucketWork, card := plannerFilterPostingByPredicateChecks(branch.preds, exactChecks, bucket, bucketWork, true)
+			bucketWork = nextBucketWork
+			switch mode {
+			case plannerPredicateBucketEmpty:
+				acc.examined += card
+				continue
+			case plannerPredicateBucketAll, plannerPredicateBucketExact:
+				if allChecksExact {
+					if acc.emitPostingNoChecks(exactIDs, card) {
+						return acc.emitted, acc.examined, acc.dedupe
+					}
+					continue
+				}
+				if acc.emitPostingChecked(exactIDs) {
+					return acc.emitted, acc.examined, acc.dedupe
+				}
+				continue
+			}
+		}
+		it := bucket.Iter()
+		for it.HasNext() {
+			if acc.emit(it.Next()) {
+				it.Release()
+				return acc.emitted, acc.examined, acc.dedupe
+			}
+		}
+		it.Release()
+	}
+	return acc.emitted, acc.examined, acc.dedupe
+}
+
+func (qv *queryView[K, V]) collectOROrderFallbackBranchCandidatesWithChecksBuf(
+	branch *plannerORBranch,
+	branchLimit int,
+	ov fieldOverlay,
+	desc bool,
+	start, end int,
+	dst *postingLazySetBuilder,
+	checks, exactChecks, residualChecks *pooled.SliceBuf[int],
+) (uint64, uint64, uint64) {
+	singleCheck := -1
+	if checks.Len() == 1 {
+		singleCheck = checks.Get(0)
+	}
+	residualSingle := -1
+	if residualChecks.Len() == 1 {
+		residualSingle = residualChecks.Get(0)
+	}
+	var bucketWork posting.List
+	defer bucketWork.Release()
+	allChecksExact := checks.Len() > 0 && exactChecks.Len() == checks.Len()
+	acc := plannerOROrderFallbackAccumulatorBuf{
+		branch:         branch,
+		dst:            dst,
+		checks:         checks,
+		residualChecks: residualChecks,
+		singleCheck:    singleCheck,
+		residualSingle: residualSingle,
+		limit:          uint64(branchLimit),
+	}
+
+	cur := ov.newCursor(ov.rangeByRanks(start, end), desc)
+	for {
+		_, bucket, ok := cur.next()
+		if !ok {
+			break
+		}
+		if bucket.IsEmpty() {
+			continue
+		}
+		if idx, ok := bucket.TrySingle(); ok {
+			if acc.emit(idx) {
+				break
+			}
+			continue
+		}
+		if exactChecks.Len() > 0 {
+			mode, exactIDs, nextBucketWork, card := plannerFilterPostingByPredicateChecksBuf(branch.preds, exactChecks, bucket, bucketWork, true)
+			bucketWork = nextBucketWork
+			switch mode {
+			case plannerPredicateBucketEmpty:
+				acc.examined += card
+				continue
+			case plannerPredicateBucketAll, plannerPredicateBucketExact:
+				if allChecksExact {
+					if acc.emitPostingNoChecks(exactIDs, card) {
+						return acc.emitted, acc.examined, acc.dedupe
+					}
+					continue
+				}
+				if acc.emitPostingChecked(exactIDs) {
+					return acc.emitted, acc.examined, acc.dedupe
+				}
+				continue
+			}
+		}
+		it := bucket.Iter()
+		for it.HasNext() {
+			if acc.emit(it.Next()) {
+				it.Release()
+				return acc.emitted, acc.examined, acc.dedupe
+			}
+		}
+		it.Release()
+	}
+	return acc.emitted, acc.examined, acc.dedupe
 }
 
 // collectOROrderFallbackBranchCandidates collects up to branchLimit matching ids
@@ -3348,104 +4105,50 @@ func (qv *queryView[K, V]) collectOROrderFallbackBranchCandidates(
 	if !ov.hasData() {
 		return 0, 0, 0, false
 	}
-	br, covered, rangeOK := qv.extractOrderRangeCoverageOverlay(order.Field, branch.preds, ov)
+	br, covered, rangeOK := qv.extractOrderRangeCoverageOverlayReader(order.Field, branch.preds, ov)
 	if !rangeOK {
 		return 0, 0, 0, false
 	}
-	for pi := range covered {
-		if covered[pi] {
-			branch.preds[pi].covered = true
+	for pi := 0; pi < covered.Len(); pi++ {
+		if covered.Get(pi) {
+			branch.predPtr(pi).covered = true
 		}
 	}
+	boolSlicePool.Put(covered)
 	start, end := br.baseStart, br.baseEnd
 	if start >= end {
 		return 0, 0, 0, true
 	}
 
-	checksBuf := getIntSliceBuf(len(branch.preds))
-	checks := branch.buildMatchChecks(checksBuf.values)
-	defer func() {
-		checksBuf.values = checks
-		releaseIntSliceBuf(checksBuf)
-	}()
-	exactChecksBuf := getIntSliceBuf(len(checks))
-	exactChecks := branch.buildPostingFilterChecks(exactChecksBuf.values, checks)
-	defer func() {
-		exactChecksBuf.values = exactChecks
-		releaseIntSliceBuf(exactChecksBuf)
-	}()
-	residualChecksBuf := getIntSliceBuf(len(checks))
-	residualChecks := plannerResidualChecks(residualChecksBuf.values, checks, exactChecks)
-	defer func() {
-		residualChecksBuf.values = residualChecks
-		releaseIntSliceBuf(residualChecksBuf)
-	}()
-	singleCheck := -1
-	if len(checks) == 1 {
-		singleCheck = checks[0]
-	}
-	residualSingle := -1
-	if len(residualChecks) == 1 {
-		residualSingle = residualChecks[0]
-	}
-	var bucketWork posting.List
-	defer bucketWork.Release()
-	allChecksExact := len(checks) > 0 && len(exactChecks) == len(checks)
-	acc := plannerOROrderFallbackAccumulator{
-		branch:         branch,
-		dst:            dst,
-		checks:         checks,
-		residualChecks: residualChecks,
-		singleCheck:    singleCheck,
-		residualSingle: residualSingle,
-		limit:          uint64(branchLimit),
+	if branch.predLen() <= plannerPredicateFastPathMaxLeaves {
+		var checksInline [plannerPredicateFastPathMaxLeaves]int
+		var exactChecksInline [plannerPredicateFastPathMaxLeaves]int
+		var residualChecksInline [plannerPredicateFastPathMaxLeaves]int
+		checks := branch.buildMatchChecks(checksInline[:0])
+		exactChecks := branch.buildPostingFilterChecks(exactChecksInline[:0], checks)
+		residualChecks := plannerResidualChecks(residualChecksInline[:0], checks, exactChecks)
+		emitted, examined, dedupe := qv.collectOROrderFallbackBranchCandidatesWithChecks(
+			branch, branchLimit, ov, order.Desc, start, end, dst, checks, exactChecks, residualChecks,
+		)
+		return emitted, examined, dedupe, true
 	}
 
-	cur := ov.newCursor(ov.rangeByRanks(start, end), order.Desc)
-	for {
-		_, bucket, ok := cur.next()
-		if !ok {
-			break
-		}
-		if bucket.IsEmpty() {
-			continue
-		}
-		if idx, ok := bucket.TrySingle(); ok {
-			if acc.emit(idx) {
-				return acc.emitted, acc.examined, acc.dedupe, true
-			}
-			continue
-		}
-		if len(exactChecks) > 0 {
-			mode, exactIDs, nextBucketWork, card := plannerFilterPostingByChecks(branch.preds, exactChecks, bucket, bucketWork, true)
-			bucketWork = nextBucketWork
-			switch mode {
-			case plannerPredicateBucketEmpty:
-				acc.examined += card
-				continue
-			case plannerPredicateBucketAll, plannerPredicateBucketExact:
-				if allChecksExact {
-					if acc.emitPostingNoChecks(exactIDs, card) {
-						return acc.emitted, acc.examined, acc.dedupe, true
-					}
-					continue
-				}
-				if acc.emitPostingChecked(exactIDs) {
-					return acc.emitted, acc.examined, acc.dedupe, true
-				}
-				continue
-			}
-		}
-		it := bucket.Iter()
-		for it.HasNext() {
-			if acc.emit(it.Next()) {
-				it.Release()
-				return acc.emitted, acc.examined, acc.dedupe, true
-			}
-		}
-		it.Release()
-	}
-	return acc.emitted, acc.examined, acc.dedupe, true
+	checksBuf := predicateCheckSlicePool.Get()
+	checksBuf.Grow(branch.predLen())
+	branch.buildMatchChecksBuf(checksBuf)
+	exactChecksBuf := predicateCheckSlicePool.Get()
+	exactChecksBuf.Grow(checksBuf.Len())
+	buildExactBucketPostingFilterActiveBufReader(exactChecksBuf, checksBuf, branch.preds)
+	residualChecksBuf := predicateCheckSlicePool.Get()
+	residualChecksBuf.Grow(checksBuf.Len())
+	plannerResidualChecksBuf(residualChecksBuf, checksBuf, exactChecksBuf)
+	emitted, examined, dedupe := qv.collectOROrderFallbackBranchCandidatesWithChecksBuf(
+		branch, branchLimit, ov, order.Desc, start, end, dst, checksBuf, exactChecksBuf, residualChecksBuf,
+	)
+	predicateCheckSlicePool.Put(residualChecksBuf)
+	predicateCheckSlicePool.Put(exactChecksBuf)
+	predicateCheckSlicePool.Put(checksBuf)
+	return emitted, examined, dedupe, true
 }
 
 func (qv *queryView[K, V]) planOROrderMergeBranchLimit(branch plannerORBranch, need int) (limit int, exhaustive bool, err error) {
@@ -3459,14 +4162,14 @@ func (qv *queryView[K, V]) planOROrderMergeBranchLimit(branch plannerORBranch, n
 		return limit, false, nil
 	}
 
-	if len(branch.preds) == 0 || len(branch.preds) > 4 {
+	if branch.predLen() == 0 || branch.predLen() > 4 {
 		return limit, false, nil
 	}
 
 	// Keep branch pre-counting conservative:
 	// for broad/range/string scans it is usually not worth extra Count().
-	for i := range branch.preds {
-		e := branch.preds[i].expr
+	for i := 0; i < branch.predLen(); i++ {
+		e := branch.pred(i).expr
 		if e.Not {
 			return limit, false, nil
 		}
@@ -3500,13 +4203,13 @@ func (qv *queryView[K, V]) planOROrderMergeBranchLimit(branch plannerORBranch, n
 }
 
 func plannerOROrderMergePrecountWorth(branch plannerORBranch, need int) bool {
-	if need <= 0 || branch.lead == nil || branch.lead.estCard == 0 {
+	if need <= 0 || !branch.hasLead() || branch.leadPred().estCard == 0 {
 		return false
 	}
 
 	checks := float64(branch.containsChecks())
 	needF := float64(need)
-	leadEst := float64(branch.lead.estCard)
+	leadEst := float64(branch.leadPred().estCard)
 	if leadEst < 1 {
 		leadEst = 1
 	}
@@ -3526,25 +4229,68 @@ func (qv *queryView[K, V]) canPrecountORBranchExpr(e qx.Expr) bool {
 	if !isMaterializedScalarCacheOp(e.Op) {
 		return true
 	}
-	cacheKey := qv.materializedPredCacheKey(e)
-	if cacheKey == "" {
+	cacheKey := qv.materializedPredKey(e)
+	if cacheKey.isZero() {
 		return false
 	}
-	_, ok := qv.snap.loadMaterializedPred(cacheKey)
+	_, ok := qv.snap.loadMaterializedPredKey(cacheKey)
 	return ok
+}
+
+func (qv *queryView[K, V]) countORBranchByUniqueLeadWithChecks(branch plannerORBranch, leadIdx int, checks []int) (uint64, bool) {
+	lead := branch.pred(leadIdx)
+	it := lead.newIter()
+	if it == nil {
+		return 0, false
+	}
+	defer it.Release()
+
+	var cnt uint64
+	for it.HasNext() {
+		idx := it.Next()
+		pass := true
+		for _, ci := range checks {
+			if !branch.predPtr(ci).matches(idx) {
+				pass = false
+				break
+			}
+		}
+		if pass {
+			cnt++
+		}
+	}
+	return cnt, true
+}
+
+func (qv *queryView[K, V]) countORBranchByUniqueLeadWithChecksBuf(branch plannerORBranch, leadIdx int, checks *pooled.SliceBuf[int]) (uint64, bool) {
+	lead := branch.pred(leadIdx)
+	it := lead.newIter()
+	if it == nil {
+		return 0, false
+	}
+	defer it.Release()
+
+	var cnt uint64
+	for it.HasNext() {
+		idx := it.Next()
+		if branch.matchesChecksBuf(idx, checks) {
+			cnt++
+		}
+	}
+	return cnt, true
 }
 
 // countORBranchByUniqueLead tries to count one OR branch by scanning a unique
 // EQ predicate lead and validating the remaining predicates with contains().
 func (qv *queryView[K, V]) countORBranchByUniqueLead(branch plannerORBranch) (uint64, bool) {
-	if len(branch.preds) == 0 {
+	if branch.predLen() == 0 {
 		return 0, false
 	}
 
 	leadIdx := -1
 	leadEst := uint64(0)
-	for i := range branch.preds {
-		p := branch.preds[i]
+	for i := 0; i < branch.predLen(); i++ {
+		p := branch.pred(i)
 		if p.alwaysTrue || p.covered || !p.hasIter() {
 			continue
 		}
@@ -3562,50 +4308,46 @@ func (qv *queryView[K, V]) countORBranchByUniqueLead(branch plannerORBranch) (ui
 	if leadEst > 64 {
 		return 0, false
 	}
+	if branch.predLen() <= plannerPredicateFastPathMaxLeaves {
+		var checksInline [plannerPredicateFastPathMaxLeaves]int
+		checks := checksInline[:0]
+		for i := 0; i < branch.predLen(); i++ {
+			if i == leadIdx {
+				continue
+			}
+			p := branch.pred(i)
+			if p.covered || p.alwaysTrue {
+				continue
+			}
+			if p.alwaysFalse || !p.hasContains() {
+				return 0, true
+			}
+			checks = append(checks, i)
+		}
+		sortActivePredicatesReader(checks, branch.preds)
+		return qv.countORBranchByUniqueLeadWithChecks(branch, leadIdx, checks)
+	}
 
-	checksBuf := getIntSliceBuf(len(branch.preds))
-	checks := checksBuf.values
-	defer func() {
-		checksBuf.values = checks
-		releaseIntSliceBuf(checksBuf)
-	}()
-	for i := range branch.preds {
+	checksBuf := predicateCheckSlicePool.Get()
+	checksBuf.Grow(branch.predLen())
+	for i := 0; i < branch.predLen(); i++ {
 		if i == leadIdx {
 			continue
 		}
-		p := branch.preds[i]
+		p := branch.pred(i)
 		if p.covered || p.alwaysTrue {
 			continue
 		}
 		if p.alwaysFalse || !p.hasContains() {
+			predicateCheckSlicePool.Put(checksBuf)
 			return 0, true
 		}
-		checks = append(checks, i)
+		checksBuf.Append(i)
 	}
-	sortActivePredicates(checks, branch.preds)
-
-	it := branch.preds[leadIdx].newIter()
-	if it == nil {
-		return 0, false
-	}
-	defer it.Release()
-
-	var cnt uint64
-	for it.HasNext() {
-		idx := it.Next()
-		pass := true
-		for _, ci := range checks {
-			if !branch.preds[ci].matches(idx) {
-				pass = false
-				break
-			}
-		}
-		if pass {
-			cnt++
-		}
-	}
-
-	return cnt, true
+	sortActivePredicatesBufReader(checksBuf, branch.preds)
+	cnt, ok := qv.countORBranchByUniqueLeadWithChecksBuf(branch, leadIdx, checksBuf)
+	predicateCheckSlicePool.Put(checksBuf)
+	return cnt, ok
 }
 
 type plannerORNoOrderBranchState struct {
@@ -3634,7 +4376,8 @@ func plannerORNoOrderClassify(branches plannerORBranches) plannerORNoOrderMode {
 		if branches[i].alwaysTrue {
 			return plannerORNoOrderModeUniverse
 		}
-		if branches[i].lead == nil || !branches[i].lead.hasIter() {
+		lead := branches[i].leadPtr()
+		if lead == nil || !lead.hasIter() {
 			return plannerORNoOrderModeUnsupported
 		}
 	}
@@ -3657,14 +4400,103 @@ func plannerORNoOrderSortBranchOrder(order []int, states []plannerORNoOrderBranc
 	}
 }
 
-func plannerORNoOrderInsertTopN(top []uint64, idx uint64, n int) []uint64 {
-	if n <= 0 {
-		return top
+func plannerORNoOrderNextBudget(cur uint64) uint64 {
+	if cur < plannerORNoOrderMinBranchBudget {
+		return plannerORNoOrderMinBranchBudget
 	}
-	lo, hi := 0, len(top)
+	n := cur * 2
+	if n > plannerORNoOrderMaxBranchBudget {
+		n = plannerORNoOrderMaxBranchBudget
+	}
+	return n
+}
+
+func plannerORNoOrderProbeBranch(st *plannerORNoOrderBranchState) (uint64, uint64) {
+	if st.exhausted || st.iter.has {
+		return 0, 0
+	}
+	st.initialized = true
+	examinedDelta, emittedDelta, budgetHit := st.iter.advanceWithBudget(st.budget)
+	if st.iter.has {
+		st.capped = false
+		return examinedDelta, emittedDelta
+	}
+	if budgetHit {
+		st.capped = true
+		st.budget = plannerORNoOrderNextBudget(st.budget)
+		return examinedDelta, emittedDelta
+	}
+	st.capped = false
+	st.exhausted = true
+	return examinedDelta, emittedDelta
+}
+
+func plannerORNoOrderConsumeBranch(st *plannerORNoOrderBranchState) (uint64, uint64) {
+	if !st.iter.has {
+		return 0, 0
+	}
+	examinedDelta, emittedDelta, budgetHit := st.iter.advanceWithBudget(st.budget)
+	if st.iter.has {
+		st.capped = false
+		return examinedDelta, emittedDelta
+	}
+	if budgetHit {
+		st.capped = true
+		st.budget = plannerORNoOrderNextBudget(st.budget)
+		return examinedDelta, emittedDelta
+	}
+	st.capped = false
+	st.exhausted = true
+	return examinedDelta, emittedDelta
+}
+
+func plannerORNoOrderFindReadyMin(states []plannerORNoOrderBranchState, maxInclusive uint64, useMax bool) *plannerORNoOrderBranchState {
+	var best *plannerORNoOrderBranchState
+	for i := range states {
+		st := &states[i]
+		if !st.iter.has {
+			continue
+		}
+		if useMax && st.iter.cur > maxInclusive {
+			continue
+		}
+		if best == nil || st.iter.cur < best.iter.cur {
+			best = st
+		}
+	}
+	return best
+}
+
+func plannerORNoOrderFindNextUninitialized(order []int, states []plannerORNoOrderBranchState) *plannerORNoOrderBranchState {
+	for _, idx := range order {
+		st := &states[idx]
+		if st.initialized || st.exhausted {
+			continue
+		}
+		return st
+	}
+	return nil
+}
+
+func plannerORNoOrderFindNextCapped(order []int, states []plannerORNoOrderBranchState) *plannerORNoOrderBranchState {
+	for _, idx := range order {
+		st := &states[idx]
+		if st.exhausted || !st.capped || st.iter.has {
+			continue
+		}
+		return st
+	}
+	return nil
+}
+
+func plannerORNoOrderInsertTopN(top *pooled.SliceBuf[uint64], idx uint64, n int) {
+	if n <= 0 {
+		return
+	}
+	lo, hi := 0, top.Len()
 	for lo < hi {
 		mid := lo + (hi-lo)/2
-		if top[mid] < idx {
+		if top.Get(mid) < idx {
 			lo = mid + 1
 			continue
 		}
@@ -3672,19 +4504,48 @@ func plannerORNoOrderInsertTopN(top []uint64, idx uint64, n int) []uint64 {
 	}
 	pos := lo
 
-	if len(top) < n {
-		top = append(top, 0)
-		copy(top[pos+1:], top[pos:])
-		top[pos] = idx
-		return top
+	if top.Len() < n {
+		top.Append(0)
+		for i := top.Len() - 1; i > pos; i-- {
+			top.Set(i, top.Get(i-1))
+		}
+		top.Set(pos, idx)
+		return
 	}
-	if pos >= len(top) {
-		return top
+	if pos >= top.Len() {
+		return
 	}
 
-	copy(top[pos+1:], top[pos:len(top)-1])
-	top[pos] = idx
-	return top
+	for i := top.Len() - 1; i > pos; i-- {
+		top.Set(i, top.Get(i-1))
+	}
+	top.Set(pos, idx)
+}
+
+func plannerORNoOrderAddCandidate(top *pooled.SliceBuf[uint64], idx uint64, need int, useLinearSeen bool, seen *u64set, trace *queryTrace) {
+	// Threshold prune prevents growing a candidate set that can no longer
+	// improve top-N; it is key for large OR unions with small LIMIT.
+	if top.Len() == need && idx > top.Get(top.Len()-1) {
+		return
+	}
+
+	if useLinearSeen {
+		for i := 0; i < top.Len(); i++ {
+			if top.Get(i) == idx {
+				if trace != nil {
+					trace.addDedupe(1)
+				}
+				return
+			}
+		}
+	} else if !seen.Add(idx) {
+		if trace != nil {
+			trace.addDedupe(1)
+		}
+		return
+	}
+
+	plannerORNoOrderInsertTopN(top, idx, need)
 }
 
 func (qv *queryView[K, V]) execPlanORNoOrder(q *qx.QX, branches plannerORBranches, trace *queryTrace) ([]K, bool) {
@@ -3727,154 +4588,41 @@ func (qv *queryView[K, V]) execPlanORNoOrderAdaptiveCore(q *qx.QX, branches plan
 	}
 
 	fullTrace := trace.full()
-	var (
-		examined    uint64
-		examinedPtr *uint64
-	)
+	examined := uint64(0)
 	var branchMetrics []TraceORBranch
+	var branchMetricsInline [plannerORBranchLimit]TraceORBranch
 	if trace != nil {
-		examinedPtr = &examined
 		if fullTrace {
-			branchMetrics = make([]TraceORBranch, len(branches))
+			branchMetrics = branchMetricsInline[:len(branches)]
 			for i := range branchMetrics {
 				branchMetrics[i].Index = i
 			}
 		}
 	}
 
-	var states []plannerORNoOrderBranchState
-	if len(branches) <= 8 {
-		var statesInline [8]plannerORNoOrderBranchState
-		states = statesInline[:len(branches)]
-	} else {
-		states = make([]plannerORNoOrderBranchState, len(branches))
-	}
+	var statesInline [plannerORBranchLimit]plannerORNoOrderBranchState
+	states := statesInline[:len(branches)]
 	for i := range states {
 		states[i] = plannerORNoOrderBranchState{}
 	}
 
-	var order []int
-	if len(branches) <= 8 {
-		var orderInline [8]int
-		order = orderInline[:len(branches)]
-	} else {
-		order = make([]int, len(branches))
-	}
+	var orderInline [plannerORBranchLimit]int
+	order := orderInline[:len(branches)]
 	for i := range branches {
 		state := &states[i]
 		state.index = i
 		state.score = branches[i].noOrderScore()
 		state.budget = branches[i].noOrderBudget(need)
 		order[i] = i
-
-		var branchExaminedPtr *uint64
-		var branchEmittedPtr *uint64
-		if fullTrace {
-			branchExaminedPtr = &branchMetrics[i].RowsExamined
-			branchEmittedPtr = &branchMetrics[i].RowsEmitted
-		}
+		lead := branches[i].leadPtr()
 		state.iter = plannerORIter{
-			it:             branches[i].lead.newIter(),
-			branch:         &branches[i],
-			examined:       examinedPtr,
-			branchExamined: branchExaminedPtr,
-			branchEmitted:  branchEmittedPtr,
+			it:     lead.newIter(),
+			branch: &branches[i],
 		}
 	}
-	defer func() {
-		for i := range states {
-			states[i].iter.Release()
-		}
-	}()
+	defer releasePlannerORNoOrderStateIters(states)
 
 	plannerORNoOrderSortBranchOrder(order, states)
-
-	nextBudget := func(cur uint64) uint64 {
-		if cur < plannerORNoOrderMinBranchBudget {
-			return plannerORNoOrderMinBranchBudget
-		}
-		n := cur * 2
-		if n > plannerORNoOrderMaxBranchBudget {
-			n = plannerORNoOrderMaxBranchBudget
-		}
-		return n
-	}
-
-	probeBranch := func(st *plannerORNoOrderBranchState) {
-		if st.exhausted || st.iter.has {
-			return
-		}
-		st.initialized = true
-		budgetHit := st.iter.advanceWithBudget(st.budget)
-		if st.iter.has {
-			st.capped = false
-			return
-		}
-		if budgetHit {
-			st.capped = true
-			st.budget = nextBudget(st.budget)
-			return
-		}
-		st.capped = false
-		st.exhausted = true
-	}
-
-	consumeBranch := func(st *plannerORNoOrderBranchState) {
-		if !st.iter.has {
-			return
-		}
-		budgetHit := st.iter.advanceWithBudget(st.budget)
-		if st.iter.has {
-			st.capped = false
-			return
-		}
-		if budgetHit {
-			st.capped = true
-			st.budget = nextBudget(st.budget)
-			return
-		}
-		st.capped = false
-		st.exhausted = true
-	}
-
-	findReadyMin := func(maxInclusive uint64, useMax bool) *plannerORNoOrderBranchState {
-		var best *plannerORNoOrderBranchState
-		for i := range states {
-			st := &states[i]
-			if !st.iter.has {
-				continue
-			}
-			if useMax && st.iter.cur > maxInclusive {
-				continue
-			}
-			if best == nil || st.iter.cur < best.iter.cur {
-				best = st
-			}
-		}
-		return best
-	}
-
-	findNextUninitialized := func() *plannerORNoOrderBranchState {
-		for _, idx := range order {
-			st := &states[idx]
-			if st.initialized || st.exhausted {
-				continue
-			}
-			return st
-		}
-		return nil
-	}
-
-	findNextCapped := func() *plannerORNoOrderBranchState {
-		for _, idx := range order {
-			st := &states[idx]
-			if st.exhausted || !st.capped || st.iter.has {
-				continue
-			}
-			return st
-		}
-		return nil
-	}
 
 	useLinearSeen := need <= plannerORNoOrderLinearSeenNeedMax
 	seen := u64set{}
@@ -3882,63 +4630,54 @@ func (qv *queryView[K, V]) execPlanORNoOrderAdaptiveCore(q *qx.QX, branches plan
 		seen = newU64Set(max(64, need*2))
 		defer releaseU64Set(&seen)
 	}
-	topBuf := getUint64SliceBuf(need)
-	top := topBuf.values
-	defer func() {
-		topBuf.values = top
-		releaseUint64SliceBuf(topBuf)
-	}()
-
-	addCandidate := func(idx uint64) {
-		// Threshold prune prevents growing a candidate set that can no longer
-		// improve top-N; it is key for large OR unions with small LIMIT.
-		if len(top) == need && idx > top[len(top)-1] {
-			return
-		}
-
-		if useLinearSeen {
-			for _, existing := range top {
-				if existing == idx {
-					if trace != nil {
-						trace.addDedupe(1)
-					}
-					return
-				}
-			}
-		} else {
-			if !seen.Add(idx) {
-				if trace != nil {
-					trace.addDedupe(1)
-				}
-				return
-			}
-		}
-		top = plannerORNoOrderInsertTopN(top, idx, need)
-	}
+	topBuf := uint64SlicePool.Get()
+	topBuf.Grow(need)
+	defer uint64SlicePool.Put(topBuf)
 
 	initialActive := plannerORNoOrderInitActiveBranches
 	if initialActive > len(order) {
 		initialActive = len(order)
 	}
 	for i := 0; i < initialActive; i++ {
-		probeBranch(&states[order[i]])
+		st := &states[order[i]]
+		examinedDelta, emittedDelta := plannerORNoOrderProbeBranch(st)
+		examined += examinedDelta
+		if fullTrace {
+			branchMetrics[st.index].RowsExamined += examinedDelta
+			branchMetrics[st.index].RowsEmitted += emittedDelta
+		}
 	}
 
 	// Phase 1: gather enough unique candidates from cheap-first branches.
-	for len(top) < need {
-		st := findReadyMin(0, false)
+	for topBuf.Len() < need {
+		st := plannerORNoOrderFindReadyMin(states, 0, false)
 		if st != nil {
-			addCandidate(st.iter.cur)
-			consumeBranch(st)
+			plannerORNoOrderAddCandidate(topBuf, st.iter.cur, need, useLinearSeen, &seen, trace)
+			examinedDelta, emittedDelta := plannerORNoOrderConsumeBranch(st)
+			examined += examinedDelta
+			if fullTrace {
+				branchMetrics[st.index].RowsExamined += examinedDelta
+				branchMetrics[st.index].RowsEmitted += emittedDelta
+			}
 			continue
 		}
 
-		if st = findNextUninitialized(); st != nil {
-			probeBranch(st)
+		if st = plannerORNoOrderFindNextUninitialized(order, states); st != nil {
+			examinedDelta, emittedDelta := plannerORNoOrderProbeBranch(st)
+			examined += examinedDelta
+			if fullTrace {
+				branchMetrics[st.index].RowsExamined += examinedDelta
+				branchMetrics[st.index].RowsEmitted += emittedDelta
+			}
 			continue
 		}
-		if st = findNextCapped(); st != nil {
-			probeBranch(st)
+		if st = plannerORNoOrderFindNextCapped(order, states); st != nil {
+			examinedDelta, emittedDelta := plannerORNoOrderProbeBranch(st)
+			examined += examinedDelta
+			if fullTrace {
+				branchMetrics[st.index].RowsExamined += examinedDelta
+				branchMetrics[st.index].RowsEmitted += emittedDelta
+			}
 			continue
 		}
 		break
@@ -3948,22 +4687,37 @@ func (qv *queryView[K, V]) execPlanORNoOrderAdaptiveCore(q *qx.QX, branches plan
 
 	// Phase 2: if LIMIT is already filled, prove all unseen branches cannot
 	// contribute ids <= current threshold.
-	for len(top) == need {
-		threshold := top[len(top)-1]
+	for topBuf.Len() == need {
+		threshold := topBuf.Get(topBuf.Len() - 1)
 
-		st := findReadyMin(threshold, true)
+		st := plannerORNoOrderFindReadyMin(states, threshold, true)
 		if st != nil {
-			addCandidate(st.iter.cur)
-			consumeBranch(st)
+			plannerORNoOrderAddCandidate(topBuf, st.iter.cur, need, useLinearSeen, &seen, trace)
+			examinedDelta, emittedDelta := plannerORNoOrderConsumeBranch(st)
+			examined += examinedDelta
+			if fullTrace {
+				branchMetrics[st.index].RowsExamined += examinedDelta
+				branchMetrics[st.index].RowsEmitted += emittedDelta
+			}
 			continue
 		}
 
-		if st = findNextUninitialized(); st != nil {
-			probeBranch(st)
+		if st = plannerORNoOrderFindNextUninitialized(order, states); st != nil {
+			examinedDelta, emittedDelta := plannerORNoOrderProbeBranch(st)
+			examined += examinedDelta
+			if fullTrace {
+				branchMetrics[st.index].RowsExamined += examinedDelta
+				branchMetrics[st.index].RowsEmitted += emittedDelta
+			}
 			continue
 		}
-		if st = findNextCapped(); st != nil {
-			probeBranch(st)
+		if st = plannerORNoOrderFindNextCapped(order, states); st != nil {
+			examinedDelta, emittedDelta := plannerORNoOrderProbeBranch(st)
+			examined += examinedDelta
+			if fullTrace {
+				branchMetrics[st.index].RowsExamined += examinedDelta
+				branchMetrics[st.index].RowsEmitted += emittedDelta
+			}
 			continue
 		}
 
@@ -3974,8 +4728,8 @@ func (qv *queryView[K, V]) execPlanORNoOrderAdaptiveCore(q *qx.QX, branches plan
 	if trace != nil {
 		trace.addExamined(examined)
 
-		if fullTrace && len(top) == need {
-			threshold := top[len(top)-1]
+		if fullTrace && topBuf.Len() == need {
+			threshold := topBuf.Get(topBuf.Len() - 1)
 			for i := range states {
 				st := &states[i]
 				if st.exhausted {
@@ -3992,13 +4746,13 @@ func (qv *queryView[K, V]) execPlanORNoOrderAdaptiveCore(q *qx.QX, branches plan
 		trace.setEarlyStopReason(earlyStopReason)
 	}
 
-	if len(top) == 0 {
+	if topBuf.Len() == 0 {
 		return nil, true
 	}
 
-	out := make([]K, 0, len(top))
-	for _, idx := range top {
-		out = append(out, qv.idFromIdxNoLock(idx))
+	out := make([]K, 0, topBuf.Len())
+	for i := 0; i < topBuf.Len(); i++ {
+		out = append(out, qv.idFromIdxNoLock(topBuf.Get(i)))
 	}
 	return out, true
 }
@@ -4015,49 +4769,34 @@ func (qv *queryView[K, V]) execPlanORNoOrderBaseline(q *qx.QX, branches plannerO
 
 func (qv *queryView[K, V]) execPlanORNoOrderBaselineCore(q *qx.QX, branches plannerORBranches, trace *queryTrace) ([]K, bool) {
 	fullTrace := trace.full()
-	var (
-		examined    uint64
-		examinedPtr *uint64
-	)
+	examined := uint64(0)
 	var branchMetrics []TraceORBranch
+	var branchMetricsInline [plannerORBranchLimit]TraceORBranch
 	if trace != nil {
-		examinedPtr = &examined
 		if fullTrace {
-			branchMetrics = make([]TraceORBranch, len(branches))
+			branchMetrics = branchMetricsInline[:len(branches)]
 			for i := range branchMetrics {
 				branchMetrics[i].Index = i
 			}
 		}
 	}
-	var iters []plannerORIter
-	if len(branches) <= 8 {
-		var itersInline [8]plannerORIter
-		iters = itersInline[:0]
-	} else {
-		iters = make([]plannerORIter, 0, len(branches))
-	}
+	var itersInline [plannerORBranchLimit]plannerORIter
+	iters := itersInline[:0]
 	for i := range branches {
-		var branchExaminedPtr *uint64
-		var branchEmittedPtr *uint64
-		if fullTrace {
-			branchExaminedPtr = &branchMetrics[i].RowsExamined
-			branchEmittedPtr = &branchMetrics[i].RowsEmitted
-		}
+		lead := branches[i].leadPtr()
 		iters = append(iters, plannerORIter{
-			it:             branches[i].lead.newIter(),
-			branch:         &branches[i],
-			examined:       examinedPtr,
-			branchExamined: branchExaminedPtr,
-			branchEmitted:  branchEmittedPtr,
+			it:     lead.newIter(),
+			branch: &branches[i],
 		})
 	}
-	defer func() {
-		for i := range iters {
-			iters[i].Release()
-		}
-	}()
+	defer releasePlannerORIters(iters)
 	for i := range iters {
-		iters[i].advance()
+		examinedDelta, emittedDelta := iters[i].advance()
+		examined += examinedDelta
+		if fullTrace {
+			branchMetrics[i].RowsExamined += examinedDelta
+			branchMetrics[i].RowsEmitted += emittedDelta
+		}
 	}
 
 	skip := q.Offset
@@ -4075,14 +4814,12 @@ func (qv *queryView[K, V]) execPlanORNoOrderBaselineCore(q *qx.QX, branches plan
 	useLinearSeen := needWindow <= plannerORNoOrderLinearSeenNeedMax
 	var (
 		seen    u64set
-		seenBuf *uint64SliceBuf
+		seenBuf *pooled.SliceBuf[uint64]
 	)
 	if useLinearSeen {
-		seenBuf = getUint64SliceBuf(needWindow)
-		seenBuf.values = seenBuf.values[:0]
-		defer func() {
-			releaseUint64SliceBuf(seenBuf)
-		}()
+		seenBuf = uint64SlicePool.Get()
+		seenBuf.Grow(needWindow)
+		defer uint64SlicePool.Put(seenBuf)
 	} else {
 		seen = newU64Set(max(64, needWindow*2))
 		defer releaseU64Set(&seen)
@@ -4110,7 +4847,12 @@ func (qv *queryView[K, V]) execPlanORNoOrderBaselineCore(q *qx.QX, branches plan
 		for i := range iters {
 			if iters[i].has && iters[i].cur == minIdx {
 				dupHits++
-				iters[i].advance()
+				examinedDelta, emittedDelta := iters[i].advance()
+				examined += examinedDelta
+				if fullTrace {
+					branchMetrics[i].RowsExamined += examinedDelta
+					branchMetrics[i].RowsEmitted += emittedDelta
+				}
 			}
 		}
 		if trace != nil && dupHits > 1 {
@@ -4119,8 +4861,8 @@ func (qv *queryView[K, V]) execPlanORNoOrderBaselineCore(q *qx.QX, branches plan
 
 		if useLinearSeen {
 			dup := false
-			for _, existing := range seenBuf.values {
-				if existing == minIdx {
+			for i := 0; i < seenBuf.Len(); i++ {
+				if seenBuf.Get(i) == minIdx {
 					dup = true
 					break
 				}
@@ -4131,7 +4873,7 @@ func (qv *queryView[K, V]) execPlanORNoOrderBaselineCore(q *qx.QX, branches plan
 				}
 				continue
 			}
-			seenBuf.values = append(seenBuf.values, minIdx)
+			seenBuf.Append(minIdx)
 		} else {
 			// No-order branch leads are only required to be iterable, not globally
 			// monotone by idx. Identical ids may therefore surface again long after

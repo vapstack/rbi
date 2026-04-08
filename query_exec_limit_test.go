@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/vapstack/qx"
+	"github.com/vapstack/rbi/internal/pooled"
 	"github.com/vapstack/rbi/internal/posting"
 )
 
@@ -248,6 +249,29 @@ func TestPostingUnionIter_AllocsPerRunStaysLowAfterWarmup(t *testing.T) {
 	})
 	if allocs > 0.2 {
 		t.Fatalf("unexpected allocs per run: got=%v want<=0.2", allocs)
+	}
+}
+
+func TestU64Set_AllocsPerRunStayZeroAfterWarmup(t *testing.T) {
+	if testRaceEnabled {
+		t.Skip("testing.AllocsPerRun is not stable under -race")
+	}
+
+	warm := newU64Set(64)
+	for i := 0; i < 32; i++ {
+		_ = warm.Add(uint64(i))
+	}
+	releaseU64Set(&warm)
+
+	allocs := testing.AllocsPerRun(100, func() {
+		set := newU64Set(64)
+		for i := 0; i < 32; i++ {
+			_ = set.Add(uint64(i))
+		}
+		releaseU64Set(&set)
+	})
+	if allocs > 0 {
+		t.Fatalf("unexpected allocs per run: got=%v want=0", allocs)
 	}
 }
 
@@ -535,14 +559,18 @@ func (qv *queryView[K, V]) baselineTryQueryPrefixNoOrderWithLimit(q *qx.QX) ([]K
 	return cursor.out, true, nil
 }
 
-func baselineScanLimitByOverlayBounds[K ~uint64 | ~string, V any](db *queryView[K, V], q *qx.QX, ov fieldOverlay, br overlayRange, desc bool, preds []leafPred, nilTailField string) []K {
+func baselineScanLimitByOverlayBounds[K ~uint64 | ~string, V any](db *queryView[K, V], q *qx.QX, ov fieldOverlay, br overlayRange, desc bool, preds *pooled.SliceBuf[leafPred], nilTailField string) []K {
 	limit := int(q.Limit)
 	out := make([]K, 0, limit)
 	cursor := db.newQueryCursor(out, 0, q.Limit, false, 0)
+	predCount := 0
+	if preds != nil {
+		predCount = preds.Len()
+	}
 
 	emitCandidate := func(idx uint64) bool {
-		for _, p := range preds {
-			if !p.containsIdx(idx) {
+		for i := 0; i < predCount; i++ {
+			if !preds.Get(i).containsIdx(idx) {
 				return false
 			}
 		}
@@ -751,17 +779,19 @@ func TestQuery_LimitRangeNoOrder_ResidualsUseBucketExactFilter(t *testing.T) {
 	}
 
 	view := db.currentQueryViewForTests()
-	preds, predsBuf, ok, err := view.buildLeafPredsExcludingBounds(leaves, f, 0)
+	predsBuf, ok, err := view.buildLeafPredsExcludingBounds(leaves, f, 0)
 	if err != nil {
 		t.Fatalf("buildLeafPredsExcludingBounds: %v", err)
 	}
 	if !ok {
 		t.Fatalf("expected residual leaf preds to be supported")
 	}
-	defer releaseLeafPreds(preds, predsBuf)
+	if predsBuf != nil {
+		defer leafPredSlicePool.Put(predsBuf)
+	}
 
 	br := view.fieldOverlay(f).rangeForBounds(bounds)
-	want := baselineScanLimitByOverlayBounds(view, q, view.fieldOverlay(f), br, false, preds, "")
+	want := baselineScanLimitByOverlayBounds(view, q, view.fieldOverlay(f), br, false, predsBuf, "")
 
 	tr := db.beginTrace(q)
 	if tr == nil {
@@ -840,18 +870,20 @@ func TestQuery_LimitOrderBasic_ResidualsUseBucketExactFilter(t *testing.T) {
 		t.Fatalf("expected order bounds to be recognized")
 	}
 
-	preds, predsBuf, ok, err := view.buildLeafPredsExcludingBounds(leaves, "age", 0)
+	predsBuf, ok, err := view.buildLeafPredsExcludingBounds(leaves, "age", 0)
 	if err != nil {
 		t.Fatalf("buildLeafPredsExcludingBounds: %v", err)
 	}
 	if !ok {
 		t.Fatalf("expected residual leaf preds to be supported")
 	}
-	defer releaseLeafPreds(preds, predsBuf)
+	if predsBuf != nil {
+		defer leafPredSlicePool.Put(predsBuf)
+	}
 
 	ov := view.fieldOverlay("age")
 	br := ov.rangeForBounds(bounds)
-	want := baselineScanLimitByOverlayBounds(view, q, ov, br, false, preds, "")
+	want := baselineScanLimitByOverlayBounds(view, q, ov, br, false, predsBuf, "")
 
 	tr := db.beginTrace(q)
 	if tr == nil {
@@ -1007,7 +1039,7 @@ func TestQuery_OrderBasic_DeepWindowCachePersistsAcrossUnchangedFieldPatch(t *te
 	if isSlice || isNil {
 		t.Fatalf("unexpected scalar flags: isSlice=%v isNil=%v", isSlice, isNil)
 	}
-	cacheKey := materializedPredCacheKeyFromScalar("score", qx.OpLT, keyValue)
+	cacheKey := db.materializedPredCacheKeyForScalar("score", qx.OpLT, keyValue)
 	prevSnap := db.getSnapshot()
 	prevBM, ok := prevSnap.loadMaterializedPred(cacheKey)
 	if !ok || prevBM.IsEmpty() {
@@ -1072,8 +1104,8 @@ func TestQuery_OrderBasic_ComplementCachedBaseOpCountsAsMaterialized(t *testing.
 	if err != nil || isSlice {
 		t.Fatalf("exprValueToNormalizedScalarBound(LTE age): err=%v isSlice=%v", err, isSlice)
 	}
-	gteComplementKey := view.materializedPredComplementCacheKeyForScalar("age", gteBound.op, gteBound.key)
-	lteScalarKey := view.materializedPredCacheKeyForScalar("age", lteBound.op, lteBound.key)
+	gteComplementKey := view.materializedPredComplementKeyForNormalizedScalarBound("age", gteBound).String()
+	lteScalarKey := view.materializedPredKeyForNormalizedScalarBound("age", lteBound).String()
 	complementSeed := posting.List{}.BuildAdded(1)
 	defer complementSeed.Release()
 	db.getSnapshot().storeMaterializedPred(gteComplementKey, complementSeed)
@@ -1086,8 +1118,8 @@ func TestQuery_OrderBasic_ComplementCachedBaseOpCountsAsMaterialized(t *testing.
 		baseOps = append(baseOps, op)
 	}
 	coresBuf, rawCoreIdxBuf := mustPrepareOrderBasicBaseCoresForTest(t, view, baseOps)
-	defer releaseOrderBasicBaseCoreSliceBuf(coresBuf)
-	defer releaseIntSliceBuf(rawCoreIdxBuf)
+	defer orderBasicBaseCoreSlicePool.Put(coresBuf)
+	defer orderBasicBaseCoreIndexSlicePool.Put(rawCoreIdxBuf)
 	if !view.hasWarmOrderBasicBaseCores(coresBuf) {
 		_, gteHit := db.getSnapshot().loadMaterializedPred(gteComplementKey)
 		_, lteHit := db.getSnapshot().loadMaterializedPred(lteScalarKey)
@@ -1133,8 +1165,8 @@ func TestQuery_OrderBasic_WarmQueryLoadsCollapsedNumericRangeSpan(t *testing.T) 
 		baseOps = append(baseOps, op)
 	}
 	coresBuf, rawCoreIdxBuf := mustPrepareOrderBasicBaseCoresForTest(t, view, baseOps)
-	defer releaseOrderBasicBaseCoreSliceBuf(coresBuf)
-	defer releaseIntSliceBuf(rawCoreIdxBuf)
+	defer orderBasicBaseCoreSlicePool.Put(coresBuf)
+	defer orderBasicBaseCoreIndexSlicePool.Put(rawCoreIdxBuf)
 	collapsed := mustFindCollapsedOrderBasicBaseCoreForTest(t, coresBuf)
 	view.promoteOrderBasicLimitMaterializedBaseOps("score", baseOps, 250, 100)
 	spanHit, ok := view.loadWarmOrderBasicBaseCore(collapsed)
@@ -1151,7 +1183,7 @@ func mustPrepareOrderBasicBaseCoresForTest[K ~string | ~uint64, V any](
 	t *testing.T,
 	view *queryView[K, V],
 	baseOps []qx.Expr,
-) (*orderBasicBaseCoreSliceBuf, *intSliceBuf) {
+) (*pooled.SliceBuf[orderBasicBaseCore], *pooled.SliceBuf[int]) {
 	t.Helper()
 	coresBuf, rawCoreIdxBuf, noMatch, err := view.prepareOrderBasicBaseCores(baseOps)
 	if err != nil {
@@ -1165,7 +1197,7 @@ func mustPrepareOrderBasicBaseCoresForTest[K ~string | ~uint64, V any](
 
 func mustFindCollapsedOrderBasicBaseCoreForTest(
 	t *testing.T,
-	coresBuf *orderBasicBaseCoreSliceBuf,
+	coresBuf *pooled.SliceBuf[orderBasicBaseCore],
 ) orderBasicBaseCore {
 	t.Helper()
 	if coresBuf == nil {
@@ -1175,14 +1207,15 @@ func mustFindCollapsedOrderBasicBaseCoreForTest(
 		found orderBasicBaseCore
 		hit   bool
 	)
-	for i := range coresBuf.values {
-		if coresBuf.values[i].kind != orderBasicBaseCoreCollapsedRange {
+	for i := 0; i < coresBuf.Len(); i++ {
+		core := coresBuf.Get(i)
+		if core.kind != orderBasicBaseCoreCollapsedRange {
 			continue
 		}
 		if hit {
 			t.Fatalf("expected exactly one collapsed order-basic base core")
 		}
-		found = coresBuf.values[i]
+		found = core
 		hit = true
 	}
 	if !hit {
@@ -1229,22 +1262,22 @@ func TestQuery_OrderBasic_WarmQueryPromotesMaterializedRangeBaseOps(t *testing.T
 		baseOps = append(baseOps, op)
 	}
 	coresBuf, rawCoreIdxBuf := mustPrepareOrderBasicBaseCoresForTest(t, view, baseOps)
-	defer releaseOrderBasicBaseCoreSliceBuf(coresBuf)
-	defer releaseIntSliceBuf(rawCoreIdxBuf)
+	defer orderBasicBaseCoreSlicePool.Put(coresBuf)
+	defer orderBasicBaseCoreIndexSlicePool.Put(rawCoreIdxBuf)
 	collapsed := mustFindCollapsedOrderBasicBaseCoreForTest(t, coresBuf)
 	if !view.hasWarmOrderBasicBaseCores(coresBuf) {
 		var missing []string
 		for _, op := range baseOps {
 			stats, ok := view.orderBasicRawBaseOpStats(op, view.snapshotUniverseCardinality())
-			cacheKey := ""
+			cacheKey := materializedPredKey{}
 			if ok {
 				cacheKey = stats.cacheKey
 			}
-			if cacheKey == "" {
+			if cacheKey.isZero() {
 				missing = append(missing, fmt.Sprintf("%s:%v=<no-key>", op.Field, op.Op))
 				continue
 			}
-			if _, ok := db.getSnapshot().loadMaterializedPred(cacheKey); !ok {
+			if _, ok := db.getSnapshot().loadMaterializedPredKey(cacheKey); !ok {
 				missing = append(missing, fmt.Sprintf("%s:%v", op.Field, op.Op))
 			}
 		}
@@ -1299,8 +1332,8 @@ func TestQuery_OrderBasic_WarmAnalyticsRangeUsesLimitOrderBasicPlan(t *testing.T
 		baseOps = append(baseOps, op)
 	}
 	coresBuf, rawCoreIdxBuf := mustPrepareOrderBasicBaseCoresForTest(t, view, baseOps)
-	defer releaseOrderBasicBaseCoreSliceBuf(coresBuf)
-	defer releaseIntSliceBuf(rawCoreIdxBuf)
+	defer orderBasicBaseCoreSlicePool.Put(coresBuf)
+	defer orderBasicBaseCoreIndexSlicePool.Put(rawCoreIdxBuf)
 	collapsed := mustFindCollapsedOrderBasicBaseCoreForTest(t, coresBuf)
 	if hit, ok := view.loadWarmOrderBasicBaseCore(collapsed); !ok {
 		db.releaseQueryView(view)
@@ -1385,19 +1418,20 @@ func TestBuildPredicatesOrdered_WarmMergedNumericRangeUsesExactRangeCache(t *tes
 	view := db.currentQueryViewForTests()
 	defer db.releaseQueryView(view)
 	leaves := mustExtractAndLeaves(t, q.Expr)
-	preds, predsBuf, ok := view.buildPredicatesOrderedWithMode(leaves, "score", false, 100, true, true)
+	predSet, ok := view.buildPredicatesOrderedWithMode(leaves, "score", false, 100, true, true)
 	if !ok {
 		t.Fatalf("buildPredicatesOrderedWithMode: ok=false")
 	}
-	defer releasePredicates(preds, predsBuf)
+	defer predSet.Release()
 
 	ageCount := 0
-	for i := range preds {
-		if preds[i].expr.Field != "age" {
+	for i := 0; i < predSet.Len(); i++ {
+		pred := predSet.Get(i)
+		if pred.expr.Field != "age" {
 			continue
 		}
 		ageCount++
-		if !preds[i].isMaterializedLike() {
+		if !pred.isMaterializedLike() {
 			t.Fatalf("expected warm merged age predicate to load exact materialized range")
 		}
 	}

@@ -36,6 +36,15 @@ func snapshotPostingContainsAll(t *testing.T, ids posting.List, want ...uint64) 
 	}
 }
 
+func mustMaterializedPredKey(t *testing.T, encoded string) materializedPredKey {
+	t.Helper()
+	key, ok := materializedPredKeyFromEncoded(encoded)
+	if !ok {
+		t.Fatalf("expected parseable materialized predicate key %q", encoded)
+	}
+	return key
+}
+
 func TestSnapshotSequence_PublishedOnWrite(t *testing.T) {
 	db, _ := openTempDBUint64(t)
 
@@ -357,7 +366,7 @@ func snapshotExtStorage(keys ...string) fieldIndexStorage {
 	if len(keys) == 0 {
 		return fieldIndexStorage{}
 	}
-	m := getPostingMap()
+	m := postingMapPool.Get()
 	for i, key := range keys {
 		m[key] = (posting.List{}).BuildAdded(uint64(i + 1))
 	}
@@ -1538,7 +1547,7 @@ func TestSnapshotExt_InheritMaterializedPredCachePreservesRecencyStamps(t *testi
 	next := &indexSnapshot{matPredCacheMaxEntries: 8}
 	inheritMaterializedPredCache[uint64, struct{}](nil, next, prev, nil)
 
-	va, ok := next.matPredCache.Load("email\x1f1\x1fa")
+	va, ok := next.matPredCache.Load(mustMaterializedPredKey(t, "email\x1f1\x1fa"))
 	if !ok {
 		t.Fatalf("expected first cache entry to be inherited")
 	}
@@ -1547,7 +1556,7 @@ func TestSnapshotExt_InheritMaterializedPredCachePreservesRecencyStamps(t *testi
 		t.Fatalf("expected first inherited stamp to stay at 7, got=%d", gotA.stamp.Load())
 	}
 
-	vb, ok := next.matPredCache.Load("name\x1f1\x1fb")
+	vb, ok := next.matPredCache.Load(mustMaterializedPredKey(t, "name\x1f1\x1fb"))
 	if !ok {
 		t.Fatalf("expected second cache entry to be inherited")
 	}
@@ -1568,16 +1577,16 @@ func TestSnapshotExt_InheritNumericRangeBucketCacheCopiesOnlyMatchingStorage(t *
 
 	ageEntry := &numericRangeBucketCacheEntry{
 		storage: shared,
-		idx: &numericRangeBucketIndex{
+		idx: numericRangeBucketIndex{
 			bucketSize: 1,
-			buckets:    []numericRangeBucket{{start: 0, end: 1}},
+			keyCount:   1,
 		},
 	}
 	scoreEntry := &numericRangeBucketCacheEntry{
 		storage: prevChanged,
-		idx: &numericRangeBucketIndex{
+		idx: numericRangeBucketIndex{
 			bucketSize: 1,
-			buckets:    []numericRangeBucket{{start: 0, end: 1}},
+			keyCount:   1,
 		},
 	}
 
@@ -1612,9 +1621,9 @@ func TestSnapshotExt_InheritNumericRangeBucketCacheSkipsMalformedAndEmptyEntries
 	valid := snapshotExtStorage("10")
 	validEntry := &numericRangeBucketCacheEntry{
 		storage: valid,
-		idx: &numericRangeBucketIndex{
+		idx: numericRangeBucketIndex{
 			bucketSize: 1,
-			buckets:    []numericRangeBucket{{start: 0, end: 1}},
+			keyCount:   1,
 		},
 	}
 
@@ -1626,9 +1635,9 @@ func TestSnapshotExt_InheritNumericRangeBucketCacheSkipsMalformedAndEmptyEntries
 	prev.numericRangeBucketCache.Store(123, validEntry)
 	prev.numericRangeBucketCache.Store("score", &numericRangeBucketCacheEntry{
 		storage: fieldIndexStorage{},
-		idx: &numericRangeBucketIndex{
+		idx: numericRangeBucketIndex{
 			bucketSize: 1,
-			buckets:    []numericRangeBucket{{start: 0, end: 1}},
+			keyCount:   1,
 		},
 	})
 	prev.numericRangeBucketCache.Store("age", validEntry)

@@ -2,8 +2,8 @@ package rbi
 
 import (
 	"slices"
-	"sync"
 
+	"github.com/vapstack/rbi/internal/pooled"
 	"github.com/vapstack/rbi/internal/posting"
 )
 
@@ -15,20 +15,33 @@ type batchPostingAccum struct {
 type batchPostingAccumArena struct{ values []batchPostingAccum }
 
 var (
-	batchPostingAccumArenaPool    sync.Pool
-	batchPostingAccumMapPool      sync.Pool
-	fixedBatchPostingAccumMapPool sync.Pool
+	batchPostingAccumArenaPool = pooled.Pointers[batchPostingAccumArena]{
+		New: func() *batchPostingAccumArena {
+			return &batchPostingAccumArena{values: make([]batchPostingAccum, 0, 8)}
+		},
+	}
+	batchPostingAccumMapPool = pooled.Maps[string, uint32]{
+		NewCap: 8,
+		MaxLen: batchPostingDeltaMapPoolMaxLen,
+		Cleanup: func(m map[string]uint32) {
+			clear(m)
+		},
+	}
+	fixedBatchPostingAccumMapPool = pooled.Maps[uint64, uint32]{
+		NewCap: 8,
+		MaxLen: batchPostingDeltaMapPoolMaxLen,
+		Cleanup: func(m map[uint64]uint32) {
+			clear(m)
+		},
+	}
 )
 
 func getBatchPostingAccumArena(capHint int) *batchPostingAccumArena {
-	if v := batchPostingAccumArenaPool.Get(); v != nil {
-		arena := v.(*batchPostingAccumArena)
-		if cap(arena.values) < capHint {
-			arena.values = slices.Grow(arena.values, capHint)
-		}
-		return arena
+	arena := batchPostingAccumArenaPool.Get()
+	if cap(arena.values) < capHint {
+		arena.values = slices.Grow(arena.values, capHint)
 	}
-	return &batchPostingAccumArena{values: make([]batchPostingAccum, 0, max(capHint, 8))}
+	return arena
 }
 
 func releaseBatchPostingAccumArena(arena *batchPostingAccumArena) {
@@ -76,58 +89,6 @@ func (acc *batchPostingAccum) materializeOwned() batchPostingDelta {
 	}
 }
 
-func getBatchPostingAccumMap() map[string]uint32 {
-	if v := batchPostingAccumMapPool.Get(); v != nil {
-		return v.(map[string]uint32)
-	}
-	return make(map[string]uint32, 8)
-}
-
-func getBatchPostingAccumMapHint(capHint int) map[string]uint32 {
-	if capHint >= 64 {
-		return make(map[string]uint32, min(capHint, batchPostingDeltaMapPoolMaxLen))
-	}
-	return getBatchPostingAccumMap()
-}
-
-func getFixedBatchPostingAccumMap() map[uint64]uint32 {
-	if v := fixedBatchPostingAccumMapPool.Get(); v != nil {
-		return v.(map[uint64]uint32)
-	}
-	return make(map[uint64]uint32, 8)
-}
-
-func getFixedBatchPostingAccumMapHint(capHint int) map[uint64]uint32 {
-	if capHint >= 64 {
-		return make(map[uint64]uint32, min(capHint, batchPostingDeltaMapPoolMaxLen))
-	}
-	return getFixedBatchPostingAccumMap()
-}
-
-func releaseBatchPostingAccumMap(m map[string]uint32) {
-	if m == nil {
-		return
-	}
-	oversized := len(m) > batchPostingDeltaMapPoolMaxLen
-	clear(m)
-	if oversized {
-		return
-	}
-	batchPostingAccumMapPool.Put(m)
-}
-
-func releaseFixedBatchPostingAccumMap(m map[uint64]uint32) {
-	if m == nil {
-		return
-	}
-	oversized := len(m) > batchPostingDeltaMapPoolMaxLen
-	clear(m)
-	if oversized {
-		return
-	}
-	fixedBatchPostingAccumMapPool.Put(m)
-}
-
 func addFieldBatchPostingAccum(
 	fieldDelta map[string]uint32,
 	arena **batchPostingAccumArena,
@@ -137,7 +98,11 @@ func addFieldBatchPostingAccum(
 	capHint int,
 ) map[string]uint32 {
 	if fieldDelta == nil {
-		fieldDelta = getBatchPostingAccumMapHint(capHint)
+		if capHint >= 64 {
+			fieldDelta = make(map[string]uint32, min(capHint, batchPostingDeltaMapPoolMaxLen))
+		} else {
+			fieldDelta = batchPostingAccumMapPool.Get()
+		}
 	}
 	ref, ok := fieldDelta[key]
 	if !ok {
@@ -160,7 +125,11 @@ func addFixedFieldBatchPostingAccum(
 	capHint int,
 ) map[uint64]uint32 {
 	if fieldDelta == nil {
-		fieldDelta = getFixedBatchPostingAccumMapHint(capHint)
+		if capHint >= 64 {
+			fieldDelta = make(map[uint64]uint32, min(capHint, batchPostingDeltaMapPoolMaxLen))
+		} else {
+			fieldDelta = fixedBatchPostingAccumMapPool.Get()
+		}
 	}
 	ref, ok := fieldDelta[key]
 	if !ok {
@@ -180,17 +149,20 @@ const insertPostingIDsBufPoolMinCap = posting.MidCap
 
 type insertPostingIDsBuf struct{ values []uint64 }
 
-var insertPostingIDsBufPool sync.Pool
+var insertPostingIDsBufPool = pooled.Pointers[insertPostingIDsBuf]{
+	New: func() *insertPostingIDsBuf {
+		return &insertPostingIDsBuf{
+			values: make([]uint64, 0, insertPostingIDsBufPoolMinCap),
+		}
+	},
+}
 
 func getInsertPostingIDsBuf(capHint int) *insertPostingIDsBuf {
-	if v := insertPostingIDsBufPool.Get(); v != nil {
-		buf := v.(*insertPostingIDsBuf)
-		if cap(buf.values) < capHint {
-			buf.values = slices.Grow(buf.values, capHint)
-		}
-		return buf
+	buf := insertPostingIDsBufPool.Get()
+	if cap(buf.values) < capHint {
+		buf.values = slices.Grow(buf.values, capHint)
 	}
-	return &insertPostingIDsBuf{values: make([]uint64, 0, max(capHint, insertPostingIDsBufPoolMinCap))}
+	return buf
 }
 
 func releaseInsertPostingIDsBuf(buf *insertPostingIDsBuf) {
@@ -213,20 +185,33 @@ type insertPostingAccum struct {
 type insertPostingAccumArena struct{ values []insertPostingAccum }
 
 var (
-	insertPostingAccumArenaPool sync.Pool
-	insertPostingMapPool        sync.Pool
-	fixedInsertPostingMapPool   sync.Pool
+	insertPostingAccumArenaPool = pooled.Pointers[insertPostingAccumArena]{
+		New: func() *insertPostingAccumArena {
+			return &insertPostingAccumArena{values: make([]insertPostingAccum, 0, 8)}
+		},
+	}
+	insertPostingMapPool = pooled.Maps[string, uint32]{
+		NewCap: 8,
+		MaxLen: postingMapPoolMaxLen,
+		Cleanup: func(m map[string]uint32) {
+			clear(m)
+		},
+	}
+	fixedInsertPostingMapPool = pooled.Maps[uint64, uint32]{
+		NewCap: 8,
+		MaxLen: postingMapPoolMaxLen,
+		Cleanup: func(m map[uint64]uint32) {
+			clear(m)
+		},
+	}
 )
 
 func getInsertPostingAccumArena(capHint int) *insertPostingAccumArena {
-	if v := insertPostingAccumArenaPool.Get(); v != nil {
-		arena := v.(*insertPostingAccumArena)
-		if cap(arena.values) < capHint {
-			arena.values = slices.Grow(arena.values, capHint)
-		}
-		return arena
+	arena := insertPostingAccumArenaPool.Get()
+	if cap(arena.values) < capHint {
+		arena.values = slices.Grow(arena.values, capHint)
 	}
-	return &insertPostingAccumArena{values: make([]insertPostingAccum, 0, max(capHint, 8))}
+	return arena
 }
 
 func releaseInsertPostingAccumArena(arena *insertPostingAccumArena) {
@@ -322,58 +307,6 @@ func (acc *insertPostingAccum) materializeOwned() posting.List {
 	return materializeInsertPostingIDsOwned(acc.inline[:n])
 }
 
-func getInsertPostingMap() map[string]uint32 {
-	if v := insertPostingMapPool.Get(); v != nil {
-		return v.(map[string]uint32)
-	}
-	return make(map[string]uint32, 8)
-}
-
-func getInsertPostingMapHint(capHint int) map[string]uint32 {
-	if capHint >= 64 {
-		return make(map[string]uint32, min(capHint, postingMapPoolMaxLen))
-	}
-	return getInsertPostingMap()
-}
-
-func getFixedInsertPostingMap() map[uint64]uint32 {
-	if v := fixedInsertPostingMapPool.Get(); v != nil {
-		return v.(map[uint64]uint32)
-	}
-	return make(map[uint64]uint32, 8)
-}
-
-func getFixedInsertPostingMapHint(capHint int) map[uint64]uint32 {
-	if capHint >= 64 {
-		return make(map[uint64]uint32, min(capHint, postingMapPoolMaxLen))
-	}
-	return getFixedInsertPostingMap()
-}
-
-func releaseInsertPostingMap(m map[string]uint32) {
-	if m == nil {
-		return
-	}
-	oversized := len(m) > postingMapPoolMaxLen
-	clear(m)
-	if oversized {
-		return
-	}
-	insertPostingMapPool.Put(m)
-}
-
-func releaseFixedInsertPostingMap(m map[uint64]uint32) {
-	if m == nil {
-		return
-	}
-	oversized := len(m) > postingMapPoolMaxLen
-	clear(m)
-	if oversized {
-		return
-	}
-	fixedInsertPostingMapPool.Put(m)
-}
-
 func addInsertPostingAccum(
 	fieldMap map[string]uint32,
 	arena **insertPostingAccumArena,
@@ -382,7 +315,11 @@ func addInsertPostingAccum(
 	capHint int,
 ) map[string]uint32 {
 	if fieldMap == nil {
-		fieldMap = getInsertPostingMapHint(capHint)
+		if capHint >= 64 {
+			fieldMap = make(map[string]uint32, min(capHint, postingMapPoolMaxLen))
+		} else {
+			fieldMap = insertPostingMapPool.Get()
+		}
 	}
 	ref, ok := fieldMap[key]
 	if !ok {
@@ -404,7 +341,11 @@ func addFixedInsertPostingAccum(
 	capHint int,
 ) map[uint64]uint32 {
 	if fieldMap == nil {
-		fieldMap = getFixedInsertPostingMapHint(capHint)
+		if capHint >= 64 {
+			fieldMap = make(map[uint64]uint32, min(capHint, postingMapPoolMaxLen))
+		} else {
+			fieldMap = fixedInsertPostingMapPool.Get()
+		}
 	}
 	ref, ok := fieldMap[key]
 	if !ok {

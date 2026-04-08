@@ -254,13 +254,13 @@ func TestTransparentMode_DisablesIndexedAPIsAndUsesDirectBoltSeqScans(t *testing
 		if err := bucket.Delete([]byte("k-02")); err != nil {
 			return err
 		}
-		buf := getEncodeBuf()
+		buf := encodePool.Get()
 		if err := db.encode(&noIndexRec{Name: "k-03", Age: 4}, buf); err != nil {
-			releaseEncodeBuf(buf)
+			encodePool.Put(buf)
 			return err
 		}
 		payload := append([]byte(nil), buf.Bytes()...)
-		releaseEncodeBuf(buf)
+		encodePool.Put(buf)
 		return bucket.Put([]byte("k-03"), payload)
 	}); err != nil {
 		t.Fatalf("out-of-band mutate: %v", err)

@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"slices"
 	"sync/atomic"
 )
 
@@ -16,11 +17,6 @@ type bitmap32 struct {
 // runOptimize attempts to further compress the runs of consecutive values found in the bitmap.
 func (rb *bitmap32) runOptimize() {
 	rb.highlowcontainer.runOptimize()
-}
-
-// newBitmap creates a new empty bitmap32.
-func newBitmap() *bitmap32 {
-	return acquireBitmap()
 }
 
 // clear resets the bitmap32 to be logically empty.
@@ -48,6 +44,7 @@ type intPeekable interface {
 	intIterable
 	peekNext() uint32
 	advanceIfNeeded(minval uint32)
+	release()
 }
 
 type intIterator struct {
@@ -127,13 +124,14 @@ func (ii *intIterator) initialize(a *bitmap32) {
 }
 
 func (ii *intIterator) release() {
-	releaseIntIterator(ii)
+	intIteratorPool.Put(ii)
 }
 
 // manyIntIterable supports bulk iteration over values in a bitmap32.
 type manyIntIterable interface {
 	nextMany(buf []uint32) int
 	nextMany64(hs uint64, buf []uint64) int
+	release()
 }
 
 type manyIntIterator struct {
@@ -208,22 +206,26 @@ func (ii *manyIntIterator) initialize(a *bitmap32) {
 }
 
 func (ii *manyIntIterator) release() {
-	releaseManyIntIterator(ii)
+	manyIntIteratorPool.Put(ii)
 }
 
 // iterator creates a new intPeekable to iterate over the integers contained in the bitmap.
 func (rb *bitmap32) iterator() intPeekable {
-	return acquireIntIterator(rb)
+	it := intIteratorPool.Get()
+	it.initialize(rb)
+	return it
 }
 
 // manyIterator creates a new manyIntIterable for bulk iteration.
 func (rb *bitmap32) manyIterator() manyIntIterable {
-	return acquireManyIntIterator(rb)
+	it := manyIntIteratorPool.Get()
+	it.initialize(rb)
+	return it
 }
 
 // clone creates a copy of the bitmap32.
 func (rb *bitmap32) clone() *bitmap32 {
-	ptr := acquireBitmap()
+	ptr := bitmapPool.Get()
 	ptr.highlowcontainer.copyFrom(&rb.highlowcontainer)
 	return ptr
 }
@@ -231,7 +233,7 @@ func (rb *bitmap32) clone() *bitmap32 {
 // cloneSharedInto overwrites dst with a copy-on-write clone of rb and returns dst.
 func (rb *bitmap32) cloneSharedInto(dst *bitmap32) *bitmap32 {
 	if dst == nil {
-		dst = newBitmap()
+		dst = bitmapPool.Get()
 	}
 	if dst == rb {
 		return dst
@@ -240,8 +242,8 @@ func (rb *bitmap32) cloneSharedInto(dst *bitmap32) *bitmap32 {
 	return dst
 }
 
-// retainBitmap32 increments the shared reference count for rb and returns it.
-func retainBitmap32(rb *bitmap32) *bitmap32 {
+// retain increments the shared reference count for rb and returns it.
+func (rb *bitmap32) retain() *bitmap32 {
 	if rb != nil {
 		rb.refs.Add(1)
 	}
@@ -257,17 +259,18 @@ func (rb *bitmap32) isUniquelyOwned() bool {
 	return rb.uniquelyOwned()
 }
 
-// releaseBitmap returns a bitmap allocated by this package back to the pool.
-func releaseBitmap(rb *bitmap32) {
+// release returns a bitmap allocated by this package back to the pool.
+func (rb *bitmap32) release() {
 	if rb == nil {
 		return
 	}
 	if rb.refs.Add(-1) != 0 {
 		return
 	}
-	rb.highlowcontainer.clear()
 	bitmapPool.Put(rb)
 }
+
+func (rb *bitmap32) Release() { rb.release() }
 
 // minimum gets the smallest value stored in this bitmap.
 func (rb *bitmap32) minimum() uint32 {
@@ -334,7 +337,7 @@ func (rb *bitmap32) add(x uint32) {
 		c := ra.getWritableContainerAtIndex(i).iaddReturnMinimized(lowbits(x))
 		rb.highlowcontainer.setContainerAtIndex(i, c)
 	} else {
-		newac := newContainerArray()
+		newac := getContainerArray()
 		rb.highlowcontainer.insertNewKeyValueAt(-i-1, hb, newac.iaddReturnMinimized(lowbits(x)))
 	}
 }
@@ -348,7 +351,7 @@ func (rb *bitmap32) addwithptr(x uint32) (int, container16) {
 		rb.highlowcontainer.setContainerAtIndex(i, c)
 		return i, c
 	}
-	newac := newContainerArray()
+	newac := getContainerArray()
 	c := newac.iaddReturnMinimized(lowbits(x))
 	rb.highlowcontainer.insertNewKeyValueAt(-i-1, hb, c)
 	return -i - 1, c
@@ -365,7 +368,7 @@ func (rb *bitmap32) checkedAdd(x uint32) bool {
 		rb.highlowcontainer.setContainerAtIndex(i, c)
 		return c.getCardinality() > oldcard
 	}
-	newac := newContainerArray()
+	newac := getContainerArray()
 	rb.highlowcontainer.insertNewKeyValueAt(-i-1, hb, newac.iaddReturnMinimized(lowbits(x)))
 	return true
 }
@@ -406,6 +409,29 @@ func (rb *bitmap32) addMany(dat []uint32) {
 	}
 }
 
+func (rb *bitmap32) addMany64Low(dat []uint64) {
+	if len(dat) == 0 {
+		return
+	}
+	if isNonDecreasingU64Low(dat) {
+		rb.addManySorted64Low(dat)
+		return
+	}
+
+	prev := lowbits64(dat[0])
+	idx, c := rb.addwithptr(prev)
+	for _, raw := range dat[1:] {
+		v := lowbits64(raw)
+		if highbits(prev) == highbits(v) {
+			c = c.iaddReturnMinimized(lowbits(v))
+			rb.highlowcontainer.setContainerAtIndex(idx, c)
+		} else {
+			idx, c = rb.addwithptr(v)
+		}
+		prev = v
+	}
+}
+
 func (rb *bitmap32) addManySorted(dat []uint32) {
 	start := 0
 	batchHighBits := highbits(dat[0])
@@ -418,6 +444,20 @@ func (rb *bitmap32) addManySorted(dat []uint32) {
 		}
 	}
 	rb.addSortedSameHighbits(batchHighBits, dat[start:])
+}
+
+func (rb *bitmap32) addManySorted64Low(dat []uint64) {
+	start := 0
+	batchHighBits := highbits(lowbits64(dat[0]))
+	for end := 1; end < len(dat); end++ {
+		hi := highbits(lowbits64(dat[end]))
+		if hi != batchHighBits {
+			rb.addSortedSameHighbits64Low(batchHighBits, dat[start:end])
+			batchHighBits = hi
+			start = end
+		}
+	}
+	rb.addSortedSameHighbits64Low(batchHighBits, dat[start:])
 }
 
 func (rb *bitmap32) addSortedSameHighbits(hb uint16, dat []uint32) {
@@ -436,6 +476,28 @@ func (rb *bitmap32) addSortedSameHighbits(hb uint16, dat []uint32) {
 		c = minimizeWritableSortedContainer(x)
 	case *containerRun:
 		c = addSorted32Ranges(x, dat)
+	default:
+		panic("unsupported container16 type")
+	}
+	rb.highlowcontainer.setContainerAtIndex(i, c)
+}
+
+func (rb *bitmap32) addSortedSameHighbits64Low(hb uint16, dat []uint64) {
+	i := rb.highlowcontainer.getIndex(hb)
+	if i < 0 {
+		rb.highlowcontainer.insertNewKeyValueAt(-i-1, hb, buildContainerFromSorted64Low(dat))
+		return
+	}
+
+	c := rb.highlowcontainer.getWritableContainerAtIndex(i)
+	switch x := c.(type) {
+	case *containerArray:
+		c = mergeArrayWithSorted64Low(x, dat)
+	case *containerBitmap:
+		addSorted64LowToBitmap(x, dat)
+		c = minimizeWritableSortedContainer(x)
+	case *containerRun:
+		c = addSorted64LowRanges(x, dat)
 	default:
 		panic("unsupported container16 type")
 	}
@@ -463,7 +525,7 @@ func (rb *bitmap32) loadManySorted64(dat []uint64) {
 func buildContainerFromSorted32(dat []uint32) container16 {
 	unique := countUniqueSorted32(dat, arrayDefaultMaxSize+1)
 	if unique <= arrayDefaultMaxSize {
-		ac := newContainerArraySize(unique)
+		ac := getContainerArrayWithLen(unique)
 		fillArrayFromSorted32(ac.content, dat)
 		return ac
 	}
@@ -475,7 +537,7 @@ func buildContainerFromSorted32(dat []uint32) container16 {
 func buildContainerFromSorted64Low(dat []uint64) container16 {
 	unique := countUniqueSorted64Low(dat, arrayDefaultMaxSize+1)
 	if unique <= arrayDefaultMaxSize {
-		ac := newContainerArraySize(unique)
+		ac := getContainerArrayWithLen(unique)
 		fillArrayFromSorted64Low(ac.content, dat)
 		return ac
 	}
@@ -521,6 +583,15 @@ func countUniqueSorted64Low(dat []uint64, limit int) int {
 		prev = low
 	}
 	return count
+}
+
+func isNonDecreasingU64Low(dat []uint64) bool {
+	for i := 1; i < len(dat); i++ {
+		if lowbits64(dat[i]) < lowbits64(dat[i-1]) {
+			return false
+		}
+	}
+	return true
 }
 
 func fillArrayFromSorted32(dst []uint16, dat []uint32) {
@@ -596,7 +667,7 @@ func minimizeFreshSortedBitmapContainer(bc *containerBitmap) container16 {
 		return bc
 	}
 	result := newContainerRunRange(0, MaxUint16)
-	releaseContainerBitmap(bc)
+	bc.release()
 	return result
 }
 
@@ -625,7 +696,7 @@ func mergeArrayWithSorted32(ac *containerArray, dat []uint32) container16 {
 
 		oldLen := len(ac.content)
 		if cap(ac.content) < newCardinality {
-			donor := newContainerArraySize(newCardinality)
+			donor := getContainerArrayWithLen(newCardinality)
 			copy(donor.content[:oldLen], ac.content)
 			fillArrayFromSorted32(donor.content[oldLen:], dat)
 			replaceContainerArrayStorage(ac, donor)
@@ -646,7 +717,7 @@ func mergeArrayWithSorted32(ac *containerArray, dat []uint32) container16 {
 
 	oldLen := len(ac.content)
 	if cap(ac.content) < newCardinality {
-		donor := newContainerArraySize(newCardinality)
+		donor := getContainerArrayWithLen(newCardinality)
 		fillMergedArrayAndSorted32(donor.content, ac.content, dat)
 		replaceContainerArrayStorage(ac, donor)
 		return ac
@@ -654,6 +725,55 @@ func mergeArrayWithSorted32(ac *containerArray, dat []uint32) container16 {
 
 	ac.content = ac.content[:newCardinality]
 	fillMergedArrayAndSorted32InPlace(ac.content, oldLen, dat)
+	return ac
+}
+
+func mergeArrayWithSorted64Low(ac *containerArray, dat []uint64) container16 {
+	if len(ac.content) == 0 {
+		return buildContainerFromSorted64Low(dat)
+	}
+
+	first := lowbits(lowbits64(dat[0]))
+	unique := countUniqueSorted64Low(dat, arrayDefaultMaxSize+1)
+	if ac.content[len(ac.content)-1] < first {
+		newCardinality := len(ac.content) + unique
+		if newCardinality > arrayDefaultMaxSize {
+			bc := ac.toBitmapContainer()
+			addSorted64LowToBitmap(bc, dat)
+			return minimizeFreshSortedBitmapContainer(bc)
+		}
+
+		oldLen := len(ac.content)
+		if cap(ac.content) < newCardinality {
+			donor := getContainerArrayWithLen(newCardinality)
+			copy(donor.content[:oldLen], ac.content)
+			fillArrayFromSorted64Low(donor.content[oldLen:], dat)
+			replaceContainerArrayStorage(ac, donor)
+			return ac
+		}
+
+		ac.content = ac.content[:newCardinality]
+		fillArrayFromSorted64Low(ac.content[oldLen:], dat)
+		return ac
+	}
+
+	newCardinality := mergedCardinalityArrayAndSorted64Low(ac.content, dat, arrayDefaultMaxSize+1)
+	if newCardinality > arrayDefaultMaxSize {
+		bc := ac.toBitmapContainer()
+		addSorted64LowToBitmap(bc, dat)
+		return minimizeFreshSortedBitmapContainer(bc)
+	}
+
+	oldLen := len(ac.content)
+	if cap(ac.content) < newCardinality {
+		donor := getContainerArrayWithLen(newCardinality)
+		fillMergedArrayAndSorted64Low(donor.content, ac.content, dat)
+		replaceContainerArrayStorage(ac, donor)
+		return ac
+	}
+
+	ac.content = ac.content[:newCardinality]
+	fillMergedArrayAndSorted64LowInPlace(ac.content, oldLen, dat)
 	return ac
 }
 
@@ -685,6 +805,35 @@ func mergedCardinalityArrayAndSorted32(left []uint16, right []uint32, limit int)
 	return count + len(left) - i
 }
 
+func mergedCardinalityArrayAndSorted64Low(left []uint16, right []uint64, limit int) int {
+	count := 0
+	i := 0
+	prev := lowbits64(right[0]) - 1
+	for _, raw := range right {
+		v32 := lowbits64(raw)
+		if v32 == prev {
+			continue
+		}
+		v := lowbits(v32)
+		for i < len(left) && left[i] < v {
+			count++
+			if count >= limit {
+				return count
+			}
+			i++
+		}
+		count++
+		if count >= limit {
+			return count
+		}
+		if i < len(left) && left[i] == v {
+			i++
+		}
+		prev = v32
+	}
+	return count + len(left) - i
+}
+
 func fillMergedArrayAndSorted32(dst, left []uint16, right []uint32) {
 	pos := 0
 	i := 0
@@ -709,6 +858,31 @@ func fillMergedArrayAndSorted32(dst, left []uint16, right []uint32) {
 	copy(dst[pos:], left[i:])
 }
 
+func fillMergedArrayAndSorted64Low(dst, left []uint16, right []uint64) {
+	pos := 0
+	i := 0
+	prev := lowbits64(right[0]) - 1
+	for _, raw := range right {
+		v32 := lowbits64(raw)
+		if v32 == prev {
+			continue
+		}
+		v := lowbits(v32)
+		for i < len(left) && left[i] < v {
+			dst[pos] = left[i]
+			pos++
+			i++
+		}
+		dst[pos] = v
+		pos++
+		if i < len(left) && left[i] == v {
+			i++
+		}
+		prev = v32
+	}
+	copy(dst[pos:], left[i:])
+}
+
 func fillMergedArrayAndSorted32InPlace(dst []uint16, oldLen int, right []uint32) {
 	write := len(dst) - 1
 	left := oldLen - 1
@@ -716,6 +890,37 @@ func fillMergedArrayAndSorted32InPlace(dst []uint16, oldLen int, right []uint32)
 	for j := len(right) - 1; j >= 0; {
 		raw := right[j]
 		for j > 0 && right[j-1] == raw {
+			j--
+		}
+
+		v := lowbits(raw)
+		for left >= 0 && dst[left] > v {
+			dst[write] = dst[left]
+			write--
+			left--
+		}
+
+		equal := left >= 0 && dst[left] == v
+		dst[write] = v
+		write--
+		if equal {
+			left--
+		}
+		j--
+	}
+
+	if left >= 0 {
+		copy(dst[:write+1], dst[:left+1])
+	}
+}
+
+func fillMergedArrayAndSorted64LowInPlace(dst []uint16, oldLen int, right []uint64) {
+	write := len(dst) - 1
+	left := oldLen - 1
+
+	for j := len(right) - 1; j >= 0; {
+		raw := lowbits64(right[j])
+		for j > 0 && lowbits64(right[j-1]) == raw {
 			j--
 		}
 
@@ -764,6 +969,35 @@ func addSorted32Ranges(c container16, dat []uint32) container16 {
 		start = v
 		prev = v
 		lastSeen = raw
+	}
+	return c.iaddRange(start, prev+1)
+}
+
+func addSorted64LowRanges(c container16, dat []uint64) container16 {
+	start := -1
+	prev := -1
+	lastSeen := lowbits64(dat[0]) - 1
+	for _, raw := range dat {
+		v32 := lowbits64(raw)
+		if v32 == lastSeen {
+			continue
+		}
+		v := int(lowbits(v32))
+		if start < 0 {
+			start = v
+			prev = v
+			lastSeen = v32
+			continue
+		}
+		if v == prev+1 {
+			prev = v
+			lastSeen = v32
+			continue
+		}
+		c = c.iaddRange(start, prev+1)
+		start = v
+		prev = v
+		lastSeen = v32
 	}
 	return c.iaddRange(start, prev+1)
 }
@@ -1020,7 +1254,7 @@ func (rb *bitmap32) xor(x2 *bitmap32) {
 		left := rb.highlowcontainer.containers[pos1]
 		right := x2.highlowcontainer.containers[pos2]
 		if left.equals(right) {
-			releaseContainer(left)
+			left.release()
 			rb.highlowcontainer.keys[pos1] = 0
 			rb.highlowcontainer.containers[pos1] = nil
 			pos1--
@@ -1031,9 +1265,9 @@ func (rb *bitmap32) xor(x2 *bitmap32) {
 		c := left.xor(right)
 		if c.isEmpty() {
 			if c != left {
-				releaseContainer(c)
+				c.release()
 			}
-			releaseContainer(left)
+			left.release()
 			rb.highlowcontainer.keys[pos1] = 0
 			rb.highlowcontainer.containers[pos1] = nil
 			pos1--
@@ -1306,22 +1540,8 @@ func (rb *bitmap32) ReadFrom(reader io.Reader) (p int64, err error) {
 	}
 
 	rb.highlowcontainer.clear()
-	defer func() {
-		if err != nil {
-			rb.highlowcontainer.clear()
-		}
-	}()
-
-	if cap(rb.highlowcontainer.keys) >= containerCount {
-		rb.highlowcontainer.keys = rb.highlowcontainer.keys[:containerCount]
-	} else {
-		rb.highlowcontainer.keys = make([]uint16, containerCount)
-	}
-	if cap(rb.highlowcontainer.containers) >= containerCount {
-		rb.highlowcontainer.containers = rb.highlowcontainer.containers[:containerCount]
-	} else {
-		rb.highlowcontainer.containers = make([]container16, containerCount)
-	}
+	defer clearBitmap32OnReadError(rb, &err)
+	rb.highlowcontainer.setSize(containerCount)
 
 	for i := 0; i < containerCount; i++ {
 		n, err = io.ReadFull(reader, header[:])
@@ -1351,6 +1571,12 @@ func (rb *bitmap32) ReadFrom(reader io.Reader) (p int64, err error) {
 	}
 
 	return p, nil
+}
+
+func clearBitmap32OnReadError(rb *bitmap32, err *error) {
+	if *err != nil {
+		rb.highlowcontainer.clear()
+	}
 }
 
 // serializedSizeInBytes computes the serialized size in bytes of the bitmap.
@@ -1434,14 +1660,14 @@ func readBitmap32WireContainer(reader io.Reader, kind byte, meta uint16) (contai
 	switch kind {
 	case bitmap32WireContainerArray:
 		cardinality := int(meta) + 1
-		container := newContainerArraySize(cardinality)
+		container := getContainerArrayWithLen(cardinality)
 		readBytes, err := readBitmap32Array(reader, container)
 		if err != nil {
-			releaseContainerArray(container)
+			container.release()
 			return nil, readBytes, err
 		}
 		if err := validateBitmap32ArrayContainer(container); err != nil {
-			releaseContainerArray(container)
+			container.release()
 			return nil, readBytes, err
 		}
 		return container, readBytes, nil
@@ -1454,24 +1680,26 @@ func readBitmap32WireContainer(reader io.Reader, kind byte, meta uint16) (contai
 		container.cardinality = cardinality
 		readBytes, err := readBitmap32Bitmap(reader, container)
 		if err != nil {
-			releaseContainerBitmap(container)
+			container.release()
 			return nil, readBytes, err
 		}
 		if err := validateBitmap32BitmapContainer(container); err != nil {
-			releaseContainerBitmap(container)
+			container.release()
 			return nil, readBytes, err
 		}
 		return container, readBytes, nil
 	case bitmap32WireContainerRun:
 		intervalCount := int(meta) + 1
-		container := acquireContainerRun(intervalCount, intervalCount)
+		container := newContainerRun()
+		container.iv = slices.Grow(container.iv, intervalCount)
+		container.iv = container.iv[:intervalCount]
 		readBytes, err := readBitmap32Run(reader, container)
 		if err != nil {
-			releaseContainerRun(container)
+			container.release()
 			return nil, readBytes, err
 		}
 		if err := validateBitmap32RunContainer(container); err != nil {
-			releaseContainerRun(container)
+			container.release()
 			return nil, readBytes, err
 		}
 		return container, readBytes, nil

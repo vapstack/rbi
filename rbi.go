@@ -14,6 +14,7 @@ import (
 	"time"
 	"unsafe"
 
+	"github.com/vapstack/rbi/internal/pooled"
 	"github.com/vapstack/rbi/internal/posting"
 	"go.etcd.io/bbolt"
 )
@@ -349,11 +350,7 @@ func New[K ~uint64 | ~string, V any](bolt *bbolt.DB, options Options, execOpts .
 	if err = regInstance(boltPath, vname); err != nil {
 		return nil, err
 	}
-	defer func() {
-		if err != nil {
-			unregInstance(boltPath, vname)
-		}
-	}()
+	defer unregInstanceOnError(&err, boltPath, vname)
 
 	calPath := ""
 	if options.PersistCalibration {
@@ -375,17 +372,6 @@ func New[K ~uint64 | ~string, V any](bolt *bbolt.DB, options Options, execOpts .
 		universe: posting.List{},
 
 		rbiFile: bolt.Path() + "." + vname + ".rbi",
-
-		recPool: sync.Pool{
-			New: func() any {
-				return new(V)
-			},
-		},
-		viewPool: sync.Pool{
-			New: func() any {
-				return new(queryView[K, V])
-			},
-		},
 
 		options:     &options,
 		execOptions: defaultExecOptions,
@@ -599,6 +585,94 @@ func (db *DB[K, V]) initBatcher() {
 		maxOps:       maxOps,
 		maxQ:         maxQueue,
 		queue:        make([]*autoBatchJob[K, V], capHint),
+		repeatIDPool: pooled.Maps[K, int]{
+			NewCap: 8,
+		},
+		requestScratchPool: pooled.Slices[*autoBatchRequest[K, V]]{
+			Clear: true,
+		},
+		attemptStatePool: pooled.Pointers[autoBatchAttemptState[K, V]]{
+			Cleanup: func(st *autoBatchAttemptState[K, V]) {
+				for _, buf := range st.ownedPayloads {
+					if buf != nil {
+						encodePool.Put(buf)
+					}
+				}
+				clear(st.ownedPayloads)
+				st.ownedPayloads = st.ownedPayloads[:0]
+
+				clear(st.prepared)
+				st.prepared = st.prepared[:0]
+
+				clear(st.accepted)
+				st.accepted = st.accepted[:0]
+
+				clear(st.states)
+				st.states = st.states[:0]
+
+				st.uniqueIdxs = st.uniqueIdxs[:0]
+
+				clear(st.uniqueOldVals)
+				st.uniqueOldVals = st.uniqueOldVals[:0]
+
+				clear(st.uniqueNewVals)
+				st.uniqueNewVals = st.uniqueNewVals[:0]
+
+				if st.stateByID != nil {
+					clear(st.stateByID)
+				}
+				st.db = nil
+				st.bucket = nil
+				st.statsEnabled = false
+			},
+		},
+		requestPool: pooled.Pointers[autoBatchRequest[K, V]]{
+			Init: func(req *autoBatchRequest[K, V]) {
+				if req.done == nil {
+					req.done = make(chan error, 1)
+				}
+			},
+			Cleanup: func(req *autoBatchRequest[K, V]) {
+				if req.setPayload != nil {
+					encodePool.Put(req.setPayload)
+					req.setPayload = nil
+				}
+				req.setValue = nil
+				req.setBaseline = nil
+				clear(req.patch)
+				req.patch = req.patch[:0]
+				req.patchIgnoreUnknown = false
+				req.beforeProcess = nil
+				req.beforeStore = nil
+				req.beforeCommit = nil
+				req.cloneValue = nil
+				req.policy = 0
+				req.replacedBy = nil
+				select {
+				case <-req.done:
+				default:
+				}
+				req.op = 0
+				var zeroID K
+				req.id = zeroID
+				req.err = nil
+			},
+		},
+		jobPool: pooled.Pointers[autoBatchJob[K, V]]{
+			Init: func(job *autoBatchJob[K, V]) {
+				if job.done == nil {
+					job.done = make(chan error, 1)
+				}
+			},
+			Cleanup: func(job *autoBatchJob[K, V]) {
+				select {
+				case <-job.done:
+				default:
+				}
+				job.reqs = nil
+				job.isolated = false
+			},
+		},
 	}
 	db.autoBatcher.cond = sync.NewCond(&db.autoBatcher.mu)
 }
@@ -679,12 +753,11 @@ type autoBatcher[K ~string | ~uint64, V any] struct {
 	queueHead          int
 	queueSize          int
 	batchScratch       []*autoBatchJob[K, V]
-	repeatIDScratch    map[K]int
-	repeatIDScratchCap int
-	requestScratchPool sync.Pool
-	attemptStatePool   sync.Pool
-	requestPool        sync.Pool
-	jobPool            sync.Pool
+	repeatIDPool       pooled.Maps[K, int]
+	requestScratchPool pooled.Slices[*autoBatchRequest[K, V]]
+	attemptStatePool   pooled.Pointers[autoBatchAttemptState[K, V]]
+	requestPool        pooled.Pointers[autoBatchRequest[K, V]]
+	jobPool            pooled.Pointers[autoBatchJob[K, V]]
 	hotUntil           time.Time
 
 	submitted          atomic.Uint64
@@ -770,8 +843,8 @@ type (
 
 		rbiFile string
 
-		recPool  sync.Pool
-		viewPool sync.Pool
+		recPool  pooled.Pointers[V]
+		viewPool pooled.Pointers[queryView[K, V]]
 
 		mu     sync.RWMutex
 		closed atomic.Bool
@@ -1113,12 +1186,7 @@ func (db *DB[K, V]) tripBrokenLocked(op string, cause any) error {
 }
 
 func (db *DB[K, V]) publishAfterCommitLocked(seq uint64, op string, publish func()) (err error) {
-	defer func() {
-		if r := recover(); r != nil {
-			err = db.tripBrokenLocked(op, r)
-			db.dropStagedSnapshot(seq)
-		}
-	}()
+	defer recoverPublishAfterCommit(db, seq, op, &err)
 	if hook := db.testHooks.afterCommitPublish; hook != nil {
 		hook(op)
 	}
@@ -1278,35 +1346,8 @@ func (db *DB[K, V]) IndexStats() IndexStats {
 			keyLen uint64
 			card   uint64
 		)
-		accumulate := func(ov fieldOverlay, countDistinct bool) {
-			br := ov.rangeForBounds(rangeBounds{has: true})
-			if br.baseStart >= br.baseEnd {
-				return
-			}
-			cur := ov.newCursor(br, false)
-			for {
-				key, ids, ok := cur.next()
-				if !ok {
-					break
-				}
-				if ids.IsEmpty() {
-					continue
-				}
-				if countDistinct {
-					unique++
-					keyLen += uint64(key.byteLen())
-				}
-				size += ids.SizeInBytes()
-				curCard := ids.Cardinality()
-				card += curCard
-				idx.EntryCount++
-				idx.KeyBytes += uint64(key.byteLen())
-				idx.PostingCardinality += curCard
-			}
-		}
-
-		accumulate(newFieldOverlayStorage(snap.index[name]), true)
-		accumulate(newFieldOverlayStorage(snap.nilIndex[name]), false)
+		accumulateIndexStats(newFieldOverlayStorage(snap.index[name]), true, &unique, &size, &keyLen, &card, &idx)
+		accumulateIndexStats(newFieldOverlayStorage(snap.nilIndex[name]), false, &unique, &size, &keyLen, &card, &idx)
 
 		idx.UniqueFieldKeys[name] = unique
 		idx.FieldSize[name] = size
@@ -1317,6 +1358,54 @@ func (db *DB[K, V]) IndexStats() IndexStats {
 	idx.ApproxStructBytes = idx.EntryCount * uint64(unsafe.Sizeof(index{}))
 	idx.ApproxHeapBytes = idx.Size + idx.KeyBytes + idx.ApproxStructBytes
 	return idx
+}
+
+func unregInstanceOnError(err *error, boltPath string, vname string) {
+	if *err != nil {
+		unregInstance(boltPath, vname)
+	}
+}
+
+func recoverPublishAfterCommit[K ~string | ~uint64, V any](db *DB[K, V], seq uint64, op string, err *error) {
+	if r := recover(); r != nil {
+		*err = db.tripBrokenLocked(op, r)
+		db.dropStagedSnapshot(seq)
+	}
+}
+
+func accumulateIndexStats(
+	ov fieldOverlay,
+	countDistinct bool,
+	unique *uint64,
+	size *uint64,
+	keyLen *uint64,
+	card *uint64,
+	idx *IndexStats,
+) {
+	br := ov.rangeForBounds(rangeBounds{has: true})
+	if br.baseStart >= br.baseEnd {
+		return
+	}
+	cur := ov.newCursor(br, false)
+	for {
+		key, ids, ok := cur.next()
+		if !ok {
+			return
+		}
+		if ids.IsEmpty() {
+			continue
+		}
+		if countDistinct {
+			*unique += 1
+			*keyLen += uint64(key.byteLen())
+		}
+		*size += ids.SizeInBytes()
+		curCard := ids.Cardinality()
+		*card += curCard
+		idx.EntryCount++
+		idx.KeyBytes += uint64(key.byteLen())
+		idx.PostingCardinality += curCard
+	}
 }
 
 // AutoBatchStats returns auto-batcher queue, batch, and availability diagnostics.

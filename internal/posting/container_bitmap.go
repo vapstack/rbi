@@ -1,14 +1,26 @@
 package posting
 
 import (
-	"sync"
 	"sync/atomic"
 	"unsafe"
+
+	"github.com/vapstack/rbi/internal/pooled"
 )
 
 const bitmapContainerWords = maxCapacity / 64
 
-var bitmapContainerPool sync.Pool
+var bitmapContainerPool = pooled.Pointers[containerBitmap]{
+	New: func() *containerBitmap {
+		return &containerBitmap{bitmap: make([]uint64, bitmapContainerWords)}
+	},
+	Init: func(bc *containerBitmap) {
+		bc.refs.Store(1)
+	},
+	Cleanup: func(bc *containerBitmap) {
+		bc.cardinality = 0
+		clear(bc.bitmap)
+	},
+}
 
 type containerBitmap struct {
 	refs        atomic.Int32
@@ -252,20 +264,19 @@ func setBitmapRangeAndCardinalityChange(bitmap []uint64, start int, end int) int
 }
 
 func newContainerBitmap() *containerBitmap {
-	if v := bitmapContainerPool.Get(); v != nil {
-		bc := v.(*containerBitmap)
-		bc.refs.Store(1)
-		bc.cardinality = 0
-		return bc
-	}
-	bc := &containerBitmap{
-		bitmap: make([]uint64, bitmapContainerWords),
-	}
-	bc.refs.Store(1)
+	return bitmapContainerPool.Get()
+}
+
+func (bc *containerBitmap) retain() container16 {
+	bc.refs.Add(1)
 	return bc
 }
 
-func releaseContainerBitmap(bc *containerBitmap) {
+func (bc *containerBitmap) uniquelyOwned() bool {
+	return bc.refs.Load() == 1
+}
+
+func (bc *containerBitmap) release() {
 	if bc == nil {
 		return
 	}
@@ -275,27 +286,19 @@ func releaseContainerBitmap(bc *containerBitmap) {
 	if len(bc.bitmap) != bitmapContainerWords {
 		return
 	}
-	bc.cardinality = 0
-	clear(bc.bitmap)
 	bitmapContainerPool.Put(bc)
 }
 
-func releaseTempBitmapUnlessReturned(temp *containerBitmap, result container16) {
-	if temp == nil {
-		return
-	}
-	if returned, ok := result.(*containerBitmap); ok && returned == temp {
-		return
-	}
-	releaseContainerBitmap(temp)
-}
+func (bc *containerBitmap) Release() { bc.release() }
 
 func efficientContainerFromTempBitmap(temp *containerBitmap) container16 {
 	if temp == nil {
 		return nil
 	}
 	result := temp.toEfficientContainer()
-	releaseTempBitmapUnlessReturned(temp, result)
+	if returned, ok := result.(*containerBitmap); !ok || returned != temp {
+		temp.release()
+	}
 	return result
 }
 
@@ -405,6 +408,8 @@ func (bcsi *bitmapContainerShortIterator) advanceIfNeeded(minval uint16) {
 	}
 }
 
+func (*bitmapContainerShortIterator) release() {}
+
 func newContainerBitmapShortIterator(a *containerBitmap) *bitmapContainerShortIterator {
 	return &bitmapContainerShortIterator{a, a.nextSetBit(0)}
 }
@@ -473,6 +478,8 @@ func (bcmi *bitmapContainerManyIterator) nextMany64(hs uint64, buf []uint64) int
 	bcmi.bitset = bitset
 	return n
 }
+
+func (*bitmapContainerManyIterator) release() {}
 
 func newContainerBitmapManyIterator(a *containerBitmap) *bitmapContainerManyIterator {
 	return &bitmapContainerManyIterator{a, -1, 0}
@@ -759,16 +766,16 @@ func (bc *containerBitmap) xorArray(value2 *containerArray) container16 {
 }
 
 func (bc *containerBitmap) xorBitmap(value2 *containerBitmap) container16 {
-	answer := newContainerBitmap()
-	answer.cardinality = bitmapXorSlice(answer.bitmap, bc.bitmap, value2.bitmap)
-	if answer.cardinality > arrayDefaultMaxSize {
-		if answer.isFull() {
+	result := newContainerBitmap()
+	result.cardinality = bitmapXorSlice(result.bitmap, bc.bitmap, value2.bitmap)
+	if result.cardinality > arrayDefaultMaxSize {
+		if result.isFull() {
 			return newContainerRunRange(0, MaxUint16)
 		}
-		return answer
+		return result
 	}
-	ac := newContainerArrayFromBitmap(answer)
-	releaseContainerBitmap(answer)
+	ac := newContainerArrayFromBitmap(result)
+	result.release()
 	return ac
 }
 
@@ -804,7 +811,6 @@ func (bc *containerBitmap) intersects(a container16) bool {
 		return bc.intersectsBitmap(x)
 	case *containerRun:
 		return x.intersects(bc)
-
 	}
 	panic("unsupported container16 type")
 }
@@ -834,7 +840,7 @@ func (bc *containerBitmap) iandArray(ac *containerArray) container16 {
 
 func (bc *containerBitmap) andRun(rc *containerRun) container16 {
 	if bc.isEmpty() || rc.isEmpty() {
-		return newContainerArray()
+		return getContainerArray()
 	}
 	if rc.isFull() {
 		return bc.clone()
@@ -842,7 +848,7 @@ func (bc *containerBitmap) andRun(rc *containerRun) container16 {
 
 	cardinality := rc.andBitmapCardinality(bc)
 	if cardinality <= arrayDefaultMaxSize {
-		answer := newContainerArraySize(cardinality)
+		answer := getContainerArrayWithLen(cardinality)
 		answer.content = answer.content[:fillArrayBitmapAndRun(answer.content, bc.bitmap, rc.iv)]
 		return answer
 	}
@@ -854,7 +860,7 @@ func (bc *containerBitmap) andRun(rc *containerRun) container16 {
 }
 
 func (bc *containerBitmap) andArray(value2 *containerArray) *containerArray {
-	answer := newContainerArrayCapacity(len(value2.content))
+	answer := getContainerArrayWithCap(len(value2.content))
 	answer.content = answer.content[:cap(answer.content)]
 	c := value2.getCardinality()
 	pos := 0
@@ -881,26 +887,26 @@ func (bc *containerBitmap) getCardinalityInRange(start, end uint) int {
 	if start >= end {
 		return 0
 	}
-	firstword := start / 64
-	endword := (end - 1) / 64
-	const allones = ^uint64(0)
-	if firstword == endword {
-		return int(popcount(bc.bitmap[firstword] & ((allones << (start % 64)) & (allones >> ((64 - end) & 63)))))
+	firstWord := start / 64
+	endWord := (end - 1) / 64
+	const allOnes = ^uint64(0)
+	if firstWord == endWord {
+		return int(popcount(bc.bitmap[firstWord] & ((allOnes << (start % 64)) & (allOnes >> ((64 - end) & 63)))))
 	}
-	answer := popcount(bc.bitmap[firstword] & (allones << (start % 64)))
-	answer += popcntSlice(bc.bitmap[firstword+1 : endword])
-	answer += popcount(bc.bitmap[endword] & (allones >> ((64 - end) & 63)))
+	answer := popcount(bc.bitmap[firstWord] & (allOnes << (start % 64)))
+	answer += popcntSlice(bc.bitmap[firstWord+1 : endWord])
+	answer += popcount(bc.bitmap[endWord] & (allOnes >> ((64 - end) & 63)))
 	return int(answer)
 }
 
 func (bc *containerBitmap) andBitmap(value2 *containerBitmap) container16 {
-	answer := newContainerBitmap()
-	answer.cardinality = bitmapAndSlice(answer.bitmap, bc.bitmap, value2.bitmap)
-	if answer.cardinality > arrayDefaultMaxSize {
-		return answer
+	result := newContainerBitmap()
+	result.cardinality = bitmapAndSlice(result.bitmap, bc.bitmap, value2.bitmap)
+	if result.cardinality > arrayDefaultMaxSize {
+		return result
 	}
-	ac := newContainerArrayFromBitmap(answer)
-	releaseContainerBitmap(answer)
+	ac := newContainerArrayFromBitmap(result)
+	result.release()
 	return ac
 }
 
@@ -1040,7 +1046,7 @@ func (bc *containerBitmap) andNotBitmap(value2 *containerBitmap) container16 {
 		return answer
 	}
 	ac := newContainerArrayFromBitmap(answer)
-	releaseContainerBitmap(answer)
+	answer.release()
 	return ac
 }
 
@@ -1076,7 +1082,7 @@ func (bc *containerBitmap) loadData(containerArray *containerArray) {
 }
 
 func (bc *containerBitmap) toArrayContainer() *containerArray {
-	ac := newContainerArray()
+	ac := getContainerArray()
 	ac.loadData(bc)
 	return ac
 }

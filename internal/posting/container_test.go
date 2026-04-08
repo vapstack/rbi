@@ -20,12 +20,12 @@ func ownContainerBitmap(bc *containerBitmap) *containerBitmap {
 }
 
 func TestArrayContainerPool_ReusedSizedContainerLeaksOldContent(t *testing.T) {
-	ac := newContainerArraySize(4)
+	ac := getContainerArrayWithLen(4)
 	copy(ac.content, []uint16{11, 22, 33, 44})
-	releaseContainerArray(ac)
+	ac.release()
 
-	reused := newContainerArraySize(4)
-	defer releaseContainerArray(reused)
+	reused := getContainerArrayWithLen(4)
+	defer reused.release()
 	if !testRaceEnabled && reused != ac {
 		t.Fatalf("array container pool did not reuse container")
 	}
@@ -35,15 +35,19 @@ func TestArrayContainerPool_ReusedSizedContainerLeaksOldContent(t *testing.T) {
 }
 
 func TestRunContainerPool_ReusedSizedContainerLeaksOldIntervals(t *testing.T) {
-	rc := acquireContainerRun(4, 4)
+	rc := newContainerRun()
+	rc.iv = slices.Grow(rc.iv, max(4, 4))
+	rc.iv = rc.iv[:4]
 	rc.iv[0] = interval16{start: 10, length: 1}
 	rc.iv[1] = interval16{start: 20, length: 2}
 	rc.iv[2] = interval16{start: 30, length: 3}
 	rc.iv[3] = interval16{start: 40, length: 4}
-	releaseContainerRun(rc)
+	rc.release()
 
-	reused := acquireContainerRun(4, 4)
-	defer releaseContainerRun(reused)
+	reused := newContainerRun()
+	reused.iv = slices.Grow(reused.iv, max(4, 4))
+	reused.iv = reused.iv[:4]
+	defer reused.release()
 	if !testRaceEnabled && reused != rc {
 		t.Fatalf("run container pool did not reuse container")
 	}
@@ -54,16 +58,20 @@ func TestRunContainerPool_ReusedSizedContainerLeaksOldIntervals(t *testing.T) {
 }
 
 func TestRunContainerPool_ReusedLargerLengthPreservesUnreleasedTail(t *testing.T) {
-	rc := acquireContainerRun(4, 4)
+	rc := newContainerRun()
+	rc.iv = slices.Grow(rc.iv, max(4, 4))
+	rc.iv = rc.iv[:4]
 	rc.iv[0] = interval16{start: 10, length: 1}
 	rc.iv[1] = interval16{start: 20, length: 2}
 	rc.iv[2] = interval16{start: 30, length: 3}
 	rc.iv[3] = interval16{start: 40, length: 4}
 	rc.iv = rc.iv[:2]
-	releaseContainerRun(rc)
+	rc.release()
 
-	reused := acquireContainerRun(4, 4)
-	defer releaseContainerRun(reused)
+	reused := newContainerRun()
+	reused.iv = slices.Grow(reused.iv, max(4, 4))
+	reused.iv = reused.iv[:4]
+	defer reused.release()
 	if !testRaceEnabled && reused != rc {
 		t.Fatalf("run container pool did not reuse container")
 	}
@@ -80,13 +88,13 @@ func TestRunContainerPool_ReusedLargerLengthPreservesUnreleasedTail(t *testing.T
 }
 
 func TestArrayContainerPool_ReusedLargerLengthPreservesUnreleasedTail(t *testing.T) {
-	ac := newContainerArraySize(4)
+	ac := getContainerArrayWithLen(4)
 	copy(ac.content, []uint16{11, 22, 33, 44})
 	ac.content = ac.content[:2]
-	releaseContainerArray(ac)
+	ac.release()
 
-	reused := newContainerArraySize(4)
-	defer releaseContainerArray(reused)
+	reused := getContainerArrayWithLen(4)
+	defer reused.release()
 	if !testRaceEnabled && reused != ac {
 		t.Fatalf("array container pool did not reuse container")
 	}
@@ -98,14 +106,73 @@ func TestArrayContainerPool_ReusedLargerLengthPreservesUnreleasedTail(t *testing
 	}
 }
 
+func TestContainerArrayPoolClassifiers(t *testing.T) {
+	getCases := []struct {
+		size int
+		want int
+	}{
+		{size: -1, want: 0},
+		{size: 0, want: 0},
+		{size: 1, want: 0},
+		{size: 32, want: 0},
+		{size: 33, want: 1},
+		{size: 64, want: 1},
+		{size: 65, want: 2},
+		{size: 1024, want: 5},
+		{size: 1025, want: 6},
+		{size: 4096, want: 7},
+		{size: 4097, want: 8},
+		{size: maxContainerArrayPoolCapacity, want: len(containerArrayPoolCapacities) - 1},
+		{size: maxContainerArrayPoolCapacity + 1, want: -1},
+	}
+	for _, tc := range getCases {
+		if got := containerArrayPoolIndex(tc.size); got != tc.want {
+			t.Fatalf("containerArrayPoolIndex(%d) = %d, want %d", tc.size, got, tc.want)
+		}
+	}
+
+	putCases := []struct {
+		capacity int
+		want     int
+	}{
+		{capacity: -1, want: -1},
+		{capacity: 0, want: -1},
+		{capacity: 31, want: -1},
+		{capacity: 32, want: 0},
+		{capacity: 33, want: 0},
+		{capacity: 63, want: 0},
+		{capacity: 64, want: 1},
+		{capacity: 65, want: 1},
+		{capacity: 1024, want: 5},
+		{capacity: 1536, want: 5},
+		{capacity: 2048, want: 6},
+		{capacity: maxContainerArrayPoolCapacity, want: len(containerArrayPoolCapacities) - 1},
+		{capacity: maxContainerArrayPoolCapacity + 1, want: -1},
+	}
+	for _, tc := range putCases {
+		if got := containerArrayPoolPutIndex(tc.capacity); got != tc.want {
+			t.Fatalf("containerArrayPoolPutIndex(%d) = %d, want %d", tc.capacity, got, tc.want)
+		}
+	}
+}
+
 func TestContainerOwnershipHelpersRejectNil(t *testing.T) {
 	panicCases := []struct {
 		name string
 		fn   func()
 	}{
-		{name: "Retain", fn: func() { retainContainer(nil) }},
-		{name: "UniquelyOwned", fn: func() { containerUniquelyOwned(nil) }},
-		{name: "Release", fn: func() { releaseContainer(nil) }},
+		{name: "Retain", fn: func() {
+			var c container16
+			c.retain()
+		}},
+		{name: "UniquelyOwned", fn: func() {
+			var c container16
+			c.uniquelyOwned()
+		}},
+		{name: "Release", fn: func() {
+			var c container16
+			c.release()
+		}},
 	}
 
 	for _, tc := range panicCases {
@@ -123,14 +190,14 @@ func TestContainerOwnershipHelpersRejectNil(t *testing.T) {
 func TestRunContainerToBitmapContainer_CorrectCardinality(t *testing.T) {
 	rc := newContainerRunRange(10, 19)
 	bc := rc.toBitmapContainer()
-	defer releaseContainerBitmap(bc)
+	defer bc.release()
 
 	if bc.cardinality != 10 {
 		t.Fatalf("unexpected cardinality: got %d want 10", bc.cardinality)
 	}
 
 	ac := bc.toArrayContainer()
-	defer releaseContainerArray(ac)
+	defer ac.release()
 
 	want := []uint16{10, 11, 12, 13, 14, 15, 16, 17, 18, 19}
 	if !slices.Equal(ac.content, want) {
@@ -140,15 +207,15 @@ func TestRunContainerToBitmapContainer_CorrectCardinality(t *testing.T) {
 
 func TestRunContainerIAndNotArray_NoZeroTail(t *testing.T) {
 	rc := newContainerRunRange(10, 19)
-	ac := newContainerArrayFromSlice([]uint16{11, 13, 17})
-	defer releaseContainerArray(ac)
+	ac := getContainerArrayFromSlice([]uint16{11, 13, 17})
+	defer ac.release()
 
 	result := rc.iandNotArray(ac)
 	got, ok := result.(*containerArray)
 	if !ok {
 		t.Fatalf("unexpected result type: %T", result)
 	}
-	defer releaseContainerArray(got)
+	defer got.release()
 
 	want := []uint16{10, 12, 14, 15, 16, 18, 19}
 	if !slices.Equal(got.content, want) {
@@ -165,7 +232,7 @@ func TestContainerIndexSearchCopyDetachAndRemove(t *testing.T) {
 			buildContainerBitmap([]uint16{20, 21, 22}),
 		},
 	}
-	defer src.releaseContainersInRange(0)
+	defer releaseContainerIndexForTest(src)
 
 	if got := src.binarySearch(0, int64(len(src.keys)), 3); got != 1 {
 		t.Fatalf("binarySearch mismatch: got=%d want=1", got)
@@ -182,7 +249,7 @@ func TestContainerIndexSearchCopyDetachAndRemove(t *testing.T) {
 
 	copyDst := new(containerIndex)
 	copyDst.copyFrom(src)
-	defer copyDst.releaseContainersInRange(0)
+	defer releaseContainerIndexForTest(copyDst)
 	if !slices.Equal(copyDst.keys, src.keys) {
 		t.Fatalf("copyFrom keys mismatch: got=%v want=%v", copyDst.keys, src.keys)
 	}
@@ -193,7 +260,7 @@ func TestContainerIndexSearchCopyDetachAndRemove(t *testing.T) {
 
 	sharedDst := new(containerIndex)
 	sharedDst.copySharedFrom(src)
-	defer sharedDst.releaseContainersInRange(0)
+	defer releaseContainerIndexForTest(sharedDst)
 	original := sharedDst.getContainerAtIndex(2)
 	writable := sharedDst.getWritableContainerAtIndex(2)
 	if writable == original {
@@ -219,7 +286,7 @@ func TestLargeArraySearchCopyDetachAndRemove(t *testing.T) {
 			buildBitmap32(20, 21, 22),
 		},
 	}
-	defer src.releaseContainersInRange(0)
+	defer releaseLargeArrayForTest(src)
 
 	if got := src.binarySearch(0, int64(len(src.keys)), 3); got != 1 {
 		t.Fatalf("binarySearch mismatch: got=%d want=1", got)
@@ -236,7 +303,7 @@ func TestLargeArraySearchCopyDetachAndRemove(t *testing.T) {
 
 	copyDst := new(largeArray)
 	copyDst.copyFrom(src)
-	defer copyDst.releaseContainersInRange(0)
+	defer releaseLargeArrayForTest(copyDst)
 	copyDst.getWritableContainerAtIndex(0).add(99)
 	if src.getContainerAtIndex(0).contains(99) {
 		t.Fatalf("copyFrom result still shares bitmap32 state with source")
@@ -244,7 +311,7 @@ func TestLargeArraySearchCopyDetachAndRemove(t *testing.T) {
 
 	sharedDst := new(largeArray)
 	sharedDst.copySharedFrom(src)
-	defer sharedDst.releaseContainersInRange(0)
+	defer releaseLargeArrayForTest(sharedDst)
 	original := sharedDst.getContainerAtIndex(2)
 	writable := sharedDst.getWritableContainerAtIndex(2)
 	if writable == original {
@@ -322,7 +389,7 @@ func TestLowLevelHelpersAndOwnershipWrappers(t *testing.T) {
 	}
 
 	rangeContainer := rangeOfOnes(10, 20)
-	defer releaseContainer(rangeContainer)
+	defer rangeContainer.release()
 	assertSameContainerSet(t, rangeContainer, []uint16{10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20})
 
 	ac := ownContainerArray(&containerArray{})
@@ -333,8 +400,8 @@ func TestLowLevelHelpersAndOwnershipWrappers(t *testing.T) {
 	if bc.refs.Load() != 1 {
 		t.Fatalf("ownContainerBitmap refs mismatch: got=%d want=1", bc.refs.Load())
 	}
-	releaseContainerArray(ac)
-	releaseContainerBitmap(bc)
+	ac.release()
+	bc.release()
 }
 
 func TestLowLevelSearchHelperEdgeCases(t *testing.T) {
@@ -363,7 +430,7 @@ func TestLowLevelSearchHelperEdgeCases(t *testing.T) {
 			buildContainerArray([]uint16{77}),
 		},
 	}
-	defer ci.releaseContainersInRange(0)
+	defer releaseContainerIndexForTest(ci)
 
 	if got := ci.binarySearch(0, int64(len(ci.keys)), 49); got != 12 {
 		t.Fatalf("containerIndex binarySearch exact mismatch: got=%d want=12", got)
@@ -396,7 +463,7 @@ func TestLowLevelSearchHelperEdgeCases(t *testing.T) {
 			buildBitmap32(61), buildBitmap32(65), buildBitmap32(69), buildBitmap32(73), buildBitmap32(77),
 		},
 	}
-	defer la.releaseContainersInRange(0)
+	defer releaseLargeArrayForTest(la)
 
 	if got := la.binarySearch(0, int64(len(la.keys)), 49); got != 12 {
 		t.Fatalf("largeArray binarySearch exact mismatch: got=%d want=12", got)
@@ -429,7 +496,7 @@ func TestIndexAppendInsertionKeepsOrdering(t *testing.T) {
 			buildContainerArray([]uint16{3}),
 		},
 	}
-	defer ci.releaseContainersInRange(0)
+	defer releaseContainerIndexForTest(ci)
 
 	ciTail := buildContainerArray([]uint16{5})
 	ci.insertNewKeyValueAt(2, 5, ciTail)
@@ -447,7 +514,7 @@ func TestIndexAppendInsertionKeepsOrdering(t *testing.T) {
 			buildBitmap32(3),
 		},
 	}
-	defer la.releaseContainersInRange(0)
+	defer releaseLargeArrayForTest(la)
 
 	laTail := buildBitmap32(5)
 	la.insertNewKeyValueAt(2, 5, laTail)
@@ -468,7 +535,7 @@ func TestLowLevelAppendCopyAliasesAndPopcountHelpers(t *testing.T) {
 			buildContainerBitmap([]uint16{20, 21, 22}),
 		},
 	}
-	defer src.releaseContainersInRange(0)
+	defer releaseContainerIndexForTest(&src)
 
 	alias := &containerIndex{
 		keys:       src.keys[:2],
@@ -482,7 +549,7 @@ func TestLowLevelAppendCopyAliasesAndPopcountHelpers(t *testing.T) {
 		keys:       []uint16{1, 3},
 		containers: []container16{buildContainerArray([]uint16{1, 2})},
 	}
-	defer independent.releaseContainersInRange(0)
+	defer releaseContainerIndexForTest(independent)
 	if src.aliases(independent) {
 		t.Fatalf("containerIndex aliases must reject distinct backing")
 	}
@@ -490,7 +557,7 @@ func TestLowLevelAppendCopyAliasesAndPopcountHelpers(t *testing.T) {
 	var dst containerIndex
 	dst.appendCopy(src, 0)
 	dst.appendCopyMany(src, 1, 3)
-	defer dst.releaseContainersInRange(0)
+	defer releaseContainerIndexForTest(&dst)
 
 	if !slices.Equal(dst.keys, src.keys) {
 		t.Fatalf("appendCopy/appendCopyMany keys mismatch: got=%v want=%v", dst.keys, src.keys)
@@ -516,11 +583,11 @@ func TestLowLevelAppendCopyAliasesAndPopcountHelpers(t *testing.T) {
 func TestRangeOfOnesContracts(t *testing.T) {
 	t.Run("EfficientRepresentations", func(t *testing.T) {
 		single := rangeOfOnes(10, 10)
-		defer releaseContainer(single)
+		defer single.release()
 		assertSameContainerSet(t, single, []uint16{10})
 
 		full := rangeOfOnes(0, MaxUint16)
-		defer releaseContainer(full)
+		defer full.release()
 		if _, ok := full.(*containerRun); !ok {
 			t.Fatalf("full rangeOfOnes must stay run, got %T", full)
 		}
@@ -675,15 +742,15 @@ func BenchmarkContainerCrossTypeEquals(b *testing.B) {
 	}
 
 	arrayEqual := buildContainerArray(arrayValues)
-	defer releaseContainer(arrayEqual)
+	defer arrayEqual.release()
 	arrayShifted := buildContainerArray(append([]uint16(nil), arrayValues...))
 	arrayShifted.(*containerArray).content[0]++
-	defer releaseContainer(arrayShifted)
+	defer arrayShifted.release()
 
 	bitmapEqual := buildContainerBitmap(arrayValues)
-	defer releaseContainer(bitmapEqual)
+	defer bitmapEqual.release()
 	bitmapShifted := buildContainerBitmap(containerToSlice(arrayShifted))
-	defer releaseContainer(bitmapShifted)
+	defer bitmapShifted.release()
 
 	runValues := make([]uint16, 0, 2048)
 	for start := 0; start < 8192; start += 8 {
@@ -693,16 +760,16 @@ func BenchmarkContainerCrossTypeEquals(b *testing.B) {
 	}
 
 	runEqual := buildContainerRun(runValues).(*containerRun)
-	defer releaseContainerRun(runEqual)
+	defer runEqual.release()
 	runShiftedValues := append([]uint16(nil), runValues...)
 	runShiftedValues[0]++
 	runShifted := buildContainerRun(runShiftedValues).(*containerRun)
-	defer releaseContainerRun(runShifted)
+	defer runShifted.release()
 
 	bitmapRunEqual := buildContainerBitmap(runValues)
-	defer releaseContainer(bitmapRunEqual)
+	defer bitmapRunEqual.release()
 	bitmapRunShifted := buildContainerBitmap(runShiftedValues)
-	defer releaseContainer(bitmapRunShifted)
+	defer bitmapRunShifted.release()
 
 	b.Run("ArrayBitmap/Equal/New", func(b *testing.B) {
 		benchmarkContainerEquals(b, func() bool {

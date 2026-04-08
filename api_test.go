@@ -513,8 +513,7 @@ func TestBatchSet_FailedBuild_ReleasesPreparedRequestsBeforePooling(t *testing.T
 		t.Fatalf("buildSetAutoBatchRequest after failed BatchSet: %v", err)
 	}
 	defer func() {
-		req.releaseOwnedState()
-		db.autoBatcher.releaseRequest(req)
+		db.autoBatcher.requestPool.Put(req)
 	}()
 
 	if req.policy != 0 {

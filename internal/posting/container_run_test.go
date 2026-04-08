@@ -50,23 +50,23 @@ func assertRunIntervalsInvariant(t *testing.T, rc *containerRun) {
 
 func TestContainerRunConstructionAndIntervalHelpers(t *testing.T) {
 	rc := newContainerRunRange(10, 19)
-	defer releaseContainerRun(rc)
+	defer rc.release()
 	assertRunIntervalsInvariant(t, rc)
 	assertSameContainerSet(t, rc, []uint16{10, 11, 12, 13, 14, 15, 16, 17, 18, 19})
 
-	tempArray := newContainerArrayFromSlice([]uint16{1, 2, 3, 10, 20, 21, 22})
+	tempArray := getContainerArrayFromSlice([]uint16{1, 2, 3, 10, 20, 21, 22})
 	fromArray := newContainerRunFromArray(tempArray)
-	releaseContainerArray(tempArray)
-	defer releaseContainerRun(fromArray)
+	tempArray.release()
+	defer fromArray.release()
 	assertRunIntervalsInvariant(t, fromArray)
 	assertSameContainerSet(t, fromArray, []uint16{1, 2, 3, 10, 20, 21, 22})
 
 	bitmap := newContainerBitmap()
-	defer releaseContainerBitmap(bitmap)
+	defer bitmap.release()
 	bitmap.iaddRange(100, 110)
 	bitmap.iaddRange(200, 205)
 	fromBitmap := newContainerRunFromBitmap(bitmap)
-	defer releaseContainerRun(fromBitmap)
+	defer fromBitmap.release()
 	assertRunIntervalsInvariant(t, fromBitmap)
 	assertSameContainerSet(t, fromBitmap, []uint16{
 		100, 101, 102, 103, 104, 105, 106, 107, 108, 109,
@@ -98,7 +98,7 @@ func TestContainerRunConstructionAndIntervalHelpers(t *testing.T) {
 	}
 
 	inverted := fromArray.invert()
-	defer releaseContainerRun(inverted)
+	defer inverted.release()
 	assertRunIntervalsInvariant(t, inverted)
 	if inverted.contains(1) || inverted.contains(2) || inverted.contains(3) {
 		t.Fatalf("invert must remove existing values")
@@ -110,7 +110,7 @@ func TestContainerRunConstructionAndIntervalHelpers(t *testing.T) {
 
 func TestContainerRunMutationAndCrossTypeOps(t *testing.T) {
 	rc := newContainerRunRange(10, 19)
-	defer releaseContainerRun(rc)
+	defer rc.release()
 
 	if !rc.iadd(25) || rc.iadd(25) {
 		t.Fatalf("iadd duplicate detection mismatch")
@@ -127,14 +127,14 @@ func TestContainerRunMutationAndCrossTypeOps(t *testing.T) {
 	})
 
 	flipped := rc.not(9, 12)
-	defer releaseContainer(flipped)
+	defer flipped.release()
 	assertSameContainerSet(t, flipped, []uint16{
 		9, 13, 14, 18, 19, 25,
 		30, 31, 32, 33, 34,
 	})
 
 	inverted := rc.inot(30, 33)
-	defer releaseContainerPair(rc, inverted)
+	defer cleanupContainerPair(rc, inverted)
 	rc = nil
 	assertSameContainerSet(t, inverted, []uint16{
 		10, 11, 13, 14, 18, 19, 25, 33, 34,
@@ -146,8 +146,8 @@ func TestContainerRunMutationAndCrossTypeOps(t *testing.T) {
 		t.Run(factory.name, func(t *testing.T) {
 			left := buildContainerRun(leftIDs)
 			right := factory.build(rightIDs)
-			defer releaseContainer(left)
-			defer releaseContainer(right)
+			defer left.release()
+			defer right.release()
 
 			unionWant := unionUint16(leftIDs, rightIDs)
 			andWant := intersectUint16(leftIDs, rightIDs)
@@ -156,40 +156,40 @@ func TestContainerRunMutationAndCrossTypeOps(t *testing.T) {
 
 			orResult := left.or(right)
 			assertSameContainerSet(t, orResult, unionWant)
-			releaseContainer(orResult)
+			orResult.release()
 
 			andResult := left.and(right)
 			assertSameContainerSet(t, andResult, andWant)
-			releaseContainer(andResult)
+			andResult.release()
 
 			xorResult := left.xor(right)
 			assertSameContainerSet(t, xorResult, xorWant)
-			releaseContainer(xorResult)
+			xorResult.release()
 
 			andNotResult := left.andNot(right)
 			assertSameContainerSet(t, andNotResult, diffWant)
-			releaseContainer(andNotResult)
+			andNotResult.release()
 
 			iorLeft := buildContainerRun(leftIDs)
 			iorRight := factory.build(rightIDs)
 			iorResult := iorLeft.ior(iorRight)
 			assertSameContainerSet(t, iorResult, unionWant)
-			releaseContainer(iorRight)
-			releaseContainerPair(iorLeft, iorResult)
+			iorRight.release()
+			cleanupContainerPair(iorLeft, iorResult)
 
 			iandLeft := buildContainerRun(leftIDs)
 			iandRight := factory.build(rightIDs)
 			iandResult := iandLeft.iand(iandRight)
 			assertSameContainerSet(t, iandResult, andWant)
-			releaseContainer(iandRight)
-			releaseContainerPair(iandLeft, iandResult)
+			iandRight.release()
+			cleanupContainerPair(iandLeft, iandResult)
 
 			iandNotLeft := buildContainerRun(leftIDs)
 			iandNotRight := factory.build(rightIDs)
 			iandNotResult := iandNotLeft.iandNot(iandNotRight)
 			assertSameContainerSet(t, iandNotResult, diffWant)
-			releaseContainer(iandNotRight)
-			releaseContainerPair(iandNotLeft, iandNotResult)
+			iandNotRight.release()
+			cleanupContainerPair(iandNotLeft, iandNotResult)
 
 			if got := left.intersects(right); got != (len(andWant) > 0) {
 				t.Fatalf("intersects mismatch: got=%v want=%v", got, len(andWant) > 0)
@@ -223,15 +223,15 @@ func TestContainerRunNotCopyAndInotRangeToggle(t *testing.T) {
 			want := xorUint16(tc.base, containerRangeUint16(tc.start, tc.end))
 
 			src := buildContainerRun(tc.base).(*containerRun)
-			defer releaseContainerRun(src)
+			defer src.release()
 			notCopy := src.notCopy(tc.start, tc.end)
-			defer releaseContainerRun(notCopy)
+			defer notCopy.release()
 			assertRunIntervalsInvariant(t, notCopy)
 			assertSameContainerSet(t, notCopy, want)
 			assertSameContainerSet(t, src, tc.base)
 
 			notResult := src.not(tc.start, tc.end)
-			defer releaseContainer(notResult)
+			defer notResult.release()
 			assertSameContainerSet(t, notResult, want)
 			assertSameContainerSet(t, src, tc.base)
 
@@ -241,7 +241,7 @@ func TestContainerRunNotCopyAndInotRangeToggle(t *testing.T) {
 			if runResult, ok := inotResult.(*containerRun); ok {
 				assertRunIntervalsInvariant(t, runResult)
 			}
-			releaseContainerPair(inplace, inotResult)
+			cleanupContainerPair(inplace, inotResult)
 		})
 	}
 }
@@ -266,7 +266,7 @@ func TestContainerRunInotEmptyRangeIsNoOp(t *testing.T) {
 	}
 	assertRunIntervalsInvariant(t, rc)
 	assertSameContainerSet(t, rc, []uint16{10, 11, 12, 20, 21, 22})
-	releaseContainerRun(rc)
+	rc.release()
 }
 
 func TestContainerRunInotReusesWritableStorage(t *testing.T) {
@@ -289,7 +289,7 @@ func TestContainerRunInotReusesWritableStorage(t *testing.T) {
 	}
 	assertRunIntervalsInvariant(t, rc)
 	assertSameContainerSet(t, rc, []uint16{10, 11, 12, 13, 14, 15, 16, 17, 20, 21, 22})
-	releaseContainerRun(rc)
+	rc.release()
 }
 
 func TestContainerRunInotReplacesStorageWhenCapacityIsTight(t *testing.T) {
@@ -312,7 +312,7 @@ func TestContainerRunInotReplacesStorageWhenCapacityIsTight(t *testing.T) {
 	}
 	assertRunIntervalsInvariant(t, rc)
 	assertSameContainerSet(t, rc, []uint16{10, 11, 12, 13, 14, 15, 16, 17, 20, 21, 22})
-	releaseContainerRun(rc)
+	rc.release()
 }
 
 func TestContainerRunInotWritablePathCanReturnArray(t *testing.T) {
@@ -328,19 +328,19 @@ func TestContainerRunInotWritablePathCanReturnArray(t *testing.T) {
 	}
 	assertRunIntervalsInvariant(t, rc)
 	assertSameContainerSet(t, result, []uint16{5, 6, 7})
-	releaseContainerPair(rc, result)
+	cleanupContainerPair(rc, result)
 }
 
 func TestContainerRunAndNotBitmapToRunFullSuffixBoundary(t *testing.T) {
 	left := newContainerRunRange(1, MaxUint16)
-	defer releaseContainerRun(left)
+	defer left.release()
 
 	right := newContainerBitmap()
-	defer releaseContainerBitmap(right)
+	defer right.release()
 	right.iaddRange(1, maxCapacity)
 
 	result, cardinality := left.andNotBitmapToRun(right)
-	defer releaseContainerRun(result)
+	defer result.release()
 	if cardinality != 0 {
 		t.Fatalf("andNotBitmapToRun cardinality mismatch: got=%d want=0", cardinality)
 	}
@@ -351,37 +351,37 @@ func TestContainerRunAndNotBitmapToRunFullSuffixBoundary(t *testing.T) {
 
 func TestContainerRunIntersectsEdgeCases(t *testing.T) {
 	full := newContainerRunRange(0, MaxUint16)
-	defer releaseContainerRun(full)
+	defer full.release()
 
-	empty := newContainerArray()
-	defer releaseContainerArray(empty)
+	empty := getContainerArray()
+	defer empty.release()
 	if full.intersects(empty) {
 		t.Fatalf("full run must not intersect empty container")
 	}
 
 	single := buildContainerArray([]uint16{42})
-	defer releaseContainer(single)
+	defer single.release()
 	if !full.intersects(single) {
 		t.Fatalf("full run must intersect non-empty container")
 	}
 
 	left := buildContainerRun([]uint16{10, 11, 12, 100, 101, 102}).(*containerRun)
-	defer releaseContainerRun(left)
+	defer left.release()
 
 	adjacent := newContainerRunRange(13, 15)
-	defer releaseContainerRun(adjacent)
+	defer adjacent.release()
 	if left.intersects(adjacent) {
 		t.Fatalf("adjacent runs must not intersect")
 	}
 
 	arrayHit := buildContainerArray([]uint16{13, 99, 101})
-	defer releaseContainer(arrayHit)
+	defer arrayHit.release()
 	if !left.intersects(arrayHit) {
 		t.Fatalf("run/array late-range hit was missed")
 	}
 
 	bitmapMiss := buildContainerBitmap([]uint16{50, 60})
-	defer releaseContainer(bitmapMiss)
+	defer bitmapMiss.release()
 	if left.intersects(bitmapMiss) {
 		t.Fatalf("run/bitmap unexpectedly intersected")
 	}
@@ -389,12 +389,12 @@ func TestContainerRunIntersectsEdgeCases(t *testing.T) {
 
 func TestContainerRunAndNotRunCopyAndXorEmptyRegressions(t *testing.T) {
 	nonEmpty := buildContainerRun([]uint16{10, 11, 12, 100, 101}).(*containerRun)
-	defer releaseContainerRun(nonEmpty)
+	defer nonEmpty.release()
 	empty := newContainerRun()
-	defer releaseContainerRun(empty)
+	defer empty.release()
 
 	diff := nonEmpty.andNotRunCopy(empty)
-	defer releaseContainerRun(diff)
+	defer diff.release()
 	if diff == nonEmpty {
 		t.Fatalf("andNotRunCopy must return a fresh run when subtracting empty")
 	}
@@ -402,7 +402,7 @@ func TestContainerRunAndNotRunCopyAndXorEmptyRegressions(t *testing.T) {
 	assertSameContainerSet(t, diff, []uint16{10, 11, 12, 100, 101})
 
 	emptyDiff := empty.andNotRunCopy(nonEmpty)
-	defer releaseContainerRun(emptyDiff)
+	defer emptyDiff.release()
 	if emptyDiff == empty {
 		t.Fatalf("andNotRunCopy must return a fresh run when the source is empty")
 	}
@@ -410,11 +410,11 @@ func TestContainerRunAndNotRunCopyAndXorEmptyRegressions(t *testing.T) {
 	assertSameContainerSet(t, emptyDiff, nil)
 
 	xorLeft := nonEmpty.xorRun(empty)
-	defer releaseContainer(xorLeft)
+	defer xorLeft.release()
 	assertSameContainerSet(t, xorLeft, []uint16{10, 11, 12, 100, 101})
 
 	xorRight := empty.xorRun(nonEmpty)
-	defer releaseContainer(xorRight)
+	defer xorRight.release()
 	assertSameContainerSet(t, xorRight, []uint16{10, 11, 12, 100, 101})
 }
 
@@ -429,12 +429,12 @@ func TestContainerRunXorRunDirectMergeRegressions(t *testing.T) {
 		want = append(want, containerRangeUint16(36, 41)...)
 
 		left := buildContainerRun(leftIDs).(*containerRun)
-		defer releaseContainerRun(left)
+		defer left.release()
 		right := buildContainerRun(rightIDs).(*containerRun)
-		defer releaseContainerRun(right)
+		defer right.release()
 
 		result := left.xorRun(right)
-		defer releaseContainer(result)
+		defer result.release()
 
 		assertSameContainerSet(t, result, want)
 		assertRunIntervalsInvariant(t, left)
@@ -448,12 +448,12 @@ func TestContainerRunXorRunDirectMergeRegressions(t *testing.T) {
 		rightIDs := containerRangeUint16(maxCapacity-2, maxCapacity)
 
 		left := buildContainerRun(leftIDs).(*containerRun)
-		defer releaseContainerRun(left)
+		defer left.release()
 		right := buildContainerRun(rightIDs).(*containerRun)
-		defer releaseContainerRun(right)
+		defer right.release()
 
 		result := left.xorRun(right)
-		defer releaseContainer(result)
+		defer result.release()
 
 		assertSameContainerSet(t, result, []uint16{uint16(maxCapacity - 3)})
 		assertSameContainerSet(t, left, leftIDs)
@@ -468,12 +468,12 @@ func TestContainerRunXorArrayDirectMergeRegressions(t *testing.T) {
 		want := containerRangeUint16(9, 18)
 
 		run := buildContainerRun(runIDs).(*containerRun)
-		defer releaseContainerRun(run)
-		array := newContainerArrayFromSlice(arrayIDs)
-		defer releaseContainerArray(array)
+		defer run.release()
+		array := getContainerArrayFromSlice(arrayIDs)
+		defer array.release()
 
 		result := run.xorArray(array)
-		defer releaseContainer(result)
+		defer result.release()
 
 		assertSameContainerSet(t, result, want)
 		assertRunIntervalsInvariant(t, run)
@@ -487,12 +487,12 @@ func TestContainerRunXorArrayDirectMergeRegressions(t *testing.T) {
 		want := []uint16{uint16(maxCapacity - 4), uint16(maxCapacity - 3), uint16(maxCapacity - 1)}
 
 		run := buildContainerRun(runIDs).(*containerRun)
-		defer releaseContainerRun(run)
-		array := newContainerArrayFromSlice(arrayIDs)
-		defer releaseContainerArray(array)
+		defer run.release()
+		array := getContainerArrayFromSlice(arrayIDs)
+		defer array.release()
 
 		result := run.xorArray(array)
-		defer releaseContainer(result)
+		defer result.release()
 
 		assertSameContainerSet(t, result, want)
 		assertSameContainerSet(t, run, runIDs)
@@ -506,12 +506,12 @@ func TestContainerRunOrArrayMinimizationPaths(t *testing.T) {
 		rightIDs := []uint16{24, 28, 32}
 
 		left := newContainerRunCopyIv(singletonIntervals16(leftIDs))
-		defer releaseContainerRun(left)
-		right := newContainerArrayFromSlice(rightIDs)
-		defer releaseContainerArray(right)
+		defer left.release()
+		right := getContainerArrayFromSlice(rightIDs)
+		defer right.release()
 
 		result := left.orArray(right)
-		defer releaseContainer(result)
+		defer result.release()
 
 		if _, ok := result.(*containerArray); !ok {
 			t.Fatalf("sparse run+array union must minimize to array, got %T", result)
@@ -529,12 +529,12 @@ func TestContainerRunOrArrayMinimizationPaths(t *testing.T) {
 		rightIDs := []uint16{uint16(arrayDefaultMaxSize * 2)}
 
 		left := newContainerRunCopyIv(singletonIntervals16(leftIDs))
-		defer releaseContainerRun(left)
-		right := newContainerArrayFromSlice(rightIDs)
-		defer releaseContainerArray(right)
+		defer left.release()
+		right := getContainerArrayFromSlice(rightIDs)
+		defer right.release()
 
 		result := left.orArray(right)
-		defer releaseContainer(result)
+		defer result.release()
 
 		if _, ok := result.(*containerBitmap); !ok {
 			t.Fatalf("large sparse run+array union must minimize to bitmap, got %T", result)
@@ -551,15 +551,15 @@ func TestContainerRunIOrArrayDonorPathMinimization(t *testing.T) {
 		rightIDs := []uint16{24, 28, 32}
 
 		left := newContainerRunCopyIv(singletonIntervals16(leftIDs))
-		right := newContainerArrayFromSlice(rightIDs)
-		defer releaseContainerArray(right)
+		right := getContainerArrayFromSlice(rightIDs)
+		defer right.release()
 
 		result := left.iorArray(right)
 		if _, ok := result.(*containerArray); !ok {
 			t.Fatalf("donor-path sparse run+array inplace union must minimize to array, got %T", result)
 		}
 		assertSameContainerSet(t, result, unionUint16(leftIDs, rightIDs))
-		releaseContainerPair(left, result)
+		cleanupContainerPair(left, result)
 	})
 
 	t.Run("Bitmap", func(t *testing.T) {
@@ -570,21 +570,21 @@ func TestContainerRunIOrArrayDonorPathMinimization(t *testing.T) {
 		rightIDs := []uint16{uint16(arrayDefaultMaxSize * 2)}
 
 		left := newContainerRunCopyIv(singletonIntervals16(leftIDs))
-		right := newContainerArrayFromSlice(rightIDs)
-		defer releaseContainerArray(right)
+		right := getContainerArrayFromSlice(rightIDs)
+		defer right.release()
 
 		result := left.iorArray(right)
 		if _, ok := result.(*containerBitmap); !ok {
 			t.Fatalf("donor-path large sparse run+array inplace union must minimize to bitmap, got %T", result)
 		}
 		assertSameContainerSet(t, result, unionUint16(leftIDs, rightIDs))
-		releaseContainerPair(left, result)
+		cleanupContainerPair(left, result)
 	})
 }
 
 func TestContainerRunConversionsIteratorsAndClone(t *testing.T) {
 	rc := buildContainerRun([]uint16{1, 2, 3, 10, 11, 12, 100, 101, 102}).(*containerRun)
-	defer releaseContainerRun(rc)
+	defer rc.release()
 
 	if got := rc.numberOfRuns(); got != 3 {
 		t.Fatalf("numberOfRuns mismatch: got=%d want=3", got)
@@ -600,21 +600,21 @@ func TestContainerRunConversionsIteratorsAndClone(t *testing.T) {
 	}
 
 	bitmap := rc.toBitmapContainer()
-	defer releaseContainerBitmap(bitmap)
+	defer bitmap.release()
 	assertSameContainerSet(t, bitmap, containerToSlice(rc))
 
 	array := rc.toArrayContainer()
-	defer releaseContainerArray(array)
+	defer array.release()
 	assertSameContainerSet(t, array, containerToSlice(rc))
 
 	optimized := rc.toEfficientContainer()
-	defer releaseContainer(optimized)
+	defer optimized.release()
 	if _, ok := optimized.(*containerRun); !ok {
 		t.Fatalf("expected run from toEfficientContainer for compact run cardinality, got %T", optimized)
 	}
 
 	optimizedFromCard := rc.toEfficientContainerFromCardinality(rc.getCardinality())
-	defer releaseContainer(optimizedFromCard)
+	defer optimizedFromCard.release()
 	if _, ok := optimizedFromCard.(*containerRun); !ok {
 		t.Fatalf("expected run from toEfficientContainerFromCardinality, got %T", optimizedFromCard)
 	}
@@ -680,36 +680,36 @@ func TestContainerRunConversionsIteratorsAndClone(t *testing.T) {
 	}
 
 	cloneRun := rc.cloneRun()
-	defer releaseContainerRun(cloneRun)
+	defer cloneRun.release()
 	cloneRun.iadd(400)
 	if rc.contains(400) {
 		t.Fatalf("cloneRun mutation changed source")
 	}
 
 	clone := rc.clone().(*containerRun)
-	defer releaseContainerRun(clone)
+	defer clone.release()
 	clone.iadd(500)
 	if rc.contains(500) {
 		t.Fatalf("clone mutation changed source")
 	}
 
 	runEq := buildContainerRun(containerToSlice(rc))
-	defer releaseContainer(runEq)
+	defer runEq.release()
 	if !rc.equals(runEq) {
 		t.Fatalf("run equals mismatch for same content")
 	}
 	arrayEq := buildContainerArray(containerToSlice(rc))
-	defer releaseContainer(arrayEq)
+	defer arrayEq.release()
 	if !rc.equals(arrayEq) || !arrayEq.equals(rc) {
 		t.Fatalf("run/array equals mismatch for same content")
 	}
 	bitmapEq := buildContainerBitmap(containerToSlice(rc))
-	defer releaseContainer(bitmapEq)
+	defer bitmapEq.release()
 	if !rc.equals(bitmapEq) || !bitmapEq.equals(rc) {
 		t.Fatalf("run/bitmap equals mismatch for same content")
 	}
 	runDifferent := buildContainerArray([]uint16{1, 2, 3})
-	defer releaseContainer(runDifferent)
+	defer runDifferent.release()
 	if rc.equals(runDifferent) {
 		t.Fatalf("run equals must reject different content")
 	}
@@ -722,10 +722,10 @@ func TestContainerRunToEfficientContainer_ArrayPathWithManySingletonRuns(t *test
 	}
 
 	rc := buildContainerRun(values).(*containerRun)
-	defer releaseContainerRun(rc)
+	defer rc.release()
 
 	result := rc.toEfficientContainer()
-	defer releaseContainer(result)
+	defer result.release()
 
 	array, ok := result.(*containerArray)
 	if !ok {
@@ -736,10 +736,10 @@ func TestContainerRunToEfficientContainer_ArrayPathWithManySingletonRuns(t *test
 
 func TestContainerRunToArrayContainer_TailAtMaxCapacity(t *testing.T) {
 	rc := newContainerRunRange(maxCapacity-8, maxCapacity-1)
-	defer releaseContainerRun(rc)
+	defer rc.release()
 
 	array := rc.toArrayContainer()
-	defer releaseContainerArray(array)
+	defer array.release()
 
 	assertSameContainerSet(t, array, containerRangeUint16(maxCapacity-8, maxCapacity))
 }
@@ -751,10 +751,10 @@ func TestContainerRunToEfficientContainerFromCardinality_ArrayPath(t *testing.T)
 	}
 
 	rc := buildContainerRun(values).(*containerRun)
-	defer releaseContainerRun(rc)
+	defer rc.release()
 
 	optimized := rc.toEfficientContainerFromCardinality(len(values))
-	defer releaseContainer(optimized)
+	defer optimized.release()
 
 	array, ok := optimized.(*containerArray)
 	if !ok {
@@ -765,7 +765,7 @@ func TestContainerRunToEfficientContainerFromCardinality_ArrayPath(t *testing.T)
 
 func TestContainerRunDirectSubtractHelper(t *testing.T) {
 	rc := buildContainerRun([]uint16{10, 11, 12, 20, 21, 22, 30, 31, 32}).(*containerRun)
-	defer releaseContainerRun(rc)
+	defer rc.release()
 
 	rc.isubtract(newInterval16Range(11, 30))
 	assertRunIntervalsInvariant(t, rc)
@@ -792,7 +792,7 @@ func TestContainerRunDirectAddDeleteAndInvertHelpers(t *testing.T) {
 
 		for _, tc := range tests {
 			t.Run(tc.name, func(t *testing.T) {
-				defer releaseContainerRun(tc.rc)
+				defer tc.rc.release()
 				if !tc.rc.add(tc.add) {
 					t.Fatalf("expected add(%d) to report insertion", tc.add)
 				}
@@ -805,7 +805,7 @@ func TestContainerRunDirectAddDeleteAndInvertHelpers(t *testing.T) {
 	t.Run("DeleteAtBranches", func(t *testing.T) {
 		t.Run("DeleteSingleValueInterval", func(t *testing.T) {
 			rc := newContainerRunRange(10, 10)
-			defer releaseContainerRun(rc)
+			defer rc.release()
 			curIndex, curPos := 0, uint16(0)
 			rc.deleteAt(&curIndex, &curPos)
 			if !rc.isEmpty() || curIndex != 0 || curPos != 0 {
@@ -815,7 +815,7 @@ func TestContainerRunDirectAddDeleteAndInvertHelpers(t *testing.T) {
 
 		t.Run("DeleteIntervalStart", func(t *testing.T) {
 			rc := newContainerRunRange(20, 22)
-			defer releaseContainerRun(rc)
+			defer rc.release()
 			curIndex, curPos := 0, uint16(0)
 			rc.deleteAt(&curIndex, &curPos)
 			assertSameContainerSet(t, rc, []uint16{21, 22})
@@ -826,7 +826,7 @@ func TestContainerRunDirectAddDeleteAndInvertHelpers(t *testing.T) {
 
 		t.Run("DeleteIntervalEnd", func(t *testing.T) {
 			rc := newContainerRunRange(30, 32)
-			defer releaseContainerRun(rc)
+			defer rc.release()
 			curIndex, curPos := 0, uint16(2)
 			rc.deleteAt(&curIndex, &curPos)
 			assertSameContainerSet(t, rc, []uint16{30, 31})
@@ -837,7 +837,7 @@ func TestContainerRunDirectAddDeleteAndInvertHelpers(t *testing.T) {
 
 		t.Run("DeleteIntervalMiddle", func(t *testing.T) {
 			rc := newContainerRunRange(40, 44)
-			defer releaseContainerRun(rc)
+			defer rc.release()
 			curIndex, curPos := 0, uint16(2)
 			rc.deleteAt(&curIndex, &curPos)
 			assertRunIntervalsInvariant(t, rc)
@@ -866,7 +866,7 @@ func TestContainerRunDirectAddDeleteAndInvertHelpers(t *testing.T) {
 
 		for _, tc := range tests {
 			t.Run(tc.name, func(t *testing.T) {
-				defer releaseContainerRun(tc.rc)
+				defer tc.rc.release()
 				tc.rc.iaddRange(tc.start, tc.endx)
 				assertRunIntervalsInvariant(t, tc.rc)
 				assertSameContainerSet(t, tc.rc, tc.want)
@@ -875,8 +875,8 @@ func TestContainerRunDirectAddDeleteAndInvertHelpers(t *testing.T) {
 	})
 
 	t.Run("RunArrayUnionReusedBuffer", func(t *testing.T) {
-		ac := newContainerArrayFromSlice([]uint16{1, 3, 5, 40, 42, 44})
-		defer releaseContainerArray(ac)
+		ac := getContainerArrayFromSlice([]uint16{1, 3, 5, 40, 42, 44})
+		defer ac.release()
 
 		src := make([]interval16, 2, 2+len(ac.content))
 		src[0] = newInterval16Range(10, 20)
@@ -887,7 +887,7 @@ func TestContainerRunDirectAddDeleteAndInvertHelpers(t *testing.T) {
 
 		got, cardMinusOne := runArrayUnionToRuns(buf[len(ac.content):], ac, buf[:0])
 		rc := newContainerRunTakeOwnership(got)
-		defer releaseContainerRun(rc)
+		defer rc.release()
 
 		if int(cardMinusOne)+1 != rc.getCardinality() {
 			t.Fatalf("runArrayUnionToRuns cardinality mismatch: got=%d want=%d", int(cardMinusOne)+1, rc.getCardinality())
@@ -916,7 +916,7 @@ func TestContainerRunDirectAddDeleteAndInvertHelpers(t *testing.T) {
 
 		for _, tc := range tests {
 			t.Run(tc.name, func(t *testing.T) {
-				defer releaseContainerRun(tc.rc)
+				defer tc.rc.release()
 				if got := tc.rc.invertlastInterval(tc.origin, 0); !slices.Equal(got, tc.want) {
 					t.Fatalf("invertlastInterval mismatch: got=%v want=%v", got, tc.want)
 				}
@@ -990,7 +990,7 @@ func TestContainerRunISubtractBranchMatrix(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			defer releaseContainerRun(tc.rc)
+			defer tc.rc.release()
 			tc.rc.isubtract(tc.del)
 			assertRunIntervalsInvariant(t, tc.rc)
 			assertSameContainerSet(t, tc.rc, tc.want)
@@ -1000,17 +1000,17 @@ func TestContainerRunISubtractBranchMatrix(t *testing.T) {
 
 func TestContainerRunIntersectOutputCanExceedMinInputRuns(t *testing.T) {
 	left := newContainerRunRange(0, 20)
-	defer releaseContainerRun(left)
+	defer left.release()
 
 	right := newContainerRunCopyIv([]interval16{
 		newInterval16Range(1, 2),
 		newInterval16Range(5, 6),
 		newInterval16Range(9, 10),
 	})
-	defer releaseContainerRun(right)
+	defer right.release()
 
 	got := left.intersect(right)
-	defer releaseContainerRun(got)
+	defer got.release()
 
 	assertRunIntervalsInvariant(t, got)
 	assertSameContainerSet(t, got, []uint16{1, 2, 5, 6, 9, 10})

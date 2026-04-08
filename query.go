@@ -135,7 +135,7 @@ func (db *DB[K, V]) makeQueryView(snap *indexSnapshot) *queryView[K, V] {
 	if db.traceRoot != nil {
 		root = db.traceRoot
 	}
-	view := root.viewPool.Get().(*queryView[K, V])
+	view := root.viewPool.Get()
 	*view = queryView[K, V]{
 		root:              root,
 		snap:              snap,
@@ -161,6 +161,13 @@ func (db *DB[K, V]) releaseQueryView(view *queryView[K, V]) {
 	root.viewPool.Put(view)
 }
 
+func finishQueryTrace[K ~uint64 | ~string, V any](trace *queryTrace, out *[]K, err *error) {
+	if trace == nil {
+		return
+	}
+	trace.finish(uint64(len(*out)), *err)
+}
+
 func (qv *queryView[K, V]) execPreparedQuery(q *qx.QX) ([]K, error) {
 	return qv.execQuery(q, false, true)
 }
@@ -181,9 +188,7 @@ func (qv *queryView[K, V]) execQuery(q *qx.QX, emitTrace bool, prepared bool) (o
 	if emitTrace && qv.root.traceOrCalibrationSamplingEnabled() {
 		trace = qv.root.beginTrace(q)
 		if trace != nil {
-			defer func() {
-				trace.finish(uint64(len(out)), err)
-			}()
+			defer finishQueryTrace[K, V](trace, &out, &err)
 		}
 	}
 
@@ -238,7 +243,7 @@ func (qv *queryView[K, V]) execQuery(q *qx.QX, emitTrace bool, prepared bool) (o
 			return nil, nil
 		}
 	}
-	defer func() { result.release() }()
+	defer result.release()
 
 	skip := q.Offset
 	needAll := q.Limit == 0
@@ -246,12 +251,7 @@ func (qv *queryView[K, V]) execQuery(q *qx.QX, emitTrace bool, prepared bool) (o
 
 	// case 1: no ordering, negative result: iterate over universe excluding the result set
 	if len(q.Order) == 0 && result.neg {
-		out = make([]K, 0, func() uint64 {
-			if needAll {
-				return qv.snapshotUniverseCardinality()
-			}
-			return need
-		}())
+		out = makeOutSlice[K](qv.postingResultCardinality(result), need)
 		cursor := qv.newQueryCursor(out, skip, need, needAll, 0)
 
 		ex := result.ids

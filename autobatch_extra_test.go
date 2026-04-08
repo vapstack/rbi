@@ -66,7 +66,14 @@ func drainCurrentAutoBatchQueue[K ~string | ~uint64, V any](
 			onBatch(batch)
 		}
 		db.executeAutoBatchJobs(batch)
-		db.autoBatcher.releaseBatchScratch(batch)
+		clear(batch)
+		db.autoBatcher.mu.Lock()
+		if cap(batch) > cap(db.autoBatcher.batchScratch) {
+			db.autoBatcher.batchScratch = batch[:0]
+		} else if db.autoBatcher.batchScratch == nil {
+			db.autoBatcher.batchScratch = batch[:0]
+		}
+		db.autoBatcher.mu.Unlock()
 	}
 }
 
@@ -602,7 +609,7 @@ func TestAutoBatchExtra_MixedQueuedOps_MatchSequentialModel(t *testing.T) {
 
 		drainQueuedAutoBatchStep(t, dbBatch, reqs, func(batch []*autoBatchJob[uint64, Rec]) {
 			for _, job := range batch {
-				req := job.reqs[0]
+				req := job.reqs.Get(0)
 				if req.replacedBy != nil {
 					continue
 				}
@@ -610,7 +617,7 @@ func TestAutoBatchExtra_MixedQueuedOps_MatchSequentialModel(t *testing.T) {
 				wantErrs[idx] = applyAutoBatchExtraRecSpec(dbSeq, specs[idx])
 			}
 			for _, job := range batch {
-				req := job.reqs[0]
+				req := job.reqs.Get(0)
 				if req.replacedBy == nil {
 					continue
 				}
@@ -796,7 +803,7 @@ func TestAutoBatchExtra_UniqueMixedQueuedOps_MatchSequentialModel(t *testing.T) 
 
 		drainQueuedAutoBatchStep(t, dbBatch, reqs, func(batch []*autoBatchJob[uint64, UniqueTestRec]) {
 			for _, job := range batch {
-				req := job.reqs[0]
+				req := job.reqs.Get(0)
 				if req.replacedBy != nil {
 					continue
 				}
@@ -804,7 +811,7 @@ func TestAutoBatchExtra_UniqueMixedQueuedOps_MatchSequentialModel(t *testing.T) 
 				wantErrs[idx] = applyAutoBatchExtraUniqueSpec(dbSeq, specs[idx])
 			}
 			for _, job := range batch {
-				req := job.reqs[0]
+				req := job.reqs.Get(0)
 				if req.replacedBy == nil {
 					continue
 				}
@@ -861,11 +868,11 @@ func TestAutoBatchExtra_GrowQueuePreservesRingOrderAndCoalesceAcrossWrap(t *test
 		t.Fatalf("queue did not grow, len=%d", got)
 	}
 	gotOrder := []uint64{
-		db.autoBatcher.queueAt(0).reqs[0].id,
-		db.autoBatcher.queueAt(1).reqs[0].id,
-		db.autoBatcher.queueAt(2).reqs[0].id,
-		db.autoBatcher.queueAt(3).reqs[0].id,
-		db.autoBatcher.queueAt(4).reqs[0].id,
+		db.autoBatcher.queueAt(0).reqs.Get(0).id,
+		db.autoBatcher.queueAt(1).reqs.Get(0).id,
+		db.autoBatcher.queueAt(2).reqs.Get(0).id,
+		db.autoBatcher.queueAt(3).reqs.Get(0).id,
+		db.autoBatcher.queueAt(4).reqs.Get(0).id,
 	}
 	db.autoBatcher.mu.Unlock()
 
@@ -882,7 +889,14 @@ func TestAutoBatchExtra_GrowQueuePreservesRingOrderAndCoalesceAcrossWrap(t *test
 	}
 
 	db.executeAutoBatchJobs(batch)
-	db.autoBatcher.releaseBatchScratch(batch)
+	clear(batch)
+	db.autoBatcher.mu.Lock()
+	if cap(batch) > cap(db.autoBatcher.batchScratch) {
+		db.autoBatcher.batchScratch = batch[:0]
+	} else if db.autoBatcher.batchScratch == nil {
+		db.autoBatcher.batchScratch = batch[:0]
+	}
+	db.autoBatcher.mu.Unlock()
 
 	for i, req := range []*autoBatchRequest[uint64, Rec]{req1, req2, req3, req4, req5} {
 		if err := mustAutoBatchErr(t, req); err != nil {
@@ -966,7 +980,7 @@ func TestAutoBatchExtra_InterleavedIsolatedSameID_PreservesSequentialState(t *te
 		db,
 		queuedSingleJob(req1),
 		&autoBatchJob[uint64, Rec]{
-			reqs:     []*autoBatchRequest[uint64, Rec]{req2},
+			reqs:     testAutoBatchRequestBuf(req2),
 			isolated: true,
 			done:     req2.done,
 		},
@@ -1077,7 +1091,7 @@ func TestAutoBatchExtra_GroupedJobBetweenSharedRequests_StaysIsolatedAndOrdered(
 		db,
 		queuedSingleJob(headReq),
 		&autoBatchJob[uint64, Rec]{
-			reqs:     []*autoBatchRequest[uint64, Rec]{groupReq1, groupReq2},
+			reqs:     testAutoBatchRequestBuf(groupReq1, groupReq2),
 			isolated: true,
 			done:     groupDone,
 		},
@@ -1090,7 +1104,7 @@ func TestAutoBatchExtra_GroupedJobBetweenSharedRequests_StaysIsolatedAndOrdered(
 		switch {
 		case len(batch) != 1:
 			popped = append(popped, fmt.Sprintf("size=%d", len(batch)))
-		case batch[0].isolated && len(batch[0].reqs) == 2:
+		case batch[0].isolated && batch[0].reqs.Len() == 2:
 			popped = append(popped, "group")
 		case batch[0].isolated:
 			popped = append(popped, "isolated")

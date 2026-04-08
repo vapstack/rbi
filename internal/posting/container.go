@@ -3,13 +3,16 @@ package posting
 import (
 	"math"
 	"math/bits"
-	"slices"
-	"sync"
 	"unsafe"
+
+	"github.com/vapstack/rbi/internal/pooled"
 )
 
 type container16 interface {
 	clone() container16
+	retain() container16
+	release()
+	uniquelyOwned() bool
 	and(container16) container16
 	andCardinality(container16) int
 	iand(container16) container16
@@ -78,9 +81,36 @@ func equalArrayRun(ac *containerArray, rc *containerRun) bool {
 type containerIndex struct {
 	keys       []uint16
 	containers []container16 `msg:"-"`
+	storage    *containerIndexStorage
 	inlineKeys [4]uint16
 	inlineVals [4]container16
 }
+
+type containerIndexStorage struct {
+	keys       []uint16
+	containers []container16
+}
+
+var containerIndexPoolCapacities = [...]int{
+	8,
+	16,
+	32,
+	64,
+	128,
+	256,
+	512,
+	1024,
+	2048,
+	4096,
+	8192,
+	16384,
+	32768,
+	65536,
+}
+
+const maxPooledContainerIndexCapacity = 1 << 16
+
+var containerIndexStoragePools [len(containerIndexPoolCapacities)]pooled.Pointers[containerIndexStorage]
 
 func (ra *containerIndex) ensureInline() {
 	if ra == nil || ra.keys != nil || ra.containers != nil {
@@ -88,6 +118,41 @@ func (ra *containerIndex) ensureInline() {
 	}
 	ra.keys = ra.inlineKeys[:0]
 	ra.containers = ra.inlineVals[:0]
+}
+
+func containerIndexPoolIndex(size int) int {
+	if size <= containerIndexPoolCapacities[0] {
+		return 0
+	}
+	if size > maxPooledContainerIndexCapacity {
+		return -1
+	}
+	return bits.Len(uint(size-1)) - 3
+}
+
+func getContainerIndexStorageWithLen(l int) *containerIndexStorage {
+	if l <= 0 {
+		l = containerIndexPoolCapacities[0]
+	}
+	idx := containerIndexPoolIndex(l)
+	if idx < 0 {
+		panic("containerIndex size exceeds pooled capacity")
+	}
+	out := containerIndexStoragePools[idx].Get()
+	out.keys = out.keys[:l]
+	out.containers = out.containers[:l]
+	return out
+}
+
+func putContainerIndexStorage(storage *containerIndexStorage) {
+	if storage == nil {
+		return
+	}
+	idx := containerIndexPoolIndex(cap(storage.keys))
+	if idx < 0 {
+		panic("containerIndex storage capacity exceeds pooled capacity")
+	}
+	containerIndexStoragePools[idx].Put(storage)
 }
 
 func (ra *containerIndex) aliases(other *containerIndex) bool {
@@ -129,15 +194,16 @@ func (ra *containerIndex) runOptimize() {
 		next := old.toEfficientContainer()
 		ra.containers[i] = next
 		if next != old {
-			releaseContainer(old)
+			old.release()
 		}
 	}
 }
 
 func (ra *containerIndex) appendContainer(key uint16, value container16) {
-	ra.ensureInline()
-	ra.keys = append(ra.keys, key)
-	ra.containers = append(ra.containers, value)
+	i := len(ra.keys)
+	ra.setSize(i + 1)
+	ra.keys[i] = key
+	ra.containers[i] = value
 }
 
 func (ra *containerIndex) appendCopy(sa containerIndex, startingindex int) {
@@ -150,38 +216,108 @@ func (ra *containerIndex) appendCopyMany(sa containerIndex, startingindex, end i
 	}
 }
 
+func (ra *containerIndex) releaseBacking() {
+	if ra.storage != nil {
+		putContainerIndexStorage(ra.storage)
+		ra.storage = nil
+	}
+	ra.keys = nil
+	ra.containers = nil
+}
+
+func (ra *containerIndex) setSize(newsize int) {
+	ra.ensureInline()
+	oldLen := len(ra.keys)
+	if cap(ra.keys) >= newsize {
+		if newsize > oldLen {
+			ra.keys = ra.keys[:newsize]
+			clear(ra.keys[oldLen:newsize])
+			ra.containers = ra.containers[:newsize]
+			clear(ra.containers[oldLen:newsize])
+		} else {
+			clear(ra.keys[newsize:oldLen])
+			clear(ra.containers[newsize:oldLen])
+			ra.keys = ra.keys[:newsize]
+			ra.containers = ra.containers[:newsize]
+		}
+		return
+	}
+
+	oldKeys := ra.keys
+	oldContainers := ra.containers
+	oldStorage := ra.storage
+
+	if newsize <= len(ra.inlineKeys) {
+		ra.storage = nil
+		ra.keys = ra.inlineKeys[:newsize]
+		ra.containers = ra.inlineVals[:newsize]
+	} else {
+		next := getContainerIndexStorageWithLen(newsize)
+		ra.storage = next
+		ra.keys = next.keys[:newsize]
+		ra.containers = next.containers[:newsize]
+	}
+
+	copied := min(len(oldKeys), newsize)
+	copy(ra.keys, oldKeys[:copied])
+	copy(ra.containers, oldContainers[:copied])
+	clear(ra.keys[copied:newsize])
+	clear(ra.containers[copied:newsize])
+
+	if oldStorage != nil {
+		putContainerIndexStorage(oldStorage)
+	}
+}
+
+func (ra *containerIndex) copyAliasedFrom(src *containerIndex, retain bool) {
+	n := len(src.keys)
+	if n == 0 {
+		ra.storage = nil
+		ra.keys = ra.inlineKeys[:0]
+		ra.containers = ra.inlineVals[:0]
+		return
+	}
+
+	if n <= len(ra.inlineKeys) {
+		var keys [4]uint16
+		var containers [4]container16
+		copy(keys[:n], src.keys)
+		for i := 0; i < n; i++ {
+			if retain {
+				containers[i] = src.containers[i].retain()
+			} else {
+				containers[i] = src.containers[i].clone()
+			}
+		}
+
+		ra.storage = nil
+		ra.keys = ra.inlineKeys[:n]
+		ra.containers = ra.inlineVals[:n]
+		copy(ra.keys, keys[:n])
+		copy(ra.containers, containers[:n])
+		return
+	}
+
+	next := getContainerIndexStorageWithLen(n)
+	copy(next.keys, src.keys)
+	for i := 0; i < n; i++ {
+		if retain {
+			next.containers[i] = src.containers[i].retain()
+		} else {
+			next.containers[i] = src.containers[i].clone()
+		}
+	}
+
+	ra.storage = next
+	ra.keys = next.keys[:n]
+	ra.containers = next.containers[:n]
+}
+
 func (ra *containerIndex) grow(newsize int) {
 	if newsize <= len(ra.keys) {
 		return
 	}
-	ra.ensureInline()
-	oldSize := len(ra.keys)
-	if cap(ra.keys) >= newsize {
-		ra.keys = ra.keys[:newsize]
-		clear(ra.keys[oldSize:])
-	} else {
-		var keys []uint16
-		if newsize <= len(ra.inlineKeys) {
-			keys = ra.inlineKeys[:newsize]
-		} else {
-			keys = make([]uint16, newsize)
-		}
-		copy(keys, ra.keys)
-		ra.keys = keys
-	}
-	if cap(ra.containers) >= newsize {
-		ra.containers = ra.containers[:newsize]
-		clear(ra.containers[oldSize:])
-	} else {
-		var containers []container16
-		if newsize <= len(ra.inlineVals) {
-			containers = ra.inlineVals[:newsize]
-		} else {
-			containers = make([]container16, newsize)
-		}
-		copy(containers, ra.containers)
-		ra.containers = containers
-	}
+	ra.setSize(newsize)
 }
 
 func (ra *containerIndex) moveKeyValueAt(src, dst int) {
@@ -237,7 +373,7 @@ func (ra *containerIndex) releaseContainersInRange(start int) {
 	}
 	for i := start; i < len(ra.containers); i++ {
 		if c := ra.containers[i]; c != nil {
-			releaseContainer(c)
+			c.release()
 			ra.clearContainerAtIndex(i)
 		}
 	}
@@ -247,36 +383,20 @@ func (ra *containerIndex) copyFrom(src *containerIndex) {
 	if ra == src {
 		return
 	}
+	if ra.aliases(src) {
+		ra.copyAliasedFrom(src, false)
+		return
+	}
 
 	ra.releaseContainersInRange(0)
 
 	if len(src.keys) == 0 {
-		ra.keys = ra.keys[:0]
-		ra.containers = ra.containers[:0]
+		ra.setSize(0)
 		return
 	}
 
-	ra.ensureInline()
-	if cap(ra.keys) >= len(src.keys) {
-		ra.keys = ra.keys[:len(src.keys)]
-	} else {
-		if len(src.keys) <= len(ra.inlineKeys) {
-			ra.keys = ra.inlineKeys[:len(src.keys)]
-		} else {
-			ra.keys = make([]uint16, len(src.keys))
-		}
-	}
+	ra.setSize(len(src.keys))
 	copy(ra.keys, src.keys)
-
-	if cap(ra.containers) >= len(src.containers) {
-		ra.containers = ra.containers[:len(src.containers)]
-	} else {
-		if len(src.containers) <= len(ra.inlineVals) {
-			ra.containers = ra.inlineVals[:len(src.containers)]
-		} else {
-			ra.containers = make([]container16, len(src.containers))
-		}
-	}
 	for i := range src.containers {
 		ra.containers[i] = src.containers[i].clone()
 	}
@@ -287,45 +407,21 @@ func (ra *containerIndex) copySharedFrom(src *containerIndex) {
 		return
 	}
 	if ra.aliases(src) {
-		tmp := new(containerIndex)
-		tmp.copySharedFrom(src)
-		ra.releaseContainersInRange(0)
-		ra.keys = tmp.keys
-		ra.containers = tmp.containers
+		ra.copyAliasedFrom(src, true)
 		return
 	}
 
 	ra.releaseContainersInRange(0)
 
 	if len(src.keys) == 0 {
-		ra.keys = ra.keys[:0]
-		ra.containers = ra.containers[:0]
+		ra.setSize(0)
 		return
 	}
 
-	ra.ensureInline()
-	if cap(ra.keys) >= len(src.keys) {
-		ra.keys = ra.keys[:len(src.keys)]
-	} else {
-		if len(src.keys) <= len(ra.inlineKeys) {
-			ra.keys = ra.inlineKeys[:len(src.keys)]
-		} else {
-			ra.keys = make([]uint16, len(src.keys))
-		}
-	}
+	ra.setSize(len(src.keys))
 	copy(ra.keys, src.keys)
-
-	if cap(ra.containers) >= len(src.containers) {
-		ra.containers = ra.containers[:len(src.containers)]
-	} else {
-		if len(src.containers) <= len(ra.inlineVals) {
-			ra.containers = ra.inlineVals[:len(src.containers)]
-		} else {
-			ra.containers = make([]container16, len(src.containers))
-		}
-	}
 	for i := range src.containers {
-		ra.containers[i] = retainContainer(src.containers[i])
+		ra.containers[i] = src.containers[i].retain()
 	}
 }
 
@@ -347,11 +443,11 @@ func (ra *containerIndex) getUnionedWritableContainer(pos int, other container16
 
 func (ra *containerIndex) getWritableContainerAtIndex(i int) container16 {
 	current := ra.containers[i]
-	if containerUniquelyOwned(current) {
+	if current.uniquelyOwned() {
 		return current
 	}
 	cloned := current.clone()
-	releaseContainer(current)
+	current.release()
 	ra.containers[i] = cloned
 	return cloned
 }
@@ -376,18 +472,15 @@ func (ra *containerIndex) getKeyAtIndex(i int) uint16 {
 }
 
 func (ra *containerIndex) insertNewKeyValueAt(i int, key uint16, value container16) {
-	ra.ensureInline()
 	if i == len(ra.keys) {
-		ra.keys = append(ra.keys, key)
-		ra.containers = append(ra.containers, value)
+		ra.appendContainer(key, value)
 		return
 	}
 
-	ra.keys = append(ra.keys, 0)
-	ra.containers = append(ra.containers, nil)
-
-	copy(ra.keys[i+1:], ra.keys[i:])
-	copy(ra.containers[i+1:], ra.containers[i:])
+	oldLen := len(ra.keys)
+	ra.setSize(oldLen + 1)
+	copy(ra.keys[i+1:], ra.keys[i:oldLen])
+	copy(ra.containers[i+1:], ra.containers[i:oldLen])
 
 	ra.keys[i] = key
 	ra.containers[i] = value
@@ -402,12 +495,12 @@ func (ra *containerIndex) removeAtIndex(i int) {
 	ra.containers[last] = nil
 	ra.keys = ra.keys[:last]
 	ra.containers = ra.containers[:last]
-	releaseContainer(removed)
+	removed.release()
 }
 
 func (ra *containerIndex) setContainerAtIndex(i int, c container16) {
 	if old := ra.containers[i]; old != nil && old != c {
-		releaseContainer(old)
+		old.release()
 	}
 	ra.containers[i] = c
 }
@@ -415,7 +508,7 @@ func (ra *containerIndex) setContainerAtIndex(i int, c container16) {
 func (ra *containerIndex) replaceKeyAndContainerAtIndex(i int, key uint16, c container16) {
 	ra.keys[i] = key
 	if old := ra.containers[i]; old != nil && old != c {
-		releaseContainer(old)
+		old.release()
 	}
 	ra.containers[i] = c
 }
@@ -576,6 +669,7 @@ type shortPeekable interface {
 	shortIterable
 	peekNext() uint16
 	advanceIfNeeded(minval uint16)
+	release()
 }
 
 type shortIterator struct {
@@ -603,9 +697,12 @@ func (si *shortIterator) advanceIfNeeded(minval uint16) {
 	}
 }
 
+func (*shortIterator) release() {}
+
 type manyIterable interface {
 	nextMany(hs uint32, buf []uint32) int
 	nextMany64(hs uint64, buf []uint64) int
+	release()
 }
 
 func (si *shortIterator) nextMany(hs uint32, buf []uint32) int {
@@ -632,33 +729,6 @@ func (si *shortIterator) nextMany64(hs uint64, buf []uint64) int {
 	}
 	si.loc = l
 	return n
-}
-
-func retainContainer(c container16) container16 {
-	switch x := c.(type) {
-	case *containerRun:
-		x.refs.Add(1)
-	case *containerArray:
-		x.refs.Add(1)
-	case *containerBitmap:
-		x.refs.Add(1)
-	default:
-		panic("unsupported container16 type")
-	}
-	return c
-}
-
-func containerUniquelyOwned(c container16) bool {
-	switch x := c.(type) {
-	case *containerRun:
-		return x.refs.Load() == 1
-	case *containerArray:
-		return x.refs.Load() == 1
-	case *containerBitmap:
-		return x.refs.Load() == 1
-	default:
-		panic("unsupported container16 type")
-	}
 }
 
 func difference(set1 []uint16, set2 []uint16, buffer []uint16) int {
@@ -1148,10 +1218,32 @@ func binarySearch(array []uint16, ikey uint16) int {
 	return -(low + 1)
 }
 
-var bitmapPool sync.Pool
+var bitmapPool = pooled.Pointers[bitmap32]{
+	Init: func(rb *bitmap32) {
+		rb.refs.Store(1)
+	},
+	Cleanup: func(rb *bitmap32) {
+		rb.highlowcontainer.clear()
+	},
+}
 
-var runContainerPool sync.Pool
+var runContainerPool = pooled.Pointers[containerRun]{
+	Init: func(rc *containerRun) {
+		rc.refs.Store(1)
+	},
+	Cleanup: func(rc *containerRun) {
+		clear(rc.iv)
+		rc.iv = rc.iv[:0]
+	},
+}
 
+// containerArrayPoolCapacities uses power-of-two classes so both acquire and
+// release can classify storage in O(1) via bits.Len.
+//
+// The release path intentionally accepts containerArray instances whose backing
+// capacity drifted at runtime after growth or storage swaps. Because of that,
+// pooled classes must support bucketing by floor(capacity) without secondary
+// validation on Get.
 var containerArrayPoolCapacities = [...]int{
 	32,
 	64,
@@ -1159,268 +1251,138 @@ var containerArrayPoolCapacities = [...]int{
 	256,
 	512,
 	1024,
-	1536,
 	2048,
-	3072,
 	4096,
-	6144,
 	8192,
-	12288,
 	16384,
 }
 
 // maxContainerArrayPoolCapacity limits which containerArray capacities are
-// returned to the pool.
+// returned to the pool. Larger arrays are dropped instead of being kept in the
+// common power-of-two classes.
 var maxContainerArrayPoolCapacity = 4 * arrayDefaultMaxSize
 
 const maxPooledRunContainerCapacity = 4 * arrayDefaultMaxSize
 
-var containerArrayClassPools [len(containerArrayPoolCapacities)]sync.Pool
+var containerArrayClassPools [len(containerArrayPoolCapacities)]pooled.Pointers[containerArray]
 
+func init() {
+	for i, maxcap := range containerIndexPoolCapacities {
+		c := maxcap
+		containerIndexStoragePools[i] = pooled.Pointers[containerIndexStorage]{
+			New: func() *containerIndexStorage {
+				return &containerIndexStorage{
+					keys:       make([]uint16, 0, c),
+					containers: make([]container16, 0, c),
+				}
+			},
+			Cleanup: func(storage *containerIndexStorage) {
+				clear(storage.keys[:cap(storage.keys)])
+				storage.keys = storage.keys[:0]
+				clear(storage.containers[:cap(storage.containers)])
+				storage.containers = storage.containers[:0]
+			},
+		}
+	}
+	for i, maxcap := range containerArrayPoolCapacities {
+		c := maxcap
+		containerArrayClassPools[i] = pooled.Pointers[containerArray]{
+			New: func() *containerArray {
+				return &containerArray{content: make([]uint16, 0, c)}
+			},
+			Init: func(ac *containerArray) {
+				ac.refs.Store(1)
+			},
+			Cleanup: func(ac *containerArray) {
+				clear(ac.content)
+				ac.content = ac.content[:0]
+			},
+		}
+	}
+}
+
+// containerArrayPoolIndex returns the smallest pooled class that can satisfy
+// size. Requests round up so objects taken from a class always have enough
+// capacity without an extra check on the Get path.
 func containerArrayPoolIndex(size int) int {
-	if size <= 0 {
-		size = containerArrayPoolCapacities[0]
+	if size <= containerArrayPoolCapacities[0] {
+		return 0
 	}
 	if size > maxContainerArrayPoolCapacity {
 		return -1
 	}
-	for i, class := range containerArrayPoolCapacities {
-		if size <= class {
-			return i
-		}
-	}
-	return -1
+	return bits.Len(uint(size-1)) - 5
 }
 
-func containerArrayPoolPutIndex(size int) int {
-	if size <= 0 || size > maxContainerArrayPoolCapacity {
+// containerArrayPoolPutIndex returns the largest pooled class not exceeding
+// capacity. Release rounds down because a containerArray may come back with a
+// reshaped backing array, and the pool must never advertise more capacity than
+// the stored slice still has.
+func containerArrayPoolPutIndex(capacity int) int {
+	if capacity < containerArrayPoolCapacities[0] || capacity > maxContainerArrayPoolCapacity {
 		return -1
 	}
-	idx := -1
-	for i, class := range containerArrayPoolCapacities {
-		if size < class {
-			break
-		}
-		idx = i
-	}
-	return idx
+	return bits.Len(uint(capacity)) - 6
 }
 
-func acquireBitmap() *bitmap32 {
-	if v := bitmapPool.Get(); v != nil {
-		rb := v.(*bitmap32)
-		rb.refs.Store(1)
-		return rb
-	}
-	rb := new(bitmap32)
-	rb.refs.Store(1)
-	return rb
+func getContainerArray() *containerArray {
+	return containerArrayClassPools[0].Get()
 }
 
-func acquireContainerRun(capHint, length int) *containerRun {
-	if capHint < length {
-		capHint = length
+func getContainerArrayWithCap(c int) *containerArray {
+	if c <= 0 {
+		return getContainerArray()
 	}
-
-	if v := runContainerPool.Get(); v != nil {
-		rc := v.(*containerRun)
-		rc.refs.Store(1)
-		if cap(rc.iv) < capHint {
-			rc.iv = slices.Grow(rc.iv, capHint)
-		}
-		rc.iv = rc.iv[:length]
-		return rc
+	if idx := containerArrayPoolIndex(c); idx >= 0 {
+		return containerArrayClassPools[idx].Get()
 	}
-
-	rc := &containerRun{iv: make([]interval16, length, capHint)}
-	rc.refs.Store(1)
-	return rc
-}
-
-func releaseContainerRun(rc *containerRun) {
-	if rc == nil {
-		return
-	}
-	if rc.refs.Add(-1) != 0 {
-		return
-	}
-	if cap(rc.iv) > maxPooledRunContainerCapacity {
-		return
-	}
-	clear(rc.iv)
-	rc.iv = rc.iv[:0]
-	runContainerPool.Put(rc)
-}
-
-func newContainerArray() *containerArray {
-	return acquireContainerArray(containerArrayPoolCapacities[0], 0)
-}
-
-func newContainerArrayCapacity(size int) *containerArray {
-	if size <= 0 {
-		size = containerArrayPoolCapacities[0]
-	}
-	return acquireContainerArray(size, 0)
-}
-
-func newContainerArraySize(size int) *containerArray {
-	if size <= 0 {
-		return newContainerArray()
-	}
-	return acquireContainerArray(size, size)
-}
-
-func newContainerArrayFromSlice(src []uint16) *containerArray {
-	if len(src) == 0 {
-		return newContainerArray()
-	}
-	ac := newContainerArraySize(len(src))
-	copy(ac.content, src)
-	return ac
-}
-
-func acquireContainerArray(capacity, length int) *containerArray {
-	if capacity < length {
-		capacity = length
-	}
-
-	idx := containerArrayPoolIndex(capacity)
-	if idx < 0 {
-		ac := &containerArray{content: make([]uint16, length, capacity)}
-		ac.refs.Store(1)
-		return ac
-	}
-
-	if v := containerArrayClassPools[idx].Get(); v != nil {
-		ac := v.(*containerArray)
-		ac.refs.Store(1)
-		ac.content = ac.content[:length]
-		return ac
-	}
-
 	ac := &containerArray{
-		content: make([]uint16, containerArrayPoolCapacities[idx])[:length],
+		content: make([]uint16, 0, c),
 	}
 	ac.refs.Store(1)
 	return ac
 }
 
-func releaseContainerArray(ac *containerArray) {
-	if ac == nil {
-		return
+func getContainerArrayWithLen(l int) *containerArray {
+	if l <= 0 {
+		return getContainerArray()
 	}
-	if ac.refs.Add(-1) != 0 {
-		return
-	}
+	ac := getContainerArrayWithCap(l)
+	ac.content = ac.content[:l]
+	return ac
+}
 
-	capacity := cap(ac.content)
-	if capacity > maxContainerArrayPoolCapacity {
-		return
+func getContainerArrayFromSlice(src []uint16) *containerArray {
+	if len(src) == 0 {
+		return getContainerArray()
 	}
-	clear(ac.content)
-
-	idx := containerArrayPoolPutIndex(capacity)
-	if idx < 0 {
-		return
-	}
-
-	ac.content = ac.content[:0]
-	containerArrayClassPools[idx].Put(ac)
+	ac := getContainerArrayWithLen(len(src))
+	copy(ac.content, src)
+	return ac
 }
 
 func replaceContainerArrayStorage(ac, donor *containerArray) {
 	oldContent := ac.content
 	ac.content = donor.content
 	donor.content = oldContent
-	releaseContainerArray(donor)
+	donor.release()
 }
 
 func replaceContainerRunStorage(rc, donor *containerRun) {
 	oldIV := rc.iv
 	rc.iv = donor.iv
 	donor.iv = oldIV
-	releaseContainerRun(donor)
-}
-
-func releaseContainer(c container16) {
-	switch x := c.(type) {
-	case *containerRun:
-		releaseContainerRun(x)
-	case *containerArray:
-		releaseContainerArray(x)
-	case *containerBitmap:
-		releaseContainerBitmap(x)
-	default:
-		panic("unsupported container16 type")
-	}
+	donor.release()
 }
 
 var (
-	intIteratorPool     sync.Pool
-	manyIntIteratorPool sync.Pool
+	intIteratorPool = pooled.Pointers[intIterator]{
+		Clear: true,
+	}
+	manyIntIteratorPool = pooled.Pointers[manyIntIterator]{
+		Clear: true,
+	}
 )
-
-func acquireIntIterator(a *bitmap32) *intIterator {
-	if v := intIteratorPool.Get(); v != nil {
-		it := v.(*intIterator)
-		it.initialize(a)
-		return it
-	}
-	it := &intIterator{}
-	it.initialize(a)
-	return it
-}
-
-func releaseIntIterator(it *intIterator) {
-	if it == nil {
-		return
-	}
-	it.pos = 0
-	it.hs = 0
-	it.iter = nil
-	it.highlowcontainer = nil
-	it.shortIter = shortIterator{}
-	it.runIter = runIterator16{}
-	it.bitmapIter = bitmapContainerShortIterator{}
-	intIteratorPool.Put(it)
-}
-
-func acquireManyIntIterator(a *bitmap32) *manyIntIterator {
-	if v := manyIntIteratorPool.Get(); v != nil {
-		it := v.(*manyIntIterator)
-		it.initialize(a)
-		return it
-	}
-	it := &manyIntIterator{}
-	it.initialize(a)
-	return it
-}
-
-func releaseManyIntIterator(it *manyIntIterator) {
-	if it == nil {
-		return
-	}
-	it.pos = 0
-	it.hs = 0
-	it.iter = nil
-	it.highlowcontainer = nil
-	it.shortIter = shortIterator{}
-	it.runIter = runIterator16{}
-	it.bitmapIter = bitmapContainerManyIterator{}
-	manyIntIteratorPool.Put(it)
-}
-
-func releaseIterator(it intPeekable) {
-	if releasable, ok := it.(interface{ release() }); ok {
-		releasable.release()
-	}
-}
-
-func releaseManyIterator(it manyIntIterable) {
-	if releasable, ok := it.(interface{ release() }); ok {
-		releasable.release()
-	}
-}
 
 func popcount(x uint64) uint64 {
 	return uint64(bits.OnesCount64(x))

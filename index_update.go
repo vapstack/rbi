@@ -23,28 +23,10 @@ type uniqueSeenWrite struct {
 	key   string
 }
 
-func (db *DB[K, V]) newUniqueBatchCheckState() uniqueBatchCheckState {
-	return uniqueBatchCheckState{
-		leaving: getUniqueLeavingOuterMap(),
-		seen:    getUniqueSeenOuterMap(),
-	}
-}
-
-func (db *DB[K, V]) releaseUniqueBatchCheckState(state uniqueBatchCheckState) {
-	if state.leaving != nil {
-		releaseUniqueLeavingOuterMap(state.leaving)
-		state.leaving = nil
-	}
-	if state.seen != nil {
-		releaseUniqueSeenOuterMap(state.seen)
-		state.seen = nil
-	}
-}
-
 func (db *DB[K, V]) markUniqueBatchLeaving(state uniqueBatchCheckState, field, key string, idx uint64) bool {
 	fm := state.leaving[field]
 	if fm == nil {
-		fm = getUniqueLeavingInnerMap()
+		fm = uniqueLeavingInnerPool.Get()
 		state.leaving[field] = fm
 	}
 	bm := fm[key]
@@ -84,7 +66,7 @@ func rollbackUniqueBatchLeaving(state uniqueBatchCheckState, touched []uniqueLea
 		}
 		if len(fm) == 0 {
 			delete(state.leaving, t.field)
-			releaseUniqueLeavingInnerMap(fm)
+			uniqueLeavingInnerPool.Put(fm)
 		}
 	}
 }
@@ -209,7 +191,7 @@ func (db *DB[K, V]) checkUniqueBatchAppend(state uniqueBatchCheckState, idx uint
 	for _, w := range seenWrites {
 		sm := state.seen[w.field]
 		if sm == nil {
-			sm = getUniqueSeenInnerMap()
+			sm = uniqueSeenInnerPool.Get()
 			state.seen[w.field] = sm
 		}
 		sm[w.key] = idx
@@ -250,16 +232,16 @@ func (db *DB[K, V]) checkUniqueOnWriteMulti(idxs []uint64, oldVals, newVals []*V
 		return nil
 	}
 
-	pos := getUint64IntMap(len(idxs))
-	defer releaseUint64IntMap(pos)
+	pos := uint64IntMapPool.Get(len(idxs))
+	defer uint64IntMapPool.Put(pos)
 
 	idxs, oldVals, newVals = collapseUniqueWriteMulti(idxs, oldVals, newVals, pos)
 
-	leaving := getUniqueLeavingOuterMap()
-	defer releaseUniqueLeavingOuterMap(leaving)
+	leaving := uniqueLeavingOuterPool.Get()
+	defer uniqueLeavingOuterPool.Put(leaving)
 
-	seen := getUniqueSeenOuterMap()
-	defer releaseUniqueSeenOuterMap(seen)
+	seen := uniqueSeenOuterPool.Get()
+	defer uniqueSeenOuterPool.Put(seen)
 
 	for i, idx := range idxs {
 		oldVal := oldVals[i]
@@ -283,7 +265,7 @@ func (db *DB[K, V]) checkUniqueOnWriteMulti(idxs []uint64, oldVals, newVals []*V
 				}
 				m := leaving[acc.name]
 				if m == nil {
-					m = getUniqueLeavingInnerMap()
+					m = uniqueLeavingInnerPool.Get()
 					leaving[acc.name] = m
 				}
 				ids := m[single]
@@ -304,7 +286,7 @@ func (db *DB[K, V]) checkUniqueOnWriteMulti(idxs []uint64, oldVals, newVals []*V
 			}
 			m := leaving[acc.name]
 			if m == nil {
-				m = getUniqueLeavingInnerMap()
+				m = uniqueLeavingInnerPool.Get()
 				leaving[acc.name] = m
 			}
 			ids := m[single]
@@ -361,7 +343,7 @@ func (db *DB[K, V]) checkUniqueBatchCandidate(
 
 	sm := seen[acc.name]
 	if sm == nil {
-		sm = getUniqueSeenInnerMap()
+		sm = uniqueSeenInnerPool.Get()
 		seen[acc.name] = sm
 	}
 	if prev, ok := sm[single]; ok && prev != idx {

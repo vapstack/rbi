@@ -1,6 +1,8 @@
 package rbi
 
 import (
+	"reflect"
+
 	"github.com/vapstack/qx"
 	"github.com/vapstack/rbi/internal/posting"
 )
@@ -30,15 +32,14 @@ func emitArrayCountZeroBucket[K ~uint64 | ~string, V any](cursor *queryCursor[K,
 			cursor.skip -= card
 			return false
 		}
-		stop := false
-		resultBM.ForEach(func(idx uint64) bool {
-			if cursor.emit(idx) {
-				stop = true
-				return false
+		it := resultBM.Iter()
+		defer it.Release()
+		for it.HasNext() {
+			if cursor.emit(it.Next()) {
+				return true
 			}
-			return true
-		})
-		return stop
+		}
+		return false
 	}
 
 	if cursor.skip > 0 {
@@ -52,15 +53,14 @@ func emitArrayCountZeroBucket[K ~uint64 | ~string, V any](cursor *queryCursor[K,
 			return false
 		}
 		if nonEmptyCount == 0 {
-			stop := false
-			resultBM.ForEach(func(idx uint64) bool {
-				if cursor.emit(idx) {
-					stop = true
-					return false
+			it := resultBM.Iter()
+			defer it.Release()
+			for it.HasNext() {
+				if cursor.emit(it.Next()) {
+					return true
 				}
-				return true
-			})
-			return stop
+			}
+			return false
 		}
 	}
 
@@ -131,11 +131,33 @@ func makeOutSlice[K ~int64 | ~uint64 | ~string](cardinality, limit uint64) []K {
 	return out
 }
 
-func postingResultContains(result postingResult, idx uint64) bool {
-	if result.neg {
-		return !result.ids.Contains(idx)
+func emitPostingResultBucketToCursor[K ~uint64 | ~string, V any](
+	qv *queryView[K, V],
+	cursor *queryCursor[K, V],
+	tmp posting.List,
+	ids posting.List,
+	result postingResult,
+) (posting.List, bool) {
+	if ids.IsEmpty() {
+		return tmp, false
 	}
-	return result.ids.Contains(idx)
+	if idx, ok := ids.TrySingle(); ok {
+		if result.neg {
+			if !result.ids.Contains(idx) {
+				return tmp, cursor.emit(idx)
+			}
+			return tmp, false
+		}
+		if result.ids.Contains(idx) {
+			return tmp, cursor.emit(idx)
+		}
+		return tmp, false
+	}
+	if shouldUseOnePassPostingResultFilter(ids, result, cursor.need, cursor.all) {
+		return tmp, qv.forEachPostingResultBucket(ids, result, cursor.emit)
+	}
+	tmp = tmpIntersectPosting(tmp, ids, result.ids)
+	return tmp, cursor.emitPosting(tmp)
 }
 
 func shouldUseOnePassPostingResultFilter(ids posting.List, result postingResult, need uint64, all bool) bool {
@@ -159,46 +181,45 @@ func (qv *queryView[K, V]) forEachPostingResultBucket(ids posting.List, result p
 	if !result.neg {
 		return ids.ForEachIntersecting(result.ids, fn)
 	}
-	stop := false
 	exclude := result.ids
-	ids.ForEach(func(idx uint64) bool {
+	it := ids.Iter()
+	defer it.Release()
+	for it.HasNext() {
+		idx := it.Next()
 		if !exclude.IsEmpty() && exclude.Contains(idx) {
-			return true
+			continue
 		}
 		if fn(idx) {
-			stop = true
-			return false
+			return true
 		}
-		return true
-	})
-	return stop
+	}
+	return false
 }
 
 func (qv *queryView[K, V]) forEachPostingResultAll(result postingResult, fn func(uint64) bool) bool {
 	if !result.neg {
-		stop := false
-		result.ids.ForEach(func(idx uint64) bool {
-			if fn(idx) {
-				stop = true
-				return false
+		it := result.ids.Iter()
+		defer it.Release()
+		for it.HasNext() {
+			if fn(it.Next()) {
+				return true
 			}
-			return true
-		})
-		return stop
+		}
+		return false
 	}
-	stop := false
 	exclude := result.ids
-	qv.snapshotUniverseView().ForEach(func(idx uint64) bool {
+	it := qv.snapshotUniverseView().Iter()
+	defer it.Release()
+	for it.HasNext() {
+		idx := it.Next()
 		if !exclude.IsEmpty() && exclude.Contains(idx) {
-			return true
+			continue
 		}
 		if fn(idx) {
-			stop = true
-			return false
+			return true
 		}
-		return true
-	})
-	return stop
+	}
+	return false
 }
 
 func (qv *queryView[K, V]) emitArrayCountZeroBucketResult(cursor *queryCursor[K, V], result postingResult, nonEmpty posting.List) bool {
@@ -233,22 +254,22 @@ func (qv *queryView[K, V]) emitArrayCountZeroBucketResult(cursor *queryCursor[K,
 		return false
 	}
 
-	stop := false
 	exclude := result.ids
-	qv.snapshotUniverseView().ForEach(func(idx uint64) bool {
+	it := qv.snapshotUniverseView().Iter()
+	defer it.Release()
+	for it.HasNext() {
+		idx := it.Next()
 		if !exclude.IsEmpty() && exclude.Contains(idx) {
-			return true
+			continue
 		}
 		if !nonEmpty.IsEmpty() && nonEmpty.Contains(idx) {
-			return true
+			continue
 		}
 		if cursor.emit(idx) {
-			stop = true
-			return false
+			return true
 		}
-		return true
-	})
-	return stop
+	}
+	return false
 }
 
 func (qv *queryView[K, V]) queryOrderBasic(result postingResult, ov fieldOverlay, o qx.Order, skip, need uint64, all bool) ([]K, error) {
@@ -273,25 +294,6 @@ func (qv *queryView[K, V]) queryOrderBasic(result postingResult, ov fieldOverlay
 	cursor := qv.newQueryCursor(out, skip, need, all, dedupeCap)
 	defer cursor.release()
 
-	processBucket := func(ids posting.List) bool {
-		if ids.IsEmpty() {
-			return false
-		}
-		if idx, ok := ids.TrySingle(); ok {
-			if postingResultContains(result, idx) {
-				return cursor.emit(idx)
-			}
-			return false
-		}
-		if shouldUseOnePassPostingResultFilter(ids, result, cursor.need, cursor.all) {
-			return qv.forEachPostingResultBucket(ids, result, func(idx uint64) bool {
-				return cursor.emit(idx)
-			})
-		}
-		tmp = tmpIntersectPosting(tmp, ids, result.ids)
-		return cursor.emitPosting(tmp)
-	}
-
 	br := ov.rangeForBounds(rangeBounds{has: true})
 	cur := ov.newCursor(br, o.Desc)
 	for {
@@ -299,7 +301,9 @@ func (qv *queryView[K, V]) queryOrderBasic(result postingResult, ov fieldOverlay
 		if !ok {
 			break
 		}
-		if processBucket(ids) {
+		var done bool
+		tmp, done = emitPostingResultBucketToCursor(qv, &cursor, tmp, ids, result)
+		if done {
 			return cursor.out, nil
 		}
 	}
@@ -307,7 +311,9 @@ func (qv *queryView[K, V]) queryOrderBasic(result postingResult, ov fieldOverlay
 	if fm := qv.fields[o.Field]; fm != nil && fm.Ptr {
 		nilIDs := qv.nilFieldOverlay(o.Field).lookupPostingRetained(nilIndexEntryKey)
 		if !nilIDs.IsEmpty() {
-			if processBucket(nilIDs) {
+			var done bool
+			tmp, done = emitPostingResultBucketToCursor(qv, &cursor, tmp, nilIDs, result)
+			if done {
 				return cursor.out, nil
 			}
 		}
@@ -320,8 +326,8 @@ func orderedDistinctStrings(vals []string, desc bool) []string {
 		return vals
 	}
 
-	seen := getStringSet(len(vals))
-	defer releaseStringSet(seen)
+	seen := stringSetPool.Get(len(vals))
+	defer stringSetPool.Put(seen)
 
 	if desc {
 		out := make([]string, 0, len(vals))
@@ -362,8 +368,8 @@ func scalarArrayPosPriorityCoversAllKeysOverlay(ov fieldOverlay, vals []string) 
 	if len(vals) == 0 {
 		return false
 	}
-	set := getStringSet(len(vals))
-	defer releaseStringSet(set)
+	set := stringSetPool.Get(len(vals))
+	defer stringSetPool.Put(set)
 	for _, v := range vals {
 		set[v] = struct{}{}
 	}
@@ -412,47 +418,25 @@ func (qv *queryView[K, V]) queryOrderArrayPosOverlay(result postingResult, ov fi
 	cursor := qv.newQueryCursor(out, skip, need, all, queryCursorDedupeCap(resultCard, skip, need, all))
 	defer cursor.release()
 
-	doValue := func(key string) bool {
-		bm := ov.lookupPostingRetained(key)
-		if bm.IsEmpty() {
-			return false
-		}
-
-		if shouldUseOnePassPostingResultFilter(bm, result, cursor.need, cursor.all) {
-			return qv.forEachPostingResultBucket(bm, result, func(idx uint64) bool {
-				return cursor.emit(idx)
-			})
-		}
-
-		tmp = tmpIntersectPosting(tmp, bm, result.ids)
-		it := tmp.Iter()
-		defer it.Release()
-		for it.HasNext() {
-			idx := it.Next()
-			if cursor.emit(idx) {
-				return true
-			}
-		}
-		return false
-	}
-
 	if !o.Desc {
 		for _, v := range vals {
-			if doValue(v) {
+			var done bool
+			tmp, done = emitPostingResultBucketToCursor(qv, &cursor, tmp, ov.lookupPostingRetained(v), result)
+			if done {
 				return cursor.out, nil
 			}
 		}
 	} else {
 		for i := len(vals) - 1; i >= 0; i-- {
-			if doValue(vals[i]) {
+			var done bool
+			tmp, done = emitPostingResultBucketToCursor(qv, &cursor, tmp, ov.lookupPostingRetained(vals[i]), result)
+			if done {
 				return cursor.out, nil
 			}
 		}
 	}
 
-	qv.forEachPostingResultAll(result, func(idx uint64) bool {
-		return cursor.emit(idx)
-	})
+	qv.forEachPostingResultAll(result, cursor.emit)
 
 	return cursor.out, nil
 }
@@ -484,31 +468,10 @@ func (qv *queryView[K, V]) queryOrderArrayPosScalarOverlay(result postingResult,
 	var tmp posting.List
 	defer tmp.Release()
 
-	emitPriority := func(key string) bool {
-		bm := ov.lookupPostingRetained(key)
-		if bm.IsEmpty() {
-			return false
-		}
-
-		if shouldUseOnePassPostingResultFilter(bm, result, cursor.need, cursor.all) {
-			return qv.forEachPostingResultBucket(bm, result, func(idx uint64) bool {
-				return cursor.emit(idx)
-			})
-		}
-
-		tmp = tmpIntersectPosting(tmp, bm, result.ids)
-		it := tmp.Iter()
-		defer it.Release()
-		for it.HasNext() {
-			if cursor.emit(it.Next()) {
-				return true
-			}
-		}
-		return false
-	}
-
 	for _, v := range orderedVals {
-		if emitPriority(v) {
+		var done bool
+		tmp, done = emitPostingResultBucketToCursor(qv, &cursor, tmp, ov.lookupPostingRetained(v), result)
+		if done {
 			return cursor.out, nil
 		}
 	}
@@ -519,9 +482,7 @@ func (qv *queryView[K, V]) queryOrderArrayPosScalarOverlay(result postingResult,
 	if !needFallback {
 		return cursor.out, nil
 	}
-	qv.forEachPostingResultAll(result, func(idx uint64) bool {
-		return cursor.emit(idx)
-	})
+	qv.forEachPostingResultAll(result, cursor.emit)
 
 	return cursor.out, nil
 }
@@ -530,11 +491,38 @@ func (qv *queryView[K, V]) orderDataValues(v any) ([]string, error) {
 	if vals, ok := v.([]string); ok {
 		return vals, nil
 	}
-	vals, _, _, err := qv.exprValueToIdxBorrowed(qx.Expr{Op: qx.OpIN, Value: v})
+
+	if s, ok := v.(string); ok {
+		return []string{s}, nil
+	}
+
+	rv := reflect.ValueOf(v)
+	rv, isNil := unwrapExprValue(rv)
+	if isNil {
+		return nil, nil
+	}
+	if queryValueIsCollectionForField(rv, nil) {
+		valsBuf, _, err := sliceValueToIdxStringBuf(rv, nil)
+		if err != nil {
+			return nil, err
+		}
+		if valsBuf == nil {
+			return nil, nil
+		}
+		defer stringSlicePool.Put(valsBuf)
+
+		out := make([]string, valsBuf.Len())
+		for i := 0; i < valsBuf.Len(); i++ {
+			out[i] = valsBuf.Get(i)
+		}
+		return out, nil
+	}
+
+	key, err := scalarValueToIdxField(v, rv, nil)
 	if err != nil {
 		return nil, err
 	}
-	return vals, nil
+	return []string{key}, nil
 }
 
 func (qv *queryView[K, V]) queryOrderArrayCount(result postingResult, s []index, o qx.Order, skip, need uint64, all bool, useZeroComplement bool) ([]K, error) {
@@ -560,15 +548,8 @@ func (qv *queryView[K, V]) queryOrderArrayCount(result postingResult, s []index,
 		}
 	}
 
-	processZero := func() bool {
-		if !useZeroComplement {
-			return false
-		}
-		return qv.emitArrayCountZeroBucketResult(&cursor, result, nonEmpty)
-	}
-
 	if !o.Desc {
-		if processZero() {
+		if useZeroComplement && qv.emitArrayCountZeroBucketResult(&cursor, result, nonEmpty) {
 			return cursor.out, nil
 		}
 
@@ -580,25 +561,11 @@ func (qv *queryView[K, V]) queryOrderArrayCount(result postingResult, s []index,
 				continue
 			}
 
-			if shouldUseOnePassPostingResultFilter(ix.IDs, result, cursor.need, cursor.all) {
-				stop := qv.forEachPostingResultBucket(ix.IDs, result, func(idx uint64) bool {
-					return cursor.emit(idx)
-				})
-				if stop {
-					return cursor.out, nil
-				}
-				continue
+			var done bool
+			tmp, done = emitPostingResultBucketToCursor(qv, &cursor, tmp, ix.IDs, result)
+			if done {
+				return cursor.out, nil
 			}
-
-			tmp = tmpIntersectPosting(tmp, ix.IDs, result.ids)
-			it := tmp.Iter()
-			for it.HasNext() {
-				if cursor.emit(it.Next()) {
-					it.Release()
-					return cursor.out, nil
-				}
-			}
-			it.Release()
 		}
 
 	} else {
@@ -612,27 +579,13 @@ func (qv *queryView[K, V]) queryOrderArrayCount(result postingResult, s []index,
 				continue
 			}
 
-			if shouldUseOnePassPostingResultFilter(ix.IDs, result, cursor.need, cursor.all) {
-				stop := qv.forEachPostingResultBucket(ix.IDs, result, func(idx uint64) bool {
-					return cursor.emit(idx)
-				})
-				if stop {
-					return cursor.out, nil
-				}
-				continue
+			var done bool
+			tmp, done = emitPostingResultBucketToCursor(qv, &cursor, tmp, ix.IDs, result)
+			if done {
+				return cursor.out, nil
 			}
-
-			tmp = tmpIntersectPosting(tmp, ix.IDs, result.ids)
-			it := tmp.Iter()
-			for it.HasNext() {
-				if cursor.emit(it.Next()) {
-					it.Release()
-					return cursor.out, nil
-				}
-			}
-			it.Release()
 		}
-		if processZero() {
+		if useZeroComplement && qv.emitArrayCountZeroBucketResult(&cursor, result, nonEmpty) {
 			return cursor.out, nil
 		}
 	}

@@ -182,7 +182,7 @@ func raceExtraRequireNumericRangeBucketCacheEntry(t *testing.T, snap *indexSnaps
 		t.Fatalf("expected numeric range bucket cache entry for field %q", field)
 	}
 	entry, ok := raw.(*numericRangeBucketCacheEntry)
-	if !ok || entry == nil || entry.idx == nil {
+	if !ok || entry == nil || entry.idx.bucketSize <= 0 {
 		t.Fatalf("expected non-nil numeric range bucket entry for field %q", field)
 	}
 	return entry

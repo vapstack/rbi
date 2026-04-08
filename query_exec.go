@@ -3,10 +3,10 @@ package rbi
 import (
 	"fmt"
 	"strings"
-	"unsafe"
 
 	"github.com/vapstack/qx"
 	"github.com/vapstack/rbi/internal/normalize"
+	"github.com/vapstack/rbi/internal/pooled"
 	"github.com/vapstack/rbi/internal/posting"
 )
 
@@ -75,15 +75,14 @@ func emitAcceptedPostingNoOrder[K ~uint64 | ~string, V any](cursor *queryCursor[
 	if idx, ok := ids.TrySingle(); ok {
 		return cursor.emit(idx)
 	}
-	stop := false
-	ids.ForEach(func(idx uint64) bool {
-		if cursor.emit(idx) {
-			stop = true
-			return false
+	it := ids.Iter()
+	defer it.Release()
+	for it.HasNext() {
+		if cursor.emit(it.Next()) {
+			return true
 		}
-		return true
-	})
-	return stop
+	}
+	return false
 }
 
 func predicatesMatchActive(preds []predicate, active []int, idx uint64) bool {
@@ -113,21 +112,1292 @@ func predicatesMatchActive(preds []predicate, active []int, idx uint64) bool {
 	return true
 }
 
+func predicatesMatchActiveReader(preds predicateReader, active []int, idx uint64) bool {
+	switch len(active) {
+	case 0:
+		return true
+	case 1:
+		return preds.GetPtr(active[0]).matches(idx)
+	case 2:
+		return preds.GetPtr(active[0]).matches(idx) &&
+			preds.GetPtr(active[1]).matches(idx)
+	case 3:
+		return preds.GetPtr(active[0]).matches(idx) &&
+			preds.GetPtr(active[1]).matches(idx) &&
+			preds.GetPtr(active[2]).matches(idx)
+	case 4:
+		return preds.GetPtr(active[0]).matches(idx) &&
+			preds.GetPtr(active[1]).matches(idx) &&
+			preds.GetPtr(active[2]).matches(idx) &&
+			preds.GetPtr(active[3]).matches(idx)
+	}
+	for _, pi := range active {
+		if !preds.GetPtr(pi).matches(idx) {
+			return false
+		}
+	}
+	return true
+}
+
+func orderPredicatesEmitCandidate[K ~uint64 | ~string, V any](
+	cursor *queryCursor[K, V],
+	preds []predicate,
+	checks []int,
+	trace *queryTrace,
+	idx uint64,
+	examined *uint64,
+) bool {
+	*examined = *examined + 1
+	if !predicatesMatchActive(preds, checks, idx) {
+		return false
+	}
+	if trace != nil {
+		trace.addMatched(1)
+	}
+	return cursor.emit(idx)
+}
+
+func orderPredicatesEmitCandidateReader[K ~uint64 | ~string, V any](
+	cursor *queryCursor[K, V],
+	preds predicateReader,
+	checks []int,
+	trace *queryTrace,
+	idx uint64,
+	examined *uint64,
+) bool {
+	*examined = *examined + 1
+	if !predicatesMatchActiveReader(preds, checks, idx) {
+		return false
+	}
+	if trace != nil {
+		trace.addMatched(1)
+	}
+	return cursor.emit(idx)
+}
+
+func orderPredicatesEmitCandidateBuf[K ~uint64 | ~string, V any](
+	cursor *queryCursor[K, V],
+	preds []predicate,
+	checks *pooled.SliceBuf[int],
+	trace *queryTrace,
+	idx uint64,
+	examined *uint64,
+) bool {
+	*examined = *examined + 1
+	if !predicatesMatchActiveBuf(preds, checks, idx) {
+		return false
+	}
+	if trace != nil {
+		trace.addMatched(1)
+	}
+	return cursor.emit(idx)
+}
+
+func orderPredicatesEmitCandidateBufReader[K ~uint64 | ~string, V any](
+	cursor *queryCursor[K, V],
+	preds predicateReader,
+	checks *pooled.SliceBuf[int],
+	trace *queryTrace,
+	idx uint64,
+	examined *uint64,
+) bool {
+	*examined = *examined + 1
+	if !predicatesMatchActiveBufReader(preds, checks, idx) {
+		return false
+	}
+	if trace != nil {
+		trace.addMatched(1)
+	}
+	return cursor.emit(idx)
+}
+
+func orderPredicatesEmitAcceptedPosting[K ~uint64 | ~string, V any](
+	cursor *queryCursor[K, V],
+	ids posting.List,
+	card uint64,
+	trace *queryTrace,
+	examined *uint64,
+) bool {
+	*examined += card
+	if trace != nil {
+		trace.addMatched(card)
+	}
+	if cursor.skip >= card {
+		cursor.skip -= card
+		return false
+	}
+	if idx, ok := ids.TrySingle(); ok {
+		return cursor.emit(idx)
+	}
+	it := ids.Iter()
+	for it.HasNext() {
+		if cursor.emit(it.Next()) {
+			it.Release()
+			return true
+		}
+	}
+	it.Release()
+	return false
+}
+
+func orderPredicatesTryBucketPosting[K ~uint64 | ~string, V any](
+	cursor *queryCursor[K, V],
+	preds []predicate,
+	exactActive []int,
+	exactOnly bool,
+	ids posting.List,
+	exactWork posting.List,
+	trace *queryTrace,
+	examined *uint64,
+) (current posting.List, exactApplied bool, handled bool, stop bool, nextExactWork posting.List) {
+	nextExactWork = exactWork
+	if ids.IsEmpty() {
+		return posting.List{}, false, true, false, nextExactWork
+	}
+	if len(exactActive) == 0 {
+		return ids, false, false, false, nextExactWork
+	}
+	card := ids.Cardinality()
+	allowExact := plannerAllowExactBucketFilter(cursor.skip, cursor.need, card, exactOnly, len(exactActive))
+	mode, exactIDs, updatedExactWork, _ := plannerFilterPostingByChecks(preds, exactActive, ids, exactWork, allowExact)
+	nextExactWork = updatedExactWork
+	switch mode {
+	case plannerPredicateBucketEmpty:
+		*examined += card
+		return posting.List{}, false, true, false, nextExactWork
+	case plannerPredicateBucketAll:
+		if exactOnly {
+			return exactIDs, true, true, orderPredicatesEmitAcceptedPosting(cursor, exactIDs, card, trace, examined), nextExactWork
+		}
+		return exactIDs, true, false, false, nextExactWork
+	case plannerPredicateBucketExact:
+		if trace != nil {
+			trace.addPostingExactFilter(1)
+		}
+		if exactIDs.IsEmpty() {
+			*examined += card
+			return posting.List{}, true, true, false, nextExactWork
+		}
+		if exactOnly {
+			return exactIDs, true, true, orderPredicatesEmitAcceptedPosting(cursor, exactIDs, exactIDs.Cardinality(), trace, examined), nextExactWork
+		}
+		return exactIDs, true, false, false, nextExactWork
+	default:
+		return ids, false, false, false, nextExactWork
+	}
+}
+
+func orderPredicatesTryBucketPostingReader[K ~uint64 | ~string, V any](
+	cursor *queryCursor[K, V],
+	preds predicateReader,
+	exactActive []int,
+	exactOnly bool,
+	ids posting.List,
+	exactWork posting.List,
+	trace *queryTrace,
+	examined *uint64,
+) (current posting.List, exactApplied bool, handled bool, stop bool, nextExactWork posting.List) {
+	nextExactWork = exactWork
+	if ids.IsEmpty() {
+		return posting.List{}, false, true, false, nextExactWork
+	}
+	if len(exactActive) == 0 {
+		return ids, false, false, false, nextExactWork
+	}
+	card := ids.Cardinality()
+	allowExact := plannerAllowExactBucketFilter(cursor.skip, cursor.need, card, exactOnly, len(exactActive))
+	mode, exactIDs, updatedExactWork, _ := plannerFilterPostingByPredicateChecks(preds, exactActive, ids, exactWork, allowExact)
+	nextExactWork = updatedExactWork
+	switch mode {
+	case plannerPredicateBucketEmpty:
+		*examined += card
+		return posting.List{}, false, true, false, nextExactWork
+	case plannerPredicateBucketAll:
+		if exactOnly {
+			return exactIDs, true, true, orderPredicatesEmitAcceptedPosting(cursor, exactIDs, card, trace, examined), nextExactWork
+		}
+		return exactIDs, true, false, false, nextExactWork
+	case plannerPredicateBucketExact:
+		if trace != nil {
+			trace.addPostingExactFilter(1)
+		}
+		if exactIDs.IsEmpty() {
+			*examined += card
+			return posting.List{}, true, true, false, nextExactWork
+		}
+		if exactOnly {
+			return exactIDs, true, true, orderPredicatesEmitAcceptedPosting(cursor, exactIDs, exactIDs.Cardinality(), trace, examined), nextExactWork
+		}
+		return exactIDs, true, false, false, nextExactWork
+	default:
+		return ids, false, false, false, nextExactWork
+	}
+}
+
+func orderPredicatesTryBucketPostingBuf[K ~uint64 | ~string, V any](
+	cursor *queryCursor[K, V],
+	preds []predicate,
+	exactActive *pooled.SliceBuf[int],
+	exactOnly bool,
+	ids posting.List,
+	exactWork posting.List,
+	trace *queryTrace,
+	examined *uint64,
+) (current posting.List, exactApplied bool, handled bool, stop bool, nextExactWork posting.List) {
+	nextExactWork = exactWork
+	if ids.IsEmpty() {
+		return posting.List{}, false, true, false, nextExactWork
+	}
+	if exactActive == nil || exactActive.Len() == 0 {
+		return ids, false, false, false, nextExactWork
+	}
+	card := ids.Cardinality()
+	allowExact := plannerAllowExactBucketFilter(cursor.skip, cursor.need, card, exactOnly, exactActive.Len())
+	mode, exactIDs, updatedExactWork, _ := plannerFilterPostingByChecksBuf(preds, exactActive, ids, exactWork, allowExact)
+	nextExactWork = updatedExactWork
+	switch mode {
+	case plannerPredicateBucketEmpty:
+		*examined += card
+		return posting.List{}, false, true, false, nextExactWork
+	case plannerPredicateBucketAll:
+		if exactOnly {
+			return exactIDs, true, true, orderPredicatesEmitAcceptedPosting(cursor, exactIDs, card, trace, examined), nextExactWork
+		}
+		return exactIDs, true, false, false, nextExactWork
+	case plannerPredicateBucketExact:
+		if trace != nil {
+			trace.addPostingExactFilter(1)
+		}
+		if exactIDs.IsEmpty() {
+			*examined += card
+			return posting.List{}, true, true, false, nextExactWork
+		}
+		if exactOnly {
+			return exactIDs, true, true, orderPredicatesEmitAcceptedPosting(cursor, exactIDs, exactIDs.Cardinality(), trace, examined), nextExactWork
+		}
+		return exactIDs, true, false, false, nextExactWork
+	default:
+		return ids, false, false, false, nextExactWork
+	}
+}
+
+func orderPredicatesTryBucketPostingBufReader[K ~uint64 | ~string, V any](
+	cursor *queryCursor[K, V],
+	preds predicateReader,
+	exactActive *pooled.SliceBuf[int],
+	exactOnly bool,
+	ids posting.List,
+	exactWork posting.List,
+	trace *queryTrace,
+	examined *uint64,
+) (current posting.List, exactApplied bool, handled bool, stop bool, nextExactWork posting.List) {
+	nextExactWork = exactWork
+	if ids.IsEmpty() {
+		return posting.List{}, false, true, false, nextExactWork
+	}
+	if exactActive == nil || exactActive.Len() == 0 {
+		return ids, false, false, false, nextExactWork
+	}
+	card := ids.Cardinality()
+	allowExact := plannerAllowExactBucketFilter(cursor.skip, cursor.need, card, exactOnly, exactActive.Len())
+	mode, exactIDs, updatedExactWork, _ := plannerFilterPostingByPredicateChecksBuf(preds, exactActive, ids, exactWork, allowExact)
+	nextExactWork = updatedExactWork
+	switch mode {
+	case plannerPredicateBucketEmpty:
+		*examined += card
+		return posting.List{}, false, true, false, nextExactWork
+	case plannerPredicateBucketAll:
+		if exactOnly {
+			return exactIDs, true, true, orderPredicatesEmitAcceptedPosting(cursor, exactIDs, card, trace, examined), nextExactWork
+		}
+		return exactIDs, true, false, false, nextExactWork
+	case plannerPredicateBucketExact:
+		if trace != nil {
+			trace.addPostingExactFilter(1)
+		}
+		if exactIDs.IsEmpty() {
+			*examined += card
+			return posting.List{}, true, true, false, nextExactWork
+		}
+		if exactOnly {
+			return exactIDs, true, true, orderPredicatesEmitAcceptedPosting(cursor, exactIDs, exactIDs.Cardinality(), trace, examined), nextExactWork
+		}
+		return exactIDs, true, false, false, nextExactWork
+	default:
+		return ids, false, false, false, nextExactWork
+	}
+}
+
+func orderPredicatesEmitPosting[K ~uint64 | ~string, V any](
+	cursor *queryCursor[K, V],
+	preds []predicate,
+	active []int,
+	exactActive []int,
+	residualActive []int,
+	exactOnly bool,
+	ids posting.List,
+	exactWork posting.List,
+	trace *queryTrace,
+	examined *uint64,
+) (bool, posting.List) {
+	if ids.IsEmpty() {
+		return false, exactWork
+	}
+	if idx, ok := ids.TrySingle(); ok {
+		return orderPredicatesEmitCandidate(cursor, preds, active, trace, idx, examined), exactWork
+	}
+
+	iterSrc := ids.Iter()
+	exactApplied := false
+	if current, applied, handled, stop, nextExactWork := orderPredicatesTryBucketPosting(
+		cursor,
+		preds,
+		exactActive,
+		exactOnly,
+		ids,
+		exactWork,
+		trace,
+		examined,
+	); handled {
+		iterSrc.Release()
+		return stop, nextExactWork
+	} else if applied && !current.IsEmpty() {
+		iterSrc.Release()
+		iterSrc = current.Iter()
+		exactApplied = true
+		exactWork = nextExactWork
+	} else {
+		exactWork = nextExactWork
+	}
+
+	checks := active
+	if exactApplied {
+		checks = residualActive
+	}
+	for iterSrc.HasNext() {
+		if orderPredicatesEmitCandidate(cursor, preds, checks, trace, iterSrc.Next(), examined) {
+			iterSrc.Release()
+			return true, exactWork
+		}
+	}
+	iterSrc.Release()
+	return false, exactWork
+}
+
+func orderPredicatesEmitPostingReader[K ~uint64 | ~string, V any](
+	cursor *queryCursor[K, V],
+	preds predicateReader,
+	active []int,
+	exactActive []int,
+	residualActive []int,
+	exactOnly bool,
+	ids posting.List,
+	exactWork posting.List,
+	trace *queryTrace,
+	examined *uint64,
+) (bool, posting.List) {
+	if ids.IsEmpty() {
+		return false, exactWork
+	}
+	if idx, ok := ids.TrySingle(); ok {
+		return orderPredicatesEmitCandidateReader(cursor, preds, active, trace, idx, examined), exactWork
+	}
+
+	iterSrc := ids.Iter()
+	exactApplied := false
+	if current, applied, handled, stop, nextExactWork := orderPredicatesTryBucketPostingReader(
+		cursor,
+		preds,
+		exactActive,
+		exactOnly,
+		ids,
+		exactWork,
+		trace,
+		examined,
+	); handled {
+		iterSrc.Release()
+		return stop, nextExactWork
+	} else if applied && !current.IsEmpty() {
+		iterSrc.Release()
+		iterSrc = current.Iter()
+		exactApplied = true
+		exactWork = nextExactWork
+	} else {
+		exactWork = nextExactWork
+	}
+
+	checks := active
+	if exactApplied {
+		checks = residualActive
+	}
+	for iterSrc.HasNext() {
+		if orderPredicatesEmitCandidateReader(cursor, preds, checks, trace, iterSrc.Next(), examined) {
+			iterSrc.Release()
+			return true, exactWork
+		}
+	}
+	iterSrc.Release()
+	return false, exactWork
+}
+
+func orderPredicatesEmitPostingBuf[K ~uint64 | ~string, V any](
+	cursor *queryCursor[K, V],
+	preds []predicate,
+	active *pooled.SliceBuf[int],
+	exactActive *pooled.SliceBuf[int],
+	residualActive *pooled.SliceBuf[int],
+	exactOnly bool,
+	ids posting.List,
+	exactWork posting.List,
+	trace *queryTrace,
+	examined *uint64,
+) (bool, posting.List) {
+	if ids.IsEmpty() {
+		return false, exactWork
+	}
+	if idx, ok := ids.TrySingle(); ok {
+		return orderPredicatesEmitCandidateBuf(cursor, preds, active, trace, idx, examined), exactWork
+	}
+
+	iterSrc := ids.Iter()
+	exactApplied := false
+	if current, applied, handled, stop, nextExactWork := orderPredicatesTryBucketPostingBuf(
+		cursor,
+		preds,
+		exactActive,
+		exactOnly,
+		ids,
+		exactWork,
+		trace,
+		examined,
+	); handled {
+		iterSrc.Release()
+		return stop, nextExactWork
+	} else if applied && !current.IsEmpty() {
+		iterSrc.Release()
+		iterSrc = current.Iter()
+		exactApplied = true
+		exactWork = nextExactWork
+	} else {
+		exactWork = nextExactWork
+	}
+
+	checks := active
+	if exactApplied {
+		checks = residualActive
+	}
+	for iterSrc.HasNext() {
+		if orderPredicatesEmitCandidateBuf(cursor, preds, checks, trace, iterSrc.Next(), examined) {
+			iterSrc.Release()
+			return true, exactWork
+		}
+	}
+	iterSrc.Release()
+	return false, exactWork
+}
+
+func orderPredicatesEmitPostingBufReader[K ~uint64 | ~string, V any](
+	cursor *queryCursor[K, V],
+	preds predicateReader,
+	active *pooled.SliceBuf[int],
+	exactActive *pooled.SliceBuf[int],
+	residualActive *pooled.SliceBuf[int],
+	exactOnly bool,
+	ids posting.List,
+	exactWork posting.List,
+	trace *queryTrace,
+	examined *uint64,
+) (bool, posting.List) {
+	if ids.IsEmpty() {
+		return false, exactWork
+	}
+	if idx, ok := ids.TrySingle(); ok {
+		return orderPredicatesEmitCandidateBufReader(cursor, preds, active, trace, idx, examined), exactWork
+	}
+
+	iterSrc := ids.Iter()
+	exactApplied := false
+	if current, applied, handled, stop, nextExactWork := orderPredicatesTryBucketPostingBufReader(
+		cursor,
+		preds,
+		exactActive,
+		exactOnly,
+		ids,
+		exactWork,
+		trace,
+		examined,
+	); handled {
+		iterSrc.Release()
+		return stop, nextExactWork
+	} else if applied && !current.IsEmpty() {
+		iterSrc.Release()
+		iterSrc = current.Iter()
+		exactApplied = true
+		exactWork = nextExactWork
+	} else {
+		exactWork = nextExactWork
+	}
+
+	checks := active
+	if exactApplied {
+		checks = residualActive
+	}
+	for iterSrc.HasNext() {
+		if orderPredicatesEmitCandidateBufReader(cursor, preds, checks, trace, iterSrc.Next(), examined) {
+			iterSrc.Release()
+			return true, exactWork
+		}
+	}
+	iterSrc.Release()
+	return false, exactWork
+}
+
+func releaseOrderBasicResidualState(preds predicateSet, activeBuf *pooled.SliceBuf[int]) {
+	if activeBuf != nil {
+		predicateCheckSlicePool.Put(activeBuf)
+	}
+	preds.Release()
+}
+
+func emitOrderLimitPosting[K ~uint64 | ~string, V any](
+	cursor *queryCursor[K, V],
+	ids posting.List,
+	examined *uint64,
+	trace *queryTrace,
+) bool {
+	if ids.IsEmpty() {
+		return false
+	}
+	if idx, ok := ids.TrySingle(); ok {
+		*examined += 1
+		if trace != nil {
+			trace.addMatched(1)
+		}
+		return cursor.emit(idx)
+	}
+	card := ids.Cardinality()
+	if cursor.skip >= card {
+		cursor.skip -= card
+		*examined += card
+		if trace != nil {
+			trace.addMatched(card)
+		}
+		return false
+	}
+	it := ids.Iter()
+	for it.HasNext() {
+		idx := it.Next()
+		*examined += 1
+		if trace != nil {
+			trace.addMatched(1)
+		}
+		if cursor.emit(idx) {
+			it.Release()
+			return true
+		}
+	}
+	it.Release()
+	return false
+}
+
+func emitOrderPrefixPostingByBase[K ~uint64 | ~string, V any](
+	cursor *queryCursor[K, V],
+	ids posting.List,
+	base postingResult,
+	baseBM posting.List,
+	baseNegUniverse bool,
+	examined *uint64,
+) bool {
+	if ids.IsEmpty() {
+		return false
+	}
+	if idx, ok := ids.TrySingle(); ok {
+		*examined += 1
+		if base.neg {
+			if !baseNegUniverse && baseBM.Contains(idx) {
+				return false
+			}
+			return cursor.emit(idx)
+		}
+		if !baseBM.Contains(idx) {
+			return false
+		}
+		return cursor.emit(idx)
+	}
+	it := ids.Iter()
+	for it.HasNext() {
+		idx := it.Next()
+		*examined += 1
+		if base.neg {
+			if !baseNegUniverse && baseBM.Contains(idx) {
+				continue
+			}
+		} else if !baseBM.Contains(idx) {
+			continue
+		}
+		if cursor.emit(idx) {
+			it.Release()
+			return true
+		}
+	}
+	it.Release()
+	return false
+}
+
+func predicatesMatchActiveBuf(preds []predicate, active *pooled.SliceBuf[int], idx uint64) bool {
+	switch active.Len() {
+	case 0:
+		return true
+	case 1:
+		return preds[active.Get(0)].matches(idx)
+	case 2:
+		return preds[active.Get(0)].matches(idx) &&
+			preds[active.Get(1)].matches(idx)
+	case 3:
+		return preds[active.Get(0)].matches(idx) &&
+			preds[active.Get(1)].matches(idx) &&
+			preds[active.Get(2)].matches(idx)
+	case 4:
+		return preds[active.Get(0)].matches(idx) &&
+			preds[active.Get(1)].matches(idx) &&
+			preds[active.Get(2)].matches(idx) &&
+			preds[active.Get(3)].matches(idx)
+	}
+	for i := 0; i < active.Len(); i++ {
+		if !preds[active.Get(i)].matches(idx) {
+			return false
+		}
+	}
+	return true
+}
+
+func predicatesMatchActiveBufReader(preds predicateReader, active *pooled.SliceBuf[int], idx uint64) bool {
+	switch active.Len() {
+	case 0:
+		return true
+	case 1:
+		return preds.GetPtr(active.Get(0)).matches(idx)
+	case 2:
+		return preds.GetPtr(active.Get(0)).matches(idx) &&
+			preds.GetPtr(active.Get(1)).matches(idx)
+	case 3:
+		return preds.GetPtr(active.Get(0)).matches(idx) &&
+			preds.GetPtr(active.Get(1)).matches(idx) &&
+			preds.GetPtr(active.Get(2)).matches(idx)
+	case 4:
+		return preds.GetPtr(active.Get(0)).matches(idx) &&
+			preds.GetPtr(active.Get(1)).matches(idx) &&
+			preds.GetPtr(active.Get(2)).matches(idx) &&
+			preds.GetPtr(active.Get(3)).matches(idx)
+	}
+	for i := 0; i < active.Len(); i++ {
+		if !preds.GetPtr(active.Get(i)).matches(idx) {
+			return false
+		}
+	}
+	return true
+}
+
+func orderBasicResidualMatches(preds []predicate, active []int, idx uint64) bool {
+	if len(active) == 0 {
+		return true
+	}
+	return predicatesMatchActive(preds, active, idx)
+}
+
+func orderBasicResidualMatchesReader(preds predicateReader, active []int, idx uint64) bool {
+	if len(active) == 0 {
+		return true
+	}
+	return predicatesMatchActiveReader(preds, active, idx)
+}
+
+func orderBasicResidualMatchesBuf(preds []predicate, active *pooled.SliceBuf[int], idx uint64) bool {
+	if active == nil || active.Len() == 0 {
+		return true
+	}
+	return predicatesMatchActiveBuf(preds, active, idx)
+}
+
+func orderBasicResidualMatchesBufReader(preds predicateReader, active *pooled.SliceBuf[int], idx uint64) bool {
+	if active == nil || active.Len() == 0 {
+		return true
+	}
+	return predicatesMatchActiveBufReader(preds, active, idx)
+}
+
+func orderBasicContains(preds []predicate, active []int, baseBM posting.List, baseNeg bool, baseNegUniverse bool, idx uint64) bool {
+	if baseNeg {
+		if baseNegUniverse {
+			return orderBasicResidualMatches(preds, active, idx)
+		}
+		if baseBM.Contains(idx) {
+			return false
+		}
+	} else if !baseBM.Contains(idx) {
+		return false
+	}
+	return orderBasicResidualMatches(preds, active, idx)
+}
+
+func orderBasicContainsReader(preds predicateReader, active []int, baseBM posting.List, baseNeg bool, baseNegUniverse bool, idx uint64) bool {
+	if baseNeg {
+		if baseNegUniverse {
+			return orderBasicResidualMatchesReader(preds, active, idx)
+		}
+		if baseBM.Contains(idx) {
+			return false
+		}
+	} else if !baseBM.Contains(idx) {
+		return false
+	}
+	return orderBasicResidualMatchesReader(preds, active, idx)
+}
+
+func orderBasicContainsBuf(preds []predicate, active *pooled.SliceBuf[int], baseBM posting.List, baseNeg bool, baseNegUniverse bool, idx uint64) bool {
+	if baseNeg {
+		if baseNegUniverse {
+			return orderBasicResidualMatchesBuf(preds, active, idx)
+		}
+		if baseBM.Contains(idx) {
+			return false
+		}
+	} else if !baseBM.Contains(idx) {
+		return false
+	}
+	return orderBasicResidualMatchesBuf(preds, active, idx)
+}
+
+func orderBasicContainsBufReader(preds predicateReader, active *pooled.SliceBuf[int], baseBM posting.List, baseNeg bool, baseNegUniverse bool, idx uint64) bool {
+	if baseNeg {
+		if baseNegUniverse {
+			return orderBasicResidualMatchesBufReader(preds, active, idx)
+		}
+		if baseBM.Contains(idx) {
+			return false
+		}
+	} else if !baseBM.Contains(idx) {
+		return false
+	}
+	return orderBasicResidualMatchesBufReader(preds, active, idx)
+}
+
+func orderBasicEmitFilteredPosting[K ~uint64 | ~string, V any](
+	cursor *queryCursor[K, V],
+	preds []predicate,
+	active []int,
+	baseBM posting.List,
+	baseNeg bool,
+	baseNegUniverse bool,
+	ids posting.List,
+	tmp posting.List,
+	examined *uint64,
+) (bool, posting.List) {
+	if ids.IsEmpty() {
+		return false, tmp
+	}
+
+	if card := ids.Cardinality(); card <= iteratorThreshold || (0 < cursor.need && cursor.need < 1000) {
+		if idx, ok := ids.TrySingle(); ok {
+			*examined++
+			return orderBasicContains(preds, active, baseBM, baseNeg, baseNegUniverse, idx) && cursor.emit(idx), tmp
+		}
+
+		it := ids.Iter()
+		for it.HasNext() {
+			idx := it.Next()
+			*examined++
+			if !orderBasicContains(preds, active, baseBM, baseNeg, baseNegUniverse, idx) {
+				continue
+			}
+			if cursor.emit(idx) {
+				it.Release()
+				return true, tmp
+			}
+		}
+		it.Release()
+		return false, tmp
+	}
+
+	*examined += ids.Cardinality()
+	nextTmp := tmp
+	if baseNeg {
+		nextTmp.Release()
+		nextTmp = posting.List{}
+		nextTmp = ids.Clone()
+		if !baseNegUniverse {
+			nextTmp = nextTmp.BuildAndNot(baseBM)
+		}
+	} else {
+		nextTmp = tmpIntersectPosting(nextTmp, ids, baseBM)
+	}
+	if nextTmp.IsEmpty() {
+		return false, nextTmp
+	}
+	if len(active) == 0 {
+		return cursor.emitPosting(nextTmp), nextTmp
+	}
+	it := nextTmp.Iter()
+	for it.HasNext() {
+		idx := it.Next()
+		if orderBasicResidualMatches(preds, active, idx) && cursor.emit(idx) {
+			it.Release()
+			return true, nextTmp
+		}
+	}
+	it.Release()
+	return false, nextTmp
+}
+
+func orderBasicEmitFilteredPostingReader[K ~uint64 | ~string, V any](
+	cursor *queryCursor[K, V],
+	preds predicateReader,
+	active []int,
+	baseBM posting.List,
+	baseNeg bool,
+	baseNegUniverse bool,
+	ids posting.List,
+	tmp posting.List,
+	examined *uint64,
+) (bool, posting.List) {
+	if ids.IsEmpty() {
+		return false, tmp
+	}
+
+	if card := ids.Cardinality(); card <= iteratorThreshold || (0 < cursor.need && cursor.need < 1000) {
+		if idx, ok := ids.TrySingle(); ok {
+			*examined++
+			return orderBasicContainsReader(preds, active, baseBM, baseNeg, baseNegUniverse, idx) && cursor.emit(idx), tmp
+		}
+
+		it := ids.Iter()
+		for it.HasNext() {
+			idx := it.Next()
+			*examined++
+			if !orderBasicContainsReader(preds, active, baseBM, baseNeg, baseNegUniverse, idx) {
+				continue
+			}
+			if cursor.emit(idx) {
+				it.Release()
+				return true, tmp
+			}
+		}
+		it.Release()
+		return false, tmp
+	}
+
+	*examined += ids.Cardinality()
+	nextTmp := tmp
+	if baseNeg {
+		nextTmp.Release()
+		nextTmp = posting.List{}
+		nextTmp = ids.Clone()
+		if !baseNegUniverse {
+			nextTmp = nextTmp.BuildAndNot(baseBM)
+		}
+	} else {
+		nextTmp = tmpIntersectPosting(nextTmp, ids, baseBM)
+	}
+	if nextTmp.IsEmpty() {
+		return false, nextTmp
+	}
+	if len(active) == 0 {
+		return cursor.emitPosting(nextTmp), nextTmp
+	}
+	it := nextTmp.Iter()
+	for it.HasNext() {
+		idx := it.Next()
+		if orderBasicResidualMatchesReader(preds, active, idx) && cursor.emit(idx) {
+			it.Release()
+			return true, nextTmp
+		}
+	}
+	it.Release()
+	return false, nextTmp
+}
+
+func orderBasicEmitFilteredPostingBuf[K ~uint64 | ~string, V any](
+	cursor *queryCursor[K, V],
+	preds []predicate,
+	active *pooled.SliceBuf[int],
+	baseBM posting.List,
+	baseNeg bool,
+	baseNegUniverse bool,
+	ids posting.List,
+	tmp posting.List,
+	examined *uint64,
+) (bool, posting.List) {
+	if ids.IsEmpty() {
+		return false, tmp
+	}
+
+	if card := ids.Cardinality(); card <= iteratorThreshold || (0 < cursor.need && cursor.need < 1000) {
+		if idx, ok := ids.TrySingle(); ok {
+			*examined++
+			return orderBasicContainsBuf(preds, active, baseBM, baseNeg, baseNegUniverse, idx) && cursor.emit(idx), tmp
+		}
+
+		it := ids.Iter()
+		for it.HasNext() {
+			idx := it.Next()
+			*examined++
+			if !orderBasicContainsBuf(preds, active, baseBM, baseNeg, baseNegUniverse, idx) {
+				continue
+			}
+			if cursor.emit(idx) {
+				it.Release()
+				return true, tmp
+			}
+		}
+		it.Release()
+		return false, tmp
+	}
+
+	*examined += ids.Cardinality()
+	nextTmp := tmp
+	if baseNeg {
+		nextTmp.Release()
+		nextTmp = posting.List{}
+		nextTmp = ids.Clone()
+		if !baseNegUniverse {
+			nextTmp = nextTmp.BuildAndNot(baseBM)
+		}
+	} else {
+		nextTmp = tmpIntersectPosting(nextTmp, ids, baseBM)
+	}
+	if nextTmp.IsEmpty() {
+		return false, nextTmp
+	}
+	if active == nil || active.Len() == 0 {
+		return cursor.emitPosting(nextTmp), nextTmp
+	}
+	it := nextTmp.Iter()
+	for it.HasNext() {
+		idx := it.Next()
+		if orderBasicResidualMatchesBuf(preds, active, idx) && cursor.emit(idx) {
+			it.Release()
+			return true, nextTmp
+		}
+	}
+	it.Release()
+	return false, nextTmp
+}
+
+func orderBasicEmitFilteredPostingBufReader[K ~uint64 | ~string, V any](
+	cursor *queryCursor[K, V],
+	preds predicateReader,
+	active *pooled.SliceBuf[int],
+	baseBM posting.List,
+	baseNeg bool,
+	baseNegUniverse bool,
+	ids posting.List,
+	tmp posting.List,
+	examined *uint64,
+) (bool, posting.List) {
+	if ids.IsEmpty() {
+		return false, tmp
+	}
+
+	if card := ids.Cardinality(); card <= iteratorThreshold || (0 < cursor.need && cursor.need < 1000) {
+		if idx, ok := ids.TrySingle(); ok {
+			*examined++
+			return orderBasicContainsBufReader(preds, active, baseBM, baseNeg, baseNegUniverse, idx) && cursor.emit(idx), tmp
+		}
+
+		it := ids.Iter()
+		for it.HasNext() {
+			idx := it.Next()
+			*examined++
+			if !orderBasicContainsBufReader(preds, active, baseBM, baseNeg, baseNegUniverse, idx) {
+				continue
+			}
+			if cursor.emit(idx) {
+				it.Release()
+				return true, tmp
+			}
+		}
+		it.Release()
+		return false, tmp
+	}
+
+	*examined += ids.Cardinality()
+	nextTmp := tmp
+	if baseNeg {
+		nextTmp.Release()
+		nextTmp = posting.List{}
+		nextTmp = ids.Clone()
+		if !baseNegUniverse {
+			nextTmp = nextTmp.BuildAndNot(baseBM)
+		}
+	} else {
+		nextTmp = tmpIntersectPosting(nextTmp, ids, baseBM)
+	}
+	if nextTmp.IsEmpty() {
+		return false, nextTmp
+	}
+	if active == nil || active.Len() == 0 {
+		return cursor.emitPosting(nextTmp), nextTmp
+	}
+	it := nextTmp.Iter()
+	for it.HasNext() {
+		idx := it.Next()
+		if orderBasicResidualMatchesBufReader(preds, active, idx) && cursor.emit(idx) {
+			it.Release()
+			return true, nextTmp
+		}
+	}
+	it.Release()
+	return false, nextTmp
+}
+
+func (qv *queryView[K, V]) runOrderBasicBaseQuery(
+	q *qx.QX,
+	orderField string,
+	baseOps []qx.Expr,
+	needWindow int,
+	order qx.Order,
+	ov fieldOverlay,
+	br overlayRange,
+	nilTailField string,
+	base postingResult,
+	residualPreds predicateReader,
+	residualActive []int,
+	trace *queryTrace,
+) ([]K, bool, error) {
+	defer base.release()
+
+	baseBM := base.ids
+	baseNegUniverse := base.neg && baseBM.IsEmpty()
+	if !base.neg && baseBM.IsEmpty() {
+		return nil, true, nil
+	}
+
+	skip := q.Offset
+	need := q.Limit
+	out := make([]K, 0, need)
+	cursor := qv.newQueryCursor(out, skip, need, false, 0)
+
+	var tmp posting.List
+	defer tmp.Release()
+
+	keyCur := ov.newCursor(br, order.Desc)
+	var (
+		examined  uint64
+		scanWidth uint64
+	)
+	nilOV := qv.nilFieldOverlay(nilTailField)
+	for {
+		_, ids, ok := keyCur.next()
+		if !ok {
+			break
+		}
+		if ids.IsEmpty() {
+			continue
+		}
+		scanWidth++
+		stop, nextTmp := orderBasicEmitFilteredPostingReader(
+			&cursor,
+			residualPreds,
+			residualActive,
+			baseBM,
+			base.neg,
+			baseNegUniverse,
+			ids,
+			tmp,
+			&examined,
+		)
+		tmp = nextTmp
+		if stop {
+			trace.addExamined(examined)
+			trace.addOrderScanWidth(scanWidth)
+			trace.setEarlyStopReason("limit_reached")
+			qv.promoteOrderBasicLimitMaterializedBaseOps(orderField, baseOps, examined, uint64(needWindow))
+			return cursor.out, true, nil
+		}
+	}
+
+	if nilTailField != "" {
+		ids := nilOV.lookupPostingRetained(nilIndexEntryKey)
+		if !ids.IsEmpty() {
+			scanWidth++
+			stop, nextTmp := orderBasicEmitFilteredPostingReader(
+				&cursor,
+				residualPreds,
+				residualActive,
+				baseBM,
+				base.neg,
+				baseNegUniverse,
+				ids,
+				tmp,
+				&examined,
+			)
+			tmp = nextTmp
+			if stop {
+				trace.addExamined(examined)
+				trace.addOrderScanWidth(scanWidth)
+				trace.setEarlyStopReason("limit_reached")
+				qv.promoteOrderBasicLimitMaterializedBaseOps(orderField, baseOps, examined, uint64(needWindow))
+				return cursor.out, true, nil
+			}
+		}
+	}
+
+	trace.addExamined(examined)
+	trace.addOrderScanWidth(scanWidth)
+	trace.setEarlyStopReason("input_exhausted")
+	qv.promoteOrderBasicLimitMaterializedBaseOps(orderField, baseOps, examined, uint64(needWindow))
+	return cursor.out, true, nil
+}
+
+func (qv *queryView[K, V]) runOrderBasicBaseQueryBuf(
+	q *qx.QX,
+	orderField string,
+	baseOps []qx.Expr,
+	needWindow int,
+	order qx.Order,
+	ov fieldOverlay,
+	br overlayRange,
+	nilTailField string,
+	base postingResult,
+	residualPreds predicateReader,
+	residualActive *pooled.SliceBuf[int],
+	trace *queryTrace,
+) ([]K, bool, error) {
+	defer base.release()
+
+	baseBM := base.ids
+	baseNegUniverse := base.neg && baseBM.IsEmpty()
+	if !base.neg && baseBM.IsEmpty() {
+		return nil, true, nil
+	}
+
+	skip := q.Offset
+	need := q.Limit
+	out := make([]K, 0, need)
+	cursor := qv.newQueryCursor(out, skip, need, false, 0)
+
+	var tmp posting.List
+	defer tmp.Release()
+
+	keyCur := ov.newCursor(br, order.Desc)
+	var (
+		examined  uint64
+		scanWidth uint64
+	)
+	nilOV := qv.nilFieldOverlay(nilTailField)
+	for {
+		_, ids, ok := keyCur.next()
+		if !ok {
+			break
+		}
+		if ids.IsEmpty() {
+			continue
+		}
+		scanWidth++
+		stop, nextTmp := orderBasicEmitFilteredPostingBufReader(
+			&cursor,
+			residualPreds,
+			residualActive,
+			baseBM,
+			base.neg,
+			baseNegUniverse,
+			ids,
+			tmp,
+			&examined,
+		)
+		tmp = nextTmp
+		if stop {
+			trace.addExamined(examined)
+			trace.addOrderScanWidth(scanWidth)
+			trace.setEarlyStopReason("limit_reached")
+			qv.promoteOrderBasicLimitMaterializedBaseOps(orderField, baseOps, examined, uint64(needWindow))
+			return cursor.out, true, nil
+		}
+	}
+
+	if nilTailField != "" {
+		ids := nilOV.lookupPostingRetained(nilIndexEntryKey)
+		if !ids.IsEmpty() {
+			scanWidth++
+			stop, nextTmp := orderBasicEmitFilteredPostingBufReader(
+				&cursor,
+				residualPreds,
+				residualActive,
+				baseBM,
+				base.neg,
+				baseNegUniverse,
+				ids,
+				tmp,
+				&examined,
+			)
+			tmp = nextTmp
+			if stop {
+				trace.addExamined(examined)
+				trace.addOrderScanWidth(scanWidth)
+				trace.setEarlyStopReason("limit_reached")
+				qv.promoteOrderBasicLimitMaterializedBaseOps(orderField, baseOps, examined, uint64(needWindow))
+				return cursor.out, true, nil
+			}
+		}
+	}
+
+	trace.addExamined(examined)
+	trace.addOrderScanWidth(scanWidth)
+	trace.setEarlyStopReason("input_exhausted")
+	qv.promoteOrderBasicLimitMaterializedBaseOps(orderField, baseOps, examined, uint64(needWindow))
+	return cursor.out, true, nil
+}
+
 type rangeBounds struct {
 	has bool
 
 	empty bool
 
-	hasLo bool
-	loKey string
-	loInc bool
+	hasLo     bool
+	loKey     string
+	loIndex   indexKey
+	loNumeric bool
+	loInc     bool
 
-	hasHi bool
-	hiKey string
-	hiInc bool
+	hasHi     bool
+	hiKey     string
+	hiIndex   indexKey
+	hiNumeric bool
+	hiInc     bool
 
 	hasPrefix bool
 	prefix    string
+}
+
+func compareRangeBoundKeys(
+	aKey string,
+	aIndex indexKey,
+	aNumeric bool,
+	bKey string,
+	bIndex indexKey,
+	bNumeric bool,
+) int {
+	if aNumeric != bNumeric {
+		panic("rbi: mixed range bound key representations")
+	}
+	if aNumeric {
+		return compareIndexKeys(aIndex, bIndex)
+	}
+	return strings.Compare(aKey, bKey)
+}
+
+func (rb rangeBounds) loEncodedKey() string {
+	if rb.loNumeric {
+		return rb.loIndex.asUnsafeString()
+	}
+	return rb.loKey
+}
+
+func (rb rangeBounds) hiEncodedKey() string {
+	if rb.hiNumeric {
+		return rb.hiIndex.asUnsafeString()
+	}
+	return rb.hiKey
 }
 
 func (rb *rangeBounds) setEmpty() {
@@ -141,7 +1411,7 @@ func (rb *rangeBounds) normalize() {
 	}
 
 	if rb.hasLo && rb.hasHi {
-		cmp := strings.Compare(rb.loKey, rb.hiKey)
+		cmp := compareRangeBoundKeys(rb.loKey, rb.loIndex, rb.loNumeric, rb.hiKey, rb.hiIndex, rb.hiNumeric)
 		if cmp > 0 || (cmp == 0 && (!rb.loInc || !rb.hiInc)) {
 			rb.setEmpty()
 			return
@@ -154,15 +1424,24 @@ func (rb *rangeBounds) normalize() {
 
 	if rb.hasHi {
 		cmp := strings.Compare(rb.hiKey, rb.prefix)
+		if rb.hiNumeric {
+			cmp = compareIndexKeyString(rb.hiIndex, rb.prefix)
+		}
 		if cmp < 0 || (cmp == 0 && !rb.hiInc) {
 			rb.setEmpty()
 			return
 		}
 	}
 
-	if upper, ok := nextPrefixUpperBound(rb.prefix); ok && rb.hasLo {
-		if strings.Compare(rb.loKey, upper) >= 0 {
-			rb.setEmpty()
+	if rb.hasLo {
+		if upper, ok := newPrefixUpperBound(rb.prefix); ok {
+			cmp := compareStringPrefixUpperBound(rb.loKey, upper)
+			if rb.loNumeric {
+				cmp = compareIndexKeyPrefixUpperBound(rb.loIndex, upper)
+			}
+			if cmp >= 0 {
+				rb.setEmpty()
+			}
 		}
 	}
 }
@@ -174,6 +1453,22 @@ func (rb *rangeBounds) applyLo(key string, inc bool) {
 	if !rb.hasLo || rb.loKey < key || (rb.loKey == key && !rb.loInc && inc) {
 		rb.hasLo = true
 		rb.loKey = key
+		rb.loIndex = indexKey{}
+		rb.loNumeric = false
+		rb.loInc = inc
+	}
+	rb.normalize()
+}
+
+func (rb *rangeBounds) applyLoIndex(key indexKey, inc bool) {
+	if rb.empty {
+		return
+	}
+	if !rb.hasLo || compareIndexKeys(rb.loIndex, key) < 0 || (compareIndexKeys(rb.loIndex, key) == 0 && !rb.loInc && inc) {
+		rb.hasLo = true
+		rb.loKey = ""
+		rb.loIndex = key
+		rb.loNumeric = true
 		rb.loInc = inc
 	}
 	rb.normalize()
@@ -186,6 +1481,22 @@ func (rb *rangeBounds) applyHi(key string, inc bool) {
 	if !rb.hasHi || rb.hiKey > key || (rb.hiKey == key && !rb.hiInc && inc) {
 		rb.hasHi = true
 		rb.hiKey = key
+		rb.hiIndex = indexKey{}
+		rb.hiNumeric = false
+		rb.hiInc = inc
+	}
+	rb.normalize()
+}
+
+func (rb *rangeBounds) applyHiIndex(key indexKey, inc bool) {
+	if rb.empty {
+		return
+	}
+	if !rb.hasHi || compareIndexKeys(rb.hiIndex, key) > 0 || (compareIndexKeys(rb.hiIndex, key) == 0 && !rb.hiInc && inc) {
+		rb.hasHi = true
+		rb.hiKey = ""
+		rb.hiIndex = key
+		rb.hiNumeric = true
 		rb.hiInc = inc
 	}
 	rb.normalize()
@@ -256,6 +1567,10 @@ func lowerBoundIndex(s []index, key string) int {
 	return lo
 }
 
+func lowerBoundIndexKey(s []index, key indexKey) int {
+	return lowerBoundIndexEntriesKey(s, key)
+}
+
 func upperBoundIndex(s []index, key string) int {
 	lo, hi := 0, len(s)
 	for lo < hi {
@@ -269,20 +1584,8 @@ func upperBoundIndex(s []index, key string) int {
 	return lo
 }
 
-func nextPrefixUpperBound(prefix string) (string, bool) {
-	if prefix == "" {
-		return "", false
-	}
-	buf := []byte(prefix)
-	for i := len(buf) - 1; i >= 0; i-- {
-		if buf[i] == 0xFF {
-			continue
-		}
-		buf[i]++
-		result := buf[:i+1]
-		return unsafe.String(unsafe.SliceData(result), len(result)), true
-	}
-	return "", false
+func upperBoundIndexKey(s []index, key indexKey) int {
+	return upperBoundIndexEntriesKey(s, key)
 }
 
 func prefixRangeEndIndex(s []index, prefix string, start int) int {
@@ -292,23 +1595,21 @@ func prefixRangeEndIndex(s []index, prefix string, start int) int {
 	if compareIndexKeyString(s[start].Key, prefix) < 0 || !indexKeyHasPrefixString(s[start].Key, prefix) {
 		return start
 	}
-	if upper, ok := nextPrefixUpperBound(prefix); ok {
-		end := lowerBoundIndex(s, upper)
-		if end < start {
-			end = start
-		}
-		return end
+	upper, ok := newPrefixUpperBound(prefix)
+	if !ok {
+		return len(s)
 	}
 
-	// Extremely rare fallback when prefix consists entirely of 0xFF bytes.
-	end := start
-	for end < len(s) {
-		if !indexKeyHasPrefixString(s[end].Key, prefix) {
-			break
+	lo, hi := start, len(s)
+	for lo < hi {
+		mid := int(uint(lo+hi) >> 1)
+		if compareIndexKeyPrefixUpperBound(s[mid].Key, upper) >= 0 {
+			hi = mid
+		} else {
+			lo = mid + 1
 		}
-		end++
 	}
-	return end
+	return lo
 }
 
 const iteratorThreshold = 2048 // 256
@@ -372,20 +1673,20 @@ func (qv *queryView[K, V]) shouldCollapseOrderBasicNumericRange(field string, rb
 	return positiveWork <= complementWork
 }
 
-func (qv *queryView[K, V]) prepareOrderBasicBaseCores(baseOps []qx.Expr) (*orderBasicBaseCoreSliceBuf, *intSliceBuf, bool, error) {
+func (qv *queryView[K, V]) prepareOrderBasicBaseCores(baseOps []qx.Expr) (*pooled.SliceBuf[orderBasicBaseCore], *pooled.SliceBuf[int], bool, error) {
 	if len(baseOps) == 0 {
 		return nil, nil, false, nil
 	}
-	coresBuf := getOrderBasicBaseCoreSliceBuf(len(baseOps))
-	coresBuf.values = coresBuf.values[:0]
-	rawCoreIdxBuf := getIntSliceBuf(len(baseOps))
-	rawCoreIdxBuf.values = rawCoreIdxBuf.values[:len(baseOps)]
-	for i := range rawCoreIdxBuf.values {
-		rawCoreIdxBuf.values[i] = -1
+	coresBuf := orderBasicBaseCoreSlicePool.Get()
+	coresBuf.Grow(len(baseOps))
+	rawCoreIdxBuf := orderBasicBaseCoreIndexSlicePool.Get()
+	rawCoreIdxBuf.SetLen(len(baseOps))
+	for i := 0; i < rawCoreIdxBuf.Len(); i++ {
+		rawCoreIdxBuf.Set(i, -1)
 	}
 
 	for i, op := range baseOps {
-		if rawCoreIdxBuf.values[i] >= 0 {
+		if rawCoreIdxBuf.Get(i) >= 0 {
 			continue
 		}
 		fm := qv.fields[op.Field]
@@ -396,7 +1697,7 @@ func (qv *queryView[K, V]) prepareOrderBasicBaseCores(baseOps []qx.Expr) (*order
 		var rb rangeBounds
 		groupCount := 0
 		for j := i; j < len(baseOps); j++ {
-			if rawCoreIdxBuf.values[j] >= 0 {
+			if rawCoreIdxBuf.Get(j) >= 0 {
 				continue
 			}
 			other := baseOps[j]
@@ -405,8 +1706,8 @@ func (qv *queryView[K, V]) prepareOrderBasicBaseCores(baseOps []qx.Expr) (*order
 			}
 			nextRB, ok, err := qv.rangeBoundsForScalarExpr(other)
 			if err != nil {
-				releaseOrderBasicBaseCoreSliceBuf(coresBuf)
-				releaseIntSliceBuf(rawCoreIdxBuf)
+				orderBasicBaseCoreSlicePool.Put(coresBuf)
+				orderBasicBaseCoreIndexSlicePool.Put(rawCoreIdxBuf)
 				return nil, nil, false, err
 			}
 			if !ok {
@@ -419,38 +1720,125 @@ func (qv *queryView[K, V]) prepareOrderBasicBaseCores(baseOps []qx.Expr) (*order
 			continue
 		}
 		if rb.empty {
-			releaseOrderBasicBaseCoreSliceBuf(coresBuf)
-			releaseIntSliceBuf(rawCoreIdxBuf)
+			orderBasicBaseCoreSlicePool.Put(coresBuf)
+			orderBasicBaseCoreIndexSlicePool.Put(rawCoreIdxBuf)
 			return nil, nil, true, nil
 		}
 		if !qv.shouldCollapseOrderBasicNumericRange(op.Field, rb) {
 			continue
 		}
 
-		coreIdx := len(coresBuf.values)
-		coresBuf.values = append(coresBuf.values, orderBasicBaseCore{
+		coreIdx := coresBuf.Len()
+		coresBuf.Append(orderBasicBaseCore{
 			kind: orderBasicBaseCoreCollapsedRange,
 			collapsed: preparedScalarExactRange{
-				field:  op.Field,
-				bounds: rb,
+				field:    op.Field,
+				bounds:   rb,
+				cacheKey: qv.materializedPredKeyForExactScalarRange(op.Field, rb),
 			},
 		})
 		for j := i; j < len(baseOps); j++ {
 			other := baseOps[j]
 			if other.Field == op.Field && isOrderBasicCollapsibleNumericRangeExpr(other, fm) {
-				rawCoreIdxBuf.values[j] = coreIdx
+				rawCoreIdxBuf.Set(j, coreIdx)
 			}
 		}
 	}
 
 	for i, op := range baseOps {
-		if rawCoreIdxBuf.values[i] >= 0 {
+		if rawCoreIdxBuf.Get(i) >= 0 {
 			continue
 		}
-		rawCoreIdxBuf.values[i] = len(coresBuf.values)
-		coresBuf.values = append(coresBuf.values, orderBasicBaseCore{
+		rawCoreIdxBuf.Set(i, coresBuf.Len())
+		coresBuf.Append(orderBasicBaseCore{
 			kind: orderBasicBaseCoreRawExpr,
 			expr: op,
+		})
+	}
+	return coresBuf, rawCoreIdxBuf, false, nil
+}
+
+func (qv *queryView[K, V]) prepareOrderBasicBaseCoresBuf(baseOps *pooled.SliceBuf[qx.Expr]) (*pooled.SliceBuf[orderBasicBaseCore], *pooled.SliceBuf[int], bool, error) {
+	if baseOps == nil || baseOps.Len() == 0 {
+		return nil, nil, false, nil
+	}
+	coresBuf := orderBasicBaseCoreSlicePool.Get()
+	coresBuf.Grow(baseOps.Len())
+	rawCoreIdxBuf := orderBasicBaseCoreIndexSlicePool.Get()
+	rawCoreIdxBuf.SetLen(baseOps.Len())
+	for i := 0; i < rawCoreIdxBuf.Len(); i++ {
+		rawCoreIdxBuf.Set(i, -1)
+	}
+
+	for i := 0; i < baseOps.Len(); i++ {
+		if rawCoreIdxBuf.Get(i) >= 0 {
+			continue
+		}
+		op := baseOps.Get(i)
+		fm := qv.fields[op.Field]
+		if !isOrderBasicCollapsibleNumericRangeExpr(op, fm) {
+			continue
+		}
+
+		var rb rangeBounds
+		groupCount := 0
+		for j := i; j < baseOps.Len(); j++ {
+			if rawCoreIdxBuf.Get(j) >= 0 {
+				continue
+			}
+			other := baseOps.Get(j)
+			if other.Field != op.Field || !isOrderBasicCollapsibleNumericRangeExpr(other, fm) {
+				continue
+			}
+			nextRB, ok, err := qv.rangeBoundsForScalarExpr(other)
+			if err != nil {
+				orderBasicBaseCoreSlicePool.Put(coresBuf)
+				orderBasicBaseCoreIndexSlicePool.Put(rawCoreIdxBuf)
+				return nil, nil, false, err
+			}
+			if !ok {
+				continue
+			}
+			mergeRangeBounds(&rb, nextRB)
+			groupCount++
+		}
+		if groupCount <= 1 {
+			continue
+		}
+		if rb.empty {
+			orderBasicBaseCoreSlicePool.Put(coresBuf)
+			orderBasicBaseCoreIndexSlicePool.Put(rawCoreIdxBuf)
+			return nil, nil, true, nil
+		}
+		if !qv.shouldCollapseOrderBasicNumericRange(op.Field, rb) {
+			continue
+		}
+
+		coreIdx := coresBuf.Len()
+		coresBuf.Append(orderBasicBaseCore{
+			kind: orderBasicBaseCoreCollapsedRange,
+			collapsed: preparedScalarExactRange{
+				field:    op.Field,
+				bounds:   rb,
+				cacheKey: qv.materializedPredKeyForExactScalarRange(op.Field, rb),
+			},
+		})
+		for j := i; j < baseOps.Len(); j++ {
+			other := baseOps.Get(j)
+			if other.Field == op.Field && isOrderBasicCollapsibleNumericRangeExpr(other, fm) {
+				rawCoreIdxBuf.Set(j, coreIdx)
+			}
+		}
+	}
+
+	for i := 0; i < baseOps.Len(); i++ {
+		if rawCoreIdxBuf.Get(i) >= 0 {
+			continue
+		}
+		rawCoreIdxBuf.Set(i, coresBuf.Len())
+		coresBuf.Append(orderBasicBaseCore{
+			kind: orderBasicBaseCoreRawExpr,
+			expr: baseOps.Get(i),
 		})
 	}
 	return coresBuf, rawCoreIdxBuf, false, nil
@@ -507,9 +1895,9 @@ func (qv *queryView[K, V]) shouldPromoteObservedOrderBasicBaseCore(
 func (qv *queryView[K, V]) promoteObservedOrderBasicBaseCore(core orderBasicBaseCore) {
 	switch core.kind {
 	case orderBasicBaseCoreCollapsedRange:
-		cacheKey := materializedPredCacheKeyForExactScalarRange(core.collapsed.field, core.collapsed.bounds)
-		if cacheKey != "" {
-			if _, ok := qv.snap.loadMaterializedPred(cacheKey); ok {
+		cacheKey := core.collapsed.cacheKey
+		if !cacheKey.isZero() {
+			if _, ok := qv.snap.loadMaterializedPredKey(cacheKey); ok {
 				return
 			}
 		}
@@ -519,19 +1907,19 @@ func (qv *queryView[K, V]) promoteObservedOrderBasicBaseCore(core orderBasicBase
 		}
 	case orderBasicBaseCoreRawExpr:
 		stats, ok := qv.orderBasicRawBaseOpStats(core.expr, qv.snapshotUniverseCardinality())
-		cacheKey := ""
+		cacheKey := materializedPredKey{}
 		if ok {
 			cacheKey = stats.cacheKey
 		}
-		if cacheKey == "" {
+		if cacheKey.isZero() {
 			return
 		}
-		if _, ok := qv.snap.loadMaterializedPred(cacheKey); ok {
+		if _, ok := qv.snap.loadMaterializedPredKey(cacheKey); ok {
 			return
 		}
-		scalarKey := qv.materializedPredCacheKey(core.expr)
+		scalarKey := qv.materializedPredKey(core.expr)
 		if cacheKey == scalarKey {
-			ids := qv.evalLazyMaterializedPredicate(core.expr, cacheKey)
+			ids := qv.evalLazyMaterializedPredicateWithKey(core.expr, cacheKey)
 			ids.Release()
 			return
 		}
@@ -539,12 +1927,12 @@ func (qv *queryView[K, V]) promoteObservedOrderBasicBaseCore(core orderBasicBase
 	}
 }
 
-func (qv *queryView[K, V]) hasWarmOrderBasicBaseCores(cores *orderBasicBaseCoreSliceBuf) bool {
+func (qv *queryView[K, V]) hasWarmOrderBasicBaseCores(cores *pooled.SliceBuf[orderBasicBaseCore]) bool {
 	if cores == nil {
 		return false
 	}
-	for i := range cores.values {
-		if hit, ok := qv.loadWarmOrderBasicBaseCore(cores.values[i]); ok {
+	for i := 0; i < cores.Len(); i++ {
+		if hit, ok := qv.loadWarmOrderBasicBaseCore(cores.Get(i)); ok {
 			hit.release()
 			return true
 		}
@@ -584,7 +1972,7 @@ func (qv *queryView[K, V]) shouldPromoteObservedOrderBasicRawBaseOp(
 		return false
 	}
 	stats, ok := qv.orderBasicRawBaseOpStats(op, universe)
-	if !ok || stats.cacheKey == "" || stats.probeBuckets == 0 || stats.probeEst == 0 {
+	if !ok || stats.cacheKey.isZero() || stats.probeBuckets == 0 || stats.probeEst == 0 {
 		return false
 	}
 	buildWork := rangeProbeMaterializeWork(stats.buildBuckets, stats.buildEst)
@@ -599,8 +1987,8 @@ func (qv *queryView[K, V]) shouldPromoteObservedOrderBasicRawBaseOp(
 	return probeWork >= buildWork
 }
 
-func (qv *queryView[K, V]) materializeOrderBasicLimitComplementBaseOp(op qx.Expr, cacheKey string) bool {
-	if cacheKey == "" || op.Field == "" {
+func (qv *queryView[K, V]) materializeOrderBasicLimitComplementBaseOp(op qx.Expr, cacheKey materializedPredKey) bool {
+	if cacheKey.isZero() || op.Field == "" {
 		return false
 	}
 	candidate, ok := qv.prepareScalarRangeRoutingCandidate(op)
@@ -612,12 +2000,12 @@ func (qv *queryView[K, V]) materializeOrderBasicLimitComplementBaseOp(op qx.Expr
 		return false
 	}
 	if plan.est == 0 {
-		qv.snap.storeMaterializedPred(cacheKey, posting.List{})
+		qv.snap.storeMaterializedPredKey(cacheKey, posting.List{})
 		return true
 	}
 	ids := candidate.core.materializeComplement(plan)
 	if ids.IsEmpty() {
-		qv.snap.storeMaterializedPred(cacheKey, posting.List{})
+		qv.snap.storeMaterializedPredKey(cacheKey, posting.List{})
 		return true
 	}
 	ids = tryShareMaterializedPredOnSnapshot(qv.snap, cacheKey, ids)
@@ -632,26 +2020,26 @@ func (qv *queryView[K, V]) materializeOrderMaterializedBaseOps(orderField string
 	coresBuf, rawCoreIdxBuf, empty, err := qv.prepareOrderBasicBaseCores(baseOps)
 	if err != nil || empty {
 		if coresBuf != nil {
-			releaseOrderBasicBaseCoreSliceBuf(coresBuf)
+			orderBasicBaseCoreSlicePool.Put(coresBuf)
 		}
 		if rawCoreIdxBuf != nil {
-			releaseIntSliceBuf(rawCoreIdxBuf)
+			orderBasicBaseCoreIndexSlicePool.Put(rawCoreIdxBuf)
 		}
 		return
 	}
-	defer releaseOrderBasicBaseCoreSliceBuf(coresBuf)
-	defer releaseIntSliceBuf(rawCoreIdxBuf)
+	defer orderBasicBaseCoreSlicePool.Put(coresBuf)
+	defer orderBasicBaseCoreIndexSlicePool.Put(rawCoreIdxBuf)
 
-	keysBuf := getStringSliceBuf(len(coresBuf.values))
-	keysBuf.values = keysBuf.values[:0]
-	defer releaseStringSliceBuf(keysBuf)
+	keysBuf := materializedPredKeySlicePool.Get()
+	keysBuf.Grow(coresBuf.Len())
+	defer materializedPredKeySlicePool.Put(keysBuf)
 
-	for i := range coresBuf.values {
-		core := coresBuf.values[i]
-		key := ""
+	for i := 0; i < coresBuf.Len(); i++ {
+		core := coresBuf.Get(i)
+		key := materializedPredKey{}
 		switch core.kind {
 		case orderBasicBaseCoreCollapsedRange:
-			key = materializedPredCacheKeyForExactScalarRange(core.collapsed.field, core.collapsed.bounds)
+			key = core.collapsed.cacheKey
 		case orderBasicBaseCoreRawExpr:
 			if core.expr.Not || core.expr.Field == "" || core.expr.Field == orderField {
 				continue
@@ -661,12 +2049,12 @@ func (qv *queryView[K, V]) materializeOrderMaterializedBaseOps(orderField string
 				key = stats.cacheKey
 			}
 		}
-		if key == "" {
+		if key.isZero() {
 			continue
 		}
 		seen := false
-		for j := range keysBuf.values {
-			if keysBuf.values[j] == key {
+		for j := 0; j < keysBuf.Len(); j++ {
+			if keysBuf.Get(j) == key {
 				seen = true
 				break
 			}
@@ -674,7 +2062,61 @@ func (qv *queryView[K, V]) materializeOrderMaterializedBaseOps(orderField string
 		if seen {
 			continue
 		}
-		keysBuf.values = append(keysBuf.values, key)
+		keysBuf.Append(key)
+		qv.promoteObservedOrderBasicBaseCore(core)
+	}
+}
+
+func (qv *queryView[K, V]) materializeOrderMaterializedBaseOpsBuf(orderField string, baseOps *pooled.SliceBuf[qx.Expr]) {
+	if qv.snap == nil || qv.snap.materializedPredCacheLimit() <= 0 || baseOps == nil || baseOps.Len() == 0 {
+		return
+	}
+	coresBuf, rawCoreIdxBuf, empty, err := qv.prepareOrderBasicBaseCoresBuf(baseOps)
+	if err != nil || empty {
+		if coresBuf != nil {
+			orderBasicBaseCoreSlicePool.Put(coresBuf)
+		}
+		if rawCoreIdxBuf != nil {
+			orderBasicBaseCoreIndexSlicePool.Put(rawCoreIdxBuf)
+		}
+		return
+	}
+	defer orderBasicBaseCoreSlicePool.Put(coresBuf)
+	defer orderBasicBaseCoreIndexSlicePool.Put(rawCoreIdxBuf)
+
+	keysBuf := materializedPredKeySlicePool.Get()
+	keysBuf.Grow(coresBuf.Len())
+	defer materializedPredKeySlicePool.Put(keysBuf)
+
+	for i := 0; i < coresBuf.Len(); i++ {
+		core := coresBuf.Get(i)
+		key := materializedPredKey{}
+		switch core.kind {
+		case orderBasicBaseCoreCollapsedRange:
+			key = core.collapsed.cacheKey
+		case orderBasicBaseCoreRawExpr:
+			if core.expr.Not || core.expr.Field == "" || core.expr.Field == orderField {
+				continue
+			}
+			stats, ok := qv.orderBasicRawBaseOpStats(core.expr, qv.snapshotUniverseCardinality())
+			if ok {
+				key = stats.cacheKey
+			}
+		}
+		if key.isZero() {
+			continue
+		}
+		seen := false
+		for j := 0; j < keysBuf.Len(); j++ {
+			if keysBuf.Get(j) == key {
+				seen = true
+				break
+			}
+		}
+		if seen {
+			continue
+		}
+		keysBuf.Append(key)
 		qv.promoteObservedOrderBasicBaseCore(core)
 	}
 }
@@ -690,39 +2132,39 @@ func (qv *queryView[K, V]) promoteOrderBasicLimitMaterializedBaseOps(orderField 
 	coresBuf, rawCoreIdxBuf, empty, err := qv.prepareOrderBasicBaseCores(baseOps)
 	if err != nil || empty {
 		if coresBuf != nil {
-			releaseOrderBasicBaseCoreSliceBuf(coresBuf)
+			orderBasicBaseCoreSlicePool.Put(coresBuf)
 		}
 		if rawCoreIdxBuf != nil {
-			releaseIntSliceBuf(rawCoreIdxBuf)
+			orderBasicBaseCoreIndexSlicePool.Put(rawCoreIdxBuf)
 		}
 		return
 	}
-	defer releaseOrderBasicBaseCoreSliceBuf(coresBuf)
-	defer releaseIntSliceBuf(rawCoreIdxBuf)
+	defer orderBasicBaseCoreSlicePool.Put(coresBuf)
+	defer orderBasicBaseCoreIndexSlicePool.Put(rawCoreIdxBuf)
 
-	keysBuf := getStringSliceBuf(len(coresBuf.values))
-	keysBuf.values = keysBuf.values[:0]
-	defer releaseStringSliceBuf(keysBuf)
+	keysBuf := materializedPredKeySlicePool.Get()
+	keysBuf.Grow(coresBuf.Len())
+	defer materializedPredKeySlicePool.Put(keysBuf)
 
-	for i := range coresBuf.values {
-		core := coresBuf.values[i]
+	for i := 0; i < coresBuf.Len(); i++ {
+		core := coresBuf.Get(i)
 		if !qv.shouldPromoteObservedOrderBasicBaseCore(orderField, core, universe, observedRows, needWindow) {
 			continue
 		}
-		key := ""
+		key := materializedPredKey{}
 		switch core.kind {
 		case orderBasicBaseCoreCollapsedRange:
-			key = materializedPredCacheKeyForExactScalarRange(core.collapsed.field, core.collapsed.bounds)
+			key = core.collapsed.cacheKey
 		case orderBasicBaseCoreRawExpr:
 			stats, ok := qv.orderBasicRawBaseOpStats(core.expr, qv.snapshotUniverseCardinality())
 			if ok {
 				key = stats.cacheKey
 			}
 		}
-		if key != "" {
+		if !key.isZero() {
 			seen := false
-			for j := range keysBuf.values {
-				if keysBuf.values[j] == key {
+			for j := 0; j < keysBuf.Len(); j++ {
+				if keysBuf.Get(j) == key {
 					seen = true
 					break
 				}
@@ -730,14 +2172,14 @@ func (qv *queryView[K, V]) promoteOrderBasicLimitMaterializedBaseOps(orderField 
 			if seen {
 				continue
 			}
-			keysBuf.values = append(keysBuf.values, key)
+			keysBuf.Append(key)
 		}
 		qv.promoteObservedOrderBasicBaseCore(core)
 	}
 }
 
-func (qv *queryView[K, V]) promoteObservedLimitLeafPreds(orderField string, preds []leafPred, observedRows uint64, needWindow uint64) {
-	if qv.snap == nil || len(preds) == 0 || observedRows == 0 {
+func (qv *queryView[K, V]) promoteObservedLimitLeafPreds(orderField string, preds *pooled.SliceBuf[leafPred], observedRows uint64, needWindow uint64) {
+	if qv.snap == nil || preds == nil || preds.Len() == 0 || observedRows == 0 {
 		return
 	}
 	universe := qv.snapshotUniverseCardinality()
@@ -745,23 +2187,23 @@ func (qv *queryView[K, V]) promoteObservedLimitLeafPreds(orderField string, pred
 		return
 	}
 
-	keysBuf := getStringSliceBuf(len(preds))
-	keysBuf.values = keysBuf.values[:0]
-	defer releaseStringSliceBuf(keysBuf)
-
-	for i := range preds {
-		if preds[i].kind != leafPredKindPredicate {
+	keysBuf := materializedPredKeySlicePool.Get()
+	keysBuf.Grow(preds.Len())
+	defer materializedPredKeySlicePool.Put(keysBuf)
+	for i := 0; i < preds.Len(); i++ {
+		pred := preds.Get(i)
+		if pred.kind != leafPredKindPredicate {
 			continue
 		}
 		var (
 			core orderBasicBaseCore
 			ok   bool
 		)
-		if preds[i].hasBaseCore {
-			core = preds[i].baseCore
+		if pred.hasBaseCore {
+			core = pred.baseCore
 			ok = true
 		} else {
-			op := preds[i].pred.expr
+			op := pred.pred.expr
 			if !isSimpleScalarRangeOrPrefixLeaf(op) || op.Field == "" || op.Field == orderField || op.Not {
 				continue
 			}
@@ -778,11 +2220,11 @@ func (qv *queryView[K, V]) promoteObservedLimitLeafPreds(orderField string, pred
 			continue
 		}
 
-		key := ""
+		key := materializedPredKey{}
 		requiresSecondHit := false
 		switch core.kind {
 		case orderBasicBaseCoreCollapsedRange:
-			key = materializedPredCacheKeyForExactScalarRange(core.collapsed.field, core.collapsed.bounds)
+			key = core.collapsed.cacheKey
 		case orderBasicBaseCoreRawExpr:
 			stats, ok := qv.orderBasicRawBaseOpStats(core.expr, universe)
 			if ok {
@@ -790,16 +2232,16 @@ func (qv *queryView[K, V]) promoteObservedLimitLeafPreds(orderField string, pred
 				requiresSecondHit = true
 			}
 		}
-		if key == "" {
+		if key.isZero() {
 			continue
 		}
-		if requiresSecondHit && !qv.snap.shouldPromoteRuntimeMaterializedPred(key) {
+		if requiresSecondHit && !qv.snap.shouldPromoteRuntimeMaterializedPredKey(key) {
 			continue
 		}
 
 		seen := false
-		for j := range keysBuf.values {
-			if keysBuf.values[j] == key {
+		for j := 0; j < keysBuf.Len(); j++ {
+			if keysBuf.Get(j) == key {
 				seen = true
 				break
 			}
@@ -807,20 +2249,20 @@ func (qv *queryView[K, V]) promoteObservedLimitLeafPreds(orderField string, pred
 		if seen {
 			continue
 		}
-		keysBuf.values = append(keysBuf.values, key)
+		keysBuf.Append(key)
 		qv.promoteObservedOrderBasicBaseCore(core)
 	}
 }
 
 func (qv *queryView[K, V]) evalOrderBasicRawBaseOp(op qx.Expr) (postingResult, error) {
 	stats, ok := qv.orderBasicRawBaseOpStats(op, qv.snapshotUniverseCardinality())
-	cacheKey := ""
+	cacheKey := materializedPredKey{}
 	if ok {
 		cacheKey = stats.cacheKey
 	}
-	if cacheKey != "" {
-		if cached, ok := qv.snap.loadMaterializedPred(cacheKey); ok {
-			if cacheKey == qv.materializedPredCacheKey(op) {
+	if !cacheKey.isZero() {
+		if cached, ok := qv.snap.loadMaterializedPredKey(cacheKey); ok {
+			if cacheKey == qv.materializedPredKey(op) {
 				return postingResult{ids: cached}, nil
 			}
 			return postingResult{ids: cached, neg: true}, nil
@@ -931,10 +2373,10 @@ func (qv *queryView[K, V]) tryQueryOrderBasicWithLimit(q *qx.QX, trace *queryTra
 		return nil, true, err
 	}
 	if baseCoresBuf != nil {
-		defer releaseOrderBasicBaseCoreSliceBuf(baseCoresBuf)
+		defer orderBasicBaseCoreSlicePool.Put(baseCoresBuf)
 	}
 	if baseRawCoreIdxBuf != nil {
-		defer releaseIntSliceBuf(baseRawCoreIdxBuf)
+		defer orderBasicBaseCoreIndexSlicePool.Put(baseRawCoreIdxBuf)
 	}
 	if noMatch {
 		return nil, true, nil
@@ -958,21 +2400,20 @@ func (qv *queryView[K, V]) tryQueryOrderBasicWithLimit(q *qx.QX, trace *queryTra
 		q.Offset == 0 &&
 		qv.shouldPreferOrderBasicBaseCorePathForNonOrderPrefix(q, f, baseOps)
 
-	hasWarmBaseOps := baseCoresBuf != nil && len(baseCoresBuf.values) > 0 && qv.hasWarmOrderBasicBaseCores(baseCoresBuf)
+	hasWarmBaseOps := baseCoresBuf != nil && baseCoresBuf.Len() > 0 && qv.hasWarmOrderBasicBaseCores(baseCoresBuf)
 	if !preferBaseCores && !fm.Ptr && len(baseOps) > 0 {
-		leavesBuf := getExprSliceBuf(len(baseOps) + 2)
-		leaves, ok := collectAndLeavesScratch(q.Expr, leavesBuf.values[:0])
-		if ok {
-			execDecision := qv.decideExecutionOrderByCost(q, leaves)
+		leavesBuf := exprSlicePool.Get()
+		leavesBuf.Grow(len(baseOps) + 2)
+		if collectAndLeavesBuf(q.Expr, leavesBuf) {
+			execDecision := qv.decideExecutionOrderByCostBuf(q, leavesBuf)
 			if execDecision.use {
 				window, _ := orderWindow(q)
-				preds, predsBuf, ok := qv.buildPredicatesOrderedWithMode(leaves, f, false, window, true, true)
+				predSet, ok := qv.buildPredicatesOrderedWithModeBuf(leavesBuf, f, false, window, true, true)
 				if ok {
-					defer releasePredicates(preds, predsBuf)
-					for i := range preds {
-						if preds[i].alwaysFalse {
-							leavesBuf.values = leaves
-							releaseExprSliceBuf(leavesBuf)
+					defer predSet.Release()
+					for i := 0; i < predSet.Len(); i++ {
+						if predSet.Get(i).alwaysFalse {
+							exprSlicePool.Put(leavesBuf)
 							return nil, true, nil
 						}
 					}
@@ -984,58 +2425,48 @@ func (qv *queryView[K, V]) tryQueryOrderBasicWithLimit(q *qx.QX, trace *queryTra
 					} else {
 						observedStart = execTrace.ev.RowsExamined
 					}
-					if out, ok := qv.execPlanOrderedBasic(q, preds, execTrace); ok {
-						leavesBuf.values = leaves
-						releaseExprSliceBuf(leavesBuf)
+					if out, ok := qv.execPlanOrderedBasicReader(q, predSet, execTrace); ok {
+						exprSlicePool.Put(leavesBuf)
 						qv.promoteOrderBasicLimitMaterializedBaseOps(f, baseOps, execTrace.ev.RowsExamined-observedStart, uint64(needWindow))
 						return out, true, nil
 					}
 				}
 			}
 		}
-		leavesBuf.values = leaves
-		releaseExprSliceBuf(leavesBuf)
+		exprSlicePool.Put(leavesBuf)
 		if !hasWarmBaseOps {
 			return nil, false, nil
 		}
 	}
 
 	if len(baseOps) == 0 {
-		out, _ := qv.scanOrderLimitWithPredicates(q, ov, br, order.Desc, nil, nilTailField, trace)
+		out, _ := qv.scanOrderLimitNoPredicates(q, ov, br, order.Desc, nilTailField, trace)
 		return out, true, nil
 	}
 
 	var base postingResult
-	var residualPreds []predicate
-	var residualPredsBuf *predicateSliceBuf
-	var residualActiveBuf *intSliceBuf
-	defer func() {
-		releaseIntSliceBuf(residualActiveBuf)
-		if residualPreds != nil || residualPredsBuf != nil {
-			releasePredicates(residualPreds, residualPredsBuf)
-		}
-	}()
+	var residualPredSet predicateSet
+	var residualActiveBuf *pooled.SliceBuf[int]
+	var residualActive []int
 
 	if hasWarmBaseOps {
-		residualOpsBuf := getExprSliceBuf(len(baseOps))
-		residualOpsBuf.values = residualOpsBuf.values[:0]
-		defer func() {
-			releaseExprSliceBuf(residualOpsBuf)
-		}()
-		var loadedCoreBuf *boolSliceBuf
-		if baseCoresBuf != nil && len(baseCoresBuf.values) > 0 {
-			loadedCoreBuf = getBoolSliceBuf(len(baseCoresBuf.values))
-			loadedCoreBuf.values = loadedCoreBuf.values[:len(baseCoresBuf.values)]
-			defer releaseBoolSliceBuf(loadedCoreBuf)
+		residualOpsBuf := exprSlicePool.Get()
+		residualOpsBuf.Grow(len(baseOps))
+		defer exprSlicePool.Put(residualOpsBuf)
+		var loadedCoreBuf *pooled.SliceBuf[bool]
+		if baseCoresBuf != nil && baseCoresBuf.Len() > 0 {
+			loadedCoreBuf = boolSlicePool.Get()
+			loadedCoreBuf.SetLen(baseCoresBuf.Len())
+			defer boolSlicePool.Put(loadedCoreBuf)
 		}
 
 		baseBuilt := false
-		for i := range baseCoresBuf.values {
-			b, ok := qv.loadWarmOrderBasicBaseCore(baseCoresBuf.values[i])
+		for i := 0; i < baseCoresBuf.Len(); i++ {
+			b, ok := qv.loadWarmOrderBasicBaseCore(baseCoresBuf.Get(i))
 			if !ok {
 				continue
 			}
-			loadedCoreBuf.values[i] = true
+			loadedCoreBuf.Set(i, true)
 			if !baseBuilt {
 				base = b
 				baseBuilt = true
@@ -1049,37 +2480,45 @@ func (qv *queryView[K, V]) tryQueryOrderBasicWithLimit(q *qx.QX, trace *queryTra
 			}
 		}
 		for i, op := range baseOps {
-			if loadedCoreBuf.values[baseRawCoreIdxBuf.values[i]] {
+			if loadedCoreBuf.Get(baseRawCoreIdxBuf.Get(i)) {
 				continue
 			}
-			residualOpsBuf.values = append(residualOpsBuf.values, op)
+			residualOpsBuf.Append(op)
 		}
 		if !baseBuilt {
 			hasWarmBaseOps = false
-		} else if len(residualOpsBuf.values) > 0 {
+		} else if residualOpsBuf.Len() > 0 {
 			window, _ := orderWindow(q)
 			var ok bool
-			residualPreds, residualPredsBuf, ok = qv.buildPredicatesOrderedWithMode(residualOpsBuf.values, f, false, window, false, true)
+			residualPredSet, ok = qv.buildPredicatesOrderedWithModeBuf(residualOpsBuf, f, false, window, false, true)
 			if !ok {
 				base.release()
 				base = postingResult{}
 				hasWarmBaseOps = false
-				if residualPreds != nil || residualPredsBuf != nil {
-					releasePredicates(residualPreds, residualPredsBuf)
-					residualPreds = nil
-					residualPredsBuf = nil
-				}
+				residualPredSet.Release()
 			} else {
-				residualActiveBuf = getIntSliceBuf(len(residualPreds))
-				for i := range residualPreds {
-					if residualPreds[i].alwaysFalse {
+				var residualActiveInline [limitQueryFastPathMaxLeaves]int
+				if residualPredSet.Len() <= limitQueryFastPathMaxLeaves {
+					residualActive = residualActiveInline[:0]
+				} else {
+					residualActiveBuf = predicateCheckSlicePool.Get()
+					residualActiveBuf.Grow(residualPredSet.Len())
+				}
+				for i := 0; i < residualPredSet.Len(); i++ {
+					p := residualPredSet.Get(i)
+					if p.alwaysFalse {
 						base.release()
+						releaseOrderBasicResidualState(residualPredSet, residualActiveBuf)
 						return nil, true, nil
 					}
-					if residualPreds[i].covered || residualPreds[i].alwaysTrue {
+					if p.covered || p.alwaysTrue {
 						continue
 					}
-					residualActiveBuf.values = append(residualActiveBuf.values, i)
+					if residualActiveBuf != nil {
+						residualActiveBuf.Append(i)
+						continue
+					}
+					residualActive = append(residualActive, i)
 				}
 			}
 		}
@@ -1087,8 +2526,8 @@ func (qv *queryView[K, V]) tryQueryOrderBasicWithLimit(q *qx.QX, trace *queryTra
 
 	if !hasWarmBaseOps {
 		baseBuilt := false
-		for i := range baseCoresBuf.values {
-			b, err := qv.evalOrderBasicBaseCore(baseCoresBuf.values[i])
+		for i := 0; i < baseCoresBuf.Len(); i++ {
+			b, err := qv.evalOrderBasicBaseCore(baseCoresBuf.Get(i))
 			if err != nil {
 				base.release()
 				return nil, true, err
@@ -1107,150 +2546,20 @@ func (qv *queryView[K, V]) tryQueryOrderBasicWithLimit(q *qx.QX, trace *queryTra
 	}
 	if !base.neg && base.ids.IsEmpty() {
 		base.release()
+		releaseOrderBasicResidualState(residualPredSet, residualActiveBuf)
 		return nil, true, nil
 	}
-	defer base.release()
-
-	baseBM := base.ids
-	baseNegUniverse := base.neg && baseBM.IsEmpty()
-	if !base.neg && baseBM.IsEmpty() {
-		return nil, true, nil
-	}
-	hasResidualActive := residualActiveBuf != nil && len(residualActiveBuf.values) > 0
-
-	skip := q.Offset
-	need := q.Limit
-
-	out := make([]K, 0, need)
-	cursor := qv.newQueryCursor(out, skip, need, false, 0)
-
-	var tmp posting.List
-	defer tmp.Release()
-
-	contains := func(idx uint64) bool {
-		if base.neg {
-			if baseNegUniverse {
-				if !hasResidualActive {
-					return true
-				}
-				return predicatesMatchActive(residualPreds, residualActiveBuf.values, idx)
-			}
-			if baseBM.Contains(idx) {
-				return false
-			}
-		} else if !baseBM.Contains(idx) {
-			return false
-		}
-		if !hasResidualActive {
-			return true
-		}
-		return predicatesMatchActive(residualPreds, residualActiveBuf.values, idx)
-	}
-	residualMatches := func(idx uint64) bool {
-		if !hasResidualActive {
-			return true
-		}
-		return predicatesMatchActive(residualPreds, residualActiveBuf.values, idx)
-	}
-
-	keyCur := ov.newCursor(br, order.Desc)
 	var (
-		examined  uint64
-		scanWidth uint64
+		out  []K
+		used bool
 	)
-	nilOV := qv.nilFieldOverlay(nilTailField)
-	emitFilteredPosting := func(ids posting.List) bool {
-		if ids.IsEmpty() {
-			return false
-		}
-
-		if card := ids.Cardinality(); card <= iteratorThreshold || (0 < cursor.need && cursor.need < 1000) {
-			if idx, ok := ids.TrySingle(); ok {
-				examined++
-				return contains(idx) && cursor.emit(idx)
-			}
-
-			it := ids.Iter()
-			for it.HasNext() {
-				idx := it.Next()
-				examined++
-				if !contains(idx) {
-					continue
-				}
-				if cursor.emit(idx) {
-					it.Release()
-					return true
-				}
-			}
-			it.Release()
-			return false
-		}
-
-		examined += ids.Cardinality()
-		if base.neg {
-			tmp.Release()
-			tmp = posting.List{}
-			tmp = ids.Clone()
-			if !baseNegUniverse {
-				tmp = tmp.BuildAndNot(baseBM)
-			}
-		} else {
-			tmp = tmpIntersectPosting(tmp, ids, baseBM)
-		}
-		if tmp.IsEmpty() {
-			return false
-		}
-		if !hasResidualActive {
-			return cursor.emitPosting(tmp)
-		}
-		it := tmp.Iter()
-		defer it.Release()
-		for it.HasNext() {
-			idx := it.Next()
-			if residualMatches(idx) && cursor.emit(idx) {
-				return true
-			}
-		}
-		return false
+	if residualActiveBuf != nil {
+		out, used, err = qv.runOrderBasicBaseQueryBuf(q, f, baseOps, needWindow, order, ov, br, nilTailField, base, residualPredSet, residualActiveBuf, trace)
+	} else {
+		out, used, err = qv.runOrderBasicBaseQuery(q, f, baseOps, needWindow, order, ov, br, nilTailField, base, residualPredSet, residualActive, trace)
 	}
-
-	for {
-		_, ids, ok := keyCur.next()
-		if !ok {
-			break
-		}
-		if ids.IsEmpty() {
-			continue
-		}
-		scanWidth++
-		if emitFilteredPosting(ids) {
-			trace.addExamined(examined)
-			trace.addOrderScanWidth(scanWidth)
-			trace.setEarlyStopReason("limit_reached")
-			qv.promoteOrderBasicLimitMaterializedBaseOps(f, baseOps, examined, uint64(needWindow))
-			return cursor.out, true, nil
-		}
-	}
-
-	if nilTailField != "" {
-		ids := nilOV.lookupPostingRetained(nilIndexEntryKey)
-		if !ids.IsEmpty() {
-			scanWidth++
-			if emitFilteredPosting(ids) {
-				trace.addExamined(examined)
-				trace.addOrderScanWidth(scanWidth)
-				trace.setEarlyStopReason("limit_reached")
-				qv.promoteOrderBasicLimitMaterializedBaseOps(f, baseOps, examined, uint64(needWindow))
-				return cursor.out, true, nil
-			}
-		}
-	}
-
-	trace.addExamined(examined)
-	trace.addOrderScanWidth(scanWidth)
-	trace.setEarlyStopReason("input_exhausted")
-	qv.promoteOrderBasicLimitMaterializedBaseOps(f, baseOps, examined, uint64(needWindow))
-	return cursor.out, true, nil
+	releaseOrderBasicResidualState(residualPredSet, residualActiveBuf)
+	return out, used, err
 }
 
 func (qv *queryView[K, V]) scanOrderLimitNoPredicates(q *qx.QX, ov fieldOverlay, br overlayRange, desc bool, nilTailField string, trace *queryTrace) ([]K, bool) {
@@ -1262,41 +2571,6 @@ func (qv *queryView[K, V]) scanOrderLimitNoPredicates(q *qx.QX, ov fieldOverlay,
 		scanWidth uint64
 	)
 
-	emitPosting := func(ids posting.List) bool {
-		if ids.IsEmpty() {
-			return false
-		}
-		if idx, ok := ids.TrySingle(); ok {
-			examined++
-			if trace != nil {
-				trace.addMatched(1)
-			}
-			return cursor.emit(idx)
-		}
-		card := ids.Cardinality()
-		if cursor.skip >= card {
-			cursor.skip -= card
-			examined += card
-			if trace != nil {
-				trace.addMatched(card)
-			}
-			return false
-		}
-		stop := false
-		ids.ForEach(func(idx uint64) bool {
-			examined++
-			if trace != nil {
-				trace.addMatched(1)
-			}
-			if cursor.emit(idx) {
-				stop = true
-				return false
-			}
-			return true
-		})
-		return stop
-	}
-
 	keyCur := ov.newCursor(br, desc)
 	for {
 		_, ids, ok := keyCur.next()
@@ -1307,7 +2581,7 @@ func (qv *queryView[K, V]) scanOrderLimitNoPredicates(q *qx.QX, ov fieldOverlay,
 			continue
 		}
 		scanWidth++
-		if emitPosting(ids) {
+		if emitOrderLimitPosting(&cursor, ids, &examined, trace) {
 			if trace != nil {
 				trace.addExamined(examined)
 				trace.addOrderScanWidth(scanWidth)
@@ -1321,7 +2595,7 @@ func (qv *queryView[K, V]) scanOrderLimitNoPredicates(q *qx.QX, ov fieldOverlay,
 		ids := qv.nilFieldOverlay(nilTailField).lookupPostingRetained(nilIndexEntryKey)
 		if !ids.IsEmpty() {
 			scanWidth++
-			if emitPosting(ids) {
+			if emitOrderLimitPosting(&cursor, ids, &examined, trace) {
 				if trace != nil {
 					trace.addExamined(examined)
 					trace.addOrderScanWidth(scanWidth)
@@ -1340,16 +2614,127 @@ func (qv *queryView[K, V]) scanOrderLimitNoPredicates(q *qx.QX, ov fieldOverlay,
 	return cursor.out, true
 }
 
-func (qv *queryView[K, V]) scanOrderLimitWithPredicates(q *qx.QX, ov fieldOverlay, br overlayRange, desc bool, preds []predicate, nilTailField string, trace *queryTrace) ([]K, bool) {
-	activeBuf := getIntSliceBuf(len(preds))
-	active := activeBuf.values
-	defer func() {
-		activeBuf.values = active
-		releaseIntSliceBuf(activeBuf)
-	}()
+func (qv *queryView[K, V]) scanOrderLimitWithPredicatesReader(q *qx.QX, ov fieldOverlay, br overlayRange, desc bool, preds predicateReader, nilTailField string, trace *queryTrace) ([]K, bool) {
+	if preds.Len() > limitQueryFastPathMaxLeaves {
+		activeBuf := predicateCheckSlicePool.Get()
+		activeBuf.Grow(preds.Len())
+		defer predicateCheckSlicePool.Put(activeBuf)
+		for i := 0; i < preds.Len(); i++ {
+			p := preds.Get(i)
+			if p.alwaysFalse {
+				if trace != nil {
+					trace.setEarlyStopReason("empty_predicate")
+				}
+				return nil, true
+			}
+			if p.covered || p.alwaysTrue {
+				continue
+			}
+			if !p.hasContains() {
+				return nil, false
+			}
+			activeBuf.Append(i)
+		}
+		if activeBuf.Len() == 0 {
+			return qv.scanOrderLimitNoPredicates(q, ov, br, desc, nilTailField, trace)
+		}
+		sortActivePredicatesBufReader(activeBuf, preds)
 
-	for i := range preds {
-		p := preds[i]
+		exactActiveBuf := predicateCheckSlicePool.Get()
+		exactActiveBuf.Grow(activeBuf.Len())
+		defer predicateCheckSlicePool.Put(exactActiveBuf)
+		buildExactBucketPostingFilterActiveBufReader(exactActiveBuf, activeBuf, preds)
+
+		residualActiveBuf := predicateCheckSlicePool.Get()
+		residualActiveBuf.Grow(activeBuf.Len())
+		defer predicateCheckSlicePool.Put(residualActiveBuf)
+		plannerResidualChecksBuf(residualActiveBuf, activeBuf, exactActiveBuf)
+
+		exactOnly := activeBuf.Len() > 0 && activeBuf.Len() == exactActiveBuf.Len()
+
+		out := make([]K, 0, q.Limit)
+		cursor := qv.newQueryCursor(out, q.Offset, q.Limit, false, 0)
+
+		var (
+			examined  uint64
+			scanWidth uint64
+		)
+
+		var exactWork posting.List
+		defer exactWork.Release()
+
+		keyCur := ov.newCursor(br, desc)
+		for {
+			_, ids, ok := keyCur.next()
+			if !ok {
+				break
+			}
+			if !ids.IsEmpty() {
+				scanWidth++
+			}
+			stop, nextExactWork := orderPredicatesEmitPostingBufReader(
+				&cursor,
+				preds,
+				activeBuf,
+				exactActiveBuf,
+				residualActiveBuf,
+				exactOnly,
+				ids,
+				exactWork,
+				trace,
+				&examined,
+			)
+			exactWork = nextExactWork
+			if stop {
+				if trace != nil {
+					trace.addExamined(examined)
+					trace.addOrderScanWidth(scanWidth)
+					trace.setEarlyStopReason("limit_reached")
+				}
+				return cursor.out, true
+			}
+		}
+
+		if nilTailField != "" {
+			ids := qv.nilFieldOverlay(nilTailField).lookupPostingRetained(nilIndexEntryKey)
+			if !ids.IsEmpty() {
+				scanWidth++
+				stop, nextExactWork := orderPredicatesEmitPostingBufReader(
+					&cursor,
+					preds,
+					activeBuf,
+					exactActiveBuf,
+					residualActiveBuf,
+					exactOnly,
+					ids,
+					exactWork,
+					trace,
+					&examined,
+				)
+				exactWork = nextExactWork
+				if stop {
+					if trace != nil {
+						trace.addExamined(examined)
+						trace.addOrderScanWidth(scanWidth)
+						trace.setEarlyStopReason("limit_reached")
+					}
+					return cursor.out, true
+				}
+			}
+		}
+
+		if trace != nil {
+			trace.addExamined(examined)
+			trace.addOrderScanWidth(scanWidth)
+			trace.setEarlyStopReason("input_exhausted")
+		}
+		return cursor.out, true
+	}
+
+	var activeInline [limitQueryFastPathMaxLeaves]int
+	active := activeInline[:0]
+	for i := 0; i < preds.Len(); i++ {
+		p := preds.Get(i)
 		if p.alwaysFalse {
 			if trace != nil {
 				trace.setEarlyStopReason("empty_predicate")
@@ -1367,28 +2752,13 @@ func (qv *queryView[K, V]) scanOrderLimitWithPredicates(q *qx.QX, ov fieldOverla
 	if len(active) == 0 {
 		return qv.scanOrderLimitNoPredicates(q, ov, br, desc, nilTailField, trace)
 	}
-	sortActivePredicates(active, preds)
+	sortActivePredicatesReader(active, preds)
 
-	exactActiveBuf := getIntSliceBuf(len(active))
-	exactActive := buildExactBucketPostingFilterActive(exactActiveBuf.values, active, preds)
-	defer func() {
-		exactActiveBuf.values = exactActive
-		releaseIntSliceBuf(exactActiveBuf)
-	}()
+	var exactActiveInline [limitQueryFastPathMaxLeaves]int
+	var residualActiveInline [limitQueryFastPathMaxLeaves]int
+	exactActive := buildExactBucketPostingFilterActiveReader(exactActiveInline[:0], active, preds)
+	residualActive := plannerResidualChecks(residualActiveInline[:0], active, exactActive)
 	exactOnly := len(active) > 0 && len(active) == len(exactActive)
-	residualActiveBuf := getIntSliceBuf(len(active))
-	residualActiveBuf.values = residualActiveBuf.values[:0]
-	defer func() {
-		releaseIntSliceBuf(residualActiveBuf)
-	}()
-	if len(exactActive) > 0 && len(exactActive) < len(active) {
-		for _, pi := range active {
-			if countIndexSliceContains(exactActive, pi) {
-				continue
-			}
-			residualActiveBuf.values = append(residualActiveBuf.values, pi)
-		}
-	}
 
 	out := make([]K, 0, q.Limit)
 	cursor := qv.newQueryCursor(out, q.Offset, q.Limit, false, 0)
@@ -1401,132 +2771,6 @@ func (qv *queryView[K, V]) scanOrderLimitWithPredicates(q *qx.QX, ov fieldOverla
 	var exactWork posting.List
 	defer exactWork.Release()
 
-	emitCandidate := func(idx uint64) bool {
-		examined++
-		for _, pi := range active {
-			if !preds[pi].matches(idx) {
-				return false
-			}
-		}
-		if trace != nil {
-			trace.addMatched(1)
-		}
-		return cursor.emit(idx)
-	}
-
-	emitAcceptedPosting := func(ids posting.List, card uint64) bool {
-		examined += card
-		if trace != nil {
-			trace.addMatched(card)
-		}
-		if cursor.skip >= card {
-			cursor.skip -= card
-			return false
-		}
-		stop := false
-		ids.ForEach(func(idx uint64) bool {
-			if cursor.emit(idx) {
-				stop = true
-				return false
-			}
-			return true
-		})
-		return stop
-	}
-
-	tryBucketPosting := func(ids posting.List) (current posting.List, exactApplied bool, handled bool, stop bool) {
-		if ids.IsEmpty() {
-			return posting.List{}, false, true, false
-		}
-		card := ids.Cardinality()
-		if len(active) == 0 {
-			return ids, false, true, emitAcceptedPosting(ids, card)
-		}
-		if len(exactActive) == 0 {
-			return ids, false, false, false
-		}
-
-		allowExact := plannerAllowExactBucketFilter(cursor.skip, cursor.need, card, exactOnly, len(exactActive))
-		mode, exactIDs, nextExactWork, _ := plannerFilterPostingByChecks(preds, exactActive, ids, exactWork, allowExact)
-		exactWork = nextExactWork
-		switch mode {
-		case plannerPredicateBucketEmpty:
-			examined += card
-			return posting.List{}, false, true, false
-		case plannerPredicateBucketAll:
-			if exactOnly {
-				return exactIDs, true, true, emitAcceptedPosting(exactIDs, card)
-			}
-			return exactIDs, true, false, false
-		case plannerPredicateBucketExact:
-			if trace != nil {
-				trace.addPostingExactFilter(1)
-			}
-			if exactIDs.IsEmpty() {
-				examined += card
-				return posting.List{}, true, true, false
-			}
-			if exactOnly {
-				return exactIDs, true, true, emitAcceptedPosting(exactIDs, exactIDs.Cardinality())
-			}
-			return exactIDs, true, false, false
-		default:
-			return ids, false, false, false
-		}
-	}
-
-	emitPosting := func(ids posting.List) bool {
-		if ids.IsEmpty() {
-			return false
-		}
-		if idx, ok := ids.TrySingle(); ok {
-			return emitCandidate(idx)
-		}
-
-		iterSrc := ids.Iter()
-		defer func() {
-			if iterSrc != nil {
-				iterSrc.Release()
-			}
-		}()
-		exactApplied := false
-		if len(active) == 0 || len(exactActive) > 0 {
-			if current, applied, handled, stop := tryBucketPosting(ids); handled {
-				return stop
-			} else if applied && !current.IsEmpty() {
-				iterSrc.Release()
-				iterSrc = current.Iter()
-				exactApplied = true
-			}
-		}
-
-		for iterSrc.HasNext() {
-			idx := iterSrc.Next()
-			examined++
-			checks := active
-			if exactApplied {
-				checks = residualActiveBuf.values
-			}
-			pass := true
-			for _, pi := range checks {
-				if !preds[pi].matches(idx) {
-					pass = false
-					break
-				}
-			}
-			if !pass {
-				continue
-			}
-			if trace != nil {
-				trace.addMatched(1)
-			}
-			if cursor.emit(idx) {
-				return true
-			}
-		}
-		return false
-	}
-
 	keyCur := ov.newCursor(br, desc)
 	for {
 		_, ids, ok := keyCur.next()
@@ -1536,7 +2780,20 @@ func (qv *queryView[K, V]) scanOrderLimitWithPredicates(q *qx.QX, ov fieldOverla
 		if !ids.IsEmpty() {
 			scanWidth++
 		}
-		if emitPosting(ids) {
+		stop, nextExactWork := orderPredicatesEmitPostingReader(
+			&cursor,
+			preds,
+			active,
+			exactActive,
+			residualActive,
+			exactOnly,
+			ids,
+			exactWork,
+			trace,
+			&examined,
+		)
+		exactWork = nextExactWork
+		if stop {
 			if trace != nil {
 				trace.addExamined(examined)
 				trace.addOrderScanWidth(scanWidth)
@@ -1550,7 +2807,20 @@ func (qv *queryView[K, V]) scanOrderLimitWithPredicates(q *qx.QX, ov fieldOverla
 		ids := qv.nilFieldOverlay(nilTailField).lookupPostingRetained(nilIndexEntryKey)
 		if !ids.IsEmpty() {
 			scanWidth++
-			if emitPosting(ids) {
+			stop, nextExactWork := orderPredicatesEmitPostingReader(
+				&cursor,
+				preds,
+				active,
+				exactActive,
+				residualActive,
+				exactOnly,
+				ids,
+				exactWork,
+				trace,
+				&examined,
+			)
+			exactWork = nextExactWork
+			if stop {
 				if trace != nil {
 					trace.addExamined(examined)
 					trace.addOrderScanWidth(scanWidth)
@@ -1667,7 +2937,7 @@ func (qv *queryView[K, V]) tryQueryOrderPrefixWithLimit(q *qx.QX, trace *queryTr
 		base = b
 
 	} else {
-		b, err := qv.evalExpr(qx.Expr{Op: qx.OpAND, Operands: baseOps})
+		b, err := qv.evalAndOperands(baseOps, false)
 		if err != nil {
 			return nil, true, err
 		}
@@ -1690,16 +2960,6 @@ func (qv *queryView[K, V]) tryQueryOrderPrefixWithLimit(q *qx.QX, trace *queryTr
 	out := make([]K, 0, need)
 	cursor := qv.newQueryCursor(out, skip, need, false, 0)
 
-	contains := func(idx uint64) bool {
-		if base.neg {
-			if baseNegUniverse {
-				return true // NOT empty == universe
-			}
-			return !baseBM.Contains(idx)
-		}
-		return baseBM.Contains(idx)
-	}
-
 	keyCur := ov.newCursor(br, ord.Desc)
 	var (
 		examined  uint64
@@ -1714,19 +2974,7 @@ func (qv *queryView[K, V]) tryQueryOrderPrefixWithLimit(q *qx.QX, trace *queryTr
 			continue
 		}
 		scanWidth++
-		stop := false
-		ids.ForEach(func(idx uint64) bool {
-			examined++
-			if !contains(idx) {
-				return true
-			}
-			if cursor.emit(idx) {
-				stop = true
-				return false
-			}
-			return true
-		})
-		if stop {
+		if emitOrderPrefixPostingByBase(&cursor, ids, base, baseBM, baseNegUniverse, &examined) {
 			trace.addExamined(examined)
 			trace.addOrderScanWidth(scanWidth)
 			trace.setEarlyStopReason("limit_reached")

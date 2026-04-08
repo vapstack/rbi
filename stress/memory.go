@@ -12,6 +12,21 @@ import (
 
 const procKB = 1024
 
+func applyMemorySummarySample(out *MemorySummary, s *MemorySnapshot) {
+	if s == nil {
+		return
+	}
+	out.MaxHeapAllocBytes = max(out.MaxHeapAllocBytes, s.Go.HeapAllocBytes)
+	out.MaxHeapInuseBytes = max(out.MaxHeapInuseBytes, s.Go.HeapInuseBytes)
+	out.MaxRSSBytes = max(out.MaxRSSBytes, s.Process.RSSBytes)
+	out.MaxAnonymousBytes = max(out.MaxAnonymousBytes, s.Process.AnonymousBytes)
+	out.MaxPrivateDirtyBytes = max(out.MaxPrivateDirtyBytes, s.Process.PrivateDirtyBytes)
+	out.MaxBenchDBMapRSSBytes = max(out.MaxBenchDBMapRSSBytes, s.Process.BenchDBMapRSSBytes)
+	out.MaxPinnedRefs = max(out.MaxPinnedRefs, s.Snapshot.PinnedRefs)
+	out.MaxRegistrySize = max(out.MaxRegistrySize, s.Snapshot.RegistrySize)
+	out.MaxUniverseCard = max(out.MaxUniverseCard, s.Snapshot.UniverseCard)
+}
+
 func CaptureMemorySnapshot(db *DBHandle) *MemorySnapshot {
 	snap := &MemorySnapshot{
 		CapturedAt: time.Now().Format(time.RFC3339Nano),
@@ -47,24 +62,10 @@ func summarizeMemory(samples []MemorySnapshot, final *MemorySnapshot) *MemorySum
 		return nil
 	}
 	var out MemorySummary
-	apply := func(s *MemorySnapshot) {
-		if s == nil {
-			return
-		}
-		out.MaxHeapAllocBytes = max(out.MaxHeapAllocBytes, s.Go.HeapAllocBytes)
-		out.MaxHeapInuseBytes = max(out.MaxHeapInuseBytes, s.Go.HeapInuseBytes)
-		out.MaxRSSBytes = max(out.MaxRSSBytes, s.Process.RSSBytes)
-		out.MaxAnonymousBytes = max(out.MaxAnonymousBytes, s.Process.AnonymousBytes)
-		out.MaxPrivateDirtyBytes = max(out.MaxPrivateDirtyBytes, s.Process.PrivateDirtyBytes)
-		out.MaxBenchDBMapRSSBytes = max(out.MaxBenchDBMapRSSBytes, s.Process.BenchDBMapRSSBytes)
-		out.MaxPinnedRefs = max(out.MaxPinnedRefs, s.Snapshot.PinnedRefs)
-		out.MaxRegistrySize = max(out.MaxRegistrySize, s.Snapshot.RegistrySize)
-		out.MaxUniverseCard = max(out.MaxUniverseCard, s.Snapshot.UniverseCard)
-	}
 	for i := range samples {
-		apply(&samples[i])
+		applyMemorySummarySample(&out, &samples[i])
 	}
-	apply(final)
+	applyMemorySummarySample(&out, final)
 	return &out
 }
 
@@ -104,7 +105,7 @@ func parseProcRollup(path string) (map[string]uint64, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer func() { _ = f.Close() }()
+	defer f.Close()
 
 	out := make(map[string]uint64, 8)
 	scanner := bufio.NewScanner(f)
@@ -127,7 +128,7 @@ func parseProcMapRollup(path, matchPath string) (map[string]uint64, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer func() { _ = f.Close() }()
+	defer f.Close()
 
 	out := make(map[string]uint64, 8)
 	scanner := bufio.NewScanner(f)

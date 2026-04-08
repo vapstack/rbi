@@ -2,11 +2,9 @@ package posting
 
 import (
 	"fmt"
+	"slices"
 	"sync/atomic"
 )
-
-// nextValue returns either the `target` if found or the next largest value.
-// if the target is out of bounds a -1 is returned
 
 //
 // Copyright (c) 2016 by the roaring authors.
@@ -24,14 +22,14 @@ modification, are permitted provided that the following conditions are
 met:
 
    * Redistributions of source code must retain the above copyright
-notice, this list of conditions and the following disclaimer.
+     notice, this list of conditions and the following disclaimer.
    * Redistributions in binary form must reproduce the above
-copyright notice, this list of conditions and the following disclaimer
-in the documentation and/or other materials provided with the
-distribution.
+     copyright notice, this list of conditions and the following disclaimer
+     in the documentation and/or other materials provided with the
+     distribution.
    * Neither the name of Google Inc. nor the names of its
-contributors may be used to endorse or promote products derived from
-this software without specific prior written permission.
+     contributors may be used to endorse or promote products derived from
+     this software without specific prior written permission.
 
 THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
 "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
@@ -345,10 +343,12 @@ func (iv interval16) last() uint16 {
 	return iv.start + iv.length
 }
 
-// newRunContainerRange makes a new container16 made of just the specified closed interval [rangestart,rangelast]
-func newContainerRunRange(rangestart uint16, rangelast uint16) *containerRun {
-	rc := acquireContainerRun(1, 1)
-	rc.iv[0] = newInterval16Range(rangestart, rangelast)
+// newRunContainerRange makes a new container16 made of just the specified closed interval [rangeStart,rangeLast]
+func newContainerRunRange(rangeStart uint16, rangeLast uint16) *containerRun {
+	rc := newContainerRun()
+	rc.iv = slices.Grow(rc.iv, max(1, 1))
+	rc.iv = rc.iv[:1]
+	rc.iv[0] = newInterval16Range(rangeStart, rangeLast)
 	return rc
 }
 
@@ -360,7 +360,9 @@ func newContainerRunFromBitmap(bc *containerBitmap) *containerRun {
 }
 
 func newContainerRunFromBitmapWithRuns(bc *containerBitmap, nbrRuns int) *containerRun {
-	rc := acquireContainerRun(nbrRuns, nbrRuns)
+	rc := newContainerRun()
+	rc.iv = slices.Grow(rc.iv, max(nbrRuns, nbrRuns))
+	rc.iv = rc.iv[:nbrRuns]
 	if nbrRuns == 0 {
 		return rc
 	}
@@ -416,7 +418,9 @@ func newContainerRunFromArray(arr *containerArray) *containerRun {
 }
 
 func newContainerRunFromArrayWithRuns(arr *containerArray, numRuns int) *containerRun {
-	rc := acquireContainerRun(numRuns, 0)
+	rc := newContainerRun()
+	rc.iv = slices.Grow(rc.iv, max(numRuns, 0))
+	rc.iv = rc.iv[:0]
 	n := arr.getCardinality()
 	if n == 0 {
 		return rc
@@ -521,7 +525,9 @@ func (rc *containerRun) union(b *containerRun) *containerRun {
 	// rc is also known as 'a' here, but golint insisted we
 	// call it rc for consistency with the rest of the methods.
 
-	result := acquireContainerRun(len(rc.iv)+len(b.iv), 0)
+	result := newContainerRun()
+	result.iv = slices.Grow(result.iv, max(len(rc.iv)+len(b.iv), 0))
+	result.iv = result.iv[:0]
 	m := result.iv[:0]
 
 	alim := len(rc.iv)
@@ -692,7 +698,9 @@ toploop:
 			if output == nil {
 				// One interval can intersect multiple intervals on the other side,
 				// so min(numa, numb) is not a safe bound here.
-				output = acquireContainerRun(numa+numb-1, 0)
+				output = newContainerRun()
+				output.iv = slices.Grow(output.iv, max(numa+numb-1, 0))
+				output.iv = output.iv[:0]
 			}
 			output.iv = append(output.iv, intersection)
 			switch {
@@ -1003,6 +1011,30 @@ func (rc *containerRun) isEmpty() bool {
 	return len(rc.iv) == 0
 }
 
+func (rc *containerRun) retain() container16 {
+	rc.refs.Add(1)
+	return rc
+}
+
+func (rc *containerRun) uniquelyOwned() bool {
+	return rc.refs.Load() == 1
+}
+
+func (rc *containerRun) release() {
+	if rc == nil {
+		return
+	}
+	if rc.refs.Add(-1) != 0 {
+		return
+	}
+	if cap(rc.iv) > maxPooledRunContainerCapacity {
+		return
+	}
+	runContainerPool.Put(rc)
+}
+
+func (rc *containerRun) Release() { rc.release() }
+
 // asSlice decompresses the contents into a []uint16 slice.
 func (rc *containerRun) asSlice() []uint16 {
 	s := make([]uint16, rc.getCardinality())
@@ -1012,13 +1044,15 @@ func (rc *containerRun) asSlice() []uint16 {
 
 // newContainerRun creates an empty containerRun.
 func newContainerRun() *containerRun {
-	return acquireContainerRun(0, 0)
+	return runContainerPool.Get()
 }
 
 // newContainerRunCopyIv creates a containerRun, initializing
 // with a copy of the supplied iv slice.
 func newContainerRunCopyIv(iv []interval16) *containerRun {
-	rc := acquireContainerRun(len(iv), len(iv))
+	rc := newContainerRun()
+	rc.iv = slices.Grow(rc.iv, len(iv))
+	rc.iv = rc.iv[:len(iv)]
 	copy(rc.iv, iv)
 	return rc
 }
@@ -1032,7 +1066,7 @@ func (rc *containerRun) cloneRun() *containerRun {
 // backed by the provided iv slice, which we will
 // assume exclusive control over from now on.
 func newContainerRunTakeOwnership(iv []interval16) *containerRun {
-	rc := acquireContainerRun(0, 0)
+	rc := newContainerRun()
 	rc.iv = iv
 	return rc
 }
@@ -1200,6 +1234,8 @@ func (ri *runIterator16) advanceIfNeeded(minval uint16) {
 		ri.curPosInIndex = 0
 	}
 }
+
+func (*runIterator16) release() {}
 
 func (rc *containerRun) newRunManyIterator() *runIterator16 {
 	return rc.newRunIterator()
@@ -1427,21 +1463,29 @@ func (rc *containerRun) invert() *containerRun {
 		case cur.start == 0 && cur.last() == MaxUint16:
 			return newContainerRun()
 		case cur.start == 0:
-			result := acquireContainerRun(1, 1)
+			result := newContainerRun()
+			result.iv = slices.Grow(result.iv, max(1, 1))
+			result.iv = result.iv[:1]
 			result.iv[0] = newInterval16Range(cur.last()+1, MaxUint16)
 			return result
 		case cur.last() == MaxUint16:
-			result := acquireContainerRun(1, 1)
+			result := newContainerRun()
+			result.iv = slices.Grow(result.iv, max(1, 1))
+			result.iv = result.iv[:1]
 			result.iv[0] = newInterval16Range(0, cur.start-1)
 			return result
 		default:
-			result := acquireContainerRun(2, 2)
+			result := newContainerRun()
+			result.iv = slices.Grow(result.iv, max(2, 2))
+			result.iv = result.iv[:2]
 			result.iv[0] = newInterval16Range(0, cur.start-1)
 			result.iv[1] = newInterval16Range(cur.last()+1, MaxUint16)
 			return result
 		}
 	}
-	result := acquireContainerRun(ni+1, 0)
+	result := newContainerRun()
+	result.iv = slices.Grow(result.iv, max(ni+1, 0))
+	result.iv = result.iv[:0]
 	invstart := uint16(0)
 	ult := ni - 1
 	for i, cur := range rc.iv {
@@ -1646,7 +1690,9 @@ func (rc *containerRun) andNotRunCopy(b *containerRun) *containerRun {
 		return rc.cloneRun()
 	}
 
-	dst := acquireContainerRun(len(rc.iv), 0)
+	dst := newContainerRun()
+	dst.iv = slices.Grow(dst.iv, max(len(rc.iv), 0))
+	dst.iv = dst.iv[:0]
 	apos := 0
 	bpos := 0
 
@@ -1826,11 +1872,11 @@ func (rc *containerRun) inplaceIntersect(rc2 *containerRun) *containerRun {
 
 func (rc *containerRun) andArray(ac *containerArray) container16 {
 	if len(rc.iv) == 0 {
-		return newContainerArray()
+		return getContainerArray()
 	}
 
 	acCardinality := ac.getCardinality()
-	c := newContainerArrayCapacity(acCardinality)
+	c := getContainerArrayWithCap(acCardinality)
 
 	for rlePos, arrayPos := 0, 0; arrayPos < acCardinality; {
 		iv := rc.iv[rlePos]
@@ -1963,7 +2009,9 @@ func (rc *containerRun) notCopy(firstOfRange, endx int) *containerRun {
 	if firstOfRange >= endx {
 		return rc.cloneRun()
 	}
-	result := acquireContainerRun(len(rc.iv)+1, 0)
+	result := newContainerRun()
+	result.iv = slices.Grow(result.iv, max(len(rc.iv)+1, 0))
+	result.iv = result.iv[:0]
 	result.iv, _ = flipRunRangeInto(result.iv[:0], rc.iv, firstOfRange, endx)
 	return result
 }
@@ -2065,7 +2113,9 @@ func (rc *containerRun) orArray(ac *containerArray) container16 {
 	if rc.isEmpty() {
 		return ac.clone()
 	}
-	result := acquireContainerRun(len(rc.iv)+len(ac.content), 0)
+	result := newContainerRun()
+	result.iv = slices.Grow(result.iv, max(len(rc.iv)+len(ac.content), 0))
+	result.iv = result.iv[:0]
 	var cardminusone uint16
 	result.iv, cardminusone = runArrayUnionToRuns(rc.iv, ac, result.iv[:0])
 	return efficientContainerFromTempRun(result, int(cardminusone)+1)
@@ -2108,14 +2158,16 @@ func (rc *containerRun) iorArray(ac *containerArray) container16 {
 		copy(buf[len(ac.content):], buf[:origLen])
 		rc.iv, cardMinusOne = runArrayUnionToRuns(buf[len(ac.content):len(ac.content)+origLen], ac, buf[:0])
 	} else {
-		donor := acquireContainerRun(maxIntervals, 0)
+		donor := newContainerRun()
+		donor.iv = slices.Grow(donor.iv, max(maxIntervals, 0))
+		donor.iv = donor.iv[:0]
 		donor.iv, cardMinusOne = runArrayUnionToRuns(rc.iv, ac, donor.iv[:0])
 		answer := donor.toEfficientContainerFromCardinality(int(cardMinusOne) + 1)
 		if runrc, ok := answer.(*containerRun); ok {
 			replaceContainerRunStorage(rc, runrc)
 			return rc
 		}
-		releaseContainerRun(donor)
+		donor.release()
 		return answer
 	}
 	return rc.toEfficientContainerFromCardinality(int(cardMinusOne) + 1)
@@ -2320,7 +2372,9 @@ func (rc *containerRun) inot(firstOfRange, endx int) container16 {
 		return rc.toEfficientContainerFromCardinality(cardinality)
 	}
 
-	donor := acquireContainerRun(oldLen+1, 0)
+	donor := newContainerRun()
+	donor.iv = slices.Grow(donor.iv, max(oldLen+1, 0))
+	donor.iv = donor.iv[:0]
 	var cardinality int
 	donor.iv, cardinality = flipRunRangeInto(donor.iv[:0], rc.iv, firstOfRange, endx)
 	answer := donor.toEfficientContainerFromCardinality(cardinality)
@@ -2328,7 +2382,7 @@ func (rc *containerRun) inot(firstOfRange, endx int) container16 {
 		replaceContainerRunStorage(rc, runrc)
 		return rc
 	}
-	releaseContainerRun(donor)
+	donor.release()
 	return answer
 }
 
@@ -2336,22 +2390,14 @@ func (rc *containerRun) andNotRun(b *containerRun) container16 {
 	return rc.andNotRunCopy(b)
 }
 
-func releaseTempRunUnlessReturned(temp *containerRun, result container16) {
-	if temp == nil {
-		return
-	}
-	if returned, ok := result.(*containerRun); ok && returned == temp {
-		return
-	}
-	releaseContainerRun(temp)
-}
-
 func efficientContainerFromTempRun(temp *containerRun, card int) container16 {
 	if temp == nil {
 		return nil
 	}
 	result := temp.toEfficientContainerFromCardinality(card)
-	releaseTempRunUnlessReturned(temp, result)
+	if returned, ok := result.(*containerRun); !ok || returned != temp {
+		temp.release()
+	}
 	return result
 }
 
@@ -2360,12 +2406,16 @@ func efficientContainerFromTempRunAuto(temp *containerRun) container16 {
 		return nil
 	}
 	result := temp.toEfficientContainer()
-	releaseTempRunUnlessReturned(temp, result)
+	if returned, ok := result.(*containerRun); !ok || returned != temp {
+		temp.release()
+	}
 	return result
 }
 
 func (rc *containerRun) andNotArrayToRun(ac *containerArray) (*containerRun, int) {
-	result := acquireContainerRun(len(rc.iv)+len(ac.content), 0)
+	result := newContainerRun()
+	result.iv = slices.Grow(result.iv, max(len(rc.iv)+len(ac.content), 0))
+	result.iv = result.iv[:0]
 	target := result.iv[:0]
 	cardinality := 0
 	arrayPos := 0
@@ -2403,7 +2453,9 @@ func (rc *containerRun) andNotArrayToRun(ac *containerArray) (*containerRun, int
 }
 
 func (rc *containerRun) andNotBitmapToRun(bc *containerBitmap) (*containerRun, int) {
-	result := acquireContainerRun(len(rc.iv), 0)
+	result := newContainerRun()
+	result.iv = slices.Grow(result.iv, max(len(rc.iv), 0))
+	result.iv = result.iv[:0]
 	target := result.iv[:0]
 	cardinality := 0
 
@@ -2433,7 +2485,7 @@ func (rc *containerRun) andNotBitmapToRun(bc *containerBitmap) (*containerRun, i
 
 func (rc *containerRun) andNotArray(ac *containerArray) container16 {
 	if rc.isEmpty() {
-		return newContainerArray()
+		return getContainerArray()
 	}
 	if ac.isEmpty() {
 		return rc.clone()
@@ -2444,7 +2496,7 @@ func (rc *containerRun) andNotArray(ac *containerArray) container16 {
 
 func (rc *containerRun) andNotBitmap(bc *containerBitmap) container16 {
 	if rc.isEmpty() {
-		return newContainerArray()
+		return getContainerArray()
 	}
 	if bc.isEmpty() {
 		return rc.clone()
@@ -2472,7 +2524,7 @@ func (rc *containerRun) iandNotArray(ac *containerArray) container16 {
 	}
 	result, cardinality := rc.andNotArrayToRun(ac)
 	if cardinality == 0 {
-		releaseContainerRun(result)
+		result.release()
 		rc.iv = rc.iv[:0]
 		return rc
 	}
@@ -2481,7 +2533,7 @@ func (rc *containerRun) iandNotArray(ac *containerArray) container16 {
 		replaceContainerRunStorage(rc, runrc)
 		return rc
 	}
-	releaseContainerRun(result)
+	result.release()
 	return answer
 }
 
@@ -2491,7 +2543,7 @@ func (rc *containerRun) iandNotBitmap(bc *containerBitmap) container16 {
 	}
 	result, cardinality := rc.andNotBitmapToRun(bc)
 	if cardinality == 0 {
-		releaseContainerRun(result)
+		result.release()
 		rc.iv = rc.iv[:0]
 		return rc
 	}
@@ -2500,7 +2552,7 @@ func (rc *containerRun) iandNotBitmap(bc *containerBitmap) container16 {
 		replaceContainerRunStorage(rc, runrc)
 		return rc
 	}
-	releaseContainerRun(result)
+	result.release()
 	return answer
 }
 
@@ -2512,7 +2564,9 @@ func (rc *containerRun) xorRun(x2 *containerRun) container16 {
 		return efficientContainerFromTempRunAuto(rc.cloneRun())
 	}
 
-	result := acquireContainerRun(len(rc.iv)+len(x2.iv), 0)
+	result := newContainerRun()
+	result.iv = slices.Grow(result.iv, max(len(rc.iv)+len(x2.iv), 0))
+	result.iv = result.iv[:0]
 	var cardinality int
 	result.iv, cardinality = xorRunsToRun(rc.iv, x2.iv, result.iv[:0])
 	return efficientContainerFromTempRun(result, cardinality)
@@ -2526,7 +2580,9 @@ func (rc *containerRun) xorArray(ac *containerArray) container16 {
 		return rc.clone()
 	}
 
-	result := acquireContainerRun(len(rc.iv)+len(ac.content), 0)
+	result := newContainerRun()
+	result.iv = slices.Grow(result.iv, max(len(rc.iv)+len(ac.content), 0))
+	result.iv = result.iv[:0]
 	var cardinality int
 	result.iv, cardinality = runArrayXorToRuns(rc.iv, ac.content, result.iv[:0])
 	return efficientContainerFromTempRun(result, cardinality)
@@ -2571,13 +2627,13 @@ func (rc *containerRun) toEfficientContainerFromCardinality(card int) container1
 }
 
 func (rc *containerRun) toArrayContainer() *containerArray {
-	ac := newContainerArraySize(rc.getCardinality())
+	ac := getContainerArrayWithLen(rc.getCardinality())
 	fillArrayFromRuns(ac.content, rc.iv)
 	return ac
 }
 
 func (rc *containerRun) toArrayContainerFromCardinality(card int) *containerArray {
-	ac := newContainerArraySize(card)
+	ac := getContainerArrayWithLen(card)
 	fillArrayFromRuns(ac.content, rc.iv)
 	return ac
 }

@@ -10,20 +10,14 @@ import (
 
 const numericRangeFullSpanCacheMaxEntries = 4
 
-type numericRangeBucket struct {
-	start int
-	end   int
-}
-
 type numericRangeBucketIndex struct {
 	bucketSize int
 	keyCount   int
-	buckets    []numericRangeBucket
 }
 
 type numericRangeBucketCacheEntry struct {
 	storage       fieldIndexStorage
-	idx           *numericRangeBucketIndex
+	idx           numericRangeBucketIndex
 	maxCard       uint64
 	fullSpanCache sync.Map
 	fullSpanCount atomic.Int32
@@ -110,7 +104,7 @@ func (e *numericRangeBucketCacheEntry) tryStoreFullSpan(start, end int, ids post
 }
 
 func (idx *numericRangeBucketIndex) fullBucketSpan(br overlayRange) (start, end int, ok bool) {
-	if idx == nil || idx.bucketSize <= 0 || len(idx.buckets) == 0 {
+	if idx == nil || idx.bucketSize <= 0 || idx.keyCount <= 0 {
 		return 0, 0, false
 	}
 	if br.baseStart < 0 || br.baseStart >= br.baseEnd {
@@ -122,25 +116,48 @@ func (idx *numericRangeBucketIndex) fullBucketSpan(br overlayRange) (start, end 
 	if startBucket < 0 {
 		startBucket = 0
 	}
-	if endBucket >= len(idx.buckets) {
-		endBucket = len(idx.buckets) - 1
+	lastBucket := idx.bucketCount() - 1
+	if lastBucket < 0 {
+		return 0, 0, false
+	}
+	if endBucket > lastBucket {
+		endBucket = lastBucket
 	}
 	if startBucket > endBucket {
 		return 0, 0, false
 	}
 
 	start = startBucket
-	if idx.buckets[start].start < br.baseStart {
+	if idx.bucketStart(start) < br.baseStart {
 		start++
 	}
 	end = endBucket
-	if end >= 0 && idx.buckets[end].end > br.baseEnd {
+	if end >= 0 && idx.bucketEnd(end) > br.baseEnd {
 		end--
 	}
 	if start > end {
 		return 0, 0, false
 	}
 	return start, end, true
+}
+
+func (idx *numericRangeBucketIndex) bucketCount() int {
+	if idx == nil || idx.bucketSize <= 0 || idx.keyCount <= 0 {
+		return 0
+	}
+	return (idx.keyCount + idx.bucketSize - 1) / idx.bucketSize
+}
+
+func (idx *numericRangeBucketIndex) bucketStart(bucket int) int {
+	return bucket * idx.bucketSize
+}
+
+func (idx *numericRangeBucketIndex) bucketEnd(bucket int) int {
+	end := (bucket + 1) * idx.bucketSize
+	if end > idx.keyCount {
+		return idx.keyCount
+	}
+	return end
 }
 
 func satAddUint64(total, add uint64) uint64 {
@@ -150,21 +167,77 @@ func satAddUint64(total, add uint64) uint64 {
 	return total + add
 }
 
-func mergeOverlayRangeInto(dst posting.List, ov fieldOverlay, br overlayRange) posting.List {
+func overlayRangeSpanLen(br overlayRange) int {
 	if br.baseStart >= br.baseEnd {
-		return dst
+		return 0
+	}
+	return br.baseEnd - br.baseStart
+}
+
+func appendOverlayRangeUnion(builder *postingUnionBuilder, ov fieldOverlay, br overlayRange) {
+	if builder == nil || overlayRangeEmpty(br) {
+		return
 	}
 	cur := ov.newCursor(br, false)
 	for {
 		_, ids, ok := cur.next()
 		if !ok {
-			return dst
+			break
 		}
 		if ids.IsEmpty() {
 			continue
 		}
-		dst = dst.BuildOr(ids)
+		builder.addPosting(ids)
 	}
+}
+
+func overlayUnionBatchSinglesEnabled(ov fieldOverlay, first, second overlayRange) bool {
+	totalSpan := overlayRangeSpanLen(first) + overlayRangeSpanLen(second)
+	if totalSpan == 0 {
+		return false
+	}
+	if totalSpan <= singleAdaptiveMaxLen {
+		return true
+	}
+	if ov.chunked == nil {
+		return false
+	}
+	_, estFirst := overlayRangeStats(ov, first)
+	_, estSecond := overlayRangeStats(ov, second)
+	return postingBatchSinglesEnabled(satAddUint64(estFirst, estSecond))
+}
+
+func overlayUnionRanges(ov fieldOverlay, first, second overlayRange) posting.List {
+	if overlayRangeEmpty(first) && overlayRangeEmpty(second) {
+		return posting.List{}
+	}
+	builder := newPostingUnionBuilder(overlayUnionBatchSinglesEnabled(ov, first, second))
+	defer builder.release()
+	appendOverlayRangeUnion(&builder, ov, first)
+	appendOverlayRangeUnion(&builder, ov, second)
+	return builder.finish(true)
+}
+
+func mergeOverlayRangesInto(dst posting.List, ov fieldOverlay, first, second overlayRange) posting.List {
+	totalSpan := overlayRangeSpanLen(first) + overlayRangeSpanLen(second)
+	if totalSpan == 0 {
+		return dst
+	}
+	const mergeOverlayRangeDirectMaxBuckets = 32
+	builder := newPostingUnionBuilder(totalSpan <= singleAdaptiveMaxLen)
+	if !dst.IsEmpty() && totalSpan > mergeOverlayRangeDirectMaxBuckets {
+		appendOverlayRangeUnion(&builder, ov, first)
+		appendOverlayRangeUnion(&builder, ov, second)
+		return dst.BuildMergedOwned(builder.finish(false))
+	}
+	builder.ids = dst
+	appendOverlayRangeUnion(&builder, ov, first)
+	appendOverlayRangeUnion(&builder, ov, second)
+	return builder.finish(false)
+}
+
+func mergeOverlayRangeInto(dst posting.List, ov fieldOverlay, br overlayRange) posting.List {
+	return mergeOverlayRangesInto(dst, ov, br, overlayRange{})
 }
 
 func isNumericScalarKind(kind reflect.Kind) bool {
@@ -178,69 +251,45 @@ func isNumericScalarKind(kind reflect.Kind) bool {
 	}
 }
 
-func buildNumericRangeBucketIndex(base []index, bucketSize, minFieldKeys int) *numericRangeBucketIndex {
+func buildNumericRangeBucketIndex(base []index, bucketSize, minFieldKeys int) (numericRangeBucketIndex, bool) {
 	if bucketSize <= 0 || minFieldKeys <= 0 {
-		return nil
+		return numericRangeBucketIndex{}, false
 	}
 	if len(base) < minFieldKeys {
-		return nil
+		return numericRangeBucketIndex{}, false
 	}
 	if bucketSize < 16 {
 		bucketSize = 16
 	}
 
-	bucketCount := (len(base) + bucketSize - 1) / bucketSize
-	out := &numericRangeBucketIndex{
+	return numericRangeBucketIndex{
 		bucketSize: bucketSize,
 		keyCount:   len(base),
-		buckets:    make([]numericRangeBucket, 0, bucketCount),
-	}
-
-	for start := 0; start < len(base); start += bucketSize {
-		end := min(start+bucketSize, len(base))
-
-		out.buckets = append(out.buckets, numericRangeBucket{
-			start: start,
-			end:   end,
-		})
-	}
-
-	return out
+	}, true
 }
 
-func buildNumericRangeBucketIndexOverlay(ov fieldOverlay, bucketSize, minFieldKeys int) *numericRangeBucketIndex {
+func buildNumericRangeBucketIndexOverlay(ov fieldOverlay, bucketSize, minFieldKeys int) (numericRangeBucketIndex, bool) {
 	if !ov.hasData() {
-		return nil
+		return numericRangeBucketIndex{}, false
 	}
 	if ov.chunked == nil {
 		return buildNumericRangeBucketIndex(ov.base, bucketSize, minFieldKeys)
 	}
 	if bucketSize <= 0 || minFieldKeys <= 0 {
-		return nil
+		return numericRangeBucketIndex{}, false
 	}
 	if ov.keyCount() < minFieldKeys {
-		return nil
+		return numericRangeBucketIndex{}, false
 	}
 	if bucketSize < 16 {
 		bucketSize = 16
 	}
 
 	keyCount := ov.keyCount()
-	bucketCount := (keyCount + bucketSize - 1) / bucketSize
-	out := &numericRangeBucketIndex{
+	return numericRangeBucketIndex{
 		bucketSize: bucketSize,
 		keyCount:   keyCount,
-		buckets:    make([]numericRangeBucket, 0, bucketCount),
-	}
-	for start := 0; start < keyCount; start += bucketSize {
-		end := min(start+bucketSize, keyCount)
-
-		out.buckets = append(out.buckets, numericRangeBucket{
-			start: start,
-			end:   end,
-		})
-	}
-	return out
+	}, true
 }
 
 func (s *indexSnapshot) getNumericRangeBucketCacheEntry(field string, storage fieldIndexStorage, bucketSize, minFieldKeys int) *numericRangeBucketCacheEntry {
@@ -250,9 +299,10 @@ func (s *indexSnapshot) getNumericRangeBucketCacheEntry(field string, storage fi
 	ov := newFieldOverlayStorage(storage)
 	cache := s.numericRangeBucketCache
 	if cache == nil {
+		idx, _ := buildNumericRangeBucketIndexOverlay(ov, bucketSize, minFieldKeys)
 		return &numericRangeBucketCacheEntry{
 			storage: storage,
-			idx:     buildNumericRangeBucketIndexOverlay(ov, bucketSize, minFieldKeys),
+			idx:     idx,
 			maxCard: s.matPredCacheMaxCard,
 		}
 	}
@@ -263,9 +313,10 @@ func (s *indexSnapshot) getNumericRangeBucketCacheEntry(field string, storage fi
 		}
 	}
 
+	idx, _ := buildNumericRangeBucketIndexOverlay(ov, bucketSize, minFieldKeys)
 	entry := &numericRangeBucketCacheEntry{
 		storage: storage,
-		idx:     buildNumericRangeBucketIndexOverlay(ov, bucketSize, minFieldKeys),
+		idx:     idx,
 		maxCard: s.matPredCacheMaxCard,
 	}
 	if actual, loaded := cache.LoadOrStore(field, entry); loaded {
@@ -305,11 +356,11 @@ func (qv *queryView[K, V]) tryEvalNumericRangeBuckets(field string, fm *field, o
 		return postingResult{}, false
 	}
 	entry := qv.snap.getNumericRangeBucketCacheEntry(field, storage, bucketSize, minFieldKeys)
-	if entry == nil || entry.idx == nil {
+	if entry == nil {
 		return postingResult{}, false
 	}
-	idx := entry.idx
-	if idx == nil || idx.bucketSize <= 0 || len(idx.buckets) == 0 {
+	idx := &entry.idx
+	if idx.bucketSize <= 0 || idx.bucketCount() == 0 {
 		return postingResult{}, false
 	}
 
@@ -324,7 +375,7 @@ func (qv *queryView[K, V]) tryEvalNumericRangeBuckets(field string, fm *field, o
 
 	fullSpanReuse := newMaterializedPredReadOnlyReuse(
 		qv.snap,
-		materializedPredCacheKeyForNumericBucketSpan(field, startFull, endFull),
+		materializedPredKeyForNumericBucketSpan(field, startFull, endFull),
 	)
 
 	var res posting.List
@@ -337,15 +388,19 @@ func (qv *queryView[K, V]) tryEvalNumericRangeBuckets(field string, fm *field, o
 		}
 	}
 	if res.IsEmpty() {
-		res = mergeOverlayRangeInto(res, ov, ov.rangeByRanks(idx.buckets[startFull].start, idx.buckets[endFull].end))
+		res = mergeOverlayRangeInto(res, ov, ov.rangeByRanks(idx.bucketStart(startFull), idx.bucketEnd(endFull)))
 		res, _ = entry.tryStoreFullSpan(startFull, endFull, res)
 	}
 
-	leftEnd := min(br.baseEnd, idx.buckets[startFull].start)
-	rightStart := max(br.baseStart, idx.buckets[endFull].end)
+	leftEnd := min(br.baseEnd, idx.bucketStart(startFull))
+	rightStart := max(br.baseStart, idx.bucketEnd(endFull))
 	if (leftEnd > br.baseStart) || (rightStart < br.baseEnd) {
-		res = mergeOverlayRangeInto(res, ov, ov.rangeByRanks(br.baseStart, leftEnd))
-		res = mergeOverlayRangeInto(res, ov, ov.rangeByRanks(rightStart, br.baseEnd))
+		res = mergeOverlayRangesInto(
+			res,
+			ov,
+			ov.rangeByRanks(br.baseStart, leftEnd),
+			ov.rangeByRanks(rightStart, br.baseEnd),
+		)
 	}
 
 	return postingResult{ids: res}, true
@@ -375,11 +430,11 @@ func (qv *queryView[K, V]) tryLoadNumericRangeBuckets(field string, fm *field, o
 		return postingResult{}, false
 	}
 	entry := qv.snap.getNumericRangeBucketCacheEntry(field, storage, bucketSize, minFieldKeys)
-	if entry == nil || entry.idx == nil {
+	if entry == nil {
 		return postingResult{}, false
 	}
-	idx := entry.idx
-	if idx == nil || idx.bucketSize <= 0 || len(idx.buckets) == 0 {
+	idx := &entry.idx
+	if idx.bucketSize <= 0 || idx.bucketCount() == 0 {
 		return postingResult{}, false
 	}
 	if idx.keyCount != ov.keyCount() {
@@ -393,7 +448,7 @@ func (qv *queryView[K, V]) tryLoadNumericRangeBuckets(field string, fm *field, o
 
 	fullSpanReuse := newMaterializedPredReadOnlyReuse(
 		qv.snap,
-		materializedPredCacheKeyForNumericBucketSpan(field, startFull, endFull),
+		materializedPredKeyForNumericBucketSpan(field, startFull, endFull),
 	)
 
 	var res posting.List
@@ -409,11 +464,15 @@ func (qv *queryView[K, V]) tryLoadNumericRangeBuckets(field string, fm *field, o
 		return postingResult{}, false
 	}
 
-	leftEnd := min(br.baseEnd, idx.buckets[startFull].start)
-	rightStart := max(br.baseStart, idx.buckets[endFull].end)
+	leftEnd := min(br.baseEnd, idx.bucketStart(startFull))
+	rightStart := max(br.baseStart, idx.bucketEnd(endFull))
 	if (leftEnd > br.baseStart) || (rightStart < br.baseEnd) {
-		res = mergeOverlayRangeInto(res, ov, ov.rangeByRanks(br.baseStart, leftEnd))
-		res = mergeOverlayRangeInto(res, ov, ov.rangeByRanks(rightStart, br.baseEnd))
+		res = mergeOverlayRangesInto(
+			res,
+			ov,
+			ov.rangeByRanks(br.baseStart, leftEnd),
+			ov.rangeByRanks(rightStart, br.baseEnd),
+		)
 	}
 
 	return postingResult{ids: res}, true

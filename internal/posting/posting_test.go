@@ -326,51 +326,51 @@ func TestReadFromReusedReceiverReleasesPreviousSmallPayload(t *testing.T) {
 
 func TestCompactPostingPools_ReacquireCanonicalState(t *testing.T) {
 	t.Run("SmallPosting", func(t *testing.T) {
-		sp := acquireSmallPosting()
+		sp := smallSetPool.Get()
 		sp.n = 3
 		sp.ids[0] = 11
 		sp.ids[1] = 22
 		sp.ids[2] = 33
-		releaseSmallPosting(sp)
+		sp.Release()
 
-		reused := acquireSmallPosting()
+		reused := smallSetPool.Get()
 		if !testRaceEnabled && reused != sp {
 			t.Fatalf("small posting pool did not reuse instance")
 		}
 		if reused.n != 0 {
 			t.Fatalf("reacquired small posting not in canonical state: n=%d", reused.n)
 		}
-		releaseSmallPosting(reused)
+		reused.Release()
 	})
 
 	t.Run("MidPosting", func(t *testing.T) {
-		mp := acquireMidPosting()
+		mp := midSetPool.Get()
 		mp.n = 5
 		mp.ids[0] = 5
 		mp.ids[1] = 10
 		mp.ids[2] = 15
 		mp.ids[3] = 20
 		mp.ids[4] = 25
-		releaseMidPosting(mp)
+		mp.Release()
 
-		reused := acquireMidPosting()
+		reused := midSetPool.Get()
 		if !testRaceEnabled && reused != mp {
 			t.Fatalf("mid posting pool did not reuse instance")
 		}
 		if reused.n != 0 {
 			t.Fatalf("reacquired mid posting not in canonical state: n=%d", reused.n)
 		}
-		releaseMidPosting(reused)
+		reused.Release()
 	})
 }
 
 func TestCompactPostingIteratorPool_ReacquireCanonicalState(t *testing.T) {
-	it := getArrayIter()
+	it := compactPostingIterPool.Get()
 	it.ids = []uint64{3, 7, 11}
 	it.i = 2
 	it.Release()
 
-	reused := getArrayIter()
+	reused := compactPostingIterPool.Get()
 	if !testRaceEnabled && reused != it {
 		t.Fatalf("compact posting iterator pool did not reuse iterator")
 	}
@@ -644,14 +644,14 @@ func TestBorrowedMutationInvariant_SourceRemainsStable(t *testing.T) {
 }
 
 func TestLargePostingPoolReleaseDoesNotCorruptSharedClone(t *testing.T) {
-	src := getLargePosting()
+	src := largePostingPool.Get()
 	src.add(1)
 	src.add(2)
 	src.add(uint64(1)<<32 | 7)
 	src.add(uint64(2)<<32 | 11)
 
-	clone := cloneLargeShared(src)
-	releaseLargePosting(src)
+	clone := src.cloneSharedInto(largePostingPool.Get())
+	src.Release()
 
 	if !clone.contains(1) || !clone.contains(2) || !clone.contains(uint64(1)<<32|7) || !clone.contains(uint64(2)<<32|11) {
 		t.Fatalf("shared clone lost data after source was returned to pool")
@@ -662,10 +662,10 @@ func TestLargePostingPoolReleaseDoesNotCorruptSharedClone(t *testing.T) {
 		t.Fatalf("clone mutation failed after pooled source release")
 	}
 
-	releaseLargePosting(clone)
+	clone.Release()
 
-	reused := getLargePosting()
-	defer releaseLargePosting(reused)
+	reused := largePostingPool.Get()
+	defer reused.Release()
 	if !reused.isEmpty() {
 		t.Fatalf("reused large posting is not empty")
 	}
@@ -1028,20 +1028,24 @@ func TestListAddManyUnsortedLargeBatchDetachesBorrowedLarge(t *testing.T) {
 }
 
 func TestListFromLargeOwnedHelpers(t *testing.T) {
-	emptyLarge := getLargePosting()
-	defer releaseLargePosting(emptyLarge)
+	emptyLarge := largePostingPool.Get()
 	if got := fromLargeOwned(emptyLarge); !got.IsEmpty() {
 		t.Fatalf("fromLargeOwned(empty) must return empty list")
 	}
+	reusedEmpty := largePostingPool.Get()
+	defer reusedEmpty.Release()
+	if !testRaceEnabled && reusedEmpty != emptyLarge {
+		t.Fatalf("fromLargeOwned(empty) did not return large payload to pool")
+	}
 
-	singleLarge := getLargePosting()
+	singleLarge := largePostingPool.Get()
 	singleLarge.add(77)
 	gotSingle := fromLargeOwned(singleLarge)
 	if id, ok := gotSingle.TrySingle(); !ok || id != 77 {
 		t.Fatalf("fromLargeOwned(single) mismatch: got=%d ok=%v", id, ok)
 	}
 
-	smallLarge := getLargePosting()
+	smallLarge := largePostingPool.Get()
 	smallLarge.addMany([]uint64{1, 3, 5, 7})
 	gotSmall := fromLargeOwned(smallLarge)
 	defer gotSmall.Release()
@@ -1596,10 +1600,8 @@ func TestBorrowedReceiverSetOpsAndMergeOwnedDetach(t *testing.T) {
 			t.Fatalf("MergeOwned on borrowed small dst still shares payload with base")
 		}
 
-		reused := postingFromIDs(21, 23, 25, 27)
-		defer reused.Release()
-		if !testRaceEnabled && reused.small() != addPtr {
-			t.Fatalf("MergeOwned did not release merged small payload")
+		if addPtr.n != 0 {
+			t.Fatalf("MergeOwned did not clear merged small payload")
 		}
 	})
 
@@ -1625,10 +1627,8 @@ func TestBorrowedReceiverSetOpsAndMergeOwnedDetach(t *testing.T) {
 			t.Fatalf("MergeOwned on borrowed large dst still shares payload with base")
 		}
 
-		reused := getLargePosting()
-		defer releaseLargePosting(reused)
-		if !testRaceEnabled && reused != addPtr {
-			t.Fatalf("MergeOwned did not release merged large payload")
+		if !addPtr.isEmpty() {
+			t.Fatalf("MergeOwned did not clear merged large payload")
 		}
 	})
 }
@@ -2591,7 +2591,7 @@ func TestListOptimizeBorrowedLargeCollapsesToCompactRepresentations(t *testing.T
 
 func TestSkipLargeRejectsInvalidPayloads(t *testing.T) {
 	lp := largePostingOf(1, 3, 5, 7, 1<<32|9)
-	defer releaseLargePosting(lp)
+	defer lp.Release()
 
 	var payload bytes.Buffer
 	writer := bufio.NewWriter(&payload)

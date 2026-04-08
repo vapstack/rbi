@@ -7,6 +7,36 @@ type containerArray struct {
 	content []uint16
 }
 
+func (ac *containerArray) retain() container16 {
+	ac.refs.Add(1)
+	return ac
+}
+
+func (ac *containerArray) uniquelyOwned() bool {
+	return ac.refs.Load() == 1
+}
+
+func (ac *containerArray) release() {
+	if ac == nil {
+		return
+	}
+	if ac.refs.Add(-1) != 0 {
+		return
+	}
+	capacity := cap(ac.content)
+	if capacity > maxContainerArrayPoolCapacity {
+		return
+	}
+	clear(ac.content)
+	idx := containerArrayPoolPutIndex(capacity)
+	if idx < 0 {
+		return
+	}
+	containerArrayClassPools[idx].Put(ac)
+}
+
+func (ac *containerArray) Release() { ac.release() }
+
 func (ac *containerArray) fillLeastSignificant16bits(x []uint32, i int, mask uint32) int {
 	if i < 0 {
 		panic("negative index")
@@ -80,7 +110,7 @@ func (ac *containerArray) iaddRange(firstOfRange, endx int) container16 {
 		return a.iaddRange(firstOfRange, endx)
 	}
 	if cap(ac.content) < newcardinality {
-		donor := newContainerArraySize(newcardinality)
+		donor := getContainerArrayWithLen(newcardinality)
 		copy(donor.content[:indexstart], ac.content[:indexstart])
 		copy(donor.content[indexstart+rangelength:], ac.content[indexend:])
 		replaceContainerArrayStorage(ac, donor)
@@ -148,10 +178,12 @@ func (ac *containerArray) notClose(firstOfRange, lastOfRange int) container16 {
 	if newCardinality > arrayDefaultMaxSize {
 		bc := ac.toBitmapContainer()
 		result := bc.inot(firstOfRange, lastOfRange+1)
-		releaseTempBitmapUnlessReturned(bc, result)
+		if returned, ok := result.(*containerBitmap); !ok || returned != bc {
+			bc.release()
+		}
 		return result
 	}
-	answer := newContainerArraySize(newCardinality)
+	answer := getContainerArrayWithLen(newCardinality)
 
 	copy(answer.content, ac.content[:startIndex])
 	outPos := startIndex
@@ -214,7 +246,7 @@ func (ac *containerArray) toBitmapContainer() *containerBitmap {
 func (ac *containerArray) appendValue(v uint16) {
 	oldLen := len(ac.content)
 	if cap(ac.content) < oldLen+1 {
-		donor := newContainerArraySize(oldLen + 1)
+		donor := getContainerArrayWithLen(oldLen + 1)
 		copy(donor.content[:oldLen], ac.content)
 		donor.content[oldLen] = v
 		replaceContainerArrayStorage(ac, donor)
@@ -227,7 +259,7 @@ func (ac *containerArray) appendValue(v uint16) {
 func (ac *containerArray) insertValue(idx int, v uint16) {
 	oldLen := len(ac.content)
 	if cap(ac.content) < oldLen+1 {
-		donor := newContainerArraySize(oldLen + 1)
+		donor := getContainerArrayWithLen(oldLen + 1)
 		copy(donor.content[:idx], ac.content[:idx])
 		copy(donor.content[idx+1:], ac.content[idx:])
 		donor.content[idx] = v
@@ -341,13 +373,13 @@ func (ac *containerArray) iorArray(value2 *containerArray) container16 {
 		if newSize > 2*arrayDefaultMaxSize && maxPossibleCardinality <= 2*arrayDefaultMaxSize {
 			newSize = 2 * arrayDefaultMaxSize
 		}
-		donor := newContainerArraySize(newSize)
+		donor := getContainerArrayWithLen(newSize)
 		copy(donor.content[len2:maxPossibleCardinality], ac.content[0:len1])
 		nl := union2by2(donor.content[len2:maxPossibleCardinality], value2.content, donor.content)
 		if nl > arrayDefaultMaxSize {
 			donor.content = donor.content[:nl]
 			bc := donor.toBitmapContainer()
-			releaseContainerArray(donor)
+			donor.release()
 			return bc
 		}
 		donor.content = donor.content[:nl]
@@ -413,7 +445,7 @@ func (ac *containerArray) orArray(value2 *containerArray) container16 {
 		}
 		return bc
 	}
-	answer := newContainerArrayCapacity(maxPossibleCardinality)
+	answer := getContainerArrayWithCap(maxPossibleCardinality)
 	nl := union2by2(value1.content, value2.content, answer.content)
 	answer.content = answer.content[:nl] // reslice to match actual used capacity
 	return answer
@@ -520,7 +552,7 @@ func (ac *containerArray) xorArray(value2 *containerArray) container16 {
 		return bc
 	}
 	desiredCapacity := totalCardinality
-	answer := newContainerArrayCapacity(desiredCapacity)
+	answer := getContainerArrayWithCap(desiredCapacity)
 	length := exclusiveUnion2by2(value1.content, value2.content, answer.content)
 	answer.content = answer.content[:length]
 	return answer
@@ -610,7 +642,7 @@ func (ac *containerArray) iandNotRun(rc *containerRun) container16 {
 func (ac *containerArray) andNotArray(value2 *containerArray) container16 {
 	value1 := ac
 	desiredcapacity := value1.getCardinality()
-	answer := newContainerArrayCapacity(desiredcapacity)
+	answer := getContainerArrayWithCap(desiredcapacity)
 	length := difference(value1.content, value2.content, answer.content)
 	answer.content = answer.content[:length]
 	return answer
@@ -624,7 +656,7 @@ func (ac *containerArray) iandNotArray(value2 *containerArray) container16 {
 
 func (ac *containerArray) andNotBitmap(value2 *containerBitmap) container16 {
 	desiredcapacity := ac.getCardinality()
-	answer := newContainerArrayCapacity(desiredcapacity)
+	answer := getContainerArrayWithCap(desiredcapacity)
 	answer.content = answer.content[:desiredcapacity]
 	pos := 0
 	for _, v := range ac.content {
@@ -671,8 +703,8 @@ func (ac *containerArray) inotClose(firstOfRange, lastOfRange int) container16 {
 	spanToBeFlipped := lastOfRange - firstOfRange + 1
 
 	newValuesInRange := spanToBeFlipped - currentValuesInRange
-	buffer := newContainerArraySize(newValuesInRange)
-	defer releaseContainerArray(buffer)
+	buffer := getContainerArrayWithLen(newValuesInRange)
+	defer buffer.release()
 	cardinalityChange := newValuesInRange - currentValuesInRange
 	newCardinality := len(ac.content) + cardinalityChange
 	if cardinalityChange > 0 {
@@ -682,7 +714,7 @@ func (ac *containerArray) inotClose(firstOfRange, lastOfRange int) container16 {
 				bcRet.inot(firstOfRange, lastOfRange+1)
 				return bcRet
 			}
-			donor := newContainerArraySize(newCardinality)
+			donor := getContainerArrayWithLen(newCardinality)
 			copy(donor.content, ac.content)
 			replaceContainerArrayStorage(ac, donor)
 		}
@@ -740,7 +772,7 @@ func (ac *containerArray) isFull() bool {
 
 func (ac *containerArray) andArray(value2 *containerArray) container16 {
 	desiredcapacity := min(ac.getCardinality(), value2.getCardinality())
-	answer := newContainerArrayCapacity(desiredcapacity)
+	answer := getContainerArrayWithCap(desiredcapacity)
 	length := intersection2by2(
 		ac.content,
 		value2.content,
@@ -779,7 +811,7 @@ func (ac *containerArray) isEmpty() bool {
 }
 
 func (ac *containerArray) clone() container16 {
-	ptr := newContainerArraySize(len(ac.content))
+	ptr := getContainerArrayWithLen(len(ac.content))
 	copy(ptr.content, ac.content)
 	return ptr
 }
@@ -799,7 +831,7 @@ func (ac *containerArray) realloc(size int) {
 		return
 	}
 	if cap(ac.content) < size {
-		donor := newContainerArraySize(size)
+		donor := getContainerArrayWithLen(size)
 		copy(donor.content, ac.content)
 		replaceContainerArrayStorage(ac, donor)
 	} else {
@@ -808,7 +840,7 @@ func (ac *containerArray) realloc(size int) {
 }
 
 func newContainerArrayFromBitmap(bc *containerBitmap) *containerArray {
-	ac := newContainerArray()
+	ac := getContainerArray()
 	ac.loadData(bc)
 	return ac
 }

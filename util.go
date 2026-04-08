@@ -17,6 +17,7 @@ import (
 	"sync"
 	"unsafe"
 
+	"github.com/vapstack/rbi/internal/pooled"
 	"github.com/vmihailenco/msgpack/v5"
 	"go.etcd.io/bbolt"
 )
@@ -57,21 +58,11 @@ type patchScratch struct {
 	seen []bool
 }
 
-var patchScratchPool = sync.Pool{
-	New: func() any {
-		return new(patchScratch)
+var patchScratchPool = pooled.Pointers[patchScratch]{
+	Cleanup: func(scratch *patchScratch) {
+		clear(scratch.seen[:cap(scratch.seen)])
+		scratch.seen = scratch.seen[:0]
 	},
-}
-
-func acquirePatchScratch(n int) *patchScratch {
-	scratch := patchScratchPool.Get().(*patchScratch)
-	scratch.seen = slices.Grow(scratch.seen[:0], n)[:n]
-	return scratch
-}
-
-func releasePatchScratch(scratch *patchScratch) {
-	clear(scratch.seen)
-	patchScratchPool.Put(scratch)
 }
 
 func (db *DB[K, V]) makePatch(oldVal, newVal *V, target []Field) []Field {
@@ -87,8 +78,9 @@ func (db *DB[K, V]) makePatch(oldVal, newVal *V, target []Field) []Field {
 	}
 	rvNew = reflect.ValueOf(newVal).Elem()
 
-	scratch := acquirePatchScratch(len(db.patchFieldAccess))
-	defer releasePatchScratch(scratch)
+	scratch := patchScratchPool.Get()
+	scratch.seen = slices.Grow(scratch.seen[:0], len(db.patchFieldAccess))[:len(db.patchFieldAccess)]
+	defer patchScratchPool.Put(scratch)
 
 	newPtr := unsafe.Pointer(newVal)
 	oldPtr := unsafe.Pointer(nil)
@@ -256,38 +248,52 @@ func (db *DB[K, V]) rollbackCreatedStrIdx(id K, idx uint64) {
 	db.strmap.restoreCommittedNoLock()
 }
 
-func (db *DB[K, V]) forEachIdxFromID(ids []K, fn func(uint64)) {
-	if len(ids) == 0 || fn == nil {
-		return
+func (db *DB[K, V]) addCheckedIdxsFromIDs(ids []K, dst *postingLazySetBuilder) uint64 {
+	if len(ids) == 0 || dst == nil {
+		return 0
 	}
 
+	dedupe := uint64(0)
 	if db.strkey {
 		s := *(*[]string)(unsafe.Pointer(&ids))
 		db.strmap.Lock()
 		for i := range s {
-			fn(db.strmap.createIdxNoLock(s[i]))
+			if !dst.addChecked(db.strmap.createIdxNoLock(s[i])) {
+				dedupe++
+			}
 		}
 		db.strmap.Unlock()
-		return
+		return dedupe
 	}
 
 	for _, idx := range *(*[]uint64)(unsafe.Pointer(&ids)) {
-		fn(idx)
+		if !dst.addChecked(idx) {
+			dedupe++
+		}
 	}
+	return dedupe
 }
 
-var msgpackEncPool = sync.Pool{New: func() any { return msgpack.NewEncoder(io.Discard) }}
-var msgpackDecPool = sync.Pool{New: func() any { return msgpack.NewDecoder(strings.NewReader("")) }}
-var msgpackReaderPool = sync.Pool{New: func() any { return bytes.NewReader(nil) }}
+var msgpackEncPool = pooled.Pointers[msgpack.Encoder]{
+	New: func() *msgpack.Encoder { return msgpack.NewEncoder(io.Discard) },
+	Cleanup: func(enc *msgpack.Encoder) {
+		enc.Reset(io.Discard)
+	},
+}
+
+var msgpackDecPool = pooled.Pointers[msgpack.Decoder]{
+	New: func() *msgpack.Decoder { return msgpack.NewDecoder(strings.NewReader("")) },
+}
+
+var msgpackReaderPool = pooled.Pointers[bytes.Reader]{Clear: true}
 
 func (db *DB[K, V]) decode(b []byte) (*V, error) {
-	v := db.recPool.Get().(*V)
-	dec := msgpackDecPool.Get().(*msgpack.Decoder)
-	reader := msgpackReaderPool.Get().(*bytes.Reader)
+	v := db.recPool.Get()
+	dec := msgpackDecPool.Get()
+	reader := msgpackReaderPool.Get()
 	reader.Reset(b)
 	dec.Reset(reader)
 	err := dec.Decode(v)
-	reader.Reset(nil)
 	msgpackReaderPool.Put(reader)
 	msgpackDecPool.Put(dec)
 	if err != nil {
@@ -298,25 +304,14 @@ func (db *DB[K, V]) decode(b []byte) (*V, error) {
 }
 
 func (db *DB[K, V]) encode(v *V, b *bytes.Buffer) error {
-	enc := msgpackEncPool.Get().(*msgpack.Encoder)
+	enc := msgpackEncPool.Get()
 	enc.Reset(b)
 	err := enc.Encode(v)
 	msgpackEncPool.Put(enc)
 	return err
 }
 
-var encodePool = sync.Pool{
-	New: func() any { return new(bytes.Buffer) },
-}
-
-func getEncodeBuf() *bytes.Buffer {
-	return encodePool.Get().(*bytes.Buffer)
-}
-
-func releaseEncodeBuf(b *bytes.Buffer) {
-	b.Reset()
-	encodePool.Put(b)
-}
+var encodePool pooled.Buffers
 
 func rollback(tx *bbolt.Tx) { _ = tx.Rollback() }
 
@@ -392,8 +387,12 @@ func uint64ByteStr(v uint64) string {
 	return unsafe.String(unsafe.SliceData(b), len(b))
 }
 
+func orderedInt64Key(v int64) uint64 {
+	return uint64(v) ^ (uint64(1) << 63)
+}
+
 func int64ByteStr(v int64) string {
-	return uint64ByteStr(uint64(v) ^ (uint64(1) << 63))
+	return uint64ByteStr(orderedInt64Key(v))
 }
 
 const canonicalFloat64NaNBits uint64 = 0x7ff8000000000001

@@ -3,43 +3,34 @@ package rbi
 import (
 	"math/bits"
 	"slices"
-	"sync"
 
 	"github.com/vapstack/qx"
+	"github.com/vapstack/rbi/internal/pooled"
 	"github.com/vapstack/rbi/internal/posting"
 )
 
 type postsAnyFilterState struct {
-	posts                 []posting.List
+	postsBuf              *pooled.SliceBuf[posting.List]
 	ids                   posting.List
 	containsCalls         int
 	containsMaterializeAt int
 }
 
-var postsAnyFilterStatePool sync.Pool
-var lazyMaterializedPredicateStatePool sync.Pool
+var postsAnyFilterStatePool = pooled.Pointers[postsAnyFilterState]{
+	Cleanup: func(state *postsAnyFilterState) {
+		state.ids.Release()
+	},
+	Clear: true,
+}
+var lazyMaterializedPredicateStatePool = pooled.Pointers[lazyMaterializedPredicateState]{
+	Cleanup: func(state *lazyMaterializedPredicateState) {
+		state.ids.Release()
+	},
+	Clear: true,
+}
 
 type lazyMaterializedPredicateLoader interface {
-	evalLazyMaterializedPredicate(raw qx.Expr, cacheKey string) posting.List
-}
-
-func acquirePostsAnyFilterState(posts []posting.List) *postsAnyFilterState {
-	if v := postsAnyFilterStatePool.Get(); v != nil {
-		state := v.(*postsAnyFilterState)
-		state.posts = posts
-		state.containsMaterializeAt = postsAnyContainsMaterializeAfter(posts)
-		return state
-	}
-	return &postsAnyFilterState{
-		posts:                 posts,
-		containsMaterializeAt: postsAnyContainsMaterializeAfter(posts),
-	}
-}
-
-func releasePostsAnyFilterState(state *postsAnyFilterState) {
-	state.ids.Release()
-	*state = postsAnyFilterState{}
-	postsAnyFilterStatePool.Put(state)
+	evalLazyMaterializedPredicateWithKey(raw qx.Expr, cacheKey materializedPredKey) posting.List
 }
 
 func (state *postsAnyFilterState) materialize() posting.List {
@@ -49,16 +40,16 @@ func (state *postsAnyFilterState) materialize() posting.List {
 	if !state.ids.IsEmpty() {
 		return state.ids
 	}
-	if isSingletonHeavyProbe(state.posts) {
-		state.ids = materializeProbeFast(state.posts)
+	if isSingletonHeavyPostingBuf(state.postsBuf) {
+		state.ids = materializePostingBufFast(state.postsBuf)
 	} else {
-		state.ids = materializePostingUnionOwned(state.posts)
+		state.ids = materializePostingUnionBufOwned(state.postsBuf)
 	}
 	return state.ids
 }
 
-func postsAnyContainsMaterializeAfter(posts []posting.List) int {
-	termCount := len(posts)
+func postsAnyContainsMaterializeAfterBuf(posts *pooled.SliceBuf[posting.List]) int {
+	termCount := postingBufLen(posts)
 	if termCount <= 1 {
 		return 0
 	}
@@ -75,7 +66,7 @@ func postsAnyContainsMaterializeAfter(posts []posting.List) int {
 	}
 	var sampleTotal uint64
 	for i, sampled := 0, 0; i < termCount && sampled < sampleN; i, sampled = i+step, sampled+1 {
-		sampleTotal += posts[i].Cardinality()
+		sampleTotal += posts.Get(i).Cardinality()
 	}
 	if sampleTotal == 0 {
 		return 0
@@ -120,25 +111,25 @@ func (state *postsAnyFilterState) matches(idx uint64) bool {
 			return state.materialize().Contains(idx)
 		}
 	}
-	switch len(state.posts) {
+	switch postingBufLen(state.postsBuf) {
 	case 0:
 		return false
 	case 1:
-		return state.posts[0].Contains(idx)
+		return state.postsBuf.Get(0).Contains(idx)
 	case 2:
-		return state.posts[0].Contains(idx) || state.posts[1].Contains(idx)
+		return state.postsBuf.Get(0).Contains(idx) || state.postsBuf.Get(1).Contains(idx)
 	case 3:
-		return state.posts[0].Contains(idx) ||
-			state.posts[1].Contains(idx) ||
-			state.posts[2].Contains(idx)
+		return state.postsBuf.Get(0).Contains(idx) ||
+			state.postsBuf.Get(1).Contains(idx) ||
+			state.postsBuf.Get(2).Contains(idx)
 	case 4:
-		return state.posts[0].Contains(idx) ||
-			state.posts[1].Contains(idx) ||
-			state.posts[2].Contains(idx) ||
-			state.posts[3].Contains(idx)
+		return state.postsBuf.Get(0).Contains(idx) ||
+			state.postsBuf.Get(1).Contains(idx) ||
+			state.postsBuf.Get(2).Contains(idx) ||
+			state.postsBuf.Get(3).Contains(idx)
 	}
-	for _, ids := range state.posts {
-		if ids.Contains(idx) {
+	for i := 0; i < state.postsBuf.Len(); i++ {
+		if state.postsBuf.Get(i).Contains(idx) {
 			return true
 		}
 	}
@@ -159,16 +150,86 @@ func postsAnyDirectBucketFilterMaxCard(termCount int) uint64 {
 	return limit
 }
 
+func postsAnyEstimatedUnionCardinality(posts *pooled.SliceBuf[posting.List]) (uint64, int) {
+	if posts == nil {
+		return 0, 0
+	}
+	est := uint64(0)
+	singletons := 0
+	for i := 0; i < posts.Len(); i++ {
+		card := posts.Get(i).Cardinality()
+		est = satAddUint64(est, card)
+		if card == 1 {
+			singletons++
+		}
+	}
+	return est, singletons
+}
+
+func postsAnyDirectIntersectWork(posts *pooled.SliceBuf[posting.List], dstCard uint64) uint64 {
+	if posts == nil || dstCard == 0 {
+		return 0
+	}
+	work := uint64(0)
+	for i := 0; i < posts.Len(); i++ {
+		card := posts.Get(i).Cardinality()
+		iterRows := card
+		otherCard := dstCard
+		if dstCard < card {
+			iterRows = dstCard
+			otherCard = card
+		}
+		work = satAddUint64(work, satMulUint64(iterRows, postingContainsLookupWork(otherCard)))
+	}
+	return work
+}
+
+func (state *postsAnyFilterState) shouldUseDirectIntersect(dstCard uint64) (uint64, bool) {
+	if state == nil || state.postsBuf == nil || dstCard == 0 {
+		return 0, false
+	}
+	termCount := state.postsBuf.Len()
+	if termCount <= 1 || termCount > 4 {
+		return 0, false
+	}
+
+	unionCard := uint64(0)
+	singletons := 0
+	if !state.ids.IsEmpty() {
+		unionCard = state.ids.Cardinality()
+	} else {
+		unionCard, singletons = postsAnyEstimatedUnionCardinality(state.postsBuf)
+	}
+	if unionCard == 0 {
+		return 0, false
+	}
+
+	directWork := postsAnyDirectIntersectWork(state.postsBuf, dstCard)
+	materializedWork := satMulUint64(dstCard, postingContainsLookupWork(unionCard))
+	if state.ids.IsEmpty() {
+		buildWork := postingUnionLinearWork(termCount, unionCard)
+		if shouldUseFastSinglesUnion(termCount, singletons, unionCard) {
+			buildWork = postingUnionFastSinglesWork(termCount, singletons, unionCard)
+		}
+		materializedWork = satAddUint64(materializedWork, buildWork)
+	}
+	if directWork >= materializedWork {
+		return 0, false
+	}
+	return unionCard, true
+}
+
 func (state *postsAnyFilterState) apply(dst posting.List) (posting.List, bool) {
 	if dst.IsEmpty() {
 		return dst, true
 	}
-	if len(state.posts) <= 4 {
+	postCount := postingBufLen(state.postsBuf)
+	if postCount <= 4 {
 		card := dst.Cardinality()
-		if card > 0 && card <= postsAnyDirectBucketFilterMaxCard(len(state.posts)) {
+		if card > 0 && card <= postsAnyDirectBucketFilterMaxCard(postCount) {
 			if idx, ok := dst.TrySingle(); ok {
-				for _, ids := range state.posts {
-					if ids.Contains(idx) {
+				for i := 0; i < state.postsBuf.Len(); i++ {
+					if state.postsBuf.Get(i).Contains(idx) {
 						return dst, true
 					}
 				}
@@ -181,8 +242,8 @@ func (state *postsAnyFilterState) apply(dst posting.List) (posting.List, bool) {
 			matched := uint64(0)
 			for it.HasNext() {
 				idx := it.Next()
-				for _, ids := range state.posts {
-					if ids.Contains(idx) {
+				for i := 0; i < state.postsBuf.Len(); i++ {
+					if state.postsBuf.Get(i).Contains(idx) {
 						builder.addSingle(idx)
 						matched++
 						break
@@ -204,9 +265,24 @@ func (state *postsAnyFilterState) apply(dst posting.List) (posting.List, bool) {
 			return out, true
 		}
 
+		if unionCard, ok := state.shouldUseDirectIntersect(card); ok {
+			capHint := card
+			if unionCard < capHint {
+				capHint = unionCard
+			}
+			builder := newPostingUnionBuilder(postingBatchSinglesEnabled(capHint))
+			for i := 0; i < state.postsBuf.Len(); i++ {
+				builder = postingListAppendIntersecting(dst, state.postsBuf.Get(i), builder)
+			}
+			dst.Release()
+			out := builder.finish(false)
+			builder.release()
+			return out, true
+		}
+
 		hit := false
-		for _, ids := range state.posts {
-			if ids.Intersects(dst) {
+		for i := 0; i < state.postsBuf.Len(); i++ {
+			if state.postsBuf.Get(i).Intersects(dst) {
 				hit = true
 				break
 			}
@@ -224,6 +300,13 @@ func (state *postsAnyFilterState) apply(dst posting.List) (posting.List, bool) {
 	return dst.BuildAnd(union), true
 }
 
+func postingBufLen(buf *pooled.SliceBuf[posting.List]) int {
+	if buf == nil {
+		return 0
+	}
+	return buf.Len()
+}
+
 func (state *postsAnyFilterState) borrowMaterialized() posting.List {
 	union := state.materialize()
 	if union.IsEmpty() {
@@ -235,30 +318,9 @@ func (state *postsAnyFilterState) borrowMaterialized() posting.List {
 type lazyMaterializedPredicateState struct {
 	loader   lazyMaterializedPredicateLoader
 	raw      qx.Expr
-	cacheKey string
+	cacheKey materializedPredKey
 	ids      posting.List
 	loaded   bool
-}
-
-func acquireLazyMaterializedPredicateState(loader lazyMaterializedPredicateLoader, raw qx.Expr, cacheKey string) *lazyMaterializedPredicateState {
-	if v := lazyMaterializedPredicateStatePool.Get(); v != nil {
-		state := v.(*lazyMaterializedPredicateState)
-		state.loader = loader
-		state.raw = raw
-		state.cacheKey = cacheKey
-		return state
-	}
-	return &lazyMaterializedPredicateState{
-		loader:   loader,
-		raw:      raw,
-		cacheKey: cacheKey,
-	}
-}
-
-func releaseLazyMaterializedPredicateState(state *lazyMaterializedPredicateState) {
-	state.ids.Release()
-	*state = lazyMaterializedPredicateState{}
-	lazyMaterializedPredicateStatePool.Put(state)
 }
 
 func (state *lazyMaterializedPredicateState) materialize() posting.List {
@@ -267,7 +329,7 @@ func (state *lazyMaterializedPredicateState) materialize() posting.List {
 	}
 	if !state.loaded {
 		if state.loader != nil {
-			state.ids = state.loader.evalLazyMaterializedPredicate(state.raw, state.cacheKey)
+			state.ids = state.loader.evalLazyMaterializedPredicateWithKey(state.raw, state.cacheKey)
 			state.loader = nil
 		}
 		state.loaded = true
@@ -275,7 +337,20 @@ func (state *lazyMaterializedPredicateState) materialize() posting.List {
 	return state.ids
 }
 
-var overlayRangeIterPool sync.Pool
+var overlayRangeIterPool = pooled.Pointers[overlayRangeIter]{
+	Cleanup: func(it *overlayRangeIter) {
+		if it.curIt != nil {
+			it.curIt.Release()
+			it.curIt = nil
+		}
+		it.cur = overlayKeyCursor{}
+		it.single = struct {
+			set bool
+			v   uint64
+		}{}
+	},
+	Clear: true,
+}
 
 type overlayRangePredicateState struct {
 	ov                    fieldOverlay
@@ -297,63 +372,18 @@ type overlayRangePredicateState struct {
 	postingFilterCalls    int
 	rangeMaterialized     bool
 	probeMaterialized     bool
-	linearPostsBuf        *postingSliceBuf
-	linearPosts           []posting.List
+	linearPostsBuf        *pooled.SliceBuf[posting.List]
 	rangeIDs              posting.List
 	probeIDs              posting.List
 }
 
-var overlayRangePredicateStatePool sync.Pool
-
-func acquireOverlayRangePredicateState(
-	ov fieldOverlay,
-	br overlayRange,
-	probe overlayRangeProbe,
-	bucketCount int,
-	est uint64,
-	neg bool,
-	reuse materializedPredReuse,
-	usePostingFilter bool,
-) *overlayRangePredicateState {
-	linearContainsMax := rangeLinearContainsLimit(probe.probeLen, probe.probeEst)
-	materializeAfter := rangeMaterializeAfterForProbe(probe.probeLen, probe.probeEst)
-	rangeMaterializeAt := rangePostingFilterMaterializeAfterForProbe(bucketCount, est)
-	var state *overlayRangePredicateState
-	if v := overlayRangePredicateStatePool.Get(); v != nil {
-		state = v.(*overlayRangePredicateState)
-	} else {
-		state = new(overlayRangePredicateState)
-	}
-	state.ov = ov
-	state.br = br
-	state.probe = probe
-	state.reuse = reuse
-	state.neg = neg
-	state.bucketCount = bucketCount
-	state.linearContainsMax = linearContainsMax
-	state.materializeAfter = materializeAfter
-	state.rangeMaterializeAt = rangeMaterializeAt
-	state.keepProbeHits = probe.useComplement == neg
-	state.probePostingFilter = false
-	state.postingFilterCheap = false
-	state.probeMaterializeAt = 0
-	if usePostingFilter {
-		totalBuckets := probe.ov.keyCount()
-		inBuckets := 0
-		for i := 0; i < probe.spanCnt; i++ {
-			inBuckets += probe.spans[i].baseEnd - probe.spans[i].baseStart
-		}
-		if probe.useComplement {
-			inBuckets = totalBuckets - inBuckets
-		}
-		if totalBuckets > 0 && inBuckets > 0 && inBuckets < totalBuckets && probe.probeLen > 0 {
-			state.probePostingFilter = true
-			state.postingFilterCheap = !state.keepProbeHits
-			state.probeMaterializeAt = rangePostingFilterMaterializeAfterForProbe(probe.probeLen, probe.probeEst)
-		}
-	}
-	state.setExpectedContainsCalls(materializeAfter)
-	return state
+var overlayRangePredicateStatePool = pooled.Pointers[overlayRangePredicateState]{
+	Cleanup: func(state *overlayRangePredicateState) {
+		state.releaseLinearPosts()
+		state.probeIDs.Release()
+		state.rangeIDs.Release()
+	},
+	Clear: true,
 }
 
 func (state *overlayRangePredicateState) setExpectedContainsCalls(expectedCalls int) {
@@ -387,18 +417,8 @@ func (state *overlayRangePredicateState) releaseLinearPosts() {
 	if state == nil || state.linearPostsBuf == nil {
 		return
 	}
-	state.linearPostsBuf.values = state.linearPosts
-	releasePostingSliceBuf(state.linearPostsBuf)
+	postingSlicePool.Put(state.linearPostsBuf)
 	state.linearPostsBuf = nil
-	state.linearPosts = nil
-}
-
-func releaseOverlayRangePredicateState(state *overlayRangePredicateState) {
-	state.releaseLinearPosts()
-	state.probeIDs.Release()
-	state.rangeIDs.Release()
-	*state = overlayRangePredicateState{}
-	overlayRangePredicateStatePool.Put(state)
 }
 
 func (state *overlayRangePredicateState) materializeRange() posting.List {
@@ -425,15 +445,15 @@ func (state *overlayRangePredicateState) materializeRange() posting.List {
 	return state.rangeIDs
 }
 
-func (state *overlayRangePredicateState) ensureLinearPosts() []posting.List {
+func (state *overlayRangePredicateState) ensureLinearPosts() *pooled.SliceBuf[posting.List] {
 	if state == nil {
 		return nil
 	}
 	if state.linearPostsBuf != nil {
-		return state.linearPosts
+		return state.linearPostsBuf
 	}
-	state.linearPostsBuf = getPostingSliceBuf(state.bucketCount)
-	state.linearPostsBuf.values = state.linearPostsBuf.values[:0]
+	state.linearPostsBuf = postingSlicePool.Get()
+	state.linearPostsBuf.Grow(state.bucketCount)
 	for i := 0; i < state.probe.spanCnt; i++ {
 		cur := state.ov.newCursor(state.probe.spans[i], false)
 		for {
@@ -444,16 +464,22 @@ func (state *overlayRangePredicateState) ensureLinearPosts() []posting.List {
 			if ids.IsEmpty() {
 				continue
 			}
-			state.linearPostsBuf.values = append(state.linearPostsBuf.values, ids)
+			state.linearPostsBuf.Append(ids)
 		}
 	}
-	state.linearPosts = state.linearPostsBuf.values
-	return state.linearPosts
+	return state.linearPostsBuf
 }
 
 func (state *overlayRangePredicateState) linearContains(idx uint64) bool {
-	for _, ids := range state.ensureLinearPosts() {
-		if ids.Contains(idx) {
+	if state == nil {
+		return false
+	}
+	if state.expectedContainsCalls <= 1 || state.containsMode != baseRangeContainsLinear {
+		return state.probe.linearContains(idx)
+	}
+	posts := state.ensureLinearPosts()
+	for i := 0; i < posts.Len(); i++ {
+		if posts.Get(i).Contains(idx) {
 			return true
 		}
 	}
@@ -470,10 +496,16 @@ func (state *overlayRangePredicateState) materializeProbe() posting.List {
 	if state.probeMaterialized {
 		return state.probeIDs
 	}
-	for i := 0; i < state.probe.spanCnt; i++ {
-		part := overlayUnionRange(state.ov, state.probe.spans[i])
-		state.probeIDs = state.probeIDs.BuildMergedOwned(part)
+	if state.probe.spanCnt == 0 {
+		state.probeMaterialized = true
+		state.releaseLinearPosts()
+		return posting.List{}
 	}
+	var second overlayRange
+	if state.probe.spanCnt > 1 {
+		second = state.probe.spans[1]
+	}
+	state.probeIDs = overlayUnionRanges(state.ov, state.probe.spans[0], second)
 	state.probeMaterialized = true
 	state.releaseLinearPosts()
 	return state.probeIDs
@@ -572,7 +604,7 @@ func (state *overlayRangePredicateState) applyToPosting(dst posting.List) (posti
 		forceMaterialize := state.probe.probeLen > rangePostingFilterKeepProbeMaxBuckets &&
 			state.postingFilterCalls >= state.probeMaterializeAt
 		if !forceMaterialize {
-			return applyRangeProbePostingFilter(dst, state.keepProbeHits, state.probe.probeLen, state.probe.linearContains, state.probe.forEachPosting)
+			return applyRangeProbePostingFilter(dst, state.keepProbeHits, state.probe.probeLen, state.probe)
 		}
 		ids := state.materializeProbe()
 		if ids.IsEmpty() {
@@ -612,7 +644,9 @@ func (state *overlayRangePredicateState) newIter() posting.Iterator {
 	if state == nil || state.neg {
 		return nil
 	}
-	return acquireOverlayRangeIter(state.ov, state.br)
+	it := overlayRangeIterPool.Get()
+	it.cur = state.ov.newCursor(state.br, false)
+	return it
 }
 
 type baseRangePredicateState struct {
@@ -631,72 +665,45 @@ type baseRangePredicateState struct {
 	postingFilterCalls int
 	hasSet             bool
 	set                u64set
-	linearPostsBuf     *postingSliceBuf
-	linearPosts        []posting.List
+	linearPostsBuf     *pooled.SliceBuf[posting.List]
 	ids                posting.List
 }
 
-var baseRangePredicateStatePool sync.Pool
-
-func acquireBaseRangePredicateState(
-	probe baseRangeProbe,
-	neg bool,
-	reuse materializedPredReuse,
-) *baseRangePredicateState {
-	keepProbeHits := probe.useComplement == neg
-	linearContainsMax := rangeLinearContainsLimit(probe.probeLen, probe.probeEst)
-	materializeAfter := rangeMaterializeAfterForProbe(probe.probeLen, probe.probeEst)
-	hashSetAfter := rangeHashSetAfterForProbe(probe.probeLen, probe.probeEst)
-	postingFilterMaterializeAt := rangePostingFilterMaterializeAfterForProbe(probe.probeLen, probe.probeEst)
-	var state *baseRangePredicateState
-	if v := baseRangePredicateStatePool.Get(); v != nil {
-		state = v.(*baseRangePredicateState)
-	} else {
-		state = &baseRangePredicateState{}
-	}
-	state.probe = probe
-	state.reuse = reuse
-	state.keepProbeHits = keepProbeHits
-	state.neg = neg
-	state.linearContainsMax = linearContainsMax
-	state.hashSetAfter = hashSetAfter
-	state.materializeAfter = materializeAfter
-	state.postingFilterMaterializeAt = postingFilterMaterializeAt
-	state.setExpectedContainsCalls(materializeAfter)
-	return state
+var baseRangePredicateStatePool = pooled.Pointers[baseRangePredicateState]{
+	Cleanup: func(state *baseRangePredicateState) {
+		if state.hasSet {
+			releaseU64Set(&state.set)
+			state.hasSet = false
+		}
+		state.releaseLinearPosts()
+		state.ids.Release()
+	},
+	Clear: true,
 }
 
-func releaseBaseRangePredicateState(state *baseRangePredicateState) {
-	if state.hasSet {
-		releaseU64Set(&state.set)
-		state.hasSet = false
+func (state *baseRangePredicateState) releaseLinearPosts() {
+	if state == nil || state.linearPostsBuf == nil {
+		return
 	}
-	if state.linearPostsBuf != nil {
-		state.linearPostsBuf.values = state.linearPosts
-		releasePostingSliceBuf(state.linearPostsBuf)
-		state.linearPostsBuf = nil
-		state.linearPosts = nil
-	}
-	state.ids.Release()
-	*state = baseRangePredicateState{}
-	baseRangePredicateStatePool.Put(state)
+	postingSlicePool.Put(state.linearPostsBuf)
+	state.linearPostsBuf = nil
 }
 
-func tryShareMaterializedPredOnSnapshot(snap *indexSnapshot, cacheKey string, ids posting.List) posting.List {
-	if snap == nil || cacheKey == "" {
+func tryShareMaterializedPredOnSnapshot(snap *indexSnapshot, cacheKey materializedPredKey, ids posting.List) posting.List {
+	if snap == nil || cacheKey.isZero() {
 		return ids
 	}
 	if snap.matPredCacheMaxEntries <= 0 {
 		return ids
 	}
 	if ids.IsEmpty() {
-		snap.storeMaterializedPred(cacheKey, posting.List{})
+		snap.storeMaterializedPredKey(cacheKey, posting.List{})
 		return ids
 	}
-	if next, ok := snap.loadOrStoreMaterializedPred(cacheKey, ids); ok {
+	if next, ok := snap.loadOrStoreMaterializedPredKey(cacheKey, ids); ok {
 		return next
 	}
-	if next, ok := snap.tryLoadOrStoreMaterializedPredOversized(cacheKey, ids); ok {
+	if next, ok := snap.tryLoadOrStoreMaterializedPredOversizedKey(cacheKey, ids); ok {
 		return next
 	}
 	return ids
@@ -753,43 +760,37 @@ func materializePostingUnionBaseRange(probe baseRangeProbe) posting.List {
 	if probe.probeLen == 0 {
 		return posting.List{}
 	}
-	postsBuf := getPostingSliceBuf(probe.probeLen)
-	postsBuf.values = postsBuf.values[:0]
-	probe.forEachPosting(func(ids posting.List) bool {
-		postsBuf.values = append(postsBuf.values, ids)
-		return true
-	})
-	out := materializePostingUnionOwned(postsBuf.values)
-	releasePostingSliceBuf(postsBuf)
+	postsBuf := postingSlicePool.Get()
+	postsBuf.Grow(probe.probeLen)
+	probe.appendPostings(postsBuf)
+	out := materializePostingUnionBufOwned(postsBuf)
+	postingSlicePool.Put(postsBuf)
 	return out
 }
 
-func (state *baseRangePredicateState) ensureLinearPosts() []posting.List {
+func (state *baseRangePredicateState) ensureLinearPosts() *pooled.SliceBuf[posting.List] {
 	if state == nil {
 		return nil
 	}
 	if state.linearPostsBuf != nil {
-		return state.linearPosts
+		return state.linearPostsBuf
 	}
-	state.linearPostsBuf = getPostingSliceBuf(state.probe.probeLen)
-	state.linearPostsBuf.values = state.linearPostsBuf.values[:0]
-	state.probe.forEachPosting(func(ids posting.List) bool {
-		state.linearPostsBuf.values = append(state.linearPostsBuf.values, ids)
-		return true
-	})
-	state.linearPosts = state.linearPostsBuf.values
-	return state.linearPosts
+	state.linearPostsBuf = postingSlicePool.Get()
+	state.linearPostsBuf.Grow(state.probe.probeLen)
+	state.probe.appendPostings(state.linearPostsBuf)
+	return state.linearPostsBuf
 }
 
 func (state *baseRangePredicateState) linearContains(idx uint64) bool {
 	if state == nil {
 		return false
 	}
-	if state.expectedContainsCalls <= 1 {
+	if state.expectedContainsCalls <= 1 || state.containsMode != baseRangeContainsLinear {
 		return state.probe.linearContains(idx)
 	}
-	for _, ids := range state.ensureLinearPosts() {
-		if ids.Contains(idx) {
+	posts := state.ensureLinearPosts()
+	for i := 0; i < posts.Len(); i++ {
+		if posts.Get(i).Contains(idx) {
 			return true
 		}
 	}
@@ -829,13 +830,7 @@ func (state *baseRangePredicateState) rawHit(idx uint64) bool {
 			}
 			state.set = newU64Set(capHint)
 			state.hasSet = true
-			state.probe.forEachPosting(func(b posting.List) bool {
-				b.ForEach(func(v uint64) bool {
-					state.set.Add(v)
-					return true
-				})
-				return true
-			})
+			state.probe.addToSet(&state.set)
 			return state.set.Has(idx)
 		}
 	case baseRangeContainsPosting:
@@ -881,7 +876,7 @@ func (state *baseRangePredicateState) applyToPosting(dst posting.List) (posting.
 	state.postingFilterCalls++
 	forceMaterialize := state.postingFilterCalls >= state.postingFilterMaterializeAt
 	if !forceMaterialize {
-		return applyRangeProbePostingFilter(dst, state.keepProbeHits, state.probe.probeLen, state.probe.linearContains, state.probe.forEachPosting)
+		return applyRangeProbePostingFilter(dst, state.keepProbeHits, state.probe.probeLen, state.probe)
 	}
 
 	ids := state.materialize()
@@ -920,12 +915,12 @@ const (
 
 type materializedPredReuse struct {
 	snap     *indexSnapshot
-	cacheKey string
+	cacheKey materializedPredKey
 	mode     materializedPredReuseMode
 }
 
-func newMaterializedPredReadOnlyReuse(snap *indexSnapshot, cacheKey string) materializedPredReuse {
-	if snap == nil || cacheKey == "" {
+func newMaterializedPredReadOnlyReuse(snap *indexSnapshot, cacheKey materializedPredKey) materializedPredReuse {
+	if snap == nil || cacheKey.isZero() {
 		return materializedPredReuse{}
 	}
 	return materializedPredReuse{
@@ -935,8 +930,8 @@ func newMaterializedPredReadOnlyReuse(snap *indexSnapshot, cacheKey string) mate
 	}
 }
 
-func newMaterializedPredSharedReuse(snap *indexSnapshot, cacheKey string) materializedPredReuse {
-	if snap == nil || cacheKey == "" {
+func newMaterializedPredSharedReuse(snap *indexSnapshot, cacheKey materializedPredKey) materializedPredReuse {
+	if snap == nil || cacheKey.isZero() {
 		return materializedPredReuse{}
 	}
 	return materializedPredReuse{
@@ -946,8 +941,8 @@ func newMaterializedPredSharedReuse(snap *indexSnapshot, cacheKey string) materi
 	}
 }
 
-func newMaterializedPredSecondHitSharedReuse(snap *indexSnapshot, cacheKey string) materializedPredReuse {
-	if snap == nil || cacheKey == "" {
+func newMaterializedPredSecondHitSharedReuse(snap *indexSnapshot, cacheKey materializedPredKey) materializedPredReuse {
+	if snap == nil || cacheKey.isZero() {
 		return materializedPredReuse{}
 	}
 	return materializedPredReuse{
@@ -958,26 +953,26 @@ func newMaterializedPredSecondHitSharedReuse(snap *indexSnapshot, cacheKey strin
 }
 
 func (reuse materializedPredReuse) load() (posting.List, bool) {
-	if reuse.mode == materializedPredReuseNone || reuse.snap == nil || reuse.cacheKey == "" {
+	if reuse.mode == materializedPredReuseNone || reuse.snap == nil || reuse.cacheKey.isZero() {
 		return posting.List{}, false
 	}
-	return reuse.snap.loadMaterializedPred(reuse.cacheKey)
+	return reuse.snap.loadMaterializedPredKey(reuse.cacheKey)
 }
 
 func (reuse materializedPredReuse) share(ids posting.List) posting.List {
 	if (reuse.mode != materializedPredReuseShared && reuse.mode != materializedPredReuseSecondHitShared) ||
-		reuse.snap == nil || reuse.cacheKey == "" {
+		reuse.snap == nil || reuse.cacheKey.isZero() {
 		return ids
 	}
 	if reuse.mode == materializedPredReuseSecondHitShared &&
-		!reuse.snap.shouldPromoteRuntimeMaterializedPred(reuse.cacheKey) {
+		!reuse.snap.shouldPromoteRuntimeMaterializedPredKey(reuse.cacheKey) {
 		return ids
 	}
 	return tryShareMaterializedPredOnSnapshot(reuse.snap, reuse.cacheKey, ids)
 }
 
 func (reuse materializedPredReuse) canSecondHitShareModeratelyOversizedEstimate(est uint64) bool {
-	if reuse.mode != materializedPredReuseSecondHitShared || reuse.snap == nil || reuse.cacheKey == "" || est == 0 {
+	if reuse.mode != materializedPredReuseSecondHitShared || reuse.snap == nil || reuse.cacheKey.isZero() || est == 0 {
 		return false
 	}
 	if reuse.snap.matPredCacheMaxEntries <= 0 {
@@ -1001,63 +996,15 @@ func (reuse materializedPredReuse) canSecondHitShareModeratelyOversizedEstimate(
 	return est <= limit*mul
 }
 
-func (qv *queryView[K, V]) materializedPredReadOnlyReuseForScalar(
-	field string,
-	bound normalizedScalarBound,
-	useComplement bool,
-) materializedPredReuse {
-	if bound.full {
-		return materializedPredReuse{}
+func (qv *queryView[K, V]) materializedPredKeyForExactScalarRange(field string, bounds rangeBounds) materializedPredKey {
+	if qv.snap.matPredCacheMaxEntries <= 0 {
+		return materializedPredKey{}
 	}
-	cacheKey := qv.materializedPredCacheKeyForScalar(field, bound.op, bound.key)
-	if useComplement {
-		cacheKey = qv.materializedPredComplementCacheKeyForScalar(field, bound.op, bound.key)
-		return newMaterializedPredReadOnlyReuse(qv.snap, cacheKey)
-	}
-	return newMaterializedPredReadOnlyReuse(qv.snap, cacheKey)
+	return materializedPredKeyForExactScalarRange(field, bounds)
 }
 
-func (qv *queryView[K, V]) materializedPredReadOnlyReuseForExactScalarRange(
-	field string,
-	bounds rangeBounds,
-) materializedPredReuse {
-	return newMaterializedPredReadOnlyReuse(qv.snap, materializedPredCacheKeyForExactScalarRange(field, bounds))
-}
-
-func (qv *queryView[K, V]) materializedPredSharedReuseForScalar(
-	field string,
-	bound normalizedScalarBound,
-) materializedPredReuse {
-	if bound.full {
-		return materializedPredReuse{}
-	}
-	cacheKey := qv.materializedPredCacheKeyForScalar(field, bound.op, bound.key)
-	return newMaterializedPredSharedReuse(qv.snap, cacheKey)
-}
-
-func (qv *queryView[K, V]) materializedPredSharedReuseForExactScalarRange(
-	field string,
-	bounds rangeBounds,
-) materializedPredReuse {
-	return newMaterializedPredSharedReuse(qv.snap, materializedPredCacheKeyForExactScalarRange(field, bounds))
-}
-
-func (qv *queryView[K, V]) materializedPredSecondHitSharedReuseForScalar(
-	field string,
-	bound normalizedScalarBound,
-) materializedPredReuse {
-	if bound.full {
-		return materializedPredReuse{}
-	}
-	cacheKey := qv.materializedPredCacheKeyForScalar(field, bound.op, bound.key)
-	return newMaterializedPredSecondHitSharedReuse(qv.snap, cacheKey)
-}
-
-func (qv *queryView[K, V]) materializedPredSecondHitSharedReuseForExactScalarRange(
-	field string,
-	bounds rangeBounds,
-) materializedPredReuse {
-	return newMaterializedPredSecondHitSharedReuse(qv.snap, materializedPredCacheKeyForExactScalarRange(field, bounds))
+func (qv *queryView[K, V]) materializedPredCacheKeyForExactScalarRange(field string, bounds rangeBounds) string {
+	return qv.materializedPredKeyForExactScalarRange(field, bounds).String()
 }
 
 /**/
@@ -1065,13 +1012,17 @@ func (qv *queryView[K, V]) materializedPredSecondHitSharedReuseForExactScalarRan
 const (
 	singleChunkCap       = 32768
 	singleAdaptiveMaxLen = 200_000
+	singleInlineCap      = 16
 )
 
-var singleIDsPool = sync.Pool{
-	New: func() any {
+var singleIDsPool = pooled.Pointers[singleIDsBuffer]{
+	New: func() *singleIDsBuffer {
 		return &singleIDsBuffer{
 			values: make([]uint64, 0, singleChunkCap),
 		}
+	},
+	Cleanup: func(buf *singleIDsBuffer) {
+		buf.values = buf.values[:0]
 	},
 }
 
@@ -1080,20 +1031,22 @@ type singleIDsBuffer struct {
 }
 
 func getSingleIDsBuf() *singleIDsBuffer {
-	return singleIDsPool.Get().(*singleIDsBuffer)
+	return singleIDsPool.Get()
 }
 
 func releaseSingleIDs(buf *singleIDsBuffer) {
 	if buf == nil || cap(buf.values) != singleChunkCap {
 		return
 	}
-	buf.values = buf.values[:0]
 	singleIDsPool.Put(buf)
 }
 
 type postingUnionBuilder struct {
-	ids     posting.List
-	singles *singleIDsBuffer
+	ids           posting.List
+	singles       *singleIDsBuffer
+	inlineSingles [singleInlineCap]uint64
+	inlineLen     int
+	batchSingles  bool
 }
 
 func postingBatchSinglesEnabled(capHint uint64) bool {
@@ -1101,25 +1054,42 @@ func postingBatchSinglesEnabled(capHint uint64) bool {
 }
 
 func newPostingUnionBuilder(batchSingles bool) postingUnionBuilder {
-	if !batchSingles {
-		return postingUnionBuilder{}
-	}
-	return postingUnionBuilder{singles: getSingleIDsBuf()}
+	return postingUnionBuilder{batchSingles: batchSingles}
 }
 
 func (b *postingUnionBuilder) flushSingles() {
-	if b.singles == nil || len(b.singles.values) == 0 {
+	if b.singles != nil {
+		if len(b.singles.values) == 0 {
+			return
+		}
+		slices.Sort(b.singles.values)
+		b.ids = b.ids.BuildAddedMany(b.singles.values)
+		b.singles.values = b.singles.values[:0]
 		return
 	}
-	slices.Sort(b.singles.values)
-	b.ids = b.ids.BuildAddedMany(b.singles.values)
-	b.singles.values = b.singles.values[:0]
+	if b.inlineLen == 0 {
+		return
+	}
+	singles := b.inlineSingles[:b.inlineLen]
+	slices.Sort(singles)
+	b.ids = b.ids.BuildAddedMany(singles)
+	b.inlineLen = 0
 }
 
 func (b *postingUnionBuilder) addSingle(idx uint64) {
-	if b.singles == nil {
+	if !b.batchSingles {
 		b.ids = b.ids.BuildAdded(idx)
 		return
+	}
+	if b.singles == nil {
+		if b.inlineLen < len(b.inlineSingles) {
+			b.inlineSingles[b.inlineLen] = idx
+			b.inlineLen++
+			return
+		}
+		b.singles = getSingleIDsBuf()
+		b.singles.values = append(b.singles.values, b.inlineSingles[:]...)
+		b.inlineLen = 0
 	}
 	b.singles.values = append(b.singles.values, idx)
 	if len(b.singles.values) == cap(b.singles.values) {
@@ -1136,6 +1106,10 @@ func (b *postingUnionBuilder) addPosting(ids posting.List) {
 		return
 	}
 	b.flushSingles()
+	if b.ids.IsEmpty() {
+		b.ids = ids.Borrow()
+		return
+	}
 	b.ids = b.ids.BuildOr(ids)
 }
 
@@ -1143,11 +1117,15 @@ func (b *postingUnionBuilder) finish(optimize bool) posting.List {
 	b.flushSingles()
 	out := b.ids
 	b.ids = posting.List{}
+	b.inlineLen = 0
 	if b.singles != nil {
 		releaseSingleIDs(b.singles)
 		b.singles = nil
 	}
 	if optimize {
+		if out.IsBorrowed() {
+			return out
+		}
 		return out.BuildOptimized()
 	}
 	return out
@@ -1156,6 +1134,7 @@ func (b *postingUnionBuilder) finish(optimize bool) posting.List {
 func (b *postingUnionBuilder) release() {
 	b.ids.Release()
 	b.ids = posting.List{}
+	b.inlineLen = 0
 	if b.singles != nil {
 		releaseSingleIDs(b.singles)
 		b.singles = nil
@@ -1163,10 +1142,13 @@ func (b *postingUnionBuilder) release() {
 }
 
 type postingSetBuilder struct {
-	ids     posting.List
-	seen    u64set
-	singles *singleIDsBuffer
-	count   uint64
+	ids           posting.List
+	seen          u64set
+	singles       *singleIDsBuffer
+	inlineSingles [singleInlineCap]uint64
+	inlineLen     int
+	count         uint64
+	batchSingles  bool
 }
 
 type postingLazySetBuilder struct {
@@ -1210,10 +1192,8 @@ func (b *postingLazySetBuilder) release() {
 
 func newPostingSetBuilder(capHint uint64, batchSingles bool) postingSetBuilder {
 	b := postingSetBuilder{
-		seen: newU64Set(normalizePostingSetCapHint(capHint)),
-	}
-	if batchSingles {
-		b.singles = getSingleIDsBuf()
+		seen:         newU64Set(normalizePostingSetCapHint(capHint)),
+		batchSingles: batchSingles,
 	}
 	return b
 }
@@ -1226,12 +1206,22 @@ func normalizePostingSetCapHint(capHint uint64) int {
 }
 
 func (b *postingSetBuilder) flushSingles() {
-	if b.singles == nil || len(b.singles.values) == 0 {
+	if b.singles != nil {
+		if len(b.singles.values) == 0 {
+			return
+		}
+		slices.Sort(b.singles.values)
+		b.ids = b.ids.BuildAddedMany(b.singles.values)
+		b.singles.values = b.singles.values[:0]
 		return
 	}
-	slices.Sort(b.singles.values)
-	b.ids = b.ids.BuildAddedMany(b.singles.values)
-	b.singles.values = b.singles.values[:0]
+	if b.inlineLen == 0 {
+		return
+	}
+	singles := b.inlineSingles[:b.inlineLen]
+	slices.Sort(singles)
+	b.ids = b.ids.BuildAddedMany(singles)
+	b.inlineLen = 0
 }
 
 func (b *postingSetBuilder) addChecked(idx uint64) bool {
@@ -1239,9 +1229,19 @@ func (b *postingSetBuilder) addChecked(idx uint64) bool {
 		return false
 	}
 	b.count++
-	if b.singles == nil {
+	if !b.batchSingles {
 		b.ids = b.ids.BuildAdded(idx)
 		return true
+	}
+	if b.singles == nil {
+		if b.inlineLen < len(b.inlineSingles) {
+			b.inlineSingles[b.inlineLen] = idx
+			b.inlineLen++
+			return true
+		}
+		b.singles = getSingleIDsBuf()
+		b.singles.values = append(b.singles.values, b.inlineSingles[:]...)
+		b.inlineLen = 0
 	}
 	b.singles.values = append(b.singles.values, idx)
 	if len(b.singles.values) == cap(b.singles.values) {
@@ -1259,6 +1259,7 @@ func (b *postingSetBuilder) finish(optimize bool) posting.List {
 	out := b.ids
 	b.ids = posting.List{}
 	releaseU64Set(&b.seen)
+	b.inlineLen = 0
 	if b.singles != nil {
 		releaseSingleIDs(b.singles)
 		b.singles = nil
@@ -1274,6 +1275,7 @@ func (b *postingSetBuilder) release() {
 	b.ids.Release()
 	b.ids = posting.List{}
 	releaseU64Set(&b.seen)
+	b.inlineLen = 0
 	if b.singles != nil {
 		releaseSingleIDs(b.singles)
 		b.singles = nil

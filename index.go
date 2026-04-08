@@ -17,6 +17,7 @@ import (
 	"time"
 	"unsafe"
 
+	"github.com/vapstack/rbi/internal/pooled"
 	"github.com/vapstack/rbi/internal/posting"
 	"go.etcd.io/bbolt"
 )
@@ -31,6 +32,36 @@ var indexKeyNumericSentinel = new(byte)
 type indexKey struct {
 	ptr  *byte
 	meta uint64
+}
+
+func releaseBuildIndexRuns(runs []buildIndexFieldRun) {
+	for i := range runs {
+		runs[i].release()
+	}
+}
+
+func cleanupBuildIndexFailure(buildOK *bool, fieldStates []*buildIndexFieldState, localUniverse []posting.List) {
+	if *buildOK {
+		return
+	}
+	for i := range fieldStates {
+		fieldStates[i].release()
+	}
+	for i := range localUniverse {
+		localUniverse[i].Release()
+	}
+}
+
+func releaseBuildIndexLocalStates(localStates []buildIndexFieldLocalState) {
+	for i := range localStates {
+		localStates[i].release()
+	}
+}
+
+func recoverLoadIndex(err *error) {
+	if r := recover(); r != nil {
+		*err = fmt.Errorf("loadIndex panic: %v", r)
+	}
 }
 
 func indexKeyFromString(s string) indexKey {
@@ -208,6 +239,76 @@ func indexKeyHasPrefixString(a indexKey, prefix string) bool {
 	return true
 }
 
+type prefixUpperBound struct {
+	prefix   string
+	cutLen   int
+	lastByte byte
+}
+
+func newPrefixUpperBound(prefix string) (prefixUpperBound, bool) {
+	for i := len(prefix) - 1; i >= 0; i-- {
+		if prefix[i] == 0xFF {
+			continue
+		}
+		return prefixUpperBound{
+			prefix:   prefix,
+			cutLen:   i + 1,
+			lastByte: prefix[i] + 1,
+		}, true
+	}
+	return prefixUpperBound{}, false
+}
+
+func compareStringPrefixUpperBound(s string, upper prefixUpperBound) int {
+	n := min(len(s), upper.cutLen)
+	last := upper.cutLen - 1
+	for i := 0; i < n; i++ {
+		ub := upper.prefix[i]
+		if i == last {
+			ub = upper.lastByte
+		}
+		if s[i] < ub {
+			return -1
+		}
+		if s[i] > ub {
+			return 1
+		}
+	}
+	if len(s) < upper.cutLen {
+		return -1
+	}
+	if len(s) > upper.cutLen {
+		return 1
+	}
+	return 0
+}
+
+func compareIndexKeyPrefixUpperBound(a indexKey, upper prefixUpperBound) int {
+	alen := a.byteLen()
+	n := min(alen, upper.cutLen)
+	last := upper.cutLen - 1
+	for i := 0; i < n; i++ {
+		ub := upper.prefix[i]
+		if i == last {
+			ub = upper.lastByte
+		}
+		ab := a.byteAt(i)
+		if ab < ub {
+			return -1
+		}
+		if ab > ub {
+			return 1
+		}
+	}
+	if alen < upper.cutLen {
+		return -1
+	}
+	if alen > upper.cutLen {
+		return 1
+	}
+	return 0
+}
+
 func indexKeyHasSuffixString(a indexKey, suffix string) bool {
 	if len(suffix) == 0 {
 		return true
@@ -287,12 +388,9 @@ type buildIndexRunHeap struct {
 }
 
 type buildIndexFieldRun struct {
-	stringKeys []string
-	numericKey []uint64
-	posts      []posting.List
-	stringBuf  *stringSliceBuf
-	u64Buf     *uint64SliceBuf
-	postBuf    *postingSliceBuf
+	stringBuf *pooled.SliceBuf[string]
+	u64Buf    *pooled.SliceBuf[uint64]
+	postBuf   *pooled.SliceBuf[posting.List]
 }
 
 func buildIndexRunTargetEntries() int {
@@ -317,7 +415,7 @@ func newBuildIndexFieldLocalState(numeric bool, slice bool) buildIndexFieldLocal
 
 func (s *buildIndexFieldLocalState) addValue(key string, idx uint64) {
 	if s.vals == nil {
-		s.vals = getPostingMap()
+		s.vals = postingMapPool.Get()
 	}
 	s.vals[key] = s.vals[key].BuildAdded(idx)
 }
@@ -352,50 +450,57 @@ func (s *buildIndexFieldLocalState) shouldFlushRegular() bool {
 }
 
 func (r buildIndexFieldRun) keyCount() int {
-	if r.numericKey != nil {
-		return len(r.numericKey)
+	if r.u64Buf != nil {
+		return r.u64Buf.Len()
 	}
-	return len(r.stringKeys)
+	if r.stringBuf == nil {
+		return 0
+	}
+	return r.stringBuf.Len()
 }
 
 func (r buildIndexFieldRun) keyAt(i int) indexKey {
-	if r.numericKey != nil {
-		return indexKeyFromU64(r.numericKey[i])
+	if r.u64Buf != nil {
+		return indexKeyFromU64(r.u64Buf.Get(i))
 	}
-	return indexKeyFromString(r.stringKeys[i])
+	return indexKeyFromString(r.stringBuf.Get(i))
+}
+
+func (r *buildIndexFieldRun) takePosting(i int) posting.List {
+	ids := r.postBuf.Get(i)
+	r.postBuf.Set(i, posting.List{})
+	return ids
 }
 
 func (r *buildIndexFieldRun) release() {
 	if r == nil {
 		return
 	}
-	posting.ReleaseSliceOwned(r.posts)
 	if r.stringBuf != nil {
-		r.stringBuf.values = r.stringKeys
-		releaseStringSliceBuf(r.stringBuf)
+		stringSlicePool.Put(r.stringBuf)
 		r.stringBuf = nil
 	}
 	if r.u64Buf != nil {
-		r.u64Buf.values = r.numericKey
-		releaseUint64SliceBuf(r.u64Buf)
+		uint64SlicePool.Put(r.u64Buf)
 		r.u64Buf = nil
 	}
 	if r.postBuf != nil {
-		r.postBuf.values = r.posts
-		releasePostingSliceBuf(r.postBuf)
+		for i := 0; i < r.postBuf.Len(); i++ {
+			ids := r.postBuf.Get(i)
+			ids.Release()
+			r.postBuf.Set(i, posting.List{})
+		}
+		postingSlicePool.Put(r.postBuf)
 		r.postBuf = nil
 	}
-	r.stringKeys = nil
-	r.numericKey = nil
-	r.posts = nil
 }
 
 func buildIndexStringRunFromPostingMap(m map[string]posting.List) buildIndexFieldRun {
 	if len(m) == 0 {
 		return buildIndexFieldRun{}
 	}
-	keyBuf := getStringSliceBuf(len(m))
-	keys := keyBuf.values[:0]
+	keyBuf := stringSlicePool.Get()
+	keyBuf.Grow(len(m))
 	for key, ids := range m {
 		ids = ids.BuildOptimized()
 		if ids.IsEmpty() {
@@ -403,26 +508,22 @@ func buildIndexStringRunFromPostingMap(m map[string]posting.List) buildIndexFiel
 			continue
 		}
 		m[key] = ids
-		keys = append(keys, key)
+		keyBuf.Append(key)
 	}
-	if len(keys) == 0 {
-		keyBuf.values = keys
-		releaseStringSliceBuf(keyBuf)
+	if keyBuf.Len() == 0 {
+		stringSlicePool.Put(keyBuf)
 		return buildIndexFieldRun{}
 	}
-	sort.Strings(keys)
-	keyBuf.values = keys
-	postBuf := getPostingSliceBuf(len(keys))
-	posts := postBuf.values[:len(keys)]
-	for i := range keys {
-		posts[i] = m[keys[i]]
+	pooled.SortSlice(keyBuf)
+	postBuf := postingSlicePool.Get()
+	postBuf.SetLen(keyBuf.Len())
+	for i := 0; i < keyBuf.Len(); i++ {
+		postBuf.Set(i, m[keyBuf.Get(i)])
 	}
 	clear(m)
 	return buildIndexFieldRun{
-		stringKeys: keys,
-		posts:      posts,
-		stringBuf:  keyBuf,
-		postBuf:    postBuf,
+		stringBuf: keyBuf,
+		postBuf:   postBuf,
 	}
 }
 
@@ -430,8 +531,8 @@ func buildIndexFixedRunFromPostingMap(m map[uint64]posting.List) buildIndexField
 	if len(m) == 0 {
 		return buildIndexFieldRun{}
 	}
-	keyBuf := getUint64SliceBuf(len(m))
-	keys := keyBuf.values[:0]
+	keyBuf := uint64SlicePool.Get()
+	keyBuf.Grow(len(m))
 	for key, ids := range m {
 		ids = ids.BuildOptimized()
 		if ids.IsEmpty() {
@@ -439,26 +540,22 @@ func buildIndexFixedRunFromPostingMap(m map[uint64]posting.List) buildIndexField
 			continue
 		}
 		m[key] = ids
-		keys = append(keys, key)
+		keyBuf.Append(key)
 	}
-	if len(keys) == 0 {
-		keyBuf.values = keys
-		releaseUint64SliceBuf(keyBuf)
+	if keyBuf.Len() == 0 {
+		uint64SlicePool.Put(keyBuf)
 		return buildIndexFieldRun{}
 	}
-	slices.Sort(keys)
-	keyBuf.values = keys
-	postBuf := getPostingSliceBuf(len(keys))
-	posts := postBuf.values[:len(keys)]
-	for i := range keys {
-		posts[i] = m[keys[i]]
+	pooled.SortSlice(keyBuf)
+	postBuf := postingSlicePool.Get()
+	postBuf.SetLen(keyBuf.Len())
+	for i := 0; i < keyBuf.Len(); i++ {
+		postBuf.Set(i, m[keyBuf.Get(i)])
 	}
 	clear(m)
 	return buildIndexFieldRun{
-		numericKey: keys,
-		posts:      posts,
-		u64Buf:     keyBuf,
-		postBuf:    postBuf,
+		u64Buf:  keyBuf,
+		postBuf: postBuf,
 	}
 }
 
@@ -601,11 +698,7 @@ func (s *buildIndexFieldState) materializeStorage() fieldIndexStorage {
 	}
 	runs := s.runs
 	s.runs = nil
-	defer func() {
-		for i := range runs {
-			runs[i].release()
-		}
-	}()
+	defer releaseBuildIndexRuns(runs)
 	total := 0
 	numeric := s.numeric
 	for i := range runs {
@@ -644,8 +737,7 @@ func (s *buildIndexFieldState) materializeStorage() fieldIndexStorage {
 		item := h.pop()
 		run := &h.runs[item.run]
 		key := item.key
-		merged := run.posts[item.pos]
-		run.posts[item.pos] = posting.List{}
+		merged := run.takePosting(item.pos)
 		h.push(item.run, item.pos+1)
 
 		for h.Len() > 0 {
@@ -655,8 +747,7 @@ func (s *buildIndexFieldState) materializeStorage() fieldIndexStorage {
 			}
 			item = h.pop()
 			run = &h.runs[item.run]
-			merged = merged.BuildMergedOwned(run.posts[item.pos])
-			run.posts[item.pos] = posting.List{}
+			merged = merged.BuildMergedOwned(run.takePosting(item.pos))
 			h.push(item.run, item.pos+1)
 		}
 		merged = merged.BuildOptimized()
@@ -828,17 +919,7 @@ func (db *DB[K, V]) buildIndex(skipFields map[string]struct{}) error {
 
 	localUniverse := make([]posting.List, workers)
 	buildOK := false
-	defer func() {
-		if buildOK {
-			return
-		}
-		for i := range fieldStates {
-			fieldStates[i].release()
-		}
-		for i := range localUniverse {
-			localUniverse[i].Release()
-		}
-	}()
+	defer cleanupBuildIndexFailure(&buildOK, fieldStates, localUniverse)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -857,11 +938,7 @@ func (db *DB[K, V]) buildIndex(skipFields map[string]struct{}) error {
 			for i := range active {
 				localStates[i] = newBuildIndexFieldLocalState(active[i].numeric, active[i].slice)
 			}
-			defer func() {
-				for i := range localStates {
-					localStates[i].release()
-				}
-			}()
+			defer releaseBuildIndexLocalStates(localStates)
 
 			var zero V
 			for kv := range jobs {
@@ -1037,8 +1114,8 @@ func addDistinctStrings(n int, valueAt func(int) string, add func(string)) int {
 		add(valueAt(0))
 		return 1
 	}
-	seen := getStringSet(n)
-	defer releaseStringSet(seen)
+	seen := stringSetPool.Get(n)
+	defer stringSetPool.Put(seen)
 	distinct := 0
 	for i := 0; i < n; i++ {
 		cur := valueAt(i)
@@ -1130,11 +1207,7 @@ const (
 )
 
 func (db *DB[K, V]) loadIndex() (skipFields map[string]struct{}, plannerStats *plannerStatsSnapshot, err error) {
-	defer func() {
-		if r := recover(); r != nil {
-			err = fmt.Errorf("loadIndex panic: %v", r)
-		}
-	}()
+	defer recoverLoadIndex(&err)
 
 	f, err := os.Open(db.rbiFile)
 	if err != nil {
@@ -1344,9 +1417,7 @@ func (db *DB[K, V]) storeIndex() error {
 	forceMemoryCleanup(true)
 
 	tmpFile := db.rbiFile + ".temp"
-	defer func() {
-		_ = os.Remove(tmpFile)
-	}()
+	defer os.Remove(tmpFile)
 
 	f, err := os.Create(tmpFile)
 	if err != nil {
@@ -2752,11 +2823,27 @@ func (o fieldOverlay) lowerBound(key string) int {
 	return lowerBoundIndex(o.base, key)
 }
 
+func (o fieldOverlay) lowerBoundKey(key indexKey) int {
+	if o.chunked != nil {
+		_, rank := o.chunked.lowerBoundPosKey(key)
+		return rank
+	}
+	return lowerBoundIndexKey(o.base, key)
+}
+
 func (o fieldOverlay) upperBound(key string) int {
 	if o.chunked != nil {
 		return o.chunked.upperBound(key)
 	}
 	return upperBoundIndex(o.base, key)
+}
+
+func (o fieldOverlay) upperBoundKey(key indexKey) int {
+	if o.chunked != nil {
+		_, rank := o.chunked.upperBoundPosKey(key)
+		return rank
+	}
+	return upperBoundIndexKey(o.base, key)
 }
 
 func (o fieldOverlay) prefixRangeEnd(prefix string, start int) int {
@@ -2800,21 +2887,21 @@ func (o fieldOverlay) postingAt(rank int) posting.List {
 	return o.base[rank].IDs.Borrow()
 }
 
-func (o fieldOverlay) lookupPostings(keys []string) ([]posting.List, uint64, *postingSliceBuf) {
-	postsBuf := getPostingSliceBuf(len(keys))
-	posts := postsBuf.values
+func (o fieldOverlay) lookupPostings(keys stringKeyReader) (*pooled.SliceBuf[posting.List], uint64) {
+	postsBuf := postingSlicePool.Get()
+	keyCount := stringKeyReaderLen(keys)
+	postsBuf.Grow(keyCount)
 	var est uint64
 
-	for _, key := range keys {
-		ids := o.lookupPostingRetained(key)
+	for i := 0; i < keyCount; i++ {
+		ids := o.lookupPostingRetained(keys.Get(i))
 		if ids.IsEmpty() {
 			continue
 		}
-		posts = append(posts, ids)
+		postsBuf.Append(ids)
 		est += ids.Cardinality()
 	}
-	postsBuf.values = posts
-	return posts, est, postsBuf
+	return postsBuf, est
 }
 
 func (o fieldOverlay) rangeForBounds(b rangeBounds) overlayRange {
@@ -2839,11 +2926,22 @@ func (o fieldOverlay) rangeForBounds(b rangeBounds) overlayRange {
 	}
 
 	if b.hasLo {
-		bl := o.lowerBound(b.loKey)
+		bl := 0
+		if b.loNumeric {
+			bl = o.lowerBoundKey(b.loIndex)
+		} else {
+			bl = o.lowerBound(b.loKey)
+		}
 		if !b.loInc {
-			ids := o.lookupPostingRetained(b.loKey)
-			if !ids.IsEmpty() {
-				bl++
+			if b.loNumeric {
+				if bl < len(o.base) && compareIndexKeys(o.base[bl].Key, b.loIndex) == 0 {
+					bl++
+				}
+			} else {
+				ids := o.lookupPostingRetained(b.loKey)
+				if !ids.IsEmpty() {
+					bl++
+				}
 			}
 		}
 		br.baseStart = max(br.baseStart, bl)
@@ -2851,10 +2949,18 @@ func (o fieldOverlay) rangeForBounds(b rangeBounds) overlayRange {
 
 	if b.hasHi {
 		var bh int
-		if b.hiInc {
-			bh = o.upperBound(b.hiKey)
+		if b.hiNumeric {
+			if b.hiInc {
+				bh = o.upperBoundKey(b.hiIndex)
+			} else {
+				bh = o.lowerBoundKey(b.hiIndex)
+			}
 		} else {
-			bh = o.lowerBound(b.hiKey)
+			if b.hiInc {
+				bh = o.upperBound(b.hiKey)
+			} else {
+				bh = o.lowerBound(b.hiKey)
+			}
 		}
 		br.baseEnd = min(br.baseEnd, bh)
 	}
@@ -2902,9 +3008,19 @@ func (o fieldOverlay) rangeForBoundsChunked(b rangeBounds) overlayRange {
 	}
 
 	if b.hasLo {
-		bl, blRank := o.chunked.lowerBoundPos(b.loKey)
+		var (
+			bl     fieldIndexChunkPos
+			blRank int
+		)
+		if b.loNumeric {
+			bl, blRank = o.chunked.lowerBoundPosKey(b.loIndex)
+		} else {
+			bl, blRank = o.chunked.lowerBoundPos(b.loKey)
+		}
 		if !b.loInc {
-			if key, ok := o.chunked.posKey(bl); ok && indexKeyEqualsString(key, b.loKey) {
+			if key, ok := o.chunked.posKey(bl); ok &&
+				((b.loNumeric && compareIndexKeys(key, b.loIndex) == 0) ||
+					(!b.loNumeric && indexKeyEqualsString(key, b.loKey))) {
 				bl = o.chunked.advancePos(bl)
 				blRank++
 			}
@@ -2920,10 +3036,18 @@ func (o fieldOverlay) rangeForBoundsChunked(b rangeBounds) overlayRange {
 			bh     fieldIndexChunkPos
 			bhRank int
 		)
-		if b.hiInc {
-			bh, bhRank = o.chunked.upperBoundPos(b.hiKey)
+		if b.hiNumeric {
+			if b.hiInc {
+				bh, bhRank = o.chunked.upperBoundPosKey(b.hiIndex)
+			} else {
+				bh, bhRank = o.chunked.lowerBoundPosKey(b.hiIndex)
+			}
 		} else {
-			bh, bhRank = o.chunked.lowerBoundPos(b.hiKey)
+			if b.hiInc {
+				bh, bhRank = o.chunked.upperBoundPos(b.hiKey)
+			} else {
+				bh, bhRank = o.chunked.lowerBoundPos(b.hiKey)
+			}
 		}
 		if bhRank < br.baseEnd {
 			br.baseEnd = bhRank

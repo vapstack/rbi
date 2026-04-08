@@ -97,14 +97,10 @@ func main() {
 		if err != nil {
 			fatalf("line reader: %v", err)
 		}
-		defer func() {
-			_ = reader.Close()
-		}()
+		defer reader.Close()
 
 		renderer = newRenderer(os.Stdout, reader.Interactive() && isTerminal(int(os.Stdout.Fd())))
-		defer func() {
-			_ = renderer.Close()
-		}()
+		defer renderer.Close()
 	}
 
 	sigCh := make(chan os.Signal, 2)

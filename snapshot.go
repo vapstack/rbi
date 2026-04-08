@@ -1,14 +1,13 @@
 package rbi
 
 import (
-	"maps"
 	"slices"
 	"sort"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"unsafe"
 
+	"github.com/vapstack/rbi/internal/pooled"
 	"github.com/vapstack/rbi/internal/posting"
 )
 
@@ -74,19 +73,11 @@ func (s indexKeyOrder) Less(i, j int) bool {
 	return compareIndexKeys(s[i].Key, s[j].Key) < 0
 }
 
-var snapshotRefPool = sync.Pool{
-	New: func() any { return new(snapshotRef) },
-}
+var snapshotRefPool = pooled.Pointers[snapshotRef]{Clear: true}
 
-func getSnapshotRef() *snapshotRef {
-	return snapshotRefPool.Get().(*snapshotRef)
-}
+var recentKeyCacheEntryPool = pooled.Pointers[recentKeyCacheEntry]{Clear: true}
 
-func releaseSnapshotRef(ref *snapshotRef) {
-	ref.snap = nil
-	ref.refs.Store(0)
-	snapshotRefPool.Put(ref)
-}
+var materializedPredCacheEntryPool = pooled.Pointers[materializedPredCacheEntry]{Clear: true}
 
 func materializedPredCacheMaxCardinality(v int) uint64 {
 	if v < 0 {
@@ -153,6 +144,13 @@ func recentKeyCacheLimit(limit int) int {
 }
 
 func (c *recentKeyCache) clear() {
+	c.keys.Range(func(_, v any) bool {
+		entry, _ := v.(*recentKeyCacheEntry)
+		if entry != nil {
+			recentKeyCacheEntryPool.Put(entry)
+		}
+		return true
+	})
 	c.keys.Clear()
 	c.count.Store(0)
 	c.clock.Store(0)
@@ -183,8 +181,19 @@ func (c *recentKeyCache) evictOldest() bool {
 	return true
 }
 
-func (c *recentKeyCache) touchOrRemember(key string, limit int) bool {
-	if key == "" || limit <= 0 {
+func recentKeyCacheKeyOK(key any) bool {
+	switch key := key.(type) {
+	case materializedPredKey:
+		return !key.isZero()
+	case string:
+		return key != ""
+	default:
+		return false
+	}
+}
+
+func (c *recentKeyCache) touchOrRemember(key any, limit int) bool {
+	if !recentKeyCacheKeyOK(key) || limit <= 0 {
 		return false
 	}
 	if v, ok := c.keys.Load(key); ok {
@@ -201,12 +210,13 @@ func (c *recentKeyCache) touchOrRemember(key string, limit int) bool {
 		}
 	}
 
-	entry := &recentKeyCacheEntry{}
+	entry := recentKeyCacheEntryPool.Get()
 	entry.touch(&c.clock)
 	actual, loaded := c.keys.LoadOrStore(key, entry)
 	if !loaded {
 		return false
 	}
+	recentKeyCacheEntryPool.Put(entry)
 	c.count.Add(-1)
 	existing, _ := actual.(*recentKeyCacheEntry)
 	if existing != nil {
@@ -222,8 +232,8 @@ func addObservedWork(cur, delta uint64) uint64 {
 	return cur + delta
 }
 
-func (c *recentKeyCache) addWorkAndShouldPromote(key string, limit int, delta uint64, threshold uint64) bool {
-	if key == "" || limit <= 0 || delta == 0 || threshold == 0 {
+func (c *recentKeyCache) addWorkAndShouldPromote(key any, limit int, delta uint64, threshold uint64) bool {
+	if !recentKeyCacheKeyOK(key) || limit <= 0 || delta == 0 || threshold == 0 {
 		return false
 	}
 	if delta >= threshold {
@@ -258,13 +268,14 @@ func (c *recentKeyCache) addWorkAndShouldPromote(key string, limit int, delta ui
 		}
 	}
 
-	entry := &recentKeyCacheEntry{}
+	entry := recentKeyCacheEntryPool.Get()
 	entry.touch(&c.clock)
 	entry.work.Store(delta)
 	actual, loaded := c.keys.LoadOrStore(key, entry)
 	if !loaded {
 		return false
 	}
+	recentKeyCacheEntryPool.Put(entry)
 	c.count.Add(-1)
 	existing, _ := actual.(*recentKeyCacheEntry)
 	if existing == nil {
@@ -412,14 +423,33 @@ func inheritNumericRangeBucketCache(next, prev *indexSnapshot) {
 	})
 }
 
-func materializedPredCacheFieldName(key string) string {
-	if key == "" {
+func materializedPredCacheFieldName(key any) string {
+	switch key := key.(type) {
+	case materializedPredKey:
+		return key.field
+	case string:
+		parsed, ok := materializedPredKeyFromEncoded(key)
+		if !ok {
+			return ""
+		}
+		return parsed.field
+	default:
 		return ""
 	}
-	if i := strings.IndexByte(key, '\x1f'); i >= 0 {
-		return key[:i]
+}
+
+func materializedPredCacheNormalizedMapKey(key any) (materializedPredKey, bool) {
+	switch key := key.(type) {
+	case materializedPredKey:
+		if key.isZero() {
+			return materializedPredKey{}, false
+		}
+		return key, true
+	case string:
+		return materializedPredKeyFromEncoded(key)
+	default:
+		return materializedPredKey{}, false
 	}
-	return key
 }
 
 func inheritMaterializedPredCache[K ~string | ~uint64, V any](db *DB[K, V], next, prev *indexSnapshot, changedFields []bool) {
@@ -437,11 +467,11 @@ func inheritMaterializedPredCache[K ~string | ~uint64, V any](db *DB[K, V], next
 		if int(next.matPredCacheCount.Load()) >= limit {
 			return false
 		}
-		key, ok := k.(string)
-		if !ok || key == "" {
+		key, ok := materializedPredCacheNormalizedMapKey(k)
+		if !ok {
 			return true
 		}
-		f := materializedPredCacheFieldName(key)
+		f := key.field
 		if f == "" {
 			return true
 		}
@@ -464,10 +494,9 @@ func inheritMaterializedPredCache[K ~string | ~uint64, V any](db *DB[K, V], next
 			oversizedEntry = !entry.ids.IsEmpty() && next.matPredCacheMaxCard > 0 &&
 				entry.ids.Cardinality() > next.matPredCacheMaxCard
 		}
-		copied := &materializedPredCacheEntry{
-			ids:       cachedIDs,
-			oversized: oversizedEntry,
-		}
+		copied := materializedPredCacheEntryPool.Get()
+		copied.ids = cachedIDs
+		copied.oversized = oversizedEntry
 		if entry != nil {
 			stamp := entry.stamp.Load()
 			copied.stamp.Store(stamp)
@@ -476,6 +505,9 @@ func inheritMaterializedPredCache[K ~string | ~uint64, V any](db *DB[K, V], next
 			}
 		}
 		if _, loaded := next.matPredCache.LoadOrStore(key, copied); loaded {
+			copied.ids = posting.List{}
+			copied.oversized = false
+			materializedPredCacheEntryPool.Put(copied)
 			return true
 		}
 		next.matPredCacheCount.Add(1)
@@ -536,7 +568,7 @@ func (db *DB[K, V]) getSnapshot() *indexSnapshot {
 	return db.buildPublishedSnapshotNoLock(0)
 }
 
-func (s *indexSnapshot) loadMaterializedPred(key string) (posting.List, bool) {
+func (s *indexSnapshot) loadMaterializedPredStringKey(key string) (posting.List, bool) {
 	if s == nil || key == "" {
 		return posting.List{}, false
 	}
@@ -555,7 +587,72 @@ func (s *indexSnapshot) loadMaterializedPred(key string) (posting.List, bool) {
 	return e.ids.Borrow(), true
 }
 
+func (s *indexSnapshot) loadMaterializedPredKey(key materializedPredKey) (posting.List, bool) {
+	if s == nil || key.isZero() {
+		return posting.List{}, false
+	}
+	if s.materializedPredCacheLimit() <= 0 {
+		return posting.List{}, false
+	}
+	v, ok := s.matPredCache.Load(key)
+	if !ok {
+		return posting.List{}, false
+	}
+	e, _ := v.(*materializedPredCacheEntry)
+	if e == nil {
+		return posting.List{}, true
+	}
+	e.touch(&s.matPredCacheClock)
+	return e.ids.Borrow(), true
+}
+
+func (s *indexSnapshot) loadMaterializedPred(key string) (posting.List, bool) {
+	if s == nil || key == "" {
+		return posting.List{}, false
+	}
+	if parsed, ok := materializedPredKeyFromEncoded(key); ok {
+		return s.loadMaterializedPredKey(parsed)
+	}
+	return s.loadMaterializedPredStringKey(key)
+}
+
+func (s *indexSnapshot) storeMaterializedPredKey(key materializedPredKey, ids posting.List) {
+	if key.isZero() {
+		return
+	}
+	limit := s.materializedPredCacheLimit()
+	if limit <= 0 {
+		return
+	}
+	if !ids.IsEmpty() && s.matPredCacheMaxCard > 0 &&
+		ids.Cardinality() > s.matPredCacheMaxCard {
+		return
+	}
+	if !s.reserveMaterializedPredSlot(limit) {
+		return
+	}
+	stored := ids
+	if stored.IsBorrowed() {
+		stored = stored.Clone()
+	}
+	e := materializedPredCacheEntryPool.Get()
+	e.ids = stored
+	e.touch(&s.matPredCacheClock)
+	if _, loaded := s.matPredCache.LoadOrStore(key, e); loaded {
+		s.matPredCacheCount.Add(-1)
+		e.ids = posting.List{}
+		materializedPredCacheEntryPool.Put(e)
+		if !stored.SharesPayload(ids) {
+			stored.Release()
+		}
+	}
+}
+
 func (s *indexSnapshot) storeMaterializedPred(key string, ids posting.List) {
+	if parsed, ok := materializedPredKeyFromEncoded(key); ok {
+		s.storeMaterializedPredKey(parsed, ids)
+		return
+	}
 	if s == nil || key == "" {
 		return
 	}
@@ -574,10 +671,13 @@ func (s *indexSnapshot) storeMaterializedPred(key string, ids posting.List) {
 	if stored.IsBorrowed() {
 		stored = stored.Clone()
 	}
-	e := &materializedPredCacheEntry{ids: stored}
+	e := materializedPredCacheEntryPool.Get()
+	e.ids = stored
 	e.touch(&s.matPredCacheClock)
 	if _, loaded := s.matPredCache.LoadOrStore(key, e); loaded {
 		s.matPredCacheCount.Add(-1)
+		e.ids = posting.List{}
+		materializedPredCacheEntryPool.Put(e)
 		if !stored.SharesPayload(ids) {
 			stored.Release()
 		}
@@ -586,7 +686,50 @@ func (s *indexSnapshot) storeMaterializedPred(key string, ids posting.List) {
 
 // tryStoreMaterializedPredOversized stores a small bounded number of oversized
 // materialized postings per snapshot as a hot-cache fallback.
+func (s *indexSnapshot) tryStoreMaterializedPredOversizedKey(key materializedPredKey, ids posting.List) bool {
+	if key.isZero() || ids.IsEmpty() {
+		return false
+	}
+	if s.matPredCacheMaxCard == 0 || ids.Cardinality() <= s.matPredCacheMaxCard {
+		return false
+	}
+	limit := s.materializedPredCacheLimit()
+	if limit <= 0 {
+		return false
+	}
+	if !s.reserveMaterializedPredOversizedSlot(limit) {
+		return false
+	}
+	if !s.reserveMaterializedPredSlot(limit) {
+		s.matPredCacheOversizedCount.Add(-1)
+		return false
+	}
+	stored := ids
+	if stored.IsBorrowed() {
+		stored = stored.Clone()
+	}
+	e := materializedPredCacheEntryPool.Get()
+	e.ids = stored
+	e.oversized = true
+	e.touch(&s.matPredCacheClock)
+	if _, loaded := s.matPredCache.LoadOrStore(key, e); loaded {
+		s.matPredCacheOversizedCount.Add(-1)
+		s.matPredCacheCount.Add(-1)
+		e.ids = posting.List{}
+		e.oversized = false
+		materializedPredCacheEntryPool.Put(e)
+		if !stored.SharesPayload(ids) {
+			stored.Release()
+		}
+		return false
+	}
+	return true
+}
+
 func (s *indexSnapshot) tryStoreMaterializedPredOversized(key string, ids posting.List) bool {
+	if parsed, ok := materializedPredKeyFromEncoded(key); ok {
+		return s.tryStoreMaterializedPredOversizedKey(parsed, ids)
+	}
 	if s == nil || key == "" || ids.IsEmpty() {
 		return false
 	}
@@ -608,11 +751,16 @@ func (s *indexSnapshot) tryStoreMaterializedPredOversized(key string, ids postin
 	if stored.IsBorrowed() {
 		stored = stored.Clone()
 	}
-	e := &materializedPredCacheEntry{ids: stored, oversized: true}
+	e := materializedPredCacheEntryPool.Get()
+	e.ids = stored
+	e.oversized = true
 	e.touch(&s.matPredCacheClock)
 	if _, loaded := s.matPredCache.LoadOrStore(key, e); loaded {
 		s.matPredCacheOversizedCount.Add(-1)
 		s.matPredCacheCount.Add(-1)
+		e.ids = posting.List{}
+		e.oversized = false
+		materializedPredCacheEntryPool.Put(e)
 		if !stored.SharesPayload(ids) {
 			stored.Release()
 		}
@@ -621,7 +769,61 @@ func (s *indexSnapshot) tryStoreMaterializedPredOversized(key string, ids postin
 	return true
 }
 
+func (s *indexSnapshot) loadOrStoreMaterializedPredKey(key materializedPredKey, ids posting.List) (posting.List, bool) {
+	if key.isZero() || ids.IsEmpty() {
+		return ids, false
+	}
+	limit := s.materializedPredCacheLimit()
+	if limit <= 0 {
+		return ids, false
+	}
+	if s.matPredCacheMaxCard > 0 &&
+		ids.Cardinality() > s.matPredCacheMaxCard {
+		return ids, false
+	}
+	if cached, ok := s.loadMaterializedPredKey(key); ok {
+		ids.Release()
+		return cached, true
+	}
+	if !s.reserveMaterializedPredSlot(limit) {
+		if cached, ok := s.loadMaterializedPredKey(key); ok {
+			ids.Release()
+			return cached, true
+		}
+		return ids, false
+	}
+
+	stored := ids
+	if stored.IsBorrowed() {
+		stored = stored.Clone()
+	}
+	e := materializedPredCacheEntryPool.Get()
+	e.ids = stored
+	actual, loaded := s.matPredCache.LoadOrStore(key, e)
+	if loaded {
+		s.matPredCacheCount.Add(-1)
+		e.ids = posting.List{}
+		materializedPredCacheEntryPool.Put(e)
+		if !stored.SharesPayload(ids) {
+			stored.Release()
+		}
+		ids.Release()
+		entry, _ := actual.(*materializedPredCacheEntry)
+		if entry == nil {
+			return posting.List{}, true
+		} else {
+			entry.touch(&s.matPredCacheClock)
+			return entry.ids.Borrow(), true
+		}
+	}
+	e.touch(&s.matPredCacheClock)
+	return stored.Borrow(), true
+}
+
 func (s *indexSnapshot) loadOrStoreMaterializedPred(key string, ids posting.List) (posting.List, bool) {
+	if parsed, ok := materializedPredKeyFromEncoded(key); ok {
+		return s.loadOrStoreMaterializedPredKey(parsed, ids)
+	}
 	if s == nil || key == "" || ids.IsEmpty() {
 		return ids, false
 	}
@@ -649,10 +851,69 @@ func (s *indexSnapshot) loadOrStoreMaterializedPred(key string, ids posting.List
 	if stored.IsBorrowed() {
 		stored = stored.Clone()
 	}
-	e := &materializedPredCacheEntry{ids: stored}
+	e := materializedPredCacheEntryPool.Get()
+	e.ids = stored
 	actual, loaded := s.matPredCache.LoadOrStore(key, e)
 	if loaded {
 		s.matPredCacheCount.Add(-1)
+		e.ids = posting.List{}
+		materializedPredCacheEntryPool.Put(e)
+		if !stored.SharesPayload(ids) {
+			stored.Release()
+		}
+		ids.Release()
+		entry, _ := actual.(*materializedPredCacheEntry)
+		if entry == nil {
+			return posting.List{}, true
+		}
+		entry.touch(&s.matPredCacheClock)
+		return entry.ids.Borrow(), true
+	}
+	e.touch(&s.matPredCacheClock)
+	return stored.Borrow(), true
+}
+
+func (s *indexSnapshot) tryLoadOrStoreMaterializedPredOversizedKey(key materializedPredKey, ids posting.List) (posting.List, bool) {
+	if key.isZero() || ids.IsEmpty() {
+		return ids, false
+	}
+	if s.matPredCacheMaxCard == 0 || ids.Cardinality() <= s.matPredCacheMaxCard {
+		return ids, false
+	}
+	limit := s.materializedPredCacheLimit()
+	if limit <= 0 {
+		return ids, false
+	}
+	if cached, ok := s.loadMaterializedPredKey(key); ok {
+		ids.Release()
+		return cached, true
+	}
+	if !s.reserveMaterializedPredOversizedSlot(limit) {
+		return ids, false
+	}
+	if !s.reserveMaterializedPredSlot(limit) {
+		s.matPredCacheOversizedCount.Add(-1)
+		if cached, ok := s.loadMaterializedPredKey(key); ok {
+			ids.Release()
+			return cached, true
+		}
+		return ids, false
+	}
+
+	stored := ids
+	if stored.IsBorrowed() {
+		stored = stored.Clone()
+	}
+	e := materializedPredCacheEntryPool.Get()
+	e.ids = stored
+	e.oversized = true
+	actual, loaded := s.matPredCache.LoadOrStore(key, e)
+	if loaded {
+		s.matPredCacheOversizedCount.Add(-1)
+		s.matPredCacheCount.Add(-1)
+		e.ids = posting.List{}
+		e.oversized = false
+		materializedPredCacheEntryPool.Put(e)
 		if !stored.SharesPayload(ids) {
 			stored.Release()
 		}
@@ -670,6 +931,9 @@ func (s *indexSnapshot) loadOrStoreMaterializedPred(key string, ids posting.List
 }
 
 func (s *indexSnapshot) tryLoadOrStoreMaterializedPredOversized(key string, ids posting.List) (posting.List, bool) {
+	if parsed, ok := materializedPredKeyFromEncoded(key); ok {
+		return s.tryLoadOrStoreMaterializedPredOversizedKey(parsed, ids)
+	}
 	if s == nil || key == "" || ids.IsEmpty() {
 		return ids, false
 	}
@@ -700,11 +964,16 @@ func (s *indexSnapshot) tryLoadOrStoreMaterializedPredOversized(key string, ids 
 	if stored.IsBorrowed() {
 		stored = stored.Clone()
 	}
-	e := &materializedPredCacheEntry{ids: stored, oversized: true}
+	e := materializedPredCacheEntryPool.Get()
+	e.ids = stored
+	e.oversized = true
 	actual, loaded := s.matPredCache.LoadOrStore(key, e)
 	if loaded {
 		s.matPredCacheOversizedCount.Add(-1)
 		s.matPredCacheCount.Add(-1)
+		e.ids = posting.List{}
+		e.oversized = false
+		materializedPredCacheEntryPool.Put(e)
 		if !stored.SharesPayload(ids) {
 			stored.Release()
 		}
@@ -712,10 +981,9 @@ func (s *indexSnapshot) tryLoadOrStoreMaterializedPredOversized(key string, ids 
 		entry, _ := actual.(*materializedPredCacheEntry)
 		if entry == nil {
 			return posting.List{}, true
-		} else {
-			entry.touch(&s.matPredCacheClock)
-			return entry.ids.Borrow(), true
 		}
+		entry.touch(&s.matPredCacheClock)
+		return entry.ids.Borrow(), true
 	}
 	e.touch(&s.matPredCacheClock)
 	return stored.Borrow(), true
@@ -735,6 +1003,15 @@ func (s *indexSnapshot) clearRuntimeCachesForTesting() {
 	if s.numericRangeBucketCache != nil {
 		s.numericRangeBucketCache.Clear()
 	}
+	s.matPredCache.Range(func(_, v any) bool {
+		entry, _ := v.(*materializedPredCacheEntry)
+		if entry != nil {
+			entry.ids = posting.List{}
+			entry.oversized = false
+			materializedPredCacheEntryPool.Put(entry)
+		}
+		return true
+	})
 	s.matPredCache.Clear()
 	s.matPredCacheCount.Store(0)
 	s.matPredCacheOversizedCount.Store(0)
@@ -743,14 +1020,39 @@ func (s *indexSnapshot) clearRuntimeCachesForTesting() {
 	s.orderORMatPredObserved.clear()
 }
 
+func (s *indexSnapshot) shouldPromoteRuntimeMaterializedPredKey(key materializedPredKey) bool {
+	if key.isZero() {
+		return false
+	}
+	return s.runtimeMatPredSeen.touchOrRemember(key, recentKeyCacheLimit(s.matPredCacheMaxEntries))
+}
+
 func (s *indexSnapshot) shouldPromoteRuntimeMaterializedPred(key string) bool {
+	if parsed, ok := materializedPredKeyFromEncoded(key); ok {
+		return s.shouldPromoteRuntimeMaterializedPredKey(parsed)
+	}
 	if s == nil || key == "" {
 		return false
 	}
 	return s.runtimeMatPredSeen.touchOrRemember(key, recentKeyCacheLimit(s.matPredCacheMaxEntries))
 }
 
+func (s *indexSnapshot) shouldPromoteObservedOrderedORMaterializedPredKey(key materializedPredKey, observedWork uint64, buildWork uint64) bool {
+	if key.isZero() || observedWork == 0 || buildWork == 0 {
+		return false
+	}
+	return s.orderORMatPredObserved.addWorkAndShouldPromote(
+		key,
+		recentKeyCacheLimit(s.matPredCacheMaxEntries),
+		observedWork,
+		buildWork,
+	)
+}
+
 func (s *indexSnapshot) shouldPromoteObservedOrderedORMaterializedPred(key string, observedWork uint64, buildWork uint64) bool {
+	if parsed, ok := materializedPredKeyFromEncoded(key); ok {
+		return s.shouldPromoteObservedOrderedORMaterializedPredKey(parsed, observedWork, buildWork)
+	}
 	if s == nil || key == "" || observedWork == 0 || buildWork == 0 {
 		return false
 	}
@@ -848,7 +1150,7 @@ func (db *DB[K, V]) publishSnapshotRef(s *indexSnapshot) {
 	prev := db.snapshot.current.Load()
 	ref := db.snapshot.bySeq[s.seq]
 	if ref == nil {
-		ref = getSnapshotRef()
+		ref = snapshotRefPool.Get()
 		db.snapshot.bySeq[s.seq] = ref
 	}
 	ref.snap = s
@@ -867,7 +1169,7 @@ func (db *DB[K, V]) stageSnapshot(s *indexSnapshot) {
 
 	ref := db.snapshot.bySeq[s.seq]
 	if ref == nil {
-		ref = getSnapshotRef()
+		ref = snapshotRefPool.Get()
 		db.snapshot.bySeq[s.seq] = ref
 	}
 	ref.snap = s
@@ -886,7 +1188,7 @@ func (db *DB[K, V]) dropStagedSnapshot(seq uint64) {
 	}
 	if ref.refs.Load() <= 0 {
 		delete(db.snapshot.bySeq, seq)
-		releaseSnapshotRef(ref)
+		snapshotRefPool.Put(ref)
 		return
 	}
 	ref.snap = nil
@@ -918,7 +1220,7 @@ func (db *DB[K, V]) unpinSnapshotRef(seq uint64, ref *snapshotRef) {
 		return
 	}
 	delete(db.snapshot.bySeq, seq)
-	releaseSnapshotRef(held)
+	snapshotRefPool.Put(held)
 }
 
 func (db *DB[K, V]) retireSnapshotLocked(seq uint64) {
@@ -934,7 +1236,7 @@ func (db *DB[K, V]) retireSnapshotLocked(seq uint64) {
 		return
 	}
 	delete(db.snapshot.bySeq, seq)
-	releaseSnapshotRef(ref)
+	snapshotRefPool.Put(ref)
 }
 
 // SnapshotStats returns diagnostics for published index snapshots.
@@ -1083,7 +1385,11 @@ func rebuildLenIndexField(universe posting.List, fieldOV fieldOverlay) (*[]index
 
 func addFieldPostingListHint(fieldMap map[string]posting.List, key string, idx uint64, capHint int) map[string]posting.List {
 	if fieldMap == nil {
-		fieldMap = getPostingMapHint(capHint)
+		if capHint >= 64 {
+			fieldMap = make(map[string]posting.List, min(capHint, postingMapPoolMaxLen))
+		} else {
+			fieldMap = postingMapPool.Get()
+		}
 	}
 	p := fieldMap[key]
 	p = p.BuildAdded(idx)
@@ -1093,7 +1399,11 @@ func addFieldPostingListHint(fieldMap map[string]posting.List, key string, idx u
 
 func addFixedFieldPostingListHint(fieldMap map[uint64]posting.List, key uint64, idx uint64, capHint int) map[uint64]posting.List {
 	if fieldMap == nil {
-		fieldMap = getFixedPostingMapHint(capHint)
+		if capHint >= 64 {
+			fieldMap = make(map[uint64]posting.List, min(capHint, postingMapPoolMaxLen))
+		} else {
+			fieldMap = fixedPostingMapPool.Get()
+		}
 	}
 	p := fieldMap[key]
 	p = p.BuildAdded(idx)
@@ -1205,7 +1515,7 @@ func mergeInsertOnlyFieldSliceOwned(
 	fixed8 bool,
 ) *[]index {
 	if len(adds) == 0 {
-		releaseInsertPostingMap(adds)
+		insertPostingMapPool.Put(adds)
 		return base
 	}
 	if len(adds) == 1 {
@@ -1216,7 +1526,7 @@ func mergeInsertOnlyFieldSliceOwned(
 				IDs: arena.accum(ref).materializeOwned(),
 			}
 		}
-		releaseInsertPostingMap(adds)
+		insertPostingMapPool.Put(adds)
 		return mergeInsertOnlySingleFieldEntry(base, add)
 	}
 
@@ -1228,7 +1538,7 @@ func mergeInsertOnlyFieldSliceOwned(
 			IDs: ids,
 		})
 	}
-	releaseInsertPostingMap(adds)
+	insertPostingMapPool.Put(adds)
 
 	return mergeInsertOnlyFieldEntries(base, addSlice)
 }
@@ -1239,7 +1549,7 @@ func mergeInsertOnlyFixedFieldSliceOwned(
 	arena *insertPostingAccumArena,
 ) *[]index {
 	if len(adds) == 0 {
-		releaseFixedInsertPostingMap(adds)
+		fixedInsertPostingMapPool.Put(adds)
 		return base
 	}
 	if len(adds) == 1 {
@@ -1250,7 +1560,7 @@ func mergeInsertOnlyFixedFieldSliceOwned(
 				IDs: arena.accum(ref).materializeOwned(),
 			}
 		}
-		releaseFixedInsertPostingMap(adds)
+		fixedInsertPostingMapPool.Put(adds)
 		return mergeInsertOnlySingleFieldEntry(base, add)
 	}
 
@@ -1262,7 +1572,7 @@ func mergeInsertOnlyFixedFieldSliceOwned(
 			IDs: ids,
 		})
 	}
-	releaseFixedInsertPostingMap(adds)
+	fixedInsertPostingMapPool.Put(adds)
 
 	return mergeInsertOnlyFieldEntries(base, addSlice)
 }
@@ -1352,27 +1662,6 @@ func (db *DB[K, V]) buildPreparedSnapshotInsertOnlyNoLock(seq uint64, prev *inde
 	indexCloned := false
 	nilIndexCloned := false
 	lenIndexCloned := false
-	ensureIndex := func() map[string]fieldIndexStorage {
-		if !indexCloned {
-			next.index = maps.Clone(prev.index)
-			indexCloned = true
-		}
-		return next.index
-	}
-	ensureNilIndex := func() map[string]fieldIndexStorage {
-		if !nilIndexCloned {
-			next.nilIndex = maps.Clone(prev.nilIndex)
-			nilIndexCloned = true
-		}
-		return next.nilIndex
-	}
-	ensureLenIndex := func() map[string]fieldIndexStorage {
-		if !lenIndexCloned {
-			next.lenIndex = maps.Clone(prev.lenIndex)
-			lenIndexCloned = true
-		}
-		return next.lenIndex
-	}
 
 	fieldStates := make([]snapshotFieldInsertState, len(db.indexedFieldAccess))
 	initSnapshotFieldInsertStateHints(fieldStates, db.indexedFieldAccess, prev, len(prepared))
@@ -1393,23 +1682,23 @@ func (db *DB[K, V]) buildPreparedSnapshotInsertOnlyNoLock(seq uint64, prev *inde
 		baseIndex := next.index[f]
 		if storage := acc.mergeSnapshotInsertStorageOwned(baseIndex, &fieldStates[i], true); storage.keyCount() > 0 {
 			if storage != baseIndex {
-				ensureIndex()[f] = storage
+				ensureSnapshotFieldIndex(&next.index, prev.index, &indexCloned)[f] = storage
 			}
 		} else if baseIndex.keyCount() > 0 {
-			delete(ensureIndex(), f)
+			delete(ensureSnapshotFieldIndex(&next.index, prev.index, &indexCloned), f)
 		}
 		baseNil := next.nilIndex[f]
 		if storage := acc.mergeSnapshotInsertNilStorageOwned(baseNil, &fieldStates[i]); storage.keyCount() > 0 {
 			if storage != baseNil {
-				ensureNilIndex()[f] = storage
+				ensureSnapshotFieldIndex(&next.nilIndex, prev.nilIndex, &nilIndexCloned)[f] = storage
 			}
 		} else if baseNil.keyCount() > 0 {
-			delete(ensureNilIndex(), f)
+			delete(ensureSnapshotFieldIndex(&next.nilIndex, prev.nilIndex, &nilIndexCloned), f)
 		}
 		if fieldStates[i].lengths != nil {
 			baseLen := next.lenIndex[f]
 			if storage := applyLenFieldPostingDiffStorageOwned(baseLen, fieldStates[i].lengths); storage != baseLen {
-				ensureLenIndex()[f] = storage
+				ensureSnapshotFieldIndex(&next.lenIndex, prev.lenIndex, &lenIndexCloned)[f] = storage
 			}
 			fieldStates[i].lengths = nil
 		}

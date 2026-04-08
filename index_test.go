@@ -3012,6 +3012,98 @@ func TestIndexExt_StringOverlayUnionRangeMatchesFlat(t *testing.T) {
 	}
 }
 
+func TestIndexExt_StringMergeOverlayRangeIntoMatchesFlat(t *testing.T) {
+	fx := indexExtStringFixture(t)
+	seedIDs := []uint64{1, 9, 64, 127}
+	for _, window := range indexExtRangeWindows(len(fx.keys)) {
+		start, end := indexExtNormalizeWindow(window[0], window[1], len(fx.keys))
+
+		seedFlat := posting.BuildFromSorted(seedIDs)
+		got := mergeOverlayRangeInto(seedFlat, fx.chunked, fx.chunked.rangeByRanks(start, end))
+
+		seedChunked := posting.BuildFromSorted(seedIDs)
+		want := mergeOverlayRangeInto(seedChunked, fx.flat, fx.flat.rangeByRanks(start, end))
+
+		indexExtAssertSameSlice(t, got.ToArray(), want.ToArray())
+		got.Release()
+		want.Release()
+	}
+}
+
+func TestIndexExt_StringMergeOverlayRangeIntoMatchesBaselineUnion(t *testing.T) {
+	fx := indexExtStringFixture(t)
+	seedIDs := []uint64{1, 9, 64, 127}
+	for _, window := range indexExtRangeWindows(len(fx.keys)) {
+		start, end := indexExtNormalizeWindow(window[0], window[1], len(fx.keys))
+		br := fx.chunked.rangeByRanks(start, end)
+
+		gotBase := posting.BuildFromSorted(seedIDs)
+		got := mergeOverlayRangeInto(gotBase, fx.chunked, br)
+
+		wantBase := posting.BuildFromSorted(seedIDs)
+		add := overlayUnionRange(fx.chunked, br)
+		want := wantBase.BuildMergedOwned(add)
+
+		indexExtAssertSameSlice(t, got.ToArray(), want.ToArray())
+		got.Release()
+		want.Release()
+	}
+}
+
+func TestIndexExt_StringOverlayUnionRangesMatchesBaselineUnion(t *testing.T) {
+	fx := indexExtStringFixture(t)
+	cases := [][4]int{
+		{0, 24, 48, 96},
+		{7, 31, 31, 63},
+		{16, 64, 96, 144},
+		{0, 0, 32, 64},
+		{120, 160, 160, len(fx.keys)},
+	}
+	for _, tc := range cases {
+		firstStart, firstEnd := indexExtNormalizeWindow(tc[0], tc[1], len(fx.keys))
+		secondStart, secondEnd := indexExtNormalizeWindow(tc[2], tc[3], len(fx.keys))
+		first := fx.chunked.rangeByRanks(firstStart, firstEnd)
+		second := fx.chunked.rangeByRanks(secondStart, secondEnd)
+
+		got := overlayUnionRanges(fx.chunked, first, second)
+		want := overlayUnionRange(fx.chunked, first)
+		want = want.BuildMergedOwned(overlayUnionRange(fx.chunked, second))
+
+		indexExtAssertSameSlice(t, got.ToArray(), want.ToArray())
+		got.Release()
+		want.Release()
+	}
+}
+
+func TestIndexExt_StringMergeOverlayRangesIntoMatchesBaselineUnion(t *testing.T) {
+	fx := indexExtStringFixture(t)
+	seedIDs := []uint64{1, 9, 64, 127}
+	cases := [][4]int{
+		{0, 24, 48, 96},
+		{7, 31, 31, 63},
+		{16, 64, 96, 144},
+		{0, 0, 32, 64},
+		{120, 160, 160, len(fx.keys)},
+	}
+	for _, tc := range cases {
+		firstStart, firstEnd := indexExtNormalizeWindow(tc[0], tc[1], len(fx.keys))
+		secondStart, secondEnd := indexExtNormalizeWindow(tc[2], tc[3], len(fx.keys))
+		first := fx.chunked.rangeByRanks(firstStart, firstEnd)
+		second := fx.chunked.rangeByRanks(secondStart, secondEnd)
+
+		gotBase := posting.BuildFromSorted(seedIDs)
+		got := mergeOverlayRangesInto(gotBase, fx.chunked, first, second)
+
+		wantBase := posting.BuildFromSorted(seedIDs)
+		want := wantBase.BuildMergedOwned(overlayUnionRange(fx.chunked, first))
+		want = want.BuildMergedOwned(overlayUnionRange(fx.chunked, second))
+
+		indexExtAssertSameSlice(t, got.ToArray(), want.ToArray())
+		got.Release()
+		want.Release()
+	}
+}
+
 func TestIndexExt_NumericBoundsMatchFlat(t *testing.T) {
 	fx := indexExtNumericFixture(t)
 	probes := []string{
@@ -3366,7 +3458,7 @@ func TestIndexExt_MergeInsertOnlyFieldStorageOwnedUnionsExistingKeysAndKeepsSort
 	baseStorage := newRegularFieldIndexStorage(&baseEntries)
 	expected := indexExtExpectedMapFromEntries(baseFix.entries)
 
-	adds := getInsertPostingMap()
+	adds := insertPostingMapPool.Get()
 	var arena *insertPostingAccumArena
 	for i, rank := range []int{1, 189, 190, 191, 389} {
 		key := baseFix.keys[rank]
@@ -3399,7 +3491,7 @@ func TestIndexExt_MergeInsertOnlyFieldStorageOwnedUnionsExistingKeysAndKeepsSort
 }
 
 func TestIndexExt_MergeInsertOnlyFieldStorageOwnedDedupsAccumulatorAdds(t *testing.T) {
-	adds := getInsertPostingMap()
+	adds := insertPostingMapPool.Get()
 	var arena *insertPostingAccumArena
 	for _, id := range []uint64{30, 10, 30, 20, 10} {
 		adds = addInsertPostingAccum(adds, &arena, "dup", id, 0)
@@ -3418,7 +3510,7 @@ func TestIndexExt_MergeInsertOnlyFieldStorageOwnedDedupsAccumulatorAdds(t *testi
 }
 
 func TestIndexExt_MergeInsertOnlyFixedFieldStorageOwnedDedupsAccumulatorAdds(t *testing.T) {
-	adds := getFixedInsertPostingMap()
+	adds := fixedInsertPostingMapPool.Get()
 	var arena *insertPostingAccumArena
 	for _, id := range []uint64{4, 2, 4, 9} {
 		adds = addFixedInsertPostingAccum(adds, &arena, 7, id, 0)
@@ -3437,7 +3529,7 @@ func TestIndexExt_MergeInsertOnlyFixedFieldStorageOwnedDedupsAccumulatorAdds(t *
 }
 
 func TestIndexExt_StorageFromPostingMapOwnedDropsEmptyPostings(t *testing.T) {
-	adds := getPostingMap()
+	adds := postingMapPool.Get()
 	adds["drop/1"] = posting.List{}
 	adds["keep/1"] = indexExtPostingFromIDs([]uint64{10})
 	adds["keep/2"] = indexExtPostingFromIDs([]uint64{20, 21, 22})

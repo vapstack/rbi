@@ -694,11 +694,12 @@ func makeORBranchForCalibrationDecisionTest(estCard uint64, extraChecks int) pla
 			contains: func(uint64) bool { return true },
 		})
 	}
-	b := plannerORBranch{
-		preds:   preds,
-		leadIdx: 0,
+	predSet := newPredicateSet(len(preds))
+	for _, p := range preds {
+		predSet.Append(p)
 	}
-	b.lead = &b.preds[0]
+	b := newPlannerORBranch(qx.Expr{}, predSet)
+	b.leadIdx = 0
 	return b
 }
 
@@ -917,7 +918,8 @@ func TestPlannerORBranchesOrdered_CoversOrderRangeLeaves(t *testing.T) {
 
 	covered := 0
 	for _, branch := range branches {
-		for _, p := range branch.preds {
+		for i := 0; i < branch.predLen(); i++ {
+			p := branch.pred(i)
 			if p.covered && p.expr.Field == "age" {
 				covered++
 			}
@@ -1022,7 +1024,7 @@ func TestPlannerORBranchesOrdered_BoundedCoveredOnlyBranchNotAlwaysTrue(t *testi
 			if !branches[i].coveredRangeBounded {
 				t.Fatalf("bounded covered-only age branch must retain covered range metadata")
 			}
-			br, _, ok := view.extractOrderRangeCoverageOverlay("age", branches[i].preds, ov)
+			br, _, ok := view.extractOrderRangeCoverageOverlayReader("age", branches[i].preds, ov)
 			if !ok {
 				t.Fatalf("extractOrderRangeCoverageOverlay: ok=false")
 			}
@@ -1139,7 +1141,8 @@ func TestPlannerOROrderDecision_PrefersMergeWhenRouteEstimatorBeatsStream(t *tes
 	if orderDistinct == 0 {
 		t.Fatalf("unexpected zero order distinct")
 	}
-	unionCard, _, _, hasAlwaysTrue := branches.unionCards(universe)
+	var branchCards [plannerORBranchLimit]uint64
+	unionCard, _, _, hasAlwaysTrue := branches.unionCards(universe, &branchCards)
 	if hasAlwaysTrue || unionCard == 0 {
 		t.Fatalf("unexpected OR shape metrics: alwaysTrue=%v unionCard=%d", hasAlwaysTrue, unionCard)
 	}

@@ -62,7 +62,7 @@ func listFromUint64Slice(ids []uint64) List {
 }
 
 func bitmap32FromUint32Slice(ids []uint32) *bitmap32 {
-	rb := newBitmap()
+	rb := bitmapPool.Get()
 	rb.addMany(ids)
 	return rb
 }
@@ -156,22 +156,22 @@ func FuzzContainerSetOps(f *testing.F) {
 
 				orResult := left.or(right)
 				assertSameContainerSet(t, orResult, unionUint16(leftIDs, rightIDs))
-				releaseContainer(orResult)
+				orResult.release()
 
 				andResult := left.and(right)
 				assertSameContainerSet(t, andResult, intersectUint16(leftIDs, rightIDs))
-				releaseContainer(andResult)
+				andResult.release()
 
 				xorResult := left.xor(right)
 				assertSameContainerSet(t, xorResult, xorUint16(leftIDs, rightIDs))
-				releaseContainer(xorResult)
+				xorResult.release()
 
 				andNotResult := left.andNot(right)
 				assertSameContainerSet(t, andNotResult, differenceUint16(leftIDs, rightIDs))
-				releaseContainer(andNotResult)
+				andNotResult.release()
 
-				releaseContainer(left)
-				releaseContainer(right)
+				left.release()
+				right.release()
 			}
 		}
 	})
@@ -185,7 +185,7 @@ func FuzzBitmap32WireRead(f *testing.F) {
 	f.Fuzz(func(t *testing.T, data []byte) {
 		ids := fuzzUint32s(data)
 		src := bitmap32FromUint32Slice(ids)
-		defer releaseBitmap(src)
+		defer src.Release()
 
 		var payload bytes.Buffer
 		if _, err := src.WriteTo(&payload); err != nil {
@@ -198,7 +198,7 @@ func FuzzBitmap32WireRead(f *testing.F) {
 		}
 
 		receiver := bitmap32FromUint32Slice([]uint32{7, 9, 11})
-		defer releaseBitmap(receiver)
+		defer receiver.Release()
 		_, err := receiver.ReadFrom(bytes.NewReader(mutated))
 		if err != nil {
 			got := bitmap32ToSlice(receiver)

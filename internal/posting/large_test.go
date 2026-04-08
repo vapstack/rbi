@@ -175,18 +175,18 @@ func TestLargePostingSharedCloneInvariant_SourceReleaseAndPoolReuse(t *testing.T
 	for _, tc := range cases {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
-			src := getLargePosting()
+			src := largePostingPool.Get()
 			tc.fill(src)
 			want := src.toArray()
 
 			clone := src.cloneSharedInto(newLargePosting())
-			releaseLargePosting(src)
+			src.Release()
 
-			reused := getLargePosting()
+			reused := largePostingPool.Get()
 			for _, id := range tc.poison {
 				reused.add(id)
 			}
-			releaseLargePosting(reused)
+			reused.Release()
 
 			if got := clone.toArray(); !slices.Equal(got, want) {
 				t.Fatalf("shared clone changed after source release and pool reuse: got=%v want=%v", got, want)
@@ -197,16 +197,16 @@ func TestLargePostingSharedCloneInvariant_SourceReleaseAndPoolReuse(t *testing.T
 				}
 			}
 
-			releaseLargePosting(clone)
+			clone.Release()
 		})
 	}
 }
 
 func TestLargePostingOrInterleavedSharedCloneKeepsSource(t *testing.T) {
 	src := newLargePosting()
-	defer releaseLargePosting(src)
+	defer src.Release()
 	right := newLargePosting()
-	defer releaseLargePosting(right)
+	defer right.Release()
 
 	leftIDs := make([]uint64, 0, 96)
 	rightIDs := make([]uint64, 0, 96)
@@ -232,7 +232,7 @@ func TestLargePostingOrInterleavedSharedCloneKeepsSource(t *testing.T) {
 	}
 
 	dst := src.cloneSharedInto(newLargePosting())
-	defer releaseLargePosting(dst)
+	defer dst.Release()
 	dst.or(right)
 
 	assertSameLargePostingSet(t, dst, unionUint64(leftIDs, rightIDs))
@@ -245,18 +245,20 @@ func TestLargeIteratorPool_ReusedIteratorStartsFromNewPosting(t *testing.T) {
 	first.add(2)
 	first.add(uint64(1)<<32 | 3)
 
-	it := acquireLargeIterator(first)
+	it := largeIteratorPool.Get()
+	it.initialize(first)
 	if got := it.Next(); got != 1 {
 		t.Fatalf("first iterator first value: got=%d", got)
 	}
-	releaseLargeIterator(it)
+	largeIteratorPool.Put(it)
 
 	second := newLargePosting()
 	second.add(7)
 	second.add(uint64(1)<<32 | 9)
 
-	reused := acquireLargeIterator(second)
-	defer releaseLargeIterator(reused)
+	reused := largeIteratorPool.Get()
+	reused.initialize(second)
+	defer largeIteratorPool.Put(reused)
 	if !testRaceEnabled && reused != it {
 		t.Fatalf("large iterator pool did not reuse iterator")
 	}
@@ -271,7 +273,7 @@ func TestLargeIteratorPool_ReusedIteratorStartsFromNewPosting(t *testing.T) {
 	}
 }
 
-func TestAddManyBatchPool_LargeThenSmallBatchProducesExactSet(t *testing.T) {
+func TestLargePostingAddMany_LargeThenSmallBatchProducesExactSet(t *testing.T) {
 	warm := newLargePosting()
 	large := make([]uint64, 0, 8192)
 	for i := 0; i < 8192; i++ {
@@ -291,7 +293,7 @@ func TestAddManyBatchPool_LargeThenSmallBatchProducesExactSet(t *testing.T) {
 
 func TestLargePostingToArrayMixedContainerShapes(t *testing.T) {
 	lp := newLargePosting()
-	defer releaseLargePosting(lp)
+	defer lp.Release()
 
 	want := []uint64{1, 3, 5}
 	lp.addMany(want)
@@ -331,7 +333,7 @@ func TestLargePostingToArrayMixedContainerShapes(t *testing.T) {
 
 func TestLargePostingBasicsAcrossHighWords(t *testing.T) {
 	lp := newLargePosting()
-	defer releaseLargePosting(lp)
+	defer lp.Release()
 
 	ids := []uint64{
 		1,
@@ -379,7 +381,7 @@ func TestLargePostingBasicsAcrossHighWords(t *testing.T) {
 
 func TestLargePostingAddRangeAndAddManyMatchOracle(t *testing.T) {
 	lp := newLargePosting()
-	defer releaseLargePosting(lp)
+	defer lp.Release()
 
 	lp.addRange(10, 15)
 	lp.addRange((1<<32)-2, (1<<32)+3)
@@ -399,12 +401,12 @@ func TestLargePostingAddRangeAndAddManyMatchOracle(t *testing.T) {
 		2<<32 | 11, 2<<32 | 13,
 	}
 	fromMany := newLargePosting()
-	defer releaseLargePosting(fromMany)
+	defer fromMany.Release()
 	fromMany.addMany(many)
 	assertSameLargePostingSet(t, fromMany, many)
 
 	elementwise := newLargePosting()
-	defer releaseLargePosting(elementwise)
+	defer elementwise.Release()
 	for _, id := range many {
 		elementwise.add(id)
 	}
@@ -415,7 +417,7 @@ func TestLargePostingAddRangeAndAddManyMatchOracle(t *testing.T) {
 
 func TestLargePostingAddManyHandlesUnsortedAndDuplicates(t *testing.T) {
 	lp := newLargePosting()
-	defer releaseLargePosting(lp)
+	defer lp.Release()
 
 	input := []uint64{
 		2<<32 | 11, 5, 1<<32 | 7, 5,
@@ -441,7 +443,7 @@ func TestLargePostingAddManySortedFullInnerContainerMinimizesToRun(t *testing.T)
 
 	t.Run("Fresh", func(t *testing.T) {
 		lp := newLargePosting()
-		defer releaseLargePosting(lp)
+		defer lp.Release()
 
 		want := makeBatch(0, maxCapacity)
 		lp.addMany(want)
@@ -461,7 +463,7 @@ func TestLargePostingAddManySortedFullInnerContainerMinimizesToRun(t *testing.T)
 
 	t.Run("ExistingBitmap32", func(t *testing.T) {
 		lp := newLargePosting()
-		defer releaseLargePosting(lp)
+		defer lp.Release()
 
 		want := makeBatch(0, maxCapacity)
 		lp.addMany(want[:arrayDefaultMaxSize+32])
@@ -507,25 +509,25 @@ func TestLargePostingSetOpsScenarios(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			left := largePostingOf(tc.left...)
 			right := largePostingOf(tc.right...)
-			defer releaseLargePosting(left)
-			defer releaseLargePosting(right)
+			defer left.Release()
+			defer right.Release()
 
 			wantAnd := intersectUint64(tc.left, tc.right)
 			wantOr := unionUint64(tc.left, tc.right)
 			wantAndNot := differenceUint64(tc.left, tc.right)
 
 			andPosting := left.clone()
-			defer releaseLargePosting(andPosting)
+			defer andPosting.Release()
 			andPosting.and(right)
 			assertSameLargePostingSet(t, andPosting, wantAnd)
 
 			orPosting := left.clone()
-			defer releaseLargePosting(orPosting)
+			defer orPosting.Release()
 			orPosting.or(right)
 			assertSameLargePostingSet(t, orPosting, wantOr)
 
 			andNotPosting := left.clone()
-			defer releaseLargePosting(andNotPosting)
+			defer andNotPosting.Release()
 			andNotPosting.andNot(right)
 			assertSameLargePostingSet(t, andNotPosting, wantAndNot)
 
@@ -545,10 +547,11 @@ func TestLargeIteratorAdvanceAndTransitions(t *testing.T) {
 		1<<32|3, 1<<32|8,
 		2<<32|1, 2<<32|9,
 	)
-	defer releaseLargePosting(lp)
+	defer lp.Release()
 
-	it := acquireLargeIterator(lp)
-	defer releaseLargeIterator(it)
+	it := largeIteratorPool.Get()
+	it.initialize(lp)
+	defer largeIteratorPool.Put(it)
 
 	if got := it.peekNext(); got != 1 {
 		t.Fatalf("peekNext mismatch: got=%d want=1", got)
@@ -575,10 +578,11 @@ func TestLargeIteratorAdvanceAndTransitions(t *testing.T) {
 func TestLargeIteratorAdvanceEdgeCasesAndIntersectsSkips(t *testing.T) {
 	t.Run("IteratorAdvanceNoopAndExhaustion", func(t *testing.T) {
 		lp := largePostingOf(1, 4, 7, 1<<32|1)
-		defer releaseLargePosting(lp)
+		defer lp.Release()
 
-		it := acquireLargeIterator(lp)
-		defer releaseLargeIterator(it)
+		it := largeIteratorPool.Get()
+		it.initialize(lp)
+		defer largeIteratorPool.Put(it)
 
 		it.advanceIfNeeded(0)
 		if got := it.peekNext(); got != 1 {
@@ -633,8 +637,8 @@ func TestLargeIteratorAdvanceEdgeCasesAndIntersectsSkips(t *testing.T) {
 			t.Run(tc.name, func(t *testing.T) {
 				left := largePostingOf(tc.left...)
 				right := largePostingOf(tc.right...)
-				defer releaseLargePosting(left)
-				defer releaseLargePosting(right)
+				defer left.Release()
+				defer right.Release()
 				if got := left.intersects(right); got != tc.want {
 					t.Fatalf("intersects mismatch: got=%v want=%v", got, tc.want)
 				}
@@ -645,14 +649,12 @@ func TestLargeIteratorAdvanceEdgeCasesAndIntersectsSkips(t *testing.T) {
 
 func TestLargeArrayCopySharedDetachAndAliasSafeCopy(t *testing.T) {
 	src := largePostingOf(1, 3, 5, 1<<32|7, 1<<32|9)
-	defer releaseLargePosting(src)
+	defer src.Release()
 
 	shared := new(largeArray)
 	shared.copySharedFrom(&src.highlowcontainer)
 	defer func() {
-		shared.releaseContainersInRange(0)
-		shared.keys = shared.keys[:0]
-		shared.containers = shared.containers[:0]
+		releaseLargeArrayForTest(shared)
 	}()
 
 	original := shared.getContainerAtIndex(0)
@@ -671,9 +673,7 @@ func TestLargeArrayCopySharedDetachAndAliasSafeCopy(t *testing.T) {
 	}
 	alias.copyFrom(&src.highlowcontainer)
 	defer func() {
-		alias.releaseContainersInRange(0)
-		alias.keys = alias.keys[:0]
-		alias.containers = alias.containers[:0]
+		releaseLargeArrayForTest(alias)
 	}()
 	if !alias.equals(&src.highlowcontainer) {
 		t.Fatalf("copyFrom alias result mismatch")
@@ -691,7 +691,7 @@ func TestLargeHelpersClearAndSetContainerAtIndex(t *testing.T) {
 	if !rb.isEmpty() {
 		t.Fatalf("bitmap32.clear must reset bitmap")
 	}
-	releaseBitmap(rb)
+	rb.Release()
 
 	la := &largeArray{
 		keys:       []uint32{7},
@@ -700,7 +700,7 @@ func TestLargeHelpersClearAndSetContainerAtIndex(t *testing.T) {
 	old := la.containers[0]
 	replacement := buildBitmap32(11, 13)
 	la.setContainerAtIndex(0, replacement)
-	defer la.releaseContainersInRange(0)
+	defer releaseLargeArrayForTest(la)
 
 	if la.getContainerAtIndex(0) != replacement {
 		t.Fatalf("setContainerAtIndex did not replace container")
@@ -719,7 +719,7 @@ func TestLargeArrayAppendCopyAndAliases(t *testing.T) {
 			buildBitmap32(20, 21, 22),
 		},
 	}
-	defer src.releaseContainersInRange(0)
+	defer releaseLargeArrayForTest(&src)
 
 	alias := &largeArray{
 		keys:       src.keys[:2],
@@ -733,7 +733,7 @@ func TestLargeArrayAppendCopyAndAliases(t *testing.T) {
 		keys:       []uint32{1, 3},
 		containers: []*bitmap32{buildBitmap32(1, 2), buildBitmap32(10, 11, 12)},
 	}
-	defer independent.releaseContainersInRange(0)
+	defer releaseLargeArrayForTest(independent)
 	if src.aliases(independent) {
 		t.Fatalf("largeArray aliases must reject distinct backing")
 	}
@@ -741,7 +741,7 @@ func TestLargeArrayAppendCopyAndAliases(t *testing.T) {
 	var dst largeArray
 	dst.appendCopy(src, 0)
 	dst.appendCopyMany(src, 1, 3)
-	defer dst.releaseContainersInRange(0)
+	defer releaseLargeArrayForTest(&dst)
 
 	if !slices.Equal(dst.keys, src.keys) {
 		t.Fatalf("appendCopy/appendCopyMany keys mismatch: got=%v want=%v", dst.keys, src.keys)
@@ -761,7 +761,7 @@ func TestWriteReadAndSkipLarge(t *testing.T) {
 		1<<32|9, 1<<32|11,
 		2<<32|13, 2<<32|15,
 	)
-	defer releaseLargePosting(lp)
+	defer lp.Release()
 
 	var payload bytes.Buffer
 	writer := bufio.NewWriter(&payload)
@@ -776,7 +776,7 @@ func TestWriteReadAndSkipLarge(t *testing.T) {
 	if err != nil {
 		t.Fatalf("readLarge: %v", err)
 	}
-	defer releaseLargePosting(roundTrip)
+	defer roundTrip.Release()
 	assertSameLargePostingSet(t, roundTrip, lp.toArray())
 
 	if err := skipLarge(bufio.NewReader(bytes.NewReader(payload.Bytes()))); err != nil {
@@ -802,7 +802,7 @@ func TestWriteReadAndSkipLargeEmptyPayloads(t *testing.T) {
 		if err != nil {
 			t.Fatalf("readLarge(nil payload): %v", err)
 		}
-		defer releaseLargePosting(got)
+		defer got.Release()
 		if !got.isEmpty() {
 			t.Fatalf("readLarge(nil payload) must return empty posting")
 		}
@@ -813,7 +813,7 @@ func TestWriteReadAndSkipLargeEmptyPayloads(t *testing.T) {
 
 	t.Run("EmptyLargePosting", func(t *testing.T) {
 		lp := newLargePosting()
-		defer releaseLargePosting(lp)
+		defer lp.Release()
 
 		var payload bytes.Buffer
 		writer := bufio.NewWriter(&payload)
@@ -833,7 +833,7 @@ func TestWriteReadAndSkipLargeEmptyPayloads(t *testing.T) {
 		if err != nil {
 			t.Fatalf("readLarge(empty payload): %v", err)
 		}
-		defer releaseLargePosting(got)
+		defer got.Release()
 		if !got.isEmpty() {
 			t.Fatalf("readLarge(empty payload) must return empty posting")
 		}
@@ -842,7 +842,7 @@ func TestWriteReadAndSkipLargeEmptyPayloads(t *testing.T) {
 
 func TestReadLargeRejectsInvalidPayloads(t *testing.T) {
 	lp := largePostingOf(1, 3, 5, 7, 1<<32|9)
-	defer releaseLargePosting(lp)
+	defer lp.Release()
 
 	var payload bytes.Buffer
 	writer := bufio.NewWriter(&payload)
@@ -897,7 +897,7 @@ func TestReadLargeRejectsInvalidPayloads(t *testing.T) {
 
 func TestLargePostingConcurrentIteratorCreateReleaseStable(t *testing.T) {
 	lp := newLargePosting()
-	defer releaseLargePosting(lp)
+	defer lp.Release()
 	lp.addRange(0, 1024)
 	lp.addRange(1<<32, (1<<32)+256)
 	for i := uint64(0); i < 5000; i++ {
@@ -923,7 +923,7 @@ func TestLargePostingConcurrentIteratorCreateReleaseStable(t *testing.T) {
 			for i := 0; i < 400; i++ {
 				it := lp.iterator()
 				got := collectLargeIterator(it)
-				releaseLargeIterator(it)
+				largeIteratorPool.Put(it)
 				if !slices.Equal(got, want) {
 					setFailed("large iterator mismatch under concurrent create/release")
 					return

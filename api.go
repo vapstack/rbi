@@ -182,14 +182,6 @@ func (db *DB[K, V]) scanStringKeys(snap *strMapSnapshot, universe posting.List, 
 
 	seekStr := *(*string)(unsafe.Pointer(&seek))
 
-	emit := func(s string) (bool, error) {
-		if s < seekStr {
-			return true, nil
-		}
-		key := *(*K)(unsafe.Pointer(&s))
-		return fn(key)
-	}
-
 	card := universe.Cardinality()
 	minIdx, hasMin := universe.Minimum()
 	maxIdx, hasMax := universe.Maximum()
@@ -200,7 +192,7 @@ func (db *DB[K, V]) scanStringKeys(snap *strMapSnapshot, universe posting.List, 
 				if !ok {
 					return fmt.Errorf("%w: %v", ErrNoValidKeyIndex, idx)
 				}
-				cont, err := emit(s)
+				cont, err := db.emitScannedStringKey(seekStr, s, fn)
 				if err != nil {
 					return err
 				}
@@ -223,7 +215,7 @@ func (db *DB[K, V]) scanStringKeys(snap *strMapSnapshot, universe posting.List, 
 				if !ok {
 					return fmt.Errorf("%w: %v", ErrNoValidKeyIndex, idx)
 				}
-				cont, err := emit(s)
+				cont, err := db.emitScannedStringKey(seekStr, s, fn)
 				if err != nil {
 					return err
 				}
@@ -260,7 +252,7 @@ func (db *DB[K, V]) scanStringKeys(snap *strMapSnapshot, universe posting.List, 
 			return fmt.Errorf("%w: %v", ErrNoValidKeyIndex, idx)
 		}
 
-		cont, err := emit(s)
+		cont, err := db.emitScannedStringKey(seekStr, s, fn)
 		if err != nil {
 			return err
 		}
@@ -269,6 +261,14 @@ func (db *DB[K, V]) scanStringKeys(snap *strMapSnapshot, universe posting.List, 
 		}
 	}
 	return nil
+}
+
+func (db *DB[K, V]) emitScannedStringKey(seek string, s string, fn func(K) (bool, error)) (bool, error) {
+	if s < seek {
+		return true, nil
+	}
+	key := *(*K)(unsafe.Pointer(&s))
+	return fn(key)
 }
 
 // SeqScan performs a sequential scan over all records starting at the given
@@ -403,12 +403,12 @@ func (db *DB[K, V]) Set(id K, newVal *V, execOpts ...ExecOption[K, V]) error {
 	if err != nil {
 		return err
 	}
-	reqScratch := db.autoBatcher.acquireRequestScratch(1)
-	defer db.autoBatcher.releaseRequestScratch(reqScratch)
+	reqScratch := db.autoBatcher.requestScratchPool.Get()
+	defer db.autoBatcher.requestScratchPool.Put(reqScratch)
 
-	reqScratch.reqs = append(reqScratch.reqs, req)
+	reqScratch.Append(req)
 
-	return db.submitAutoBatchRequests(reqScratch.reqs, cfg.noBatch)
+	return db.submitAutoBatchRequests(reqScratch, cfg.noBatch)
 }
 
 // BatchSet stores multiple values under the provided IDs in a single write
@@ -456,23 +456,23 @@ func (db *DB[K, V]) BatchSet(ids []K, newVals []*V, execOpts ...ExecOption[K, V]
 	}
 	defer db.endOp()
 
-	reqScratch := db.autoBatcher.acquireRequestScratch(len(ids))
-	defer db.autoBatcher.releaseRequestScratch(reqScratch)
+	reqScratch := db.autoBatcher.requestScratchPool.Get()
+	defer db.autoBatcher.requestScratchPool.Put(reqScratch)
 
-	reqs := reqScratch.reqs
+	reqScratch.Grow(len(ids))
+
 	for i := range ids {
 		req, err := db.buildSetAutoBatchRequest(ids[i], newVals[i], cfg.beforeStore, cfg.beforeCommit, cfg.cloneValue)
 		if err != nil {
-			reqScratch.reqs = reqs
-			releaseAutoBatchRequestsState(reqs)
-			db.autoBatcher.releaseRequests(reqs)
+			for j := 0; j < reqScratch.Len(); j++ {
+				db.autoBatcher.requestPool.Put(reqScratch.Get(j))
+			}
 			return err
 		}
-		reqs = append(reqs, req)
+		reqScratch.Append(req)
 	}
-	reqScratch.reqs = reqs
 
-	return db.submitAutoBatchRequests(reqs, true)
+	return db.submitAutoBatchRequests(reqScratch, true)
 }
 
 // Patch applies a partial update to the value stored under the given id,
@@ -510,11 +510,11 @@ func (db *DB[K, V]) patch(id K, fields []Field, execOpts ...ExecOption[K, V]) er
 
 	req := db.buildPatchAutoBatchRequest(id, fields, ignoreUnknown, cfg.beforeProcess, cfg.beforeStore, cfg.beforeCommit)
 
-	reqScratch := db.autoBatcher.acquireRequestScratch(1)
-	defer db.autoBatcher.releaseRequestScratch(reqScratch)
+	reqScratch := db.autoBatcher.requestScratchPool.Get()
+	defer db.autoBatcher.requestScratchPool.Put(reqScratch)
 
-	reqScratch.reqs = append(reqScratch.reqs, req)
-	return db.submitAutoBatchRequests(reqScratch.reqs, cfg.noBatch)
+	reqScratch.Append(req)
+	return db.submitAutoBatchRequests(reqScratch, cfg.noBatch)
 }
 
 // BatchPatch applies the same patch to all values stored under the given IDs
@@ -543,16 +543,16 @@ func (db *DB[K, V]) batchPatch(ids []K, patch []Field, execOpts ...ExecOption[K,
 	cfg := db.resolveExecOptions(execOpts)
 	ignoreUnknown := !cfg.patchStrict
 
-	reqScratch := db.autoBatcher.acquireRequestScratch(len(ids))
-	defer db.autoBatcher.releaseRequestScratch(reqScratch)
+	reqScratch := db.autoBatcher.requestScratchPool.Get()
+	defer db.autoBatcher.requestScratchPool.Put(reqScratch)
 
-	reqs := reqScratch.reqs
+	reqScratch.Grow(len(ids))
+
 	for i := range ids {
-		reqs = append(reqs, db.buildPatchAutoBatchRequest(ids[i], patch, ignoreUnknown, cfg.beforeProcess, cfg.beforeStore, cfg.beforeCommit))
+		reqScratch.Append(db.buildPatchAutoBatchRequest(ids[i], patch, ignoreUnknown, cfg.beforeProcess, cfg.beforeStore, cfg.beforeCommit))
 	}
-	reqScratch.reqs = reqs
 
-	return db.submitAutoBatchRequests(reqs, true)
+	return db.submitAutoBatchRequests(reqScratch, true)
 }
 
 // Delete removes the value stored under the given id, if any.
@@ -570,12 +570,12 @@ func (db *DB[K, V]) Delete(id K, execOpts ...ExecOption[K, V]) error {
 	cfg := db.resolveExecOptions(execOpts)
 	req := db.buildDeleteAutoBatchRequest(id, cfg.beforeCommit)
 
-	reqScratch := db.autoBatcher.acquireRequestScratch(1)
-	defer db.autoBatcher.releaseRequestScratch(reqScratch)
+	reqScratch := db.autoBatcher.requestScratchPool.Get()
+	defer db.autoBatcher.requestScratchPool.Put(reqScratch)
 
-	reqScratch.reqs = append(reqScratch.reqs, req)
+	reqScratch.Append(req)
 
-	return db.submitAutoBatchRequests(reqScratch.reqs, cfg.noBatch)
+	return db.submitAutoBatchRequests(reqScratch, cfg.noBatch)
 }
 
 // BatchDelete removes all values stored under the provided ids in a single
@@ -596,14 +596,14 @@ func (db *DB[K, V]) BatchDelete(ids []K, execOpts ...ExecOption[K, V]) error {
 
 	cfg := db.resolveExecOptions(execOpts)
 
-	reqScratch := db.autoBatcher.acquireRequestScratch(len(ids))
-	defer db.autoBatcher.releaseRequestScratch(reqScratch)
+	reqScratch := db.autoBatcher.requestScratchPool.Get()
+	defer db.autoBatcher.requestScratchPool.Put(reqScratch)
 
-	reqs := reqScratch.reqs
+	reqScratch.Grow(len(ids))
+
 	for i := range ids {
-		reqs = append(reqs, db.buildDeleteAutoBatchRequest(ids[i], cfg.beforeCommit))
+		reqScratch.Append(db.buildDeleteAutoBatchRequest(ids[i], cfg.beforeCommit))
 	}
-	reqScratch.reqs = reqs
 
-	return db.submitAutoBatchRequests(reqs, true)
+	return db.submitAutoBatchRequests(reqScratch, true)
 }

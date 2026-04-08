@@ -6,8 +6,8 @@ import (
 )
 
 func TestContainerArraySingleAndRangeOps(t *testing.T) {
-	ac := newContainerArrayFromSlice([]uint16{3, 7, 11})
-	defer releaseContainerArray(ac)
+	ac := getContainerArrayFromSlice([]uint16{3, 7, 11})
+	defer ac.release()
 
 	if !ac.iadd(5) || ac.iadd(5) {
 		t.Fatalf("iadd duplicate detection mismatch")
@@ -29,11 +29,11 @@ func TestContainerArraySingleAndRangeOps(t *testing.T) {
 	assertSameContainerSet(t, ac, []uint16{3, 5, 11})
 
 	flipped := ac.not(4, 7)
-	defer releaseContainer(flipped)
+	defer flipped.release()
 	assertSameContainerSet(t, flipped, []uint16{3, 4, 6, 11})
 
 	inverted := ac.inot(0, 4)
-	defer releaseContainerPair(ac, inverted)
+	defer cleanupContainerPair(ac, inverted)
 	ac = nil
 	assertSameContainerSet(t, inverted, []uint16{0, 1, 2, 5, 11})
 }
@@ -46,8 +46,8 @@ func TestContainerArrayCrossTypeOps(t *testing.T) {
 		t.Run(factory.name, func(t *testing.T) {
 			left := buildContainerArray(leftIDs)
 			right := factory.build(rightIDs)
-			defer releaseContainer(left)
-			defer releaseContainer(right)
+			defer left.release()
+			defer right.release()
 
 			unionWant := unionUint16(leftIDs, rightIDs)
 			andWant := intersectUint16(leftIDs, rightIDs)
@@ -56,40 +56,40 @@ func TestContainerArrayCrossTypeOps(t *testing.T) {
 
 			orResult := left.or(right)
 			assertSameContainerSet(t, orResult, unionWant)
-			releaseContainer(orResult)
+			orResult.release()
 
 			andResult := left.and(right)
 			assertSameContainerSet(t, andResult, andWant)
-			releaseContainer(andResult)
+			andResult.release()
 
 			xorResult := left.xor(right)
 			assertSameContainerSet(t, xorResult, xorWant)
-			releaseContainer(xorResult)
+			xorResult.release()
 
 			andNotResult := left.andNot(right)
 			assertSameContainerSet(t, andNotResult, diffWant)
-			releaseContainer(andNotResult)
+			andNotResult.release()
 
 			iorLeft := buildContainerArray(leftIDs)
 			iorRight := factory.build(rightIDs)
 			iorResult := iorLeft.ior(iorRight)
 			assertSameContainerSet(t, iorResult, unionWant)
-			releaseContainer(iorRight)
-			releaseContainerPair(iorLeft, iorResult)
+			iorRight.release()
+			cleanupContainerPair(iorLeft, iorResult)
 
 			iandLeft := buildContainerArray(leftIDs)
 			iandRight := factory.build(rightIDs)
 			iandResult := iandLeft.iand(iandRight)
 			assertSameContainerSet(t, iandResult, andWant)
-			releaseContainer(iandRight)
-			releaseContainerPair(iandLeft, iandResult)
+			iandRight.release()
+			cleanupContainerPair(iandLeft, iandResult)
 
 			iandNotLeft := buildContainerArray(leftIDs)
 			iandNotRight := factory.build(rightIDs)
 			iandNotResult := iandNotLeft.iandNot(iandNotRight)
 			assertSameContainerSet(t, iandNotResult, diffWant)
-			releaseContainer(iandNotRight)
-			releaseContainerPair(iandNotLeft, iandNotResult)
+			iandNotRight.release()
+			cleanupContainerPair(iandNotLeft, iandNotResult)
 
 			if got := left.intersects(right); got != (len(andWant) > 0) {
 				t.Fatalf("intersects mismatch: got=%v want=%v", got, len(andWant) > 0)
@@ -99,17 +99,17 @@ func TestContainerArrayCrossTypeOps(t *testing.T) {
 			}
 			eq := buildContainerArray(leftIDs)
 			if !left.equals(eq) {
-				releaseContainer(eq)
+				eq.release()
 				t.Fatalf("equals mismatch for array clone")
 			}
-			releaseContainer(eq)
+			eq.release()
 		})
 	}
 }
 
 func TestContainerArrayHelpersAndTransitions(t *testing.T) {
-	ac := newContainerArrayFromSlice([]uint16{2, 4, 6, 8})
-	defer releaseContainerArray(ac)
+	ac := getContainerArrayFromSlice([]uint16{2, 4, 6, 8})
+	defer ac.release()
 
 	if ac.isFull() {
 		t.Fatalf("array container must never report full")
@@ -154,27 +154,27 @@ func TestContainerArrayHelpersAndTransitions(t *testing.T) {
 
 	bc := newContainerBitmap()
 	bc.iaddRange(100, 110)
-	defer releaseContainerBitmap(bc)
+	defer bc.release()
 	fromBitmap := newContainerArrayFromBitmap(bc)
-	defer releaseContainerArray(fromBitmap)
+	defer fromBitmap.release()
 	assertSameContainerSet(t, fromBitmap, []uint16{100, 101, 102, 103, 104, 105, 106, 107, 108, 109})
 
-	large := newContainerArraySize(arrayDefaultMaxSize)
+	large := getContainerArrayWithLen(arrayDefaultMaxSize)
 	for i := range large.content {
 		large.content[i] = uint16(i * 2)
 	}
 	spilled := large.iaddReturnMinimized(uint16(arrayDefaultMaxSize*2 + 1))
-	defer releaseContainerPair(large, spilled)
+	defer cleanupContainerPair(large, spilled)
 	if _, ok := spilled.(*containerBitmap); !ok {
 		t.Fatalf("expected bitmap spill after exceeding arrayDefaultMaxSize, got %T", spilled)
 	}
 
-	flipDense := newContainerArraySize(arrayDefaultMaxSize)
+	flipDense := getContainerArrayWithLen(arrayDefaultMaxSize)
 	for i := range flipDense.content {
 		flipDense.content[i] = uint16(i * 2)
 	}
 	flippedDense := flipDense.inot(1, arrayDefaultMaxSize*2)
-	defer releaseContainerPair(flipDense, flippedDense)
+	defer cleanupContainerPair(flipDense, flippedDense)
 	if _, ok := flippedDense.(*containerBitmap); !ok {
 		t.Fatalf("expected bitmap spill after inot promotion, got %T", flippedDense)
 	}
@@ -188,20 +188,20 @@ func TestContainerArrayHelpersAndTransitions(t *testing.T) {
 		t.Fatalf("inot promotion kept values that should have been flipped out")
 	}
 
-	runFriendly := newContainerArrayFromSlice([]uint16{10, 11, 12, 13, 14, 40, 41, 42, 43})
-	defer releaseContainerArray(runFriendly)
+	runFriendly := getContainerArrayFromSlice([]uint16{10, 11, 12, 13, 14, 40, 41, 42, 43})
+	defer runFriendly.release()
 	optimized := runFriendly.toEfficientContainer()
-	defer releaseContainer(optimized)
+	defer optimized.release()
 	if _, ok := optimized.(*containerRun); !ok {
 		t.Fatalf("expected run container from run-friendly array, got %T", optimized)
 	}
 
 	bitmapRight := newContainerBitmap()
 	bitmapRight.iaddRange(1000, 6000)
-	defer releaseContainerBitmap(bitmapRight)
-	bitmapUnion := newContainerArrayFromSlice([]uint16{1, 3, 5})
+	defer bitmapRight.release()
+	bitmapUnion := getContainerArrayFromSlice([]uint16{1, 3, 5})
 	iorBitmap := bitmapUnion.iorBitmap(bitmapRight)
-	defer releaseContainerPair(bitmapUnion, iorBitmap)
+	defer cleanupContainerPair(bitmapUnion, iorBitmap)
 	if _, ok := iorBitmap.(*containerBitmap); !ok {
 		t.Fatalf("iorBitmap must keep bitmap representation for dense union, got %T", iorBitmap)
 	}
@@ -209,28 +209,28 @@ func TestContainerArrayHelpersAndTransitions(t *testing.T) {
 		t.Fatalf("iorBitmap lost union elements")
 	}
 
-	smallLeft := newContainerArrayFromSlice([]uint16{1, 3, 5})
-	defer releaseContainerArray(smallLeft)
+	smallLeft := getContainerArrayFromSlice([]uint16{1, 3, 5})
+	defer smallLeft.release()
 	runRight := newContainerRunRange(10, 12)
-	defer releaseContainerRun(runRight)
+	defer runRight.release()
 	iorRun := smallLeft.iorRun(runRight)
-	defer releaseContainer(iorRun)
+	defer iorRun.release()
 	assertSameContainerSet(t, iorRun, []uint16{1, 3, 5, 10, 11, 12})
 
-	orA := newContainerArrayFromSlice([]uint16{1, 3, 5})
-	defer releaseContainerArray(orA)
-	orB := newContainerArrayFromSlice([]uint16{2, 4, 6})
-	defer releaseContainerArray(orB)
+	orA := getContainerArrayFromSlice([]uint16{1, 3, 5})
+	defer orA.release()
+	orB := getContainerArrayFromSlice([]uint16{2, 4, 6})
+	defer orB.release()
 	orArray := orA.orArray(orB)
-	defer releaseContainer(orArray)
+	defer orArray.release()
 	assertSameContainerSet(t, orArray, []uint16{1, 2, 3, 4, 5, 6})
 
 	xorArray := orA.xorArray(orB)
-	defer releaseContainer(xorArray)
+	defer xorArray.release()
 	assertSameContainerSet(t, xorArray, []uint16{1, 2, 3, 4, 5, 6})
 
-	inserted := newContainerArrayFromSlice([]uint16{10, 20, 30})
-	defer releaseContainerArray(inserted)
+	inserted := getContainerArrayFromSlice([]uint16{10, 20, 30})
+	defer inserted.release()
 	inserted.insertValue(1, 15)
 	assertSameContainerSet(t, inserted, []uint16{10, 15, 20, 30})
 
@@ -242,17 +242,17 @@ func TestContainerArrayHelpersAndTransitions(t *testing.T) {
 
 func TestContainerArrayDirectBranchCoverage(t *testing.T) {
 	t.Run("DenseOrAndXorArrayBranches", func(t *testing.T) {
-		leftDense := newContainerArraySize(arrayDefaultMaxSize)
-		defer releaseContainerArray(leftDense)
-		rightDense := newContainerArraySize(arrayDefaultMaxSize)
-		defer releaseContainerArray(rightDense)
+		leftDense := getContainerArrayWithLen(arrayDefaultMaxSize)
+		defer leftDense.release()
+		rightDense := getContainerArrayWithLen(arrayDefaultMaxSize)
+		defer rightDense.release()
 		for i := range leftDense.content {
 			leftDense.content[i] = uint16(i * 2)
 			rightDense.content[i] = uint16(i*2 + 1)
 		}
 
 		orDense := leftDense.orArray(rightDense)
-		defer releaseContainer(orDense)
+		defer orDense.release()
 		if _, ok := orDense.(*containerBitmap); !ok {
 			t.Fatalf("dense orArray must spill to bitmap, got %T", orDense)
 		}
@@ -261,7 +261,7 @@ func TestContainerArrayDirectBranchCoverage(t *testing.T) {
 		}
 
 		xorDense := leftDense.xorArray(rightDense)
-		defer releaseContainer(xorDense)
+		defer xorDense.release()
 		if _, ok := xorDense.(*containerBitmap); !ok {
 			t.Fatalf("dense xorArray must spill to bitmap, got %T", xorDense)
 		}
@@ -269,24 +269,24 @@ func TestContainerArrayDirectBranchCoverage(t *testing.T) {
 			t.Fatalf("dense xorArray lost edge values")
 		}
 
-		sameLeft := newContainerArraySize(arrayDefaultMaxSize)
-		defer releaseContainerArray(sameLeft)
-		sameRight := newContainerArraySize(arrayDefaultMaxSize)
-		defer releaseContainerArray(sameRight)
+		sameLeft := getContainerArrayWithLen(arrayDefaultMaxSize)
+		defer sameLeft.release()
+		sameRight := getContainerArrayWithLen(arrayDefaultMaxSize)
+		defer sameRight.release()
 		for i := range sameLeft.content {
 			sameLeft.content[i] = uint16(i * 2)
 			sameRight.content[i] = uint16(i * 2)
 		}
 
 		orSame := sameLeft.orArray(sameRight)
-		defer releaseContainer(orSame)
+		defer orSame.release()
 		if _, ok := orSame.(*containerArray); !ok {
 			t.Fatalf("dense duplicate orArray must shrink back to array, got %T", orSame)
 		}
 		assertSameContainerSet(t, orSame, containerToSlice(sameLeft))
 
 		xorSame := sameLeft.xorArray(sameRight)
-		defer releaseContainer(xorSame)
+		defer xorSame.release()
 		if _, ok := xorSame.(*containerArray); !ok {
 			t.Fatalf("dense duplicate xorArray must shrink back to array, got %T", xorSame)
 		}
@@ -296,19 +296,19 @@ func TestContainerArrayDirectBranchCoverage(t *testing.T) {
 	})
 
 	t.Run("IorRunHeuristicAndFallback", func(t *testing.T) {
-		heuristic := newContainerArrayFromSlice([]uint16{10, 20, 30, 40, 50, 60})
+		heuristic := getContainerArrayFromSlice([]uint16{10, 20, 30, 40, 50, 60})
 		smallRun := newContainerRunRange(25, 26)
-		defer releaseContainerRun(smallRun)
+		defer smallRun.release()
 		heuristicResult := heuristic.iorRun(smallRun)
-		defer releaseContainerPair(heuristic, heuristicResult)
+		defer cleanupContainerPair(heuristic, heuristicResult)
 		assertSameContainerSet(t, heuristicResult, []uint16{10, 20, 25, 26, 30, 40, 50, 60})
 
-		fallback := newContainerArrayFromSlice([]uint16{10, 20})
-		defer releaseContainerArray(fallback)
+		fallback := getContainerArrayFromSlice([]uint16{10, 20})
+		defer fallback.release()
 		largeRun := newContainerRunRange(100, 5000)
-		defer releaseContainerRun(largeRun)
+		defer largeRun.release()
 		fallbackResult := fallback.iorRun(largeRun)
-		defer releaseContainer(fallbackResult)
+		defer fallbackResult.release()
 		if _, ok := fallbackResult.(*containerRun); !ok {
 			t.Fatalf("iorRun fallback must preserve run-backed union, got %T", fallbackResult)
 		}
@@ -318,8 +318,8 @@ func TestContainerArrayDirectBranchCoverage(t *testing.T) {
 	})
 
 	t.Run("EqualsAndInsertValueInPlace", func(t *testing.T) {
-		inPlace := newContainerArrayCapacity(4)
-		defer releaseContainerArray(inPlace)
+		inPlace := getContainerArrayWithCap(4)
+		defer inPlace.release()
 		inPlace.content = append(inPlace.content, 10, 20, 30)
 		inPlace.insertValue(1, 15)
 		assertSameContainerSet(t, inPlace, []uint16{10, 15, 20, 30})
@@ -329,13 +329,13 @@ func TestContainerArrayDirectBranchCoverage(t *testing.T) {
 		}
 
 		sameBitmap := buildContainerBitmap([]uint16{10, 15, 20, 30})
-		defer releaseContainer(sameBitmap)
+		defer sameBitmap.release()
 		if !inPlace.equals(sameBitmap) {
 			t.Fatalf("array equals must accept same content across container type")
 		}
 
 		diffBitmap := buildContainerBitmap([]uint16{10, 15, 20})
-		defer releaseContainer(diffBitmap)
+		defer diffBitmap.release()
 		if inPlace.equals(diffBitmap) {
 			t.Fatalf("array equals must reject different cardinality")
 		}

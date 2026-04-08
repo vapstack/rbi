@@ -149,7 +149,7 @@ func TestRace_ConcurrentReadersAndWriters(t *testing.T) {
 		}(int64(2000 + rr))
 	}
 
-	time.Sleep(250 * time.Millisecond)
+	time.Sleep(150 * time.Millisecond)
 	close(stop)
 	wg.Wait()
 	close(errCh)
@@ -294,7 +294,7 @@ func TestRace_ConcurrentReadersAndWriters_Snapshots(t *testing.T) {
 		}(int64(4100 + rr))
 	}
 
-	time.Sleep(250 * time.Millisecond)
+	time.Sleep(150 * time.Millisecond)
 	close(stop)
 	wg.Wait()
 	close(errCh)

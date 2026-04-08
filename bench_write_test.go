@@ -184,8 +184,8 @@ func buildWriteBenchBatchUpdateInput(batchSize int) ([]uint64, []*UserBench, []*
 }
 
 func rawSetBench(db *DB[uint64, UserBench], raw *bbolt.DB, id uint64, rec *UserBench) error {
-	b := getEncodeBuf()
-	defer releaseEncodeBuf(b)
+	b := encodePool.Get()
+	defer encodePool.Put(b)
 
 	if err := db.encode(rec, b); err != nil {
 		return fmt.Errorf("encode: %w", err)
@@ -232,8 +232,8 @@ func rawPatchBench(db *DB[uint64, UserBench], raw *bbolt.DB, id uint64, patch []
 			return fmt.Errorf("apply patch: %w", err)
 		}
 
-		b := getEncodeBuf()
-		defer releaseEncodeBuf(b)
+		b := encodePool.Get()
+		defer encodePool.Put(b)
 		if err = db.encode(newVal, b); err != nil {
 			return fmt.Errorf("encode: %w", err)
 		}

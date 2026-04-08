@@ -189,8 +189,8 @@ func addDistinctStringsToSink[S stringValueSink](vals []string, sink S) int {
 		sink.addString(vals[0])
 		return 1
 	}
-	seen := getStringSet(len(vals))
-	defer releaseStringSet(seen)
+	seen := stringSetPool.Get(len(vals))
+	defer stringSetPool.Put(seen)
 	distinct := 0
 	for i := range vals {
 		cur := vals[i]
@@ -213,8 +213,8 @@ func addDistinctValueIndexerStringsToSink[S stringValueSink](vals reflect.Value,
 		sink.addString(vals.Index(0).Interface().(ValueIndexer).IndexingValue())
 		return 1
 	}
-	seen := getStringSet(n)
-	defer releaseStringSet(seen)
+	seen := stringSetPool.Get(n)
+	defer stringSetPool.Put(seen)
 	distinct := 0
 	for i := 0; i < n; i++ {
 		cur := vals.Index(i).Interface().(ValueIndexer).IndexingValue()

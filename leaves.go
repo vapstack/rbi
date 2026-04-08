@@ -1,6 +1,9 @@
 package rbi
 
-import "github.com/vapstack/qx"
+import (
+	"github.com/vapstack/qx"
+	"github.com/vapstack/rbi/internal/pooled"
+)
 
 type andLeafMode uint8
 
@@ -23,6 +26,13 @@ func collectAndLeaves(e qx.Expr) ([]qx.Expr, bool) {
 
 func collectAndLeavesScratch(e qx.Expr, dst []qx.Expr) ([]qx.Expr, bool) {
 	return collectAndLeavesModeScratch(e, dst, andLeafModeCollect)
+}
+
+func collectAndLeavesBuf(e qx.Expr, dst *pooled.SliceBuf[qx.Expr]) bool {
+	if dst == nil {
+		return false
+	}
+	return appendAndLeavesModeBuf(dst, e, andLeafModeCollect)
 }
 
 func extractAndLeaves(e qx.Expr) ([]qx.Expr, bool) {
@@ -144,6 +154,39 @@ func appendAndLeaf(dst []qx.Expr, e qx.Expr) ([]qx.Expr, andLeafStatus) {
 		return nil, andLeafStatusOverflow
 	}
 	return append(dst, e), andLeafStatusOK
+}
+
+func appendAndLeavesModeBuf(dst *pooled.SliceBuf[qx.Expr], e qx.Expr, mode andLeafMode) bool {
+	switch e.Op {
+	case qx.OpNOOP:
+		if mode != andLeafModeCollect {
+			return false
+		}
+		if !e.Not {
+			return true
+		}
+		dst.Append(qx.Expr{Op: qx.OpNOOP, Not: true})
+		return true
+	case qx.OpAND:
+		if e.Not || len(e.Operands) == 0 {
+			return false
+		}
+		for _, ch := range e.Operands {
+			if !appendAndLeavesModeBuf(dst, ch, mode) {
+				return false
+			}
+		}
+		return true
+	default:
+		if e.Op == qx.OpOR || len(e.Operands) != 0 {
+			return false
+		}
+		if mode == andLeafModeExtract && e.Not {
+			return false
+		}
+		dst.Append(e)
+		return true
+	}
 }
 
 func forEachAndLeaf(e qx.Expr, fn func(qx.Expr) bool) bool {

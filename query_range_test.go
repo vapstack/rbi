@@ -18,7 +18,7 @@ func requireNumericRangeBucketCacheEntry(t *testing.T, snap *indexSnapshot, fiel
 		t.Fatalf("expected numeric range bucket cache entry for field %q", field)
 	}
 	e, ok := raw.(*numericRangeBucketCacheEntry)
-	if !ok || e == nil || e.idx == nil {
+	if !ok || e == nil || e.idx.bucketSize <= 0 {
 		t.Fatalf("expected non-nil numeric range bucket index for field %q", field)
 	}
 	return e
@@ -760,6 +760,57 @@ func TestNumericRangeBucketSpanCache_RespectsCardinalityGuard(t *testing.T) {
 	}
 	if cached, ok := entry.loadFullSpan(start, end); ok && !cached.IsEmpty() {
 		t.Fatal("expected oversized full-span posting to be rejected by cache guard")
+	}
+}
+
+func TestNumericRangeBucketSpanCache_LoadHotPathAllocsStayLowAfterWarmup(t *testing.T) {
+	if testRaceEnabled {
+		t.Skip("testing.AllocsPerRun is not stable under -race")
+	}
+
+	db, _ := openTempDBUint64(t, Options{
+		SnapshotMaterializedPredCacheMaxEntries: 64,
+	})
+
+	seedGeneratedUint64Data(t, db, 20_000, func(i int) *Rec {
+		return &Rec{
+			Name:  fmt.Sprintf("u_%d", i),
+			Age:   i,
+			Score: float64(i),
+		}
+	})
+	if err := db.RebuildIndex(); err != nil {
+		t.Fatalf("RebuildIndex: %v", err)
+	}
+
+	setNumericBucketKnobs(t, db, 128, 1, 1)
+
+	fm := db.fields["age"]
+	if fm == nil {
+		t.Fatalf("expected age field metadata")
+	}
+	ov := db.fieldOverlay("age")
+	if !ov.hasData() {
+		t.Fatalf("expected age overlay data")
+	}
+	qv := db.currentQueryViewForTests()
+
+	br := ov.rangeByRanks(2501, 3001)
+	warm, ok := db.tryEvalNumericRangeBuckets("age", fm, ov, br)
+	if !ok {
+		t.Fatal("expected numeric range bucket warmup path")
+	}
+	warm.release()
+
+	allocs := testing.AllocsPerRun(100, func() {
+		out, ok := qv.tryLoadNumericRangeBuckets("age", fm, ov, br)
+		if !ok {
+			t.Fatal("expected warmed numeric range bucket load path")
+		}
+		out.release()
+	})
+	if allocs > 12 {
+		t.Fatalf("unexpected allocs per run on warmed numeric bucket load: got=%v want<=12", allocs)
 	}
 }
 
