@@ -1486,10 +1486,20 @@ func TestCountPredicateMaterializationThresholds_Adaptive(t *testing.T) {
 	if !shouldUseCountLeadResidualHasAnyExactFilter(smallHasAnyResidual) {
 		t.Fatalf("expected small HASANY residual exact filter above threshold")
 	}
-	tooWide := predicate{
+	fourTermHasAnyResidual := predicate{
 		kind:     predicateKindPostsAny,
 		expr:     qx.Expr{Op: qx.OpHASANY, Field: "roles"},
 		postsBuf: newPostsBuf(4),
+		estCard:  80_000,
+	}
+	defer postingSlicePool.Put(fourTermHasAnyResidual.postsBuf)
+	if !shouldUseCountLeadResidualHasAnyExactFilter(fourTermHasAnyResidual) {
+		t.Fatalf("expected four-term HASANY residual exact filter above threshold")
+	}
+	tooWide := predicate{
+		kind:     predicateKindPostsAny,
+		expr:     qx.Expr{Op: qx.OpHASANY, Field: "roles"},
+		postsBuf: newPostsBuf(5),
 		estCard:  80_000,
 	}
 	defer postingSlicePool.Put(tooWide.postsBuf)

@@ -194,6 +194,7 @@ var countLeadResidualExactFilterSlicePool = pooled.Slices[countLeadResidualExact
 			filter := buf.Get(i)
 			filter.ids.Release()
 			filter.ids = posting.List{}
+			filter.state = nil
 			buf.Set(i, filter)
 		}
 	},

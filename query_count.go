@@ -20,7 +20,7 @@ const countPredBroadRangeComplementMaxCard = 32_768
 const countPredBroadRangeComplementMaxCardCap = 131_072
 const countPredBroadRangeComplementFastProbeMin = 4_096
 const countPredBroadRangeComplementFastAvgPerBucketMax = 8
-const countPredLeadResidualHasAnyExactMaxTerms = 3
+const countPredLeadResidualHasAnyExactMaxTerms = 4
 const countPredLeadResidualHasAnyExactMinCard = 65_536
 
 // Count evaluates the expression from the given query and returns the number of matching records.
@@ -192,8 +192,9 @@ func countPostingAgainstResult(ids posting.List, filter postingResult) uint64 {
 }
 
 type countLeadResidualExactFilter struct {
-	idx int
-	ids posting.List
+	idx   int
+	ids   posting.List
+	state *postsAnyFilterState
 }
 
 func shouldUseCountLeadResidualHasAnyExactFilter(p predicate) bool {
@@ -237,10 +238,15 @@ func (qv *queryView[K, V]) buildCountLeadResidualExactFiltersByCandidatesInto(ds
 		if p.kind != predicateKindPostsAny || p.expr.Not || p.expr.Op != qx.OpHASANY || p.postCount() == 0 {
 			continue
 		}
-		var ids posting.List
 		if p.postsAnyState != nil {
-			ids = p.postsAnyState.borrowMaterialized()
-		} else if isSingletonHeavyPostingBuf(p.postsBuf) {
+			dst.Append(countLeadResidualExactFilter{
+				idx:   pi,
+				state: p.postsAnyState,
+			})
+			continue
+		}
+		var ids posting.List
+		if isSingletonHeavyPostingBuf(p.postsBuf) {
 			ids = materializePostingBufFast(p.postsBuf)
 		} else {
 			ids = materializePostingUnionBufOwned(p.postsBuf)
@@ -262,10 +268,15 @@ func (qv *queryView[K, V]) buildCountLeadResidualExactFiltersByCandidatesIntoSet
 		if p.kind != predicateKindPostsAny || p.expr.Not || p.expr.Op != qx.OpHASANY || p.postCount() == 0 {
 			continue
 		}
-		var ids posting.List
 		if p.postsAnyState != nil {
-			ids = p.postsAnyState.borrowMaterialized()
-		} else if isSingletonHeavyPostingBuf(p.postsBuf) {
+			dst.Append(countLeadResidualExactFilter{
+				idx:   pi,
+				state: p.postsAnyState,
+			})
+			continue
+		}
+		var ids posting.List
+		if isSingletonHeavyPostingBuf(p.postsBuf) {
 			ids = materializePostingBufFast(p.postsBuf)
 		} else {
 			ids = materializePostingUnionBufOwned(p.postsBuf)
@@ -316,6 +327,24 @@ func countApplyLeadResidualExactFilters(src, work posting.List, filters *pooled.
 	work = src.CloneInto(work)
 	for i := 0; i < filters.Len(); i++ {
 		f := filters.Get(i)
+		if f.state != nil {
+			next, ok := f.state.apply(work)
+			if !ok {
+				union := f.state.materialize()
+				if union.IsEmpty() {
+					work.Release()
+					work = posting.List{}
+					break
+				}
+				work = work.BuildAnd(union)
+			} else {
+				work = next
+			}
+			if work.IsEmpty() {
+				break
+			}
+			continue
+		}
 		if f.ids.IsEmpty() {
 			work.Release()
 			work = posting.List{}
@@ -333,7 +362,14 @@ func shouldApplyCountLeadResidualExactFilters(src posting.List, filters *pooled.
 	if src.IsEmpty() || filters == nil || filters.Len() == 0 {
 		return false
 	}
-	return src.Cardinality() > plannerPredicateBucketExactMinCardForChecks(filters.Len())
+	return shouldBuildCountLeadResidualExactFilters(src, filters.Len())
+}
+
+func shouldBuildCountLeadResidualExactFilters(src posting.List, filterCount int) bool {
+	if src.IsEmpty() || filterCount <= 0 {
+		return false
+	}
+	return src.Cardinality() > plannerPredicateBucketExactMinCardForChecks(filterCount)
 }
 
 func countPostingMatchesMulti(preds predicateReader, checks []int, ids posting.List) uint64 {
@@ -420,19 +456,16 @@ func (qv *queryView[K, V]) ensureCountLeadResidualExactFilters(
 	residualBoth []int,
 	extraExactBuf *pooled.SliceBuf[countLeadResidualExactFilter],
 	extraExactBuilt bool,
-	extraWork posting.List,
-) (*pooled.SliceBuf[countLeadResidualExactFilter], bool, posting.List, []int) {
+) (*pooled.SliceBuf[countLeadResidualExactFilter], bool, []int) {
 	if extraExactBuilt {
-		return extraExactBuf, true, extraWork, residualBoth
+		return extraExactBuf, true, residualBoth
 	}
 	extraExactBuf = countLeadResidualExactFilterSlicePool.Get()
 	extraExactBuf.Grow(len(candidates))
 	qv.buildCountLeadResidualExactFiltersByCandidatesInto(extraExactBuf, preds, candidates)
 	if extraExactBuf.Len() == 0 {
-		return extraExactBuf, true, extraWork, residualBoth
+		return extraExactBuf, true, residualBoth
 	}
-	extraWork.Release()
-	extraWork = posting.List{}
 	residualBoth = residualBoth[:0]
 	for _, pi := range residualExact {
 		if countLeadResidualExactFiltersContain(extraExactBuf, pi) {
@@ -440,7 +473,7 @@ func (qv *queryView[K, V]) ensureCountLeadResidualExactFilters(
 		}
 		residualBoth = append(residualBoth, pi)
 	}
-	return extraExactBuf, true, extraWork, residualBoth
+	return extraExactBuf, true, residualBoth
 }
 
 func (qv *queryView[K, V]) ensureCountLeadResidualExactFiltersSet(
@@ -450,19 +483,16 @@ func (qv *queryView[K, V]) ensureCountLeadResidualExactFiltersSet(
 	residualBoth []int,
 	extraExactBuf *pooled.SliceBuf[countLeadResidualExactFilter],
 	extraExactBuilt bool,
-	extraWork posting.List,
-) (*pooled.SliceBuf[countLeadResidualExactFilter], bool, posting.List, []int) {
+) (*pooled.SliceBuf[countLeadResidualExactFilter], bool, []int) {
 	if extraExactBuilt {
-		return extraExactBuf, true, extraWork, residualBoth
+		return extraExactBuf, true, residualBoth
 	}
 	extraExactBuf = countLeadResidualExactFilterSlicePool.Get()
 	extraExactBuf.Grow(len(candidates))
 	qv.buildCountLeadResidualExactFiltersByCandidatesIntoSet(extraExactBuf, preds, candidates)
 	if extraExactBuf.Len() == 0 {
-		return extraExactBuf, true, extraWork, residualBoth
+		return extraExactBuf, true, residualBoth
 	}
-	extraWork.Release()
-	extraWork = posting.List{}
 	residualBoth = residualBoth[:0]
 	for _, pi := range residualExact {
 		if countLeadResidualExactFiltersContain(extraExactBuf, pi) {
@@ -470,7 +500,7 @@ func (qv *queryView[K, V]) ensureCountLeadResidualExactFiltersSet(
 		}
 		residualBoth = append(residualBoth, pi)
 	}
-	return extraExactBuf, true, extraWork, residualBoth
+	return extraExactBuf, true, residualBoth
 }
 
 func (qv *queryView[K, V]) buildCountLeadResidualScratch(
@@ -1755,23 +1785,24 @@ func (qv *queryView[K, V]) tryCountORBranchLeadPostingsBuf(
 		}
 
 		extraApplied := false
-		extraExactBuf, extraExactBuilt, extraWork, residualBoth = qv.ensureCountLeadResidualExactFiltersSet(
-			br.preds,
-			extraExactCandidates,
-			residualExact,
-			residualBoth,
-			extraExactBuf,
-			extraExactBuilt,
-			extraWork,
-		)
-		if shouldApplyCountLeadResidualExactFilters(current, extraExactBuf) {
-			filtered, nextExtraWork := countApplyLeadResidualExactFilters(current, extraWork, extraExactBuf)
-			extraWork = nextExtraWork
-			if filtered.IsEmpty() {
-				continue
+		if extraExactBuilt || shouldBuildCountLeadResidualExactFilters(current, len(extraExactCandidates)) {
+			extraExactBuf, extraExactBuilt, residualBoth = qv.ensureCountLeadResidualExactFiltersSet(
+				br.preds,
+				extraExactCandidates,
+				residualExact,
+				residualBoth,
+				extraExactBuf,
+				extraExactBuilt,
+			)
+			if shouldApplyCountLeadResidualExactFilters(current, extraExactBuf) {
+				filtered, nextExtraWork := countApplyLeadResidualExactFilters(current, extraWork, extraExactBuf)
+				extraWork = nextExtraWork
+				if filtered.IsEmpty() {
+					continue
+				}
+				current = filtered
+				extraApplied = true
 			}
-			current = filtered
-			extraApplied = true
 		}
 		checkList := checks
 		if extraApplied {
@@ -2553,23 +2584,24 @@ func (qv *queryView[K, V]) tryCountByPredicatesLeadBuckets(preds predicateSet, l
 			}
 
 			extraApplied := false
-			extraExactBuf, extraExactBuilt, extraWork, residualBoth = qv.ensureCountLeadResidualExactFiltersSet(
-				preds,
-				extraExactCandidates,
-				residualExact,
-				residualBoth,
-				extraExactBuf,
-				extraExactBuilt,
-				extraWork,
-			)
-			if shouldApplyCountLeadResidualExactFilters(current, extraExactBuf) {
-				filtered, nextExtraWork := countApplyLeadResidualExactFilters(current, extraWork, extraExactBuf)
-				extraWork = nextExtraWork
-				if filtered.IsEmpty() {
-					continue
+			if extraExactBuilt || shouldBuildCountLeadResidualExactFilters(current, len(extraExactCandidates)) {
+				extraExactBuf, extraExactBuilt, residualBoth = qv.ensureCountLeadResidualExactFiltersSet(
+					preds,
+					extraExactCandidates,
+					residualExact,
+					residualBoth,
+					extraExactBuf,
+					extraExactBuilt,
+				)
+				if shouldApplyCountLeadResidualExactFilters(current, extraExactBuf) {
+					filtered, nextExtraWork := countApplyLeadResidualExactFilters(current, extraWork, extraExactBuf)
+					extraWork = nextExtraWork
+					if filtered.IsEmpty() {
+						continue
+					}
+					current = filtered
+					extraApplied = true
 				}
-				current = filtered
-				extraApplied = true
 			}
 
 			checks := activeChecks
@@ -2698,23 +2730,24 @@ func (qv *queryView[K, V]) tryCountByPredicatesLeadBuckets(preds predicateSet, l
 		}
 
 		extraApplied := false
-		extraExactBuf, extraExactBuilt, extraWork, residualBoth = qv.ensureCountLeadResidualExactFiltersSet(
-			preds,
-			extraExactCandidates,
-			residualExact,
-			residualBoth,
-			extraExactBuf,
-			extraExactBuilt,
-			extraWork,
-		)
-		if shouldApplyCountLeadResidualExactFilters(current, extraExactBuf) {
-			filtered, nextExtraWork := countApplyLeadResidualExactFilters(current, extraWork, extraExactBuf)
-			extraWork = nextExtraWork
-			if filtered.IsEmpty() {
-				continue
+		if extraExactBuilt || shouldBuildCountLeadResidualExactFilters(current, len(extraExactCandidates)) {
+			extraExactBuf, extraExactBuilt, residualBoth = qv.ensureCountLeadResidualExactFiltersSet(
+				preds,
+				extraExactCandidates,
+				residualExact,
+				residualBoth,
+				extraExactBuf,
+				extraExactBuilt,
+			)
+			if shouldApplyCountLeadResidualExactFilters(current, extraExactBuf) {
+				filtered, nextExtraWork := countApplyLeadResidualExactFilters(current, extraWork, extraExactBuf)
+				extraWork = nextExtraWork
+				if filtered.IsEmpty() {
+					continue
+				}
+				current = filtered
+				extraApplied = true
 			}
-			current = filtered
-			extraApplied = true
 		}
 
 		checks := activeChecks
@@ -2823,23 +2856,24 @@ func (qv *queryView[K, V]) tryCountByPredicatesLeadPostings(preds predicateSet, 
 		}
 
 		extraApplied := false
-		extraExactBuf, extraExactBuilt, extraWork, residualBoth = qv.ensureCountLeadResidualExactFiltersSet(
-			preds,
-			extraExactCandidates,
-			residualExact,
-			residualBoth,
-			extraExactBuf,
-			extraExactBuilt,
-			extraWork,
-		)
-		if shouldApplyCountLeadResidualExactFilters(current, extraExactBuf) {
-			filtered, nextExtraWork := countApplyLeadResidualExactFilters(current, extraWork, extraExactBuf)
-			extraWork = nextExtraWork
-			if filtered.IsEmpty() {
-				continue
+		if extraExactBuilt || shouldBuildCountLeadResidualExactFilters(current, len(extraExactCandidates)) {
+			extraExactBuf, extraExactBuilt, residualBoth = qv.ensureCountLeadResidualExactFiltersSet(
+				preds,
+				extraExactCandidates,
+				residualExact,
+				residualBoth,
+				extraExactBuf,
+				extraExactBuilt,
+			)
+			if shouldApplyCountLeadResidualExactFilters(current, extraExactBuf) {
+				filtered, nextExtraWork := countApplyLeadResidualExactFilters(current, extraWork, extraExactBuf)
+				extraWork = nextExtraWork
+				if filtered.IsEmpty() {
+					continue
+				}
+				current = filtered
+				extraApplied = true
 			}
-			current = filtered
-			extraApplied = true
 		}
 
 		checks := activeChecks
