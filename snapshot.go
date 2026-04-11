@@ -1766,7 +1766,8 @@ func (db *DB[K, V]) buildPreparedSnapshotInsertOnlyNoLock(seq uint64, prev *inde
 	}
 	db.initSnapshotRuntimeCaches(next)
 
-	fieldStates := make([]snapshotFieldInsertState, len(db.indexedFieldAccess))
+	fieldStates := snapshotFieldInsertStateSlicePool.Get()
+	fieldStates.SetLen(len(db.indexedFieldAccess))
 	initSnapshotFieldInsertStateHints(fieldStates, db.indexedFieldAccess, prev, len(prepared))
 
 	for i := range prepared {
@@ -1776,14 +1777,15 @@ func (db *DB[K, V]) buildPreparedSnapshotInsertOnlyNoLock(seq uint64, prev *inde
 
 		for _, acc := range db.indexedFieldAccess {
 			useZeroComplement := prev.lenZeroComplement != nil && acc.ordinal < prev.lenZeroComplement.Len() && prev.lenZeroComplement.Get(acc.ordinal)
-			acc.collectSnapshotInsertValue(ptr, op.idx, useZeroComplement, &fieldStates[acc.ordinal])
+			acc.collectSnapshotInsertValue(ptr, op.idx, useZeroComplement, fieldStates.GetPtr(acc.ordinal))
 		}
 	}
 
 	changedCount := 0
 	for i, acc := range db.indexedFieldAccess {
+		state := fieldStates.GetPtr(i)
 		baseIndex := next.index.Get(i)
-		if storage := acc.mergeSnapshotInsertStorageOwned(baseIndex, &fieldStates[i], true); storage.keyCount() > 0 {
+		if storage := acc.mergeSnapshotInsertStorageOwned(baseIndex, state, true); storage.keyCount() > 0 {
 			if storage != baseIndex {
 				next.index.Set(i, storage)
 			}
@@ -1791,31 +1793,31 @@ func (db *DB[K, V]) buildPreparedSnapshotInsertOnlyNoLock(seq uint64, prev *inde
 			next.index.Set(i, fieldIndexStorage{})
 		}
 		baseNil := next.nilIndex.Get(i)
-		if storage := acc.mergeSnapshotInsertNilStorageOwned(baseNil, &fieldStates[i]); storage.keyCount() > 0 {
+		if storage := acc.mergeSnapshotInsertNilStorageOwned(baseNil, state); storage.keyCount() > 0 {
 			if storage != baseNil {
 				next.nilIndex.Set(i, storage)
 			}
 		} else if baseNil.keyCount() > 0 {
 			next.nilIndex.Set(i, fieldIndexStorage{})
 		}
-		if fieldStates[i].lengths != nil {
+		if state.lengths != nil {
 			baseLen := next.lenIndex.Get(i)
-			if storage := applyLenFieldPostingDiffStorageOwned(baseLen, fieldStates[i].lengths); storage != baseLen {
+			if storage := applyLenFieldPostingDiffStorageOwned(baseLen, state.lengths); storage != baseLen {
 				next.lenIndex.Set(i, storage)
 			}
-			fieldStates[i].lengths = nil
+			state.lengths = nil
 		}
-		if fieldStates[i].changed {
+		if state.changed {
 			changedCount++
 		}
-		fieldStates[i].releaseOwned()
+		state.releaseOwned()
 	}
 	inheritNumericRangeBucketCache(next, prev)
 
 	if changedCount > 0 {
 		changed := make([]bool, len(db.indexedFieldAccess))
-		for i := range fieldStates {
-			if fieldStates[i].changed {
+		for i := 0; i < fieldStates.Len(); i++ {
+			if fieldStates.Get(i).changed {
 				changed[i] = true
 			}
 		}
@@ -1824,6 +1826,7 @@ func (db *DB[K, V]) buildPreparedSnapshotInsertOnlyNoLock(seq uint64, prev *inde
 		inheritMaterializedPredCache(db, next, prev, nil)
 	}
 	next.retainSharedOwnedStorageFrom(prev)
+	snapshotFieldInsertStateSlicePool.Put(fieldStates)
 
 	return next, true
 }

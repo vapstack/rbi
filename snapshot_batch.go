@@ -198,7 +198,7 @@ func ensureSnapshotUniverseOwned(next *indexSnapshot, universeOwned *bool) {
 }
 
 type indexedFieldBatchDeltas struct {
-	fields []snapshotFieldBatchState
+	fields *pooled.SliceBuf[snapshotFieldBatchState]
 }
 
 func normalizePreparedBatchForSnapshot[K ~string | ~uint64, V any](prepared []autoBatchPrepared[K, V]) []snapshotBatchEntry[K, V] {
@@ -1786,7 +1786,7 @@ func (db *DB[K, V]) collectSnapshotBatchEntryDiffs(
 
 	db.forEachSnapshotModifiedIndexedField(op, func(acc indexedFieldAccessor) bool {
 		useZeroComplement := lenZeroComplement != nil && acc.ordinal < lenZeroComplement.Len() && lenZeroComplement.Get(acc.ordinal)
-		acc.collectSnapshotBatchDiff(op.idx, ptrOld, ptrNew, useZeroComplement, &deltas.fields[acc.ordinal])
+		acc.collectSnapshotBatchDiff(op.idx, ptrOld, ptrNew, useZeroComplement, deltas.fields.GetPtr(acc.ordinal))
 		return true
 	})
 }
@@ -1812,8 +1812,9 @@ func (db *DB[K, V]) buildPreparedSnapshotAggregatedNoLock(
 
 	normalized := normalizePreparedBatchForSnapshot(prepared)
 	deltas := indexedFieldBatchDeltas{
-		fields: make([]snapshotFieldBatchState, len(db.indexedFieldAccess)),
+		fields: snapshotFieldBatchStateSlicePool.Get(),
 	}
+	deltas.fields.SetLen(len(db.indexedFieldAccess))
 
 	universeOwned := false
 
@@ -1832,7 +1833,7 @@ func (db *DB[K, V]) buildPreparedSnapshotAggregatedNoLock(
 
 	changedCount := 0
 	for i, acc := range db.indexedFieldAccess {
-		state := &deltas.fields[i]
+		state := deltas.fields.GetPtr(i)
 		baseIndex := next.index.Get(i)
 		if storage := acc.applySnapshotBatchStorageOwned(baseIndex, state, true); storage.keyCount() == 0 {
 			if baseIndex.keyCount() > 0 {
@@ -1861,12 +1862,11 @@ func (db *DB[K, V]) buildPreparedSnapshotAggregatedNoLock(
 		}
 		state.releaseOwned()
 	}
-
 	inheritNumericRangeBucketCache(next, prev)
 	if changedCount > 0 {
 		changed := make([]bool, len(db.indexedFieldAccess))
-		for i := range deltas.fields {
-			if deltas.fields[i].changed {
+		for i := 0; i < deltas.fields.Len(); i++ {
+			if deltas.fields.Get(i).changed {
 				changed[i] = true
 			}
 		}
@@ -1874,6 +1874,7 @@ func (db *DB[K, V]) buildPreparedSnapshotAggregatedNoLock(
 	} else {
 		inheritMaterializedPredCache(db, next, prev, nil)
 	}
+	snapshotFieldBatchStateSlicePool.Put(deltas.fields)
 	next.retainSharedOwnedStorageFrom(prev)
 
 	return next

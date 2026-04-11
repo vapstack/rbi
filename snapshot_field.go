@@ -4,6 +4,7 @@ import (
 	"slices"
 	"unsafe"
 
+	"github.com/vapstack/rbi/internal/pooled"
 	"github.com/vapstack/rbi/internal/posting"
 )
 
@@ -29,6 +30,10 @@ type snapshotFieldInsertState struct {
 	lengthsHint int
 }
 
+var snapshotFieldInsertStateSlicePool = pooled.Slices[snapshotFieldInsertState]{
+	Clear: true,
+}
+
 type fieldWriteScratch struct {
 	strings []string
 	fixed   []uint64
@@ -46,6 +51,10 @@ type snapshotFieldBatchState struct {
 	changed bool
 	old     fieldWriteScratch
 	new     fieldWriteScratch
+}
+
+var snapshotFieldBatchStateSlicePool = pooled.Slices[snapshotFieldBatchState]{
+	Clear: true,
 }
 
 func (s *fieldWriteScratch) reset() {
@@ -216,13 +225,18 @@ func (acc indexedFieldAccessor) collectSnapshotInsertValue(
 	})
 }
 
-func initSnapshotFieldInsertStateHints(states []snapshotFieldInsertState, access []indexedFieldAccessor, prev *indexSnapshot, batchHint int) {
+func initSnapshotFieldInsertStateHints(
+	states *pooled.SliceBuf[snapshotFieldInsertState],
+	access []indexedFieldAccessor,
+	prev *indexSnapshot,
+	batchHint int,
+) {
 	if prev == nil || batchHint <= 0 {
 		return
 	}
 	for i := range access {
 		acc := access[i]
-		state := &states[i]
+		state := states.GetPtr(i)
 		var indexHint int
 		if prev.index != nil && acc.ordinal < prev.index.Len() {
 			indexHint = snapshotFieldStorageHint(prev.index.Get(acc.ordinal), batchHint)
