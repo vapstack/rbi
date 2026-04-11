@@ -101,7 +101,9 @@ func TestPlannerFilterPostingByPredicateChecksBuf_PostsAnyOwnedLargeAllocsPerRun
 	defer predicateCheckSlicePool.Put(checks)
 
 	var work posting.List
-	defer work.Release()
+	defer func() {
+		work.Release()
+	}()
 
 	run := func() {
 		mode, exact, nextWork, card := plannerFilterPostingByPredicateChecksBuf(preds, checks, src, work, true)
@@ -173,7 +175,9 @@ func TestPlannerFilterPostingByPredicateChecksBuf_CompactBorrowedAllocsPerRunSta
 	defer predicateCheckSlicePool.Put(checks)
 
 	var work posting.List
-	defer work.Release()
+	defer func() {
+		work.Release()
+	}()
 
 	run := func() {
 		mode, exact, nextWork, card := plannerFilterPostingByPredicateChecksBuf(preds, checks, src.Borrow(), work, true)

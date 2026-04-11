@@ -390,6 +390,13 @@ type bitmapContainerShortIterator struct {
 	i   int
 }
 
+var bitmapContainerShortIteratorPool = pooled.Pointers[bitmapContainerShortIterator]{
+	Cleanup: func(it *bitmapContainerShortIterator) {
+		it.ptr = nil
+		it.i = 0
+	},
+}
+
 func (bcsi *bitmapContainerShortIterator) next() uint16 {
 	j := bcsi.i
 	bcsi.i = bcsi.ptr.nextSetBit(uint(bcsi.i) + 1)
@@ -410,10 +417,15 @@ func (bcsi *bitmapContainerShortIterator) advanceIfNeeded(minval uint16) {
 	}
 }
 
-func (*bitmapContainerShortIterator) release() {}
+func (it *bitmapContainerShortIterator) release() {
+	bitmapContainerShortIteratorPool.Put(it)
+}
 
 func newContainerBitmapShortIterator(a *containerBitmap) *bitmapContainerShortIterator {
-	return &bitmapContainerShortIterator{a, a.nextSetBit(0)}
+	it := bitmapContainerShortIteratorPool.Get()
+	it.ptr = a
+	it.i = a.nextSetBit(0)
+	return it
 }
 
 func (bc *containerBitmap) getShortIterator() shortPeekable {
@@ -424,6 +436,14 @@ type bitmapContainerManyIterator struct {
 	ptr    *containerBitmap
 	base   int
 	bitset uint64
+}
+
+var bitmapContainerManyIteratorPool = pooled.Pointers[bitmapContainerManyIterator]{
+	Cleanup: func(it *bitmapContainerManyIterator) {
+		it.ptr = nil
+		it.base = 0
+		it.bitset = 0
+	},
 }
 
 func (bcmi *bitmapContainerManyIterator) nextMany(hs uint32, buf []uint32) int {
@@ -481,10 +501,16 @@ func (bcmi *bitmapContainerManyIterator) nextMany64(hs uint64, buf []uint64) int
 	return n
 }
 
-func (*bitmapContainerManyIterator) release() {}
+func (it *bitmapContainerManyIterator) release() {
+	bitmapContainerManyIteratorPool.Put(it)
+}
 
 func newContainerBitmapManyIterator(a *containerBitmap) *bitmapContainerManyIterator {
-	return &bitmapContainerManyIterator{a, -1, 0}
+	it := bitmapContainerManyIteratorPool.Get()
+	it.ptr = a
+	it.base = -1
+	it.bitset = 0
+	return it
 }
 
 func (bc *containerBitmap) getManyIterator() manyIterable {

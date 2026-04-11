@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"slices"
 	"sync/atomic"
+
+	"github.com/vapstack/rbi/internal/pooled"
 )
 
 //
@@ -1170,9 +1172,21 @@ type runIterator16 struct {
 	curPosInIndex uint16
 }
 
+var runIterator16Pool = pooled.Pointers[runIterator16]{
+	Cleanup: func(it *runIterator16) {
+		it.rc = nil
+		it.curIndex = 0
+		it.curPosInIndex = 0
+	},
+}
+
 // newRunIterator returns a new empty run iterator over rc.
 func (rc *containerRun) newRunIterator() *runIterator16 {
-	return &runIterator16{rc: rc, curIndex: 0, curPosInIndex: 0}
+	it := runIterator16Pool.Get()
+	it.rc = rc
+	it.curIndex = 0
+	it.curPosInIndex = 0
+	return it
 }
 
 func (rc *containerRun) iterate(cb func(x uint16) bool) bool {
@@ -1235,7 +1249,9 @@ func (ri *runIterator16) advanceIfNeeded(minval uint16) {
 	}
 }
 
-func (*runIterator16) release() {}
+func (ri *runIterator16) release() {
+	runIterator16Pool.Put(ri)
+}
 
 func (rc *containerRun) newRunManyIterator() *runIterator16 {
 	return rc.newRunIterator()

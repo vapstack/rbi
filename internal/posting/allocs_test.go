@@ -176,7 +176,8 @@ func TestHotPathPools_NoAllocsAfterWarmup(t *testing.T) {
 
 	t.Run("ListBuildAddedSmall", func(t *testing.T) {
 		requireZeroAllocsAfterPoolWarmup(t, func() {
-			out := small.BuildAdded(99)
+			out := small.Clone()
+			out = out.BuildAdded(99)
 			allocUint64Sink = out.Cardinality()
 			out.Release()
 		})
@@ -184,7 +185,8 @@ func TestHotPathPools_NoAllocsAfterWarmup(t *testing.T) {
 
 	t.Run("ListBuildRemovedMid", func(t *testing.T) {
 		requireZeroAllocsAfterPoolWarmup(t, func() {
-			out := mid.BuildRemoved(midIDs[len(midIDs)/2])
+			out := mid.Clone()
+			out = out.BuildRemoved(midIDs[len(midIDs)/2])
 			allocUint64Sink = out.Cardinality()
 			out.Release()
 		})
@@ -192,7 +194,8 @@ func TestHotPathPools_NoAllocsAfterWarmup(t *testing.T) {
 
 	t.Run("ListBuildAddedManySortedLarge", func(t *testing.T) {
 		requireZeroAllocsAfterPoolWarmup(t, func() {
-			out := large.BuildAddedMany(addManySortedIDs)
+			out := large.Clone()
+			out = out.BuildAddedMany(addManySortedIDs)
 			allocUint64Sink = out.Cardinality()
 			out.Release()
 		})
@@ -200,7 +203,8 @@ func TestHotPathPools_NoAllocsAfterWarmup(t *testing.T) {
 
 	t.Run("ListBuildAddedManyUnsortedLarge", func(t *testing.T) {
 		requireZeroAllocsAfterPoolWarmup(t, func() {
-			out := large.BuildAddedMany(addManyUnsortedIDs)
+			out := large.Clone()
+			out = out.BuildAddedMany(addManyUnsortedIDs)
 			allocUint64Sink = out.Cardinality()
 			out.Release()
 		})
@@ -208,7 +212,22 @@ func TestHotPathPools_NoAllocsAfterWarmup(t *testing.T) {
 
 	t.Run("ListBuildAndLarge", func(t *testing.T) {
 		requireZeroAllocsAfterPoolWarmup(t, func() {
-			out := large.BuildAnd(largeMask)
+			out := large.Clone()
+			out = out.BuildAnd(largeMask)
+			allocUint64Sink = out.Cardinality()
+			out.Release()
+		})
+	})
+
+	t.Run("ListBuildAndLargeWithCompactMask", func(t *testing.T) {
+		mask := BuildFromSorted([]uint64{
+			largeIDs[3], largeIDs[11], largeIDs[19], largeIDs[27], largeIDs[35], largeIDs[43],
+		})
+		defer mask.Release()
+
+		requireZeroAllocsAfterPoolWarmup(t, func() {
+			out := large.Clone()
+			out = out.BuildAnd(mask)
 			allocUint64Sink = out.Cardinality()
 			out.Release()
 		})
@@ -244,7 +263,9 @@ func TestHotPathPools_NoAllocsAfterWarmup(t *testing.T) {
 
 	t.Run("ListTryResetOwnedCompactLikeFromSorted", func(t *testing.T) {
 		var scratch List
-		defer scratch.Release()
+		defer func() {
+			scratch.Release()
+		}()
 
 		requireZeroAllocsAfterPoolWarmup(t, func() {
 			prev := scratch
@@ -281,7 +302,8 @@ func TestHotPathPools_NoAllocsAfterWarmup(t *testing.T) {
 
 	t.Run("ListBuildOrLarge", func(t *testing.T) {
 		requireZeroAllocsAfterPoolWarmup(t, func() {
-			out := large.BuildOr(largeOther)
+			out := large.Clone()
+			out = out.BuildOr(largeOther)
 			allocUint64Sink = out.Cardinality()
 			out.Release()
 		})
@@ -289,7 +311,8 @@ func TestHotPathPools_NoAllocsAfterWarmup(t *testing.T) {
 
 	t.Run("ListBuildAndNotLarge", func(t *testing.T) {
 		requireZeroAllocsAfterPoolWarmup(t, func() {
-			out := large.BuildAndNot(largeOther)
+			out := large.Clone()
+			out = out.BuildAndNot(largeOther)
 			allocUint64Sink = out.Cardinality()
 			out.Release()
 		})
@@ -340,6 +363,112 @@ func TestHotPathPools_NoAllocsAfterWarmup(t *testing.T) {
 			var sum uint32
 			for it.hasNext() {
 				sum += it.next()
+			}
+			allocUint32Sink = sum
+			it.release()
+		})
+	})
+
+	arrayContainer := buildContainerArray([]uint16{1, 5, 9, 13, 17, 21}).(*containerArray)
+	defer arrayContainer.Release()
+
+	t.Run("ContainerArrayShortIterator", func(t *testing.T) {
+		requireZeroAllocsAfterPoolWarmup(t, func() {
+			it := arrayContainer.getShortIterator()
+			var sum uint32
+			for it.hasNext() {
+				sum += uint32(it.next())
+			}
+			allocUint32Sink = sum
+			it.release()
+		})
+	})
+
+	t.Run("ContainerArrayManyIterator", func(t *testing.T) {
+		requireZeroAllocsAfterPoolWarmup(t, func() {
+			it := arrayContainer.getManyIterator()
+			var sum uint32
+			var buf [4]uint32
+			for {
+				n := it.nextMany(0, buf[:])
+				if n == 0 {
+					break
+				}
+				for i := 0; i < n; i++ {
+					sum += buf[i]
+				}
+			}
+			allocUint32Sink = sum
+			it.release()
+		})
+	})
+
+	runContainer := buildContainerRun([]uint16{3, 4, 5, 10, 11, 12, 20, 21, 22, 23}).(*containerRun)
+	defer runContainer.Release()
+
+	t.Run("ContainerRunShortIterator", func(t *testing.T) {
+		requireZeroAllocsAfterPoolWarmup(t, func() {
+			it := runContainer.getShortIterator()
+			var sum uint32
+			for it.hasNext() {
+				sum += uint32(it.next())
+			}
+			allocUint32Sink = sum
+			it.release()
+		})
+	})
+
+	t.Run("ContainerRunManyIterator", func(t *testing.T) {
+		requireZeroAllocsAfterPoolWarmup(t, func() {
+			it := runContainer.getManyIterator()
+			var sum uint32
+			var buf [4]uint32
+			for {
+				n := it.nextMany(0, buf[:])
+				if n == 0 {
+					break
+				}
+				for i := 0; i < n; i++ {
+					sum += buf[i]
+				}
+			}
+			allocUint32Sink = sum
+			it.release()
+		})
+	})
+
+	bitmapContainer := buildContainerBitmap([]uint16{
+		1, 3, 5, 7, 9, 11, 13, 15,
+		17, 19, 21, 23, 25, 27, 29, 31,
+		33, 35, 37, 39, 41, 43, 45, 47,
+	}).(*containerBitmap)
+	defer bitmapContainer.Release()
+
+	t.Run("ContainerBitmapShortIterator", func(t *testing.T) {
+		requireZeroAllocsAfterPoolWarmup(t, func() {
+			it := bitmapContainer.getShortIterator()
+			var sum uint32
+			for it.hasNext() {
+				sum += uint32(it.next())
+			}
+			allocUint32Sink = sum
+			it.release()
+		})
+	})
+
+	t.Run("ContainerBitmapManyIterator", func(t *testing.T) {
+		requireZeroAllocsAfterPoolWarmup(t, func() {
+			it := newContainerBitmapManyIterator(bitmapContainer)
+			var sum uint32
+			var buf [4]uint32
+			for {
+				n := it.nextMany(0, buf[:])
+				if n == 0 {
+					break
+				}
+				for i := 0; i < n; i++ {
+					sum += buf[i]
+				}
 			}
 			allocUint32Sink = sum
 			it.release()

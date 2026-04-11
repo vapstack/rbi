@@ -360,7 +360,7 @@ func TestSnapshotReleaseOwnedStorage_SkipsLiveSharedFlatRoot(t *testing.T) {
 	db.snapshot.mu.Lock()
 	retired := db.releaseRetiredSnapshotRefLocked(old.seq, oldRef)
 	db.snapshot.mu.Unlock()
-	retired.releaseOwnedStorage()
+	releaseRetiredSnapshots(retired)
 	if !snapshotExtFieldContainsID(t, current, "f", "shared", 1) {
 		t.Fatalf("current snapshot lost shared posting after old prune")
 	}

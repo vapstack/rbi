@@ -4,8 +4,10 @@ import (
 	"fmt"
 	"reflect"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/vapstack/qx"
 )
@@ -917,6 +919,1319 @@ func assertQueryExtraPublicReadPathsMatchExpected(t *testing.T, db *DB[uint64, R
 	assertQueryExtIDsMatchExpected(t, db, q)
 	assertQueryExtItemsMatchExpected(t, db, q)
 	assertQueryExtCountMatchesBaseQuery(t, db, q)
+}
+
+func queryExtOrderedORNegativeResidualFixture() ([]uint64, []*Rec, []*Rec, *qx.QX) {
+	ids := []uint64{1, 2, 3, 4, 5, 6, 7, 8}
+
+	stateA := []*Rec{
+		{Name: "A1-fr-low", Age: 20, Score: 30, Active: false, Meta: Meta{Country: "FR"}},
+		{Name: "alice", Age: 21, Score: 40, Active: false, Meta: Meta{Country: "NL"}},
+		{Name: "A3-de-hi", Age: 22, Score: 70, Active: true, Meta: Meta{Country: "DE"}},
+		{Name: "A4-us-mid", Age: 23, Score: 60, Active: false, Meta: Meta{Country: "US"}},
+		{Name: "A5-pl-mid", Age: 24, Score: 50, Active: true, Meta: Meta{Country: "PL"}},
+		{Name: "A6-nl-none", Age: 25, Score: 80, Active: false, Meta: Meta{Country: "NL"}},
+		{Name: "alice", Age: 26, Score: 54, Active: false, Meta: Meta{Country: "FR"}},
+		{Name: "alice", Age: 27, Score: 53, Active: true, Meta: Meta{Country: "DE"}},
+	}
+
+	stateB := []*Rec{
+		{Name: "B1-nl-none", Age: 35, Score: 30, Active: false, Meta: Meta{Country: "NL"}},
+		{Name: "alice", Age: 36, Score: 54, Active: false, Meta: Meta{Country: "FR"}},
+		{Name: "B3-de-low", Age: 37, Score: 48, Active: true, Meta: Meta{Country: "DE"}},
+		{Name: "B4-us-low", Age: 38, Score: 20, Active: false, Meta: Meta{Country: "US"}},
+		{Name: "B5-de-none", Age: 39, Score: 90, Active: false, Meta: Meta{Country: "DE"}},
+		{Name: "B6-pl-hi", Age: 40, Score: 80, Active: false, Meta: Meta{Country: "PL"}},
+		{Name: "alice", Age: 41, Score: 40, Active: false, Meta: Meta{Country: "NL"}},
+		{Name: "alice", Age: 42, Score: 53, Active: true, Meta: Meta{Country: "FR"}},
+	}
+
+	q := qx.Query(
+		qx.OR(
+			qx.NOTIN("country", []string{"NL", "DE"}),
+			qx.AND(
+				qx.EQ("name", "alice"),
+				qx.LT("score", 55.0),
+			),
+			qx.AND(
+				qx.EQ("active", true),
+				qx.GTE("score", 45.0),
+			),
+		),
+	).By("age", qx.ASC).Skip(2).Max(4)
+
+	return ids, stateA, stateB, q
+}
+
+func queryExtStringOrderedORFixture() ([]string, []*Rec, []*Rec, *qx.QX) {
+	ids := []string{"id-1", "id-2", "id-3", "id-4", "id-5", "id-6", "id-7"}
+
+	stateA := []*Rec{
+		{Name: "aa/00", Active: true, Score: 10, Meta: Meta{Country: "US"}},
+		{Name: "aa/01", Active: false, Score: 40, Meta: Meta{Country: "FR"}},
+		{Name: "aa/02", Active: true, Score: 70, Meta: Meta{Country: "NL"}},
+		{Name: "ab/00", Active: false, Score: 30, Meta: Meta{Country: "NL"}},
+		{Name: "ab/01", Active: true, Score: 60, Meta: Meta{Country: "US"}},
+		{Name: "ac/00", Active: true, Score: 50, Meta: Meta{Country: "FR"}},
+		{Name: "zz/00", Active: true, Score: 5, Meta: Meta{Country: "DE"}},
+	}
+
+	stateB := []*Rec{
+		{Name: "aa/00", Active: false, Score: 10, Meta: Meta{Country: "US"}},
+		{Name: "aa/03", Active: true, Score: 20, Meta: Meta{Country: "FR"}},
+		{Name: "aa/04", Active: true, Score: 40, Meta: Meta{Country: "DE"}},
+		{Name: "ab/00", Active: true, Score: 30, Meta: Meta{Country: "NL"}},
+		{Name: "ab/02", Active: false, Score: 60, Meta: Meta{Country: "US"}},
+		{Name: "ab/03", Active: true, Score: 80, Meta: Meta{Country: "NL"}},
+		{Name: "ac/00", Active: true, Score: 50, Meta: Meta{Country: "FR"}},
+	}
+
+	q := qx.Query(
+		qx.OR(
+			qx.AND(
+				qx.PREFIX("name", "aa/"),
+				qx.EQ("active", true),
+			),
+			qx.AND(
+				qx.PREFIX("name", "ab/"),
+				qx.EQ("country", "NL"),
+			),
+			qx.AND(
+				qx.EQ("name", "aa/03"),
+				qx.LT("score", 25.0),
+			),
+		),
+	).By("name", qx.ASC).Skip(1).Max(3)
+
+	return ids, stateA, stateB, q
+}
+
+func queryExtNoOrderORDisjointFixture() ([]uint64, []*Rec, []*Rec, *qx.QX) {
+	ids := []uint64{1, 2, 3, 4, 5, 6, 7, 8}
+
+	stateA := []*Rec{
+		{Name: "A1-fr", Email: "cold/01", Active: false, Age: 20, Score: 20, Meta: Meta{Country: "FR"}},
+		{Name: "A2-hot", Email: "hot/02", Active: false, Age: 21, Score: 30, Meta: Meta{Country: "US"}},
+		{Name: "A3-miss", Email: "cold/03", Active: false, Age: 22, Score: 40, Meta: Meta{Country: "PL"}},
+		{Name: "A4-fr", Email: "cold/04", Active: false, Age: 23, Score: 50, Meta: Meta{Country: "FR"}},
+		{Name: "A5-off", Email: "cold/05", Active: false, Age: 45, Score: 90, Meta: Meta{Country: "NL"}},
+		{Name: "A6-off", Email: "hot/06", Active: false, Age: 46, Score: 80, Meta: Meta{Country: "DE"}},
+		{Name: "A7-off", Email: "cold/07", Active: false, Age: 47, Score: 70, Meta: Meta{Country: "NL"}},
+		{Name: "A8-off", Email: "hot/08", Active: false, Age: 48, Score: 60, Meta: Meta{Country: "DE"}},
+	}
+
+	stateB := []*Rec{
+		{Name: "B1-off", Email: "cold/01", Active: false, Age: 20, Score: 80, Meta: Meta{Country: "NL"}},
+		{Name: "B2-off", Email: "hot/02", Active: false, Age: 21, Score: 80, Meta: Meta{Country: "DE"}},
+		{Name: "B3-off", Email: "cold/03", Active: false, Age: 22, Score: 80, Meta: Meta{Country: "NL"}},
+		{Name: "B4-off", Email: "hot/04", Active: false, Age: 23, Score: 80, Meta: Meta{Country: "DE"}},
+		{Name: "B5-nl", Email: "vip/05", Active: true, Age: 45, Score: 40, Meta: Meta{Country: "NL"}},
+		{Name: "B6-nl", Email: "vip/06", Active: true, Age: 46, Score: 50, Meta: Meta{Country: "NL"}},
+		{Name: "B7-nl", Email: "vip/07", Active: true, Age: 47, Score: 60, Meta: Meta{Country: "NL"}},
+		{Name: "B8-nl", Email: "vip/08", Active: true, Age: 48, Score: 70, Meta: Meta{Country: "NL"}},
+	}
+
+	q := qx.Query(
+		qx.OR(
+			qx.AND(
+				qx.EQ("country", "FR"),
+				qx.LT("score", 55.0),
+			),
+			qx.AND(
+				qx.PREFIX("email", "hot/"),
+				qx.LT("score", 55.0),
+			),
+			qx.AND(
+				qx.EQ("active", true),
+				qx.GTE("age", 45),
+				qx.EQ("country", "NL"),
+			),
+		),
+	).Skip(1).Max(3)
+
+	return ids, stateA, stateB, q
+}
+
+func queryExtRecSignature(rec *Rec) string {
+	if rec == nil {
+		return "<nil>"
+	}
+	opt := "<nil>"
+	if rec.Opt != nil {
+		opt = *rec.Opt
+	}
+	return fmt.Sprintf(
+		"%s|%s|%d|%g|%t|%s|%s|%s|%s",
+		rec.Name,
+		rec.Email,
+		rec.Age,
+		rec.Score,
+		rec.Active,
+		rec.Country,
+		rec.FullName,
+		opt,
+		strings.Join(rec.Tags, "\x1f"),
+	)
+}
+
+func queryExtBuildSignatureCounts(items []*Rec) map[string]int {
+	out := make(map[string]int, len(items))
+	for i := range items {
+		if items[i] == nil {
+			continue
+		}
+		out[queryExtRecSignature(items[i])]++
+	}
+	return out
+}
+
+func queryExtValidateNoOrderItemsAgainstFullSet(q *qx.QX, items []*Rec, fullSigCounts map[string]int, fullLen int) error {
+	seen := make(map[string]int, len(items))
+	for i := range items {
+		if items[i] == nil {
+			return fmt.Errorf("nil item at i=%d", i)
+		}
+		sig := queryExtRecSignature(items[i])
+		limit, ok := fullSigCounts[sig]
+		if !ok {
+			return fmt.Errorf("item %q outside full result set", sig)
+		}
+		seen[sig]++
+		if seen[sig] > limit {
+			return fmt.Errorf("duplicate item %q exceeds full-set multiplicity", sig)
+		}
+	}
+
+	maxLen := fullLen
+	if q.Offset >= uint64(fullLen) {
+		maxLen = 0
+	} else if q.Offset > 0 {
+		maxLen = fullLen - int(q.Offset)
+	}
+	if q.Limit > 0 && int(q.Limit) < maxLen {
+		maxLen = int(q.Limit)
+	}
+	if len(items) > maxLen {
+		return fmt.Errorf("items window overflow got=%d max=%d", len(items), maxLen)
+	}
+	return nil
+}
+
+func TestQueryExt_OrderedORNegativeResidualPlannerTrace_MatchesExpected(t *testing.T) {
+	var (
+		mu     sync.Mutex
+		events []TraceEvent
+	)
+
+	db, _ := openTempDBUint64(t, Options{
+		AnalyzeInterval:  -1,
+		TraceSink:        func(ev TraceEvent) { mu.Lock(); events = append(events, ev); mu.Unlock() },
+		TraceSampleEvery: 1,
+	})
+
+	ids, stateA, _, q := queryExtOrderedORNegativeResidualFixture()
+	if err := db.BatchSet(ids, stateA); err != nil {
+		t.Fatalf("BatchSet(stateA): %v", err)
+	}
+
+	got, err := db.QueryKeys(q)
+	if err != nil {
+		t.Fatalf("QueryKeys(%+v): %v", q, err)
+	}
+	want, err := expectedKeysUint64(t, db, q)
+	if err != nil {
+		t.Fatalf("expectedKeysUint64(%+v): %v", q, err)
+	}
+	assertQueryIDsEqual(t, q, got, want)
+
+	mu.Lock()
+	if len(events) == 0 {
+		mu.Unlock()
+		t.Fatalf("expected trace event for ordered OR query")
+	}
+	ev := events[len(events)-1]
+	mu.Unlock()
+
+	if ev.Plan != string(PlanMaterialized) &&
+		ev.Plan != string(PlanORMergeOrderMerge) &&
+		ev.Plan != string(PlanORMergeOrderStream) {
+		t.Fatalf("unexpected planner route for ordered OR fixture: got %q", ev.Plan)
+	}
+	if ev.RowsReturned != uint64(len(want)) {
+		t.Fatalf("trace rows returned mismatch: got=%d want=%d", ev.RowsReturned, len(want))
+	}
+
+	assertQueryExtItemsMatchExpected(t, db, q)
+	assertQueryExtCountMatchesBaseQuery(t, db, q)
+	assertQueryExtPreparedMatchesExpected(t, db, q)
+}
+
+func TestQueryExt_OrderedORPrefixBoundaryChurn_MatchesSeqScanAndPrepared(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
+
+	rows := map[uint64]*Rec{
+		1: {Name: "alpha-00", FullName: "grp/a/00", Active: true, Score: 10},
+		2: {Name: "alpha-01", FullName: "grp/a/01", Active: false, Score: 40},
+		3: {Name: "alpha-02", FullName: "grp/a/02", Active: true, Score: 60},
+		4: {Name: "alpha-out", FullName: "grp/a0", Active: true, Score: 80},
+		5: {Name: "alpha-zz", FullName: "grp/a/zz", Active: false, Score: 55},
+		6: {Name: "beta-00", FullName: "grp/b/00", Active: true, Score: 15},
+		7: {Name: "beta-05", FullName: "grp/b/05", Active: false, Score: 25},
+		8: {Name: "beta-09", FullName: "grp/b/09", Active: true, Score: 65},
+		9: {Name: "gamma-00", FullName: "grp/c/00", Active: true, Score: 75},
+	}
+	for id, rec := range rows {
+		if err := db.Set(id, rec); err != nil {
+			t.Fatalf("Set(%d): %v", id, err)
+		}
+	}
+
+	q := qx.Query(
+		qx.OR(
+			qx.AND(
+				qx.PREFIX("full_name", "grp/a/"),
+				qx.GTE("full_name", "grp/a/01"),
+			),
+			qx.AND(
+				qx.PREFIX("full_name", "grp/a/"),
+				qx.GTE("score", 55.0),
+			),
+			qx.AND(
+				qx.PREFIX("full_name", "grp/b/"),
+				qx.EQ("active", true),
+			),
+		),
+	).By("full_name", qx.ASC).Skip(1).Max(6)
+
+	check := func(step string) {
+		t.Run(step, func(t *testing.T) {
+			assertQueryExtAllReadPathsMatchExpected(t, db, q)
+		})
+	}
+
+	check("initial")
+
+	if err := db.Patch(4, []Field{{Name: "full_name", Value: "grp/a/10"}}); err != nil {
+		t.Fatalf("Patch(4 full_name): %v", err)
+	}
+	if err := db.Patch(6, []Field{{Name: "active", Value: false}}); err != nil {
+		t.Fatalf("Patch(6 active): %v", err)
+	}
+	check("after_order_boundary_cross")
+
+	if err := db.Patch(5, []Field{{Name: "full_name", Value: "grp/b/01"}, {Name: "active", Value: true}}); err != nil {
+		t.Fatalf("Patch(5 full_name/active): %v", err)
+	}
+	if err := db.Delete(2); err != nil {
+		t.Fatalf("Delete(2): %v", err)
+	}
+	if err := db.Set(10, &Rec{Name: "alpha-new", FullName: "grp/a/00", Active: true, Score: 70}); err != nil {
+		t.Fatalf("Set(10): %v", err)
+	}
+	check("after_overlap_churn")
+}
+
+func TestQueryExt_ConcurrentAtomicBatchSetSnapshotConsistency_OnOrderedORNegativeResidual_WithAnalyzer(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: 5 * time.Millisecond})
+
+	ids, stateA, stateB, q := queryExtOrderedORNegativeResidualFixture()
+	setState := func(vals []*Rec) error {
+		return db.BatchSet(ids, vals)
+	}
+
+	if err := setState(stateA); err != nil {
+		t.Fatalf("BatchSet(stateA): %v", err)
+	}
+	wantA, err := expectedKeysUint64(t, db, q)
+	if err != nil {
+		t.Fatalf("expectedKeysUint64(stateA): %v", err)
+	}
+	itemsA, err := db.Query(q)
+	if err != nil {
+		t.Fatalf("Query(stateA): %v", err)
+	}
+	namesA := queryExtItemNames(t, itemsA)
+	countA, err := db.Count(q)
+	if err != nil {
+		t.Fatalf("Count(stateA): %v", err)
+	}
+
+	if err := setState(stateB); err != nil {
+		t.Fatalf("BatchSet(stateB): %v", err)
+	}
+	wantB, err := expectedKeysUint64(t, db, q)
+	if err != nil {
+		t.Fatalf("expectedKeysUint64(stateB): %v", err)
+	}
+	itemsB, err := db.Query(q)
+	if err != nil {
+		t.Fatalf("Query(stateB): %v", err)
+	}
+	namesB := queryExtItemNames(t, itemsB)
+	countB, err := db.Count(q)
+	if err != nil {
+		t.Fatalf("Count(stateB): %v", err)
+	}
+
+	if err := setState(stateA); err != nil {
+		t.Fatalf("BatchSet(stateA reset): %v", err)
+	}
+
+	startVersion := db.PlannerStats().Version
+	if latest, ok := waitPlannerStatsVersionGreater(db, startVersion, 250*time.Millisecond); !ok {
+		t.Fatalf("expected analyzer to publish planner stats during ordered OR test: start=%d latest=%d", startVersion, latest)
+	}
+
+	var wg sync.WaitGroup
+	errCh := make(chan error, 16)
+	start := make(chan struct{})
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		<-start
+		for i := 0; i < 120; i++ {
+			vals := stateB
+			if i%2 == 1 {
+				vals = stateA
+			}
+			if err := setState(vals); err != nil {
+				errCh <- fmt.Errorf("writer: %w", err)
+				return
+			}
+		}
+	}()
+
+	for g := 0; g < 8; g++ {
+		wg.Add(1)
+		go func(gid int) {
+			defer wg.Done()
+			<-start
+			for i := 0; i < 160; i++ {
+				gotKeys, err := db.QueryKeys(q)
+				if err != nil {
+					errCh <- fmt.Errorf("g=%d i=%d QueryKeys: %w", gid, i, err)
+					return
+				}
+				if !queryIDsEqual(q, gotKeys, wantA) && !queryIDsEqual(q, gotKeys, wantB) {
+					errCh <- fmt.Errorf("g=%d i=%d QueryKeys hybrid snapshot: got=%v wantA=%v wantB=%v", gid, i, gotKeys, wantA, wantB)
+					return
+				}
+
+				gotItems, err := db.Query(q)
+				if err != nil {
+					errCh <- fmt.Errorf("g=%d i=%d Query: %w", gid, i, err)
+					return
+				}
+				gotNames, ok := queryExtItemNamesOK(gotItems)
+				if !ok {
+					errCh <- fmt.Errorf("g=%d i=%d Query returned nil item: %#v", gid, i, gotItems)
+					return
+				}
+				if !slices.Equal(gotNames, namesA) && !slices.Equal(gotNames, namesB) {
+					errCh <- fmt.Errorf("g=%d i=%d Query hybrid snapshot: got=%v wantA=%v wantB=%v", gid, i, gotNames, namesA, namesB)
+					return
+				}
+
+				gotCount, err := db.Count(q)
+				if err != nil {
+					errCh <- fmt.Errorf("g=%d i=%d Count: %w", gid, i, err)
+					return
+				}
+				if gotCount != countA && gotCount != countB {
+					errCh <- fmt.Errorf("g=%d i=%d Count hybrid snapshot: got=%d wantA=%d wantB=%d", gid, i, gotCount, countA, countB)
+					return
+				}
+			}
+		}(g)
+	}
+
+	close(start)
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		t.Fatal(err)
+	}
+}
+
+func TestQueryExt_ConcurrentWriter_RootExecPreparedQuery_OnOrderedORNegativeResidual_ReturnsNoHybridResults(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: 5 * time.Millisecond})
+
+	ids, stateA, stateB, q := queryExtOrderedORNegativeResidualFixture()
+	setState := func(vals []*Rec) error {
+		return db.BatchSet(ids, vals)
+	}
+
+	nq := normalizeQueryForTest(q)
+	if err := db.checkUsedQuery(nq); err != nil {
+		t.Fatalf("checkUsedQuery(%+v): %v", nq, err)
+	}
+
+	if err := setState(stateA); err != nil {
+		t.Fatalf("BatchSet(stateA): %v", err)
+	}
+	wantA, err := expectedKeysUint64(t, db, q)
+	if err != nil {
+		t.Fatalf("expectedKeysUint64(stateA): %v", err)
+	}
+
+	if err := setState(stateB); err != nil {
+		t.Fatalf("BatchSet(stateB): %v", err)
+	}
+	wantB, err := expectedKeysUint64(t, db, q)
+	if err != nil {
+		t.Fatalf("expectedKeysUint64(stateB): %v", err)
+	}
+
+	if err := setState(stateA); err != nil {
+		t.Fatalf("BatchSet(stateA reset): %v", err)
+	}
+
+	startVersion := db.PlannerStats().Version
+	if latest, ok := waitPlannerStatsVersionGreater(db, startVersion, 250*time.Millisecond); !ok {
+		t.Fatalf("expected analyzer to publish planner stats during prepared ordered OR test: start=%d latest=%d", startVersion, latest)
+	}
+
+	start := make(chan struct{})
+	found := make(chan []uint64, 1)
+	errCh := make(chan error, 1)
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		<-start
+		for i := 0; i < 320; i++ {
+			vals := stateB
+			if i%2 == 1 {
+				vals = stateA
+			}
+			if err := setState(vals); err != nil {
+				select {
+				case errCh <- fmt.Errorf("writer: %w", err):
+				default:
+				}
+				return
+			}
+		}
+	}()
+
+	for g := 0; g < 8; g++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			for i := 0; i < 480; i++ {
+				got, err := db.execPreparedQuery(nq)
+				if err != nil {
+					select {
+					case errCh <- fmt.Errorf("execPreparedQuery: %w", err):
+					default:
+					}
+					return
+				}
+				if queryIDsEqual(q, got, wantA) || queryIDsEqual(q, got, wantB) {
+					continue
+				}
+				select {
+				case found <- append([]uint64(nil), got...):
+				default:
+				}
+				return
+			}
+		}()
+	}
+
+	close(start)
+	wg.Wait()
+	close(found)
+	close(errCh)
+
+	for err := range errCh {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	for got := range found {
+		t.Fatalf("root execPreparedQuery returned hybrid ordered OR result under concurrent writes: got=%v wantA=%v wantB=%v", got, wantA, wantB)
+	}
+}
+
+func TestQueryExt_StringKeys_ConcurrentAtomicBatchSetSnapshotConsistency_OnOrderedOR(t *testing.T) {
+	db, _ := openTempDBString(t, Options{AnalyzeInterval: -1})
+
+	ids, stateA, stateB, q := queryExtStringOrderedORFixture()
+	setState := func(vals []*Rec) error {
+		return db.BatchSet(ids, vals)
+	}
+
+	if err := setState(stateA); err != nil {
+		t.Fatalf("BatchSet(stateA): %v", err)
+	}
+	wantA, err := expectedKeysString(t, db, q)
+	if err != nil {
+		t.Fatalf("expectedKeysString(stateA): %v", err)
+	}
+	itemsA, err := db.Query(q)
+	if err != nil {
+		t.Fatalf("Query(stateA): %v", err)
+	}
+	namesA := queryExtItemNames(t, itemsA)
+	countA, err := db.Count(q)
+	if err != nil {
+		t.Fatalf("Count(stateA): %v", err)
+	}
+
+	if err := setState(stateB); err != nil {
+		t.Fatalf("BatchSet(stateB): %v", err)
+	}
+	wantB, err := expectedKeysString(t, db, q)
+	if err != nil {
+		t.Fatalf("expectedKeysString(stateB): %v", err)
+	}
+	itemsB, err := db.Query(q)
+	if err != nil {
+		t.Fatalf("Query(stateB): %v", err)
+	}
+	namesB := queryExtItemNames(t, itemsB)
+	countB, err := db.Count(q)
+	if err != nil {
+		t.Fatalf("Count(stateB): %v", err)
+	}
+
+	if err := setState(stateA); err != nil {
+		t.Fatalf("BatchSet(stateA reset): %v", err)
+	}
+
+	var wg sync.WaitGroup
+	errCh := make(chan error, 16)
+	start := make(chan struct{})
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		<-start
+		for i := 0; i < 120; i++ {
+			vals := stateB
+			if i%2 == 1 {
+				vals = stateA
+			}
+			if err := setState(vals); err != nil {
+				errCh <- fmt.Errorf("writer: %w", err)
+				return
+			}
+		}
+	}()
+
+	for g := 0; g < 8; g++ {
+		wg.Add(1)
+		go func(gid int) {
+			defer wg.Done()
+			<-start
+			for i := 0; i < 160; i++ {
+				gotKeys, err := db.QueryKeys(q)
+				if err != nil {
+					errCh <- fmt.Errorf("g=%d i=%d QueryKeys: %w", gid, i, err)
+					return
+				}
+				if !queryStringIDsEqual(q, gotKeys, wantA) && !queryStringIDsEqual(q, gotKeys, wantB) {
+					errCh <- fmt.Errorf("g=%d i=%d QueryKeys hybrid snapshot: got=%v wantA=%v wantB=%v", gid, i, gotKeys, wantA, wantB)
+					return
+				}
+
+				gotItems, err := db.Query(q)
+				if err != nil {
+					errCh <- fmt.Errorf("g=%d i=%d Query: %w", gid, i, err)
+					return
+				}
+				gotNames, ok := queryExtItemNamesOK(gotItems)
+				if !ok {
+					errCh <- fmt.Errorf("g=%d i=%d Query returned nil item: %#v", gid, i, gotItems)
+					return
+				}
+				if !slices.Equal(gotNames, namesA) && !slices.Equal(gotNames, namesB) {
+					errCh <- fmt.Errorf("g=%d i=%d Query hybrid snapshot: got=%v wantA=%v wantB=%v", gid, i, gotNames, namesA, namesB)
+					return
+				}
+
+				gotCount, err := db.Count(q)
+				if err != nil {
+					errCh <- fmt.Errorf("g=%d i=%d Count: %w", gid, i, err)
+					return
+				}
+				if gotCount != countA && gotCount != countB {
+					errCh <- fmt.Errorf("g=%d i=%d Count hybrid snapshot: got=%d wantA=%d wantB=%d", gid, i, gotCount, countA, countB)
+					return
+				}
+			}
+		}(g)
+	}
+
+	close(start)
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		t.Fatal(err)
+	}
+}
+
+func TestQueryExt_StringKeys_ConcurrentWriter_RootExecPreparedQuery_OnOrderedOR_ReturnsNoHybridResults(t *testing.T) {
+	db, _ := openTempDBString(t, Options{AnalyzeInterval: -1})
+
+	ids, stateA, stateB, q := queryExtStringOrderedORFixture()
+	setState := func(vals []*Rec) error {
+		return db.BatchSet(ids, vals)
+	}
+
+	nq := normalizeQueryForTest(q)
+	if err := db.checkUsedQuery(nq); err != nil {
+		t.Fatalf("checkUsedQuery(%+v): %v", nq, err)
+	}
+
+	if err := setState(stateA); err != nil {
+		t.Fatalf("BatchSet(stateA): %v", err)
+	}
+	wantA, err := expectedKeysString(t, db, q)
+	if err != nil {
+		t.Fatalf("expectedKeysString(stateA): %v", err)
+	}
+
+	if err := setState(stateB); err != nil {
+		t.Fatalf("BatchSet(stateB): %v", err)
+	}
+	wantB, err := expectedKeysString(t, db, q)
+	if err != nil {
+		t.Fatalf("expectedKeysString(stateB): %v", err)
+	}
+
+	if err := setState(stateA); err != nil {
+		t.Fatalf("BatchSet(stateA reset): %v", err)
+	}
+
+	start := make(chan struct{})
+	found := make(chan []string, 1)
+	errCh := make(chan error, 1)
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		<-start
+		for i := 0; i < 320; i++ {
+			vals := stateB
+			if i%2 == 1 {
+				vals = stateA
+			}
+			if err := setState(vals); err != nil {
+				select {
+				case errCh <- fmt.Errorf("writer: %w", err):
+				default:
+				}
+				return
+			}
+		}
+	}()
+
+	for g := 0; g < 8; g++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			for i := 0; i < 480; i++ {
+				got, err := db.execPreparedQuery(nq)
+				if err != nil {
+					select {
+					case errCh <- fmt.Errorf("execPreparedQuery: %w", err):
+					default:
+					}
+					return
+				}
+				if queryStringIDsEqual(q, got, wantA) || queryStringIDsEqual(q, got, wantB) {
+					continue
+				}
+				select {
+				case found <- append([]string(nil), got...):
+				default:
+				}
+				return
+			}
+		}()
+	}
+
+	close(start)
+	wg.Wait()
+	close(found)
+	close(errCh)
+
+	for err := range errCh {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	for got := range found {
+		t.Fatalf("root execPreparedQuery returned hybrid string-key ordered OR result under concurrent writes: got=%v wantA=%v wantB=%v", got, wantA, wantB)
+	}
+}
+
+func TestQueryExt_RefreshPlannerStatsDuringRuntimeFallbackEligibleOrderedOR_AllReadPathsStayExact(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
+	_ = seedData(t, db, 8_000)
+
+	q := normalizeQueryForTest(
+		qx.Query(
+			qx.OR(
+				qx.AND(
+					qx.EQ("active", true),
+					qx.EQ("country", "NL"),
+					qx.GTE("score", 30.0),
+				),
+				qx.AND(
+					qx.EQ("name", "alice"),
+					qx.GTE("age", 25),
+				),
+				qx.PREFIX("full_name", "FN-1"),
+			),
+		).By("age", qx.ASC).Skip(140).Max(120),
+	)
+
+	wantKeys, err := expectedKeysUint64(t, db, q)
+	if err != nil {
+		t.Fatalf("expectedKeysUint64(%+v): %v", q, err)
+	}
+	wantItems, err := db.BatchGet(wantKeys...)
+	if err != nil {
+		t.Fatalf("BatchGet(wantKeys): %v", err)
+	}
+	baseQ := cloneQuery(q)
+	baseQ.Order = nil
+	baseQ.Offset = 0
+	baseQ.Limit = 0
+	wantCount, err := db.Count(baseQ)
+	if err != nil {
+		t.Fatalf("Count(baseQ): %v", err)
+	}
+	nq := normalizeQueryForTest(q)
+	if err := db.checkUsedQuery(nq); err != nil {
+		t.Fatalf("checkUsedQuery(%+v): %v", nq, err)
+	}
+
+	errCh := make(chan error, 16)
+	var wg sync.WaitGroup
+
+	for g := 0; g < 6; g++ {
+		wg.Add(1)
+		go func(gid int) {
+			defer wg.Done()
+			for i := 0; i < 30; i++ {
+				gotKeys, err := db.QueryKeys(q)
+				if err != nil {
+					errCh <- fmt.Errorf("g=%d i=%d QueryKeys: %w", gid, i, err)
+					return
+				}
+				if !queryIDsEqual(q, gotKeys, wantKeys) {
+					errCh <- fmt.Errorf("g=%d i=%d QueryKeys mismatch: got=%v want=%v", gid, i, gotKeys, wantKeys)
+					return
+				}
+
+				gotItems, err := db.Query(q)
+				if err != nil {
+					errCh <- fmt.Errorf("g=%d i=%d Query: %w", gid, i, err)
+					return
+				}
+				if len(gotItems) != len(wantItems) {
+					errCh <- fmt.Errorf("g=%d i=%d Query len mismatch: got=%d want=%d", gid, i, len(gotItems), len(wantItems))
+					return
+				}
+				for j := range wantItems {
+					if gotItems[j] == nil || wantItems[j] == nil || !reflect.DeepEqual(*gotItems[j], *wantItems[j]) {
+						errCh <- fmt.Errorf("g=%d i=%d Query item mismatch at j=%d", gid, i, j)
+						return
+					}
+				}
+
+				gotCount, err := db.Count(q)
+				if err != nil {
+					errCh <- fmt.Errorf("g=%d i=%d Count: %w", gid, i, err)
+					return
+				}
+				if gotCount != wantCount {
+					errCh <- fmt.Errorf("g=%d i=%d Count mismatch: got=%d want=%d", gid, i, gotCount, wantCount)
+					return
+				}
+
+				gotPrepared, err := db.execPreparedQuery(nq)
+				if err != nil {
+					errCh <- fmt.Errorf("g=%d i=%d execPreparedQuery: %w", gid, i, err)
+					return
+				}
+				if !queryIDsEqual(nq, gotPrepared, wantKeys) {
+					errCh <- fmt.Errorf("g=%d i=%d execPreparedQuery mismatch: got=%v want=%v", gid, i, gotPrepared, wantKeys)
+					return
+				}
+			}
+		}(g)
+	}
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 25; i++ {
+			if err := db.RefreshPlannerStats(); err != nil {
+				errCh <- fmt.Errorf("RefreshPlannerStats i=%d: %w", i, err)
+				return
+			}
+		}
+	}()
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 200; i++ {
+			s := db.PlannerStats()
+			if s.Fields != nil {
+				s.Fields["country"] = PlannerFieldStats{}
+				delete(s.Fields, "age")
+			}
+		}
+	}()
+
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		t.Fatal(err)
+	}
+}
+
+func TestQueryExt_ConcurrentAtomicBatchSetSnapshotConsistency_OnNoOrderORWindow_WithAnalyzer(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: 5 * time.Millisecond})
+
+	ids, stateA, stateB, q := queryExtNoOrderORDisjointFixture()
+	setState := func(vals []*Rec) error {
+		return db.BatchSet(ids, vals)
+	}
+
+	fullQ := cloneQuery(q)
+	fullQ.Offset = 0
+	fullQ.Limit = 0
+
+	if err := setState(stateA); err != nil {
+		t.Fatalf("BatchSet(stateA): %v", err)
+	}
+	fullA, err := expectedKeysUint64(t, db, fullQ)
+	if err != nil {
+		t.Fatalf("expectedKeysUint64(full stateA): %v", err)
+	}
+	itemsAFull, err := db.BatchGet(fullA...)
+	if err != nil {
+		t.Fatalf("BatchGet(fullA): %v", err)
+	}
+	sigsAFull := queryExtBuildSignatureCounts(itemsAFull)
+	countA, err := db.Count(q)
+	if err != nil {
+		t.Fatalf("Count(stateA): %v", err)
+	}
+
+	if err := setState(stateB); err != nil {
+		t.Fatalf("BatchSet(stateB): %v", err)
+	}
+	fullB, err := expectedKeysUint64(t, db, fullQ)
+	if err != nil {
+		t.Fatalf("expectedKeysUint64(full stateB): %v", err)
+	}
+	itemsBFull, err := db.BatchGet(fullB...)
+	if err != nil {
+		t.Fatalf("BatchGet(fullB): %v", err)
+	}
+	sigsBFull := queryExtBuildSignatureCounts(itemsBFull)
+	countB, err := db.Count(q)
+	if err != nil {
+		t.Fatalf("Count(stateB): %v", err)
+	}
+
+	if err := setState(stateA); err != nil {
+		t.Fatalf("BatchSet(stateA reset): %v", err)
+	}
+
+	nq := normalizeQueryForTest(q)
+	if err := db.checkUsedQuery(nq); err != nil {
+		t.Fatalf("checkUsedQuery(%+v): %v", nq, err)
+	}
+
+	startVersion := db.PlannerStats().Version
+	if latest, ok := waitPlannerStatsVersionGreater(db, startVersion, 250*time.Millisecond); !ok {
+		t.Fatalf("expected analyzer to publish planner stats during no-order OR test: start=%d latest=%d", startVersion, latest)
+	}
+
+	var wg sync.WaitGroup
+	errCh := make(chan error, 16)
+	start := make(chan struct{})
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		<-start
+		for i := 0; i < 120; i++ {
+			vals := stateB
+			if i%2 == 1 {
+				vals = stateA
+			}
+			if err := setState(vals); err != nil {
+				errCh <- fmt.Errorf("writer: %w", err)
+				return
+			}
+		}
+	}()
+
+	for g := 0; g < 8; g++ {
+		wg.Add(1)
+		go func(gid int) {
+			defer wg.Done()
+			<-start
+			for i := 0; i < 160; i++ {
+				gotKeys, err := db.QueryKeys(q)
+				if err != nil {
+					errCh <- fmt.Errorf("g=%d i=%d QueryKeys: %w", gid, i, err)
+					return
+				}
+				errKA := plannerExtValidateNoOrderWindow(q, gotKeys, fullA)
+				errKB := plannerExtValidateNoOrderWindow(q, gotKeys, fullB)
+				if errKA != nil && errKB != nil {
+					errCh <- fmt.Errorf("g=%d i=%d QueryKeys hybrid snapshot: got=%v errA=%v errB=%v", gid, i, gotKeys, errKA, errKB)
+					return
+				}
+
+				gotItems, err := db.Query(q)
+				if err != nil {
+					errCh <- fmt.Errorf("g=%d i=%d Query: %w", gid, i, err)
+					return
+				}
+				gotNames, ok := queryExtItemNamesOK(gotItems)
+				if !ok {
+					errCh <- fmt.Errorf("g=%d i=%d Query returned nil item: %#v", gid, i, gotItems)
+					return
+				}
+				errIA := queryExtValidateNoOrderItemsAgainstFullSet(q, gotItems, sigsAFull, len(fullA))
+				errIB := queryExtValidateNoOrderItemsAgainstFullSet(q, gotItems, sigsBFull, len(fullB))
+				if errIA != nil && errIB != nil {
+					errCh <- fmt.Errorf("g=%d i=%d Query hybrid snapshot: errA=%v errB=%v items=%v", gid, i, errIA, errIB, gotNames)
+					return
+				}
+
+				gotCount, err := db.Count(q)
+				if err != nil {
+					errCh <- fmt.Errorf("g=%d i=%d Count: %w", gid, i, err)
+					return
+				}
+				if gotCount != countA && gotCount != countB {
+					errCh <- fmt.Errorf("g=%d i=%d Count hybrid snapshot: got=%d wantA=%d wantB=%d", gid, i, gotCount, countA, countB)
+					return
+				}
+
+				gotPrepared, err := db.execPreparedQuery(nq)
+				if err != nil {
+					errCh <- fmt.Errorf("g=%d i=%d execPreparedQuery: %w", gid, i, err)
+					return
+				}
+				errPA := plannerExtValidateNoOrderWindow(q, gotPrepared, fullA)
+				errPB := plannerExtValidateNoOrderWindow(q, gotPrepared, fullB)
+				if errPA != nil && errPB != nil {
+					errCh <- fmt.Errorf("g=%d i=%d execPreparedQuery hybrid snapshot: got=%v errA=%v errB=%v", gid, i, gotPrepared, errPA, errPB)
+					return
+				}
+			}
+		}(g)
+	}
+
+	close(start)
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		t.Fatal(err)
+	}
+}
+
+func TestQueryExt_RefreshPlannerStatsDuringAdversarialNoOrderOR_AllReadPathsStayValid(t *testing.T) {
+	db := plannerExtOpenSeededDB(t, Options{AnalyzeInterval: -1})
+	q := plannerExtQueryAdversarialNoOrderNegativeResidualOverlap()
+
+	fullQ := cloneQuery(q)
+	fullQ.Offset = 0
+	fullQ.Limit = 0
+	full, err := expectedKeysUint64(t, db, fullQ)
+	if err != nil {
+		t.Fatalf("expectedKeysUint64(full %+v): %v", fullQ, err)
+	}
+	fullItems, err := db.BatchGet(full...)
+	if err != nil {
+		t.Fatalf("BatchGet(full): %v", err)
+	}
+	fullSigCounts := queryExtBuildSignatureCounts(fullItems)
+	wantCount := uint64(len(full))
+
+	nq := normalizeQueryForTest(q)
+	if err := db.checkUsedQuery(nq); err != nil {
+		t.Fatalf("checkUsedQuery(%+v): %v", nq, err)
+	}
+
+	errCh := make(chan error, 16)
+	var wg sync.WaitGroup
+
+	for g := 0; g < 6; g++ {
+		wg.Add(1)
+		go func(gid int) {
+			defer wg.Done()
+			for i := 0; i < 25; i++ {
+				gotKeys, err := db.QueryKeys(q)
+				if err != nil {
+					errCh <- fmt.Errorf("g=%d i=%d QueryKeys: %w", gid, i, err)
+					return
+				}
+				if err = plannerExtValidateNoOrderWindow(q, gotKeys, full); err != nil {
+					errCh <- fmt.Errorf("g=%d i=%d QueryKeys invalid: %v got=%v full=%v", gid, i, err, gotKeys, full)
+					return
+				}
+
+				gotItems, err := db.Query(q)
+				if err != nil {
+					errCh <- fmt.Errorf("g=%d i=%d Query: %w", gid, i, err)
+					return
+				}
+				gotNames, ok := queryExtItemNamesOK(gotItems)
+				if !ok {
+					errCh <- fmt.Errorf("g=%d i=%d Query returned nil item: %#v", gid, i, gotItems)
+					return
+				}
+				if err = queryExtValidateNoOrderItemsAgainstFullSet(q, gotItems, fullSigCounts, len(full)); err != nil {
+					errCh <- fmt.Errorf("g=%d i=%d Query invalid: %v items=%v", gid, i, err, gotNames)
+					return
+				}
+
+				gotCount, err := db.Count(q)
+				if err != nil {
+					errCh <- fmt.Errorf("g=%d i=%d Count: %w", gid, i, err)
+					return
+				}
+				if gotCount != wantCount {
+					errCh <- fmt.Errorf("g=%d i=%d Count mismatch: got=%d want=%d", gid, i, gotCount, wantCount)
+					return
+				}
+
+				gotPrepared, err := db.execPreparedQuery(nq)
+				if err != nil {
+					errCh <- fmt.Errorf("g=%d i=%d execPreparedQuery: %w", gid, i, err)
+					return
+				}
+				if err = plannerExtValidateNoOrderWindow(q, gotPrepared, full); err != nil {
+					errCh <- fmt.Errorf("g=%d i=%d execPreparedQuery invalid: %v got=%v full=%v", gid, i, err, gotPrepared, full)
+					return
+				}
+			}
+		}(g)
+	}
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 20; i++ {
+			if err := db.RefreshPlannerStats(); err != nil {
+				errCh <- fmt.Errorf("RefreshPlannerStats i=%d: %w", i, err)
+				return
+			}
+		}
+	}()
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 120; i++ {
+			s := db.PlannerStats()
+			if s.Fields != nil {
+				s.Fields["country"] = PlannerFieldStats{}
+				delete(s.Fields, "age")
+			}
+		}
+	}()
+
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		t.Fatal(err)
+	}
+}
+
+func TestQueryExt_Race_PlannerAnalyzeLoopVsSnapshotPublish_OnOrderedORFixture(t *testing.T) {
+	if !testRaceEnabled {
+		t.Skip("run with -race to detect planner analyzer vs snapshot publish race")
+	}
+
+	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: 2 * time.Millisecond})
+
+	ids, stateA, stateB, q := queryExtOrderedORNegativeResidualFixture()
+	setState := func(vals []*Rec) error {
+		return db.BatchSet(ids, vals)
+	}
+
+	if err := setState(stateA); err != nil {
+		t.Fatalf("BatchSet(stateA): %v", err)
+	}
+	startVersion := db.PlannerStats().Version
+	if latest, ok := waitPlannerStatsVersionGreater(db, startVersion, 250*time.Millisecond); !ok {
+		t.Fatalf("expected analyzer to start before race reproducer: start=%d latest=%d", startVersion, latest)
+	}
+
+	wantA, err := expectedKeysUint64(t, db, q)
+	if err != nil {
+		t.Fatalf("expectedKeysUint64(stateA): %v", err)
+	}
+	if err := setState(stateB); err != nil {
+		t.Fatalf("BatchSet(stateB): %v", err)
+	}
+	wantB, err := expectedKeysUint64(t, db, q)
+	if err != nil {
+		t.Fatalf("expectedKeysUint64(stateB): %v", err)
+	}
+	if err := setState(stateA); err != nil {
+		t.Fatalf("BatchSet(stateA reset): %v", err)
+	}
+
+	errCh := make(chan error, 16)
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		<-start
+		for i := 0; i < 200; i++ {
+			vals := stateB
+			if i%2 == 1 {
+				vals = stateA
+			}
+			if err := setState(vals); err != nil {
+				errCh <- fmt.Errorf("writer: %w", err)
+				return
+			}
+		}
+	}()
+
+	for g := 0; g < 4; g++ {
+		wg.Add(1)
+		go func(gid int) {
+			defer wg.Done()
+			<-start
+			for i := 0; i < 120; i++ {
+				got, err := db.QueryKeys(q)
+				if err != nil {
+					errCh <- fmt.Errorf("g=%d i=%d QueryKeys: %w", gid, i, err)
+					return
+				}
+				if !queryIDsEqual(q, got, wantA) && !queryIDsEqual(q, got, wantB) {
+					errCh <- fmt.Errorf("g=%d i=%d hybrid ordered OR result: got=%v wantA=%v wantB=%v", gid, i, got, wantA, wantB)
+					return
+				}
+			}
+		}(g)
+	}
+
+	close(start)
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		t.Fatal(err)
+	}
+}
+
+func TestQueryExt_Race_RefreshPlannerStatsVsSnapshotPublish_OnOrderedORFixture(t *testing.T) {
+	if !testRaceEnabled {
+		t.Skip("run with -race to detect RefreshPlannerStats vs snapshot publish race")
+	}
+
+	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
+
+	ids, stateA, stateB, q := queryExtOrderedORNegativeResidualFixture()
+	setState := func(vals []*Rec) error {
+		return db.BatchSet(ids, vals)
+	}
+
+	if err := setState(stateA); err != nil {
+		t.Fatalf("BatchSet(stateA): %v", err)
+	}
+	wantA, err := expectedKeysUint64(t, db, q)
+	if err != nil {
+		t.Fatalf("expectedKeysUint64(stateA): %v", err)
+	}
+	if err := setState(stateB); err != nil {
+		t.Fatalf("BatchSet(stateB): %v", err)
+	}
+	wantB, err := expectedKeysUint64(t, db, q)
+	if err != nil {
+		t.Fatalf("expectedKeysUint64(stateB): %v", err)
+	}
+	if err := setState(stateA); err != nil {
+		t.Fatalf("BatchSet(stateA reset): %v", err)
+	}
+
+	errCh := make(chan error, 32)
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		<-start
+		for i := 0; i < 240; i++ {
+			vals := stateB
+			if i%2 == 1 {
+				vals = stateA
+			}
+			if err := setState(vals); err != nil {
+				errCh <- fmt.Errorf("writer: %w", err)
+				return
+			}
+		}
+	}()
+
+	for g := 0; g < 3; g++ {
+		wg.Add(1)
+		go func(gid int) {
+			defer wg.Done()
+			<-start
+			for i := 0; i < 160; i++ {
+				if err := db.RefreshPlannerStats(); err != nil {
+					errCh <- fmt.Errorf("g=%d i=%d RefreshPlannerStats: %w", gid, i, err)
+					return
+				}
+			}
+		}(g)
+	}
+
+	for g := 0; g < 2; g++ {
+		wg.Add(1)
+		go func(gid int) {
+			defer wg.Done()
+			<-start
+			for i := 0; i < 120; i++ {
+				got, err := db.QueryKeys(q)
+				if err != nil {
+					errCh <- fmt.Errorf("query g=%d i=%d QueryKeys: %w", gid, i, err)
+					return
+				}
+				if !queryIDsEqual(q, got, wantA) && !queryIDsEqual(q, got, wantB) {
+					errCh <- fmt.Errorf("query g=%d i=%d hybrid ordered OR result: got=%v wantA=%v wantB=%v", gid, i, got, wantA, wantB)
+					return
+				}
+			}
+		}(g)
+	}
+
+	close(start)
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		t.Fatal(err)
+	}
 }
 
 func TestQueryExt_OrderBasicPointerBounds_DoNotLeakNilTail(t *testing.T) {

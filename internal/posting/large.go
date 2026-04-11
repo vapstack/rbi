@@ -687,7 +687,7 @@ type largeIterator struct {
 	pos              int
 	hs               uint64
 	iter             intPeekable
-	highlowcontainer *largeArray
+	highlowcontainer largeArray
 }
 
 func (it *largeIterator) HasNext() bool {
@@ -737,10 +737,15 @@ func (it *largeIterator) advanceIfNeeded(minval uint64) {
 }
 
 func (it *largeIterator) initialize(lp *largePosting) {
+	if it.iter != nil {
+		it.iter.release()
+	}
 	it.pos = 0
 	it.hs = 0
 	it.iter = nil
-	it.highlowcontainer = &lp.highlowcontainer
+	// Retain a shared top-level snapshot so owner Release cannot invalidate
+	// iterator traversal mid-stream.
+	it.highlowcontainer.copySharedFrom(&lp.highlowcontainer)
 	it.init()
 }
 
@@ -838,7 +843,8 @@ var (
 			it.pos = 0
 			it.hs = 0
 			it.iter = nil
-			it.highlowcontainer = nil
+			it.highlowcontainer.clear()
+			it.highlowcontainer.releaseBacking()
 		},
 	}
 )

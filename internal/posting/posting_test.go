@@ -158,9 +158,8 @@ func TestCloneIntoLargeKeepsSharedContainerClone(t *testing.T) {
 	defer src.Release()
 
 	dst := postingFromIDs(999, 1001, 1003)
-	defer dst.Release()
-
 	dst = src.CloneInto(dst)
+	defer dst.Release()
 
 	srcLarge := src.largeRef()
 	dstLarge := dst.largeRef()
@@ -200,10 +199,9 @@ func TestBuildRemovedTwoElementPostingBecomesSingleton(t *testing.T) {
 func TestBuildRemovedOwnedCompactReusesPayload(t *testing.T) {
 	t.Run("Small", func(t *testing.T) {
 		ids := postingFromIDs(3, 7, 11, 19)
-		defer ids.Release()
-
 		before := ids.small()
 		ids = ids.BuildRemoved(11)
+		defer ids.Release()
 
 		after := ids.small()
 		if after == nil {
@@ -217,10 +215,9 @@ func TestBuildRemovedOwnedCompactReusesPayload(t *testing.T) {
 
 	t.Run("Mid", func(t *testing.T) {
 		ids := postingFromIDs(2, 4, 6, 8, 10, 12, 14, 16, 18, 20)
-		defer ids.Release()
-
 		before := ids.mid()
 		ids = ids.BuildRemoved(10)
+		defer ids.Release()
 
 		after := ids.mid()
 		if after == nil {
@@ -1012,7 +1009,9 @@ func TestListCheckedAddBorrowedDuplicateNoDetach(t *testing.T) {
 		defer base.Release()
 
 		borrowed := base.Borrow()
-		defer borrowed.Release()
+		defer func() {
+			borrowed.Release()
+		}()
 
 		var added bool
 		borrowed, added = borrowed.BuildAddedChecked(11)
@@ -1041,7 +1040,9 @@ func TestListCheckedAddBorrowedDuplicateNoDetach(t *testing.T) {
 		defer base.Release()
 
 		borrowed := base.Borrow()
-		defer borrowed.Release()
+		defer func() {
+			borrowed.Release()
+		}()
 
 		var added bool
 		borrowed, added = borrowed.BuildAddedChecked(8)
@@ -1407,8 +1408,6 @@ func TestListMixedIntersectionLazyLargeDownshift(t *testing.T) {
 	}
 
 	large := postingFromIDs(baseIDs...)
-	defer large.Release()
-
 	keep := []uint64{baseIDs[1], baseIDs[9], baseIDs[17]}
 	keepSet := make(map[uint64]struct{}, len(keep))
 	for _, id := range keep {
@@ -1420,6 +1419,7 @@ func TestListMixedIntersectionLazyLargeDownshift(t *testing.T) {
 		}
 		large = large.BuildRemoved(id)
 	}
+	defer large.Release()
 
 	assertListRepresentation(t, large, "large")
 	if got := large.Cardinality(); got != uint64(len(keep)) {
@@ -1508,7 +1508,9 @@ func TestListLifecycleHelpers(t *testing.T) {
 		defer base.Release()
 
 		clone := base.Clone()
-		defer clone.Release()
+		defer func() {
+			clone.Release()
+		}()
 		if base.SharesPayload(clone) {
 			t.Fatalf("small clone unexpectedly shares payload")
 		}
@@ -2611,9 +2613,8 @@ func TestListAddManySortedLargeFastPaths(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			list := postingFromIDs(tc.base...)
-			defer list.Release()
-
 			list = list.BuildAddedMany(batch)
+			defer list.Release()
 
 			want := unionUint64(tc.base, batch)
 			assertSameListSet(t, list, want)
@@ -2643,9 +2644,8 @@ func TestListAddManyUnsortedLargeFastPaths(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			list := postingFromIDs(tc.base...)
-			defer list.Release()
-
 			list = list.BuildAddedMany(batch)
+			defer list.Release()
 
 			want := unionUint64(tc.base, batch)
 			assertSameListSet(t, list, want)

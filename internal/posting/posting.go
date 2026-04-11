@@ -1382,6 +1382,42 @@ func (p List) BuildAnd(other List) List {
 		return p
 	}
 	if lp := p.largeRef(); lp != nil {
+		if id, ok := other.TrySingle(); ok {
+			if lp.contains(id) {
+				p.Release()
+				return singleton(id)
+			}
+			p.Release()
+			return List{}
+		}
+		if sp := other.small(); sp != nil {
+			var matched [SmallCap]uint64
+			n := 0
+			for i := 0; i < int(sp.n); i++ {
+				id := sp.ids[i]
+				if !lp.contains(id) {
+					continue
+				}
+				matched[n] = id
+				n++
+			}
+			p.Release()
+			return compactListFromSorted(matched[:n])
+		}
+		if mp := other.mid(); mp != nil {
+			var matched [MidCap]uint64
+			n := 0
+			for i := 0; i < int(mp.n); i++ {
+				id := mp.ids[i]
+				if !lp.contains(id) {
+					continue
+				}
+				matched[n] = id
+				n++
+			}
+			p.Release()
+			return compactListFromSorted(matched[:n])
+		}
 		if p.IsBorrowed() {
 			p = p.Clone()
 			lp = p.largeRef()
@@ -1686,6 +1722,9 @@ func (p List) Release() {
 }
 
 func (p List) ReleasePayload() {
+	if p.IsBorrowed() {
+		return
+	}
 	if sp := p.small(); sp != nil {
 		sp.release()
 		return

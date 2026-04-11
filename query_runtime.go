@@ -268,6 +268,17 @@ func (state *postsAnyFilterState) applyOwnedLargeDirect(dst posting.List, card u
 		}
 		return dst, true
 	}
+	if matched <= posting.MidCap {
+		var out posting.List
+		if singles != nil {
+			out = posting.BuildFromSorted(singles.values)
+			releaseSingleIDs(singles)
+		} else {
+			out = posting.BuildFromSorted(inline[:inlineLen])
+		}
+		dst.Release()
+		return out, true
+	}
 
 	if singles != nil {
 		out, ok := dst.TryResetOwnedLargeFromSorted(singles.values)

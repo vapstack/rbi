@@ -4573,16 +4573,16 @@ func (qv *queryView[K, V]) execPlanOrderedBasicAnchored(q *qx.QX, preds predicat
 	}
 
 	candidateIDs := candidates
+	var exactWork posting.List
 	if useExactPosting {
 		exactApplied := false
-		exactWork := posting.List{}
 		mode, exactIDs, exactWork, _ := plannerFilterPostingByPredicateChecks(preds, exactChecks, candidates, exactWork, true)
-		defer exactWork.Release()
 		switch mode {
 		case plannerPredicateBucketEmpty:
 			if trace != nil {
 				trace.setEarlyStopReason("no_candidates")
 			}
+			exactWork.Release()
 			return nil, true
 		case plannerPredicateBucketAll:
 			candidateIDs = candidates
@@ -4600,6 +4600,7 @@ func (qv *queryView[K, V]) execPlanOrderedBasicAnchored(q *qx.QX, preds predicat
 			if trace != nil {
 				trace.setEarlyStopReason("no_candidates")
 			}
+			exactWork.Release()
 			return nil, true
 		}
 		if exactApplied && len(residualChecks) > 0 {
@@ -4612,6 +4613,7 @@ func (qv *queryView[K, V]) execPlanOrderedBasicAnchored(q *qx.QX, preds predicat
 				if trace != nil {
 					trace.setEarlyStopReason("no_candidates")
 				}
+				exactWork.Release()
 				return nil, true
 			}
 			candidateIDs = filtered
@@ -4620,6 +4622,7 @@ func (qv *queryView[K, V]) execPlanOrderedBasicAnchored(q *qx.QX, preds predicat
 			deferredChecks = deferredChecks[:0]
 		}
 		if candidateIDs.Cardinality() > candidateCap {
+			exactWork.Release()
 			return nil, false
 		}
 	}
@@ -4673,6 +4676,7 @@ func (qv *queryView[K, V]) execPlanOrderedBasicAnchored(q *qx.QX, preds predicat
 		}
 	}
 
+	exactWork.Release()
 	return cursor.out, true
 }
 
@@ -4823,16 +4827,16 @@ func (qv *queryView[K, V]) execPlanOrderedBasicAnchoredBuf(q *qx.QX, preds predi
 	}
 
 	candidateIDs := candidates
+	var exactWork posting.List
 	if useExactPosting {
 		exactApplied := false
-		exactWork := posting.List{}
 		mode, exactIDs, exactWork, _ := plannerFilterPostingByPredicateChecksBuf(preds, exactChecksBuf, candidates, exactWork, true)
-		defer exactWork.Release()
 		switch mode {
 		case plannerPredicateBucketEmpty:
 			if trace != nil {
 				trace.setEarlyStopReason("no_candidates")
 			}
+			exactWork.Release()
 			return nil, true
 		case plannerPredicateBucketAll:
 			candidateIDs = candidates
@@ -4850,6 +4854,7 @@ func (qv *queryView[K, V]) execPlanOrderedBasicAnchoredBuf(q *qx.QX, preds predi
 			if trace != nil {
 				trace.setEarlyStopReason("no_candidates")
 			}
+			exactWork.Release()
 			return nil, true
 		}
 		if exactApplied && residualChecksBuf.Len() > 0 {
@@ -4862,6 +4867,7 @@ func (qv *queryView[K, V]) execPlanOrderedBasicAnchoredBuf(q *qx.QX, preds predi
 				if trace != nil {
 					trace.setEarlyStopReason("no_candidates")
 				}
+				exactWork.Release()
 				return nil, true
 			}
 			candidateIDs = filtered
@@ -4870,6 +4876,7 @@ func (qv *queryView[K, V]) execPlanOrderedBasicAnchoredBuf(q *qx.QX, preds predi
 			deferredChecksBuf.Truncate()
 		}
 		if candidateIDs.Cardinality() > candidateCap {
+			exactWork.Release()
 			return nil, false
 		}
 	}
@@ -4923,6 +4930,7 @@ func (qv *queryView[K, V]) execPlanOrderedBasicAnchoredBuf(q *qx.QX, preds predi
 		}
 	}
 
+	exactWork.Release()
 	return cursor.out, true
 }
 

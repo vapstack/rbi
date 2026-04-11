@@ -1178,7 +1178,6 @@ func (qv *queryView[K, V]) runOrderBasicBaseQuery(
 	cursor := qv.newQueryCursor(out, skip, need, false, 0)
 
 	var tmp posting.List
-	defer tmp.Release()
 
 	keyCur := ov.newCursor(br, order.Desc)
 	var (
@@ -1212,6 +1211,7 @@ func (qv *queryView[K, V]) runOrderBasicBaseQuery(
 			trace.addOrderScanWidth(scanWidth)
 			trace.setEarlyStopReason("limit_reached")
 			qv.promoteOrderBasicLimitMaterializedBaseOps(orderField, baseOps, examined, uint64(needWindow))
+			tmp.Release()
 			return cursor.out, true, nil
 		}
 	}
@@ -1237,6 +1237,7 @@ func (qv *queryView[K, V]) runOrderBasicBaseQuery(
 				trace.addOrderScanWidth(scanWidth)
 				trace.setEarlyStopReason("limit_reached")
 				qv.promoteOrderBasicLimitMaterializedBaseOps(orderField, baseOps, examined, uint64(needWindow))
+				tmp.Release()
 				return cursor.out, true, nil
 			}
 		}
@@ -1246,6 +1247,7 @@ func (qv *queryView[K, V]) runOrderBasicBaseQuery(
 	trace.addOrderScanWidth(scanWidth)
 	trace.setEarlyStopReason("input_exhausted")
 	qv.promoteOrderBasicLimitMaterializedBaseOps(orderField, baseOps, examined, uint64(needWindow))
+	tmp.Release()
 	return cursor.out, true, nil
 }
 
@@ -1277,7 +1279,6 @@ func (qv *queryView[K, V]) runOrderBasicBaseQueryBuf(
 	cursor := qv.newQueryCursor(out, skip, need, false, 0)
 
 	var tmp posting.List
-	defer tmp.Release()
 
 	keyCur := ov.newCursor(br, order.Desc)
 	var (
@@ -1311,6 +1312,7 @@ func (qv *queryView[K, V]) runOrderBasicBaseQueryBuf(
 			trace.addOrderScanWidth(scanWidth)
 			trace.setEarlyStopReason("limit_reached")
 			qv.promoteOrderBasicLimitMaterializedBaseOps(orderField, baseOps, examined, uint64(needWindow))
+			tmp.Release()
 			return cursor.out, true, nil
 		}
 	}
@@ -1336,6 +1338,7 @@ func (qv *queryView[K, V]) runOrderBasicBaseQueryBuf(
 				trace.addOrderScanWidth(scanWidth)
 				trace.setEarlyStopReason("limit_reached")
 				qv.promoteOrderBasicLimitMaterializedBaseOps(orderField, baseOps, examined, uint64(needWindow))
+				tmp.Release()
 				return cursor.out, true, nil
 			}
 		}
@@ -1345,6 +1348,7 @@ func (qv *queryView[K, V]) runOrderBasicBaseQueryBuf(
 	trace.addOrderScanWidth(scanWidth)
 	trace.setEarlyStopReason("input_exhausted")
 	qv.promoteOrderBasicLimitMaterializedBaseOps(orderField, baseOps, examined, uint64(needWindow))
+	tmp.Release()
 	return cursor.out, true, nil
 }
 
@@ -2667,7 +2671,6 @@ func (qv *queryView[K, V]) scanOrderLimitWithPredicatesReader(q *qx.QX, ov field
 		)
 
 		var exactWork posting.List
-		defer exactWork.Release()
 
 		keyCur := ov.newCursor(br, desc)
 		for {
@@ -2697,6 +2700,7 @@ func (qv *queryView[K, V]) scanOrderLimitWithPredicatesReader(q *qx.QX, ov field
 					trace.addOrderScanWidth(scanWidth)
 					trace.setEarlyStopReason("limit_reached")
 				}
+				exactWork.Release()
 				return cursor.out, true
 			}
 		}
@@ -2724,6 +2728,7 @@ func (qv *queryView[K, V]) scanOrderLimitWithPredicatesReader(q *qx.QX, ov field
 						trace.addOrderScanWidth(scanWidth)
 						trace.setEarlyStopReason("limit_reached")
 					}
+					exactWork.Release()
 					return cursor.out, true
 				}
 			}
@@ -2734,6 +2739,7 @@ func (qv *queryView[K, V]) scanOrderLimitWithPredicatesReader(q *qx.QX, ov field
 			trace.addOrderScanWidth(scanWidth)
 			trace.setEarlyStopReason("input_exhausted")
 		}
+		exactWork.Release()
 		return cursor.out, true
 	}
 
@@ -2775,7 +2781,6 @@ func (qv *queryView[K, V]) scanOrderLimitWithPredicatesReader(q *qx.QX, ov field
 	)
 
 	var exactWork posting.List
-	defer exactWork.Release()
 
 	keyCur := ov.newCursor(br, desc)
 	for {
@@ -2805,6 +2810,7 @@ func (qv *queryView[K, V]) scanOrderLimitWithPredicatesReader(q *qx.QX, ov field
 				trace.addOrderScanWidth(scanWidth)
 				trace.setEarlyStopReason("limit_reached")
 			}
+			exactWork.Release()
 			return cursor.out, true
 		}
 	}
@@ -2832,6 +2838,7 @@ func (qv *queryView[K, V]) scanOrderLimitWithPredicatesReader(q *qx.QX, ov field
 					trace.addOrderScanWidth(scanWidth)
 					trace.setEarlyStopReason("limit_reached")
 				}
+				exactWork.Release()
 				return cursor.out, true
 			}
 		}
@@ -2842,6 +2849,7 @@ func (qv *queryView[K, V]) scanOrderLimitWithPredicatesReader(q *qx.QX, ov field
 		trace.addOrderScanWidth(scanWidth)
 		trace.setEarlyStopReason("input_exhausted")
 	}
+	exactWork.Release()
 	return cursor.out, true
 }
 

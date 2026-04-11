@@ -84,7 +84,7 @@ const (
 
 type snapshotRef struct {
 	snap    *indexSnapshot
-	retired *indexSnapshot
+	retired *pooled.SliceBuf[*indexSnapshot]
 	refs    atomic.Int64
 }
 
@@ -97,6 +97,8 @@ func (s indexKeyOrder) Less(i, j int) bool {
 }
 
 var snapshotRefPool = pooled.Pointers[snapshotRef]{Clear: true}
+
+var snapshotRetiredListPool = pooled.Slices[*indexSnapshot]{Clear: true}
 
 var recentKeyCacheSlotPool = pooled.Slices[recentKeyCacheSlot]{Clear: true}
 
@@ -563,6 +565,32 @@ func (s *indexSnapshot) evictMaterializedPred(mode materializedPredCacheEvictMod
 	return ok
 }
 
+func appendRetiredSnapshot(buf *pooled.SliceBuf[*indexSnapshot], snap *indexSnapshot) *pooled.SliceBuf[*indexSnapshot] {
+	if snap == nil {
+		return buf
+	}
+	if buf == nil {
+		buf = snapshotRetiredListPool.Get()
+	}
+	buf.Append(snap)
+	return buf
+}
+
+func releaseRetiredSnapshots(buf *pooled.SliceBuf[*indexSnapshot]) {
+	if buf == nil {
+		return
+	}
+	for i := 0; i < buf.Len(); i++ {
+		retired := buf.Get(i)
+		if retired == nil {
+			continue
+		}
+		retired.releaseOwnedStorage()
+		retired.releaseRuntimeCaches()
+	}
+	snapshotRetiredListPool.Put(buf)
+}
+
 func inheritNumericRangeBucketCache(next, prev *indexSnapshot) {
 	if next == nil {
 		return
@@ -690,10 +718,7 @@ func (db *DB[K, V]) finishSnapshotPublishNoLock(s *indexSnapshot) {
 	if db.strkey && db.strmap != nil {
 		db.strmap.markCommittedPublished(s.strmap)
 	}
-	if retired != nil {
-		retired.releaseOwnedStorage()
-		retired.releaseRuntimeCaches()
-	}
+	releaseRetiredSnapshots(retired)
 }
 
 func (db *DB[K, V]) getSnapshot() *indexSnapshot {
@@ -1123,7 +1148,7 @@ func (s *indexSnapshot) fieldLookupPostingRetained(field, key string) posting.Li
 	return newFieldOverlayStorage(s.index[field]).lookupPostingRetained(key)
 }
 
-func (db *DB[K, V]) publishSnapshotRef(s *indexSnapshot) *indexSnapshot {
+func (db *DB[K, V]) publishSnapshotRef(s *indexSnapshot) *pooled.SliceBuf[*indexSnapshot] {
 	if s == nil {
 		return nil
 	}
@@ -1135,11 +1160,17 @@ func (db *DB[K, V]) publishSnapshotRef(s *indexSnapshot) *indexSnapshot {
 		ref = snapshotRefPool.Get()
 		db.snapshot.bySeq[s.seq] = ref
 	}
+	var retired *pooled.SliceBuf[*indexSnapshot]
+	if prev != nil && prev.seq == s.seq && ref.snap != nil && ref.snap != s {
+		if ref.refs.Load() != 0 {
+			ref.retired = appendRetiredSnapshot(ref.retired, ref.snap)
+		} else {
+			retired = appendRetiredSnapshot(retired, ref.snap)
+		}
+	}
 	ref.snap = s
-	ref.retired = nil
 	db.snapshot.current.Store(s)
 	db.snapshot.currentRef.Store(ref)
-	var retired *indexSnapshot
 	if prev != nil && prev.seq != s.seq {
 		retired = db.retireSnapshotLocked(prev.seq)
 	}
@@ -1160,7 +1191,6 @@ func (db *DB[K, V]) stageSnapshot(s *indexSnapshot) {
 		db.snapshot.bySeq[s.seq] = ref
 	}
 	ref.snap = s
-	ref.retired = nil
 }
 
 func (db *DB[K, V]) dropStagedSnapshot(seq uint64) {
@@ -1175,17 +1205,14 @@ func (db *DB[K, V]) dropStagedSnapshot(seq uint64) {
 		db.snapshot.mu.Unlock()
 		return
 	}
-	var retired *indexSnapshot
+	var retired *pooled.SliceBuf[*indexSnapshot]
 	if ref.refs.Load() <= 0 {
 		retired = db.releaseRetiredSnapshotRefLocked(seq, ref)
 		db.snapshot.mu.Unlock()
-		if retired != nil {
-			retired.releaseOwnedStorage()
-			retired.releaseRuntimeCaches()
-		}
+		releaseRetiredSnapshots(retired)
 		return
 	}
-	ref.retired = ref.snap
+	ref.retired = appendRetiredSnapshot(ref.retired, ref.snap)
 	ref.snap = nil
 	db.snapshot.mu.Unlock()
 }
@@ -1210,15 +1237,21 @@ func (db *DB[K, V]) unpinSnapshotRef(seq uint64, ref *snapshotRef) {
 		return
 	}
 	var drainCurrent *indexSnapshot
-	var retired *indexSnapshot
+	var retired *pooled.SliceBuf[*indexSnapshot]
 	db.snapshot.mu.Lock()
 	held := db.snapshot.bySeq[seq]
 	if held != ref || held.refs.Load() != 0 || held.snap != nil {
+		if held == ref && held != nil && held.refs.Load() == 0 && held.snap != nil &&
+			held == db.snapshot.currentRef.Load() && held.retired != nil {
+			retired = held.retired
+			held.retired = nil
+		}
 		if held == ref && held != nil && held.snap != nil &&
 			held == db.snapshot.currentRef.Load() {
 			drainCurrent = held.snap
 		}
 		db.snapshot.mu.Unlock()
+		releaseRetiredSnapshots(retired)
 		if drainCurrent != nil {
 			drainCurrent.drainRetiredRuntimeCaches()
 		}
@@ -1226,13 +1259,10 @@ func (db *DB[K, V]) unpinSnapshotRef(seq uint64, ref *snapshotRef) {
 	}
 	retired = db.releaseRetiredSnapshotRefLocked(seq, held)
 	db.snapshot.mu.Unlock()
-	if retired != nil {
-		retired.releaseOwnedStorage()
-		retired.releaseRuntimeCaches()
-	}
+	releaseRetiredSnapshots(retired)
 }
 
-func (db *DB[K, V]) retireSnapshotLocked(seq uint64) *indexSnapshot {
+func (db *DB[K, V]) retireSnapshotLocked(seq uint64) *pooled.SliceBuf[*indexSnapshot] {
 	ref := db.snapshot.bySeq[seq]
 	if ref == nil {
 		return nil
@@ -1241,14 +1271,14 @@ func (db *DB[K, V]) retireSnapshotLocked(seq uint64) *indexSnapshot {
 		return nil
 	}
 	if ref.refs.Load() != 0 {
-		ref.retired = ref.snap
+		ref.retired = appendRetiredSnapshot(ref.retired, ref.snap)
 		ref.snap = nil
 		return nil
 	}
 	return db.releaseRetiredSnapshotRefLocked(seq, ref)
 }
 
-func (db *DB[K, V]) releaseRetiredSnapshotRefLocked(seq uint64, ref *snapshotRef) *indexSnapshot {
+func (db *DB[K, V]) releaseRetiredSnapshotRefLocked(seq uint64, ref *snapshotRef) *pooled.SliceBuf[*indexSnapshot] {
 	if ref == nil {
 		return nil
 	}
@@ -1259,8 +1289,8 @@ func (db *DB[K, V]) releaseRetiredSnapshotRefLocked(seq uint64, ref *snapshotRef
 		return nil
 	}
 	retired := ref.retired
-	if retired == nil {
-		retired = ref.snap
+	if ref.snap != nil {
+		retired = appendRetiredSnapshot(retired, ref.snap)
 	}
 	ref.snap = nil
 	ref.retired = nil
@@ -1331,7 +1361,6 @@ func rebuildLenIndexField(universe posting.List, fieldOV fieldOverlay) (*[]index
 	}
 
 	var nonEmpty posting.List
-	defer nonEmpty.Release()
 
 	counts := make(map[uint64]uint32, 1024)
 	br := fieldOV.rangeForBounds(rangeBounds{has: true})
@@ -1418,6 +1447,7 @@ func rebuildLenIndexField(universe posting.List, fieldOV fieldOverlay) (*[]index
 	slices.SortFunc(result, func(a, b index) int {
 		return compareIndexKeys(a.Key, b.Key)
 	})
+	nonEmpty.Release()
 	return &result, useZeroComplement
 }
 

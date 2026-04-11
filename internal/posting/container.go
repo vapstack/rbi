@@ -677,6 +677,13 @@ type shortIterator struct {
 	loc   int
 }
 
+var shortIteratorPool = pooled.Pointers[shortIterator]{
+	Cleanup: func(it *shortIterator) {
+		it.slice = nil
+		it.loc = 0
+	},
+}
+
 func (si *shortIterator) hasNext() bool {
 	return si.loc < len(si.slice)
 }
@@ -697,7 +704,9 @@ func (si *shortIterator) advanceIfNeeded(minval uint16) {
 	}
 }
 
-func (*shortIterator) release() {}
+func (si *shortIterator) release() {
+	shortIteratorPool.Put(si)
+}
 
 type manyIterable interface {
 	nextMany(hs uint32, buf []uint32) int

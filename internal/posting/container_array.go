@@ -65,11 +65,17 @@ func (ac *containerArray) iterate(cb func(x uint16) bool) bool {
 }
 
 func (ac *containerArray) getShortIterator() shortPeekable {
-	return &shortIterator{ac.content, 0}
+	it := shortIteratorPool.Get()
+	it.slice = ac.content
+	it.loc = 0
+	return it
 }
 
 func (ac *containerArray) getManyIterator() manyIterable {
-	return &shortIterator{ac.content, 0}
+	it := shortIteratorPool.Get()
+	it.slice = ac.content
+	it.loc = 0
+	return it
 }
 
 func (ac *containerArray) minimum() uint16 {

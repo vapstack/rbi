@@ -1025,7 +1025,6 @@ func (db *DB[K, V]) buildIndex(skipFields map[string]struct{}) error {
 		db.lenZeroComplement = make(map[string]bool)
 	}
 
-	prevUniverse := db.universe
 	db.universe = posting.List{}
 	for i := range localUniverse {
 		if localUniverse[i].IsEmpty() {
@@ -1086,7 +1085,6 @@ func (db *DB[K, V]) buildIndex(skipFields map[string]struct{}) error {
 	if err = db.publishCurrentSequenceSnapshotNoLock(); err != nil {
 		return fmt.Errorf("publish snapshot: %w", err)
 	}
-	prevUniverse.Release()
 
 	active = nil
 	fieldStates = nil

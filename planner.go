@@ -4113,7 +4113,6 @@ func (qv *queryView[K, V]) collectOROrderFallbackBranchCandidatesWithChecks(
 		residualSingle = residualChecks[0]
 	}
 	var bucketWork posting.List
-	defer bucketWork.Release()
 	allChecksExact := len(checks) > 0 && len(exactChecks) == len(checks)
 	acc := plannerOROrderFallbackAccumulator{
 		branch:         branch,
@@ -4150,11 +4149,13 @@ func (qv *queryView[K, V]) collectOROrderFallbackBranchCandidatesWithChecks(
 			case plannerPredicateBucketAll, plannerPredicateBucketExact:
 				if allChecksExact {
 					if acc.emitPostingNoChecks(exactIDs, card) {
+						bucketWork.Release()
 						return acc.emitted, acc.examined, acc.dedupe
 					}
 					continue
 				}
 				if acc.emitPostingChecked(exactIDs) {
+					bucketWork.Release()
 					return acc.emitted, acc.examined, acc.dedupe
 				}
 				continue
@@ -4164,11 +4165,13 @@ func (qv *queryView[K, V]) collectOROrderFallbackBranchCandidatesWithChecks(
 		for it.HasNext() {
 			if acc.emit(it.Next()) {
 				it.Release()
+				bucketWork.Release()
 				return acc.emitted, acc.examined, acc.dedupe
 			}
 		}
 		it.Release()
 	}
+	bucketWork.Release()
 	return acc.emitted, acc.examined, acc.dedupe
 }
 
@@ -4190,7 +4193,6 @@ func (qv *queryView[K, V]) collectOROrderFallbackBranchCandidatesWithChecksBuf(
 		residualSingle = residualChecks.Get(0)
 	}
 	var bucketWork posting.List
-	defer bucketWork.Release()
 	allChecksExact := checks.Len() > 0 && exactChecks.Len() == checks.Len()
 	acc := plannerOROrderFallbackAccumulatorBuf{
 		branch:         branch,
@@ -4227,11 +4229,13 @@ func (qv *queryView[K, V]) collectOROrderFallbackBranchCandidatesWithChecksBuf(
 			case plannerPredicateBucketAll, plannerPredicateBucketExact:
 				if allChecksExact {
 					if acc.emitPostingNoChecks(exactIDs, card) {
+						bucketWork.Release()
 						return acc.emitted, acc.examined, acc.dedupe
 					}
 					continue
 				}
 				if acc.emitPostingChecked(exactIDs) {
+					bucketWork.Release()
 					return acc.emitted, acc.examined, acc.dedupe
 				}
 				continue
@@ -4241,11 +4245,13 @@ func (qv *queryView[K, V]) collectOROrderFallbackBranchCandidatesWithChecksBuf(
 		for it.HasNext() {
 			if acc.emit(it.Next()) {
 				it.Release()
+				bucketWork.Release()
 				return acc.emitted, acc.examined, acc.dedupe
 			}
 		}
 		it.Release()
 	}
+	bucketWork.Release()
 	return acc.emitted, acc.examined, acc.dedupe
 }
 

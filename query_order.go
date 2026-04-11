@@ -284,7 +284,6 @@ func (qv *queryView[K, V]) queryOrderBasic(result postingResult, ov fieldOverlay
 	}
 
 	var tmp posting.List
-	defer tmp.Release()
 
 	out := makeOutSlice[K](resultCard, need)
 	dedupeCap := uint64(0)
@@ -304,6 +303,7 @@ func (qv *queryView[K, V]) queryOrderBasic(result postingResult, ov fieldOverlay
 		var done bool
 		tmp, done = emitPostingResultBucketToCursor(qv, &cursor, tmp, ids, result)
 		if done {
+			tmp.Release()
 			return cursor.out, nil
 		}
 	}
@@ -314,10 +314,12 @@ func (qv *queryView[K, V]) queryOrderBasic(result postingResult, ov fieldOverlay
 			var done bool
 			tmp, done = emitPostingResultBucketToCursor(qv, &cursor, tmp, nilIDs, result)
 			if done {
+				tmp.Release()
 				return cursor.out, nil
 			}
 		}
 	}
+	tmp.Release()
 	return cursor.out, nil
 }
 
@@ -414,7 +416,6 @@ func (qv *queryView[K, V]) queryOrderArrayPosOverlay(result postingResult, ov fi
 
 	out := makeOutSlice[K](resultCard, need)
 	var tmp posting.List
-	defer tmp.Release()
 	cursor := qv.newQueryCursor(out, skip, need, all, queryCursorDedupeCap(resultCard, skip, need, all))
 	defer cursor.release()
 
@@ -423,6 +424,7 @@ func (qv *queryView[K, V]) queryOrderArrayPosOverlay(result postingResult, ov fi
 			var done bool
 			tmp, done = emitPostingResultBucketToCursor(qv, &cursor, tmp, ov.lookupPostingRetained(v), result)
 			if done {
+				tmp.Release()
 				return cursor.out, nil
 			}
 		}
@@ -431,6 +433,7 @@ func (qv *queryView[K, V]) queryOrderArrayPosOverlay(result postingResult, ov fi
 			var done bool
 			tmp, done = emitPostingResultBucketToCursor(qv, &cursor, tmp, ov.lookupPostingRetained(vals[i]), result)
 			if done {
+				tmp.Release()
 				return cursor.out, nil
 			}
 		}
@@ -438,6 +441,7 @@ func (qv *queryView[K, V]) queryOrderArrayPosOverlay(result postingResult, ov fi
 
 	qv.forEachPostingResultAll(result, cursor.emit)
 
+	tmp.Release()
 	return cursor.out, nil
 }
 
@@ -466,24 +470,27 @@ func (qv *queryView[K, V]) queryOrderArrayPosScalarOverlay(result postingResult,
 	defer cursor.release()
 
 	var tmp posting.List
-	defer tmp.Release()
 
 	for _, v := range orderedVals {
 		var done bool
 		tmp, done = emitPostingResultBucketToCursor(qv, &cursor, tmp, ov.lookupPostingRetained(v), result)
 		if done {
+			tmp.Release()
 			return cursor.out, nil
 		}
 	}
 
 	if !cursor.all && cursor.need == 0 {
+		tmp.Release()
 		return cursor.out, nil
 	}
 	if !needFallback {
+		tmp.Release()
 		return cursor.out, nil
 	}
 	qv.forEachPostingResultAll(result, cursor.emit)
 
+	tmp.Release()
 	return cursor.out, nil
 }
 
@@ -534,7 +541,6 @@ func (qv *queryView[K, V]) queryOrderArrayCount(result postingResult, s []index,
 	out := makeOutSlice[K](resultCard, need)
 
 	var tmp posting.List
-	defer tmp.Release()
 
 	cursor := qv.newQueryCursor(out, skip, need, all, 0)
 	defer cursor.release()
@@ -550,6 +556,7 @@ func (qv *queryView[K, V]) queryOrderArrayCount(result postingResult, s []index,
 
 	if !o.Desc {
 		if useZeroComplement && qv.emitArrayCountZeroBucketResult(&cursor, result, nonEmpty) {
+			tmp.Release()
 			return cursor.out, nil
 		}
 
@@ -564,6 +571,7 @@ func (qv *queryView[K, V]) queryOrderArrayCount(result postingResult, s []index,
 			var done bool
 			tmp, done = emitPostingResultBucketToCursor(qv, &cursor, tmp, ix.IDs, result)
 			if done {
+				tmp.Release()
 				return cursor.out, nil
 			}
 		}
@@ -582,13 +590,16 @@ func (qv *queryView[K, V]) queryOrderArrayCount(result postingResult, s []index,
 			var done bool
 			tmp, done = emitPostingResultBucketToCursor(qv, &cursor, tmp, ix.IDs, result)
 			if done {
+				tmp.Release()
 				return cursor.out, nil
 			}
 		}
 		if useZeroComplement && qv.emitArrayCountZeroBucketResult(&cursor, result, nonEmpty) {
+			tmp.Release()
 			return cursor.out, nil
 		}
 	}
 
+	tmp.Release()
 	return cursor.out, nil
 }

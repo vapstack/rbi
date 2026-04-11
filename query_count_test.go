@@ -2759,7 +2759,9 @@ func TestCountApplyLeadResidualExactFilters_StateOnlyAllocsPerRunStayZeroAfterWa
 	}()
 
 	var work posting.List
-	defer work.Release()
+	defer func() {
+		work.Release()
+	}()
 
 	run := func() {
 		out, nextWork := countApplyLeadResidualExactFilters(src.Borrow(), work, filters)

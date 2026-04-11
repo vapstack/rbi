@@ -927,10 +927,8 @@ func (qv *queryView[K, V]) scanLimitByOverlayBounds(q *qx.QX, ov fieldOverlay, b
 	}
 
 	var exactWork posting.List
-	defer exactWork.Release()
 
 	var applyWork posting.List
-	defer applyWork.Release()
 
 	keyCur := ov.newCursor(br, desc)
 	for {
@@ -966,6 +964,8 @@ func (qv *queryView[K, V]) scanLimitByOverlayBounds(q *qx.QX, ov fieldOverlay, b
 				trace.addOrderScanWidth(scanWidth)
 			}
 			trace.setEarlyStopReason("limit_reached")
+			exactWork.Release()
+			applyWork.Release()
 			return cursor.out
 		}
 	}
@@ -998,6 +998,8 @@ func (qv *queryView[K, V]) scanLimitByOverlayBounds(q *qx.QX, ov fieldOverlay, b
 					trace.addOrderScanWidth(scanWidth)
 				}
 				trace.setEarlyStopReason("limit_reached")
+				exactWork.Release()
+				applyWork.Release()
 				return cursor.out
 			}
 		}
@@ -1008,6 +1010,8 @@ func (qv *queryView[K, V]) scanLimitByOverlayBounds(q *qx.QX, ov fieldOverlay, b
 		trace.addOrderScanWidth(scanWidth)
 	}
 	trace.setEarlyStopReason("input_exhausted")
+	exactWork.Release()
+	applyWork.Release()
 	return cursor.out
 }
 

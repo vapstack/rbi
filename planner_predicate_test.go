@@ -1053,10 +1053,10 @@ func TestBuildPredRange_BroadPositivePostingFilterKeepsComplementCacheLocal(t *t
 	}
 
 	var universe posting.List
-	defer universe.Release()
 	for i := 1; i <= 256; i++ {
 		universe = universe.BuildAdded(uint64(i))
 	}
+	defer universe.Release()
 
 	for i := 0; i < 64; i++ {
 		dst := universe.Borrow()
