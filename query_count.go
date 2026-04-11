@@ -403,18 +403,6 @@ func shouldBuildCountLeadResidualExactFilters(src posting.List, filterCount int)
 	return src.Cardinality() > plannerPredicateBucketExactMinCardForChecks(filterCount)
 }
 
-func countPostingMatchesMulti(preds predicateReader, checks []int, ids posting.List) uint64 {
-	var cnt uint64
-	it := ids.Iter()
-	for it.HasNext() {
-		if countPredicatesMatch(preds, checks, it.Next()) {
-			cnt++
-		}
-	}
-	it.Release()
-	return cnt
-}
-
 func countPostingMatchesMultiSet(preds predicateSet, checks []int, ids posting.List) uint64 {
 	var cnt uint64
 	it := ids.Iter()
@@ -480,33 +468,6 @@ func countORBranchAcceptPosting(
 	return cnt
 }
 
-func (qv *queryView[K, V]) ensureCountLeadResidualExactFilters(
-	preds predicateReader,
-	candidates []int,
-	residualExact []int,
-	residualBoth []int,
-	extraExactBuf *pooled.SliceBuf[countLeadResidualExactFilter],
-	extraExactBuilt bool,
-) (*pooled.SliceBuf[countLeadResidualExactFilter], bool, []int) {
-	if extraExactBuilt {
-		return extraExactBuf, true, residualBoth
-	}
-	extraExactBuf = countLeadResidualExactFilterSlicePool.Get()
-	extraExactBuf.Grow(len(candidates))
-	qv.buildCountLeadResidualExactFiltersByCandidatesInto(extraExactBuf, preds, candidates)
-	if extraExactBuf.Len() == 0 {
-		return extraExactBuf, true, residualBoth
-	}
-	residualBoth = residualBoth[:0]
-	for _, pi := range residualExact {
-		if countLeadResidualExactFiltersContain(extraExactBuf, pi) {
-			continue
-		}
-		residualBoth = append(residualBoth, pi)
-	}
-	return extraExactBuf, true, residualBoth
-}
-
 func (qv *queryView[K, V]) ensureCountLeadResidualExactFiltersSet(
 	preds predicateSet,
 	candidates []int,
@@ -532,38 +493,6 @@ func (qv *queryView[K, V]) ensureCountLeadResidualExactFiltersSet(
 		residualBoth = append(residualBoth, pi)
 	}
 	return extraExactBuf, true, residualBoth
-}
-
-func (qv *queryView[K, V]) buildCountLeadResidualScratch(
-	preds predicateReader,
-	active []int,
-	exactActiveDst []int,
-	extraExactCandidatesDst []int,
-	residualExactDst []int,
-	residualBothDst []int,
-) ([]int, []int, []int, []int) {
-	exactActive := exactActiveDst[:0]
-	for _, pi := range active {
-		if preds.Get(pi).supportsPostingApply() {
-			exactActive = append(exactActive, pi)
-		}
-	}
-	extraExactCandidates := qv.collectCountLeadResidualExactCandidatesInto(
-		extraExactCandidatesDst,
-		preds,
-		active,
-		exactActive,
-	)
-	residualExact := residualExactDst[:0]
-	residualBoth := residualBothDst[:0]
-	for _, pi := range active {
-		if countIndexSliceContains(exactActive, pi) {
-			continue
-		}
-		residualExact = append(residualExact, pi)
-		residualBoth = append(residualBoth, pi)
-	}
-	return exactActive, extraExactCandidates, residualExact, residualBoth
 }
 
 func (qv *queryView[K, V]) buildCountLeadResidualScratchSet(
@@ -1345,15 +1274,6 @@ func (br *countORBranch) buildPostingFilterChecks(dst []int) []int {
 	return dst
 }
 
-func countPredicatesMatch(preds predicateReader, checks []int, idx uint64) bool {
-	for _, pi := range checks {
-		if !preds.GetPtr(pi).matches(idx) {
-			return false
-		}
-	}
-	return true
-}
-
 func countPredicatesMatchSet(preds predicateSet, checks []int, idx uint64) bool {
 	for _, pi := range checks {
 		if !preds.GetPtr(pi).matches(idx) {
@@ -1377,23 +1297,6 @@ func (br *countORBranch) matches(idx uint64) bool {
 		return false
 	}
 	return br.checksMatch(idx)
-}
-
-func countORBranchEstimate(preds predicateReader, active []int, leadEst uint64) uint64 {
-	est := leadEst
-	for _, pi := range active {
-		p := preds.Get(pi)
-		if p.covered || p.alwaysTrue || p.estCard == 0 {
-			continue
-		}
-		if est == 0 || p.estCard < est {
-			est = p.estCard
-		}
-	}
-	if est == 0 {
-		return 1
-	}
-	return est
 }
 
 func countORBranchEstimateSet(preds predicateSet, active []int, leadEst uint64) uint64 {
@@ -3743,7 +3646,7 @@ func countPredicateResidualOpWeight(p predicate) uint64 {
 		if isNumericRangeOp(p.expr.Op) {
 			return 4
 		}
-		return uint64(max(2, p.checkCost()+2))
+		return max(2, p.checkCost()+2)
 	}
 }
 

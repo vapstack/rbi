@@ -283,7 +283,6 @@ func leafPredsTryBucketPosting[K ~uint64 | ~string, V any](
 	allowExact := plannerAllowExactBucketFilter(0, cursor.need, card, exactOnly, len(exactActive))
 	mode, exactIDs, updatedExactWork, _ := plannerFilterPostingByLeafChecks(preds, exactActive, ids, exactWork, allowExact)
 	nextExactWork = updatedExactWork
-	current = ids
 	currentCard := card
 
 	switch mode {
@@ -1603,21 +1602,6 @@ func hasEmptyLeafPred(preds *pooled.SliceBuf[leafPred]) bool {
 	return false
 }
 
-func minCardPosting(posts []posting.List) posting.List {
-	if len(posts) == 0 {
-		return posting.List{}
-	}
-	best := posts[0]
-	bestC := best.Cardinality()
-	for i := 1; i < len(posts); i++ {
-		if c := posts[i].Cardinality(); c < bestC {
-			best = posts[i]
-			bestC = c
-		}
-	}
-	return best
-}
-
 func minCardPostingBuf(posts *pooled.SliceBuf[posting.List]) posting.List {
 	if posts == nil || posts.Len() == 0 {
 		return posting.List{}
@@ -1651,10 +1635,6 @@ type postingConcatIter struct {
 	postsBuf *pooled.SliceBuf[posting.List]
 	i        int
 	curIt    posting.Iterator
-}
-
-func newPostingConcatIter(posts []posting.List) posting.Iterator {
-	return &postingConcatIter{posts: posts}
 }
 
 func newPostingConcatBufIter(posts *pooled.SliceBuf[posting.List]) posting.Iterator {

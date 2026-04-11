@@ -188,25 +188,3 @@ func appendAndLeavesModeBuf(dst *pooled.SliceBuf[qx.Expr], e qx.Expr, mode andLe
 		return true
 	}
 }
-
-func forEachAndLeaf(e qx.Expr, fn func(qx.Expr) bool) bool {
-	switch e.Op {
-	case qx.OpNOOP:
-		return false
-	case qx.OpAND:
-		if e.Not || len(e.Operands) == 0 {
-			return false
-		}
-		for _, ch := range e.Operands {
-			if !forEachAndLeaf(ch, fn) {
-				return false
-			}
-		}
-		return true
-	default:
-		if e.Op == qx.OpOR || len(e.Operands) != 0 {
-			return false
-		}
-		return fn(e)
-	}
-}

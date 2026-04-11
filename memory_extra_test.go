@@ -5,7 +5,6 @@ import (
 	"testing"
 
 	"github.com/vapstack/qx"
-	"github.com/vapstack/rbi/internal/posting"
 )
 
 func memoryExtraTwoChunkNumericRoot() *fieldIndexChunkedRoot {
@@ -43,22 +42,6 @@ func memoryExtraFullPageSplitNumericRoot() *fieldIndexChunkedRoot {
 	return newFieldIndexChunkedRootFromPages([]*fieldIndexChunkDirPage{
 		newFieldIndexChunkDirPage(refs),
 	})
-}
-
-func memoryExtraBuildLargePostingOffset(offset uint64) posting.List {
-	ids := make([]uint64, 0, posting.MidCap+16)
-	for i := uint64(0); i < uint64(posting.MidCap+16); i++ {
-		ids = append(ids, offset+i*3+1)
-	}
-	return posting.BuildFromSorted(ids)
-}
-
-func memoryExtraBuildMidPostingOffset(offset uint64) posting.List {
-	ids := make([]uint64, 0, posting.MidCap)
-	for i := uint64(0); i < uint64(posting.MidCap); i++ {
-		ids = append(ids, offset+i*3+1)
-	}
-	return posting.BuildFromSorted(ids)
 }
 
 func TestMemoryExtra_MaterializedPredCacheStoreBorrowedDetachesFromSourceOwner(t *testing.T) {

@@ -570,16 +570,6 @@ func (c *materializedPredCache) insertLocked(key materializedPredKey, entry *mat
 	return true
 }
 
-func (s *indexSnapshot) evictMaterializedPred(mode materializedPredCacheEvictMode) bool {
-	if s == nil || s.matPredCache == nil {
-		return false
-	}
-	s.matPredCache.mu.Lock()
-	ok := s.matPredCache.evictLocked(mode, &s.matPredCacheCount, &s.matPredCacheOversizedCount)
-	s.matPredCache.mu.Unlock()
-	return ok
-}
-
 func appendRetiredSnapshot(buf *pooled.SliceBuf[*indexSnapshot], snap *indexSnapshot) *pooled.SliceBuf[*indexSnapshot] {
 	if snap == nil {
 		return buf
@@ -938,14 +928,6 @@ func (s *indexSnapshot) loadOrStoreMaterializedPredKey(key materializedPredKey, 
 	return stored.Borrow(), true
 }
 
-func (s *indexSnapshot) loadOrStoreMaterializedPred(key string, ids posting.List) (posting.List, bool) {
-	parsed, ok := materializedPredCacheKeyFromString(key)
-	if !ok {
-		return ids, false
-	}
-	return s.loadOrStoreMaterializedPredKey(parsed, ids)
-}
-
 func (s *indexSnapshot) tryLoadOrStoreMaterializedPredOversizedKey(key materializedPredKey, ids posting.List) (posting.List, bool) {
 	if key.isZero() || ids.IsEmpty() || s == nil || s.matPredCache == nil {
 		return ids, false
@@ -992,14 +974,6 @@ func (s *indexSnapshot) tryLoadOrStoreMaterializedPredOversizedKey(key materiali
 	s.matPredCacheOversizedCount.Add(1)
 	s.matPredCache.mu.Unlock()
 	return stored.Borrow(), true
-}
-
-func (s *indexSnapshot) tryLoadOrStoreMaterializedPredOversized(key string, ids posting.List) (posting.List, bool) {
-	parsed, ok := materializedPredCacheKeyFromString(key)
-	if !ok {
-		return ids, false
-	}
-	return s.tryLoadOrStoreMaterializedPredOversizedKey(parsed, ids)
 }
 
 func (s *indexSnapshot) materializedPredCacheLimit() int {
@@ -1153,17 +1127,6 @@ func (s *indexSnapshot) fieldNameSet() map[string]struct{} {
 		if acc.ordinal < s.index.Len() && s.index.Get(acc.ordinal).keyCount() > 0 {
 			fields[f] = struct{}{}
 		}
-	}
-	return fields
-}
-
-func (s *indexSnapshot) indexedFieldNameSet() map[string]struct{} {
-	if s == nil {
-		return nil
-	}
-	fields := s.fieldNameSet()
-	for f := range s.nilFieldNameSet() {
-		fields[f] = struct{}{}
 	}
 	return fields
 }

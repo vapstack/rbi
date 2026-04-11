@@ -1522,12 +1522,6 @@ func (b *fieldIndexChunkBuilder) appendRefsRange(root *fieldIndexChunkedRoot, st
 	}
 }
 
-func (b *fieldIndexChunkBuilder) appendOwnedRefSlice(refs []fieldIndexChunkRef) {
-	for i := range refs {
-		b.appendOwnedRef(refs[i])
-	}
-}
-
 func (b *fieldIndexChunkBuilder) appendEntries(entries []index) {
 	if b == nil || len(entries) == 0 {
 		return

@@ -331,10 +331,7 @@ func stressBenchBasePatch(rec *StressBenchUser) []Field {
 }
 
 func stressBenchAltPatch(rec *StressBenchUser) []Field {
-	verified := true
-	if rec.IsVerified {
-		verified = false
-	}
+	verified := !rec.IsVerified
 	return []Field{
 		{Name: "country", Value: benchNextStringCycle(benchStressCountries, rec.Country)},
 		{Name: "plan", Value: benchNextStringCycle(stressBenchTurnoverPlans[:], rec.Plan)},

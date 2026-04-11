@@ -25,14 +25,6 @@ type keyedBatchPostingDelta struct {
 	delta batchPostingDelta
 }
 
-type keyedBatchPostingDeltaOrder []keyedBatchPostingDelta
-
-func (s keyedBatchPostingDeltaOrder) Len() int      { return len(s) }
-func (s keyedBatchPostingDeltaOrder) Swap(i, j int) { s[i], s[j] = s[j], s[i] }
-func (s keyedBatchPostingDeltaOrder) Less(i, j int) bool {
-	return compareIndexKeys(s[i].key, s[j].key) < 0
-}
-
 type keyedBatchPostingDeltaBufOrder struct {
 	buf *pooled.SliceBuf[keyedBatchPostingDelta]
 }

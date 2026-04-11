@@ -397,23 +397,23 @@ var bitmapContainerShortIteratorPool = pooled.Pointers[bitmapContainerShortItera
 	},
 }
 
-func (bcsi *bitmapContainerShortIterator) next() uint16 {
-	j := bcsi.i
-	bcsi.i = bcsi.ptr.nextSetBit(uint(bcsi.i) + 1)
+func (it *bitmapContainerShortIterator) next() uint16 {
+	j := it.i
+	it.i = it.ptr.nextSetBit(uint(it.i) + 1)
 	return uint16(j)
 }
 
-func (bcsi *bitmapContainerShortIterator) hasNext() bool {
-	return bcsi.i >= 0
+func (it *bitmapContainerShortIterator) hasNext() bool {
+	return it.i >= 0
 }
 
-func (bcsi *bitmapContainerShortIterator) peekNext() uint16 {
-	return uint16(bcsi.i)
+func (it *bitmapContainerShortIterator) peekNext() uint16 {
+	return uint16(it.i)
 }
 
-func (bcsi *bitmapContainerShortIterator) advanceIfNeeded(minval uint16) {
-	if bcsi.hasNext() && bcsi.peekNext() < minval {
-		bcsi.i = bcsi.ptr.nextSetBit(uint(minval))
+func (it *bitmapContainerShortIterator) advanceIfNeeded(minval uint16) {
+	if it.hasNext() && it.peekNext() < minval {
+		it.i = it.ptr.nextSetBit(uint(minval))
 	}
 }
 
@@ -446,20 +446,20 @@ var bitmapContainerManyIteratorPool = pooled.Pointers[bitmapContainerManyIterato
 	},
 }
 
-func (bcmi *bitmapContainerManyIterator) nextMany(hs uint32, buf []uint32) int {
+func (it *bitmapContainerManyIterator) nextMany(hs uint32, buf []uint32) int {
 	n := 0
-	base := bcmi.base
-	bitset := bcmi.bitset
+	base := it.base
+	bitset := it.bitset
 
 	for n < len(buf) {
 		if bitset == 0 {
 			base++
-			if base >= len(bcmi.ptr.bitmap) {
-				bcmi.base = base
-				bcmi.bitset = bitset
+			if base >= len(it.ptr.bitmap) {
+				it.base = base
+				it.bitset = bitset
 				return n
 			}
-			bitset = bcmi.ptr.bitmap[base]
+			bitset = it.ptr.bitmap[base]
 			continue
 		}
 		t := bitset & -bitset
@@ -468,26 +468,26 @@ func (bcmi *bitmapContainerManyIterator) nextMany(hs uint32, buf []uint32) int {
 		bitset ^= t
 	}
 
-	bcmi.base = base
-	bcmi.bitset = bitset
+	it.base = base
+	it.bitset = bitset
 	return n
 }
 
 // nextMany64 returns the number of values added to the buffer
-func (bcmi *bitmapContainerManyIterator) nextMany64(hs uint64, buf []uint64) int {
+func (it *bitmapContainerManyIterator) nextMany64(hs uint64, buf []uint64) int {
 	n := 0
-	base := bcmi.base
-	bitset := bcmi.bitset
+	base := it.base
+	bitset := it.bitset
 
 	for n < len(buf) {
 		if bitset == 0 {
 			base++
-			if base >= len(bcmi.ptr.bitmap) {
-				bcmi.base = base
-				bcmi.bitset = bitset
+			if base >= len(it.ptr.bitmap) {
+				it.base = base
+				it.bitset = bitset
 				return n
 			}
-			bitset = bcmi.ptr.bitmap[base]
+			bitset = it.ptr.bitmap[base]
 			continue
 		}
 		t := bitset & -bitset
@@ -496,8 +496,8 @@ func (bcmi *bitmapContainerManyIterator) nextMany64(hs uint64, buf []uint64) int
 		bitset ^= t
 	}
 
-	bcmi.base = base
-	bcmi.bitset = bitset
+	it.base = base
+	it.bitset = bitset
 	return n
 }
 

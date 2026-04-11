@@ -252,13 +252,13 @@ func (p predicate) postingFilterCapability() predicatePostingFilterCapability {
 			predicatePostingFilterCheap
 	}
 	if p.hasRuntimeRangeState() {
-		cap := predicatePostingFilterApply
+		c := predicatePostingFilterApply
 		if p.postingFilterCheap {
-			cap |= predicatePostingFilterExactBucket |
+			c |= predicatePostingFilterExactBucket |
 				predicatePostingFilterPreferExact |
 				predicatePostingFilterCheap
 		}
-		return cap
+		return c
 	}
 	switch p.kind {
 	case predicateKindPosting,
@@ -685,24 +685,6 @@ func (p predicate) applyToPosting(dst posting.List) (posting.List, bool) {
 	return posting.List{}, false
 }
 
-func countBucketPostsAny(posts []posting.List, bucket posting.List) (uint64, bool) {
-	if bucket.IsEmpty() {
-		return 0, true
-	}
-	if len(posts) == 0 {
-		return 0, true
-	}
-	if len(posts) == 1 {
-		return posts[0].AndCardinality(bucket), true
-	}
-	for _, ids := range posts {
-		if ids.Intersects(bucket) {
-			return 0, false
-		}
-	}
-	return 0, true
-}
-
 func countBucketPostsAnyBuf(posts *pooled.SliceBuf[posting.List], bucket posting.List) (uint64, bool) {
 	if bucket.IsEmpty() {
 		return 0, true
@@ -719,29 +701,6 @@ func countBucketPostsAnyBuf(posts *pooled.SliceBuf[posting.List], bucket posting
 		}
 	}
 	return 0, true
-}
-
-func countBucketPostsAnyNot(posts []posting.List, bucket posting.List) (uint64, bool) {
-	if bucket.IsEmpty() {
-		return 0, true
-	}
-	bc := bucket.Cardinality()
-	if len(posts) == 0 {
-		return bc, true
-	}
-	if len(posts) == 1 {
-		hit := posts[0].AndCardinality(bucket)
-		if hit >= bc {
-			return 0, true
-		}
-		return bc - hit, true
-	}
-	for _, ids := range posts {
-		if ids.Intersects(bucket) {
-			return 0, false
-		}
-	}
-	return bc, true
 }
 
 func countBucketPostsAnyNotBuf(posts *pooled.SliceBuf[posting.List], bucket posting.List) (uint64, bool) {
@@ -767,24 +726,6 @@ func countBucketPostsAnyNotBuf(posts *pooled.SliceBuf[posting.List], bucket post
 	return bc, true
 }
 
-func countBucketPostsAll(posts []posting.List, bucket posting.List) (uint64, bool) {
-	if bucket.IsEmpty() {
-		return 0, true
-	}
-	if len(posts) == 0 {
-		return 0, true
-	}
-	if len(posts) == 1 {
-		return posts[0].AndCardinality(bucket), true
-	}
-	for _, ids := range posts {
-		if !ids.Intersects(bucket) {
-			return 0, true
-		}
-	}
-	return 0, false
-}
-
 func countBucketPostsAllBuf(posts *pooled.SliceBuf[posting.List], bucket posting.List) (uint64, bool) {
 	if bucket.IsEmpty() {
 		return 0, true
@@ -798,29 +739,6 @@ func countBucketPostsAllBuf(posts *pooled.SliceBuf[posting.List], bucket posting
 	for i := 0; i < posts.Len(); i++ {
 		if !posts.Get(i).Intersects(bucket) {
 			return 0, true
-		}
-	}
-	return 0, false
-}
-
-func countBucketPostsAllNot(posts []posting.List, bucket posting.List) (uint64, bool) {
-	if bucket.IsEmpty() {
-		return 0, true
-	}
-	bc := bucket.Cardinality()
-	if len(posts) == 0 {
-		return bc, true
-	}
-	if len(posts) == 1 {
-		hit := posts[0].AndCardinality(bucket)
-		if hit >= bc {
-			return 0, true
-		}
-		return bc - hit, true
-	}
-	for _, ids := range posts {
-		if !ids.Intersects(bucket) {
-			return bc, true
 		}
 	}
 	return 0, false
@@ -1634,10 +1552,6 @@ func materializedPredCacheKeyFromScalar(field string, op qx.Op, key string) stri
 		return ""
 	}
 	return field + "\x1f" + strconv.Itoa(int(op)) + "\x1f" + key
-}
-
-func materializedPredCacheKeyForNumericBucketSpan(field string, startBucket, endBucket int) string {
-	return materializedPredKeyForNumericBucketSpan(field, startBucket, endBucket).String()
 }
 
 // tryShareMaterializedPred caches ids and, on success, rewrites the caller
@@ -2753,38 +2667,6 @@ func orderedScanEmitPostingByChecks[K ~uint64 | ~string, V any](
 	return false
 }
 
-func orderedScanEmitPostingByChecksBuf[K ~uint64 | ~string, V any](
-	cursor *queryCursor[K, V],
-	ids posting.List,
-	preds predicateReader,
-	checks *pooled.SliceBuf[int],
-	singleCheck int,
-	trace *queryTrace,
-) bool {
-	if ids.IsEmpty() {
-		return false
-	}
-	if idx, ok := ids.TrySingle(); ok {
-		if !orderedPredicateChecksMatchBufReader(preds, checks, singleCheck, idx) {
-			return false
-		}
-		return orderedScanEmitMatched(cursor, trace, idx)
-	}
-	it := ids.Iter()
-	for it.HasNext() {
-		idx := it.Next()
-		if !orderedPredicateChecksMatchBufReader(preds, checks, singleCheck, idx) {
-			continue
-		}
-		if orderedScanEmitMatched(cursor, trace, idx) {
-			it.Release()
-			return true
-		}
-	}
-	it.Release()
-	return false
-}
-
 func orderedScanEmitBucketNoPredicates[K ~uint64 | ~string, V any](
 	cursor *queryCursor[K, V],
 	bucket posting.List,
@@ -2869,75 +2751,6 @@ func orderedScanEmitBucketWithPredicates[K ~uint64 | ~string, V any](
 	}
 
 	return orderedScanEmitPostingByChecks(cursor, bucket, preds, active, singleActive, trace), exactWork
-}
-
-func orderedScanEmitBucketWithPredicatesBuf[K ~uint64 | ~string, V any](
-	cursor *queryCursor[K, V],
-	preds predicateReader,
-	active *pooled.SliceBuf[int],
-	singleActive int,
-	exactActive *pooled.SliceBuf[int],
-	exactOnly bool,
-	residualActive *pooled.SliceBuf[int],
-	singleResidual int,
-	bucket posting.List,
-	exactWork posting.List,
-	trace *queryTrace,
-	scanWidth *uint64,
-) (bool, posting.List) {
-	if bucket.IsEmpty() {
-		return false, exactWork
-	}
-	*scanWidth++
-	card := bucket.Cardinality()
-	if trace != nil {
-		trace.addExamined(card)
-	}
-	if idx, ok := bucket.TrySingle(); ok {
-		if !orderedPredicateChecksMatchBufReader(preds, active, singleActive, idx) {
-			return false, exactWork
-		}
-		return orderedScanEmitMatched(cursor, trace, idx), exactWork
-	}
-
-	if exactActive.Len() > 0 {
-		allowExact := plannerAllowExactBucketFilter(cursor.skip, cursor.need, card, exactOnly, exactActive.Len())
-		mode, exactIDs, nextExactWork, _ := plannerFilterPostingByPredicateChecksBuf(preds, exactActive, bucket, exactWork, allowExact)
-		exactWork = nextExactWork
-		switch mode {
-		case plannerPredicateBucketEmpty:
-			return false, exactWork
-		case plannerPredicateBucketAll:
-			if exactOnly {
-				return orderedScanEmitPostingMatchedAll(cursor, exactIDs, card, trace), exactWork
-			}
-			return orderedScanEmitPostingByChecksBuf(cursor, exactIDs, preds, residualActive, singleResidual, trace), exactWork
-		case plannerPredicateBucketExact:
-			if trace != nil {
-				trace.addPostingExactFilter(1)
-			}
-			if exactIDs.IsEmpty() {
-				return false, exactWork
-			}
-			if exactOnly {
-				return orderedScanEmitPostingMatchedAll(cursor, exactIDs, exactIDs.Cardinality(), trace), exactWork
-			}
-			return orderedScanEmitPostingByChecksBuf(cursor, exactIDs, preds, residualActive, singleResidual, trace), exactWork
-		}
-	}
-
-	if singleActive >= 0 && cursor.skip > 0 {
-		cnt, ok := preds.Get(singleActive).countBucket(bucket)
-		if ok && cnt <= cursor.skip {
-			cursor.skip -= cnt
-			if trace != nil {
-				trace.addMatched(cnt)
-			}
-			return false, exactWork
-		}
-	}
-
-	return orderedScanEmitPostingByChecksBuf(cursor, bucket, preds, active, singleActive, trace), exactWork
 }
 
 func orderedBasicAnchoredEmitPosting[K ~uint64 | ~string, V any](
@@ -3058,16 +2871,6 @@ func buildExactBucketPostingFilterActive[T plannerExactBucketPostingFilterPredic
 		}
 	}
 	return dst
-}
-
-func buildExactBucketPostingFilterActiveBuf[T plannerExactBucketPostingFilterPredicate](dst, active *pooled.SliceBuf[int], preds []T) {
-	dst.Truncate()
-	for i := 0; i < active.Len(); i++ {
-		pi := active.Get(i)
-		if preds[pi].supportsExactBucketPostingFilter() {
-			dst.Append(pi)
-		}
-	}
 }
 
 func buildExactBucketPostingFilterActiveReader(dst, active []int, preds predicateReader) []int {
@@ -3599,10 +3402,6 @@ func (qv *queryView[K, V]) buildPredicateWithColdMode(e qx.Expr, allowMaterializ
 		return predicate{}, false
 	}
 	return p, true
-}
-
-func (qv *queryView[K, V]) buildPredRangeWithMode(e qx.Expr, fm *field, slice *[]index, allowMaterialize bool) (predicate, bool) {
-	return qv.buildPredRangeWithColdMode(e, fm, slice, allowMaterialize, false)
 }
 
 func (qv *queryView[K, V]) buildPredRangeWithColdMode(e qx.Expr, fm *field, slice *[]index, allowMaterialize bool, lazyColdMaterialize bool) (predicate, bool) {
@@ -4228,28 +4027,6 @@ func materializeBaseRangeProbeFast(probe baseRangeProbe) posting.List {
 	out := builder.finish(true)
 	builder.release()
 	return out
-}
-
-func isSingletonHeavyProbe(probe []posting.List) bool {
-	probeLen := 0
-	singletons := 0
-	est := uint64(0)
-	for _, p := range probe {
-		if p.IsEmpty() {
-			continue
-		}
-		probeLen++
-		card := p.Cardinality()
-		if card == 1 {
-			singletons++
-		}
-		if ^uint64(0)-est < card {
-			est = ^uint64(0)
-		} else {
-			est += card
-		}
-	}
-	return shouldUseFastSinglesUnion(probeLen, singletons, est)
 }
 
 func isSingletonHeavyPostingBuf(probe *pooled.SliceBuf[posting.List]) bool {
@@ -5214,38 +4991,6 @@ func (qv *queryView[K, V]) collectOrderRangeBounds(field string, n int, exprAt f
 			continue
 		}
 		if applied, ok := qv.applyScalarExprToRangeBounds(e, &rb); !ok {
-			boolSlicePool.Put(covered)
-			return rangeBounds{}, nil, false, false
-		} else if applied {
-			covered.Set(i, true)
-			has = true
-		}
-	}
-	if !has {
-		covered.Truncate()
-	}
-
-	return rb, covered, has, true
-}
-
-func (qv *queryView[K, V]) collectPredicateRangeBounds(field string, preds []predicate) (rangeBounds, *pooled.SliceBuf[bool], bool, bool) {
-	var rb rangeBounds
-	covered := boolSlicePool.Get()
-	covered.SetLen(len(preds))
-	has := false
-
-	for i := range preds {
-		p := preds[i]
-		if p.expr.Not || p.expr.Field != field {
-			continue
-		}
-		if p.hasEffectiveBounds {
-			mergeRangeBounds(&rb, p.effectiveBounds)
-			covered.Set(i, true)
-			has = true
-			continue
-		}
-		if applied, ok := qv.applyScalarExprToRangeBounds(p.expr, &rb); !ok {
 			boolSlicePool.Put(covered)
 			return rangeBounds{}, nil, false, false
 		} else if applied {

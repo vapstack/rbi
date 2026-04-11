@@ -376,14 +376,6 @@ func postingBufLen(buf *pooled.SliceBuf[posting.List]) int {
 	return buf.Len()
 }
 
-func (state *postsAnyFilterState) borrowMaterialized() posting.List {
-	union := state.materialize()
-	if union.IsEmpty() {
-		return posting.List{}
-	}
-	return union.Borrow()
-}
-
 type lazyMaterializedPredicateState struct {
 	loader   lazyMaterializedPredicateLoader
 	raw      qx.Expr
@@ -1070,10 +1062,6 @@ func (qv *queryView[K, V]) materializedPredKeyForExactScalarRange(field string, 
 		return materializedPredKey{}
 	}
 	return materializedPredKeyForExactScalarRange(field, bounds)
-}
-
-func (qv *queryView[K, V]) materializedPredCacheKeyForExactScalarRange(field string, bounds rangeBounds) string {
-	return qv.materializedPredKeyForExactScalarRange(field, bounds).String()
 }
 
 /**/

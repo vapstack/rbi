@@ -117,7 +117,7 @@ func main() {
 	}
 
 	var reader *lineReader
-	var renderer *renderer
+	var renderer *uiRenderer
 	if !opts.Headless {
 		reader, err = newLineReader()
 		if err != nil {
@@ -213,7 +213,7 @@ func main() {
 	_, _ = fmt.Fprintf(os.Stdout, "\nreport saved to %s\nDB closed %s\n", opts.ReportPath, handle.DBFile)
 }
 
-func renderShutdownStatus(app *app, renderer *renderer, reader *lineReader, message string) {
+func renderShutdownStatus(app *stressApp, renderer *uiRenderer, reader *lineReader, message string) {
 	app.setStatus(message)
 	_ = renderer.render(app.buildSnapshot(time.Now(), false), reader.Buffer(), app.statusText())
 }

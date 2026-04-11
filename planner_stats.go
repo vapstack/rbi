@@ -139,21 +139,21 @@ func (db *DB[K, V]) collectPlannerFieldStatsFromOverlay(s *indexSnapshot, fieldN
 	return ov.fieldStats(), nil
 }
 
-func (ov fieldOverlay) fieldStats() PlannerFieldStats {
+func (o fieldOverlay) fieldStats() PlannerFieldStats {
 	var (
 		total    uint64
 		maxCard  uint64
 		nonEmpty uint64
 		distinct uint64
 	)
-	br := ov.rangeForBounds(rangeBounds{has: true})
+	br := o.rangeForBounds(rangeBounds{has: true})
 	if br.baseStart >= br.baseEnd {
 		return PlannerFieldStats{}
 	}
 
 	q50 := newP2Quantile(0.50)
 	q95 := newP2Quantile(0.95)
-	cur := ov.newCursor(br, false)
+	cur := o.newCursor(br, false)
 	for {
 		_, ids, ok := cur.next()
 		if !ok {

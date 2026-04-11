@@ -210,61 +210,6 @@ func (qv *queryView[K, V]) evalAndOperands(ops []qx.Expr, negate bool) (postingR
 	return first, nil
 }
 
-func (qv *queryView[K, V]) evalAndOperandsExcept(ops []qx.Expr, skip int) (postingResult, error) {
-	if len(ops) == 0 || (skip >= 0 && len(ops) <= 1) {
-		return postingResult{}, fmt.Errorf("%w: empty AND expression", ErrInvalidQuery)
-	}
-
-	var (
-		first    postingResult
-		hasFirst bool
-	)
-
-	for i, op := range ops {
-		if i == skip {
-			continue
-		}
-
-		b, err := qv.evalExpr(op)
-		if err != nil {
-			if hasFirst {
-				first.release()
-			}
-			return postingResult{}, err
-		}
-
-		if !b.neg && b.ids.IsEmpty() {
-			b.release()
-			if hasFirst {
-				first.release()
-			}
-			return postingResult{}, nil
-		}
-
-		if !hasFirst {
-			first = b
-			hasFirst = true
-			continue
-		}
-
-		first, err = qv.andPostingResult(first, b)
-		if err != nil {
-			first.release()
-			return postingResult{}, err
-		}
-
-		if !first.neg && first.ids.IsEmpty() {
-			first.release()
-			return postingResult{}, nil
-		}
-	}
-
-	if !hasFirst {
-		return postingResult{}, fmt.Errorf("%w: empty AND expression", ErrInvalidQuery)
-	}
-	return first, nil
-}
-
 // evalSimple evaluates a single non-boolean predicate against the current
 // immutable snapshot indexes.
 func (qv *queryView[K, V]) evalSimple(e qx.Expr) (postingResult, error) {
@@ -479,30 +424,6 @@ func (qv *queryView[K, V]) evalSimple(e qx.Expr) (postingResult, error) {
 	default:
 		return postingResult{}, fmt.Errorf("unsupported op: %v", e.Op)
 	}
-}
-
-func materializePostingUnionOwned(posts []posting.List) posting.List {
-	dst := posts[:0]
-	for _, ids := range posts {
-		if ids.IsEmpty() {
-			continue
-		}
-		dst = append(dst, ids)
-	}
-	posts = dst
-	n := len(posts)
-	switch n {
-	case 0:
-		return posting.List{}
-	case 1:
-		return posts[0].Clone()
-	}
-
-	// Few postings do not justify goroutine overhead.
-	if n < 256 {
-		return linearPostingUnionOwned(posts)
-	}
-	return parallelBatchedPostingUnionOwned(posts)
 }
 
 func linearPostingUnionOwned(posts []posting.List) posting.List {

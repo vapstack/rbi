@@ -7,27 +7,27 @@ import (
 	"time"
 )
 
-type renderer struct {
+type uiRenderer struct {
 	out         *os.File
 	interactive bool
 }
 
-func newRenderer(out *os.File, interactive bool) *renderer {
-	r := &renderer{out: out, interactive: interactive}
+func newRenderer(out *os.File, interactive bool) *uiRenderer {
+	r := &uiRenderer{out: out, interactive: interactive}
 	if interactive {
 		_, _ = fmt.Fprint(out, "\x1b[?1049h\x1b[2J\x1b[H\x1b[?25l")
 	}
 	return r
 }
 
-func (r *renderer) Close() error {
+func (r *uiRenderer) Close() error {
 	if r.interactive {
 		_, _ = fmt.Fprint(r.out, "\x1b[?25h\x1b[?1049l")
 	}
 	return nil
 }
 
-func (r *renderer) render(snapshot viewSnapshot, inputBuffer, status string) error {
+func (r *uiRenderer) render(snapshot viewSnapshot, inputBuffer, status string) error {
 	var b strings.Builder
 	if r.interactive {
 		b.WriteString("\x1b[H\x1b[2J")

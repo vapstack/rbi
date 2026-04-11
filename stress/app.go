@@ -20,7 +20,7 @@ var (
 	setGroupPattern     = regexp.MustCompile(`^\s*([rRwWaA])\s+(\d+)\s*$`)
 )
 
-type app struct {
+type stressApp struct {
 	handle         *DBHandle
 	startMaxID     uint64
 	classes        []*classController
@@ -50,7 +50,7 @@ type app struct {
 }
 
 type classController struct {
-	app  *app
+	app  *stressApp
 	desc *classDescriptor
 	ctx  *WorkloadContext
 
@@ -124,13 +124,21 @@ type workerCommand struct {
 	Value   int
 }
 
-func newApp(handle *DBHandle, catalog []*classDescriptor, refreshEvery, telemetryEvery time.Duration, reportPath string, classFilter, queryFilter []string, queryBreakdown, queryLatency, jitter bool, traces *plannerTraceCollector) *app {
+func newApp(
+	handle *DBHandle,
+	catalog []*classDescriptor,
+	refreshEvery, telemetryEvery time.Duration,
+	reportPath string,
+	classFilter, queryFilter []string,
+	queryBreakdown, queryLatency, jitter bool,
+	traces *plannerTraceCollector,
+) *stressApp {
 	workCtx := &WorkloadContext{
 		DB:           handle.DB,
 		MaxIDPtr:     &handle.MaxID,
 		EmailSamples: handle.EmailSamples,
 	}
-	a := &app{
+	a := &stressApp{
 		handle:         handle,
 		startMaxID:     handle.MaxID,
 		refreshEvery:   refreshEvery,
@@ -160,7 +168,7 @@ func newApp(handle *DBHandle, catalog []*classDescriptor, refreshEvery, telemetr
 	return a
 }
 
-func (a *app) run(ctx context.Context, renderer *renderer, input *lineReader) error {
+func (a *stressApp) run(ctx context.Context, renderer *uiRenderer, input *lineReader) error {
 	refreshTicker := time.NewTicker(a.refreshEvery)
 	defer refreshTicker.Stop()
 
@@ -210,7 +218,7 @@ func (a *app) run(ctx context.Context, renderer *renderer, input *lineReader) er
 	}
 }
 
-func (a *app) runHeadless(ctx context.Context) error {
+func (a *stressApp) runHeadless(ctx context.Context) error {
 	refreshTicker := time.NewTicker(a.refreshEvery)
 	defer refreshTicker.Stop()
 
@@ -233,7 +241,7 @@ func (a *app) runHeadless(ctx context.Context) error {
 	}
 }
 
-func (a *app) applyInitialWorkers(initial map[string]int) {
+func (a *stressApp) applyInitialWorkers(initial map[string]int) {
 	for _, class := range a.classes {
 		if n, ok := initial[class.desc.Info.Name]; ok && n > 0 {
 			class.setWorkers(n)
@@ -242,17 +250,17 @@ func (a *app) applyInitialWorkers(initial map[string]int) {
 	a.resetEpochWithMeta("initial", "")
 }
 
-func (a *app) stopAllWorkers() {
+func (a *stressApp) stopAllWorkers() {
 	a.stopOnce.Do(func() {
 		close(a.stopCh)
 	})
 }
 
-func (a *app) waitWorkers() {
+func (a *stressApp) waitWorkers() {
 	a.workerWG.Wait()
 }
 
-func (a *app) buildReport(interrupted bool) stressReport {
+func (a *stressApp) buildReport(interrupted bool) stressReport {
 	now := time.Now()
 	epoch := a.currentEpoch()
 	a.captureTelemetryForEpoch(epoch, now)
@@ -294,11 +302,11 @@ func (a *app) buildReport(interrupted bool) stressReport {
 	}
 }
 
-func (a *app) sampleCounts(now time.Time) {
+func (a *stressApp) sampleCounts(now time.Time) {
 	a.sampleCountsForEpoch(a.currentEpoch(), now)
 }
 
-func (a *app) sampleCountsForEpoch(epoch *runEpoch, now time.Time) {
+func (a *stressApp) sampleCountsForEpoch(epoch *runEpoch, now time.Time) {
 	if epoch == nil {
 		return
 	}
@@ -330,11 +338,11 @@ func (a *app) sampleCountsForEpoch(epoch *runEpoch, now time.Time) {
 	_, _ = epoch.observeScope("role:total", readCompleted+writeCompleted, readPaused+writePaused, readWorkers+writeWorkers, now)
 }
 
-func (a *app) buildSnapshot(now time.Time, includeWorkers bool) viewSnapshot {
+func (a *stressApp) buildSnapshot(now time.Time, includeWorkers bool) viewSnapshot {
 	return a.buildSnapshotForEpoch(a.currentEpoch(), now, includeWorkers)
 }
 
-func (a *app) buildSnapshotForEpoch(epoch *runEpoch, now time.Time, includeWorkers bool) viewSnapshot {
+func (a *stressApp) buildSnapshotForEpoch(epoch *runEpoch, now time.Time, includeWorkers bool) viewSnapshot {
 	if epoch == nil {
 		epoch = &runEpoch{startedAt: now}
 	}
@@ -405,14 +413,14 @@ func (a *app) buildSnapshotForEpoch(epoch *runEpoch, now time.Time, includeWorke
 	return out
 }
 
-func (a *app) resetEpochWithMeta(kind, startedByCommand string) {
+func (a *stressApp) resetEpochWithMeta(kind, startedByCommand string) {
 	for _, class := range a.classes {
 		class.resetMetrics()
 	}
 	a.epoch.Store(newRunEpoch(a.handle, a.traces, a.nextPhaseID(), kind, startedByCommand))
 }
 
-func (a *app) currentEpoch() *runEpoch {
+func (a *stressApp) currentEpoch() *runEpoch {
 	epoch := a.epoch.Load()
 	if epoch != nil {
 		return epoch
@@ -422,7 +430,7 @@ func (a *app) currentEpoch() *runEpoch {
 	return epoch
 }
 
-func (a *app) nextPhaseID() int {
+func (a *stressApp) nextPhaseID() int {
 	a.phaseMu.Lock()
 	defer a.phaseMu.Unlock()
 	id := a.nextPhaseIndex
@@ -430,13 +438,13 @@ func (a *app) nextPhaseID() int {
 	return id
 }
 
-func (a *app) archivePhase(phase phaseReport) {
+func (a *stressApp) archivePhase(phase phaseReport) {
 	a.phaseMu.Lock()
 	defer a.phaseMu.Unlock()
 	a.archivedPhases = append(a.archivedPhases, phase)
 }
 
-func (a *app) buildPhaseReport(epoch *runEpoch, now time.Time, endedByCommand string) phaseReport {
+func (a *stressApp) buildPhaseReport(epoch *runEpoch, now time.Time, endedByCommand string) phaseReport {
 	if epoch == nil {
 		epoch = &runEpoch{startedAt: now}
 	}
@@ -466,7 +474,7 @@ func (a *app) buildPhaseReport(epoch *runEpoch, now time.Time, endedByCommand st
 	}
 }
 
-func (a *app) finalizeCurrentPhase(endedByCommand string) {
+func (a *stressApp) finalizeCurrentPhase(endedByCommand string) {
 	epoch := a.currentEpoch()
 	now := time.Now()
 	a.captureTelemetryForEpoch(epoch, now)
@@ -474,7 +482,7 @@ func (a *app) finalizeCurrentPhase(endedByCommand string) {
 	a.archivePhase(a.buildPhaseReport(epoch, now, endedByCommand))
 }
 
-func (a *app) phaseReports(now time.Time) []phaseReport {
+func (a *stressApp) phaseReports(now time.Time) []phaseReport {
 	epoch := a.currentEpoch()
 	a.phaseMu.Lock()
 	phases := append([]phaseReport(nil), a.archivedPhases...)
@@ -483,11 +491,11 @@ func (a *app) phaseReports(now time.Time) []phaseReport {
 	return phases
 }
 
-func (a *app) captureTelemetry(now time.Time) {
+func (a *stressApp) captureTelemetry(now time.Time) {
 	a.captureTelemetryForEpoch(a.currentEpoch(), now)
 }
 
-func (a *app) captureTelemetryForEpoch(epoch *runEpoch, now time.Time) {
+func (a *stressApp) captureTelemetryForEpoch(epoch *runEpoch, now time.Time) {
 	if epoch == nil {
 		return
 	}
@@ -505,7 +513,7 @@ func (a *app) captureTelemetryForEpoch(epoch *runEpoch, now time.Time) {
 	)
 }
 
-func (a *app) applyCommand(line string) error {
+func (a *stressApp) applyCommand(line string) error {
 	cmd, err := parseWorkerCommand(line)
 	if err != nil {
 		return err
@@ -560,13 +568,13 @@ func (a *app) applyCommand(line string) error {
 	return nil
 }
 
-func (a *app) setStatus(msg string) {
+func (a *stressApp) setStatus(msg string) {
 	a.statusMu.Lock()
 	defer a.statusMu.Unlock()
 	a.status = msg
 }
 
-func (a *app) statusText() string {
+func (a *stressApp) statusText() string {
 	a.statusMu.Lock()
 	defer a.statusMu.Unlock()
 	return a.status
@@ -711,7 +719,7 @@ func (c *classController) capture(now time.Time, epoch *runEpoch, planner planne
 	return classCapture{report: report, latency: classLatency, paused: paused, workers: len(workers)}
 }
 
-func (a *app) runWorker(class *classController, worker *workerHandle) {
+func (a *stressApp) runWorker(class *classController, worker *workerHandle) {
 	defer a.workerWG.Done()
 	defer worker.stoppedAt.Store(time.Now().UnixNano())
 
