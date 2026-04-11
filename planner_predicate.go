@@ -645,6 +645,33 @@ func (p predicate) applyToPosting(dst posting.List) (posting.List, bool) {
 		return dst.BuildAndNot(p.ids), true
 	}
 
+	if p.rangeMat {
+		if p.ids.IsEmpty() {
+			if p.expr.Not {
+				return dst, true
+			}
+			dst.Release()
+			return posting.List{}, true
+		}
+		if p.expr.Not {
+			return dst.BuildAndNot(p.ids), true
+		}
+		return dst.BuildAnd(p.ids), true
+	}
+	if p.lazyMatState != nil {
+		ids := p.lazyMatState.materialize()
+		if ids.IsEmpty() {
+			if p.expr.Not {
+				return dst, true
+			}
+			dst.Release()
+			return posting.List{}, true
+		}
+		if p.expr.Not {
+			return dst.BuildAndNot(ids), true
+		}
+		return dst.BuildAnd(ids), true
+	}
 	if next, ok, handled := p.runtimeRangeApply(dst); handled {
 		return next, ok
 	}
