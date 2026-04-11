@@ -1012,17 +1012,34 @@ func (db *DB[K, V]) buildIndex(skipFields map[string]struct{}) error {
 		}
 	}
 
-	if db.index == nil {
-		db.index = make(map[string]fieldIndexStorage)
+	slotCount := len(db.indexedFieldAccess)
+	if db.index == nil || db.index.Len() != slotCount {
+		releaseFieldIndexStorageSlotsOwned(db.index)
+		db.index = fieldIndexStorageSlicePool.Get()
+		db.index.SetLen(slotCount)
 	}
-	if db.nilIndex == nil {
-		db.nilIndex = make(map[string]fieldIndexStorage)
+	if db.nilIndex == nil || db.nilIndex.Len() != slotCount {
+		releaseFieldIndexStorageSlotsOwned(db.nilIndex)
+		db.nilIndex = fieldIndexStorageSlicePool.Get()
+		db.nilIndex.SetLen(slotCount)
 	}
-	if db.lenIndex == nil {
-		db.lenIndex = make(map[string]fieldIndexStorage)
+	if db.lenIndex == nil || db.lenIndex.Len() != slotCount {
+		releaseFieldIndexStorageSlotsOwned(db.lenIndex)
+		db.lenIndex = fieldIndexStorageSlicePool.Get()
+		db.lenIndex.SetLen(slotCount)
 	}
-	if db.lenZeroComplement == nil {
-		db.lenZeroComplement = make(map[string]bool)
+	if db.lenZeroComplement == nil || db.lenZeroComplement.Len() != slotCount {
+		if db.lenZeroComplement != nil {
+			fieldIndexBoolSlicePool.Put(db.lenZeroComplement)
+		}
+		db.lenZeroComplement = fieldIndexBoolSlicePool.Get()
+		db.lenZeroComplement.SetLen(slotCount)
+	} else if len(skipFields) == 0 {
+		db.lenZeroComplement.Clear()
+	} else {
+		for i := range active {
+			db.lenZeroComplement.Set(active[i].acc.ordinal, false)
+		}
 	}
 
 	db.universe = posting.List{}
@@ -1034,36 +1051,34 @@ func (db *DB[K, V]) buildIndex(skipFields map[string]struct{}) error {
 	}
 
 	for i := range fieldStates {
-		name := active[i].acc.name
-		oldIndexStorage := db.index[name]
+		ordinal := active[i].acc.ordinal
+		oldIndexStorage := db.index.Get(ordinal)
 		if storage := fieldStates[i].materializeStorage(); storage.keyCount() > 0 {
 			releaseFieldIndexStorageOwned(oldIndexStorage)
-			db.index[name] = storage
+			db.index.Set(ordinal, storage)
 		} else {
 			releaseFieldIndexStorageOwned(oldIndexStorage)
-			delete(db.index, name)
+			db.index.Set(ordinal, fieldIndexStorage{})
 		}
-		oldNilStorage := db.nilIndex[name]
+		oldNilStorage := db.nilIndex.Get(ordinal)
 		if storage := fieldStates[i].materializeNilStorage(); storage.keyCount() > 0 {
 			releaseFieldIndexStorageOwned(oldNilStorage)
-			db.nilIndex[name] = storage
+			db.nilIndex.Set(ordinal, storage)
 		} else {
 			releaseFieldIndexStorageOwned(oldNilStorage)
-			delete(db.nilIndex, name)
+			db.nilIndex.Set(ordinal, fieldIndexStorage{})
 		}
-		oldLenStorage := db.lenIndex[name]
+		oldLenStorage := db.lenIndex.Get(ordinal)
 		if storage, useZeroComplement := fieldStates[i].materializeLenStorage(db.universe); active[i].slice {
 			if storage.keyCount() > 0 {
 				releaseFieldIndexStorageOwned(oldLenStorage)
-				db.lenIndex[name] = storage
+				db.lenIndex.Set(ordinal, storage)
 			} else {
 				releaseFieldIndexStorageOwned(oldLenStorage)
-				delete(db.lenIndex, name)
+				db.lenIndex.Set(ordinal, fieldIndexStorage{})
 			}
 			if useZeroComplement {
-				db.lenZeroComplement[name] = true
-			} else {
-				delete(db.lenZeroComplement, name)
+				db.lenZeroComplement.Set(ordinal, true)
 			}
 		}
 	}
@@ -1075,7 +1090,8 @@ func (db *DB[K, V]) buildIndex(skipFields map[string]struct{}) error {
 
 	for name, f := range db.fields {
 		if f.Slice {
-			if _, ok := db.lenIndex[name]; !ok {
+			acc, ok := db.indexedFieldByName[name]
+			if !ok || db.lenIndex.Get(acc.ordinal).keyCount() == 0 {
 				db.buildLenIndex()
 				break
 			}
@@ -1163,22 +1179,23 @@ func (db *DB[K, V]) idxFromKeyNoLock(key []byte) uint64 {
 }
 
 func (db *DB[K, V]) buildLenIndex() {
-	releaseFieldIndexStorageMapOwned(db.lenIndex)
-	db.lenIndex = make(map[string]fieldIndexStorage, len(db.fields))
-	if db.lenZeroComplement == nil {
-		db.lenZeroComplement = make(map[string]bool)
-	} else {
-		clear(db.lenZeroComplement)
+	releaseFieldIndexStorageSlotsOwned(db.lenIndex)
+	db.lenIndex = fieldIndexStorageSlicePool.Get()
+	db.lenIndex.SetLen(len(db.indexedFieldAccess))
+	if db.lenZeroComplement != nil {
+		fieldIndexBoolSlicePool.Put(db.lenZeroComplement)
 	}
+	db.lenZeroComplement = fieldIndexBoolSlicePool.Get()
+	db.lenZeroComplement.SetLen(len(db.indexedFieldAccess))
 
-	for name, f := range db.fields {
-		if !f.Slice {
+	for _, acc := range db.indexedFieldAccess {
+		if !acc.field.Slice {
 			continue
 		}
-		result, useZeroComplement := rebuildLenIndexField(db.universe, newFieldOverlayStorage(db.index[name]))
-		db.lenIndex[name] = newFlatFieldIndexStorage(result)
+		result, useZeroComplement := rebuildLenIndexField(db.universe, newFieldOverlayStorage(db.index.Get(acc.ordinal)))
+		db.lenIndex.Set(acc.ordinal, newFlatFieldIndexStorage(result))
 		if useZeroComplement {
-			db.lenZeroComplement[name] = true
+			db.lenZeroComplement.Set(acc.ordinal, true)
 		}
 	}
 }
@@ -1187,12 +1204,16 @@ func (db *DB[K, V]) isLenZeroComplementField(field string) bool {
 	if field == "" {
 		return false
 	}
+	acc, ok := db.indexedFieldByName[field]
+	if !ok || db.lenZeroComplement == nil || acc.ordinal >= db.lenZeroComplement.Len() {
+		return false
+	}
 	if db.traceRoot != nil {
-		return db.lenZeroComplement[field]
+		return db.lenZeroComplement.Get(acc.ordinal)
 	}
 	db.mu.RLock()
 	defer db.mu.RUnlock()
-	return db.lenZeroComplement[field]
+	return db.lenZeroComplement.Get(acc.ordinal)
 }
 
 const (
@@ -1315,10 +1336,36 @@ func (db *DB[K, V]) loadIndexPayload(reader *bufio.Reader) (map[string]struct{},
 
 	db.universe = universe
 	db.strmap = strmap
-	db.index = indexes
-	db.nilIndex = nilIndexes
-	db.lenIndex = lenIndexes
-	db.lenZeroComplement = detectLenZeroComplement(lenIndexes)
+	releaseFieldIndexStorageSlotsOwned(db.index)
+	releaseFieldIndexStorageSlotsOwned(db.nilIndex)
+	releaseFieldIndexStorageSlotsOwned(db.lenIndex)
+	if db.lenZeroComplement != nil {
+		fieldIndexBoolSlicePool.Put(db.lenZeroComplement)
+	}
+	db.index = fieldIndexStorageSlicePool.Get()
+	db.index.SetLen(len(db.indexedFieldAccess))
+	db.nilIndex = fieldIndexStorageSlicePool.Get()
+	db.nilIndex.SetLen(len(db.indexedFieldAccess))
+	db.lenIndex = fieldIndexStorageSlicePool.Get()
+	db.lenIndex.SetLen(len(db.indexedFieldAccess))
+	for _, acc := range db.indexedFieldAccess {
+		if storage, ok := indexes[acc.name]; ok {
+			db.index.Set(acc.ordinal, storage)
+			delete(indexes, acc.name)
+		}
+		if storage, ok := nilIndexes[acc.name]; ok {
+			db.nilIndex.Set(acc.ordinal, storage)
+			delete(nilIndexes, acc.name)
+		}
+		if storage, ok := lenIndexes[acc.name]; ok {
+			db.lenIndex.Set(acc.ordinal, storage)
+			delete(lenIndexes, acc.name)
+		}
+	}
+	releaseFieldIndexStorageMapOwned(indexes)
+	releaseFieldIndexStorageMapOwned(nilIndexes)
+	releaseFieldIndexStorageMapOwned(lenIndexes)
+	db.lenZeroComplement = detectLenZeroComplement(db.lenIndex, db.indexedFieldAccess)
 
 	lenLoaded := len(skipFields) == len(db.fields)
 	if lenLoaded && !universe.IsEmpty() {
@@ -1329,9 +1376,13 @@ func (db *DB[K, V]) loadIndexPayload(reader *bufio.Reader) (map[string]struct{},
 			if _, ok := skipFields[name]; !ok {
 				continue
 			}
-			s, ok := lenIndexes[name]
-			base := s.flatSlice()
-			if !ok || base == nil || len(*base) == 0 {
+			acc, ok := db.indexedFieldByName[name]
+			if !ok {
+				lenLoaded = false
+				break
+			}
+			base := db.lenIndex.Get(acc.ordinal).flatSlice()
+			if base == nil || len(*base) == 0 {
 				lenLoaded = false
 				break
 			}
@@ -1341,19 +1392,23 @@ func (db *DB[K, V]) loadIndexPayload(reader *bufio.Reader) (map[string]struct{},
 	return skipFields, plannerStats, lenLoaded, nil
 }
 
-func detectLenZeroComplement(indexes map[string]fieldIndexStorage) map[string]bool {
-	if len(indexes) == 0 {
-		return make(map[string]bool)
+func detectLenZeroComplement(indexes *pooled.SliceBuf[fieldIndexStorage], access []indexedFieldAccessor) *pooled.SliceBuf[bool] {
+	out := fieldIndexBoolSlicePool.Get()
+	out.SetLen(len(access))
+	if indexes == nil {
+		return out
 	}
-	out := make(map[string]bool, len(indexes))
-	for f, storage := range indexes {
-		slice := storage.flatSlice()
+	for _, acc := range access {
+		if acc.ordinal >= indexes.Len() {
+			continue
+		}
+		slice := indexes.Get(acc.ordinal).flatSlice()
 		if slice == nil || len(*slice) == 0 {
 			continue
 		}
 		for _, ix := range *slice {
 			if indexKeyEqualsString(ix.Key, lenIndexNonEmptyKey) {
-				out[f] = true
+				out.Set(acc.ordinal, true)
 				break
 			}
 		}
@@ -1483,7 +1538,8 @@ func (db *DB[K, V]) storeIndexPayload(writer *bufio.Writer) error {
 	fieldNames := sortedFieldNames(snap.fieldNameSet())
 
 	if err := writeIndexFamily(writer, fieldNames, func(field string) fieldIndexStorage {
-		return snap.index[field]
+		storage, _ := snap.fieldIndexStorage(field)
+		return storage
 	}); err != nil {
 		return err
 	}
@@ -1491,7 +1547,8 @@ func (db *DB[K, V]) storeIndexPayload(writer *bufio.Writer) error {
 	nilFieldNames := sortedFieldNames(snap.nilFieldNameSet())
 
 	if err := writeIndexFamily(writer, nilFieldNames, func(field string) fieldIndexStorage {
-		return snap.nilIndex[field]
+		acc := snap.indexedFieldByName[field]
+		return snap.nilIndex.Get(acc.ordinal)
 	}); err != nil {
 		return err
 	}
@@ -1499,7 +1556,8 @@ func (db *DB[K, V]) storeIndexPayload(writer *bufio.Writer) error {
 	lenFieldNames := sortedFieldNames(snap.lenFieldNameSet())
 
 	if err := writeIndexFamily(writer, lenFieldNames, func(field string) fieldIndexStorage {
-		return snap.lenIndex[field]
+		acc := snap.indexedFieldByName[field]
+		return snap.lenIndex.Get(acc.ordinal)
 	}); err != nil {
 		return err
 	}
@@ -1558,16 +1616,16 @@ func writeFieldIndexStorage(writer *bufio.Writer, storage fieldIndexStorage) err
 			return fmt.Errorf("encode: writing storage encoding: %w", err)
 		}
 		root := storage.chunked
-		if err := writeUvarint(writer, uint64(len(root.pages))); err != nil {
+		if err := writeUvarint(writer, uint64(root.pages.Len())); err != nil {
 			return fmt.Errorf("encode: writing page count: %w", err)
 		}
-		for i := range root.pages {
-			page := root.pages[i]
-			if err := writeUvarint(writer, uint64(len(page.refs))); err != nil {
+		for i := 0; i < root.pages.Len(); i++ {
+			page := root.pages.Get(i)
+			if err := writeUvarint(writer, uint64(page.refsLen())); err != nil {
 				return fmt.Errorf("encode: writing page refs: %w", err)
 			}
-			for j := range page.refs {
-				if err := writeFieldIndexChunk(writer, page.refs[j].chunk); err != nil {
+			for j := 0; j < page.refsLen(); j++ {
+				if err := writeFieldIndexChunk(writer, page.refAt(j).chunk); err != nil {
 					return err
 				}
 			}
@@ -3105,21 +3163,21 @@ func (o fieldOverlay) newCursor(br overlayRange, desc bool) overlayKeyCursor {
 			c.chunkIdx = pos.chunk
 			c.entryIdx = pos.entry
 			c.pageIdx, c.refIdx = o.chunked.pagePosForChunk(pos.chunk)
-			if c.pageIdx >= len(o.chunked.pages) {
+			if c.pageIdx >= o.chunked.pages.Len() {
 				c.remaining = 0
 				return c
 			}
-			c.chunk = o.chunked.pages[c.pageIdx].refs[c.refIdx].chunk
+			c.chunk = o.chunked.pages.Get(c.pageIdx).refAt(c.refIdx).chunk
 			return c
 		}
 		c.chunkIdx = br.startPos.chunk
 		c.entryIdx = br.startPos.entry
 		c.pageIdx, c.refIdx = o.chunked.pagePosForChunk(br.startPos.chunk)
-		if c.pageIdx >= len(o.chunked.pages) {
+		if c.pageIdx >= o.chunked.pages.Len() {
 			c.remaining = 0
 			return c
 		}
-		c.chunk = o.chunked.pages[c.pageIdx].refs[c.refIdx].chunk
+		c.chunk = o.chunked.pages.Get(c.pageIdx).refAt(c.refIdx).chunk
 		return c
 	}
 	if desc {
@@ -3154,9 +3212,9 @@ func (c *overlayKeyCursor) next() (indexKey, posting.List, bool) {
 							c.chunk = nil
 							return indexKey{}, posting.List{}, false
 						}
-						c.refIdx = len(c.chunked.pages[c.pageIdx].refs) - 1
+						c.refIdx = c.chunked.pages.Get(c.pageIdx).refsLen() - 1
 					}
-					c.chunk = c.chunked.pages[c.pageIdx].refs[c.refIdx].chunk
+					c.chunk = c.chunked.pages.Get(c.pageIdx).refAt(c.refIdx).chunk
 					c.entryIdx = c.chunk.keyCount() - 1
 				}
 			}
@@ -3181,15 +3239,15 @@ func (c *overlayKeyCursor) next() (indexKey, posting.List, bool) {
 			if c.entryIdx >= c.chunk.keyCount() {
 				c.chunkIdx++
 				c.refIdx++
-				if c.refIdx >= len(c.chunked.pages[c.pageIdx].refs) {
+				if c.refIdx >= c.chunked.pages.Get(c.pageIdx).refsLen() {
 					c.pageIdx++
-					if c.pageIdx >= len(c.chunked.pages) {
+					if c.pageIdx >= c.chunked.pages.Len() {
 						c.chunk = nil
 						return indexKey{}, posting.List{}, false
 					}
 					c.refIdx = 0
 				}
-				c.chunk = c.chunked.pages[c.pageIdx].refs[c.refIdx].chunk
+				c.chunk = c.chunked.pages.Get(c.pageIdx).refAt(c.refIdx).chunk
 				c.entryIdx = 0
 			}
 		}

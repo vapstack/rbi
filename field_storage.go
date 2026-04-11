@@ -6,6 +6,7 @@ import (
 	"sync/atomic"
 	"unsafe"
 
+	"github.com/vapstack/rbi/internal/pooled"
 	"github.com/vapstack/rbi/internal/posting"
 )
 
@@ -42,19 +43,19 @@ type fieldIndexChunkRef struct {
 }
 
 type fieldIndexChunkDirPage struct {
-	refs      []fieldIndexChunkRef
-	prefix    []int
-	rowPrefix []uint64
+	refs      *pooled.SliceBuf[fieldIndexChunkRef]
+	prefix    *pooled.SliceBuf[int]
+	rowPrefix *pooled.SliceBuf[uint64]
 }
 
 // fieldIndexChunkedRoot stores immutable directory pages over immutable chunks
 // plus top-level chunk/entry prefixes for fast rank/span calculations.
 type fieldIndexChunkedRoot struct {
 	refs        atomic.Int32
-	pages       []fieldIndexChunkDirPage
-	chunkPrefix []int
-	prefix      []int
-	rowPrefix   []uint64
+	pages       *pooled.SliceBuf[*fieldIndexChunkDirPage]
+	chunkPrefix *pooled.SliceBuf[int]
+	prefix      *pooled.SliceBuf[int]
+	rowPrefix   *pooled.SliceBuf[uint64]
 	keyCount    int
 	chunkCount  int
 }
@@ -71,8 +72,8 @@ type fieldIndexStorage struct {
 }
 
 type fieldIndexChunkBuilder struct {
-	pages       []fieldIndexChunkDirPage
-	pendingRefs []fieldIndexChunkRef
+	pages       *pooled.SliceBuf[*fieldIndexChunkDirPage]
+	pendingRefs *pooled.SliceBuf[fieldIndexChunkRef]
 	total       int
 	chunks      int
 }
@@ -89,6 +90,177 @@ type fieldIndexChunkStreamBuilder struct {
 	pendingRows       uint64
 	pendingNumericKey []uint64
 	pendingStringKeys []indexKey
+}
+
+var fieldIndexChunkRefSlicePool = pooled.Slices[fieldIndexChunkRef]{
+	MinCap: fieldIndexDirPageTargetRefs,
+	Clear:  true,
+}
+
+var fieldIndexChunkDirPagePtrSlicePool = pooled.Slices[*fieldIndexChunkDirPage]{
+	MinCap: 8,
+	Clear:  true,
+}
+
+var fieldIndexStorageSlicePool = pooled.Slices[fieldIndexStorage]{
+	Clear: true,
+}
+
+var fieldIndexBoolSlicePool = pooled.Slices[bool]{
+	Clear: true,
+}
+
+var fieldIndexChunkDirPagePrefixPool = pooled.Slices[int]{
+	MinCap: fieldIndexDirPageTargetRefs + 1,
+}
+
+var fieldIndexChunkDirPageRowPrefixPool = pooled.Slices[uint64]{
+	MinCap: fieldIndexDirPageTargetRefs + 1,
+}
+
+var fieldIndexChunkRootChunkPrefixPool = pooled.Slices[int]{
+	MinCap: 8,
+}
+
+var fieldIndexChunkRootPrefixPool = pooled.Slices[int]{
+	MinCap: 8,
+}
+
+var fieldIndexChunkRootRowPrefixPool = pooled.Slices[uint64]{
+	MinCap: 8,
+}
+
+var fieldIndexChunkDirPagePool = pooled.Pointers[fieldIndexChunkDirPage]{Clear: true}
+
+func newFieldIndexChunkRefBuf(capHint int) *pooled.SliceBuf[fieldIndexChunkRef] {
+	buf := fieldIndexChunkRefSlicePool.Get()
+	if capHint > 0 {
+		buf.Grow(capHint)
+	}
+	return buf
+}
+
+func newFieldIndexChunkDirPageSlice(capHint int) *pooled.SliceBuf[*fieldIndexChunkDirPage] {
+	buf := fieldIndexChunkDirPagePtrSlicePool.Get()
+	if capHint > 0 {
+		buf.Grow(capHint)
+	}
+	return buf
+}
+
+func newFieldIndexChunkDirPageOwned(refs *pooled.SliceBuf[fieldIndexChunkRef]) *fieldIndexChunkDirPage {
+	if refs == nil || refs.Len() == 0 {
+		fieldIndexChunkRefSlicePool.Put(refs)
+		return nil
+	}
+	page := fieldIndexChunkDirPagePool.Get()
+	page.refs = refs
+	page.prefix = fieldIndexChunkDirPagePrefixPool.Get()
+	page.prefix.SetLen(refs.Len() + 1)
+	page.prefix.Set(0, 0)
+	page.rowPrefix = fieldIndexChunkDirPageRowPrefixPool.Get()
+	page.rowPrefix.SetLen(refs.Len() + 1)
+	page.rowPrefix.Set(0, 0)
+
+	total := 0
+	rows := uint64(0)
+	for i := 0; i < refs.Len(); i++ {
+		ref := refs.Get(i)
+		total += ref.chunk.keyCount()
+		rows += ref.chunk.rowCount()
+		page.prefix.Set(i+1, total)
+		page.rowPrefix.Set(i+1, rows)
+	}
+	return page
+}
+
+func newFieldIndexChunkDirPage(refs []fieldIndexChunkRef) *fieldIndexChunkDirPage {
+	if len(refs) == 0 {
+		return nil
+	}
+	buf := newFieldIndexChunkRefBuf(len(refs))
+	buf.AppendAll(refs)
+	return newFieldIndexChunkDirPageOwned(buf)
+}
+
+func (p *fieldIndexChunkDirPage) release() {
+	if p == nil {
+		return
+	}
+	if p.refs != nil {
+		for i := 0; i < p.refs.Len(); i++ {
+			ref := p.refs.Get(i)
+			if ref.chunk != nil {
+				ref.chunk.release()
+			}
+		}
+		fieldIndexChunkRefSlicePool.Put(p.refs)
+		p.refs = nil
+	}
+	if p.prefix != nil {
+		fieldIndexChunkDirPagePrefixPool.Put(p.prefix)
+		p.prefix = nil
+	}
+	if p.rowPrefix != nil {
+		fieldIndexChunkDirPageRowPrefixPool.Put(p.rowPrefix)
+		p.rowPrefix = nil
+	}
+	fieldIndexChunkDirPagePool.Put(p)
+}
+
+func (p *fieldIndexChunkDirPage) refsLen() int {
+	if p == nil || p.refs == nil {
+		return 0
+	}
+	return p.refs.Len()
+}
+
+func (p *fieldIndexChunkDirPage) refAt(i int) fieldIndexChunkRef {
+	if p == nil || p.refs == nil {
+		return fieldIndexChunkRef{}
+	}
+	return p.refs.Get(i)
+}
+
+func (p *fieldIndexChunkDirPage) keyCount() int {
+	if p == nil || p.prefix == nil || p.prefix.Len() == 0 {
+		return 0
+	}
+	return p.prefix.Get(p.prefix.Len() - 1)
+}
+
+func (p *fieldIndexChunkDirPage) prefixAt(i int) int {
+	if p == nil || p.prefix == nil {
+		return 0
+	}
+	return p.prefix.Get(i)
+}
+
+func (p *fieldIndexChunkDirPage) rowPrefixAt(i int) uint64 {
+	if p == nil || p.rowPrefix == nil {
+		return 0
+	}
+	return p.rowPrefix.Get(i)
+}
+
+func (p *fieldIndexChunkDirPage) lastKey() indexKey {
+	if p == nil || p.refs == nil || p.refs.Len() == 0 {
+		return indexKey{}
+	}
+	return p.refs.Get(p.refs.Len() - 1).last
+}
+
+func releaseFieldIndexChunkDirPages(pages *pooled.SliceBuf[*fieldIndexChunkDirPage]) {
+	if pages == nil {
+		return
+	}
+	for i := 0; i < pages.Len(); i++ {
+		page := pages.Get(i)
+		if page != nil {
+			page.release()
+		}
+	}
+	fieldIndexChunkDirPagePtrSlicePool.Put(pages)
 }
 
 func postingRows(posts []posting.List) uint64 {
@@ -230,15 +402,19 @@ func (r *fieldIndexChunkedRoot) release() {
 	if r == nil || r.refs.Add(-1) != 0 {
 		return
 	}
-	for i := range r.pages {
-		page := &r.pages[i]
-		for j := range page.refs {
-			chunk := page.refs[j].chunk
-			if chunk == nil {
-				continue
-			}
-			chunk.release()
-		}
+	releaseFieldIndexChunkDirPages(r.pages)
+	r.pages = nil
+	if r.chunkPrefix != nil {
+		fieldIndexChunkRootChunkPrefixPool.Put(r.chunkPrefix)
+		r.chunkPrefix = nil
+	}
+	if r.prefix != nil {
+		fieldIndexChunkRootPrefixPool.Put(r.prefix)
+		r.prefix = nil
+	}
+	if r.rowPrefix != nil {
+		fieldIndexChunkRootRowPrefixPool.Put(r.rowPrefix)
+		r.rowPrefix = nil
 	}
 }
 
@@ -269,6 +445,29 @@ func releaseFieldIndexStorageMapOwned(m map[string]fieldIndexStorage) {
 	for _, storage := range m {
 		releaseFieldIndexStorageOwned(storage)
 	}
+}
+
+func retainSharedFieldIndexStorageSlots(next, prev *pooled.SliceBuf[fieldIndexStorage]) {
+	if next == nil || prev == nil {
+		return
+	}
+	limit := min(next.Len(), prev.Len())
+	for i := 0; i < limit; i++ {
+		storage := next.Get(i)
+		if storage == prev.Get(i) {
+			storage.retain()
+		}
+	}
+}
+
+func releaseFieldIndexStorageSlotsOwned(slots *pooled.SliceBuf[fieldIndexStorage]) {
+	if slots == nil {
+		return
+	}
+	for i := 0; i < slots.Len(); i++ {
+		releaseFieldIndexStorageOwned(slots.Get(i))
+	}
+	fieldIndexStorageSlicePool.Put(slots)
 }
 
 func newFlatFieldIndexStorageFromPostingMapOwned(m map[string]posting.List, fixed8 bool) fieldIndexStorage {
@@ -764,11 +963,11 @@ func upperBoundIndexEntriesKey(entries []index, key indexKey) int {
 	return lo
 }
 
-func searchChunkPageAfterChunk(prefix []int, chunk int) int {
-	lo, hi := 0, len(prefix)-1
+func searchChunkPageAfterChunk(prefix *pooled.SliceBuf[int], chunk int) int {
+	lo, hi := 0, prefix.Len()-1
 	for lo < hi {
 		mid := (lo + hi) >> 1
-		if prefix[mid+1] > chunk {
+		if prefix.Get(mid+1) > chunk {
 			hi = mid
 		} else {
 			lo = mid + 1
@@ -777,11 +976,11 @@ func searchChunkPageAfterChunk(prefix []int, chunk int) int {
 	return lo
 }
 
-func searchChunkPageAtOrAfterChunk(prefix []int, limit int) int {
-	lo, hi := 0, len(prefix)-1
+func searchChunkPageAtOrAfterChunk(prefix *pooled.SliceBuf[int], limit int) int {
+	lo, hi := 0, prefix.Len()-1
 	for lo < hi {
 		mid := (lo + hi) >> 1
-		if prefix[mid+1] >= limit {
+		if prefix.Get(mid+1) >= limit {
 			hi = mid
 		} else {
 			lo = mid + 1
@@ -790,11 +989,11 @@ func searchChunkPageAtOrAfterChunk(prefix []int, limit int) int {
 	return lo
 }
 
-func searchChunkPageByLastKeyFrom(pages []fieldIndexChunkDirPage, start int, key indexKey) int {
-	lo, hi := start, len(pages)
+func searchChunkPageByLastKeyFrom(pages *pooled.SliceBuf[*fieldIndexChunkDirPage], start int, key indexKey) int {
+	lo, hi := start, pages.Len()
 	for lo < hi {
 		mid := lo + (hi-lo)>>1
-		if compareIndexKeys(pages[mid].lastKey(), key) >= 0 {
+		if compareIndexKeys(pages.Get(mid).lastKey(), key) >= 0 {
 			hi = mid
 		} else {
 			lo = mid + 1
@@ -803,11 +1002,11 @@ func searchChunkPageByLastKeyFrom(pages []fieldIndexChunkDirPage, start int, key
 	return lo
 }
 
-func searchChunkRefByLastKeyFrom(refs []fieldIndexChunkRef, start int, key indexKey) int {
-	lo, hi := start, len(refs)
+func searchChunkRefByLastKeyFrom(page *fieldIndexChunkDirPage, start int, key indexKey) int {
+	lo, hi := start, page.refsLen()
 	for lo < hi {
 		mid := lo + (hi-lo)>>1
-		if compareIndexKeys(refs[mid].last, key) >= 0 {
+		if compareIndexKeys(page.refAt(mid).last, key) >= 0 {
 			hi = mid
 		} else {
 			lo = mid + 1
@@ -873,24 +1072,6 @@ func balancedFieldIndexChunkSize(remaining int) int {
 	return size
 }
 
-func newFieldIndexChunkDirPage(refs []fieldIndexChunkRef) fieldIndexChunkDirPage {
-	prefix := make([]int, len(refs)+1)
-	rowPrefix := make([]uint64, len(refs)+1)
-	total := 0
-	rows := uint64(0)
-	for i := range refs {
-		total += refs[i].chunk.keyCount()
-		rows += refs[i].chunk.rowCount()
-		prefix[i+1] = total
-		rowPrefix[i+1] = rows
-	}
-	return fieldIndexChunkDirPage{
-		refs:      refs,
-		prefix:    prefix,
-		rowPrefix: rowPrefix,
-	}
-}
-
 func retainedFieldIndexChunkRef(ref fieldIndexChunkRef) fieldIndexChunkRef {
 	if ref.chunk != nil {
 		ref.chunk.retain()
@@ -898,54 +1079,35 @@ func retainedFieldIndexChunkRef(ref fieldIndexChunkRef) fieldIndexChunkRef {
 	return ref
 }
 
-func cloneFieldIndexChunkRefSliceRetained(src []fieldIndexChunkRef) []fieldIndexChunkRef {
-	if len(src) == 0 {
+func cloneFieldIndexChunkRefBufRetained(page *fieldIndexChunkDirPage) *pooled.SliceBuf[fieldIndexChunkRef] {
+	if page == nil || page.refsLen() == 0 {
 		return nil
 	}
-	dst := make([]fieldIndexChunkRef, len(src))
-	copy(dst, src)
-	for i := range dst {
-		if dst[i].chunk != nil {
-			dst[i].chunk.retain()
-		}
+	dst := newFieldIndexChunkRefBuf(page.refsLen())
+	dst.SetLen(page.refsLen())
+	for i := 0; i < page.refsLen(); i++ {
+		dst.Set(i, retainedFieldIndexChunkRef(page.refAt(i)))
 	}
 	return dst
 }
 
-func retainFieldIndexChunkDirPage(page fieldIndexChunkDirPage) fieldIndexChunkDirPage {
-	return fieldIndexChunkDirPage{
-		refs:      cloneFieldIndexChunkRefSliceRetained(page.refs),
-		prefix:    page.prefix,
-		rowPrefix: page.rowPrefix,
-	}
+func retainFieldIndexChunkDirPage(page *fieldIndexChunkDirPage) *fieldIndexChunkDirPage {
+	return newFieldIndexChunkDirPageOwned(cloneFieldIndexChunkRefBufRetained(page))
 }
 
-func retainFieldIndexChunkedRootPagesExcept(base *fieldIndexChunkedRoot, skip int) []fieldIndexChunkDirPage {
-	if base == nil || len(base.pages) == 0 {
+func retainFieldIndexChunkedRootPagesExcept(base *fieldIndexChunkedRoot, skip int) *pooled.SliceBuf[*fieldIndexChunkDirPage] {
+	if base == nil || base.pages == nil || base.pages.Len() == 0 {
 		return nil
 	}
-	pages := make([]fieldIndexChunkDirPage, len(base.pages))
-	for i := range base.pages {
+	pages := newFieldIndexChunkDirPageSlice(base.pages.Len())
+	pages.SetLen(base.pages.Len())
+	for i := 0; i < base.pages.Len(); i++ {
 		if i == skip {
 			continue
 		}
-		pages[i] = retainFieldIndexChunkDirPage(base.pages[i])
+		pages.Set(i, retainFieldIndexChunkDirPage(base.pages.Get(i)))
 	}
 	return pages
-}
-
-func (p fieldIndexChunkDirPage) keyCount() int {
-	if len(p.prefix) == 0 {
-		return 0
-	}
-	return p.prefix[len(p.prefix)-1]
-}
-
-func (p fieldIndexChunkDirPage) lastKey() indexKey {
-	if len(p.refs) == 0 {
-		return indexKey{}
-	}
-	return p.refs[len(p.refs)-1].last
 }
 
 func newFieldIndexChunkStreamBuilder(builder *fieldIndexChunkBuilder, numeric bool) fieldIndexChunkStreamBuilder {
@@ -1332,8 +1494,8 @@ func newFieldIndexChunkBuilder(capEntries int) fieldIndexChunkBuilder {
 	chunkCap := max(1, capEntries/fieldIndexChunkTargetEntries+1)
 	pageCap := max(1, chunkCap/fieldIndexDirPageTargetRefs+2)
 	return fieldIndexChunkBuilder{
-		pages:       make([]fieldIndexChunkDirPage, 0, pageCap),
-		pendingRefs: make([]fieldIndexChunkRef, 0, min(chunkCap, fieldIndexDirPageTargetRefs)),
+		pages:       newFieldIndexChunkDirPageSlice(pageCap),
+		pendingRefs: newFieldIndexChunkRefBuf(min(chunkCap, fieldIndexDirPageTargetRefs)),
 	}
 }
 
@@ -1352,11 +1514,11 @@ func (b *fieldIndexChunkBuilder) appendOwnedRef(ref fieldIndexChunkRef) {
 	if b == nil || ref.chunk == nil || ref.chunk.keyCount() == 0 {
 		return
 	}
-	b.pendingRefs = append(b.pendingRefs, ref)
+	b.pendingRefs.Append(ref)
 	size := ref.chunk.keyCount()
 	b.total += size
 	b.chunks++
-	if len(b.pendingRefs) >= fieldIndexDirPageTargetRefs {
+	if b.pendingRefs.Len() >= fieldIndexDirPageTargetRefs {
 		b.flushPendingPage()
 	}
 }
@@ -1367,22 +1529,23 @@ func (b *fieldIndexChunkBuilder) appendRefsRange(root *fieldIndexChunkedRoot, st
 	}
 	startPage, startOff := root.pagePosForChunk(start)
 	endPage, endOff := root.pagePosForChunk(end)
-	if startPage == len(root.pages) {
+	if startPage == root.pages.Len() {
 		return
 	}
+	startPageRef := root.pages.Get(startPage)
 	if startPage == endPage {
-		b.appendRefSlice(root.pages[startPage].refs[startOff:endOff])
+		b.appendRefSlice(startPageRef, startOff, endOff)
 		return
 	}
 	if startOff > 0 {
-		b.appendRefSlice(root.pages[startPage].refs[startOff:])
+		b.appendRefSlice(startPageRef, startOff, startPageRef.refsLen())
 		startPage++
 	}
 	for page := startPage; page < endPage; page++ {
-		b.appendPage(root.pages[page])
+		b.appendPage(root.pages.Get(page))
 	}
 	if endOff > 0 {
-		b.appendRefSlice(root.pages[endPage].refs[:endOff])
+		b.appendRefSlice(root.pages.Get(endPage), 0, endOff)
 	}
 }
 
@@ -1404,67 +1567,105 @@ func (b *fieldIndexChunkBuilder) appendEntries(entries []index) {
 	}
 }
 
-func (b *fieldIndexChunkBuilder) appendRefSlice(refs []fieldIndexChunkRef) {
-	for i := range refs {
-		b.appendOwnedRef(retainedFieldIndexChunkRef(refs[i]))
+func (b *fieldIndexChunkBuilder) appendRefSlice(page *fieldIndexChunkDirPage, start, end int) {
+	if page == nil || start < 0 || end < start || end > page.refsLen() {
+		return
+	}
+	for i := start; i < end; i++ {
+		b.appendOwnedRef(retainedFieldIndexChunkRef(page.refAt(i)))
 	}
 }
 
 func (b *fieldIndexChunkBuilder) flushPendingPage() {
-	if b == nil || len(b.pendingRefs) == 0 {
+	if b == nil || b.pendingRefs == nil || b.pendingRefs.Len() == 0 {
 		return
 	}
-	refs := slices.Clone(b.pendingRefs)
-	b.pages = append(b.pages, newFieldIndexChunkDirPage(refs))
-	b.pendingRefs = b.pendingRefs[:0]
+	page := newFieldIndexChunkDirPageOwned(b.pendingRefs)
+	if page != nil {
+		b.pages.Append(page)
+	}
+	b.pendingRefs = newFieldIndexChunkRefBuf(fieldIndexDirPageTargetRefs)
 }
 
-func (b *fieldIndexChunkBuilder) appendPage(page fieldIndexChunkDirPage) {
-	if b == nil || len(page.refs) == 0 {
+func (b *fieldIndexChunkBuilder) appendPage(page *fieldIndexChunkDirPage) {
+	if b == nil || page == nil || page.refsLen() == 0 {
 		return
 	}
-	b.appendRefSlice(page.refs)
+	b.appendRefSlice(page, 0, page.refsLen())
 }
 
-func (b *fieldIndexChunkBuilder) appendOwnedPage(page fieldIndexChunkDirPage) {
-	if b == nil || len(page.refs) == 0 {
+func (b *fieldIndexChunkBuilder) appendOwnedPage(page *fieldIndexChunkDirPage) {
+	if b == nil || page == nil || page.refsLen() == 0 {
 		return
 	}
-	b.appendOwnedRefSlice(page.refs)
+	if b.pendingRefs != nil && b.pendingRefs.Len() != 0 {
+		b.flushPendingPage()
+	}
+	b.pages.Append(page)
+	b.total += page.keyCount()
+	b.chunks += page.refsLen()
 }
 
 func (b *fieldIndexChunkBuilder) root() *fieldIndexChunkedRoot {
 	if b == nil || b.total == 0 {
+		if b != nil {
+			if b.pendingRefs != nil {
+				fieldIndexChunkRefSlicePool.Put(b.pendingRefs)
+				b.pendingRefs = nil
+			}
+			releaseFieldIndexChunkDirPages(b.pages)
+			b.pages = nil
+		}
 		return nil
 	}
 	b.flushPendingPage()
-
-	return newFieldIndexChunkedRootFromPages(b.pages)
+	pages := b.pages
+	b.pages = nil
+	if b.pendingRefs != nil {
+		fieldIndexChunkRefSlicePool.Put(b.pendingRefs)
+		b.pendingRefs = nil
+	}
+	return newFieldIndexChunkedRootFromOwnedPages(pages)
 }
 
-func newFieldIndexChunkedRootFromPages(pages []fieldIndexChunkDirPage) *fieldIndexChunkedRoot {
+func newFieldIndexChunkedRootFromPages(pages []*fieldIndexChunkDirPage) *fieldIndexChunkedRoot {
 	if len(pages) == 0 {
 		return nil
 	}
-	chunkPrefix := make([]int, len(pages)+1)
-	prefix := make([]int, len(pages)+1)
-	rowPrefix := make([]uint64, len(pages)+1)
+	pageBuf := newFieldIndexChunkDirPageSlice(len(pages))
+	pageBuf.AppendAll(pages)
+	return newFieldIndexChunkedRootFromOwnedPages(pageBuf)
+}
+
+func newFieldIndexChunkedRootFromOwnedPages(pages *pooled.SliceBuf[*fieldIndexChunkDirPage]) *fieldIndexChunkedRoot {
+	if pages == nil || pages.Len() == 0 {
+		return nil
+	}
+	chunkPrefix := fieldIndexChunkRootChunkPrefixPool.Get()
+	chunkPrefix.SetLen(pages.Len() + 1)
+	chunkPrefix.Set(0, 0)
+	prefix := fieldIndexChunkRootPrefixPool.Get()
+	prefix.SetLen(pages.Len() + 1)
+	prefix.Set(0, 0)
+	rowPrefix := fieldIndexChunkRootRowPrefixPool.Get()
+	rowPrefix.SetLen(pages.Len() + 1)
+	rowPrefix.Set(0, 0)
 
 	chunks := 0
 	total := 0
 	rows := uint64(0)
 
-	for i := range pages {
-		chunks += len(pages[i].refs)
-		total += pages[i].keyCount()
-		if len(pages[i].rowPrefix) > 0 {
-			rows += pages[i].rowPrefix[len(pages[i].rowPrefix)-1]
-		}
-		chunkPrefix[i+1] = chunks
-		prefix[i+1] = total
-		rowPrefix[i+1] = rows
+	for i := 0; i < pages.Len(); i++ {
+		page := pages.Get(i)
+		chunks += page.refsLen()
+		total += page.keyCount()
+		rows += page.rowPrefixAt(page.refsLen())
+		chunkPrefix.Set(i+1, chunks)
+		prefix.Set(i+1, total)
+		rowPrefix.Set(i+1, rows)
 	}
 	if total == 0 {
+		releaseFieldIndexChunkDirPages(pages)
 		return nil
 	}
 	root := &fieldIndexChunkedRoot{
@@ -1493,9 +1694,10 @@ func flattenChunkedFieldIndexRoot(r *fieldIndexChunkedRoot) *[]index {
 		return nil
 	}
 	out := make([]index, 0, r.keyCount)
-	for i := range r.pages {
-		for j := range r.pages[i].refs {
-			chunk := r.pages[i].refs[j].chunk
+	for i := 0; i < r.pages.Len(); i++ {
+		page := r.pages.Get(i)
+		for j := 0; j < page.refsLen(); j++ {
+			chunk := page.refAt(j).chunk
 			for k := 0; k < chunk.keyCount(); k++ {
 				out = append(out, index{
 					Key: chunk.keyAt(k),
@@ -1586,22 +1788,25 @@ func (r *fieldIndexChunkedRoot) prevPos(end fieldIndexChunkPos) (fieldIndexChunk
 }
 
 func (r *fieldIndexChunkedRoot) pagePosForChunk(chunk int) (int, int) {
-	if chunk < 0 || chunk >= r.chunkCount || len(r.pages) == 0 {
-		return len(r.pages), 0
+	if r == nil || r.pages == nil || r.pages.Len() == 0 {
+		return 0, 0
+	}
+	if chunk < 0 || chunk >= r.chunkCount {
+		return r.pages.Len(), 0
 	}
 	page := searchChunkPageAfterChunk(r.chunkPrefix, chunk)
-	if page >= len(r.pages) {
-		return len(r.pages), 0
+	if page >= r.pages.Len() {
+		return r.pages.Len(), 0
 	}
-	return page, chunk - r.chunkPrefix[page]
+	return page, chunk - r.chunkPrefix.Get(page)
 }
 
 func (r *fieldIndexChunkedRoot) refAtChunk(chunk int) (fieldIndexChunkRef, bool) {
 	page, off := r.pagePosForChunk(chunk)
-	if page >= len(r.pages) {
+	if r.pages == nil || page >= r.pages.Len() {
 		return fieldIndexChunkRef{}, false
 	}
-	return r.pages[page].refs[off], true
+	return r.pages.Get(page).refAt(off), true
 }
 
 func (r *fieldIndexChunkedRoot) entryPrefixForChunk(limit int) int {
@@ -1612,11 +1817,11 @@ func (r *fieldIndexChunkedRoot) entryPrefixForChunk(limit int) int {
 		return r.keyCount
 	}
 	page := searchChunkPageAtOrAfterChunk(r.chunkPrefix, limit)
-	if page >= len(r.pages) {
+	if r.pages == nil || page >= r.pages.Len() {
 		return r.keyCount
 	}
-	off := limit - r.chunkPrefix[page]
-	return r.prefix[page] + r.pages[page].prefix[off]
+	off := limit - r.chunkPrefix.Get(page)
+	return r.prefix.Get(page) + r.pages.Get(page).prefixAt(off)
 }
 
 func (r *fieldIndexChunkedRoot) rowPrefixForChunk(limit int) uint64 {
@@ -1624,20 +1829,20 @@ func (r *fieldIndexChunkedRoot) rowPrefixForChunk(limit int) uint64 {
 		return 0
 	}
 	if limit >= r.chunkCount {
-		if len(r.rowPrefix) == 0 {
+		if r.rowPrefix == nil || r.rowPrefix.Len() == 0 {
 			return 0
 		}
-		return r.rowPrefix[len(r.rowPrefix)-1]
+		return r.rowPrefix.Get(r.rowPrefix.Len() - 1)
 	}
 	page := searchChunkPageAtOrAfterChunk(r.chunkPrefix, limit)
-	if page >= len(r.pages) {
-		if len(r.rowPrefix) == 0 {
+	if r.pages == nil || page >= r.pages.Len() {
+		if r.rowPrefix == nil || r.rowPrefix.Len() == 0 {
 			return 0
 		}
-		return r.rowPrefix[len(r.rowPrefix)-1]
+		return r.rowPrefix.Get(r.rowPrefix.Len() - 1)
 	}
-	off := limit - r.chunkPrefix[page]
-	return r.rowPrefix[page] + r.pages[page].rowPrefix[off]
+	off := limit - r.chunkPrefix.Get(page)
+	return r.rowPrefix.Get(page) + r.pages.Get(page).rowPrefixAt(off)
 }
 
 func (r *fieldIndexChunkedRoot) chunkRowsRange(start, end int) uint64 {
@@ -1696,22 +1901,23 @@ func (r *fieldIndexChunkedRoot) posForRank(rank int) fieldIndexChunkPos {
 	if rank >= r.keyCount {
 		return r.endPos()
 	}
-	page := sort.Search(len(r.pages), func(i int) bool {
-		return r.prefix[i+1] > rank
+	page := sort.Search(r.pages.Len(), func(i int) bool {
+		return r.prefix.Get(i+1) > rank
 	})
-	if page >= len(r.pages) {
+	if page >= r.pages.Len() {
 		return r.endPos()
 	}
-	localRank := rank - r.prefix[page]
-	refIdx := sort.Search(len(r.pages[page].refs), func(i int) bool {
-		return r.pages[page].prefix[i+1] > localRank
+	pageRef := r.pages.Get(page)
+	localRank := rank - r.prefix.Get(page)
+	refIdx := sort.Search(pageRef.refsLen(), func(i int) bool {
+		return pageRef.prefixAt(i+1) > localRank
 	})
-	if refIdx >= len(r.pages[page].refs) {
+	if refIdx >= pageRef.refsLen() {
 		return r.endPos()
 	}
 	return fieldIndexChunkPos{
-		chunk: r.chunkPrefix[page] + refIdx,
-		entry: localRank - r.pages[page].prefix[refIdx],
+		chunk: r.chunkPrefix.Get(page) + refIdx,
+		entry: localRank - pageRef.prefixAt(refIdx),
 	}
 }
 
@@ -1719,150 +1925,155 @@ func (r *fieldIndexChunkedRoot) lowerBoundPos(key string) (fieldIndexChunkPos, i
 	if r == nil || r.chunkCount == 0 {
 		return fieldIndexChunkPos{}, 0
 	}
-	page := sort.Search(len(r.pages), func(i int) bool {
-		return compareIndexKeyString(r.pages[i].lastKey(), key) >= 0
+	page := sort.Search(r.pages.Len(), func(i int) bool {
+		return compareIndexKeyString(r.pages.Get(i).lastKey(), key) >= 0
 	})
-	if page >= len(r.pages) {
+	if page >= r.pages.Len() {
 		return r.endPos(), r.keyCount
 	}
-	refs := r.pages[page].refs
-	refIdx := sort.Search(len(refs), func(i int) bool {
-		return compareIndexKeyString(refs[i].last, key) >= 0
+	pageRef := r.pages.Get(page)
+	refIdx := sort.Search(pageRef.refsLen(), func(i int) bool {
+		return compareIndexKeyString(pageRef.refAt(i).last, key) >= 0
 	})
-	if refIdx >= len(refs) {
+	if refIdx >= pageRef.refsLen() {
 		return r.endPos(), r.keyCount
 	}
-	chunk := refs[refIdx].chunk
+	ref := pageRef.refAt(refIdx)
+	chunk := ref.chunk
 	entryIdx := lowerBoundFieldIndexChunk(chunk, key)
-	rank := r.prefix[page] + r.pages[page].prefix[refIdx] + entryIdx
+	rank := r.prefix.Get(page) + pageRef.prefixAt(refIdx) + entryIdx
 	if entryIdx >= chunk.keyCount() {
-		nextChunk := r.chunkPrefix[page] + refIdx + 1
+		nextChunk := r.chunkPrefix.Get(page) + refIdx + 1
 		if nextChunk >= r.chunkCount {
 			return r.endPos(), r.keyCount
 		}
 		return fieldIndexChunkPos{chunk: nextChunk}, rank
 	}
-	return fieldIndexChunkPos{chunk: r.chunkPrefix[page] + refIdx, entry: entryIdx}, rank
+	return fieldIndexChunkPos{chunk: r.chunkPrefix.Get(page) + refIdx, entry: entryIdx}, rank
 }
 
 func (r *fieldIndexChunkedRoot) upperBoundPos(key string) (fieldIndexChunkPos, int) {
 	if r == nil || r.chunkCount == 0 {
 		return fieldIndexChunkPos{}, 0
 	}
-	page := sort.Search(len(r.pages), func(i int) bool {
-		return compareIndexKeyString(r.pages[i].lastKey(), key) > 0
+	page := sort.Search(r.pages.Len(), func(i int) bool {
+		return compareIndexKeyString(r.pages.Get(i).lastKey(), key) > 0
 	})
-	if page >= len(r.pages) {
+	if page >= r.pages.Len() {
 		return r.endPos(), r.keyCount
 	}
-	refs := r.pages[page].refs
-	refIdx := sort.Search(len(refs), func(i int) bool {
-		return compareIndexKeyString(refs[i].last, key) > 0
+	pageRef := r.pages.Get(page)
+	refIdx := sort.Search(pageRef.refsLen(), func(i int) bool {
+		return compareIndexKeyString(pageRef.refAt(i).last, key) > 0
 	})
-	if refIdx >= len(refs) {
+	if refIdx >= pageRef.refsLen() {
 		return r.endPos(), r.keyCount
 	}
-	chunk := refs[refIdx].chunk
+	ref := pageRef.refAt(refIdx)
+	chunk := ref.chunk
 	entryIdx := upperBoundFieldIndexChunk(chunk, key)
-	rank := r.prefix[page] + r.pages[page].prefix[refIdx] + entryIdx
+	rank := r.prefix.Get(page) + pageRef.prefixAt(refIdx) + entryIdx
 	if entryIdx >= chunk.keyCount() {
-		nextChunk := r.chunkPrefix[page] + refIdx + 1
+		nextChunk := r.chunkPrefix.Get(page) + refIdx + 1
 		if nextChunk >= r.chunkCount {
 			return r.endPos(), r.keyCount
 		}
 		return fieldIndexChunkPos{chunk: nextChunk}, rank
 	}
-	return fieldIndexChunkPos{chunk: r.chunkPrefix[page] + refIdx, entry: entryIdx}, rank
+	return fieldIndexChunkPos{chunk: r.chunkPrefix.Get(page) + refIdx, entry: entryIdx}, rank
 }
 
 func (r *fieldIndexChunkedRoot) lowerBoundPosKey(key indexKey) (fieldIndexChunkPos, int) {
 	if r == nil || r.chunkCount == 0 {
 		return fieldIndexChunkPos{}, 0
 	}
-	page := sort.Search(len(r.pages), func(i int) bool {
-		return compareIndexKeys(r.pages[i].lastKey(), key) >= 0
+	page := sort.Search(r.pages.Len(), func(i int) bool {
+		return compareIndexKeys(r.pages.Get(i).lastKey(), key) >= 0
 	})
-	if page >= len(r.pages) {
+	if page >= r.pages.Len() {
 		return r.endPos(), r.keyCount
 	}
-	refs := r.pages[page].refs
-	refIdx := sort.Search(len(refs), func(i int) bool {
-		return compareIndexKeys(refs[i].last, key) >= 0
+	pageRef := r.pages.Get(page)
+	refIdx := sort.Search(pageRef.refsLen(), func(i int) bool {
+		return compareIndexKeys(pageRef.refAt(i).last, key) >= 0
 	})
-	if refIdx >= len(refs) {
+	if refIdx >= pageRef.refsLen() {
 		return r.endPos(), r.keyCount
 	}
-	chunk := refs[refIdx].chunk
+	ref := pageRef.refAt(refIdx)
+	chunk := ref.chunk
 	entryIdx := lowerBoundFieldIndexChunkKey(chunk, key)
-	rank := r.prefix[page] + r.pages[page].prefix[refIdx] + entryIdx
+	rank := r.prefix.Get(page) + pageRef.prefixAt(refIdx) + entryIdx
 	if entryIdx >= chunk.keyCount() {
-		nextChunk := r.chunkPrefix[page] + refIdx + 1
+		nextChunk := r.chunkPrefix.Get(page) + refIdx + 1
 		if nextChunk >= r.chunkCount {
 			return r.endPos(), r.keyCount
 		}
 		return fieldIndexChunkPos{chunk: nextChunk}, rank
 	}
-	return fieldIndexChunkPos{chunk: r.chunkPrefix[page] + refIdx, entry: entryIdx}, rank
+	return fieldIndexChunkPos{chunk: r.chunkPrefix.Get(page) + refIdx, entry: entryIdx}, rank
 }
 
 func (r *fieldIndexChunkedRoot) upperBoundPosKey(key indexKey) (fieldIndexChunkPos, int) {
 	if r == nil || r.chunkCount == 0 {
 		return fieldIndexChunkPos{}, 0
 	}
-	page := sort.Search(len(r.pages), func(i int) bool {
-		return compareIndexKeys(r.pages[i].lastKey(), key) > 0
+	page := sort.Search(r.pages.Len(), func(i int) bool {
+		return compareIndexKeys(r.pages.Get(i).lastKey(), key) > 0
 	})
-	if page >= len(r.pages) {
+	if page >= r.pages.Len() {
 		return r.endPos(), r.keyCount
 	}
-	refs := r.pages[page].refs
-	refIdx := sort.Search(len(refs), func(i int) bool {
-		return compareIndexKeys(refs[i].last, key) > 0
+	pageRef := r.pages.Get(page)
+	refIdx := sort.Search(pageRef.refsLen(), func(i int) bool {
+		return compareIndexKeys(pageRef.refAt(i).last, key) > 0
 	})
-	if refIdx >= len(refs) {
+	if refIdx >= pageRef.refsLen() {
 		return r.endPos(), r.keyCount
 	}
-	chunk := refs[refIdx].chunk
+	ref := pageRef.refAt(refIdx)
+	chunk := ref.chunk
 	entryIdx := upperBoundFieldIndexChunkKey(chunk, key)
-	rank := r.prefix[page] + r.pages[page].prefix[refIdx] + entryIdx
+	rank := r.prefix.Get(page) + pageRef.prefixAt(refIdx) + entryIdx
 	if entryIdx >= chunk.keyCount() {
-		nextChunk := r.chunkPrefix[page] + refIdx + 1
+		nextChunk := r.chunkPrefix.Get(page) + refIdx + 1
 		if nextChunk >= r.chunkCount {
 			return r.endPos(), r.keyCount
 		}
 		return fieldIndexChunkPos{chunk: nextChunk}, rank
 	}
-	return fieldIndexChunkPos{chunk: r.chunkPrefix[page] + refIdx, entry: entryIdx}, rank
+	return fieldIndexChunkPos{chunk: r.chunkPrefix.Get(page) + refIdx, entry: entryIdx}, rank
 }
 
 func (r *fieldIndexChunkedRoot) lowerBoundPosPrefixUpperBound(upper prefixUpperBound) (fieldIndexChunkPos, int) {
 	if r == nil || r.chunkCount == 0 {
 		return fieldIndexChunkPos{}, 0
 	}
-	page := sort.Search(len(r.pages), func(i int) bool {
-		return compareIndexKeyPrefixUpperBound(r.pages[i].lastKey(), upper) >= 0
+	page := sort.Search(r.pages.Len(), func(i int) bool {
+		return compareIndexKeyPrefixUpperBound(r.pages.Get(i).lastKey(), upper) >= 0
 	})
-	if page >= len(r.pages) {
+	if page >= r.pages.Len() {
 		return r.endPos(), r.keyCount
 	}
-	refs := r.pages[page].refs
-	refIdx := sort.Search(len(refs), func(i int) bool {
-		return compareIndexKeyPrefixUpperBound(refs[i].last, upper) >= 0
+	pageRef := r.pages.Get(page)
+	refIdx := sort.Search(pageRef.refsLen(), func(i int) bool {
+		return compareIndexKeyPrefixUpperBound(pageRef.refAt(i).last, upper) >= 0
 	})
-	if refIdx >= len(refs) {
+	if refIdx >= pageRef.refsLen() {
 		return r.endPos(), r.keyCount
 	}
-	chunk := refs[refIdx].chunk
+	ref := pageRef.refAt(refIdx)
+	chunk := ref.chunk
 	entryIdx := lowerBoundFieldIndexChunkPrefixUpperBound(chunk, upper)
-	rank := r.prefix[page] + r.pages[page].prefix[refIdx] + entryIdx
+	rank := r.prefix.Get(page) + pageRef.prefixAt(refIdx) + entryIdx
 	if entryIdx >= chunk.keyCount() {
-		nextChunk := r.chunkPrefix[page] + refIdx + 1
+		nextChunk := r.chunkPrefix.Get(page) + refIdx + 1
 		if nextChunk >= r.chunkCount {
 			return r.endPos(), r.keyCount
 		}
 		return fieldIndexChunkPos{chunk: nextChunk}, rank
 	}
-	return fieldIndexChunkPos{chunk: r.chunkPrefix[page] + refIdx, entry: entryIdx}, rank
+	return fieldIndexChunkPos{chunk: r.chunkPrefix.Get(page) + refIdx, entry: entryIdx}, rank
 }
 
 // prefixRangeEndPos returns the first position after prefix when start/startRank
@@ -1885,20 +2096,21 @@ func (r *fieldIndexChunkedRoot) lookupPostingRetained(key string) posting.List {
 	if r == nil || r.chunkCount == 0 {
 		return posting.List{}
 	}
-	page := sort.Search(len(r.pages), func(i int) bool {
-		return compareIndexKeyString(r.pages[i].lastKey(), key) >= 0
+	page := sort.Search(r.pages.Len(), func(i int) bool {
+		return compareIndexKeyString(r.pages.Get(i).lastKey(), key) >= 0
 	})
-	if page >= len(r.pages) {
+	if page >= r.pages.Len() {
 		return posting.List{}
 	}
-	refs := r.pages[page].refs
-	refIdx := sort.Search(len(refs), func(i int) bool {
-		return compareIndexKeyString(refs[i].last, key) >= 0
+	pageRef := r.pages.Get(page)
+	refIdx := sort.Search(pageRef.refsLen(), func(i int) bool {
+		return compareIndexKeyString(pageRef.refAt(i).last, key) >= 0
 	})
-	if refIdx >= len(refs) {
+	if refIdx >= pageRef.refsLen() {
 		return posting.List{}
 	}
-	chunk := refs[refIdx].chunk
+	ref := pageRef.refAt(refIdx)
+	chunk := ref.chunk
 	entryIdx := lowerBoundFieldIndexChunk(chunk, key)
 	if entryIdx >= chunk.keyCount() || !indexKeyEqualsString(chunk.keyAt(entryIdx), key) {
 		return posting.List{}
@@ -1938,17 +2150,17 @@ func (r *fieldIndexChunkedRoot) touchChunkIndexFrom(start int, key indexKey) int
 	}
 	startPage, startOff := r.pagePosForChunk(start)
 	page := searchChunkPageByLastKeyFrom(r.pages, startPage, key)
-	if page >= len(r.pages) {
+	if r.pages == nil || page >= r.pages.Len() {
 		return r.chunkCount - 1
 	}
-	refs := r.pages[page].refs
+	pageRef := r.pages.Get(page)
 	refStart := 0
 	if page == startPage {
 		refStart = startOff
 	}
-	refIdx := searchChunkRefByLastKeyFrom(refs, refStart, key)
-	if refIdx >= len(refs) {
-		return r.chunkPrefix[page+1] - 1
+	refIdx := searchChunkRefByLastKeyFrom(pageRef, refStart, key)
+	if refIdx >= pageRef.refsLen() {
+		return r.chunkPrefix.Get(page+1) - 1
 	}
-	return r.chunkPrefix[page] + refIdx
+	return r.chunkPrefix.Get(page) + refIdx
 }

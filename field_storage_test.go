@@ -48,7 +48,7 @@ func fieldStorageInsertedTestKey(pos int, fixed8 bool) indexKey {
 }
 
 func fieldStorageSingleChunkRoot(ref fieldIndexChunkRef) *fieldIndexChunkedRoot {
-	return newFieldIndexChunkedRootFromPages([]fieldIndexChunkDirPage{newFieldIndexChunkDirPage([]fieldIndexChunkRef{ref})})
+	return newFieldIndexChunkedRootFromPages([]*fieldIndexChunkDirPage{newFieldIndexChunkDirPage([]fieldIndexChunkRef{ref})})
 }
 
 func TestFlattenChunkedFieldIndexRoot_RoundTrip(t *testing.T) {
@@ -238,7 +238,7 @@ func TestNewFieldIndexChunkRefsWithInsertedEntry_OwnsUntouchedPostings(t *testin
 
 			replRoot := fieldStorageSingleChunkRoot(replRefs[0])
 			if len(replRefs) > 1 {
-				replRoot = newFieldIndexChunkedRootFromPages([]fieldIndexChunkDirPage{newFieldIndexChunkDirPage(replRefs)})
+				replRoot = newFieldIndexChunkedRootFromPages([]*fieldIndexChunkDirPage{newFieldIndexChunkDirPage(replRefs)})
 			}
 			replStorage := newChunkedFieldIndexStorage(replRoot)
 
@@ -378,12 +378,12 @@ func TestApplySingleFieldPostingDiffChunked_RebalancesOversizedDirectoryPagesAft
 		chunk: splitChunk,
 	})
 
-	root := newFieldIndexChunkedRootFromPages([]fieldIndexChunkDirPage{newFieldIndexChunkDirPage(refs)})
+	root := newFieldIndexChunkedRootFromPages([]*fieldIndexChunkDirPage{newFieldIndexChunkDirPage(refs)})
 	if root == nil {
 		t.Fatalf("expected chunked root")
 	}
-	if len(root.pages) != 1 || len(root.pages[0].refs) != fieldIndexDirPageTargetRefs {
-		t.Fatalf("expected exactly one full directory page, got pages=%d refs=%d", len(root.pages), len(root.pages[0].refs))
+	if root.pages.Len() != 1 || root.pages.Get(0).refsLen() != fieldIndexDirPageTargetRefs {
+		t.Fatalf("expected exactly one full directory page, got pages=%d refs=%d", root.pages.Len(), root.pages.Get(0).refsLen())
 	}
 
 	insertKey := indexKeyFromU64(splitChunkBase + 2)
@@ -399,12 +399,12 @@ func TestApplySingleFieldPostingDiffChunked_RebalancesOversizedDirectoryPagesAft
 	if got.chunked.chunkCount != fieldIndexDirPageTargetRefs+1 {
 		t.Fatalf("unexpected chunk count after split: got=%d want=%d", got.chunked.chunkCount, fieldIndexDirPageTargetRefs+1)
 	}
-	if len(got.chunked.pages) < 2 {
-		t.Fatalf("expected split to rebalance into multiple pages, got %d", len(got.chunked.pages))
+	if got.chunked.pages.Len() < 2 {
+		t.Fatalf("expected split to rebalance into multiple pages, got %d", got.chunked.pages.Len())
 	}
-	for i := range got.chunked.pages {
-		if len(got.chunked.pages[i].refs) > fieldIndexDirPageTargetRefs {
-			t.Fatalf("page %d exceeds ref bound: got=%d want<=%d", i, len(got.chunked.pages[i].refs), fieldIndexDirPageTargetRefs)
+	for i := 0; i < got.chunked.pages.Len(); i++ {
+		if got.chunked.pages.Get(i).refsLen() > fieldIndexDirPageTargetRefs {
+			t.Fatalf("page %d exceeds ref bound: got=%d want<=%d", i, got.chunked.pages.Get(i).refsLen(), fieldIndexDirPageTargetRefs)
 		}
 	}
 

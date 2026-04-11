@@ -223,15 +223,20 @@ func initSnapshotFieldInsertStateHints(states []snapshotFieldInsertState, access
 	for i := range access {
 		acc := access[i]
 		state := &states[i]
-		indexHint := snapshotFieldStorageHint(prev.index[acc.name], batchHint)
+		var indexHint int
+		if prev.index != nil && acc.ordinal < prev.index.Len() {
+			indexHint = snapshotFieldStorageHint(prev.index.Get(acc.ordinal), batchHint)
+		}
 		if acc.field != nil && acc.field.KeyKind == fieldWriteKeysOrderedU64 {
 			state.fixedHint = indexHint
 		} else {
 			state.indexHint = indexHint
 		}
-		state.nilsHint = snapshotFieldStorageHint(prev.nilIndex[acc.name], batchHint)
-		if acc.field != nil && acc.field.Slice {
-			state.lengthsHint = snapshotFieldStorageHint(prev.lenIndex[acc.name], batchHint)
+		if prev.nilIndex != nil && acc.ordinal < prev.nilIndex.Len() {
+			state.nilsHint = snapshotFieldStorageHint(prev.nilIndex.Get(acc.ordinal), batchHint)
+		}
+		if acc.field != nil && acc.field.Slice && prev.lenIndex != nil && acc.ordinal < prev.lenIndex.Len() {
+			state.lengthsHint = snapshotFieldStorageHint(prev.lenIndex.Get(acc.ordinal), batchHint)
 		}
 	}
 }

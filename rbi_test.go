@@ -46,6 +46,17 @@ type plannerStatsPartialNextRec struct {
 	Age  int    `db:"age"`
 }
 
+type lenZeroComplementPartialBaseRec struct {
+	Name string   `db:"name"`
+	Tags []string `db:"tags"`
+}
+
+type lenZeroComplementPartialNextRec struct {
+	Name string   `db:"name"`
+	Tags []string `db:"tags"`
+	Age  int      `db:"age"`
+}
+
 type noIndexRec struct {
 	Name string `rbi:"-"`
 	Age  int    `rbi:"-"`
@@ -818,6 +829,95 @@ func TestWrap_PartialPersistedLoad_RefreshesPlannerStats(t *testing.T) {
 	}
 	if stats, ok := got.Fields["age"]; !ok || stats.DistinctKeys == 0 {
 		t.Fatalf("planner age stats=%+v want non-zero rebuilt stats", stats)
+	}
+}
+
+func TestWrap_PartialPersistedLoad_PreservesLenZeroComplementFlags(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "len_zero_partial.db")
+
+	const bucket = "len_zero_partial"
+
+	rawDB, err := bbolt.Open(path, 0o600, nil)
+	if err != nil {
+		t.Fatalf("bbolt.Open: %v", err)
+	}
+
+	db, err := New[uint64, lenZeroComplementPartialBaseRec](rawDB, Options{
+		AnalyzeInterval: -1,
+		BucketName:      bucket,
+	})
+	if err != nil {
+		t.Fatalf("initial New: %v", err)
+	}
+	for i := 1; i <= 90; i++ {
+		rec := &lenZeroComplementPartialBaseRec{
+			Name: fmt.Sprintf("u_%d", i),
+		}
+		if i%5 == 0 {
+			rec.Tags = []string{"go"}
+		}
+		if err := db.Set(uint64(i), rec); err != nil {
+			t.Fatalf("Set(%d): %v", i, err)
+		}
+	}
+	if err := db.RebuildIndex(); err != nil {
+		t.Fatalf("initial RebuildIndex: %v", err)
+	}
+	if !db.isLenZeroComplementField("tags") {
+		t.Fatalf("expected zero-complement flag before partial persisted load")
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("initial Close: %v", err)
+	}
+	if err := rawDB.Close(); err != nil {
+		t.Fatalf("initial raw Close: %v", err)
+	}
+
+	rawDB2, err := bbolt.Open(path, 0o600, nil)
+	if err != nil {
+		t.Fatalf("reopen bbolt.Open: %v", err)
+	}
+	defer func() { _ = rawDB2.Close() }()
+
+	var logBuf bytes.Buffer
+	prevLogWriter := log.Writer()
+	log.SetOutput(&logBuf)
+	defer log.SetOutput(prevLogWriter)
+
+	db2, err := New[uint64, lenZeroComplementPartialNextRec](rawDB2, Options{
+		AnalyzeInterval: -1,
+		BucketName:      bucket,
+	})
+	if err != nil {
+		t.Fatalf("reopen New: %v", err)
+	}
+	defer func() { _ = db2.Close() }()
+
+	gotLog := logBuf.String()
+	if strings.Contains(gotLog, "persisted index unavailable") {
+		t.Fatalf("expected partial persisted load, got log: %q", gotLog)
+	}
+	if strings.Contains(gotLog, "rbi: rebuilding index from bbolt") {
+		t.Fatalf("expected partial rebuild with reused persisted fields, got log: %q", gotLog)
+	}
+
+	if !db2.isLenZeroComplementField("tags") {
+		t.Fatalf("expected zero-complement flag for loaded tags len index after partial load")
+	}
+
+	want := make([]uint64, 0, 72)
+	for i := 1; i <= 90; i++ {
+		if i%5 != 0 {
+			want = append(want, uint64(i))
+		}
+	}
+	got, err := db2.QueryKeys(qx.Query(qx.EQ("tags", []string{})))
+	if err != nil {
+		t.Fatalf("QueryKeys(empty tags): %v", err)
+	}
+	if !slices.Equal(got, want) {
+		t.Fatalf("unexpected empty-tags result after partial load: got=%v want=%v", got, want)
 	}
 }
 

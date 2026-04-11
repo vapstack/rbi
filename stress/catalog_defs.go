@@ -197,8 +197,16 @@ func defaultStressClassSpecs() []stressClassSpec {
 				Name:           ClassWriteFast,
 				Role:           RoleWrite,
 				DefaultWorkers: 128,
+				Queries: []StressQueryInfo{
+					{Name: "write_touch_last_seen", Weight: 1},
+				},
 			},
-			run: runWriteTouchLastSeen,
+			queries: []stressQuerySpec{
+				{
+					info: StressQueryInfo{Name: "write_touch_last_seen", Weight: 1},
+					run:  runWriteTouchLastSeen,
+				},
+			},
 		},
 		{
 			info: StressClassInfo{

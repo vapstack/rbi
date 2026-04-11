@@ -363,11 +363,7 @@ func New[K ~uint64 | ~string, V any](bolt *bbolt.DB, options Options, execOpts .
 		strmap: newStrMapper(0, defaultSnapshotStrMapCompactDepth),
 		bucket: []byte(vname),
 
-		fields:            make(map[string]*field),
-		index:             make(map[string]fieldIndexStorage),
-		nilIndex:          make(map[string]fieldIndexStorage),
-		lenIndex:          make(map[string]fieldIndexStorage),
-		lenZeroComplement: make(map[string]bool),
+		fields: make(map[string]*field),
 
 		universe: posting.List{},
 
@@ -416,6 +412,15 @@ func New[K ~uint64 | ~string, V any](bolt *bbolt.DB, options Options, execOpts .
 		db.nilIndex = nil
 		db.lenIndex = nil
 		db.lenZeroComplement = nil
+	} else {
+		db.index = fieldIndexStorageSlicePool.Get()
+		db.index.SetLen(len(db.indexedFieldAccess))
+		db.nilIndex = fieldIndexStorageSlicePool.Get()
+		db.nilIndex.SetLen(len(db.indexedFieldAccess))
+		db.lenIndex = fieldIndexStorageSlicePool.Get()
+		db.lenIndex.SetLen(len(db.indexedFieldAccess))
+		db.lenZeroComplement = fieldIndexBoolSlicePool.Get()
+		db.lenZeroComplement.SetLen(len(db.indexedFieldAccess))
 	}
 	db.initBatcher()
 
@@ -831,10 +836,10 @@ type (
 		indexedFieldAccess   []indexedFieldAccessor
 		indexedFieldByName   map[string]indexedFieldAccessor
 		uniqueFieldAccessors []indexedFieldAccessor
-		index                map[string]fieldIndexStorage
-		nilIndex             map[string]fieldIndexStorage
-		lenIndex             map[string]fieldIndexStorage
-		lenZeroComplement    map[string]bool
+		index                *pooled.SliceBuf[fieldIndexStorage]
+		nilIndex             *pooled.SliceBuf[fieldIndexStorage]
+		lenIndex             *pooled.SliceBuf[fieldIndexStorage]
+		lenZeroComplement    *pooled.SliceBuf[bool]
 		patchMap             map[string]*field
 		patchFieldAccess     []patchFieldAccessor
 		patchFieldOrdinal    map[string]int
@@ -1345,17 +1350,16 @@ func (db *DB[K, V]) IndexStats() IndexStats {
 	idx.ApproxStructBytes = 0
 	idx.ApproxHeapBytes = 0
 
-	fields := snap.indexedFieldNameSet()
-
-	for name := range fields {
+	for _, acc := range db.indexedFieldAccess {
+		name := acc.name
 		var (
 			unique uint64
 			size   uint64
 			keyLen uint64
 			card   uint64
 		)
-		accumulateIndexStats(newFieldOverlayStorage(snap.index[name]), true, &unique, &size, &keyLen, &card, &idx)
-		accumulateIndexStats(newFieldOverlayStorage(snap.nilIndex[name]), false, &unique, &size, &keyLen, &card, &idx)
+		accumulateIndexStats(newFieldOverlayStorage(snap.index.Get(acc.ordinal)), true, &unique, &size, &keyLen, &card, &idx)
+		accumulateIndexStats(newFieldOverlayStorage(snap.nilIndex.Get(acc.ordinal)), false, &unique, &size, &keyLen, &card, &idx)
 
 		idx.UniqueFieldKeys[name] = unique
 		idx.FieldSize[name] = size
@@ -1634,21 +1638,28 @@ func (db *DB[K, V]) Truncate() error {
 		return fmt.Errorf("advance bucket sequence: %w", err)
 	}
 
-	nextIndex := make(map[string]fieldIndexStorage)
-	nextNilIndex := make(map[string]fieldIndexStorage)
-	nextLenIndex := make(map[string]fieldIndexStorage)
+	nextIndex := fieldIndexStorageSlicePool.Get()
+	nextIndex.SetLen(len(db.indexedFieldAccess))
+	nextNilIndex := fieldIndexStorageSlicePool.Get()
+	nextNilIndex.SetLen(len(db.indexedFieldAccess))
+	nextLenIndex := fieldIndexStorageSlicePool.Get()
+	nextLenIndex.SetLen(len(db.indexedFieldAccess))
+	nextLenZeroComplement := fieldIndexBoolSlicePool.Get()
+	nextLenZeroComplement.SetLen(len(db.indexedFieldAccess))
 	nextUniverse := posting.List{}
 	var nextStrMap *strMapSnapshot
 	if db.strkey {
 		nextStrMap = &strMapSnapshot{}
 	}
 	snap := &indexSnapshot{
-		seq:      seq,
-		index:    nextIndex,
-		nilIndex: nextNilIndex,
-		lenIndex: nextLenIndex,
-		universe: nextUniverse,
-		strmap:   nextStrMap,
+		seq:                seq,
+		index:              nextIndex,
+		nilIndex:           nextNilIndex,
+		lenIndex:           nextLenIndex,
+		lenZeroComplement:  nextLenZeroComplement,
+		indexedFieldByName: db.indexedFieldByName,
+		universe:           nextUniverse,
+		strmap:             nextStrMap,
 	}
 	db.initSnapshotRuntimeCaches(snap)
 	db.stageSnapshot(snap)
@@ -1661,7 +1672,7 @@ func (db *DB[K, V]) Truncate() error {
 	db.index = nextIndex
 	db.nilIndex = nextNilIndex
 	db.lenIndex = nextLenIndex
-	db.lenZeroComplement = make(map[string]bool)
+	db.lenZeroComplement = nextLenZeroComplement
 
 	// Keep previously published snapshots immutable for concurrent readers.
 	db.universe = nextUniverse

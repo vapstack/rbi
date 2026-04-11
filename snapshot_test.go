@@ -11,6 +11,7 @@ import (
 	"unsafe"
 
 	"github.com/vapstack/qx"
+	"github.com/vapstack/rbi/internal/pooled"
 	"github.com/vapstack/rbi/internal/posting"
 )
 
@@ -244,7 +245,7 @@ func TestSnapshot_EmptyBaseBatchSetBuildsDistinctLenIndex(t *testing.T) {
 	}
 
 	s := db.getSnapshot()
-	if s.lenZeroComplement["tags"] {
+	if snapshotTestLenZeroComplementField(s, "tags") {
 		t.Fatalf("unexpected zero-complement mode for balanced empty/non-empty tags")
 	}
 	if !snapshotExtLenContainsID(t, s, "tags", 0, 1) || !snapshotExtLenContainsID(t, s, "tags", 0, 2) {
@@ -333,18 +334,10 @@ func TestSnapshotReleaseOwnedStorage_SkipsLiveSharedFlatRoot(t *testing.T) {
 		index{Key: indexKeyFromString("shared"), IDs: shared},
 	)
 
-	old := &indexSnapshot{
-		seq: 1,
-		index: map[string]fieldIndexStorage{
-			"f": sharedStorage,
-		},
-	}
-	current := &indexSnapshot{
-		seq: 2,
-		index: map[string]fieldIndexStorage{
-			"f": sharedStorage,
-		},
-	}
+	old := snapshotTestNewSnapshot(map[string]fieldIndexStorage{"f": sharedStorage}, nil, nil, nil)
+	old.seq = 1
+	current := snapshotTestNewSnapshot(map[string]fieldIndexStorage{"f": sharedStorage}, nil, nil, nil)
+	current.seq = 2
 	current.retainSharedOwnedStorageFrom(old)
 
 	oldRef := &snapshotRef{snap: old}
@@ -554,12 +547,14 @@ func snapshotExtNilContainsID(tb testing.TB, s *indexSnapshot, field string, id 
 
 func snapshotExtLenContainsID(tb testing.TB, s *indexSnapshot, field string, ln uint64, id uint64) bool {
 	tb.Helper()
-	return newFieldOverlayStorage(s.lenIndex[field]).lookupPostingRetained(uint64ByteStr(ln)).Contains(id)
+	acc := s.indexedFieldByName[field]
+	return newFieldOverlayStorage(s.lenIndex.Get(acc.ordinal)).lookupPostingRetained(uint64ByteStr(ln)).Contains(id)
 }
 
 func snapshotExtLenNonEmptyContainsID(tb testing.TB, s *indexSnapshot, field string, id uint64) bool {
 	tb.Helper()
-	return newFieldOverlayStorage(s.lenIndex[field]).lookupPostingRetained(lenIndexNonEmptyKey).Contains(id)
+	acc := s.indexedFieldByName[field]
+	return newFieldOverlayStorage(s.lenIndex.Get(acc.ordinal)).lookupPostingRetained(lenIndexNonEmptyKey).Contains(id)
 }
 
 func snapshotExtRunConcurrent(n int, fn func(i int)) {
@@ -992,7 +987,7 @@ func TestSnapshotExt_ZeroComplementLenIndexImmutableAcrossPatchToEmpty(t *testin
 		t.Fatalf("expected old snapshot to be pinnable")
 	}
 	defer db.unpinSnapshotRef(s1.seq, ref)
-	if !pinnedS1.lenZeroComplement["tags"] {
+	if !snapshotTestLenZeroComplementField(pinnedS1, "tags") {
 		t.Fatalf("expected zero-complement len index for sparse non-empty tags")
 	}
 	if !snapshotExtLenNonEmptyContainsID(t, pinnedS1, "tags", 1) {
@@ -1792,17 +1787,23 @@ func TestSnapshotExt_InheritNumericRangeBucketCacheCopiesOnlyMatchingStorage(t *
 		},
 	}
 
-	prev := &indexSnapshot{
-		index: map[string]fieldIndexStorage{"age": shared, "score": prevChanged},
-	}
+	prev := snapshotTestNewSnapshot(
+		map[string]fieldIndexStorage{"age": shared, "score": prevChanged},
+		nil,
+		nil,
+		nil,
+	)
 	prev.numericRangeBucketCache = numericRangeBucketCachePool.Get()
 	prev.numericRangeBucketCache.init(2)
 	prev.numericRangeBucketCache.storeSlot("age", 0, ageEntry)
 	prev.numericRangeBucketCache.storeSlot("score", 1, scoreEntry)
 
-	next := &indexSnapshot{
-		index: map[string]fieldIndexStorage{"age": shared, "score": nextChanged},
-	}
+	next := snapshotTestNewSnapshot(
+		map[string]fieldIndexStorage{"age": shared, "score": nextChanged},
+		nil,
+		nil,
+		nil,
+	)
 	next.numericRangeBucketCache = numericRangeBucketCachePool.Get()
 	next.numericRangeBucketCache.init(2)
 	inheritNumericRangeBucketCache(next, prev)
@@ -1832,9 +1833,7 @@ func TestSnapshotExt_InheritNumericRangeBucketCacheSkipsMalformedAndEmptyEntries
 		},
 	}
 
-	prev := &indexSnapshot{
-		index: map[string]fieldIndexStorage{"age": valid},
-	}
+	prev := snapshotTestNewSnapshot(map[string]fieldIndexStorage{"age": valid}, nil, nil, nil)
 	prev.numericRangeBucketCache = numericRangeBucketCachePool.Get()
 	prev.numericRangeBucketCache.init(3)
 	prev.numericRangeBucketCache.storeSlot("", 0, validEntry)
@@ -1847,9 +1846,7 @@ func TestSnapshotExt_InheritNumericRangeBucketCacheSkipsMalformedAndEmptyEntries
 	})
 	prev.numericRangeBucketCache.storeSlot("age", 2, validEntry)
 
-	next := &indexSnapshot{
-		index: map[string]fieldIndexStorage{"age": valid},
-	}
+	next := snapshotTestNewSnapshot(map[string]fieldIndexStorage{"age": valid}, nil, nil, nil)
 	next.numericRangeBucketCache = numericRangeBucketCachePool.Get()
 	next.numericRangeBucketCache.init(3)
 	inheritNumericRangeBucketCache(next, prev)
@@ -2499,4 +2496,90 @@ func TestMaterializedPredCache_InsertNilEntriesAllocsPerRunStayZeroAfterWarmup(t
 	}
 
 	requireZeroAllocsAfterWarmupRBI(t, run)
+}
+
+func snapshotTestIndexedFieldByName(
+	index map[string]fieldIndexStorage,
+	nilIndex map[string]fieldIndexStorage,
+	lenIndex map[string]fieldIndexStorage,
+	lenZeroComplement map[string]bool,
+) map[string]indexedFieldAccessor {
+	keys := make([]string, 0, len(index)+len(nilIndex)+len(lenIndex)+len(lenZeroComplement))
+	seen := make(map[string]struct{}, cap(keys))
+	add := func(name string) {
+		if _, ok := seen[name]; ok {
+			return
+		}
+		seen[name] = struct{}{}
+		keys = append(keys, name)
+	}
+	for name := range index {
+		add(name)
+	}
+	for name := range nilIndex {
+		add(name)
+	}
+	for name := range lenIndex {
+		add(name)
+	}
+	for name := range lenZeroComplement {
+		add(name)
+	}
+	slices.Sort(keys)
+	out := make(map[string]indexedFieldAccessor, len(keys))
+	for i, name := range keys {
+		out[name] = indexedFieldAccessor{
+			ordinal: i,
+			name:    name,
+			field:   &field{Slice: lenIndex[name].keyCount() > 0 || lenZeroComplement[name]},
+		}
+	}
+	return out
+}
+
+func snapshotTestFieldIndexSlots(
+	src map[string]fieldIndexStorage,
+	byName map[string]indexedFieldAccessor,
+) *pooled.SliceBuf[fieldIndexStorage] {
+	out := fieldIndexStorageSlicePool.Get()
+	out.SetLen(len(byName))
+	for name, storage := range src {
+		out.Set(byName[name].ordinal, storage)
+	}
+	return out
+}
+
+func snapshotTestBoolSlots(src map[string]bool, byName map[string]indexedFieldAccessor) *pooled.SliceBuf[bool] {
+	out := fieldIndexBoolSlicePool.Get()
+	out.SetLen(len(byName))
+	for name, value := range src {
+		if value {
+			out.Set(byName[name].ordinal, true)
+		}
+	}
+	return out
+}
+
+func snapshotTestNewSnapshot(
+	index map[string]fieldIndexStorage,
+	nilIndex map[string]fieldIndexStorage,
+	lenIndex map[string]fieldIndexStorage,
+	lenZeroComplement map[string]bool,
+) *indexSnapshot {
+	byName := snapshotTestIndexedFieldByName(index, nilIndex, lenIndex, lenZeroComplement)
+	return &indexSnapshot{
+		index:              snapshotTestFieldIndexSlots(index, byName),
+		nilIndex:           snapshotTestFieldIndexSlots(nilIndex, byName),
+		lenIndex:           snapshotTestFieldIndexSlots(lenIndex, byName),
+		lenZeroComplement:  snapshotTestBoolSlots(lenZeroComplement, byName),
+		indexedFieldByName: byName,
+	}
+}
+
+func snapshotTestLenZeroComplementField(s *indexSnapshot, name string) bool {
+	acc, ok := s.indexedFieldByName[name]
+	if !ok || s.lenZeroComplement == nil || acc.ordinal >= s.lenZeroComplement.Len() {
+		return false
+	}
+	return s.lenZeroComplement.Get(acc.ordinal)
 }

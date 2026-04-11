@@ -18,7 +18,7 @@ func memoryExtraTwoChunkNumericRoot() *fieldIndexChunkedRoot {
 	}
 	right.last = right.chunk.keyAt(right.chunk.keyCount() - 1)
 
-	return newFieldIndexChunkedRootFromPages([]fieldIndexChunkDirPage{
+	return newFieldIndexChunkedRootFromPages([]*fieldIndexChunkDirPage{
 		newFieldIndexChunkDirPage([]fieldIndexChunkRef{left, right}),
 	})
 }
@@ -40,7 +40,7 @@ func memoryExtraFullPageSplitNumericRoot() *fieldIndexChunkedRoot {
 	ref.last = ref.chunk.keyAt(ref.chunk.keyCount() - 1)
 	refs = append(refs, ref)
 
-	return newFieldIndexChunkedRootFromPages([]fieldIndexChunkDirPage{
+	return newFieldIndexChunkedRootFromPages([]*fieldIndexChunkDirPage{
 		newFieldIndexChunkDirPage(refs),
 	})
 }
@@ -439,17 +439,13 @@ func TestMemoryExtra_NumericRangeInheritedBorrowedMutationDetaches(t *testing.T)
 	stored.Release()
 	base.Release()
 
-	prev := &indexSnapshot{
-		index: map[string]fieldIndexStorage{"age": shared},
-	}
+	prev := snapshotTestNewSnapshot(map[string]fieldIndexStorage{"age": shared}, nil, nil, nil)
 	prev.numericRangeBucketCache = numericRangeBucketCachePool.Get()
 	prev.numericRangeBucketCache.init(1)
 	prev.numericRangeBucketCache.storeSlot("age", 0, entry)
 	defer prev.releaseRuntimeCaches()
 
-	next := &indexSnapshot{
-		index: map[string]fieldIndexStorage{"age": shared},
-	}
+	next := snapshotTestNewSnapshot(map[string]fieldIndexStorage{"age": shared}, nil, nil, nil)
 	next.numericRangeBucketCache = numericRangeBucketCachePool.Get()
 	next.numericRangeBucketCache.init(1)
 	defer next.releaseRuntimeCaches()
@@ -738,17 +734,13 @@ func TestMemoryExtra_NumericRangeInheritedReleaseKeepsSiblingSnapshotEntry(t *te
 	stored.Release()
 	base.Release()
 
-	prev := &indexSnapshot{
-		index: map[string]fieldIndexStorage{"age": shared},
-	}
+	prev := snapshotTestNewSnapshot(map[string]fieldIndexStorage{"age": shared}, nil, nil, nil)
 	prev.numericRangeBucketCache = numericRangeBucketCachePool.Get()
 	prev.numericRangeBucketCache.init(1)
 	prev.numericRangeBucketCache.storeSlot("age", 0, entry)
 	defer prev.releaseRuntimeCaches()
 
-	next := &indexSnapshot{
-		index: map[string]fieldIndexStorage{"age": shared},
-	}
+	next := snapshotTestNewSnapshot(map[string]fieldIndexStorage{"age": shared}, nil, nil, nil)
 	next.numericRangeBucketCache = numericRangeBucketCachePool.Get()
 	next.numericRangeBucketCache.init(1)
 	defer next.releaseRuntimeCaches()
@@ -866,8 +858,8 @@ func TestMemoryExtra_ApplySingleFieldPostingDiffChunked_FullPageSplitDoesNotMuta
 	}
 	defer root.release()
 
-	basePages := len(root.pages)
-	baseRefs := len(root.pages[0].refs)
+	basePages := root.pages.Len()
+	baseRefs := root.pages.Get(0).refsLen()
 	baseChunks := root.chunkCount
 	baseKeys := root.keyCount
 	baseRows := root.chunkRowsRange(0, root.chunkCount)
@@ -886,11 +878,11 @@ func TestMemoryExtra_ApplySingleFieldPostingDiffChunked_FullPageSplitDoesNotMuta
 		t.Fatal("expected chunked storage after full-page split insert")
 	}
 
-	if len(root.pages) != basePages {
-		t.Fatalf("base root page count changed after split rebuild: got=%d want=%d", len(root.pages), basePages)
+	if root.pages.Len() != basePages {
+		t.Fatalf("base root page count changed after split rebuild: got=%d want=%d", root.pages.Len(), basePages)
 	}
-	if len(root.pages[0].refs) != baseRefs {
-		t.Fatalf("base root ref count changed after split rebuild: got=%d want=%d", len(root.pages[0].refs), baseRefs)
+	if root.pages.Get(0).refsLen() != baseRefs {
+		t.Fatalf("base root ref count changed after split rebuild: got=%d want=%d", root.pages.Get(0).refsLen(), baseRefs)
 	}
 	if got := root.chunkCount; got != baseChunks {
 		t.Fatalf("base root chunkCount changed after split rebuild: got=%d want=%d", got, baseChunks)

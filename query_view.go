@@ -6,6 +6,7 @@ import (
 	"unsafe"
 
 	"github.com/vapstack/qx"
+	"github.com/vapstack/rbi/internal/pooled"
 	"github.com/vapstack/rbi/internal/posting"
 )
 
@@ -43,7 +44,7 @@ type queryView[K ~string | ~uint64, V any] struct {
 	fields            map[string]*field
 	planner           *planner
 	options           *Options
-	lenZeroComplement map[string]bool
+	lenZeroComplement *pooled.SliceBuf[bool]
 
 	normalizedScalarBoundCacheLen uint8
 	normalizedScalarBoundCache    [normalizedScalarBoundCacheMaxEntries]normalizedScalarBoundCacheEntry
@@ -137,11 +138,19 @@ func (qv *queryView[K, V]) storeNormalizedScalarBound(expr qx.Expr, v reflect.Va
 }
 
 func (qv *queryView[K, V]) snapshotFieldIndexSlice(field string) *[]index {
-	return qv.snap.index[field].flatSlice()
+	acc, ok := qv.root.indexedFieldByName[field]
+	if !ok || qv.snap.index == nil || acc.ordinal >= qv.snap.index.Len() {
+		return nil
+	}
+	return qv.snap.index.Get(acc.ordinal).flatSlice()
 }
 
 func (qv *queryView[K, V]) snapshotLenFieldIndexSlice(field string) *[]index {
-	return qv.snap.lenIndex[field].flatSlice()
+	acc, ok := qv.root.indexedFieldByName[field]
+	if !ok || qv.snap.lenIndex == nil || acc.ordinal >= qv.snap.lenIndex.Len() {
+		return nil
+	}
+	return qv.snap.lenIndex.Get(acc.ordinal).flatSlice()
 }
 
 func (qv *queryView[K, V]) snapshotUniverseCardinality() uint64 {
@@ -153,15 +162,27 @@ func (qv *queryView[K, V]) snapshotUniverseView() posting.List {
 }
 
 func (qv *queryView[K, V]) fieldOverlay(field string) fieldOverlay {
-	return newFieldOverlayStorage(qv.snap.index[field])
+	acc, ok := qv.root.indexedFieldByName[field]
+	if !ok || qv.snap.index == nil || acc.ordinal >= qv.snap.index.Len() {
+		return fieldOverlay{}
+	}
+	return newFieldOverlayStorage(qv.snap.index.Get(acc.ordinal))
 }
 
 func (qv *queryView[K, V]) nilFieldOverlay(field string) fieldOverlay {
-	return newFieldOverlayStorage(qv.snap.nilIndex[field])
+	acc, ok := qv.root.indexedFieldByName[field]
+	if !ok || qv.snap.nilIndex == nil || acc.ordinal >= qv.snap.nilIndex.Len() {
+		return fieldOverlay{}
+	}
+	return newFieldOverlayStorage(qv.snap.nilIndex.Get(acc.ordinal))
 }
 
 func (qv *queryView[K, V]) lenFieldOverlay(field string) fieldOverlay {
-	return newFieldOverlayStorage(qv.snap.lenIndex[field])
+	acc, ok := qv.root.indexedFieldByName[field]
+	if !ok || qv.snap.lenIndex == nil || acc.ordinal >= qv.snap.lenIndex.Len() {
+		return fieldOverlay{}
+	}
+	return newFieldOverlayStorage(qv.snap.lenIndex.Get(acc.ordinal))
 }
 
 func (qv *queryView[K, V]) hasIndexedField(field string) bool {
@@ -204,5 +225,9 @@ func (qv *queryView[K, V]) idFromIdxNoLock(idx uint64) K {
 }
 
 func (qv *queryView[K, V]) isLenZeroComplementField(field string) bool {
-	return qv.lenZeroComplement[field]
+	acc, ok := qv.root.indexedFieldByName[field]
+	if !ok || qv.lenZeroComplement == nil || acc.ordinal >= qv.lenZeroComplement.Len() {
+		return false
+	}
+	return qv.lenZeroComplement.Get(acc.ordinal)
 }

@@ -142,7 +142,7 @@ func TestQueryViewIdxMapping_UsesPinnedStrMapSnapshot(t *testing.T) {
 	}
 	viewSnap := &indexSnapshot{
 		strmap:            snap,
-		lenZeroComplement: map[string]bool{},
+		lenZeroComplement: snapshotTestBoolSlots(nil, nil),
 	}
 	view := &queryView[string, UserBench]{
 		root:              db,
@@ -698,7 +698,7 @@ func TestIndexPersistence_ChunkedFieldRoundTrip(t *testing.T) {
 		}
 	}
 
-	if storage, ok := db.index["name"]; !ok || !storage.isChunked() {
+	if storage, ok := db.getSnapshot().fieldIndexStorage("name"); !ok || !storage.isChunked() {
 		t.Fatalf("expected chunked name index before close")
 	}
 
@@ -719,7 +719,7 @@ func TestIndexPersistence_ChunkedFieldRoundTrip(t *testing.T) {
 		}
 	})
 
-	if storage, ok := db2.index["name"]; !ok || !storage.isChunked() {
+	if storage, ok := db2.getSnapshot().fieldIndexStorage("name"); !ok || !storage.isChunked() {
 		t.Fatalf("expected chunked name index after reopen")
 	}
 
@@ -798,6 +798,55 @@ func TestIndexPersistence_LenZeroComplement_AllEmptyAfterReopen(t *testing.T) {
 	}
 	if !slices.Equal(gotAfterReopen, want) {
 		t.Fatalf("unexpected empty-tags ids after reopen: got=%v want=%v", gotAfterReopen, want)
+	}
+}
+
+func TestRebuildIndex_LenZeroComplementClearsStaleFlags(t *testing.T) {
+	db, _ := openTempDBUint64(t)
+
+	for i := 1; i <= 90; i++ {
+		rec := &Rec{
+			Name:  fmt.Sprintf("u_%d", i),
+			Email: fmt.Sprintf("u_%d@example.test", i),
+			Age:   i,
+		}
+		if i%5 == 0 {
+			rec.Tags = []string{"go"}
+		}
+		if err := db.Set(uint64(i), rec); err != nil {
+			t.Fatalf("Set(%d): %v", i, err)
+		}
+	}
+
+	if err := db.RebuildIndex(); err != nil {
+		t.Fatalf("RebuildIndex(initial): %v", err)
+	}
+	if !db.isLenZeroComplementField("tags") {
+		t.Fatalf("expected zero-complement mode before rebuild transition")
+	}
+
+	for i := 1; i <= 90; i++ {
+		if i%5 == 0 {
+			continue
+		}
+		if err := db.Patch(uint64(i), []Field{{Name: "tags", Value: []string{"go"}}}); err != nil {
+			t.Fatalf("Patch(%d): %v", i, err)
+		}
+	}
+
+	if err := db.RebuildIndex(); err != nil {
+		t.Fatalf("RebuildIndex(after patch): %v", err)
+	}
+	if db.isLenZeroComplementField("tags") {
+		t.Fatalf("expected zero-complement mode to be cleared after rebuild")
+	}
+
+	got, err := db.QueryKeys(qx.Query(qx.EQ("tags", []string{})))
+	if err != nil {
+		t.Fatalf("QueryKeys(empty tags): %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("expected no empty-tags ids after rebuild, got %v", got)
 	}
 }
 
@@ -2477,8 +2526,8 @@ func indexExtMultiPageStringFixture(t *testing.T) indexExtOverlayFixture {
 	}
 
 	fx := indexExtNewSingletonOverlayFixture(t, keys, false)
-	if len(fx.root.pages) < 2 {
-		t.Fatalf("expected multi-page root, got %d pages", len(fx.root.pages))
+	if fx.root.pages.Len() < 2 {
+		t.Fatalf("expected multi-page root, got %d pages", fx.root.pages.Len())
 	}
 	return fx
 }
@@ -3264,7 +3313,8 @@ func TestIndexExt_MultiPageStringDirectoryMatchesFlat(t *testing.T) {
 		ranks[rank] = struct{}{}
 	}
 
-	for _, prefix := range fx.root.prefix {
+	for i := 0; i < fx.root.prefix.Len(); i++ {
+		prefix := fx.root.prefix.Get(i)
 		addRank(prefix - 1)
 		addRank(prefix)
 	}
@@ -3331,7 +3381,8 @@ func TestIndexExt_ApplyFieldPostingDiffChunkedMultiPageBoundariesMatchFlat(t *te
 	addBoundary(0)
 	addBoundary(fieldIndexChunkTargetEntries - 1)
 	addBoundary(fieldIndexChunkTargetEntries)
-	for _, prefix := range fx.root.prefix {
+	for i := 0; i < fx.root.prefix.Len(); i++ {
+		prefix := fx.root.prefix.Get(i)
 		addBoundary(prefix - 1)
 		addBoundary(prefix)
 	}
@@ -3363,8 +3414,8 @@ func TestIndexExt_ApplyFieldPostingDiffChunkedMultiPageBoundariesMatchFlat(t *te
 	}
 	ops = append(ops,
 		indexExtDeltaOp{key: "mp/00-before", add: []uint64{1_100_001}},
-		indexExtDeltaOp{key: fx.keys[fx.root.prefix[1]-1] + "/after", add: []uint64{1_100_002}},
-		indexExtDeltaOp{key: fx.keys[fx.root.prefix[1]] + "/after", add: []uint64{1_100_003}},
+		indexExtDeltaOp{key: fx.keys[fx.root.prefix.Get(1)-1] + "/after", add: []uint64{1_100_002}},
+		indexExtDeltaOp{key: fx.keys[fx.root.prefix.Get(1)] + "/after", add: []uint64{1_100_003}},
 		indexExtDeltaOp{key: "mp/z-after", add: []uint64{1_100_004}},
 	)
 
@@ -3863,7 +3914,11 @@ func TestIndexExt_SnapshotOverlayStableDuringConcurrentWrites(t *testing.T) {
 	}
 	defer db.unpinSnapshotRef(snap.seq, pinnedRef)
 	snap = pinnedSnap
-	oldOV := newFieldOverlayStorage(snap.index["name"])
+	storage, ok := snap.fieldIndexStorage("name")
+	if !ok {
+		t.Fatalf("expected pinned snapshot storage for name")
+	}
+	oldOV := newFieldOverlayStorage(storage)
 	br := oldOV.rangeForBounds(indexExtBoundCase(t, struct {
 		op  qx.Op
 		key string

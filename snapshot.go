@@ -15,13 +15,14 @@ import (
 type indexSnapshot struct {
 	seq uint64
 
-	index             map[string]fieldIndexStorage
-	nilIndex          map[string]fieldIndexStorage
-	lenIndex          map[string]fieldIndexStorage
-	lenZeroComplement map[string]bool
-	universe          posting.List
-	universeOwner     *snapshotPostingOwner
-	strmap            *strMapSnapshot
+	index              *pooled.SliceBuf[fieldIndexStorage]
+	nilIndex           *pooled.SliceBuf[fieldIndexStorage]
+	lenIndex           *pooled.SliceBuf[fieldIndexStorage]
+	lenZeroComplement  *pooled.SliceBuf[bool]
+	indexedFieldByName map[string]indexedFieldAccessor
+	universe           posting.List
+	universeOwner      *snapshotPostingOwner
+	strmap             *strMapSnapshot
 
 	numericRangeBucketCache *numericRangeBucketCache
 
@@ -608,12 +609,16 @@ func inheritNumericRangeBucketCache(next, prev *indexSnapshot) {
 		if slot.field == "" || slot.entry == nil || slot.entry.storage.keyCount() == 0 {
 			continue
 		}
-		nextStorage, ok := next.fieldIndexStorage(slot.field)
-		if !ok || nextStorage != slot.entry.storage {
+		acc, ok := next.indexedFieldByName[slot.field]
+		if !ok || next.index == nil || acc.ordinal >= next.index.Len() {
+			continue
+		}
+		nextStorage := next.index.Get(acc.ordinal)
+		if nextStorage != slot.entry.storage {
 			continue
 		}
 		slot.entry.retain()
-		next.numericRangeBucketCache.storeSlot(slot.field, i, slot.entry)
+		next.numericRangeBucketCache.storeSlot(slot.field, acc.ordinal, slot.entry)
 	}
 }
 
@@ -686,13 +691,14 @@ func (db *DB[K, V]) buildPublishedSnapshotNoLock(seq uint64) *indexSnapshot {
 		strmap = db.strmap.snapshot()
 	}
 	snap := &indexSnapshot{
-		seq:               seq,
-		index:             db.index,
-		nilIndex:          db.nilIndex,
-		lenIndex:          db.lenIndex,
-		lenZeroComplement: db.lenZeroComplement,
-		universe:          db.universe,
-		strmap:            strmap,
+		seq:                seq,
+		index:              db.index,
+		nilIndex:           db.nilIndex,
+		lenIndex:           db.lenIndex,
+		lenZeroComplement:  db.lenZeroComplement,
+		indexedFieldByName: db.indexedFieldByName,
+		universe:           db.universe,
+		strmap:             strmap,
 	}
 	db.initSnapshotRuntimeCaches(snap)
 	return snap
@@ -701,6 +707,12 @@ func (db *DB[K, V]) buildPublishedSnapshotNoLock(seq uint64) *indexSnapshot {
 func (db *DB[K, V]) publishSnapshotNoLock(seq uint64) {
 	prev := db.snapshot.current.Load()
 	snap := db.buildPublishedSnapshotNoLock(seq)
+	if !db.transparent && prev != nil {
+		snap.index = cloneFieldIndexStorageSlots(db.index, len(db.indexedFieldAccess))
+		snap.nilIndex = cloneFieldIndexStorageSlots(db.nilIndex, len(db.indexedFieldAccess))
+		snap.lenIndex = cloneFieldIndexStorageSlots(db.lenIndex, len(db.indexedFieldAccess))
+		snap.lenZeroComplement = cloneFieldIndexBoolSlots(db.lenZeroComplement, len(db.indexedFieldAccess))
+	}
 	snap.retainSharedOwnedStorageFrom(prev)
 	db.finishSnapshotPublishNoLock(snap)
 }
@@ -1083,38 +1095,50 @@ func (db *DB[K, V]) clearCurrentSnapshotCachesForTesting() {
 }
 
 func (s *indexSnapshot) fieldIndexStorage(field string) (fieldIndexStorage, bool) {
-	if s == nil {
+	if s == nil || s.index == nil {
 		return fieldIndexStorage{}, false
 	}
-	storage, ok := s.index[field]
-	return storage, ok
+	acc, ok := s.indexedFieldByName[field]
+	if !ok || acc.ordinal >= s.index.Len() {
+		return fieldIndexStorage{}, false
+	}
+	storage := s.index.Get(acc.ordinal)
+	return storage, storage.keyCount() > 0
 }
 
 func (s *indexSnapshot) nilFieldIndexSlice(field string) *[]index {
-	if s == nil {
+	if s == nil || s.nilIndex == nil {
 		return nil
 	}
-	return s.nilIndex[field].flatSlice()
+	acc, ok := s.indexedFieldByName[field]
+	if !ok || acc.ordinal >= s.nilIndex.Len() {
+		return nil
+	}
+	return s.nilIndex.Get(acc.ordinal).flatSlice()
 }
 
 func (s *indexSnapshot) nilFieldNameSet() map[string]struct{} {
-	if s == nil {
+	if s == nil || s.nilIndex == nil {
 		return nil
 	}
-	fields := make(map[string]struct{}, len(s.nilIndex))
-	for f := range s.nilIndex {
-		fields[f] = struct{}{}
+	fields := make(map[string]struct{}, len(s.indexedFieldByName))
+	for f, acc := range s.indexedFieldByName {
+		if acc.ordinal < s.nilIndex.Len() && s.nilIndex.Get(acc.ordinal).keyCount() > 0 {
+			fields[f] = struct{}{}
+		}
 	}
 	return fields
 }
 
 func (s *indexSnapshot) fieldNameSet() map[string]struct{} {
-	if s == nil {
+	if s == nil || s.index == nil {
 		return nil
 	}
-	fields := make(map[string]struct{}, len(s.index))
-	for f := range s.index {
-		fields[f] = struct{}{}
+	fields := make(map[string]struct{}, len(s.indexedFieldByName))
+	for f, acc := range s.indexedFieldByName {
+		if acc.ordinal < s.index.Len() && s.index.Get(acc.ordinal).keyCount() > 0 {
+			fields[f] = struct{}{}
+		}
 	}
 	return fields
 }
@@ -1131,21 +1155,28 @@ func (s *indexSnapshot) indexedFieldNameSet() map[string]struct{} {
 }
 
 func (s *indexSnapshot) lenFieldNameSet() map[string]struct{} {
-	if s == nil {
+	if s == nil || s.lenIndex == nil {
 		return nil
 	}
-	fields := make(map[string]struct{}, len(s.lenIndex))
-	for f := range s.lenIndex {
+	fields := make(map[string]struct{}, len(s.indexedFieldByName))
+	for f, acc := range s.indexedFieldByName {
+		if !acc.field.Slice || acc.ordinal >= s.lenIndex.Len() || s.lenIndex.Get(acc.ordinal).keyCount() == 0 {
+			continue
+		}
 		fields[f] = struct{}{}
 	}
 	return fields
 }
 
 func (s *indexSnapshot) fieldLookupPostingRetained(field, key string) posting.List {
-	if s == nil {
+	if s == nil || s.index == nil {
 		return posting.List{}
 	}
-	return newFieldOverlayStorage(s.index[field]).lookupPostingRetained(key)
+	acc, ok := s.indexedFieldByName[field]
+	if !ok || acc.ordinal >= s.index.Len() {
+		return posting.List{}
+	}
+	return newFieldOverlayStorage(s.index.Get(acc.ordinal)).lookupPostingRetained(key)
 }
 
 func (db *DB[K, V]) publishSnapshotRef(s *indexSnapshot) *pooled.SliceBuf[*indexSnapshot] {
@@ -1516,22 +1547,26 @@ func (db *DB[K, V]) buildPreparedSnapshotFromEmptyBaseNoLock(seq uint64, prev *i
 		}
 	}
 
-	nextIndex := make(map[string]fieldIndexStorage, len(db.indexedFieldAccess))
+	nextIndex := fieldIndexStorageSlicePool.Get()
+	nextIndex.SetLen(len(db.indexedFieldAccess))
 	for i, acc := range db.indexedFieldAccess {
 		if storage := acc.materializeSnapshotOverlayStorageOwned(&fieldStates[i]); storage.keyCount() > 0 {
-			nextIndex[acc.name] = storage
+			nextIndex.Set(i, storage)
 		}
 	}
 
-	nextNilIndex := make(map[string]fieldIndexStorage, len(db.indexedFieldAccess))
+	nextNilIndex := fieldIndexStorageSlicePool.Get()
+	nextNilIndex.SetLen(len(db.indexedFieldAccess))
 	for i, acc := range db.indexedFieldAccess {
 		if storage := acc.materializeSnapshotOverlayNilStorageOwned(&fieldStates[i]); storage.keyCount() > 0 {
-			nextNilIndex[acc.name] = storage
+			nextNilIndex.Set(i, storage)
 		}
 	}
 
-	nextLenIndex := make(map[string]fieldIndexStorage, len(db.fields))
-	nextLenZeroComplement := make(map[string]bool, len(db.fields))
+	nextLenIndex := fieldIndexStorageSlicePool.Get()
+	nextLenIndex.SetLen(len(db.indexedFieldAccess))
+	nextLenZeroComplement := fieldIndexBoolSlicePool.Get()
+	nextLenZeroComplement.SetLen(len(db.indexedFieldAccess))
 	for i, acc := range db.indexedFieldAccess {
 		if !acc.field.Slice {
 			continue
@@ -1539,20 +1574,21 @@ func (db *DB[K, V]) buildPreparedSnapshotFromEmptyBaseNoLock(seq uint64, prev *i
 		lengths := fieldStates[i].lengths
 		fieldStates[i].lengths = nil
 		storage, useZeroComplement := materializeLenFieldStorageOwned(universe, lengths)
-		nextLenIndex[acc.name] = storage
+		nextLenIndex.Set(i, storage)
 		if useZeroComplement {
-			nextLenZeroComplement[acc.name] = true
+			nextLenZeroComplement.Set(i, true)
 		}
 	}
 
 	snap := &indexSnapshot{
-		seq:               seq,
-		index:             nextIndex,
-		nilIndex:          nextNilIndex,
-		lenIndex:          nextLenIndex,
-		lenZeroComplement: nextLenZeroComplement,
-		universe:          universe,
-		strmap:            db.strmap.snapshot(),
+		seq:                seq,
+		index:              nextIndex,
+		nilIndex:           nextNilIndex,
+		lenIndex:           nextLenIndex,
+		lenZeroComplement:  nextLenZeroComplement,
+		indexedFieldByName: db.indexedFieldByName,
+		universe:           universe,
+		strmap:             db.strmap.snapshot(),
 	}
 	db.initSnapshotRuntimeCaches(snap)
 	inheritNumericRangeBucketCache(snap, prev)
@@ -1720,17 +1756,15 @@ func (db *DB[K, V]) buildPreparedSnapshotInsertOnlyNoLock(seq uint64, prev *inde
 	next := &indexSnapshot{
 		seq: seq,
 
-		index:             prev.index,
-		nilIndex:          prev.nilIndex,
-		lenIndex:          prev.lenIndex,
-		lenZeroComplement: prev.lenZeroComplement,
-		universe:          prev.universe.Clone(),
-		strmap:            db.strmap.snapshot(),
+		index:              cloneFieldIndexStorageSlots(prev.index, len(db.indexedFieldAccess)),
+		nilIndex:           cloneFieldIndexStorageSlots(prev.nilIndex, len(db.indexedFieldAccess)),
+		lenIndex:           cloneFieldIndexStorageSlots(prev.lenIndex, len(db.indexedFieldAccess)),
+		lenZeroComplement:  cloneFieldIndexBoolSlots(prev.lenZeroComplement, len(db.indexedFieldAccess)),
+		indexedFieldByName: db.indexedFieldByName,
+		universe:           prev.universe.Clone(),
+		strmap:             db.strmap.snapshot(),
 	}
 	db.initSnapshotRuntimeCaches(next)
-	indexCloned := false
-	nilIndexCloned := false
-	lenIndexCloned := false
 
 	fieldStates := make([]snapshotFieldInsertState, len(db.indexedFieldAccess))
 	initSnapshotFieldInsertStateHints(fieldStates, db.indexedFieldAccess, prev, len(prepared))
@@ -1741,33 +1775,33 @@ func (db *DB[K, V]) buildPreparedSnapshotInsertOnlyNoLock(seq uint64, prev *inde
 		ptr := unsafe.Pointer(op.newVal)
 
 		for _, acc := range db.indexedFieldAccess {
-			acc.collectSnapshotInsertValue(ptr, op.idx, prev.lenZeroComplement[acc.name], &fieldStates[acc.ordinal])
+			useZeroComplement := prev.lenZeroComplement != nil && acc.ordinal < prev.lenZeroComplement.Len() && prev.lenZeroComplement.Get(acc.ordinal)
+			acc.collectSnapshotInsertValue(ptr, op.idx, useZeroComplement, &fieldStates[acc.ordinal])
 		}
 	}
 
 	changedCount := 0
 	for i, acc := range db.indexedFieldAccess {
-		f := acc.name
-		baseIndex := next.index[f]
+		baseIndex := next.index.Get(i)
 		if storage := acc.mergeSnapshotInsertStorageOwned(baseIndex, &fieldStates[i], true); storage.keyCount() > 0 {
 			if storage != baseIndex {
-				ensureSnapshotFieldIndex(&next.index, prev.index, &indexCloned)[f] = storage
+				next.index.Set(i, storage)
 			}
 		} else if baseIndex.keyCount() > 0 {
-			delete(ensureSnapshotFieldIndex(&next.index, prev.index, &indexCloned), f)
+			next.index.Set(i, fieldIndexStorage{})
 		}
-		baseNil := next.nilIndex[f]
+		baseNil := next.nilIndex.Get(i)
 		if storage := acc.mergeSnapshotInsertNilStorageOwned(baseNil, &fieldStates[i]); storage.keyCount() > 0 {
 			if storage != baseNil {
-				ensureSnapshotFieldIndex(&next.nilIndex, prev.nilIndex, &nilIndexCloned)[f] = storage
+				next.nilIndex.Set(i, storage)
 			}
 		} else if baseNil.keyCount() > 0 {
-			delete(ensureSnapshotFieldIndex(&next.nilIndex, prev.nilIndex, &nilIndexCloned), f)
+			next.nilIndex.Set(i, fieldIndexStorage{})
 		}
 		if fieldStates[i].lengths != nil {
-			baseLen := next.lenIndex[f]
+			baseLen := next.lenIndex.Get(i)
 			if storage := applyLenFieldPostingDiffStorageOwned(baseLen, fieldStates[i].lengths); storage != baseLen {
-				ensureSnapshotFieldIndex(&next.lenIndex, prev.lenIndex, &lenIndexCloned)[f] = storage
+				next.lenIndex.Set(i, storage)
 			}
 			fieldStates[i].lengths = nil
 		}
@@ -1825,17 +1859,6 @@ func (o *snapshotPostingOwner) release() {
 	o.ids.Release()
 }
 
-func retainSharedFieldIndexStorageMap(next, prev map[string]fieldIndexStorage) {
-	if len(next) == 0 || len(prev) == 0 {
-		return
-	}
-	for field, storage := range next {
-		if prev[field] == storage {
-			storage.retain()
-		}
-	}
-}
-
 func (s *indexSnapshot) ensureUniverseOwner() {
 	if s == nil || s.universeOwner != nil {
 		return
@@ -1859,12 +1882,11 @@ func (s *indexSnapshot) retainSharedOwnedStorageFrom(prev *indexSnapshot) {
 	} else {
 		s.ensureUniverseOwner()
 	}
-	if prev == nil {
-		return
+	if prev != nil {
+		retainSharedFieldIndexStorageSlots(s.index, prev.index)
+		retainSharedFieldIndexStorageSlots(s.nilIndex, prev.nilIndex)
+		retainSharedFieldIndexStorageSlots(s.lenIndex, prev.lenIndex)
 	}
-	retainSharedFieldIndexStorageMap(s.index, prev.index)
-	retainSharedFieldIndexStorageMap(s.nilIndex, prev.nilIndex)
-	retainSharedFieldIndexStorageMap(s.lenIndex, prev.lenIndex)
 }
 
 func (s *indexSnapshot) releaseOwnedStorage() {
@@ -1874,7 +1896,14 @@ func (s *indexSnapshot) releaseOwnedStorage() {
 	if s.universeOwner != nil {
 		s.universeOwner.release()
 	}
-	releaseFieldIndexStorageMapOwned(s.index)
-	releaseFieldIndexStorageMapOwned(s.nilIndex)
-	releaseFieldIndexStorageMapOwned(s.lenIndex)
+	releaseFieldIndexStorageSlotsOwned(s.index)
+	releaseFieldIndexStorageSlotsOwned(s.nilIndex)
+	releaseFieldIndexStorageSlotsOwned(s.lenIndex)
+	if s.lenZeroComplement != nil {
+		fieldIndexBoolSlicePool.Put(s.lenZeroComplement)
+	}
+	s.index = nil
+	s.nilIndex = nil
+	s.lenIndex = nil
+	s.lenZeroComplement = nil
 }

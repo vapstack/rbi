@@ -1,8 +1,6 @@
 package rbi
 
 import (
-	"maps"
-	"slices"
 	"sort"
 	"unsafe"
 
@@ -164,16 +162,30 @@ func advanceFieldPostingDiffBaseEntry(base *fieldIndexChunkedRoot, endChunk int,
 	}
 }
 
-func ensureSnapshotFieldIndex(
-	dst *map[string]fieldIndexStorage,
-	src map[string]fieldIndexStorage,
-	cloned *bool,
-) map[string]fieldIndexStorage {
-	if !*cloned {
-		*dst = maps.Clone(src)
-		*cloned = true
+func cloneFieldIndexStorageSlots(src *pooled.SliceBuf[fieldIndexStorage], size int) *pooled.SliceBuf[fieldIndexStorage] {
+	out := fieldIndexStorageSlicePool.Get()
+	out.SetLen(size)
+	if src == nil {
+		return out
 	}
-	return *dst
+	limit := min(size, src.Len())
+	for i := 0; i < limit; i++ {
+		out.Set(i, src.Get(i))
+	}
+	return out
+}
+
+func cloneFieldIndexBoolSlots(src *pooled.SliceBuf[bool], size int) *pooled.SliceBuf[bool] {
+	out := fieldIndexBoolSlicePool.Get()
+	out.SetLen(size)
+	if src == nil {
+		return out
+	}
+	limit := min(size, src.Len())
+	for i := 0; i < limit; i++ {
+		out.Set(i, src.Get(i))
+	}
+	return out
 }
 
 func ensureSnapshotUniverseOwned(next *indexSnapshot, universeOwned *bool) {
@@ -1402,44 +1414,23 @@ func fieldIndexChunkEntriesBorrowed(chunk *fieldIndexChunk) []index {
 	return entries
 }
 
-func applyRowDeltaSuffix(rows []uint64, start int, delta int64) {
-	if delta == 0 {
-		return
-	}
-	if delta > 0 {
-		add := uint64(delta)
-		for i := start; i < len(rows); i++ {
-			rows[i] += add
-		}
-		return
-	}
-	sub := uint64(-delta)
-	for i := start; i < len(rows); i++ {
-		rows[i] -= sub
-	}
-}
-
-func applyIntDeltaSuffix(values []int, start, delta int) {
-	if delta == 0 {
-		return
-	}
-	for i := start; i < len(values); i++ {
-		values[i] += delta
-	}
-}
-
 func rebuildChunkedRootWithOwnedPageRefsReplaced(
 	base *fieldIndexChunkedRoot,
 	page int,
-	replRefs []fieldIndexChunkRef,
+	replRefs *pooled.SliceBuf[fieldIndexChunkRef],
 ) *fieldIndexChunkedRoot {
-	if base == nil || page < 0 || page >= len(base.pages) {
+	if base == nil || base.pages == nil || page < 0 || page >= base.pages.Len() {
+		if replRefs != nil {
+			fieldIndexChunkRefSlicePool.Put(replRefs)
+		}
 		return nil
 	}
-	est := base.keyCount - base.pages[page].keyCount()
-	for i := range replRefs {
-		if replRefs[i].chunk != nil {
-			est += replRefs[i].chunk.keyCount()
+	est := base.keyCount - base.pages.Get(page).keyCount()
+	if replRefs != nil {
+		for i := 0; i < replRefs.Len(); i++ {
+			if chunk := replRefs.Get(i).chunk; chunk != nil {
+				est += chunk.keyCount()
+			}
 		}
 	}
 	if est < 0 {
@@ -1447,13 +1438,43 @@ func rebuildChunkedRootWithOwnedPageRefsReplaced(
 	}
 	builder := newFieldIndexChunkBuilder(est)
 	for i := 0; i < page; i++ {
-		builder.appendOwnedPage(retainFieldIndexChunkDirPage(base.pages[i]))
+		builder.appendPage(base.pages.Get(i))
 	}
-	builder.appendOwnedRefSlice(replRefs)
-	for i := page + 1; i < len(base.pages); i++ {
-		builder.appendOwnedPage(retainFieldIndexChunkDirPage(base.pages[i]))
+	if replRefs != nil {
+		for i := 0; i < replRefs.Len(); i++ {
+			builder.appendOwnedRef(replRefs.Get(i))
+		}
+		fieldIndexChunkRefSlicePool.Put(replRefs)
+	}
+	for i := page + 1; i < base.pages.Len(); i++ {
+		builder.appendPage(base.pages.Get(i))
 	}
 	return builder.root()
+}
+
+func newFieldIndexChunkRefBufWithReplacedRef(
+	page *fieldIndexChunkDirPage,
+	off int,
+	replRefs []fieldIndexChunkRef,
+) *pooled.SliceBuf[fieldIndexChunkRef] {
+	if page == nil || off < 0 || off >= page.refsLen() {
+		return nil
+	}
+	total := page.refsLen() - 1 + len(replRefs)
+	if total <= 0 {
+		return nil
+	}
+	refs := newFieldIndexChunkRefBuf(total)
+	for i := 0; i < off; i++ {
+		refs.Append(retainedFieldIndexChunkRef(page.refAt(i)))
+	}
+	for i := range replRefs {
+		refs.Append(replRefs[i])
+	}
+	for i := off + 1; i < page.refsLen(); i++ {
+		refs.Append(retainedFieldIndexChunkRef(page.refAt(i)))
+	}
+	return refs
 }
 
 func applySingleFieldPostingDiffChunked(base *fieldIndexChunkedRoot, delta keyedBatchPostingDelta) fieldIndexStorage {
@@ -1466,9 +1487,10 @@ func applySingleFieldPostingDiffChunked(base *fieldIndexChunkedRoot, delta keyed
 		return newChunkedFieldIndexStorage(base)
 	}
 	page, off := base.pagePosForChunk(touchIdx)
-	if page >= len(base.pages) {
+	if base.pages == nil || page >= base.pages.Len() {
 		return newChunkedFieldIndexStorage(base)
 	}
+	pageRef := base.pages.Get(page)
 
 	ref, ok := base.refAtChunk(touchIdx)
 	if !ok || ref.chunk == nil {
@@ -1508,44 +1530,14 @@ func applySingleFieldPostingDiffChunked(base *fieldIndexChunkedRoot, delta keyed
 			chunk.stringData = ref.chunk.stringData
 		}
 		chunk.refs.Store(1)
-
-		refs := make([]fieldIndexChunkRef, len(base.pages[page].refs))
-		copy(refs, base.pages[page].refs)
-		for i := range refs {
-			if i == off || refs[i].chunk == nil {
-				continue
-			}
-			refs[i].chunk.retain()
-		}
-		refs[off] = fieldIndexChunkRef{
+		repl := [1]fieldIndexChunkRef{{
 			last:  ref.last,
 			chunk: chunk,
+		}}
+		root := rebuildChunkedRootWithOwnedPageRefsReplaced(base, page, newFieldIndexChunkRefBufWithReplacedRef(pageRef, off, repl[:]))
+		if root == nil {
+			return fieldIndexStorage{}
 		}
-		pageRowPrefix := base.pages[page].rowPrefix
-		if rowsDelta != 0 {
-			pageRowPrefix = slices.Clone(pageRowPrefix)
-			applyRowDeltaSuffix(pageRowPrefix, off+1, rowsDelta)
-		}
-		pages := retainFieldIndexChunkedRootPagesExcept(base, page)
-		pages[page] = fieldIndexChunkDirPage{
-			refs:      refs,
-			prefix:    base.pages[page].prefix,
-			rowPrefix: pageRowPrefix,
-		}
-		rootRowPrefix := base.rowPrefix
-		if rowsDelta != 0 {
-			rootRowPrefix = slices.Clone(rootRowPrefix)
-			applyRowDeltaSuffix(rootRowPrefix, page+1, rowsDelta)
-		}
-		root := &fieldIndexChunkedRoot{
-			pages:       pages,
-			chunkPrefix: base.chunkPrefix,
-			prefix:      base.prefix,
-			rowPrefix:   rootRowPrefix,
-			keyCount:    base.keyCount,
-			chunkCount:  base.chunkCount,
-		}
-		root.refs.Store(1)
 		return newChunkedFieldIndexStorage(root)
 	}
 	if delta.delta.remove.IsEmpty() && !delta.delta.add.IsEmpty() {
@@ -1554,112 +1546,7 @@ func applySingleFieldPostingDiffChunked(base *fieldIndexChunkedRoot, delta keyed
 			IDs: delta.delta.add,
 		})
 		if len(replRefs) > 0 {
-			if len(replRefs) == 1 {
-				repl := replRefs[0]
-				keyDelta := repl.chunk.keyCount() - ref.chunk.keyCount()
-				rowsDelta := int64(repl.chunk.rowCount()) - int64(ref.chunk.rowCount())
-
-				refs := make([]fieldIndexChunkRef, len(base.pages[page].refs))
-				copy(refs, base.pages[page].refs)
-				for i := range refs {
-					if i == off || refs[i].chunk == nil {
-						continue
-					}
-					refs[i].chunk.retain()
-				}
-				refs[off] = repl
-
-				pagePrefix := base.pages[page].prefix
-				if keyDelta != 0 {
-					pagePrefix = slices.Clone(pagePrefix)
-					applyIntDeltaSuffix(pagePrefix, off+1, keyDelta)
-				}
-
-				pageRowPrefix := base.pages[page].rowPrefix
-				if rowsDelta != 0 {
-					pageRowPrefix = slices.Clone(pageRowPrefix)
-					applyRowDeltaSuffix(pageRowPrefix, off+1, rowsDelta)
-				}
-
-				pages := retainFieldIndexChunkedRootPagesExcept(base, page)
-				pages[page] = fieldIndexChunkDirPage{
-					refs:      refs,
-					prefix:    pagePrefix,
-					rowPrefix: pageRowPrefix,
-				}
-
-				rootPrefix := base.prefix
-				if keyDelta != 0 {
-					rootPrefix = slices.Clone(rootPrefix)
-					applyIntDeltaSuffix(rootPrefix, page+1, keyDelta)
-				}
-
-				rootRowPrefix := base.rowPrefix
-				if rowsDelta != 0 {
-					rootRowPrefix = slices.Clone(rootRowPrefix)
-					applyRowDeltaSuffix(rootRowPrefix, page+1, rowsDelta)
-				}
-
-				root := &fieldIndexChunkedRoot{
-					pages:       pages,
-					chunkPrefix: base.chunkPrefix,
-					prefix:      rootPrefix,
-					rowPrefix:   rootRowPrefix,
-					keyCount:    base.keyCount + keyDelta,
-					chunkCount:  base.chunkCount,
-				}
-				root.refs.Store(1)
-				return newChunkedFieldIndexStorage(root)
-			}
-
-			oldPage := base.pages[page]
-			newPageRefs := make([]fieldIndexChunkRef, 0, len(oldPage.refs)-1+len(replRefs))
-			newPageRefs = append(newPageRefs, oldPage.refs[:off]...)
-			newPageRefs = append(newPageRefs, replRefs...)
-			newPageRefs = append(newPageRefs, oldPage.refs[off+1:]...)
-
-			pagesCap := len(base.pages)
-			if len(newPageRefs) == 0 {
-				pagesCap--
-			}
-			if len(newPageRefs) > fieldIndexDirPageTargetRefs {
-				pageRefs := make([]fieldIndexChunkRef, 0, len(newPageRefs))
-				for i := 0; i < off; i++ {
-					pageRefs = append(pageRefs, retainedFieldIndexChunkRef(oldPage.refs[i]))
-				}
-				pageRefs = append(pageRefs, replRefs...)
-				for i := off + 1; i < len(oldPage.refs); i++ {
-					pageRefs = append(pageRefs, retainedFieldIndexChunkRef(oldPage.refs[i]))
-				}
-				root := rebuildChunkedRootWithOwnedPageRefsReplaced(base, page, pageRefs)
-				if root == nil {
-					return fieldIndexStorage{}
-				}
-				if !shouldUseChunkedFieldIndex(root.keyCount) {
-					return newFlatFieldIndexStorage(flattenChunkedFieldIndexRoot(root))
-				}
-				return newChunkedFieldIndexStorage(root)
-			}
-			pages := make([]fieldIndexChunkDirPage, 0, max(pagesCap, 0))
-			for i := 0; i < page; i++ {
-				pages = append(pages, retainFieldIndexChunkDirPage(base.pages[i]))
-			}
-			if len(newPageRefs) > 0 {
-				pageRefs := make([]fieldIndexChunkRef, 0, len(newPageRefs))
-				for i := 0; i < off; i++ {
-					pageRefs = append(pageRefs, retainedFieldIndexChunkRef(oldPage.refs[i]))
-				}
-				pageRefs = append(pageRefs, replRefs...)
-				for i := off + 1; i < len(oldPage.refs); i++ {
-					pageRefs = append(pageRefs, retainedFieldIndexChunkRef(oldPage.refs[i]))
-				}
-				pages = append(pages, newFieldIndexChunkDirPage(pageRefs))
-			}
-			for i := page + 1; i < len(base.pages); i++ {
-				pages = append(pages, retainFieldIndexChunkDirPage(base.pages[i]))
-			}
-
-			root := newFieldIndexChunkedRootFromPages(pages)
+			root := rebuildChunkedRootWithOwnedPageRefsReplaced(base, page, newFieldIndexChunkRefBufWithReplacedRef(pageRef, off, replRefs))
 			if root == nil {
 				return fieldIndexStorage{}
 			}
@@ -1676,55 +1563,7 @@ func applySingleFieldPostingDiffChunked(base *fieldIndexChunkedRoot, delta keyed
 	if updated != nil {
 		replRefs = newFieldIndexChunkRefsFromEntries(*updated)
 	}
-
-	oldPage := base.pages[page]
-	newPageRefs := make([]fieldIndexChunkRef, 0, len(oldPage.refs)-1+len(replRefs))
-	newPageRefs = append(newPageRefs, oldPage.refs[:off]...)
-	newPageRefs = append(newPageRefs, replRefs...)
-	newPageRefs = append(newPageRefs, oldPage.refs[off+1:]...)
-
-	pagesCap := len(base.pages)
-	if len(newPageRefs) == 0 {
-		pagesCap--
-	}
-	if len(newPageRefs) > fieldIndexDirPageTargetRefs {
-		pageRefs := make([]fieldIndexChunkRef, 0, len(newPageRefs))
-		for i := 0; i < off; i++ {
-			pageRefs = append(pageRefs, retainedFieldIndexChunkRef(oldPage.refs[i]))
-		}
-		pageRefs = append(pageRefs, replRefs...)
-		for i := off + 1; i < len(oldPage.refs); i++ {
-			pageRefs = append(pageRefs, retainedFieldIndexChunkRef(oldPage.refs[i]))
-		}
-		root := rebuildChunkedRootWithOwnedPageRefsReplaced(base, page, pageRefs)
-		if root == nil {
-			return fieldIndexStorage{}
-		}
-		if !shouldUseChunkedFieldIndex(root.keyCount) {
-			return newFlatFieldIndexStorage(flattenChunkedFieldIndexRoot(root))
-		}
-		return newChunkedFieldIndexStorage(root)
-	}
-	pages := make([]fieldIndexChunkDirPage, 0, max(pagesCap, 0))
-	for i := 0; i < page; i++ {
-		pages = append(pages, retainFieldIndexChunkDirPage(base.pages[i]))
-	}
-	if len(newPageRefs) > 0 {
-		pageRefs := make([]fieldIndexChunkRef, 0, len(newPageRefs))
-		for i := 0; i < off; i++ {
-			pageRefs = append(pageRefs, retainedFieldIndexChunkRef(oldPage.refs[i]))
-		}
-		pageRefs = append(pageRefs, replRefs...)
-		for i := off + 1; i < len(oldPage.refs); i++ {
-			pageRefs = append(pageRefs, retainedFieldIndexChunkRef(oldPage.refs[i]))
-		}
-		pages = append(pages, newFieldIndexChunkDirPage(pageRefs))
-	}
-	for i := page + 1; i < len(base.pages); i++ {
-		pages = append(pages, retainFieldIndexChunkDirPage(base.pages[i]))
-	}
-
-	root := newFieldIndexChunkedRootFromPages(pages)
+	root := rebuildChunkedRootWithOwnedPageRefsReplaced(base, page, newFieldIndexChunkRefBufWithReplacedRef(pageRef, off, replRefs))
 	if root == nil {
 		return fieldIndexStorage{}
 	}
@@ -1935,7 +1774,7 @@ func (db *DB[K, V]) forEachSnapshotModifiedIndexedField(op snapshotBatchEntry[K,
 func (db *DB[K, V]) collectSnapshotBatchEntryDiffs(
 	op snapshotBatchEntry[K, V],
 	deltas *indexedFieldBatchDeltas,
-	lenZeroComplement map[string]bool,
+	lenZeroComplement *pooled.SliceBuf[bool],
 ) {
 	var ptrOld, ptrNew unsafe.Pointer
 	if op.oldVal != nil {
@@ -1946,7 +1785,8 @@ func (db *DB[K, V]) collectSnapshotBatchEntryDiffs(
 	}
 
 	db.forEachSnapshotModifiedIndexedField(op, func(acc indexedFieldAccessor) bool {
-		acc.collectSnapshotBatchDiff(op.idx, ptrOld, ptrNew, lenZeroComplement[acc.name], &deltas.fields[acc.ordinal])
+		useZeroComplement := lenZeroComplement != nil && acc.ordinal < lenZeroComplement.Len() && lenZeroComplement.Get(acc.ordinal)
+		acc.collectSnapshotBatchDiff(op.idx, ptrOld, ptrNew, useZeroComplement, &deltas.fields[acc.ordinal])
 		return true
 	})
 }
@@ -1959,18 +1799,16 @@ func (db *DB[K, V]) buildPreparedSnapshotAggregatedNoLock(
 	next := &indexSnapshot{
 		seq: seq,
 
-		index:             prev.index,
-		nilIndex:          prev.nilIndex,
-		lenIndex:          prev.lenIndex,
-		lenZeroComplement: prev.lenZeroComplement,
-		universe:          prev.universe,
-		universeOwner:     prev.universeOwner,
-		strmap:            db.strmap.snapshot(),
+		index:              cloneFieldIndexStorageSlots(prev.index, len(db.indexedFieldAccess)),
+		nilIndex:           cloneFieldIndexStorageSlots(prev.nilIndex, len(db.indexedFieldAccess)),
+		lenIndex:           cloneFieldIndexStorageSlots(prev.lenIndex, len(db.indexedFieldAccess)),
+		lenZeroComplement:  cloneFieldIndexBoolSlots(prev.lenZeroComplement, len(db.indexedFieldAccess)),
+		indexedFieldByName: db.indexedFieldByName,
+		universe:           prev.universe,
+		universeOwner:      prev.universeOwner,
+		strmap:             db.strmap.snapshot(),
 	}
 	db.initSnapshotRuntimeCaches(next)
-	indexCloned := false
-	nilIndexCloned := false
-	lenIndexCloned := false
 
 	normalized := normalizePreparedBatchForSnapshot(prepared)
 	deltas := indexedFieldBatchDeltas{
@@ -1994,28 +1832,27 @@ func (db *DB[K, V]) buildPreparedSnapshotAggregatedNoLock(
 
 	changedCount := 0
 	for i, acc := range db.indexedFieldAccess {
-		f := acc.name
 		state := &deltas.fields[i]
-		baseIndex := next.index[f]
+		baseIndex := next.index.Get(i)
 		if storage := acc.applySnapshotBatchStorageOwned(baseIndex, state, true); storage.keyCount() == 0 {
 			if baseIndex.keyCount() > 0 {
-				delete(ensureSnapshotFieldIndex(&next.index, prev.index, &indexCloned), f)
+				next.index.Set(i, fieldIndexStorage{})
 			}
 		} else if storage != baseIndex {
-			ensureSnapshotFieldIndex(&next.index, prev.index, &indexCloned)[f] = storage
+			next.index.Set(i, storage)
 		}
-		baseNil := next.nilIndex[f]
+		baseNil := next.nilIndex.Get(i)
 		if storage := acc.applySnapshotBatchNilStorageOwned(baseNil, state); storage.keyCount() == 0 {
 			if baseNil.keyCount() > 0 {
-				delete(ensureSnapshotFieldIndex(&next.nilIndex, prev.nilIndex, &nilIndexCloned), f)
+				next.nilIndex.Set(i, fieldIndexStorage{})
 			}
 		} else if storage != baseNil {
-			ensureSnapshotFieldIndex(&next.nilIndex, prev.nilIndex, &nilIndexCloned)[f] = storage
+			next.nilIndex.Set(i, storage)
 		}
 		if state.lengths != nil {
-			baseLen := next.lenIndex[f]
+			baseLen := next.lenIndex.Get(i)
 			if storage := applyLenFieldPostingDiffStorageOwned(baseLen, state.lengths); storage != baseLen {
-				ensureSnapshotFieldIndex(&next.lenIndex, prev.lenIndex, &lenIndexCloned)[f] = storage
+				next.lenIndex.Set(i, storage)
 			}
 			state.lengths = nil
 		}

@@ -44,10 +44,14 @@ func (db *DB[K, V]) refreshPlannerStatsWithBudget(softBudget time.Duration, useC
 	db.planner.analyzer.Lock()
 	defer db.planner.analyzer.Unlock()
 
-	snap, fieldNames, universeCardinality, err := db.collectPlannerFieldNamesAndUniverse()
-	if err != nil {
+	if err := db.unavailableErr(); err != nil {
 		return err
 	}
+	snap, seq, ref, pinned := db.pinCurrentSnapshot()
+	defer db.unpinCurrentSnapshot(seq, ref, pinned)
+
+	fieldNames := db.sortedPlannerFieldNames()
+	universeCardinality := snap.universeCardinality()
 
 	prev := db.planner.stats.Load()
 	capHint := len(fieldNames)
@@ -112,21 +116,6 @@ func (db *DB[K, V]) refreshPlannerStatsWithBudget(softBudget time.Duration, useC
 	return nil
 }
 
-func (db *DB[K, V]) collectPlannerFieldNamesAndUniverse() (*indexSnapshot, []string, uint64, error) {
-	if err := db.unavailableErr(); err != nil {
-		return nil, nil, 0, err
-	}
-
-	s := db.getSnapshot()
-	fieldNames := make([]string, 0, len(db.indexedFieldAccess))
-	for _, acc := range db.indexedFieldAccess {
-		fieldNames = append(fieldNames, acc.name)
-	}
-	sort.Strings(fieldNames)
-
-	return s, fieldNames, s.universeCardinality(), nil
-}
-
 func (s *indexSnapshot) universeCardinality() uint64 {
 	if s == nil {
 		return 0
@@ -139,7 +128,11 @@ func (db *DB[K, V]) collectPlannerFieldStatsFromOverlay(s *indexSnapshot, fieldN
 		return PlannerFieldStats{}, err
 	}
 
-	ov := newFieldOverlayStorage(s.index[fieldName])
+	acc, ok := db.indexedFieldByName[fieldName]
+	if !ok || s.index == nil || acc.ordinal >= s.index.Len() {
+		return PlannerFieldStats{}, nil
+	}
+	ov := newFieldOverlayStorage(s.index.Get(acc.ordinal))
 	if !ov.hasData() {
 		return PlannerFieldStats{}, nil
 	}
@@ -347,17 +340,21 @@ func (db *DB[K, V]) plannerStatsSnapshotForPersistLocked(version uint64) *planne
 	if current == nil {
 		return db.buildPlannerStatsSnapshotLocked(version)
 	}
+	snap, seq, ref, pinned := db.pinCurrentSnapshot()
+	defer db.unpinCurrentSnapshot(seq, ref, pinned)
 
 	return &plannerStatsSnapshot{
 		Version:             version,
 		GeneratedAt:         time.Now(),
-		UniverseCardinality: db.getSnapshot().universeCardinality(),
+		UniverseCardinality: snap.universeCardinality(),
 		Fields:              current.Fields,
 	}
 }
 
 func (db *DB[K, V]) buildPlannerStatsSnapshotLocked(version uint64) *plannerStatsSnapshot {
-	snap := db.getSnapshot()
+	snap, seq, ref, pinned := db.pinCurrentSnapshot()
+	defer db.unpinCurrentSnapshot(seq, ref, pinned)
+
 	fields := db.sortedPlannerFieldNames()
 
 	out := &plannerStatsSnapshot{
@@ -368,7 +365,11 @@ func (db *DB[K, V]) buildPlannerStatsSnapshotLocked(version uint64) *plannerStat
 	}
 
 	for _, fieldName := range fields {
-		ov := newFieldOverlayStorage(snap.index[fieldName])
+		acc, ok := db.indexedFieldByName[fieldName]
+		if !ok || snap.index == nil || acc.ordinal >= snap.index.Len() {
+			continue
+		}
+		ov := newFieldOverlayStorage(snap.index.Get(acc.ordinal))
 		out.Fields[fieldName] = ov.fieldStats()
 	}
 
