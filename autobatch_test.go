@@ -437,6 +437,43 @@ func TestBatch_PopSkipsCoalescingWindowBeforeIsolatedFollower(t *testing.T) {
 	}
 }
 
+func TestBatch_HotWindowActiveReflectsSingletonHotWaitGate(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{
+		AutoBatchWindow:   25 * time.Millisecond,
+		AutoBatchMax:      16,
+		AutoBatchMaxQueue: 64,
+	})
+
+	db.autoBatcher.mu.Lock()
+	db.autoBatcher.hotUntil = time.Now().Add(time.Second)
+	db.autoBatcher.hotBatchSize = 2
+	db.autoBatcher.window = 25 * time.Millisecond
+	db.autoBatcher.mu.Unlock()
+
+	if st := db.AutoBatchStats(); st.HotWindowActive {
+		t.Fatalf("HotWindowActive must stay false for 2-request hot batches, stats=%+v", st)
+	}
+
+	db.autoBatcher.mu.Lock()
+	db.autoBatcher.hotBatchSize = 4
+	db.autoBatcher.window = 0
+	db.autoBatcher.mu.Unlock()
+
+	if st := db.AutoBatchStats(); st.HotWindowActive {
+		t.Fatalf("HotWindowActive must stay false when AutoBatchWindow is disabled, stats=%+v", st)
+	}
+
+	db.autoBatcher.mu.Lock()
+	db.autoBatcher.window = 25 * time.Millisecond
+	db.autoBatcher.hotBatchSize = 4
+	db.autoBatcher.hotUntil = time.Now().Add(time.Second)
+	db.autoBatcher.mu.Unlock()
+
+	if st := db.AutoBatchStats(); !st.HotWindowActive {
+		t.Fatalf("HotWindowActive must be true when singleton hot wait is enabled, stats=%+v", st)
+	}
+}
+
 func TestBatch_CallbackRequestsStayBatchable(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
 		AutoBatchWindow:   5 * time.Millisecond,

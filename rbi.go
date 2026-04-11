@@ -570,6 +570,7 @@ func (db *DB[K, V]) initSnapshotRuntimeCaches(s *indexSnapshot) {
 	)
 	if s.matPredCacheMaxEntries > 0 {
 		s.matPredCache = materializedPredCachePool.Get()
+		s.matPredCache.refs.Store(1)
 		s.matPredCache.init(s.matPredCacheMaxEntries)
 	}
 }
@@ -681,6 +682,7 @@ func (db *DB[K, V]) initBatcher() {
 				}
 				job.reqs = nil
 				job.isolated = false
+				job.enqueuedAt = 0
 			},
 		},
 	}
@@ -770,6 +772,7 @@ type autoBatcher[K ~string | ~uint64, V any] struct {
 	requestPool        pooled.Pointers[autoBatchRequest[K, V]]
 	jobPool            pooled.Pointers[autoBatchJob[K, V]]
 	hotUntil           time.Time
+	hotBatchSize       int
 
 	submitted          atomic.Uint64
 	enqueued           atomic.Uint64
@@ -787,6 +790,8 @@ type autoBatcher[K ~string | ~uint64, V any] struct {
 	queueHighWater     atomic.Uint64
 	coalesceWaits      atomic.Uint64
 	coalesceWaitNanos  atomic.Uint64
+	queueWaitNanos     atomic.Uint64
+	executeNanos       atomic.Uint64
 
 	fallbackClosed atomic.Uint64
 
@@ -1025,6 +1030,10 @@ type (
 		CoalesceWaits uint64
 		// CoalesceWaitTime is total time spent sleeping for coalescing.
 		CoalesceWaitTime time.Duration
+		// QueueWaitTime is aggregate request wait time from enqueue to dequeue.
+		QueueWaitTime time.Duration
+		// ExecuteTime is aggregate batch execution wall time after dequeue.
+		ExecuteTime time.Duration
 
 		// FallbackClosed is number of write calls rejected by auto-batcher because DB is closed.
 		FallbackClosed uint64
@@ -1452,6 +1461,8 @@ func (db *DB[K, V]) AutoBatchStats() AutoBatchStats {
 		CoalescedSetDelete:  db.autoBatcher.coalescedSetDelete.Load(),
 		CoalesceWaits:       db.autoBatcher.coalesceWaits.Load(),
 		CoalesceWaitTime:    time.Duration(db.autoBatcher.coalesceWaitNanos.Load()),
+		QueueWaitTime:       time.Duration(db.autoBatcher.queueWaitNanos.Load()),
+		ExecuteTime:         time.Duration(db.autoBatcher.executeNanos.Load()),
 		FallbackClosed:      db.autoBatcher.fallbackClosed.Load(),
 		UniqueRejected:      db.autoBatcher.uniqueRejected.Load(),
 		TxBeginErrors:       db.autoBatcher.txBeginErrors.Load(),
@@ -1464,7 +1475,9 @@ func (db *DB[K, V]) AutoBatchStats() AutoBatchStats {
 	out.QueueLen = db.autoBatcher.queueSize
 	out.QueueCap = cap(db.autoBatcher.queue)
 	out.WorkerRunning = db.autoBatcher.running
-	out.HotWindowActive = time.Now().Before(db.autoBatcher.hotUntil)
+	out.HotWindowActive = db.autoBatcher.window > 0 &&
+		time.Now().Before(db.autoBatcher.hotUntil) &&
+		(db.autoBatcher.hotBatchSize == 0 || db.autoBatcher.hotBatchSize >= 3)
 	db.autoBatcher.mu.Unlock()
 
 	if out.ExecutedBatches > 0 {

@@ -151,6 +151,8 @@ type batchDelta struct {
 	CoalescedSetDelete  uint64        `json:"coalesced_set_delete"`
 	CoalesceWaits       uint64        `json:"coalesce_waits"`
 	CoalesceWaitTime    time.Duration `json:"coalesce_wait_time"`
+	QueueWaitTime       time.Duration `json:"queue_wait_time"`
+	ExecuteTime         time.Duration `json:"execute_time"`
 	FallbackClosed      uint64        `json:"fallback_closed"`
 	UniqueRejected      uint64        `json:"unique_rejected"`
 	TxBeginErrors       uint64        `json:"tx_begin_errors"`

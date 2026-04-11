@@ -44,6 +44,7 @@ type materializedPredCacheEntry struct {
 }
 
 type materializedPredCache struct {
+	refs    atomic.Int32
 	mu      sync.RWMutex
 	slots   *pooled.SliceBuf[materializedPredCacheSlot]
 	retired *pooled.SliceBuf[*materializedPredCacheEntry]
@@ -346,6 +347,19 @@ func (c *materializedPredCache) init(limit int) {
 		c.slots = materializedPredCacheSlotPool.Get()
 	}
 	c.slots.SetLen(limit)
+}
+
+func (c *materializedPredCache) retain() {
+	if c != nil {
+		c.refs.Add(1)
+	}
+}
+
+func (c *materializedPredCache) releaseRef() {
+	if c == nil || c.refs.Add(-1) != 0 {
+		return
+	}
+	materializedPredCachePool.Put(c)
 }
 
 func (c *materializedPredCache) entryCount() int {
@@ -1030,7 +1044,7 @@ func (s *indexSnapshot) releaseRuntimeCaches() {
 		s.numericRangeBucketCache = nil
 	}
 	if s.matPredCache != nil {
-		materializedPredCachePool.Put(s.matPredCache)
+		s.matPredCache.releaseRef()
 		s.matPredCache = nil
 	}
 	s.runtimeMatPredSeen.clear()
@@ -1267,7 +1281,7 @@ func (db *DB[K, V]) unpinSnapshotRef(seq uint64, ref *snapshotRef) {
 	if ref.refs.Add(-1) != 0 {
 		return
 	}
-	var drainCurrent *indexSnapshot
+	var drainCache *materializedPredCache
 	var retired *pooled.SliceBuf[*indexSnapshot]
 	db.snapshot.mu.Lock()
 	held := db.snapshot.bySeq[seq]
@@ -1279,12 +1293,16 @@ func (db *DB[K, V]) unpinSnapshotRef(seq uint64, ref *snapshotRef) {
 		}
 		if held == ref && held != nil && held.snap != nil &&
 			held == db.snapshot.currentRef.Load() {
-			drainCurrent = held.snap
+			drainCache = held.snap.matPredCache
+			if drainCache != nil {
+				drainCache.retain()
+			}
 		}
 		db.snapshot.mu.Unlock()
 		releaseRetiredSnapshots(retired)
-		if drainCurrent != nil {
-			drainCurrent.drainRetiredRuntimeCaches()
+		if drainCache != nil {
+			drainCache.drainRetired()
+			drainCache.releaseRef()
 		}
 		return
 	}

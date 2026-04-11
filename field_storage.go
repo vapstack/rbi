@@ -43,6 +43,7 @@ type fieldIndexChunkRef struct {
 }
 
 type fieldIndexChunkDirPage struct {
+	refsCount atomic.Int32
 	refs      *pooled.SliceBuf[fieldIndexChunkRef]
 	prefix    *pooled.SliceBuf[int]
 	rowPrefix *pooled.SliceBuf[uint64]
@@ -149,11 +150,8 @@ func newFieldIndexChunkDirPageSlice(capHint int) *pooled.SliceBuf[*fieldIndexChu
 }
 
 func newFieldIndexChunkDirPageOwned(refs *pooled.SliceBuf[fieldIndexChunkRef]) *fieldIndexChunkDirPage {
-	if refs == nil || refs.Len() == 0 {
-		fieldIndexChunkRefSlicePool.Put(refs)
-		return nil
-	}
 	page := fieldIndexChunkDirPagePool.Get()
+	page.refsCount.Store(1)
 	page.refs = refs
 	page.prefix = fieldIndexChunkDirPagePrefixPool.Get()
 	page.prefix.SetLen(refs.Len() + 1)
@@ -174,6 +172,12 @@ func newFieldIndexChunkDirPageOwned(refs *pooled.SliceBuf[fieldIndexChunkRef]) *
 	return page
 }
 
+func (p *fieldIndexChunkDirPage) retain() {
+	if p != nil {
+		p.refsCount.Add(1)
+	}
+}
+
 func newFieldIndexChunkDirPage(refs []fieldIndexChunkRef) *fieldIndexChunkDirPage {
 	if len(refs) == 0 {
 		return nil
@@ -184,7 +188,7 @@ func newFieldIndexChunkDirPage(refs []fieldIndexChunkRef) *fieldIndexChunkDirPag
 }
 
 func (p *fieldIndexChunkDirPage) release() {
-	if p == nil {
+	if p == nil || p.refsCount.Add(-1) != 0 {
 		return
 	}
 	if p.refs != nil {
@@ -1079,37 +1083,6 @@ func retainedFieldIndexChunkRef(ref fieldIndexChunkRef) fieldIndexChunkRef {
 	return ref
 }
 
-func cloneFieldIndexChunkRefBufRetained(page *fieldIndexChunkDirPage) *pooled.SliceBuf[fieldIndexChunkRef] {
-	if page == nil || page.refsLen() == 0 {
-		return nil
-	}
-	dst := newFieldIndexChunkRefBuf(page.refsLen())
-	dst.SetLen(page.refsLen())
-	for i := 0; i < page.refsLen(); i++ {
-		dst.Set(i, retainedFieldIndexChunkRef(page.refAt(i)))
-	}
-	return dst
-}
-
-func retainFieldIndexChunkDirPage(page *fieldIndexChunkDirPage) *fieldIndexChunkDirPage {
-	return newFieldIndexChunkDirPageOwned(cloneFieldIndexChunkRefBufRetained(page))
-}
-
-func retainFieldIndexChunkedRootPagesExcept(base *fieldIndexChunkedRoot, skip int) *pooled.SliceBuf[*fieldIndexChunkDirPage] {
-	if base == nil || base.pages == nil || base.pages.Len() == 0 {
-		return nil
-	}
-	pages := newFieldIndexChunkDirPageSlice(base.pages.Len())
-	pages.SetLen(base.pages.Len())
-	for i := 0; i < base.pages.Len(); i++ {
-		if i == skip {
-			continue
-		}
-		pages.Set(i, retainFieldIndexChunkDirPage(base.pages.Get(i)))
-	}
-	return pages
-}
-
 func newFieldIndexChunkStreamBuilder(builder *fieldIndexChunkBuilder, numeric bool) fieldIndexChunkStreamBuilder {
 	out := fieldIndexChunkStreamBuilder{
 		builder: builder,
@@ -1581,9 +1554,7 @@ func (b *fieldIndexChunkBuilder) flushPendingPage() {
 		return
 	}
 	page := newFieldIndexChunkDirPageOwned(b.pendingRefs)
-	if page != nil {
-		b.pages.Append(page)
-	}
+	b.pages.Append(page)
 	b.pendingRefs = newFieldIndexChunkRefBuf(fieldIndexDirPageTargetRefs)
 }
 
@@ -1591,7 +1562,14 @@ func (b *fieldIndexChunkBuilder) appendPage(page *fieldIndexChunkDirPage) {
 	if b == nil || page == nil || page.refsLen() == 0 {
 		return
 	}
-	b.appendRefSlice(page, 0, page.refsLen())
+	if page.refsLen() != fieldIndexDirPageTargetRefs || (b.pendingRefs != nil && b.pendingRefs.Len() != 0) {
+		b.appendRefSlice(page, 0, page.refsLen())
+		return
+	}
+	page.retain()
+	b.pages.Append(page)
+	b.total += page.keyCount()
+	b.chunks += page.refsLen()
 }
 
 func (b *fieldIndexChunkBuilder) appendOwnedPage(page *fieldIndexChunkDirPage) {

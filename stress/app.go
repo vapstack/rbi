@@ -1078,6 +1078,8 @@ func makeBatchSample(now time.Time, baseline, current rbi.AutoBatchStats) batchS
 			CoalescedSetDelete:  deltaUint64(current.CoalescedSetDelete, baseline.CoalescedSetDelete),
 			CoalesceWaits:       deltaUint64(current.CoalesceWaits, baseline.CoalesceWaits),
 			CoalesceWaitTime:    current.CoalesceWaitTime - baseline.CoalesceWaitTime,
+			QueueWaitTime:       current.QueueWaitTime - baseline.QueueWaitTime,
+			ExecuteTime:         current.ExecuteTime - baseline.ExecuteTime,
 			FallbackClosed:      deltaUint64(current.FallbackClosed, baseline.FallbackClosed),
 			UniqueRejected:      deltaUint64(current.UniqueRejected, baseline.UniqueRejected),
 			TxBeginErrors:       deltaUint64(current.TxBeginErrors, baseline.TxBeginErrors),

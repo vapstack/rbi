@@ -93,9 +93,10 @@ type autoBatchRequest[K ~string | ~uint64, V any] struct {
 }
 
 type autoBatchJob[K ~string | ~uint64, V any] struct {
-	reqs     *pooled.SliceBuf[*autoBatchRequest[K, V]]
-	isolated bool
-	done     chan error
+	reqs       *pooled.SliceBuf[*autoBatchRequest[K, V]]
+	isolated   bool
+	done       chan error
+	enqueuedAt int64
 }
 
 type autoBatchPrepared[K ~string | ~uint64, V any] struct {
@@ -535,6 +536,7 @@ func (db *DB[K, V]) submitAutoBatchRequests(reqs *pooled.SliceBuf[*autoBatchRequ
 
 	db.autoBatcher.enqueue(job)
 	if stats {
+		job.enqueuedAt = time.Now().UnixNano()
 		db.autoBatcher.enqueued.Add(1)
 		atomicSetMax(&db.autoBatcher.queueHighWater, uint64(db.autoBatcher.queueLen()))
 	}
@@ -610,14 +612,11 @@ func (db *DB[K, V]) autoBatchWaitDurationLocked(frontLimit int) time.Duration {
 	switch {
 
 	case frontLimit > 1:
-		keepHot := 4 * db.autoBatcher.window
-		if keepHot < 500*time.Microsecond {
-			keepHot = 500 * time.Microsecond
-		}
-		db.autoBatcher.hotUntil = now.Add(keepHot)
 		return db.autoBatcher.window
 
-	case db.autoBatcher.queueLen() == 1 && now.Before(db.autoBatcher.hotUntil):
+	case db.autoBatcher.queueLen() == 1 &&
+		(db.autoBatcher.hotBatchSize == 0 || db.autoBatcher.hotBatchSize >= 3) &&
+		now.Before(db.autoBatcher.hotUntil):
 		waitDur := db.autoBatcher.window
 		if waitDur > 50*time.Microsecond {
 			waitDur /= 2
@@ -684,11 +683,32 @@ func (db *DB[K, V]) popAutoBatch() []*autoBatchJob[K, V] {
 	n = db.autoBatchRepeatedIDLimitLocked(n)
 
 	batch := db.autoBatcher.dequeueFrontScratch(n)
+	now := time.Now()
+	if n > 1 {
+		keepHot := 4 * db.autoBatcher.window
+		if keepHot < 500*time.Microsecond {
+			keepHot = 500 * time.Microsecond
+		}
+		db.autoBatcher.hotUntil = now.Add(keepHot)
+		db.autoBatcher.hotBatchSize = n
+	} else {
+		db.autoBatcher.hotUntil = time.Time{}
+		db.autoBatcher.hotBatchSize = 0
+	}
 	if len(batch) > 1 {
 		db.markSupersededSetDeleteJobs(batch)
 	}
 	if stats {
+		nowUnix := now.UnixNano()
+		var queueWait uint64
+		for _, job := range batch {
+			if job.enqueuedAt == 0 || nowUnix <= job.enqueuedAt {
+				continue
+			}
+			queueWait += uint64(nowUnix - job.enqueuedAt)
+		}
 		db.autoBatcher.dequeued.Add(uint64(len(batch)))
+		db.autoBatcher.queueWaitNanos.Add(queueWait)
 	}
 	if db.autoBatcher.cond != nil {
 		db.autoBatcher.cond.Broadcast()
@@ -1058,10 +1078,18 @@ func (db *DB[K, V]) applyAutoBatchAcceptedLocked(
 
 func (db *DB[K, V]) executeAutoBatchJobs(batch []*autoBatchJob[K, V]) {
 	db.recordExecutedAutoBatchStats(len(batch))
+	stats := db.autoBatcher.statsEnabled
+	var started time.Time
+	if stats {
+		started = time.Now()
+	}
 
 	if len(batch) == 1 && batch[0].isolated {
 		db.runAutoBatchAtomic(batch[0].reqs)
 		db.finishAutoBatchJobs(batch)
+		if stats {
+			db.autoBatcher.executeNanos.Add(uint64(time.Since(started)))
+		}
 		return
 	}
 
@@ -1080,6 +1108,9 @@ func (db *DB[K, V]) executeAutoBatchJobs(batch []*autoBatchJob[K, V]) {
 	}
 	db.finishAutoBatchJobs(batch)
 	db.autoBatcher.requestScratchPool.Put(reqScratch)
+	if stats {
+		db.autoBatcher.executeNanos.Add(uint64(time.Since(started)))
+	}
 }
 
 func resolveAutoBatchRequestErrs[K ~string | ~uint64, V any](batch *pooled.SliceBuf[*autoBatchRequest[K, V]]) {
@@ -1115,11 +1146,19 @@ func (db *DB[K, V]) finishAutoBatchJobs(batch []*autoBatchJob[K, V]) {
 
 func (db *DB[K, V]) executeAutoBatch(batch []*autoBatchRequest[K, V]) {
 	db.recordExecutedAutoBatchStats(len(batch))
+	stats := db.autoBatcher.statsEnabled
+	var started time.Time
+	if stats {
+		started = time.Now()
+	}
 	reqScratch := db.autoBatcher.requestScratchPool.Get()
 	reqScratch.AppendAll(batch)
 	db.runAutoBatchShared(reqScratch)
 	db.autoBatcher.requestScratchPool.Put(reqScratch)
 	db.finishAutoBatch(batch)
+	if stats {
+		db.autoBatcher.executeNanos.Add(uint64(time.Since(started)))
+	}
 }
 
 func (db *DB[K, V]) runAutoBatchShared(batch *pooled.SliceBuf[*autoBatchRequest[K, V]]) {
