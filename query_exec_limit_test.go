@@ -252,6 +252,45 @@ func TestPostingUnionIter_AllocsPerRunStaysLowAfterWarmup(t *testing.T) {
 	}
 }
 
+func TestPostingUnionBufIter_SmallUnionAllocsPerRunStayZeroAfterWarmup(t *testing.T) {
+	if testRaceEnabled {
+		t.Skip("testing.AllocsPerRun is not stable under -race")
+	}
+
+	posts := [...]posting.List{
+		postingOf(1, 2, 5),
+		postingOf(2, 3),
+		postingOf(1, 4),
+	}
+	for i := range posts {
+		defer posts[i].Release()
+	}
+
+	postsBuf := postingSlicePool.Get()
+	postsBuf.Append(posts[0])
+	postsBuf.Append(posts[1])
+	postsBuf.Append(posts[2])
+	defer postingSlicePool.Put(postsBuf)
+
+	warm := newPostingUnionBufIter(postsBuf)
+	if warm != nil {
+		warm.Release()
+	}
+
+	allocs := testing.AllocsPerRun(100, func() {
+		it := newPostingUnionBufIter(postsBuf)
+		for it.HasNext() {
+			_ = it.Next()
+		}
+		if it != nil {
+			it.Release()
+		}
+	})
+	if allocs != 0 {
+		t.Fatalf("expected zero allocs after warmup, got %.2f", allocs)
+	}
+}
+
 func TestU64Set_AllocsPerRunStayZeroAfterWarmup(t *testing.T) {
 	if testRaceEnabled {
 		t.Skip("testing.AllocsPerRun is not stable under -race")

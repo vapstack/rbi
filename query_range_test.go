@@ -2,6 +2,10 @@ package rbi
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
+	"runtime"
+	"runtime/pprof"
 	"slices"
 	"testing"
 
@@ -13,12 +17,11 @@ func requireNumericRangeBucketCacheEntry(t *testing.T, snap *indexSnapshot, fiel
 	if snap == nil || snap.numericRangeBucketCache == nil {
 		t.Fatalf("expected non-nil numeric range bucket cache for field %q", field)
 	}
-	raw, ok := snap.numericRangeBucketCache.Load(field)
+	e, ok := snap.numericRangeBucketCache.loadField(field)
 	if !ok {
 		t.Fatalf("expected numeric range bucket cache entry for field %q", field)
 	}
-	e, ok := raw.(*numericRangeBucketCacheEntry)
-	if !ok || e == nil || e.idx.bucketSize <= 0 {
+	if e == nil || e.idx.bucketSize <= 0 {
 		t.Fatalf("expected non-nil numeric range bucket index for field %q", field)
 	}
 	return e
@@ -48,6 +51,16 @@ func bitmapToIDs(t *testing.T, b postingResult) []uint64 {
 		t.Fatalf("unexpected negative postingResult result")
 	}
 	return b.ids.ToArray()
+}
+
+func numericRangeFullSpanCacheEntryCount(entry *numericRangeBucketCacheEntry) int {
+	count := 0
+	for i := range entry.fullSpanCache {
+		if entry.fullSpanCache[i].used {
+			count++
+		}
+	}
+	return count
 }
 
 func warmNumericRangeBucketEntry(t *testing.T, db *DB[uint64, Rec], expr qx.Expr) (*numericRangeBucketCacheEntry, overlayRange) {
@@ -291,7 +304,7 @@ func TestEvalSimple_NumericRangeBuckets_WorkWithoutPredicateCacheWhenReuseEnable
 	expr := qx.Expr{Op: qx.OpGTE, Field: "age", Value: 2_500}
 	snap := db.getSnapshot()
 	if snap.numericRangeBucketCache == nil {
-		t.Fatalf("expected numeric range bucket cache map when reuse is enabled")
+		t.Fatalf("expected numeric range bucket cache when reuse is enabled")
 	}
 
 	got1, err := db.evalSimple(expr)
@@ -355,7 +368,7 @@ func TestNumericRangeBucketCache_InheritsSafeEntriesAcrossSnapshotsWhenFieldInde
 		t.Fatalf("expected current snapshot after patch")
 	}
 	if snap2.numericRangeBucketCache == snap1.numericRangeBucketCache {
-		t.Fatalf("expected each snapshot to own its numeric range cache map")
+		t.Fatalf("expected each snapshot to own its numeric range cache")
 	}
 	entry2 := requireNumericRangeBucketCacheEntry(t, snap2, "age")
 	storage2, ok := snap2.fieldIndexStorage("age")
@@ -401,9 +414,9 @@ func TestNumericRangeBucketCache_DropsChangedFieldEntryAcrossSnapshots(t *testin
 		t.Fatalf("expected current snapshot with initialized numeric range cache")
 	}
 	if snap2.numericRangeBucketCache == snap1.numericRangeBucketCache {
-		t.Fatalf("expected changed-field snapshot to use a distinct numeric range cache map")
+		t.Fatalf("expected changed-field snapshot to use a distinct numeric range cache")
 	}
-	if _, ok := snap2.numericRangeBucketCache.Load("age"); ok {
+	if _, ok := snap2.numericRangeBucketCache.loadField("age"); ok {
 		t.Fatalf("expected changed numeric field cache entry to be dropped on inherited snapshot")
 	}
 
@@ -477,7 +490,7 @@ func TestNumericRangeBucketSpanCache_ReusedForNearbyBounds(t *testing.T) {
 		t.Fatalf("expected local cached full bucket span after first evaluation")
 	}
 	cached1.Release()
-	countAfterFirst := entry.fullSpanCount.Load()
+	countAfterFirst := numericRangeFullSpanCacheEntryCount(entry)
 
 	br2 := makeRange(2501)
 	start2, end2, ok := entry.idx.fullBucketSpan(br2)
@@ -492,7 +505,7 @@ func TestNumericRangeBucketSpanCache_ReusedForNearbyBounds(t *testing.T) {
 		t.Fatalf("expected numeric range bucket path for second bound")
 	}
 	out2.release()
-	if got := entry.fullSpanCount.Load(); got != countAfterFirst {
+	if got := numericRangeFullSpanCacheEntryCount(entry); got != countAfterFirst {
 		t.Fatalf("expected cached local full span reuse without new entries: before=%d after=%d", countAfterFirst, got)
 	}
 }
@@ -802,7 +815,7 @@ func TestNumericRangeBucketSpanCache_LoadHotPathAllocsStayLowAfterWarmup(t *test
 	}
 	warm.release()
 
-	allocs := testing.AllocsPerRun(100, func() {
+	allocs := testing.AllocsPerRun(20, func() {
 		out, ok := qv.tryLoadNumericRangeBuckets("age", fm, ov, br)
 		if !ok {
 			t.Fatal("expected warmed numeric range bucket load path")
@@ -811,6 +824,168 @@ func TestNumericRangeBucketSpanCache_LoadHotPathAllocsStayLowAfterWarmup(t *test
 	})
 	if allocs > 12 {
 		t.Fatalf("unexpected allocs per run on warmed numeric bucket load: got=%v want<=12", allocs)
+	}
+}
+
+func TestTryEvalNumericRangeBuckets_ColdBuildAllocsStayLowAfterWarmup(t *testing.T) {
+	if testRaceEnabled {
+		t.Skip("testing.AllocsPerRun is not stable under -race")
+	}
+
+	db, _ := openTempDBUint64(t, Options{
+		SnapshotMaterializedPredCacheMaxEntries: 64,
+	})
+
+	seedGeneratedUint64Data(t, db, 20_000, func(i int) *Rec {
+		return &Rec{
+			Name:  fmt.Sprintf("u_%d", i),
+			Age:   i,
+			Score: float64(i),
+		}
+	})
+	if err := db.RebuildIndex(); err != nil {
+		t.Fatalf("RebuildIndex: %v", err)
+	}
+
+	setNumericBucketKnobs(t, db, 128, 1, 1)
+
+	fm := db.fields["age"]
+	if fm == nil {
+		t.Fatalf("expected age field metadata")
+	}
+	ov := db.fieldOverlay("age")
+	if !ov.hasData() {
+		t.Fatalf("expected age overlay data")
+	}
+	qv := db.currentQueryViewForTests()
+	br := ov.rangeByRanks(2501, 3001)
+
+	warm, ok := qv.tryEvalNumericRangeBuckets("age", fm, ov, br)
+	if !ok {
+		t.Fatal("expected numeric range bucket warmup path")
+	}
+	warm.release()
+	db.clearCurrentSnapshotCachesForTesting()
+
+	allocs := testing.AllocsPerRun(100, func() {
+		db.clearCurrentSnapshotCachesForTesting()
+		out, ok := qv.tryEvalNumericRangeBuckets("age", fm, ov, br)
+		if !ok {
+			t.Fatal("expected numeric range bucket cold build path")
+		}
+		out.release()
+	})
+	if allocs != 0 {
+		t.Fatalf("unexpected allocs after warmup: got=%v want=0", allocs)
+	}
+}
+
+func TestMaterializeOrderBasicLimitComplementBaseOp_AllocsPerRunStayZeroAfterWarmup(t *testing.T) {
+	if testRaceEnabled {
+		t.Skip("testing.AllocsPerRun is not stable under -race")
+	}
+
+	db, _ := openTempDBUint64(t, Options{
+		SnapshotMaterializedPredCacheMaxEntries: 64,
+	})
+
+	seedGeneratedUint64Data(t, db, 20_000, func(i int) *Rec {
+		return &Rec{
+			Name:  fmt.Sprintf("u_%d", i),
+			Age:   i,
+			Score: float64(20_000 - i),
+		}
+	})
+	if err := db.RebuildIndex(); err != nil {
+		t.Fatalf("RebuildIndex: %v", err)
+	}
+
+	setNumericBucketKnobs(t, db, 128, 1, 1)
+
+	qv := db.currentQueryViewForTests()
+	op := qx.GTE("age", 2_500)
+	stats, ok := qv.orderBasicRawBaseOpStats(op, qv.snapshotUniverseCardinality())
+	if !ok || stats.cacheKey.isZero() || !stats.buildComplement {
+		t.Fatalf("expected complement materialization stats for %v", op)
+	}
+
+	if !qv.materializeOrderBasicLimitComplementBaseOp(op, stats.cacheKey) {
+		t.Fatal("expected warmup materialization")
+	}
+	db.clearCurrentSnapshotCachesForTesting()
+
+	allocs := testing.AllocsPerRun(100, func() {
+		db.clearCurrentSnapshotCachesForTesting()
+		if !qv.materializeOrderBasicLimitComplementBaseOp(op, stats.cacheKey) {
+			t.Fatal("expected cold materialization")
+		}
+	})
+	if allocs != 0 {
+		t.Fatalf("unexpected allocs after warmup: got=%v want=0", allocs)
+	}
+}
+
+func TestDumpQueryKeysFrontpageCandidate_ColdTurnoverAllocProfile(t *testing.T) {
+	profilePath := os.Getenv("RBI_FRONT_PAGE_ALLOC_PROFILE")
+	if profilePath == "" {
+		t.Skip("set RBI_FRONT_PAGE_ALLOC_PROFILE to dump a frontpage alloc profile")
+	}
+
+	prevRate := runtime.MemProfileRate
+	runtime.MemProfileRate = 0
+	defer func() {
+		runtime.MemProfileRate = prevRate
+	}()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "stress_frontpage_turnover_profile.db")
+	db, raw := openBoltAndNew[uint64, StressBenchUser](t, path, benchOptions())
+	t.Cleanup(func() {
+		_ = db.Close()
+		_ = raw.Close()
+	})
+
+	seedBenchStressData(t, db, 50_000)
+	q := qx.Query(
+		qx.EQ("status", "active"),
+		qx.HASANY("tags", []string{"technology", "programming", "golang"}),
+		qx.GTE("score", 120.0),
+		qx.GTE("last_login", benchStressBaseUnix-45*24*3600),
+	).By("score", qx.DESC).Max(100)
+
+	ring := buildStressBenchTurnoverRing(t, db)
+	state := newBenchReadModeState[uint64, StressBenchUser](t, benchCacheMode{suffix: "ColdTurnover", kind: benchCacheModeColdTurnover}, ring)
+
+	for i := 0; i < 12; i++ {
+		state.applyTurnover(t, db)
+		if _, err := db.QueryKeys(q); err != nil {
+			t.Fatalf("warm QueryKeys: %v", err)
+		}
+	}
+
+	for i := 0; i < 128; i++ {
+		state.applyTurnover(t, db)
+		runtime.MemProfileRate = 1
+		if _, err := db.QueryKeys(q); err != nil {
+			t.Fatalf("profiled QueryKeys: %v", err)
+		}
+		runtime.MemProfileRate = 0
+	}
+
+	runtime.GC()
+	f, err := os.Create(profilePath)
+	if err != nil {
+		t.Fatalf("Create(alloc profile): %v", err)
+	}
+	defer func() {
+		_ = f.Close()
+	}()
+	profile := pprof.Lookup("allocs")
+	if profile == nil {
+		t.Fatal("allocs profile unavailable")
+	}
+	if err := profile.WriteTo(f, 0); err != nil {
+		t.Fatalf("WriteTo(alloc profile): %v", err)
 	}
 }
 

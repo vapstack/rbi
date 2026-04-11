@@ -36,15 +36,6 @@ func snapshotPostingContainsAll(t *testing.T, ids posting.List, want ...uint64) 
 	}
 }
 
-func mustMaterializedPredKey(t *testing.T, encoded string) materializedPredKey {
-	t.Helper()
-	key, ok := materializedPredKeyFromEncoded(encoded)
-	if !ok {
-		t.Fatalf("expected parseable materialized predicate key %q", encoded)
-	}
-	return key
-}
-
 func TestSnapshotSequence_PublishedOnWrite(t *testing.T) {
 	db, _ := openTempDBUint64(t)
 
@@ -333,6 +324,124 @@ func TestSnapshot_UnpinPrunesRegistryWhenLastReaderExits(t *testing.T) {
 	}
 }
 
+func TestSnapshotReleaseOwnedStorage_SkipsLiveSharedFlatRoot(t *testing.T) {
+	shared := snapshotExtPosting()
+	for i := uint64(0); i < 96; i++ {
+		shared = shared.BuildAdded((i << 1) + 1)
+	}
+	sharedStorage := snapshotExtFlatStorageOwned(
+		index{Key: indexKeyFromString("shared"), IDs: shared},
+	)
+
+	old := &indexSnapshot{
+		seq: 1,
+		index: map[string]fieldIndexStorage{
+			"f": sharedStorage,
+		},
+	}
+	current := &indexSnapshot{
+		seq: 2,
+		index: map[string]fieldIndexStorage{
+			"f": sharedStorage,
+		},
+	}
+	current.retainSharedOwnedStorageFrom(old)
+
+	oldRef := &snapshotRef{snap: old}
+	currentRef := &snapshotRef{snap: current}
+	db := &DB[uint64, struct{}]{}
+	db.snapshot.bySeq = map[uint64]*snapshotRef{
+		old.seq:     oldRef,
+		current.seq: currentRef,
+	}
+	db.snapshot.current.Store(current)
+	db.snapshot.currentRef.Store(currentRef)
+
+	db.snapshot.mu.Lock()
+	retired := db.releaseRetiredSnapshotRefLocked(old.seq, oldRef)
+	db.snapshot.mu.Unlock()
+	retired.releaseOwnedStorage()
+	if !snapshotExtFieldContainsID(t, current, "f", "shared", 1) {
+		t.Fatalf("current snapshot lost shared posting after old prune")
+	}
+	if !snapshotExtFieldContainsID(t, current, "f", "shared", 191) {
+		t.Fatalf("current snapshot shared posting corrupted after old prune")
+	}
+
+	shared.ReleasePayload()
+}
+
+func TestSnapshotFromEmptyBase_PublishedUniverseGetsOwnerAndPinnedScanStaysStable(t *testing.T) {
+	db, _ := openTempDBString(t, Options{
+		AnalyzeInterval: -1,
+		AutoBatchMax:    1,
+	})
+
+	const seedN = 256
+	keys := make([]string, 0, seedN)
+	vals := make([]*Rec, 0, seedN)
+	for i := 1; i <= seedN; i++ {
+		key := fmt.Sprintf("k%04d", i)
+		keys = append(keys, key)
+		vals = append(vals, &Rec{
+			Meta:     Meta{Country: "NL"},
+			Name:     key,
+			Email:    fmt.Sprintf("%s@example.test", key),
+			Age:      i,
+			Score:    float64(i),
+			Active:   i%2 == 0,
+			Tags:     []string{"go", "db"},
+			FullName: key,
+		})
+	}
+
+	if err := db.BatchSet(keys, vals); err != nil {
+		t.Fatalf("BatchSet(seed): %v", err)
+	}
+
+	old := db.getSnapshot()
+	if old.universeOwner == nil {
+		t.Fatal("expected from-empty published snapshot to own universe")
+	}
+	pinned, ref, ok := db.pinSnapshotRefBySeq(old.seq)
+	if !ok || pinned != old {
+		t.Fatal("expected seeded snapshot to be pinnable")
+	}
+	defer db.unpinSnapshotRef(old.seq, ref)
+
+	expect := slices.Clone(keys)
+	checkPinned := func() {
+		t.Helper()
+		iter := pinned.universe.Iter()
+		defer iter.Release()
+
+		got := make([]string, 0, len(expect))
+		if err := db.scanStringKeys(pinned.strmap, pinned.universe, iter, "", func(id string) (bool, error) {
+			got = append(got, id)
+			return true, nil
+		}); err != nil {
+			t.Fatalf("scanStringKeys(pinned): %v", err)
+		}
+		if !slices.Equal(got, expect) {
+			t.Fatalf("pinned scan mismatch: got=%v want=%v", got, expect)
+		}
+	}
+
+	checkPinned()
+
+	for i := 0; i < 32; i++ {
+		key := keys[i%len(keys)]
+		if err := db.Patch(key, []Field{
+			{Name: "active", Value: i%2 == 0},
+			{Name: "country", Value: "DE"},
+			{Name: "name", Value: fmt.Sprintf("patched-%03d", i)},
+		}); err != nil {
+			t.Fatalf("Patch(%s): %v", key, err)
+		}
+		checkPinned()
+	}
+}
+
 /**/
 
 func snapshotExtOptions() Options {
@@ -350,16 +459,67 @@ func snapshotExtPosting(ids ...uint64) posting.List {
 	return out
 }
 
-func snapshotExtSyncMapLen(m *sync.Map) int {
-	if m == nil {
+func snapshotExtInitMaterializedPredCache(s *indexSnapshot) {
+	if s == nil || s.matPredCacheMaxEntries <= 0 || s.matPredCache != nil {
+		return
+	}
+	s.matPredCache = materializedPredCachePool.Get()
+	s.matPredCache.init(s.matPredCacheMaxEntries)
+}
+
+func snapshotExtMaterializedPredEntryCount(s *indexSnapshot) int {
+	if s == nil || s.matPredCache == nil {
 		return 0
 	}
-	var n int
-	m.Range(func(_, _ any) bool {
-		n++
-		return true
-	})
-	return n
+	return s.matPredCache.entryCount()
+}
+
+func snapshotExtStoreMaterializedPredEntry(
+	tb testing.TB,
+	s *indexSnapshot,
+	key string,
+	entry *materializedPredCacheEntry,
+) {
+	tb.Helper()
+	snapshotExtInitMaterializedPredCache(s)
+	parsed, ok := materializedPredCacheKeyFromString(key)
+	if !ok {
+		tb.Fatalf("invalid materialized predicate key %q", key)
+	}
+	if entry != nil && entry.refs.Load() == 0 {
+		entry.refs.Store(1)
+	}
+	s.matPredCache.mu.Lock()
+	defer s.matPredCache.mu.Unlock()
+	if _, exists := s.matPredCache.lookupLocked(parsed); exists {
+		tb.Fatalf("duplicate materialized predicate key %q", key)
+	}
+	if !s.matPredCache.insertLocked(parsed, entry) {
+		tb.Fatalf("failed to insert materialized predicate key %q", key)
+	}
+	s.matPredCacheCount.Add(1)
+	if entry != nil && entry.oversized {
+		s.matPredCacheOversizedCount.Add(1)
+	}
+}
+
+func snapshotExtLoadMaterializedPredEntry(
+	tb testing.TB,
+	s *indexSnapshot,
+	key string,
+) (*materializedPredCacheEntry, bool) {
+	tb.Helper()
+	if s == nil || s.matPredCache == nil {
+		return nil, false
+	}
+	parsed, ok := materializedPredCacheKeyFromString(key)
+	if !ok {
+		tb.Fatalf("invalid materialized predicate key %q", key)
+	}
+	s.matPredCache.mu.RLock()
+	entry, hit := s.matPredCache.lookupLocked(parsed)
+	s.matPredCache.mu.RUnlock()
+	return entry, hit
 }
 
 func snapshotExtStorage(keys ...string) fieldIndexStorage {
@@ -371,6 +531,15 @@ func snapshotExtStorage(keys ...string) fieldIndexStorage {
 		m[key] = (posting.List{}).BuildAdded(uint64(i + 1))
 	}
 	return newFlatFieldIndexStorageFromPostingMapOwned(m, false)
+}
+
+func snapshotExtFlatStorageOwned(entries ...index) fieldIndexStorage {
+	if len(entries) == 0 {
+		return fieldIndexStorage{}
+	}
+	out := make([]index, len(entries))
+	copy(out, entries)
+	return newFlatFieldIndexStorage(&out)
 }
 
 func snapshotExtFieldContainsID(tb testing.TB, s *indexSnapshot, field, key string, id uint64) bool {
@@ -745,16 +914,21 @@ func TestSnapshotExt_OldSnapshotFieldLookupImmutableAcrossSetUpdate(t *testing.T
 	}
 
 	s1 := db.getSnapshot()
+	pinnedS1, ref, ok := db.pinSnapshotRefBySeq(s1.seq)
+	if !ok || pinnedS1 != s1 {
+		t.Fatalf("expected old snapshot to be pinnable")
+	}
+	defer db.unpinSnapshotRef(s1.seq, ref)
 
 	if err := db.Set(2, &Rec{Name: "charlie", Age: 20}); err != nil {
 		t.Fatalf("Set(update): %v", err)
 	}
 
 	s2 := db.getSnapshot()
-	if !snapshotExtFieldContainsID(t, s1, "name", "bob", 2) {
+	if !snapshotExtFieldContainsID(t, pinnedS1, "name", "bob", 2) {
 		t.Fatalf("old snapshot lost original scalar posting")
 	}
-	if snapshotExtFieldContainsID(t, s1, "name", "charlie", 2) {
+	if snapshotExtFieldContainsID(t, pinnedS1, "name", "charlie", 2) {
 		t.Fatalf("old snapshot unexpectedly sees updated scalar posting")
 	}
 	if !snapshotExtFieldContainsID(t, s2, "name", "charlie", 2) {
@@ -773,16 +947,21 @@ func TestSnapshotExt_OldSnapshotLenIndexImmutableAcrossSetUpdate(t *testing.T) {
 	}
 
 	s1 := db.getSnapshot()
+	pinnedS1, ref, ok := db.pinSnapshotRefBySeq(s1.seq)
+	if !ok || pinnedS1 != s1 {
+		t.Fatalf("expected old snapshot to be pinnable")
+	}
+	defer db.unpinSnapshotRef(s1.seq, ref)
 
 	if err := db.Set(1, &Rec{Name: "alice", Tags: []string{"go"}}); err != nil {
 		t.Fatalf("Set(update): %v", err)
 	}
 
 	s2 := db.getSnapshot()
-	if !snapshotExtLenContainsID(t, s1, "tags", 2, 1) {
+	if !snapshotExtLenContainsID(t, pinnedS1, "tags", 2, 1) {
 		t.Fatalf("old snapshot lost original len posting")
 	}
-	if snapshotExtLenContainsID(t, s1, "tags", 1, 1) {
+	if snapshotExtLenContainsID(t, pinnedS1, "tags", 1, 1) {
 		t.Fatalf("old snapshot unexpectedly sees updated len posting")
 	}
 	if !snapshotExtLenContainsID(t, s2, "tags", 1, 1) {
@@ -808,10 +987,15 @@ func TestSnapshotExt_ZeroComplementLenIndexImmutableAcrossPatchToEmpty(t *testin
 	}
 
 	s1 := db.getSnapshot()
-	if !s1.lenZeroComplement["tags"] {
+	pinnedS1, ref, ok := db.pinSnapshotRefBySeq(s1.seq)
+	if !ok || pinnedS1 != s1 {
+		t.Fatalf("expected old snapshot to be pinnable")
+	}
+	defer db.unpinSnapshotRef(s1.seq, ref)
+	if !pinnedS1.lenZeroComplement["tags"] {
 		t.Fatalf("expected zero-complement len index for sparse non-empty tags")
 	}
-	if !snapshotExtLenNonEmptyContainsID(t, s1, "tags", 1) {
+	if !snapshotExtLenNonEmptyContainsID(t, pinnedS1, "tags", 1) {
 		t.Fatalf("expected old snapshot non-empty sentinel to include id=1")
 	}
 
@@ -820,7 +1004,7 @@ func TestSnapshotExt_ZeroComplementLenIndexImmutableAcrossPatchToEmpty(t *testin
 	}
 
 	s2 := db.getSnapshot()
-	if !snapshotExtLenNonEmptyContainsID(t, s1, "tags", 1) {
+	if !snapshotExtLenNonEmptyContainsID(t, pinnedS1, "tags", 1) {
 		t.Fatalf("old snapshot lost non-empty sentinel membership")
 	}
 	if snapshotExtLenNonEmptyContainsID(t, s2, "tags", 1) {
@@ -836,13 +1020,18 @@ func TestSnapshotExt_OldSnapshotNilIndexImmutableAcrossPatch(t *testing.T) {
 	}
 
 	s1 := db.getSnapshot()
+	pinnedS1, ref, ok := db.pinSnapshotRefBySeq(s1.seq)
+	if !ok || pinnedS1 != s1 {
+		t.Fatalf("expected old snapshot to be pinnable")
+	}
+	defer db.unpinSnapshotRef(s1.seq, ref)
 	val := "zzz"
 	if err := db.Patch(1, []Field{{Name: "opt", Value: &val}}); err != nil {
 		t.Fatalf("Patch(opt): %v", err)
 	}
 
 	s2 := db.getSnapshot()
-	if !snapshotExtNilContainsID(t, s1, "opt", 1) {
+	if !snapshotExtNilContainsID(t, pinnedS1, "opt", 1) {
 		t.Fatalf("old snapshot lost nil-index membership")
 	}
 	if snapshotExtNilContainsID(t, s2, "opt", 1) {
@@ -864,12 +1053,17 @@ func TestSnapshotExt_OldSnapshotUniverseImmutableAcrossDelete(t *testing.T) {
 	}
 
 	s1 := db.getSnapshot()
+	pinnedS1, ref, ok := db.pinSnapshotRefBySeq(s1.seq)
+	if !ok || pinnedS1 != s1 {
+		t.Fatalf("expected old snapshot to be pinnable")
+	}
+	defer db.unpinSnapshotRef(s1.seq, ref)
 	if err := db.Delete(2); err != nil {
 		t.Fatalf("Delete(2): %v", err)
 	}
 
 	s2 := db.getSnapshot()
-	if !s1.universe.Contains(2) || s1.universe.Cardinality() != 2 {
+	if !pinnedS1.universe.Contains(2) || pinnedS1.universe.Cardinality() != 2 {
 		t.Fatalf("old snapshot universe mutated after delete")
 	}
 	if s2.universe.Contains(2) || s2.universe.Cardinality() != 1 {
@@ -1180,7 +1374,7 @@ func TestSnapshotExt_ClearRuntimeCachesForTestingClearsCurrentSnapshotCaches(t *
 	setNumericBucketKnobs(t, db, 128, 1, 1)
 	snap := db.getSnapshot()
 	snapshotExtEvalNumericRangeBuckets(t, db, qx.Expr{Op: qx.OpGTE, Field: "age", Value: 500})
-	if snap.numericRangeBucketCache == nil || snapshotExtSyncMapLen(snap.numericRangeBucketCache) == 0 {
+	if snap.numericRangeBucketCache == nil || snap.numericRangeBucketCache.entryCount() == 0 {
 		t.Fatalf("expected numeric range bucket cache entries after evaluation")
 	}
 	if got := snap.matPredCacheCount.Load(); got != 0 {
@@ -1205,7 +1399,7 @@ func TestSnapshotExt_ClearRuntimeCachesForTestingClearsCurrentSnapshotCaches(t *
 	if snap.shouldPromoteRuntimeMaterializedPred("age\x1f5\x1f500") {
 		t.Fatalf("expected first runtime promotion sight to stay local")
 	}
-	if got := snapshotExtSyncMapLen(&snap.runtimeMatPredSeen.keys); got != 1 {
+	if got := snap.runtimeMatPredSeen.entryCount(); got != 1 {
 		t.Fatalf("expected one runtime seen-key entry before clear, got=%d", got)
 	}
 
@@ -1214,10 +1408,10 @@ func TestSnapshotExt_ClearRuntimeCachesForTestingClearsCurrentSnapshotCaches(t *
 	if db.getSnapshot() != snap {
 		t.Fatalf("expected cache clear to keep current snapshot published")
 	}
-	if got := snapshotExtSyncMapLen(snap.numericRangeBucketCache); got != 0 {
+	if got := snap.numericRangeBucketCache.entryCount(); got != 0 {
 		t.Fatalf("expected numeric range bucket cache to be empty after clear, got=%d", got)
 	}
-	if got := snapshotExtSyncMapLen(&snap.matPredCache); got != 0 {
+	if got := snapshotExtMaterializedPredEntryCount(snap); got != 0 {
 		t.Fatalf("expected materialized predicate cache to be empty after clear, got=%d", got)
 	}
 	if got := snap.matPredCacheCount.Load(); got != 0 {
@@ -1229,10 +1423,10 @@ func TestSnapshotExt_ClearRuntimeCachesForTestingClearsCurrentSnapshotCaches(t *
 	if _, ok := snap.loadMaterializedPred(cacheKey); ok {
 		t.Fatalf("expected cleared materialized predicate cache entry to be absent")
 	}
-	if got := snapshotExtSyncMapLen(&snap.runtimeMatPredSeen.keys); got != 0 {
+	if got := snap.runtimeMatPredSeen.entryCount(); got != 0 {
 		t.Fatalf("expected runtime seen-key cache to be empty after clear, got=%d", got)
 	}
-	if got := snapshotExtSyncMapLen(&snap.orderORMatPredObserved.keys); got != 0 {
+	if got := snap.orderORMatPredObserved.entryCount(); got != 0 {
 		t.Fatalf("expected ordered OR observed-work cache to be empty after clear, got=%d", got)
 	}
 }
@@ -1250,7 +1444,7 @@ func TestSnapshotExt_RuntimeSeenPromotionBounded(t *testing.T) {
 			t.Fatalf("expected first runtime sight for %q to stay local", key)
 		}
 	}
-	if got := snapshotExtSyncMapLen(&s.runtimeMatPredSeen.keys); got > limit {
+	if got := s.runtimeMatPredSeen.entryCount(); got > limit {
 		t.Fatalf("runtime seen-key cache exceeded limit: got=%d want<=%d", got, limit)
 	}
 
@@ -1266,13 +1460,13 @@ func TestSnapshotExt_OrderedORObservedPromotionAccumulates(t *testing.T) {
 	if s.shouldPromoteObservedOrderedORMaterializedPred(key, 10, 25) {
 		t.Fatalf("expected first observed work below threshold to stay local")
 	}
-	if got := snapshotExtSyncMapLen(&s.orderORMatPredObserved.keys); got != 1 {
+	if got := s.orderORMatPredObserved.entryCount(); got != 1 {
 		t.Fatalf("expected one ordered OR observed-work entry, got=%d", got)
 	}
 	if !s.shouldPromoteObservedOrderedORMaterializedPred(key, 15, 25) {
 		t.Fatalf("expected accumulated observed work to trigger promotion")
 	}
-	if got := snapshotExtSyncMapLen(&s.orderORMatPredObserved.keys); got != 0 {
+	if got := s.orderORMatPredObserved.entryCount(); got != 0 {
 		t.Fatalf("expected promoted ordered OR observed-work entry to be removed, got=%d", got)
 	}
 }
@@ -1281,13 +1475,14 @@ func TestSnapshotExt_StoreMaterializedPredConcurrentDistinctKeysRespectsLimit(t 
 	n := max(16, runtime.GOMAXPROCS(0)*8)
 	for round := 0; round < 16; round++ {
 		s := &indexSnapshot{matPredCacheMaxEntries: 1}
+		snapshotExtInitMaterializedPredCache(s)
 		snapshotExtRunConcurrent(n, func(i int) {
 			s.storeMaterializedPred(fmt.Sprintf("email\x1f%d\x1f%d", qx.OpPREFIX, i), posting.List{})
 		})
 		if got := s.matPredCacheCount.Load(); got > 1 {
 			t.Fatalf("round=%d materialized cache count exceeded limit: got=%d", round, got)
 		}
-		if got := snapshotExtSyncMapLen(&s.matPredCache); got > 1 {
+		if got := snapshotExtMaterializedPredEntryCount(s); got > 1 {
 			t.Fatalf("round=%d materialized cache entries exceeded limit: got=%d", round, got)
 		}
 	}
@@ -1296,6 +1491,7 @@ func TestSnapshotExt_StoreMaterializedPredConcurrentDistinctKeysRespectsLimit(t 
 func TestSnapshotExt_StoreMaterializedPredConcurrentSameKeyStoresSingleEntry(t *testing.T) {
 	n := max(16, runtime.GOMAXPROCS(0)*8)
 	s := &indexSnapshot{matPredCacheMaxEntries: 8}
+	snapshotExtInitMaterializedPredCache(s)
 
 	snapshotExtRunConcurrent(n, func(i int) {
 		s.storeMaterializedPred("email\x1f1\x1fsame", snapshotExtPosting(uint64(i+1)))
@@ -1304,7 +1500,7 @@ func TestSnapshotExt_StoreMaterializedPredConcurrentSameKeyStoresSingleEntry(t *
 	if got := s.matPredCacheCount.Load(); got != 1 {
 		t.Fatalf("expected single cache count for duplicate key, got=%d", got)
 	}
-	if got := snapshotExtSyncMapLen(&s.matPredCache); got != 1 {
+	if got := snapshotExtMaterializedPredEntryCount(s); got != 1 {
 		t.Fatalf("expected single cache entry for duplicate key, got=%d", got)
 	}
 }
@@ -1317,13 +1513,14 @@ func TestSnapshotExt_TryStoreMaterializedPredOversizedConcurrentDistinctKeysResp
 			matPredCacheMaxEntries: 1,
 			matPredCacheMaxCard:    1,
 		}
+		snapshotExtInitMaterializedPredCache(s)
 		snapshotExtRunConcurrent(n, func(i int) {
 			s.tryStoreMaterializedPredOversized(fmt.Sprintf("age\x1frange_bucket\x1f%d", i), bm)
 		})
 		if got := s.matPredCacheCount.Load(); got > 1 {
 			t.Fatalf("round=%d oversized cache count exceeded limit: got=%d", round, got)
 		}
-		if got := snapshotExtSyncMapLen(&s.matPredCache); got > 1 {
+		if got := snapshotExtMaterializedPredEntryCount(s); got > 1 {
 			t.Fatalf("round=%d oversized cache entries exceeded limit: got=%d", round, got)
 		}
 		if got := s.matPredCacheOversizedCount.Load(); got > 1 {
@@ -1339,6 +1536,7 @@ func TestSnapshotExt_TryStoreMaterializedPredOversizedConcurrentSameKeyDoesNotLe
 		matPredCacheMaxEntries: 8,
 		matPredCacheMaxCard:    1,
 	}
+	snapshotExtInitMaterializedPredCache(s)
 
 	snapshotExtRunConcurrent(n, func(i int) {
 		s.tryStoreMaterializedPredOversized("age\x1frange_bucket\x1fsame", bm)
@@ -1347,7 +1545,7 @@ func TestSnapshotExt_TryStoreMaterializedPredOversizedConcurrentSameKeyDoesNotLe
 	if got := s.matPredCacheCount.Load(); got != 1 {
 		t.Fatalf("expected single oversized cache count for duplicate key, got=%d", got)
 	}
-	if got := snapshotExtSyncMapLen(&s.matPredCache); got != 1 {
+	if got := snapshotExtMaterializedPredEntryCount(s); got != 1 {
 		t.Fatalf("expected single oversized cache entry for duplicate key, got=%d", got)
 	}
 	if got := s.matPredCacheOversizedCount.Load(); got != 1 {
@@ -1360,6 +1558,7 @@ func TestSnapshotExt_MaterializedPredCacheOversizedAdmissionTurnsOverEntries(t *
 		matPredCacheMaxEntries: 8,
 		matPredCacheMaxCard:    1,
 	}
+	snapshotExtInitMaterializedPredCache(s)
 
 	small := snapshotExtPosting(1)
 	large := snapshotExtPosting(1, 2)
@@ -1370,7 +1569,7 @@ func TestSnapshotExt_MaterializedPredCacheOversizedAdmissionTurnsOverEntries(t *
 	if got := s.matPredCacheCount.Load(); got != 8 {
 		t.Fatalf("expected regular cache to fill total limit, got=%d", got)
 	}
-	if got := snapshotExtSyncMapLen(&s.matPredCache); got != 8 {
+	if got := snapshotExtMaterializedPredEntryCount(s); got != 8 {
 		t.Fatalf("expected eight regular cache entries before oversized admission, got=%d", got)
 	}
 
@@ -1387,7 +1586,7 @@ func TestSnapshotExt_MaterializedPredCacheOversizedAdmissionTurnsOverEntries(t *
 	if got := s.matPredCacheCount.Load(); got != 8 {
 		t.Fatalf("expected total cache count to remain bounded by limit, got=%d", got)
 	}
-	if got := snapshotExtSyncMapLen(&s.matPredCache); got != 8 {
+	if got := snapshotExtMaterializedPredEntryCount(s); got != 8 {
 		t.Fatalf("expected total cache entries to remain bounded by limit, got=%d", got)
 	}
 	if got := s.matPredCacheOversizedCount.Load(); got != 2 {
@@ -1416,6 +1615,7 @@ func TestSnapshotExt_MaterializedPredCacheRegularAdmissionTurnsOverOlderRegularE
 		matPredCacheMaxEntries: 8,
 		matPredCacheMaxCard:    1,
 	}
+	snapshotExtInitMaterializedPredCache(s)
 
 	small := snapshotExtPosting(1)
 	large := snapshotExtPosting(1, 2)
@@ -1435,7 +1635,7 @@ func TestSnapshotExt_MaterializedPredCacheRegularAdmissionTurnsOverOlderRegularE
 	if got := s.matPredCacheCount.Load(); got != 8 {
 		t.Fatalf("expected total cache count to remain bounded by limit, got=%d", got)
 	}
-	if got := snapshotExtSyncMapLen(&s.matPredCache); got != 8 {
+	if got := snapshotExtMaterializedPredEntryCount(s); got != 8 {
 		t.Fatalf("expected total cache entries to remain bounded by limit, got=%d", got)
 	}
 	if got := s.matPredCacheOversizedCount.Load(); got != 2 {
@@ -1448,13 +1648,14 @@ func TestSnapshotExt_MaterializedPredCacheRegularAdmissionTurnsOverOlderRegularE
 
 func TestSnapshotExt_InheritMaterializedPredCacheSkipsChangedFieldsAndKeepsOthers(t *testing.T) {
 	prev := &indexSnapshot{matPredCacheMaxEntries: 8}
+	snapshotExtInitMaterializedPredCache(prev)
 	nameIDs := snapshotExtPosting(1)
 	emailIDs := snapshotExtPosting(2)
-	prev.matPredCache.Store("name\x1f1\x1fa", &materializedPredCacheEntry{ids: nameIDs})
-	prev.matPredCache.Store("email\x1f1\x1fb", &materializedPredCacheEntry{ids: emailIDs})
-	prev.matPredCacheCount.Store(2)
+	snapshotExtStoreMaterializedPredEntry(t, prev, "name\x1f1\x1fa", &materializedPredCacheEntry{ids: nameIDs})
+	snapshotExtStoreMaterializedPredEntry(t, prev, "email\x1f1\x1fb", &materializedPredCacheEntry{ids: emailIDs})
 
 	next := &indexSnapshot{matPredCacheMaxEntries: 8}
+	snapshotExtInitMaterializedPredCache(next)
 	db := &DB[uint64, struct{}]{
 		indexedFieldByName: map[string]indexedFieldAccessor{
 			"name":  {ordinal: 0},
@@ -1472,16 +1673,14 @@ func TestSnapshotExt_InheritMaterializedPredCacheSkipsChangedFieldsAndKeepsOther
 	}
 }
 
-func TestSnapshotExt_InheritMaterializedPredCacheSkipsMalformedKeysAndBadEntries(t *testing.T) {
+func TestSnapshotExt_InheritMaterializedPredCacheSkipsFieldlessKeys(t *testing.T) {
 	prev := &indexSnapshot{matPredCacheMaxEntries: 8}
-	prev.matPredCache.Store("", &materializedPredCacheEntry{ids: snapshotExtPosting(1)})
-	prev.matPredCache.Store("\x1fbroken", &materializedPredCacheEntry{ids: snapshotExtPosting(1)})
-	prev.matPredCache.Store(123, &materializedPredCacheEntry{ids: snapshotExtPosting(1)})
-	prev.matPredCache.Store("email\x1f1\x1fa", "bad")
-	prev.matPredCache.Store("name\x1f1\x1fb", &materializedPredCacheEntry{ids: posting.List{}})
-	prev.matPredCacheCount.Store(5)
+	snapshotExtInitMaterializedPredCache(prev)
+	snapshotExtStoreMaterializedPredEntry(t, prev, "opaque", &materializedPredCacheEntry{ids: snapshotExtPosting(1)})
+	snapshotExtStoreMaterializedPredEntry(t, prev, "name\x1f1\x1fb", &materializedPredCacheEntry{ids: posting.List{}})
 
 	next := &indexSnapshot{matPredCacheMaxEntries: 8}
+	snapshotExtInitMaterializedPredCache(next)
 	inheritMaterializedPredCache[uint64, struct{}](nil, next, prev, nil)
 
 	if got := next.matPredCacheCount.Load(); got != 1 {
@@ -1495,11 +1694,12 @@ func TestSnapshotExt_InheritMaterializedPredCacheSkipsMalformedKeysAndBadEntries
 
 func TestSnapshotExt_InheritMaterializedPredCacheAllowsTypedNilEntries(t *testing.T) {
 	prev := &indexSnapshot{matPredCacheMaxEntries: 8}
+	snapshotExtInitMaterializedPredCache(prev)
 	var nilEntry *materializedPredCacheEntry
-	prev.matPredCache.Store("name\x1f1\x1fa", nilEntry)
-	prev.matPredCacheCount.Store(1)
+	snapshotExtStoreMaterializedPredEntry(t, prev, "name\x1f1\x1fa", nilEntry)
 
 	next := &indexSnapshot{matPredCacheMaxEntries: 8}
+	snapshotExtInitMaterializedPredCache(next)
 	inheritMaterializedPredCache[uint64, struct{}](nil, next, prev, nil)
 
 	if got := next.matPredCacheCount.Load(); got != 1 {
@@ -1513,16 +1713,17 @@ func TestSnapshotExt_InheritMaterializedPredCacheAllowsTypedNilEntries(t *testin
 
 func TestSnapshotExt_InheritMaterializedPredCacheClampsOversizedCount(t *testing.T) {
 	prev := &indexSnapshot{matPredCacheMaxEntries: 8}
+	snapshotExtInitMaterializedPredCache(prev)
 	oversized := snapshotExtPosting(1, 2)
-	prev.matPredCache.Store("a\x1f1\x1f1", &materializedPredCacheEntry{ids: oversized})
-	prev.matPredCache.Store("b\x1f1\x1f2", &materializedPredCacheEntry{ids: oversized})
-	prev.matPredCache.Store("c\x1f1\x1f3", &materializedPredCacheEntry{ids: oversized})
-	prev.matPredCacheCount.Store(3)
+	snapshotExtStoreMaterializedPredEntry(t, prev, "a\x1f1\x1f1", &materializedPredCacheEntry{ids: oversized, oversized: true})
+	snapshotExtStoreMaterializedPredEntry(t, prev, "b\x1f1\x1f2", &materializedPredCacheEntry{ids: oversized, oversized: true})
+	snapshotExtStoreMaterializedPredEntry(t, prev, "c\x1f1\x1f3", &materializedPredCacheEntry{ids: oversized, oversized: true})
 
 	next := &indexSnapshot{
 		matPredCacheMaxEntries: 8,
 		matPredCacheMaxCard:    1,
 	}
+	snapshotExtInitMaterializedPredCache(next)
 	inheritMaterializedPredCache[uint64, struct{}](nil, next, prev, nil)
 
 	if got := next.matPredCacheCount.Load(); got != 3 {
@@ -1535,32 +1736,33 @@ func TestSnapshotExt_InheritMaterializedPredCacheClampsOversizedCount(t *testing
 
 func TestSnapshotExt_InheritMaterializedPredCachePreservesRecencyStamps(t *testing.T) {
 	prev := &indexSnapshot{matPredCacheMaxEntries: 8}
+	snapshotExtInitMaterializedPredCache(prev)
 	a := &materializedPredCacheEntry{ids: snapshotExtPosting(1)}
+	a.refs.Store(1)
 	a.stamp.Store(7)
 	b := &materializedPredCacheEntry{ids: snapshotExtPosting(2)}
+	b.refs.Store(1)
 	b.stamp.Store(13)
-	prev.matPredCache.Store("email\x1f1\x1fa", a)
-	prev.matPredCache.Store("name\x1f1\x1fb", b)
-	prev.matPredCacheCount.Store(2)
+	snapshotExtStoreMaterializedPredEntry(t, prev, "email\x1f1\x1fa", a)
+	snapshotExtStoreMaterializedPredEntry(t, prev, "name\x1f1\x1fb", b)
 	prev.matPredCacheClock.Store(13)
 
 	next := &indexSnapshot{matPredCacheMaxEntries: 8}
+	snapshotExtInitMaterializedPredCache(next)
 	inheritMaterializedPredCache[uint64, struct{}](nil, next, prev, nil)
 
-	va, ok := next.matPredCache.Load(mustMaterializedPredKey(t, "email\x1f1\x1fa"))
+	gotA, ok := snapshotExtLoadMaterializedPredEntry(t, next, "email\x1f1\x1fa")
 	if !ok {
 		t.Fatalf("expected first cache entry to be inherited")
 	}
-	gotA, _ := va.(*materializedPredCacheEntry)
 	if gotA == nil || gotA.stamp.Load() != 7 {
 		t.Fatalf("expected first inherited stamp to stay at 7, got=%d", gotA.stamp.Load())
 	}
 
-	vb, ok := next.matPredCache.Load(mustMaterializedPredKey(t, "name\x1f1\x1fb"))
+	gotB, ok := snapshotExtLoadMaterializedPredEntry(t, next, "name\x1f1\x1fb")
 	if !ok {
 		t.Fatalf("expected second cache entry to be inherited")
 	}
-	gotB, _ := vb.(*materializedPredCacheEntry)
 	if gotB == nil || gotB.stamp.Load() != 13 {
 		t.Fatalf("expected second inherited stamp to stay at 13, got=%d", gotB.stamp.Load())
 	}
@@ -1591,28 +1793,31 @@ func TestSnapshotExt_InheritNumericRangeBucketCacheCopiesOnlyMatchingStorage(t *
 	}
 
 	prev := &indexSnapshot{
-		index:                   map[string]fieldIndexStorage{"age": shared, "score": prevChanged},
-		numericRangeBucketCache: &sync.Map{},
+		index: map[string]fieldIndexStorage{"age": shared, "score": prevChanged},
 	}
-	prev.numericRangeBucketCache.Store("age", ageEntry)
-	prev.numericRangeBucketCache.Store("score", scoreEntry)
+	prev.numericRangeBucketCache = numericRangeBucketCachePool.Get()
+	prev.numericRangeBucketCache.init(2)
+	prev.numericRangeBucketCache.storeSlot("age", 0, ageEntry)
+	prev.numericRangeBucketCache.storeSlot("score", 1, scoreEntry)
 
 	next := &indexSnapshot{
 		index: map[string]fieldIndexStorage{"age": shared, "score": nextChanged},
 	}
+	next.numericRangeBucketCache = numericRangeBucketCachePool.Get()
+	next.numericRangeBucketCache.init(2)
 	inheritNumericRangeBucketCache(next, prev)
 
 	if next.numericRangeBucketCache == nil {
-		t.Fatalf("expected next snapshot to own a numeric range cache map")
+		t.Fatalf("expected next snapshot to own a numeric range cache")
 	}
-	if got := snapshotExtSyncMapLen(next.numericRangeBucketCache); got != 1 {
+	if got := next.numericRangeBucketCache.entryCount(); got != 1 {
 		t.Fatalf("expected exactly one inherited numeric range entry, got=%d", got)
 	}
-	raw, ok := next.numericRangeBucketCache.Load("age")
+	raw, ok := next.numericRangeBucketCache.loadField("age")
 	if !ok || raw != ageEntry {
 		t.Fatalf("expected matching-storage entry to be inherited by pointer")
 	}
-	if _, ok := next.numericRangeBucketCache.Load("score"); ok {
+	if _, ok := next.numericRangeBucketCache.loadField("score"); ok {
 		t.Fatalf("expected changed-storage entry to be skipped")
 	}
 }
@@ -1628,32 +1833,34 @@ func TestSnapshotExt_InheritNumericRangeBucketCacheSkipsMalformedAndEmptyEntries
 	}
 
 	prev := &indexSnapshot{
-		index:                   map[string]fieldIndexStorage{"age": valid},
-		numericRangeBucketCache: &sync.Map{},
+		index: map[string]fieldIndexStorage{"age": valid},
 	}
-	prev.numericRangeBucketCache.Store("", validEntry)
-	prev.numericRangeBucketCache.Store(123, validEntry)
-	prev.numericRangeBucketCache.Store("score", &numericRangeBucketCacheEntry{
+	prev.numericRangeBucketCache = numericRangeBucketCachePool.Get()
+	prev.numericRangeBucketCache.init(3)
+	prev.numericRangeBucketCache.storeSlot("", 0, validEntry)
+	prev.numericRangeBucketCache.storeSlot("score", 1, &numericRangeBucketCacheEntry{
 		storage: fieldIndexStorage{},
 		idx: numericRangeBucketIndex{
 			bucketSize: 1,
 			keyCount:   1,
 		},
 	})
-	prev.numericRangeBucketCache.Store("age", validEntry)
+	prev.numericRangeBucketCache.storeSlot("age", 2, validEntry)
 
 	next := &indexSnapshot{
 		index: map[string]fieldIndexStorage{"age": valid},
 	}
+	next.numericRangeBucketCache = numericRangeBucketCachePool.Get()
+	next.numericRangeBucketCache.init(3)
 	inheritNumericRangeBucketCache(next, prev)
 
 	if next.numericRangeBucketCache == nil {
 		t.Fatalf("expected next snapshot to own numeric cache map")
 	}
-	if got := snapshotExtSyncMapLen(next.numericRangeBucketCache); got != 1 {
+	if got := next.numericRangeBucketCache.entryCount(); got != 1 {
 		t.Fatalf("expected malformed/empty entries to be filtered, got=%d", got)
 	}
-	raw, ok := next.numericRangeBucketCache.Load("age")
+	raw, ok := next.numericRangeBucketCache.loadField("age")
 	if !ok || raw != validEntry {
 		t.Fatalf("expected only valid age entry to survive filtering")
 	}
@@ -1675,13 +1882,18 @@ func TestSpanshotExt_ScanKeysStringShouldStayOnSingleSnapshotAcrossTruncate(t *t
 	if old == nil || old.strmap == nil {
 		t.Fatalf("expected published string-key snapshot")
 	}
+	pinned, ref, ok := db.pinSnapshotRefBySeq(old.seq)
+	if !ok || pinned != old {
+		t.Fatalf("expected current string snapshot to be pinnable")
+	}
+	defer db.unpinSnapshotRef(old.seq, ref)
 
 	var want []string
-	iterOld := old.universe.Iter()
+	iterOld := pinned.universe.Iter()
 	defer iterOld.Release()
 	for iterOld.HasNext() {
 		idx := iterOld.Next()
-		key, ok := old.strmap.getStringNoLock(idx)
+		key, ok := pinned.strmap.getStringNoLock(idx)
 		if !ok {
 			t.Fatalf("old snapshot lost key mapping for idx=%d", idx)
 		}
@@ -1691,7 +1903,7 @@ func TestSpanshotExt_ScanKeysStringShouldStayOnSingleSnapshotAcrossTruncate(t *t
 		t.Fatalf("unexpected old snapshot key order: %v", want)
 	}
 
-	universe := db.snapshotUniverseView()
+	universe := pinned.universe
 	iter := universe.Iter()
 	defer iter.Release()
 
@@ -1700,7 +1912,7 @@ func TestSpanshotExt_ScanKeysStringShouldStayOnSingleSnapshotAcrossTruncate(t *t
 	}
 
 	var got []string
-	err := db.scanStringKeys(old.strmap, universe, iter, "", func(id string) (bool, error) {
+	err := db.scanStringKeys(pinned.strmap, universe, iter, "", func(id string) (bool, error) {
 		got = append(got, id)
 		return true, nil
 	})
@@ -1723,7 +1935,12 @@ func TestSpanshotExt_ScanKeysStringSplitSnapshotMustNotEmitFutureKeysAfterTrunca
 	}
 
 	old := db.getSnapshot()
-	universe := db.snapshotUniverseView()
+	pinned, ref, ok := db.pinSnapshotRefBySeq(old.seq)
+	if !ok || pinned != old {
+		t.Fatalf("expected current string snapshot to be pinnable")
+	}
+	defer db.unpinSnapshotRef(old.seq, ref)
+	universe := pinned.universe
 	iter := universe.Iter()
 	defer iter.Release()
 
@@ -1735,7 +1952,7 @@ func TestSpanshotExt_ScanKeysStringSplitSnapshotMustNotEmitFutureKeysAfterTrunca
 	}
 
 	var got []string
-	err := db.scanStringKeys(old.strmap, universe, iter, "", func(id string) (bool, error) {
+	err := db.scanStringKeys(pinned.strmap, universe, iter, "", func(id string) (bool, error) {
 		got = append(got, id)
 		return true, nil
 	})
@@ -1870,6 +2087,7 @@ func TestSpanshotExt_MaterializedPredMixedRegularAndOversizedConcurrentRespectsG
 			matPredCacheMaxEntries: 1,
 			matPredCacheMaxCard:    1,
 		}
+		snapshotExtInitMaterializedPredCache(s)
 		snapshotExtRunConcurrent(n, func(i int) {
 			if i%2 == 0 {
 				s.storeMaterializedPred(fmt.Sprintf("email\x1f%d\x1f%d", qx.OpPREFIX, i), small)
@@ -1881,7 +2099,7 @@ func TestSpanshotExt_MaterializedPredMixedRegularAndOversizedConcurrentRespectsG
 		if got := s.matPredCacheCount.Load(); got > 1 {
 			t.Fatalf("round=%d mixed cache count exceeded global limit: got=%d", round, got)
 		}
-		if got := snapshotExtSyncMapLen(&s.matPredCache); got > 1 {
+		if got := snapshotExtMaterializedPredEntryCount(s); got > 1 {
 			t.Fatalf("round=%d mixed cache entries exceeded global limit: got=%d", round, got)
 		}
 	}
@@ -1889,6 +2107,7 @@ func TestSpanshotExt_MaterializedPredMixedRegularAndOversizedConcurrentRespectsG
 
 func TestIndexSnapshotMaterializedPredCacheDetachedLoadsUnderConcurrency(t *testing.T) {
 	snap := &indexSnapshot{matPredCacheMaxEntries: 8}
+	snapshotExtInitMaterializedPredCache(snap)
 
 	base := snapshotExtPosting()
 	for i := uint64(1); i <= 40; i++ {
@@ -2041,4 +2260,243 @@ func assertPostingConsumerSet(t *testing.T, got posting.List, want []uint64) {
 	if !slices.Equal(gotIDs, want) {
 		t.Fatalf("posting mismatch: got=%v want=%v", gotIDs, want)
 	}
+}
+
+/**/
+
+func TestSnapshotExt_PinCurrentSnapshotTracksReaderPinsAcrossPublish(t *testing.T) {
+	db, _ := openTempDBUint64(t, snapshotExtOptions())
+
+	if err := db.Set(1, &Rec{Name: "alice", Age: 30}); err != nil {
+		t.Fatalf("Set(1): %v", err)
+	}
+
+	current := db.getSnapshot()
+	snap, seq, ref, pinned := db.pinCurrentSnapshot()
+	if !pinned || snap != current {
+		t.Fatalf("expected current snapshot pin")
+	}
+	if seq != current.seq || ref == nil {
+		t.Fatalf("expected current snapshot ref pin")
+	}
+	if got := ref.refs.Load(); got != 1 {
+		t.Fatalf("expected one current snapshot ref, got=%d", got)
+	}
+
+	if err := db.Set(2, &Rec{Name: "bob", Age: 20}); err != nil {
+		t.Fatalf("Set(2): %v", err)
+	}
+
+	if got := ref.refs.Load(); got != 1 {
+		t.Fatalf("expected old snapshot ref pin to survive publish, got=%d", got)
+	}
+
+	db.unpinCurrentSnapshot(seq, ref, pinned)
+	if got := ref.refs.Load(); got != 0 {
+		t.Fatalf("expected current snapshot ref pins to drop after unpin, got=%d", got)
+	}
+}
+
+func TestSnapshotExt_QueryKeysReleasesCurrentSnapshotPinOnError(t *testing.T) {
+	db, _ := openTempDBUint64(t, snapshotExtOptions())
+
+	if err := db.Set(1, &Rec{Name: "alice", Age: 30}); err != nil {
+		t.Fatalf("Set(1): %v", err)
+	}
+
+	snap := db.getSnapshot()
+	if _, err := db.QueryKeys(qx.Query(qx.EQ("does_not_exist", 1))); err == nil {
+		t.Fatalf("expected QueryKeys to fail for unknown field")
+	}
+	ref := db.snapshot.bySeq[snap.seq]
+	if ref == nil {
+		t.Fatalf("expected QueryKeys snapshot ref to remain registered")
+	}
+	if got := ref.refs.Load(); got != 0 {
+		t.Fatalf("expected QueryKeys pin release on error, got=%d", got)
+	}
+}
+
+func TestSnapshotExt_CountReleasesCurrentSnapshotPinOnError(t *testing.T) {
+	db, _ := openTempDBUint64(t, snapshotExtOptions())
+
+	if err := db.Set(1, &Rec{Name: "alice", Age: 30}); err != nil {
+		t.Fatalf("Set(1): %v", err)
+	}
+
+	snap := db.getSnapshot()
+	if _, err := db.Count(qx.Query(qx.EQ("does_not_exist", 1))); err == nil {
+		t.Fatalf("expected Count to fail for unknown field")
+	}
+	ref := db.snapshot.bySeq[snap.seq]
+	if ref == nil {
+		t.Fatalf("expected Count snapshot ref to remain registered")
+	}
+	if got := ref.refs.Load(); got != 0 {
+		t.Fatalf("expected Count pin release on error, got=%d", got)
+	}
+}
+
+func TestSnapshotExt_ScanKeysReleasesCurrentSnapshotPinOnCallbackError(t *testing.T) {
+	db, _ := openTempDBUint64(t, snapshotExtOptions())
+
+	if err := db.Set(1, &Rec{Name: "alice", Age: 30}); err != nil {
+		t.Fatalf("Set(1): %v", err)
+	}
+
+	snap := db.getSnapshot()
+	wantErr := errors.New("stop")
+	err := db.ScanKeys(0, func(uint64) (bool, error) {
+		return false, wantErr
+	})
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("ScanKeys err=%v want %v", err, wantErr)
+	}
+	ref := db.snapshot.bySeq[snap.seq]
+	if ref == nil {
+		t.Fatalf("expected ScanKeys snapshot ref to remain registered")
+	}
+	if got := ref.refs.Load(); got != 0 {
+		t.Fatalf("expected ScanKeys pin release on callback error, got=%d", got)
+	}
+}
+
+/**/
+
+func requireZeroAllocsAfterWarmupRBI(t *testing.T, fn func()) {
+	t.Helper()
+	if testRaceEnabled {
+		t.Skip("testing.AllocsPerRun is not stable under -race")
+	}
+	for i := 0; i < 32; i++ {
+		fn()
+	}
+	allocs := testing.AllocsPerRun(100, fn)
+	if allocs != 0 {
+		t.Fatalf("unexpected allocs after pool warmup: got=%v want=0", allocs)
+	}
+}
+
+func TestMaterializedPredCache_LoadOrStoreAllocsPerRunStayZeroAfterWarmup(t *testing.T) {
+	snap := &indexSnapshot{
+		matPredCacheMaxEntries: 8,
+		matPredCacheMaxCard:    ^uint64(0),
+	}
+	snap.matPredCache = materializedPredCachePool.Get()
+	snap.matPredCache.init(snap.matPredCacheMaxEntries)
+	defer snap.releaseRuntimeCaches()
+
+	keys := [...]materializedPredKey{
+		materializedPredKeyForScalar("email", qx.OpPREFIX, "user"),
+		materializedPredKeyForScalar("email", qx.OpPREFIX, "admin"),
+		materializedPredKeyForScalar("name", qx.OpSUFFIX, "son"),
+		materializedPredKeyForScalar("bio", qx.OpCONTAINS, "ops"),
+	}
+	posts := [...]posting.List{
+		posting.BuildFromSorted([]uint64{3, 9, 17, 25}),
+		posting.BuildFromSorted([]uint64{5, 7, 11, 13, 19, 23, 29, 31, 37, 41, 43, 47}),
+		buildQueryRuntimeTestLargePosting(),
+		posting.BuildFromSorted([]uint64{1<<32 | 3, 1<<32 | 7, 2<<32 | 9, 2<<32 | 15}),
+	}
+	defer posts[0].Release()
+	defer posts[1].Release()
+	defer posts[2].Release()
+	defer posts[3].Release()
+
+	run := func() {
+		snap.matPredCache.clear()
+		snap.matPredCacheCount.Store(0)
+		snap.matPredCacheOversizedCount.Store(0)
+		snap.matPredCacheClock.Store(0)
+		for i := range keys {
+			got, ok := snap.loadOrStoreMaterializedPredKey(keys[i], posts[i].Borrow())
+			if !ok {
+				t.Fatalf("loadOrStoreMaterializedPredKey(%v) did not cache entry", keys[i])
+			}
+			got.Release()
+		}
+	}
+
+	requireZeroAllocsAfterWarmupRBI(t, run)
+}
+
+func TestRecentKeyCache_AllocsPerRunStayZeroAfterWarmup(t *testing.T) {
+	var cache recentKeyCache
+	keys := [...]materializedPredKey{
+		materializedPredKeyForScalar("email", qx.OpPREFIX, "user"),
+		materializedPredKeyForScalar("email", qx.OpPREFIX, "admin"),
+		materializedPredKeyForScalar("name", qx.OpSUFFIX, "son"),
+		materializedPredKeyForScalar("name", qx.OpSUFFIX, "ov"),
+		materializedPredKeyForScalar("bio", qx.OpCONTAINS, "ops"),
+		materializedPredKeyForScalar("bio", qx.OpCONTAINS, "db"),
+	}
+	limit := len(keys)
+
+	run := func() {
+		cache.clear()
+		for i := range keys {
+			if cache.touchOrRemember(keys[i], limit) {
+				t.Fatalf("touchOrRemember unexpectedly reported warm hit for cold key %v", keys[i])
+			}
+		}
+		for i := range keys {
+			if !cache.touchOrRemember(keys[i], limit) {
+				t.Fatalf("touchOrRemember missed existing key %v", keys[i])
+			}
+		}
+		cache.clear()
+		for i := range keys {
+			if cache.addWorkAndShouldPromote(keys[i], limit, 1, 2) {
+				t.Fatalf("addWorkAndShouldPromote promoted too early for key %v", keys[i])
+			}
+		}
+		for i := range keys {
+			if !cache.addWorkAndShouldPromote(keys[i], limit, 1, 2) {
+				t.Fatalf("addWorkAndShouldPromote failed to promote key %v", keys[i])
+			}
+		}
+	}
+
+	requireZeroAllocsAfterWarmupRBI(t, run)
+}
+
+func TestMaterializedPredCacheEntryPool_AllocsPerRunStayZeroAfterWarmup(t *testing.T) {
+	run := func() {
+		var entries [4]*materializedPredCacheEntry
+		for i := range entries {
+			entries[i] = materializedPredCacheEntryPool.Get()
+		}
+		for i := range entries {
+			materializedPredCacheEntryPool.Put(entries[i])
+		}
+	}
+
+	requireZeroAllocsAfterWarmupRBI(t, run)
+}
+
+func TestMaterializedPredCache_InsertNilEntriesAllocsPerRunStayZeroAfterWarmup(t *testing.T) {
+	cache := materializedPredCachePool.Get()
+	cache.init(8)
+	defer materializedPredCachePool.Put(cache)
+
+	keys := [...]materializedPredKey{
+		materializedPredKeyForScalar("email", qx.OpPREFIX, "user"),
+		materializedPredKeyForScalar("email", qx.OpPREFIX, "admin"),
+		materializedPredKeyForScalar("name", qx.OpSUFFIX, "son"),
+		materializedPredKeyForScalar("bio", qx.OpCONTAINS, "ops"),
+	}
+
+	run := func() {
+		cache.clear()
+		cache.mu.Lock()
+		for i := range keys {
+			if !cache.insertLocked(keys[i], nil) {
+				cache.mu.Unlock()
+				t.Fatalf("insertLocked(%v) failed", keys[i])
+			}
+		}
+		cache.mu.Unlock()
+	}
+
+	requireZeroAllocsAfterWarmupRBI(t, run)
 }

@@ -11,7 +11,9 @@ const bitmapContainerWords = maxCapacity / 64
 
 var bitmapContainerPool = pooled.Pointers[containerBitmap]{
 	New: func() *containerBitmap {
-		return &containerBitmap{bitmap: make([]uint64, bitmapContainerWords)}
+		return &containerBitmap{
+			bitmap: make([]uint64, bitmapContainerWords),
+		}
 	},
 	Init: func(bc *containerBitmap) {
 		bc.refs.Store(1)

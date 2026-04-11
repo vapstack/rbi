@@ -471,7 +471,7 @@ func TestBuildPredRange_PrefixMaterializationSkippedWhenCacheDisabled(t *testing
 	if !ok {
 		t.Fatalf("expected parseable materialized cache key %q", rawKey)
 	}
-	if _, ok := db.getSnapshot().matPredCache.Load(parsedKey); ok {
+	if _, ok := db.getSnapshot().loadMaterializedPredKey(parsedKey); ok {
 		t.Fatalf("expected no cache store when materialized predicate cache is disabled")
 	}
 	if got := db.getSnapshot().matPredCacheCount.Load(); got != 0 {
@@ -770,6 +770,41 @@ func TestBuildPredRangeCandidate_ChunkedRangeMatchesBitmapBaseline(t *testing.T)
 	wantCount := countByExprBitmap(t, db, expr)
 	if got.Cardinality() != wantCount {
 		t.Fatalf("range predicate mismatch: got=%d want=%d", got.Cardinality(), wantCount)
+	}
+}
+
+func TestRangeIter_AllocsPerRunStayZeroAfterWarmup(t *testing.T) {
+	if testRaceEnabled {
+		t.Skip("testing.AllocsPerRun is not stable under -race")
+	}
+
+	buckets := []index{
+		{IDs: posting.BuildFromSorted([]uint64{1, 3, 5})},
+		{IDs: posting.BuildFromSorted([]uint64{7})},
+		{IDs: posting.BuildFromSorted([]uint64{9, 11})},
+	}
+	defer func() {
+		for i := range buckets {
+			buckets[i].IDs.Release()
+		}
+	}()
+
+	run := func() {
+		it := newRangeIter(buckets, 0, len(buckets))
+		var sum uint64
+		for it.HasNext() {
+			sum += it.Next()
+		}
+		it.Release()
+		if sum != 36 {
+			t.Fatalf("unexpected iterator sum: %d", sum)
+		}
+	}
+
+	run()
+	allocs := testing.AllocsPerRun(100, run)
+	if allocs != 0 {
+		t.Fatalf("unexpected allocs after warmup: got=%v want=0", allocs)
 	}
 }
 

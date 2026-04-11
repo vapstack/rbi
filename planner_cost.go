@@ -50,13 +50,14 @@ func (qv *queryView[K, V]) decidePlanORNoOrder(q *qx.QX, branches plannerORBranc
 		return d
 	}
 
-	for i := range branches {
-		if branches[i].alwaysTrue {
+	for i := 0; i < branches.Len(); i++ {
+		branch := branches.Get(i)
+		if branch.alwaysTrue {
 			d.use = true
 			d.expectedRows = uint64(need)
 			return d
 		}
-		lead := branches[i].leadPtr()
+		lead := branch.leadPtr()
 		if lead == nil || !lead.hasIter() {
 			return d
 		}
@@ -100,9 +101,10 @@ func (qv *queryView[K, V]) decidePlanORNoOrder(q *qx.QX, branches plannerORBranc
 }
 
 func (branches plannerORBranches) hasNonOrderPrefixTailRisk(orderField string) bool {
-	for i := range branches {
-		for pi := 0; pi < branches[i].predLen(); pi++ {
-			p := branches[i].pred(pi)
+	for i := 0; i < branches.Len(); i++ {
+		branch := branches.Get(i)
+		for pi := 0; pi < branch.predLen(); pi++ {
+			p := branch.pred(pi)
 			if isPositiveNonOrderScalarPrefixLeaf(orderField, p.expr) && !p.isMaterializedLike() {
 				return true
 			}
@@ -170,7 +172,7 @@ func (qv *queryView[K, V]) decidePlanOROrder(q *qx.QX, branches plannerORBranche
 
 	// Merge strategy only makes sense when no branch is tautological and the
 	// requested window is bounded enough to amortize branch merge overhead.
-	mergeNeedLimit := plannerOROrderMergeNeedLimit(need, len(branches), unionCard, sumCard, q.Offset)
+	mergeNeedLimit := plannerOROrderMergeNeedLimit(need, branches.Len(), unionCard, sumCard, q.Offset)
 	mergeAllowed := !hasAlwaysTrue && need <= mergeNeedLimit
 	if mergeAllowed {
 		costMerge := branches.orderMergeCost(uint64(need), &branchCards, branchCount, unionCard, sumCard, universe, orderStats, mergeStats)
@@ -205,7 +207,7 @@ func (branches plannerORBranches) unionCards(universe uint64, branchCards *[plan
 		return 0, 0, 0, false
 	}
 
-	n := len(branches)
+	n := branches.Len()
 	if n > plannerORBranchLimit {
 		n = plannerORBranchLimit
 	}
@@ -213,14 +215,15 @@ func (branches plannerORBranches) unionCards(universe uint64, branchCards *[plan
 	remainProb := 1.0
 
 	for i := 0; i < n; i++ {
-		if branches[i].alwaysTrue {
+		branch := branches.Get(i)
+		if branch.alwaysTrue {
 			if branchCards != nil {
 				branchCards[i] = universe
 			}
 			return universe, universe, n, true
 		}
 
-		card := branches[i].estimatedCard(universe)
+		card := branch.estimatedCard(universe)
 		if branchCards != nil {
 			branchCards[i] = card
 		}
@@ -326,29 +329,30 @@ func estimateRowsForNeed(need, card, universe uint64) uint64 {
 }
 
 func (branches plannerORBranches) noOrderChecks(branchCards *[plannerORBranchLimit]uint64, branchCount int) float64 {
-	if len(branches) == 0 {
+	if branches.Len() == 0 {
 		return 1.0
 	}
 
 	totalWeight := float64(0)
 	totalChecks := float64(0)
 
-	n := len(branches)
+	n := branches.Len()
 	if branchCount > 0 && branchCount < n {
 		n = branchCount
 	}
 	for i := 0; i < n; i++ {
+		branch := branches.Get(i)
 		weight := float64(1)
 		if branchCards != nil && branchCards[i] > 0 {
 			weight = float64(branchCards[i])
 		}
 
 		checks := 0
-		for pi := 0; pi < branches[i].predLen(); pi++ {
-			if pi == branches[i].leadIdx {
+		for pi := 0; pi < branch.predLen(); pi++ {
+			if pi == branch.leadIdx {
 				continue
 			}
-			p := branches[i].pred(pi)
+			p := branch.pred(pi)
 			if p.alwaysTrue || p.alwaysFalse {
 				continue
 			}
@@ -380,12 +384,12 @@ func (branches plannerORBranches) orderStreamChecksByBranch(
 		return 1.0
 	}
 
-	if len(branches) == 0 {
+	if branches.Len() == 0 {
 		return 1.0
 	}
 
 	total := float64(0)
-	n := len(branches)
+	n := branches.Len()
 	if n > plannerORBranchLimit {
 		n = plannerORBranchLimit
 	}
@@ -421,7 +425,7 @@ func (branches plannerORBranches) orderMergeCost(
 	subRows := float64(0)
 	candidateUpper := uint64(0)
 
-	n := len(branches)
+	n := branches.Len()
 	if branchCount > 0 && branchCount < n {
 		n = branchCount
 	}

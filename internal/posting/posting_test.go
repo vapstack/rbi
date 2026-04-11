@@ -5,12 +5,111 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"io"
+	"os"
+	"path/filepath"
+	"runtime"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"unsafe"
 )
+
+var forbiddenListMethodNames = map[string]struct{}{
+	"Add":           {},
+	"CheckedAdd":    {},
+	"AddMany":       {},
+	"Remove":        {},
+	"OrInPlace":     {},
+	"AndInPlace":    {},
+	"AndNotInPlace": {},
+	"Optimize":      {},
+	"Clear":         {},
+	"MergeOwned":    {},
+	"ReadFrom":      {},
+	"OrInto":        {},
+	"AndNotFrom":    {},
+}
+
+func TestListRemainsSmallValueHandle(t *testing.T) {
+	if got := unsafe.Sizeof(List{}); got != 16 {
+		t.Fatalf("posting.List size changed: got=%d want=16", got)
+	}
+}
+
+func TestListForbiddenMethodsGuard(t *testing.T) {
+	dir := testPackageDir(t)
+	fset := token.NewFileSet()
+	var failures []string
+
+	err := filepath.WalkDir(dir, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			if d.Name() == "testdata" {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
+			return nil
+		}
+
+		file, parseErr := parser.ParseFile(fset, path, nil, parser.SkipObjectResolution)
+		if parseErr != nil {
+			return parseErr
+		}
+
+		for _, decl := range file.Decls {
+			fn, ok := decl.(*ast.FuncDecl)
+			if !ok || fn.Recv == nil || len(fn.Recv.List) == 0 {
+				continue
+			}
+			if !isListReceiver(fn.Recv.List[0].Type) {
+				continue
+			}
+			if _, forbidden := forbiddenListMethodNames[fn.Name.Name]; forbidden {
+				failures = append(failures, fset.Position(fn.Pos()).String()+": forbidden production method on posting.List: "+fn.Name.Name)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walk posting package: %v", err)
+	}
+	if len(failures) > 0 {
+		t.Fatalf("posting.List architecture guard failed:\n%s", strings.Join(failures, "\n"))
+	}
+}
+
+func testPackageDir(t *testing.T) string {
+	t.Helper()
+	_, file, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller failed")
+	}
+	return filepath.Dir(file)
+}
+
+func isListReceiver(expr ast.Expr) bool {
+	switch v := expr.(type) {
+	case *ast.Ident:
+		return v.Name == "List"
+	case *ast.StarExpr:
+		id, ok := v.X.(*ast.Ident)
+		return ok && id.Name == "List"
+	default:
+		return false
+	}
+}
+
+/**/
 
 func postingFromIDs(ids ...uint64) List {
 	var out List

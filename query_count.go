@@ -36,7 +36,10 @@ func (db *DB[K, V]) Count(q *qx.QX) (uint64, error) {
 		return 0, ErrNoIndex
 	}
 
-	view := db.makeQueryView(db.getSnapshot())
+	snap, seq, ref, pinned := db.pinCurrentSnapshot()
+	defer db.unpinCurrentSnapshot(seq, ref, pinned)
+
+	view := db.makeQueryView(snap)
 	defer db.releaseQueryView(view)
 	return view.countInternal(q, true)
 }
@@ -324,38 +327,66 @@ func countApplyLeadResidualExactFilters(src, work posting.List, filters *pooled.
 		return src, work
 	}
 
-	work = src.CloneInto(work)
+	current := src.Borrow()
 	for i := 0; i < filters.Len(); i++ {
 		f := filters.Get(i)
 		if f.state != nil {
-			next, ok := f.state.apply(work)
+			sharedWork := !current.IsEmpty() && current.SharesPayload(work)
+			next, ok := f.state.apply(current)
 			if !ok {
 				union := f.state.materialize()
 				if union.IsEmpty() {
-					work.Release()
-					work = posting.List{}
+					if sharedWork {
+						work = posting.List{}
+					}
+					current.Release()
+					current = posting.List{}
 					break
 				}
-				work = work.BuildAnd(union)
+				if current.IsBorrowed() {
+					current = current.CloneInto(work)
+				} else if !sharedWork {
+					work.Release()
+				}
+				current = current.BuildAnd(union)
+				work = current
 			} else {
-				work = next
-			}
-			if work.IsEmpty() {
-				break
+				current = next
+				if current.IsEmpty() {
+					if sharedWork {
+						work = posting.List{}
+					}
+					break
+				}
+				if !current.IsBorrowed() {
+					if !current.SharesPayload(work) {
+						work.Release()
+					}
+					work = current
+				}
 			}
 			continue
 		}
 		if f.ids.IsEmpty() {
-			work.Release()
-			work = posting.List{}
+			if current.SharesPayload(work) {
+				work = posting.List{}
+			}
+			current.Release()
+			current = posting.List{}
 			break
 		}
-		work = work.BuildAnd(f.ids)
-		if work.IsEmpty() {
+		if current.IsBorrowed() {
+			current = current.CloneInto(work)
+		} else if !current.SharesPayload(work) {
+			work.Release()
+		}
+		current = current.BuildAnd(f.ids)
+		work = current
+		if current.IsEmpty() {
 			break
 		}
 	}
-	return work, work
+	return current, work
 }
 
 func shouldApplyCountLeadResidualExactFilters(src posting.List, filters *pooled.SliceBuf[countLeadResidualExactFilter]) bool {
@@ -1643,9 +1674,27 @@ func (qv *queryView[K, V]) countORMaterializedSpillUnion(
 			branchTrace[br.index].SkipReason = "materialized_spill"
 		}
 
-		res, err := qv.evalExpr(br.expr)
-		if err != nil {
-			return 0, 0, true, err
+		var (
+			res postingResult
+			err error
+		)
+		if !br.expr.Not && br.expr.Op == qx.OpAND && len(br.expr.Operands) > 1 {
+			var ok bool
+			res, ok, err = qv.evalAndOperandsExceptReordered(br.expr.Operands, -1)
+			if err != nil {
+				return 0, 0, true, err
+			}
+			if !ok {
+				res, err = qv.evalExpr(br.expr)
+				if err != nil {
+					return 0, 0, true, err
+				}
+			}
+		} else {
+			res, err = qv.evalExpr(br.expr)
+			if err != nil {
+				return 0, 0, true, err
+			}
 		}
 		if res.neg {
 			res.release()
@@ -2557,6 +2606,12 @@ func (qv *queryView[K, V]) tryCountByPredicatesLeadBuckets(preds predicateSet, l
 				}
 				continue
 			}
+			if len(activeChecks) == 1 {
+				if in, ok := preds.Get(activeChecks[0]).countBucket(ids); ok {
+					cnt += in
+					continue
+				}
+			}
 
 			if len(exactActive) == 0 && (extraExactBuf == nil || extraExactBuf.Len() == 0) {
 				cnt += countPostingMatchesMultiSet(preds, activeChecks, ids)
@@ -2703,6 +2758,12 @@ func (qv *queryView[K, V]) tryCountByPredicatesLeadBuckets(preds predicateSet, l
 			}
 			continue
 		}
+		if len(activeChecks) == 1 {
+			if in, ok := preds.Get(activeChecks[0]).countBucket(ids); ok {
+				cnt += in
+				continue
+			}
+		}
 
 		if len(exactActive) == 0 && (extraExactBuf == nil || extraExactBuf.Len() == 0) {
 			cnt += countPostingMatchesMultiSet(preds, activeChecks, ids)
@@ -2828,6 +2889,12 @@ func (qv *queryView[K, V]) tryCountByPredicatesLeadPostings(preds predicateSet, 
 				cnt++
 			}
 			continue
+		}
+		if len(activeChecks) == 1 {
+			if in, ok := preds.Get(activeChecks[0]).countBucket(ids); ok {
+				cnt += in
+				continue
+			}
 		}
 
 		if len(exactActive) == 0 && (extraExactBuf == nil || extraExactBuf.Len() == 0) {

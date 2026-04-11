@@ -9,6 +9,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"runtime"
 	"runtime/debug"
 	"sync/atomic"
 	"syscall"
@@ -29,19 +30,17 @@ func main() {
 		}
 		fatalf("parse options: %v", err)
 	}
-	catalog, _, _, err = loadFilteredClassCatalog(opts.ClassFilter, opts.QueryFilter)
-	if err != nil {
-		fatalf("apply stress filters: %v", err)
-	}
-	initialWorkers, err := resolveInitialWorkers(catalog, opts.InitialWorkers, opts.WorkerGroups)
-	if err != nil {
-		fatalf("invalid worker overrides: %v", err)
+	if opts.AllocProfile != "" {
+		runtime.MemProfileRate = 0
 	}
 
 	log.Printf(
-		"opening DB file=%s report=%s headless=%t duration=%s no_cache=%t trace_sample=%d trace_top=%d query_stats=%t jitter=%t class_filter=%v query_filter=%v",
+		"opening DB file=%s report=%s alloc_profile=%s alloc_source=%s alloc_mode=%s headless=%t duration=%s no_cache=%t trace_sample=%d trace_top=%d query_stats=%t jitter=%t class_filter=%v query_filter=%v",
 		opts.DBFile,
 		opts.ReportPath,
+		opts.AllocProfile,
+		opts.AllocSource,
+		opts.AllocMode,
 		opts.Headless,
 		opts.Duration,
 		opts.NoCache,
@@ -56,7 +55,7 @@ func main() {
 	if err != nil {
 		fatalf("start profiling: %v", err)
 	}
-	traceCollector := newPlannerTraceCollector(catalog, opts.TraceSampleEvery, opts.TraceTopN)
+	traceCollector := newPlannerTraceCollector(nil, opts.TraceSampleEvery, opts.TraceTopN)
 	handle, err := OpenBenchDB(DBConfig{
 		DBFile:               opts.DBFile,
 		BoltNoSync:           opts.BoltNoSync,
@@ -75,6 +74,33 @@ func main() {
 		handle.MaxID,
 		len(handle.EmailSamples),
 	)
+	if opts.AllocProfile != "" {
+		runErr := runFocusedAllocProfile(handle, opts, traceCollector)
+		if stopProfiling != nil {
+			if err := stopProfiling(); err != nil {
+				fatalf("stop profiling: %v", err)
+			}
+		}
+		debug.FreeOSMemory()
+		closeErr := handle.Close()
+		if runErr != nil {
+			fatalf("run focused alloc profile: %v", runErr)
+		}
+		if closeErr != nil {
+			fatalf("close db: %v", closeErr)
+		}
+		_, _ = fmt.Fprintf(os.Stdout, "\nalloc profile saved to %s\nDB closed %s\n", opts.AllocProfile, handle.DBFile)
+		return
+	}
+	catalog, _, _, err = loadFilteredClassCatalog(opts.ClassFilter, opts.QueryFilter)
+	if err != nil {
+		fatalf("apply stress filters: %v", err)
+	}
+	initialWorkers, err := resolveInitialWorkers(catalog, opts.InitialWorkers, opts.WorkerGroups)
+	if err != nil {
+		fatalf("invalid worker overrides: %v", err)
+	}
+	traceCollector = newPlannerTraceCollector(catalog, opts.TraceSampleEvery, opts.TraceTopN)
 
 	queryBreakdown := !opts.Headless || opts.QueryStats
 	queryLatency := !opts.Headless || opts.QueryStats

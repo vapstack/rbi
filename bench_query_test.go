@@ -41,16 +41,6 @@ const (
 	benchBatch = 20_000
 )
 
-type benchCacheMode struct {
-	suffix                       string
-	clearSnapshotCachesEachQuery bool
-}
-
-var benchCacheModes = []benchCacheMode{
-	{suffix: "WithCaching"},
-	{suffix: "NoCaching", clearSnapshotCachesEachQuery: true},
-}
-
 func benchOptions() Options {
 	return Options{
 		DisableIndexLoad:  true,
@@ -67,21 +57,6 @@ func openBenchDB(b *testing.B) (*DB[uint64, UserBench], *bbolt.DB, string) {
 
 	db, raw := openBoltAndNew[uint64, UserBench](b, filepath.Join(dir, "bench.db"), benchOptions())
 	return db, raw, dir
-}
-
-func clearBenchSnapshotCachesIfNeeded[K ~string | ~uint64, V any](db *DB[K, V], mode benchCacheMode) {
-	if mode.clearSnapshotCachesEachQuery {
-		db.clearCurrentSnapshotCachesForTesting()
-	}
-}
-
-func prepareReadBenchWithMode[K ~string | ~uint64, V any](b *testing.B, db *DB[K, V], mode benchCacheMode, warm func()) {
-	b.Helper()
-	prepareReadBenchSnapshot(b, db)
-	if !mode.clearSnapshotCachesEachQuery {
-		warm()
-	}
-	b.ResetTimer()
 }
 
 func seedBenchData(tb testing.TB, db *DB[uint64, UserBench], n int) {
@@ -159,28 +134,33 @@ func seedBenchData(tb testing.TB, db *DB[uint64, UserBench], n int) {
 	flush()
 }
 
+type cachedBenchUserDB struct {
+	db  *DB[uint64, UserBench]
+	raw *bbolt.DB
+	dir string
+}
+
 var (
-	benchDBs  = make(map[string]*DB[uint64, UserBench])
-	benchRaws = make(map[string]*bbolt.DB)
-	benchDirs = make(map[string]string)
-	oneMu     sync.Mutex
+	benchDBs = make(map[string]*cachedBenchUserDB)
+	oneMu    sync.Mutex
 )
 
-func benchDBCacheKey(mode benchCacheMode, n int) string {
-	return mode.suffix + "/" + strconv.Itoa(n)
+func benchDBFamilyKey(n int) string {
+	return "user_uint64/" + strconv.Itoa(n)
 }
 
 func buildBenchDB(b *testing.B, n int) *DB[uint64, UserBench] {
-	return buildBenchDBWithCaching(b, n, benchCacheModes[0])
+	return buildBenchDBWithMode(b, n, benchCacheModes[0])
 }
 
-func buildBenchDBWithCaching(b *testing.B, n int, mode benchCacheMode) *DB[uint64, UserBench] {
+func buildBenchDBWithMode(b *testing.B, n int, mode benchCacheMode) *DB[uint64, UserBench] {
 	b.Helper()
 	oneMu.Lock()
 	defer oneMu.Unlock()
-	key := benchDBCacheKey(mode, n)
-	if db := benchDBs[key]; db != nil && !db.closed.Load() {
-		return db
+
+	key := benchDBFamilyKey(n)
+	if cached := benchDBs[key]; cached != nil && cached.db != nil && !cached.db.closed.Load() {
+		return cached.db
 	}
 
 	db, raw, dir := openBenchDB(b)
@@ -197,9 +177,12 @@ func buildBenchDBWithCaching(b *testing.B, n int, mode benchCacheMode) *DB[uint6
 	// b.Logf("unique field keys: %v", s.UniqueFieldKeys)
 
 	b.StartTimer()
-	benchDBs[key] = db
-	benchRaws[key] = raw
-	benchDirs[key] = dir
+	benchDBs[key] = &cachedBenchUserDB{db: db, raw: raw, dir: dir}
+	registerBenchSuiteCleanup(func() {
+		_ = db.Close()
+		_ = raw.Close()
+		_ = os.RemoveAll(dir)
+	})
 	return db
 }
 
@@ -207,6 +190,11 @@ func warmBenchCountOnceUint64(b *testing.B, db *DB[uint64, UserBench], q *qx.QX)
 	b.Helper()
 	b.StopTimer()
 	defer b.StartTimer()
+	runBenchCountOnceUint64(b, db, q)
+}
+
+func runBenchCountOnceUint64(b *testing.B, db *DB[uint64, UserBench], q *qx.QX) {
+	b.Helper()
 	if _, err := db.Count(q); err != nil {
 		b.Fatal(err)
 	}
@@ -216,6 +204,11 @@ func warmBenchQueryKeysOnceUint64(b *testing.B, db *DB[uint64, UserBench], q *qx
 	b.Helper()
 	b.StopTimer()
 	defer b.StartTimer()
+	runBenchQueryKeysOnceUint64(b, db, q)
+}
+
+func runBenchQueryKeysOnceUint64(b *testing.B, db *DB[uint64, UserBench], q *qx.QX) {
+	b.Helper()
 	if _, err := db.QueryKeys(q); err != nil {
 		b.Fatal(err)
 	}
@@ -225,6 +218,11 @@ func warmBenchReadQueryOnceUint64(b *testing.B, db *DB[uint64, UserBench], q *qx
 	b.Helper()
 	b.StopTimer()
 	defer b.StartTimer()
+	runBenchReadQueryOnceUint64(b, db, q)
+}
+
+func runBenchReadQueryOnceUint64(b *testing.B, db *DB[uint64, UserBench], q *qx.QX) {
+	b.Helper()
 	items, err := db.Query(q)
 	if err != nil {
 		b.Fatal(err)
@@ -234,7 +232,7 @@ func warmBenchReadQueryOnceUint64(b *testing.B, db *DB[uint64, UserBench], q *qx
 
 func runBenchCacheModes(b *testing.B, fn func(*testing.B, benchCacheMode)) {
 	b.Helper()
-	for _, mode := range benchCacheModes {
+	for _, mode := range activeBenchCacheModes() {
 		mode := mode
 		b.Run(mode.suffix, func(b *testing.B) {
 			fn(b, mode)
@@ -245,7 +243,7 @@ func runBenchCacheModes(b *testing.B, fn func(*testing.B, benchCacheMode)) {
 func runCountBenchCacheModes(b *testing.B, qf func() *qx.QX) {
 	b.Helper()
 	runBenchCacheModes(b, func(b *testing.B, mode benchCacheMode) {
-		db := buildBenchDBWithCaching(b, benchN, mode)
+		db := buildBenchDBWithMode(b, benchN, mode)
 		runCountBenchWithMode(b, db, qf(), mode)
 	})
 }
@@ -253,7 +251,7 @@ func runCountBenchCacheModes(b *testing.B, qf func() *qx.QX) {
 func runQueryKeysBenchCacheModes(b *testing.B, qf func() *qx.QX) {
 	b.Helper()
 	runBenchCacheModes(b, func(b *testing.B, mode benchCacheMode) {
-		db := buildBenchDBWithCaching(b, benchN, mode)
+		db := buildBenchDBWithMode(b, benchN, mode)
 		runQueryKeysBenchWithMode(b, db, qf(), mode)
 	})
 }
@@ -261,7 +259,7 @@ func runQueryKeysBenchCacheModes(b *testing.B, qf func() *qx.QX) {
 func runReadQueryBenchCacheModes(b *testing.B, qf func() *qx.QX) {
 	b.Helper()
 	runBenchCacheModes(b, func(b *testing.B, mode benchCacheMode) {
-		db := buildBenchDBWithCaching(b, benchN, mode)
+		db := buildBenchDBWithMode(b, benchN, mode)
 		runReadQueryBenchWithMode(b, db, qf(), mode)
 	})
 }
@@ -900,15 +898,18 @@ func runQueryKeysBench(b *testing.B, db *DB[uint64, UserBench], q *qx.QX) {
 func runQueryKeysBenchWithMode(b *testing.B, db *DB[uint64, UserBench], q *qx.QX, mode benchCacheMode) {
 	b.Helper()
 	b.ReportAllocs()
-	prepareReadBenchWithMode(b, db, mode, func() {
-		warmBenchQueryKeysOnceUint64(b, db, q)
-	})
+	state := prepareReadBenchWithMode(
+		b,
+		db,
+		q,
+		mode,
+		warmBenchQueryKeysOnceUint64,
+		runBenchQueryKeysOnceUint64,
+		buildUserBenchTurnoverRingUint64,
+	)
 	for b.Loop() {
-		clearBenchSnapshotCachesIfNeeded(db, mode)
-		_, err := db.QueryKeys(q)
-		if err != nil {
-			b.Fatal(err)
-		}
+		state.beforeQuery(b, db)
+		runBenchQueryKeysOnceUint64(b, db, q)
 	}
 }
 
@@ -919,15 +920,18 @@ func runCountBench(b *testing.B, db *DB[uint64, UserBench], q *qx.QX) {
 func runCountBenchWithMode(b *testing.B, db *DB[uint64, UserBench], q *qx.QX, mode benchCacheMode) {
 	b.Helper()
 	b.ReportAllocs()
-	prepareReadBenchWithMode(b, db, mode, func() {
-		warmBenchCountOnceUint64(b, db, q)
-	})
+	state := prepareReadBenchWithMode(
+		b,
+		db,
+		q,
+		mode,
+		warmBenchCountOnceUint64,
+		runBenchCountOnceUint64,
+		buildUserBenchTurnoverRingUint64,
+	)
 	for b.Loop() {
-		clearBenchSnapshotCachesIfNeeded(db, mode)
-		_, err := db.Count(q)
-		if err != nil {
-			b.Fatal(err)
-		}
+		state.beforeQuery(b, db)
+		runBenchCountOnceUint64(b, db, q)
 	}
 }
 
@@ -938,16 +942,18 @@ func runReadQueryBench(b *testing.B, db *DB[uint64, UserBench], q *qx.QX) {
 func runReadQueryBenchWithMode(b *testing.B, db *DB[uint64, UserBench], q *qx.QX, mode benchCacheMode) {
 	b.Helper()
 	b.ReportAllocs()
-	prepareReadBenchWithMode(b, db, mode, func() {
-		warmBenchReadQueryOnceUint64(b, db, q)
-	})
+	state := prepareReadBenchWithMode(
+		b,
+		db,
+		q,
+		mode,
+		warmBenchReadQueryOnceUint64,
+		runBenchReadQueryOnceUint64,
+		buildUserBenchTurnoverRingUint64,
+	)
 	for b.Loop() {
-		clearBenchSnapshotCachesIfNeeded(db, mode)
-		items, err := db.Query(q)
-		if err != nil {
-			b.Fatal(err)
-		}
-		db.ReleaseRecords(items...)
+		state.beforeQuery(b, db)
+		runBenchReadQueryOnceUint64(b, db, q)
 	}
 }
 

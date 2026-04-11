@@ -445,7 +445,7 @@ func TestRace_ConcurrentWriters_SnapshotRouteEquivalence(t *testing.T) {
 		}
 
 		q := queries[r.IntN(len(queries))]
-		snap := db.getSnapshot()
+		snap, seq, snapRef, pinned := db.pinCurrentSnapshot()
 		view := db.makeQueryView(snap)
 
 		nq, ref, usedExec, usedPlan := assertPreparedRouteEquivalence(t, view, q)
@@ -456,15 +456,18 @@ func TestRace_ConcurrentWriters_SnapshotRouteEquivalence(t *testing.T) {
 			cnt, err := view.countPreparedExpr(nq.Expr)
 			if err != nil {
 				db.releaseQueryView(view)
+				db.unpinCurrentSnapshot(seq, snapRef, pinned)
 				t.Fatalf("countPreparedExpr: %v", err)
 			}
 			if cnt != uint64(len(ref)) {
 				db.releaseQueryView(view)
+				db.unpinCurrentSnapshot(seq, snapRef, pinned)
 				t.Fatalf("count mismatch on snapshot view: got=%d want=%d", cnt, len(ref))
 			}
 		}
 
 		db.releaseQueryView(view)
+		db.unpinCurrentSnapshot(seq, snapRef, pinned)
 	}
 
 	close(stop)
@@ -637,13 +640,14 @@ func TestRace_ConcurrentWriters_OROrderScoreChurn_SnapshotRouteEquivalence(t *te
 		}
 
 		q := queries[r.IntN(len(queries))]
-		snap := db.getSnapshot()
+		snap, seq, snapRef, pinned := db.pinCurrentSnapshot()
 		view := db.makeQueryView(snap)
 
 		_, _, _, usedPlan := assertPreparedRouteEquivalence(t, view, q)
 		sawPlan = sawPlan || usedPlan
 
 		db.releaseQueryView(view)
+		db.unpinCurrentSnapshot(seq, snapRef, pinned)
 	}
 
 	close(stop)
@@ -819,7 +823,7 @@ func TestRace_StringKeyGrowth_FastPaths_SnapshotRouteEquivalence(t *testing.T) {
 		}
 
 		q := queries[r.IntN(len(queries))]
-		snap := db.getSnapshot()
+		snap, seq, snapRef, pinned := db.pinCurrentSnapshot()
 		view := db.makeQueryView(snap)
 
 		nq, ref, usedExec, usedPlan := assertPreparedRouteEquivalenceString(t, view, q)
@@ -831,11 +835,13 @@ func TestRace_StringKeyGrowth_FastPaths_SnapshotRouteEquivalence(t *testing.T) {
 			idx, ok := view.strmapView.getIdxNoLock(key)
 			if !ok {
 				db.releaseQueryView(view)
+				db.unpinCurrentSnapshot(seq, snapRef, pinned)
 				t.Fatalf("missing idx mapping in strmap snapshot for key=%q", key)
 			}
 			back, ok := view.strmapView.getStringNoLock(idx)
 			if !ok || back != key {
 				db.releaseQueryView(view)
+				db.unpinCurrentSnapshot(seq, snapRef, pinned)
 				t.Fatalf("strmap round-trip mismatch: key=%q idx=%d back=%q ok=%v", key, idx, back, ok)
 			}
 		}
@@ -844,15 +850,18 @@ func TestRace_StringKeyGrowth_FastPaths_SnapshotRouteEquivalence(t *testing.T) {
 			cnt, err := view.countPreparedExpr(nq.Expr)
 			if err != nil {
 				db.releaseQueryView(view)
+				db.unpinCurrentSnapshot(seq, snapRef, pinned)
 				t.Fatalf("countPreparedExpr: %v", err)
 			}
 			if cnt != uint64(len(ref)) {
 				db.releaseQueryView(view)
+				db.unpinCurrentSnapshot(seq, snapRef, pinned)
 				t.Fatalf("count mismatch on string snapshot view: got=%d want=%d", cnt, len(ref))
 			}
 		}
 
 		db.releaseQueryView(view)
+		db.unpinCurrentSnapshot(seq, snapRef, pinned)
 	}
 
 	close(stop)

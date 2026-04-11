@@ -1219,6 +1219,9 @@ func binarySearch(array []uint16, ikey uint16) int {
 }
 
 var bitmapPool = pooled.Pointers[bitmap32]{
+	New: func() *bitmap32 {
+		return new(bitmap32)
+	},
 	Init: func(rb *bitmap32) {
 		rb.refs.Store(1)
 	},
@@ -1288,7 +1291,9 @@ func init() {
 		c := maxcap
 		containerArrayClassPools[i] = pooled.Pointers[containerArray]{
 			New: func() *containerArray {
-				return &containerArray{content: make([]uint16, 0, c)}
+				return &containerArray{
+					content: make([]uint16, 0, c),
+				}
 			},
 			Init: func(ac *containerArray) {
 				ac.refs.Store(1)

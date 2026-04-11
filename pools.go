@@ -25,6 +25,7 @@ const (
 	predicateCheckSlicePoolMaxCap           = 4 << 10
 	predicateSlicePoolMaxCap                = 256
 	leafPredSlicePoolMaxCap                 = 256
+	plannerORBranchSlicePoolMaxCap          = plannerORBranchLimit
 	plannerOROrderIterSlicePoolMaxCap       = 512
 	plannerOROrderMergeItemSliceMaxCap      = 512
 	orderBasicBaseCoreSlicePoolMaxCap       = 128
@@ -152,7 +153,6 @@ var keyedBatchPostingDeltaSlicePool = pooled.Slices[keyedBatchPostingDelta]{
 			delta := buf.Get(i)
 			delta.delta.add.Release()
 			delta.delta.remove.Release()
-			buf.Set(i, keyedBatchPostingDelta{})
 		}
 	},
 	Clear: true,
@@ -178,7 +178,6 @@ var countORBranchSlicePool = pooled.Slices[countORBranch]{
 		for i := 0; i < buf.Len(); i++ {
 			br := buf.Get(i)
 			releaseCountORBranchPredicates(br)
-			buf.Set(i, countORBranch{})
 		}
 	},
 	Clear: true,
@@ -191,11 +190,7 @@ var countLeadResidualExactFilterSlicePool = pooled.Slices[countLeadResidualExact
 	MaxCap: countLeadResidualExactFilterPoolMaxCap,
 	Cleanup: func(buf *pooled.SliceBuf[countLeadResidualExactFilter]) {
 		for i := 0; i < buf.Len(); i++ {
-			filter := buf.Get(i)
-			filter.ids.Release()
-			filter.ids = posting.List{}
-			filter.state = nil
-			buf.Set(i, filter)
+			buf.Get(i).ids.Release()
 		}
 	},
 	Clear: true,
@@ -231,7 +226,17 @@ var leafPredSlicePool = pooled.Slices[leafPred]{
 			if pred.postsBuf != nil {
 				postingSlicePool.Put(pred.postsBuf)
 			}
-			buf.Set(i, leafPred{})
+		}
+	},
+	Clear: true,
+}
+
+var plannerORBranchSlicePool = pooled.Slices[plannerORBranch]{
+	MinCap: 8,
+	MaxCap: plannerORBranchSlicePoolMaxCap,
+	Cleanup: func(buf *pooled.SliceBuf[plannerORBranch]) {
+		for i := 0; i < buf.Len(); i++ {
+			releasePlannerORBranchPredicates(buf.Get(i))
 		}
 	},
 	Clear: true,
@@ -244,7 +249,6 @@ var plannerOROrderIterSlicePool = pooled.Slices[plannerOROrderBranchIter]{
 		for i := 0; i < buf.Len(); i++ {
 			iter := buf.Get(i)
 			iter.close()
-			buf.Set(i, plannerOROrderBranchIter{})
 		}
 	},
 	Clear: true,

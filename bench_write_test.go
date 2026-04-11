@@ -497,6 +497,9 @@ func Benchmark_Write_Patch_NoIndex(b *testing.B) {
 }
 
 func Benchmark_Write_Update_BeforeStore(b *testing.B) {
+	if testing.Short() {
+		b.Skip("skip extended write benchmark in short mode")
+	}
 	db, _, _ := buildWriteBenchDB(b)
 	targetID := uint64(1000)
 	recA, recB := writeBenchUpdateRecords()
@@ -520,6 +523,9 @@ func Benchmark_Write_Update_BeforeStore(b *testing.B) {
 }
 
 func Benchmark_Write_Update_BeforeCommit(b *testing.B) {
+	if testing.Short() {
+		b.Skip("skip extended write benchmark in short mode")
+	}
 	db, raw, _ := buildWriteBenchDB(b)
 	targetID := uint64(1000)
 	recA, recB := writeBenchUpdateRecords()
@@ -541,6 +547,9 @@ func Benchmark_Write_Update_BeforeCommit(b *testing.B) {
 }
 
 func Benchmark_Write_Update_BeforeStore_BeforeCommit_MakePatch(b *testing.B) {
+	if testing.Short() {
+		b.Skip("skip extended write benchmark in short mode")
+	}
 	db, raw, _ := buildWriteBenchDB(b)
 	targetID := uint64(1000)
 	recA, recB := writeBenchUpdateRecords()
@@ -573,6 +582,9 @@ func Benchmark_Write_Update_BeforeStore_BeforeCommit_MakePatch(b *testing.B) {
 }
 
 func Benchmark_Write_Update_BeforeStore_BeforeCommit_MakePatch_BatchSet(b *testing.B) {
+	if testing.Short() {
+		b.Skip("skip extended write benchmark in short mode")
+	}
 	db, raw, _ := buildWriteBenchDB(b)
 	ids, valsA, valsB := buildWriteBenchBatchUpdateInput(writeBenchUserBatchSize)
 	patchBucket := ensureBenchSideBucket(b, raw, "bench_patch_log")
@@ -609,6 +621,9 @@ func Benchmark_Write_Update_BeforeStore_BeforeCommit_MakePatch_BatchSet(b *testi
 }
 
 func Benchmark_Write_Update_BeforeCommit_BatchSet(b *testing.B) {
+	if testing.Short() {
+		b.Skip("skip extended write benchmark in short mode")
+	}
 	db, raw, _ := buildWriteBenchDB(b)
 	ids, valsA, valsB := buildWriteBenchBatchUpdateInput(writeBenchUserBatchSize)
 	auditBucket := ensureBenchSideBucket(b, raw, "bench_audit")
@@ -634,6 +649,9 @@ func Benchmark_Write_Update_BeforeCommit_BatchSet(b *testing.B) {
 }
 
 func Benchmark_Write_Update_BeforeStore_BeforeCommit_MakePatch_Parallel(b *testing.B) {
+	if testing.Short() {
+		b.Skip("skip extended write benchmark in short mode")
+	}
 	for _, tc := range []struct {
 		name string
 		opts Options

@@ -1533,11 +1533,7 @@ func (qv *queryView[K, V]) evalLazyMaterializedPredicateWithKey(raw qx.Expr, cac
 		}
 		return posting.List{}
 	}
-	ids := b.ids
-	if !cacheKey.isZero() {
-		ids = qv.tryShareMaterializedPred(cacheKey, ids)
-	}
-	return ids
+	return b.ids
 }
 
 func (qv *queryView[K, V]) evalLazyMaterializedPredicate(raw qx.Expr, cacheKey string) posting.List {
@@ -1634,8 +1630,21 @@ type rangeIter struct {
 	}
 }
 
+var rangeIterPool = pooled.Pointers[rangeIter]{
+	Cleanup: func(it *rangeIter) {
+		if it.curIt != nil {
+			it.curIt.Release()
+		}
+	},
+	Clear: true,
+}
+
 func newRangeIter(s []index, start, end int) posting.Iterator {
-	return &rangeIter{s: s, i: start, end: end}
+	it := rangeIterPool.Get()
+	it.s = s
+	it.i = start
+	it.end = end
+	return it
 }
 
 func (it *rangeIter) HasNext() bool {
@@ -1668,17 +1677,7 @@ func (it *rangeIter) HasNext() bool {
 }
 
 func (it *rangeIter) Release() {
-	if it.curIt != nil {
-		it.curIt.Release()
-		it.curIt = nil
-	}
-	it.s = nil
-	it.i = 0
-	it.end = 0
-	it.single = struct {
-		set bool
-		v   uint64
-	}{}
+	rangeIterPool.Put(it)
 }
 
 func (it *rangeIter) Next() uint64 {

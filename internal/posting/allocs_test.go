@@ -1,6 +1,10 @@
 package posting
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/vapstack/rbi/internal/pooled"
+)
 
 var (
 	allocBoolSink              bool
@@ -126,9 +130,36 @@ func TestHotPathPools_NoAllocsAfterWarmup(t *testing.T) {
 		})
 	})
 
+	t.Run("ListIterSingleton", func(t *testing.T) {
+		single := BuildFromSorted([]uint64{42})
+		defer single.Release()
+
+		requireZeroAllocsAfterPoolWarmup(t, func() {
+			it := single.Iter()
+			allocUint64Sink = it.Next()
+			it.Release()
+		})
+	})
+
 	t.Run("ListCloneLarge", func(t *testing.T) {
 		requireZeroAllocsAfterPoolWarmup(t, func() {
 			out := large.Clone()
+			allocUint64Sink = out.Cardinality()
+			out.Release()
+		})
+	})
+
+	t.Run("ListCloneSmall", func(t *testing.T) {
+		requireZeroAllocsAfterPoolWarmup(t, func() {
+			out := small.Clone()
+			allocUint64Sink = out.Cardinality()
+			out.Release()
+		})
+	})
+
+	t.Run("ListCloneMid", func(t *testing.T) {
+		requireZeroAllocsAfterPoolWarmup(t, func() {
+			out := mid.Clone()
 			allocUint64Sink = out.Cardinality()
 			out.Release()
 		})
@@ -178,6 +209,71 @@ func TestHotPathPools_NoAllocsAfterWarmup(t *testing.T) {
 	t.Run("ListBuildAndLarge", func(t *testing.T) {
 		requireZeroAllocsAfterPoolWarmup(t, func() {
 			out := large.BuildAnd(largeMask)
+			allocUint64Sink = out.Cardinality()
+			out.Release()
+		})
+	})
+
+	t.Run("ListTryBuildAndAnyBufCompact", func(t *testing.T) {
+		postA := BuildFromSorted([]uint64{midIDs[1], midIDs[5], midIDs[9], midIDs[13], midIDs[17], midIDs[21]})
+		postB := BuildFromSorted([]uint64{midIDs[5], midIDs[7], midIDs[11], midIDs[17], midIDs[23], midIDs[27]})
+		defer postA.Release()
+		defer postB.Release()
+
+		postBufPool := pooled.Slices[List]{
+			MinCap: 4,
+			MaxCap: 16,
+			Clear:  true,
+		}
+		postsBuf := postBufPool.Get()
+		postsBuf.Append(postA)
+		postsBuf.Append(postB)
+		defer postBufPool.Put(postsBuf)
+
+		requireZeroAllocsAfterPoolWarmup(t, func() {
+			out := mid.Clone()
+			var ok bool
+			out, ok = out.TryBuildAndAnyBuf(postsBuf)
+			if !ok {
+				t.Fatalf("expected compact AND-any filter to succeed")
+			}
+			allocUint64Sink = out.Cardinality()
+			out.Release()
+		})
+	})
+
+	t.Run("ListTryResetOwnedCompactLikeFromSorted", func(t *testing.T) {
+		var scratch List
+		defer scratch.Release()
+
+		requireZeroAllocsAfterPoolWarmup(t, func() {
+			prev := scratch
+			out, next, ok := scratch.TryResetOwnedCompactLikeFromSorted(mid.Borrow(), []uint64{
+				midIDs[5], midIDs[7], midIDs[11], midIDs[17], midIDs[23], midIDs[27],
+			})
+			if !ok {
+				t.Fatalf("expected compact scratch reset to succeed")
+			}
+			if !next.SharesPayload(prev) {
+				prev.Release()
+			}
+			scratch = next
+			allocUint64Sink = out.Cardinality()
+		})
+	})
+
+	t.Run("ListTryResetOwnedLargeFromSorted", func(t *testing.T) {
+		rewriteIDs := []uint64{
+			largeIDs[3], largeIDs[11], largeIDs[19], largeIDs[27], largeIDs[35], largeIDs[43],
+			largeIDs[51], largeIDs[59], largeIDs[67], largeIDs[75], largeIDs[83], largeIDs[91],
+		}
+		requireZeroAllocsAfterPoolWarmup(t, func() {
+			out := large.Clone()
+			var ok bool
+			out, ok = out.TryResetOwnedLargeFromSorted(rewriteIDs)
+			if !ok {
+				t.Fatalf("expected owned large rewrite to succeed")
+			}
 			allocUint64Sink = out.Cardinality()
 			out.Release()
 		})

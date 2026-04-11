@@ -181,6 +181,7 @@ func ensureSnapshotUniverseOwned(next *indexSnapshot, universeOwned *bool) {
 		return
 	}
 	next.universe = next.universe.Clone()
+	next.universeOwner = nil
 	*universeOwned = true
 }
 
@@ -614,7 +615,7 @@ func applyFieldPostingDiffSorted(base *[]index, deltaKeys []keyedBatchPostingDel
 	for i < len(src) || j < len(deltaKeys) {
 		switch {
 		case j >= len(deltaKeys):
-			out = append(out, src[i:]...)
+			out = appendBorrowedIndexEntries(out, src[i:])
 			i = len(src)
 		case i >= len(src):
 			ids := applyBatchPostingDeltaOwned(posting.List{}, &deltaKeys[j].delta)
@@ -626,7 +627,7 @@ func applyFieldPostingDiffSorted(base *[]index, deltaKeys []keyedBatchPostingDel
 			cmp := compareIndexKeys(src[i].Key, deltaKeys[j].key)
 			switch {
 			case cmp < 0:
-				out = append(out, src[i])
+				out = append(out, borrowedFieldIndexEntry(src[i]))
 				i++
 			case cmp > 0:
 				ids := applyBatchPostingDeltaOwned(posting.List{}, &deltaKeys[j].delta)
@@ -669,7 +670,7 @@ func applyFieldPostingDiffSortedBuf(base *[]index, deltaKeys *pooled.SliceBuf[ke
 	for i < len(src) || j < deltaKeys.Len() {
 		switch {
 		case j >= deltaKeys.Len():
-			out = append(out, src[i:]...)
+			out = appendBorrowedIndexEntries(out, src[i:])
 			i = len(src)
 		case i >= len(src):
 			delta := takeKeyedBatchPostingDeltaBuf(deltaKeys, j)
@@ -683,7 +684,7 @@ func applyFieldPostingDiffSortedBuf(base *[]index, deltaKeys *pooled.SliceBuf[ke
 			cmp := compareIndexKeys(src[i].Key, delta.key)
 			switch {
 			case cmp < 0:
-				out = append(out, src[i])
+				out = append(out, borrowedFieldIndexEntry(src[i]))
 				i++
 			case cmp > 0:
 				delta = takeKeyedBatchPostingDeltaBuf(deltaKeys, j)
@@ -728,9 +729,9 @@ func applySingleFieldPostingDiffSorted(base *[]index, delta keyedBatchPostingDel
 			return base
 		}
 		out := make([]index, len(src)+1)
-		copy(out, src[:pos])
+		copyBorrowedIndexEntries(out[:pos], src[:pos])
 		out[pos] = index{Key: delta.key, IDs: ids}
-		copy(out[pos+1:], src[pos:])
+		copyBorrowedIndexEntries(out[pos+1:], src[pos:])
 		return &out
 	}
 
@@ -740,13 +741,13 @@ func applySingleFieldPostingDiffSorted(base *[]index, delta keyedBatchPostingDel
 			return nil
 		}
 		out := make([]index, len(src)-1)
-		copy(out, src[:pos])
-		copy(out[pos:], src[pos+1:])
+		copyBorrowedIndexEntries(out[:pos], src[:pos])
+		copyBorrowedIndexEntries(out[pos:], src[pos+1:])
 		return &out
 	}
 
 	out := make([]index, len(src))
-	copy(out, src)
+	copyBorrowedIndexEntries(out, src)
 	out[pos].IDs = ids
 	return &out
 }
@@ -776,7 +777,7 @@ func appendFieldPostingDiffFlatSorted(builder *fieldIndexChunkBuilder, base *[]i
 	for i < len(src) || j < len(deltaKeys) {
 		switch {
 		case j >= len(deltaKeys):
-			out.append(src[i].Key, src[i].IDs)
+			out.append(src[i].Key, src[i].IDs.Borrow())
 			i++
 		case i >= len(src):
 			ids := applyBatchPostingDeltaOwned(posting.List{}, &deltaKeys[j].delta)
@@ -788,7 +789,7 @@ func appendFieldPostingDiffFlatSorted(builder *fieldIndexChunkBuilder, base *[]i
 			cmp := compareIndexKeys(src[i].Key, deltaKeys[j].key)
 			switch {
 			case cmp < 0:
-				out.append(src[i].Key, src[i].IDs)
+				out.append(src[i].Key, src[i].IDs.Borrow())
 				i++
 			case cmp > 0:
 				ids := applyBatchPostingDeltaOwned(posting.List{}, &deltaKeys[j].delta)
@@ -834,7 +835,7 @@ func appendFieldPostingDiffFlatSortedBuf(builder *fieldIndexChunkBuilder, base *
 	for i < len(src) || (deltaKeys != nil && j < deltaKeys.Len()) {
 		switch {
 		case deltaKeys == nil || j >= deltaKeys.Len():
-			out.append(src[i].Key, src[i].IDs)
+			out.append(src[i].Key, src[i].IDs.Borrow())
 			i++
 		case i >= len(src):
 			delta := takeKeyedBatchPostingDeltaBuf(deltaKeys, j)
@@ -848,7 +849,7 @@ func appendFieldPostingDiffFlatSortedBuf(builder *fieldIndexChunkBuilder, base *
 			cmp := compareIndexKeys(src[i].Key, delta.key)
 			switch {
 			case cmp < 0:
-				out.append(src[i].Key, src[i].IDs)
+				out.append(src[i].Key, src[i].IDs.Borrow())
 				i++
 			case cmp > 0:
 				delta = takeKeyedBatchPostingDeltaBuf(deltaKeys, j)
@@ -1427,7 +1428,7 @@ func applyIntDeltaSuffix(values []int, start, delta int) {
 	}
 }
 
-func rebuildChunkedRootWithPageRefsReplaced(
+func rebuildChunkedRootWithOwnedPageRefsReplaced(
 	base *fieldIndexChunkedRoot,
 	page int,
 	replRefs []fieldIndexChunkRef,
@@ -1446,11 +1447,11 @@ func rebuildChunkedRootWithPageRefsReplaced(
 	}
 	builder := newFieldIndexChunkBuilder(est)
 	for i := 0; i < page; i++ {
-		builder.appendPage(base.pages[i])
+		builder.appendOwnedPage(retainFieldIndexChunkDirPage(base.pages[i]))
 	}
-	builder.appendRefSlice(replRefs)
+	builder.appendOwnedRefSlice(replRefs)
 	for i := page + 1; i < len(base.pages); i++ {
-		builder.appendPage(base.pages[i])
+		builder.appendOwnedPage(retainFieldIndexChunkDirPage(base.pages[i]))
 	}
 	return builder.root()
 }
@@ -1493,6 +1494,9 @@ func applySingleFieldPostingDiffChunked(base *fieldIndexChunkedRoot, delta keyed
 		posts := make([]posting.List, len(ref.chunk.posts))
 		copyBorrowedPostingSlice(posts, ref.chunk.posts)
 		posts[entryIdx] = updatedIDs
+		for i := range posts {
+			posts[i] = storedFieldPosting(posts[i])
+		}
 		chunk := &fieldIndexChunk{
 			posts: posts,
 			rows:  rows,
@@ -1503,8 +1507,16 @@ func applySingleFieldPostingDiffChunked(base *fieldIndexChunkedRoot, delta keyed
 			chunk.stringRefs = ref.chunk.stringRefs
 			chunk.stringData = ref.chunk.stringData
 		}
+		chunk.refs.Store(1)
 
-		refs := slices.Clone(base.pages[page].refs)
+		refs := make([]fieldIndexChunkRef, len(base.pages[page].refs))
+		copy(refs, base.pages[page].refs)
+		for i := range refs {
+			if i == off || refs[i].chunk == nil {
+				continue
+			}
+			refs[i].chunk.retain()
+		}
 		refs[off] = fieldIndexChunkRef{
 			last:  ref.last,
 			chunk: chunk,
@@ -1514,7 +1526,7 @@ func applySingleFieldPostingDiffChunked(base *fieldIndexChunkedRoot, delta keyed
 			pageRowPrefix = slices.Clone(pageRowPrefix)
 			applyRowDeltaSuffix(pageRowPrefix, off+1, rowsDelta)
 		}
-		pages := slices.Clone(base.pages)
+		pages := retainFieldIndexChunkedRootPagesExcept(base, page)
 		pages[page] = fieldIndexChunkDirPage{
 			refs:      refs,
 			prefix:    base.pages[page].prefix,
@@ -1525,14 +1537,16 @@ func applySingleFieldPostingDiffChunked(base *fieldIndexChunkedRoot, delta keyed
 			rootRowPrefix = slices.Clone(rootRowPrefix)
 			applyRowDeltaSuffix(rootRowPrefix, page+1, rowsDelta)
 		}
-		return newChunkedFieldIndexStorage(&fieldIndexChunkedRoot{
+		root := &fieldIndexChunkedRoot{
 			pages:       pages,
 			chunkPrefix: base.chunkPrefix,
 			prefix:      base.prefix,
 			rowPrefix:   rootRowPrefix,
 			keyCount:    base.keyCount,
 			chunkCount:  base.chunkCount,
-		})
+		}
+		root.refs.Store(1)
+		return newChunkedFieldIndexStorage(root)
 	}
 	if delta.delta.remove.IsEmpty() && !delta.delta.add.IsEmpty() {
 		replRefs := newFieldIndexChunkRefsWithInsertedEntry(ref, entryIdx, index{
@@ -1545,7 +1559,14 @@ func applySingleFieldPostingDiffChunked(base *fieldIndexChunkedRoot, delta keyed
 				keyDelta := repl.chunk.keyCount() - ref.chunk.keyCount()
 				rowsDelta := int64(repl.chunk.rowCount()) - int64(ref.chunk.rowCount())
 
-				refs := slices.Clone(base.pages[page].refs)
+				refs := make([]fieldIndexChunkRef, len(base.pages[page].refs))
+				copy(refs, base.pages[page].refs)
+				for i := range refs {
+					if i == off || refs[i].chunk == nil {
+						continue
+					}
+					refs[i].chunk.retain()
+				}
 				refs[off] = repl
 
 				pagePrefix := base.pages[page].prefix
@@ -1560,7 +1581,7 @@ func applySingleFieldPostingDiffChunked(base *fieldIndexChunkedRoot, delta keyed
 					applyRowDeltaSuffix(pageRowPrefix, off+1, rowsDelta)
 				}
 
-				pages := slices.Clone(base.pages)
+				pages := retainFieldIndexChunkedRootPagesExcept(base, page)
 				pages[page] = fieldIndexChunkDirPage{
 					refs:      refs,
 					prefix:    pagePrefix,
@@ -1579,14 +1600,16 @@ func applySingleFieldPostingDiffChunked(base *fieldIndexChunkedRoot, delta keyed
 					applyRowDeltaSuffix(rootRowPrefix, page+1, rowsDelta)
 				}
 
-				return newChunkedFieldIndexStorage(&fieldIndexChunkedRoot{
+				root := &fieldIndexChunkedRoot{
 					pages:       pages,
 					chunkPrefix: base.chunkPrefix,
 					prefix:      rootPrefix,
 					rowPrefix:   rootRowPrefix,
 					keyCount:    base.keyCount + keyDelta,
 					chunkCount:  base.chunkCount,
-				})
+				}
+				root.refs.Store(1)
+				return newChunkedFieldIndexStorage(root)
 			}
 
 			oldPage := base.pages[page]
@@ -1600,7 +1623,15 @@ func applySingleFieldPostingDiffChunked(base *fieldIndexChunkedRoot, delta keyed
 				pagesCap--
 			}
 			if len(newPageRefs) > fieldIndexDirPageTargetRefs {
-				root := rebuildChunkedRootWithPageRefsReplaced(base, page, newPageRefs)
+				pageRefs := make([]fieldIndexChunkRef, 0, len(newPageRefs))
+				for i := 0; i < off; i++ {
+					pageRefs = append(pageRefs, retainedFieldIndexChunkRef(oldPage.refs[i]))
+				}
+				pageRefs = append(pageRefs, replRefs...)
+				for i := off + 1; i < len(oldPage.refs); i++ {
+					pageRefs = append(pageRefs, retainedFieldIndexChunkRef(oldPage.refs[i]))
+				}
+				root := rebuildChunkedRootWithOwnedPageRefsReplaced(base, page, pageRefs)
 				if root == nil {
 					return fieldIndexStorage{}
 				}
@@ -1610,11 +1641,23 @@ func applySingleFieldPostingDiffChunked(base *fieldIndexChunkedRoot, delta keyed
 				return newChunkedFieldIndexStorage(root)
 			}
 			pages := make([]fieldIndexChunkDirPage, 0, max(pagesCap, 0))
-			pages = append(pages, base.pages[:page]...)
-			if len(newPageRefs) > 0 {
-				pages = append(pages, newFieldIndexChunkDirPage(newPageRefs))
+			for i := 0; i < page; i++ {
+				pages = append(pages, retainFieldIndexChunkDirPage(base.pages[i]))
 			}
-			pages = append(pages, base.pages[page+1:]...)
+			if len(newPageRefs) > 0 {
+				pageRefs := make([]fieldIndexChunkRef, 0, len(newPageRefs))
+				for i := 0; i < off; i++ {
+					pageRefs = append(pageRefs, retainedFieldIndexChunkRef(oldPage.refs[i]))
+				}
+				pageRefs = append(pageRefs, replRefs...)
+				for i := off + 1; i < len(oldPage.refs); i++ {
+					pageRefs = append(pageRefs, retainedFieldIndexChunkRef(oldPage.refs[i]))
+				}
+				pages = append(pages, newFieldIndexChunkDirPage(pageRefs))
+			}
+			for i := page + 1; i < len(base.pages); i++ {
+				pages = append(pages, retainFieldIndexChunkDirPage(base.pages[i]))
+			}
 
 			root := newFieldIndexChunkedRootFromPages(pages)
 			if root == nil {
@@ -1645,7 +1688,15 @@ func applySingleFieldPostingDiffChunked(base *fieldIndexChunkedRoot, delta keyed
 		pagesCap--
 	}
 	if len(newPageRefs) > fieldIndexDirPageTargetRefs {
-		root := rebuildChunkedRootWithPageRefsReplaced(base, page, newPageRefs)
+		pageRefs := make([]fieldIndexChunkRef, 0, len(newPageRefs))
+		for i := 0; i < off; i++ {
+			pageRefs = append(pageRefs, retainedFieldIndexChunkRef(oldPage.refs[i]))
+		}
+		pageRefs = append(pageRefs, replRefs...)
+		for i := off + 1; i < len(oldPage.refs); i++ {
+			pageRefs = append(pageRefs, retainedFieldIndexChunkRef(oldPage.refs[i]))
+		}
+		root := rebuildChunkedRootWithOwnedPageRefsReplaced(base, page, pageRefs)
 		if root == nil {
 			return fieldIndexStorage{}
 		}
@@ -1655,11 +1706,23 @@ func applySingleFieldPostingDiffChunked(base *fieldIndexChunkedRoot, delta keyed
 		return newChunkedFieldIndexStorage(root)
 	}
 	pages := make([]fieldIndexChunkDirPage, 0, max(pagesCap, 0))
-	pages = append(pages, base.pages[:page]...)
-	if len(newPageRefs) > 0 {
-		pages = append(pages, newFieldIndexChunkDirPage(newPageRefs))
+	for i := 0; i < page; i++ {
+		pages = append(pages, retainFieldIndexChunkDirPage(base.pages[i]))
 	}
-	pages = append(pages, base.pages[page+1:]...)
+	if len(newPageRefs) > 0 {
+		pageRefs := make([]fieldIndexChunkRef, 0, len(newPageRefs))
+		for i := 0; i < off; i++ {
+			pageRefs = append(pageRefs, retainedFieldIndexChunkRef(oldPage.refs[i]))
+		}
+		pageRefs = append(pageRefs, replRefs...)
+		for i := off + 1; i < len(oldPage.refs); i++ {
+			pageRefs = append(pageRefs, retainedFieldIndexChunkRef(oldPage.refs[i]))
+		}
+		pages = append(pages, newFieldIndexChunkDirPage(pageRefs))
+	}
+	for i := page + 1; i < len(base.pages); i++ {
+		pages = append(pages, retainFieldIndexChunkDirPage(base.pages[i]))
+	}
 
 	root := newFieldIndexChunkedRootFromPages(pages)
 	if root == nil {
@@ -1757,13 +1820,16 @@ func mergeInsertOnlyFieldStorageOwned(
 		defer keyedBatchPostingDeltaSlicePool.Put(buf)
 		return applyFieldPostingDiffChunkedBuf(base.chunked, buf)
 	}
-	if allowChunk && base.flat != nil && shouldUseChunkedFieldIndex(len(*base.flat)+len(adds)) {
+	flat := base.flatSlice()
+	if allowChunk && flat != nil && shouldUseChunkedFieldIndex(len(*flat)+len(adds)) {
 		buf := sortedInsertPostingAddsBufOwned(adds, arena, fixed8)
 		if buf == nil {
 			return base
 		}
 		defer keyedBatchPostingDeltaSlicePool.Put(buf)
-		return applyFieldPostingDiffChunkedBuf(buildChunkedFieldIndexRoot(*base.flat), buf)
+		borrowed := make([]index, len(*flat))
+		copyBorrowedIndexEntries(borrowed, *flat)
+		return applyFieldPostingDiffChunkedBuf(buildChunkedFieldIndexRoot(borrowed), buf)
 	}
 	slice := mergeInsertOnlyFieldSliceOwned(base.flatSlice(), adds, arena, fixed8)
 	if !allowChunk {
@@ -1808,13 +1874,16 @@ func mergeInsertOnlyFixedFieldStorageOwned(
 		defer keyedBatchPostingDeltaSlicePool.Put(buf)
 		return applyFieldPostingDiffChunkedBuf(base.chunked, buf)
 	}
-	if allowChunk && base.flat != nil && shouldUseChunkedFieldIndex(len(*base.flat)+len(adds)) {
+	flat := base.flatSlice()
+	if allowChunk && flat != nil && shouldUseChunkedFieldIndex(len(*flat)+len(adds)) {
 		buf := sortedFixedInsertPostingAddsBufOwned(adds, arena)
 		if buf == nil {
 			return base
 		}
 		defer keyedBatchPostingDeltaSlicePool.Put(buf)
-		return applyFieldPostingDiffChunkedBuf(buildChunkedFieldIndexRoot(*base.flat), buf)
+		borrowed := make([]index, len(*flat))
+		copyBorrowedIndexEntries(borrowed, *flat)
+		return applyFieldPostingDiffChunkedBuf(buildChunkedFieldIndexRoot(borrowed), buf)
 	}
 	slice := mergeInsertOnlyFixedFieldSliceOwned(base.flatSlice(), adds, arena)
 	if !allowChunk {
@@ -1895,6 +1964,7 @@ func (db *DB[K, V]) buildPreparedSnapshotAggregatedNoLock(
 		lenIndex:          prev.lenIndex,
 		lenZeroComplement: prev.lenZeroComplement,
 		universe:          prev.universe,
+		universeOwner:     prev.universeOwner,
 		strmap:            db.strmap.snapshot(),
 	}
 	db.initSnapshotRuntimeCaches(next)
@@ -1967,6 +2037,7 @@ func (db *DB[K, V]) buildPreparedSnapshotAggregatedNoLock(
 	} else {
 		inheritMaterializedPredCache(db, next, prev, nil)
 	}
+	next.retainSharedOwnedStorageFrom(prev)
 
 	return next
 }

@@ -1074,15 +1074,16 @@ func TestPlannerExt_Bug_ExecPlanORNoOrderAdaptive_PanicsOnAlwaysTrueBranch(t *te
 	if !ok {
 		t.Fatalf("buildORBranches: ok=false q=%+v", q)
 	}
-	defer releaseORBranches(branches)
+	defer branches.Release()
 	if alwaysFalse {
 		t.Fatalf("unexpected alwaysFalse for q=%+v", q)
 	}
-	if len(branches) != 3 {
-		t.Fatalf("unexpected branch count: got=%d want=3", len(branches))
+	if branches.Len() != 3 {
+		t.Fatalf("unexpected branch count: got=%d want=3", branches.Len())
 	}
-	if !branches[2].alwaysTrue || branches[2].hasLead() || branches[2].leadPtr() != nil {
-		t.Fatalf("expected broad prefix branch to collapse to alwaysTrue without lead: branch=%+v", branches[2])
+	branch2 := branches.Get(2)
+	if !branch2.alwaysTrue || branch2.hasLead() || branch2.leadPtr() != nil {
+		t.Fatalf("expected broad prefix branch to collapse to alwaysTrue without lead: branch=%+v", branch2)
 	}
 
 	defer func() {
@@ -1112,15 +1113,16 @@ func TestPlannerExt_Bug_ExecPlanORNoOrderBaseline_PanicsOnAlwaysTrueBranch(t *te
 	if !ok {
 		t.Fatalf("buildORBranches: ok=false q=%+v", q)
 	}
-	defer releaseORBranches(branches)
+	defer branches.Release()
 	if alwaysFalse {
 		t.Fatalf("unexpected alwaysFalse for q=%+v", q)
 	}
-	if len(branches) != 3 {
-		t.Fatalf("unexpected branch count: got=%d want=3", len(branches))
+	if branches.Len() != 3 {
+		t.Fatalf("unexpected branch count: got=%d want=3", branches.Len())
 	}
-	if !branches[2].alwaysTrue || branches[2].hasLead() || branches[2].leadPtr() != nil {
-		t.Fatalf("expected broad prefix branch to collapse to alwaysTrue without lead: branch=%+v", branches[2])
+	branch2 := branches.Get(2)
+	if !branch2.alwaysTrue || branch2.hasLead() || branch2.leadPtr() != nil {
+		t.Fatalf("expected broad prefix branch to collapse to alwaysTrue without lead: branch=%+v", branch2)
 	}
 
 	defer func() {
@@ -1165,14 +1167,14 @@ func TestPlannerExt_Property_OrderedORInternalPlansMatchSeqScan(t *testing.T) {
 			t.Fatalf("case=%d buildORBranches basic: ok=false q=%+v", i, q)
 		}
 		if alwaysFalse {
-			releaseORBranches(branchesBasic)
+			branchesBasic.Release()
 			if len(want) != 0 || len(gotQuery) != 0 {
 				t.Fatalf("case=%d alwaysFalse branch set returned rows: q=%+v got=%v want=%v", i, q, gotQuery, want)
 			}
 			continue
 		}
 		gotBasic, okBasic := db.execPlanOROrderBasic(q, branchesBasic, nil)
-		releaseORBranches(branchesBasic)
+		branchesBasic.Release()
 		if okBasic {
 			sawBasic++
 			if !queryIDsEqual(q, gotBasic, want) {
@@ -1185,11 +1187,11 @@ func TestPlannerExt_Property_OrderedORInternalPlansMatchSeqScan(t *testing.T) {
 			t.Fatalf("case=%d buildORBranches fallback: ok=false q=%+v", i, q)
 		}
 		if alwaysFalse {
-			releaseORBranches(branchesFallback)
+			branchesFallback.Release()
 			continue
 		}
 		gotFallback, okFallback, err := db.execPlanOROrderMergeFallback(q, branchesFallback, nil)
-		releaseORBranches(branchesFallback)
+		branchesFallback.Release()
 		if err != nil {
 			t.Fatalf("case=%d execPlanOROrderMergeFallback(%+v): %v", i, q, err)
 		}
@@ -1205,11 +1207,11 @@ func TestPlannerExt_Property_OrderedORInternalPlansMatchSeqScan(t *testing.T) {
 			t.Fatalf("case=%d buildORBranches kway: ok=false q=%+v", i, q)
 		}
 		if alwaysFalse {
-			releaseORBranches(branchesKWay)
+			branchesKWay.Release()
 			continue
 		}
 		gotKWay, okKWay, err := db.execPlanOROrderKWay(q, branchesKWay, nil)
-		releaseORBranches(branchesKWay)
+		branchesKWay.Release()
 		if err != nil {
 			t.Fatalf("case=%d execPlanOROrderKWay(%+v): %v", i, q, err)
 		}
@@ -1270,25 +1272,25 @@ func TestPlannerExt_Property_NoOrderORInternalPlansPreserveWindow(t *testing.T) 
 			t.Fatalf("case=%d buildORBranches adaptive: ok=false q=%+v", i, q)
 		}
 		if alwaysFalse {
-			releaseORBranches(branchesAdaptive)
+			branchesAdaptive.Release()
 			if len(full) != 0 || len(gotQuery) != 0 {
 				t.Fatalf("case=%d alwaysFalse no-order branch set returned rows: q=%+v got=%v full=%v", i, q, gotQuery, full)
 			}
 			continue
 		}
 		skipAdaptive := false
-		for bi := range branchesAdaptive {
-			if branchesAdaptive[bi].leadPtr() == nil {
+		for bi := 0; bi < branchesAdaptive.Len(); bi++ {
+			if branchesAdaptive.GetPtr(bi).leadPtr() == nil {
 				skipAdaptive = true
 				skippedLead++
 				break
 			}
 		}
 		if skipAdaptive {
-			releaseORBranches(branchesAdaptive)
+			branchesAdaptive.Release()
 		} else {
 			gotAdaptive, okAdaptive := db.execPlanORNoOrderAdaptive(q, branchesAdaptive, nil)
-			releaseORBranches(branchesAdaptive)
+			branchesAdaptive.Release()
 			if okAdaptive {
 				sawAdaptive++
 				if err = plannerExtValidateNoOrderWindow(q, gotAdaptive, full); err != nil {
@@ -1305,23 +1307,23 @@ func TestPlannerExt_Property_NoOrderORInternalPlansPreserveWindow(t *testing.T) 
 			t.Fatalf("case=%d buildORBranches baseline: ok=false q=%+v", i, q)
 		}
 		if alwaysFalse {
-			releaseORBranches(branchesBaseline)
+			branchesBaseline.Release()
 			continue
 		}
 		skipBaseline := false
-		for bi := range branchesBaseline {
-			if branchesBaseline[bi].leadPtr() == nil {
+		for bi := 0; bi < branchesBaseline.Len(); bi++ {
+			if branchesBaseline.GetPtr(bi).leadPtr() == nil {
 				skipBaseline = true
 				skippedBase++
 				break
 			}
 		}
 		if skipBaseline {
-			releaseORBranches(branchesBaseline)
+			branchesBaseline.Release()
 			continue
 		}
 		gotBaseline, okBaseline := db.execPlanORNoOrderBaseline(q, branchesBaseline, nil)
-		releaseORBranches(branchesBaseline)
+		branchesBaseline.Release()
 		if okBaseline {
 			sawBaseline++
 			if err = plannerExtValidateNoOrderWindow(q, gotBaseline, full); err != nil {
@@ -1441,11 +1443,11 @@ func TestPlannerExt_BuildORBranchesDropsFalseBranchAndKeepsTautology(t *testing.
 	if !ok {
 		t.Fatalf("buildORBranches: ok=false")
 	}
-	defer releaseORBranches(branches)
+	defer branches.Release()
 	if alwaysFalse {
 		t.Fatalf("expected tautology branch to keep OR satisfiable")
 	}
-	if len(branches) != 1 || !branches[0].alwaysTrue {
+	if branches.Len() != 1 || !branches.Get(0).alwaysTrue {
 		t.Fatalf("expected surviving branch to collapse to alwaysTrue")
 	}
 }
@@ -1463,33 +1465,34 @@ func TestPlannerExt_BuildORBranches_KeepsNegativeOnlyBranchWithoutLead(t *testin
 	if !ok {
 		t.Fatalf("buildORBranches: ok=false")
 	}
-	defer releaseORBranches(branches)
+	defer branches.Release()
 	if alwaysFalse {
 		t.Fatalf("unexpected alwaysFalse for negative-only branch shape")
 	}
-	if len(branches) != 2 {
-		t.Fatalf("unexpected branch count: got=%d want=2", len(branches))
+	if branches.Len() != 2 {
+		t.Fatalf("unexpected branch count: got=%d want=2", branches.Len())
 	}
-	if branches[0].alwaysTrue {
+	branch0 := branches.Get(0)
+	if branch0.alwaysTrue {
 		t.Fatalf("negative-only branch must not collapse to alwaysTrue")
 	}
-	if branches[0].hasLead() || branches[0].leadPtr() != nil || branches[0].leadIdx != -1 {
-		t.Fatalf("negative-only branch must not synthesize lead iterator: lead=%v leadIdx=%d", branches[0].leadPtr(), branches[0].leadIdx)
+	if branch0.hasLead() || branch0.leadPtr() != nil || branch0.leadIdx != -1 {
+		t.Fatalf("negative-only branch must not synthesize lead iterator: lead=%v leadIdx=%d", branch0.leadPtr(), branch0.leadIdx)
 	}
-	if branches[1].leadPtr() == nil {
+	if branches.GetPtr(1).leadPtr() == nil {
 		t.Fatalf("positive branch must retain lead iterator")
 	}
 
-	if branches[0].predLen() > plannerPredicateFastPathMaxLeaves {
-		t.Fatalf("unexpected predicate count: got=%d max=%d", branches[0].predLen(), plannerPredicateFastPathMaxLeaves)
+	if branch0.predLen() > plannerPredicateFastPathMaxLeaves {
+		t.Fatalf("unexpected predicate count: got=%d max=%d", branch0.predLen(), plannerPredicateFastPathMaxLeaves)
 	}
 	var checksInline [plannerPredicateFastPathMaxLeaves]int
-	checks := branches[0].buildMatchChecks(checksInline[:0])
+	checks := branch0.buildMatchChecks(checksInline[:0])
 	if len(checks) == 0 {
 		t.Fatalf("negative-only branch must still emit residual checks")
 	}
 	for _, idx := range checks {
-		if !branches[0].predPtr(idx).hasContains() {
+		if !branch0.predPtr(idx).hasContains() {
 			t.Fatalf("negative-only branch check %d must stay matchable", idx)
 		}
 	}

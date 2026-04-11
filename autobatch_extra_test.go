@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -77,6 +78,55 @@ func drainCurrentAutoBatchQueue[K ~string | ~uint64, V any](
 	}
 }
 
+func describeAutoBatchJobForTest[K ~string | ~uint64, V any](job *autoBatchJob[K, V]) string {
+	if job == nil {
+		return "<nil>"
+	}
+	ids := make([]K, job.reqs.Len())
+	for i := 0; i < job.reqs.Len(); i++ {
+		ids[i] = job.reqs.Get(i).id
+	}
+	kind := "shared"
+	if job.isolated {
+		kind = "isolated"
+	}
+	return fmt.Sprintf("%s:reqs=%d ids=%v", kind, job.reqs.Len(), ids)
+}
+
+func describeAutoBatchBatchForTest[K ~string | ~uint64, V any](batch []*autoBatchJob[K, V]) string {
+	if len(batch) == 0 {
+		return "[]"
+	}
+	parts := make([]string, len(batch))
+	for i := range batch {
+		parts[i] = describeAutoBatchJobForTest(batch[i])
+	}
+	return "[" + strings.Join(parts, ", ") + "]"
+}
+
+func describeAutoBatchQueueForTest[K ~string | ~uint64, V any](db *DB[K, V]) string {
+	db.autoBatcher.mu.Lock()
+	size := db.autoBatcher.queueLen()
+	head := db.autoBatcher.queueHead
+	parts := make([]string, size)
+	for i := 0; i < size; i++ {
+		parts[i] = describeAutoBatchJobForTest(db.autoBatcher.queueAt(i))
+	}
+	db.autoBatcher.mu.Unlock()
+	return fmt.Sprintf("head=%d size=%d jobs=[%s]", head, size, strings.Join(parts, ", "))
+}
+
+func recycleAutoBatchScratchForTest[K ~string | ~uint64, V any](db *DB[K, V], batch []*autoBatchJob[K, V]) {
+	clear(batch)
+	db.autoBatcher.mu.Lock()
+	if cap(batch) > cap(db.autoBatcher.batchScratch) {
+		db.autoBatcher.batchScratch = batch[:0]
+	} else if db.autoBatcher.batchScratch == nil {
+		db.autoBatcher.batchScratch = batch[:0]
+	}
+	db.autoBatcher.mu.Unlock()
+}
+
 func terminalAutoBatchReq[K ~string | ~uint64, V any](req *autoBatchRequest[K, V]) *autoBatchRequest[K, V] {
 	for req != nil && req.replacedBy != nil {
 		req = req.replacedBy
@@ -93,6 +143,104 @@ func sameAutoBatchExtraErr(got, want error) bool {
 	default:
 		return got.Error() == want.Error()
 	}
+}
+
+func newAutoBatchPopReqForTest(id uint64) *autoBatchRequest[uint64, Rec] {
+	return &autoBatchRequest[uint64, Rec]{
+		op:   autoBatchPatch,
+		id:   id,
+		done: make(chan error, 1),
+	}
+}
+
+func configureGroupedBetweenSharedQueueForTest(
+	db *DB[uint64, Rec],
+	headID uint64,
+	groupIDs [2]uint64,
+	tailID uint64,
+) {
+	db.autoBatcher.mu.Lock()
+	db.autoBatcher.window = 0
+	db.autoBatcher.maxOps = 16
+	db.autoBatcher.running = true
+	db.autoBatcher.hotUntil = time.Time{}
+	setAutoBatchQueueJobsForTest(
+		db,
+		queuedSingleJob(newAutoBatchPopReqForTest(headID)),
+		&autoBatchJob[uint64, Rec]{
+			reqs:     testAutoBatchRequestBuf(newAutoBatchPopReqForTest(groupIDs[0]), newAutoBatchPopReqForTest(groupIDs[1])),
+			isolated: true,
+			done:     make(chan error, 1),
+		},
+		queuedSingleJob(newAutoBatchPopReqForTest(tailID)),
+	)
+	db.autoBatcher.mu.Unlock()
+}
+
+func assertGroupedBetweenSharedPopSequenceForTest(tb testing.TB, db *DB[uint64, Rec], iteration int) {
+	tb.Helper()
+
+	first := db.popAutoBatch()
+	if len(first) != 1 || first[0].isolated || first[0].reqs.Len() != 1 || first[0].reqs.Get(0).id != 1 {
+		tb.Fatalf(
+			"iter=%d pop1=%s queue=%s",
+			iteration,
+			describeAutoBatchBatchForTest(first),
+			describeAutoBatchQueueForTest(db),
+		)
+	}
+	recycleAutoBatchScratchForTest(db, first)
+
+	second := db.popAutoBatch()
+	if len(second) != 1 || !second[0].isolated || second[0].reqs.Len() != 2 ||
+		second[0].reqs.Get(0).id != 2 || second[0].reqs.Get(1).id != 3 {
+		tb.Fatalf(
+			"iter=%d pop2=%s queue=%s",
+			iteration,
+			describeAutoBatchBatchForTest(second),
+			describeAutoBatchQueueForTest(db),
+		)
+	}
+	recycleAutoBatchScratchForTest(db, second)
+
+	third := db.popAutoBatch()
+	if len(third) != 1 || third[0].isolated || third[0].reqs.Len() != 1 || third[0].reqs.Get(0).id != 4 {
+		tb.Fatalf(
+			"iter=%d pop3=%s queue=%s",
+			iteration,
+			describeAutoBatchBatchForTest(third),
+			describeAutoBatchQueueForTest(db),
+		)
+	}
+	recycleAutoBatchScratchForTest(db, third)
+
+	empty := db.popAutoBatch()
+	if len(empty) != 0 {
+		tb.Fatalf(
+			"iter=%d trailing-pop=%s queue=%s",
+			iteration,
+			describeAutoBatchBatchForTest(empty),
+			describeAutoBatchQueueForTest(db),
+		)
+	}
+}
+
+func warmAutoBatchScratchForTest(db *DB[uint64, Rec]) {
+	db.autoBatcher.mu.Lock()
+	db.autoBatcher.window = 0
+	db.autoBatcher.maxOps = 16
+	db.autoBatcher.running = true
+	db.autoBatcher.hotUntil = time.Time{}
+	setAutoBatchQueueJobsForTest(
+		db,
+		queuedSingleJob(newAutoBatchPopReqForTest(10)),
+		queuedSingleJob(newAutoBatchPopReqForTest(11)),
+		queuedSingleJob(newAutoBatchPopReqForTest(12)),
+	)
+	db.autoBatcher.mu.Unlock()
+
+	batch := db.popAutoBatch()
+	recycleAutoBatchScratchForTest(db, batch)
 }
 
 func cloneAutoBatchExtraFields(in []Field) []Field {
@@ -1149,6 +1297,43 @@ func TestAutoBatchExtra_GroupedJobBetweenSharedRequests_StaysIsolatedAndOrdered(
 		t.Fatalf("Get(2): %v", err)
 	} else if got == nil || got.Name != "mid-2" || got.Age != 20 || got.Score != 2.5 {
 		t.Fatalf("unexpected id=2 value: %#v", got)
+	}
+}
+
+func TestAutoBatchExtra_GroupedJobBetweenSharedRequests_PopSequenceStable(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{
+		AutoBatchWindow:   5 * time.Millisecond,
+		AutoBatchMax:      16,
+		AutoBatchMaxQueue: 64,
+	})
+
+	iters := 20000
+	if testRaceEnabled {
+		iters = 4000
+	}
+
+	for i := 0; i < iters; i++ {
+		configureGroupedBetweenSharedQueueForTest(db, 1, [2]uint64{2, 3}, 4)
+		assertGroupedBetweenSharedPopSequenceForTest(t, db, i)
+	}
+}
+
+func TestAutoBatchExtra_GroupedJobBetweenSharedRequests_PopSequenceStableAfterScratchReuse(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{
+		AutoBatchWindow:   5 * time.Millisecond,
+		AutoBatchMax:      16,
+		AutoBatchMaxQueue: 64,
+	})
+
+	iters := 12000
+	if testRaceEnabled {
+		iters = 2000
+	}
+
+	for i := 0; i < iters; i++ {
+		warmAutoBatchScratchForTest(db)
+		configureGroupedBetweenSharedQueueForTest(db, 1, [2]uint64{2, 3}, 4)
+		assertGroupedBetweenSharedPopSequenceForTest(t, db, i)
 	}
 }
 

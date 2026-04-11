@@ -36,6 +36,33 @@ go run ./stress \
   -heap-profile /tmp/stress-count.heap.pprof
 ```
 
+Focused alloc-profile run for one exact query class:
+
+```bash
+go run ./stress \
+  -db bench/bench.db \
+  -alloc-profile /tmp/discovery.allocs.pprof \
+  -alloc-ops 64 \
+  -alloc-source prepared \
+  -alloc-mode turnover \
+  -alloc-scope query \
+  -alloc-warmup-ops 64 \
+  -class alloc_count \
+  -query count_realistic_discovery_or
+```
+
+Focused alloc-profile on the original stochastic stress workload path:
+
+```bash
+go run ./stress \
+  -db stress/stress.db \
+  -alloc-profile /tmp/discovery-workload.allocs.pprof \
+  -duration 15s \
+  -alloc-source workload \
+  -class r_hvy \
+  -query read_discovery_explore_keys
+```
+
 Headless until `Ctrl+C`:
 
 ```bash
@@ -48,9 +75,17 @@ go run ./stress -db bench.db -headless -out stress_report.json -r_idx 128 -w_fst
 - `-out`, `-report` : output JSON report path
 - `-cpu-profile` : write CPU profile for the run
 - `-heap-profile` : write heap profile at shutdown, before `FreeOSMemory`
+- `-alloc-profile` : run one focused filtered query and write an `allocs` profile
+- `-alloc-source` : focused alloc source, `prepared` or `workload`
+- `-alloc-mode` : focused alloc execution mode, `hot` or `turnover`
+- `-alloc-scope` : focused alloc scope, `full` or `query`
 - `-pprof-http` : expose `net/http/pprof`
 - `-duration` : fixed run duration; enables headless mode automatically
 - `-headless`, `-no-ui` : disable interactive UI
+- `-alloc-warmup-ops` : warmup query ops before focused alloc profiling
+- `-alloc-ops` : fixed measured op count for focused alloc profiling
+- `-alloc-memrate` : `runtime.MemProfileRate` during focused alloc profiling
+- `-alloc-turnover-ring` : turnover ring size for prepared alloc profiling
 - `-no-cache` : disable rbi runtime caches and numeric range bucket acceleration
 - interactive mode shows per-query counters/TPS/latency by default
 - `-query-stats` : enable the same per-query breakdowns/latency collector in headless runs and
@@ -134,3 +169,32 @@ Only one `stress` process should target a given DB file at a time. `report saved
 DB ownership: the process still has to release OS memory and finish `DB.Close()`. The stress helper
 uses a fixed short open timeout internally to catch accidental parallel runs; do not start another
 `stress`/`bench` process until the prior one has fully exited and released the DB.
+
+`-alloc-profile` is a separate focused mode. It requires filters that leave exactly one class and one
+query, performs warmup outside the measured phase, enables `runtime.MemProfileRate` only for the
+measured window, and writes `pprof` `allocs` data for that window. Use `-alloc-ops` when you need
+hot/turnover profiles to be directly comparable per operation.
+
+`-alloc-source=prepared` runs benchmark-like prepared queries that are built once outside the
+measured loop, so the profile reflects engine execution rather than `qx.Query(...)` construction.
+Prepared research classes are:
+
+- `alloc_items`
+- `alloc_keys`
+- `alloc_count`
+
+Prepared query names include both stress-aligned and benchmark-aligned scenarios, for example:
+
+- `read_discovery_explore_keys`
+- `read_frontpage_candidate_keys`
+- `count_realistic_discovery_or`
+- `count_gap_heavyor_multibranch`
+- `keys_heavy_limit`
+- `keys_realistic_autocomplete_prefix_limit`
+- `keys_gap_crm_multibranch_or_limit`
+
+`-alloc-mode=turnover` applies one benchmark-like patch before each profiled op.
+
+`-alloc-scope=query` excludes the turnover patch itself from the `allocs` profile and records only
+the reader/query phase after each patch. `-alloc-scope=full` profiles the whole cold cycle,
+including turnover/publish work.

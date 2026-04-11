@@ -3,6 +3,7 @@ package rbi
 import (
 	"fmt"
 	"math/rand/v2"
+	"os"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -147,14 +148,16 @@ var dynamicBenchQueries = []dynamicBenchQueryCase{
 }
 
 var (
-	dynamicBenchMu   sync.Mutex
-	dynamicBenchDBs  = make(map[string]*DB[uint64, UserBench])
-	dynamicBenchRaws = make(map[string]*bbolt.DB)
+	dynamicBenchMu  sync.Mutex
+	dynamicBenchDBs = make(map[string]*cachedDynamicBenchDB)
 )
 
 func openDynamicBenchDB(b *testing.B) (*DB[uint64, UserBench], *bbolt.DB, string) {
 	b.Helper()
-	dir := b.TempDir()
+	dir, err := os.MkdirTemp("", "rbi-bench-dynamic-*")
+	if err != nil {
+		b.Fatalf("os.MkdirTemp: %v", err)
+	}
 	path := filepath.Join(dir, "dynamic_bench.db")
 
 	opts := benchOptions()
@@ -163,24 +166,45 @@ func openDynamicBenchDB(b *testing.B) (*DB[uint64, UserBench], *bbolt.DB, string
 	return db, raw, path
 }
 
+type cachedDynamicBenchDB struct {
+	db   *DB[uint64, UserBench]
+	raw  *bbolt.DB
+	path string
+}
+
+func dynamicBenchProfileCacheKey(profile dynamicBenchProfile) string {
+	return fmt.Sprintf(
+		"dynamic/%s/%d/%d/%d/%d/%d",
+		profile.name,
+		profile.n,
+		profile.seed,
+		profile.distribution,
+		profile.scoreMode,
+		profile.scoreBuckets,
+	)
+}
+
 func buildBenchDBDynamicProfileWithMode(b *testing.B, profile dynamicBenchProfile, mode benchCacheMode) *DB[uint64, UserBench] {
 	b.Helper()
 	dynamicBenchMu.Lock()
 	defer dynamicBenchMu.Unlock()
 
-	key := fmt.Sprintf("%s/%d/%s", profile.name, profile.n, mode.suffix)
-	if db := dynamicBenchDBs[key]; db != nil {
-		return db
+	key := dynamicBenchProfileCacheKey(profile)
+	if cached := dynamicBenchDBs[key]; cached != nil && cached.db != nil && !cached.db.closed.Load() {
+		return cached.db
 	}
 
-	db, raw, _ := openDynamicBenchDB(b)
+	db, raw, path := openDynamicBenchDB(b)
 
 	b.StopTimer()
 	seedBenchDataDynamicProfile(b, db, profile)
 	b.StartTimer()
-
-	dynamicBenchDBs[key] = db
-	dynamicBenchRaws[key] = raw
+	dynamicBenchDBs[key] = &cachedDynamicBenchDB{db: db, raw: raw, path: path}
+	registerBenchSuiteCleanup(func() {
+		_ = db.Close()
+		_ = raw.Close()
+		_ = os.RemoveAll(filepath.Dir(path))
+	})
 	return db
 }
 

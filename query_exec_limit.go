@@ -1455,6 +1455,59 @@ func buildExactBucketPostingFilterActiveLeaf(dst, active []int, preds *pooled.Sl
 	return dst
 }
 
+func plannerFilterCompactPostingByLeafChecks(
+	preds *pooled.SliceBuf[leafPred],
+	checks []int,
+	src posting.List,
+	work posting.List,
+	card uint64,
+) (plannerPredicateBucketMode, posting.List, posting.List, bool) {
+	if preds == nil || card == 0 || card > posting.MidCap {
+		return 0, posting.List{}, work, false
+	}
+	if idx, ok := src.TrySingle(); ok {
+		for _, pi := range checks {
+			if !preds.Get(pi).containsIdx(idx) {
+				return plannerPredicateBucketEmpty, posting.List{}, work, true
+			}
+		}
+		return plannerPredicateBucketAll, src, work, true
+	}
+	var matched [posting.MidCap]uint64
+	n := 0
+	it := src.Iter()
+	for it.HasNext() {
+		idx := it.Next()
+		keep := true
+		for _, pi := range checks {
+			if !preds.Get(pi).containsIdx(idx) {
+				keep = false
+				break
+			}
+		}
+		if keep {
+			matched[n] = idx
+			n++
+		}
+	}
+	it.Release()
+	if n == 0 {
+		_, nextWork, ok := work.TryResetOwnedCompactLikeFromSorted(src, nil)
+		if !ok {
+			return 0, posting.List{}, work, false
+		}
+		return plannerPredicateBucketEmpty, posting.List{}, nextWork, true
+	}
+	if uint64(n) == card {
+		return plannerPredicateBucketAll, src, work, true
+	}
+	exact, nextWork, ok := work.TryResetOwnedCompactLikeFromSorted(src, matched[:n])
+	if !ok {
+		return 0, posting.List{}, work, false
+	}
+	return plannerPredicateBucketExact, exact, nextWork, true
+}
+
 func plannerFilterPostingByLeafChecks(
 	preds *pooled.SliceBuf[leafPred],
 	checks []int,
@@ -1494,6 +1547,10 @@ func plannerFilterPostingByLeafChecks(
 			return plannerPredicateBucketAll, src, work, card
 		}
 		return plannerPredicateBucketFallback, posting.List{}, work, card
+	}
+
+	if mode, exact, nextWork, ok := plannerFilterCompactPostingByLeafChecks(preds, checks, src, work, card); ok {
+		return mode, exact, nextWork, card
 	}
 
 	work = src.CloneInto(work)
@@ -1678,6 +1735,15 @@ type u64setPoolBuf struct {
 
 var u64setPools = initU64SetPools()
 
+var postingSmallUnionIterPool = pooled.Pointers[postingSmallUnionIter]{
+	Cleanup: func(it *postingSmallUnionIter) {
+		if it.curIt != nil {
+			it.curIt.Release()
+		}
+	},
+	Clear: true,
+}
+
 var postingUnionIterPool = pooled.Pointers[postingUnionIter]{
 	Clear: true,
 }
@@ -1712,7 +1778,9 @@ func u64setRequiredSize(capHint int) int {
 
 func newPostingUnionIter(posts []posting.List) posting.Iterator {
 	if len(posts) > 1 && len(posts) <= 3 {
-		return &postingSmallUnionIter{posts: posts}
+		it := postingSmallUnionIterPool.Get()
+		it.posts = posts
+		return it
 	}
 
 	/*
@@ -1734,7 +1802,9 @@ func newPostingUnionIter(posts []posting.List) posting.Iterator {
 
 func newPostingUnionBufIter(posts *pooled.SliceBuf[posting.List]) posting.Iterator {
 	if posts.Len() > 1 && posts.Len() <= 3 {
-		return &postingSmallUnionIter{postsBuf: posts}
+		it := postingSmallUnionIterPool.Get()
+		it.postsBuf = posts
+		return it
 	}
 	capHint := min(max(posts.Len()*16, 64), 1024)
 	it := postingUnionIterPool.Get()
@@ -1817,15 +1887,7 @@ func (u *postingSmallUnionIter) Next() uint64 {
 }
 
 func (u *postingSmallUnionIter) Release() {
-	if u.curIt != nil {
-		u.curIt.Release()
-		u.curIt = nil
-	}
-	u.posts = nil
-	u.postsBuf = nil
-	u.i = 0
-	u.next = 0
-	u.has = false
+	postingSmallUnionIterPool.Put(u)
 }
 
 func (u *postingUnionIter) HasNext() bool {

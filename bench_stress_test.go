@@ -5,6 +5,7 @@ import (
 	"math/rand/v2"
 	"os"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"testing"
 
@@ -47,13 +48,6 @@ var (
 	benchStressAllRoles = []string{"member", "trusted", "moderator", "admin", "staff", "bot"}
 )
 
-var (
-	benchStressMu   sync.Mutex
-	benchStressDBs  = make(map[string]*DB[uint64, StressBenchUser])
-	benchStressRaws = make(map[string]*bbolt.DB)
-	benchStressDirs = make(map[string]string)
-)
-
 func openBenchStressDB(b *testing.B) (*DB[uint64, StressBenchUser], *bbolt.DB, string) {
 	b.Helper()
 	dir, err := os.MkdirTemp("", "rbi-bench-stress-*")
@@ -64,24 +58,41 @@ func openBenchStressDB(b *testing.B) (*DB[uint64, StressBenchUser], *bbolt.DB, s
 	return db, raw, dir
 }
 
-func buildBenchStressDBWithCaching(b *testing.B, n int, mode benchCacheMode) *DB[uint64, StressBenchUser] {
+type cachedBenchStressDB struct {
+	db  *DB[uint64, StressBenchUser]
+	raw *bbolt.DB
+	dir string
+}
+
+var (
+	benchStressDBs = make(map[string]*cachedBenchStressDB)
+	benchStressMu  sync.Mutex
+)
+
+func benchStressDBFamilyKey(n int) string {
+	return "stress_uint64/" + strconv.Itoa(n)
+}
+
+func buildBenchStressDBWithMode(b *testing.B, n int, mode benchCacheMode) *DB[uint64, StressBenchUser] {
 	b.Helper()
 	benchStressMu.Lock()
 	defer benchStressMu.Unlock()
 
-	key := benchDBCacheKey(mode, n)
-	if db := benchStressDBs[key]; db != nil && !db.closed.Load() {
-		return db
+	key := benchStressDBFamilyKey(n)
+	if cached := benchStressDBs[key]; cached != nil && cached.db != nil && !cached.db.closed.Load() {
+		return cached.db
 	}
 
 	db, raw, dir := openBenchStressDB(b)
 	b.StopTimer()
 	seedBenchStressData(b, db, n)
 	b.StartTimer()
-
-	benchStressDBs[key] = db
-	benchStressRaws[key] = raw
-	benchStressDirs[key] = dir
+	benchStressDBs[key] = &cachedBenchStressDB{db: db, raw: raw, dir: dir}
+	registerBenchSuiteCleanup(func() {
+		_ = db.Close()
+		_ = raw.Close()
+		_ = os.RemoveAll(dir)
+	})
 	return db
 }
 
@@ -264,6 +275,11 @@ func warmBenchCountOnceStress(b *testing.B, db *DB[uint64, StressBenchUser], q *
 	b.Helper()
 	b.StopTimer()
 	defer b.StartTimer()
+	runBenchCountOnceStress(b, db, q)
+}
+
+func runBenchCountOnceStress(b *testing.B, db *DB[uint64, StressBenchUser], q *qx.QX) {
+	b.Helper()
 	if _, err := db.Count(q); err != nil {
 		b.Fatal(err)
 	}
@@ -273,6 +289,11 @@ func warmBenchQueryKeysOnceStress(b *testing.B, db *DB[uint64, StressBenchUser],
 	b.Helper()
 	b.StopTimer()
 	defer b.StartTimer()
+	runBenchQueryKeysOnceStress(b, db, q)
+}
+
+func runBenchQueryKeysOnceStress(b *testing.B, db *DB[uint64, StressBenchUser], q *qx.QX) {
+	b.Helper()
 	if _, err := db.QueryKeys(q); err != nil {
 		b.Fatal(err)
 	}
@@ -282,6 +303,11 @@ func warmBenchReadQueryOnceStress(b *testing.B, db *DB[uint64, StressBenchUser],
 	b.Helper()
 	b.StopTimer()
 	defer b.StartTimer()
+	runBenchReadQueryOnceStress(b, db, q)
+}
+
+func runBenchReadQueryOnceStress(b *testing.B, db *DB[uint64, StressBenchUser], q *qx.QX) {
+	b.Helper()
 	items, err := db.Query(q)
 	if err != nil {
 		b.Fatal(err)
@@ -292,51 +318,61 @@ func warmBenchReadQueryOnceStress(b *testing.B, db *DB[uint64, StressBenchUser],
 func runStressCountBenchWithMode(b *testing.B, db *DB[uint64, StressBenchUser], q *qx.QX, mode benchCacheMode) {
 	b.Helper()
 	b.ReportAllocs()
-	prepareReadBenchWithMode(b, db, mode, func() {
-		warmBenchCountOnceStress(b, db, q)
-	})
+	state := prepareReadBenchWithMode(
+		b,
+		db,
+		q,
+		mode,
+		warmBenchCountOnceStress,
+		runBenchCountOnceStress,
+		buildStressBenchTurnoverRing,
+	)
 	for b.Loop() {
-		clearBenchSnapshotCachesIfNeeded(db, mode)
-		if _, err := db.Count(q); err != nil {
-			b.Fatal(err)
-		}
+		state.beforeQuery(b, db)
+		runBenchCountOnceStress(b, db, q)
 	}
 }
 
 func runStressQueryKeysBenchWithMode(b *testing.B, db *DB[uint64, StressBenchUser], q *qx.QX, mode benchCacheMode) {
 	b.Helper()
 	b.ReportAllocs()
-	prepareReadBenchWithMode(b, db, mode, func() {
-		warmBenchQueryKeysOnceStress(b, db, q)
-	})
+	state := prepareReadBenchWithMode(
+		b,
+		db,
+		q,
+		mode,
+		warmBenchQueryKeysOnceStress,
+		runBenchQueryKeysOnceStress,
+		buildStressBenchTurnoverRing,
+	)
 	for b.Loop() {
-		clearBenchSnapshotCachesIfNeeded(db, mode)
-		if _, err := db.QueryKeys(q); err != nil {
-			b.Fatal(err)
-		}
+		state.beforeQuery(b, db)
+		runBenchQueryKeysOnceStress(b, db, q)
 	}
 }
 
 func runStressReadQueryBenchWithMode(b *testing.B, db *DB[uint64, StressBenchUser], q *qx.QX, mode benchCacheMode) {
 	b.Helper()
 	b.ReportAllocs()
-	prepareReadBenchWithMode(b, db, mode, func() {
-		warmBenchReadQueryOnceStress(b, db, q)
-	})
+	state := prepareReadBenchWithMode(
+		b,
+		db,
+		q,
+		mode,
+		warmBenchReadQueryOnceStress,
+		runBenchReadQueryOnceStress,
+		buildStressBenchTurnoverRing,
+	)
 	for b.Loop() {
-		clearBenchSnapshotCachesIfNeeded(db, mode)
-		items, err := db.Query(q)
-		if err != nil {
-			b.Fatal(err)
-		}
-		db.ReleaseRecords(items...)
+		state.beforeQuery(b, db)
+		runBenchReadQueryOnceStress(b, db, q)
 	}
 }
 
 func runStressCountBenchCacheModes(b *testing.B, qf func() *qx.QX) {
 	b.Helper()
 	runBenchCacheModes(b, func(b *testing.B, mode benchCacheMode) {
-		db := buildBenchStressDBWithCaching(b, benchStressN, mode)
+		db := buildBenchStressDBWithMode(b, benchStressN, mode)
 		runStressCountBenchWithMode(b, db, qf(), mode)
 	})
 }
@@ -344,7 +380,7 @@ func runStressCountBenchCacheModes(b *testing.B, qf func() *qx.QX) {
 func runStressQueryKeysBenchCacheModes(b *testing.B, qf func() *qx.QX) {
 	b.Helper()
 	runBenchCacheModes(b, func(b *testing.B, mode benchCacheMode) {
-		db := buildBenchStressDBWithCaching(b, benchStressN, mode)
+		db := buildBenchStressDBWithMode(b, benchStressN, mode)
 		runStressQueryKeysBenchWithMode(b, db, qf(), mode)
 	})
 }
@@ -352,7 +388,7 @@ func runStressQueryKeysBenchCacheModes(b *testing.B, qf func() *qx.QX) {
 func runStressReadQueryBenchCacheModes(b *testing.B, qf func() *qx.QX) {
 	b.Helper()
 	runBenchCacheModes(b, func(b *testing.B, mode benchCacheMode) {
-		db := buildBenchStressDBWithCaching(b, benchStressN, mode)
+		db := buildBenchStressDBWithMode(b, benchStressN, mode)
 		runStressReadQueryBenchWithMode(b, db, qf(), mode)
 	})
 }

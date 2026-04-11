@@ -2,7 +2,6 @@ package rbi
 
 import (
 	"math/bits"
-	"slices"
 
 	"github.com/vapstack/qx"
 	"github.com/vapstack/rbi/internal/pooled"
@@ -219,6 +218,65 @@ func (state *postsAnyFilterState) shouldUseDirectIntersect(dstCard uint64) (uint
 	return unionCard, true
 }
 
+func (state *postsAnyFilterState) applyOwnedLargeDirect(dst posting.List, card uint64) (posting.List, bool) {
+	if state == nil || state.postsBuf == nil || card == 0 || !dst.IsOwnedLarge() {
+		return posting.List{}, false
+	}
+
+	it := dst.Iter()
+	var inline [singleInlineCap]uint64
+	inlineLen := 0
+	var singles *singleIDsBuffer
+	matched := uint64(0)
+	for it.HasNext() {
+		idx := it.Next()
+		hit := false
+		for i := 0; i < state.postsBuf.Len(); i++ {
+			if state.postsBuf.Get(i).Contains(idx) {
+				hit = true
+				break
+			}
+		}
+		if !hit {
+			continue
+		}
+		matched++
+		if singles == nil {
+			if inlineLen < len(inline) {
+				inline[inlineLen] = idx
+				inlineLen++
+				continue
+			}
+			singles = getSingleIDsBuf()
+			singles.values = append(singles.values, inline[:]...)
+			inlineLen = 0
+		}
+		singles.values = append(singles.values, idx)
+	}
+	it.Release()
+
+	if matched == 0 {
+		if singles != nil {
+			releaseSingleIDs(singles)
+		}
+		dst.Release()
+		return posting.List{}, true
+	}
+	if matched == card {
+		if singles != nil {
+			releaseSingleIDs(singles)
+		}
+		return dst, true
+	}
+
+	if singles != nil {
+		out, ok := dst.TryResetOwnedLargeFromSorted(singles.values)
+		releaseSingleIDs(singles)
+		return out, ok
+	}
+	return dst.TryResetOwnedLargeFromSorted(inline[:inlineLen])
+}
+
 func (state *postsAnyFilterState) apply(dst posting.List) (posting.List, bool) {
 	if dst.IsEmpty() {
 		return dst, true
@@ -227,14 +285,11 @@ func (state *postsAnyFilterState) apply(dst posting.List) (posting.List, bool) {
 	if postCount <= 4 {
 		card := dst.Cardinality()
 		if card > 0 && card <= postsAnyDirectBucketFilterMaxCard(postCount) {
-			if idx, ok := dst.TrySingle(); ok {
-				for i := 0; i < state.postsBuf.Len(); i++ {
-					if state.postsBuf.Get(i).Contains(idx) {
-						return dst, true
-					}
-				}
-				dst.Release()
-				return posting.List{}, true
+			if next, ok := state.applyOwnedLargeDirect(dst, card); ok {
+				return next, true
+			}
+			if next, ok := dst.TryBuildAndAnyBuf(state.postsBuf); ok {
+				return next, true
 			}
 
 			builder := newPostingUnionBuilder(postingBatchSinglesEnabled(card))
@@ -266,6 +321,9 @@ func (state *postsAnyFilterState) apply(dst posting.List) (posting.List, bool) {
 		}
 
 		if unionCard, ok := state.shouldUseDirectIntersect(card); ok {
+			if next, ok := state.applyOwnedLargeDirect(dst, card); ok {
+				return next, true
+			}
 			capHint := card
 			if unionCard < capHint {
 				capHint = unionCard
@@ -1062,7 +1120,6 @@ func (b *postingUnionBuilder) flushSingles() {
 		if len(b.singles.values) == 0 {
 			return
 		}
-		slices.Sort(b.singles.values)
 		b.ids = b.ids.BuildAddedMany(b.singles.values)
 		b.singles.values = b.singles.values[:0]
 		return
@@ -1071,7 +1128,6 @@ func (b *postingUnionBuilder) flushSingles() {
 		return
 	}
 	singles := b.inlineSingles[:b.inlineLen]
-	slices.Sort(singles)
 	b.ids = b.ids.BuildAddedMany(singles)
 	b.inlineLen = 0
 }
@@ -1100,6 +1156,15 @@ func (b *postingUnionBuilder) addSingle(idx uint64) {
 func (b *postingUnionBuilder) addPosting(ids posting.List) {
 	if ids.IsEmpty() {
 		return
+	}
+	if b.batchSingles {
+		var compact [posting.MidCap]uint64
+		if values, ok := ids.TryAppendCompactTo(compact[:0]); ok {
+			for _, idx := range values {
+				b.addSingle(idx)
+			}
+			return
+		}
 	}
 	if idx, ok := ids.TrySingle(); ok {
 		b.addSingle(idx)
@@ -1210,7 +1275,6 @@ func (b *postingSetBuilder) flushSingles() {
 		if len(b.singles.values) == 0 {
 			return
 		}
-		slices.Sort(b.singles.values)
 		b.ids = b.ids.BuildAddedMany(b.singles.values)
 		b.singles.values = b.singles.values[:0]
 		return
@@ -1219,7 +1283,6 @@ func (b *postingSetBuilder) flushSingles() {
 		return
 	}
 	singles := b.inlineSingles[:b.inlineLen]
-	slices.Sort(singles)
 	b.ids = b.ids.BuildAddedMany(singles)
 	b.inlineLen = 0
 }

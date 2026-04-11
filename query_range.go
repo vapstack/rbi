@@ -5,41 +5,222 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/vapstack/rbi/internal/pooled"
 	"github.com/vapstack/rbi/internal/posting"
 )
 
 const numericRangeFullSpanCacheMaxEntries = 4
+
+type numericRangeBucketCache struct {
+	mu    sync.Mutex
+	slots *pooled.SliceBuf[numericRangeBucketCacheSlot]
+}
 
 type numericRangeBucketIndex struct {
 	bucketSize int
 	keyCount   int
 }
 
+type numericRangeBucketCacheSlot struct {
+	field string
+	entry *numericRangeBucketCacheEntry
+}
+
+type numericRangeFullSpanCacheSlot struct {
+	key   uint64
+	ids   posting.List
+	stamp uint64
+	used  bool
+}
+
 type numericRangeBucketCacheEntry struct {
+	refs          atomic.Int32
 	storage       fieldIndexStorage
 	idx           numericRangeBucketIndex
 	maxCard       uint64
-	fullSpanCache sync.Map
-	fullSpanCount atomic.Int32
+	mu            sync.Mutex
+	fullSpanClock uint64
+	fullSpanCache [numericRangeFullSpanCacheMaxEntries]numericRangeFullSpanCacheSlot
+	retired       *pooled.SliceBuf[posting.List]
+}
+
+var numericRangeBucketCachePool = pooled.Pointers[numericRangeBucketCache]{
+	Cleanup: func(c *numericRangeBucketCache) {
+		c.release()
+	},
+}
+
+var numericRangeBucketCacheSlotPool = pooled.Slices[numericRangeBucketCacheSlot]{
+	Clear: true,
+}
+
+var numericRangeBucketCacheEntryPool = pooled.Pointers[numericRangeBucketCacheEntry]{
+	Cleanup: func(e *numericRangeBucketCacheEntry) {
+		e.releaseFullSpanCache()
+	},
+	Clear: true,
+}
+
+var numericRangeRetiredPostingPool = pooled.Slices[posting.List]{
+	Cleanup: func(buf *pooled.SliceBuf[posting.List]) {
+		for i := 0; i < buf.Len(); i++ {
+			ids := buf.Get(i)
+			if !ids.IsEmpty() {
+				ids.Release()
+			}
+		}
+	},
+	Clear: true,
 }
 
 func numericRangeFullSpanCacheKey(start, end int) uint64 {
 	return uint64(uint32(start))<<32 | uint64(uint32(end))
 }
 
+func (c *numericRangeBucketCache) init(fieldCount int) {
+	if c.slots == nil {
+		c.slots = numericRangeBucketCacheSlotPool.Get()
+	}
+	c.slots.SetLen(fieldCount)
+}
+
+func (c *numericRangeBucketCache) clearEntries() {
+	if c == nil || c.slots == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for i := 0; i < c.slots.Len(); i++ {
+		slot := c.slots.Get(i)
+		if slot.entry != nil {
+			slot.entry.release()
+			slot.entry = nil
+		}
+		slot.field = ""
+		c.slots.Set(i, slot)
+	}
+}
+
+func (c *numericRangeBucketCache) release() {
+	if c == nil || c.slots == nil {
+		return
+	}
+	c.clearEntries()
+	numericRangeBucketCacheSlotPool.Put(c.slots)
+	c.slots = nil
+}
+
+func (c *numericRangeBucketCache) loadSlot(field string, ordinal int) (*numericRangeBucketCacheEntry, bool) {
+	if c == nil || c.slots == nil || ordinal < 0 || ordinal >= c.slots.Len() {
+		return nil, false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	slot := c.slots.Get(ordinal)
+	if slot.entry == nil || slot.field != field {
+		return nil, false
+	}
+	return slot.entry, true
+}
+
+func (c *numericRangeBucketCache) storeSlot(field string, ordinal int, entry *numericRangeBucketCacheEntry) {
+	if c == nil || c.slots == nil || ordinal < 0 || ordinal >= c.slots.Len() {
+		return
+	}
+	c.mu.Lock()
+	slot := c.slots.Get(ordinal)
+	slot.field = field
+	slot.entry = entry
+	c.slots.Set(ordinal, slot)
+	c.mu.Unlock()
+}
+
+func (c *numericRangeBucketCache) loadField(field string) (*numericRangeBucketCacheEntry, bool) {
+	if c == nil || c.slots == nil || field == "" {
+		return nil, false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for i := 0; i < c.slots.Len(); i++ {
+		slot := c.slots.Get(i)
+		if slot.field == field && slot.entry != nil {
+			return slot.entry, true
+		}
+	}
+	return nil, false
+}
+
+func (c *numericRangeBucketCache) entryCount() int {
+	if c == nil || c.slots == nil {
+		return 0
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	count := 0
+	for i := 0; i < c.slots.Len(); i++ {
+		if c.slots.Get(i).entry != nil {
+			count++
+		}
+	}
+	return count
+}
+
+func (e *numericRangeBucketCacheEntry) retain() {
+	e.refs.Add(1)
+}
+
+func (e *numericRangeBucketCacheEntry) release() {
+	if e != nil && e.refs.Add(-1) == 0 {
+		numericRangeBucketCacheEntryPool.Put(e)
+	}
+}
+
+func (e *numericRangeBucketCacheEntry) releaseFullSpanCache() {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	for i := range e.fullSpanCache {
+		if e.fullSpanCache[i].used && !e.fullSpanCache[i].ids.IsEmpty() {
+			e.fullSpanCache[i].ids.Release()
+		}
+		e.fullSpanCache[i] = numericRangeFullSpanCacheSlot{}
+	}
+	if e.retired != nil {
+		numericRangeRetiredPostingPool.Put(e.retired)
+		e.retired = nil
+	}
+	e.fullSpanClock = 0
+}
+
+func (e *numericRangeBucketCacheEntry) retirePosting(ids posting.List) {
+	if ids.IsEmpty() {
+		return
+	}
+	if e.retired == nil {
+		e.retired = numericRangeRetiredPostingPool.Get()
+	}
+	e.retired.Append(ids)
+}
+
 func (e *numericRangeBucketCacheEntry) loadFullSpan(start, end int) (posting.List, bool) {
 	if e == nil {
 		return posting.List{}, false
 	}
-	v, ok := e.fullSpanCache.Load(numericRangeFullSpanCacheKey(start, end))
-	if !ok {
-		return posting.List{}, false
+	key := numericRangeFullSpanCacheKey(start, end)
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	for i := range e.fullSpanCache {
+		slot := &e.fullSpanCache[i]
+		if !slot.used || slot.key != key {
+			continue
+		}
+		if slot.ids.IsEmpty() {
+			return posting.List{}, false
+		}
+		e.fullSpanClock++
+		slot.stamp = e.fullSpanClock
+		return slot.ids.Borrow(), true
 	}
-	ids, ok := v.(posting.List)
-	if !ok || ids.IsEmpty() {
-		return posting.List{}, false
-	}
-	return ids.Borrow(), true
+	return posting.List{}, false
 }
 
 func (e *numericRangeBucketCacheEntry) tryStoreFullSpan(start, end int, ids posting.List) (posting.List, bool) {
@@ -47,60 +228,67 @@ func (e *numericRangeBucketCacheEntry) tryStoreFullSpan(start, end int, ids post
 		return ids, false
 	}
 	key := numericRangeFullSpanCacheKey(start, end)
-	if cached, ok := e.loadFullSpan(start, end); ok {
-		ids.Release()
-		return cached, true
-	}
 	if e.maxCard > 0 && ids.Cardinality() > e.maxCard {
 		return ids, false
 	}
+	e.mu.Lock()
+	for i := range e.fullSpanCache {
+		slot := &e.fullSpanCache[i]
+		if !slot.used || slot.key != key {
+			continue
+		}
+		e.fullSpanClock++
+		slot.stamp = e.fullSpanClock
+		cached := slot.ids
+		e.mu.Unlock()
+		ids.Release()
+		return cached.Borrow(), true
+	}
+	e.mu.Unlock()
 	stored := ids
 	if stored.IsBorrowed() {
 		stored = stored.Clone()
 	}
-	for {
-		n := e.fullSpanCount.Load()
-		if n >= numericRangeFullSpanCacheMaxEntries {
-			var evictKey any
-			e.fullSpanCache.Range(func(k, v any) bool {
-				evictKey = k
-				return false
-			})
-			if evictKey == nil {
-				if !stored.SharesPayload(ids) {
-					stored.Release()
-				}
-				return ids, false
-			}
-			actual, deleted := e.fullSpanCache.LoadAndDelete(evictKey)
-			if !deleted {
-				continue
-			}
-			// loadFullSpan hands out Borrow() views, which are non-owning wrappers
-			// over the same posting payload. Eviction must only stop future cache
-			// hits; it cannot release the payload eagerly because concurrent readers
-			// may still be traversing the evicted posting.
-			_ = actual
-			e.fullSpanCount.Add(-1)
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	for i := range e.fullSpanCache {
+		slot := &e.fullSpanCache[i]
+		if !slot.used || slot.key != key {
 			continue
 		}
-		if e.fullSpanCount.CompareAndSwap(n, n+1) {
-			actual, loaded := e.fullSpanCache.LoadOrStore(key, stored)
-			if loaded {
-				e.fullSpanCount.Add(-1)
-				if !stored.SharesPayload(ids) {
-					stored.Release()
-				}
-				ids.Release()
-				cached, _ := actual.(posting.List)
-				if !cached.IsEmpty() {
-					return cached.Borrow(), true
-				}
-				return posting.List{}, false
-			}
-			return stored.Borrow(), true
+		e.fullSpanClock++
+		slot.stamp = e.fullSpanClock
+		cached := slot.ids
+		if !stored.SharesPayload(ids) {
+			stored.Release()
+		}
+		ids.Release()
+		return cached.Borrow(), true
+	}
+	slotIdx := -1
+	oldestStamp := ^uint64(0)
+	for i := range e.fullSpanCache {
+		slot := &e.fullSpanCache[i]
+		if !slot.used {
+			slotIdx = i
+			break
+		}
+		if slot.stamp <= oldestStamp {
+			oldestStamp = slot.stamp
+			slotIdx = i
 		}
 	}
+	e.fullSpanClock++
+	if replaced := e.fullSpanCache[slotIdx]; replaced.used && !replaced.ids.IsEmpty() {
+		e.retirePosting(replaced.ids)
+	}
+	e.fullSpanCache[slotIdx] = numericRangeFullSpanCacheSlot{
+		key:   key,
+		ids:   stored,
+		stamp: e.fullSpanClock,
+		used:  true,
+	}
+	return stored.Borrow(), true
 }
 
 func (idx *numericRangeBucketIndex) fullBucketSpan(br overlayRange) (start, end int, ok bool) {
@@ -292,41 +480,48 @@ func buildNumericRangeBucketIndexOverlay(ov fieldOverlay, bucketSize, minFieldKe
 	}, true
 }
 
-func (s *indexSnapshot) getNumericRangeBucketCacheEntry(field string, storage fieldIndexStorage, bucketSize, minFieldKeys int) *numericRangeBucketCacheEntry {
+func (s *indexSnapshot) getNumericRangeBucketCacheEntry(field string, ordinal int, storage fieldIndexStorage, bucketSize, minFieldKeys int) *numericRangeBucketCacheEntry {
 	if s == nil || storage.keyCount() == 0 {
 		return nil
 	}
 	ov := newFieldOverlayStorage(storage)
 	cache := s.numericRangeBucketCache
 	if cache == nil {
-		idx, _ := buildNumericRangeBucketIndexOverlay(ov, bucketSize, minFieldKeys)
-		return &numericRangeBucketCacheEntry{
-			storage: storage,
-			idx:     idx,
-			maxCard: s.matPredCacheMaxCard,
-		}
+		return nil
 	}
 
-	if cached, ok := cache.Load(field); ok {
-		if entry, ok := cached.(*numericRangeBucketCacheEntry); ok && entry != nil && entry.storage == storage {
-			return entry
-		}
+	if entry, ok := cache.loadSlot(field, ordinal); ok && entry.storage == storage {
+		return entry
 	}
 
 	idx, _ := buildNumericRangeBucketIndexOverlay(ov, bucketSize, minFieldKeys)
-	entry := &numericRangeBucketCacheEntry{
-		storage: storage,
-		idx:     idx,
-		maxCard: s.matPredCacheMaxCard,
+	entry := numericRangeBucketCacheEntryPool.Get()
+	entry.refs.Store(1)
+	entry.storage = storage
+	entry.idx = idx
+	entry.maxCard = s.matPredCacheMaxCard
+	if cached, ok := cache.loadSlot(field, ordinal); ok && cached.storage == storage {
+		entry.release()
+		return cached
 	}
-	if actual, loaded := cache.LoadOrStore(field, entry); loaded {
-		if stored, ok := actual.(*numericRangeBucketCacheEntry); ok && stored != nil && stored.storage == storage {
-			return stored
-		}
-		cache.Store(field, entry)
-	}
-
+	cache.storeSlot(field, ordinal, entry)
 	return entry
+}
+
+func (qv *queryView[K, V]) numericRangeFieldOrdinal(field string) (int, bool) {
+	acc, ok := qv.root.indexedFieldByName[field]
+	if !ok {
+		return 0, false
+	}
+	return acc.ordinal, true
+}
+
+func (qv *queryView[K, V]) numericRangeBucketCacheEntry(field string, storage fieldIndexStorage, bucketSize, minFieldKeys int) *numericRangeBucketCacheEntry {
+	ordinal, ok := qv.numericRangeFieldOrdinal(field)
+	if !ok {
+		return nil
+	}
+	return qv.snap.getNumericRangeBucketCacheEntry(field, ordinal, storage, bucketSize, minFieldKeys)
 }
 
 func (qv *queryView[K, V]) tryEvalNumericRangeBuckets(field string, fm *field, ov fieldOverlay, br overlayRange) (postingResult, bool) {
@@ -337,10 +532,7 @@ func (qv *queryView[K, V]) tryEvalNumericRangeBuckets(field string, fm *field, o
 	bucketSize := qv.options.NumericRangeBucketSize
 	minFieldKeys := qv.options.NumericRangeBucketMinFieldKeys
 	minSpan := qv.options.NumericRangeBucketMinSpanKeys
-	if bucketSize <= 0 || minFieldKeys <= 0 {
-		return postingResult{}, false
-	}
-	if minSpan <= 0 {
+	if bucketSize <= 0 || minFieldKeys <= 0 || minSpan <= 0 {
 		return postingResult{}, false
 	}
 	span := br.baseEnd - br.baseStart
@@ -355,7 +547,7 @@ func (qv *queryView[K, V]) tryEvalNumericRangeBuckets(field string, fm *field, o
 	if !ok || storage.keyCount() == 0 {
 		return postingResult{}, false
 	}
-	entry := qv.snap.getNumericRangeBucketCacheEntry(field, storage, bucketSize, minFieldKeys)
+	entry := qv.numericRangeBucketCacheEntry(field, storage, bucketSize, minFieldKeys)
 	if entry == nil {
 		return postingResult{}, false
 	}
@@ -363,7 +555,6 @@ func (qv *queryView[K, V]) tryEvalNumericRangeBuckets(field string, fm *field, o
 	if idx.bucketSize <= 0 || idx.bucketCount() == 0 {
 		return postingResult{}, false
 	}
-
 	if idx.keyCount != ov.keyCount() {
 		return postingResult{}, false
 	}
@@ -429,7 +620,7 @@ func (qv *queryView[K, V]) tryLoadNumericRangeBuckets(field string, fm *field, o
 	if !ok || storage.keyCount() == 0 {
 		return postingResult{}, false
 	}
-	entry := qv.snap.getNumericRangeBucketCacheEntry(field, storage, bucketSize, minFieldKeys)
+	entry := qv.numericRangeBucketCacheEntry(field, storage, bucketSize, minFieldKeys)
 	if entry == nil {
 		return postingResult{}, false
 	}
@@ -497,8 +688,9 @@ func (qv *queryView[K, V]) tryCountSnapshotNumericRange(field string, fm *field,
 		root := storage.chunked
 		return root.rangeRows(root.posForRank(start), root.posForRank(end)), true
 	}
-	if storage.flat == nil {
+	flat := storage.flatSlice()
+	if flat == nil {
 		return 0, false
 	}
-	return countBaseIndexRangeCardinality(*storage.flat, start, end), true
+	return countBaseIndexRangeCardinality(*flat, start, end), true
 }

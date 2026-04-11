@@ -203,7 +203,7 @@ func TestFieldIndexChunkStreamBuilder_RoundTripAfterFlushes(t *testing.T) {
 	}
 }
 
-func TestNewFieldIndexChunkRefsWithInsertedEntry_BorrowsUntouchedPostings(t *testing.T) {
+func TestNewFieldIndexChunkRefsWithInsertedEntry_OwnsUntouchedPostings(t *testing.T) {
 	tests := []struct {
 		name   string
 		fixed8 bool
@@ -259,11 +259,11 @@ func TestNewFieldIndexChunkRefsWithInsertedEntry_BorrowsUntouchedPostings(t *tes
 					if src >= len(ref.chunk.posts) {
 						t.Fatalf("unexpected extra untouched posting at %d", i)
 					}
-					if !ids.IsBorrowed() {
-						t.Fatalf("untouched posting at src=%d is not borrowed", src)
+					if ids.IsBorrowed() {
+						t.Fatalf("untouched posting at src=%d unexpectedly borrowed", src)
 					}
-					if !ids.SharesPayload(ref.chunk.posts[src]) {
-						t.Fatalf("untouched posting at src=%d does not share payload", src)
+					if ids.Cardinality() != ref.chunk.posts[src].Cardinality() {
+						t.Fatalf("untouched posting at src=%d changed cardinality", src)
 					}
 					src++
 				}
@@ -278,7 +278,7 @@ func TestNewFieldIndexChunkRefsWithInsertedEntry_BorrowsUntouchedPostings(t *tes
 	}
 }
 
-func TestApplySingleFieldPostingDiffChunked_BorrowsUntouchedPostingsOnExistingKeyFastPath(t *testing.T) {
+func TestApplySingleFieldPostingDiffChunked_OwnsUntouchedPostingsOnExistingKeyFastPath(t *testing.T) {
 	tests := []struct {
 		name   string
 		fixed8 bool
@@ -334,11 +334,11 @@ func TestApplySingleFieldPostingDiffChunked_BorrowsUntouchedPostingsOnExistingKe
 					}
 					continue
 				}
-				if !ids.IsBorrowed() {
-					t.Fatalf("untouched posting %d is not borrowed", i)
+				if ids.IsBorrowed() {
+					t.Fatalf("untouched posting %d unexpectedly borrowed", i)
 				}
-				if !ids.SharesPayload(ref.chunk.posts[i]) {
-					t.Fatalf("untouched posting %d does not share base payload", i)
+				if ids.Cardinality() != ref.chunk.posts[i].Cardinality() {
+					t.Fatalf("untouched posting %d changed cardinality", i)
 				}
 			}
 

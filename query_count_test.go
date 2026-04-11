@@ -1,14 +1,17 @@
 package rbi
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"runtime/pprof"
 	"sync"
 	"testing"
 
 	"github.com/vapstack/qx"
+	"github.com/vapstack/rbi/internal/normalize"
 	"github.com/vapstack/rbi/internal/pooled"
 	"github.com/vapstack/rbi/internal/posting"
 )
@@ -2036,6 +2039,12 @@ func TestCount_PreparePredicate_BroadRangeComplementCacheInvalidatedByNilFieldWr
 			releasePredicates([]predicate{p})
 			t.Fatalf("expected cached complement postingResult before nil insert")
 		}
+		heldSnap, heldRef, ok := db.pinSnapshotRefBySeq(prevSnap.seq)
+		if !ok || heldSnap != prevSnap || heldRef == nil {
+			releasePredicates([]predicate{p})
+			t.Fatalf("pinSnapshotRefBySeq(seq=%d) failed", prevSnap.seq)
+		}
+		defer db.unpinSnapshotRef(prevSnap.seq, heldRef)
 		releasePredicates([]predicate{p})
 
 		if err := db.Set(90_001, &Rec{
@@ -2082,6 +2091,12 @@ func TestCount_PreparePredicate_BroadRangeComplementCacheInvalidatedByNilFieldWr
 			releasePredicates([]predicate{p})
 			t.Fatalf("expected cached complement postingResult before nil delete")
 		}
+		heldSnap, heldRef, ok := db.pinSnapshotRefBySeq(prevSnap.seq)
+		if !ok || heldSnap != prevSnap || heldRef == nil {
+			releasePredicates([]predicate{p})
+			t.Fatalf("pinSnapshotRefBySeq(seq=%d) failed", prevSnap.seq)
+		}
+		defer db.unpinSnapshotRef(prevSnap.seq, heldRef)
 		releasePredicates([]predicate{p})
 
 		nilID := uint64(80_000)
@@ -2586,6 +2601,243 @@ func TestCount_BroadMaterializedLeadCheapResiduals_UsesPredicateScan(t *testing.
 	}
 }
 
+func TestCount_LeadPostingsSingleResidualBucketCount_AllocsPerRunStayZeroAfterWarmup(t *testing.T) {
+	if testRaceEnabled {
+		t.Skip("testing.AllocsPerRun is not stable under -race")
+	}
+
+	opts := benchOptions()
+	opts.AnalyzeInterval = -1
+
+	path := filepath.Join(t.TempDir(), "bench.db")
+	db, raw := openBoltAndNew[uint64, UserBench](t, path, opts)
+	t.Cleanup(func() {
+		_ = db.Close()
+		_ = raw.Close()
+	})
+
+	seedBenchData(t, db, 100_000)
+
+	q := qx.Query(
+		qx.PREFIX("email", "user"),
+		qx.EQ("status", "active"),
+		qx.NOTIN("plan", []string{"free"}),
+	)
+	expr, _ := normalize.Expr(q.Expr)
+
+	run := func() {
+		qv := db.makeQueryView(db.getSnapshot())
+		defer db.releaseQueryView(qv)
+		var leavesBuf [countPredicateScanMaxLeaves]qx.Expr
+		leaves, ok := collectAndLeavesScratch(expr, leavesBuf[:0])
+		if !ok {
+			t.Fatalf("collectAndLeavesScratch=false")
+		}
+
+		predSet, ok := qv.buildCountPredicatesWithMode(leaves, false)
+		if !ok {
+			t.Fatalf("buildCountPredicatesWithMode=false")
+		}
+		defer predSet.Release()
+
+		universe := qv.snapshotUniverseCardinality()
+		leadIdx, leadEst, leadScore := qv.pickCountLeadPredicate(predSet, universe)
+		if leadIdx < 0 {
+			t.Fatalf("leadIdx < 0")
+		}
+		if shouldPreferMaterializedCountEval(predSet, leadScore, universe) {
+			t.Fatalf("expected predicate count path")
+		}
+		if err := qv.prepareCountPredicateWithTrace(predSet.GetPtr(leadIdx), leadEst, universe, nil); err != nil {
+			t.Fatalf("prepareCountPredicate(lead): %v", err)
+		}
+		if predSet.Get(leadIdx).estCard > 0 {
+			leadEst = predSet.Get(leadIdx).estCard
+		}
+		leadNeedsCheck := predSet.GetPtr(leadIdx).leadIterNeedsContainsCheck()
+
+		var activeBuf [countPredicateScanMaxLeaves]int
+		active := activeBuf[:0]
+		for i := 0; i < predSet.Len(); i++ {
+			if i == leadIdx && !leadNeedsCheck {
+				continue
+			}
+			p := predSet.Get(i)
+			if p.covered || p.alwaysTrue {
+				continue
+			}
+			if p.alwaysFalse {
+				t.Fatalf("unexpected alwaysFalse predicate")
+			}
+			active = append(active, i)
+		}
+		if !predSet.GetPtr(leadIdx).isMaterializedLike() && qv.shouldRejectBroadLeadPredicateScan(predSet, active, leadEst, universe) {
+			t.Fatalf("unexpected broad lead predicate scan rejection")
+		}
+		for _, pi := range active {
+			if err := qv.prepareCountPredicateWithTrace(predSet.GetPtr(pi), leadEst, universe, nil); err != nil {
+				t.Fatalf("prepareCountPredicate(active=%d): %v", pi, err)
+			}
+		}
+
+		write := 0
+		for _, pi := range active {
+			p := predSet.Get(pi)
+			if p.covered || p.alwaysTrue {
+				continue
+			}
+			if p.alwaysFalse {
+				t.Fatalf("unexpected alwaysFalse active predicate")
+			}
+			if !p.hasContains() {
+				t.Fatalf("expected count predicate path to keep contains checks")
+			}
+			active[write] = pi
+			write++
+		}
+		active = active[:write]
+		sortActivePredicatesSet(active, predSet)
+
+		cnt, examined, ok := qv.tryCountByPredicatesLeadPostings(predSet, leadIdx, active)
+		if !ok {
+			t.Fatalf("tryCountByPredicatesLeadPostings=false")
+		}
+		if cnt == 0 || examined == 0 {
+			t.Fatalf("unexpected cnt=%d examined=%d", cnt, examined)
+		}
+	}
+
+	run()
+	allocs := testing.AllocsPerRun(50, run)
+	if allocs != 0 {
+		t.Fatalf("unexpected allocs after warmup: got=%v want=0", allocs)
+	}
+}
+
+func TestCountApplyLeadResidualExactFilters_StateOnlyAllocsPerRunStayZeroAfterWarmup(t *testing.T) {
+	if testRaceEnabled {
+		t.Skip("testing.AllocsPerRun is not stable under -race")
+	}
+
+	src := posting.BuildFromSorted([]uint64{
+		3, 5, 7, 9, 11, 13, 15, 17, 19, 21, 23, 25, 27, 29, 31, 33,
+		35, 37, 39, 41, 43, 45, 47, 49, 51, 53, 55, 57, 59, 61, 63, 65,
+	})
+	defer src.Release()
+
+	postA := posting.BuildFromSorted([]uint64{7, 11, 19, 31, 43, 55, 63})
+	postB := posting.BuildFromSorted([]uint64{5, 11, 17, 23, 31, 41, 47, 59})
+	postC := posting.BuildFromSorted([]uint64{3, 9, 15, 21, 27, 33, 39, 45, 51, 57, 63})
+	postD := posting.BuildFromSorted([]uint64{11, 21, 31, 41, 51, 61})
+	defer postA.Release()
+	defer postB.Release()
+	defer postC.Release()
+	defer postD.Release()
+
+	postsBuf1 := postingSlicePool.Get()
+	postsBuf1.Append(postA)
+	postsBuf1.Append(postB)
+	state1 := postsAnyFilterStatePool.Get()
+	state1.postsBuf = postsBuf1
+
+	postsBuf2 := postingSlicePool.Get()
+	postsBuf2.Append(postC)
+	postsBuf2.Append(postD)
+	state2 := postsAnyFilterStatePool.Get()
+	state2.postsBuf = postsBuf2
+
+	filters := countLeadResidualExactFilterSlicePool.Get()
+	filters.Append(countLeadResidualExactFilter{idx: 0, state: state1})
+	filters.Append(countLeadResidualExactFilter{idx: 1, state: state2})
+
+	defer func() {
+		countLeadResidualExactFilterSlicePool.Put(filters)
+		postsAnyFilterStatePool.Put(state1)
+		postsAnyFilterStatePool.Put(state2)
+		postingSlicePool.Put(postsBuf1)
+		postingSlicePool.Put(postsBuf2)
+	}()
+
+	var work posting.List
+	defer work.Release()
+
+	run := func() {
+		out, nextWork := countApplyLeadResidualExactFilters(src.Borrow(), work, filters)
+		work = nextWork
+		if out.IsEmpty() {
+			t.Fatalf("expected non-empty filtered posting")
+		}
+		if got := out.Cardinality(); got != 4 {
+			t.Fatalf("unexpected filtered cardinality: got=%d want=4", got)
+		}
+	}
+
+	run()
+	allocs := testing.AllocsPerRun(100, run)
+	if allocs != 0 {
+		t.Fatalf("unexpected allocs after warmup: got=%v want=0", allocs)
+	}
+}
+
+func TestCountApplyLeadResidualExactFilters_MixedStateAndIDsMatchesExpected(t *testing.T) {
+	src := posting.BuildFromSorted([]uint64{
+		3, 5, 7, 9, 11, 13, 15, 17, 19, 21, 23, 25, 27, 29, 31, 33,
+		35, 37, 39, 41, 43, 45, 47, 49, 51, 53, 55, 57, 59, 61, 63, 65,
+	})
+	defer src.Release()
+
+	postA := posting.BuildFromSorted([]uint64{7, 11, 19, 31, 43, 55, 63})
+	postB := posting.BuildFromSorted([]uint64{5, 11, 17, 23, 31, 41, 47, 59})
+	exact := posting.BuildFromSorted([]uint64{7, 11, 19, 23, 31, 37, 43, 59})
+	defer postA.Release()
+	defer postB.Release()
+	defer exact.Release()
+
+	postsBuf := postingSlicePool.Get()
+	postsBuf.Append(postA)
+	postsBuf.Append(postB)
+	state := postsAnyFilterStatePool.Get()
+	state.postsBuf = postsBuf
+
+	filters := countLeadResidualExactFilterSlicePool.Get()
+	filters.Append(countLeadResidualExactFilter{idx: 0, state: state})
+	filters.Append(countLeadResidualExactFilter{idx: 1, ids: exact})
+
+	defer func() {
+		countLeadResidualExactFilterSlicePool.Put(filters)
+		postsAnyFilterStatePool.Put(state)
+		postingSlicePool.Put(postsBuf)
+	}()
+
+	out, nextWork := countApplyLeadResidualExactFilters(src.Borrow(), posting.List{}, filters)
+	defer nextWork.Release()
+
+	if out.IsEmpty() {
+		t.Fatalf("expected non-empty filtered posting")
+	}
+	if got := out.Cardinality(); got != 7 {
+		t.Fatalf("unexpected filtered cardinality: got=%d want=7", got)
+	}
+
+	want := []uint64{7, 11, 19, 23, 31, 43, 59}
+	it := out.Iter()
+	defer it.Release()
+	for i := 0; i < len(want); i++ {
+		if !it.HasNext() {
+			t.Fatalf("missing filtered id at pos=%d want=%d", i, want[i])
+		}
+		if got := it.Next(); got != want[i] {
+			t.Fatalf("unexpected filtered id at pos=%d: got=%d want=%d", i, got, want[i])
+		}
+	}
+	if it.HasNext() {
+		t.Fatalf("unexpected extra filtered id=%d", it.Next())
+	}
+	if !out.SharesPayload(nextWork) {
+		t.Fatalf("expected reusable work to keep filtered posting payload")
+	}
+}
+
 func TestCount_PickORLeadPredicate_PrefersPrefixLeadOverCheapEqLead(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
 		AnalyzeInterval:                         -1,
@@ -2686,5 +2938,69 @@ func TestCountLeavesForUniquePath_ReusesScratchForSingleLeaf(t *testing.T) {
 	leaves[0].Field = "other"
 	if buf[0].Field != "other" {
 		t.Fatalf("expected returned slice to reuse caller scratch")
+	}
+}
+
+func TestDumpCountSecurityAuditColdTurnoverCPUProfile(t *testing.T) {
+	profilePath := os.Getenv("RBI_SECURITY_AUDIT_CPU_PROFILE")
+	if profilePath == "" {
+		t.Skip("set RBI_SECURITY_AUDIT_CPU_PROFILE to dump a cold-turnover CPU profile")
+	}
+
+	path := filepath.Join(t.TempDir(), "security_audit_profile.db")
+	db, raw := openBoltAndNew[uint64, UserBench](t, path, benchOptions())
+	t.Cleanup(func() {
+		_ = db.Close()
+		_ = raw.Close()
+	})
+
+	seedBenchData(t, db, benchN)
+	q := qx.Query(
+		qx.HASANY("roles", []string{"admin", "moderator"}),
+		qx.NOTIN("status", []string{"banned"}),
+		qx.GTE("score", 200.0),
+		qx.IN("country", []string{"US", "DE", "PL"}),
+	)
+
+	ring := buildUserBenchTurnoverRingUint64(t, db)
+	state := newBenchReadModeState[uint64, UserBench](
+		t,
+		benchCacheMode{suffix: "ColdTurnover", kind: benchCacheModeColdTurnover},
+		ring,
+	)
+	t.Cleanup(func() { state.close(t, db) })
+
+	for i := 0; i < 12; i++ {
+		pprof.Do(context.Background(), pprof.Labels("phase", "turnover"), func(context.Context) {
+			state.applyTurnover(t, db)
+		})
+		pprof.Do(context.Background(), pprof.Labels("phase", "query"), func(context.Context) {
+			if _, err := db.Count(q); err != nil {
+				t.Fatalf("warm Count: %v", err)
+			}
+		})
+	}
+
+	f, err := os.Create(profilePath)
+	if err != nil {
+		t.Fatalf("Create(cpu profile): %v", err)
+	}
+	defer func() {
+		_ = f.Close()
+	}()
+	if err := pprof.StartCPUProfile(f); err != nil {
+		t.Fatalf("StartCPUProfile: %v", err)
+	}
+	defer pprof.StopCPUProfile()
+
+	for i := 0; i < 128; i++ {
+		pprof.Do(context.Background(), pprof.Labels("phase", "turnover"), func(context.Context) {
+			state.applyTurnover(t, db)
+		})
+		pprof.Do(context.Background(), pprof.Labels("phase", "query"), func(context.Context) {
+			if _, err := db.Count(q); err != nil {
+				t.Fatalf("profiled Count: %v", err)
+			}
+		})
 	}
 }

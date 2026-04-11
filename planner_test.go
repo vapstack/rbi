@@ -38,6 +38,167 @@ func flattenOverlayForTest(ov fieldOverlay) []index {
 	}
 }
 
+func TestPlannerORBranches_AllocsPerRunStayZeroAfterWarmup(t *testing.T) {
+	if testRaceEnabled {
+		t.Skip("testing.AllocsPerRun is not stable under -race")
+	}
+
+	run := func() {
+		branches := newPlannerORBranches(4)
+		branches.Append(plannerORBranch{alwaysTrue: true, leadIdx: -1})
+		branches.Append(plannerORBranch{estCard: 7, estKnown: true, leadIdx: -1})
+		branches.Append(plannerORBranch{coveredRangeBounded: true, coveredRangeStart: 1, coveredRangeEnd: 3, leadIdx: -1})
+		branches.Release()
+	}
+
+	for i := 0; i < 32; i++ {
+		run()
+	}
+	allocs := testing.AllocsPerRun(100, run)
+	if allocs != 0 {
+		t.Fatalf("unexpected allocs after warmup: got=%v want=0", allocs)
+	}
+}
+
+func TestPlannerFilterPostingByPredicateChecksBuf_PostsAnyOwnedLargeAllocsPerRunStayZeroAfterWarmup(t *testing.T) {
+	if testRaceEnabled {
+		t.Skip("testing.AllocsPerRun is not stable under -race")
+	}
+
+	srcIDs := make([]uint64, 0, 96)
+	for i := 0; i < 96; i++ {
+		srcIDs = append(srcIDs, uint64(i*3+1))
+	}
+	src := posting.BuildFromSorted(srcIDs)
+	defer src.Release()
+
+	postA := posting.BuildFromSorted([]uint64{
+		srcIDs[3], srcIDs[8], srcIDs[14], srcIDs[19], srcIDs[27], srcIDs[36], srcIDs[44], srcIDs[52],
+	})
+	postB := posting.BuildFromSorted([]uint64{
+		srcIDs[8], srcIDs[19], srcIDs[31], srcIDs[36], srcIDs[44], srcIDs[61], srcIDs[74], srcIDs[88],
+	})
+	defer postA.Release()
+	defer postB.Release()
+
+	postsBuf := postingSlicePool.Get()
+	postsBuf.Append(postA)
+	postsBuf.Append(postB)
+	defer postingSlicePool.Put(postsBuf)
+
+	state := postsAnyFilterStatePool.Get()
+	state.postsBuf = postsBuf
+
+	preds := newPredicateSet(1)
+	preds.Append(predicate{
+		kind:          predicateKindPostsAny,
+		postsAnyState: state,
+	})
+	defer preds.Release()
+
+	checks := predicateCheckSlicePool.Get()
+	checks.Append(0)
+	defer predicateCheckSlicePool.Put(checks)
+
+	var work posting.List
+	defer work.Release()
+
+	run := func() {
+		mode, exact, nextWork, card := plannerFilterPostingByPredicateChecksBuf(preds, checks, src, work, true)
+		work = nextWork
+		if mode != plannerPredicateBucketExact {
+			t.Fatalf("unexpected mode: got=%v want=%v", mode, plannerPredicateBucketExact)
+		}
+		if card != src.Cardinality() {
+			t.Fatalf("unexpected source cardinality: got=%d want=%d", card, src.Cardinality())
+		}
+		if got := exact.Cardinality(); got != 12 {
+			t.Fatalf("unexpected exact cardinality: got=%d want=12", got)
+		}
+		for _, idx := range []uint64{srcIDs[8], srcIDs[19], srcIDs[36], srcIDs[44], srcIDs[88]} {
+			if !exact.Contains(idx) {
+				t.Fatalf("exact posting is missing id %d", idx)
+			}
+		}
+	}
+
+	run()
+	allocs := testing.AllocsPerRun(100, run)
+	if allocs != 0 {
+		t.Fatalf("unexpected allocs after warmup: got=%v want=0", allocs)
+	}
+}
+
+func TestPlannerFilterPostingByPredicateChecksBuf_CompactBorrowedAllocsPerRunStayZeroAfterWarmup(t *testing.T) {
+	if testRaceEnabled {
+		t.Skip("testing.AllocsPerRun is not stable under -race")
+	}
+
+	src := posting.BuildFromSorted([]uint64{1, 3, 5, 7, 9, 11})
+	defer src.Release()
+
+	postA := posting.BuildFromSorted([]uint64{1, 3, 5, 7, 9})
+	postB := posting.BuildFromSorted([]uint64{3, 5, 11, 13})
+	postC := posting.BuildFromSorted([]uint64{1, 3, 5, 15})
+	postD := posting.BuildFromSorted([]uint64{3, 5, 7, 11})
+	defer postA.Release()
+	defer postB.Release()
+	defer postC.Release()
+	defer postD.Release()
+
+	preds := newPredicateSet(4)
+	preds.Append(predicate{
+		kind:    predicateKindPosting,
+		posting: postA,
+	})
+	preds.Append(predicate{
+		kind:    predicateKindPosting,
+		posting: postB,
+	})
+	preds.Append(predicate{
+		kind:    predicateKindPosting,
+		posting: postC,
+	})
+	preds.Append(predicate{
+		kind:    predicateKindPosting,
+		posting: postD,
+	})
+	defer preds.Release()
+
+	checks := predicateCheckSlicePool.Get()
+	checks.Append(0)
+	checks.Append(1)
+	checks.Append(2)
+	checks.Append(3)
+	defer predicateCheckSlicePool.Put(checks)
+
+	var work posting.List
+	defer work.Release()
+
+	run := func() {
+		mode, exact, nextWork, card := plannerFilterPostingByPredicateChecksBuf(preds, checks, src.Borrow(), work, true)
+		work = nextWork
+		if mode != plannerPredicateBucketExact {
+			t.Fatalf("unexpected mode: got=%v want=%v", mode, plannerPredicateBucketExact)
+		}
+		if card != src.Cardinality() {
+			t.Fatalf("unexpected source cardinality: got=%d want=%d", card, src.Cardinality())
+		}
+		if got := exact.Cardinality(); got != 2 {
+			t.Fatalf("unexpected exact cardinality: got=%d want=2", got)
+		}
+		if !exact.Contains(3) || !exact.Contains(5) {
+			t.Fatalf("unexpected exact posting: want ids 3 and 5")
+		}
+	}
+
+	run()
+	allocs := testing.AllocsPerRun(100, run)
+	if allocs != 0 {
+		t.Fatalf("unexpected allocs after warmup: got=%v want=0", allocs)
+	}
+}
+
 func TestPlannerCalibration_ObserveUpdatesMultiplier(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
 		AnalyzeInterval:        -1,
@@ -447,12 +608,11 @@ func TestPlannerCalibration_InfluencesORNoOrderDecision(t *testing.T) {
 		P95BucketCard:   2,
 	})
 
-	branches := plannerORBranches{
-		makeORBranchForCalibrationDecisionTest(4_000, 4),
-		makeORBranchForCalibrationDecisionTest(4_000, 4),
-		makeORBranchForCalibrationDecisionTest(4_000, 4),
-	}
-	defer releaseORBranches(branches)
+	branches := newPlannerORBranches(3)
+	branches.Append(makeORBranchForCalibrationDecisionTest(4_000, 4))
+	branches.Append(makeORBranchForCalibrationDecisionTest(4_000, 4))
+	branches.Append(makeORBranchForCalibrationDecisionTest(4_000, 4))
+	defer branches.Release()
 
 	base := db.decidePlanORNoOrder(q, branches)
 	if !base.use {
@@ -801,7 +961,7 @@ func TestPlannerORNoOrderAdaptive_MatchesBaseline(t *testing.T) {
 	if alwaysFalse {
 		t.Fatalf("unexpected alwaysFalse for adaptive branches")
 	}
-	defer releaseORBranches(branchesAdaptive)
+	defer branchesAdaptive.Release()
 
 	gotAdaptive, ok := db.execPlanORNoOrderAdaptive(q, branchesAdaptive, nil)
 	if !ok {
@@ -815,7 +975,7 @@ func TestPlannerORNoOrderAdaptive_MatchesBaseline(t *testing.T) {
 	if alwaysFalse {
 		t.Fatalf("unexpected alwaysFalse for baseline branches")
 	}
-	defer releaseORBranches(branchesBaseline)
+	defer branchesBaseline.Release()
 
 	gotBaseline, ok := db.execPlanORNoOrderBaseline(q, branchesBaseline, nil)
 	if !ok {
@@ -855,7 +1015,7 @@ func TestPlannerOROrderKWay_MatchesFallbackMerge(t *testing.T) {
 	if alwaysFalse {
 		t.Fatalf("unexpected alwaysFalse for kway branches")
 	}
-	defer releaseORBranches(branchesKWay)
+	defer branchesKWay.Release()
 
 	gotKWay, ok, err := db.execPlanOROrderKWay(q, branchesKWay, nil)
 	if err != nil {
@@ -872,7 +1032,7 @@ func TestPlannerOROrderKWay_MatchesFallbackMerge(t *testing.T) {
 	if alwaysFalse {
 		t.Fatalf("unexpected alwaysFalse for fallback merge branches")
 	}
-	defer releaseORBranches(branchesBaseline)
+	defer branchesBaseline.Release()
 
 	gotBaseline, ok, err := db.execPlanOROrderMergeFallback(q, branchesBaseline, nil)
 	if err != nil {
@@ -914,10 +1074,11 @@ func TestPlannerORBranchesOrdered_CoversOrderRangeLeaves(t *testing.T) {
 	if alwaysFalse {
 		t.Fatalf("unexpected alwaysFalse for ordered OR branches")
 	}
-	defer releaseORBranches(branches)
+	defer branches.Release()
 
 	covered := 0
-	for _, branch := range branches {
+	for i := 0; i < branches.Len(); i++ {
+		branch := branches.Get(i)
 		for i := 0; i < branch.predLen(); i++ {
 			p := branch.pred(i)
 			if p.covered && p.expr.Field == "age" {
@@ -970,7 +1131,7 @@ func TestPlannerOROrderDecision_PrefersStreamWhenAllBranchesAreOrderBounded(t *t
 	if alwaysFalse {
 		t.Fatalf("unexpected alwaysFalse for ordered OR branches")
 	}
-	defer releaseORBranches(branches)
+	defer branches.Release()
 
 	decision := view.decidePlanOROrder(q, branches)
 	if decision.plan != plannerOROrderStream {
@@ -1009,22 +1170,23 @@ func TestPlannerORBranchesOrdered_BoundedCoveredOnlyBranchNotAlwaysTrue(t *testi
 	if alwaysFalse {
 		t.Fatalf("unexpected alwaysFalse for ordered OR branches")
 	}
-	defer releaseORBranches(branches)
+	defer branches.Release()
 
 	foundAgeRange := false
 	snap := view.planner.stats.Load()
 	universe := snap.universeOr(view.snapshotUniverseCardinality())
 	ov := view.fieldOverlay("age")
-	for i := range branches {
-		if branches[i].expr.Op == qx.OpGTE && branches[i].expr.Field == "age" {
+	for i := 0; i < branches.Len(); i++ {
+		branch := branches.GetPtr(i)
+		if branch.expr.Op == qx.OpGTE && branch.expr.Field == "age" {
 			foundAgeRange = true
-			if branches[i].alwaysTrue {
+			if branch.alwaysTrue {
 				t.Fatalf("bounded covered-only age branch must not become alwaysTrue")
 			}
-			if !branches[i].coveredRangeBounded {
+			if !branch.coveredRangeBounded {
 				t.Fatalf("bounded covered-only age branch must retain covered range metadata")
 			}
-			br, _, ok := view.extractOrderRangeCoverageOverlayReader("age", branches[i].preds, ov)
+			br, _, ok := view.extractOrderRangeCoverageOverlayReader("age", branch.preds, ov)
 			if !ok {
 				t.Fatalf("extractOrderRangeCoverageOverlay: ok=false")
 			}
@@ -1033,8 +1195,8 @@ func TestPlannerORBranchesOrdered_BoundedCoveredOnlyBranchNotAlwaysTrue(t *testi
 			if mergeStats[i].rangeRows != wantCard {
 				t.Fatalf("rangeRows=%d, want %d", mergeStats[i].rangeRows, wantCard)
 			}
-			if branches[i].estimatedCard(universe) != wantCard {
-				t.Fatalf("estimatedCard=%d, want rangeRows=%d", branches[i].estimatedCard(universe), wantCard)
+			if branch.estimatedCard(universe) != wantCard {
+				t.Fatalf("estimatedCard=%d, want rangeRows=%d", branch.estimatedCard(universe), wantCard)
 			}
 		}
 	}
@@ -1077,23 +1239,24 @@ func TestPlannerORBranchesOrdered_EmptyCoveredOnlyBranchKeepsZeroEstimatedCard(t
 	if alwaysFalse {
 		t.Fatalf("unexpected alwaysFalse for ordered OR branches")
 	}
-	defer releaseORBranches(branches)
+	defer branches.Release()
 
 	snap := view.planner.stats.Load()
 	universe := snap.universeOr(view.snapshotUniverseCardinality())
 	foundAgeRange := false
-	for i := range branches {
-		if branches[i].expr.Op != qx.OpLT || branches[i].expr.Field != "age" {
+	for i := 0; i < branches.Len(); i++ {
+		branch := branches.Get(i)
+		if branch.expr.Op != qx.OpLT || branch.expr.Field != "age" {
 			continue
 		}
 		foundAgeRange = true
-		if branches[i].alwaysTrue {
+		if branch.alwaysTrue {
 			t.Fatalf("empty covered-only age branch must not become alwaysTrue")
 		}
-		if !branches[i].estKnown {
+		if !branch.estKnown {
 			t.Fatalf("empty covered-only age branch must keep known zero cardinality")
 		}
-		if got := branches[i].estimatedCard(universe); got != 0 {
+		if got := branch.estimatedCard(universe); got != 0 {
 			t.Fatalf("estimatedCard=%d, want 0", got)
 		}
 	}
@@ -1129,7 +1292,7 @@ func TestPlannerOROrderDecision_PrefersMergeWhenRouteEstimatorBeatsStream(t *tes
 	if alwaysFalse {
 		t.Fatalf("unexpected alwaysFalse for ordered OR branches")
 	}
-	defer releaseORBranches(branches)
+	defer branches.Release()
 
 	snap := view.planner.stats.Load()
 	universe := snap.universeOr(view.snapshotUniverseCardinality())
@@ -1294,10 +1457,10 @@ func TestPlannerOROrderMergeBranchStats_SkipFullSpanRowCountingWithoutOrderBound
 	if alwaysFalse {
 		t.Fatalf("unexpected alwaysFalse for ordered OR branches")
 	}
-	defer releaseORBranches(branches)
+	defer branches.Release()
 
 	stats := view.orderMergeBranchStats("age", branches, view.fieldOverlay("age"))
-	for i := range branches {
+	for i := 0; i < branches.Len(); i++ {
 		if stats[i].rangeRows != 0 {
 			t.Fatalf("expected no full-span row counting for branch %d without order bounds, got rangeRows=%d", i, stats[i].rangeRows)
 		}
@@ -1346,7 +1509,7 @@ func TestPlannerOROrderMergePaths_MixedExactAndNonExactChecks_MatchSeqScan(t *te
 	if alwaysFalse {
 		t.Fatalf("unexpected alwaysFalse for kway branches")
 	}
-	defer releaseORBranches(branchesKWay)
+	defer branchesKWay.Release()
 
 	gotKWay, ok, err := db.execPlanOROrderKWay(q, branchesKWay, nil)
 	if err != nil {
@@ -1363,7 +1526,7 @@ func TestPlannerOROrderMergePaths_MixedExactAndNonExactChecks_MatchSeqScan(t *te
 	if alwaysFalse {
 		t.Fatalf("unexpected alwaysFalse for fallback branches")
 	}
-	defer releaseORBranches(branchesFallback)
+	defer branchesFallback.Release()
 
 	gotFallback, ok, err := db.execPlanOROrderMergeFallback(q, branchesFallback, nil)
 	if err != nil {
@@ -1430,7 +1593,7 @@ func TestPlannerOROrderKWayRuntimeFallbackEnable(t *testing.T) {
 	if alwaysFalse {
 		t.Fatalf("unexpected alwaysFalse for prefix branches")
 	}
-	defer releaseORBranches(branchesPrefix)
+	defer branchesPrefix.Release()
 
 	needPrefix, ok := orderWindow(qPrefix)
 	if !ok {
@@ -1454,7 +1617,7 @@ func TestPlannerOROrderKWayRuntimeFallbackEnable(t *testing.T) {
 	if alwaysFalse {
 		t.Fatalf("unexpected alwaysFalse for simple branches")
 	}
-	defer releaseORBranches(branchesSimple)
+	defer branchesSimple.Release()
 
 	needSimple, ok := orderWindow(qSimple)
 	if !ok {
@@ -1893,7 +2056,7 @@ func TestPlannerOROrderMergeFallbackFirst_ComplexOffset(t *testing.T) {
 	if alwaysFalse {
 		t.Fatalf("unexpected alwaysFalse for complex branches")
 	}
-	defer releaseORBranches(branchesComplex)
+	defer branchesComplex.Release()
 
 	if !db.shouldPreferOROrderFallbackFirst(qComplex, branchesComplex) {
 		needComplex, ok := orderWindow(qComplex)
@@ -1929,7 +2092,7 @@ func TestPlannerOROrderMergeFallbackFirst_ComplexOffset(t *testing.T) {
 	if alwaysFalse {
 		t.Fatalf("unexpected alwaysFalse for light branches")
 	}
-	defer releaseORBranches(branchesLight)
+	defer branchesLight.Release()
 
 	if db.shouldPreferOROrderFallbackFirst(qLight, branchesLight) {
 		t.Fatalf("unexpected fallback-first preference for light ordered OR")

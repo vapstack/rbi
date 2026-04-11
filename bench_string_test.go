@@ -13,13 +13,6 @@ import (
 	"go.etcd.io/bbolt"
 )
 
-var (
-	oneStringDBs  = make(map[string]*DB[string, UserBench])
-	oneStringRaws = make(map[string]*bbolt.DB)
-	oneStringDirs = make(map[string]string)
-	oneStringMu   sync.Mutex
-)
-
 func openBenchDBString(b *testing.B) (*DB[string, UserBench], *bbolt.DB, string) {
 	b.Helper()
 	dir, err := os.MkdirTemp("", "rbi-bench-string-*")
@@ -32,8 +25,8 @@ func openBenchDBString(b *testing.B) (*DB[string, UserBench], *bbolt.DB, string)
 	return db, raw, dir
 }
 
-func seedBenchDataString(b *testing.B, db *DB[string, UserBench], n int) {
-	b.Helper()
+func seedBenchDataString(tb testing.TB, db *DB[string, UserBench], n int) {
+	tb.Helper()
 
 	db.DisableSync()
 	defer db.EnableSync()
@@ -69,7 +62,7 @@ func seedBenchDataString(b *testing.B, db *DB[string, UserBench], n int) {
 			return
 		}
 		if err := db.BatchSet(ids, vals); err != nil {
-			b.Fatalf("BatchSet(seed string): %v", err)
+			tb.Fatalf("BatchSet(seed string): %v", err)
 		}
 		ids = ids[:0]
 		vals = vals[:0]
@@ -104,35 +97,52 @@ func seedBenchDataString(b *testing.B, db *DB[string, UserBench], n int) {
 	flush()
 }
 
-func buildBenchDBString(b *testing.B, n int) *DB[string, UserBench] {
-	return buildBenchDBStringWithCaching(b, n, benchCacheModes[0])
+type cachedBenchStringDB struct {
+	db  *DB[string, UserBench]
+	raw *bbolt.DB
+	dir string
 }
 
-func buildBenchDBStringWithCaching(b *testing.B, n int, mode benchCacheMode) *DB[string, UserBench] {
+var (
+	oneStringDBs = make(map[string]*cachedBenchStringDB)
+	oneStringMu  sync.Mutex
+)
+
+func benchStringDBFamilyKey(n int) string {
+	return "user_string/" + strconv.Itoa(n)
+}
+
+func buildBenchDBString(b *testing.B, n int) *DB[string, UserBench] {
+	return buildBenchDBStringWithMode(b, n, benchCacheModes[0])
+}
+
+func buildBenchDBStringWithMode(b *testing.B, n int, mode benchCacheMode) *DB[string, UserBench] {
 	b.Helper()
 	oneStringMu.Lock()
 	defer oneStringMu.Unlock()
 
-	key := benchDBCacheKey(mode, n)
-	if db := oneStringDBs[key]; db != nil && !db.closed.Load() {
-		return db
+	key := benchStringDBFamilyKey(n)
+	if cached := oneStringDBs[key]; cached != nil && cached.db != nil && !cached.db.closed.Load() {
+		return cached.db
 	}
 
 	db, raw, dir := openBenchDBString(b)
 	b.StopTimer()
 	seedBenchDataString(b, db, n)
 	b.StartTimer()
-
-	oneStringDBs[key] = db
-	oneStringRaws[key] = raw
-	oneStringDirs[key] = dir
+	oneStringDBs[key] = &cachedBenchStringDB{db: db, raw: raw, dir: dir}
+	registerBenchSuiteCleanup(func() {
+		_ = db.Close()
+		_ = raw.Close()
+		_ = os.RemoveAll(dir)
+	})
 	return db
 }
 
 func runStringCountBenchCacheModes(b *testing.B, qf func() *qx.QX) {
 	b.Helper()
 	runBenchCacheModes(b, func(b *testing.B, mode benchCacheMode) {
-		db := buildBenchDBStringWithCaching(b, benchN, mode)
+		db := buildBenchDBStringWithMode(b, benchN, mode)
 		runStringCountBenchWithMode(b, db, qf(), mode)
 	})
 }
@@ -196,6 +206,11 @@ func warmBenchCountOnceString(b *testing.B, db *DB[string, UserBench], q *qx.QX)
 	b.Helper()
 	b.StopTimer()
 	defer b.StartTimer()
+	runBenchCountOnceString(b, db, q)
+}
+
+func runBenchCountOnceString(b *testing.B, db *DB[string, UserBench], q *qx.QX) {
+	b.Helper()
 	if _, err := db.Count(q); err != nil {
 		b.Fatal(err)
 	}
@@ -205,6 +220,11 @@ func warmBenchQueryKeysOnceString(b *testing.B, db *DB[string, UserBench], q *qx
 	b.Helper()
 	b.StopTimer()
 	defer b.StartTimer()
+	runBenchQueryKeysOnceString(b, db, q)
+}
+
+func runBenchQueryKeysOnceString(b *testing.B, db *DB[string, UserBench], q *qx.QX) {
+	b.Helper()
 	if _, err := db.QueryKeys(q); err != nil {
 		b.Fatal(err)
 	}
@@ -214,6 +234,11 @@ func warmBenchReadQueryOnceString(b *testing.B, db *DB[string, UserBench], q *qx
 	b.Helper()
 	b.StopTimer()
 	defer b.StartTimer()
+	runBenchReadQueryOnceString(b, db, q)
+}
+
+func runBenchReadQueryOnceString(b *testing.B, db *DB[string, UserBench], q *qx.QX) {
+	b.Helper()
 	items, err := db.Query(q)
 	if err != nil {
 		b.Fatal(err)
@@ -228,15 +253,18 @@ func runStringCountBench(b *testing.B, db *DB[string, UserBench], q *qx.QX) {
 func runStringCountBenchWithMode(b *testing.B, db *DB[string, UserBench], q *qx.QX, mode benchCacheMode) {
 	b.Helper()
 	b.ReportAllocs()
-	prepareReadBenchWithMode(b, db, mode, func() {
-		warmBenchCountOnceString(b, db, q)
-	})
+	state := prepareReadBenchWithMode(
+		b,
+		db,
+		q,
+		mode,
+		warmBenchCountOnceString,
+		runBenchCountOnceString,
+		buildUserBenchTurnoverRingString,
+	)
 	for b.Loop() {
-		clearBenchSnapshotCachesIfNeeded(db, mode)
-		_, err := db.Count(q)
-		if err != nil {
-			b.Fatal(err)
-		}
+		state.beforeQuery(b, db)
+		runBenchCountOnceString(b, db, q)
 	}
 }
 
@@ -247,15 +275,18 @@ func runStringQueryKeysBench(b *testing.B, db *DB[string, UserBench], q *qx.QX) 
 func runStringQueryKeysBenchWithMode(b *testing.B, db *DB[string, UserBench], q *qx.QX, mode benchCacheMode) {
 	b.Helper()
 	b.ReportAllocs()
-	prepareReadBenchWithMode(b, db, mode, func() {
-		warmBenchQueryKeysOnceString(b, db, q)
-	})
+	state := prepareReadBenchWithMode(
+		b,
+		db,
+		q,
+		mode,
+		warmBenchQueryKeysOnceString,
+		runBenchQueryKeysOnceString,
+		buildUserBenchTurnoverRingString,
+	)
 	for b.Loop() {
-		clearBenchSnapshotCachesIfNeeded(db, mode)
-		_, err := db.QueryKeys(q)
-		if err != nil {
-			b.Fatal(err)
-		}
+		state.beforeQuery(b, db)
+		runBenchQueryKeysOnceString(b, db, q)
 	}
 }
 
@@ -266,16 +297,18 @@ func runStringReadQueryBench(b *testing.B, db *DB[string, UserBench], q *qx.QX) 
 func runStringReadQueryBenchWithMode(b *testing.B, db *DB[string, UserBench], q *qx.QX, mode benchCacheMode) {
 	b.Helper()
 	b.ReportAllocs()
-	prepareReadBenchWithMode(b, db, mode, func() {
-		warmBenchReadQueryOnceString(b, db, q)
-	})
+	state := prepareReadBenchWithMode(
+		b,
+		db,
+		q,
+		mode,
+		warmBenchReadQueryOnceString,
+		runBenchReadQueryOnceString,
+		buildUserBenchTurnoverRingString,
+	)
 	for b.Loop() {
-		clearBenchSnapshotCachesIfNeeded(db, mode)
-		items, err := db.Query(q)
-		if err != nil {
-			b.Fatal(err)
-		}
-		db.ReleaseRecords(items...)
+		state.beforeQuery(b, db)
+		runBenchReadQueryOnceString(b, db, q)
 	}
 }
 

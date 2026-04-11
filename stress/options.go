@@ -21,39 +21,54 @@ type workerGroupOverrides struct {
 }
 
 type options struct {
-	DBFile           string
-	ReportPath       string
-	CPUProfile       string
-	HeapProfile      string
-	PprofHTTP        string
-	EmailSampleN     int
-	NoCache          bool
-	BoltNoSync       bool
-	AnalyzeInterval  time.Duration
-	RefreshEvery     time.Duration
-	TelemetryEvery   time.Duration
-	TraceSampleEvery int
-	TraceTopN        int
-	QueryStats       bool
-	Jitter           bool
-	Duration         time.Duration
-	Headless         bool
-	ClassFilter      []string
-	QueryFilter      []string
-	WorkerGroups     workerGroupOverrides
-	InitialWorkers   map[string]int
+	DBFile              string
+	ReportPath          string
+	CPUProfile          string
+	HeapProfile         string
+	AllocProfile        string
+	AllocSource         string
+	AllocMode           string
+	AllocScope          string
+	PprofHTTP           string
+	AllocWarmupOps      int
+	AllocOps            int
+	AllocMemProfileRate int
+	AllocTurnoverRing   int
+	EmailSampleN        int
+	NoCache             bool
+	BoltNoSync          bool
+	AnalyzeInterval     time.Duration
+	RefreshEvery        time.Duration
+	TelemetryEvery      time.Duration
+	TraceSampleEvery    int
+	TraceTopN           int
+	QueryStats          bool
+	Jitter              bool
+	Duration            time.Duration
+	Headless            bool
+	ClassFilter         []string
+	QueryFilter         []string
+	WorkerGroups        workerGroupOverrides
+	InitialWorkers      map[string]int
 }
 
 func parseOptions(catalog []*classDescriptor) (options, error) {
 	opts := options{
-		DBFile:           DefaultDBFilename,
-		ReportPath:       "stress_report.json",
-		EmailSampleN:     DefaultEmailSampleN,
-		RefreshEvery:     2 * time.Second,
-		TelemetryEvery:   4 * time.Second,
-		TraceSampleEvery: -1,
-		TraceTopN:        24,
-		InitialWorkers:   make(map[string]int, len(catalog)),
+		DBFile:              DefaultDBFilename,
+		ReportPath:          "stress_report.json",
+		AllocSource:         allocSourcePrepared,
+		AllocMode:           allocModeHot,
+		AllocScope:          allocScopeFull,
+		AllocWarmupOps:      64,
+		AllocOps:            0,
+		AllocMemProfileRate: 1,
+		AllocTurnoverRing:   defaultAllocTurnoverRingSize,
+		EmailSampleN:        DefaultEmailSampleN,
+		RefreshEvery:        2 * time.Second,
+		TelemetryEvery:      4 * time.Second,
+		TraceSampleEvery:    -1,
+		TraceTopN:           24,
+		InitialWorkers:      make(map[string]int, len(catalog)),
 	}
 
 	fs := flag.NewFlagSet(os.Args[0], flag.ContinueOnError)
@@ -64,7 +79,15 @@ func parseOptions(catalog []*classDescriptor) (options, error) {
 	fs.StringVar(&opts.ReportPath, "out", opts.ReportPath, "path to JSON report file")
 	fs.StringVar(&opts.CPUProfile, "cpu-profile", "", "write CPU profile to file")
 	fs.StringVar(&opts.HeapProfile, "heap-profile", "", "write heap profile to file at process end")
+	fs.StringVar(&opts.AllocProfile, "alloc-profile", "", "write focused allocs profile to file for a single filtered query")
+	fs.StringVar(&opts.AllocSource, "alloc-source", opts.AllocSource, "focused alloc source: prepared or workload")
+	fs.StringVar(&opts.AllocMode, "alloc-mode", opts.AllocMode, "focused alloc mode: hot or turnover")
+	fs.StringVar(&opts.AllocScope, "alloc-scope", opts.AllocScope, "focused alloc scope: full or query")
 	fs.StringVar(&opts.PprofHTTP, "pprof-http", "", "listen address for net/http/pprof (e.g. :6060)")
+	fs.IntVar(&opts.AllocWarmupOps, "alloc-warmup-ops", opts.AllocWarmupOps, "warmup query ops before focused alloc profiling")
+	fs.IntVar(&opts.AllocOps, "alloc-ops", opts.AllocOps, "fixed measured query ops for focused alloc profiling (overrides duration)")
+	fs.IntVar(&opts.AllocMemProfileRate, "alloc-memrate", opts.AllocMemProfileRate, "runtime.MemProfileRate during focused alloc profiling")
+	fs.IntVar(&opts.AllocTurnoverRing, "alloc-turnover-ring", opts.AllocTurnoverRing, "turnover ring size for prepared alloc profiling")
 	fs.IntVar(&opts.EmailSampleN, "email-sample", opts.EmailSampleN, "how many existing emails to sample for indexed reads")
 	fs.BoolVar(&opts.NoCache, "no-cache", false, "disable rbi runtime caches and numeric range bucket acceleration")
 	fs.BoolVar(&opts.BoltNoSync, "bolt-no-sync", false, "open bbolt with NoSync=true (unsafe)")
@@ -103,6 +126,15 @@ func parseOptions(catalog []*classDescriptor) (options, error) {
 	if opts.EmailSampleN < 0 {
 		return options{}, fmt.Errorf("email-sample must be >= 0")
 	}
+	if opts.AllocWarmupOps < 0 {
+		return options{}, fmt.Errorf("alloc-warmup-ops must be >= 0")
+	}
+	if opts.AllocOps < 0 {
+		return options{}, fmt.Errorf("alloc-ops must be >= 0")
+	}
+	if opts.AllocMemProfileRate < 0 {
+		return options{}, fmt.Errorf("alloc-memrate must be >= 0")
+	}
 	if opts.RefreshEvery <= 0 {
 		return options{}, fmt.Errorf("refresh must be > 0")
 	}
@@ -117,6 +149,36 @@ func parseOptions(catalog []*classDescriptor) (options, error) {
 	}
 	if opts.Duration > 0 {
 		opts.Headless = true
+	}
+	switch opts.AllocSource {
+	case allocSourcePrepared, allocSourceWorkload:
+	default:
+		return options{}, fmt.Errorf("alloc-source must be %q or %q", allocSourcePrepared, allocSourceWorkload)
+	}
+	switch opts.AllocMode {
+	case allocModeHot, allocModeTurnover:
+	default:
+		return options{}, fmt.Errorf("alloc-mode must be %q or %q", allocModeHot, allocModeTurnover)
+	}
+	switch opts.AllocScope {
+	case allocScopeFull, allocScopeQuery:
+	default:
+		return options{}, fmt.Errorf("alloc-scope must be %q or %q", allocScopeFull, allocScopeQuery)
+	}
+	if opts.AllocTurnoverRing < 0 {
+		return options{}, fmt.Errorf("alloc-turnover-ring must be >= 0")
+	}
+	if opts.AllocProfile != "" {
+		opts.Headless = true
+		if opts.Duration <= 0 && opts.AllocOps <= 0 {
+			return options{}, fmt.Errorf("alloc-profile requires duration > 0 or alloc-ops > 0")
+		}
+		if opts.AllocMemProfileRate == 0 {
+			return options{}, fmt.Errorf("alloc-memrate must be > 0 when alloc-profile is enabled")
+		}
+		if opts.AllocMode == allocModeTurnover && opts.AllocTurnoverRing == 0 {
+			return options{}, fmt.Errorf("alloc-turnover-ring must be > 0 when alloc-mode=%s", allocModeTurnover)
+		}
 	}
 	opts.ClassFilter = dedupeStrings(opts.ClassFilter)
 	opts.QueryFilter = dedupeStrings(opts.QueryFilter)

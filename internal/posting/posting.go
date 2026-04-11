@@ -227,6 +227,25 @@ func (p List) IsBorrowed() bool {
 	return p.ptr != nil && !p.isSingleton() && p.single&postingMetaBorrowed != 0
 }
 
+type PayloadKey struct {
+	Ptr  uintptr
+	Kind uint64
+}
+
+func (p List) PayloadKey() (PayloadKey, bool) {
+	if p.ptr == nil || p.isSingleton() {
+		return PayloadKey{}, false
+	}
+	return PayloadKey{
+		Ptr:  uintptr(p.ptr),
+		Kind: p.kind(),
+	}, true
+}
+
+func (p List) IsOwnedLarge() bool {
+	return p.largeRef() != nil && !p.IsBorrowed()
+}
+
 func (p List) Borrow() List {
 	if p.ptr == nil || p.isSingleton() {
 		return p
@@ -299,6 +318,98 @@ func compactFilterByMembership(ids List, other List, keepMatches bool) List {
 		for i := 0; i < int(mp.n); i++ {
 			id := mp.ids[i]
 			if other.Contains(id) != keepMatches {
+				continue
+			}
+			mp.ids[n] = id
+			n++
+		}
+		switch {
+		case n == 0:
+			mp.release()
+			return List{}
+		case n == 1:
+			keep := mp.ids[0]
+			mp.release()
+			return singleton(keep)
+		case n <= SmallCap:
+			sp := smallSetPool.Get()
+			sp.n = uint8(n)
+			copy(sp.ids[:n], mp.ids[:n])
+			mp.release()
+			return smallValue(sp)
+		default:
+			mp.n = uint8(n)
+			return ids
+		}
+	}
+	return ids
+}
+
+func postingBufContainsAny(posts *pooled.SliceBuf[List], id uint64) bool {
+	if posts == nil {
+		return false
+	}
+	for i := 0; i < posts.Len(); i++ {
+		if posts.Get(i).Contains(id) {
+			return true
+		}
+	}
+	return false
+}
+
+func compactFilterByAnyMembership(ids List, other *pooled.SliceBuf[List]) List {
+	if sp := ids.small(); sp != nil {
+		if ids.IsBorrowed() {
+			var kept [SmallCap]uint64
+			n := 0
+			for i := 0; i < int(sp.n); i++ {
+				id := sp.ids[i]
+				if postingBufContainsAny(other, id) {
+					kept[n] = id
+					n++
+				}
+			}
+			return compactListFromSorted(kept[:n])
+		}
+		n := 0
+		for i := 0; i < int(sp.n); i++ {
+			id := sp.ids[i]
+			if !postingBufContainsAny(other, id) {
+				continue
+			}
+			sp.ids[n] = id
+			n++
+		}
+		switch n {
+		case 0:
+			sp.release()
+			return List{}
+		case 1:
+			keep := sp.ids[0]
+			sp.release()
+			return singleton(keep)
+		default:
+			sp.n = uint8(n)
+			return ids
+		}
+	}
+	if mp := ids.mid(); mp != nil {
+		if ids.IsBorrowed() {
+			var kept [MidCap]uint64
+			n := 0
+			for i := 0; i < int(mp.n); i++ {
+				id := mp.ids[i]
+				if postingBufContainsAny(other, id) {
+					kept[n] = id
+					n++
+				}
+			}
+			return compactListFromSorted(kept[:n])
+		}
+		n := 0
+		for i := 0; i < int(mp.n); i++ {
+			id := mp.ids[i]
+			if !postingBufContainsAny(other, id) {
 				continue
 			}
 			mp.ids[n] = id
@@ -408,6 +519,22 @@ func (p List) TrySingle() (uint64, bool) {
 		}
 	}
 	return 0, false
+}
+
+func (p List) TryAppendCompactTo(dst []uint64) ([]uint64, bool) {
+	if p.ptr == nil {
+		return dst, true
+	}
+	if p.isSingleton() {
+		return append(dst, p.single), true
+	}
+	if sp := p.small(); sp != nil {
+		return append(dst, sp.ids[:sp.n]...), true
+	}
+	if mp := p.mid(); mp != nil {
+		return append(dst, mp.ids[:mp.n]...), true
+	}
+	return dst, false
 }
 
 func (p List) Cardinality() uint64 {
@@ -690,7 +817,7 @@ func (p List) Iter() Iterator {
 		return emptyIterator()
 	}
 	if p.isSingleton() {
-		return newSingletonIter(p.single)
+		return getSingletonIter(p.single)
 	}
 	if sp := p.small(); sp != nil {
 		it := compactPostingIterPool.Get()
@@ -805,6 +932,76 @@ func (p List) CloneInto(dst List) List {
 	}
 	dst.Release()
 	return largeValue(src.cloneSharedInto(largePostingPool.Get()))
+}
+
+func (p List) TryBuildAndAnyBuf(other *pooled.SliceBuf[List]) (List, bool) {
+	if p.IsEmpty() {
+		return p, true
+	}
+	if other == nil || other.Len() == 0 {
+		p.Release()
+		return List{}, true
+	}
+	if other.Len() == 1 {
+		return p.BuildAnd(other.Get(0)), true
+	}
+	if id, ok := p.TrySingle(); ok {
+		if postingBufContainsAny(other, id) {
+			return p, true
+		}
+		p.Release()
+		return List{}, true
+	}
+	if p.isSmall() || p.isMid() {
+		return compactFilterByAnyMembership(p, other), true
+	}
+	return List{}, false
+}
+
+func (p List) TryResetOwnedCompactLikeFromSorted(src List, ids []uint64) (List, List, bool) {
+	if src.small() != nil {
+		if len(ids) > SmallCap {
+			return List{}, p, false
+		}
+		cur := p.small()
+		if cur == nil || p.IsBorrowed() {
+			p.Release()
+			cur = smallSetPool.Get()
+		}
+		copy(cur.ids[:len(ids)], ids)
+		cur.n = uint8(len(ids))
+		next := smallValue(cur)
+		switch len(ids) {
+		case 0:
+			return List{}, next, true
+		case 1:
+			return singleton(ids[0]), next, true
+		default:
+			return next, next, true
+		}
+	}
+	if src.mid() != nil {
+		if len(ids) > MidCap {
+			return List{}, p, false
+		}
+		cur := p.mid()
+		if cur == nil || p.IsBorrowed() {
+			p.Release()
+			cur = midSetPool.Get()
+		}
+		copy(cur.ids[:len(ids)], ids)
+		cur.n = uint8(len(ids))
+		next := midValue(cur)
+		switch len(ids) {
+		case 0:
+			return List{}, next, true
+		case 1:
+			return singleton(ids[0]), next, true
+		default:
+			return next, next, true
+		}
+	}
+	return List{}, p, false
 }
 
 func (p List) BuildRemoved(idx uint64) List {
@@ -1319,6 +1516,20 @@ func (p List) BuildOptimized() List {
 	return p
 }
 
+func (p List) TryResetOwnedLargeFromSorted(ids []uint64) (List, bool) {
+	lp := p.largeRef()
+	if lp == nil || p.IsBorrowed() {
+		return List{}, false
+	}
+	lp.clear()
+	if len(ids) == 0 {
+		lp.release()
+		return List{}, true
+	}
+	lp.addManySorted(ids)
+	return p, true
+}
+
 func (p List) WriteTo(writer *bufio.Writer) error {
 	if p.IsEmpty() {
 		return writer.WriteByte(encodingEmpty)
@@ -1471,6 +1682,10 @@ func (p List) Release() {
 	if p.IsBorrowed() {
 		return
 	}
+	p.ReleasePayload()
+}
+
+func (p List) ReleasePayload() {
 	if sp := p.small(); sp != nil {
 		sp.release()
 		return
@@ -1568,8 +1783,11 @@ type singletonIter struct {
 	has bool
 }
 
-func newSingletonIter(v uint64) Iterator {
-	return &singletonIter{v: v, has: true}
+func getSingletonIter(v uint64) Iterator {
+	it := singletonIterPool.Get()
+	it.v = v
+	it.has = true
+	return it
 }
 
 func (it *singletonIter) HasNext() bool { return it.has }
@@ -1582,7 +1800,9 @@ func (it *singletonIter) Next() uint64 {
 	return it.v
 }
 
-func (*singletonIter) Release() {}
+func (it *singletonIter) Release() {
+	singletonIterPool.Put(it)
+}
 
 var (
 	smallSetPool = pooled.Pointers[smallPosting]{
@@ -1599,6 +1819,12 @@ var (
 		Cleanup: func(it *arrayIter) {
 			it.ids = nil
 			it.i = 0
+		},
+	}
+	singletonIterPool = pooled.Pointers[singletonIter]{
+		Cleanup: func(it *singletonIter) {
+			it.v = 0
+			it.has = false
 		},
 	}
 )

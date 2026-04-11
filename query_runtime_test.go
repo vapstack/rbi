@@ -143,3 +143,35 @@ func TestPostingUnionBuilder_SmallPostingsBatchSinglesMatchesBaseline(t *testing
 		t.Fatalf("small posting union mismatch: got=%v want=%v", got.ToArray(), want.ToArray())
 	}
 }
+
+func TestPostingUnionBuilder_CompactPostingsBatchSinglesAllocsPerRunStayZeroAfterWarmup(t *testing.T) {
+	if testRaceEnabled {
+		t.Skip("testing.AllocsPerRun is not stable under -race")
+	}
+
+	posts := [...]posting.List{
+		posting.BuildFromSorted([]uint64{1, 3, 5, 7, 9, 11, 13, 15}),
+		posting.BuildFromSorted([]uint64{17, 19, 21, 23, 25, 27, 29, 31}),
+		posting.BuildFromSorted([]uint64{33, 35, 37, 39, 41, 43, 45, 47}),
+		posting.BuildFromSorted([]uint64{49, 51, 53, 55, 57, 59, 61, 63}),
+		posting.BuildFromSorted([]uint64{65, 67, 69, 71, 73, 75, 77, 79}),
+	}
+	for i := range posts {
+		defer posts[i].Release()
+	}
+
+	run := func() {
+		builder := newPostingUnionBuilder(true)
+		for i := range posts {
+			builder.addPosting(posts[i])
+		}
+		out := builder.finish(true)
+		out.Release()
+	}
+
+	run()
+	allocs := testing.AllocsPerRun(100, run)
+	if allocs != 0 {
+		t.Fatalf("expected zero allocs after warmup, got %.2f", allocs)
+	}
+}

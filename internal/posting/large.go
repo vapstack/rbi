@@ -823,6 +823,9 @@ func skipLarge(reader *bufio.Reader) error {
 
 var (
 	largePostingPool = pooled.Pointers[largePosting]{
+		New: func() *largePosting {
+			return new(largePosting)
+		},
 		Cleanup: func(lp *largePosting) {
 			lp.clear()
 		},

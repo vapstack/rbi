@@ -557,11 +557,16 @@ func (db *DB[K, V]) initSnapshotRuntimeCaches(s *indexSnapshot) {
 	if s == nil {
 		return
 	}
-	s.numericRangeBucketCache = &sync.Map{}
+	s.numericRangeBucketCache = numericRangeBucketCachePool.Get()
+	s.numericRangeBucketCache.init(len(db.indexedFieldAccess))
 	s.matPredCacheMaxEntries = max(0, db.options.SnapshotMaterializedPredCacheMaxEntries)
 	s.matPredCacheMaxCard = materializedPredCacheMaxCardinality(
 		db.options.SnapshotMaterializedPredCacheMaxCardinality,
 	)
+	if s.matPredCacheMaxEntries > 0 {
+		s.matPredCache = materializedPredCachePool.Get()
+		s.matPredCache.init(s.matPredCacheMaxEntries)
+	}
 }
 
 func (db *DB[K, V]) initBatcher() {
@@ -714,6 +719,7 @@ type calibrator struct {
 
 type snapshot struct {
 	current      atomic.Pointer[indexSnapshot]
+	currentRef   atomic.Pointer[snapshotRef]
 	statsEnabled bool
 
 	bySeq map[uint64]*snapshotRef
@@ -1252,7 +1258,8 @@ func (db *DB[K, V]) Stats() Stats[K] {
 	}
 	defer db.endOp()
 
-	snap := db.getSnapshot()
+	snap, seq, ref, pinned := db.pinCurrentSnapshot()
+	defer db.unpinCurrentSnapshot(seq, ref, pinned)
 
 	db.mu.RLock()
 	out := db.stats
@@ -1322,7 +1329,8 @@ func (db *DB[K, V]) IndexStats() IndexStats {
 	}
 	defer db.endOp()
 
-	snap := db.getSnapshot()
+	snap, seq, ref, pinned := db.pinCurrentSnapshot()
+	defer db.unpinCurrentSnapshot(seq, ref, pinned)
 
 	idx := IndexStats{
 		UniqueFieldKeys:       make(map[string]uint64),

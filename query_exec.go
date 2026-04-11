@@ -2152,6 +2152,7 @@ func (qv *queryView[K, V]) promoteOrderBasicLimitMaterializedBaseOps(orderField 
 			continue
 		}
 		key := materializedPredKey{}
+		requiresSecondHit := false
 		switch core.kind {
 		case orderBasicBaseCoreCollapsedRange:
 			key = core.collapsed.cacheKey
@@ -2159,21 +2160,26 @@ func (qv *queryView[K, V]) promoteOrderBasicLimitMaterializedBaseOps(orderField 
 			stats, ok := qv.orderBasicRawBaseOpStats(core.expr, qv.snapshotUniverseCardinality())
 			if ok {
 				key = stats.cacheKey
+				requiresSecondHit = true
 			}
 		}
-		if !key.isZero() {
-			seen := false
-			for j := 0; j < keysBuf.Len(); j++ {
-				if keysBuf.Get(j) == key {
-					seen = true
-					break
-				}
-			}
-			if seen {
-				continue
-			}
-			keysBuf.Append(key)
+		if key.isZero() {
+			continue
 		}
+		if requiresSecondHit && !qv.snap.shouldPromoteRuntimeMaterializedPredKey(key) {
+			continue
+		}
+		seen := false
+		for j := 0; j < keysBuf.Len(); j++ {
+			if keysBuf.Get(j) == key {
+				seen = true
+				break
+			}
+		}
+		if seen {
+			continue
+		}
+		keysBuf.Append(key)
 		qv.promoteObservedOrderBasicBaseCore(core)
 	}
 }

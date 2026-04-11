@@ -1579,10 +1579,11 @@ func writeFieldIndexStorage(writer *bufio.Writer, storage fieldIndexStorage) err
 		if err := writer.WriteByte(fieldStorageEncodingFlat); err != nil {
 			return fmt.Errorf("encode: writing storage encoding: %w", err)
 		}
-		if err := writeUvarint(writer, uint64(len(*storage.flat))); err != nil {
+		entries := storage.flat.entries
+		if err := writeUvarint(writer, uint64(len(entries))); err != nil {
 			return fmt.Errorf("encode: writing flat len: %w", err)
 		}
-		return writeIndexEntries(writer, *storage.flat)
+		return writeIndexEntries(writer, entries)
 	default:
 		return fmt.Errorf("encode: empty field storage")
 	}
@@ -2472,7 +2473,7 @@ func readFieldIndexStorage(reader *bufio.Reader, keep bool) (fieldIndexStorage, 
 				})
 			}
 			if len(refs) > 0 {
-				builder.appendPage(newFieldIndexChunkDirPage(refs))
+				builder.appendOwnedPage(newFieldIndexChunkDirPage(refs))
 			}
 		}
 		return newChunkedFieldIndexStorage(builder.root()), nil
@@ -2513,7 +2514,7 @@ func readFieldIndexChunk(reader *bufio.Reader) (*fieldIndexChunk, error) {
 			}
 			posts[i] = ids
 		}
-		return &fieldIndexChunk{posts: posts, numeric: keys, rows: postingRows(posts)}, nil
+		return newNumericFieldIndexChunk(posts, keys, postingRows(posts)), nil
 
 	case fieldIndexChunkEncodingString:
 		count, err := binary.ReadUvarint(reader)
@@ -2553,12 +2554,7 @@ func readFieldIndexChunk(reader *bufio.Reader) (*fieldIndexChunk, error) {
 			}
 			posts[i] = ids
 		}
-		return &fieldIndexChunk{
-			posts:      posts,
-			stringRefs: refs,
-			stringData: data,
-			rows:       postingRows(posts),
-		}, nil
+		return newStringFieldIndexChunk(posts, refs, data, postingRows(posts)), nil
 
 	default:
 		return nil, fmt.Errorf("invalid field chunk encoding %v", tag)
@@ -2802,7 +2798,7 @@ func newFieldOverlayStorage(storage fieldIndexStorage) fieldOverlay {
 	if storage.chunked != nil {
 		return fieldOverlay{chunked: storage.chunked}
 	}
-	return newFieldOverlay(storage.flat)
+	return newFieldOverlay(storage.flatSlice())
 }
 
 func (o fieldOverlay) hasData() bool {

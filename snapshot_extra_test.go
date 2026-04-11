@@ -214,12 +214,11 @@ func snapshotExtraRequireNumericRangeBucketCacheEntry(t *testing.T, snap *indexS
 	if snap == nil || snap.numericRangeBucketCache == nil {
 		t.Fatalf("expected non-nil numeric range bucket cache for field %q", field)
 	}
-	raw, ok := snap.numericRangeBucketCache.Load(field)
+	e, ok := snap.numericRangeBucketCache.loadField(field)
 	if !ok {
 		t.Fatalf("expected numeric range bucket cache entry for field %q", field)
 	}
-	e, ok := raw.(*numericRangeBucketCacheEntry)
-	if !ok || e == nil || e.idx.bucketSize <= 0 {
+	if e == nil || e.idx.bucketSize <= 0 {
 		t.Fatalf("expected non-nil numeric range bucket index for field %q", field)
 	}
 	return e

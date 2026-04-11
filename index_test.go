@@ -3857,6 +3857,12 @@ func TestIndexExt_SnapshotOverlayStableDuringConcurrentWrites(t *testing.T) {
 	})
 
 	snap := db.getSnapshot()
+	pinnedSnap, pinnedRef, ok := db.pinSnapshotRefBySeq(snap.seq)
+	if !ok {
+		t.Fatalf("pinSnapshotRefBySeq(%d): false", snap.seq)
+	}
+	defer db.unpinSnapshotRef(snap.seq, pinnedRef)
+	snap = pinnedSnap
 	oldOV := newFieldOverlayStorage(snap.index["name"])
 	br := oldOV.rangeForBounds(indexExtBoundCase(t, struct {
 		op  qx.Op

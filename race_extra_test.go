@@ -177,12 +177,11 @@ func raceExtraRequireNumericRangeBucketCacheEntry(t *testing.T, snap *indexSnaps
 	if snap == nil || snap.numericRangeBucketCache == nil {
 		t.Fatalf("expected non-nil numeric range bucket cache for field %q", field)
 	}
-	raw, ok := snap.numericRangeBucketCache.Load(field)
+	entry, ok := snap.numericRangeBucketCache.loadField(field)
 	if !ok {
 		t.Fatalf("expected numeric range bucket cache entry for field %q", field)
 	}
-	entry, ok := raw.(*numericRangeBucketCacheEntry)
-	if !ok || entry == nil || entry.idx.bucketSize <= 0 {
+	if entry == nil || entry.idx.bucketSize <= 0 {
 		t.Fatalf("expected non-nil numeric range bucket entry for field %q", field)
 	}
 	return entry
@@ -312,6 +311,7 @@ func TestRaceExtra_NumericRangeBucketSpanCacheDetachedLoadsUnderConcurrency(t *t
 
 func TestRaceExtra_MaterializedPredBorrowedViewSurvivesConcurrentEviction(t *testing.T) {
 	snap := &indexSnapshot{matPredCacheMaxEntries: 1}
+	snapshotExtInitMaterializedPredCache(snap)
 
 	base := raceExtraPosting()
 	for i := uint64(1); i <= 48; i++ {

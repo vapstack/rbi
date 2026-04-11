@@ -88,6 +88,37 @@ func (db *DB[K, V]) queryRecords(tx *bbolt.Tx, snap *indexSnapshot, q *qx.QX) ([
 	return values, nil
 }
 
+func (db *DB[K, V]) pinCurrentSnapshot() (*indexSnapshot, uint64, *snapshotRef, bool) {
+	for {
+		db.snapshot.mu.RLock()
+		ref := db.snapshot.currentRef.Load()
+		if ref == nil {
+			db.snapshot.mu.RUnlock()
+			return db.buildPublishedSnapshotNoLock(0), 0, nil, false
+		}
+		ref.refs.Add(1)
+		if db.snapshot.currentRef.Load() != ref {
+			db.snapshot.mu.RUnlock()
+			ref.refs.Add(-1)
+			continue
+		}
+		snap := ref.snap
+		db.snapshot.mu.RUnlock()
+		if snap == nil {
+			ref.refs.Add(-1)
+			continue
+		}
+		return snap, snap.seq, ref, true
+	}
+}
+
+func (db *DB[K, V]) unpinCurrentSnapshot(seq uint64, ref *snapshotRef, pinned bool) {
+	if !pinned || ref == nil {
+		return
+	}
+	db.unpinSnapshotRef(seq, ref)
+}
+
 // QueryKeys evaluates the given query against the index and returns all matching ids.
 func (db *DB[K, V]) QueryKeys(q *qx.QX) ([]K, error) {
 	if err := db.beginOp(); err != nil {
@@ -105,16 +136,24 @@ func (db *DB[K, V]) QueryKeys(q *qx.QX) ([]K, error) {
 		return nil, fmt.Errorf("rbi does not support multi-column ordering")
 	}
 
-	view := db.makeQueryView(db.getSnapshot())
+	snap, seq, ref, pinned := db.pinCurrentSnapshot()
+	defer db.unpinCurrentSnapshot(seq, ref, pinned)
+
+	view := db.makeQueryView(snap)
 	defer db.releaseQueryView(view)
+
 	return view.execQuery(q, true, false)
 }
 
 // execPreparedQuery skips normalize/field-validation and tracing for internal
 // callers that already operate on validated/normalized QX.
 func (db *DB[K, V]) execPreparedQuery(q *qx.QX) ([]K, error) {
-	view := db.makeQueryView(db.getSnapshot())
+	snap, seq, ref, pinned := db.pinCurrentSnapshot()
+	defer db.unpinCurrentSnapshot(seq, ref, pinned)
+
+	view := db.makeQueryView(snap)
 	defer db.releaseQueryView(view)
+
 	return view.execPreparedQuery(q)
 }
 
@@ -311,6 +350,9 @@ func (qv *queryView[K, V]) execQuery(q *qx.QX, emitTrace bool, prepared bool) (o
 	// Offset requires cursor-based pagination logic.
 	if !qv.strkey && needAll && skip == 0 {
 		ids := result.ids.ToArray()
+		if len(ids) == 0 {
+			return nil, nil
+		}
 		return unsafe.Slice((*K)(unsafe.Pointer(&ids[0])), len(ids)), nil
 	}
 
