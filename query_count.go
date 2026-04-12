@@ -424,17 +424,34 @@ func countORBranchAcceptIdx(
 	idx uint64,
 	checks []int,
 ) uint64 {
-	if useSeenDedup && seen.Has(idx) {
+	if useSeenDedup {
+		if len(checks) == 0 {
+			if seen.Add(idx) {
+				return 1
+			}
+			return 0
+		}
+		if seen.Has(idx) {
+			return 0
+		}
+		if !countPredicatesMatchSet(br.preds, checks, idx) {
+			return 0
+		}
+		if seen.Add(idx) {
+			return 1
+		}
 		return 0
 	}
 	if len(checks) > 0 && !countPredicatesMatchSet(br.preds, checks, idx) {
 		return 0
 	}
-	if useSeenDedup {
-		if seen.Add(idx) {
-			return 1
+	if br.prevOrderLen == branchIdx {
+		for i := 0; i < br.prevOrderLen; i++ {
+			if branches.GetPtr(br.prevOrder[i]).matches(idx) {
+				return 0
+			}
 		}
-		return 0
+		return 1
 	}
 	for j := 0; j < branchIdx; j++ {
 		if branches.GetPtr(j).matches(idx) {
@@ -458,6 +475,9 @@ func countORBranchAcceptPosting(
 	}
 	if idx, ok := ids.TrySingle(); ok {
 		return countORBranchAcceptIdx(branches, branchIdx, br, useSeenDedup, seen, idx, checks)
+	}
+	if useSeenDedup && len(checks) == 0 {
+		return seen.addPosting(ids)
 	}
 	var cnt uint64
 	it := ids.Iter()
@@ -1146,6 +1166,9 @@ type countORBranch struct {
 	checksLen    int
 	leadInChecks bool
 	checks       [countPredicateScanMaxLeaves]int
+	matchWeight  uint64
+	prevOrderLen int
+	prevOrder    [countORPredicateMaxBranchesBase + 1]int
 	est          uint64
 }
 
@@ -1165,6 +1188,53 @@ func newCountORBranch(index int, preds predicateSet, lead int, checks []int, est
 		}
 	}
 	return br
+}
+
+func countORBranchDupOrderLess(branches *pooled.SliceBuf[countORBranch], a, b int) bool {
+	ba := branches.Get(a)
+	bb := branches.Get(b)
+	aw := ba.matchWeight
+	if aw == 0 {
+		aw = 1
+	}
+	bw := bb.matchWeight
+	if bw == 0 {
+		bw = 1
+	}
+	left := satMulUint64(ba.est, bw)
+	right := satMulUint64(bb.est, aw)
+	if left != right {
+		return left > right
+	}
+	if aw != bw {
+		return aw < bw
+	}
+	if ba.est != bb.est {
+		return ba.est > bb.est
+	}
+	return a < b
+}
+
+func countORPreparePrevOrderBuf(branches *pooled.SliceBuf[countORBranch]) {
+	if branches == nil || branches.Len() <= 1 {
+		return
+	}
+	for i := 1; i < branches.Len(); i++ {
+		br := branches.GetPtr(i)
+		br.prevOrderLen = i
+		for j := 0; j < i; j++ {
+			br.prevOrder[j] = j
+		}
+		for j := 1; j < br.prevOrderLen; j++ {
+			cur := br.prevOrder[j]
+			k := j
+			for k > 0 && countORBranchDupOrderLess(branches, cur, br.prevOrder[k-1]) {
+				br.prevOrder[k] = br.prevOrder[k-1]
+				k--
+			}
+			br.prevOrder[k] = cur
+		}
+	}
 }
 
 func (br *countORBranch) predLen() int {
@@ -1432,6 +1502,36 @@ func countORDedupDupShareBounds(branchCount int, universe uint64, expectedProbes
 	return minShare, forceShare
 }
 
+func countORBranchesMatchWorkBuf(branches *pooled.SliceBuf[countORBranch]) uint64 {
+	if branches == nil || branches.Len() == 0 {
+		return 0
+	}
+	var work uint64
+	for i := 0; i < branches.Len(); i++ {
+		br := branches.Get(i)
+		weight := br.matchWeight
+		if weight == 0 {
+			weight = 1
+		}
+		work = satAddUint64(work, satMulUint64(br.est, weight))
+	}
+	return work
+}
+
+func countORDedupWorkMultiplier(sumEst uint64, matchWork uint64) float64 {
+	if sumEst == 0 || matchWork <= sumEst {
+		return 1
+	}
+	mult := float64(matchWork) / float64(sumEst)
+	if mult < 1 {
+		return 1
+	}
+	if mult > 4 {
+		return 4
+	}
+	return mult
+}
+
 func countORBranchesShouldUseSeenDedupBuf(branches *pooled.SliceBuf[countORBranch], universe uint64, expectedProbes uint64) bool {
 	if branches == nil || branches.Len() <= 2 {
 		return false
@@ -1440,17 +1540,26 @@ func countORBranchesShouldUseSeenDedupBuf(branches *pooled.SliceBuf[countORBranc
 	if sumEst == 0 {
 		return false
 	}
-
-	threshold := countORSeenUnionThreshold(universe, branches.Len(), expectedProbes)
-	if sumEst < threshold {
+	matchWork := countORBranchesMatchWorkBuf(branches)
+	if matchWork == 0 {
 		return false
 	}
 
+	threshold := countORSeenUnionThreshold(universe, branches.Len(), expectedProbes)
+	if matchWork < threshold {
+		return false
+	}
+
+	workMult := countORDedupWorkMultiplier(sumEst, matchWork)
 	if universe > 0 {
 		unionEst := countORBranchesUnionEstimateBuf(branches, universe)
 		if unionEst > 0 && sumEst > unionEst {
 			dupEst := sumEst - unionEst
 			dupShare := float64(dupEst) / float64(sumEst)
+			dupShare *= workMult
+			if dupShare > 1 {
+				dupShare = 1
+			}
 			minDupShare, forceDupShare := countORDedupDupShareBounds(branches.Len(), universe, expectedProbes)
 			if dupShare < minDupShare {
 				return false
@@ -3451,13 +3560,25 @@ branchLoop:
 		}
 		checks = checks[:write]
 		sortActivePredicatesSet(checks, predSet)
+		matchWeight := uint64(0)
+		if !countIndexSliceContains(checks, leadIdx) {
+			matchWeight = qv.countORPredicateResidualCheckWeight(predSet.Get(leadIdx), leadEst, uc)
+		}
+		for _, pi := range checks {
+			matchWeight = satAddUint64(matchWeight, qv.countORPredicateResidualCheckWeight(predSet.Get(pi), leadEst, uc))
+		}
+		if matchWeight == 0 {
+			matchWeight = 1
+		}
 
 		if leadEst == 0 || leadWeight == 0 {
 			leadEst = 1
 			leadWeight = 1
 		}
 		expectedProbes += leadEst * leadWeight
-		branchesBuf.Append(newCountORBranch(branchIdx, predSet, leadIdx, checks, leadEst))
+		br := newCountORBranch(branchIdx, predSet, leadIdx, checks, leadEst)
+		br.matchWeight = matchWeight
+		branchesBuf.Append(br)
 	}
 
 	if branchesBuf.Len() == 0 {
@@ -3486,6 +3607,8 @@ branchLoop:
 	if useSeenDedup {
 		seen = newCountORSeenBuf(branchesBuf, materializedBranchEst, uc)
 		defer seen.release()
+	} else {
+		countORPreparePrevOrderBuf(branchesBuf)
 	}
 
 	var cnt uint64
