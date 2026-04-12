@@ -72,6 +72,9 @@ func (qv *queryView[K, V]) countInternal(q *qx.QX, emitTrace bool) (uint64, erro
 	if out, ok, err := qv.tryCountByScalarLookup(expr, trace); ok || err != nil {
 		return countInternalFinishTrace(trace, out, err)
 	}
+	if out, ok, err := qv.tryCountBySliceLookup(expr, trace); ok || err != nil {
+		return countInternalFinishTrace(trace, out, err)
+	}
 	if out, ok, err := qv.tryCountByScalarInSplit(expr, trace); ok || err != nil {
 		return countInternalFinishTrace(trace, out, err)
 	}
@@ -171,6 +174,169 @@ func countScalarLookupComplement(universe, hit uint64, invert bool) uint64 {
 		return 0
 	}
 	return universe - hit
+}
+
+func countPostingUnionCardinality2(a, b posting.List) uint64 {
+	if a.IsEmpty() {
+		return b.Cardinality()
+	}
+	if b.IsEmpty() {
+		return a.Cardinality()
+	}
+	return satAddUint64(a.Cardinality(), b.Cardinality()) - a.AndCardinality(b)
+}
+
+func countPostingAllMatches(posts *pooled.SliceBuf[posting.List]) uint64 {
+	if posts == nil || posts.Len() == 0 {
+		return 0
+	}
+	leadIdx := 0
+	lead := posts.Get(0)
+	leadCard := lead.Cardinality()
+	if leadCard == 0 {
+		return 0
+	}
+	for i := 1; i < posts.Len(); i++ {
+		ids := posts.Get(i)
+		card := ids.Cardinality()
+		if card == 0 {
+			return 0
+		}
+		if card < leadCard {
+			leadIdx = i
+			lead = ids
+			leadCard = card
+		}
+	}
+	if idx, ok := lead.TrySingle(); ok {
+		for i := 0; i < posts.Len(); i++ {
+			if i == leadIdx {
+				continue
+			}
+			if !posts.Get(i).Contains(idx) {
+				return 0
+			}
+		}
+		return 1
+	}
+	var cnt uint64
+	it := lead.Iter()
+	for it.HasNext() {
+		idx := it.Next()
+		match := true
+		for i := 0; i < posts.Len(); i++ {
+			if i == leadIdx {
+				continue
+			}
+			if !posts.Get(i).Contains(idx) {
+				match = false
+				break
+			}
+		}
+		if match {
+			cnt++
+		}
+	}
+	it.Release()
+	return cnt
+}
+
+func (qv *queryView[K, V]) tryCountBySliceLookup(expr qx.Expr, trace *queryTrace) (uint64, bool, error) {
+	if expr.Field == "" {
+		return 0, false, nil
+	}
+
+	f := qv.fields[expr.Field]
+	if f == nil || !f.Slice {
+		return 0, false, nil
+	}
+
+	ov := qv.fieldOverlay(expr.Field)
+	if !ov.hasData() && !qv.hasIndexedField(expr.Field) {
+		return 0, false, nil
+	}
+
+	valsBuf, isSlice, _, err := qv.exprValueToDistinctIdxBuf(expr)
+	if valsBuf != nil {
+		defer stringSlicePool.Put(valsBuf)
+	}
+	valCount := 0
+	if valsBuf != nil {
+		valCount = valsBuf.Len()
+	}
+	if err != nil {
+		return 0, false, err
+	}
+	if !isSlice {
+		return 0, false, nil
+	}
+	if valCount == 0 {
+		return 0, false, nil
+	}
+
+	universe := qv.snapshotUniverseCardinality()
+
+	switch expr.Op {
+
+	case qx.OpHASANY:
+		postsBuf, _ := qv.scalarLookupPostings(expr.Field, valsBuf, false)
+		defer postingSlicePool.Put(postsBuf)
+		switch postsBuf.Len() {
+		case 0:
+			if trace != nil {
+				trace.setPlan(PlanCountScalarLookup)
+				trace.addExamined(0)
+			}
+			return countScalarLookupComplement(universe, 0, expr.Not), true, nil
+		case 1:
+			hit := postsBuf.Get(0).Cardinality()
+			if trace != nil {
+				trace.setPlan(PlanCountScalarLookup)
+				trace.addExamined(hit)
+			}
+			return countScalarLookupComplement(universe, hit, expr.Not), true, nil
+		case 2:
+			a := postsBuf.Get(0)
+			b := postsBuf.Get(1)
+			hit := countPostingUnionCardinality2(a, b)
+			if trace != nil {
+				trace.setPlan(PlanCountScalarLookup)
+				trace.addExamined(satAddUint64(a.Cardinality(), b.Cardinality()))
+			}
+			return countScalarLookupComplement(universe, hit, expr.Not), true, nil
+		default:
+			return 0, false, nil
+		}
+
+	case qx.OpHAS:
+		postsBuf := postingSlicePool.Get()
+		postsBuf.Grow(valCount)
+		defer postingSlicePool.Put(postsBuf)
+
+		var examined uint64
+		for i := 0; i < valCount; i++ {
+			ids := ov.lookupPostingRetained(valsBuf.Get(i))
+			card := ids.Cardinality()
+			examined = satAddUint64(examined, card)
+			if ids.IsEmpty() {
+				if trace != nil {
+					trace.setPlan(PlanCountScalarLookup)
+					trace.addExamined(examined)
+				}
+				return countScalarLookupComplement(universe, 0, expr.Not), true, nil
+			}
+			postsBuf.Append(ids)
+		}
+
+		hit := countPostingAllMatches(postsBuf)
+		if trace != nil {
+			trace.setPlan(PlanCountScalarLookup)
+			trace.addExamined(examined)
+		}
+		return countScalarLookupComplement(universe, hit, expr.Not), true, nil
+	}
+
+	return 0, false, nil
 }
 
 func countPostingAgainstResult(ids posting.List, filter postingResult) uint64 {
