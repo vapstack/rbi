@@ -3243,6 +3243,43 @@ func TestRegression_CountORByPredicates_MultiTermHASLead(t *testing.T) {
 	}
 }
 
+func TestQueryKeys_NoOrderBroadNegativeAll_MatchesExpected(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
+
+	countries := []string{"US", "DE", "FR", "GB"}
+	seedGeneratedUint64Data(t, db, 100_000, func(i int) *Rec {
+		return &Rec{
+			Name:   fmt.Sprintf("u_%d", i),
+			Email:  fmt.Sprintf("user%06d@example.com", i),
+			Age:    18 + (i % 50),
+			Score:  float64(i % 1_000),
+			Active: i%2 == 0,
+			Meta: Meta{
+				Country: countries[i%len(countries)],
+			},
+		}
+	})
+	if err := db.RebuildIndex(); err != nil {
+		t.Fatalf("RebuildIndex: %v", err)
+	}
+
+	q := qx.Query(qx.NOTIN("country", []string{"US"}))
+
+	got, err := db.QueryKeys(q)
+	if err != nil {
+		t.Fatalf("QueryKeys: %v", err)
+	}
+	if len(got) < 64_000 {
+		t.Fatalf("expected broad negative result to exercise large no-order route, got %d rows", len(got))
+	}
+
+	want, err := expectedKeysUint64(t, db, q)
+	if err != nil {
+		t.Fatalf("expectedKeysUint64: %v", err)
+	}
+	assertQueryIDsEqual(t, q, got, want)
+}
+
 func TestQuery_RouteEquivalence_PreparedExecutionPlanner_BaseAndMutated(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
 	_ = seedData(t, db, 8_000)

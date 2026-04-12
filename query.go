@@ -6,6 +6,7 @@ import (
 
 	"github.com/vapstack/qx"
 	"github.com/vapstack/rbi/internal/normalize"
+	"github.com/vapstack/rbi/internal/posting"
 	"go.etcd.io/bbolt"
 )
 
@@ -207,6 +208,37 @@ func finishQueryTrace[K ~uint64 | ~string, V any](trace *queryTrace, out *[]K, e
 	trace.finish(uint64(len(*out)), *err)
 }
 
+// Broad negative full scans are faster when we materialize the complement once
+// instead of probing exclusion membership for every universe id.
+func shouldMaterializeNegativeAllNumericKeys(universeCard, excludedCard uint64) bool {
+	if universeCard == 0 || excludedCard >= universeCard {
+		return false
+	}
+	resultCard := universeCard - excludedCard
+	if resultCard < 64_000 {
+		return false
+	}
+	return resultCard >= excludedCard*2
+}
+
+func (qv *queryView[K, V]) materializeNegativeResultKeys() []uint64 {
+	universe := qv.snapshotUniverseView()
+	return universe.ToArray()
+}
+
+func (qv *queryView[K, V]) materializeNegativeResultKeysExcluding(exclude posting.List) []uint64 {
+	if exclude.IsEmpty() {
+		return qv.materializeNegativeResultKeys()
+	}
+	ids := qv.snapshotUniverseView().BuildAndNot(exclude)
+	if ids.IsEmpty() {
+		return nil
+	}
+	out := ids.ToArray()
+	ids.Release()
+	return out
+}
+
 func (qv *queryView[K, V]) execPreparedQuery(q *qx.QX) ([]K, error) {
 	return qv.execQuery(q, false, true)
 }
@@ -297,6 +329,14 @@ func (qv *queryView[K, V]) execQuery(q *qx.QX, emitTrace bool, prepared bool) (o
 
 	// case 1: no ordering, negative result: iterate over universe excluding the result set
 	if len(q.Order) == 0 && result.neg {
+		if !qv.strkey && needAll && skip == 0 &&
+			shouldMaterializeNegativeAllNumericKeys(qv.snapshotUniverseCardinality(), result.ids.Cardinality()) {
+			ids := qv.materializeNegativeResultKeysExcluding(result.ids)
+			if len(ids) == 0 {
+				return nil, nil
+			}
+			return unsafe.Slice((*K)(unsafe.Pointer(&ids[0])), len(ids)), nil
+		}
 		out = makeOutSlice[K](qv.postingResultCardinality(result), need)
 		cursor := qv.newQueryCursor(out, skip, need, needAll, 0)
 
