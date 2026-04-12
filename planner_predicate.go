@@ -2226,7 +2226,7 @@ func (qv *queryView[K, V]) tryPlanOrdered(q *qx.QX, trace *queryTrace) ([]K, boo
 			return nil, false, nil
 		}
 		window, _ := orderWindow(q)
-		predSet, ok := qv.buildPredicatesOrderedWithMode(leaves, o.Field, false, window, true, true)
+		predSet, ok := qv.buildPredicatesOrderedWithMode(leaves, o.Field, false, window, q.Offset, true, true)
 		if !ok {
 			return nil, false, nil
 		}
@@ -3010,15 +3010,17 @@ func isOrderRangeCoveredLeaf(orderField string, e qx.Expr) bool {
 }
 
 func (qv *queryView[K, V]) buildPredicatesOrdered(leaves []qx.Expr, orderField string) (predicateSet, bool) {
-	return qv.buildPredicatesOrderedWithMode(leaves, orderField, true, 0, true, true)
+	return qv.buildPredicatesOrderedWithMode(leaves, orderField, true, 0, 0, true, true)
 }
 
 type orderedScalarRangeRouting struct {
 	eagerMaterialize bool
 	broadComplement  bool
+	cacheKey         materializedPredKey
+	requirePromotion bool
 }
 
-func (qv *queryView[K, V]) orderedScalarRangeRouting(e qx.Expr, orderedWindow int, universe uint64) orderedScalarRangeRouting {
+func (qv *queryView[K, V]) orderedScalarRangeRouting(e qx.Expr, orderedWindow int, orderedOffset uint64, universe uint64) orderedScalarRangeRouting {
 	if universe == 0 || e.Not || e.Field == "" || !isNumericRangeOp(e.Op) {
 		return orderedScalarRangeRouting{}
 	}
@@ -3029,9 +3031,24 @@ func (qv *queryView[K, V]) orderedScalarRangeRouting(e qx.Expr, orderedWindow in
 
 	route := orderedScalarRangeRouting{
 		eagerMaterialize: candidate.plan.orderedEagerMaterializeUseful(orderedWindow, universe),
+		cacheKey:         candidate.core.sharedReuse.cacheKey,
+	}
+	expectedRows := orderedPredicateExpectedRows(orderedWindow, candidate.plan.est, universe)
+	if orderedOffset == 0 && expectedRows > 0 && expectedRows < candidate.plan.est {
+		route.requirePromotion = satMulUint64(expectedRows, 2) < candidate.plan.est
 	}
 	route.broadComplement = candidate.broadComplementCardinality(universe)
 	return route
+}
+
+func (qv *queryView[K, V]) orderedScalarRangeCanEagerMaterialize(route orderedScalarRangeRouting) bool {
+	if !route.eagerMaterialize {
+		return false
+	}
+	if !route.requirePromotion || qv.snap == nil || route.cacheKey.isZero() {
+		return true
+	}
+	return qv.snap.shouldPromoteRuntimeMaterializedPredKey(route.cacheKey)
 }
 
 func overlayRangeEmpty(br overlayRange) bool {
@@ -3147,7 +3164,7 @@ func (qv *queryView[K, V]) buildMergedNumericRangePredicateWithColdMode(
 	return p, ok
 }
 
-func (qv *queryView[K, V]) buildPredicatesOrderedWithMode(leaves []qx.Expr, orderField string, allowMaterialize bool, orderedWindow int, coverOrderRange bool, allowOrderedEagerMaterialize bool) (predicateSet, bool) {
+func (qv *queryView[K, V]) buildPredicatesOrderedWithMode(leaves []qx.Expr, orderField string, allowMaterialize bool, orderedWindow int, orderedOffset uint64, coverOrderRange bool, allowOrderedEagerMaterialize bool) (predicateSet, bool) {
 	if len(leaves) == 1 && leaves[0].Op == qx.OpNOOP && leaves[0].Not {
 		preds := newPredicateSet(1)
 		preds.Append(predicate{alwaysFalse: true})
@@ -3216,15 +3233,15 @@ func (qv *queryView[K, V]) buildPredicatesOrderedWithMode(leaves []qx.Expr, orde
 		}
 		predAllowMaterialize := allowMaterialize
 		orderedEagerMaterialize := false
-		orderedRoute := qv.orderedScalarRangeRouting(e, orderedWindow, routeUniverse)
+		orderedRoute := qv.orderedScalarRangeRouting(e, orderedWindow, orderedOffset, routeUniverse)
 		if !predAllowMaterialize {
-			orderedRoute = qv.orderedScalarRangeRouting(e, orderedWindow, universe)
+			orderedRoute = qv.orderedScalarRangeRouting(e, orderedWindow, orderedOffset, universe)
 		}
 		if !predAllowMaterialize && allowOrderedEagerMaterialize &&
 			!orderRangeDeferred &&
 			orderedMergedScalarRangeFieldCount(mergedRangesBuf, e.Field) <= 1 &&
 			e.Field != orderField &&
-			orderedRoute.eagerMaterialize {
+			qv.orderedScalarRangeCanEagerMaterialize(orderedRoute) {
 			predAllowMaterialize = true
 			orderedEagerMaterialize = true
 		}
@@ -3255,6 +3272,7 @@ func (qv *queryView[K, V]) buildPredicatesOrderedWithModeBuf(
 	orderField string,
 	allowMaterialize bool,
 	orderedWindow int,
+	orderedOffset uint64,
 	coverOrderRange bool,
 	allowOrderedEagerMaterialize bool,
 ) (predicateSet, bool) {
@@ -3328,15 +3346,15 @@ func (qv *queryView[K, V]) buildPredicatesOrderedWithModeBuf(
 		}
 		predAllowMaterialize := allowMaterialize
 		orderedEagerMaterialize := false
-		orderedRoute := qv.orderedScalarRangeRouting(e, orderedWindow, routeUniverse)
+		orderedRoute := qv.orderedScalarRangeRouting(e, orderedWindow, orderedOffset, routeUniverse)
 		if !predAllowMaterialize {
-			orderedRoute = qv.orderedScalarRangeRouting(e, orderedWindow, universe)
+			orderedRoute = qv.orderedScalarRangeRouting(e, orderedWindow, orderedOffset, universe)
 		}
 		if !predAllowMaterialize && allowOrderedEagerMaterialize &&
 			!orderRangeDeferred &&
 			orderedMergedScalarRangeFieldCount(mergedRangesBuf, e.Field) <= 1 &&
 			e.Field != orderField &&
-			orderedRoute.eagerMaterialize {
+			qv.orderedScalarRangeCanEagerMaterialize(orderedRoute) {
 			predAllowMaterialize = true
 			orderedEagerMaterialize = true
 		}

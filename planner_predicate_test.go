@@ -1108,7 +1108,7 @@ func TestBuildPredicatesOrdered_BroadComplementPromotesOnSecondSight(t *testing.
 		t.Fatalf("expected non-empty complement cache key")
 	}
 
-	preds1, ok := db.buildPredicatesOrderedWithMode([]qx.Expr{expr}, "score", false, 4096, false, true)
+	preds1, ok := db.buildPredicatesOrderedWithMode([]qx.Expr{expr}, "score", false, 4096, 0, false, true)
 	if !ok {
 		t.Fatalf("first buildPredicatesOrderedWithMode: ok=false")
 	}
@@ -1126,7 +1126,7 @@ func TestBuildPredicatesOrdered_BroadComplementPromotesOnSecondSight(t *testing.
 		t.Fatalf("unexpected shared complement cache entry after first ordered build")
 	}
 
-	preds2, ok := db.buildPredicatesOrderedWithMode([]qx.Expr{expr}, "score", false, 4096, false, true)
+	preds2, ok := db.buildPredicatesOrderedWithMode([]qx.Expr{expr}, "score", false, 4096, 0, false, true)
 	if !ok {
 		t.Fatalf("second buildPredicatesOrderedWithMode: ok=false")
 	}
@@ -1195,6 +1195,51 @@ func TestOverlayRangeStats_ChunkedMatchesCursorScanOnLargeUniqueRange(t *testing
 		if gotBuckets != wantBuckets || gotEst != wantEst {
 			t.Fatalf("case %d mismatch: got buckets=%d est=%d want buckets=%d est=%d", i, gotBuckets, gotEst, wantBuckets, wantEst)
 		}
+	}
+}
+
+func TestOrderedScalarRangeCanEagerMaterialize_RequiresPromotionOnlyForSmallOrderedWindows(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
+	seedGeneratedUint64Data(t, db, 32, func(i int) *Rec {
+		return &Rec{
+			Name:  fmt.Sprintf("u_%d", i),
+			Age:   i,
+			Score: float64(i),
+		}
+	})
+	if err := db.RebuildIndex(); err != nil {
+		t.Fatalf("RebuildIndex: %v", err)
+	}
+
+	view := db.currentQueryViewForTests()
+	defer db.releaseQueryView(view)
+
+	expr := qx.GTE("age", 10)
+	cacheKey := view.materializedPredKey(expr)
+	if cacheKey.isZero() {
+		t.Fatalf("expected non-zero materialized predicate cache key")
+	}
+
+	route := orderedScalarRangeRouting{
+		eagerMaterialize: true,
+		cacheKey:         cacheKey,
+		requirePromotion: true,
+	}
+	if view.orderedScalarRangeCanEagerMaterialize(route) {
+		t.Fatalf("expected first-hit ordered eager materialization to stay disabled")
+	}
+	if !view.orderedScalarRangeCanEagerMaterialize(route) {
+		t.Fatalf("expected second-hit ordered eager materialization to become enabled")
+	}
+
+	if !view.orderedScalarRangeCanEagerMaterialize(orderedScalarRangeRouting{
+		eagerMaterialize: true,
+		cacheKey:         cacheKey,
+	}) {
+		t.Fatalf("expected wide ordered window eager materialization to stay enabled")
+	}
+	if !view.orderedScalarRangeCanEagerMaterialize(orderedScalarRangeRouting{eagerMaterialize: true}) {
+		t.Fatalf("expected zero-cache-key ordered eager materialization to stay enabled")
 	}
 }
 

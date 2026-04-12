@@ -135,6 +135,48 @@ func TestQuery_LimitOrderAndRange_UnsatisfiableRest_ReturnEmpty(t *testing.T) {
 	}
 }
 
+func TestPlannerFilterPostingByLeafChecks_PreferredExactBypassesSmallBucketFallback(t *testing.T) {
+	src := posting.BuildFromSorted([]uint64{1, 3, 5, 7, 9, 11, 13, 15})
+	defer src.Release()
+
+	postA := posting.BuildFromSorted([]uint64{3, 7, 11})
+	postB := posting.BuildFromSorted([]uint64{5, 7, 13})
+	defer postA.Release()
+	defer postB.Release()
+
+	postsBuf := postingSlicePool.Get()
+	postsBuf.Append(postA)
+	postsBuf.Append(postB)
+
+	state := postsAnyFilterStatePool.Get()
+	state.postsBuf = postsBuf
+
+	preds := leafPredSlicePool.Get()
+	preds.Append(leafPred{
+		kind:          leafPredKindPostsUnion,
+		postsBuf:      postsBuf,
+		postsAnyState: state,
+	})
+	defer leafPredSlicePool.Put(preds)
+
+	mode, exact, work, card := plannerFilterPostingByLeafChecks(preds, []int{0}, src.Borrow(), posting.List{}, false)
+	defer work.Release()
+	if mode != plannerPredicateBucketExact {
+		t.Fatalf("unexpected mode: got=%v want=%v", mode, plannerPredicateBucketExact)
+	}
+	if card != src.Cardinality() {
+		t.Fatalf("unexpected source cardinality: got=%d want=%d", card, src.Cardinality())
+	}
+	if got := exact.Cardinality(); got != 5 {
+		t.Fatalf("unexpected exact cardinality: got=%d want=5", got)
+	}
+	for _, idx := range []uint64{3, 5, 7, 11, 13} {
+		if !exact.Contains(idx) {
+			t.Fatalf("exact posting is missing id %d", idx)
+		}
+	}
+}
+
 func TestApplyBoundsToIndexRange_PrefixIntersectsRange(t *testing.T) {
 	s := []index{
 		{Key: indexKeyFromString("aa")},
@@ -1045,6 +1087,97 @@ func TestQuery_OrderBasic_DeepWindowEagerMaterializesNonOrderNumericRange(t *tes
 	}
 }
 
+func TestQuery_OrderBasic_BuildLeafPredsExcludingBounds_WarmsBroadComplement(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{
+		AnalyzeInterval:                         -1,
+		SnapshotMaterializedPredCacheMaxEntries: 16,
+	})
+
+	setNumericBucketKnobs(t, db, 128, 1, 1)
+	seedGeneratedUint64Data(t, db, 64, func(i int) *Rec {
+		return &Rec{
+			Name:  fmt.Sprintf("u_%d", i),
+			Age:   18 + i,
+			Score: float64(i),
+		}
+	})
+	if err := db.RebuildIndex(); err != nil {
+		t.Fatalf("RebuildIndex: %v", err)
+	}
+
+	q := qx.Query(
+		qx.GTE("score", 0.0),
+		qx.GTE("age", 40),
+	).By("score", qx.ASC).Max(50)
+	leaves := mustExtractAndLeaves(t, q.Expr)
+
+	view := db.currentQueryViewForTests()
+	defer db.releaseQueryView(view)
+
+	expr := qx.GTE("age", 40)
+	bound, isSlice, err := view.exprValueToNormalizedScalarBound(expr)
+	if err != nil {
+		t.Fatalf("exprValueToNormalizedScalarBound: %v", err)
+	}
+	if isSlice || bound.full || bound.empty {
+		t.Fatalf("unexpected normalized bound state: slice=%v full=%v empty=%v", isSlice, bound.full, bound.empty)
+	}
+	cacheKey := view.materializedPredComplementKeyForNormalizedScalarBound(expr.Field, bound).String()
+	if cacheKey == "" {
+		t.Fatalf("expected non-empty complement cache key")
+	}
+
+	preds1, ok, err := view.buildLeafPredsExcludingBounds(leaves, "score", 4096)
+	if err != nil {
+		t.Fatalf("first buildLeafPredsExcludingBounds: %v", err)
+	}
+	if !ok {
+		t.Fatalf("expected first residual leaf preds to be supported")
+	}
+	if preds1 == nil || preds1.Len() != 1 {
+		t.Fatalf("unexpected first predicate count: %d", preds1.Len())
+	}
+	first := preds1.Get(0)
+	if first.kind != leafPredKindPredicate {
+		leafPredSlicePool.Put(preds1)
+		t.Fatalf("expected predicate leaf, got kind=%v", first.kind)
+	}
+	if first.pred.kind == predicateKindMaterializedNot {
+		leafPredSlicePool.Put(preds1)
+		t.Fatalf("expected first ordered broad complement to stay runtime-local")
+	}
+	if !first.pred.hasRuntimeRangeState() {
+		leafPredSlicePool.Put(preds1)
+		t.Fatalf("expected first ordered broad complement to keep runtime range state")
+	}
+	leafPredSlicePool.Put(preds1)
+	if _, ok := db.getSnapshot().loadMaterializedPred(cacheKey); ok {
+		t.Fatalf("unexpected shared complement cache entry after first ordered leaf build")
+	}
+
+	preds2, ok, err := view.buildLeafPredsExcludingBounds(leaves, "score", 4096)
+	if err != nil {
+		t.Fatalf("second buildLeafPredsExcludingBounds: %v", err)
+	}
+	if !ok {
+		t.Fatalf("expected second residual leaf preds to be supported")
+	}
+	if preds2 == nil || preds2.Len() != 1 {
+		t.Fatalf("unexpected second predicate count: %d", preds2.Len())
+	}
+	defer leafPredSlicePool.Put(preds2)
+	second := preds2.Get(0)
+	if second.kind != leafPredKindPredicate {
+		t.Fatalf("expected predicate leaf, got kind=%v", second.kind)
+	}
+	if second.pred.kind != predicateKindMaterializedNot {
+		t.Fatalf("expected second ordered broad complement to materialize, got kind=%v", second.pred.kind)
+	}
+	if _, ok := db.getSnapshot().loadMaterializedPred(cacheKey); !ok {
+		t.Fatalf("expected shared complement cache entry after second ordered leaf build")
+	}
+}
+
 func TestQuery_OrderBasic_DeepWindowCachePersistsAcrossUnchangedFieldPatch(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
 		AnalyzeInterval:                         -1,
@@ -1457,7 +1590,7 @@ func TestBuildPredicatesOrdered_WarmMergedNumericRangeUsesExactRangeCache(t *tes
 	view := db.currentQueryViewForTests()
 	defer db.releaseQueryView(view)
 	leaves := mustExtractAndLeaves(t, q.Expr)
-	predSet, ok := view.buildPredicatesOrderedWithMode(leaves, "score", false, 100, true, true)
+	predSet, ok := view.buildPredicatesOrderedWithMode(leaves, "score", false, 100, 0, true, true)
 	if !ok {
 		t.Fatalf("buildPredicatesOrderedWithMode: ok=false")
 	}

@@ -2263,7 +2263,7 @@ func TestPointerNil_ExecPlanOrderedBasic_BaseNilTail(t *testing.T) {
 		t.Fatalf("collectAndLeaves: ok=false")
 	}
 	window, _ := orderWindow(q)
-	preds, ok := db.buildPredicatesOrderedWithMode(leaves, "opt", false, window, true, true)
+	preds, ok := db.buildPredicatesOrderedWithMode(leaves, "opt", false, window, q.Offset, true, true)
 	if !ok {
 		t.Fatalf("buildPredicatesOrderedWithMode: ok=false")
 	}

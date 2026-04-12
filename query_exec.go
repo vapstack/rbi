@@ -1910,7 +1910,7 @@ func (qv *queryView[K, V]) tryQueryOrderBasicWithLimit(q *qx.QX, trace *queryTra
 			execDecision := qv.decideExecutionOrderByCostBuf(q, leavesBuf)
 			if execDecision.use {
 				window, _ := orderWindow(q)
-				predSet, ok := qv.buildPredicatesOrderedWithModeBuf(leavesBuf, f, false, window, true, true)
+				predSet, ok := qv.buildPredicatesOrderedWithModeBuf(leavesBuf, f, false, window, q.Offset, true, true)
 				if ok {
 					defer predSet.Release()
 					for i := 0; i < predSet.Len(); i++ {
@@ -1992,7 +1992,7 @@ func (qv *queryView[K, V]) tryQueryOrderBasicWithLimit(q *qx.QX, trace *queryTra
 		} else if residualOpsBuf.Len() > 0 {
 			window, _ := orderWindow(q)
 			var ok bool
-			residualPredSet, ok = qv.buildPredicatesOrderedWithModeBuf(residualOpsBuf, f, false, window, false, true)
+			residualPredSet, ok = qv.buildPredicatesOrderedWithModeBuf(residualOpsBuf, f, false, window, q.Offset, false, true)
 			if !ok {
 				base.release()
 				base = postingResult{}

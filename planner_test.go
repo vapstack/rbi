@@ -203,6 +203,52 @@ func TestPlannerFilterPostingByPredicateChecksBuf_CompactBorrowedAllocsPerRunSta
 	}
 }
 
+func TestPlannerFilterPostingByPredicateChecksBuf_PreferredExactBypassesSmallBucketFallback(t *testing.T) {
+	src := posting.BuildFromSorted([]uint64{1, 3, 5, 7, 9, 11, 13, 15})
+	defer src.Release()
+
+	postA := posting.BuildFromSorted([]uint64{3, 7, 11})
+	postB := posting.BuildFromSorted([]uint64{5, 7, 13})
+	defer postA.Release()
+	defer postB.Release()
+
+	postsBuf := postingSlicePool.Get()
+	postsBuf.Append(postA)
+	postsBuf.Append(postB)
+	defer postingSlicePool.Put(postsBuf)
+
+	state := postsAnyFilterStatePool.Get()
+	state.postsBuf = postsBuf
+
+	preds := newPredicateSet(1)
+	preds.Append(predicate{
+		kind:          predicateKindPostsAny,
+		postsAnyState: state,
+	})
+	defer preds.Release()
+
+	checks := predicateCheckSlicePool.Get()
+	checks.Append(0)
+	defer predicateCheckSlicePool.Put(checks)
+
+	mode, exact, work, card := plannerFilterPostingByPredicateChecksBuf(preds, checks, src.Borrow(), posting.List{}, false)
+	defer work.Release()
+	if mode != plannerPredicateBucketExact {
+		t.Fatalf("unexpected mode: got=%v want=%v", mode, plannerPredicateBucketExact)
+	}
+	if card != src.Cardinality() {
+		t.Fatalf("unexpected source cardinality: got=%d want=%d", card, src.Cardinality())
+	}
+	if got := exact.Cardinality(); got != 5 {
+		t.Fatalf("unexpected exact cardinality: got=%d want=5", got)
+	}
+	for _, idx := range []uint64{3, 5, 7, 11, 13} {
+		if !exact.Contains(idx) {
+			t.Fatalf("exact posting is missing id %d", idx)
+		}
+	}
+}
+
 func TestPlannerCalibration_ObserveUpdatesMultiplier(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
 		AnalyzeInterval:        -1,
@@ -1128,7 +1174,7 @@ func TestPlannerOROrderDecision_PrefersStreamWhenAllBranchesAreOrderBounded(t *t
 
 	view := db.currentQueryViewForTests()
 	window, _ := orderWindow(q)
-	branches, alwaysFalse, ok := view.buildORBranchesOrdered(q.Expr.Operands, "age", window)
+	branches, alwaysFalse, ok := view.buildORBranchesOrdered(q.Expr.Operands, "age", window, 0)
 	if !ok {
 		t.Fatalf("buildORBranchesOrdered: ok=false")
 	}
@@ -1167,7 +1213,7 @@ func TestPlannerORBranchesOrdered_BoundedCoveredOnlyBranchNotAlwaysTrue(t *testi
 
 	view := db.currentQueryViewForTests()
 	window, _ := orderWindow(q)
-	branches, alwaysFalse, ok := view.buildORBranchesOrdered(q.Expr.Operands, "age", window)
+	branches, alwaysFalse, ok := view.buildORBranchesOrdered(q.Expr.Operands, "age", window, 0)
 	if !ok {
 		t.Fatalf("buildORBranchesOrdered: ok=false")
 	}
@@ -1236,7 +1282,7 @@ func TestPlannerORBranchesOrdered_EmptyCoveredOnlyBranchKeepsZeroEstimatedCard(t
 
 	view := db.currentQueryViewForTests()
 	window, _ := orderWindow(q)
-	branches, alwaysFalse, ok := view.buildORBranchesOrdered(q.Expr.Operands, "age", window)
+	branches, alwaysFalse, ok := view.buildORBranchesOrdered(q.Expr.Operands, "age", window, 0)
 	if !ok {
 		t.Fatalf("buildORBranchesOrdered: ok=false")
 	}
@@ -1289,7 +1335,7 @@ func TestPlannerOROrderDecision_PrefersMergeWhenRouteEstimatorBeatsStream(t *tes
 
 	view := db.currentQueryViewForTests()
 	window, _ := orderWindow(q)
-	branches, alwaysFalse, ok := view.buildORBranchesOrdered(q.Expr.Operands, "score", window)
+	branches, alwaysFalse, ok := view.buildORBranchesOrdered(q.Expr.Operands, "score", window, 0)
 	if !ok {
 		t.Fatalf("buildORBranchesOrdered: ok=false")
 	}
@@ -1357,7 +1403,7 @@ func TestPlannerORBranchesOrdered_AvoidsMaterializingDeferredOrderRangeLeaves(t 
 		ageExpr,
 	}
 
-	preds, ok := db.buildPredicatesOrderedWithMode(leaves, "score", false, 4096, false, true)
+	preds, ok := db.buildPredicatesOrderedWithMode(leaves, "score", false, 4096, 0, false, true)
 	if !ok {
 		t.Fatalf("buildPredicatesOrderedWithMode: ok=false")
 	}
@@ -1413,7 +1459,7 @@ func TestBuildPredicatesOrdered_MergesPositiveNumericRangeLeavesOnSameField(t *t
 		qx.LTE("age", 400),
 	}
 
-	preds, ok := db.buildPredicatesOrderedWithMode(leaves, "score", false, 4096, false, true)
+	preds, ok := db.buildPredicatesOrderedWithMode(leaves, "score", false, 4096, 0, false, true)
 	if !ok {
 		t.Fatalf("buildPredicatesOrderedWithMode: ok=false")
 	}
@@ -1454,7 +1500,7 @@ func TestPlannerOROrderMergeBranchStats_SkipFullSpanRowCountingWithoutOrderBound
 
 	view := db.currentQueryViewForTests()
 	window, _ := orderWindow(q)
-	branches, alwaysFalse, ok := view.buildORBranchesOrdered(q.Expr.Operands, "age", window)
+	branches, alwaysFalse, ok := view.buildORBranchesOrdered(q.Expr.Operands, "age", window, 0)
 	if !ok {
 		t.Fatalf("buildORBranchesOrdered: ok=false")
 	}

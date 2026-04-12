@@ -299,22 +299,6 @@ func runBenchQueryKeysOnceStress(b *testing.B, db *DB[uint64, StressBenchUser], 
 	}
 }
 
-func warmBenchReadQueryOnceStress(b *testing.B, db *DB[uint64, StressBenchUser], q *qx.QX) {
-	b.Helper()
-	b.StopTimer()
-	defer b.StartTimer()
-	runBenchReadQueryOnceStress(b, db, q)
-}
-
-func runBenchReadQueryOnceStress(b *testing.B, db *DB[uint64, StressBenchUser], q *qx.QX) {
-	b.Helper()
-	items, err := db.Query(q)
-	if err != nil {
-		b.Fatal(err)
-	}
-	db.ReleaseRecords(items...)
-}
-
 func runStressCountBenchWithMode(b *testing.B, db *DB[uint64, StressBenchUser], q *qx.QX, mode benchCacheMode) {
 	b.Helper()
 	b.ReportAllocs()
@@ -351,24 +335,6 @@ func runStressQueryKeysBenchWithMode(b *testing.B, db *DB[uint64, StressBenchUse
 	}
 }
 
-func runStressReadQueryBenchWithMode(b *testing.B, db *DB[uint64, StressBenchUser], q *qx.QX, mode benchCacheMode) {
-	b.Helper()
-	b.ReportAllocs()
-	state := prepareReadBenchWithMode(
-		b,
-		db,
-		q,
-		mode,
-		warmBenchReadQueryOnceStress,
-		runBenchReadQueryOnceStress,
-		buildStressBenchTurnoverRing,
-	)
-	for b.Loop() {
-		state.beforeQuery(b, db)
-		runBenchReadQueryOnceStress(b, db, q)
-	}
-}
-
 func runStressCountBenchCacheModes(b *testing.B, qf func() *qx.QX) {
 	b.Helper()
 	runBenchCacheModes(b, func(b *testing.B, mode benchCacheMode) {
@@ -385,16 +351,8 @@ func runStressQueryKeysBenchCacheModes(b *testing.B, qf func() *qx.QX) {
 	})
 }
 
-func runStressReadQueryBenchCacheModes(b *testing.B, qf func() *qx.QX) {
-	b.Helper()
-	runBenchCacheModes(b, func(b *testing.B, mode benchCacheMode) {
-		db := buildBenchStressDBWithMode(b, benchStressN, mode)
-		runStressReadQueryBenchWithMode(b, db, qf(), mode)
-	})
-}
-
-func Benchmark_Read_Query_Items_Stress_MemberDirectoryPrefix(b *testing.B) {
-	runStressReadQueryBenchCacheModes(b, func() *qx.QX {
+func Benchmark_Query_Index_Keys_Stress_MemberDirectoryPrefix(b *testing.B) {
+	runStressQueryKeysBenchCacheModes(b, func() *qx.QX {
 		return qx.Query(
 			qx.PREFIX("name", "user_"),
 			qx.EQ("status", "active"),
@@ -402,8 +360,8 @@ func Benchmark_Read_Query_Items_Stress_MemberDirectoryPrefix(b *testing.B) {
 	})
 }
 
-func Benchmark_Read_Query_Items_Stress_RecentCountryActive(b *testing.B) {
-	runStressReadQueryBenchCacheModes(b, func() *qx.QX {
+func Benchmark_Query_Index_Keys_Stress_RecentCountryActive(b *testing.B) {
+	runStressQueryKeysBenchCacheModes(b, func() *qx.QX {
 		return qx.Query(
 			qx.EQ("country", "DE"),
 			qx.EQ("status", "active"),
@@ -411,8 +369,8 @@ func Benchmark_Read_Query_Items_Stress_RecentCountryActive(b *testing.B) {
 	})
 }
 
-func Benchmark_Read_Query_Items_Stress_ActiveRegionPro(b *testing.B) {
-	runStressReadQueryBenchCacheModes(b, func() *qx.QX {
+func Benchmark_Query_Index_Keys_Stress_ActiveRegionPro(b *testing.B) {
+	runStressQueryKeysBenchCacheModes(b, func() *qx.QX {
 		return qx.Query(
 			qx.EQ("status", "active"),
 			qx.GTE("last_login", benchStressBaseUnix-72*3600),
@@ -422,8 +380,8 @@ func Benchmark_Read_Query_Items_Stress_ActiveRegionPro(b *testing.B) {
 	})
 }
 
-func Benchmark_Read_Query_Items_Stress_LeaderboardTop(b *testing.B) {
-	runStressReadQueryBenchCacheModes(b, func() *qx.QX {
+func Benchmark_Query_Index_Keys_Stress_LeaderboardTop(b *testing.B) {
+	runStressQueryKeysBenchCacheModes(b, func() *qx.QX {
 		return qx.Query(
 			qx.EQ("status", "active"),
 			qx.GTE("score", 250.0),

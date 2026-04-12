@@ -149,8 +149,8 @@ func (db *DB[K, V]) tryQueryPrefixNoOrderWithLimit(q *qx.QX, trace *queryTrace) 
 	return db.currentQueryViewForTests().tryQueryPrefixNoOrderWithLimit(q, trace)
 }
 
-func (db *DB[K, V]) buildPredicatesOrderedWithMode(leaves []qx.Expr, orderField string, allowMaterialize bool, orderedWindow int, coverOrderRange bool, allowOrderedEagerMaterialize bool) ([]predicate, bool) {
-	preds, ok := db.currentQueryViewForTests().buildPredicatesOrderedWithMode(leaves, orderField, allowMaterialize, orderedWindow, coverOrderRange, allowOrderedEagerMaterialize)
+func (db *DB[K, V]) buildPredicatesOrderedWithMode(leaves []qx.Expr, orderField string, allowMaterialize bool, orderedWindow int, orderedOffset uint64, coverOrderRange bool, allowOrderedEagerMaterialize bool) ([]predicate, bool) {
+	preds, ok := db.currentQueryViewForTests().buildPredicatesOrderedWithMode(leaves, orderField, allowMaterialize, orderedWindow, orderedOffset, coverOrderRange, allowOrderedEagerMaterialize)
 	return detachPredicateSetForTests(preds), ok
 }
 
@@ -167,7 +167,7 @@ func (db *DB[K, V]) buildORBranches(ops []qx.Expr) (plannerORBranches, bool, boo
 }
 
 func (db *DB[K, V]) buildORBranchesOrdered(ops []qx.Expr, orderField string, orderedWindow int) (plannerORBranches, bool, bool) {
-	return db.currentQueryViewForTests().buildORBranchesOrdered(ops, orderField, orderedWindow)
+	return db.currentQueryViewForTests().buildORBranchesOrdered(ops, orderField, orderedWindow, 0)
 }
 
 func (db *DB[K, V]) execPlanORNoOrderAdaptive(q *qx.QX, branches plannerORBranches, trace *queryTrace) ([]K, bool) {

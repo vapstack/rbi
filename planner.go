@@ -643,6 +643,24 @@ func plannerPredicateBucketExactMinCardForChecks(checks int) uint64 {
 	return uint64(threshold)
 }
 
+func plannerHasPreferredExactBucketFilterReader(preds predicateReader, checks []int) bool {
+	for _, pi := range checks {
+		if preds.Get(pi).prefersExactBucketPostingFilter() {
+			return true
+		}
+	}
+	return false
+}
+
+func plannerHasPreferredExactBucketFilterBufReader(preds predicateReader, checks *pooled.SliceBuf[int]) bool {
+	for i := 0; i < checks.Len(); i++ {
+		if preds.Get(checks.Get(i)).prefersExactBucketPostingFilter() {
+			return true
+		}
+	}
+	return false
+}
+
 func plannerFilterCompactPostingByPredicateChecks(
 	preds predicateReader,
 	checks []int,
@@ -764,7 +782,9 @@ func plannerFilterPostingByChecks(
 		return plannerPredicateBucketAll, src, work, card
 	}
 
-	if !allowExact || card <= plannerPredicateBucketExactMinCardForChecks(len(checks)) {
+	smallCard := card <= plannerPredicateBucketExactMinCardForChecks(len(checks))
+	preferExact := smallCard && plannerHasPreferredExactBucketFilterReader(predicateSliceView(preds), checks)
+	if (!allowExact || smallCard) && !preferExact {
 		skipBucket := false
 		fullBucket := true
 		for _, pi := range checks {
@@ -826,7 +846,9 @@ func plannerFilterPostingByPredicateChecks(
 		return plannerPredicateBucketAll, src, work, card
 	}
 
-	if !allowExact || card <= plannerPredicateBucketExactMinCardForChecks(len(checks)) {
+	smallCard := card <= plannerPredicateBucketExactMinCardForChecks(len(checks))
+	preferExact := smallCard && plannerHasPreferredExactBucketFilterReader(preds, checks)
+	if (!allowExact || smallCard) && !preferExact {
 		skipBucket := false
 		fullBucket := true
 		for _, pi := range checks {
@@ -888,7 +910,10 @@ func plannerFilterPostingByPredicateSetChecks(
 		return plannerPredicateBucketAll, src, work, card
 	}
 
-	if !allowExact || card <= plannerPredicateBucketExactMinCardForChecks(len(checks)) {
+	smallCard := card <= plannerPredicateBucketExactMinCardForChecks(len(checks))
+	preferExact := smallCard && plannerHasPreferredExactBucketFilterReader(preds, checks)
+
+	if (!allowExact || smallCard) && !preferExact {
 		skipBucket := false
 		fullBucket := true
 		for _, pi := range checks {
@@ -950,7 +975,10 @@ func plannerFilterPostingByPredicateChecksBuf(
 		return plannerPredicateBucketAll, src, work, card
 	}
 
-	if !allowExact || card <= plannerPredicateBucketExactMinCardForChecks(checks.Len()) {
+	smallCard := card <= plannerPredicateBucketExactMinCardForChecks(checks.Len())
+	preferExact := smallCard && plannerHasPreferredExactBucketFilterBufReader(preds, checks)
+
+	if (!allowExact || smallCard) && !preferExact {
 		skipBucket := false
 		fullBucket := true
 		for i := 0; i < checks.Len(); i++ {
@@ -1721,7 +1749,7 @@ func (qv *queryView[K, V]) tryPlanORMergeMode(q *qx.QX, trace *queryTrace) ([]K,
 		return nil, false, nil
 	}
 	window, _ := orderWindow(q)
-	branches, alwaysFalse, ok := qv.buildORBranchesOrdered(q.Expr.Operands, o.Field, window)
+	branches, alwaysFalse, ok := qv.buildORBranchesOrdered(q.Expr.Operands, o.Field, window, q.Offset)
 	if !ok {
 		return nil, false, nil
 	}
@@ -2271,6 +2299,7 @@ func (qv *queryView[K, V]) buildORBranchesOrdered(
 	ops []qx.Expr,
 	orderField string,
 	orderedWindow int,
+	orderedOffset uint64,
 ) (plannerORBranches, bool, bool) {
 	out := newPlannerORBranches(len(ops))
 	var leavesBuf [8]qx.Expr
@@ -2282,7 +2311,7 @@ func (qv *queryView[K, V]) buildORBranchesOrdered(
 			return plannerORBranches{}, false, false
 		}
 
-		preds, ok := qv.buildPredicatesOrderedWithMode(leaves, orderField, false, orderedWindow, true, true)
+		preds, ok := qv.buildPredicatesOrderedWithMode(leaves, orderField, false, orderedWindow, orderedOffset, true, true)
 		if !ok {
 			out.Release()
 			return plannerORBranches{}, false, false

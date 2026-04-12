@@ -122,6 +122,17 @@ func (p leafPred) supportsExactBucketPostingFilter() bool {
 	}
 }
 
+func (p leafPred) prefersExactBucketPostingFilter() bool {
+	switch p.kind {
+	case leafPredKindPredicate:
+		return p.pred.prefersExactBucketPostingFilter()
+	case leafPredKindPostsConcat, leafPredKindPostsUnion:
+		return p.postsAnyState != nil || p.postingFilter != nil
+	default:
+		return false
+	}
+}
+
 func (p leafPred) supportsPostingApply() bool {
 	switch p.kind {
 	case leafPredKindPredicate:
@@ -780,7 +791,7 @@ func (qv *queryView[K, V]) tryLimitQueryOrderBasic(q *qx.QX, leaves []qx.Expr, t
 		out, _ := qv.scanOrderLimitNoPredicates(q, ov, br, order.Desc, nilTailField, trace)
 		return out, true, nil
 	}
-	fullPredSet, ok := qv.buildPredicatesOrderedWithMode(residualLeaves, f, false, window, false, true)
+	fullPredSet, ok := qv.buildPredicatesOrderedWithMode(residualLeaves, f, false, window, q.Offset, false, true)
 	if !ok {
 		return nil, false, nil
 	}
@@ -832,6 +843,10 @@ func (qv *queryView[K, V]) tryLimitQueryRangeNoOrderByField(q *qx.QX, field stri
 func (qv *queryView[K, V]) buildLeafPredsExcludingBounds(leaves []qx.Expr, field string, orderedWindow int) (*pooled.SliceBuf[leafPred], bool, error) {
 	predsBuf := leafPredSlicePool.Get()
 	predsBuf.Grow(len(leaves))
+	orderedUniverse := uint64(0)
+	if orderedWindow > 0 {
+		orderedUniverse = qv.snapshotUniverseCardinality()
+	}
 	var mergedRangesBuf *pooled.SliceBuf[orderedMergedScalarRangeField]
 	if len(leaves) > 1 {
 		mergedRangesBuf = orderedMergedScalarRangeFieldSlicePool.Get()
@@ -864,6 +879,12 @@ func (qv *queryView[K, V]) buildLeafPredsExcludingBounds(leaves []qx.Expr, field
 						leafPredSlicePool.Put(predsBuf)
 						return nil, false, nil
 					}
+					if orderedUniverse > 0 &&
+						p.kind == leafPredKindPredicate &&
+						p.pred.hasRuntimeRangeState() {
+						orderedRoute := qv.orderedScalarRangeRouting(e, orderedWindow, 0, orderedUniverse)
+						qv.tryMaterializeBroadRangeComplementPredicateForOrdered(&p.pred, orderedRoute.broadComplement, orderedUniverse, orderedWindow)
+					}
 					qv.attachLeafPredPostingFilter(&p)
 					predsBuf.Append(p)
 					continue
@@ -878,6 +899,12 @@ func (qv *queryView[K, V]) buildLeafPredsExcludingBounds(leaves []qx.Expr, field
 		if !ok {
 			leafPredSlicePool.Put(predsBuf)
 			return nil, false, nil
+		}
+		if orderedUniverse > 0 &&
+			p.kind == leafPredKindPredicate &&
+			p.pred.hasRuntimeRangeState() {
+			orderedRoute := qv.orderedScalarRangeRouting(e, orderedWindow, 0, orderedUniverse)
+			qv.tryMaterializeBroadRangeComplementPredicateForOrdered(&p.pred, orderedRoute.broadComplement, orderedUniverse, orderedWindow)
 		}
 		qv.attachLeafPredPostingFilter(&p)
 		predsBuf.Append(p)
@@ -1526,7 +1553,17 @@ func plannerFilterPostingByLeafChecks(
 		return plannerPredicateBucketAll, src, work, card
 	}
 
-	if !allowExact || card <= plannerPredicateBucketExactMinCardForChecks(len(checks)) {
+	smallCard := card <= plannerPredicateBucketExactMinCardForChecks(len(checks))
+	preferExact := false
+	if smallCard {
+		for _, pi := range checks {
+			if preds.Get(pi).prefersExactBucketPostingFilter() {
+				preferExact = true
+				break
+			}
+		}
+	}
+	if (!allowExact || smallCard) && !preferExact {
 		skipBucket := false
 		fullBucket := true
 		for _, pi := range checks {
