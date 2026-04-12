@@ -62,6 +62,40 @@ func (qv *queryView[K, V]) tryExecutionPlan(q *qx.QX, trace *queryTrace) ([]K, b
 	return nil, false, nil
 }
 
+func (qv *queryView[K, V]) tryOrderBasicNoFilterWithLimit(q *qx.QX, trace *queryTrace) ([]K, bool, error) {
+	if len(q.Order) != 1 || q.Limit == 0 || !normalize.IsTrueConst(q.Expr) {
+		return nil, false, nil
+	}
+
+	order := q.Order[0]
+	if order.Type != qx.OrderBasic {
+		return nil, false, nil
+	}
+
+	fm := qv.fields[order.Field]
+	if fm == nil || fm.Slice {
+		return nil, false, nil
+	}
+
+	fullBounds := rangeBounds{has: true}
+	nilTailField := orderNilTailField(fm, order.Field, fullBounds)
+	ov := qv.fieldOverlay(order.Field)
+	if !ov.hasData() && nilTailField == "" {
+		if !qv.hasIndexedField(order.Field) {
+			return nil, false, nil
+		}
+		return nil, true, nil
+	}
+
+	br := ov.rangeForBounds(fullBounds)
+	if overlayRangeEmpty(br) && nilTailField == "" {
+		return nil, true, nil
+	}
+
+	out, _ := qv.scanOrderLimitNoPredicates(q, ov, br, order.Desc, nilTailField, trace)
+	return out, true, nil
+}
+
 func emitAcceptedPostingNoOrder[K ~uint64 | ~string, V any](cursor *queryCursor[K, V], ids posting.List, examined *uint64) bool {
 	if ids.IsEmpty() {
 		return false

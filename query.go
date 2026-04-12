@@ -243,6 +243,13 @@ func (qv *queryView[K, V]) execQuery(q *qx.QX, emitTrace bool, prepared bool) (o
 		return out, err
 	}
 
+	if out, ok, err = qv.tryOrderBasicNoFilterWithLimit(q, trace); ok {
+		if trace != nil {
+			trace.setPlan(PlanLimitOrderBasic)
+		}
+		return out, err
+	}
+
 	// Planner/execution fast-paths are attempted before postingResult fallback because
 	// they can short-circuit large scans when query shape matches known patterns.
 	if !shouldSkipPlannerForArrayOrderShape(q) {
