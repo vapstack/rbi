@@ -535,6 +535,10 @@ func (db *DB[K, V]) submitAutoBatchRequests(reqs *pooled.SliceBuf[*autoBatchRequ
 	}
 
 	db.autoBatcher.enqueue(job)
+	select {
+	case db.autoBatcher.waitNotify <- struct{}{}:
+	default:
+	}
 	if stats {
 		job.enqueuedAt = time.Now().UnixNano()
 		db.autoBatcher.enqueued.Add(1)
@@ -663,10 +667,54 @@ func (db *DB[K, V]) popAutoBatch() []*autoBatchJob[K, V] {
 
 	frontLimit := autoBatchFrontLimit(&db.autoBatcher, db.autoBatcher.maxOps)
 	waitDur := db.autoBatchWaitDurationLocked(frontLimit)
+
 	if waitDur > 0 {
-		db.autoBatcher.mu.Unlock()
 		start := time.Now()
-		time.Sleep(waitDur)
+
+		db.autoBatcher.mu.Unlock()
+
+		if frontLimit > 1 {
+			time.Sleep(waitDur)
+
+		} else {
+			deadline := start.Add(waitDur)
+			timer := db.autoBatcher.waitTimer
+
+			for {
+				remaining := time.Until(deadline)
+				if remaining <= 0 {
+					break
+				}
+				if timer == nil {
+					timer = time.NewTimer(remaining)
+					db.autoBatcher.waitTimer = timer
+				} else {
+					timer.Reset(remaining)
+				}
+
+				select {
+				case <-timer.C:
+				case <-db.autoBatcher.waitNotify:
+				}
+				timer.Stop()
+
+				db.autoBatcher.mu.Lock()
+				if db.autoBatcher.queueLen() == 0 {
+					if stats {
+						db.autoBatcher.coalesceWaits.Add(1)
+						db.autoBatcher.coalesceWaitNanos.Add(uint64(time.Since(start)))
+					}
+					db.autoBatcher.running = false
+					db.autoBatcher.mu.Unlock()
+					return nil
+				}
+				if db.autoBatcher.hotBatchSize > 0 && db.autoBatcher.queueLen() >= db.autoBatcher.hotBatchSize {
+					db.autoBatcher.mu.Unlock()
+					break
+				}
+				db.autoBatcher.mu.Unlock()
+			}
+		}
 		if stats {
 			db.autoBatcher.coalesceWaits.Add(1)
 			db.autoBatcher.coalesceWaitNanos.Add(uint64(time.Since(start)))

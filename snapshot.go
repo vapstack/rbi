@@ -626,7 +626,7 @@ func inheritNumericRangeBucketCache(next, prev *indexSnapshot) {
 	}
 }
 
-func inheritMaterializedPredCache[K ~string | ~uint64, V any](db *DB[K, V], next, prev *indexSnapshot, changedFields []bool) {
+func inheritMaterializedPredCache[K ~string | ~uint64, V any](db *DB[K, V], next, prev *indexSnapshot, changedFields *pooled.SliceBuf[bool]) {
 	if next == nil || prev == nil {
 		return
 	}
@@ -654,7 +654,7 @@ func inheritMaterializedPredCache[K ~string | ~uint64, V any](db *DB[K, V], next
 		}
 		if changedFields != nil {
 			acc, ok := db.indexedFieldByName[f]
-			if !ok || changedFields[acc.ordinal] {
+			if !ok || changedFields.Get(acc.ordinal) {
 				continue
 			}
 		}
@@ -1580,13 +1580,15 @@ func (db *DB[K, V]) buildPreparedSnapshotFromEmptyBaseNoLock(seq uint64, prev *i
 		}
 	}
 	if changedCount > 0 {
-		changed := make([]bool, len(db.indexedFieldAccess))
+		changed := fieldIndexBoolSlicePool.Get()
+		changed.SetLen(len(db.indexedFieldAccess))
 		for i := range fieldStates {
 			if fieldStates[i].changed {
-				changed[i] = true
+				changed.Set(i, true)
 			}
 		}
 		inheritMaterializedPredCache(db, snap, prev, changed)
+		fieldIndexBoolSlicePool.Put(changed)
 	} else {
 		inheritMaterializedPredCache(db, snap, prev, nil)
 	}
@@ -1796,13 +1798,15 @@ func (db *DB[K, V]) buildPreparedSnapshotInsertOnlyNoLock(seq uint64, prev *inde
 	inheritNumericRangeBucketCache(next, prev)
 
 	if changedCount > 0 {
-		changed := make([]bool, len(db.indexedFieldAccess))
+		changed := fieldIndexBoolSlicePool.Get()
+		changed.SetLen(len(db.indexedFieldAccess))
 		for i := 0; i < fieldStates.Len(); i++ {
 			if fieldStates.Get(i).changed {
-				changed[i] = true
+				changed.Set(i, true)
 			}
 		}
 		inheritMaterializedPredCache(db, next, prev, changed)
+		fieldIndexBoolSlicePool.Put(changed)
 	} else {
 		inheritMaterializedPredCache(db, next, prev, nil)
 	}

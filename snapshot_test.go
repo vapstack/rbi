@@ -1657,7 +1657,10 @@ func TestSnapshotExt_InheritMaterializedPredCacheSkipsChangedFieldsAndKeepsOther
 			"email": {ordinal: 1},
 		},
 	}
-	inheritMaterializedPredCache(db, next, prev, []bool{true, false})
+	changed := snapshotTestBoolSlots(map[string]bool{"name": true}, db.indexedFieldByName)
+	defer fieldIndexBoolSlicePool.Put(changed)
+
+	inheritMaterializedPredCache(db, next, prev, changed)
 
 	if _, ok := next.loadMaterializedPred("name\x1f1\x1fa"); ok {
 		t.Fatalf("expected changed-field cache entry to be skipped")

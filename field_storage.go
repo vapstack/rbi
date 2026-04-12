@@ -111,6 +111,8 @@ var fieldIndexBoolSlicePool = pooled.Slices[bool]{
 	Clear: true,
 }
 
+var fieldIndexOrdinalSlicePool = pooled.Slices[int]{}
+
 var fieldIndexChunkDirPagePrefixPool = pooled.Slices[int]{
 	MinCap: fieldIndexDirPageTargetRefs + 1,
 }

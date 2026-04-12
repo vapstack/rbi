@@ -595,6 +595,7 @@ func (db *DB[K, V]) initBatcher() {
 		window:       window,
 		maxOps:       maxOps,
 		maxQ:         maxQueue,
+		waitNotify:   make(chan struct{}, 1),
 		queue:        make([]*autoBatchJob[K, V], capHint),
 		repeatIDPool: pooled.Maps[K, int]{
 			NewCap: 8,
@@ -761,6 +762,8 @@ type autoBatcher[K ~string | ~uint64, V any] struct {
 
 	mu                 sync.Mutex
 	cond               *sync.Cond
+	waitNotify         chan struct{}
+	waitTimer          *time.Timer
 	running            bool
 	queue              []*autoBatchJob[K, V]
 	queueHead          int
