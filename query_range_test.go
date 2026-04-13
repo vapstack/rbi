@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/vapstack/qx"
+	"github.com/vapstack/rbi/internal/posting"
 )
 
 func requireNumericRangeBucketCacheEntry(t *testing.T, snap *indexSnapshot, field string) *numericRangeBucketCacheEntry {
@@ -61,6 +62,36 @@ func numericRangeFullSpanCacheEntryCount(entry *numericRangeBucketCacheEntry) in
 		}
 	}
 	return count
+}
+
+func TestNumericRangeBucketSpanCache_LoadExtendedFullSpan(t *testing.T) {
+	entry := numericRangeBucketCacheEntryPool.Get()
+	defer numericRangeBucketCacheEntryPool.Put(entry)
+	entry.refs.Store(1)
+
+	base := (posting.List{}).BuildAddedMany([]uint64{10, 20, 30, 40})
+	if _, ok := entry.tryStoreFullSpan(4, 10, base); !ok {
+		base.Release()
+		t.Fatalf("expected first full span store to succeed")
+	}
+
+	cachedSuffix, startSuffix, endSuffix, ok := entry.loadExtendedFullSpan(2, 10)
+	if !ok {
+		t.Fatalf("expected suffix extension hit")
+	}
+	if startSuffix != 4 || endSuffix != 10 {
+		t.Fatalf("unexpected suffix extension bounds: got=%d..%d want=4..10", startSuffix, endSuffix)
+	}
+	cachedSuffix.Release()
+
+	cachedPrefix, startPrefix, endPrefix, ok := entry.loadExtendedFullSpan(4, 12)
+	if !ok {
+		t.Fatalf("expected prefix extension hit")
+	}
+	if startPrefix != 4 || endPrefix != 10 {
+		t.Fatalf("unexpected prefix extension bounds: got=%d..%d want=4..10", startPrefix, endPrefix)
+	}
+	cachedPrefix.Release()
 }
 
 func warmNumericRangeBucketEntry(t *testing.T, db *DB[uint64, Rec], expr qx.Expr) (*numericRangeBucketCacheEntry, overlayRange) {
@@ -603,6 +634,87 @@ func TestNumericRangeBucketSpanCache_ReusedFullSpanStillMergesEdgeBuckets(t *tes
 	}
 	if !slices.Equal(got2, want2IDs) {
 		t.Fatalf("expected cached full-span reuse to still merge edge buckets: got=%v want=%v", got2, want2IDs)
+	}
+}
+
+func TestNumericRangeBucketSpanCache_ExtendedSuffixSpanStillMatchesRange(t *testing.T) {
+	db, _ := openTempDBUint64(t)
+
+	seedGeneratedUint64Data(t, db, 20_000, func(i int) *Rec {
+		return &Rec{
+			Name:  fmt.Sprintf("u_%d", i),
+			Age:   i,
+			Score: float64(i),
+		}
+	})
+	if err := db.RebuildIndex(); err != nil {
+		t.Fatalf("RebuildIndex: %v", err)
+	}
+
+	setNumericBucketKnobs(t, db, 128, 1, 1)
+
+	snap := db.getSnapshot()
+	fm := db.fields["age"]
+	if fm == nil {
+		t.Fatalf("expected age field metadata")
+	}
+	ov := db.fieldOverlay("age")
+	if !ov.hasData() {
+		t.Fatalf("expected age overlay data")
+	}
+
+	makeRange := func(v int) overlayRange {
+		t.Helper()
+		key, isSlice, isNil, err := db.exprValueToIdxScalar(qx.Expr{Op: qx.OpGTE, Field: "age", Value: v})
+		if err != nil {
+			t.Fatalf("exprValueToIdxScalar(%d): %v", v, err)
+		}
+		if isSlice || isNil {
+			t.Fatalf("unexpected scalar flags for age: isSlice=%v isNil=%v", isSlice, isNil)
+		}
+		var rb rangeBounds
+		rb.applyLo(key, true)
+		return ov.rangeForBounds(rb)
+	}
+
+	brNarrow := makeRange(2500)
+	outNarrow, ok := db.tryEvalNumericRangeBuckets("age", fm, ov, brNarrow)
+	if !ok {
+		t.Fatalf("expected numeric range bucket path for narrow bound")
+	}
+	outNarrow.release()
+
+	entry := requireNumericRangeBucketCacheEntry(t, snap, "age")
+	startNarrow, endNarrow, ok := entry.idx.fullBucketSpan(brNarrow)
+	if !ok {
+		t.Fatalf("expected full bucket span for narrow bound")
+	}
+
+	brWide := makeRange(2000)
+	startWide, endWide, ok := entry.idx.fullBucketSpan(brWide)
+	if !ok {
+		t.Fatalf("expected full bucket span for wide bound")
+	}
+	if endWide != endNarrow || startWide >= startNarrow {
+		t.Fatalf("expected wider same-end full span: narrow=%d..%d wide=%d..%d", startNarrow, endNarrow, startWide, endWide)
+	}
+
+	outWide, ok := db.tryEvalNumericRangeBuckets("age", fm, ov, brWide)
+	if !ok {
+		t.Fatalf("expected numeric range bucket path for wide bound")
+	}
+	gotWide := bitmapToIDs(t, outWide)
+	outWide.release()
+
+	wantWide, err := db.evalSimple(qx.Expr{Op: qx.OpGTE, Field: "age", Value: 2000})
+	if err != nil {
+		t.Fatalf("evalSimple(wide): %v", err)
+	}
+	wantWideIDs := bitmapToIDs(t, wantWide)
+	wantWide.release()
+
+	if !slices.Equal(gotWide, wantWideIDs) {
+		t.Fatalf("expected extended suffix reuse to match classic path: got=%v want=%v", gotWide, wantWideIDs)
 	}
 }
 

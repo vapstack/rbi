@@ -82,6 +82,38 @@ func openBoltAndNew[K ~string | ~uint64, V any](tb testing.TB, path string, opti
 	return db, raw
 }
 
+func TestQuery_TryQueryEmptyOnSnapshot_SimpleScalarLeaf(t *testing.T) {
+	db, _ := openTempDBUint64(t)
+
+	for i := 1; i <= 8; i++ {
+		if err := db.Set(uint64(i), &Rec{
+			Name:   fmt.Sprintf("u%d", i),
+			Age:    18 + i,
+			Active: i%2 == 0,
+		}); err != nil {
+			t.Fatalf("Set(%d): %v", i, err)
+		}
+	}
+
+	qv := db.currentQueryViewForTests()
+
+	empty, err := qv.tryQueryEmptyOnSnapshot(qx.Query(qx.GT("age", 100)))
+	if err != nil {
+		t.Fatalf("tryQueryEmptyOnSnapshot(no-match): %v", err)
+	}
+	if !empty {
+		t.Fatalf("expected GT(age,100) to be proven empty without tx")
+	}
+
+	empty, err = qv.tryQueryEmptyOnSnapshot(qx.Query(qx.GTE("age", 20)))
+	if err != nil {
+		t.Fatalf("tryQueryEmptyOnSnapshot(hit): %v", err)
+	}
+	if empty {
+		t.Fatalf("did not expect GTE(age,20) hit query to be proven empty")
+	}
+}
+
 func seedData(t *testing.T, db *DB[uint64, Rec], n int) []uint64 {
 	t.Helper()
 

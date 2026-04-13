@@ -131,6 +131,84 @@ func TestUnique_QueryEQ_UsesUniquePlan_AcrossHitMissAndUnsatisfiable(t *testing.
 	}
 }
 
+func TestUnique_QueryEQ_DirectFastPathRequiresNoOrderNoOffset(t *testing.T) {
+	db, _ := openTempDBUint64Unique(t)
+
+	if err := db.Set(1, &UniqueTestRec{Email: "a@x", Code: 1, Opt: nil}); err != nil {
+		t.Fatalf("Set(1): %v", err)
+	}
+	if err := db.Set(2, &UniqueTestRec{Email: "b@x", Code: 2, Opt: nil}); err != nil {
+		t.Fatalf("Set(2): %v", err)
+	}
+	opt := "present"
+	if err := db.Set(3, &UniqueTestRec{Email: "c@x", Code: 3, Opt: &opt}); err != nil {
+		t.Fatalf("Set(3): %v", err)
+	}
+
+	t.Run("offset", func(t *testing.T) {
+		ids, err := db.QueryKeys(qx.Query(qx.EQ("email", "c@x")).Skip(1))
+		if err != nil {
+			t.Fatalf("QueryKeys: %v", err)
+		}
+		if len(ids) != 0 {
+			t.Fatalf("expected empty result after offset, got %v", ids)
+		}
+	})
+
+	t.Run("ordered_nullable_unique", func(t *testing.T) {
+		ids, err := db.QueryKeys(qx.Query(qx.EQ("opt", nil)).By("code", qx.DESC))
+		if err != nil {
+			t.Fatalf("QueryKeys: %v", err)
+		}
+		want := []uint64{2, 1}
+		if !slices.Equal(ids, want) {
+			t.Fatalf("unexpected ordered ids: got=%v want=%v", ids, want)
+		}
+	})
+
+	t.Run("invalid_order_field", func(t *testing.T) {
+		if _, err := db.QueryKeys(qx.Query(qx.EQ("email", "c@x")).By("missing", qx.ASC)); err == nil {
+			t.Fatalf("expected QueryKeys to fail for unknown order field")
+		}
+	})
+}
+
+func TestUnique_QueryEQ_NullLimit_TraceCountsOnlyEmittedRows(t *testing.T) {
+	var events []TraceEvent
+	opts := Options{
+		TraceSink: func(ev TraceEvent) {
+			events = append(events, ev)
+		},
+		TraceSampleEvery: 1,
+	}
+	db, _ := openTempDBUint64Unique(t, opts)
+
+	if err := db.Set(1, &UniqueTestRec{Email: "a@x", Code: 1, Opt: nil}); err != nil {
+		t.Fatalf("Set(1): %v", err)
+	}
+	if err := db.Set(2, &UniqueTestRec{Email: "b@x", Code: 2, Opt: nil}); err != nil {
+		t.Fatalf("Set(2): %v", err)
+	}
+
+	ids, err := db.QueryKeys(qx.Query(qx.EQ("opt", nil)).Max(1))
+	if err != nil {
+		t.Fatalf("QueryKeys: %v", err)
+	}
+	if len(ids) != 1 {
+		t.Fatalf("expected one id, got %v", ids)
+	}
+	if len(events) == 0 {
+		t.Fatalf("expected trace event")
+	}
+	last := events[len(events)-1]
+	if last.Plan != string(PlanUniqueEq) {
+		t.Fatalf("expected plan %q, got %q", PlanUniqueEq, last.Plan)
+	}
+	if last.RowsExamined != 1 {
+		t.Fatalf("expected RowsExamined=1, got trace=%+v", last)
+	}
+}
+
 func TestUnique_Count_WithUniqueAnchor(t *testing.T) {
 	db, _ := openTempDBUint64Unique(t)
 

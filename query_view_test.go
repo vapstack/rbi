@@ -255,6 +255,10 @@ func (db *DB[K, V]) shouldPreferExecutionNoOrderPrefix(q *qx.QX, leaves []qx.Exp
 	return db.currentQueryViewForTests().shouldPreferExecutionNoOrderPrefix(q, leaves)
 }
 
+func (db *DB[K, V]) shouldPreferExecutionPlan(q *qx.QX) bool {
+	return db.currentQueryViewForTests().shouldPreferExecutionPlan(q, nil)
+}
+
 func (db *DB[K, V]) shouldPreferOROrderFallbackFirst(q *qx.QX, branches plannerORBranches) bool {
 	return db.currentQueryViewForTests().shouldPreferOROrderFallbackFirst(q, branches)
 }

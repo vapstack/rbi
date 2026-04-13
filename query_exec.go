@@ -96,22 +96,69 @@ func (qv *queryView[K, V]) tryOrderBasicNoFilterWithLimit(q *qx.QX, trace *query
 	return out, true, nil
 }
 
+func (qv *queryView[K, V]) tryNoFilterNoOrderWithLimit(q *qx.QX, trace *queryTrace) ([]K, bool, error) {
+	if q.Limit == 0 || q.Offset != 0 || len(q.Order) != 0 || !normalize.IsTrueConst(q.Expr) {
+		return nil, false, nil
+	}
+
+	universe := qv.snapshotUniverseView()
+	if universe.IsEmpty() {
+		if trace != nil {
+			trace.addExamined(0)
+			trace.setEarlyStopReason("input_exhausted")
+		}
+		return nil, true, nil
+	}
+
+	card := universe.Cardinality()
+	outCap := q.Limit
+	if outCap > card {
+		outCap = card
+	}
+	out := make([]K, 0, clampUint64ToInt(outCap))
+	cursor := qv.newQueryCursor(out, 0, q.Limit, false, 0)
+	var examined uint64
+	var examinedPtr *uint64
+	if trace != nil {
+		examinedPtr = &examined
+	}
+	stopped := emitAcceptedPostingNoOrder(&cursor, universe, examinedPtr)
+	if trace != nil {
+		trace.addExamined(examined)
+		if stopped {
+			trace.setEarlyStopReason("limit_reached")
+		} else {
+			trace.setEarlyStopReason("input_exhausted")
+		}
+	}
+	return cursor.out, true, nil
+}
+
 func emitAcceptedPostingNoOrder[K ~uint64 | ~string, V any](cursor *queryCursor[K, V], ids posting.List, examined *uint64) bool {
 	if ids.IsEmpty() {
 		return false
 	}
-	card := ids.Cardinality()
-	*examined += card
-	if cursor.skip >= card {
-		cursor.skip -= card
-		return false
+	addExamined := func(n uint64) {
+		if examined != nil {
+			*examined += n
+		}
+	}
+	if cursor.skip > 0 {
+		card := ids.Cardinality()
+		if cursor.skip >= card {
+			addExamined(card)
+			cursor.skip -= card
+			return false
+		}
 	}
 	if idx, ok := ids.TrySingle(); ok {
+		addExamined(1)
 		return cursor.emit(idx)
 	}
 	it := ids.Iter()
 	defer it.Release()
 	for it.HasNext() {
+		addExamined(1)
 		if cursor.emit(it.Next()) {
 			return true
 		}
@@ -2549,11 +2596,6 @@ func (qv *queryView[K, V]) tryQueryRangeNoOrderWithLimit(q *qx.QX, trace *queryT
 		return nil, false, nil
 	}
 
-	ov := qv.fieldOverlay(f)
-	if !ov.hasData() {
-		return nil, true, nil
-	}
-
 	isNil := false
 	rb := rangeBounds{has: true}
 	if e.Op == qx.OpEQ {
@@ -2565,6 +2607,33 @@ func (qv *queryView[K, V]) tryQueryRangeNoOrderWithLimit(q *qx.QX, trace *queryT
 			return nil, false, nil
 		}
 		isNil = eqNil
+		if isNil {
+			ids := qv.nilFieldOverlay(f).lookupPostingRetained(nilIndexEntryKey)
+			if ids.IsEmpty() {
+				return nil, true, nil
+			}
+			skip := q.Offset
+			need := q.Limit
+			out := make([]K, 0, need)
+			cursor := qv.newQueryCursor(out, skip, need, false, 0)
+			var examined uint64
+			var examinedPtr *uint64
+			if trace != nil {
+				examinedPtr = &examined
+			}
+			if emitAcceptedPostingNoOrder(&cursor, ids, examinedPtr) {
+				if trace != nil {
+					trace.addExamined(examined)
+					trace.setEarlyStopReason("limit_reached")
+				}
+				return cursor.out, true, nil
+			}
+			if trace != nil {
+				trace.addExamined(examined)
+				trace.setEarlyStopReason("input_exhausted")
+			}
+			return cursor.out, true, nil
+		}
 		rb.applyLo(key, true)
 		rb.applyHi(key, true)
 	} else {
@@ -2578,6 +2647,11 @@ func (qv *queryView[K, V]) tryQueryRangeNoOrderWithLimit(q *qx.QX, trace *queryT
 		rb = nextRB
 	}
 
+	ov := qv.fieldOverlay(f)
+	if !ov.hasData() {
+		return nil, true, nil
+	}
+
 	br := ov.rangeForBounds(rb)
 	if overlayRangeEmpty(br) {
 		return nil, true, nil
@@ -2586,32 +2660,15 @@ func (qv *queryView[K, V]) tryQueryRangeNoOrderWithLimit(q *qx.QX, trace *queryT
 	skip := q.Offset
 	need := q.Limit
 
-	if isNil {
-		if e.Op != qx.OpEQ {
-			return nil, true, nil
-		}
-		ids := qv.nilFieldOverlay(f).lookupPostingRetained(nilIndexEntryKey)
-		if ids.IsEmpty() {
-			return nil, true, nil
-		}
-		out := make([]K, 0, need)
-		cursor := qv.newQueryCursor(out, skip, need, false, 0)
-		var examined uint64
-		if emitAcceptedPostingNoOrder(&cursor, ids, &examined) {
-			trace.addExamined(examined)
-			trace.setEarlyStopReason("limit_reached")
-			return cursor.out, true, nil
-		}
-		trace.addExamined(examined)
-		trace.setEarlyStopReason("input_exhausted")
-		return cursor.out, true, nil
-	}
-
 	out := make([]K, 0, need)
 	cursor := qv.newQueryCursor(out, skip, need, false, 0)
 
 	keyCur := ov.newCursor(br, false)
 	var examined uint64
+	var examinedPtr *uint64
+	if trace != nil {
+		examinedPtr = &examined
+	}
 	for {
 		_, ids, ok := keyCur.next()
 		if !ok {
@@ -2620,15 +2677,19 @@ func (qv *queryView[K, V]) tryQueryRangeNoOrderWithLimit(q *qx.QX, trace *queryT
 		if ids.IsEmpty() {
 			continue
 		}
-		if emitAcceptedPostingNoOrder(&cursor, ids, &examined) {
-			trace.addExamined(examined)
-			trace.setEarlyStopReason("limit_reached")
+		if emitAcceptedPostingNoOrder(&cursor, ids, examinedPtr) {
+			if trace != nil {
+				trace.addExamined(examined)
+				trace.setEarlyStopReason("limit_reached")
+			}
 			return cursor.out, true, nil
 		}
 	}
 
-	trace.addExamined(examined)
-	trace.setEarlyStopReason("input_exhausted")
+	if trace != nil {
+		trace.addExamined(examined)
+		trace.setEarlyStopReason("input_exhausted")
+	}
 	return cursor.out, true, nil
 }
 
@@ -2676,6 +2737,10 @@ func (qv *queryView[K, V]) tryQueryPrefixNoOrderWithLimit(q *qx.QX, trace *query
 
 	keyCur := prefixState.ov.newCursor(prefixState.br, false)
 	var examined uint64
+	var examinedPtr *uint64
+	if trace != nil {
+		examinedPtr = &examined
+	}
 	for {
 		_, ids, ok := keyCur.next()
 		if !ok {
@@ -2684,14 +2749,18 @@ func (qv *queryView[K, V]) tryQueryPrefixNoOrderWithLimit(q *qx.QX, trace *query
 		if ids.IsEmpty() {
 			continue
 		}
-		if emitAcceptedPostingNoOrder(&cursor, ids, &examined) {
-			trace.addExamined(examined)
-			trace.setEarlyStopReason("limit_reached")
+		if emitAcceptedPostingNoOrder(&cursor, ids, examinedPtr) {
+			if trace != nil {
+				trace.addExamined(examined)
+				trace.setEarlyStopReason("limit_reached")
+			}
 			return cursor.out, true, nil
 		}
 	}
 
-	trace.addExamined(examined)
-	trace.setEarlyStopReason("input_exhausted")
+	if trace != nil {
+		trace.addExamined(examined)
+		trace.setEarlyStopReason("input_exhausted")
+	}
 	return cursor.out, true, nil
 }

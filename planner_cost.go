@@ -1152,6 +1152,16 @@ func (qv *queryView[K, V]) shouldPreferExecutionPlan(q *qx.QX, trace *queryTrace
 		return false
 	}
 
+	if q.Offset == 0 && len(q.Order) == 1 && q.Order[0].Type == qx.OrderBasic && len(leaves) == 1 {
+		e := leaves[0]
+		if !e.Not && e.Field != "" && e.Field != q.Order[0].Field && len(e.Operands) == 0 {
+			switch e.Op {
+			case qx.OpEQ, qx.OpIN, qx.OpHAS, qx.OpHASANY:
+				return false
+			}
+		}
+	}
+
 	execDecision := qv.decideExecutionOrderByCost(q, leaves)
 	if !execDecision.use {
 		return false

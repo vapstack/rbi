@@ -545,6 +545,10 @@ func (qv *queryView[K, V]) tryUniqueEqNoOrder(q *qx.QX, trace *queryTrace) ([]K,
 		return nil, false, nil
 	}
 
+	if out, ok, err := qv.tryDirectSingleUniqueEqNoOrder(q, trace); ok || err != nil {
+		return out, ok, err
+	}
+
 	var leavesBuf [8]qx.Expr
 	leaves, ok := extractAndLeavesScratch(q.Expr, leavesBuf[:0])
 	if !ok || len(leaves) == 0 {
@@ -646,6 +650,83 @@ func (qv *queryView[K, V]) tryUniqueEqNoOrder(q *qx.QX, trace *queryTrace) ([]K,
 	if trace != nil {
 		trace.addExamined(examined)
 		trace.setEarlyStopReason("input_exhausted")
+	}
+	return cursor.out, true, nil
+}
+
+func (qv *queryView[K, V]) tryDirectSingleUniqueEqNoOrder(q *qx.QX, trace *queryTrace) ([]K, bool, error) {
+	if q == nil || q.Offset != 0 || len(q.Order) != 0 {
+		return nil, false, nil
+	}
+	e := q.Expr
+	if e.Not || e.Op != qx.OpEQ || e.Field == "" || len(e.Operands) != 0 {
+		return nil, false, nil
+	}
+	if !qv.isPositiveUniqueEqExpr(e) {
+		return nil, false, nil
+	}
+
+	key, isSlice, isNil, err := qv.exprValueToIdxScalar(e)
+	if err != nil {
+		return nil, true, err
+	}
+	if isSlice {
+		return nil, false, nil
+	}
+
+	var ids posting.List
+	if isNil {
+		ids = qv.nilFieldOverlay(e.Field).lookupPostingRetained(nilIndexEntryKey)
+	} else {
+		ids = qv.fieldOverlay(e.Field).lookupPostingRetained(key)
+	}
+	if ids.IsEmpty() {
+		if trace != nil {
+			trace.setPlan(PlanUniqueEq)
+			trace.addExamined(0)
+			trace.setEarlyStopReason("input_exhausted")
+		}
+		return nil, true, nil
+	}
+	defer ids.Release()
+
+	if trace != nil {
+		trace.setPlan(PlanUniqueEq)
+	}
+	if idx, ok := ids.TrySingle(); ok {
+		out := make([]K, 1)
+		out[0] = qv.idFromIdxNoLock(idx)
+		if trace != nil {
+			trace.addExamined(1)
+			if q.Limit == 1 {
+				trace.setEarlyStopReason("limit_reached")
+			} else {
+				trace.setEarlyStopReason("input_exhausted")
+			}
+		}
+		return out, true, nil
+	}
+
+	needAll := q.Limit == 0
+	capOut := clampUint64ToInt(q.Limit)
+	if needAll {
+		capOut = clampUint64ToInt(ids.Cardinality())
+	}
+	out := make([]K, 0, capOut)
+	cursor := qv.newQueryCursor(out, 0, q.Limit, needAll, 0)
+	var examined uint64
+	var examinedPtr *uint64
+	if trace != nil {
+		examinedPtr = &examined
+	}
+	stopped := emitAcceptedPostingNoOrder(&cursor, ids, examinedPtr)
+	if trace != nil {
+		trace.addExamined(examined)
+		if stopped {
+			trace.setEarlyStopReason("limit_reached")
+		} else {
+			trace.setEarlyStopReason("input_exhausted")
+		}
 	}
 	return cursor.out, true, nil
 }

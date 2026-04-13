@@ -590,9 +590,11 @@ func Benchmark_Query_Index_Keys_Realistic_Exclusion_All(b *testing.B) {
 }
 
 func Benchmark_Query_Index_Keys_Realistic_Autocomplete_Prefix_Limit(b *testing.B) {
-	runQueryKeysBenchCacheModes(b, func() *qx.QX {
-		return qx.Query(qx.PREFIX("email", "user10")).Max(10)
-	})
+	// This prefix-only microbenchmark is sensitive to cache-mode turnover
+	// overhead; keep it single-mode so Cold rotation does not dominate runtime.
+	db := buildBenchDB(b, benchN)
+	q := qx.Query(qx.PREFIX("email", "user10")).Max(10)
+	runQueryKeysBench(b, db, q)
 }
 
 func Benchmark_Query_Index_Keys_Realistic_Autocomplete_Order_Limit(b *testing.B) {
@@ -740,9 +742,11 @@ func Benchmark_Read_Query_Items_HeavyFetch(b *testing.B) {
 }
 
 func Benchmark_Read_Query_Items_GT_NoMatch(b *testing.B) {
-	runReadQueryBenchCacheModes(b, func() *qx.QX {
-		return qx.Query(qx.GT("age", 100))
-	})
+	// This no-match read microbenchmark mostly measures fixed query overhead;
+	// Cold cache rotation stretches runtime without adding much signal.
+	db := buildBenchDB(b, benchN)
+	q := qx.Query(qx.GT("age", 100))
+	runReadQueryBench(b, db, q)
 }
 
 func Benchmark_Write_Helper_MakePatch(b *testing.B) {

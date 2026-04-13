@@ -1384,6 +1384,71 @@ func TestBuildPredicateWithMode_RuntimeExactUnionPromotesOnSecondMaterialize(t *
 	})
 }
 
+func TestBuildPredicateWithMode_HasPromotesOnSecondBuild(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{
+		AnalyzeInterval:                         -1,
+		SnapshotMaterializedPredCacheMaxEntries: 16,
+	})
+
+	seedGeneratedUint64Data(t, db, 20_000, func(i int) *Rec {
+		return &Rec{
+			Name:   fmt.Sprintf("u_%d", i),
+			Email:  fmt.Sprintf("user%05d@example.com", i),
+			Age:    18 + (i % 60),
+			Score:  float64(i),
+			Active: i%2 == 0,
+			Tags: [...][]string{
+				{"go", "db"},
+				{"db", "ops"},
+				{"go", "perf"},
+				{"security"},
+			}[i%4],
+		}
+	})
+	if err := db.RebuildIndex(); err != nil {
+		t.Fatalf("RebuildIndex: %v", err)
+	}
+
+	vals := stringSlicePool.Get()
+	vals.Append("db")
+	vals.Append("go")
+	cacheKey := materializedPredKeyForDistinctSetTerms("tags", qx.OpHAS, vals, false)
+	stringSlicePool.Put(vals)
+
+	expr := qx.Expr{Op: qx.OpHAS, Field: "tags", Value: []string{"go", "db"}}
+
+	first, ok := db.buildPredicateWithMode(expr, false)
+	if !ok {
+		t.Fatalf("expected first predicate build to succeed")
+	}
+	if first.kind != predicateKindPostsAll {
+		releasePredicates([]predicate{first})
+		t.Fatalf("expected first predicate to stay posts-all, got kind=%v", first.kind)
+	}
+	releasePredicates([]predicate{first})
+
+	second, ok := db.buildPredicateWithMode(expr, false)
+	if !ok {
+		t.Fatalf("expected second predicate build to succeed")
+	}
+	defer releasePredicates([]predicate{second})
+	if second.kind != predicateKindMaterialized {
+		t.Fatalf("expected second predicate to materialize, got kind=%v", second.kind)
+	}
+	if second.ids.IsEmpty() {
+		t.Fatalf("expected second predicate to hold materialized ids")
+	}
+
+	cached, ok := db.getSnapshot().loadMaterializedPredKey(cacheKey)
+	if !ok || cached.IsEmpty() {
+		t.Fatalf("expected shared HAS cache entry after second build")
+	}
+	defer cached.Release()
+	if !second.ids.SharesPayload(cached) {
+		t.Fatalf("expected second predicate ids to use shared cache payload")
+	}
+}
+
 func TestOverlayRangeStats_ChunkedMatchesCursorScanOnLargeUniqueRange(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
 	seedGeneratedUint64Data(t, db, 16_000, func(i int) *Rec {

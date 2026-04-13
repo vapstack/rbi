@@ -8,8 +8,6 @@ import (
 	"github.com/vapstack/rbi/internal/pooled"
 )
 
-var materializedPredSetKeyBufPool pooled.Buffers
-
 type materializedPredKeyKind uint8
 
 const (
@@ -74,8 +72,6 @@ func (key materializedPredKey) String() string {
 	case materializedPredKeyOpaque:
 		return key.raw
 	case materializedPredKeyDistinctSet:
-		// buf := materializedPredSetKeyBufPool.Get()
-		// defer materializedPredSetKeyBufPool.Put(buf)
 
 		var buf strings.Builder
 

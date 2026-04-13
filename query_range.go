@@ -77,6 +77,10 @@ func numericRangeFullSpanCacheKey(start, end int) uint64 {
 	return uint64(uint32(start))<<32 | uint64(uint32(end))
 }
 
+func numericRangeFullSpanCacheBounds(key uint64) (int, int) {
+	return int(uint32(key >> 32)), int(uint32(key))
+}
+
 func (c *numericRangeBucketCache) init(fieldCount int) {
 	if c.slots == nil {
 		c.slots = numericRangeBucketCacheSlotPool.Get()
@@ -221,6 +225,50 @@ func (e *numericRangeBucketCacheEntry) loadFullSpan(start, end int) (posting.Lis
 		return slot.ids.Borrow(), true
 	}
 	return posting.List{}, false
+}
+
+func (e *numericRangeBucketCacheEntry) loadExtendedFullSpan(start, end int) (posting.List, int, int, bool) {
+	if e == nil {
+		return posting.List{}, 0, 0, false
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	bestIdx := -1
+	bestBuckets := 0
+	bestStart := 0
+	bestEnd := 0
+	for i := range e.fullSpanCache {
+		slot := &e.fullSpanCache[i]
+		if !slot.used || slot.ids.IsEmpty() {
+			continue
+		}
+		slotStart, slotEnd := numericRangeFullSpanCacheBounds(slot.key)
+		switch {
+		case slotStart == start && slotEnd < end:
+			buckets := slotEnd - slotStart + 1
+			if bestIdx < 0 || buckets > bestBuckets {
+				bestIdx = i
+				bestBuckets = buckets
+				bestStart = slotStart
+				bestEnd = slotEnd
+			}
+		case slotEnd == end && slotStart > start:
+			buckets := slotEnd - slotStart + 1
+			if bestIdx < 0 || buckets > bestBuckets {
+				bestIdx = i
+				bestBuckets = buckets
+				bestStart = slotStart
+				bestEnd = slotEnd
+			}
+		}
+	}
+	if bestIdx < 0 {
+		return posting.List{}, 0, 0, false
+	}
+	e.fullSpanClock++
+	e.fullSpanCache[bestIdx].stamp = e.fullSpanClock
+	return e.fullSpanCache[bestIdx].ids.Borrow(), bestStart, bestEnd, true
 }
 
 func (e *numericRangeBucketCacheEntry) tryStoreFullSpan(start, end int, ids posting.List) (posting.List, bool) {
@@ -579,7 +627,25 @@ func (qv *queryView[K, V]) tryEvalNumericRangeBuckets(field string, fm *field, o
 		}
 	}
 	if res.IsEmpty() {
-		res = mergeOverlayRangeInto(res, ov, ov.rangeByRanks(idx.bucketStart(startFull), idx.bucketEnd(endFull)))
+		if cached, cachedStart, cachedEnd, ok := entry.loadExtendedFullSpan(startFull, endFull); ok {
+			res = cached
+			switch {
+			case cachedStart == startFull && cachedEnd < endFull:
+				res = mergeOverlayRangeInto(
+					res,
+					ov,
+					ov.rangeByRanks(idx.bucketStart(cachedEnd+1), idx.bucketEnd(endFull)),
+				)
+			case cachedEnd == endFull && cachedStart > startFull:
+				res = mergeOverlayRangeInto(
+					res,
+					ov,
+					ov.rangeByRanks(idx.bucketStart(startFull), idx.bucketStart(cachedStart)),
+				)
+			}
+		} else {
+			res = mergeOverlayRangeInto(res, ov, ov.rangeByRanks(idx.bucketStart(startFull), idx.bucketEnd(endFull)))
+		}
 		res, _ = entry.tryStoreFullSpan(startFull, endFull, res)
 	}
 

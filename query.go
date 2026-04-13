@@ -37,6 +37,62 @@ func (db *DB[K, V]) Query(q *qx.QX) ([]*V, error) {
 	return db.queryRecords(tx, snap, q)
 }
 
+func (qv *queryView[K, V]) tryQueryEmptyOnSnapshot(q *qx.QX) (bool, error) {
+	if q == nil || q.Offset != 0 || q.Limit != 0 || len(q.Order) != 0 {
+		return false, nil
+	}
+
+	e := q.Expr
+	if e.Not || e.Field == "" || len(e.Operands) != 0 {
+		return false, nil
+	}
+
+	switch e.Op {
+	case qx.OpEQ:
+		fm := qv.fields[e.Field]
+		if fm == nil || fm.Slice {
+			return false, nil
+		}
+		key, isSlice, isNil, err := qv.exprValueToIdxScalar(e)
+		if err != nil {
+			return false, err
+		}
+		if isSlice {
+			return false, nil
+		}
+		if isNil {
+			return qv.nilFieldOverlay(e.Field).lookupCardinality(nilIndexEntryKey) == 0, nil
+		}
+		return qv.fieldOverlay(e.Field).lookupCardinality(key) == 0, nil
+
+	case qx.OpGT, qx.OpGTE, qx.OpLT, qx.OpLTE, qx.OpPREFIX:
+		fm := qv.fields[e.Field]
+		if fm == nil || fm.Slice {
+			return false, nil
+		}
+		bound, isSlice, err := qv.exprValueToNormalizedScalarBound(e)
+		if err != nil {
+			return false, err
+		}
+		if isSlice {
+			return false, nil
+		}
+		var bounds rangeBounds
+		bounds.has = true
+		applyNormalizedScalarBound(&bounds, bound)
+		if bounds.empty {
+			return true, nil
+		}
+		ov := qv.fieldOverlay(e.Field)
+		if !ov.hasData() {
+			return true, nil
+		}
+		return overlayRangeEmpty(ov.rangeForBounds(bounds)), nil
+	}
+
+	return false, nil
+}
+
 func (db *DB[K, V]) beginQueryTxSnapshot() (*bbolt.Tx, *indexSnapshot, uint64, *snapshotRef, error) {
 	// Hold the registry read lock across Begin(false) -> Sequence() -> pin so a
 	// writer cannot publish/retire away the exact snapshot needed by this read tx
@@ -74,6 +130,12 @@ func (db *DB[K, V]) beginQueryTxSnapshot() (*bbolt.Tx, *indexSnapshot, uint64, *
 func (db *DB[K, V]) queryRecords(tx *bbolt.Tx, snap *indexSnapshot, q *qx.QX) ([]*V, error) {
 	view := db.makeQueryView(snap)
 	defer db.releaseQueryView(view)
+
+	if !db.traceOrCalibrationSamplingEnabled() {
+		if empty, err := view.tryQueryEmptyOnSnapshot(q); empty || err != nil {
+			return nil, err
+		}
+	}
 
 	ids, err := view.execQuery(q, true, false)
 	if err != nil {
@@ -248,6 +310,25 @@ func (qv *queryView[K, V]) execPreparedQuery(q *qx.QX) ([]K, error) {
 // The method keeps all routing decisions in one place so fast-path/planner
 // selection remains consistent across QueryKeys and Query callers.
 func (qv *queryView[K, V]) execQuery(q *qx.QX, emitTrace bool, prepared bool) (out []K, err error) {
+	traceEnabled := emitTrace && qv.root.traceOrCalibrationSamplingEnabled()
+
+	if !prepared && !traceEnabled {
+		if out, ok, fastErr := qv.tryDirectSingleUniqueEqNoOrder(q, nil); ok {
+			return out, fastErr
+		}
+		if out, ok, fastErr := qv.tryNoFilterNoOrderWithLimit(q, nil); ok {
+			return out, fastErr
+		}
+		if out, ok, fastErr := qv.tryOrderBasicNoFilterWithLimit(q, nil); ok {
+			return out, fastErr
+		}
+		if out, ok, fastErr := qv.tryQueryPrefixNoOrderWithLimit(q, nil); ok {
+			return out, fastErr
+		}
+		if out, ok, fastErr := qv.tryQueryRangeNoOrderWithLimit(q, nil); ok {
+			return out, fastErr
+		}
+	}
 
 	// Normalization is intentionally skipped for pre-normalized internal calls
 	// to avoid duplicate AST rewrites in hot paths.
@@ -256,7 +337,7 @@ func (qv *queryView[K, V]) execQuery(q *qx.QX, emitTrace bool, prepared bool) (o
 	}
 
 	var trace *queryTrace
-	if emitTrace && qv.root.traceOrCalibrationSamplingEnabled() {
+	if traceEnabled {
 		trace = qv.root.beginTrace(q)
 		if trace != nil {
 			defer finishQueryTrace[K, V](trace, &out, &err)
@@ -272,6 +353,13 @@ func (qv *queryView[K, V]) execQuery(q *qx.QX, emitTrace bool, prepared bool) (o
 	var ok bool
 
 	if out, ok, err = qv.tryUniqueEqNoOrder(q, trace); ok {
+		return out, err
+	}
+
+	if out, ok, err = qv.tryNoFilterNoOrderWithLimit(q, trace); ok {
+		if trace != nil {
+			trace.setPlan(PlanLimit)
+		}
 		return out, err
 	}
 

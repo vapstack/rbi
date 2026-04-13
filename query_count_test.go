@@ -90,6 +90,39 @@ func countByExprBitmapCountORBench(t *testing.T, db *DB[uint64, countORBenchRec]
 	return db.countPostingResult(b)
 }
 
+func TestCount_SimpleScalarLeaf_TraceUsesScalarLookupPlan(t *testing.T) {
+	var events []TraceEvent
+	opts := Options{
+		TraceSink: func(ev TraceEvent) {
+			events = append(events, ev)
+		},
+		TraceSampleEvery: 1,
+	}
+	db, _ := openTempDBUint64(t, opts)
+
+	if err := db.Set(1, &Rec{Name: "a", Age: 20, Meta: Meta{Country: "NL"}}); err != nil {
+		t.Fatalf("Set(1): %v", err)
+	}
+	if err := db.Set(2, &Rec{Name: "b", Age: 30, Meta: Meta{Country: "DE"}}); err != nil {
+		t.Fatalf("Set(2): %v", err)
+	}
+
+	got, err := db.Count(qx.Query(qx.EQ("country", "NL")))
+	if err != nil {
+		t.Fatalf("Count: %v", err)
+	}
+	if got != 1 {
+		t.Fatalf("expected count=1, got %d", got)
+	}
+	if len(events) == 0 {
+		t.Fatalf("expected trace event")
+	}
+	last := events[len(events)-1]
+	if last.Plan != string(PlanCountScalarLookup) {
+		t.Fatalf("expected plan %q, got %q", PlanCountScalarLookup, last.Plan)
+	}
+}
+
 func expectPredicateExactPostingFilterCount(t *testing.T, p predicate, src posting.List, want uint64) {
 	t.Helper()
 
@@ -1532,6 +1565,42 @@ func TestCountORSeenStrategy_Adaptive(t *testing.T) {
 	defer seenLarge.release()
 	if seenLarge.mode != countORSeenModePosting {
 		t.Fatalf("expected posting seen set for large adaptive cap, got mode=%d", seenLarge.mode)
+	}
+}
+
+func TestCountORSeen_AddPostingOwned_PostingModeDedups(t *testing.T) {
+	makePosting := func(ids ...uint64) posting.List {
+		return (posting.List{}).BuildAddedMany(ids)
+	}
+
+	seen := countORSeen{mode: countORSeenModePosting}
+	defer seen.release()
+
+	if added := seen.addPostingOwned(makePosting(1, 2, 3)); added != 3 {
+		t.Fatalf("unexpected added count after first posting: got=%d want=3", added)
+	}
+	if added := seen.addPostingOwned(makePosting(3, 4)); added != 1 {
+		t.Fatalf("unexpected added count after second posting: got=%d want=1", added)
+	}
+	if added := seen.addPostingOwned(makePosting(4, 5)); added != 1 {
+		t.Fatalf("unexpected added count after third posting: got=%d want=1", added)
+	}
+	for _, id := range []uint64{1, 2, 3, 4, 5} {
+		if !seen.ids.Contains(id) {
+			t.Fatalf("expected seen posting to contain %d", id)
+		}
+	}
+
+	if added := seen.addPostingOwned(makePosting(2, 6)); added != 1 {
+		t.Fatalf("unexpected added count after fourth posting: got=%d want=1", added)
+	}
+	if added := seen.addPostingOwned(makePosting(6, 7)); added != 1 {
+		t.Fatalf("unexpected added count after fifth posting: got=%d want=1", added)
+	}
+	for _, id := range []uint64{1, 2, 3, 4, 5, 6, 7} {
+		if !seen.ids.Contains(id) {
+			t.Fatalf("expected seen posting to contain %d after incremental adds", id)
+		}
 	}
 }
 

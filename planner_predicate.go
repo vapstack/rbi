@@ -1188,6 +1188,64 @@ func (qv *queryView[K, V]) buildPredHasCandidate(e qx.Expr, fm *field, ov fieldO
 		return predicate{}, false
 	}
 
+	raw := e
+	raw.Not = false
+	cacheKey := materializedPredKey{}
+	if qv.snap != nil && qv.snap.matPredCacheMaxEntries > 0 {
+		cacheKey = materializedPredKeyForDistinctSetTerms(raw.Field, raw.Op, valsBuf, false)
+		if !cacheKey.isZero() {
+			if cached, ok := qv.snap.loadMaterializedPredKey(cacheKey); ok {
+				if e.Not {
+					return predicate{
+						expr: e,
+						kind: predicateKindMaterializedNot,
+						ids:  cached,
+					}, true
+				}
+				return predicate{
+					expr:     e,
+					kind:     predicateKindMaterialized,
+					iterKind: predicateIterMaterialized,
+					ids:      cached,
+					estCard:  cached.Cardinality(),
+				}, true
+			}
+			if qv.snap.shouldPromoteRuntimeMaterializedPredKey(cacheKey) {
+				ids := qv.evalLazyMaterializedPredicateWithKey(raw, cacheKey)
+				if ids.IsEmpty() {
+					if e.Not {
+						return predicate{expr: e, alwaysTrue: true}, true
+					}
+					return predicate{expr: e, alwaysFalse: true}, true
+				}
+				releaseIDs := true
+				if cached, ok := qv.snap.loadMaterializedPredKey(cacheKey); ok {
+					if !ids.SharesPayload(cached) {
+						ids.Release()
+					}
+					ids = cached
+					releaseIDs = false
+				}
+				if e.Not {
+					return predicate{
+						expr:       e,
+						kind:       predicateKindMaterializedNot,
+						ids:        ids,
+						releaseIDs: releaseIDs,
+					}, true
+				}
+				return predicate{
+					expr:       e,
+					kind:       predicateKindMaterialized,
+					iterKind:   predicateIterMaterialized,
+					ids:        ids,
+					estCard:    ids.Cardinality(),
+					releaseIDs: releaseIDs,
+				}, true
+			}
+		}
+	}
+
 	postsBuf := postingSlicePool.Get()
 	postsBuf.Grow(valsBuf.Len())
 
@@ -1511,7 +1569,7 @@ func (qv *queryView[K, V]) evalLazyMaterializedPredicateWithKey(raw qx.Expr, cac
 				}
 				return posting.List{}
 			}
-			return core.evalMaterializedPostingResult(ov).ids
+			return tryShareMaterializedPredOnSnapshot(qv.snap, cacheKey, core.evalMaterializedPostingResult(ov).ids)
 		}
 	}
 
@@ -1529,7 +1587,7 @@ func (qv *queryView[K, V]) evalLazyMaterializedPredicateWithKey(raw qx.Expr, cac
 		}
 		return posting.List{}
 	}
-	return b.ids
+	return tryShareMaterializedPredOnSnapshot(qv.snap, cacheKey, b.ids)
 }
 
 func (qv *queryView[K, V]) evalLazyMaterializedPredicate(raw qx.Expr, cacheKey string) posting.List {

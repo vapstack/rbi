@@ -73,6 +73,94 @@ func TestQuery_LimitNoOrder_UnsatisfiableLeafs_ReturnEmpty(t *testing.T) {
 	}
 }
 
+func TestQuery_LimitNoFilterNoOrder_UsesDirectLimitPlan(t *testing.T) {
+	var events []TraceEvent
+	opts := Options{
+		TraceSink: func(ev TraceEvent) {
+			events = append(events, ev)
+		},
+		TraceSampleEvery: 1,
+	}
+	db, _ := openTempDBUint64(t, opts)
+
+	for i := 1; i <= 5; i++ {
+		if err := db.Set(uint64(i), &Rec{Name: fmt.Sprintf("u%d", i), Age: 20 + i}); err != nil {
+			t.Fatalf("Set(%d): %v", i, err)
+		}
+	}
+
+	ids, err := db.QueryKeys(qx.Query().Max(3))
+	if err != nil {
+		t.Fatalf("QueryKeys: %v", err)
+	}
+	if !reflect.DeepEqual(ids, []uint64{1, 2, 3}) {
+		t.Fatalf("unexpected ids: got=%v want=%v", ids, []uint64{1, 2, 3})
+	}
+	if len(events) == 0 {
+		t.Fatalf("expected trace event")
+	}
+	last := events[len(events)-1]
+	if last.Plan != string(PlanLimit) {
+		t.Fatalf("expected plan %q, got %q", PlanLimit, last.Plan)
+	}
+	if last.RowsExamined != 3 {
+		t.Fatalf("expected RowsExamined=3, got trace=%+v", last)
+	}
+}
+
+func TestQuery_RangeNoOrderWithLimit_NilEQ_UsesNilOverlayInEarlyRoute(t *testing.T) {
+	db, _ := openTempDBUint64(t)
+
+	if err := db.Set(1, &Rec{Name: "nil-a", Opt: nil}); err != nil {
+		t.Fatalf("Set(1): %v", err)
+	}
+	if err := db.Set(2, &Rec{Name: "value"}); err != nil {
+		t.Fatalf("Set(2): %v", err)
+	}
+	if err := db.Set(3, &Rec{Name: "nil-b", Opt: nil}); err != nil {
+		t.Fatalf("Set(3): %v", err)
+	}
+
+	ids, err := db.QueryKeys(qx.Query(qx.EQ("opt", nil)).Max(1))
+	if err != nil {
+		t.Fatalf("QueryKeys: %v", err)
+	}
+	if len(ids) != 1 {
+		t.Fatalf("expected one id from nil equality limit query, got %v", ids)
+	}
+
+	items, err := db.Query(qx.Query(qx.EQ("opt", nil)).Max(1))
+	if err != nil {
+		t.Fatalf("Query: %v", err)
+	}
+	if len(items) != 1 || items[0] == nil || items[0].Opt != nil {
+		t.Fatalf("expected one nil-opt item, got %#v", items)
+	}
+	db.ReleaseRecords(items...)
+}
+
+func TestQuery_SingleExactOrderedLimit_PrefersPlannerLimitPath(t *testing.T) {
+	db, _ := openTempDBUint64(t)
+
+	for i := 1; i <= 32; i++ {
+		if err := db.Set(uint64(i), &Rec{
+			Name:   fmt.Sprintf("u%d", i),
+			Age:    18 + (i % 17),
+			Active: i%2 == 0,
+		}); err != nil {
+			t.Fatalf("Set(%d): %v", i, err)
+		}
+	}
+
+	q := qx.Query(
+		qx.EQ("active", true),
+	).By("age", qx.ASC).Max(8)
+
+	if db.shouldPreferExecutionPlan(q) {
+		t.Fatalf("expected single exact ordered limit to prefer planner/limit path")
+	}
+}
+
 func TestQuery_LimitOrderAndRange_UnsatisfiableRest_ReturnEmpty(t *testing.T) {
 	db, _ := openTempDBUint64(t)
 

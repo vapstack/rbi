@@ -60,9 +60,19 @@ func (qv *queryView[K, V]) countInternal(q *qx.QX, emitTrace bool) (uint64, erro
 		return 0, err
 	}
 
+	traceEnabled := emitTrace && qv.root.traceOrCalibrationSamplingEnabled()
+	if !traceEnabled && q.Expr.Field != "" && len(q.Expr.Operands) == 0 && q.Expr.Op != qx.OpNOOP {
+		if out, ok, err := qv.tryCountByScalarLookup(q.Expr, nil); ok || err != nil {
+			return out, err
+		}
+		if out, ok, err := qv.tryCountBySliceLookup(q.Expr, nil); ok || err != nil {
+			return out, err
+		}
+	}
+
 	expr, _ := normalize.Expr(q.Expr)
 	var trace *queryTrace
-	if emitTrace && qv.root.traceOrCalibrationSamplingEnabled() {
+	if traceEnabled {
 		trace = qv.root.beginTrace(&qx.QX{Expr: expr})
 	}
 
@@ -1843,6 +1853,34 @@ func (s *countORSeen) addPosting(ids posting.List) uint64 {
 	}
 }
 
+func (s *countORSeen) addPostingOwned(ids posting.List) uint64 {
+	if ids.IsEmpty() {
+		return 0
+	}
+	switch s.mode {
+	case countORSeenModeHash:
+		added := s.addPosting(ids)
+		ids.Release()
+		return added
+	case countORSeenModePosting:
+		if s.ids.IsEmpty() {
+			s.ids = ids
+			return ids.Cardinality()
+		}
+		before := s.ids.Cardinality()
+		s.ids = s.ids.BuildOr(ids)
+		ids.Release()
+		after := s.ids.Cardinality()
+		if after <= before {
+			return 0
+		}
+		return after - before
+	default:
+		ids.Release()
+		return 0
+	}
+}
+
 func (qv *queryView[K, V]) countORMaterializedSpillUnion(
 	branches []countORMaterializedBranch,
 	seen *countORSeen,
@@ -1897,7 +1935,8 @@ func (qv *queryView[K, V]) countORMaterializedSpillUnion(
 
 		card := res.ids.Cardinality()
 		examined += card
-		added := seen.addPosting(res.ids)
+		added := seen.addPostingOwned(res.ids)
+		res.ids = posting.List{}
 		cnt += added
 		if branchTrace != nil {
 			branchTrace[br.index].RowsExamined += card
