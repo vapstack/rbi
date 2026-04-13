@@ -1037,6 +1037,97 @@ func TestPlannerORNoOrderAdaptive_MatchesBaseline(t *testing.T) {
 	}
 }
 
+func TestBuildORBranches_BroadNumericRangeUsesRuntimeStateOnColdFirstHit(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{
+		AnalyzeInterval:                         -1,
+		SnapshotMaterializedPredCacheMaxEntries: 16,
+		NumericRangeBucketSize:                  8,
+		NumericRangeBucketMinFieldKeys:          16,
+		NumericRangeBucketMinSpanKeys:           4,
+	})
+	seedGeneratedUint64Data(t, db, 12_000, func(i int) *Rec {
+		return &Rec{
+			Name:   fmt.Sprintf("u_%d", i),
+			Email:  fmt.Sprintf("user%05d@example.com", i),
+			Age:    i,
+			Score:  float64(i),
+			Active: i%2 == 0,
+		}
+	})
+	if err := db.RebuildIndex(); err != nil {
+		t.Fatalf("RebuildIndex: %v", err)
+	}
+
+	q := normalize.Query(qx.Query(
+		qx.OR(
+			qx.AND(
+				qx.SUFFIX("email", "@example.com"),
+				qx.GTE("score", 6_000.0),
+			),
+			qx.AND(
+				qx.EQ("active", true),
+				qx.EQ("name", "u_42"),
+			),
+		),
+	).Max(150))
+
+	checkRangePred := func(branches plannerORBranches, wantMaterialized bool) {
+		t.Helper()
+		var found bool
+		for i := 0; i < branches.Len(); i++ {
+			branch := branches.Get(i)
+			for j := 0; j < branch.predLen(); j++ {
+				p := branch.pred(j)
+				if p.expr.Field != "score" || p.expr.Op != qx.OpGTE {
+					continue
+				}
+				found = true
+				if wantMaterialized {
+					if !p.isMaterializedLike() {
+						t.Fatalf("expected broad range leaf to become materialized on second build")
+					}
+					continue
+				}
+				if p.isMaterializedLike() || p.lazyMatState != nil {
+					t.Fatalf("expected broad range leaf to stay on runtime state")
+				}
+				if p.baseRangeState == nil && p.overlayState == nil {
+					t.Fatalf("expected broad range leaf runtime state")
+				}
+			}
+		}
+		if !found {
+			t.Fatalf("expected score range predicate in OR branches")
+		}
+	}
+
+	branches, alwaysFalse, ok := db.buildORBranches(q.Expr.Operands)
+	if !ok {
+		t.Fatalf("buildORBranches: ok=false")
+	}
+	if alwaysFalse {
+		t.Fatalf("unexpected alwaysFalse")
+	}
+	checkRangePred(branches, false)
+	branches.Release()
+	if got := db.getSnapshot().matPredCacheCount.Load(); got != 0 {
+		t.Fatalf("unexpected shared materialized predicate cache entry after first build: %d", got)
+	}
+
+	branches, alwaysFalse, ok = db.buildORBranches(q.Expr.Operands)
+	if !ok {
+		t.Fatalf("buildORBranches second: ok=false")
+	}
+	defer branches.Release()
+	if alwaysFalse {
+		t.Fatalf("unexpected alwaysFalse on second build")
+	}
+	checkRangePred(branches, true)
+	if got := db.getSnapshot().matPredCacheCount.Load(); got == 0 {
+		t.Fatalf("expected shared materialized predicate cache entry after second build")
+	}
+}
+
 func TestPlannerOROrderKWay_MatchesFallbackMerge(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
 		AnalyzeInterval: -1,

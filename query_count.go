@@ -525,7 +525,7 @@ func countApplyLeadResidualExactFilters(src, work posting.List, filters *pooled.
 					break
 				}
 				if !current.IsBorrowed() {
-					if !current.SharesPayload(work) {
+					if !sharedWork && !current.SharesPayload(work) {
 						work.Release()
 					}
 					work = current

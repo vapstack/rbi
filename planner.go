@@ -2272,7 +2272,29 @@ func (qv *queryView[K, V]) buildORBranches(ops []qx.Expr) (plannerORBranches, bo
 			return plannerORBranches{}, false, false
 		}
 
-		preds, ok := qv.buildPredicates(leaves)
+		useLazyColdPredicates := false
+		if qv.snap != nil && qv.snap.matPredCacheMaxEntries > 0 && len(leaves) > 1 {
+			for _, e := range leaves {
+				if e.Not || e.Field == "" || !isNumericRangeOp(e.Op) {
+					continue
+				}
+				fm := qv.fields[e.Field]
+				if fm == nil || fm.Slice || !isNumericScalarKind(fm.Kind) {
+					continue
+				}
+				key := qv.materializedPredKey(e)
+				if key.isZero() {
+					continue
+				}
+				if qv.snap.shouldPromoteRuntimeMaterializedPredKey(key) {
+					useLazyColdPredicates = false
+					break
+				}
+				useLazyColdPredicates = true
+			}
+		}
+
+		preds, ok := qv.buildPredicatesWithColdMode(leaves, true, useLazyColdPredicates)
 		if !ok {
 			out.Release()
 			return plannerORBranches{}, false, false

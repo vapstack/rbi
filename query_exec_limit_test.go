@@ -1094,7 +1094,7 @@ func TestQuery_LimitOrderBasic_ResidualsUseBucketExactFilter(t *testing.T) {
 	}
 }
 
-func TestQuery_OrderBasic_RangeBaseOpsSkipsEagerBaseBitmapBeforeOrderedPredicatesAfterPatch(t *testing.T) {
+func TestQuery_OrderBasic_RangeBaseOpsMaterializeBroadComplementWithoutExactSiblings(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
 		AnalyzeInterval:                         -1,
 		SnapshotMaterializedPredCacheMaxEntries: 16,
@@ -1135,12 +1135,12 @@ func TestQuery_OrderBasic_RangeBaseOpsSkipsEagerBaseBitmapBeforeOrderedPredicate
 	assertSameSlice(t, got, want)
 
 	after := db.getSnapshot()
-	if got := after.matPredCacheCount.Load(); got != 0 {
-		t.Fatalf("expected ordered predicate path to avoid eager base bitmap materialization, cache entries=%d", got)
+	if got := after.matPredCacheCount.Load(); got == 0 {
+		t.Fatalf("expected ordered predicate path to materialize broad complement, cache entries=%d", got)
 	}
 }
 
-func TestQuery_OrderBasic_DeepWindowEagerMaterializesNonOrderNumericRange(t *testing.T) {
+func TestQuery_OrderBasic_SmallAndDeepWindowMaterializeNonOrderNumericRangeWhenCostWins(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
 		AnalyzeInterval:                         -1,
 		SnapshotMaterializedPredCacheMaxEntries: 16,
@@ -1165,8 +1165,8 @@ func TestQuery_OrderBasic_DeepWindowEagerMaterializesNonOrderNumericRange(t *tes
 	if _, err := db.QueryKeys(small); err != nil {
 		t.Fatalf("small QueryKeys: %v", err)
 	}
-	if got := db.getSnapshot().matPredCacheCount.Load(); got != 0 {
-		t.Fatalf("unexpected materialized predicate cache for small ordered window: %d", got)
+	if got := db.getSnapshot().matPredCacheCount.Load(); got == 0 {
+		t.Fatalf("expected materialized predicate cache for small ordered window: %d", got)
 	}
 
 	deep := qx.Query(
@@ -1183,7 +1183,7 @@ func TestQuery_OrderBasic_DeepWindowEagerMaterializesNonOrderNumericRange(t *tes
 	assertSameSlice(t, got, want)
 
 	if got := db.getSnapshot().matPredCacheCount.Load(); got == 0 {
-		t.Fatalf("expected deep ordered window to materialize numeric range predicate")
+		t.Fatalf("expected deep ordered window to keep materialized numeric range predicate")
 	}
 }
 
@@ -1271,6 +1271,98 @@ func TestQuery_OrderBasic_BuildLeafPredsExcludingBounds_MaterializesBroadComplem
 	}
 	if _, ok := db.getSnapshot().loadMaterializedPred(cacheKey); !ok {
 		t.Fatalf("expected shared complement cache entry after second ordered leaf build")
+	}
+}
+
+func TestQuery_OrderBasic_BuildLeafPredsExcludingBounds_DelaysBroadComplementWithMultipleExactSiblings(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{
+		AnalyzeInterval:                         -1,
+		SnapshotMaterializedPredCacheMaxEntries: 16,
+	})
+
+	setNumericBucketKnobs(t, db, 128, 1, 1)
+	seedGeneratedUint64Data(t, db, 256, func(i int) *Rec {
+		country := "US"
+		if i%3 == 0 {
+			country = "DE"
+		}
+		return &Rec{
+			Name:   fmt.Sprintf("u_%d", i),
+			Age:    18 + i,
+			Score:  float64(i),
+			Active: i%2 == 0,
+			Meta: Meta{
+				Country: country,
+			},
+		}
+	})
+	if err := db.RebuildIndex(); err != nil {
+		t.Fatalf("RebuildIndex: %v", err)
+	}
+
+	q := qx.Query(
+		qx.EQ("active", true),
+		qx.EQ("country", "DE"),
+		qx.GTE("age", 40),
+	).By("score", qx.ASC).Max(50)
+	leaves := mustExtractAndLeaves(t, q.Expr)
+
+	view := db.currentQueryViewForTests()
+	defer db.releaseQueryView(view)
+
+	expr := qx.GTE("age", 40)
+	bound, isSlice, err := view.exprValueToNormalizedScalarBound(expr)
+	if err != nil {
+		t.Fatalf("exprValueToNormalizedScalarBound: %v", err)
+	}
+	if isSlice || bound.full || bound.empty {
+		t.Fatalf("unexpected normalized bound state: slice=%v full=%v empty=%v", isSlice, bound.full, bound.empty)
+	}
+	cacheKey := view.materializedPredComplementKeyForNormalizedScalarBound(expr.Field, bound).String()
+	if cacheKey == "" {
+		t.Fatalf("expected non-empty complement cache key")
+	}
+
+	preds, ok, err := view.buildLeafPredsExcludingBounds(leaves, "score", 4096)
+	if err != nil {
+		t.Fatalf("buildLeafPredsExcludingBounds: %v", err)
+	}
+	if !ok {
+		t.Fatalf("expected residual leaf preds to be supported")
+	}
+	if preds == nil || preds.Len() != 3 {
+		t.Fatalf("unexpected predicate count: %d", preds.Len())
+	}
+	defer leafPredSlicePool.Put(preds)
+
+	rangeIdx := -1
+	exactSiblingCount := 0
+	for i := 0; i < preds.Len(); i++ {
+		p := preds.Get(i)
+		if p.kind == leafPredKindPredicate && p.pred.expr.Field == "age" && p.pred.expr.Op == qx.OpGTE {
+			rangeIdx = i
+			continue
+		}
+		if p.supportsExactBucketPostingFilter() {
+			exactSiblingCount++
+		}
+	}
+	if rangeIdx < 0 {
+		t.Fatalf("expected age range leaf")
+	}
+	if exactSiblingCount < 2 {
+		t.Fatalf("expected multiple exact siblings, got %d", exactSiblingCount)
+	}
+
+	rangePred := preds.Get(rangeIdx)
+	if rangePred.kind != leafPredKindPredicate {
+		t.Fatalf("expected predicate leaf, got kind=%v", rangePred.kind)
+	}
+	if rangePred.pred.kind == predicateKindMaterializedNot {
+		t.Fatalf("expected broad complement to stay delayed with multiple exact siblings")
+	}
+	if _, ok := db.getSnapshot().loadMaterializedPred(cacheKey); ok {
+		t.Fatalf("unexpected shared complement cache entry on first build with multiple exact siblings")
 	}
 }
 

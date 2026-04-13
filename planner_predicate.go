@@ -3082,10 +3082,11 @@ func (qv *queryView[K, V]) buildPredicatesOrdered(leaves []qx.Expr, orderField s
 }
 
 type orderedScalarRangeRouting struct {
-	eagerMaterialize bool
-	broadComplement  bool
-	cacheKey         materializedPredKey
-	requirePromotion bool
+	eagerMaterialize   bool
+	broadComplement    bool
+	cacheKey           materializedPredKey
+	complementCacheKey materializedPredKey
+	requirePromotion   bool
 }
 
 func (qv *queryView[K, V]) orderedScalarRangeRouting(e qx.Expr, orderedWindow int, orderedOffset uint64, universe uint64) orderedScalarRangeRouting {
@@ -3098,8 +3099,9 @@ func (qv *queryView[K, V]) orderedScalarRangeRouting(e qx.Expr, orderedWindow in
 	}
 
 	route := orderedScalarRangeRouting{
-		eagerMaterialize: candidate.plan.orderedEagerMaterializeUseful(orderedWindow, universe),
-		cacheKey:         candidate.core.sharedReuse.cacheKey,
+		eagerMaterialize:   candidate.plan.orderedEagerMaterializeUseful(orderedWindow, universe),
+		cacheKey:           candidate.core.sharedReuse.cacheKey,
+		complementCacheKey: candidate.core.complementCacheKey,
 	}
 	expectedRows := orderedPredicateExpectedRows(orderedWindow, candidate.plan.est, universe)
 	if orderedOffset == 0 && expectedRows > 0 && expectedRows < candidate.plan.est {

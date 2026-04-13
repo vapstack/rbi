@@ -906,12 +906,6 @@ func (qv *queryView[K, V]) buildLeafPredsExcludingBounds(leaves []qx.Expr, field
 						leafPredSlicePool.Put(predsBuf)
 						return nil, false, nil
 					}
-					if orderedUniverse > 0 &&
-						p.kind == leafPredKindPredicate &&
-						p.pred.hasRuntimeRangeState() {
-						orderedRoute := qv.orderedScalarRangeRouting(e, orderedWindow, 0, orderedUniverse)
-						qv.tryMaterializeBroadRangeComplementPredicateForOrdered(&p.pred, orderedRoute.broadComplement, orderedUniverse, orderedWindow)
-					}
 					qv.attachLeafPredPostingFilter(&p)
 					if orderedUniverse > 0 && p.postsAnyState != nil {
 						p.setExpectedContainsCalls(
@@ -932,12 +926,6 @@ func (qv *queryView[K, V]) buildLeafPredsExcludingBounds(leaves []qx.Expr, field
 			leafPredSlicePool.Put(predsBuf)
 			return nil, false, nil
 		}
-		if orderedUniverse > 0 &&
-			p.kind == leafPredKindPredicate &&
-			p.pred.hasRuntimeRangeState() {
-			orderedRoute := qv.orderedScalarRangeRouting(e, orderedWindow, 0, orderedUniverse)
-			qv.tryMaterializeBroadRangeComplementPredicateForOrdered(&p.pred, orderedRoute.broadComplement, orderedUniverse, orderedWindow)
-		}
 		qv.attachLeafPredPostingFilter(&p)
 		if orderedUniverse > 0 && p.postsAnyState != nil {
 			p.setExpectedContainsCalls(
@@ -949,6 +937,40 @@ func (qv *queryView[K, V]) buildLeafPredsExcludingBounds(leaves []qx.Expr, field
 	if predsBuf.Len() == 0 {
 		leafPredSlicePool.Put(predsBuf)
 		return nil, true, nil
+	}
+	if orderedUniverse > 0 {
+		for i := 0; i < predsBuf.Len(); i++ {
+			p := predsBuf.Get(i)
+			if p.kind != leafPredKindPredicate || !p.pred.hasRuntimeRangeState() {
+				continue
+			}
+			orderedRoute := qv.orderedScalarRangeRouting(p.pred.expr, orderedWindow, 0, orderedUniverse)
+			if !orderedRoute.broadComplement {
+				continue
+			}
+			exactSiblingCount := 0
+			for j := 0; j < predsBuf.Len(); j++ {
+				if j == i {
+					continue
+				}
+				if predsBuf.Get(j).supportsExactBucketPostingFilter() {
+					exactSiblingCount++
+				}
+			}
+			if exactSiblingCount >= 2 {
+				// Multiple exact bucket siblings already cut broad range work
+				// aggressively, so first-hit complement materialization is only
+				// worth taking when a warm shared complement already exists.
+				if orderedRoute.complementCacheKey.isZero() || qv.snap == nil {
+					continue
+				}
+				if _, ok := qv.snap.loadMaterializedPredKey(orderedRoute.complementCacheKey); !ok {
+					continue
+				}
+			}
+			qv.tryMaterializeBroadRangeComplementPredicateForOrdered(&p.pred, orderedRoute.broadComplement, orderedUniverse, orderedWindow)
+			predsBuf.Set(i, p)
+		}
 	}
 	return predsBuf, true, nil
 }
