@@ -1,9 +1,11 @@
 package rbi
 
 import (
+	"slices"
 	"testing"
 
 	"github.com/vapstack/qx"
+	"github.com/vapstack/rbi/internal/posting"
 )
 
 func TestMaterializedPredKeyExactScalarRange_RoundTripNumeric(t *testing.T) {
@@ -69,5 +71,44 @@ func TestMaterializedPredKeyScalar_NumericBoundsDoNotCollide(t *testing.T) {
 	c40 := materializedPredComplementKeyForNumericScalar("age", qx.OpGTE, indexKeyFromU64(orderedInt64Key(40)))
 	if c30 == c40 {
 		t.Fatal("expected distinct numeric scalar complement cache keys")
+	}
+}
+
+func TestMaterializedPredKeyDistinctSet_RoundTripThroughStringCacheAPI(t *testing.T) {
+	vals := stringSlicePool.Get()
+	defer stringSlicePool.Put(vals)
+	vals.Append("DE")
+	vals.Append("FR")
+
+	key := materializedPredKeyForDistinctSetTerms("country", qx.OpIN, vals, true)
+	if key.isZero() {
+		t.Fatal("expected non-zero distinct-set cache key")
+	}
+
+	parsed, ok := materializedPredKeyFromEncoded(key.String())
+	if !ok {
+		t.Fatal("expected distinct-set cache key to parse")
+	}
+	if parsed != key {
+		t.Fatalf("distinct-set round-trip mismatch:\n got=%#v\nwant=%#v", parsed, key)
+	}
+
+	db, _ := openTempDBUint64(t, Options{
+		AnalyzeInterval:                         -1,
+		SnapshotMaterializedPredCacheMaxEntries: 16,
+	})
+	ids := posting.BuildFromSorted([]uint64{1, 3, 5, 8})
+	defer ids.Release()
+
+	snap := db.getSnapshot()
+	snap.storeMaterializedPred(key.String(), ids.Borrow())
+	got, ok := snap.loadMaterializedPred(key.String())
+	if !ok {
+		t.Fatal("expected string-key cache API to load stored distinct-set key")
+	}
+	defer got.Release()
+
+	if !slices.Equal(got.ToArray(), ids.ToArray()) {
+		t.Fatalf("string-key cache round-trip mismatch: got=%v want=%v", got.ToArray(), ids.ToArray())
 	}
 }

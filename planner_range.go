@@ -223,6 +223,9 @@ func (qv *queryView[K, V]) initPreparedScalarRangePredicateFromBound(
 		cacheKey = qv.materializedPredKeyForNormalizedScalarBound(e.Field, bound)
 		complementCacheKey = qv.materializedPredComplementKeyForNormalizedScalarBound(e.Field, bound)
 	}
+	loadReuse := newMaterializedPredReadOnlyReuse(qv.snap, cacheKey)
+	sharedReuse := newMaterializedPredSharedReuse(qv.snap, cacheKey)
+	secondHitReuse := newMaterializedPredSecondHitSharedReuse(qv.snap, cacheKey)
 	*core = preparedScalarRangePredicate[K, V]{
 		qv:                 qv,
 		expr:               e,
@@ -230,9 +233,9 @@ func (qv *queryView[K, V]) initPreparedScalarRangePredicateFromBound(
 		bound:              bound,
 		bounds:             rangeBoundsForNormalizedScalarBound(bound),
 		complementCacheKey: complementCacheKey,
-		loadReuse:          newMaterializedPredReadOnlyReuse(qv.snap, cacheKey),
-		sharedReuse:        newMaterializedPredSharedReuse(qv.snap, cacheKey),
-		secondHitReuse:     newMaterializedPredSecondHitSharedReuse(qv.snap, cacheKey),
+		loadReuse:          loadReuse,
+		sharedReuse:        sharedReuse,
+		secondHitReuse:     secondHitReuse,
 		usePostingFilter:   shouldUseNumericRangePostingFilter(e, fm),
 	}
 }
@@ -244,14 +247,17 @@ func (qv *queryView[K, V]) initPreparedExactScalarRangePredicate(
 	bounds rangeBounds,
 ) {
 	cacheKey := qv.materializedPredKeyForExactScalarRange(e.Field, bounds)
+	loadReuse := newMaterializedPredReadOnlyReuse(qv.snap, cacheKey)
+	sharedReuse := newMaterializedPredSharedReuse(qv.snap, cacheKey)
+	secondHitReuse := newMaterializedPredSecondHitSharedReuse(qv.snap, cacheKey)
 	*core = preparedScalarRangePredicate[K, V]{
 		qv:               qv,
 		expr:             e,
 		fm:               fm,
 		bounds:           bounds,
-		loadReuse:        newMaterializedPredReadOnlyReuse(qv.snap, cacheKey),
-		sharedReuse:      newMaterializedPredSharedReuse(qv.snap, cacheKey),
-		secondHitReuse:   newMaterializedPredSecondHitSharedReuse(qv.snap, cacheKey),
+		loadReuse:        loadReuse,
+		sharedReuse:      sharedReuse,
+		secondHitReuse:   secondHitReuse,
 		usePostingFilter: fm != nil && !fm.Slice && isNumericScalarKind(fm.Kind),
 	}
 }

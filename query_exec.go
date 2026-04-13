@@ -324,6 +324,7 @@ func orderPredicatesEmitPostingReader[K ~uint64 | ~string, V any](
 		return orderPredicatesEmitCandidateReader(cursor, preds, active, trace, idx, examined), exactWork
 	}
 
+	currentIDs := ids
 	iterSrc := ids.Iter()
 	exactApplied := false
 	if current, applied, handled, stop, nextExactWork := orderPredicatesTryBucketPostingReader(
@@ -339,6 +340,7 @@ func orderPredicatesEmitPostingReader[K ~uint64 | ~string, V any](
 		iterSrc.Release()
 		return stop, nextExactWork
 	} else if applied && !current.IsEmpty() {
+		currentIDs = current
 		iterSrc.Release()
 		iterSrc = current.Iter()
 		exactApplied = true
@@ -348,8 +350,19 @@ func orderPredicatesEmitPostingReader[K ~uint64 | ~string, V any](
 	}
 
 	checks := active
+	singleCheck := -1
 	if exactApplied {
 		checks = residualActive
+		if len(residualActive) == 1 {
+			singleCheck = residualActive[0]
+		}
+	} else if len(active) == 1 {
+		singleCheck = active[0]
+	}
+	if orderedSkipSingleCheckBucket(cursor, preds, singleCheck, currentIDs, trace) {
+		*examined += currentIDs.Cardinality()
+		iterSrc.Release()
+		return false, exactWork
 	}
 	for iterSrc.HasNext() {
 		if orderPredicatesEmitCandidateReader(cursor, preds, checks, trace, iterSrc.Next(), examined) {
@@ -380,6 +393,7 @@ func orderPredicatesEmitPostingBufReader[K ~uint64 | ~string, V any](
 		return orderPredicatesEmitCandidateBufReader(cursor, preds, active, trace, idx, examined), exactWork
 	}
 
+	currentIDs := ids
 	iterSrc := ids.Iter()
 	exactApplied := false
 	if current, applied, handled, stop, nextExactWork := orderPredicatesTryBucketPostingBufReader(
@@ -395,6 +409,7 @@ func orderPredicatesEmitPostingBufReader[K ~uint64 | ~string, V any](
 		iterSrc.Release()
 		return stop, nextExactWork
 	} else if applied && !current.IsEmpty() {
+		currentIDs = current
 		iterSrc.Release()
 		iterSrc = current.Iter()
 		exactApplied = true
@@ -404,8 +419,19 @@ func orderPredicatesEmitPostingBufReader[K ~uint64 | ~string, V any](
 	}
 
 	checks := active
+	singleCheck := -1
 	if exactApplied {
 		checks = residualActive
+		if residualActive.Len() == 1 {
+			singleCheck = residualActive.Get(0)
+		}
+	} else if active.Len() == 1 {
+		singleCheck = active.Get(0)
+	}
+	if orderedSkipSingleCheckBucket(cursor, preds, singleCheck, currentIDs, trace) {
+		*examined += currentIDs.Cardinality()
+		iterSrc.Release()
+		return false, exactWork
 	}
 	for iterSrc.HasNext() {
 		if orderPredicatesEmitCandidateBufReader(cursor, preds, checks, trace, iterSrc.Next(), examined) {

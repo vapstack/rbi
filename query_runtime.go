@@ -13,6 +13,9 @@ type postsAnyFilterState struct {
 	ids                   posting.List
 	containsCalls         int
 	containsMaterializeAt int
+	applyObservedSavings  uint64
+	neg                   bool
+	reuse                 materializedPredReuse
 }
 
 var postsAnyFilterStatePool = pooled.Pointers[postsAnyFilterState]{
@@ -39,11 +42,16 @@ func (state *postsAnyFilterState) materialize() posting.List {
 	if !state.ids.IsEmpty() {
 		return state.ids
 	}
+	if cached, ok := state.reuse.load(); ok {
+		state.ids = cached
+		return state.ids
+	}
 	if isSingletonHeavyPostingBuf(state.postsBuf) {
 		state.ids = materializePostingBufFast(state.postsBuf)
 	} else {
 		state.ids = materializePostingUnionBufOwned(state.postsBuf)
 	}
+	state.ids = state.reuse.share(state.ids)
 	return state.ids
 }
 
@@ -97,42 +105,139 @@ func postsAnyContainsMaterializeAfterBuf(posts *pooled.SliceBuf[posting.List]) i
 	return int(threshold)
 }
 
+func postsAnyContainsWork(posts *pooled.SliceBuf[posting.List]) (uint64, uint64, uint64, bool) {
+	termCount := postingBufLen(posts)
+	if termCount <= 1 {
+		return 0, 0, 0, false
+	}
+	unionCard, singletons := postsAnyEstimatedUnionCardinality(posts)
+	if unionCard == 0 {
+		return 0, 0, 0, false
+	}
+	buildWork := postingUnionLinearWork(termCount, unionCard)
+	if shouldUseFastSinglesUnion(termCount, singletons, unionCard) {
+		buildWork = postingUnionFastSinglesWork(termCount, singletons, unionCard)
+	}
+	directWork := uint64(0)
+	for i := 0; i < posts.Len(); i++ {
+		directWork = satAddUint64(directWork, postingContainsLookupWork(posts.Get(i).Cardinality()))
+	}
+	return buildWork, directWork, postingContainsLookupWork(unionCard), true
+}
+
+func (state *postsAnyFilterState) setExpectedContainsCalls(expectedCalls int) {
+	if state == nil || !state.ids.IsEmpty() || expectedCalls <= 0 {
+		return
+	}
+	buildWork, directPerCall, materializedPerCall, ok := postsAnyContainsWork(state.postsBuf)
+	if !ok || directPerCall <= materializedPerCall {
+		return
+	}
+	directTotal := satMulUint64(uint64(expectedCalls), directPerCall)
+	materializedTotal := satAddUint64(
+		satMulUint64(buildWork, materializedShareStructuralFactor(postingBufLen(state.postsBuf))),
+		satMulUint64(uint64(expectedCalls), materializedPerCall),
+	)
+	if materializedTotal < directTotal {
+		state.containsMaterializeAt = 1
+	}
+}
+
 func (state *postsAnyFilterState) matches(idx uint64) bool {
 	if state == nil {
 		return false
 	}
+	if !state.neg {
+		if !state.ids.IsEmpty() {
+			return state.ids.Contains(idx)
+		}
+		if state.containsMaterializeAt > 0 {
+			state.containsCalls++
+			if state.containsCalls >= state.containsMaterializeAt {
+				return state.materialize().Contains(idx)
+			}
+		}
+		switch postingBufLen(state.postsBuf) {
+		case 0:
+			return false
+		case 1:
+			return state.postsBuf.Get(0).Contains(idx)
+		case 2:
+			return state.postsBuf.Get(0).Contains(idx) || state.postsBuf.Get(1).Contains(idx)
+		case 3:
+			return state.postsBuf.Get(0).Contains(idx) ||
+				state.postsBuf.Get(1).Contains(idx) ||
+				state.postsBuf.Get(2).Contains(idx)
+		case 4:
+			return state.postsBuf.Get(0).Contains(idx) ||
+				state.postsBuf.Get(1).Contains(idx) ||
+				state.postsBuf.Get(2).Contains(idx) ||
+				state.postsBuf.Get(3).Contains(idx)
+		}
+		for i := 0; i < state.postsBuf.Len(); i++ {
+			if state.postsBuf.Get(i).Contains(idx) {
+				return true
+			}
+		}
+		return false
+	}
+
 	if !state.ids.IsEmpty() {
-		return state.ids.Contains(idx)
+		return !state.ids.Contains(idx)
 	}
 	if state.containsMaterializeAt > 0 {
 		state.containsCalls++
 		if state.containsCalls >= state.containsMaterializeAt {
-			return state.materialize().Contains(idx)
+			return !state.materialize().Contains(idx)
 		}
 	}
 	switch postingBufLen(state.postsBuf) {
 	case 0:
-		return false
+		return true
 	case 1:
-		return state.postsBuf.Get(0).Contains(idx)
+		return !state.postsBuf.Get(0).Contains(idx)
 	case 2:
-		return state.postsBuf.Get(0).Contains(idx) || state.postsBuf.Get(1).Contains(idx)
+		return !state.postsBuf.Get(0).Contains(idx) && !state.postsBuf.Get(1).Contains(idx)
 	case 3:
-		return state.postsBuf.Get(0).Contains(idx) ||
-			state.postsBuf.Get(1).Contains(idx) ||
-			state.postsBuf.Get(2).Contains(idx)
+		return !state.postsBuf.Get(0).Contains(idx) &&
+			!state.postsBuf.Get(1).Contains(idx) &&
+			!state.postsBuf.Get(2).Contains(idx)
 	case 4:
-		return state.postsBuf.Get(0).Contains(idx) ||
-			state.postsBuf.Get(1).Contains(idx) ||
-			state.postsBuf.Get(2).Contains(idx) ||
-			state.postsBuf.Get(3).Contains(idx)
+		return !state.postsBuf.Get(0).Contains(idx) &&
+			!state.postsBuf.Get(1).Contains(idx) &&
+			!state.postsBuf.Get(2).Contains(idx) &&
+			!state.postsBuf.Get(3).Contains(idx)
 	}
 	for i := 0; i < state.postsBuf.Len(); i++ {
 		if state.postsBuf.Get(i).Contains(idx) {
-			return true
+			return false
 		}
 	}
-	return false
+	return true
+}
+
+func (state *postsAnyFilterState) countBucket(bucket posting.List) (uint64, bool) {
+	if bucket.IsEmpty() {
+		return 0, true
+	}
+	if state == nil {
+		return 0, false
+	}
+	if !state.neg {
+		if !state.ids.IsEmpty() || state.containsMaterializeAt == 1 {
+			return state.materialize().AndCardinality(bucket), true
+		}
+		return countBucketPostsAnyBuf(state.postsBuf, bucket)
+	}
+	if !state.ids.IsEmpty() || state.containsMaterializeAt == 1 {
+		bc := bucket.Cardinality()
+		hit := state.materialize().AndCardinality(bucket)
+		if hit >= bc {
+			return 0, true
+		}
+		return bc - hit, true
+	}
+	return countBucketPostsAnyNotBuf(state.postsBuf, bucket)
 }
 
 func postsAnyDirectBucketFilterMaxCard(termCount int) uint64 {
@@ -183,13 +288,13 @@ func postsAnyDirectIntersectWork(posts *pooled.SliceBuf[posting.List], dstCard u
 	return work
 }
 
-func (state *postsAnyFilterState) shouldUseDirectIntersect(dstCard uint64) (uint64, bool) {
+func (state *postsAnyFilterState) applyWork(dstCard uint64) (uint64, uint64, uint64, uint64, bool) {
 	if state == nil || state.postsBuf == nil || dstCard == 0 {
-		return 0, false
+		return 0, 0, 0, 0, false
 	}
 	termCount := state.postsBuf.Len()
 	if termCount <= 1 || termCount > 4 {
-		return 0, false
+		return 0, 0, 0, 0, false
 	}
 
 	unionCard := uint64(0)
@@ -200,22 +305,19 @@ func (state *postsAnyFilterState) shouldUseDirectIntersect(dstCard uint64) (uint
 		unionCard, singletons = postsAnyEstimatedUnionCardinality(state.postsBuf)
 	}
 	if unionCard == 0 {
-		return 0, false
+		return 0, 0, 0, 0, false
 	}
 
-	directWork := postsAnyDirectIntersectWork(state.postsBuf, dstCard)
-	materializedWork := satMulUint64(dstCard, postingContainsLookupWork(unionCard))
+	buildWork := uint64(0)
 	if state.ids.IsEmpty() {
-		buildWork := postingUnionLinearWork(termCount, unionCard)
+		buildWork = postingUnionLinearWork(termCount, unionCard)
 		if shouldUseFastSinglesUnion(termCount, singletons, unionCard) {
 			buildWork = postingUnionFastSinglesWork(termCount, singletons, unionCard)
 		}
-		materializedWork = satAddUint64(materializedWork, buildWork)
 	}
-	if directWork >= materializedWork {
-		return 0, false
-	}
-	return unionCard, true
+	directWork := postsAnyDirectIntersectWork(state.postsBuf, dstCard)
+	materializedCheckWork := satMulUint64(dstCard, postingContainsLookupWork(unionCard))
+	return unionCard, buildWork, directWork, materializedCheckWork, true
 }
 
 func (state *postsAnyFilterState) applyOwnedLargeDirect(dst posting.List, card uint64) (posting.List, bool) {
@@ -292,73 +394,107 @@ func (state *postsAnyFilterState) apply(dst posting.List) (posting.List, bool) {
 	if dst.IsEmpty() {
 		return dst, true
 	}
+	if state.neg {
+		union := state.materialize()
+		if union.IsEmpty() {
+			return dst, true
+		}
+		return dst.BuildAndNot(union), true
+	}
 	postCount := postingBufLen(state.postsBuf)
 	if postCount <= 4 {
 		card := dst.Cardinality()
-		if card > 0 && card <= postsAnyDirectBucketFilterMaxCard(postCount) {
-			if next, ok := state.applyOwnedLargeDirect(dst, card); ok {
-				return next, true
-			}
-			if next, ok := dst.TryBuildAndAnyBuf(state.postsBuf); ok {
-				return next, true
-			}
-
-			builder := newPostingUnionBuilder(postingBatchSinglesEnabled(card))
-			it := dst.Iter()
-			matched := uint64(0)
-			for it.HasNext() {
-				idx := it.Next()
-				for i := 0; i < state.postsBuf.Len(); i++ {
-					if state.postsBuf.Get(i).Contains(idx) {
-						builder.addSingle(idx)
-						matched++
-						break
+		if card > 0 {
+			unionCard := uint64(0)
+			canDirect := false
+			if estUnion, buildWork, directWork, materializedCheckWork, ok := state.applyWork(card); ok {
+				unionCard = estUnion
+				if state.ids.IsEmpty() {
+					if directWork > materializedCheckWork {
+						savings := directWork - materializedCheckWork
+						if satAddUint64(state.applyObservedSavings, savings) >= buildWork {
+							union := state.materialize()
+							if union.IsEmpty() {
+								dst.Release()
+								return posting.List{}, true
+							}
+							return dst.BuildAnd(union), true
+						}
+						state.applyObservedSavings = satAddUint64(state.applyObservedSavings, savings)
 					}
+					canDirect = directWork < satAddUint64(buildWork, materializedCheckWork)
+				} else {
+					if directWork >= materializedCheckWork {
+						return dst.BuildAnd(state.ids), true
+					}
+					canDirect = true
 				}
 			}
-			it.Release()
-			if matched == 0 {
+			if card <= postsAnyDirectBucketFilterMaxCard(postCount) {
+				if next, ok := state.applyOwnedLargeDirect(dst, card); ok {
+					return next, true
+				}
+				if next, ok := dst.TryBuildAndAnyBuf(state.postsBuf); ok {
+					return next, true
+				}
+
+				builder := newPostingUnionBuilder(postingBatchSinglesEnabled(card))
+				it := dst.Iter()
+				matched := uint64(0)
+				for it.HasNext() {
+					idx := it.Next()
+					for i := 0; i < state.postsBuf.Len(); i++ {
+						if state.postsBuf.Get(i).Contains(idx) {
+							builder.addSingle(idx)
+							matched++
+							break
+						}
+					}
+				}
+				it.Release()
+				if matched == 0 {
+					builder.release()
+					dst.Release()
+					return posting.List{}, true
+				}
+				if matched == card {
+					builder.release()
+					return dst, true
+				}
+				out := builder.finish(false)
+				dst.Release()
+				return out, true
+			}
+
+			if canDirect {
+				if next, ok := state.applyOwnedLargeDirect(dst, card); ok {
+					return next, true
+				}
+				capHint := card
+				if unionCard < capHint {
+					capHint = unionCard
+				}
+				builder := newPostingUnionBuilder(postingBatchSinglesEnabled(capHint))
+				for i := 0; i < state.postsBuf.Len(); i++ {
+					builder = postingListAppendIntersecting(dst, state.postsBuf.Get(i), builder)
+				}
+				dst.Release()
+				out := builder.finish(false)
 				builder.release()
+				return out, true
+			}
+
+			hit := false
+			for i := 0; i < state.postsBuf.Len(); i++ {
+				if state.postsBuf.Get(i).Intersects(dst) {
+					hit = true
+					break
+				}
+			}
+			if !hit {
 				dst.Release()
 				return posting.List{}, true
 			}
-			if matched == card {
-				builder.release()
-				return dst, true
-			}
-			out := builder.finish(false)
-			dst.Release()
-			return out, true
-		}
-
-		if unionCard, ok := state.shouldUseDirectIntersect(card); ok {
-			if next, ok := state.applyOwnedLargeDirect(dst, card); ok {
-				return next, true
-			}
-			capHint := card
-			if unionCard < capHint {
-				capHint = unionCard
-			}
-			builder := newPostingUnionBuilder(postingBatchSinglesEnabled(capHint))
-			for i := 0; i < state.postsBuf.Len(); i++ {
-				builder = postingListAppendIntersecting(dst, state.postsBuf.Get(i), builder)
-			}
-			dst.Release()
-			out := builder.finish(false)
-			builder.release()
-			return out, true
-		}
-
-		hit := false
-		for i := 0; i < state.postsBuf.Len(); i++ {
-			if state.postsBuf.Get(i).Intersects(dst) {
-				hit = true
-				break
-			}
-		}
-		if !hit {
-			dst.Release()
-			return posting.List{}, true
 		}
 	}
 	union := state.materialize()

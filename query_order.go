@@ -2,6 +2,7 @@ package rbi
 
 import (
 	"reflect"
+	"unsafe"
 
 	"github.com/vapstack/qx"
 	"github.com/vapstack/rbi/internal/posting"
@@ -128,6 +129,57 @@ func makeOutSlice[K ~int64 | ~uint64 | ~string](cardinality, limit uint64) []K {
 	} else {
 		out = make([]K, 0, cardinality)
 	}
+	return out
+}
+
+func shouldMaterializeOrderedAllNumericBuckets[K ~uint64 | ~string, V any](
+	qv *queryView[K, V],
+	skip uint64,
+	all bool,
+	resultCard uint64,
+) bool {
+	return !qv.strkey && all && skip == 0 && resultCard >= 64_000
+}
+
+func appendMaterializedNumericPostingKeys[K ~uint64 | ~string](out []K, ids posting.List) []K {
+	if ids.IsEmpty() {
+		return out
+	}
+	if idx, ok := ids.TrySingle(); ok {
+		return append(out, *(*K)(unsafe.Pointer(&idx)))
+	}
+	card := int(ids.Cardinality())
+	if card == 0 {
+		return out
+	}
+	base := len(out)
+	out = out[:base+card]
+	dst := unsafe.Slice((*uint64)(unsafe.Pointer(&out[base])), card)
+	it := ids.Iter()
+	for i := 0; i < card; i++ {
+		dst[i] = it.Next()
+	}
+	it.Release()
+	return out
+}
+
+func appendMaterializedNumericPostingResultKeys[K ~uint64 | ~string](
+	out []K,
+	ids posting.List,
+	result postingResult,
+) []K {
+	if ids.IsEmpty() {
+		return out
+	}
+	if result.neg {
+		matched := ids.Borrow().BuildAndNot(result.ids)
+		out = appendMaterializedNumericPostingKeys(out, matched)
+		matched.Release()
+		return out
+	}
+	matched := ids.Borrow().BuildAnd(result.ids)
+	out = appendMaterializedNumericPostingKeys(out, matched)
+	matched.Release()
 	return out
 }
 
@@ -286,6 +338,25 @@ func (qv *queryView[K, V]) queryOrderBasic(result postingResult, ov fieldOverlay
 	var tmp posting.List
 
 	out := makeOutSlice[K](resultCard, need)
+	if !isSliceOrderField && shouldMaterializeOrderedAllNumericBuckets(qv, skip, all, resultCard) {
+		br := ov.rangeForBounds(rangeBounds{has: true})
+		cur := ov.newCursor(br, o.Desc)
+		for {
+			_, ids, ok := cur.next()
+			if !ok {
+				break
+			}
+			out = appendMaterializedNumericPostingResultKeys(out, ids, result)
+		}
+		if fm := qv.fields[o.Field]; fm != nil && fm.Ptr {
+			out = appendMaterializedNumericPostingResultKeys(
+				out,
+				qv.nilFieldOverlay(o.Field).lookupPostingRetained(nilIndexEntryKey),
+				result,
+			)
+		}
+		return out, nil
+	}
 	dedupeCap := uint64(0)
 	if isSliceOrderField {
 		dedupeCap = queryCursorDedupeCap(resultCard, skip, need, all)
@@ -462,6 +533,16 @@ func (qv *queryView[K, V]) queryOrderArrayPosScalarOverlay(result postingResult,
 	needSeen := needFallback && len(orderedVals) > 0
 
 	out := makeOutSlice[K](resultCard, need)
+	if !needFallback &&
+		!result.neg &&
+		shouldMaterializeOrderedAllNumericBuckets(qv, skip, all, resultCard) {
+		for _, v := range orderedVals {
+			ids := ov.lookupPostingRetained(v).Borrow().BuildAnd(result.ids)
+			out = appendMaterializedNumericPostingKeys(out, ids)
+			ids.Release()
+		}
+		return out, nil
+	}
 	dedupeCap := uint64(0)
 	if needSeen {
 		dedupeCap = queryCursorDedupeCap(resultCard, skip, need, all)
@@ -552,6 +633,39 @@ func (qv *queryView[K, V]) queryOrderArrayCount(result postingResult, s []index,
 				break
 			}
 		}
+	}
+	if !result.neg && shouldMaterializeOrderedAllNumericBuckets(qv, skip, all, resultCard) {
+		appendZero := func() {
+			if !useZeroComplement {
+				return
+			}
+			ids := result.ids.Borrow().BuildAndNot(nonEmpty)
+			out = appendMaterializedNumericPostingKeys(out, ids)
+			ids.Release()
+		}
+		if !o.Desc {
+			appendZero()
+			for _, ix := range s {
+				if indexKeyEqualsString(ix.Key, lenIndexNonEmptyKey) || ix.IDs.IsEmpty() {
+					continue
+				}
+				ids := ix.IDs.Borrow().BuildAnd(result.ids)
+				out = appendMaterializedNumericPostingKeys(out, ids)
+				ids.Release()
+			}
+			return out, nil
+		}
+		for i := len(s) - 1; i >= 0; i-- {
+			ix := s[i]
+			if indexKeyEqualsString(ix.Key, lenIndexNonEmptyKey) || ix.IDs.IsEmpty() {
+				continue
+			}
+			ids := ix.IDs.Borrow().BuildAnd(result.ids)
+			out = appendMaterializedNumericPostingKeys(out, ids)
+			ids.Release()
+		}
+		appendZero()
+		return out, nil
 	}
 
 	if !o.Desc {

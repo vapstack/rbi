@@ -775,6 +775,7 @@ func (qv *queryView[K, V]) evalAndOperandsExceptReordered(ops []qx.Expr, skip in
 	}
 
 	sortCountLeafPlanOrder(plans, pos)
+	qv.reorderCountEvalAndPositivePlans(plans, pos)
 	sortCountLeafPlanOrder(plans, neg)
 
 	var (
@@ -1319,6 +1320,14 @@ func (qv *queryView[K, V]) buildCountPredicatesWithMode(leaves []qx.Expr, allowM
 		if !ok {
 			preds.Release()
 			return predicateSet{}, false
+		}
+		if p.postsAnyState != nil {
+			if p.expr.Not {
+				postsAnyFilterStatePool.Put(p.postsAnyState)
+				p.postsAnyState = nil
+			} else {
+				p.postsAnyState.reuse = materializedPredReuse{}
+			}
 		}
 		preds.Append(p)
 	}
@@ -3971,7 +3980,95 @@ func countLeafPlanLess(plans []countLeafPlan, a, b int) bool {
 	return a < b
 }
 
+func countLeafPlanStartsBroadScalarMaterialization(plan countLeafPlan) bool {
+	if plan.expr.Not || !plan.hasSel || !isScalarRangeOrPrefixOp(plan.expr.Op) {
+		return false
+	}
+	return plan.selectivity > 0.5
+}
+
+func countLeafPlanSeedsCustomMaterialization(plan countLeafPlan) bool {
+	if plan.expr.Not {
+		return false
+	}
+	return plan.expr.Op == qx.OpSUFFIX || plan.expr.Op == qx.OpCONTAINS
+}
+
+func (qv *queryView[K, V]) reorderCountEvalAndPositivePlans(plans []countLeafPlan, pos []int) {
+	if len(pos) <= 1 {
+		return
+	}
+	if !countLeafPlanStartsBroadScalarMaterialization(plans[pos[0]]) {
+		return
+	}
+	pick := -1
+	for i := 1; i < len(pos); i++ {
+		if countLeafPlanSeedsCustomMaterialization(plans[pos[i]]) {
+			cacheKey := qv.materializedPredKey(plans[pos[i]].expr)
+			if !cacheKey.isZero() {
+				if cached, ok := qv.snap.loadMaterializedPredKey(cacheKey); ok && !cached.IsEmpty() {
+					continue
+				}
+			}
+			pick = i
+			break
+		}
+	}
+	if pick < 0 {
+		return
+	}
+	cur := pos[pick]
+	for i := pick; i > 0; i-- {
+		pos[i] = pos[i-1]
+	}
+	pos[0] = cur
+}
+
 func (qv *queryView[K, V]) applyAndPostingResultExpr(acc *postingResult, hasAcc *bool, expr qx.Expr) (bool, error) {
+	if *hasAcc {
+		if !acc.neg && !acc.ids.IsEmpty() && expr.Field != "" {
+			usePostingApply := false
+			if isScalarEqOrInOp(expr.Op) || expr.Op == qx.OpHAS || expr.Op == qx.OpHASANY {
+				usePostingApply = true
+			} else if isScalarRangeOrPrefixOp(expr.Op) {
+				usePostingApply = true
+				if qv.snap != nil {
+					cacheKey := qv.materializedPredKey(expr)
+					if !cacheKey.isZero() {
+						if _, ok := qv.snap.loadMaterializedPredKey(cacheKey); ok {
+							usePostingApply = false
+						} else if qv.snap.shouldPromoteRuntimeMaterializedPredKey(cacheKey) {
+							usePostingApply = false
+						}
+					}
+				}
+			}
+			if usePostingApply {
+				p, ok := qv.buildPredicateWithMode(expr, false)
+				if ok {
+					defer releasePredicateOwnedState(&p)
+					if p.alwaysFalse {
+						acc.release()
+						*acc = postingResult{}
+						return true, nil
+					}
+					if !p.alwaysTrue && !p.covered {
+						if next, ok := p.applyToPosting(acc.ids); ok {
+							acc.ids = next
+							acc.neg = false
+							if acc.ids.IsEmpty() {
+								acc.release()
+								*acc = postingResult{}
+								return true, nil
+							}
+							return false, nil
+						}
+					}
+				}
+			}
+		}
+	}
+
 	b, err := qv.evalExpr(expr)
 	if err != nil {
 		return false, err

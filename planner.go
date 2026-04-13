@@ -2219,13 +2219,13 @@ func (qv *queryView[K, V]) shouldObserveOrderedORLeaf(orderField string, expr qx
 		return true
 	}
 	cacheKey, buildWork, ok = qv.orderedORMaterializedPrefixLeafBuildWork(orderField, expr)
-	if !ok || cacheKey.isZero() || buildWork == 0 {
-		return false
+	if ok && !cacheKey.isZero() && buildWork != 0 {
+		if _, hit := qv.snap.loadMaterializedPredKey(cacheKey); hit {
+			return false
+		}
+		return true
 	}
-	if _, hit := qv.snap.loadMaterializedPredKey(cacheKey); hit {
-		return false
-	}
-	return true
+	return false
 }
 
 func hasNoOrderLeadCandidatesOR(ops []qx.Expr) bool {

@@ -190,6 +190,9 @@ func (p *predicate) setExpectedContainsCalls(expected int) {
 	if p == nil {
 		return
 	}
+	if p.postsAnyState != nil {
+		p.postsAnyState.setExpectedContainsCalls(expected)
+	}
 	if p.baseRangeState != nil {
 		p.baseRangeState.setExpectedContainsCalls(expected)
 	}
@@ -270,6 +273,11 @@ func (p predicate) postingFilterCapability() predicatePostingFilterCapability {
 			predicatePostingFilterExactBucket |
 			predicatePostingFilterCheap
 	case predicateKindPostsAnyNot:
+		if p.postsAnyState != nil {
+			return predicatePostingFilterApply |
+				predicatePostingFilterExactBucket |
+				predicatePostingFilterCheap
+		}
 		if p.postCount() > predicatePostsAnyNotExactPostingMaxTerms {
 			return 0
 		}
@@ -458,6 +466,9 @@ func (p *predicate) matches(idx uint64) bool {
 		}
 		return false
 	case predicateKindPostsAnyNot:
+		if p.postsAnyState != nil {
+			return p.postsAnyState.matches(idx)
+		}
 		for i := 0; i < p.postCount(); i++ {
 			ids := p.postAt(i)
 			if ids.Contains(idx) {
@@ -511,8 +522,10 @@ func (p predicate) countBucket(bucket posting.List) (uint64, bool) {
 		return in, ok
 	}
 	switch p.kind {
+
 	case predicateKindPosting:
 		return p.posting.AndCardinality(bucket), true
+
 	case predicateKindPostingNot:
 		bc := bucket.Cardinality()
 		hit := p.posting.AndCardinality(bucket)
@@ -520,16 +533,28 @@ func (p predicate) countBucket(bucket posting.List) (uint64, bool) {
 			return 0, true
 		}
 		return bc - hit, true
+
 	case predicateKindPostsAny:
+		if p.postsAnyState != nil {
+			return p.postsAnyState.countBucket(bucket)
+		}
 		return countBucketPostsAnyBuf(p.postsBuf, bucket)
+
 	case predicateKindPostsAnyNot:
+		if p.postsAnyState != nil {
+			return p.postsAnyState.countBucket(bucket)
+		}
 		return countBucketPostsAnyNotBuf(p.postsBuf, bucket)
+
 	case predicateKindPostsAll:
 		return countBucketPostsAllBuf(p.postsBuf, bucket)
+
 	case predicateKindPostsAllNot:
 		return countBucketPostsAllNotBuf(p.postsBuf, bucket)
+
 	case predicateKindMaterialized:
 		return p.ids.AndCardinality(bucket), true
+
 	case predicateKindMaterializedNot:
 		bc := bucket.Cardinality()
 		if p.ids.IsEmpty() {
@@ -540,6 +565,7 @@ func (p predicate) countBucket(bucket posting.List) (uint64, bool) {
 			return 0, true
 		}
 		return bc - hit, true
+
 	default:
 		if p.rangeMat {
 			in := bucket.AndCardinality(p.ids)
@@ -591,6 +617,9 @@ func (p predicate) applyToPosting(dst posting.List) (posting.List, bool) {
 		return dst.BuildAndNot(p.posting), true
 
 	case predicateKindPostsAnyNot:
+		if p.postsAnyState != nil {
+			return p.postsAnyState.apply(dst)
+		}
 		if p.postCount() > predicatePostsAnyNotExactPostingMaxTerms {
 			return posting.List{}, false
 		}
@@ -1081,6 +1110,10 @@ func (qv *queryView[K, V]) buildPredInCandidate(e qx.Expr, fm *field, ov fieldOv
 		return predicate{}, false
 	}
 	postsBuf, est := qv.scalarLookupPostings(e.Field, valsBuf, hasNil)
+	cacheKey := materializedPredKey{}
+	if qv.snap != nil && qv.snap.matPredCacheMaxEntries > 0 {
+		cacheKey = materializedPredKeyForDistinctSetTerms(e.Field, e.Op, valsBuf, hasNil)
+	}
 
 	if e.Not {
 		if postsBuf.Len() == 0 {
@@ -1095,10 +1128,16 @@ func (qv *queryView[K, V]) buildPredInCandidate(e qx.Expr, fm *field, ov fieldOv
 				postsBuf: postsBuf,
 			}, true
 		}
+		postsAnyState := postsAnyFilterStatePool.Get()
+		postsAnyState.postsBuf = postsBuf
+		postsAnyState.containsMaterializeAt = postsAnyContainsMaterializeAfterBuf(postsBuf)
+		postsAnyState.neg = true
+		postsAnyState.reuse = newMaterializedPredSecondHitSharedReuse(qv.snap, cacheKey)
 		return predicate{
-			expr:     e,
-			kind:     predicateKindPostsAnyNot,
-			postsBuf: postsBuf,
+			expr:          e,
+			kind:          predicateKindPostsAnyNot,
+			postsBuf:      postsBuf,
+			postsAnyState: postsAnyState,
 		}, true
 	}
 
@@ -1121,6 +1160,7 @@ func (qv *queryView[K, V]) buildPredInCandidate(e qx.Expr, fm *field, ov fieldOv
 	postsAnyState := postsAnyFilterStatePool.Get()
 	postsAnyState.postsBuf = postsBuf
 	postsAnyState.containsMaterializeAt = postsAnyContainsMaterializeAfterBuf(postsBuf)
+	postsAnyState.reuse = newMaterializedPredSecondHitSharedReuse(qv.snap, cacheKey)
 
 	return predicate{
 		expr:          e,
@@ -1225,6 +1265,10 @@ func (qv *queryView[K, V]) buildPredHasAnyCandidate(e qx.Expr, fm *field, ov fie
 		postsBuf.Append(ids)
 		est += ids.Cardinality()
 	}
+	cacheKey := materializedPredKey{}
+	if qv.snap != nil && qv.snap.matPredCacheMaxEntries > 0 {
+		cacheKey = materializedPredKeyForDistinctSetTerms(e.Field, e.Op, valsBuf, false)
+	}
 	if e.Not {
 		if postsBuf.Len() == 0 {
 			postingSlicePool.Put(postsBuf)
@@ -1238,10 +1282,16 @@ func (qv *queryView[K, V]) buildPredHasAnyCandidate(e qx.Expr, fm *field, ov fie
 				postsBuf: postsBuf,
 			}, true
 		}
+		postsAnyState := postsAnyFilterStatePool.Get()
+		postsAnyState.postsBuf = postsBuf
+		postsAnyState.containsMaterializeAt = postsAnyContainsMaterializeAfterBuf(postsBuf)
+		postsAnyState.neg = true
+		postsAnyState.reuse = newMaterializedPredSecondHitSharedReuse(qv.snap, cacheKey)
 		return predicate{
-			expr:     e,
-			kind:     predicateKindPostsAnyNot,
-			postsBuf: postsBuf,
+			expr:          e,
+			kind:          predicateKindPostsAnyNot,
+			postsBuf:      postsBuf,
+			postsAnyState: postsAnyState,
 		}, true
 	}
 
@@ -1265,6 +1315,7 @@ func (qv *queryView[K, V]) buildPredHasAnyCandidate(e qx.Expr, fm *field, ov fie
 	postsAnyState := postsAnyFilterStatePool.Get()
 	postsAnyState.postsBuf = postsBuf
 	postsAnyState.containsMaterializeAt = postsAnyContainsMaterializeAfterBuf(postsBuf)
+	postsAnyState.reuse = newMaterializedPredSecondHitSharedReuse(qv.snap, cacheKey)
 
 	return predicate{
 		expr:          e,
@@ -2635,6 +2686,27 @@ func orderedScanEmitPostingMatchedAll[K ~uint64 | ~string, V any](
 	return false
 }
 
+func orderedSkipSingleCheckBucket[K ~uint64 | ~string, V any](
+	cursor *queryCursor[K, V],
+	preds predicateReader,
+	singleCheck int,
+	ids posting.List,
+	trace *queryTrace,
+) bool {
+	if singleCheck < 0 || cursor.skip == 0 || ids.IsEmpty() {
+		return false
+	}
+	cnt, ok := preds.Get(singleCheck).countBucket(ids)
+	if !ok || cnt > cursor.skip {
+		return false
+	}
+	cursor.skip -= cnt
+	if trace != nil {
+		trace.addMatched(cnt)
+	}
+	return true
+}
+
 func orderedScanEmitPostingByChecks[K ~uint64 | ~string, V any](
 	cursor *queryCursor[K, V],
 	ids posting.List,
@@ -2644,6 +2716,9 @@ func orderedScanEmitPostingByChecks[K ~uint64 | ~string, V any](
 	trace *queryTrace,
 ) bool {
 	if ids.IsEmpty() {
+		return false
+	}
+	if orderedSkipSingleCheckBucket(cursor, preds, singleCheck, ids, trace) {
 		return false
 	}
 	if idx, ok := ids.TrySingle(); ok {
@@ -2736,17 +2811,6 @@ func orderedScanEmitBucketWithPredicates[K ~uint64 | ~string, V any](
 				return orderedScanEmitPostingMatchedAll(cursor, exactIDs, exactIDs.Cardinality(), trace), exactWork
 			}
 			return orderedScanEmitPostingByChecks(cursor, exactIDs, preds, residualActive, singleResidual, trace), exactWork
-		}
-	}
-
-	if singleActive >= 0 && cursor.skip > 0 {
-		cnt, ok := preds.Get(singleActive).countBucket(bucket)
-		if ok && cnt <= cursor.skip {
-			cursor.skip -= cnt
-			if trace != nil {
-				trace.addMatched(cnt)
-			}
-			return false, exactWork
 		}
 	}
 
@@ -2977,7 +3041,7 @@ func releasePredicates(preds []predicate) {
 	}
 }
 
-func (qv *queryView[K, V]) buildPredicatesWithMode(leaves []qx.Expr, allowMaterialize bool) (predicateSet, bool) {
+func (qv *queryView[K, V]) buildPredicatesWithColdMode(leaves []qx.Expr, allowMaterialize bool, lazyColdMaterialize bool) (predicateSet, bool) {
 	if len(leaves) == 1 && leaves[0].Op == qx.OpNOOP && leaves[0].Not {
 		preds := newPredicateSet(1)
 		preds.Append(predicate{alwaysFalse: true})
@@ -2986,7 +3050,7 @@ func (qv *queryView[K, V]) buildPredicatesWithMode(leaves []qx.Expr, allowMateri
 
 	preds := newPredicateSet(len(leaves))
 	for _, e := range leaves {
-		p, ok := qv.buildPredicateWithMode(e, allowMaterialize)
+		p, ok := qv.buildPredicateWithColdMode(e, allowMaterialize, lazyColdMaterialize)
 		if !ok {
 			preds.Release()
 			return predicateSet{}, false
@@ -2994,6 +3058,10 @@ func (qv *queryView[K, V]) buildPredicatesWithMode(leaves []qx.Expr, allowMateri
 		preds.Append(p)
 	}
 	return preds, true
+}
+
+func (qv *queryView[K, V]) buildPredicatesWithMode(leaves []qx.Expr, allowMaterialize bool) (predicateSet, bool) {
+	return qv.buildPredicatesWithColdMode(leaves, allowMaterialize, false)
 }
 
 func (qv *queryView[K, V]) buildPredicates(leaves []qx.Expr) (predicateSet, bool) {
@@ -3081,8 +3149,7 @@ func (qv *queryView[K, V]) tryMaterializeBroadRangeComplementPredicateForOrdered
 		setPredicateAlwaysTrue(p)
 		return true
 	}
-	if qv.snap == nil || candidate.core.complementCacheKey.isZero() ||
-		!qv.snap.shouldPromoteRuntimeMaterializedPredKey(candidate.core.complementCacheKey) {
+	if qv.snap == nil || candidate.core.complementCacheKey.isZero() {
 		return false
 	}
 	if plan.est >= p.estCard {
@@ -3094,11 +3161,12 @@ func (qv *queryView[K, V]) tryMaterializeBroadRangeComplementPredicateForOrdered
 	}
 	buildWork := postingUnionLinearWork(plan.buckets, plan.est)
 	materializedWork := satAddUint64(buildWork, satMulUint64(expectedRows, postingContainsLookupWork(plan.est)))
-	probeWork := rangeProbeTotalWorkForRows(int(expectedRows), plan.buckets, plan.est)
+	probeWork := rangeProbeTotalWorkForRows(
+		int(expectedRows),
+		candidate.plan.runtimeProbeBuckets,
+		candidate.plan.runtimeProbeEst,
+	)
 	if materializedWork >= probeWork {
-		return false
-	}
-	if probeWork < satMulUint64(buildWork, materializedShareStructuralFactor(plan.buckets)) {
 		return false
 	}
 	ids := candidate.core.materializeComplement(plan)
@@ -3226,6 +3294,11 @@ func (qv *queryView[K, V]) buildPredicatesOrderedWithMode(leaves []qx.Expr, orde
 							orderedBaseRangeExpectedContainsCalls(p.baseRangeState, orderedWindow, universe),
 						)
 					}
+					if p.postsAnyState != nil && orderedWindow > 0 && universe > 0 {
+						p.postsAnyState.setExpectedContainsCalls(
+							clampUint64ToInt(orderedPredicateExpectedRows(orderedWindow, p.estCard, universe)),
+						)
+					}
 					preds.Append(p)
 					continue
 				}
@@ -3254,6 +3327,11 @@ func (qv *queryView[K, V]) buildPredicatesOrderedWithMode(leaves []qx.Expr, orde
 		if p.baseRangeState != nil && orderedWindow > 0 && universe > 0 {
 			p.setExpectedContainsCalls(
 				orderedBaseRangeExpectedContainsCalls(p.baseRangeState, orderedWindow, universe),
+			)
+		}
+		if p.postsAnyState != nil && orderedWindow > 0 && universe > 0 {
+			p.postsAnyState.setExpectedContainsCalls(
+				clampUint64ToInt(orderedPredicateExpectedRows(orderedWindow, p.estCard, universe)),
 			)
 		}
 		if !orderRangeDeferred && orderedEagerMaterialize &&
@@ -3339,6 +3417,11 @@ func (qv *queryView[K, V]) buildPredicatesOrderedWithModeBuf(
 							orderedBaseRangeExpectedContainsCalls(p.baseRangeState, orderedWindow, universe),
 						)
 					}
+					if p.postsAnyState != nil && orderedWindow > 0 && universe > 0 {
+						p.postsAnyState.setExpectedContainsCalls(
+							clampUint64ToInt(orderedPredicateExpectedRows(orderedWindow, p.estCard, universe)),
+						)
+					}
 					preds.Append(p)
 					continue
 				}
@@ -3367,6 +3450,11 @@ func (qv *queryView[K, V]) buildPredicatesOrderedWithModeBuf(
 		if p.baseRangeState != nil && orderedWindow > 0 && universe > 0 {
 			p.setExpectedContainsCalls(
 				orderedBaseRangeExpectedContainsCalls(p.baseRangeState, orderedWindow, universe),
+			)
+		}
+		if p.postsAnyState != nil && orderedWindow > 0 && universe > 0 {
+			p.postsAnyState.setExpectedContainsCalls(
+				clampUint64ToInt(orderedPredicateExpectedRows(orderedWindow, p.estCard, universe)),
 			)
 		}
 		if !orderRangeDeferred && orderedEagerMaterialize &&

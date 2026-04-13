@@ -2,9 +2,11 @@ package rbi
 
 import (
 	"fmt"
+	"slices"
 	"testing"
 
 	"github.com/vapstack/qx"
+	"github.com/vapstack/rbi/internal/posting"
 )
 
 func hasLenIndexKey(slice *[]index, key string) bool {
@@ -444,6 +446,116 @@ func TestQuery_ByArrayCount_WithNegation_NoLimit(t *testing.T) {
 		t.Fatalf("expectedKeysUint64: %v", err)
 	}
 	assertSameSlice(t, got, want)
+}
+
+func TestQuery_BroadArrayOrder_NoLimit_MatchesExpected(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
+	_ = seedData(t, db, 70_000)
+
+	queries := []*qx.QX{
+		qx.Query().ByArrayPos("country", []string{
+			"NL", "PL", "DE", "Finland", "Iceland", "Thailand", "Switzerland",
+		}, qx.ASC),
+		qx.Query().ByArrayCount("tags", qx.DESC),
+	}
+
+	for _, q := range queries {
+		got, err := db.QueryKeys(q)
+		if err != nil {
+			t.Fatalf("QueryKeys(%+v): %v", q, err)
+		}
+		if len(got) < 64_000 {
+			t.Fatalf("expected broad ordered result to exercise bucket materialization route, got %d rows for %+v", len(got), q)
+		}
+
+		want, err := expectedKeysUint64(t, db, q)
+		if err != nil {
+			t.Fatalf("expectedKeysUint64(%+v): %v", q, err)
+		}
+		assertSameSlice(t, got, want)
+	}
+
+	followUp := qx.Query(
+		qx.NOT(qx.EQ("active", true)),
+	).ByArrayCount("tags", qx.DESC)
+	gotFollowUp, err := db.QueryKeys(followUp)
+	if err != nil {
+		t.Fatalf("QueryKeys(follow-up): %v", err)
+	}
+	wantFollowUp, err := expectedKeysUint64(t, db, followUp)
+	if err != nil {
+		t.Fatalf("expectedKeysUint64(follow-up): %v", err)
+	}
+	assertSameSlice(t, gotFollowUp, wantFollowUp)
+}
+
+func TestQuery_BroadBasicOrder_NoLimit_MatchesExpected(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
+	_ = seedData(t, db, 80_000)
+
+	queries := []*qx.QX{
+		qx.Query().By("age", qx.ASC),
+		qx.Query(
+			qx.NOT(qx.EQ("country", "NL")),
+		).By("score", qx.DESC),
+	}
+
+	qv := db.currentQueryViewForTests()
+	for _, q := range queries {
+		result, err := qv.evalExpr(q.Expr)
+		if err != nil {
+			t.Fatalf("evalExpr(%+v): %v", q, err)
+		}
+		if qv.postingResultCardinality(result) < 64_000 {
+			result.release()
+			t.Fatalf("expected broad ordered result to exercise bucket materialization route, got %d rows for %+v", qv.postingResultCardinality(result), q)
+		}
+
+		got, err := qv.queryOrderBasic(result, qv.fieldOverlay(q.Order[0].Field), q.Order[0], 0, 0, true)
+		result.release()
+		if err != nil {
+			t.Fatalf("queryOrderBasic(%+v): %v", q, err)
+		}
+
+		want, err := expectedKeysUint64(t, db, q)
+		if err != nil {
+			t.Fatalf("expectedKeysUint64(%+v): %v", q, err)
+		}
+		assertSameSlice(t, got, want)
+	}
+
+	followUp := qx.Query(
+		qx.NOT(qx.EQ("active", true)),
+	).By("age", qx.ASC)
+	gotFollowUp, err := db.QueryKeys(followUp)
+	if err != nil {
+		t.Fatalf("QueryKeys(follow-up): %v", err)
+	}
+	wantFollowUp, err := expectedKeysUint64(t, db, followUp)
+	if err != nil {
+		t.Fatalf("expectedKeysUint64(follow-up): %v", err)
+	}
+	assertSameSlice(t, gotFollowUp, wantFollowUp)
+}
+
+func TestAppendMaterializedNumericPostingKeys_DoesNotAllocateIntermediateArray(t *testing.T) {
+	ids := posting.BuildFromSorted([]uint64{1, 3, 5, 7, 9, 11, 13, 15})
+	defer ids.Release()
+
+	card := int(ids.Cardinality())
+	backing := make([]uint64, card)
+	want := ids.ToArray()
+
+	allocs := testing.AllocsPerRun(100, func() {
+		out := backing[:0]
+		out = appendMaterializedNumericPostingKeys(out, ids)
+		if !slices.Equal(out, want) {
+			t.Fatalf("appendMaterializedNumericPostingKeys mismatch: got=%v want=%v", out, want)
+		}
+	})
+	if allocs != 0 {
+		t.Fatalf("unexpected allocs: got=%v want=0", allocs)
+	}
 }
 
 func TestQuery_SortWithNegativeResult_NoDuplicates(t *testing.T) {

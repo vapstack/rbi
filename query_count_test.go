@@ -489,6 +489,105 @@ func TestCount_ScalarInSplit_CohortShape_MatchesBitmap(t *testing.T) {
 	}
 }
 
+func TestCount_ScalarInSplit_ResidualFilterMatchesBitmap(t *testing.T) {
+	db := countOpenORBenchSharedDB(t, "test_count_scalar_in_split_residual_filter.db", Options{
+		AnalyzeInterval: -1,
+	})
+
+	q := qx.Query(
+		qx.HASANY("roles", []string{"admin", "support"}),
+		qx.NOTIN("status", []string{"banned"}),
+		qx.GTE("score", 50.0),
+		qx.IN("country", []string{"US", "DE", "FR"}),
+	)
+
+	var leavesBuf [countPredicateScanMaxLeaves]qx.Expr
+	leaves, ok := collectAndLeavesScratch(q.Expr, leavesBuf[:0])
+	if !ok {
+		t.Fatalf("collectAndLeavesScratch=false")
+	}
+
+	lead := -1
+	for i := range leaves {
+		if leaves[i].Op == qx.OpIN && leaves[i].Field == "country" && !leaves[i].Not {
+			lead = i
+			break
+		}
+	}
+	if lead < 0 {
+		t.Fatalf("country IN lead not found")
+	}
+
+	qv := db.makeQueryView(db.getSnapshot())
+	defer db.releaseQueryView(qv)
+
+	filter, ok, err := qv.evalAndOperandsExceptReordered(leaves, lead)
+	if err != nil {
+		t.Fatalf("evalAndOperandsExceptReordered: %v", err)
+	}
+	if !ok {
+		t.Fatalf("expected residual filter")
+	}
+	defer filter.release()
+
+	valsBuf, isSlice, hasNil, err := qv.exprValueToDistinctIdxBuf(qx.Expr{Op: qx.OpIN, Field: "country", Value: []string{"US", "DE", "FR"}})
+	if valsBuf != nil {
+		defer stringSlicePool.Put(valsBuf)
+	}
+	if err != nil || !isSlice || hasNil {
+		t.Fatalf("exprValueToDistinctIdxBuf: isSlice=%v hasNil=%v err=%v", isSlice, hasNil, err)
+	}
+
+	var got uint64
+	ov := qv.fieldOverlay("country")
+	for i := 0; i < valsBuf.Len(); i++ {
+		ids := ov.lookupPostingRetained(valsBuf.Get(i))
+		if ids.IsEmpty() {
+			continue
+		}
+		got += countPostingAgainstResult(ids, filter)
+	}
+
+	want := countByExprBitmapCountORBench(t, db, q.Expr)
+	if got != want {
+		t.Fatalf("count mismatch: got=%d want=%d", got, want)
+	}
+}
+
+func TestCount_EvalAndOperandsExceptReordered_BroadRangeAfterContainsMatchesBitmap(t *testing.T) {
+	db := countOpenORBenchSharedDB(t, "test_count_eval_and_reordered_contains_range.db", Options{
+		AnalyzeInterval: -1,
+	})
+
+	expr := qx.AND(
+		qx.CONTAINS("email", "user1"),
+		qx.GTE("score", 20.0),
+	)
+
+	qv := db.makeQueryView(db.getSnapshot())
+	defer db.releaseQueryView(qv)
+
+	var leavesBuf [countPredicateScanMaxLeaves]qx.Expr
+	leaves, ok := collectAndLeavesScratch(expr, leavesBuf[:0])
+	if !ok {
+		t.Fatalf("collectAndLeavesScratch=false")
+	}
+
+	got, ok, err := qv.evalAndOperandsExceptReordered(leaves, -1)
+	if err != nil {
+		t.Fatalf("evalAndOperandsExceptReordered: %v", err)
+	}
+	if !ok {
+		t.Fatalf("expected reordered eval to succeed")
+	}
+	defer got.release()
+
+	want := countByExprBitmapCountORBench(t, db, expr)
+	if have := qv.countPostingResult(got); have != want {
+		t.Fatalf("count mismatch: got=%d want=%d", have, want)
+	}
+}
+
 func TestCount_ByPredicates_BucketLead_MatchesBitmap(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
 

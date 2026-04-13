@@ -118,6 +118,118 @@ func TestPostsAnyFilterStateApply_DirectIntersectMatchesMaterializedUnion(t *tes
 	}
 }
 
+func TestPostsAnyFilterStateApply_RepeatedDirectIntersectPromotesMaterializedUnion(t *testing.T) {
+	dstIDs := make([]uint64, 0, 128)
+	for i := uint64(0); i < 128; i++ {
+		dstIDs = append(dstIDs, i*2+1)
+	}
+	dst := posting.BuildFromSorted(dstIDs)
+	defer dst.Release()
+
+	postAIDs := make([]uint64, 0, 2048)
+	postBIDs := make([]uint64, 0, 1365)
+	for i := uint64(0); i < 2048; i++ {
+		v := i*2 + 1
+		postAIDs = append(postAIDs, v)
+		if i%3 != 0 {
+			postBIDs = append(postBIDs, v)
+		}
+	}
+	postA := posting.BuildFromSorted(postAIDs)
+	postB := posting.BuildFromSorted(postBIDs)
+
+	postsBuf := postingSlicePool.Get()
+	postsBuf.Append(postA)
+	postsBuf.Append(postB)
+
+	state := postsAnyFilterStatePool.Get()
+	state.postsBuf = postsBuf
+
+	defer func() {
+		postsAnyFilterStatePool.Put(state)
+		for i := 0; i < postsBuf.Len(); i++ {
+			postsBuf.Get(i).Release()
+			postsBuf.Set(i, posting.List{})
+		}
+		postingSlicePool.Put(postsBuf)
+	}()
+
+	expectedBuilder := newPostingUnionBuilder(true)
+	expectedBuilder.addPosting(postA)
+	expectedBuilder.addPosting(postB)
+	expectedUnion := expectedBuilder.finish(true)
+	expectedBuilder.release()
+	defer expectedUnion.Release()
+
+	expected := dst.Borrow().BuildAnd(expectedUnion)
+	defer expected.Release()
+
+	promoted := false
+	for i := 0; i < 16; i++ {
+		got, ok := state.apply(dst.Borrow())
+		if !ok {
+			t.Fatalf("postsAny repeated apply must stay exact")
+		}
+		if !slices.Equal(got.ToArray(), expected.ToArray()) {
+			got.Release()
+			t.Fatalf("postsAny repeated direct intersect mismatch on iter=%d", i)
+		}
+		got.Release()
+		if !state.ids.IsEmpty() {
+			promoted = true
+			break
+		}
+	}
+	if !promoted {
+		t.Fatalf("expected repeated direct intersect to promote materialized union")
+	}
+}
+
+func TestPostsAnyFilterStateSetExpectedContainsCalls_PromotesFirstUseMaterialization(t *testing.T) {
+	postAIDs := make([]uint64, 0, 4096)
+	postBIDs := make([]uint64, 0, 3072)
+	for i := uint64(0); i < 4096; i++ {
+		v := i*2 + 1
+		postAIDs = append(postAIDs, v)
+		if i%4 != 0 {
+			postBIDs = append(postBIDs, v)
+		}
+	}
+	postA := posting.BuildFromSorted(postAIDs)
+	postB := posting.BuildFromSorted(postBIDs)
+
+	postsBuf := postingSlicePool.Get()
+	postsBuf.Append(postA)
+	postsBuf.Append(postB)
+
+	state := postsAnyFilterStatePool.Get()
+	state.postsBuf = postsBuf
+	state.containsMaterializeAt = postsAnyContainsMaterializeAfterBuf(postsBuf)
+
+	defer func() {
+		postsAnyFilterStatePool.Put(state)
+		for i := 0; i < postsBuf.Len(); i++ {
+			postsBuf.Get(i).Release()
+			postsBuf.Set(i, posting.List{})
+		}
+		postingSlicePool.Put(postsBuf)
+	}()
+
+	if state.containsMaterializeAt == 1 {
+		t.Fatalf("expected setup to start above first-use materialization threshold")
+	}
+	state.setExpectedContainsCalls(8192)
+	if state.containsMaterializeAt != 1 {
+		t.Fatalf("expected expected-work routing to promote first-use materialization, got=%d", state.containsMaterializeAt)
+	}
+	if !state.matches(postAIDs[7]) {
+		t.Fatalf("expected promoted state to match union member")
+	}
+	if state.ids.IsEmpty() {
+		t.Fatalf("expected first contains after promotion to materialize union")
+	}
+}
+
 func TestPostingUnionBuilder_SmallPostingsBatchSinglesMatchesBaseline(t *testing.T) {
 	left := posting.BuildFromSorted([]uint64{3, 5, 7, 9, 11, 13, 15, 17})
 	right := posting.BuildFromSorted([]uint64{5, 6, 7, 18, 19, 20, 21, 22, 23, 24})

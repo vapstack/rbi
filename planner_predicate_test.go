@@ -168,6 +168,59 @@ func TestPredicateSupportsCheapPostingFilter_UsesUnifiedCapability(t *testing.T)
 			t.Fatalf("posts-any exact path must stay in cheap posting-filter class")
 		}
 	})
+
+	t.Run("PostsAnyNotRuntime", func(t *testing.T) {
+		p := predicate{kind: predicateKindPostsAnyNot, postsAnyState: &postsAnyFilterState{}}
+		if !p.supportsPostingApply() {
+			t.Fatalf("posts-any-not runtime path lost posting-filter capability")
+		}
+		if !p.supportsExactBucketPostingFilter() {
+			t.Fatalf("posts-any-not runtime path lost exact bucket posting-filter capability")
+		}
+		if !p.supportsCheapPostingApply() {
+			t.Fatalf("posts-any-not runtime path must stay in cheap posting-filter class")
+		}
+		if p.prefersExactBucketPostingFilter() {
+			t.Fatalf("posts-any-not runtime path must not force preferred exact routing")
+		}
+	})
+}
+
+func TestPredicatePostsAnyNotRuntimeApplyToPosting(t *testing.T) {
+	posts := postingSlicePool.Get()
+	defer postingSlicePool.Put(posts)
+	posts.Append(posting.BuildFromSorted([]uint64{2, 4, 6}))
+	posts.Append(posting.BuildFromSorted([]uint64{1, 4, 7}))
+	posts.Append(posting.BuildFromSorted([]uint64{3, 5, 7}))
+	defer func() {
+		for i := 0; i < posts.Len(); i++ {
+			posts.Get(i).Release()
+		}
+	}()
+
+	p := predicate{
+		kind: predicateKindPostsAnyNot,
+		postsAnyState: &postsAnyFilterState{
+			postsBuf: posts,
+			neg:      true,
+		},
+		postsBuf: posts,
+	}
+
+	src := posting.BuildFromSorted([]uint64{1, 2, 3, 4, 5, 6, 7, 8})
+	defer src.Release()
+
+	got, ok := p.applyToPosting(src.Borrow())
+	if !ok {
+		t.Fatal("expected exact applyToPosting support for runtime posts-any-not")
+	}
+	defer got.Release()
+
+	want := posting.BuildFromSorted([]uint64{8})
+	defer want.Release()
+	if got.Cardinality() != want.Cardinality() || got.AndCardinality(want) != want.Cardinality() {
+		t.Fatalf("applyToPosting mismatch: got=%v want=%v", got.ToArray(), want.ToArray())
+	}
 }
 
 func TestPredicateLeadIterMayDuplicate_RangeStatesStayUnique(t *testing.T) {
@@ -812,6 +865,9 @@ func TestBuildPredicateWithMode_AllowMaterializeSkipsColdNumericRangeUnionWhenPo
 	db, _ := openTempDBUint64(t, Options{
 		AnalyzeInterval:                         -1,
 		SnapshotMaterializedPredCacheMaxEntries: 16,
+		NumericRangeBucketSize:                  8,
+		NumericRangeBucketMinFieldKeys:          16,
+		NumericRangeBucketMinSpanKeys:           4,
 	})
 	seedGeneratedUint64Data(t, db, 12_000, func(i int) *Rec {
 		return &Rec{
@@ -1076,7 +1132,7 @@ func TestBuildPredRange_BroadPositivePostingFilterKeepsComplementCacheLocal(t *t
 	}
 }
 
-func TestBuildPredicatesOrdered_BroadComplementPromotesOnSecondSight(t *testing.T) {
+func TestBuildPredicatesOrdered_BroadComplementMaterializesOnFirstSightWhenCostWins(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
 		AnalyzeInterval:                         -1,
 		SnapshotMaterializedPredCacheMaxEntries: 16,
@@ -1116,14 +1172,11 @@ func TestBuildPredicatesOrdered_BroadComplementPromotesOnSecondSight(t *testing.
 	if len(preds1) != 1 {
 		t.Fatalf("unexpected first predicate count: %d", len(preds1))
 	}
-	if preds1[0].kind == predicateKindMaterializedNot {
-		t.Fatalf("expected first ordered broad complement to stay runtime-local")
+	if preds1[0].kind != predicateKindMaterializedNot {
+		t.Fatalf("expected first ordered broad complement to materialize, got kind=%v", preds1[0].kind)
 	}
-	if !preds1[0].hasRuntimeRangeState() {
-		t.Fatalf("expected first ordered broad complement to keep runtime range state")
-	}
-	if _, ok := db.getSnapshot().loadMaterializedPred(cacheKey); ok {
-		t.Fatalf("unexpected shared complement cache entry after first ordered build")
+	if _, ok := db.getSnapshot().loadMaterializedPred(cacheKey); !ok {
+		t.Fatalf("expected shared complement cache entry after first ordered build")
 	}
 
 	preds2, ok := db.buildPredicatesOrderedWithMode([]qx.Expr{expr}, "score", false, 4096, 0, false, true)
@@ -1140,6 +1193,195 @@ func TestBuildPredicatesOrdered_BroadComplementPromotesOnSecondSight(t *testing.
 	if _, ok := db.getSnapshot().loadMaterializedPred(cacheKey); !ok {
 		t.Fatalf("expected shared complement cache entry after second ordered build")
 	}
+}
+
+func TestBuildPredicateWithMode_RuntimeExactUnionPromotesOnSecondMaterialize(t *testing.T) {
+	run := func(
+		t *testing.T,
+		expr qx.Expr,
+		wantKind predicateKind,
+		cacheKey materializedPredKey,
+		seed func(*DB[uint64, Rec]),
+	) {
+		db, _ := openTempDBUint64(t, Options{
+			AnalyzeInterval:                         -1,
+			SnapshotMaterializedPredCacheMaxEntries: 16,
+		})
+		seed(db)
+		if err := db.RebuildIndex(); err != nil {
+			t.Fatalf("RebuildIndex: %v", err)
+		}
+
+		materialize := func() predicate {
+			p, ok := db.buildPredicateWithMode(expr, false)
+			if !ok {
+				t.Fatalf("expected predicate build to succeed")
+			}
+			if p.kind != wantKind || p.postsAnyState == nil {
+				releasePredicates([]predicate{p})
+				t.Fatalf("expected runtime exact-union predicate kind=%v, got kind=%v", wantKind, p.kind)
+			}
+			calls := p.postsAnyState.containsMaterializeAt + 1
+			for i := 0; i < calls; i++ {
+				_ = p.matches(uint64(i + 1))
+			}
+			if p.postsAnyState.ids.IsEmpty() {
+				releasePredicates([]predicate{p})
+				t.Fatalf("expected runtime exact union materialization after %d calls", calls)
+			}
+			return p
+		}
+
+		first := materialize()
+		if _, ok := db.getSnapshot().loadMaterializedPredKey(cacheKey); ok {
+			releasePredicates([]predicate{first})
+			t.Fatalf("unexpected shared exact-union cache entry after first materialize")
+		}
+		releasePredicates([]predicate{first})
+
+		second := materialize()
+		releasePredicates([]predicate{second})
+
+		cached, ok := db.getSnapshot().loadMaterializedPredKey(cacheKey)
+		if !ok || cached.IsEmpty() {
+			t.Fatalf("expected shared exact-union cache entry after second materialize")
+		}
+		defer cached.Release()
+
+		third, ok := db.buildPredicateWithMode(expr, false)
+		if !ok {
+			t.Fatalf("expected third predicate build to succeed")
+		}
+		defer releasePredicates([]predicate{third})
+		if third.kind != wantKind || third.postsAnyState == nil {
+			t.Fatalf("expected third predicate to stay runtime exact-union kind=%v, got kind=%v", wantKind, third.kind)
+		}
+		ids := third.postsAnyState.materialize()
+		if ids.IsEmpty() {
+			t.Fatalf("expected cached exact-union materialization ids")
+		}
+		if !ids.SharesPayload(cached) {
+			t.Fatalf("expected third materialize to load shared exact-union cache payload")
+		}
+	}
+
+	t.Run("IN", func(t *testing.T) {
+		vals := stringSlicePool.Get()
+		vals.Append("DE")
+		vals.Append("FR")
+		cacheKey := materializedPredKeyForDistinctSetTerms("country", qx.OpIN, vals, false)
+		stringSlicePool.Put(vals)
+
+		run(t,
+			qx.Expr{Op: qx.OpIN, Field: "country", Value: []string{"DE", "FR"}},
+			predicateKindPostsAny,
+			cacheKey,
+			func(db *DB[uint64, Rec]) {
+				seedGeneratedUint64Data(t, db, 20_000, func(i int) *Rec {
+					return &Rec{
+						Name:   fmt.Sprintf("u_%d", i),
+						Email:  fmt.Sprintf("user%05d@example.com", i),
+						Age:    18 + (i % 60),
+						Score:  float64(20_000 - i),
+						Active: i%2 == 0,
+						Meta: Meta{
+							Country: [...]string{"US", "NL", "DE", "PL", "SE", "FR", "GB", "ES"}[i%8],
+						},
+					}
+				})
+			},
+		)
+	})
+
+	t.Run("HASANY", func(t *testing.T) {
+		vals := stringSlicePool.Get()
+		vals.Append("db")
+		vals.Append("go")
+		cacheKey := materializedPredKeyForDistinctSetTerms("tags", qx.OpHASANY, vals, false)
+		stringSlicePool.Put(vals)
+
+		run(t,
+			qx.Expr{Op: qx.OpHASANY, Field: "tags", Value: []string{"go", "db"}},
+			predicateKindPostsAny,
+			cacheKey,
+			func(db *DB[uint64, Rec]) {
+				seedGeneratedUint64Data(t, db, 20_000, func(i int) *Rec {
+					return &Rec{
+						Name:   fmt.Sprintf("u_%d", i),
+						Email:  fmt.Sprintf("user%05d@example.com", i),
+						Age:    18 + (i % 60),
+						Score:  float64(i),
+						Active: i%2 == 0,
+						Tags: [...][]string{
+							{"go", "db"},
+							{"db", "ops"},
+							{"go", "perf"},
+							{"security"},
+						}[i%4],
+					}
+				})
+			},
+		)
+	})
+
+	t.Run("NOTIN", func(t *testing.T) {
+		vals := stringSlicePool.Get()
+		vals.Append("DE")
+		vals.Append("FR")
+		cacheKey := materializedPredKeyForDistinctSetTerms("country", qx.OpIN, vals, false)
+		stringSlicePool.Put(vals)
+
+		run(t,
+			qx.Expr{Op: qx.OpIN, Field: "country", Value: []string{"DE", "FR"}, Not: true},
+			predicateKindPostsAnyNot,
+			cacheKey,
+			func(db *DB[uint64, Rec]) {
+				seedGeneratedUint64Data(t, db, 20_000, func(i int) *Rec {
+					return &Rec{
+						Name:   fmt.Sprintf("u_%d", i),
+						Email:  fmt.Sprintf("user%05d@example.com", i),
+						Age:    18 + (i % 60),
+						Score:  float64(20_000 - i),
+						Active: i%2 == 0,
+						Meta: Meta{
+							Country: [...]string{"US", "NL", "DE", "PL", "SE", "FR", "GB", "ES"}[i%8],
+						},
+					}
+				})
+			},
+		)
+	})
+
+	t.Run("HASNONE", func(t *testing.T) {
+		vals := stringSlicePool.Get()
+		vals.Append("db")
+		vals.Append("go")
+		cacheKey := materializedPredKeyForDistinctSetTerms("tags", qx.OpHASANY, vals, false)
+		stringSlicePool.Put(vals)
+
+		run(t,
+			qx.Expr{Op: qx.OpHASANY, Field: "tags", Value: []string{"go", "db"}, Not: true},
+			predicateKindPostsAnyNot,
+			cacheKey,
+			func(db *DB[uint64, Rec]) {
+				seedGeneratedUint64Data(t, db, 20_000, func(i int) *Rec {
+					return &Rec{
+						Name:   fmt.Sprintf("u_%d", i),
+						Email:  fmt.Sprintf("user%05d@example.com", i),
+						Age:    18 + (i % 60),
+						Score:  float64(i),
+						Active: i%2 == 0,
+						Tags: [...][]string{
+							{"go", "db"},
+							{"db", "ops"},
+							{"go", "perf"},
+							{"security"},
+						}[i%4],
+					}
+				})
+			},
+		)
+	})
 }
 
 func TestOverlayRangeStats_ChunkedMatchesCursorScanOnLargeUniqueRange(t *testing.T) {

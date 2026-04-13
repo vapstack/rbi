@@ -1559,6 +1559,15 @@ func (qv *queryView[K, V]) decideOrderedByCost(q *qx.QX, leaves []qx.Expr) plann
 	}
 
 	orderedCost := expectedProbeRows*orderedRowFactor + float64(len(leaves))*32.0
+	orderedCost += qv.estimateOrderedAnchorSetupCost(
+		o.Field,
+		leaves,
+		snap,
+		universe,
+		orderDistinct,
+		profile.coverage,
+		int(need),
+	)
 	orderedCost *= qv.root.plannerCostMultiplier(plannerCalOrdered)
 
 	fallbackProbeFactor := plannerOrderedFallbackProbeFactor(orderSkew, profile, q.Offset)
@@ -1585,6 +1594,160 @@ func (qv *queryView[K, V]) decideOrderedByCost(q *qx.QX, leaves []qx.Expr) plann
 	d.fallbackCost = fallbackCost
 	d.use = orderedCost <= fallbackCost*gainReq
 	return d
+}
+
+func (qv *queryView[K, V]) estimateOrderedAnchorSetupCost(
+	orderField string,
+	leaves []qx.Expr,
+	snap *plannerStatsSnapshot,
+	universe uint64,
+	orderDistinct uint64,
+	coverage float64,
+	needWindow int,
+) float64 {
+	if needWindow <= 0 || universe == 0 || orderDistinct == 0 {
+		return 0
+	}
+
+	orderSpanDistinct := uint64(math.Ceil(coverage * float64(orderDistinct)))
+	if orderSpanDistinct < plannerOrderedAnchorSpanMin {
+		return 0
+	}
+
+	orderHasBuckets := orderDistinct > 0
+	activeCount := 0
+	activeRangeLikeCount := 0
+	leadFound := false
+	leadScore := 0.0
+	leadEst := uint64(0)
+	leadRangeLike := false
+
+	var mergedBaseRangesArr [plannerOrderedLeafMax]mergedBaseScalarRangeField
+	mergedBaseRanges, ok := qv.collectMergedBaseScalarRangeFields(orderField, leaves, mergedBaseRangesArr[:0])
+	if !ok {
+		return 0
+	}
+
+	for _, e := range leaves {
+		if e.Not || e.Field == "" || e.Op == qx.OpNOOP {
+			continue
+		}
+		if e.Field == orderField && len(e.Operands) == 0 && isScalarRangeEqOp(e.Op) {
+			continue
+		}
+		if e.Field != orderField && len(e.Operands) == 0 && isScalarRangeEqOp(e.Op) {
+			continue
+		}
+
+		leafSel, _, _, _, ok := qv.estimateLeafOrderCost(e, snap, universe, orderField, orderHasBuckets)
+		if !ok || leafSel <= 0 {
+			continue
+		}
+
+		activeCount++
+		rangeLike := isScalarRangeOrPrefixOp(e.Op)
+		if rangeLike {
+			activeRangeLikeCount++
+		}
+
+		estCard := uint64(leafSel * float64(universe))
+		if estCard == 0 {
+			estCard = 1
+		}
+		weight := orderedAnchorLeadOpWeight(e.Op)
+		if e.Field == orderField {
+			weight *= 2.8
+		}
+		score := float64(estCard) * weight
+		if !leadFound || score < leadScore || (score == leadScore && estCard < leadEst) {
+			leadFound = true
+			leadScore = score
+			leadEst = estCard
+			leadRangeLike = rangeLike
+		}
+	}
+
+	for _, merged := range mergedBaseRanges {
+		fieldStats := qv.plannerFieldStats(merged.field, snap, universe)
+		leafSel, _, ok := qv.estimateMergedScalarRangeOrderCost(merged.field, merged.bounds, universe, fieldStats)
+		if !ok || leafSel <= 0 {
+			continue
+		}
+
+		activeCount++
+		rangeLike := true
+		weight := orderedAnchorLeadOpWeight(qx.OpGT)
+		if !merged.bounds.hasPrefix &&
+			merged.bounds.hasLo &&
+			merged.bounds.hasHi &&
+			merged.bounds.loInc &&
+			merged.bounds.hiInc &&
+			compareRangeBoundKeys(
+				merged.bounds.loKey,
+				merged.bounds.loIndex,
+				merged.bounds.loNumeric,
+				merged.bounds.hiKey,
+				merged.bounds.hiIndex,
+				merged.bounds.hiNumeric,
+			) == 0 {
+			rangeLike = false
+			weight = orderedAnchorLeadOpWeight(qx.OpEQ)
+		}
+		if rangeLike {
+			activeRangeLikeCount++
+		}
+
+		estCard := uint64(leafSel * float64(universe))
+		if estCard == 0 {
+			estCard = 1
+		}
+		score := float64(estCard) * weight
+		if !leadFound || score < leadScore || (score == leadScore && estCard < leadEst) {
+			leadFound = true
+			leadScore = score
+			leadEst = estCard
+			leadRangeLike = rangeLike
+		}
+	}
+
+	if activeCount < plannerOrderedAnchorMinActive || !leadFound || leadEst == 0 {
+		return 0
+	}
+
+	if leadRangeLike {
+		rangeLeadMax := uint64(max(needWindow*64, 65_536))
+		if leadEst > rangeLeadMax {
+			return 0
+		}
+	}
+
+	leadBudget, candidateCap := plannerOrderedAnchorBudgets(needWindow, activeCount, leadEst)
+	if orderSpanDistinct >= orderDistinct {
+		wideLeadMax := candidateCap * 8
+		if wideLeadMax < candidateCap {
+			wideLeadMax = ^uint64(0)
+		}
+		if leadEst > wideLeadMax {
+			return 0
+		}
+	}
+
+	setupRows := leadEst
+	if setupRows > leadBudget {
+		setupRows = leadBudget
+	}
+	if setupRows == 0 {
+		return 0
+	}
+
+	nonLeadCount := activeCount - 1
+	nonLeadRangeLikeCount := activeRangeLikeCount
+	if leadRangeLike && nonLeadRangeLikeCount > 0 {
+		nonLeadRangeLikeCount--
+	}
+
+	return float64(setupRows) *
+		(1.0 + float64(nonLeadCount)*0.35 + float64(nonLeadRangeLikeCount)*0.25)
 }
 
 func (qv *queryView[K, V]) estimateOrderedProfile(orderField string, leaves []qx.Expr, orderSlice []index, snap *plannerStatsSnapshot, universe uint64) (plannerOrderedProfile, bool) {

@@ -5,7 +5,10 @@ import (
 	"strings"
 
 	"github.com/vapstack/qx"
+	"github.com/vapstack/rbi/internal/pooled"
 )
+
+var materializedPredSetKeyBufPool pooled.Buffers
 
 type materializedPredKeyKind uint8
 
@@ -16,6 +19,7 @@ const (
 	materializedPredKeyScalarComplement
 	materializedPredKeyExactScalarRange
 	materializedPredKeyNumericBucketSpan
+	materializedPredKeyDistinctSet
 )
 
 const (
@@ -26,7 +30,12 @@ const (
 	materializedPredKeyLoNumeric
 	materializedPredKeyHiNumeric
 	materializedPredKeyScalarNumeric
+	materializedPredKeySetHasNil
 )
+
+// Keep small exact-set cache keys inline so hot-path key construction stays
+// allocation-free; wider sets simply skip this cache class.
+const materializedPredKeyDistinctSetInlineMax = 4
 
 type materializedPredKey struct {
 	kind        materializedPredKeyKind
@@ -42,6 +51,8 @@ type materializedPredKey struct {
 	flags       uint8
 	startBucket int
 	endBucket   int
+	setTerms    [materializedPredKeyDistinctSetInlineMax]string
+	setValueCnt uint8
 }
 
 func (key materializedPredKey) isZero() bool {
@@ -62,11 +73,40 @@ func (key materializedPredKey) String() string {
 	switch key.kind {
 	case materializedPredKeyOpaque:
 		return key.raw
+	case materializedPredKeyDistinctSet:
+		// buf := materializedPredSetKeyBufPool.Get()
+		// defer materializedPredSetKeyBufPool.Put(buf)
+
+		var buf strings.Builder
+
+		buf.WriteString(key.field)
+		buf.WriteByte('\x1f')
+		buf.WriteString("set_exact")
+		buf.WriteByte('\x1f')
+		buf.WriteString(strconv.Itoa(int(key.op)))
+		buf.WriteByte('\x1f')
+		if key.flags&materializedPredKeySetHasNil != 0 {
+			buf.WriteByte('1')
+		} else {
+			buf.WriteByte('0')
+		}
+
+		var numBuf [24]byte
+		for i := 0; i < int(key.setValueCnt); i++ {
+			v := key.setTerms[i]
+			buf.WriteByte('\x1e')
+			buf.Write(strconv.AppendInt(numBuf[:0], int64(len(v)), 10))
+			buf.WriteByte('\x1f')
+			buf.WriteString(v)
+		}
+		return buf.String()
+
 	case materializedPredKeyScalar:
 		if key.flags&materializedPredKeyScalarNumeric != 0 {
 			return key.field + "\x1f" + strconv.Itoa(int(key.op)) + "\x1f" + "n" + "\x1f" + key.keyIndex.asUnsafeString()
 		}
 		return key.field + "\x1f" + strconv.Itoa(int(key.op)) + "\x1f" + key.key
+
 	case materializedPredKeyScalarComplement:
 		if key.flags&materializedPredKeyScalarNumeric != 0 {
 			return key.field + "\x1f" + "count_range_complement" + "\x1f" +
@@ -74,6 +114,7 @@ func (key materializedPredKey) String() string {
 		}
 		return key.field + "\x1f" + "count_range_complement" + "\x1f" +
 			strconv.Itoa(int(key.op)) + "\x1f" + key.key
+
 	case materializedPredKeyExactScalarRange:
 		loTag := ""
 		loVal := ""
@@ -109,9 +150,11 @@ func (key materializedPredKey) String() string {
 		}
 		return key.field + "\x1f" + "range_exact" + "\x1f" +
 			loTag + "\x1f" + loVal + "\x1f" + hiTag + "\x1f" + hiVal
+
 	case materializedPredKeyNumericBucketSpan:
 		return key.field + "\x1f" + "range_bucket" + "\x1f" +
 			strconv.Itoa(key.startBucket) + "\x1f" + strconv.Itoa(key.endBucket)
+
 	default:
 		return ""
 	}
@@ -224,25 +267,111 @@ func materializedPredKeyForNumericBucketSpan(field string, startBucket, endBucke
 	}
 }
 
+func materializedPredKeyForDistinctSetTerms(field string, op qx.Op, vals *pooled.SliceBuf[string], includeNil bool) materializedPredKey {
+	termCount := btoi(includeNil)
+	if vals != nil {
+		termCount += vals.Len()
+	}
+	if field == "" || termCount < 2 {
+		return materializedPredKey{}
+	}
+	switch op {
+	case qx.OpIN, qx.OpHASANY, qx.OpHAS:
+	default:
+		return materializedPredKey{}
+	}
+	if vals != nil && vals.Len() > materializedPredKeyDistinctSetInlineMax {
+		return materializedPredKey{}
+	}
+	key := materializedPredKey{
+		kind:  materializedPredKeyDistinctSet,
+		field: field,
+		op:    op,
+	}
+	if vals != nil {
+		key.setValueCnt = uint8(vals.Len())
+		for i := 0; i < vals.Len(); i++ {
+			key.setTerms[i] = vals.Get(i)
+		}
+	}
+	if includeNil {
+		key.flags |= materializedPredKeySetHasNil
+	}
+	return key
+}
+
 func materializedPredKeyFromEncoded(key string) (materializedPredKey, bool) {
 	if key == "" {
 		return materializedPredKey{}, false
 	}
-	field, rest, ok := strings.Cut(key, "\x1f")
+	f, rem, ok := strings.Cut(key, "\x1f")
 	if !ok {
 		return materializedPredKey{
 			kind: materializedPredKeyOpaque,
 			raw:  key,
 		}, true
 	}
-	if field == "" {
+	if f == "" {
 		return materializedPredKey{}, false
 	}
-	head, tail, ok := strings.Cut(rest, "\x1f")
+	head, tail, ok := strings.Cut(rem, "\x1f")
 	if !ok {
 		return materializedPredKey{}, false
 	}
 	switch head {
+	case "set_exact":
+		opStr, rest, ok := strings.Cut(tail, "\x1f")
+		if !ok {
+			return materializedPredKey{}, false
+		}
+		op, err := strconv.Atoi(opStr)
+		if err != nil {
+			return materializedPredKey{}, false
+		}
+		if rest == "" {
+			return materializedPredKey{}, false
+		}
+		out := materializedPredKey{
+			kind:  materializedPredKeyDistinctSet,
+			field: f,
+			op:    qx.Op(op),
+		}
+		switch rest[0] {
+		case '0':
+		case '1':
+			out.flags |= materializedPredKeySetHasNil
+		default:
+			return materializedPredKey{}, false
+		}
+		rest = rest[1:]
+		if len(rest) > 0 && rest[0] == '\x1f' {
+			rest = rest[1:]
+		}
+		for rest != "" {
+			if int(out.setValueCnt) >= len(out.setTerms) {
+				return materializedPredKey{}, false
+			}
+			if rest[0] != '\x1e' {
+				return materializedPredKey{}, false
+			}
+			rest = rest[1:]
+			lenStr, next, ok := strings.Cut(rest, "\x1f")
+			if !ok {
+				return materializedPredKey{}, false
+			}
+			n, err := strconv.Atoi(lenStr)
+			if err != nil || n < 0 || len(next) < n {
+				return materializedPredKey{}, false
+			}
+			out.setTerms[out.setValueCnt] = next[:n]
+			out.setValueCnt++
+			rest = next[n:]
+		}
+		if int(out.setValueCnt)+btoi(out.flags&materializedPredKeySetHasNil != 0) < 2 {
+			return materializedPredKey{}, false
+		}
+		return out, true
+
 	case "count_range_complement":
 		opStr, scalarKey, ok := strings.Cut(tail, "\x1f")
 		if !ok {
@@ -258,7 +387,7 @@ func materializedPredKeyFromEncoded(key string) (materializedPredKey, bool) {
 			}
 			return materializedPredKey{
 				kind:     materializedPredKeyScalarComplement,
-				field:    field,
+				field:    f,
 				op:       qx.Op(op),
 				keyIndex: indexKeyFromU64(fixed8StringToU64(val)),
 				flags:    materializedPredKeyScalarNumeric,
@@ -266,17 +395,18 @@ func materializedPredKeyFromEncoded(key string) (materializedPredKey, bool) {
 		}
 		return materializedPredKey{
 			kind:  materializedPredKeyScalarComplement,
-			field: field,
+			field: f,
 			op:    qx.Op(op),
 			key:   scalarKey,
 		}, true
+
 	case "range_exact":
 		if loTag, rest, ok := strings.Cut(tail, "\x1f"); ok {
 			if loVal, rest, ok := strings.Cut(rest, "\x1f"); ok {
 				if hiTag, hiVal, ok := strings.Cut(rest, "\x1f"); ok {
 					out := materializedPredKey{
 						kind:  materializedPredKeyExactScalarRange,
-						field: field,
+						field: f,
 					}
 					if loTag != "" {
 						if len(loTag) != 2 {
@@ -341,7 +471,7 @@ func materializedPredKeyFromEncoded(key string) (materializedPredKey, bool) {
 		}
 		out := materializedPredKey{
 			kind:  materializedPredKeyExactScalarRange,
-			field: field,
+			field: f,
 		}
 		if loRaw != "" {
 			switch loRaw[0] {
@@ -369,6 +499,7 @@ func materializedPredKeyFromEncoded(key string) (materializedPredKey, bool) {
 			return materializedPredKey{}, false
 		}
 		return out, true
+
 	case "range_bucket":
 		startStr, endStr, ok := strings.Cut(tail, "\x1f")
 		if !ok {
@@ -382,8 +513,9 @@ func materializedPredKeyFromEncoded(key string) (materializedPredKey, bool) {
 		if err != nil {
 			return materializedPredKey{}, false
 		}
-		out := materializedPredKeyForNumericBucketSpan(field, startBucket, endBucket)
+		out := materializedPredKeyForNumericBucketSpan(f, startBucket, endBucket)
 		return out, !out.isZero()
+
 	default:
 		op, err := strconv.Atoi(head)
 		if err != nil {
@@ -395,7 +527,7 @@ func materializedPredKeyFromEncoded(key string) (materializedPredKey, bool) {
 			}
 			return materializedPredKey{
 				kind:     materializedPredKeyScalar,
-				field:    field,
+				field:    f,
 				op:       qx.Op(op),
 				keyIndex: indexKeyFromU64(fixed8StringToU64(val)),
 				flags:    materializedPredKeyScalarNumeric,
@@ -403,7 +535,7 @@ func materializedPredKeyFromEncoded(key string) (materializedPredKey, bool) {
 		}
 		return materializedPredKey{
 			kind:  materializedPredKeyScalar,
-			field: field,
+			field: f,
 			op:    qx.Op(op),
 			key:   tail,
 		}, true

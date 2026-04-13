@@ -177,6 +177,106 @@ func TestPlannerFilterPostingByLeafChecks_PreferredExactBypassesSmallBucketFallb
 	}
 }
 
+func TestLeafPred_PostsAnyStateContainsIdxAndCountBucketUseRuntimeState(t *testing.T) {
+	postA := posting.BuildFromSorted([]uint64{1, 3, 5, 7, 9, 11, 13})
+	postB := posting.BuildFromSorted([]uint64{5, 7, 9, 15, 17, 19})
+	bucket := posting.BuildFromSorted([]uint64{1, 2, 5, 6, 7, 9, 14, 15, 17})
+	defer bucket.Release()
+
+	postsBuf := postingSlicePool.Get()
+	postsBuf.Append(postA)
+	postsBuf.Append(postB)
+
+	state := postsAnyFilterStatePool.Get()
+	state.postsBuf = postsBuf
+	state.containsMaterializeAt = 1
+
+	pred := leafPred{
+		kind:          leafPredKindPostsUnion,
+		postsBuf:      postsBuf,
+		postsAnyState: state,
+	}
+
+	defer func() {
+		postsAnyFilterStatePool.Put(state)
+		for i := 0; i < postsBuf.Len(); i++ {
+			postsBuf.Get(i).Release()
+			postsBuf.Set(i, posting.List{})
+		}
+		postingSlicePool.Put(postsBuf)
+	}()
+
+	if !pred.containsIdx(7) {
+		t.Fatalf("expected runtime state to match existing id")
+	}
+	if pred.containsIdx(6) {
+		t.Fatalf("unexpected match for missing id")
+	}
+	if state.ids.IsEmpty() {
+		t.Fatalf("expected containsIdx to materialize union through runtime state")
+	}
+
+	cnt, ok := pred.countBucket(bucket)
+	if !ok {
+		t.Fatalf("expected runtime state countBucket to stay exact")
+	}
+	if cnt != 6 {
+		t.Fatalf("unexpected runtime state bucket count: got=%d want=6", cnt)
+	}
+}
+
+func TestOrderPredicatesEmitPostingReader_SingleBucketCountSkipsWithoutMatches(t *testing.T) {
+	ids := posting.BuildFromSorted([]uint64{1, 2, 3, 4, 5, 6, 7})
+	defer ids.Release()
+
+	preds := predicateSliceView([]predicate{
+		{
+			kind: predicateKindCustom,
+			contains: func(uint64) bool {
+				panic("matches must not be called when single-check bucket skip succeeds")
+			},
+			bucketCount: func(bucket posting.List) (uint64, bool) {
+				if !bucket.SharesPayload(ids) {
+					t.Fatalf("unexpected bucket passed to countBucket")
+				}
+				return 4, true
+			},
+		},
+	})
+
+	cursor := queryCursor[uint64, Rec]{
+		skip: 4,
+		need: 1,
+	}
+	examined := uint64(0)
+	stop, nextWork := orderPredicatesEmitPostingReader(
+		&cursor,
+		preds,
+		[]int{0},
+		nil,
+		nil,
+		false,
+		ids.Borrow(),
+		posting.List{},
+		nil,
+		&examined,
+	)
+	defer nextWork.Release()
+
+	if stop {
+		t.Fatalf("unexpected stop on pure skip")
+	}
+	if cursor.skip != 0 {
+		t.Fatalf("unexpected remaining skip: got=%d want=0", cursor.skip)
+	}
+	if len(cursor.out) != 0 {
+		t.Fatalf("unexpected emitted keys during skip: %v", cursor.out)
+	}
+	if examined != ids.Cardinality() {
+		t.Fatalf("unexpected examined rows: got=%d want=%d", examined, ids.Cardinality())
+	}
+}
+
 func TestApplyBoundsToIndexRange_PrefixIntersectsRange(t *testing.T) {
 	s := []index{
 		{Key: indexKeyFromString("aa")},
@@ -1087,7 +1187,7 @@ func TestQuery_OrderBasic_DeepWindowEagerMaterializesNonOrderNumericRange(t *tes
 	}
 }
 
-func TestQuery_OrderBasic_BuildLeafPredsExcludingBounds_WarmsBroadComplement(t *testing.T) {
+func TestQuery_OrderBasic_BuildLeafPredsExcludingBounds_MaterializesBroadComplementOnFirstSightWhenCostWins(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
 		AnalyzeInterval:                         -1,
 		SnapshotMaterializedPredCacheMaxEntries: 16,
@@ -1142,17 +1242,13 @@ func TestQuery_OrderBasic_BuildLeafPredsExcludingBounds_WarmsBroadComplement(t *
 		leafPredSlicePool.Put(preds1)
 		t.Fatalf("expected predicate leaf, got kind=%v", first.kind)
 	}
-	if first.pred.kind == predicateKindMaterializedNot {
+	if first.pred.kind != predicateKindMaterializedNot {
 		leafPredSlicePool.Put(preds1)
-		t.Fatalf("expected first ordered broad complement to stay runtime-local")
-	}
-	if !first.pred.hasRuntimeRangeState() {
-		leafPredSlicePool.Put(preds1)
-		t.Fatalf("expected first ordered broad complement to keep runtime range state")
+		t.Fatalf("expected first ordered broad complement to materialize, got kind=%v", first.pred.kind)
 	}
 	leafPredSlicePool.Put(preds1)
-	if _, ok := db.getSnapshot().loadMaterializedPred(cacheKey); ok {
-		t.Fatalf("unexpected shared complement cache entry after first ordered leaf build")
+	if _, ok = db.getSnapshot().loadMaterializedPred(cacheKey); !ok {
+		t.Fatalf("expected shared complement cache entry after first ordered leaf build")
 	}
 
 	preds2, ok, err := view.buildLeafPredsExcludingBounds(leaves, "score", 4096)
@@ -1521,6 +1617,49 @@ func TestQuery_OrderBasic_WarmAnalyticsRangeUsesLimitOrderBasicPlan(t *testing.T
 	if _, err := db.QueryKeys(q); err != nil {
 		t.Fatalf("second QueryKeys: %v", err)
 	}
+	if len(events) < 2 {
+		t.Fatalf("expected at least two trace events, got %d", len(events))
+	}
+	if events[len(events)-1].Plan != string(PlanLimitOrderBasic) {
+		t.Fatalf("expected second query to use %q, got %q", PlanLimitOrderBasic, events[len(events)-1].Plan)
+	}
+}
+
+func TestQuery_OrderBasic_WarmBroadExactAndRangeUsesLimitOrderBasicPlan(t *testing.T) {
+	var events []TraceEvent
+	db, _ := openTempDBUint64(t, Options{
+		AnalyzeInterval:  -1,
+		TraceSampleEvery: 1,
+		TraceSink: func(ev TraceEvent) {
+			events = append(events, ev)
+		},
+	})
+
+	seedGeneratedUint64Data(t, db, 100_000, func(i int) *Rec {
+		return &Rec{
+			Name:   fmt.Sprintf("u_%d", i),
+			Age:    18 + (i % 50),
+			Score:  float64(i),
+			Active: i%10 != 0 && i%7 != 0,
+		}
+	})
+	if err := db.RebuildIndex(); err != nil {
+		t.Fatalf("RebuildIndex: %v", err)
+	}
+
+	q := qx.Query(
+		qx.EQ("active", true),
+		qx.GTE("score", 250.0),
+		qx.GTE("age", 20),
+	).By("score", qx.DESC).Max(50)
+
+	if _, err := db.QueryKeys(q); err != nil {
+		t.Fatalf("first QueryKeys: %v", err)
+	}
+	if _, err := db.QueryKeys(q); err != nil {
+		t.Fatalf("second QueryKeys: %v", err)
+	}
+
 	if len(events) < 2 {
 		t.Fatalf("expected at least two trace events, got %d", len(events))
 	}

@@ -41,6 +41,18 @@ func (p leafPred) postAt(i int) posting.List {
 	return p.postsBuf.Get(i)
 }
 
+func (p *leafPred) setExpectedContainsCalls(expected int) {
+	if p == nil {
+		return
+	}
+	if p.kind == leafPredKindPredicate {
+		p.pred.setExpectedContainsCalls(expected)
+	}
+	if p.postsAnyState != nil {
+		p.postsAnyState.setExpectedContainsCalls(expected)
+	}
+}
+
 func (p leafPred) hasIter() bool {
 	switch p.kind {
 	case leafPredKindEmpty:
@@ -84,11 +96,18 @@ func (p leafPred) iterNew() posting.Iterator {
 
 func (p leafPred) containsIdx(idx uint64) bool {
 	switch p.kind {
+
 	case leafPredKindPredicate:
 		return p.pred.matches(idx)
+
 	case leafPredKindPosting:
 		return p.posting.Contains(idx)
+
 	case leafPredKindPostsConcat, leafPredKindPostsUnion:
+		if p.postsAnyState != nil &&
+			(!p.postsAnyState.ids.IsEmpty() || p.postsAnyState.containsMaterializeAt == 1) {
+			return p.postsAnyState.matches(idx)
+		}
 		for i := 0; i < p.postCount(); i++ {
 			ids := p.postAt(i)
 			if ids.Contains(idx) {
@@ -96,6 +115,7 @@ func (p leafPred) containsIdx(idx uint64) bool {
 			}
 		}
 		return false
+
 	case leafPredKindPostsAll:
 		for i := 0; i < p.postCount(); i++ {
 			ids := p.postAt(i)
@@ -104,6 +124,7 @@ func (p leafPred) containsIdx(idx uint64) bool {
 			}
 		}
 		return true
+
 	default:
 		return false
 	}
@@ -155,6 +176,9 @@ func (p leafPred) countBucket(bucket posting.List) (uint64, bool) {
 	case leafPredKindPosting:
 		return p.posting.AndCardinality(bucket), true
 	case leafPredKindPostsConcat, leafPredKindPostsUnion:
+		if p.postsAnyState != nil {
+			return p.postsAnyState.countBucket(bucket)
+		}
 		return countBucketPostsAnyBuf(p.postsBuf, bucket)
 	case leafPredKindPostsAll:
 		return countBucketPostsAllBuf(p.postsBuf, bucket)
@@ -300,12 +324,14 @@ func leafPredsTryBucketPosting[K ~uint64 | ~string, V any](
 	case plannerPredicateBucketEmpty:
 		*examined += card
 		return posting.List{}, false, true, false, nextExactWork, nextApplyWork
+
 	case plannerPredicateBucketAll:
 		if exactOnly {
 			return exactIDs, true, true, leafPredsEmitMatchedPosting(cursor, exactIDs, card, trace, examined), nextExactWork, nextApplyWork
 		}
 		current = exactIDs
 		exactApplied = true
+
 	case plannerPredicateBucketExact:
 		if trace != nil {
 			trace.addPostingExactFilter(1)
@@ -320,6 +346,7 @@ func leafPredsTryBucketPosting[K ~uint64 | ~string, V any](
 		if exactOnly {
 			return exactIDs, true, true, leafPredsEmitMatchedPosting(cursor, exactIDs, currentCard, trace, examined), nextExactWork, nextApplyWork
 		}
+
 	default:
 		return ids, false, false, false, nextExactWork, nextApplyWork
 	}
@@ -886,6 +913,11 @@ func (qv *queryView[K, V]) buildLeafPredsExcludingBounds(leaves []qx.Expr, field
 						qv.tryMaterializeBroadRangeComplementPredicateForOrdered(&p.pred, orderedRoute.broadComplement, orderedUniverse, orderedWindow)
 					}
 					qv.attachLeafPredPostingFilter(&p)
+					if orderedUniverse > 0 && p.postsAnyState != nil {
+						p.setExpectedContainsCalls(
+							clampUint64ToInt(orderedPredicateExpectedRows(orderedWindow, p.estCard, orderedUniverse)),
+						)
+					}
 					predsBuf.Append(p)
 					continue
 				}
@@ -907,6 +939,11 @@ func (qv *queryView[K, V]) buildLeafPredsExcludingBounds(leaves []qx.Expr, field
 			qv.tryMaterializeBroadRangeComplementPredicateForOrdered(&p.pred, orderedRoute.broadComplement, orderedUniverse, orderedWindow)
 		}
 		qv.attachLeafPredPostingFilter(&p)
+		if orderedUniverse > 0 && p.postsAnyState != nil {
+			p.setExpectedContainsCalls(
+				clampUint64ToInt(orderedPredicateExpectedRows(orderedWindow, p.estCard, orderedUniverse)),
+			)
+		}
 		predsBuf.Append(p)
 	}
 	if predsBuf.Len() == 0 {
