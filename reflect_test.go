@@ -748,9 +748,9 @@ func TestReflectExt_MakePatch_PreservesNamedSliceType(t *testing.T) {
 	patch := db.MakePatch(oldVal, newVal)
 	fields := patchFieldsByName(patch)
 
-	gotTags, ok := fields["Tags"].(reflectNamedTags)
+	gotTags, ok := fields["tags"].(reflectNamedTags)
 	if !ok {
-		t.Fatalf("patch must contain reflectNamedTags value for Tags, got %#v", fields["Tags"])
+		t.Fatalf("patch must contain reflectNamedTags value for tags, got %#v", fields["tags"])
 	}
 	if !reflect.DeepEqual(gotTags, newVal.Tags) {
 		t.Fatalf("patch lost named slice contents: got=%#v want=%#v", gotTags, newVal.Tags)
@@ -779,9 +779,9 @@ func TestReflectExt_MakePatch_UsesFullFieldEqualityForValueIndexer(t *testing.T)
 	patch := db.MakePatch(oldVal, newVal)
 	fields := patchFieldsByName(patch)
 
-	gotKey, ok := fields["Key"].(reflectMapVI)
+	gotKey, ok := fields["key"].(reflectMapVI)
 	if !ok {
-		t.Fatalf("patch must contain reflectMapVI value for Key, got %#v", fields["Key"])
+		t.Fatalf("patch must contain reflectMapVI value for key, got %#v", fields["key"])
 	}
 	if !reflect.DeepEqual(gotKey, reflectMapVI{"id": "a", "note": "new"}) {
 		t.Fatalf("patch lost ValueIndexer-backed field contents: got=%#v", gotKey)

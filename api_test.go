@@ -662,28 +662,28 @@ func TestMakePatch_BeforeCommit_DeepCopy_SliceValues(t *testing.T) {
 
 	// expect changed fields: name and tags
 
-	if _, ok := got["Name"]; !ok {
-		t.Fatalf("expected patch to include %q, got %#v", "Name", patch)
+	if _, ok := got["name"]; !ok {
+		t.Fatalf("expected patch to include %q, got %#v", "name", patch)
 	}
-	if _, ok := got["Tags"]; !ok {
-		t.Fatalf("expected patch to include %q, got %#v", "Tags", patch)
+	if _, ok := got["tags"]; !ok {
+		t.Fatalf("expected patch to include %q, got %#v", "tags", patch)
 	}
-	if _, ok := got["Age"]; ok {
-		t.Fatalf("did not expect patch to include unchanged field %q, got %#v", "Age", patch)
-	}
-
-	if v, _ := got["Name"].(string); v != "bob" {
-		t.Fatalf("expected patched name %q, got %#v", "bob", got["Name"])
+	if _, ok := got["age"]; ok {
+		t.Fatalf("did not expect patch to include unchanged field %q, got %#v", "age", patch)
 	}
 
-	gotTags, _ := got["Tags"].([]string)
+	if v, _ := got["name"].(string); v != "bob" {
+		t.Fatalf("expected patched name %q, got %#v", "bob", got["name"])
+	}
+
+	gotTags, _ := got["tags"].([]string)
 	if len(gotTags) != 2 || gotTags[0] != "x" || gotTags[1] != "y" {
 		t.Fatalf("expected patched tags [x y], got %#v", gotTags)
 	}
 
 	origTags[0] = "MUTATED"
 
-	gotTags2, _ := got["Tags"].([]string)
+	gotTags2, _ := got["tags"].([]string)
 	if len(gotTags2) != 2 || gotTags2[0] != "x" || gotTags2[1] != "y" {
 		t.Fatalf("expected deep-copied tags [x y], got %#v", gotTags2)
 	}
@@ -698,9 +698,9 @@ func TestMakePatch_EmitsNilToEmptySliceTransition(t *testing.T) {
 	patch := db.MakePatch(oldVal, newVal)
 	fields := patchFieldsByName(patch)
 
-	gotTags, ok := fields["Tags"].([]string)
+	gotTags, ok := fields["tags"].([]string)
 	if !ok {
-		t.Fatalf("patch must contain []string value for Tags, got %#v", fields["Tags"])
+		t.Fatalf("patch must contain []string value for tags, got %#v", fields["tags"])
 	}
 	if gotTags == nil || len(gotTags) != 0 {
 		t.Fatalf("patch must preserve non-nil empty slice, got %#v", gotTags)
@@ -715,6 +715,102 @@ func TestMakePatch_EmitsNilToEmptySliceTransition(t *testing.T) {
 	}
 	if applied.Tags == nil || len(applied.Tags) != 0 {
 		t.Fatalf("patched record lost non-nil empty slice: %#v", applied.Tags)
+	}
+}
+
+func TestMakePatch_DefaultUsesDBNamesAndRoundTripsViaPatch(t *testing.T) {
+	db, _ := openTempDBUint64(t)
+
+	oldVal := &Rec{
+		Name:     "alice",
+		FullName: "Alice A.",
+	}
+	newVal := &Rec{
+		Name:     "bob",
+		FullName: "Bob B.",
+	}
+
+	mustSetAPIRec(t, db, 1, oldVal)
+
+	patch := db.MakePatch(oldVal, newVal)
+	fields := patchFieldsByName(patch)
+
+	if _, ok := fields["name"]; !ok {
+		t.Fatalf("expected patch to include %q, got %#v", "name", patch)
+	}
+	if _, ok := fields["full_name"]; !ok {
+		t.Fatalf("expected patch to include %q, got %#v", "full_name", patch)
+	}
+	if _, ok := fields["Name"]; ok {
+		t.Fatalf("did not expect patch to include Go field name %q, got %#v", "Name", patch)
+	}
+	if _, ok := fields["fullName"]; ok {
+		t.Fatalf("did not expect patch to include json field name %q, got %#v", "fullName", patch)
+	}
+
+	if err := db.Patch(1, patch, PatchStrict); err != nil {
+		t.Fatalf("Patch(MakePatch(...)): %v", err)
+	}
+
+	got, err := db.Get(1)
+	if err != nil {
+		t.Fatalf("Get(1): %v", err)
+	}
+	if got == nil {
+		t.Fatalf("Get(1): got nil")
+	}
+	defer releaseUniqueRecords(db, got)
+
+	if got.Name != "bob" || got.FullName != "Bob B." {
+		t.Fatalf("unexpected record after patch: %#v", got)
+	}
+}
+
+func TestMakePatch_PatchJSON_UsesJSONOrGoNamesAndRoundTripsViaPatch(t *testing.T) {
+	db, _ := openTempDBUint64(t)
+
+	oldVal := &Rec{
+		Name:     "alice",
+		FullName: "Alice A.",
+	}
+	newVal := &Rec{
+		Name:     "bob",
+		FullName: "Bob B.",
+	}
+
+	mustSetAPIRec(t, db, 1, oldVal)
+
+	patch := db.MakePatch(oldVal, newVal, PatchJSON)
+	fields := patchFieldsByName(patch)
+
+	if _, ok := fields["Name"]; !ok {
+		t.Fatalf("expected patch to include Go field name fallback %q, got %#v", "Name", patch)
+	}
+	if _, ok := fields["fullName"]; !ok {
+		t.Fatalf("expected patch to include json field name %q, got %#v", "fullName", patch)
+	}
+	if _, ok := fields["name"]; ok {
+		t.Fatalf("did not expect patch to include db field name %q, got %#v", "name", patch)
+	}
+	if _, ok := fields["full_name"]; ok {
+		t.Fatalf("did not expect patch to include db field name %q, got %#v", "full_name", patch)
+	}
+
+	if err := db.Patch(1, patch, PatchStrict); err != nil {
+		t.Fatalf("Patch(MakePatch(..., PatchJSON)): %v", err)
+	}
+
+	got, err := db.Get(1)
+	if err != nil {
+		t.Fatalf("Get(1): %v", err)
+	}
+	if got == nil {
+		t.Fatalf("Get(1): got nil")
+	}
+	defer releaseUniqueRecords(db, got)
+
+	if got.Name != "bob" || got.FullName != "Bob B." {
+		t.Fatalf("unexpected record after patch: %#v", got)
 	}
 }
 
@@ -763,20 +859,20 @@ func TestCollectBatchPatch_BeforeCommit_CollectsAndDeepCopies_SliceValues(t *tes
 	}
 	m1 := toMap(p1)
 
-	if _, ok = m1["Name"]; !ok {
-		t.Fatalf("id=1: expected patch to include %q, got %#v", "Name", p1)
+	if _, ok = m1["name"]; !ok {
+		t.Fatalf("id=1: expected patch to include %q, got %#v", "name", p1)
 	}
-	if _, ok = m1["Tags"]; !ok {
-		t.Fatalf("id=1: expected patch to include %q, got %#v", "Tags", p1)
+	if _, ok = m1["tags"]; !ok {
+		t.Fatalf("id=1: expected patch to include %q, got %#v", "tags", p1)
 	}
-	if _, ok = m1["Age"]; ok {
-		t.Fatalf("id=1: did not expect patch to include unchanged field %q, got %#v", "Age", p1)
+	if _, ok = m1["age"]; ok {
+		t.Fatalf("id=1: did not expect patch to include unchanged field %q, got %#v", "age", p1)
 	}
 
-	if v, _ := m1["Name"].(string); v != "bob" {
-		t.Fatalf("id=1: expected patched name %q, got %#v", "bob", m1["Name"])
+	if v, _ := m1["name"].(string); v != "bob" {
+		t.Fatalf("id=1: expected patched name %q, got %#v", "bob", m1["name"])
 	}
-	tags1, _ := m1["Tags"].([]string)
+	tags1, _ := m1["tags"].([]string)
 	if len(tags1) != 2 || tags1[0] != "x" || tags1[1] != "y" {
 		t.Fatalf("id=1: expected patched tags [x y], got %#v", tags1)
 	}
@@ -787,20 +883,20 @@ func TestCollectBatchPatch_BeforeCommit_CollectsAndDeepCopies_SliceValues(t *tes
 	}
 	m2 := toMap(p2)
 
-	if _, ok = m2["Age"]; !ok {
-		t.Fatalf("id=2: expected patch to include %q, got %#v", "Age", p2)
+	if _, ok = m2["age"]; !ok {
+		t.Fatalf("id=2: expected patch to include %q, got %#v", "age", p2)
 	}
-	if _, ok = m2["Tags"]; !ok {
-		t.Fatalf("id=2: expected patch to include %q, got %#v", "Tags", p2)
+	if _, ok = m2["tags"]; !ok {
+		t.Fatalf("id=2: expected patch to include %q, got %#v", "tags", p2)
 	}
-	if _, ok = m2["Name"]; ok {
-		t.Fatalf("id=2: did not expect patch to include unchanged field %q, got %#v", "Name", p2)
+	if _, ok = m2["name"]; ok {
+		t.Fatalf("id=2: did not expect patch to include unchanged field %q, got %#v", "name", p2)
 	}
 
-	if v, _ := m2["Age"].(int); v != 21 {
-		t.Fatalf("id=2: expected patched age %d, got %#v", 21, m2["Age"])
+	if v, _ := m2["age"].(int); v != 21 {
+		t.Fatalf("id=2: expected patched age %d, got %#v", 21, m2["age"])
 	}
-	tags2, _ := m2["Tags"].([]string)
+	tags2, _ := m2["tags"].([]string)
 	if len(tags2) != 2 || tags2[0] != "p" || tags2[1] != "q" {
 		t.Fatalf("id=2: expected patched tags [p q], got %#v", tags2)
 	}
@@ -808,11 +904,11 @@ func TestCollectBatchPatch_BeforeCommit_CollectsAndDeepCopies_SliceValues(t *tes
 	origTags1[0] = "MUTATED1"
 	origTags2[0] = "MUTATED2"
 
-	tags1b, _ := m1["Tags"].([]string)
+	tags1b, _ := m1["tags"].([]string)
 	if len(tags1b) != 2 || tags1b[0] != "x" || tags1b[1] != "y" {
 		t.Fatalf("id=1: expected deep-copied tags [x y], got %#v", tags1b)
 	}
-	tags2b, _ := m2["Tags"].([]string)
+	tags2b, _ := m2["tags"].([]string)
 	if len(tags2b) != 2 || tags2b[0] != "p" || tags2b[1] != "q" {
 		t.Fatalf("id=2: expected deep-copied tags [p q], got %#v", tags2b)
 	}

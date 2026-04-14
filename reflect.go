@@ -10,15 +10,16 @@ import (
 )
 
 type field struct {
-	Name    string
-	Unique  bool
-	Kind    reflect.Kind
-	Ptr     bool
-	Slice   bool
-	UseVI   bool
-	KeyKind fieldWriteKeyKind
-	DBName  string
-	Index   []int
+	Name     string
+	Unique   bool
+	Kind     reflect.Kind
+	Ptr      bool
+	Slice    bool
+	UseVI    bool
+	KeyKind  fieldWriteKeyKind
+	DBName   string
+	JSONName string
+	Index    []int
 }
 
 type fieldWriteKeyKind uint8
@@ -547,10 +548,11 @@ func (db *DB[K, V]) populatePatcher(t reflect.Type, idx []int) error {
 		}
 
 		f := &field{
-			Name:   rf.Name,
-			DBName: rf.Name,
-			Kind:   rf.Type.Kind(),
-			Index:  append(slices.Clone(idx), i),
+			Name:     rf.Name,
+			DBName:   rf.Name,
+			JSONName: rf.Name,
+			Kind:     rf.Type.Kind(),
+			Index:    append(slices.Clone(idx), i),
 		}
 
 		f.UseVI = rf.Type.Implements(viType)
@@ -585,6 +587,7 @@ func (db *DB[K, V]) populatePatcher(t reflect.Type, idx []int) error {
 			if jsonName == "" {
 				continue
 			}
+			f.JSONName = jsonName
 			if existing, ok := db.patchMap[jsonName]; ok && existing.Name != f.Name {
 				return fmt.Errorf("ambiguous json tag '%v' used by fields %v and %v", jsonName, existing.Name, f.Name)
 			}

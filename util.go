@@ -30,16 +30,36 @@ func forceMemoryCleanup(releaseOSMemory bool) {
 	runtime.GC()
 }
 
+// PatchOption controls MakePatch behaviour.
+type PatchOption uint8
+
+const (
+	// PatchJSON makes MakePatch emit json tag names when present.
+	// Fields without a json tag fall back to their Go struct field name.
+	PatchJSON PatchOption = 1 << iota
+)
+
 // MakePatch builds and returns a patch describing fields that changed between
 // oldVal and newVal.
 //
 // The patch includes both indexed and non-indexed fields. For every modified
-// field it adds a Field entry whose Name is the Go struct field name,
-// and whose Value is a deep copy of the value taken from newVal.
+// field it adds a Field entry whose Name uses the db tag when present or
+// Go struct field name otherwise.
+//
+// When PatchJSON is passed, Name uses the json tag when present or
+// Go struct field name otherwise.
+//
+// Value is always a deep copy taken from newVal.
 //
 // If newVal is nil, it returns an empty slice.
-func (db *DB[K, V]) MakePatch(oldVal, newVal *V) []Field {
-	return db.makePatch(oldVal, newVal, nil)
+func (db *DB[K, V]) MakePatch(oldVal, newVal *V, opts ...PatchOption) []Field {
+	useJSON := false
+	for _, opt := range opts {
+		if opt == PatchJSON {
+			useJSON = true
+		}
+	}
+	return db.makePatch(oldVal, newVal, nil, useJSON)
 }
 
 // MakePatchInto is like MakePatch, but writes the result into the provided
@@ -50,8 +70,14 @@ func (db *DB[K, V]) MakePatch(oldVal, newVal *V) []Field {
 // array or a grown one if capacity is insufficient.
 //
 // If newVal is nil, it returns an empty slice.
-func (db *DB[K, V]) MakePatchInto(oldVal, newVal *V, dst []Field) []Field {
-	return db.makePatch(oldVal, newVal, dst)
+func (db *DB[K, V]) MakePatchInto(oldVal, newVal *V, dst []Field, opts ...PatchOption) []Field {
+	useJSON := false
+	for _, opt := range opts {
+		if opt == PatchJSON {
+			useJSON = true
+		}
+	}
+	return db.makePatch(oldVal, newVal, dst, useJSON)
 }
 
 type patchScratch struct {
@@ -65,7 +91,7 @@ var patchScratchPool = pooled.Pointers[patchScratch]{
 	},
 }
 
-func (db *DB[K, V]) makePatch(oldVal, newVal *V, target []Field) []Field {
+func (db *DB[K, V]) makePatch(oldVal, newVal *V, target []Field, useJSON bool) []Field {
 	target = target[:0]
 
 	if newVal == nil {
@@ -99,9 +125,13 @@ func (db *DB[K, V]) makePatch(oldVal, newVal *V, target []Field) []Field {
 		} else {
 			value = deepCopyValue(rvNew.FieldByIndex(patchAcc.field.Index).Interface())
 		}
+		name := patchAcc.field.DBName
+		if useJSON {
+			name = patchAcc.field.JSONName
+		}
 		scratch.seen[acc.patchOrdinal] = true
 		target = append(target, Field{
-			Name:  patchAcc.field.Name,
+			Name:  name,
 			Value: value,
 		})
 		return true
@@ -133,9 +163,13 @@ func (db *DB[K, V]) makePatch(oldVal, newVal *V, target []Field) []Field {
 		} else {
 			newValue = deepCopyValue(newValue)
 		}
+		name := patchAcc.field.DBName
+		if useJSON {
+			name = patchAcc.field.JSONName
+		}
 
 		target = append(target, Field{
-			Name:  patchAcc.field.Name,
+			Name:  name,
 			Value: newValue,
 		})
 	}
