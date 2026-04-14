@@ -1,7 +1,11 @@
 package main
 
 import (
+	"bytes"
+	"encoding/json"
 	"os"
+	"path/filepath"
+	"reflect"
 	"testing"
 	"time"
 
@@ -216,5 +220,54 @@ func TestPhaseReportsTrackManualCommandBoundaries(t *testing.T) {
 	}
 	if phases[2].Kind != "manual" || phases[2].StartedByCommand != "r 0" || phases[2].EndedByCommand != "" {
 		t.Fatalf("phase2 = %+v, want current manual phase started by second command", phases[2])
+	}
+}
+
+func TestBuildReport_IncludesFinalIndexStatsOnly(t *testing.T) {
+	dir := t.TempDir()
+	handle, err := OpenBenchDB(DBConfig{
+		DBFile:         filepath.Join(dir, "stress.db"),
+		SeedRecords:    0,
+		SeedRecordsSet: true,
+	}, 0)
+	if err != nil {
+		t.Fatalf("OpenBenchDB: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := handle.Close(); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	if err := handle.DB.Set(1, generateUser(NewRand(1), 1)); err != nil {
+		t.Fatalf("Set(1): %v", err)
+	}
+
+	app := newApp(
+		handle,
+		nil,
+		time.Second,
+		time.Second,
+		filepath.Join(dir, "stress_report.json"),
+		nil,
+		nil,
+		false,
+		false,
+		false,
+		nil,
+	)
+
+	report := app.buildReport(false)
+	want := handle.DB.IndexStats()
+	if !reflect.DeepEqual(report.IndexStats, want) {
+		t.Fatalf("report.IndexStats = %+v, want %+v", report.IndexStats, want)
+	}
+
+	data, err := json.Marshal(report)
+	if err != nil {
+		t.Fatalf("Marshal(report): %v", err)
+	}
+	if got := bytes.Count(data, []byte(`"index_stats"`)); got != 1 {
+		t.Fatalf("expected final report JSON to contain exactly one index_stats section, got %d", got)
 	}
 }

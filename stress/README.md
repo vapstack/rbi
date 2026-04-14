@@ -161,6 +161,7 @@ The report contains:
 - memory samples
 - snapshot samples
 - autobatch samples
+- final `index_stats` with per-field posting bytes, key bytes, layout bytes, and approximate heap totals
 - `phases`: archived stats windows between manual interactive commands
 
 On `Ctrl+C`, the utility stops workers, writes the final report, runs `debug.FreeOSMemory()`, 

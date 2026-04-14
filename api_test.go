@@ -1494,6 +1494,8 @@ func TestAPI_IndexStats_ReturnMapsAreCallerOwned(t *testing.T) {
 	s1.FieldSize["age"] = 0
 	delete(s1.UniqueFieldKeys, "age")
 	delete(s1.FieldTotalCardinality, "age")
+	delete(s1.FieldApproxStructBytes, "age")
+	delete(s1.FieldApproxHeapBytes, "age")
 
 	s2 := db.IndexStats()
 	if s2.FieldSize["age"] == 0 {
@@ -1504,6 +1506,12 @@ func TestAPI_IndexStats_ReturnMapsAreCallerOwned(t *testing.T) {
 	}
 	if _, ok := s2.FieldTotalCardinality["age"]; !ok {
 		t.Fatalf("caller mutation leaked into IndexStats.FieldTotalCardinality")
+	}
+	if _, ok := s2.FieldApproxStructBytes["age"]; !ok {
+		t.Fatalf("caller mutation leaked into IndexStats.FieldApproxStructBytes")
+	}
+	if _, ok := s2.FieldApproxHeapBytes["age"]; !ok {
+		t.Fatalf("caller mutation leaked into IndexStats.FieldApproxHeapBytes")
 	}
 }
 

@@ -299,6 +299,7 @@ func (a *stressApp) buildReport(interrupted bool) stressReport {
 		BatchBaseline:     batchBase,
 		BatchFinal:        batchFinal,
 		BatchSamples:      batchSamples,
+		IndexStats:        a.handle.DB.IndexStats(),
 	}
 }
 

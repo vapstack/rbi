@@ -953,27 +953,82 @@ type (
 
 	// IndexStats contains expensive index shape and memory diagnostics.
 	IndexStats struct {
-		// UniqueFieldKeys contains the number of unique index keys per indexed field name.
+		// UniqueFieldKeys contains distinct logical value keys per field in the
+		// regular value index.
+		//
+		// It excludes the synthetic nil-family entry and excludes slice-length
+		// helper indexes. On multivalue fields it counts distinct field values,
+		// not records.
 		UniqueFieldKeys map[string]uint64
-		// IndexSize contains the total size of the index, in bytes.
+		// Size contains posting payload bytes across all covered field index
+		// families.
+		//
+		// It is the sum of FieldSize and includes nil-family postings when a
+		// field has indexed nils. It excludes raw key storage and structural
+		// layout overhead.
 		Size uint64
-		// IndexFieldSize contains the size of the index for each indexed field.
+		// FieldSize contains posting payload bytes per field across the covered
+		// field index families.
+		//
+		// This includes nil-family postings for the field, but excludes raw key
+		// storage and structural layout overhead.
 		FieldSize map[string]uint64
-		// IndexFieldKeyBytes contains total bytes occupied by index keys per field.
+		// FieldKeyBytes contains raw retained key bytes per field in the regular
+		// value index.
+		//
+		// String keys contribute their byte length. Numeric keys contribute 8
+		// bytes each. Synthetic nil-family entries are excluded.
 		FieldKeyBytes map[string]uint64
-		// IndexFieldTotalCardinality contains sum of posting-list cardinalities per field.
+		// FieldTotalCardinality contains the sum of posting-list cardinalities
+		// per field across the covered field index families.
+		//
+		// This includes nil-family postings. Multivalue fields can exceed the
+		// number of records because one record may appear in multiple postings.
 		FieldTotalCardinality map[string]uint64
+		// FieldApproxStructBytes contains approximate structural/layout overhead
+		// per field.
+		//
+		// It includes roots, pages, chunk metadata, owner arrays, and a share of
+		// the top-level field-storage slot owners so that the map sums to
+		// ApproxStructBytes. It excludes posting payload bytes and raw key bytes.
+		FieldApproxStructBytes map[string]uint64
+		// FieldApproxHeapBytes contains approximate total heap per field for the
+		// same covered storage as the other per-field maps.
+		//
+		// For each field it is FieldSize + FieldKeyBytes +
+		// FieldApproxStructBytes, and the map sums to ApproxHeapBytes.
+		FieldApproxHeapBytes map[string]uint64
 
-		// EntryCount is the total number of non-empty index entries across fields.
+		// EntryCount is the total number of non-empty index entries across the
+		// covered field index families.
+		//
+		// This includes synthetic nil-family entries.
 		EntryCount uint64
-		// KeyBytes is the total byte length of index keys across entries.
+		// KeyBytes is the total raw key bytes across regular value-index entries.
+		//
+		// It is the sum of FieldKeyBytes.
 		KeyBytes uint64
-		// PostingCardinality is the sum of posting cardinalities across entries.
+		// PostingCardinality is the sum of posting cardinalities across the
+		// covered field index families.
+		//
+		// It is the sum of FieldTotalCardinality.
 		PostingCardinality uint64
 
-		// ApproxStructBytes is approximate memory used by index entry structs.
+		// ApproxStructBytes is approximate layout overhead from roots, pages,
+		// chunk metadata, and pooled owner arrays.
+		//
+		// It excludes posting payload bytes and raw key bytes, and is the sum of
+		// FieldApproxStructBytes.
 		ApproxStructBytes uint64
-		// ApproxHeapBytes is rough index heap estimate from bitmaps, keys and structs.
+		// ApproxHeapBytes is the approximate total heap for the covered field
+		// index storage.
+		//
+		// It is Size + KeyBytes + ApproxStructBytes, and also the sum of
+		// FieldApproxHeapBytes.
+		//
+		// Coverage is limited to regular field value indexes plus synthetic
+		// nil-family indexes. It excludes slice-length helper indexes, universe
+		// bitmap state, string-key mapping state, and runtime query caches.
 		ApproxHeapBytes uint64
 	}
 
@@ -1333,7 +1388,8 @@ func (db *DB[K, V]) statsKeyFromIdx(snap *indexSnapshot, idx uint64) K {
 //
 // In indexed mode it walks the published index snapshot and reports per-field
 // entry counts, key bytes, posting cardinalities, and approximate memory
-// usage. On large databases this can be expensive.
+// usage for regular field value indexes plus synthetic nil-family indexes.
+// On large databases this can be expensive.
 //
 // In transparent mode it returns a zero-valued IndexStats because no secondary
 // indexes, universe bitmap, or string-key runtime mapping are maintained.
@@ -1350,36 +1406,49 @@ func (db *DB[K, V]) IndexStats() IndexStats {
 	defer db.unpinCurrentSnapshot(seq, ref, pinned)
 
 	idx := IndexStats{
-		UniqueFieldKeys:       make(map[string]uint64),
-		FieldSize:             make(map[string]uint64),
-		FieldKeyBytes:         make(map[string]uint64),
-		FieldTotalCardinality: make(map[string]uint64),
+		UniqueFieldKeys:        make(map[string]uint64),
+		FieldSize:              make(map[string]uint64),
+		FieldKeyBytes:          make(map[string]uint64),
+		FieldTotalCardinality:  make(map[string]uint64),
+		FieldApproxStructBytes: make(map[string]uint64),
+		FieldApproxHeapBytes:   make(map[string]uint64),
 	}
-	idx.Size = 0
-	idx.EntryCount = 0
-	idx.KeyBytes = 0
-	idx.PostingCardinality = 0
-	idx.ApproxStructBytes = 0
-	idx.ApproxHeapBytes = 0
+	sharedStructBytes := approxSliceBufBytes(snap.index) + approxSliceBufBytes(snap.nilIndex)
+	fieldCount := len(db.indexedFieldAccess)
+	sharedStructPerField := uint64(0)
+	sharedStructRemainder := uint64(0)
+	if fieldCount > 0 {
+		sharedStructPerField = sharedStructBytes / uint64(fieldCount)
+		sharedStructRemainder = sharedStructBytes % uint64(fieldCount)
+	}
 
-	for _, acc := range db.indexedFieldAccess {
+	for i, acc := range db.indexedFieldAccess {
 		name := acc.name
-		var (
-			unique uint64
-			size   uint64
-			keyLen uint64
-			card   uint64
-		)
-		accumulateIndexStats(newFieldOverlayStorage(snap.index.Get(acc.ordinal)), true, &unique, &size, &keyLen, &card, &idx)
-		accumulateIndexStats(newFieldOverlayStorage(snap.nilIndex.Get(acc.ordinal)), false, &unique, &size, &keyLen, &card, &idx)
+		fieldStats := collectFieldIndexStats(snap.index.Get(acc.ordinal), true)
+		nilStats := collectFieldIndexStats(snap.nilIndex.Get(acc.ordinal), false)
+
+		unique := fieldStats.unique + nilStats.unique
+		size := fieldStats.postingBytes + nilStats.postingBytes
+		keyLen := fieldStats.keyBytes + nilStats.keyBytes
+		card := fieldStats.postingCardinality + nilStats.postingCardinality
 
 		idx.UniqueFieldKeys[name] = unique
 		idx.FieldSize[name] = size
 		idx.FieldKeyBytes[name] = keyLen
 		idx.FieldTotalCardinality[name] = card
+		fieldStructBytes := fieldStats.approxStructBytes + nilStats.approxStructBytes + sharedStructPerField
+		if uint64(i) < sharedStructRemainder {
+			fieldStructBytes++
+		}
+		idx.FieldApproxStructBytes[name] = fieldStructBytes
+		idx.FieldApproxHeapBytes[name] = size + keyLen + fieldStructBytes
+
 		idx.Size += size
+		idx.EntryCount += fieldStats.entryCount + nilStats.entryCount
+		idx.KeyBytes += keyLen
+		idx.PostingCardinality += card
+		idx.ApproxStructBytes += fieldStructBytes
 	}
-	idx.ApproxStructBytes = idx.EntryCount * uint64(unsafe.Sizeof(index{}))
 	idx.ApproxHeapBytes = idx.Size + idx.KeyBytes + idx.ApproxStructBytes
 	return idx
 }
@@ -1397,39 +1466,103 @@ func recoverPublishAfterCommit[K ~string | ~uint64, V any](db *DB[K, V], seq uin
 	}
 }
 
-func accumulateIndexStats(
-	ov fieldOverlay,
-	countDistinct bool,
-	unique *uint64,
-	size *uint64,
-	keyLen *uint64,
-	card *uint64,
-	idx *IndexStats,
-) {
-	br := ov.rangeForBounds(rangeBounds{has: true})
-	if br.baseStart >= br.baseEnd {
-		return
+type fieldIndexStats struct {
+	unique             uint64
+	postingBytes       uint64
+	keyBytes           uint64
+	postingCardinality uint64
+	entryCount         uint64
+	approxStructBytes  uint64
+}
+
+func collectFieldIndexStats(storage fieldIndexStorage, countDistinct bool) fieldIndexStats {
+	if storage.flat != nil {
+		return collectFlatFieldIndexStats(storage.flat, countDistinct)
 	}
-	cur := ov.newCursor(br, false)
-	for {
-		key, ids, ok := cur.next()
-		if !ok {
-			return
+	if storage.chunked != nil {
+		return collectChunkedFieldIndexStats(storage.chunked, countDistinct)
+	}
+	return fieldIndexStats{}
+}
+
+func collectFlatFieldIndexStats(root *fieldIndexFlatRoot, countDistinct bool) fieldIndexStats {
+	if root == nil {
+		return fieldIndexStats{}
+	}
+	stats := fieldIndexStats{
+		approxStructBytes: uint64(unsafe.Sizeof(fieldIndexFlatRoot{})) +
+			uint64(cap(root.entries))*uint64(unsafe.Sizeof(index{})),
+	}
+	for i := range root.entries {
+		entry := root.entries[i]
+		if entry.Key.isNumeric() {
+			stats.approxStructBytes -= uint64(unsafe.Sizeof(uint64(0)))
 		}
-		if ids.IsEmpty() {
+		accumulateIndexEntryStats(entry.Key, entry.IDs, countDistinct, &stats)
+	}
+	return stats
+}
+
+func collectChunkedFieldIndexStats(root *fieldIndexChunkedRoot, countDistinct bool) fieldIndexStats {
+	if root == nil {
+		return fieldIndexStats{}
+	}
+	stats := fieldIndexStats{
+		approxStructBytes: uint64(unsafe.Sizeof(fieldIndexChunkedRoot{})) +
+			approxSliceBufBytes(root.pages) +
+			approxSliceBufBytes(root.chunkPrefix) +
+			approxSliceBufBytes(root.prefix) +
+			approxSliceBufBytes(root.rowPrefix),
+	}
+	for i := 0; i < root.pages.Len(); i++ {
+		page := root.pages.Get(i)
+		if page == nil {
 			continue
 		}
-		if countDistinct {
-			*unique += 1
-			*keyLen += uint64(key.byteLen())
+		stats.approxStructBytes += uint64(unsafe.Sizeof(fieldIndexChunkDirPage{})) +
+			approxSliceBufBytes(page.refs) +
+			approxSliceBufBytes(page.prefix) +
+			approxSliceBufBytes(page.rowPrefix)
+
+		for j := 0; j < page.refsLen(); j++ {
+			chunk := page.refAt(j).chunk
+			if chunk == nil {
+				continue
+			}
+			stats.approxStructBytes += uint64(unsafe.Sizeof(fieldIndexChunk{})) +
+				uint64(cap(chunk.posts))*uint64(unsafe.Sizeof(posting.List{}))
+			if chunk.numeric == nil {
+				stats.approxStructBytes += uint64(cap(chunk.stringRefs)) * uint64(unsafe.Sizeof(fieldIndexStringRef{}))
+			}
+			for k := 0; k < chunk.keyCount(); k++ {
+				accumulateIndexEntryStats(chunk.keyAt(k), chunk.posts[k], countDistinct, &stats)
+			}
 		}
-		*size += ids.SizeInBytes()
-		curCard := ids.Cardinality()
-		*card += curCard
-		idx.EntryCount++
-		idx.KeyBytes += uint64(key.byteLen())
-		idx.PostingCardinality += curCard
 	}
+	return stats
+}
+
+func accumulateIndexEntryStats(key indexKey, ids posting.List, countDistinct bool, stats *fieldIndexStats) {
+	if ids.IsEmpty() {
+		return
+	}
+	if countDistinct {
+		stats.unique++
+		stats.keyBytes += uint64(key.byteLen())
+	}
+	stats.postingBytes += ids.SizeInBytes()
+	card := ids.Cardinality()
+	stats.postingCardinality += card
+	stats.entryCount++
+}
+
+func approxSliceBufBytes[T any](buf *pooled.SliceBuf[T]) uint64 {
+	if buf == nil {
+		return 0
+	}
+	var zero T
+	return uint64(unsafe.Sizeof(pooled.SliceBuf[T]{})) +
+		uint64(buf.Cap())*uint64(unsafe.Sizeof(zero))
 }
 
 // AutoBatchStats returns auto-batcher queue, batch, and availability diagnostics.

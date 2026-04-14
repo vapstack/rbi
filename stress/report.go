@@ -6,7 +6,7 @@ import (
 	"github.com/vapstack/rbi"
 )
 
-const reportSchema = "rbi.stress_report/v6"
+const reportSchema = "rbi.stress_report/v8"
 
 type stressReport struct {
 	Schema      string `json:"schema"`
@@ -46,6 +46,8 @@ type stressReport struct {
 	BatchBaseline batchSample   `json:"batch_baseline"`
 	BatchFinal    batchSample   `json:"batch_final"`
 	BatchSamples  []batchSample `json:"batch_samples,omitempty"`
+
+	IndexStats rbi.IndexStats `json:"index_stats"`
 }
 
 type classReport struct {

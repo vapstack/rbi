@@ -14,15 +14,14 @@ query capabilities, while preserving bbolt’s ACID guarantees for data storage.
 Indexes are kept fully in memory and built on a heavily reworked fork of
 [roaring64](https://github.com/RoaringBitmap/roaring) for compact memory layout and fast set operations.
 
-### Properties
+RBI is not a replacement for a relational database.
+
+### Features
 
 * ACID – data durability is delegated to bbolt.
 * Index-only filtering – disk is never touched.
 * Document-oriented – queries return whole records, not individual fields.
 * Strong typing – generic API with user-defined key and value types.
-
-### Features
-
 * Automatic indexing of exported struct fields
 * Fine-grained control via struct tags (`db`, `dbi`, `rbi`)
 * Efficient query building via [qx package](https://github.com/vapstack/qx):
@@ -397,13 +396,76 @@ Transparent mode does not load or write `.rbi` files.
 
 ## Memory usage
 
-All secondary indexes are kept in memory.\
-Memory usage is roughly proportional to:
-* number of indexed fields,
-* number of records,
-* cardinality and distribution of indexed values.
+All secondary indexes are kept in memory.
 
-Careful index configuration is recommended for very large datasets.
+Memory usage is mainly driven by:
+
+- number of indexed fields
+- number of records
+- distinct value count per field
+- average value length in bytes
+
+### Rough planning estimates
+
+- `N` = number of non-nil records for the field
+- `D` = number of distinct indexed values for the field
+- `L` = average string length in bytes
+- `K` = key size in bytes (8 for numeric fields, `L` for strings)
+
+### Unique string fields
+
+```text
+ApproxMem(field) ~= N * (L + 8 + 8 + 18)
+                 ~= N * (L + 34)
+```
+
+For 5,000,000 rows with an average string length of 22 bytes, the estimate is:\
+`5,000,000 * (22 + 34) ~= 270 MiB`
+
+### Unique numeric fields
+
+```text
+ApproxMem(field) ~= N * (8 + 8 + 18)
+                 ~= N * 34
+```
+
+For unique numeric fields, 
+the total cost is usually close to 34 bytes per non-nil row.
+
+### Non-unique scalar fields
+
+```text
+ApproxMem(field) ~= D * (K + 25) + PostingBytes
+```
+
+**PostingBytes** depends on data distribution.
+Low-cardinality fields are often much cheaper than unique fields because large
+postings compress well.
+
+### Slice fields
+
+For slice fields, memory scales with total memberships rather than record count:
+```text
+ApproxMem(field) ~= D * (K + 25) + PostingBytes(total_memberships)
+```
+
+If each record contains multiple tags/roles/etc., the posting part can be
+several times larger than the record count.
+
+How to estimate:
+
+1. Estimate `N`, `D`, and average value length `L` per indexed field.
+2. Use `N * (L + 34)` for large unique string fields.
+3. Use `N * 34` for large unique numeric fields.
+4. Use `D * (K + 25) + PostingBytes` for non-unique fields, with the
+   understanding that `PostingBytes` is distribution-dependent.
+5. Keep some extra headroom for shared structures, caches, and other overhead.
+
+### GC pressure
+
+RBI uses semi-manual memory management to minimize GC pressure.
+Most internal and intermediate structures are pooled and reused.
+Index structures use ownership-aware copy-on-write behaviour.
 
 ## Multiple instances
 
@@ -530,5 +592,5 @@ Batch APIs (`BatchSet`, `BatchPatch`, `BatchDelete`) significantly reduce per-re
 
 ## Contributing
 
-Pull requests are welcome.\
+Documentation and bug fixes are welcome as pull requests.\
 For major changes, please open an issue first.
