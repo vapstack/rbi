@@ -266,7 +266,7 @@ Available hooks/options:
 
 - `CloneFunc` - optional helper for `Set`/`BatchSet` with `BeforeStore`.
   It can be used when the value becomes encodable only after normalization, or
-  simply as a faster cloning path than RBI's fallback msgpack snapshotting.
+  simply as a faster cloning path than RBI's fallback encode/decode snapshotting.
   If `CloneFunc` is omitted and `*V` implements `Clone() *V`, RBI uses that
   method automatically.
 
@@ -481,7 +481,8 @@ if explicit control is required (e.g. when value type is renamed).
 
 ## Encoding and schema evolution
 
-Values are encoded using [msgpack](https://github.com/vmihailenco/msgpack).
+Values are encoded using [msgpack](https://github.com/vmihailenco/msgpack) by
+default. If `*V` implements `Codec`, it is used instead.
 
 Msgpack provides good performance, compact binary representation, and a
 flat encoding model similar to JSON. This makes it tolerant to many
@@ -502,6 +503,18 @@ Most schema changes are handled gracefully:
 
 Indexes for affected fields are automatically rebuilt when schema changes are
 detected.
+
+### Custom encoding
+
+Type can implement `Codec` interface:
+```go
+type Codec interface {
+    EncodeRBI(io.Writer) error
+    DecodeRBI(io.Reader) error
+}
+```
+If it does, RBI uses it instead of msgpack for all encoding/decoding work.
+Fallback decoding, if required, is the responsibility of the implementation.
 
 ## Non-goals
 

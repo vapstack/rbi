@@ -3,6 +3,7 @@ package rbi
 import (
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"maps"
 	"math"
@@ -344,6 +345,10 @@ func New[K ~uint64 | ~string, V any](bolt *bbolt.DB, options Options, execOpts .
 	var defaultExecOptions execOptions[K, V]
 	applyExecOptions(&defaultExecOptions, execOpts)
 	defaultExecOptions = freezeExecOptions(defaultExecOptions)
+	codecEncode, codecDecode, err := defaultCodecMethods[V]()
+	if err != nil {
+		return nil, err
+	}
 
 	boltPath := bolt.Path()
 
@@ -371,6 +376,8 @@ func New[K ~uint64 | ~string, V any](bolt *bbolt.DB, options Options, execOpts .
 
 		options:     &options,
 		execOptions: defaultExecOptions,
+		codecEncode: codecEncode,
+		codecDecode: codecDecode,
 		snapshot: snapshot{
 			bySeq:        make(map[uint64]*snapshotRef, 128),
 			statsEnabled: options.EnableSnapshotStats,
@@ -861,6 +868,9 @@ type (
 		execOptions execOptions[K, V]
 
 		rbiFile string
+
+		encodeFn func(*V, io.Writer) error
+		decodeFn func(*V, io.Reader) error
 
 		recPool  pooled.Pointers[V]
 		viewPool pooled.Pointers[queryView[K, V]]

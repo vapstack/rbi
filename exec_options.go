@@ -93,12 +93,12 @@ func NoBatch[K ~string | ~uint64, V any](cfg *execOptions[K, V]) {
 // BeforeStore is invoked only for records that are being inserted or updated.
 // Delete operations and missing Patch targets do not invoke it.
 //
-// For Set/BatchSet, RBI normally snapshots the input value through msgpack
+// For Set/BatchSet, RBI normally snapshots the input value through
 // encode/decode before BeforeStore runs so it can safely isolate retries and
-// caller-owned objects. If the value only becomes encodable after BeforeStore
-// normalizes it, or if the caller can produce an independent copy faster than
-// RBI's fallback msgpack snapshotting, pass CloneFunc. If CloneFunc is not
-// provided and *V implements Clone() *V, RBI uses that method automatically.
+// caller-owned objects. If the value only becomes encodable after
+// BeforeStore normalizes it, or if the caller can produce an independent copy
+// faster than RBI's fallback snapshotting, pass CloneFunc. If CloneFunc is not
+// provided and *V implements `Clone() *V`, RBI uses that method automatically.
 //
 // BeforeStore may be passed more than once. Hooks passed to New are invoked
 // before per-operation hooks.
@@ -115,11 +115,11 @@ func BeforeStore[K ~string | ~uint64, V any](fn func(key K, oldValue, newValue *
 // hooks are present.
 //
 // When provided, RBI uses CloneFunc to create an internal baseline copy before
-// BeforeStore runs instead of snapshotting the value through msgpack
-// encode/decode. This is useful for values that only become encodable after
+// BeforeStore runs instead of snapshotting the value through encode/decode.
+// This is useful for values that only become encodable after
 // BeforeStore normalizes them, and it may also reduce cloning overhead when
 // the caller can produce an independent copy faster than RBI's fallback
-// msgpack snapshotting.
+// snapshotting.
 //
 // CloneFunc:
 //   - Receives the write key and source value.
@@ -129,9 +129,10 @@ func BeforeStore[K ~string | ~uint64, V any](fn func(key K, oldValue, newValue *
 //   - Must be deterministic and free of external side effects.
 //
 // If CloneFunc is not provided and *V implements Clone() *V, RBI uses that
-// method automatically. Otherwise RBI falls back to msgpack snapshotting before
-// BeforeStore for Set/BatchSet. Patch/BatchPatch ignore CloneFunc because they
-// already rebuild a fresh working copy from stored bytes.
+// method automatically. Otherwise, RBI falls back to encode/decode snapshotting
+// before BeforeStore for Set/BatchSet.
+// Patch/BatchPatch ignore CloneFunc because they already rebuild a fresh
+// working copy from stored bytes.
 //
 // CloneFunc may be passed more than once. The last non-nil CloneFunc wins.
 // When passed to New, CloneFunc becomes the default for matching write

@@ -30,6 +30,21 @@ func forceMemoryCleanup(releaseOSMemory bool) {
 	runtime.GC()
 }
 
+// Codec overrides default msgpack encoding/decoding for *V.
+//
+// EncodeRBI must write the full encoded form of the receiver to w.
+// DecodeRBI must populate the receiver from the encoded form read from r.
+//
+// RBI does not retry decoding with msgpack when DecodeRBI returns an error.
+// If fallback decoding is needed, implement it inside the
+// custom codec, for example by using github.com/vmihailenco/msgpack/v5.
+type Codec interface {
+	EncodeRBI(io.Writer) error
+	DecodeRBI(io.Reader) error
+}
+
+var codecType = reflect.TypeFor[Codec]()
+
 // PatchOption controls MakePatch behaviour.
 type PatchOption uint8
 
@@ -316,21 +331,67 @@ var msgpackEncPool = pooled.Pointers[msgpack.Encoder]{
 }
 
 var msgpackDecPool = pooled.Pointers[msgpack.Decoder]{
-	New: func() *msgpack.Decoder { return msgpack.NewDecoder(strings.NewReader("")) },
+	New: func() *msgpack.Decoder {
+		return msgpack.NewDecoder(strings.NewReader(""))
+	},
 }
 
-var msgpackReaderPool = pooled.Pointers[bytes.Reader]{Clear: true}
+var decodeReaderPool = pooled.Pointers[bytes.Reader]{
+	Clear: true,
+}
+
+func defaultCodecMethods[V any]() (func(*V, io.Writer) error, func(*V, io.Reader) error, error) {
+	t := reflect.TypeFor[*V]()
+	if !t.Implements(codecType) {
+		return nil, nil, nil
+	}
+	if _, bad := reflect.TypeFor[V]().MethodByName("DecodeRBI"); bad {
+		return nil, nil, fmt.Errorf("invalid Codec implementation for %v: DecodeRBI must have pointer receiver", t)
+	}
+
+	encodeMethod, ok := t.MethodByName("EncodeRBI")
+	if !ok {
+		return nil, nil, nil
+	}
+	encodeFn, ok := encodeMethod.Func.Interface().(func(*V, io.Writer) error)
+	if !ok {
+		return nil, nil, nil
+	}
+
+	decodeMethod, ok := t.MethodByName("DecodeRBI")
+	if !ok {
+		return nil, nil, nil
+	}
+	decodeFn, ok := decodeMethod.Func.Interface().(func(*V, io.Reader) error)
+	if !ok {
+		return nil, nil, nil
+	}
+
+	return encodeFn, decodeFn, nil
+}
 
 func (db *DB[K, V]) decode(b []byte) (*V, error) {
 	v := db.recPool.Get()
-	dec := msgpackDecPool.Get()
-	reader := msgpackReaderPool.Get()
+
+	reader := decodeReaderPool.Get()
+	defer decodeReaderPool.Put(reader)
+
 	reader.Reset(b)
+
+	if db.decodeFn != nil {
+		if err := db.decodeFn(v, reader); err != nil {
+			db.ReleaseRecords(v)
+			return nil, err
+		}
+		return v, nil
+	}
+
+	dec := msgpackDecPool.Get()
+	defer msgpackDecPool.Put(dec)
+
 	dec.Reset(reader)
-	err := dec.Decode(v)
-	msgpackReaderPool.Put(reader)
-	msgpackDecPool.Put(dec)
-	if err != nil {
+
+	if err := dec.Decode(v); err != nil {
 		db.ReleaseRecords(v)
 		return nil, err
 	}
@@ -338,6 +399,9 @@ func (db *DB[K, V]) decode(b []byte) (*V, error) {
 }
 
 func (db *DB[K, V]) encode(v *V, b *bytes.Buffer) error {
+	if db.encodeFn != nil {
+		return db.encodeFn(v, b)
+	}
 	enc := msgpackEncPool.Get()
 	enc.Reset(b)
 	err := enc.Encode(v)

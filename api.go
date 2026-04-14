@@ -326,7 +326,7 @@ func (db *DB[K, V]) SeqScan(seek K, fn func(K, *V) (bool, error)) error {
 
 // SeqScanRaw performs a sequential scan over all records starting at the
 // given key (inclusive), passing raw bytes to the provided fn.
-// These bytes are msgpack-encoded representation of the values.
+// These bytes are encoded representation of the values.
 //
 // SeqScanRaw stops reading when the provided fn returns false or a non-nil error.
 // The database transaction remains open during the scan.
@@ -376,16 +376,19 @@ func (db *DB[K, V]) SeqScanRaw(seek K, fn func(K, []byte) (bool, error)) error {
 // BeforeProcess hooks, if any, run on the caller-owned input value before RBI
 // starts encoding, cloning, queueing, or transactional work for Set.
 //
-// The value is msgpack-encoded and written inside a single write
-// transaction. Any existing value for the key is decoded and passed as oldValue
-// to BeforeStore and BeforeCommit hooks. BeforeStore may modify the stored
-// value before it is encoded. If BeforeStore is used and CloneFunc is not
-// provided, RBI first checks whether *V implements Clone() *V and uses it when
-// available. Otherwise, the input value must already be msgpack-encodable
-// because RBI falls back to encode/decode snapshotting before the hook runs.
+// The value is encoded and written inside a single write transaction.
+// Any existing value for the key is decoded and passed as oldValue to BeforeStore
+// and BeforeCommit hooks. BeforeStore may modify the stored value before it is
+// encoded. If *V implements Codec, it is used directly; otherwise msgpack is used.
+//
+// If BeforeStore is used and CloneFunc is not provided, Set checks
+// whether *V implements Clone() *V and uses it when available.
+// Otherwise, the input value must already be encodable because Set falls back
+// to encode/decode snapshotting before the hook runs.
+//
 // CloneFunc can also be used as a faster cloning path when the caller can
-// produce an independent copy more cheaply than msgpack snapshotting. If any
-// hook returns an error, the transaction is rolled back and the error is
+// produce an independent copy more cheaply than RBI's fallback snapshotting.
+// If any hook returns an error, the transaction is rolled back and the error is
 // returned.
 func (db *DB[K, V]) Set(id K, newVal *V, execOpts ...ExecOption[K, V]) error {
 	if newVal == nil {
@@ -420,14 +423,16 @@ func (db *DB[K, V]) Set(id K, newVal *V, execOpts ...ExecOption[K, V]) error {
 // starts encoding, cloning, queueing, or transactional work for BatchSet.
 //
 // For each key, any existing value is decoded and passed as oldValue to all
-// configured BeforeStore and BeforeCommit hooks. If an error is encountered during any of
-// the processing steps, the transaction is rolled back and the error is returned.
-// If BeforeStore is used and CloneFunc is not provided, RBI first checks
-// whether *V implements Clone() *V and uses it when available. Otherwise each
-// input value must already be msgpack-encodable because RBI falls back to
-// encode/decode snapshotting before the hook runs. CloneFunc can also be used
-// as a faster cloning path when the caller can produce an independent copy
-// more cheaply than msgpack snapshotting.
+// configured BeforeStore and BeforeCommit hooks.
+// If an error is encountered during any of the processing steps,
+// the transaction is rolled back and the error is returned.
+// If BeforeStore is used and CloneFunc is not provided, BatchSet first checks
+// whether *V implements `Clone() *V` and uses it when available.
+// Otherwise, each input value must already be encodable because BatchSet
+// falls back to encode/decode snapshotting before the hook runs.
+//
+// CloneFunc can also be used as a faster cloning path when the caller can
+// produce an independent copy more cheaply than RBI's fallback snapshotting.
 //
 // After a successful commit, the in-memory index is updated for all modified keys.
 //
