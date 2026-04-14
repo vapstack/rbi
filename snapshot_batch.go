@@ -270,26 +270,36 @@ func addFixedFieldBatchPostingDelta(fieldDelta map[uint64]batchPostingDelta, key
 	return fieldDelta
 }
 
-func collectFieldBatchPostingDiff(
+func collectFieldBatchPostingDiffBuf(
 	fieldDelta map[string]uint32,
 	arena **batchPostingAccumArena,
 	idx uint64,
-	oldVals, newVals []string,
+	oldVals, newVals *pooled.SliceBuf[string],
 ) (map[string]uint32, bool) {
-	if len(oldVals) == 0 && len(newVals) == 0 {
+	oldLen := 0
+	if oldVals != nil {
+		oldLen = oldVals.Len()
+	}
+	newLen := 0
+	if newVals != nil {
+		newLen = newVals.Len()
+	}
+	if oldLen == 0 && newLen == 0 {
 		return fieldDelta, false
 	}
 
 	var changed bool
 	i, j := 0, 0
-	for i < len(oldVals) && j < len(newVals) {
+	for i < oldLen && j < newLen {
+		oldVal := oldVals.Get(i)
+		newVal := newVals.Get(j)
 		switch {
-		case oldVals[i] < newVals[j]:
-			fieldDelta = addFieldBatchPostingAccum(fieldDelta, arena, oldVals[i], idx, false, 0)
+		case oldVal < newVal:
+			fieldDelta = addFieldBatchPostingAccum(fieldDelta, arena, oldVal, idx, false, 0)
 			changed = true
 			i++
-		case oldVals[i] > newVals[j]:
-			fieldDelta = addFieldBatchPostingAccum(fieldDelta, arena, newVals[j], idx, true, 0)
+		case oldVal > newVal:
+			fieldDelta = addFieldBatchPostingAccum(fieldDelta, arena, newVal, idx, true, 0)
 			changed = true
 			j++
 		default:
@@ -297,37 +307,47 @@ func collectFieldBatchPostingDiff(
 			j++
 		}
 	}
-	for ; i < len(oldVals); i++ {
-		fieldDelta = addFieldBatchPostingAccum(fieldDelta, arena, oldVals[i], idx, false, 0)
+	for ; i < oldLen; i++ {
+		fieldDelta = addFieldBatchPostingAccum(fieldDelta, arena, oldVals.Get(i), idx, false, 0)
 		changed = true
 	}
-	for ; j < len(newVals); j++ {
-		fieldDelta = addFieldBatchPostingAccum(fieldDelta, arena, newVals[j], idx, true, 0)
+	for ; j < newLen; j++ {
+		fieldDelta = addFieldBatchPostingAccum(fieldDelta, arena, newVals.Get(j), idx, true, 0)
 		changed = true
 	}
 	return fieldDelta, changed
 }
 
-func collectFixedFieldBatchPostingDiff(
+func collectFixedFieldBatchPostingDiffBuf(
 	fieldDelta map[uint64]uint32,
 	arena **batchPostingAccumArena,
 	idx uint64,
-	oldVals, newVals []uint64,
+	oldVals, newVals *pooled.SliceBuf[uint64],
 ) (map[uint64]uint32, bool) {
-	if len(oldVals) == 0 && len(newVals) == 0 {
+	oldLen := 0
+	if oldVals != nil {
+		oldLen = oldVals.Len()
+	}
+	newLen := 0
+	if newVals != nil {
+		newLen = newVals.Len()
+	}
+	if oldLen == 0 && newLen == 0 {
 		return fieldDelta, false
 	}
 
 	var changed bool
 	i, j := 0, 0
-	for i < len(oldVals) && j < len(newVals) {
+	for i < oldLen && j < newLen {
+		oldVal := oldVals.Get(i)
+		newVal := newVals.Get(j)
 		switch {
-		case oldVals[i] < newVals[j]:
-			fieldDelta = addFixedFieldBatchPostingAccum(fieldDelta, arena, oldVals[i], idx, false, 0)
+		case oldVal < newVal:
+			fieldDelta = addFixedFieldBatchPostingAccum(fieldDelta, arena, oldVal, idx, false, 0)
 			changed = true
 			i++
-		case oldVals[i] > newVals[j]:
-			fieldDelta = addFixedFieldBatchPostingAccum(fieldDelta, arena, newVals[j], idx, true, 0)
+		case oldVal > newVal:
+			fieldDelta = addFixedFieldBatchPostingAccum(fieldDelta, arena, newVal, idx, true, 0)
 			changed = true
 			j++
 		default:
@@ -335,12 +355,12 @@ func collectFixedFieldBatchPostingDiff(
 			j++
 		}
 	}
-	for ; i < len(oldVals); i++ {
-		fieldDelta = addFixedFieldBatchPostingAccum(fieldDelta, arena, oldVals[i], idx, false, 0)
+	for ; i < oldLen; i++ {
+		fieldDelta = addFixedFieldBatchPostingAccum(fieldDelta, arena, oldVals.Get(i), idx, false, 0)
 		changed = true
 	}
-	for ; j < len(newVals); j++ {
-		fieldDelta = addFixedFieldBatchPostingAccum(fieldDelta, arena, newVals[j], idx, true, 0)
+	for ; j < newLen; j++ {
+		fieldDelta = addFixedFieldBatchPostingAccum(fieldDelta, arena, newVals.Get(j), idx, true, 0)
 		changed = true
 	}
 	return fieldDelta, changed

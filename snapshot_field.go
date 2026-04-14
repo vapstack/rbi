@@ -1,7 +1,6 @@
 package rbi
 
 import (
-	"slices"
 	"unsafe"
 
 	"github.com/vapstack/rbi/internal/pooled"
@@ -35,8 +34,8 @@ var snapshotFieldInsertStateSlicePool = pooled.Slices[snapshotFieldInsertState]{
 }
 
 type fieldWriteScratch struct {
-	strings []string
-	fixed   []uint64
+	strings *pooled.SliceBuf[string]
+	fixed   *pooled.SliceBuf[uint64]
 	ok      bool
 	isNil   bool
 	length  int
@@ -61,8 +60,29 @@ func (s *fieldWriteScratch) reset() {
 	if s == nil {
 		return
 	}
-	s.strings = s.strings[:0]
-	s.fixed = s.fixed[:0]
+	if s.strings != nil {
+		s.strings.Truncate()
+	}
+	if s.fixed != nil {
+		s.fixed.Truncate()
+	}
+	s.ok = false
+	s.isNil = false
+	s.length = 0
+}
+
+func (s *fieldWriteScratch) release() {
+	if s == nil {
+		return
+	}
+	if s.strings != nil {
+		fieldWriteScratchStringSlicePool.Put(s.strings)
+		s.strings = nil
+	}
+	if s.fixed != nil {
+		fieldWriteScratchUint64SlicePool.Put(s.fixed)
+		s.fixed = nil
+	}
 	s.ok = false
 	s.isNil = false
 	s.length = 0
@@ -88,16 +108,44 @@ func (s *fieldWriteScratch) addString(key string) {
 	if s == nil {
 		return
 	}
+	if s.strings == nil {
+		s.strings = fieldWriteScratchStringSlicePool.Get()
+	}
 	s.ok = true
-	s.strings = append(s.strings, key)
+	s.strings.Append(key)
 }
 
 func (s *fieldWriteScratch) addFixed(key uint64) {
 	if s == nil {
 		return
 	}
+	if s.fixed == nil {
+		s.fixed = fieldWriteScratchUint64SlicePool.Get()
+	}
 	s.ok = true
-	s.fixed = append(s.fixed, key)
+	s.fixed.Append(key)
+}
+
+func (s *fieldWriteScratch) stringLen() int {
+	if s == nil || s.strings == nil {
+		return 0
+	}
+	return s.strings.Len()
+}
+
+func (s *fieldWriteScratch) fixedLen() int {
+	if s == nil || s.fixed == nil {
+		return 0
+	}
+	return s.fixed.Len()
+}
+
+func (s *fieldWriteScratch) stringAt(i int) string {
+	return s.strings.Get(i)
+}
+
+func (s *fieldWriteScratch) fixedAt(i int) uint64 {
+	return s.fixed.Get(i)
 }
 
 func (s *fieldWriteScratch) sortForField(f *field) {
@@ -105,13 +153,13 @@ func (s *fieldWriteScratch) sortForField(f *field) {
 		return
 	}
 	if f.KeyKind == fieldWriteKeysOrderedU64 {
-		if len(s.fixed) > 1 {
-			slices.Sort(s.fixed)
+		if s.fixed != nil && s.fixed.Len() > 1 {
+			pooled.SortSlice(s.fixed)
 		}
 		return
 	}
-	if len(s.strings) > 1 {
-		slices.Sort(s.strings)
+	if s.strings != nil && s.strings.Len() > 1 {
+		pooled.SortSlice(s.strings)
 	}
 }
 
@@ -371,21 +419,21 @@ func (acc indexedFieldAccessor) collectSnapshotBatchDiff(
 	var changed bool
 	if acc.field != nil && acc.field.KeyKind == fieldWriteKeysOrderedU64 {
 		if acc.field.Slice {
-			var oldMulti, newMulti []uint64
+			var oldMulti, newMulti *pooled.SliceBuf[uint64]
 			if oldOK {
 				oldMulti = state.old.fixed
 			}
 			if newOK {
 				newMulti = state.new.fixed
 			}
-			state.fixed, changed = collectFixedFieldBatchPostingDiff(state.fixed, &state.arena, idx, oldMulti, newMulti)
+			state.fixed, changed = collectFixedFieldBatchPostingDiffBuf(state.fixed, &state.arena, idx, oldMulti, newMulti)
 		} else {
 			var oldSingle, newSingle uint64
-			if oldOK && len(state.old.fixed) > 0 {
-				oldSingle = state.old.fixed[0]
+			if oldOK && state.old.fixedLen() > 0 {
+				oldSingle = state.old.fixedAt(0)
 			}
-			if newOK && len(state.new.fixed) > 0 {
-				newSingle = state.new.fixed[0]
+			if newOK && state.new.fixedLen() > 0 {
+				newSingle = state.new.fixedAt(0)
 			}
 			state.fixed, changed = collectScalarFixedFieldBatchPostingDiff(
 				state.fixed,
@@ -398,21 +446,21 @@ func (acc indexedFieldAccessor) collectSnapshotBatchDiff(
 			)
 		}
 	} else if acc.field != nil && acc.field.Slice {
-		var oldMulti, newMulti []string
+		var oldMulti, newMulti *pooled.SliceBuf[string]
 		if oldOK {
 			oldMulti = state.old.strings
 		}
 		if newOK {
 			newMulti = state.new.strings
 		}
-		state.index, changed = collectFieldBatchPostingDiff(state.index, &state.arena, idx, oldMulti, newMulti)
+		state.index, changed = collectFieldBatchPostingDiffBuf(state.index, &state.arena, idx, oldMulti, newMulti)
 	} else {
 		var oldSingle, newSingle string
-		if oldOK && len(state.old.strings) > 0 {
-			oldSingle = state.old.strings[0]
+		if oldOK && state.old.stringLen() > 0 {
+			oldSingle = state.old.stringAt(0)
 		}
-		if newOK && len(state.new.strings) > 0 {
-			newSingle = state.new.strings[0]
+		if newOK && state.new.stringLen() > 0 {
+			newSingle = state.new.stringAt(0)
 		}
 		state.index, changed = collectScalarFieldBatchPostingDiff(
 			state.index,
@@ -471,6 +519,8 @@ func (acc indexedFieldAccessor) applySnapshotBatchNilStorageOwned(base fieldInde
 }
 
 func (state *snapshotFieldBatchState) releaseOwned() {
+	state.old.release()
+	state.new.release()
 	batchPostingAccumMapPool.Put(state.index)
 	fixedBatchPostingAccumMapPool.Put(state.fixed)
 	batchPostingAccumMapPool.Put(state.nils)

@@ -26,7 +26,7 @@ Focused profiling run for one problematic query:
 
 ```bash
 go run ./stress \
-  -db bench/bench.db \
+  -db stress/stress.db \
   -headless \
   -duration 20s \
   -class r_med \
@@ -40,7 +40,7 @@ Focused alloc-profile run for one exact query class:
 
 ```bash
 go run ./stress \
-  -db bench/bench.db \
+  -db stress/stress.db \
   -alloc-profile /tmp/discovery.allocs.pprof \
   -alloc-ops 64 \
   -alloc-source prepared \
