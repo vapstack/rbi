@@ -708,6 +708,17 @@ func (qv *queryView[K, V]) baselineTryQueryRangeNoOrderWithLimit(q *qx.QX) ([]K,
 			return nil, false, nil
 		}
 		isNil = eqNil
+		if isNil {
+			ids := qv.nilFieldLookupPostingRetained(f)
+			if ids.IsEmpty() {
+				return nil, true, nil
+			}
+			out := make([]K, 0, q.Limit)
+			cursor := qv.newQueryCursor(out, q.Offset, q.Limit, false, 0)
+			var examined uint64
+			baselineEmitAcceptedPostingNoOrder(&cursor, ids, &examined)
+			return cursor.out, true, nil
+		}
 		rb.applyLo(key, true)
 		rb.applyHi(key, true)
 	} else {
@@ -728,19 +739,6 @@ func (qv *queryView[K, V]) baselineTryQueryRangeNoOrderWithLimit(q *qx.QX) ([]K,
 
 	out := make([]K, 0, q.Limit)
 	cursor := qv.newQueryCursor(out, q.Offset, q.Limit, false, 0)
-
-	if isNil {
-		if e.Op != qx.OpEQ {
-			return nil, true, nil
-		}
-		ids := qv.nilFieldLookupPostingRetained(f)
-		if ids.IsEmpty() {
-			return nil, true, nil
-		}
-		var examined uint64
-		emitAcceptedPostingNoOrder(&cursor, ids, &examined)
-		return cursor.out, true, nil
-	}
 
 	keyCur := ov.newCursor(br, false)
 	var examined uint64
