@@ -345,7 +345,7 @@ func New[K ~uint64 | ~string, V any](bolt *bbolt.DB, options Options, execOpts .
 	var defaultExecOptions execOptions[K, V]
 	applyExecOptions(&defaultExecOptions, execOpts)
 	defaultExecOptions = freezeExecOptions(defaultExecOptions)
-	codecEncode, codecDecode, err := defaultCodecMethods[V]()
+	encodeFn, decodeFn, err := defaultCodecMethods[V]()
 	if err != nil {
 		return nil, err
 	}
@@ -376,8 +376,8 @@ func New[K ~uint64 | ~string, V any](bolt *bbolt.DB, options Options, execOpts .
 
 		options:     &options,
 		execOptions: defaultExecOptions,
-		codecEncode: codecEncode,
-		codecDecode: codecDecode,
+		encodeFn:    encodeFn,
+		decodeFn:    decodeFn,
 		snapshot: snapshot{
 			bySeq:        make(map[uint64]*snapshotRef, 128),
 			statsEnabled: options.EnableSnapshotStats,
