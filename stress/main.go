@@ -58,6 +58,8 @@ func main() {
 	traceCollector := newPlannerTraceCollector(nil, opts.TraceSampleEvery, opts.TraceTopN)
 	handle, err := OpenBenchDB(DBConfig{
 		DBFile:               opts.DBFile,
+		SeedRecords:          opts.SeedRecords,
+		SeedRecordsSet:       opts.SeedRecordsSet,
 		BoltNoSync:           opts.BoltNoSync,
 		AnalyzeInterval:      opts.AnalyzeInterval,
 		DisableRuntimeCaches: opts.NoCache,

@@ -40,6 +40,8 @@ const stressBoltOpenTimeout = 500 * time.Millisecond
 
 type DBConfig struct {
 	DBFile               string
+	SeedRecords          int
+	SeedRecordsSet       bool
 	OpenTimeout          time.Duration
 	BoltNoSync           bool
 	AnalyzeInterval      time.Duration
@@ -115,7 +117,7 @@ func OpenBenchDB(cfg DBConfig, emailSampleN int) (*DBHandle, error) {
 		return nil, fmt.Errorf("init rbi: %w", err)
 	}
 
-	startRecords, maxID, err := loadOrSeedDatabase(db)
+	startRecords, maxID, err := loadOrSeedDatabase(db, cfg.SeedRecords, cfg.SeedRecordsSet)
 	if err != nil {
 		_ = db.Close()
 		_ = rawBolt.Close()
@@ -148,10 +150,14 @@ func (h *DBHandle) Close() error {
 	return err
 }
 
-func loadOrSeedDatabase(db *rbi.DB[uint64, UserBench]) (uint64, uint64, error) {
+func loadOrSeedDatabase(db *rbi.DB[uint64, UserBench], seedRecords int, seedRecordsSet bool) (uint64, uint64, error) {
 	count, err := db.Count(nil)
 	if err != nil {
 		return 0, 0, fmt.Errorf("count existing records: %w", err)
+	}
+	target := uint64(InitialRecords)
+	if seedRecordsSet {
+		target = uint64(seedRecords)
 	}
 	var maxID uint64
 	if count > 0 {
@@ -160,11 +166,24 @@ func loadOrSeedDatabase(db *rbi.DB[uint64, UserBench]) (uint64, uint64, error) {
 		if maxID == 0 {
 			maxID = scanMaxID(db)
 		}
+		if count >= target {
+			return count, maxID, nil
+		}
+		missing := target - count
+		log.Printf("Database has %d records. Seeding %d more to reach %d...", count, missing, target)
+		seedData(db, &maxID, int(missing))
+		count, err = db.Count(nil)
+		if err != nil {
+			return 0, 0, fmt.Errorf("count after top-up seed: %w", err)
+		}
 		return count, maxID, nil
 	}
 
-	log.Printf("Database empty. Seeding %d records...", InitialRecords)
-	seedData(db, &maxID, InitialRecords)
+	if target == 0 {
+		return 0, 0, nil
+	}
+	log.Printf("Database empty. Seeding %d records...", target)
+	seedData(db, &maxID, int(target))
 	count, err = db.Count(nil)
 	if err != nil {
 		return 0, 0, fmt.Errorf("count after seed: %w", err)

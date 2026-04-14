@@ -7,7 +7,7 @@ import (
 )
 
 const (
-	DefaultDBFilename    = "bench.db"
+	DefaultDBFilename    = "stress.db"
 	DefaultEmailSampleN  = 10_000
 	InitialRecords       = 5_000_000
 	MaxLatencySampleSize = 250_000

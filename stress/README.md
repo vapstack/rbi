@@ -72,6 +72,7 @@ go run ./stress -db bench.db -headless -out stress_report.json -r_idx 128 -w_fst
 ## Main Flags
 
 - `-db` : path to Bolt DB file
+- `-seed-records` : when set, ensure the DB contains at least this many records before starting
 - `-out`, `-report` : output JSON report path
 - `-cpu-profile` : write CPU profile for the run
 - `-heap-profile` : write heap profile at shutdown, before `FreeOSMemory`

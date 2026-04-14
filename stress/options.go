@@ -22,6 +22,8 @@ type workerGroupOverrides struct {
 
 type options struct {
 	DBFile              string
+	SeedRecords         int
+	SeedRecordsSet      bool
 	ReportPath          string
 	CPUProfile          string
 	HeapProfile         string
@@ -75,6 +77,18 @@ func parseOptions(catalog []*classDescriptor) (options, error) {
 	fs.SetOutput(os.Stderr)
 
 	fs.StringVar(&opts.DBFile, "db", opts.DBFile, "path to bolt db file")
+	fs.Func("seed-records", "when set, ensure DB contains at least this many records before starting", func(value string) error {
+		n, err := strconv.Atoi(value)
+		if err != nil {
+			return fmt.Errorf("seed-records must be an integer")
+		}
+		if n < 0 {
+			return fmt.Errorf("seed-records must be >= 0")
+		}
+		opts.SeedRecords = n
+		opts.SeedRecordsSet = true
+		return nil
+	})
 	fs.StringVar(&opts.ReportPath, "report", opts.ReportPath, "path to JSON report file")
 	fs.StringVar(&opts.ReportPath, "out", opts.ReportPath, "path to JSON report file")
 	fs.StringVar(&opts.CPUProfile, "cpu-profile", "", "write CPU profile to file")

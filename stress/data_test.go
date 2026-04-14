@@ -69,3 +69,74 @@ func TestBuildRBIOptions(t *testing.T) {
 		t.Fatalf("trace = sink:%v every:%d, want non-nil/17", opts.TraceSink == nil, opts.TraceSampleEvery)
 	}
 }
+
+func TestOpenBenchDBSeedsEmptyDBToExplicitTarget(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "seed_target.db")
+	handle, err := OpenBenchDB(DBConfig{
+		DBFile:         path,
+		SeedRecords:    7,
+		SeedRecordsSet: true,
+	}, 0)
+	if err != nil {
+		t.Fatalf("OpenBenchDB: %v", err)
+	}
+	defer func() {
+		if closeErr := handle.Close(); closeErr != nil {
+			t.Fatalf("handle close: %v", closeErr)
+		}
+	}()
+
+	if got := handle.StartRecords; got != 7 {
+		t.Fatalf("StartRecords = %d, want 7", got)
+	}
+	if got := handle.MaxID; got != 7 {
+		t.Fatalf("MaxID = %d, want 7", got)
+	}
+	if got, err := handle.DB.Count(nil); err != nil {
+		t.Fatalf("Count(nil): %v", err)
+	} else if got != 7 {
+		t.Fatalf("Count(nil) = %d, want 7", got)
+	}
+}
+
+func TestOpenBenchDBTopUpToExplicitTarget(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "seed_top_up.db")
+
+	handle, err := OpenBenchDB(DBConfig{
+		DBFile:         path,
+		SeedRecords:    5,
+		SeedRecordsSet: true,
+	}, 0)
+	if err != nil {
+		t.Fatalf("OpenBenchDB(initial): %v", err)
+	}
+	if err := handle.Close(); err != nil {
+		t.Fatalf("initial close: %v", err)
+	}
+
+	handle, err = OpenBenchDB(DBConfig{
+		DBFile:         path,
+		SeedRecords:    8,
+		SeedRecordsSet: true,
+	}, 0)
+	if err != nil {
+		t.Fatalf("OpenBenchDB(top-up): %v", err)
+	}
+	defer func() {
+		if closeErr := handle.Close(); closeErr != nil {
+			t.Fatalf("handle close: %v", closeErr)
+		}
+	}()
+
+	if got := handle.StartRecords; got != 8 {
+		t.Fatalf("StartRecords = %d, want 8", got)
+	}
+	if got := handle.MaxID; got != 8 {
+		t.Fatalf("MaxID = %d, want 8", got)
+	}
+	if got, err := handle.DB.Count(nil); err != nil {
+		t.Fatalf("Count(nil): %v", err)
+	} else if got != 8 {
+		t.Fatalf("Count(nil) = %d, want 8", got)
+	}
+}
