@@ -545,10 +545,10 @@ func TestU64Set_AllocsPerRunStayZeroAfterWarmup(t *testing.T) {
 }
 
 type orderBasicHighCardPrefixRec struct {
-	Score  float64 `db:"score"`
-	Email  string  `db:"email"`
-	Status string  `db:"status"`
-	Plan   string  `db:"plan"`
+	Score  float64 `db:"score"  dbi:"default"`
+	Email  string  `db:"email"  dbi:"default"`
+	Status string  `db:"status" dbi:"default"`
+	Plan   string  `db:"plan"   dbi:"default"`
 }
 
 func TestQuery_OrderBasicWithLimit_SkipsHighCardNonOrderPrefixShape(t *testing.T) {

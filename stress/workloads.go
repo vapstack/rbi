@@ -47,11 +47,10 @@ func runReadProfileByIDItems(ctx *WorkloadContext, rng *rand.Rand) (string, erro
 	const queryName = "read_profile_by_id_items"
 	currentMaxID := atomic.LoadUint64(ctx.MaxIDPtr)
 	id := pickReadID(rng, currentMaxID)
-	q := qx.Query(qx.EQ("id", id)).Max(1)
 	done := traceQuery(ctx, queryName)
 	defer done()
-	items, err := ctx.DB.Query(q)
-	ctx.DB.ReleaseRecords(items...)
+	item, err := ctx.DB.Get(id)
+	ctx.DB.ReleaseRecords(item)
 	return queryName, err
 }
 

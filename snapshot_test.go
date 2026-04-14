@@ -606,8 +606,8 @@ func snapshotExtEvalNumericRangeBuckets(t *testing.T, db *DB[uint64, Rec], expr 
 }
 
 type snapshotReorderedSliceRec struct {
-	Tags   []string `db:"tags"`
-	Scores []int    `db:"scores"`
+	Tags   []string `db:"tags" dbi:"default"`
+	Scores []int    `db:"scores" dbi:"default"`
 }
 
 func TestSnapshotExt_CollectSnapshotBatchDiff_ReorderedSliceValuesProduceNoDeltas(t *testing.T) {

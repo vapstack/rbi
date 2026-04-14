@@ -56,13 +56,13 @@ import (
 )
 
 type User struct {
-    ID      uint64   `db:"id"`
-    Name    string   `db:"name"`
-    Age     int      `db:"age"`
-    Active  bool     `db:"active"`
-    Tags    []string `db:"tags"`
-    Meta    string   `rbi:"-"` // not indexed
-    Exclude string   `db:"-"`  // not indexed
+    ID      uint64   `db:"id"     dbi:"default"`
+    Name    string   `db:"name"   dbi:"default"`
+    Age     int      `db:"age"    dbi:"default"`
+    Active  bool     `db:"active" dbi:"default"`
+    Tags    []string `db:"tags"   dbi:"default"`
+    Meta    string   `db:"meta"   dbi:"-"` // not indexed
+    Exclude string                         // not indexed
 }
 
 func main() {
@@ -289,7 +289,7 @@ Important notes:
   can deadlock or become mode-dependent.
 - `BeforeCommit` must not modify the bucket managed by RBI itself.
 
-## Ordering Limitations
+## Ordering limitations
 
 The package currently supports ordering by **a single indexed field only**.
 
@@ -301,19 +301,17 @@ result sets.
 If multi-column ordering is required, it must be implemented at the application
 level.
 
-## Struct Tags and Indexing
+## Struct tags and indexing
 
-By default, **all exported struct fields** are indexed using the Go field name.
+To mark field as indexed, use `rbi` or `dbi` struct tags.
+If both tags are present on the same field, `rbi` takes priority.
 
-To exclude a field from indexing, use one of:
-- `db:"-"`
-- `dbi:"-"`
-- `rbi:"-"`
+Supported values are: `default`, `unique` and `-`.
 
-> Excluding large fields (blobs, binary data)
-> is strongly recommended unless you actually query on them.
+To keep a field non-indexed, just omit tags or use `rbi:"-"`
+if you already have `dbi` tags.
 
-## Slice Fields
+## Slice fields
 
 Slice-typed fields are indexed element-wise and support `HAS`, `HASNOT`, `HASANY`, 
 `HASNONE` operations.
@@ -321,12 +319,12 @@ Slice-typed fields are indexed element-wise and support `HAS`, `HASNOT`, `HASANY
 Equality for slice fields is implemented as **set equality**, not array equality.\
 This means `["a", "b", "a"] == ["a", "b"]`
 
-## Unique Constraints
+## Unique constraints
 
 Tagging a field with:
 
 ```go
-`rbi:"unique"`
+`rbi:"unique"` / `dbi:"unique"`
 ```
 
 enforces a uniqueness constraint for that field.
@@ -337,7 +335,7 @@ enforces a uniqueness constraint for that field.
 
 ## Custom indexing with `ValueIndexer`
 
-Scalar values and slices of scalars are indexed by default.
+Scalar values and slices of scalars can be indexed by default.
 Custom types may implement:
 
 ```go
@@ -368,16 +366,16 @@ This allows JSON payloads to be applied directly without additional mapping.
 ```go
 type User struct {
     // Indexed as "UserName". Patchable via "UserName"
-    UserName string
+    UserName string `dbi:"default"`
     
     // Indexed as "email". Patchable via "Email", "email", or "mail".
-    Email string `db:"email" json:"mail"`
+    Email string `db:"email" json:"mail" dbi:"default"`
     
     // Not indexed. Patchable via "Password" or "pass".
     Password string `db:"-" json:"pass"`
     
     // Not indexed. Patchable via "Meta".
-    Meta string `rbi:"-"`
+    Meta string
 }
 ```
 

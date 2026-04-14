@@ -11,9 +11,9 @@ import (
 )
 
 type pooledSparseRec struct {
-	Name string   `db:"name"`
-	Tags []string `db:"tags"`
-	Opt  *string  `db:"opt"`
+	Name string   `db:"name" dbi:"default"`
+	Tags []string `db:"tags" dbi:"default"`
+	Opt  *string  `db:"opt"  dbi:"default"`
 }
 
 func (r *pooledSparseRec) MarshalMsgpack() ([]byte, error) {

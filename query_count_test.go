@@ -146,14 +146,14 @@ func cloneSnapshotUniverse(t *testing.T, db *DB[uint64, Rec]) posting.List {
 }
 
 type countORBenchRec struct {
-	Country string   `db:"country"`
-	Plan    string   `db:"plan"`
-	Status  string   `db:"status"`
-	Age     int      `db:"age"`
-	Score   float64  `db:"score"`
-	Email   string   `db:"email"`
-	Tags    []string `db:"tags"`
-	Roles   []string `db:"roles"`
+	Country string   `db:"country" dbi:"default"`
+	Plan    string   `db:"plan"    dbi:"default"`
+	Status  string   `db:"status"  dbi:"default"`
+	Age     int      `db:"age"     dbi:"default"`
+	Score   float64  `db:"score"   dbi:"default"`
+	Email   string   `db:"email"   dbi:"default"`
+	Tags    []string `db:"tags"    dbi:"default"`
+	Roles   []string `db:"roles"   dbi:"default"`
 }
 
 type seededDBFixture struct {

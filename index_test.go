@@ -1791,9 +1791,9 @@ func TestRebuildIndex_RejectsCoreOpsWhileActive(t *testing.T) {
 /**/
 
 type PtrIntRec struct {
-	Name   string `db:"name"`
-	Rank   *int   `db:"rank"`
-	Active bool   `db:"active"`
+	Name   string `db:"name"   dbi:"default"`
+	Rank   *int   `db:"rank"   dbi:"default"`
+	Active bool   `db:"active" dbi:"default"`
 }
 
 func intPtr(v int) *int {

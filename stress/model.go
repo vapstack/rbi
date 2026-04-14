@@ -32,19 +32,19 @@ const (
 
 type UserBench struct {
 	ID         uint64   `db:"id"`
-	Name       string   `db:"name"`
-	Email      string   `db:"email" rbi:"unique"`
-	Country    string   `db:"country"`
-	Plan       string   `db:"plan"`
-	Status     string   `db:"status"`
-	Age        int      `db:"age"`
-	Score      float64  `db:"score"`
-	IsVerified bool     `db:"is_verified"`
-	CreatedAt  int64    `db:"created_at"`
-	LastLogin  int64    `db:"last_login"`
-	Tags       []string `db:"tags"`
-	Roles      []string `db:"roles"`
-	Blob       []byte   `db:"-" rbi:"-"`
+	Name       string   `db:"name"        dbi:"default"`
+	Email      string   `db:"email"       dbi:"unique"`
+	Country    string   `db:"country"     dbi:"default"`
+	Plan       string   `db:"plan"        dbi:"default"`
+	Status     string   `db:"status"      dbi:"default"`
+	Age        int      `db:"age"         dbi:"default"`
+	Score      float64  `db:"score"       dbi:"default"`
+	IsVerified bool     `db:"is_verified" dbi:"default"`
+	CreatedAt  int64    `db:"created_at"  dbi:"default"`
+	LastLogin  int64    `db:"last_login"  dbi:"default"`
+	Tags       []string `db:"tags"        dbi:"default"`
+	Roles      []string `db:"roles"       dbi:"default"`
+	Blob       []byte   `db:"-"`
 }
 
 type LatencySummary struct {

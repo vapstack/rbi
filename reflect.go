@@ -71,8 +71,36 @@ func (db *DB[K, V]) populateFields(t reflect.Type, idx []int) error {
 		if !f.IsExported() {
 			continue
 		}
+		tag := f.Tag.Get("rbi")
+		if tag == "" {
+			tag = f.Tag.Get("dbi")
+		}
+		var (
+			use    bool
+			skip   bool
+			unique bool
+		)
+		switch value := strings.Split(tag, ",")[0]; value {
+		case "":
+			// do not use, do not skip (for embedded structs)
+		case "-":
+			skip = true
+		case "default":
+			use = true
+		case "unique":
+			use = true
+			unique = true
+		default:
+			return fmt.Errorf("invalid index tag value %q on field %v", value, f.Name)
+		}
 		if f.Anonymous {
 			if f.Type.Kind() == reflect.Struct {
+				if unique {
+					return fmt.Errorf("unique is not supported for anonymous embedded struct field %v", f.Name)
+				}
+				if skip {
+					continue
+				}
 				newIdx := append(slices.Clone(idx), i)
 				if err := db.populateFields(f.Type, newIdx); err != nil {
 					return err
@@ -80,19 +108,12 @@ func (db *DB[K, V]) populateFields(t reflect.Type, idx []int) error {
 			}
 			continue
 		}
-		dbname := f.Name
-		if dbTag := f.Tag.Get("db"); dbTag != "" {
-			if dbTag == "-" {
-				continue
-			}
-			dbname = dbTag
-		}
-		tag := f.Tag.Get("rbi")
-		if tag == "" {
-			tag = f.Tag.Get("dbi")
-		}
-		if tag == "-" {
+		if skip || !use {
 			continue
+		}
+		dbname := f.Name
+		if dbTag := f.Tag.Get("db"); dbTag != "" && dbTag != "-" {
+			dbname = dbTag
 		}
 
 		kind := f.Type.Kind()
@@ -177,18 +198,11 @@ func (db *DB[K, V]) populateFields(t reflect.Type, idx []int) error {
 			}
 		}
 
-		unique := false
-		if tag != "" {
-			for _, p := range strings.Split(tag, ",") {
-				if strings.TrimSpace(p) == "unique" {
-					if slice {
-						return fmt.Errorf("%v (%v): unique is not supported for slice fields", f.Name, f.Type)
-					}
-					db.hasUnique = true
-					unique = true
-					break
-				}
+		if unique {
+			if slice {
+				return fmt.Errorf("%v (%v): unique is not supported for slice fields", f.Name, f.Type)
 			}
+			db.hasUnique = true
 		}
 
 		db.fields[dbname] = &field{ // last wins

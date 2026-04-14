@@ -22,7 +22,7 @@ func (s reflectFoldedString) IndexingValue() string {
 }
 
 type reflectScalarVIRec struct {
-	Code reflectFoldedString `db:"code"`
+	Code reflectFoldedString `db:"code" dbi:"default"`
 }
 
 type reflectScalarVIUniqueRec struct {
@@ -30,7 +30,7 @@ type reflectScalarVIUniqueRec struct {
 }
 
 type reflectSliceVIRec struct {
-	Tags []reflectFoldedString `db:"tags"`
+	Tags []reflectFoldedString `db:"tags" dbi:"default"`
 }
 
 type reflectHexBytes []byte
@@ -40,7 +40,7 @@ func (b reflectHexBytes) IndexingValue() string {
 }
 
 type reflectBytesVIRec struct {
-	Key reflectHexBytes `db:"key"`
+	Key reflectHexBytes `db:"key" dbi:"default"`
 }
 
 type reflectMapVI map[string]string
@@ -73,7 +73,7 @@ type reflectInterfaceVIRec struct {
 }
 
 type reflectInterfaceVISliceRec struct {
-	Tags []ValueIndexer `db:"tags"`
+	Tags []ValueIndexer `db:"tags" dbi:"default"`
 }
 
 type reflectPtrFoldedString string
@@ -87,18 +87,18 @@ func (s *reflectPtrFoldedString) IndexingValue() string {
 
 type ReflectUnsafeEmbeddedIndexed struct {
 	Code  *reflectPtrFoldedString `db:"code" rbi:"unique"`
-	Score int                     `db:"score"`
-	Tags  []string                `db:"tags"`
-	Count *uint64                 `db:"count"`
+	Score int                     `db:"score" dbi:"default"`
+	Tags  []string                `db:"tags" dbi:"default"`
+	Count *uint64                 `db:"count" dbi:"default"`
 }
 
 type reflectUnsafeAccessorRec struct {
-	Name string `db:"name"`
+	Name string `db:"name" dbi:"default"`
 	ReflectUnsafeEmbeddedIndexed
 }
 
 type reflectPatchTimeRec struct {
-	Name    string               `db:"name"`
+	Name    string               `db:"name" dbi:"default"`
 	When    time.Time            `db:"-"`
 	Slots   []time.Time          `db:"-"`
 	Windows map[time.Time]string `db:"-"`
@@ -108,8 +108,8 @@ type reflectNamedTag string
 type reflectNamedTags []reflectNamedTag
 
 type reflectNamedSlicePatchRec struct {
-	Name string           `db:"name"`
-	Tags reflectNamedTags `db:"tags"`
+	Name string           `db:"name" dbi:"default"`
+	Tags reflectNamedTags `db:"tags" dbi:"default"`
 }
 
 type reflectPatchNestedChild struct {
@@ -125,18 +125,18 @@ type reflectPatchNested struct {
 }
 
 type reflectPatchNestedRec struct {
-	Name      string              `db:"name"`
+	Name      string              `db:"name" dbi:"default"`
 	Nested    reflectPatchNested  `db:"-"`
 	NestedPtr *reflectPatchNested `db:"-"`
 }
 
 type reflectPatchNestedSliceRec struct {
-	Name  string                  `db:"name"`
+	Name  string                  `db:"name" dbi:"default"`
 	Items []reflectPatchNestedRec `db:"-"`
 }
 
 type reflectNumericPatchRec struct {
-	Name  string  `db:"name"`
+	Name  string  `db:"name" dbi:"default"`
 	I8    int8    `db:"-"`
 	U8    uint8   `db:"-"`
 	I64   int64   `db:"-"`
