@@ -20,13 +20,16 @@ func ownContainerBitmap(bc *containerBitmap) *containerBitmap {
 }
 
 func TestArrayContainerPool_ReusedSizedContainerLeaksOldContent(t *testing.T) {
+	if testRaceEnabled {
+		t.Skip("sync.Pool is unreliable under -race")
+	}
 	ac := getContainerArrayWithLen(4)
 	copy(ac.content, []uint16{11, 22, 33, 44})
 	ac.release()
 
 	reused := getContainerArrayWithLen(4)
 	defer reused.release()
-	if !testRaceEnabled && reused != ac {
+	if reused != ac {
 		t.Fatalf("array container pool did not reuse container")
 	}
 	if !slices.Equal(reused.content, []uint16{0, 0, 0, 0}) {
@@ -35,6 +38,9 @@ func TestArrayContainerPool_ReusedSizedContainerLeaksOldContent(t *testing.T) {
 }
 
 func TestRunContainerPool_ReusedSizedContainerLeaksOldIntervals(t *testing.T) {
+	if testRaceEnabled {
+		t.Skip("sync.Pool is unreliable under -race")
+	}
 	rc := newContainerRun()
 	rc.iv = slices.Grow(rc.iv, max(4, 4))
 	rc.iv = rc.iv[:4]
@@ -48,7 +54,7 @@ func TestRunContainerPool_ReusedSizedContainerLeaksOldIntervals(t *testing.T) {
 	reused.iv = slices.Grow(reused.iv, max(4, 4))
 	reused.iv = reused.iv[:4]
 	defer reused.release()
-	if !testRaceEnabled && reused != rc {
+	if reused != rc {
 		t.Fatalf("run container pool did not reuse container")
 	}
 	zero := make([]interval16, 4)
@@ -58,6 +64,9 @@ func TestRunContainerPool_ReusedSizedContainerLeaksOldIntervals(t *testing.T) {
 }
 
 func TestRunContainerPool_ReusedLargerLengthPreservesUnreleasedTail(t *testing.T) {
+	if testRaceEnabled {
+		t.Skip("sync.Pool is unreliable under -race")
+	}
 	rc := newContainerRun()
 	rc.iv = slices.Grow(rc.iv, max(4, 4))
 	rc.iv = rc.iv[:4]
@@ -72,14 +81,14 @@ func TestRunContainerPool_ReusedLargerLengthPreservesUnreleasedTail(t *testing.T
 	reused.iv = slices.Grow(reused.iv, max(4, 4))
 	reused.iv = reused.iv[:4]
 	defer reused.release()
-	if !testRaceEnabled && reused != rc {
+	if reused != rc {
 		t.Fatalf("run container pool did not reuse container")
 	}
 	zero := make([]interval16, 2)
 	if !slices.Equal(reused.iv[:2], zero) {
 		t.Fatalf("reused larger run container leaked released prefix: %v", reused.iv)
 	}
-	if !testRaceEnabled && !slices.Equal(reused.iv[2:], []interval16{
+	if !slices.Equal(reused.iv[2:], []interval16{
 		{start: 30, length: 3},
 		{start: 40, length: 4},
 	}) {
@@ -88,6 +97,9 @@ func TestRunContainerPool_ReusedLargerLengthPreservesUnreleasedTail(t *testing.T
 }
 
 func TestArrayContainerPool_ReusedLargerLengthPreservesUnreleasedTail(t *testing.T) {
+	if testRaceEnabled {
+		t.Skip("sync.Pool is unreliable under -race")
+	}
 	ac := getContainerArrayWithLen(4)
 	copy(ac.content, []uint16{11, 22, 33, 44})
 	ac.content = ac.content[:2]
@@ -95,15 +107,95 @@ func TestArrayContainerPool_ReusedLargerLengthPreservesUnreleasedTail(t *testing
 
 	reused := getContainerArrayWithLen(4)
 	defer reused.release()
-	if !testRaceEnabled && reused != ac {
+	if reused != ac {
 		t.Fatalf("array container pool did not reuse container")
 	}
 	if !slices.Equal(reused.content[:2], []uint16{0, 0}) {
 		t.Fatalf("reused larger array container leaked released prefix: %v", reused.content)
 	}
-	if !testRaceEnabled && !slices.Equal(reused.content[2:], []uint16{33, 44}) {
+	if !slices.Equal(reused.content[2:], []uint16{33, 44}) {
 		t.Fatalf("reused larger array container unexpectedly normalized unreleased tail: %v", reused.content)
 	}
+}
+
+func TestRunContainerPoolCleanupContract(t *testing.T) {
+	t.Run("SizedContainerZeroesReleasedPrefix", func(t *testing.T) {
+		backing := [4]interval16{
+			{start: 10, length: 1},
+			{start: 20, length: 2},
+			{start: 30, length: 3},
+			{start: 40, length: 4},
+		}
+		rc := containerRun{iv: backing[:]}
+
+		runContainerPool.Cleanup(&rc)
+
+		zero := [4]interval16{}
+		if backing != zero {
+			t.Fatalf("run container cleanup leaked released prefix: %v", backing)
+		}
+		if len(rc.iv) != 0 {
+			t.Fatalf("run container cleanup did not reset length: got %d want 0", len(rc.iv))
+		}
+	})
+
+	t.Run("ShorterLenPreservesUnreleasedTail", func(t *testing.T) {
+		backing := [4]interval16{
+			{start: 10, length: 1},
+			{start: 20, length: 2},
+			{start: 30, length: 3},
+			{start: 40, length: 4},
+		}
+		rc := containerRun{iv: backing[:2]}
+
+		runContainerPool.Cleanup(&rc)
+
+		if !slices.Equal(backing[:2], []interval16{{}, {}}) {
+			t.Fatalf("run container cleanup leaked released prefix: %v", backing)
+		}
+		if !slices.Equal(backing[2:], []interval16{
+			{start: 30, length: 3},
+			{start: 40, length: 4},
+		}) {
+			t.Fatalf("run container cleanup unexpectedly normalized unreleased tail: %v", backing)
+		}
+		if len(rc.iv) != 0 {
+			t.Fatalf("run container cleanup did not reset length: got %d want 0", len(rc.iv))
+		}
+	})
+}
+
+func TestArrayContainerPoolCleanupContract(t *testing.T) {
+	t.Run("SizedContainerZeroesReleasedPrefix", func(t *testing.T) {
+		backing := [4]uint16{11, 22, 33, 44}
+		ac := containerArray{content: backing[:]}
+
+		containerArrayClassPools[0].Cleanup(&ac)
+
+		if backing != [4]uint16{} {
+			t.Fatalf("array container cleanup leaked released prefix: %v", backing)
+		}
+		if len(ac.content) != 0 {
+			t.Fatalf("array container cleanup did not reset length: got %d want 0", len(ac.content))
+		}
+	})
+
+	t.Run("ShorterLenPreservesUnreleasedTail", func(t *testing.T) {
+		backing := [4]uint16{11, 22, 33, 44}
+		ac := containerArray{content: backing[:2]}
+
+		containerArrayClassPools[0].Cleanup(&ac)
+
+		if !slices.Equal(backing[:2], []uint16{0, 0}) {
+			t.Fatalf("array container cleanup leaked released prefix: %v", backing)
+		}
+		if !slices.Equal(backing[2:], []uint16{33, 44}) {
+			t.Fatalf("array container cleanup unexpectedly normalized unreleased tail: %v", backing)
+		}
+		if len(ac.content) != 0 {
+			t.Fatalf("array container cleanup did not reset length: got %d want 0", len(ac.content))
+		}
+	})
 }
 
 func TestContainerArrayPoolClassifiers(t *testing.T) {
