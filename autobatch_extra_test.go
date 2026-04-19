@@ -20,6 +20,7 @@ func drainQueuedAutoBatchStep[K ~string | ~uint64, V any](
 	onBatch func([]*autoBatchJob[K, V]),
 ) {
 	tb.Helper()
+	waitAutoBatcherIdleForTest(tb, db)
 
 	limit := len(reqs)
 	if limit < 16 {
@@ -142,6 +143,25 @@ func sameAutoBatchExtraErr(got, want error) bool {
 		return errors.Is(got, ErrUniqueViolation) && errors.Is(want, ErrUniqueViolation)
 	default:
 		return got.Error() == want.Error()
+	}
+}
+
+func waitAutoBatcherIdleForTest(
+	tb testing.TB,
+	db interface{ AutoBatchStats() AutoBatchStats },
+) {
+	tb.Helper()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		stats := db.AutoBatchStats()
+		if stats.QueueLen == 0 && !stats.WorkerRunning {
+			return
+		}
+		if time.Now().After(deadline) {
+			tb.Fatalf("timeout waiting for autobatcher idle, last=%+v", stats)
+		}
+		time.Sleep(1 * time.Millisecond)
 	}
 }
 
@@ -1101,6 +1121,7 @@ func TestAutoBatchExtra_GrowQueuePreservesRingOrderAndCoalesceAcrossWrap(t *test
 	if err := db.Set(1, &Rec{Name: "seed-1", Age: 10}); err != nil {
 		t.Fatalf("seed Set(1): %v", err)
 	}
+	waitAutoBatcherIdleForTest(t, db)
 
 	req1 := mustBuildSetAutoReq(t, db, 1, &Rec{Name: "wrap-A", Age: 20}, nil, nil, nil)
 	req2 := mustBuildDeleteAutoReq(t, db, 1, nil)
@@ -1196,6 +1217,7 @@ func TestAutoBatchExtra_InterleavedIsolatedSameID_PreservesSequentialState(t *te
 	if err := db.Set(1, &Rec{Name: "seed", Age: 10, Score: 1.5}); err != nil {
 		t.Fatalf("seed Set(1): %v", err)
 	}
+	waitAutoBatcherIdleForTest(t, db)
 
 	var seen []string
 	req1 := mustBuildPatchAutoReq(t, db, 1, []Field{{Name: "age", Value: float64(20)}}, true, nil, nil, nil)
@@ -1289,6 +1311,7 @@ func TestAutoBatchExtra_GroupedJobBetweenSharedRequests_StaysIsolatedAndOrdered(
 	if err := db.Set(2, &Rec{Name: "seed-2", Age: 20, Score: 2.5}); err != nil {
 		t.Fatalf("seed Set(2): %v", err)
 	}
+	waitAutoBatcherIdleForTest(t, db)
 
 	headReq := mustBuildPatchAutoReq(t, db, 1, []Field{{Name: "age", Value: float64(30)}}, true, nil, nil, nil)
 

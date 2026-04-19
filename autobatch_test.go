@@ -694,6 +694,7 @@ func TestBatch_DuplicatePatchSameID_NonUniqueFieldsStayBatched(t *testing.T) {
 	if err := db.Set(2, &UniqueTestRec{Email: "b@x", Code: 2, Tags: []string{"seed-2"}}); err != nil {
 		t.Fatalf("seed Set(2): %v", err)
 	}
+	waitAutoBatcherIdleForTest(t, db)
 
 	req1 := &autoBatchRequest[uint64, UniqueTestRec]{
 		op:                 autoBatchPatch,
@@ -990,6 +991,7 @@ func TestBatch_SetDeleteSameID_CoalescedToLastWrite(t *testing.T) {
 	if err := db.Set(1, &Rec{Name: "seed", Age: 11}); err != nil {
 		t.Fatalf("seed Set(1): %v", err)
 	}
+	waitAutoBatcherIdleForTest(t, db)
 
 	setA := &Rec{Name: "A", Age: 20}
 	setB := &Rec{Name: "B", Age: 30}
@@ -1087,6 +1089,7 @@ func TestBatch_CoalescedChain_PropagatesTerminalError(t *testing.T) {
 	if err := db.Set(2, &UniqueTestRec{Email: "taken@x", Code: 2}); err != nil {
 		t.Fatalf("seed Set(2): %v", err)
 	}
+	waitAutoBatcherIdleForTest(t, db)
 
 	req1 := &autoBatchRequest[uint64, UniqueTestRec]{
 		op:         autoBatchSet,
@@ -1643,6 +1646,8 @@ func setAutoBatchQueueJobsForTest[K ~string | ~uint64, V any](db *DB[K, V], jobs
 
 func popQueuedSingleReqBatch[K ~string | ~uint64, V any](tb testing.TB, db *DB[K, V], reqs ...*autoBatchRequest[K, V]) []*autoBatchJob[K, V] {
 	tb.Helper()
+	waitAutoBatcherIdleForTest(tb, db)
+
 	limit := len(reqs)
 	if limit < 16 {
 		limit = 16
