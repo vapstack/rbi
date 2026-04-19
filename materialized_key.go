@@ -4,8 +4,8 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/vapstack/qx"
 	"github.com/vapstack/rbi/internal/pooled"
+	"github.com/vapstack/rbi/internal/qir"
 )
 
 type materializedPredKeyKind uint8
@@ -39,7 +39,7 @@ type materializedPredKey struct {
 	kind        materializedPredKeyKind
 	raw         string
 	field       string
-	op          qx.Op
+	op          qir.Op
 	key         string
 	keyIndex    indexKey
 	loKey       string
@@ -156,7 +156,7 @@ func (key materializedPredKey) String() string {
 	}
 }
 
-func materializedPredKeyForScalar(field string, op qx.Op, key string) materializedPredKey {
+func materializedPredKeyForScalar(field string, op qir.Op, key string) materializedPredKey {
 	if field == "" || !isMaterializedScalarCacheOp(op) {
 		return materializedPredKey{}
 	}
@@ -168,7 +168,7 @@ func materializedPredKeyForScalar(field string, op qx.Op, key string) materializ
 	}
 }
 
-func materializedPredKeyForNumericScalar(field string, op qx.Op, key indexKey) materializedPredKey {
+func materializedPredKeyForNumericScalar(field string, op qir.Op, key indexKey) materializedPredKey {
 	if field == "" || !key.isNumeric() || !isMaterializedScalarCacheOp(op) {
 		return materializedPredKey{}
 	}
@@ -181,7 +181,7 @@ func materializedPredKeyForNumericScalar(field string, op qx.Op, key indexKey) m
 	}
 }
 
-func materializedPredComplementKeyForScalar(field string, op qx.Op, key string) materializedPredKey {
+func materializedPredComplementKeyForScalar(field string, op qir.Op, key string) materializedPredKey {
 	if field == "" || key == "" || !isNumericRangeOp(op) {
 		return materializedPredKey{}
 	}
@@ -193,7 +193,7 @@ func materializedPredComplementKeyForScalar(field string, op qx.Op, key string) 
 	}
 }
 
-func materializedPredComplementKeyForNumericScalar(field string, op qx.Op, key indexKey) materializedPredKey {
+func materializedPredComplementKeyForNumericScalar(field string, op qir.Op, key indexKey) materializedPredKey {
 	if field == "" || !key.isNumeric() || !isNumericRangeOp(op) {
 		return materializedPredKey{}
 	}
@@ -263,7 +263,7 @@ func materializedPredKeyForNumericBucketSpan(field string, startBucket, endBucke
 	}
 }
 
-func materializedPredKeyForDistinctSetTerms(field string, op qx.Op, vals *pooled.SliceBuf[string], includeNil bool) materializedPredKey {
+func materializedPredKeyForDistinctSetTerms(field string, op qir.Op, vals *pooled.SliceBuf[string], includeNil bool) materializedPredKey {
 	termCount := btoi(includeNil)
 	if vals != nil {
 		termCount += vals.Len()
@@ -272,7 +272,7 @@ func materializedPredKeyForDistinctSetTerms(field string, op qx.Op, vals *pooled
 		return materializedPredKey{}
 	}
 	switch op {
-	case qx.OpIN, qx.OpHASANY, qx.OpHAS:
+	case qir.OpIN, qir.OpHASANY, qir.OpHASALL:
 	default:
 		return materializedPredKey{}
 	}
@@ -330,7 +330,7 @@ func materializedPredKeyFromEncoded(key string) (materializedPredKey, bool) {
 		out := materializedPredKey{
 			kind:  materializedPredKeyDistinctSet,
 			field: f,
-			op:    qx.Op(op),
+			op:    qir.Op(op),
 		}
 		switch rest[0] {
 		case '0':
@@ -384,7 +384,7 @@ func materializedPredKeyFromEncoded(key string) (materializedPredKey, bool) {
 			return materializedPredKey{
 				kind:     materializedPredKeyScalarComplement,
 				field:    f,
-				op:       qx.Op(op),
+				op:       qir.Op(op),
 				keyIndex: indexKeyFromU64(fixed8StringToU64(val)),
 				flags:    materializedPredKeyScalarNumeric,
 			}, true
@@ -392,7 +392,7 @@ func materializedPredKeyFromEncoded(key string) (materializedPredKey, bool) {
 		return materializedPredKey{
 			kind:  materializedPredKeyScalarComplement,
 			field: f,
-			op:    qx.Op(op),
+			op:    qir.Op(op),
 			key:   scalarKey,
 		}, true
 
@@ -524,7 +524,7 @@ func materializedPredKeyFromEncoded(key string) (materializedPredKey, bool) {
 			return materializedPredKey{
 				kind:     materializedPredKeyScalar,
 				field:    f,
-				op:       qx.Op(op),
+				op:       qir.Op(op),
 				keyIndex: indexKeyFromU64(fixed8StringToU64(val)),
 				flags:    materializedPredKeyScalarNumeric,
 			}, true
@@ -532,7 +532,7 @@ func materializedPredKeyFromEncoded(key string) (materializedPredKey, bool) {
 		return materializedPredKey{
 			kind:  materializedPredKeyScalar,
 			field: f,
-			op:    qx.Op(op),
+			op:    qir.Op(op),
 			key:   tail,
 		}, true
 	}

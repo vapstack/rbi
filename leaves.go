@@ -1,8 +1,8 @@
 package rbi
 
 import (
-	"github.com/vapstack/qx"
 	"github.com/vapstack/rbi/internal/pooled"
+	"github.com/vapstack/rbi/internal/qir"
 )
 
 type andLeafMode uint8
@@ -20,30 +20,30 @@ const (
 	andLeafStatusInvalid
 )
 
-func collectAndLeaves(e qx.Expr) ([]qx.Expr, bool) {
+func collectAndLeaves(e qir.Expr) ([]qir.Expr, bool) {
 	return collectAndLeavesMode(e, andLeafModeCollect)
 }
 
-func collectAndLeavesScratch(e qx.Expr, dst []qx.Expr) ([]qx.Expr, bool) {
+func collectAndLeavesScratch(e qir.Expr, dst []qir.Expr) ([]qir.Expr, bool) {
 	return collectAndLeavesModeScratch(e, dst, andLeafModeCollect)
 }
 
-func collectAndLeavesBuf(e qx.Expr, dst *pooled.SliceBuf[qx.Expr]) bool {
+func collectAndLeavesBuf(e qir.Expr, dst *pooled.SliceBuf[qir.Expr]) bool {
 	if dst == nil {
 		return false
 	}
 	return appendAndLeavesModeBuf(dst, e, andLeafModeCollect)
 }
 
-func extractAndLeaves(e qx.Expr) ([]qx.Expr, bool) {
+func extractAndLeaves(e qir.Expr) ([]qir.Expr, bool) {
 	return collectAndLeavesMode(e, andLeafModeExtract)
 }
 
-func extractAndLeavesScratch(e qx.Expr, dst []qx.Expr) ([]qx.Expr, bool) {
+func extractAndLeavesScratch(e qir.Expr, dst []qir.Expr) ([]qir.Expr, bool) {
 	return collectAndLeavesModeScratch(e, dst, andLeafModeExtract)
 }
 
-func collectAndLeavesFixed(e qx.Expr, dst []qx.Expr) ([]qx.Expr, bool) {
+func collectAndLeavesFixed(e qir.Expr, dst []qir.Expr) ([]qir.Expr, bool) {
 	dst, status := appendAndLeavesMode(dst[:0], e, andLeafModeCollect)
 	if status != andLeafStatusOK || len(dst) == 0 {
 		return nil, false
@@ -51,7 +51,7 @@ func collectAndLeavesFixed(e qx.Expr, dst []qx.Expr) ([]qx.Expr, bool) {
 	return dst, true
 }
 
-func collectAndLeavesMode(e qx.Expr, mode andLeafMode) ([]qx.Expr, bool) {
+func collectAndLeavesMode(e qir.Expr, mode andLeafMode) ([]qir.Expr, bool) {
 	n, ok := countAndLeavesMode(e, mode)
 	if !ok {
 		return nil, false
@@ -59,7 +59,7 @@ func collectAndLeavesMode(e qx.Expr, mode andLeafMode) ([]qx.Expr, bool) {
 	if n == 0 {
 		return nil, true
 	}
-	out := make([]qx.Expr, 0, n)
+	out := make([]qir.Expr, 0, n)
 	out, status := appendAndLeavesMode(out, e, mode)
 	if status != andLeafStatusOK {
 		return nil, false
@@ -67,7 +67,7 @@ func collectAndLeavesMode(e qx.Expr, mode andLeafMode) ([]qx.Expr, bool) {
 	return out, true
 }
 
-func collectAndLeavesModeScratch(e qx.Expr, dst []qx.Expr, mode andLeafMode) ([]qx.Expr, bool) {
+func collectAndLeavesModeScratch(e qir.Expr, dst []qir.Expr, mode andLeafMode) ([]qir.Expr, bool) {
 	dst, status := appendAndLeavesMode(dst[:0], e, mode)
 	switch status {
 	case andLeafStatusOK:
@@ -82,9 +82,9 @@ func collectAndLeavesModeScratch(e qx.Expr, dst []qx.Expr, mode andLeafMode) ([]
 	}
 }
 
-func countAndLeavesMode(e qx.Expr, mode andLeafMode) (int, bool) {
+func countAndLeavesMode(e qir.Expr, mode andLeafMode) (int, bool) {
 	switch e.Op {
-	case qx.OpNOOP:
+	case qir.OpNOOP:
 		if mode == andLeafModeCollect && e.Not {
 			return 1, true
 		}
@@ -92,7 +92,7 @@ func countAndLeavesMode(e qx.Expr, mode andLeafMode) (int, bool) {
 			return 0, true
 		}
 		return 0, false
-	case qx.OpAND:
+	case qir.OpAND:
 		if e.Not || len(e.Operands) == 0 {
 			return 0, false
 		}
@@ -106,7 +106,7 @@ func countAndLeavesMode(e qx.Expr, mode andLeafMode) (int, bool) {
 		}
 		return total, true
 	default:
-		if e.Op == qx.OpOR || len(e.Operands) != 0 {
+		if e.Op == qir.OpOR || len(e.Operands) != 0 {
 			return 0, false
 		}
 		if mode == andLeafModeExtract && e.Not {
@@ -116,17 +116,17 @@ func countAndLeavesMode(e qx.Expr, mode andLeafMode) (int, bool) {
 	}
 }
 
-func appendAndLeavesMode(dst []qx.Expr, e qx.Expr, mode andLeafMode) ([]qx.Expr, andLeafStatus) {
+func appendAndLeavesMode(dst []qir.Expr, e qir.Expr, mode andLeafMode) ([]qir.Expr, andLeafStatus) {
 	switch e.Op {
-	case qx.OpNOOP:
+	case qir.OpNOOP:
 		if mode != andLeafModeCollect {
 			return nil, andLeafStatusInvalid
 		}
 		if !e.Not {
 			return dst, andLeafStatusOK
 		}
-		return appendAndLeaf(dst, qx.Expr{Op: qx.OpNOOP, Not: true})
-	case qx.OpAND:
+		return appendAndLeaf(dst, qir.Expr{Op: qir.OpNOOP, Not: true, FieldOrdinal: qir.NoFieldOrdinal})
+	case qir.OpAND:
 		if e.Not || len(e.Operands) == 0 {
 			return nil, andLeafStatusInvalid
 		}
@@ -139,7 +139,7 @@ func appendAndLeavesMode(dst []qx.Expr, e qx.Expr, mode andLeafMode) ([]qx.Expr,
 		}
 		return dst, andLeafStatusOK
 	default:
-		if e.Op == qx.OpOR || len(e.Operands) != 0 {
+		if e.Op == qir.OpOR || len(e.Operands) != 0 {
 			return nil, andLeafStatusInvalid
 		}
 		if mode == andLeafModeExtract && e.Not {
@@ -149,25 +149,25 @@ func appendAndLeavesMode(dst []qx.Expr, e qx.Expr, mode andLeafMode) ([]qx.Expr,
 	}
 }
 
-func appendAndLeaf(dst []qx.Expr, e qx.Expr) ([]qx.Expr, andLeafStatus) {
+func appendAndLeaf(dst []qir.Expr, e qir.Expr) ([]qir.Expr, andLeafStatus) {
 	if len(dst) >= cap(dst) {
 		return nil, andLeafStatusOverflow
 	}
 	return append(dst, e), andLeafStatusOK
 }
 
-func appendAndLeavesModeBuf(dst *pooled.SliceBuf[qx.Expr], e qx.Expr, mode andLeafMode) bool {
+func appendAndLeavesModeBuf(dst *pooled.SliceBuf[qir.Expr], e qir.Expr, mode andLeafMode) bool {
 	switch e.Op {
-	case qx.OpNOOP:
+	case qir.OpNOOP:
 		if mode != andLeafModeCollect {
 			return false
 		}
 		if !e.Not {
 			return true
 		}
-		dst.Append(qx.Expr{Op: qx.OpNOOP, Not: true})
+		dst.Append(qir.Expr{Op: qir.OpNOOP, Not: true, FieldOrdinal: qir.NoFieldOrdinal})
 		return true
-	case qx.OpAND:
+	case qir.OpAND:
 		if e.Not || len(e.Operands) == 0 {
 			return false
 		}
@@ -178,7 +178,7 @@ func appendAndLeavesModeBuf(dst *pooled.SliceBuf[qx.Expr], e qx.Expr, mode andLe
 		}
 		return true
 	default:
-		if e.Op == qx.OpOR || len(e.Operands) != 0 {
+		if e.Op == qir.OpOR || len(e.Operands) != 0 {
 			return false
 		}
 		if mode == andLeafModeExtract && e.Not {

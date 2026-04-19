@@ -127,18 +127,18 @@ func TestRace_ConcurrentReadersAndWriters(t *testing.T) {
 					if it == nil {
 						continue
 					}
-					ok, e := evalExprBool(it, q.Expr)
+					ok, e := evalExprBool(it, q.Filter)
 					if e != nil {
 						reportErr(fmt.Errorf("eval logic error: %w", e))
 						return
 					}
 					if !ok {
-						reportErr(fmt.Errorf("consistency error: item %v returned for query %v", it, q.Expr))
+						reportErr(fmt.Errorf("consistency error: item %v returned for query %v", it, q.Filter))
 						return
 					}
 				}
 
-				if _, err = db.Count(q); err != nil {
+				if _, err = db.Count(q.Filter); err != nil {
 					if errors.Is(err, ErrClosed) {
 						return
 					}
@@ -250,13 +250,13 @@ func TestRace_ConcurrentReadersAndWriters_Snapshots(t *testing.T) {
 					if it == nil {
 						continue
 					}
-					ok, e := evalExprBool(it, q.Expr)
+					ok, e := evalExprBool(it, q.Filter)
 					if e != nil {
 						reportErr(fmt.Errorf("eval logic error: %w", e))
 						return
 					}
 					if !ok {
-						reportErr(fmt.Errorf("consistency error: item %v returned for query %v", it, q.Expr))
+						reportErr(fmt.Errorf("consistency error: item %v returned for query %v", it, q.Filter))
 						return
 					}
 				}
@@ -271,7 +271,7 @@ func TestRace_ConcurrentReadersAndWriters_Snapshots(t *testing.T) {
 				}
 				_ = ids
 
-				if _, err = db.Count(q); err != nil {
+				if _, err = db.Count(q.Filter); err != nil {
 					if errors.Is(err, ErrClosed) {
 						return
 					}
@@ -404,17 +404,17 @@ func TestRace_ConcurrentWriters_SnapshotRouteEquivalence(t *testing.T) {
 			qx.EQ("active", true),
 			qx.GTE("age", 24),
 			qx.LT("age", 50),
-		).By("age", qx.ASC).Max(120),
+		).Sort("age", qx.ASC).Limit(120),
 		qx.Query(
 			qx.PREFIX("full_name", "FN-1"),
 			qx.EQ("active", true),
-		).By("full_name", qx.ASC).Max(60),
+		).Sort("full_name", qx.ASC).Limit(60),
 		qx.Query(
 			qx.OR(
 				qx.EQ("active", true),
 				qx.EQ("name", "alice"),
 			),
-		).Max(90),
+		).Limit(90),
 		qx.Query(
 			qx.HASANY("tags", []string{"go", "ops"}),
 			qx.NOTIN("country", []string{"Thailand", "Iceland"}),
@@ -423,15 +423,19 @@ func TestRace_ConcurrentWriters_SnapshotRouteEquivalence(t *testing.T) {
 			qx.EQ("active", true),
 			qx.HASANY("tags", []string{"go", "db"}),
 			qx.NOTIN("country", []string{"PL", "DE"}),
-		).Max(75),
+		).Limit(75),
 		qx.Query(
 			qx.GTE("age", 24),
 			qx.LTE("age", 42),
 			qx.EQ("active", true),
-		).Max(85),
-		qx.Query(
-			qx.GTE("age", 20),
-		).ByArrayCount("tags", qx.DESC).Skip(5).Max(40),
+		).Limit(85),
+		queryOrderSortByArrayCount(
+			qx.Query(
+				qx.GTE("age", 20),
+			),
+			"tags",
+			qx.DESC,
+		).Offset(5).Limit(40),
 	}
 
 	var sawExec bool
@@ -452,8 +456,15 @@ func TestRace_ConcurrentWriters_SnapshotRouteEquivalence(t *testing.T) {
 		sawExec = sawExec || usedExec
 		sawPlan = sawPlan || usedPlan
 
-		if q.Limit == 0 && q.Offset == 0 {
-			cnt, err := view.countPreparedExpr(nq.Expr)
+		if q.Window.Limit == 0 && q.Window.Offset == 0 {
+			preparedCount, compiledCount, err := prepareTestExpr(db, nq.Filter)
+			if err != nil {
+				db.releaseQueryView(view)
+				db.unpinCurrentSnapshot(seq, snapRef, pinned)
+				t.Fatalf("prepareTestExpr(count): %v", err)
+			}
+			cnt, err := view.countPreparedExpr(compiledCount)
+			preparedCount.Release()
 			if err != nil {
 				db.releaseQueryView(view)
 				db.unpinCurrentSnapshot(seq, snapRef, pinned)
@@ -615,20 +626,20 @@ func TestRace_ConcurrentWriters_OROrderScoreChurn_SnapshotRouteEquivalence(t *te
 					qx.GTE("score", 30.0),
 				),
 			),
-		).By("score", qx.DESC).Skip(180).Max(90),
+		).Sort("score", qx.DESC).Offset(180).Limit(90),
 		qx.Query(
 			qx.OR(
 				qx.AND(qx.PREFIX("full_name", "FN-1"), qx.EQ("active", true)),
 				qx.AND(qx.EQ("country", "US"), qx.GTE("age", 25)),
 				qx.AND(qx.HASANY("tags", []string{"go", "db"}), qx.GTE("score", 60.0)),
 			),
-		).By("score", qx.ASC).Max(75),
+		).Sort("score", qx.ASC).Limit(75),
 		qx.Query(
 			qx.OR(
 				qx.AND(qx.EQ("active", false), qx.NOTIN("country", []string{"Thailand", "Iceland"}), qx.GTE("score", 35.0)),
 				qx.AND(qx.EQ("name", "bob"), qx.GTE("age", 22)),
 			),
-		).By("score", qx.DESC).Skip(30).Max(120),
+		).Sort("score", qx.DESC).Offset(30).Limit(120),
 	}
 
 	var sawPlan bool
@@ -790,27 +801,27 @@ func TestRace_StringKeyGrowth_FastPaths_SnapshotRouteEquivalence(t *testing.T) {
 		qx.Query(
 			qx.PREFIX("full_name", "FN-1"),
 			qx.EQ("active", true),
-		).By("full_name", qx.ASC).Max(50),
+		).Sort("full_name", qx.ASC).Limit(50),
 		qx.Query(
 			qx.GTE("age", 25),
 			qx.LT("age", 60),
 			qx.EQ("active", true),
-		).By("age", qx.ASC).Max(60),
+		).Sort("age", qx.ASC).Limit(60),
 		qx.Query(
 			qx.OR(
 				qx.AND(qx.EQ("active", true), qx.HASANY("tags", []string{"go", "ops"})),
 				qx.AND(qx.EQ("name", "alice"), qx.GTE("age", 20)),
 				qx.PREFIX("full_name", "FN-1"),
 			),
-		).By("score", qx.DESC).Skip(20).Max(80),
+		).Sort("score", qx.DESC).Offset(20).Limit(80),
 		qx.Query(
 			qx.EQ("active", true),
 			qx.NOTIN("country", []string{"NL", "DE"}),
 			qx.IN("name", []string{"alice", "bob", "carol"}),
-		).By("age", qx.ASC).Max(80),
+		).Sort("age", qx.ASC).Limit(80),
 		qx.Query(
 			qx.PREFIX("full_name", "FN-"),
-		).Max(90),
+		).Limit(90),
 	}
 
 	var sawExec bool
@@ -846,8 +857,15 @@ func TestRace_StringKeyGrowth_FastPaths_SnapshotRouteEquivalence(t *testing.T) {
 			}
 		}
 
-		if q.Limit == 0 && q.Offset == 0 {
-			cnt, err := view.countPreparedExpr(nq.Expr)
+		if q.Window.Limit == 0 && q.Window.Offset == 0 {
+			preparedCount, compiledCount, err := prepareTestExpr(db, nq.Filter)
+			if err != nil {
+				db.releaseQueryView(view)
+				db.unpinCurrentSnapshot(seq, snapRef, pinned)
+				t.Fatalf("prepareTestExpr(count): %v", err)
+			}
+			cnt, err := view.countPreparedExpr(compiledCount)
+			preparedCount.Release()
 			if err != nil {
 				db.releaseQueryView(view)
 				db.unpinCurrentSnapshot(seq, snapRef, pinned)

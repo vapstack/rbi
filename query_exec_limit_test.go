@@ -10,7 +10,39 @@ import (
 	"github.com/vapstack/qx"
 	"github.com/vapstack/rbi/internal/pooled"
 	"github.com/vapstack/rbi/internal/posting"
+	"github.com/vapstack/rbi/internal/qir"
 )
+
+func mustLimitQIRExpr[K ~string | ~uint64, V any](t testing.TB, db *DB[K, V], expr qx.Expr) qir.Expr {
+	t.Helper()
+	prepared, compiled, err := prepareTestExpr(db, expr)
+	if err != nil {
+		t.Fatalf("prepareTestExpr(%+v): %v", expr, err)
+	}
+	compiled = detachTestQIRExpr(compiled)
+	prepared.Release()
+	return compiled
+}
+
+func mustLimitQIRLeaves[K ~string | ~uint64, V any](t testing.TB, db *DB[K, V], expr qx.Expr) []qir.Expr {
+	t.Helper()
+	leaves, ok := collectAndLeaves(mustLimitQIRExpr(t, db, expr))
+	if !ok {
+		t.Fatalf("collectAndLeaves failed")
+	}
+	return leaves
+}
+
+func filterQIRLeavesByField[K ~string | ~uint64, V any](db *DB[K, V], leaves []qir.Expr, field string) []qir.Expr {
+	out := make([]qir.Expr, 0, len(leaves))
+	for _, leaf := range leaves {
+		if testExprFieldName(db, leaf) == field {
+			continue
+		}
+		out = append(out, leaf)
+	}
+	return out
+}
 
 func TestQuery_LimitNoOrder_UnsatisfiableLeafs_ReturnEmpty(t *testing.T) {
 	db, _ := openTempDBUint64(t)
@@ -28,26 +60,26 @@ func TestQuery_LimitNoOrder_UnsatisfiableLeafs_ReturnEmpty(t *testing.T) {
 	}{
 		{
 			name: "eq_missing",
-			q:    qx.Query(qx.EQ("email", "missing@example.com")).Max(8),
+			q:    qx.Query(qx.EQ("email", "missing@example.com")).Limit(8),
 		},
 		{
 			name: "in_all_missing",
-			q:    qx.Query(qx.IN("email", []string{"x@example.com", "y@example.com"})).Max(8),
+			q:    qx.Query(qx.IN("email", []string{"x@example.com", "y@example.com"})).Limit(8),
 		},
 		{
 			name: "has_missing",
-			q:    qx.Query(qx.HAS("tags", []string{"missing"})).Max(8),
+			q:    qx.Query(qx.HASALL("tags", []string{"missing"})).Limit(8),
 		},
 		{
 			name: "hasany_all_missing",
-			q:    qx.Query(qx.HASANY("tags", []string{"missing-1", "missing-2"})).Max(8),
+			q:    qx.Query(qx.HASANY("tags", []string{"missing-1", "missing-2"})).Limit(8),
 		},
 		{
 			name: "and_hit_plus_missing",
 			q: qx.Query(
 				qx.EQ("name", "alice"),
 				qx.EQ("email", "missing@example.com"),
-			).Max(8),
+			).Limit(8),
 		},
 	}
 
@@ -89,7 +121,7 @@ func TestQuery_LimitNoFilterNoOrder_UsesDirectLimitPlan(t *testing.T) {
 		}
 	}
 
-	ids, err := db.QueryKeys(qx.Query().Max(3))
+	ids, err := db.QueryKeys(qx.Query().Limit(3))
 	if err != nil {
 		t.Fatalf("QueryKeys: %v", err)
 	}
@@ -121,7 +153,7 @@ func TestQuery_RangeNoOrderWithLimit_NilEQ_UsesNilOverlayInEarlyRoute(t *testing
 		t.Fatalf("Set(3): %v", err)
 	}
 
-	ids, err := db.QueryKeys(qx.Query(qx.EQ("opt", nil)).Max(1))
+	ids, err := db.QueryKeys(qx.Query(qx.EQ("opt", nil)).Limit(1))
 	if err != nil {
 		t.Fatalf("QueryKeys: %v", err)
 	}
@@ -129,7 +161,7 @@ func TestQuery_RangeNoOrderWithLimit_NilEQ_UsesNilOverlayInEarlyRoute(t *testing
 		t.Fatalf("expected one id from nil equality limit query, got %v", ids)
 	}
 
-	items, err := db.Query(qx.Query(qx.EQ("opt", nil)).Max(1))
+	items, err := db.Query(qx.Query(qx.EQ("opt", nil)).Limit(1))
 	if err != nil {
 		t.Fatalf("Query: %v", err)
 	}
@@ -154,7 +186,7 @@ func TestQuery_SingleExactOrderedLimit_PrefersPlannerLimitPath(t *testing.T) {
 
 	q := qx.Query(
 		qx.EQ("active", true),
-	).By("age", qx.ASC).Max(8)
+	).Sort("age", qx.ASC).Limit(8)
 
 	if db.shouldPreferExecutionPlan(q) {
 		t.Fatalf("expected single exact ordered limit to prefer planner/limit path")
@@ -178,11 +210,8 @@ func TestQuery_LimitOrderAndRange_UnsatisfiableRest_ReturnEmpty(t *testing.T) {
 
 	qOrder := qx.Query(
 		qx.EQ("email", "missing@example.com"),
-	).By("age", qx.ASC).Max(10)
-	leaves, ok := extractAndLeaves(qOrder.Expr)
-	if !ok || len(leaves) == 0 {
-		t.Fatalf("extractAndLeaves(order): ok=%v len=%d", ok, len(leaves))
-	}
+	).Sort("age", qx.ASC).Limit(10)
+	leaves := mustExtractAndLeaves(t, qOrder.Filter)
 	out, used, err := db.tryLimitQueryOrderBasic(qOrder, leaves, nil)
 	if err != nil {
 		t.Fatalf("tryLimitQueryOrderBasic: %v", err)
@@ -202,8 +231,8 @@ func TestQuery_LimitOrderAndRange_UnsatisfiableRest_ReturnEmpty(t *testing.T) {
 		qx.GTE("age", 20),
 		qx.LT("age", 40),
 		qx.EQ("email", "missing@example.com"),
-	).Max(10)
-	rangeLeaves := mustExtractAndLeaves(t, qRange.Expr)
+	).Limit(10)
+	rangeLeaves := mustExtractAndLeaves(t, qRange.Filter)
 	f, bounds, ok, err := db.extractNoOrderBounds(rangeLeaves)
 	if err != nil {
 		t.Fatalf("extractNoOrderBounds: %v", err)
@@ -585,7 +614,7 @@ func TestQuery_OrderBasicWithLimit_SkipsHighCardNonOrderPrefixShape(t *testing.T
 		qx.PREFIX("email", "user0019"),
 		qx.EQ("status", "active"),
 		qx.NOTIN("plan", []string{"free"}),
-	).By("score", qx.DESC).Max(20)
+	).Sort("score", qx.DESC).Limit(20)
 
 	out, used, err := db.tryQueryOrderBasicWithLimit(q, nil)
 	if err != nil {
@@ -608,7 +637,7 @@ func TestQuery_OffsetBeyondResult_ReturnsEmpty(t *testing.T) {
 	db, _ := openTempDBUint64(t)
 	_ = seedData(t, db, 80)
 
-	q := qx.Query(qx.EQ("country", "NL")).Skip(10_000).Max(50)
+	q := qx.Query(qx.EQ("country", "NL")).Offset(10_000).Limit(50)
 
 	got, err := db.QueryKeys(q)
 	if err != nil {
@@ -629,7 +658,7 @@ func TestQuery_NoOrder_UnboundedLimit_RespectsOffset(t *testing.T) {
 	db, _ := openTempDBUint64(t)
 	_ = seedData(t, db, 140)
 
-	q := qx.Query(qx.GTE("age", 18)).Skip(35)
+	q := qx.Query(qx.GTE("age", 18)).Offset(35)
 
 	got, err := db.QueryKeys(q)
 	if err != nil {
@@ -664,25 +693,31 @@ func baselineEmitAcceptedPostingNoOrder[K ~uint64 | ~string, V any](cursor *quer
 }
 
 func (qv *queryView[K, V]) baselineTryQueryRangeNoOrderWithLimit(q *qx.QX) ([]K, bool, error) {
-	if len(q.Order) > 0 || q.Limit == 0 {
+	prepared, viewQ, err := prepareTestQuery(qv.root, q)
+	if err != nil {
+		return nil, false, err
+	}
+	defer prepared.Release()
+
+	if viewQ.HasOrder || viewQ.Limit == 0 {
 		return nil, false, nil
 	}
-	if q.Expr.Not {
+	if viewQ.Expr.Not {
 		return nil, false, nil
 	}
 
-	e := q.Expr
-	if e.Op == qx.OpAND || e.Op == qx.OpOR || len(e.Operands) != 0 {
+	e := viewQ.Expr
+	if e.Op == qir.OpAND || e.Op == qir.OpOR || len(e.Operands) != 0 {
 		return nil, false, nil
 	}
 
 	switch e.Op {
-	case qx.OpGT, qx.OpGTE, qx.OpLT, qx.OpLTE, qx.OpEQ:
+	case qir.OpGT, qir.OpGTE, qir.OpLT, qir.OpLTE, qir.OpEQ:
 	default:
 		return nil, false, nil
 	}
 
-	f := e.Field
+	f := qv.fieldNameByExpr(e)
 	if f == "" {
 		return nil, false, nil
 	}
@@ -699,7 +734,7 @@ func (qv *queryView[K, V]) baselineTryQueryRangeNoOrderWithLimit(q *qx.QX) ([]K,
 
 	isNil := false
 	rb := rangeBounds{has: true}
-	if e.Op == qx.OpEQ {
+	if e.Op == qir.OpEQ {
 		key, isSlice, eqNil, err := qv.exprValueToIdxScalar(e)
 		if err != nil {
 			return nil, true, err
@@ -713,8 +748,8 @@ func (qv *queryView[K, V]) baselineTryQueryRangeNoOrderWithLimit(q *qx.QX) ([]K,
 			if ids.IsEmpty() {
 				return nil, true, nil
 			}
-			out := make([]K, 0, q.Limit)
-			cursor := qv.newQueryCursor(out, q.Offset, q.Limit, false, 0)
+			out := make([]K, 0, viewQ.Limit)
+			cursor := qv.newQueryCursor(out, viewQ.Offset, viewQ.Limit, false, 0)
 			var examined uint64
 			baselineEmitAcceptedPostingNoOrder(&cursor, ids, &examined)
 			return cursor.out, true, nil
@@ -737,8 +772,8 @@ func (qv *queryView[K, V]) baselineTryQueryRangeNoOrderWithLimit(q *qx.QX) ([]K,
 		return nil, true, nil
 	}
 
-	out := make([]K, 0, q.Limit)
-	cursor := qv.newQueryCursor(out, q.Offset, q.Limit, false, 0)
+	out := make([]K, 0, viewQ.Limit)
+	cursor := qv.newQueryCursor(out, viewQ.Offset, viewQ.Limit, false, 0)
 
 	keyCur := ov.newCursor(br, false)
 	var examined uint64
@@ -758,22 +793,29 @@ func (qv *queryView[K, V]) baselineTryQueryRangeNoOrderWithLimit(q *qx.QX) ([]K,
 }
 
 func (qv *queryView[K, V]) baselineTryQueryPrefixNoOrderWithLimit(q *qx.QX) ([]K, bool, error) {
-	if len(q.Order) > 0 || q.Limit == 0 {
+	prepared, viewQ, err := prepareTestQuery(qv.root, q)
+	if err != nil {
+		return nil, false, err
+	}
+	defer prepared.Release()
+
+	if viewQ.HasOrder || viewQ.Limit == 0 {
 		return nil, false, nil
 	}
-	if q.Expr.Not {
+	if viewQ.Expr.Not {
 		return nil, false, nil
 	}
 
-	e := q.Expr
-	if e.Op != qx.OpPREFIX || e.Field == "" {
+	e := viewQ.Expr
+	f := qv.fieldNameByExpr(e)
+	if e.Op != qir.OpPREFIX || f == "" {
 		return nil, false, nil
 	}
 	if len(e.Operands) != 0 {
 		return nil, false, nil
 	}
 
-	fm := qv.fields[e.Field]
+	fm := qv.fields[f]
 	if fm == nil || fm.Slice {
 		return nil, false, nil
 	}
@@ -789,10 +831,10 @@ func (qv *queryView[K, V]) baselineTryQueryPrefixNoOrderWithLimit(q *qx.QX) ([]K
 		return nil, true, nil
 	}
 
-	ov := qv.fieldOverlay(e.Field)
+	ov := qv.fieldOverlay(f)
 	if !ov.hasData() {
-		if !qv.hasIndexedField(e.Field) {
-			return nil, true, fmt.Errorf("no index for field: %v", e.Field)
+		if !qv.hasIndexedField(f) {
+			return nil, true, fmt.Errorf("no index for field: %v", f)
 		}
 		return nil, true, nil
 	}
@@ -806,8 +848,8 @@ func (qv *queryView[K, V]) baselineTryQueryPrefixNoOrderWithLimit(q *qx.QX) ([]K
 		return nil, true, nil
 	}
 
-	out := make([]K, 0, q.Limit)
-	cursor := qv.newQueryCursor(out, q.Offset, q.Limit, false, 0)
+	out := make([]K, 0, viewQ.Limit)
+	cursor := qv.newQueryCursor(out, viewQ.Offset, viewQ.Limit, false, 0)
 
 	keyCur := ov.newCursor(br, false)
 	var examined uint64
@@ -827,9 +869,9 @@ func (qv *queryView[K, V]) baselineTryQueryPrefixNoOrderWithLimit(q *qx.QX) ([]K
 }
 
 func baselineScanLimitByOverlayBounds[K ~uint64 | ~string, V any](db *queryView[K, V], q *qx.QX, ov fieldOverlay, br overlayRange, desc bool, preds *pooled.SliceBuf[leafPred], nilTailField string) []K {
-	limit := int(q.Limit)
+	limit := int(q.Window.Limit)
 	out := make([]K, 0, limit)
-	cursor := db.newQueryCursor(out, 0, q.Limit, false, 0)
+	cursor := db.newQueryCursor(out, 0, q.Window.Limit, false, 0)
 	predCount := 0
 	if preds != nil {
 		predCount = preds.Len()
@@ -900,7 +942,7 @@ func TestQuery_RangeNoOrderWithLimit_DeepOffset_MatchesExpected(t *testing.T) {
 		t.Fatalf("RebuildIndex: %v", err)
 	}
 
-	q := qx.Query(qx.GTE("age", 20)).Skip(4_000).Max(25)
+	q := qx.Query(qx.GTE("age", 20)).Offset(4_000).Limit(25)
 
 	got, used, err := db.tryQueryRangeNoOrderWithLimit(q, nil)
 	if err != nil {
@@ -936,7 +978,7 @@ func TestQuery_PrefixNoOrderWithLimit_DeepOffset_MatchesExpected(t *testing.T) {
 		t.Fatalf("RebuildIndex: %v", err)
 	}
 
-	q := qx.Query(qx.PREFIX("full_name", "grp-1")).Skip(750).Max(30)
+	q := qx.Query(qx.PREFIX("full_name", "grp-1")).Offset(750).Limit(30)
 
 	got, used, err := db.tryQueryPrefixNoOrderWithLimit(q, nil)
 	if err != nil {
@@ -977,7 +1019,7 @@ func TestQuery_RangeNoOrderWithLimit_NilEQDeepOffset_MatchesExpected(t *testing.
 		t.Fatalf("RebuildIndex: %v", err)
 	}
 
-	q := qx.Query(qx.EQ("opt", nil)).Skip(2_500).Max(40)
+	q := qx.Query(qx.EQ("opt", nil)).Offset(2_500).Limit(40)
 
 	got, used, err := db.tryQueryRangeNoOrderWithLimit(q, nil)
 	if err != nil {
@@ -1034,9 +1076,9 @@ func TestQuery_LimitRangeNoOrder_ResidualsUseBucketExactFilter(t *testing.T) {
 		qx.LT("age", 64),
 		qx.IN("country", []string{"NL", "DE"}),
 		qx.EQ("active", true),
-	).Max(25)
+	).Limit(25)
 
-	leaves := mustExtractAndLeaves(t, q.Expr)
+	leaves := mustExtractAndLeaves(t, q.Filter)
 	f, bounds, ok, err := db.extractNoOrderBounds(leaves)
 	if err != nil {
 		t.Fatalf("extractNoOrderBounds: %v", err)
@@ -1046,7 +1088,8 @@ func TestQuery_LimitRangeNoOrder_ResidualsUseBucketExactFilter(t *testing.T) {
 	}
 
 	view := db.currentQueryViewForTests()
-	predsBuf, ok, err := view.buildLeafPredsExcludingBounds(leaves, f, 0)
+	qirLeaves := mustLimitQIRLeaves(t, db, q.Filter)
+	predsBuf, ok, err := view.buildLeafPredsExcludingBounds(qirLeaves, f, 0)
 	if err != nil {
 		t.Fatalf("buildLeafPredsExcludingBounds: %v", err)
 	}
@@ -1060,7 +1103,13 @@ func TestQuery_LimitRangeNoOrder_ResidualsUseBucketExactFilter(t *testing.T) {
 	br := view.fieldOverlay(f).rangeForBounds(bounds)
 	want := baselineScanLimitByOverlayBounds(view, q, view.fieldOverlay(f), br, false, predsBuf, "")
 
-	tr := db.beginTrace(q)
+	preparedQ, viewQ, err := prepareTestQuery(db, q)
+	if err != nil {
+		t.Fatalf("prepareTestQuery: %v", err)
+	}
+	defer preparedQ.Release()
+
+	tr := db.beginTrace(viewQ)
 	if tr == nil {
 		t.Fatalf("expected trace to be enabled")
 	}
@@ -1125,11 +1174,12 @@ func TestQuery_LimitOrderBasic_ResidualsUseBucketExactFilter(t *testing.T) {
 		qx.LT("age", 64),
 		qx.EQ("active", true),
 		qx.EQ("country", "NL"),
-	).By("age", qx.ASC).Max(20)
+	).Sort("age", qx.ASC).Limit(20)
 
-	leaves := mustExtractAndLeaves(t, q.Expr)
+	leaves := mustExtractAndLeaves(t, q.Filter)
 	view := db.currentQueryViewForTests()
-	bounds, ok, err := view.extractBoundsForField("age", leaves)
+	qirLeaves := mustLimitQIRLeaves(t, db, q.Filter)
+	bounds, ok, err := view.extractBoundsForField("age", qirLeaves)
 	if err != nil {
 		t.Fatalf("extractBoundsForField: %v", err)
 	}
@@ -1137,7 +1187,7 @@ func TestQuery_LimitOrderBasic_ResidualsUseBucketExactFilter(t *testing.T) {
 		t.Fatalf("expected order bounds to be recognized")
 	}
 
-	predsBuf, ok, err := view.buildLeafPredsExcludingBounds(leaves, "age", 0)
+	predsBuf, ok, err := view.buildLeafPredsExcludingBounds(qirLeaves, "age", 0)
 	if err != nil {
 		t.Fatalf("buildLeafPredsExcludingBounds: %v", err)
 	}
@@ -1152,7 +1202,13 @@ func TestQuery_LimitOrderBasic_ResidualsUseBucketExactFilter(t *testing.T) {
 	br := ov.rangeForBounds(bounds)
 	want := baselineScanLimitByOverlayBounds(view, q, ov, br, false, predsBuf, "")
 
-	tr := db.beginTrace(q)
+	preparedQ, viewQ, err := prepareTestQuery(db, q)
+	if err != nil {
+		t.Fatalf("prepareTestQuery: %v", err)
+	}
+	defer preparedQ.Release()
+
+	tr := db.beginTrace(viewQ)
 	if tr == nil {
 		t.Fatalf("expected trace to be enabled")
 	}
@@ -1208,7 +1264,7 @@ func TestQuery_OrderBasic_RangeBaseOpsMaterializeBroadComplementWithoutExactSibl
 
 	q := qx.Query(
 		qx.LT("score", 4_000.0),
-	).By("age", qx.ASC).Max(5)
+	).Sort("age", qx.ASC).Limit(5)
 
 	got, err := db.QueryKeys(q)
 	if err != nil {
@@ -1247,7 +1303,7 @@ func TestQuery_OrderBasic_SmallAndDeepWindowMaterializeNonOrderNumericRangeWhenC
 
 	small := qx.Query(
 		qx.LT("score", 4_000.0),
-	).By("age", qx.ASC).Max(5)
+	).Sort("age", qx.ASC).Limit(5)
 	if _, err := db.QueryKeys(small); err != nil {
 		t.Fatalf("small QueryKeys: %v", err)
 	}
@@ -1257,7 +1313,7 @@ func TestQuery_OrderBasic_SmallAndDeepWindowMaterializeNonOrderNumericRangeWhenC
 
 	deep := qx.Query(
 		qx.LT("score", 4_000.0),
-	).By("age", qx.ASC).Skip(2_000).Max(10)
+	).Sort("age", qx.ASC).Offset(2_000).Limit(10)
 	got, err := db.QueryKeys(deep)
 	if err != nil {
 		t.Fatalf("deep QueryKeys: %v", err)
@@ -1294,13 +1350,13 @@ func TestQuery_OrderBasic_BuildLeafPredsExcludingBounds_MaterializesBroadComplem
 	q := qx.Query(
 		qx.GTE("score", 0.0),
 		qx.GTE("age", 40),
-	).By("score", qx.ASC).Max(50)
-	leaves := mustExtractAndLeaves(t, q.Expr)
+	).Sort("score", qx.ASC).Limit(50)
+	leaves := mustLimitQIRLeaves(t, db, q.Filter)
 
 	view := db.currentQueryViewForTests()
 	defer db.releaseQueryView(view)
 
-	expr := qx.GTE("age", 40)
+	expr := mustLimitQIRExpr(t, db, qx.GTE("age", 40))
 	bound, isSlice, err := view.exprValueToNormalizedScalarBound(expr)
 	if err != nil {
 		t.Fatalf("exprValueToNormalizedScalarBound: %v", err)
@@ -1308,7 +1364,7 @@ func TestQuery_OrderBasic_BuildLeafPredsExcludingBounds_MaterializesBroadComplem
 	if isSlice || bound.full || bound.empty {
 		t.Fatalf("unexpected normalized bound state: slice=%v full=%v empty=%v", isSlice, bound.full, bound.empty)
 	}
-	cacheKey := view.materializedPredComplementKeyForNormalizedScalarBound(expr.Field, bound).String()
+	cacheKey := view.materializedPredComplementKeyForNormalizedScalarBound("age", bound).String()
 	if cacheKey == "" {
 		t.Fatalf("expected non-empty complement cache key")
 	}
@@ -1390,13 +1446,13 @@ func TestQuery_OrderBasic_BuildLeafPredsExcludingBounds_DelaysBroadComplementWit
 		qx.EQ("active", true),
 		qx.EQ("country", "DE"),
 		qx.GTE("age", 40),
-	).By("score", qx.ASC).Max(50)
-	leaves := mustExtractAndLeaves(t, q.Expr)
+	).Sort("score", qx.ASC).Limit(50)
+	leaves := mustLimitQIRLeaves(t, db, q.Filter)
 
 	view := db.currentQueryViewForTests()
 	defer db.releaseQueryView(view)
 
-	expr := qx.GTE("age", 40)
+	expr := mustLimitQIRExpr(t, db, qx.GTE("age", 40))
 	bound, isSlice, err := view.exprValueToNormalizedScalarBound(expr)
 	if err != nil {
 		t.Fatalf("exprValueToNormalizedScalarBound: %v", err)
@@ -1404,7 +1460,7 @@ func TestQuery_OrderBasic_BuildLeafPredsExcludingBounds_DelaysBroadComplementWit
 	if isSlice || bound.full || bound.empty {
 		t.Fatalf("unexpected normalized bound state: slice=%v full=%v empty=%v", isSlice, bound.full, bound.empty)
 	}
-	cacheKey := view.materializedPredComplementKeyForNormalizedScalarBound(expr.Field, bound).String()
+	cacheKey := view.materializedPredComplementKeyForNormalizedScalarBound("age", bound).String()
 	if cacheKey == "" {
 		t.Fatalf("expected non-empty complement cache key")
 	}
@@ -1425,7 +1481,7 @@ func TestQuery_OrderBasic_BuildLeafPredsExcludingBounds_DelaysBroadComplementWit
 	exactSiblingCount := 0
 	for i := 0; i < preds.Len(); i++ {
 		p := preds.Get(i)
-		if p.kind == leafPredKindPredicate && p.pred.expr.Field == "age" && p.pred.expr.Op == qx.OpGTE {
+		if p.kind == leafPredKindPredicate && testExprFieldName(db, p.pred.expr) == "age" && p.pred.expr.Op == qir.OpGTE {
 			rangeIdx = i
 			continue
 		}
@@ -1473,12 +1529,12 @@ func TestQuery_OrderBasic_DeepWindowCachePersistsAcrossUnchangedFieldPatch(t *te
 
 	q := qx.Query(
 		qx.LT("score", 4_000.0),
-	).By("age", qx.ASC).Skip(2_000).Max(10)
+	).Sort("age", qx.ASC).Offset(2_000).Limit(10)
 	if _, err := db.QueryKeys(q); err != nil {
 		t.Fatalf("QueryKeys: %v", err)
 	}
 
-	keyValue, isSlice, isNil, err := db.exprValueToIdxScalar(qx.Expr{Op: qx.OpLT, Field: "score", Value: 4_000.0})
+	keyValue, isSlice, isNil, err := db.exprValueToIdxScalar(qx.LT("score", 4_000.0))
 	if err != nil {
 		t.Fatalf("exprValueToIdxScalar: %v", err)
 	}
@@ -1528,13 +1584,13 @@ func TestQuery_OrderBasic_ComplementCachedBaseOpCountsAsMaterialized(t *testing.
 		qx.GTE("age", 25),
 		qx.LTE("age", 40),
 		qx.GT("score", 0.5),
-	).By("score", qx.DESC).Max(100)
+	).Sort("score", qx.DESC).Limit(100)
 	if _, err := db.QueryKeys(q); err != nil {
 		t.Fatalf("warm QueryKeys: %v", err)
 	}
 
 	fillView := db.currentQueryViewForTests()
-	lteExpr := qx.Expr{Op: qx.OpLTE, Field: "age", Value: 40}
+	lteExpr := mustLimitQIRExpr(t, db, qx.LTE("age", 40))
 	lteCacheKey := fillView.materializedPredCacheKey(lteExpr)
 	lteIDs := fillView.evalLazyMaterializedPredicate(lteExpr, lteCacheKey)
 	lteIDs.Release()
@@ -1542,11 +1598,11 @@ func TestQuery_OrderBasic_ComplementCachedBaseOpCountsAsMaterialized(t *testing.
 
 	view := db.currentQueryViewForTests()
 	defer db.releaseQueryView(view)
-	gteBound, isSlice, err := view.exprValueToNormalizedScalarBound(qx.Expr{Op: qx.OpGTE, Field: "age", Value: 25})
+	gteBound, isSlice, err := view.exprValueToNormalizedScalarBound(mustLimitQIRExpr(t, db, qx.GTE("age", 25)))
 	if err != nil || isSlice {
 		t.Fatalf("exprValueToNormalizedScalarBound(GTE age): err=%v isSlice=%v", err, isSlice)
 	}
-	lteBound, isSlice, err := view.exprValueToNormalizedScalarBound(qx.Expr{Op: qx.OpLTE, Field: "age", Value: 40})
+	lteBound, isSlice, err := view.exprValueToNormalizedScalarBound(mustLimitQIRExpr(t, db, qx.LTE("age", 40)))
 	if err != nil || isSlice {
 		t.Fatalf("exprValueToNormalizedScalarBound(LTE age): err=%v isSlice=%v", err, isSlice)
 	}
@@ -1555,14 +1611,8 @@ func TestQuery_OrderBasic_ComplementCachedBaseOpCountsAsMaterialized(t *testing.
 	complementSeed := posting.List{}.BuildAdded(1)
 	defer complementSeed.Release()
 	db.getSnapshot().storeMaterializedPred(gteComplementKey, complementSeed)
-	leaves := mustExtractAndLeaves(t, q.Expr)
-	baseOps := make([]qx.Expr, 0, len(leaves))
-	for _, op := range leaves {
-		if op.Field == "score" {
-			continue
-		}
-		baseOps = append(baseOps, op)
-	}
+	leaves := mustLimitQIRLeaves(t, db, q.Filter)
+	baseOps := filterQIRLeavesByField(db, leaves, "score")
 	coresBuf, rawCoreIdxBuf := mustPrepareOrderBasicBaseCoresForTest(t, view, baseOps)
 	defer orderBasicBaseCoreSlicePool.Put(coresBuf)
 	defer orderBasicBaseCoreIndexSlicePool.Put(rawCoreIdxBuf)
@@ -1598,18 +1648,12 @@ func TestQuery_OrderBasic_WarmQueryLoadsCollapsedNumericRangeSpan(t *testing.T) 
 		qx.GTE("age", 25),
 		qx.LTE("age", 40),
 		qx.GT("score", 0.5),
-	).By("score", qx.DESC).Max(100)
+	).Sort("score", qx.DESC).Limit(100)
 
 	view := db.currentQueryViewForTests()
 	defer db.releaseQueryView(view)
-	leaves := mustExtractAndLeaves(t, q.Expr)
-	baseOps := make([]qx.Expr, 0, len(leaves))
-	for _, op := range leaves {
-		if op.Field == "score" {
-			continue
-		}
-		baseOps = append(baseOps, op)
-	}
+	leaves := mustLimitQIRLeaves(t, db, q.Filter)
+	baseOps := filterQIRLeavesByField(db, leaves, "score")
 	coresBuf, rawCoreIdxBuf := mustPrepareOrderBasicBaseCoresForTest(t, view, baseOps)
 	defer orderBasicBaseCoreSlicePool.Put(coresBuf)
 	defer orderBasicBaseCoreIndexSlicePool.Put(rawCoreIdxBuf)
@@ -1628,7 +1672,7 @@ func TestQuery_OrderBasic_WarmQueryLoadsCollapsedNumericRangeSpan(t *testing.T) 
 func mustPrepareOrderBasicBaseCoresForTest[K ~string | ~uint64, V any](
 	t *testing.T,
 	view *queryView[K, V],
-	baseOps []qx.Expr,
+	baseOps []qir.Expr,
 ) (*pooled.SliceBuf[orderBasicBaseCore], *pooled.SliceBuf[int]) {
 	t.Helper()
 	coresBuf, rawCoreIdxBuf, noMatch, err := view.prepareOrderBasicBaseCores(baseOps)
@@ -1692,21 +1736,15 @@ func TestQuery_OrderBasic_WarmQueryPromotesMaterializedRangeBaseOps(t *testing.T
 		qx.GTE("age", 25),
 		qx.LTE("age", 40),
 		qx.GT("score", 0.5),
-	).By("score", qx.DESC).Max(100)
+	).Sort("score", qx.DESC).Limit(100)
 	if _, err := db.QueryKeys(q); err != nil {
 		t.Fatalf("warm QueryKeys: %v", err)
 	}
 
 	view := db.currentQueryViewForTests()
 	defer db.releaseQueryView(view)
-	leaves := mustExtractAndLeaves(t, q.Expr)
-	baseOps := make([]qx.Expr, 0, len(leaves))
-	for _, op := range leaves {
-		if op.Field == "score" {
-			continue
-		}
-		baseOps = append(baseOps, op)
-	}
+	leaves := mustLimitQIRLeaves(t, db, q.Filter)
+	baseOps := filterQIRLeavesByField(db, leaves, "score")
 	coresBuf, rawCoreIdxBuf := mustPrepareOrderBasicBaseCoresForTest(t, view, baseOps)
 	defer orderBasicBaseCoreSlicePool.Put(coresBuf)
 	defer orderBasicBaseCoreIndexSlicePool.Put(rawCoreIdxBuf)
@@ -1720,11 +1758,11 @@ func TestQuery_OrderBasic_WarmQueryPromotesMaterializedRangeBaseOps(t *testing.T
 				cacheKey = stats.cacheKey
 			}
 			if cacheKey.isZero() {
-				missing = append(missing, fmt.Sprintf("%s:%v=<no-key>", op.Field, op.Op))
+				missing = append(missing, fmt.Sprintf("%s:%v=<no-key>", testExprFieldName(db, op), op.Op))
 				continue
 			}
 			if _, ok := db.getSnapshot().loadMaterializedPredKey(cacheKey); !ok {
-				missing = append(missing, fmt.Sprintf("%s:%v", op.Field, op.Op))
+				missing = append(missing, fmt.Sprintf("%s:%v", testExprFieldName(db, op), op.Op))
 			}
 		}
 		t.Fatalf("expected warm ordered query to promote materialized range base ops, missing=%v", missing)
@@ -1764,19 +1802,13 @@ func TestQuery_OrderBasic_WarmAnalyticsRangeUsesLimitOrderBasicPlan(t *testing.T
 		qx.GTE("age", 25),
 		qx.LTE("age", 40),
 		qx.GT("score", 0.5),
-	).By("score", qx.DESC).Max(100)
+	).Sort("score", qx.DESC).Limit(100)
 	if _, err := db.QueryKeys(q); err != nil {
 		t.Fatalf("first QueryKeys: %v", err)
 	}
 	view := db.currentQueryViewForTests()
-	leaves := mustExtractAndLeaves(t, q.Expr)
-	baseOps := make([]qx.Expr, 0, len(leaves))
-	for _, op := range leaves {
-		if op.Field == "score" {
-			continue
-		}
-		baseOps = append(baseOps, op)
-	}
+	leaves := mustLimitQIRLeaves(t, db, q.Filter)
+	baseOps := filterQIRLeavesByField(db, leaves, "score")
 	coresBuf, rawCoreIdxBuf := mustPrepareOrderBasicBaseCoresForTest(t, view, baseOps)
 	defer orderBasicBaseCoreSlicePool.Put(coresBuf)
 	defer orderBasicBaseCoreIndexSlicePool.Put(rawCoreIdxBuf)
@@ -1829,7 +1861,7 @@ func TestQuery_OrderBasic_WarmBroadExactAndRangeUsesLimitOrderBasicPlan(t *testi
 		qx.EQ("active", true),
 		qx.GTE("score", 250.0),
 		qx.GTE("age", 20),
-	).By("score", qx.DESC).Max(50)
+	).Sort("score", qx.DESC).Limit(50)
 
 	if _, err := db.QueryKeys(q); err != nil {
 		t.Fatalf("first QueryKeys: %v", err)
@@ -1854,12 +1886,9 @@ func TestQuery_OrderBasic_ExtractBoundsForField_IgnoresSecondaryRangeBounds(t *t
 		qx.GTE("age", 25),
 		qx.LTE("age", 40),
 		qx.EQ("active", true),
-	).By("score", qx.DESC).Max(50)
+	).Sort("score", qx.DESC).Limit(50)
 
-	leaves, ok := collectAndLeaves(q.Expr)
-	if !ok || len(leaves) == 0 {
-		t.Fatalf("collectAndLeaves: ok=%v len=%d", ok, len(leaves))
-	}
+	leaves := mustLimitQIRLeaves(t, db, q.Filter)
 
 	view := db.currentQueryViewForTests()
 	bounds, ok, err := view.extractBoundsForField("score", leaves)
@@ -1899,14 +1928,14 @@ func TestBuildPredicatesOrdered_WarmMergedNumericRangeUsesExactRangeCache(t *tes
 		qx.GTE("age", 25),
 		qx.LTE("age", 40),
 		qx.GT("score", 0.5),
-	).By("score", qx.DESC).Max(100)
+	).Sort("score", qx.DESC).Limit(100)
 	if _, err := db.QueryKeys(q); err != nil {
 		t.Fatalf("warm QueryKeys: %v", err)
 	}
 
 	view := db.currentQueryViewForTests()
 	defer db.releaseQueryView(view)
-	leaves := mustExtractAndLeaves(t, q.Expr)
+	leaves := mustLimitQIRLeaves(t, db, q.Filter)
 	predSet, ok := view.buildPredicatesOrderedWithMode(leaves, "score", false, 100, 0, true, true)
 	if !ok {
 		t.Fatalf("buildPredicatesOrderedWithMode: ok=false")
@@ -1916,7 +1945,7 @@ func TestBuildPredicatesOrdered_WarmMergedNumericRangeUsesExactRangeCache(t *tes
 	ageCount := 0
 	for i := 0; i < predSet.Len(); i++ {
 		pred := predSet.Get(i)
-		if pred.expr.Field != "age" {
+		if testExprFieldName(db, pred.expr) != "age" {
 			continue
 		}
 		ageCount++
@@ -1985,9 +2014,11 @@ func TestQuery_NoOrder_UnboundedLimit_RandomizedOffsetConsistency(t *testing.T) 
 
 	for step := 0; step < 220; step++ {
 		q := &qx.QX{
-			Expr:   randomExpr(),
-			Offset: uint64(r.IntN(180)),
-			Limit:  0, // unbounded
+			Filter: randomExpr(),
+			Window: qx.Window{
+				Offset: uint64(r.IntN(180)),
+				Limit:  0, // unbounded
+			},
 		}
 
 		gotKeys, err := db.QueryKeys(q)

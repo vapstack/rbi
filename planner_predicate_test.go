@@ -6,7 +6,42 @@ import (
 
 	"github.com/vapstack/qx"
 	"github.com/vapstack/rbi/internal/posting"
+	"github.com/vapstack/rbi/internal/qir"
 )
+
+func mustTestQIRExpr(t testing.TB, expr qx.Expr) qir.Expr {
+	t.Helper()
+	prepared, compiled, err := prepareTestExpr[uint64, Rec](nil, expr)
+	if err != nil {
+		t.Fatalf("prepareTestExpr(%+v): %v", expr, err)
+	}
+	compiled = detachTestQIRExpr(compiled)
+	prepared.Release()
+	return compiled
+}
+
+func mustTestQIRExprForDB[K ~string | ~uint64, V any](t testing.TB, db *DB[K, V], expr qx.Expr) qir.Expr {
+	t.Helper()
+	prepared, compiled, err := prepareTestExpr(db, expr)
+	if err != nil {
+		t.Fatalf("prepareTestExpr(%+v): %v", expr, err)
+	}
+	compiled = detachTestQIRExpr(compiled)
+	prepared.Release()
+	return compiled
+}
+
+func detachTestQIRExpr(expr qir.Expr) qir.Expr {
+	if len(expr.Operands) == 0 {
+		return expr
+	}
+	out := expr
+	out.Operands = make([]qir.Expr, len(expr.Operands))
+	for i := range expr.Operands {
+		out.Operands[i] = detachTestQIRExpr(expr.Operands[i])
+	}
+	return out
+}
 
 func predicateMatchIDs(pred predicate, universe posting.List) []uint64 {
 	var out []uint64
@@ -43,7 +78,7 @@ func runPredicatePostingFilter(t *testing.T, pred predicate, universe posting.Li
 
 func TestReleasePredicateOwnedState_ClearsRangeMaterializedRewriteState(t *testing.T) {
 	p := materializedRangePredicateWithMode(
-		qx.Expr{Op: qx.OpGTE, Field: "age", Value: 10},
+		mustTestQIRExpr(t, qx.GTE("age", 10)),
 		posting.BuildFromSorted([]uint64{2, 4, 6}),
 	)
 	if !p.rangeMat || !p.hasIter() {
@@ -95,7 +130,7 @@ func TestPredicateSupportsPostingFilter_RangeStateDoesNotRequireCheapFlag(t *tes
 
 func TestPredicateSupportsPostingFilter_RangeMaterializedSupportsExact(t *testing.T) {
 	p := materializedRangePredicateWithMode(
-		qx.Expr{Op: qx.OpLTE, Field: "age", Value: 40},
+		mustTestQIRExpr(t, qx.LTE("age", 40)),
 		posting.BuildFromSorted([]uint64{1, 3, 5}),
 	)
 	defer releasePredicateOwnedState(&p)
@@ -382,7 +417,7 @@ func TestAcquireOverlayRangePredicateState_PositiveDirectProbeKeepsProbeHitsWith
 func TestPredicateMaterializedIDsDriveContainsAndIterCapabilities(t *testing.T) {
 	t.Run("LazyMaterializedPositive", func(t *testing.T) {
 		p := predicate{
-			expr: qx.Expr{Op: qx.OpPREFIX, Field: "email", Value: "user"},
+			expr: mustTestQIRExpr(t, qx.PREFIX("email", "user")),
 			lazyMatState: &lazyMaterializedPredicateState{
 				ids:    posting.BuildFromSorted([]uint64{1, 3, 5}),
 				loaded: true,
@@ -402,7 +437,7 @@ func TestPredicateMaterializedIDsDriveContainsAndIterCapabilities(t *testing.T) 
 
 	t.Run("LazyMaterializedNegative", func(t *testing.T) {
 		p := predicate{
-			expr: qx.Expr{Op: qx.OpPREFIX, Field: "email", Value: "user", Not: true},
+			expr: mustTestQIRExpr(t, qx.NOT(qx.PREFIX("email", "user"))),
 			lazyMatState: &lazyMaterializedPredicateState{
 				ids:    posting.BuildFromSorted([]uint64{1, 3, 5}),
 				loaded: true,
@@ -438,7 +473,7 @@ func TestBuildPredRange_PrefixMaterializationStoredInCache(t *testing.T) {
 		t.Fatalf("RebuildIndex: %v", err)
 	}
 
-	expr := qx.Expr{Op: qx.OpPREFIX, Field: "email", Value: "user1"}
+	expr := qx.PREFIX("email", "user1")
 	cacheKey := db.materializedPredCacheKey(expr)
 	if cacheKey == "" {
 		t.Fatalf("expected non-empty materialized cache key for prefix predicate")
@@ -493,7 +528,7 @@ func TestBuildPredRange_PrefixMaterializationSkippedWhenCacheDisabled(t *testing
 		t.Fatalf("RebuildIndex: %v", err)
 	}
 
-	expr := qx.Expr{Op: qx.OpPREFIX, Field: "email", Value: "user1"}
+	expr := qx.PREFIX("email", "user1")
 	if cacheKey := db.materializedPredCacheKey(expr); cacheKey != "" {
 		t.Fatalf("expected empty materialized cache key when cache is disabled, got %q", cacheKey)
 	}
@@ -519,7 +554,7 @@ func TestBuildPredRange_PrefixMaterializationSkippedWhenCacheDisabled(t *testing
 	}
 	releasePredicates([]predicate{p})
 
-	rawKey := materializedPredCacheKeyFromScalar("email", qx.OpPREFIX, "user1")
+	rawKey := materializedPredCacheKeyFromScalar("email", compileScalarOpForTest(qx.OpPREFIX), "user1")
 	parsedKey, ok := materializedPredKeyFromEncoded(rawKey)
 	if !ok {
 		t.Fatalf("expected parseable materialized cache key %q", rawKey)
@@ -550,7 +585,7 @@ func TestBuildPredRangeCandidate_FullUniversePrefixBecomesAlwaysTrue(t *testing.
 		t.Fatalf("RebuildIndex: %v", err)
 	}
 
-	p, ok := db.buildPredicateWithMode(qx.Expr{Op: qx.OpPREFIX, Field: "email", Value: "user"}, false)
+	p, ok := db.buildPredicateWithMode(qx.PREFIX("email", "user"), false)
 	if !ok {
 		t.Fatalf("expected range candidate build to succeed")
 	}
@@ -581,7 +616,7 @@ func TestBuildPredRange_BaseNumericPostingFilter_NotComplementMaterializedFallba
 		t.Fatalf("expected base numeric index path for age, got chunked overlay")
 	}
 
-	expr := qx.Expr{Op: qx.OpGTE, Field: "age", Value: 30, Not: true}
+	expr := qx.NOT(qx.GTE("age", 30))
 	predExpected, ok := db.buildPredicateWithMode(expr, false)
 	if !ok {
 		t.Fatal("expected base numeric predicate to build")
@@ -618,7 +653,7 @@ func TestBuildPredRange_OverlayNumericPostingFilter_NotComplementMaterializedFal
 		t.Fatalf("expected chunked overlay path for age")
 	}
 
-	expr := qx.Expr{Op: qx.OpGTE, Field: "age", Value: 30, Not: true}
+	expr := qx.NOT(qx.GTE("age", 30))
 	predExpected, ok := db.buildPredicateWithMode(expr, false)
 	if !ok {
 		t.Fatal("expected overlay numeric predicate to build")
@@ -660,12 +695,8 @@ func TestBuildPredRange_OverlayNumericPostingFilter_ComplementMaterializedFallba
 		t.Fatalf("expected chunked overlay path for age")
 	}
 
-	expr := qx.Expr{Op: qx.OpGTE, Field: "age", Value: 1_000}
-	bound, isSlice, err := db.currentQueryViewForTests().exprValueToNormalizedScalarBound(qx.Expr{
-		Op:    expr.Op,
-		Field: expr.Field,
-		Value: expr.Value,
-	})
+	expr := qx.GTE("age", 1_000)
+	bound, isSlice, err := db.currentQueryViewForTests().exprValueToNormalizedScalarBound(mustTestQIRExprForDB(t, db, expr))
 	if err != nil {
 		t.Fatalf("exprValueToNormalizedScalarBound: %v", err)
 	}
@@ -772,7 +803,7 @@ func TestBuildPredRangeCandidate_DoesNotCollapsePartialChunkedRangeToAlwaysTrue(
 		t.Fatalf("RebuildIndex: %v", err)
 	}
 
-	p, ok := db.buildPredicateWithMode(qx.Expr{Op: qx.OpGT, Field: "score", Value: 4.0}, false)
+	p, ok := db.buildPredicateWithMode(qx.GT("score", 4.0), false)
 	if !ok {
 		t.Fatalf("expected predicate build to succeed")
 	}
@@ -801,7 +832,7 @@ func TestBuildPredRangeCandidate_ChunkedRangeMatchesBitmapBaseline(t *testing.T)
 		t.Fatalf("RebuildIndex: %v", err)
 	}
 
-	expr := qx.Expr{Op: qx.OpGT, Field: "score", Value: 4.0}
+	expr := qx.GT("score", 4.0)
 	p, ok := db.buildPredicateWithMode(expr, false)
 	if !ok {
 		t.Fatalf("expected predicate build to succeed")
@@ -882,8 +913,8 @@ func TestBuildPredicateWithMode_AllowMaterializeSkipsColdNumericRangeUnionWhenPo
 		t.Fatalf("RebuildIndex: %v", err)
 	}
 
-	expr := qx.Expr{Op: qx.OpLT, Field: "age", Value: 6_000}
-	p, ok := db.currentQueryViewForTests().buildPredicateWithColdMode(expr, true, true)
+	expr := qx.LT("age", 6_000)
+	p, ok := db.currentQueryViewForTests().buildPredicateWithColdMode(mustTestQIRExprForDB(t, db, expr), true, true)
 	if !ok {
 		t.Fatalf("expected predicate build to succeed")
 	}
@@ -922,7 +953,7 @@ func TestBuildPredicateWithMode_RuntimeNumericRangeMaterializationKeepsScalarCac
 			t.Fatalf("RebuildIndex: %v", err)
 		}
 
-		expr := qx.Expr{Op: qx.OpGT, Field: "age", Value: 11_000}
+		expr := qx.GT("age", 11_000)
 		cacheKey := db.materializedPredCacheKey(expr)
 		p, ok := db.buildPredicateWithMode(expr, false)
 		if !ok {
@@ -975,7 +1006,7 @@ func TestBuildPredicateWithMode_RuntimeNumericRangeMaterializationKeepsScalarCac
 			t.Fatalf("RebuildIndex: %v", err)
 		}
 
-		expr := qx.Expr{Op: qx.OpGT, Field: "score", Value: 220.0}
+		expr := qx.GT("score", 220.0)
 		cacheKey := db.materializedPredCacheKey(expr)
 		p, ok := db.buildPredicateWithMode(expr, false)
 		if !ok {
@@ -1022,18 +1053,19 @@ func TestBuildPredRange_BroadPositiveRuntimeKeepsComplementCacheLocal(t *testing
 		t.Fatalf("RebuildIndex: %v", err)
 	}
 
-	expr := qx.Expr{Op: qx.OpGTE, Field: "age", Value: 40}
+	expr := qx.GTE("age", 40)
 	view := db.currentQueryViewForTests()
 	defer db.releaseQueryView(view)
-	bound, isSlice, err := view.exprValueToNormalizedScalarBound(expr)
+	compiled := mustTestQIRExprForDB(t, db, expr)
+	bound, isSlice, err := view.exprValueToNormalizedScalarBound(compiled)
 	if err != nil {
 		t.Fatalf("exprValueToNormalizedScalarBound: %v", err)
 	}
 	if isSlice || bound.full || bound.empty {
 		t.Fatalf("unexpected normalized bound state: slice=%v full=%v empty=%v", isSlice, bound.full, bound.empty)
 	}
-	fullCacheKey := view.materializedPredKey(expr).String()
-	complementCacheKey := view.materializedPredComplementKeyForNormalizedScalarBound(expr.Field, bound).String()
+	fullCacheKey := view.materializedPredKey(compiled).String()
+	complementCacheKey := view.materializedPredComplementKeyForNormalizedScalarBound("age", bound).String()
 	if fullCacheKey == "" || complementCacheKey == "" {
 		t.Fatalf("expected non-empty scalar and complement cache keys")
 	}
@@ -1089,17 +1121,18 @@ func TestBuildPredRange_BroadPositivePostingFilterKeepsComplementCacheLocal(t *t
 
 	view := db.currentQueryViewForTests()
 	defer db.releaseQueryView(view)
-	expr := qx.Expr{Op: qx.OpGTE, Field: "age", Value: 40}
-	bound, isSlice, err := view.exprValueToNormalizedScalarBound(expr)
+	expr := qx.GTE("age", 40)
+	compiled := mustTestQIRExprForDB(t, db, expr)
+	bound, isSlice, err := view.exprValueToNormalizedScalarBound(compiled)
 	if err != nil {
 		t.Fatalf("exprValueToNormalizedScalarBound: %v", err)
 	}
 	if isSlice || bound.full || bound.empty {
 		t.Fatalf("unexpected normalized bound state: slice=%v full=%v empty=%v", isSlice, bound.full, bound.empty)
 	}
-	complementCacheKey := view.materializedPredComplementKeyForNormalizedScalarBound(expr.Field, bound).String()
+	complementCacheKey := view.materializedPredComplementKeyForNormalizedScalarBound("age", bound).String()
 
-	p, ok := view.buildPredicateWithMode(expr, false)
+	p, ok := view.buildPredicateWithMode(compiled, false)
 	if !ok {
 		t.Fatalf("expected predicate build to succeed")
 	}
@@ -1152,14 +1185,15 @@ func TestBuildPredicatesOrdered_BroadComplementMaterializesOnFirstSightWhenCostW
 	defer db.releaseQueryView(view)
 
 	expr := qx.GTE("age", 40)
-	bound, isSlice, err := view.exprValueToNormalizedScalarBound(expr)
+	compiled := mustTestQIRExprForDB(t, db, expr)
+	bound, isSlice, err := view.exprValueToNormalizedScalarBound(compiled)
 	if err != nil {
 		t.Fatalf("exprValueToNormalizedScalarBound: %v", err)
 	}
 	if isSlice || bound.full || bound.empty {
 		t.Fatalf("unexpected normalized bound state: slice=%v full=%v empty=%v", isSlice, bound.full, bound.empty)
 	}
-	cacheKey := view.materializedPredComplementKeyForNormalizedScalarBound(expr.Field, bound).String()
+	cacheKey := view.materializedPredComplementKeyForNormalizedScalarBound("age", bound).String()
 	if cacheKey == "" {
 		t.Fatalf("expected non-empty complement cache key")
 	}
@@ -1269,11 +1303,11 @@ func TestBuildPredicateWithMode_RuntimeExactUnionPromotesOnSecondMaterialize(t *
 		vals := stringSlicePool.Get()
 		vals.Append("DE")
 		vals.Append("FR")
-		cacheKey := materializedPredKeyForDistinctSetTerms("country", qx.OpIN, vals, false)
+		cacheKey := materializedPredKeyForDistinctSetTerms("country", compileScalarOpForTest(qx.OpIN), vals, false)
 		stringSlicePool.Put(vals)
 
 		run(t,
-			qx.Expr{Op: qx.OpIN, Field: "country", Value: []string{"DE", "FR"}},
+			qx.IN("country", []string{"DE", "FR"}),
 			predicateKindPostsAny,
 			cacheKey,
 			func(db *DB[uint64, Rec]) {
@@ -1297,11 +1331,11 @@ func TestBuildPredicateWithMode_RuntimeExactUnionPromotesOnSecondMaterialize(t *
 		vals := stringSlicePool.Get()
 		vals.Append("db")
 		vals.Append("go")
-		cacheKey := materializedPredKeyForDistinctSetTerms("tags", qx.OpHASANY, vals, false)
+		cacheKey := materializedPredKeyForDistinctSetTerms("tags", compileScalarOpForTest(qx.OpHASANY), vals, false)
 		stringSlicePool.Put(vals)
 
 		run(t,
-			qx.Expr{Op: qx.OpHASANY, Field: "tags", Value: []string{"go", "db"}},
+			qx.HASANY("tags", []string{"go", "db"}),
 			predicateKindPostsAny,
 			cacheKey,
 			func(db *DB[uint64, Rec]) {
@@ -1328,11 +1362,11 @@ func TestBuildPredicateWithMode_RuntimeExactUnionPromotesOnSecondMaterialize(t *
 		vals := stringSlicePool.Get()
 		vals.Append("DE")
 		vals.Append("FR")
-		cacheKey := materializedPredKeyForDistinctSetTerms("country", qx.OpIN, vals, false)
+		cacheKey := materializedPredKeyForDistinctSetTerms("country", compileScalarOpForTest(qx.OpIN), vals, false)
 		stringSlicePool.Put(vals)
 
 		run(t,
-			qx.Expr{Op: qx.OpIN, Field: "country", Value: []string{"DE", "FR"}, Not: true},
+			qx.NOT(qx.IN("country", []string{"DE", "FR"})),
 			predicateKindPostsAnyNot,
 			cacheKey,
 			func(db *DB[uint64, Rec]) {
@@ -1356,11 +1390,11 @@ func TestBuildPredicateWithMode_RuntimeExactUnionPromotesOnSecondMaterialize(t *
 		vals := stringSlicePool.Get()
 		vals.Append("db")
 		vals.Append("go")
-		cacheKey := materializedPredKeyForDistinctSetTerms("tags", qx.OpHASANY, vals, false)
+		cacheKey := materializedPredKeyForDistinctSetTerms("tags", compileScalarOpForTest(qx.OpHASANY), vals, false)
 		stringSlicePool.Put(vals)
 
 		run(t,
-			qx.Expr{Op: qx.OpHASANY, Field: "tags", Value: []string{"go", "db"}, Not: true},
+			qx.NOT(qx.HASANY("tags", []string{"go", "db"})),
 			predicateKindPostsAnyNot,
 			cacheKey,
 			func(db *DB[uint64, Rec]) {
@@ -1412,10 +1446,10 @@ func TestBuildPredicateWithMode_HasPromotesOnSecondBuild(t *testing.T) {
 	vals := stringSlicePool.Get()
 	vals.Append("db")
 	vals.Append("go")
-	cacheKey := materializedPredKeyForDistinctSetTerms("tags", qx.OpHAS, vals, false)
+	cacheKey := materializedPredKeyForDistinctSetTerms("tags", compileScalarOpForTest(qx.OpHASALL), vals, false)
 	stringSlicePool.Put(vals)
 
-	expr := qx.Expr{Op: qx.OpHAS, Field: "tags", Value: []string{"go", "db"}}
+	expr := qx.HASALL("tags", []string{"go", "db"})
 
 	first, ok := db.buildPredicateWithMode(expr, false)
 	if !ok {
@@ -1522,7 +1556,7 @@ func TestOrderedScalarRangeCanEagerMaterialize_RequiresPromotionOnlyForSmallOrde
 	defer db.releaseQueryView(view)
 
 	expr := qx.GTE("age", 10)
-	cacheKey := view.materializedPredKey(expr)
+	cacheKey := view.materializedPredKey(mustTestQIRExprForDB(t, db, expr))
 	if cacheKey.isZero() {
 		t.Fatalf("expected non-zero materialized predicate cache key")
 	}
@@ -1567,7 +1601,7 @@ func TestMaterializedPredCacheKeyFromScalar_SupportsRangeAndPrefix(t *testing.T)
 		{op: qx.OpIN, wantHit: false},
 	}
 	for _, c := range cases {
-		got := materializedPredCacheKeyFromScalar("f", c.op, "v")
+		got := materializedPredCacheKeyFromScalar("f", compileScalarOpForTest(c.op), "v")
 		if c.wantHit && got == "" {
 			t.Fatalf("expected non-empty key for op=%v", c.op)
 		}

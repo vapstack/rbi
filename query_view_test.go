@@ -11,6 +11,7 @@ import (
 	"github.com/vapstack/qx"
 	"github.com/vapstack/rbi/internal/pooled"
 	"github.com/vapstack/rbi/internal/posting"
+	"github.com/vapstack/rbi/internal/qir"
 )
 
 var (
@@ -63,6 +64,20 @@ func (db *DB[K, V]) currentQueryViewForTests() *queryView[K, V] {
 	}
 }
 
+func testExprFieldName[K ~string | ~uint64, V any](db *DB[K, V], expr qir.Expr) string {
+	if db == nil {
+		return ""
+	}
+	return db.fieldNameByOrdinal(expr.FieldOrdinal)
+}
+
+func testOrderFieldName[K ~string | ~uint64, V any](db *DB[K, V], order qir.Order) string {
+	if db == nil {
+		return ""
+	}
+	return db.fieldNameByOrdinal(order.FieldOrdinal)
+}
+
 func (db *DB[K, V]) snapshotFieldIndexSlice(field string) *[]index {
 	return db.currentQueryViewForTests().snapshotFieldIndexSlice(field)
 }
@@ -105,105 +120,337 @@ func (qv *queryView[K, V]) nilFieldLookupPostingRetained(field string) posting.L
 	return newFieldOverlay(qv.snap.nilFieldIndexSlice(field)).lookupPostingRetained(nilIndexEntryKey)
 }
 
+func prepareTestQuery[K ~string | ~uint64, V any](db *DB[K, V], q *qx.QX) (*qir.Query, qir.Shape, error) {
+	var (
+		prepared *qir.Query
+		err      error
+	)
+	if db == nil {
+		prepared, err = qir.PrepareQueryNoResolve(q)
+	} else {
+		prepared, err = db.prepareQuery(q)
+	}
+	if err != nil {
+		return nil, qir.Shape{}, err
+	}
+	return prepared, qir.NewShape(prepared), nil
+}
+
+func prepareTestExpr[K ~string | ~uint64, V any](db *DB[K, V], expr qx.Expr) (*qir.Query, qir.Expr, error) {
+	var (
+		prepared *qir.Query
+		err      error
+	)
+	if db == nil {
+		prepared, err = qir.PrepareCountExprsNoResolve(expr)
+	} else {
+		prepared, err = db.prepareCountExprs(expr)
+	}
+	if err != nil {
+		return nil, qir.Expr{}, err
+	}
+	return prepared, prepared.Expr, nil
+}
+
+func prepareTestExprs[K ~string | ~uint64, V any](db *DB[K, V], exprs []qx.Expr) ([]*qir.Query, []qir.Expr, error) {
+	prepared := make([]*qir.Query, 0, len(exprs))
+	out := make([]qir.Expr, 0, len(exprs))
+	for i := range exprs {
+		p, expr, err := prepareTestExpr(db, exprs[i])
+		if err != nil {
+			releasePreparedQueriesForTest(prepared)
+			return nil, nil, err
+		}
+		prepared = append(prepared, p)
+		out = append(out, detachTestQIRExpr(expr))
+	}
+	return prepared, out, nil
+}
+
+func releasePreparedQueriesForTest(prepared []*qir.Query) {
+	for i := range prepared {
+		prepared[i].Release()
+	}
+}
+
+func compileScalarOpForTest(op qx.Op) qir.Op {
+	switch op {
+	case qx.OpEQ:
+		return qir.OpEQ
+	case qx.OpGT:
+		return qir.OpGT
+	case qx.OpGTE:
+		return qir.OpGTE
+	case qx.OpLT:
+		return qir.OpLT
+	case qx.OpLTE:
+		return qir.OpLTE
+	case qx.OpIN:
+		return qir.OpIN
+	case qx.OpHASANY:
+		return qir.OpHASANY
+	case qx.OpHASALL:
+		return qir.OpHASALL
+	case qx.OpPREFIX:
+		return qir.OpPREFIX
+	case qx.OpSUFFIX:
+		return qir.OpSUFFIX
+	case qx.OpCONTAINS:
+		return qir.OpCONTAINS
+	default:
+		panic(fmt.Sprintf("unsupported qx op in test helper: %q", op))
+	}
+}
+
 func (db *DB[K, V]) evalExpr(e qx.Expr) (postingResult, error) {
-	return db.currentQueryViewForTests().evalExpr(e)
+	prepared, expr, err := prepareTestExpr(db, e)
+	if err != nil {
+		return postingResult{}, err
+	}
+	defer prepared.Release()
+	return db.currentQueryViewForTests().evalExpr(expr)
 }
 
 func (db *DB[K, V]) tryExecutionPlan(q *qx.QX, trace *queryTrace) ([]K, bool, error) {
-	return db.currentQueryViewForTests().tryExecutionPlan(q, trace)
+	prepared, viewQ, err := prepareTestQuery(db, q)
+	if err != nil {
+		return nil, false, err
+	}
+	defer prepared.Release()
+	return db.currentQueryViewForTests().tryExecutionPlan(&viewQ, trace)
 }
 
 func (db *DB[K, V]) tryPlan(q *qx.QX, trace *queryTrace) ([]K, bool, error) {
-	return db.currentQueryViewForTests().tryPlan(q, trace)
+	prepared, viewQ, err := prepareTestQuery(db, q)
+	if err != nil {
+		return nil, false, err
+	}
+	defer prepared.Release()
+	return db.currentQueryViewForTests().tryPlan(&viewQ, trace)
 }
 
 func (db *DB[K, V]) countPreparedExpr(expr qx.Expr) (uint64, error) {
-	return db.currentQueryViewForTests().countPreparedExpr(expr)
+	prepared, compiled, err := prepareTestExpr(db, expr)
+	if err != nil {
+		return 0, err
+	}
+	defer prepared.Release()
+	return db.currentQueryViewForTests().countPreparedExpr(compiled)
 }
 
 func (db *DB[K, V]) tryPlanCandidate(q *qx.QX, trace *queryTrace) ([]K, bool, error) {
-	return db.currentQueryViewForTests().tryPlanCandidate(q, trace)
+	prepared, viewQ, err := prepareTestQuery(db, q)
+	if err != nil {
+		return nil, false, err
+	}
+	defer prepared.Release()
+	return db.currentQueryViewForTests().tryPlanCandidate(&viewQ, trace)
 }
 
 func (db *DB[K, V]) tryLimitQueryOrderBasic(q *qx.QX, leaves []qx.Expr, trace *queryTrace) ([]K, bool, error) {
-	return db.currentQueryViewForTests().tryLimitQueryOrderBasic(q, leaves, trace)
+	preparedQ, viewQ, err := prepareTestQuery(db, q)
+	if err != nil {
+		return nil, false, err
+	}
+	defer preparedQ.Release()
+
+	preparedLeaves, compiledLeaves, err := prepareTestExprs(db, leaves)
+	if err != nil {
+		return nil, false, err
+	}
+	defer releasePreparedQueriesForTest(preparedLeaves)
+
+	return db.currentQueryViewForTests().tryLimitQueryOrderBasic(&viewQ, compiledLeaves, trace)
 }
 
 func (db *DB[K, V]) tryLimitQueryRangeNoOrderByField(q *qx.QX, field string, bounds rangeBounds, rest []qx.Expr, trace *queryTrace) ([]K, bool, error) {
-	return db.currentQueryViewForTests().tryLimitQueryRangeNoOrderByField(q, field, bounds, rest, trace)
+	preparedQ, viewQ, err := prepareTestQuery(db, q)
+	if err != nil {
+		return nil, false, err
+	}
+	defer preparedQ.Release()
+
+	preparedRest, compiledRest, err := prepareTestExprs(db, rest)
+	if err != nil {
+		return nil, false, err
+	}
+	defer releasePreparedQueriesForTest(preparedRest)
+
+	return db.currentQueryViewForTests().tryLimitQueryRangeNoOrderByField(&viewQ, field, bounds, compiledRest, trace)
 }
 
 func (db *DB[K, V]) tryQueryOrderBasicWithLimit(q *qx.QX, trace *queryTrace) ([]K, bool, error) {
-	return db.currentQueryViewForTests().tryQueryOrderBasicWithLimit(q, trace)
+	prepared, viewQ, err := prepareTestQuery(db, q)
+	if err != nil {
+		return nil, false, err
+	}
+	defer prepared.Release()
+	return db.currentQueryViewForTests().tryQueryOrderBasicWithLimit(&viewQ, trace)
 }
 
 func (db *DB[K, V]) tryQueryOrderPrefixWithLimit(q *qx.QX, trace *queryTrace) ([]K, bool, error) {
-	return db.currentQueryViewForTests().tryQueryOrderPrefixWithLimit(q, trace)
+	prepared, viewQ, err := prepareTestQuery(db, q)
+	if err != nil {
+		return nil, false, err
+	}
+	defer prepared.Release()
+	return db.currentQueryViewForTests().tryQueryOrderPrefixWithLimit(&viewQ, trace)
 }
 
 func (db *DB[K, V]) tryQueryRangeNoOrderWithLimit(q *qx.QX, trace *queryTrace) ([]K, bool, error) {
-	return db.currentQueryViewForTests().tryQueryRangeNoOrderWithLimit(q, trace)
+	prepared, viewQ, err := prepareTestQuery(db, q)
+	if err != nil {
+		return nil, false, err
+	}
+	defer prepared.Release()
+	return db.currentQueryViewForTests().tryQueryRangeNoOrderWithLimit(&viewQ, trace)
 }
 
 func (db *DB[K, V]) tryQueryPrefixNoOrderWithLimit(q *qx.QX, trace *queryTrace) ([]K, bool, error) {
-	return db.currentQueryViewForTests().tryQueryPrefixNoOrderWithLimit(q, trace)
+	prepared, viewQ, err := prepareTestQuery(db, q)
+	if err != nil {
+		return nil, false, err
+	}
+	defer prepared.Release()
+	return db.currentQueryViewForTests().tryQueryPrefixNoOrderWithLimit(&viewQ, trace)
 }
 
 func (db *DB[K, V]) buildPredicatesOrderedWithMode(leaves []qx.Expr, orderField string, allowMaterialize bool, orderedWindow int, orderedOffset uint64, coverOrderRange bool, allowOrderedEagerMaterialize bool) ([]predicate, bool) {
-	preds, ok := db.currentQueryViewForTests().buildPredicatesOrderedWithMode(leaves, orderField, allowMaterialize, orderedWindow, orderedOffset, coverOrderRange, allowOrderedEagerMaterialize)
+	prepared, compiledLeaves, err := prepareTestExprs(db, leaves)
+	if err != nil {
+		return nil, false
+	}
+	defer releasePreparedQueriesForTest(prepared)
+
+	preds, ok := db.currentQueryViewForTests().buildPredicatesOrderedWithMode(compiledLeaves, orderField, allowMaterialize, orderedWindow, orderedOffset, coverOrderRange, allowOrderedEagerMaterialize)
 	return detachPredicateSetForTests(preds), ok
 }
 
 func (db *DB[K, V]) execPlanOrderedBasic(q *qx.QX, preds []predicate, trace *queryTrace) ([]K, bool) {
-	return db.currentQueryViewForTests().execPlanOrderedBasicReader(q, predicateSliceView(preds), trace)
+	prepared, viewQ, err := prepareTestQuery(db, q)
+	if err != nil {
+		return nil, false
+	}
+	defer prepared.Release()
+	return db.currentQueryViewForTests().execPlanOrderedBasicReader(&viewQ, predicateSliceView(preds), trace)
 }
 
 func (db *DB[K, V]) execPlanOrderedBasicFallback(q *qx.QX, preds []predicate, active []int, start, end int, s []index, trace *queryTrace) []K {
-	return db.currentQueryViewForTests().execPlanOrderedBasicFallback(q, preds, active, start, end, s, trace)
+	prepared, viewQ, err := prepareTestQuery(db, q)
+	if err != nil {
+		return nil
+	}
+	defer prepared.Release()
+	return db.currentQueryViewForTests().execPlanOrderedBasicFallback(&viewQ, preds, active, start, end, s, trace)
 }
 
 func (db *DB[K, V]) buildORBranches(ops []qx.Expr) (plannerORBranches, bool, bool) {
-	return db.currentQueryViewForTests().buildORBranches(ops)
+	prepared, compiledOps, err := prepareTestExprs(db, ops)
+	if err != nil {
+		return plannerORBranches{}, false, false
+	}
+	defer releasePreparedQueriesForTest(prepared)
+	return db.currentQueryViewForTests().buildORBranches(compiledOps)
 }
 
 func (db *DB[K, V]) buildORBranchesOrdered(ops []qx.Expr, orderField string, orderedWindow int) (plannerORBranches, bool, bool) {
-	return db.currentQueryViewForTests().buildORBranchesOrdered(ops, orderField, orderedWindow, 0)
+	prepared, compiledOps, err := prepareTestExprs(db, ops)
+	if err != nil {
+		return plannerORBranches{}, false, false
+	}
+	defer releasePreparedQueriesForTest(prepared)
+	return db.currentQueryViewForTests().buildORBranchesOrdered(compiledOps, orderField, orderedWindow, 0)
 }
 
 func (db *DB[K, V]) execPlanORNoOrderAdaptive(q *qx.QX, branches plannerORBranches, trace *queryTrace) ([]K, bool) {
-	return db.currentQueryViewForTests().execPlanORNoOrderAdaptive(q, branches, trace)
+	prepared, viewQ, err := prepareTestQuery(db, q)
+	if err != nil {
+		return nil, false
+	}
+	defer prepared.Release()
+	return db.currentQueryViewForTests().execPlanORNoOrderAdaptive(&viewQ, branches, trace)
 }
 
 func (db *DB[K, V]) execPlanORNoOrderBaseline(q *qx.QX, branches plannerORBranches, trace *queryTrace) ([]K, bool) {
-	return db.currentQueryViewForTests().execPlanORNoOrderBaseline(q, branches, trace)
+	prepared, viewQ, err := prepareTestQuery(db, q)
+	if err != nil {
+		return nil, false
+	}
+	defer prepared.Release()
+	return db.currentQueryViewForTests().execPlanORNoOrderBaseline(&viewQ, branches, trace)
 }
 
 func (db *DB[K, V]) execPlanOROrderBasic(q *qx.QX, branches plannerORBranches, trace *queryTrace) ([]K, bool) {
-	return db.currentQueryViewForTests().execPlanOROrderBasic(q, branches, trace, nil)
+	prepared, viewQ, err := prepareTestQuery(db, q)
+	if err != nil {
+		return nil, false
+	}
+	defer prepared.Release()
+	return db.currentQueryViewForTests().execPlanOROrderBasic(&viewQ, branches, trace, nil)
 }
 
 func (db *DB[K, V]) execPlanOROrderMergeFallback(q *qx.QX, branches plannerORBranches, trace *queryTrace) ([]K, bool, error) {
-	return db.currentQueryViewForTests().execPlanOROrderMergeFallback(q, branches, trace)
+	prepared, viewQ, err := prepareTestQuery(db, q)
+	if err != nil {
+		return nil, false, err
+	}
+	defer prepared.Release()
+	return db.currentQueryViewForTests().execPlanOROrderMergeFallback(&viewQ, branches, trace)
 }
 
 func (db *DB[K, V]) execPlanOROrderKWay(q *qx.QX, branches plannerORBranches, trace *queryTrace) ([]K, bool, error) {
-	return db.currentQueryViewForTests().execPlanOROrderKWay(q, branches, trace)
+	prepared, viewQ, err := prepareTestQuery(db, q)
+	if err != nil {
+		return nil, false, err
+	}
+	defer prepared.Release()
+	return db.currentQueryViewForTests().execPlanOROrderKWay(&viewQ, branches, trace)
 }
 
 func (db *DB[K, V]) materializedPredCacheKey(e qx.Expr) string {
-	return db.currentQueryViewForTests().materializedPredCacheKey(e)
+	prepared, expr, err := prepareTestExpr(db, e)
+	if err != nil {
+		return ""
+	}
+	defer prepared.Release()
+	return db.currentQueryViewForTests().materializedPredCacheKey(expr)
 }
 
 func (db *DB[K, V]) buildPredRangeCandidateWithMode(e qx.Expr, fm *field, ov fieldOverlay, allowMaterialize bool) (predicate, bool) {
-	return db.currentQueryViewForTests().buildPredRangeCandidateWithMode(e, fm, ov, allowMaterialize)
+	prepared, expr, err := prepareTestExpr(db, e)
+	if err != nil {
+		return predicate{}, false
+	}
+	defer prepared.Release()
+	return db.currentQueryViewForTests().buildPredRangeCandidateWithMode(expr, fm, ov, allowMaterialize)
 }
 
 func (db *DB[K, V]) buildPredicateWithMode(e qx.Expr, allowMaterialize bool) (predicate, bool) {
-	return db.currentQueryViewForTests().buildPredicateWithMode(e, allowMaterialize)
+	prepared, expr, err := prepareTestExpr(db, e)
+	if err != nil {
+		return predicate{}, false
+	}
+	defer prepared.Release()
+	return db.currentQueryViewForTests().buildPredicateWithMode(expr, allowMaterialize)
 }
 
 func (db *DB[K, V]) collectOrderRangeBounds(field string, n int, exprAt func(i int) qx.Expr) (rangeBounds, []bool, bool, bool) {
-	rb, covered, has, ok := db.currentQueryViewForTests().collectOrderRangeBounds(field, n, exprAt)
+	prepared := make([]*qir.Query, 0, n)
+	compiled := make([]qir.Expr, 0, n)
+	for i := 0; i < n; i++ {
+		p, expr, err := prepareTestExpr(db, exprAt(i))
+		if err != nil {
+			releasePreparedQueriesForTest(prepared)
+			return rangeBounds{}, nil, false, false
+		}
+		prepared = append(prepared, p)
+		compiled = append(compiled, expr)
+	}
+	defer releasePreparedQueriesForTest(prepared)
+
+	rb, covered, has, ok := db.currentQueryViewForTests().collectOrderRangeBounds(field, n, func(i int) qir.Expr {
+		return compiled[i]
+	})
 	return rb, copyBoolBufAndRelease(covered), has, ok
 }
 
@@ -234,37 +481,101 @@ func copyBoolBufAndRelease(buf *pooled.SliceBuf[bool]) []bool {
 }
 
 func (db *DB[K, V]) decidePlanORNoOrder(q *qx.QX, branches plannerORBranches) plannerORNoOrderDecision {
-	return db.currentQueryViewForTests().decidePlanORNoOrder(q, branches)
+	prepared, viewQ, err := prepareTestQuery(db, q)
+	if err != nil {
+		return plannerORNoOrderDecision{}
+	}
+	defer prepared.Release()
+	return db.currentQueryViewForTests().decidePlanORNoOrder(&viewQ, branches)
 }
 
 func (db *DB[K, V]) shouldUseOROrderKWayRuntimeFallback(q *qx.QX, branches plannerORBranches, needWindow int) bool {
-	return db.currentQueryViewForTests().shouldUseOROrderKWayRuntimeFallback(q, branches, needWindow)
+	prepared, viewQ, err := prepareTestQuery(db, q)
+	if err != nil {
+		return false
+	}
+	defer prepared.Release()
+	return db.currentQueryViewForTests().shouldUseOROrderKWayRuntimeFallback(&viewQ, branches, needWindow)
 }
 
 func (db *DB[K, V]) buildPredicates(leaves []qx.Expr) ([]predicate, bool) {
-	preds, ok := db.currentQueryViewForTests().buildPredicates(leaves)
+	prepared, compiledLeaves, err := prepareTestExprs(db, leaves)
+	if err != nil {
+		return nil, false
+	}
+	defer releasePreparedQueriesForTest(prepared)
+
+	preds, ok := db.currentQueryViewForTests().buildPredicates(compiledLeaves)
 	return detachPredicateSetForTests(preds), ok
 }
 
 func (db *DB[K, V]) buildPredicatesOrdered(leaves []qx.Expr, orderField string) ([]predicate, bool) {
-	preds, ok := db.currentQueryViewForTests().buildPredicatesOrdered(leaves, orderField)
+	prepared, compiledLeaves, err := prepareTestExprs(db, leaves)
+	if err != nil {
+		return nil, false
+	}
+	defer releasePreparedQueriesForTest(prepared)
+
+	preds, ok := db.currentQueryViewForTests().buildPredicatesOrdered(compiledLeaves, orderField)
 	return detachPredicateSetForTests(preds), ok
 }
 
 func (db *DB[K, V]) shouldPreferExecutionNoOrderPrefix(q *qx.QX, leaves []qx.Expr) bool {
-	return db.currentQueryViewForTests().shouldPreferExecutionNoOrderPrefix(q, leaves)
+	preparedQ, viewQ, err := prepareTestQuery(db, q)
+	if err != nil {
+		return false
+	}
+	defer preparedQ.Release()
+
+	preparedLeaves, compiledLeaves, err := prepareTestExprs(db, leaves)
+	if err != nil {
+		return false
+	}
+	defer releasePreparedQueriesForTest(preparedLeaves)
+
+	return db.currentQueryViewForTests().shouldPreferExecutionNoOrderPrefix(&viewQ, compiledLeaves)
 }
 
 func (db *DB[K, V]) shouldPreferExecutionPlan(q *qx.QX) bool {
-	return db.currentQueryViewForTests().shouldPreferExecutionPlan(q, nil)
+	prepared, viewQ, err := prepareTestQuery(db, q)
+	if err != nil {
+		return false
+	}
+	defer prepared.Release()
+	return db.currentQueryViewForTests().shouldPreferExecutionPlan(&viewQ, nil)
 }
 
 func (db *DB[K, V]) shouldPreferOROrderFallbackFirst(q *qx.QX, branches plannerORBranches) bool {
-	return db.currentQueryViewForTests().shouldPreferOROrderFallbackFirst(q, branches)
+	prepared, viewQ, err := prepareTestQuery(db, q)
+	if err != nil {
+		return false
+	}
+	defer prepared.Release()
+	return db.currentQueryViewForTests().shouldPreferOROrderFallbackFirst(&viewQ, branches)
 }
 
 func (db *DB[K, V]) shouldUseCandidateOrder(o qx.Order, leaves []qx.Expr) bool {
-	return db.currentQueryViewForTests().shouldUseCandidateOrder(o, leaves)
+	dir := qx.ASC
+	if o.Desc {
+		dir = qx.DESC
+	}
+	order, err := qir.PrepareQueryResolved(qx.Query().SortBy(o.By, dir), preparedFieldResolver[K, V]{db: db})
+	if err != nil {
+		return false
+	}
+	defer order.Release()
+	orderView := qir.NewShape(order)
+	if !orderView.HasOrder {
+		return false
+	}
+
+	prepared, compiledLeaves, err := prepareTestExprs(db, leaves)
+	if err != nil {
+		return false
+	}
+	defer releasePreparedQueriesForTest(prepared)
+
+	return db.currentQueryViewForTests().shouldUseCandidateOrder(orderView.Order, compiledLeaves)
 }
 
 func (db *DB[K, V]) countPostingResult(b postingResult) uint64 {
@@ -272,12 +583,24 @@ func (db *DB[K, V]) countPostingResult(b postingResult) uint64 {
 }
 
 func (db *DB[K, V]) buildPredicatesWithMode(leaves []qx.Expr, allowMaterialize bool) ([]predicate, bool) {
-	preds, ok := db.currentQueryViewForTests().buildPredicatesWithMode(leaves, allowMaterialize)
+	prepared, compiledLeaves, err := prepareTestExprs(db, leaves)
+	if err != nil {
+		return nil, false
+	}
+	defer releasePreparedQueriesForTest(prepared)
+
+	preds, ok := db.currentQueryViewForTests().buildPredicatesWithMode(compiledLeaves, allowMaterialize)
 	return detachPredicateSetForTests(preds), ok
 }
 
 func (db *DB[K, V]) buildCountPredicatesWithMode(leaves []qx.Expr, allowMaterialize bool) ([]predicate, bool) {
-	preds, ok := db.currentQueryViewForTests().buildCountPredicatesWithMode(leaves, allowMaterialize)
+	prepared, compiledLeaves, err := prepareTestExprs(db, leaves)
+	if err != nil {
+		return nil, false
+	}
+	defer releasePreparedQueriesForTest(prepared)
+
+	preds, ok := db.currentQueryViewForTests().buildCountPredicatesWithMode(compiledLeaves, allowMaterialize)
 	return detachPredicateSetForTests(preds), ok
 }
 
@@ -352,7 +675,12 @@ func (db *DB[K, V]) tryCountByPredicatesLeadPostings(preds []predicate, leadIdx 
 }
 
 func (db *DB[K, V]) tryCountORByPredicates(expr qx.Expr, trace *queryTrace) (uint64, bool, error) {
-	return db.currentQueryViewForTests().tryCountORByPredicates(expr, trace)
+	prepared, compiled, err := prepareTestExpr(db, expr)
+	if err != nil {
+		return 0, false, err
+	}
+	defer prepared.Release()
+	return db.currentQueryViewForTests().tryCountORByPredicates(compiled, trace)
 }
 
 func (db *DB[K, V]) pickCountORLeadPredicate(preds []predicate, universe uint64) (int, uint64, uint64) {
@@ -365,15 +693,20 @@ func (db *DB[K, V]) pickCountORLeadPredicate(preds []predicate, universe uint64)
 }
 
 func (db *DB[K, V]) exprValueToIdxScalar(expr qx.Expr) (string, bool, bool, error) {
-	return db.currentQueryViewForTests().exprValueToIdxScalar(expr)
+	prepared, compiled, err := prepareTestExpr(db, expr)
+	if err != nil {
+		return "", false, false, err
+	}
+	defer prepared.Release()
+	return db.currentQueryViewForTests().exprValueToIdxScalar(compiled)
 }
 
 func (db *DB[K, V]) materializedPredCacheKeyForScalar(field string, op qx.Op, key string) string {
-	return db.currentQueryViewForTests().materializedPredCacheKeyForScalar(field, op, key)
+	return db.currentQueryViewForTests().materializedPredCacheKeyForScalar(field, compileScalarOpForTest(op), key)
 }
 
 func (db *DB[K, V]) materializedPredComplementCacheKeyForScalar(field string, op qx.Op, key string) string {
-	return db.currentQueryViewForTests().materializedPredComplementCacheKeyForScalar(field, op, key)
+	return db.currentQueryViewForTests().materializedPredComplementCacheKeyForScalar(field, compileScalarOpForTest(op), key)
 }
 
 func (db *DB[K, V]) pickCountLeadPredicate(preds []predicate, universe uint64) (int, uint64, uint64) {
@@ -381,15 +714,30 @@ func (db *DB[K, V]) pickCountLeadPredicate(preds []predicate, universe uint64) (
 }
 
 func (db *DB[K, V]) tryCountByPredicates(expr qx.Expr, trace *queryTrace) (uint64, bool, error) {
-	return db.currentQueryViewForTests().tryCountByPredicates(expr, trace)
+	prepared, compiled, err := prepareTestExpr(db, expr)
+	if err != nil {
+		return 0, false, err
+	}
+	defer prepared.Release()
+	return db.currentQueryViewForTests().tryCountByPredicates(compiled, trace)
 }
 
 func (db *DB[K, V]) extractNoOrderBounds(leaves []qx.Expr) (string, rangeBounds, bool, error) {
-	return db.currentQueryViewForTests().extractNoOrderBounds(leaves)
+	prepared, compiledLeaves, err := prepareTestExprs(db, leaves)
+	if err != nil {
+		return "", rangeBounds{}, false, err
+	}
+	defer releasePreparedQueriesForTest(prepared)
+	return db.currentQueryViewForTests().extractNoOrderBounds(compiledLeaves)
 }
 
 func (db *DB[K, V]) checkUsedQuery(q *qx.QX) error {
-	return db.currentQueryViewForTests().checkUsedQuery(q)
+	prepared, viewQ, err := prepareTestQuery(db, q)
+	if err != nil {
+		return err
+	}
+	defer prepared.Release()
+	return db.currentQueryViewForTests().checkUsedQuery(&viewQ)
 }
 
 func (db *DB[K, V]) tryEvalNumericRangeBuckets(field string, fm *field, ov fieldOverlay, br overlayRange) (postingResult, bool) {
@@ -397,7 +745,12 @@ func (db *DB[K, V]) tryEvalNumericRangeBuckets(field string, fm *field, ov field
 }
 
 func (db *DB[K, V]) evalSimple(e qx.Expr) (postingResult, error) {
-	return db.currentQueryViewForTests().evalSimple(e)
+	prepared, expr, err := prepareTestExpr(db, e)
+	if err != nil {
+		return postingResult{}, err
+	}
+	defer prepared.Release()
+	return db.currentQueryViewForTests().evalSimple(expr)
 }
 
 func (db *DB[K, V]) tryCountSnapshotNumericRange(field string, fm *field, ov fieldOverlay, start, end int) (uint64, bool) {
@@ -406,15 +759,34 @@ func (db *DB[K, V]) tryCountSnapshotNumericRange(field string, fm *field, ov fie
 
 func (db *DB[K, V]) exprValueToIdxOwned(expr qx.Expr) ([]string, bool, bool, error) {
 	qv := db.currentQueryViewForTests()
-	fm := qv.fields[expr.Field]
+	var (
+		prepared *qir.Query
+		compiled qir.Expr
+		fm       *field
+		err      error
+	)
+	if qv.root == nil || len(qv.root.indexedFieldAccess) == 0 {
+		prepared, err = qir.PrepareCountExprResolved(testExprFieldResolver{}, expr)
+		if err != nil {
+			return nil, false, false, err
+		}
+		compiled = prepared.Expr
+	} else {
+		prepared, compiled, err = prepareTestExpr(db, expr)
+		if err != nil {
+			return nil, false, false, err
+		}
+		fm = qv.fields[qv.fieldNameByExpr(compiled)]
+	}
+	defer prepared.Release()
 
-	if expr.Value == nil {
-		if expr.Op == qx.OpIN {
+	if compiled.Value == nil {
+		if compiled.Op == qir.OpIN {
 			return nil, true, false, nil
 		}
 		return nil, false, true, nil
 	}
-	switch v := expr.Value.(type) {
+	switch v := compiled.Value.(type) {
 	case []string:
 		if fm != nil && (fm.UseVI || fm.Kind == reflect.String) {
 			return slices.Clone(v), true, false, nil
@@ -425,10 +797,10 @@ func (db *DB[K, V]) exprValueToIdxOwned(expr qx.Expr) ([]string, bool, bool, err
 		}
 	}
 
-	v := reflect.ValueOf(expr.Value)
+	v := reflect.ValueOf(compiled.Value)
 	v, isNil := unwrapExprValue(v)
 	if isNil {
-		if expr.Op == qx.OpIN {
+		if compiled.Op == qir.OpIN {
 			return nil, true, false, nil
 		}
 		return nil, false, true, nil
@@ -451,7 +823,7 @@ func (db *DB[K, V]) exprValueToIdxOwned(expr qx.Expr) ([]string, bool, bool, err
 		return out, true, hasNil, nil
 	}
 
-	key, err := scalarValueToIdxField(expr.Value, v, fm)
+	key, err := scalarValueToIdxField(compiled.Value, v, fm)
 	if err != nil {
 		return nil, false, false, err
 	}
@@ -460,7 +832,25 @@ func (db *DB[K, V]) exprValueToIdxOwned(expr qx.Expr) ([]string, bool, bool, err
 
 func (db *DB[K, V]) exprValueToDistinctIdxOwned(expr qx.Expr) ([]string, bool, bool, error) {
 	qv := db.currentQueryViewForTests()
-	valsBuf, isSlice, hasNil, err := qv.exprValueToDistinctIdxBuf(expr)
+	var (
+		prepared *qir.Query
+		compiled qir.Expr
+		err      error
+	)
+	if qv.root == nil || len(qv.root.indexedFieldAccess) == 0 {
+		prepared, err = qir.PrepareCountExprResolved(testExprFieldResolver{}, expr)
+		if err != nil {
+			return nil, false, false, err
+		}
+		compiled = prepared.Expr
+	} else {
+		prepared, compiled, err = prepareTestExpr(db, expr)
+		if err != nil {
+			return nil, false, false, err
+		}
+	}
+	defer prepared.Release()
+	valsBuf, isSlice, hasNil, err := qv.exprValueToDistinctIdxBuf(compiled)
 	if err != nil || valsBuf == nil {
 		return nil, isSlice, hasNil, err
 	}

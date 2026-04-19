@@ -12,6 +12,7 @@ import (
 
 	"github.com/vapstack/qx"
 	"github.com/vapstack/rbi/internal/posting"
+	"github.com/vapstack/rbi/internal/qir"
 )
 
 var plannerExtSeeded struct {
@@ -85,7 +86,7 @@ func plannerExtQuery005() *qx.QX {
 			qx.EQ("country", "PL"),
 			qx.IN("country", []string{"Iceland", "PL"}),
 			qx.LT("score", 65.0),
-		).By("age", qx.ASC).Max(10),
+		).Sort("age", qx.ASC).Limit(10),
 	)
 }
 
@@ -94,7 +95,7 @@ func plannerExtQuery248() *qx.QX {
 		qx.Query(
 			qx.LT("score", 65.0),
 			qx.LT("score", 55.0),
-		).By("age", qx.DESC).Skip(10).Max(40),
+		).Sort("age", qx.DESC).Offset(10).Limit(40),
 	)
 }
 
@@ -111,7 +112,7 @@ func plannerExtQuery296() *qx.QX {
 					qx.LT("score", 65.0),
 				),
 			),
-		).By("age", qx.ASC).Max(25),
+		).Sort("age", qx.ASC).Limit(25),
 	)
 }
 
@@ -125,7 +126,7 @@ func plannerExtQuery561() *qx.QX {
 					qx.LT("score", 65.0),
 				),
 			),
-		).By("age", qx.DESC).Skip(20).Max(5),
+		).Sort("age", qx.DESC).Offset(20).Limit(5),
 	)
 }
 
@@ -142,7 +143,7 @@ func plannerExtQuery570() *qx.QX {
 					qx.EQ("active", true),
 				),
 			),
-		).Max(80),
+		).Limit(80),
 	)
 }
 
@@ -152,7 +153,7 @@ func plannerExtQuery584() *qx.QX {
 			qx.LT("score", 65.0),
 			qx.EQ("country", "PL"),
 			qx.NOTIN("name", []string{"bob", "dave"}),
-		).By("full_name", qx.ASC).Max(40),
+		).Sort("full_name", qx.ASC).Limit(40),
 	)
 }
 
@@ -169,7 +170,7 @@ func plannerExtQuery651() *qx.QX {
 					qx.EQ("active", false),
 				),
 			),
-		).By("age", qx.ASC).Skip(5).Max(5),
+		).Sort("age", qx.ASC).Offset(5).Limit(5),
 	)
 }
 
@@ -180,7 +181,7 @@ func plannerExtQuery652() *qx.QX {
 			qx.NOTIN("name", []string{"alice", "eve"}),
 			qx.EQ("country", "PL"),
 			qx.LT("score", 55.0),
-		).By("full_name", qx.ASC).Skip(50).Max(15),
+		).Sort("full_name", qx.ASC).Offset(50).Limit(15),
 	)
 }
 
@@ -189,7 +190,7 @@ func plannerExtQuery717() *qx.QX {
 		qx.Query(
 			qx.HASANY("tags", []string{"db", "rust"}),
 			qx.LT("score", 65.0),
-		).By("age", qx.DESC).Max(10),
+		).Sort("age", qx.DESC).Limit(10),
 	)
 }
 
@@ -198,7 +199,7 @@ func plannerExtQuery1145() *qx.QX {
 		qx.Query(
 			qx.HASANY("tags", []string{"db", "ops"}),
 			qx.LT("score", 65.0),
-		).By("age", qx.ASC).Max(40),
+		).Sort("age", qx.ASC).Limit(40),
 	)
 }
 
@@ -209,7 +210,7 @@ func plannerExtQuery1216() *qx.QX {
 			qx.GTE("age", 35),
 			qx.LT("score", 55.0),
 			qx.GTE("score", 25.0),
-		).Skip(5).Max(5),
+		).Offset(5).Limit(5),
 	)
 }
 
@@ -219,7 +220,7 @@ func plannerExtQuery1269() *qx.QX {
 			qx.HASANY("tags", []string{"go", "go"}),
 			qx.LT("score", 65.0),
 			qx.GTE("age", 22),
-		).By("age", qx.DESC).Skip(3).Max(40),
+		).Sort("age", qx.DESC).Offset(3).Limit(40),
 	)
 }
 
@@ -236,7 +237,7 @@ func plannerExtQuery1283() *qx.QX {
 					qx.EQ("name", "alice"),
 				),
 			),
-		).By("age", qx.DESC).Max(80),
+		).Sort("age", qx.DESC).Limit(80),
 	)
 }
 
@@ -245,7 +246,7 @@ func plannerExtQuery1363() *qx.QX {
 		qx.Query(
 			qx.LT("score", 55.0),
 			qx.LT("score", 45.0),
-		).By("full_name", qx.DESC).Max(15),
+		).Sort("full_name", qx.DESC).Limit(15),
 	)
 }
 
@@ -262,7 +263,7 @@ func plannerExtQuery1383() *qx.QX {
 					qx.LT("score", 65.0),
 				),
 			),
-		).By("age", qx.ASC).Max(5),
+		).Sort("age", qx.ASC).Limit(5),
 	)
 }
 
@@ -279,7 +280,7 @@ func plannerExtQuery1386() *qx.QX {
 					qx.LT("score", 55.0),
 				),
 			),
-		).By("age", qx.ASC).Max(10),
+		).Sort("age", qx.ASC).Limit(10),
 	)
 }
 
@@ -296,7 +297,7 @@ func plannerExtQuery1473() *qx.QX {
 					qx.GTE("score", 55.0),
 				),
 			),
-		).By("age", qx.ASC).Max(40),
+		).Sort("age", qx.ASC).Limit(40),
 	)
 }
 
@@ -310,7 +311,7 @@ func plannerExtQueryAdversarialOrderedNegativeOnlyBranch() *qx.QX {
 					qx.LT("score", 55.0),
 				),
 			),
-		).By("age", qx.ASC).Skip(40).Max(35),
+		).Sort("age", qx.ASC).Offset(40).Limit(35),
 	)
 }
 
@@ -334,7 +335,7 @@ func plannerExtQueryAdversarialOrderedNegativeResidualOverlap() *qx.QX {
 					qx.LT("score", 65.0),
 				),
 			),
-		).By("full_name", qx.DESC).Skip(10).Max(50),
+		).Sort("full_name", qx.DESC).Offset(10).Limit(50),
 	)
 }
 
@@ -358,7 +359,7 @@ func plannerExtQueryAdversarialNoOrderNegativeResidualOverlap() *qx.QX {
 					qx.NOTIN("name", []string{"eve"}),
 				),
 			),
-		).Max(120),
+		).Limit(120),
 	)
 }
 
@@ -449,7 +450,7 @@ func plannerExtRandomBranch(r *rand.Rand, orderField string, allowNegativeOnly b
 
 	for len(ops) < leafCount {
 		leaf := plannerExtRandomLeaf(r, orderField, true)
-		if !leaf.Not && leaf.Op != qx.OpNOOP {
+		if !plannerExtExprIsNot(leaf) && plannerExtExprOp(leaf) != qx.OpNOOP {
 			positive++
 		}
 		ops = append(ops, leaf)
@@ -496,18 +497,18 @@ func plannerExtRandomORQuery(
 		q := qx.Query(qx.OR(ops...))
 		if ordered {
 			if r.IntN(2) == 0 {
-				q = q.By(orderField, qx.ASC)
+				q = q.Sort(orderField, qx.ASC)
 			} else {
-				q = q.By(orderField, qx.DESC)
+				q = q.Sort(orderField, qx.DESC)
 			}
 		}
 		if offsetAllowed && r.IntN(3) == 0 {
-			q = q.Skip(r.IntN(40))
+			q = q.Offset(r.IntN(40))
 		}
-		q = q.Max(1 + r.IntN(80))
+		q = q.Limit(1 + r.IntN(80))
 
 		nq := normalizeQueryForTest(q)
-		if nq.Expr.Op == qx.OpOR && !nq.Expr.Not && len(nq.Expr.Operands) >= 2 {
+		if nq.Filter.Is(qx.KindOP, qx.OpOR) && len(nq.Filter.Args) >= 2 {
 			return nq
 		}
 	}
@@ -536,18 +537,35 @@ func plannerExtValidateNoOrderWindow(q *qx.QX, got, full []uint64) error {
 	}
 
 	maxLen := len(full)
-	if q.Offset >= uint64(len(full)) {
+	if q.Window.Offset >= uint64(len(full)) {
 		maxLen = 0
-	} else if q.Offset > 0 {
-		maxLen = len(full) - int(q.Offset)
+	} else if q.Window.Offset > 0 {
+		maxLen = len(full) - int(q.Window.Offset)
 	}
-	if q.Limit > 0 && int(q.Limit) < maxLen {
-		maxLen = int(q.Limit)
+	if q.Window.Limit > 0 && int(q.Window.Limit) < maxLen {
+		maxLen = int(q.Window.Limit)
 	}
 	if len(got) > maxLen {
 		return fmt.Errorf("window overflow got=%d max=%d", len(got), maxLen)
 	}
 	return nil
+}
+
+func plannerExtExprIsNot(expr qx.Expr) bool {
+	return expr.Is(qx.KindOP, qx.OpNOT)
+}
+
+func plannerExtExprOp(expr qx.Expr) qx.Op {
+	if expr.Kind == qx.KindNONE {
+		return qx.OpNOOP
+	}
+	if expr.Is(qx.KindOP, qx.OpNOT) && len(expr.Args) == 1 {
+		return plannerExtExprOp(expr.Args[0])
+	}
+	if expr.Kind == qx.KindOP {
+		return qx.Op(expr.Name)
+	}
+	return qx.OpNONE
 }
 
 func plannerExtRequireTrace(events []TraceEvent) error {
@@ -578,7 +596,7 @@ func plannerExtAssertQueryContract(t *testing.T, q *qx.QX) {
 		t.Fatalf("QueryKeys(%+v): %v", q, err)
 	}
 
-	if len(q.Order) > 0 || (q.Offset == 0 && q.Limit == 0) {
+	if len(q.Order) > 0 || (q.Window.Offset == 0 && q.Window.Limit == 0) {
 		want, err := expectedKeysUint64(t, db, q)
 		if err != nil {
 			t.Fatalf("expectedKeysUint64(%+v): %v", q, err)
@@ -588,8 +606,8 @@ func plannerExtAssertQueryContract(t *testing.T, q *qx.QX) {
 		}
 	} else {
 		fullQ := cloneQuery(q)
-		fullQ.Offset = 0
-		fullQ.Limit = 0
+		fullQ.Window.Offset = 0
+		fullQ.Window.Limit = 0
 		full, err := expectedKeysUint64(t, db, fullQ)
 		if err != nil {
 			t.Fatalf("expectedKeysUint64(full %+v): %v", fullQ, err)
@@ -775,8 +793,8 @@ func TestPlannerExt_Race_NoOrderORDuplicatesOnOverlap(t *testing.T) {
 	db := plannerExtOpenSeededDB(t, Options{AnalyzeInterval: -1})
 	q := plannerExtQuery570()
 	fullQ := cloneQuery(q)
-	fullQ.Offset = 0
-	fullQ.Limit = 0
+	fullQ.Window.Offset = 0
+	fullQ.Window.Limit = 0
 	full, err := expectedKeysUint64(t, db, fullQ)
 	if err != nil {
 		t.Fatalf("expectedKeysUint64(full): %v", err)
@@ -952,7 +970,7 @@ func TestPlannerExt_Race_PeriodicAnalyzerDuringAdversarialQueries(t *testing.T) 
 
 	exps := make([]expectation, 0, len(queries))
 	for _, q := range queries {
-		if len(q.Order) > 0 || (q.Offset == 0 && q.Limit == 0) {
+		if len(q.Order) > 0 || (q.Window.Offset == 0 && q.Window.Limit == 0) {
 			want, err := expectedKeysUint64(t, db, q)
 			if err != nil {
 				t.Fatalf("expectedKeysUint64(%+v): %v", q, err)
@@ -962,8 +980,8 @@ func TestPlannerExt_Race_PeriodicAnalyzerDuringAdversarialQueries(t *testing.T) 
 		}
 
 		fullQ := cloneQuery(q)
-		fullQ.Offset = 0
-		fullQ.Limit = 0
+		fullQ.Window.Offset = 0
+		fullQ.Window.Limit = 0
 		full, err := expectedKeysUint64(t, db, fullQ)
 		if err != nil {
 			t.Fatalf("expectedKeysUint64(full %+v): %v", fullQ, err)
@@ -1067,10 +1085,10 @@ func TestPlannerExt_Bug_ExecPlanORNoOrderAdaptive_PanicsOnAlwaysTrueBranch(t *te
 				qx.EQ("country", "PL"),
 				qx.PREFIX("full_name", "FN-"),
 			),
-		).Max(43),
+		).Limit(43),
 	)
 
-	branches, alwaysFalse, ok := db.buildORBranches(q.Expr.Operands)
+	branches, alwaysFalse, ok := db.buildORBranches(q.Filter.Args)
 	if !ok {
 		t.Fatalf("buildORBranches: ok=false q=%+v", q)
 	}
@@ -1106,10 +1124,10 @@ func TestPlannerExt_Bug_ExecPlanORNoOrderBaseline_PanicsOnAlwaysTrueBranch(t *te
 				qx.EQ("country", "PL"),
 				qx.PREFIX("full_name", "FN-"),
 			),
-		).Max(43),
+		).Limit(43),
 	)
 
-	branches, alwaysFalse, ok := db.buildORBranches(q.Expr.Operands)
+	branches, alwaysFalse, ok := db.buildORBranches(q.Filter.Args)
 	if !ok {
 		t.Fatalf("buildORBranches: ok=false q=%+v", q)
 	}
@@ -1162,7 +1180,7 @@ func TestPlannerExt_Property_OrderedORInternalPlansMatchSeqScan(t *testing.T) {
 			t.Fatalf("case=%d public planner mismatch:\nq=%+v\ngot=%v\nwant=%v", i, q, gotQuery, want)
 		}
 
-		branchesBasic, alwaysFalse, ok := db.buildORBranches(q.Expr.Operands)
+		branchesBasic, alwaysFalse, ok := db.buildORBranches(q.Filter.Args)
 		if !ok {
 			t.Fatalf("case=%d buildORBranches basic: ok=false q=%+v", i, q)
 		}
@@ -1182,7 +1200,7 @@ func TestPlannerExt_Property_OrderedORInternalPlansMatchSeqScan(t *testing.T) {
 			}
 		}
 
-		branchesFallback, alwaysFalse, ok := db.buildORBranches(q.Expr.Operands)
+		branchesFallback, alwaysFalse, ok := db.buildORBranches(q.Filter.Args)
 		if !ok {
 			t.Fatalf("case=%d buildORBranches fallback: ok=false q=%+v", i, q)
 		}
@@ -1202,7 +1220,7 @@ func TestPlannerExt_Property_OrderedORInternalPlansMatchSeqScan(t *testing.T) {
 			}
 		}
 
-		branchesKWay, alwaysFalse, ok := db.buildORBranches(q.Expr.Operands)
+		branchesKWay, alwaysFalse, ok := db.buildORBranches(q.Filter.Args)
 		if !ok {
 			t.Fatalf("case=%d buildORBranches kway: ok=false q=%+v", i, q)
 		}
@@ -1248,8 +1266,8 @@ func TestPlannerExt_Property_NoOrderORInternalPlansPreserveWindow(t *testing.T) 
 	for i := 0; i < plannerExtPropertyCases; i++ {
 		q := plannerExtRandomORQuery(t, r, false, false, false)
 		fullQ := cloneQuery(q)
-		fullQ.Offset = 0
-		fullQ.Limit = 0
+		fullQ.Window.Offset = 0
+		fullQ.Window.Limit = 0
 
 		full, err := expectedKeysUint64(t, db, fullQ)
 		if err != nil {
@@ -1263,11 +1281,11 @@ func TestPlannerExt_Property_NoOrderORInternalPlansPreserveWindow(t *testing.T) 
 		if err = plannerExtValidateNoOrderWindow(q, gotQuery, full); err != nil {
 			t.Fatalf("case=%d public no-order mismatch:\nq=%+v\nerr=%v\ngot=%v\nfull=%v", i, q, err, gotQuery, full)
 		}
-		if len(full) <= int(q.Limit) && !queryIDsEqual(q, gotQuery, full) {
+		if len(full) <= int(q.Window.Limit) && !queryIDsEqual(q, gotQuery, full) {
 			t.Fatalf("case=%d expected full no-order result when limit covers all rows:\nq=%+v\ngot=%v\nfull=%v", i, q, gotQuery, full)
 		}
 
-		branchesAdaptive, alwaysFalse, ok := db.buildORBranches(q.Expr.Operands)
+		branchesAdaptive, alwaysFalse, ok := db.buildORBranches(q.Filter.Args)
 		if !ok {
 			t.Fatalf("case=%d buildORBranches adaptive: ok=false q=%+v", i, q)
 		}
@@ -1296,13 +1314,13 @@ func TestPlannerExt_Property_NoOrderORInternalPlansPreserveWindow(t *testing.T) 
 				if err = plannerExtValidateNoOrderWindow(q, gotAdaptive, full); err != nil {
 					t.Fatalf("case=%d execPlanORNoOrderAdaptive mismatch:\nq=%+v\nerr=%v\ngot=%v\nfull=%v", i, q, err, gotAdaptive, full)
 				}
-				if len(full) <= int(q.Limit) && !queryIDsEqual(q, gotAdaptive, full) {
+				if len(full) <= int(q.Window.Limit) && !queryIDsEqual(q, gotAdaptive, full) {
 					t.Fatalf("case=%d adaptive underfilled full no-order result:\nq=%+v\ngot=%v\nfull=%v", i, q, gotAdaptive, full)
 				}
 			}
 		}
 
-		branchesBaseline, alwaysFalse, ok := db.buildORBranches(q.Expr.Operands)
+		branchesBaseline, alwaysFalse, ok := db.buildORBranches(q.Filter.Args)
 		if !ok {
 			t.Fatalf("case=%d buildORBranches baseline: ok=false q=%+v", i, q)
 		}
@@ -1329,7 +1347,7 @@ func TestPlannerExt_Property_NoOrderORInternalPlansPreserveWindow(t *testing.T) 
 			if err = plannerExtValidateNoOrderWindow(q, gotBaseline, full); err != nil {
 				t.Fatalf("case=%d execPlanORNoOrderBaseline mismatch:\nq=%+v\nerr=%v\ngot=%v\nfull=%v", i, q, err, gotBaseline, full)
 			}
-			if len(full) <= int(q.Limit) && !queryIDsEqual(q, gotBaseline, full) {
+			if len(full) <= int(q.Window.Limit) && !queryIDsEqual(q, gotBaseline, full) {
 				t.Fatalf("case=%d baseline underfilled full no-order result:\nq=%+v\ngot=%v\nfull=%v", i, q, gotBaseline, full)
 			}
 		}
@@ -1350,10 +1368,10 @@ func TestPlannerExt_Property_NoOrderORInternalPlansPreserveWindow(t *testing.T) 
 }
 
 func TestPlannerExt_OrderWindowRejectsOverflow(t *testing.T) {
-	if got, ok := orderWindow(&qx.QX{Offset: 3, Limit: 7}); !ok || got != 10 {
+	if got, ok := orderWindow(&qir.Shape{Offset: 3, Limit: 7}); !ok || got != 10 {
 		t.Fatalf("unexpected normal order window: got=%d ok=%v", got, ok)
 	}
-	if _, ok := orderWindow(&qx.QX{Offset: ^uint64(0), Limit: 1}); ok {
+	if _, ok := orderWindow(&qir.Shape{Offset: ^uint64(0), Limit: 1}); ok {
 		t.Fatalf("expected overflowing order window to be rejected")
 	}
 }
@@ -1437,8 +1455,8 @@ func TestPlannerExt_BuildORBranchesDropsFalseBranchAndKeepsTautology(t *testing.
 	db := plannerExtOpenSeededDB(t, Options{AnalyzeInterval: -1})
 
 	branches, alwaysFalse, ok := db.buildORBranches([]qx.Expr{
-		{Op: qx.OpNOOP, Not: true},
-		{Op: qx.OpNOOP},
+		qx.NOT(qx.Expr{}),
+		qx.Expr{},
 	})
 	if !ok {
 		t.Fatalf("buildORBranches: ok=false")

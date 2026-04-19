@@ -546,7 +546,7 @@ func TestRaceExtra_PublicQueriesStayExactUnderConcurrentMaterializedCacheThrash(
 					return
 				}
 
-				count, err := db.Count(tc.q)
+				count, err := db.Count(tc.q.Filter)
 				if err != nil {
 					setFailed(fmt.Sprintf("Count failed: %v", err))
 					return
@@ -637,7 +637,13 @@ func TestRaceExtra_PinnedSnapshotQueryViewStaysExactAcrossConcurrentPublishes(t 
 		view := db.makeQueryView(snap)
 		defer db.releaseQueryView(view)
 
-		got, err := view.execQuery(q, false, false)
+		prepared, viewQ, err := prepareTestQuery(db, q)
+		if err != nil {
+			return err
+		}
+		defer prepared.Release()
+
+		got, err := view.execQuery(&viewQ, false, false)
 		if err != nil {
 			return err
 		}
@@ -933,16 +939,22 @@ func TestRaceExtra_PublicNumericRangeQueriesStayExactAcrossConcurrentUnchangedFi
 		view := makeView()
 		defer db.releaseQueryView(view)
 
-		fm := view.fields[expr.Field]
-		if fm == nil {
-			t.Fatalf("expected field metadata for %q", expr.Field)
+		prepared, compiled, err := prepareTestExpr(db, expr)
+		if err != nil {
+			t.Fatalf("prepareTestExpr(%v): %v", expr, err)
 		}
-		ov := view.fieldOverlay(expr.Field)
+		defer prepared.Release()
+		field := db.fieldNameByOrdinal(compiled.FieldOrdinal)
+		fm := view.fields[field]
+		if fm == nil {
+			t.Fatalf("expected field metadata for %q", field)
+		}
+		ov := view.fieldOverlay(field)
 		if !ov.hasData() {
-			t.Fatalf("expected field overlay for %q", expr.Field)
+			t.Fatalf("expected field overlay for %q", field)
 		}
 
-		key, isSlice, isNil, err := view.exprValueToIdxScalar(expr)
+		key, isSlice, isNil, err := view.exprValueToIdxScalar(compiled)
 		if err != nil {
 			t.Fatalf("exprValueToIdxScalar(%v): %v", expr, err)
 		}
@@ -950,43 +962,53 @@ func TestRaceExtra_PublicNumericRangeQueriesStayExactAcrossConcurrentUnchangedFi
 			t.Fatalf("unexpected scalar flags for %v: isSlice=%v isNil=%v", expr, isSlice, isNil)
 		}
 
-		rb, ok := rangeBoundsForOp(expr.Op, key)
+		rb, ok := rangeBoundsForOp(compiled.Op, key)
 		if !ok {
-			t.Fatalf("rangeBoundsForOp(%v) failed", expr.Op)
+			t.Fatalf("rangeBoundsForOp(%v) failed", compiled.Op)
 		}
 
 		br := ov.rangeForBounds(rb)
-		out, ok := view.tryEvalNumericRangeBuckets(expr.Field, fm, ov, br)
+		out, ok := view.tryEvalNumericRangeBuckets(field, fm, ov, br)
 		if !ok {
 			t.Fatalf("expected numeric range bucket path for %v", expr)
 		}
 		out.release()
 
-		return br, raceExtraRequireNumericRangeBucketCacheEntry(t, db.getSnapshot(), expr.Field)
+		return br, raceExtraRequireNumericRangeBucketCacheEntry(t, db.getSnapshot(), field)
 	}
 
 	evalSimple := func(expr qx.Expr) (postingResult, error) {
 		view := makeView()
 		defer db.releaseQueryView(view)
-		return view.evalSimple(expr)
+		prepared, compiled, err := prepareTestExpr(db, expr)
+		if err != nil {
+			return postingResult{}, err
+		}
+		defer prepared.Release()
+		return view.evalSimple(compiled)
 	}
 
 	exprValueToIdxScalar := func(expr qx.Expr) (string, bool, bool, error) {
 		view := makeView()
 		defer db.releaseQueryView(view)
-		return view.exprValueToIdxScalar(expr)
+		prepared, compiled, err := prepareTestExpr(db, expr)
+		if err != nil {
+			return "", false, false, err
+		}
+		defer prepared.Release()
+		return view.exprValueToIdxScalar(compiled)
 	}
 
 	materializedPredCacheKeyForScalar := func(field string, op qx.Op, key string) string {
 		view := makeView()
 		defer db.releaseQueryView(view)
-		return view.materializedPredCacheKeyForScalar(field, op, key)
+		return view.materializedPredCacheKeyForScalar(field, compileScalarOpForTest(op), key)
 	}
 
-	exprGTE2500 := qx.Expr{Op: qx.OpGTE, Field: "age", Value: 2500}
-	exprGTE2501 := qx.Expr{Op: qx.OpGTE, Field: "age", Value: 2501}
-	exprLT4500 := qx.Expr{Op: qx.OpLT, Field: "age", Value: 4500}
-	exprLT4499 := qx.Expr{Op: qx.OpLT, Field: "age", Value: 4499}
+	exprGTE2500 := qx.GTE("age", 2500)
+	exprGTE2501 := qx.GTE("age", 2501)
+	exprLT4500 := qx.LT("age", 4500)
+	exprLT4499 := qx.LT("age", 4499)
 
 	br1, entry1 := spanFor(exprGTE2500)
 	br2, entry2 := spanFor(exprGTE2501)
@@ -1181,7 +1203,7 @@ func TestRaceExtra_PublicNumericRangeQueriesStayExactAcrossConcurrentUnchangedFi
 					return
 				}
 
-				count, err := db.Count(q)
+				count, err := db.Count(q.Filter)
 				if err != nil {
 					setFailed(fmt.Sprintf("Count(%d) failed: %v", idx, err))
 					return

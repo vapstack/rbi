@@ -31,7 +31,7 @@ func TestTracer_EmitsAndSamples(t *testing.T) {
 	q := qx.Query(
 		qx.EQ("active", true),
 		qx.GTE("age", 20),
-	).Max(100)
+	).Limit(100)
 
 	for i := 0; i < 5; i++ {
 		ids, err := db.QueryKeys(q)
@@ -89,7 +89,7 @@ func TestTracer_ORDecisionEstimates(t *testing.T) {
 			qx.EQ("active", true),
 			qx.EQ("name", "alice"),
 		),
-	).Max(120)
+	).Limit(120)
 
 	ids, err := db.QueryKeys(q)
 	if err != nil {
@@ -168,7 +168,7 @@ func TestTracer_OROrderMetrics(t *testing.T) {
 			qx.EQ("active", true),
 			qx.EQ("name", "alice"),
 		),
-	).By("age", qx.ASC).Max(80)
+	).Sort("age", qx.ASC).Limit(80)
 
 	ids, err := db.QueryKeys(q)
 	if err != nil {
@@ -236,7 +236,7 @@ func TestTracer_QueryValuesPathEmitsTrace(t *testing.T) {
 		qx.EQ("active", true),
 		qx.GTE("age", 22),
 		qx.LT("age", 45),
-	).By("age", qx.ASC).Max(80)
+	).Sort("age", qx.ASC).Limit(80)
 
 	items, err := db.Query(q)
 	if err != nil {
@@ -289,7 +289,7 @@ func TestTracer_CountPathEmitsTrace(t *testing.T) {
 		qx.GTE("age", 20),
 	)
 
-	cnt, err := db.Count(q)
+	cnt, err := db.Count(q.Filter)
 	if err != nil {
 		t.Fatalf("Count: %v", err)
 	}
@@ -355,15 +355,15 @@ func TestTracer_CountPathTracksBroadRangePrepareMetrics(t *testing.T) {
 		qx.GTE("age", 35_000),
 	)
 
-	first, err := db.Count(q)
+	first, err := db.Count(q.Filter)
 	if err != nil {
 		t.Fatalf("first Count: %v", err)
 	}
-	second, err := db.Count(q)
+	second, err := db.Count(q.Filter)
 	if err != nil {
 		t.Fatalf("second Count: %v", err)
 	}
-	third, err := db.Count(q)
+	third, err := db.Count(q.Filter)
 	if err != nil {
 		t.Fatalf("third Count: %v", err)
 	}

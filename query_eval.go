@@ -6,7 +6,7 @@ import (
 	"reflect"
 	"sync"
 
-	"github.com/vapstack/qx"
+	"github.com/vapstack/rbi/internal/qir"
 
 	"github.com/vapstack/rbi/internal/pooled"
 	"github.com/vapstack/rbi/internal/posting"
@@ -35,19 +35,17 @@ func releasePostingResults(buf *pooled.SliceBuf[postingResult]) {
 	}
 }
 
-func (qv *queryView[K, V]) checkUsedQuery(q *qx.QX) error {
-	for _, o := range q.Order {
-		if _, ok := qv.fields[o.Field]; !ok {
-			return fmt.Errorf("no index for field: %v", o.Field)
-		}
+func (qv *queryView[K, V]) checkUsedQuery(q *qir.Shape) error {
+	if q.HasOrder && qv.fieldMetaByOrder(q.Order) == nil {
+		return fmt.Errorf("no index for field: %v", qv.fieldNameByOrder(q.Order))
 	}
 	return qv.checkUsedExpr(q.Expr)
 }
 
-func (qv *queryView[K, V]) checkUsedExpr(exp qx.Expr) error {
-	if exp.Field != "" {
-		if _, ok := qv.fields[exp.Field]; !ok {
-			return fmt.Errorf("no index for field: %v", exp.Field)
+func (qv *queryView[K, V]) checkUsedExpr(exp qir.Expr) error {
+	if exp.FieldOrdinal >= 0 {
+		if qv.fieldMetaByExpr(exp) == nil {
+			return fmt.Errorf("no index for field: %v", qv.fieldNameByExpr(exp))
 		}
 	}
 	for _, op := range exp.Operands {
@@ -62,11 +60,11 @@ func (qv *queryView[K, V]) checkUsedExpr(exp qx.Expr) error {
 //
 // Results may be positive sets or negative/complement sets to
 // postpone expensive universe materialization until it is actually required.
-func (qv *queryView[K, V]) evalExpr(e qx.Expr) (postingResult, error) {
+func (qv *queryView[K, V]) evalExpr(e qir.Expr) (postingResult, error) {
 	switch e.Op {
 
-	case qx.OpNOOP:
-		if e.Field != "" || e.Value != nil || len(e.Operands) != 0 {
+	case qir.OpNOOP:
+		if e.FieldOrdinal != qir.NoFieldOrdinal || e.Value != nil || len(e.Operands) != 0 {
 			return postingResult{}, fmt.Errorf("%w: invalid expression, op: %v", ErrInvalidQuery, e.Op)
 		}
 		res := postingResult{neg: true}
@@ -75,10 +73,10 @@ func (qv *queryView[K, V]) evalExpr(e qx.Expr) (postingResult, error) {
 		}
 		return res, nil
 
-	case qx.OpAND:
+	case qir.OpAND:
 		return qv.evalAndOperands(e.Operands, e.Not)
 
-	case qx.OpOR:
+	case qir.OpOR:
 		if len(e.Operands) == 0 {
 			return postingResult{}, fmt.Errorf("%w: empty OR expression", ErrInvalidQuery)
 		}
@@ -156,7 +154,7 @@ func (qv *queryView[K, V]) evalExpr(e qx.Expr) (postingResult, error) {
 	}
 }
 
-func (qv *queryView[K, V]) evalAndOperands(ops []qx.Expr, negate bool) (postingResult, error) {
+func (qv *queryView[K, V]) evalAndOperands(ops []qir.Expr, negate bool) (postingResult, error) {
 	if len(ops) == 0 {
 		return postingResult{}, fmt.Errorf("%w: empty AND expression", ErrInvalidQuery)
 	}
@@ -212,31 +210,32 @@ func (qv *queryView[K, V]) evalAndOperands(ops []qx.Expr, negate bool) (postingR
 
 // evalSimple evaluates a single non-boolean predicate against the current
 // immutable snapshot indexes.
-func (qv *queryView[K, V]) evalSimple(e qx.Expr) (postingResult, error) {
-	ov := qv.fieldOverlay(e.Field)
-	if !ov.hasData() && !qv.hasIndexedField(e.Field) {
-		return postingResult{}, fmt.Errorf("no index for field: %v", e.Field)
+func (qv *queryView[K, V]) evalSimple(e qir.Expr) (postingResult, error) {
+	fieldName := qv.fieldNameByExpr(e)
+	ov := qv.fieldOverlayForExpr(e)
+	if !ov.hasData() && !qv.hasIndexedFieldForExpr(e) {
+		return postingResult{}, fmt.Errorf("no index for field: %v", fieldName)
 	}
 
-	f := qv.fields[e.Field]
+	f := qv.fieldMetaByExpr(e)
 	if f == nil {
-		return postingResult{}, fmt.Errorf("no metadata for field: %v", e.Field)
+		return postingResult{}, fmt.Errorf("no metadata for field: %v", fieldName)
 	}
 
 	switch e.Op {
-	case qx.OpEQ:
+	case qir.OpEQ:
 		if !f.Slice {
 			key, isSlice, isNil, err := qv.exprValueToIdxScalar(e)
 			if err != nil {
 				return postingResult{}, err
 			}
 			if isSlice {
-				return postingResult{}, fmt.Errorf("%w: %v expects a single value for scalar field %v", ErrInvalidQuery, e.Op, e.Field)
+				return postingResult{}, fmt.Errorf("%w: %v expects a single value for scalar field %v", ErrInvalidQuery, e.Op, fieldName)
 			}
 
 			var ids posting.List
 			if isNil {
-				ids = qv.nilFieldOverlay(e.Field).lookupPostingRetained(nilIndexEntryKey)
+				ids = qv.nilFieldOverlayForExpr(e).lookupPostingRetained(nilIndexEntryKey)
 			} else {
 				ids = ov.lookupPostingRetained(key)
 			}
@@ -254,14 +253,14 @@ func (qv *queryView[K, V]) evalSimple(e qx.Expr) (postingResult, error) {
 				defer stringSlicePool.Put(valsBuf)
 			}
 			if !isSlice {
-				return postingResult{}, fmt.Errorf("%w: %v expects a slice for slice field %v", ErrInvalidQuery, e.Op, e.Field)
+				return postingResult{}, fmt.Errorf("%w: %v expects a slice for slice field %v", ErrInvalidQuery, e.Op, fieldName)
 			}
-			return qv.evalSliceEQ(e.Field, valsBuf)
+			return qv.evalSliceEQ(fieldName, e.FieldOrdinal, valsBuf)
 		}
 
-	case qx.OpIN:
+	case qir.OpIN:
 		if f.Slice {
-			return postingResult{}, fmt.Errorf("%w: %v not supported on slice field %v", ErrInvalidQuery, e.Op, e.Field)
+			return postingResult{}, fmt.Errorf("%w: %v not supported on slice field %v", ErrInvalidQuery, e.Op, fieldName)
 		}
 		valsBuf, isSlice, hasNil, err := qv.exprValueToDistinctIdxBuf(e)
 		if err != nil {
@@ -295,16 +294,16 @@ func (qv *queryView[K, V]) evalSimple(e qx.Expr) (postingResult, error) {
 			builder.addPosting(ids)
 		}
 		if hasNil {
-			ids := qv.nilFieldOverlay(e.Field).lookupPostingRetained(nilIndexEntryKey)
+			ids := qv.nilFieldOverlayForExpr(e).lookupPostingRetained(nilIndexEntryKey)
 			if !ids.IsEmpty() {
 				builder.addPosting(ids)
 			}
 		}
 		return postingResult{ids: builder.finish(false)}, nil
 
-	case qx.OpHASANY, qx.OpHAS:
+	case qir.OpHASANY, qir.OpHASALL:
 		if !f.Slice {
-			return postingResult{}, fmt.Errorf("%w: %v not supported on non-slice field %v", ErrInvalidQuery, e.Op, e.Field)
+			return postingResult{}, fmt.Errorf("%w: %v not supported on non-slice field %v", ErrInvalidQuery, e.Op, fieldName)
 		}
 		valsBuf, isSlice, _, err := qv.exprValueToDistinctIdxBuf(e)
 		if err != nil {
@@ -324,7 +323,7 @@ func (qv *queryView[K, V]) evalSimple(e qx.Expr) (postingResult, error) {
 			return postingResult{}, fmt.Errorf("%v: %v: no values provided", ErrInvalidQuery, e.Op)
 		}
 
-		if e.Op == qx.OpHAS {
+		if e.Op == qir.OpHASALL {
 			var acc posting.List
 			for i := 0; i < valCount; i++ {
 				ids := ov.lookupPostingRetained(valsBuf.Get(i))
@@ -357,7 +356,7 @@ func (qv *queryView[K, V]) evalSimple(e qx.Expr) (postingResult, error) {
 		}
 		return postingResult{ids: builder.finish(false)}, nil
 
-	case qx.OpGT, qx.OpGTE, qx.OpLT, qx.OpLTE, qx.OpPREFIX:
+	case qir.OpGT, qir.OpGTE, qir.OpLT, qir.OpLTE, qir.OpPREFIX:
 		bound, isSlice, err := qv.exprValueToNormalizedScalarBound(e)
 		if err != nil {
 			return postingResult{}, err
@@ -372,7 +371,7 @@ func (qv *queryView[K, V]) evalSimple(e qx.Expr) (postingResult, error) {
 		qv.initPreparedScalarRangePredicateFromBound(&core, e, f, bound)
 		return core.evalMaterializedPostingResult(ov), nil
 
-	case qx.OpSUFFIX, qx.OpCONTAINS:
+	case qir.OpSUFFIX, qir.OpCONTAINS:
 		v, isSlice, isNil, err := qv.exprValueToIdxScalar(e)
 		if err != nil {
 			return postingResult{}, err
@@ -383,7 +382,7 @@ func (qv *queryView[K, V]) evalSimple(e qx.Expr) (postingResult, error) {
 		if isNil {
 			return postingResult{}, nil
 		}
-		cacheKey := qv.materializedPredKeyForScalar(e.Field, e.Op, v)
+		cacheKey := qv.materializedPredKeyForScalar(fieldName, e.Op, v)
 		if !cacheKey.isZero() {
 			if cached, ok := qv.snap.loadMaterializedPredKey(cacheKey); ok {
 				if cached.IsEmpty() {
@@ -404,8 +403,8 @@ func (qv *queryView[K, V]) evalSimple(e qx.Expr) (postingResult, error) {
 			if !ok {
 				break
 			}
-			match := e.Op == qx.OpSUFFIX && indexKeyHasSuffixString(key, v) ||
-				e.Op == qx.OpCONTAINS && indexKeyContainsString(key, v)
+			match := e.Op == qir.OpSUFFIX && indexKeyHasSuffixString(key, v) ||
+				e.Op == qir.OpCONTAINS && indexKeyContainsString(key, v)
 			if !match {
 				continue
 			}
@@ -495,11 +494,11 @@ func parallelBatchedPostingUnionOwned(posts []posting.List) posting.List {
 //
 // Callers pass distinct values; duplicates are removed before this point so
 // this path can stay read-only.
-func (qv *queryView[K, V]) evalSliceEQ(field string, vals stringKeyReader) (postingResult, error) {
+func (qv *queryView[K, V]) evalSliceEQ(field string, fieldOrdinal int, vals stringKeyReader) (postingResult, error) {
 	valCount := stringKeyReaderLen(vals)
-	lenOV := qv.lenFieldOverlay(field)
-	useZeroComplement := valCount == 0 && qv.isLenZeroComplementField(field)
-	if !lenOV.hasData() && qv.snapshotLenFieldIndexSlice(field) == nil && !useZeroComplement {
+	lenOV := qv.lenFieldOverlayRef(field, fieldOrdinal)
+	useZeroComplement := valCount == 0 && qv.isLenZeroComplementRef(field, fieldOrdinal)
+	if !lenOV.hasData() && qv.snapshotLenFieldIndexSliceRef(field, fieldOrdinal) == nil && !useZeroComplement {
 		return postingResult{}, fmt.Errorf("no lenIndex for slice field: %v", field)
 	}
 
@@ -518,7 +517,7 @@ func (qv *queryView[K, V]) evalSliceEQ(field string, vals stringKeyReader) (post
 		return postingResult{}, nil
 	}
 
-	ov := qv.fieldOverlay(field)
+	ov := qv.fieldOverlayRef(field, fieldOrdinal)
 	acc := lenBM.Clone()
 	for i := 0; i < valCount; i++ {
 		ids := ov.lookupPostingRetained(vals.Get(i))
@@ -562,7 +561,7 @@ func queryValueIsCollectionForField(v reflect.Value, fm *field) bool {
 const impossibleLookupKey = "\x00"
 
 type normalizedScalarBound struct {
-	op          qx.Op
+	op          qir.Op
 	key         string
 	keyIndex    indexKey
 	hasIndexKey bool
@@ -570,11 +569,11 @@ type normalizedScalarBound struct {
 	empty       bool
 }
 
-func normalizedScalarBoundFromString(op qx.Op, key string) normalizedScalarBound {
+func normalizedScalarBoundFromString(op qir.Op, key string) normalizedScalarBound {
 	return normalizedScalarBound{op: op, key: key}
 }
 
-func normalizedScalarBoundFromIndexKey(op qx.Op, key indexKey) normalizedScalarBound {
+func normalizedScalarBoundFromIndexKey(op qir.Op, key indexKey) normalizedScalarBound {
 	return normalizedScalarBound{
 		op:          op,
 		keyIndex:    key,
@@ -726,7 +725,7 @@ func scalarValueToIdxField(raw any, v reflect.Value, fm *field) (string, error) 
 	}
 }
 
-func normalizeSignedIntRangeBound(op qx.Op, v reflect.Value) normalizedScalarBound {
+func normalizeSignedIntRangeBound(op qir.Op, v reflect.Value) normalizedScalarBound {
 	switch v.Kind() {
 	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
 		return normalizedScalarBoundFromIndexKey(op, indexKeyFromU64(orderedInt64Key(v.Int())))
@@ -734,7 +733,7 @@ func normalizeSignedIntRangeBound(op qx.Op, v reflect.Value) normalizedScalarBou
 		u := v.Uint()
 		if u > math.MaxInt64 {
 			switch op {
-			case qx.OpGT, qx.OpGTE:
+			case qir.OpGT, qir.OpGTE:
 				return normalizedScalarBound{empty: true}
 			default:
 				return normalizedScalarBound{full: true}
@@ -746,14 +745,14 @@ func normalizeSignedIntRangeBound(op qx.Op, v reflect.Value) normalizedScalarBou
 		switch {
 		case math.IsNaN(f), math.IsInf(f, 1):
 			switch op {
-			case qx.OpGT, qx.OpGTE:
+			case qir.OpGT, qir.OpGTE:
 				return normalizedScalarBound{empty: true}
 			default:
 				return normalizedScalarBound{full: true}
 			}
 		case math.IsInf(f, -1):
 			switch op {
-			case qx.OpGT, qx.OpGTE:
+			case qir.OpGT, qir.OpGTE:
 				return normalizedScalarBound{full: true}
 			default:
 				return normalizedScalarBound{empty: true}
@@ -761,7 +760,7 @@ func normalizeSignedIntRangeBound(op qx.Op, v reflect.Value) normalizedScalarBou
 		case f == math.Trunc(f):
 			if f < math.MinInt64 || f > math.MaxInt64 {
 				switch op {
-				case qx.OpGT, qx.OpGTE:
+				case qir.OpGT, qir.OpGTE:
 					if f < math.MinInt64 {
 						return normalizedScalarBound{full: true}
 					}
@@ -774,9 +773,9 @@ func normalizeSignedIntRangeBound(op qx.Op, v reflect.Value) normalizedScalarBou
 				}
 			}
 			return normalizedScalarBoundFromIndexKey(op, indexKeyFromU64(orderedInt64Key(int64(f))))
-		case op == qx.OpEQ:
+		case op == qir.OpEQ:
 			return normalizedScalarBound{empty: true}
-		case op == qx.OpGT || op == qx.OpGTE:
+		case op == qir.OpGT || op == qir.OpGTE:
 			floor := math.Floor(f)
 			if floor < math.MinInt64 {
 				return normalizedScalarBound{full: true}
@@ -784,7 +783,7 @@ func normalizeSignedIntRangeBound(op qx.Op, v reflect.Value) normalizedScalarBou
 			if floor > math.MaxInt64 {
 				return normalizedScalarBound{empty: true}
 			}
-			return normalizedScalarBoundFromIndexKey(qx.OpGT, indexKeyFromU64(orderedInt64Key(int64(floor))))
+			return normalizedScalarBoundFromIndexKey(qir.OpGT, indexKeyFromU64(orderedInt64Key(int64(floor))))
 		default:
 			ceil := math.Ceil(f)
 			if ceil < math.MinInt64 {
@@ -793,20 +792,20 @@ func normalizeSignedIntRangeBound(op qx.Op, v reflect.Value) normalizedScalarBou
 			if ceil > math.MaxInt64 {
 				return normalizedScalarBound{full: true}
 			}
-			return normalizedScalarBoundFromIndexKey(qx.OpLT, indexKeyFromU64(orderedInt64Key(int64(ceil))))
+			return normalizedScalarBoundFromIndexKey(qir.OpLT, indexKeyFromU64(orderedInt64Key(int64(ceil))))
 		}
 	default:
 		return normalizedScalarBound{empty: true}
 	}
 }
 
-func normalizeUnsignedIntRangeBound(op qx.Op, v reflect.Value) normalizedScalarBound {
+func normalizeUnsignedIntRangeBound(op qir.Op, v reflect.Value) normalizedScalarBound {
 	switch v.Kind() {
 	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
 		i := v.Int()
 		if i < 0 {
 			switch op {
-			case qx.OpGT, qx.OpGTE:
+			case qir.OpGT, qir.OpGTE:
 				return normalizedScalarBound{full: true}
 			default:
 				return normalizedScalarBound{empty: true}
@@ -820,21 +819,21 @@ func normalizeUnsignedIntRangeBound(op qx.Op, v reflect.Value) normalizedScalarB
 		switch {
 		case math.IsNaN(f), math.IsInf(f, 1):
 			switch op {
-			case qx.OpGT, qx.OpGTE:
+			case qir.OpGT, qir.OpGTE:
 				return normalizedScalarBound{empty: true}
 			default:
 				return normalizedScalarBound{full: true}
 			}
 		case math.IsInf(f, -1):
 			switch op {
-			case qx.OpGT, qx.OpGTE:
+			case qir.OpGT, qir.OpGTE:
 				return normalizedScalarBound{full: true}
 			default:
 				return normalizedScalarBound{empty: true}
 			}
 		case f < 0:
 			switch op {
-			case qx.OpGT, qx.OpGTE:
+			case qir.OpGT, qir.OpGTE:
 				return normalizedScalarBound{full: true}
 			default:
 				return normalizedScalarBound{empty: true}
@@ -842,34 +841,34 @@ func normalizeUnsignedIntRangeBound(op qx.Op, v reflect.Value) normalizedScalarB
 		case f == math.Trunc(f):
 			if f > float64(^uint64(0)) {
 				switch op {
-				case qx.OpGT, qx.OpGTE:
+				case qir.OpGT, qir.OpGTE:
 					return normalizedScalarBound{empty: true}
 				default:
 					return normalizedScalarBound{full: true}
 				}
 			}
 			return normalizedScalarBoundFromIndexKey(op, indexKeyFromU64(uint64(f)))
-		case op == qx.OpEQ:
+		case op == qir.OpEQ:
 			return normalizedScalarBound{empty: true}
-		case op == qx.OpGT || op == qx.OpGTE:
+		case op == qir.OpGT || op == qir.OpGTE:
 			floor := math.Floor(f)
 			if floor > float64(^uint64(0)) {
 				return normalizedScalarBound{empty: true}
 			}
-			return normalizedScalarBoundFromIndexKey(qx.OpGT, indexKeyFromU64(uint64(floor)))
+			return normalizedScalarBoundFromIndexKey(qir.OpGT, indexKeyFromU64(uint64(floor)))
 		default:
 			ceil := math.Ceil(f)
 			if ceil > float64(^uint64(0)) {
 				return normalizedScalarBound{full: true}
 			}
-			return normalizedScalarBoundFromIndexKey(qx.OpLT, indexKeyFromU64(uint64(ceil)))
+			return normalizedScalarBoundFromIndexKey(qir.OpLT, indexKeyFromU64(uint64(ceil)))
 		}
 	default:
 		return normalizedScalarBound{empty: true}
 	}
 }
 
-func normalizeFloatRangeBound(op qx.Op, v reflect.Value) normalizedScalarBound {
+func normalizeFloatRangeBound(op qir.Op, v reflect.Value) normalizedScalarBound {
 	f, ok := numericQueryValueToFloat64(v)
 	if !ok {
 		return normalizedScalarBound{empty: true}
@@ -877,12 +876,12 @@ func normalizeFloatRangeBound(op qx.Op, v reflect.Value) normalizedScalarBound {
 	return normalizedScalarBoundFromIndexKey(op, indexKeyFromU64(orderedFloat64Key(f)))
 }
 
-func (qv *queryView[K, V]) exprValueToNormalizedScalarBound(expr qx.Expr) (normalizedScalarBound, bool, error) {
+func (qv *queryView[K, V]) exprValueToNormalizedScalarBound(expr qir.Expr) (normalizedScalarBound, bool, error) {
 	if expr.Value == nil {
 		return normalizedScalarBound{empty: true}, false, nil
 	}
 
-	fm := qv.fields[expr.Field]
+	fm := qv.fieldMetaByExpr(expr)
 	v := reflect.ValueOf(expr.Value)
 	v, isNil := unwrapExprValue(v)
 	if isNil {
@@ -894,7 +893,7 @@ func (qv *queryView[K, V]) exprValueToNormalizedScalarBound(expr qx.Expr) (norma
 	if bound, ok := qv.loadNormalizedScalarBound(expr, v); ok {
 		return bound, false, nil
 	}
-	if expr.Op == qx.OpPREFIX {
+	if expr.Op == qir.OpPREFIX {
 		if fm != nil && fm.KeyKind == fieldWriteKeysOrderedU64 {
 			bound := normalizedScalarBound{empty: true}
 			qv.storeNormalizedScalarBound(expr, v, bound)
@@ -904,7 +903,7 @@ func (qv *queryView[K, V]) exprValueToNormalizedScalarBound(expr qx.Expr) (norma
 		if err != nil {
 			return normalizedScalarBound{}, false, err
 		}
-		bound := normalizedScalarBoundFromString(qx.OpPREFIX, key)
+		bound := normalizedScalarBoundFromString(qir.OpPREFIX, key)
 		qv.storeNormalizedScalarBound(expr, v, bound)
 		return bound, false, nil
 	}
@@ -948,31 +947,31 @@ func applyNormalizedScalarBound(rb *rangeBounds, b normalizedScalarBound) {
 		return
 	}
 	switch b.op {
-	case qx.OpGT:
+	case qir.OpGT:
 		if b.hasIndexKey {
 			rb.applyLoIndex(b.keyIndex, false)
 		} else {
 			rb.applyLo(b.key, false)
 		}
-	case qx.OpGTE:
+	case qir.OpGTE:
 		if b.hasIndexKey {
 			rb.applyLoIndex(b.keyIndex, true)
 		} else {
 			rb.applyLo(b.key, true)
 		}
-	case qx.OpLT:
+	case qir.OpLT:
 		if b.hasIndexKey {
 			rb.applyHiIndex(b.keyIndex, false)
 		} else {
 			rb.applyHi(b.key, false)
 		}
-	case qx.OpLTE:
+	case qir.OpLTE:
 		if b.hasIndexKey {
 			rb.applyHiIndex(b.keyIndex, true)
 		} else {
 			rb.applyHi(b.key, true)
 		}
-	case qx.OpEQ:
+	case qir.OpEQ:
 		if b.hasIndexKey {
 			rb.applyLoIndex(b.keyIndex, true)
 			rb.applyHiIndex(b.keyIndex, true)
@@ -980,7 +979,7 @@ func applyNormalizedScalarBound(rb *rangeBounds, b normalizedScalarBound) {
 			rb.applyLo(b.key, true)
 			rb.applyHi(b.key, true)
 		}
-	case qx.OpPREFIX:
+	case qir.OpPREFIX:
 		rb.applyPrefix(b.key)
 	}
 }
@@ -1040,13 +1039,13 @@ func sliceValueToIdxStringBuf(v reflect.Value, fm *field) (*pooled.SliceBuf[stri
 	return ixsBuf, hasNil, nil
 }
 
-func (qv *queryView[K, V]) scalarLookupPostings(field string, keys stringKeyReader, includeNil bool) (*pooled.SliceBuf[posting.List], uint64) {
+func (qv *queryView[K, V]) scalarLookupPostings(field string, fieldOrdinal int, keys stringKeyReader, includeNil bool) (*pooled.SliceBuf[posting.List], uint64) {
 	postsBuf := postingSlicePool.Get()
 	keyCount := stringKeyReaderLen(keys)
 	postsBuf.Grow(keyCount + btoi(includeNil))
 	var est uint64
 
-	ov := qv.fieldOverlay(field)
+	ov := qv.fieldOverlayRef(field, fieldOrdinal)
 	for i := 0; i < keyCount; i++ {
 		ids := ov.lookupPostingRetained(keys.Get(i))
 		if ids.IsEmpty() {
@@ -1056,7 +1055,7 @@ func (qv *queryView[K, V]) scalarLookupPostings(field string, keys stringKeyRead
 		est += ids.Cardinality()
 	}
 	if includeNil {
-		ids := qv.nilFieldOverlay(field).lookupPostingRetained(nilIndexEntryKey)
+		ids := qv.nilFieldOverlayRef(field, fieldOrdinal).lookupPostingRetained(nilIndexEntryKey)
 		if !ids.IsEmpty() {
 			postsBuf.Append(ids)
 			est += ids.Cardinality()
@@ -1065,12 +1064,12 @@ func (qv *queryView[K, V]) scalarLookupPostings(field string, keys stringKeyRead
 	return postsBuf, est
 }
 
-func (qv *queryView[K, V]) exprValueToIdxScalar(expr qx.Expr) (string, bool, bool, error) {
+func (qv *queryView[K, V]) exprValueToIdxScalar(expr qir.Expr) (string, bool, bool, error) {
 	if expr.Value == nil {
 		return "", false, true, nil
 	}
 
-	fm := qv.fields[expr.Field]
+	fm := qv.fieldMetaByExpr(expr)
 	v := reflect.ValueOf(expr.Value)
 	v, isNil := unwrapExprValue(v)
 	if isNil {
@@ -1095,11 +1094,11 @@ func (qv *queryView[K, V]) diffPostingResult(acc, sub postingResult) (postingRes
 
 // exprValueToDistinctIdxBuf returns caller-owned indexed values deduplicated
 // for set-like operators whose semantics do not depend on input order.
-func (qv *queryView[K, V]) exprValueToDistinctIdxBuf(expr qx.Expr) (*pooled.SliceBuf[string], bool, bool, error) {
-	fm := qv.fields[expr.Field]
+func (qv *queryView[K, V]) exprValueToDistinctIdxBuf(expr qir.Expr) (*pooled.SliceBuf[string], bool, bool, error) {
+	fm := qv.fieldMetaByExpr(expr)
 
 	if expr.Value == nil {
-		if expr.Op == qx.OpIN {
+		if expr.Op == qir.OpIN {
 			return nil, true, false, nil
 		}
 		return nil, false, true, nil
@@ -1125,7 +1124,7 @@ func (qv *queryView[K, V]) exprValueToDistinctIdxBuf(expr qx.Expr) (*pooled.Slic
 	v := reflect.ValueOf(expr.Value)
 	v, isNil := unwrapExprValue(v)
 	if isNil {
-		if expr.Op == qx.OpIN {
+		if expr.Op == qir.OpIN {
 			return nil, true, false, nil
 		}
 		return nil, false, true, nil

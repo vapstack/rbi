@@ -515,7 +515,14 @@ func (db *DB[K, V]) initIndexedFieldAccessors() error {
 	db.indexedFieldByName = make(map[string]indexedFieldAccessor, len(db.fields))
 	db.uniqueFieldAccessors = make([]indexedFieldAccessor, 0, 4)
 
-	for _, f := range db.fields {
+	names := make([]string, 0, len(db.fields))
+	for name := range db.fields {
+		names = append(names, name)
+	}
+	slices.Sort(names)
+
+	for _, name := range names {
+		f := db.fields[name]
 		acc, err := db.makeIndexedFieldAccessor(f)
 		if err != nil {
 			return err

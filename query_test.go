@@ -12,7 +12,7 @@ import (
 	"testing"
 
 	"github.com/vapstack/qx"
-	"github.com/vapstack/rbi/internal/normalize"
+	"github.com/vapstack/rbi/internal/qir"
 	"go.etcd.io/bbolt"
 )
 
@@ -97,7 +97,12 @@ func TestQuery_TryQueryEmptyOnSnapshot_SimpleScalarLeaf(t *testing.T) {
 
 	qv := db.currentQueryViewForTests()
 
-	empty, err := qv.tryQueryEmptyOnSnapshot(qx.Query(qx.GT("age", 100)))
+	prepared, viewQ, err := prepareTestQuery(db, qx.Query(qx.GT("age", 100)))
+	if err != nil {
+		t.Fatalf("prepareTestQuery(no-match): %v", err)
+	}
+	empty, err := qv.tryQueryEmptyOnSnapshot(&viewQ)
+	prepared.Release()
 	if err != nil {
 		t.Fatalf("tryQueryEmptyOnSnapshot(no-match): %v", err)
 	}
@@ -105,7 +110,12 @@ func TestQuery_TryQueryEmptyOnSnapshot_SimpleScalarLeaf(t *testing.T) {
 		t.Fatalf("expected GT(age,100) to be proven empty without tx")
 	}
 
-	empty, err = qv.tryQueryEmptyOnSnapshot(qx.Query(qx.GTE("age", 20)))
+	prepared, viewQ, err = prepareTestQuery(db, qx.Query(qx.GTE("age", 20)))
+	if err != nil {
+		t.Fatalf("prepareTestQuery(hit): %v", err)
+	}
+	empty, err = qv.tryQueryEmptyOnSnapshot(&viewQ)
+	prepared.Release()
 	if err != nil {
 		t.Fatalf("tryQueryEmptyOnSnapshot(hit): %v", err)
 	}
@@ -214,11 +224,124 @@ func seedGeneratedUint64Data(t *testing.T, db *DB[uint64, Rec], n int, gen func(
 
 func mustExtractAndLeaves(t testing.TB, e qx.Expr) []qx.Expr {
 	t.Helper()
-	leaves, ok := extractAndLeaves(e)
+	leaves, ok := collectAndLeavesForTest(e)
 	if !ok || len(leaves) == 0 {
 		t.Fatalf("extractAndLeaves failed: ok=%v len=%d", ok, len(leaves))
 	}
 	return leaves
+}
+
+func collectAndLeavesForTest(e qx.Expr) ([]qx.Expr, bool) {
+	switch {
+	case e.Is(qx.KindOP, qx.OpNOT):
+		if len(e.Args) != 1 {
+			return nil, false
+		}
+		child := e.Args[0]
+		if child.Is(qx.KindOP, qx.OpAND) || child.Is(qx.KindOP, qx.OpOR) || child.Is(qx.KindOP, qx.OpNOT) || child.Kind == qx.KindNONE {
+			return nil, false
+		}
+		if child.Kind != qx.KindOP {
+			return nil, false
+		}
+		return []qx.Expr{e}, true
+	case e.Is(qx.KindOP, qx.OpAND):
+		if len(e.Args) == 0 {
+			return nil, false
+		}
+		out := make([]qx.Expr, 0, len(e.Args))
+		for i := range e.Args {
+			leaves, ok := collectAndLeavesForTest(e.Args[i])
+			if !ok {
+				return nil, false
+			}
+			out = append(out, leaves...)
+		}
+		return out, true
+	case e.Kind == qx.KindNONE:
+		return []qx.Expr{e}, true
+	case e.Kind == qx.KindOP:
+		if e.Is(qx.KindOP, qx.OpOR) {
+			return nil, false
+		}
+		return []qx.Expr{e}, true
+	default:
+		return nil, false
+	}
+}
+
+func orderWindowForTest(q *qx.QX) (int, bool) {
+	if q == nil || q.Window.Limit == 0 {
+		return 0, false
+	}
+	need := q.Window.Offset + q.Window.Limit
+	if need < q.Window.Offset {
+		return 0, false
+	}
+	if need > uint64(math.MaxInt) {
+		return 0, false
+	}
+	return int(need), true
+}
+
+func testOrderBasic(field string, desc bool) qx.Order {
+	return qx.Order{By: qx.REF(field), Desc: desc}
+}
+
+func testOrderByArrayPos(field string, priority []string, desc bool) qx.Order {
+	return qx.Order{By: qx.POS(field, priority), Desc: desc}
+}
+
+func testOrderByArrayCount(field string, desc bool) qx.Order {
+	return qx.Order{By: qx.LEN(field), Desc: desc}
+}
+
+func queryTestOrderField(q *qx.QX) string {
+	if q == nil || len(q.Order) == 0 {
+		return ""
+	}
+	by := q.Order[0].By
+	if by.Kind == qx.KindREF {
+		return by.Name
+	}
+	if by.Kind == qx.KindOP && len(by.Args) > 0 && by.Args[0].Kind == qx.KindREF {
+		return by.Args[0].Name
+	}
+	return ""
+}
+
+func queryTestOrderIsArrayPosOnField(q *qx.QX, field string) bool {
+	if q == nil || len(q.Order) == 0 {
+		return false
+	}
+	by := q.Order[0].By
+	return by.Is(qx.KindOP, qx.OpPOS) && len(by.Args) == 2 && by.Args[0].Kind == qx.KindREF && by.Args[0].Name == field
+}
+
+func queryTestOrderLabel(q *qx.QX) string {
+	if q == nil || len(q.Order) == 0 {
+		return "none"
+	}
+	by := q.Order[0].By
+	if by.Kind == qx.KindREF {
+		return "basic:" + by.Name
+	}
+	if by.Kind == qx.KindOP {
+		return by.Name
+	}
+	return by.Kind
+}
+
+func queryTestOrderValues(q *qx.QX) []string {
+	if q == nil || len(q.Order) == 0 {
+		return nil
+	}
+	by := q.Order[0].By
+	if by.Kind != qx.KindOP || len(by.Args) != 2 {
+		return nil
+	}
+	vals, _ := by.Args[1].Value.([]string)
+	return vals
 }
 
 func TestExtractAndLeavesRejectsNegatedAndGroup(t *testing.T) {
@@ -230,7 +353,7 @@ func TestExtractAndLeavesRejectsNegatedAndGroup(t *testing.T) {
 		qx.EQ("active", true),
 	)
 
-	leaves, ok := extractAndLeaves(e)
+	leaves, ok := extractAndLeaves(mustTestQIRExpr(t, e))
 	if ok || leaves != nil {
 		t.Fatalf("expected negated AND group to be rejected, got ok=%v leaves=%v", ok, leaves)
 	}
@@ -245,8 +368,8 @@ func TestCollectAndLeavesFixedRejectsNegatedAndGroup(t *testing.T) {
 		qx.EQ("active", true),
 	)
 
-	var buf [4]qx.Expr
-	leaves, ok := collectAndLeavesFixed(e, buf[:0])
+	var buf [4]qir.Expr
+	leaves, ok := collectAndLeavesFixed(mustTestQIRExpr(t, e), buf[:0])
 	if ok || leaves != nil {
 		t.Fatalf("expected negated AND group to be rejected, got ok=%v leaves=%v", ok, leaves)
 	}
@@ -323,6 +446,62 @@ func fieldValue(rec *Rec, field string) any {
 	default:
 		return nil
 	}
+}
+
+type testExprFieldResolver struct{}
+
+func (testExprFieldResolver) ResolveField(name string) (int, bool) {
+	switch name {
+	case "country":
+		return 0, true
+	case "name":
+		return 1, true
+	case "email":
+		return 2, true
+	case "age":
+		return 3, true
+	case "score":
+		return 4, true
+	case "active":
+		return 5, true
+	case "tags":
+		return 6, true
+	case "full_name", "fullName":
+		return 7, true
+	case "opt":
+		return 8, true
+	default:
+		return 0, false
+	}
+}
+
+func testExprFieldNameByOrdinal(ordinal int) string {
+	switch ordinal {
+	case 0:
+		return "country"
+	case 1:
+		return "name"
+	case 2:
+		return "email"
+	case 3:
+		return "age"
+	case 4:
+		return "score"
+	case 5:
+		return "active"
+	case 6:
+		return "tags"
+	case 7:
+		return "full_name"
+	case 8:
+		return "opt"
+	default:
+		return ""
+	}
+}
+
+func fieldValueByOrdinal(rec *Rec, ordinal int) any {
+	return fieldValue(rec, testExprFieldNameByOrdinal(ordinal))
 }
 
 func asString(v any) (string, bool) {
@@ -527,24 +706,32 @@ func querySliceContainsScalar(values any, want any) (bool, error) {
 	return false, nil
 }
 
-// evalExprBool tries to implement the query logic to serve as a reference implementation
+// evalExprBool tries to implement the query logic to serve as a reference implementation.
 func evalExprBool(rec *Rec, e qx.Expr) (bool, error) {
+	prepared, err := qir.PrepareCountExprResolved(testExprFieldResolver{}, e)
+	if err != nil {
+		return false, err
+	}
+	defer prepared.Release()
+	return evalPreparedExprBool(rec, prepared.Expr)
+}
 
-	if e.Op == qx.OpNOOP {
+func evalPreparedExprBool(rec *Rec, e qir.Expr) (bool, error) {
+	if e.Op == qir.OpNOOP {
 		if e.Not {
 			return false, nil
 		}
 		return true, nil
 	}
 
-	if e.Op == qx.OpAND || e.Op == qx.OpOR {
+	if e.Op == qir.OpAND || e.Op == qir.OpOR {
 		if len(e.Operands) == 0 {
 			return false, ErrInvalidQuery
 		}
-		if e.Op == qx.OpAND {
+		if e.Op == qir.OpAND {
 			out := true
 			for _, ch := range e.Operands {
-				b, err := evalExprBool(rec, ch)
+				b, err := evalPreparedExprBool(rec, ch)
 				if err != nil {
 					return false, err
 				}
@@ -561,7 +748,7 @@ func evalExprBool(rec *Rec, e qx.Expr) (bool, error) {
 		// OpOR
 		out := false
 		for _, ch := range e.Operands {
-			b, err := evalExprBool(rec, ch)
+			b, err := evalPreparedExprBool(rec, ch)
 			if err != nil {
 				return false, err
 			}
@@ -576,12 +763,13 @@ func evalExprBool(rec *Rec, e qx.Expr) (bool, error) {
 		return out, nil
 	}
 
-	fv := fieldValue(rec, e.Field)
+	fieldName := testExprFieldNameByOrdinal(e.FieldOrdinal)
+	fv := fieldValueByOrdinal(rec, e.FieldOrdinal)
 
 	var out bool
 
 	switch e.Op {
-	case qx.OpEQ:
+	case qir.OpEQ:
 		if e.Value == nil {
 			out = fv == nil
 			break
@@ -603,19 +791,19 @@ func evalExprBool(rec *Rec, e qx.Expr) (bool, error) {
 			s, ok2 := e.Value.(string)
 			out = ok2 && v == s
 		case []string:
-			return false, fmt.Errorf("test harness: EQ not defined for slice field %q", e.Field)
+			return false, fmt.Errorf("test harness: EQ not defined for slice field %q", fieldName)
 		default:
 			return false, fmt.Errorf("test harness: unsupported EQ field type %T", fv)
 		}
 
-	case qx.OpIN:
+	case qir.OpIN:
 		var err error
 		out, err = querySliceContainsScalar(e.Value, fv)
 		if err != nil {
 			return false, err
 		}
 
-	case qx.OpGT, qx.OpGTE, qx.OpLT, qx.OpLTE:
+	case qir.OpGT, qir.OpGTE, qir.OpLT, qir.OpLTE:
 		if fv == nil || e.Value == nil {
 			out = false
 			break
@@ -627,13 +815,13 @@ func evalExprBool(rec *Rec, e qx.Expr) (bool, error) {
 				return false, fmt.Errorf("test harness: bad numeric value for %v", e.Op)
 			}
 			switch e.Op {
-			case qx.OpGT:
+			case qir.OpGT:
 				out = int64(v) > i
-			case qx.OpGTE:
+			case qir.OpGTE:
 				out = int64(v) >= i
-			case qx.OpLT:
+			case qir.OpLT:
 				out = int64(v) < i
-			case qx.OpLTE:
+			case qir.OpLTE:
 				out = int64(v) <= i
 			}
 		case float64:
@@ -643,13 +831,13 @@ func evalExprBool(rec *Rec, e qx.Expr) (bool, error) {
 			}
 			cmp := compareFloat64QuerySemantics(v, f)
 			switch e.Op {
-			case qx.OpGT:
+			case qir.OpGT:
 				out = cmp > 0
-			case qx.OpGTE:
+			case qir.OpGTE:
 				out = cmp >= 0
-			case qx.OpLT:
+			case qir.OpLT:
 				out = cmp < 0
-			case qx.OpLTE:
+			case qir.OpLTE:
 				out = cmp <= 0
 			}
 		case string:
@@ -658,20 +846,20 @@ func evalExprBool(rec *Rec, e qx.Expr) (bool, error) {
 				return false, fmt.Errorf("test harness: bad string value for %v", e.Op)
 			}
 			switch e.Op {
-			case qx.OpGT:
+			case qir.OpGT:
 				out = v > s
-			case qx.OpGTE:
+			case qir.OpGTE:
 				out = v >= s
-			case qx.OpLT:
+			case qir.OpLT:
 				out = v < s
-			case qx.OpLTE:
+			case qir.OpLTE:
 				out = v <= s
 			}
 		default:
 			return false, fmt.Errorf("test harness: unsupported range field type %T", fv)
 		}
 
-	case qx.OpPREFIX:
+	case qir.OpPREFIX:
 		if fv == nil || e.Value == nil {
 			out = false
 			break
@@ -686,7 +874,7 @@ func evalExprBool(rec *Rec, e qx.Expr) (bool, error) {
 		}
 		out = strings.HasPrefix(s, p)
 
-	case qx.OpSUFFIX:
+	case qir.OpSUFFIX:
 		if fv == nil || e.Value == nil {
 			out = false
 			break
@@ -701,7 +889,7 @@ func evalExprBool(rec *Rec, e qx.Expr) (bool, error) {
 		}
 		out = strings.HasSuffix(s, p)
 
-	case qx.OpCONTAINS:
+	case qir.OpCONTAINS:
 		if fv == nil || e.Value == nil {
 			out = false
 			break
@@ -716,16 +904,16 @@ func evalExprBool(rec *Rec, e qx.Expr) (bool, error) {
 		}
 		out = strings.Contains(s, p)
 
-	case qx.OpHAS, qx.OpHASANY:
+	case qir.OpHASALL, qir.OpHASANY:
 		arr, ok2 := fv.([]string)
 		if !ok2 {
 			return false, fmt.Errorf("test harness: %v only for []string in this test", e.Op)
 		}
 		if e.Value == nil {
 			switch e.Op {
-			case qx.OpHAS:
+			case qir.OpHASALL:
 				return false, fmt.Errorf("HAS: no values provided")
-			case qx.OpHASANY:
+			case qir.OpHASANY:
 				out = false
 			}
 			break
@@ -735,9 +923,9 @@ func evalExprBool(rec *Rec, e qx.Expr) (bool, error) {
 			return false, fmt.Errorf("test harness: %v expects []string", e.Op)
 		}
 		switch e.Op {
-		case qx.OpHAS:
+		case qir.OpHASALL:
 			out = containsAll(arr, needles)
-		case qx.OpHASANY:
+		case qir.OpHASANY:
 			out = containsAny(arr, needles)
 		}
 
@@ -763,7 +951,7 @@ func expectedKeysUint64(t *testing.T, db *DB[uint64, Rec], q *qx.QX) ([]uint64, 
 	var rows []row
 
 	err := db.SeqScan(0, func(id uint64, v *Rec) (bool, error) {
-		ok, e := evalExprBool(v, q.Expr)
+		ok, e := evalExprBool(v, q.Filter)
 		if e != nil {
 			return false, e
 		}
@@ -779,10 +967,15 @@ func expectedKeysUint64(t *testing.T, db *DB[uint64, Rec], q *qx.QX) ([]uint64, 
 	if len(q.Order) == 0 {
 		sort.Slice(rows, func(i, j int) bool { return rows[i].id < rows[j].id })
 	} else {
-		o := q.Order[0]
-		switch o.Type {
-		case qx.OrderBasic:
-			f := o.Field
+		prepared, viewQ, err := prepareTestQuery(db, q)
+		if err != nil {
+			return nil, err
+		}
+		defer prepared.Release()
+		o := viewQ.Order
+		f := testOrderFieldName(db, o)
+		switch o.Kind {
+		case qir.OrderKindBasic:
 			less := func(a, b row) bool {
 				va := fieldValue(a.rec, f)
 				vb := fieldValue(b.rec, f)
@@ -794,8 +987,7 @@ func expectedKeysUint64(t *testing.T, db *DB[uint64, Rec], q *qx.QX) ([]uint64, 
 			}
 			sort.Slice(rows, func(i, j int) bool { return less(rows[i], rows[j]) })
 
-		case qx.OrderByArrayPos:
-			f := o.Field
+		case qir.OrderKindArrayPos:
 			want, _ := o.Data.([]string)
 			if len(want) == 0 {
 				sort.Slice(rows, func(i, j int) bool { return rows[i].id < rows[j].id })
@@ -836,8 +1028,7 @@ func expectedKeysUint64(t *testing.T, db *DB[uint64, Rec], q *qx.QX) ([]uint64, 
 				return ri < rj
 			})
 
-		case qx.OrderByArrayCount:
-			f := o.Field
+		case qir.OrderKindArrayCount:
 			sort.Slice(rows, func(i, j int) bool {
 				ai, _ := fieldValue(rows[i].rec, f).([]string)
 				aj, _ := fieldValue(rows[j].rec, f).([]string)
@@ -853,17 +1044,17 @@ func expectedKeysUint64(t *testing.T, db *DB[uint64, Rec], q *qx.QX) ([]uint64, 
 			})
 
 		default:
-			return nil, fmt.Errorf("test harness: unknown order type %v", o.Type)
+			return nil, fmt.Errorf("test harness: unknown order kind %v", o.Kind)
 		}
 	}
 
-	off := int(q.Offset)
+	off := int(q.Window.Offset)
 	if off > len(rows) {
 		return nil, nil
 	}
 	rows = rows[off:]
-	if q.Limit != 0 && int(q.Limit) < len(rows) {
-		rows = rows[:int(q.Limit)]
+	if q.Window.Limit != 0 && int(q.Window.Limit) < len(rows) {
+		rows = rows[:int(q.Window.Limit)]
 	}
 
 	out := make([]uint64, len(rows))
@@ -886,7 +1077,7 @@ func expectedKeysString(t testing.TB, db *DB[string, Rec], q *qx.QX) ([]string, 
 
 	var rows []row
 	err := db.SeqScan("", func(id string, v *Rec) (bool, error) {
-		ok, e := evalExprBool(v, q.Expr)
+		ok, e := evalExprBool(v, q.Filter)
 		if e != nil {
 			return false, e
 		}
@@ -906,10 +1097,15 @@ func expectedKeysString(t testing.TB, db *DB[string, Rec], q *qx.QX) ([]string, 
 	if len(q.Order) == 0 {
 		sort.Slice(rows, func(i, j int) bool { return rows[i].idx < rows[j].idx })
 	} else {
-		o := q.Order[0]
-		switch o.Type {
-		case qx.OrderBasic:
-			f := o.Field
+		prepared, viewQ, err := prepareTestQuery(db, q)
+		if err != nil {
+			return nil, err
+		}
+		defer prepared.Release()
+		o := viewQ.Order
+		f := testOrderFieldName(db, o)
+		switch o.Kind {
+		case qir.OrderKindBasic:
 			less := func(a, b row) bool {
 				va := fieldValue(a.rec, f)
 				vb := fieldValue(b.rec, f)
@@ -921,8 +1117,7 @@ func expectedKeysString(t testing.TB, db *DB[string, Rec], q *qx.QX) ([]string, 
 			}
 			sort.Slice(rows, func(i, j int) bool { return less(rows[i], rows[j]) })
 
-		case qx.OrderByArrayPos:
-			f := o.Field
+		case qir.OrderKindArrayPos:
 			want, _ := o.Data.([]string)
 			if len(want) == 0 {
 				sort.Slice(rows, func(i, j int) bool { return rows[i].idx < rows[j].idx })
@@ -962,8 +1157,7 @@ func expectedKeysString(t testing.TB, db *DB[string, Rec], q *qx.QX) ([]string, 
 				return ri < rj
 			})
 
-		case qx.OrderByArrayCount:
-			f := o.Field
+		case qir.OrderKindArrayCount:
 			sort.Slice(rows, func(i, j int) bool {
 				ai, _ := fieldValue(rows[i].rec, f).([]string)
 				aj, _ := fieldValue(rows[j].rec, f).([]string)
@@ -979,17 +1173,17 @@ func expectedKeysString(t testing.TB, db *DB[string, Rec], q *qx.QX) ([]string, 
 			})
 
 		default:
-			return nil, fmt.Errorf("test harness: unknown order type %v", o.Type)
+			return nil, fmt.Errorf("test harness: unknown order kind %v", o.Kind)
 		}
 	}
 
-	off := int(q.Offset)
+	off := int(q.Window.Offset)
 	if off > len(rows) {
 		return nil, nil
 	}
 	rows = rows[off:]
-	if q.Limit != 0 && int(q.Limit) < len(rows) {
-		rows = rows[:int(q.Limit)]
+	if q.Window.Limit != 0 && int(q.Window.Limit) < len(rows) {
+		rows = rows[:int(q.Window.Limit)]
 	}
 
 	out := make([]string, len(rows))
@@ -1037,13 +1231,13 @@ func assertNoOrderWindowSubsetString(t testing.TB, q *qx.QX, got, full []string,
 	}
 
 	maxLen := len(full)
-	if q.Offset >= uint64(len(full)) {
+	if q.Window.Offset >= uint64(len(full)) {
 		maxLen = 0
-	} else if q.Offset > 0 {
-		maxLen = len(full) - int(q.Offset)
+	} else if q.Window.Offset > 0 {
+		maxLen = len(full) - int(q.Window.Offset)
 	}
-	if q.Limit > 0 && int(q.Limit) < maxLen {
-		maxLen = int(q.Limit)
+	if q.Window.Limit > 0 && int(q.Window.Limit) < maxLen {
+		maxLen = int(q.Window.Limit)
 	}
 	if len(got) > maxLen {
 		t.Fatalf("%s: no-order window overflow got=%d max=%d", label, len(got), maxLen)
@@ -1106,7 +1300,7 @@ func TestQuery_RouteEquivalence_StringKeys_Randomized(t *testing.T) {
 		case 5:
 			return qx.HASANY("tags", pickVals(tagPool, 2))
 		case 6:
-			return qx.HAS("tags", pickVals(tagPool, 2))
+			return qx.HASALL("tags", pickVals(tagPool, 2))
 		case 7:
 			return qx.HASNONE("tags", pickVals(tagPool, 2))
 		case 8:
@@ -1134,30 +1328,30 @@ func TestQuery_RouteEquivalence_StringKeys_Randomized(t *testing.T) {
 	randomOrder := func() []qx.Order {
 		switch r.IntN(5) {
 		case 0, 1:
-			return []qx.Order{{Field: "score", Desc: r.IntN(2) == 0, Type: qx.OrderBasic}}
+			return []qx.Order{testOrderBasic("score", r.IntN(2) == 0)}
 		case 2:
-			return []qx.Order{{Field: "age", Desc: r.IntN(2) == 0, Type: qx.OrderBasic}}
+			return []qx.Order{testOrderBasic("age", r.IntN(2) == 0)}
 		case 3:
-			return []qx.Order{{Field: "tags", Desc: r.IntN(2) == 0, Type: qx.OrderByArrayPos, Data: pickVals(tagPool, 3)}}
+			return []qx.Order{testOrderByArrayPos("tags", pickVals(tagPool, 3), r.IntN(2) == 0)}
 		default:
 			if r.IntN(100) < 50 {
-				return []qx.Order{{Field: "country", Desc: r.IntN(2) == 0, Type: qx.OrderByArrayPos, Data: pickVals(countries, 3)}}
+				return []qx.Order{testOrderByArrayPos("country", pickVals(countries, 3), r.IntN(2) == 0)}
 			}
-			return []qx.Order{{Field: "tags", Desc: r.IntN(2) == 0, Type: qx.OrderByArrayCount}}
+			return []qx.Order{testOrderByArrayCount("tags", r.IntN(2) == 0)}
 		}
 	}
 
 	for step := 0; step < 180; step++ {
-		q := &qx.QX{Expr: randomExpr()}
+		q := &qx.QX{Filter: randomExpr()}
 		mode := r.IntN(100)
 		switch {
 		case mode < 45:
 			q.Order = randomOrder()
-			q.Offset = uint64(r.IntN(120))
-			q.Limit = uint64(20 + r.IntN(120))
+			q.Window.Offset = uint64(r.IntN(120))
+			q.Window.Limit = uint64(20 + r.IntN(120))
 		case mode < 65:
-			q.Offset = uint64(r.IntN(180))
-			q.Limit = uint64(10 + r.IntN(120))
+			q.Window.Offset = uint64(r.IntN(180))
+			q.Window.Limit = uint64(10 + r.IntN(120))
 		case mode < 80:
 			q.Order = randomOrder()
 		}
@@ -1170,10 +1364,10 @@ func TestQuery_RouteEquivalence_StringKeys_Randomized(t *testing.T) {
 		if err != nil {
 			t.Fatalf("step=%d expectedKeysString(page %+v): %v", step, q, err)
 		}
-		if len(q.Order) == 0 && (q.Offset > 0 || q.Limit > 0) {
+		if len(q.Order) == 0 && (q.Window.Offset > 0 || q.Window.Limit > 0) {
 			fullQ := cloneQuery(q)
-			fullQ.Offset = 0
-			fullQ.Limit = 0
+			fullQ.Window.Offset = 0
+			fullQ.Window.Limit = 0
 			wantFull, err := expectedKeysString(t, db, fullQ)
 			if err != nil {
 				t.Fatalf("step=%d expectedKeysString(full %+v): %v", step, q, err)
@@ -1205,13 +1399,13 @@ func TestQuery_RouteEquivalence_StringKeys_Randomized(t *testing.T) {
 
 		countQ := cloneQuery(q)
 		countQ.Order = nil
-		countQ.Offset = 0
-		countQ.Limit = 0
+		countQ.Window.Offset = 0
+		countQ.Window.Limit = 0
 		wantAll, err := expectedKeysString(t, db, countQ)
 		if err != nil {
 			t.Fatalf("step=%d expectedKeysString(all %+v): %v", step, q, err)
 		}
-		cnt, err := db.Count(q)
+		cnt, err := db.Count(q.Filter)
 		if err != nil {
 			t.Fatalf("step=%d Count(%+v): %v", step, q, err)
 		}
@@ -1239,18 +1433,32 @@ func queryStringIDsEqual(q *qx.QX, a, b []string) bool {
 
 type preparedRouteEqUint64 interface {
 	rootDB() *DB[uint64, Rec]
-	checkUsedQuery(*qx.QX) error
-	execPreparedQuery(*qx.QX) ([]uint64, error)
-	tryExecutionPlan(*qx.QX, *queryTrace) ([]uint64, bool, error)
-	tryPlan(*qx.QX, *queryTrace) ([]uint64, bool, error)
 }
 
 type preparedRouteEqString interface {
 	rootDB() *DB[string, Rec]
-	checkUsedQuery(*qx.QX) error
-	execPreparedQuery(*qx.QX) ([]string, error)
-	tryExecutionPlan(*qx.QX, *queryTrace) ([]string, bool, error)
-	tryPlan(*qx.QX, *queryTrace) ([]string, bool, error)
+}
+
+func preparedRouteViewUint64(src preparedRouteEqUint64) *queryView[uint64, Rec] {
+	switch v := any(src).(type) {
+	case *DB[uint64, Rec]:
+		return v.currentQueryViewForTests()
+	case *queryView[uint64, Rec]:
+		return v
+	default:
+		panic("unexpected uint64 prepared route source")
+	}
+}
+
+func preparedRouteViewString(src preparedRouteEqString) *queryView[string, Rec] {
+	switch v := any(src).(type) {
+	case *DB[string, Rec]:
+		return v.currentQueryViewForTests()
+	case *queryView[string, Rec]:
+		return v
+	default:
+		panic("unexpected string prepared route source")
+	}
 }
 
 func assertPreparedRouteEquivalenceString(
@@ -1260,32 +1468,44 @@ func assertPreparedRouteEquivalenceString(
 ) (nq *qx.QX, ref []string, usedExecution bool, usedPlanner bool) {
 	t.Helper()
 
+	view := preparedRouteViewString(db)
 	nq = normalizeQueryForTest(q)
-	if err := db.checkUsedQuery(nq); err != nil {
+	prepared, viewQ, err := prepareTestQuery(db.rootDB(), nq)
+	if err != nil {
+		t.Fatalf("prepareQuery(%+v): %v", nq, err)
+	}
+	defer prepared.Release()
+
+	if err := view.checkUsedQuery(&viewQ); err != nil {
 		t.Fatalf("checkUsedQuery(%+v): %v", nq, err)
 	}
 
-	ref, err := db.execPreparedQuery(nq)
+	ref, err = view.execPreparedQuery(&viewQ)
 	if err != nil {
 		t.Fatalf("execPreparedQuery(%+v): %v", nq, err)
 	}
 	assertNoDuplicateStringIDs(t, "prepared", ref)
 
-	strictEqual := len(nq.Order) > 0 || (nq.Limit == 0 && nq.Offset == 0)
+	strictEqual := len(nq.Order) > 0 || (nq.Window.Limit == 0 && nq.Window.Offset == 0)
 	var noOrderFull []string
 	if !strictEqual {
 		fullQ := cloneQuery(nq)
-		fullQ.Offset = 0
-		fullQ.Limit = 0
+		fullQ.Window.Offset = 0
+		fullQ.Window.Limit = 0
 
-		noOrderFull, err = db.execPreparedQuery(fullQ)
+		fullPrepared, fullViewQ, ferr := prepareTestQuery(db.rootDB(), fullQ)
+		if ferr != nil {
+			t.Fatalf("prepareQuery(full %+v): %v", fullQ, ferr)
+		}
+		noOrderFull, err = view.execPreparedQuery(&fullViewQ)
+		fullPrepared.Release()
 		if err != nil {
 			t.Fatalf("execPreparedQuery(full %+v): %v", fullQ, err)
 		}
 		assertNoOrderWindowSubsetString(t, nq, ref, noOrderFull, "prepared")
 	}
 
-	execOut, ok, err := db.tryExecutionPlan(nq, nil)
+	execOut, ok, err := view.tryExecutionPlan(&viewQ, nil)
 	if err != nil {
 		t.Fatalf("tryExecutionPlan(%+v): %v", nq, err)
 	}
@@ -1311,7 +1531,7 @@ func assertPreparedRouteEquivalenceString(
 		usedExecution = true
 	}
 
-	planOut, ok, err := db.tryPlan(nq, nil)
+	planOut, ok, err := view.tryPlan(&viewQ, nil)
 	if err != nil {
 		t.Fatalf("tryPlan(%+v): %v", nq, err)
 	}
@@ -1374,17 +1594,17 @@ func TestQuery_RouteEquivalence_PreparedExecutionPlanner_StringKeys(t *testing.T
 			qx.EQ("active", true),
 			qx.GTE("age", 22),
 			qx.LT("age", 50),
-		).By("age", qx.ASC).Max(120),
+		).Sort("age", qx.ASC).Limit(120),
 		qx.Query(
 			qx.PREFIX("full_name", "FN-1"),
 			qx.EQ("active", true),
-		).By("full_name", qx.ASC).Max(90),
+		).Sort("full_name", qx.ASC).Limit(90),
 		qx.Query(
 			qx.OR(
 				qx.EQ("active", true),
 				qx.EQ("name", "alice"),
 			),
-		).Max(140),
+		).Limit(140),
 		qx.Query(
 			qx.OR(
 				qx.AND(
@@ -1396,19 +1616,19 @@ func TestQuery_RouteEquivalence_PreparedExecutionPlanner_StringKeys(t *testing.T
 					qx.GTE("age", 25),
 				),
 			),
-		).By("score", qx.DESC).Skip(40).Max(90),
-		qx.Query(
+		).Sort("score", qx.DESC).Offset(40).Limit(90),
+		queryOrderSortByArrayCount(qx.Query(
 			qx.GTE("age", 20),
-		).ByArrayCount("tags", qx.DESC).Skip(7).Max(55),
+		), "tags", qx.DESC).Offset(7).Limit(55),
 		qx.Query(
 			qx.EQ("active", true),
 			qx.HASANY("tags", []string{"go", "db"}),
 			qx.NOTIN("country", []string{"PL", "DE"}),
-		).Max(85),
+		).Limit(85),
 		qx.Query(
-			qx.HAS("tags", []string{"go", "db"}),
+			qx.HASALL("tags", []string{"go", "db"}),
 			qx.HASANY("tags", []string{"go", "ops"}),
-		).By("score", qx.DESC).Skip(30).Max(70),
+		).Sort("score", qx.DESC).Offset(30).Limit(70),
 	}
 
 	var sawExec bool
@@ -1428,10 +1648,10 @@ func TestQuery_RouteEquivalence_PreparedExecutionPlanner_StringKeys(t *testing.T
 		if err != nil {
 			t.Fatalf("q%d expectedKeysString: %v", i, err)
 		}
-		if len(q.Order) == 0 && (q.Limit > 0 || q.Offset > 0) {
+		if len(q.Order) == 0 && (q.Window.Limit > 0 || q.Window.Offset > 0) {
 			fullQ := cloneQuery(q)
-			fullQ.Offset = 0
-			fullQ.Limit = 0
+			fullQ.Window.Offset = 0
+			fullQ.Window.Limit = 0
 			fullWant, err := expectedKeysString(t, db, fullQ)
 			if err != nil {
 				t.Fatalf("q%d expectedKeysString(full): %v", i, err)
@@ -1472,7 +1692,7 @@ func TestQueryCorrectnessAgainstSeqScan_Uint64Keys(t *testing.T) {
 		qx.Query(qx.LTE("age", 25)),
 		qx.Query(qx.IN("age", []int{18, 19, 20})),
 
-		qx.Query(qx.HAS("tags", []string{"go", "db"})),
+		qx.Query(qx.HASALL("tags", []string{"go", "db"})),
 		qx.Query(qx.HASANY("tags", []string{"go", "java"})),
 		qx.Query(qx.HASNONE("tags", []string{"rust"})),
 
@@ -1490,14 +1710,14 @@ func TestQueryCorrectnessAgainstSeqScan_Uint64Keys(t *testing.T) {
 	}
 
 	queries = append(queries,
-		qx.Query(qx.GT("age", 20)).By("age", qx.ASC).Skip(5).Max(10),
-		qx.Query().ByArrayCount("tags", qx.DESC),
-		qx.Query().ByArrayPos("tags", []string{"go", "java"}, qx.ASC),
+		qx.Query(qx.GT("age", 20)).Sort("age", qx.ASC).Offset(5).Limit(10),
+		queryOrderSortByArrayCount(qx.Query(), "tags", qx.DESC),
+		queryOrderSortByArrayPos(qx.Query(), "tags", []string{"go", "java"}, qx.ASC),
 	)
 
 	for i, q := range queries {
 		q := q
-		t.Run(fmt.Sprintf("q%d_%v", i, q.Expr.Op), func(t *testing.T) {
+		t.Run(fmt.Sprintf("q%d_%v", i, plannerExtExprOp(q.Filter)), func(t *testing.T) {
 			gotKeys, err := db.QueryKeys(q)
 			if err != nil {
 				t.Fatalf("QueryKeys: %v", err)
@@ -1518,15 +1738,15 @@ func TestQueryCorrectnessAgainstSeqScan_Uint64Keys(t *testing.T) {
 			}
 
 			qNoPage := *q
-			qNoPage.Offset = 0
-			qNoPage.Limit = 0
+			qNoPage.Window.Offset = 0
+			qNoPage.Window.Limit = 0
 
 			wantAllKeys, err := expectedKeysUint64(t, db, &qNoPage)
 			if err != nil {
 				t.Fatalf("expectedKeysUint64(all): %v", err)
 			}
 
-			cnt, err := db.Count(q)
+			cnt, err := db.Count(q.Filter)
 			if err != nil {
 				t.Fatalf("Count: %v", err)
 			}
@@ -1565,7 +1785,7 @@ func TestQuerySetEquivalence_StringKeys(t *testing.T) {
 
 	wantSet := map[string]struct{}{}
 	err = db.SeqScan("", func(id string, v *Rec) (bool, error) {
-		ok, e := evalExprBool(v, q.Expr)
+		ok, e := evalExprBool(v, q.Filter)
 		if e != nil {
 			return false, e
 		}
@@ -1666,7 +1886,7 @@ func TestSort_OrderStability_WithDupValues(t *testing.T) {
 		}
 	}
 
-	q := qx.Query(qx.EQ("age", 20)).By("age", qx.ASC)
+	q := qx.Query(qx.EQ("age", 20)).Sort("age", qx.ASC)
 
 	ids, err := db.QueryKeys(q)
 	if err != nil {
@@ -1686,7 +1906,7 @@ func TestQuery_NegativeNoOrder_ExcludesCorrectly_WithPaging(t *testing.T) {
 
 	q := qx.Query(
 		qx.NOT(qx.EQ("name", "alice")),
-	).Skip(10).Max(40)
+	).Offset(10).Limit(40)
 
 	got, err := db.QueryKeys(q)
 	if err != nil {
@@ -1713,7 +1933,7 @@ func TestQuery_OrderVariants_AcrossSnapshots_MatchSeqScanModel(t *testing.T) {
 		t.Helper()
 		for i, q := range queries {
 			q := q
-			t.Run(fmt.Sprintf("%s_q%d_%v", label, i, q.Order[0].Type), func(t *testing.T) {
+			t.Run(fmt.Sprintf("%s_q%d_%s", label, i, queryTestOrderLabel(q)), func(t *testing.T) {
 				got, err := db.QueryKeys(q)
 				if err != nil {
 					t.Fatalf("QueryKeys: %v", err)
@@ -1729,16 +1949,16 @@ func TestQuery_OrderVariants_AcrossSnapshots_MatchSeqScanModel(t *testing.T) {
 
 	baseQueries := []*qx.QX{
 		// Base basic-order fast path (skip=0, limit<=256) and non-fast variant.
-		qx.Query(qx.GTE("age", 20)).By("age", qx.ASC).Max(64),
-		qx.Query(qx.GTE("age", 20)).By("age", qx.DESC).Skip(7).Max(41),
+		qx.Query(qx.GTE("age", 20)).Sort("age", qx.ASC).Limit(64),
+		qx.Query(qx.GTE("age", 20)).Sort("age", qx.DESC).Offset(7).Limit(41),
 
 		// Base array order over slice field.
-		qx.Query(qx.NOT(qx.EQ("active", false))).ByArrayPos("tags", []string{"go", "java", "ops"}, qx.ASC).Skip(3).Max(33),
-		qx.Query(qx.NOT(qx.EQ("active", true))).ByArrayCount("tags", qx.DESC).Skip(2).Max(37),
+		queryOrderSortByArrayPos(qx.Query(qx.NOT(qx.EQ("active", false))), "tags", []string{"go", "java", "ops"}, qx.ASC).Offset(3).Limit(33),
+		queryOrderSortByArrayCount(qx.Query(qx.NOT(qx.EQ("active", true))), "tags", qx.DESC).Offset(2).Limit(37),
 
 		// ArrayPos over scalar field to cover scalar ordering variants.
-		qx.Query().ByArrayPos("country", []string{"NL", "DE", "PL"}, qx.ASC).Max(60),
-		qx.Query().ByArrayPos("country", []string{"NL", "DE", "PL"}, qx.DESC),
+		queryOrderSortByArrayPos(qx.Query(), "country", []string{"NL", "DE", "PL"}, qx.ASC).Limit(60),
+		queryOrderSortByArrayPos(qx.Query(), "country", []string{"NL", "DE", "PL"}, qx.DESC),
 	}
 	runChecks("base", baseQueries)
 
@@ -1769,12 +1989,12 @@ func TestQuery_OrderVariants_AcrossSnapshots_MatchSeqScanModel(t *testing.T) {
 	}
 
 	mutatedQueries := []*qx.QX{
-		qx.Query(qx.GTE("age", 20)).By("age", qx.ASC).Max(64),
-		qx.Query(qx.GTE("age", 20)).By("age", qx.DESC).Skip(7).Max(41),
-		qx.Query(qx.NOT(qx.EQ("active", false))).ByArrayPos("tags", []string{"go", "java", "ops"}, qx.DESC).Skip(3).Max(33),
-		qx.Query(qx.NOT(qx.EQ("active", true))).ByArrayCount("tags", qx.ASC).Skip(2).Max(37),
-		qx.Query().ByArrayPos("country", []string{"NL", "DE", "PL"}, qx.ASC).Max(60),
-		qx.Query().ByArrayPos("country", []string{"NL", "DE", "PL"}, qx.DESC),
+		qx.Query(qx.GTE("age", 20)).Sort("age", qx.ASC).Limit(64),
+		qx.Query(qx.GTE("age", 20)).Sort("age", qx.DESC).Offset(7).Limit(41),
+		queryOrderSortByArrayPos(qx.Query(qx.NOT(qx.EQ("active", false))), "tags", []string{"go", "java", "ops"}, qx.DESC).Offset(3).Limit(33),
+		queryOrderSortByArrayCount(qx.Query(qx.NOT(qx.EQ("active", true))), "tags", qx.ASC).Offset(2).Limit(37),
+		queryOrderSortByArrayPos(qx.Query(), "country", []string{"NL", "DE", "PL"}, qx.ASC).Limit(60),
+		queryOrderSortByArrayPos(qx.Query(), "country", []string{"NL", "DE", "PL"}, qx.DESC),
 	}
 	runChecks("mutated", mutatedQueries)
 }
@@ -1855,39 +2075,35 @@ func TestQuery_ArrayOrder_RandomMutations_MatchSeqScan(t *testing.T) {
 				if r.IntN(100) < 45 {
 					b := randomLeaf()
 					if r.IntN(2) == 0 {
-						return qx.Expr{Op: qx.OpAND, Operands: []qx.Expr{a, b}}
+						return qx.AND(a, b)
 					}
-					return qx.Expr{Op: qx.OpOR, Operands: []qx.Expr{a, b}}
+					return qx.OR(a, b)
 				}
 				return a
 			}
 			randomQuery := func() *qx.QX {
-				q := &qx.QX{Expr: randomExpr()}
+				q := &qx.QX{Filter: randomExpr()}
 				switch r.IntN(4) {
 				case 0:
-					q.Order = []qx.Order{{Field: "age", Desc: r.IntN(2) == 0, Type: qx.OrderBasic}}
+					q.Order = []qx.Order{testOrderBasic("age", r.IntN(2) == 0)}
 				case 1:
-					q.Order = []qx.Order{
-						{Field: "tags", Desc: r.IntN(2) == 0, Type: qx.OrderByArrayPos, Data: pickVals(tagPool, 3)},
-					}
+					q.Order = []qx.Order{testOrderByArrayPos("tags", pickVals(tagPool, 3), r.IntN(2) == 0)}
 				case 2:
-					q.Order = []qx.Order{
-						{Field: "country", Desc: r.IntN(2) == 0, Type: qx.OrderByArrayPos, Data: pickVals(countries, 3)},
-					}
+					q.Order = []qx.Order{testOrderByArrayPos("country", pickVals(countries, 3), r.IntN(2) == 0)}
 				default:
-					q.Order = []qx.Order{{Field: "tags", Desc: r.IntN(2) == 0, Type: qx.OrderByArrayCount}}
+					q.Order = []qx.Order{testOrderByArrayCount("tags", r.IntN(2) == 0)}
 				}
 
 				switch r.IntN(100) {
 				case 0, 1, 2, 3, 4, 5, 6, 7, 8, 9:
-					q.Offset = 0
-					q.Limit = 0
+					q.Window.Offset = 0
+					q.Window.Limit = 0
 				case 10, 11, 12, 13, 14, 15, 16, 17, 18, 19:
-					q.Offset = uint64(350 + r.IntN(300))
-					q.Limit = uint64(25 + r.IntN(60))
+					q.Window.Offset = uint64(350 + r.IntN(300))
+					q.Window.Limit = uint64(25 + r.IntN(60))
 				default:
-					q.Offset = uint64(r.IntN(45))
-					q.Limit = uint64(1 + r.IntN(120))
+					q.Window.Offset = uint64(r.IntN(45))
+					q.Window.Limit = uint64(1 + r.IntN(120))
 				}
 				return q
 			}
@@ -1965,12 +2181,12 @@ func TestQuery_ArrayOrder_RandomMutations_MatchSeqScan(t *testing.T) {
 
 						extra := ""
 						if first >= 0 && first < len(got) && first < len(want) && len(q.Order) > 0 {
-							if q.Order[0].Type == qx.OrderByArrayPos && q.Order[0].Field == "tags" {
+							if queryTestOrderIsArrayPosOnField(q, "tags") {
 								gid := got[first]
 								wid := want[first]
 								gv, _ := db.Get(gid)
 								wv, _ := db.Get(wid)
-								vals, _ := q.Order[0].Data.([]string)
+								vals := queryTestOrderValues(q)
 								var bits []string
 								for _, tag := range vals {
 									ids := db.fieldLookupPostingRetained("tags", tag)
@@ -1987,12 +2203,12 @@ func TestQuery_ArrayOrder_RandomMutations_MatchSeqScan(t *testing.T) {
 									wv,
 									strings.Join(bits, ", "),
 								)
-							} else if q.Order[0].Type == qx.OrderByArrayPos && q.Order[0].Field == "country" {
+							} else if queryTestOrderIsArrayPosOnField(q, "country") {
 								gid := got[first]
 								wid := want[first]
 								gv, _ := db.Get(gid)
 								wv, _ := db.Get(wid)
-								vals, _ := q.Order[0].Data.([]string)
+								vals := queryTestOrderValues(q)
 								var bits []string
 								for _, country := range vals {
 									ids := db.fieldLookupPostingRetained("country", country)
@@ -2108,33 +2324,29 @@ func TestQuery_RandomMixedMultiWrites_MatchSeqScanModel(t *testing.T) {
 		if r.IntN(100) < 45 {
 			b := randomLeaf()
 			if r.IntN(2) == 0 {
-				return qx.Expr{Op: qx.OpAND, Operands: []qx.Expr{a, b}}
+				return qx.AND(a, b)
 			}
-			return qx.Expr{Op: qx.OpOR, Operands: []qx.Expr{a, b}}
+			return qx.OR(a, b)
 		}
 		return a
 	}
 	randomQuery := func() *qx.QX {
-		q := &qx.QX{Expr: randomExpr()}
+		q := &qx.QX{Filter: randomExpr()}
 		switch r.IntN(4) {
 		case 0:
-			q.Order = []qx.Order{{Field: "age", Desc: r.IntN(2) == 0, Type: qx.OrderBasic}}
+			q.Order = []qx.Order{testOrderBasic("age", r.IntN(2) == 0)}
 		case 1:
-			q.Order = []qx.Order{
-				{Field: "tags", Desc: r.IntN(2) == 0, Type: qx.OrderByArrayPos, Data: pickVals(tagPool, 3)},
-			}
+			q.Order = []qx.Order{testOrderByArrayPos("tags", pickVals(tagPool, 3), r.IntN(2) == 0)}
 		case 2:
-			q.Order = []qx.Order{
-				{Field: "country", Desc: r.IntN(2) == 0, Type: qx.OrderByArrayPos, Data: pickVals(countries, 3)},
-			}
+			q.Order = []qx.Order{testOrderByArrayPos("country", pickVals(countries, 3), r.IntN(2) == 0)}
 		default:
-			q.Order = []qx.Order{{Field: "tags", Desc: r.IntN(2) == 0, Type: qx.OrderByArrayCount}}
+			q.Order = []qx.Order{testOrderByArrayCount("tags", r.IntN(2) == 0)}
 		}
-		q.Offset = uint64(r.IntN(40))
+		q.Window.Offset = uint64(r.IntN(40))
 		if r.IntN(100) < 10 {
-			q.Limit = 0
+			q.Window.Limit = 0
 		} else {
-			q.Limit = uint64(1 + r.IntN(120))
+			q.Window.Limit = uint64(1 + r.IntN(120))
 		}
 		return q
 	}
@@ -2232,8 +2444,8 @@ func TestQuery_RandomMixedMultiWrites_MatchSeqScanModel(t *testing.T) {
 					wid := wantKeys[first]
 					gv, _ := db.Get(gid)
 					wv, _ := db.Get(wid)
-					if len(q.Order) > 0 && q.Order[0].Type == qx.OrderByArrayPos && q.Order[0].Field == "country" {
-						vals, _ := q.Order[0].Data.([]string)
+					if queryTestOrderIsArrayPosOnField(q, "country") {
+						vals := queryTestOrderValues(q)
 						var gm, wm []string
 						for _, country := range vals {
 							ids := db.fieldLookupPostingRetained("country", country)
@@ -2318,13 +2530,13 @@ func TestQuery_RandomMixedMultiWrites_MatchSeqScanModel(t *testing.T) {
 			}
 
 			qNoPage := *q
-			qNoPage.Offset = 0
-			qNoPage.Limit = 0
+			qNoPage.Window.Offset = 0
+			qNoPage.Window.Limit = 0
 			wantAllKeys, err := expectedKeysUint64(t, db, &qNoPage)
 			if err != nil {
 				t.Fatalf("step=%d qi=%d expectedKeys(all): %v q=%+v", step, qi, err, q)
 			}
-			cnt, err := db.Count(q)
+			cnt, err := db.Count(q.Filter)
 			if err != nil {
 				t.Fatalf("step=%d qi=%d Count: %v q=%+v", step, qi, err, q)
 			}
@@ -2359,9 +2571,9 @@ func TestQuery_ByArrayPos_Scalar_DuplicatePriority_BaseAndOverlay(t *testing.T) 
 		}
 	}
 
-	baseQ := qx.Query(qx.EQ("active", false)).ByArrayPos("country", []string{"NL", "NL", "PL"}, qx.ASC).Skip(3).Max(120)
+	baseQ := queryOrderSortByArrayPos(qx.Query(qx.EQ("active", false)), "country", []string{"NL", "NL", "PL"}, qx.ASC).Offset(3).Limit(120)
 	check("base", baseQ)
-	baseDescQ := qx.Query(qx.EQ("active", false)).ByArrayPos("country", []string{"NL", "NL", "PL"}, qx.DESC).Skip(3).Max(120)
+	baseDescQ := queryOrderSortByArrayPos(qx.Query(qx.EQ("active", false)), "country", []string{"NL", "NL", "PL"}, qx.DESC).Offset(3).Limit(120)
 	check("base-desc", baseDescQ)
 
 	if err := db.Patch(5, []Field{{Name: "country", Value: "NL"}}); err != nil {
@@ -2383,9 +2595,9 @@ func TestQuery_ByArrayPos_Scalar_DuplicatePriority_BaseAndOverlay(t *testing.T) 
 		t.Fatalf("Set(1001): %v", err)
 	}
 
-	overlayQ := qx.Query(qx.EQ("active", false)).ByArrayPos("country", []string{"NL", "NL", "PL"}, qx.ASC).Skip(3).Max(120)
+	overlayQ := queryOrderSortByArrayPos(qx.Query(qx.EQ("active", false)), "country", []string{"NL", "NL", "PL"}, qx.ASC).Offset(3).Limit(120)
 	check("overlay", overlayQ)
-	overlayDescQ := qx.Query(qx.EQ("active", false)).ByArrayPos("country", []string{"NL", "NL", "PL"}, qx.DESC).Skip(3).Max(120)
+	overlayDescQ := queryOrderSortByArrayPos(qx.Query(qx.EQ("active", false)), "country", []string{"NL", "NL", "PL"}, qx.DESC).Offset(3).Limit(120)
 	check("overlay-desc", overlayDescQ)
 }
 
@@ -2452,13 +2664,13 @@ func assertNoOrderWindowSubset(t testing.TB, q *qx.QX, got, full []uint64, label
 	}
 
 	maxLen := len(full)
-	if q.Offset >= uint64(len(full)) {
+	if q.Window.Offset >= uint64(len(full)) {
 		maxLen = 0
-	} else if q.Offset > 0 {
-		maxLen = len(full) - int(q.Offset)
+	} else if q.Window.Offset > 0 {
+		maxLen = len(full) - int(q.Window.Offset)
 	}
-	if q.Limit > 0 && int(q.Limit) < maxLen {
-		maxLen = int(q.Limit)
+	if q.Window.Limit > 0 && int(q.Window.Limit) < maxLen {
+		maxLen = int(q.Window.Limit)
 	}
 	if len(got) > maxLen {
 		t.Fatalf("%s: no-order window overflow got=%d max=%d", label, len(got), maxLen)
@@ -2468,32 +2680,44 @@ func assertNoOrderWindowSubset(t testing.TB, q *qx.QX, got, full []uint64, label
 func assertPreparedRouteEquivalence(t testing.TB, db preparedRouteEqUint64, q *qx.QX) (nq *qx.QX, ref []uint64, usedExecution bool, usedPlanner bool) {
 	t.Helper()
 
+	view := preparedRouteViewUint64(db)
 	nq = normalizeQueryForTest(q)
-	if err := db.checkUsedQuery(nq); err != nil {
+	prepared, viewQ, err := prepareTestQuery(db.rootDB(), nq)
+	if err != nil {
+		t.Fatalf("prepareQuery(%+v): %v", nq, err)
+	}
+	defer prepared.Release()
+
+	if err := view.checkUsedQuery(&viewQ); err != nil {
 		t.Fatalf("checkUsedQuery(%+v): %v", nq, err)
 	}
 
-	ref, err := db.execPreparedQuery(nq)
+	ref, err = view.execPreparedQuery(&viewQ)
 	if err != nil {
 		t.Fatalf("execPreparedQuery(%+v): %v", nq, err)
 	}
 	assertNoDuplicateIDs(t, "prepared", ref)
 
-	strictEqual := len(nq.Order) > 0 || (nq.Limit == 0 && nq.Offset == 0)
+	strictEqual := len(nq.Order) > 0 || (nq.Window.Limit == 0 && nq.Window.Offset == 0)
 	var noOrderFull []uint64
 	if !strictEqual {
 		fullQ := cloneQuery(nq)
-		fullQ.Offset = 0
-		fullQ.Limit = 0
+		fullQ.Window.Offset = 0
+		fullQ.Window.Limit = 0
 
-		noOrderFull, err = db.execPreparedQuery(fullQ)
+		fullPrepared, fullViewQ, ferr := prepareTestQuery(db.rootDB(), fullQ)
+		if ferr != nil {
+			t.Fatalf("prepareQuery(full %+v): %v", fullQ, ferr)
+		}
+		noOrderFull, err = view.execPreparedQuery(&fullViewQ)
+		fullPrepared.Release()
 		if err != nil {
 			t.Fatalf("execPreparedQuery(full %+v): %v", fullQ, err)
 		}
 		assertNoOrderWindowSubset(t, nq, ref, noOrderFull, "prepared")
 	}
 
-	execOut, ok, err := db.tryExecutionPlan(nq, nil)
+	execOut, ok, err := view.tryExecutionPlan(&viewQ, nil)
 	if err != nil {
 		t.Fatalf("tryExecutionPlan(%+v): %v", nq, err)
 	}
@@ -2516,7 +2740,7 @@ func assertPreparedRouteEquivalence(t testing.TB, db preparedRouteEqUint64, q *q
 		usedExecution = true
 	}
 
-	planOut, ok, err := db.tryPlan(nq, nil)
+	planOut, ok, err := view.tryPlan(&viewQ, nil)
 	if err != nil {
 		t.Fatalf("tryPlan(%+v): %v", nq, err)
 	}
@@ -2543,78 +2767,33 @@ func assertPreparedRouteEquivalence(t testing.TB, db preparedRouteEqUint64, q *q
 }
 
 func cloneQuery(q *qx.QX) *qx.QX {
-	if q == nil {
-		return nil
-	}
-	out := *q
-	if len(q.Order) > 0 {
-		out.Order = append([]qx.Order(nil), q.Order...)
-	}
-	return &out
+	return qx.Clone(q)
 }
 
 func normalizeQueryForTest(q *qx.QX) *qx.QX {
-	n := cloneQuery(q)
-	n = normalize.Query(n)
-	return n
+	return qx.Normalize(cloneQuery(q))
 }
 
 func wrapExprWithNoise(e qx.Expr, mode int) qx.Expr {
 	switch mode % 4 {
 	case 0:
 		// e AND true
-		return qx.Expr{
-			Op: qx.OpAND,
-			Operands: []qx.Expr{
-				e,
-				{Op: qx.OpNOOP},
-			},
-		}
+		return qx.AND(e, qx.Expr{})
 	case 1:
 		// e OR false
-		return qx.Expr{
-			Op: qx.OpOR,
-			Operands: []qx.Expr{
-				e,
-				{Op: qx.OpNOOP, Not: true},
-			},
-		}
+		return qx.OR(e, qx.NOT(qx.Expr{}))
 	case 2:
 		// (true AND e) AND true
-		return qx.Expr{
-			Op: qx.OpAND,
-			Operands: []qx.Expr{
-				{
-					Op: qx.OpAND,
-					Operands: []qx.Expr{
-						{Op: qx.OpNOOP},
-						e,
-					},
-				},
-				{Op: qx.OpNOOP},
-			},
-		}
+		return qx.AND(qx.AND(qx.Expr{}, e), qx.Expr{})
 	default:
 		// e OR (false OR false)
-		return qx.Expr{
-			Op: qx.OpOR,
-			Operands: []qx.Expr{
-				e,
-				{
-					Op: qx.OpOR,
-					Operands: []qx.Expr{
-						{Op: qx.OpNOOP, Not: true},
-						{Op: qx.OpNOOP, Not: true},
-					},
-				},
-			},
-		}
+		return qx.OR(e, qx.OR(qx.NOT(qx.Expr{}), qx.NOT(qx.Expr{})))
 	}
 }
 
 func withNoisyEquivalentQuery(q *qx.QX, noiseMode int) *qx.QX {
 	out := cloneQuery(q)
-	out.Expr = wrapExprWithNoise(q.Expr, noiseMode)
+	out.Filter = wrapExprWithNoise(q.Filter, noiseMode)
 	return out
 }
 
@@ -2645,7 +2824,7 @@ func TestQuery_Metamorphic_NormalizeAndNoiseEquivalence(t *testing.T) {
 						qx.NE("name", "alice"),
 					),
 				),
-			).By("score", qx.DESC).Skip(300).Max(120),
+			).Sort("score", qx.DESC).Offset(300).Limit(120),
 		},
 		{
 			name: "AND_NoOrder_Complex",
@@ -2662,7 +2841,7 @@ func TestQuery_Metamorphic_NormalizeAndNoiseEquivalence(t *testing.T) {
 				qx.PREFIX("full_name", "FN-1"),
 				qx.EQ("active", true),
 				qx.NOTIN("country", []string{"NL"}),
-			).By("score", qx.DESC).Max(80),
+			).Sort("score", qx.DESC).Limit(80),
 		},
 		{
 			name: "OrderRange",
@@ -2670,7 +2849,7 @@ func TestQuery_Metamorphic_NormalizeAndNoiseEquivalence(t *testing.T) {
 				qx.GTE("age", 25),
 				qx.LTE("age", 40),
 				qx.GT("score", 20.0),
-			).By("score", qx.DESC).Skip(100).Max(90),
+			).Sort("score", qx.DESC).Offset(100).Limit(90),
 		},
 	}
 
@@ -2805,7 +2984,7 @@ func randomMetamorphicLeaf(r *rand.Rand) qx.Expr {
 	case 5:
 		return qx.HASANY("tags", pickVals(tagPool, 2))
 	case 6:
-		return qx.HAS("tags", pickVals(tagPool, 2))
+		return qx.HASALL("tags", pickVals(tagPool, 2))
 	case 7:
 		return qx.HASNONE("tags", pickVals(tagPool, 2))
 	case 8:
@@ -2834,10 +3013,7 @@ func randomMetamorphicAndExpr(r *rand.Rand, leafN int) qx.Expr {
 	if len(ops) == 1 {
 		return ops[0]
 	}
-	return qx.Expr{
-		Op:       qx.OpAND,
-		Operands: ops,
-	}
+	return qx.AND(ops...)
 }
 
 func randomMetamorphicQuery(r *rand.Rand) *qx.QX {
@@ -2853,48 +3029,16 @@ func randomMetamorphicQuery(r *rand.Rand) *qx.QX {
 	pickOrder := func() []qx.Order {
 		switch r.IntN(5) {
 		case 0, 1:
-			return []qx.Order{
-				{
-					Field: "score",
-					Desc:  r.IntN(2) == 0,
-					Type:  qx.OrderBasic,
-				},
-			}
+			return []qx.Order{testOrderBasic("score", r.IntN(2) == 0)}
 		case 2:
-			return []qx.Order{
-				{
-					Field: "age",
-					Desc:  r.IntN(2) == 0,
-					Type:  qx.OrderBasic,
-				},
-			}
+			return []qx.Order{testOrderBasic("age", r.IntN(2) == 0)}
 		case 3:
-			return []qx.Order{
-				{
-					Field: "tags",
-					Desc:  r.IntN(2) == 0,
-					Type:  qx.OrderByArrayPos,
-					Data:  pickVals(tagPool, 3),
-				},
-			}
+			return []qx.Order{testOrderByArrayPos("tags", pickVals(tagPool, 3), r.IntN(2) == 0)}
 		default:
 			if r.IntN(100) < 50 {
-				return []qx.Order{
-					{
-						Field: "country",
-						Desc:  r.IntN(2) == 0,
-						Type:  qx.OrderByArrayPos,
-						Data:  pickVals(countries, 3),
-					},
-				}
+				return []qx.Order{testOrderByArrayPos("country", pickVals(countries, 3), r.IntN(2) == 0)}
 			}
-			return []qx.Order{
-				{
-					Field: "tags",
-					Desc:  r.IntN(2) == 0,
-					Type:  qx.OrderByArrayCount,
-				},
-			}
+			return []qx.Order{testOrderByArrayCount("tags", r.IntN(2) == 0)}
 		}
 	}
 
@@ -2905,42 +3049,39 @@ func randomMetamorphicQuery(r *rand.Rand) *qx.QX {
 		for i := 0; i < branchN; i++ {
 			branches = append(branches, randomMetamorphicAndExpr(r, 1+r.IntN(3)))
 		}
-		expr = qx.Expr{
-			Op:       qx.OpOR,
-			Operands: branches,
-		}
+		expr = qx.OR(branches...)
 	} else {
 		expr = randomMetamorphicAndExpr(r, 1+r.IntN(4))
 	}
 
 	q := &qx.QX{
-		Expr: expr,
+		Filter: expr,
 	}
 	mode := r.IntN(100)
 	if mode < 45 {
 		// paged + ordered
 		q.Order = pickOrder()
-		q.Offset = uint64(r.IntN(120))
-		q.Limit = uint64(20 + r.IntN(120))
+		q.Window.Offset = uint64(r.IntN(120))
+		q.Window.Limit = uint64(20 + r.IntN(120))
 		if r.IntN(100) < 25 {
-			q.Offset = uint64(250 + r.IntN(400))
+			q.Window.Offset = uint64(250 + r.IntN(400))
 		}
 	} else if mode < 65 {
 		// paged + no-order (window invariants should hold across routes)
-		q.Offset = uint64(r.IntN(180))
-		q.Limit = uint64(10 + r.IntN(120))
+		q.Window.Offset = uint64(r.IntN(180))
+		q.Window.Limit = uint64(10 + r.IntN(120))
 		if r.IntN(100) < 20 {
-			q.Offset = uint64(250 + r.IntN(350))
+			q.Window.Offset = uint64(250 + r.IntN(350))
 		}
 	} else if mode < 80 {
 		// ordered + unpaged
 		q.Order = pickOrder()
-		q.Offset = 0
-		q.Limit = 0
+		q.Window.Offset = 0
+		q.Window.Limit = 0
 	} else {
 		// no-order + unpaged baseline
-		q.Offset = 0
-		q.Limit = 0
+		q.Window.Offset = 0
+		q.Window.Limit = 0
 	}
 	return q
 }
@@ -3008,8 +3149,8 @@ func TestQuery_Metamorphic_RandomizedProfiles_RouteEquivalence(t *testing.T) {
 
 				countQ := cloneQuery(q)
 				countQ.Order = nil
-				countQ.Offset = 0
-				countQ.Limit = 0
+				countQ.Window.Offset = 0
+				countQ.Window.Limit = 0
 
 				wantCountKeys, err := expectedKeysUint64(t, db, countQ)
 				if err != nil {
@@ -3020,7 +3161,7 @@ func TestQuery_Metamorphic_RandomizedProfiles_RouteEquivalence(t *testing.T) {
 				}
 				wantCount := uint64(len(wantCountKeys))
 
-				gotCount, err := db.Count(q)
+				gotCount, err := db.Count(q.Filter)
 				if err != nil {
 					t.Fatalf("Count(profile=%s i=%d): %v\nq=%+v", p.name, i, err, q)
 				}
@@ -3031,7 +3172,7 @@ func TestQuery_Metamorphic_RandomizedProfiles_RouteEquivalence(t *testing.T) {
 					)
 				}
 
-				preparedCount, err := db.countPreparedExpr(normalizeQueryForTest(q).Expr)
+				preparedCount, err := db.countPreparedExpr(normalizeQueryForTest(q).Filter)
 				if err != nil {
 					t.Fatalf("countPreparedExpr(profile=%s i=%d): %v\nq=%+v", p.name, i, err, q)
 				}
@@ -3050,7 +3191,7 @@ func capturedNotInOrderOffsetQuery() *qx.QX {
 	return qx.Query(
 		qx.NOTIN("country", []string{"Iceland", "Finland"}),
 		qx.NOTIN("country", []string{"Iceland", "DE"}),
-	).By("score", qx.ASC).Skip(446).Max(70)
+	).Sort("score", qx.ASC).Offset(446).Limit(70)
 }
 
 func openSkewedNotInRegressionDB(t *testing.T) *DB[uint64, Rec] {
@@ -3096,21 +3237,21 @@ func TestRegression_NotInOrderOffset_RouteEquivalence(t *testing.T) {
 			q: qx.Query(
 				qx.NOTIN("country", []string{"DE", "PL"}),
 				qx.NOTIN("country", []string{"Thailand", "US"}),
-			).By("score", qx.ASC).Skip(210).Max(90),
+			).Sort("score", qx.ASC).Offset(210).Limit(90),
 		},
 		{
 			name: "desc_order",
 			q: qx.Query(
 				qx.NOTIN("country", []string{"Iceland", "Finland"}),
 				qx.NOTIN("country", []string{"Iceland", "DE"}),
-			).By("score", qx.DESC).Skip(446).Max(70),
+			).Sort("score", qx.DESC).Offset(446).Limit(70),
 		},
 		{
 			name: "without_offset",
 			q: qx.Query(
 				qx.NOTIN("country", []string{"Iceland", "Finland"}),
 				qx.NOTIN("country", []string{"Iceland", "DE"}),
-			).By("score", qx.ASC).Max(70),
+			).Sort("score", qx.ASC).Limit(70),
 		},
 	}
 
@@ -3153,26 +3294,26 @@ func TestRegression_MultiTermHAS_LeadSelfCheck_RouteAndCount(t *testing.T) {
 		{
 			name: "no_order_limit",
 			q: qx.Query(
-				qx.HAS("tags", []string{"db", "rust"}),
-				qx.HAS("tags", []string{"db", "infra"}),
+				qx.HASALL("tags", []string{"db", "rust"}),
+				qx.HASALL("tags", []string{"db", "infra"}),
 				qx.HASANY("tags", []string{"infra", "rust"}),
-			).Max(120),
+			).Limit(120),
 		},
 		{
 			name: "no_order_offset_limit",
 			q: qx.Query(
-				qx.HAS("tags", []string{"db", "rust"}),
-				qx.HAS("tags", []string{"db", "infra"}),
+				qx.HASALL("tags", []string{"db", "rust"}),
+				qx.HASALL("tags", []string{"db", "infra"}),
 				qx.HASANY("tags", []string{"infra", "rust"}),
-			).Skip(40).Max(80),
+			).Offset(40).Limit(80),
 		},
 		{
 			name: "ordered_offset_limit",
 			q: qx.Query(
-				qx.HAS("tags", []string{"db", "rust"}),
-				qx.HAS("tags", []string{"db", "infra"}),
+				qx.HASALL("tags", []string{"db", "rust"}),
+				qx.HASALL("tags", []string{"db", "infra"}),
 				qx.HASANY("tags", []string{"infra", "rust"}),
-			).By("age", qx.ASC).Skip(20).Max(90),
+			).Sort("age", qx.ASC).Offset(20).Limit(90),
 		},
 	}
 
@@ -3192,8 +3333,7 @@ func TestRegression_MultiTermHAS_LeadSelfCheck_RouteAndCount(t *testing.T) {
 			_, prepared, _, _ := assertPreparedRouteEquivalence(t, db, tc.q)
 			assertQueryIDsEqual(t, tc.q, got, prepared)
 
-			expr, _ := normalize.Expr(tc.q.Expr)
-			cntPred, ok, err := db.tryCountByPredicates(expr, nil)
+			cntPred, ok, err := db.tryCountByPredicates(tc.q.Filter, nil)
 			if err != nil {
 				t.Fatalf("tryCountByPredicates: %v", err)
 			}
@@ -3203,15 +3343,15 @@ func TestRegression_MultiTermHAS_LeadSelfCheck_RouteAndCount(t *testing.T) {
 
 			countQ := cloneQuery(tc.q)
 			countQ.Order = nil
-			countQ.Offset = 0
-			countQ.Limit = 0
+			countQ.Window.Offset = 0
+			countQ.Window.Limit = 0
 			wantCountKeys, err := expectedKeysUint64(t, db, countQ)
 			if err != nil {
 				t.Fatalf("expectedKeysUint64(count): %v", err)
 			}
 			wantCount := uint64(len(wantCountKeys))
 
-			cnt, err := db.Count(tc.q)
+			cnt, err := db.Count(tc.q.Filter)
 			if err != nil {
 				t.Fatalf("Count: %v", err)
 			}
@@ -3238,12 +3378,12 @@ func TestRegression_CountORByPredicates_MultiTermHASLead(t *testing.T) {
 	q := qx.Query(
 		qx.OR(
 			qx.AND(
-				qx.HAS("tags", []string{"db", "rust"}),
-				qx.HAS("tags", []string{"db", "infra"}),
+				qx.HASALL("tags", []string{"db", "rust"}),
+				qx.HASALL("tags", []string{"db", "infra"}),
 				qx.SUFFIX("country", "land"),
 			),
 			qx.AND(
-				qx.HAS("tags", []string{"go", "db"}),
+				qx.HASALL("tags", []string{"go", "db"}),
 				qx.PREFIX("full_name", "FN-1"),
 			),
 		),
@@ -3254,8 +3394,7 @@ func TestRegression_CountORByPredicates_MultiTermHASLead(t *testing.T) {
 		t.Fatalf("expectedKeysUint64: %v", err)
 	}
 
-	expr, _ := normalize.Expr(q.Expr)
-	cntFast, ok, err := db.tryCountORByPredicates(expr, nil)
+	cntFast, ok, err := db.tryCountORByPredicates(q.Filter, nil)
 	if err != nil {
 		t.Fatalf("tryCountORByPredicates: %v", err)
 	}
@@ -3266,7 +3405,7 @@ func TestRegression_CountORByPredicates_MultiTermHASLead(t *testing.T) {
 		t.Fatalf("tryCountORByPredicates mismatch: got=%d want=%d", cntFast, len(want))
 	}
 
-	cnt, err := db.Count(q)
+	cnt, err := db.Count(q.Filter)
 	if err != nil {
 		t.Fatalf("Count: %v", err)
 	}
@@ -3325,17 +3464,17 @@ func TestQuery_RouteEquivalence_PreparedExecutionPlanner_BaseAndMutated(t *testi
 			qx.EQ("active", true),
 			qx.GTE("age", 22),
 			qx.LT("age", 50),
-		).By("age", qx.ASC).Max(120),
+		).Sort("age", qx.ASC).Limit(120),
 		qx.Query(
 			qx.PREFIX("full_name", "FN-1"),
 			qx.EQ("active", true),
-		).By("full_name", qx.ASC).Max(90),
+		).Sort("full_name", qx.ASC).Limit(90),
 		qx.Query(
 			qx.OR(
 				qx.EQ("active", true),
 				qx.EQ("name", "alice"),
 			),
-		).Max(140),
+		).Limit(140),
 		qx.Query(
 			qx.OR(
 				qx.AND(
@@ -3347,20 +3486,20 @@ func TestQuery_RouteEquivalence_PreparedExecutionPlanner_BaseAndMutated(t *testi
 					qx.GTE("age", 25),
 				),
 			),
-		).By("score", qx.DESC).Skip(40).Max(90),
-		qx.Query(
+		).Sort("score", qx.DESC).Offset(40).Limit(90),
+		queryOrderSortByArrayCount(qx.Query(
 			qx.GTE("age", 20),
-		).ByArrayCount("tags", qx.DESC).Skip(7).Max(55),
+		), "tags", qx.DESC).Offset(7).Limit(55),
 		qx.Query(
 			qx.EQ("active", true),
 			qx.HASANY("tags", []string{"go", "db"}),
 			qx.NOTIN("country", []string{"PL", "DE"}),
-		).Max(85),
+		).Limit(85),
 		qx.Query(
 			qx.GTE("age", 24),
 			qx.LTE("age", 42),
 			qx.EQ("active", true),
-		).Max(95),
+		).Limit(95),
 		qx.Query(
 			qx.HASANY("tags", []string{"go", "db"}),
 			qx.NOTIN("country", []string{"Thailand", "Iceland"}),
@@ -3389,10 +3528,10 @@ func TestQuery_RouteEquivalence_PreparedExecutionPlanner_BaseAndMutated(t *testi
 				t.Fatalf("%s q%d expectedKeysUint64: %v", label, i, err)
 			}
 
-			if len(q.Order) == 0 && (q.Limit > 0 || q.Offset > 0) {
+			if len(q.Order) == 0 && (q.Window.Limit > 0 || q.Window.Offset > 0) {
 				fullQ := cloneQuery(q)
-				fullQ.Offset = 0
-				fullQ.Limit = 0
+				fullQ.Window.Offset = 0
+				fullQ.Window.Limit = 0
 				fullWant, err := expectedKeysUint64(t, db, fullQ)
 				if err != nil {
 					t.Fatalf("%s q%d expectedKeysUint64(full): %v", label, i, err)
@@ -3404,8 +3543,8 @@ func TestQuery_RouteEquivalence_PreparedExecutionPlanner_BaseAndMutated(t *testi
 				assertQueryIDsEqual(t, nq, ref, want)
 			}
 
-			if q.Limit == 0 && q.Offset == 0 {
-				cnt, err := db.countPreparedExpr(nq.Expr)
+			if q.Window.Limit == 0 && q.Window.Offset == 0 {
+				cnt, err := db.countPreparedExpr(nq.Filter)
 				if err != nil {
 					t.Fatalf("%s q%d countPreparedExpr: %v", label, i, err)
 				}
@@ -3471,19 +3610,15 @@ func TestNormalize_WrappedQueryMatchesDirectResults(t *testing.T) {
 	direct := qx.Query(
 		qx.GTE("age", 18),
 		qx.EQ("active", true),
-	).By("score", qx.DESC).Skip(500).Max(100)
+	).Sort("score", qx.DESC).Offset(500).Limit(100)
 
 	wrapped := &qx.QX{
-		Expr: qx.Expr{
-			Op: qx.OpOR,
-			Operands: []qx.Expr{
-				direct.Expr,
-				{Op: qx.OpNOOP, Not: true},
-			},
-		},
+		Filter: qx.OR(
+			direct.Filter,
+			qx.NOT(qx.Expr{}),
+		),
 		Order:  direct.Order,
-		Offset: direct.Offset,
-		Limit:  direct.Limit,
+		Window: direct.Window,
 	}
 
 	gotDirect, err := db.QueryKeys(direct)
@@ -3505,17 +3640,17 @@ func TestNormalizeExpr_AlreadyCanonicalAND_AllocsPerRunStayZero(t *testing.T) {
 		t.Skip("testing.AllocsPerRun is not stable under -race")
 	}
 
-	expr := qx.Expr{
-		Op: qx.OpAND,
-		Operands: []qx.Expr{
-			{Op: qx.OpEQ, Field: "active", Value: true},
-			{Op: qx.OpIN, Field: "country", Value: []string{"DE", "NL"}},
-			{Op: qx.OpHASANY, Field: "tags", Value: []string{"go", "ops"}},
-			{Op: qx.OpGTE, Field: "age", Value: 21},
+	expr := qir.Expr{
+		Op: qir.OpAND,
+		Operands: []qir.Expr{
+			{Op: qir.OpEQ, FieldOrdinal: 0, Value: true},
+			{Op: qir.OpIN, FieldOrdinal: 1, Value: []string{"DE", "NL"}},
+			{Op: qir.OpHASANY, FieldOrdinal: 2, Value: []string{"go", "ops"}},
+			{Op: qir.OpGTE, FieldOrdinal: 3, Value: 21},
 		},
 	}
 
-	out, changed := normalize.Expr(expr)
+	out, changed := qir.NormalizeExpr(expr)
 	if changed {
 		t.Fatalf("expected canonical AND to stay unchanged")
 	}
@@ -3524,7 +3659,7 @@ func TestNormalizeExpr_AlreadyCanonicalAND_AllocsPerRunStayZero(t *testing.T) {
 	}
 
 	allocs := testing.AllocsPerRun(100, func() {
-		_, _ = normalize.Expr(expr)
+		_, _ = qir.NormalizeExpr(expr)
 	})
 	if allocs > 0 {
 		t.Fatalf("unexpected allocs per run: got=%v want=0", allocs)
@@ -3536,16 +3671,16 @@ func TestNormalizeExpr_AlreadyCanonicalOR_AllocsPerRunStayZero(t *testing.T) {
 		t.Skip("testing.AllocsPerRun is not stable under -race")
 	}
 
-	expr := qx.Expr{
-		Op: qx.OpOR,
-		Operands: []qx.Expr{
-			{Op: qx.OpEQ, Field: "active", Value: true},
-			{Op: qx.OpIN, Field: "country", Value: []string{"DE", "NL"}},
-			{Op: qx.OpPREFIX, Field: "email", Value: "ali"},
+	expr := qir.Expr{
+		Op: qir.OpOR,
+		Operands: []qir.Expr{
+			{Op: qir.OpEQ, FieldOrdinal: 0, Value: true},
+			{Op: qir.OpIN, FieldOrdinal: 1, Value: []string{"DE", "NL"}},
+			{Op: qir.OpPREFIX, FieldOrdinal: 2, Value: "ali"},
 		},
 	}
 
-	out, changed := normalize.Expr(expr)
+	out, changed := qir.NormalizeExpr(expr)
 	if changed {
 		t.Fatalf("expected canonical OR to stay unchanged")
 	}
@@ -3554,7 +3689,7 @@ func TestNormalizeExpr_AlreadyCanonicalOR_AllocsPerRunStayZero(t *testing.T) {
 	}
 
 	allocs := testing.AllocsPerRun(100, func() {
-		_, _ = normalize.Expr(expr)
+		_, _ = qir.NormalizeExpr(expr)
 	})
 	if allocs > 0 {
 		t.Fatalf("unexpected allocs per run: got=%v want=0", allocs)

@@ -3,9 +3,9 @@ package rbi
 import (
 	"math"
 
-	"github.com/vapstack/qx"
 	"github.com/vapstack/rbi/internal/pooled"
 	"github.com/vapstack/rbi/internal/posting"
+	"github.com/vapstack/rbi/internal/qir"
 )
 
 // PlanName is a stable plan identifier used by tracing and calibration.
@@ -78,7 +78,7 @@ const (
 )
 
 type plannerORBranch struct {
-	expr qx.Expr
+	expr qir.Expr
 
 	preds               predicateSet
 	alwaysTrue          bool
@@ -169,7 +169,7 @@ func plannerORSortPredicates(preds *predicateSet) {
 	}
 }
 
-func buildPlannerORBranch(op qx.Expr, preds predicateSet) (plannerORBranch, bool, bool) {
+func buildPlannerORBranch(op qir.Expr, preds predicateSet) (plannerORBranch, bool, bool) {
 	plannerORSortPredicates(&preds)
 
 	branch := newPlannerORBranch(op, preds)
@@ -212,7 +212,7 @@ func buildPlannerORBranch(op qx.Expr, preds predicateSet) (plannerORBranch, bool
 	return branch, true, true
 }
 
-func newPlannerORBranch(op qx.Expr, preds predicateSet) plannerORBranch {
+func newPlannerORBranch(op qir.Expr, preds predicateSet) plannerORBranch {
 	br := plannerORBranch{
 		expr:    op,
 		preds:   preds,
@@ -1350,7 +1350,7 @@ func plannerOROrderMergeNeedLimit(need int, branchCount int, unionCard, sumCard 
 	return limit
 }
 
-func plannerOROrderFallbackFirstGainForShape(routeCost plannerOROrderRouteCost, q *qx.QX, need int) float64 {
+func plannerOROrderFallbackFirstGainForShape(routeCost plannerOROrderRouteCost, q *qir.Shape, need int) float64 {
 	gain := plannerOROrderFallbackFirstGain
 	if routeCost.overlap >= 2.0 {
 		gain += 0.02
@@ -1372,7 +1372,7 @@ func plannerOROrderFallbackFirstGainForShape(routeCost plannerOROrderRouteCost, 
 	return plannerClampFloat(gain, 0.90, 1.02)
 }
 
-func plannerOROrderFallbackFirstOffsetGainForShape(routeCost plannerOROrderRouteCost, q *qx.QX, need int) float64 {
+func plannerOROrderFallbackFirstOffsetGainForShape(routeCost plannerOROrderRouteCost, q *qir.Shape, need int) float64 {
 	gain := plannerOROrderFallbackFirstOffsetGain
 	if routeCost.overlap >= 2.0 {
 		gain += 0.05
@@ -1386,7 +1386,7 @@ func plannerOROrderFallbackFirstOffsetGainForShape(routeCost plannerOROrderRoute
 	return plannerClampFloat(gain, 1.25, 1.60)
 }
 
-func plannerORKWayRuntimeShapeFromGuard(guard plannerOROrderRuntimeGuardDecision, q *qx.QX) plannerORKWayRuntimeShape {
+func plannerORKWayRuntimeShapeFromGuard(guard plannerOROrderRuntimeGuardDecision, q *qir.Shape) plannerORKWayRuntimeShape {
 	shape := plannerORKWayRuntimeShape{
 		overlap:   guard.routeCost.overlap,
 		avgChecks: guard.avgChecks,
@@ -1440,17 +1440,18 @@ func plannerORKWayRuntimeNearTieGain(shape plannerORKWayRuntimeShape) float64 {
 // estimateOROrderMergeRouteCost estimates relative work for the two merge
 // sub-routes: k-way stream merge vs fallback branch-collect+rank.
 func (qv *queryView[K, V]) estimateOROrderMergeRouteCost(
-	q *qx.QX,
+	q *qir.Shape,
 	branches plannerORBranches,
 	need int,
 	mergeStats [plannerORBranchLimit]plannerOROrderMergeBranchStats,
 ) (plannerOROrderRouteCost, bool) {
-	if need <= 0 || q == nil || len(q.Order) != 1 {
+	if need <= 0 || q == nil || !q.HasOrder {
 		return plannerOROrderRouteCost{}, false
 	}
 
-	orderField := q.Order[0].Field
-	if orderField == "" {
+	order := q.Order
+	orderField := qv.fieldNameByOrder(order)
+	if order.FieldOrdinal < 0 {
 		return plannerOROrderRouteCost{}, false
 	}
 
@@ -1459,7 +1460,7 @@ func (qv *queryView[K, V]) estimateOROrderMergeRouteCost(
 	if universe == 0 {
 		return plannerOROrderRouteCost{}, false
 	}
-	orderOV := qv.fieldOverlay(orderField)
+	orderOV := qv.fieldOverlayForOrder(order)
 	orderDistinct := uint64(overlayApproxDistinctTotalCount(orderOV))
 	orderStats := qv.plannerOrderFieldStats(orderField, snap, universe, orderDistinct)
 
@@ -1492,7 +1493,7 @@ func (qv *queryView[K, V]) estimateOROrderMergeRouteCost(
 		overlap = 16
 	}
 
-	hasPrefixTailRisk := branches.hasNonOrderPrefixTailRisk(orderField)
+	hasPrefixTailRisk := qv.hasNonOrderPrefixTailRisk(branches, orderField)
 	hasSelectiveLead := branches.hasSelectiveLead(need)
 	offsetShare := 0.0
 	if q.Offset > 0 {
@@ -1637,10 +1638,10 @@ func releasePlannerORIters(iters []plannerORIter) {
 	}
 }
 
-func (qv *queryView[K, V]) tryPlan(q *qx.QX, trace *queryTrace) ([]K, bool, error) {
+func (qv *queryView[K, V]) tryPlan(q *qir.Shape, trace *queryTrace) ([]K, bool, error) {
 	orderedPtr := false
-	if len(q.Order) == 1 && q.Order[0].Type == qx.OrderBasic {
-		if fm := qv.fields[q.Order[0].Field]; fm != nil && fm.Ptr {
+	if q.HasOrder && q.Order.Kind == qir.OrderKindBasic {
+		if fm := qv.fieldMetaByOrder(q.Order); fm != nil && fm.Ptr {
 			orderedPtr = true
 		}
 	}
@@ -1687,14 +1688,11 @@ func (it *plannerORIter) advanceWithBudget(budget uint64) (uint64, uint64, bool)
 //
 // This path exists to avoid full bitmap materialization when branch-aware
 // streaming/merge strategies can satisfy LIMIT/OFFSET cheaper.
-func (qv *queryView[K, V]) tryPlanORMergeMode(q *qx.QX, trace *queryTrace) ([]K, bool, error) {
+func (qv *queryView[K, V]) tryPlanORMergeMode(q *qir.Shape, trace *queryTrace) ([]K, bool, error) {
 	if q.Limit == 0 {
 		return nil, false, nil
 	}
-	if len(q.Order) > 1 {
-		return nil, false, nil
-	}
-	if q.Expr.Op != qx.OpOR || q.Expr.Not {
+	if q.Expr.Op != qir.OpOR || q.Expr.Not {
 		return nil, false, nil
 	}
 	if len(q.Expr.Operands) < plannerORMinOperandCount {
@@ -1705,11 +1703,11 @@ func (qv *queryView[K, V]) tryPlanORMergeMode(q *qx.QX, trace *queryTrace) ([]K,
 	}
 	// No-order OR requires branch leads; otherwise the adaptive/baseline runners
 	// cannot advance branches independently and we fall back to bitmap eval.
-	if len(q.Order) == 0 && !hasNoOrderLeadCandidatesOR(q.Expr.Operands) {
+	if !q.HasOrder && !hasNoOrderLeadCandidatesOR(q.Expr.Operands) {
 		return nil, false, nil
 	}
 
-	if len(q.Order) == 0 {
+	if !q.HasOrder {
 		branches, alwaysFalse, ok := qv.buildORBranches(q.Expr.Operands)
 		if !ok {
 			return nil, false, nil
@@ -1741,15 +1739,15 @@ func (qv *queryView[K, V]) tryPlanORMergeMode(q *qx.QX, trace *queryTrace) ([]K,
 		return out, true, nil
 	}
 
-	o := q.Order[0]
-	if o.Type != qx.OrderBasic {
+	o := q.Order
+	if o.Kind != qir.OrderKindBasic {
 		return nil, false, nil
 	}
 	if q.Limit > plannerOROrderLimitMax || q.Offset > plannerOROrderOffsetMax {
 		return nil, false, nil
 	}
 	window, _ := orderWindow(q)
-	branches, alwaysFalse, ok := qv.buildORBranchesOrdered(q.Expr.Operands, o.Field, window, q.Offset)
+	branches, alwaysFalse, ok := qv.buildORBranchesOrdered(q.Expr.Operands, qv.fieldNameByOrder(o), window, q.Offset)
 	if !ok {
 		return nil, false, nil
 	}
@@ -2012,10 +2010,10 @@ func setOROrderMergeFallbackTrace(trace *queryTrace, examined, scanWidth uint64,
 
 func (qv *queryView[K, V]) orderedORMaterializedRangeLeafCosts(
 	orderField string,
-	leaf qx.Expr,
+	leaf qir.Expr,
 ) (materializedPredKey, uint64, uint64, uint64, bool) {
 	candidate, ok := qv.prepareScalarRangeRoutingCandidate(leaf)
-	if !ok || !candidate.numeric || leaf.Field == orderField {
+	if !ok || !candidate.numeric || qv.fieldNameByExpr(leaf) == orderField {
 		return materializedPredKey{}, 0, 0, 0, false
 	}
 	core := candidate.core
@@ -2060,9 +2058,9 @@ func (qv *queryView[K, V]) orderedORMaterializedRangeLeafCosts(
 
 func (qv *queryView[K, V]) orderedORMaterializedPrefixLeafBuildWork(
 	orderField string,
-	leaf qx.Expr,
+	leaf qir.Expr,
 ) (materializedPredKey, uint64, bool) {
-	if !isPositiveNonOrderScalarPrefixLeaf(orderField, leaf) {
+	if !qv.isPositiveNonOrderScalarPrefixLeaf(orderField, leaf) {
 		return materializedPredKey{}, 0, false
 	}
 	candidate, ok := qv.prepareScalarRangeRoutingCandidate(leaf)
@@ -2087,16 +2085,16 @@ func (qv *queryView[K, V]) orderedORMaterializedPrefixLeafBuildWork(
 }
 
 func (qv *queryView[K, V]) promoteOrderedORMaterializedBaseOps(
-	q *qx.QX,
+	q *qir.Shape,
 	branches plannerORBranches,
 	branchChecks [plannerORBranchLimit]*pooled.SliceBuf[int],
 	observed *orderedORObservedStats,
 ) {
-	if q == nil || branches.Len() == 0 || qv.snap == nil || len(q.Order) != 1 || observed == nil {
+	if q == nil || branches.Len() == 0 || qv.snap == nil || !q.HasOrder || observed == nil {
 		return
 	}
-	orderField := q.Order[0].Field
-	if orderField == "" {
+	orderField := qv.fieldNameByOrder(q.Order)
+	if q.Order.FieldOrdinal < 0 {
 		return
 	}
 
@@ -2210,7 +2208,7 @@ func (qv *queryView[K, V]) promoteOrderedORMaterializedBaseOps(
 	qv.materializeOrderMaterializedBaseOpsBuf(orderField, baseOpsBuf)
 }
 
-func (qv *queryView[K, V]) shouldObserveOrderedORLeaf(orderField string, expr qx.Expr) bool {
+func (qv *queryView[K, V]) shouldObserveOrderedORLeaf(orderField string, expr qir.Expr) bool {
 	cacheKey, buildWork, checkWork, _, ok := qv.orderedORMaterializedRangeLeafCosts(orderField, expr)
 	if ok && !cacheKey.isZero() && buildWork != 0 && checkWork != 0 {
 		if _, hit := qv.snap.loadMaterializedPredKey(cacheKey); hit {
@@ -2228,7 +2226,7 @@ func (qv *queryView[K, V]) shouldObserveOrderedORLeaf(orderField string, expr qx
 	return false
 }
 
-func hasNoOrderLeadCandidatesOR(ops []qx.Expr) bool {
+func hasNoOrderLeadCandidatesOR(ops []qir.Expr) bool {
 	for _, op := range ops {
 		if !branchHasPositiveLeafOR(op) {
 			return false
@@ -2237,9 +2235,9 @@ func hasNoOrderLeadCandidatesOR(ops []qx.Expr) bool {
 	return true
 }
 
-func branchHasPositiveLeafOR(e qx.Expr) bool {
+func branchHasPositiveLeafOR(e qir.Expr) bool {
 	switch e.Op {
-	case qx.OpAND:
+	case qir.OpAND:
 		if e.Not || len(e.Operands) == 0 {
 			return false
 		}
@@ -2249,7 +2247,7 @@ func branchHasPositiveLeafOR(e qx.Expr) bool {
 			}
 		}
 		return false
-	case qx.OpNOOP, qx.OpOR:
+	case qir.OpNOOP, qir.OpOR:
 		return false
 	default:
 		if e.Not {
@@ -2261,9 +2259,9 @@ func branchHasPositiveLeafOR(e qx.Expr) bool {
 
 // buildORBranches compiles each OR branch into planner predicates and optional
 // lead iterators used by OR execution strategies.
-func (qv *queryView[K, V]) buildORBranches(ops []qx.Expr) (plannerORBranches, bool, bool) {
+func (qv *queryView[K, V]) buildORBranches(ops []qir.Expr) (plannerORBranches, bool, bool) {
 	out := newPlannerORBranches(len(ops))
-	var leavesBuf [8]qx.Expr
+	var leavesBuf [8]qir.Expr
 
 	for _, op := range ops {
 		leaves, ok := collectAndLeavesScratch(op, leavesBuf[:0])
@@ -2275,10 +2273,10 @@ func (qv *queryView[K, V]) buildORBranches(ops []qx.Expr) (plannerORBranches, bo
 		useLazyColdPredicates := false
 		if qv.snap != nil && qv.snap.matPredCacheMaxEntries > 0 && len(leaves) > 1 {
 			for _, e := range leaves {
-				if e.Not || e.Field == "" || !isNumericRangeOp(e.Op) {
+				if e.Not || e.FieldOrdinal < 0 || !isNumericRangeOp(e.Op) {
 					continue
 				}
-				fm := qv.fields[e.Field]
+				fm := qv.fieldMetaByExpr(e)
 				if fm == nil || fm.Slice || !isNumericScalarKind(fm.Kind) {
 					continue
 				}
@@ -2318,13 +2316,13 @@ func (qv *queryView[K, V]) buildORBranches(ops []qx.Expr) (plannerORBranches, bo
 }
 
 func (qv *queryView[K, V]) buildORBranchesOrdered(
-	ops []qx.Expr,
+	ops []qir.Expr,
 	orderField string,
 	orderedWindow int,
 	orderedOffset uint64,
 ) (plannerORBranches, bool, bool) {
 	out := newPlannerORBranches(len(ops))
-	var leavesBuf [8]qx.Expr
+	var leavesBuf [8]qir.Expr
 
 	for _, op := range ops {
 		leaves, ok := collectAndLeavesScratch(op, leavesBuf[:0])
@@ -2391,19 +2389,19 @@ func (qv *queryView[K, V]) buildORBranchesOrdered(
 // checking branch predicates per candidate.
 //
 // It keeps deterministic ordering semantics and avoids full OR unions for LIMIT-heavy queries.
-func (qv *queryView[K, V]) execPlanOROrderBasic(q *qx.QX, branches plannerORBranches, trace *queryTrace, observed *orderedORObservedStats) ([]K, bool) {
-	o := q.Order[0]
-	f := o.Field
-	if f == "" {
+func (qv *queryView[K, V]) execPlanOROrderBasic(q *qir.Shape, branches plannerORBranches, trace *queryTrace, observed *orderedORObservedStats) ([]K, bool) {
+	o := q.Order
+	f := qv.fieldNameByOrder(o)
+	if o.FieldOrdinal < 0 {
 		return nil, false
 	}
 
-	fm := qv.fields[f]
+	fm := qv.fieldMetaByOrder(o)
 	if fm == nil || fm.Slice {
 		return nil, false
 	}
 
-	ov := qv.fieldOverlay(f)
+	ov := qv.fieldOverlayForOrder(o)
 	if !ov.hasData() {
 		return nil, false
 	}
@@ -2681,7 +2679,7 @@ func (qv *queryView[K, V]) execPlanOROrderBasic(q *qx.QX, branches plannerORBran
 	return out, true
 }
 
-func orderWindow(q *qx.QX) (int, bool) {
+func orderWindow(q *qir.Shape) (int, bool) {
 	if q.Limit == 0 {
 		return 0, false
 	}
@@ -2696,22 +2694,23 @@ func orderWindow(q *qx.QX) (int, bool) {
 	return int(need), true
 }
 
-func (qv *queryView[K, V]) shouldPreferOROrderFallbackFirst(q *qx.QX, branches plannerORBranches) bool {
+func (qv *queryView[K, V]) shouldPreferOROrderFallbackFirst(q *qir.Shape, branches plannerORBranches) bool {
 	d, ok := qv.decideOROrderFallbackFirst(q, branches)
 	return ok && d.prefer
 }
 
-func (qv *queryView[K, V]) decideOROrderFallbackFirst(q *qx.QX, branches plannerORBranches) (plannerOROrderFallbackDecision, bool) {
+func (qv *queryView[K, V]) decideOROrderFallbackFirst(q *qir.Shape, branches plannerORBranches) (plannerOROrderFallbackDecision, bool) {
 	need, ok := orderWindow(q)
 	if !ok || need <= 0 {
 		return plannerOROrderFallbackDecision{}, false
 	}
-	if len(q.Order) != 1 {
+	if !q.HasOrder {
 		return plannerOROrderFallbackDecision{}, false
 	}
 
-	orderField := q.Order[0].Field
-	ov := qv.fieldOverlay(orderField)
+	order := q.Order
+	orderField := qv.fieldNameByOrder(order)
+	ov := qv.fieldOverlayForOrder(order)
 	mergeStats := qv.orderMergeBranchStats(orderField, branches, ov)
 	routeCost, ok := qv.estimateOROrderMergeRouteCost(q, branches, need, mergeStats)
 	if !ok {
@@ -2781,22 +2780,23 @@ func (qv *queryView[K, V]) decideOROrderFallbackFirst(q *qx.QX, branches planner
 	return d, true
 }
 
-func (qv *queryView[K, V]) shouldUseOROrderKWayRuntimeFallback(q *qx.QX, branches plannerORBranches, needWindow int) bool {
+func (qv *queryView[K, V]) shouldUseOROrderKWayRuntimeFallback(q *qir.Shape, branches plannerORBranches, needWindow int) bool {
 	d, ok := qv.decideOROrderKWayRuntimeFallback(q, branches, needWindow)
 	return ok && d.enable
 }
 
-func (qv *queryView[K, V]) decideOROrderKWayRuntimeFallback(q *qx.QX, branches plannerORBranches, needWindow int) (plannerOROrderRuntimeGuardDecision, bool) {
-	if needWindow <= 0 || len(q.Order) != 1 || branches.Len() < 2 {
+func (qv *queryView[K, V]) decideOROrderKWayRuntimeFallback(q *qir.Shape, branches plannerORBranches, needWindow int) (plannerOROrderRuntimeGuardDecision, bool) {
+	if needWindow <= 0 || !q.HasOrder || branches.Len() < 2 {
 		return plannerOROrderRuntimeGuardDecision{}, false
 	}
 
-	orderField := q.Order[0].Field
-	if orderField == "" {
+	order := q.Order
+	orderField := qv.fieldNameByOrder(order)
+	if order.FieldOrdinal < 0 {
 		return plannerOROrderRuntimeGuardDecision{}, false
 	}
 
-	ov := qv.fieldOverlay(orderField)
+	ov := qv.fieldOverlayForOrder(order)
 	mergeStats := qv.orderMergeBranchStats(orderField, branches, ov)
 	routeCost, ok := qv.estimateOROrderMergeRouteCost(q, branches, needWindow, mergeStats)
 	if !ok {
@@ -2828,7 +2828,7 @@ func (qv *queryView[K, V]) decideOROrderKWayRuntimeFallback(q *qx.QX, branches p
 		return d, true
 	}
 
-	hasPrefixTailRisk := branches.hasNonOrderPrefixTailRisk(orderField)
+	hasPrefixTailRisk := qv.hasNonOrderPrefixTailRisk(branches, orderField)
 	if hasPrefixTailRisk && q.Offset > 0 {
 		d.enable = true
 		d.reason = "prefix_offset_shape"
@@ -3011,7 +3011,7 @@ func plannerORKWayShouldFallbackRuntimeDetailedWithShape(needWindow, pops int, u
 	return d
 }
 
-func (qv *queryView[K, V]) execPlanOROrderMerge(q *qx.QX, branches plannerORBranches, trace *queryTrace) ([]K, bool, error) {
+func (qv *queryView[K, V]) execPlanOROrderMerge(q *qir.Shape, branches plannerORBranches, trace *queryTrace) ([]K, bool, error) {
 	fallbackDec, decOK := qv.decideOROrderFallbackFirst(q, branches)
 	if trace != nil && decOK {
 		route := "kway_first"
@@ -3214,9 +3214,9 @@ func (v plannerOrderIndexView) close() {
 	}
 }
 
-// plannerOrderIndexSnapshotView returns the current immutable order-index slice.
-func (qv *queryView[K, V]) plannerOrderIndexSnapshotView(field string) (plannerOrderIndexView, bool) {
-	ov := qv.fieldOverlay(field)
+// plannerOrderIndexSnapshotViewByOrdinal returns the current immutable order-index slice.
+func (qv *queryView[K, V]) plannerOrderIndexSnapshotViewByOrdinal(fieldOrdinal int) (plannerOrderIndexView, bool) {
+	ov := qv.fieldOverlayByOrdinal(fieldOrdinal)
 	if !ov.hasData() {
 		return plannerOrderIndexView{}, false
 	}
@@ -3451,18 +3451,18 @@ func (it *plannerOROrderBranchIter) advance() (uint64, uint64, bool) {
 	}
 }
 
-func (qv *queryView[K, V]) execPlanOROrderKWay(q *qx.QX, branches plannerORBranches, trace *queryTrace) ([]K, bool, error) {
+func (qv *queryView[K, V]) execPlanOROrderKWay(q *qir.Shape, branches plannerORBranches, trace *queryTrace) ([]K, bool, error) {
 	needWindow, ok := orderWindow(q)
 	if !ok || needWindow <= 0 {
 		return nil, false, nil
 	}
 
-	o := q.Order[0]
-	fm := qv.fields[o.Field]
+	o := q.Order
+	fm := qv.fieldMetaByOrder(o)
 	if fm == nil || fm.Slice {
 		return nil, false, nil
 	}
-	orderView, ok := qv.plannerOrderIndexSnapshotView(o.Field)
+	orderView, ok := qv.plannerOrderIndexSnapshotViewByOrdinal(o.FieldOrdinal)
 	if !ok {
 		return nil, false, nil
 	}
@@ -3534,7 +3534,7 @@ func (qv *queryView[K, V]) execPlanOROrderKWay(q *qx.QX, branches plannerORBranc
 
 	for i := 0; i < branches.Len(); i++ {
 		branch := branches.GetPtr(i)
-		br, covered, rangeOK := qv.extractOrderRangeCoverageOverlayReader(o.Field, branch.preds, ov)
+		br, covered, rangeOK := qv.extractOrderRangeCoverageOverlayReader(qv.fieldNameByOrder(o), branch.preds, ov)
 		if !rangeOK {
 			return nil, false, nil
 		}
@@ -3723,7 +3723,7 @@ func (qv *queryView[K, V]) execPlanOROrderKWay(q *qx.QX, branches plannerORBranc
 	return out, true, nil
 }
 
-func (qv *queryView[K, V]) execPlanOROrderMergeFallback(q *qx.QX, branches plannerORBranches, trace *queryTrace) ([]K, bool, error) {
+func (qv *queryView[K, V]) execPlanOROrderMergeFallback(q *qir.Shape, branches plannerORBranches, trace *queryTrace) ([]K, bool, error) {
 	need, ok := orderWindow(q)
 	if !ok || need <= 0 {
 		return nil, false, nil
@@ -3741,11 +3741,11 @@ func (qv *queryView[K, V]) execPlanOROrderMergeFallback(q *qx.QX, branches plann
 		}
 	}
 
-	orderField := q.Order[0].Field
+	order := q.Order
 	directBranchCollect := false
 	var orderOV fieldOverlay
-	if orderField != "" {
-		orderOV = qv.fieldOverlay(orderField)
+	if order.FieldOrdinal >= 0 {
+		orderOV = qv.fieldOverlayForOrder(order)
 		directBranchCollect = orderOV.hasData()
 	}
 
@@ -3771,7 +3771,7 @@ func (qv *queryView[K, V]) execPlanOROrderMergeFallback(q *qx.QX, branches plann
 
 		if directBranchCollect {
 			emitted, examined, dedupe, okCollect := qv.collectOROrderFallbackBranchCandidates(
-				branches.GetPtr(i), q.Order[0], branchLimit, orderOV, &candidateSet,
+				branches.GetPtr(i), q.Order, branchLimit, orderOV, &candidateSet,
 			)
 			if okCollect {
 				if trace != nil {
@@ -3789,15 +3789,12 @@ func (qv *queryView[K, V]) execPlanOROrderMergeFallback(q *qx.QX, branches plann
 			}
 		}
 
-		subQ := &qx.QX{
-			Expr:  branch.expr,
-			Limit: uint64(branchLimit),
-		}
-		if !branchExhaustive {
-			subQ.Order = q.Order
+		subQ := q.WithExpr(branch.expr).WithWindow(0, uint64(branchLimit))
+		if branchExhaustive {
+			subQ = subQ.WithoutOrder()
 		}
 
-		ids, err := qv.execPreparedQuery(subQ)
+		ids, err := qv.execPreparedQuery(&subQ)
 		if err != nil {
 			candidateSet.release()
 			return nil, true, err
@@ -3828,13 +3825,13 @@ func (qv *queryView[K, V]) execPlanOROrderMergeFallback(q *qx.QX, branches plann
 		return nil, true, nil
 	}
 
-	o := q.Order[0]
-	fm := qv.fields[o.Field]
+	o := q.Order
+	fm := qv.fieldMetaByOrder(o)
 	if fm == nil || fm.Slice {
 		candidateIDs.Release()
 		return nil, false, nil
 	}
-	orderView, ok := qv.plannerOrderIndexSnapshotView(o.Field)
+	orderView, ok := qv.plannerOrderIndexSnapshotViewByOrdinal(o.FieldOrdinal)
 	if !ok {
 		candidateIDs.Release()
 		return nil, false, nil
@@ -4247,7 +4244,7 @@ func (qv *queryView[K, V]) collectOROrderFallbackBranchCandidatesWithChecksBuf(
 // Returns ok=false when fast-path preconditions are not satisfied.
 func (qv *queryView[K, V]) collectOROrderFallbackBranchCandidates(
 	branch *plannerORBranch,
-	order qx.Order,
+	order qir.Order,
 	branchLimit int,
 	ov fieldOverlay,
 	dst *postingLazySetBuilder,
@@ -4255,20 +4252,21 @@ func (qv *queryView[K, V]) collectOROrderFallbackBranchCandidates(
 	if branchLimit <= 0 {
 		return 0, 0, 0, false
 	}
-	if order.Type != qx.OrderBasic || order.Field == "" {
+	if order.Kind != qir.OrderKindBasic || order.FieldOrdinal < 0 {
 		return 0, 0, 0, false
 	}
-	fm := qv.fields[order.Field]
+	fieldName := qv.fieldNameByOrder(order)
+	fm := qv.fieldMetaByOrder(order)
 	if fm == nil || fm.Slice {
 		return 0, 0, 0, false
 	}
 	if !ov.hasData() {
-		ov = qv.fieldOverlay(order.Field)
+		ov = qv.fieldOverlay(fieldName)
 	}
 	if !ov.hasData() {
 		return 0, 0, 0, false
 	}
-	br, covered, rangeOK := qv.extractOrderRangeCoverageOverlayReader(order.Field, branch.preds, ov)
+	br, covered, rangeOK := qv.extractOrderRangeCoverageOverlayReader(fieldName, branch.preds, ov)
 	if !rangeOK {
 		return 0, 0, 0, false
 	}
@@ -4388,7 +4386,7 @@ func plannerOROrderMergePrecountWorth(branch plannerORBranch, need int) bool {
 	return preCountWork+postCountScanWork <= branchScanWork*plannerOROrderMergePrecountGain
 }
 
-func (qv *queryView[K, V]) canPrecountORBranchExpr(e qx.Expr) bool {
+func (qv *queryView[K, V]) canPrecountORBranchExpr(e qir.Expr) bool {
 	if !isMaterializedScalarCacheOp(e.Op) {
 		return true
 	}
@@ -4712,7 +4710,7 @@ func plannerORNoOrderAddCandidate(top *pooled.SliceBuf[uint64], idx uint64, need
 	plannerORNoOrderInsertTopN(top, idx, need)
 }
 
-func (qv *queryView[K, V]) execPlanORNoOrder(q *qx.QX, branches plannerORBranches, trace *queryTrace) ([]K, bool) {
+func (qv *queryView[K, V]) execPlanORNoOrder(q *qir.Shape, branches plannerORBranches, trace *queryTrace) ([]K, bool) {
 	switch plannerORNoOrderClassify(branches) {
 	case plannerORNoOrderModeUniverse:
 		return qv.execPlanORUniverseNoOrder(q, trace), true
@@ -4731,7 +4729,7 @@ func (qv *queryView[K, V]) execPlanORNoOrder(q *qx.QX, branches plannerORBranche
 // execPlanORNoOrderAdaptive collects top-N ids for no-order OR via adaptive per-branch probing.
 //
 // It starts with cheap branches and increases probe budgets only when needed to prove top-N completeness.
-func (qv *queryView[K, V]) execPlanORNoOrderAdaptive(q *qx.QX, branches plannerORBranches, trace *queryTrace) ([]K, bool) {
+func (qv *queryView[K, V]) execPlanORNoOrderAdaptive(q *qir.Shape, branches plannerORBranches, trace *queryTrace) ([]K, bool) {
 	switch plannerORNoOrderClassify(branches) {
 	case plannerORNoOrderModeUniverse:
 		return qv.execPlanORUniverseNoOrder(q, trace), true
@@ -4741,7 +4739,7 @@ func (qv *queryView[K, V]) execPlanORNoOrderAdaptive(q *qx.QX, branches plannerO
 	return qv.execPlanORNoOrderAdaptiveCore(q, branches, trace)
 }
 
-func (qv *queryView[K, V]) execPlanORNoOrderAdaptiveCore(q *qx.QX, branches plannerORBranches, trace *queryTrace) ([]K, bool) {
+func (qv *queryView[K, V]) execPlanORNoOrderAdaptiveCore(q *qir.Shape, branches plannerORBranches, trace *queryTrace) ([]K, bool) {
 	if q.Limit == 0 || q.Offset != 0 {
 		return nil, false
 	}
@@ -4922,7 +4920,7 @@ func (qv *queryView[K, V]) execPlanORNoOrderAdaptiveCore(q *qx.QX, branches plan
 	return out, true
 }
 
-func (qv *queryView[K, V]) execPlanORNoOrderBaseline(q *qx.QX, branches plannerORBranches, trace *queryTrace) ([]K, bool) {
+func (qv *queryView[K, V]) execPlanORNoOrderBaseline(q *qir.Shape, branches plannerORBranches, trace *queryTrace) ([]K, bool) {
 	switch plannerORNoOrderClassify(branches) {
 	case plannerORNoOrderModeUniverse:
 		return qv.execPlanORUniverseNoOrder(q, trace), true
@@ -4932,7 +4930,7 @@ func (qv *queryView[K, V]) execPlanORNoOrderBaseline(q *qx.QX, branches plannerO
 	return qv.execPlanORNoOrderBaselineCore(q, branches, trace)
 }
 
-func (qv *queryView[K, V]) execPlanORNoOrderBaselineCore(q *qx.QX, branches plannerORBranches, trace *queryTrace) ([]K, bool) {
+func (qv *queryView[K, V]) execPlanORNoOrderBaselineCore(q *qir.Shape, branches plannerORBranches, trace *queryTrace) ([]K, bool) {
 	fullTrace := trace.full()
 	examined := uint64(0)
 	var branchMetrics []TraceORBranch
@@ -5074,7 +5072,7 @@ func (qv *queryView[K, V]) execPlanORNoOrderBaselineCore(q *qx.QX, branches plan
 	return out, true
 }
 
-func (qv *queryView[K, V]) execPlanORUniverseNoOrder(q *qx.QX, trace *queryTrace) []K {
+func (qv *queryView[K, V]) execPlanORUniverseNoOrder(q *qir.Shape, trace *queryTrace) []K {
 	skip := q.Offset
 	need := int(q.Limit)
 	out := make([]K, 0, need)

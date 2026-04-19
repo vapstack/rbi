@@ -29,7 +29,7 @@ func TestEmptySliceQueries(t *testing.T) {
 		t.Fatal("HASANY with empty slice: error expected, got nil")
 	}
 
-	_, err = db.QueryKeys(qx.Query(qx.HAS("tags", []string{})))
+	_, err = db.QueryKeys(qx.Query(qx.HASALL("tags", []string{})))
 	if err == nil {
 		t.Fatal("HAS with empty slice: error expected, got nil")
 	}
@@ -47,7 +47,7 @@ func TestQuery_SliceEQ_EmptyDBAndAfterLastDelete(t *testing.T) {
 	if len(got) != 0 {
 		t.Fatalf("expected empty result on empty db, got %v", got)
 	}
-	cnt, err := db.Count(q)
+	cnt, err := db.Count(q.Filter)
 	if err != nil {
 		t.Fatalf("Count(empty db): %v", err)
 	}
@@ -69,7 +69,7 @@ func TestQuery_SliceEQ_EmptyDBAndAfterLastDelete(t *testing.T) {
 	if len(got) != 0 {
 		t.Fatalf("expected empty result after last delete, got %v", got)
 	}
-	cnt, err = db.Count(q)
+	cnt, err = db.Count(q.Filter)
 	if err != nil {
 		t.Fatalf("Count(after last delete): %v", err)
 	}
@@ -156,7 +156,7 @@ func TestQuery_Iterator_KeepsEmptyStringKey(t *testing.T) {
 			}
 			assertSameSlice(t, got, tc.want)
 
-			cnt, err := db.Count(tc.q)
+			cnt, err := db.Count(tc.q.Filter)
 			if err != nil {
 				t.Fatalf("Count(%s): %v", tc.name, err)
 			}
@@ -180,31 +180,29 @@ func TestQuery_INNilMatchesEmptyListSemantics(t *testing.T) {
 	var nilStrings []string
 
 	tests := []struct {
-		name  string
-		value any
+		name string
+		q    *qx.QX
 	}{
-		{name: "nil", value: nil},
-		{name: "empty-slice", value: []string{}},
-		{name: "nil-slice", value: nilStrings},
+		{name: "nil", q: qx.Query(qx.IN("name", []string(nil)))},
+		{name: "empty-slice", q: qx.Query(qx.IN("name", []string{}))},
+		{name: "nil-slice", q: qx.Query(qx.IN("name", nilStrings))},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			q := qx.Query(qx.IN("name", tc.value))
-
-			_, err := db.QueryKeys(q)
+			_, err := db.QueryKeys(tc.q)
 			if err == nil || !strings.Contains(err.Error(), "no values provided") {
 				t.Fatalf("QueryKeys expected no-values error, got: %v", err)
 			}
 
-			_, err = db.Count(q)
+			_, err = db.Count(tc.q.Filter)
 			if err == nil || !strings.Contains(err.Error(), "no values provided") {
 				t.Fatalf("Count expected no-values error, got: %v", err)
 			}
 		})
 	}
 
-	got, err := db.QueryKeys(qx.Query(qx.IN("name", []any{"alice", nil})))
+	got, err := db.QueryKeys(qx.Query(qx.OP(qx.OpIN, qx.REF("name"), qx.LIT([]any{"alice", nil}))))
 	if err != nil {
 		t.Fatalf("QueryKeys(mixed IN): %v", err)
 	}
@@ -365,7 +363,7 @@ func TestQuery_IN_WithDuplicates_DoesNotDuplicateResults(t *testing.T) {
 	_ = seedData(t, db, 160)
 
 	// duplicate values in IN should not cause duplicated ids
-	q := qx.Query(qx.IN("country", []string{"NL", "NL", "DE", "DE"})).By("age", qx.ASC).Max(50)
+	q := qx.Query(qx.IN("country", []string{"NL", "NL", "DE", "DE"})).Sort("age", qx.ASC).Limit(50)
 
 	got, err := db.QueryKeys(q)
 	if err != nil {
@@ -430,7 +428,7 @@ func TestQuery_SliceField_HAS_DuplicateNeedles_MatchesAccordingToHarness(t *test
 		t.Fatal(err)
 	}
 
-	q := qx.Query(qx.HAS("tags", []string{"go", "go"}))
+	q := qx.Query(qx.HASALL("tags", []string{"go", "go"}))
 
 	got, err := db.QueryKeys(q)
 	if err != nil {

@@ -3,7 +3,7 @@ package rbi
 import (
 	"time"
 
-	"github.com/vapstack/qx"
+	"github.com/vapstack/rbi/internal/qir"
 )
 
 // TraceEvent is an optional per-query planner execution trace.
@@ -146,7 +146,7 @@ func (db *DB[K, V]) traceOrCalibrationSamplingEnabled() bool {
 }
 
 // beginTrace handles begin trace.
-func (db *DB[K, V]) beginTrace(q *qx.QX) *queryTrace {
+func (db *DB[K, V]) beginTrace(q qir.Shape) *queryTrace {
 	if db.traceRoot != nil {
 		return db.traceRoot.beginTrace(q)
 	}
@@ -173,13 +173,13 @@ func (db *DB[K, V]) beginTrace(q *qx.QX) *queryTrace {
 			Offset:    q.Offset,
 			Limit:     q.Limit,
 		}
-		if len(q.Order) > 0 {
+		if q.HasOrder {
 			tr.ev.HasOrder = true
-			tr.ev.OrderField = q.Order[0].Field
-			tr.ev.OrderDesc = q.Order[0].Desc
+			tr.ev.OrderField = db.fieldNameByOrdinal(q.Order.FieldOrdinal)
+			tr.ev.OrderDesc = q.Order.Desc
 		}
 
-		var leavesBuf [8]qx.Expr
+		var leavesBuf [8]qir.Expr
 		leaves, ok := collectAndLeavesScratch(q.Expr, leavesBuf[:0])
 		if ok {
 			tr.ev.LeafCount = len(leaves)
@@ -187,7 +187,7 @@ func (db *DB[K, V]) beginTrace(q *qx.QX) *queryTrace {
 				if e.Not {
 					tr.ev.HasNeg = true
 				}
-				if e.Op == qx.OpPREFIX {
+				if e.Op == qir.OpPREFIX {
 					tr.ev.HasPrefix = true
 				}
 			}

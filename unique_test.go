@@ -24,7 +24,7 @@ func TestUnique_QueryEQ_Max1Equivalent(t *testing.T) {
 	}
 
 	qNoLimit := qx.Query(qx.EQ("email", "a@x"))
-	qLimit1 := qx.Query(qx.EQ("email", "a@x")).Max(1)
+	qLimit1 := qx.Query(qx.EQ("email", "a@x")).Limit(1)
 
 	idsNoLimit, err := db.QueryKeys(qNoLimit)
 	if err != nil {
@@ -46,7 +46,7 @@ func TestUnique_QueryEQ_Max1Equivalent(t *testing.T) {
 	qAndLimit1 := qx.Query(
 		qx.EQ("email", "a@x"),
 		qx.EQ("code", 1),
-	).Max(1)
+	).Limit(1)
 
 	idsAndNoLimit, err := db.QueryKeys(qAndNoLimit)
 	if err != nil {
@@ -87,7 +87,7 @@ func TestUnique_QueryEQ_UsesUniquePlan_AcrossHitMissAndUnsatisfiable(t *testing.
 		},
 		{
 			name:    "hit_limit_1",
-			q:       qx.Query(qx.EQ("email", "a@x")).Max(1),
+			q:       qx.Query(qx.EQ("email", "a@x")).Limit(1),
 			wantLen: 1,
 		},
 		{
@@ -97,15 +97,15 @@ func TestUnique_QueryEQ_UsesUniquePlan_AcrossHitMissAndUnsatisfiable(t *testing.
 		},
 		{
 			name:    "miss_limit_1",
-			q:       qx.Query(qx.EQ("email", "missing@x")).Max(1),
+			q:       qx.Query(qx.EQ("email", "missing@x")).Limit(1),
 			wantLen: 0,
 		},
 		{
 			name: "unsatisfiable_conjunction_limit_1",
 			q: qx.Query(
 				qx.EQ("email", "a@x"),
-				qx.HAS("tags", []string{"missing"}),
-			).Max(1),
+				qx.HASALL("tags", []string{"missing"}),
+			).Limit(1),
 			wantLen: 0,
 		},
 	}
@@ -146,7 +146,7 @@ func TestUnique_QueryEQ_DirectFastPathRequiresNoOrderNoOffset(t *testing.T) {
 	}
 
 	t.Run("offset", func(t *testing.T) {
-		ids, err := db.QueryKeys(qx.Query(qx.EQ("email", "c@x")).Skip(1))
+		ids, err := db.QueryKeys(qx.Query(qx.EQ("email", "c@x")).Offset(1))
 		if err != nil {
 			t.Fatalf("QueryKeys: %v", err)
 		}
@@ -156,7 +156,7 @@ func TestUnique_QueryEQ_DirectFastPathRequiresNoOrderNoOffset(t *testing.T) {
 	})
 
 	t.Run("ordered_nullable_unique", func(t *testing.T) {
-		ids, err := db.QueryKeys(qx.Query(qx.EQ("opt", nil)).By("code", qx.DESC))
+		ids, err := db.QueryKeys(qx.Query(qx.EQ("opt", nil)).Sort("code", qx.DESC))
 		if err != nil {
 			t.Fatalf("QueryKeys: %v", err)
 		}
@@ -167,7 +167,7 @@ func TestUnique_QueryEQ_DirectFastPathRequiresNoOrderNoOffset(t *testing.T) {
 	})
 
 	t.Run("invalid_order_field", func(t *testing.T) {
-		if _, err := db.QueryKeys(qx.Query(qx.EQ("email", "c@x")).By("missing", qx.ASC)); err == nil {
+		if _, err := db.QueryKeys(qx.Query(qx.EQ("email", "c@x")).Sort("missing", qx.ASC)); err == nil {
 			t.Fatalf("expected QueryKeys to fail for unknown order field")
 		}
 	})
@@ -190,7 +190,7 @@ func TestUnique_QueryEQ_NullLimit_TraceCountsOnlyEmittedRows(t *testing.T) {
 		t.Fatalf("Set(2): %v", err)
 	}
 
-	ids, err := db.QueryKeys(qx.Query(qx.EQ("opt", nil)).Max(1))
+	ids, err := db.QueryKeys(qx.Query(qx.EQ("opt", nil)).Limit(1))
 	if err != nil {
 		t.Fatalf("QueryKeys: %v", err)
 	}
@@ -219,7 +219,7 @@ func TestUnique_Count_WithUniqueAnchor(t *testing.T) {
 		t.Fatalf("Set: %v", err)
 	}
 
-	c1, err := db.Count(qx.Query(qx.EQ("email", "a@x")))
+	c1, err := db.Count(qx.EQ("email", "a@x"))
 	if err != nil {
 		t.Fatalf("Count(eq unique): %v", err)
 	}
@@ -227,10 +227,10 @@ func TestUnique_Count_WithUniqueAnchor(t *testing.T) {
 		t.Fatalf("expected count=1, got %d", c1)
 	}
 
-	c2, err := db.Count(qx.Query(
+	c2, err := db.Count(
 		qx.EQ("email", "a@x"),
 		qx.EQ("code", 1),
-	))
+	)
 	if err != nil {
 		t.Fatalf("Count(and hit): %v", err)
 	}
@@ -238,10 +238,10 @@ func TestUnique_Count_WithUniqueAnchor(t *testing.T) {
 		t.Fatalf("expected count=1, got %d", c2)
 	}
 
-	c3, err := db.Count(qx.Query(
+	c3, err := db.Count(
 		qx.EQ("email", "a@x"),
 		qx.EQ("code", 2),
-	))
+	)
 	if err != nil {
 		t.Fatalf("Count(and miss): %v", err)
 	}
@@ -690,11 +690,11 @@ func TestUnique_ExecuteBatch_MixedOps_MatchesSequentialModel(t *testing.T) {
 	compareState := func(step int) {
 		t.Helper()
 
-		cntBatch, err := dbBatch.Count(nil)
+		cntBatch, err := dbBatch.Count()
 		if err != nil {
 			t.Fatalf("step=%d batch Count: %v", step, err)
 		}
-		cntSeq, err := dbSeq.Count(nil)
+		cntSeq, err := dbSeq.Count()
 		if err != nil {
 			t.Fatalf("step=%d seq Count: %v", step, err)
 		}
@@ -947,9 +947,9 @@ func TestUnique_RandomMixedWrites_ModelConsistency(t *testing.T) {
 	checkState := func(step int) {
 		t.Helper()
 
-		cnt, err := db.Count(nil)
+		cnt, err := db.Count()
 		if err != nil {
-			t.Fatalf("step=%d Count(nil): %v", step, err)
+			t.Fatalf("step=%d Count(): %v", step, err)
 		}
 		if cnt != uint64(len(model)) {
 			t.Fatalf("step=%d count mismatch: got=%d want=%d", step, cnt, len(model))
@@ -1231,7 +1231,7 @@ func TestUnique_ConcurrentSet_SingleWinner(t *testing.T) {
 		t.Fatalf("expected exactly one successful insert, got %d", got)
 	}
 
-	total, err := db.Count(nil)
+	total, err := db.Count()
 	if err != nil {
 		t.Fatalf("Count: %v", err)
 	}

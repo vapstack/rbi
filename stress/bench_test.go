@@ -38,7 +38,7 @@ var focusedReadBenchCases = []focusedReadBenchCase{
 					qx.IN("country", []string{"US", "DE"}),
 					qx.NOTIN("plan", []string{"free"}),
 				),
-			).By("last_login", qx.DESC).Max(40)
+			).Sort("last_login", qx.DESC).Limit(40)
 		},
 		run: runQueryItemsBench,
 	},
@@ -52,7 +52,7 @@ var focusedReadBenchCases = []focusedReadBenchCase{
 					qx.GTE("score", 250.0),
 					qx.GTE("last_login", now-180*24*3600),
 				),
-			).By("score", qx.DESC).Max(50)
+			).Sort("score", qx.DESC).Limit(50)
 		},
 		run: runQueryItemsBench,
 	},
@@ -82,7 +82,7 @@ var focusedReadBenchCases = []focusedReadBenchCase{
 					qx.GTE("score", 120.0),
 					qx.GTE("last_login", now-45*24*3600),
 				),
-			).By("score", qx.DESC).Max(100)
+			).Sort("score", qx.DESC).Limit(100)
 		},
 		run: runQueryKeysBenchQuery,
 	},
@@ -101,7 +101,7 @@ var focusedReadBenchCases = []focusedReadBenchCase{
 						qx.GTE("created_at", now-180*24*3600),
 					),
 				),
-			).By("created_at", qx.DESC).Max(100)
+			).Sort("created_at", qx.DESC).Limit(100)
 		},
 		run: runQueryKeysBenchQuery,
 	},
@@ -116,7 +116,7 @@ var focusedReadBenchCases = []focusedReadBenchCase{
 					qx.NOTIN("status", []string{"banned"}),
 					qx.EQ("country", "US"),
 				),
-			).By("last_login", qx.DESC).Max(120)
+			).Sort("last_login", qx.DESC).Limit(120)
 		},
 		run: runQueryKeysBenchQuery,
 	},
@@ -144,7 +144,7 @@ var focusedReadBenchCases = []focusedReadBenchCase{
 						qx.GTE("last_login", now-14*24*3600),
 					),
 				),
-			).By("created_at", qx.DESC).Max(150)
+			).Sort("created_at", qx.DESC).Limit(150)
 		},
 		run: runQueryKeysBenchQuery,
 	},
@@ -159,7 +159,7 @@ var focusedReadBenchCases = []focusedReadBenchCase{
 					qx.NOTIN("plan", []string{"enterprise"}),
 					qx.LT("score", 180.0),
 				),
-			).By("last_login", qx.ASC).Skip(2500).Max(100)
+			).Sort("last_login", qx.ASC).Offset(2500).Limit(100)
 		},
 		run: runQueryKeysBenchQuery,
 	},
@@ -174,7 +174,7 @@ var focusedReadBenchCases = []focusedReadBenchCase{
 					qx.NOTIN("plan", []string{"pro", "enterprise"}),
 					qx.LT("score", 120.0),
 				),
-			).Max(250)
+			).Limit(250)
 		},
 		run: runQueryKeysBenchQuery,
 	},
@@ -487,7 +487,7 @@ func runQueryKeysBenchQuery(db *rbi.DB[uint64, UserBench], q *qx.QX) error {
 }
 
 func runCountBenchQuery(db *rbi.DB[uint64, UserBench], q *qx.QX) error {
-	_, err := db.Count(q)
+	_, err := db.Count(q.Filter)
 	return err
 }
 

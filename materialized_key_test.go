@@ -53,8 +53,8 @@ func TestMaterializedPredKeyExactScalarRange_ParseLegacyEncoding(t *testing.T) {
 }
 
 func TestMaterializedPredKeyScalar_NumericBoundsDoNotCollide(t *testing.T) {
-	k30 := materializedPredKeyForNumericScalar("age", qx.OpGTE, indexKeyFromU64(orderedInt64Key(30)))
-	k40 := materializedPredKeyForNumericScalar("age", qx.OpGTE, indexKeyFromU64(orderedInt64Key(40)))
+	k30 := materializedPredKeyForNumericScalar("age", compileScalarOpForTest(qx.OpGTE), indexKeyFromU64(orderedInt64Key(30)))
+	k40 := materializedPredKeyForNumericScalar("age", compileScalarOpForTest(qx.OpGTE), indexKeyFromU64(orderedInt64Key(40)))
 	if k30 == k40 {
 		t.Fatal("expected distinct numeric scalar cache keys")
 	}
@@ -67,8 +67,8 @@ func TestMaterializedPredKeyScalar_NumericBoundsDoNotCollide(t *testing.T) {
 		t.Fatalf("scalar round-trip mismatch:\n got=%#v\nwant=%#v", p30, k30)
 	}
 
-	c30 := materializedPredComplementKeyForNumericScalar("age", qx.OpGTE, indexKeyFromU64(orderedInt64Key(30)))
-	c40 := materializedPredComplementKeyForNumericScalar("age", qx.OpGTE, indexKeyFromU64(orderedInt64Key(40)))
+	c30 := materializedPredComplementKeyForNumericScalar("age", compileScalarOpForTest(qx.OpGTE), indexKeyFromU64(orderedInt64Key(30)))
+	c40 := materializedPredComplementKeyForNumericScalar("age", compileScalarOpForTest(qx.OpGTE), indexKeyFromU64(orderedInt64Key(40)))
 	if c30 == c40 {
 		t.Fatal("expected distinct numeric scalar complement cache keys")
 	}
@@ -80,7 +80,7 @@ func TestMaterializedPredKeyDistinctSet_RoundTripThroughStringCacheAPI(t *testin
 	vals.Append("DE")
 	vals.Append("FR")
 
-	key := materializedPredKeyForDistinctSetTerms("country", qx.OpIN, vals, true)
+	key := materializedPredKeyForDistinctSetTerms("country", compileScalarOpForTest(qx.OpIN), vals, true)
 	if key.isZero() {
 		t.Fatal("expected non-zero distinct-set cache key")
 	}

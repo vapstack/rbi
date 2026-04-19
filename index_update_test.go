@@ -123,7 +123,7 @@ func TestQuery_PatchUpdatesIndex_Correctness(t *testing.T) {
 		}
 	}
 
-	q := qx.Query(qx.GTE("age", 35)).By("age", qx.ASC)
+	q := qx.Query(qx.GTE("age", 35)).Sort("age", qx.ASC)
 
 	got, err := db.QueryKeys(q)
 	if err != nil {
@@ -136,7 +136,7 @@ func TestQuery_PatchUpdatesIndex_Correctness(t *testing.T) {
 	}
 	assertSameSlice(t, got, want)
 
-	cnt, err := db.Count(q)
+	cnt, err := db.Count(q.Filter)
 	if err != nil {
 		t.Fatalf("Count: %v", err)
 	}

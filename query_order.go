@@ -4,8 +4,8 @@ import (
 	"reflect"
 	"unsafe"
 
-	"github.com/vapstack/qx"
 	"github.com/vapstack/rbi/internal/posting"
+	"github.com/vapstack/rbi/internal/qir"
 )
 
 func shouldUseOnePassIntersectionPosting(a posting.List, b posting.List, need uint64, all bool) bool {
@@ -324,14 +324,14 @@ func (qv *queryView[K, V]) emitArrayCountZeroBucketResult(cursor *queryCursor[K,
 	return false
 }
 
-func (qv *queryView[K, V]) queryOrderBasic(result postingResult, ov fieldOverlay, o qx.Order, skip, need uint64, all bool) ([]K, error) {
+func (qv *queryView[K, V]) queryOrderBasic(result postingResult, ov fieldOverlay, o qir.Order, skip, need uint64, all bool) ([]K, error) {
 	resultCard := qv.postingResultCardinality(result)
 	if resultCard == 0 {
 		return nil, nil
 	}
 
 	isSliceOrderField := false
-	if fm := qv.fields[o.Field]; fm != nil && fm.Slice {
+	if fm := qv.fieldMetaByOrder(o); fm != nil && fm.Slice {
 		isSliceOrderField = true
 	}
 
@@ -348,10 +348,10 @@ func (qv *queryView[K, V]) queryOrderBasic(result postingResult, ov fieldOverlay
 			}
 			out = appendMaterializedNumericPostingResultKeys(out, ids, result)
 		}
-		if fm := qv.fields[o.Field]; fm != nil && fm.Ptr {
+		if fm := qv.fieldMetaByOrder(o); fm != nil && fm.Ptr {
 			out = appendMaterializedNumericPostingResultKeys(
 				out,
-				qv.nilFieldOverlay(o.Field).lookupPostingRetained(nilIndexEntryKey),
+				qv.nilFieldOverlayForOrder(o).lookupPostingRetained(nilIndexEntryKey),
 				result,
 			)
 		}
@@ -379,8 +379,8 @@ func (qv *queryView[K, V]) queryOrderBasic(result postingResult, ov fieldOverlay
 		}
 	}
 
-	if fm := qv.fields[o.Field]; fm != nil && fm.Ptr {
-		nilIDs := qv.nilFieldOverlay(o.Field).lookupPostingRetained(nilIndexEntryKey)
+	if fm := qv.fieldMetaByOrder(o); fm != nil && fm.Ptr {
+		nilIDs := qv.nilFieldOverlayForOrder(o).lookupPostingRetained(nilIndexEntryKey)
 		if !nilIDs.IsEmpty() {
 			var done bool
 			tmp, done = emitPostingResultBucketToCursor(qv, &cursor, tmp, nilIDs, result)
@@ -471,7 +471,7 @@ func scalarArrayPosPriorityCoversAllResultsOverlay(resultBM posting.List, ov, ni
 	return !nilOV.lookupPostingRetained(nilIndexEntryKey).Intersects(resultBM)
 }
 
-func (qv *queryView[K, V]) queryOrderArrayPosOverlay(result postingResult, ov fieldOverlay, o qx.Order, skip, need uint64, all bool) ([]K, error) {
+func (qv *queryView[K, V]) queryOrderArrayPosOverlay(result postingResult, ov fieldOverlay, o qir.Order, skip, need uint64, all bool) ([]K, error) {
 	resultCard := qv.postingResultCardinality(result)
 	if resultCard == 0 {
 		return nil, nil
@@ -481,8 +481,8 @@ func (qv *queryView[K, V]) queryOrderArrayPosOverlay(result postingResult, ov fi
 	if err != nil {
 		return nil, err
 	}
-	if fm := qv.fields[o.Field]; fm != nil && !fm.Slice {
-		return qv.queryOrderArrayPosScalarOverlay(result, o.Field, ov, vals, o.Desc, skip, need, all)
+	if fm := qv.fieldMetaByOrder(o); fm != nil && !fm.Slice {
+		return qv.queryOrderArrayPosScalarOverlay(result, qv.fieldNameByOrder(o), o.FieldOrdinal, ov, vals, o.Desc, skip, need, all)
 	}
 
 	out := makeOutSlice[K](resultCard, need)
@@ -516,14 +516,14 @@ func (qv *queryView[K, V]) queryOrderArrayPosOverlay(result postingResult, ov fi
 	return cursor.out, nil
 }
 
-func (qv *queryView[K, V]) queryOrderArrayPosScalarOverlay(result postingResult, field string, ov fieldOverlay, vals []string, desc bool, skip, need uint64, all bool) ([]K, error) {
+func (qv *queryView[K, V]) queryOrderArrayPosScalarOverlay(result postingResult, field string, fieldOrdinal int, ov fieldOverlay, vals []string, desc bool, skip, need uint64, all bool) ([]K, error) {
 	resultCard := qv.postingResultCardinality(result)
 	if resultCard == 0 {
 		return nil, nil
 	}
 	nilOV := fieldOverlay{}
-	if fm := qv.fields[field]; fm != nil && fm.Ptr {
-		nilOV = qv.nilFieldOverlay(field)
+	if fm := qv.fieldMeta(field, fieldOrdinal); fm != nil && fm.Ptr {
+		nilOV = qv.nilFieldOverlayRef(field, fieldOrdinal)
 	}
 	orderedVals := orderedDistinctStrings(vals, desc)
 	coversAll := !result.neg && len(orderedVals) > 0 && scalarArrayPosPriorityCoversAllResultsOverlay(result.ids, ov, nilOV, orderedVals)
@@ -613,7 +613,7 @@ func (qv *queryView[K, V]) orderDataValues(v any) ([]string, error) {
 	return []string{key}, nil
 }
 
-func (qv *queryView[K, V]) queryOrderArrayCount(result postingResult, s []index, o qx.Order, skip, need uint64, all bool, useZeroComplement bool) ([]K, error) {
+func (qv *queryView[K, V]) queryOrderArrayCount(result postingResult, s []index, o qir.Order, skip, need uint64, all bool, useZeroComplement bool) ([]K, error) {
 	resultCard := qv.postingResultCardinality(result)
 	if resultCard == 0 {
 		return nil, nil

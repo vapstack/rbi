@@ -195,7 +195,7 @@ func warmBenchCountOnceUint64(b *testing.B, db *DB[uint64, UserBench], q *qx.QX)
 
 func runBenchCountOnceUint64(b *testing.B, db *DB[uint64, UserBench], q *qx.QX) {
 	b.Helper()
-	if _, err := db.Count(q); err != nil {
+	if _, err := db.Count(q.Filter); err != nil {
 		b.Fatal(err)
 	}
 }
@@ -428,7 +428,7 @@ func Benchmark_Query_Index_Count_Gap_HeavyOR_MultiBranch(b *testing.B) {
 
 func Benchmark_Query_Index_Keys_Simple_First100(b *testing.B) {
 	db := buildBenchDB(b, benchN)
-	q := qx.Query().Max(100)
+	q := qx.Query().Limit(100)
 	runQueryKeysBench(b, db, q)
 }
 
@@ -454,7 +454,7 @@ func Benchmark_Read_Index_Keys_Scan_All_Uint64(b *testing.B) {
 
 func Benchmark_Query_Index_Keys_Medium_IN_Limit(b *testing.B) {
 	db := buildBenchDB(b, benchN)
-	q := qx.Query(qx.IN("country", []string{"NL", "DE"})).Max(100)
+	q := qx.Query(qx.IN("country", []string{"NL", "DE"})).Limit(100)
 	runQueryKeysBench(b, db, q)
 }
 
@@ -464,7 +464,7 @@ func Benchmark_Query_Index_Keys_Heavy_Range_Order_Limit(b *testing.B) {
 			qx.EQ("status", "active"),
 			qx.GTE("age", 30),
 			qx.LT("age", 50),
-		).By("age", qx.ASC).Max(100)
+		).Sort("age", qx.ASC).Limit(100)
 	})
 }
 
@@ -483,7 +483,7 @@ func Benchmark_Query_Index_Keys_Heavy_Limit(b *testing.B) {
 				),
 				qx.HASNONE("roles", []string{"admin"}),
 			),
-		).Max(10)
+		).Limit(10)
 	})
 }
 
@@ -513,7 +513,7 @@ func Benchmark_Query_Index_Keys_Realistic_DashboardFilter_Limit(b *testing.B) {
 		qx.EQ("status", "active"),
 		qx.EQ("plan", "enterprise"),
 		qx.EQ("country", "US"),
-	).Max(100)
+	).Limit(100)
 	runQueryKeysBench(b, db, q)
 }
 
@@ -523,13 +523,13 @@ func Benchmark_Query_Index_Keys_Realistic_Analytics_Range_Order_Limit(b *testing
 			qx.GTE("age", 25),
 			qx.LTE("age", 40),
 			qx.GT("score", 0.5),
-		).By("score", qx.DESC).Max(100)
+		).Sort("score", qx.DESC).Limit(100)
 	})
 }
 
 func Benchmark_Query_Index_Keys_Realistic_LeaderBoard(b *testing.B) {
 	db := buildBenchDB(b, benchN)
-	q := qx.Query().By("score", qx.DESC).Max(10)
+	q := qx.Query().Sort("score", qx.DESC).Limit(10)
 	runQueryKeysBench(b, db, q)
 }
 
@@ -538,7 +538,7 @@ func Benchmark_Query_Index_Keys_Realistic_Permissions_HasAny_Limit(b *testing.B)
 	// SELECT * FROM users WHERE roles && ['admin', 'moderator']
 	q := qx.Query(
 		qx.HASANY("roles", []string{"admin", "moderator"}),
-	).Max(100)
+	).Limit(100)
 	runQueryKeysBench(b, db, q)
 }
 
@@ -555,8 +555,8 @@ func Benchmark_Query_Index_Keys_Realistic_Skills_HasAll_Limit(b *testing.B) {
 	db := buildBenchDB(b, benchN)
 	// SELECT * FROM users WHERE tags @> ['go', 'db']
 	q := qx.Query(
-		qx.HAS("tags", []string{"go", "db"}),
-	).Max(100)
+		qx.HASALL("tags", []string{"go", "db"}),
+	).Limit(100)
 	runQueryKeysBench(b, db, q)
 }
 
@@ -564,7 +564,7 @@ func Benchmark_Query_Index_Keys_Realistic_Skills_HasAll_All(b *testing.B) {
 	db := buildBenchDB(b, benchN)
 	// SELECT * FROM users WHERE tags @> ['go', 'db']
 	q := qx.Query(
-		qx.HAS("tags", []string{"go", "db"}),
+		qx.HASALL("tags", []string{"go", "db"}),
 	)
 	runQueryKeysBench(b, db, q)
 }
@@ -575,7 +575,7 @@ func Benchmark_Query_Index_Keys_Realistic_Exclusion_Limit(b *testing.B) {
 			qx.EQ("status", "active"),
 			qx.NE("plan", "free"),
 			qx.NOTIN("country", []string{"US", "GB"}),
-		).Max(100)
+		).Limit(100)
 	})
 }
 
@@ -593,7 +593,7 @@ func Benchmark_Query_Index_Keys_Realistic_Autocomplete_Prefix_Limit(b *testing.B
 	// This prefix-only microbenchmark is sensitive to cache-mode turnover
 	// overhead; keep it single-mode so Cold rotation does not dominate runtime.
 	db := buildBenchDB(b, benchN)
-	q := qx.Query(qx.PREFIX("email", "user10")).Max(10)
+	q := qx.Query(qx.PREFIX("email", "user10")).Limit(10)
 	runQueryKeysBench(b, db, q)
 }
 
@@ -602,7 +602,7 @@ func Benchmark_Query_Index_Keys_Realistic_Autocomplete_Order_Limit(b *testing.B)
 		return qx.Query(
 			qx.PREFIX("email", "user10"),
 			qx.EQ("status", "active"),
-		).By("email", qx.ASC).Max(10)
+		).Sort("email", qx.ASC).Limit(10)
 	})
 }
 
@@ -612,7 +612,7 @@ func Benchmark_Query_Index_Keys_Realistic_Autocomplete_Complex_Limit(b *testing.
 			qx.PREFIX("email", "user10"),
 			qx.EQ("status", "active"),
 			qx.NOTIN("plan", []string{"free"}),
-		).By("score", qx.DESC).Max(10)
+		).Sort("score", qx.DESC).Limit(10)
 	})
 }
 
@@ -625,7 +625,7 @@ func Benchmark_Query_Index_Keys_Realistic_ComplexSegment_Limit(b *testing.B) {
 			qx.NE("plan", "free"),
 			qx.GTE("age", 20),
 			qx.HASANY("tags", []string{"security", "ops"}),
-		).Max(100)
+		).Limit(100)
 	})
 }
 
@@ -646,10 +646,10 @@ func Benchmark_Query_Index_Keys_Realistic_TopLevel_OR_Limit(b *testing.B) {
 	runQueryKeysBenchCacheModes(b, func() *qx.QX {
 		return qx.Query(
 			qx.OR(
-				qx.HAS("roles", []string{"admin"}),
+				qx.HASALL("roles", []string{"admin"}),
 				qx.EQ("plan", "enterprise"),
 			),
-		).Max(100)
+		).Limit(100)
 	})
 }
 
@@ -657,7 +657,7 @@ func Benchmark_Query_Index_Keys_Realistic_TopLevel_OR_All(b *testing.B) {
 	runQueryKeysBenchCacheModes(b, func() *qx.QX {
 		return qx.Query(
 			qx.OR(
-				qx.HAS("roles", []string{"admin"}),
+				qx.HASALL("roles", []string{"admin"}),
 				qx.EQ("plan", "enterprise"),
 			),
 		)
@@ -670,7 +670,7 @@ func Benchmark_Query_Index_Keys_Sort_EarlyExit(b *testing.B) {
 
 	q := qx.Query(
 		qx.EQ("status", "active"),
-	).By("age", qx.ASC).Max(20)
+	).Sort("age", qx.ASC).Limit(20)
 
 	prepareReadBenchSnapshot(b, db)
 	warmBenchQueryKeysOnceUint64(b, db, q)
@@ -690,7 +690,7 @@ func Benchmark_Query_Index_Keys_Sort_DeepOffset_Limit(b *testing.B) {
 	runQueryKeysBenchCacheModes(b, func() *qx.QX {
 		return qx.Query(
 			qx.GTE("age", 18),
-		).By("score", qx.DESC).Skip(5000).Max(50)
+		).Sort("score", qx.DESC).Offset(5000).Limit(50)
 	})
 }
 
@@ -699,45 +699,45 @@ func Benchmark_Query_Index_Keys_Sort_Complex_Order_Limit(b *testing.B) {
 	q := qx.Query(
 		qx.EQ("country", "DE"),
 		qx.HASANY("tags", []string{"rust", "go"}),
-	).By("age", qx.DESC).Max(50)
+	).Sort("age", qx.DESC).Limit(50)
 	runQueryKeysBench(b, db, q)
 }
 
 func Benchmark_Query_Index_Keys_Sort_ArrayPos_Limit(b *testing.B) {
 	db := buildBenchDB(b, benchN)
 	priority := []string{"enterprise", "pro", "basic", "free"}
-	q := qx.Query(qx.EQ("status", "active")).ByArrayPos("plan", priority, qx.ASC).Max(50)
+	q := qx.Query(qx.EQ("status", "active")).SortBy(qx.POS("plan", priority), qx.ASC).Limit(50)
 	runQueryKeysBench(b, db, q)
 }
 
 func Benchmark_Query_Index_Keys_Sort_ArrayPos_All(b *testing.B) {
 	db := buildBenchDB(b, benchN)
 	priority := []string{"enterprise", "pro", "basic", "free"}
-	q := qx.Query(qx.EQ("status", "active")).ByArrayPos("plan", priority, qx.ASC)
+	q := qx.Query(qx.EQ("status", "active")).SortBy(qx.POS("plan", priority), qx.ASC)
 	runQueryKeysBench(b, db, q)
 }
 
 func Benchmark_Query_Index_Keys_Sort_ArrayCount_Limit(b *testing.B) {
 	db := buildBenchDB(b, benchN)
-	q := qx.Query(qx.EQ("status", "active")).ByArrayCount("roles", qx.DESC).Max(50)
+	q := qx.Query(qx.EQ("status", "active")).SortBy(qx.LEN("roles"), qx.DESC).Limit(50)
 	runQueryKeysBench(b, db, q)
 }
 
 func Benchmark_Query_Index_Keys_Sort_ArrayCount_All(b *testing.B) {
 	db := buildBenchDB(b, benchN)
-	q := qx.Query(qx.EQ("status", "active")).ByArrayCount("roles", qx.DESC)
+	q := qx.Query(qx.EQ("status", "active")).SortBy(qx.LEN("roles"), qx.DESC)
 	runQueryKeysBench(b, db, q)
 }
 
 func Benchmark_Read_Query_Items_SimpleFetch(b *testing.B) {
 	db := buildBenchDB(b, benchN)
-	q := qx.Query(qx.EQ("country", "US")).By("age", qx.DESC).Max(20)
+	q := qx.Query(qx.EQ("country", "US")).Sort("age", qx.DESC).Limit(20)
 	runReadQueryBench(b, db, q)
 }
 
 func Benchmark_Read_Query_Items_HeavyFetch(b *testing.B) {
 	runReadQueryBenchCacheModes(b, func() *qx.QX {
-		return qx.Query(qx.GTE("age", 20)).By("score", qx.DESC).Max(100)
+		return qx.Query(qx.GTE("age", 20)).Sort("score", qx.DESC).Limit(100)
 	})
 }
 
@@ -804,7 +804,7 @@ func Benchmark_Query_Index_Keys_Gap_FacetedSearch_OR_Order_Offset_Limit(b *testi
 					qx.GTE("score", 70.0),
 				),
 			),
-		).By("score", qx.DESC).Skip(500).Max(100)
+		).Sort("score", qx.DESC).Offset(500).Limit(100)
 	})
 }
 
@@ -826,7 +826,7 @@ func Benchmark_Query_Index_Keys_Gap_CRM_MultiBranch_OR_Limit(b *testing.B) {
 					qx.HASANY("tags", []string{"security", "ops"}),
 				),
 			),
-		).Max(150)
+		).Limit(150)
 	})
 }
 
@@ -838,7 +838,7 @@ func Benchmark_Query_Index_Keys_Gap_OR_NoOrder_AdaptiveLateBranch_Limit(b *testi
 				qx.EQ("email", "user000020@example.com"),
 				qx.GTE("email", "user490000@example.com"),
 			),
-		).Max(2)
+		).Limit(2)
 	})
 }
 
@@ -860,7 +860,7 @@ func Benchmark_Query_Index_Keys_Gap_HeavyOR_Order_Limit(b *testing.B) {
 					qx.GTE("age", 30),
 				),
 			),
-		).By("score", qx.DESC).Max(120)
+		).Sort("score", qx.DESC).Limit(120)
 	})
 }
 
@@ -870,7 +870,7 @@ func Benchmark_Query_Index_Keys_Gap_Mixed_EQ_HASANY_GTE_Order_Limit(b *testing.B
 			qx.EQ("status", "active"),
 			qx.HASANY("tags", []string{"go", "security", "ops"}),
 			qx.GTE("age", 25),
-		).By("score", qx.DESC).Max(100)
+		).Sort("score", qx.DESC).Limit(100)
 	})
 }
 
@@ -880,7 +880,7 @@ func Benchmark_Query_Index_Keys_Gap_BroadPrefix_OtherOrder_Limit(b *testing.B) {
 			qx.PREFIX("email", "user"),
 			qx.EQ("status", "active"),
 			qx.NOTIN("plan", []string{"free"}),
-		).By("score", qx.DESC).Max(100)
+		).Sort("score", qx.DESC).Limit(100)
 	})
 }
 
@@ -891,7 +891,7 @@ func Benchmark_Query_Index_Keys_Gap_ArrayCountSort_MixedFilters_Offset_Limit(b *
 			qx.NOTIN("country", []string{"US", "GB"}),
 			qx.HASANY("tags", []string{"go", "security", "ops"}),
 			qx.GTE("age", 25),
-		).ByArrayCount("roles", qx.DESC).Skip(2000).Max(100)
+		).SortBy(qx.LEN("roles"), qx.DESC).Offset(2000).Limit(100)
 	})
 }
 

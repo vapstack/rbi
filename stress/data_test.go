@@ -92,10 +92,10 @@ func TestOpenBenchDBSeedsEmptyDBToExplicitTarget(t *testing.T) {
 	if got := handle.MaxID; got != 7 {
 		t.Fatalf("MaxID = %d, want 7", got)
 	}
-	if got, err := handle.DB.Count(nil); err != nil {
-		t.Fatalf("Count(nil): %v", err)
+	if got, err := handle.DB.Count(); err != nil {
+		t.Fatalf("Count(): %v", err)
 	} else if got != 7 {
-		t.Fatalf("Count(nil) = %d, want 7", got)
+		t.Fatalf("Count() = %d, want 7", got)
 	}
 }
 
@@ -134,9 +134,9 @@ func TestOpenBenchDBTopUpToExplicitTarget(t *testing.T) {
 	if got := handle.MaxID; got != 8 {
 		t.Fatalf("MaxID = %d, want 8", got)
 	}
-	if got, err := handle.DB.Count(nil); err != nil {
-		t.Fatalf("Count(nil): %v", err)
+	if got, err := handle.DB.Count(); err != nil {
+		t.Fatalf("Count(): %v", err)
 	} else if got != 8 {
-		t.Fatalf("Count(nil) = %d, want 8", got)
+		t.Fatalf("Count() = %d, want 8", got)
 	}
 }

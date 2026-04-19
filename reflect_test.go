@@ -222,7 +222,7 @@ func TestReflectExt_QueryValueIndexerScalarNamedString_NormalizesQueryValue(t *t
 	}
 	assertUint64Set(t, got, []uint64{1, 2})
 
-	cnt, err := db.Count(q)
+	cnt, err := db.Count(q.Filter)
 	if err != nil {
 		t.Fatalf("Count: %v", err)
 	}
@@ -290,7 +290,7 @@ func TestReflectExt_QueryValueIndexerSliceNamedString_NormalizesElements(t *test
 	}
 	assertUint64Set(t, got, []uint64{1, 2})
 
-	cnt, err := db.Count(q)
+	cnt, err := db.Count(q.Filter)
 	if err != nil {
 		t.Fatalf("Count: %v", err)
 	}
@@ -336,7 +336,7 @@ func TestReflectExt_QueryValueIndexerScalarUnderlyingSlice_RemainsScalar(t *test
 	}
 	assertUint64Slice(t, got, []uint64{1})
 
-	cnt, err := db.Count(q)
+	cnt, err := db.Count(q.Filter)
 	if err != nil {
 		t.Fatalf("Count: %v", err)
 	}

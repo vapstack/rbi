@@ -13,6 +13,7 @@ import (
 	"github.com/vapstack/qx"
 	"github.com/vapstack/rbi/internal/pooled"
 	"github.com/vapstack/rbi/internal/posting"
+	"go.etcd.io/bbolt"
 )
 
 func mustCurrentBucketSequence(t *testing.T, db *DB[uint64, Rec]) uint64 {
@@ -198,7 +199,7 @@ func TestSnapshotStrMap_LatestSnapshotRetainsOldMappingsAcrossChain(t *testing.T
 func TestSnapshot_EmptyBaseWriteInvalidatesTouchedMaterializedPredicateCache(t *testing.T) {
 	db, _ := openTempDBUint64(t)
 
-	expr := qx.Expr{Op: qx.OpPREFIX, Field: "email", Value: "user"}
+	expr := qx.PREFIX("email", "user")
 	cacheKey := db.materializedPredCacheKey(expr)
 	if cacheKey == "" {
 		t.Fatalf("expected materialized predicate cache key for prefix predicate")
@@ -267,7 +268,7 @@ func TestSnapshot_EmptyBaseBatchSetBuildsDistinctLenIndex(t *testing.T) {
 		t.Fatalf("unexpected empty-tags result: got=%v want=%v", gotEmpty, want)
 	}
 
-	orderQ := qx.Query().ByArrayCount("tags", qx.ASC)
+	orderQ := queryOrderSortByArrayCount(qx.Query(), "tags", qx.ASC)
 	gotOrder, err := db.QueryKeys(orderQ)
 	if err != nil {
 		t.Fatalf("QueryKeys(array count): %v", err)
@@ -573,34 +574,57 @@ func snapshotExtRunConcurrent(n int, fn func(i int)) {
 	wg.Wait()
 }
 
+func snapshotExtQueryTxRecords[K ~string | ~uint64, V any](t *testing.T, db *DB[K, V], tx *bbolt.Tx, snap *indexSnapshot, q *qx.QX) []*V {
+	t.Helper()
+
+	prepared, viewQ, err := prepareTestQuery(db, q)
+	if err != nil {
+		t.Fatalf("prepareTestQuery(queryRecords): %v", err)
+	}
+	defer prepared.Release()
+
+	items, err := db.queryRecords(tx, snap, &viewQ)
+	if err != nil {
+		t.Fatalf("queryRecords: %v", err)
+	}
+	return items
+}
+
 func snapshotExtEvalNumericRangeBuckets(t *testing.T, db *DB[uint64, Rec], expr qx.Expr) {
 	t.Helper()
 
-	fm := db.fields[expr.Field]
-	if fm == nil {
-		t.Fatalf("expected %q field metadata", expr.Field)
+	prepared, compiled, err := prepareTestExpr(db, expr)
+	if err != nil {
+		t.Fatalf("prepareTestExpr(numeric range): %v", err)
 	}
-	ov := db.fieldOverlay(expr.Field)
+	defer prepared.Release()
+
+	field := db.fieldNameByOrdinal(compiled.FieldOrdinal)
+	fm := db.fields[field]
+	if fm == nil {
+		t.Fatalf("expected %q field metadata", field)
+	}
+	ov := db.fieldOverlay(field)
 	if !ov.hasData() {
-		t.Fatalf("expected %q field index data", expr.Field)
+		t.Fatalf("expected %q field index data", field)
 	}
 
 	key, isSlice, isNil, err := db.exprValueToIdxScalar(expr)
 	if err != nil {
-		t.Fatalf("exprValueToIdxScalar(%s): %v", expr.Field, err)
+		t.Fatalf("exprValueToIdxScalar(%s): %v", field, err)
 	}
 	if isSlice || isNil {
 		t.Fatalf("unexpected scalar flags: isSlice=%v isNil=%v", isSlice, isNil)
 	}
 
-	rb, ok := rangeBoundsForOp(expr.Op, key)
+	rb, ok := rangeBoundsForOp(compiled.Op, key)
 	if !ok {
-		t.Fatalf("rangeBoundsForOp(%v) failed", expr.Op)
+		t.Fatalf("rangeBoundsForOp(%v) failed", compiled.Op)
 	}
 
-	out, ok := db.tryEvalNumericRangeBuckets(expr.Field, fm, ov, ov.rangeForBounds(rb))
+	out, ok := db.tryEvalNumericRangeBuckets(field, fm, ov, ov.rangeForBounds(rb))
 	if !ok {
-		t.Fatalf("expected numeric range bucket path for %q", expr.Field)
+		t.Fatalf("expected numeric range bucket path for %q", field)
 	}
 	out.release()
 }
@@ -872,18 +896,12 @@ func TestSnapshotExt_BeginQueryTxSnapshotSeesOldStateWhileNewSnapshotPublished(t
 		done <- db.Set(2, &Rec{Name: "bob", Age: 20})
 	}()
 
-	oldItems, err := db.queryRecords(tx, snap, qx.Query(qx.EQ("name", "bob")))
-	if err != nil {
-		t.Fatalf("queryRecords(old snapshot): %v", err)
-	}
+	oldItems := snapshotExtQueryTxRecords(t, db, tx, snap, qx.Query(qx.EQ("name", "bob")))
 	if len(oldItems) != 0 {
 		t.Fatalf("old tx/snapshot unexpectedly sees future write: %#v", oldItems)
 	}
 
-	oldItems, err = db.queryRecords(tx, snap, qx.Query(qx.EQ("name", "alice")))
-	if err != nil {
-		t.Fatalf("queryRecords(old snapshot for alice): %v", err)
-	}
+	oldItems = snapshotExtQueryTxRecords(t, db, tx, snap, qx.Query(qx.EQ("name", "alice")))
 	if len(oldItems) != 1 || oldItems[0] == nil || oldItems[0].Name != "alice" {
 		t.Fatalf("unexpected old snapshot query result: %#v", oldItems)
 	}
@@ -1209,7 +1227,7 @@ func TestSnapshotExt_PatchUnchangedFieldInheritsPositiveMaterializedPredCache(t 
 		t.Fatalf("Set(1): %v", err)
 	}
 
-	key := db.materializedPredCacheKey(qx.Expr{Op: qx.OpPREFIX, Field: "email", Value: "ali"})
+	key := db.materializedPredCacheKey(qx.PREFIX("email", "ali"))
 	if key == "" {
 		t.Fatalf("expected non-empty cache key")
 	}
@@ -1236,7 +1254,7 @@ func TestSnapshotExt_PatchUnchangedFieldInheritsNegativeMaterializedPredCache(t 
 		t.Fatalf("Set(1): %v", err)
 	}
 
-	key := db.materializedPredCacheKey(qx.Expr{Op: qx.OpPREFIX, Field: "email", Value: "zz"})
+	key := db.materializedPredCacheKey(qx.PREFIX("email", "zz"))
 	if key == "" {
 		t.Fatalf("expected non-empty cache key")
 	}
@@ -1262,8 +1280,8 @@ func TestSnapshotExt_PatchTouchedFieldDropsOnlyTouchedMaterializedPredCache(t *t
 		t.Fatalf("Set(1): %v", err)
 	}
 
-	nameKey := db.materializedPredCacheKey(qx.Expr{Op: qx.OpPREFIX, Field: "name", Value: "ali"})
-	emailKey := db.materializedPredCacheKey(qx.Expr{Op: qx.OpPREFIX, Field: "email", Value: "ali"})
+	nameKey := db.materializedPredCacheKey(qx.PREFIX("name", "ali"))
+	emailKey := db.materializedPredCacheKey(qx.PREFIX("email", "ali"))
 	if nameKey == "" || emailKey == "" {
 		t.Fatalf("expected non-empty cache keys")
 	}
@@ -1295,8 +1313,8 @@ func TestSnapshotExt_PatchDuplicateTouchedFieldStillDropsTouchedCacheAndKeepsOth
 		t.Fatalf("Set(1): %v", err)
 	}
 
-	nameKey := db.materializedPredCacheKey(qx.Expr{Op: qx.OpPREFIX, Field: "name", Value: "ali"})
-	emailKey := db.materializedPredCacheKey(qx.Expr{Op: qx.OpPREFIX, Field: "email", Value: "ali"})
+	nameKey := db.materializedPredCacheKey(qx.PREFIX("name", "ali"))
+	emailKey := db.materializedPredCacheKey(qx.PREFIX("email", "ali"))
 	if nameKey == "" || emailKey == "" {
 		t.Fatalf("expected non-empty cache keys")
 	}
@@ -1330,8 +1348,8 @@ func TestSnapshotExt_PatchTouchedNilFieldDropsNilPredicateCache(t *testing.T) {
 		t.Fatalf("Set(1): %v", err)
 	}
 
-	optKey := db.materializedPredCacheKey(qx.Expr{Op: qx.OpPREFIX, Field: "opt", Value: "z"})
-	emailKey := db.materializedPredCacheKey(qx.Expr{Op: qx.OpPREFIX, Field: "email", Value: "ali"})
+	optKey := db.materializedPredCacheKey(qx.PREFIX("opt", "z"))
+	emailKey := db.materializedPredCacheKey(qx.PREFIX("email", "ali"))
 	if optKey == "" || emailKey == "" {
 		t.Fatalf("expected non-empty cache keys")
 	}
@@ -1374,14 +1392,14 @@ func TestSnapshotExt_ClearRuntimeCachesForTestingClearsCurrentSnapshotCaches(t *
 
 	setNumericBucketKnobs(t, db, 128, 1, 1)
 	snap := db.getSnapshot()
-	snapshotExtEvalNumericRangeBuckets(t, db, qx.Expr{Op: qx.OpGTE, Field: "age", Value: 500})
+	snapshotExtEvalNumericRangeBuckets(t, db, qx.GTE("age", 500))
 	if snap.numericRangeBucketCache == nil || snap.numericRangeBucketCache.entryCount() == 0 {
 		t.Fatalf("expected numeric range bucket cache entries after evaluation")
 	}
 	if got := snap.matPredCacheCount.Load(); got != 0 {
 		t.Fatalf("expected numeric range bucket helper to keep shared materialized predicate cache empty, got=%d", got)
 	}
-	expr := qx.Expr{Op: qx.OpPREFIX, Field: "name", Value: "u_1"}
+	expr := qx.PREFIX("name", "u_1")
 	cacheKey := db.materializedPredCacheKey(expr)
 	if cacheKey == "" {
 		t.Fatalf("expected non-empty materialized predicate cache key")
@@ -1478,7 +1496,7 @@ func TestSnapshotExt_StoreMaterializedPredConcurrentDistinctKeysRespectsLimit(t 
 		s := &indexSnapshot{matPredCacheMaxEntries: 1}
 		snapshotExtInitMaterializedPredCache(s)
 		snapshotExtRunConcurrent(n, func(i int) {
-			s.storeMaterializedPred(fmt.Sprintf("email\x1f%d\x1f%d", qx.OpPREFIX, i), posting.List{})
+			s.storeMaterializedPred(fmt.Sprintf("email\x1f%s\x1f%d", qx.OpPREFIX, i), posting.List{})
 		})
 		if got := s.matPredCacheCount.Load(); got > 1 {
 			t.Fatalf("round=%d materialized cache count exceeded limit: got=%d", round, got)
@@ -1565,7 +1583,7 @@ func TestSnapshotExt_MaterializedPredCacheOversizedAdmissionTurnsOverEntries(t *
 	large := snapshotExtPosting(1, 2)
 
 	for i := 0; i < 8; i++ {
-		s.storeMaterializedPred(fmt.Sprintf("email\x1f%d\x1f%d", qx.OpPREFIX, i), small)
+		s.storeMaterializedPred(fmt.Sprintf("email\x1f%s\x1f%d", qx.OpPREFIX, i), small)
 	}
 	if got := s.matPredCacheCount.Load(); got != 8 {
 		t.Fatalf("expected regular cache to fill total limit, got=%d", got)
@@ -1622,7 +1640,7 @@ func TestSnapshotExt_MaterializedPredCacheRegularAdmissionTurnsOverOlderRegularE
 	large := snapshotExtPosting(1, 2)
 
 	for i := 0; i < 8; i++ {
-		s.storeMaterializedPred(fmt.Sprintf("email\x1f%d\x1f%d", qx.OpPREFIX, i), small)
+		s.storeMaterializedPred(fmt.Sprintf("email\x1f%s\x1f%d", qx.OpPREFIX, i), small)
 	}
 	if !s.tryStoreMaterializedPredOversized("age\x1frange_bucket\x1f0", large) {
 		t.Fatalf("expected first oversized cache entry to be admitted")
@@ -1994,18 +2012,12 @@ func TestSpanshotExt_BeginQueryTxSnapshotSurvivesConcurrentTruncate(t *testing.T
 		done <- db.Truncate()
 	}()
 
-	alice, err := db.queryRecords(tx, snap, qx.Query(qx.EQ("name", "alice")))
-	if err != nil {
-		t.Fatalf("queryRecords(old snapshot alice): %v", err)
-	}
+	alice := snapshotExtQueryTxRecords(t, db, tx, snap, qx.Query(qx.EQ("name", "alice")))
 	if len(alice) != 1 || alice[0] == nil || alice[0].Name != "alice" {
 		t.Fatalf("unexpected old snapshot alice result: %#v", alice)
 	}
 
-	all, err := db.queryRecords(tx, snap, qx.Query())
-	if err != nil {
-		t.Fatalf("queryRecords(old snapshot all): %v", err)
-	}
+	all := snapshotExtQueryTxRecords(t, db, tx, snap, qx.Query())
 	if len(all) != 2 {
 		t.Fatalf("old tx/snapshot lost rows across truncate: %#v", all)
 	}
@@ -2061,10 +2073,7 @@ func TestSpanshotExt_BeginQueryTxSnapshotSurvivesBrokenTruncatePublish(t *testin
 		done <- db.Truncate()
 	}()
 
-	all, err := db.queryRecords(tx, snap, qx.Query())
-	if err != nil {
-		t.Fatalf("queryRecords(old snapshot all): %v", err)
-	}
+	all := snapshotExtQueryTxRecords(t, db, tx, snap, qx.Query())
 	if len(all) != 2 {
 		t.Fatalf("old tx/snapshot lost rows during broken truncate publish: %#v", all)
 	}
@@ -2096,7 +2105,7 @@ func TestSpanshotExt_MaterializedPredMixedRegularAndOversizedConcurrentRespectsG
 		snapshotExtInitMaterializedPredCache(s)
 		snapshotExtRunConcurrent(n, func(i int) {
 			if i%2 == 0 {
-				s.storeMaterializedPred(fmt.Sprintf("email\x1f%d\x1f%d", qx.OpPREFIX, i), small)
+				s.storeMaterializedPred(fmt.Sprintf("email\x1f%s\x1f%d", qx.OpPREFIX, i), small)
 				return
 			}
 			s.tryStoreMaterializedPredOversized(fmt.Sprintf("age\x1frange_bucket\x1f%d", i), large)
@@ -2331,7 +2340,7 @@ func TestSnapshotExt_CountReleasesCurrentSnapshotPinOnError(t *testing.T) {
 	}
 
 	snap := db.getSnapshot()
-	if _, err := db.Count(qx.Query(qx.EQ("does_not_exist", 1))); err == nil {
+	if _, err := db.Count(qx.EQ("does_not_exist", 1)); err == nil {
 		t.Fatalf("expected Count to fail for unknown field")
 	}
 	ref := db.snapshot.bySeq[snap.seq]
@@ -2393,10 +2402,10 @@ func TestMaterializedPredCache_LoadOrStoreAllocsPerRunStayZeroAfterWarmup(t *tes
 	defer snap.releaseRuntimeCaches()
 
 	keys := [...]materializedPredKey{
-		materializedPredKeyForScalar("email", qx.OpPREFIX, "user"),
-		materializedPredKeyForScalar("email", qx.OpPREFIX, "admin"),
-		materializedPredKeyForScalar("name", qx.OpSUFFIX, "son"),
-		materializedPredKeyForScalar("bio", qx.OpCONTAINS, "ops"),
+		materializedPredKeyForScalar("email", compileScalarOpForTest(qx.OpPREFIX), "user"),
+		materializedPredKeyForScalar("email", compileScalarOpForTest(qx.OpPREFIX), "admin"),
+		materializedPredKeyForScalar("name", compileScalarOpForTest(qx.OpSUFFIX), "son"),
+		materializedPredKeyForScalar("bio", compileScalarOpForTest(qx.OpCONTAINS), "ops"),
 	}
 	posts := [...]posting.List{
 		posting.BuildFromSorted([]uint64{3, 9, 17, 25}),
@@ -2429,12 +2438,12 @@ func TestMaterializedPredCache_LoadOrStoreAllocsPerRunStayZeroAfterWarmup(t *tes
 func TestRecentKeyCache_AllocsPerRunStayZeroAfterWarmup(t *testing.T) {
 	var cache recentKeyCache
 	keys := [...]materializedPredKey{
-		materializedPredKeyForScalar("email", qx.OpPREFIX, "user"),
-		materializedPredKeyForScalar("email", qx.OpPREFIX, "admin"),
-		materializedPredKeyForScalar("name", qx.OpSUFFIX, "son"),
-		materializedPredKeyForScalar("name", qx.OpSUFFIX, "ov"),
-		materializedPredKeyForScalar("bio", qx.OpCONTAINS, "ops"),
-		materializedPredKeyForScalar("bio", qx.OpCONTAINS, "db"),
+		materializedPredKeyForScalar("email", compileScalarOpForTest(qx.OpPREFIX), "user"),
+		materializedPredKeyForScalar("email", compileScalarOpForTest(qx.OpPREFIX), "admin"),
+		materializedPredKeyForScalar("name", compileScalarOpForTest(qx.OpSUFFIX), "son"),
+		materializedPredKeyForScalar("name", compileScalarOpForTest(qx.OpSUFFIX), "ov"),
+		materializedPredKeyForScalar("bio", compileScalarOpForTest(qx.OpCONTAINS), "ops"),
+		materializedPredKeyForScalar("bio", compileScalarOpForTest(qx.OpCONTAINS), "db"),
 	}
 	limit := len(keys)
 
@@ -2486,10 +2495,10 @@ func TestMaterializedPredCache_InsertNilEntriesAllocsPerRunStayZeroAfterWarmup(t
 	defer materializedPredCachePool.Put(cache)
 
 	keys := [...]materializedPredKey{
-		materializedPredKeyForScalar("email", qx.OpPREFIX, "user"),
-		materializedPredKeyForScalar("email", qx.OpPREFIX, "admin"),
-		materializedPredKeyForScalar("name", qx.OpSUFFIX, "son"),
-		materializedPredKeyForScalar("bio", qx.OpCONTAINS, "ops"),
+		materializedPredKeyForScalar("email", compileScalarOpForTest(qx.OpPREFIX), "user"),
+		materializedPredKeyForScalar("email", compileScalarOpForTest(qx.OpPREFIX), "admin"),
+		materializedPredKeyForScalar("name", compileScalarOpForTest(qx.OpSUFFIX), "son"),
+		materializedPredKeyForScalar("bio", compileScalarOpForTest(qx.OpCONTAINS), "ops"),
 	}
 
 	run := func() {

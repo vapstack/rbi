@@ -11,9 +11,9 @@ import (
 	"testing"
 
 	"github.com/vapstack/qx"
-	"github.com/vapstack/rbi/internal/normalize"
 	"github.com/vapstack/rbi/internal/pooled"
 	"github.com/vapstack/rbi/internal/posting"
+	"github.com/vapstack/rbi/internal/qir"
 )
 
 func copySeededDBWithSidecars(t *testing.T, src, name string) string {
@@ -90,6 +90,40 @@ func countByExprBitmapCountORBench(t *testing.T, db *DB[uint64, countORBenchRec]
 	return db.countPostingResult(b)
 }
 
+func mustCountQIRExpr(t testing.TB, expr qx.Expr) qir.Expr {
+	t.Helper()
+	return mustTestQIRExpr(t, expr)
+}
+
+func mustCountQIRExprForDB[K ~string | ~uint64, V any](t testing.TB, db *DB[K, V], expr qx.Expr) qir.Expr {
+	t.Helper()
+	prepared, compiled, err := prepareTestExpr(db, expr)
+	if err != nil {
+		t.Fatalf("prepareTestExpr(%+v): %v", expr, err)
+	}
+	compiled = detachTestQIRExpr(compiled)
+	prepared.Release()
+	return compiled
+}
+
+func mustCollectCountLeavesScratch(t testing.TB, expr qx.Expr, dst []qir.Expr) []qir.Expr {
+	t.Helper()
+	leaves, ok := collectAndLeavesScratch(mustCountQIRExpr(t, expr), dst)
+	if !ok {
+		t.Fatalf("collectAndLeavesScratch=false")
+	}
+	return leaves
+}
+
+func mustCollectCountLeavesScratchForDB[K ~string | ~uint64, V any](t testing.TB, db *DB[K, V], expr qx.Expr, dst []qir.Expr) []qir.Expr {
+	t.Helper()
+	leaves, ok := collectAndLeavesScratch(mustCountQIRExprForDB(t, db, expr), dst)
+	if !ok {
+		t.Fatalf("collectAndLeavesScratch=false")
+	}
+	return leaves
+}
+
 func TestCount_SimpleScalarLeaf_TraceUsesScalarLookupPlan(t *testing.T) {
 	var events []TraceEvent
 	opts := Options{
@@ -107,7 +141,7 @@ func TestCount_SimpleScalarLeaf_TraceUsesScalarLookupPlan(t *testing.T) {
 		t.Fatalf("Set(2): %v", err)
 	}
 
-	got, err := db.Count(qx.Query(qx.EQ("country", "NL")))
+	got, err := db.Count(qx.Query(qx.EQ("country", "NL")).Filter)
 	if err != nil {
 		t.Fatalf("Count: %v", err)
 	}
@@ -417,11 +451,11 @@ func TestCount_ScalarInSplit_MixedResiduals_UsesPlan(t *testing.T) {
 		qx.GTE("score", 60.0),
 	)
 
-	got, err := db.Count(q)
+	got, err := db.Count(q.Filter)
 	if err != nil {
 		t.Fatalf("Count: %v", err)
 	}
-	want := countByExprBitmapCountORBench(t, db, q.Expr)
+	want := countByExprBitmapCountORBench(t, db, q.Filter)
 	if got != want {
 		t.Fatalf("count mismatch: got=%d want=%d", got, want)
 	}
@@ -502,11 +536,11 @@ func TestCount_ScalarInSplit_CohortShape_MatchesBitmap(t *testing.T) {
 		qx.GTE("score", 80.0),
 	)
 
-	got, err := db.Count(q)
+	got, err := db.Count(q.Filter)
 	if err != nil {
 		t.Fatalf("Count: %v", err)
 	}
-	want := countByExprBitmapCountORBench(t, db, q.Expr)
+	want := countByExprBitmapCountORBench(t, db, q.Filter)
 	if got != want {
 		t.Fatalf("count mismatch: got=%d want=%d", got, want)
 	}
@@ -534,15 +568,12 @@ func TestCount_ScalarInSplit_ResidualFilterMatchesBitmap(t *testing.T) {
 		qx.IN("country", []string{"US", "DE", "FR"}),
 	)
 
-	var leavesBuf [countPredicateScanMaxLeaves]qx.Expr
-	leaves, ok := collectAndLeavesScratch(q.Expr, leavesBuf[:0])
-	if !ok {
-		t.Fatalf("collectAndLeavesScratch=false")
-	}
+	var leavesBuf [countPredicateScanMaxLeaves]qir.Expr
+	leaves := mustCollectCountLeavesScratchForDB(t, db, q.Filter, leavesBuf[:0])
 
 	lead := -1
 	for i := range leaves {
-		if leaves[i].Op == qx.OpIN && leaves[i].Field == "country" && !leaves[i].Not {
+		if leaves[i].Op == qir.OpIN && db.fieldNameByOrdinal(leaves[i].FieldOrdinal) == "country" && !leaves[i].Not {
 			lead = i
 			break
 		}
@@ -563,7 +594,7 @@ func TestCount_ScalarInSplit_ResidualFilterMatchesBitmap(t *testing.T) {
 	}
 	defer filter.release()
 
-	valsBuf, isSlice, hasNil, err := qv.exprValueToDistinctIdxBuf(qx.Expr{Op: qx.OpIN, Field: "country", Value: []string{"US", "DE", "FR"}})
+	valsBuf, isSlice, hasNil, err := qv.exprValueToDistinctIdxBuf(mustCountQIRExprForDB(t, db, qx.IN("country", []string{"US", "DE", "FR"})))
 	if valsBuf != nil {
 		defer stringSlicePool.Put(valsBuf)
 	}
@@ -581,7 +612,7 @@ func TestCount_ScalarInSplit_ResidualFilterMatchesBitmap(t *testing.T) {
 		got += countPostingAgainstResult(ids, filter)
 	}
 
-	want := countByExprBitmapCountORBench(t, db, q.Expr)
+	want := countByExprBitmapCountORBench(t, db, q.Filter)
 	if got != want {
 		t.Fatalf("count mismatch: got=%d want=%d", got, want)
 	}
@@ -600,11 +631,8 @@ func TestCount_EvalAndOperandsExceptReordered_BroadRangeAfterContainsMatchesBitm
 	qv := db.makeQueryView(db.getSnapshot())
 	defer db.releaseQueryView(qv)
 
-	var leavesBuf [countPredicateScanMaxLeaves]qx.Expr
-	leaves, ok := collectAndLeavesScratch(expr, leavesBuf[:0])
-	if !ok {
-		t.Fatalf("collectAndLeavesScratch=false")
-	}
+	var leavesBuf [countPredicateScanMaxLeaves]qir.Expr
+	leaves := mustCollectCountLeavesScratchForDB(t, db, expr, leavesBuf[:0])
 
 	got, ok, err := qv.evalAndOperandsExceptReordered(leaves, -1)
 	if err != nil {
@@ -646,11 +674,11 @@ func TestCount_ByPredicates_BucketLead_MatchesBitmap(t *testing.T) {
 		qx.NOT(qx.EQ("active", false)),
 	)
 
-	got, err := db.Count(q)
+	got, err := db.Count(q.Filter)
 	if err != nil {
 		t.Fatalf("Count: %v", err)
 	}
-	want := countByExprBitmap(t, db, q.Expr)
+	want := countByExprBitmap(t, db, q.Filter)
 	if got != want {
 		t.Fatalf("count mismatch: got=%d want=%d", got, want)
 	}
@@ -689,10 +717,7 @@ func TestCount_ByPredicates_BucketLeadHasAnyResidual_MatchesBitmap(t *testing.T)
 		qx.LT("age", 60_000),
 		qx.HASANY("tags", []string{"go", "db"}),
 	)
-	leaves, ok := collectAndLeaves(expr)
-	if !ok {
-		t.Fatalf("collectAndLeaves failed")
-	}
+	leaves := mustExtractAndLeaves(t, expr)
 	preds, ok := db.buildPredicatesWithMode(leaves, false)
 	if !ok {
 		t.Fatalf("buildPredicatesWithMode failed")
@@ -701,7 +726,7 @@ func TestCount_ByPredicates_BucketLeadHasAnyResidual_MatchesBitmap(t *testing.T)
 
 	leadIdx := -1
 	for i := range preds {
-		if preds[i].expr.Field == "age" && preds[i].expr.Op == qx.OpGTE {
+		if db.fieldNameByOrdinal(preds[i].expr.FieldOrdinal) == "age" && preds[i].expr.Op == qir.OpGTE {
 			leadIdx = i
 			break
 		}
@@ -743,7 +768,7 @@ func TestCount_ByPredicates_BucketLeadHasAnyResidual_MatchesBitmap(t *testing.T)
 
 	hasAnyIdx := -1
 	for _, pi := range active {
-		if preds[pi].expr.Field == "tags" && preds[pi].expr.Op == qx.OpHASANY {
+		if db.fieldNameByOrdinal(preds[pi].expr.FieldOrdinal) == "tags" && preds[pi].expr.Op == qir.OpHASANY {
 			hasAnyIdx = pi
 			break
 		}
@@ -810,10 +835,7 @@ func TestCount_ByPredicates_PostingsLead_MatchesBitmap(t *testing.T) {
 		qx.NOTIN("active", []bool{false}),
 		qx.HASANY("tags", []string{"go", "db"}),
 	)
-	leaves, ok := collectAndLeaves(expr)
-	if !ok {
-		t.Fatalf("collectAndLeaves failed")
-	}
+	leaves := mustExtractAndLeaves(t, expr)
 	preds, ok := db.buildPredicatesWithMode(leaves, false)
 	if !ok {
 		t.Fatalf("buildPredicatesWithMode failed")
@@ -845,7 +867,7 @@ func TestCount_ByPredicates_PostingsLead_MatchesBitmap(t *testing.T) {
 	if leadIdx < 0 {
 		t.Fatalf("expected iterable lead")
 	}
-	if preds[leadIdx].expr.Op != qx.OpIN {
+	if preds[leadIdx].expr.Op != qir.OpIN {
 		t.Fatalf("expected IN lead, got %v", preds[leadIdx].expr.Op)
 	}
 	if err := db.prepareCountPredicate(&preds[leadIdx], leadEst, universe); err != nil {
@@ -913,10 +935,7 @@ func TestCount_ByPredicates_BucketLead_ContradictoryPrefixesReturnZero(t *testin
 		qx.PREFIX("email", "user01"),
 		qx.PREFIX("email", "user02"),
 	)
-	leaves, ok := collectAndLeaves(expr)
-	if !ok {
-		t.Fatalf("collectAndLeaves failed")
-	}
+	leaves := mustExtractAndLeaves(t, expr)
 	preds, ok := db.buildPredicatesWithMode(leaves, false)
 	if !ok {
 		t.Fatalf("buildPredicatesWithMode failed")
@@ -980,11 +999,11 @@ func TestCount_BroadLeadWithSmallIN_PrefersScalarInSplit(t *testing.T) {
 		qx.GTE("score", 10.0),
 	)
 
-	got, err := db.Count(q)
+	got, err := db.Count(q.Filter)
 	if err != nil {
 		t.Fatalf("Count: %v", err)
 	}
-	want := countByExprBitmap(t, db, q.Expr)
+	want := countByExprBitmap(t, db, q.Filter)
 	if got != want {
 		t.Fatalf("count mismatch: got=%d want=%d", got, want)
 	}
@@ -1090,11 +1109,8 @@ func TestCount_ORByPredicates_StrictWidePrefixLeadBudgetUsesScanWeight(t *testin
 	uc := db.snapshotUniverseCardinality()
 	var oldExpectedProbes uint64
 	var scanExpectedProbes uint64
-	for _, op := range expr.Operands {
-		leaves, ok := collectAndLeaves(op)
-		if !ok {
-			t.Fatalf("collectAndLeaves failed for %v", op)
-		}
+	for _, op := range expr.Args {
+		leaves := mustExtractAndLeaves(t, op)
 		preds, ok := db.buildPredicatesWithMode(leaves, false)
 		if !ok {
 			t.Fatalf("buildPredicatesWithMode failed for %v", op)
@@ -1105,9 +1121,9 @@ func TestCount_ORByPredicates_StrictWidePrefixLeadBudgetUsesScanWeight(t *testin
 			t.Fatalf("expected OR lead for branch %v", op)
 		}
 		lead := preds[leadIdx]
-		if lead.expr.Op != qx.OpPREFIX {
+		if lead.expr.Op != qir.OpPREFIX {
 			releasePredicates(preds)
-			t.Fatalf("expected prefix lead, got field=%s op=%v", lead.expr.Field, lead.expr.Op)
+			t.Fatalf("expected prefix lead, got field=%s op=%v", db.fieldNameByOrdinal(lead.expr.FieldOrdinal), lead.expr.Op)
 		}
 		oldExpectedProbes += leadEst * countLeadOpWeight(lead.expr.Op)
 		scanExpectedProbes += leadEst * countPredicateLeadScanWeight(lead)
@@ -1120,7 +1136,7 @@ func TestCount_ORByPredicates_StrictWidePrefixLeadBudgetUsesScanWeight(t *testin
 		t.Fatalf("expected scan-weight budget to reject OR path, got scanExpectedProbes=%d universe=%d", scanExpectedProbes, uc)
 	}
 
-	got, err := db.Count(q)
+	got, err := db.Count(q.Filter)
 	if err != nil {
 		t.Fatalf("Count: %v", err)
 	}
@@ -1174,10 +1190,7 @@ func TestCount_ByPredicates_SinglePostingLead_MatchesBitmap(t *testing.T) {
 		qx.GTE("score", 120.0),
 		qx.HASANY("tags", []string{"go", "db"}),
 	)
-	leaves, ok := collectAndLeaves(expr)
-	if !ok {
-		t.Fatalf("collectAndLeaves failed")
-	}
+	leaves := mustExtractAndLeaves(t, expr)
 	preds, ok := db.buildPredicatesWithMode(leaves, false)
 	if !ok {
 		t.Fatalf("buildPredicatesWithMode failed")
@@ -1209,7 +1222,7 @@ func TestCount_ByPredicates_SinglePostingLead_MatchesBitmap(t *testing.T) {
 	if leadIdx < 0 {
 		t.Fatalf("expected iterable lead")
 	}
-	if preds[leadIdx].expr.Op != qx.OpEQ {
+	if preds[leadIdx].expr.Op != qir.OpEQ {
 		t.Fatalf("expected EQ lead, got %v", preds[leadIdx].expr.Op)
 	}
 	if err := db.prepareCountPredicate(&preds[leadIdx], leadEst, universe); err != nil {
@@ -1282,7 +1295,7 @@ func TestCount_ORPredicates_FiveBranches_MatchesBitmap(t *testing.T) {
 	)
 	q := qx.Query(expr)
 
-	got, err := db.Count(q)
+	got, err := db.Count(q.Filter)
 	if err != nil {
 		t.Fatalf("Count: %v", err)
 	}
@@ -1392,7 +1405,7 @@ func TestCount_ORByPredicates_HybridMaterializedSpill_MatchesBitmap(t *testing.T
 	)
 	q := qx.Query(expr)
 
-	got, err := db.Count(q)
+	got, err := db.Count(q.Filter)
 	if err != nil {
 		t.Fatalf("Count: %v", err)
 	}
@@ -1410,8 +1423,8 @@ func TestCount_ORByPredicates_HybridMaterializedSpill_MatchesBitmap(t *testing.T
 	if ev.Plan != string(PlanCountORHybrid) {
 		t.Fatalf("expected hybrid OR count plan %q, got %q", PlanCountORHybrid, ev.Plan)
 	}
-	if len(ev.ORBranches) != len(expr.Operands) {
-		t.Fatalf("expected %d OR branch traces, got %d", len(expr.Operands), len(ev.ORBranches))
+	if len(ev.ORBranches) != len(expr.Args) {
+		t.Fatalf("expected %d OR branch traces, got %d", len(expr.Args), len(ev.ORBranches))
 	}
 	spilled := false
 	for _, br := range ev.ORBranches {
@@ -1464,7 +1477,7 @@ func TestCount_ORByPredicates_HybridTraceEmitsUseOriginalBranchIndex(t *testing.
 	)
 	q := qx.Query(expr)
 
-	got, err := db.Count(q)
+	got, err := db.Count(q.Filter)
 	if err != nil {
 		t.Fatalf("Count: %v", err)
 	}
@@ -1482,8 +1495,8 @@ func TestCount_ORByPredicates_HybridTraceEmitsUseOriginalBranchIndex(t *testing.
 	if ev.Plan != string(PlanCountORHybrid) {
 		t.Fatalf("expected hybrid OR count plan %q, got %q", PlanCountORHybrid, ev.Plan)
 	}
-	if len(ev.ORBranches) != len(expr.Operands) {
-		t.Fatalf("expected %d OR branch traces, got %d", len(expr.Operands), len(ev.ORBranches))
+	if len(ev.ORBranches) != len(expr.Args) {
+		t.Fatalf("expected %d OR branch traces, got %d", len(expr.Args), len(ev.ORBranches))
 	}
 	if ev.ORBranches[0].SkipReason != "materialized_spill" {
 		t.Fatalf("expected branch 0 to spill, got trace=%+v", ev.ORBranches)
@@ -1637,7 +1650,7 @@ func TestCountPredicateMaterializationThresholds_Adaptive(t *testing.T) {
 
 	customPred := predicate{
 		kind:    predicateKindCustom,
-		expr:    qx.Expr{Op: qx.OpPREFIX, Field: "email"},
+		expr:    qir.Expr{Op: qir.OpPREFIX, FieldOrdinal: 0},
 		estCard: 200_000,
 	}
 	if shouldMaterializeCustomCountPredicate(customPred, 2_000, 500_000) {
@@ -1649,7 +1662,7 @@ func TestCountPredicateMaterializationThresholds_Adaptive(t *testing.T) {
 
 	smallHasAnyResidual := predicate{
 		kind:     predicateKindPostsAny,
-		expr:     qx.Expr{Op: qx.OpHASANY, Field: "roles"},
+		expr:     qir.Expr{Op: qir.OpHASANY, FieldOrdinal: 0},
 		postsBuf: newPostsBuf(3),
 		estCard:  80_000,
 	}
@@ -1659,7 +1672,7 @@ func TestCountPredicateMaterializationThresholds_Adaptive(t *testing.T) {
 	}
 	fourTermHasAnyResidual := predicate{
 		kind:     predicateKindPostsAny,
-		expr:     qx.Expr{Op: qx.OpHASANY, Field: "roles"},
+		expr:     qir.Expr{Op: qir.OpHASANY, FieldOrdinal: 0},
 		postsBuf: newPostsBuf(4),
 		estCard:  80_000,
 	}
@@ -1669,7 +1682,7 @@ func TestCountPredicateMaterializationThresholds_Adaptive(t *testing.T) {
 	}
 	tooWide := predicate{
 		kind:     predicateKindPostsAny,
-		expr:     qx.Expr{Op: qx.OpHASANY, Field: "roles"},
+		expr:     qir.Expr{Op: qir.OpHASANY, FieldOrdinal: 0},
 		postsBuf: newPostsBuf(5),
 		estCard:  80_000,
 	}
@@ -1710,7 +1723,7 @@ func TestCount_ScalarINSplit_MatchesBitmap(t *testing.T) {
 	)
 	q := qx.Query(expr)
 
-	got, err := db.Count(q)
+	got, err := db.Count(q.Filter)
 	if err != nil {
 		t.Fatalf("Count: %v", err)
 	}
@@ -1759,7 +1772,7 @@ func TestCount_ScalarINSplit_WorksAfterPatches(t *testing.T) {
 	)
 	q := qx.Query(expr)
 
-	got, err := db.Count(q)
+	got, err := db.Count(q.Filter)
 	if err != nil {
 		t.Fatalf("Count: %v", err)
 	}
@@ -1795,11 +1808,8 @@ func TestCount_BuildPredicates_DeferBroadRangeMaterialization(t *testing.T) {
 		qx.IN("country", []string{"US", "DE", "FR", "GB"}),
 		qx.NOTIN("active", []bool{false}),
 	)
-	leaves, ok := collectAndLeaves(expr)
-	if !ok {
-		t.Fatalf("collectAndLeaves failed")
-	}
-	rangeKey, isSlice, isNil, err := db.exprValueToIdxScalar(qx.Expr{Op: qx.OpGTE, Field: "age", Value: 1_000})
+	leaves := mustExtractAndLeaves(t, expr)
+	rangeKey, isSlice, isNil, err := db.exprValueToIdxScalar(qx.GTE("age", 1_000))
 	if err != nil || isSlice || isNil {
 		t.Fatalf("exprValueToIdxScalar failed: err=%v isSlice=%v isNil=%v", err, isSlice, isNil)
 	}
@@ -1855,10 +1865,7 @@ func TestCount_BuildPredicates_MergesPositiveNumericRangesSameField(t *testing.T
 		qx.IN("country", []string{"US"}),
 		qx.NOTIN("active", []bool{false}),
 	)
-	leaves, ok := collectAndLeaves(expr)
-	if !ok {
-		t.Fatalf("collectAndLeaves failed")
-	}
+	leaves := mustExtractAndLeaves(t, expr)
 	preds, ok := db.buildCountPredicatesWithMode(leaves, false)
 	if !ok {
 		t.Fatalf("buildCountPredicatesWithMode failed")
@@ -1867,7 +1874,7 @@ func TestCount_BuildPredicates_MergesPositiveNumericRangesSameField(t *testing.T
 
 	agePreds := 0
 	for i := range preds {
-		if preds[i].expr.Field == "age" {
+		if db.fieldNameByOrdinal(preds[i].expr.FieldOrdinal) == "age" {
 			agePreds++
 		}
 	}
@@ -1877,7 +1884,7 @@ func TestCount_BuildPredicates_MergesPositiveNumericRangesSameField(t *testing.T
 }
 
 func TestCount_PreparePredicate_UsesBroadRangeComplementWithoutCache(t *testing.T) {
-	expr := qx.Expr{Op: qx.OpGTE, Field: "age", Value: 1_000}
+	expr := qx.GTE("age", 1_000)
 
 	t.Run("NoCacheUsesLazyExactPostingFilter", func(t *testing.T) {
 		db := countOpenPreparePredicateBroadRangeDB(t, Options{
@@ -1962,11 +1969,11 @@ func TestCount_PreparePredicate_UsesTinyPostingBroadRangeComplement(t *testing.T
 	}{
 		{
 			name: "SingleBucket",
-			expr: qx.Expr{Op: qx.OpGTE, Field: "age", Value: 1},
+			expr: qx.GTE("age", 1),
 		},
 		{
 			name: "TwoBuckets",
-			expr: qx.Expr{Op: qx.OpGTE, Field: "age", Value: 2},
+			expr: qx.GTE("age", 2),
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -2007,7 +2014,7 @@ func TestCount_PreparePredicate_UsesProbeBoundedBroadRangeComplement(t *testing.
 		return countOpenPreparePredicateBroadRangeDB(t, opts)
 	}
 
-	expr := qx.Expr{Op: qx.OpGTE, Field: "age", Value: 35_000}
+	expr := qx.GTE("age", 35_000)
 
 	for _, tc := range []struct {
 		name      string
@@ -2059,7 +2066,7 @@ func TestCount_PreparePredicate_UsesProbeBoundedBroadRangeComplement(t *testing.
 				if err != nil || isSlice || isNil {
 					t.Fatalf("exprValueToIdxScalar: err=%v isSlice=%v isNil=%v", err, isSlice, isNil)
 				}
-				cacheKey := db.materializedPredComplementCacheKeyForScalar(expr.Field, expr.Op, key)
+				cacheKey := db.materializedPredComplementCacheKeyForScalar("age", qx.OpGTE, key)
 				cached, ok := db.getSnapshot().loadMaterializedPred(cacheKey)
 				if !ok || cached.IsEmpty() {
 					t.Fatalf("expected complement postingResult to be cached after promotion")
@@ -2151,12 +2158,14 @@ func prepareBroadRangeComplementPredicate(t *testing.T, db *DB[uint64, Rec], exp
 		t.Fatalf("expected broad range predicate to materialize complement postingResult, got kind=%v", p.kind)
 	}
 
-	key, isSlice, isNil, err := db.exprValueToIdxScalar(expr)
+	compiledExpr := mustCountQIRExprForDB(t, db, expr)
+	view := db.currentQueryViewForTests()
+	key, isSlice, isNil, err := view.exprValueToIdxScalar(compiledExpr)
 	if err != nil || isSlice || isNil {
 		releasePredicates([]predicate{p})
 		t.Fatalf("exprValueToIdxScalar: err=%v isSlice=%v isNil=%v", err, isSlice, isNil)
 	}
-	cacheKey := db.materializedPredComplementCacheKeyForScalar(expr.Field, expr.Op, key)
+	cacheKey := view.materializedPredComplementCacheKeyForScalar(view.fieldNameByExpr(compiledExpr), compiledExpr.Op, key)
 	if cacheKey == "" {
 		releasePredicates([]predicate{p})
 		t.Fatalf("expected non-empty complement cache key")
@@ -2184,7 +2193,7 @@ func preparePromotedBroadRangeComplementPredicate(t *testing.T, db *DB[uint64, R
 func TestCount_PreparePredicate_BroadRangeComplementIncludesNilRows(t *testing.T) {
 	db := countOpenBroadRangeComplementOptDB(t, "count_prepare_predicate_broad_range_opt_with_nil.db", true)
 
-	expr := qx.Expr{Op: qx.OpGTE, Field: "opt", Value: "m"}
+	expr := qx.GTE("opt", "m")
 	p, _ := prepareBroadRangeComplementPredicate(t, db, expr, 3_000)
 	defer releasePredicates([]predicate{p})
 
@@ -2195,7 +2204,7 @@ func TestCount_PreparePredicate_BroadRangeComplementIncludesNilRows(t *testing.T
 }
 
 func TestCount_PreparePredicate_BroadRangeComplementCacheInvalidatedByNilFieldWrites(t *testing.T) {
-	expr := qx.Expr{Op: qx.OpGTE, Field: "opt", Value: "m"}
+	expr := qx.GTE("opt", "m")
 
 	t.Run("InsertOnly", func(t *testing.T) {
 		db := countOpenBroadRangeComplementOptDB(t, "count_prepare_predicate_broad_range_opt_no_nil.db", false)
@@ -2341,11 +2350,11 @@ func TestCount_PreparePredicate_BroadRangeComplementMatchesChunkedRangeAfterChur
 	}{
 		{
 			name: "GTE",
-			expr: qx.Expr{Op: qx.OpGTE, Field: "age", Value: 1100},
+			expr: qx.GTE("age", 1100),
 		},
 		{
 			name: "LT",
-			expr: qx.Expr{Op: qx.OpLT, Field: "age", Value: 1260},
+			expr: qx.LT("age", 1260),
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -2361,7 +2370,7 @@ func TestCount_PreparePredicate_BroadRangeComplementMatchesChunkedRangeAfterChur
 func TestCount_PreparePredicate_KeepsLegacyCapForComparableBroadLead(t *testing.T) {
 	db := countOpenPreparePredicateBroadRangeDB(t, Options{AnalyzeInterval: -1})
 
-	expr := qx.Expr{Op: qx.OpGTE, Field: "age", Value: 35_000}
+	expr := qx.GTE("age", 35_000)
 	p, ok := db.buildPredicateWithMode(expr, false)
 	if !ok {
 		t.Fatalf("buildPredicateWithMode failed")
@@ -2467,7 +2476,7 @@ func TestCount_PreparePredicate_UsesExactNumericEstimateForSkewedBroadRange(t *t
 
 	setNumericBucketKnobs(t, db, 128, 1, 1)
 
-	expr := qx.Expr{Op: qx.OpGTE, Field: "age", Value: rangeFrom}
+	expr := qx.GTE("age", rangeFrom)
 	p, ok := db.buildPredicateWithMode(expr, false)
 	if !ok {
 		t.Fatalf("buildPredicateWithMode failed")
@@ -2561,7 +2570,7 @@ func TestCount_PreparePredicate_UsesBroadRangeComplementOnFullSnapshot(t *testin
 
 	setNumericBucketKnobs(t, db, 128, 1, 1)
 
-	expr := qx.Expr{Op: qx.OpGTE, Field: "age", Value: rangeFrom}
+	expr := qx.GTE("age", rangeFrom)
 	p, ok := db.buildPredicateWithMode(expr, false)
 	if !ok {
 		t.Fatalf("buildPredicateWithMode failed")
@@ -2636,10 +2645,7 @@ func TestCount_PickLeadPredicate_PrefersLeadThatUnlocksCustomResidualMaterializa
 		qx.IN("country", []string{"US", "DE"}),
 		qx.CONTAINS("name", "needle"),
 	)
-	leaves, ok := collectAndLeaves(expr)
-	if !ok {
-		t.Fatalf("collectAndLeaves failed")
-	}
+	leaves := mustExtractAndLeaves(t, expr)
 	preds, ok := db.buildPredicatesWithMode(leaves, false)
 	if !ok {
 		t.Fatalf("buildPredicatesWithMode failed")
@@ -2654,13 +2660,13 @@ func TestCount_PickLeadPredicate_PrefersLeadThatUnlocksCustomResidualMaterializa
 	oldLeadScore := 0.0
 	for i := range preds {
 		p := preds[i]
-		if p.expr.Field == "active" && p.expr.Op == qx.OpEQ {
+		if db.fieldNameByOrdinal(p.expr.FieldOrdinal) == "active" && p.expr.Op == qir.OpEQ {
 			activeIdx = i
 		}
-		if p.expr.Field == "country" && p.expr.Op == qx.OpIN {
+		if db.fieldNameByOrdinal(p.expr.FieldOrdinal) == "country" && p.expr.Op == qir.OpIN {
 			countryIdx = i
 		}
-		if p.expr.Field == "name" && p.expr.Op == qx.OpCONTAINS {
+		if db.fieldNameByOrdinal(p.expr.FieldOrdinal) == "name" && p.expr.Op == qir.OpCONTAINS {
 			containsIdx = i
 		}
 		if p.alwaysTrue || p.covered || !p.hasIter() || p.estCard == 0 {
@@ -2677,7 +2683,7 @@ func TestCount_PickLeadPredicate_PrefersLeadThatUnlocksCustomResidualMaterializa
 		t.Fatalf("expected active/country/contains predicates, got active=%d country=%d contains=%d", activeIdx, countryIdx, containsIdx)
 	}
 	if oldLeadIdx != activeIdx {
-		t.Fatalf("expected baseline score to prefer active EQ lead, got idx=%d field=%s op=%v", oldLeadIdx, preds[oldLeadIdx].expr.Field, preds[oldLeadIdx].expr.Op)
+		t.Fatalf("expected baseline score to prefer active EQ lead, got idx=%d field=%s op=%v", oldLeadIdx, db.fieldNameByOrdinal(preds[oldLeadIdx].expr.FieldOrdinal), preds[oldLeadIdx].expr.Op)
 	}
 
 	universe := db.snapshotUniverseCardinality()
@@ -2705,7 +2711,7 @@ func TestCount_PickLeadPredicate_PrefersLeadThatUnlocksCustomResidualMaterializa
 
 	leadIdx, leadEst, _ := db.pickCountLeadPredicate(preds, universe)
 	if leadIdx != countryIdx {
-		t.Fatalf("expected residual-aware lead pick to prefer country IN, got idx=%d field=%s op=%v", leadIdx, preds[leadIdx].expr.Field, preds[leadIdx].expr.Op)
+		t.Fatalf("expected residual-aware lead pick to prefer country IN, got idx=%d field=%s op=%v", leadIdx, db.fieldNameByOrdinal(preds[leadIdx].expr.FieldOrdinal), preds[leadIdx].expr.Op)
 	}
 	if leadEst != preds[countryIdx].estCard {
 		t.Fatalf("unexpected chosen lead est: got=%d want=%d", leadEst, preds[countryIdx].estCard)
@@ -2748,7 +2754,7 @@ func TestCount_BroadMaterializedLeadCheapResiduals_UsesPredicateScan(t *testing.
 	)
 	q := qx.Query(expr)
 
-	got, err := db.Count(q)
+	got, err := db.Count(q.Filter)
 	if err != nil {
 		t.Fatalf("Count: %v", err)
 	}
@@ -2791,13 +2797,13 @@ func TestCount_LeadPostingsSingleResidualBucketCount_AllocsPerRunStayZeroAfterWa
 		qx.EQ("status", "active"),
 		qx.NOTIN("plan", []string{"free"}),
 	)
-	expr, _ := normalize.Expr(q.Expr)
+	compiledExpr := mustCountQIRExprForDB(t, db, q.Filter)
 
 	run := func() {
 		qv := db.makeQueryView(db.getSnapshot())
 		defer db.releaseQueryView(qv)
-		var leavesBuf [countPredicateScanMaxLeaves]qx.Expr
-		leaves, ok := collectAndLeavesScratch(expr, leavesBuf[:0])
+		var leavesBuf [countPredicateScanMaxLeaves]qir.Expr
+		leaves, ok := collectAndLeavesScratch(compiledExpr, leavesBuf[:0])
 		if !ok {
 			t.Fatalf("collectAndLeavesScratch=false")
 		}
@@ -3040,10 +3046,7 @@ func TestCount_PickORLeadPredicate_PrefersPrefixLeadOverCheapEqLead(t *testing.T
 		qx.EQ("active", true),
 		qx.GTE("score", 60.0),
 	)
-	leaves, ok := collectAndLeaves(expr)
-	if !ok {
-		t.Fatalf("collectAndLeaves failed")
-	}
+	leaves := mustExtractAndLeaves(t, expr)
 	preds, ok := db.buildPredicatesWithMode(leaves, false)
 	if !ok {
 		t.Fatalf("buildPredicatesWithMode failed")
@@ -3056,10 +3059,10 @@ func TestCount_PickORLeadPredicate_PrefersPrefixLeadOverCheapEqLead(t *testing.T
 	oldLeadScore := 0.0
 	for i := range preds {
 		p := preds[i]
-		if p.expr.Field == "email" && p.expr.Op == qx.OpPREFIX {
+		if db.fieldNameByOrdinal(p.expr.FieldOrdinal) == "email" && p.expr.Op == qir.OpPREFIX {
 			prefixIdx = i
 		}
-		if p.expr.Field == "active" && p.expr.Op == qx.OpEQ {
+		if db.fieldNameByOrdinal(p.expr.FieldOrdinal) == "active" && p.expr.Op == qir.OpEQ {
 			activeIdx = i
 		}
 		if p.alwaysTrue || p.covered || !p.hasIter() || p.estCard == 0 {
@@ -3075,13 +3078,13 @@ func TestCount_PickORLeadPredicate_PrefersPrefixLeadOverCheapEqLead(t *testing.T
 		t.Fatalf("expected prefix and active predicates, got prefix=%d active=%d", prefixIdx, activeIdx)
 	}
 	if oldLeadIdx != activeIdx {
-		t.Fatalf("expected old OR lead score to prefer active EQ lead, got idx=%d field=%s op=%v", oldLeadIdx, preds[oldLeadIdx].expr.Field, preds[oldLeadIdx].expr.Op)
+		t.Fatalf("expected old OR lead score to prefer active EQ lead, got idx=%d field=%s op=%v", oldLeadIdx, db.fieldNameByOrdinal(preds[oldLeadIdx].expr.FieldOrdinal), preds[oldLeadIdx].expr.Op)
 	}
 
 	universe := db.snapshotUniverseCardinality()
 	leadIdx, leadEst, _ := db.pickCountORLeadPredicate(preds, universe)
 	if leadIdx != prefixIdx {
-		t.Fatalf("expected OR-specific lead score to prefer prefix lead, got idx=%d field=%s op=%v", leadIdx, preds[leadIdx].expr.Field, preds[leadIdx].expr.Op)
+		t.Fatalf("expected OR-specific lead score to prefer prefix lead, got idx=%d field=%s op=%v", leadIdx, db.fieldNameByOrdinal(preds[leadIdx].expr.FieldOrdinal), preds[leadIdx].expr.Op)
 	}
 	if leadEst != preds[prefixIdx].estCard {
 		t.Fatalf("unexpected chosen OR lead est: got=%d want=%d", leadEst, preds[prefixIdx].estCard)
@@ -3089,8 +3092,8 @@ func TestCount_PickORLeadPredicate_PrefersPrefixLeadOverCheapEqLead(t *testing.T
 }
 
 func TestCountLeavesForUniquePath_ReusesScratchForSingleLeaf(t *testing.T) {
-	expr := qx.EQ("email", "a@x")
-	var buf [4]qx.Expr
+	expr := mustCountQIRExpr(t, qx.EQ("email", "a@x"))
+	var buf [4]qir.Expr
 
 	leaves, ok := countLeavesForUniquePath(expr, buf[:0])
 	if !ok {
@@ -3102,11 +3105,11 @@ func TestCountLeavesForUniquePath_ReusesScratchForSingleLeaf(t *testing.T) {
 	if cap(leaves) != len(buf) {
 		t.Fatalf("expected scratch-backed slice cap=%d, got %d", len(buf), cap(leaves))
 	}
-	if leaves[0].Op != expr.Op || leaves[0].Field != expr.Field || leaves[0].Value != expr.Value || leaves[0].Not != expr.Not {
+	if leaves[0].Op != expr.Op || leaves[0].FieldOrdinal != expr.FieldOrdinal || leaves[0].Value != expr.Value || leaves[0].Not != expr.Not {
 		t.Fatalf("unexpected leaf: got=%v want=%v", leaves[0], expr)
 	}
-	leaves[0].Field = "other"
-	if buf[0].Field != "other" {
+	leaves[0].FieldOrdinal = 123
+	if buf[0].FieldOrdinal != 123 {
 		t.Fatalf("expected returned slice to reuse caller scratch")
 	}
 }
@@ -3145,7 +3148,7 @@ func TestDumpCountSecurityAuditColdTurnoverCPUProfile(t *testing.T) {
 			state.applyTurnover(t, db)
 		})
 		pprof.Do(context.Background(), pprof.Labels("phase", "query"), func(context.Context) {
-			if _, err := db.Count(q); err != nil {
+			if _, err := db.Count(q.Filter); err != nil {
 				t.Fatalf("warm Count: %v", err)
 			}
 		})
@@ -3168,7 +3171,7 @@ func TestDumpCountSecurityAuditColdTurnoverCPUProfile(t *testing.T) {
 			state.applyTurnover(t, db)
 		})
 		pprof.Do(context.Background(), pprof.Labels("phase", "query"), func(context.Context) {
-			if _, err := db.Count(q); err != nil {
+			if _, err := db.Count(q.Filter); err != nil {
 				t.Fatalf("profiled Count: %v", err)
 			}
 		})

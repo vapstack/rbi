@@ -87,7 +87,7 @@ var dynamicBenchQueries = []dynamicBenchQueryCase{
 				qx.GTE("age", 24),
 				qx.LTE("age", 46),
 				qx.GT("score", 4.0),
-			).By("score", qx.DESC).Max(100)
+			).Sort("score", qx.DESC).Limit(100)
 		},
 	},
 	{
@@ -97,7 +97,7 @@ var dynamicBenchQueries = []dynamicBenchQueryCase{
 				qx.PREFIX("email", "user10"),
 				qx.EQ("status", "active"),
 				qx.NOTIN("plan", []string{"free"}),
-			).By("score", qx.DESC).Max(80)
+			).Sort("score", qx.DESC).Limit(80)
 		},
 	},
 	{
@@ -109,7 +109,7 @@ var dynamicBenchQueries = []dynamicBenchQueryCase{
 				qx.NE("plan", "free"),
 				qx.HASANY("tags", []string{"go", "ops"}),
 				qx.GTE("age", 22),
-			).Max(120)
+			).Limit(120)
 		},
 	},
 	{
@@ -117,7 +117,7 @@ var dynamicBenchQueries = []dynamicBenchQueryCase{
 		query: func() *qx.QX {
 			return qx.Query(
 				qx.GTE("age", 18),
-			).By("score", qx.DESC).Skip(5_000).Max(100)
+			).Sort("score", qx.DESC).Offset(5_000).Limit(100)
 		},
 	},
 	{
@@ -142,7 +142,7 @@ var dynamicBenchQueries = []dynamicBenchQueryCase{
 						qx.GTE("score", 8.0),
 					),
 				),
-			).By("score", qx.DESC).Skip(500).Max(100)
+			).Sort("score", qx.DESC).Offset(500).Limit(100)
 		},
 	},
 }

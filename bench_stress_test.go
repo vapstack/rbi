@@ -280,7 +280,7 @@ func warmBenchCountOnceStress(b *testing.B, db *DB[uint64, StressBenchUser], q *
 
 func runBenchCountOnceStress(b *testing.B, db *DB[uint64, StressBenchUser], q *qx.QX) {
 	b.Helper()
-	if _, err := db.Count(q); err != nil {
+	if _, err := db.Count(q.Filter); err != nil {
 		b.Fatal(err)
 	}
 }
@@ -356,7 +356,7 @@ func Benchmark_Query_Index_Keys_Stress_MemberDirectoryPrefix(b *testing.B) {
 		return qx.Query(
 			qx.PREFIX("name", "user_"),
 			qx.EQ("status", "active"),
-		).By("name", qx.ASC).Max(12)
+		).Sort("name", qx.ASC).Limit(12)
 	})
 }
 
@@ -365,7 +365,7 @@ func Benchmark_Query_Index_Keys_Stress_RecentCountryActive(b *testing.B) {
 		return qx.Query(
 			qx.EQ("country", "DE"),
 			qx.EQ("status", "active"),
-		).By("last_login", qx.DESC).Max(20)
+		).Sort("last_login", qx.DESC).Limit(20)
 	})
 }
 
@@ -376,7 +376,7 @@ func Benchmark_Query_Index_Keys_Stress_ActiveRegionPro(b *testing.B) {
 			qx.GTE("last_login", benchStressBaseUnix-72*3600),
 			qx.IN("country", []string{"DE", "FR"}),
 			qx.NOTIN("plan", []string{"free"}),
-		).By("last_login", qx.DESC).Max(40)
+		).Sort("last_login", qx.DESC).Limit(40)
 	})
 }
 
@@ -386,7 +386,7 @@ func Benchmark_Query_Index_Keys_Stress_LeaderboardTop(b *testing.B) {
 			qx.EQ("status", "active"),
 			qx.GTE("score", 250.0),
 			qx.GTE("last_login", benchStressBaseUnix-180*24*3600),
-		).By("score", qx.DESC).Max(50)
+		).Sort("score", qx.DESC).Limit(50)
 	})
 }
 
@@ -408,7 +408,7 @@ func Benchmark_Query_Index_Keys_Stress_FrontpageCandidate(b *testing.B) {
 			qx.HASANY("tags", []string{"technology", "programming", "golang"}),
 			qx.GTE("score", 120.0),
 			qx.GTE("last_login", benchStressBaseUnix-45*24*3600),
-		).By("score", qx.DESC).Max(100)
+		).Sort("score", qx.DESC).Limit(100)
 	})
 }
 
@@ -425,7 +425,7 @@ func Benchmark_Query_Index_Keys_Stress_ModerationQueue(b *testing.B) {
 					qx.GTE("created_at", benchStressBaseUnix-180*24*3600),
 				),
 			),
-		).By("created_at", qx.DESC).Max(100)
+		).Sort("created_at", qx.DESC).Limit(100)
 	})
 }
 
@@ -436,7 +436,7 @@ func Benchmark_Query_Index_Keys_Stress_InactiveCleanup(b *testing.B) {
 			qx.NOTIN("status", []string{"banned"}),
 			qx.NOTIN("plan", []string{"pro", "enterprise"}),
 			qx.LT("score", 120.0),
-		).Max(250)
+		).Limit(250)
 	})
 }
 
@@ -447,7 +447,7 @@ func Benchmark_Query_Index_Keys_Stress_StaffAuditFeed(b *testing.B) {
 			qx.GTE("last_login", benchStressBaseUnix-120*24*3600),
 			qx.NOTIN("status", []string{"banned"}),
 			qx.EQ("country", "DE"),
-		).By("last_login", qx.DESC).Max(120)
+		).Sort("last_login", qx.DESC).Limit(120)
 	})
 }
 
@@ -473,7 +473,7 @@ func Benchmark_Query_Index_Keys_Stress_DiscoveryExplore(b *testing.B) {
 					qx.GTE("last_login", benchStressBaseUnix-14*24*3600),
 				),
 			),
-		).By("created_at", qx.DESC).Max(150)
+		).Sort("created_at", qx.DESC).Limit(150)
 	})
 }
 
@@ -484,6 +484,6 @@ func Benchmark_Query_Index_Keys_Stress_DormantArchivePage(b *testing.B) {
 			qx.LT("last_login", benchStressBaseUnix-180*24*3600),
 			qx.NOTIN("plan", []string{"enterprise"}),
 			qx.LT("score", 180.0),
-		).By("last_login", qx.ASC).Skip(2500).Max(100)
+		).Sort("last_login", qx.ASC).Offset(2500).Limit(100)
 	})
 }

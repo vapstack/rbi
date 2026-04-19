@@ -1,9 +1,9 @@
 package rbi
 
 import (
-	"github.com/vapstack/qx"
 	"github.com/vapstack/rbi/internal/pooled"
 	"github.com/vapstack/rbi/internal/posting"
+	"github.com/vapstack/rbi/internal/qir"
 )
 
 const (
@@ -36,7 +36,7 @@ const (
 
 /**/
 
-var exprSlicePool = pooled.Slices[qx.Expr]{
+var exprSlicePool = pooled.Slices[qir.Expr]{
 	MinCap: 8,
 	MaxCap: exprSlicePoolMaxCap,
 	Clear:  true,

@@ -54,6 +54,32 @@ func queryExtOptPriority() []string {
 	return []string{"alpha", "beta", "", "gamma"}
 }
 
+func clearQueryExtOrderWindow(q *qx.QX) {
+	if q == nil {
+		return
+	}
+	q.Order = nil
+	q.Window.Offset = 0
+	q.Window.Limit = 0
+}
+
+func execPreparedQueryExt[K ~uint64 | ~string](db *DB[K, Rec], q *qx.QX) ([]K, error) {
+	prepared, viewQ, err := prepareTestQuery(db, q)
+	if err != nil {
+		return nil, err
+	}
+	defer prepared.Release()
+	return db.execPreparedQuery(&viewQ)
+}
+
+func queryExtSortByArrayPos(q *qx.QX, field string, priority []string, dir qx.OrderDirection) *qx.QX {
+	return q.SortBy(qx.POS(field, priority), dir)
+}
+
+func queryExtSortByArrayCount(q *qx.QX, field string, dir qx.OrderDirection) *qx.QX {
+	return q.SortBy(qx.LEN(field), dir)
+}
+
 func assertQueryExtIDsMatchExpected(t *testing.T, db *DB[uint64, Rec], q *qx.QX) []uint64 {
 	t.Helper()
 
@@ -102,7 +128,7 @@ func assertQueryExtCountMatchesOrderedResultSet(t *testing.T, db *DB[uint64, Rec
 	if err != nil {
 		t.Fatalf("QueryKeys(%+v): %v", q, err)
 	}
-	cnt, err := db.Count(q)
+	cnt, err := db.Count(q.Filter)
 	if err != nil {
 		t.Fatalf("Count(%+v): %v", q, err)
 	}
@@ -115,15 +141,13 @@ func assertQueryExtCountMatchesBaseQuery(t *testing.T, db *DB[uint64, Rec], q *q
 	t.Helper()
 
 	base := cloneQuery(q)
-	base.Order = nil
-	base.Offset = 0
-	base.Limit = 0
+	clearQueryExtOrderWindow(base)
 
-	want, err := db.Count(base)
+	want, err := db.Count(base.Filter)
 	if err != nil {
 		t.Fatalf("Count(base %+v): %v", base, err)
 	}
-	got, err := db.Count(q)
+	got, err := db.Count(q.Filter)
 	if err != nil {
 		t.Fatalf("Count(%+v): %v", q, err)
 	}
@@ -145,27 +169,25 @@ func assertQueryExtPreparedMatchesExpected(t *testing.T, db *DB[uint64, Rec], q 
 		t.Fatalf("checkUsedQuery(%+v): %v", nq, err)
 	}
 
-	got, err := db.execPreparedQuery(nq)
+	got, err := execPreparedQueryExt(db, nq)
 	if err != nil {
 		t.Fatalf("execPreparedQuery(%+v): %v", nq, err)
 	}
 	assertQueryIDsEqual(t, q, got, want)
 
 	base := cloneQuery(q)
-	base.Order = nil
-	base.Offset = 0
-	base.Limit = 0
+	clearQueryExtOrderWindow(base)
 
-	wantCount, err := db.Count(base)
+	wantCount, err := db.Count(base.Filter)
 	if err != nil {
 		t.Fatalf("Count(base %+v): %v", base, err)
 	}
-	gotCount, err := db.countPreparedExpr(nq.Expr)
+	gotCount, err := db.countPreparedExpr(nq.Filter)
 	if err != nil {
-		t.Fatalf("countPreparedExpr(%+v): %v", nq.Expr, err)
+		t.Fatalf("countPreparedExpr(%+v): %v", nq.Filter, err)
 	}
 	if gotCount != wantCount {
-		t.Fatalf("countPreparedExpr(%+v)=%d want=%d", nq.Expr, gotCount, wantCount)
+		t.Fatalf("countPreparedExpr(%+v)=%d want=%d", nq.Filter, gotCount, wantCount)
 	}
 }
 
@@ -211,9 +233,7 @@ func assertQueryExtConcurrentReadStable(t *testing.T, db *DB[uint64, Rec], q *qx
 		t.Fatalf("BatchGet(wantPage): %v", err)
 	}
 	countQ := cloneQuery(q)
-	countQ.Order = nil
-	countQ.Offset = 0
-	countQ.Limit = 0
+	clearQueryExtOrderWindow(countQ)
 	wantAll, err := expectedKeysUint64(t, db, countQ)
 	if err != nil {
 		t.Fatalf("expectedKeysUint64(count %+v): %v", countQ, err)
@@ -258,7 +278,7 @@ func assertQueryExtConcurrentReadStable(t *testing.T, db *DB[uint64, Rec], q *qx
 					}
 				}
 
-				gotCount, err := db.Count(q)
+				gotCount, err := db.Count(q.Filter)
 				if err != nil {
 					errCh <- fmt.Errorf("g=%d i=%d Count: %w", gid, i, err)
 					return
@@ -269,7 +289,7 @@ func assertQueryExtConcurrentReadStable(t *testing.T, db *DB[uint64, Rec], q *qx
 				}
 
 				if withPrepared {
-					gotPrepared, err := db.execPreparedQuery(nq)
+					gotPrepared, err := execPreparedQueryExt(db, nq)
 					if err != nil {
 						errCh <- fmt.Errorf("g=%d i=%d execPreparedQuery: %w", gid, i, err)
 						return
@@ -292,52 +312,52 @@ func assertQueryExtConcurrentReadStable(t *testing.T, db *DB[uint64, Rec], q *qx
 
 func TestQueryExt_ArrayPosPointer_AllPriorities_ASC_IncludesNilTail(t *testing.T) {
 	db := seedQueryExtOptArrayPosDB(t)
-	assertQueryExtIDsMatchExpected(t, db, qx.Query().ByArrayPos("opt", queryExtOptPriority(), qx.ASC))
+	assertQueryExtIDsMatchExpected(t, db, queryExtSortByArrayPos(qx.Query(), "opt", queryExtOptPriority(), qx.ASC))
 }
 
 func TestQueryExt_ArrayPosPointer_AllPriorities_DESC_IncludesNilTail(t *testing.T) {
 	db := seedQueryExtOptArrayPosDB(t)
-	assertQueryExtIDsMatchExpected(t, db, qx.Query().ByArrayPos("opt", queryExtOptPriority(), qx.DESC))
+	assertQueryExtIDsMatchExpected(t, db, queryExtSortByArrayPos(qx.Query(), "opt", queryExtOptPriority(), qx.DESC))
 }
 
 func TestQueryExt_ArrayPosPointer_ActiveFilter_ASC_IncludesNilTail(t *testing.T) {
 	db := seedQueryExtOptArrayPosDB(t)
-	assertQueryExtIDsMatchExpected(t, db, qx.Query(qx.EQ("active", true)).ByArrayPos("opt", queryExtOptPriority(), qx.ASC))
+	assertQueryExtIDsMatchExpected(t, db, queryExtSortByArrayPos(qx.Query(qx.EQ("active", true)), "opt", queryExtOptPriority(), qx.ASC))
 }
 
 func TestQueryExt_ArrayPosPointer_ActiveFilter_DESC_IncludesNilTail(t *testing.T) {
 	db := seedQueryExtOptArrayPosDB(t)
-	assertQueryExtIDsMatchExpected(t, db, qx.Query(qx.EQ("active", true)).ByArrayPos("opt", queryExtOptPriority(), qx.DESC))
+	assertQueryExtIDsMatchExpected(t, db, queryExtSortByArrayPos(qx.Query(qx.EQ("active", true)), "opt", queryExtOptPriority(), qx.DESC))
 }
 
 func TestQueryExt_ArrayPosPointer_EqNilOnly_ASC_ReturnsNilRows(t *testing.T) {
 	db := seedQueryExtOptArrayPosDB(t)
-	assertQueryExtIDsMatchExpected(t, db, qx.Query(qx.EQ("opt", nil)).ByArrayPos("opt", queryExtOptPriority(), qx.ASC))
+	assertQueryExtIDsMatchExpected(t, db, queryExtSortByArrayPos(qx.Query(qx.EQ("opt", nil)), "opt", queryExtOptPriority(), qx.ASC))
 }
 
 func TestQueryExt_ArrayPosPointer_EqNilOnly_DESC_ReturnsNilRows(t *testing.T) {
 	db := seedQueryExtOptArrayPosDB(t)
-	assertQueryExtIDsMatchExpected(t, db, qx.Query(qx.EQ("opt", nil)).ByArrayPos("opt", queryExtOptPriority(), qx.DESC))
+	assertQueryExtIDsMatchExpected(t, db, queryExtSortByArrayPos(qx.Query(qx.EQ("opt", nil)), "opt", queryExtOptPriority(), qx.DESC))
 }
 
 func TestQueryExt_ArrayPosPointer_SkipWindowIntoNilTail_ASC(t *testing.T) {
 	db := seedQueryExtOptArrayPosDB(t)
-	assertQueryExtIDsMatchExpected(t, db, qx.Query().ByArrayPos("opt", queryExtOptPriority(), qx.ASC).Skip(4).Max(8))
+	assertQueryExtIDsMatchExpected(t, db, queryExtSortByArrayPos(qx.Query(), "opt", queryExtOptPriority(), qx.ASC).Offset(4).Limit(8))
 }
 
 func TestQueryExt_ArrayPosPointer_SkipWindowIntoNilTail_DESC(t *testing.T) {
 	db := seedQueryExtOptArrayPosDB(t)
-	assertQueryExtIDsMatchExpected(t, db, qx.Query().ByArrayPos("opt", queryExtOptPriority(), qx.DESC).Skip(3).Max(3))
+	assertQueryExtIDsMatchExpected(t, db, queryExtSortByArrayPos(qx.Query(), "opt", queryExtOptPriority(), qx.DESC).Offset(3).Limit(3))
 }
 
 func TestQueryExt_ArrayPosPointer_LimitWindowCrossesIntoNilTail_ASC(t *testing.T) {
 	db := seedQueryExtOptArrayPosDB(t)
-	assertQueryExtIDsMatchExpected(t, db, qx.Query().ByArrayPos("opt", queryExtOptPriority(), qx.ASC).Max(5))
+	assertQueryExtIDsMatchExpected(t, db, queryExtSortByArrayPos(qx.Query(), "opt", queryExtOptPriority(), qx.ASC).Limit(5))
 }
 
 func TestQueryExt_ArrayPosPointer_NegativePredicate_RetainsNilTail(t *testing.T) {
 	db := seedQueryExtOptArrayPosDB(t)
-	assertQueryExtIDsMatchExpected(t, db, qx.Query(qx.NOT(qx.EQ("active", true))).ByArrayPos("opt", queryExtOptPriority(), qx.ASC))
+	assertQueryExtIDsMatchExpected(t, db, queryExtSortByArrayPos(qx.Query(qx.NOT(qx.EQ("active", true))), "opt", queryExtOptPriority(), qx.ASC))
 }
 
 func TestQueryExt_ArrayPosPointer_PatchToNil_RetainsExpandedNilTail(t *testing.T) {
@@ -345,7 +365,7 @@ func TestQueryExt_ArrayPosPointer_PatchToNil_RetainsExpandedNilTail(t *testing.T
 	if err := db.Patch(6, []Field{{Name: "opt", Value: (*string)(nil)}}); err != nil {
 		t.Fatalf("Patch(6 opt=nil): %v", err)
 	}
-	assertQueryExtIDsMatchExpected(t, db, qx.Query().ByArrayPos("opt", queryExtOptPriority(), qx.ASC))
+	assertQueryExtIDsMatchExpected(t, db, queryExtSortByArrayPos(qx.Query(), "opt", queryExtOptPriority(), qx.ASC))
 }
 
 func TestQueryExt_ArrayPosPointer_PatchFromNilToValue_RetainsRemainingNilTail(t *testing.T) {
@@ -353,7 +373,7 @@ func TestQueryExt_ArrayPosPointer_PatchFromNilToValue_RetainsRemainingNilTail(t 
 	if err := db.Patch(1, []Field{{Name: "opt", Value: "delta"}}); err != nil {
 		t.Fatalf("Patch(1 opt=delta): %v", err)
 	}
-	assertQueryExtIDsMatchExpected(t, db, qx.Query().ByArrayPos("opt", []string{"alpha", "beta", "", "gamma", "delta"}, qx.ASC))
+	assertQueryExtIDsMatchExpected(t, db, queryExtSortByArrayPos(qx.Query(), "opt", []string{"alpha", "beta", "", "gamma", "delta"}, qx.ASC))
 }
 
 func TestQueryExt_ArrayPosPointer_DeleteNonNil_RetainsNilTail(t *testing.T) {
@@ -361,7 +381,7 @@ func TestQueryExt_ArrayPosPointer_DeleteNonNil_RetainsNilTail(t *testing.T) {
 	if err := db.Delete(6); err != nil {
 		t.Fatalf("Delete(6): %v", err)
 	}
-	assertQueryExtIDsMatchExpected(t, db, qx.Query().ByArrayPos("opt", queryExtOptPriority(), qx.ASC))
+	assertQueryExtIDsMatchExpected(t, db, queryExtSortByArrayPos(qx.Query(), "opt", queryExtOptPriority(), qx.ASC))
 }
 
 func TestQueryExt_ArrayPosPointer_InsertNil_RetainsNewNilTail(t *testing.T) {
@@ -369,42 +389,42 @@ func TestQueryExt_ArrayPosPointer_InsertNil_RetainsNewNilTail(t *testing.T) {
 	if err := db.Set(7, &Rec{Name: "nil-3", Opt: nil, Active: true}); err != nil {
 		t.Fatalf("Set(7): %v", err)
 	}
-	assertQueryExtIDsMatchExpected(t, db, qx.Query().ByArrayPos("opt", queryExtOptPriority(), qx.ASC))
+	assertQueryExtIDsMatchExpected(t, db, queryExtSortByArrayPos(qx.Query(), "opt", queryExtOptPriority(), qx.ASC))
 }
 
 func TestQueryExt_ArrayPosPointer_QueryValues_AllPriorities_ASC_RetainsNilTail(t *testing.T) {
 	db := seedQueryExtOptArrayPosDB(t)
-	assertQueryExtItemsMatchExpected(t, db, qx.Query().ByArrayPos("opt", queryExtOptPriority(), qx.ASC))
+	assertQueryExtItemsMatchExpected(t, db, queryExtSortByArrayPos(qx.Query(), "opt", queryExtOptPriority(), qx.ASC))
 }
 
 func TestQueryExt_ArrayPosPointer_CountMatchesOrderedResultSet_WhenUnbounded(t *testing.T) {
 	db := seedQueryExtOptArrayPosDB(t)
-	assertQueryExtCountMatchesOrderedResultSet(t, db, qx.Query().ByArrayPos("opt", queryExtOptPriority(), qx.ASC))
+	assertQueryExtCountMatchesOrderedResultSet(t, db, queryExtSortByArrayPos(qx.Query(), "opt", queryExtOptPriority(), qx.ASC))
 }
 
 func TestQueryExt_ArrayPosPointer_AllNilDataset_ASC_WithPriorities(t *testing.T) {
 	db := seedQueryExtOptAllNilDB(t)
-	assertQueryExtIDsMatchExpected(t, db, qx.Query().ByArrayPos("opt", queryExtOptPriority(), qx.ASC))
+	assertQueryExtIDsMatchExpected(t, db, queryExtSortByArrayPos(qx.Query(), "opt", queryExtOptPriority(), qx.ASC))
 }
 
 func TestQueryExt_ArrayPosPointer_AllNilDataset_DESC_WithPriorities(t *testing.T) {
 	db := seedQueryExtOptAllNilDB(t)
-	assertQueryExtIDsMatchExpected(t, db, qx.Query().ByArrayPos("opt", queryExtOptPriority(), qx.DESC))
+	assertQueryExtIDsMatchExpected(t, db, queryExtSortByArrayPos(qx.Query(), "opt", queryExtOptPriority(), qx.DESC))
 }
 
 func TestQueryExt_ArrayPosPointer_AllNilDataset_ASC_EmptyPriorities(t *testing.T) {
 	db := seedQueryExtOptAllNilDB(t)
-	assertQueryExtIDsMatchExpected(t, db, qx.Query().ByArrayPos("opt", []string{}, qx.ASC))
+	assertQueryExtIDsMatchExpected(t, db, queryExtSortByArrayPos(qx.Query(), "opt", []string{}, qx.ASC))
 }
 
 func TestQueryExt_ArrayPosPointer_ASC_EmptyPriorities_FallsBackToIDOrder(t *testing.T) {
 	db := seedQueryExtOptArrayPosDB(t)
-	assertQueryExtIDsMatchExpected(t, db, qx.Query().ByArrayPos("opt", []string{}, qx.ASC))
+	assertQueryExtIDsMatchExpected(t, db, queryExtSortByArrayPos(qx.Query(), "opt", []string{}, qx.ASC))
 }
 
 func TestQueryExt_ArrayPosPointer_AllNilDataset_Window_EmptyPriorities(t *testing.T) {
 	db := seedQueryExtOptAllNilDB(t)
-	assertQueryExtIDsMatchExpected(t, db, qx.Query().ByArrayPos("opt", []string{}, qx.ASC).Skip(1).Max(2))
+	assertQueryExtIDsMatchExpected(t, db, queryExtSortByArrayPos(qx.Query(), "opt", []string{}, qx.ASC).Offset(1).Limit(2))
 }
 
 func TestQueryExt_ArrayPosPointer_AllNilAfterPatches_ASC(t *testing.T) {
@@ -414,30 +434,30 @@ func TestQueryExt_ArrayPosPointer_AllNilAfterPatches_ASC(t *testing.T) {
 			t.Fatalf("Patch(%d opt=nil): %v", id, err)
 		}
 	}
-	assertQueryExtIDsMatchExpected(t, db, qx.Query().ByArrayPos("opt", queryExtOptPriority(), qx.ASC))
+	assertQueryExtIDsMatchExpected(t, db, queryExtSortByArrayPos(qx.Query(), "opt", queryExtOptPriority(), qx.ASC))
 }
 
 func TestQueryExt_ArrayPosPointer_AllNilPredicate_DESC(t *testing.T) {
 	db := seedQueryExtOptAllNilDB(t)
-	assertQueryExtIDsMatchExpected(t, db, qx.Query(qx.EQ("active", true)).ByArrayPos("opt", []string{"alpha"}, qx.DESC))
+	assertQueryExtIDsMatchExpected(t, db, queryExtSortByArrayPos(qx.Query(qx.EQ("active", true)), "opt", []string{"alpha"}, qx.DESC))
 }
 
 func TestQueryExt_CountIgnoresUnknownBasicOrderField(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
 	_ = seedData(t, db, 64)
-	assertQueryExtCountMatchesBaseQuery(t, db, qx.Query(qx.EQ("active", true)).By("no_such_field", qx.ASC).Skip(7).Max(9))
+	assertQueryExtCountMatchesBaseQuery(t, db, qx.Query(qx.EQ("active", true)).Sort("no_such_field", qx.ASC).Offset(7).Limit(9))
 }
 
 func TestQueryExt_CountIgnoresUnknownArrayPosOrderField(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
 	_ = seedData(t, db, 64)
-	assertQueryExtCountMatchesBaseQuery(t, db, qx.Query(qx.EQ("active", true)).ByArrayPos("no_such_field", []string{"a", "b"}, qx.ASC))
+	assertQueryExtCountMatchesBaseQuery(t, db, queryExtSortByArrayPos(qx.Query(qx.EQ("active", true)), "no_such_field", []string{"a", "b"}, qx.ASC))
 }
 
 func TestQueryExt_CountIgnoresUnknownArrayCountOrderField(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
 	_ = seedData(t, db, 64)
-	assertQueryExtCountMatchesBaseQuery(t, db, qx.Query(qx.EQ("active", true)).ByArrayCount("no_such_field", qx.DESC))
+	assertQueryExtCountMatchesBaseQuery(t, db, queryExtSortByArrayCount(qx.Query(qx.EQ("active", true)), "no_such_field", qx.DESC))
 }
 
 func TestQueryExt_CountIgnoresUnknownSecondaryOrderField(t *testing.T) {
@@ -446,8 +466,8 @@ func TestQueryExt_CountIgnoresUnknownSecondaryOrderField(t *testing.T) {
 
 	q := qx.Query(qx.EQ("active", true))
 	q.Order = []qx.Order{
-		{Field: "age", Type: qx.OrderBasic, Desc: false},
-		{Field: "no_such_field", Type: qx.OrderBasic, Desc: true},
+		{By: qx.REF("age")},
+		{By: qx.REF("no_such_field"), Desc: true},
 	}
 	assertQueryExtCountMatchesBaseQuery(t, db, q)
 }
@@ -455,12 +475,12 @@ func TestQueryExt_CountIgnoresUnknownSecondaryOrderField(t *testing.T) {
 func TestQueryExt_CountIgnoresUnknownOrderFieldOnNoopQuery(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
 	_ = seedData(t, db, 64)
-	assertQueryExtCountMatchesBaseQuery(t, db, qx.Query().By("no_such_field", qx.DESC))
+	assertQueryExtCountMatchesBaseQuery(t, db, qx.Query().Sort("no_such_field", qx.DESC))
 }
 
 func TestQueryExt_CountIgnoresUnknownOrderFieldOnEmptyDB(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
-	assertQueryExtCountMatchesBaseQuery(t, db, qx.Query(qx.EQ("active", true)).By("no_such_field", qx.ASC))
+	assertQueryExtCountMatchesBaseQuery(t, db, qx.Query(qx.EQ("active", true)).Sort("no_such_field", qx.ASC))
 }
 
 func TestQueryExt_OrderBasicPointer_NilTailChurn_MatchesSeqScanAndPrepared(t *testing.T) {
@@ -492,15 +512,15 @@ func TestQueryExt_OrderBasicPointer_NilTailChurn_MatchesSeqScanAndPrepared(t *te
 	}{
 		{
 			name: "asc_window",
-			q:    qx.Query().By("opt", qx.ASC).Skip(2).Max(7),
+			q:    qx.Query().Sort("opt", qx.ASC).Offset(2).Limit(7),
 		},
 		{
 			name: "desc_active_window",
-			q:    qx.Query(qx.EQ("active", true)).By("opt", qx.DESC).Skip(1).Max(5),
+			q:    qx.Query(qx.EQ("active", true)).Sort("opt", qx.DESC).Offset(1).Limit(5),
 		},
 		{
 			name: "negated_filter_asc",
-			q:    qx.Query(qx.NOT(qx.EQ("active", true))).By("opt", qx.ASC).Skip(1).Max(6),
+			q:    qx.Query(qx.NOT(qx.EQ("active", true))).Sort("opt", qx.ASC).Offset(1).Limit(6),
 		},
 	}
 
@@ -584,15 +604,15 @@ func TestQueryExt_ArrayCount_DistinctLengthChurn_MatchesSeqScanAndPrepared(t *te
 	}{
 		{
 			name: "asc_window",
-			q:    qx.Query().ByArrayCount("tags", qx.ASC).Skip(1).Max(7),
+			q:    queryExtSortByArrayCount(qx.Query(), "tags", qx.ASC).Offset(1).Limit(7),
 		},
 		{
 			name: "desc_active_window",
-			q:    qx.Query(qx.EQ("active", true)).ByArrayCount("tags", qx.DESC).Skip(1).Max(4),
+			q:    queryExtSortByArrayCount(qx.Query(qx.EQ("active", true)), "tags", qx.DESC).Offset(1).Limit(4),
 		},
 		{
 			name: "asc_negated_filter",
-			q:    qx.Query(qx.NOT(qx.EQ("active", false))).ByArrayCount("tags", qx.ASC).Max(6),
+			q:    queryExtSortByArrayCount(qx.Query(qx.NOT(qx.EQ("active", false))), "tags", qx.ASC).Limit(6),
 		},
 	}
 
@@ -644,16 +664,16 @@ func TestQueryExt_ConcurrentSharedOrderBasicQuery_IsStable(t *testing.T) {
 		qx.EQ("active", true),
 		qx.NOTIN("country", []string{"Iceland"}),
 		qx.GTE("age", 20),
-	).By("score", qx.DESC).Skip(10).Max(80)
+	).Sort("score", qx.DESC).Offset(10).Limit(80)
 	assertQueryExtConcurrentReadStable(t, db, q, true)
 }
 
 func TestQueryExt_ConcurrentSharedArrayCountQuery_IsStable(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
 	_ = seedData(t, db, 1_200)
-	q := qx.Query(
+	q := queryExtSortByArrayCount(qx.Query(
 		qx.NOT(qx.EQ("active", false)),
-	).ByArrayCount("tags", qx.DESC).Skip(3).Max(70)
+	), "tags", qx.DESC).Offset(3).Limit(70)
 	assertQueryExtConcurrentReadStable(t, db, q, true)
 }
 
@@ -682,7 +702,7 @@ func TestQueryExt_ConcurrentAtomicBatchSetSnapshotConsistency_OnPointerOrder(t *
 		return db.BatchSet(ids, vals)
 	}
 
-	q := qx.Query(qx.EQ("active", true)).By("opt", qx.ASC).Skip(1).Max(3)
+	q := qx.Query(qx.EQ("active", true)).Sort("opt", qx.ASC).Offset(1).Limit(3)
 
 	if err := setState(stateA); err != nil {
 		t.Fatalf("BatchSet(stateA): %v", err)
@@ -696,7 +716,7 @@ func TestQueryExt_ConcurrentAtomicBatchSetSnapshotConsistency_OnPointerOrder(t *
 		t.Fatalf("Query(stateA): %v", err)
 	}
 	namesA := queryExtItemNames(t, itemsA)
-	countA, err := db.Count(q)
+	countA, err := db.Count(q.Filter)
 	if err != nil {
 		t.Fatalf("Count(stateA): %v", err)
 	}
@@ -713,7 +733,7 @@ func TestQueryExt_ConcurrentAtomicBatchSetSnapshotConsistency_OnPointerOrder(t *
 		t.Fatalf("Query(stateB): %v", err)
 	}
 	namesB := queryExtItemNames(t, itemsB)
-	countB, err := db.Count(q)
+	countB, err := db.Count(q.Filter)
 	if err != nil {
 		t.Fatalf("Count(stateB): %v", err)
 	}
@@ -775,7 +795,7 @@ func TestQueryExt_ConcurrentAtomicBatchSetSnapshotConsistency_OnPointerOrder(t *
 					return
 				}
 
-				gotCount, err := db.Count(q)
+				gotCount, err := db.Count(q.Filter)
 				if err != nil {
 					errCh <- fmt.Errorf("g=%d i=%d Count: %w", gid, i, err)
 					return
@@ -821,7 +841,7 @@ func TestQueryExt_ConcurrentWriter_RootExecPreparedQuery_ReturnsHybridResults(t 
 		return db.BatchSet(ids, vals)
 	}
 
-	q := qx.Query(qx.EQ("active", true)).By("opt", qx.ASC).Skip(1).Max(3)
+	q := qx.Query(qx.EQ("active", true)).Sort("opt", qx.ASC).Offset(1).Limit(3)
 	nq := normalizeQueryForTest(q)
 	if err := db.checkUsedQuery(nq); err != nil {
 		t.Fatalf("checkUsedQuery(%+v): %v", nq, err)
@@ -877,7 +897,7 @@ func TestQueryExt_ConcurrentWriter_RootExecPreparedQuery_ReturnsHybridResults(t 
 			defer wg.Done()
 			<-start
 			for i := 0; i < 500; i++ {
-				got, err := db.execPreparedQuery(nq)
+				got, err := execPreparedQueryExt(db, nq)
 				if err != nil {
 					select {
 					case errCh <- fmt.Errorf("execPreparedQuery: %w", err):
@@ -958,7 +978,7 @@ func queryExtOrderedORNegativeResidualFixture() ([]uint64, []*Rec, []*Rec, *qx.Q
 				qx.GTE("score", 45.0),
 			),
 		),
-	).By("age", qx.ASC).Skip(2).Max(4)
+	).Sort("age", qx.ASC).Offset(2).Limit(4)
 
 	return ids, stateA, stateB, q
 }
@@ -1001,7 +1021,7 @@ func queryExtStringOrderedORFixture() ([]string, []*Rec, []*Rec, *qx.QX) {
 				qx.LT("score", 25.0),
 			),
 		),
-	).By("name", qx.ASC).Skip(1).Max(3)
+	).Sort("name", qx.ASC).Offset(1).Limit(3)
 
 	return ids, stateA, stateB, q
 }
@@ -1047,7 +1067,7 @@ func queryExtNoOrderORDisjointFixture() ([]uint64, []*Rec, []*Rec, *qx.QX) {
 				qx.EQ("country", "NL"),
 			),
 		),
-	).Skip(1).Max(3)
+	).Offset(1).Limit(3)
 
 	return ids, stateA, stateB, q
 }
@@ -1103,13 +1123,13 @@ func queryExtValidateNoOrderItemsAgainstFullSet(q *qx.QX, items []*Rec, fullSigC
 	}
 
 	maxLen := fullLen
-	if q.Offset >= uint64(fullLen) {
+	if q.Window.Offset >= uint64(fullLen) {
 		maxLen = 0
-	} else if q.Offset > 0 {
-		maxLen = fullLen - int(q.Offset)
+	} else if q.Window.Offset > 0 {
+		maxLen = fullLen - int(q.Window.Offset)
 	}
-	if q.Limit > 0 && int(q.Limit) < maxLen {
-		maxLen = int(q.Limit)
+	if q.Window.Limit > 0 && int(q.Window.Limit) < maxLen {
+		maxLen = int(q.Window.Limit)
 	}
 	if len(items) > maxLen {
 		return fmt.Errorf("items window overflow got=%d max=%d", len(items), maxLen)
@@ -1201,7 +1221,7 @@ func TestQueryExt_OrderedORPrefixBoundaryChurn_MatchesSeqScanAndPrepared(t *test
 				qx.EQ("active", true),
 			),
 		),
-	).By("full_name", qx.ASC).Skip(1).Max(6)
+	).Sort("full_name", qx.ASC).Offset(1).Limit(6)
 
 	check := func(step string) {
 		t.Run(step, func(t *testing.T) {
@@ -1251,7 +1271,7 @@ func TestQueryExt_ConcurrentAtomicBatchSetSnapshotConsistency_OnOrderedORNegativ
 		t.Fatalf("Query(stateA): %v", err)
 	}
 	namesA := queryExtItemNames(t, itemsA)
-	countA, err := db.Count(q)
+	countA, err := db.Count(q.Filter)
 	if err != nil {
 		t.Fatalf("Count(stateA): %v", err)
 	}
@@ -1268,7 +1288,7 @@ func TestQueryExt_ConcurrentAtomicBatchSetSnapshotConsistency_OnOrderedORNegativ
 		t.Fatalf("Query(stateB): %v", err)
 	}
 	namesB := queryExtItemNames(t, itemsB)
-	countB, err := db.Count(q)
+	countB, err := db.Count(q.Filter)
 	if err != nil {
 		t.Fatalf("Count(stateB): %v", err)
 	}
@@ -1333,7 +1353,7 @@ func TestQueryExt_ConcurrentAtomicBatchSetSnapshotConsistency_OnOrderedORNegativ
 					return
 				}
 
-				gotCount, err := db.Count(q)
+				gotCount, err := db.Count(q.Filter)
 				if err != nil {
 					errCh <- fmt.Errorf("g=%d i=%d Count: %w", gid, i, err)
 					return
@@ -1422,7 +1442,7 @@ func TestQueryExt_ConcurrentWriter_RootExecPreparedQuery_OnOrderedORNegativeResi
 			defer wg.Done()
 			<-start
 			for i := 0; i < 480; i++ {
-				got, err := db.execPreparedQuery(nq)
+				got, err := execPreparedQueryExt(db, nq)
 				if err != nil {
 					select {
 					case errCh <- fmt.Errorf("execPreparedQuery: %w", err):
@@ -1478,7 +1498,7 @@ func TestQueryExt_StringKeys_ConcurrentAtomicBatchSetSnapshotConsistency_OnOrder
 		t.Fatalf("Query(stateA): %v", err)
 	}
 	namesA := queryExtItemNames(t, itemsA)
-	countA, err := db.Count(q)
+	countA, err := db.Count(q.Filter)
 	if err != nil {
 		t.Fatalf("Count(stateA): %v", err)
 	}
@@ -1495,7 +1515,7 @@ func TestQueryExt_StringKeys_ConcurrentAtomicBatchSetSnapshotConsistency_OnOrder
 		t.Fatalf("Query(stateB): %v", err)
 	}
 	namesB := queryExtItemNames(t, itemsB)
-	countB, err := db.Count(q)
+	countB, err := db.Count(q.Filter)
 	if err != nil {
 		t.Fatalf("Count(stateB): %v", err)
 	}
@@ -1555,7 +1575,7 @@ func TestQueryExt_StringKeys_ConcurrentAtomicBatchSetSnapshotConsistency_OnOrder
 					return
 				}
 
-				gotCount, err := db.Count(q)
+				gotCount, err := db.Count(q.Filter)
 				if err != nil {
 					errCh <- fmt.Errorf("g=%d i=%d Count: %w", gid, i, err)
 					return
@@ -1639,7 +1659,7 @@ func TestQueryExt_StringKeys_ConcurrentWriter_RootExecPreparedQuery_OnOrderedOR_
 			defer wg.Done()
 			<-start
 			for i := 0; i < 480; i++ {
-				got, err := db.execPreparedQuery(nq)
+				got, err := execPreparedQueryExt(db, nq)
 				if err != nil {
 					select {
 					case errCh <- fmt.Errorf("execPreparedQuery: %w", err):
@@ -1693,7 +1713,7 @@ func TestQueryExt_RefreshPlannerStatsDuringRuntimeFallbackEligibleOrderedOR_AllR
 				),
 				qx.PREFIX("full_name", "FN-1"),
 			),
-		).By("age", qx.ASC).Skip(140).Max(120),
+		).Sort("age", qx.ASC).Offset(140).Limit(120),
 	)
 
 	wantKeys, err := expectedKeysUint64(t, db, q)
@@ -1706,9 +1726,8 @@ func TestQueryExt_RefreshPlannerStatsDuringRuntimeFallbackEligibleOrderedOR_AllR
 	}
 	baseQ := cloneQuery(q)
 	baseQ.Order = nil
-	baseQ.Offset = 0
-	baseQ.Limit = 0
-	wantCount, err := db.Count(baseQ)
+	clearQueryExtOrderWindow(baseQ)
+	wantCount, err := db.Count(baseQ.Filter)
 	if err != nil {
 		t.Fatalf("Count(baseQ): %v", err)
 	}
@@ -1751,7 +1770,7 @@ func TestQueryExt_RefreshPlannerStatsDuringRuntimeFallbackEligibleOrderedOR_AllR
 					}
 				}
 
-				gotCount, err := db.Count(q)
+				gotCount, err := db.Count(q.Filter)
 				if err != nil {
 					errCh <- fmt.Errorf("g=%d i=%d Count: %w", gid, i, err)
 					return
@@ -1761,7 +1780,7 @@ func TestQueryExt_RefreshPlannerStatsDuringRuntimeFallbackEligibleOrderedOR_AllR
 					return
 				}
 
-				gotPrepared, err := db.execPreparedQuery(nq)
+				gotPrepared, err := execPreparedQueryExt(db, nq)
 				if err != nil {
 					errCh <- fmt.Errorf("g=%d i=%d execPreparedQuery: %w", gid, i, err)
 					return
@@ -1813,8 +1832,7 @@ func TestQueryExt_ConcurrentAtomicBatchSetSnapshotConsistency_OnNoOrderORWindow_
 	}
 
 	fullQ := cloneQuery(q)
-	fullQ.Offset = 0
-	fullQ.Limit = 0
+	clearQueryExtOrderWindow(fullQ)
 
 	if err := setState(stateA); err != nil {
 		t.Fatalf("BatchSet(stateA): %v", err)
@@ -1828,7 +1846,7 @@ func TestQueryExt_ConcurrentAtomicBatchSetSnapshotConsistency_OnNoOrderORWindow_
 		t.Fatalf("BatchGet(fullA): %v", err)
 	}
 	sigsAFull := queryExtBuildSignatureCounts(itemsAFull)
-	countA, err := db.Count(q)
+	countA, err := db.Count(q.Filter)
 	if err != nil {
 		t.Fatalf("Count(stateA): %v", err)
 	}
@@ -1845,7 +1863,7 @@ func TestQueryExt_ConcurrentAtomicBatchSetSnapshotConsistency_OnNoOrderORWindow_
 		t.Fatalf("BatchGet(fullB): %v", err)
 	}
 	sigsBFull := queryExtBuildSignatureCounts(itemsBFull)
-	countB, err := db.Count(q)
+	countB, err := db.Count(q.Filter)
 	if err != nil {
 		t.Fatalf("Count(stateB): %v", err)
 	}
@@ -1919,7 +1937,7 @@ func TestQueryExt_ConcurrentAtomicBatchSetSnapshotConsistency_OnNoOrderORWindow_
 					return
 				}
 
-				gotCount, err := db.Count(q)
+				gotCount, err := db.Count(q.Filter)
 				if err != nil {
 					errCh <- fmt.Errorf("g=%d i=%d Count: %w", gid, i, err)
 					return
@@ -1929,7 +1947,7 @@ func TestQueryExt_ConcurrentAtomicBatchSetSnapshotConsistency_OnNoOrderORWindow_
 					return
 				}
 
-				gotPrepared, err := db.execPreparedQuery(nq)
+				gotPrepared, err := execPreparedQueryExt(db, nq)
 				if err != nil {
 					errCh <- fmt.Errorf("g=%d i=%d execPreparedQuery: %w", gid, i, err)
 					return
@@ -1957,8 +1975,7 @@ func TestQueryExt_RefreshPlannerStatsDuringAdversarialNoOrderOR_AllReadPathsStay
 	q := plannerExtQueryAdversarialNoOrderNegativeResidualOverlap()
 
 	fullQ := cloneQuery(q)
-	fullQ.Offset = 0
-	fullQ.Limit = 0
+	clearQueryExtOrderWindow(fullQ)
 	full, err := expectedKeysUint64(t, db, fullQ)
 	if err != nil {
 		t.Fatalf("expectedKeysUint64(full %+v): %v", fullQ, err)
@@ -2008,7 +2025,7 @@ func TestQueryExt_RefreshPlannerStatsDuringAdversarialNoOrderOR_AllReadPathsStay
 					return
 				}
 
-				gotCount, err := db.Count(q)
+				gotCount, err := db.Count(q.Filter)
 				if err != nil {
 					errCh <- fmt.Errorf("g=%d i=%d Count: %w", gid, i, err)
 					return
@@ -2018,7 +2035,7 @@ func TestQueryExt_RefreshPlannerStatsDuringAdversarialNoOrderOR_AllReadPathsStay
 					return
 				}
 
-				gotPrepared, err := db.execPreparedQuery(nq)
+				gotPrepared, err := execPreparedQueryExt(db, nq)
 				if err != nil {
 					errCh <- fmt.Errorf("g=%d i=%d execPreparedQuery: %w", gid, i, err)
 					return
@@ -2259,15 +2276,15 @@ func TestQueryExt_OrderBasicPointerBounds_DoNotLeakNilTail(t *testing.T) {
 	}{
 		{
 			name: "gt_asc",
-			q:    qx.Query(qx.GT("opt", "aa")).By("opt", qx.ASC).Max(8),
+			q:    qx.Query(qx.GT("opt", "aa")).Sort("opt", qx.ASC).Limit(8),
 		},
 		{
 			name: "lte_active_desc",
-			q:    qx.Query(qx.LTE("opt", "aa"), qx.EQ("active", true)).By("opt", qx.DESC).Max(8),
+			q:    qx.Query(qx.LTE("opt", "aa"), qx.EQ("active", true)).Sort("opt", qx.DESC).Limit(8),
 		},
 		{
 			name: "gte_window",
-			q:    qx.Query(qx.GTE("opt", "ab")).By("opt", qx.ASC).Skip(1).Max(2),
+			q:    qx.Query(qx.GTE("opt", "ab")).Sort("opt", qx.ASC).Offset(1).Limit(2),
 		},
 	}
 
@@ -2324,21 +2341,21 @@ func TestQueryExt_PrefixRangeIntersections_StayExactAcrossBoundaryChurn(t *testi
 				qx.PREFIX("name", "aa/"),
 				qx.GTE("name", "aa/0"),
 				qx.LT("name", "aa0"),
-			).By("name", qx.ASC).Max(10),
+			).Sort("name", qx.ASC).Limit(10),
 		},
 		{
 			name: "prefix_singleton_upper_edge",
 			q: qx.Query(
 				qx.PREFIX("name", "aa/"),
 				qx.LTE("name", "aa/"),
-			).By("name", qx.ASC).Max(10),
+			).Sort("name", qx.ASC).Limit(10),
 		},
 		{
 			name: "prefix_empty_after_crossing_upper",
 			q: qx.Query(
 				qx.PREFIX("name", "aa/"),
 				qx.GTE("name", "aa0"),
-			).By("name", qx.ASC).Max(10),
+			).Sort("name", qx.ASC).Limit(10),
 		},
 		{
 			name: "bounded_prefix_desc_window",
@@ -2346,7 +2363,7 @@ func TestQueryExt_PrefixRangeIntersections_StayExactAcrossBoundaryChurn(t *testi
 				qx.PREFIX("name", "aa/"),
 				qx.GT("name", "aa/"),
 				qx.LTE("name", "aa/zz"),
-			).By("name", qx.DESC).Skip(1).Max(3),
+			).Sort("name", qx.DESC).Offset(1).Limit(3),
 		},
 	}
 
@@ -2401,16 +2418,16 @@ func TestQueryExt_MixedCaching_NumericRangesRemainExactAcrossClearAndPublish(t *
 		qx.Query(
 			qx.LT("score", 15_000.0),
 			qx.EQ("active", true),
-		).By("age", qx.ASC).Skip(3_500).Max(80),
+		).Sort("age", qx.ASC).Offset(3_500).Limit(80),
 		qx.Query(
 			qx.LT("score", 15_001.0),
 			qx.EQ("active", true),
-		).By("age", qx.ASC).Skip(3_500).Max(80),
+		).Sort("age", qx.ASC).Offset(3_500).Limit(80),
 		qx.Query(
 			qx.GTE("score", 6_000.0),
 			qx.LT("score", 17_000.0),
 			qx.EQ("country", "US"),
-		).By("age", qx.DESC).Skip(900).Max(60),
+		).Sort("age", qx.DESC).Offset(900).Limit(60),
 	}
 
 	checkQueries := func(step string) {
@@ -2471,9 +2488,9 @@ func TestQueryExt_ConcurrentEvictingMaterializedPredicates_RemainStable(t *testi
 	}
 
 	queries := []*qx.QX{
-		qx.Query(qx.LT("score", 4_000.0)).By("age", qx.ASC).Skip(2_000).Max(40),
-		qx.Query(qx.LT("score", 4_001.0)).By("age", qx.ASC).Skip(2_000).Max(40),
-		qx.Query(qx.LT("score", 3_999.0)).By("age", qx.ASC).Skip(2_000).Max(40),
+		qx.Query(qx.LT("score", 4_000.0)).Sort("age", qx.ASC).Offset(2_000).Limit(40),
+		qx.Query(qx.LT("score", 4_001.0)).Sort("age", qx.ASC).Offset(2_000).Limit(40),
+		qx.Query(qx.LT("score", 3_999.0)).Sort("age", qx.ASC).Offset(2_000).Limit(40),
 	}
 	expects := make([]expectation, len(queries))
 	for i, q := range queries {
@@ -2487,9 +2504,8 @@ func TestQueryExt_ConcurrentEvictingMaterializedPredicates_RemainStable(t *testi
 		}
 		countQ := cloneQuery(q)
 		countQ.Order = nil
-		countQ.Offset = 0
-		countQ.Limit = 0
-		count, err := db.Count(countQ)
+		clearQueryExtOrderWindow(countQ)
+		count, err := db.Count(countQ.Filter)
 		if err != nil {
 			t.Fatalf("Count(q%d base): %v", i, err)
 		}
@@ -2544,7 +2560,7 @@ func TestQueryExt_ConcurrentEvictingMaterializedPredicates_RemainStable(t *testi
 					}
 				}
 
-				gotCount, err := db.Count(exp.q)
+				gotCount, err := db.Count(exp.q.Filter)
 				if err != nil {
 					errCh <- fmt.Errorf("g=%d i=%d Count: %w", gid, i, err)
 					return
@@ -2600,7 +2616,7 @@ func TestQueryExt_StringKeys_ConcurrentPrefixRangeSnapshotConsistency(t *testing
 		qx.GT("name", "aa/00"),
 		qx.LTE("name", "aa/zz"),
 		qx.EQ("active", true),
-	).By("name", qx.DESC).Skip(1).Max(3)
+	).Sort("name", qx.DESC).Offset(1).Limit(3)
 
 	if err := setState(stateA); err != nil {
 		t.Fatalf("BatchSet(stateA): %v", err)
@@ -2614,7 +2630,7 @@ func TestQueryExt_StringKeys_ConcurrentPrefixRangeSnapshotConsistency(t *testing
 		t.Fatalf("Query(stateA): %v", err)
 	}
 	namesA := queryExtItemNames(t, itemsA)
-	countA, err := db.Count(q)
+	countA, err := db.Count(q.Filter)
 	if err != nil {
 		t.Fatalf("Count(stateA): %v", err)
 	}
@@ -2631,7 +2647,7 @@ func TestQueryExt_StringKeys_ConcurrentPrefixRangeSnapshotConsistency(t *testing
 		t.Fatalf("Query(stateB): %v", err)
 	}
 	namesB := queryExtItemNames(t, itemsB)
-	countB, err := db.Count(q)
+	countB, err := db.Count(q.Filter)
 	if err != nil {
 		t.Fatalf("Count(stateB): %v", err)
 	}
@@ -2691,7 +2707,7 @@ func TestQueryExt_StringKeys_ConcurrentPrefixRangeSnapshotConsistency(t *testing
 					return
 				}
 
-				gotCount, err := db.Count(q)
+				gotCount, err := db.Count(q.Filter)
 				if err != nil {
 					errCh <- fmt.Errorf("g=%d i=%d Count: %w", gid, i, err)
 					return
@@ -2736,15 +2752,15 @@ func TestQueryExt_NumericRangeFieldMutation_DoesNotReuseStaleCaches(t *testing.T
 		qx.Query(
 			qx.GTE("age", 2_500),
 			qx.EQ("active", true),
-		).By("age", qx.ASC).Skip(120).Max(80),
+		).Sort("age", qx.ASC).Offset(120).Limit(80),
 		qx.Query(
 			qx.GTE("age", 2_501),
 			qx.EQ("active", true),
-		).By("age", qx.ASC).Skip(120).Max(80),
+		).Sort("age", qx.ASC).Offset(120).Limit(80),
 		qx.Query(
 			qx.GTE("age", 2_400),
 			qx.LT("age", 2_650),
-		).By("age", qx.ASC).Max(120),
+		).Sort("age", qx.ASC).Limit(120),
 	}
 
 	checkQueries := func(step string) {
@@ -2810,7 +2826,7 @@ func TestQueryExt_OrderedOROverlap_DeduplicatesAcrossMutations(t *testing.T) {
 			qx.AND(qx.PREFIX("email", "grp-b/"), qx.EQ("country", "NL")),
 			qx.AND(qx.PREFIX("email", "grp-a/"), qx.LTE("score", 15.0)),
 		),
-	).By("score", qx.DESC).Skip(10).Max(120)
+	).Sort("score", qx.DESC).Offset(10).Limit(120)
 
 	assertQueryExtraPublicReadPathsMatchExpected(t, db, q)
 
@@ -2868,21 +2884,21 @@ func TestQueryExt_OrderBasicPointerPrefixWithNegativeBaseOps_RemainsExact(t *tes
 			q: qx.Query(
 				qx.PREFIX("opt", "a"),
 				qx.NOT(qx.EQ("active", true)),
-			).By("opt", qx.ASC).Skip(1).Max(4),
+			).Sort("opt", qx.ASC).Offset(1).Limit(4),
 		},
 		{
 			name: "prefix_not_active_desc",
 			q: qx.Query(
 				qx.PREFIX("opt", "a"),
 				qx.NOT(qx.EQ("active", true)),
-			).By("opt", qx.DESC).Max(5),
+			).Sort("opt", qx.DESC).Limit(5),
 		},
 		{
 			name: "prefix_not_name",
 			q: qx.Query(
 				qx.PREFIX("opt", "a"),
 				qx.NOT(qx.EQ("name", "ax-off")),
-			).By("opt", qx.ASC).Max(6),
+			).Sort("opt", qx.ASC).Limit(6),
 		},
 	}
 
@@ -2948,7 +2964,7 @@ func TestQueryExt_ConcurrentAtomicBatchSetSnapshotConsistency_OnNumericRangeOrde
 		qx.GTE("age", 130),
 		qx.LT("age", 420),
 		qx.EQ("active", true),
-	).By("age", qx.ASC).Skip(4).Max(18)
+	).Sort("age", qx.ASC).Offset(4).Limit(18)
 
 	if err := setState(stateA); err != nil {
 		t.Fatalf("BatchSet(stateA): %v", err)
@@ -2965,7 +2981,7 @@ func TestQueryExt_ConcurrentAtomicBatchSetSnapshotConsistency_OnNumericRangeOrde
 		t.Fatalf("Query(stateA): %v", err)
 	}
 	namesA := queryExtItemNames(t, itemsA)
-	countA, err := db.Count(q)
+	countA, err := db.Count(q.Filter)
 	if err != nil {
 		t.Fatalf("Count(stateA): %v", err)
 	}
@@ -2985,7 +3001,7 @@ func TestQueryExt_ConcurrentAtomicBatchSetSnapshotConsistency_OnNumericRangeOrde
 		t.Fatalf("Query(stateB): %v", err)
 	}
 	namesB := queryExtItemNames(t, itemsB)
-	countB, err := db.Count(q)
+	countB, err := db.Count(q.Filter)
 	if err != nil {
 		t.Fatalf("Count(stateB): %v", err)
 	}
@@ -3045,7 +3061,7 @@ func TestQueryExt_ConcurrentAtomicBatchSetSnapshotConsistency_OnNumericRangeOrde
 					return
 				}
 
-				gotCount, err := db.Count(q)
+				gotCount, err := db.Count(q.Filter)
 				if err != nil {
 					errCh <- fmt.Errorf("g=%d i=%d Count: %w", gid, i, err)
 					return

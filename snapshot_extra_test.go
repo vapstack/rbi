@@ -185,7 +185,13 @@ func snapshotExtraQuerySnapshotKeys[K ~string | ~uint64](t *testing.T, db *DB[K,
 	view := db.makeQueryView(snap)
 	defer db.releaseQueryView(view)
 
-	ids, err := view.execQuery(q, false, false)
+	prepared, viewQ, err := prepareTestQuery(db, q)
+	if err != nil {
+		t.Fatalf("prepareTestQuery(snapshot query): %v", err)
+	}
+	defer prepared.Release()
+
+	ids, err := view.execQuery(&viewQ, false, false)
 	if err != nil {
 		t.Fatalf("snapshot query: %v", err)
 	}
@@ -215,16 +221,19 @@ func snapshotExtraScanSnapshotStringKeys(t *testing.T, db *DB[string, snapshotEx
 func snapshotExtraMaterializedPredCacheKey(t *testing.T, db *DB[uint64, snapshotExtraRec], e qx.Expr) string {
 	t.Helper()
 
-	view := db.makeQueryView(db.getSnapshot())
-	defer db.releaseQueryView(view)
-
-	return view.materializedPredCacheKey(e)
+	return db.materializedPredCacheKey(e)
 }
 
-func snapshotExtraQueryTxRecords(t *testing.T, db *DB[uint64, snapshotExtraRec], tx *bbolt.Tx, snap *indexSnapshot, q *qx.QX) []*snapshotExtraRec {
+func snapshotExtraQueryTxRecords[K ~string | ~uint64](t *testing.T, db *DB[K, snapshotExtraRec], tx *bbolt.Tx, snap *indexSnapshot, q *qx.QX) []*snapshotExtraRec {
 	t.Helper()
 
-	items, err := db.queryRecords(tx, snap, q)
+	prepared, viewQ, err := prepareTestQuery(db, q)
+	if err != nil {
+		t.Fatalf("prepareTestQuery(queryRecords): %v", err)
+	}
+	defer prepared.Release()
+
+	items, err := db.queryRecords(tx, snap, &viewQ)
 	if err != nil {
 		t.Fatalf("queryRecords: %v", err)
 	}
@@ -730,10 +739,7 @@ func TestSnapshotExtra_StringKeyPinnedSnapshotDoesNotSeeRealStagedFutureKey(t *t
 		t.Fatalf("beginQueryTxSnapshot pinned wrong string snapshot: seq=%d want=%d", seq, old.seq)
 	}
 
-	beforeFuture, err := db.queryRecords(tx, snap, qx.Query(qx.EQ("name", "future")))
-	if err != nil {
-		t.Fatalf("queryRecords(future before publish): %v", err)
-	}
+	beforeFuture := snapshotExtraQueryTxRecords(t, db, tx, snap, qx.Query(qx.EQ("name", "future")))
 	if len(beforeFuture) != 0 {
 		t.Fatalf("old string tx/snapshot observed staged future row: %#v", beforeFuture)
 	}
@@ -835,10 +841,7 @@ func TestSnapshotExtra_StringKeyRollbackRemovesLiveCreatedIdxAndReusesIt(t *test
 	if seq != old.seq || snap != old {
 		t.Fatalf("beginQueryTxSnapshot pinned wrong string snapshot: seq=%d want=%d", seq, old.seq)
 	}
-	beforeGhost, err := db.queryRecords(tx, snap, qx.Query(qx.EQ("name", "ghost")))
-	if err != nil {
-		t.Fatalf("queryRecords(ghost before rollback): %v", err)
-	}
+	beforeGhost := snapshotExtraQueryTxRecords(t, db, tx, snap, qx.Query(qx.EQ("name", "ghost")))
 	if len(beforeGhost) != 0 {
 		t.Fatalf("old string tx/snapshot observed ghost row before rollback: %#v", beforeGhost)
 	}
@@ -978,17 +981,11 @@ func TestSnapshotExtra_StringKeyBatchRollbackRemovesAllLiveCreatedIdxs(t *testin
 	if seq != old.seq || snap != old {
 		t.Fatalf("beginQueryTxSnapshot pinned wrong string snapshot: seq=%d want=%d", seq, old.seq)
 	}
-	beforeGhostA, err := db.queryRecords(tx, snap, qx.Query(qx.EQ("name", "ghostA")))
-	if err != nil {
-		t.Fatalf("queryRecords(ghostA before rollback): %v", err)
-	}
+	beforeGhostA := snapshotExtraQueryTxRecords(t, db, tx, snap, qx.Query(qx.EQ("name", "ghostA")))
 	if len(beforeGhostA) != 0 {
 		t.Fatalf("old string tx/snapshot observed ghostA row before rollback: %#v", beforeGhostA)
 	}
-	beforeGhostB, err := db.queryRecords(tx, snap, qx.Query(qx.EQ("name", "ghostB")))
-	if err != nil {
-		t.Fatalf("queryRecords(ghostB before rollback): %v", err)
-	}
+	beforeGhostB := snapshotExtraQueryTxRecords(t, db, tx, snap, qx.Query(qx.EQ("name", "ghostB")))
 	if len(beforeGhostB) != 0 {
 		t.Fatalf("old string tx/snapshot observed ghostB row before rollback: %#v", beforeGhostB)
 	}
@@ -1041,7 +1038,7 @@ func TestSnapshotExtra_StringKeyBatchRollbackRemovesAllLiveCreatedIdxs(t *testin
 	if liveRealAIdx != 2 || liveRealBIdx != 3 {
 		t.Fatalf("expected live real keys to reuse rolled-back idxs 2,3; got realA=%d realB=%d", liveRealAIdx, liveRealBIdx)
 	}
-	queryReal, err := db.QueryKeys(qx.Query().By("name", qx.ASC))
+	queryReal, err := db.QueryKeys(qx.Query().Sort("name", qx.ASC))
 	if err != nil {
 		t.Fatalf("QueryKeys(real recovery): %v", err)
 	}
@@ -1085,8 +1082,8 @@ func TestSnapshotExtra_MaterializedPredCacheDoesNotLeakAcrossTouchedSnapshot(t *
 	}
 
 	old := db.getSnapshot()
-	posExpr := qx.Expr{Op: qx.OpPREFIX, Field: "email", Value: "alpha"}
-	negExpr := qx.Expr{Op: qx.OpPREFIX, Field: "email", Value: "future"}
+	posExpr := qx.PREFIX("email", "alpha")
+	negExpr := qx.PREFIX("email", "future")
 
 	posKey := snapshotExtraMaterializedPredCacheKey(t, db, posExpr)
 	negKey := snapshotExtraMaterializedPredCacheKey(t, db, negExpr)
@@ -1203,12 +1200,9 @@ func TestSnapshotExtra_BeginQueryTxSnapshotUnaffectedByOtherBucketWrites(t *test
 			t.Fatalf("dbA query pinned wrong snapshot during other-bucket writes: iter=%d seq=%d want=%d", i, seq, beforeSeq)
 		}
 
-		items, err := dbA.queryRecords(tx, snap, qx.Query().By("name", qx.ASC))
+		items := snapshotExtraQueryTxRecords(t, dbA, tx, snap, qx.Query().Sort("name", qx.ASC))
 		rollback(tx)
 		dbA.unpinSnapshotRef(seq, ref)
-		if err != nil {
-			t.Fatalf("queryRecords(iter=%d): %v", i, err)
-		}
 		if len(items) != 2 || items[0] == nil || items[1] == nil || items[0].Name != "alice" || items[1].Name != "bob" {
 			t.Fatalf("dbA query drift during other-bucket writes at iter=%d: %#v", i, items)
 		}
@@ -1223,7 +1217,7 @@ func TestSnapshotExtra_BeginQueryTxSnapshotUnaffectedByOtherBucketWrites(t *test
 		t.Fatalf("dbA snapshot sequence changed due to other bucket writes: before=%d after=%d", beforeSeq, afterSeq)
 	}
 
-	keys, err := dbA.QueryKeys(qx.Query().By("name", qx.ASC))
+	keys, err := dbA.QueryKeys(qx.Query().Sort("name", qx.ASC))
 	if err != nil {
 		t.Fatalf("dbA QueryKeys(final): %v", err)
 	}
@@ -1296,7 +1290,7 @@ func TestSnapshotExtra_BeginQueryTxSnapshotIgnoresRealStagedDeleteBeforeCommit(t
 		t.Fatalf("beginQueryTxSnapshot pinned wrong snapshot: seq=%d want=%d", seq, old.seq)
 	}
 
-	beforeAll := snapshotExtraQueryTxRecords(t, db, tx, snap, qx.Query().By("name", qx.ASC))
+	beforeAll := snapshotExtraQueryTxRecords(t, db, tx, snap, qx.Query().Sort("name", qx.ASC))
 	if len(beforeAll) != 3 || beforeAll[0] == nil || beforeAll[1] == nil || beforeAll[2] == nil ||
 		beforeAll[0].Name != "alice" || beforeAll[1].Name != "bob" || beforeAll[2].Name != "carol" {
 		t.Fatalf("old tx/snapshot drifted before delete publish: %#v", beforeAll)
@@ -1314,7 +1308,7 @@ func TestSnapshotExtra_BeginQueryTxSnapshotIgnoresRealStagedDeleteBeforeCommit(t
 		t.Fatalf("Delete(2): %v", err)
 	}
 
-	oldKeys := snapshotExtraQuerySnapshotKeys(t, db, pinned, qx.Query().By("name", qx.ASC))
+	oldKeys := snapshotExtraQuerySnapshotKeys(t, db, pinned, qx.Query().Sort("name", qx.ASC))
 	if !slices.Equal(oldKeys, []uint64{1, 2, 3}) {
 		t.Fatalf("pinned old snapshot changed after delete publish: got=%v want=[1 2 3]", oldKeys)
 	}
@@ -1323,7 +1317,7 @@ func TestSnapshotExtra_BeginQueryTxSnapshotIgnoresRealStagedDeleteBeforeCommit(t
 		t.Fatalf("pinned old snapshot lost deleted row after publish: got=%v want=[2]", oldBob)
 	}
 
-	currentKeys, err := db.QueryKeys(qx.Query().By("name", qx.ASC))
+	currentKeys, err := db.QueryKeys(qx.Query().Sort("name", qx.ASC))
 	if err != nil {
 		t.Fatalf("QueryKeys(current after delete): %v", err)
 	}
@@ -1403,7 +1397,7 @@ func TestSnapshotExtra_BeginQueryTxSnapshotSurvivesRealStagedDeleteRollback(t *t
 		t.Fatalf("beginQueryTxSnapshot pinned wrong snapshot: seq=%d want=%d", seq, old.seq)
 	}
 
-	beforeAll := snapshotExtraQueryTxRecords(t, db, tx, snap, qx.Query().By("name", qx.ASC))
+	beforeAll := snapshotExtraQueryTxRecords(t, db, tx, snap, qx.Query().Sort("name", qx.ASC))
 	if len(beforeAll) != 3 || beforeAll[0] == nil || beforeAll[1] == nil || beforeAll[2] == nil ||
 		beforeAll[0].Name != "alice" || beforeAll[1].Name != "bob" || beforeAll[2].Name != "carol" {
 		t.Fatalf("old tx/snapshot drifted before delete rollback: %#v", beforeAll)
@@ -1422,12 +1416,12 @@ func TestSnapshotExtra_BeginQueryTxSnapshotSurvivesRealStagedDeleteRollback(t *t
 		t.Fatalf("rollback replaced published snapshot: got=%p want=%p", got, old)
 	}
 
-	oldKeys := snapshotExtraQuerySnapshotKeys(t, db, pinned, qx.Query().By("name", qx.ASC))
+	oldKeys := snapshotExtraQuerySnapshotKeys(t, db, pinned, qx.Query().Sort("name", qx.ASC))
 	if !slices.Equal(oldKeys, []uint64{1, 2, 3}) {
 		t.Fatalf("pinned old snapshot changed after delete rollback: got=%v want=[1 2 3]", oldKeys)
 	}
 
-	currentKeys, err := db.QueryKeys(qx.Query().By("name", qx.ASC))
+	currentKeys, err := db.QueryKeys(qx.Query().Sort("name", qx.ASC))
 	if err != nil {
 		t.Fatalf("QueryKeys(current after rollback): %v", err)
 	}
@@ -1511,7 +1505,7 @@ func TestSnapshotExtra_BeginQueryTxSnapshotIgnoresRealStagedBatchDeleteBeforeCom
 		t.Fatalf("beginQueryTxSnapshot pinned wrong snapshot: seq=%d want=%d", seq, old.seq)
 	}
 
-	beforeAll := snapshotExtraQueryTxRecords(t, db, tx, snap, qx.Query().By("name", qx.ASC))
+	beforeAll := snapshotExtraQueryTxRecords(t, db, tx, snap, qx.Query().Sort("name", qx.ASC))
 	if len(beforeAll) != 4 || beforeAll[0] == nil || beforeAll[1] == nil || beforeAll[2] == nil || beforeAll[3] == nil ||
 		beforeAll[0].Name != "alice" || beforeAll[1].Name != "bob" || beforeAll[2].Name != "carol" || beforeAll[3].Name != "dave" {
 		t.Fatalf("old tx/snapshot drifted before batch_delete publish: %#v", beforeAll)
@@ -1525,7 +1519,7 @@ func TestSnapshotExtra_BeginQueryTxSnapshotIgnoresRealStagedBatchDeleteBeforeCom
 		t.Fatalf("BatchDelete(2,2,3,3): %v", err)
 	}
 
-	oldKeys := snapshotExtraQuerySnapshotKeys(t, db, pinned, qx.Query().By("name", qx.ASC))
+	oldKeys := snapshotExtraQuerySnapshotKeys(t, db, pinned, qx.Query().Sort("name", qx.ASC))
 	if !slices.Equal(oldKeys, []uint64{1, 2, 3, 4}) {
 		t.Fatalf("pinned old snapshot changed after batch_delete publish: got=%v want=[1 2 3 4]", oldKeys)
 	}
@@ -1534,7 +1528,7 @@ func TestSnapshotExtra_BeginQueryTxSnapshotIgnoresRealStagedBatchDeleteBeforeCom
 		t.Fatalf("pinned old snapshot lost batch-deleted rows after publish: got=%v want=[2 3]", oldDeleted)
 	}
 
-	currentKeys, err := db.QueryKeys(qx.Query().By("name", qx.ASC))
+	currentKeys, err := db.QueryKeys(qx.Query().Sort("name", qx.ASC))
 	if err != nil {
 		t.Fatalf("QueryKeys(current after batch_delete): %v", err)
 	}
@@ -1615,7 +1609,7 @@ func TestSnapshotExtra_BeginQueryTxSnapshotSurvivesRealStagedBatchDeleteRollback
 		t.Fatalf("beginQueryTxSnapshot pinned wrong snapshot: seq=%d want=%d", seq, old.seq)
 	}
 
-	beforeAll := snapshotExtraQueryTxRecords(t, db, tx, snap, qx.Query().By("name", qx.ASC))
+	beforeAll := snapshotExtraQueryTxRecords(t, db, tx, snap, qx.Query().Sort("name", qx.ASC))
 	if len(beforeAll) != 4 || beforeAll[0] == nil || beforeAll[1] == nil || beforeAll[2] == nil || beforeAll[3] == nil ||
 		beforeAll[0].Name != "alice" || beforeAll[1].Name != "bob" || beforeAll[2].Name != "carol" || beforeAll[3].Name != "dave" {
 		t.Fatalf("old tx/snapshot drifted before batch_delete rollback: %#v", beforeAll)
@@ -1634,12 +1628,12 @@ func TestSnapshotExtra_BeginQueryTxSnapshotSurvivesRealStagedBatchDeleteRollback
 		t.Fatalf("rollback replaced published snapshot: got=%p want=%p", got, old)
 	}
 
-	oldKeys := snapshotExtraQuerySnapshotKeys(t, db, pinned, qx.Query().By("name", qx.ASC))
+	oldKeys := snapshotExtraQuerySnapshotKeys(t, db, pinned, qx.Query().Sort("name", qx.ASC))
 	if !slices.Equal(oldKeys, []uint64{1, 2, 3, 4}) {
 		t.Fatalf("pinned old snapshot changed after batch_delete rollback: got=%v want=[1 2 3 4]", oldKeys)
 	}
 
-	currentKeys, err := db.QueryKeys(qx.Query().By("name", qx.ASC))
+	currentKeys, err := db.QueryKeys(qx.Query().Sort("name", qx.ASC))
 	if err != nil {
 		t.Fatalf("QueryKeys(current after rollback): %v", err)
 	}
@@ -1701,7 +1695,7 @@ func TestSnapshotExtra_MultiGenerationPinnedSnapshotsRemainExactAcrossRotationAn
 
 	checkKeys := func(label string, snap *indexSnapshot, want []uint64) {
 		t.Helper()
-		got := snapshotExtraQuerySnapshotKeys(t, db, snap, qx.Query().By("name", qx.ASC))
+		got := snapshotExtraQuerySnapshotKeys(t, db, snap, qx.Query().Sort("name", qx.ASC))
 		if !slices.Equal(got, want) {
 			t.Fatalf("%s snapshot mismatch: got=%v want=%v", label, got, want)
 		}
@@ -1711,7 +1705,7 @@ func TestSnapshotExtra_MultiGenerationPinnedSnapshotsRemainExactAcrossRotationAn
 	checkKeys("B", pinnedB, []uint64{1, 2})
 	checkKeys("C", pinnedC, []uint64{2})
 
-	currentKeys, err := db.QueryKeys(qx.Query().By("name", qx.ASC))
+	currentKeys, err := db.QueryKeys(qx.Query().Sort("name", qx.ASC))
 	if err != nil {
 		t.Fatalf("QueryKeys(current): %v", err)
 	}
@@ -1846,7 +1840,7 @@ func TestSnapshotExtra_BeginQueryTxSnapshotIgnoresRealStagedTruncateBeforeCommit
 		t.Fatalf("beginQueryTxSnapshot pinned wrong snapshot: seq=%d want=%d", seq, old.seq)
 	}
 
-	beforeAll := snapshotExtraQueryTxRecords(t, db, tx, snap, qx.Query().By("name", qx.ASC))
+	beforeAll := snapshotExtraQueryTxRecords(t, db, tx, snap, qx.Query().Sort("name", qx.ASC))
 	if len(beforeAll) != 3 || beforeAll[0] == nil || beforeAll[1] == nil || beforeAll[2] == nil ||
 		beforeAll[0].Name != "alice" || beforeAll[1].Name != "bob" || beforeAll[2].Name != "carol" {
 		t.Fatalf("old tx/snapshot drifted before truncate publish: %#v", beforeAll)
@@ -1860,12 +1854,12 @@ func TestSnapshotExtra_BeginQueryTxSnapshotIgnoresRealStagedTruncateBeforeCommit
 		t.Fatalf("Truncate: %v", err)
 	}
 
-	oldKeys := snapshotExtraQuerySnapshotKeys(t, db, pinned, qx.Query().By("name", qx.ASC))
+	oldKeys := snapshotExtraQuerySnapshotKeys(t, db, pinned, qx.Query().Sort("name", qx.ASC))
 	if !slices.Equal(oldKeys, []uint64{1, 2, 3}) {
 		t.Fatalf("pinned old snapshot changed after truncate publish: got=%v want=[1 2 3]", oldKeys)
 	}
 
-	currentKeys, err := db.QueryKeys(qx.Query().By("name", qx.ASC))
+	currentKeys, err := db.QueryKeys(qx.Query().Sort("name", qx.ASC))
 	if err != nil {
 		t.Fatalf("QueryKeys(current after truncate): %v", err)
 	}
@@ -1938,7 +1932,7 @@ func TestSnapshotExtra_BeginQueryTxSnapshotSurvivesRealStagedTruncateRollback(t 
 		t.Fatalf("beginQueryTxSnapshot pinned wrong snapshot: seq=%d want=%d", seq, old.seq)
 	}
 
-	beforeAll := snapshotExtraQueryTxRecords(t, db, tx, snap, qx.Query().By("name", qx.ASC))
+	beforeAll := snapshotExtraQueryTxRecords(t, db, tx, snap, qx.Query().Sort("name", qx.ASC))
 	if len(beforeAll) != 3 || beforeAll[0] == nil || beforeAll[1] == nil || beforeAll[2] == nil ||
 		beforeAll[0].Name != "alice" || beforeAll[1].Name != "bob" || beforeAll[2].Name != "carol" {
 		t.Fatalf("old tx/snapshot drifted before truncate rollback: %#v", beforeAll)
@@ -1957,12 +1951,12 @@ func TestSnapshotExtra_BeginQueryTxSnapshotSurvivesRealStagedTruncateRollback(t 
 		t.Fatalf("rollback replaced published snapshot: got=%p want=%p", got, old)
 	}
 
-	oldKeys := snapshotExtraQuerySnapshotKeys(t, db, pinned, qx.Query().By("name", qx.ASC))
+	oldKeys := snapshotExtraQuerySnapshotKeys(t, db, pinned, qx.Query().Sort("name", qx.ASC))
 	if !slices.Equal(oldKeys, []uint64{1, 2, 3}) {
 		t.Fatalf("pinned old snapshot changed after truncate rollback: got=%v want=[1 2 3]", oldKeys)
 	}
 
-	currentKeys, err := db.QueryKeys(qx.Query().By("name", qx.ASC))
+	currentKeys, err := db.QueryKeys(qx.Query().Sort("name", qx.ASC))
 	if err != nil {
 		t.Fatalf("QueryKeys(current after rollback): %v", err)
 	}
@@ -2014,7 +2008,7 @@ func TestSnapshotExtra_DuplicatePinsOnSameRetiredSnapshotPruneOnlyOnLastUnpin(t 
 		t.Fatalf("expected publish to advance snapshot sequence")
 	}
 
-	oldKeys := snapshotExtraQuerySnapshotKeys(t, db, pinned1, qx.Query().By("name", qx.ASC))
+	oldKeys := snapshotExtraQuerySnapshotKeys(t, db, pinned1, qx.Query().Sort("name", qx.ASC))
 	if !slices.Equal(oldKeys, []uint64{1, 2}) {
 		t.Fatalf("pinned old snapshot changed after publish: got=%v want=[1 2]", oldKeys)
 	}
@@ -2033,7 +2027,7 @@ func TestSnapshotExtra_DuplicatePinsOnSameRetiredSnapshotPruneOnlyOnLastUnpin(t 
 
 	db.unpinSnapshotRef(old.seq, ref1)
 
-	stillKeys := snapshotExtraQuerySnapshotKeys(t, db, pinned2, qx.Query().By("name", qx.ASC))
+	stillKeys := snapshotExtraQuerySnapshotKeys(t, db, pinned2, qx.Query().Sort("name", qx.ASC))
 	if !slices.Equal(stillKeys, []uint64{1, 2}) {
 		t.Fatalf("remaining pin lost old snapshot view after first unpin: got=%v want=[1 2]", stillKeys)
 	}
@@ -2091,8 +2085,8 @@ func TestSnapshotExtra_PinnedOldMaterializedPredCacheSurvivesTruncateRebuild(t *
 	old := db.getSnapshot()
 	alphaQ := qx.Query(qx.PREFIX("email", "alpha"))
 	futureQ := qx.Query(qx.PREFIX("email", "future"))
-	alphaKey := snapshotExtraMaterializedPredCacheKey(t, db, qx.Expr{Op: qx.OpPREFIX, Field: "email", Value: "alpha"})
-	futureKey := snapshotExtraMaterializedPredCacheKey(t, db, qx.Expr{Op: qx.OpPREFIX, Field: "email", Value: "future"})
+	alphaKey := snapshotExtraMaterializedPredCacheKey(t, db, qx.PREFIX("email", "alpha"))
+	futureKey := snapshotExtraMaterializedPredCacheKey(t, db, qx.PREFIX("email", "future"))
 
 	oldAlpha, err := db.QueryKeys(alphaQ)
 	if err != nil {
@@ -2328,7 +2322,7 @@ func TestSnapshotExtra_PinnedOldMaterializedPredCacheStaysExactAcrossConcurrentT
 	})
 
 	old := db.getSnapshot()
-	alphaExpr := qx.Expr{Op: qx.OpPREFIX, Field: "email", Value: "alpha"}
+	alphaExpr := qx.PREFIX("email", "alpha")
 	alphaQ := qx.Query(qx.PREFIX("email", "alpha"))
 	wantOld, err := db.QueryKeys(alphaQ)
 	if err != nil {
@@ -2350,7 +2344,13 @@ func TestSnapshotExtra_PinnedOldMaterializedPredCacheStaysExactAcrossConcurrentT
 	queryPinnedAlpha := func() ([]uint64, error) {
 		view := db.makeQueryView(pinned)
 		defer db.releaseQueryView(view)
-		return view.execQuery(alphaQ, false, false)
+		prepared, viewQ, err := prepareTestQuery(db, alphaQ)
+		if err != nil {
+			return nil, err
+		}
+		out, err := view.execQuery(&viewQ, false, false)
+		prepared.Release()
+		return out, err
 	}
 
 	var failed atomic.Pointer[string]
@@ -2481,7 +2481,13 @@ func TestSnapshotExtra_PinnedOldNumericRangeCacheStaysExactAcrossConcurrentAgeCh
 	queryPinnedRange := func() ([]uint64, error) {
 		view := db.makeQueryView(pinned)
 		defer db.releaseQueryView(view)
-		return view.execQuery(rangeQ, false, false)
+		prepared, viewQ, err := prepareTestQuery(db, rangeQ)
+		if err != nil {
+			return nil, err
+		}
+		out, err := view.execQuery(&viewQ, false, false)
+		prepared.Release()
+		return out, err
 	}
 
 	var failed atomic.Pointer[string]
@@ -2813,7 +2819,7 @@ func TestSnapshotExtra_StringKeyPinnedSnapshotChainSurvivesTruncateRotationAndPr
 	checkScan("A", pinnedA, []string{"k1", "k2"})
 	checkScan("B", pinnedB, []string{"k1", "k2", "k3"})
 
-	currentKeys, err := db.QueryKeys(qx.Query().By("name", qx.ASC))
+	currentKeys, err := db.QueryKeys(qx.Query().Sort("name", qx.ASC))
 	if err != nil {
 		t.Fatalf("QueryKeys(current): %v", err)
 	}

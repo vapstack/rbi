@@ -208,10 +208,10 @@ func TestBatch_RepeatedPatchIDMaintainsIndexConsistency(t *testing.T) {
 	}
 
 	assertContains(qx.Query(qx.EQ("age", 31)), "age=31")
-	assertContains(qx.Query(qx.HAS("tags", []string{"rust"})), `tag="rust"`)
-	assertContains(qx.Query(qx.HAS("tags", []string{"db"})), `tag="db"`)
+	assertContains(qx.Query(qx.HASALL("tags", []string{"rust"})), `tag="rust"`)
+	assertContains(qx.Query(qx.HASALL("tags", []string{"db"})), `tag="db"`)
 	assertOmits(qx.Query(qx.EQ("age", 30)), "age=30")
-	assertOmits(qx.Query(qx.HAS("tags", []string{"go"})), `tag="go"`)
+	assertOmits(qx.Query(qx.HASALL("tags", []string{"go"})), `tag="go"`)
 }
 
 func TestBatch_StatsTrackBatchSizeDistribution(t *testing.T) {
@@ -1656,7 +1656,6 @@ func popQueuedSingleReqBatch[K ~string | ~uint64, V any](tb testing.TB, db *DB[K
 	db.autoBatcher.mu.Lock()
 	db.autoBatcher.window = 0
 	db.autoBatcher.maxOps = limit
-	db.autoBatcher.running = true
 	db.autoBatcher.hotUntil = time.Time{}
 	db.autoBatcher.queueHead = 0
 	db.autoBatcher.queueSize = len(reqs)
@@ -3054,13 +3053,13 @@ func TestAutoBatchExt_Race_HotSameID_AutoBatchQueryConsistency(t *testing.T) {
 					if item == nil {
 						continue
 					}
-					ok, evalErr := evalExprBool(item, q.Expr)
+					ok, evalErr := evalExprBool(item, q.Filter)
 					if evalErr != nil {
 						reportErr(fmt.Errorf("eval: %w", evalErr))
 						return
 					}
 					if !ok {
-						reportErr(fmt.Errorf("query returned inconsistent item %#v for %v", item, q.Expr))
+						reportErr(fmt.Errorf("query returned inconsistent item %#v for %v", item, q.Filter))
 						return
 					}
 				}
@@ -3243,11 +3242,11 @@ func TestAutoBatchExt_New_CoalescedSetDeleteUnique_MatchesCollapsedSequentialMod
 	compareState := func(step int, emailPool []string, codeMax int) {
 		t.Helper()
 
-		cntBatch, err := dbBatch.Count(nil)
+		cntBatch, err := dbBatch.Count()
 		if err != nil {
 			t.Fatalf("step=%d batch Count: %v", step, err)
 		}
-		cntSeq, err := dbSeq.Count(nil)
+		cntSeq, err := dbSeq.Count()
 		if err != nil {
 			t.Fatalf("step=%d seq Count: %v", step, err)
 		}
@@ -3458,11 +3457,11 @@ func TestAutoBatchExt_New_SharedPatchRetry_MatchesSequentialModel(t *testing.T) 
 	compareState := func(step int) {
 		t.Helper()
 
-		cntBatch, err := dbBatch.Count(nil)
+		cntBatch, err := dbBatch.Count()
 		if err != nil {
 			t.Fatalf("step=%d batch Count: %v", step, err)
 		}
-		cntSeq, err := dbSeq.Count(nil)
+		cntSeq, err := dbSeq.Count()
 		if err != nil {
 			t.Fatalf("step=%d seq Count: %v", step, err)
 		}
@@ -3791,13 +3790,13 @@ func TestAutoBatchExt_New_Race_HotPatchHooks_QueryConsistency(t *testing.T) {
 					if item == nil {
 						continue
 					}
-					ok, evalErr := evalExprBool(item, q.Expr)
+					ok, evalErr := evalExprBool(item, q.Filter)
 					if evalErr != nil {
 						reportErr(fmt.Errorf("eval: %w", evalErr))
 						return
 					}
 					if !ok {
-						reportErr(fmt.Errorf("query returned inconsistent item %#v for %v", item, q.Expr))
+						reportErr(fmt.Errorf("query returned inconsistent item %#v for %v", item, q.Filter))
 						return
 					}
 				}

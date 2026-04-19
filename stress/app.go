@@ -1052,7 +1052,7 @@ func averageTPS(completed uint64, startedAt, now time.Time, paused uint64, worke
 }
 
 func currentRecordCount(db *rbi.DB[uint64, UserBench]) uint64 {
-	count, err := db.Count(nil)
+	count, err := db.Count()
 	if err != nil {
 		return 0
 	}

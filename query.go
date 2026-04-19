@@ -5,8 +5,8 @@ import (
 	"unsafe"
 
 	"github.com/vapstack/qx"
-	"github.com/vapstack/rbi/internal/normalize"
 	"github.com/vapstack/rbi/internal/posting"
+	"github.com/vapstack/rbi/internal/qir"
 	"go.etcd.io/bbolt"
 )
 
@@ -23,9 +23,12 @@ func (db *DB[K, V]) Query(q *qx.QX) ([]*V, error) {
 	if q == nil {
 		return nil, fmt.Errorf("QX is nil")
 	}
-	if len(q.Order) > 1 {
-		return nil, fmt.Errorf("rbi does not support multi-column ordering")
+	prepared, err := db.prepareQuery(q)
+	if err != nil {
+		return nil, err
 	}
+	defer prepared.Release()
+	viewQ := qir.NewShape(prepared)
 
 	tx, snap, seq, ref, err := db.beginQueryTxSnapshot()
 	if err != nil {
@@ -34,22 +37,22 @@ func (db *DB[K, V]) Query(q *qx.QX) ([]*V, error) {
 	defer db.unpinSnapshotRef(seq, ref)
 	defer rollback(tx)
 
-	return db.queryRecords(tx, snap, q)
+	return db.queryRecords(tx, snap, &viewQ)
 }
 
-func (qv *queryView[K, V]) tryQueryEmptyOnSnapshot(q *qx.QX) (bool, error) {
-	if q == nil || q.Offset != 0 || q.Limit != 0 || len(q.Order) != 0 {
+func (qv *queryView[K, V]) tryQueryEmptyOnSnapshot(q *qir.Shape) (bool, error) {
+	if q == nil || q.Offset != 0 || q.Limit != 0 || q.HasOrder {
 		return false, nil
 	}
 
 	e := q.Expr
-	if e.Not || e.Field == "" || len(e.Operands) != 0 {
+	if e.Not || e.FieldOrdinal < 0 || len(e.Operands) != 0 {
 		return false, nil
 	}
 
 	switch e.Op {
-	case qx.OpEQ:
-		fm := qv.fields[e.Field]
+	case qir.OpEQ:
+		fm := qv.fieldMetaByExpr(e)
 		if fm == nil || fm.Slice {
 			return false, nil
 		}
@@ -61,12 +64,12 @@ func (qv *queryView[K, V]) tryQueryEmptyOnSnapshot(q *qx.QX) (bool, error) {
 			return false, nil
 		}
 		if isNil {
-			return qv.nilFieldOverlay(e.Field).lookupCardinality(nilIndexEntryKey) == 0, nil
+			return qv.nilFieldOverlayForExpr(e).lookupCardinality(nilIndexEntryKey) == 0, nil
 		}
-		return qv.fieldOverlay(e.Field).lookupCardinality(key) == 0, nil
+		return qv.fieldOverlayForExpr(e).lookupCardinality(key) == 0, nil
 
-	case qx.OpGT, qx.OpGTE, qx.OpLT, qx.OpLTE, qx.OpPREFIX:
-		fm := qv.fields[e.Field]
+	case qir.OpGT, qir.OpGTE, qir.OpLT, qir.OpLTE, qir.OpPREFIX:
+		fm := qv.fieldMetaByExpr(e)
 		if fm == nil || fm.Slice {
 			return false, nil
 		}
@@ -83,7 +86,7 @@ func (qv *queryView[K, V]) tryQueryEmptyOnSnapshot(q *qx.QX) (bool, error) {
 		if bounds.empty {
 			return true, nil
 		}
-		ov := qv.fieldOverlay(e.Field)
+		ov := qv.fieldOverlayForExpr(e)
 		if !ov.hasData() {
 			return true, nil
 		}
@@ -127,7 +130,7 @@ func (db *DB[K, V]) beginQueryTxSnapshot() (*bbolt.Tx, *indexSnapshot, uint64, *
 	return tx, snap, seq, ref, nil
 }
 
-func (db *DB[K, V]) queryRecords(tx *bbolt.Tx, snap *indexSnapshot, q *qx.QX) ([]*V, error) {
+func (db *DB[K, V]) queryRecords(tx *bbolt.Tx, snap *indexSnapshot, q *qir.Shape) ([]*V, error) {
 	view := db.makeQueryView(snap)
 	defer db.releaseQueryView(view)
 
@@ -195,9 +198,12 @@ func (db *DB[K, V]) QueryKeys(q *qx.QX) ([]K, error) {
 	if q == nil {
 		return nil, fmt.Errorf("QX is nil")
 	}
-	if len(q.Order) > 1 {
-		return nil, fmt.Errorf("rbi does not support multi-column ordering")
+	prepared, err := db.prepareQuery(q)
+	if err != nil {
+		return nil, err
 	}
+	defer prepared.Release()
+	viewQ := qir.NewShape(prepared)
 
 	snap, seq, ref, pinned := db.pinCurrentSnapshot()
 	defer db.unpinCurrentSnapshot(seq, ref, pinned)
@@ -205,12 +211,12 @@ func (db *DB[K, V]) QueryKeys(q *qx.QX) ([]K, error) {
 	view := db.makeQueryView(snap)
 	defer db.releaseQueryView(view)
 
-	return view.execQuery(q, true, false)
+	return view.execQuery(&viewQ, true, false)
 }
 
 // execPreparedQuery skips normalize/field-validation and tracing for internal
 // callers that already operate on validated/normalized QX.
-func (db *DB[K, V]) execPreparedQuery(q *qx.QX) ([]K, error) {
+func (db *DB[K, V]) execPreparedQuery(q *qir.Shape) ([]K, error) {
 	snap, seq, ref, pinned := db.pinCurrentSnapshot()
 	defer db.unpinCurrentSnapshot(seq, ref, pinned)
 
@@ -220,12 +226,12 @@ func (db *DB[K, V]) execPreparedQuery(q *qx.QX) ([]K, error) {
 	return view.execPreparedQuery(q)
 }
 
-func shouldSkipPlannerForArrayOrderShape(q *qx.QX) bool {
-	if q == nil || len(q.Order) != 1 {
+func shouldSkipPlannerForArrayOrderShape(q *qir.Shape) bool {
+	if q == nil || !q.HasOrder {
 		return false
 	}
-	switch q.Order[0].Type {
-	case qx.OrderByArrayPos, qx.OrderByArrayCount:
+	switch q.Order.Kind {
+	case qir.OrderKindArrayPos, qir.OrderKindArrayCount:
 		return true
 	default:
 		return false
@@ -301,7 +307,7 @@ func (qv *queryView[K, V]) materializeNegativeResultKeysExcluding(exclude postin
 	return out
 }
 
-func (qv *queryView[K, V]) execPreparedQuery(q *qx.QX) ([]K, error) {
+func (qv *queryView[K, V]) execPreparedQuery(q *qir.Shape) ([]K, error) {
 	return qv.execQuery(q, false, true)
 }
 
@@ -309,7 +315,7 @@ func (qv *queryView[K, V]) execPreparedQuery(q *qx.QX) ([]K, error) {
 //
 // The method keeps all routing decisions in one place so fast-path/planner
 // selection remains consistent across QueryKeys and Query callers.
-func (qv *queryView[K, V]) execQuery(q *qx.QX, emitTrace bool, prepared bool) (out []K, err error) {
+func (qv *queryView[K, V]) execQuery(q *qir.Shape, emitTrace bool, prepared bool) (out []K, err error) {
 	traceEnabled := emitTrace && qv.root.traceOrCalibrationSamplingEnabled()
 
 	if !prepared && !traceEnabled {
@@ -330,23 +336,11 @@ func (qv *queryView[K, V]) execQuery(q *qx.QX, emitTrace bool, prepared bool) (o
 		}
 	}
 
-	// Normalization is intentionally skipped for pre-normalized internal calls
-	// to avoid duplicate AST rewrites in hot paths.
-	if !prepared {
-		q = normalize.Query(q)
-	}
-
 	var trace *queryTrace
 	if traceEnabled {
-		trace = qv.root.beginTrace(q)
+		trace = qv.root.beginTrace(*q)
 		if trace != nil {
 			defer finishQueryTrace[K, V](trace, &out, &err)
-		}
-	}
-
-	if !prepared {
-		if err = qv.checkUsedQuery(q); err != nil {
-			return nil, err
 		}
 	}
 
@@ -416,7 +410,7 @@ func (qv *queryView[K, V]) execQuery(q *qx.QX, emitTrace bool, prepared bool) (o
 	need := q.Limit
 
 	// case 1: no ordering, negative result: iterate over universe excluding the result set
-	if len(q.Order) == 0 && result.neg {
+	if !q.HasOrder && result.neg {
 		if !qv.strkey && needAll && skip == 0 &&
 			shouldMaterializeNegativeAllNumericKeys(qv.snapshotUniverseCardinality(), result.ids.Cardinality()) {
 			ids := qv.materializeNegativeResultKeysExcluding(result.ids)
@@ -445,34 +439,35 @@ func (qv *queryView[K, V]) execQuery(q *qx.QX, emitTrace bool, prepared bool) (o
 	}
 
 	// case 2: ordering
-	if len(q.Order) > 0 {
-		order := q.Order[0]
+	if q.HasOrder {
+		order := q.Order
+		orderField := qv.fieldNameByOrder(order)
 
-		switch order.Type {
+		switch order.Kind {
 
-		case qx.OrderByArrayPos:
-			ov := qv.fieldOverlay(order.Field)
-			if !ov.hasData() && !qv.hasIndexedField(order.Field) {
-				return nil, fmt.Errorf("cannot sort non-indexed field: %v", order.Field)
+		case qir.OrderKindArrayPos:
+			ov := qv.fieldOverlayForOrder(order)
+			if !ov.hasData() && !qv.hasIndexedFieldForOrder(order) {
+				return nil, fmt.Errorf("cannot sort non-indexed field: %v", orderField)
 			}
 			return qv.queryOrderArrayPosOverlay(result, ov, order, skip, need, needAll)
 
-		case qx.OrderByArrayCount:
-			lenOV := qv.lenFieldOverlay(order.Field)
-			useZeroComplement := qv.isLenZeroComplementField(order.Field)
-			if !lenOV.hasData() && !qv.hasIndexedLenField(order.Field) {
-				return nil, fmt.Errorf("cannot sort non-indexed field: %v", order.Field)
+		case qir.OrderKindArrayCount:
+			lenOV := qv.lenFieldOverlayForOrder(order)
+			useZeroComplement := qv.isLenZeroComplementForOrder(order)
+			if !lenOV.hasData() && !qv.hasIndexedLenField(orderField) {
+				return nil, fmt.Errorf("cannot sort non-indexed field: %v", orderField)
 			}
-			slice := qv.snapshotLenFieldIndexSlice(order.Field)
+			slice := qv.snapshotLenFieldIndexSliceForOrder(order)
 			if slice == nil {
-				return nil, fmt.Errorf("cannot sort non-indexed field: %v", order.Field)
+				return nil, fmt.Errorf("cannot sort non-indexed field: %v", orderField)
 			}
 			return qv.queryOrderArrayCount(result, *slice, order, skip, need, needAll, useZeroComplement)
 		}
 
-		ov := qv.fieldOverlay(order.Field)
-		if !ov.hasData() && !qv.hasIndexedField(order.Field) {
-			return nil, fmt.Errorf("cannot sort non-indexed field: %v", order.Field)
+		ov := qv.fieldOverlayForOrder(order)
+		if !ov.hasData() && !qv.hasIndexedFieldForOrder(order) {
+			return nil, fmt.Errorf("cannot sort non-indexed field: %v", orderField)
 		}
 		return qv.queryOrderBasic(result, ov, order, skip, need, needAll)
 	}

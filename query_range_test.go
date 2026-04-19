@@ -97,32 +97,38 @@ func TestNumericRangeBucketSpanCache_LoadExtendedFullSpan(t *testing.T) {
 func warmNumericRangeBucketEntry(t *testing.T, db *DB[uint64, Rec], expr qx.Expr) (*numericRangeBucketCacheEntry, overlayRange) {
 	t.Helper()
 
-	fm := db.fields[expr.Field]
-	if fm == nil {
-		t.Fatalf("expected %s field metadata", expr.Field)
+	prepared, compiled, err := prepareTestExpr(db, expr)
+	if err != nil {
+		t.Fatalf("prepareTestExpr(%+v): %v", expr, err)
 	}
-	ov := db.fieldOverlay(expr.Field)
+	defer prepared.Release()
+	field := db.fieldNameByOrdinal(compiled.FieldOrdinal)
+	fm := db.fields[field]
+	if fm == nil {
+		t.Fatalf("expected %s field metadata", field)
+	}
+	ov := db.fieldOverlay(field)
 	if !ov.hasData() {
-		t.Fatalf("expected %s overlay data", expr.Field)
+		t.Fatalf("expected %s overlay data", field)
 	}
 	key, isSlice, isNil, err := db.exprValueToIdxScalar(expr)
 	if err != nil {
-		t.Fatalf("exprValueToIdxScalar(%s): %v", expr.Field, err)
+		t.Fatalf("exprValueToIdxScalar(%s): %v", field, err)
 	}
 	if isSlice || isNil {
-		t.Fatalf("unexpected scalar flags for %s: isSlice=%v isNil=%v", expr.Field, isSlice, isNil)
+		t.Fatalf("unexpected scalar flags for %s: isSlice=%v isNil=%v", field, isSlice, isNil)
 	}
-	rb, ok := rangeBoundsForOp(expr.Op, key)
+	rb, ok := rangeBoundsForOp(compiled.Op, key)
 	if !ok {
-		t.Fatalf("rangeBoundsForOp(%v) failed", expr.Op)
+		t.Fatalf("rangeBoundsForOp(%v) failed", compiled.Op)
 	}
 	br := ov.rangeForBounds(rb)
-	out, ok := db.tryEvalNumericRangeBuckets(expr.Field, fm, ov, br)
+	out, ok := db.tryEvalNumericRangeBuckets(field, fm, ov, br)
 	if !ok {
-		t.Fatalf("expected numeric range bucket path for %s", expr.Field)
+		t.Fatalf("expected numeric range bucket path for %s", field)
 	}
 	out.release()
-	return requireNumericRangeBucketCacheEntry(t, db.getSnapshot(), expr.Field), br
+	return requireNumericRangeBucketCacheEntry(t, db.getSnapshot(), field), br
 }
 
 func TestEvalSimple_NumericRangeBuckets_MatchClassicPath(t *testing.T) {
@@ -140,11 +146,7 @@ func TestEvalSimple_NumericRangeBuckets_MatchClassicPath(t *testing.T) {
 	if err := db.RebuildIndex(); err != nil {
 		t.Fatalf("RebuildIndex: %v", err)
 	}
-	expr := qx.Expr{
-		Op:    qx.OpGTE,
-		Field: "age",
-		Value: 2_500,
-	}
+	expr := qx.GTE("age", 2_500)
 
 	// Baseline: force classic per-key range scan by requiring an unrealistically
 	// large span for bucket routing.
@@ -195,11 +197,7 @@ func TestEvalSimple_NumericRangeBuckets_WorksAfterPatches(t *testing.T) {
 		}
 	}
 
-	expr := qx.Expr{
-		Op:    qx.OpGTE,
-		Field: "age",
-		Value: 7_500,
-	}
+	expr := qx.GTE("age", 7_500)
 
 	// Enabled bucket mode should remain exact after recent mutations.
 	setNumericBucketKnobs(t, db, 128, 1, 1)
@@ -248,13 +246,13 @@ func TestCount_NumericRangeBuckets_MatchClassicPath(t *testing.T) {
 	)
 
 	setNumericBucketKnobs(t, db, 128, 1, 1<<30)
-	baseline, err := db.Count(q)
+	baseline, err := db.Count(q.Filter)
 	if err != nil {
 		t.Fatalf("Count baseline: %v", err)
 	}
 
 	setNumericBucketKnobs(t, db, 128, 1, 1)
-	got, err := db.Count(q)
+	got, err := db.Count(q.Filter)
 	if err != nil {
 		t.Fatalf("Count with buckets: %v", err)
 	}
@@ -299,13 +297,13 @@ func TestCount_NumericRangeBuckets_WorksAfterPatches(t *testing.T) {
 	)
 
 	setNumericBucketKnobs(t, db, 128, 1, 1<<30)
-	baseline, err := db.Count(q)
+	baseline, err := db.Count(q.Filter)
 	if err != nil {
 		t.Fatalf("Count baseline: %v", err)
 	}
 
 	setNumericBucketKnobs(t, db, 128, 1, 1)
-	got, err := db.Count(q)
+	got, err := db.Count(q.Filter)
 	if err != nil {
 		t.Fatalf("Count with buckets: %v", err)
 	}
@@ -332,7 +330,7 @@ func TestEvalSimple_NumericRangeBuckets_WorkWithoutPredicateCacheWhenReuseEnable
 	}
 	setNumericBucketKnobs(t, db, 128, 1, 1)
 
-	expr := qx.Expr{Op: qx.OpGTE, Field: "age", Value: 2_500}
+	expr := qx.GTE("age", 2_500)
 	snap := db.getSnapshot()
 	if snap.numericRangeBucketCache == nil {
 		t.Fatalf("expected numeric range bucket cache when reuse is enabled")
@@ -379,7 +377,7 @@ func TestNumericRangeBucketCache_InheritsSafeEntriesAcrossSnapshotsWhenFieldInde
 	}
 
 	setNumericBucketKnobs(t, db, 128, 1, 1)
-	entry1, _ := warmNumericRangeBucketEntry(t, db, qx.Expr{Op: qx.OpGTE, Field: "age", Value: 2_000})
+	entry1, _ := warmNumericRangeBucketEntry(t, db, qx.GTE("age", 2_000))
 
 	snap1 := db.getSnapshot()
 	if snap1.numericRangeBucketCache == nil {
@@ -428,7 +426,7 @@ func TestNumericRangeBucketCache_DropsChangedFieldEntryAcrossSnapshots(t *testin
 	}
 
 	setNumericBucketKnobs(t, db, 128, 1, 1)
-	entry1, _ := warmNumericRangeBucketEntry(t, db, qx.Expr{Op: qx.OpGTE, Field: "age", Value: 2_000})
+	entry1, _ := warmNumericRangeBucketEntry(t, db, qx.GTE("age", 2_000))
 
 	snap1 := db.getSnapshot()
 	storage1, ok := snap1.fieldIndexStorage("age")
@@ -451,7 +449,7 @@ func TestNumericRangeBucketCache_DropsChangedFieldEntryAcrossSnapshots(t *testin
 		t.Fatalf("expected changed numeric field cache entry to be dropped on inherited snapshot")
 	}
 
-	warmNumericRangeBucketEntry(t, db, qx.Expr{Op: qx.OpGTE, Field: "age", Value: 2_000})
+	warmNumericRangeBucketEntry(t, db, qx.GTE("age", 2_000))
 
 	snap3 := db.getSnapshot()
 	entry3 := requireNumericRangeBucketCacheEntry(t, snap3, "age")
@@ -492,7 +490,7 @@ func TestNumericRangeBucketSpanCache_ReusedForNearbyBounds(t *testing.T) {
 
 	makeRange := func(v int) overlayRange {
 		t.Helper()
-		key, isSlice, isNil, err := db.exprValueToIdxScalar(qx.Expr{Op: qx.OpGTE, Field: "age", Value: v})
+		key, isSlice, isNil, err := db.exprValueToIdxScalar(qx.GTE("age", v))
 		if err != nil {
 			t.Fatalf("exprValueToIdxScalar(%d): %v", v, err)
 		}
@@ -569,7 +567,7 @@ func TestNumericRangeBucketSpanCache_ReusedFullSpanStillMergesEdgeBuckets(t *tes
 
 	makeRange := func(v int) overlayRange {
 		t.Helper()
-		key, isSlice, isNil, err := db.exprValueToIdxScalar(qx.Expr{Op: qx.OpGTE, Field: "age", Value: v})
+		key, isSlice, isNil, err := db.exprValueToIdxScalar(qx.GTE("age", v))
 		if err != nil {
 			t.Fatalf("exprValueToIdxScalar(%d): %v", v, err)
 		}
@@ -615,14 +613,14 @@ func TestNumericRangeBucketSpanCache_ReusedFullSpanStillMergesEdgeBuckets(t *tes
 	got2 := bitmapToIDs(t, out2)
 	out2.release()
 
-	want1, err := db.evalSimple(qx.Expr{Op: qx.OpGTE, Field: "age", Value: 2500})
+	want1, err := db.evalSimple(qx.GTE("age", 2500))
 	if err != nil {
 		t.Fatalf("evalSimple(first): %v", err)
 	}
 	want1IDs := bitmapToIDs(t, want1)
 	want1.release()
 
-	want2, err := db.evalSimple(qx.Expr{Op: qx.OpGTE, Field: "age", Value: 2501})
+	want2, err := db.evalSimple(qx.GTE("age", 2501))
 	if err != nil {
 		t.Fatalf("evalSimple(second): %v", err)
 	}
@@ -665,7 +663,7 @@ func TestNumericRangeBucketSpanCache_ExtendedSuffixSpanStillMatchesRange(t *test
 
 	makeRange := func(v int) overlayRange {
 		t.Helper()
-		key, isSlice, isNil, err := db.exprValueToIdxScalar(qx.Expr{Op: qx.OpGTE, Field: "age", Value: v})
+		key, isSlice, isNil, err := db.exprValueToIdxScalar(qx.GTE("age", v))
 		if err != nil {
 			t.Fatalf("exprValueToIdxScalar(%d): %v", v, err)
 		}
@@ -706,7 +704,7 @@ func TestNumericRangeBucketSpanCache_ExtendedSuffixSpanStillMatchesRange(t *test
 	gotWide := bitmapToIDs(t, outWide)
 	outWide.release()
 
-	wantWide, err := db.evalSimple(qx.Expr{Op: qx.OpGTE, Field: "age", Value: 2000})
+	wantWide, err := db.evalSimple(qx.GTE("age", 2000))
 	if err != nil {
 		t.Fatalf("evalSimple(wide): %v", err)
 	}
@@ -736,7 +734,7 @@ func TestNumericRangeBucketSpanCache_PredicateReleaseKeepsSharedPosting_Base(t *
 
 	setNumericBucketKnobs(t, db, 128, 1, 1)
 
-	expr := qx.Expr{Op: qx.OpGTE, Field: "age", Value: 2_500}
+	expr := qx.GTE("age", 2_500)
 	entry, br := warmNumericRangeBucketEntry(t, db, expr)
 
 	pred, ok := db.buildPredicateWithMode(expr, true)
@@ -797,7 +795,7 @@ func TestNumericRangeBucketSpanCache_PredicateReleaseKeepsSharedPosting_AfterPat
 
 	setNumericBucketKnobs(t, db, 128, 1, 1)
 
-	expr := qx.Expr{Op: qx.OpGTE, Field: "age", Value: 2_500}
+	expr := qx.GTE("age", 2_500)
 	entry, br := warmNumericRangeBucketEntry(t, db, expr)
 
 	pred, ok := db.buildPredicateWithMode(expr, true)
@@ -861,7 +859,7 @@ func TestNumericRangeBucketSpanCache_RespectsCardinalityGuard(t *testing.T) {
 		t.Fatalf("expected age overlay data")
 	}
 
-	key, isSlice, isNil, err := db.exprValueToIdxScalar(qx.Expr{Op: qx.OpGTE, Field: "age", Value: 0})
+	key, isSlice, isNil, err := db.exprValueToIdxScalar(qx.GTE("age", 0))
 	if err != nil {
 		t.Fatalf("exprValueToIdxScalar: %v", err)
 	}
@@ -1015,7 +1013,7 @@ func TestMaterializeOrderBasicLimitComplementBaseOp_AllocsPerRunStayZeroAfterWar
 	setNumericBucketKnobs(t, db, 128, 1, 1)
 
 	qv := db.currentQueryViewForTests()
-	op := qx.GTE("age", 2_500)
+	op := mustTestQIRExprForDB(t, db, qx.GTE("age", 2_500))
 	stats, ok := qv.orderBasicRawBaseOpStats(op, qv.snapshotUniverseCardinality())
 	if !ok || stats.cacheKey.isZero() || !stats.buildComplement {
 		t.Fatalf("expected complement materialization stats for %v", op)
@@ -1063,7 +1061,7 @@ func TestDumpQueryKeysFrontpageCandidate_ColdTurnoverAllocProfile(t *testing.T) 
 		qx.HASANY("tags", []string{"technology", "programming", "golang"}),
 		qx.GTE("score", 120.0),
 		qx.GTE("last_login", benchStressBaseUnix-45*24*3600),
-	).By("score", qx.DESC).Max(100)
+	).Sort("score", qx.DESC).Limit(100)
 
 	ring := buildStressBenchTurnoverRing(t, db)
 	state := newBenchReadModeState[uint64, StressBenchUser](t, benchCacheMode{suffix: "ColdTurnover", kind: benchCacheModeColdTurnover}, ring)

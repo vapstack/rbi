@@ -4,17 +4,16 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/vapstack/qx"
-	"github.com/vapstack/rbi/internal/normalize"
 	"github.com/vapstack/rbi/internal/pooled"
 	"github.com/vapstack/rbi/internal/posting"
+	"github.com/vapstack/rbi/internal/qir"
 )
 
-func (qv *queryView[K, V]) tryExecutionPlan(q *qx.QX, trace *queryTrace) ([]K, bool, error) {
+func (qv *queryView[K, V]) tryExecutionPlan(q *qir.Shape, trace *queryTrace) ([]K, bool, error) {
 	// Execution-plan fast paths support only single-column basic order.
 	// Non-basic order types must stay on planner/postingResult routes.
-	if len(q.Order) > 0 {
-		if len(q.Order) != 1 || q.Order[0].Type != qx.OrderBasic {
+	if q.HasOrder {
+		if q.Order.Kind != qir.OrderKindBasic {
 			return nil, false, nil
 		}
 	}
@@ -62,26 +61,27 @@ func (qv *queryView[K, V]) tryExecutionPlan(q *qx.QX, trace *queryTrace) ([]K, b
 	return nil, false, nil
 }
 
-func (qv *queryView[K, V]) tryOrderBasicNoFilterWithLimit(q *qx.QX, trace *queryTrace) ([]K, bool, error) {
-	if len(q.Order) != 1 || q.Limit == 0 || !normalize.IsTrueConst(q.Expr) {
+func (qv *queryView[K, V]) tryOrderBasicNoFilterWithLimit(q *qir.Shape, trace *queryTrace) ([]K, bool, error) {
+	if !q.HasOrder || q.Limit == 0 || !qir.IsTrueConst(q.Expr) {
 		return nil, false, nil
 	}
 
-	order := q.Order[0]
-	if order.Type != qx.OrderBasic {
+	order := q.Order
+	if order.Kind != qir.OrderKindBasic {
 		return nil, false, nil
 	}
 
-	fm := qv.fields[order.Field]
+	orderField := qv.fieldNameByOrder(order)
+	fm := qv.fieldMetaByOrder(order)
 	if fm == nil || fm.Slice {
 		return nil, false, nil
 	}
 
 	fullBounds := rangeBounds{has: true}
-	nilTailField := orderNilTailField(fm, order.Field, fullBounds)
-	ov := qv.fieldOverlay(order.Field)
+	nilTailField := orderNilTailField(fm, orderField, fullBounds)
+	ov := qv.fieldOverlayForOrder(order)
 	if !ov.hasData() && nilTailField == "" {
-		if !qv.hasIndexedField(order.Field) {
+		if !qv.hasIndexedFieldForOrder(order) {
 			return nil, false, nil
 		}
 		return nil, true, nil
@@ -96,8 +96,8 @@ func (qv *queryView[K, V]) tryOrderBasicNoFilterWithLimit(q *qx.QX, trace *query
 	return out, true, nil
 }
 
-func (qv *queryView[K, V]) tryNoFilterNoOrderWithLimit(q *qx.QX, trace *queryTrace) ([]K, bool, error) {
-	if q.Limit == 0 || q.Offset != 0 || len(q.Order) != 0 || !normalize.IsTrueConst(q.Expr) {
+func (qv *queryView[K, V]) tryNoFilterNoOrderWithLimit(q *qir.Shape, trace *queryTrace) ([]K, bool, error) {
+	if q.Limit == 0 || q.Offset != 0 || q.HasOrder || !qir.IsTrueConst(q.Expr) {
 		return nil, false, nil
 	}
 
@@ -784,11 +784,11 @@ func orderBasicEmitFilteredPostingBufReader[K ~uint64 | ~string, V any](
 }
 
 func (qv *queryView[K, V]) runOrderBasicBaseQuery(
-	q *qx.QX,
+	q *qir.Shape,
 	orderField string,
-	baseOps []qx.Expr,
+	baseOps []qir.Expr,
 	needWindow int,
-	order qx.Order,
+	order qir.Order,
 	ov fieldOverlay,
 	br overlayRange,
 	nilTailField string,
@@ -885,11 +885,11 @@ func (qv *queryView[K, V]) runOrderBasicBaseQuery(
 }
 
 func (qv *queryView[K, V]) runOrderBasicBaseQueryBuf(
-	q *qx.QX,
+	q *qir.Shape,
 	orderField string,
-	baseOps []qx.Expr,
+	baseOps []qir.Expr,
 	needWindow int,
-	order qx.Order,
+	order qir.Order,
 	ov fieldOverlay,
 	br overlayRange,
 	nilTailField string,
@@ -1145,21 +1145,21 @@ func (rb *rangeBounds) applyPrefix(prefix string) {
 	rb.normalize()
 }
 
-func (rb *rangeBounds) applyOp(op qx.Op, key string) bool {
+func (rb *rangeBounds) applyOp(op qir.Op, key string) bool {
 	rb.has = true
 	switch op {
-	case qx.OpGT:
+	case qir.OpGT:
 		rb.applyLo(key, false)
-	case qx.OpGTE:
+	case qir.OpGTE:
 		rb.applyLo(key, true)
-	case qx.OpLT:
+	case qir.OpLT:
 		rb.applyHi(key, false)
-	case qx.OpLTE:
+	case qir.OpLTE:
 		rb.applyHi(key, true)
-	case qx.OpEQ:
+	case qir.OpEQ:
 		rb.applyLo(key, true)
 		rb.applyHi(key, true)
-	case qx.OpPREFIX:
+	case qir.OpPREFIX:
 		rb.applyPrefix(key)
 	default:
 		return false
@@ -1246,22 +1246,22 @@ const (
 
 type orderBasicBaseCore struct {
 	kind      orderBasicBaseCoreKind
-	expr      qx.Expr
+	expr      qir.Expr
 	collapsed preparedScalarExactRange
 }
 
-func isOrderBasicCollapsibleNumericRangeExpr(op qx.Expr, fm *field) bool {
-	if op.Not || op.Field == "" || fm == nil || fm.Slice || !isNumericScalarKind(fm.Kind) {
+func isOrderBasicCollapsibleNumericRangeExpr(op qir.Expr, fm *field) bool {
+	if op.Not || op.FieldOrdinal < 0 || fm == nil || fm.Slice || !isNumericScalarKind(fm.Kind) {
 		return false
 	}
 	return isScalarRangeEqOp(op.Op)
 }
 
-func (qv *queryView[K, V]) shouldCollapseOrderBasicNumericRange(field string, rb rangeBounds) bool {
+func (qv *queryView[K, V]) shouldCollapseOrderBasicNumericRange(field string, fieldOrdinal int, rb rangeBounds) bool {
 	if field == "" || rb.empty {
 		return false
 	}
-	ov := qv.fieldOverlay(field)
+	ov := qv.fieldOverlayRef(field, fieldOrdinal)
 	if !ov.hasData() {
 		return true
 	}
@@ -1282,7 +1282,7 @@ func (qv *queryView[K, V]) shouldCollapseOrderBasicNumericRange(field string, rb
 		return false
 	}
 	complementBuckets := ov.keyCount() - bucketCount
-	if qv.nilFieldOverlay(field).lookupCardinality(nilIndexEntryKey) > 0 {
+	if qv.nilFieldOverlayRef(field, fieldOrdinal).lookupCardinality(nilIndexEntryKey) > 0 {
 		complementBuckets++
 	}
 	complementEst := uint64(0)
@@ -1296,7 +1296,7 @@ func (qv *queryView[K, V]) shouldCollapseOrderBasicNumericRange(field string, rb
 	return positiveWork <= complementWork
 }
 
-func (qv *queryView[K, V]) prepareOrderBasicBaseCores(baseOps []qx.Expr) (*pooled.SliceBuf[orderBasicBaseCore], *pooled.SliceBuf[int], bool, error) {
+func (qv *queryView[K, V]) prepareOrderBasicBaseCores(baseOps []qir.Expr) (*pooled.SliceBuf[orderBasicBaseCore], *pooled.SliceBuf[int], bool, error) {
 	if len(baseOps) == 0 {
 		return nil, nil, false, nil
 	}
@@ -1312,10 +1312,11 @@ func (qv *queryView[K, V]) prepareOrderBasicBaseCores(baseOps []qx.Expr) (*poole
 		if rawCoreIdxBuf.Get(i) >= 0 {
 			continue
 		}
-		fm := qv.fields[op.Field]
+		fm := qv.fieldMetaByExpr(op)
 		if !isOrderBasicCollapsibleNumericRangeExpr(op, fm) {
 			continue
 		}
+		fieldName := qv.fieldNameByExpr(op)
 
 		var rb rangeBounds
 		groupCount := 0
@@ -1324,7 +1325,7 @@ func (qv *queryView[K, V]) prepareOrderBasicBaseCores(baseOps []qx.Expr) (*poole
 				continue
 			}
 			other := baseOps[j]
-			if other.Field != op.Field || !isOrderBasicCollapsibleNumericRangeExpr(other, fm) {
+			if other.FieldOrdinal != op.FieldOrdinal || !isOrderBasicCollapsibleNumericRangeExpr(other, fm) {
 				continue
 			}
 			nextRB, ok, err := qv.rangeBoundsForScalarExpr(other)
@@ -1347,7 +1348,7 @@ func (qv *queryView[K, V]) prepareOrderBasicBaseCores(baseOps []qx.Expr) (*poole
 			orderBasicBaseCoreIndexSlicePool.Put(rawCoreIdxBuf)
 			return nil, nil, true, nil
 		}
-		if !qv.shouldCollapseOrderBasicNumericRange(op.Field, rb) {
+		if !qv.shouldCollapseOrderBasicNumericRange(fieldName, op.FieldOrdinal, rb) {
 			continue
 		}
 
@@ -1355,14 +1356,14 @@ func (qv *queryView[K, V]) prepareOrderBasicBaseCores(baseOps []qx.Expr) (*poole
 		coresBuf.Append(orderBasicBaseCore{
 			kind: orderBasicBaseCoreCollapsedRange,
 			collapsed: preparedScalarExactRange{
-				field:    op.Field,
+				field:    fieldName,
 				bounds:   rb,
-				cacheKey: qv.materializedPredKeyForExactScalarRange(op.Field, rb),
+				cacheKey: qv.materializedPredKeyForExactScalarRange(fieldName, rb),
 			},
 		})
 		for j := i; j < len(baseOps); j++ {
 			other := baseOps[j]
-			if other.Field == op.Field && isOrderBasicCollapsibleNumericRangeExpr(other, fm) {
+			if other.FieldOrdinal == op.FieldOrdinal && isOrderBasicCollapsibleNumericRangeExpr(other, fm) {
 				rawCoreIdxBuf.Set(j, coreIdx)
 			}
 		}
@@ -1381,7 +1382,7 @@ func (qv *queryView[K, V]) prepareOrderBasicBaseCores(baseOps []qx.Expr) (*poole
 	return coresBuf, rawCoreIdxBuf, false, nil
 }
 
-func (qv *queryView[K, V]) prepareOrderBasicBaseCoresBuf(baseOps *pooled.SliceBuf[qx.Expr]) (*pooled.SliceBuf[orderBasicBaseCore], *pooled.SliceBuf[int], bool, error) {
+func (qv *queryView[K, V]) prepareOrderBasicBaseCoresBuf(baseOps *pooled.SliceBuf[qir.Expr]) (*pooled.SliceBuf[orderBasicBaseCore], *pooled.SliceBuf[int], bool, error) {
 	if baseOps == nil || baseOps.Len() == 0 {
 		return nil, nil, false, nil
 	}
@@ -1398,10 +1399,11 @@ func (qv *queryView[K, V]) prepareOrderBasicBaseCoresBuf(baseOps *pooled.SliceBu
 			continue
 		}
 		op := baseOps.Get(i)
-		fm := qv.fields[op.Field]
+		fm := qv.fieldMetaByExpr(op)
 		if !isOrderBasicCollapsibleNumericRangeExpr(op, fm) {
 			continue
 		}
+		fieldName := qv.fieldNameByExpr(op)
 
 		var rb rangeBounds
 		groupCount := 0
@@ -1410,7 +1412,7 @@ func (qv *queryView[K, V]) prepareOrderBasicBaseCoresBuf(baseOps *pooled.SliceBu
 				continue
 			}
 			other := baseOps.Get(j)
-			if other.Field != op.Field || !isOrderBasicCollapsibleNumericRangeExpr(other, fm) {
+			if other.FieldOrdinal != op.FieldOrdinal || !isOrderBasicCollapsibleNumericRangeExpr(other, fm) {
 				continue
 			}
 			nextRB, ok, err := qv.rangeBoundsForScalarExpr(other)
@@ -1433,7 +1435,7 @@ func (qv *queryView[K, V]) prepareOrderBasicBaseCoresBuf(baseOps *pooled.SliceBu
 			orderBasicBaseCoreIndexSlicePool.Put(rawCoreIdxBuf)
 			return nil, nil, true, nil
 		}
-		if !qv.shouldCollapseOrderBasicNumericRange(op.Field, rb) {
+		if !qv.shouldCollapseOrderBasicNumericRange(fieldName, op.FieldOrdinal, rb) {
 			continue
 		}
 
@@ -1441,14 +1443,14 @@ func (qv *queryView[K, V]) prepareOrderBasicBaseCoresBuf(baseOps *pooled.SliceBu
 		coresBuf.Append(orderBasicBaseCore{
 			kind: orderBasicBaseCoreCollapsedRange,
 			collapsed: preparedScalarExactRange{
-				field:    op.Field,
+				field:    fieldName,
 				bounds:   rb,
-				cacheKey: qv.materializedPredKeyForExactScalarRange(op.Field, rb),
+				cacheKey: qv.materializedPredKeyForExactScalarRange(fieldName, rb),
 			},
 		})
 		for j := i; j < baseOps.Len(); j++ {
 			other := baseOps.Get(j)
-			if other.Field == op.Field && isOrderBasicCollapsibleNumericRangeExpr(other, fm) {
+			if other.FieldOrdinal == op.FieldOrdinal && isOrderBasicCollapsibleNumericRangeExpr(other, fm) {
 				rawCoreIdxBuf.Set(j, coreIdx)
 			}
 		}
@@ -1564,7 +1566,7 @@ func (qv *queryView[K, V]) hasWarmOrderBasicBaseCores(cores *pooled.SliceBuf[ord
 }
 
 func (qv *queryView[K, V]) orderBasicRawBaseOpStats(
-	op qx.Expr,
+	op qir.Expr,
 	universe uint64,
 ) (scalarMaterializationStats, bool) {
 	if !isSimpleScalarRangeOrPrefixLeaf(op) {
@@ -1580,12 +1582,12 @@ func (qv *queryView[K, V]) orderBasicRawBaseOpStats(
 
 func (qv *queryView[K, V]) shouldPromoteObservedOrderBasicRawBaseOp(
 	orderField string,
-	op qx.Expr,
+	op qir.Expr,
 	universe uint64,
 	observedRows uint64,
 	needWindow uint64,
 ) bool {
-	if universe == 0 || observedRows == 0 || op.Not || op.Field == "" || op.Field == orderField {
+	if universe == 0 || observedRows == 0 || op.Not || op.FieldOrdinal < 0 || qv.fieldNameByExpr(op) == orderField {
 		return false
 	}
 	if needWindow == 0 {
@@ -1610,8 +1612,8 @@ func (qv *queryView[K, V]) shouldPromoteObservedOrderBasicRawBaseOp(
 	return probeWork >= buildWork
 }
 
-func (qv *queryView[K, V]) materializeOrderBasicLimitComplementBaseOp(op qx.Expr, cacheKey materializedPredKey) bool {
-	if cacheKey.isZero() || op.Field == "" {
+func (qv *queryView[K, V]) materializeOrderBasicLimitComplementBaseOp(op qir.Expr, cacheKey materializedPredKey) bool {
+	if cacheKey.isZero() || op.FieldOrdinal < 0 {
 		return false
 	}
 	candidate, ok := qv.prepareScalarRangeRoutingCandidate(op)
@@ -1636,7 +1638,7 @@ func (qv *queryView[K, V]) materializeOrderBasicLimitComplementBaseOp(op qx.Expr
 	return true
 }
 
-func (qv *queryView[K, V]) materializeOrderMaterializedBaseOpsBuf(orderField string, baseOps *pooled.SliceBuf[qx.Expr]) {
+func (qv *queryView[K, V]) materializeOrderMaterializedBaseOpsBuf(orderField string, baseOps *pooled.SliceBuf[qir.Expr]) {
 	if qv.snap == nil || qv.snap.materializedPredCacheLimit() <= 0 || baseOps == nil || baseOps.Len() == 0 {
 		return
 	}
@@ -1664,7 +1666,7 @@ func (qv *queryView[K, V]) materializeOrderMaterializedBaseOpsBuf(orderField str
 		case orderBasicBaseCoreCollapsedRange:
 			key = core.collapsed.cacheKey
 		case orderBasicBaseCoreRawExpr:
-			if core.expr.Not || core.expr.Field == "" || core.expr.Field == orderField {
+			if core.expr.Not || core.expr.FieldOrdinal < 0 || qv.fieldNameByExpr(core.expr) == orderField {
 				continue
 			}
 			stats, ok := qv.orderBasicRawBaseOpStats(core.expr, qv.snapshotUniverseCardinality())
@@ -1690,7 +1692,7 @@ func (qv *queryView[K, V]) materializeOrderMaterializedBaseOpsBuf(orderField str
 	}
 }
 
-func (qv *queryView[K, V]) promoteOrderBasicLimitMaterializedBaseOps(orderField string, baseOps []qx.Expr, observedRows uint64, needWindow uint64) {
+func (qv *queryView[K, V]) promoteOrderBasicLimitMaterializedBaseOps(orderField string, baseOps []qir.Expr, observedRows uint64, needWindow uint64) {
 	if qv.snap == nil || len(baseOps) == 0 || observedRows == 0 {
 		return
 	}
@@ -1779,7 +1781,7 @@ func (qv *queryView[K, V]) promoteObservedLimitLeafPreds(orderField string, pred
 			ok = true
 		} else {
 			op := pred.pred.expr
-			if !isSimpleScalarRangeOrPrefixLeaf(op) || op.Field == "" || op.Field == orderField || op.Not {
+			if !isSimpleScalarRangeOrPrefixLeaf(op) || op.FieldOrdinal < 0 || qv.fieldNameByExpr(op) == orderField || op.Not {
 				continue
 			}
 			core = orderBasicBaseCore{
@@ -1829,7 +1831,7 @@ func (qv *queryView[K, V]) promoteObservedLimitLeafPreds(orderField string, pred
 	}
 }
 
-func (qv *queryView[K, V]) evalOrderBasicRawBaseOp(op qx.Expr) (postingResult, error) {
+func (qv *queryView[K, V]) evalOrderBasicRawBaseOp(op qir.Expr) (postingResult, error) {
 	stats, ok := qv.orderBasicRawBaseOpStats(op, qv.snapshotUniverseCardinality())
 	cacheKey := materializedPredKey{}
 	if ok {
@@ -1846,7 +1848,7 @@ func (qv *queryView[K, V]) evalOrderBasicRawBaseOp(op qx.Expr) (postingResult, e
 	return qv.evalExpr(op)
 }
 
-func (qv *queryView[K, V]) loadWarmOrderBasicRawBaseOp(op qx.Expr) (postingResult, bool) {
+func (qv *queryView[K, V]) loadWarmOrderBasicRawBaseOp(op qir.Expr) (postingResult, bool) {
 	candidate, ok := qv.prepareScalarRangeRoutingCandidate(op)
 	if !ok {
 		return postingResult{}, false
@@ -1854,7 +1856,7 @@ func (qv *queryView[K, V]) loadWarmOrderBasicRawBaseOp(op qx.Expr) (postingResul
 	return candidate.core.loadWarmScalarPostingResult()
 }
 
-func (qv *queryView[K, V]) shouldPreferOrderBasicBaseCorePathForNonOrderPrefix(q *qx.QX, orderField string, baseOps []qx.Expr) bool {
+func (qv *queryView[K, V]) shouldPreferOrderBasicBaseCorePathForNonOrderPrefix(q *qir.Shape, orderField string, baseOps []qir.Expr) bool {
 	if len(baseOps) == 0 {
 		return false
 	}
@@ -1869,7 +1871,7 @@ func (qv *queryView[K, V]) shouldPreferOrderBasicBaseCorePathForNonOrderPrefix(q
 	}
 
 	for _, op := range baseOps {
-		if !isPositiveNonOrderScalarPrefixLeaf(orderField, op) {
+		if !qv.isPositiveNonOrderScalarPrefixLeaf(orderField, op) {
 			continue
 		}
 		candidate, ok := qv.prepareScalarRangeRoutingCandidate(op)
@@ -1884,9 +1886,9 @@ func (qv *queryView[K, V]) shouldPreferOrderBasicBaseCorePathForNonOrderPrefix(q
 	return false
 }
 
-func (qv *queryView[K, V]) tryQueryOrderBasicWithLimit(q *qx.QX, trace *queryTrace) ([]K, bool, error) {
+func (qv *queryView[K, V]) tryQueryOrderBasicWithLimit(q *qir.Shape, trace *queryTrace) ([]K, bool, error) {
 
-	if len(q.Order) != 1 || q.Limit == 0 {
+	if !q.HasOrder || q.Limit == 0 {
 		return nil, false, nil
 	}
 
@@ -1894,40 +1896,40 @@ func (qv *queryView[K, V]) tryQueryOrderBasicWithLimit(q *qx.QX, trace *queryTra
 		return nil, false, nil
 	}
 
-	order := q.Order[0]
-	if order.Type != qx.OrderBasic {
+	order := q.Order
+	if order.Kind != qir.OrderKindBasic {
 		return nil, false, nil
 	}
 
 	ops := q.Expr.Operands
 
-	if normalize.IsTrueConst(q.Expr) {
+	if qir.IsTrueConst(q.Expr) {
 		ops = nil
-	} else if q.Expr.Op != qx.OpAND {
-		var single [1]qx.Expr
+	} else if q.Expr.Op != qir.OpAND {
+		var single [1]qir.Expr
 		single[0] = q.Expr
 		ops = single[:]
 	}
 
-	f := order.Field
+	f := qv.fieldNameByOrder(order)
 	needWindow, _ := orderWindow(q)
-	fm := qv.fields[f]
+	fm := qv.fieldMetaByOrder(order)
 	if fm == nil || fm.Slice {
 		return nil, false, nil
 	}
 
 	var rb rangeBounds
 
-	var baseOps []qx.Expr
-	var baseOpsStack [8]qx.Expr
+	var baseOps []qir.Expr
+	var baseOpsStack [8]qir.Expr
 	if len(ops) <= len(baseOpsStack) {
 		baseOps = baseOpsStack[:0]
 	} else {
-		baseOps = make([]qx.Expr, 0, len(ops))
+		baseOps = make([]qir.Expr, 0, len(ops))
 	}
 
 	for _, op := range ops {
-		if op.Field == f {
+		if op.FieldOrdinal == order.FieldOrdinal {
 			if op.Not || !isScalarRangeEqOp(op.Op) {
 				return nil, false, nil
 			}
@@ -1958,9 +1960,9 @@ func (qv *queryView[K, V]) tryQueryOrderBasicWithLimit(q *qx.QX, trace *queryTra
 	}
 
 	nilTailField := orderNilTailField(fm, f, rb)
-	ov := qv.fieldOverlay(f)
+	ov := qv.fieldOverlayForOrder(order)
 	if !ov.hasData() && nilTailField == "" {
-		if !qv.hasIndexedField(f) {
+		if !qv.hasIndexedFieldForOrder(order) {
 			return nil, false, nil
 		}
 		return nil, true, nil
@@ -2137,7 +2139,7 @@ func (qv *queryView[K, V]) tryQueryOrderBasicWithLimit(q *qx.QX, trace *queryTra
 	return out, used, err
 }
 
-func (qv *queryView[K, V]) scanOrderLimitNoPredicates(q *qx.QX, ov fieldOverlay, br overlayRange, desc bool, nilTailField string, trace *queryTrace) ([]K, bool) {
+func (qv *queryView[K, V]) scanOrderLimitNoPredicates(q *qir.Shape, ov fieldOverlay, br overlayRange, desc bool, nilTailField string, trace *queryTrace) ([]K, bool) {
 	out := make([]K, 0, q.Limit)
 	cursor := qv.newQueryCursor(out, q.Offset, q.Limit, false, 0)
 
@@ -2189,7 +2191,7 @@ func (qv *queryView[K, V]) scanOrderLimitNoPredicates(q *qx.QX, ov fieldOverlay,
 	return cursor.out, true
 }
 
-func (qv *queryView[K, V]) scanOrderLimitWithPredicatesReader(q *qx.QX, ov fieldOverlay, br overlayRange, desc bool, preds predicateReader, nilTailField string, trace *queryTrace) ([]K, bool) {
+func (qv *queryView[K, V]) scanOrderLimitWithPredicatesReader(q *qir.Shape, ov fieldOverlay, br overlayRange, desc bool, preds predicateReader, nilTailField string, trace *queryTrace) ([]K, bool) {
 	if preds.Len() > limitQueryFastPathMaxLeaves {
 		activeBuf := predicateCheckSlicePool.Get()
 		activeBuf.Grow(preds.Len())
@@ -2418,35 +2420,35 @@ func (qv *queryView[K, V]) scanOrderLimitWithPredicatesReader(q *qx.QX, ov field
 	return cursor.out, true
 }
 
-func (qv *queryView[K, V]) tryQueryOrderPrefixWithLimit(q *qx.QX, trace *queryTrace) ([]K, bool, error) {
+func (qv *queryView[K, V]) tryQueryOrderPrefixWithLimit(q *qir.Shape, trace *queryTrace) ([]K, bool, error) {
 
-	if len(q.Order) != 1 || q.Limit == 0 {
+	if !q.HasOrder || q.Limit == 0 {
 		return nil, false, nil
 	}
 
-	ord := q.Order[0]
-	if ord.Type != qx.OrderBasic {
+	ord := q.Order
+	if ord.Kind != qir.OrderKindBasic {
 		return nil, false, nil
 	}
 	if q.Expr.Not {
 		return nil, false, nil
 	}
 
-	f := ord.Field
-	fm := qv.fields[f]
+	f := qv.fieldNameByOrder(ord)
+	fm := qv.fieldMetaByOrder(ord)
 	if fm == nil || fm.Slice {
 		return nil, false, nil
 	}
 
-	ov := qv.fieldOverlay(f)
+	ov := qv.fieldOverlayForOrder(ord)
 	if !ov.hasData() {
 		return nil, true, nil
 	}
 
 	expr := q.Expr
 	ops := expr.Operands
-	if expr.Op != qx.OpAND {
-		var single [1]qx.Expr
+	if expr.Op != qir.OpAND {
+		var single [1]qir.Expr
 		single[0] = expr
 		ops = single[:]
 	}
@@ -2454,20 +2456,20 @@ func (qv *queryView[K, V]) tryQueryOrderPrefixWithLimit(q *qx.QX, trace *queryTr
 	var (
 		hasPrefix bool
 		prefix    string
-		baseOps   []qx.Expr
+		baseOps   []qir.Expr
 	)
-	var baseOpsStack [8]qx.Expr
+	var baseOpsStack [8]qir.Expr
 	if len(ops) <= len(baseOpsStack) {
 		baseOps = baseOpsStack[:0]
 	} else {
-		baseOps = make([]qx.Expr, 0, len(ops))
+		baseOps = make([]qir.Expr, 0, len(ops))
 	}
 
 	for _, op := range ops {
 		if op.Not {
 			return nil, false, nil
 		}
-		if classifyOrderFieldScalarLeaf(f, op) == orderFieldScalarLeafPrefix {
+		if qv.classifyOrderFieldScalarLeaf(f, op) == orderFieldScalarLeafPrefix {
 			prefixState, ok, err := qv.prepareScalarPrefixRoute(op)
 			if err != nil {
 				return nil, true, err
@@ -2567,9 +2569,9 @@ func (qv *queryView[K, V]) tryQueryOrderPrefixWithLimit(q *qx.QX, trace *queryTr
 	return cursor.out, true, nil
 }
 
-func (qv *queryView[K, V]) tryQueryRangeNoOrderWithLimit(q *qx.QX, trace *queryTrace) ([]K, bool, error) {
+func (qv *queryView[K, V]) tryQueryRangeNoOrderWithLimit(q *qir.Shape, trace *queryTrace) ([]K, bool, error) {
 
-	if len(q.Order) > 0 || q.Limit == 0 {
+	if q.HasOrder || q.Limit == 0 {
 		return nil, false, nil
 	}
 
@@ -2578,7 +2580,7 @@ func (qv *queryView[K, V]) tryQueryRangeNoOrderWithLimit(q *qx.QX, trace *queryT
 	}
 
 	e := q.Expr
-	if e.Op == qx.OpAND || e.Op == qx.OpOR || len(e.Operands) != 0 {
+	if e.Op == qir.OpAND || e.Op == qir.OpOR || len(e.Operands) != 0 {
 		return nil, false, nil
 	}
 
@@ -2586,19 +2588,18 @@ func (qv *queryView[K, V]) tryQueryRangeNoOrderWithLimit(q *qx.QX, trace *queryT
 		return nil, false, nil
 	}
 
-	f := e.Field
-	if f == "" {
+	if e.FieldOrdinal < 0 {
 		return nil, false, nil
 	}
 
-	fm := qv.fields[f]
+	fm := qv.fieldMetaByExpr(e)
 	if fm == nil || fm.Slice {
 		return nil, false, nil
 	}
 
 	isNil := false
 	rb := rangeBounds{has: true}
-	if e.Op == qx.OpEQ {
+	if e.Op == qir.OpEQ {
 		key, isSlice, eqNil, err := qv.exprValueToIdxScalar(e)
 		if err != nil {
 			return nil, true, err
@@ -2608,7 +2609,7 @@ func (qv *queryView[K, V]) tryQueryRangeNoOrderWithLimit(q *qx.QX, trace *queryT
 		}
 		isNil = eqNil
 		if isNil {
-			ids := qv.nilFieldOverlay(f).lookupPostingRetained(nilIndexEntryKey)
+			ids := qv.nilFieldOverlayForExpr(e).lookupPostingRetained(nilIndexEntryKey)
 			if ids.IsEmpty() {
 				return nil, true, nil
 			}
@@ -2647,7 +2648,7 @@ func (qv *queryView[K, V]) tryQueryRangeNoOrderWithLimit(q *qx.QX, trace *queryT
 		rb = nextRB
 	}
 
-	ov := qv.fieldOverlay(f)
+	ov := qv.fieldOverlayForExpr(e)
 	if !ov.hasData() {
 		return nil, true, nil
 	}
@@ -2693,9 +2694,9 @@ func (qv *queryView[K, V]) tryQueryRangeNoOrderWithLimit(q *qx.QX, trace *queryT
 	return cursor.out, true, nil
 }
 
-func (qv *queryView[K, V]) tryQueryPrefixNoOrderWithLimit(q *qx.QX, trace *queryTrace) ([]K, bool, error) {
+func (qv *queryView[K, V]) tryQueryPrefixNoOrderWithLimit(q *qir.Shape, trace *queryTrace) ([]K, bool, error) {
 
-	if len(q.Order) > 0 || q.Limit == 0 {
+	if q.HasOrder || q.Limit == 0 {
 		return nil, false, nil
 	}
 
@@ -2708,7 +2709,7 @@ func (qv *queryView[K, V]) tryQueryPrefixNoOrderWithLimit(q *qx.QX, trace *query
 		return nil, false, nil
 	}
 
-	fm := qv.fields[e.Field]
+	fm := qv.fieldMetaByExpr(e)
 	if fm == nil || fm.Slice {
 		return nil, false, nil
 	}
@@ -2721,8 +2722,8 @@ func (qv *queryView[K, V]) tryQueryPrefixNoOrderWithLimit(q *qx.QX, trace *query
 		return nil, false, nil
 	}
 	if !prefixState.hasData {
-		if !qv.hasIndexedField(e.Field) {
-			return nil, true, fmt.Errorf("no index for field: %v", e.Field)
+		if !qv.hasIndexedFieldForExpr(e) {
+			return nil, true, fmt.Errorf("no index for field: %v", qv.fieldNameByExpr(e))
 		}
 		return nil, true, nil
 	}

@@ -211,7 +211,7 @@ func warmBenchCountOnceString(b *testing.B, db *DB[string, UserBench], q *qx.QX)
 
 func runBenchCountOnceString(b *testing.B, db *DB[string, UserBench], q *qx.QX) {
 	b.Helper()
-	if _, err := db.Count(q); err != nil {
+	if _, err := db.Count(q.Filter); err != nil {
 		b.Fatal(err)
 	}
 }
@@ -355,14 +355,14 @@ func Benchmark_Query_Index_Count_Realistic_HeavyOR_StringKeyDB(b *testing.B) {
 
 func Benchmark_Query_Index_Keys_Medium_IN_Limit_StringKeyDB(b *testing.B) {
 	db := buildBenchDBString(b, benchN)
-	q := qx.Query(qx.IN("country", []string{"NL", "DE"})).Max(100)
+	q := qx.Query(qx.IN("country", []string{"NL", "DE"})).Limit(100)
 	runStringQueryKeysBench(b, db, q)
 }
 
 func Benchmark_Read_Query_Items_SingleByEmail_StringKeyDB(b *testing.B) {
 	db := buildBenchDBString(b, benchN)
 	target := fmt.Sprintf("user%06d@example.com", benchN/2)
-	q := qx.Query(qx.EQ("email", target)).Max(1)
+	q := qx.Query(qx.EQ("email", target)).Limit(1)
 	runStringReadQueryBench(b, db, q)
 }
 

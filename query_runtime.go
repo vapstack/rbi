@@ -3,9 +3,9 @@ package rbi
 import (
 	"math/bits"
 
-	"github.com/vapstack/qx"
 	"github.com/vapstack/rbi/internal/pooled"
 	"github.com/vapstack/rbi/internal/posting"
+	"github.com/vapstack/rbi/internal/qir"
 )
 
 type postsAnyFilterState struct {
@@ -32,7 +32,7 @@ var lazyMaterializedPredicateStatePool = pooled.Pointers[lazyMaterializedPredica
 }
 
 type lazyMaterializedPredicateLoader interface {
-	evalLazyMaterializedPredicateWithKey(raw qx.Expr, cacheKey materializedPredKey) posting.List
+	evalLazyMaterializedPredicateWithKey(raw qir.Expr, cacheKey materializedPredKey) posting.List
 }
 
 func (state *postsAnyFilterState) materialize() posting.List {
@@ -514,7 +514,7 @@ func postingBufLen(buf *pooled.SliceBuf[posting.List]) int {
 
 type lazyMaterializedPredicateState struct {
 	loader   lazyMaterializedPredicateLoader
-	raw      qx.Expr
+	raw      qir.Expr
 	cacheKey materializedPredKey
 	ids      posting.List
 	loaded   bool

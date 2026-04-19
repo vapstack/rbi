@@ -51,7 +51,7 @@ func TestMemoryExtra_MaterializedPredCacheStoreBorrowedDetachesFromSourceOwner(t
 	snapshotExtInitMaterializedPredCache(snap)
 	defer snap.releaseRuntimeCaches()
 
-	key := materializedPredKeyForScalar("email", qx.OpPREFIX, "user")
+	key := materializedPredKeyForScalar("email", compileScalarOpForTest(qx.OpPREFIX), "user")
 	base := buildQueryRuntimeTestLargePosting()
 	want := base.ToArray()
 
@@ -161,7 +161,7 @@ func TestMemoryExtra_MaterializedPredLoadOrStoreHitReturnsCachedPayloadNotCaller
 	snapshotExtInitMaterializedPredCache(snap)
 	defer snap.releaseRuntimeCaches()
 
-	key := materializedPredKeyForScalar("email", qx.OpPREFIX, "user")
+	key := materializedPredKeyForScalar("email", compileScalarOpForTest(qx.OpPREFIX), "user")
 	cachedBase := buildQueryRuntimeTestLargePosting()
 	want := cachedBase.ToArray()
 	snap.storeMaterializedPredKey(key, cachedBase.Borrow())
@@ -332,7 +332,7 @@ func TestMemoryExtra_MaterializedPredInheritedBorrowedMutationDetaches(t *testin
 
 	base := buildQueryRuntimeTestLargePosting()
 	want := base.ToArray()
-	key := materializedPredKeyForScalar("email", qx.OpPREFIX, "user")
+	key := materializedPredKeyForScalar("email", compileScalarOpForTest(qx.OpPREFIX), "user")
 	prev.storeMaterializedPredKey(key, base.Borrow())
 	base.Release()
 
@@ -606,7 +606,7 @@ func TestMemoryExtra_MaterializedPredInheritedReleaseKeepsSiblingSnapshotEntry(t
 
 	base := buildQueryRuntimeTestLargePosting()
 	want := base.ToArray()
-	key := materializedPredKeyForScalar("email", qx.OpPREFIX, "user")
+	key := materializedPredKeyForScalar("email", compileScalarOpForTest(qx.OpPREFIX), "user")
 	prev.storeMaterializedPredKey(key, base.Borrow())
 	base.Release()
 
@@ -648,7 +648,7 @@ func TestMemoryExtra_MaterializedPredInheritedEvictAndDrainKeepsSiblingSnapshotE
 
 	base := buildQueryRuntimeTestLargePosting()
 	want := base.ToArray()
-	key := materializedPredKeyForScalar("email", qx.OpPREFIX, "user")
+	key := materializedPredKeyForScalar("email", compileScalarOpForTest(qx.OpPREFIX), "user")
 	prev.storeMaterializedPredKey(key, base.Borrow())
 	base.Release()
 
@@ -672,7 +672,7 @@ func TestMemoryExtra_MaterializedPredInheritedEvictAndDrainKeepsSiblingSnapshotE
 		t.Fatalf("test setup chose existing id %d", extra)
 	}
 	evictor = evictor.BuildAdded(extra)
-	prev.storeMaterializedPredKey(materializedPredKeyForScalar("email", qx.OpPREFIX, "other"), evictor.Borrow())
+	prev.storeMaterializedPredKey(materializedPredKeyForScalar("email", compileScalarOpForTest(qx.OpPREFIX), "other"), evictor.Borrow())
 	evictor.Release()
 
 	if _, ok := prev.loadMaterializedPredKey(key); ok {

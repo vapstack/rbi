@@ -669,7 +669,7 @@ func TestIndexPersistence(t *testing.T) {
 		}
 	})
 
-	ids, err := db2.QueryKeys(&qx.QX{Expr: qx.Expr{Op: qx.OpEQ, Field: "name", Value: "alice"}})
+	ids, err := db2.QueryKeys(qx.Query(qx.EQ("name", "alice")))
 	if err != nil {
 		t.Fatalf("QueryKeys: %v", err)
 	}
@@ -723,7 +723,7 @@ func TestIndexPersistence_ChunkedFieldRoundTrip(t *testing.T) {
 		t.Fatalf("expected chunked name index after reopen")
 	}
 
-	ids, err := db2.QueryKeys(&qx.QX{Expr: qx.Expr{Op: qx.OpEQ, Field: "name", Value: "user_0007"}})
+	ids, err := db2.QueryKeys(qx.Query(qx.EQ("name", "user_0007")))
 	if err != nil {
 		t.Fatalf("QueryKeys: %v", err)
 	}
@@ -865,7 +865,7 @@ func TestRebuildIndex_CleanState(t *testing.T) {
 	if err := db.Delete(2); err != nil {
 		t.Fatal(err)
 	}
-	cnt, err := db.Count(&qx.QX{Expr: qx.Expr{Op: qx.OpEQ, Field: "age", Value: 30}})
+	cnt, err := db.Count(qx.EQ("age", 30))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -878,7 +878,7 @@ func TestRebuildIndex_CleanState(t *testing.T) {
 	}
 
 	// verify state (1, 3)
-	ids, err := db.QueryKeys(&qx.QX{Expr: qx.Expr{Op: qx.OpEQ, Field: "age", Value: 30}})
+	ids, err := db.QueryKeys(qx.Query(qx.EQ("age", 30)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1450,11 +1450,11 @@ func TestRebuildIndex_StormConcurrentMixedOps_FinalConsistency(t *testing.T) {
 	)
 
 	queries := []*qx.QX{
-		qx.Query(qx.GTE("age", 25)).By("age", qx.ASC).Skip(2).Max(40),
-		qx.Query(qx.NOT(qx.EQ("active", false))).ByArrayCount("tags", qx.DESC).Skip(1).Max(55),
-		qx.Query(qx.HASANY("tags", []string{"seed", "w0", "w1", "grp-2"})).ByArrayPos("country", []string{"NL", "DE", "PL", "US"}, qx.ASC).Max(70),
-		qx.Query(qx.PREFIX("name", "rw-")).By("name", qx.ASC).Max(80),
-		qx.Query(qx.IN("country", []string{"NL", "DE"})).ByArrayPos("tags", []string{"seed", "w0", "grp-1"}, qx.DESC).Skip(3).Max(60),
+		qx.Query(qx.GTE("age", 25)).Sort("age", qx.ASC).Offset(2).Limit(40),
+		qx.Query(qx.NOT(qx.EQ("active", false))).SortBy(qx.LEN("tags"), qx.DESC).Offset(1).Limit(55),
+		qx.Query(qx.HASANY("tags", []string{"seed", "w0", "w1", "grp-2"})).SortBy(qx.POS("country", []string{"NL", "DE", "PL", "US"}), qx.ASC).Limit(70),
+		qx.Query(qx.PREFIX("name", "rw-")).Sort("name", qx.ASC).Limit(80),
+		qx.Query(qx.IN("country", []string{"NL", "DE"})).SortBy(qx.POS("tags", []string{"seed", "w0", "grp-1"}), qx.DESC).Offset(3).Limit(60),
 	}
 
 	var wg sync.WaitGroup
@@ -1531,7 +1531,7 @@ func TestRebuildIndex_StormConcurrentMixedOps_FinalConsistency(t *testing.T) {
 					errCh <- fmt.Errorf("reader=%d Query(i=%d): %w", r, i, err)
 					return
 				}
-				if _, err := db.Count(q); err != nil && !errors.Is(err, ErrRebuildInProgress) {
+				if _, err := db.Count(q.Filter); err != nil && !errors.Is(err, ErrRebuildInProgress) {
 					errCh <- fmt.Errorf("reader=%d Count(i=%d): %w", r, i, err)
 					return
 				}
@@ -1553,10 +1553,10 @@ func TestRebuildIndex_StormConcurrentMixedOps_FinalConsistency(t *testing.T) {
 	}
 
 	checkQueries := []*qx.QX{
-		qx.Query(qx.GTE("age", 18)).By("age", qx.DESC).Skip(5).Max(70),
-		qx.Query(qx.HASANY("tags", []string{"w0", "w1", "grp-3", "seed"})).ByArrayCount("tags", qx.ASC).Skip(4).Max(90),
-		qx.Query(qx.IN("country", []string{"NL", "DE", "US"})).ByArrayPos("country", []string{"DE", "NL", "US", "PL"}, qx.ASC).Max(120),
-		qx.Query(qx.NOT(qx.EQ("active", false))).ByArrayPos("tags", []string{"w0", "w1", "seed", "grp-1"}, qx.DESC).Skip(2).Max(85),
+		qx.Query(qx.GTE("age", 18)).Sort("age", qx.DESC).Offset(5).Limit(70),
+		qx.Query(qx.HASANY("tags", []string{"w0", "w1", "grp-3", "seed"})).SortBy(qx.LEN("tags"), qx.ASC).Offset(4).Limit(90),
+		qx.Query(qx.IN("country", []string{"NL", "DE", "US"})).SortBy(qx.POS("country", []string{"DE", "NL", "US", "PL"}), qx.ASC).Limit(120),
+		qx.Query(qx.NOT(qx.EQ("active", false))).SortBy(qx.POS("tags", []string{"w0", "w1", "seed", "grp-1"}), qx.DESC).Offset(2).Limit(85),
 	}
 	for i, q := range checkQueries {
 		got, err := db.QueryKeys(q)
@@ -1579,9 +1579,9 @@ func TestRebuildIndex_StormConcurrentMixedOps_FinalConsistency(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("SeqScan(final): %v", err)
 	}
-	cnt, err := db.Count(nil)
+	cnt, err := db.Count()
 	if err != nil {
-		t.Fatalf("Count(nil): %v", err)
+		t.Fatalf("Count(): %v", err)
 	}
 	if cnt != seqCount {
 		t.Fatalf("final count mismatch: count=%d seqscan=%d", cnt, seqCount)
@@ -1746,7 +1746,7 @@ func TestRebuildIndex_RejectsCoreOpsWhileActive(t *testing.T) {
 	_, err = db.Query(qx.Query())
 	expectBusy("Query", err)
 
-	_, err = db.Count(nil)
+	_, err = db.Count()
 	expectBusy("Count", err)
 
 	err = db.Set(2, &Rec{Name: "bob", Age: 31})
@@ -1882,10 +1882,10 @@ func TestPointerNil_StringQueriesAndOrder(t *testing.T) {
 	assertSameSlice(t, gotContains, []uint64{4})
 
 	for _, q := range []*qx.QX{
-		qx.Query().By("opt", qx.ASC),
-		qx.Query().By("opt", qx.DESC),
-		qx.Query(qx.EQ("active", true)).By("opt", qx.ASC).Skip(1).Max(2),
-		qx.Query(qx.EQ("active", true)).By("opt", qx.DESC).Skip(1).Max(2),
+		qx.Query().Sort("opt", qx.ASC),
+		qx.Query().Sort("opt", qx.DESC),
+		qx.Query(qx.EQ("active", true)).Sort("opt", qx.ASC).Offset(1).Limit(2),
+		qx.Query(qx.EQ("active", true)).Sort("opt", qx.DESC).Offset(1).Limit(2),
 	} {
 		got, err := db.QueryKeys(q)
 		if err != nil {
@@ -1944,25 +1944,25 @@ func TestPointerNil_IntQueriesCountRebuildAndReopen(t *testing.T) {
 			t.Fatalf("%s GT count mismatch: got=%v wantCount=%d", stage, gotGT, wantGT)
 		}
 
-		gotAsc, err := db.QueryKeys(qx.Query().By("rank", qx.ASC))
+		gotAsc, err := db.QueryKeys(qx.Query().Sort("rank", qx.ASC))
 		if err != nil {
 			t.Fatalf("%s QueryKeys(By rank ASC): %v", stage, err)
 		}
 		assertSameSlice(t, gotAsc, wantAsc)
 
-		gotDesc, err := db.QueryKeys(qx.Query().By("rank", qx.DESC))
+		gotDesc, err := db.QueryKeys(qx.Query().Sort("rank", qx.DESC))
 		if err != nil {
 			t.Fatalf("%s QueryKeys(By rank DESC): %v", stage, err)
 		}
 		assertSameSlice(t, gotDesc, wantDesc)
 
-		gotAscPage, err := db.QueryKeys(qx.Query().By("rank", qx.ASC).Skip(1).Max(3))
+		gotAscPage, err := db.QueryKeys(qx.Query().Sort("rank", qx.ASC).Offset(1).Limit(3))
 		if err != nil {
 			t.Fatalf("%s QueryKeys(By rank ASC page): %v", stage, err)
 		}
 		assertSameSlice(t, gotAscPage, wantAsc[1:])
 
-		cntNil, err := db.Count(qx.Query(qx.EQ("rank", nil)))
+		cntNil, err := db.Count(qx.Query(qx.EQ("rank", nil)).Filter)
 		if err != nil {
 			t.Fatalf("%s Count(EQ nil): %v", stage, err)
 		}
@@ -1970,7 +1970,7 @@ func TestPointerNil_IntQueriesCountRebuildAndReopen(t *testing.T) {
 			t.Fatalf("%s Count(EQ nil) mismatch: got=%d want=%d", stage, cntNil, wantCountNil)
 		}
 
-		cntIn, err := db.Count(qx.Query(qx.IN("rank", []any{nil, 10})))
+		cntIn, err := db.Count(qx.Query(qx.IN("rank", []any{nil, 10})).Filter)
 		if err != nil {
 			t.Fatalf("%s Count(IN nil,10): %v", stage, err)
 		}
@@ -2103,7 +2103,7 @@ func TestPlanCandidateOrder_SkipsPointerSortField(t *testing.T) {
 	q := qx.Query(
 		qx.NOT(qx.EQ("active", false)),
 		qx.NOT(qx.EQ("country", "PL")),
-	).By("opt", qx.ASC).Max(10)
+	).Sort("opt", qx.ASC).Limit(10)
 
 	got, err := db.QueryKeys(q)
 	if err != nil {
@@ -2141,8 +2141,8 @@ func TestPointerNil_OrderExecutionFastPaths(t *testing.T) {
 		}
 	}
 
-	qLimit := qx.Query(qx.EQ("active", true)).By("opt", qx.ASC).Max(3)
-	limitLeaves := mustExtractAndLeaves(t, qLimit.Expr)
+	qLimit := qx.Query(qx.EQ("active", true)).Sort("opt", qx.ASC).Limit(3)
+	limitLeaves := mustExtractAndLeaves(t, qLimit.Filter)
 	out, used, err := db.tryLimitQueryOrderBasic(qLimit, limitLeaves, nil)
 	if err != nil {
 		t.Fatalf("tryLimitQueryOrderBasic: %v", err)
@@ -2161,7 +2161,7 @@ func TestPointerNil_OrderExecutionFastPaths(t *testing.T) {
 		assertSameSlice(t, got, want)
 	}
 
-	qOffset := qx.Query(qx.EQ("active", true)).By("opt", qx.ASC).Skip(1).Max(2)
+	qOffset := qx.Query(qx.EQ("active", true)).Sort("opt", qx.ASC).Offset(1).Limit(2)
 	out, used, err = db.tryQueryOrderBasicWithLimit(qOffset, nil)
 	if err != nil {
 		t.Fatalf("tryQueryOrderBasicWithLimit: %v", err)
@@ -2175,7 +2175,7 @@ func TestPointerNil_OrderExecutionFastPaths(t *testing.T) {
 	}
 	assertSameSlice(t, out, want)
 
-	qPrefix := qx.Query(qx.PREFIX("opt", "")).By("opt", qx.ASC).Skip(1).Max(2)
+	qPrefix := qx.Query(qx.PREFIX("opt", "")).Sort("opt", qx.ASC).Offset(1).Limit(2)
 	out, used, err = db.tryQueryOrderPrefixWithLimit(qPrefix, nil)
 	if err != nil {
 		t.Fatalf("tryQueryOrderPrefixWithLimit: %v", err)
@@ -2194,7 +2194,7 @@ func TestPointerNil_OrderExecutionFastPaths(t *testing.T) {
 		assertSameSlice(t, got, want)
 	}
 
-	qPrefixDesc := qx.Query(qx.PREFIX("opt", "")).By("opt", qx.DESC).Skip(1).Max(2)
+	qPrefixDesc := qx.Query(qx.PREFIX("opt", "")).Sort("opt", qx.DESC).Offset(1).Limit(2)
 	out, used, err = db.tryQueryOrderPrefixWithLimit(qPrefixDesc, nil)
 	if err != nil {
 		t.Fatalf("tryQueryOrderPrefixWithLimit(desc): %v", err)
@@ -2227,7 +2227,7 @@ func TestPointerNil_OrderSmallSlice_AllNilField(t *testing.T) {
 		t.Fatalf("RebuildIndex: %v", err)
 	}
 
-	q := qx.Query().By("rank", qx.ASC).Max(2)
+	q := qx.Query().Sort("rank", qx.ASC).Limit(2)
 	got, err := db.QueryKeys(q)
 	if err != nil {
 		t.Fatalf("QueryKeys: %v", err)
@@ -2256,14 +2256,17 @@ func TestPointerNil_ExecPlanOrderedBasic_BaseNilTail(t *testing.T) {
 
 	q := normalizeQueryForTest(qx.Query(
 		qx.NOT(qx.EQ("active", false)),
-	).By("opt", qx.ASC).Skip(1).Max(3))
+	).Sort("opt", qx.ASC).Offset(1).Limit(3))
 
-	leaves, ok := collectAndLeaves(q.Expr)
-	if !ok {
-		t.Fatalf("collectAndLeaves: ok=false")
+	preparedQ, viewQ, err := prepareTestQuery(db, q)
+	if err != nil {
+		t.Fatalf("prepareTestQuery: %v", err)
 	}
-	window, _ := orderWindow(q)
-	preds, ok := db.buildPredicatesOrderedWithMode(leaves, "opt", false, window, q.Offset, true, true)
+	defer preparedQ.Release()
+
+	leaves := mustExtractAndLeaves(t, q.Filter)
+	window, _ := orderWindow(&viewQ)
+	preds, ok := db.buildPredicatesOrderedWithMode(leaves, "opt", false, window, q.Window.Offset, true, true)
 	if !ok {
 		t.Fatalf("buildPredicatesOrderedWithMode: ok=false")
 	}
@@ -2273,7 +2276,7 @@ func TestPointerNil_ExecPlanOrderedBasic_BaseNilTail(t *testing.T) {
 	if !ok {
 		t.Fatalf("execPlanOrderedBasic: ok=false")
 	}
-	want, err := db.execPreparedQuery(q)
+	want, err := db.currentQueryViewForTests().execPreparedQuery(&viewQ)
 	if err != nil {
 		t.Fatalf("execPreparedQuery: %v", err)
 	}
@@ -2325,7 +2328,7 @@ func TestPointerNil_TryPlanOrdered_AllowsPointerSortField(t *testing.T) {
 
 	q := normalizeQueryForTest(qx.Query(
 		qx.NOT(qx.EQ("active", false)),
-	).By("opt", qx.DESC).Skip(1).Max(2))
+	).Sort("opt", qx.DESC).Offset(1).Limit(2))
 
 	got, ok, err := db.tryPlan(q, nil)
 	if err != nil {
@@ -2334,7 +2337,13 @@ func TestPointerNil_TryPlanOrdered_AllowsPointerSortField(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected tryPlan to use ordered planner path for pointer sort field")
 	}
-	want, err := db.execPreparedQuery(q)
+	preparedQ, viewQ, err := prepareTestQuery(db, q)
+	if err != nil {
+		t.Fatalf("prepareTestQuery: %v", err)
+	}
+	defer preparedQ.Release()
+
+	want, err := db.currentQueryViewForTests().execPreparedQuery(&viewQ)
 	if err != nil {
 		t.Fatalf("execPreparedQuery: %v", err)
 	}
@@ -2600,7 +2609,7 @@ func indexExtBoundCase(t *testing.T, ops ...struct {
 	t.Helper()
 	rb := rangeBounds{has: true}
 	for _, op := range ops {
-		if !rb.applyOp(op.op, op.key) {
+		if !rb.applyOp(compileScalarOpForTest(op.op), op.key) {
 			t.Fatalf("applyOp(%v, %q) failed", op.op, op.key)
 		}
 	}
@@ -2756,7 +2765,7 @@ func indexExtAssertCountExpected(t *testing.T, db *DB[uint64, Rec], q *qx.QX) {
 	if err != nil {
 		t.Fatalf("expectedKeysUint64: %v", err)
 	}
-	got, err := db.Count(q)
+	got, err := db.Count(q.Filter)
 	if err != nil {
 		t.Fatalf("Count: %v", err)
 	}
@@ -3611,7 +3620,7 @@ func TestIndexExt_DBFieldOverlayPromotesOnDistinctGrowth(t *testing.T) {
 		t.Fatalf("expected chunked name overlay above threshold")
 	}
 
-	indexExtAssertQueryKeysExpected(t, db, qx.Query(qx.PREFIX("name", "prom/")).By("name", qx.ASC))
+	indexExtAssertQueryKeysExpected(t, db, qx.Query(qx.PREFIX("name", "prom/")).Sort("name", qx.ASC))
 }
 
 func TestIndexExt_DBFieldOverlayDemotesOnDistinctCollapse(t *testing.T) {
@@ -3633,7 +3642,7 @@ func TestIndexExt_DBFieldOverlayDemotesOnDistinctCollapse(t *testing.T) {
 		t.Fatalf("expected flat name overlay after deletes")
 	}
 
-	indexExtAssertQueryKeysExpected(t, db, qx.Query(qx.PREFIX("name", "dem/")).By("name", qx.ASC))
+	indexExtAssertQueryKeysExpected(t, db, qx.Query(qx.PREFIX("name", "dem/")).Sort("name", qx.ASC))
 }
 
 func TestIndexExt_DBPrefixQueryAfterSetPatchDeleteMatchesExpected(t *testing.T) {
@@ -3664,7 +3673,7 @@ func TestIndexExt_DBPrefixQueryAfterSetPatchDeleteMatchesExpected(t *testing.T) 
 		return &Rec{Name: fmt.Sprintf("aa/new/%03d", i), Age: i}
 	})
 
-	q := qx.Query(qx.PREFIX("name", "aa/")).By("name", qx.ASC)
+	q := qx.Query(qx.PREFIX("name", "aa/")).Sort("name", qx.ASC)
 	indexExtAssertQueryKeysExpected(t, db, q)
 }
 
@@ -3691,7 +3700,7 @@ func TestIndexExt_DBRangeQueryAfterBoundaryPatchesMatchesExpected(t *testing.T) 
 		}
 	}
 
-	q := qx.Query(qx.GTE("age", 200), qx.LT("age", 350)).By("age", qx.ASC)
+	q := qx.Query(qx.GTE("age", 200), qx.LT("age", 350)).Sort("age", qx.ASC)
 	indexExtAssertQueryKeysExpected(t, db, q)
 }
 
@@ -3767,7 +3776,7 @@ func TestIndexExt_DBOrderAscAfterChurnMatchesExpected(t *testing.T) {
 		}
 	}
 
-	q := qx.Query(qx.PREFIX("name", "orda/")).By("age", qx.ASC)
+	q := qx.Query(qx.PREFIX("name", "orda/")).Sort("age", qx.ASC)
 	indexExtAssertQueryKeysExpected(t, db, q)
 }
 
@@ -3807,7 +3816,7 @@ func TestIndexExt_DBOrderDescLimitOffsetAfterChurnMatchesExpected(t *testing.T) 
 		}
 	}
 
-	q := qx.Query(qx.EQ("active", true)).By("age", qx.DESC).Skip(17).Max(61)
+	q := qx.Query(qx.EQ("active", true)).Sort("age", qx.DESC).Offset(17).Limit(61)
 	indexExtAssertQueryKeysExpected(t, db, q)
 }
 
@@ -3841,7 +3850,7 @@ func TestIndexExt_DBNilPointerTransitionsPreserveIndexes(t *testing.T) {
 		t.Fatalf("expected opt overlay to remain chunked")
 	}
 
-	indexExtAssertQueryKeysExpected(t, db, qx.Query(qx.PREFIX("opt", "opt-hot-")).By("opt", qx.ASC))
+	indexExtAssertQueryKeysExpected(t, db, qx.Query(qx.PREFIX("opt", "opt-hot-")).Sort("opt", qx.ASC))
 	indexExtAssertQueryKeysExpected(t, db, qx.Query(qx.EQ("opt", nil)))
 }
 
@@ -3877,7 +3886,7 @@ func TestIndexExt_DBSliceReplaceRemovesStaleTermsAndLenBuckets(t *testing.T) {
 	}
 
 	indexExtAssertQueryKeysExpected(t, db, qx.Query(qx.HASANY("tags", []string{"hot"})))
-	indexExtAssertQueryKeysExpected(t, db, qx.Query(qx.HAS("tags", []string{"shared", "hot"})))
+	indexExtAssertQueryKeysExpected(t, db, qx.Query(qx.HASALL("tags", []string{"shared", "hot"})))
 
 	var wantZero []uint64
 	for i := 1; i <= 30; i++ {
@@ -4073,7 +4082,7 @@ func TestIndexExt_DBFloatSignedZeroBetweenBoundsMatchesExpected(t *testing.T) {
 	q := qx.Query(
 		qx.GTE("score", 0.0),
 		qx.LTE("score", 0.0),
-	).By("score", qx.ASC)
+	).Sort("score", qx.ASC)
 
 	indexExtAssertQueryKeysExpected(t, db, q)
 	indexExtAssertCountExpected(t, db, q)
@@ -4084,7 +4093,7 @@ func TestIndexExt_DBFloatSignedZeroOrderAscMatchesExpected(t *testing.T) {
 
 	q := qx.Query(
 		qx.GTE("score", -1.0),
-	).By("score", qx.ASC).Max(8)
+	).Sort("score", qx.ASC).Limit(8)
 
 	indexExtAssertQueryKeysExpected(t, db, q)
 }
@@ -4147,14 +4156,14 @@ func TestIndexExt_DBFloatNaNCountMatchesExpected(t *testing.T) {
 func TestIndexExt_DBFloatNaNLessEqualMatchesExpected(t *testing.T) {
 	db := indexExtFloatNaNChunkedDB(t)
 
-	q := qx.Query(qx.LTE("score", math.NaN())).By("score", qx.ASC).Max(16)
+	q := qx.Query(qx.LTE("score", math.NaN())).Sort("score", qx.ASC).Limit(16)
 	indexExtAssertQueryKeysExpected(t, db, q)
 }
 
 func TestIndexExt_DBFloatNaNGreaterEqualMatchesExpected(t *testing.T) {
 	db := indexExtFloatNaNChunkedDB(t)
 
-	q := qx.Query(qx.GTE("score", math.NaN())).By("score", qx.ASC).Max(16)
+	q := qx.Query(qx.GTE("score", math.NaN())).Sort("score", qx.ASC).Limit(16)
 	indexExtAssertQueryKeysExpected(t, db, q)
 	indexExtAssertCountExpected(t, db, q)
 }
@@ -4185,7 +4194,7 @@ func TestIndexExt_DBIntFieldFloatEqualityMatchesExpected(t *testing.T) {
 func TestIndexExt_DBIntFieldFloatRangeMatchesExpected(t *testing.T) {
 	db := indexExtNumericCoercionChunkedDB(t)
 
-	q := qx.Query(qx.GTE("age", 200.0), qx.LT("age", 205.0)).By("age", qx.ASC)
+	q := qx.Query(qx.GTE("age", 200.0), qx.LT("age", 205.0)).Sort("age", qx.ASC)
 	indexExtAssertQueryKeysExpected(t, db, q)
 	indexExtAssertCountExpected(t, db, q)
 }
@@ -4201,7 +4210,7 @@ func TestIndexExt_DBFloatFieldIntEqualityMatchesExpected(t *testing.T) {
 func TestIndexExt_DBFloatFieldIntRangeMatchesExpected(t *testing.T) {
 	db := indexExtNumericCoercionChunkedDB(t)
 
-	q := qx.Query(qx.GTE("score", 200), qx.LT("score", 205)).By("score", qx.ASC)
+	q := qx.Query(qx.GTE("score", 200), qx.LT("score", 205)).Sort("score", qx.ASC)
 	indexExtAssertQueryKeysExpected(t, db, q)
 	indexExtAssertCountExpected(t, db, q)
 }
@@ -4217,7 +4226,7 @@ func TestIndexExt_DBIntFieldUintEqualityMatchesExpected(t *testing.T) {
 func TestIndexExt_DBIntFieldUintRangeMatchesExpected(t *testing.T) {
 	db := indexExtNumericCoercionChunkedDB(t)
 
-	q := qx.Query(qx.GTE("age", uint64(200)), qx.LT("age", uint64(205))).By("age", qx.ASC)
+	q := qx.Query(qx.GTE("age", uint64(200)), qx.LT("age", uint64(205))).Sort("age", qx.ASC)
 	indexExtAssertQueryKeysExpected(t, db, q)
 	indexExtAssertCountExpected(t, db, q)
 }

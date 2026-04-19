@@ -60,7 +60,7 @@ func runReadAccountByEmailItems(ctx *WorkloadContext, rng *rand.Rand) (string, e
 		return runReadProfileByIDItems(ctx, rng)
 	}
 	email := pickSampleEmail(rng, ctx.EmailSamples)
-	q := qx.Query(qx.EQ("email", email)).Max(1)
+	q := qx.Query(qx.EQ("email", email)).Limit(1)
 	done := traceQuery(ctx, queryName)
 	defer done()
 	items, err := ctx.DB.Query(q)
@@ -75,7 +75,7 @@ func runReadMemberDirectoryPrefixItems(ctx *WorkloadContext, rng *rand.Rand) (st
 	q := qx.Query(
 		qx.PREFIX("name", prefix),
 		qx.EQ("status", "active"),
-	).By("name", qx.ASC).Max(12)
+	).Sort("name", qx.ASC).Limit(12)
 	done := traceQuery(ctx, queryName)
 	defer done()
 	items, err := ctx.DB.Query(q)
@@ -89,7 +89,7 @@ func runReadRecentCountryActiveItems(ctx *WorkloadContext, rng *rand.Rand) (stri
 	q := qx.Query(
 		qx.EQ("country", country),
 		qx.EQ("status", "active"),
-	).By("last_login", qx.DESC).Max(20)
+	).Sort("last_login", qx.DESC).Limit(20)
 	done := traceQuery(ctx, queryName)
 	defer done()
 	items, err := ctx.DB.Query(q)
@@ -109,7 +109,7 @@ func runReadActiveRegionProItems(ctx *WorkloadContext, rng *rand.Rand) (string, 
 			qx.IN("country", []string{c1, c2}),
 			qx.NOTIN("plan", []string{"free"}),
 		),
-	).By("last_login", qx.DESC).Max(40)
+	).Sort("last_login", qx.DESC).Limit(40)
 	done := traceQuery(ctx, queryName)
 	defer done()
 	items, err := ctx.DB.Query(q)
@@ -131,7 +131,7 @@ func runReadFrontpageCandidateKeys(ctx *WorkloadContext, rng *rand.Rand) (string
 			qx.GTE("score", 120.0),
 			qx.GTE("last_login", now-45*24*3600),
 		),
-	).By("score", qx.DESC).Max(100)
+	).Sort("score", qx.DESC).Limit(100)
 	done := traceQuery(ctx, queryName)
 	defer done()
 	_, err := ctx.DB.QueryKeys(q)
@@ -156,7 +156,7 @@ func runReadModerationQueueKeys(ctx *WorkloadContext, rng *rand.Rand) (string, e
 				qx.GTE("created_at", now-180*24*3600),
 			),
 		),
-	).By("created_at", qx.DESC).Max(100)
+	).Sort("created_at", qx.DESC).Limit(100)
 	done := traceQuery(ctx, queryName)
 	defer done()
 	_, err := ctx.DB.QueryKeys(q)
@@ -172,7 +172,7 @@ func runReadLeaderboardTopItems(ctx *WorkloadContext, _ *rand.Rand) (string, err
 			qx.GTE("score", 250.0),
 			qx.GTE("last_login", now-180*24*3600),
 		),
-	).By("score", qx.DESC).Max(50)
+	).Sort("score", qx.DESC).Limit(50)
 	done := traceQuery(ctx, queryName)
 	defer done()
 	items, err := ctx.DB.Query(q)
@@ -195,7 +195,7 @@ func runReadSignupDashboardCount(ctx *WorkloadContext, rng *rand.Rand) (string, 
 	)
 	done := traceQuery(ctx, queryName)
 	defer done()
-	_, err := ctx.DB.Count(q)
+	_, err := ctx.DB.Count(q.Filter)
 	return queryName, err
 }
 
@@ -209,7 +209,7 @@ func runReadInactiveCleanupKeys(ctx *WorkloadContext, _ *rand.Rand) (string, err
 			qx.NOTIN("plan", []string{"pro", "enterprise"}),
 			qx.LT("score", 120.0),
 		),
-	).Max(250)
+	).Limit(250)
 	done := traceQuery(ctx, queryName)
 	defer done()
 	_, err := ctx.DB.QueryKeys(q)
@@ -227,7 +227,7 @@ func runReadStaffAuditFeedKeys(ctx *WorkloadContext, rng *rand.Rand) (string, er
 			qx.NOTIN("status", []string{"banned"}),
 			qx.EQ("country", country),
 		),
-	).By("last_login", qx.DESC).Max(120)
+	).Sort("last_login", qx.DESC).Limit(120)
 	done := traceQuery(ctx, queryName)
 	defer done()
 	_, err := ctx.DB.QueryKeys(q)
@@ -262,7 +262,7 @@ func runReadDiscoveryExploreKeys(ctx *WorkloadContext, rng *rand.Rand) (string, 
 				qx.GTE("last_login", now-14*24*3600),
 			),
 		),
-	).By("created_at", qx.DESC).Max(150)
+	).Sort("created_at", qx.DESC).Limit(150)
 	done := traceQuery(ctx, queryName)
 	defer done()
 	_, err := ctx.DB.QueryKeys(q)
@@ -280,7 +280,7 @@ func runReadDormantArchivePageKeys(ctx *WorkloadContext, rng *rand.Rand) (string
 			qx.NOTIN("plan", []string{"enterprise"}),
 			qx.LT("score", 180.0),
 		),
-	).By("last_login", qx.ASC).Skip(skip).Max(100)
+	).Sort("last_login", qx.ASC).Offset(skip).Limit(100)
 	done := traceQuery(ctx, queryName)
 	defer done()
 	_, err := ctx.DB.QueryKeys(q)

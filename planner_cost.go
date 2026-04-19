@@ -3,8 +3,8 @@ package rbi
 import (
 	"math"
 
-	"github.com/vapstack/qx"
 	"github.com/vapstack/rbi/internal/pooled"
+	"github.com/vapstack/rbi/internal/qir"
 )
 
 // Cost model margins. Values below 1 require measurable advantage
@@ -39,10 +39,10 @@ type plannerOROrderDecision struct {
 	fallbackCost float64
 }
 
-func (qv *queryView[K, V]) decidePlanORNoOrder(q *qx.QX, branches plannerORBranches) plannerORNoOrderDecision {
+func (qv *queryView[K, V]) decidePlanORNoOrder(q *qir.Shape, branches plannerORBranches) plannerORNoOrderDecision {
 	var d plannerORNoOrderDecision
 
-	if len(q.Order) != 0 {
+	if q.HasOrder {
 		return d
 	}
 	need, ok := orderWindow(q)
@@ -100,12 +100,12 @@ func (qv *queryView[K, V]) decidePlanORNoOrder(q *qx.QX, branches plannerORBranc
 	return d
 }
 
-func (branches plannerORBranches) hasNonOrderPrefixTailRisk(orderField string) bool {
+func (qv *queryView[K, V]) hasNonOrderPrefixTailRisk(branches plannerORBranches, orderField string) bool {
 	for i := 0; i < branches.Len(); i++ {
 		branch := branches.Get(i)
 		for pi := 0; pi < branch.predLen(); pi++ {
 			p := branch.pred(pi)
-			if isPositiveNonOrderScalarPrefixLeaf(orderField, p.expr) && !p.isMaterializedLike() {
+			if qv.isPositiveNonOrderScalarPrefixLeaf(orderField, p.expr) && !p.isMaterializedLike() {
 				return true
 			}
 		}
@@ -113,24 +113,25 @@ func (branches plannerORBranches) hasNonOrderPrefixTailRisk(orderField string) b
 	return false
 }
 
-func (qv *queryView[K, V]) decidePlanOROrder(q *qx.QX, branches plannerORBranches) plannerOROrderDecision {
+func (qv *queryView[K, V]) decidePlanOROrder(q *qir.Shape, branches plannerORBranches) plannerOROrderDecision {
 	d := plannerOROrderDecision{plan: plannerOROrderFallback}
 
-	if len(q.Order) != 1 {
+	if !q.HasOrder {
 		return d
 	}
 
-	o := q.Order[0]
-	if o.Type != qx.OrderBasic {
+	o := q.Order
+	if o.Kind != qir.OrderKindBasic {
 		return d
 	}
+	orderField := qv.fieldNameByOrder(o)
 
-	fm := qv.fields[o.Field]
+	fm := qv.fieldMetaByOrder(o)
 	if fm == nil || fm.Slice {
 		return d
 	}
 
-	ov := qv.fieldOverlay(o.Field)
+	ov := qv.fieldOverlayForOrder(o)
 	if !ov.hasData() {
 		return d
 	}
@@ -149,14 +150,14 @@ func (qv *queryView[K, V]) decidePlanOROrder(q *qx.QX, branches plannerORBranche
 		return d
 	}
 
-	mergeStats := qv.orderMergeBranchStats(o.Field, branches, ov)
+	mergeStats := qv.orderMergeBranchStats(orderField, branches, ov)
 	var branchCards [plannerORBranchLimit]uint64
 	unionCard, sumCard, branchCount, hasAlwaysTrue := branches.unionCards(universe, &branchCards)
 	if unionCard == 0 {
 		return d
 	}
 
-	orderStats := qv.plannerOrderFieldStats(o.Field, snap, universe, orderDistinct)
+	orderStats := qv.plannerOrderFieldStats(orderField, snap, universe, orderDistinct)
 	expectedRows := estimateRowsForNeed(uint64(need), unionCard, universe)
 	routeCost, routeOK := qv.estimateOROrderMergeRouteCost(q, branches, need, mergeStats)
 
@@ -680,14 +681,15 @@ type mergedBaseScalarRangeField struct {
 
 func (qv *queryView[K, V]) collectMergedBaseScalarRangeFields(
 	orderField string,
-	leaves []qx.Expr,
+	leaves []qir.Expr,
 	dst []mergedBaseScalarRangeField,
 ) ([]mergedBaseScalarRangeField, bool) {
 	for _, e := range leaves {
-		if e.Not || e.Field == "" || e.Field == orderField || len(e.Operands) != 0 || !isScalarRangeEqOp(e.Op) {
+		fieldName := qv.fieldNameByExpr(e)
+		if e.Not || e.FieldOrdinal < 0 || fieldName == orderField || len(e.Operands) != 0 || !isScalarRangeEqOp(e.Op) {
 			continue
 		}
-		fm := qv.fields[e.Field]
+		fm := qv.fieldMetaByExpr(e)
 		if fm == nil || fm.Slice {
 			continue
 		}
@@ -697,7 +699,7 @@ func (qv *queryView[K, V]) collectMergedBaseScalarRangeFields(
 		}
 		merged := false
 		for i := range dst {
-			if dst[i].field != e.Field {
+			if dst[i].field != fieldName {
 				continue
 			}
 			mergeRangeBounds(&dst[i].bounds, nextRB)
@@ -708,7 +710,7 @@ func (qv *queryView[K, V]) collectMergedBaseScalarRangeFields(
 			continue
 		}
 		dst = append(dst, mergedBaseScalarRangeField{
-			field:  e.Field,
+			field:  fieldName,
 			bounds: nextRB,
 		})
 	}
@@ -717,15 +719,16 @@ func (qv *queryView[K, V]) collectMergedBaseScalarRangeFields(
 
 func (qv *queryView[K, V]) collectMergedBaseScalarRangeFieldsBuf(
 	orderField string,
-	leaves *pooled.SliceBuf[qx.Expr],
+	leaves *pooled.SliceBuf[qir.Expr],
 	dst []mergedBaseScalarRangeField,
 ) ([]mergedBaseScalarRangeField, bool) {
 	for i := 0; i < leaves.Len(); i++ {
 		e := leaves.Get(i)
-		if e.Not || e.Field == "" || e.Field == orderField || len(e.Operands) != 0 || !isScalarRangeEqOp(e.Op) {
+		fieldName := qv.fieldNameByExpr(e)
+		if e.Not || e.FieldOrdinal < 0 || fieldName == orderField || len(e.Operands) != 0 || !isScalarRangeEqOp(e.Op) {
 			continue
 		}
-		fm := qv.fields[e.Field]
+		fm := qv.fieldMetaByExpr(e)
 		if fm == nil || fm.Slice {
 			continue
 		}
@@ -735,7 +738,7 @@ func (qv *queryView[K, V]) collectMergedBaseScalarRangeFieldsBuf(
 		}
 		merged := false
 		for j := range dst {
-			if dst[j].field != e.Field {
+			if dst[j].field != fieldName {
 				continue
 			}
 			mergeRangeBounds(&dst[j].bounds, nextRB)
@@ -746,7 +749,7 @@ func (qv *queryView[K, V]) collectMergedBaseScalarRangeFieldsBuf(
 			continue
 		}
 		dst = append(dst, mergedBaseScalarRangeField{
-			field:  e.Field,
+			field:  fieldName,
 			bounds: nextRB,
 		})
 	}
@@ -813,24 +816,25 @@ func (qv *queryView[K, V]) estimateMergedScalarRangeOrderCost(
 	return selectivity, fallbackWork, true
 }
 
-func executionOrderShapeInfo(orderField string, leaves []qx.Expr) (hasOrderPrefix bool, compatible bool) {
+func (qv *queryView[K, V]) executionOrderShapeInfo(orderField string, leaves []qir.Expr) (hasOrderPrefix bool, compatible bool) {
 	for _, e := range leaves {
-		if e.Op == qx.OpNOOP {
+		if e.Op == qir.OpNOOP {
 			if e.Not {
 				return false, false
 			}
 			continue
 		}
 		if e.Not {
-			if e.Field == "" || e.Field == orderField {
+			fieldName := qv.fieldNameByExpr(e)
+			if e.FieldOrdinal < 0 || fieldName == orderField {
 				return false, false
 			}
 			continue
 		}
-		if e.Field == "" {
+		if e.FieldOrdinal < 0 {
 			return false, false
 		}
-		switch classifyOrderFieldScalarLeaf(orderField, e) {
+		switch qv.classifyOrderFieldScalarLeaf(orderField, e) {
 		case orderFieldScalarLeafOther:
 			continue
 		case orderFieldScalarLeafRange:
@@ -843,25 +847,26 @@ func executionOrderShapeInfo(orderField string, leaves []qx.Expr) (hasOrderPrefi
 	return hasOrderPrefix, true
 }
 
-func executionOrderShapeInfoBuf(orderField string, leaves *pooled.SliceBuf[qx.Expr]) (hasOrderPrefix bool, compatible bool) {
+func (qv *queryView[K, V]) executionOrderShapeInfoBuf(orderField string, leaves *pooled.SliceBuf[qir.Expr]) (hasOrderPrefix bool, compatible bool) {
 	for i := 0; i < leaves.Len(); i++ {
 		e := leaves.Get(i)
-		if e.Op == qx.OpNOOP {
+		if e.Op == qir.OpNOOP {
 			if e.Not {
 				return false, false
 			}
 			continue
 		}
 		if e.Not {
-			if e.Field == "" || e.Field == orderField {
+			fieldName := qv.fieldNameByExpr(e)
+			if e.FieldOrdinal < 0 || fieldName == orderField {
 				return false, false
 			}
 			continue
 		}
-		if e.Field == "" {
+		if e.FieldOrdinal < 0 {
 			return false, false
 		}
-		switch classifyOrderFieldScalarLeaf(orderField, e) {
+		switch qv.classifyOrderFieldScalarLeaf(orderField, e) {
 		case orderFieldScalarLeafOther:
 			continue
 		case orderFieldScalarLeafRange:
@@ -874,13 +879,13 @@ func executionOrderShapeInfoBuf(orderField string, leaves *pooled.SliceBuf[qx.Ex
 	return hasOrderPrefix, true
 }
 
-func (qv *queryView[K, V]) decideExecutionOrderByCost(q *qx.QX, leaves []qx.Expr) plannerExecutionOrderDecision {
+func (qv *queryView[K, V]) decideExecutionOrderByCost(q *qir.Shape, leaves []qir.Expr) plannerExecutionOrderDecision {
 	var d plannerExecutionOrderDecision
 
 	if q.Expr.Not {
 		return d
 	}
-	if len(q.Order) != 1 {
+	if !q.HasOrder {
 		return d
 	}
 	if q.Limit == 0 {
@@ -895,28 +900,29 @@ func (qv *queryView[K, V]) decideExecutionOrderByCost(q *qx.QX, leaves []qx.Expr
 		return d
 	}
 
-	o := q.Order[0]
-	if o.Type != qx.OrderBasic || o.Field == "" {
+	o := q.Order
+	if o.Kind != qir.OrderKindBasic || o.FieldOrdinal < 0 {
 		return d
 	}
+	orderField := qv.fieldNameByOrder(o)
 
-	fm := qv.fields[o.Field]
+	fm := qv.fieldMetaByOrder(o)
 	if fm == nil || fm.Slice {
 		return d
 	}
 
-	ov := qv.fieldOverlay(o.Field)
+	ov := qv.fieldOverlayForOrder(o)
 	useOverlayProfile := ov.hasData()
 
 	var orderSlice *[]index
 	if !useOverlayProfile {
-		orderSlice = qv.snapshotFieldIndexSlice(o.Field)
+		orderSlice = qv.snapshotFieldIndexSliceForOrder(o)
 		if orderSlice == nil || len(*orderSlice) == 0 {
 			return d
 		}
 	}
 
-	hasOrderPrefix, compatible := executionOrderShapeInfo(o.Field, leaves)
+	hasOrderPrefix, compatible := qv.executionOrderShapeInfo(orderField, leaves)
 	if !compatible {
 		return d
 	}
@@ -931,7 +937,7 @@ func (qv *queryView[K, V]) decideExecutionOrderByCost(q *qx.QX, leaves []qx.Expr
 	orderDistinct := uint64(0)
 
 	if useOverlayProfile {
-		profile, ok = qv.estimateOrderedProfileOverlay(o.Field, leaves, ov, snap, universe)
+		profile, ok = qv.estimateOrderedProfileOverlay(orderField, leaves, ov, snap, universe)
 		if !ok {
 			return d
 		}
@@ -940,7 +946,7 @@ func (qv *queryView[K, V]) decideExecutionOrderByCost(q *qx.QX, leaves []qx.Expr
 			return d
 		}
 	} else {
-		profile, ok = qv.estimateOrderedProfile(o.Field, leaves, *orderSlice, snap, universe)
+		profile, ok = qv.estimateOrderedProfile(orderField, leaves, *orderSlice, snap, universe)
 		if !ok {
 			return d
 		}
@@ -963,7 +969,7 @@ func (qv *queryView[K, V]) decideExecutionOrderByCost(q *qx.QX, leaves []qx.Expr
 		return d
 	}
 
-	orderStats := qv.plannerOrderFieldStats(o.Field, snap, universe, orderDistinct)
+	orderStats := qv.plannerOrderFieldStats(orderField, snap, universe, orderDistinct)
 	orderSkew := orderStats.skew()
 	expectedProbeRows := estimateOrderExpectedProbes(float64(need), float64(universe), profile.selectivity, profile.coverage, orderSkew)
 
@@ -1001,13 +1007,13 @@ func (qv *queryView[K, V]) decideExecutionOrderByCost(q *qx.QX, leaves []qx.Expr
 	return d
 }
 
-func (qv *queryView[K, V]) decideExecutionOrderByCostBuf(q *qx.QX, leaves *pooled.SliceBuf[qx.Expr]) plannerExecutionOrderDecision {
+func (qv *queryView[K, V]) decideExecutionOrderByCostBuf(q *qir.Shape, leaves *pooled.SliceBuf[qir.Expr]) plannerExecutionOrderDecision {
 	var d plannerExecutionOrderDecision
 
 	if q.Expr.Not {
 		return d
 	}
-	if len(q.Order) != 1 {
+	if !q.HasOrder {
 		return d
 	}
 	if q.Limit == 0 {
@@ -1022,28 +1028,29 @@ func (qv *queryView[K, V]) decideExecutionOrderByCostBuf(q *qx.QX, leaves *poole
 		return d
 	}
 
-	o := q.Order[0]
-	if o.Type != qx.OrderBasic || o.Field == "" {
+	o := q.Order
+	if o.Kind != qir.OrderKindBasic || o.FieldOrdinal < 0 {
 		return d
 	}
+	orderField := qv.fieldNameByOrder(o)
 
-	fm := qv.fields[o.Field]
+	fm := qv.fieldMetaByOrder(o)
 	if fm == nil || fm.Slice {
 		return d
 	}
 
-	ov := qv.fieldOverlay(o.Field)
+	ov := qv.fieldOverlayForOrder(o)
 	useOverlayProfile := ov.hasData()
 
 	var orderSlice *[]index
 	if !useOverlayProfile {
-		orderSlice = qv.snapshotFieldIndexSlice(o.Field)
+		orderSlice = qv.snapshotFieldIndexSliceForOrder(o)
 		if orderSlice == nil || len(*orderSlice) == 0 {
 			return d
 		}
 	}
 
-	hasOrderPrefix, compatible := executionOrderShapeInfoBuf(o.Field, leaves)
+	hasOrderPrefix, compatible := qv.executionOrderShapeInfoBuf(orderField, leaves)
 	if !compatible {
 		return d
 	}
@@ -1058,7 +1065,7 @@ func (qv *queryView[K, V]) decideExecutionOrderByCostBuf(q *qx.QX, leaves *poole
 	orderDistinct := uint64(0)
 
 	if useOverlayProfile {
-		profile, ok = qv.estimateOrderedProfileOverlayBuf(o.Field, leaves, ov, snap, universe)
+		profile, ok = qv.estimateOrderedProfileOverlayBuf(orderField, leaves, ov, snap, universe)
 		if !ok {
 			return d
 		}
@@ -1067,7 +1074,7 @@ func (qv *queryView[K, V]) decideExecutionOrderByCostBuf(q *qx.QX, leaves *poole
 			return d
 		}
 	} else {
-		profile, ok = qv.estimateOrderedProfileBuf(o.Field, leaves, *orderSlice, snap, universe)
+		profile, ok = qv.estimateOrderedProfileBuf(orderField, leaves, *orderSlice, snap, universe)
 		if !ok {
 			return d
 		}
@@ -1090,7 +1097,7 @@ func (qv *queryView[K, V]) decideExecutionOrderByCostBuf(q *qx.QX, leaves *poole
 		return d
 	}
 
-	orderStats := qv.plannerOrderFieldStats(o.Field, snap, universe, orderDistinct)
+	orderStats := qv.plannerOrderFieldStats(orderField, snap, universe, orderDistinct)
 	orderSkew := orderStats.skew()
 	expectedProbeRows := estimateOrderExpectedProbes(float64(need), float64(universe), profile.selectivity, profile.coverage, orderSkew)
 
@@ -1128,7 +1135,7 @@ func (qv *queryView[K, V]) decideExecutionOrderByCostBuf(q *qx.QX, leaves *poole
 	return d
 }
 
-func (qv *queryView[K, V]) shouldPreferExecutionPlan(q *qx.QX, trace *queryTrace) bool {
+func (qv *queryView[K, V]) shouldPreferExecutionPlan(q *qir.Shape, trace *queryTrace) bool {
 	if plannerObviousExecutionFastPath(q) {
 		if trace != nil {
 			trace.setEstimated(q.Limit, 1.0, 2.0)
@@ -1136,13 +1143,13 @@ func (qv *queryView[K, V]) shouldPreferExecutionPlan(q *qx.QX, trace *queryTrace
 		return true
 	}
 
-	var leavesBuf [8]qx.Expr
+	var leavesBuf [8]qir.Expr
 	leaves, ok := collectAndLeavesScratch(q.Expr, leavesBuf[:0])
 	if !ok || len(leaves) == 0 {
 		return false
 	}
 
-	if len(q.Order) == 0 {
+	if !q.HasOrder {
 		if qv.shouldPreferExecutionNoOrderPrefix(q, leaves) {
 			if trace != nil {
 				trace.setEstimated(q.Limit, 1.0, 1.1)
@@ -1152,11 +1159,12 @@ func (qv *queryView[K, V]) shouldPreferExecutionPlan(q *qx.QX, trace *queryTrace
 		return false
 	}
 
-	if q.Offset == 0 && len(q.Order) == 1 && q.Order[0].Type == qx.OrderBasic && len(leaves) == 1 {
+	if q.Offset == 0 && q.HasOrder && q.Order.Kind == qir.OrderKindBasic && len(leaves) == 1 {
 		e := leaves[0]
-		if !e.Not && e.Field != "" && e.Field != q.Order[0].Field && len(e.Operands) == 0 {
+		orderField := qv.fieldNameByOrder(q.Order)
+		if !e.Not && e.FieldOrdinal >= 0 && qv.fieldNameByExpr(e) != orderField && len(e.Operands) == 0 {
 			switch e.Op {
-			case qx.OpEQ, qx.OpIN, qx.OpHAS, qx.OpHASANY:
+			case qir.OpEQ, qir.OpIN, qir.OpHASALL, qir.OpHASANY:
 				return false
 			}
 		}
@@ -1167,10 +1175,11 @@ func (qv *queryView[K, V]) shouldPreferExecutionPlan(q *qx.QX, trace *queryTrace
 		return false
 	}
 
-	if q.Offset == 0 && len(q.Order) == 1 && q.Order[0].Type == qx.OrderBasic {
-		if _, ok, err := qv.extractBoundsForField(q.Order[0].Field, leaves); err == nil && ok {
-			if qv.supportsLimitLeafPredsExcludingBounds(leaves, q.Order[0].Field) &&
-				!qv.hasWarmScalarLimitLeafPredsExcludingBounds(leaves, q.Order[0].Field) {
+	if q.Offset == 0 && q.HasOrder && q.Order.Kind == qir.OrderKindBasic {
+		orderField := qv.fieldNameByOrder(q.Order)
+		if _, ok, err := qv.extractBoundsForField(orderField, leaves); err == nil && ok {
+			if qv.supportsLimitLeafPredsExcludingBounds(leaves, orderField) &&
+				!qv.hasWarmScalarLimitLeafPredsExcludingBounds(leaves, orderField) {
 				if trace != nil {
 					trace.setEstimated(execDecision.expectedProbeRows, execDecision.executionCost, execDecision.executionCost*plannerExecutionPreferGain)
 				}
@@ -1197,40 +1206,51 @@ func (qv *queryView[K, V]) shouldPreferExecutionPlan(q *qx.QX, trace *queryTrace
 	return true
 }
 
-func plannerObviousExecutionFastPath(q *qx.QX) bool {
+func plannerObviousExecutionFastPath(q *qir.Shape) bool {
 	if q == nil || q.Limit == 0 || q.Expr.Not {
 		return false
 	}
 
-	if len(q.Order) == 0 {
+	if !q.HasOrder {
 		e := q.Expr
 		return isPositiveScalarPrefixLeaf(e)
 	}
 
-	if len(q.Order) != 1 {
+	if !q.HasOrder {
 		return false
 	}
-	ord := q.Order[0]
-	if ord.Type != qx.OrderBasic || ord.Field == "" {
+	ord := q.Order
+	if ord.Kind != qir.OrderKindBasic || ord.FieldOrdinal < 0 {
 		return false
 	}
+	orderFieldOrdinal := ord.FieldOrdinal
 
 	expr := q.Expr
-	if expr.Op == qx.OpAND {
+	if expr.Op == qir.OpAND {
 		hasPrefix := false
 		for i := range expr.Operands {
 			op := expr.Operands[i]
 			if op.Not {
 				return false
 			}
-			if classifyOrderFieldScalarLeaf(ord.Field, op) == orderFieldScalarLeafPrefix {
+			if op.FieldOrdinal < 0 {
+				return false
+			}
+			if op.FieldOrdinal != orderFieldOrdinal {
+				continue
+			}
+			if op.Op == qir.OpPREFIX {
 				hasPrefix = true
+				continue
+			}
+			if !isScalarRangeEqOp(op.Op) {
+				return false
 			}
 		}
 		return hasPrefix
 	}
 
-	return classifyOrderFieldScalarLeaf(ord.Field, expr) == orderFieldScalarLeafPrefix && len(expr.Operands) == 0
+	return expr.FieldOrdinal == orderFieldOrdinal && expr.Op == qir.OpPREFIX && len(expr.Operands) == 0
 }
 
 func plannerExecutionNoOrderPrefixLeafLimit(qLimit uint64, universe uint64) int {
@@ -1335,7 +1355,7 @@ func plannerExecutionNoOrderPrefixProbeShare(restCount int, restSelectivity floa
 	return plannerClampFloat(share, 0.25, 0.65)
 }
 
-func (qv *queryView[K, V]) shouldPreferExecutionNoOrderPrefix(q *qx.QX, leaves []qx.Expr) bool {
+func (qv *queryView[K, V]) shouldPreferExecutionNoOrderPrefix(q *qir.Shape, leaves []qir.Expr) bool {
 	if q.Limit == 0 || q.Offset != 0 {
 		return false
 	}
@@ -1360,7 +1380,7 @@ func (qv *queryView[K, V]) shouldPreferExecutionNoOrderPrefix(q *qx.QX, leaves [
 	restCount := 0
 
 	for _, e := range leaves {
-		if e.Op == qx.OpNOOP || e.Not || e.Field == "" {
+		if e.Op == qir.OpNOOP || e.Not || e.FieldOrdinal < 0 {
 			return false
 		}
 
@@ -1392,8 +1412,8 @@ func (qv *queryView[K, V]) shouldPreferExecutionNoOrderPrefix(q *qx.QX, leaves [
 		}
 
 		switch e.Op {
-		case qx.OpEQ, qx.OpIN, qx.OpHAS, qx.OpHASANY:
-			fm := qv.fields[e.Field]
+		case qir.OpEQ, qir.OpIN, qir.OpHASALL, qir.OpHASANY:
+			fm := qv.fieldMetaByExpr(e)
 			if fm == nil {
 				return false
 			}
@@ -1444,10 +1464,10 @@ func (qv *queryView[K, V]) shouldPreferExecutionNoOrderPrefix(q *qx.QX, leaves [
 	return expectedProbe <= float64(prefixRows)*probeShare
 }
 
-func (qv *queryView[K, V]) decideOrderedByCost(q *qx.QX, leaves []qx.Expr) plannerOrderedDecision {
+func (qv *queryView[K, V]) decideOrderedByCost(q *qir.Shape, leaves []qir.Expr) plannerOrderedDecision {
 	var d plannerOrderedDecision
 
-	if len(q.Order) != 1 {
+	if !q.HasOrder {
 		return d
 	}
 	if q.Limit == 0 {
@@ -1462,20 +1482,21 @@ func (qv *queryView[K, V]) decideOrderedByCost(q *qx.QX, leaves []qx.Expr) plann
 		return d
 	}
 
-	o := q.Order[0]
-	if o.Type != qx.OrderBasic {
+	o := q.Order
+	if o.Kind != qir.OrderKindBasic {
 		return d
 	}
+	orderField := qv.fieldNameByOrder(o)
 
-	fm := qv.fields[o.Field]
+	fm := qv.fieldMetaByOrder(o)
 	if fm == nil || fm.Slice {
 		return d
 	}
-	ov := qv.fieldOverlay(o.Field)
+	ov := qv.fieldOverlayForOrder(o)
 	useOverlayProfile := ov.hasData()
 	var orderSlice *[]index
 	if !useOverlayProfile {
-		orderSlice = qv.snapshotFieldIndexSlice(o.Field)
+		orderSlice = qv.snapshotFieldIndexSliceForOrder(o)
 		if orderSlice == nil || len(*orderSlice) == 0 {
 			return d
 		}
@@ -1491,7 +1512,7 @@ func (qv *queryView[K, V]) decideOrderedByCost(q *qx.QX, leaves []qx.Expr) plann
 	var ok bool
 	orderDistinct := uint64(0)
 	if useOverlayProfile {
-		profile, ok = qv.estimateOrderedProfileOverlay(o.Field, leaves, ov, snap, universe)
+		profile, ok = qv.estimateOrderedProfileOverlay(orderField, leaves, ov, snap, universe)
 		if !ok {
 			return d
 		}
@@ -1500,7 +1521,7 @@ func (qv *queryView[K, V]) decideOrderedByCost(q *qx.QX, leaves []qx.Expr) plann
 			return d
 		}
 	} else {
-		profile, ok = qv.estimateOrderedProfile(o.Field, leaves, *orderSlice, snap, universe)
+		profile, ok = qv.estimateOrderedProfile(orderField, leaves, *orderSlice, snap, universe)
 		if !ok {
 			return d
 		}
@@ -1511,10 +1532,10 @@ func (qv *queryView[K, V]) decideOrderedByCost(q *qx.QX, leaves []qx.Expr) plann
 	hasPrefixNonOrder := false
 	for i := range leaves {
 		e := leaves[i]
-		if !isPositiveNonOrderScalarPrefixLeaf(o.Field, e) {
+		if !qv.isPositiveNonOrderScalarPrefixLeaf(orderField, e) {
 			continue
 		}
-		leafSel, _, _, _, ok := qv.estimateLeafOrderCost(e, snap, universe, o.Field, orderDistinct > 0)
+		leafSel, _, _, _, ok := qv.estimateLeafOrderCost(e, snap, universe, orderField, orderDistinct > 0)
 		if !ok {
 			continue
 		}
@@ -1543,7 +1564,7 @@ func (qv *queryView[K, V]) decideOrderedByCost(q *qx.QX, leaves []qx.Expr) plann
 		return d
 	}
 
-	orderStats := qv.plannerOrderFieldStats(o.Field, snap, universe, orderDistinct)
+	orderStats := qv.plannerOrderFieldStats(orderField, snap, universe, orderDistinct)
 	orderSkew := orderStats.skew()
 
 	// Probe estimate is the key bridge between logical selectivity and physical
@@ -1570,7 +1591,7 @@ func (qv *queryView[K, V]) decideOrderedByCost(q *qx.QX, leaves []qx.Expr) plann
 
 	orderedCost := expectedProbeRows*orderedRowFactor + float64(len(leaves))*32.0
 	orderedCost += qv.estimateOrderedAnchorSetupCost(
-		o.Field,
+		orderField,
 		leaves,
 		snap,
 		universe,
@@ -1608,7 +1629,7 @@ func (qv *queryView[K, V]) decideOrderedByCost(q *qx.QX, leaves []qx.Expr) plann
 
 func (qv *queryView[K, V]) estimateOrderedAnchorSetupCost(
 	orderField string,
-	leaves []qx.Expr,
+	leaves []qir.Expr,
 	snap *plannerStatsSnapshot,
 	universe uint64,
 	orderDistinct uint64,
@@ -1639,13 +1660,14 @@ func (qv *queryView[K, V]) estimateOrderedAnchorSetupCost(
 	}
 
 	for _, e := range leaves {
-		if e.Not || e.Field == "" || e.Op == qx.OpNOOP {
+		fieldName := qv.fieldNameByExpr(e)
+		if e.Not || e.FieldOrdinal < 0 || e.Op == qir.OpNOOP {
 			continue
 		}
-		if e.Field == orderField && len(e.Operands) == 0 && isScalarRangeEqOp(e.Op) {
+		if fieldName == orderField && len(e.Operands) == 0 && isScalarRangeEqOp(e.Op) {
 			continue
 		}
-		if e.Field != orderField && len(e.Operands) == 0 && isScalarRangeEqOp(e.Op) {
+		if fieldName != orderField && len(e.Operands) == 0 && isScalarRangeEqOp(e.Op) {
 			continue
 		}
 
@@ -1665,7 +1687,7 @@ func (qv *queryView[K, V]) estimateOrderedAnchorSetupCost(
 			estCard = 1
 		}
 		weight := orderedAnchorLeadOpWeight(e.Op)
-		if e.Field == orderField {
+		if fieldName == orderField {
 			weight *= 2.8
 		}
 		score := float64(estCard) * weight
@@ -1686,7 +1708,7 @@ func (qv *queryView[K, V]) estimateOrderedAnchorSetupCost(
 
 		activeCount++
 		rangeLike := true
-		weight := orderedAnchorLeadOpWeight(qx.OpGT)
+		weight := orderedAnchorLeadOpWeight(qir.OpGT)
 		if !merged.bounds.hasPrefix &&
 			merged.bounds.hasLo &&
 			merged.bounds.hasHi &&
@@ -1701,7 +1723,7 @@ func (qv *queryView[K, V]) estimateOrderedAnchorSetupCost(
 				merged.bounds.hiNumeric,
 			) == 0 {
 			rangeLike = false
-			weight = orderedAnchorLeadOpWeight(qx.OpEQ)
+			weight = orderedAnchorLeadOpWeight(qir.OpEQ)
 		}
 		if rangeLike {
 			activeRangeLikeCount++
@@ -1760,7 +1782,7 @@ func (qv *queryView[K, V]) estimateOrderedAnchorSetupCost(
 		(1.0 + float64(nonLeadCount)*0.35 + float64(nonLeadRangeLikeCount)*0.25)
 }
 
-func (qv *queryView[K, V]) estimateOrderedProfile(orderField string, leaves []qx.Expr, orderSlice []index, snap *plannerStatsSnapshot, universe uint64) (plannerOrderedProfile, bool) {
+func (qv *queryView[K, V]) estimateOrderedProfile(orderField string, leaves []qir.Expr, orderSlice []index, snap *plannerStatsSnapshot, universe uint64) (plannerOrderedProfile, bool) {
 	if universe == 0 {
 		return plannerOrderedProfile{}, false
 	}
@@ -1799,7 +1821,7 @@ func (qv *queryView[K, V]) estimateOrderedProfile(orderField string, leaves []qx
 	}
 
 	for i, e := range leaves {
-		if !e.Not && e.Field != "" && e.Field != orderField && len(e.Operands) == 0 && isScalarRangeEqOp(e.Op) {
+		if !e.Not && e.FieldOrdinal >= 0 && qv.fieldNameByExpr(e) != orderField && len(e.Operands) == 0 && isScalarRangeEqOp(e.Op) {
 			continue
 		}
 		leafSel, leafWork, leafOrderRange, leafHasPrefix, ok := qv.estimateLeafOrderCost(e, snap, universe, orderField, orderHasBuckets)
@@ -1837,7 +1859,7 @@ func (qv *queryView[K, V]) estimateOrderedProfile(orderField string, leaves []qx
 			orderRangeLeaves++
 		}
 
-		if e.Op == qx.OpNOOP && !e.Not {
+		if e.Op == qir.OpNOOP && !e.Not {
 			continue
 		}
 		if coveredBuf.Get(i) {
@@ -1845,7 +1867,7 @@ func (qv *queryView[K, V]) estimateOrderedProfile(orderField string, leaves []qx
 		}
 		activeChecks++
 		baseWork += leafWork
-		if isBoundOp(e.Op) && e.Field != orderField {
+		if isBoundOp(e.Op) && qv.fieldNameByExpr(e) != orderField {
 			baseRangeLeaves++
 		}
 	}
@@ -1911,7 +1933,7 @@ func (qv *queryView[K, V]) estimateOrderedProfile(orderField string, leaves []qx
 	}, true
 }
 
-func (qv *queryView[K, V]) estimateOrderedProfileBuf(orderField string, leaves *pooled.SliceBuf[qx.Expr], orderSlice []index, snap *plannerStatsSnapshot, universe uint64) (plannerOrderedProfile, bool) {
+func (qv *queryView[K, V]) estimateOrderedProfileBuf(orderField string, leaves *pooled.SliceBuf[qir.Expr], orderSlice []index, snap *plannerStatsSnapshot, universe uint64) (plannerOrderedProfile, bool) {
 	if universe == 0 {
 		return plannerOrderedProfile{}, false
 	}
@@ -1951,7 +1973,7 @@ func (qv *queryView[K, V]) estimateOrderedProfileBuf(orderField string, leaves *
 
 	for i := 0; i < leaves.Len(); i++ {
 		e := leaves.Get(i)
-		if !e.Not && e.Field != "" && e.Field != orderField && len(e.Operands) == 0 && isScalarRangeEqOp(e.Op) {
+		if !e.Not && e.FieldOrdinal >= 0 && qv.fieldNameByExpr(e) != orderField && len(e.Operands) == 0 && isScalarRangeEqOp(e.Op) {
 			continue
 		}
 		leafSel, leafWork, leafOrderRange, leafHasPrefix, ok := qv.estimateLeafOrderCost(e, snap, universe, orderField, orderHasBuckets)
@@ -1989,7 +2011,7 @@ func (qv *queryView[K, V]) estimateOrderedProfileBuf(orderField string, leaves *
 			orderRangeLeaves++
 		}
 
-		if e.Op == qx.OpNOOP && !e.Not {
+		if e.Op == qir.OpNOOP && !e.Not {
 			continue
 		}
 		if coveredBuf.Get(i) {
@@ -1997,7 +2019,7 @@ func (qv *queryView[K, V]) estimateOrderedProfileBuf(orderField string, leaves *
 		}
 		activeChecks++
 		baseWork += leafWork
-		if isBoundOp(e.Op) && e.Field != orderField {
+		if isBoundOp(e.Op) && qv.fieldNameByExpr(e) != orderField {
 			baseRangeLeaves++
 		}
 	}
@@ -2061,7 +2083,7 @@ func (qv *queryView[K, V]) estimateOrderedProfileBuf(orderField string, leaves *
 	}, true
 }
 
-func (qv *queryView[K, V]) estimateOrderedProfileOverlay(orderField string, leaves []qx.Expr, ov fieldOverlay, snap *plannerStatsSnapshot, universe uint64) (plannerOrderedProfile, bool) {
+func (qv *queryView[K, V]) estimateOrderedProfileOverlay(orderField string, leaves []qir.Expr, ov fieldOverlay, snap *plannerStatsSnapshot, universe uint64) (plannerOrderedProfile, bool) {
 	if universe == 0 {
 		return plannerOrderedProfile{}, false
 	}
@@ -2100,7 +2122,7 @@ func (qv *queryView[K, V]) estimateOrderedProfileOverlay(orderField string, leav
 	}
 
 	for i, e := range leaves {
-		if !e.Not && e.Field != "" && e.Field != orderField && len(e.Operands) == 0 && isScalarRangeEqOp(e.Op) {
+		if !e.Not && e.FieldOrdinal >= 0 && qv.fieldNameByExpr(e) != orderField && len(e.Operands) == 0 && isScalarRangeEqOp(e.Op) {
 			continue
 		}
 		leafSel, leafWork, leafOrderRange, leafHasPrefix, ok := qv.estimateLeafOrderCost(e, snap, universe, orderField, orderHasBuckets)
@@ -2138,7 +2160,7 @@ func (qv *queryView[K, V]) estimateOrderedProfileOverlay(orderField string, leav
 			orderRangeLeaves++
 		}
 
-		if e.Op == qx.OpNOOP && !e.Not {
+		if e.Op == qir.OpNOOP && !e.Not {
 			continue
 		}
 		if coveredBuf.Get(i) {
@@ -2146,7 +2168,7 @@ func (qv *queryView[K, V]) estimateOrderedProfileOverlay(orderField string, leav
 		}
 		activeChecks++
 		baseWork += leafWork
-		if isBoundOp(e.Op) && e.Field != orderField {
+		if isBoundOp(e.Op) && qv.fieldNameByExpr(e) != orderField {
 			baseRangeLeaves++
 		}
 	}
@@ -2210,7 +2232,7 @@ func (qv *queryView[K, V]) estimateOrderedProfileOverlay(orderField string, leav
 	}, true
 }
 
-func (qv *queryView[K, V]) estimateOrderedProfileOverlayBuf(orderField string, leaves *pooled.SliceBuf[qx.Expr], ov fieldOverlay, snap *plannerStatsSnapshot, universe uint64) (plannerOrderedProfile, bool) {
+func (qv *queryView[K, V]) estimateOrderedProfileOverlayBuf(orderField string, leaves *pooled.SliceBuf[qir.Expr], ov fieldOverlay, snap *plannerStatsSnapshot, universe uint64) (plannerOrderedProfile, bool) {
 	if universe == 0 {
 		return plannerOrderedProfile{}, false
 	}
@@ -2250,7 +2272,7 @@ func (qv *queryView[K, V]) estimateOrderedProfileOverlayBuf(orderField string, l
 
 	for i := 0; i < leaves.Len(); i++ {
 		e := leaves.Get(i)
-		if !e.Not && e.Field != "" && e.Field != orderField && len(e.Operands) == 0 && isScalarRangeEqOp(e.Op) {
+		if !e.Not && e.FieldOrdinal >= 0 && qv.fieldNameByExpr(e) != orderField && len(e.Operands) == 0 && isScalarRangeEqOp(e.Op) {
 			continue
 		}
 		leafSel, leafWork, leafOrderRange, leafHasPrefix, ok := qv.estimateLeafOrderCost(e, snap, universe, orderField, orderHasBuckets)
@@ -2288,7 +2310,7 @@ func (qv *queryView[K, V]) estimateOrderedProfileOverlayBuf(orderField string, l
 			orderRangeLeaves++
 		}
 
-		if e.Op == qx.OpNOOP && !e.Not {
+		if e.Op == qir.OpNOOP && !e.Not {
 			continue
 		}
 		if coveredBuf.Get(i) {
@@ -2296,7 +2318,7 @@ func (qv *queryView[K, V]) estimateOrderedProfileOverlayBuf(orderField string, l
 		}
 		activeChecks++
 		baseWork += leafWork
-		if isBoundOp(e.Op) && e.Field != orderField {
+		if isBoundOp(e.Op) && qv.fieldNameByExpr(e) != orderField {
 			baseRangeLeaves++
 		}
 	}
@@ -2360,7 +2382,7 @@ func (qv *queryView[K, V]) estimateOrderedProfileOverlayBuf(orderField string, l
 	}, true
 }
 
-func (qv *queryView[K, V]) extractOrderRangeCoverageLeaves(orderField string, leaves []qx.Expr, orderSlice []index) (int, int, *pooled.SliceBuf[bool], bool) {
+func (qv *queryView[K, V]) extractOrderRangeCoverageLeaves(orderField string, leaves []qir.Expr, orderSlice []index) (int, int, *pooled.SliceBuf[bool], bool) {
 	rb := rangeBounds{}
 	coveredBuf := boolSlicePool.Get()
 	coveredBuf.SetLen(len(leaves))
@@ -2368,7 +2390,7 @@ func (qv *queryView[K, V]) extractOrderRangeCoverageLeaves(orderField string, le
 	has := false
 	for i := range leaves {
 		e := leaves[i]
-		if e.Not || e.Field != orderField {
+		if e.Not || qv.fieldNameByExpr(e) != orderField {
 			continue
 		}
 		if applied, ok := qv.applyScalarExprToRangeBounds(e, &rb); !ok {
@@ -2388,7 +2410,7 @@ func (qv *queryView[K, V]) extractOrderRangeCoverageLeaves(orderField string, le
 	return st, en, coveredBuf, true
 }
 
-func (qv *queryView[K, V]) extractOrderRangeCoverageLeavesBuf(orderField string, leaves *pooled.SliceBuf[qx.Expr], orderSlice []index) (int, int, *pooled.SliceBuf[bool], bool) {
+func (qv *queryView[K, V]) extractOrderRangeCoverageLeavesBuf(orderField string, leaves *pooled.SliceBuf[qir.Expr], orderSlice []index) (int, int, *pooled.SliceBuf[bool], bool) {
 	rb := rangeBounds{}
 	coveredBuf := boolSlicePool.Get()
 	coveredBuf.SetLen(leaves.Len())
@@ -2396,7 +2418,7 @@ func (qv *queryView[K, V]) extractOrderRangeCoverageLeavesBuf(orderField string,
 	has := false
 	for i := 0; i < leaves.Len(); i++ {
 		e := leaves.Get(i)
-		if e.Not || e.Field != orderField {
+		if e.Not || qv.fieldNameByExpr(e) != orderField {
 			continue
 		}
 		if applied, ok := qv.applyScalarExprToRangeBounds(e, &rb); !ok {
@@ -2416,7 +2438,7 @@ func (qv *queryView[K, V]) extractOrderRangeCoverageLeavesBuf(orderField string,
 	return st, en, coveredBuf, true
 }
 
-func (qv *queryView[K, V]) extractOrderRangeCoverageLeavesOverlay(orderField string, leaves []qx.Expr, ov fieldOverlay) (int, int, *pooled.SliceBuf[bool], bool) {
+func (qv *queryView[K, V]) extractOrderRangeCoverageLeavesOverlay(orderField string, leaves []qir.Expr, ov fieldOverlay) (int, int, *pooled.SliceBuf[bool], bool) {
 	rb := rangeBounds{}
 	coveredBuf := boolSlicePool.Get()
 	coveredBuf.SetLen(len(leaves))
@@ -2424,7 +2446,7 @@ func (qv *queryView[K, V]) extractOrderRangeCoverageLeavesOverlay(orderField str
 	has := false
 	for i := range leaves {
 		e := leaves[i]
-		if e.Not || e.Field != orderField {
+		if e.Not || qv.fieldNameByExpr(e) != orderField {
 			continue
 		}
 		if applied, ok := qv.applyScalarExprToRangeBounds(e, &rb); !ok {
@@ -2456,7 +2478,7 @@ func (qv *queryView[K, V]) extractOrderRangeCoverageLeavesOverlay(orderField str
 	return in, total, coveredBuf, true
 }
 
-func (qv *queryView[K, V]) extractOrderRangeCoverageLeavesOverlayBuf(orderField string, leaves *pooled.SliceBuf[qx.Expr], ov fieldOverlay) (int, int, *pooled.SliceBuf[bool], bool) {
+func (qv *queryView[K, V]) extractOrderRangeCoverageLeavesOverlayBuf(orderField string, leaves *pooled.SliceBuf[qir.Expr], ov fieldOverlay) (int, int, *pooled.SliceBuf[bool], bool) {
 	rb := rangeBounds{}
 	coveredBuf := boolSlicePool.Get()
 	coveredBuf.SetLen(leaves.Len())
@@ -2464,7 +2486,7 @@ func (qv *queryView[K, V]) extractOrderRangeCoverageLeavesOverlayBuf(orderField 
 	has := false
 	for i := 0; i < leaves.Len(); i++ {
 		e := leaves.Get(i)
-		if e.Not || e.Field != orderField {
+		if e.Not || qv.fieldNameByExpr(e) != orderField {
 			continue
 		}
 		if applied, ok := qv.applyScalarExprToRangeBounds(e, &rb); !ok {
@@ -2505,7 +2527,7 @@ func overlayApproxDistinctRangeCount(ov fieldOverlay, br overlayRange) int {
 }
 
 func (qv *queryView[K, V]) estimateLeafOrderCost(
-	e qx.Expr,
+	e qir.Expr,
 	snap *plannerStatsSnapshot,
 	universe uint64,
 	orderField string,
@@ -2513,43 +2535,44 @@ func (qv *queryView[K, V]) estimateLeafOrderCost(
 ) (
 	selectivity float64, fallbackWork float64, orderRange bool, hasPrefix bool, ok bool) {
 
-	if e.Op == qx.OpNOOP {
+	if e.Op == qir.OpNOOP {
 		if e.Not {
 			return 0, 0, false, false, true
 		}
 		return 1, 0, false, false, true
 	}
 
-	if e.Field == "" {
+	if e.FieldOrdinal < 0 {
 		return 0, 0, false, false, false
 	}
-	if qv.fields[e.Field] == nil {
+	if qv.fieldMetaByExpr(e) == nil {
 		return 0, 0, false, false, false
 	}
-	if !qv.fieldOverlay(e.Field).hasData() {
+	if !qv.fieldOverlayForExpr(e).hasData() {
 		return 0, 0, false, false, false
 	}
 
-	fieldStats := qv.plannerFieldStats(e.Field, snap, universe)
+	fieldName := qv.fieldNameByExpr(e)
+	fieldStats := qv.plannerFieldStats(fieldName, snap, universe)
 	rawSel := 0.0
 	valueCount := 1
 
 	switch e.Op {
-	case qx.OpEQ:
-		rawSel, ok = qv.estimateEqSelectivity(e.Field, e.Value, universe, fieldStats)
-	case qx.OpIN:
-		rawSel, valueCount, ok = qv.estimateInLikeSelectivity(e.Field, e.Value, universe, false)
-	case qx.OpHASANY:
-		rawSel, valueCount, ok = qv.estimateInLikeSelectivity(e.Field, e.Value, universe, false)
-	case qx.OpHAS:
-		rawSel, valueCount, ok = qv.estimateInLikeSelectivity(e.Field, e.Value, universe, true)
+	case qir.OpEQ:
+		rawSel, ok = qv.estimateEqSelectivity(fieldName, e.Value, universe, fieldStats)
+	case qir.OpIN:
+		rawSel, valueCount, ok = qv.estimateInLikeSelectivity(fieldName, e.Value, universe, false)
+	case qir.OpHASANY:
+		rawSel, valueCount, ok = qv.estimateInLikeSelectivity(fieldName, e.Value, universe, false)
+	case qir.OpHASALL:
+		rawSel, valueCount, ok = qv.estimateInLikeSelectivity(fieldName, e.Value, universe, true)
 
 	default:
 		if !isSimpleScalarRangeOrPrefixLeaf(e) {
 			return 0, 0, false, false, false
 		}
 		rawSel, ok = qv.estimateRangeSelectivity(e, universe, fieldStats)
-		switch classifyOrderFieldScalarLeaf(orderField, e) {
+		switch qv.classifyOrderFieldScalarLeaf(orderField, e) {
 		case orderFieldScalarLeafRange:
 			orderRange = true
 		case orderFieldScalarLeafPrefix:
@@ -2579,11 +2602,11 @@ func (qv *queryView[K, V]) estimateLeafOrderCost(
 
 	fallbackWork = rawSel * float64(universe)
 	switch e.Op {
-	case qx.OpIN, qx.OpHASANY:
+	case qir.OpIN, qir.OpHASANY:
 		fallbackWork *= 1.0 + float64(max(valueCount-1, 0))*0.35
-	case qx.OpHAS:
+	case qir.OpHASALL:
 		fallbackWork *= 1.0 + float64(max(valueCount-1, 0))*0.55
-	case qx.OpPREFIX:
+	case qir.OpPREFIX:
 		fallbackWork *= 1.20
 	default:
 		if isNumericRangeOp(e.Op) {
@@ -2595,7 +2618,7 @@ func (qv *queryView[K, V]) estimateLeafOrderCost(
 	}
 
 	// range-only order queries benefit from fast baseline scans when unpaged
-	orderLeafKind := classifyOrderFieldScalarLeaf(orderField, e)
+	orderLeafKind := qv.classifyOrderFieldScalarLeaf(orderField, e)
 	if orderLeafKind == orderFieldScalarLeafRange || orderLeafKind == orderFieldScalarLeafPrefix {
 		if orderHasBuckets {
 			fallbackWork *= 0.92
@@ -2606,7 +2629,11 @@ func (qv *queryView[K, V]) estimateLeafOrderCost(
 }
 
 func (qv *queryView[K, V]) estimateEqSelectivity(field string, value any, universe uint64, stats PlannerFieldStats) (float64, bool) {
-	key, isSlice, isNil, err := qv.exprValueToIdxScalar(qx.Expr{Op: qx.OpEQ, Field: field, Value: value})
+	key, isSlice, isNil, err := qv.exprValueToIdxScalar(qir.Expr{
+		Op:           qir.OpEQ,
+		FieldOrdinal: qv.fieldOrdinalByName(field),
+		Value:        value,
+	})
 	if err != nil || isSlice {
 		return 0, false
 	}
@@ -2645,7 +2672,11 @@ func (qv *queryView[K, V]) estimateEqSelectivity(field string, value any, univer
 }
 
 func (qv *queryView[K, V]) estimateInLikeSelectivity(field string, value any, universe uint64, intersect bool) (float64, int, bool) {
-	valsBuf, isSlice, hasNil, err := qv.exprValueToDistinctIdxBuf(qx.Expr{Op: qx.OpIN, Field: field, Value: value})
+	valsBuf, isSlice, hasNil, err := qv.exprValueToDistinctIdxBuf(qir.Expr{
+		Op:           qir.OpIN,
+		FieldOrdinal: qv.fieldOrdinalByName(field),
+		Value:        value,
+	})
 	if valsBuf != nil {
 		defer stringSlicePool.Put(valsBuf)
 	}
@@ -2714,7 +2745,7 @@ func (qv *queryView[K, V]) estimateInLikeSelectivity(field string, value any, un
 	return sel, valueCount, true
 }
 
-func (qv *queryView[K, V]) estimateRangeSelectivity(e qx.Expr, universe uint64, stats PlannerFieldStats) (float64, bool) {
+func (qv *queryView[K, V]) estimateRangeSelectivity(e qir.Expr, universe uint64, stats PlannerFieldStats) (float64, bool) {
 	rb, ok, err := qv.rangeBoundsForScalarExpr(e)
 	if err != nil || !ok {
 		return 0, false
@@ -2726,7 +2757,7 @@ func (qv *queryView[K, V]) estimateRangeSelectivity(e qx.Expr, universe uint64, 
 		return 1, true
 	}
 
-	ov := qv.fieldOverlay(e.Field)
+	ov := qv.fieldOverlayForExpr(e)
 	if ov.hasData() {
 		br := ov.rangeForBounds(rb)
 		if br.baseStart >= br.baseEnd {

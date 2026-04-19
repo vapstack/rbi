@@ -11,7 +11,7 @@ func TestExprValueToIdxOwnedClonesStringSlice(t *testing.T) {
 	db := &DB[uint64, Rec]{}
 	src := []string{"x"}
 
-	vals, isSlice, hasNil, err := db.exprValueToIdxOwned(qx.Expr{Op: qx.OpIN, Value: src})
+	vals, isSlice, hasNil, err := db.exprValueToIdxOwned(qx.IN("name", src))
 	if err != nil {
 		t.Fatalf("exprValueToIdxOwned: %v", err)
 	}
@@ -32,7 +32,7 @@ func TestExprValueToDistinctIdxOwnedDoesNotMutateSource(t *testing.T) {
 	db := &DB[uint64, Rec]{}
 	src := []string{"b", "a", "a"}
 
-	vals, isSlice, hasNil, err := db.exprValueToDistinctIdxOwned(qx.Expr{Op: qx.OpIN, Value: src})
+	vals, isSlice, hasNil, err := db.exprValueToDistinctIdxOwned(qx.IN("name", src))
 	if err != nil {
 		t.Fatalf("exprValueToDistinctIdxOwned: %v", err)
 	}

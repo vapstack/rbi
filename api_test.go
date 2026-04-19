@@ -926,7 +926,7 @@ func TestTruncate(t *testing.T) {
 		t.Fatalf("Set(2): %v", err)
 	}
 
-	if cnt, err := db.Count(nil); err != nil || cnt != 2 {
+	if cnt, err := db.Count(); err != nil || cnt != 2 {
 		t.Fatalf("Count(before): cnt=%d err=%v", cnt, err)
 	}
 	if ids, err := db.QueryKeys(qx.Query(qx.EQ("email", "a@x"))); err != nil || len(ids) != 1 || ids[0] != 1 {
@@ -957,8 +957,8 @@ func TestTruncate(t *testing.T) {
 			_ = db.SeqScan(0, func(_ uint64, _ *UniqueTestRec) (bool, error) { return true, nil })
 			_ = db.SeqScanRaw(0, func(_ uint64, _ []byte) (bool, error) { return true, nil })
 
-			_, _ = db.QueryKeys(&qx.QX{Expr: qx.Expr{Op: qx.OpNOOP}})
-			_, _ = db.Count(nil)
+			_, _ = db.QueryKeys(qx.Query())
+			_, _ = db.Count()
 		}
 	}
 
@@ -999,12 +999,12 @@ func TestTruncate(t *testing.T) {
 		t.Fatalf("expected BatchGet to return [nil nil], got %#v", vals)
 	}
 
-	if cnt, err := db.Count(nil); err != nil {
+	if cnt, err := db.Count(); err != nil {
 		t.Fatalf("Count(after): %v", err)
 	} else if cnt != 0 {
 		t.Fatalf("expected 0 records after truncate, got %d", cnt)
 	}
-	if ids, err := db.QueryKeys(&qx.QX{Expr: qx.Expr{Op: qx.OpNOOP}}); err != nil {
+	if ids, err := db.QueryKeys(qx.Query()); err != nil {
 		t.Fatalf("QueryKeys(NOOP after): %v", err)
 	} else if len(ids) != 0 {
 		t.Fatalf("expected no keys after truncate, got %v", ids)
@@ -1315,7 +1315,7 @@ func TestAPI_Query_ReturnOrderMatchesQueryKeys(t *testing.T) {
 		3: {Name: "id-3", Age: 30},
 	})
 
-	q := qx.Query(qx.GTE("age", 20)).By("age", qx.DESC)
+	q := qx.Query(qx.GTE("age", 20)).Sort("age", qx.DESC)
 
 	keys, err := db.QueryKeys(q)
 	if err != nil {
@@ -1379,7 +1379,7 @@ func TestAPI_Count_IgnoresOrderOffsetLimit(t *testing.T) {
 		4: {Name: "d", Age: 35},
 	})
 
-	got, err := db.Count(qx.Query(qx.GTE("age", 25)).By("age", qx.ASC).Skip(2).Max(1))
+	got, err := db.Count(qx.Query(qx.GTE("age", 25)).Sort("age", qx.ASC).Offset(2).Limit(1).Filter)
 	if err != nil {
 		t.Fatalf("Count: %v", err)
 	}
@@ -1396,7 +1396,7 @@ func TestAPI_Count_IgnoresInvalidOrderField(t *testing.T) {
 		2: {Name: "b", Age: 30},
 	})
 
-	got, err := db.Count(qx.Query(qx.GTE("age", 25)).By("does_not_exist", qx.ASC).Skip(1).Max(1))
+	got, err := db.Count(qx.Query(qx.GTE("age", 25)).Sort("does_not_exist", qx.ASC).Offset(1).Limit(1).Filter)
 	if err != nil {
 		t.Fatalf("Count should ignore order fields entirely, got err=%v", err)
 	}
@@ -1695,7 +1695,7 @@ func TestAPI_QueryKeysQueryCountReturnErrClosedAfterClose(t *testing.T) {
 	if _, err := db.Query(q); !errors.Is(err, ErrClosed) {
 		t.Fatalf("Query after Close: expected ErrClosed, got %v", err)
 	}
-	if _, err := db.Count(q); !errors.Is(err, ErrClosed) {
+	if _, err := db.Count(q.Filter); !errors.Is(err, ErrClosed) {
 		t.Fatalf("Count after Close: expected ErrClosed, got %v", err)
 	}
 }
@@ -1846,17 +1846,17 @@ func TestAPI_ConcurrentStatsAccessAndWrites(t *testing.T) {
 					errCh <- errors.New("missing calibration snapshot")
 					return
 				}
-				items, err := db.Query(qx.Query(qx.GTE("age", 18)).Max(8))
+				items, err := db.Query(qx.Query(qx.GTE("age", 18)).Limit(8))
 				if err != nil {
 					errCh <- err
 					return
 				}
 				releaseUniqueRecords(db, items...)
-				if _, err := db.QueryKeys(qx.Query(qx.EQ("active", true)).Max(8)); err != nil {
+				if _, err := db.QueryKeys(qx.Query(qx.EQ("active", true)).Limit(8)); err != nil {
 					errCh <- err
 					return
 				}
-				if _, err := db.Count(nil); err != nil {
+				if _, err := db.Count(); err != nil {
 					errCh <- err
 					return
 				}
@@ -1932,7 +1932,7 @@ func TestAPI_ConcurrentCalibrationAccessAndQueries(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		for i := 0; i < 120; i++ {
-			q := qx.Query(qx.GTE("age", 20)).By("age", qx.ASC).Max(10)
+			q := qx.Query(qx.GTE("age", 20)).Sort("age", qx.ASC).Limit(10)
 			items, err := db.Query(q)
 			if err != nil {
 				errCh <- err
@@ -1943,7 +1943,7 @@ func TestAPI_ConcurrentCalibrationAccessAndQueries(t *testing.T) {
 				errCh <- err
 				return
 			}
-			if _, err := db.Count(qx.Query(qx.EQ("active", true))); err != nil {
+			if _, err := db.Count(qx.Query(qx.EQ("active", true)).Filter); err != nil {
 				errCh <- err
 				return
 			}
@@ -2400,9 +2400,9 @@ func ioExtMustQueryName(t *testing.T, db *DB[uint64, Rec], name string) []uint64
 
 func ioExtMustCountUint64(t *testing.T, db *DB[uint64, Rec]) uint64 {
 	t.Helper()
-	cnt, err := db.Count(nil)
+	cnt, err := db.Count()
 	if err != nil {
-		t.Fatalf("Count(nil): %v", err)
+		t.Fatalf("Count(): %v", err)
 	}
 	return cnt
 }

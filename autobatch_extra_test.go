@@ -739,11 +739,11 @@ func TestAutoBatchExtra_MixedQueuedOps_MatchSequentialModel(t *testing.T) {
 	compareState := func(step int) {
 		t.Helper()
 
-		cntBatch, err := dbBatch.Count(nil)
+		cntBatch, err := dbBatch.Count()
 		if err != nil {
 			t.Fatalf("step=%d batch Count: %v", step, err)
 		}
-		cntSeq, err := dbSeq.Count(nil)
+		cntSeq, err := dbSeq.Count()
 		if err != nil {
 			t.Fatalf("step=%d seq Count: %v", step, err)
 		}
@@ -940,11 +940,11 @@ func TestAutoBatchExtra_UniqueMixedQueuedOps_MatchSequentialModel(t *testing.T) 
 	compareState := func(step int) {
 		t.Helper()
 
-		cntBatch, err := dbBatch.Count(nil)
+		cntBatch, err := dbBatch.Count()
 		if err != nil {
 			t.Fatalf("step=%d batch Count: %v", step, err)
 		}
-		cntSeq, err := dbSeq.Count(nil)
+		cntSeq, err := dbSeq.Count()
 		if err != nil {
 			t.Fatalf("step=%d seq Count: %v", step, err)
 		}

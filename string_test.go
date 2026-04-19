@@ -247,7 +247,7 @@ func TestStringExt_SharedAutoBatchUniqueRejectHolePersistsAcrossReopen(t *testin
 			t.Fatalf("%s: real-hole payload mismatch: %#v", label, v)
 		}
 
-		gotAll, queryErr := db.QueryKeys(&qx.QX{Expr: qx.Expr{Op: qx.OpNOOP}})
+		gotAll, queryErr := db.QueryKeys(qx.Query())
 		if queryErr != nil {
 			t.Fatalf("%s: QueryKeys(NOOP): %v", label, queryErr)
 		}
@@ -426,7 +426,7 @@ func TestStringExt_PublishedReadPagesPreserveQueryAndScanOrder(t *testing.T) {
 		t.Fatalf("expected multi-page published read layout")
 	}
 
-	gotKeys, err := db.QueryKeys(&qx.QX{Expr: qx.Expr{Op: qx.OpNOOP}})
+	gotKeys, err := db.QueryKeys(qx.Query())
 	if err != nil {
 		t.Fatalf("QueryKeys(NOOP): %v", err)
 	}
@@ -513,7 +513,13 @@ func TestStringExt_BeginQueryTxSnapshotScanAndQueryStayConsistentDuringDeleteRei
 				var queried []string
 				if scanErr == nil {
 					view := db.makeQueryView(snap)
-					queried, scanErr = view.execQuery(&qx.QX{Expr: qx.Expr{Op: qx.OpNOOP}}, false, false)
+					prepared, viewQ, prepErr := prepareTestQuery(db, qx.Query())
+					if prepErr != nil {
+						scanErr = prepErr
+					} else {
+						queried, scanErr = view.execQuery(&viewQ, false, false)
+						prepared.Release()
+					}
 					db.releaseQueryView(view)
 				}
 				if scanErr == nil && !slices.Equal(scanned, queried) {
@@ -560,7 +566,7 @@ func TestStringExt_BeginQueryTxSnapshotScanAndQueryStayConsistentDuringDeleteRei
 		t.FailNow()
 	}
 
-	gotAll, err := db.QueryKeys(&qx.QX{Expr: qx.Expr{Op: qx.OpNOOP}})
+	gotAll, err := db.QueryKeys(qx.Query())
 	if err != nil {
 		t.Fatalf("final QueryKeys(NOOP): %v", err)
 	}

@@ -44,6 +44,14 @@ func collectIDsByTagDistinctLen(t *testing.T, db *DB[uint64, Rec], wantLen int) 
 	return out
 }
 
+func queryOrderSortByArrayCount(q *qx.QX, field string, dir qx.OrderDirection) *qx.QX {
+	return q.SortBy(qx.LEN(field), dir)
+}
+
+func queryOrderSortByArrayPos(q *qx.QX, field string, priority []string, dir qx.OrderDirection) *qx.QX {
+	return q.SortBy(qx.POS(field, priority), dir)
+}
+
 func TestLenIndex_ZeroComplement_BaseQueryAndOrder(t *testing.T) {
 	db, _ := openTempDBUint64(t)
 
@@ -89,7 +97,7 @@ func TestLenIndex_ZeroComplement_BaseQueryAndOrder(t *testing.T) {
 	wantEmpty := collectIDsByTagDistinctLen(t, db, 0)
 	assertSameSlice(t, gotEmpty, wantEmpty)
 
-	ascQ := qx.Query().ByArrayCount("tags", qx.ASC).Skip(3).Max(120)
+	ascQ := queryOrderSortByArrayCount(qx.Query(), "tags", qx.ASC).Offset(3).Limit(120)
 	gotAsc, err := db.QueryKeys(ascQ)
 	if err != nil {
 		t.Fatalf("QueryKeys(ASC array count): %v", err)
@@ -100,7 +108,7 @@ func TestLenIndex_ZeroComplement_BaseQueryAndOrder(t *testing.T) {
 	}
 	assertSameSlice(t, gotAsc, wantAsc)
 
-	descQ := qx.Query().ByArrayCount("tags", qx.DESC).Skip(2).Max(100)
+	descQ := queryOrderSortByArrayCount(qx.Query(), "tags", qx.DESC).Offset(2).Limit(100)
 	gotDesc, err := db.QueryKeys(descQ)
 	if err != nil {
 		t.Fatalf("QueryKeys(DESC array count): %v", err)
@@ -139,7 +147,7 @@ func TestQuery_ByArrayCount_ZeroComplementSkipWholeBucket(t *testing.T) {
 	}
 
 	zeroCount := len(collectIDsByTagDistinctLen(t, db, 0))
-	q := qx.Query().ByArrayCount("tags", qx.ASC).Skip(zeroCount + 5).Max(80)
+	q := queryOrderSortByArrayCount(qx.Query(), "tags", qx.ASC).Offset(zeroCount + 5).Limit(80)
 
 	got, err := db.QueryKeys(q)
 	if err != nil {
@@ -200,7 +208,7 @@ func TestLenIndex_ZeroComplement_WorksAfterPatches(t *testing.T) {
 	wantEmpty := collectIDsByTagDistinctLen(t, db, 0)
 	assertSameSlice(t, gotEmpty, wantEmpty)
 
-	ascQ := qx.Query(qx.EQ("active", true)).ByArrayCount("tags", qx.ASC).Skip(1).Max(110)
+	ascQ := queryOrderSortByArrayCount(qx.Query(qx.EQ("active", true)), "tags", qx.ASC).Offset(1).Limit(110)
 	gotAsc, err := db.QueryKeys(ascQ)
 	if err != nil {
 		t.Fatalf("QueryKeys(ASC array count overlay): %v", err)
@@ -211,7 +219,7 @@ func TestLenIndex_ZeroComplement_WorksAfterPatches(t *testing.T) {
 	}
 	assertSameSlice(t, gotAsc, wantAsc)
 
-	descQ := qx.Query(qx.EQ("active", false)).ByArrayCount("tags", qx.DESC).Skip(2).Max(110)
+	descQ := queryOrderSortByArrayCount(qx.Query(qx.EQ("active", false)), "tags", qx.DESC).Offset(2).Limit(110)
 	gotDesc, err := db.QueryKeys(descQ)
 	if err != nil {
 		t.Fatalf("QueryKeys(DESC array count overlay): %v", err)
@@ -282,7 +290,7 @@ func TestLenIndex_ZeroComplement_WorksAfterInsertAndDelete(t *testing.T) {
 	wantEmpty := collectIDsByTagDistinctLen(t, db, 0)
 	assertSameSlice(t, gotEmpty, wantEmpty)
 
-	ascQ := qx.Query(qx.EQ("active", true)).ByArrayCount("tags", qx.ASC).Skip(1).Max(120)
+	ascQ := queryOrderSortByArrayCount(qx.Query(qx.EQ("active", true)), "tags", qx.ASC).Offset(1).Limit(120)
 	gotAsc, err := db.QueryKeys(ascQ)
 	if err != nil {
 		t.Fatalf("QueryKeys(ASC array count insert/delete): %v", err)
@@ -293,7 +301,7 @@ func TestLenIndex_ZeroComplement_WorksAfterInsertAndDelete(t *testing.T) {
 	}
 	assertSameSlice(t, gotAsc, wantAsc)
 
-	descQ := qx.Query(qx.EQ("active", false)).ByArrayCount("tags", qx.DESC).Skip(2).Max(120)
+	descQ := queryOrderSortByArrayCount(qx.Query(qx.EQ("active", false)), "tags", qx.DESC).Offset(2).Limit(120)
 	gotDesc, err := db.QueryKeys(descQ)
 	if err != nil {
 		t.Fatalf("QueryKeys(DESC array count insert/delete): %v", err)
@@ -313,7 +321,7 @@ func TestQuery_OrderBy_WithNegationAndLimit(t *testing.T) {
 	// exercise the negative ordered path directly without forcing universe materialization
 	q := qx.Query(
 		qx.NOT(qx.EQ("country", "NL")),
-	).By("age", qx.ASC).Skip(3).Max(25)
+	).Sort("age", qx.ASC).Offset(3).Limit(25)
 
 	got, err := db.QueryKeys(q)
 	if err != nil {
@@ -352,7 +360,7 @@ func TestQuery_Prefix_OrderBySameField_Limit(t *testing.T) {
 
 	q := qx.Query(
 		qx.PREFIX("email", "user10"),
-	).By("email", qx.ASC).Max(15)
+	).Sort("email", qx.ASC).Limit(15)
 
 	got, err := db.QueryKeys(q)
 	if err != nil {
@@ -371,9 +379,9 @@ func TestQuery_ByArrayPos_WithLimitAndNegation(t *testing.T) {
 	_ = seedData(t, db, 220)
 
 	priority := []string{"go", "java", "ops"}
-	q := qx.Query(
+	q := queryOrderSortByArrayPos(qx.Query(
 		qx.NOT(qx.CONTAINS("country", "land")),
-	).ByArrayPos("tags", priority, qx.ASC).Skip(2).Max(30)
+	), "tags", priority, qx.ASC).Offset(2).Limit(30)
 
 	got, err := db.QueryKeys(q)
 	if err != nil {
@@ -392,9 +400,9 @@ func TestQuery_ByArrayPos_WithNegation_NoLimit(t *testing.T) {
 	_ = seedData(t, db, 220)
 
 	priority := []string{"go", "java", "ops"}
-	q := qx.Query(
+	q := queryOrderSortByArrayPos(qx.Query(
 		qx.NOT(qx.CONTAINS("country", "land")),
-	).ByArrayPos("tags", priority, qx.ASC)
+	), "tags", priority, qx.ASC)
 
 	got, err := db.QueryKeys(q)
 	if err != nil {
@@ -412,9 +420,9 @@ func TestQuery_ByArrayCount_WithLimitAndNegation(t *testing.T) {
 	db, _ := openTempDBUint64(t)
 	_ = seedData(t, db, 220)
 
-	q := qx.Query(
+	q := queryOrderSortByArrayCount(qx.Query(
 		qx.NOT(qx.EQ("active", true)),
-	).ByArrayCount("tags", qx.DESC).Skip(1).Max(40)
+	), "tags", qx.DESC).Offset(1).Limit(40)
 
 	got, err := db.QueryKeys(q)
 	if err != nil {
@@ -432,9 +440,9 @@ func TestQuery_ByArrayCount_WithNegation_NoLimit(t *testing.T) {
 	db, _ := openTempDBUint64(t)
 	_ = seedData(t, db, 220)
 
-	q := qx.Query(
+	q := queryOrderSortByArrayCount(qx.Query(
 		qx.NOT(qx.EQ("active", true)),
-	).ByArrayCount("tags", qx.DESC)
+	), "tags", qx.DESC)
 
 	got, err := db.QueryKeys(q)
 	if err != nil {
@@ -453,10 +461,10 @@ func TestQuery_BroadArrayOrder_NoLimit_MatchesExpected(t *testing.T) {
 	_ = seedData(t, db, 70_000)
 
 	queries := []*qx.QX{
-		qx.Query().ByArrayPos("country", []string{
+		queryOrderSortByArrayPos(qx.Query(), "country", []string{
 			"NL", "PL", "DE", "Finland", "Iceland", "Thailand", "Switzerland",
 		}, qx.ASC),
-		qx.Query().ByArrayCount("tags", qx.DESC),
+		queryOrderSortByArrayCount(qx.Query(), "tags", qx.DESC),
 	}
 
 	for _, q := range queries {
@@ -475,9 +483,9 @@ func TestQuery_BroadArrayOrder_NoLimit_MatchesExpected(t *testing.T) {
 		assertSameSlice(t, got, want)
 	}
 
-	followUp := qx.Query(
+	followUp := queryOrderSortByArrayCount(qx.Query(
 		qx.NOT(qx.EQ("active", true)),
-	).ByArrayCount("tags", qx.DESC)
+	), "tags", qx.DESC)
 	gotFollowUp, err := db.QueryKeys(followUp)
 	if err != nil {
 		t.Fatalf("QueryKeys(follow-up): %v", err)
@@ -494,15 +502,15 @@ func TestQuery_BroadBasicOrder_NoLimit_MatchesExpected(t *testing.T) {
 	_ = seedData(t, db, 80_000)
 
 	queries := []*qx.QX{
-		qx.Query().By("age", qx.ASC),
+		qx.Query().Sort("age", qx.ASC),
 		qx.Query(
 			qx.NOT(qx.EQ("country", "NL")),
-		).By("score", qx.DESC),
+		).Sort("score", qx.DESC),
 	}
 
 	qv := db.currentQueryViewForTests()
 	for _, q := range queries {
-		result, err := qv.evalExpr(q.Expr)
+		result, err := db.evalExpr(q.Filter)
 		if err != nil {
 			t.Fatalf("evalExpr(%+v): %v", q, err)
 		}
@@ -511,7 +519,13 @@ func TestQuery_BroadBasicOrder_NoLimit_MatchesExpected(t *testing.T) {
 			t.Fatalf("expected broad ordered result to exercise bucket materialization route, got %d rows for %+v", qv.postingResultCardinality(result), q)
 		}
 
-		got, err := qv.queryOrderBasic(result, qv.fieldOverlay(q.Order[0].Field), q.Order[0], 0, 0, true)
+		prepared, viewQ, err := prepareTestQuery(db, q)
+		if err != nil {
+			result.release()
+			t.Fatalf("prepareTestQuery(%+v): %v", q, err)
+		}
+		got, err := qv.queryOrderBasic(result, qv.fieldOverlay(testOrderFieldName(db, viewQ.Order)), viewQ.Order, 0, 0, true)
+		prepared.Release()
 		result.release()
 		if err != nil {
 			t.Fatalf("queryOrderBasic(%+v): %v", q, err)
@@ -526,7 +540,7 @@ func TestQuery_BroadBasicOrder_NoLimit_MatchesExpected(t *testing.T) {
 
 	followUp := qx.Query(
 		qx.NOT(qx.EQ("active", true)),
-	).By("age", qx.ASC)
+	).Sort("age", qx.ASC)
 	gotFollowUp, err := db.QueryKeys(followUp)
 	if err != nil {
 		t.Fatalf("QueryKeys(follow-up): %v", err)
@@ -565,7 +579,7 @@ func TestQuery_SortWithNegativeResult_NoDuplicates(t *testing.T) {
 	// negative result + ORDER must preserve ordered output without duplicates
 	q := qx.Query(
 		qx.NOT(qx.EQ("country", "NL")),
-	).By("age", qx.ASC).Max(120)
+	).Sort("age", qx.ASC).Limit(120)
 
 	got, err := db.QueryKeys(q)
 	if err != nil {

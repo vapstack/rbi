@@ -1,11 +1,9 @@
-# rbi
+## Roaring Bolt Indexer
 
 [![GoDoc](https://pkg.go.dev/badge/github.com/vapstack/rbi.svg)](https://pkg.go.dev/github.com/vapstack/rbi)
 [![License](https://img.shields.io/badge/license-Apache2-blue.svg)](https://raw.githubusercontent.com/vapstack/rbi/master/LICENSE)
 
-> **This package should be considered experimental**
-
-## Roaring Bolt Indexer
+> This package should be considered experimental
 
 A secondary index layer for [bbolt](https://github.com/etcd-io/bbolt).
 
@@ -172,6 +170,37 @@ Query methods:
 * `SeqScan` - performs a sequential scan over all records starting at the given key
 * `ScanKeys` – iterate the current in-memory key set without opening a Bolt read transaction
 
+#### Supported `qx` subset:
+
+- Supported predicate helpers:\
+  `AND`, `OR`, `NOT`, `EQ`, `NE`, `GT`, `GTE`, `LT`, `LTE`, `IN`, 
+  `NOTIN`, `HASALL`, `HASANY`, `HASNONE`, `PREFIX`, `SUFFIX`, and `CONTAINS`.
+- Predicate left-hand side must always be a source field reference.
+- Predicate right-hand side must always be a literal value.
+- No computed expressions on any side.
+- Grouping/reduction/having and projection/select are not supported.
+- Ordering supports exactly one expression, and only these forms:
+  - By field:\
+    `Sort("field", ASC|DESC)` or `SortBy(REF("field"), ASC)`
+  - By slice-field length:\
+    `SortBy(qx.LEN(qx.REF("field")), ASC|DESC)`
+  - By field value position in the provided slice:\
+    `SortBy(qx.POS(qx.REF("field), []T{...}), ASC|DESC)`
+- `qx.POS` ordering requires a literal priority list/array value.\
+  Scalar-string `POS(field, "alice bob")` is not supported.
+
+## Ordering limitations
+
+The package currently supports ordering by **a single indexed field only**.
+
+Queries that specify more than one ordering expression are rejected with an
+error. This restriction is intentional and allows to execute ordered queries
+directly via index traversal without materializing or re-sorting intermediate
+result sets.
+
+If multi-column ordering is required, it must be implemented at the application
+level.
+
 ## Transparent mode
 
 If a value type has no indexed fields, RBI automatically switches to a
@@ -288,18 +317,6 @@ Important notes:
   internal locks while running `BeforeCommit`, so re-entering the same `DB`
   can deadlock or become mode-dependent.
 - `BeforeCommit` must not modify the bucket managed by RBI itself.
-
-## Ordering limitations
-
-The package currently supports ordering by **a single indexed field only**.
-
-Queries that specify more than one ordering expression are rejected with an
-error. This restriction is intentional and allows to execute ordered queries
-directly via index traversal without materializing or re-sorting intermediate
-result sets.
-
-If multi-column ordering is required, it must be implemented at the application
-level.
 
 ## Struct tags and indexing
 

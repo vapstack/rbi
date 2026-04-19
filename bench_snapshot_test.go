@@ -494,7 +494,7 @@ func TestBenchMode_ColdTurnoverInheritsUnchangedFieldCaches(t *testing.T) {
 		_ = raw.Close()
 	})
 	seedBenchData(t, db, 10_000)
-	expr := qx.Expr{Op: qx.OpPREFIX, Field: "email", Value: "user1"}
+	expr := qx.PREFIX("email", "user1")
 	cacheKey := db.materializedPredCacheKey(expr)
 	if cacheKey == "" {
 		t.Fatalf("expected non-empty cache key")

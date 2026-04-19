@@ -151,7 +151,7 @@ func (h *DBHandle) Close() error {
 }
 
 func loadOrSeedDatabase(db *rbi.DB[uint64, UserBench], seedRecords int, seedRecordsSet bool) (uint64, uint64, error) {
-	count, err := db.Count(nil)
+	count, err := db.Count()
 	if err != nil {
 		return 0, 0, fmt.Errorf("count existing records: %w", err)
 	}
@@ -172,7 +172,7 @@ func loadOrSeedDatabase(db *rbi.DB[uint64, UserBench], seedRecords int, seedReco
 		missing := target - count
 		log.Printf("Database has %d records. Seeding %d more to reach %d...", count, missing, target)
 		seedData(db, &maxID, int(missing))
-		count, err = db.Count(nil)
+		count, err = db.Count()
 		if err != nil {
 			return 0, 0, fmt.Errorf("count after top-up seed: %w", err)
 		}
@@ -184,7 +184,7 @@ func loadOrSeedDatabase(db *rbi.DB[uint64, UserBench], seedRecords int, seedReco
 	}
 	log.Printf("Database empty. Seeding %d records...", target)
 	seedData(db, &maxID, int(target))
-	count, err = db.Count(nil)
+	count, err = db.Count()
 	if err != nil {
 		return 0, 0, fmt.Errorf("count after seed: %w", err)
 	}

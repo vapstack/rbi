@@ -60,7 +60,7 @@ func defaultResearchAllocQueries() []researchAllocQuerySpec {
 						qx.IN("country", []string{"US", "DE"}),
 						qx.NOTIN("plan", []string{"free"}),
 					),
-				).By("last_login", qx.DESC).Max(40)
+				).Sort("last_login", qx.DESC).Limit(40)
 			},
 		},
 		{
@@ -74,7 +74,7 @@ func defaultResearchAllocQueries() []researchAllocQuerySpec {
 						qx.GTE("score", 250.0),
 						qx.GTE("last_login", now-180*24*3600),
 					),
-				).By("score", qx.DESC).Max(50)
+				).Sort("score", qx.DESC).Limit(50)
 			},
 		},
 		{
@@ -104,7 +104,7 @@ func defaultResearchAllocQueries() []researchAllocQuerySpec {
 						qx.GTE("score", 120.0),
 						qx.GTE("last_login", now-45*24*3600),
 					),
-				).By("score", qx.DESC).Max(100)
+				).Sort("score", qx.DESC).Limit(100)
 			},
 		},
 		{
@@ -123,7 +123,7 @@ func defaultResearchAllocQueries() []researchAllocQuerySpec {
 							qx.GTE("created_at", now-180*24*3600),
 						),
 					),
-				).By("created_at", qx.DESC).Max(100)
+				).Sort("created_at", qx.DESC).Limit(100)
 			},
 		},
 		{
@@ -138,7 +138,7 @@ func defaultResearchAllocQueries() []researchAllocQuerySpec {
 						qx.NOTIN("status", []string{"banned"}),
 						qx.EQ("country", "US"),
 					),
-				).By("last_login", qx.DESC).Max(120)
+				).Sort("last_login", qx.DESC).Limit(120)
 			},
 		},
 		{
@@ -166,7 +166,7 @@ func defaultResearchAllocQueries() []researchAllocQuerySpec {
 							qx.GTE("last_login", now-14*24*3600),
 						),
 					),
-				).By("created_at", qx.DESC).Max(150)
+				).Sort("created_at", qx.DESC).Limit(150)
 			},
 		},
 		{
@@ -181,7 +181,7 @@ func defaultResearchAllocQueries() []researchAllocQuerySpec {
 						qx.NOTIN("plan", []string{"enterprise"}),
 						qx.LT("score", 180.0),
 					),
-				).By("last_login", qx.ASC).Skip(2500).Max(100)
+				).Sort("last_login", qx.ASC).Offset(2500).Limit(100)
 			},
 		},
 		{
@@ -196,7 +196,7 @@ func defaultResearchAllocQueries() []researchAllocQuerySpec {
 						qx.NOTIN("plan", []string{"pro", "enterprise"}),
 						qx.LT("score", 120.0),
 					),
-				).Max(250)
+				).Limit(250)
 			},
 		},
 		{
@@ -346,7 +346,7 @@ func defaultResearchAllocQueries() []researchAllocQuerySpec {
 					qx.EQ("status", "active"),
 					qx.GTE("age", 30),
 					qx.LT("age", 50),
-				).By("age", qx.ASC).Max(100)
+				).Sort("age", qx.ASC).Limit(100)
 			},
 		},
 		{
@@ -367,7 +367,7 @@ func defaultResearchAllocQueries() []researchAllocQuerySpec {
 						),
 						qx.HASNONE("roles", []string{"admin"}),
 					),
-				).Max(10)
+				).Limit(10)
 			},
 		},
 		{
@@ -375,7 +375,7 @@ func defaultResearchAllocQueries() []researchAllocQuerySpec {
 			queryInfo: StressQueryInfo{Name: "keys_realistic_autocomplete_prefix_limit", Weight: 1},
 			runKind:   researchAllocRunKeys,
 			build: func(_ int64) *qx.QX {
-				return qx.Query(qx.PREFIX("email", "user10")).Max(10)
+				return qx.Query(qx.PREFIX("email", "user10")).Limit(10)
 			},
 		},
 		{
@@ -386,7 +386,7 @@ func defaultResearchAllocQueries() []researchAllocQuerySpec {
 				return qx.Query(
 					qx.PREFIX("email", "user10"),
 					qx.EQ("status", "active"),
-				).By("email", qx.ASC).Max(10)
+				).Sort("email", qx.ASC).Limit(10)
 			},
 		},
 		{
@@ -398,7 +398,7 @@ func defaultResearchAllocQueries() []researchAllocQuerySpec {
 					qx.PREFIX("email", "user10"),
 					qx.EQ("status", "active"),
 					qx.NOTIN("plan", []string{"free"}),
-				).By("score", qx.DESC).Max(10)
+				).Sort("score", qx.DESC).Limit(10)
 			},
 		},
 		{
@@ -422,7 +422,7 @@ func defaultResearchAllocQueries() []researchAllocQuerySpec {
 							qx.HASANY("tags", []string{"security", "ops"}),
 						),
 					),
-				).Max(150)
+				).Limit(150)
 			},
 		},
 		{
@@ -446,7 +446,7 @@ func defaultResearchAllocQueries() []researchAllocQuerySpec {
 							qx.GTE("age", 30),
 						),
 					),
-				).By("score", qx.DESC).Max(120)
+				).Sort("score", qx.DESC).Limit(120)
 			},
 		},
 	}
@@ -519,7 +519,7 @@ func runResearchAllocQuery(db *rbi.DB[uint64, UserBench], kind researchAllocRunK
 		_, err := db.QueryKeys(q)
 		return err
 	case researchAllocRunCount:
-		_, err := db.Count(q)
+		_, err := db.Count(q.Filter)
 		return err
 	default:
 		return fmt.Errorf("unknown alloc run kind %d", kind)

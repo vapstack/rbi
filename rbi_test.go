@@ -280,8 +280,8 @@ func TestTransparentMode_DisablesIndexedAPIsAndUsesDirectBoltSeqScans(t *testing
 	if _, err := db.QueryKeys(qx.Query()); !errors.Is(err, ErrNoIndex) {
 		t.Fatalf("QueryKeys(all) err=%v want %v", err, ErrNoIndex)
 	}
-	if _, err := db.Count(nil); !errors.Is(err, ErrNoIndex) {
-		t.Fatalf("Count(nil) err=%v want %v", err, ErrNoIndex)
+	if _, err := db.Count(); !errors.Is(err, ErrNoIndex) {
+		t.Fatalf("Count() err=%v want %v", err, ErrNoIndex)
 	}
 	if err := db.RebuildIndex(); !errors.Is(err, ErrNoIndex) {
 		t.Fatalf("RebuildIndex err=%v want %v", err, ErrNoIndex)
@@ -773,10 +773,10 @@ func TestTransparentMode_TruncateAdvancesBucketSequenceAndInvalidatesStaleSideca
 		t.Fatalf("bucket sequence did not advance across transparent truncate: current=%d stored=%d", currentSeq, storedSeq)
 	}
 
-	if cnt, err := dbReopen.Count(nil); err != nil {
-		t.Fatalf("reopen Count(nil): %v", err)
+	if cnt, err := dbReopen.Count(); err != nil {
+		t.Fatalf("reopen Count(): %v", err)
 	} else if cnt != 0 {
-		t.Fatalf("reopen Count(nil)=%d want 0", cnt)
+		t.Fatalf("reopen Count()=%d want 0", cnt)
 	}
 
 	keys, err := dbReopen.QueryKeys(qx.Query())
@@ -870,7 +870,7 @@ func TestMultiWrap_DifferentStructs(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	ids, err := recDB.QueryKeys(&qx.QX{Expr: qx.Expr{Op: qx.OpEQ, Field: "age", Value: 30}})
+	ids, err := recDB.QueryKeys(qx.Query(qx.EQ("age", 30)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -878,7 +878,7 @@ func TestMultiWrap_DifferentStructs(t *testing.T) {
 		t.Errorf("expected 1 record, got: %v", len(ids))
 	}
 
-	sids, err := productDB.QueryKeys(&qx.QX{Expr: qx.Expr{Op: qx.OpEQ, Field: "price", Value: 100.0}})
+	sids, err := productDB.QueryKeys(qx.Query(qx.EQ("price", 100.0)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1321,7 +1321,7 @@ func TestMultiWrap_SameStruct_DifferentBuckets(t *testing.T) {
 		t.Fatal("bucket leaked")
 	}
 
-	ids, err = dbEU.QueryKeys(&qx.QX{Expr: qx.Expr{Op: qx.OpEQ, Field: "name", Value: "hans"}})
+	ids, err = dbEU.QueryKeys(qx.Query(qx.EQ("name", "hans")))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1395,11 +1395,11 @@ func TestMultiWrap_ConcurrentWrites(t *testing.T) {
 		t.FailNow()
 	}
 
-	c1, err := db1.Count(nil)
+	c1, err := db1.Count()
 	if err != nil {
 		t.Fatal(err)
 	}
-	c2, err := db2.Count(nil)
+	c2, err := db2.Count()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1411,7 +1411,7 @@ func TestMultiWrap_ConcurrentWrites(t *testing.T) {
 		t.Errorf("db2 count mismatch: got %d, expected %d", c2, count)
 	}
 
-	idsLeak, err := db1.QueryKeys(&qx.QX{Expr: qx.Expr{Op: qx.OpEQ, Field: "age", Value: 20}})
+	idsLeak, err := db1.QueryKeys(qx.Query(qx.EQ("age", 20)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1419,7 +1419,7 @@ func TestMultiWrap_ConcurrentWrites(t *testing.T) {
 		t.Fatalf("isolation failed: db1 contains %d records from db2 (Age=20)", len(idsLeak))
 	}
 
-	idsCorrect, err := db1.QueryKeys(&qx.QX{Expr: qx.Expr{Op: qx.OpEQ, Field: "age", Value: 10}})
+	idsCorrect, err := db1.QueryKeys(qx.Query(qx.EQ("age", 10)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1473,7 +1473,7 @@ func TestMultiWrap_ReopenPersistence(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	ids1, err := db1New.QueryKeys(&qx.QX{Expr: qx.Expr{Op: qx.OpEQ, Field: "name", Value: "one"}})
+	ids1, err := db1New.QueryKeys(qx.Query(qx.EQ("name", "one")))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1481,7 +1481,7 @@ func TestMultiWrap_ReopenPersistence(t *testing.T) {
 		t.Error("t1 persistence failed")
 	}
 
-	ids2, err := db2New.QueryKeys(&qx.QX{Expr: qx.Expr{Op: qx.OpEQ, Field: "name", Value: "two"}})
+	ids2, err := db2New.QueryKeys(qx.Query(qx.EQ("name", "two")))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1489,7 +1489,7 @@ func TestMultiWrap_ReopenPersistence(t *testing.T) {
 		t.Error("t2 persistence failed")
 	}
 
-	idsCross, err := db1New.QueryKeys(&qx.QX{Expr: qx.Expr{Op: qx.OpEQ, Field: "name", Value: "two"}})
+	idsCross, err := db1New.QueryKeys(qx.Query(qx.EQ("name", "two")))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1764,7 +1764,7 @@ func TestStringKeys_ExoticCharacters(t *testing.T) {
 		}
 
 		// validate index lookup via string mapper
-		q := &qx.QX{Expr: qx.Expr{Op: qx.OpEQ, Field: "name", Value: expectedName}}
+		q := qx.Query(qx.EQ("name", expectedName))
 		ids, err := db.QueryKeys(q)
 		if err != nil {
 			t.Fatalf("QueryKeys for %q failed: %v", k, err)
@@ -1811,7 +1811,7 @@ func TestStringKeys_Persistence_MappingStability(t *testing.T) {
 	}()
 
 	// validate correctness after reopen
-	q := &qx.QX{Expr: qx.Expr{Op: qx.OpEQ, Field: "age", Value: 20}}
+	q := qx.Query(qx.EQ("age", 20))
 	ids, err := db2.QueryKeys(q)
 	if err != nil {
 		t.Fatalf("QueryKeys: %v", err)
@@ -1829,7 +1829,7 @@ func TestStringKeys_Persistence_MappingStability(t *testing.T) {
 		t.Fatalf("Set: %v", err)
 	}
 
-	ids, _ = db2.QueryKeys(&qx.QX{Expr: qx.Expr{Op: qx.OpEQ, Field: "age", Value: 40}})
+	ids, _ = db2.QueryKeys(qx.Query(qx.EQ("age", 40)))
 	if len(ids) != 1 || ids[0] != "charlie" {
 		t.Errorf("Insert after reopen failed: %v", ids)
 	}
@@ -1874,7 +1874,7 @@ func TestStringKeys_RebuildIndex_FromScratch(t *testing.T) {
 	// validate rebuilt index
 	for i, k := range keys {
 		age := i * 10
-		ids, err := db2.QueryKeys(&qx.QX{Expr: qx.Expr{Op: qx.OpEQ, Field: "age", Value: age}})
+		ids, err := db2.QueryKeys(qx.Query(qx.EQ("age", age)))
 		if err != nil {
 			t.Fatalf("QueryKeys: %v", err)
 		}
@@ -1916,13 +1916,13 @@ func TestStringKeys_Concurrency_MapperStress(t *testing.T) {
 
 	// validate total count
 	totalExpected := workers * writes
-	count, _ := db.Count(nil)
+	count, _ := db.Count()
 	if int(count) != totalExpected {
 		t.Errorf("expected %d records, got %d", totalExpected, count)
 	}
 
 	// validate index query under load
-	ids, _ := db.QueryKeys(&qx.QX{Expr: qx.Expr{Op: qx.OpEQ, Field: "name", Value: "worker"}})
+	ids, _ := db.QueryKeys(qx.Query(qx.EQ("name", "worker")))
 	if len(ids) != totalExpected {
 		t.Errorf("expected %d keys, got %d", totalExpected, len(ids))
 	}
@@ -2010,7 +2010,7 @@ func TestStringKeys_BatchMutations_ModelReplayConsistency(t *testing.T) {
 		}
 	}
 
-	count, err := db.Count(nil)
+	count, err := db.Count()
 	if err != nil {
 		t.Fatalf("Count: %v", err)
 	}
@@ -2146,7 +2146,7 @@ func TestStringKeys_ConcurrentMixedOps_FinalIndexConsistency(t *testing.T) {
 					errCh <- fmt.Errorf("reader=%d Query: %w", readerID, err)
 					return
 				}
-				if _, err := db.Count(q); err != nil {
+				if _, err := db.Count(q.Filter); err != nil {
 					errCh <- fmt.Errorf("reader=%d Count: %w", readerID, err)
 					return
 				}
@@ -2232,7 +2232,7 @@ func TestStringKeys_ConcurrentMixedOps_FinalIndexConsistency(t *testing.T) {
 		t.Fatalf("SeqScan: %v", err)
 	}
 
-	count, err := db.Count(nil)
+	count, err := db.Count()
 	if err != nil {
 		t.Fatalf("Count: %v", err)
 	}
@@ -2321,7 +2321,7 @@ func TestConcurrentWriters_FinalStateAndIndexConsistency(t *testing.T) {
 					errCh <- fmt.Errorf("reader Query error: %w", err)
 					return
 				}
-				if _, err := db.Count(q); err != nil {
+				if _, err := db.Count(q.Filter); err != nil {
 					errCh <- fmt.Errorf("reader Count error: %w", err)
 					return
 				}
@@ -2398,9 +2398,9 @@ func TestConcurrentWriters_FinalStateAndIndexConsistency(t *testing.T) {
 		t.Fatalf("SeqScan: %v", err)
 	}
 
-	total, err := db.Count(nil)
+	total, err := db.Count()
 	if err != nil {
-		t.Fatalf("Count(nil): %v", err)
+		t.Fatalf("Count(): %v", err)
 	}
 	if total != uint64(len(live)) {
 		t.Fatalf("count mismatch: got=%d want=%d", total, len(live))
@@ -2503,7 +2503,7 @@ func TestConcurrentBatchWriters_ModelReplayConsistency(t *testing.T) {
 					errCh <- fmt.Errorf("reader Query error: %w", err)
 					return
 				}
-				if _, err := db.Count(q); err != nil {
+				if _, err := db.Count(q.Filter); err != nil {
 					errCh <- fmt.Errorf("reader Count error: %w", err)
 					return
 				}
@@ -2600,9 +2600,9 @@ func TestConcurrentBatchWriters_ModelReplayConsistency(t *testing.T) {
 		t.Fatalf("SeqScan: %v", err)
 	}
 
-	total, err := db.Count(nil)
+	total, err := db.Count()
 	if err != nil {
-		t.Fatalf("Count(nil): %v", err)
+		t.Fatalf("Count(): %v", err)
 	}
 	if total != uint64(len(live)) {
 		t.Fatalf("count mismatch: got=%d want=%d", total, len(live))
@@ -2897,9 +2897,9 @@ func TestBatchConcurrentSingleOps_ModelReplayConsistency(t *testing.T) {
 		t.Fatalf("SeqScan: %v", scanErr)
 	}
 
-	count, err := db.Count(nil)
+	count, err := db.Count()
 	if err != nil {
-		t.Fatalf("Count(nil): %v", err)
+		t.Fatalf("Count(): %v", err)
 	}
 	if count != uint64(len(live)) {
 		t.Fatalf("count mismatch: got=%d want=%d", count, len(live))
@@ -2954,7 +2954,7 @@ func TestBatchConcurrentSingleOps_ModelReplayConsistency(t *testing.T) {
 		assertIndexContains(qx.Query(qx.EQ("score", want.Score)), id, fmt.Sprintf("score=%v", want.Score))
 		assertIndexContains(qx.Query(qx.EQ("active", want.Active)), id, fmt.Sprintf("active=%v", want.Active))
 		for _, tag := range want.Tags {
-			assertIndexContains(qx.Query(qx.HAS("tags", []string{tag})), id, fmt.Sprintf("tag=%q", tag))
+			assertIndexContains(qx.Query(qx.HASALL("tags", []string{tag})), id, fmt.Sprintf("tag=%q", tag))
 		}
 	}
 
@@ -3033,7 +3033,7 @@ func TestBatchConcurrentSingleOps_ModelReplayConsistency(t *testing.T) {
 			if cur != nil && slices.Contains(cur.Tags, tag) {
 				continue
 			}
-			assertIndexOmits(qx.Query(qx.HAS("tags", []string{tag})), id, fmt.Sprintf("tag=%q", tag))
+			assertIndexOmits(qx.Query(qx.HASALL("tags", []string{tag})), id, fmt.Sprintf("tag=%q", tag))
 			staleChecked++
 		}
 	}
@@ -3051,7 +3051,7 @@ func TestStringKeys_QueryOrder_FollowsInternalIndex(t *testing.T) {
 	}
 
 	// returns results ordered by internal id (insertion order)
-	ids, err := db.QueryKeys(&qx.QX{Expr: qx.Expr{Op: qx.OpEQ, Field: "age", Value: 1}})
+	ids, err := db.QueryKeys(qx.Query(qx.EQ("age", 1)))
 	if err != nil {
 		t.Fatalf("QueryKeys: %v", err)
 	}
@@ -3089,7 +3089,7 @@ func TestStringKeys_VeryLongKey(t *testing.T) {
 		t.Errorf("value mismatch: %v", v.Name)
 	}
 
-	ids, err := db.QueryKeys(&qx.QX{Expr: qx.Expr{Op: qx.OpEQ, Field: "name", Value: "long"}})
+	ids, err := db.QueryKeys(qx.Query(qx.EQ("name", "long")))
 	if err != nil {
 		t.Fatalf("QueryKeys: %v", err)
 	}
@@ -3105,7 +3105,7 @@ func TestStringKeys_QueryResultKey_RemainsValidAfterClose(t *testing.T) {
 		t.Fatalf("Set: %v", err)
 	}
 
-	ids, err := db.QueryKeys(&qx.QX{Expr: qx.Expr{Op: qx.OpNOOP}})
+	ids, err := db.QueryKeys(qx.Query())
 	if err != nil {
 		t.Fatalf("QueryKeys: %v", err)
 	}
@@ -3187,7 +3187,7 @@ func TestFailpoint_CommitSetRollsBackAndKeepsState(t *testing.T) {
 		t.Fatalf("expected no value after failed commit, got: %#v", v)
 	}
 
-	if cnt, err := db.Count(nil); err != nil {
+	if cnt, err := db.Count(); err != nil {
 		t.Fatalf("Count: %v", err)
 	} else if cnt != 0 {
 		t.Fatalf("expected Count=0 after failed commit, got %d", cnt)
@@ -3385,7 +3385,7 @@ func TestTruncate_PreservesSequenceMonotonicityAcrossBucketRecreate(t *testing.T
 		t.Fatalf("snapshot sequence mismatch after reopen: got=%d want=%d", snap.seq, truncateSeq)
 	}
 
-	ids, err := db3.QueryKeys(&qx.QX{Expr: qx.Expr{Op: qx.OpEQ, Field: "age", Value: 30}})
+	ids, err := db3.QueryKeys(qx.Query(qx.EQ("age", 30)))
 	if err != nil {
 		t.Fatalf("QueryKeys(after reopen): %v", err)
 	}
@@ -3632,7 +3632,7 @@ func TestBatchSet_DuplicateIDs_LastWriteWinsAndIndexConsistent(t *testing.T) {
 	assertHas("tags", "db", true)
 	assertHas("tags", "ops", true)
 
-	if cnt, err := db.Count(nil); err != nil {
+	if cnt, err := db.Count(); err != nil {
 		t.Fatalf("Count: %v", err)
 	} else if cnt != 1 {
 		t.Fatalf("expected Count=1, got %d", cnt)
@@ -3694,8 +3694,8 @@ func TestSet_NilValue_ReturnsErrNilValueAndNoWrites(t *testing.T) {
 		t.Fatalf("expected nil value for id=1, got %#v", v)
 	}
 
-	if cnt, err := db.Count(nil); err != nil {
-		t.Fatalf("Count(nil): %v", err)
+	if cnt, err := db.Count(); err != nil {
+		t.Fatalf("Count(): %v", err)
 	} else if cnt != 0 {
 		t.Fatalf("expected Count=0, got %d", cnt)
 	}
@@ -3754,8 +3754,8 @@ func TestBatchSet_NilValue_ReturnsErrNilValueAndAtomic(t *testing.T) {
 		t.Fatalf("unexpected index entry for rejected value: %v", ids)
 	}
 
-	if cnt, err := db.Count(nil); err != nil {
-		t.Fatalf("Count(nil): %v", err)
+	if cnt, err := db.Count(); err != nil {
+		t.Fatalf("Count(): %v", err)
 	} else if cnt != 1 {
 		t.Fatalf("expected Count=1 after rejected BatchSet, got %d", cnt)
 	}
@@ -3828,7 +3828,7 @@ func TestBatchPatchBatchDelete_DuplicateIDs_IndexConsistency(t *testing.T) {
 		t.Fatalf("BatchDelete duplicate ids: %v", err)
 	}
 
-	if cnt, err := db.Count(nil); err != nil {
+	if cnt, err := db.Count(); err != nil {
 		t.Fatalf("Count: %v", err)
 	} else if cnt != 0 {
 		t.Fatalf("expected Count=0 after duplicate BatchDelete, got %d", cnt)
@@ -4104,7 +4104,7 @@ func TestMultiWrite_CallbackError_RollbackDataAndIndex(t *testing.T) {
 
 			assertNoFutureSnapshotRefs(t, db)
 
-			if cnt, err := db.Count(nil); err != nil {
+			if cnt, err := db.Count(); err != nil {
 				t.Fatalf("Count: %v", err)
 			} else if cnt != 3 {
 				t.Fatalf("expected Count=3 after rollback, got %d", cnt)
@@ -4766,7 +4766,7 @@ func TestReadPaths_MissingKeys_DoNotGrowStrMap(t *testing.T) {
 	}
 	assertNoGrow("Query(missing)")
 
-	if cnt, err := db.Count(qMissing); err != nil {
+	if cnt, err := db.Count(qMissing.Filter); err != nil {
 		t.Fatalf("Count(missing sku): %v", err)
 	} else if cnt != 0 {
 		t.Fatalf("Count(missing sku) expected 0, got %d", cnt)
@@ -5078,5 +5078,37 @@ func TestComponentAccessors(t *testing.T) {
 	bs := db.AutoBatchStats()
 	if bs.Window <= 0 {
 		t.Fatalf("expected AutoBatchStats.Window > 0")
+	}
+}
+
+type stableOrdinalRec struct {
+	Z string `rbi:"default"`
+	A string `rbi:"default"`
+	M int    `rbi:"default"`
+}
+
+func TestInitIndexedFieldAccessors_AssignsStableSortedOrdinals(t *testing.T) {
+	db := &DB[uint64, stableOrdinalRec]{
+		fields: make(map[string]*field),
+		vtype:  reflect.TypeFor[stableOrdinalRec](),
+	}
+	if err := db.populateFields(db.vtype, nil); err != nil {
+		t.Fatalf("populateFields: %v", err)
+	}
+	if err := db.initIndexedFieldAccessors(); err != nil {
+		t.Fatalf("initIndexedFieldAccessors: %v", err)
+	}
+
+	got := make([]string, len(db.indexedFieldAccess))
+	for i, acc := range db.indexedFieldAccess {
+		got[i] = acc.name
+		if acc.ordinal != i {
+			t.Fatalf("expected ordinal %d for %q, got %d", i, acc.name, acc.ordinal)
+		}
+	}
+
+	want := []string{"A", "M", "Z"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("unexpected field ordinal order:\n got=%v\nwant=%v", got, want)
 	}
 }
