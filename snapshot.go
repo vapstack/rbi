@@ -317,9 +317,7 @@ func (c *recentKeyCache) addWorkAndShouldPromote(key any, limit int, delta uint6
 }
 
 func (e *materializedPredCacheEntry) retain() {
-	if e != nil {
-		e.refs.Add(1)
-	}
+	e.refs.Add(1)
 }
 
 func (e *materializedPredCacheEntry) release() {
@@ -350,9 +348,7 @@ func (c *materializedPredCache) init(limit int) {
 }
 
 func (c *materializedPredCache) retain() {
-	if c != nil {
-		c.refs.Add(1)
-	}
+	c.refs.Add(1)
 }
 
 func (c *materializedPredCache) releaseRef() {
@@ -1835,9 +1831,7 @@ func newSnapshotPostingOwner(ids posting.List) *snapshotPostingOwner {
 }
 
 func (o *snapshotPostingOwner) retain() {
-	if o != nil {
-		o.refs.Add(1)
-	}
+	o.refs.Add(1)
 }
 
 func (o *snapshotPostingOwner) release() {

@@ -175,9 +175,7 @@ func newFieldIndexChunkDirPageOwned(refs *pooled.SliceBuf[fieldIndexChunkRef]) *
 }
 
 func (p *fieldIndexChunkDirPage) retain() {
-	if p != nil {
-		p.refsCount.Add(1)
-	}
+	p.refsCount.Add(1)
 }
 
 func newFieldIndexChunkDirPage(refs []fieldIndexChunkRef) *fieldIndexChunkDirPage {
@@ -371,9 +369,7 @@ func newRegularFieldIndexStorage(slice *[]index) fieldIndexStorage {
 }
 
 func (r *fieldIndexFlatRoot) retain() {
-	if r != nil {
-		r.refs.Add(1)
-	}
+	r.refs.Add(1)
 }
 
 func (r *fieldIndexFlatRoot) release() {
@@ -386,9 +382,7 @@ func (r *fieldIndexFlatRoot) release() {
 }
 
 func (c *fieldIndexChunk) retain() {
-	if c != nil {
-		c.refs.Add(1)
-	}
+	c.refs.Add(1)
 }
 
 func (c *fieldIndexChunk) release() {
@@ -399,9 +393,7 @@ func (c *fieldIndexChunk) release() {
 }
 
 func (r *fieldIndexChunkedRoot) retain() {
-	if r != nil {
-		r.refs.Add(1)
-	}
+	r.refs.Add(1)
 }
 
 func (r *fieldIndexChunkedRoot) release() {
@@ -1079,9 +1071,7 @@ func balancedFieldIndexChunkSize(remaining int) int {
 }
 
 func retainedFieldIndexChunkRef(ref fieldIndexChunkRef) fieldIndexChunkRef {
-	if ref.chunk != nil {
-		ref.chunk.retain()
-	}
+	ref.chunk.retain()
 	return ref
 }
 
