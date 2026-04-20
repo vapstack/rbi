@@ -10,6 +10,7 @@ import (
 	"os"
 	"reflect"
 	"runtime"
+	"runtime/debug"
 	"slices"
 	"sort"
 	"strings"
@@ -58,10 +59,66 @@ func releaseBuildIndexLocalStates(localStates []buildIndexFieldLocalState) {
 	}
 }
 
-func recoverLoadIndex(err *error) {
-	if r := recover(); r != nil {
-		*err = fmt.Errorf("loadIndex panic: %v", r)
+type persistedIndexLoadDiag struct {
+	file         string
+	dbPath       string
+	bucket       string
+	size         int64
+	version      byte
+	versionKnown bool
+}
+
+func (d persistedIndexLoadDiag) context() string {
+	version := "unknown"
+	if d.versionKnown {
+		version = fmt.Sprintf("%d", d.version)
 	}
+	if d.size >= 0 {
+		return fmt.Sprintf("persisted index file=%q db=%q bucket=%q size=%d version=%s", d.file, d.dbPath, d.bucket, d.size, version)
+	}
+	return fmt.Sprintf("persisted index file=%q db=%q bucket=%q version=%s", d.file, d.dbPath, d.bucket, version)
+}
+
+func (d persistedIndexLoadDiag) wrap(stage string, err error) error {
+	if err == nil {
+		return nil
+	}
+	return fmt.Errorf("%s stage=%s: %w", d.context(), stage, err)
+}
+
+func recoverLoadIndex(err *error, diag *persistedIndexLoadDiag) {
+	if r := recover(); r != nil {
+		panicErr := fmt.Errorf("panic: %v\n%s", r, debug.Stack())
+		if diag != nil {
+			*err = diag.wrap("panic", panicErr)
+			return
+		}
+		*err = panicErr
+	}
+}
+
+func formatDiagnosticBytesPrefix(b []byte, limit int) string {
+	if len(b) == 0 {
+		return "empty"
+	}
+	if limit <= 0 || len(b) <= limit {
+		return fmt.Sprintf("%x", b)
+	}
+	return fmt.Sprintf("%x...(len=%d)", b[:limit], len(b))
+}
+
+func (db *DB[K, V]) formatBuildIndexKeyDiagnostic(key []byte) string {
+	if db.strkey {
+		s := string(key)
+		if len(s) > 64 {
+			return fmt.Sprintf("id=%q...(len=%d key_prefix_hex=%s)", s[:64], len(s), formatDiagnosticBytesPrefix(key, 24))
+		}
+		return fmt.Sprintf("id=%q", s)
+	}
+	if len(key) == 8 {
+		return fmt.Sprintf("id=%d", binary.BigEndian.Uint64(key))
+	}
+	return fmt.Sprintf("key_len=%d key_prefix_hex=%s", len(key), formatDiagnosticBytesPrefix(key, 24))
 }
 
 func indexKeyFromString(s string) indexKey {
@@ -904,7 +961,9 @@ func (db *DB[K, V]) buildIndex(skipFields map[string]struct{}) error {
 
 	type rawdata struct {
 		v   []byte
+		key []byte
 		idx uint64
+		pos uint64
 	}
 
 	fieldStates := make([]*buildIndexFieldState, len(active))
@@ -945,7 +1004,16 @@ func (db *DB[K, V]) buildIndex(skipFields map[string]struct{}) error {
 				val, err := db.decode(kv.v)
 				if err != nil {
 					localUniverse[widx] = lu
-					workerErrs[widx] = err
+					workerErrs[widx] = fmt.Errorf(
+						"worker=%d stage=decode scan_pos=%d %s idx=%d value_len=%d value_prefix_hex=%s: %w",
+						widx,
+						kv.pos,
+						db.formatBuildIndexKeyDiagnostic(kv.key),
+						kv.idx,
+						len(kv.v),
+						formatDiagnosticBytesPrefix(kv.v, 32),
+						err,
+					)
 					cancel()
 					return
 				}
@@ -986,16 +1054,29 @@ func (db *DB[K, V]) buildIndex(skipFields map[string]struct{}) error {
 			defer db.strmap.Unlock()
 		}
 		nextGCAt := uint64(indexBuildGCStride)
+		nextReleaseAt := uint64(indexBuildReleaseOSMemoryStride)
 		scanned := uint64(0)
 		for k, v := c.First(); k != nil; k, v = c.Next() {
+			if !db.strkey && len(k) != 8 {
+				return fmt.Errorf(
+					"invalid uint64 key size scan_pos=%d key_len=%d key_prefix_hex=%s",
+					scanned+1,
+					len(k),
+					formatDiagnosticBytesPrefix(k, 24),
+				)
+			}
 			idx := db.idxFromKeyNoLock(k)
 			select {
 			case <-done:
 				return nil
-			case jobs <- rawdata{v: v, idx: idx}:
+			case jobs <- rawdata{v: v, key: k, idx: idx, pos: scanned + 1}:
 			}
 			scanned++
-			if scanned >= nextGCAt {
+			if scanned >= nextReleaseAt {
+				forceMemoryCleanup(true)
+				nextReleaseAt += indexBuildReleaseOSMemoryStride
+				nextGCAt = scanned + indexBuildGCStride
+			} else if scanned >= nextGCAt {
 				forceMemoryCleanup(false)
 				nextGCAt += indexBuildGCStride
 			}
@@ -1004,11 +1085,11 @@ func (db *DB[K, V]) buildIndex(skipFields map[string]struct{}) error {
 	})
 
 	if err != nil {
-		return fmt.Errorf("scan error: %w", err)
+		return fmt.Errorf("scan error: db=%q bucket=%q: %w", db.bolt.Path(), string(db.bucket), err)
 	}
 	for _, err = range workerErrs {
 		if err != nil {
-			return fmt.Errorf("scan error: %w", err)
+			return fmt.Errorf("scan error: db=%q bucket=%q: %w", db.bolt.Path(), string(db.bucket), err)
 		}
 	}
 
@@ -1217,49 +1298,61 @@ func (db *DB[K, V]) isLenZeroComplementField(field string) bool {
 }
 
 const (
-	initialIndexLen    = 32 << 10
-	maxStoredStringLen = 64 << 30
-	indexBuildGCStride = 100_000
+	initialIndexLen                 = 32 << 10
+	maxStoredStringLen              = 64 << 30
+	indexBuildGCStride              = 100_000
+	indexBuildReleaseOSMemoryStride = 1_000_000
 
 	nilIndexEntryKey    = ""
 	lenIndexNonEmptyKey = "\xFFNONEMPTY"
 )
 
 func (db *DB[K, V]) loadIndex() (skipFields map[string]struct{}, plannerStats *plannerStatsSnapshot, err error) {
-	defer recoverLoadIndex(&err)
+	diag := persistedIndexLoadDiag{
+		file:   db.rbiFile,
+		dbPath: db.bolt.Path(),
+		bucket: string(db.bucket),
+		size:   -1,
+	}
+	defer recoverLoadIndex(&err, &diag)
 
 	f, err := os.Open(db.rbiFile)
 	if err != nil {
 		return nil, nil, err
 	}
 	defer closeFile(f)
+	if info, statErr := f.Stat(); statErr == nil {
+		diag.size = info.Size()
+	}
 
 	start := time.Now()
 	reader := bufio.NewReaderSize(f, 32<<20)
 
 	ver, err := reader.ReadByte()
 	if err != nil {
-		return nil, nil, fmt.Errorf("%w: reading version: %w", errPersistedIndexInvalid, err)
+		return nil, nil, diag.wrap("read_version", fmt.Errorf("%w: reading version: %w", errPersistedIndexInvalid, err))
 	}
+	diag.version = ver
+	diag.versionKnown = true
 
 	var lenLoaded bool
 	switch ver {
 	case 24:
 		skipFields, plannerStats, lenLoaded, err = db.loadIndexV24(reader)
 	default:
-		return nil, nil, fmt.Errorf("%w: unsupported persisted index version: %v", errPersistedIndexInvalid, ver)
+		return nil, nil, diag.wrap("version", fmt.Errorf("%w: unsupported persisted index version: %v", errPersistedIndexInvalid, ver))
 	}
 	if err != nil {
 		if errors.Is(err, errPersistedIndexStale) || errors.Is(err, errPersistedIndexInvalid) {
-			return nil, nil, err
+			return nil, nil, diag.wrap("load_v24", err)
 		}
-		return nil, nil, fmt.Errorf("error loading index: %w", err)
+		return nil, nil, diag.wrap("load_v24", fmt.Errorf("error loading index: %w", err))
 	}
 
 	db.lenIndexLoaded = lenLoaded
 	db.stats.LoadTime = time.Since(start)
 	if err = db.publishCurrentSequenceSnapshotNoLock(); err != nil {
-		return nil, nil, fmt.Errorf("publish snapshot: %w", err)
+		return nil, nil, diag.wrap("publish_snapshot", fmt.Errorf("publish snapshot: %w", err))
 	}
 	forceMemoryCleanup(true)
 
@@ -1305,17 +1398,17 @@ func (db *DB[K, V]) loadIndexPayload(reader *bufio.Reader) (map[string]struct{},
 		return nil, nil, false, err
 	}
 
-	indexes, err := readIndexSections(reader, compatible)
+	indexes, err := readIndexSections(reader, compatible, "regular index")
 	if err != nil {
 		return nil, nil, false, fmt.Errorf("decode: reading index sections: %w", err)
 	}
 
-	nilIndexes, err := readIndexSections(reader, compatible)
+	nilIndexes, err := readIndexSections(reader, compatible, "nil index")
 	if err != nil {
 		return nil, nil, false, fmt.Errorf("decode: reading nil index sections: %w", err)
 	}
 
-	lenIndexes, err := readIndexSections(reader, compatible)
+	lenIndexes, err := readIndexSections(reader, compatible, "len index")
 	if err != nil {
 		return nil, nil, false, fmt.Errorf("decode: reading len index sections: %w", err)
 	}
@@ -1430,10 +1523,10 @@ func (db *DB[K, V]) readFieldCompatibility(reader *bufio.Reader) (map[string]boo
 	for i := uint64(0); i < count; i++ {
 		name, stored, err := readField(reader)
 		if err != nil {
-			return nil, fmt.Errorf("decode: reading field: %w", err)
+			return nil, fmt.Errorf("decode: reading field %d/%d: %w", i+1, count, err)
 		}
 		if _, exists := seen[name]; exists {
-			return nil, fmt.Errorf("decode: duplicate field %q", name)
+			return nil, fmt.Errorf("decode: duplicate field %q at entry %d/%d", name, i+1, count)
 		}
 		seen[name] = struct{}{}
 		cur := db.fields[name]
@@ -2118,7 +2211,7 @@ func readStrMap(reader *bufio.Reader, compactAt int) (*strMapper, error) {
 			}
 			s, err := readString(reader)
 			if err != nil {
-				return nil, fmt.Errorf("decode: reading strmap string: %w", err)
+				return nil, fmt.Errorf("decode: reading strmap dense string idx=%d: %w", i, err)
 			}
 			strs[i] = s
 			used[i] = true
@@ -2144,20 +2237,20 @@ func readStrMap(reader *bufio.Reader, compactAt int) (*strMapper, error) {
 		for i := uint64(0); i < count; i++ {
 			idx, err := binary.ReadUvarint(reader)
 			if err != nil {
-				return nil, fmt.Errorf("decode: reading strmap sparse idx: %w", err)
+				return nil, fmt.Errorf("decode: reading strmap sparse idx entry=%d/%d: %w", i+1, count, err)
 			}
 			if idx == 0 || idx > next {
-				return nil, fmt.Errorf("decode: strmap sparse idx out of range: idx=%v next=%v", idx, next)
+				return nil, fmt.Errorf("decode: strmap sparse idx out of range at entry=%d/%d: idx=%v next=%v", i+1, count, idx, next)
 			}
 			if _, exists := strs[idx]; exists {
-				return nil, fmt.Errorf("decode: duplicate strmap sparse idx: %v", idx)
+				return nil, fmt.Errorf("decode: duplicate strmap sparse idx at entry=%d/%d: %v", i+1, count, idx)
 			}
 			s, err := readString(reader)
 			if err != nil {
-				return nil, fmt.Errorf("decode: reading strmap sparse string: %w", err)
+				return nil, fmt.Errorf("decode: reading strmap sparse string idx=%d entry=%d/%d: %w", idx, i+1, count, err)
 			}
 			if _, exists := keys[s]; exists {
-				return nil, fmt.Errorf("decode: duplicate strmap sparse key: %q", s)
+				return nil, fmt.Errorf("decode: duplicate strmap sparse key at entry=%d/%d: %q", i+1, count, s)
 			}
 			keys[s] = idx
 			strs[idx] = s
@@ -2312,15 +2405,15 @@ func readPlannerStatsSnapshot(reader *bufio.Reader, compatible map[string]bool) 
 	for i := uint64(0); i < fieldCount; i++ {
 		f, err := readString(reader)
 		if err != nil {
-			return nil, fmt.Errorf("decode: reading planner stats field name: %w", err)
+			return nil, fmt.Errorf("decode: reading planner stats field name %d/%d: %w", i+1, fieldCount, err)
 		}
 		stats, err := readPlannerFieldStats(reader)
 		if err != nil {
-			return nil, fmt.Errorf("decode: reading planner stats field %q: %w", f, err)
+			return nil, fmt.Errorf("decode: reading planner stats field %q (%d/%d): %w", f, i+1, fieldCount, err)
 		}
 		if compatible[f] {
 			if _, exists := fields[f]; exists {
-				return nil, fmt.Errorf("decode: duplicate planner stats field %q", f)
+				return nil, fmt.Errorf("decode: duplicate planner stats field %q at entry %d/%d", f, i+1, fieldCount)
 			}
 			fields[f] = stats
 		}
@@ -2330,7 +2423,7 @@ func readPlannerStatsSnapshot(reader *bufio.Reader, compatible map[string]bool) 
 	}
 	for f := range compatible {
 		if _, ok := fields[f]; !ok {
-			return nil, fmt.Errorf("decode: missing planner stats field %q", f)
+			return nil, fmt.Errorf("decode: missing planner stats field %q (loaded=%d compatible=%d)", f, len(fields), len(compatible))
 		}
 	}
 
@@ -2422,10 +2515,11 @@ func sortedMapFieldNames[T any](m map[string]T) []string {
 func readIndexSections(
 	reader *bufio.Reader,
 	compatible map[string]bool,
+	section string,
 ) (map[string]fieldIndexStorage, error) {
 	count, err := binary.ReadUvarint(reader)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("reading %s field count: %w", section, err)
 	}
 	if count == 0 {
 		return make(map[string]fieldIndexStorage), nil
@@ -2436,17 +2530,17 @@ func readIndexSections(
 	for i := uint64(0); i < count; i++ {
 		f, err := readString(reader)
 		if err != nil {
-			return nil, fmt.Errorf("reading field name: %w", err)
+			return nil, fmt.Errorf("reading %s field name %d/%d: %w", section, i+1, count, err)
 		}
 		if _, exists := seen[f]; exists {
-			return nil, fmt.Errorf("duplicate field %q", f)
+			return nil, fmt.Errorf("duplicate %s field %q at entry %d/%d", section, f, i+1, count)
 		}
 		seen[f] = struct{}{}
 
 		keep := compatible[f]
-		storage, err := readFieldIndexStorage(reader, keep)
+		storage, err := readFieldIndexStorage(reader, keep, section, f)
 		if err != nil {
-			return nil, fmt.Errorf("reading field storage: %w", err)
+			return nil, fmt.Errorf("reading %s storage for field %q (%d/%d keep=%t): %w", section, f, i+1, count, keep, err)
 		}
 		if keep && storage.keyCount() > 0 {
 			out[f] = storage
@@ -2456,10 +2550,10 @@ func readIndexSections(
 	return out, nil
 }
 
-func readFieldIndexStorage(reader *bufio.Reader, keep bool) (fieldIndexStorage, error) {
+func readFieldIndexStorage(reader *bufio.Reader, keep bool, section string, fieldName string) (fieldIndexStorage, error) {
 	tag, err := reader.ReadByte()
 	if err != nil {
-		return fieldIndexStorage{}, err
+		return fieldIndexStorage{}, fmt.Errorf("reading storage encoding: %w", err)
 	}
 	switch tag {
 	case fieldStorageEncodingFlat:
@@ -2470,7 +2564,7 @@ func readFieldIndexStorage(reader *bufio.Reader, keep bool) (fieldIndexStorage, 
 		if !keep {
 			for i := uint64(0); i < count; i++ {
 				if err := skipIndexEntry(reader); err != nil {
-					return fieldIndexStorage{}, err
+					return fieldIndexStorage{}, fmt.Errorf("skipping flat entry %d/%d for field %q in %s: %w", i+1, count, fieldName, section, err)
 				}
 			}
 			return fieldIndexStorage{}, nil
@@ -2479,7 +2573,7 @@ func readFieldIndexStorage(reader *bufio.Reader, keep bool) (fieldIndexStorage, 
 		for i := uint64(0); i < count; i++ {
 			ent, err := readIndexEntry(reader)
 			if err != nil {
-				return fieldIndexStorage{}, err
+				return fieldIndexStorage{}, fmt.Errorf("reading flat entry %d/%d for field %q in %s: %w", i+1, count, fieldName, section, err)
 			}
 			if ent.IDs.IsEmpty() {
 				continue
@@ -2497,11 +2591,11 @@ func readFieldIndexStorage(reader *bufio.Reader, keep bool) (fieldIndexStorage, 
 			for i := uint64(0); i < pageCount; i++ {
 				refCount, err := binary.ReadUvarint(reader)
 				if err != nil {
-					return fieldIndexStorage{}, fmt.Errorf("reading page refs: %w", err)
+					return fieldIndexStorage{}, fmt.Errorf("reading page ref count %d/%d for field %q in %s: %w", i+1, pageCount, fieldName, section, err)
 				}
 				for j := uint64(0); j < refCount; j++ {
 					if err := skipFieldIndexChunk(reader); err != nil {
-						return fieldIndexStorage{}, err
+						return fieldIndexStorage{}, fmt.Errorf("skipping chunk page=%d/%d ref=%d/%d for field %q in %s: %w", i+1, pageCount, j+1, refCount, fieldName, section, err)
 					}
 				}
 			}
@@ -2511,13 +2605,13 @@ func readFieldIndexStorage(reader *bufio.Reader, keep bool) (fieldIndexStorage, 
 		for i := uint64(0); i < pageCount; i++ {
 			refCount, err := binary.ReadUvarint(reader)
 			if err != nil {
-				return fieldIndexStorage{}, fmt.Errorf("reading page refs: %w", err)
+				return fieldIndexStorage{}, fmt.Errorf("reading page ref count %d/%d for field %q in %s: %w", i+1, pageCount, fieldName, section, err)
 			}
 			refs := make([]fieldIndexChunkRef, 0, refCount)
 			for j := uint64(0); j < refCount; j++ {
 				chunk, err := readFieldIndexChunk(reader)
 				if err != nil {
-					return fieldIndexStorage{}, err
+					return fieldIndexStorage{}, fmt.Errorf("reading chunk page=%d/%d ref=%d/%d for field %q in %s: %w", i+1, pageCount, j+1, refCount, fieldName, section, err)
 				}
 				if chunk == nil || chunk.keyCount() == 0 {
 					continue
@@ -2542,7 +2636,7 @@ func readFieldIndexStorage(reader *bufio.Reader, keep bool) (fieldIndexStorage, 
 func readFieldIndexChunk(reader *bufio.Reader) (*fieldIndexChunk, error) {
 	tag, err := reader.ReadByte()
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("reading field chunk encoding: %w", err)
 	}
 	switch tag {
 	case fieldIndexChunkEncodingRaw8:
@@ -2561,12 +2655,12 @@ func readFieldIndexChunk(reader *bufio.Reader) (*fieldIndexChunk, error) {
 		var buf [8]byte
 		for i := range keys {
 			if _, err := io.ReadFull(reader, buf[:]); err != nil {
-				return nil, fmt.Errorf("reading numeric chunk key: %w", err)
+				return nil, fmt.Errorf("reading numeric chunk key %d/%d: %w", i+1, len(keys), err)
 			}
 			keys[i] = binary.BigEndian.Uint64(buf[:])
 			ids, err := posting.ReadFrom(reader)
 			if err != nil {
-				return nil, fmt.Errorf("reading numeric chunk posting: %w", err)
+				return nil, fmt.Errorf("reading numeric chunk posting %d/%d: %w", i+1, len(keys), err)
 			}
 			posts[i] = ids
 		}
@@ -2589,10 +2683,10 @@ func readFieldIndexChunk(reader *bufio.Reader) (*fieldIndexChunk, error) {
 		for i := range refs {
 			n, err := binary.ReadUvarint(reader)
 			if err != nil {
-				return nil, fmt.Errorf("reading string chunk key len: %w", err)
+				return nil, fmt.Errorf("reading string chunk key len %d/%d: %w", i+1, len(refs), err)
 			}
 			if n > uint64(^uint(0)>>1) {
-				return nil, fmt.Errorf("string chunk key len overflows int: %v", n)
+				return nil, fmt.Errorf("string chunk key len overflows int at entry %d/%d: %v", i+1, len(refs), n)
 			}
 			keyLen := int(n)
 			start := len(data)
@@ -2600,13 +2694,13 @@ func readFieldIndexChunk(reader *bufio.Reader) (*fieldIndexChunk, error) {
 			data = data[:start+keyLen]
 			if keyLen > 0 {
 				if _, err := io.ReadFull(reader, data[start:start+keyLen]); err != nil {
-					return nil, fmt.Errorf("reading string chunk key: %w", err)
+					return nil, fmt.Errorf("reading string chunk key %d/%d: %w", i+1, len(refs), err)
 				}
 			}
 			refs[i] = fieldIndexStringRef{off: uint32(start), len: uint32(keyLen)}
 			ids, err := posting.ReadFrom(reader)
 			if err != nil {
-				return nil, fmt.Errorf("reading string chunk posting: %w", err)
+				return nil, fmt.Errorf("reading string chunk posting %d/%d: %w", i+1, len(refs), err)
 			}
 			posts[i] = ids
 		}
@@ -2620,7 +2714,7 @@ func readFieldIndexChunk(reader *bufio.Reader) (*fieldIndexChunk, error) {
 func skipFieldIndexChunk(reader *bufio.Reader) error {
 	tag, err := reader.ReadByte()
 	if err != nil {
-		return err
+		return fmt.Errorf("reading field chunk encoding: %w", err)
 	}
 	switch tag {
 	case fieldIndexChunkEncodingRaw8:
@@ -2630,10 +2724,10 @@ func skipFieldIndexChunk(reader *bufio.Reader) error {
 		}
 		for i := uint64(0); i < count; i++ {
 			if _, err := io.CopyN(io.Discard, reader, 8); err != nil {
-				return err
+				return fmt.Errorf("skipping numeric chunk key %d/%d: %w", i+1, count, err)
 			}
 			if err := posting.Skip(reader); err != nil {
-				return err
+				return fmt.Errorf("skipping numeric chunk posting %d/%d: %w", i+1, count, err)
 			}
 		}
 		return nil
@@ -2646,15 +2740,15 @@ func skipFieldIndexChunk(reader *bufio.Reader) error {
 		for i := uint64(0); i < count; i++ {
 			n, err := binary.ReadUvarint(reader)
 			if err != nil {
-				return fmt.Errorf("reading string chunk key len: %w", err)
+				return fmt.Errorf("reading string chunk key len %d/%d: %w", i+1, count, err)
 			}
 			if n > 0 {
 				if _, err := io.CopyN(io.Discard, reader, int64(n)); err != nil {
-					return err
+					return fmt.Errorf("skipping string chunk key %d/%d: %w", i+1, count, err)
 				}
 			}
 			if err := posting.Skip(reader); err != nil {
-				return err
+				return fmt.Errorf("skipping string chunk posting %d/%d: %w", i+1, count, err)
 			}
 		}
 		return nil
@@ -2667,20 +2761,23 @@ func skipFieldIndexChunk(reader *bufio.Reader) error {
 func readIndexEntry(reader *bufio.Reader) (index, error) {
 	key, err := readIndexKey(reader)
 	if err != nil {
-		return index{}, err
+		return index{}, fmt.Errorf("reading index key: %w", err)
 	}
 	ids, err := posting.ReadFrom(reader)
 	if err != nil {
-		return index{}, err
+		return index{}, fmt.Errorf("reading index posting: %w", err)
 	}
 	return index{Key: key, IDs: ids}, nil
 }
 
 func skipIndexEntry(reader *bufio.Reader) error {
 	if err := skipIndexKey(reader); err != nil {
-		return err
+		return fmt.Errorf("skipping index key: %w", err)
 	}
-	return posting.Skip(reader)
+	if err := posting.Skip(reader); err != nil {
+		return fmt.Errorf("skipping index posting: %w", err)
+	}
+	return nil
 }
 
 func readIndexKey(reader *bufio.Reader) (indexKey, error) {

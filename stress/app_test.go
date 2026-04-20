@@ -2,10 +2,14 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"io"
+	"math/rand/v2"
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -269,5 +273,138 @@ func TestBuildReport_IncludesFinalIndexStatsOnly(t *testing.T) {
 	}
 	if got := bytes.Count(data, []byte(`"index_stats"`)); got != 1 {
 		t.Fatalf("expected final report JSON to contain exactly one index_stats section, got %d", got)
+	}
+}
+
+func TestRunHeadlessStopsOnWorkerError(t *testing.T) {
+	app := newApp(
+		&DBHandle{},
+		[]*classDescriptor{
+			{
+				Info: StressClassInfo{
+					ID:    7,
+					Alias: "r_med",
+					Name:  ClassReadMedium,
+					Role:  RoleRead,
+				},
+				Def: ClassDef{
+					Name: ClassReadMedium,
+					Role: RoleRead,
+					Run: func(ctx *WorkloadContext, rng *rand.Rand) (string, error) {
+						return "read_profile_by_id_items", io.EOF
+					},
+				},
+			},
+		},
+		time.Hour,
+		time.Hour,
+		"/tmp/stress-report.json",
+		nil,
+		nil,
+		false,
+		false,
+		false,
+		nil,
+	)
+	t.Cleanup(func() {
+		app.stopAllWorkers()
+		app.waitWorkers()
+	})
+
+	app.applyInitialWorkers(map[string]int{ClassReadMedium: 1})
+
+	err := app.runHeadless(context.Background())
+	if err == nil {
+		t.Fatal("runHeadless returned nil, want worker failure")
+	}
+	if !strings.Contains(err.Error(), "worker failures=1") {
+		t.Fatalf("runHeadless error = %q, want worker failure summary", err.Error())
+	}
+
+	app.waitWorkers()
+	errors := app.snapshotWorkerErrors()
+	if len(errors) != 1 {
+		t.Fatalf("len(workerErrors) = %d, want 1", len(errors))
+	}
+	entry := errors[0]
+	if entry.Role != RoleRead {
+		t.Fatalf("entry.Role = %q, want %q", entry.Role, RoleRead)
+	}
+	if entry.ClassAlias != "r_med" || entry.ClassName != ClassReadMedium {
+		t.Fatalf("entry class = (%q, %q), want (r_med, %q)", entry.ClassAlias, entry.ClassName, ClassReadMedium)
+	}
+	if entry.Query != "read_profile_by_id_items" {
+		t.Fatalf("entry.Query = %q, want read_profile_by_id_items", entry.Query)
+	}
+	if entry.WorkerName != "r_med#1" || entry.WorkerID != 1 {
+		t.Fatalf("entry worker = (%q, %d), want (r_med#1, 1)", entry.WorkerName, entry.WorkerID)
+	}
+	if entry.ClassWorkers != 1 {
+		t.Fatalf("entry.ClassWorkers = %d, want 1", entry.ClassWorkers)
+	}
+	if entry.TotalWorkers != 1 {
+		t.Fatalf("entry.TotalWorkers = %d, want 1", entry.TotalWorkers)
+	}
+	if entry.Err != io.EOF.Error() {
+		t.Fatalf("entry.Err = %q, want %q", entry.Err, io.EOF.Error())
+	}
+}
+
+func TestPrintWorkerErrorsIncludesExecutionContext(t *testing.T) {
+	app := newApp(
+		&DBHandle{},
+		[]*classDescriptor{
+			{
+				Info: StressClassInfo{
+					ID:    9,
+					Alias: "w_hvy",
+					Name:  ClassWriteHeavy,
+					Role:  RoleWrite,
+				},
+				Def: ClassDef{Name: ClassWriteHeavy, Role: RoleWrite},
+			},
+		},
+		time.Hour,
+		time.Hour,
+		"/tmp/stress-report.json",
+		nil,
+		nil,
+		false,
+		false,
+		false,
+		nil,
+	)
+	class := app.classes[0]
+	worker := &workerHandle{
+		id:   3,
+		name: "w_hvy#3",
+		stop: make(chan struct{}),
+	}
+
+	class.mu.Lock()
+	class.workers = append(class.workers, worker)
+	class.mu.Unlock()
+
+	app.recordWorkerError(class, worker, "write_bulk_signup", io.EOF)
+
+	var out bytes.Buffer
+	app.printWorkerErrors(&out)
+	text := out.String()
+
+	for _, want := range []string{
+		"worker failures (1):",
+		"role=write",
+		"class=w_hvy(write_heavy)",
+		"class_id=9",
+		"query=write_bulk_signup",
+		"worker=w_hvy#3",
+		"worker_id=3",
+		"class_workers=1",
+		"total_workers=1",
+		`err="EOF"`,
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("printWorkerErrors output missing %q:\n%s", want, text)
+		}
 	}
 }

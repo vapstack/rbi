@@ -1038,8 +1038,26 @@ func TestWrap_CorruptedPersistedIndex_RebuildsInsteadOfPanicking(t *testing.T) {
 	if !strings.Contains(gotLog, "persisted index is invalid") {
 		t.Fatalf("expected corrupted persisted index invalid marker in log, got: %q", gotLog)
 	}
+	if !strings.Contains(gotLog, "persisted index file=") {
+		t.Fatalf("expected corrupted persisted index log to include file context, got: %q", gotLog)
+	}
+	if !strings.Contains(gotLog, "bucket=\"Rec\"") {
+		t.Fatalf("expected corrupted persisted index log to include bucket context, got: %q", gotLog)
+	}
+	if !strings.Contains(gotLog, "stage=load_v24") {
+		t.Fatalf("expected corrupted persisted index log to include load stage, got: %q", gotLog)
+	}
+	if !strings.Contains(gotLog, "version=24") {
+		t.Fatalf("expected corrupted persisted index log to include format version, got: %q", gotLog)
+	}
 	if !strings.Contains(gotLog, "rbi: rebuilding index from bbolt") {
 		t.Fatalf("expected rebuild start in log, got: %q", gotLog)
+	}
+	if !strings.Contains(gotLog, "mode=full") {
+		t.Fatalf("expected full rebuild mode in log, got: %q", gotLog)
+	}
+	if !strings.Contains(gotLog, "rbi: index build completed (mode=full duration=") {
+		t.Fatalf("expected full rebuild completion duration in log, got: %q", gotLog)
 	}
 
 	got, err := db2.Get(1)
@@ -1051,7 +1069,78 @@ func TestWrap_CorruptedPersistedIndex_RebuildsInsteadOfPanicking(t *testing.T) {
 	}
 }
 
-func TestWrap_PersistedIndexSchemaNarrowing_ReusesCompatibleIndexes(t *testing.T) {
+func TestWrap_MissingPersistedIndex_LogsFullRebuildReason(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "missing_index.db")
+
+	rawDB, err := bbolt.Open(path, 0o600, nil)
+	if err != nil {
+		t.Fatalf("bbolt.Open: %v", err)
+	}
+
+	db, err := New[uint64, Rec](rawDB, Options{})
+	if err != nil {
+		t.Fatalf("initial New: %v", err)
+	}
+	rbiPath := db.rbiFile
+
+	if err = db.Set(1, &Rec{Name: "alice", Age: 30}); err != nil {
+		t.Fatalf("seed Set: %v", err)
+	}
+	if err = db.Close(); err != nil {
+		t.Fatalf("initial Close: %v", err)
+	}
+	if err = rawDB.Close(); err != nil {
+		t.Fatalf("initial raw Close: %v", err)
+	}
+	if err = os.Remove(rbiPath); err != nil {
+		t.Fatalf("remove .rbi: %v", err)
+	}
+
+	rawDB2, err := bbolt.Open(path, 0o600, nil)
+	if err != nil {
+		t.Fatalf("reopen bbolt.Open: %v", err)
+	}
+	defer func() { _ = rawDB2.Close() }()
+
+	var logBuf bytes.Buffer
+	prevLogWriter := log.Writer()
+	log.SetOutput(&logBuf)
+	defer log.SetOutput(prevLogWriter)
+
+	db2, err := New[uint64, Rec](rawDB2, Options{})
+	if err != nil {
+		t.Fatalf("reopen New: %v", err)
+	}
+	defer func() { _ = db2.Close() }()
+
+	gotLog := logBuf.String()
+	if !strings.Contains(gotLog, "persisted index missing") {
+		t.Fatalf("expected missing persisted index reason in log, got: %q", gotLog)
+	}
+	if !strings.Contains(gotLog, fmt.Sprintf("file=%q", rbiPath)) {
+		t.Fatalf("expected missing persisted index log to include file path, got: %q", gotLog)
+	}
+	if !strings.Contains(gotLog, "rbi: rebuilding index from bbolt") {
+		t.Fatalf("expected full rebuild start in log, got: %q", gotLog)
+	}
+	if !strings.Contains(gotLog, "mode=full") {
+		t.Fatalf("expected full rebuild mode in log, got: %q", gotLog)
+	}
+	if !strings.Contains(gotLog, "rbi: index build completed (mode=full duration=") {
+		t.Fatalf("expected full rebuild completion duration in log, got: %q", gotLog)
+	}
+
+	got, err := db2.Get(1)
+	if err != nil {
+		t.Fatalf("Get(1): %v", err)
+	}
+	if got == nil || got.Name != "alice" || got.Age != 30 {
+		t.Fatalf("expected rebuilt record after missing persisted index, got %#v", got)
+	}
+}
+
+func TestWrap_PersistedIndexSchemaNarrowing_LogsFullRebuildWhenNoCompatibleIndexes(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "schema_mismatch.db")
 
@@ -1101,10 +1190,19 @@ func TestWrap_PersistedIndexSchemaNarrowing_ReusesCompatibleIndexes(t *testing.T
 
 	gotLog := logBuf.String()
 	if strings.Contains(gotLog, "persisted index unavailable") {
-		t.Fatalf("expected compatible field indexes to be reused, got log: %q", gotLog)
+		t.Fatalf("expected successful persisted index read without availability failure, got log: %q", gotLog)
 	}
-	if strings.Contains(gotLog, "rbi: rebuilding index from bbolt") {
-		t.Fatalf("expected schema narrowing to avoid full rebuild, got log: %q", gotLog)
+	if !strings.Contains(gotLog, "persisted index has no compatible field indexes") {
+		t.Fatalf("expected explicit no-compatible-indexes reason in log, got: %q", gotLog)
+	}
+	if !strings.Contains(gotLog, "rbi: rebuilding index from bbolt") {
+		t.Fatalf("expected full rebuild log for no-compatible-indexes path, got: %q", gotLog)
+	}
+	if !strings.Contains(gotLog, "mode=full") {
+		t.Fatalf("expected full rebuild mode in log, got: %q", gotLog)
+	}
+	if !strings.Contains(gotLog, "rbi: index build completed (mode=full duration=") {
+		t.Fatalf("expected full rebuild completion duration in log, got: %q", gotLog)
 	}
 
 	got, err := db2.Get(1)
@@ -1255,7 +1353,19 @@ func TestWrap_PartialPersistedLoad_PreservesLenZeroComplementFlags(t *testing.T)
 		t.Fatalf("expected partial persisted load, got log: %q", gotLog)
 	}
 	if strings.Contains(gotLog, "rbi: rebuilding index from bbolt") {
-		t.Fatalf("expected partial rebuild with reused persisted fields, got log: %q", gotLog)
+		t.Fatalf("expected partial rebuild instead of full rebuild, got log: %q", gotLog)
+	}
+	if !strings.Contains(gotLog, "rbi: partially rebuilding index from bbolt") {
+		t.Fatalf("expected partial rebuild log, got: %q", gotLog)
+	}
+	if !strings.Contains(gotLog, "loaded_fields=2/3") {
+		t.Fatalf("expected partial rebuild loaded field count in log, got: %q", gotLog)
+	}
+	if !strings.Contains(gotLog, "missing_fields=1") {
+		t.Fatalf("expected partial rebuild missing field count in log, got: %q", gotLog)
+	}
+	if !strings.Contains(gotLog, "rbi: index build completed (mode=partial duration=") {
+		t.Fatalf("expected partial rebuild completion duration in log, got: %q", gotLog)
 	}
 
 	if !db2.isLenZeroComplementField("tags") {

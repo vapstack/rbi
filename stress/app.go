@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
 	"math/rand/v2"
 	"regexp"
 	"slices"
@@ -47,6 +48,9 @@ type stressApp struct {
 
 	statusMu sync.Mutex
 	status   string
+
+	errorMu      sync.Mutex
+	workerErrors []workerRunError
 }
 
 type classController struct {
@@ -124,6 +128,41 @@ type workerCommand struct {
 	Value   int
 }
 
+type workerRunError struct {
+	At           time.Time
+	Role         string
+	ClassID      int
+	ClassAlias   string
+	ClassName    string
+	Query        string
+	WorkerID     int64
+	WorkerName   string
+	ClassWorkers int
+	TotalWorkers int
+	Err          string
+}
+
+func (e workerRunError) summary() string {
+	query := e.Query
+	if query == "" {
+		query = "unknown"
+	}
+	return fmt.Sprintf(
+		"at=%s role=%s class=%s(%s) class_id=%d query=%s worker=%s worker_id=%d class_workers=%d total_workers=%d err=%q",
+		e.At.Format(time.RFC3339Nano),
+		e.Role,
+		e.ClassAlias,
+		e.ClassName,
+		e.ClassID,
+		query,
+		e.WorkerName,
+		e.WorkerID,
+		e.ClassWorkers,
+		e.TotalWorkers,
+		e.Err,
+	)
+}
+
 func newApp(
 	handle *DBHandle,
 	catalog []*classDescriptor,
@@ -186,6 +225,8 @@ func (a *stressApp) run(ctx context.Context, renderer *uiRenderer, input *lineRe
 		select {
 		case <-ctx.Done():
 			return nil
+		case <-a.stopCh:
+			return a.workerFailure()
 		case line, ok := <-input.Lines():
 			if !ok {
 				return nil
@@ -233,6 +274,8 @@ func (a *stressApp) runHeadless(ctx context.Context) error {
 		select {
 		case <-ctx.Done():
 			return nil
+		case <-a.stopCh:
+			return a.workerFailure()
 		case <-refreshTicker.C:
 			a.sampleCounts(time.Now())
 		case <-telemetryTicker.C:
@@ -258,6 +301,67 @@ func (a *stressApp) stopAllWorkers() {
 
 func (a *stressApp) waitWorkers() {
 	a.workerWG.Wait()
+}
+
+func (a *stressApp) totalWorkerCount() int {
+	total := 0
+	for _, class := range a.classes {
+		total += class.workerCount()
+	}
+	return total
+}
+
+func (a *stressApp) recordWorkerError(class *classController, worker *workerHandle, query string, err error) {
+	if err == nil {
+		return
+	}
+	entry := workerRunError{
+		At:           time.Now(),
+		Role:         class.desc.Info.Role,
+		ClassID:      class.desc.Info.ID,
+		ClassAlias:   class.desc.Info.Alias,
+		ClassName:    class.desc.Info.Name,
+		Query:        query,
+		WorkerID:     worker.id,
+		WorkerName:   worker.name,
+		ClassWorkers: class.workerCount(),
+		TotalWorkers: a.totalWorkerCount(),
+		Err:          err.Error(),
+	}
+	a.errorMu.Lock()
+	a.workerErrors = append(a.workerErrors, entry)
+	a.errorMu.Unlock()
+}
+
+func (a *stressApp) snapshotWorkerErrors() []workerRunError {
+	a.errorMu.Lock()
+	defer a.errorMu.Unlock()
+	return append([]workerRunError(nil), a.workerErrors...)
+}
+
+func (a *stressApp) hasWorkerErrors() bool {
+	a.errorMu.Lock()
+	defer a.errorMu.Unlock()
+	return len(a.workerErrors) > 0
+}
+
+func (a *stressApp) workerFailure() error {
+	errors := a.snapshotWorkerErrors()
+	if len(errors) == 0 {
+		return nil
+	}
+	return fmt.Errorf("worker failures=%d first={%s}", len(errors), errors[0].summary())
+}
+
+func (a *stressApp) printWorkerErrors(out io.Writer) {
+	errors := a.snapshotWorkerErrors()
+	if len(errors) == 0 {
+		return
+	}
+	_, _ = fmt.Fprintf(out, "\nworker failures (%d):\n", len(errors))
+	for i := range errors {
+		_, _ = fmt.Fprintf(out, "%d. %s\n", i+1, errors[i].summary())
+	}
 }
 
 func (a *stressApp) buildReport(interrupted bool) stressReport {
@@ -754,6 +858,11 @@ func (a *stressApp) runWorker(class *classController, worker *workerHandle) {
 		metrics := worker.metrics.Load()
 		if metrics != nil {
 			metrics.observe(kind, latencyNS, errCount)
+		}
+		if err != nil {
+			a.recordWorkerError(class, worker, kind, err)
+			a.stopAllWorkers()
+			return
 		}
 		if a.jitter {
 			jitterStarted := time.Now()

@@ -166,11 +166,20 @@ func main() {
 	default:
 		runErr = app.run(ctx, renderer, reader)
 	}
+	if app.hasWorkerErrors() {
+		closeInteractiveSession(&renderer, &reader)
+	}
 	if interrupted.Load() && renderer != nil && reader != nil {
 		renderShutdownStatus(app, renderer, reader, "Interrupt received; waiting for workers to stop...")
 	}
 	app.stopAllWorkers()
 	app.waitWorkers()
+	if workerErr := app.workerFailure(); workerErr != nil {
+		app.printWorkerErrors(os.Stderr)
+		if runErr == nil || errors.Is(runErr, context.Canceled) {
+			runErr = workerErr
+		}
+	}
 	if stopProfiling != nil {
 		if interrupted.Load() && renderer != nil && reader != nil {
 			renderShutdownStatus(app, renderer, reader, "Workers stopped; saving profiles...")
@@ -206,9 +215,11 @@ func main() {
 	}
 
 	if runErr != nil && !errors.Is(runErr, context.Canceled) {
+		closeInteractiveSession(&renderer, &reader)
 		fatalf("run stress: %v", runErr)
 	}
 	if closeErr != nil {
+		closeInteractiveSession(&renderer, &reader)
 		fatalf("close db: %v", closeErr)
 	}
 
@@ -218,6 +229,17 @@ func main() {
 func renderShutdownStatus(app *stressApp, renderer *uiRenderer, reader *lineReader, message string) {
 	app.setStatus(message)
 	_ = renderer.render(app.buildSnapshot(time.Now(), false), reader.Buffer(), app.statusText())
+}
+
+func closeInteractiveSession(renderer **uiRenderer, reader **lineReader) {
+	if *renderer != nil {
+		_ = (*renderer).Close()
+		*renderer = nil
+	}
+	if *reader != nil {
+		_ = (*reader).Close()
+		*reader = nil
+	}
 }
 
 func saveReportFile(path string, report stressReport) error {

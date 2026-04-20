@@ -4,12 +4,14 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"sync"
 	"time"
 )
 
 type uiRenderer struct {
 	out         *os.File
 	interactive bool
+	closeOnce   sync.Once
 }
 
 func newRenderer(out *os.File, interactive bool) *uiRenderer {
@@ -21,9 +23,11 @@ func newRenderer(out *os.File, interactive bool) *uiRenderer {
 }
 
 func (r *uiRenderer) Close() error {
-	if r.interactive {
-		_, _ = fmt.Fprint(r.out, "\x1b[?25h\x1b[?1049l")
-	}
+	r.closeOnce.Do(func() {
+		if r.interactive {
+			_, _ = fmt.Fprint(r.out, "\x1b[?25h\x1b[?1049l")
+		}
+	})
 	return nil
 }
 

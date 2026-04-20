@@ -1745,6 +1745,66 @@ func TestAutoBatchExt_SharedSet_DecodePreparedValueError_IsolatesFailedRequest(t
 	}
 }
 
+func TestAutoBatchExt_SharedSet_EmptyMsgpackPayload_IsolatesFailedRequest(t *testing.T) {
+	db, _ := openTempDBUint64(t)
+
+	badReq := mustBuildSetAutoReq(t, db, 1, &Rec{Name: "bad", Age: 11}, nil, nil, nil)
+	replaceAutoBatchPayloadForTest(badReq, rawAutoBatchPayload(t, nil))
+
+	goodReq := mustBuildSetAutoReq(t, db, 2, &Rec{Name: "good", Age: 22}, nil, nil, nil)
+
+	db.executeAutoBatch([]*autoBatchRequest[uint64, Rec]{badReq, goodReq})
+
+	if err := mustAutoBatchErr(t, badReq); err == nil || !strings.Contains(err.Error(), "empty msgpack payload") {
+		t.Fatalf("bad request error = %v, want empty msgpack payload", err)
+	}
+	if err := mustAutoBatchErr(t, goodReq); err != nil {
+		t.Fatalf("good request error = %v", err)
+	}
+
+	if got, err := db.Get(1); err != nil {
+		t.Fatalf("Get(1): %v", err)
+	} else if got != nil {
+		t.Fatalf("id=1 must stay absent, got %#v", got)
+	}
+	if got, err := db.Get(2); err != nil {
+		t.Fatalf("Get(2): %v", err)
+	} else if got == nil || got.Name != "good" || got.Age != 22 {
+		t.Fatalf("unexpected id=2 value: %#v", got)
+	}
+}
+
+func TestAutoBatchExt_AtomicSet_EmptyMsgpackPayload_FailsWholeBatch(t *testing.T) {
+	db, _ := openTempDBUint64(t)
+
+	badReq := mustBuildSetAutoReq(t, db, 1, &Rec{Name: "bad", Age: 11}, nil, nil, nil)
+	replaceAutoBatchPayloadForTest(badReq, rawAutoBatchPayload(t, nil))
+
+	goodReq := mustBuildSetAutoReq(t, db, 2, &Rec{Name: "good", Age: 22}, nil, nil, nil)
+
+	db.runAutoBatchAtomic(testAutoBatchRequestBuf(badReq, goodReq))
+
+	if badReq.err == nil || !strings.Contains(badReq.err.Error(), "empty msgpack payload") {
+		t.Fatalf("bad request error = %v, want empty msgpack payload", badReq.err)
+	}
+	if goodReq.err == nil || !strings.Contains(goodReq.err.Error(), "empty msgpack payload") {
+		t.Fatalf("good request error = %v, want shared batch failure", goodReq.err)
+	}
+
+	if got, err := db.Get(1); err != nil {
+		t.Fatalf("Get(1): %v", err)
+	} else if got != nil {
+		t.Fatalf("id=1 must stay absent, got %#v", got)
+	}
+	if got, err := db.Get(2); err != nil {
+		t.Fatalf("Get(2): %v", err)
+	} else if got != nil {
+		t.Fatalf("id=2 must stay absent after atomic failure, got %#v", got)
+	}
+
+	db.finishAutoBatch([]*autoBatchRequest[uint64, Rec]{badReq, goodReq})
+}
+
 func TestAutoBatchExt_SharedPatch_BeforeProcessError_IsolatesFailedRequest(t *testing.T) {
 	db, _ := openTempDBUint64(t)
 

@@ -442,6 +442,7 @@ func New[K ~uint64 | ~string, V any](bolt *bbolt.DB, options Options, execOpts .
 	var (
 		loadedPlannerStats *plannerStatsSnapshot
 		loadedFieldCount   int
+		buildMode          string
 	)
 	if !db.transparent {
 		var (
@@ -458,19 +459,45 @@ func New[K ~uint64 | ~string, V any](bolt *bbolt.DB, options Options, execOpts .
 					rebuildReason = fmt.Sprintf("persisted index unavailable (%v)", err)
 				}
 			}
+		} else if os.IsNotExist(err) {
+			rebuildReason = fmt.Sprintf("persisted index missing (file=%q)", db.rbiFile)
 		} else if !os.IsNotExist(err) {
 			rebuildReason = fmt.Sprintf("persisted index stat failed (%v)", err)
 		}
 
+		loadedFieldCount = len(skipFields)
+		totalFieldCount := len(db.fields)
 		if rebuildReason != "" {
+			buildMode = "full"
 			log.Printf("rbi: %s", rebuildReason)
-			log.Printf("rbi: rebuilding index from bbolt")
+			log.Printf(
+				"rbi: rebuilding index from bbolt (mode=full loaded_fields=%d/%d)",
+				loadedFieldCount,
+				totalFieldCount,
+			)
+		} else if totalFieldCount > 0 {
+			if loadedFieldCount == 0 {
+				buildMode = "full"
+				log.Printf("rbi: persisted index has no compatible field indexes (file=%q)", db.rbiFile)
+				log.Printf("rbi: rebuilding index from bbolt (mode=full loaded_fields=0/%d)", totalFieldCount)
+			} else if loadedFieldCount < totalFieldCount {
+				buildMode = "partial"
+				log.Printf(
+					"rbi: partially rebuilding index from bbolt (loaded_fields=%d/%d missing_fields=%d)",
+					loadedFieldCount,
+					totalFieldCount,
+					totalFieldCount-loadedFieldCount,
+				)
+			}
 		}
 
+		buildStarted := time.Now()
 		if err = db.buildIndex(skipFields); err != nil {
 			return nil, fmt.Errorf("error building index: %w", err)
 		}
-		loadedFieldCount = len(skipFields)
+		if buildMode != "" {
+			log.Printf("rbi: index build completed (mode=%s duration=%s)", buildMode, time.Since(buildStarted))
+		}
 	}
 
 	db.patchMap = make(map[string]*field)
@@ -493,6 +520,9 @@ func New[K ~uint64 | ~string, V any](bolt *bbolt.DB, options Options, execOpts .
 		} else {
 			if err = db.RefreshPlannerStats(); err != nil {
 				return nil, fmt.Errorf("failed to build planner stats snapshot: %w", err)
+			}
+			if buildMode != "" {
+				forceMemoryCleanup(true)
 			}
 		}
 
@@ -1325,6 +1355,7 @@ func (db *DB[K, V]) RebuildIndex() error {
 	}
 
 	db.refreshPlannerStatsLocked()
+	forceMemoryCleanup(true)
 	return nil
 }
 

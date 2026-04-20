@@ -61,6 +61,19 @@ const (
 	autoBatchDelete
 )
 
+func autoBatchOpString(op autoBatchOp) string {
+	switch op {
+	case autoBatchSet:
+		return "set"
+	case autoBatchPatch:
+		return "patch"
+	case autoBatchDelete:
+		return "delete"
+	default:
+		return fmt.Sprintf("unknown(%d)", op)
+	}
+}
+
 type autoBatchReqPolicy uint8
 
 const (
@@ -1075,18 +1088,53 @@ func (db *DB[K, V]) applyAutoBatchAcceptedLocked(
 	stats := db.autoBatcher.statsEnabled
 	var callbackFailedReq *autoBatchRequest[K, V]
 
+acceptedLoop:
 	for _, op := range accepted {
 		var err error
 		switch op.req.op {
 		case autoBatchSet, autoBatchPatch:
+			if db.decodeFn == nil && len(op.payload) == 0 {
+				err = fmt.Errorf(
+					"invalid write payload op=%s id=%v idx=%d key_len=%d payload_len=0: empty msgpack payload",
+					autoBatchOpString(op.req.op),
+					op.req.id,
+					op.idx,
+					len(op.key),
+				)
+				op.req.err = err
+				if stats {
+					db.autoBatcher.txOpErrors.Add(1)
+				}
+				if !atomicAll {
+					callbackFailedReq = op.req
+					break acceptedLoop
+				}
+				return nil, err
+			}
 			err = bucket.Put(op.key, op.payload)
 			if err != nil {
-				err = fmt.Errorf("put: %w", err)
+				err = fmt.Errorf(
+					"put op=%s id=%v idx=%d key_len=%d payload_len=%d payload_prefix_hex=%s: %w",
+					autoBatchOpString(op.req.op),
+					op.req.id,
+					op.idx,
+					len(op.key),
+					len(op.payload),
+					formatDiagnosticBytesPrefix(op.payload, 32),
+					err,
+				)
 			}
 		case autoBatchDelete:
 			err = bucket.Delete(op.key)
 			if err != nil {
-				err = fmt.Errorf("delete: %w", err)
+				err = fmt.Errorf(
+					"delete op=%s id=%v idx=%d key_len=%d: %w",
+					autoBatchOpString(op.req.op),
+					op.req.id,
+					op.idx,
+					len(op.key),
+					err,
+				)
 			}
 		default:
 			err = fmt.Errorf("unknown auto-batch op: %v", op.req.op)
@@ -1105,6 +1153,15 @@ func (db *DB[K, V]) applyAutoBatchAcceptedLocked(
 			db.autoBatcher.callbackOps.Add(1)
 		}
 		if err = runBeforeCommitHooks(tx, op.req.id, op.oldVal, op.newVal, op.req.beforeCommit); err != nil {
+			err = fmt.Errorf(
+				"before_commit op=%s id=%v idx=%d key_len=%d payload_len=%d: %w",
+				autoBatchOpString(op.req.op),
+				op.req.id,
+				op.idx,
+				len(op.key),
+				len(op.payload),
+				err,
+			)
 			op.req.err = err
 			if stats {
 				db.autoBatcher.callbackErrors.Add(1)
