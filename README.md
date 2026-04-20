@@ -17,10 +17,10 @@ RBI is not a replacement for a relational database.
 ### Features
 
 * ACID – data durability is delegated to bbolt.
-* Index-only filtering – disk is never touched.
+* Index-only filtering/sorting – disk is never touched.
 * Document-oriented – queries return whole records, not individual fields.
 * Strong typing – generic API with user-defined key and value types.
-* Automatic indexing of exported struct fields
+* Opt-in indexing via struct tags (`dbi`, `rbi`)
 * Fine-grained control via struct tags (`db`, `dbi`, `rbi`)
 * Efficient query building via [qx package](https://github.com/vapstack/qx):
   - comparisons: `EQ`, `GT`, `GTE`, `LT`, `LTE`
@@ -146,6 +146,8 @@ Queries are constructed using the [`qx`](https://github.com/vapstack/qx) package
 Field names refer to the names specified in `db` tags.\
 If a field does not have a `db` tag, the Go struct field name is used.
 
+Predicates and ordering can only reference fields that are explicitly indexed.
+
 ```go
 q := qx.Query(
     qx.EQ("field", val),
@@ -203,8 +205,8 @@ level.
 
 ## Transparent mode
 
-If a value type has no indexed fields, RBI automatically switches to a
-transparent mode. This is useful when you want a strongly-typed generic API 
+If a value type has no fields tagged for indexing, RBI automatically switches 
+to a transparent mode. This is useful for a strongly-typed generic API 
 over a bbolt bucket without maintaining secondary indexes.
 
 In transparent mode:
@@ -249,7 +251,7 @@ are not affected by unrelated writes to other bbolt buckets.
 ## Configuration
 
 All runtime controls are configured through `Options`.
-Recommended pattern is to set only the fields you need.
+Recommended pattern is to set only the required fields.
 
 ```go
 db, err := rbi.New[uint64, User](bolt, rbi.Options{
@@ -320,13 +322,13 @@ Important notes:
 
 ## Struct tags and indexing
 
-To mark field as indexed, use `rbi` or `dbi` struct tags.
+Fields are indexed when marked with `rbi` or `dbi` struct tags.
 If both tags are present on the same field, `rbi` takes priority.
 
 Supported values are: `default`, `unique` and `-`.
 
 To keep a field non-indexed, just omit tags or use `rbi:"-"`
-if you already have `dbi` tags.
+when `dbi` tags are already present.
 
 ## Slice fields
 
@@ -352,7 +354,8 @@ enforces a uniqueness constraint for that field.
 
 ## Custom indexing with `ValueIndexer`
 
-Scalar values and slices of scalars can be indexed by default.
+Scalar values and slices of scalars can be indexed out of the box 
+once the field is tagged for indexing.\
 Custom types may implement:
 
 ```go
@@ -509,17 +512,19 @@ the exact structural layout of the type.
 
 Most schema changes are handled gracefully:
 
-* **Adding fields** – a new index is created for the field; existing records
-  simply have no value for it.
-* **Removing fields** – the corresponding index is removed, but encoded data
-  for the field remains on disk until the record is updated.
-* **Renaming fields** – the old index is removed and a new one is created;
-  stored data remains until records are updated.
-* **Changing field types** – affected indexes are rebuilt; decoding behavior
-  and compatibility are the responsibility of the user.
+- **Adding fields** – if the new field is indexed, a new index is
+  created for it; existing records simply have no value for it.
+- **Removing fields** – if the field was indexed, the corresponding index is
+  removed, but encoded data for the field remains on disk until the record is
+  updated.
+- **Renaming fields** – if an indexed field is renamed, the old index is
+  removed and a new one is created; stored data remains until records are
+  updated.
+- **Changing field types** – affected indexes for indexed fields are rebuilt;
+  decoding behavior and compatibility are the responsibility of the user.
 
-Indexes for affected fields are automatically rebuilt when schema changes are
-detected.
+Indexes for affected tagged fields are automatically rebuilt when schema
+changes are detected.
 
 ### Custom encoding
 
@@ -548,7 +553,7 @@ The focus is on fast selection of complete documents.
 
 - Package is read-optimized.
 - Prefer batch writes over single inserts, if possible.
-- Always use limits if you do not need the whole set.
+- Always use limits when the whole result set is not needed.
 - Not all logical branches are currently optimized.
 
 There is still room for optimization, but the current performance is already
