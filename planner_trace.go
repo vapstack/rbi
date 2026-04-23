@@ -90,6 +90,12 @@ type TraceORRoute struct {
 	HasPrefixNonOrder   bool
 	HasSelectiveLead    bool
 	FallbackCollectFast bool
+	PlannerAnalysisTime time.Duration
+	PlannerPredicates   uint64
+	PlannerCacheHits    uint64
+	PlannerBuilds       uint64
+	PlannerExactRanges  uint64
+	PlannerReusedRanges uint64
 
 	RuntimeGuardEnabled bool
 	RuntimeGuardReason  string
@@ -331,6 +337,25 @@ func (t *queryTrace) setOROrderRouteDecision(route, reason string, cost plannerO
 	t.ev.ORRoute.HasPrefixNonOrder = cost.hasPrefixTailRisk
 	t.ev.ORRoute.HasSelectiveLead = cost.hasSelectiveLead
 	t.ev.ORRoute.FallbackCollectFast = fallbackCollectFast
+}
+
+func (t *queryTrace) addOROrderPlannerAnalysis(
+	d time.Duration,
+	predicates uint64,
+	cacheHits uint64,
+	builds uint64,
+	exactRanges uint64,
+	reusedRanges uint64,
+) {
+	if !t.full() {
+		return
+	}
+	t.ev.ORRoute.PlannerAnalysisTime += d
+	t.ev.ORRoute.PlannerPredicates += predicates
+	t.ev.ORRoute.PlannerCacheHits += cacheHits
+	t.ev.ORRoute.PlannerBuilds += builds
+	t.ev.ORRoute.PlannerExactRanges = exactRanges
+	t.ev.ORRoute.PlannerReusedRanges = reusedRanges
 }
 
 func (t *queryTrace) setOROrderRuntimeGuard(enabled bool, reason string) {

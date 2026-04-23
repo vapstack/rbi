@@ -27,6 +27,7 @@ const (
 	predicateSlicePoolMaxCap                = 256
 	leafPredSlicePoolMaxCap                 = 256
 	plannerORBranchSlicePoolMaxCap          = plannerORBranchLimit
+	plannerORPredicateBuildInfoSliceMaxCap  = 64
 	plannerOROrderIterSlicePoolMaxCap       = 512
 	plannerOROrderMergeItemSliceMaxCap      = 512
 	orderBasicBaseCoreSlicePoolMaxCap       = 128
@@ -256,6 +257,12 @@ var plannerORBranchSlicePool = pooled.Slices[plannerORBranch]{
 		}
 	},
 	Clear: true,
+}
+
+var plannerORPredicateBuildInfoSlicePool = pooled.Slices[orderedORMaterializedPredicateBuildInfo]{
+	MinCap: 8,
+	MaxCap: plannerORPredicateBuildInfoSliceMaxCap,
+	Clear:  true,
 }
 
 var plannerOROrderIterSlicePool = pooled.Slices[plannerOROrderBranchIter]{

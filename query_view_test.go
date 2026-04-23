@@ -362,6 +362,20 @@ func (db *DB[K, V]) buildORBranchesOrdered(ops []qx.Expr, orderField string, ord
 	return db.currentQueryViewForTests().buildORBranchesOrdered(compiledOps, orderField, orderedWindow, 0)
 }
 
+func (db *DB[K, V]) buildORBranchesOrderedWithOffset(
+	ops []qx.Expr,
+	orderField string,
+	orderedWindow int,
+	orderedOffset uint64,
+) (plannerORBranches, bool, bool) {
+	prepared, compiledOps, err := prepareTestExprs(db, ops)
+	if err != nil {
+		return plannerORBranches{}, false, false
+	}
+	defer releasePreparedQueriesForTest(prepared)
+	return db.currentQueryViewForTests().buildORBranchesOrdered(compiledOps, orderField, orderedWindow, orderedOffset)
+}
+
 func (db *DB[K, V]) execPlanORNoOrderAdaptive(q *qx.QX, branches plannerORBranches, trace *queryTrace) ([]K, bool) {
 	prepared, viewQ, err := prepareTestQuery(db, q)
 	if err != nil {
@@ -386,7 +400,7 @@ func (db *DB[K, V]) execPlanOROrderBasic(q *qx.QX, branches plannerORBranches, t
 		return nil, false
 	}
 	defer prepared.Release()
-	return db.currentQueryViewForTests().execPlanOROrderBasic(&viewQ, branches, trace, nil)
+	return db.currentQueryViewForTests().execPlanOROrderBasic(&viewQ, branches, nil, trace, nil)
 }
 
 func (db *DB[K, V]) execPlanOROrderMergeFallback(q *qx.QX, branches plannerORBranches, trace *queryTrace) ([]K, bool, error) {
@@ -404,7 +418,7 @@ func (db *DB[K, V]) execPlanOROrderKWay(q *qx.QX, branches plannerORBranches, tr
 		return nil, false, err
 	}
 	defer prepared.Release()
-	return db.currentQueryViewForTests().execPlanOROrderKWay(&viewQ, branches, trace)
+	return db.currentQueryViewForTests().execPlanOROrderKWay(&viewQ, branches, nil, trace)
 }
 
 func (db *DB[K, V]) materializedPredCacheKey(e qx.Expr) string {

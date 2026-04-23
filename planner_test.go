@@ -1046,7 +1046,7 @@ func TestPlannerORNoOrderAdaptive_MatchesBaseline(t *testing.T) {
 	}
 }
 
-func TestBuildORBranches_BroadNumericRangeUsesRuntimeStateOnColdFirstHit(t *testing.T) {
+func TestBuildORBranches_BroadNumericRangeStaysRuntimeOnSecondBuild(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
 		AnalyzeInterval:                         -1,
 		SnapshotMaterializedPredCacheMaxEntries: 16,
@@ -1080,7 +1080,7 @@ func TestBuildORBranches_BroadNumericRangeUsesRuntimeStateOnColdFirstHit(t *test
 		),
 	).Limit(150)
 
-	checkRangePred := func(branches plannerORBranches, wantMaterialized bool) {
+	checkRangePred := func(branches plannerORBranches) {
 		t.Helper()
 		var found bool
 		for i := 0; i < branches.Len(); i++ {
@@ -1091,12 +1091,6 @@ func TestBuildORBranches_BroadNumericRangeUsesRuntimeStateOnColdFirstHit(t *test
 					continue
 				}
 				found = true
-				if wantMaterialized {
-					if !p.isMaterializedLike() {
-						t.Fatalf("expected broad range leaf to become materialized on second build")
-					}
-					continue
-				}
 				if p.isMaterializedLike() || p.lazyMatState != nil {
 					t.Fatalf("expected broad range leaf to stay on runtime state")
 				}
@@ -1117,7 +1111,7 @@ func TestBuildORBranches_BroadNumericRangeUsesRuntimeStateOnColdFirstHit(t *test
 	if alwaysFalse {
 		t.Fatalf("unexpected alwaysFalse")
 	}
-	checkRangePred(branches, false)
+	checkRangePred(branches)
 	branches.Release()
 	if got := db.getSnapshot().matPredCacheCount.Load(); got != 0 {
 		t.Fatalf("unexpected shared materialized predicate cache entry after first build: %d", got)
@@ -1131,9 +1125,501 @@ func TestBuildORBranches_BroadNumericRangeUsesRuntimeStateOnColdFirstHit(t *test
 	if alwaysFalse {
 		t.Fatalf("unexpected alwaysFalse on second build")
 	}
-	checkRangePred(branches, true)
+	checkRangePred(branches)
+	if got := db.getSnapshot().matPredCacheCount.Load(); got != 0 {
+		t.Fatalf("unexpected shared materialized predicate cache entry after second build: %d", got)
+	}
+}
+
+func TestPlannerORNoOrder_BroadResidualRangePromotesRouteAware(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{
+		AnalyzeInterval:                         -1,
+		SnapshotMaterializedPredCacheMaxEntries: 16,
+		NumericRangeBucketSize:                  8,
+		NumericRangeBucketMinFieldKeys:          16,
+		NumericRangeBucketMinSpanKeys:           4,
+	})
+	seedGeneratedUint64Data(t, db, 12_000, func(i int) *Rec {
+		return &Rec{
+			Name:   fmt.Sprintf("u_%d", i),
+			Email:  fmt.Sprintf("user%05d@example.com", i),
+			Age:    i,
+			Score:  float64(i),
+			Active: i%2 == 0,
+		}
+	})
+	if err := db.RebuildIndex(); err != nil {
+		t.Fatalf("RebuildIndex: %v", err)
+	}
+
+	q := qx.Query(
+		qx.OR(
+			qx.AND(
+				qx.EQ("active", true),
+				qx.GTE("score", 4_000.0),
+			),
+			qx.AND(
+				qx.EQ("name", "u_42"),
+				qx.EQ("email", "user00042@example.com"),
+			),
+		),
+	).Limit(150)
+
+	checkScorePred := func(branches plannerORBranches, wantKind predicateKind) {
+		t.Helper()
+		var found bool
+		for i := 0; i < branches.Len(); i++ {
+			branch := branches.Get(i)
+			for j := 0; j < branch.predLen(); j++ {
+				p := branch.pred(j)
+				if db.fieldNameByOrdinal(p.expr.FieldOrdinal) != "score" || p.expr.Op != compileScalarOpForTest(qx.OpGTE) {
+					continue
+				}
+				found = true
+				if j == branch.leadIdx {
+					t.Fatalf("expected broad score range to stay residual, got lead in branch %d", i)
+				}
+				if p.kind != wantKind {
+					t.Fatalf("unexpected broad score predicate kind: got=%v want=%v", p.kind, wantKind)
+				}
+			}
+		}
+		if !found {
+			t.Fatalf("expected score range predicate in OR branches")
+		}
+	}
+
+	branches, alwaysFalse, ok := db.buildORBranches(q.Filter.Args)
+	if !ok {
+		t.Fatalf("buildORBranches first: ok=false")
+	}
+	if alwaysFalse {
+		t.Fatalf("unexpected alwaysFalse on first build")
+	}
+	checkScorePred(branches, predicateKindCustom)
+	branches.Release()
+
+	branches, alwaysFalse, ok = db.buildORBranches(q.Filter.Args)
+	if !ok {
+		t.Fatalf("buildORBranches second: ok=false")
+	}
+	if alwaysFalse {
+		t.Fatalf("unexpected alwaysFalse on second build")
+	}
+	checkScorePred(branches, predicateKindCustom)
+
+	if _, ok := db.execPlanORNoOrderAdaptive(q, branches, nil); !ok {
+		branches.Release()
+		t.Fatalf("execPlanORNoOrderAdaptive: ok=false")
+	}
+	checkScorePred(branches, predicateKindMaterializedNot)
+	branches.Release()
+
 	if got := db.getSnapshot().matPredCacheCount.Load(); got == 0 {
-		t.Fatalf("expected shared materialized predicate cache entry after second build")
+		t.Fatalf("expected route-aware residual materialization to populate shared cache")
+	}
+}
+
+func TestPlannerORNoOrder_NullableBroadResidualRangeDoesNotStayLazy(t *testing.T) {
+	db, _ := openTempDBUint64PtrInt(t, Options{
+		AnalyzeInterval:                         -1,
+		SnapshotMaterializedPredCacheMaxEntries: 16,
+	})
+	for i := 0; i < 4; i++ {
+		rec := &PtrIntRec{Name: fmt.Sprintf("nil_%02d", i), Rank: nil, Active: i%2 == 0}
+		if err := db.Set(uint64(i+1), rec); err != nil {
+			t.Fatalf("Set(nil_%02d): %v", i, err)
+		}
+	}
+	for i := 0; i < 24; i++ {
+		rec := &PtrIntRec{Name: fmt.Sprintf("rank_%02d", i), Rank: intPtr(i), Active: i%2 == 0}
+		if err := db.Set(uint64(i+5), rec); err != nil {
+			t.Fatalf("Set(rank_%02d): %v", i, err)
+		}
+	}
+	if err := db.RebuildIndex(); err != nil {
+		t.Fatalf("RebuildIndex: %v", err)
+	}
+
+	q := qx.Query(
+		qx.OR(
+			qx.AND(
+				qx.EQ("active", true),
+				qx.GTE("rank", 4),
+			),
+			qx.AND(
+				qx.EQ("name", "nil_01"),
+				qx.EQ("active", false),
+			),
+		),
+	).Limit(50)
+
+	branches, alwaysFalse, ok := db.buildORBranches(q.Filter.Args)
+	if !ok {
+		t.Fatalf("buildORBranches: ok=false")
+	}
+	defer branches.Release()
+	if alwaysFalse {
+		t.Fatalf("unexpected alwaysFalse")
+	}
+
+	found := false
+	for bi := 0; bi < branches.Len(); bi++ {
+		branch := branches.Get(bi)
+		for pi := 0; pi < branch.predLen(); pi++ {
+			p := branch.pred(pi)
+			if db.fieldNameByOrdinal(p.expr.FieldOrdinal) != "rank" || p.expr.Op != compileScalarOpForTest(qx.OpGTE) {
+				continue
+			}
+			found = true
+			if p.lazyMatState != nil {
+				t.Fatalf("expected nullable broad range to avoid lazy state")
+			}
+			if p.hasRuntimeRangeState() {
+				t.Fatalf("expected nullable broad range to avoid runtime complement probe")
+			}
+			if p.kind == predicateKindMaterializedNot || !p.rangeMat {
+				t.Fatalf("expected nil-heavy nullable broad range to materialize positive side when branch already has lead, got kind=%v rangeMat=%v", p.kind, p.rangeMat)
+			}
+			if !p.isMaterializedLike() {
+				t.Fatalf("expected nullable broad range to materialize for correctness, got kind=%v", p.kind)
+			}
+			if p.matches(1) || p.matches(2) {
+				t.Fatalf("nil rank rows must not match broad positive range")
+			}
+			if !p.matches(9) {
+				t.Fatalf("expected in-range row to match materialized nullable range")
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("expected rank range predicate in OR branches")
+	}
+}
+
+func TestPlannerORNoOrder_NullableNonBroadComplementResidualRangeDoesNotStayLazy(t *testing.T) {
+	db, _ := openTempDBUint64PtrInt(t, Options{
+		AnalyzeInterval:                         -1,
+		SnapshotMaterializedPredCacheMaxEntries: 16,
+	})
+	for i := 0; i < 64; i++ {
+		rec := &PtrIntRec{Name: fmt.Sprintf("nil_%02d", i), Rank: nil, Active: i%2 == 0}
+		if err := db.Set(uint64(i+1), rec); err != nil {
+			t.Fatalf("Set(nil_%02d): %v", i, err)
+		}
+	}
+	for i := 0; i < 40; i++ {
+		v := 0
+		rec := &PtrIntRec{Name: fmt.Sprintf("zero_%02d", i), Rank: &v, Active: i%2 == 0}
+		if err := db.Set(uint64(i+65), rec); err != nil {
+			t.Fatalf("Set(zero_%02d): %v", i, err)
+		}
+	}
+	for i := 1; i <= 9; i++ {
+		v := i
+		rec := &PtrIntRec{Name: fmt.Sprintf("rank_%02d", i), Rank: &v, Active: true}
+		if err := db.Set(uint64(i+105), rec); err != nil {
+			t.Fatalf("Set(rank_%02d): %v", i, err)
+		}
+	}
+	if err := db.RebuildIndex(); err != nil {
+		t.Fatalf("RebuildIndex: %v", err)
+	}
+
+	view := db.currentQueryViewForTests()
+	defer db.releaseQueryView(view)
+	expr := mustTestQIRExprForDB(t, db, qx.GTE("rank", 1))
+	candidate, ok := view.prepareScalarRangeRoutingCandidate(expr)
+	if !ok {
+		t.Fatalf("expected nullable range routing candidate")
+	}
+	universe := view.snapshotUniverseCardinality()
+	if universe == 0 {
+		t.Fatalf("expected non-zero snapshot universe")
+	}
+	if !candidate.plan.useComplement {
+		t.Fatalf("expected complement route for sparse nullable range")
+	}
+	if candidate.broadComplementCardinality(universe) {
+		t.Fatalf("expected non-broad complement route for sparse nullable range")
+	}
+
+	q := qx.Query(
+		qx.OR(
+			qx.AND(
+				qx.EQ("active", true),
+				qx.GTE("rank", 1),
+			),
+			qx.AND(
+				qx.EQ("name", "nil_01"),
+				qx.EQ("active", false),
+			),
+		),
+	).Limit(50)
+
+	branches, alwaysFalse, ok := db.buildORBranches(q.Filter.Args)
+	if !ok {
+		t.Fatalf("buildORBranches: ok=false")
+	}
+	defer branches.Release()
+	if alwaysFalse {
+		t.Fatalf("unexpected alwaysFalse")
+	}
+
+	found := false
+	for bi := 0; bi < branches.Len(); bi++ {
+		branch := branches.Get(bi)
+		for pi := 0; pi < branch.predLen(); pi++ {
+			p := branch.pred(pi)
+			if db.fieldNameByOrdinal(p.expr.FieldOrdinal) != "rank" || p.expr.Op != compileScalarOpForTest(qx.OpGTE) {
+				continue
+			}
+			found = true
+			if p.lazyMatState != nil {
+				t.Fatalf("expected nullable non-broad complement range to avoid lazy state")
+			}
+			if p.hasRuntimeRangeState() {
+				t.Fatalf("expected nullable non-broad complement range to avoid runtime complement probe")
+			}
+			if p.kind == predicateKindMaterializedNot || !p.rangeMat {
+				t.Fatalf("expected nil-heavy nullable non-broad range to materialize positive side when branch already has lead, got kind=%v rangeMat=%v", p.kind, p.rangeMat)
+			}
+			if !p.isMaterializedLike() {
+				t.Fatalf("expected nullable non-broad complement range to materialize for correctness, got kind=%v", p.kind)
+			}
+			if p.matches(1) || p.matches(3) {
+				t.Fatalf("nil rank rows must not match nullable non-broad positive range")
+			}
+			if !p.matches(106) {
+				t.Fatalf("expected in-range row to match materialized nullable non-broad range")
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("expected rank range predicate in OR branches")
+	}
+}
+
+func TestPlannerORNoOrder_NullableNonBroadComplementResidualRangeDoesNotStayLazyWithoutMatPredCache(t *testing.T) {
+	db, _ := openTempDBUint64PtrInt(t, Options{
+		AnalyzeInterval:                         -1,
+		SnapshotMaterializedPredCacheMaxEntries: 0,
+	})
+	for i := 0; i < 64; i++ {
+		rec := &PtrIntRec{Name: fmt.Sprintf("nil_%02d", i), Rank: nil, Active: i%2 == 0}
+		if err := db.Set(uint64(i+1), rec); err != nil {
+			t.Fatalf("Set(nil_%02d): %v", i, err)
+		}
+	}
+	for i := 0; i < 40; i++ {
+		v := 0
+		rec := &PtrIntRec{Name: fmt.Sprintf("zero_%02d", i), Rank: &v, Active: i%2 == 0}
+		if err := db.Set(uint64(i+65), rec); err != nil {
+			t.Fatalf("Set(zero_%02d): %v", i, err)
+		}
+	}
+	for i := 1; i <= 9; i++ {
+		v := i
+		rec := &PtrIntRec{Name: fmt.Sprintf("rank_%02d", i), Rank: &v, Active: true}
+		if err := db.Set(uint64(i+105), rec); err != nil {
+			t.Fatalf("Set(rank_%02d): %v", i, err)
+		}
+	}
+	if err := db.RebuildIndex(); err != nil {
+		t.Fatalf("RebuildIndex: %v", err)
+	}
+
+	view := db.currentQueryViewForTests()
+	defer db.releaseQueryView(view)
+	expr := mustTestQIRExprForDB(t, db, qx.GTE("rank", 1))
+	candidate, ok := view.prepareScalarRangeRoutingCandidate(expr)
+	if !ok {
+		t.Fatalf("expected nullable range routing candidate")
+	}
+	universe := view.snapshotUniverseCardinality()
+	if universe == 0 {
+		t.Fatalf("expected non-zero snapshot universe")
+	}
+	if !candidate.plan.useComplement {
+		t.Fatalf("expected complement route for sparse nullable range")
+	}
+	if candidate.broadComplementCardinality(universe) {
+		t.Fatalf("expected non-broad complement route for sparse nullable range")
+	}
+
+	q := qx.Query(
+		qx.OR(
+			qx.AND(
+				qx.EQ("active", true),
+				qx.GTE("rank", 1),
+			),
+			qx.AND(
+				qx.EQ("name", "nil_01"),
+				qx.EQ("active", false),
+			),
+		),
+	).Limit(50)
+
+	branches, alwaysFalse, ok := db.buildORBranches(q.Filter.Args)
+	if !ok {
+		t.Fatalf("buildORBranches: ok=false")
+	}
+	defer branches.Release()
+	if alwaysFalse {
+		t.Fatalf("unexpected alwaysFalse")
+	}
+
+	found := false
+	for bi := 0; bi < branches.Len(); bi++ {
+		branch := branches.Get(bi)
+		for pi := 0; pi < branch.predLen(); pi++ {
+			p := branch.pred(pi)
+			if db.fieldNameByOrdinal(p.expr.FieldOrdinal) != "rank" || p.expr.Op != compileScalarOpForTest(qx.OpGTE) {
+				continue
+			}
+			found = true
+			if p.lazyMatState != nil {
+				t.Fatalf("expected nullable non-broad complement range to avoid lazy state with mat-pred cache disabled")
+			}
+			if p.hasRuntimeRangeState() {
+				t.Fatalf("expected nullable non-broad complement range to avoid runtime complement probe with mat-pred cache disabled")
+			}
+			if p.kind == predicateKindMaterializedNot || !p.rangeMat {
+				t.Fatalf("expected nil-heavy nullable non-broad range to materialize positive side with mat-pred cache disabled, got kind=%v rangeMat=%v", p.kind, p.rangeMat)
+			}
+			if p.matches(1) || p.matches(3) {
+				t.Fatalf("nil rank rows must not match nullable non-broad positive range with mat-pred cache disabled")
+			}
+			if !p.matches(106) {
+				t.Fatalf("expected in-range row to match materialized nullable range with mat-pred cache disabled")
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("expected rank range predicate in OR branches")
+	}
+
+	gotBaseline, ok := db.execPlanORNoOrderBaseline(q, branches, nil)
+	if !ok {
+		t.Fatalf("execPlanORNoOrderBaseline: ok=false")
+	}
+	for _, id := range gotBaseline {
+		if id == 1 || id == 3 || id == 5 {
+			t.Fatalf("baseline execution leaked unrelated nil-rank row id=%d with mat-pred cache disabled", id)
+		}
+	}
+}
+
+func TestPlannerORNoOrder_NullableNonBroadComplementOnlyPositiveLeafKeepsLead(t *testing.T) {
+	db, _ := openTempDBUint64PtrInt(t, Options{
+		AnalyzeInterval:                         -1,
+		SnapshotMaterializedPredCacheMaxEntries: 16,
+	})
+	for i := 0; i < 64; i++ {
+		rec := &PtrIntRec{Name: fmt.Sprintf("nil_%02d", i), Rank: nil, Active: i%2 == 0}
+		if err := db.Set(uint64(i+1), rec); err != nil {
+			t.Fatalf("Set(nil_%02d): %v", i, err)
+		}
+	}
+	for i := 0; i < 40; i++ {
+		v := 0
+		rec := &PtrIntRec{Name: fmt.Sprintf("zero_%02d", i), Rank: &v, Active: i%2 == 0}
+		if err := db.Set(uint64(i+65), rec); err != nil {
+			t.Fatalf("Set(zero_%02d): %v", i, err)
+		}
+	}
+	for i := 1; i <= 9; i++ {
+		v := i
+		rec := &PtrIntRec{Name: fmt.Sprintf("rank_%02d", i), Rank: &v, Active: true}
+		if err := db.Set(uint64(i+105), rec); err != nil {
+			t.Fatalf("Set(rank_%02d): %v", i, err)
+		}
+	}
+	if err := db.RebuildIndex(); err != nil {
+		t.Fatalf("RebuildIndex: %v", err)
+	}
+
+	q := qx.Query(
+		qx.OR(
+			qx.AND(
+				qx.GTE("rank", 1),
+				qx.NOT(qx.EQ("active", false)),
+			),
+			qx.EQ("name", "nil_01"),
+		),
+	).Limit(50)
+
+	branches, alwaysFalse, ok := db.buildORBranches(q.Filter.Args)
+	if !ok {
+		t.Fatalf("buildORBranches: ok=false")
+	}
+	defer branches.Release()
+	if alwaysFalse {
+		t.Fatalf("unexpected alwaysFalse")
+	}
+
+	found := false
+	for bi := 0; bi < branches.Len(); bi++ {
+		branch := branches.Get(bi)
+		for pi := 0; pi < branch.predLen(); pi++ {
+			p := branch.pred(pi)
+			if db.fieldNameByOrdinal(p.expr.FieldOrdinal) != "rank" || p.expr.Op != compileScalarOpForTest(qx.OpGTE) {
+				continue
+			}
+			found = true
+			if !branch.hasLead() || branch.leadPtr() == nil {
+				t.Fatalf("expected forced nullable range branch to keep lead iterator")
+			}
+			if db.fieldNameByOrdinal(branch.leadPred().expr.FieldOrdinal) != "rank" {
+				t.Fatalf("expected nullable range leaf to remain the lead predicate, got field=%s", db.fieldNameByOrdinal(branch.leadPred().expr.FieldOrdinal))
+			}
+			if p.kind == predicateKindMaterializedNot {
+				t.Fatalf("expected only positive leaf to keep positive materialized side as branch lead")
+			}
+			if !p.isMaterializedLike() {
+				t.Fatalf("expected forced nullable range branch to materialize")
+			}
+			if p.hasRuntimeRangeState() {
+				t.Fatalf("expected forced nullable range branch to avoid runtime complement state")
+			}
+			if p.matches(1) || p.matches(3) || p.matches(5) {
+				t.Fatalf("nil rank rows must not match branch where range is the only positive leaf")
+			}
+			if !p.matches(106) {
+				t.Fatalf("expected in-range row to match branch where range is the only positive leaf")
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("expected rank range branch with negative sibling leaf")
+	}
+
+	gotBaseline, ok := db.execPlanORNoOrderBaseline(q, branches, nil)
+	if !ok {
+		t.Fatalf("execPlanORNoOrderBaseline: ok=false")
+	}
+	for _, id := range gotBaseline {
+		if id == 1 || id == 3 || id == 5 {
+			t.Fatalf("baseline execution leaked unrelated nil-rank row id=%d", id)
+		}
+	}
+
+	branches2, alwaysFalse, ok := db.buildORBranches(q.Filter.Args)
+	if !ok {
+		t.Fatalf("buildORBranches second: ok=false")
+	}
+	defer branches2.Release()
+	if alwaysFalse {
+		t.Fatalf("unexpected alwaysFalse on second build")
+	}
+	gotAdaptive, ok := db.execPlanORNoOrderAdaptive(q, branches2, nil)
+	if !ok {
+		t.Fatalf("execPlanORNoOrderAdaptive: ok=false")
+	}
+	for _, id := range gotAdaptive {
+		if id == 1 || id == 3 || id == 5 {
+			t.Fatalf("adaptive execution leaked unrelated nil-rank row id=%d", id)
+		}
 	}
 }
 
@@ -1195,6 +1681,811 @@ func TestPlannerOROrderKWay_MatchesFallbackMerge(t *testing.T) {
 	}
 }
 
+func TestPlannerOROrderBranchIter_ResidualRowsExcludeExactOnlyChecks(t *testing.T) {
+	bucket := posting.BuildFromSorted([]uint64{1, 2, 3, 4, 5, 6, 7, 8})
+	defer bucket.Release()
+
+	exact := posting.BuildFromSorted([]uint64{1, 2, 3, 4})
+	defer exact.Release()
+
+	residualAllowed := posting.BuildFromSorted([]uint64{1, 2})
+	defer residualAllowed.Release()
+
+	preds := newPredicateSet(2)
+	preds.Append(predicate{
+		kind:    predicateKindPosting,
+		posting: exact.Borrow(),
+		estCard: exact.Cardinality(),
+	})
+	preds.Append(predicate{
+		kind:    predicateKindCustom,
+		estCard: residualAllowed.Cardinality(),
+		contains: func(idx uint64) bool {
+			return residualAllowed.Contains(idx)
+		},
+	})
+	defer preds.Release()
+
+	checks := predicateCheckSlicePool.Get()
+	checks.Append(0)
+	checks.Append(1)
+	exactChecks := predicateCheckSlicePool.Get()
+	exactChecks.Append(0)
+	residualChecks := predicateCheckSlicePool.Get()
+	residualChecks.Append(1)
+
+	iter := plannerOROrderBranchIter{
+		branch:         &plannerORBranch{preds: preds, leadIdx: -1},
+		checks:         checks,
+		exactChecks:    exactChecks,
+		residualChecks: residualChecks,
+		overlay:        fieldOverlay{base: []index{{IDs: bucket.Borrow()}}},
+		single:         -1,
+		exactSingle:    0,
+		residualSingle: 1,
+		allChecksExact: false,
+		startBucket:    0,
+		endBucket:      1,
+	}
+	iter.init()
+	defer iter.close()
+
+	var examined uint64
+	var residualExamined uint64
+	var emitted uint64
+	for {
+		examinedDelta, residualDelta, emittedDelta, ok := iter.advance()
+		examined += examinedDelta
+		residualExamined += residualDelta
+		emitted += emittedDelta
+		if !ok {
+			break
+		}
+	}
+
+	if examined != 8 {
+		t.Fatalf("expected examined=8, got=%d", examined)
+	}
+	if residualExamined != 4 {
+		t.Fatalf("expected residualExamined=4, got=%d", residualExamined)
+	}
+	if emitted != 2 {
+		t.Fatalf("expected emitted=2, got=%d", emitted)
+	}
+}
+
+func TestInitOrderedORBranchEstimates_ExcludesCoveredLeafFromCard(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{
+		AnalyzeInterval: -1,
+	})
+	seedGeneratedUint64Data(t, db, 100, func(i int) *Rec {
+		return &Rec{
+			Name:  fmt.Sprintf("u_%d", i),
+			Age:   18 + i,
+			Score: float64(i),
+		}
+	})
+	if err := db.RebuildIndex(); err != nil {
+		t.Fatalf("RebuildIndex: %v", err)
+	}
+
+	view := db.currentQueryViewForTests()
+	if got := view.snapshotUniverseCardinality(); got != 100 {
+		t.Fatalf("snapshotUniverse=%d, want 100", got)
+	}
+
+	preds := newPredicateSet(2)
+	preds.Append(predicate{
+		estCard: 32,
+		covered: true,
+	})
+	preds.Append(predicate{
+		estCard: 90,
+	})
+
+	branches := newPlannerORBranches(1)
+	branches.Append(plannerORBranch{
+		preds:   preds,
+		leadIdx: -1,
+	})
+	defer branches.Release()
+
+	var branchUniverses [plannerORBranchLimit]uint64
+	branchUniverses[0] = 32
+
+	var estimates [plannerORBranchLimit]plannerOROrderedBranchEstimate
+	view.initOrderedORBranchEstimates(branches, &branchUniverses, 10, &estimates)
+
+	if got := estimates[0].card; got != 29 {
+		t.Fatalf("estimate.card=%d, want 29", got)
+	}
+	wantProbeRows := estimateRowsForNeed(10, 29, 32)
+	if got := estimates[0].probeRows; got != wantProbeRows {
+		t.Fatalf("estimate.probeRows=%d, want %d", got, wantProbeRows)
+	}
+}
+
+func TestPlannerOROrder_RepeatedExecutionPromotesMaterializedRange(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{
+		AnalyzeInterval:                         -1,
+		SnapshotMaterializedPredCacheMaxEntries: 16,
+	})
+	_ = seedData(t, db, 20_000)
+
+	q := qx.Query(
+		qx.OR(
+			qx.AND(
+				qx.EQ("country", "DE"),
+				qx.HASANY("tags", []string{"rust", "go"}),
+				qx.GTE("score", 40.0),
+			),
+			qx.PREFIX("email", "user1"),
+			qx.GTE("age", 30),
+		),
+	).Sort("score", qx.DESC).Limit(240)
+
+	db.clearCurrentSnapshotCachesForTesting()
+	if got := db.getSnapshot().matPredCacheCount.Load(); got != 0 {
+		t.Fatalf("unexpected materialized predicate cache before ordered OR execution: %d", got)
+	}
+
+	for i := 0; i < 2; i++ {
+		got, err := db.QueryKeys(q)
+		if err != nil {
+			t.Fatalf("QueryKeys run %d err: %v", i+1, err)
+		}
+		if len(got) == 0 {
+			t.Fatalf("QueryKeys run %d returned no rows", i+1)
+		}
+	}
+
+	if got := db.getSnapshot().matPredCacheCount.Load(); got == 0 {
+		t.Fatalf("expected repeated ordered OR execution to promote materialized predicate")
+	}
+}
+
+func TestPlannerOROrderKWay_RepeatedExecutionPromotesExactOnlyMaterializedRange(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{
+		AnalyzeInterval:                         -1,
+		SnapshotMaterializedPredCacheMaxEntries: 16,
+	})
+	seedGeneratedUint64Data(t, db, 256, func(i int) *Rec {
+		return &Rec{
+			Name:  fmt.Sprintf("u_%d", i),
+			Age:   18 + i,
+			Score: float64(i),
+		}
+	})
+	if err := db.RebuildIndex(); err != nil {
+		t.Fatalf("RebuildIndex: %v", err)
+	}
+
+	q := qx.Query(
+		qx.OR(
+			qx.AND(
+				qx.GTE("age", 30),
+				qx.LTE("age", 250),
+			),
+			qx.EQ("name", "u_1"),
+		),
+	).Sort("score", qx.DESC).Limit(96)
+
+	db.clearCurrentSnapshotCachesForTesting()
+	if got := db.getSnapshot().matPredCacheCount.Load(); got != 0 {
+		t.Fatalf("unexpected materialized predicate cache before ordered OR k-way execution: %d", got)
+	}
+
+	window, ok := orderWindowForTest(q)
+	if !ok {
+		t.Fatalf("orderWindowForTest: ok=false")
+	}
+
+	for i := 0; i < 2; i++ {
+		branches, alwaysFalse, ok := db.buildORBranchesOrdered(q.Filter.Args, "score", window)
+		if !ok {
+			t.Fatalf("buildORBranchesOrdered run %d: ok=false", i+1)
+		}
+		if alwaysFalse {
+			branches.Release()
+			t.Fatalf("unexpected alwaysFalse on run %d", i+1)
+		}
+
+		foundExactOnlyAge := false
+		for bi := 0; bi < branches.Len(); bi++ {
+			branch := branches.Get(bi)
+			checks := predicateCheckSlicePool.Get()
+			exactChecks := predicateCheckSlicePool.Get()
+			residualChecks := predicateCheckSlicePool.Get()
+			branch.buildMatchChecksBuf(checks)
+			exactChecks.Grow(checks.Len())
+			buildExactBucketPostingFilterActiveBufReader(exactChecks, checks, branch.preds)
+			residualChecks.Grow(checks.Len())
+			plannerResidualChecksBuf(residualChecks, checks, exactChecks)
+			checkLen := checks.Len()
+			exactLen := exactChecks.Len()
+			residualLen := residualChecks.Len()
+			ageBranch := false
+			for pi := 0; pi < branch.predLen(); pi++ {
+				if db.fieldNameByOrdinal(branch.pred(pi).expr.FieldOrdinal) == "age" {
+					ageBranch = true
+					break
+				}
+			}
+			predicateCheckSlicePool.Put(residualChecks)
+			predicateCheckSlicePool.Put(exactChecks)
+			predicateCheckSlicePool.Put(checks)
+			if !ageBranch {
+				continue
+			}
+			if checkLen == 1 && exactLen == 1 && residualLen == 0 {
+				foundExactOnlyAge = true
+				continue
+			}
+			branches.Release()
+			t.Fatalf("expected exact-only merged age branch on run %d, branch %d: checks=%d exact=%d residual=%d", i+1, bi, checkLen, exactLen, residualLen)
+		}
+		if !foundExactOnlyAge {
+			branches.Release()
+			t.Fatalf("expected exact-only merged age branch on run %d", i+1)
+		}
+
+		got, ok, err := db.execPlanOROrderKWay(q, branches, nil)
+		branches.Release()
+		if err != nil {
+			t.Fatalf("execPlanOROrderKWay run %d err: %v", i+1, err)
+		}
+		if !ok {
+			t.Fatalf("execPlanOROrderKWay run %d: ok=false", i+1)
+		}
+		if len(got) == 0 {
+			t.Fatalf("execPlanOROrderKWay run %d returned no rows", i+1)
+		}
+	}
+
+	if got := db.getSnapshot().matPredCacheCount.Load(); got == 0 {
+		t.Fatalf("expected repeated ordered OR k-way execution to promote exact-only materialized predicate")
+	}
+}
+
+func TestPlannerOROrder_WarmMaterializationRefreshesAnalysisBeforeDecision(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{
+		AnalyzeInterval:                         -1,
+		SnapshotMaterializedPredCacheMaxEntries: 16,
+	})
+	seedGeneratedUint64Data(t, db, 256, func(i int) *Rec {
+		return &Rec{
+			Name:  fmt.Sprintf("u_%d", i),
+			Age:   18 + i,
+			Score: float64(i),
+		}
+	})
+	if err := db.RebuildIndex(); err != nil {
+		t.Fatalf("RebuildIndex: %v", err)
+	}
+
+	q := qx.Query(
+		qx.OR(
+			qx.AND(
+				qx.GTE("age", 30),
+				qx.LTE("age", 250),
+			),
+			qx.EQ("name", "u_1"),
+		),
+	).Sort("score", qx.DESC).Offset(32).Limit(120)
+
+	view := db.currentQueryViewForTests()
+	warm, ok := db.buildPredicatesOrderedWithMode(
+		[]qx.Expr{qx.GTE("age", 30), qx.LTE("age", 250)},
+		"score",
+		false,
+		4096,
+		0,
+		false,
+		false,
+	)
+	if !ok {
+		t.Fatalf("warm buildPredicatesOrderedWithMode: ok=false")
+	}
+	if len(warm) != 1 {
+		releasePredicates(warm)
+		t.Fatalf("unexpected warm predicate count: %d", len(warm))
+	}
+	if !warm[0].hasEffectiveBounds {
+		releasePredicates(warm)
+		t.Fatal("expected merged warm predicate with effective bounds")
+	}
+	if !view.materializeOrderedORPredicate(&warm[0]) {
+		releasePredicates(warm)
+		t.Fatal("expected exact-range warm predicate to materialize")
+	}
+	releasePredicates(warm)
+
+	window, _ := orderWindowForTest(q)
+	branches, alwaysFalse, ok := db.buildORBranchesOrderedWithOffset(q.Filter.Args, "score", window, q.Window.Offset)
+	if !ok {
+		t.Fatalf("buildORBranchesOrdered: ok=false")
+	}
+	if alwaysFalse {
+		t.Fatalf("unexpected alwaysFalse for ordered OR branches")
+	}
+	defer branches.Release()
+
+	preparedQ, viewQ, err := prepareTestQuery(db, q)
+	if err != nil {
+		t.Fatalf("prepareTestQuery: %v", err)
+	}
+	defer preparedQ.Release()
+
+	analysis, ok := view.buildOROrderAnalysis(&viewQ, branches)
+	if !ok {
+		t.Fatalf("buildOROrderAnalysis: ok=false")
+	}
+	defer analysis.release()
+
+	for bi := 0; bi < branches.Len(); bi++ {
+		branch := branches.Get(bi)
+		for pi := 0; pi < branch.predLen(); pi++ {
+			_ = view.orderedORPredicateBuildInfoForBranch("score", branch.pred(pi), &analysis, branch, bi, pi)
+		}
+	}
+
+	if !view.maybeWarmMaterializeOrderedORPredicates(&viewQ, branches, &analysis, nil) {
+		t.Fatalf("expected warm ordered-OR materialization to rewrite predicates")
+	}
+
+	foundMaterialized := false
+	refreshedAnalysis := false
+	for bi := 0; bi < branches.Len(); bi++ {
+		branch := branches.Get(bi)
+		for pi := 0; pi < branch.predLen(); pi++ {
+			p := branch.pred(pi)
+			if p.isMaterializedLike() {
+				foundMaterialized = true
+				if analysis.branches[bi].buildReady || analysis.branches[bi].predBuild != nil {
+					t.Fatalf("expected rewritten branch %d analysis cache to be invalidated", bi)
+				}
+				refreshedAnalysis = true
+				break
+			}
+		}
+	}
+
+	if !foundMaterialized {
+		t.Fatalf("expected warm ordered-OR rewrite to materialize at least one branch predicate")
+	}
+	if !refreshedAnalysis {
+		t.Fatalf("expected warm ordered-OR rewrite to refresh cached branch analysis")
+	}
+}
+
+func TestPlannerOROrder_RefreshBranchCollapsesCoveredTautology(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{
+		AnalyzeInterval:                         -1,
+		SnapshotMaterializedPredCacheMaxEntries: 16,
+	})
+	seedGeneratedUint64Data(t, db, 256, func(i int) *Rec {
+		return &Rec{
+			Name:  fmt.Sprintf("u_%d", i),
+			Age:   18 + i,
+			Score: float64(i),
+		}
+	})
+	if err := db.RebuildIndex(); err != nil {
+		t.Fatalf("RebuildIndex: %v", err)
+	}
+
+	q := qx.Query(
+		qx.OR(
+			qx.AND(
+				qx.GTE("score", 128.0),
+				qx.GTE("age", 30),
+			),
+			qx.EQ("name", "u_1"),
+		),
+	).Sort("score", qx.DESC).Limit(64)
+
+	window, _ := orderWindowForTest(q)
+	branches, alwaysFalse, ok := db.buildORBranchesOrdered(q.Filter.Args, "score", window)
+	if !ok {
+		t.Fatalf("buildORBranchesOrdered: ok=false")
+	}
+	if alwaysFalse {
+		t.Fatalf("unexpected alwaysFalse for ordered OR branches")
+	}
+	defer branches.Release()
+
+	preparedQ, viewQ, err := prepareTestQuery(db, q)
+	if err != nil {
+		t.Fatalf("prepareTestQuery: %v", err)
+	}
+	defer preparedQ.Release()
+
+	view := db.currentQueryViewForTests()
+	analysis, ok := view.buildOROrderAnalysis(&viewQ, branches)
+	if !ok {
+		t.Fatalf("buildOROrderAnalysis: ok=false")
+	}
+	defer analysis.release()
+	analysis.applyCovered(branches)
+
+	targetBranch := -1
+	targetPred := -1
+	for bi := 0; bi < branches.Len(); bi++ {
+		branch := branches.Get(bi)
+		for pi := 0; pi < branch.predLen(); pi++ {
+			if view.fieldNameByExpr(branch.pred(pi).expr) != "age" {
+				continue
+			}
+			targetBranch = bi
+			targetPred = pi
+			break
+		}
+		if targetBranch >= 0 {
+			break
+		}
+	}
+	if targetBranch < 0 || targetPred < 0 {
+		t.Fatalf("expected ordered OR branch with residual age predicate")
+	}
+	if !analysis.mergeStats[targetBranch].rangeBounded {
+		t.Fatalf("expected bounded ordered range for target branch")
+	}
+
+	branch := branches.GetPtr(targetBranch)
+	setPredicateAlwaysTrue(branch.predPtr(targetPred))
+	analysis.refreshBranch(branches, targetBranch)
+
+	if branch.alwaysTrue {
+		t.Fatalf("expected covered tautology branch to stay range-bounded, not global alwaysTrue")
+	}
+	if branch.leadIdx != -1 {
+		t.Fatalf("expected covered tautology branch to drop lead, got leadIdx=%d", branch.leadIdx)
+	}
+	if !branch.estKnown {
+		t.Fatalf("expected covered tautology branch to get exact bounded cardinality")
+	}
+	if branch.estCard != analysis.branches[targetBranch].universe {
+		t.Fatalf(
+			"expected covered tautology branch cardinality=%d, got=%d",
+			analysis.branches[targetBranch].universe,
+			branch.estCard,
+		)
+	}
+	if !branch.coveredRangeBounded {
+		t.Fatalf("expected covered tautology branch to retain bounded range metadata")
+	}
+	if branch.coveredRangeStart != analysis.branches[targetBranch].rangeStart ||
+		branch.coveredRangeEnd != analysis.branches[targetBranch].rangeEnd {
+		t.Fatalf(
+			"expected covered range [%d,%d), got [%d,%d)",
+			analysis.branches[targetBranch].rangeStart,
+			analysis.branches[targetBranch].rangeEnd,
+			branch.coveredRangeStart,
+			branch.coveredRangeEnd,
+		)
+	}
+	if analysis.mergeStats[targetBranch].streamChecks != 0 || analysis.mergeStats[targetBranch].mergeChecks != 0 {
+		t.Fatalf(
+			"expected no remaining checks after covered tautology collapse, got stream=%d merge=%d",
+			analysis.mergeStats[targetBranch].streamChecks,
+			analysis.mergeStats[targetBranch].mergeChecks,
+		)
+	}
+}
+
+func TestPlannerOROrder_RefreshBranchCollapsesImpossibleBranch(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{
+		AnalyzeInterval:                         -1,
+		SnapshotMaterializedPredCacheMaxEntries: 16,
+	})
+	seedGeneratedUint64Data(t, db, 256, func(i int) *Rec {
+		return &Rec{
+			Name:  fmt.Sprintf("u_%d", i),
+			Age:   18 + i,
+			Score: float64(i),
+		}
+	})
+	if err := db.RebuildIndex(); err != nil {
+		t.Fatalf("RebuildIndex: %v", err)
+	}
+
+	q := qx.Query(
+		qx.OR(
+			qx.AND(
+				qx.GTE("score", 128.0),
+				qx.GTE("age", 30),
+			),
+			qx.EQ("name", "u_1"),
+		),
+	).Sort("score", qx.DESC).Limit(64)
+
+	window, _ := orderWindowForTest(q)
+	branches, alwaysFalse, ok := db.buildORBranchesOrdered(q.Filter.Args, "score", window)
+	if !ok {
+		t.Fatalf("buildORBranchesOrdered: ok=false")
+	}
+	if alwaysFalse {
+		t.Fatalf("unexpected alwaysFalse for ordered OR branches")
+	}
+	defer branches.Release()
+
+	preparedQ, viewQ, err := prepareTestQuery(db, q)
+	if err != nil {
+		t.Fatalf("prepareTestQuery: %v", err)
+	}
+	defer preparedQ.Release()
+
+	view := db.currentQueryViewForTests()
+	analysis, ok := view.buildOROrderAnalysis(&viewQ, branches)
+	if !ok {
+		t.Fatalf("buildOROrderAnalysis: ok=false")
+	}
+	defer analysis.release()
+	analysis.applyCovered(branches)
+
+	targetBranch := -1
+	targetPred := -1
+	for bi := 0; bi < branches.Len(); bi++ {
+		branch := branches.Get(bi)
+		for pi := 0; pi < branch.predLen(); pi++ {
+			if view.fieldNameByExpr(branch.pred(pi).expr) != "age" {
+				continue
+			}
+			targetBranch = bi
+			targetPred = pi
+			break
+		}
+		if targetBranch >= 0 {
+			break
+		}
+	}
+	if targetBranch < 0 || targetPred < 0 {
+		t.Fatalf("expected ordered OR branch with residual age predicate")
+	}
+	if !analysis.mergeStats[targetBranch].rangeBounded {
+		t.Fatalf("expected bounded ordered range for target branch")
+	}
+	if analysis.branches[targetBranch].rangeStart >= analysis.branches[targetBranch].rangeEnd {
+		t.Fatalf("expected target branch to start with non-empty ordered span")
+	}
+
+	branch := branches.GetPtr(targetBranch)
+	branch.predPtr(targetPred).alwaysFalse = true
+	analysis.refreshBranch(branches, targetBranch)
+
+	if branch.alwaysTrue {
+		t.Fatalf("expected impossible branch to stay non-tautological")
+	}
+	if branch.leadIdx != -1 {
+		t.Fatalf("expected impossible branch to drop lead, got leadIdx=%d", branch.leadIdx)
+	}
+	if !branch.estKnown || branch.estCard != 0 {
+		t.Fatalf("expected impossible branch to collapse to estCard=0, got known=%v card=%d", branch.estKnown, branch.estCard)
+	}
+	if !branch.coveredRangeBounded {
+		t.Fatalf("expected impossible branch to collapse to empty covered range")
+	}
+	if branch.coveredRangeStart != 0 || branch.coveredRangeEnd != 0 {
+		t.Fatalf("expected impossible branch covered range [0,0), got [%d,%d)", branch.coveredRangeStart, branch.coveredRangeEnd)
+	}
+	if analysis.branches[targetBranch].rangeStart != 0 || analysis.branches[targetBranch].rangeEnd != 0 {
+		t.Fatalf(
+			"expected impossible branch analysis range [0,0), got [%d,%d)",
+			analysis.branches[targetBranch].rangeStart,
+			analysis.branches[targetBranch].rangeEnd,
+		)
+	}
+	if analysis.branches[targetBranch].universe != 0 {
+		t.Fatalf("expected impossible branch analysis universe=0, got=%d", analysis.branches[targetBranch].universe)
+	}
+	if !analysis.mergeStats[targetBranch].rangeBounded || analysis.mergeStats[targetBranch].rangeRows != 0 {
+		t.Fatalf(
+			"expected impossible branch merge stats to collapse to empty range, got bounded=%v rows=%d",
+			analysis.mergeStats[targetBranch].rangeBounded,
+			analysis.mergeStats[targetBranch].rangeRows,
+		)
+	}
+	if analysis.mergeStats[targetBranch].streamChecks != 0 || analysis.mergeStats[targetBranch].mergeChecks != 0 {
+		t.Fatalf(
+			"expected impossible branch checks to collapse to zero, got stream=%d merge=%d",
+			analysis.mergeStats[targetBranch].streamChecks,
+			analysis.mergeStats[targetBranch].mergeChecks,
+		)
+	}
+}
+
+func TestPlannerORBranchCheckCounts_LargeImpossibleBranchWithZeroLenCoveredReturnsZero(t *testing.T) {
+	preds := newPredicateSet(9)
+	for i := 0; i < 9; i++ {
+		if i == 4 {
+			preds.Append(predicate{alwaysFalse: true})
+			continue
+		}
+		ids := posting.BuildFromSorted([]uint64{uint64(i + 1)})
+		preds.Append(predicate{
+			kind:       predicateKindMaterialized,
+			ids:        ids,
+			releaseIDs: true,
+			estCard:    1,
+		})
+	}
+	defer preds.Release()
+
+	covered := boolSlicePool.Get()
+	defer boolSlicePool.Put(covered)
+	covered.Truncate()
+
+	streamChecks, mergeChecks := plannerORBranchCheckCounts(
+		plannerORBranch{preds: preds, leadIdx: -1},
+		covered,
+	)
+	if streamChecks != 0 || mergeChecks != 0 {
+		t.Fatalf("expected impossible large branch to report zero checks, got stream=%d merge=%d", streamChecks, mergeChecks)
+	}
+}
+
+func TestPlannerOROrder_MergeWarmupMaterializesExactPredicate(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{
+		AnalyzeInterval:                         -1,
+		SnapshotMaterializedPredCacheMaxEntries: 16,
+	})
+	seedGeneratedUint64Data(t, db, 256, func(i int) *Rec {
+		return &Rec{
+			Name:  fmt.Sprintf("u_%d", i),
+			Age:   18 + i,
+			Score: float64(i),
+		}
+	})
+	if err := db.RebuildIndex(); err != nil {
+		t.Fatalf("RebuildIndex: %v", err)
+	}
+
+	view := db.currentQueryViewForTests()
+	warm, ok := db.buildPredicatesOrderedWithMode(
+		[]qx.Expr{qx.GTE("age", 30), qx.LTE("age", 250)},
+		"score",
+		false,
+		4096,
+		0,
+		false,
+		false,
+	)
+	if !ok {
+		t.Fatalf("warm buildPredicatesOrderedWithMode: ok=false")
+	}
+	if len(warm) != 1 {
+		releasePredicates(warm)
+		t.Fatalf("unexpected warm predicate count: %d", len(warm))
+	}
+	if !warm[0].hasEffectiveBounds || !warm[0].supportsExactBucketPostingFilter() {
+		releasePredicates(warm)
+		t.Fatalf("expected exact-range warm predicate")
+	}
+	if !view.materializeOrderedORPredicate(&warm[0]) {
+		releasePredicates(warm)
+		t.Fatalf("expected exact-range warm predicate to materialize")
+	}
+	releasePredicates(warm)
+
+	q := qx.Query(
+		qx.OR(
+			qx.AND(
+				qx.GTE("age", 30),
+				qx.LTE("age", 250),
+			),
+			qx.EQ("name", "u_1"),
+		),
+	).Sort("score", qx.DESC).Offset(32).Limit(120)
+
+	window, _ := orderWindowForTest(q)
+	branches, alwaysFalse, ok := db.buildORBranchesOrderedWithOffset(q.Filter.Args, "score", window, q.Window.Offset)
+	if !ok {
+		t.Fatalf("buildORBranchesOrdered: ok=false")
+	}
+	if alwaysFalse {
+		t.Fatalf("unexpected alwaysFalse for ordered OR branches")
+	}
+	defer branches.Release()
+
+	preparedQ, viewQ, err := prepareTestQuery(db, q)
+	if err != nil {
+		t.Fatalf("prepareTestQuery: %v", err)
+	}
+	defer preparedQ.Release()
+
+	analysis, ok := view.buildOROrderAnalysis(&viewQ, branches)
+	if !ok {
+		t.Fatalf("buildOROrderAnalysis: ok=false")
+	}
+	defer analysis.release()
+
+	targetBranch := -1
+	targetPred := -1
+	for bi := 0; bi < branches.Len(); bi++ {
+		branch := branches.Get(bi)
+		for pi := 0; pi < branch.predLen(); pi++ {
+			p := branch.pred(pi)
+			if view.fieldNameByExpr(p.expr) != "age" {
+				continue
+			}
+			if !p.hasEffectiveBounds || !p.supportsExactBucketPostingFilter() {
+				continue
+			}
+			targetBranch = bi
+			targetPred = pi
+			break
+		}
+		if targetBranch >= 0 {
+			break
+		}
+	}
+	if targetBranch < 0 || targetPred < 0 {
+		t.Fatalf("expected ordered OR branch with exact age predicate")
+	}
+	if branches.GetPtr(targetBranch).predPtr(targetPred).isMaterializedLike() {
+		t.Fatalf("expected target exact predicate to start non-materialized")
+	}
+
+	if !view.maybeMaterializeOrderedORPredicates(&viewQ, branches, &analysis, true, false, nil) {
+		t.Fatalf("expected merge warmup to materialize exact predicate from warm cache")
+	}
+	if !branches.GetPtr(targetBranch).predPtr(targetPred).isMaterializedLike() {
+		t.Fatalf("expected merge warmup to rewrite exact predicate into materialized form")
+	}
+}
+
+func TestOrderedORMaterializedPredicateWarmHitWorth(t *testing.T) {
+	tests := []struct {
+		name            string
+		leafChecks      uint64
+		checkWork       uint64
+		cachedCheckWork uint64
+		want            bool
+	}{
+		{
+			name:            "zero_checks",
+			leafChecks:      0,
+			checkWork:       32,
+			cachedCheckWork: 8,
+			want:            false,
+		},
+		{
+			name:            "no_per_query_gain",
+			leafChecks:      4,
+			checkWork:       8,
+			cachedCheckWork: 8,
+			want:            false,
+		},
+		{
+			name:            "single_check_near_tie",
+			leafChecks:      1,
+			checkWork:       12,
+			cachedCheckWork: 8,
+			want:            false,
+		},
+		{
+			name:            "single_check_clear_gain",
+			leafChecks:      1,
+			checkWork:       24,
+			cachedCheckWork: 8,
+			want:            true,
+		},
+		{
+			name:            "repeated_checks_amortize",
+			leafChecks:      3,
+			checkWork:       12,
+			cachedCheckWork: 8,
+			want:            true,
+		},
+	}
+
+	for _, tt := range tests {
+		if got := orderedORMaterializedPredicateWarmHitWorth(tt.leafChecks, tt.checkWork, tt.cachedCheckWork); got != tt.want {
+			t.Fatalf("%s: got=%v want=%v", tt.name, got, tt.want)
+		}
+	}
+}
+
 func TestPlannerORBranchesOrdered_CoversOrderRangeLeaves(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
 		AnalyzeInterval: -1,
@@ -1248,6 +2539,97 @@ func TestPlannerORBranchesOrdered_CoversOrderRangeLeaves(t *testing.T) {
 	}
 	if !slices.Equal(got, want) {
 		t.Fatalf("ordered OR basic mismatch:\ngot=%v\nwant=%v", got, want)
+	}
+}
+
+func TestBuildOROrderAnalysis_NonRangeOrderPredicateKeepsOrderedPath(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{
+		AnalyzeInterval: -1,
+	})
+	_ = seedData(t, db, 20_000)
+
+	q := qx.Query(
+		qx.OR(
+			qx.AND(
+				qx.CONTAINS("full_name", "FN-1"),
+				qx.EQ("active", true),
+			),
+			qx.AND(
+				qx.EQ("country", "NL"),
+				qx.GTE("age", 25),
+			),
+		),
+	).Sort("full_name", qx.ASC).Limit(120)
+
+	window, _ := orderWindowForTest(q)
+	branchesBasic, alwaysFalse, ok := db.buildORBranchesOrdered(q.Filter.Args, "full_name", window)
+	if !ok {
+		t.Fatalf("buildORBranchesOrdered basic: ok=false")
+	}
+	if alwaysFalse {
+		t.Fatalf("unexpected alwaysFalse for ordered OR branches")
+	}
+	defer branchesBasic.Release()
+
+	preparedQ, viewQ, err := prepareTestQuery(db, q)
+	if err != nil {
+		t.Fatalf("prepareTestQuery: %v", err)
+	}
+	defer preparedQ.Release()
+
+	view := db.currentQueryViewForTests()
+	defer db.releaseQueryView(view)
+
+	analysis, ok := view.buildOROrderAnalysis(&viewQ, branchesBasic)
+	if !ok {
+		t.Fatalf("buildOROrderAnalysis: ok=false for non-range order predicate")
+	}
+	defer analysis.release()
+
+	orderOV := view.fieldOverlayForOrder(viewQ.Order)
+	if analysis.branches[0].rangeStart != 0 || analysis.branches[0].rangeEnd != orderOV.keyCount() {
+		t.Fatalf(
+			"expected non-range order predicate branch to keep full-span order coverage, got start=%d end=%d want_end=%d",
+			analysis.branches[0].rangeStart,
+			analysis.branches[0].rangeEnd,
+			orderOV.keyCount(),
+		)
+	}
+	if covered := analysis.branches[0].covered; covered != nil && covered.Len() != 0 {
+		t.Fatalf("expected non-range order predicate branch to keep zero covered leaves, got=%d", covered.Len())
+	}
+
+	gotBasic, ok := view.execPlanOROrderBasic(&viewQ, branchesBasic, &analysis, nil, nil)
+	if !ok {
+		t.Fatalf("execPlanOROrderBasic: ok=false")
+	}
+
+	branchesFallback, alwaysFalse, ok := db.buildORBranchesOrdered(q.Filter.Args, "full_name", window)
+	if !ok {
+		t.Fatalf("buildORBranchesOrdered fallback: ok=false")
+	}
+	if alwaysFalse {
+		t.Fatalf("unexpected alwaysFalse for ordered OR fallback branches")
+	}
+	defer branchesFallback.Release()
+
+	gotFallback, ok, err := view.execPlanOROrderMergeFallback(&viewQ, branchesFallback, nil)
+	if err != nil {
+		t.Fatalf("execPlanOROrderMergeFallback err: %v", err)
+	}
+	if !ok {
+		t.Fatalf("execPlanOROrderMergeFallback: ok=false")
+	}
+
+	want, err := db.QueryKeys(q)
+	if err != nil {
+		t.Fatalf("QueryKeys(%+v): %v", q, err)
+	}
+	if !slices.Equal(gotBasic, want) {
+		t.Fatalf("ordered OR basic with non-range order predicate mismatch:\ngot=%v\nwant=%v", gotBasic, want)
+	}
+	if !slices.Equal(gotFallback, want) {
+		t.Fatalf("ordered OR fallback with non-range order predicate mismatch:\ngot=%v\nwant=%v", gotFallback, want)
 	}
 }
 
@@ -1624,6 +3006,78 @@ func TestPlannerOROrderMergeBranchStats_SkipFullSpanRowCountingWithoutOrderBound
 		if stats[i].rangeRows != 0 {
 			t.Fatalf("expected no full-span row counting for branch %d without order bounds, got rangeRows=%d", i, stats[i].rangeRows)
 		}
+	}
+}
+
+func TestBuildPredRangeCandidateWithColdMode_ComplementProbeStatsUseObservedOverlaySpans(t *testing.T) {
+	db, _ := openTempDBUint64PtrInt(t, Options{
+		AnalyzeInterval: -1,
+	})
+	for i := 0; i < 100; i++ {
+		rec := &PtrIntRec{Name: fmt.Sprintf("nil_%02d", i), Rank: nil, Active: i%2 == 0}
+		if err := db.Set(uint64(i+1), rec); err != nil {
+			t.Fatalf("Set(nil_%02d): %v", i, err)
+		}
+	}
+	for i := 0; i < 40; i++ {
+		v := 0
+		rec := &PtrIntRec{Name: fmt.Sprintf("zero_%02d", i), Rank: &v, Active: i%2 == 0}
+		if err := db.Set(uint64(i+101), rec); err != nil {
+			t.Fatalf("Set(zero_%02d): %v", i, err)
+		}
+	}
+	for i := 1; i <= 9; i++ {
+		v := i
+		rec := &PtrIntRec{Name: fmt.Sprintf("rank_%02d", i), Rank: &v, Active: true}
+		if err := db.Set(uint64(i+141), rec); err != nil {
+			t.Fatalf("Set(rank_%02d): %v", i, err)
+		}
+	}
+	if err := db.RebuildIndex(); err != nil {
+		t.Fatalf("RebuildIndex: %v", err)
+	}
+
+	view := db.currentQueryViewForTests()
+	defer db.releaseQueryView(view)
+	expr := mustTestQIRExprForDB(t, db, qx.GTE("rank", 1))
+	fm := view.fieldMetaByExpr(expr)
+	if fm == nil {
+		t.Fatal("expected field metadata")
+	}
+	ov := view.fieldOverlayForExpr(expr)
+	if !ov.hasData() {
+		t.Fatal("expected overlay data")
+	}
+
+	candidate, ok := view.prepareScalarRangeRoutingCandidate(expr)
+	if !ok {
+		t.Fatal("prepareScalarRangeRoutingCandidate: ok=false")
+	}
+	if !candidate.plan.useComplement {
+		t.Fatal("expected complement probe path for broad range")
+	}
+	if candidate.broadComplementCardinality(view.snapshotUniverseCardinality()) {
+		t.Fatal("expected sparse nullable complement path to stay non-broad by rows")
+	}
+
+	p, ok := view.buildPredRangeCandidateWithColdMode(expr, fm, ov, false, false)
+	if !ok {
+		t.Fatal("buildPredRangeCandidateWithColdMode: ok=false")
+	}
+	defer releasePredicateOwnedState(&p)
+	if p.overlayState == nil {
+		t.Fatal("expected overlay range predicate state")
+	}
+
+	actual := newOverlayRangeProbe(ov, candidate.plan.br, true, -1, 0)
+	if got, want := p.overlayState.probe.probeLen, actual.probeLen; got != want {
+		t.Fatalf("probeLen = %d, want observed %d", got, want)
+	}
+	if got, want := p.overlayState.probe.probeEst, actual.probeEst; got != want {
+		t.Fatalf("probeEst = %d, want observed %d", got, want)
+	}
+	if candidate.plan.runtimeProbeBuckets == actual.probeLen && candidate.plan.runtimeProbeEst == actual.probeEst {
+		t.Fatalf("expected observed complement probe stats to differ from precomputed runtime stats")
 	}
 }
 

@@ -1508,6 +1508,107 @@ func TestQuery_OrderBasic_BuildLeafPredsExcludingBounds_DelaysBroadComplementWit
 	}
 }
 
+func TestQuery_OrderBasic_BuildLeafPredsExcludingBounds_ForceMaterializesNonBroadNullableComplement(t *testing.T) {
+	db, _ := openTempDBUint64PtrInt(t, Options{
+		AnalyzeInterval:                         -1,
+		SnapshotMaterializedPredCacheMaxEntries: 16,
+	})
+	for i := 0; i < 64; i++ {
+		rec := &PtrIntRec{Name: fmt.Sprintf("nil_%02d", i), Rank: nil, Active: i%2 == 0}
+		if err := db.Set(uint64(i+1), rec); err != nil {
+			t.Fatalf("Set(nil_%02d): %v", i, err)
+		}
+	}
+	for i := 0; i < 40; i++ {
+		v := 0
+		rec := &PtrIntRec{Name: fmt.Sprintf("zero_%02d", i), Rank: &v, Active: i%2 == 0}
+		if err := db.Set(uint64(i+65), rec); err != nil {
+			t.Fatalf("Set(zero_%02d): %v", i, err)
+		}
+	}
+	for i := 1; i <= 9; i++ {
+		v := i
+		rec := &PtrIntRec{Name: fmt.Sprintf("rank_%02d", i), Rank: &v, Active: true}
+		if err := db.Set(uint64(i+105), rec); err != nil {
+			t.Fatalf("Set(rank_%02d): %v", i, err)
+		}
+	}
+	if err := db.RebuildIndex(); err != nil {
+		t.Fatalf("RebuildIndex: %v", err)
+	}
+
+	q := qx.Query(
+		qx.GTE("name", ""),
+		qx.LT("name", "~"),
+		qx.GTE("rank", 1),
+	).Sort("name", qx.ASC).Limit(5)
+	leaves := mustLimitQIRLeaves(t, db, q.Filter)
+	window, ok := orderWindowForTest(q)
+	if !ok || window <= 0 {
+		t.Fatalf("expected ordered window")
+	}
+
+	view := db.currentQueryViewForTests()
+	defer db.releaseQueryView(view)
+
+	expr := mustLimitQIRExpr(t, db, qx.GTE("rank", 1))
+	route := view.orderedPredicateScalarRangeRouting(
+		predicate{expr: expr},
+		window,
+		0,
+		view.snapshotUniverseCardinality(),
+	)
+	if !route.forceComplement {
+		t.Fatalf("expected nullable ordered route to force complement materialization")
+	}
+	if route.broadComplement {
+		t.Fatalf("expected nullable ordered route to stay non-broad by row cardinality")
+	}
+
+	preds, ok, err := view.buildLeafPredsExcludingBounds(leaves, "name", window)
+	if err != nil {
+		t.Fatalf("buildLeafPredsExcludingBounds: %v", err)
+	}
+	if !ok {
+		t.Fatalf("expected residual leaf preds to be supported")
+	}
+	predCount := 0
+	if preds != nil {
+		predCount = preds.Len()
+	}
+	if preds == nil || predCount != 1 {
+		if preds != nil {
+			leafPredSlicePool.Put(preds)
+		}
+		t.Fatalf("unexpected predicate count: %d", predCount)
+	}
+	defer leafPredSlicePool.Put(preds)
+
+	p := preds.Get(0)
+	if p.kind != leafPredKindPredicate {
+		t.Fatalf("expected predicate leaf, got kind=%v", p.kind)
+	}
+	if p.pred.kind == predicateKindMaterializedNot || !p.pred.rangeMat {
+		t.Fatalf("expected nil-heavy forced nullable ordered rewrite to materialize positive side, got kind=%v rangeMat=%v", p.pred.kind, p.pred.rangeMat)
+	}
+	if p.pred.hasRuntimeRangeState() {
+		t.Fatalf("expected forced nullable complement rewrite to avoid runtime range state")
+	}
+	if p.pred.matches(1) || p.pred.matches(3) {
+		t.Fatalf("nil rank rows must not match forced nullable ordered range")
+	}
+	if !p.pred.matches(106) {
+		t.Fatalf("expected in-range row to match forced nullable ordered range")
+	}
+
+	got, err := db.QueryKeys(q)
+	if err != nil {
+		t.Fatalf("QueryKeys: %v", err)
+	}
+	want := []uint64{106, 107, 108, 109, 110}
+	assertSameSlice(t, got, want)
+}
+
 func TestQuery_OrderBasic_DeepWindowCachePersistsAcrossUnchangedFieldPatch(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
 		AnalyzeInterval:                         -1,

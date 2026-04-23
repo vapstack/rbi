@@ -248,18 +248,23 @@ func (qv *queryView[K, V]) initPreparedExactScalarRangePredicate(
 	bounds rangeBounds,
 ) {
 	cacheKey := qv.materializedPredKeyForExactScalarRange(qv.fieldNameByExpr(e), bounds)
+	complementCacheKey := materializedPredKey{}
+	if fm != nil && !fm.Slice && isNumericScalarKind(fm.Kind) && isNumericRangeOp(e.Op) {
+		complementCacheKey = qv.materializedPredComplementKeyForExactScalarRange(qv.fieldNameByExpr(e), bounds)
+	}
 	loadReuse := newMaterializedPredReadOnlyReuse(qv.snap, cacheKey)
 	sharedReuse := newMaterializedPredSharedReuse(qv.snap, cacheKey)
 	secondHitReuse := newMaterializedPredSecondHitSharedReuse(qv.snap, cacheKey)
 	*core = preparedScalarRangePredicate[K, V]{
-		qv:               qv,
-		expr:             e,
-		fm:               fm,
-		bounds:           bounds,
-		loadReuse:        loadReuse,
-		sharedReuse:      sharedReuse,
-		secondHitReuse:   secondHitReuse,
-		usePostingFilter: fm != nil && !fm.Slice && isNumericScalarKind(fm.Kind),
+		qv:                 qv,
+		expr:               e,
+		fm:                 fm,
+		bounds:             bounds,
+		complementCacheKey: complementCacheKey,
+		loadReuse:          loadReuse,
+		sharedReuse:        sharedReuse,
+		secondHitReuse:     secondHitReuse,
+		usePostingFilter:   fm != nil && !fm.Slice && isNumericScalarKind(fm.Kind),
 	}
 }
 
@@ -352,6 +357,14 @@ func (candidate preparedScalarRangeRoutingCandidate[K, V]) broadComplementCardin
 		candidate.plan.est > 0 &&
 		candidate.plan.est < universe &&
 		candidate.plan.est > universe-candidate.plan.est
+}
+
+func (candidate preparedScalarRangeRoutingCandidate[K, V]) shouldPreferPositiveMaterializationForNullableComplement(
+	plan scalarComplementMaterializationPlan,
+) bool {
+	return !plan.nilPosting.IsEmpty() &&
+		candidate.plan.est > 0 &&
+		plan.est > candidate.plan.est
 }
 
 func (core *preparedScalarRangePredicate[K, V]) orderedEagerMaterializeUseful(orderedWindow int) bool {
@@ -797,14 +810,21 @@ func (core *preparedScalarRangePredicate[K, V]) planOverlay(ov fieldOverlay) (pr
 	return plan, predicate{}, false
 }
 
-func (core *preparedScalarRangePredicate[K, V]) buildFromSlice(slice []index, allowMaterialize bool, lazyColdMaterialize bool) (predicate, bool) {
+func (core *preparedScalarRangePredicate[K, V]) buildFromSlice(
+	slice []index,
+	allowMaterialize bool,
+	lazyColdMaterialize bool,
+	allowWarmLoad bool,
+) (predicate, bool) {
 	plan, pred, done := core.planBase(slice)
 	if done {
 		return pred, true
 	}
 
-	if cached, ok := core.loadReuse.load(); ok {
-		return materializedRangePredicateWithMode(core.expr, cached), true
+	if allowWarmLoad {
+		if cached, ok := core.loadReuse.load(); ok {
+			return materializedRangePredicateWithMode(core.expr, cached), true
+		}
 	}
 
 	probe := newBaseRangeProbe(slice, plan.start, plan.end, plan.useComplement)
@@ -868,21 +888,28 @@ func (core *preparedScalarRangePredicate[K, V]) buildFromSlice(slice []index, al
 	}, true
 }
 
-func (core *preparedScalarRangePredicate[K, V]) buildFromOverlay(ov fieldOverlay, allowMaterialize bool, lazyColdMaterialize bool) (predicate, bool) {
+func (core *preparedScalarRangePredicate[K, V]) buildFromOverlay(
+	ov fieldOverlay,
+	allowMaterialize bool,
+	lazyColdMaterialize bool,
+	allowWarmLoad bool,
+) (predicate, bool) {
 	plan, pred, done := core.planOverlay(ov)
 	if done {
 		return pred, true
 	}
 
-	if cached, ok := core.loadReuse.load(); ok {
-		return materializedRangePredicateWithMode(core.expr, cached), true
+	if allowWarmLoad {
+		if cached, ok := core.loadReuse.load(); ok {
+			return materializedRangePredicateWithMode(core.expr, cached), true
+		}
 	}
 
-	probeLen := -1
-	probeEst := uint64(0)
-	if !plan.useComplement {
-		probeLen = plan.runtimeProbeBuckets
-		probeEst = plan.runtimeProbeEst
+	probeLen := plan.runtimeProbeBuckets
+	probeEst := plan.runtimeProbeEst
+	if plan.useComplement {
+		probeLen = -1
+		probeEst = 0
 	}
 	probe := newOverlayRangeProbe(ov, plan.br, plan.useComplement, probeLen, probeEst)
 

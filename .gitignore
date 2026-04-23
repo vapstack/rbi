@@ -13,5 +13,8 @@ stress.db.UserBench.rbi
 bench_*.txt
 bench_report*.json
 stress_report*.json
+report_*.json
+diag_*.json
 result_*.json
 testdata
+*.bak

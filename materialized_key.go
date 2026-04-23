@@ -16,6 +16,7 @@ const (
 	materializedPredKeyScalar
 	materializedPredKeyScalarComplement
 	materializedPredKeyExactScalarRange
+	materializedPredKeyExactScalarRangeComplement
 	materializedPredKeyNumericBucketSpan
 	materializedPredKeyDistinctSet
 )
@@ -111,7 +112,7 @@ func (key materializedPredKey) String() string {
 		return key.field + "\x1f" + "count_range_complement" + "\x1f" +
 			strconv.Itoa(int(key.op)) + "\x1f" + key.key
 
-	case materializedPredKeyExactScalarRange:
+	case materializedPredKeyExactScalarRange, materializedPredKeyExactScalarRangeComplement:
 		loTag := ""
 		loVal := ""
 		hiTag := ""
@@ -144,7 +145,11 @@ func (key materializedPredKey) String() string {
 				hiTag += ")"
 			}
 		}
-		return key.field + "\x1f" + "range_exact" + "\x1f" +
+		head := "range_exact"
+		if key.kind == materializedPredKeyExactScalarRangeComplement {
+			head = "count_range_exact_complement"
+		}
+		return key.field + "\x1f" + head + "\x1f" +
 			loTag + "\x1f" + loVal + "\x1f" + hiTag + "\x1f" + hiVal
 
 	case materializedPredKeyNumericBucketSpan:
@@ -206,7 +211,7 @@ func materializedPredComplementKeyForNumericScalar(field string, op qir.Op, key 
 	}
 }
 
-func materializedPredKeyForExactScalarRange(field string, bounds rangeBounds) materializedPredKey {
+func materializedPredKeyForExactScalarRangeKind(kind materializedPredKeyKind, field string, bounds rangeBounds) materializedPredKey {
 	if field == "" || bounds.empty || (!bounds.hasLo && !bounds.hasHi) {
 		return materializedPredKey{}
 	}
@@ -230,7 +235,7 @@ func materializedPredKeyForExactScalarRange(field string, bounds rangeBounds) ma
 		}
 	}
 	key := materializedPredKey{
-		kind:  materializedPredKeyExactScalarRange,
+		kind:  kind,
 		field: field,
 		flags: flags,
 	}
@@ -249,6 +254,115 @@ func materializedPredKeyForExactScalarRange(field string, bounds rangeBounds) ma
 		}
 	}
 	return key
+}
+
+func materializedPredKeyForExactScalarRange(field string, bounds rangeBounds) materializedPredKey {
+	return materializedPredKeyForExactScalarRangeKind(materializedPredKeyExactScalarRange, field, bounds)
+}
+
+func materializedPredComplementKeyForExactScalarRange(field string, bounds rangeBounds) materializedPredKey {
+	return materializedPredKeyForExactScalarRangeKind(materializedPredKeyExactScalarRangeComplement, field, bounds)
+}
+
+func parseMaterializedPredKeyExactScalarRange(kind materializedPredKeyKind, field, tail string) (materializedPredKey, bool) {
+	if loTag, rest, ok := strings.Cut(tail, "\x1f"); ok {
+		if loVal, rest, ok := strings.Cut(rest, "\x1f"); ok {
+			if hiTag, hiVal, ok := strings.Cut(rest, "\x1f"); ok {
+				out := materializedPredKey{
+					kind:  kind,
+					field: field,
+				}
+				if loTag != "" {
+					if len(loTag) != 2 {
+						return materializedPredKey{}, false
+					}
+					switch loTag[1] {
+					case '[':
+						out.flags |= materializedPredKeyHasLo | materializedPredKeyLoInc
+					case '(':
+						out.flags |= materializedPredKeyHasLo
+					default:
+						return materializedPredKey{}, false
+					}
+					switch loTag[0] {
+					case 'n':
+						if len(loVal) != 8 {
+							return materializedPredKey{}, false
+						}
+						out.flags |= materializedPredKeyLoNumeric
+						out.loIndex = indexKeyFromU64(fixed8StringToU64(loVal))
+					case 's':
+						out.loKey = loVal
+					default:
+						return materializedPredKey{}, false
+					}
+				}
+				if hiTag != "" {
+					if len(hiTag) != 2 {
+						return materializedPredKey{}, false
+					}
+					switch hiTag[1] {
+					case ']':
+						out.flags |= materializedPredKeyHasHi | materializedPredKeyHiInc
+					case ')':
+						out.flags |= materializedPredKeyHasHi
+					default:
+						return materializedPredKey{}, false
+					}
+					switch hiTag[0] {
+					case 'n':
+						if len(hiVal) != 8 {
+							return materializedPredKey{}, false
+						}
+						out.flags |= materializedPredKeyHiNumeric
+						out.hiIndex = indexKeyFromU64(fixed8StringToU64(hiVal))
+					case 's':
+						out.hiKey = hiVal
+					default:
+						return materializedPredKey{}, false
+					}
+				}
+				if out.flags&(materializedPredKeyHasLo|materializedPredKeyHasHi) == 0 {
+					return materializedPredKey{}, false
+				}
+				return out, true
+			}
+		}
+	}
+	loRaw, hiRaw, ok := strings.Cut(tail, "\x1f")
+	if !ok {
+		return materializedPredKey{}, false
+	}
+	out := materializedPredKey{
+		kind:  kind,
+		field: field,
+	}
+	if loRaw != "" {
+		switch loRaw[0] {
+		case '[':
+			out.flags |= materializedPredKeyHasLo | materializedPredKeyLoInc
+		case '(':
+			out.flags |= materializedPredKeyHasLo
+		default:
+			return materializedPredKey{}, false
+		}
+		out.loKey = loRaw[1:]
+	}
+	if hiRaw != "" {
+		switch hiRaw[0] {
+		case ']':
+			out.flags |= materializedPredKeyHasHi | materializedPredKeyHiInc
+		case ')':
+			out.flags |= materializedPredKeyHasHi
+		default:
+			return materializedPredKey{}, false
+		}
+		out.hiKey = hiRaw[1:]
+	}
+	if out.flags&(materializedPredKeyHasLo|materializedPredKeyHasHi) == 0 {
+		return materializedPredKey{}, false
+	}
+	return out, true
 }
 
 func materializedPredKeyForNumericBucketSpan(field string, startBucket, endBucket int) materializedPredKey {
@@ -397,104 +511,10 @@ func materializedPredKeyFromEncoded(key string) (materializedPredKey, bool) {
 		}, true
 
 	case "range_exact":
-		if loTag, rest, ok := strings.Cut(tail, "\x1f"); ok {
-			if loVal, rest, ok := strings.Cut(rest, "\x1f"); ok {
-				if hiTag, hiVal, ok := strings.Cut(rest, "\x1f"); ok {
-					out := materializedPredKey{
-						kind:  materializedPredKeyExactScalarRange,
-						field: f,
-					}
-					if loTag != "" {
-						if len(loTag) != 2 {
-							return materializedPredKey{}, false
-						}
-						switch loTag[1] {
-						case '[':
-							out.flags |= materializedPredKeyHasLo | materializedPredKeyLoInc
-						case '(':
-							out.flags |= materializedPredKeyHasLo
-						default:
-							return materializedPredKey{}, false
-						}
-						switch loTag[0] {
-						case 'n':
-							if len(loVal) != 8 {
-								return materializedPredKey{}, false
-							}
-							out.flags |= materializedPredKeyLoNumeric
-							out.loIndex = indexKeyFromU64(fixed8StringToU64(loVal))
-						case 's':
-							out.loKey = loVal
-						default:
-							return materializedPredKey{}, false
-						}
-					}
-					if hiTag != "" {
-						if len(hiTag) != 2 {
-							return materializedPredKey{}, false
-						}
-						switch hiTag[1] {
-						case ']':
-							out.flags |= materializedPredKeyHasHi | materializedPredKeyHiInc
-						case ')':
-							out.flags |= materializedPredKeyHasHi
-						default:
-							return materializedPredKey{}, false
-						}
-						switch hiTag[0] {
-						case 'n':
-							if len(hiVal) != 8 {
-								return materializedPredKey{}, false
-							}
-							out.flags |= materializedPredKeyHiNumeric
-							out.hiIndex = indexKeyFromU64(fixed8StringToU64(hiVal))
-						case 's':
-							out.hiKey = hiVal
-						default:
-							return materializedPredKey{}, false
-						}
-					}
-					if out.flags&(materializedPredKeyHasLo|materializedPredKeyHasHi) == 0 {
-						return materializedPredKey{}, false
-					}
-					return out, true
-				}
-			}
-		}
-		loRaw, hiRaw, ok := strings.Cut(tail, "\x1f")
-		if !ok {
-			return materializedPredKey{}, false
-		}
-		out := materializedPredKey{
-			kind:  materializedPredKeyExactScalarRange,
-			field: f,
-		}
-		if loRaw != "" {
-			switch loRaw[0] {
-			case '[':
-				out.flags |= materializedPredKeyHasLo | materializedPredKeyLoInc
-			case '(':
-				out.flags |= materializedPredKeyHasLo
-			default:
-				return materializedPredKey{}, false
-			}
-			out.loKey = loRaw[1:]
-		}
-		if hiRaw != "" {
-			switch hiRaw[0] {
-			case ']':
-				out.flags |= materializedPredKeyHasHi | materializedPredKeyHiInc
-			case ')':
-				out.flags |= materializedPredKeyHasHi
-			default:
-				return materializedPredKey{}, false
-			}
-			out.hiKey = hiRaw[1:]
-		}
-		if out.flags&(materializedPredKeyHasLo|materializedPredKeyHasHi) == 0 {
-			return materializedPredKey{}, false
-		}
-		return out, true
+		return parseMaterializedPredKeyExactScalarRange(materializedPredKeyExactScalarRange, f, tail)
+
+	case "count_range_exact_complement":
+		return parseMaterializedPredKeyExactScalarRange(materializedPredKeyExactScalarRangeComplement, f, tail)
 
 	case "range_bucket":
 		startStr, endStr, ok := strings.Cut(tail, "\x1f")

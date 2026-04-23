@@ -39,6 +39,214 @@ type plannerOROrderDecision struct {
 	fallbackCost float64
 }
 
+type plannerOROrderBranchAnalysis struct {
+	rangeStart int
+	rangeEnd   int
+	universe   uint64
+	covered    *pooled.SliceBuf[bool]
+	predBuild  *pooled.SliceBuf[orderedORMaterializedPredicateBuildInfo]
+	buildReady bool
+}
+
+type plannerOROrderAnalysis struct {
+	orderField       string
+	snapshotUniverse uint64
+	branchCount      int
+	exactUniverses   int
+	reusedUniverses  int
+	mergeStats       [plannerORBranchLimit]plannerOROrderMergeBranchStats
+	branches         [plannerORBranchLimit]plannerOROrderBranchAnalysis
+}
+
+func (a *plannerOROrderAnalysis) release() {
+	if a == nil {
+		return
+	}
+	n := a.branchCount
+	if n > plannerORBranchLimit {
+		n = plannerORBranchLimit
+	}
+	for i := 0; i < n; i++ {
+		if a.branches[i].covered != nil {
+			boolSlicePool.Put(a.branches[i].covered)
+		}
+		if a.branches[i].predBuild != nil {
+			plannerORPredicateBuildInfoSlicePool.Put(a.branches[i].predBuild)
+		}
+	}
+	*a = plannerOROrderAnalysis{}
+}
+
+func (a *plannerOROrderAnalysis) applyCovered(branches plannerORBranches) {
+	if a == nil {
+		return
+	}
+	n := min(a.branchCount, branches.Len())
+	for i := 0; i < n; i++ {
+		covered := a.branches[i].covered
+		if covered == nil || covered.Len() == 0 {
+			continue
+		}
+		branch := branches.GetPtr(i)
+		limit := min(covered.Len(), branch.predLen())
+		for pi := 0; pi < limit; pi++ {
+			if covered.Get(pi) {
+				branch.predPtr(pi).covered = true
+			}
+		}
+	}
+}
+
+func (a *plannerOROrderAnalysis) predicateBuildInfo(branchIdx, predIdx int) (orderedORMaterializedPredicateBuildInfo, bool) {
+	if a == nil || branchIdx < 0 || branchIdx >= a.branchCount {
+		return orderedORMaterializedPredicateBuildInfo{}, false
+	}
+	buf := a.branches[branchIdx].predBuild
+	if buf == nil || predIdx < 0 || predIdx >= buf.Len() {
+		return orderedORMaterializedPredicateBuildInfo{}, false
+	}
+	info := buf.Get(predIdx)
+	return info, info.ok
+}
+
+func (a *plannerOROrderAnalysis) refreshBranch(branches plannerORBranches, branchIdx int) {
+	if a == nil || branchIdx < 0 || branchIdx >= a.branchCount || branchIdx >= branches.Len() {
+		return
+	}
+	covered := a.branches[branchIdx].covered
+	branch := branches.GetPtr(branchIdx)
+	hasFalse := false
+	allTrue := true
+	leadIdx := -1
+	leadEst := uint64(0)
+	for pi := 0; pi < branch.predLen(); pi++ {
+		p := branch.pred(pi)
+		if p.alwaysFalse {
+			hasFalse = true
+			break
+		}
+		if p.covered || p.alwaysTrue {
+			continue
+		}
+		if covered != nil && pi < covered.Len() && covered.Get(pi) {
+			continue
+		}
+		allTrue = false
+		if p.hasIter() && (leadIdx == -1 || p.estCard < leadEst) {
+			leadIdx = pi
+			leadEst = p.estCard
+		}
+	}
+	branch.alwaysTrue = false
+	branch.leadIdx = -1
+	if hasFalse {
+		branch.estCard = 0
+		branch.estKnown = true
+		branch.coveredRangeBounded = true
+		branch.coveredRangeStart = 0
+		branch.coveredRangeEnd = 0
+		a.branches[branchIdx].rangeStart = 0
+		a.branches[branchIdx].rangeEnd = 0
+		a.branches[branchIdx].universe = 0
+		a.mergeStats[branchIdx].rangeBounded = true
+		a.mergeStats[branchIdx].rangeRows = 0
+	} else if allTrue {
+		if a.mergeStats[branchIdx].rangeBounded {
+			branch.estCard = a.branches[branchIdx].universe
+			branch.estKnown = true
+			branch.coveredRangeBounded = true
+			branch.coveredRangeStart = a.branches[branchIdx].rangeStart
+			branch.coveredRangeEnd = a.branches[branchIdx].rangeEnd
+		} else {
+			branch.alwaysTrue = true
+			branch.estKnown = false
+			branch.estCard = 0
+			branch.coveredRangeBounded = false
+			branch.coveredRangeStart = 0
+			branch.coveredRangeEnd = 0
+		}
+	} else {
+		branch.leadIdx = leadIdx
+	}
+	a.mergeStats[branchIdx].streamChecks, a.mergeStats[branchIdx].mergeChecks = plannerORBranchCheckCounts(*branch, covered)
+	if a.branches[branchIdx].predBuild != nil {
+		plannerORPredicateBuildInfoSlicePool.Put(a.branches[branchIdx].predBuild)
+		a.branches[branchIdx].predBuild = nil
+	}
+	a.branches[branchIdx].buildReady = false
+}
+
+func (qv *queryView[K, V]) buildOROrderAnalysis(q *qir.Shape, branches plannerORBranches) (plannerOROrderAnalysis, bool) {
+	var analysis plannerOROrderAnalysis
+	if q == nil || !q.HasOrder {
+		return analysis, false
+	}
+	order := q.Order
+	if order.Kind != qir.OrderKindBasic || order.FieldOrdinal < 0 {
+		return analysis, false
+	}
+	ov := qv.fieldOverlayForOrder(order)
+	if !ov.hasData() {
+		return analysis, false
+	}
+	snapshotUniverse := qv.snapshotUniverseCardinality()
+	if snapshotUniverse == 0 {
+		return analysis, false
+	}
+	orderField := qv.fieldNameByOrder(order)
+	branchCount := branches.Len()
+	if branchCount > plannerORBranchLimit {
+		branchCount = plannerORBranchLimit
+	}
+	analysis.orderField = orderField
+	analysis.snapshotUniverse = snapshotUniverse
+	analysis.branchCount = branchCount
+	fullSpanEnd := ov.keyCount()
+
+	for i := 0; i < branchCount; i++ {
+		branch := branches.GetPtr(i)
+		br, covered, ok := qv.extractOrderRangeCoverageOverlayReader(orderField, branch.preds, ov)
+		if !ok {
+			analysis.release()
+			return plannerOROrderAnalysis{}, false
+		}
+		analysis.branches[i].covered = covered
+		analysis.branches[i].rangeStart = br.baseStart
+		analysis.branches[i].rangeEnd = br.baseEnd
+		if covered.Len() == 0 {
+			analysis.mergeStats[i].streamChecks, analysis.mergeStats[i].mergeChecks = plannerORBranchCheckCounts(*branch, nil)
+		} else {
+			analysis.mergeStats[i].streamChecks, analysis.mergeStats[i].mergeChecks = plannerORBranchCheckCounts(*branch, covered)
+		}
+		if br.baseStart == 0 && br.baseEnd == fullSpanEnd {
+			analysis.branches[i].universe = snapshotUniverse
+			analysis.reusedUniverses++
+			continue
+		}
+		analysis.mergeStats[i].rangeBounded = true
+		if branch.coveredRangeBounded &&
+			branch.estKnown &&
+			branch.coveredRangeStart == br.baseStart &&
+			branch.coveredRangeEnd == br.baseEnd {
+			analysis.mergeStats[i].rangeRows = branch.estCard
+			analysis.branches[i].universe = branch.estCard
+			analysis.reusedUniverses++
+			continue
+		}
+		_, analysis.mergeStats[i].rangeRows = overlayRangeStats(ov, br)
+		analysis.branches[i].universe = analysis.mergeStats[i].rangeRows
+		analysis.exactUniverses++
+		if branch.coveredRangeBounded &&
+			!branch.estKnown &&
+			branch.coveredRangeStart == br.baseStart &&
+			branch.coveredRangeEnd == br.baseEnd {
+			branch.estCard = analysis.mergeStats[i].rangeRows
+			branch.estKnown = true
+		}
+	}
+	return analysis, true
+}
+
 func (qv *queryView[K, V]) decidePlanORNoOrder(q *qir.Shape, branches plannerORBranches) plannerORNoOrderDecision {
 	var d plannerORNoOrderDecision
 
@@ -114,9 +322,22 @@ func (qv *queryView[K, V]) hasNonOrderPrefixTailRisk(branches plannerORBranches,
 }
 
 func (qv *queryView[K, V]) decidePlanOROrder(q *qir.Shape, branches plannerORBranches) plannerOROrderDecision {
+	analysis, ok := qv.buildOROrderAnalysis(q, branches)
+	if !ok {
+		return plannerOROrderDecision{plan: plannerOROrderFallback}
+	}
+	defer analysis.release()
+	return qv.decidePlanOROrderWithAnalysis(q, branches, &analysis)
+}
+
+func (qv *queryView[K, V]) decidePlanOROrderWithAnalysis(
+	q *qir.Shape,
+	branches plannerORBranches,
+	analysis *plannerOROrderAnalysis,
+) plannerOROrderDecision {
 	d := plannerOROrderDecision{plan: plannerOROrderFallback}
 
-	if !q.HasOrder {
+	if q == nil || !q.HasOrder || analysis == nil {
 		return d
 	}
 
@@ -124,7 +345,7 @@ func (qv *queryView[K, V]) decidePlanOROrder(q *qir.Shape, branches plannerORBra
 	if o.Kind != qir.OrderKindBasic {
 		return d
 	}
-	orderField := qv.fieldNameByOrder(o)
+	orderField := analysis.orderField
 
 	fm := qv.fieldMetaByOrder(o)
 	if fm == nil || fm.Slice {
@@ -145,12 +366,11 @@ func (qv *queryView[K, V]) decidePlanOROrder(q *qir.Shape, branches plannerORBra
 	}
 
 	snap := qv.planner.stats.Load()
-	universe := snap.universeOr(qv.snapshotUniverseCardinality())
+	universe := snap.universeOr(analysis.snapshotUniverse)
 	if universe == 0 {
 		return d
 	}
 
-	mergeStats := qv.orderMergeBranchStats(orderField, branches, ov)
 	var branchCards [plannerORBranchLimit]uint64
 	unionCard, sumCard, branchCount, hasAlwaysTrue := branches.unionCards(universe, &branchCards)
 	if unionCard == 0 {
@@ -159,10 +379,10 @@ func (qv *queryView[K, V]) decidePlanOROrder(q *qir.Shape, branches plannerORBra
 
 	orderStats := qv.plannerOrderFieldStats(orderField, snap, universe, orderDistinct)
 	expectedRows := estimateRowsForNeed(uint64(need), unionCard, universe)
-	routeCost, routeOK := qv.estimateOROrderMergeRouteCost(q, branches, need, mergeStats)
+	routeCost, routeOK := qv.estimateOROrderMergeRouteCost(q, branches, need, analysis.mergeStats)
 
 	// Stream cost tracks row-by-row predicate checks during ordered scan.
-	streamChecks := branches.orderStreamChecksByBranch(hasAlwaysTrue, mergeStats)
+	streamChecks := branches.orderStreamChecksByBranch(hasAlwaysTrue, analysis.mergeStats)
 	streamSkew := orderStats.skew()
 	costStream := float64(expectedRows) * streamChecks * streamSkew
 	costStream *= qv.root.plannerCostMultiplier(plannerCalOROrderStream)
@@ -176,11 +396,11 @@ func (qv *queryView[K, V]) decidePlanOROrder(q *qir.Shape, branches plannerORBra
 	mergeNeedLimit := plannerOROrderMergeNeedLimit(need, branches.Len(), unionCard, sumCard, q.Offset)
 	mergeAllowed := !hasAlwaysTrue && need <= mergeNeedLimit
 	if mergeAllowed {
-		costMerge := branches.orderMergeCost(uint64(need), &branchCards, branchCount, unionCard, sumCard, universe, orderStats, mergeStats)
+		costMerge := branches.orderMergeCost(uint64(need), &branchCards, branchCount, unionCard, sumCard, universe, orderStats, analysis.mergeStats)
 		if routeOK && routeCost.kWay > 0 && routeCost.kWay < costMerge &&
-			branches.hasFullSpanOrderBranch(mergeStats) &&
+			branches.hasFullSpanOrderBranch(analysis.mergeStats) &&
 			!routeCost.hasPrefixTailRisk &&
-			!branches.hasKWayExactBucketApplyWork(mergeStats) {
+			!branches.hasKWayExactBucketApplyWork(analysis.mergeStats) {
 			costMerge = routeCost.kWay
 		}
 		costMerge *= qv.root.plannerCostMultiplier(plannerCalOROrderMerge)
@@ -309,6 +529,101 @@ func (branch plannerORBranch) estimatedCard(universe uint64) uint64 {
 		est = universe
 	}
 	return est
+}
+
+func (branch plannerORBranch) estimatedCardWithinOrderedUniverse(snapshotUniverse, universe uint64) uint64 {
+	if snapshotUniverse == 0 || universe == 0 {
+		return 0
+	}
+	if branch.alwaysTrue {
+		return universe
+	}
+
+	hasCovered := false
+	for i := 0; i < branch.predLen(); i++ {
+		if branch.pred(i).covered {
+			hasCovered = true
+			break
+		}
+	}
+	if !hasCovered {
+		card := branch.estimatedCard(snapshotUniverse)
+		if card > universe {
+			card = universe
+		}
+		return card
+	}
+
+	minEst := uint64(0)
+	active := 0
+	uncovered := 0
+	for i := 0; i < branch.predLen(); i++ {
+		p := branch.pred(i)
+		if p.alwaysFalse {
+			return 0
+		}
+		if p.alwaysTrue || p.covered {
+			continue
+		}
+		uncovered++
+		if p.estCard == 0 {
+			continue
+		}
+		active++
+		if minEst == 0 || p.estCard < minEst {
+			minEst = p.estCard
+		}
+	}
+	if uncovered == 0 {
+		if branch.estKnown {
+			if branch.estCard > universe {
+				return universe
+			}
+			return branch.estCard
+		}
+		return universe
+	}
+
+	if minEst == 0 {
+		if branch.hasLead() {
+			lead := branch.leadPred()
+			if !lead.covered && !lead.alwaysTrue && !lead.alwaysFalse && lead.estCard > 0 {
+				minEst = lead.estCard
+				active = 1
+			}
+		}
+		if minEst == 0 {
+			minEst = max(1, snapshotUniverse/plannerORBranchFallbackDiv)
+			active = 1
+		}
+	}
+
+	est := minEst
+	if active > 1 {
+		decay := 1.0
+		for i := 1; i < active; i++ {
+			decay *= 0.72
+		}
+		est = uint64(float64(est) * decay)
+		if est == 0 {
+			est = 1
+		}
+	}
+	if est > snapshotUniverse {
+		est = snapshotUniverse
+	}
+	if snapshotUniverse == universe {
+		return est
+	}
+
+	scaled := uint64(math.Ceil(float64(est) * float64(universe) / float64(snapshotUniverse)))
+	if scaled == 0 {
+		scaled = 1
+	}
+	if scaled > universe {
+		scaled = universe
+	}
+	return scaled
 }
 
 func estimateRowsForNeed(need, card, universe uint64) uint64 {

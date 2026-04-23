@@ -35,6 +35,33 @@ func TestMaterializedPredKeyExactScalarRange_RoundTripNumeric(t *testing.T) {
 	}
 }
 
+func TestMaterializedPredKeyExactScalarRangeComplement_RoundTripNumeric(t *testing.T) {
+	bounds := rangeBounds{
+		has:       true,
+		hasLo:     true,
+		loInc:     true,
+		loNumeric: true,
+		loIndex:   indexKeyFromU64(orderedInt64Key(30)),
+		hasHi:     true,
+		hiInc:     false,
+		hiNumeric: true,
+		hiIndex:   indexKeyFromU64(orderedInt64Key(60)),
+	}
+
+	key := materializedPredComplementKeyForExactScalarRange("age", bounds)
+	if key.isZero() {
+		t.Fatal("expected non-zero exact range complement cache key")
+	}
+
+	parsed, ok := materializedPredKeyFromEncoded(key.String())
+	if !ok {
+		t.Fatal("expected numeric exact range complement cache key to parse")
+	}
+	if parsed != key {
+		t.Fatalf("round-trip mismatch:\n got=%#v\nwant=%#v", parsed, key)
+	}
+}
+
 func TestMaterializedPredKeyExactScalarRange_ParseLegacyEncoding(t *testing.T) {
 	legacy := "age\x1frange_exact\x1f[\x00\x00\x00\x00\x00\x00\x00\x1e\x1f)\x00\x00\x00\x00\x00\x00\x00<"
 	parsed, ok := materializedPredKeyFromEncoded(legacy)

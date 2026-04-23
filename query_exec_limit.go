@@ -1026,8 +1026,8 @@ func (qv *queryView[K, V]) buildLeafPredsExcludingBounds(leaves []qir.Expr, fiel
 			if p.kind != leafPredKindPredicate || !p.pred.hasRuntimeRangeState() {
 				continue
 			}
-			orderedRoute := qv.orderedScalarRangeRouting(p.pred.expr, orderedWindow, 0, orderedUniverse)
-			if !orderedRoute.broadComplement {
+			orderedRoute := qv.orderedPredicateScalarRangeRouting(p.pred, orderedWindow, 0, orderedUniverse)
+			if !orderedRoute.broadComplement && !orderedRoute.forceComplement {
 				continue
 			}
 			exactSiblingCount := 0
@@ -1039,7 +1039,7 @@ func (qv *queryView[K, V]) buildLeafPredsExcludingBounds(leaves []qir.Expr, fiel
 					exactSiblingCount++
 				}
 			}
-			if exactSiblingCount >= 2 {
+			if exactSiblingCount >= 2 && !orderedRoute.forceComplement {
 				// Multiple exact bucket siblings already cut broad range work
 				// aggressively, so first-hit complement materialization is only
 				// worth taking when a warm shared complement already exists.
@@ -1050,7 +1050,13 @@ func (qv *queryView[K, V]) buildLeafPredsExcludingBounds(leaves []qir.Expr, fiel
 					continue
 				}
 			}
-			qv.tryMaterializeBroadRangeComplementPredicateForOrdered(&p.pred, orderedRoute.broadComplement, orderedUniverse, orderedWindow)
+			qv.tryMaterializeBroadRangeComplementPredicateForOrdered(
+				&p.pred,
+				orderedRoute.broadComplement,
+				orderedUniverse,
+				orderedWindow,
+				orderedRoute.forceComplement,
+			)
 			predsBuf.Set(i, p)
 		}
 	}

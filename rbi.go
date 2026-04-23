@@ -448,46 +448,57 @@ func New[K ~uint64 | ~string, V any](bolt *bbolt.DB, options Options, execOpts .
 		var (
 			skipFields    map[string]struct{}
 			rebuildReason string
+			logBuild      bool
 		)
 
 		if _, err = os.Stat(db.rbiFile); err == nil {
 			if options.DisableIndexLoad {
 				rebuildReason = "persisted index load disabled"
+				logBuild = !options.DisableIndexStore
 			} else {
 				skipFields, loadedPlannerStats, err = db.loadIndex()
 				if err != nil {
 					rebuildReason = fmt.Sprintf("persisted index unavailable (%v)", err)
 				}
+				logBuild = true
 			}
 		} else if os.IsNotExist(err) {
 			rebuildReason = fmt.Sprintf("persisted index missing (file=%q)", db.rbiFile)
+			logBuild = !options.DisableIndexStore
 		} else if !os.IsNotExist(err) {
 			rebuildReason = fmt.Sprintf("persisted index stat failed (%v)", err)
+			logBuild = true
 		}
 
 		loadedFieldCount = len(skipFields)
 		totalFieldCount := len(db.fields)
 		if rebuildReason != "" {
 			buildMode = "full"
-			log.Printf("rbi: %s", rebuildReason)
-			log.Printf(
-				"rbi: rebuilding index from bbolt (mode=full loaded_fields=%d/%d)",
-				loadedFieldCount,
-				totalFieldCount,
-			)
+			if logBuild {
+				log.Printf("rbi: %s", rebuildReason)
+				log.Printf(
+					"rbi: rebuilding index from bbolt (mode=full loaded_fields=%d/%d)",
+					loadedFieldCount,
+					totalFieldCount,
+				)
+			}
 		} else if totalFieldCount > 0 {
 			if loadedFieldCount == 0 {
 				buildMode = "full"
-				log.Printf("rbi: persisted index has no compatible field indexes (file=%q)", db.rbiFile)
-				log.Printf("rbi: rebuilding index from bbolt (mode=full loaded_fields=0/%d)", totalFieldCount)
+				if logBuild {
+					log.Printf("rbi: persisted index has no compatible field indexes (file=%q)", db.rbiFile)
+					log.Printf("rbi: rebuilding index from bbolt (mode=full loaded_fields=0/%d)", totalFieldCount)
+				}
 			} else if loadedFieldCount < totalFieldCount {
 				buildMode = "partial"
-				log.Printf(
-					"rbi: partially rebuilding index from bbolt (loaded_fields=%d/%d missing_fields=%d)",
-					loadedFieldCount,
-					totalFieldCount,
-					totalFieldCount-loadedFieldCount,
-				)
+				if logBuild {
+					log.Printf(
+						"rbi: partially rebuilding index from bbolt (loaded_fields=%d/%d missing_fields=%d)",
+						loadedFieldCount,
+						totalFieldCount,
+						totalFieldCount-loadedFieldCount,
+					)
+				}
 			}
 		}
 
@@ -495,7 +506,7 @@ func New[K ~uint64 | ~string, V any](bolt *bbolt.DB, options Options, execOpts .
 		if err = db.buildIndex(skipFields); err != nil {
 			return nil, fmt.Errorf("error building index: %w", err)
 		}
-		if buildMode != "" {
+		if logBuild && buildMode != "" {
 			log.Printf("rbi: index build completed (mode=%s duration=%s)", buildMode, time.Since(buildStarted))
 		}
 	}

@@ -47,6 +47,12 @@ func TestPlannerTraceCollectorAggregatesByClassAndQuery(t *testing.T) {
 		ORRoute: rbi.TraceORRoute{
 			Route:                    "fallback",
 			Reason:                   "cost",
+			PlannerAnalysisTime:      240 * time.Microsecond,
+			PlannerPredicates:        6,
+			PlannerCacheHits:         2,
+			PlannerBuilds:            1,
+			PlannerExactRanges:       1,
+			PlannerReusedRanges:      1,
 			RuntimeFallbackTriggered: true,
 			RuntimeFallbackReason:    "projected_examined",
 		},
@@ -104,5 +110,17 @@ func TestPlannerTraceCollectorAggregatesByClassAndQuery(t *testing.T) {
 	}
 	if got := queryReport.ORRouteCounts["fallback:cost"]; got != 1 {
 		t.Fatalf("OR route count = %d, want 1", got)
+	}
+	if queryReport.AvgPlannerUs <= 0 {
+		t.Fatalf("planner analysis avg = %v, want > 0", queryReport.AvgPlannerUs)
+	}
+	if queryReport.AvgPlannerPreds != 6 {
+		t.Fatalf("planner predicate avg = %v, want 6", queryReport.AvgPlannerPreds)
+	}
+	if queryReport.AvgPlannerHits != 2 {
+		t.Fatalf("planner cache hits avg = %v, want 2", queryReport.AvgPlannerHits)
+	}
+	if queryReport.AvgPlannerBuilds != 1 {
+		t.Fatalf("planner builds avg = %v, want 1", queryReport.AvgPlannerBuilds)
 	}
 }

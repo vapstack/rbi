@@ -33,6 +33,14 @@ func main() {
 	if opts.AllocProfile != "" {
 		runtime.MemProfileRate = 0
 	}
+	catalog, _, _, err = loadFilteredClassCatalog(opts.ClassFilter, opts.QueryFilter)
+	if err != nil {
+		fatalf("apply stress filters: %v", err)
+	}
+	initialWorkers, err := resolveInitialWorkers(catalog, opts.InitialWorkers, opts.WorkerGroups)
+	if err != nil {
+		fatalf("invalid worker overrides: %v", err)
+	}
 
 	log.Printf(
 		"opening DB file=%s report=%s alloc_profile=%s alloc_source=%s alloc_mode=%s headless=%t duration=%s no_cache=%t trace_sample=%d trace_top=%d query_stats=%t jitter=%t class_filter=%v query_filter=%v",
@@ -55,7 +63,7 @@ func main() {
 	if err != nil {
 		fatalf("start profiling: %v", err)
 	}
-	traceCollector := newPlannerTraceCollector(nil, opts.TraceSampleEvery, opts.TraceTopN)
+	traceCollector := newPlannerTraceCollector(catalog, opts.TraceSampleEvery, opts.TraceTopN)
 	handle, err := OpenBenchDB(DBConfig{
 		DBFile:               opts.DBFile,
 		SeedRecords:          opts.SeedRecords,
@@ -94,16 +102,6 @@ func main() {
 		_, _ = fmt.Fprintf(os.Stdout, "\nalloc profile saved to %s\nDB closed %s\n", opts.AllocProfile, handle.DBFile)
 		return
 	}
-	catalog, _, _, err = loadFilteredClassCatalog(opts.ClassFilter, opts.QueryFilter)
-	if err != nil {
-		fatalf("apply stress filters: %v", err)
-	}
-	initialWorkers, err := resolveInitialWorkers(catalog, opts.InitialWorkers, opts.WorkerGroups)
-	if err != nil {
-		fatalf("invalid worker overrides: %v", err)
-	}
-	traceCollector = newPlannerTraceCollector(catalog, opts.TraceSampleEvery, opts.TraceTopN)
-
 	queryBreakdown := !opts.Headless || opts.QueryStats
 	queryLatency := !opts.Headless || opts.QueryStats
 	app := newApp(handle, catalog, opts.RefreshEvery, opts.TelemetryEvery, opts.ReportPath, opts.ClassFilter, opts.QueryFilter, queryBreakdown, queryLatency, opts.Jitter, traceCollector)

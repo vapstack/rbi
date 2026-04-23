@@ -213,6 +213,193 @@ func TestTracer_OROrderMetrics(t *testing.T) {
 	}
 }
 
+func TestTracer_OROrderPlannerAnalysisMetrics(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{
+		AnalyzeInterval:                         -1,
+		SnapshotMaterializedPredCacheMaxEntries: 16,
+	})
+	seedGeneratedUint64Data(t, db, 256, func(i int) *Rec {
+		return &Rec{
+			Name:  fmt.Sprintf("u_%d", i),
+			Age:   18 + i,
+			Score: float64(i),
+		}
+	})
+
+	q := qx.Query(
+		qx.OR(
+			qx.AND(
+				qx.GTE("age", 30),
+				qx.LTE("age", 250),
+			),
+			qx.EQ("name", "u_1"),
+		),
+	).Sort("score", qx.DESC).Limit(240)
+
+	db.clearCurrentSnapshotCachesForTesting()
+	view := db.currentQueryViewForTests()
+	defer db.releaseQueryView(view)
+
+	warm, ok := db.buildPredicatesOrderedWithMode(
+		[]qx.Expr{qx.GTE("age", 30), qx.LTE("age", 250)},
+		"score", false, 4096, 0, false, false,
+	)
+	if !ok {
+		t.Fatalf("warm buildPredicatesOrderedWithMode: ok=false")
+	}
+	if len(warm) != 1 {
+		releasePredicates(warm)
+		t.Fatalf("unexpected warm predicate count: %d", len(warm))
+	}
+	if !warm[0].hasEffectiveBounds {
+		releasePredicates(warm)
+		t.Fatal("expected merged warm predicate with effective bounds")
+	}
+	if !view.materializeOrderedORPredicate(&warm[0]) {
+		releasePredicates(warm)
+		t.Fatal("expected warm predicate to materialize")
+	}
+	releasePredicates(warm)
+	if got := db.getSnapshot().matPredCacheCount.Load(); got == 0 {
+		t.Fatalf("expected prewarmed materialized predicate cache")
+	}
+
+	preparedQ, viewQ, err := prepareTestQuery(db, q)
+	if err != nil {
+		t.Fatalf("prepareTestQuery: %v", err)
+	}
+	defer preparedQ.Release()
+
+	window, _ := orderWindowForTest(q)
+	branches, alwaysFalse, ok := db.buildORBranchesOrdered(q.Filter.Args, "score", window)
+	if !ok {
+		t.Fatalf("buildORBranchesOrdered: ok=false")
+	}
+	if alwaysFalse {
+		branches.Release()
+		t.Fatalf("unexpected alwaysFalse for ordered OR branches")
+	}
+	defer branches.Release()
+
+	analysis, ok := view.buildOROrderAnalysis(&viewQ, branches)
+	if !ok {
+		t.Fatalf("buildOROrderAnalysis: ok=false")
+	}
+	defer analysis.release()
+
+	for bi := 0; bi < branches.Len(); bi++ {
+		branch := branches.Get(bi)
+		for pi := 0; pi < branch.predLen(); pi++ {
+			_ = view.orderedORPredicateBuildInfoForBranch("score", branch.pred(pi), &analysis, branch, bi, pi)
+		}
+	}
+
+	trace := &queryTrace{
+		sink: func(TraceEvent) {},
+	}
+	if !view.maybeWarmMaterializeOrderedORPredicates(&viewQ, branches, &analysis, trace) {
+		t.Fatalf("expected warm ordered-OR materialization to rewrite predicates")
+	}
+	ev := trace.ev
+	if ev.ORRoute.PlannerAnalysisTime <= 0 {
+		t.Fatalf("expected positive planner analysis time, trace=%+v", ev.ORRoute)
+	}
+	if ev.ORRoute.PlannerPredicates == 0 {
+		t.Fatalf("expected planner predicate analysis count, trace=%+v", ev.ORRoute)
+	}
+	if ev.ORRoute.PlannerExactRanges+ev.ORRoute.PlannerReusedRanges == 0 {
+		t.Fatalf("expected planner range analysis counters, trace=%+v", ev.ORRoute)
+	}
+	if ev.ORRoute.PlannerCacheHits+ev.ORRoute.PlannerBuilds == 0 {
+		t.Fatalf("expected planner analysis to observe cache hits or builds, trace=%+v", ev.ORRoute)
+	}
+}
+
+func TestTracer_OROrderPlannerAnalysisRangeCountersNotDoubleCountAcrossPhases(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{
+		AnalyzeInterval:                         -1,
+		SnapshotMaterializedPredCacheMaxEntries: 16,
+	})
+	seedGeneratedUint64Data(t, db, 256, func(i int) *Rec {
+		return &Rec{
+			Name:  fmt.Sprintf("u_%d", i),
+			Age:   18 + i,
+			Score: float64(i),
+		}
+	})
+
+	q := qx.Query(
+		qx.OR(
+			qx.AND(
+				qx.GTE("age", 30),
+				qx.LTE("age", 250),
+			),
+			qx.EQ("name", "u_1"),
+		),
+	).Sort("score", qx.DESC).Limit(240)
+
+	db.clearCurrentSnapshotCachesForTesting()
+	view := db.currentQueryViewForTests()
+	defer db.releaseQueryView(view)
+
+	warm, ok := db.buildPredicatesOrderedWithMode(
+		[]qx.Expr{qx.GTE("age", 30), qx.LTE("age", 250)},
+		"score", false, 4096, 0, false, false,
+	)
+	if !ok {
+		t.Fatalf("warm buildPredicatesOrderedWithMode: ok=false")
+	}
+	if len(warm) != 1 {
+		releasePredicates(warm)
+		t.Fatalf("unexpected warm predicate count: %d", len(warm))
+	}
+	if !warm[0].hasEffectiveBounds {
+		releasePredicates(warm)
+		t.Fatal("expected merged warm predicate with effective bounds")
+	}
+	if !view.materializeOrderedORPredicate(&warm[0]) {
+		releasePredicates(warm)
+		t.Fatal("expected warm predicate to materialize")
+	}
+	releasePredicates(warm)
+
+	preparedQ, viewQ, err := prepareTestQuery(db, q)
+	if err != nil {
+		t.Fatalf("prepareTestQuery: %v", err)
+	}
+	defer preparedQ.Release()
+
+	window, _ := orderWindowForTest(q)
+	branches, alwaysFalse, ok := db.buildORBranchesOrdered(q.Filter.Args, "score", window)
+	if !ok {
+		t.Fatalf("buildORBranchesOrdered: ok=false")
+	}
+	if alwaysFalse {
+		branches.Release()
+		t.Fatalf("unexpected alwaysFalse for ordered OR branches")
+	}
+	defer branches.Release()
+
+	analysis, ok := view.buildOROrderAnalysis(&viewQ, branches)
+	if !ok {
+		t.Fatalf("buildOROrderAnalysis: ok=false")
+	}
+	defer analysis.release()
+
+	trace := &queryTrace{
+		sink: func(TraceEvent) {},
+	}
+	view.maybeWarmMaterializeOrderedORPredicates(&viewQ, branches, &analysis, trace)
+	view.maybeEagerMaterializeOrderedORPredicates(&viewQ, branches, &analysis, false, trace)
+
+	if got, want := trace.ev.ORRoute.PlannerExactRanges, uint64(analysis.exactUniverses); got != want {
+		t.Fatalf("PlannerExactRanges = %d, want %d", got, want)
+	}
+	if got, want := trace.ev.ORRoute.PlannerReusedRanges, uint64(analysis.reusedUniverses); got != want {
+		t.Fatalf("PlannerReusedRanges = %d, want %d", got, want)
+	}
+}
+
 func TestTracer_QueryValuesPathEmitsTrace(t *testing.T) {
 	var (
 		mu     sync.Mutex

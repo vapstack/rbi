@@ -13,13 +13,13 @@ If the target DB is empty, the runner seeds it with the standard benchmark datas
 Interactive mode:
 
 ```bash
-go run ./stress -db bench.db
+go run ./stress -db stress.db
 ```
 
 Headless timed mode:
 
 ```bash
-go run ./stress -db bench.db -out stress_report.json -duration 30s -r_smp 8 -w_med 4
+go run ./stress -db sress.db -out stress_report.json -duration 30s -r_smp 8 -w_med 4
 ```
 
 Focused profiling run for one problematic query:
@@ -66,7 +66,7 @@ go run ./stress \
 Headless until `Ctrl+C`:
 
 ```bash
-go run ./stress -db bench.db -headless -out stress_report.json -r_idx 128 -w_fst 16
+go run ./stress -db stress.db -headless -out stress_report.json -r_idx 128 -w_fst 16
 ```
 
 ## Main Flags
@@ -123,10 +123,10 @@ Aliases:
 Examples:
 
 ```bash
-go run ./stress -db bench.db -r 4 -w 2
-go run ./stress -db bench.db -a 2 -r 24 -w_hvy 1
-go run ./stress -db bench.db -r_idx 8 -w_fst 4
-go run ./stress -db bench.db -read_simple 8 -write_medium 4
+go run ./stress -db stress.db -r 4 -w 2
+go run ./stress -db stress.db -a 2 -r 24 -w_hvy 1
+go run ./stress -db stress.db -r_idx 8 -w_fst 4
+go run ./stress -db stress.db -read_simple 8 -write_medium 4
 ```
 
 ## Interactive Commands

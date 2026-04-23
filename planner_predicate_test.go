@@ -106,6 +106,25 @@ func TestReleasePredicateOwnedState_ClearsRangeMaterializedRewriteState(t *testi
 	}
 }
 
+func TestSetPredicateMaterializedNot_PreservesEstCard(t *testing.T) {
+	p := predicate{
+		expr:    mustTestQIRExpr(t, qx.GTE("age", 10)),
+		estCard: 123,
+	}
+	ids := posting.BuildFromSorted([]uint64{2, 4, 6})
+	defer ids.Release()
+
+	setPredicateMaterializedNot(&p, ids.Borrow())
+	defer releasePredicateOwnedState(&p)
+
+	if p.kind != predicateKindMaterializedNot {
+		t.Fatalf("expected materialized-not kind, got=%v", p.kind)
+	}
+	if p.estCard != 123 {
+		t.Fatalf("expected preserved estCard=123, got=%d", p.estCard)
+	}
+}
+
 func TestPredicateSupportsPostingFilter_RangeStateDoesNotRequireCheapFlag(t *testing.T) {
 	t.Run("BaseRange", func(t *testing.T) {
 		p := predicate{
@@ -1229,6 +1248,978 @@ func TestBuildPredicatesOrdered_BroadComplementMaterializesOnFirstSightWhenCostW
 	}
 }
 
+func TestBuildPredicatesOrdered_BroadComplementWarmCacheHitLoadsWhenOrderedEagerMaterializeDisabled(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{
+		AnalyzeInterval:                         -1,
+		SnapshotMaterializedPredCacheMaxEntries: 16,
+	})
+	seedGeneratedUint64Data(t, db, 256, func(i int) *Rec {
+		return &Rec{
+			Name:  fmt.Sprintf("u_%d", i),
+			Age:   18 + i,
+			Score: float64(i),
+		}
+	})
+	if err := db.RebuildIndex(); err != nil {
+		t.Fatalf("RebuildIndex: %v", err)
+	}
+
+	view := db.currentQueryViewForTests()
+	defer db.releaseQueryView(view)
+
+	expr := qx.GTE("age", 40)
+	compiled := mustTestQIRExprForDB(t, db, expr)
+	bound, isSlice, err := view.exprValueToNormalizedScalarBound(compiled)
+	if err != nil {
+		t.Fatalf("exprValueToNormalizedScalarBound: %v", err)
+	}
+	if isSlice || bound.full || bound.empty {
+		t.Fatalf("unexpected normalized bound state: slice=%v full=%v empty=%v", isSlice, bound.full, bound.empty)
+	}
+	cacheKey := view.materializedPredComplementKeyForNormalizedScalarBound("age", bound).String()
+	if cacheKey == "" {
+		t.Fatalf("expected non-empty complement cache key")
+	}
+
+	warm, ok := db.buildPredicatesOrderedWithMode([]qx.Expr{expr}, "score", false, 4096, 0, false, true)
+	if !ok {
+		t.Fatalf("warm buildPredicatesOrderedWithMode: ok=false")
+	}
+	releasePredicates(warm)
+	if _, ok := db.getSnapshot().loadMaterializedPred(cacheKey); !ok {
+		t.Fatalf("expected shared complement cache entry after warm build")
+	}
+
+	preds, ok := db.buildPredicatesOrderedWithMode([]qx.Expr{expr}, "score", false, 4096, 0, false, false)
+	if !ok {
+		t.Fatalf("buildPredicatesOrderedWithMode: ok=false")
+	}
+	defer releasePredicates(preds)
+	if len(preds) != 1 {
+		t.Fatalf("unexpected predicate count: %d", len(preds))
+	}
+	if preds[0].kind != predicateKindMaterializedNot {
+		t.Fatalf("expected warm ordered broad complement cache hit, got kind=%v", preds[0].kind)
+	}
+	if preds[0].hasRuntimeRangeState() {
+		t.Fatalf("expected warm cache hit to replace runtime range state")
+	}
+}
+
+func TestBuildPredicatesOrdered_CoverOrderRangeBroadComplementWarmCacheHitLoadsWhenOrderedEagerMaterializeDisabled(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{
+		AnalyzeInterval:                         -1,
+		SnapshotMaterializedPredCacheMaxEntries: 16,
+	})
+	seedGeneratedUint64Data(t, db, 256, func(i int) *Rec {
+		return &Rec{
+			Name:  fmt.Sprintf("u_%d", i),
+			Age:   18 + i,
+			Score: float64(i),
+		}
+	})
+	if err := db.RebuildIndex(); err != nil {
+		t.Fatalf("RebuildIndex: %v", err)
+	}
+
+	view := db.currentQueryViewForTests()
+	defer db.releaseQueryView(view)
+
+	expr := qx.GTE("age", 40)
+	compiled := mustTestQIRExprForDB(t, db, expr)
+	bound, isSlice, err := view.exprValueToNormalizedScalarBound(compiled)
+	if err != nil {
+		t.Fatalf("exprValueToNormalizedScalarBound: %v", err)
+	}
+	if isSlice || bound.full || bound.empty {
+		t.Fatalf("unexpected normalized bound state: slice=%v full=%v empty=%v", isSlice, bound.full, bound.empty)
+	}
+	cacheKey := view.materializedPredComplementKeyForNormalizedScalarBound("age", bound).String()
+	if cacheKey == "" {
+		t.Fatalf("expected non-empty complement cache key")
+	}
+
+	warm, ok := db.buildPredicatesOrderedWithMode([]qx.Expr{expr}, "score", false, 4096, 0, true, true)
+	if !ok {
+		t.Fatalf("warm buildPredicatesOrderedWithMode: ok=false")
+	}
+	releasePredicates(warm)
+	if _, ok := db.getSnapshot().loadMaterializedPred(cacheKey); !ok {
+		t.Fatalf("expected shared complement cache entry after warm build")
+	}
+
+	preds, ok := db.buildPredicatesOrderedWithMode([]qx.Expr{expr}, "score", false, 4096, 0, true, false)
+	if !ok {
+		t.Fatalf("buildPredicatesOrderedWithMode: ok=false")
+	}
+	defer releasePredicates(preds)
+	if len(preds) != 1 {
+		t.Fatalf("unexpected predicate count: %d", len(preds))
+	}
+	if preds[0].kind != predicateKindMaterializedNot {
+		t.Fatalf("expected warm ordered broad complement cache hit in coverOrderRange mode, got kind=%v", preds[0].kind)
+	}
+	if preds[0].hasRuntimeRangeState() {
+		t.Fatalf("expected warm cache hit in coverOrderRange mode to replace runtime range state")
+	}
+}
+
+func TestBuildPredicatesOrdered_CoveredExactRangeWarmCacheHitLoadsWhenPredicateStaysLazy(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{
+		AnalyzeInterval:                         -1,
+		SnapshotMaterializedPredCacheMaxEntries: 16,
+	})
+	seedGeneratedUint64Data(t, db, 256, func(i int) *Rec {
+		return &Rec{
+			Name:  fmt.Sprintf("u_%d", i),
+			Age:   18 + i,
+			Score: float64(i),
+		}
+	})
+	if err := db.RebuildIndex(); err != nil {
+		t.Fatalf("RebuildIndex: %v", err)
+	}
+
+	view := db.currentQueryViewForTests()
+	defer db.releaseQueryView(view)
+
+	leaves := []qx.Expr{qx.GTE("age", 30), qx.LTE("age", 250)}
+	warm, ok := db.buildPredicatesOrderedWithMode(leaves, "score", false, 4096, 0, false, false)
+	if !ok {
+		t.Fatalf("warm buildPredicatesOrderedWithMode: ok=false")
+	}
+	if len(warm) != 1 {
+		releasePredicates(warm)
+		t.Fatalf("unexpected warm predicate count: %d", len(warm))
+	}
+	if !warm[0].hasEffectiveBounds {
+		releasePredicates(warm)
+		t.Fatalf("expected merged exact-range warm predicate")
+	}
+	cacheKey := view.materializedPredComplementKeyForExactScalarRange("age", warm[0].effectiveBounds)
+	if cacheKey.isZero() {
+		releasePredicates(warm)
+		t.Fatalf("expected non-zero exact-range complement cache key")
+	}
+	if !view.materializeOrderedORPredicate(&warm[0]) {
+		releasePredicates(warm)
+		t.Fatalf("expected merged exact-range warm predicate to materialize")
+	}
+	releasePredicates(warm)
+	cached, ok := db.getSnapshot().loadMaterializedPredKey(cacheKey)
+	if !ok || cached.IsEmpty() {
+		t.Fatalf("expected shared merged exact-range complement cache entry after warm materialization")
+	}
+	cached.Release()
+
+	preds, ok := db.buildPredicatesOrderedWithMode(leaves, "score", false, 4096, 0, true, true)
+	if !ok {
+		t.Fatalf("buildPredicatesOrderedWithMode: ok=false")
+	}
+	defer releasePredicates(preds)
+	if len(preds) != 1 {
+		t.Fatalf("unexpected predicate count: %d", len(preds))
+	}
+	if preds[0].kind != predicateKindMaterializedNot {
+		t.Fatalf("expected covered exact-range warm cache hit, got kind=%v", preds[0].kind)
+	}
+	if preds[0].hasRuntimeRangeState() {
+		t.Fatalf("expected covered exact-range warm cache hit to avoid runtime range state")
+	}
+}
+
+func TestBuildPredicatesOrderedBuf_CoveredExactRangeWarmCacheHitLoadsWhenPredicateStaysLazy(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{
+		AnalyzeInterval:                         -1,
+		SnapshotMaterializedPredCacheMaxEntries: 16,
+	})
+	seedGeneratedUint64Data(t, db, 256, func(i int) *Rec {
+		return &Rec{
+			Name:  fmt.Sprintf("u_%d", i),
+			Age:   18 + i,
+			Score: float64(i),
+		}
+	})
+	if err := db.RebuildIndex(); err != nil {
+		t.Fatalf("RebuildIndex: %v", err)
+	}
+
+	view := db.currentQueryViewForTests()
+	defer db.releaseQueryView(view)
+
+	compiled := exprSlicePool.Get()
+	defer exprSlicePool.Put(compiled)
+	compiled.Append(mustTestQIRExprForDB(t, db, qx.GTE("age", 30)))
+	compiled.Append(mustTestQIRExprForDB(t, db, qx.LTE("age", 250)))
+
+	warm, ok := view.buildPredicatesOrderedWithModeBuf(compiled, "score", false, 4096, 0, false, false)
+	if !ok {
+		t.Fatalf("warm buildPredicatesOrderedWithModeBuf: ok=false")
+	}
+	if warm.Len() != 1 {
+		warm.Release()
+		t.Fatalf("unexpected warm predicate count: %d", warm.Len())
+	}
+	warmPred := warm.Get(0)
+	if !warmPred.hasEffectiveBounds {
+		warm.Release()
+		t.Fatalf("expected merged exact-range warm predicate")
+	}
+	cacheKey := view.materializedPredComplementKeyForExactScalarRange("age", warmPred.effectiveBounds)
+	if cacheKey.isZero() {
+		warm.Release()
+		t.Fatalf("expected non-zero exact-range complement cache key")
+	}
+	if !view.materializeOrderedORPredicate(warm.GetPtr(0)) {
+		warm.Release()
+		t.Fatalf("expected merged exact-range warm predicate to materialize")
+	}
+	warm.Release()
+	cached, ok := db.getSnapshot().loadMaterializedPredKey(cacheKey)
+	if !ok || cached.IsEmpty() {
+		t.Fatalf("expected shared merged exact-range complement cache entry after warm materialization")
+	}
+	cached.Release()
+
+	preds, ok := view.buildPredicatesOrderedWithModeBuf(compiled, "score", false, 4096, 0, true, true)
+	if !ok {
+		t.Fatalf("buildPredicatesOrderedWithModeBuf: ok=false")
+	}
+	defer preds.Release()
+	if preds.Len() != 1 {
+		t.Fatalf("unexpected predicate count: %d", preds.Len())
+	}
+	p := preds.Get(0)
+	if p.kind != predicateKindMaterializedNot {
+		t.Fatalf("expected covered exact-range warm cache hit, got kind=%v", p.kind)
+	}
+	if p.hasRuntimeRangeState() {
+		t.Fatalf("expected covered exact-range warm cache hit to avoid runtime range state")
+	}
+}
+
+func TestBuildPredicatesOrdered_BroadComplementStaysDeferredWhenOrderedEagerMaterializeDisabled(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{
+		AnalyzeInterval:                         -1,
+		SnapshotMaterializedPredCacheMaxEntries: 16,
+	})
+	seedGeneratedUint64Data(t, db, 256, func(i int) *Rec {
+		return &Rec{
+			Name:  fmt.Sprintf("u_%d", i),
+			Age:   18 + i,
+			Score: float64(i),
+		}
+	})
+	if err := db.RebuildIndex(); err != nil {
+		t.Fatalf("RebuildIndex: %v", err)
+	}
+
+	view := db.currentQueryViewForTests()
+	defer db.releaseQueryView(view)
+
+	expr := qx.GTE("age", 40)
+	compiled := mustTestQIRExprForDB(t, db, expr)
+	bound, isSlice, err := view.exprValueToNormalizedScalarBound(compiled)
+	if err != nil {
+		t.Fatalf("exprValueToNormalizedScalarBound: %v", err)
+	}
+	if isSlice || bound.full || bound.empty {
+		t.Fatalf("unexpected normalized bound state: slice=%v full=%v empty=%v", isSlice, bound.full, bound.empty)
+	}
+	cacheKey := view.materializedPredComplementKeyForNormalizedScalarBound("age", bound).String()
+	if cacheKey == "" {
+		t.Fatalf("expected non-empty complement cache key")
+	}
+
+	preds, ok := db.buildPredicatesOrderedWithMode([]qx.Expr{expr}, "score", false, 4096, 0, false, false)
+	if !ok {
+		t.Fatalf("buildPredicatesOrderedWithMode: ok=false")
+	}
+	defer releasePredicates(preds)
+	if len(preds) != 1 {
+		t.Fatalf("unexpected predicate count: %d", len(preds))
+	}
+	if preds[0].isMaterializedLike() {
+		t.Fatalf("expected ordered broad complement to stay deferred when eager materialization is disabled, got kind=%v", preds[0].kind)
+	}
+	if !preds[0].hasRuntimeRangeState() {
+		t.Fatalf("expected deferred ordered broad complement to keep runtime range state")
+	}
+	if _, ok := db.getSnapshot().loadMaterializedPred(cacheKey); ok {
+		t.Fatalf("unexpected shared complement cache entry with eager materialization disabled")
+	}
+}
+
+func TestBuildPredicatesOrdered_BroadNullableComplementMaterializesWhenOrderedEagerMaterializeDisabled(t *testing.T) {
+	db, _ := openTempDBUint64PtrInt(t, Options{
+		AnalyzeInterval:                         -1,
+		SnapshotMaterializedPredCacheMaxEntries: 16,
+	})
+	for i := 0; i < 4; i++ {
+		rec := &PtrIntRec{Name: fmt.Sprintf("nil_%02d", i), Rank: nil, Active: i%2 == 0}
+		if err := db.Set(uint64(i+1), rec); err != nil {
+			t.Fatalf("Set(nil_%02d): %v", i, err)
+		}
+	}
+	for i := 0; i < 24; i++ {
+		rec := &PtrIntRec{Name: fmt.Sprintf("rank_%02d", i), Rank: intPtr(i), Active: i%2 == 0}
+		if err := db.Set(uint64(i+5), rec); err != nil {
+			t.Fatalf("Set(rank_%02d): %v", i, err)
+		}
+	}
+	if err := db.RebuildIndex(); err != nil {
+		t.Fatalf("RebuildIndex: %v", err)
+	}
+
+	view := db.currentQueryViewForTests()
+	defer db.releaseQueryView(view)
+
+	expr := qx.GTE("rank", 4)
+	compiled := mustTestQIRExprForDB(t, db, expr)
+	candidate, ok := view.prepareScalarRangeRoutingCandidate(compiled)
+	if !ok {
+		t.Fatalf("expected broad nullable range routing candidate")
+	}
+	if !candidate.plan.useComplement || !candidate.broadComplementCardinality(view.snapshotUniverseCardinality()) {
+		t.Fatalf("expected broad complement route for nullable ordered predicate")
+	}
+
+	preds, ok := db.buildPredicatesOrderedWithMode([]qx.Expr{expr}, "name", false, 4096, 0, false, false)
+	if !ok {
+		t.Fatalf("buildPredicatesOrderedWithMode: ok=false")
+	}
+	defer releasePredicates(preds)
+	if len(preds) != 1 {
+		t.Fatalf("unexpected predicate count: %d", len(preds))
+	}
+	if !preds[0].isMaterializedLike() {
+		t.Fatalf("expected nullable broad complement to materialize for correctness")
+	}
+	if preds[0].hasRuntimeRangeState() {
+		t.Fatalf("expected nullable broad complement to avoid deferred runtime range state")
+	}
+	if preds[0].matches(1) || preds[0].matches(2) {
+		t.Fatalf("nil rank rows must not match positive broad range")
+	}
+	if !preds[0].matches(9) {
+		t.Fatalf("expected in-range row to match materialized nullable broad range")
+	}
+}
+
+func TestBuildPredicatesOrdered_NonBroadNullableComplementMaterializesWhenOrderedEagerMaterializeDisabled(t *testing.T) {
+	db, _ := openTempDBUint64PtrInt(t, Options{
+		AnalyzeInterval:                         -1,
+		SnapshotMaterializedPredCacheMaxEntries: 16,
+	})
+	for i := 0; i < 64; i++ {
+		rec := &PtrIntRec{Name: fmt.Sprintf("nil_%02d", i), Rank: nil, Active: i%2 == 0}
+		if err := db.Set(uint64(i+1), rec); err != nil {
+			t.Fatalf("Set(nil_%02d): %v", i, err)
+		}
+	}
+	for i := 0; i < 40; i++ {
+		v := 0
+		rec := &PtrIntRec{Name: fmt.Sprintf("zero_%02d", i), Rank: &v, Active: i%2 == 0}
+		if err := db.Set(uint64(i+65), rec); err != nil {
+			t.Fatalf("Set(zero_%02d): %v", i, err)
+		}
+	}
+	for i := 1; i <= 9; i++ {
+		v := i
+		rec := &PtrIntRec{Name: fmt.Sprintf("rank_%02d", i), Rank: &v, Active: true}
+		if err := db.Set(uint64(i+105), rec); err != nil {
+			t.Fatalf("Set(rank_%02d): %v", i, err)
+		}
+	}
+	if err := db.RebuildIndex(); err != nil {
+		t.Fatalf("RebuildIndex: %v", err)
+	}
+
+	view := db.currentQueryViewForTests()
+	defer db.releaseQueryView(view)
+
+	expr := qx.GTE("rank", 1)
+	compiled := mustTestQIRExprForDB(t, db, expr)
+	candidate, ok := view.prepareScalarRangeRoutingCandidate(compiled)
+	if !ok {
+		t.Fatalf("expected nullable range routing candidate")
+	}
+	if !candidate.plan.useComplement {
+		t.Fatalf("expected complement route for sparse nullable ordered predicate")
+	}
+	if candidate.broadComplementCardinality(view.snapshotUniverseCardinality()) {
+		t.Fatalf("expected non-broad complement route for sparse nullable ordered predicate")
+	}
+
+	preds, ok := db.buildPredicatesOrderedWithMode([]qx.Expr{expr}, "name", false, 4096, 0, false, false)
+	if !ok {
+		t.Fatalf("buildPredicatesOrderedWithMode: ok=false")
+	}
+	defer releasePredicates(preds)
+	if len(preds) != 1 {
+		t.Fatalf("unexpected predicate count: %d", len(preds))
+	}
+	if !preds[0].isMaterializedLike() {
+		t.Fatalf("expected nullable non-broad complement to materialize for correctness")
+	}
+	if preds[0].kind == predicateKindMaterializedNot || !preds[0].rangeMat {
+		t.Fatalf("expected nil-heavy nullable non-broad range to materialize positive side, got kind=%v rangeMat=%v", preds[0].kind, preds[0].rangeMat)
+	}
+	if preds[0].hasRuntimeRangeState() {
+		t.Fatalf("expected nullable non-broad complement to avoid deferred runtime range state")
+	}
+	if preds[0].matches(1) || preds[0].matches(3) {
+		t.Fatalf("nil rank rows must not match positive non-broad range")
+	}
+	if !preds[0].matches(106) {
+		t.Fatalf("expected in-range row to match materialized nullable non-broad range")
+	}
+}
+
+func TestMaterializeOrderedORPredicate_ExactRangeComplementSharesCache(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{
+		AnalyzeInterval:                         -1,
+		SnapshotMaterializedPredCacheMaxEntries: 16,
+	})
+	seedGeneratedUint64Data(t, db, 256, func(i int) *Rec {
+		return &Rec{
+			Name:  fmt.Sprintf("u_%d", i),
+			Age:   18 + i,
+			Score: float64(i),
+		}
+	})
+	if err := db.RebuildIndex(); err != nil {
+		t.Fatalf("RebuildIndex: %v", err)
+	}
+
+	view := db.currentQueryViewForTests()
+	defer db.releaseQueryView(view)
+
+	expr := mustTestQIRExprForDB(t, db, qx.GTE("age", 40))
+	bound, isSlice, err := view.exprValueToNormalizedScalarBound(expr)
+	if err != nil {
+		t.Fatalf("exprValueToNormalizedScalarBound: %v", err)
+	}
+	if isSlice || bound.full || bound.empty {
+		t.Fatalf("unexpected normalized bound state: slice=%v full=%v empty=%v", isSlice, bound.full, bound.empty)
+	}
+	bounds := rangeBoundsForNormalizedScalarBound(bound)
+	cacheKey := view.materializedPredComplementKeyForExactScalarRange("age", bounds)
+	if cacheKey.isZero() {
+		t.Fatal("expected non-zero exact-range complement cache key")
+	}
+
+	p := predicate{
+		expr:               expr,
+		hasEffectiveBounds: true,
+		effectiveBounds:    bounds,
+	}
+	gotKey, buildWork, checkWork, cachedCheckWork, ok := view.orderedORMaterializedExactRangePredicateCosts("score", p)
+	if !ok {
+		t.Fatal("expected ordered exact-range complement build info")
+	}
+	if gotKey != cacheKey {
+		t.Fatalf("unexpected cache key: got=%q want=%q", gotKey.String(), cacheKey.String())
+	}
+	if buildWork == 0 || checkWork == 0 || cachedCheckWork == 0 {
+		t.Fatalf("expected non-zero exact-range complement work metrics, got build=%d check=%d cached=%d", buildWork, checkWork, cachedCheckWork)
+	}
+	if !view.materializeOrderedORPredicate(&p) {
+		t.Fatal("expected exact-range complement predicate to materialize")
+	}
+	defer releasePredicates([]predicate{p})
+	if p.kind != predicateKindMaterializedNot {
+		t.Fatalf("expected complement-backed materialized predicate, got kind=%v", p.kind)
+	}
+
+	cached, ok := db.getSnapshot().loadMaterializedPredKey(cacheKey)
+	if !ok || cached.IsEmpty() {
+		t.Fatal("expected shared exact-range complement cache entry after materialization")
+	}
+	cached.Release()
+}
+
+func TestOrderedORMaterializedRangeLeafCosts_NullableComplementPrefersPositiveCacheKey(t *testing.T) {
+	db, _ := openTempDBUint64PtrInt(t, Options{
+		AnalyzeInterval:                         -1,
+		SnapshotMaterializedPredCacheMaxEntries: 16,
+	})
+	for i := 0; i < 64; i++ {
+		rec := &PtrIntRec{Name: fmt.Sprintf("nil_%02d", i), Rank: nil, Active: i%2 == 0}
+		if err := db.Set(uint64(i+1), rec); err != nil {
+			t.Fatalf("Set(nil_%02d): %v", i, err)
+		}
+	}
+	for i := 0; i < 40; i++ {
+		v := 0
+		rec := &PtrIntRec{Name: fmt.Sprintf("zero_%02d", i), Rank: &v, Active: i%2 == 0}
+		if err := db.Set(uint64(i+65), rec); err != nil {
+			t.Fatalf("Set(zero_%02d): %v", i, err)
+		}
+	}
+	for i := 1; i <= 9; i++ {
+		v := i
+		rec := &PtrIntRec{Name: fmt.Sprintf("rank_%02d", i), Rank: &v, Active: true}
+		if err := db.Set(uint64(i+105), rec); err != nil {
+			t.Fatalf("Set(rank_%02d): %v", i, err)
+		}
+	}
+	if err := db.RebuildIndex(); err != nil {
+		t.Fatalf("RebuildIndex: %v", err)
+	}
+
+	view := db.currentQueryViewForTests()
+	defer db.releaseQueryView(view)
+
+	expr := mustTestQIRExprForDB(t, db, qx.GTE("rank", 1))
+	candidate, ok := view.prepareScalarRangeRoutingCandidate(expr)
+	if !ok {
+		t.Fatalf("expected nullable range routing candidate")
+	}
+	if !candidate.plan.useComplement {
+		t.Fatalf("expected complement route for nullable ordered range")
+	}
+	compPlan, ok := candidate.core.prepareComplementMaterialization()
+	if !ok || !candidate.shouldPreferPositiveMaterializationForNullableComplement(compPlan) {
+		t.Fatalf("expected nullable ordered range to prefer positive-side materialization")
+	}
+	wantKey := view.materializedPredKeyForNormalizedScalarBound("rank", candidate.core.bound)
+	if wantKey.isZero() {
+		t.Fatalf("expected non-zero positive-side cache key")
+	}
+	gotKey, buildWork, checkWork, cachedCheckWork, ok := view.orderedORMaterializedRangeLeafCosts("name", expr)
+	if !ok {
+		t.Fatalf("expected ordered range leaf build info")
+	}
+	if gotKey != wantKey {
+		t.Fatalf("unexpected nullable ordered range cache key: got=%q want=%q", gotKey.String(), wantKey.String())
+	}
+	if buildWork == 0 || checkWork == 0 || cachedCheckWork == 0 {
+		t.Fatalf("expected non-zero nullable ordered range work metrics, got build=%d check=%d cached=%d", buildWork, checkWork, cachedCheckWork)
+	}
+}
+
+func TestOrderedORMaterializedExactRangePredicateCosts_NullableComplementPrefersPositiveCacheKey(t *testing.T) {
+	db, _ := openTempDBUint64PtrInt(t, Options{
+		AnalyzeInterval:                         -1,
+		SnapshotMaterializedPredCacheMaxEntries: 16,
+	})
+	for i := 0; i < 64; i++ {
+		rec := &PtrIntRec{Name: fmt.Sprintf("nil_%02d", i), Rank: nil, Active: i%2 == 0}
+		if err := db.Set(uint64(i+1), rec); err != nil {
+			t.Fatalf("Set(nil_%02d): %v", i, err)
+		}
+	}
+	for i := 0; i < 40; i++ {
+		v := 0
+		rec := &PtrIntRec{Name: fmt.Sprintf("zero_%02d", i), Rank: &v, Active: i%2 == 0}
+		if err := db.Set(uint64(i+65), rec); err != nil {
+			t.Fatalf("Set(zero_%02d): %v", i, err)
+		}
+	}
+	for i := 1; i <= 9; i++ {
+		v := i
+		rec := &PtrIntRec{Name: fmt.Sprintf("rank_%02d", i), Rank: &v, Active: true}
+		if err := db.Set(uint64(i+105), rec); err != nil {
+			t.Fatalf("Set(rank_%02d): %v", i, err)
+		}
+	}
+	if err := db.RebuildIndex(); err != nil {
+		t.Fatalf("RebuildIndex: %v", err)
+	}
+
+	view := db.currentQueryViewForTests()
+	defer db.releaseQueryView(view)
+
+	preds, ok := db.buildPredicatesOrderedWithMode(
+		[]qx.Expr{qx.GTE("rank", 1), qx.LTE("rank", 9)},
+		"name",
+		false,
+		4096,
+		0,
+		false,
+		false,
+	)
+	if !ok {
+		t.Fatalf("buildPredicatesOrderedWithMode: ok=false")
+	}
+	defer releasePredicates(preds)
+	if len(preds) != 1 {
+		t.Fatalf("unexpected predicate count: %d", len(preds))
+	}
+	if !preds[0].hasEffectiveBounds {
+		t.Fatalf("expected merged exact-range predicate")
+	}
+	wantKey := view.materializedPredKeyForExactScalarRange("rank", preds[0].effectiveBounds)
+	if wantKey.isZero() {
+		t.Fatalf("expected non-zero positive-side exact-range cache key")
+	}
+	gotKey, buildWork, checkWork, cachedCheckWork, ok := view.orderedORMaterializedExactRangePredicateCosts("name", preds[0])
+	if !ok {
+		t.Fatalf("expected ordered exact-range build info")
+	}
+	if gotKey != wantKey {
+		t.Fatalf("unexpected nullable ordered exact-range cache key: got=%q want=%q", gotKey.String(), wantKey.String())
+	}
+	if buildWork == 0 || checkWork == 0 || cachedCheckWork == 0 {
+		t.Fatalf("expected non-zero nullable ordered exact-range work metrics, got build=%d check=%d cached=%d", buildWork, checkWork, cachedCheckWork)
+	}
+}
+
+func TestMaterializeOrderedORPredicate_PreservesMergedExactRangeBounds(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{
+		AnalyzeInterval:                         -1,
+		SnapshotMaterializedPredCacheMaxEntries: 16,
+	})
+	seedGeneratedUint64Data(t, db, 256, func(i int) *Rec {
+		return &Rec{
+			Name:  fmt.Sprintf("u_%d", i),
+			Age:   18 + i,
+			Score: float64(i),
+		}
+	})
+	if err := db.RebuildIndex(); err != nil {
+		t.Fatalf("RebuildIndex: %v", err)
+	}
+
+	view := db.currentQueryViewForTests()
+	defer db.releaseQueryView(view)
+
+	preds, ok := db.buildPredicatesOrderedWithMode(
+		[]qx.Expr{qx.GTE("age", 30), qx.LTE("age", 60)},
+		"score",
+		false,
+		4096,
+		0,
+		false,
+		false,
+	)
+	if !ok {
+		t.Fatalf("buildPredicatesOrderedWithMode: ok=false")
+	}
+	defer releasePredicates(preds)
+	if len(preds) != 1 {
+		t.Fatalf("unexpected predicate count: %d", len(preds))
+	}
+	if !preds[0].hasEffectiveBounds {
+		t.Fatalf("expected merged exact-range predicate to retain effective bounds before materialization")
+	}
+	wantBounds := preds[0].effectiveBounds
+	wantKey := view.materializedPredKeyForExactScalarRange("age", wantBounds)
+	if wantKey.isZero() {
+		t.Fatalf("expected non-zero exact-range cache key")
+	}
+
+	if !view.materializeOrderedORPredicate(&preds[0]) {
+		t.Fatalf("expected merged exact-range predicate to materialize")
+	}
+	if !preds[0].hasEffectiveBounds {
+		t.Fatalf("expected materialized merged exact-range predicate to keep effective bounds")
+	}
+	if preds[0].effectiveBounds != wantBounds {
+		t.Fatalf("effectiveBounds changed after materialization")
+	}
+
+	gotKey, _, _, _, ok := view.orderedORMaterializedExactRangePredicateCosts("score", preds[0])
+	if !ok {
+		t.Fatalf("expected materialized merged exact-range predicate to remain routable as exact range")
+	}
+	if gotKey != wantKey {
+		t.Fatalf("unexpected exact-range cache key after materialization: got=%q want=%q", gotKey.String(), wantKey.String())
+	}
+}
+
+func TestBuildPredicatesOrdered_MergedExactComplementWarmCacheHitLoadsWhenOrderedEagerMaterializeDisabled(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{
+		AnalyzeInterval:                         -1,
+		SnapshotMaterializedPredCacheMaxEntries: 16,
+	})
+	seedGeneratedUint64Data(t, db, 256, func(i int) *Rec {
+		return &Rec{
+			Name:  fmt.Sprintf("u_%d", i),
+			Age:   18 + i,
+			Score: float64(i),
+		}
+	})
+	if err := db.RebuildIndex(); err != nil {
+		t.Fatalf("RebuildIndex: %v", err)
+	}
+
+	view := db.currentQueryViewForTests()
+	defer db.releaseQueryView(view)
+
+	leaves := []qx.Expr{qx.GTE("age", 30), qx.LTE("age", 250)}
+	warm, ok := db.buildPredicatesOrderedWithMode(leaves, "score", false, 4096, 0, false, false)
+	if !ok {
+		t.Fatalf("warm buildPredicatesOrderedWithMode: ok=false")
+	}
+	if len(warm) != 1 {
+		releasePredicates(warm)
+		t.Fatalf("unexpected warm predicate count: %d", len(warm))
+	}
+	if !warm[0].hasEffectiveBounds {
+		releasePredicates(warm)
+		t.Fatalf("expected merged exact-range warm predicate")
+	}
+	wantBounds := warm[0].effectiveBounds
+	cacheKey := view.materializedPredComplementKeyForExactScalarRange("age", warm[0].effectiveBounds)
+	if cacheKey.isZero() {
+		releasePredicates(warm)
+		t.Fatalf("expected non-zero exact-range complement cache key")
+	}
+	if !view.materializeOrderedORPredicate(&warm[0]) {
+		releasePredicates(warm)
+		t.Fatalf("expected merged exact-range warm predicate to materialize")
+	}
+	if !warm[0].hasEffectiveBounds {
+		releasePredicates(warm)
+		t.Fatalf("expected broad merged exact-range complement materialization to preserve effective bounds")
+	}
+	if warm[0].effectiveBounds != wantBounds {
+		releasePredicates(warm)
+		t.Fatalf("effectiveBounds changed after broad merged exact-range complement materialization")
+	}
+	gotKey, _, _, _, ok := view.orderedORMaterializedExactRangePredicateCosts("score", warm[0])
+	if !ok {
+		releasePredicates(warm)
+		t.Fatalf("expected broad merged exact-range complement materialization to remain routable as exact range")
+	}
+	if gotKey != cacheKey {
+		releasePredicates(warm)
+		t.Fatalf("unexpected exact-range complement cache key after materialization: got=%q want=%q", gotKey.String(), cacheKey.String())
+	}
+	releasePredicates(warm)
+	cached, ok := db.getSnapshot().loadMaterializedPredKey(cacheKey)
+	if !ok || cached.IsEmpty() {
+		t.Fatalf("expected shared merged exact-range complement cache entry after warm materialization")
+	}
+	cached.Release()
+
+	preds, ok := db.buildPredicatesOrderedWithMode(leaves, "score", false, 4096, 0, false, false)
+	if !ok {
+		t.Fatalf("buildPredicatesOrderedWithMode: ok=false")
+	}
+	defer releasePredicates(preds)
+	if len(preds) != 1 {
+		t.Fatalf("unexpected predicate count: %d", len(preds))
+	}
+	if preds[0].kind != predicateKindMaterializedNot {
+		t.Fatalf("expected merged exact-range complement warm cache hit, got kind=%v", preds[0].kind)
+	}
+	if preds[0].hasRuntimeRangeState() {
+		t.Fatalf("expected merged exact-range complement warm cache hit to avoid runtime range state")
+	}
+	if !preds[0].hasEffectiveBounds {
+		t.Fatalf("expected merged exact-range complement warm cache hit to preserve effective bounds")
+	}
+	if preds[0].effectiveBounds != wantBounds {
+		t.Fatalf("effectiveBounds changed on merged exact-range complement warm cache hit")
+	}
+	gotKey, _, _, _, ok = view.orderedORMaterializedExactRangePredicateCosts("score", preds[0])
+	if !ok {
+		t.Fatalf("expected merged exact-range complement warm cache hit to remain routable as exact range")
+	}
+	if gotKey != cacheKey {
+		t.Fatalf("unexpected exact-range complement cache key after warm cache hit: got=%q want=%q", gotKey.String(), cacheKey.String())
+	}
+}
+
+func TestBuildPredicatesOrdered_MergedExactNonBroadComplementWarmCacheHitLoadsWhenOrderedEagerMaterializeDisabled(t *testing.T) {
+	db, _ := openTempDBUint64PtrInt(t, Options{
+		AnalyzeInterval:                         -1,
+		SnapshotMaterializedPredCacheMaxEntries: 16,
+	})
+	for i := 0; i < 40; i++ {
+		v := 0
+		rec := &PtrIntRec{Name: fmt.Sprintf("zero_%02d", i), Rank: &v, Active: i%2 == 0}
+		if err := db.Set(uint64(i+1), rec); err != nil {
+			t.Fatalf("Set(zero_%02d): %v", i, err)
+		}
+	}
+	for i := 1; i <= 9; i++ {
+		v := i
+		rec := &PtrIntRec{Name: fmt.Sprintf("rank_%02d", i), Rank: &v, Active: true}
+		if err := db.Set(uint64(i+41), rec); err != nil {
+			t.Fatalf("Set(rank_%02d): %v", i, err)
+		}
+	}
+	if err := db.RebuildIndex(); err != nil {
+		t.Fatalf("RebuildIndex: %v", err)
+	}
+
+	view := db.currentQueryViewForTests()
+	defer db.releaseQueryView(view)
+
+	leaves := []qx.Expr{qx.GTE("rank", 1), qx.LTE("rank", 9)}
+	warm, ok := db.buildPredicatesOrderedWithMode(leaves, "name", false, 4096, 0, false, false)
+	if !ok {
+		t.Fatalf("warm buildPredicatesOrderedWithMode: ok=false")
+	}
+	if len(warm) != 1 {
+		releasePredicates(warm)
+		t.Fatalf("unexpected warm predicate count: %d", len(warm))
+	}
+	if !warm[0].hasEffectiveBounds {
+		releasePredicates(warm)
+		t.Fatalf("expected merged exact-range warm predicate")
+	}
+	cacheKey := view.materializedPredComplementKeyForExactScalarRange("rank", warm[0].effectiveBounds)
+	if cacheKey.isZero() {
+		releasePredicates(warm)
+		t.Fatalf("expected non-zero exact-range complement cache key")
+	}
+	if warm[0].isMaterializedLike() {
+		releasePredicates(warm)
+		t.Fatalf("expected first build to keep non-broad complement on runtime state")
+	}
+	if !view.materializeOrderedORPredicate(&warm[0]) {
+		releasePredicates(warm)
+		t.Fatalf("expected merged exact-range predicate to materialize")
+	}
+	if warm[0].kind != predicateKindMaterializedNot {
+		releasePredicates(warm)
+		t.Fatalf("expected complement-backed merged exact-range predicate, got kind=%v", warm[0].kind)
+	}
+	releasePredicates(warm)
+
+	cached, ok := db.getSnapshot().loadMaterializedPredKey(cacheKey)
+	if !ok || cached.IsEmpty() {
+		t.Fatalf("expected shared merged exact-range complement cache entry after warm materialization")
+	}
+	cached.Release()
+
+	preds, ok := db.buildPredicatesOrderedWithMode(leaves, "name", false, 4096, 0, false, false)
+	if !ok {
+		t.Fatalf("buildPredicatesOrderedWithMode: ok=false")
+	}
+	defer releasePredicates(preds)
+	if len(preds) != 1 {
+		t.Fatalf("unexpected predicate count: %d", len(preds))
+	}
+	if preds[0].kind != predicateKindMaterializedNot {
+		t.Fatalf("expected merged exact-range non-broad complement warm cache hit, got kind=%v", preds[0].kind)
+	}
+	if preds[0].hasRuntimeRangeState() {
+		t.Fatalf("expected merged exact-range non-broad complement warm cache hit to avoid runtime range state")
+	}
+}
+
+func TestBuildPredicatesOrdered_CoverOrderRangeMergedExactComplementWarmCacheHitLoadsWhenOrderedEagerMaterializeDisabled(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{
+		AnalyzeInterval:                         -1,
+		SnapshotMaterializedPredCacheMaxEntries: 16,
+	})
+	seedGeneratedUint64Data(t, db, 256, func(i int) *Rec {
+		return &Rec{
+			Name:  fmt.Sprintf("u_%d", i),
+			Age:   18 + i,
+			Score: float64(i),
+		}
+	})
+	if err := db.RebuildIndex(); err != nil {
+		t.Fatalf("RebuildIndex: %v", err)
+	}
+
+	view := db.currentQueryViewForTests()
+	defer db.releaseQueryView(view)
+
+	leaves := []qx.Expr{qx.GTE("age", 30), qx.LTE("age", 250)}
+	warm, ok := db.buildPredicatesOrderedWithMode(leaves, "score", false, 4096, 0, true, false)
+	if !ok {
+		t.Fatalf("warm buildPredicatesOrderedWithMode: ok=false")
+	}
+	if len(warm) != 1 {
+		releasePredicates(warm)
+		t.Fatalf("unexpected warm predicate count: %d", len(warm))
+	}
+	if !warm[0].hasEffectiveBounds {
+		releasePredicates(warm)
+		t.Fatalf("expected merged exact-range warm predicate")
+	}
+	wantBounds := warm[0].effectiveBounds
+	cacheKey := view.materializedPredComplementKeyForExactScalarRange("age", warm[0].effectiveBounds)
+	if cacheKey.isZero() {
+		releasePredicates(warm)
+		t.Fatalf("expected non-zero exact-range complement cache key")
+	}
+	if !view.materializeOrderedORPredicate(&warm[0]) {
+		releasePredicates(warm)
+		t.Fatalf("expected merged exact-range warm predicate to materialize")
+	}
+	releasePredicates(warm)
+	cached, ok := db.getSnapshot().loadMaterializedPredKey(cacheKey)
+	if !ok || cached.IsEmpty() {
+		t.Fatalf("expected shared merged exact-range complement cache entry after warm materialization")
+	}
+	cached.Release()
+
+	preds, ok := db.buildPredicatesOrderedWithMode(leaves, "score", false, 4096, 0, true, false)
+	if !ok {
+		t.Fatalf("buildPredicatesOrderedWithMode: ok=false")
+	}
+	defer releasePredicates(preds)
+	if len(preds) != 1 {
+		t.Fatalf("unexpected predicate count: %d", len(preds))
+	}
+	if preds[0].kind != predicateKindMaterializedNot {
+		t.Fatalf("expected merged exact-range complement warm cache hit in coverOrderRange mode, got kind=%v", preds[0].kind)
+	}
+	if preds[0].hasRuntimeRangeState() {
+		t.Fatalf("expected merged exact-range complement warm cache hit in coverOrderRange mode to avoid runtime range state")
+	}
+	if !preds[0].hasEffectiveBounds {
+		t.Fatalf("expected merged exact-range complement warm cache hit in coverOrderRange mode to preserve effective bounds")
+	}
+	if preds[0].effectiveBounds != wantBounds {
+		t.Fatalf("effectiveBounds changed on coverOrderRange merged exact-range complement warm cache hit")
+	}
+	gotKey, _, _, _, ok := view.orderedORMaterializedExactRangePredicateCosts("score", preds[0])
+	if !ok {
+		t.Fatalf("expected coverOrderRange merged exact-range complement warm cache hit to remain routable as exact range")
+	}
+	if gotKey != cacheKey {
+		t.Fatalf("unexpected exact-range complement cache key after coverOrderRange warm cache hit: got=%q want=%q", gotKey.String(), cacheKey.String())
+	}
+}
+
+func TestOrderedORMaterializedPrefixLeafBuildWork_RejectsBroadComplementPrefix(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{
+		AnalyzeInterval:                         -1,
+		SnapshotMaterializedPredCacheMaxEntries: 16,
+	})
+	seedGeneratedUint64Data(t, db, 256, func(i int) *Rec {
+		email := fmt.Sprintf("user%05d@example.com", i)
+		if i >= 224 {
+			email = fmt.Sprintf("other%05d@example.com", i)
+		}
+		return &Rec{
+			Name:  fmt.Sprintf("u_%d", i),
+			Email: email,
+			Score: float64(i),
+		}
+	})
+	if err := db.RebuildIndex(); err != nil {
+		t.Fatalf("RebuildIndex: %v", err)
+	}
+
+	view := db.currentQueryViewForTests()
+	defer db.releaseQueryView(view)
+
+	expr := mustTestQIRExprForDB(t, db, qx.PREFIX("email", "user"))
+	candidate, ok := view.prepareScalarRangeRoutingCandidate(expr)
+	if !ok {
+		t.Fatal("expected broad prefix routing candidate")
+	}
+	if !candidate.plan.useComplement {
+		t.Fatal("expected broad prefix candidate to choose complement probe")
+	}
+
+	cacheKey, buildWork, ok := view.orderedORMaterializedPrefixLeafBuildWork("score", expr)
+	if ok || buildWork != 0 || !cacheKey.isZero() {
+		t.Fatalf("expected broad prefix complement candidate to be rejected, got ok=%v build=%d key=%q", ok, buildWork, cacheKey.String())
+	}
+}
+
 func TestBuildPredicateWithMode_RuntimeExactUnionPromotesOnSecondMaterialize(t *testing.T) {
 	run := func(
 		t *testing.T,
@@ -1581,6 +2572,74 @@ func TestOrderedScalarRangeCanEagerMaterialize_RequiresPromotionOnlyForSmallOrde
 	}
 	if !view.orderedScalarRangeCanEagerMaterialize(orderedScalarRangeRouting{eagerMaterialize: true}) {
 		t.Fatalf("expected zero-cache-key ordered eager materialization to stay enabled")
+	}
+}
+
+func TestOrderedScalarRangeCanEagerMaterialize_UsesComplementPromotionKey(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{
+		AnalyzeInterval:                         -1,
+		SnapshotMaterializedPredCacheMaxEntries: 16,
+	})
+	seedGeneratedUint64Data(t, db, 256, func(i int) *Rec {
+		return &Rec{
+			Name:  fmt.Sprintf("u_%d", i),
+			Age:   18 + i,
+			Score: float64(i),
+		}
+	})
+	if err := db.RebuildIndex(); err != nil {
+		t.Fatalf("RebuildIndex: %v", err)
+	}
+
+	view := db.currentQueryViewForTests()
+	defer db.releaseQueryView(view)
+
+	preds, ok := db.buildPredicatesOrderedWithMode(
+		[]qx.Expr{qx.GTE("age", 30), qx.LTE("age", 250)},
+		"score",
+		false,
+		16,
+		0,
+		false,
+		false,
+	)
+	if !ok {
+		t.Fatalf("buildPredicatesOrderedWithMode: ok=false")
+	}
+	defer releasePredicates(preds)
+	if len(preds) != 1 {
+		t.Fatalf("unexpected predicate count: %d", len(preds))
+	}
+	if !preds[0].hasEffectiveBounds {
+		t.Fatalf("expected merged exact-range predicate")
+	}
+
+	route := view.orderedPredicateScalarRangeRouting(
+		preds[0],
+		16,
+		0,
+		view.snapshotUniverseCardinality(),
+	)
+	if !route.useComplement {
+		t.Fatalf("expected merged exact-range ordered route to use complement")
+	}
+	if route.cacheKey.isZero() || route.complementCacheKey.isZero() {
+		t.Fatalf("expected both exact-range cache keys to be non-zero")
+	}
+	if route.cacheKey == route.complementCacheKey {
+		t.Fatalf("expected complement promotion key to differ from positive-side cache key")
+	}
+	route.requirePromotion = true
+	route.eagerMaterialize = true
+
+	if view.orderedScalarRangeCanEagerMaterialize(route) {
+		t.Fatalf("expected cold complement promotion gate to stay disabled")
+	}
+	if !db.getSnapshot().shouldPromoteRuntimeMaterializedPredKey(route.complementCacheKey) {
+		t.Fatalf("expected warmed complement key to trigger promotion gate")
+	}
+	if !view.orderedScalarRangeCanEagerMaterialize(route) {
+		t.Fatalf("expected ordered eager materialization to honor complement promotion key")
 	}
 }
 

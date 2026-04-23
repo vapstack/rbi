@@ -202,6 +202,7 @@ var focusedRoutingQueryNames = []string{
 	"read_leaderboard_top_items",
 	"read_frontpage_candidate_keys",
 	"read_moderation_queue_keys",
+	"read_discovery_explore_keys",
 }
 
 func BenchmarkStressFocusedReadPerf(b *testing.B) {
@@ -376,7 +377,7 @@ func focusedBenchDBPath(b *testing.B) string {
 		return path
 	}
 
-	path := filepath.Join("..", "bench", "bench.db")
+	path := "stress.db"
 	if abs, err := filepath.Abs(path); err == nil {
 		path = abs
 	}
@@ -503,6 +504,12 @@ func reportFocusedReadTraceMetrics(b *testing.B, report *plannerTraceScopeReport
 	b.ReportMetric(report.AvgOrderScanWidth, "order_scan/op")
 	b.ReportMetric(report.AvgDedupeCount, "dedupe/op")
 	b.ReportMetric(report.AvgDurationUs, "trace_us/op")
+	b.ReportMetric(report.AvgPlannerUs, "planner_us/op")
+	b.ReportMetric(report.AvgPlannerPreds, "planner_preds/op")
+	b.ReportMetric(report.AvgPlannerHits, "planner_hits/op")
+	b.ReportMetric(report.AvgPlannerBuilds, "planner_builds/op")
+	b.ReportMetric(report.AvgPlannerExact, "planner_exact/op")
+	b.ReportMetric(report.AvgPlannerReused, "planner_reused/op")
 	b.ReportMetric(float64(report.RuntimeFallbacks), "runtime_fallbacks")
 	if len(report.PlanCounts) > 0 {
 		var maxPlan uint64

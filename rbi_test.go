@@ -1140,6 +1140,39 @@ func TestWrap_MissingPersistedIndex_LogsFullRebuildReason(t *testing.T) {
 	}
 }
 
+func TestWrap_MissingPersistedIndex_WithIndexStoreDisabled_SuppressesPersistedLogs(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "missing_index_store_disabled.db")
+
+	rawDB, err := bbolt.Open(path, 0o600, nil)
+	if err != nil {
+		t.Fatalf("bbolt.Open: %v", err)
+	}
+	defer func() { _ = rawDB.Close() }()
+
+	var logBuf bytes.Buffer
+	prevLogWriter := log.Writer()
+	log.SetOutput(&logBuf)
+	defer log.SetOutput(prevLogWriter)
+
+	db, err := New[uint64, Rec](rawDB, Options{DisableIndexStore: true})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	gotLog := logBuf.String()
+	if strings.Contains(gotLog, "persisted index missing") {
+		t.Fatalf("unexpected missing persisted index log with DisableIndexStore: %q", gotLog)
+	}
+	if strings.Contains(gotLog, "rbi: rebuilding index from bbolt") {
+		t.Fatalf("unexpected rebuild log with DisableIndexStore: %q", gotLog)
+	}
+	if strings.Contains(gotLog, "rbi: index build completed") {
+		t.Fatalf("unexpected rebuild completion log with DisableIndexStore: %q", gotLog)
+	}
+}
+
 func TestWrap_PersistedIndexSchemaNarrowing_LogsFullRebuildWhenNoCompatibleIndexes(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "schema_mismatch.db")

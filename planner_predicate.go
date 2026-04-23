@@ -1521,6 +1521,24 @@ func (qv *queryView[K, V]) buildPredRangeCandidateWithMode(e qir.Expr, fm *field
 }
 
 func (qv *queryView[K, V]) buildPredRangeCandidateWithColdMode(e qir.Expr, fm *field, ov fieldOverlay, allowMaterialize bool, lazyColdMaterialize bool) (predicate, bool) {
+	return qv.buildPredRangeCandidateWithColdModeAndWarmLoad(
+		e,
+		fm,
+		ov,
+		allowMaterialize,
+		lazyColdMaterialize,
+		true,
+	)
+}
+
+func (qv *queryView[K, V]) buildPredRangeCandidateWithColdModeAndWarmLoad(
+	e qir.Expr,
+	fm *field,
+	ov fieldOverlay,
+	allowMaterialize bool,
+	lazyColdMaterialize bool,
+	allowWarmLoad bool,
+) (predicate, bool) {
 	var core preparedScalarRangePredicate[K, V]
 	pred, done, ok := qv.initPreparedScalarRangePredicate(&core, e, fm)
 	if !ok {
@@ -1529,7 +1547,7 @@ func (qv *queryView[K, V]) buildPredRangeCandidateWithColdMode(e qir.Expr, fm *f
 	if done {
 		return pred, true
 	}
-	return core.buildFromOverlay(ov, allowMaterialize, lazyColdMaterialize)
+	return core.buildFromOverlay(ov, allowMaterialize, lazyColdMaterialize, allowWarmLoad)
 }
 
 func (qv *queryView[K, V]) buildPredMaterializedCandidate(e qir.Expr) (predicate, bool) {
@@ -3103,11 +3121,13 @@ func setPredicateMaterializedNot(p *predicate, ids posting.List) {
 		setPredicateAlwaysTrue(p)
 		return
 	}
+	estCard := p.estCard
 	releasePredicateOwnedState(p)
 	p.kind = predicateKindMaterializedNot
 	p.iterKind = predicateIterNone
 	p.ids = ids
 	p.releaseIDs = true
+	p.estCard = estCard
 	p.alwaysTrue = false
 	p.alwaysFalse = false
 }
@@ -3165,13 +3185,24 @@ type orderedScalarRangeRouting struct {
 	cacheKey           materializedPredKey
 	complementCacheKey materializedPredKey
 	requirePromotion   bool
+	forceComplement    bool
+	useComplement      bool
 }
 
 func (qv *queryView[K, V]) orderedScalarRangeRouting(e qir.Expr, orderedWindow int, orderedOffset uint64, universe uint64) orderedScalarRangeRouting {
-	if universe == 0 || e.Not || e.FieldOrdinal < 0 || !isNumericRangeOp(e.Op) {
+	return qv.orderedPredicateScalarRangeRouting(predicate{expr: e}, orderedWindow, orderedOffset, universe)
+}
+
+func (qv *queryView[K, V]) orderedPredicateScalarRangeRouting(
+	p predicate,
+	orderedWindow int,
+	orderedOffset uint64,
+	universe uint64,
+) orderedScalarRangeRouting {
+	if universe == 0 || p.expr.Not || p.expr.FieldOrdinal < 0 || !isNumericRangeOp(p.expr.Op) {
 		return orderedScalarRangeRouting{}
 	}
-	candidate, ok := qv.prepareScalarRangeRoutingCandidate(e)
+	candidate, ok := qv.preparePredicateScalarRangeRoutingCandidate(p)
 	if !ok || !candidate.numeric {
 		return orderedScalarRangeRouting{}
 	}
@@ -3180,12 +3211,30 @@ func (qv *queryView[K, V]) orderedScalarRangeRouting(e qir.Expr, orderedWindow i
 		eagerMaterialize:   candidate.plan.orderedEagerMaterializeUseful(orderedWindow, universe),
 		cacheKey:           candidate.core.sharedReuse.cacheKey,
 		complementCacheKey: candidate.core.complementCacheKey,
+		useComplement:      candidate.plan.useComplement,
 	}
 	expectedRows := orderedPredicateExpectedRows(orderedWindow, candidate.plan.est, universe)
 	if orderedOffset == 0 && expectedRows > 0 && expectedRows < candidate.plan.est {
 		route.requirePromotion = satMulUint64(expectedRows, 2) < candidate.plan.est
 	}
 	route.broadComplement = candidate.broadComplementCardinality(universe)
+	route.forceComplement = candidate.plan.useComplement &&
+		candidate.core.qv.nilFieldOverlayForExpr(candidate.core.expr).lookupCardinality(nilIndexEntryKey) > 0
+	return route
+}
+
+func (qv *queryView[K, V]) orderedScalarRangeRoutingForBuild(
+	p predicate,
+	predAllowMaterialize bool,
+	orderedWindow int,
+	orderedOffset uint64,
+	universe uint64,
+	routeUniverse uint64,
+) orderedScalarRangeRouting {
+	route := qv.orderedPredicateScalarRangeRouting(p, orderedWindow, orderedOffset, routeUniverse)
+	if !predAllowMaterialize {
+		route = qv.orderedPredicateScalarRangeRouting(p, orderedWindow, orderedOffset, universe)
+	}
 	return route
 }
 
@@ -3193,18 +3242,28 @@ func (qv *queryView[K, V]) orderedScalarRangeCanEagerMaterialize(route orderedSc
 	if !route.eagerMaterialize {
 		return false
 	}
-	if !route.requirePromotion || qv.snap == nil || route.cacheKey.isZero() {
+	promotionKey := route.cacheKey
+	if route.useComplement && !route.complementCacheKey.isZero() {
+		promotionKey = route.complementCacheKey
+	}
+	if !route.requirePromotion || qv.snap == nil || promotionKey.isZero() {
 		return true
 	}
-	return qv.snap.shouldPromoteRuntimeMaterializedPredKey(route.cacheKey)
+	return qv.snap.shouldPromoteRuntimeMaterializedPredKey(promotionKey)
 }
 
 func overlayRangeEmpty(br overlayRange) bool {
 	return br.baseStart >= br.baseEnd
 }
 
-func (qv *queryView[K, V]) tryMaterializeBroadRangeComplementPredicateForOrdered(p *predicate, broadComplement bool, universe uint64, orderedWindow int) bool {
-	if p == nil || !broadComplement {
+func (qv *queryView[K, V]) tryMaterializeBroadRangeComplementPredicateForOrdered(
+	p *predicate,
+	broadComplement bool,
+	universe uint64,
+	orderedWindow int,
+	force bool,
+) bool {
+	if p == nil || (!broadComplement && !force) {
 		return false
 	}
 
@@ -3220,6 +3279,9 @@ func (qv *queryView[K, V]) tryMaterializeBroadRangeComplementPredicateForOrdered
 	if !ok {
 		return false
 	}
+	if force && !cacheHit && !empty && candidate.shouldPreferPositiveMaterializationForNullableComplement(plan) {
+		return qv.materializePositiveScalarRangePredicateWithCandidate(p, candidate)
+	}
 	if cacheHit {
 		setPredicateMaterializedNot(p, cached)
 		return true
@@ -3227,6 +3289,17 @@ func (qv *queryView[K, V]) tryMaterializeBroadRangeComplementPredicateForOrdered
 	if empty {
 		storeEmptyScalarComplementMaterialization(plan)
 		setPredicateAlwaysTrue(p)
+		return true
+	}
+	if force {
+		ids := candidate.core.materializeComplement(plan)
+		if ids.IsEmpty() {
+			storeEmptyScalarComplementMaterialization(plan)
+			setPredicateAlwaysTrue(p)
+			return true
+		}
+		ids = plan.sharedReuse.share(ids)
+		setPredicateMaterializedNot(p, ids)
 		return true
 	}
 	if qv.snap == nil || candidate.core.complementCacheKey.isZero() {
@@ -3260,6 +3333,25 @@ func (qv *queryView[K, V]) tryMaterializeBroadRangeComplementPredicateForOrdered
 	return true
 }
 
+func (qv *queryView[K, V]) loadWarmComplementPredicateForOrdered(p *predicate, useComplement bool) bool {
+	if p == nil || !useComplement {
+		return false
+	}
+	candidate, ok := qv.preparePredicateScalarRangeRoutingCandidate(*p)
+	if !ok {
+		return false
+	}
+	plan, cached, cacheHit, _, ok := candidate.core.loadComplementMaterialization()
+	if !ok || !cacheHit {
+		return false
+	}
+	if candidate.shouldPreferPositiveMaterializationForNullableComplement(plan) {
+		return false
+	}
+	setPredicateMaterializedNot(p, cached)
+	return true
+}
+
 func (qv *queryView[K, V]) isPositiveOrderedNumericRangeLeaf(e qir.Expr, orderField string) bool {
 	if e.Not || e.FieldOrdinal < 0 || qv.fieldNameByExpr(e) == orderField || !isNumericRangeOp(e.Op) {
 		return false
@@ -3282,6 +3374,22 @@ func (qv *queryView[K, V]) buildMergedNumericRangePredicateWithColdMode(
 	allowMaterialize bool,
 	lazyColdMaterialize bool,
 ) (predicate, bool) {
+	return qv.buildMergedNumericRangePredicateWithColdModeAndWarmLoad(
+		e,
+		bounds,
+		allowMaterialize,
+		lazyColdMaterialize,
+		true,
+	)
+}
+
+func (qv *queryView[K, V]) buildMergedNumericRangePredicateWithColdModeAndWarmLoad(
+	e qir.Expr,
+	bounds rangeBounds,
+	allowMaterialize bool,
+	lazyColdMaterialize bool,
+	allowWarmLoad bool,
+) (predicate, bool) {
 	fm := qv.fieldMetaByExpr(e)
 	if fm == nil || fm.Slice {
 		return predicate{}, false
@@ -3293,7 +3401,7 @@ func (qv *queryView[K, V]) buildMergedNumericRangePredicateWithColdMode(
 		return predicate{}, false
 	}
 	if ov.chunked != nil {
-		p, ok := core.buildFromOverlay(ov, allowMaterialize, lazyColdMaterialize)
+		p, ok := core.buildFromOverlay(ov, allowMaterialize, lazyColdMaterialize, allowWarmLoad)
 		if ok {
 			p.effectiveBounds = bounds
 			p.hasEffectiveBounds = true
@@ -3304,12 +3412,86 @@ func (qv *queryView[K, V]) buildMergedNumericRangePredicateWithColdMode(
 	if slice == nil {
 		return predicate{}, false
 	}
-	p, ok := core.buildFromSlice(*slice, allowMaterialize, lazyColdMaterialize)
+	p, ok := core.buildFromSlice(*slice, allowMaterialize, lazyColdMaterialize, allowWarmLoad)
 	if ok {
 		p.effectiveBounds = bounds
 		p.hasEffectiveBounds = true
 	}
 	return p, ok
+}
+
+func (qv *queryView[K, V]) initOrderedPredicateExpectedContainsCalls(
+	p *predicate,
+	orderedWindow int,
+	universe uint64,
+) {
+	if p == nil || orderedWindow <= 0 || universe == 0 {
+		return
+	}
+	if p.baseRangeState != nil {
+		p.setExpectedContainsCalls(
+			orderedBaseRangeExpectedContainsCalls(p.baseRangeState, orderedWindow, universe),
+		)
+	}
+	if p.postsAnyState != nil {
+		p.postsAnyState.setExpectedContainsCalls(
+			clampUint64ToInt(orderedPredicateExpectedRows(orderedWindow, p.estCard, universe)),
+		)
+	}
+}
+
+func (qv *queryView[K, V]) postprocessBuiltOrderedPredicate(
+	p *predicate,
+	orderedRoute orderedScalarRangeRouting,
+	predAllowMaterialize bool,
+	orderedEagerMaterialize bool,
+	orderRangeDeferred bool,
+	allowWarmOrderedRangeLoad bool,
+	orderedWindow int,
+	universe uint64,
+) {
+	if p == nil {
+		return
+	}
+	qv.initOrderedPredicateExpectedContainsCalls(p, orderedWindow, universe)
+	if orderRangeDeferred || !p.hasRuntimeRangeState() {
+		return
+	}
+	// Warm-cache reloads are cheap and should stay available even when ordered
+	// build-time eager materialization is intentionally disabled for this shape.
+	if allowWarmOrderedRangeLoad &&
+		qv.loadWarmComplementPredicateForOrdered(p, orderedRoute.useComplement) {
+		return
+	}
+	if orderedRoute.forceComplement {
+		qv.tryMaterializeBroadRangeComplementPredicateForOrdered(
+			p,
+			orderedRoute.broadComplement,
+			universe,
+			orderedWindow,
+			true,
+		)
+		return
+	}
+	if orderedEagerMaterialize {
+		qv.tryMaterializeBroadRangeComplementPredicateForOrdered(
+			p,
+			orderedRoute.broadComplement,
+			universe,
+			orderedWindow,
+			false,
+		)
+		return
+	}
+	if !predAllowMaterialize && orderedRoute.requirePromotion {
+		qv.tryMaterializeBroadRangeComplementPredicateForOrdered(
+			p,
+			orderedRoute.broadComplement,
+			universe,
+			orderedWindow,
+			false,
+		)
+	}
 }
 
 func (qv *queryView[K, V]) buildPredicatesOrderedWithMode(leaves []qir.Expr, orderField string, allowMaterialize bool, orderedWindow int, orderedOffset uint64, coverOrderRange bool, allowOrderedEagerMaterialize bool) (predicateSet, bool) {
@@ -3324,6 +3506,8 @@ func (qv *queryView[K, V]) buildPredicatesOrderedWithMode(leaves []qir.Expr, ord
 	if !allowMaterialize {
 		universe = qv.snapshotUniverseCardinality()
 	}
+	allowWarmOrderedRangeLoad := allowMaterialize || allowOrderedEagerMaterialize || !coverOrderRange || orderedOffset == 0
+	allowWarmScalarRangeLoad := allowWarmOrderedRangeLoad
 	routeUniverse := universe
 	if routeUniverse == 0 && orderedWindow > 0 {
 		routeUniverse = qv.snapshotUniverseCardinality()
@@ -3365,21 +3549,49 @@ func (qv *queryView[K, V]) buildPredicatesOrderedWithMode(leaves []qir.Expr, ord
 					if merged.first != i {
 						continue
 					}
-					p, ok := qv.buildMergedNumericRangePredicateWithColdMode(merged.expr, merged.bounds, allowMaterialize, true)
+					mergedPred := predicate{
+						expr:               merged.expr,
+						hasEffectiveBounds: true,
+						effectiveBounds:    merged.bounds,
+					}
+					predAllowMaterialize := allowMaterialize
+					orderedRoute := qv.orderedScalarRangeRoutingForBuild(
+						mergedPred,
+						predAllowMaterialize,
+						orderedWindow,
+						orderedOffset,
+						universe,
+						routeUniverse,
+					)
+					orderedEagerMaterialize := false
+					if !predAllowMaterialize &&
+						allowOrderedEagerMaterialize &&
+						qv.orderedScalarRangeCanEagerMaterialize(orderedRoute) {
+						predAllowMaterialize = true
+						orderedEagerMaterialize = true
+					}
+					lazyColdMaterialize := predAllowMaterialize && !orderedRoute.eagerMaterialize
+					p, ok := qv.buildMergedNumericRangePredicateWithColdModeAndWarmLoad(
+						merged.expr,
+						merged.bounds,
+						predAllowMaterialize,
+						lazyColdMaterialize,
+						allowWarmScalarRangeLoad,
+					)
 					if !ok {
 						preds.Release()
 						return predicateSet{}, false
 					}
-					if p.baseRangeState != nil && orderedWindow > 0 && universe > 0 {
-						p.setExpectedContainsCalls(
-							orderedBaseRangeExpectedContainsCalls(p.baseRangeState, orderedWindow, universe),
-						)
-					}
-					if p.postsAnyState != nil && orderedWindow > 0 && universe > 0 {
-						p.postsAnyState.setExpectedContainsCalls(
-							clampUint64ToInt(orderedPredicateExpectedRows(orderedWindow, p.estCard, universe)),
-						)
-					}
+					qv.postprocessBuiltOrderedPredicate(
+						&p,
+						orderedRoute,
+						predAllowMaterialize,
+						orderedEagerMaterialize,
+						false,
+						allowWarmOrderedRangeLoad,
+						orderedWindow,
+						universe,
+					)
 					preds.Append(p)
 					continue
 				}
@@ -3400,27 +3612,26 @@ func (qv *queryView[K, V]) buildPredicatesOrderedWithMode(leaves []qir.Expr, ord
 			orderedEagerMaterialize = true
 		}
 		lazyColdMaterialize := predAllowMaterialize && !orderedRoute.eagerMaterialize
-		p, ok := qv.buildPredicateWithColdMode(e, predAllowMaterialize, lazyColdMaterialize)
+		p, ok := qv.buildPredicateWithColdModeAndWarmLoad(
+			e,
+			predAllowMaterialize,
+			lazyColdMaterialize,
+			allowWarmScalarRangeLoad,
+		)
 		if !ok {
 			preds.Release()
 			return predicateSet{}, false
 		}
-		if p.baseRangeState != nil && orderedWindow > 0 && universe > 0 {
-			p.setExpectedContainsCalls(
-				orderedBaseRangeExpectedContainsCalls(p.baseRangeState, orderedWindow, universe),
-			)
-		}
-		if p.postsAnyState != nil && orderedWindow > 0 && universe > 0 {
-			p.postsAnyState.setExpectedContainsCalls(
-				clampUint64ToInt(orderedPredicateExpectedRows(orderedWindow, p.estCard, universe)),
-			)
-		}
-		if !orderRangeDeferred && orderedEagerMaterialize &&
-			p.hasRuntimeRangeState() {
-			qv.tryMaterializeBroadRangeComplementPredicateForOrdered(&p, orderedRoute.broadComplement, universe, orderedWindow)
-		} else if !predAllowMaterialize && !orderRangeDeferred {
-			qv.tryMaterializeBroadRangeComplementPredicateForOrdered(&p, orderedRoute.broadComplement, universe, orderedWindow)
-		}
+		qv.postprocessBuiltOrderedPredicate(
+			&p,
+			orderedRoute,
+			predAllowMaterialize,
+			orderedEagerMaterialize,
+			orderRangeDeferred,
+			allowWarmOrderedRangeLoad,
+			orderedWindow,
+			universe,
+		)
 		preds.Append(p)
 	}
 	return preds, true
@@ -3449,6 +3660,8 @@ func (qv *queryView[K, V]) buildPredicatesOrderedWithModeBuf(
 	if !allowMaterialize {
 		universe = qv.snapshotUniverseCardinality()
 	}
+	allowWarmOrderedRangeLoad := allowMaterialize || allowOrderedEagerMaterialize || !coverOrderRange || orderedOffset == 0
+	allowWarmScalarRangeLoad := allowWarmOrderedRangeLoad
 	routeUniverse := universe
 	if routeUniverse == 0 && orderedWindow > 0 {
 		routeUniverse = qv.snapshotUniverseCardinality()
@@ -3489,21 +3702,49 @@ func (qv *queryView[K, V]) buildPredicatesOrderedWithModeBuf(
 					if merged.first != i {
 						continue
 					}
-					p, ok := qv.buildMergedNumericRangePredicateWithColdMode(merged.expr, merged.bounds, allowMaterialize, true)
+					mergedPred := predicate{
+						expr:               merged.expr,
+						hasEffectiveBounds: true,
+						effectiveBounds:    merged.bounds,
+					}
+					predAllowMaterialize := allowMaterialize
+					orderedRoute := qv.orderedScalarRangeRoutingForBuild(
+						mergedPred,
+						predAllowMaterialize,
+						orderedWindow,
+						orderedOffset,
+						universe,
+						routeUniverse,
+					)
+					orderedEagerMaterialize := false
+					if !predAllowMaterialize &&
+						allowOrderedEagerMaterialize &&
+						qv.orderedScalarRangeCanEagerMaterialize(orderedRoute) {
+						predAllowMaterialize = true
+						orderedEagerMaterialize = true
+					}
+					lazyColdMaterialize := predAllowMaterialize && !orderedRoute.eagerMaterialize
+					p, ok := qv.buildMergedNumericRangePredicateWithColdModeAndWarmLoad(
+						merged.expr,
+						merged.bounds,
+						predAllowMaterialize,
+						lazyColdMaterialize,
+						allowWarmScalarRangeLoad,
+					)
 					if !ok {
 						preds.Release()
 						return predicateSet{}, false
 					}
-					if p.baseRangeState != nil && orderedWindow > 0 && universe > 0 {
-						p.setExpectedContainsCalls(
-							orderedBaseRangeExpectedContainsCalls(p.baseRangeState, orderedWindow, universe),
-						)
-					}
-					if p.postsAnyState != nil && orderedWindow > 0 && universe > 0 {
-						p.postsAnyState.setExpectedContainsCalls(
-							clampUint64ToInt(orderedPredicateExpectedRows(orderedWindow, p.estCard, universe)),
-						)
-					}
+					qv.postprocessBuiltOrderedPredicate(
+						&p,
+						orderedRoute,
+						predAllowMaterialize,
+						orderedEagerMaterialize,
+						false,
+						allowWarmOrderedRangeLoad,
+						orderedWindow,
+						universe,
+					)
 					preds.Append(p)
 					continue
 				}
@@ -3524,27 +3765,26 @@ func (qv *queryView[K, V]) buildPredicatesOrderedWithModeBuf(
 			orderedEagerMaterialize = true
 		}
 		lazyColdMaterialize := predAllowMaterialize && !orderedRoute.eagerMaterialize
-		p, ok := qv.buildPredicateWithColdMode(e, predAllowMaterialize, lazyColdMaterialize)
+		p, ok := qv.buildPredicateWithColdModeAndWarmLoad(
+			e,
+			predAllowMaterialize,
+			lazyColdMaterialize,
+			allowWarmScalarRangeLoad,
+		)
 		if !ok {
 			preds.Release()
 			return predicateSet{}, false
 		}
-		if p.baseRangeState != nil && orderedWindow > 0 && universe > 0 {
-			p.setExpectedContainsCalls(
-				orderedBaseRangeExpectedContainsCalls(p.baseRangeState, orderedWindow, universe),
-			)
-		}
-		if p.postsAnyState != nil && orderedWindow > 0 && universe > 0 {
-			p.postsAnyState.setExpectedContainsCalls(
-				clampUint64ToInt(orderedPredicateExpectedRows(orderedWindow, p.estCard, universe)),
-			)
-		}
-		if !orderRangeDeferred && orderedEagerMaterialize &&
-			p.hasRuntimeRangeState() {
-			qv.tryMaterializeBroadRangeComplementPredicateForOrdered(&p, orderedRoute.broadComplement, universe, orderedWindow)
-		} else if !predAllowMaterialize && !orderRangeDeferred {
-			qv.tryMaterializeBroadRangeComplementPredicateForOrdered(&p, orderedRoute.broadComplement, universe, orderedWindow)
-		}
+		qv.postprocessBuiltOrderedPredicate(
+			&p,
+			orderedRoute,
+			predAllowMaterialize,
+			orderedEagerMaterialize,
+			orderRangeDeferred,
+			allowWarmOrderedRangeLoad,
+			orderedWindow,
+			universe,
+		)
 		preds.Append(p)
 	}
 	return preds, true
@@ -3555,6 +3795,15 @@ func (qv *queryView[K, V]) buildPredicateWithMode(e qir.Expr, allowMaterialize b
 }
 
 func (qv *queryView[K, V]) buildPredicateWithColdMode(e qir.Expr, allowMaterialize bool, lazyColdMaterialize bool) (predicate, bool) {
+	return qv.buildPredicateWithColdModeAndWarmLoad(e, allowMaterialize, lazyColdMaterialize, true)
+}
+
+func (qv *queryView[K, V]) buildPredicateWithColdModeAndWarmLoad(
+	e qir.Expr,
+	allowMaterialize bool,
+	lazyColdMaterialize bool,
+	allowWarmLoad bool,
+) (predicate, bool) {
 	if e.Op == qir.OpNOOP {
 		if e.Not {
 			return predicate{expr: e, alwaysFalse: true}, true
@@ -3577,13 +3826,27 @@ func (qv *queryView[K, V]) buildPredicateWithColdMode(e qir.Expr, allowMateriali
 			return predicate{}, false
 		}
 		if ov.chunked != nil {
-			return qv.buildPredRangeCandidateWithColdMode(e, fm, ov, allowMaterialize, lazyColdMaterialize)
+			return qv.buildPredRangeCandidateWithColdModeAndWarmLoad(
+				e,
+				fm,
+				ov,
+				allowMaterialize,
+				lazyColdMaterialize,
+				allowWarmLoad,
+			)
 		}
 		slice := qv.snapshotFieldIndexSliceForExpr(e)
 		if slice == nil {
 			return predicate{}, false
 		}
-		return qv.buildPredRangeWithColdMode(e, fm, slice, allowMaterialize, lazyColdMaterialize)
+		return qv.buildPredRangeWithColdModeAndWarmLoad(
+			e,
+			fm,
+			slice,
+			allowMaterialize,
+			lazyColdMaterialize,
+			allowWarmLoad,
+		)
 	}
 	p, ok := qv.buildPredicateCandidate(e)
 	if !ok {
@@ -3593,6 +3856,24 @@ func (qv *queryView[K, V]) buildPredicateWithColdMode(e qir.Expr, allowMateriali
 }
 
 func (qv *queryView[K, V]) buildPredRangeWithColdMode(e qir.Expr, fm *field, slice *[]index, allowMaterialize bool, lazyColdMaterialize bool) (predicate, bool) {
+	return qv.buildPredRangeWithColdModeAndWarmLoad(
+		e,
+		fm,
+		slice,
+		allowMaterialize,
+		lazyColdMaterialize,
+		true,
+	)
+}
+
+func (qv *queryView[K, V]) buildPredRangeWithColdModeAndWarmLoad(
+	e qir.Expr,
+	fm *field,
+	slice *[]index,
+	allowMaterialize bool,
+	lazyColdMaterialize bool,
+	allowWarmLoad bool,
+) (predicate, bool) {
 	var core preparedScalarRangePredicate[K, V]
 	pred, done, ok := qv.initPreparedScalarRangePredicate(&core, e, fm)
 	if !ok {
@@ -3601,7 +3882,7 @@ func (qv *queryView[K, V]) buildPredRangeWithColdMode(e qir.Expr, fm *field, sli
 	if done {
 		return pred, true
 	}
-	return core.buildFromSlice(*slice, allowMaterialize, lazyColdMaterialize)
+	return core.buildFromSlice(*slice, allowMaterialize, lazyColdMaterialize, allowWarmLoad)
 }
 
 type baseRangeProbe struct {

@@ -56,6 +56,7 @@ type plannerTraceStats struct {
 
 	totalDurationNS      uint64
 	maxDurationNS        uint64
+	totalPlannerNS       uint64
 	totalRowsExamined    uint64
 	maxRowsExamined      uint64
 	totalRowsMatched     uint64
@@ -74,6 +75,11 @@ type plannerTraceStats struct {
 	maxOrderScanWidth    uint64
 	totalDedupeCount     uint64
 	maxDedupeCount       uint64
+	totalPlannerPreds    uint64
+	totalPlannerHits     uint64
+	totalPlannerBuilds   uint64
+	totalPlannerExact    uint64
+	totalPlannerReused   uint64
 	planCounts           map[string]uint64
 	earlyStopCounts      map[string]uint64
 	orRouteCounts        map[string]uint64
@@ -124,6 +130,12 @@ type plannerTraceScopeReport struct {
 	MaxOrderScanWidth uint64            `json:"max_order_scan_width"`
 	AvgDedupeCount    float64           `json:"avg_dedupe_count"`
 	MaxDedupeCount    uint64            `json:"max_dedupe_count"`
+	AvgPlannerUs      float64           `json:"avg_planner_analysis_us"`
+	AvgPlannerPreds   float64           `json:"avg_planner_predicates"`
+	AvgPlannerHits    float64           `json:"avg_planner_cache_hits"`
+	AvgPlannerBuilds  float64           `json:"avg_planner_builds"`
+	AvgPlannerExact   float64           `json:"avg_planner_exact_ranges"`
+	AvgPlannerReused  float64           `json:"avg_planner_reused_ranges"`
 	PlanCounts        map[string]uint64 `json:"plan_counts,omitempty"`
 	EarlyStopCounts   map[string]uint64 `json:"early_stop_counts,omitempty"`
 	ORRouteCounts     map[string]uint64 `json:"or_route_counts,omitempty"`
@@ -341,6 +353,7 @@ func (s *plannerTraceStats) observe(ev rbi.TraceEvent) {
 	if durationNS > s.maxDurationNS {
 		s.maxDurationNS = durationNS
 	}
+	s.totalPlannerNS += uint64(ev.ORRoute.PlannerAnalysisTime.Nanoseconds())
 	s.totalRowsExamined += ev.RowsExamined
 	if ev.RowsExamined > s.maxRowsExamined {
 		s.maxRowsExamined = ev.RowsExamined
@@ -375,6 +388,11 @@ func (s *plannerTraceStats) observe(ev rbi.TraceEvent) {
 	if ev.DedupeCount > s.maxDedupeCount {
 		s.maxDedupeCount = ev.DedupeCount
 	}
+	s.totalPlannerPreds += ev.ORRoute.PlannerPredicates
+	s.totalPlannerHits += ev.ORRoute.PlannerCacheHits
+	s.totalPlannerBuilds += ev.ORRoute.PlannerBuilds
+	s.totalPlannerExact += ev.ORRoute.PlannerExactRanges
+	s.totalPlannerReused += ev.ORRoute.PlannerReusedRanges
 
 	if ev.Plan != "" {
 		if s.planCounts == nil {
@@ -465,6 +483,12 @@ func (s *plannerTraceStats) report() plannerTraceScopeReport {
 		MaxOrderScanWidth: s.maxOrderScanWidth,
 		AvgDedupeCount:    float64(s.totalDedupeCount) / n,
 		MaxDedupeCount:    s.maxDedupeCount,
+		AvgPlannerUs:      nsToUs(float64(s.totalPlannerNS) / n),
+		AvgPlannerPreds:   float64(s.totalPlannerPreds) / n,
+		AvgPlannerHits:    float64(s.totalPlannerHits) / n,
+		AvgPlannerBuilds:  float64(s.totalPlannerBuilds) / n,
+		AvgPlannerExact:   float64(s.totalPlannerExact) / n,
+		AvgPlannerReused:  float64(s.totalPlannerReused) / n,
 		PlanCounts:        cloneStringCounts(s.planCounts),
 		EarlyStopCounts:   cloneStringCounts(s.earlyStopCounts),
 		ORRouteCounts:     cloneStringCounts(s.orRouteCounts),
