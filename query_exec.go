@@ -1177,6 +1177,155 @@ func orderNilTailField(fm *field, field string, bounds rangeBounds) string {
 	return field
 }
 
+func (qv *queryView[K, V]) validateOrderBasicBaseOps(baseOps []qir.Expr) error {
+	for _, op := range baseOps {
+		if err := qv.validateOrderBasicExpr(op); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// Validate operator/value compatibility without evaluating postings on paths
+// that are already proven empty by contradictory order-field predicates.
+func (qv *queryView[K, V]) validateOrderBasicExpr(e qir.Expr) error {
+	switch e.Op {
+	case qir.OpNOOP:
+		if e.FieldOrdinal != qir.NoFieldOrdinal || e.Value != nil || len(e.Operands) != 0 {
+			return fmt.Errorf("%w: invalid expression, op: %v", ErrInvalidQuery, e.Op)
+		}
+		return nil
+	case qir.OpAND:
+		if len(e.Operands) == 0 {
+			return fmt.Errorf("%w: empty AND expression", ErrInvalidQuery)
+		}
+		for _, op := range e.Operands {
+			if err := qv.validateOrderBasicExpr(op); err != nil {
+				return err
+			}
+		}
+		return nil
+	case qir.OpOR:
+		if len(e.Operands) == 0 {
+			return fmt.Errorf("%w: empty OR expression", ErrInvalidQuery)
+		}
+		for _, op := range e.Operands {
+			if err := qv.validateOrderBasicExpr(op); err != nil {
+				return err
+			}
+		}
+		return nil
+	default:
+		return qv.validateOrderBasicSimpleExpr(e)
+	}
+}
+
+func (qv *queryView[K, V]) validateOrderBasicSimpleExpr(e qir.Expr) error {
+	if e.FieldOrdinal < 0 {
+		return fmt.Errorf("%w: invalid expression, op: %v", ErrInvalidQuery, e.Op)
+	}
+	fieldName := qv.fieldNameByExpr(e)
+	ov := qv.fieldOverlayForExpr(e)
+	if !ov.hasData() && !qv.hasIndexedFieldForExpr(e) {
+		return fmt.Errorf("no index for field: %v", fieldName)
+	}
+
+	fm := qv.fieldMetaByExpr(e)
+	if fm == nil {
+		return fmt.Errorf("no metadata for field: %v", fieldName)
+	}
+
+	switch e.Op {
+	case qir.OpEQ:
+		if !fm.Slice {
+			_, isSlice, _, err := qv.exprValueToIdxScalar(e)
+			if err != nil {
+				return err
+			}
+			if isSlice {
+				return fmt.Errorf("%w: %v expects a single value for scalar field %v", ErrInvalidQuery, e.Op, fieldName)
+			}
+			return nil
+		}
+		valsBuf, isSlice, _, err := qv.exprValueToDistinctIdxBuf(e)
+		if valsBuf != nil {
+			defer stringSlicePool.Put(valsBuf)
+		}
+		if err != nil {
+			return err
+		}
+		if !isSlice {
+			return fmt.Errorf("%w: %v expects a slice for slice field %v", ErrInvalidQuery, e.Op, fieldName)
+		}
+		return nil
+
+	case qir.OpIN:
+		if fm.Slice {
+			return fmt.Errorf("%w: %v not supported on slice field %v", ErrInvalidQuery, e.Op, fieldName)
+		}
+		valsBuf, isSlice, hasNil, err := qv.exprValueToDistinctIdxBuf(e)
+		if valsBuf != nil {
+			defer stringSlicePool.Put(valsBuf)
+		}
+		if err != nil {
+			return err
+		}
+		if !isSlice && e.Value != nil {
+			return fmt.Errorf("%w: %v expects a slice", ErrInvalidQuery, e.Op)
+		}
+		valCount := 0
+		if valsBuf != nil {
+			valCount = valsBuf.Len()
+		}
+		if valCount == 0 && !hasNil {
+			return fmt.Errorf("%v: %v: no values provided", ErrInvalidQuery, e.Op)
+		}
+		return nil
+
+	case qir.OpHASANY, qir.OpHASALL:
+		if !fm.Slice {
+			return fmt.Errorf("%w: %v not supported on non-slice field %v", ErrInvalidQuery, e.Op, fieldName)
+		}
+		valsBuf, isSlice, _, err := qv.exprValueToDistinctIdxBuf(e)
+		if valsBuf != nil {
+			defer stringSlicePool.Put(valsBuf)
+		}
+		if err != nil {
+			return err
+		}
+		if !isSlice && e.Value != nil {
+			return fmt.Errorf("%w: %v expects a slice", ErrInvalidQuery, e.Op)
+		}
+		if valsBuf == nil || valsBuf.Len() == 0 {
+			return fmt.Errorf("%v: %v: no values provided", ErrInvalidQuery, e.Op)
+		}
+		return nil
+
+	case qir.OpGT, qir.OpGTE, qir.OpLT, qir.OpLTE, qir.OpPREFIX:
+		_, isSlice, err := qv.exprValueToNormalizedScalarBound(e)
+		if err != nil {
+			return err
+		}
+		if isSlice {
+			return fmt.Errorf("%w: %v expects a single value", ErrInvalidQuery, e.Op)
+		}
+		return nil
+
+	case qir.OpSUFFIX, qir.OpCONTAINS:
+		_, isSlice, _, err := qv.exprValueToIdxScalar(e)
+		if err != nil {
+			return err
+		}
+		if isSlice {
+			return fmt.Errorf("%w: %v expects a single string value", ErrInvalidQuery, e.Op)
+		}
+		return nil
+
+	default:
+		return fmt.Errorf("%w: invalid expression, op: %v", ErrInvalidQuery, e.Op)
+	}
+}
+
 func lowerBoundIndex(s []index, key string) int {
 	lo, hi := 0, len(s)
 	for lo < hi {
@@ -1919,6 +2068,9 @@ func (qv *queryView[K, V]) tryQueryOrderBasicWithLimit(q *qir.Shape, trace *quer
 	}
 
 	var rb rangeBounds
+	orderEqNil := false
+	orderEqNilConflict := false
+	orderNonNilConstraint := false
 
 	var baseOps []qir.Expr
 	var baseOpsStack [8]qir.Expr
@@ -1933,6 +2085,27 @@ func (qv *queryView[K, V]) tryQueryOrderBasicWithLimit(q *qir.Shape, trace *quer
 			if op.Not || !isScalarRangeEqOp(op.Op) {
 				return nil, false, nil
 			}
+			if op.Op == qir.OpEQ {
+				_, isSlice, isNil, err := qv.exprValueToIdxScalar(op)
+				if err != nil {
+					return nil, true, err
+				}
+				if isSlice {
+					return nil, false, nil
+				}
+				if isNil {
+					if orderNonNilConstraint {
+						orderEqNilConflict = true
+					}
+					orderEqNil = true
+					rb.setEmpty()
+					continue
+				}
+			}
+			orderNonNilConstraint = true
+			if orderEqNil {
+				orderEqNilConflict = true
+			}
 			nextRB, ok, err := qv.rangeBoundsForScalarExpr(op)
 			if err != nil {
 				return nil, true, err
@@ -1944,6 +2117,12 @@ func (qv *queryView[K, V]) tryQueryOrderBasicWithLimit(q *qir.Shape, trace *quer
 			continue
 		}
 		baseOps = append(baseOps, op)
+	}
+	if orderEqNilConflict {
+		if err := qv.validateOrderBasicBaseOps(baseOps); err != nil {
+			return nil, true, err
+		}
+		return nil, true, nil
 	}
 	baseCoresBuf, baseRawCoreIdxBuf, noMatch, err := qv.prepareOrderBasicBaseCores(baseOps)
 	if err != nil {
@@ -1960,6 +2139,15 @@ func (qv *queryView[K, V]) tryQueryOrderBasicWithLimit(q *qir.Shape, trace *quer
 	}
 
 	nilTailField := orderNilTailField(fm, f, rb)
+	if orderEqNil {
+		if !fm.Ptr {
+			if err := qv.validateOrderBasicBaseOps(baseOps); err != nil {
+				return nil, true, err
+			}
+			return nil, true, nil
+		}
+		nilTailField = f
+	}
 	ov := qv.fieldOverlayForOrder(order)
 	if !ov.hasData() && nilTailField == "" {
 		if !qv.hasIndexedFieldForOrder(order) {

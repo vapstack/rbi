@@ -1,10 +1,10 @@
 package rbi
 
 import (
+	"errors"
 	"fmt"
 	"reflect"
 	"slices"
-	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -55,21 +55,11 @@ func queryExtOptPriority() []string {
 }
 
 func clearQueryExtOrderWindow(q *qx.QX) {
-	if q == nil {
-		return
-	}
-	q.Order = nil
-	q.Window.Offset = 0
-	q.Window.Limit = 0
+	clearQueryOrderWindowForTest(q)
 }
 
 func execPreparedQueryExt[K ~uint64 | ~string](db *DB[K, Rec], q *qx.QX) ([]K, error) {
-	prepared, viewQ, err := prepareTestQuery(db, q)
-	if err != nil {
-		return nil, err
-	}
-	defer prepared.Release()
-	return db.execPreparedQuery(&viewQ)
+	return execPreparedQueryForTest(db, q)
 }
 
 func queryExtSortByArrayPos(q *qx.QX, field string, priority []string, dir qx.OrderDirection) *qx.QX {
@@ -82,43 +72,14 @@ func queryExtSortByArrayCount(q *qx.QX, field string, dir qx.OrderDirection) *qx
 
 func assertQueryExtIDsMatchExpected(t *testing.T, db *DB[uint64, Rec], q *qx.QX) []uint64 {
 	t.Helper()
-
-	got := runQueryKeysChecked(t, db, q)
-	want, err := expectedKeysUint64(t, db, q)
-	if err != nil {
-		t.Fatalf("expectedKeysUint64(%+v): %v", q, err)
-	}
-	assertQueryIDsEqual(t, q, got, want)
-	return want
+	contract := newUint64QueryContract(t, db)
+	contract.AssertQueryKeysMatchReference(q)
+	return contract.ReferenceKeys(q)
 }
 
 func assertQueryExtItemsMatchExpected(t *testing.T, db *DB[uint64, Rec], q *qx.QX) {
 	t.Helper()
-
-	wantIDs, err := expectedKeysUint64(t, db, q)
-	if err != nil {
-		t.Fatalf("expectedKeysUint64(%+v): %v", q, err)
-	}
-	wantItems, err := db.BatchGet(wantIDs...)
-	if err != nil {
-		t.Fatalf("BatchGet(wantIDs): %v", err)
-	}
-
-	gotItems, err := db.Query(q)
-	if err != nil {
-		t.Fatalf("Query(%+v): %v", q, err)
-	}
-	if len(gotItems) != len(wantItems) {
-		t.Fatalf("items len mismatch: got=%d want=%d", len(gotItems), len(wantItems))
-	}
-	for i := range wantItems {
-		if gotItems[i] == nil || wantItems[i] == nil {
-			t.Fatalf("nil item mismatch at i=%d: got=%#v want=%#v", i, gotItems[i], wantItems[i])
-		}
-		if !reflect.DeepEqual(*gotItems[i], *wantItems[i]) {
-			t.Fatalf("item mismatch at i=%d: got=%#v want=%#v", i, gotItems[i], wantItems[i])
-		}
-	}
+	newUint64QueryContract(t, db).AssertQueryRecordsMatchReference(q)
 }
 
 func assertQueryExtCountMatchesOrderedResultSet(t *testing.T, db *DB[uint64, Rec], q *qx.QX) {
@@ -139,65 +100,19 @@ func assertQueryExtCountMatchesOrderedResultSet(t *testing.T, db *DB[uint64, Rec
 
 func assertQueryExtCountMatchesBaseQuery(t *testing.T, db *DB[uint64, Rec], q *qx.QX) {
 	t.Helper()
-
-	base := cloneQuery(q)
-	clearQueryExtOrderWindow(base)
-
-	want, err := db.Count(base.Filter)
-	if err != nil {
-		t.Fatalf("Count(base %+v): %v", base, err)
-	}
-	got, err := db.Count(q.Filter)
-	if err != nil {
-		t.Fatalf("Count(%+v): %v", q, err)
-	}
-	if got != want {
-		t.Fatalf("Count mismatch: got=%d want=%d", got, want)
-	}
+	newUint64QueryContract(t, db).AssertCountMatchesReference(q)
 }
 
 func assertQueryExtPreparedMatchesExpected(t *testing.T, db *DB[uint64, Rec], q *qx.QX) {
 	t.Helper()
-
-	want, err := expectedKeysUint64(t, db, q)
-	if err != nil {
-		t.Fatalf("expectedKeysUint64(%+v): %v", q, err)
-	}
-
-	nq := normalizeQueryForTest(q)
-	if err := db.checkUsedQuery(nq); err != nil {
-		t.Fatalf("checkUsedQuery(%+v): %v", nq, err)
-	}
-
-	got, err := execPreparedQueryExt(db, nq)
-	if err != nil {
-		t.Fatalf("execPreparedQuery(%+v): %v", nq, err)
-	}
-	assertQueryIDsEqual(t, q, got, want)
-
-	base := cloneQuery(q)
-	clearQueryExtOrderWindow(base)
-
-	wantCount, err := db.Count(base.Filter)
-	if err != nil {
-		t.Fatalf("Count(base %+v): %v", base, err)
-	}
-	gotCount, err := db.countPreparedExpr(nq.Filter)
-	if err != nil {
-		t.Fatalf("countPreparedExpr(%+v): %v", nq.Filter, err)
-	}
-	if gotCount != wantCount {
-		t.Fatalf("countPreparedExpr(%+v)=%d want=%d", nq.Filter, gotCount, wantCount)
-	}
+	contract := newUint64QueryContract(t, db)
+	contract.AssertPreparedKeysMatchReference(q)
+	contract.AssertPreparedCountMatchesReference(q)
 }
 
 func assertQueryExtAllReadPathsMatchExpected(t *testing.T, db *DB[uint64, Rec], q *qx.QX) {
 	t.Helper()
-
-	assertQueryExtIDsMatchExpected(t, db, q)
-	assertQueryExtItemsMatchExpected(t, db, q)
-	assertQueryExtCountMatchesBaseQuery(t, db, q)
-	assertQueryExtPreparedMatchesExpected(t, db, q)
+	newUint64QueryContract(t, db).AssertAllReadPathsMatchReference(q)
 }
 
 func queryExtItemNames(t testing.TB, items []*Rec) []string {
@@ -1073,36 +988,11 @@ func queryExtNoOrderORDisjointFixture() ([]uint64, []*Rec, []*Rec, *qx.QX) {
 }
 
 func queryExtRecSignature(rec *Rec) string {
-	if rec == nil {
-		return "<nil>"
-	}
-	opt := "<nil>"
-	if rec.Opt != nil {
-		opt = *rec.Opt
-	}
-	return fmt.Sprintf(
-		"%s|%s|%d|%g|%t|%s|%s|%s|%s",
-		rec.Name,
-		rec.Email,
-		rec.Age,
-		rec.Score,
-		rec.Active,
-		rec.Country,
-		rec.FullName,
-		opt,
-		strings.Join(rec.Tags, "\x1f"),
-	)
+	return queryContractRecSignature(rec)
 }
 
 func queryExtBuildSignatureCounts(items []*Rec) map[string]int {
-	out := make(map[string]int, len(items))
-	for i := range items {
-		if items[i] == nil {
-			continue
-		}
-		out[queryExtRecSignature(items[i])]++
-	}
-	return out
+	return queryContractBuildRecSignatureCounts(items)
 }
 
 func queryExtValidateNoOrderItemsAgainstFullSet(q *qx.QX, items []*Rec, fullSigCounts map[string]int, fullLen int) error {
@@ -2309,6 +2199,161 @@ func TestQueryExt_OrderBasicPointerBounds_DoNotLeakNilTail(t *testing.T) {
 	}
 
 	check("after_patch")
+}
+
+func TestQueryExt_OrderBasicPointerNilContradictions_RemainEmpty(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
+
+	rows := map[uint64]*Rec{
+		1: {Name: "nil-a", Opt: nil, Active: true},
+		2: {Name: "empty", Opt: strPtr(""), Active: true},
+		3: {Name: "aa-a", Opt: strPtr("aa"), Active: true},
+		4: {Name: "ab-a", Opt: strPtr("ab"), Active: true},
+		5: {Name: "ac-off", Opt: strPtr("ac"), Active: false},
+		6: {Name: "ba-a", Opt: strPtr("ba"), Active: true},
+		7: {Name: "nil-b", Opt: nil, Active: false},
+	}
+	for id, rec := range rows {
+		if err := db.Set(id, rec); err != nil {
+			t.Fatalf("Set(%d): %v", id, err)
+		}
+	}
+
+	tests := []struct {
+		name string
+		q    *qx.QX
+	}{
+		{
+			name: "eq_nil_and_gt",
+			q:    qx.Query(qx.EQ("opt", nil), qx.GT("opt", "aa")).Sort("opt", qx.ASC).Limit(8),
+		},
+		{
+			name: "eq_nil_and_eq_value",
+			q:    qx.Query(qx.EQ("opt", nil), qx.EQ("opt", "aa")).Sort("opt", qx.ASC).Limit(8),
+		},
+		{
+			name: "eq_nil_and_prefix",
+			q:    qx.Query(qx.EQ("opt", nil), qx.PREFIX("opt", "a")).Sort("opt", qx.DESC).Offset(1).Limit(3),
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			assertQueryExtAllReadPathsMatchExpected(t, db, tc.q)
+
+			got, used, err := db.tryExecutionPlan(tc.q, nil)
+			if err != nil {
+				t.Fatalf("tryExecutionPlan(%+v): %v", tc.q, err)
+			}
+			if !used {
+				t.Fatalf("expected ordered execution fast path to be applicable")
+			}
+			if len(got) != 0 {
+				t.Fatalf("expected empty fast-path result, got=%v", got)
+			}
+		})
+	}
+}
+
+func TestQueryExt_OrderBasicNilShortCircuit_PreservesResidualValidation(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
+
+	rows := map[uint64]*Rec{
+		1: {Name: "nil-a", Opt: nil, Age: 10, Active: true},
+		2: {Name: "empty", Opt: strPtr(""), Age: 20, Active: true},
+		3: {Name: "aa-a", Opt: strPtr("aa"), Age: 30, Active: true},
+		4: {Name: "ab-a", Opt: strPtr("ab"), Age: 40, Active: true},
+	}
+	for id, rec := range rows {
+		if err := db.Set(id, rec); err != nil {
+			t.Fatalf("Set(%d): %v", id, err)
+		}
+	}
+
+	tests := []struct {
+		name string
+		q    *qx.QX
+	}{
+		{
+			name: "pointer_conflict_invalid_residual",
+			q: qx.Query(
+				qx.EQ("opt", nil),
+				qx.GT("opt", "aa"),
+				qx.HASALL("name", []string{"x"}),
+			).Sort("opt", qx.ASC).Limit(8),
+		},
+		{
+			name: "non_pointer_nil_invalid_residual",
+			q: qx.Query(
+				qx.EQ("age", nil),
+				qx.HASALL("name", []string{"x"}),
+			).Sort("age", qx.ASC).Limit(8),
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			_, used, err := db.tryExecutionPlan(tc.q, nil)
+			if !used {
+				t.Fatalf("expected tryExecutionPlan to take ordered fast path")
+			}
+			if !errors.Is(err, ErrInvalidQuery) {
+				t.Fatalf("tryExecutionPlan(%+v) err=%v, want ErrInvalidQuery", tc.q, err)
+			}
+
+			_, err = db.QueryKeys(tc.q)
+			if !errors.Is(err, ErrInvalidQuery) {
+				t.Fatalf("QueryKeys(%+v) err=%v, want ErrInvalidQuery", tc.q, err)
+			}
+		})
+	}
+}
+
+func TestQueryExt_OrderBasicNilShortCircuit_DoesNotMaterializeResiduals(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{
+		AnalyzeInterval:                         -1,
+		SnapshotMaterializedPredCacheMaxEntries: 16,
+	})
+
+	rows := map[uint64]*Rec{
+		1: {Name: "nil-a", Opt: nil, Active: true},
+		2: {Name: "alpha", Opt: strPtr("aa"), Active: true},
+		3: {Name: "bravo", Opt: strPtr("ab"), Active: true},
+		4: {Name: "charlie", Opt: strPtr("ac"), Active: true},
+	}
+	for id, rec := range rows {
+		if err := db.Set(id, rec); err != nil {
+			t.Fatalf("Set(%d): %v", id, err)
+		}
+	}
+
+	q := qx.Query(
+		qx.EQ("opt", nil),
+		qx.GT("opt", "aa"),
+		qx.CONTAINS("name", "a"),
+	).Sort("opt", qx.ASC).Limit(8)
+
+	cacheKey := db.materializedPredCacheKey(qx.CONTAINS("name", "a"))
+	if cacheKey == "" {
+		t.Fatalf("expected non-empty materialized cache key")
+	}
+	if _, ok := db.getSnapshot().loadMaterializedPred(cacheKey); ok {
+		t.Fatalf("unexpected residual cache entry before execution")
+	}
+
+	got, used, err := db.tryExecutionPlan(q, nil)
+	if err != nil {
+		t.Fatalf("tryExecutionPlan(%+v): %v", q, err)
+	}
+	if !used {
+		t.Fatalf("expected ordered execution fast path to be applicable")
+	}
+	if len(got) != 0 {
+		t.Fatalf("expected empty fast-path result, got=%v", got)
+	}
+	if _, ok := db.getSnapshot().loadMaterializedPred(cacheKey); ok {
+		t.Fatalf("unexpected residual cache entry after empty nil-order short-circuit")
+	}
 }
 
 func TestQueryExt_PrefixRangeIntersections_StayExactAcrossBoundaryChurn(t *testing.T) {

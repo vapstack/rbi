@@ -518,37 +518,7 @@ func plannerExtRandomORQuery(
 }
 
 func plannerExtValidateNoOrderWindow(q *qx.QX, got, full []uint64) error {
-	seen := make(map[uint64]struct{}, len(got))
-	for _, id := range got {
-		if _, ok := seen[id]; ok {
-			return fmt.Errorf("duplicate id=%d result=%v", id, got)
-		}
-		seen[id] = struct{}{}
-	}
-
-	allow := make(map[uint64]struct{}, len(full))
-	for _, id := range full {
-		allow[id] = struct{}{}
-	}
-	for _, id := range got {
-		if _, ok := allow[id]; !ok {
-			return fmt.Errorf("id=%d outside full result set", id)
-		}
-	}
-
-	maxLen := len(full)
-	if q.Window.Offset >= uint64(len(full)) {
-		maxLen = 0
-	} else if q.Window.Offset > 0 {
-		maxLen = len(full) - int(q.Window.Offset)
-	}
-	if q.Window.Limit > 0 && int(q.Window.Limit) < maxLen {
-		maxLen = int(q.Window.Limit)
-	}
-	if len(got) > maxLen {
-		return fmt.Errorf("window overflow got=%d max=%d", len(got), maxLen)
-	}
-	return nil
+	return queryContractValidateNoOrderWindow(q, got, full)
 }
 
 func plannerExtExprIsNot(expr qx.Expr) bool {
@@ -591,34 +561,10 @@ func plannerExtAssertQueryContract(t *testing.T, q *qx.QX) {
 		TraceSampleEvery: 1,
 	})
 
-	got, err := db.QueryKeys(q)
-	if err != nil {
-		t.Fatalf("QueryKeys(%+v): %v", q, err)
-	}
-
-	if len(q.Order) > 0 || (q.Window.Offset == 0 && q.Window.Limit == 0) {
-		want, err := expectedKeysUint64(t, db, q)
-		if err != nil {
-			t.Fatalf("expectedKeysUint64(%+v): %v", q, err)
-		}
-		if !queryIDsEqual(q, got, want) {
-			t.Fatalf("query mismatch:\nq=%+v\ngot=%v\nwant=%v", q, got, want)
-		}
-	} else {
-		fullQ := cloneQuery(q)
-		fullQ.Window.Offset = 0
-		fullQ.Window.Limit = 0
-		full, err := expectedKeysUint64(t, db, fullQ)
-		if err != nil {
-			t.Fatalf("expectedKeysUint64(full %+v): %v", fullQ, err)
-		}
-		if err = plannerExtValidateNoOrderWindow(q, got, full); err != nil {
-			t.Fatalf("no-order contract mismatch:\nq=%+v\nerr=%v\ngot=%v\nfull=%v", q, err, got, full)
-		}
-	}
+	newUint64QueryContract(t, db).AssertQueryKeysMatchReference(q)
 
 	mu.Lock()
-	err = plannerExtRequireTrace(events)
+	err := plannerExtRequireTrace(events)
 	mu.Unlock()
 	if err != nil {
 		t.Fatal(err)

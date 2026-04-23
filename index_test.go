@@ -1930,7 +1930,7 @@ func TestPointerNil_IntQueriesCountRebuildAndReopen(t *testing.T) {
 		}
 	}
 
-	check := func(stage string, wantAsc, wantDesc, wantNil, wantIn []uint64, wantGT, wantCountNil, wantCountIn uint64) {
+	check := func(stage string, wantAsc, wantDesc, wantNil, wantIn, wantGT []uint64, wantCountNil, wantCountIn uint64) {
 		t.Helper()
 
 		gotNil, err := db.QueryKeys(qx.Query(qx.EQ("rank", nil)))
@@ -1949,9 +1949,7 @@ func TestPointerNil_IntQueriesCountRebuildAndReopen(t *testing.T) {
 		if err != nil {
 			t.Fatalf("%s QueryKeys(GT 0): %v", stage, err)
 		}
-		if uint64(len(gotGT)) != wantGT {
-			t.Fatalf("%s GT count mismatch: got=%v wantCount=%d", stage, gotGT, wantGT)
-		}
+		assertSameSet(t, gotGT, wantGT)
 
 		gotAsc, err := db.QueryKeys(qx.Query().Sort("rank", qx.ASC))
 		if err != nil {
@@ -1988,7 +1986,7 @@ func TestPointerNil_IntQueriesCountRebuildAndReopen(t *testing.T) {
 		}
 	}
 
-	check("base", []uint64{2, 3, 4, 1}, []uint64{4, 3, 2, 1}, []uint64{1}, []uint64{1, 3}, 2, 1, 2)
+	check("base", []uint64{2, 3, 4, 1}, []uint64{4, 3, 2, 1}, []uint64{1}, []uint64{1, 3}, []uint64{3, 4}, 1, 2)
 
 	if err := db.Patch(1, []Field{{Name: "rank", Value: 15}}); err != nil {
 		t.Fatalf("Patch(1 rank=15): %v", err)
@@ -2000,12 +1998,12 @@ func TestPointerNil_IntQueriesCountRebuildAndReopen(t *testing.T) {
 		t.Fatalf("Patch(4 rank=5): %v", err)
 	}
 
-	check("delta", []uint64{4, 3, 1, 2}, []uint64{1, 3, 4, 2}, []uint64{2}, []uint64{2, 3}, 3, 1, 2)
+	check("delta", []uint64{4, 3, 1, 2}, []uint64{1, 3, 4, 2}, []uint64{2}, []uint64{2, 3}, []uint64{1, 3, 4}, 1, 2)
 
 	if err := db.RebuildIndex(); err != nil {
 		t.Fatalf("RebuildIndex: %v", err)
 	}
-	check("rebuild", []uint64{4, 3, 1, 2}, []uint64{1, 3, 4, 2}, []uint64{2}, []uint64{2, 3}, 3, 1, 2)
+	check("rebuild", []uint64{4, 3, 1, 2}, []uint64{1, 3, 4, 2}, []uint64{2}, []uint64{2, 3}, []uint64{1, 3, 4}, 1, 2)
 
 	plannerStats := db.PlannerStats()
 	fs, ok := plannerStats.Fields["rank"]
@@ -2056,7 +2054,7 @@ func TestPointerNil_IntQueriesCountRebuildAndReopen(t *testing.T) {
 	}()
 	db = reopened
 
-	check("reopen", []uint64{4, 3, 1, 2}, []uint64{1, 3, 4, 2}, []uint64{2}, []uint64{2, 3}, 3, 1, 2)
+	check("reopen", []uint64{4, 3, 1, 2}, []uint64{1, 3, 4, 2}, []uint64{2}, []uint64{2, 3}, []uint64{1, 3, 4}, 1, 2)
 }
 
 func TestPointerNil_RebuildClearsStaleNilBase(t *testing.T) {
@@ -2183,6 +2181,28 @@ func TestPointerNil_OrderExecutionFastPaths(t *testing.T) {
 		t.Fatalf("expectedKeysUint64(offset): %v", err)
 	}
 	assertSameSlice(t, out, want)
+
+	qEqNilLimit := qx.Query(qx.EQ("opt", nil)).Sort("opt", qx.ASC).Limit(10)
+	eqNilLeaves := mustExtractAndLeaves(t, qEqNilLimit.Filter)
+	out, used, err = db.tryLimitQueryOrderBasic(qEqNilLimit, eqNilLeaves, nil)
+	if err != nil {
+		t.Fatalf("tryLimitQueryOrderBasic(eq nil): %v", err)
+	}
+	want, err = expectedKeysUint64(t, db, qEqNilLimit)
+	if err != nil {
+		t.Fatalf("expectedKeysUint64(eq nil limit): %v", err)
+	}
+	if used {
+		assertSameSlice(t, out, want)
+	}
+	planOut, used, err := db.tryExecutionPlan(qEqNilLimit, nil)
+	if err != nil {
+		t.Fatalf("tryExecutionPlan(eq nil limit): %v", err)
+	}
+	if !used {
+		t.Fatalf("expected tryExecutionPlan to use ORDER+LIMIT fast path for eq nil")
+	}
+	assertSameSlice(t, planOut, want)
 
 	qPrefix := qx.Query(qx.PREFIX("opt", "")).Sort("opt", qx.ASC).Offset(1).Limit(2)
 	out, used, err = db.tryQueryOrderPrefixWithLimit(qPrefix, nil)

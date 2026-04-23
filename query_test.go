@@ -941,7 +941,7 @@ func evalPreparedExprBool(rec *Rec, e qir.Expr) (bool, error) {
 }
 
 // expectedKeysUint64 scans the DB linearly and applies logic to produce the expected result set
-func expectedKeysUint64(t *testing.T, db *DB[uint64, Rec], q *qx.QX) ([]uint64, error) {
+func expectedKeysUint64(t testing.TB, db *DB[uint64, Rec], q *qx.QX) ([]uint64, error) {
 	t.Helper()
 
 	type row struct {
@@ -1219,29 +1219,8 @@ func assertNoDuplicateStringIDs(t testing.TB, label string, ids []string) {
 
 func assertNoOrderWindowSubsetString(t testing.TB, q *qx.QX, got, full []string, label string) {
 	t.Helper()
-	assertNoDuplicateStringIDs(t, label, got)
-
-	allow := make(map[string]struct{}, len(full))
-	for _, id := range full {
-		allow[id] = struct{}{}
-	}
-	for _, id := range got {
-		if _, ok := allow[id]; !ok {
-			t.Fatalf("%s: id=%q is outside full no-order result set", label, id)
-		}
-	}
-
-	maxLen := len(full)
-	if q.Window.Offset >= uint64(len(full)) {
-		maxLen = 0
-	} else if q.Window.Offset > 0 {
-		maxLen = len(full) - int(q.Window.Offset)
-	}
-	if q.Window.Limit > 0 && int(q.Window.Limit) < maxLen {
-		maxLen = int(q.Window.Limit)
-	}
-	if len(got) > maxLen {
-		t.Fatalf("%s: no-order window overflow got=%d max=%d", label, len(got), maxLen)
+	if err := queryContractValidateNoOrderWindow(q, got, full); err != nil {
+		t.Fatalf("%s: %v", label, err)
 	}
 }
 
@@ -2652,29 +2631,8 @@ func assertNoDuplicateIDs(t testing.TB, label string, ids []uint64) {
 
 func assertNoOrderWindowSubset(t testing.TB, q *qx.QX, got, full []uint64, label string) {
 	t.Helper()
-	assertNoDuplicateIDs(t, label, got)
-
-	allow := make(map[uint64]struct{}, len(full))
-	for _, id := range full {
-		allow[id] = struct{}{}
-	}
-	for _, id := range got {
-		if _, ok := allow[id]; !ok {
-			t.Fatalf("%s: id=%d is outside full no-order result set", label, id)
-		}
-	}
-
-	maxLen := len(full)
-	if q.Window.Offset >= uint64(len(full)) {
-		maxLen = 0
-	} else if q.Window.Offset > 0 {
-		maxLen = len(full) - int(q.Window.Offset)
-	}
-	if q.Window.Limit > 0 && int(q.Window.Limit) < maxLen {
-		maxLen = int(q.Window.Limit)
-	}
-	if len(got) > maxLen {
-		t.Fatalf("%s: no-order window overflow got=%d max=%d", label, len(got), maxLen)
+	if err := queryContractValidateNoOrderWindow(q, got, full); err != nil {
+		t.Fatalf("%s: %v", label, err)
 	}
 }
 

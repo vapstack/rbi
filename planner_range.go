@@ -398,7 +398,7 @@ func (core *preparedScalarRangePredicate[K, V]) orderedEagerMaterializeUseful(or
 	}
 	probeBuckets := plan.inBuckets
 	probeEst := plan.est
-	if plan.useComplement {
+	if core.usesRuntimeComplement(plan.useComplement) {
 		probeBuckets = len(*slice) - plan.inBuckets
 		if universe > plan.est {
 			probeEst = universe - plan.est
@@ -692,6 +692,16 @@ func (core *preparedScalarRangePredicate[K, V]) runtimeReuse(est uint64, useComp
 	return stateReuse
 }
 
+func (core *preparedScalarRangePredicate[K, V]) hasNilTail() bool {
+	return core.fm != nil &&
+		core.fm.Ptr &&
+		core.qv.nilFieldOverlayForExpr(core.expr).lookupCardinality(nilIndexEntryKey) > 0
+}
+
+func (core *preparedScalarRangePredicate[K, V]) usesRuntimeComplement(useComplement bool) bool {
+	return useComplement && !core.hasNilTail()
+}
+
 func (core *preparedScalarRangePredicate[K, V]) planBase(slice []index) (preparedBaseRangePredicatePlan, predicate, bool) {
 	start, end := applyBoundsToIndexRange(slice, core.bounds)
 	if start >= end {
@@ -700,7 +710,9 @@ func (core *preparedScalarRangePredicate[K, V]) planBase(slice []index) (prepare
 		}
 		return preparedBaseRangePredicatePlan{}, predicate{expr: core.expr, alwaysFalse: true}, true
 	}
-	if start == 0 && end == len(slice) {
+	ptrHasNilTail := core.hasNilTail()
+	fullSpanHasNilTail := start == 0 && end == len(slice) && ptrHasNilTail
+	if start == 0 && end == len(slice) && !fullSpanHasNilTail {
 		if core.expr.Not {
 			return preparedBaseRangePredicatePlan{}, predicate{expr: core.expr, alwaysFalse: true}, true
 		}
@@ -775,7 +787,9 @@ func (core *preparedScalarRangePredicate[K, V]) planOverlay(ov fieldOverlay) (pr
 	}
 
 	totalBuckets := ov.keyCount()
-	if bucketCount == totalBuckets {
+	ptrHasNilTail := core.hasNilTail()
+	fullSpanHasNilTail := bucketCount == totalBuckets && ptrHasNilTail
+	if bucketCount == totalBuckets && !fullSpanHasNilTail {
 		if core.expr.Not {
 			return preparedOverlayRangePredicatePlan{}, predicate{expr: core.expr, alwaysFalse: true}, true
 		}
@@ -791,7 +805,7 @@ func (core *preparedScalarRangePredicate[K, V]) planOverlay(ov fieldOverlay) (pr
 		runtimeProbeEst:     est,
 	}
 
-	if plan.useComplement {
+	if core.usesRuntimeComplement(plan.useComplement) {
 		plan.runtimeProbeBuckets = totalBuckets - bucketCount
 		universe := core.qv.snapshotUniverseCardinality()
 		if universe > est {
@@ -827,7 +841,10 @@ func (core *preparedScalarRangePredicate[K, V]) buildFromSlice(
 		}
 	}
 
-	probe := newBaseRangeProbe(slice, plan.start, plan.end, plan.useComplement)
+	// Nullable value indexes do not contain nil-tail rows, so a direct complement
+	// probe would treat nil as "not seen" and invert it incorrectly at runtime.
+	useRuntimeComplement := core.usesRuntimeComplement(plan.useComplement)
+	probe := newBaseRangeProbe(slice, plan.start, plan.end, useRuntimeComplement)
 	coldMaterializeAllowed := allowMaterialize
 	if coldMaterializeAllowed && lazyColdMaterialize && core.usePostingFilter &&
 		rangePostingFilterMaterializeAfterForProbe(probe.probeLen, probe.probeEst) > 1 {
@@ -851,8 +868,8 @@ func (core *preparedScalarRangePredicate[K, V]) buildFromSlice(
 			return materializedRangePredicateWithMode(core.expr, out.ids), true
 		}
 	}
-	reuse := core.runtimeReuse(plan.est, plan.useComplement)
-	if allowMaterialize && !plan.useComplement && core.fm != nil && !isNumericScalarKind(core.fm.Kind) {
+	reuse := core.runtimeReuse(plan.est, useRuntimeComplement)
+	if allowMaterialize && !useRuntimeComplement && core.fm != nil && !isNumericScalarKind(core.fm.Kind) {
 		reuse = core.sharedReuse
 	}
 	keepProbeHits := probe.useComplement == core.expr.Not
@@ -905,13 +922,14 @@ func (core *preparedScalarRangePredicate[K, V]) buildFromOverlay(
 		}
 	}
 
-	probeLen := plan.runtimeProbeBuckets
-	probeEst := plan.runtimeProbeEst
-	if plan.useComplement {
+	useRuntimeComplement := core.usesRuntimeComplement(plan.useComplement)
+	probeLen := plan.bucketCount
+	probeEst := plan.est
+	if useRuntimeComplement {
 		probeLen = -1
 		probeEst = 0
 	}
-	probe := newOverlayRangeProbe(ov, plan.br, plan.useComplement, probeLen, probeEst)
+	probe := newOverlayRangeProbe(ov, plan.br, useRuntimeComplement, probeLen, probeEst)
 
 	coldMaterializeAllowed := allowMaterialize
 	if coldMaterializeAllowed && lazyColdMaterialize && core.usePostingFilter {
@@ -941,8 +959,8 @@ func (core *preparedScalarRangePredicate[K, V]) buildFromOverlay(
 			return materializedRangePredicateWithMode(core.expr, out.ids), true
 		}
 	}
-	reuse := core.runtimeReuse(plan.est, plan.useComplement)
-	if allowMaterialize && !plan.useComplement && core.fm != nil && !isNumericScalarKind(core.fm.Kind) {
+	reuse := core.runtimeReuse(plan.est, useRuntimeComplement)
+	if allowMaterialize && !useRuntimeComplement && core.fm != nil && !isNumericScalarKind(core.fm.Kind) {
 		reuse = core.sharedReuse
 	}
 	materializeAfter := rangeMaterializeAfterForProbe(probe.probeLen, probe.probeEst)

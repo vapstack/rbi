@@ -1609,6 +1609,81 @@ func TestQuery_OrderBasic_BuildLeafPredsExcludingBounds_ForceMaterializesNonBroa
 	assertSameSlice(t, got, want)
 }
 
+func TestQuery_OrderBasic_BuildLimitLeafPred_NullableComplementUsesPositiveProbeCosts(t *testing.T) {
+	db, _ := openTempDBUint64PtrInt(t, Options{
+		AnalyzeInterval: -1,
+	})
+	for i := 0; i < 4096; i++ {
+		rec := &PtrIntRec{Name: fmt.Sprintf("nil_%04d", i), Rank: nil, Active: i%2 == 0}
+		if err := db.Set(uint64(i+1), rec); err != nil {
+			t.Fatalf("Set(nil_%04d): %v", i, err)
+		}
+	}
+	v0 := 0
+	if err := db.Set(4097, &PtrIntRec{Name: "zero", Rank: &v0, Active: true}); err != nil {
+		t.Fatalf("Set(zero): %v", err)
+	}
+	for i := 0; i < 100; i++ {
+		v := 1
+		if err := db.Set(uint64(4098+i), &PtrIntRec{Name: fmt.Sprintf("one_%03d", i), Rank: &v, Active: true}); err != nil {
+			t.Fatalf("Set(one_%03d): %v", i, err)
+		}
+	}
+	for i := 0; i < 100; i++ {
+		v := 2
+		if err := db.Set(uint64(4198+i), &PtrIntRec{Name: fmt.Sprintf("two_%03d", i), Rank: &v, Active: true}); err != nil {
+			t.Fatalf("Set(two_%03d): %v", i, err)
+		}
+	}
+	if err := db.RebuildIndex(); err != nil {
+		t.Fatalf("RebuildIndex: %v", err)
+	}
+
+	view := db.currentQueryViewForTests()
+	defer db.releaseQueryView(view)
+
+	expr := mustLimitQIRExpr(t, db, qx.GTE("rank", 1))
+	candidate, ok := view.prepareScalarRangeRoutingCandidate(expr)
+	if !ok {
+		t.Fatalf("expected nullable range routing candidate")
+	}
+	if !candidate.plan.useComplement {
+		t.Fatalf("expected complement route for nullable ordered range")
+	}
+	if candidate.plan.runtimeProbeBuckets != candidate.plan.bucketCount {
+		t.Fatalf("runtimeProbeBuckets=%d want positive bucketCount=%d", candidate.plan.runtimeProbeBuckets, candidate.plan.bucketCount)
+	}
+	if candidate.plan.runtimeProbeEst != candidate.plan.est {
+		t.Fatalf("runtimeProbeEst=%d want positive est=%d", candidate.plan.runtimeProbeEst, candidate.plan.est)
+	}
+	if candidate.plan.orderedEagerMaterializeUseful(5, view.snapshotUniverseCardinality()) {
+		t.Fatalf("expected ordered eager materialization to stay disabled when positive runtime probe is cheaper")
+	}
+
+	lp, ok, err := view.buildLimitLeafPred(expr, 5)
+	if err != nil {
+		t.Fatalf("buildLimitLeafPred: %v", err)
+	}
+	if !ok {
+		t.Fatalf("expected buildLimitLeafPred to support nullable range")
+	}
+	if lp.kind != leafPredKindPredicate {
+		t.Fatalf("expected predicate leaf, got kind=%v", lp.kind)
+	}
+	if lp.pred.isMaterializedLike() {
+		t.Fatalf("expected nullable ordered limit leaf to stay deferred")
+	}
+	if !lp.pred.hasRuntimeRangeState() {
+		t.Fatalf("expected nullable ordered limit leaf to keep runtime range state")
+	}
+	if lp.pred.matches(1) || lp.pred.matches(2048) || lp.pred.matches(4097) {
+		t.Fatalf("nil or out-of-range rows must not match deferred nullable range")
+	}
+	if !lp.pred.matches(4098) || !lp.pred.matches(4297) {
+		t.Fatalf("expected in-range rows to match deferred nullable range")
+	}
+}
+
 func TestQuery_OrderBasic_DeepWindowCachePersistsAcrossUnchangedFieldPatch(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
 		AnalyzeInterval:                         -1,

@@ -3009,7 +3009,7 @@ func TestPlannerOROrderMergeBranchStats_SkipFullSpanRowCountingWithoutOrderBound
 	}
 }
 
-func TestBuildPredRangeCandidateWithColdMode_ComplementProbeStatsUseObservedOverlaySpans(t *testing.T) {
+func TestBuildPredRangeCandidateWithColdMode_NullableComplementRouteKeepsPositiveRuntimeProbe(t *testing.T) {
 	db, _ := openTempDBUint64PtrInt(t, Options{
 		AnalyzeInterval: -1,
 	})
@@ -3068,16 +3068,17 @@ func TestBuildPredRangeCandidateWithColdMode_ComplementProbeStatsUseObservedOver
 	if p.overlayState == nil {
 		t.Fatal("expected overlay range predicate state")
 	}
-
-	actual := newOverlayRangeProbe(ov, candidate.plan.br, true, -1, 0)
-	if got, want := p.overlayState.probe.probeLen, actual.probeLen; got != want {
-		t.Fatalf("probeLen = %d, want observed %d", got, want)
+	if p.overlayState.probe.useComplement {
+		t.Fatal("expected nullable complement route to keep positive runtime probe")
 	}
-	if got, want := p.overlayState.probe.probeEst, actual.probeEst; got != want {
-		t.Fatalf("probeEst = %d, want observed %d", got, want)
+	if p.matches(1) || p.matches(50) {
+		t.Fatal("nil rank rows must not match positive nullable range")
 	}
-	if candidate.plan.runtimeProbeBuckets == actual.probeLen && candidate.plan.runtimeProbeEst == actual.probeEst {
-		t.Fatalf("expected observed complement probe stats to differ from precomputed runtime stats")
+	if p.matches(101) {
+		t.Fatal("out-of-range zero bucket must not match positive nullable range")
+	}
+	if !p.matches(142) {
+		t.Fatal("expected in-range row to match positive nullable range")
 	}
 }
 
