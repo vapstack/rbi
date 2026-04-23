@@ -1131,10 +1131,10 @@ func TestAPI_New_InvalidBucketFillPercent_NegativeRejected(t *testing.T) {
 	raw, _ := openRawBolt(t)
 	defer func() { _ = raw.Close() }()
 
-	db, err := New[uint64, Rec](raw, Options{
+	db, err := New[uint64, Rec](raw, testOptions(Options{
 		BucketName:        "api_invalid_fill_negative",
 		BucketFillPercent: -0.25,
-	})
+	}))
 	if err == nil {
 		_ = db.Close()
 		t.Fatalf("expected negative BucketFillPercent to be rejected")
@@ -1145,10 +1145,10 @@ func TestAPI_New_InvalidBucketFillPercent_AboveOneRejected(t *testing.T) {
 	raw, _ := openRawBolt(t)
 	defer func() { _ = raw.Close() }()
 
-	db, err := New[uint64, Rec](raw, Options{
+	db, err := New[uint64, Rec](raw, testOptions(Options{
 		BucketName:        "api_invalid_fill_above_one",
 		BucketFillPercent: 1.25,
-	})
+	}))
 	if err == nil {
 		_ = db.Close()
 		t.Fatalf("expected BucketFillPercent > 1 to be rejected")
@@ -1159,7 +1159,7 @@ func TestAPI_BucketName_ReturnsClone(t *testing.T) {
 	raw, _ := openRawBolt(t)
 	defer func() { _ = raw.Close() }()
 
-	db, err := New[uint64, Rec](raw, Options{BucketName: "api_bucket_clone"})
+	db, err := New[uint64, Rec](raw, testOptions(Options{BucketName: "api_bucket_clone"}))
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}

@@ -158,6 +158,7 @@ func openTempDBUint64Reflect[V any](t *testing.T, filename string, options ...Op
 	if len(options) > 0 {
 		opts = options[0]
 	}
+	opts = testOptions(opts)
 	opts.EnableAutoBatchStats = true
 	opts.EnableSnapshotStats = true
 

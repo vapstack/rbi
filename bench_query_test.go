@@ -42,10 +42,10 @@ const (
 )
 
 func benchOptions() Options {
-	return Options{
+	return testOptions(Options{
 		DisableIndexLoad:  true,
 		DisableIndexStore: true,
-	}
+	})
 }
 
 func openBenchDB(b *testing.B) (*DB[uint64, UserBench], *bbolt.DB, string) {

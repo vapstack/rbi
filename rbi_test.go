@@ -172,16 +172,9 @@ func TestTransparentMode_IgnoresPersistedIndexAndDoesNotStoreSidecar(t *testing.
 	}
 
 	var logBuf bytes.Buffer
-	prevLogWriter := log.Writer()
-	prevLogFlags := log.Flags()
-	log.SetOutput(&logBuf)
-	log.SetFlags(0)
-	defer func() {
-		log.SetOutput(prevLogWriter)
-		log.SetFlags(prevLogFlags)
-	}()
-
-	db, raw := openBoltAndNew[uint64, noIndexRec](t, path)
+	db, raw := openBoltAndNew[uint64, noIndexRec](t, path, Options{
+		Logger: log.New(&logBuf, "", 0),
+	})
 	defer func() {
 		if db != nil {
 			_ = db.Close()
@@ -490,7 +483,7 @@ func TestIndexTags_InvalidActiveTagValueFailsFast(t *testing.T) {
 	}
 	defer func() { _ = rawDBI.Close() }()
 
-	_, err = New[uint64, invalidDBITagRec](rawDBI, Options{})
+	_, err = New[uint64, invalidDBITagRec](rawDBI, testOptions(Options{}))
 	if err == nil || !strings.Contains(err.Error(), `invalid index tag value "defualt"`) {
 		t.Fatalf("invalid dbi tag err=%v", err)
 	}
@@ -501,7 +494,7 @@ func TestIndexTags_InvalidActiveTagValueFailsFast(t *testing.T) {
 	}
 	defer func() { _ = rawRBI.Close() }()
 
-	_, err = New[uint64, invalidRBITagRec](rawRBI, Options{})
+	_, err = New[uint64, invalidRBITagRec](rawRBI, testOptions(Options{}))
 	if err == nil || !strings.Contains(err.Error(), `invalid index tag value "autp"`) {
 		t.Fatalf("invalid rbi tag err=%v", err)
 	}
@@ -512,7 +505,7 @@ func TestIndexTags_InvalidActiveTagValueFailsFast(t *testing.T) {
 	}
 	defer func() { _ = rawDBIAuto.Close() }()
 
-	_, err = New[uint64, removedDBIAutoTagRec](rawDBIAuto, Options{})
+	_, err = New[uint64, removedDBIAutoTagRec](rawDBIAuto, testOptions(Options{}))
 	if err == nil || !strings.Contains(err.Error(), `invalid index tag value "auto"`) {
 		t.Fatalf("removed dbi auto tag err=%v", err)
 	}
@@ -523,7 +516,7 @@ func TestIndexTags_InvalidActiveTagValueFailsFast(t *testing.T) {
 	}
 	defer func() { _ = rawRBIAuto.Close() }()
 
-	_, err = New[uint64, removedRBIAutoTagRec](rawRBIAuto, Options{})
+	_, err = New[uint64, removedRBIAutoTagRec](rawRBIAuto, testOptions(Options{}))
 	if err == nil || !strings.Contains(err.Error(), `invalid index tag value "auto"`) {
 		t.Fatalf("removed rbi auto tag err=%v", err)
 	}
@@ -852,12 +845,12 @@ func TestMultiWrap_DifferentStructs(t *testing.T) {
 		}
 	}()
 
-	recDB, err := New[uint64, Rec](rawDB, Options{})
+	recDB, err := New[uint64, Rec](rawDB, testOptions(Options{}))
 	if err != nil {
 		t.Fatalf("Wrap 1 (Rec): %v", err)
 	}
 
-	productDB, err := New[string, Product](rawDB, Options{})
+	productDB, err := New[string, Product](rawDB, testOptions(Options{}))
 	if err != nil {
 		t.Fatalf("Wrap 2 (Product): %v", err)
 	}
@@ -907,12 +900,12 @@ func TestWrap_FailedPopulateFields_DoesNotLeakRegistry(t *testing.T) {
 
 	const bucket = "registry_cleanup_check"
 
-	_, err := New[uint64, invalidUniqueSliceRec](rawDB, Options{BucketName: bucket})
+	_, err := New[uint64, invalidUniqueSliceRec](rawDB, testOptions(Options{BucketName: bucket}))
 	if err == nil {
 		t.Fatalf("expected Wrap failure for invalidUniqueSliceRec")
 	}
 
-	db, err := New[uint64, Rec](rawDB, Options{BucketName: bucket})
+	db, err := New[uint64, Rec](rawDB, testOptions(Options{BucketName: bucket}))
 	if err != nil {
 		t.Fatalf("Wrap after failed Wrap must succeed, got: %v", err)
 	}
@@ -935,7 +928,7 @@ func TestWrap_BuildIndexError_DoesNotCloseCallerBolt(t *testing.T) {
 		t.Fatalf("seed invalid payload: %v", err)
 	}
 
-	_, err := New[uint64, Rec](rawDB, Options{BucketName: bucket})
+	_, err := New[uint64, Rec](rawDB, testOptions(Options{BucketName: bucket}))
 	if err == nil {
 		t.Fatalf("expected Wrap failure on malformed payload")
 	}
@@ -960,13 +953,13 @@ func TestWrap_InvalidBucketName_RejectsUnsafeCharacters(t *testing.T) {
 		"bad name",
 		"1bucket",
 	} {
-		_, err := New[uint64, Rec](rawDB, Options{BucketName: bucket})
+		_, err := New[uint64, Rec](rawDB, testOptions(Options{BucketName: bucket}))
 		if !errors.Is(err, ErrInvalidBucketName) {
 			t.Fatalf("bucket=%q: expected ErrInvalidBucketName, got=%v", bucket, err)
 		}
 	}
 
-	db, err := New[uint64, Rec](rawDB, Options{BucketName: "bucket_name_ok"})
+	db, err := New[uint64, Rec](rawDB, testOptions(Options{BucketName: "bucket_name_ok"}))
 	if err != nil {
 		t.Fatalf("expected valid bucket name to succeed, got: %v", err)
 	}
@@ -982,7 +975,7 @@ func TestWrap_CorruptedPersistedIndex_RebuildsInsteadOfPanicking(t *testing.T) {
 		t.Fatalf("bbolt.Open: %v", err)
 	}
 
-	db, err := New[uint64, Rec](rawDB, Options{})
+	db, err := New[uint64, Rec](rawDB, testOptions(Options{}))
 	if err != nil {
 		t.Fatalf("initial New: %v", err)
 	}
@@ -1014,9 +1007,6 @@ func TestWrap_CorruptedPersistedIndex_RebuildsInsteadOfPanicking(t *testing.T) {
 	defer func() { _ = rawDB2.Close() }()
 
 	var logBuf bytes.Buffer
-	prevLogWriter := log.Writer()
-	log.SetOutput(&logBuf)
-	defer log.SetOutput(prevLogWriter)
 
 	var db2 *DB[uint64, Rec]
 	func() {
@@ -1025,7 +1015,9 @@ func TestWrap_CorruptedPersistedIndex_RebuildsInsteadOfPanicking(t *testing.T) {
 				t.Fatalf("reopen New panicked on corrupted persisted index: %v", r)
 			}
 		}()
-		db2, err = New[uint64, Rec](rawDB2, Options{})
+		db2, err = New[uint64, Rec](rawDB2, Options{
+			Logger: log.New(&logBuf, "", 0),
+		})
 	}()
 	if err != nil {
 		t.Fatalf("reopen New: %v", err)
@@ -1078,7 +1070,7 @@ func TestWrap_MissingPersistedIndex_LogsFullRebuildReason(t *testing.T) {
 		t.Fatalf("bbolt.Open: %v", err)
 	}
 
-	db, err := New[uint64, Rec](rawDB, Options{})
+	db, err := New[uint64, Rec](rawDB, testOptions(Options{}))
 	if err != nil {
 		t.Fatalf("initial New: %v", err)
 	}
@@ -1104,11 +1096,10 @@ func TestWrap_MissingPersistedIndex_LogsFullRebuildReason(t *testing.T) {
 	defer func() { _ = rawDB2.Close() }()
 
 	var logBuf bytes.Buffer
-	prevLogWriter := log.Writer()
-	log.SetOutput(&logBuf)
-	defer log.SetOutput(prevLogWriter)
 
-	db2, err := New[uint64, Rec](rawDB2, Options{})
+	db2, err := New[uint64, Rec](rawDB2, Options{
+		Logger: log.New(&logBuf, "", 0),
+	})
 	if err != nil {
 		t.Fatalf("reopen New: %v", err)
 	}
@@ -1140,7 +1131,32 @@ func TestWrap_MissingPersistedIndex_LogsFullRebuildReason(t *testing.T) {
 	}
 }
 
-func TestWrap_MissingPersistedIndex_WithIndexStoreDisabled_SuppressesPersistedLogs(t *testing.T) {
+func TestWrap_LoggerOptionReceivesIndexBuildLogs(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "custom_logger.db")
+
+	rawDB, err := bbolt.Open(path, 0o600, nil)
+	if err != nil {
+		t.Fatalf("bbolt.Open: %v", err)
+	}
+	defer func() { _ = rawDB.Close() }()
+
+	var customLogBuf bytes.Buffer
+	db, err := New[uint64, Rec](rawDB, Options{
+		Logger: log.New(&customLogBuf, "", 0),
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	gotLog := customLogBuf.String()
+	if !strings.Contains(gotLog, "persisted index missing") {
+		t.Fatalf("expected custom logger to receive rebuild reason, got: %q", gotLog)
+	}
+}
+
+func TestWrap_MissingPersistedIndex_WithIndexStoreDisabled_StillLogsRebuild(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "missing_index_store_disabled.db")
 
@@ -1151,25 +1167,25 @@ func TestWrap_MissingPersistedIndex_WithIndexStoreDisabled_SuppressesPersistedLo
 	defer func() { _ = rawDB.Close() }()
 
 	var logBuf bytes.Buffer
-	prevLogWriter := log.Writer()
-	log.SetOutput(&logBuf)
-	defer log.SetOutput(prevLogWriter)
 
-	db, err := New[uint64, Rec](rawDB, Options{DisableIndexStore: true})
+	db, err := New[uint64, Rec](rawDB, Options{
+		DisableIndexStore: true,
+		Logger:            log.New(&logBuf, "", 0),
+	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
 	defer func() { _ = db.Close() }()
 
 	gotLog := logBuf.String()
-	if strings.Contains(gotLog, "persisted index missing") {
-		t.Fatalf("unexpected missing persisted index log with DisableIndexStore: %q", gotLog)
+	if !strings.Contains(gotLog, "persisted index missing") {
+		t.Fatalf("expected missing persisted index log with DisableIndexStore, got: %q", gotLog)
 	}
-	if strings.Contains(gotLog, "rbi: rebuilding index from bbolt") {
-		t.Fatalf("unexpected rebuild log with DisableIndexStore: %q", gotLog)
+	if !strings.Contains(gotLog, "rbi: rebuilding index from bbolt") {
+		t.Fatalf("expected rebuild log with DisableIndexStore, got: %q", gotLog)
 	}
-	if strings.Contains(gotLog, "rbi: index build completed") {
-		t.Fatalf("unexpected rebuild completion log with DisableIndexStore: %q", gotLog)
+	if !strings.Contains(gotLog, "rbi: index build completed") {
+		t.Fatalf("expected rebuild completion log with DisableIndexStore, got: %q", gotLog)
 	}
 }
 
@@ -1184,10 +1200,10 @@ func TestWrap_PersistedIndexSchemaNarrowing_LogsFullRebuildWhenNoCompatibleIndex
 		t.Fatalf("bbolt.Open: %v", err)
 	}
 
-	db, err := New[uint64, Rec](rawDB, Options{
+	db, err := New[uint64, Rec](rawDB, testOptions(Options{
 		AnalyzeInterval: -1,
 		BucketName:      bucket,
-	})
+	}))
 	if err != nil {
 		t.Fatalf("initial New: %v", err)
 	}
@@ -1208,13 +1224,11 @@ func TestWrap_PersistedIndexSchemaNarrowing_LogsFullRebuildWhenNoCompatibleIndex
 	defer func() { _ = rawDB2.Close() }()
 
 	var logBuf bytes.Buffer
-	prevLogWriter := log.Writer()
-	log.SetOutput(&logBuf)
-	defer log.SetOutput(prevLogWriter)
 
 	db2, err := New[uint64, schemaSubsetRec](rawDB2, Options{
 		AnalyzeInterval: -1,
 		BucketName:      bucket,
+		Logger:          log.New(&logBuf, "", 0),
 	})
 	if err != nil {
 		t.Fatalf("reopen New: %v", err)
@@ -1266,10 +1280,10 @@ func TestWrap_PartialPersistedLoad_RefreshesPlannerStats(t *testing.T) {
 		t.Fatalf("bbolt.Open: %v", err)
 	}
 
-	db, err := New[uint64, plannerStatsPartialBaseRec](rawDB, Options{
+	db, err := New[uint64, plannerStatsPartialBaseRec](rawDB, testOptions(Options{
 		AnalyzeInterval: -1,
 		BucketName:      bucket,
-	})
+	}))
 	if err != nil {
 		t.Fatalf("initial New: %v", err)
 	}
@@ -1295,10 +1309,10 @@ func TestWrap_PartialPersistedLoad_RefreshesPlannerStats(t *testing.T) {
 	}
 	defer func() { _ = rawDB2.Close() }()
 
-	db2, err := New[uint64, plannerStatsPartialNextRec](rawDB2, Options{
+	db2, err := New[uint64, plannerStatsPartialNextRec](rawDB2, testOptions(Options{
 		AnalyzeInterval: -1,
 		BucketName:      bucket,
-	})
+	}))
 	if err != nil {
 		t.Fatalf("reopen New: %v", err)
 	}
@@ -1330,10 +1344,10 @@ func TestWrap_PartialPersistedLoad_PreservesLenZeroComplementFlags(t *testing.T)
 		t.Fatalf("bbolt.Open: %v", err)
 	}
 
-	db, err := New[uint64, lenZeroComplementPartialBaseRec](rawDB, Options{
+	db, err := New[uint64, lenZeroComplementPartialBaseRec](rawDB, testOptions(Options{
 		AnalyzeInterval: -1,
 		BucketName:      bucket,
-	})
+	}))
 	if err != nil {
 		t.Fatalf("initial New: %v", err)
 	}
@@ -1368,13 +1382,11 @@ func TestWrap_PartialPersistedLoad_PreservesLenZeroComplementFlags(t *testing.T)
 	defer func() { _ = rawDB2.Close() }()
 
 	var logBuf bytes.Buffer
-	prevLogWriter := log.Writer()
-	log.SetOutput(&logBuf)
-	defer log.SetOutput(prevLogWriter)
 
 	db2, err := New[uint64, lenZeroComplementPartialNextRec](rawDB2, Options{
 		AnalyzeInterval: -1,
 		BucketName:      bucket,
+		Logger:          log.New(&logBuf, "", 0),
 	})
 	if err != nil {
 		t.Fatalf("reopen New: %v", err)
@@ -1428,12 +1440,12 @@ func TestMultiWrap_SameStruct_DifferentBuckets(t *testing.T) {
 		}
 	}()
 
-	dbUS, err := New[uint64, Rec](rawDB, Options{BucketName: "users_us"})
+	dbUS, err := New[uint64, Rec](rawDB, testOptions(Options{BucketName: "users_us"}))
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	dbEU, err := New[uint64, Rec](rawDB, Options{BucketName: "users_eu"})
+	dbEU, err := New[uint64, Rec](rawDB, testOptions(Options{BucketName: "users_eu"}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1481,11 +1493,11 @@ func TestMultiWrap_ConcurrentWrites(t *testing.T) {
 		}
 	}()
 
-	db1, err := New[uint64, Rec](rawDB, Options{BucketName: "b1"})
+	db1, err := New[uint64, Rec](rawDB, testOptions(Options{BucketName: "b1"}))
 	if err != nil {
 		t.Fatal(err)
 	}
-	db2, err := New[uint64, Rec](rawDB, Options{BucketName: "b2"})
+	db2, err := New[uint64, Rec](rawDB, testOptions(Options{BucketName: "b2"}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1574,8 +1586,8 @@ func TestMultiWrap_ConcurrentWrites(t *testing.T) {
 func TestMultiWrap_ReopenPersistence(t *testing.T) {
 	rawDB, path := openRawBolt(t)
 
-	opts1 := Options{BucketName: "t1"}
-	opts2 := Options{BucketName: "t2"}
+	opts1 := testOptions(Options{BucketName: "t1"})
+	opts2 := testOptions(Options{BucketName: "t2"})
 
 	db1, _ := New[uint64, Rec](rawDB, opts1)
 	db2, _ := New[uint64, Rec](rawDB, opts2)
@@ -1645,12 +1657,12 @@ func TestMultiWrap_CloseBehavior(t *testing.T) {
 	rawDB, _ := openRawBolt(t)
 	// Wrap does not transfer ownership of rawDB to wrapped instances.
 
-	db1, err := New[uint64, Rec](rawDB, Options{BucketName: "b1"})
+	db1, err := New[uint64, Rec](rawDB, testOptions(Options{BucketName: "b1"}))
 	if err != nil {
 		t.Fatalf("Wrap 1: %v", err)
 	}
 
-	db2, err := New[uint64, Rec](rawDB, Options{BucketName: "b2"})
+	db2, err := New[uint64, Rec](rawDB, testOptions(Options{BucketName: "b2"}))
 	if err != nil {
 		t.Fatalf("Wrap 2: %v", err)
 	}
@@ -3274,17 +3286,17 @@ func TestWrap_DoubleOpenCheck(t *testing.T) {
 		}
 	}()
 
-	db1, err := New[uint64, Rec](rawDB, Options{BucketName: "users"})
+	db1, err := New[uint64, Rec](rawDB, testOptions(Options{BucketName: "users"}))
 	if err != nil {
 		t.Fatalf("first open failed: %v", err)
 	}
 
-	_, err = New[uint64, Rec](rawDB, Options{BucketName: "users"})
+	_, err = New[uint64, Rec](rawDB, testOptions(Options{BucketName: "users"}))
 	if err == nil {
 		t.Fatal("expected error on double open, got nil")
 	}
 
-	db2, err := New[uint64, Rec](rawDB, Options{BucketName: "admins"})
+	db2, err := New[uint64, Rec](rawDB, testOptions(Options{BucketName: "admins"}))
 	if err != nil {
 		t.Fatalf("different bucket open failed: %v", err)
 	}
@@ -3293,7 +3305,7 @@ func TestWrap_DoubleOpenCheck(t *testing.T) {
 		t.Fatalf("db1 close: %v", err)
 	}
 
-	db1Reopen, err := New[uint64, Rec](rawDB, Options{BucketName: "users"})
+	db1Reopen, err := New[uint64, Rec](rawDB, testOptions(Options{BucketName: "users"}))
 	if err != nil {
 		t.Fatalf("reopen failed: %v", err)
 	}
@@ -4290,7 +4302,7 @@ func TestNew_DefaultExecOptions_ApplyToWrites(t *testing.T) {
 	var calls []string
 	db, err := New[uint64, Rec](
 		raw,
-		Options{AutoBatchMax: 1},
+		testOptions(Options{AutoBatchMax: 1}),
 		PatchStrict,
 		BeforeProcess(func(_ uint64, value *Rec) error {
 			value.Name = "pre-" + value.Name

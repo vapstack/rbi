@@ -3,7 +3,6 @@ package rbi
 import (
 	"encoding/json"
 	"errors"
-	"log"
 	"math"
 	"os"
 	"time"
@@ -254,7 +253,7 @@ func (db *DB[K, V]) initCalibration() {
 	}
 
 	if err := db.LoadCalibration(path); err != nil && !errors.Is(err, os.ErrNotExist) {
-		log.Printf("rbi: failed to load planner calibration (%v): %v", path, err)
+		db.logger.Printf("rbi: failed to load planner calibration (%v): %v", path, err)
 	}
 }
 

@@ -1913,10 +1913,10 @@ func TestPointerNil_StringQueriesAndOrder(t *testing.T) {
 
 func TestPointerNil_IntQueriesCountRebuildAndReopen(t *testing.T) {
 	db, path := openTempDBUint64PtrInt(t)
-	opts := Options{
+	opts := testOptions(Options{
 		EnableAutoBatchStats: true,
 		EnableSnapshotStats:  true,
-	}
+	})
 
 	rows := map[uint64]*PtrIntRec{
 		1: {Name: "nil", Rank: nil, Active: true},

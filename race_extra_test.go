@@ -40,6 +40,7 @@ func raceExtraOpenTempDBUint64(t *testing.T, opts Options) *DB[uint64, raceExtra
 		t.Fatalf("bbolt.Open: %v", err)
 	}
 
+	opts = testOptions(opts)
 	opts.EnableAutoBatchStats = true
 	opts.EnableSnapshotStats = true
 
@@ -66,6 +67,7 @@ func raceExtraOpenTempDBString(t *testing.T, opts Options) *DB[string, raceExtra
 		t.Fatalf("bbolt.Open: %v", err)
 	}
 
+	opts = testOptions(opts)
 	opts.EnableAutoBatchStats = true
 	opts.EnableSnapshotStats = true
 

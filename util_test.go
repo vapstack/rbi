@@ -247,7 +247,7 @@ func TestCodec_NewRejectsValueReceiverDecodeRBI(t *testing.T) {
 	raw, _ := openRawBolt(t)
 	defer func() { _ = raw.Close() }()
 
-	_, err := New[uint64, codecBadValueDecodeRec](raw, Options{})
+	_, err := New[uint64, codecBadValueDecodeRec](raw, testOptions(Options{}))
 	if err == nil {
 		t.Fatalf("expected New to reject value-receiver DecodeRBI")
 	}
@@ -276,7 +276,7 @@ func TestCodec_NewBuildIndexUsesCodecDecode(t *testing.T) {
 		t.Fatalf("seed custom payload: %v", err)
 	}
 
-	db, err := New[uint64, codecRec](raw, Options{BucketName: bucket})
+	db, err := New[uint64, codecRec](raw, testOptions(Options{BucketName: bucket}))
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}

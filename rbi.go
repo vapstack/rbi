@@ -66,6 +66,11 @@ type Options struct {
 	// to the .rbi file on Close.
 	DisableIndexStore bool
 
+	// Logger receives informational indexer messages.
+	//
+	// Default: standard logger from package log.
+	Logger *log.Logger
+
 	// BucketName overrides the default bucket name.
 	// By default, bucket name is derived from the name of the value type V.
 	//
@@ -241,6 +246,9 @@ type Options struct {
 }
 
 func (o *Options) setDefaults() {
+	if o.Logger == nil {
+		o.Logger = log.Default()
+	}
 	if o.AnalyzeInterval == 0 {
 		o.AnalyzeInterval = defaultOptionsAnalyzeInterval
 	}
@@ -376,6 +384,7 @@ func New[K ~uint64 | ~string, V any](bolt *bbolt.DB, options Options, execOpts .
 
 		options:     &options,
 		execOptions: defaultExecOptions,
+		logger:      options.Logger,
 		encodeFn:    encodeFn,
 		decodeFn:    decodeFn,
 		snapshot: snapshot{
@@ -448,57 +457,46 @@ func New[K ~uint64 | ~string, V any](bolt *bbolt.DB, options Options, execOpts .
 		var (
 			skipFields    map[string]struct{}
 			rebuildReason string
-			logBuild      bool
 		)
 
 		if _, err = os.Stat(db.rbiFile); err == nil {
 			if options.DisableIndexLoad {
 				rebuildReason = "persisted index load disabled"
-				logBuild = !options.DisableIndexStore
 			} else {
 				skipFields, loadedPlannerStats, err = db.loadIndex()
 				if err != nil {
 					rebuildReason = fmt.Sprintf("persisted index unavailable (%v)", err)
 				}
-				logBuild = true
 			}
 		} else if os.IsNotExist(err) {
 			rebuildReason = fmt.Sprintf("persisted index missing (file=%q)", db.rbiFile)
-			logBuild = !options.DisableIndexStore
 		} else if !os.IsNotExist(err) {
 			rebuildReason = fmt.Sprintf("persisted index stat failed (%v)", err)
-			logBuild = true
 		}
 
 		loadedFieldCount = len(skipFields)
 		totalFieldCount := len(db.fields)
 		if rebuildReason != "" {
 			buildMode = "full"
-			if logBuild {
-				log.Printf("rbi: %s", rebuildReason)
-				log.Printf(
-					"rbi: rebuilding index from bbolt (mode=full loaded_fields=%d/%d)",
-					loadedFieldCount,
-					totalFieldCount,
-				)
-			}
+			db.logger.Printf("rbi: %s", rebuildReason)
+			db.logger.Printf(
+				"rbi: rebuilding index from bbolt (mode=full loaded_fields=%d/%d)",
+				loadedFieldCount,
+				totalFieldCount,
+			)
 		} else if totalFieldCount > 0 {
 			if loadedFieldCount == 0 {
 				buildMode = "full"
-				if logBuild {
-					log.Printf("rbi: persisted index has no compatible field indexes (file=%q)", db.rbiFile)
-					log.Printf("rbi: rebuilding index from bbolt (mode=full loaded_fields=0/%d)", totalFieldCount)
-				}
+				db.logger.Printf("rbi: persisted index has no compatible field indexes (file=%q)", db.rbiFile)
+				db.logger.Printf("rbi: rebuilding index from bbolt (mode=full loaded_fields=0/%d)", totalFieldCount)
 			} else if loadedFieldCount < totalFieldCount {
 				buildMode = "partial"
-				if logBuild {
-					log.Printf(
-						"rbi: partially rebuilding index from bbolt (loaded_fields=%d/%d missing_fields=%d)",
-						loadedFieldCount,
-						totalFieldCount,
-						totalFieldCount-loadedFieldCount,
-					)
-				}
+				db.logger.Printf(
+					"rbi: partially rebuilding index from bbolt (loaded_fields=%d/%d missing_fields=%d)",
+					loadedFieldCount,
+					totalFieldCount,
+					totalFieldCount-loadedFieldCount,
+				)
 			}
 		}
 
@@ -506,8 +504,8 @@ func New[K ~uint64 | ~string, V any](bolt *bbolt.DB, options Options, execOpts .
 		if err = db.buildIndex(skipFields); err != nil {
 			return nil, fmt.Errorf("error building index: %w", err)
 		}
-		if logBuild && buildMode != "" {
-			log.Printf("rbi: index build completed (mode=%s duration=%s)", buildMode, time.Since(buildStarted))
+		if buildMode != "" {
+			db.logger.Printf("rbi: index build completed (mode=%s duration=%s)", buildMode, time.Since(buildStarted))
 		}
 	}
 
@@ -911,6 +909,7 @@ type (
 		snapshot    snapshot
 		autoBatcher autoBatcher[K, V]
 		rebuilder   rebuilder
+		logger      *log.Logger
 
 		options     *Options
 		execOptions execOptions[K, V]
@@ -1309,7 +1308,7 @@ func (db *DB[K, V]) publishCurrentSequenceSnapshotNoLock() error {
 
 func (db *DB[K, V]) tripBrokenLocked(op string, cause any) error {
 	if db.broken.CompareAndSwap(false, true) {
-		log.Printf("rbi: index entered broken state: post-commit snapshot publish failed (%v): %v", op, cause)
+		db.logger.Printf("rbi: index entered broken state: post-commit snapshot publish failed (%v): %v", op, cause)
 		if stop := db.planner.analyzer.stop; stop != nil {
 			select {
 			case <-stop:
@@ -1782,7 +1781,7 @@ func (db *DB[K, V]) Close() error {
 		if err == nil {
 			err = e
 		} else {
-			log.Println("rbi: failed to persist planner calibration:", e)
+			db.logger.Println("rbi: failed to persist planner calibration:", e)
 		}
 	}
 	if err == nil && db.broken.Load() {

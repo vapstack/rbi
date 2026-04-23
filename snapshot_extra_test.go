@@ -22,10 +22,10 @@ type snapshotExtraRec struct {
 }
 
 func snapshotExtraOptions() Options {
-	return Options{
+	return testOptions(Options{
 		AutoBatchMax:    1,
 		AnalyzeInterval: -1,
-	}
+	})
 }
 
 func snapshotExtraOpenTempDBUint64(t *testing.T, opts Options) (*DB[uint64, snapshotExtraRec], string) {
@@ -38,6 +38,7 @@ func snapshotExtraOpenTempDBUint64(t *testing.T, opts Options) (*DB[uint64, snap
 		t.Fatalf("bbolt.Open: %v", err)
 	}
 
+	opts = testOptions(opts)
 	opts.EnableAutoBatchStats = true
 	opts.EnableSnapshotStats = true
 
@@ -65,6 +66,7 @@ func snapshotExtraOpenTempDBString(t *testing.T, opts Options) (*DB[string, snap
 		t.Fatalf("bbolt.Open: %v", err)
 	}
 
+	opts = testOptions(opts)
 	opts.EnableAutoBatchStats = true
 	opts.EnableSnapshotStats = true
 
