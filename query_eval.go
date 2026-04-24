@@ -684,6 +684,13 @@ func numericQueryValueToUint64Exact(v reflect.Value) (uint64, bool) {
 	}
 }
 
+func timeQueryValueToInt64Exact(v reflect.Value) (int64, bool) {
+	if unix, ok := queryValueToUnixSeconds(v); ok {
+		return unix, true
+	}
+	return numericQueryValueToInt64Exact(v)
+}
+
 func scalarValueToIdxField(raw any, v reflect.Value, fm *field) (string, error) {
 	if fm != nil && fm.UseVI {
 		if vi, ok := raw.(ValueIndexer); ok {
@@ -705,6 +712,11 @@ func scalarValueToIdxField(raw any, v reflect.Value, fm *field) (string, error) 
 	}
 
 	switch {
+	case isNativeTimeField(fm):
+		if unix, ok := timeQueryValueToInt64Exact(v); ok {
+			return int64ByteStr(unix), nil
+		}
+		return impossibleLookupKey, nil
 	case signedIntFieldKind(fm.Kind):
 		if i, ok := numericQueryValueToInt64Exact(v); ok {
 			return int64ByteStr(i), nil
@@ -723,6 +735,13 @@ func scalarValueToIdxField(raw any, v reflect.Value, fm *field) (string, error) 
 	default:
 		return scalarValueToIdxRaw(raw, v)
 	}
+}
+
+func normalizeUnixTimeRangeBound(op qir.Op, v reflect.Value) normalizedScalarBound {
+	if unix, ok := queryValueToUnixSeconds(v); ok {
+		return normalizedScalarBoundFromIndexKey(op, indexKeyFromU64(orderedInt64Key(unix)))
+	}
+	return normalizeSignedIntRangeBound(op, v)
 }
 
 func normalizeSignedIntRangeBound(op qir.Op, v reflect.Value) normalizedScalarBound {
@@ -910,6 +929,10 @@ func (qv *queryView[K, V]) exprValueToNormalizedScalarBound(expr qir.Expr) (norm
 
 	if fm != nil && !fm.UseVI {
 		switch {
+		case isNativeTimeField(fm):
+			bound := normalizeUnixTimeRangeBound(expr.Op, v)
+			qv.storeNormalizedScalarBound(expr, v, bound)
+			return bound, false, nil
 		case signedIntFieldKind(fm.Kind):
 			bound := normalizeSignedIntRangeBound(expr.Op, v)
 			qv.storeNormalizedScalarBound(expr, v, bound)

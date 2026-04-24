@@ -1400,7 +1400,7 @@ type orderBasicBaseCore struct {
 }
 
 func isOrderBasicCollapsibleNumericRangeExpr(op qir.Expr, fm *field) bool {
-	if op.Not || op.FieldOrdinal < 0 || fm == nil || fm.Slice || !isNumericScalarKind(fm.Kind) {
+	if op.Not || op.FieldOrdinal < 0 || !fieldUsesOrderedNumericKeys(fm) {
 		return false
 	}
 	return isScalarRangeEqOp(op.Op)

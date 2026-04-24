@@ -171,7 +171,7 @@ func (qv *queryView[K, V]) isPositiveMergedNumericRangeLeaf(e qir.Expr) bool {
 		return false
 	}
 	fm := qv.fieldMetaByExpr(e)
-	return fm != nil && !fm.Slice && isNumericScalarKind(fm.Kind)
+	return fieldUsesOrderedNumericKeys(fm)
 }
 
 func isSimpleScalarRangeOrPrefixLeaf(e qir.Expr) bool {
@@ -249,7 +249,7 @@ func (qv *queryView[K, V]) initPreparedExactScalarRangePredicate(
 ) {
 	cacheKey := qv.materializedPredKeyForExactScalarRange(qv.fieldNameByExpr(e), bounds)
 	complementCacheKey := materializedPredKey{}
-	if fm != nil && !fm.Slice && isNumericScalarKind(fm.Kind) && isNumericRangeOp(e.Op) {
+	if fieldUsesOrderedNumericKeys(fm) && isNumericRangeOp(e.Op) {
 		complementCacheKey = qv.materializedPredComplementKeyForExactScalarRange(qv.fieldNameByExpr(e), bounds)
 	}
 	loadReuse := newMaterializedPredReadOnlyReuse(qv.snap, cacheKey)
@@ -264,7 +264,7 @@ func (qv *queryView[K, V]) initPreparedExactScalarRangePredicate(
 		loadReuse:          loadReuse,
 		sharedReuse:        sharedReuse,
 		secondHitReuse:     secondHitReuse,
-		usePostingFilter:   fm != nil && !fm.Slice && isNumericScalarKind(fm.Kind),
+		usePostingFilter:   fieldUsesOrderedNumericKeys(fm),
 	}
 }
 
@@ -318,7 +318,7 @@ func (qv *queryView[K, V]) prepareScalarRangeRoutingCandidate(
 	return preparedScalarRangeRoutingCandidate[K, V]{
 		core:    core,
 		plan:    plan,
-		numeric: isNumericScalarKind(fm.Kind),
+		numeric: fieldUsesOrderedNumericKeys(fm),
 	}, true
 }
 
@@ -348,7 +348,7 @@ func (qv *queryView[K, V]) preparePredicateScalarRangeRoutingCandidate(
 	return preparedScalarRangeRoutingCandidate[K, V]{
 		core:    core,
 		plan:    plan,
-		numeric: isNumericScalarKind(fm.Kind),
+		numeric: fieldUsesOrderedNumericKeys(fm),
 	}, true
 }
 
@@ -869,7 +869,7 @@ func (core *preparedScalarRangePredicate[K, V]) buildFromSlice(
 		}
 	}
 	reuse := core.runtimeReuse(plan.est, useRuntimeComplement)
-	if allowMaterialize && !useRuntimeComplement && core.fm != nil && !isNumericScalarKind(core.fm.Kind) {
+	if allowMaterialize && !useRuntimeComplement && !fieldUsesOrderedNumericKeys(core.fm) {
 		reuse = core.sharedReuse
 	}
 	keepProbeHits := probe.useComplement == core.expr.Not
@@ -960,7 +960,7 @@ func (core *preparedScalarRangePredicate[K, V]) buildFromOverlay(
 		}
 	}
 	reuse := core.runtimeReuse(plan.est, useRuntimeComplement)
-	if allowMaterialize && !useRuntimeComplement && core.fm != nil && !isNumericScalarKind(core.fm.Kind) {
+	if allowMaterialize && !useRuntimeComplement && !fieldUsesOrderedNumericKeys(core.fm) {
 		reuse = core.sharedReuse
 	}
 	materializeAfter := rangeMaterializeAfterForProbe(probe.probeLen, probe.probeEst)
@@ -1130,7 +1130,7 @@ func (qv *queryView[K, V]) loadWarmPreparedScalarExactRange(op preparedScalarExa
 		}
 	}
 	fm := qv.fields[op.field]
-	if fm == nil || fm.Slice || !isNumericScalarKind(fm.Kind) {
+	if !fieldUsesOrderedNumericKeys(fm) {
 		return postingResult{}, false
 	}
 	ov := qv.fieldOverlay(op.field)
@@ -1151,7 +1151,7 @@ func (qv *queryView[K, V]) evalPreparedScalarExactRange(op preparedScalarExactRa
 		}
 	}
 	fm := qv.fields[op.field]
-	if fm == nil || fm.Slice || !isNumericScalarKind(fm.Kind) {
+	if !fieldUsesOrderedNumericKeys(fm) {
 		return postingResult{}, nil
 	}
 	ov := qv.fieldOverlay(op.field)

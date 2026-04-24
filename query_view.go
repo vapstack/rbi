@@ -20,6 +20,7 @@ const (
 	normalizedScalarBoundCacheSigned
 	normalizedScalarBoundCacheUnsigned
 	normalizedScalarBoundCacheFloat
+	normalizedScalarBoundCacheUnixTime
 )
 
 type normalizedScalarBoundCacheEntry struct {
@@ -50,9 +51,17 @@ type queryView[K ~string | ~uint64, V any] struct {
 	normalizedScalarBoundCache    [normalizedScalarBoundCacheMaxEntries]normalizedScalarBoundCacheEntry
 }
 
-func normalizedScalarBoundCacheValue(v reflect.Value) (normalizedScalarBoundCacheEntry, bool) {
+func normalizedScalarBoundCacheValue(v reflect.Value, fm *field) (normalizedScalarBoundCacheEntry, bool) {
 	if !v.IsValid() {
 		return normalizedScalarBoundCacheEntry{}, false
+	}
+	if isNativeTimeField(fm) {
+		if unix, ok := queryValueToUnixSeconds(v); ok {
+			return normalizedScalarBoundCacheEntry{
+				kind: normalizedScalarBoundCacheUnixTime,
+				i64:  unix,
+			}, true
+		}
 	}
 	switch v.Kind() {
 	case reflect.String:
@@ -84,7 +93,7 @@ func (qv *queryView[K, V]) loadNormalizedScalarBound(expr qir.Expr, v reflect.Va
 	if qv == nil {
 		return normalizedScalarBound{}, false
 	}
-	key, ok := normalizedScalarBoundCacheValue(v)
+	key, ok := normalizedScalarBoundCacheValue(v, qv.fieldMetaByExpr(expr))
 	if !ok {
 		return normalizedScalarBound{}, false
 	}
@@ -107,6 +116,10 @@ func (qv *queryView[K, V]) loadNormalizedScalarBound(expr qir.Expr, v reflect.Va
 			if entry.i64 == key.i64 {
 				return entry.bound, true
 			}
+		case normalizedScalarBoundCacheUnixTime:
+			if entry.i64 == key.i64 {
+				return entry.bound, true
+			}
 		case normalizedScalarBoundCacheUnsigned:
 			if entry.u64 == key.u64 {
 				return entry.bound, true
@@ -124,7 +137,7 @@ func (qv *queryView[K, V]) storeNormalizedScalarBound(expr qir.Expr, v reflect.V
 	if qv == nil {
 		return
 	}
-	key, ok := normalizedScalarBoundCacheValue(v)
+	key, ok := normalizedScalarBoundCacheValue(v, qv.fieldMetaByExpr(expr))
 	if !ok {
 		return
 	}

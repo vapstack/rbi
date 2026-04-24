@@ -104,6 +104,35 @@ type reflectPatchTimeRec struct {
 	Windows map[time.Time]string `db:"-"`
 }
 
+type reflectNamedTime time.Time
+type reflectNamedTimePtr *time.Time
+
+type reflectNamedTimeRec struct {
+	When reflectNamedTime `db:"when" dbi:"default"`
+}
+
+type reflectTimePtrRec struct {
+	When *time.Time `db:"when" dbi:"default"`
+}
+
+type reflectNamedTimePtrRec struct {
+	When reflectNamedTimePtr `db:"when" dbi:"default"`
+}
+
+type reflectTimeVI time.Time
+
+func (v reflectTimeVI) IndexingValue() string {
+	return time.Time(v).UTC().Format(time.RFC3339Nano)
+}
+
+type reflectTimeVIRec struct {
+	When reflectTimeVI `db:"when" rbi:"unique"`
+}
+
+type reflectInt64AgeRec struct {
+	Age int64 `db:"age" dbi:"default"`
+}
+
 type reflectNamedTag string
 type reflectNamedTags []reflectNamedTag
 
@@ -322,6 +351,30 @@ func TestReflectExt_QueryValueIndexerSlicePlainStrings_UseCanonicalKeys(t *testi
 	assertUint64Set(t, got, []uint64{1, 2})
 }
 
+func TestReflectExt_QueryValueIndexerScalar_POSSort_TypedPrioritySlice(t *testing.T) {
+	db := openTempDBUint64Reflect[reflectScalarVIRec](t, "reflect_scalar_vi_pos.db")
+
+	if err := db.BatchSet(
+		[]uint64{1, 2, 3},
+		[]*reflectScalarVIRec{
+			{Code: reflectFoldedString("MiXeD")},
+			{Code: reflectFoldedString("other")},
+			{Code: reflectFoldedString("mixed")},
+		},
+	); err != nil {
+		t.Fatalf("BatchSet: %v", err)
+	}
+
+	got, err := db.QueryKeys(qx.Query().SortBy(qx.POS("code", []reflectFoldedString{
+		reflectFoldedString("other"),
+		reflectFoldedString("mixed"),
+	}), qx.ASC))
+	if err != nil {
+		t.Fatalf("QueryKeys(SortBy POS code): %v", err)
+	}
+	assertUint64Slice(t, got, []uint64{2, 1, 3})
+}
+
 func TestReflectExt_QueryValueIndexerScalarUnderlyingSlice_RemainsScalar(t *testing.T) {
 	db := openTempDBUint64Reflect[reflectBytesVIRec](t, "reflect_bytes_vi.db")
 
@@ -360,6 +413,26 @@ func TestReflectExt_QueryValueIndexerScalarUnderlyingSlice_AllowsCanonicalString
 		t.Fatalf("QueryKeys: %v", err)
 	}
 	assertUint64Slice(t, got, []uint64{1})
+}
+
+func TestReflectExt_QueryValueIndexerScalarUnderlyingSlice_POSSort_RemainsScalar(t *testing.T) {
+	db := openTempDBUint64Reflect[reflectBytesVIRec](t, "reflect_bytes_vi_pos.db")
+
+	if err := db.BatchSet(
+		[]uint64{1, 2},
+		[]*reflectBytesVIRec{
+			{Key: reflectHexBytes{0xab, 0xcd}},
+			{Key: reflectHexBytes{0xde, 0xf0}},
+		},
+	); err != nil {
+		t.Fatalf("BatchSet: %v", err)
+	}
+
+	got, err := db.QueryKeys(qx.Query().SortBy(qx.POS("key", reflectHexBytes{0xde, 0xf0}), qx.ASC))
+	if err != nil {
+		t.Fatalf("QueryKeys(SortBy POS key): %v", err)
+	}
+	assertUint64Slice(t, got, []uint64{2, 1})
 }
 
 func TestReflectExt_ValueIndexerDirectIfaceMap_QueryUniqueAndRebuild(t *testing.T) {
@@ -450,6 +523,164 @@ func TestReflectExt_ValueIndexerInterfaceSlice_InitAndWritePath(t *testing.T) {
 	got, err = db.QueryKeys(qx.Query(qx.HASANY("tags", []string{"second"})))
 	if err != nil {
 		t.Fatalf("QueryKeys(second): %v", err)
+	}
+	assertUint64Slice(t, got, []uint64{1})
+}
+
+func TestReflectExt_QueryNativeTimeScalarNamedType_UsesUnixSeconds(t *testing.T) {
+	db := openTempDBUint64Reflect[reflectNamedTimeRec](t, "reflect_named_time.db")
+
+	base := time.Unix(1_700_000_000, 100_000_000).UTC()
+	sameSec := time.Unix(base.Unix(), 900_000_000).UTC()
+	later := base.Add(2 * time.Second)
+
+	if err := db.BatchSet(
+		[]uint64{1, 2, 3},
+		[]*reflectNamedTimeRec{
+			{When: reflectNamedTime(base)},
+			{When: reflectNamedTime(sameSec)},
+			{When: reflectNamedTime(later)},
+		},
+	); err != nil {
+		t.Fatalf("BatchSet: %v", err)
+	}
+
+	got, err := db.QueryKeys(qx.Query(qx.EQ("when", base)))
+	if err != nil {
+		t.Fatalf("QueryKeys(EQ time.Time): %v", err)
+	}
+	assertUint64Set(t, got, []uint64{1, 2})
+
+	got, err = db.QueryKeys(qx.Query(qx.EQ("when", reflectNamedTime(sameSec))))
+	if err != nil {
+		t.Fatalf("QueryKeys(EQ named time): %v", err)
+	}
+	assertUint64Set(t, got, []uint64{1, 2})
+
+	got, err = db.QueryKeys(qx.Query(qx.GTE("when", base.Add(time.Second))))
+	if err != nil {
+		t.Fatalf("QueryKeys(GTE time): %v", err)
+	}
+	assertUint64Slice(t, got, []uint64{3})
+
+	got, err = db.QueryKeys(qx.Query().Sort("when", qx.ASC))
+	if err != nil {
+		t.Fatalf("QueryKeys(Sort when ASC): %v", err)
+	}
+	assertUint64Slice(t, got, []uint64{1, 2, 3})
+}
+
+func TestReflectExt_QueryNativeTimePointer_UsesUnixSecondsAndNilIndex(t *testing.T) {
+	db := openTempDBUint64Reflect[reflectTimePtrRec](t, "reflect_time_ptr.db")
+
+	early := time.Unix(1_700_000_100, 200_000_000).UTC()
+	late := early.Add(3 * time.Second)
+
+	if err := db.BatchSet(
+		[]uint64{1, 2, 3},
+		[]*reflectTimePtrRec{
+			{When: nil},
+			{When: &early},
+			{When: &late},
+		},
+	); err != nil {
+		t.Fatalf("BatchSet: %v", err)
+	}
+
+	got, err := db.QueryKeys(qx.Query(qx.EQ("when", nil)))
+	if err != nil {
+		t.Fatalf("QueryKeys(EQ nil): %v", err)
+	}
+	assertUint64Slice(t, got, []uint64{1})
+
+	got, err = db.QueryKeys(qx.Query(qx.LT("when", late)))
+	if err != nil {
+		t.Fatalf("QueryKeys(LT time): %v", err)
+	}
+	assertUint64Slice(t, got, []uint64{2})
+
+	got, err = db.QueryKeys(qx.Query(qx.GTE("when", early)).Sort("when", qx.ASC))
+	if err != nil {
+		t.Fatalf("QueryKeys(GTE+Sort when ASC): %v", err)
+	}
+	assertUint64Slice(t, got, []uint64{2, 3})
+}
+
+func TestReflectExt_NewRejectsNamedNativeTimePointerType(t *testing.T) {
+	raw, _ := openRawBolt(t)
+	defer func() { _ = raw.Close() }()
+
+	_, err := New[uint64, reflectNamedTimePtrRec](raw, testOptions(Options{}))
+	if err == nil {
+		t.Fatalf("expected New to reject named *time.Time indexed field")
+	}
+	if !strings.Contains(err.Error(), "cannot index field When") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestReflectExt_QueryNativeTimeScalar_POSSort_NormalizesPriorities(t *testing.T) {
+	db := openTempDBUint64Reflect[reflectNamedTimeRec](t, "reflect_named_time_pos.db")
+
+	base := time.Unix(1_700_000_000, 100_000_000).UTC()
+	sameSec := time.Unix(base.Unix(), 900_000_000).UTC()
+	later := base.Add(2 * time.Second)
+
+	if err := db.BatchSet(
+		[]uint64{1, 2, 3},
+		[]*reflectNamedTimeRec{
+			{When: reflectNamedTime(base)},
+			{When: reflectNamedTime(sameSec)},
+			{When: reflectNamedTime(later)},
+		},
+	); err != nil {
+		t.Fatalf("BatchSet: %v", err)
+	}
+
+	got, err := db.QueryKeys(qx.Query().SortBy(qx.POS("when", []time.Time{later, base}), qx.ASC))
+	if err != nil {
+		t.Fatalf("QueryKeys(SortBy POS when): %v", err)
+	}
+	assertUint64Slice(t, got, []uint64{3, 1, 2})
+}
+
+func TestReflectExt_TimeWrapperValueIndexer_PreservesCustomSemantics(t *testing.T) {
+	db := openTempDBUint64Reflect[reflectTimeVIRec](t, "reflect_time_vi.db")
+
+	first := time.Unix(1_700_000_200, 100_000_000).UTC()
+	second := time.Unix(first.Unix(), 900_000_000).UTC()
+
+	if err := db.Set(1, &reflectTimeVIRec{When: reflectTimeVI(first)}); err != nil {
+		t.Fatalf("Set(1): %v", err)
+	}
+	if err := db.Set(2, &reflectTimeVIRec{When: reflectTimeVI(second)}); err != nil {
+		t.Fatalf("Set(2): %v", err)
+	}
+
+	got, err := db.QueryKeys(qx.Query(qx.EQ("when", second.Format(time.RFC3339Nano))))
+	if err != nil {
+		t.Fatalf("QueryKeys(EQ canonical string): %v", err)
+	}
+	assertUint64Slice(t, got, []uint64{2})
+}
+
+func TestReflectExt_QueryMixedNumericAndTimeBounds_DoesNotAliasCache(t *testing.T) {
+	db := openTempDBUint64Reflect[reflectInt64AgeRec](t, "reflect_int64_time_cache.db")
+
+	if err := db.Set(1, &reflectInt64AgeRec{Age: 15}); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+
+	q := qx.Query(
+		qx.OR(
+			qx.GTE("age", time.Unix(10, 0)),
+			qx.GTE("age", int64(10)),
+		),
+	)
+
+	got, err := db.QueryKeys(q)
+	if err != nil {
+		t.Fatalf("QueryKeys(OR mixed time/int64): %v", err)
 	}
 	assertUint64Slice(t, got, []uint64{1})
 }

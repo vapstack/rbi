@@ -1634,7 +1634,7 @@ func (qv *queryView[K, V]) materializedPredKeyForScalar(field string, op qir.Op,
 	if qv.snap.matPredCacheMaxEntries <= 0 {
 		return materializedPredKey{}
 	}
-	if fm := qv.fields[field]; fm != nil && !fm.Slice && isNumericScalarKind(fm.Kind) && len(key) == 8 {
+	if fm := qv.fields[field]; fieldUsesOrderedNumericKeys(fm) && len(key) == 8 {
 		return materializedPredKeyForNumericScalar(field, op, indexKeyFromFixed8String(key))
 	}
 	return materializedPredKeyForScalar(field, op, key)
@@ -1648,7 +1648,7 @@ func (qv *queryView[K, V]) materializedPredComplementKeyForScalar(field string, 
 	if qv.snap.matPredCacheMaxEntries <= 0 {
 		return materializedPredKey{}
 	}
-	if fm := qv.fields[field]; fm != nil && !fm.Slice && isNumericScalarKind(fm.Kind) && len(key) == 8 {
+	if fm := qv.fields[field]; fieldUsesOrderedNumericKeys(fm) && len(key) == 8 {
 		return materializedPredComplementKeyForNumericScalar(field, op, indexKeyFromFixed8String(key))
 	}
 	return materializedPredComplementKeyForScalar(field, op, key)
@@ -3357,7 +3357,7 @@ func (qv *queryView[K, V]) isPositiveOrderedNumericRangeLeaf(e qir.Expr, orderFi
 		return false
 	}
 	fm := qv.fieldMetaByExpr(e)
-	return fm != nil && !fm.Slice && isNumericScalarKind(fm.Kind)
+	return fieldUsesOrderedNumericKeys(fm)
 }
 
 func (qv *queryView[K, V]) buildMergedNumericRangePredicate(
@@ -4189,7 +4189,7 @@ type rangePostingFilterProbe interface {
 }
 
 func shouldUseNumericRangePostingFilter(e qir.Expr, fm *field) bool {
-	if fm == nil || fm.Slice || !isNumericScalarKind(fm.Kind) || !isNumericRangeOp(e.Op) {
+	if !fieldUsesOrderedNumericKeys(fm) || !isNumericRangeOp(e.Op) {
 		return false
 	}
 	return true

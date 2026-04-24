@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"reflect"
 	"slices"
+	"time"
 	"unsafe"
 )
 
@@ -459,6 +460,25 @@ func writeFloatSliceField[S lenFixedValueSink, T floatFieldValue](ptr unsafe.Poi
 	sink.setLen(addDistinctFloatFixedKeysToSink(sliceFieldValue[T](ptr, offset), sink))
 }
 
+func writePtrTimeField[S nilFixedValueSink](ptr unsafe.Pointer, sink S, offset uintptr) {
+	if ptr == nil {
+		return
+	}
+	v := ptrFieldValue[time.Time](ptr, offset)
+	if v == nil {
+		sink.setNil()
+		return
+	}
+	sink.addFixed(buildInt64Key(v.Unix()))
+}
+
+func writeScalarTimeField[S fixedValueSink](ptr unsafe.Pointer, sink S, offset uintptr) {
+	if ptr == nil {
+		return
+	}
+	sink.addFixed(buildInt64Key(scalarFieldValue[time.Time](ptr, offset).Unix()))
+}
+
 func slicesModified[T comparable](lhs, rhs []T) bool {
 	if len(lhs) != len(rhs) {
 		return true
@@ -559,6 +579,50 @@ func valueIndexerSliceReflectAccessorBundle(sliceType reflect.Type, offset uintp
 				}
 			}
 			return false
+		},
+	}
+}
+
+func timeFieldAccessorBundle(offset uintptr, ptr bool) fieldAccessorBundle {
+	if ptr {
+		return fieldAccessorBundle{
+			unique: func(ptr unsafe.Pointer) (string, bool, bool) {
+				if ptr == nil {
+					return "", false, false
+				}
+				v := ptrFieldValue[time.Time](ptr, offset)
+				if v == nil {
+					return "", true, true
+				}
+				return int64ByteStr(v.Unix()), true, false
+			},
+			writeBuild:   func(ptr unsafe.Pointer, sink buildFieldWriteSink) { writePtrTimeField(ptr, sink, offset) },
+			writeOverlay: func(ptr unsafe.Pointer, sink snapshotOverlayWriteSink) { writePtrTimeField(ptr, sink, offset) },
+			writeInsert:  func(ptr unsafe.Pointer, sink snapshotInsertWriteSink) { writePtrTimeField(ptr, sink, offset) },
+			writeScratch: func(ptr unsafe.Pointer, sink *fieldWriteScratch) { writePtrTimeField(ptr, sink, offset) },
+			modified: func(v1, v2 unsafe.Pointer) bool {
+				p1 := ptrFieldValue[time.Time](v1, offset)
+				p2 := ptrFieldValue[time.Time](v2, offset)
+				if p1 == nil || p2 == nil {
+					return p1 != p2
+				}
+				return p1.Unix() != p2.Unix()
+			},
+		}
+	}
+	return fieldAccessorBundle{
+		unique: func(ptr unsafe.Pointer) (string, bool, bool) {
+			if ptr == nil {
+				return "", false, false
+			}
+			return int64ByteStr(scalarFieldValue[time.Time](ptr, offset).Unix()), true, false
+		},
+		writeBuild:   func(ptr unsafe.Pointer, sink buildFieldWriteSink) { writeScalarTimeField(ptr, sink, offset) },
+		writeOverlay: func(ptr unsafe.Pointer, sink snapshotOverlayWriteSink) { writeScalarTimeField(ptr, sink, offset) },
+		writeInsert:  func(ptr unsafe.Pointer, sink snapshotInsertWriteSink) { writeScalarTimeField(ptr, sink, offset) },
+		writeScratch: func(ptr unsafe.Pointer, sink *fieldWriteScratch) { writeScalarTimeField(ptr, sink, offset) },
+		modified: func(v1, v2 unsafe.Pointer) bool {
+			return scalarFieldValue[time.Time](v1, offset).Unix() != scalarFieldValue[time.Time](v2, offset).Unix()
 		},
 	}
 }
@@ -1077,6 +1141,10 @@ func buildPatchValueCopyFn(f *field, fieldType reflect.Type, offset uintptr) pat
 func buildFieldAccessorBundle(f *field, fieldType reflect.Type, offset uintptr) (fieldAccessorBundle, error) {
 	if f == nil {
 		return fieldAccessorBundle{}, nil
+	}
+
+	if isNativeTimeField(f) {
+		return timeFieldAccessorBundle(offset, f.Ptr), nil
 	}
 
 	if f.UseVI {

@@ -2115,7 +2115,7 @@ func (qv *queryView[K, V]) orderedORMaterializedExactRangePredicateCosts(
 		return materializedPredKey{}, 0, 0, 0, false
 	}
 	fm := qv.fieldMetaByExpr(p.expr)
-	if fm == nil || fm.Slice || !isNumericScalarKind(fm.Kind) {
+	if !fieldUsesOrderedNumericKeys(fm) {
 		return materializedPredKey{}, 0, 0, 0, false
 	}
 
@@ -3308,7 +3308,7 @@ func (qv *queryView[K, V]) shouldKeepORBranchNumericRangeLazy(e qir.Expr) bool {
 		return false
 	}
 	fm := qv.fieldMetaByExpr(e)
-	if fm == nil || fm.Slice || !isNumericScalarKind(fm.Kind) {
+	if !fieldUsesOrderedNumericKeys(fm) {
 		return false
 	}
 	candidate, ok := qv.prepareScalarRangeRoutingCandidate(e)
@@ -3341,7 +3341,7 @@ func (qv *queryView[K, V]) shouldForceORBranchNumericRangeMaterialize(e qir.Expr
 		return false
 	}
 	fm := qv.fieldMetaByExpr(e)
-	if fm == nil || fm.Slice || !isNumericScalarKind(fm.Kind) {
+	if !fieldUsesOrderedNumericKeys(fm) {
 		return false
 	}
 	candidate, ok := qv.prepareScalarRangeRoutingCandidate(e)
@@ -3359,7 +3359,7 @@ func (qv *queryView[K, V]) shouldBuildORBranchLeafLazy(e qir.Expr, branchLeafCou
 		return false
 	}
 	fm := qv.fieldMetaByExpr(e)
-	if fm == nil || fm.Slice || !isNumericScalarKind(fm.Kind) {
+	if !fieldUsesOrderedNumericKeys(fm) {
 		return false
 	}
 	candidate, ok := qv.prepareScalarRangeRoutingCandidate(e)
@@ -3411,7 +3411,7 @@ func (qv *queryView[K, V]) mayNeedORBranchRangeRewrite(leaves []qir.Expr) bool {
 			continue
 		}
 		fm := qv.fieldMetaByExpr(e)
-		if fm != nil && !fm.Slice && isNumericScalarKind(fm.Kind) {
+		if fieldUsesOrderedNumericKeys(fm) {
 			if qv.snap != nil && qv.snap.matPredCacheMaxEntries > 0 {
 				return true
 			}

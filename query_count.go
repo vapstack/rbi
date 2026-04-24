@@ -2399,7 +2399,7 @@ func (qv *queryView[K, V]) tryMaterializeBroadRangeComplementPredicateForCount(p
 	if fm == nil || fm.Slice {
 		return false
 	}
-	if !route.coarseMaterialize && !isNumericScalarKind(fm.Kind) {
+	if !route.coarseMaterialize && !fieldUsesOrderedNumericKeys(fm) {
 		return false
 	}
 	candidate, ok := qv.preparePredicateScalarRangeRoutingCandidate(*p)

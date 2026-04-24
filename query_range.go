@@ -573,7 +573,7 @@ func (qv *queryView[K, V]) numericRangeBucketCacheEntry(field string, storage fi
 }
 
 func (qv *queryView[K, V]) tryEvalNumericRangeBuckets(field string, fm *field, ov fieldOverlay, br overlayRange) (postingResult, bool) {
-	if fm == nil || fm.Slice || !isNumericScalarKind(fm.Kind) {
+	if !fieldUsesOrderedNumericKeys(fm) {
 		return postingResult{}, false
 	}
 
@@ -664,7 +664,7 @@ func (qv *queryView[K, V]) tryEvalNumericRangeBuckets(field string, fm *field, o
 }
 
 func (qv *queryView[K, V]) tryLoadNumericRangeBuckets(field string, fm *field, ov fieldOverlay, br overlayRange) (postingResult, bool) {
-	if fm == nil || fm.Slice || !isNumericScalarKind(fm.Kind) {
+	if !fieldUsesOrderedNumericKeys(fm) {
 		return postingResult{}, false
 	}
 
@@ -736,7 +736,7 @@ func (qv *queryView[K, V]) tryLoadNumericRangeBuckets(field string, fm *field, o
 }
 
 func (qv *queryView[K, V]) tryCountSnapshotNumericRange(field string, fm *field, ov fieldOverlay, start, end int) (uint64, bool) {
-	if fm == nil || fm.Slice || !isNumericScalarKind(fm.Kind) {
+	if !fieldUsesOrderedNumericKeys(fm) {
 		return 0, false
 	}
 	if start < 0 || start > end || end > ov.keyCount() {

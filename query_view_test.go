@@ -7,6 +7,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/vapstack/qx"
 	"github.com/vapstack/rbi/internal/pooled"
@@ -61,6 +62,51 @@ func (db *DB[K, V]) currentQueryViewForTests() *queryView[K, V] {
 		planner:           &db.planner,
 		options:           db.options,
 		lenZeroComplement: snap.lenZeroComplement,
+	}
+}
+
+func TestQueryView_NativeTimeNormalizedBoundCache_WorksAndStaysTypeSensitive(t *testing.T) {
+	db := openTempDBUint64Reflect[reflectNamedTimeRec](t, "query_view_time_cache.db")
+
+	when := time.Unix(1_700_001_000, 900_000_000).UTC()
+	if err := db.Set(1, &reflectNamedTimeRec{When: reflectNamedTime(when)}); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+
+	view := db.currentQueryViewForTests()
+	timeExpr := mustTestQIRExprForDB(t, db, qx.GTE("when", when))
+	bound, isSlice, err := view.exprValueToNormalizedScalarBound(timeExpr)
+	if err != nil || isSlice {
+		t.Fatalf("exprValueToNormalizedScalarBound(time): bound=%+v err=%v isSlice=%v", bound, err, isSlice)
+	}
+	if view.normalizedScalarBoundCacheLen != 1 {
+		t.Fatalf("expected one cached native-time bound, got=%d", view.normalizedScalarBoundCacheLen)
+	}
+	if view.normalizedScalarBoundCache[0].kind != normalizedScalarBoundCacheUnixTime {
+		t.Fatalf("expected unix-time cache kind, got=%v", view.normalizedScalarBoundCache[0].kind)
+	}
+
+	bound2, isSlice, err := view.exprValueToNormalizedScalarBound(timeExpr)
+	if err != nil || isSlice {
+		t.Fatalf("exprValueToNormalizedScalarBound(time, second): bound=%+v err=%v isSlice=%v", bound2, err, isSlice)
+	}
+	if bound2 != bound {
+		t.Fatalf("cached native-time bound mismatch: first=%+v second=%+v", bound, bound2)
+	}
+	if view.normalizedScalarBoundCacheLen != 1 {
+		t.Fatalf("expected cache len to stay 1 after hit, got=%d", view.normalizedScalarBoundCacheLen)
+	}
+
+	intExpr := mustTestQIRExprForDB(t, db, qx.GTE("when", int64(when.Unix())))
+	bound3, isSlice, err := view.exprValueToNormalizedScalarBound(intExpr)
+	if err != nil || isSlice {
+		t.Fatalf("exprValueToNormalizedScalarBound(int): bound=%+v err=%v isSlice=%v", bound3, err, isSlice)
+	}
+	if bound3 != bound {
+		t.Fatalf("time and int operands must normalize to the same bound on native-time field: time=%+v int=%+v", bound, bound3)
+	}
+	if view.normalizedScalarBoundCacheLen != 2 {
+		t.Fatalf("expected distinct cache entries for time and int operands, got=%d", view.normalizedScalarBoundCacheLen)
 	}
 }
 

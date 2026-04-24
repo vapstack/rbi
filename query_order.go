@@ -477,7 +477,7 @@ func (qv *queryView[K, V]) queryOrderArrayPosOverlay(result postingResult, ov fi
 		return nil, nil
 	}
 
-	vals, err := qv.orderDataValues(o.Data)
+	vals, err := qv.orderDataValues(o.Data, qv.fieldMetaByOrder(o))
 	if err != nil {
 		return nil, err
 	}
@@ -575,7 +575,7 @@ func (qv *queryView[K, V]) queryOrderArrayPosScalarOverlay(result postingResult,
 	return cursor.out, nil
 }
 
-func (qv *queryView[K, V]) orderDataValues(v any) ([]string, error) {
+func (qv *queryView[K, V]) orderDataValues(v any, fm *field) ([]string, error) {
 	if vals, ok := v.([]string); ok {
 		return vals, nil
 	}
@@ -589,8 +589,12 @@ func (qv *queryView[K, V]) orderDataValues(v any) ([]string, error) {
 	if isNil {
 		return nil, nil
 	}
-	if queryValueIsCollectionForField(rv, nil) {
-		valsBuf, _, err := sliceValueToIdxStringBuf(rv, nil)
+	collection := queryValueIsCollectionForField(rv, fm)
+	if !collection && rv.Kind() == reflect.Slice {
+		collection = !rv.Type().Implements(viType)
+	}
+	if collection {
+		valsBuf, _, err := sliceValueToIdxStringBuf(rv, fm)
 		if err != nil {
 			return nil, err
 		}
@@ -606,7 +610,7 @@ func (qv *queryView[K, V]) orderDataValues(v any) ([]string, error) {
 		return out, nil
 	}
 
-	key, err := scalarValueToIdxField(v, rv, nil)
+	key, err := scalarValueToIdxField(v, rv, fm)
 	if err != nil {
 		return nil, err
 	}

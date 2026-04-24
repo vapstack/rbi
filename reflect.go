@@ -6,6 +6,7 @@ import (
 	"reflect"
 	"slices"
 	"strings"
+	"time"
 	"unsafe"
 )
 
@@ -48,9 +49,39 @@ type ValueIndexer interface {
 	IndexingValue() string
 }
 
-var viType = reflect.TypeFor[ValueIndexer]()
+var (
+	viType         = reflect.TypeFor[ValueIndexer]()
+	nativeTimeType = reflect.TypeFor[time.Time]()
+	nativeTimePtr  = reflect.TypeFor[*time.Time]()
+)
 
-func inferFieldWriteKeyKind(kind reflect.Kind, useVI bool) fieldWriteKeyKind {
+func isNativeTimeScalarType(t reflect.Type) bool {
+	return t != nil && t.ConvertibleTo(nativeTimeType)
+}
+
+func isNativeTimePointerType(t reflect.Type) bool {
+	return t == nativeTimePtr
+}
+
+func isNativeTimeField(f *field) bool {
+	return f != nil && !f.Slice && !f.UseVI && f.Kind == reflect.Struct && f.KeyKind == fieldWriteKeysOrderedU64
+}
+
+func fieldUsesOrderedNumericKeys(f *field) bool {
+	return f != nil && !f.Slice && f.KeyKind == fieldWriteKeysOrderedU64
+}
+
+func queryValueToUnixSeconds(v reflect.Value) (int64, bool) {
+	if !v.IsValid() || !v.Type().ConvertibleTo(nativeTimeType) {
+		return 0, false
+	}
+	return v.Convert(nativeTimeType).Interface().(time.Time).Unix(), true
+}
+
+func inferFieldWriteKeyKind(kind reflect.Kind, useVI, nativeTime bool) fieldWriteKeyKind {
+	if nativeTime {
+		return fieldWriteKeysOrderedU64
+	}
 	if useVI {
 		return fieldWriteKeysString
 	}
@@ -120,12 +151,14 @@ func (db *DB[K, V]) populateFields(t reflect.Type, idx []int) error {
 		kind := f.Type.Kind()
 
 		var (
-			ptr   bool
-			slice bool
-			useVI bool
+			ptr        bool
+			slice      bool
+			useVI      bool
+			nativeTime bool
 		)
 
 		useVI = f.Type.Implements(viType)
+		nativeTime = !useVI && isNativeTimeScalarType(f.Type)
 
 		if kind == reflect.Slice && !useVI {
 			slice = true
@@ -159,7 +192,9 @@ func (db *DB[K, V]) populateFields(t reflect.Type, idx []int) error {
 			switch kind {
 
 			case reflect.Struct:
-				return fmt.Errorf("cannot index field %v of type %v, consider implementing ValueIndexer interface", f.Name, f.Type)
+				if !nativeTime {
+					return fmt.Errorf("cannot index field %v of type %v, consider implementing ValueIndexer interface", f.Name, f.Type)
+				}
 
 			case reflect.Array:
 				return fmt.Errorf("cannot index field %v of array type, use slice instead", f.Name)
@@ -176,6 +211,12 @@ func (db *DB[K, V]) populateFields(t reflect.Type, idx []int) error {
 				return fmt.Errorf("cannot index field %v of type %v", f.Name, f.Type)
 
 			case reflect.Pointer:
+				if isNativeTimePointerType(f.Type) {
+					ptr = true
+					kind = reflect.Struct
+					nativeTime = true
+					break
+				}
 				ptr = true
 				kind = f.Type.Elem().Kind()
 				switch kind {
@@ -213,7 +254,7 @@ func (db *DB[K, V]) populateFields(t reflect.Type, idx []int) error {
 			Ptr:     ptr,
 			Slice:   slice,
 			UseVI:   useVI,
-			KeyKind: inferFieldWriteKeyKind(kind, useVI),
+			KeyKind: inferFieldWriteKeyKind(kind, useVI, nativeTime),
 			DBName:  dbname,
 			Index:   append(slices.Clone(idx), i),
 		}
