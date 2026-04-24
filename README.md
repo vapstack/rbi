@@ -27,7 +27,7 @@ RBI is not a replacement for a relational database.
   - slices: `IN`, `HAS`, `HASANY`
   - strings: `PREFIX`, `SUFFIX`, `CONTAINS`
   - logical: `AND`, `OR`, `NOT`
-* Index-based ordering with offset / limit, including `ByArrayPos` and `ByArrayCount`
+* Index-based ordering with offset/limit, including sorting by array position/count
 * Partial updates (`Patch*`) with minimal index churn
 * Batch and auto-batched writes
 * Uniqueness constraints
@@ -175,8 +175,9 @@ Query methods:
 #### Supported `qx` subset:
 
 - Supported predicate helpers:\
-  `AND`, `OR`, `NOT`, `EQ`, `NE`, `GT`, `GTE`, `LT`, `LTE`, `IN`, 
-  `NOTIN`, `HASALL`, `HASANY`, `HASNONE`, `PREFIX`, `SUFFIX`, and `CONTAINS`.
+  `AND`, `OR`, `NOT`, `EQ`, `NE`/`NOTEQ`, `GT`, `GTE`, `LT`, `LTE`, `IN`,
+  `NOTIN`, `HASALL`, `HASANY`, `HASNONE`, `ISNULL`, `NOTNULL`,
+  `PREFIX`, `SUFFIX`, and `CONTAINS`.
 - Predicate left-hand side must always be a source field reference.
 - Predicate right-hand side must always be a literal value.
 - No computed expressions on any side.

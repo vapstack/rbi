@@ -471,6 +471,19 @@ func compileFilter[R FieldResolver](q *Query, src qx.Expr, compiler *prepareComp
 		return compileLeaf(OpHASALL, false, src.Args, compiler)
 	case qx.OpHASANY:
 		return compileLeaf(OpHASANY, false, src.Args, compiler)
+	case qx.OpISNULL:
+		if len(src.Args) != 1 {
+			return Expr{}, fmt.Errorf("rbi: invalid %s expression", qx.OpISNULL)
+		}
+		_, fieldOrdinal, err := compileFieldRef(src.Args[0], compiler)
+		if err != nil {
+			return Expr{}, err
+		}
+		return Expr{
+			Op:           OpEQ,
+			FieldOrdinal: fieldOrdinal,
+			Value:        nil,
+		}, nil
 	case qx.OpPREFIX:
 		return compileLeaf(OpPREFIX, false, src.Args, compiler)
 	case qx.OpSUFFIX:

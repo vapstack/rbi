@@ -112,6 +112,67 @@ func TestQuery_PointerField_NilVsZeroValue(t *testing.T) {
 	}
 }
 
+func TestQuery_PointerField_ISNULLAndNOTNULLAliases(t *testing.T) {
+	db, _ := openTempDBUint64(t)
+
+	sEmpty := ""
+	sVal := "val"
+
+	if err := db.Set(1, &Rec{Name: "nil_opt", Opt: nil}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Set(2, &Rec{Name: "empty_opt", Opt: &sEmpty}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Set(3, &Rec{Name: "val_opt", Opt: &sVal}); err != nil {
+		t.Fatal(err)
+	}
+
+	gotEqNil, err := db.QueryKeys(qx.Query(qx.EQ("opt", nil)))
+	if err != nil {
+		t.Fatalf("QueryKeys(EQ nil): %v", err)
+	}
+	gotIsNull, err := db.QueryKeys(qx.Query(qx.ISNULL("opt")))
+	if err != nil {
+		t.Fatalf("QueryKeys(ISNULL): %v", err)
+	}
+	assertSameSlice(t, gotIsNull, gotEqNil)
+
+	gotNeNil, err := db.QueryKeys(qx.Query(qx.NE("opt", nil)))
+	if err != nil {
+		t.Fatalf("QueryKeys(NE nil): %v", err)
+	}
+	gotNotNull, err := db.QueryKeys(qx.Query(qx.NOTNULL("opt")))
+	if err != nil {
+		t.Fatalf("QueryKeys(NOTNULL): %v", err)
+	}
+	assertSameSet(t, gotNotNull, gotNeNil)
+
+	cntEqNil, err := db.Count(qx.Query(qx.EQ("opt", nil)).Filter)
+	if err != nil {
+		t.Fatalf("Count(EQ nil): %v", err)
+	}
+	cntIsNull, err := db.Count(qx.Query(qx.ISNULL("opt")).Filter)
+	if err != nil {
+		t.Fatalf("Count(ISNULL): %v", err)
+	}
+	if cntIsNull != cntEqNil {
+		t.Fatalf("Count(ISNULL): got=%d want=%d", cntIsNull, cntEqNil)
+	}
+
+	cntNeNil, err := db.Count(qx.Query(qx.NE("opt", nil)).Filter)
+	if err != nil {
+		t.Fatalf("Count(NE nil): %v", err)
+	}
+	cntNotNull, err := db.Count(qx.Query(qx.NOTNULL("opt")).Filter)
+	if err != nil {
+		t.Fatalf("Count(NOTNULL): %v", err)
+	}
+	if cntNotNull != cntNeNil {
+		t.Fatalf("Count(NOTNULL): got=%d want=%d", cntNotNull, cntNeNil)
+	}
+}
+
 func TestQuery_Iterator_KeepsEmptyStringKey(t *testing.T) {
 	db, _ := openTempDBUint64(t)
 

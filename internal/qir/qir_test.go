@@ -81,6 +81,42 @@ func TestPrepareQuery_POSScalarStringRejected(t *testing.T) {
 	}
 }
 
+func TestPrepareCountExpr_ISNULLCompilesAsEqNil(t *testing.T) {
+	got, err := PrepareCountExprResolved(testPrepareFieldResolver, qx.ISNULL("status"))
+	if err != nil {
+		t.Fatalf("PrepareCountExprResolved(ISNULL): %v", err)
+	}
+	defer got.Release()
+
+	want, err := PrepareCountExprResolved(testPrepareFieldResolver, qx.EQ("status", nil))
+	if err != nil {
+		t.Fatalf("PrepareCountExprResolved(EQ nil): %v", err)
+	}
+	defer want.Release()
+
+	if !reflect.DeepEqual(got.Expr, want.Expr) {
+		t.Fatalf("unexpected compiled expr:\n got=%+v\nwant=%+v", got.Expr, want.Expr)
+	}
+}
+
+func TestPrepareCountExpr_NOTNULLCompilesAsNeNil(t *testing.T) {
+	got, err := PrepareCountExprResolved(testPrepareFieldResolver, qx.NOTNULL("status"))
+	if err != nil {
+		t.Fatalf("PrepareCountExprResolved(NOTNULL): %v", err)
+	}
+	defer got.Release()
+
+	want, err := PrepareCountExprResolved(testPrepareFieldResolver, qx.NE("status", nil))
+	if err != nil {
+		t.Fatalf("PrepareCountExprResolved(NE nil): %v", err)
+	}
+	defer want.Release()
+
+	if !reflect.DeepEqual(got.Expr, want.Expr) {
+		t.Fatalf("unexpected compiled expr:\n got=%+v\nwant=%+v", got.Expr, want.Expr)
+	}
+}
+
 func TestQueryReleaseOwned_ClearsInlineOrderStorage(t *testing.T) {
 	q := queryPool.Get()
 	q.setOrder(Order{
