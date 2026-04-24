@@ -1389,6 +1389,96 @@ func TestBatch_BeforeCommitError_IsolatesFailedRequest(t *testing.T) {
 	}
 }
 
+func TestBatch_OversizeIndexedString_IsolatesFailedRequest(t *testing.T) {
+	db, _ := openTempDBUint64(t)
+
+	badVal := &Rec{Name: "bad", Email: strings.Repeat("x", fieldIndexStringRefMax+1)}
+	goodVal := &Rec{Name: "good", Email: "good@example.com"}
+
+	badReq := &autoBatchRequest[uint64, Rec]{
+		op:         autoBatchSet,
+		id:         1,
+		setValue:   badVal,
+		setPayload: mustEncodeAutoBatchPayload(t, db, badVal),
+		done:       make(chan error, 1),
+	}
+	goodReq := &autoBatchRequest[uint64, Rec]{
+		op:         autoBatchSet,
+		id:         2,
+		setValue:   goodVal,
+		setPayload: mustEncodeAutoBatchPayload(t, db, goodVal),
+		done:       make(chan error, 1),
+	}
+
+	db.executeAutoBatch([]*autoBatchRequest[uint64, Rec]{badReq, goodReq})
+
+	if err := <-badReq.done; err == nil || !strings.Contains(err.Error(), "exceeds limit") {
+		t.Fatalf("bad request must fail with indexed string limit error, got: %v", err)
+	}
+	if err := <-goodReq.done; err != nil {
+		t.Fatalf("good request must succeed, got: %v", err)
+	}
+
+	if got, err := db.Get(1); err != nil {
+		t.Fatalf("Get(1): %v", err)
+	} else if got != nil {
+		t.Fatalf("id=1 must not persist after indexed string validation failure, got: %#v", got)
+	}
+	if got, err := db.Get(2); err != nil {
+		t.Fatalf("Get(2): %v", err)
+	} else if got == nil || got.Email != goodVal.Email {
+		t.Fatalf("id=2 must persist after isolation retry, got: %#v", got)
+	}
+}
+
+func TestAutoBatchExt_RepeatedPatchSameID_OversizeIndexedString_IsolatesOnlyBadRequest(t *testing.T) {
+	db, _ := openTempDBUint64(t)
+
+	if err := db.Set(1, &Rec{Name: "seed", Age: 10, Email: "seed@example.com"}); err != nil {
+		t.Fatalf("seed Set(1): %v", err)
+	}
+
+	req1 := mustBuildPatchAutoReq(t, db, 1, []Field{{Name: "age", Value: 20}}, true, nil, nil, nil)
+	req2 := mustBuildPatchAutoReq(
+		t,
+		db,
+		1,
+		[]Field{{Name: "email", Value: strings.Repeat("x", fieldIndexStringRefMax+1)}},
+		true,
+		nil,
+		nil,
+		nil,
+	)
+	req3 := mustBuildSetAutoReq(t, db, 2, &Rec{Name: "good", Age: 30, Email: "good@example.com"}, nil, nil, nil)
+
+	batch := popQueuedSingleReqBatch(t, db, req1, req2, req3)
+	if len(batch) != 3 {
+		t.Fatalf("popped batch size = %d, want 3", len(batch))
+	}
+	db.executeAutoBatchJobs(batch)
+
+	if err := mustAutoBatchErr(t, req1); err != nil {
+		t.Fatalf("req1 error = %v", err)
+	}
+	if err := mustAutoBatchErr(t, req2); err == nil || !strings.Contains(err.Error(), "exceeds limit") {
+		t.Fatalf("req2 must fail with indexed string limit error, got: %v", err)
+	}
+	if err := mustAutoBatchErr(t, req3); err != nil {
+		t.Fatalf("req3 error = %v", err)
+	}
+
+	if got, err := db.Get(1); err != nil {
+		t.Fatalf("Get(1): %v", err)
+	} else if got == nil || got.Age != 20 || got.Email != "seed@example.com" {
+		t.Fatalf("id=1 final state = %#v, want age-only update with original email", got)
+	}
+	if got, err := db.Get(2); err != nil {
+		t.Fatalf("Get(2): %v", err)
+	} else if got == nil || got.Email != "good@example.com" {
+		t.Fatalf("id=2 final state = %#v, want persisted good record", got)
+	}
+}
+
 func TestBatch_BeforeCommitError_Isolation_RechecksUniqueAfterRetry(t *testing.T) {
 	db, _ := openTempDBUint64Unique(t)
 

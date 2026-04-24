@@ -876,6 +876,12 @@ func (db *DB[K, V]) prepareAutoBatchSet(att *autoBatchAttemptState[K, V], req *a
 	newVal := req.setValue
 	payload := req.payloadBytes()
 	var ownedPayload *bytes.Buffer
+	releaseDecodedNewVal := false
+	defer func() {
+		if releaseDecodedNewVal {
+			db.ReleaseRecords(newVal)
+		}
+	}()
 
 	if len(req.beforeStore) > 0 {
 		if att.statsEnabled {
@@ -893,12 +899,18 @@ func (db *DB[K, V]) prepareAutoBatchSet(att *autoBatchAttemptState[K, V], req *a
 				req.err = fmt.Errorf("decode prepared value: %w", err)
 				return
 			}
+			releaseDecodedNewVal = true
 		}
 		if err = runBeforeStoreHooks(req.id, oldVal, newVal, req.beforeStore); err != nil {
 			req.err = err
 			if att.statsEnabled {
 				db.autoBatcher.callbackErrors.Add(1)
 			}
+			return
+		}
+
+		if err = db.validateIndexedStringValues(newVal); err != nil {
+			req.err = err
 			return
 		}
 
@@ -911,6 +923,13 @@ func (db *DB[K, V]) prepareAutoBatchSet(att *autoBatchAttemptState[K, V], req *a
 		ownedPayload = buf
 		att.ownedPayloads = append(att.ownedPayloads, buf)
 		payload = buf.Bytes()
+	}
+
+	if len(req.beforeStore) == 0 {
+		if err = db.validateIndexedStringValues(newVal); err != nil {
+			req.err = err
+			return
+		}
 	}
 
 	if !db.transparent {
@@ -927,6 +946,7 @@ func (db *DB[K, V]) prepareAutoBatchSet(att *autoBatchAttemptState[K, V], req *a
 		newVal:  newVal,
 	})
 	state.value = newVal
+	releaseDecodedNewVal = false
 	if ownedPayload != nil {
 		state.setOwnedPayload(ownedPayload)
 	} else {
@@ -954,6 +974,12 @@ func (db *DB[K, V]) prepareAutoBatchPatch(att *autoBatchAttemptState[K, V], req 
 		req.err = fmt.Errorf("failed to re-decode value for patching: %w", err)
 		return
 	}
+	releaseDecodedNewVal := true
+	defer func() {
+		if releaseDecodedNewVal {
+			db.ReleaseRecords(newVal)
+		}
+	}()
 	if err = db.applyPatch(newVal, req.patch, req.patchIgnoreUnknown); err != nil {
 		req.err = fmt.Errorf("failed to apply patch: %w", err)
 		return
@@ -975,6 +1001,11 @@ func (db *DB[K, V]) prepareAutoBatchPatch(att *autoBatchAttemptState[K, V], req 
 			}
 			return
 		}
+	}
+
+	if err = db.validateIndexedStringValues(newVal); err != nil {
+		req.err = err
+		return
 	}
 
 	buf := encodePool.Get()
@@ -999,6 +1030,7 @@ func (db *DB[K, V]) prepareAutoBatchPatch(att *autoBatchAttemptState[K, V], req 
 		newVal:  newVal,
 	})
 	state.value = newVal
+	releaseDecodedNewVal = false
 	state.setOwnedPayload(buf)
 }
 
@@ -1146,32 +1178,31 @@ acceptedLoop:
 			return nil, err
 		}
 
-		if len(op.req.beforeCommit) == 0 {
-			continue
-		}
-		if stats && len(op.req.beforeStore) == 0 {
-			db.autoBatcher.callbackOps.Add(1)
-		}
-		if err = runBeforeCommitHooks(tx, op.req.id, op.oldVal, op.newVal, op.req.beforeCommit); err != nil {
-			err = fmt.Errorf(
-				"before_commit op=%s id=%v idx=%d key_len=%d payload_len=%d: %w",
-				autoBatchOpString(op.req.op),
-				op.req.id,
-				op.idx,
-				len(op.key),
-				len(op.payload),
-				err,
-			)
-			op.req.err = err
-			if stats {
-				db.autoBatcher.callbackErrors.Add(1)
-				db.autoBatcher.txOpErrors.Add(1)
+		if len(op.req.beforeCommit) > 0 {
+			if stats && len(op.req.beforeStore) == 0 {
+				db.autoBatcher.callbackOps.Add(1)
 			}
-			if !atomicAll {
-				callbackFailedReq = op.req
-				break
+			if err = runBeforeCommitHooks(tx, op.req.id, op.oldVal, op.newVal, op.req.beforeCommit); err != nil {
+				err = fmt.Errorf(
+					"before_commit op=%s id=%v idx=%d key_len=%d payload_len=%d: %w",
+					autoBatchOpString(op.req.op),
+					op.req.id,
+					op.idx,
+					len(op.key),
+					len(op.payload),
+					err,
+				)
+				op.req.err = err
+				if stats {
+					db.autoBatcher.callbackErrors.Add(1)
+					db.autoBatcher.txOpErrors.Add(1)
+				}
+				if !atomicAll {
+					callbackFailedReq = op.req
+					break
+				}
+				return nil, err
 			}
-			return nil, err
 		}
 	}
 

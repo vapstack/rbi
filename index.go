@@ -1023,7 +1023,29 @@ func (db *DB[K, V]) buildIndex(skipFields map[string]struct{}) error {
 				lu = lu.BuildAdded(idx)
 
 				for k := range active {
-					active[k].acc.writeBuild(ptr, buildFieldWriteSink{state: &localStates[k], idx: idx})
+					var fieldErr error
+					active[k].acc.writeBuild(ptr, buildFieldWriteSink{
+						state: &localStates[k],
+						idx:   idx,
+						field: active[k].acc.name,
+						err:   &fieldErr,
+					})
+					if fieldErr != nil {
+						*val = zero
+						db.recPool.Put(val)
+						localUniverse[widx] = lu
+						workerErrs[widx] = fmt.Errorf(
+							"worker=%d stage=index scan_pos=%d %s idx=%d field=%q: %w",
+							widx,
+							kv.pos,
+							db.formatBuildIndexKeyDiagnostic(kv.key),
+							kv.idx,
+							active[k].acc.name,
+							fieldErr,
+						)
+						cancel()
+						return
+					}
 					if localStates[k].shouldFlushRegular() {
 						localStates[k].flushRegularInto(fieldStates[k])
 					}
@@ -1227,22 +1249,62 @@ func addDistinctStrings(n int, valueAt func(int) string, add func(string)) int {
 type buildFieldWriteSink struct {
 	state *buildIndexFieldLocalState
 	idx   uint64
+	field string
+	err   *error
 }
 
 func (s buildFieldWriteSink) setNil() {
+	if s.state == nil {
+		return
+	}
 	s.state.addNil(s.idx)
 }
 
 func (s buildFieldWriteSink) setLen(length int) {
+	if s.state == nil {
+		return
+	}
 	s.state.addLen(length, s.idx)
 }
 
 func (s buildFieldWriteSink) addString(key string) {
+	if s.err != nil && *s.err == nil && indexedStringKeyTooLongLen(len(key)) {
+		if s.field != "" {
+			*s.err = fmt.Errorf("field %q indexed string value len %d exceeds limit %d", s.field, len(key), fieldIndexStringRefMax)
+		} else {
+			*s.err = validateIndexedStringKeyLen(len(key))
+		}
+		return
+	}
+	if s.state == nil {
+		return
+	}
 	s.state.addValue(key, s.idx)
 }
 
 func (s buildFieldWriteSink) addFixed(key uint64) {
+	if s.state == nil {
+		return
+	}
 	s.state.addFixedValue(key, s.idx)
+}
+
+func (db *DB[K, V]) validateIndexedStringValues(val *V) error {
+	if val == nil {
+		return nil
+	}
+	ptr := unsafe.Pointer(val)
+	for _, acc := range db.indexedStringValidationAccess {
+		var fieldErr error
+		acc.writeBuild(ptr, buildFieldWriteSink{
+			field: acc.name,
+			err:   &fieldErr,
+		})
+		if fieldErr != nil {
+			return fieldErr
+		}
+	}
+	return nil
 }
 
 func indexKeyFromStoredString(s string, fixed8 bool) indexKey {
@@ -2697,7 +2759,13 @@ func readFieldIndexChunk(reader *bufio.Reader) (*fieldIndexChunk, error) {
 					return nil, fmt.Errorf("reading string chunk key %d/%d: %w", i+1, len(refs), err)
 				}
 			}
-			refs[i] = fieldIndexStringRef{off: uint32(start), len: uint32(keyLen)}
+			if !fieldIndexStringRefFits(start, keyLen) {
+				if keyLen > fieldIndexStringRefMax {
+					return nil, fmt.Errorf("string chunk key len exceeds uint16 at entry %d/%d: %d", i+1, len(refs), keyLen)
+				}
+				return nil, fmt.Errorf("string chunk key offset exceeds uint16 at entry %d/%d: %d", i+1, len(refs), start)
+			}
+			refs[i] = newFieldIndexStringRef(start, keyLen)
 			ids, err := posting.ReadFrom(reader)
 			if err != nil {
 				return nil, fmt.Errorf("reading string chunk posting %d/%d: %w", i+1, len(refs), err)
@@ -2789,6 +2857,9 @@ func readIndexKey(reader *bufio.Reader) (indexKey, error) {
 	case indexKeyEncodingString:
 		s, err := readString(reader)
 		if err != nil {
+			return indexKey{}, err
+		}
+		if err := validateIndexedStringKeyLen(len(s)); err != nil {
 			return indexKey{}, err
 		}
 		return indexKeyFromString(s), nil

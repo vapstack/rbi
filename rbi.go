@@ -545,12 +545,14 @@ func New[K ~uint64 | ~string, V any](bolt *bbolt.DB, options Options, execOpts .
 func (db *DB[K, V]) initIndexedFieldAccessors() error {
 	if len(db.fields) == 0 {
 		db.indexedFieldAccess = nil
+		db.indexedStringValidationAccess = nil
 		db.indexedFieldByName = nil
 		db.uniqueFieldAccessors = nil
 		return nil
 	}
 
 	db.indexedFieldAccess = make([]indexedFieldAccessor, 0, len(db.fields))
+	db.indexedStringValidationAccess = make([]indexedFieldAccessor, 0, len(db.fields))
 	db.indexedFieldByName = make(map[string]indexedFieldAccessor, len(db.fields))
 	db.uniqueFieldAccessors = make([]indexedFieldAccessor, 0, 4)
 
@@ -568,6 +570,9 @@ func (db *DB[K, V]) initIndexedFieldAccessors() error {
 		}
 		acc.ordinal = len(db.indexedFieldAccess)
 		db.indexedFieldAccess = append(db.indexedFieldAccess, acc)
+		if f.UseVI || f.Kind == reflect.String {
+			db.indexedStringValidationAccess = append(db.indexedStringValidationAccess, acc)
+		}
 		db.indexedFieldByName[f.DBName] = acc
 		if f.Unique && !f.Slice {
 			db.uniqueFieldAccessors = append(db.uniqueFieldAccessors, acc)
@@ -894,16 +899,17 @@ type (
 		hasUnique      bool
 		lenIndexLoaded bool
 
-		indexedFieldAccess   []indexedFieldAccessor
-		indexedFieldByName   map[string]indexedFieldAccessor
-		uniqueFieldAccessors []indexedFieldAccessor
-		index                *pooled.SliceBuf[fieldIndexStorage]
-		nilIndex             *pooled.SliceBuf[fieldIndexStorage]
-		lenIndex             *pooled.SliceBuf[fieldIndexStorage]
-		lenZeroComplement    *pooled.SliceBuf[bool]
-		patchMap             map[string]*field
-		patchFieldAccess     []patchFieldAccessor
-		patchFieldOrdinal    map[string]int
+		indexedFieldAccess            []indexedFieldAccessor
+		indexedStringValidationAccess []indexedFieldAccessor
+		indexedFieldByName            map[string]indexedFieldAccessor
+		uniqueFieldAccessors          []indexedFieldAccessor
+		index                         *pooled.SliceBuf[fieldIndexStorage]
+		nilIndex                      *pooled.SliceBuf[fieldIndexStorage]
+		lenIndex                      *pooled.SliceBuf[fieldIndexStorage]
+		lenZeroComplement             *pooled.SliceBuf[bool]
+		patchMap                      map[string]*field
+		patchFieldAccess              []patchFieldAccessor
+		patchFieldOrdinal             map[string]int
 
 		planner     planner
 		snapshot    snapshot

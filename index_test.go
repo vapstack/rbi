@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"math"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"sort"
 	"strings"
@@ -15,6 +16,7 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"unsafe"
 
 	"github.com/vapstack/qx"
 	"github.com/vapstack/rbi/internal/posting"
@@ -81,6 +83,34 @@ func TestAddDistinctFixedKeys_SinglePass(t *testing.T) {
 	want := []uint64{buildInt64Key(5), buildInt64Key(7), buildInt64Key(11)}
 	if !slices.Equal(got, want) {
 		t.Fatalf("unexpected distinct order: got=%v want=%v", got, want)
+	}
+}
+
+func TestValidateIndexedStringValues_UsesOnlyStringValidationAccessors(t *testing.T) {
+	db := &DB[uint64, Rec]{
+		indexedFieldAccess: []indexedFieldAccessor{
+			{
+				name:  "active",
+				field: &field{Kind: reflect.Bool},
+				writeBuild: func(_ unsafe.Pointer, _ buildFieldWriteSink) {
+					t.Fatal("bool accessor must not be called")
+				},
+			},
+		},
+		indexedStringValidationAccess: []indexedFieldAccessor{
+			{
+				name:  "email",
+				field: &field{Kind: reflect.String},
+				writeBuild: func(_ unsafe.Pointer, sink buildFieldWriteSink) {
+					sink.addString(strings.Repeat("x", fieldIndexStringRefMax+1))
+				},
+			},
+		},
+	}
+
+	err := db.validateIndexedStringValues(&Rec{})
+	if err == nil || !strings.Contains(err.Error(), "exceeds limit") {
+		t.Fatalf("validateIndexedStringValues error = %v, want indexed string limit error", err)
 	}
 }
 

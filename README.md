@@ -331,6 +331,17 @@ Supported values are: `default`, `unique` and `-`.
 To keep a field non-indexed, just omit tags or use `rbi:"-"`
 when `dbi` tags are already present.
 
+## Indexed string size limit
+
+Indexed string keys are limited to 65,535 bytes per value. This applies to: 
+scalar `string` fields, individual elements of `[]string` fields, and values 
+returned by `ValueIndexer` (including slice elements that implement it).
+
+The limit is measured in bytes, not runes.
+
+Writes that produce a longer indexed string value are rejected before commit.
+If existing data already contains such values, index rebuild/load will fail.
+
 ## Slice fields
 
 Slice-typed fields are indexed element-wise and support `HAS`, `HASNOT`, `HASANY`, 
@@ -372,6 +383,7 @@ The returned value is used as the indexed representation.
 - Equal values must produce equal indexing values.
 - `nil` handling is the responsibility of the implementation.
 - `IndexingValue` may be called on a nil receiver.
+- `IndexingValue` must not return more than 65,535 bytes.
 
 > Incorrect implementations may cause panics or undefined query behavior.
 
@@ -417,12 +429,10 @@ Transparent mode does not load or write `.rbi` files.
 
 All secondary indexes are kept in memory.
 
-Memory usage is mainly driven by:
-
-- number of indexed fields
-- number of records
-- distinct value count per field
+Memory usage for a single indexed field depends on:
+- distinct value count
 - average value length in bytes
+- number of records
 
 ### Rough planning estimates
 
@@ -431,25 +441,23 @@ Memory usage is mainly driven by:
 - `L` = average string length in bytes
 - `K` = key size in bytes (8 for numeric fields, `L` for strings)
 
+String-backed indexes have a per-value limit of 65,535 bytes.
+The estimates below assume indexed string values are comfortably below that limit.
+Very long strings reduce chunk density and can increase chunk/page overhead.
+
 ### Unique string fields
 
 ```text
-ApproxMem(field) ~= N * (L + 8 + 8 + 18)
-                 ~= N * (L + 34)
+ApproxMem(field) ~= N * (L + 30)
 ```
 
 For 5,000,000 rows with an average string length of 22 bytes, the estimate is:\
-`5,000,000 * (22 + 34) ~= 270 MiB`
+`5,000,000 * (22 + 30) ~= 250 MiB`
 
 ### Unique numeric fields
 
-```text
-ApproxMem(field) ~= N * (8 + 8 + 18)
-                 ~= N * 34
-```
-
 For unique numeric fields, 
-the total cost is usually close to 34 bytes per non-nil row.
+the total cost is usually close to ~33 bytes per non-nil row.
 
 ### Non-unique scalar fields
 
@@ -463,28 +471,14 @@ postings compress well.
 
 ### Slice fields
 
-For slice fields, memory scales with total memberships rather than record count:
-```text
-ApproxMem(field) ~= D * (K + 25) + PostingBytes(total_memberships)
-```
-
-If each record contains multiple tags/roles/etc., the posting part can be
-several times larger than the record count.
-
-How to estimate:
-
-1. Estimate `N`, `D`, and average value length `L` per indexed field.
-2. Use `N * (L + 34)` for large unique string fields.
-3. Use `N * 34` for large unique numeric fields.
-4. Use `D * (K + 25) + PostingBytes` for non-unique fields, with the
-   understanding that `PostingBytes` is distribution-dependent.
-5. Keep some extra headroom for shared structures, caches, and other overhead.
+Slice fields are indexed element-wise. Each distinct element of the slice 
+is treated like a regular indexed value of the same type.
 
 ### GC pressure
 
 RBI uses semi-manual memory management to minimize GC pressure.
 Most internal and intermediate structures are pooled and reused.
-Index structures use ownership-aware copy-on-write behaviour.
+Index structures use arenas and ownership-aware copy-on-write behaviour.
 
 ## Multiple instances
 

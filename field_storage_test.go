@@ -1,8 +1,12 @@
 package rbi
 
 import (
+	"bufio"
+	"bytes"
 	"fmt"
+	"strings"
 	"testing"
+	"unsafe"
 
 	"github.com/vapstack/rbi/internal/posting"
 )
@@ -49,6 +53,167 @@ func fieldStorageInsertedTestKey(pos int, fixed8 bool) indexKey {
 
 func fieldStorageSingleChunkRoot(ref fieldIndexChunkRef) *fieldIndexChunkedRoot {
 	return newFieldIndexChunkedRootFromPages([]*fieldIndexChunkDirPage{newFieldIndexChunkDirPage([]fieldIndexChunkRef{ref})})
+}
+
+func TestFieldIndexStringRefSize(t *testing.T) {
+	if got := unsafe.Sizeof(fieldIndexStringRef{}); got != 4 {
+		t.Fatalf("unexpected fieldIndexStringRef size: got %d want 4", got)
+	}
+}
+
+func TestNewFieldIndexChunkFromKeys_StringRefsFitUint16(t *testing.T) {
+	keys := []indexKey{
+		indexKeyFromStoredString(strings.Repeat("a", 40000), false),
+		indexKeyFromStoredString(strings.Repeat("b", 40000), false),
+	}
+	posts := []posting.List{
+		fieldStorageSingleton(1),
+		fieldStorageSingleton(2),
+	}
+	chunk := newFieldIndexChunkFromKeys(posts, keys, 2)
+	if chunk == nil {
+		t.Fatalf("expected string chunk")
+	}
+	if chunk.keyCount() != len(keys) {
+		t.Fatalf("unexpected key count: got %d want %d", chunk.keyCount(), len(keys))
+	}
+	if got := chunk.keyAt(0).byteLen(); got != 40000 {
+		t.Fatalf("unexpected first key len: got %d want 40000", got)
+	}
+	if got := chunk.keyAt(1).byteLen(); got != 40000 {
+		t.Fatalf("unexpected second key len: got %d want 40000", got)
+	}
+	if got := int(chunk.stringRefs[1].off); got != 40000 {
+		t.Fatalf("unexpected second ref offset: got %d want 40000", got)
+	}
+}
+
+func TestNewFieldIndexChunkFromKeys_StringRefOffsetOverflowPanics(t *testing.T) {
+	defer func() {
+		if recover() == nil {
+			t.Fatalf("expected ref overflow panic")
+		}
+	}()
+
+	keys := []indexKey{
+		indexKeyFromStoredString(strings.Repeat("a", fieldIndexStringRefMax), false),
+		indexKeyFromStoredString("b", false),
+		indexKeyFromStoredString("c", false),
+	}
+	posts := []posting.List{
+		fieldStorageSingleton(1),
+		fieldStorageSingleton(2),
+		fieldStorageSingleton(3),
+	}
+	_ = newFieldIndexChunkFromKeys(posts, keys, 3)
+}
+
+func TestNewFieldIndexChunkRefsFromEntries_StringChunksRespectOffsetLimit(t *testing.T) {
+	const total = fieldIndexChunkTargetEntries
+	entries := make([]index, total)
+	wantKeys := make([]string, total)
+
+	for i := 0; i < total; i++ {
+		key := fmt.Sprintf("%04d/%s", i, strings.Repeat("x", 395))
+		wantKeys[i] = key
+		entries[i] = index{
+			Key: indexKeyFromStoredString(key, false),
+			IDs: fieldStorageSingleton(uint64(i + 1)),
+		}
+	}
+
+	refs := newFieldIndexChunkRefsFromEntries(entries)
+	if len(refs) < 2 {
+		t.Fatalf("expected long string entries to split into multiple chunks, got %d", len(refs))
+	}
+	for i := range refs {
+		chunk := refs[i].chunk
+		if chunk == nil {
+			t.Fatalf("chunk %d is nil", i)
+		}
+		for j := range chunk.stringRefs {
+			ref := chunk.stringRefs[j]
+			if int(ref.off) > fieldIndexStringRefMax {
+				t.Fatalf("chunk %d ref %d offset exceeds limit: %d", i, j, ref.off)
+			}
+			if int(ref.len) > fieldIndexStringRefMax {
+				t.Fatalf("chunk %d ref %d len exceeds limit: %d", i, j, ref.len)
+			}
+		}
+	}
+
+	root := newFieldIndexChunkedRootFromPages([]*fieldIndexChunkDirPage{newFieldIndexChunkDirPage(refs)})
+	flat := flattenChunkedFieldIndexRoot(root)
+	if flat == nil || len(*flat) != total {
+		t.Fatalf("unexpected flattened len: got %d want %d", len(*flat), total)
+	}
+	for i := range *flat {
+		if got := (*flat)[i].Key.asUnsafeString(); got != wantKeys[i] {
+			t.Fatalf("key[%d]: got %q want %q", i, got, wantKeys[i])
+		}
+	}
+}
+
+func TestNewFieldIndexChunkRefsFromEntries_StringChunksPreserveBalancedTail(t *testing.T) {
+	const total = fieldIndexChunkThreshold + 1
+	entries := make([]index, total)
+	for i := range entries {
+		entries[i] = index{
+			Key: indexKeyFromStoredString(fmt.Sprintf("k%04d", i), false),
+			IDs: fieldStorageSingleton(uint64(i + 1)),
+		}
+	}
+
+	refs := newFieldIndexChunkRefsFromEntries(entries)
+	if len(refs) != 3 {
+		t.Fatalf("unexpected chunk count: got %d want 3", len(refs))
+	}
+	if got := refs[0].chunk.keyCount(); got != 192 {
+		t.Fatalf("chunk 0 size: got %d want 192", got)
+	}
+	if got := refs[1].chunk.keyCount(); got != 96 {
+		t.Fatalf("chunk 1 size: got %d want 96", got)
+	}
+	if got := refs[2].chunk.keyCount(); got != 97 {
+		t.Fatalf("chunk 2 size: got %d want 97", got)
+	}
+}
+
+func TestBuildFieldWriteSinkAddStringRejectsTooLongValue(t *testing.T) {
+	var err error
+	sink := buildFieldWriteSink{
+		field: "email",
+		err:   &err,
+	}
+	sink.addString(strings.Repeat("x", fieldIndexStringRefMax+1))
+	if err == nil {
+		t.Fatalf("expected indexed string validation error")
+	}
+	if !strings.Contains(err.Error(), "exceeds limit") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestReadIndexKeyRejectsTooLongString(t *testing.T) {
+	var raw bytes.Buffer
+	writer := bufio.NewWriter(&raw)
+	if err := writer.WriteByte(indexKeyEncodingString); err != nil {
+		t.Fatalf("write tag: %v", err)
+	}
+	if err := writeString(writer, strings.Repeat("x", fieldIndexStringRefMax+1)); err != nil {
+		t.Fatalf("write string: %v", err)
+	}
+	if err := writer.Flush(); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+
+	_, err := readIndexKey(bufio.NewReader(bytes.NewReader(raw.Bytes())))
+	if err == nil {
+		t.Fatalf("expected indexed string validation error")
+	}
+	if !strings.Contains(err.Error(), "exceeds limit") {
+		t.Fatalf("unexpected error: %v", err)
+	}
 }
 
 func TestFlattenChunkedFieldIndexRoot_RoundTrip(t *testing.T) {
