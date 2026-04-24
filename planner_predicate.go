@@ -834,7 +834,7 @@ func (qv *queryView[K, V]) tryPlanCandidate(q *qir.Shape, trace *queryTrace) ([]
 		if trace != nil {
 			trace.setPlan(PlanCandidateOrder)
 		}
-		return qv.execPlanCandidateOrderBasic(q, predSet), true, nil
+		return qv.execPlanCandidateOrderBasic(q, predSet, trace), true, nil
 	}
 
 	// baseline fast-paths are better for trivial single-field range/prefix scans with limit;
@@ -862,7 +862,7 @@ func (qv *queryView[K, V]) tryPlanCandidate(q *qir.Shape, trace *queryTrace) ([]
 	if trace != nil {
 		trace.setPlan(PlanCandidateNoOrder)
 	}
-	return qv.execPlanLeadScanNoOrder(q, predSet, nil), true, nil
+	return qv.execPlanLeadScanNoOrder(q, predSet, trace), true, nil
 }
 
 func (qv *queryView[K, V]) shouldUseCandidateOrder(o qir.Order, leaves []qir.Expr) bool {
@@ -1901,7 +1901,7 @@ func (qv *queryView[K, V]) tryExecLeadScanNoOrderBuckets(q *qir.Shape, preds pre
 	return out, true
 }
 
-func (qv *queryView[K, V]) execPlanCandidateOrderBasic(q *qir.Shape, preds predicateReader) []K {
+func (qv *queryView[K, V]) execPlanCandidateOrderBasic(q *qir.Shape, preds predicateReader, trace *queryTrace) []K {
 	o := q.Order
 
 	fm := qv.fieldMetaByOrder(o)
@@ -1948,10 +1948,10 @@ func (qv *queryView[K, V]) execPlanCandidateOrderBasic(q *qir.Shape, preds predi
 	}
 	sortActivePredicatesReader(active, preds)
 	if len(active) == 0 {
-		out, _ := qv.scanOrderLimitNoPredicates(q, ov, br, o.Desc, "", nil)
+		out, _ := qv.scanOrderLimitNoPredicates(q, ov, br, o.Desc, "", trace)
 		return out
 	}
-	out, _ := qv.scanOrderLimitWithPredicatesReader(q, ov, br, o.Desc, preds, "", nil)
+	out, _ := qv.scanOrderLimitWithPredicatesReader(q, ov, br, o.Desc, preds, "", trace)
 	return out
 }
 
