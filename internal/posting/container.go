@@ -65,17 +65,34 @@ func equalArrayBitmap(ac *containerArray, bc *containerBitmap) bool {
 }
 
 func equalArrayRun(ac *containerArray, rc *containerRun) bool {
-	if len(ac.content) != rc.getCardinality() {
-		return false
-	}
-	ait := shortIterator{slice: ac.content}
-	rit := runIterator16{rc: rc}
-	for ait.hasNext() {
-		if ait.next() != rit.next() {
-			return false
+	pos := 0
+	for i := range rc.iv {
+		start := int(rc.iv[i].start)
+		end := int(rc.iv[i].last())
+		for value := start; value <= end; value++ {
+			if pos >= len(ac.content) || ac.content[pos] != uint16(value) {
+				return false
+			}
+			pos++
 		}
 	}
-	return true
+	return pos == len(ac.content)
+}
+
+func equalBitmapRun(bc *containerBitmap, rc *containerRun) bool {
+	bit := bitmapContainerShortIterator{ptr: bc, i: bc.nextSetBit(0)}
+	remaining := bc.cardinality
+	for i := range rc.iv {
+		start := int(rc.iv[i].start)
+		end := int(rc.iv[i].last())
+		for value := start; value <= end; value++ {
+			if !bit.hasNext() || bit.next() != uint16(value) {
+				return false
+			}
+			remaining--
+		}
+	}
+	return remaining == 0
 }
 
 type containerIndex struct {
@@ -1249,12 +1266,12 @@ var runContainerPool = pooled.Pointers[containerRun]{
 	},
 }
 
-// containerArrayPoolCapacities uses power-of-two classes so both acquire and
-// release can classify storage in O(1) via bits.Len.
+// containerArrayPoolCapacities uses power-of-two classes so get/put
+// can classify storage in O(1) via bits.Len.
 //
 // The release path intentionally accepts containerArray instances whose backing
-// capacity drifted at runtime after growth or storage swaps. Because of that,
-// pooled classes must support bucketing by floor(capacity) without secondary
+// capacity drifted at runtime after growth or storage swaps.
+// Pooled classes must support bucketing by floor(capacity) without secondary
 // validation on Get.
 var containerArrayPoolCapacities = [...]int{
 	32,
@@ -1432,16 +1449,6 @@ func popcntXorSlice(s, m []uint64) uint64 {
 		cnt += popcount(s[i] ^ m[i])
 	}
 	return cnt
-}
-
-// countLeadingZeros returns the number of leading zeros bits in x; the result is 64 for x == 0.
-func countLeadingZeros(x uint64) int {
-	return bits.LeadingZeros64(x)
-}
-
-// countTrailingZeros returns the number of trailing zero bits in x; the result is 64 for x == 0.
-func countTrailingZeros(x uint64) int {
-	return bits.TrailingZeros64(x)
 }
 
 func union2by2(set1 []uint16, set2 []uint16, buffer []uint16) int {

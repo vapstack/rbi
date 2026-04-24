@@ -157,7 +157,7 @@ func (ii *manyIntIterator) init() {
 			ii.runIter = runIterator16{rc: t, curIndex: 0, curPosInIndex: 0}
 			ii.iter = &ii.runIter
 		case *containerBitmap:
-			ii.bitmapIter = bitmapContainerManyIterator{t, -1, 0}
+			ii.bitmapIter = bitmapContainerManyIterator{ptr: t, base: 0, bitset: t.bitmap[0]}
 			ii.iter = &ii.bitmapIter
 		}
 		return

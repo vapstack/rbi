@@ -71,18 +71,12 @@ type arrayIter struct {
 }
 
 func cloneSmallPosting(sp *smallPosting) *smallPosting {
-	if sp == nil {
-		return nil
-	}
 	clone := smallSetPool.Get()
 	*clone = *sp
 	return clone
 }
 
 func cloneMidPosting(mp *midPosting) *midPosting {
-	if mp == nil {
-		return nil
-	}
 	clone := midSetPool.Get()
 	*clone = *mp
 	return clone
@@ -183,29 +177,21 @@ func (p List) isMid() bool {
 }
 
 func (p List) small() *smallPosting {
-	if !p.isSmall() {
+	if p.ptr == nil || p.ptr == singleValue || p.kind() != postingKindSmall {
 		return nil
 	}
 	return (*smallPosting)(p.ptr)
 }
 
 func (p List) mid() *midPosting {
-	if !p.isMid() {
+	if p.ptr == nil || p.ptr == singleValue || p.kind() != postingKindMid {
 		return nil
 	}
 	return (*midPosting)(p.ptr)
 }
 
-func (p List) smallLen() int {
-	sp := p.small()
-	if sp == nil {
-		return 0
-	}
-	return int(sp.n)
-}
-
 func (it *arrayIter) HasNext() bool {
-	return it != nil && it.i < len(it.ids)
+	return it.i < len(it.ids)
 }
 
 func (it *arrayIter) Next() uint64 {
@@ -438,7 +424,7 @@ func compactFilterByAnyMembership(ids List, other *pooled.SliceBuf[List]) List {
 }
 
 func (p List) largeRef() *largePosting {
-	if p.ptr == nil || p.isSingleton() || p.kind() != postingKindLarge {
+	if p.ptr == nil || p.ptr == singleValue || p.kind() != postingKindLarge {
 		return nil
 	}
 	return (*largePosting)(p.ptr)
@@ -544,8 +530,8 @@ func (p List) Cardinality() uint64 {
 	if p.isSingleton() {
 		return 1
 	}
-	if p.isSmall() {
-		return uint64(p.smallLen())
+	if sp := p.small(); sp != nil {
+		return uint64(sp.n)
 	}
 	if mp := p.mid(); mp != nil {
 		return uint64(mp.n)
@@ -1537,7 +1523,7 @@ func (p List) BuildAndNot(other List) List {
 }
 
 func (p List) BuildOptimized() List {
-	if p.ptr == nil || p.isSingleton() || p.isSmall() || p.isMid() {
+	if p.ptr == nil || p.ptr == singleValue || p.kind() != postingKindLarge {
 		return p
 	}
 	if p.IsBorrowed() {

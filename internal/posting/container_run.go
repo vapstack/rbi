@@ -2,6 +2,7 @@ package posting
 
 import (
 	"fmt"
+	"math/bits"
 	"slices"
 	"sync/atomic"
 
@@ -383,7 +384,7 @@ func newContainerRunFromBitmapWithRuns(bc *containerBitmap, nbrRuns int) *contai
 			// wrap up, no more runs
 			return rc
 		}
-		localRunStart := countTrailingZeros(curWord)
+		localRunStart := bits.TrailingZeros64(curWord)
 		runStart := localRunStart + 64*longCtr
 		// stuff 1s into number's LSBs
 		curWordWith1s := curWord | (curWord - 1)
@@ -402,7 +403,7 @@ func newContainerRunFromBitmapWithRuns(bc *containerBitmap, nbrRuns int) *contai
 			rc.iv[runCount].length = uint16(runEnd) - uint16(runStart) - 1
 			return rc
 		}
-		localRunEnd := countTrailingZeros(^curWordWith1s)
+		localRunEnd := bits.TrailingZeros64(^curWordWith1s)
 		runEnd = localRunEnd + longCtr*64
 		rc.iv[runCount].start = uint16(runStart)
 		rc.iv[runCount].length = uint16(runEnd) - 1 - uint16(runStart)
@@ -2055,17 +2056,7 @@ func (rc *containerRun) equals(o container16) bool {
 	case *containerArray:
 		return equalArrayRun(other, rc)
 	case *containerBitmap:
-		if other.cardinality != rc.getCardinality() {
-			return false
-		}
-		bit := bitmapContainerShortIterator{ptr: other, i: other.nextSetBit(0)}
-		rit := runIterator16{rc: rc}
-		for rit.hasNext() {
-			if bit.next() != rit.next() {
-				return false
-			}
-		}
-		return true
+		return equalBitmapRun(other, rc)
 	}
 	panic("unsupported container16 type")
 }

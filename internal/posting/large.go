@@ -152,7 +152,7 @@ func appendBitmapContainerToArray64(dst []uint64, hs uint64, bc *containerBitmap
 	start := len(dst)
 	dst = slices.Grow(dst, bc.cardinality)
 	dst = dst[:start+bc.cardinality]
-	it := bitmapContainerManyIterator{ptr: bc, base: -1}
+	it := bitmapContainerManyIterator{ptr: bc, base: 0, bitset: bc.bitmap[0]}
 	n := it.nextMany64(hs, dst[start:])
 	return dst[:start+n]
 }

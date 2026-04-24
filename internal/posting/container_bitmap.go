@@ -1,6 +1,7 @@
 package posting
 
 import (
+	"math/bits"
 	"sync/atomic"
 	"unsafe"
 
@@ -72,10 +73,9 @@ func bitmapAndNotSlice(dst, left, right []uint64) int {
 
 func appendBitmapWordValues(dst []uint16, pos int, word uint64, base int) int {
 	for word != 0 {
-		t := word & -word
-		dst[pos] = uint16(base + countTrailingZeros(t))
+		dst[pos] = uint16(base + bits.TrailingZeros64(word))
 		pos++
-		word ^= t
+		word &= word - 1
 	}
 	return pos
 }
@@ -328,45 +328,18 @@ func (bc *containerBitmap) minimum() uint16 {
 	for i := 0; i < len(bc.bitmap); i++ {
 		w := bc.bitmap[i]
 		if w != 0 {
-			r := countTrailingZeros(w)
+			r := bits.TrailingZeros64(w)
 			return uint16(r + i*64)
 		}
 	}
 	return MaxUint16
 }
 
-// i should be non-zero
-func clz(i uint64) int {
-	n := 1
-	x := uint32(i >> 32)
-	if x == 0 {
-		n += 32
-		x = uint32(i)
-	}
-	if x>>16 == 0 {
-		n += 16
-		x = x << 16
-	}
-	if x>>24 == 0 {
-		n += 8
-		x = x << 8
-	}
-	if x>>28 == 0 {
-		n += 4
-		x = x << 4
-	}
-	if x>>30 == 0 {
-		n += 2
-		x = x << 2
-	}
-	return n - int(x>>31)
-}
-
 func (bc *containerBitmap) maximum() uint16 {
 	for i := len(bc.bitmap); i > 0; i-- {
 		w := bc.bitmap[i-1]
 		if w != 0 {
-			r := clz(w)
+			r := bits.LeadingZeros64(w)
 			return uint16((i-1)*64 + 63 - r)
 		}
 	}
@@ -452,20 +425,18 @@ func (it *bitmapContainerManyIterator) nextMany(hs uint32, buf []uint32) int {
 	bitset := it.bitset
 
 	for n < len(buf) {
-		if bitset == 0 {
-			base++
-			if base >= len(it.ptr.bitmap) {
-				it.base = base
-				it.bitset = bitset
+		for bitset == 0 {
+			if base >= len(it.ptr.bitmap)-1 {
+				it.base = len(it.ptr.bitmap)
+				it.bitset = 0
 				return n
 			}
+			base++
 			bitset = it.ptr.bitmap[base]
-			continue
 		}
-		t := bitset & -bitset
-		buf[n] = uint32((base*64)+int(popcount(t-1))) | hs
-		n = n + 1
-		bitset ^= t
+		buf[n] = uint32(base*64+bits.TrailingZeros64(bitset)) | hs
+		n++
+		bitset &= bitset - 1
 	}
 
 	it.base = base
@@ -480,20 +451,18 @@ func (it *bitmapContainerManyIterator) nextMany64(hs uint64, buf []uint64) int {
 	bitset := it.bitset
 
 	for n < len(buf) {
-		if bitset == 0 {
-			base++
-			if base >= len(it.ptr.bitmap) {
-				it.base = base
-				it.bitset = bitset
+		for bitset == 0 {
+			if base >= len(it.ptr.bitmap)-1 {
+				it.base = len(it.ptr.bitmap)
+				it.bitset = 0
 				return n
 			}
+			base++
 			bitset = it.ptr.bitmap[base]
-			continue
 		}
-		t := bitset & -bitset
-		buf[n] = uint64((base*64)+int(popcount(t-1))) | hs
-		n = n + 1
-		bitset ^= t
+		buf[n] = uint64(base*64+bits.TrailingZeros64(bitset)) | hs
+		n++
+		bitset &= bitset - 1
 	}
 
 	it.base = base
@@ -505,16 +474,12 @@ func (it *bitmapContainerManyIterator) release() {
 	bitmapContainerManyIteratorPool.Put(it)
 }
 
-func newContainerBitmapManyIterator(a *containerBitmap) *bitmapContainerManyIterator {
-	it := bitmapContainerManyIteratorPool.Get()
-	it.ptr = a
-	it.base = -1
-	it.bitset = 0
-	return it
-}
-
 func (bc *containerBitmap) getManyIterator() manyIterable {
-	return newContainerBitmapManyIterator(bc)
+	it := bitmapContainerManyIteratorPool.Get()
+	it.ptr = bc
+	it.base = 0
+	it.bitset = bc.bitmap[0]
+	return it
 }
 
 func (bc *containerBitmap) getSizeInBytes() int {
@@ -546,10 +511,9 @@ func (bc *containerBitmap) fillLeastSignificant16bits(x []uint32, i int, mask ui
 	for k := 0; k < len(bc.bitmap); k++ {
 		bitset := bc.bitmap[k]
 		for bitset != 0 {
-			t := bitset & -bitset
-			x[pos] = base + uint32(popcount(t-1))
+			x[pos] = base + uint32(bits.TrailingZeros64(bitset))
 			pos++
-			bitset ^= t
+			bitset &= bitset - 1
 		}
 		base += 64
 	}
@@ -566,17 +530,7 @@ func (bc *containerBitmap) equals(o container16) bool {
 	case *containerArray:
 		return equalArrayBitmap(other, bc)
 	case *containerRun:
-		if bc.cardinality != other.getCardinality() {
-			return false
-		}
-		bit := bitmapContainerShortIterator{ptr: bc, i: bc.nextSetBit(0)}
-		rit := runIterator16{rc: other}
-		for rit.hasNext() {
-			if bit.next() != rit.next() {
-				return false
-			}
-		}
-		return true
+		return equalBitmapRun(bc, other)
 	}
 	panic("unsupported container16 type")
 }
@@ -611,12 +565,13 @@ func (bc *containerBitmap) iremoveReturnMinimized(i uint16) container16 {
 
 // iremove returns true if i was found.
 func (bc *containerBitmap) iremove(i uint16) bool {
-	if bc.contains(i) {
-		bc.cardinality--
-		bc.bitmap[i/64] &^= uint64(1) << (i % 64)
-		return true
-	}
-	return false
+	wordIdx := i >> 6
+	shift := i & 63
+	previous := bc.bitmap[wordIdx]
+	newWord := previous &^ (uint64(1) << shift)
+	bc.bitmap[wordIdx] = newWord
+	bc.cardinality -= int((previous ^ newWord) >> shift)
+	return newWord != previous
 }
 
 func (bc *containerBitmap) isFull() bool {
@@ -890,23 +845,23 @@ func (bc *containerBitmap) andRun(rc *containerRun) container16 {
 func (bc *containerBitmap) andArray(value2 *containerArray) *containerArray {
 	answer := getContainerArrayWithCap(len(value2.content))
 	answer.content = answer.content[:cap(answer.content)]
-	c := value2.getCardinality()
 	pos := 0
-	for k := 0; k < c; k++ {
-		v := value2.content[k]
+	for _, v := range value2.content {
+		word := bc.bitmap[v>>6]
+		mask := uint64(1) << (v & 63)
 		answer.content[pos] = v
-		pos += int(bc.bitValue(v))
+		pos += int((word & mask) >> (v & 63))
 	}
 	answer.content = answer.content[:pos]
 	return answer
 }
 
 func (bc *containerBitmap) andArrayCardinality(value2 *containerArray) int {
-	c := value2.getCardinality()
 	pos := 0
-	for k := 0; k < c; k++ {
-		v := value2.content[k]
-		pos += int(bc.bitValue(v))
+	for _, v := range value2.content {
+		word := bc.bitmap[v>>6]
+		mask := uint64(1) << (v & 63)
+		pos += int((word & mask) >> (v & 63))
 	}
 	return pos
 }
@@ -939,10 +894,8 @@ func (bc *containerBitmap) andBitmap(value2 *containerBitmap) container16 {
 }
 
 func (bc *containerBitmap) intersectsArray(value2 *containerArray) bool {
-	c := value2.getCardinality()
-	for k := 0; k < c; k++ {
-		v := value2.content[k]
-		if bc.contains(v) {
+	for _, v := range value2.content {
+		if bc.bitmap[v>>6]&(uint64(1)<<(v&63)) != 0 {
 			return true
 		}
 	}
@@ -1003,30 +956,25 @@ func (bc *containerBitmap) iandNotArray(ac *containerArray) container16 {
 
 	// Word by word, we remove the elements in ac from bc. The approach is to build
 	// a mask of the elements to remove, and then apply it to the bitmap.
-	wordIdx := uint16(0)
+	wordIdx := ac.content[0] / 64
 	mask := uint64(0)
-	for i, v := range ac.content {
-		if v/64 != wordIdx {
-			// Flush the current word.
-			if i != 0 {
-				// We're removing bits that are set in the mask and in the current word.
-				// To figure out the cardinality change, we count the number of bits that
-				// are set in the mask and in the current word.
-				mask &= bc.bitmap[wordIdx]
-				bc.bitmap[wordIdx] &= ^mask
-				bc.cardinality -= int(popcount(mask))
-			}
+	for _, v := range ac.content {
+		nextWordIdx := v / 64
+		if nextWordIdx != wordIdx {
+			cleared := mask & bc.bitmap[wordIdx]
+			bc.bitmap[wordIdx] &^= mask
+			bc.cardinality -= int(popcount(cleared))
 
-			wordIdx = v / 64
+			wordIdx = nextWordIdx
 			mask = 0
 		}
 		mask |= 1 << (v % 64)
 	}
 
 	// Flush the last word.
-	mask &= bc.bitmap[wordIdx]
-	bc.bitmap[wordIdx] &= ^mask
-	bc.cardinality -= int(popcount(mask))
+	cleared := mask & bc.bitmap[wordIdx]
+	bc.bitmap[wordIdx] &^= mask
+	bc.cardinality -= int(popcount(cleared))
 
 	if bc.getCardinality() <= arrayDefaultMaxSize {
 		return bc.toArrayContainer()
@@ -1100,10 +1048,8 @@ func (bc *containerBitmap) bitValue(i uint16) uint64 {
 }
 
 func (bc *containerBitmap) loadData(containerArray *containerArray) {
-	bc.cardinality = containerArray.getCardinality()
-	c := containerArray.getCardinality()
-	for k := 0; k < c; k++ {
-		x := containerArray.content[k]
+	bc.cardinality = len(containerArray.content)
+	for _, x := range containerArray.content {
 		i := int(x) / 64
 		bc.bitmap[i] |= uint64(1) << uint(x%64)
 	}
@@ -1121,10 +1067,9 @@ func (bc *containerBitmap) fillArray(container16 []uint16) {
 	for k := 0; k < len(bc.bitmap); k++ {
 		bitset := bc.bitmap[k]
 		for bitset != 0 {
-			t := bitset & -bitset
-			container16[pos] = uint16(base + int(popcount(t-1)))
-			pos = pos + 1
-			bitset ^= t
+			container16[pos] = uint16(base + bits.TrailingZeros64(bitset))
+			pos++
+			bitset &= bitset - 1
 		}
 		base += 64
 	}
@@ -1142,12 +1087,12 @@ func (bc *containerBitmap) nextSetBit(i uint) int {
 	w := bc.bitmap[x]
 	w = w >> (i % 64)
 	if w != 0 {
-		return int(i) + countTrailingZeros(w)
+		return int(i) + bits.TrailingZeros64(w)
 	}
 	x++
 	for ; x < length; x++ {
 		if bc.bitmap[x] != 0 {
-			return int(x*64) + countTrailingZeros(bc.bitmap[x])
+			return int(x*64) + bits.TrailingZeros64(bc.bitmap[x])
 		}
 	}
 	return -1
@@ -1164,13 +1109,13 @@ func (bc *containerBitmap) nextUnsetBit(i uint) int {
 	w := ^bc.bitmap[x]
 	w &= ^uint64(0) << (i & 63)
 	if w != 0 {
-		return int(x*64) + countTrailingZeros(w)
+		return int(x*64) + bits.TrailingZeros64(w)
 	}
 	x++
 	for ; x < length; x++ {
 		w = ^bc.bitmap[x]
 		if w != 0 {
-			return int(x*64) + countTrailingZeros(w)
+			return int(x*64) + bits.TrailingZeros64(w)
 		}
 	}
 	return int(length * 64)
@@ -1201,7 +1146,7 @@ func (bc *containerBitmap) uPrevSetBit(i uint) int {
 
 	w = w << (63 - b)
 	if w != 0 {
-		return int(i) - countLeadingZeros(w)
+		return int(i) - bits.LeadingZeros64(w)
 	}
 	orig := x
 	x--
@@ -1210,7 +1155,7 @@ func (bc *containerBitmap) uPrevSetBit(i uint) int {
 	}
 	for ; x < orig; x-- {
 		if bc.bitmap[x] != 0 {
-			return int((x*64)+63) - countLeadingZeros(bc.bitmap[x])
+			return int((x*64)+63) - bits.LeadingZeros64(bc.bitmap[x])
 		}
 	}
 	return -1

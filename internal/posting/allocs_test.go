@@ -458,7 +458,7 @@ func TestHotPathPools_NoAllocsAfterWarmup(t *testing.T) {
 
 	t.Run("ContainerBitmapManyIterator", func(t *testing.T) {
 		requireZeroAllocsAfterPoolWarmup(t, func() {
-			it := newContainerBitmapManyIterator(bitmapContainer)
+			it := bitmapContainer.getManyIterator()
 			var sum uint32
 			var buf [4]uint32
 			for {
