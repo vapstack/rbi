@@ -1542,7 +1542,15 @@ func applySingleFieldPostingDiffChunked(base *fieldIndexChunkedRoot, delta keyed
 		posts[entryIdx] = updatedIDs
 		var chunk *fieldIndexChunk
 		if ref.chunk.hasNumericKeys() {
-			chunk = newNumericFieldIndexChunk(posts, ref.chunk.numeric, rows)
+			if ref.chunk.hasUniqueNumericOwners() {
+				keys := make([]uint64, ref.chunk.keyCount())
+				for i := range keys {
+					keys[i] = ref.chunk.keyAt(i).meta
+				}
+				chunk = newNumericFieldIndexChunk(posts, keys, rows)
+			} else {
+				chunk = newNumericFieldIndexChunk(posts, ref.chunk.numeric, rows)
+			}
 		} else {
 			chunk = newStringFieldIndexChunk(posts, ref.chunk.stringRefs, ref.chunk.stringData, rows)
 		}

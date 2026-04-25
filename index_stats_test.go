@@ -225,6 +225,8 @@ func indexStatsTestChunkedStructBytes(root *fieldIndexChunkedRoot) uint64 {
 				} else {
 					total += uint64(cap(chunk.posts)) * uint64(unsafe.Sizeof(index{}.IDs))
 				}
+			} else if chunk.hasUniqueNumericOwners() {
+				total += uint64(cap(chunk.numeric)/2) * uint64(unsafe.Sizeof(uint64(0)))
 			} else {
 				total += uint64(cap(chunk.posts)) * uint64(unsafe.Sizeof(index{}.IDs))
 			}

@@ -1813,7 +1813,7 @@ func writeFieldIndexChunk(writer *bufio.Writer, chunk *fieldIndexChunk) error {
 		}
 		var buf [8]byte
 		for i := 0; i < chunk.keyCount(); i++ {
-			binary.BigEndian.PutUint64(buf[:], chunk.numeric[i])
+			binary.BigEndian.PutUint64(buf[:], chunk.keyAt(i).meta)
 			if _, err := writer.Write(buf[:]); err != nil {
 				return fmt.Errorf("encode: writing numeric chunk key: %w", err)
 			}

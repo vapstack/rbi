@@ -1601,6 +1601,8 @@ func collectChunkedFieldIndexStats(root *fieldIndexChunkedRoot, countDistinct bo
 				} else {
 					stats.approxStructBytes += uint64(cap(chunk.posts)) * uint64(unsafe.Sizeof(posting.List{}))
 				}
+			} else if chunk.hasUniqueNumericOwners() {
+				stats.approxStructBytes += uint64(cap(chunk.numeric)/2) * uint64(unsafe.Sizeof(uint64(0)))
 			} else {
 				stats.approxStructBytes += uint64(cap(chunk.posts)) * uint64(unsafe.Sizeof(posting.List{}))
 			}

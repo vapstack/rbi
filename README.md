@@ -436,7 +436,7 @@ and average value length in bytes.
 - `N` = number of non-nil records for the field
 - `D` = number of distinct indexed values for the field
 - `K` = key size in bytes
-   (8 for numeric fields, string length in bytes for strings)
+   (8 for numeric fields, average string length in bytes for strings)
 
 String-backed indexes have a per-value limit of 65,535 bytes.
 The estimates below assume indexed string values are comfortably below that limit.
@@ -453,13 +453,17 @@ For 5,000,000 rows with an average string length of 22 bytes, the estimate is:\
 
 ### Unique numeric fields
 
-For unique numeric fields, 
-the total cost is usually close to ~33 bytes per non-nil row.
+```text
+ApproxMem(field) ~= N * (24...26)
+```
+
+For 5,000,000 rows this is roughly:\
+`5,000,000 * (26) ~= 124 MiB`
 
 ### Non-unique scalar fields
 
 ```text
-ApproxMem(field) ~= D * (K + 25) + PostingBytes
+ApproxMem(field) ~= D * (K + 16..22) + PostingBytes
 ```
 
 **PostingBytes** depends on data distribution.
