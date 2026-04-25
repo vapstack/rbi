@@ -157,6 +157,18 @@ type fieldIndexChunk struct {
 	rows       uint64
 }
 
+func (c *fieldIndexChunk) hasStringKeys() bool {
+	return c != nil && c.stringRefs != nil
+}
+
+func (c *fieldIndexChunk) hasNumericKeys() bool {
+	return c != nil && c.stringRefs == nil && c.numeric != nil
+}
+
+func (c *fieldIndexChunk) hasUniqueStringOwners() bool {
+	return c != nil && c.stringRefs != nil && c.numeric != nil
+}
+
 type fieldIndexChunkRef struct {
 	last  indexKey
 	chunk *fieldIndexChunk
@@ -444,7 +456,47 @@ func newNumericFieldIndexChunk(posts []posting.List, keys []uint64, rows uint64)
 	return chunk
 }
 
+func stringChunkAllSingletonPosts(posts []posting.List) bool {
+	for i := range posts {
+		if _, ok := posts[i].TrySingle(); !ok {
+			return false
+		}
+	}
+	return true
+}
+
+func stringChunkOwners(posts []posting.List) []uint64 {
+	owners := make([]uint64, len(posts))
+	for i := range posts {
+		owner, ok := posts[i].TrySingle()
+		if !ok {
+			panic("string owner chunk requires singleton postings")
+		}
+		owners[i] = owner
+	}
+	return owners
+}
+
+func newUniqueStringFieldIndexChunk(owners []uint64, refs []fieldIndexStringRef, data []byte) *fieldIndexChunk {
+	if len(owners) != len(refs) {
+		panic("string owner chunk owners/refs len mismatch")
+	}
+	chunk := &fieldIndexChunk{
+		numeric:    owners,
+		stringRefs: refs,
+		stringData: data,
+		rows:       uint64(len(refs)),
+	}
+	chunk.refs.Store(1)
+	return chunk
+}
+
 func newStringFieldIndexChunk(posts []posting.List, refs []fieldIndexStringRef, data []byte, rows uint64) *fieldIndexChunk {
+	if stringChunkAllSingletonPosts(posts) {
+		owners := stringChunkOwners(posts)
+		posting.ReleaseSliceOwned(posts)
+		return newUniqueStringFieldIndexChunk(owners, refs, data)
+	}
 	for i := range posts {
 		posts[i] = storedFieldPosting(posts[i])
 	}
@@ -923,26 +975,36 @@ func (c *fieldIndexChunk) keyCount() int {
 	if c == nil {
 		return 0
 	}
-	if c.numeric != nil {
-		return len(c.numeric)
+	if c.hasStringKeys() {
+		return len(c.stringRefs)
 	}
-	return len(c.stringRefs)
+	return len(c.numeric)
 }
 
 func (c *fieldIndexChunk) keyAt(i int) indexKey {
 	if c == nil || i < 0 || i >= c.keyCount() {
 		return indexKey{}
 	}
-	if c.numeric != nil {
-		return indexKeyFromU64(c.numeric[i])
+	if c.hasStringKeys() {
+		ref := c.stringRefs[i]
+		return indexKeyFromBytes(c.stringData[int(ref.off) : int(ref.off)+int(ref.len)])
 	}
-	ref := c.stringRefs[i]
-	return indexKeyFromBytes(c.stringData[int(ref.off) : int(ref.off)+int(ref.len)])
+	return indexKeyFromU64(c.numeric[i])
 }
 
 func (c *fieldIndexChunk) postingAt(i int) posting.List {
-	if c == nil || i < 0 || i >= len(c.posts) {
-		return posting.List{}
+	var p posting.List
+	if c == nil || i < 0 {
+		return p
+	}
+	if c.hasUniqueStringOwners() {
+		if i >= len(c.numeric) {
+			return p
+		}
+		return p.BuildAdded(c.numeric[i])
+	}
+	if i >= len(c.posts) {
+		return p
 	}
 	return c.posts[i].Borrow()
 }
@@ -958,14 +1020,21 @@ func (c *fieldIndexChunk) rowsInRange(start, end int) uint64 {
 	if c == nil {
 		return 0
 	}
+	limit := len(c.posts)
+	if c.hasUniqueStringOwners() {
+		limit = len(c.numeric)
+	}
 	if start < 0 {
 		start = 0
 	}
-	if end > len(c.posts) {
-		end = len(c.posts)
+	if end > limit {
+		end = limit
 	}
 	if start >= end {
 		return 0
+	}
+	if c.hasUniqueStringOwners() {
+		return uint64(end - start)
 	}
 	var total uint64
 	for i := start; i < end; i++ {
@@ -1420,7 +1489,7 @@ func newFieldIndexChunkRefsWithInsertedEntry(ref fieldIndexChunkRef, pos int, ad
 	if ref.chunk == nil {
 		return nil
 	}
-	if ref.chunk.numeric != nil {
+	if ref.chunk.hasNumericKeys() {
 		return newNumericFieldIndexChunkRefsWithInsertedEntry(ref, pos, add)
 	}
 	return newStringFieldIndexChunkRefsWithInsertedEntry(ref, pos, add)

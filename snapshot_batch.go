@@ -959,7 +959,7 @@ func appendFieldPostingDiffChunkRangeSorted(
 
 	numeric := false
 	if startChunk < endChunk {
-		if ref, ok := base.refAtChunk(startChunk); ok && ref.chunk != nil && ref.chunk.numeric != nil {
+		if ref, ok := base.refAtChunk(startChunk); ok && ref.chunk != nil && ref.chunk.hasNumericKeys() {
 			numeric = true
 		}
 	} else if len(deltaKeys) > 0 {
@@ -1028,7 +1028,7 @@ func appendFieldPostingDiffChunkRangeSortedBuf(
 
 	numeric := false
 	if startChunk < endChunk {
-		if ref, ok := base.refAtChunk(startChunk); ok && ref.chunk != nil && ref.chunk.numeric != nil {
+		if ref, ok := base.refAtChunk(startChunk); ok && ref.chunk != nil && ref.chunk.hasNumericKeys() {
 			numeric = true
 		}
 	} else {
@@ -1535,23 +1535,17 @@ func applySingleFieldPostingDiffChunked(base *fieldIndexChunkedRoot, delta keyed
 		} else if rowsDelta < 0 {
 			rows -= uint64(-rowsDelta)
 		}
-		posts := make([]posting.List, len(ref.chunk.posts))
-		copyBorrowedPostingSlice(posts, ref.chunk.posts)
-		posts[entryIdx] = updatedIDs
+		posts := make([]posting.List, ref.chunk.keyCount())
 		for i := range posts {
-			posts[i] = storedFieldPosting(posts[i])
+			posts[i] = ref.chunk.postingAt(i)
 		}
-		chunk := &fieldIndexChunk{
-			posts: posts,
-			rows:  rows,
-		}
-		if ref.chunk.numeric != nil {
-			chunk.numeric = ref.chunk.numeric
+		posts[entryIdx] = updatedIDs
+		var chunk *fieldIndexChunk
+		if ref.chunk.hasNumericKeys() {
+			chunk = newNumericFieldIndexChunk(posts, ref.chunk.numeric, rows)
 		} else {
-			chunk.stringRefs = ref.chunk.stringRefs
-			chunk.stringData = ref.chunk.stringData
+			chunk = newStringFieldIndexChunk(posts, ref.chunk.stringRefs, ref.chunk.stringData, rows)
 		}
-		chunk.refs.Store(1)
 		repl := [1]fieldIndexChunkRef{{
 			last:  ref.last,
 			chunk: chunk,

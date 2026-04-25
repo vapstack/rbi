@@ -1593,13 +1593,19 @@ func collectChunkedFieldIndexStats(root *fieldIndexChunkedRoot, countDistinct bo
 			if chunk == nil {
 				continue
 			}
-			stats.approxStructBytes += uint64(unsafe.Sizeof(fieldIndexChunk{})) +
-				uint64(cap(chunk.posts))*uint64(unsafe.Sizeof(posting.List{}))
-			if chunk.numeric == nil {
+			stats.approxStructBytes += uint64(unsafe.Sizeof(fieldIndexChunk{}))
+			if chunk.hasStringKeys() {
 				stats.approxStructBytes += uint64(cap(chunk.stringRefs)) * uint64(unsafe.Sizeof(fieldIndexStringRef{}))
+				if chunk.hasUniqueStringOwners() {
+					stats.approxStructBytes += uint64(cap(chunk.numeric)) * uint64(unsafe.Sizeof(uint64(0)))
+				} else {
+					stats.approxStructBytes += uint64(cap(chunk.posts)) * uint64(unsafe.Sizeof(posting.List{}))
+				}
+			} else {
+				stats.approxStructBytes += uint64(cap(chunk.posts)) * uint64(unsafe.Sizeof(posting.List{}))
 			}
 			for k := 0; k < chunk.keyCount(); k++ {
-				accumulateIndexEntryStats(chunk.keyAt(k), chunk.posts[k], countDistinct, &stats)
+				accumulateIndexEntryStats(chunk.keyAt(k), chunk.postingAt(k), countDistinct, &stats)
 			}
 		}
 	}

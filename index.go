@@ -1804,20 +1804,20 @@ func writeFieldIndexChunk(writer *bufio.Writer, chunk *fieldIndexChunk) error {
 	if chunk == nil || chunk.keyCount() == 0 {
 		return fmt.Errorf("encode: empty chunk")
 	}
-	if chunk.numeric != nil {
+	if chunk.hasNumericKeys() {
 		if err := writer.WriteByte(fieldIndexChunkEncodingRaw8); err != nil {
 			return fmt.Errorf("encode: writing chunk encoding: %w", err)
 		}
-		if err := writeUvarint(writer, uint64(len(chunk.numeric))); err != nil {
+		if err := writeUvarint(writer, uint64(chunk.keyCount())); err != nil {
 			return fmt.Errorf("encode: writing numeric chunk len: %w", err)
 		}
 		var buf [8]byte
-		for i := range chunk.numeric {
+		for i := 0; i < chunk.keyCount(); i++ {
 			binary.BigEndian.PutUint64(buf[:], chunk.numeric[i])
 			if _, err := writer.Write(buf[:]); err != nil {
 				return fmt.Errorf("encode: writing numeric chunk key: %w", err)
 			}
-			if err := chunk.posts[i].WriteTo(writer); err != nil {
+			if err := chunk.postingAt(i).WriteTo(writer); err != nil {
 				return fmt.Errorf("encode: writing numeric chunk posting: %w", err)
 			}
 		}
@@ -1830,7 +1830,7 @@ func writeFieldIndexChunk(writer *bufio.Writer, chunk *fieldIndexChunk) error {
 	if err := writeUvarint(writer, uint64(len(chunk.stringRefs))); err != nil {
 		return fmt.Errorf("encode: writing string chunk len: %w", err)
 	}
-	for i := range chunk.stringRefs {
+	for i := 0; i < chunk.keyCount(); i++ {
 		ref := chunk.stringRefs[i]
 		if err := writeUvarint(writer, uint64(ref.len)); err != nil {
 			return fmt.Errorf("encode: writing string chunk key len: %w", err)
@@ -1842,7 +1842,7 @@ func writeFieldIndexChunk(writer *bufio.Writer, chunk *fieldIndexChunk) error {
 				return fmt.Errorf("encode: writing string chunk key: %w", err)
 			}
 		}
-		if err := chunk.posts[i].WriteTo(writer); err != nil {
+		if err := chunk.postingAt(i).WriteTo(writer); err != nil {
 			return fmt.Errorf("encode: writing string chunk posting: %w", err)
 		}
 	}

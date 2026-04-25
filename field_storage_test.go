@@ -108,6 +108,189 @@ func TestNewFieldIndexChunkFromKeys_StringRefOffsetOverflowPanics(t *testing.T) 
 	_ = newFieldIndexChunkFromKeys(posts, keys, 3)
 }
 
+func TestNewFieldIndexChunkFromKeys_StringSingletonsUseOwnerLayout(t *testing.T) {
+	keys := []indexKey{
+		indexKeyFromStoredString("alpha", false),
+		indexKeyFromStoredString("beta", false),
+	}
+	posts := []posting.List{
+		fieldStorageSingleton(101),
+		fieldStorageSingleton(202),
+	}
+
+	chunk := newFieldIndexChunkFromKeys(posts, keys, 2)
+	if chunk == nil {
+		t.Fatalf("expected string chunk")
+	}
+	if !chunk.hasUniqueStringOwners() {
+		t.Fatalf("expected owner layout for singleton string chunk")
+	}
+	if len(chunk.posts) != 0 {
+		t.Fatalf("expected no stored posting handles, got %d", len(chunk.posts))
+	}
+	if got := chunk.rowCount(); got != 2 {
+		t.Fatalf("unexpected row count: got %d want 2", got)
+	}
+	if got := chunk.rowsInRange(0, 2); got != 2 {
+		t.Fatalf("unexpected range rows: got %d want 2", got)
+	}
+	ids := chunk.postingAt(1)
+	if ids.Cardinality() != 1 || !ids.Contains(202) {
+		t.Fatalf("unexpected posting: %v", ids)
+	}
+}
+
+func TestFieldIndexChunk_StringSingletonRoundTripUsesOwnerLayout(t *testing.T) {
+	keys := []indexKey{
+		indexKeyFromStoredString("alpha", false),
+		indexKeyFromStoredString("beta", false),
+	}
+	posts := []posting.List{
+		fieldStorageSingleton(11),
+		fieldStorageSingleton(22),
+	}
+	chunk := newFieldIndexChunkFromKeys(posts, keys, 2)
+	if chunk == nil {
+		t.Fatalf("expected string chunk")
+	}
+	if !chunk.hasUniqueStringOwners() {
+		t.Fatalf("expected owner layout before serialization")
+	}
+
+	var raw bytes.Buffer
+	writer := bufio.NewWriter(&raw)
+	if err := writeFieldIndexChunk(writer, chunk); err != nil {
+		t.Fatalf("write chunk: %v", err)
+	}
+	if err := writer.Flush(); err != nil {
+		t.Fatalf("flush chunk: %v", err)
+	}
+
+	roundTrip, err := readFieldIndexChunk(bufio.NewReader(bytes.NewReader(raw.Bytes())))
+	if err != nil {
+		t.Fatalf("read chunk: %v", err)
+	}
+	if roundTrip == nil {
+		t.Fatalf("expected round-trip chunk")
+	}
+	if !roundTrip.hasUniqueStringOwners() {
+		t.Fatalf("expected owner layout after serialization round-trip")
+	}
+	if got := roundTrip.keyAt(0).asUnsafeString(); got != "alpha" {
+		t.Fatalf("unexpected first key: got %q want %q", got, "alpha")
+	}
+	if ids := roundTrip.postingAt(1); ids.Cardinality() != 1 || !ids.Contains(22) {
+		t.Fatalf("unexpected round-trip posting: %v", ids)
+	}
+}
+
+func TestApplyFieldPostingDiffChunked_StringOwnerChunkKeepsStringLayout(t *testing.T) {
+	entries := make([]index, fieldIndexChunkThreshold)
+	for i := range entries {
+		entries[i] = index{
+			Key: indexKeyFromStoredString(fmt.Sprintf("k%04d", i), false),
+			IDs: fieldStorageSingleton(uint64(i + 1)),
+		}
+	}
+
+	root := buildChunkedFieldIndexRoot(entries)
+	if root == nil {
+		t.Fatalf("expected chunked root")
+	}
+	defer root.release()
+
+	ref, ok := root.refAtChunk(0)
+	if !ok || ref.chunk == nil || !ref.chunk.hasUniqueStringOwners() {
+		t.Fatalf("expected owner layout in first chunk")
+	}
+
+	oldKey := "k0095"
+	newKey := "k0095a"
+	deltas := []keyedBatchPostingDelta{
+		{
+			key: indexKeyFromStoredString(oldKey, false),
+			delta: batchPostingDelta{
+				remove: fieldStorageSingleton(96),
+			},
+		},
+		{
+			key: indexKeyFromStoredString(newKey, false),
+			delta: batchPostingDelta{
+				add: fieldStorageSingleton(900_001),
+			},
+		},
+	}
+
+	storage := applyFieldPostingDiffChunked(root, deltas)
+	defer releaseFieldIndexStorageOwned(storage)
+
+	if storage.chunked == nil {
+		t.Fatalf("expected chunked storage")
+	}
+	repl, ok := storage.chunked.refAtChunk(0)
+	if !ok || repl.chunk == nil {
+		t.Fatalf("expected replacement first chunk")
+	}
+	if !repl.chunk.hasUniqueStringOwners() {
+		t.Fatalf("expected owner layout to be preserved for singleton result chunk")
+	}
+	if ids := storage.chunked.lookupPostingRetained(oldKey); !ids.IsEmpty() {
+		t.Fatalf("expected old key to be removed, got %v", ids)
+	}
+	ids := storage.chunked.lookupPostingRetained(newKey)
+	if ids.Cardinality() != 1 || !ids.Contains(900_001) {
+		t.Fatalf("unexpected new key posting: %v", ids)
+	}
+	if ids := storage.chunked.lookupPostingRetained("k0096"); ids.Cardinality() != 1 || !ids.Contains(97) {
+		t.Fatalf("neighbor key lookup broken: %v", ids)
+	}
+}
+
+func TestApplySingleFieldPostingDiffChunked_StringOwnerChunkDemotesOnMultiPosting(t *testing.T) {
+	entries := make([]index, fieldIndexChunkThreshold)
+	for i := range entries {
+		entries[i] = index{
+			Key: indexKeyFromStoredString(fmt.Sprintf("k%04d", i), false),
+			IDs: fieldStorageSingleton(uint64(i + 1)),
+		}
+	}
+
+	root := buildChunkedFieldIndexRoot(entries)
+	if root == nil {
+		t.Fatalf("expected chunked root")
+	}
+	defer root.release()
+
+	storage := applySingleFieldPostingDiffChunked(root, keyedBatchPostingDelta{
+		key: indexKeyFromStoredString("k0095", false),
+		delta: batchPostingDelta{
+			add: fieldStorageSingleton(900_002),
+		},
+	})
+	defer releaseFieldIndexStorageOwned(storage)
+
+	if storage.chunked == nil {
+		t.Fatalf("expected chunked storage")
+	}
+	repl, ok := storage.chunked.refAtChunk(0)
+	if !ok || repl.chunk == nil {
+		t.Fatalf("expected replacement first chunk")
+	}
+	if !repl.chunk.hasStringKeys() {
+		t.Fatalf("expected string chunk after update")
+	}
+	if repl.chunk.hasUniqueStringOwners() {
+		t.Fatalf("expected owner layout to be dropped after multi-posting update")
+	}
+	ids := storage.chunked.lookupPostingRetained("k0095")
+	if ids.Cardinality() != 2 || !ids.Contains(96) || !ids.Contains(900_002) {
+		t.Fatalf("unexpected expanded posting: %v", ids)
+	}
+	if got := repl.chunk.keyAt(95).asUnsafeString(); got != "k0095" {
+		t.Fatalf("unexpected updated key: got %q want %q", got, "k0095")
+	}
+}
+
 func TestNewFieldIndexChunkRefsFromEntries_StringChunksRespectOffsetLimit(t *testing.T) {
 	const total = fieldIndexChunkTargetEntries
 	entries := make([]index, total)

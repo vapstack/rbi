@@ -428,18 +428,15 @@ Transparent mode does not load or write `.rbi` files.
 ## Memory usage
 
 All secondary indexes are kept in memory.
-
-Memory usage for a single indexed field depends on:
-- distinct value count
-- average value length in bytes
-- number of records
+Memory usage for a single indexed field mostly depends on distinct value count
+and average value length in bytes.
 
 ### Rough planning estimates
 
 - `N` = number of non-nil records for the field
 - `D` = number of distinct indexed values for the field
-- `L` = average string length in bytes
-- `K` = key size in bytes (8 for numeric fields, `L` for strings)
+- `K` = key size in bytes
+   (8 for numeric fields, string length in bytes for strings)
 
 String-backed indexes have a per-value limit of 65,535 bytes.
 The estimates below assume indexed string values are comfortably below that limit.
@@ -448,11 +445,11 @@ Very long strings reduce chunk density and can increase chunk/page overhead.
 ### Unique string fields
 
 ```text
-ApproxMem(field) ~= N * (L + 30)
+ApproxMem(field) ~= N * (K + 20...22)
 ```
 
 For 5,000,000 rows with an average string length of 22 bytes, the estimate is:\
-`5,000,000 * (22 + 30) ~= 250 MiB`
+`5,000,000 * (22 + 22) ~= 210 MiB`
 
 ### Unique numeric fields
 

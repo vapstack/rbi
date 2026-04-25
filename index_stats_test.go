@@ -217,10 +217,16 @@ func indexStatsTestChunkedStructBytes(root *fieldIndexChunkedRoot) uint64 {
 			if chunk == nil {
 				continue
 			}
-			total += uint64(unsafe.Sizeof(fieldIndexChunk{})) +
-				uint64(cap(chunk.posts))*uint64(unsafe.Sizeof(index{}.IDs))
-			if chunk.numeric == nil {
+			total += uint64(unsafe.Sizeof(fieldIndexChunk{}))
+			if chunk.hasStringKeys() {
 				total += uint64(cap(chunk.stringRefs)) * uint64(unsafe.Sizeof(fieldIndexStringRef{}))
+				if chunk.hasUniqueStringOwners() {
+					total += uint64(cap(chunk.numeric)) * uint64(unsafe.Sizeof(uint64(0)))
+				} else {
+					total += uint64(cap(chunk.posts)) * uint64(unsafe.Sizeof(index{}.IDs))
+				}
+			} else {
+				total += uint64(cap(chunk.posts)) * uint64(unsafe.Sizeof(index{}.IDs))
 			}
 		}
 	}
