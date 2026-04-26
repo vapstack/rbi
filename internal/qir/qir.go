@@ -224,11 +224,6 @@ func (q *Query) newOwnedExprSlice(n int) []Expr {
 	return s
 }
 
-func (q *Query) setOrder(order Order) {
-	q.orderStorage[0] = order
-	q.Order = q.orderStorage[:]
-}
-
 func PrepareQueryResolved[R FieldResolver](src *qx.QX, resolve R) (*Query, error) {
 	if src == nil {
 		return nil, fmt.Errorf("QX is nil")
@@ -262,7 +257,8 @@ func PrepareQueryResolved[R FieldResolver](src *qx.QX, resolve R) (*Query, error
 			query.Release()
 			return nil, err
 		}
-		query.setOrder(order)
+		query.orderStorage[0] = order
+		query.Order = query.orderStorage[:]
 	}
 
 	return query, nil
@@ -301,7 +297,8 @@ func PrepareQueryNoResolve(src *qx.QX) (*Query, error) {
 			query.Release()
 			return nil, err
 		}
-		query.setOrder(order)
+		query.orderStorage[0] = order
+		query.Order = query.orderStorage[:]
 	}
 
 	return query, nil
@@ -632,13 +629,6 @@ func IsFalseConst(e Expr) bool {
 
 type exprBufAlloc func(capacity int) []Expr
 
-func makeExprBuf(capacity int) []Expr {
-	if capacity == 0 {
-		return nil
-	}
-	return make([]Expr, 0, capacity)
-}
-
 func (q *Query) newOwnedExprBuf(capacity int) []Expr {
 	if capacity == 0 {
 		return nil
@@ -647,7 +637,12 @@ func (q *Query) newOwnedExprBuf(capacity int) []Expr {
 }
 
 func NormalizeExpr(e Expr) (Expr, bool) {
-	return normalizeExprWithAlloc(e, makeExprBuf)
+	return normalizeExprWithAlloc(e, func(capacity int) []Expr {
+		if capacity == 0 {
+			return nil
+		}
+		return make([]Expr, 0, capacity)
+	})
 }
 
 func normalizeExprWithAlloc(e Expr, alloc exprBufAlloc) (Expr, bool) {
@@ -748,7 +743,7 @@ func normalizeBoolNode(e Expr, invert bool, alloc exprBufAlloc) (Expr, bool, boo
 			}
 		}
 
-		if isMalformedNoop(nc) {
+		if nc.Op == OpNOOP && (nc.FieldOrdinal != NoFieldOrdinal || nc.Value != nil || len(nc.Operands) != 0) {
 			if childPost {
 				postNeeded = true
 			}
@@ -836,10 +831,6 @@ func normalizeBoolNode(e Expr, invert bool, alloc exprBufAlloc) (Expr, bool, boo
 		})
 	}
 	return Expr{Op: op, FieldOrdinal: NoFieldOrdinal, Operands: out}, true, false
-}
-
-func isMalformedNoop(e Expr) bool {
-	return e.Op == OpNOOP && (e.FieldOrdinal != NoFieldOrdinal || e.Value != nil || len(e.Operands) != 0)
 }
 
 func needSortExprs(exprs []Expr) bool {

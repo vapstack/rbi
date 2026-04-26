@@ -26,7 +26,7 @@ func mustLimitQIRExpr[K ~string | ~uint64, V any](t testing.TB, db *DB[K, V], ex
 
 func mustLimitQIRLeaves[K ~string | ~uint64, V any](t testing.TB, db *DB[K, V], expr qx.Expr) []qir.Expr {
 	t.Helper()
-	leaves, ok := collectAndLeaves(mustLimitQIRExpr(t, db, expr))
+	leaves, ok := collectAndLeavesMode(mustLimitQIRExpr(t, db, expr), andLeafModeCollect)
 	if !ok {
 		t.Fatalf("collectAndLeaves failed")
 	}
@@ -717,7 +717,7 @@ func (qv *queryView[K, V]) baselineTryQueryRangeNoOrderWithLimit(q *qx.QX) ([]K,
 		return nil, false, nil
 	}
 
-	f := qv.fieldNameByExpr(e)
+	f := qv.fieldNameByOrdinal(e.FieldOrdinal)
 	if f == "" {
 		return nil, false, nil
 	}
@@ -807,7 +807,7 @@ func (qv *queryView[K, V]) baselineTryQueryPrefixNoOrderWithLimit(q *qx.QX) ([]K
 	}
 
 	e := viewQ.Expr
-	f := qv.fieldNameByExpr(e)
+	f := qv.fieldNameByOrdinal(e.FieldOrdinal)
 	if e.Op != qir.OpPREFIX || f == "" {
 		return nil, false, nil
 	}
@@ -1943,7 +1943,7 @@ func TestQuery_OrderBasic_WarmQueryPromotesMaterializedRangeBaseOps(t *testing.T
 		}
 		t.Fatalf("expected warm ordered query to promote materialized range base ops, missing=%v", missing)
 	}
-	exactKey := materializedPredCacheKeyForExactScalarRange(collapsed.collapsed.field, collapsed.collapsed.bounds)
+	exactKey := materializedPredKeyForExactScalarRange(collapsed.collapsed.field, collapsed.collapsed.bounds).String()
 	if exactKey == "" {
 		t.Fatalf("expected collapsed exact range cache key")
 	}

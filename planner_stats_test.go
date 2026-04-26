@@ -61,7 +61,7 @@ func TestPlannerStatsCollector_PeriodicBudgetAdvancesCursor(t *testing.T) {
 
 	cycles := fieldCount + 3
 	for i := 0; i < cycles; i++ {
-		if err := db.refreshPlannerStatsPeriodic(); err != nil {
+		if err := db.refreshPlannerStatsWithBudget(db.planner.analyzer.softBudget, true); err != nil {
 			t.Fatalf("refreshPlannerStatsPeriodic cycle %d: %v", i, err)
 		}
 

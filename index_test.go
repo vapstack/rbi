@@ -70,7 +70,7 @@ func TestAddDistinctFixedKeys_SinglePass(t *testing.T) {
 	calls := 0
 	distinct := addDistinctFixedKeys(len(values), func(i int) uint64 {
 		calls++
-		return buildInt64Key(values[i])
+		return uint64(values[i]) ^ (uint64(1) << 63)
 	}, func(v uint64) {
 		got = append(got, v)
 	})
@@ -80,7 +80,7 @@ func TestAddDistinctFixedKeys_SinglePass(t *testing.T) {
 	if distinct != 3 {
 		t.Fatalf("distinct mismatch: got=%d want=3", distinct)
 	}
-	want := []uint64{buildInt64Key(5), buildInt64Key(7), buildInt64Key(11)}
+	want := []uint64{uint64(5) ^ (uint64(1) << 63), uint64(7) ^ (uint64(1) << 63), uint64(11) ^ (uint64(1) << 63)}
 	if !slices.Equal(got, want) {
 		t.Fatalf("unexpected distinct order: got=%v want=%v", got, want)
 	}
@@ -3121,8 +3121,8 @@ func TestIndexExt_StringOverlayUnionRangeMatchesFlat(t *testing.T) {
 	fx := indexExtStringFixture(t)
 	for _, window := range indexExtRangeWindows(len(fx.keys)) {
 		start, end := indexExtNormalizeWindow(window[0], window[1], len(fx.keys))
-		got := overlayUnionRange(fx.chunked, fx.chunked.rangeByRanks(start, end))
-		want := overlayUnionRange(fx.flat, fx.flat.rangeByRanks(start, end))
+		got := overlayUnionRanges(fx.chunked, fx.chunked.rangeByRanks(start, end), overlayRange{})
+		want := overlayUnionRanges(fx.flat, fx.flat.rangeByRanks(start, end), overlayRange{})
 		indexExtAssertSameSlice(t, got.ToArray(), want.ToArray())
 		got.Release()
 		want.Release()
@@ -3136,10 +3136,10 @@ func TestIndexExt_StringMergeOverlayRangeIntoMatchesFlat(t *testing.T) {
 		start, end := indexExtNormalizeWindow(window[0], window[1], len(fx.keys))
 
 		seedFlat := posting.BuildFromSorted(seedIDs)
-		got := mergeOverlayRangeInto(seedFlat, fx.chunked, fx.chunked.rangeByRanks(start, end))
+		got := mergeOverlayRangesInto(seedFlat, fx.chunked, fx.chunked.rangeByRanks(start, end), overlayRange{})
 
 		seedChunked := posting.BuildFromSorted(seedIDs)
-		want := mergeOverlayRangeInto(seedChunked, fx.flat, fx.flat.rangeByRanks(start, end))
+		want := mergeOverlayRangesInto(seedChunked, fx.flat, fx.flat.rangeByRanks(start, end), overlayRange{})
 
 		indexExtAssertSameSlice(t, got.ToArray(), want.ToArray())
 		got.Release()
@@ -3155,10 +3155,10 @@ func TestIndexExt_StringMergeOverlayRangeIntoMatchesBaselineUnion(t *testing.T) 
 		br := fx.chunked.rangeByRanks(start, end)
 
 		gotBase := posting.BuildFromSorted(seedIDs)
-		got := mergeOverlayRangeInto(gotBase, fx.chunked, br)
+		got := mergeOverlayRangesInto(gotBase, fx.chunked, br, overlayRange{})
 
 		wantBase := posting.BuildFromSorted(seedIDs)
-		add := overlayUnionRange(fx.chunked, br)
+		add := overlayUnionRanges(fx.chunked, br, overlayRange{})
 		want := wantBase.BuildMergedOwned(add)
 
 		indexExtAssertSameSlice(t, got.ToArray(), want.ToArray())
@@ -3183,8 +3183,8 @@ func TestIndexExt_StringOverlayUnionRangesMatchesBaselineUnion(t *testing.T) {
 		second := fx.chunked.rangeByRanks(secondStart, secondEnd)
 
 		got := overlayUnionRanges(fx.chunked, first, second)
-		want := overlayUnionRange(fx.chunked, first)
-		want = want.BuildMergedOwned(overlayUnionRange(fx.chunked, second))
+		want := overlayUnionRanges(fx.chunked, first, overlayRange{})
+		want = want.BuildMergedOwned(overlayUnionRanges(fx.chunked, second, overlayRange{}))
 
 		indexExtAssertSameSlice(t, got.ToArray(), want.ToArray())
 		got.Release()
@@ -3212,8 +3212,8 @@ func TestIndexExt_StringMergeOverlayRangesIntoMatchesBaselineUnion(t *testing.T)
 		got := mergeOverlayRangesInto(gotBase, fx.chunked, first, second)
 
 		wantBase := posting.BuildFromSorted(seedIDs)
-		want := wantBase.BuildMergedOwned(overlayUnionRange(fx.chunked, first))
-		want = want.BuildMergedOwned(overlayUnionRange(fx.chunked, second))
+		want := wantBase.BuildMergedOwned(overlayUnionRanges(fx.chunked, first, overlayRange{}))
+		want = want.BuildMergedOwned(overlayUnionRanges(fx.chunked, second, overlayRange{}))
 
 		indexExtAssertSameSlice(t, got.ToArray(), want.ToArray())
 		got.Release()

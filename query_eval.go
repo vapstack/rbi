@@ -37,7 +37,7 @@ func releasePostingResults(buf *pooled.SliceBuf[postingResult]) {
 
 func (qv *queryView[K, V]) checkUsedQuery(q *qir.Shape) error {
 	if q.HasOrder && qv.fieldMetaByOrder(q.Order) == nil {
-		return fmt.Errorf("no index for field: %v", qv.fieldNameByOrder(q.Order))
+		return fmt.Errorf("no index for field: %v", qv.fieldNameByOrdinal(q.Order.FieldOrdinal))
 	}
 	return qv.checkUsedExpr(q.Expr)
 }
@@ -45,7 +45,7 @@ func (qv *queryView[K, V]) checkUsedQuery(q *qir.Shape) error {
 func (qv *queryView[K, V]) checkUsedExpr(exp qir.Expr) error {
 	if exp.FieldOrdinal >= 0 {
 		if qv.fieldMetaByExpr(exp) == nil {
-			return fmt.Errorf("no index for field: %v", qv.fieldNameByExpr(exp))
+			return fmt.Errorf("no index for field: %v", qv.fieldNameByOrdinal(exp.FieldOrdinal))
 		}
 	}
 	for _, op := range exp.Operands {
@@ -211,7 +211,7 @@ func (qv *queryView[K, V]) evalAndOperands(ops []qir.Expr, negate bool) (posting
 // evalSimple evaluates a single non-boolean predicate against the current
 // immutable snapshot indexes.
 func (qv *queryView[K, V]) evalSimple(e qir.Expr) (postingResult, error) {
-	fieldName := qv.fieldNameByExpr(e)
+	fieldName := qv.fieldNameByOrdinal(e.FieldOrdinal)
 	ov := qv.fieldOverlayForExpr(e)
 	if !ov.hasData() && !qv.hasIndexedFieldForExpr(e) {
 		return postingResult{}, fmt.Errorf("no index for field: %v", fieldName)
@@ -569,10 +569,6 @@ type normalizedScalarBound struct {
 	empty       bool
 }
 
-func normalizedScalarBoundFromString(op qir.Op, key string) normalizedScalarBound {
-	return normalizedScalarBound{op: op, key: key}
-}
-
 func normalizedScalarBoundFromIndexKey(op qir.Op, key indexKey) normalizedScalarBound {
 	return normalizedScalarBound{
 		op:          op,
@@ -922,7 +918,7 @@ func (qv *queryView[K, V]) exprValueToNormalizedScalarBound(expr qir.Expr) (norm
 		if err != nil {
 			return normalizedScalarBound{}, false, err
 		}
-		bound := normalizedScalarBoundFromString(qir.OpPREFIX, key)
+		bound := normalizedScalarBound{op: qir.OpPREFIX, key: key}
 		qv.storeNormalizedScalarBound(expr, v, bound)
 		return bound, false, nil
 	}
@@ -952,7 +948,7 @@ func (qv *queryView[K, V]) exprValueToNormalizedScalarBound(expr qir.Expr) (norm
 	if err != nil {
 		return normalizedScalarBound{}, false, err
 	}
-	bound := normalizedScalarBoundFromString(expr.Op, key)
+	bound := normalizedScalarBound{op: expr.Op, key: key}
 	qv.storeNormalizedScalarBound(expr, v, bound)
 	return bound, false, nil
 }

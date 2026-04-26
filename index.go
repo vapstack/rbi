@@ -1286,14 +1286,6 @@ func (db *DB[K, V]) buildIndex(skipFields map[string]struct{}, skipMeasureFields
 	return nil
 }
 
-func buildInt64Key(v int64) uint64 {
-	return uint64(v) ^ (uint64(1) << 63)
-}
-
-func buildFloat64Key(f float64) uint64 {
-	return orderedFloat64Key(f)
-}
-
 func addDistinctStrings(n int, valueAt func(int) string, add func(string)) int {
 	if n == 0 {
 		return 0
@@ -1339,7 +1331,7 @@ func (s buildFieldWriteSink) setLen(length int) {
 }
 
 func (s buildFieldWriteSink) addString(key string) {
-	if s.err != nil && *s.err == nil && indexedStringKeyTooLongLen(len(key)) {
+	if s.err != nil && *s.err == nil && len(key) > fieldIndexStringRefMax {
 		if s.field != "" {
 			*s.err = fmt.Errorf("field %q indexed string value len %d exceeds limit %d", s.field, len(key), fieldIndexStringRefMax)
 		} else {
@@ -3316,7 +3308,7 @@ func (o fieldOverlay) lowerBoundKey(key indexKey) int {
 		_, rank := o.chunked.lowerBoundPosKey(key)
 		return rank
 	}
-	return lowerBoundIndexKey(o.base, key)
+	return lowerBoundIndexEntriesKey(o.base, key)
 }
 
 func (o fieldOverlay) upperBound(key string) int {
@@ -3331,7 +3323,7 @@ func (o fieldOverlay) upperBoundKey(key indexKey) int {
 		_, rank := o.chunked.upperBoundPosKey(key)
 		return rank
 	}
-	return upperBoundIndexKey(o.base, key)
+	return upperBoundIndexEntriesKey(o.base, key)
 }
 
 func (o fieldOverlay) prefixRangeEnd(prefix string, start int) int {
@@ -3474,7 +3466,7 @@ func (o fieldOverlay) rangeForBoundsChunked(b rangeBounds) overlayRange {
 	if o.chunked == nil {
 		return br
 	}
-	br.startPos = o.chunked.startPos()
+	br.startPos = fieldIndexChunkPos{}
 	br.endPos = o.chunked.endPos()
 	if b.empty {
 		br.baseEnd = 0
@@ -3545,7 +3537,7 @@ func (o fieldOverlay) rangeForBoundsChunked(b rangeBounds) overlayRange {
 
 	if br.baseStart < 0 {
 		br.baseStart = 0
-		br.startPos = o.chunked.startPos()
+		br.startPos = fieldIndexChunkPos{}
 	}
 	if maxEnd := o.keyCount(); br.baseEnd > maxEnd {
 		br.baseEnd = maxEnd

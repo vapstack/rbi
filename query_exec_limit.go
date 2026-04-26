@@ -448,7 +448,7 @@ func (qv *queryView[K, V]) tryLimitQuery(q *qir.Shape, trace *queryTrace) ([]K, 
 	}
 
 	var leavesBuf [8]qir.Expr
-	leaves, ok := extractAndLeavesScratch(q.Expr, leavesBuf[:0])
+	leaves, ok := collectAndLeavesModeScratch(q.Expr, leavesBuf[:0], andLeafModeExtract)
 	if !ok || len(leaves) == 0 {
 		return nil, false, "", nil
 	}
@@ -467,7 +467,7 @@ func (qv *queryView[K, V]) tryLimitQuery(q *qir.Shape, trace *queryTrace) ([]K, 
 			return nil, false, "", err
 		}
 		plan := PlanLimitOrderBasic
-		if qv.hasPrefixBoundForField(leaves, qv.fieldNameByOrder(q.Order)) {
+		if qv.hasPrefixBoundForField(leaves, qv.fieldNameByOrdinal(q.Order.FieldOrdinal)) {
 			plan = PlanLimitOrderPrefix
 		}
 		return out, true, plan, err
@@ -506,7 +506,7 @@ func (qv *queryView[K, V]) extractNoOrderBounds(leaves []qir.Expr) (string, rang
 		if e.Not || e.FieldOrdinal < 0 {
 			return "", rangeBounds{}, false, nil
 		}
-		fieldName := qv.fieldNameByExpr(e)
+		fieldName := qv.fieldNameByOrdinal(e.FieldOrdinal)
 		if !found {
 			found = true
 			f = fieldName
@@ -551,7 +551,7 @@ func (qv *queryView[K, V]) tryUniqueEqNoOrder(q *qir.Shape, trace *queryTrace) (
 	}
 
 	var leavesBuf [8]qir.Expr
-	leaves, ok := extractAndLeavesScratch(q.Expr, leavesBuf[:0])
+	leaves, ok := collectAndLeavesModeScratch(q.Expr, leavesBuf[:0], andLeafModeExtract)
 	if !ok || len(leaves) == 0 {
 		return nil, false, nil
 	}
@@ -737,7 +737,7 @@ func (qv *queryView[K, V]) hasPrefixBoundForField(leaves []qir.Expr, field strin
 		if e.Not {
 			continue
 		}
-		if qv.fieldNameByExpr(e) == field && e.Op == qir.OpPREFIX {
+		if qv.fieldNameByOrdinal(e.FieldOrdinal) == field && e.Op == qir.OpPREFIX {
 			return true
 		}
 	}
@@ -817,7 +817,7 @@ func (qv *queryView[K, V]) tryLimitQueryOrderBasic(q *qir.Shape, leaves []qir.Ex
 	order := q.Order
 	needWindow, _ := orderWindow(q)
 
-	f := qv.fieldNameByOrder(order)
+	f := qv.fieldNameByOrdinal(order.FieldOrdinal)
 	if order.FieldOrdinal < 0 {
 		return nil, false, nil
 	}
@@ -968,11 +968,11 @@ func (qv *queryView[K, V]) buildLeafPredsExcludingBounds(leaves []qir.Expr, fiel
 		defer orderedMergedScalarRangeFieldSlicePool.Put(mergedRangesBuf)
 	}
 	for i, e := range leaves {
-		if isBoundOp(e.Op) && !e.Not && qv.fieldNameByExpr(e) == field {
+		if isBoundOp(e.Op) && !e.Not && qv.fieldNameByOrdinal(e.FieldOrdinal) == field {
 			continue
 		}
 		if mergedRangesBuf != nil && qv.isPositiveMergedNumericRangeLeaf(e) {
-			idx := findOrderedMergedScalarRangeField(mergedRangesBuf, qv.fieldNameByExpr(e))
+			idx := findOrderedMergedScalarRangeField(mergedRangesBuf, qv.fieldNameByOrdinal(e.FieldOrdinal))
 			if idx >= 0 {
 				merged := mergedRangesBuf.Get(idx)
 				if merged.count > 1 {
@@ -1208,7 +1208,7 @@ func (qv *queryView[K, V]) extractBoundsForField(field string, leaves []qir.Expr
 		if e.Not || e.FieldOrdinal < 0 {
 			return b, false, nil
 		}
-		if qv.fieldNameByExpr(e) != field {
+		if qv.fieldNameByOrdinal(e.FieldOrdinal) != field {
 			continue
 		}
 
@@ -1243,7 +1243,7 @@ func applyBoundsToIndexRange(s []index, b rangeBounds) (start, end int) {
 	if b.hasLo {
 		lo := 0
 		if b.loNumeric {
-			lo = lowerBoundIndexKey(s, b.loIndex)
+			lo = lowerBoundIndexEntriesKey(s, b.loIndex)
 		} else {
 			lo = lowerBoundIndex(s, b.loKey)
 		}
@@ -1262,9 +1262,9 @@ func applyBoundsToIndexRange(s []index, b rangeBounds) (start, end int) {
 		hi := 0
 		if b.hiNumeric {
 			if b.hiInc {
-				hi = upperBoundIndexKey(s, b.hiIndex)
+				hi = upperBoundIndexEntriesKey(s, b.hiIndex)
 			} else {
-				hi = lowerBoundIndexKey(s, b.hiIndex)
+				hi = lowerBoundIndexEntriesKey(s, b.hiIndex)
 			}
 		} else {
 			if b.hiInc {
@@ -1295,7 +1295,7 @@ func (qv *queryView[K, V]) buildLeafPred(e qir.Expr) (leafPred, bool, error) {
 		return leafPred{}, false, nil
 	}
 
-	fieldName := qv.fieldNameByExpr(e)
+	fieldName := qv.fieldNameByOrdinal(e.FieldOrdinal)
 	ov := qv.fieldOverlayForExpr(e)
 	if !ov.hasData() && !qv.hasIndexedFieldForExpr(e) {
 		return leafPred{}, false, nil
@@ -1517,7 +1517,7 @@ func (qv *queryView[K, V]) buildMergedLimitLeafPred(e qir.Expr, bounds rangeBoun
 	if fm == nil || fm.Slice {
 		return leafPred{}, false, nil
 	}
-	fieldName := qv.fieldNameByExpr(e)
+	fieldName := qv.fieldNameByOrdinal(e.FieldOrdinal)
 	allowMaterialize := false
 	if orderedWindow > 0 {
 		var core preparedScalarRangePredicate[K, V]
@@ -1576,7 +1576,7 @@ func (qv *queryView[K, V]) supportsLimitLeafPredExpr(e qir.Expr) bool {
 func (qv *queryView[K, V]) supportsLimitLeafPredsExcludingBounds(leaves []qir.Expr, field string) bool {
 	hasResidual := false
 	for _, e := range leaves {
-		if isBoundOp(e.Op) && !e.Not && qv.fieldNameByExpr(e) == field {
+		if isBoundOp(e.Op) && !e.Not && qv.fieldNameByOrdinal(e.FieldOrdinal) == field {
 			continue
 		}
 		hasResidual = true
@@ -1589,7 +1589,7 @@ func (qv *queryView[K, V]) supportsLimitLeafPredsExcludingBounds(leaves []qir.Ex
 
 func (qv *queryView[K, V]) hasWarmScalarLimitLeafPredsExcludingBounds(leaves []qir.Expr, field string) bool {
 	for _, e := range leaves {
-		if isBoundOp(e.Op) && !e.Not && qv.fieldNameByExpr(e) == field {
+		if isBoundOp(e.Op) && !e.Not && qv.fieldNameByOrdinal(e.FieldOrdinal) == field {
 			continue
 		}
 		if !isSimpleScalarRangeOrPrefixLeaf(e) {

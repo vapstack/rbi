@@ -223,7 +223,7 @@ func TestPlannerShadow_OrderedOR_StreamVsFallback(t *testing.T) {
 		}
 		branches, alwaysFalse, ok := view.buildORBranchesOrdered(
 			viewQ.Expr.Operands,
-			view.fieldNameByOrder(viewQ.Order),
+			view.fieldNameByOrdinal(viewQ.Order.FieldOrdinal),
 			window,
 			viewQ.Offset,
 		)
@@ -279,7 +279,7 @@ func TestPlannerShadow_OrderedORMergeVsFallback(t *testing.T) {
 		}
 		branches, alwaysFalse, ok := view.buildORBranchesOrdered(
 			viewQ.Expr.Operands,
-			view.fieldNameByOrder(viewQ.Order),
+			view.fieldNameByOrdinal(viewQ.Order.FieldOrdinal),
 			window,
 			viewQ.Offset,
 		)
@@ -327,12 +327,12 @@ func TestPlannerShadow_OrderedLimitExecutionVsPlanner(t *testing.T) {
 
 	ordered := h.run("shadow_order_limit_planner", func(view *queryView[uint64, Rec], viewQ *qir.Shape, trace *queryTrace) ([]uint64, bool, error) {
 		var leavesBuf [plannerPredicateFastPathMaxLeaves]qir.Expr
-		leaves, ok := collectAndLeavesScratch(viewQ.Expr, leavesBuf[:0])
+		leaves, ok := collectAndLeavesModeScratch(viewQ.Expr, leavesBuf[:0], andLeafModeCollect)
 		if !ok {
 			return nil, false, nil
 		}
 		window, _ := orderWindow(viewQ)
-		orderField := view.fieldNameByOrder(viewQ.Order)
+		orderField := view.fieldNameByOrdinal(viewQ.Order.FieldOrdinal)
 		predSet, ok := view.buildPredicatesOrderedWithMode(leaves, orderField, false, window, viewQ.Offset, true, true)
 		if !ok {
 			return nil, false, nil
@@ -385,12 +385,12 @@ func TestPlannerShadow_CandidateOrderVsOrderedPlanner(t *testing.T) {
 
 	ordered := h.run("shadow_candidate_order_alt_planner", func(view *queryView[uint64, Rec], viewQ *qir.Shape, trace *queryTrace) ([]uint64, bool, error) {
 		var leavesBuf [plannerPredicateFastPathMaxLeaves]qir.Expr
-		leaves, ok := collectAndLeavesScratch(viewQ.Expr, leavesBuf[:0])
+		leaves, ok := collectAndLeavesModeScratch(viewQ.Expr, leavesBuf[:0], andLeafModeCollect)
 		if !ok {
 			return nil, false, nil
 		}
 		window, _ := orderWindow(viewQ)
-		orderField := view.fieldNameByOrder(viewQ.Order)
+		orderField := view.fieldNameByOrdinal(viewQ.Order.FieldOrdinal)
 		predSet, ok := view.buildPredicatesOrderedWithMode(leaves, orderField, false, window, viewQ.Offset, true, true)
 		if !ok {
 			return nil, false, nil

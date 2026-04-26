@@ -633,7 +633,7 @@ func (state *overlayRangePredicateState) materializeRange() posting.List {
 			return state.rangeIDs
 		}
 	}
-	state.rangeIDs = overlayUnionRange(state.ov, state.br)
+	state.rangeIDs = overlayUnionRanges(state.ov, state.br, overlayRange{})
 	state.rangeMaterialized = true
 	state.releaseLinearPosts()
 	if !state.probe.useComplement {

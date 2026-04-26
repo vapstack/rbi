@@ -108,7 +108,7 @@ func mustCountQIRExprForDB[K ~string | ~uint64, V any](t testing.TB, db *DB[K, V
 
 func mustCollectCountLeavesScratch(t testing.TB, expr qx.Expr, dst []qir.Expr) []qir.Expr {
 	t.Helper()
-	leaves, ok := collectAndLeavesScratch(mustCountQIRExpr(t, expr), dst)
+	leaves, ok := collectAndLeavesModeScratch(mustCountQIRExpr(t, expr), dst, andLeafModeCollect)
 	if !ok {
 		t.Fatalf("collectAndLeavesScratch=false")
 	}
@@ -117,7 +117,7 @@ func mustCollectCountLeavesScratch(t testing.TB, expr qx.Expr, dst []qir.Expr) [
 
 func mustCollectCountLeavesScratchForDB[K ~string | ~uint64, V any](t testing.TB, db *DB[K, V], expr qx.Expr, dst []qir.Expr) []qir.Expr {
 	t.Helper()
-	leaves, ok := collectAndLeavesScratch(mustCountQIRExprForDB(t, db, expr), dst)
+	leaves, ok := collectAndLeavesModeScratch(mustCountQIRExprForDB(t, db, expr), dst, andLeafModeCollect)
 	if !ok {
 		t.Fatalf("collectAndLeavesScratch=false")
 	}
@@ -2165,7 +2165,7 @@ func prepareBroadRangeComplementPredicate(t *testing.T, db *DB[uint64, Rec], exp
 		releasePredicates([]predicate{p})
 		t.Fatalf("exprValueToIdxScalar: err=%v isSlice=%v isNil=%v", err, isSlice, isNil)
 	}
-	cacheKey := view.materializedPredComplementCacheKeyForScalar(view.fieldNameByExpr(compiledExpr), compiledExpr.Op, key)
+	cacheKey := view.materializedPredComplementCacheKeyForScalar(view.fieldNameByOrdinal(compiledExpr.FieldOrdinal), compiledExpr.Op, key)
 	if cacheKey == "" {
 		releasePredicates([]predicate{p})
 		t.Fatalf("expected non-empty complement cache key")
@@ -2803,7 +2803,7 @@ func TestCount_LeadPostingsSingleResidualBucketCount_AllocsPerRunStayZeroAfterWa
 		qv := db.makeQueryView(db.getSnapshot())
 		defer db.releaseQueryView(qv)
 		var leavesBuf [countPredicateScanMaxLeaves]qir.Expr
-		leaves, ok := collectAndLeavesScratch(compiledExpr, leavesBuf[:0])
+		leaves, ok := collectAndLeavesModeScratch(compiledExpr, leavesBuf[:0], andLeafModeCollect)
 		if !ok {
 			t.Fatalf("collectAndLeavesScratch=false")
 		}

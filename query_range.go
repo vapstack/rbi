@@ -472,10 +472,6 @@ func mergeOverlayRangesInto(dst posting.List, ov fieldOverlay, first, second ove
 	return builder.finish(false)
 }
 
-func mergeOverlayRangeInto(dst posting.List, ov fieldOverlay, br overlayRange) posting.List {
-	return mergeOverlayRangesInto(dst, ov, br, overlayRange{})
-}
-
 func isNumericScalarKind(kind reflect.Kind) bool {
 	switch kind {
 	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
@@ -631,20 +627,22 @@ func (qv *queryView[K, V]) tryEvalNumericRangeBuckets(field string, fm *field, o
 			res = cached
 			switch {
 			case cachedStart == startFull && cachedEnd < endFull:
-				res = mergeOverlayRangeInto(
+				res = mergeOverlayRangesInto(
 					res,
 					ov,
 					ov.rangeByRanks(idx.bucketStart(cachedEnd+1), idx.bucketEnd(endFull)),
+					overlayRange{},
 				)
 			case cachedEnd == endFull && cachedStart > startFull:
-				res = mergeOverlayRangeInto(
+				res = mergeOverlayRangesInto(
 					res,
 					ov,
 					ov.rangeByRanks(idx.bucketStart(startFull), idx.bucketStart(cachedStart)),
+					overlayRange{},
 				)
 			}
 		} else {
-			res = mergeOverlayRangeInto(res, ov, ov.rangeByRanks(idx.bucketStart(startFull), idx.bucketEnd(endFull)))
+			res = mergeOverlayRangesInto(res, ov, ov.rangeByRanks(idx.bucketStart(startFull), idx.bucketEnd(endFull)), overlayRange{})
 		}
 		res, _ = entry.tryStoreFullSpan(startFull, endFull, res)
 	}

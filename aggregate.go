@@ -525,7 +525,10 @@ func (db *DB[K, V]) prepareAggregateMetricField(name string, op aggregateMetricO
 	}
 	kind := aggregateFieldValueKind(acc.field)
 	if op == aggregateMetricSum || op == aggregateMetricAvg {
-		if acc.field.UseVI || !isAggregateNumericKind(acc.field.Kind) {
+		if acc.field.UseVI ||
+			!(isAggregateSignedKind(acc.field.Kind) ||
+				isAggregateUnsignedKind(acc.field.Kind) ||
+				isAggregateFloatKind(acc.field.Kind)) {
 			return aggregateFieldRef{}, fmt.Errorf("%w: %s requires numeric field %q", ErrInvalidQuery, aggregateMetricOpName(op), name)
 		}
 	}
@@ -596,10 +599,6 @@ func aggregateMeasureValueKind(kind measureValueKind) aggregateValueKind {
 	default:
 		return aggregateValueInvalid
 	}
-}
-
-func isAggregateNumericKind(kind reflect.Kind) bool {
-	return isAggregateSignedKind(kind) || isAggregateUnsignedKind(kind) || isAggregateFloatKind(kind)
 }
 
 func isAggregateSignedKind(kind reflect.Kind) bool {
@@ -1371,7 +1370,8 @@ func aggregateComparePredicateValues(a Value, b Value) (int, bool) {
 		}
 		return 0, false
 	}
-	if aggregateValueKindIsNumeric(ak) && aggregateValueKindIsNumeric(bk) {
+	if (ak == ValueKindInt || ak == ValueKindUint || ak == ValueKindFloat) &&
+		(bk == ValueKindInt || bk == ValueKindUint || bk == ValueKindFloat) {
 		return aggregateCompareNumericValues(a, b)
 	}
 	if ak != bk {
@@ -1397,7 +1397,8 @@ func aggregateCompareOrderValues(a Value, b Value) int {
 	if ak == ValueKindNone || bk == ValueKindNone {
 		return compareInt64(int64(ak), int64(bk))
 	}
-	if aggregateValueKindIsNumeric(ak) && aggregateValueKindIsNumeric(bk) {
+	if (ak == ValueKindInt || ak == ValueKindUint || ak == ValueKindFloat) &&
+		(bk == ValueKindInt || bk == ValueKindUint || bk == ValueKindFloat) {
 		cmp, _ := aggregateCompareNumericValues(a, b)
 		return cmp
 	}
@@ -1513,10 +1514,6 @@ func aggregateCompareUint64Float64(u uint64, f float64) int {
 		return cmp
 	}
 	return -1
-}
-
-func aggregateValueKindIsNumeric(kind ValueKind) bool {
-	return kind == ValueKindInt || kind == ValueKindUint || kind == ValueKindFloat
 }
 
 func applyAggregateWindow(result Result, offset uint64, limit uint64) Result {

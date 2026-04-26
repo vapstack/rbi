@@ -186,7 +186,7 @@ func (db *DB[K, V]) beginTrace(q qir.Shape) *queryTrace {
 		}
 
 		var leavesBuf [8]qir.Expr
-		leaves, ok := collectAndLeavesScratch(q.Expr, leavesBuf[:0])
+		leaves, ok := collectAndLeavesModeScratch(q.Expr, leavesBuf[:0], andLeafModeCollect)
 		if ok {
 			tr.ev.LeafCount = len(leaves)
 			for _, e := range leaves {

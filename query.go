@@ -23,7 +23,7 @@ func (db *DB[K, V]) Query(q *qx.QX) ([]*V, error) {
 	if q == nil {
 		return nil, fmt.Errorf("QX is nil")
 	}
-	prepared, err := db.prepareQuery(q)
+	prepared, err := qir.PrepareQueryResolved(q, preparedFieldResolver[K, V]{db: db})
 	if err != nil {
 		return nil, err
 	}
@@ -198,7 +198,7 @@ func (db *DB[K, V]) QueryKeys(q *qx.QX) ([]K, error) {
 	if q == nil {
 		return nil, fmt.Errorf("QX is nil")
 	}
-	prepared, err := db.prepareQuery(q)
+	prepared, err := qir.PrepareQueryResolved(q, preparedFieldResolver[K, V]{db: db})
 	if err != nil {
 		return nil, err
 	}
@@ -441,7 +441,7 @@ func (qv *queryView[K, V]) execQuery(q *qir.Shape, emitTrace bool, prepared bool
 	// case 2: ordering
 	if q.HasOrder {
 		order := q.Order
-		orderField := qv.fieldNameByOrder(order)
+		orderField := qv.fieldNameByOrdinal(order.FieldOrdinal)
 
 		switch order.Kind {
 
@@ -454,7 +454,7 @@ func (qv *queryView[K, V]) execQuery(q *qir.Shape, emitTrace bool, prepared bool
 
 		case qir.OrderKindArrayCount:
 			lenOV := qv.lenFieldOverlayForOrder(order)
-			useZeroComplement := qv.isLenZeroComplementForOrder(order)
+			useZeroComplement := qv.isLenZeroComplementOrdinal(order.FieldOrdinal)
 			if !lenOV.hasData() && !qv.hasIndexedLenField(orderField) {
 				return nil, fmt.Errorf("cannot sort non-indexed field: %v", orderField)
 			}

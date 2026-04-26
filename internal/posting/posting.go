@@ -203,14 +203,12 @@ func (it *arrayIter) Next() uint64 {
 	return v
 }
 
-func (p List) isSingleton() bool { return p.ptr == singleValue }
-
 func (p List) kind() uint64 {
 	return p.single & postingMetaKindMask
 }
 
 func (p List) IsBorrowed() bool {
-	return p.ptr != nil && !p.isSingleton() && p.single&postingMetaBorrowed != 0
+	return p.ptr != nil && p.ptr != singleValue && p.single&postingMetaBorrowed != 0
 }
 
 type PayloadKey struct {
@@ -219,7 +217,7 @@ type PayloadKey struct {
 }
 
 func (p List) PayloadKey() (PayloadKey, bool) {
-	if p.ptr == nil || p.isSingleton() {
+	if p.ptr == nil || p.ptr == singleValue {
 		return PayloadKey{}, false
 	}
 	return PayloadKey{
@@ -233,7 +231,7 @@ func (p List) IsOwnedLarge() bool {
 }
 
 func (p List) Borrow() List {
-	if p.ptr == nil || p.isSingleton() {
+	if p.ptr == nil || p.ptr == singleValue {
 		return p
 	}
 	p.single |= postingMetaBorrowed
@@ -244,8 +242,8 @@ func (p List) SharesPayload(other List) bool {
 	switch {
 	case p.IsEmpty() || other.IsEmpty():
 		return p.IsEmpty() && other.IsEmpty()
-	case p.isSingleton() || other.isSingleton():
-		return p.isSingleton() && other.isSingleton() && p.single == other.single
+	case p.ptr == singleValue || other.ptr == singleValue:
+		return p.ptr == singleValue && other.ptr == singleValue && p.single == other.single
 	default:
 		return p.ptr == other.ptr && p.kind() == other.kind()
 	}
@@ -484,7 +482,7 @@ func (p List) TrySingle() (uint64, bool) {
 	if p.ptr == nil {
 		return 0, false
 	}
-	if p.isSingleton() {
+	if p.ptr == singleValue {
 		return p.single, true
 	}
 	if sp := p.small(); sp != nil {
@@ -511,7 +509,7 @@ func (p List) TryAppendCompactTo(dst []uint64) ([]uint64, bool) {
 	if p.ptr == nil {
 		return dst, true
 	}
-	if p.isSingleton() {
+	if p.ptr == singleValue {
 		return append(dst, p.single), true
 	}
 	if sp := p.small(); sp != nil {
@@ -527,7 +525,7 @@ func (p List) Cardinality() uint64 {
 	if p.ptr == nil {
 		return 0
 	}
-	if p.isSingleton() {
+	if p.ptr == singleValue {
 		return 1
 	}
 	if sp := p.small(); sp != nil {
@@ -543,7 +541,7 @@ func (p List) Contains(id uint64) bool {
 	if p.ptr == nil {
 		return false
 	}
-	if p.isSingleton() {
+	if p.ptr == singleValue {
 		return p.single == id
 	}
 	if sp := p.small(); sp != nil {
@@ -584,7 +582,7 @@ func (p List) Minimum() (uint64, bool) {
 	if p.ptr == nil {
 		return 0, false
 	}
-	if p.isSingleton() {
+	if p.ptr == singleValue {
 		return p.single, true
 	}
 	if sp := p.small(); sp != nil {
@@ -600,7 +598,7 @@ func (p List) Maximum() (uint64, bool) {
 	if p.ptr == nil {
 		return 0, false
 	}
-	if p.isSingleton() {
+	if p.ptr == singleValue {
 		return p.single, true
 	}
 	if sp := p.small(); sp != nil {
@@ -616,7 +614,7 @@ func (p List) SizeInBytes() uint64 {
 	if p.ptr == nil {
 		return 0
 	}
-	if p.isSingleton() {
+	if p.ptr == singleValue {
 		return 8
 	}
 	if sp := p.small(); sp != nil {
@@ -632,7 +630,7 @@ func (p List) ToArray() []uint64 {
 	if p.IsEmpty() {
 		return nil
 	}
-	if p.isSingleton() {
+	if p.ptr == singleValue {
 		return []uint64{p.single}
 	}
 	if sp := p.small(); sp != nil {
@@ -656,7 +654,7 @@ func (p List) ForEach(fn func(uint64) bool) bool {
 	if p.ptr == nil {
 		return true
 	}
-	if p.isSingleton() {
+	if p.ptr == singleValue {
 		return fn(p.single)
 	}
 	if sp := p.small(); sp != nil {
@@ -800,9 +798,9 @@ func (p List) ForEachIntersecting(other List, fn func(uint64) bool) bool {
 
 func (p List) Iter() Iterator {
 	if p.IsEmpty() {
-		return emptyIterator()
+		return emptyIter{}
 	}
-	if p.isSingleton() {
+	if p.ptr == singleValue {
 		return getSingletonIter(p.single)
 	}
 	if sp := p.small(); sp != nil {
@@ -828,7 +826,7 @@ func (p List) andIntoLarge(dst *largePosting) {
 		dst.clear()
 		return
 	}
-	if p.isSingleton() {
+	if p.ptr == singleValue {
 		if !dst.contains(p.single) {
 			dst.clear()
 			return
@@ -871,7 +869,7 @@ func (p List) andIntoLarge(dst *largePosting) {
 }
 
 func (p List) Clone() List {
-	if p.IsEmpty() || p.isSingleton() {
+	if p.IsEmpty() || p.ptr == singleValue {
 		return p
 	}
 	if sp := p.small(); sp != nil {
@@ -887,7 +885,7 @@ func (p List) CloneInto(dst List) List {
 	if dst.SharesPayload(p) {
 		return p.Clone()
 	}
-	if p.IsEmpty() || p.isSingleton() {
+	if p.IsEmpty() || p.ptr == singleValue {
 		dst.Release()
 		return p
 	}
@@ -999,7 +997,7 @@ func buildRemoved(ids List, idx uint64) List {
 	switch {
 	case ids.IsEmpty():
 		return ids
-	case ids.isSingleton():
+	case ids.ptr == singleValue:
 		if ids.single == idx {
 			return List{}
 		}
@@ -1144,7 +1142,7 @@ func (p List) BuildAddedMany(ids []uint64) List {
 	lp := largePostingPool.Get()
 	switch {
 	case current.IsEmpty():
-	case current.isSingleton():
+	case current.ptr == singleValue:
 		lp.add(current.single)
 	case current.isSmall():
 		sp := current.small()
@@ -1173,7 +1171,7 @@ func buildAddedChecked(ids List, idx uint64) (List, bool) {
 	switch {
 	case ids.IsEmpty():
 		return singleton(idx), true
-	case ids.isSingleton():
+	case ids.ptr == singleValue:
 		if ids.single == idx {
 			return ids, false
 		}
@@ -1286,7 +1284,7 @@ func buildAdded(ids List, idx uint64) List {
 	switch {
 	case ids.IsEmpty():
 		return singleton(idx)
-	case ids.isSingleton():
+	case ids.ptr == singleValue:
 		if ids.single == idx {
 			return ids
 		}
@@ -1428,7 +1426,7 @@ func (p List) BuildOr(other List) List {
 	if p.SharesPayload(other) {
 		return p
 	}
-	if other.isSingleton() {
+	if other.ptr == singleValue {
 		return buildAdded(p, other.single)
 	}
 	if sp := other.small(); sp != nil {
@@ -1443,7 +1441,7 @@ func (p List) BuildOr(other List) List {
 		}
 		return p
 	}
-	if p.isSingleton() {
+	if p.ptr == singleValue {
 		lp := largePostingPool.Get()
 		lp.add(p.single)
 		lp.or(other.largeRef())
@@ -1794,8 +1792,6 @@ type Iterator interface {
 }
 
 type emptyIter struct{}
-
-func emptyIterator() Iterator { return emptyIter{} }
 
 func (emptyIter) HasNext() bool { return false }
 

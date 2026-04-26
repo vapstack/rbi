@@ -24,12 +24,8 @@ type fieldIndexStringRef struct {
 	len uint16
 }
 
-func indexedStringKeyTooLongLen(n int) bool {
-	return n > fieldIndexStringRefMax
-}
-
 func validateIndexedStringKeyLen(n int) error {
-	if indexedStringKeyTooLongLen(n) {
+	if n > fieldIndexStringRefMax {
 		return fmt.Errorf("indexed string value len %d exceeds limit %d", n, fieldIndexStringRefMax)
 	}
 	return nil
@@ -65,7 +61,7 @@ func nextStringFieldIndexChunkSizeStrings(keys []string, start int) int {
 	limit := min(len(keys)-start, fieldIndexChunkTargetEntries)
 	for i := start; size < limit; i++ {
 		keyLen := len(keys[i])
-		if indexedStringKeyTooLongLen(keyLen) {
+		if keyLen > fieldIndexStringRefMax {
 			panic(fmt.Sprintf("indexed string value len %d exceeds limit %d", keyLen, fieldIndexStringRefMax))
 		}
 		if size > 0 && keyLen > 0 && bytes > fieldIndexStringRefMax {
@@ -87,7 +83,7 @@ func nextStringFieldIndexChunkSizeIndexKeys(keys []indexKey, start int) int {
 	limit := min(len(keys)-start, fieldIndexChunkTargetEntries)
 	for i := start; size < limit; i++ {
 		keyLen := keys[i].byteLen()
-		if indexedStringKeyTooLongLen(keyLen) {
+		if keyLen > fieldIndexStringRefMax {
 			panic(fmt.Sprintf("indexed string value len %d exceeds limit %d", keyLen, fieldIndexStringRefMax))
 		}
 		if size > 0 && keyLen > 0 && bytes > fieldIndexStringRefMax {
@@ -109,7 +105,7 @@ func nextStringFieldIndexChunkSizeEntries(entries []index, start int) int {
 	limit := min(len(entries)-start, fieldIndexChunkTargetEntries)
 	for i := start; size < limit; i++ {
 		keyLen := entries[i].Key.byteLen()
-		if indexedStringKeyTooLongLen(keyLen) {
+		if keyLen > fieldIndexStringRefMax {
 			panic(fmt.Sprintf("indexed string value len %d exceeds limit %d", keyLen, fieldIndexStringRefMax))
 		}
 		if size > 0 && keyLen > 0 && bytes > fieldIndexStringRefMax {
@@ -128,7 +124,7 @@ func stringEntriesFitSingleChunk(entries []index) bool {
 	bytes := 0
 	for i := range entries {
 		keyLen := entries[i].Key.byteLen()
-		if indexedStringKeyTooLongLen(keyLen) {
+		if keyLen > fieldIndexStringRefMax {
 			return false
 		}
 		if i > 0 && keyLen > 0 && bytes > fieldIndexStringRefMax {
@@ -419,10 +415,6 @@ func storedFieldPosting(ids posting.List) posting.List {
 	return ids
 }
 
-func borrowedFieldPosting(ids posting.List) posting.List {
-	return ids.Borrow()
-}
-
 func borrowedFieldIndexEntry(ent index) index {
 	ent.IDs = ent.IDs.Borrow()
 	return ent
@@ -443,7 +435,7 @@ func appendBorrowedIndexEntries(dst []index, src []index) []index {
 
 func copyBorrowedPostingSlice(dst, src []posting.List) {
 	for i := range src {
-		dst[i] = borrowedFieldPosting(src[i])
+		dst[i] = src[i].Borrow()
 	}
 }
 
@@ -573,7 +565,7 @@ func newRegularFieldIndexStorage(slice *[]index) fieldIndexStorage {
 	if slice == nil || len(*slice) == 0 {
 		return fieldIndexStorage{}
 	}
-	if !shouldUseChunkedFieldIndex(len(*slice)) {
+	if len(*slice) < fieldIndexChunkThreshold {
 		return newFlatFieldIndexStorage(slice)
 	}
 	return newChunkedFieldIndexStorage(buildChunkedFieldIndexRoot(*slice))
@@ -753,7 +745,7 @@ func newRegularFieldIndexStorageFromPostingMapOwned(m map[string]posting.List, f
 		return fieldIndexStorage{}
 	}
 	sort.Strings(keys)
-	if !shouldUseChunkedFieldIndex(len(keys)) {
+	if len(keys) < fieldIndexChunkThreshold {
 		entries := make([]index, 0, len(keys))
 		for i := range keys {
 			entries = append(entries, index{
@@ -814,7 +806,7 @@ func newRegularFieldIndexStorageFromInsertPostingAccumsOwned(
 		keys = append(keys, key)
 	}
 	sort.Strings(keys)
-	if !shouldUseChunkedFieldIndex(len(keys)) {
+	if len(keys) < fieldIndexChunkThreshold {
 		entries := make([]index, 0, len(keys))
 		for i := range keys {
 			entries = append(entries, index{
@@ -907,7 +899,7 @@ func newRegularFieldIndexStorageFromFixedPostingMapOwned(m map[uint64]posting.Li
 		return fieldIndexStorage{}
 	}
 	slices.Sort(keys)
-	if !shouldUseChunkedFieldIndex(len(keys)) {
+	if len(keys) < fieldIndexChunkThreshold {
 		entries := make([]index, 0, len(keys))
 		for i := range keys {
 			entries = append(entries, index{
@@ -950,7 +942,7 @@ func newRegularFieldIndexStorageFromFixedInsertPostingAccumsOwned(
 	}
 
 	slices.Sort(keys)
-	if !shouldUseChunkedFieldIndex(len(keys)) {
+	if len(keys) < fieldIndexChunkThreshold {
 		entries := make([]index, 0, len(keys))
 		for i := range keys {
 			entries = append(entries, index{
@@ -979,10 +971,6 @@ func newRegularFieldIndexStorageFromFixedInsertPostingAccumsOwned(
 	fixedInsertPostingMapPool.Put(m)
 
 	return newChunkedFieldIndexStorage(builder.root())
-}
-
-func shouldUseChunkedFieldIndex(keyCount int) bool {
-	return keyCount >= fieldIndexChunkThreshold
 }
 
 func (s fieldIndexStorage) isChunked() bool {
@@ -1342,7 +1330,7 @@ func (b *fieldIndexChunkStreamBuilder) append(key indexKey, ids posting.List) {
 	}
 	if !b.numeric {
 		keyLen := key.byteLen()
-		if indexedStringKeyTooLongLen(keyLen) {
+		if keyLen > fieldIndexStringRefMax {
 			panic(fmt.Sprintf("indexed string value len %d exceeds limit %d", keyLen, fieldIndexStringRefMax))
 		}
 		if len(b.posts) > 0 && shouldSealStringFieldIndexChunk(len(b.posts), b.stringBytes) {
@@ -1833,10 +1821,6 @@ func flattenChunkedFieldIndexRoot(r *fieldIndexChunkedRoot) *[]index {
 		return nil
 	}
 	return &out
-}
-
-func (r *fieldIndexChunkedRoot) startPos() fieldIndexChunkPos {
-	return fieldIndexChunkPos{}
 }
 
 func (r *fieldIndexChunkedRoot) endPos() fieldIndexChunkPos {

@@ -119,12 +119,13 @@ func TestPrepareCountExpr_NOTNULLCompilesAsNeNil(t *testing.T) {
 
 func TestQueryReleaseOwned_ClearsInlineOrderStorage(t *testing.T) {
 	q := queryPool.Get()
-	q.setOrder(Order{
+	q.orderStorage[0] = Order{
 		FieldOrdinal: 2,
 		Kind:         OrderKindArrayPos,
 		Data:         []string{"go", "ops"},
 		Desc:         true,
-	})
+	}
+	q.Order = q.orderStorage[:]
 
 	q.releaseOwned()
 

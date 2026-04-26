@@ -113,7 +113,7 @@ func plannerArgminOROrderCandidatesForTest[K ~string | ~uint64, V any](
 	if !ov.hasData() {
 		return plannerOROrderArgminCandidates{}, false
 	}
-	orderDistinct := uint64(overlayApproxDistinctTotalCount(ov))
+	orderDistinct := uint64(ov.keyCount())
 	if orderDistinct == 0 {
 		return plannerOROrderArgminCandidates{}, false
 	}
@@ -539,7 +539,7 @@ func TestPlannerArgmin_OrderedDecisionMatchesCandidatePolicy(t *testing.T) {
 			defer preparedQ.Release()
 
 			var leavesBuf [plannerPredicateFastPathMaxLeaves]qir.Expr
-			leaves, ok := collectAndLeavesScratch(viewQ.Expr, leavesBuf[:0])
+			leaves, ok := collectAndLeavesModeScratch(viewQ.Expr, leavesBuf[:0], andLeafModeCollect)
 			if !ok || len(leaves) == 0 {
 				t.Fatalf("collectAndLeavesScratch: ok=%v len=%d", ok, len(leaves))
 			}

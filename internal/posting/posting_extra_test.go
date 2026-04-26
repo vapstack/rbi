@@ -9,7 +9,7 @@ import (
 func TestPostingExtraBorrowedReleasePayloadCorruptsSmallOwner(t *testing.T) {
 	base := postingFromIDs(3, 7, 11, 19)
 	want := []uint64{3, 7, 11, 19}
-	if base.IsEmpty() || base.isSingleton() || base.largeRef() != nil {
+	if base.IsEmpty() || base.ptr == singleValue || base.largeRef() != nil {
 		t.Fatalf("expected compact owned posting")
 	}
 	t.Cleanup(func() {

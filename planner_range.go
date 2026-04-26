@@ -106,7 +106,7 @@ func storeEmptyScalarComplementMaterialization(plan scalarComplementMaterializat
 }
 
 func (qv *queryView[K, V]) classifyOrderFieldScalarLeaf(orderField string, e qir.Expr) orderFieldScalarLeafKind {
-	if e.FieldOrdinal < 0 || qv.fieldNameByExpr(e) != orderField {
+	if e.FieldOrdinal < 0 || qv.fieldNameByOrdinal(e.FieldOrdinal) != orderField {
 		return orderFieldScalarLeafOther
 	}
 	if e.Not {
@@ -163,7 +163,7 @@ func isPositiveScalarPrefixLeaf(e qir.Expr) bool {
 }
 
 func (qv *queryView[K, V]) isPositiveNonOrderScalarPrefixLeaf(orderField string, e qir.Expr) bool {
-	return qv.fieldNameByExpr(e) != orderField && isPositiveScalarPrefixLeaf(e)
+	return qv.fieldNameByOrdinal(e.FieldOrdinal) != orderField && isPositiveScalarPrefixLeaf(e)
 }
 
 func (qv *queryView[K, V]) isPositiveMergedNumericRangeLeaf(e qir.Expr) bool {
@@ -219,7 +219,7 @@ func (qv *queryView[K, V]) initPreparedScalarRangePredicateFromBound(
 ) {
 	cacheKey := materializedPredKey{}
 	complementCacheKey := materializedPredKey{}
-	fieldName := qv.fieldNameByExpr(e)
+	fieldName := qv.fieldNameByOrdinal(e.FieldOrdinal)
 	if !bound.full {
 		cacheKey = qv.materializedPredKeyForNormalizedScalarBound(fieldName, bound)
 		complementCacheKey = qv.materializedPredComplementKeyForNormalizedScalarBound(fieldName, bound)
@@ -247,10 +247,10 @@ func (qv *queryView[K, V]) initPreparedExactScalarRangePredicate(
 	fm *field,
 	bounds rangeBounds,
 ) {
-	cacheKey := qv.materializedPredKeyForExactScalarRange(qv.fieldNameByExpr(e), bounds)
+	cacheKey := qv.materializedPredKeyForExactScalarRange(qv.fieldNameByOrdinal(e.FieldOrdinal), bounds)
 	complementCacheKey := materializedPredKey{}
 	if fieldUsesOrderedNumericKeys(fm) && isNumericRangeOp(e.Op) {
-		complementCacheKey = qv.materializedPredComplementKeyForExactScalarRange(qv.fieldNameByExpr(e), bounds)
+		complementCacheKey = qv.materializedPredComplementKeyForExactScalarRange(qv.fieldNameByOrdinal(e.FieldOrdinal), bounds)
 	}
 	loadReuse := newMaterializedPredReadOnlyReuse(qv.snap, cacheKey)
 	sharedReuse := newMaterializedPredSharedReuse(qv.snap, cacheKey)
@@ -561,7 +561,7 @@ func (qv *queryView[K, V]) collectOrderedMergedScalarRangeFields(
 		if err != nil || !ok {
 			return false
 		}
-		fieldName := qv.fieldNameByExpr(e)
+		fieldName := qv.fieldNameByOrdinal(e.FieldOrdinal)
 		idx := findOrderedMergedScalarRangeField(dst, fieldName)
 		if idx < 0 {
 			dst.Append(orderedMergedScalarRangeField{
@@ -596,7 +596,7 @@ func (qv *queryView[K, V]) collectOrderedMergedScalarRangeFieldsBuf(
 		if err != nil || !ok {
 			return false
 		}
-		fieldName := qv.fieldNameByExpr(e)
+		fieldName := qv.fieldNameByOrdinal(e.FieldOrdinal)
 		idx := findOrderedMergedScalarRangeField(dst, fieldName)
 		if idx < 0 {
 			dst.Append(orderedMergedScalarRangeField{
@@ -629,7 +629,7 @@ func (qv *queryView[K, V]) collectMergedNumericRangeFields(
 		if err != nil || !ok {
 			return false
 		}
-		fieldName := qv.fieldNameByExpr(e)
+		fieldName := qv.fieldNameByOrdinal(e.FieldOrdinal)
 		idx := findOrderedMergedScalarRangeField(dst, fieldName)
 		if idx < 0 {
 			dst.Append(orderedMergedScalarRangeField{
@@ -722,7 +722,7 @@ func (core *preparedScalarRangePredicate[K, V]) planBase(slice []index) (prepare
 	inBuckets := end - start
 	est := uint64(0)
 	ov := fieldOverlay{base: slice}
-	fieldName := core.qv.fieldNameByExpr(core.expr)
+	fieldName := core.qv.fieldNameByOrdinal(core.expr.FieldOrdinal)
 	if exact, ok := core.qv.tryCountSnapshotNumericRange(fieldName, core.fm, ov, start, end); ok {
 		est = exact
 	} else if inBuckets == 1 {
@@ -857,7 +857,7 @@ func (core *preparedScalarRangePredicate[K, V]) buildFromSlice(
 			baseStart: plan.start,
 			baseEnd:   plan.end,
 		}
-		fieldName := core.qv.fieldNameByExpr(core.expr)
+		fieldName := core.qv.fieldNameByOrdinal(core.expr.FieldOrdinal)
 		if coldMaterializeAllowed {
 			if out, ok := core.qv.tryEvalNumericRangeBuckets(fieldName, core.fm, ov, br); ok {
 				out.ids = core.sharedReuse.share(out.ids)
@@ -948,7 +948,7 @@ func (core *preparedScalarRangePredicate[K, V]) buildFromOverlay(
 	}
 
 	if allowMaterialize {
-		fieldName := core.qv.fieldNameByExpr(core.expr)
+		fieldName := core.qv.fieldNameByOrdinal(core.expr.FieldOrdinal)
 		if coldMaterializeAllowed {
 			if out, ok := core.qv.tryEvalNumericRangeBuckets(fieldName, core.fm, ov, plan.br); ok {
 				out.ids = core.sharedReuse.share(out.ids)
@@ -1028,7 +1028,7 @@ func (core *preparedScalarRangePredicate[K, V]) evalMaterializedPostingResult(ov
 	}
 
 	if core.expr.Op != qir.OpPREFIX {
-		if out, ok := core.qv.tryEvalNumericRangeBuckets(core.qv.fieldNameByExpr(core.expr), core.fm, ov, br); ok {
+		if out, ok := core.qv.tryEvalNumericRangeBuckets(core.qv.fieldNameByOrdinal(core.expr.FieldOrdinal), core.fm, ov, br); ok {
 			out.ids = core.sharedReuse.share(out.ids)
 			if out.ids.IsEmpty() {
 				return postingResult{}
@@ -1037,7 +1037,7 @@ func (core *preparedScalarRangePredicate[K, V]) evalMaterializedPostingResult(ov
 		}
 	}
 
-	ids := overlayUnionRange(ov, br)
+	ids := overlayUnionRanges(ov, br, overlayRange{})
 	ids = core.sharedReuse.share(ids)
 	if ids.IsEmpty() {
 		return postingResult{}
@@ -1113,14 +1113,10 @@ func (core *preparedScalarRangePredicate[K, V]) loadWarmScalarPostingResult() (p
 	if done {
 		return postingResult{}, false
 	}
-	if out, ok := core.qv.tryLoadNumericRangeBuckets(core.qv.fieldNameByExpr(core.expr), core.fm, ov, plan.br); ok {
+	if out, ok := core.qv.tryLoadNumericRangeBuckets(core.qv.fieldNameByOrdinal(core.expr.FieldOrdinal), core.fm, ov, plan.br); ok {
 		return out, true
 	}
 	return postingResult{}, false
-}
-
-func materializedPredCacheKeyForExactScalarRange(field string, bounds rangeBounds) string {
-	return materializedPredKeyForExactScalarRange(field, bounds).String()
 }
 
 func (qv *queryView[K, V]) loadWarmPreparedScalarExactRange(op preparedScalarExactRange) (postingResult, bool) {
@@ -1168,7 +1164,7 @@ func (qv *queryView[K, V]) evalPreparedScalarExactRange(op preparedScalarExactRa
 		}
 		return out, nil
 	}
-	ids := overlayUnionRange(ov, br)
+	ids := overlayUnionRanges(ov, br, overlayRange{})
 	if !op.cacheKey.isZero() {
 		ids = qv.tryShareMaterializedPred(op.cacheKey, ids)
 	}
@@ -1253,7 +1249,7 @@ func (core *preparedScalarRangePredicate[K, V]) loadComplementMaterialization() 
 func (core *preparedScalarRangePredicate[K, V]) materializeComplement(plan scalarComplementMaterializationPlan) posting.List {
 	var ids posting.List
 	ov := core.qv.fieldOverlayForExpr(core.expr)
-	fieldName := core.qv.fieldNameByExpr(core.expr)
+	fieldName := core.qv.fieldNameByOrdinal(core.expr.FieldOrdinal)
 	var pendingBefore, pendingAfter overlayRange
 	if !overlayRangeEmpty(plan.before) {
 		if out, ok := core.qv.tryEvalNumericRangeBuckets(fieldName, core.fm, ov, plan.before); ok {

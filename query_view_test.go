@@ -174,7 +174,7 @@ func prepareTestQuery[K ~string | ~uint64, V any](db *DB[K, V], q *qx.QX) (*qir.
 	if db == nil {
 		prepared, err = qir.PrepareQueryNoResolve(q)
 	} else {
-		prepared, err = db.prepareQuery(q)
+		prepared, err = qir.PrepareQueryResolved(q, preparedFieldResolver[K, V]{db: db})
 	}
 	if err != nil {
 		return nil, qir.Shape{}, err
@@ -190,7 +190,7 @@ func prepareTestExpr[K ~string | ~uint64, V any](db *DB[K, V], expr qx.Expr) (*q
 	if db == nil {
 		prepared, err = qir.PrepareCountExprsNoResolve(expr)
 	} else {
-		prepared, err = db.prepareCountExprs(expr)
+		prepared, err = qir.PrepareCountExprsResolved(preparedFieldResolver[K, V]{db: db}, expr)
 	}
 	if err != nil {
 		return nil, qir.Expr{}, err
@@ -836,7 +836,7 @@ func (db *DB[K, V]) exprValueToIdxOwned(expr qx.Expr) ([]string, bool, bool, err
 		if err != nil {
 			return nil, false, false, err
 		}
-		fm = qv.fields[qv.fieldNameByExpr(compiled)]
+		fm = qv.fields[qv.fieldNameByOrdinal(compiled.FieldOrdinal)]
 	}
 	defer prepared.Release()
 

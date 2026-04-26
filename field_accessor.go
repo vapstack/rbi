@@ -234,14 +234,14 @@ func addDistinctSignedFixedKeysToSink[S fixedValueSink, T signedFieldValue](vals
 		return 0
 	}
 	if len(vals) == 1 {
-		sink.addFixed(buildInt64Key(int64(vals[0])))
+		sink.addFixed(uint64(int64(vals[0])) ^ (uint64(1) << 63))
 		return 1
 	}
 	seen := newU64Set(len(vals))
 	defer releaseU64Set(&seen)
 	distinct := 0
 	for i := range vals {
-		cur := buildInt64Key(int64(vals[i]))
+		cur := uint64(int64(vals[i])) ^ (uint64(1) << 63)
 		if !seen.Add(cur) {
 			continue
 		}
@@ -278,14 +278,14 @@ func addDistinctFloatFixedKeysToSink[S fixedValueSink, T floatFieldValue](vals [
 		return 0
 	}
 	if len(vals) == 1 {
-		sink.addFixed(buildFloat64Key(float64(vals[0])))
+		sink.addFixed(orderedFloat64Key(float64(vals[0])))
 		return 1
 	}
 	seen := newU64Set(len(vals))
 	defer releaseU64Set(&seen)
 	distinct := 0
 	for i := range vals {
-		cur := buildFloat64Key(float64(vals[i]))
+		cur := orderedFloat64Key(float64(vals[i]))
 		if !seen.Add(cur) {
 			continue
 		}
@@ -377,14 +377,14 @@ func writePtrIntField[S nilFixedValueSink, T signedFieldValue](ptr unsafe.Pointe
 		sink.setNil()
 		return
 	}
-	sink.addFixed(buildInt64Key(int64(*v)))
+	sink.addFixed(uint64(int64(*v)) ^ (uint64(1) << 63))
 }
 
 func writeScalarIntField[S fixedValueSink, T signedFieldValue](ptr unsafe.Pointer, sink S, offset uintptr) {
 	if ptr == nil {
 		return
 	}
-	sink.addFixed(buildInt64Key(int64(scalarFieldValue[T](ptr, offset))))
+	sink.addFixed(uint64(int64(scalarFieldValue[T](ptr, offset))) ^ (uint64(1) << 63))
 }
 
 func writePtrUintField[S nilFixedValueSink, T unsignedFieldValue](ptr unsafe.Pointer, sink S, offset uintptr) {
@@ -415,14 +415,14 @@ func writePtrFloatField[S nilFixedValueSink, T floatFieldValue](ptr unsafe.Point
 		sink.setNil()
 		return
 	}
-	sink.addFixed(buildFloat64Key(float64(*v)))
+	sink.addFixed(orderedFloat64Key(float64(*v)))
 }
 
 func writeScalarFloatField[S fixedValueSink, T floatFieldValue](ptr unsafe.Pointer, sink S, offset uintptr) {
 	if ptr == nil {
 		return
 	}
-	sink.addFixed(buildFloat64Key(float64(scalarFieldValue[T](ptr, offset))))
+	sink.addFixed(orderedFloat64Key(float64(scalarFieldValue[T](ptr, offset))))
 }
 
 func writeStringSliceField[S lenStringValueSink](ptr unsafe.Pointer, sink S, offset uintptr) {
@@ -469,14 +469,14 @@ func writePtrTimeField[S nilFixedValueSink](ptr unsafe.Pointer, sink S, offset u
 		sink.setNil()
 		return
 	}
-	sink.addFixed(buildInt64Key(v.Unix()))
+	sink.addFixed(uint64(v.Unix()) ^ (uint64(1) << 63))
 }
 
 func writeScalarTimeField[S fixedValueSink](ptr unsafe.Pointer, sink S, offset uintptr) {
 	if ptr == nil {
 		return
 	}
-	sink.addFixed(buildInt64Key(scalarFieldValue[time.Time](ptr, offset).Unix()))
+	sink.addFixed(uint64(scalarFieldValue[time.Time](ptr, offset).Unix()) ^ (uint64(1) << 63))
 }
 
 func slicesModified[T comparable](lhs, rhs []T) bool {

@@ -40,9 +40,9 @@ func (db *DB[K, V]) Count(exprs ...qx.Expr) (uint64, error) {
 	)
 	switch len(exprs) {
 	case 1:
-		prepared, err = db.prepareCountExpr(exprs[0])
+		prepared, err = qir.PrepareCountExprResolved(preparedFieldResolver[K, V]{db: db}, exprs[0])
 	default:
-		prepared, err = db.prepareCountExprs(exprs...)
+		prepared, err = qir.PrepareCountExprsResolved(preparedFieldResolver[K, V]{db: db}, exprs...)
 	}
 	if err != nil {
 		return 0, err
@@ -299,7 +299,7 @@ func (qv *queryView[K, V]) tryCountBySliceLookup(expr qir.Expr, trace *queryTrac
 	switch expr.Op {
 
 	case qir.OpHASANY:
-		postsBuf, _ := qv.scalarLookupPostings(qv.fieldNameByExpr(expr), expr.FieldOrdinal, valsBuf, false)
+		postsBuf, _ := qv.scalarLookupPostings(qv.fieldNameByOrdinal(expr.FieldOrdinal), expr.FieldOrdinal, valsBuf, false)
 		defer postingSlicePool.Put(postsBuf)
 		switch postsBuf.Len() {
 		case 0:
@@ -807,7 +807,7 @@ func (qv *queryView[K, V]) evalAndOperandsExceptReordered(ops []qir.Expr, skip i
 		if mergedRangesBuf != nil {
 			e := plans[pi].expr
 			if qv.isPositiveMergedNumericRangeLeaf(e) {
-				idx := findOrderedMergedScalarRangeField(mergedRangesBuf, qv.fieldNameByExpr(e))
+				idx := findOrderedMergedScalarRangeField(mergedRangesBuf, qv.fieldNameByOrdinal(e.FieldOrdinal))
 				if idx >= 0 {
 					merged := mergedRangesBuf.Get(idx)
 					if merged.count > 1 {
@@ -909,7 +909,7 @@ func (qv *queryView[K, V]) evalMergedExactRangePostingResult(e qir.Expr, bounds 
 		return postingResult{}, true
 	}
 	if core.expr.Op != qir.OpPREFIX {
-		if out, ok := qv.tryEvalNumericRangeBuckets(qv.fieldNameByExpr(core.expr), core.fm, ov, br); ok {
+		if out, ok := qv.tryEvalNumericRangeBuckets(qv.fieldNameByOrdinal(core.expr.FieldOrdinal), core.fm, ov, br); ok {
 			if out.ids.IsEmpty() {
 				return postingResult{}, true
 			}
@@ -918,7 +918,7 @@ func (qv *queryView[K, V]) evalMergedExactRangePostingResult(e qir.Expr, bounds 
 		}
 	}
 
-	ids := overlayUnionRange(ov, br)
+	ids := overlayUnionRanges(ov, br, overlayRange{})
 	if ids.IsEmpty() {
 		return postingResult{}, true
 	}
@@ -935,7 +935,7 @@ func (qv *queryView[K, V]) tryCountByScalarInSplit(expr qir.Expr, trace *queryTr
 	}
 
 	var leavesBuf [countPredicateScanMaxLeaves]qir.Expr
-	leaves, ok := collectAndLeavesScratch(expr, leavesBuf[:0])
+	leaves, ok := collectAndLeavesModeScratch(expr, leavesBuf[:0], andLeafModeCollect)
 	if !ok || len(leaves) < 2 || len(leaves) > countPredicateScanMaxLeaves {
 		return 0, false, nil
 	}
@@ -1080,7 +1080,7 @@ func countLeavesForUniquePath(expr qir.Expr, dst []qir.Expr) ([]qir.Expr, bool) 
 		return nil, false
 	}
 	if expr.Op == qir.OpAND {
-		leaves, ok := collectAndLeavesScratch(expr, dst)
+		leaves, ok := collectAndLeavesModeScratch(expr, dst, andLeafModeCollect)
 		if !ok || len(leaves) == 0 {
 			return nil, false
 		}
@@ -1327,7 +1327,7 @@ func (qv *queryView[K, V]) buildCountPredicatesWithMode(leaves []qir.Expr, allow
 
 	for i, e := range leaves {
 		if mergedRangesBuf != nil && qv.isPositiveMergedNumericRangeLeaf(e) {
-			idx := findOrderedMergedScalarRangeField(mergedRangesBuf, qv.fieldNameByExpr(e))
+			idx := findOrderedMergedScalarRangeField(mergedRangesBuf, qv.fieldNameByOrdinal(e.FieldOrdinal))
 			if idx >= 0 {
 				merged := mergedRangesBuf.Get(idx)
 				if merged.count > 1 {
@@ -2629,7 +2629,7 @@ func (qv *queryView[K, V]) tryCountByPredicates(expr qir.Expr, trace *queryTrace
 	}
 
 	var leavesBuf [countPredicateScanMaxLeaves]qir.Expr
-	leaves, ok := collectAndLeavesScratch(expr, leavesBuf[:0])
+	leaves, ok := collectAndLeavesModeScratch(expr, leavesBuf[:0], andLeafModeCollect)
 	if !ok || !shouldTryCountByPredicates(leaves) {
 		return 0, false, nil
 	}
@@ -2782,7 +2782,7 @@ func (qv *queryView[K, V]) tryCountByPredicatesLeadBuckets(preds predicateSet, l
 	}
 	ov := span.ov
 	if ov.chunked != nil {
-		rb, covered, hasBounds, ok := qv.collectPredicateRangeBoundsSet(qv.fieldNameByExpr(e), preds)
+		rb, covered, hasBounds, ok := qv.collectPredicateRangeBoundsSet(qv.fieldNameByOrdinal(e.FieldOrdinal), preds)
 		if !ok || !hasBounds {
 			if ok {
 				boolSlicePool.Put(covered)
@@ -2933,7 +2933,7 @@ func (qv *queryView[K, V]) tryCountByPredicatesLeadBuckets(preds predicateSet, l
 	if !span.hasData {
 		return 0, 0, false
 	}
-	rb, covered, hasBounds, ok := qv.collectPredicateRangeBoundsSet(qv.fieldNameByExpr(e), preds)
+	rb, covered, hasBounds, ok := qv.collectPredicateRangeBoundsSet(qv.fieldNameByOrdinal(e.FieldOrdinal), preds)
 	if !ok || !hasBounds {
 		if ok {
 			boolSlicePool.Put(covered)
@@ -4161,7 +4161,7 @@ func (qv *queryView[K, V]) tryCountPreparedAndReordered(expr qir.Expr) (uint64, 
 	}
 
 	var leavesBuf [countPredicateScanMaxLeaves]qir.Expr
-	leaves, ok := collectAndLeavesScratch(expr, leavesBuf[:0])
+	leaves, ok := collectAndLeavesModeScratch(expr, leavesBuf[:0], andLeafModeCollect)
 	if !ok || len(leaves) < 2 || len(leaves) > countPredicateScanMaxLeaves {
 		return 0, false, nil
 	}

@@ -138,7 +138,7 @@ func plannerGuardrailRunForcedOROrderFallback(
 	}
 	branches, alwaysFalse, ok := view.buildORBranchesOrdered(
 		viewQ.Expr.Operands,
-		view.fieldNameByOrder(viewQ.Order),
+		view.fieldNameByOrdinal(viewQ.Order.FieldOrdinal),
 		window,
 		viewQ.Offset,
 	)
@@ -167,12 +167,12 @@ func plannerGuardrailRunForcedOrderedPlanner(
 	trace *queryTrace,
 ) ([]uint64, bool, error) {
 	var leavesBuf [plannerPredicateFastPathMaxLeaves]qir.Expr
-	leaves, ok := collectAndLeavesScratch(viewQ.Expr, leavesBuf[:0])
+	leaves, ok := collectAndLeavesModeScratch(viewQ.Expr, leavesBuf[:0], andLeafModeCollect)
 	if !ok {
 		return nil, false, nil
 	}
 	window, _ := orderWindow(viewQ)
-	orderField := view.fieldNameByOrder(viewQ.Order)
+	orderField := view.fieldNameByOrdinal(viewQ.Order.FieldOrdinal)
 	predSet, ok := view.buildPredicatesOrderedWithMode(leaves, orderField, false, window, viewQ.Offset, true, true)
 	if !ok {
 		return nil, false, nil
@@ -207,7 +207,7 @@ func plannerGuardrailRunForcedOrderedNoOrderPlanner(
 	trace *queryTrace,
 ) ([]uint64, bool, error) {
 	var leavesBuf [plannerPredicateFastPathMaxLeaves]qir.Expr
-	leaves, ok := collectAndLeavesScratch(viewQ.Expr, leavesBuf[:0])
+	leaves, ok := collectAndLeavesModeScratch(viewQ.Expr, leavesBuf[:0], andLeafModeCollect)
 	if !ok {
 		return nil, false, nil
 	}

@@ -2113,7 +2113,7 @@ func TestPlannerOROrder_RefreshBranchCollapsesCoveredTautology(t *testing.T) {
 	for bi := 0; bi < branches.Len(); bi++ {
 		branch := branches.Get(bi)
 		for pi := 0; pi < branch.predLen(); pi++ {
-			if view.fieldNameByExpr(branch.pred(pi).expr) != "age" {
+			if view.fieldNameByOrdinal(branch.pred(pi).expr.FieldOrdinal) != "age" {
 				continue
 			}
 			targetBranch = bi
@@ -2228,7 +2228,7 @@ func TestPlannerOROrder_RefreshBranchCollapsesImpossibleBranch(t *testing.T) {
 	for bi := 0; bi < branches.Len(); bi++ {
 		branch := branches.Get(bi)
 		for pi := 0; pi < branch.predLen(); pi++ {
-			if view.fieldNameByExpr(branch.pred(pi).expr) != "age" {
+			if view.fieldNameByOrdinal(branch.pred(pi).expr.FieldOrdinal) != "age" {
 				continue
 			}
 			targetBranch = bi
@@ -2405,7 +2405,7 @@ func TestPlannerOROrder_MergeWarmupMaterializesExactPredicate(t *testing.T) {
 		branch := branches.Get(bi)
 		for pi := 0; pi < branch.predLen(); pi++ {
 			p := branch.pred(pi)
-			if view.fieldNameByExpr(p.expr) != "age" {
+			if view.fieldNameByOrdinal(p.expr.FieldOrdinal) != "age" {
 				continue
 			}
 			if !p.hasEffectiveBounds || !p.supportsExactBucketPostingFilter() {
@@ -2836,7 +2836,7 @@ func TestPlannerOROrderDecision_PrefersMergeWhenRouteEstimatorBeatsStream(t *tes
 		t.Fatalf("unexpected zero universe")
 	}
 	ov := view.fieldOverlay("score")
-	orderDistinct := uint64(overlayApproxDistinctTotalCount(ov))
+	orderDistinct := uint64(ov.keyCount())
 	if orderDistinct == 0 {
 		t.Fatalf("unexpected zero order distinct")
 	}
@@ -3160,22 +3160,22 @@ func TestPlannerOROrderMergePaths_MixedExactAndNonExactChecks_MatchSeqScan(t *te
 }
 
 func TestPlannerORKWayShouldFallbackRuntime(t *testing.T) {
-	if plannerORKWayShouldFallbackRuntime(120, 16, 20, 300_000) {
+	if plannerORKWayShouldFallbackRuntimeDetailed(120, 16, 20, 300_000).fallback {
 		t.Fatalf("unexpected fallback for too-small pop sample")
 	}
-	if plannerORKWayShouldFallbackRuntime(120, 64, 4, 300_000) {
+	if plannerORKWayShouldFallbackRuntimeDetailed(120, 64, 4, 300_000).fallback {
 		t.Fatalf("unexpected fallback for too-small unique sample")
 	}
-	if plannerORKWayShouldFallbackRuntime(120, 64, 20, 8_000) {
+	if plannerORKWayShouldFallbackRuntimeDetailed(120, 64, 20, 8_000).fallback {
 		t.Fatalf("unexpected fallback for too-small examined sample")
 	}
-	if plannerORKWayShouldFallbackRuntime(120, 64, 50, 40_000) {
+	if plannerORKWayShouldFallbackRuntimeDetailed(120, 64, 50, 40_000).fallback {
 		t.Fatalf("unexpected fallback for efficient stream")
 	}
-	if !plannerORKWayShouldFallbackRuntime(120, 64, 12, 500_000) {
+	if !plannerORKWayShouldFallbackRuntimeDetailed(120, 64, 12, 500_000).fallback {
 		t.Fatalf("expected fallback for poor projected k-way efficiency")
 	}
-	if !plannerORKWayShouldFallbackRuntime(250_000, 3_000, 2_900, 300_000) {
+	if !plannerORKWayShouldFallbackRuntimeDetailed(250_000, 3_000, 2_900, 300_000).fallback {
 		t.Fatalf("expected fallback for large-window low-overlap stream")
 	}
 }

@@ -188,7 +188,7 @@ func TestBuildRemovedTwoElementPostingBecomesSingleton(t *testing.T) {
 	ids := postingFromIDs(7, 11)
 	ids = ids.BuildRemoved(7)
 
-	if !ids.isSingleton() {
+	if ids.ptr != singleValue {
 		t.Fatalf("expected singleton after removing one of two elements")
 	}
 	if id, ok := ids.TrySingle(); !ok || id != 11 {
@@ -372,7 +372,7 @@ func TestReadSmallPostingSingletonCanonicalizes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReadFrom: %v", err)
 	}
-	if !got.isSingleton() {
+	if got.ptr != singleValue {
 		t.Fatalf("expected singleton canonicalization for small payload len=1")
 	}
 	if got.small() != nil || got.mid() != nil || got.largeRef() != nil {
@@ -798,7 +798,7 @@ func assertListRepresentation(t *testing.T, list List, want string) {
 			t.Fatalf("expected empty representation")
 		}
 	case "singleton":
-		if !list.isSingleton() {
+		if list.ptr != singleValue {
 			t.Fatalf("expected singleton representation")
 		}
 	case "small":
@@ -1178,7 +1178,7 @@ func TestListBorrowDoesNotAllocate(t *testing.T) {
 			}
 			allocs := testing.AllocsPerRun(1000, func() {
 				b := tc.list.Borrow()
-				if !tc.list.IsEmpty() && !tc.list.isSingleton() && !b.SharesPayload(tc.list) {
+				if !tc.list.IsEmpty() && tc.list.ptr != singleValue && !b.SharesPayload(tc.list) {
 					t.Fatalf("Borrow must share payload")
 				}
 				b.Release()

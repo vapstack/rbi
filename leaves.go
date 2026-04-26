@@ -20,29 +20,6 @@ const (
 	andLeafStatusInvalid
 )
 
-func collectAndLeaves(e qir.Expr) ([]qir.Expr, bool) {
-	return collectAndLeavesMode(e, andLeafModeCollect)
-}
-
-func collectAndLeavesScratch(e qir.Expr, dst []qir.Expr) ([]qir.Expr, bool) {
-	return collectAndLeavesModeScratch(e, dst, andLeafModeCollect)
-}
-
-func collectAndLeavesBuf(e qir.Expr, dst *pooled.SliceBuf[qir.Expr]) bool {
-	if dst == nil {
-		return false
-	}
-	return appendAndLeavesModeBuf(dst, e, andLeafModeCollect)
-}
-
-func extractAndLeaves(e qir.Expr) ([]qir.Expr, bool) {
-	return collectAndLeavesMode(e, andLeafModeExtract)
-}
-
-func extractAndLeavesScratch(e qir.Expr, dst []qir.Expr) ([]qir.Expr, bool) {
-	return collectAndLeavesModeScratch(e, dst, andLeafModeExtract)
-}
-
 func collectAndLeavesFixed(e qir.Expr, dst []qir.Expr) ([]qir.Expr, bool) {
 	dst, status := appendAndLeavesMode(dst[:0], e, andLeafModeCollect)
 	if status != andLeafStatusOK || len(dst) == 0 {

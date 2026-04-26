@@ -354,7 +354,7 @@ func TestExtractAndLeavesRejectsNegatedAndGroup(t *testing.T) {
 		qx.EQ("active", true),
 	)
 
-	leaves, ok := extractAndLeaves(mustTestQIRExpr(t, e))
+	leaves, ok := collectAndLeavesMode(mustTestQIRExpr(t, e), andLeafModeExtract)
 	if ok || leaves != nil {
 		t.Fatalf("expected negated AND group to be rejected, got ok=%v leaves=%v", ok, leaves)
 	}

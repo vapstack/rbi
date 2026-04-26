@@ -27,10 +27,6 @@ func (db *DB[K, V]) RefreshPlannerStats() error {
 	return db.refreshPlannerStatsWithBudget(0, false)
 }
 
-func (db *DB[K, V]) refreshPlannerStatsPeriodic() error {
-	return db.refreshPlannerStatsWithBudget(db.planner.analyzer.softBudget, true)
-}
-
 func (db *DB[K, V]) refreshPlannerStatsWithBudget(softBudget time.Duration, useCursor bool) error {
 	if err := db.beginOp(); err != nil {
 		return err
@@ -249,7 +245,7 @@ func (db *DB[K, V]) runPlannerAnalyzeLoop(stop <-chan struct{}, done chan<- stru
 		case <-timer.C:
 		}
 
-		err := db.refreshPlannerStatsPeriodic()
+		err := db.refreshPlannerStatsWithBudget(db.planner.analyzer.softBudget, true)
 		if err != nil {
 			if errors.Is(err, ErrClosed) || errors.Is(err, ErrBroken) {
 				return

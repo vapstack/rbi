@@ -917,7 +917,7 @@ func applyFieldPostingDiffFlatMaybeChunked(base *[]index, deltaKeys []keyedBatch
 	if root == nil {
 		return fieldIndexStorage{}
 	}
-	if !shouldUseChunkedFieldIndex(root.keyCount) {
+	if root.keyCount < fieldIndexChunkThreshold {
 		return newFlatFieldIndexStorage(flattenChunkedFieldIndexRoot(root))
 	}
 	return newChunkedFieldIndexStorage(root)
@@ -937,7 +937,7 @@ func applyFieldPostingDiffFlatMaybeChunkedBuf(base *[]index, deltaKeys *pooled.S
 	if root == nil {
 		return fieldIndexStorage{}
 	}
-	if !shouldUseChunkedFieldIndex(root.keyCount) {
+	if root.keyCount < fieldIndexChunkThreshold {
 		return newFlatFieldIndexStorage(flattenChunkedFieldIndexRoot(root))
 	}
 	return newChunkedFieldIndexStorage(root)
@@ -1106,7 +1106,7 @@ func applyFieldPostingDiffStorageOwned(
 	if flat != nil {
 		baseCount = len(*flat)
 	}
-	if shouldUseChunkedFieldIndex(buf.Len() + baseCount) {
+	if buf.Len()+baseCount >= fieldIndexChunkThreshold {
 		return applyFieldPostingDiffFlatMaybeChunkedBuf(flat, buf)
 	}
 	return newRegularFieldIndexStorage(applyFieldPostingDiffSortedBuf(flat, buf))
@@ -1134,7 +1134,7 @@ func applyFixedFieldPostingDiffStorageOwned(
 	if flat != nil {
 		baseCount = len(*flat)
 	}
-	if shouldUseChunkedFieldIndex(buf.Len() + baseCount) {
+	if buf.Len()+baseCount >= fieldIndexChunkThreshold {
 		return applyFieldPostingDiffFlatMaybeChunkedBuf(flat, buf)
 	}
 	return newRegularFieldIndexStorage(applyFieldPostingDiffSortedBuf(flat, buf))
@@ -1357,7 +1357,7 @@ func applyFieldPostingDiffChunked(
 	if root == nil {
 		return fieldIndexStorage{}
 	}
-	if !shouldUseChunkedFieldIndex(root.keyCount) {
+	if root.keyCount < fieldIndexChunkThreshold {
 		return newFlatFieldIndexStorage(flattenChunkedFieldIndexRoot(root))
 	}
 	return newChunkedFieldIndexStorage(root)
@@ -1416,7 +1416,7 @@ func applyFieldPostingDiffChunkedBuf(
 	if root == nil {
 		return fieldIndexStorage{}
 	}
-	if !shouldUseChunkedFieldIndex(root.keyCount) {
+	if root.keyCount < fieldIndexChunkThreshold {
 		return newFlatFieldIndexStorage(flattenChunkedFieldIndexRoot(root))
 	}
 	return newChunkedFieldIndexStorage(root)
@@ -1574,7 +1574,7 @@ func applySingleFieldPostingDiffChunked(base *fieldIndexChunkedRoot, delta keyed
 			if root == nil {
 				return fieldIndexStorage{}
 			}
-			if !shouldUseChunkedFieldIndex(root.keyCount) {
+			if root.keyCount < fieldIndexChunkThreshold {
 				return newFlatFieldIndexStorage(flattenChunkedFieldIndexRoot(root))
 			}
 			return newChunkedFieldIndexStorage(root)
@@ -1591,7 +1591,7 @@ func applySingleFieldPostingDiffChunked(base *fieldIndexChunkedRoot, delta keyed
 	if root == nil {
 		return fieldIndexStorage{}
 	}
-	if !shouldUseChunkedFieldIndex(root.keyCount) {
+	if root.keyCount < fieldIndexChunkThreshold {
 		return newFlatFieldIndexStorage(flattenChunkedFieldIndexRoot(root))
 	}
 	return newChunkedFieldIndexStorage(root)
@@ -1684,7 +1684,7 @@ func mergeInsertOnlyFieldStorageOwned(
 		return applyFieldPostingDiffChunkedBuf(base.chunked, buf)
 	}
 	flat := base.flatSlice()
-	if allowChunk && flat != nil && shouldUseChunkedFieldIndex(len(*flat)+len(adds)) {
+	if allowChunk && flat != nil && len(*flat)+len(adds) >= fieldIndexChunkThreshold {
 		buf := sortedInsertPostingAddsBufOwned(adds, arena, fixed8)
 		if buf == nil {
 			return base
@@ -1738,7 +1738,7 @@ func mergeInsertOnlyFixedFieldStorageOwned(
 		return applyFieldPostingDiffChunkedBuf(base.chunked, buf)
 	}
 	flat := base.flatSlice()
-	if allowChunk && flat != nil && shouldUseChunkedFieldIndex(len(*flat)+len(adds)) {
+	if allowChunk && flat != nil && len(*flat)+len(adds) >= fieldIndexChunkThreshold {
 		buf := sortedFixedInsertPostingAddsBufOwned(adds, arena)
 		if buf == nil {
 			return base

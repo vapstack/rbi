@@ -1469,7 +1469,7 @@ func (qv *queryView[K, V]) estimateOROrderMergeRouteCost(
 	}
 
 	order := q.Order
-	orderField := qv.fieldNameByOrder(order)
+	orderField := qv.fieldNameByOrdinal(order.FieldOrdinal)
 	if order.FieldOrdinal < 0 {
 		return plannerOROrderRouteCost{}, false
 	}
@@ -1480,7 +1480,7 @@ func (qv *queryView[K, V]) estimateOROrderMergeRouteCost(
 		return plannerOROrderRouteCost{}, false
 	}
 	orderOV := qv.fieldOverlayForOrder(order)
-	orderDistinct := uint64(overlayApproxDistinctTotalCount(orderOV))
+	orderDistinct := uint64(orderOV.keyCount())
 	orderStats := qv.plannerOrderFieldStats(orderField, snap, universe, orderDistinct)
 
 	var branchCards [plannerORBranchLimit]uint64
@@ -1766,7 +1766,7 @@ func (qv *queryView[K, V]) tryPlanORMergeMode(q *qir.Shape, trace *queryTrace) (
 		return nil, false, nil
 	}
 	window, _ := orderWindow(q)
-	branches, alwaysFalse, ok := qv.buildORBranchesOrdered(q.Expr.Operands, qv.fieldNameByOrder(o), window, q.Offset)
+	branches, alwaysFalse, ok := qv.buildORBranchesOrdered(q.Expr.Operands, qv.fieldNameByOrdinal(o.FieldOrdinal), window, q.Offset)
 	if !ok {
 		return nil, false, nil
 	}
@@ -2053,7 +2053,7 @@ func (qv *queryView[K, V]) orderedORMaterializedRangeLeafCosts(
 	leaf qir.Expr,
 ) (materializedPredKey, uint64, uint64, uint64, bool) {
 	candidate, ok := qv.prepareScalarRangeRoutingCandidate(leaf)
-	if !ok || !candidate.numeric || qv.fieldNameByExpr(leaf) == orderField {
+	if !ok || !candidate.numeric || qv.fieldNameByOrdinal(leaf.FieldOrdinal) == orderField {
 		return materializedPredKey{}, 0, 0, 0, false
 	}
 	core := candidate.core
@@ -2110,7 +2110,7 @@ func (qv *queryView[K, V]) orderedORMaterializedExactRangePredicateCosts(
 	if !p.hasEffectiveBounds || p.expr.FieldOrdinal < 0 {
 		return materializedPredKey{}, 0, 0, 0, false
 	}
-	fieldName := qv.fieldNameByExpr(p.expr)
+	fieldName := qv.fieldNameByOrdinal(p.expr.FieldOrdinal)
 	if fieldName == orderField {
 		return materializedPredKey{}, 0, 0, 0, false
 	}
@@ -3053,7 +3053,7 @@ func (qv *queryView[K, V]) promoteOrderedORMaterializedBaseOps(
 	if q == nil || branches.Len() == 0 || qv.snap == nil || !q.HasOrder || observed == nil {
 		return
 	}
-	orderField := qv.fieldNameByOrder(q.Order)
+	orderField := qv.fieldNameByOrdinal(q.Order.FieldOrdinal)
 	if q.Order.FieldOrdinal < 0 {
 		return
 	}
@@ -3164,7 +3164,7 @@ func (qv *queryView[K, V]) promoteObservedOrderedORKWayMaterializedBaseOps(
 	if !ok || needWindow <= 0 {
 		return
 	}
-	orderField := qv.fieldNameByOrder(q.Order)
+	orderField := qv.fieldNameByOrdinal(q.Order.FieldOrdinal)
 	if q.Order.FieldOrdinal < 0 {
 		return
 	}
@@ -3489,7 +3489,7 @@ func (qv *queryView[K, V]) buildORBranches(ops []qir.Expr) (plannerORBranches, b
 	var leavesBuf [8]qir.Expr
 
 	for _, op := range ops {
-		leaves, ok := collectAndLeavesScratch(op, leavesBuf[:0])
+		leaves, ok := collectAndLeavesModeScratch(op, leavesBuf[:0], andLeafModeCollect)
 		if !ok {
 			out.Release()
 			return plannerORBranches{}, false, false
@@ -3528,7 +3528,7 @@ func (qv *queryView[K, V]) buildORBranchesOrdered(
 	var leavesBuf [8]qir.Expr
 
 	for _, op := range ops {
-		leaves, ok := collectAndLeavesScratch(op, leavesBuf[:0])
+		leaves, ok := collectAndLeavesModeScratch(op, leavesBuf[:0], andLeafModeCollect)
 		if !ok {
 			out.Release()
 			return plannerORBranches{}, false, false
@@ -3598,7 +3598,7 @@ func (qv *queryView[K, V]) buildORBranchesOrdered(
 // It keeps deterministic ordering semantics and avoids full OR unions for LIMIT-heavy queries.
 func (qv *queryView[K, V]) execPlanOROrderBasic(q *qir.Shape, branches plannerORBranches, analysis *plannerOROrderAnalysis, trace *queryTrace, observed *orderedORObservedStats) ([]K, bool) {
 	o := q.Order
-	f := qv.fieldNameByOrder(o)
+	f := qv.fieldNameByOrdinal(o.FieldOrdinal)
 	if o.FieldOrdinal < 0 {
 		return nil, false
 	}
@@ -3939,7 +3939,7 @@ func (qv *queryView[K, V]) decideOROrderFallbackFirstWithAnalysis(
 	if analysis != nil {
 		mergeStats = analysis.mergeStats
 	} else {
-		mergeStats = qv.orderMergeBranchStats(qv.fieldNameByOrder(order), branches, ov)
+		mergeStats = qv.orderMergeBranchStats(qv.fieldNameByOrdinal(order.FieldOrdinal), branches, ov)
 	}
 	routeCost, ok := qv.estimateOROrderMergeRouteCost(q, branches, need, mergeStats)
 	if !ok {
@@ -4029,7 +4029,7 @@ func (qv *queryView[K, V]) decideOROrderKWayRuntimeFallbackWithAnalysis(
 	}
 
 	order := q.Order
-	orderField := qv.fieldNameByOrder(order)
+	orderField := qv.fieldNameByOrdinal(order.FieldOrdinal)
 	if order.FieldOrdinal < 0 {
 		return plannerOROrderRuntimeGuardDecision{}, false
 	}
@@ -4091,10 +4091,6 @@ func (qv *queryView[K, V]) decideOROrderKWayRuntimeFallbackWithAnalysis(
 	d.enable = false
 	d.reason = "guard_not_needed"
 	return d, true
-}
-
-func plannerORKWayShouldFallbackRuntime(needWindow int, pops int, unique uint64, examined uint64) bool {
-	return plannerORKWayShouldFallbackRuntimeDetailed(needWindow, pops, unique, examined).fallback
 }
 
 func plannerORKWayShouldFallbackRuntimeDetailed(needWindow int, pops int, unique uint64, examined uint64) plannerORKWayRuntimeDecision {
@@ -4798,7 +4794,7 @@ func (qv *queryView[K, V]) execPlanOROrderKWay(
 	if !ov.hasData() {
 		return nil, true, nil
 	}
-	orderField := qv.fieldNameByOrder(o)
+	orderField := qv.fieldNameByOrdinal(o.FieldOrdinal)
 
 	for i := 0; i < branches.Len(); i++ {
 		if branches.Get(i).alwaysTrue {
@@ -5634,7 +5630,7 @@ func (qv *queryView[K, V]) collectOROrderFallbackBranchCandidates(
 	if order.Kind != qir.OrderKindBasic || order.FieldOrdinal < 0 {
 		return 0, 0, 0, false
 	}
-	fieldName := qv.fieldNameByOrder(order)
+	fieldName := qv.fieldNameByOrdinal(order.FieldOrdinal)
 	fm := qv.fieldMetaByOrder(order)
 	if fm == nil || fm.Slice {
 		return 0, 0, 0, false

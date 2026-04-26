@@ -182,14 +182,6 @@ func (qv *queryView[K, V]) indexedFieldAccessorByOrdinal(ordinal int) (indexedFi
 	return qv.root.indexedFieldAccess[ordinal], true
 }
 
-func (qv *queryView[K, V]) indexedFieldAccessorForExpr(expr qir.Expr) (indexedFieldAccessor, bool) {
-	return qv.indexedFieldAccessorByOrdinal(expr.FieldOrdinal)
-}
-
-func (qv *queryView[K, V]) indexedFieldAccessorForOrder(order qir.Order) (indexedFieldAccessor, bool) {
-	return qv.indexedFieldAccessorByOrdinal(order.FieldOrdinal)
-}
-
 func (qv *queryView[K, V]) fieldMetaByOrdinal(ordinal int) *field {
 	acc, ok := qv.indexedFieldAccessorByOrdinal(ordinal)
 	if !ok {
@@ -212,14 +204,6 @@ func (qv *queryView[K, V]) fieldNameByOrdinal(ordinal int) string {
 	return qv.root.fieldNameByOrdinal(ordinal)
 }
 
-func (qv *queryView[K, V]) fieldNameByExpr(expr qir.Expr) string {
-	return qv.fieldNameByOrdinal(expr.FieldOrdinal)
-}
-
-func (qv *queryView[K, V]) fieldNameByOrder(order qir.Order) string {
-	return qv.fieldNameByOrdinal(order.FieldOrdinal)
-}
-
 func (qv *queryView[K, V]) fieldMeta(field string, ordinal int) *field {
 	acc, ok := qv.indexedFieldAccessor(field, ordinal)
 	if !ok {
@@ -229,7 +213,7 @@ func (qv *queryView[K, V]) fieldMeta(field string, ordinal int) *field {
 }
 
 func (qv *queryView[K, V]) fieldMetaByExpr(expr qir.Expr) *field {
-	acc, ok := qv.indexedFieldAccessorForExpr(expr)
+	acc, ok := qv.indexedFieldAccessorByOrdinal(expr.FieldOrdinal)
 	if !ok {
 		return nil
 	}
@@ -237,7 +221,7 @@ func (qv *queryView[K, V]) fieldMetaByExpr(expr qir.Expr) *field {
 }
 
 func (qv *queryView[K, V]) fieldMetaByOrder(order qir.Order) *field {
-	acc, ok := qv.indexedFieldAccessorForOrder(order)
+	acc, ok := qv.indexedFieldAccessorByOrdinal(order.FieldOrdinal)
 	if !ok {
 		return nil
 	}
@@ -269,7 +253,7 @@ func (qv *queryView[K, V]) snapshotFieldIndexSlice(field string) *[]index {
 }
 
 func (qv *queryView[K, V]) snapshotFieldIndexSliceForExpr(expr qir.Expr) *[]index {
-	acc, ok := qv.indexedFieldAccessorForExpr(expr)
+	acc, ok := qv.indexedFieldAccessorByOrdinal(expr.FieldOrdinal)
 	if !ok {
 		return nil
 	}
@@ -277,7 +261,7 @@ func (qv *queryView[K, V]) snapshotFieldIndexSliceForExpr(expr qir.Expr) *[]inde
 }
 
 func (qv *queryView[K, V]) snapshotFieldIndexSliceForOrder(order qir.Order) *[]index {
-	acc, ok := qv.indexedFieldAccessorForOrder(order)
+	acc, ok := qv.indexedFieldAccessorByOrdinal(order.FieldOrdinal)
 	if !ok {
 		return nil
 	}
@@ -309,7 +293,7 @@ func (qv *queryView[K, V]) snapshotLenFieldIndexSlice(field string) *[]index {
 }
 
 func (qv *queryView[K, V]) snapshotLenFieldIndexSliceForOrder(order qir.Order) *[]index {
-	acc, ok := qv.indexedFieldAccessorForOrder(order)
+	acc, ok := qv.indexedFieldAccessorByOrdinal(order.FieldOrdinal)
 	if !ok {
 		return nil
 	}
@@ -349,7 +333,7 @@ func (qv *queryView[K, V]) fieldOverlay(field string) fieldOverlay {
 }
 
 func (qv *queryView[K, V]) fieldOverlayForExpr(expr qir.Expr) fieldOverlay {
-	acc, ok := qv.indexedFieldAccessorForExpr(expr)
+	acc, ok := qv.indexedFieldAccessorByOrdinal(expr.FieldOrdinal)
 	if !ok {
 		return fieldOverlay{}
 	}
@@ -357,7 +341,7 @@ func (qv *queryView[K, V]) fieldOverlayForExpr(expr qir.Expr) fieldOverlay {
 }
 
 func (qv *queryView[K, V]) fieldOverlayForOrder(order qir.Order) fieldOverlay {
-	acc, ok := qv.indexedFieldAccessorForOrder(order)
+	acc, ok := qv.indexedFieldAccessorByOrdinal(order.FieldOrdinal)
 	if !ok {
 		return fieldOverlay{}
 	}
@@ -389,7 +373,7 @@ func (qv *queryView[K, V]) nilFieldOverlay(field string) fieldOverlay {
 }
 
 func (qv *queryView[K, V]) nilFieldOverlayForExpr(expr qir.Expr) fieldOverlay {
-	acc, ok := qv.indexedFieldAccessorForExpr(expr)
+	acc, ok := qv.indexedFieldAccessorByOrdinal(expr.FieldOrdinal)
 	if !ok {
 		return fieldOverlay{}
 	}
@@ -397,7 +381,7 @@ func (qv *queryView[K, V]) nilFieldOverlayForExpr(expr qir.Expr) fieldOverlay {
 }
 
 func (qv *queryView[K, V]) nilFieldOverlayForOrder(order qir.Order) fieldOverlay {
-	acc, ok := qv.indexedFieldAccessorForOrder(order)
+	acc, ok := qv.indexedFieldAccessorByOrdinal(order.FieldOrdinal)
 	if !ok {
 		return fieldOverlay{}
 	}
@@ -429,7 +413,7 @@ func (qv *queryView[K, V]) lenFieldOverlay(field string) fieldOverlay {
 }
 
 func (qv *queryView[K, V]) lenFieldOverlayForExpr(expr qir.Expr) fieldOverlay {
-	acc, ok := qv.indexedFieldAccessorForExpr(expr)
+	acc, ok := qv.indexedFieldAccessorByOrdinal(expr.FieldOrdinal)
 	if !ok {
 		return fieldOverlay{}
 	}
@@ -437,7 +421,7 @@ func (qv *queryView[K, V]) lenFieldOverlayForExpr(expr qir.Expr) fieldOverlay {
 }
 
 func (qv *queryView[K, V]) lenFieldOverlayForOrder(order qir.Order) fieldOverlay {
-	acc, ok := qv.indexedFieldAccessorForOrder(order)
+	acc, ok := qv.indexedFieldAccessorByOrdinal(order.FieldOrdinal)
 	if !ok {
 		return fieldOverlay{}
 	}
@@ -455,12 +439,12 @@ func (qv *queryView[K, V]) hasIndexedFieldRef(field string, ordinal int) bool {
 }
 
 func (qv *queryView[K, V]) hasIndexedFieldForExpr(expr qir.Expr) bool {
-	_, ok := qv.indexedFieldAccessorForExpr(expr)
+	_, ok := qv.indexedFieldAccessorByOrdinal(expr.FieldOrdinal)
 	return ok
 }
 
 func (qv *queryView[K, V]) hasIndexedFieldForOrder(order qir.Order) bool {
-	_, ok := qv.indexedFieldAccessorForOrder(order)
+	_, ok := qv.indexedFieldAccessorByOrdinal(order.FieldOrdinal)
 	return ok
 }
 
@@ -517,10 +501,6 @@ func (qv *queryView[K, V]) isLenZeroComplementRef(field string, ordinal int) boo
 		return false
 	}
 	return qv.isLenZeroComplementOrdinal(acc.ordinal)
-}
-
-func (qv *queryView[K, V]) isLenZeroComplementForOrder(order qir.Order) bool {
-	return qv.isLenZeroComplementOrdinal(order.FieldOrdinal)
 }
 
 func (qv *queryView[K, V]) isLenZeroComplementField(field string) bool {
