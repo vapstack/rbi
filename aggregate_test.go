@@ -90,6 +90,12 @@ type aggregateOverflowRec struct {
 	Unsigned uint64 `db:"unsigned" rbi:"measure"`
 }
 
+type aggregateHavingPrecisionRec struct {
+	Group    string `db:"group"    rbi:"index"`
+	Signed   int64  `db:"signed"   rbi:"measure"`
+	Unsigned uint64 `db:"unsigned" rbi:"measure"`
+}
+
 type aggregateModelRec struct {
 	Country string `db:"country" rbi:"index"`
 	Status  string `db:"status"  rbi:"index"`
@@ -369,6 +375,285 @@ func TestAggregateWindowAppliesToResultRows(t *testing.T) {
 	if len(result.Rows) != 0 {
 		t.Fatalf("offset beyond end rows len=%d, want 0", len(result.Rows))
 	}
+}
+
+func TestAggregateHavingFiltersRows(t *testing.T) {
+	db := openTempAggregateDB(t)
+	seedAggregateTestData(t, db)
+
+	result, err := db.Aggregate(qx.Query(qx.GTE("age", 18)).
+		Group("country", "status").
+		Metrics(
+			qx.ROWCOUNT().AS("rows"),
+			qx.SUM("score").AS("score_sum"),
+		).
+		Having(
+			qx.IN(qx.OUT("country"), []string{"DE", "US"}),
+			qx.GT(qx.OUT("score_sum"), 20),
+		))
+	if err != nil {
+		t.Fatalf("Aggregate: %v", err)
+	}
+	requireAggregateLayout(t, result.Layout, []string{"country", "status", "rows", "score_sum"})
+
+	got := make(map[string]Row, len(result.Rows))
+	for i := range result.Rows {
+		country := mustAggregateString(t, result.Rows[i][0])
+		status := mustAggregateString(t, result.Rows[i][1])
+		got[country+"|"+status] = result.Rows[i]
+	}
+	if len(got) != 2 {
+		t.Fatalf("having rows len=%d, want 2; rows=%#v", len(result.Rows), result.Rows)
+	}
+	requireAggregateUint(t, got["US|active"][2], 2)
+	requireAggregateInt(t, got["US|active"][3], 30)
+	requireAggregateUint(t, got["US|inactive"][2], 1)
+	requireAggregateInt(t, got["US|inactive"][3], 30)
+
+	result, err = db.Aggregate(qx.Aggregate(qx.ROWCOUNT().AS("rows")).Having(qx.GT(qx.OUT("rows"), 10)))
+	if err != nil {
+		t.Fatalf("Aggregate ungrouped having: %v", err)
+	}
+	if len(result.Rows) != 0 {
+		t.Fatalf("ungrouped having rows len=%d, want 0", len(result.Rows))
+	}
+}
+
+func TestAggregateHavingPointerLiterals(t *testing.T) {
+	db := openTempAggregateDB(t)
+	seedAggregateTestData(t, db)
+
+	limit := uint64(1)
+	countryUS := "US"
+	result, err := db.Aggregate(qx.Query(qx.GTE("age", 18)).
+		Group("country", "status").
+		Metrics(qx.ROWCOUNT().AS("rows")).
+		Having(
+			qx.GT(qx.OUT("rows"), &limit),
+			qx.IN(qx.OUT("country"), []*string{&countryUS}),
+		))
+	if err != nil {
+		t.Fatalf("Aggregate pointer scalar/IN element: %v", err)
+	}
+	if len(result.Rows) != 1 {
+		t.Fatalf("pointer having rows len=%d, want 1; rows=%#v", len(result.Rows), result.Rows)
+	}
+	requireAggregateString(t, result.Rows[0][0], "US")
+	requireAggregateString(t, result.Rows[0][1], "active")
+	requireAggregateUint(t, result.Rows[0][2], 2)
+
+	countries := []string{"US"}
+	result, err = db.Aggregate(qx.Query(qx.GTE("age", 18)).
+		Group("country").
+		Metrics(qx.ROWCOUNT().AS("rows")).
+		Having(qx.OP(qx.OpIN, qx.OUT("country"), qx.LIT(&countries))))
+	if err != nil {
+		t.Fatalf("Aggregate pointer IN slice: %v", err)
+	}
+	if len(result.Rows) != 1 {
+		t.Fatalf("pointer slice IN rows len=%d, want 1; rows=%#v", len(result.Rows), result.Rows)
+	}
+	requireAggregateString(t, result.Rows[0][0], "US")
+	requireAggregateUint(t, result.Rows[0][1], 3)
+}
+
+func TestAggregateHavingNullPredicates(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aggregate_having_null.db")
+	db, raw := openBoltAndNew[uint64, aggregateNullGroupRec](t, path, Options{AnalyzeInterval: -1})
+	t.Cleanup(func() {
+		_ = db.Close()
+		_ = raw.Close()
+	})
+
+	segmentA := "a"
+	segmentB := "b"
+	amount10 := int64(10)
+	rows := []aggregateNullGroupRec{
+		{Segment: &segmentA, Amount: &amount10},
+		{Segment: &segmentB},
+		{},
+	}
+	for i := range rows {
+		if err := db.Set(uint64(i+1), &rows[i]); err != nil {
+			t.Fatalf("Set(%d): %v", i+1, err)
+		}
+	}
+
+	result, err := db.Aggregate(qx.Group("segment").Metrics(qx.AVG("amount").AS("avg_amount")).
+		Having(qx.ISNULL(qx.OUT("avg_amount"))).
+		SortOut("segment"))
+	if err != nil {
+		t.Fatalf("Aggregate: %v", err)
+	}
+	requireAggregateLayout(t, result.Layout, []string{"segment", "avg_amount"})
+	if len(result.Rows) != 2 {
+		t.Fatalf("null having rows len=%d, want 2; rows=%#v", len(result.Rows), result.Rows)
+	}
+	requireAggregateNone(t, result.Rows[0][0])
+	requireAggregateNone(t, result.Rows[0][1])
+	requireAggregateString(t, result.Rows[1][0], "b")
+	requireAggregateNone(t, result.Rows[1][1])
+
+	var nilFloat *float64
+	result, err = db.Aggregate(qx.Group("segment").Metrics(qx.AVG("amount").AS("avg_amount")).
+		Having(qx.EQ(qx.OUT("avg_amount"), nilFloat)).
+		SortOut("segment"))
+	if err != nil {
+		t.Fatalf("Aggregate typed nil EQ: %v", err)
+	}
+	if len(result.Rows) != 2 {
+		t.Fatalf("typed nil EQ rows len=%d, want 2; rows=%#v", len(result.Rows), result.Rows)
+	}
+	requireAggregateNone(t, result.Rows[0][0])
+	requireAggregateString(t, result.Rows[1][0], "b")
+
+	result, err = db.Aggregate(qx.Group("segment").Metrics(qx.AVG("amount").AS("avg_amount")).
+		Having(qx.IN(qx.OUT("avg_amount"), []*float64{nilFloat})).
+		SortOut("segment"))
+	if err != nil {
+		t.Fatalf("Aggregate typed nil IN: %v", err)
+	}
+	if len(result.Rows) != 2 {
+		t.Fatalf("typed nil IN rows len=%d, want 2; rows=%#v", len(result.Rows), result.Rows)
+	}
+	requireAggregateNone(t, result.Rows[0][0])
+	requireAggregateString(t, result.Rows[1][0], "b")
+
+	result, err = db.Aggregate(qx.Group("segment").Metrics(qx.AVG("amount").AS("avg_amount")).
+		Having(qx.GTE(qx.OUT("avg_amount"), nil)))
+	if err != nil {
+		t.Fatalf("Aggregate GTE nil: %v", err)
+	}
+	if len(result.Rows) != 0 {
+		t.Fatalf("GTE nil having rows len=%d, want 0; rows=%#v", len(result.Rows), result.Rows)
+	}
+
+	result, err = db.Aggregate(qx.Group("segment").Metrics(qx.AVG("amount").AS("avg_amount")).
+		Having(qx.LTE(qx.OUT("avg_amount"), nil)))
+	if err != nil {
+		t.Fatalf("Aggregate LTE nil: %v", err)
+	}
+	if len(result.Rows) != 0 {
+		t.Fatalf("LTE nil having rows len=%d, want 0; rows=%#v", len(result.Rows), result.Rows)
+	}
+}
+
+func TestAggregateOrderByMultipleOutputsBeforeWindow(t *testing.T) {
+	db := openTempAggregateDB(t)
+	seedAggregateTestData(t, db)
+
+	result, err := db.Aggregate(qx.Query(qx.GTE("age", 18)).
+		Group("country", "status").
+		Metrics(
+			qx.ROWCOUNT().AS("rows"),
+			qx.SUM("score").AS("score_sum"),
+		).
+		SortOut("rows", qx.DESC).
+		SortOut("score_sum", qx.DESC).
+		SortOut("country"))
+	if err != nil {
+		t.Fatalf("Aggregate: %v", err)
+	}
+	requireAggregateLayout(t, result.Layout, []string{"country", "status", "rows", "score_sum"})
+	if len(result.Rows) != 3 {
+		t.Fatalf("ordered rows len=%d, want 3; rows=%#v", len(result.Rows), result.Rows)
+	}
+	requireAggregateString(t, result.Rows[0][0], "US")
+	requireAggregateString(t, result.Rows[0][1], "active")
+	requireAggregateString(t, result.Rows[1][0], "US")
+	requireAggregateString(t, result.Rows[1][1], "inactive")
+	requireAggregateString(t, result.Rows[2][0], "DE")
+	requireAggregateString(t, result.Rows[2][1], "active")
+
+	result, err = db.Aggregate(qx.Query(qx.GTE("age", 18)).
+		Group("country", "status").
+		Metrics(
+			qx.ROWCOUNT().AS("rows"),
+			qx.SUM("score").AS("score_sum"),
+		).
+		SortOut("rows", qx.DESC).
+		SortOut("score_sum", qx.DESC).
+		SortOut("country").
+		Offset(1).
+		Limit(1))
+	if err != nil {
+		t.Fatalf("Aggregate with window: %v", err)
+	}
+	if len(result.Rows) != 1 {
+		t.Fatalf("window rows len=%d, want 1; rows=%#v", len(result.Rows), result.Rows)
+	}
+	requireAggregateString(t, result.Rows[0][0], "US")
+	requireAggregateString(t, result.Rows[0][1], "inactive")
+}
+
+func TestAggregateHavingComparesLargeIntegersWithFloatLiteralsExactly(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aggregate_having_precision.db")
+	db, raw := openBoltAndNew[uint64, aggregateHavingPrecisionRec](t, path, Options{AnalyzeInterval: -1})
+	t.Cleanup(func() {
+		_ = db.Close()
+		_ = raw.Close()
+	})
+
+	const exactFloatBoundary = uint64(1 << 53)
+	rows := []aggregateHavingPrecisionRec{
+		{Group: "uint_eq", Unsigned: exactFloatBoundary},
+		{Group: "uint_hi", Unsigned: exactFloatBoundary + 1},
+		{Group: "int_eq", Signed: -int64(exactFloatBoundary)},
+		{Group: "int_low", Signed: -int64(exactFloatBoundary) - 1},
+	}
+	for i := range rows {
+		if err := db.Set(uint64(i+1), &rows[i]); err != nil {
+			t.Fatalf("Set(%d): %v", i+1, err)
+		}
+	}
+
+	result, err := db.Aggregate(qx.Group("group").Metrics(qx.SUM("unsigned").AS("sum")).
+		Having(qx.GT(qx.OUT("sum"), float64(exactFloatBoundary))).
+		SortOut("group"))
+	if err != nil {
+		t.Fatalf("Aggregate unsigned GT: %v", err)
+	}
+	if len(result.Rows) != 1 {
+		t.Fatalf("unsigned GT rows len=%d, want 1; rows=%#v", len(result.Rows), result.Rows)
+	}
+	requireAggregateString(t, result.Rows[0][0], "uint_hi")
+	requireAggregateUint(t, result.Rows[0][1], exactFloatBoundary+1)
+
+	result, err = db.Aggregate(qx.Group("group").Metrics(qx.SUM("unsigned").AS("sum")).
+		Having(qx.EQ(qx.OUT("sum"), float64(exactFloatBoundary))).
+		SortOut("group"))
+	if err != nil {
+		t.Fatalf("Aggregate unsigned EQ: %v", err)
+	}
+	if len(result.Rows) != 1 {
+		t.Fatalf("unsigned EQ rows len=%d, want 1; rows=%#v", len(result.Rows), result.Rows)
+	}
+	requireAggregateString(t, result.Rows[0][0], "uint_eq")
+
+	result, err = db.Aggregate(qx.Group("group").Metrics(qx.SUM("unsigned").AS("sum")).
+		Having(qx.IN(qx.OUT("sum"), []float64{float64(exactFloatBoundary)})).
+		SortOut("group"))
+	if err != nil {
+		t.Fatalf("Aggregate unsigned IN: %v", err)
+	}
+	if len(result.Rows) != 1 {
+		t.Fatalf("unsigned IN rows len=%d, want 1; rows=%#v", len(result.Rows), result.Rows)
+	}
+	requireAggregateString(t, result.Rows[0][0], "uint_eq")
+
+	result, err = db.Aggregate(qx.Group("group").Metrics(qx.SUM("signed").AS("sum")).
+		Having(qx.LT(qx.OUT("sum"), -float64(exactFloatBoundary))).
+		SortOut("group"))
+	if err != nil {
+		t.Fatalf("Aggregate signed LT: %v", err)
+	}
+	if len(result.Rows) != 1 {
+		t.Fatalf("signed LT rows len=%d, want 1; rows=%#v", len(result.Rows), result.Rows)
+	}
+	requireAggregateString(t, result.Rows[0][0], "int_low")
+	requireAggregateInt(t, result.Rows[0][1], -int64(exactFloatBoundary)-1)
 }
 
 func TestAggregateValueIndexerFieldsUseStringIndexKeys(t *testing.T) {
@@ -1065,9 +1350,34 @@ func TestAggregateRejectsUnsupportedFirstVersionShapes(t *testing.T) {
 			want: `aggregate metric "count" supports only direct field reference`,
 		},
 		{
-			name: "having",
-			q:    qx.Aggregate(qx.ROWCOUNT().AS("rows")).Having(qx.GT(qx.OUT("rows"), 1)),
-			want: "aggregate having is not supported",
+			name: "having_left_expression",
+			q:    qx.Aggregate(qx.ROWCOUNT().AS("rows")).Having(qx.GT(qx.ADD(qx.OUT("rows"), qx.LIT(1)), 1)),
+			want: "aggregate HAVING left side supports only OUT references",
+		},
+		{
+			name: "having_right_expression",
+			q:    qx.Aggregate(qx.ROWCOUNT().AS("rows")).Having(qx.GT(qx.OUT("rows"), qx.ADD(qx.LIT(1), qx.LIT(2)))),
+			want: "aggregate HAVING right side supports only literals",
+		},
+		{
+			name: "having_unknown_output",
+			q:    qx.Aggregate(qx.ROWCOUNT().AS("rows")).Having(qx.GT(qx.OUT("missing"), 1)),
+			want: `unknown aggregate output "missing" in HAVING`,
+		},
+		{
+			name: "having_in_empty_values",
+			q:    qx.Aggregate(qx.ROWCOUNT().AS("rows")).Having(qx.IN(qx.OUT("rows"), []uint64{})),
+			want: "no values provided",
+		},
+		{
+			name: "having_in_nil_values",
+			q:    qx.Aggregate(qx.ROWCOUNT().AS("rows")).Having(qx.IN(qx.OUT("rows"), []uint64(nil))),
+			want: "no values provided",
+		},
+		{
+			name: "having_unsupported_predicate",
+			q:    qx.Aggregate(qx.ROWCOUNT().AS("rows")).Having(qx.CONTAINS(qx.OUT("rows"), "1")),
+			want: "aggregate HAVING supports only simple OUT predicates",
 		},
 		{
 			name: "projection",
@@ -1075,9 +1385,19 @@ func TestAggregateRejectsUnsupportedFirstVersionShapes(t *testing.T) {
 			want: "aggregate projection is not supported",
 		},
 		{
-			name: "order",
-			q:    qx.Aggregate(qx.ROWCOUNT().AS("rows")).SortOut("rows"),
-			want: "aggregate order is not supported",
+			name: "order_ref",
+			q:    qx.Aggregate(qx.ROWCOUNT().AS("rows")).Sort("rows"),
+			want: "aggregate ORDER supports only OUT references",
+		},
+		{
+			name: "order_expression",
+			q:    qx.Aggregate(qx.ROWCOUNT().AS("rows")).SortBy(qx.ADD(qx.OUT("rows"), qx.LIT(1))),
+			want: "aggregate ORDER supports only OUT references",
+		},
+		{
+			name: "order_unknown_output",
+			q:    qx.Aggregate(qx.ROWCOUNT().AS("rows")).SortOut("missing"),
+			want: `unknown aggregate output "missing" in ORDER`,
 		},
 		{
 			name: "filter_measure",

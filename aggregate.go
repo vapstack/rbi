@@ -5,6 +5,7 @@ import (
 	"math"
 	"math/bits"
 	"reflect"
+	"sort"
 
 	"github.com/vapstack/qx"
 	"github.com/vapstack/rbi/internal/posting"
@@ -49,12 +50,45 @@ type aggregateMetric struct {
 	rowCount bool
 }
 
+type aggregateOrder struct {
+	index int
+	desc  bool
+}
+
+type aggregateHavingOp uint8
+
+const (
+	aggregateHavingAnd aggregateHavingOp = iota + 1
+	aggregateHavingOr
+	aggregateHavingNot
+	aggregateHavingEQ
+	aggregateHavingNE
+	aggregateHavingGT
+	aggregateHavingGTE
+	aggregateHavingLT
+	aggregateHavingLTE
+	aggregateHavingIN
+	aggregateHavingExists
+	aggregateHavingIsNull
+)
+
+type aggregateHavingExpr struct {
+	op     aggregateHavingOp
+	index  int
+	value  Value
+	values []Value
+	args   []aggregateHavingExpr
+}
+
 type aggregateQuery struct {
-	filter  *qir.Query
-	groups  []aggregateFieldRef
-	metrics []aggregateMetric
-	offset  uint64
-	limit   uint64
+	filter    *qir.Query
+	groups    []aggregateFieldRef
+	metrics   []aggregateMetric
+	having    aggregateHavingExpr
+	hasHaving bool
+	order     []aggregateOrder
+	offset    uint64
+	limit     uint64
 }
 
 type aggregateMetricState struct {
@@ -102,6 +136,12 @@ func (db *DB[K, V]) Aggregate(q *qx.QX) (Result, error) {
 	if err != nil {
 		return Result{}, err
 	}
+	if prepared.hasHaving {
+		result = applyAggregateHaving(result, prepared.having)
+	}
+	if len(prepared.order) > 0 {
+		sort.Sort(aggregateRowSorter{rows: result.Rows, order: prepared.order})
+	}
 	return applyAggregateWindow(result, prepared.offset, prepared.limit), nil
 }
 
@@ -115,6 +155,9 @@ func (q *aggregateQuery) release() {
 	}
 	q.groups = nil
 	q.metrics = nil
+	q.having = aggregateHavingExpr{}
+	q.hasHaving = false
+	q.order = nil
 }
 
 func (db *DB[K, V]) prepareAggregate(src *qx.QX) (*aggregateQuery, error) {
@@ -124,14 +167,8 @@ func (db *DB[K, V]) prepareAggregate(src *qx.QX) (*aggregateQuery, error) {
 	if src.Reduction == nil || src.Reduction.IsEmpty() {
 		return nil, fmt.Errorf("%w: aggregate query requires reduction", ErrInvalidQuery)
 	}
-	if !src.Reduction.Having.IsZero() {
-		return nil, fmt.Errorf("%w: aggregate having is not supported", ErrInvalidQuery)
-	}
 	if len(src.Projection) > 0 {
 		return nil, fmt.Errorf("%w: aggregate projection is not supported", ErrInvalidQuery)
-	}
-	if len(src.Order) > 0 {
-		return nil, fmt.Errorf("%w: aggregate order is not supported", ErrInvalidQuery)
 	}
 
 	filter, err := qir.PrepareQueryResolved(&qx.QX{Filter: src.Filter}, preparedFieldResolver[K, V]{db: db})
@@ -144,7 +181,7 @@ func (db *DB[K, V]) prepareAggregate(src *qx.QX) (*aggregateQuery, error) {
 		offset: src.Window.Offset,
 		limit:  src.Window.Limit,
 	}
-	seenNames := make(map[string]struct{}, len(src.Reduction.Group)+len(src.Reduction.Metrics))
+	outputPositions := make(map[string]int, len(src.Reduction.Group)+len(src.Reduction.Metrics))
 
 	for i := range src.Reduction.Group {
 		group, err := db.prepareAggregateGroup(src.Reduction.Group[i])
@@ -152,7 +189,7 @@ func (db *DB[K, V]) prepareAggregate(src *qx.QX) (*aggregateQuery, error) {
 			out.release()
 			return nil, err
 		}
-		if err := reserveAggregateOutputName(seenNames, group.out); err != nil {
+		if err := reserveAggregateOutputName(outputPositions, group.out, len(outputPositions)); err != nil {
 			out.release()
 			return nil, err
 		}
@@ -165,7 +202,7 @@ func (db *DB[K, V]) prepareAggregate(src *qx.QX) (*aggregateQuery, error) {
 			out.release()
 			return nil, err
 		}
-		if err := reserveAggregateOutputName(seenNames, metric.out); err != nil {
+		if err := reserveAggregateOutputName(outputPositions, metric.out, len(outputPositions)); err != nil {
 			out.release()
 			return nil, err
 		}
@@ -185,15 +222,212 @@ func (db *DB[K, V]) prepareAggregate(src *qx.QX) (*aggregateQuery, error) {
 		out.release()
 		return nil, fmt.Errorf("%w: aggregate query has no groups or metrics", ErrInvalidQuery)
 	}
+	if !src.Reduction.Having.IsZero() {
+		having, err := prepareAggregateHaving(src.Reduction.Having, outputPositions)
+		if err != nil {
+			out.release()
+			return nil, err
+		}
+		out.having = having
+		out.hasHaving = true
+	}
+	if len(src.Order) > 0 {
+		order, err := prepareAggregateOrder(src.Order, outputPositions)
+		if err != nil {
+			out.release()
+			return nil, err
+		}
+		out.order = order
+	}
 	return out, nil
 }
 
-func reserveAggregateOutputName(seen map[string]struct{}, name string) error {
+func reserveAggregateOutputName(seen map[string]int, name string, pos int) error {
 	if _, ok := seen[name]; ok {
 		return fmt.Errorf("%w: duplicate aggregate output %q", ErrInvalidQuery, name)
 	}
-	seen[name] = struct{}{}
+	seen[name] = pos
 	return nil
+}
+
+func prepareAggregateOrder(src []qx.Order, outputs map[string]int) ([]aggregateOrder, error) {
+	order := make([]aggregateOrder, 0, len(src))
+	for i := range src {
+		by := src[i].By
+		if by.Kind != qx.KindOUT || by.Name == "" {
+			return nil, fmt.Errorf("%w: aggregate ORDER supports only OUT references", ErrInvalidQuery)
+		}
+		pos, ok := outputs[by.Name]
+		if !ok {
+			return nil, fmt.Errorf("%w: unknown aggregate output %q in ORDER", ErrInvalidQuery, by.Name)
+		}
+		order = append(order, aggregateOrder{index: pos, desc: src[i].Desc})
+	}
+	return order, nil
+}
+
+func prepareAggregateHaving(expr qx.Expr, outputs map[string]int) (aggregateHavingExpr, error) {
+	if expr.Kind != qx.KindOP {
+		return aggregateHavingExpr{}, fmt.Errorf("%w: aggregate HAVING root must be a predicate", ErrInvalidQuery)
+	}
+	switch expr.Name {
+	case qx.OpAND, qx.OpOR:
+		args := make([]aggregateHavingExpr, len(expr.Args))
+		for i := range expr.Args {
+			arg, err := prepareAggregateHaving(expr.Args[i], outputs)
+			if err != nil {
+				return aggregateHavingExpr{}, err
+			}
+			args[i] = arg
+		}
+		op := aggregateHavingAnd
+		if expr.Name == qx.OpOR {
+			op = aggregateHavingOr
+		}
+		return aggregateHavingExpr{op: op, args: args}, nil
+	case qx.OpNOT:
+		if len(expr.Args) != 1 {
+			return aggregateHavingExpr{}, fmt.Errorf("%w: aggregate HAVING NOT expects one predicate", ErrInvalidQuery)
+		}
+		arg, err := prepareAggregateHaving(expr.Args[0], outputs)
+		if err != nil {
+			return aggregateHavingExpr{}, err
+		}
+		return aggregateHavingExpr{op: aggregateHavingNot, args: []aggregateHavingExpr{arg}}, nil
+	case qx.OpEXISTS, qx.OpISNULL:
+		if len(expr.Args) != 1 {
+			return aggregateHavingExpr{}, fmt.Errorf("%w: aggregate HAVING %s expects one OUT reference", ErrInvalidQuery, expr.Name)
+		}
+		pos, err := prepareAggregateHavingOutput(expr.Args[0], outputs)
+		if err != nil {
+			return aggregateHavingExpr{}, err
+		}
+		op := aggregateHavingExists
+		if expr.Name == qx.OpISNULL {
+			op = aggregateHavingIsNull
+		}
+		return aggregateHavingExpr{op: op, index: pos}, nil
+	case qx.OpEQ, qx.OpNE, qx.OpGT, qx.OpGTE, qx.OpLT, qx.OpLTE:
+		if len(expr.Args) != 2 {
+			return aggregateHavingExpr{}, fmt.Errorf("%w: aggregate HAVING %s expects OUT and literal", ErrInvalidQuery, expr.Name)
+		}
+		pos, err := prepareAggregateHavingOutput(expr.Args[0], outputs)
+		if err != nil {
+			return aggregateHavingExpr{}, err
+		}
+		value, err := aggregateLiteralValue(expr.Args[1])
+		if err != nil {
+			return aggregateHavingExpr{}, err
+		}
+		return aggregateHavingExpr{op: aggregateHavingPredicateOp(expr.Name), index: pos, value: value}, nil
+	case qx.OpIN:
+		if len(expr.Args) != 2 {
+			return aggregateHavingExpr{}, fmt.Errorf("%w: aggregate HAVING IN expects OUT and literal slice", ErrInvalidQuery)
+		}
+		pos, err := prepareAggregateHavingOutput(expr.Args[0], outputs)
+		if err != nil {
+			return aggregateHavingExpr{}, err
+		}
+		values, err := aggregateLiteralValueSlice(expr.Args[1])
+		if err != nil {
+			return aggregateHavingExpr{}, err
+		}
+		return aggregateHavingExpr{op: aggregateHavingIN, index: pos, values: values}, nil
+	default:
+		return aggregateHavingExpr{}, fmt.Errorf("%w: aggregate HAVING supports only simple OUT predicates", ErrInvalidQuery)
+	}
+}
+
+func prepareAggregateHavingOutput(expr qx.Expr, outputs map[string]int) (int, error) {
+	if expr.Kind != qx.KindOUT || expr.Name == "" {
+		return 0, fmt.Errorf("%w: aggregate HAVING left side supports only OUT references", ErrInvalidQuery)
+	}
+	pos, ok := outputs[expr.Name]
+	if !ok {
+		return 0, fmt.Errorf("%w: unknown aggregate output %q in HAVING", ErrInvalidQuery, expr.Name)
+	}
+	return pos, nil
+}
+
+func aggregateHavingPredicateOp(name string) aggregateHavingOp {
+	switch name {
+	case qx.OpEQ:
+		return aggregateHavingEQ
+	case qx.OpNE:
+		return aggregateHavingNE
+	case qx.OpGT:
+		return aggregateHavingGT
+	case qx.OpGTE:
+		return aggregateHavingGTE
+	case qx.OpLT:
+		return aggregateHavingLT
+	default:
+		return aggregateHavingLTE
+	}
+}
+
+func aggregateLiteralValue(expr qx.Expr) (Value, error) {
+	if expr.Kind != qx.KindLIT {
+		return Value{}, fmt.Errorf("%w: aggregate HAVING right side supports only literals", ErrInvalidQuery)
+	}
+	return aggregateLiteralRawValue(expr.Value)
+}
+
+func aggregateLiteralRawValue(raw any) (Value, error) {
+	v := reflect.ValueOf(raw)
+	if !v.IsValid() {
+		return Value{}, nil
+	}
+	v, isNil := unwrapExprValue(v)
+	if isNil {
+		return Value{}, nil
+	}
+	if unix, ok := queryValueToUnixSeconds(v); ok {
+		return Value{num: uint64(unix), any: ValueKindInt}, nil
+	}
+	switch v.Kind() {
+	case reflect.String:
+		return valueFromSafeString(v.String()), nil
+	case reflect.Bool:
+		if v.Bool() {
+			return Value{num: 1, any: ValueKindBool}, nil
+		}
+		return Value{num: 0, any: ValueKindBool}, nil
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		return Value{num: uint64(v.Int()), any: ValueKindInt}, nil
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
+		return Value{num: v.Uint(), any: ValueKindUint}, nil
+	case reflect.Float32, reflect.Float64:
+		return Value{num: math.Float64bits(v.Float()), any: ValueKindFloat}, nil
+	default:
+		return Value{}, fmt.Errorf("%w: unsupported aggregate HAVING literal type %T", ErrInvalidQuery, raw)
+	}
+}
+
+func aggregateLiteralValueSlice(expr qx.Expr) ([]Value, error) {
+	if expr.Kind != qx.KindLIT {
+		return nil, fmt.Errorf("%w: aggregate HAVING IN right side supports only literal slices", ErrInvalidQuery)
+	}
+	raw := reflect.ValueOf(expr.Value)
+	if !raw.IsValid() {
+		return nil, fmt.Errorf("%w: aggregate HAVING IN right side supports only literal slices", ErrInvalidQuery)
+	}
+	raw, isNil := unwrapExprValue(raw)
+	if isNil || raw.Kind() != reflect.Slice {
+		return nil, fmt.Errorf("%w: aggregate HAVING IN right side supports only literal slices", ErrInvalidQuery)
+	}
+	if raw.Len() == 0 {
+		return nil, fmt.Errorf("%w: aggregate HAVING IN: no values provided", ErrInvalidQuery)
+	}
+	values := make([]Value, raw.Len())
+	for i := 0; i < raw.Len(); i++ {
+		value, err := aggregateLiteralRawValue(raw.Index(i).Interface())
+		if err != nil {
+			return nil, err
+		}
+		values[i] = value
+	}
+	return values, nil
 }
 
 func (db *DB[K, V]) prepareAggregateGroup(expr qx.Expr) (aggregateFieldRef, error) {
@@ -1008,6 +1242,258 @@ func (o fieldOverlay) keyAt(rank int) indexKey {
 		return ref.chunk.keyAt(pos.entry)
 	}
 	return o.base[rank].Key
+}
+
+func applyAggregateHaving(result Result, having aggregateHavingExpr) Result {
+	out := 0
+	for i := range result.Rows {
+		if having.eval(result.Rows[i]) {
+			result.Rows[out] = result.Rows[i]
+			out++
+		}
+	}
+	for i := out; i < len(result.Rows); i++ {
+		result.Rows[i] = nil
+	}
+	result.Rows = result.Rows[:out]
+	return result
+}
+
+func (expr aggregateHavingExpr) eval(row Row) bool {
+	switch expr.op {
+	case aggregateHavingAnd:
+		for i := range expr.args {
+			if !expr.args[i].eval(row) {
+				return false
+			}
+		}
+		return true
+	case aggregateHavingOr:
+		for i := range expr.args {
+			if expr.args[i].eval(row) {
+				return true
+			}
+		}
+		return false
+	case aggregateHavingNot:
+		return !expr.args[0].eval(row)
+	case aggregateHavingExists:
+		return row[expr.index].Kind() != ValueKindNone
+	case aggregateHavingIsNull:
+		return row[expr.index].Kind() == ValueKindNone
+	case aggregateHavingIN:
+		for i := range expr.values {
+			cmp, ok := aggregateComparePredicateValues(row[expr.index], expr.values[i])
+			if ok && cmp == 0 {
+				return true
+			}
+		}
+		return false
+	default:
+		left := row[expr.index]
+		cmp, ok := aggregateComparePredicateValues(left, expr.value)
+		switch expr.op {
+		case aggregateHavingEQ:
+			return ok && cmp == 0
+		case aggregateHavingNE:
+			return !ok || cmp != 0
+		case aggregateHavingGT:
+			return ok && left.Kind() != ValueKindNone && expr.value.Kind() != ValueKindNone && cmp > 0
+		case aggregateHavingGTE:
+			return ok && left.Kind() != ValueKindNone && expr.value.Kind() != ValueKindNone && cmp >= 0
+		case aggregateHavingLT:
+			return ok && left.Kind() != ValueKindNone && expr.value.Kind() != ValueKindNone && cmp < 0
+		default:
+			return ok && left.Kind() != ValueKindNone && expr.value.Kind() != ValueKindNone && cmp <= 0
+		}
+	}
+}
+
+type aggregateRowSorter struct {
+	rows  []Row
+	order []aggregateOrder
+}
+
+func (s aggregateRowSorter) Len() int {
+	return len(s.rows)
+}
+
+func (s aggregateRowSorter) Less(i int, j int) bool {
+	left := s.rows[i]
+	right := s.rows[j]
+	for k := range s.order {
+		order := s.order[k]
+		cmp := aggregateCompareOrderValues(left[order.index], right[order.index])
+		if cmp == 0 {
+			continue
+		}
+		if order.desc {
+			return cmp > 0
+		}
+		return cmp < 0
+	}
+	return false
+}
+
+func (s aggregateRowSorter) Swap(i int, j int) {
+	s.rows[i], s.rows[j] = s.rows[j], s.rows[i]
+}
+
+func aggregateComparePredicateValues(a Value, b Value) (int, bool) {
+	ak := a.Kind()
+	bk := b.Kind()
+	if ak == ValueKindNone || bk == ValueKindNone {
+		if ak == bk {
+			return 0, true
+		}
+		return 0, false
+	}
+	if aggregateValueKindIsNumeric(ak) && aggregateValueKindIsNumeric(bk) {
+		return aggregateCompareNumericValues(a, b)
+	}
+	if ak != bk {
+		return 0, false
+	}
+	switch ak {
+	case ValueKindBool:
+		av, _ := a.Bool()
+		bv, _ := b.Bool()
+		return compareBool(av, bv), true
+	case ValueKindString:
+		av, _ := a.String()
+		bv, _ := b.String()
+		return compareString(av, bv), true
+	default:
+		return 0, false
+	}
+}
+
+func aggregateCompareOrderValues(a Value, b Value) int {
+	ak := a.Kind()
+	bk := b.Kind()
+	if ak == ValueKindNone || bk == ValueKindNone {
+		return compareInt64(int64(ak), int64(bk))
+	}
+	if aggregateValueKindIsNumeric(ak) && aggregateValueKindIsNumeric(bk) {
+		cmp, _ := aggregateCompareNumericValues(a, b)
+		return cmp
+	}
+	if ak == bk {
+		switch ak {
+		case ValueKindBool:
+			av, _ := a.Bool()
+			bv, _ := b.Bool()
+			return compareBool(av, bv)
+		case ValueKindString:
+			av, _ := a.String()
+			bv, _ := b.String()
+			return compareString(av, bv)
+		}
+	}
+	return compareInt64(int64(ak), int64(bk))
+}
+
+func aggregateCompareNumericValues(a Value, b Value) (int, bool) {
+	ak := a.Kind()
+	bk := b.Kind()
+	if ak == ValueKindFloat {
+		av, _ := a.Float()
+		switch bk {
+		case ValueKindFloat:
+			bv, _ := b.Float()
+			return compareFloat64QuerySemantics(av, bv), true
+		case ValueKindInt:
+			bv, _ := b.Int()
+			return -aggregateCompareInt64Float64(bv, av), true
+		case ValueKindUint:
+			bv, _ := b.Uint()
+			return -aggregateCompareUint64Float64(bv, av), true
+		}
+		return 0, false
+	}
+	if bk == ValueKindFloat {
+		bv, _ := b.Float()
+		switch ak {
+		case ValueKindInt:
+			av, _ := a.Int()
+			return aggregateCompareInt64Float64(av, bv), true
+		case ValueKindUint:
+			av, _ := a.Uint()
+			return aggregateCompareUint64Float64(av, bv), true
+		}
+		return 0, false
+	}
+	if ak == ValueKindInt && bk == ValueKindInt {
+		av, _ := a.Int()
+		bv, _ := b.Int()
+		return compareInt64(av, bv), true
+	}
+	if ak == ValueKindUint && bk == ValueKindUint {
+		av, _ := a.Uint()
+		bv, _ := b.Uint()
+		return compareUint64(av, bv), true
+	}
+	if ak == ValueKindInt {
+		av, _ := a.Int()
+		bv, _ := b.Uint()
+		if av < 0 {
+			return -1, true
+		}
+		return compareUint64(uint64(av), bv), true
+	}
+	av, _ := a.Uint()
+	bv, _ := b.Int()
+	if bv < 0 {
+		return 1, true
+	}
+	return compareUint64(av, uint64(bv)), true
+}
+
+func aggregateCompareInt64Float64(i int64, f float64) int {
+	f = canonicalizeFloat64ForIndex(f)
+	switch {
+	case math.IsNaN(f), math.IsInf(f, 1):
+		return -1
+	case math.IsInf(f, -1):
+		return 1
+	case f < minInt64Float:
+		return 1
+	case f >= maxInt64Float:
+		return -1
+	}
+	trunc := math.Trunc(f)
+	base := int64(trunc)
+	cmp := compareInt64(i, base)
+	if cmp != 0 || f == trunc {
+		return cmp
+	}
+	if f > 0 {
+		return -1
+	}
+	return 1
+}
+
+func aggregateCompareUint64Float64(u uint64, f float64) int {
+	f = canonicalizeFloat64ForIndex(f)
+	switch {
+	case math.IsNaN(f), math.IsInf(f, 1):
+		return -1
+	case math.IsInf(f, -1), f < 0:
+		return 1
+	case f >= maxUint64Float:
+		return -1
+	}
+	trunc := math.Trunc(f)
+	base := uint64(trunc)
+	cmp := compareUint64(u, base)
+	if cmp != 0 || f == trunc {
+		return cmp
+	}
+	return -1
+}
+
+func aggregateValueKindIsNumeric(kind ValueKind) bool {
+	return kind == ValueKindInt || kind == ValueKindUint || kind == ValueKindFloat
 }
 
 func applyAggregateWindow(result Result, offset uint64, limit uint64) Result {
