@@ -96,6 +96,10 @@ type aggregateHavingPrecisionRec struct {
 	Unsigned uint64 `db:"unsigned" rbi:"measure"`
 }
 
+type aggregateSliceRec struct {
+	Tags []string `db:"tags" rbi:"index"`
+}
+
 type aggregateModelRec struct {
 	Country string `db:"country" rbi:"index"`
 	Status  string `db:"status"  rbi:"index"`
@@ -719,6 +723,90 @@ func TestAggregateDistinctField(t *testing.T) {
 	}
 	requireAggregateString(t, result.Rows[0][0], "DE")
 	requireAggregateString(t, result.Rows[1][0], "US")
+}
+
+func TestAggregateCountDistinctField(t *testing.T) {
+	db := openTempAggregateDB(t)
+	seedAggregateTestData(t, db)
+
+	result, err := db.Aggregate(qx.Aggregate(
+		qx.COUNT(qx.DISTINCT("country")).AS("country_count"),
+		qx.ROWCOUNT().AS("rows"),
+	))
+	if err != nil {
+		t.Fatalf("Aggregate ungrouped: %v", err)
+	}
+	requireAggregateLayout(t, result.Layout, []string{"country_count", "rows"})
+	if len(result.Rows) != 1 {
+		t.Fatalf("rows len=%d, want 1", len(result.Rows))
+	}
+	requireAggregateUint(t, result.Rows[0][0], 2)
+	requireAggregateUint(t, result.Rows[0][1], 5)
+
+	result, err = db.Aggregate(qx.Group("status").Metrics(
+		qx.COUNT(qx.DISTINCT("country")).AS("country_count"),
+		qx.ROWCOUNT().AS("rows"),
+	).SortOut("status"))
+	if err != nil {
+		t.Fatalf("Aggregate grouped: %v", err)
+	}
+	requireAggregateLayout(t, result.Layout, []string{"status", "country_count", "rows"})
+	if len(result.Rows) != 2 {
+		t.Fatalf("group rows len=%d, want 2; rows=%#v", len(result.Rows), result.Rows)
+	}
+	requireAggregateString(t, result.Rows[0][0], "active")
+	requireAggregateUint(t, result.Rows[0][1], 2)
+	requireAggregateUint(t, result.Rows[0][2], 3)
+	requireAggregateString(t, result.Rows[1][0], "inactive")
+	requireAggregateUint(t, result.Rows[1][1], 2)
+	requireAggregateUint(t, result.Rows[1][2], 2)
+}
+
+func TestAggregateCountDistinctIgnoresNullValues(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aggregate_count_distinct_null.db")
+	db, raw := openBoltAndNew[uint64, aggregateNullGroupRec](t, path, Options{AnalyzeInterval: -1})
+	t.Cleanup(func() {
+		_ = db.Close()
+		_ = raw.Close()
+	})
+
+	segmentA := "a"
+	segmentB := "b"
+	rows := []aggregateNullGroupRec{
+		{Segment: &segmentA},
+		{},
+		{Segment: &segmentB},
+		{},
+	}
+	for i := range rows {
+		if err := db.Set(uint64(i+1), &rows[i]); err != nil {
+			t.Fatalf("Set(%d): %v", i+1, err)
+		}
+	}
+
+	result, err := db.Aggregate(qx.Aggregate(
+		qx.COUNT(qx.DISTINCT("segment")).AS("segment_count"),
+		qx.DISTINCT("segment").AS("segment"),
+	))
+	if err == nil || !strings.Contains(err.Error(), "DISTINCT is supported only as a single ungrouped metric") {
+		t.Fatalf("mixed rowset DISTINCT err=%v", err)
+	}
+
+	result, err = db.Aggregate(qx.Aggregate(qx.COUNT(qx.DISTINCT("segment")).AS("segment_count")))
+	if err != nil {
+		t.Fatalf("Aggregate count distinct: %v", err)
+	}
+	requireAggregateLayout(t, result.Layout, []string{"segment_count"})
+	requireAggregateUint(t, result.Rows[0][0], 2)
+
+	result, err = db.Aggregate(qx.Aggregate(qx.DISTINCT("segment").AS("segment")))
+	if err != nil {
+		t.Fatalf("Aggregate distinct: %v", err)
+	}
+	if len(result.Rows) != 3 {
+		t.Fatalf("distinct rows len=%d, want 3; rows=%#v", len(result.Rows), result.Rows)
+	}
 }
 
 func TestAggregateEmptyMatchesReturnShapeWithoutRowsForGroupedAndDistinct(t *testing.T) {
@@ -1345,9 +1433,14 @@ func TestAggregateRejectsUnsupportedFirstVersionShapes(t *testing.T) {
 			want: `SUM requires numeric field "country"`,
 		},
 		{
-			name: "count_distinct_nested",
-			q:    qx.Aggregate(qx.COUNT(qx.DISTINCT("country"))),
-			want: `aggregate metric "count" supports only direct field reference`,
+			name: "count_distinct_expression",
+			q:    qx.Aggregate(qx.COUNT(qx.DISTINCT(qx.LOWER("country")))),
+			want: `COUNT(DISTINCT) supports only direct field reference`,
+		},
+		{
+			name: "count_distinct_measure",
+			q:    qx.Aggregate(qx.COUNT(qx.DISTINCT("score"))),
+			want: `DISTINCT over measure field "score" is not supported`,
 		},
 		{
 			name: "having_left_expression",
@@ -1411,6 +1504,21 @@ func TestAggregateRejectsUnsupportedFirstVersionShapes(t *testing.T) {
 		if err == nil || !strings.Contains(err.Error(), cases[i].want) {
 			t.Fatalf("%s: err=%v, want %q", cases[i].name, err, cases[i].want)
 		}
+	}
+}
+
+func TestAggregateRejectsCountDistinctSliceField(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aggregate_count_distinct_slice.db")
+	db, raw := openBoltAndNew[uint64, aggregateSliceRec](t, path, Options{AnalyzeInterval: -1})
+	t.Cleanup(func() {
+		_ = db.Close()
+		_ = raw.Close()
+	})
+
+	_, err := db.Aggregate(qx.Aggregate(qx.COUNT(qx.DISTINCT("tags")).AS("tag_count")))
+	if err == nil || !strings.Contains(err.Error(), `aggregate over slice field "tags" is not supported`) {
+		t.Fatalf("COUNT(DISTINCT slice) err=%v", err)
 	}
 }
 

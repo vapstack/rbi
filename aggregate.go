@@ -21,6 +21,7 @@ const (
 	aggregateMetricMin
 	aggregateMetricMax
 	aggregateMetricDistinct
+	aggregateMetricCountDistinct
 )
 
 type aggregateValueKind uint8
@@ -466,6 +467,21 @@ func (db *DB[K, V]) prepareAggregateMetric(expr qx.Expr) (aggregateMetric, error
 			}
 			return metric, nil
 		}
+		if len(expr.Args) == 1 && expr.Args[0].Kind == qx.KindOP && expr.Args[0].Name == qx.OpDISTINCT {
+			metric.op = aggregateMetricCountDistinct
+			if len(expr.Args[0].Args) != 1 || expr.Args[0].Args[0].Kind != qx.KindREF || expr.Args[0].Args[0].Name == "" {
+				return aggregateMetric{}, fmt.Errorf("%w: COUNT(DISTINCT) supports only direct field reference", ErrInvalidQuery)
+			}
+			field, err := db.prepareAggregateMetricField(expr.Args[0].Args[0].Name, metric.op)
+			if err != nil {
+				return aggregateMetric{}, err
+			}
+			metric.field = field
+			if metric.out == "" {
+				metric.out = defaultAggregateMetricName(metric.op, field.name)
+			}
+			return metric, nil
+		}
 	case qx.OpSUM:
 		metric.op = aggregateMetricSum
 	case qx.OpAVG:
@@ -495,7 +511,7 @@ func (db *DB[K, V]) prepareAggregateMetric(expr qx.Expr) (aggregateMetric, error
 
 func (db *DB[K, V]) prepareAggregateMetricField(name string, op aggregateMetricOp) (aggregateFieldRef, error) {
 	if acc, ok := db.measureFieldByName[name]; ok {
-		if op == aggregateMetricDistinct {
+		if op == aggregateMetricDistinct || op == aggregateMetricCountDistinct {
 			return aggregateFieldRef{}, fmt.Errorf("%w: DISTINCT over measure field %q is not supported", ErrInvalidQuery, name)
 		}
 		return aggregateFieldRef{name: name, measure: acc, isMeasure: true, kind: aggregateMeasureValueKind(acc.kind)}, nil
@@ -520,6 +536,8 @@ func defaultAggregateMetricName(op aggregateMetricOp, field string) string {
 	switch op {
 	case aggregateMetricCount:
 		return "count_" + field
+	case aggregateMetricCountDistinct:
+		return "count_distinct_" + field
 	case aggregateMetricSum:
 		return "sum_" + field
 	case aggregateMetricAvg:
@@ -934,6 +952,11 @@ func (qv *queryView[K, V]) foldOrdinaryMetric(state *aggregateMetricState, ids p
 			state.seen = true
 			continue
 		}
+		if state.metric.op == aggregateMetricCountDistinct {
+			state.count++
+			state.seen = true
+			continue
+		}
 		value := aggregateValueFromIndexKey(acc.field, ov.keyAt(rank))
 		if err := state.addValue(value, n); err != nil {
 			return err
@@ -1087,7 +1110,7 @@ func (state *aggregateMetricState) addBest(value Value) {
 
 func (state *aggregateMetricState) finish() Value {
 	switch state.metric.op {
-	case aggregateMetricCount:
+	case aggregateMetricCount, aggregateMetricCountDistinct:
 		return Value{num: state.count, any: ValueKindUint}
 	case aggregateMetricSum:
 		if !state.seen {

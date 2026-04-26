@@ -123,6 +123,18 @@ func Benchmark_Aggregate_Distinct_Country(b *testing.B) {
 	})
 }
 
+func Benchmark_Aggregate_CountDistinct_Country_Ungrouped(b *testing.B) {
+	runAggregateBenchCacheModes(b, func() *qx.QX {
+		return qx.Aggregate(qx.COUNT(qx.DISTINCT("country")).AS("country_count"))
+	})
+}
+
+func Benchmark_Aggregate_CountDistinct_Country_Group1(b *testing.B) {
+	runAggregateBenchCacheModes(b, func() *qx.QX {
+		return qx.Group("status").Metrics(qx.COUNT(qx.DISTINCT("country")).AS("country_count"))
+	})
+}
+
 func Benchmark_Aggregate_OrdinaryLowCard_CountSumMin_Ungrouped(b *testing.B) {
 	runAggregateOrdinaryBenchCacheModes(b, func() *qx.QX {
 		return qx.Aggregate(
