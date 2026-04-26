@@ -16,9 +16,9 @@ import (
 )
 
 type snapshotExtraRec struct {
-	Name  string `db:"name" dbi:"default"`
-	Email string `db:"email" dbi:"default"`
-	Age   int    `db:"age" dbi:"default"`
+	Name  string `db:"name" rbi:"index"`
+	Email string `db:"email" rbi:"index"`
+	Age   int    `db:"age" rbi:"index"`
 }
 
 func snapshotExtraOptions() Options {

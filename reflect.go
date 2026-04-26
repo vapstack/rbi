@@ -11,17 +11,27 @@ import (
 )
 
 type field struct {
-	Name     string
-	Unique   bool
-	Kind     reflect.Kind
-	Ptr      bool
-	Slice    bool
-	UseVI    bool
-	KeyKind  fieldWriteKeyKind
-	DBName   string
-	JSONName string
-	Index    []int
+	Name      string
+	Unique    bool
+	IndexKind IndexKind
+	Kind      reflect.Kind
+	Ptr       bool
+	Slice     bool
+	UseVI     bool
+	KeyKind   fieldWriteKeyKind
+	DBName    string
+	JSONName  string
+	Index     []int
 }
+
+// IndexKind declares how a struct field participates in RBI secondary storage.
+type IndexKind uint8
+
+const (
+	IndexDefault IndexKind = iota
+	IndexUnique
+	IndexMeasure
+)
 
 type fieldWriteKeyKind uint8
 
@@ -96,6 +106,13 @@ func inferFieldWriteKeyKind(kind reflect.Kind, useVI, nativeTime bool) fieldWrit
 }
 
 func (db *DB[K, V]) populateFields(t reflect.Type, idx []int) error {
+	if idx == nil && db.options != nil && db.options.Index != nil {
+		return db.populateFieldsFromOptions(t)
+	}
+	return db.populateFieldsFromTags(t, idx)
+}
+
+func (db *DB[K, V]) populateFieldsFromTags(t reflect.Type, idx []int) error {
 
 	for i := 0; i < t.NumField(); i++ {
 
@@ -104,37 +121,23 @@ func (db *DB[K, V]) populateFields(t reflect.Type, idx []int) error {
 			continue
 		}
 		tag := f.Tag.Get("rbi")
-		if tag == "" {
-			tag = f.Tag.Get("dbi")
-		}
-		var (
-			use    bool
-			skip   bool
-			unique bool
-		)
-		switch value := strings.Split(tag, ",")[0]; value {
-		case "":
-			// do not use, do not skip (for embedded structs)
-		case "-":
-			skip = true
-		case "default":
-			use = true
-		case "unique":
-			use = true
-			unique = true
-		default:
-			return fmt.Errorf("invalid index tag value %q on field %v", value, f.Name)
+		indexKind, use, skip, err := parseRBITag(tag, f.Name)
+		if err != nil {
+			return err
 		}
 		if f.Anonymous {
+			if indexKind == IndexUnique {
+				return fmt.Errorf("unique is not supported for anonymous embedded struct field %v", f.Name)
+			}
+			if indexKind == IndexMeasure {
+				return fmt.Errorf("measure is not supported for anonymous embedded struct field %v", f.Name)
+			}
 			if f.Type.Kind() == reflect.Struct {
-				if unique {
-					return fmt.Errorf("unique is not supported for anonymous embedded struct field %v", f.Name)
-				}
 				if skip {
 					continue
 				}
 				newIdx := append(slices.Clone(idx), i)
-				if err := db.populateFields(f.Type, newIdx); err != nil {
+				if err := db.populateFieldsFromTags(f.Type, newIdx); err != nil {
 					return err
 				}
 			}
@@ -143,123 +146,300 @@ func (db *DB[K, V]) populateFields(t reflect.Type, idx []int) error {
 		if skip || !use {
 			continue
 		}
-		dbname := f.Name
-		if dbTag := f.Tag.Get("db"); dbTag != "" && dbTag != "-" {
-			dbname = dbTag
+		if err := db.addIndexedField(f, append(slices.Clone(idx), i), indexKind); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func parseRBITag(tag string, fieldName string) (IndexKind, bool, bool, error) {
+	if tag == "" {
+		return IndexDefault, false, false, nil
+	}
+	if strings.Contains(tag, ",") {
+		return IndexDefault, false, false, fmt.Errorf("invalid index tag value %q on field %v", tag, fieldName)
+	}
+	switch tag {
+	case "-":
+		return IndexDefault, false, true, nil
+	case "index":
+		return IndexDefault, true, false, nil
+	case "unique":
+		return IndexUnique, true, false, nil
+	case "measure":
+		return IndexMeasure, true, false, nil
+	default:
+		return IndexDefault, false, false, fmt.Errorf("invalid index tag value %q on field %v", tag, fieldName)
+	}
+}
+
+func validateIndexKind(indexKind IndexKind) error {
+	switch indexKind {
+	case IndexDefault, IndexUnique, IndexMeasure:
+		return nil
+	default:
+		return fmt.Errorf("invalid IndexKind %d", indexKind)
+	}
+}
+
+type optionIndexField struct {
+	structField reflect.StructField
+	index       []int
+	dbName      string
+}
+
+func (db *DB[K, V]) populateFieldsFromOptions(t reflect.Type) error {
+	byGo := make(map[string]optionIndexField, t.NumField())
+	byDB := make(map[string]optionIndexField, t.NumField())
+	if err := collectOptionIndexFields(t, nil, byGo, byDB); err != nil {
+		return err
+	}
+
+	seen := make(map[string]string, len(db.options.Index))
+	for name, indexKind := range db.options.Index {
+		if err := validateIndexKind(indexKind); err != nil {
+			return fmt.Errorf("field %q: %w", name, err)
 		}
 
-		kind := f.Type.Kind()
-
-		var (
-			ptr        bool
-			slice      bool
-			useVI      bool
-			nativeTime bool
-		)
-
-		useVI = f.Type.Implements(viType)
-		nativeTime = !useVI && isNativeTimeScalarType(f.Type)
-
-		if kind == reflect.Slice && !useVI {
-			slice = true
-			elem := f.Type.Elem()
-			kind = elem.Kind()
-			useVI = elem.Implements(viType)
-			if !useVI {
-				switch kind {
-				case reflect.Bool,
-					reflect.Int,
-					reflect.Int8,
-					reflect.Int16,
-					reflect.Int32,
-					reflect.Int64,
-					reflect.Uint,
-					reflect.Uint8,
-					reflect.Uint16,
-					reflect.Uint32,
-					reflect.Uint64,
-					reflect.Uintptr,
-					reflect.Float32,
-					reflect.Float64,
-					reflect.String:
-					// OK
-				default:
-					return fmt.Errorf("slice elements must either be of a simple type or implement the ValueIndexer interface")
-				}
+		info, ok := byGo[name]
+		if dbInfo, dbOK := byDB[name]; dbOK {
+			if ok && info.index != nil && !slices.Equal(info.index, dbInfo.index) {
+				return fmt.Errorf("index field %q is ambiguous", name)
 			}
-		} else if !useVI {
+			info = dbInfo
+			ok = true
+		}
+		if !ok {
+			return fmt.Errorf("unknown index field %q", name)
+		}
+		if info.index == nil {
+			return fmt.Errorf("ambiguous Go field name %q", name)
+		}
 
+		fieldID := fieldIndexID(info.index)
+		if previous, exists := seen[fieldID]; exists {
+			return fmt.Errorf("field %v is indexed more than once via %q and %q", info.structField.Name, previous, name)
+		}
+		seen[fieldID] = name
+
+		if err := db.addIndexedField(info.structField, info.index, indexKind); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func collectOptionIndexFields(t reflect.Type, idx []int, byGo map[string]optionIndexField, byDB map[string]optionIndexField) error {
+	for i := 0; i < t.NumField(); i++ {
+		sf := t.Field(i)
+		if !sf.IsExported() {
+			continue
+		}
+		nextIdx := append(slices.Clone(idx), i)
+		if sf.Anonymous && sf.Type.Kind() == reflect.Struct {
+			if err := collectOptionIndexFields(sf.Type, nextIdx, byGo, byDB); err != nil {
+				return err
+			}
+			continue
+		}
+
+		dbName := sf.Name
+		hasDBName := false
+		if dbTag := sf.Tag.Get("db"); dbTag != "" && dbTag != "-" {
+			dbName = dbTag
+			hasDBName = true
+		}
+		info := optionIndexField{
+			structField: sf,
+			index:       nextIdx,
+			dbName:      dbName,
+		}
+		if existing, ok := byGo[sf.Name]; ok && !slices.Equal(existing.index, nextIdx) {
+			byGo[sf.Name] = optionIndexField{}
+		} else {
+			byGo[sf.Name] = info
+		}
+		if hasDBName {
+			if existing, ok := byDB[dbName]; ok && !slices.Equal(existing.index, nextIdx) {
+				return fmt.Errorf("ambiguous db tag %q", dbName)
+			}
+			byDB[dbName] = info
+		}
+	}
+	return nil
+}
+
+func fieldIndexID(index []int) string {
+	var b strings.Builder
+	for i, v := range index {
+		if i > 0 {
+			b.WriteByte('.')
+		}
+		b.WriteString(fmt.Sprint(v))
+	}
+	return b.String()
+}
+
+func (db *DB[K, V]) addIndexedField(sf reflect.StructField, index []int, indexKind IndexKind) error {
+	if err := validateIndexKind(indexKind); err != nil {
+		return fmt.Errorf("field %v: %w", sf.Name, err)
+	}
+	f, err := buildFieldDefinition(sf, index, indexKind)
+	if err != nil {
+		return err
+	}
+	if indexKind == IndexUnique {
+		db.hasUnique = true
+	}
+	if indexKind == IndexMeasure {
+		if db.measureFields == nil {
+			db.measureFields = make(map[string]*field)
+		}
+		db.measureFields[f.DBName] = f
+		return nil
+	}
+	if db.fields == nil {
+		db.fields = make(map[string]*field)
+	}
+	db.fields[f.DBName] = f // last wins
+	return nil
+}
+
+func buildFieldDefinition(sf reflect.StructField, index []int, indexKind IndexKind) (*field, error) {
+	dbname := sf.Name
+	if dbTag := sf.Tag.Get("db"); dbTag != "" && dbTag != "-" {
+		dbname = dbTag
+	}
+
+	kind := sf.Type.Kind()
+	var (
+		ptr        bool
+		slice      bool
+		useVI      bool
+		nativeTime bool
+	)
+
+	useVI = sf.Type.Implements(viType)
+	nativeTime = !useVI && isNativeTimeScalarType(sf.Type)
+
+	if indexKind == IndexMeasure {
+		if useVI || nativeTime {
+			return nil, fmt.Errorf("measure field %v has unsupported type %v", sf.Name, sf.Type)
+		}
+		if kind == reflect.Pointer {
+			ptr = true
+			kind = sf.Type.Elem().Kind()
+		}
+		switch kind {
+		case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+			reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64,
+			reflect.Float32, reflect.Float64:
+			// OK
+		default:
+			return nil, fmt.Errorf("measure field %v has unsupported type %v", sf.Name, sf.Type)
+		}
+		return &field{
+			Name:      sf.Name,
+			IndexKind: indexKind,
+			Kind:      kind,
+			Ptr:       ptr,
+			KeyKind:   inferFieldWriteKeyKind(kind, false, false),
+			DBName:    dbname,
+			Index:     slices.Clone(index),
+		}, nil
+	}
+
+	if kind == reflect.Slice && !useVI {
+		slice = true
+		elem := sf.Type.Elem()
+		kind = elem.Kind()
+		useVI = elem.Implements(viType)
+		if !useVI {
 			switch kind {
-
+			case reflect.Bool,
+				reflect.Int,
+				reflect.Int8,
+				reflect.Int16,
+				reflect.Int32,
+				reflect.Int64,
+				reflect.Uint,
+				reflect.Uint8,
+				reflect.Uint16,
+				reflect.Uint32,
+				reflect.Uint64,
+				reflect.Uintptr,
+				reflect.Float32,
+				reflect.Float64,
+				reflect.String:
+				// OK
+			default:
+				return nil, fmt.Errorf("slice elements must either be of a simple type or implement the ValueIndexer interface")
+			}
+		}
+	} else if !useVI {
+		switch kind {
+		case reflect.Struct:
+			if !nativeTime {
+				return nil, fmt.Errorf("cannot index field %v of type %v, consider implementing ValueIndexer interface", sf.Name, sf.Type)
+			}
+		case reflect.Array:
+			return nil, fmt.Errorf("cannot index field %v of array type, use slice instead", sf.Name)
+		case reflect.Invalid,
+			reflect.Func,
+			reflect.Map,
+			reflect.Chan,
+			reflect.Complex64,
+			reflect.Complex128,
+			reflect.Interface,
+			reflect.UnsafePointer,
+			reflect.Uintptr:
+			return nil, fmt.Errorf("cannot index field %v of type %v", sf.Name, sf.Type)
+		case reflect.Pointer:
+			if isNativeTimePointerType(sf.Type) {
+				ptr = true
+				kind = reflect.Struct
+				nativeTime = true
+				break
+			}
+			ptr = true
+			kind = sf.Type.Elem().Kind()
+			switch kind {
 			case reflect.Struct:
-				if !nativeTime {
-					return fmt.Errorf("cannot index field %v of type %v, consider implementing ValueIndexer interface", f.Name, f.Type)
-				}
-
-			case reflect.Array:
-				return fmt.Errorf("cannot index field %v of array type, use slice instead", f.Name)
-
+				return nil, fmt.Errorf("cannot index field %v of type %v, consider implementing ValueIndexer interface", sf.Name, sf.Type)
 			case reflect.Invalid,
 				reflect.Func,
 				reflect.Map,
+				reflect.Slice,
+				reflect.Array,
 				reflect.Chan,
 				reflect.Complex64,
 				reflect.Complex128,
 				reflect.Interface,
 				reflect.UnsafePointer,
-				reflect.Uintptr:
-				return fmt.Errorf("cannot index field %v of type %v", f.Name, f.Type)
-
-			case reflect.Pointer:
-				if isNativeTimePointerType(f.Type) {
-					ptr = true
-					kind = reflect.Struct
-					nativeTime = true
-					break
-				}
-				ptr = true
-				kind = f.Type.Elem().Kind()
-				switch kind {
-				case reflect.Struct:
-					return fmt.Errorf("cannot index field %v of type %v, consider implementing ValueIndexer interface", f.Name, f.Type)
-				case reflect.Invalid,
-					reflect.Func,
-					reflect.Map,
-					reflect.Slice,
-					reflect.Array,
-					reflect.Chan,
-					reflect.Complex64,
-					reflect.Complex128,
-					reflect.Interface,
-					reflect.UnsafePointer,
-					reflect.Uintptr,
-					reflect.Pointer:
-					return fmt.Errorf("cannot index field %v of type %v", f.Name, f.Type)
-				}
-
+				reflect.Uintptr,
+				reflect.Pointer:
+				return nil, fmt.Errorf("cannot index field %v of type %v", sf.Name, sf.Type)
 			}
-		}
-
-		if unique {
-			if slice {
-				return fmt.Errorf("%v (%v): unique is not supported for slice fields", f.Name, f.Type)
-			}
-			db.hasUnique = true
-		}
-
-		db.fields[dbname] = &field{ // last wins
-			Name:    f.Name,
-			Unique:  unique,
-			Kind:    kind,
-			Ptr:     ptr,
-			Slice:   slice,
-			UseVI:   useVI,
-			KeyKind: inferFieldWriteKeyKind(kind, useVI, nativeTime),
-			DBName:  dbname,
-			Index:   append(slices.Clone(idx), i),
 		}
 	}
-	return nil
+
+	if indexKind == IndexUnique && slice {
+		return nil, fmt.Errorf("%v (%v): unique is not supported for slice fields", sf.Name, sf.Type)
+	}
+
+	return &field{
+		Name:      sf.Name,
+		Unique:    indexKind == IndexUnique,
+		IndexKind: indexKind,
+		Kind:      kind,
+		Ptr:       ptr,
+		Slice:     slice,
+		UseVI:     useVI,
+		KeyKind:   inferFieldWriteKeyKind(kind, useVI, nativeTime),
+		DBName:    dbname,
+		Index:     slices.Clone(index),
+	}, nil
 }
 
 type (

@@ -16,18 +16,18 @@ import (
 )
 
 type codecRec struct {
-	Name string `db:"name" dbi:"default"`
-	Age  int    `db:"age" dbi:"default"`
+	Name string `db:"name" rbi:"index"`
+	Age  int    `db:"age" rbi:"index"`
 }
 
 type codecSparseRec struct {
-	Name string   `db:"name" dbi:"default"`
-	Tags []string `db:"tags" dbi:"default"`
-	Opt  *string  `db:"opt" dbi:"default"`
+	Name string   `db:"name" rbi:"index"`
+	Tags []string `db:"tags" rbi:"index"`
+	Opt  *string  `db:"opt" rbi:"index"`
 }
 
 type codecBadValueDecodeRec struct {
-	Name string `db:"name" dbi:"default"`
+	Name string `db:"name" rbi:"index"`
 }
 
 const (

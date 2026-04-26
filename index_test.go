@@ -1830,9 +1830,9 @@ func TestRebuildIndex_RejectsCoreOpsWhileActive(t *testing.T) {
 /**/
 
 type PtrIntRec struct {
-	Name   string `db:"name"   dbi:"default"`
-	Rank   *int   `db:"rank"   dbi:"default"`
-	Active bool   `db:"active" dbi:"default"`
+	Name   string `db:"name"   rbi:"index"`
+	Rank   *int   `db:"rank"   rbi:"index"`
+	Active bool   `db:"active" rbi:"index"`
 }
 
 func intPtr(v int) *int {
@@ -4129,7 +4129,7 @@ func TestIndexExt_DuplicateIDBatchPatchNetDiffKeepsIndexesConsistent(t *testing.
 
 	assertState("incremental")
 
-	if err := db.buildIndex(nil); err != nil {
+	if err := db.buildIndex(nil, nil); err != nil {
 		t.Fatalf("buildIndex: %v", err)
 	}
 	assertState("rebuilt")

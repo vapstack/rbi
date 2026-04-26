@@ -23,17 +23,17 @@ import (
 // - _Gap_, _Realistic_: workload families.
 
 type UserBench struct {
-	ID      uint64   `db:"id"      dbi:"default"`
-	Country string   `db:"country" dbi:"default"`
-	Plan    string   `db:"plan"    dbi:"default"`
-	Status  string   `db:"status"  dbi:"default"`
-	Age     int      `db:"age"     dbi:"default"`
-	Score   float64  `db:"score"   dbi:"default"`
-	Name    string   `db:"name"    dbi:"default"`
-	Email   string   `db:"email"   dbi:"default"`
-	Tags    []string `db:"tags"    dbi:"default"`
-	Roles   []string `db:"roles"   dbi:"default"`
-	Blob    []byte   `db:"-"       dbi:"-"`
+	ID      uint64   `db:"id"      rbi:"index"`
+	Country string   `db:"country" rbi:"index"`
+	Plan    string   `db:"plan"    rbi:"index"`
+	Status  string   `db:"status"  rbi:"index"`
+	Age     int      `db:"age"     rbi:"index"`
+	Score   float64  `db:"score"   rbi:"index"`
+	Name    string   `db:"name"    rbi:"index"`
+	Email   string   `db:"email"   rbi:"index"`
+	Tags    []string `db:"tags"    rbi:"index"`
+	Roles   []string `db:"roles"   rbi:"index"`
+	Blob    []byte   `db:"-"       rbi:"-"`
 }
 
 const (

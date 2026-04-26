@@ -15,20 +15,20 @@ import (
 )
 
 type raceExtraMeta struct {
-	Country string `db:"country" dbi:"default"`
+	Country string `db:"country" rbi:"index"`
 }
 
 type raceExtraRec struct {
 	raceExtraMeta
 
-	Name     string   `db:"name"      dbi:"default"`
-	Email    string   `db:"email"     dbi:"default"`
-	Age      int      `db:"age"       dbi:"default"`
-	Score    float64  `db:"score"     dbi:"default"`
-	Active   bool     `db:"active"    dbi:"default"`
-	Tags     []string `db:"tags"      dbi:"default"`
-	FullName string   `db:"full_name" dbi:"default"`
-	Opt      *string  `db:"opt"       dbi:"default"`
+	Name     string   `db:"name"      rbi:"index"`
+	Email    string   `db:"email"     rbi:"index"`
+	Age      int      `db:"age"       rbi:"index"`
+	Score    float64  `db:"score"     rbi:"index"`
+	Active   bool     `db:"active"    rbi:"index"`
+	Tags     []string `db:"tags"      rbi:"index"`
+	FullName string   `db:"full_name" rbi:"index"`
+	Opt      *string  `db:"opt"       rbi:"index"`
 }
 
 func raceExtraOpenTempDBUint64(t *testing.T, opts Options) *DB[uint64, raceExtraRec] {

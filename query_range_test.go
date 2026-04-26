@@ -1035,7 +1035,7 @@ func TestMaterializeOrderBasicLimitComplementBaseOp_AllocsPerRunStayZeroAfterWar
 	}
 }
 
-func TestDumpQueryKeysFrontpageCandidate_ColdTurnoverAllocProfile(t *testing.T) {
+func TestDumpQueryKeysFrontpageCandidate_ColdAllocProfile(t *testing.T) {
 	profilePath := os.Getenv("RBI_FRONT_PAGE_ALLOC_PROFILE")
 	if profilePath == "" {
 		t.Skip("set RBI_FRONT_PAGE_ALLOC_PROFILE to dump a frontpage alloc profile")
@@ -1064,7 +1064,7 @@ func TestDumpQueryKeysFrontpageCandidate_ColdTurnoverAllocProfile(t *testing.T) 
 	).Sort("score", qx.DESC).Limit(100)
 
 	ring := buildStressBenchTurnoverRing(t, db)
-	state := newBenchReadModeState[uint64, StressBenchUser](t, benchCacheMode{suffix: "ColdTurnover", kind: benchCacheModeColdTurnover}, ring)
+	state := newBenchReadModeState[uint64, StressBenchUser](t, benchCacheMode{suffix: "Cold", kind: benchCacheModeCold}, ring)
 
 	for i := 0; i < 12; i++ {
 		state.applyTurnover(t, db)

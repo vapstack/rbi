@@ -1828,6 +1828,7 @@ func (db *DB[K, V]) buildPreparedSnapshotAggregatedNoLock(
 		nilIndex:           cloneFieldIndexStorageSlots(prev.nilIndex, len(db.indexedFieldAccess)),
 		lenIndex:           cloneFieldIndexStorageSlots(prev.lenIndex, len(db.indexedFieldAccess)),
 		lenZeroComplement:  cloneFieldIndexBoolSlots(prev.lenZeroComplement, len(db.indexedFieldAccess)),
+		measure:            cloneMeasureFieldStorageSlots(prev.measure, len(db.measureFieldAccess)),
 		indexedFieldByName: db.indexedFieldByName,
 		universe:           prev.universe,
 		universeOwner:      prev.universeOwner,
@@ -1843,6 +1844,7 @@ func (db *DB[K, V]) buildPreparedSnapshotAggregatedNoLock(
 	}
 	deltas.fields.SetLen(len(db.indexedFieldAccess))
 	deltas.changed.SetLen(len(db.indexedFieldAccess))
+	measureDeltas := newMeasureFieldBatchDeltas(len(db.measureFieldAccess))
 
 	universeOwned := false
 
@@ -1857,6 +1859,7 @@ func (db *DB[K, V]) buildPreparedSnapshotAggregatedNoLock(
 			next.universe = next.universe.BuildRemoved(op.idx)
 		}
 		db.collectSnapshotBatchEntryDiffs(op, &deltas, prev.lenZeroComplement)
+		db.collectSnapshotMeasureEntryDiffs(op, &measureDeltas)
 	}
 
 	for i := 0; i < deltas.touched.Len(); i++ {
@@ -1896,6 +1899,8 @@ func (db *DB[K, V]) buildPreparedSnapshotAggregatedNoLock(
 		}
 		state.releaseOwned()
 	}
+	applyMeasureFieldBatchDeltas(next, &measureDeltas)
+	measureDeltas.release()
 	inheritNumericRangeBucketCache(next, prev)
 	if changedCount > 0 {
 		inheritMaterializedPredCache(db, next, prev, deltas.changed)

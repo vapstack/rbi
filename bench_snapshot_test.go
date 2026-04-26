@@ -13,8 +13,8 @@ type benchCacheModeKind uint8
 
 const (
 	benchCacheModeHot benchCacheModeKind = iota
+	benchCacheModeCold
 	benchCacheModeColdFresh
-	benchCacheModeColdTurnover
 	benchCacheModeColdPinned
 )
 
@@ -56,14 +56,14 @@ type benchReadModeState[K ~string | ~uint64, V any] struct {
 
 var benchCacheModes = []benchCacheMode{
 	{suffix: "Hot", kind: benchCacheModeHot},
+	{suffix: "Cold", kind: benchCacheModeCold},
 	{suffix: "ColdFresh", kind: benchCacheModeColdFresh},
-	{suffix: "ColdTurnover", kind: benchCacheModeColdTurnover},
 	{suffix: "ColdPinned", kind: benchCacheModeColdPinned},
 }
 
 var benchCacheModesShort = []benchCacheMode{
 	{suffix: "Hot", kind: benchCacheModeHot},
-	{suffix: "ColdTurnover", kind: benchCacheModeColdTurnover},
+	{suffix: "Cold", kind: benchCacheModeCold},
 }
 
 var userBenchTurnoverCountries = [...]string{"US", "NL", "DE", "PL", "SE", "FR", "GB", "ES"}
@@ -104,7 +104,7 @@ func (s *benchReadModeState[K, V]) beforeQuery(b *testing.B, db *DB[K, V]) {
 	case benchCacheModeColdFresh:
 		s.applyTurnover(b, db)
 		db.getSnapshot().clearRuntimeCachesForTesting()
-	case benchCacheModeColdTurnover:
+	case benchCacheModeCold:
 		s.applyTurnover(b, db)
 	case benchCacheModeColdPinned:
 		s.pinCurrentSnapshot(b, db)
@@ -486,7 +486,7 @@ func TestBenchMode_ColdFreshPublishesAndClearsNewSnapshotCaches(t *testing.T) {
 	}
 }
 
-func TestBenchMode_ColdTurnoverInheritsUnchangedFieldCaches(t *testing.T) {
+func TestBenchMode_ColdInheritsUnchangedFieldCaches(t *testing.T) {
 	path := t.TempDir() + "/bench.db"
 	db, raw := openBoltAndNew[uint64, UserBench](t, path, benchOptions())
 	t.Cleanup(func() {
@@ -508,7 +508,7 @@ func TestBenchMode_ColdTurnoverInheritsUnchangedFieldCaches(t *testing.T) {
 	}
 	state := newBenchReadModeState[uint64, UserBench](
 		t,
-		benchCacheMode{suffix: "ColdTurnover", kind: benchCacheModeColdTurnover},
+		benchCacheMode{suffix: "Cold", kind: benchCacheModeCold},
 		buildUserBenchTurnoverRingUint64(t, db),
 	)
 	t.Cleanup(func() { state.close(t, db) })
@@ -516,7 +516,7 @@ func TestBenchMode_ColdTurnoverInheritsUnchangedFieldCaches(t *testing.T) {
 
 	newSnap := db.getSnapshot()
 	if newSnap == oldSnap || newSnap.seq == oldSnap.seq {
-		t.Fatalf("expected ColdTurnover to publish a new snapshot")
+		t.Fatalf("expected Cold to publish a new snapshot")
 	}
 	if _, ok := newSnap.loadMaterializedPred(cacheKey); !ok {
 		t.Fatalf("expected unchanged-field materialized cache to survive turnover")
@@ -560,7 +560,7 @@ func runBenchModeBeforeQueryForTest[K ~string | ~uint64, V any](tb testing.TB, d
 	case benchCacheModeColdFresh:
 		state.applyTurnover(tb, db)
 		db.getSnapshot().clearRuntimeCachesForTesting()
-	case benchCacheModeColdTurnover:
+	case benchCacheModeCold:
 		state.applyTurnover(tb, db)
 	case benchCacheModeColdPinned:
 		state.pinCurrentSnapshot(tb, db)
@@ -598,7 +598,7 @@ func TestBenchTurnoverRingIsReversible(t *testing.T) {
 
 	state := newBenchReadModeState[uint64, UserBench](
 		t,
-		benchCacheMode{suffix: "ColdTurnover", kind: benchCacheModeColdTurnover},
+		benchCacheMode{suffix: "Cold", kind: benchCacheModeCold},
 		&benchTurnoverRing[uint64]{entries: []benchTurnoverEntry[uint64]{ring.entries[0]}},
 	)
 	runBenchModeBeforeQueryForTest(t, db, state)

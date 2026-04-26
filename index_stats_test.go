@@ -11,8 +11,8 @@ import (
 )
 
 type indexStatsTestRec struct {
-	Name string `db:"name" dbi:"default"`
-	Rank *int   `db:"rank" dbi:"default"`
+	Name string `db:"name" rbi:"index"`
+	Rank *int   `db:"rank" rbi:"index"`
 }
 
 type indexStatsTestFieldStats struct {

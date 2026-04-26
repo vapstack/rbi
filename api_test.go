@@ -20,8 +20,8 @@ import (
 )
 
 type beforeStoreCloneRec struct {
-	Name  string `db:"name"  dbi:"default"`
-	Ready bool   `db:"ready" dbi:"default"`
+	Name  string `db:"name"  rbi:"index"`
+	Ready bool   `db:"ready" rbi:"index"`
 }
 
 func (r *beforeStoreCloneRec) Clone() *beforeStoreCloneRec {

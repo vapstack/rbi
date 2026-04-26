@@ -19,6 +19,7 @@ type indexSnapshot struct {
 	nilIndex           *pooled.SliceBuf[fieldIndexStorage]
 	lenIndex           *pooled.SliceBuf[fieldIndexStorage]
 	lenZeroComplement  *pooled.SliceBuf[bool]
+	measure            *pooled.SliceBuf[measureFieldStorage]
 	indexedFieldByName map[string]indexedFieldAccessor
 	universe           posting.List
 	universeOwner      *snapshotPostingOwner
@@ -696,6 +697,7 @@ func (db *DB[K, V]) buildPublishedSnapshotNoLock(seq uint64) *indexSnapshot {
 		nilIndex:           db.nilIndex,
 		lenIndex:           db.lenIndex,
 		lenZeroComplement:  db.lenZeroComplement,
+		measure:            db.measure,
 		indexedFieldByName: db.indexedFieldByName,
 		universe:           db.universe,
 		strmap:             strmap,
@@ -712,6 +714,7 @@ func (db *DB[K, V]) publishSnapshotNoLock(seq uint64) {
 		snap.nilIndex = cloneFieldIndexStorageSlots(db.nilIndex, len(db.indexedFieldAccess))
 		snap.lenIndex = cloneFieldIndexStorageSlots(db.lenIndex, len(db.indexedFieldAccess))
 		snap.lenZeroComplement = cloneFieldIndexBoolSlots(db.lenZeroComplement, len(db.indexedFieldAccess))
+		snap.measure = cloneMeasureFieldStorageSlots(db.measure, len(db.measureFieldAccess))
 	}
 	snap.retainSharedOwnedStorageFrom(prev)
 	db.finishSnapshotPublishNoLock(snap)
@@ -725,6 +728,7 @@ func (db *DB[K, V]) finishSnapshotPublishNoLock(s *indexSnapshot) {
 	db.nilIndex = s.nilIndex
 	db.lenIndex = s.lenIndex
 	db.lenZeroComplement = s.lenZeroComplement
+	db.measure = s.measure
 	db.universe = s.universe
 	retired := db.publishSnapshotRef(s)
 	if db.strkey && db.strmap != nil {
@@ -1511,17 +1515,50 @@ func (db *DB[K, V]) buildPreparedSnapshotFromEmptyBaseNoLock(seq uint64, prev *i
 		}
 	}
 
-	fieldStates := make([]snapshotFieldOverlayState, len(db.indexedFieldAccess))
 	var universe posting.List
+	hasRepeated := false
+	for i := range prepared {
+		var added bool
+		universe, added = universe.BuildAddedChecked(prepared[i].idx)
+		if !added {
+			hasRepeated = true
+		}
+	}
+
+	var lastByIdx map[uint64]int
+	if hasRepeated {
+		lastByIdx = uint64IntMapPool.Get(len(prepared))
+		for i := range prepared {
+			lastByIdx[prepared[i].idx] = i
+		}
+	}
+
+	fieldStates := make([]snapshotFieldOverlayState, len(db.indexedFieldAccess))
+	measureStates := make([]*pooled.SliceBuf[measureEntry], len(db.measureFieldAccess))
 
 	for i := range prepared {
+		if hasRepeated && lastByIdx[prepared[i].idx] != i {
+			continue
+		}
 		op := prepared[i]
-		universe = universe.BuildAdded(op.idx)
 		ptr := unsafe.Pointer(op.newVal)
 
 		for _, acc := range db.indexedFieldAccess {
 			acc.collectSnapshotOverlayValue(ptr, op.idx, &fieldStates[acc.ordinal])
 		}
+		for _, acc := range db.measureFieldAccess {
+			if value, ok := acc.read(ptr); ok {
+				buf := measureStates[acc.ordinal]
+				if buf == nil {
+					buf = measureEntrySlicePool.Get()
+					measureStates[acc.ordinal] = buf
+				}
+				buf.Append(measureEntry{id: op.idx, value: value})
+			}
+		}
+	}
+	if hasRepeated {
+		uint64IntMapPool.Put(lastByIdx)
 	}
 
 	nextIndex := fieldIndexStorageSlicePool.Get()
@@ -1556,6 +1593,13 @@ func (db *DB[K, V]) buildPreparedSnapshotFromEmptyBaseNoLock(seq uint64, prev *i
 			nextLenZeroComplement.Set(i, true)
 		}
 	}
+	nextMeasure := measureFieldStorageSlicePool.Get()
+	nextMeasure.SetLen(len(db.measureFieldAccess))
+	for i := range db.measureFieldAccess {
+		storage := newMeasureStorageFromEntriesOwned(measureStates[i])
+		nextMeasure.Set(i, storage)
+		measureStates[i] = nil
+	}
 
 	snap := &indexSnapshot{
 		seq:                seq,
@@ -1563,6 +1607,7 @@ func (db *DB[K, V]) buildPreparedSnapshotFromEmptyBaseNoLock(seq uint64, prev *i
 		nilIndex:           nextNilIndex,
 		lenIndex:           nextLenIndex,
 		lenZeroComplement:  nextLenZeroComplement,
+		measure:            nextMeasure,
 		indexedFieldByName: db.indexedFieldByName,
 		universe:           universe,
 		strmap:             db.strmap.snapshot(),
@@ -1731,6 +1776,15 @@ func (db *DB[K, V]) buildPreparedSnapshotInsertOnlyNoLock(seq uint64, prev *inde
 			return nil, false
 		}
 	}
+	var addedUniverse posting.List
+	for i := range prepared {
+		var added bool
+		addedUniverse, added = addedUniverse.BuildAddedChecked(prepared[i].idx)
+		if !added {
+			addedUniverse.Release()
+			return nil, false
+		}
+	}
 
 	next := &indexSnapshot{
 		seq: seq,
@@ -1739,24 +1793,31 @@ func (db *DB[K, V]) buildPreparedSnapshotInsertOnlyNoLock(seq uint64, prev *inde
 		nilIndex:           cloneFieldIndexStorageSlots(prev.nilIndex, len(db.indexedFieldAccess)),
 		lenIndex:           cloneFieldIndexStorageSlots(prev.lenIndex, len(db.indexedFieldAccess)),
 		lenZeroComplement:  cloneFieldIndexBoolSlots(prev.lenZeroComplement, len(db.indexedFieldAccess)),
+		measure:            cloneMeasureFieldStorageSlots(prev.measure, len(db.measureFieldAccess)),
 		indexedFieldByName: db.indexedFieldByName,
 		universe:           prev.universe.Clone(),
 		strmap:             db.strmap.snapshot(),
 	}
+	next.universe = next.universe.BuildMergedOwned(addedUniverse)
 	db.initSnapshotRuntimeCaches(next)
 
 	fieldStates := snapshotFieldInsertStateSlicePool.Get()
 	fieldStates.SetLen(len(db.indexedFieldAccess))
 	initSnapshotFieldInsertStateHints(fieldStates, db.indexedFieldAccess, prev, len(prepared))
+	measureDeltas := newMeasureFieldBatchDeltas(len(db.measureFieldAccess))
 
 	for i := range prepared {
 		op := prepared[i]
-		next.universe = next.universe.BuildAdded(op.idx)
 		ptr := unsafe.Pointer(op.newVal)
 
 		for _, acc := range db.indexedFieldAccess {
 			useZeroComplement := prev.lenZeroComplement != nil && acc.ordinal < prev.lenZeroComplement.Len() && prev.lenZeroComplement.Get(acc.ordinal)
 			acc.collectSnapshotInsertValue(ptr, op.idx, useZeroComplement, fieldStates.GetPtr(acc.ordinal))
+		}
+		for _, acc := range db.measureFieldAccess {
+			if value, ok := acc.read(ptr); ok {
+				measureDeltas.append(acc.ordinal, measureBatchDelta{id: op.idx, newOK: true, new: value})
+			}
 		}
 	}
 
@@ -1791,6 +1852,8 @@ func (db *DB[K, V]) buildPreparedSnapshotInsertOnlyNoLock(seq uint64, prev *inde
 		}
 		state.releaseOwned()
 	}
+	applyMeasureFieldBatchDeltas(next, &measureDeltas)
+	measureDeltas.release()
 	inheritNumericRangeBucketCache(next, prev)
 
 	if changedCount > 0 {
@@ -1868,6 +1931,7 @@ func (s *indexSnapshot) retainSharedOwnedStorageFrom(prev *indexSnapshot) {
 		retainSharedFieldIndexStorageSlots(s.index, prev.index)
 		retainSharedFieldIndexStorageSlots(s.nilIndex, prev.nilIndex)
 		retainSharedFieldIndexStorageSlots(s.lenIndex, prev.lenIndex)
+		retainSharedMeasureFieldStorageSlots(s.measure, prev.measure)
 	}
 }
 
@@ -1881,11 +1945,13 @@ func (s *indexSnapshot) releaseOwnedStorage() {
 	releaseFieldIndexStorageSlotsOwned(s.index)
 	releaseFieldIndexStorageSlotsOwned(s.nilIndex)
 	releaseFieldIndexStorageSlotsOwned(s.lenIndex)
+	releaseMeasureFieldStorageSlotsOwned(s.measure)
 	if s.lenZeroComplement != nil {
 		fieldIndexBoolSlicePool.Put(s.lenZeroComplement)
 	}
 	s.index = nil
 	s.nilIndex = nil
 	s.lenIndex = nil
+	s.measure = nil
 	s.lenZeroComplement = nil
 }

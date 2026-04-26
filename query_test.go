@@ -17,21 +17,21 @@ import (
 )
 
 type Meta struct {
-	Country string `db:"country" dbi:"default"`
+	Country string `db:"country" rbi:"index"`
 }
 
 type Rec struct {
 	Meta
 
-	Name   string   `db:"name"   dbi:"default"`
-	Email  string   `db:"email"  dbi:"default"`
-	Age    int      `db:"age"    dbi:"default"`
-	Score  float64  `db:"score"  dbi:"default"`
-	Active bool     `db:"active" dbi:"default"`
-	Tags   []string `db:"tags"   dbi:"default"`
+	Name   string   `db:"name"   rbi:"index"`
+	Email  string   `db:"email"  rbi:"index"`
+	Age    int      `db:"age"    rbi:"index"`
+	Score  float64  `db:"score"  rbi:"index"`
+	Active bool     `db:"active" rbi:"index"`
+	Tags   []string `db:"tags"   rbi:"index"`
 
-	FullName string  `db:"full_name" json:"fullName" dbi:"default"`
-	Opt      *string `db:"opt"                       dbi:"default"`
+	FullName string  `db:"full_name" json:"fullName" rbi:"index"`
+	Opt      *string `db:"opt"                       rbi:"index"`
 }
 
 func openTempDBUint64(t *testing.T, options ...Options) (*DB[uint64, Rec], string) {

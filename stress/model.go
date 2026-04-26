@@ -32,18 +32,18 @@ const (
 
 type UserBench struct {
 	ID         uint64   `db:"id"`
-	Name       string   `db:"name"        dbi:"default"`
-	Email      string   `db:"email"       dbi:"unique"`
-	Country    string   `db:"country"     dbi:"default"`
-	Plan       string   `db:"plan"        dbi:"default"`
-	Status     string   `db:"status"      dbi:"default"`
-	Age        int      `db:"age"         dbi:"default"`
-	Score      float64  `db:"score"       dbi:"default"`
-	IsVerified bool     `db:"is_verified" dbi:"default"`
-	CreatedAt  int64    `db:"created_at"  dbi:"default"`
-	LastLogin  int64    `db:"last_login"  dbi:"default"`
-	Tags       []string `db:"tags"        dbi:"default"`
-	Roles      []string `db:"roles"       dbi:"default"`
+	Name       string   `db:"name"        rbi:"index"`
+	Email      string   `db:"email"       rbi:"unique"`
+	Country    string   `db:"country"     rbi:"index"`
+	Plan       string   `db:"plan"        rbi:"index"`
+	Status     string   `db:"status"      rbi:"index"`
+	Age        int      `db:"age"         rbi:"index"`
+	Score      float64  `db:"score"       rbi:"index"`
+	IsVerified bool     `db:"is_verified" rbi:"index"`
+	CreatedAt  int64    `db:"created_at"  rbi:"index"`
+	LastLogin  int64    `db:"last_login"  rbi:"index"`
+	Tags       []string `db:"tags"        rbi:"index"`
+	Roles      []string `db:"roles"       rbi:"index"`
 	Blob       []byte   `db:"-"`
 }
 

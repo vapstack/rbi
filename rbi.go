@@ -56,6 +56,11 @@ const (
 // Zero-valued option fields use defaults.
 // DefaultOptions returns options with all defaults pre-filled.
 type Options struct {
+	// Index overrides struct rbi tags when non-nil.
+	//
+	// Keys may be Go field names or db tag values. A nil map means indexes are
+	// declared by rbi tags. A non-nil empty map disables all indexed fields.
+	Index map[string]IndexKind
 
 	// DisableIndexLoad prevents indexer from loading previously persisted index
 	// data from the .rbi file on startup. If set, indexer rebuilds the index
@@ -376,7 +381,8 @@ func New[K ~uint64 | ~string, V any](bolt *bbolt.DB, options Options, execOpts .
 		strmap: newStrMapper(0, defaultSnapshotStrMapCompactDepth),
 		bucket: []byte(vname),
 
-		fields: make(map[string]*field),
+		fields:        make(map[string]*field),
+		measureFields: make(map[string]*field),
 
 		universe: posting.List{},
 
@@ -421,7 +427,10 @@ func New[K ~uint64 | ~string, V any](bolt *bbolt.DB, options Options, execOpts .
 	if err = db.initIndexedFieldAccessors(); err != nil {
 		return nil, fmt.Errorf("failed to initialize field accessors: %w", err)
 	}
-	db.transparent = len(db.indexedFieldAccess) == 0
+	if err = db.initMeasureFieldAccessors(); err != nil {
+		return nil, fmt.Errorf("failed to initialize measure field accessors: %w", err)
+	}
+	db.transparent = len(db.indexedFieldAccess) == 0 && len(db.measureFields) == 0
 	if db.transparent {
 		db.strmap = nil
 		db.index = nil
@@ -437,6 +446,8 @@ func New[K ~uint64 | ~string, V any](bolt *bbolt.DB, options Options, execOpts .
 		db.lenIndex.SetLen(len(db.indexedFieldAccess))
 		db.lenZeroComplement = fieldIndexBoolSlicePool.Get()
 		db.lenZeroComplement.SetLen(len(db.indexedFieldAccess))
+		db.measure = measureFieldStorageSlicePool.Get()
+		db.measure.SetLen(len(db.measureFieldAccess))
 	}
 	db.initBatcher()
 
@@ -449,21 +460,23 @@ func New[K ~uint64 | ~string, V any](bolt *bbolt.DB, options Options, execOpts .
 	}
 
 	var (
-		loadedPlannerStats *plannerStatsSnapshot
-		loadedFieldCount   int
-		buildMode          string
+		loadedPlannerStats       *plannerStatsSnapshot
+		loadedFieldCount         int
+		loadedOrdinaryFieldCount int
+		buildMode                string
 	)
 	if !db.transparent {
 		var (
-			skipFields    map[string]struct{}
-			rebuildReason string
+			skipFields        map[string]struct{}
+			skipMeasureFields map[string]struct{}
+			rebuildReason     string
 		)
 
 		if _, err = os.Stat(db.rbiFile); err == nil {
 			if options.DisableIndexLoad {
 				rebuildReason = "persisted index load disabled"
 			} else {
-				skipFields, loadedPlannerStats, err = db.loadIndex()
+				skipFields, skipMeasureFields, loadedPlannerStats, err = db.loadIndex()
 				if err != nil {
 					rebuildReason = fmt.Sprintf("persisted index unavailable (%v)", err)
 				}
@@ -474,8 +487,9 @@ func New[K ~uint64 | ~string, V any](bolt *bbolt.DB, options Options, execOpts .
 			rebuildReason = fmt.Sprintf("persisted index stat failed (%v)", err)
 		}
 
-		loadedFieldCount = len(skipFields)
-		totalFieldCount := len(db.fields)
+		loadedOrdinaryFieldCount = len(skipFields)
+		loadedFieldCount = loadedOrdinaryFieldCount + len(skipMeasureFields)
+		totalFieldCount := len(db.fields) + len(db.measureFields)
 		if rebuildReason != "" {
 			buildMode = "full"
 			db.logger.Printf("rbi: %s", rebuildReason)
@@ -501,7 +515,7 @@ func New[K ~uint64 | ~string, V any](bolt *bbolt.DB, options Options, execOpts .
 		}
 
 		buildStarted := time.Now()
-		if err = db.buildIndex(skipFields); err != nil {
+		if err = db.buildIndex(skipFields, skipMeasureFields); err != nil {
 			return nil, fmt.Errorf("error building index: %w", err)
 		}
 		if buildMode != "" {
@@ -518,13 +532,16 @@ func New[K ~uint64 | ~string, V any](bolt *bbolt.DB, options Options, execOpts .
 	for name := range db.fields {
 		db.fieldSlice = append(db.fieldSlice, name)
 	}
+	for name := range db.measureFields {
+		db.fieldSlice = append(db.fieldSlice, name)
+	}
 	db.stats.FieldCount = len(db.fieldSlice)
 	if !db.transparent {
 		if err = db.publishCurrentSequenceSnapshotNoLock(); err != nil {
 			return nil, fmt.Errorf("failed to publish initial snapshot: %w", err)
 		}
 
-		if loadedPlannerStats != nil && loadedFieldCount == len(db.fields) {
+		if loadedPlannerStats != nil && loadedOrdinaryFieldCount == len(db.fields) {
 			db.publishLoadedPlannerStats(loadedPlannerStats)
 		} else {
 			if err = db.RefreshPlannerStats(); err != nil {
@@ -895,6 +912,7 @@ type (
 		universe posting.List
 
 		fields         map[string]*field
+		measureFields  map[string]*field
 		fieldSlice     []string
 		hasUnique      bool
 		lenIndexLoaded bool
@@ -903,10 +921,13 @@ type (
 		indexedStringValidationAccess []indexedFieldAccessor
 		indexedFieldByName            map[string]indexedFieldAccessor
 		uniqueFieldAccessors          []indexedFieldAccessor
+		measureFieldAccess            []measureFieldAccessor
+		measureFieldByName            map[string]measureFieldAccessor
 		index                         *pooled.SliceBuf[fieldIndexStorage]
 		nilIndex                      *pooled.SliceBuf[fieldIndexStorage]
 		lenIndex                      *pooled.SliceBuf[fieldIndexStorage]
 		lenZeroComplement             *pooled.SliceBuf[bool]
+		measure                       *pooled.SliceBuf[measureFieldStorage]
 		patchMap                      map[string]*field
 		patchFieldAccess              []patchFieldAccessor
 		patchFieldOrdinal             map[string]int
@@ -1366,7 +1387,7 @@ func (db *DB[K, V]) RebuildIndex() error {
 		return ErrNoIndex
 	}
 
-	if err := db.buildIndex(nil); err != nil {
+	if err := db.buildIndex(nil, nil); err != nil {
 		return fmt.Errorf("error building index: %w", err)
 	}
 
@@ -1867,6 +1888,8 @@ func (db *DB[K, V]) Truncate() error {
 	nextLenIndex.SetLen(len(db.indexedFieldAccess))
 	nextLenZeroComplement := fieldIndexBoolSlicePool.Get()
 	nextLenZeroComplement.SetLen(len(db.indexedFieldAccess))
+	nextMeasure := measureFieldStorageSlicePool.Get()
+	nextMeasure.SetLen(len(db.measureFieldAccess))
 	nextUniverse := posting.List{}
 	var nextStrMap *strMapSnapshot
 	if db.strkey {
@@ -1878,6 +1901,7 @@ func (db *DB[K, V]) Truncate() error {
 		nilIndex:           nextNilIndex,
 		lenIndex:           nextLenIndex,
 		lenZeroComplement:  nextLenZeroComplement,
+		measure:            nextMeasure,
 		indexedFieldByName: db.indexedFieldByName,
 		universe:           nextUniverse,
 		strmap:             nextStrMap,
@@ -1894,6 +1918,7 @@ func (db *DB[K, V]) Truncate() error {
 	db.nilIndex = nextNilIndex
 	db.lenIndex = nextLenIndex
 	db.lenZeroComplement = nextLenZeroComplement
+	db.measure = nextMeasure
 
 	// Keep previously published snapshots immutable for concurrent readers.
 	db.universe = nextUniverse

@@ -22,7 +22,7 @@ func (s reflectFoldedString) IndexingValue() string {
 }
 
 type reflectScalarVIRec struct {
-	Code reflectFoldedString `db:"code" dbi:"default"`
+	Code reflectFoldedString `db:"code" rbi:"index"`
 }
 
 type reflectScalarVIUniqueRec struct {
@@ -30,7 +30,7 @@ type reflectScalarVIUniqueRec struct {
 }
 
 type reflectSliceVIRec struct {
-	Tags []reflectFoldedString `db:"tags" dbi:"default"`
+	Tags []reflectFoldedString `db:"tags" rbi:"index"`
 }
 
 type reflectHexBytes []byte
@@ -40,7 +40,7 @@ func (b reflectHexBytes) IndexingValue() string {
 }
 
 type reflectBytesVIRec struct {
-	Key reflectHexBytes `db:"key" dbi:"default"`
+	Key reflectHexBytes `db:"key" rbi:"index"`
 }
 
 type reflectMapVI map[string]string
@@ -73,7 +73,7 @@ type reflectInterfaceVIRec struct {
 }
 
 type reflectInterfaceVISliceRec struct {
-	Tags []ValueIndexer `db:"tags" dbi:"default"`
+	Tags []ValueIndexer `db:"tags" rbi:"index"`
 }
 
 type reflectPtrFoldedString string
@@ -87,18 +87,18 @@ func (s *reflectPtrFoldedString) IndexingValue() string {
 
 type ReflectUnsafeEmbeddedIndexed struct {
 	Code  *reflectPtrFoldedString `db:"code" rbi:"unique"`
-	Score int                     `db:"score" dbi:"default"`
-	Tags  []string                `db:"tags" dbi:"default"`
-	Count *uint64                 `db:"count" dbi:"default"`
+	Score int                     `db:"score" rbi:"index"`
+	Tags  []string                `db:"tags" rbi:"index"`
+	Count *uint64                 `db:"count" rbi:"index"`
 }
 
 type reflectUnsafeAccessorRec struct {
-	Name string `db:"name" dbi:"default"`
+	Name string `db:"name" rbi:"index"`
 	ReflectUnsafeEmbeddedIndexed
 }
 
 type reflectPatchTimeRec struct {
-	Name    string               `db:"name" dbi:"default"`
+	Name    string               `db:"name" rbi:"index"`
 	When    time.Time            `db:"-"`
 	Slots   []time.Time          `db:"-"`
 	Windows map[time.Time]string `db:"-"`
@@ -108,15 +108,15 @@ type reflectNamedTime time.Time
 type reflectNamedTimePtr *time.Time
 
 type reflectNamedTimeRec struct {
-	When reflectNamedTime `db:"when" dbi:"default"`
+	When reflectNamedTime `db:"when" rbi:"index"`
 }
 
 type reflectTimePtrRec struct {
-	When *time.Time `db:"when" dbi:"default"`
+	When *time.Time `db:"when" rbi:"index"`
 }
 
 type reflectNamedTimePtrRec struct {
-	When reflectNamedTimePtr `db:"when" dbi:"default"`
+	When reflectNamedTimePtr `db:"when" rbi:"index"`
 }
 
 type reflectTimeVI time.Time
@@ -130,15 +130,15 @@ type reflectTimeVIRec struct {
 }
 
 type reflectInt64AgeRec struct {
-	Age int64 `db:"age" dbi:"default"`
+	Age int64 `db:"age" rbi:"index"`
 }
 
 type reflectNamedTag string
 type reflectNamedTags []reflectNamedTag
 
 type reflectNamedSlicePatchRec struct {
-	Name string           `db:"name" dbi:"default"`
-	Tags reflectNamedTags `db:"tags" dbi:"default"`
+	Name string           `db:"name" rbi:"index"`
+	Tags reflectNamedTags `db:"tags" rbi:"index"`
 }
 
 type reflectPatchNestedChild struct {
@@ -154,18 +154,18 @@ type reflectPatchNested struct {
 }
 
 type reflectPatchNestedRec struct {
-	Name      string              `db:"name" dbi:"default"`
+	Name      string              `db:"name" rbi:"index"`
 	Nested    reflectPatchNested  `db:"-"`
 	NestedPtr *reflectPatchNested `db:"-"`
 }
 
 type reflectPatchNestedSliceRec struct {
-	Name  string                  `db:"name" dbi:"default"`
+	Name  string                  `db:"name" rbi:"index"`
 	Items []reflectPatchNestedRec `db:"-"`
 }
 
 type reflectNumericPatchRec struct {
-	Name  string  `db:"name" dbi:"default"`
+	Name  string  `db:"name" rbi:"index"`
 	I8    int8    `db:"-"`
 	U8    uint8   `db:"-"`
 	I64   int64   `db:"-"`

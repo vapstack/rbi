@@ -180,14 +180,14 @@ func cloneSnapshotUniverse(t *testing.T, db *DB[uint64, Rec]) posting.List {
 }
 
 type countORBenchRec struct {
-	Country string   `db:"country" dbi:"default"`
-	Plan    string   `db:"plan"    dbi:"default"`
-	Status  string   `db:"status"  dbi:"default"`
-	Age     int      `db:"age"     dbi:"default"`
-	Score   float64  `db:"score"   dbi:"default"`
-	Email   string   `db:"email"   dbi:"default"`
-	Tags    []string `db:"tags"    dbi:"default"`
-	Roles   []string `db:"roles"   dbi:"default"`
+	Country string   `db:"country" rbi:"index"`
+	Plan    string   `db:"plan"    rbi:"index"`
+	Status  string   `db:"status"  rbi:"index"`
+	Age     int      `db:"age"     rbi:"index"`
+	Score   float64  `db:"score"   rbi:"index"`
+	Email   string   `db:"email"   rbi:"index"`
+	Tags    []string `db:"tags"    rbi:"index"`
+	Roles   []string `db:"roles"   rbi:"index"`
 }
 
 type seededDBFixture struct {
@@ -3114,7 +3114,7 @@ func TestCountLeavesForUniquePath_ReusesScratchForSingleLeaf(t *testing.T) {
 	}
 }
 
-func TestDumpCountSecurityAuditColdTurnoverCPUProfile(t *testing.T) {
+func TestDumpCountSecurityAuditColdCPUProfile(t *testing.T) {
 	profilePath := os.Getenv("RBI_SECURITY_AUDIT_CPU_PROFILE")
 	if profilePath == "" {
 		t.Skip("set RBI_SECURITY_AUDIT_CPU_PROFILE to dump a cold-turnover CPU profile")
@@ -3138,7 +3138,7 @@ func TestDumpCountSecurityAuditColdTurnoverCPUProfile(t *testing.T) {
 	ring := buildUserBenchTurnoverRingUint64(t, db)
 	state := newBenchReadModeState[uint64, UserBench](
 		t,
-		benchCacheMode{suffix: "ColdTurnover", kind: benchCacheModeColdTurnover},
+		benchCacheMode{suffix: "Cold", kind: benchCacheModeCold},
 		ring,
 	)
 	t.Cleanup(func() { state.close(t, db) })
