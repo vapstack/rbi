@@ -474,7 +474,7 @@ func (it *bitmapContainerManyIterator) release() {
 	bitmapContainerManyIteratorPool.Put(it)
 }
 
-func (bc *containerBitmap) getManyIterator() manyIterable {
+func (bc *containerBitmap) getManyIterator() *bitmapContainerManyIterator {
 	it := bitmapContainerManyIteratorPool.Get()
 	it.ptr = bc
 	it.base = 0
