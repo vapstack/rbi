@@ -675,11 +675,11 @@ func (qv *queryView[K, V]) executeUngroupedAggregate(q *aggregateQuery, ids post
 	for i := range q.metrics {
 		layout[i] = q.metrics[i].out
 		states[i].metric = q.metrics[i]
-		if !empty {
-			err := qv.foldAggregateMetric(&states[i], ids)
-			if err != nil {
-				return Result{}, err
-			}
+	}
+	if !empty {
+		err := qv.foldAggregateMetricStates(states, ids)
+		if err != nil {
+			return Result{}, err
 		}
 	}
 	row := make(Row, len(states))
@@ -729,9 +729,9 @@ func (qv *queryView[K, V]) aggregateGroupRecursive(
 		states := make([]aggregateMetricState, len(q.metrics))
 		for i := range q.metrics {
 			states[i].metric = q.metrics[i]
-			if err := qv.foldAggregateMetric(&states[i], current); err != nil {
-				return err
-			}
+		}
+		if err := qv.foldAggregateMetricStates(states, current); err != nil {
+			return err
 		}
 		row := make(Row, len(groupValues)+len(states))
 		copy(row, groupValues)
@@ -744,14 +744,18 @@ func (qv *queryView[K, V]) aggregateGroupRecursive(
 
 	acc := q.groups[level].ordinary
 	ov := newFieldOverlayStorage(qv.snap.index.Get(acc.ordinal))
-	for rank := 0; rank < ov.keyCount(); rank++ {
-		bucketIDs := ov.postingAt(rank)
+	cur := ov.newCursor(ov.rangeByRanks(0, ov.keyCount()), false)
+	for {
+		key, bucketIDs, ok := cur.next()
+		if !ok {
+			break
+		}
 		next := current.Borrow().BuildAnd(bucketIDs)
 		if next.IsEmpty() {
 			next.Release()
 			continue
 		}
-		groupValues[level] = aggregateValueFromIndexKey(acc.field, ov.keyAt(rank))
+		groupValues[level] = aggregateValueFromIndexKey(acc.field, key)
 		if err := qv.aggregateGroupRecursive(q, next, level+1, groupValues, rows); err != nil {
 			next.Release()
 			return err
@@ -775,31 +779,48 @@ func (qv *queryView[K, V]) aggregateGroupRecursive(
 
 func (qv *queryView[K, V]) appendDistinctRows(rows *[]Row, acc indexedFieldAccessor, ids posting.List) error {
 	ov := newFieldOverlayStorage(qv.snap.index.Get(acc.ordinal))
-	for rank := 0; rank < ov.keyCount(); rank++ {
-		bucketIDs := ov.postingAt(rank)
-		if aggregateIntersectCardinality(ids, bucketIDs, qv.snapshotUniverseCardinality()) == 0 {
+	universe := qv.snapshotUniverseCardinality()
+	filterCardinality := ids.Cardinality()
+	cur := ov.newCursor(ov.rangeByRanks(0, ov.keyCount()), false)
+	for {
+		key, bucketIDs, ok := cur.next()
+		if !ok {
+			break
+		}
+		if aggregateIntersectCardinalityKnown(ids, bucketIDs, filterCardinality, universe) == 0 {
 			continue
 		}
-		*rows = append(*rows, Row{aggregateValueFromIndexKey(acc.field, ov.keyAt(rank))})
+		*rows = append(*rows, Row{aggregateValueFromIndexKey(acc.field, key)})
 	}
 	nilIDs := newFieldOverlayStorage(qv.snap.nilIndex.Get(acc.ordinal)).lookupPostingRetained(nilIndexEntryKey)
-	if aggregateIntersectCardinality(ids, nilIDs, qv.snapshotUniverseCardinality()) > 0 {
+	if aggregateIntersectCardinalityKnown(ids, nilIDs, filterCardinality, universe) > 0 {
 		*rows = append(*rows, Row{Value{}})
 	}
 	return nil
 }
 
-func (qv *queryView[K, V]) foldAggregateMetric(state *aggregateMetricState, ids posting.List) error {
-	metric := state.metric
-	if metric.rowCount {
-		state.count = ids.Cardinality()
-		state.seen = true
-		return nil
+func (qv *queryView[K, V]) foldAggregateMetricStates(states []aggregateMetricState, ids posting.List) error {
+	for i := range states {
+		metric := states[i].metric
+		if metric.rowCount {
+			states[i].count = ids.Cardinality()
+			states[i].seen = true
+			continue
+		}
+		if metric.field.isMeasure {
+			if err := qv.foldMeasureMetric(&states[i], ids); err != nil {
+				return err
+			}
+			continue
+		}
+		if hasPriorOrdinaryAggregateMetricState(states, i) {
+			continue
+		}
+		if err := qv.foldOrdinaryMetricStates(states, ids, i); err != nil {
+			return err
+		}
 	}
-	if metric.field.isMeasure {
-		return qv.foldMeasureMetric(state, ids)
-	}
-	return qv.foldOrdinaryMetric(state, ids)
+	return nil
 }
 
 func (qv *queryView[K, V]) foldMeasureMetric(state *aggregateMetricState, ids posting.List) error {
@@ -936,45 +957,74 @@ func (state *aggregateMetricState) addMeasureStorageIntersect(storage measureFie
 	return nil
 }
 
-func (qv *queryView[K, V]) foldOrdinaryMetric(state *aggregateMetricState, ids posting.List) error {
-	acc := state.metric.field.ordinary
+func hasPriorOrdinaryAggregateMetricState(states []aggregateMetricState, pos int) bool {
+	metric := states[pos].metric
+	for i := 0; i < pos; i++ {
+		if aggregateMetricsShareOrdinaryField(states[i].metric, metric) {
+			return true
+		}
+	}
+	return false
+}
+
+func aggregateMetricsShareOrdinaryField(a aggregateMetric, b aggregateMetric) bool {
+	return !a.rowCount &&
+		!b.rowCount &&
+		!a.field.isMeasure &&
+		!b.field.isMeasure &&
+		a.field.ordinary.ordinal == b.field.ordinary.ordinal
+}
+
+func (qv *queryView[K, V]) foldOrdinaryMetricStates(states []aggregateMetricState, ids posting.List, first int) error {
+	acc := states[first].metric.field.ordinary
 	ov := newFieldOverlayStorage(qv.snap.index.Get(acc.ordinal))
 	universe := qv.snapshotUniverseCardinality()
-	for rank := 0; rank < ov.keyCount(); rank++ {
-		bucketIDs := ov.postingAt(rank)
-		n := aggregateIntersectCardinality(ids, bucketIDs, universe)
+	filterCardinality := ids.Cardinality()
+	cur := ov.newCursor(ov.rangeByRanks(0, ov.keyCount()), false)
+	for {
+		key, bucketIDs, ok := cur.next()
+		if !ok {
+			break
+		}
+		n := aggregateIntersectCardinalityKnown(ids, bucketIDs, filterCardinality, universe)
 		if n == 0 {
 			continue
 		}
-		if state.metric.op == aggregateMetricCount {
-			state.count += n
-			state.seen = true
-			continue
-		}
-		if state.metric.op == aggregateMetricCountDistinct {
-			state.count++
-			state.seen = true
-			continue
-		}
-		value := aggregateValueFromIndexKey(acc.field, ov.keyAt(rank))
-		if err := state.addValue(value, n); err != nil {
-			return err
+		var value Value
+		valueReady := false
+		for i := first; i < len(states); i++ {
+			if !aggregateMetricsShareOrdinaryField(states[first].metric, states[i].metric) {
+				continue
+			}
+			switch states[i].metric.op {
+			case aggregateMetricCount:
+				states[i].count += n
+				states[i].seen = true
+			case aggregateMetricCountDistinct:
+				states[i].count++
+				states[i].seen = true
+			default:
+				if !valueReady {
+					value = aggregateValueFromIndexKey(acc.field, key)
+					valueReady = true
+				}
+				if err := states[i].addValue(value, n); err != nil {
+					return err
+				}
+			}
 		}
 	}
 	return nil
 }
 
-func aggregateIntersectCardinality(filter posting.List, bucket posting.List, universe uint64) uint64 {
-	if filter.IsEmpty() || bucket.IsEmpty() {
+func aggregateIntersectCardinalityKnown(filter posting.List, bucket posting.List, filterCardinality uint64, universe uint64) uint64 {
+	if filterCardinality == 0 || bucket.IsEmpty() {
 		return 0
 	}
-	if filter.Cardinality() == universe {
+	if filterCardinality == universe {
 		return bucket.Cardinality()
 	}
-	ids := filter.Borrow().BuildAnd(bucket)
-	card := ids.Cardinality()
-	ids.Release()
-	return card
+	return filter.AndCardinality(bucket)
 }
 
 func (state *aggregateMetricState) addRawMeasure(raw uint64, kind measureValueKind, n uint64) error {
