@@ -28,6 +28,26 @@ func openBenchAggMeasureDB(b *testing.B) (*DB[uint64, UserBench], *bbolt.DB, str
 	return db, raw, dir
 }
 
+func openBenchAggHybridDB(b *testing.B) (*DB[uint64, UserBench], *bbolt.DB, string) {
+	b.Helper()
+	dir, err := os.MkdirTemp("", "rbi-bench-agg-hybrid-*")
+	if err != nil {
+		b.Fatalf("os.MkdirTemp: %v", err)
+	}
+
+	opts := benchOptions()
+	opts.Index = map[string]IndexKind{
+		"country": IndexDefault,
+		"plan":    IndexDefault,
+		"status":  IndexDefault,
+		"age":     IndexDefault,
+		"score":   IndexMeasure,
+	}
+
+	db, raw := openBoltAndNew[uint64, UserBench](b, filepath.Join(dir, "bench_agg_hybrid.db"), opts)
+	return db, raw, dir
+}
+
 func buildBenchAggMeasureDBWithMode(b *testing.B, n int, mode benchCacheMode) *DB[uint64, UserBench] {
 	b.Helper()
 	oneMu.Lock()
@@ -39,6 +59,31 @@ func buildBenchAggMeasureDBWithMode(b *testing.B, n int, mode benchCacheMode) *D
 	}
 
 	db, raw, dir := openBenchAggMeasureDB(b)
+
+	b.StopTimer()
+	seedBenchData(b, db, n)
+	b.StartTimer()
+
+	benchDBs[key] = &cachedBenchUserDB{db: db, raw: raw, dir: dir}
+	registerBenchSuiteCleanup(func() {
+		_ = db.Close()
+		_ = raw.Close()
+		_ = os.RemoveAll(dir)
+	})
+	return db
+}
+
+func buildBenchAggHybridDBWithMode(b *testing.B, n int, mode benchCacheMode) *DB[uint64, UserBench] {
+	b.Helper()
+	oneMu.Lock()
+	defer oneMu.Unlock()
+
+	key := "agg_hybrid/" + benchDBFamilyKey(n)
+	if cached := benchDBs[key]; cached != nil && cached.db != nil && !cached.db.closed.Load() {
+		return cached.db
+	}
+
+	db, raw, dir := openBenchAggHybridDB(b)
 
 	b.StopTimer()
 	seedBenchData(b, db, n)
@@ -93,6 +138,14 @@ func runAggregateBenchCacheModes(b *testing.B, qf func() *qx.QX) {
 	b.Helper()
 	runBenchCacheModes(b, func(b *testing.B, mode benchCacheMode) {
 		db := buildBenchAggMeasureDBWithMode(b, benchN, mode)
+		runAggregateBenchWithMode(b, db, qf(), mode)
+	})
+}
+
+func runAggregateHybridBenchCacheModes(b *testing.B, qf func() *qx.QX) {
+	b.Helper()
+	runBenchCacheModes(b, func(b *testing.B, mode benchCacheMode) {
+		db := buildBenchAggHybridDBWithMode(b, benchN, mode)
 		runAggregateBenchWithMode(b, db, qf(), mode)
 	})
 }
@@ -257,6 +310,47 @@ func Benchmark_Aggregate_Measure_CountSumMin_Group2_FilterSelective(b *testing.B
 				qx.COUNT("score").AS("score_count"),
 				qx.SUM("score").AS("score_sum"),
 				qx.MIN("score").AS("score_min"),
+			)
+	})
+}
+
+func Benchmark_Aggregate_Hybrid_MeasureOrdinary_CountSumMin_Ungrouped(b *testing.B) {
+	runAggregateHybridBenchCacheModes(b, func() *qx.QX {
+		return qx.Aggregate(
+			qx.COUNT("score").AS("score_count"),
+			qx.SUM("score").AS("score_sum"),
+			qx.MIN("score").AS("score_min"),
+			qx.COUNT("age").AS("age_count"),
+			qx.SUM("age").AS("age_sum"),
+			qx.MIN("age").AS("age_min"),
+		)
+	})
+}
+
+func Benchmark_Aggregate_Hybrid_MeasureOrdinary_CountSumMin_Group2(b *testing.B) {
+	runAggregateHybridBenchCacheModes(b, func() *qx.QX {
+		return qx.Group("country", "status").Metrics(
+			qx.COUNT("score").AS("score_count"),
+			qx.SUM("score").AS("score_sum"),
+			qx.MIN("score").AS("score_min"),
+			qx.COUNT("age").AS("age_count"),
+			qx.SUM("age").AS("age_sum"),
+			qx.MIN("age").AS("age_min"),
+		)
+	})
+}
+
+func Benchmark_Aggregate_Hybrid_MeasureOrdinary_CountSumMin_Group2_FilterSelective(b *testing.B) {
+	runAggregateHybridBenchCacheModes(b, func() *qx.QX {
+		return qx.Query(qx.EQ("country", "US"), qx.EQ("status", "active")).
+			Group("country", "status").
+			Metrics(
+				qx.COUNT("score").AS("score_count"),
+				qx.SUM("score").AS("score_sum"),
+				qx.MIN("score").AS("score_min"),
+				qx.COUNT("age").AS("age_count"),
+				qx.SUM("age").AS("age_sum"),
+				qx.MIN("age").AS("age_min"),
 			)
 	})
 }
