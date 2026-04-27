@@ -107,6 +107,11 @@ type aggregateModelRec struct {
 	Amount  *int64 `db:"amount"  rbi:"measure"`
 }
 
+type aggregateByIDGateRec struct {
+	Group string `db:"group" rbi:"index"`
+	Score int    `db:"score" rbi:"index"`
+}
+
 func openTempAggregateDB(t *testing.T) *DB[uint64, aggregateTestRec] {
 	t.Helper()
 	dir := t.TempDir()
@@ -198,6 +203,74 @@ func TestAggregateOrdinaryMetricsAndRowCount(t *testing.T) {
 	requireAggregateNone(t, row[2])
 	requireAggregateNone(t, row[3])
 	requireAggregateNone(t, row[4])
+}
+
+func TestAggregateGroupedOrdinaryByIDGateUsesSelectivity(t *testing.T) {
+	dir := t.TempDir()
+	db, raw := openBoltAndNew[uint64, aggregateByIDGateRec](t, filepath.Join(dir, "aggregate_by_id_gate.db"), Options{AnalyzeInterval: -1})
+	t.Cleanup(func() {
+		_ = db.Close()
+		_ = raw.Close()
+	})
+
+	ids := make([]uint64, 0, 20)
+	vals := make([]*aggregateByIDGateRec, 0, 20)
+	for i := 1; i <= 20; i++ {
+		group := "a"
+		if i&1 == 0 {
+			group = "b"
+		}
+		ids = append(ids, uint64(i))
+		vals = append(vals, &aggregateByIDGateRec{Group: group, Score: i})
+	}
+	if err := db.BatchSet(ids, vals); err != nil {
+		t.Fatalf("BatchSet: %v", err)
+	}
+
+	full, err := db.prepareAggregate(qx.Group("group").Metrics(
+		qx.COUNT("score").AS("score_count"),
+		qx.SUM("score").AS("score_sum"),
+		qx.MIN("score").AS("score_min"),
+	))
+	if err != nil {
+		t.Fatalf("prepare full aggregate: %v", err)
+	}
+	defer full.release()
+
+	selective, err := db.prepareAggregate(qx.Query(qx.EQ("score", 1)).Group("group").Metrics(
+		qx.COUNT("score").AS("score_count"),
+		qx.SUM("score").AS("score_sum"),
+		qx.MIN("score").AS("score_min"),
+	))
+	if err != nil {
+		t.Fatalf("prepare selective aggregate: %v", err)
+	}
+	defer selective.release()
+
+	snap, seq, ref, pinned := db.pinCurrentSnapshot()
+	defer db.unpinCurrentSnapshot(seq, ref, pinned)
+	view := db.makeQueryView(snap)
+	defer db.releaseQueryView(view)
+
+	fullIDs, err := view.aggregateMatchedIDs(full.filter)
+	if err != nil {
+		t.Fatalf("full aggregate ids: %v", err)
+	}
+	if !view.canExecuteGroupedOrdinaryByID(full, fullIDs) {
+		fullIDs.Release()
+		t.Fatal("full high-card grouped ordinary aggregate did not use by-ID gate")
+	}
+	fullIDs.Release()
+
+	selectiveIDs, err := view.aggregateMatchedIDs(selective.filter)
+	if err != nil {
+		t.Fatalf("selective aggregate ids: %v", err)
+	}
+	if view.canExecuteGroupedOrdinaryByID(selective, selectiveIDs) {
+		selectiveIDs.Release()
+		t.Fatal("selective grouped ordinary aggregate used by-ID gate")
+	}
+	selectiveIDs.Release()
 }
 
 func TestAggregateUngroupedMeasureAndOrdinaryMetrics(t *testing.T) {

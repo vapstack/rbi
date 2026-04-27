@@ -8,6 +8,7 @@ import (
 	"sort"
 
 	"github.com/vapstack/qx"
+	"github.com/vapstack/rbi/internal/pooled"
 	"github.com/vapstack/rbi/internal/posting"
 	"github.com/vapstack/rbi/internal/qir"
 )
@@ -709,6 +710,9 @@ func (qv *queryView[K, V]) executeDistinctAggregate(metric aggregateMetric, ids 
 }
 
 func (qv *queryView[K, V]) executeGroupedAggregate(q *aggregateQuery, ids posting.List) (Result, error) {
+	if qv.canExecuteGroupedOrdinaryByID(q, ids) {
+		return qv.executeGroupedOrdinaryByID(q, ids)
+	}
 	layout := groupedAggregateLayout(q)
 	rows := make([]Row, 0)
 	groupValues := make([]Value, len(q.groups))
@@ -716,6 +720,346 @@ func (qv *queryView[K, V]) executeGroupedAggregate(q *aggregateQuery, ids postin
 		return Result{}, err
 	}
 	return Result{Layout: layout, Rows: rows}, nil
+}
+
+func (qv *queryView[K, V]) canExecuteGroupedOrdinaryByID(q *aggregateQuery, ids posting.List) bool {
+	hasOrdinary := false
+	for i := range q.metrics {
+		metric := q.metrics[i]
+		if metric.rowCount {
+			continue
+		}
+		if metric.field.isMeasure {
+			return false
+		}
+		hasOrdinary = true
+	}
+	if !hasOrdinary {
+		return false
+	}
+	maxID, ok := ids.Maximum()
+	if !ok || maxID >= aggregateGroupIDOrdinalSlicePoolMaxCap {
+		return false
+	}
+	filterCardinality := ids.Cardinality()
+	if maxID+1 > filterCardinality*16 {
+		return false
+	}
+
+	metricKeys, metricRows, minMetricRows := qv.aggregateOrdinaryMetricWork(q)
+	if metricRows == 0 || filterCardinality*8 < minMetricRows {
+		return false
+	}
+	groupEstimate := qv.aggregateGroupCountUpperBound(q, filterCardinality)
+	return aggregateMulGreater(groupEstimate, metricKeys, metricRows)
+}
+
+func (qv *queryView[K, V]) aggregateOrdinaryMetricWork(q *aggregateQuery) (uint64, uint64, uint64) {
+	var keys uint64
+	var rows uint64
+	var minRows uint64
+	for i := range q.metrics {
+		metric := q.metrics[i]
+		if metric.rowCount || hasPriorOrdinaryAggregateMetric(q.metrics, i) {
+			continue
+		}
+		ov := newFieldOverlayStorage(qv.snap.index.Get(metric.field.ordinary.ordinal))
+		fieldRows := aggregateOverlayRows(ov)
+		keys += uint64(ov.keyCount())
+		rows += fieldRows
+		if minRows == 0 || fieldRows < minRows {
+			minRows = fieldRows
+		}
+	}
+	return keys, rows, minRows
+}
+
+func (qv *queryView[K, V]) aggregateGroupCountUpperBound(q *aggregateQuery, filterCardinality uint64) uint64 {
+	groups := uint64(1)
+	for i := range q.groups {
+		acc := q.groups[i].ordinary
+		distinct := uint64(newFieldOverlayStorage(qv.snap.index.Get(acc.ordinal)).keyCount())
+		if newFieldOverlayStorage(qv.snap.nilIndex.Get(acc.ordinal)).keyCount() > 0 {
+			distinct++
+		}
+		if distinct == 0 {
+			return 0
+		}
+		if groups > filterCardinality/distinct {
+			return filterCardinality
+		}
+		groups *= distinct
+	}
+	if groups > filterCardinality {
+		return filterCardinality
+	}
+	return groups
+}
+
+func aggregateOverlayRows(ov fieldOverlay) uint64 {
+	if ov.chunked != nil {
+		if ov.chunked.rowPrefix != nil && ov.chunked.rowPrefix.Len() > 0 {
+			return ov.chunked.rowPrefix.Get(ov.chunked.rowPrefix.Len() - 1)
+		}
+		return ov.chunked.chunkRowsRange(0, ov.chunked.chunkCount)
+	}
+	var rows uint64
+	for i := range ov.base {
+		rows += ov.base[i].IDs.Cardinality()
+	}
+	return rows
+}
+
+func aggregateMulGreater(a uint64, b uint64, limit uint64) bool {
+	return b != 0 && a > limit/b
+}
+
+func (qv *queryView[K, V]) executeGroupedOrdinaryByID(q *aggregateQuery, ids posting.List) (Result, error) {
+	layout := groupedAggregateLayout(q)
+	rows := make([]Row, 0)
+	states := aggregateMetricStateSlicePool.Get()
+	groupByID := aggregateGroupIDOrdinalSlicePool.Get()
+	maxID, _ := ids.Maximum()
+	groupByID.SetLen(int(maxID) + 1)
+
+	groupValues := make([]Value, len(q.groups))
+	err := qv.buildGroupedOrdinaryIDMap(q, ids, 0, groupValues, &rows, states, groupByID)
+	if err == nil {
+		err = qv.foldGroupedOrdinaryByID(q, rows, states, groupByID)
+	}
+	releaseAggregateGroupIDOrdinals(groupByID, ids)
+	if err != nil {
+		aggregateMetricStateSlicePool.Put(states)
+		return Result{}, err
+	}
+	for rowIdx := range rows {
+		base := rowIdx * len(q.metrics)
+		for metricIdx := range q.metrics {
+			rows[rowIdx][len(q.groups)+metricIdx] = states.GetPtr(base + metricIdx).finish()
+		}
+	}
+	aggregateMetricStateSlicePool.Put(states)
+	return Result{Layout: layout, Rows: rows}, nil
+}
+
+func releaseAggregateGroupIDOrdinals(groupByID *pooled.SliceBuf[uint32], ids posting.List) {
+	it := ids.Iter()
+	for it.HasNext() {
+		id := it.Next()
+		if id < uint64(groupByID.Len()) {
+			groupByID.Set(int(id), 0)
+		}
+	}
+	it.Release()
+	aggregateGroupIDOrdinalSlicePool.Put(groupByID)
+}
+
+func (qv *queryView[K, V]) buildGroupedOrdinaryIDMap(
+	q *aggregateQuery,
+	current posting.List,
+	level int,
+	groupValues []Value,
+	rows *[]Row,
+	states *pooled.SliceBuf[aggregateMetricState],
+	groupByID *pooled.SliceBuf[uint32],
+) error {
+	if level == len(q.groups) {
+		rowIndex := len(*rows)
+		if uint64(rowIndex) >= uint64(^uint32(0)) {
+			return fmt.Errorf("%w: aggregate group count exceeds runtime limit", ErrInvalidQuery)
+		}
+		row := make(Row, len(groupValues)+len(q.metrics))
+		copy(row, groupValues)
+		*rows = append(*rows, row)
+
+		rowCount := current.Cardinality()
+		for i := range q.metrics {
+			state := aggregateMetricState{metric: q.metrics[i]}
+			if q.metrics[i].rowCount {
+				state.count = rowCount
+				state.seen = true
+			}
+			states.Append(state)
+		}
+
+		groupOrdinal := uint32(rowIndex + 1)
+		it := current.Iter()
+		for it.HasNext() {
+			id := it.Next()
+			groupByID.Set(int(id), groupOrdinal)
+		}
+		it.Release()
+		return nil
+	}
+
+	acc := q.groups[level].ordinary
+	ov := newFieldOverlayStorage(qv.snap.index.Get(acc.ordinal))
+	cur := ov.newCursor(ov.rangeByRanks(0, ov.keyCount()), false)
+	for {
+		key, bucketIDs, ok := cur.next()
+		if !ok {
+			break
+		}
+		next := current.Borrow().BuildAnd(bucketIDs)
+		if next.IsEmpty() {
+			next.Release()
+			continue
+		}
+		groupValues[level] = aggregateValueFromIndexKey(acc.field, key)
+		if err := qv.buildGroupedOrdinaryIDMap(q, next, level+1, groupValues, rows, states, groupByID); err != nil {
+			next.Release()
+			return err
+		}
+		next.Release()
+	}
+	nilIDs := newFieldOverlayStorage(qv.snap.nilIndex.Get(acc.ordinal)).lookupPostingRetained(nilIndexEntryKey)
+	if !nilIDs.IsEmpty() {
+		next := current.Borrow().BuildAnd(nilIDs)
+		if !next.IsEmpty() {
+			groupValues[level] = Value{}
+			if err := qv.buildGroupedOrdinaryIDMap(q, next, level+1, groupValues, rows, states, groupByID); err != nil {
+				next.Release()
+				return err
+			}
+		}
+		next.Release()
+	}
+	return nil
+}
+
+func (qv *queryView[K, V]) foldGroupedOrdinaryByID(
+	q *aggregateQuery,
+	rows []Row,
+	states *pooled.SliceBuf[aggregateMetricState],
+	groupByID *pooled.SliceBuf[uint32],
+) error {
+	for i := range q.metrics {
+		metric := q.metrics[i]
+		if metric.rowCount {
+			continue
+		}
+		if hasPriorOrdinaryAggregateMetric(q.metrics, i) {
+			continue
+		}
+		if err := qv.foldGroupedOrdinaryFieldByID(q, rows, states, groupByID, i); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func hasPriorOrdinaryAggregateMetric(metrics []aggregateMetric, pos int) bool {
+	metric := metrics[pos]
+	for i := 0; i < pos; i++ {
+		if aggregateMetricsShareOrdinaryField(metrics[i], metric) {
+			return true
+		}
+	}
+	return false
+}
+
+func (qv *queryView[K, V]) foldGroupedOrdinaryFieldByID(
+	q *aggregateQuery,
+	rows []Row,
+	states *pooled.SliceBuf[aggregateMetricState],
+	groupByID *pooled.SliceBuf[uint32],
+	first int,
+) error {
+	if len(rows) == 0 {
+		return nil
+	}
+
+	counts := aggregateGroupBucketCountSlicePool.Get()
+	counts.SetLen(len(rows))
+	touched := aggregateGroupBucketTouchedSlicePool.Get()
+
+	acc := q.metrics[first].field.ordinary
+	ov := newFieldOverlayStorage(qv.snap.index.Get(acc.ordinal))
+	cur := ov.newCursor(ov.rangeByRanks(0, ov.keyCount()), false)
+	var err error
+	for {
+		key, bucketIDs, ok := cur.next()
+		if !ok {
+			break
+		}
+		it := bucketIDs.Iter()
+		for it.HasNext() {
+			id := it.Next()
+			if id >= uint64(groupByID.Len()) {
+				continue
+			}
+			groupOrdinal := groupByID.Get(int(id))
+			if groupOrdinal == 0 {
+				continue
+			}
+			groupIndex := int(groupOrdinal - 1)
+			if counts.Get(groupIndex) == 0 {
+				touched.Append(groupIndex)
+			}
+			counts.Set(groupIndex, counts.Get(groupIndex)+1)
+		}
+		it.Release()
+		if touched.Len() > 0 {
+			err = addGroupedOrdinaryBucketValue(q, states, first, acc.field, key, counts, touched)
+			resetAggregateGroupBucketCounts(counts, touched)
+			if err != nil {
+				break
+			}
+		}
+	}
+
+	resetAggregateGroupBucketCounts(counts, touched)
+	aggregateGroupBucketTouchedSlicePool.Put(touched)
+	aggregateGroupBucketCountSlicePool.Put(counts)
+	return err
+}
+
+func addGroupedOrdinaryBucketValue(
+	q *aggregateQuery,
+	states *pooled.SliceBuf[aggregateMetricState],
+	first int,
+	field *field,
+	key indexKey,
+	counts *pooled.SliceBuf[uint64],
+	touched *pooled.SliceBuf[int],
+) error {
+	var value Value
+	valueReady := false
+	for pos := 0; pos < touched.Len(); pos++ {
+		groupIndex := touched.Get(pos)
+		n := counts.Get(groupIndex)
+		stateBase := groupIndex * len(q.metrics)
+		for metricIdx := first; metricIdx < len(q.metrics); metricIdx++ {
+			if !aggregateMetricsShareOrdinaryField(q.metrics[first], q.metrics[metricIdx]) {
+				continue
+			}
+			state := states.GetPtr(stateBase + metricIdx)
+			switch state.metric.op {
+			case aggregateMetricCount:
+				state.count += n
+				state.seen = true
+			case aggregateMetricCountDistinct:
+				state.count++
+				state.seen = true
+			default:
+				if !valueReady {
+					value = aggregateValueFromIndexKey(field, key)
+					valueReady = true
+				}
+				if err := state.addValue(value, n); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func resetAggregateGroupBucketCounts(counts *pooled.SliceBuf[uint64], touched *pooled.SliceBuf[int]) {
+	for i := 0; i < touched.Len(); i++ {
+		counts.Set(touched.Get(i), 0)
+	}
+	touched.Truncate()
 }
 
 func (qv *queryView[K, V]) aggregateGroupRecursive(

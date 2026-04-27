@@ -33,6 +33,9 @@ const (
 	orderBasicBaseCoreSlicePoolMaxCap       = 128
 	orderBasicBaseCoreIndexSlicePoolMaxCap  = 128
 	orderedMergedScalarRangeFieldPoolMaxCap = 64
+	aggregateGroupIDOrdinalSlicePoolMaxCap  = 8 << 20
+	aggregateGroupBucketSlicePoolMaxCap     = 1 << 20
+	aggregateMetricStateSlicePoolMaxCap     = 1 << 20
 )
 
 /**/
@@ -78,6 +81,35 @@ var predicateCheckSlicePool = pooled.Slices[int]{
 var orderedMergedScalarRangeFieldSlicePool = pooled.Slices[orderedMergedScalarRangeField]{
 	MinCap: 4,
 	MaxCap: orderedMergedScalarRangeFieldPoolMaxCap,
+	Clear:  true,
+}
+
+/**/
+
+var aggregateGroupIDOrdinalSlicePool = pooled.Slices[uint32]{
+	MinCap: 1024,
+	MaxCap: aggregateGroupIDOrdinalSlicePoolMaxCap,
+}
+
+/**/
+
+var aggregateGroupBucketCountSlicePool = pooled.Slices[uint64]{
+	MinCap: 64,
+	MaxCap: aggregateGroupBucketSlicePoolMaxCap,
+}
+
+/**/
+
+var aggregateGroupBucketTouchedSlicePool = pooled.Slices[int]{
+	MinCap: 64,
+	MaxCap: aggregateGroupBucketSlicePoolMaxCap,
+}
+
+/**/
+
+var aggregateMetricStateSlicePool = pooled.Slices[aggregateMetricState]{
+	MinCap: 16,
+	MaxCap: aggregateMetricStateSlicePoolMaxCap,
 	Clear:  true,
 }
 
