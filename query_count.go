@@ -40,9 +40,9 @@ func (db *DB[K, V]) Count(exprs ...qx.Expr) (uint64, error) {
 	)
 	switch len(exprs) {
 	case 1:
-		prepared, err = qir.PrepareCountExprResolved(preparedFieldResolver[K, V]{db: db}, exprs[0])
+		prepared, err = qir.PrepareCountExprResolved(db.indexedFieldMap, exprs[0])
 	default:
-		prepared, err = qir.PrepareCountExprsResolved(preparedFieldResolver[K, V]{db: db}, exprs...)
+		prepared, err = qir.PrepareCountExprsResolved(db.indexedFieldMap, exprs...)
 	}
 	if err != nil {
 		return 0, err
@@ -65,12 +65,12 @@ func countInternalFinishTrace(trace *queryTrace, out uint64, err error) (uint64,
 	return out, err
 }
 
-func (qv *queryView[K, V]) countInternal(q *qir.Shape, emitTrace bool) (uint64, error) {
+func (qv *queryView) countInternal(q *qir.Shape, emitTrace bool) (uint64, error) {
 	if q == nil {
 		return qv.snapshotUniverseCardinality(), nil
 	}
 
-	traceEnabled := emitTrace && qv.root.traceOrCalibrationSamplingEnabled()
+	traceEnabled := emitTrace && qv.engine.traceOrCalibrationSamplingEnabled()
 	if !traceEnabled && q.Expr.FieldOrdinal >= 0 && len(q.Expr.Operands) == 0 && q.Expr.Op != qir.OpNOOP {
 		if out, ok, err := qv.tryCountByScalarLookup(q.Expr, nil); ok || err != nil {
 			return out, err
@@ -83,7 +83,7 @@ func (qv *queryView[K, V]) countInternal(q *qir.Shape, emitTrace bool) (uint64, 
 	expr := q.Expr
 	var trace *queryTrace
 	if traceEnabled {
-		trace = qv.root.beginTrace(q.WithExpr(expr))
+		trace = qv.engine.beginTrace(q.WithExpr(expr))
 	}
 
 	if out, ok, err := qv.tryCountByUniqueEq(expr, trace); ok || err != nil {
@@ -123,7 +123,7 @@ func (qv *queryView[K, V]) countInternal(q *qir.Shape, emitTrace bool) (uint64, 
 	return countInternalFinishTrace(trace, qv.countPostingResult(b), nil)
 }
 
-func (qv *queryView[K, V]) tryCountByScalarLookup(expr qir.Expr, trace *queryTrace) (uint64, bool, error) {
+func (qv *queryView) tryCountByScalarLookup(expr qir.Expr, trace *queryTrace) (uint64, bool, error) {
 	if expr.FieldOrdinal < 0 {
 		return 0, false, nil
 	}
@@ -261,7 +261,7 @@ func countPostingAllMatches(posts *pooled.SliceBuf[posting.List]) uint64 {
 	return cnt
 }
 
-func (qv *queryView[K, V]) tryCountBySliceLookup(expr qir.Expr, trace *queryTrace) (uint64, bool, error) {
+func (qv *queryView) tryCountBySliceLookup(expr qir.Expr, trace *queryTrace) (uint64, bool, error) {
 	if expr.FieldOrdinal < 0 {
 		return 0, false, nil
 	}
@@ -417,7 +417,7 @@ func countIndexSliceContains(active []int, idx int) bool {
 	return false
 }
 
-func (qv *queryView[K, V]) buildCountLeadResidualExactFiltersByCandidatesInto(dst *pooled.SliceBuf[countLeadResidualExactFilter], preds predicateReader, candidates []int) {
+func (qv *queryView) buildCountLeadResidualExactFiltersByCandidatesInto(dst *pooled.SliceBuf[countLeadResidualExactFilter], preds predicateReader, candidates []int) {
 	dst.Truncate()
 	for _, pi := range candidates {
 		if pi < 0 || pi >= preds.Len() {
@@ -447,7 +447,7 @@ func (qv *queryView[K, V]) buildCountLeadResidualExactFiltersByCandidatesInto(ds
 	}
 }
 
-func (qv *queryView[K, V]) buildCountLeadResidualExactFiltersByCandidatesIntoSet(dst *pooled.SliceBuf[countLeadResidualExactFilter], preds predicateSet, candidates []int) {
+func (qv *queryView) buildCountLeadResidualExactFiltersByCandidatesIntoSet(dst *pooled.SliceBuf[countLeadResidualExactFilter], preds predicateSet, candidates []int) {
 	dst.Truncate()
 	for _, pi := range candidates {
 		if pi < 0 || pi >= preds.Len() {
@@ -477,7 +477,7 @@ func (qv *queryView[K, V]) buildCountLeadResidualExactFiltersByCandidatesIntoSet
 	}
 }
 
-func (qv *queryView[K, V]) collectCountLeadResidualExactCandidatesInto(dst []int, preds predicateReader, active []int, exclude []int) []int {
+func (qv *queryView) collectCountLeadResidualExactCandidatesInto(dst []int, preds predicateReader, active []int, exclude []int) []int {
 	dst = dst[:0]
 	for _, pi := range active {
 		if countIndexSliceContains(exclude, pi) {
@@ -491,7 +491,7 @@ func (qv *queryView[K, V]) collectCountLeadResidualExactCandidatesInto(dst []int
 	return dst
 }
 
-func (qv *queryView[K, V]) collectCountLeadResidualExactCandidatesIntoSet(dst []int, preds predicateSet, active []int, exclude []int) []int {
+func (qv *queryView) collectCountLeadResidualExactCandidatesIntoSet(dst []int, preds predicateSet, active []int, exclude []int) []int {
 	dst = dst[:0]
 	for _, pi := range active {
 		if countIndexSliceContains(exclude, pi) {
@@ -674,7 +674,7 @@ func countORBranchAcceptPosting(
 	return cnt
 }
 
-func (qv *queryView[K, V]) ensureCountLeadResidualExactFiltersSet(
+func (qv *queryView) ensureCountLeadResidualExactFiltersSet(
 	preds predicateSet,
 	candidates []int,
 	residualExact []int,
@@ -701,7 +701,7 @@ func (qv *queryView[K, V]) ensureCountLeadResidualExactFiltersSet(
 	return extraExactBuf, true, residualBoth
 }
 
-func (qv *queryView[K, V]) buildCountLeadResidualScratchSet(
+func (qv *queryView) buildCountLeadResidualScratchSet(
 	preds predicateSet,
 	active []int,
 	exactActiveDst []int,
@@ -733,7 +733,7 @@ func (qv *queryView[K, V]) buildCountLeadResidualScratchSet(
 	return exactActive, extraExactCandidates, residualExact, residualBoth
 }
 
-func (qv *queryView[K, V]) evalAndOperandsExceptReordered(ops []qir.Expr, skip int) (postingResult, bool, error) {
+func (qv *queryView) evalAndOperandsExceptReordered(ops []qir.Expr, skip int) (postingResult, bool, error) {
 	if len(ops) == 0 || (skip >= 0 && len(ops) <= 1) {
 		return postingResult{}, false, nil
 	}
@@ -849,7 +849,7 @@ func (qv *queryView[K, V]) evalAndOperandsExceptReordered(ops []qir.Expr, skip i
 	return acc, true, nil
 }
 
-func (qv *queryView[K, V]) applyAndMergedExactRangePostingResult(
+func (qv *queryView) applyAndMergedExactRangePostingResult(
 	acc *postingResult,
 	hasAcc *bool,
 	e qir.Expr,
@@ -883,7 +883,7 @@ func (qv *queryView[K, V]) applyAndMergedExactRangePostingResult(
 	return false, nil
 }
 
-func (qv *queryView[K, V]) evalMergedExactRangePostingResult(e qir.Expr, bounds rangeBounds) (postingResult, bool) {
+func (qv *queryView) evalMergedExactRangePostingResult(e qir.Expr, bounds rangeBounds) (postingResult, bool) {
 	if e.Not || e.FieldOrdinal < 0 {
 		return postingResult{}, false
 	}
@@ -895,7 +895,7 @@ func (qv *queryView[K, V]) evalMergedExactRangePostingResult(e qir.Expr, bounds 
 	if !ov.hasData() {
 		return postingResult{}, false
 	}
-	var core preparedScalarRangePredicate[K, V]
+	var core preparedScalarRangePredicate
 	qv.initPreparedExactScalarRangePredicate(&core, e, fm, bounds)
 	if cached, ok := core.loadReuse.load(); ok {
 		if cached.IsEmpty() {
@@ -929,7 +929,7 @@ func (qv *queryView[K, V]) evalMergedExactRangePostingResult(e qir.Expr, bounds 
 // tryCountByScalarInSplit accelerates flat AND counts with a positive scalar IN leaf:
 // it evaluates all non-IN leaves once into a postingResult filter and then sums
 // per-value intersections against that combined filter.
-func (qv *queryView[K, V]) tryCountByScalarInSplit(expr qir.Expr, trace *queryTrace) (uint64, bool, error) {
+func (qv *queryView) tryCountByScalarInSplit(expr qir.Expr, trace *queryTrace) (uint64, bool, error) {
 	if expr.Not || expr.Op != qir.OpAND || len(expr.Operands) < 2 {
 		return 0, false, nil
 	}
@@ -1067,7 +1067,7 @@ func (qv *queryView[K, V]) tryCountByScalarInSplit(expr qir.Expr, trace *queryTr
 	return cnt, true, nil
 }
 
-func (qv *queryView[K, V]) isPositiveUniqueEqExpr(e qir.Expr) bool {
+func (qv *queryView) isPositiveUniqueEqExpr(e qir.Expr) bool {
 	if !isPositiveScalarEqLeaf(e) {
 		return false
 	}
@@ -1097,7 +1097,7 @@ func countLeavesForUniquePath(expr qir.Expr, dst []qir.Expr) ([]qir.Expr, bool) 
 	return dst, true
 }
 
-func (qv *queryView[K, V]) uniqueCountPathPrecheck(expr qir.Expr) (hasUnique bool, ok bool) {
+func (qv *queryView) uniqueCountPathPrecheck(expr qir.Expr) (hasUnique bool, ok bool) {
 	if expr.Not {
 		return false, false
 	}
@@ -1127,7 +1127,7 @@ func (qv *queryView[K, V]) uniqueCountPathPrecheck(expr qir.Expr) (hasUnique boo
 
 // tryCountByUniqueEq counts expressions anchored by a positive EQ predicate on
 // a unique scalar field, which bounds the candidate set to at most one row.
-func (qv *queryView[K, V]) tryCountByUniqueEq(expr qir.Expr, trace *queryTrace) (uint64, bool, error) {
+func (qv *queryView) tryCountByUniqueEq(expr qir.Expr, trace *queryTrace) (uint64, bool, error) {
 	hasUnique, ok := qv.uniqueCountPathPrecheck(expr)
 	if !ok || !hasUnique {
 		return 0, false, nil
@@ -1289,7 +1289,7 @@ func countBroadLeadResidualScoreLimit(leadEst, universe uint64) uint64 {
 	return satAddUint64(satMulUint64(universe, 2), satMulUint64(universe-leadEst, 2))
 }
 
-func (qv *queryView[K, V]) shouldRejectBroadLeadPredicateScan(preds predicateReader, active []int, leadEst, universe uint64) bool {
+func (qv *queryView) shouldRejectBroadLeadPredicateScan(preds predicateReader, active []int, leadEst, universe uint64) bool {
 	limit := countBroadLeadResidualScoreLimit(leadEst, universe)
 	if limit == 0 {
 		return false
@@ -1304,7 +1304,7 @@ func (qv *queryView[K, V]) shouldRejectBroadLeadPredicateScan(preds predicateRea
 	return false
 }
 
-func (qv *queryView[K, V]) buildCountPredicatesWithMode(leaves []qir.Expr, allowMaterialize bool) (predicateSet, bool) {
+func (qv *queryView) buildCountPredicatesWithMode(leaves []qir.Expr, allowMaterialize bool) (predicateSet, bool) {
 	owner := predicateSlicePool.Get()
 	owner.Grow(len(leaves))
 	preds := predicateSet{owner: owner}
@@ -1899,7 +1899,7 @@ func (s *countORSeen) addPostingOwned(ids posting.List) uint64 {
 	}
 }
 
-func (qv *queryView[K, V]) countORMaterializedSpillUnion(
+func (qv *queryView) countORMaterializedSpillUnion(
 	branches []countORMaterializedBranch,
 	seen *countORSeen,
 	trace *queryTrace,
@@ -1966,7 +1966,7 @@ func (qv *queryView[K, V]) countORMaterializedSpillUnion(
 	return cnt, examined, true, nil
 }
 
-func (qv *queryView[K, V]) tryCountORBranchLeadPostingsBuf(
+func (qv *queryView) tryCountORBranchLeadPostingsBuf(
 	branches *pooled.SliceBuf[countORBranch],
 	branchIdx int,
 	useSeenDedup bool,
@@ -2308,7 +2308,7 @@ func (route countScalarComplementRouting) prefersLazyPostingFilter(p predicate, 
 	return !snap.shouldPromoteRuntimeMaterializedPredKey(route.complementCacheKey)
 }
 
-func (qv *queryView[K, V]) countScalarComplementRouting(p predicate, leadProbeEst uint64, universe uint64) countScalarComplementRouting {
+func (qv *queryView) countScalarComplementRouting(p predicate, leadProbeEst uint64, universe uint64) countScalarComplementRouting {
 	if universe == 0 || leadProbeEst == 0 || !p.isCustomUnmaterialized() || p.expr.Not || !isNumericRangeOp(p.expr.Op) {
 		return countScalarComplementRouting{}
 	}
@@ -2386,7 +2386,7 @@ func countBaseIndexRangeCardinality(s []index, start, end int) uint64 {
 	return total
 }
 
-func (qv *queryView[K, V]) tryMaterializeBroadRangeComplementPredicateForCount(p *predicate, leadProbeEst uint64, universe uint64, trace *queryTrace) bool {
+func (qv *queryView) tryMaterializeBroadRangeComplementPredicateForCount(p *predicate, leadProbeEst uint64, universe uint64, trace *queryTrace) bool {
 	if p == nil {
 		return false
 	}
@@ -2450,7 +2450,7 @@ func (qv *queryView[K, V]) tryMaterializeBroadRangeComplementPredicateForCount(p
 	return true
 }
 
-func (qv *queryView[K, V]) materializePostingIntersection(posts *pooled.SliceBuf[posting.List]) posting.List {
+func (qv *queryView) materializePostingIntersection(posts *pooled.SliceBuf[posting.List]) posting.List {
 	if posts == nil || posts.Len() == 0 {
 		return posting.List{}
 	}
@@ -2479,7 +2479,7 @@ func (qv *queryView[K, V]) materializePostingIntersection(posts *pooled.SliceBuf
 	return out.BuildOptimized()
 }
 
-func (qv *queryView[K, V]) materializeSetPredicateForCount(p *predicate) bool {
+func (qv *queryView) materializeSetPredicateForCount(p *predicate) bool {
 	if p == nil {
 		return false
 	}
@@ -2534,7 +2534,7 @@ func (qv *queryView[K, V]) materializeSetPredicateForCount(p *predicate) bool {
 	return true
 }
 
-func (qv *queryView[K, V]) materializeCustomPredicateForCount(p *predicate) error {
+func (qv *queryView) materializeCustomPredicateForCount(p *predicate) error {
 	if p == nil {
 		return nil
 	}
@@ -2580,11 +2580,11 @@ func (qv *queryView[K, V]) materializeCustomPredicateForCount(p *predicate) erro
 	return nil
 }
 
-func (qv *queryView[K, V]) prepareCountPredicate(p *predicate, probeEst uint64, universe uint64) error {
+func (qv *queryView) prepareCountPredicate(p *predicate, probeEst uint64, universe uint64) error {
 	return qv.prepareCountPredicateWithTrace(p, probeEst, universe, nil)
 }
 
-func (qv *queryView[K, V]) prepareCountPredicateWithTrace(p *predicate, probeEst uint64, universe uint64, trace *queryTrace) error {
+func (qv *queryView) prepareCountPredicateWithTrace(p *predicate, probeEst uint64, universe uint64, trace *queryTrace) error {
 	if p == nil || p.alwaysTrue || p.alwaysFalse || p.covered {
 		return nil
 	}
@@ -2623,7 +2623,7 @@ func (qv *queryView[K, V]) prepareCountPredicateWithTrace(p *predicate, probeEst
 //
 // It exists to avoid materializing full postingResult intermediates when a lead can
 // cheaply prune the candidate space.
-func (qv *queryView[K, V]) tryCountByPredicates(expr qir.Expr, trace *queryTrace) (uint64, bool, error) {
+func (qv *queryView) tryCountByPredicates(expr qir.Expr, trace *queryTrace) (uint64, bool, error) {
 	if expr.Not || expr.Op != qir.OpAND || len(expr.Operands) < 2 {
 		return 0, false, nil
 	}
@@ -2770,7 +2770,7 @@ func (qv *queryView[K, V]) tryCountByPredicates(expr qir.Expr, trace *queryTrace
 	return cnt, true, nil
 }
 
-func (qv *queryView[K, V]) tryCountByPredicatesLeadBuckets(preds predicateSet, leadIdx int, active []int) (uint64, uint64, bool) {
+func (qv *queryView) tryCountByPredicatesLeadBuckets(preds predicateSet, leadIdx int, active []int) (uint64, uint64, bool) {
 	if leadIdx < 0 || leadIdx >= preds.Len() {
 		return 0, 0, false
 	}
@@ -3082,7 +3082,7 @@ func (qv *queryView[K, V]) tryCountByPredicatesLeadBuckets(preds predicateSet, l
 	return cnt, examined, true
 }
 
-func (qv *queryView[K, V]) tryCountByPredicatesLeadPostings(preds predicateSet, leadIdx int, active []int) (uint64, uint64, bool) {
+func (qv *queryView) tryCountByPredicatesLeadPostings(preds predicateSet, leadIdx int, active []int) (uint64, uint64, bool) {
 	if leadIdx < 0 || leadIdx >= preds.Len() {
 		return 0, 0, false
 	}
@@ -3368,7 +3368,7 @@ func satMulUint64(a, b uint64) uint64 {
 	return a * b
 }
 
-func (qv *queryView[K, V]) prepareCountORPredicateWithTrace(p *predicate, probeEst uint64, universe uint64, trace *queryTrace) error {
+func (qv *queryView) prepareCountORPredicateWithTrace(p *predicate, probeEst uint64, universe uint64, trace *queryTrace) error {
 	if p == nil || p.alwaysTrue || p.alwaysFalse || p.covered {
 		return nil
 	}
@@ -3392,7 +3392,7 @@ func (qv *queryView[K, V]) prepareCountORPredicateWithTrace(p *predicate, probeE
 	return nil
 }
 
-func (qv *queryView[K, V]) countPredicateResidualCheckWeight(p predicate, probeEst, universe uint64) uint64 {
+func (qv *queryView) countPredicateResidualCheckWeight(p predicate, probeEst, universe uint64) uint64 {
 	if p.alwaysTrue || p.covered {
 		return 0
 	}
@@ -3422,7 +3422,7 @@ func (qv *queryView[K, V]) countPredicateResidualCheckWeight(p predicate, probeE
 	return weight
 }
 
-func (qv *queryView[K, V]) countORPredicateResidualCheckWeight(p predicate, probeEst, universe uint64) uint64 {
+func (qv *queryView) countORPredicateResidualCheckWeight(p predicate, probeEst, universe uint64) uint64 {
 	if p.alwaysTrue || p.covered {
 		return 0
 	}
@@ -3449,7 +3449,7 @@ func (qv *queryView[K, V]) countORPredicateResidualCheckWeight(p predicate, prob
 	return weight
 }
 
-func (qv *queryView[K, V]) countLeadResidualScore(p predicate, leadEst, universe uint64) uint64 {
+func (qv *queryView) countLeadResidualScore(p predicate, leadEst, universe uint64) uint64 {
 	if leadEst == 0 || p.alwaysTrue || p.covered {
 		return 0
 	}
@@ -3464,7 +3464,7 @@ func (qv *queryView[K, V]) countLeadResidualScore(p predicate, leadEst, universe
 	return satMulUint64(effectiveRows, weight)
 }
 
-func (qv *queryView[K, V]) countORLeadResidualScore(p predicate, leadEst, universe uint64) uint64 {
+func (qv *queryView) countORLeadResidualScore(p predicate, leadEst, universe uint64) uint64 {
 	if leadEst == 0 || p.alwaysTrue || p.covered {
 		return 0
 	}
@@ -3475,7 +3475,7 @@ func (qv *queryView[K, V]) countORLeadResidualScore(p predicate, leadEst, univer
 	return satMulUint64(leadEst, weight)
 }
 
-func (qv *queryView[K, V]) pickCountLeadPredicate(preds predicateReader, universe uint64) (int, uint64, uint64) {
+func (qv *queryView) pickCountLeadPredicate(preds predicateReader, universe uint64) (int, uint64, uint64) {
 	leadIdx := -1
 	leadEst := uint64(0)
 	leadScore := uint64(0)
@@ -3509,7 +3509,7 @@ func (qv *queryView[K, V]) pickCountLeadPredicate(preds predicateReader, univers
 	return leadIdx, leadEst, leadScore
 }
 
-func (qv *queryView[K, V]) pickCountORLeadPredicate(preds predicateSet, universe uint64) (int, uint64, uint64) {
+func (qv *queryView) pickCountORLeadPredicate(preds predicateSet, universe uint64) (int, uint64, uint64) {
 	leadIdx := -1
 	leadEst := uint64(0)
 	leadScore := uint64(0)
@@ -3547,7 +3547,7 @@ func (qv *queryView[K, V]) pickCountORLeadPredicate(preds predicateSet, universe
 //
 // The path is intentionally conservative: it is enabled only for bounded OR
 // shapes where lead-driven probing is usually cheaper than full postingResult union.
-func (qv *queryView[K, V]) tryCountORByPredicates(expr qir.Expr, trace *queryTrace) (uint64, bool, error) {
+func (qv *queryView) tryCountORByPredicates(expr qir.Expr, trace *queryTrace) (uint64, bool, error) {
 	if !shouldTryCountORByPredicates(expr) {
 		return 0, false, nil
 	}
@@ -3941,7 +3941,7 @@ branchLoop:
 	return cnt, true, nil
 }
 
-func (qv *queryView[K, V]) countPreparedExpr(expr qir.Expr) (uint64, error) {
+func (qv *queryView) countPreparedExpr(expr qir.Expr) (uint64, error) {
 	if cnt, ok, err := qv.tryCountPreparedAndReordered(expr); ok || err != nil {
 		return cnt, err
 	}
@@ -4051,7 +4051,7 @@ func countLeafPlanSeedsCustomMaterialization(plan countLeafPlan) bool {
 	return plan.expr.Op == qir.OpSUFFIX || plan.expr.Op == qir.OpCONTAINS
 }
 
-func (qv *queryView[K, V]) reorderCountEvalAndPositivePlans(plans []countLeafPlan, pos []int) {
+func (qv *queryView) reorderCountEvalAndPositivePlans(plans []countLeafPlan, pos []int) {
 	if len(pos) <= 1 {
 		return
 	}
@@ -4081,7 +4081,7 @@ func (qv *queryView[K, V]) reorderCountEvalAndPositivePlans(plans []countLeafPla
 	pos[0] = cur
 }
 
-func (qv *queryView[K, V]) applyAndPostingResultExpr(acc *postingResult, hasAcc *bool, expr qir.Expr) (bool, error) {
+func (qv *queryView) applyAndPostingResultExpr(acc *postingResult, hasAcc *bool, expr qir.Expr) (bool, error) {
 	if *hasAcc {
 		if !acc.neg && !acc.ids.IsEmpty() && expr.FieldOrdinal >= 0 {
 			usePostingApply := false
@@ -4155,7 +4155,7 @@ func (qv *queryView[K, V]) applyAndPostingResultExpr(acc *postingResult, hasAcc 
 	return false, nil
 }
 
-func (qv *queryView[K, V]) tryCountPreparedAndReordered(expr qir.Expr) (uint64, bool, error) {
+func (qv *queryView) tryCountPreparedAndReordered(expr qir.Expr) (uint64, bool, error) {
 	if expr.Not || expr.Op != qir.OpAND || len(expr.Operands) < 2 {
 		return 0, false, nil
 	}
@@ -4239,7 +4239,7 @@ func (qv *queryView[K, V]) tryCountPreparedAndReordered(expr qir.Expr) (uint64, 
 	return cnt, true, nil
 }
 
-func (qv *queryView[K, V]) countPostingResult(b postingResult) uint64 {
+func (qv *queryView) countPostingResult(b postingResult) uint64 {
 	if b.neg {
 		if b.ids.IsEmpty() {
 			return qv.snapshotUniverseCardinality()

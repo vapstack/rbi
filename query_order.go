@@ -2,7 +2,6 @@ package rbi
 
 import (
 	"reflect"
-	"unsafe"
 
 	"github.com/vapstack/rbi/internal/posting"
 	"github.com/vapstack/rbi/internal/qir"
@@ -22,7 +21,7 @@ func shouldUseOnePassIntersectionPosting(a posting.List, b posting.List, need ui
 	return minCard <= iteratorThreshold*4
 }
 
-func emitArrayCountZeroBucket[K ~uint64 | ~string, V any](cursor *queryCursor[K, V], resultBM posting.List, nonEmpty posting.List) bool {
+func emitArrayCountZeroBucket(cursor *queryCursor, resultBM posting.List, nonEmpty posting.List) bool {
 	if resultBM.IsEmpty() {
 		return false
 	}
@@ -122,31 +121,31 @@ func tmpIntersectPosting(tmp posting.List, a posting.List, b posting.List) posti
 	return builder.finish(false)
 }
 
-func makeOutSlice[K ~int64 | ~uint64 | ~string](cardinality, limit uint64) []K {
-	var out []K
+func makeOutSlice(cardinality, limit uint64) []uint64 {
+	var out []uint64
 	if limit > 0 {
-		out = make([]K, 0, min(limit, cardinality))
+		out = make([]uint64, 0, min(limit, cardinality))
 	} else {
-		out = make([]K, 0, cardinality)
+		out = make([]uint64, 0, cardinality)
 	}
 	return out
 }
 
-func shouldMaterializeOrderedAllNumericBuckets[K ~uint64 | ~string, V any](
-	qv *queryView[K, V],
+func shouldMaterializeOrderedAllNumericBuckets(
+	qv *queryView,
 	skip uint64,
 	all bool,
 	resultCard uint64,
 ) bool {
-	return !qv.strkey && all && skip == 0 && resultCard >= 64_000
+	return !qv.strKey && all && skip == 0 && resultCard >= 64_000
 }
 
-func appendMaterializedNumericPostingKeys[K ~uint64 | ~string](out []K, ids posting.List) []K {
+func appendMaterializedNumericPostingKeys(out []uint64, ids posting.List) []uint64 {
 	if ids.IsEmpty() {
 		return out
 	}
 	if idx, ok := ids.TrySingle(); ok {
-		return append(out, *(*K)(unsafe.Pointer(&idx)))
+		return append(out, idx)
 	}
 	card := int(ids.Cardinality())
 	if card == 0 {
@@ -154,20 +153,19 @@ func appendMaterializedNumericPostingKeys[K ~uint64 | ~string](out []K, ids post
 	}
 	base := len(out)
 	out = out[:base+card]
-	dst := unsafe.Slice((*uint64)(unsafe.Pointer(&out[base])), card)
 	it := ids.Iter()
 	for i := 0; i < card; i++ {
-		dst[i] = it.Next()
+		out[base+i] = it.Next()
 	}
 	it.Release()
 	return out
 }
 
-func appendMaterializedNumericPostingResultKeys[K ~uint64 | ~string](
-	out []K,
+func appendMaterializedNumericPostingResultKeys(
+	out []uint64,
 	ids posting.List,
 	result postingResult,
-) []K {
+) []uint64 {
 	if ids.IsEmpty() {
 		return out
 	}
@@ -183,9 +181,9 @@ func appendMaterializedNumericPostingResultKeys[K ~uint64 | ~string](
 	return out
 }
 
-func emitPostingResultBucketToCursor[K ~uint64 | ~string, V any](
-	qv *queryView[K, V],
-	cursor *queryCursor[K, V],
+func emitPostingResultBucketToCursor(
+	qv *queryView,
+	cursor *queryCursor,
 	tmp posting.List,
 	ids posting.List,
 	result postingResult,
@@ -219,14 +217,14 @@ func shouldUseOnePassPostingResultFilter(ids posting.List, result postingResult,
 	return shouldUseOnePassIntersectionPosting(ids, result.ids, need, all)
 }
 
-func (qv *queryView[K, V]) postingResultCardinality(result postingResult) uint64 {
+func (qv *queryView) postingResultCardinality(result postingResult) uint64 {
 	if !result.neg {
 		return result.ids.Cardinality()
 	}
 	return qv.snapshotUniverseCardinality() - result.ids.Cardinality()
 }
 
-func (qv *queryView[K, V]) forEachPostingResultBucket(ids posting.List, result postingResult, fn func(uint64) bool) bool {
+func (qv *queryView) forEachPostingResultBucket(ids posting.List, result postingResult, fn func(uint64) bool) bool {
 	if ids.IsEmpty() {
 		return false
 	}
@@ -248,7 +246,7 @@ func (qv *queryView[K, V]) forEachPostingResultBucket(ids posting.List, result p
 	return false
 }
 
-func (qv *queryView[K, V]) forEachPostingResultAll(result postingResult, fn func(uint64) bool) bool {
+func (qv *queryView) forEachPostingResultAll(result postingResult, fn func(uint64) bool) bool {
 	if !result.neg {
 		it := result.ids.Iter()
 		defer it.Release()
@@ -274,7 +272,7 @@ func (qv *queryView[K, V]) forEachPostingResultAll(result postingResult, fn func
 	return false
 }
 
-func (qv *queryView[K, V]) emitArrayCountZeroBucketResult(cursor *queryCursor[K, V], result postingResult, nonEmpty posting.List) bool {
+func (qv *queryView) emitArrayCountZeroBucketResult(cursor *queryCursor, result postingResult, nonEmpty posting.List) bool {
 	if !result.neg {
 		return emitArrayCountZeroBucket(cursor, result.ids, nonEmpty)
 	}
@@ -324,7 +322,7 @@ func (qv *queryView[K, V]) emitArrayCountZeroBucketResult(cursor *queryCursor[K,
 	return false
 }
 
-func (qv *queryView[K, V]) queryOrderBasic(result postingResult, ov fieldOverlay, o qir.Order, skip, need uint64, all bool) ([]K, error) {
+func (qv *queryView) queryOrderBasic(result postingResult, ov fieldOverlay, o qir.Order, skip, need uint64, all bool) ([]uint64, error) {
 	resultCard := qv.postingResultCardinality(result)
 	if resultCard == 0 {
 		return nil, nil
@@ -337,7 +335,7 @@ func (qv *queryView[K, V]) queryOrderBasic(result postingResult, ov fieldOverlay
 
 	var tmp posting.List
 
-	out := makeOutSlice[K](resultCard, need)
+	out := makeOutSlice(resultCard, need)
 	if !isSliceOrderField && shouldMaterializeOrderedAllNumericBuckets(qv, skip, all, resultCard) {
 		br := ov.rangeForBounds(rangeBounds{has: true})
 		cur := ov.newCursor(br, o.Desc)
@@ -471,7 +469,7 @@ func scalarArrayPosPriorityCoversAllResultsOverlay(resultBM posting.List, ov, ni
 	return !nilOV.lookupPostingRetained(nilIndexEntryKey).Intersects(resultBM)
 }
 
-func (qv *queryView[K, V]) queryOrderArrayPosOverlay(result postingResult, ov fieldOverlay, o qir.Order, skip, need uint64, all bool) ([]K, error) {
+func (qv *queryView) queryOrderArrayPosOverlay(result postingResult, ov fieldOverlay, o qir.Order, skip, need uint64, all bool) ([]uint64, error) {
 	resultCard := qv.postingResultCardinality(result)
 	if resultCard == 0 {
 		return nil, nil
@@ -485,7 +483,7 @@ func (qv *queryView[K, V]) queryOrderArrayPosOverlay(result postingResult, ov fi
 		return qv.queryOrderArrayPosScalarOverlay(result, qv.fieldNameByOrdinal(o.FieldOrdinal), o.FieldOrdinal, ov, vals, o.Desc, skip, need, all)
 	}
 
-	out := makeOutSlice[K](resultCard, need)
+	out := makeOutSlice(resultCard, need)
 	var tmp posting.List
 	cursor := qv.newQueryCursor(out, skip, need, all, queryCursorDedupeCap(resultCard, skip, need, all))
 	defer cursor.release()
@@ -516,7 +514,7 @@ func (qv *queryView[K, V]) queryOrderArrayPosOverlay(result postingResult, ov fi
 	return cursor.out, nil
 }
 
-func (qv *queryView[K, V]) queryOrderArrayPosScalarOverlay(result postingResult, field string, fieldOrdinal int, ov fieldOverlay, vals []string, desc bool, skip, need uint64, all bool) ([]K, error) {
+func (qv *queryView) queryOrderArrayPosScalarOverlay(result postingResult, field string, fieldOrdinal int, ov fieldOverlay, vals []string, desc bool, skip, need uint64, all bool) ([]uint64, error) {
 	resultCard := qv.postingResultCardinality(result)
 	if resultCard == 0 {
 		return nil, nil
@@ -532,7 +530,7 @@ func (qv *queryView[K, V]) queryOrderArrayPosScalarOverlay(result postingResult,
 	needFallback := result.neg || !coversAll
 	needSeen := needFallback && len(orderedVals) > 0
 
-	out := makeOutSlice[K](resultCard, need)
+	out := makeOutSlice(resultCard, need)
 	if !needFallback &&
 		!result.neg &&
 		shouldMaterializeOrderedAllNumericBuckets(qv, skip, all, resultCard) {
@@ -575,7 +573,7 @@ func (qv *queryView[K, V]) queryOrderArrayPosScalarOverlay(result postingResult,
 	return cursor.out, nil
 }
 
-func (qv *queryView[K, V]) orderDataValues(v any, fm *field) ([]string, error) {
+func (qv *queryView) orderDataValues(v any, fm *field) ([]string, error) {
 	if vals, ok := v.([]string); ok {
 		return vals, nil
 	}
@@ -617,13 +615,13 @@ func (qv *queryView[K, V]) orderDataValues(v any, fm *field) ([]string, error) {
 	return []string{key}, nil
 }
 
-func (qv *queryView[K, V]) queryOrderArrayCount(result postingResult, s []index, o qir.Order, skip, need uint64, all bool, useZeroComplement bool) ([]K, error) {
+func (qv *queryView) queryOrderArrayCount(result postingResult, s []index, o qir.Order, skip, need uint64, all bool, useZeroComplement bool) ([]uint64, error) {
 	resultCard := qv.postingResultCardinality(result)
 	if resultCard == 0 {
 		return nil, nil
 	}
 
-	out := makeOutSlice[K](resultCard, need)
+	out := makeOutSlice(resultCard, need)
 
 	var tmp posting.List
 

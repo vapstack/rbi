@@ -552,15 +552,15 @@ func (s *indexSnapshot) getNumericRangeBucketCacheEntry(field string, ordinal in
 	return entry
 }
 
-func (qv *queryView[K, V]) numericRangeFieldOrdinal(field string) (int, bool) {
-	acc, ok := qv.root.indexedFieldByName[field]
+func (qv *queryView) numericRangeFieldOrdinal(field string) (int, bool) {
+	acc, ok := qv.engine.indexedFieldMap[field]
 	if !ok {
 		return 0, false
 	}
 	return acc.ordinal, true
 }
 
-func (qv *queryView[K, V]) numericRangeBucketCacheEntry(field string, storage fieldIndexStorage, bucketSize, minFieldKeys int) *numericRangeBucketCacheEntry {
+func (qv *queryView) numericRangeBucketCacheEntry(field string, storage fieldIndexStorage, bucketSize, minFieldKeys int) *numericRangeBucketCacheEntry {
 	ordinal, ok := qv.numericRangeFieldOrdinal(field)
 	if !ok {
 		return nil
@@ -568,7 +568,7 @@ func (qv *queryView[K, V]) numericRangeBucketCacheEntry(field string, storage fi
 	return qv.snap.getNumericRangeBucketCacheEntry(field, ordinal, storage, bucketSize, minFieldKeys)
 }
 
-func (qv *queryView[K, V]) tryEvalNumericRangeBuckets(field string, fm *field, ov fieldOverlay, br overlayRange) (postingResult, bool) {
+func (qv *queryView) tryEvalNumericRangeBuckets(field string, fm *field, ov fieldOverlay, br overlayRange) (postingResult, bool) {
 	if !fieldUsesOrderedNumericKeys(fm) {
 		return postingResult{}, false
 	}
@@ -661,7 +661,7 @@ func (qv *queryView[K, V]) tryEvalNumericRangeBuckets(field string, fm *field, o
 	return postingResult{ids: res}, true
 }
 
-func (qv *queryView[K, V]) tryLoadNumericRangeBuckets(field string, fm *field, ov fieldOverlay, br overlayRange) (postingResult, bool) {
+func (qv *queryView) tryLoadNumericRangeBuckets(field string, fm *field, ov fieldOverlay, br overlayRange) (postingResult, bool) {
 	if !fieldUsesOrderedNumericKeys(fm) {
 		return postingResult{}, false
 	}
@@ -733,7 +733,7 @@ func (qv *queryView[K, V]) tryLoadNumericRangeBuckets(field string, fm *field, o
 	return postingResult{ids: res}, true
 }
 
-func (qv *queryView[K, V]) tryCountSnapshotNumericRange(field string, fm *field, ov fieldOverlay, start, end int) (uint64, bool) {
+func (qv *queryView) tryCountSnapshotNumericRange(field string, fm *field, ov fieldOverlay, start, end int) (uint64, bool) {
 	if !fieldUsesOrderedNumericKeys(fm) {
 		return 0, false
 	}

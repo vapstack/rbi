@@ -37,7 +37,7 @@ func TestPrepareCountExpr_TrimmedManualOpNameRejected(t *testing.T) {
 }
 
 func TestPrepareQuery_TrimmedManualOrderOpNameRejected(t *testing.T) {
-	_, err := PrepareQueryResolved(&qx.QX{
+	_, err := PrepareQuery(&qx.QX{
 		Filter: qx.EQ("status", "active"),
 		Order: []qx.Order{{
 			By: qx.Expr{
@@ -72,7 +72,7 @@ func TestPrepareCountExpr_MalformedKindNoneRejected(t *testing.T) {
 }
 
 func TestPrepareQuery_POSScalarStringRejected(t *testing.T) {
-	_, err := PrepareQueryResolved(
+	_, err := PrepareQuery(
 		qx.Query().SortBy(qx.POS("status", "alice bob"), qx.ASC),
 		testPrepareFieldResolver,
 	)

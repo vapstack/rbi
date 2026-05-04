@@ -43,7 +43,7 @@ func benchmarkPrepareQuery(b *testing.B, q *qx.QX) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for b.Loop() {
-		prepared, err := PrepareQueryResolved(q, prepareBenchFieldOrdinals)
+		prepared, err := PrepareQuery(q, prepareBenchFieldOrdinals)
 		if err != nil {
 			b.Fatal(err)
 		}

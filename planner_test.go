@@ -417,8 +417,8 @@ func TestPlannerCalibration_QueryViewUsesRootSnapshot(t *testing.T) {
 	view := db.makeQueryView(db.getSnapshot())
 	defer db.releaseQueryView(view)
 
-	assertApproxMultiplier(t, view.root.plannerCostMultiplier(plannerCalOrdered), 0.73)
-	assertApproxMultiplier(t, view.root.plannerCostMultiplier(plannerCalLimitOrderBasic), 1.41)
+	assertApproxMultiplier(t, view.engine.plannerCostMultiplier(plannerCalOrdered), 0.73)
+	assertApproxMultiplier(t, view.engine.plannerCostMultiplier(plannerCalLimitOrderBasic), 1.41)
 }
 
 func TestPlannerCalibration_DisabledUsesManualSnapshot(t *testing.T) {
@@ -444,8 +444,8 @@ func TestPlannerCalibration_DisabledUsesManualSnapshot(t *testing.T) {
 	view := db.makeQueryView(db.getSnapshot())
 	defer db.releaseQueryView(view)
 
-	assertApproxMultiplier(t, view.root.plannerCostMultiplier(plannerCalOrdered), 0.73)
-	assertApproxMultiplier(t, view.root.plannerCostMultiplier(plannerCalLimitOrderBasic), 1.41)
+	assertApproxMultiplier(t, view.engine.plannerCostMultiplier(plannerCalOrdered), 0.73)
+	assertApproxMultiplier(t, view.engine.plannerCostMultiplier(plannerCalLimitOrderBasic), 1.41)
 	if db.traceOrCalibrationSamplingEnabled() {
 		t.Fatalf("expected online calibration sampling to remain disabled")
 	}
@@ -461,8 +461,8 @@ func TestPlannerCalibration_DisabledWithoutSnapshotUsesIdentityMultiplier(t *tes
 	view := db.makeQueryView(db.getSnapshot())
 	defer db.releaseQueryView(view)
 
-	assertApproxMultiplier(t, view.root.plannerCostMultiplier(plannerCalOrdered), 1.0)
-	assertApproxMultiplier(t, view.root.plannerCostMultiplier(plannerCalLimitOrderBasic), 1.0)
+	assertApproxMultiplier(t, view.engine.plannerCostMultiplier(plannerCalOrdered), 1.0)
+	assertApproxMultiplier(t, view.engine.plannerCostMultiplier(plannerCalLimitOrderBasic), 1.0)
 	if _, ok := db.GetCalibrationSnapshot(); ok {
 		t.Fatalf("expected no calibration snapshot when online calibration is disabled and nothing was loaded")
 	}
@@ -850,7 +850,7 @@ func TestPlannerCalibration_AutoPersist_DisabledUsesFrozenState(t *testing.T) {
 
 	view := db2.makeQueryView(db2.getSnapshot())
 	defer db2.releaseQueryView(view)
-	assertApproxMultiplier(t, view.root.plannerCostMultiplier(plannerCalOrdered), 1.42)
+	assertApproxMultiplier(t, view.engine.plannerCostMultiplier(plannerCalOrdered), 1.42)
 	if db2.traceOrCalibrationSamplingEnabled() {
 		t.Fatalf("expected online calibration sampling to remain disabled")
 	}

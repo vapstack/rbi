@@ -124,7 +124,7 @@ func (db *DB[K, V]) collectPlannerFieldStatsFromOverlay(s *indexSnapshot, fieldN
 		return PlannerFieldStats{}, err
 	}
 
-	acc, ok := db.indexedFieldByName[fieldName]
+	acc, ok := db.indexedFieldMap[fieldName]
 	if !ok || s.index == nil || acc.ordinal >= s.index.Len() {
 		return PlannerFieldStats{}, nil
 	}
@@ -361,7 +361,7 @@ func (db *DB[K, V]) buildPlannerStatsSnapshotLocked(version uint64) *plannerStat
 	}
 
 	for _, fieldName := range fields {
-		acc, ok := db.indexedFieldByName[fieldName]
+		acc, ok := db.indexedFieldMap[fieldName]
 		if !ok || snap.index == nil || acc.ordinal >= snap.index.Len() {
 			continue
 		}

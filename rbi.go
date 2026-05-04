@@ -378,10 +378,10 @@ func New[K ~uint64 | ~string, V any](bolt *bbolt.DB, options Options, execOpts .
 	db = &DB[K, V]{
 		bolt:   bolt,
 		vtype:  vtype,
-		strmap: newStrMapper(0, defaultSnapshotStrMapCompactDepth),
+		strMap: newStrMapper(0, defaultSnapshotStrMapCompactDepth),
 		bucket: []byte(vname),
 
-		fields:        make(map[string]*field),
+		indexFields:   make(map[string]*field),
 		measureFields: make(map[string]*field),
 
 		universe: posting.List{},
@@ -393,32 +393,33 @@ func New[K ~uint64 | ~string, V any](bolt *bbolt.DB, options Options, execOpts .
 		logger:      options.Logger,
 		encodeFn:    encodeFn,
 		decodeFn:    decodeFn,
-		snapshot: snapshot{
+		snapshot: &snapshotManager{
 			bySeq:        make(map[uint64]*snapshotRef, 128),
 			statsEnabled: options.EnableSnapshotStats,
 		},
 
-		planner: planner{
-			analyzer: analyzer{
+		planner: &planner{
+			analyzer: &analyzer{
 				interval:   plannerAnalyzeInterval(options.AnalyzeInterval),
 				softBudget: defaultAnalyzeSoftBudget,
 			},
-			tracer: tracer{
+			tracer: &tracer{
 				sink:        options.TraceSink,
 				sampleEvery: traceSampleEvery(options.TraceSampleEvery, options.TraceSink),
 			},
-			calibrator: calibrator{
+			calibrator: &calibrator{
 				enabled:     options.CalibrationEnabled,
 				sampleEvery: calibrationSampleEvery(options.CalibrationEnabled, options.CalibrationSampleEvery),
 				persistPath: calPath,
 			},
 		},
+		rebuilder: new(rebuilder),
 	}
 	db.rebuilder.cond = sync.NewCond(&db.rebuilder.mu)
 
 	var k K
 	if reflect.TypeOf(k).Kind() == reflect.String {
-		db.strkey = true
+		db.strKey = true
 	}
 
 	if err = db.populateFields(vtype, nil); err != nil {
@@ -432,7 +433,7 @@ func New[K ~uint64 | ~string, V any](bolt *bbolt.DB, options Options, execOpts .
 	}
 	db.transparent = len(db.indexedFieldAccess) == 0 && len(db.measureFields) == 0
 	if db.transparent {
-		db.strmap = nil
+		db.strMap = nil
 		db.index = nil
 		db.nilIndex = nil
 		db.lenIndex = nil
@@ -449,6 +450,7 @@ func New[K ~uint64 | ~string, V any](bolt *bbolt.DB, options Options, execOpts .
 		db.measure = measureFieldStorageSlicePool.Get()
 		db.measure.SetLen(len(db.measureFieldAccess))
 	}
+	db.initQueryEngine()
 	db.initBatcher()
 
 	err = bolt.Update(func(tx *bbolt.Tx) error {
@@ -489,7 +491,7 @@ func New[K ~uint64 | ~string, V any](bolt *bbolt.DB, options Options, execOpts .
 
 		loadedOrdinaryFieldCount = len(skipFields)
 		loadedFieldCount = loadedOrdinaryFieldCount + len(skipMeasureFields)
-		totalFieldCount := len(db.fields) + len(db.measureFields)
+		totalFieldCount := len(db.indexFields) + len(db.measureFields)
 		if rebuildReason != "" {
 			buildMode = "full"
 			db.logger.Printf("rbi: %s", rebuildReason)
@@ -529,7 +531,7 @@ func New[K ~uint64 | ~string, V any](bolt *bbolt.DB, options Options, execOpts .
 	}
 	db.initPatchFieldAccessors()
 
-	for name := range db.fields {
+	for name := range db.indexFields {
 		db.fieldSlice = append(db.fieldSlice, name)
 	}
 	for name := range db.measureFields {
@@ -541,7 +543,7 @@ func New[K ~uint64 | ~string, V any](bolt *bbolt.DB, options Options, execOpts .
 			return nil, fmt.Errorf("failed to publish initial snapshot: %w", err)
 		}
 
-		if loadedPlannerStats != nil && loadedOrdinaryFieldCount == len(db.fields) {
+		if loadedPlannerStats != nil && loadedOrdinaryFieldCount == len(db.indexFields) {
 			db.publishLoadedPlannerStats(loadedPlannerStats)
 		} else {
 			if err = db.RefreshPlannerStats(); err != nil {
@@ -559,28 +561,42 @@ func New[K ~uint64 | ~string, V any](bolt *bbolt.DB, options Options, execOpts .
 	return db, nil
 }
 
+func (db *DB[K, V]) initQueryEngine() {
+	db.engine = &queryEngine{
+		strkey:             db.strKey,
+		fields:             db.indexFields,
+		indexedFieldAccess: db.indexedFieldAccess,
+		indexedFieldMap:    db.indexedFieldMap,
+		measureFieldAccess: db.measureFieldAccess,
+		measureFieldMap:    db.measureFieldMap,
+		planner:            db.planner,
+		options:            db.options,
+		viewPool:           new(pooled.Pointers[queryView]),
+	}
+}
+
 func (db *DB[K, V]) initIndexedFieldAccessors() error {
-	if len(db.fields) == 0 {
+	if len(db.indexFields) == 0 {
 		db.indexedFieldAccess = nil
 		db.indexedStringValidationAccess = nil
-		db.indexedFieldByName = nil
+		db.indexedFieldMap = nil
 		db.uniqueFieldAccessors = nil
 		return nil
 	}
 
-	db.indexedFieldAccess = make([]indexedFieldAccessor, 0, len(db.fields))
-	db.indexedStringValidationAccess = make([]indexedFieldAccessor, 0, len(db.fields))
-	db.indexedFieldByName = make(map[string]indexedFieldAccessor, len(db.fields))
+	db.indexedFieldAccess = make([]indexedFieldAccessor, 0, len(db.indexFields))
+	db.indexedStringValidationAccess = make([]indexedFieldAccessor, 0, len(db.indexFields))
+	db.indexedFieldMap = make(map[string]indexedFieldAccessor, len(db.indexFields))
 	db.uniqueFieldAccessors = make([]indexedFieldAccessor, 0, 4)
 
-	names := make([]string, 0, len(db.fields))
-	for name := range db.fields {
+	names := make([]string, 0, len(db.indexFields))
+	for name := range db.indexFields {
 		names = append(names, name)
 	}
 	slices.Sort(names)
 
 	for _, name := range names {
-		f := db.fields[name]
+		f := db.indexFields[name]
 		acc, err := db.makeIndexedFieldAccessor(f)
 		if err != nil {
 			return err
@@ -590,7 +606,7 @@ func (db *DB[K, V]) initIndexedFieldAccessors() error {
 		if f.UseVI || f.Kind == reflect.String {
 			db.indexedStringValidationAccess = append(db.indexedStringValidationAccess, acc)
 		}
-		db.indexedFieldByName[f.DBName] = acc
+		db.indexedFieldMap[f.DBName] = acc
 		if f.Unique && !f.Slice {
 			db.uniqueFieldAccessors = append(db.uniqueFieldAccessors, acc)
 		}
@@ -665,7 +681,7 @@ func (db *DB[K, V]) initBatcher() {
 	if maxQueue > 0 && maxQueue < capHint {
 		capHint = maxQueue
 	}
-	db.autoBatcher = autoBatcher[K, V]{
+	db.autoBatcher = &autoBatcher[K, V]{
 		statsEnabled: db.options.EnableAutoBatchStats,
 		window:       window,
 		maxOps:       maxOps,
@@ -769,9 +785,9 @@ type planner struct {
 	statsVersion atomic.Uint64
 	stats        atomic.Pointer[plannerStatsSnapshot]
 
-	analyzer   analyzer
-	tracer     tracer
-	calibrator calibrator
+	analyzer   *analyzer
+	tracer     *tracer
+	calibrator *calibrator
 }
 
 type analyzer struct {
@@ -800,7 +816,7 @@ type calibrator struct {
 	sync.Mutex
 }
 
-type snapshot struct {
+type snapshotManager struct {
 	current      atomic.Pointer[indexSnapshot]
 	currentRef   atomic.Pointer[snapshotRef]
 	statsEnabled bool
@@ -905,24 +921,26 @@ type (
 
 		bucket []byte
 
-		strkey      bool
+		strKey bool
+		strMap *strMapper
+
 		transparent bool
-		strmap      *strMapper
 
 		universe posting.List
 
-		fields         map[string]*field
-		measureFields  map[string]*field
+		indexFields   map[string]*field
+		measureFields map[string]*field
+
 		fieldSlice     []string
 		hasUnique      bool
 		lenIndexLoaded bool
 
 		indexedFieldAccess            []indexedFieldAccessor
 		indexedStringValidationAccess []indexedFieldAccessor
-		indexedFieldByName            map[string]indexedFieldAccessor
+		indexedFieldMap               indexedFieldMap
 		uniqueFieldAccessors          []indexedFieldAccessor
 		measureFieldAccess            []measureFieldAccessor
-		measureFieldByName            map[string]measureFieldAccessor
+		measureFieldMap               measureFieldMap
 		index                         *pooled.SliceBuf[fieldIndexStorage]
 		nilIndex                      *pooled.SliceBuf[fieldIndexStorage]
 		lenIndex                      *pooled.SliceBuf[fieldIndexStorage]
@@ -932,10 +950,11 @@ type (
 		patchFieldAccess              []patchFieldAccessor
 		patchFieldOrdinal             map[string]int
 
-		planner     planner
-		snapshot    snapshot
-		autoBatcher autoBatcher[K, V]
-		rebuilder   rebuilder
+		planner     *planner
+		engine      *queryEngine
+		snapshot    *snapshotManager
+		autoBatcher *autoBatcher[K, V]
+		rebuilder   *rebuilder
 		logger      *log.Logger
 
 		options     *Options
@@ -946,8 +965,7 @@ type (
 		encodeFn func(*V, io.Writer) error
 		decodeFn func(*V, io.Reader) error
 
-		recPool  pooled.Pointers[V]
-		viewPool pooled.Pointers[queryView[K, V]]
+		recPool pooled.Pointers[V]
 
 		mu     sync.RWMutex
 		closed atomic.Bool
@@ -956,13 +974,16 @@ type (
 		stats Stats[K]
 
 		traceRoot *DB[K, V]
-		testHooks testHooks
+		testHooks *testHooks
 	}
 
 	index struct {
 		Key indexKey
 		IDs posting.List
 	}
+
+	indexedFieldMap map[string]indexedFieldAccessor
+	measureFieldMap map[string]measureFieldAccessor
 
 	// PlannerStats contains planner snapshot metadata, per-field stats and sampling settings.
 	PlannerStats struct {
@@ -1208,6 +1229,14 @@ type (
 	}
 )
 
+func (m indexedFieldMap) ResolveField(name string) (int, bool) {
+	acc, ok := m[name]
+	if !ok {
+		return 0, false
+	}
+	return acc.ordinal, true
+}
+
 // DisableSync disables fsync for bolt writes. Can help with batch inserts.
 // It should not be used during normal operation.
 func (db *DB[K, V]) DisableSync() { db.bolt.NoSync = true }
@@ -1349,17 +1378,21 @@ func (db *DB[K, V]) tripBrokenLocked(op string, cause any) error {
 
 func (db *DB[K, V]) publishAfterCommitLocked(seq uint64, op string, publish func()) (err error) {
 	defer recoverPublishAfterCommit(db, seq, op, &err)
-	if hook := db.testHooks.afterCommitPublish; hook != nil {
-		hook(op)
+	if db.testHooks != nil {
+		if hook := db.testHooks.afterCommitPublish; hook != nil {
+			hook(op)
+		}
 	}
 	publish()
 	return nil
 }
 
 func (db *DB[K, V]) commit(tx *bbolt.Tx, op string) error {
-	if hook := db.testHooks.beforeCommit; hook != nil {
-		if err := hook(op); err != nil {
-			return err
+	if db.testHooks != nil {
+		if hook := db.testHooks.beforeCommit; hook != nil {
+			if err := hook(op); err != nil {
+				return err
+			}
 		}
 	}
 	return tx.Commit()
@@ -1457,7 +1490,7 @@ func (db *DB[K, V]) statsLastKeyFromSnapshot(snap *indexSnapshot, keyCount uint6
 
 func (db *DB[K, V]) statsKeyFromIdx(snap *indexSnapshot, idx uint64) K {
 	var zero K
-	if db.strkey {
+	if db.strKey {
 		if snap == nil || snap.strmap == nil {
 			return zero
 		}
@@ -1892,7 +1925,7 @@ func (db *DB[K, V]) Truncate() error {
 	nextMeasure.SetLen(len(db.measureFieldAccess))
 	nextUniverse := posting.List{}
 	var nextStrMap *strMapSnapshot
-	if db.strkey {
+	if db.strKey {
 		nextStrMap = &strMapSnapshot{}
 	}
 	snap := &indexSnapshot{
@@ -1902,7 +1935,7 @@ func (db *DB[K, V]) Truncate() error {
 		lenIndex:           nextLenIndex,
 		lenZeroComplement:  nextLenZeroComplement,
 		measure:            nextMeasure,
-		indexedFieldByName: db.indexedFieldByName,
+		indexedFieldByName: db.indexedFieldMap,
 		universe:           nextUniverse,
 		strmap:             nextStrMap,
 	}
@@ -1913,7 +1946,7 @@ func (db *DB[K, V]) Truncate() error {
 		return fmt.Errorf("commit error: %w", err)
 	}
 
-	db.strmap.truncate()
+	db.strMap.truncate()
 	db.index = nextIndex
 	db.nilIndex = nextNilIndex
 	db.lenIndex = nextLenIndex

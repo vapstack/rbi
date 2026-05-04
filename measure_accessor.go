@@ -31,12 +31,12 @@ type measureFieldAccessor struct {
 func (db *DB[K, V]) initMeasureFieldAccessors() error {
 	if len(db.measureFields) == 0 {
 		db.measureFieldAccess = nil
-		db.measureFieldByName = nil
+		db.measureFieldMap = nil
 		return nil
 	}
 
 	db.measureFieldAccess = make([]measureFieldAccessor, 0, len(db.measureFields))
-	db.measureFieldByName = make(map[string]measureFieldAccessor, len(db.measureFields))
+	db.measureFieldMap = make(map[string]measureFieldAccessor, len(db.measureFields))
 
 	names := make([]string, 0, len(db.measureFields))
 	for name := range db.measureFields {
@@ -52,7 +52,7 @@ func (db *DB[K, V]) initMeasureFieldAccessors() error {
 		}
 		acc.ordinal = len(db.measureFieldAccess)
 		db.measureFieldAccess = append(db.measureFieldAccess, acc)
-		db.measureFieldByName[f.DBName] = acc
+		db.measureFieldMap[f.DBName] = acc
 	}
 	return nil
 }

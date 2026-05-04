@@ -176,7 +176,7 @@ func (a *plannerOROrderAnalysis) refreshBranch(branches plannerORBranches, branc
 	a.branches[branchIdx].buildReady = false
 }
 
-func (qv *queryView[K, V]) buildOROrderAnalysis(q *qir.Shape, branches plannerORBranches) (plannerOROrderAnalysis, bool) {
+func (qv *queryView) buildOROrderAnalysis(q *qir.Shape, branches plannerORBranches) (plannerOROrderAnalysis, bool) {
 	var analysis plannerOROrderAnalysis
 	if q == nil || !q.HasOrder {
 		return analysis, false
@@ -247,7 +247,7 @@ func (qv *queryView[K, V]) buildOROrderAnalysis(q *qir.Shape, branches plannerOR
 	return analysis, true
 }
 
-func (qv *queryView[K, V]) decidePlanORNoOrder(q *qir.Shape, branches plannerORBranches) plannerORNoOrderDecision {
+func (qv *queryView) decidePlanORNoOrder(q *qir.Shape, branches plannerORBranches) plannerORNoOrderDecision {
 	var d plannerORNoOrderDecision
 
 	if q.HasOrder {
@@ -293,7 +293,7 @@ func (qv *queryView[K, V]) decidePlanORNoOrder(q *qir.Shape, branches plannerORB
 	expectedRows := estimateRowsForNeed(uint64(need), unionCard, universe)
 	avgChecks := branches.noOrderChecks(&branchCards, branchCount)
 	costKWay := float64(expectedRows) * (1.0 + avgChecks)
-	costKWay *= qv.root.plannerCostMultiplier(plannerCalORNoOrder)
+	costKWay *= qv.engine.plannerCostMultiplier(plannerCalORNoOrder)
 
 	fallbackRows := min(unionCard, uint64(need))
 	costFallback := float64(sumCard) + float64(fallbackRows)
@@ -308,7 +308,7 @@ func (qv *queryView[K, V]) decidePlanORNoOrder(q *qir.Shape, branches plannerORB
 	return d
 }
 
-func (qv *queryView[K, V]) hasNonOrderPrefixTailRisk(branches plannerORBranches, orderField string) bool {
+func (qv *queryView) hasNonOrderPrefixTailRisk(branches plannerORBranches, orderField string) bool {
 	for i := 0; i < branches.Len(); i++ {
 		branch := branches.Get(i)
 		for pi := 0; pi < branch.predLen(); pi++ {
@@ -321,7 +321,7 @@ func (qv *queryView[K, V]) hasNonOrderPrefixTailRisk(branches plannerORBranches,
 	return false
 }
 
-func (qv *queryView[K, V]) decidePlanOROrder(q *qir.Shape, branches plannerORBranches) plannerOROrderDecision {
+func (qv *queryView) decidePlanOROrder(q *qir.Shape, branches plannerORBranches) plannerOROrderDecision {
 	analysis, ok := qv.buildOROrderAnalysis(q, branches)
 	if !ok {
 		return plannerOROrderDecision{plan: plannerOROrderFallback}
@@ -330,7 +330,7 @@ func (qv *queryView[K, V]) decidePlanOROrder(q *qir.Shape, branches plannerORBra
 	return qv.decidePlanOROrderWithAnalysis(q, branches, &analysis)
 }
 
-func (qv *queryView[K, V]) decidePlanOROrderWithAnalysis(
+func (qv *queryView) decidePlanOROrderWithAnalysis(
 	q *qir.Shape,
 	branches plannerORBranches,
 	analysis *plannerOROrderAnalysis,
@@ -385,7 +385,7 @@ func (qv *queryView[K, V]) decidePlanOROrderWithAnalysis(
 	streamChecks := branches.orderStreamChecksByBranch(hasAlwaysTrue, analysis.mergeStats)
 	streamSkew := orderStats.skew()
 	costStream := float64(expectedRows) * streamChecks * streamSkew
-	costStream *= qv.root.plannerCostMultiplier(plannerCalOROrderStream)
+	costStream *= qv.engine.plannerCostMultiplier(plannerCalOROrderStream)
 
 	costFallback := float64(sumCard) + float64(expectedRows)
 	bestPlan := plannerOROrderFallback
@@ -403,7 +403,7 @@ func (qv *queryView[K, V]) decidePlanOROrderWithAnalysis(
 			!branches.hasKWayExactBucketApplyWork(analysis.mergeStats) {
 			costMerge = routeCost.kWay
 		}
-		costMerge *= qv.root.plannerCostMultiplier(plannerCalOROrderMerge)
+		costMerge *= qv.engine.plannerCostMultiplier(plannerCalOROrderMerge)
 		if costMerge <= bestCost*plannerOROrderMergeGain {
 			bestPlan = plannerOROrderMerge
 			bestCost = costMerge
@@ -825,7 +825,7 @@ func (stats PlannerFieldStats) mergeRankRows(candidateUpper, need, universe uint
 	return uint64(rows)
 }
 
-func (qv *queryView[K, V]) plannerOrderFieldStats(field string, snap *plannerStatsSnapshot, universe uint64, distinctFallback uint64) PlannerFieldStats {
+func (qv *queryView) plannerOrderFieldStats(field string, snap *plannerStatsSnapshot, universe uint64, distinctFallback uint64) PlannerFieldStats {
 	if snap != nil {
 		if s, ok := snap.Fields[field]; ok {
 			return s
@@ -994,7 +994,7 @@ type mergedBaseScalarRangeField struct {
 	bounds rangeBounds
 }
 
-func (qv *queryView[K, V]) collectMergedBaseScalarRangeFields(
+func (qv *queryView) collectMergedBaseScalarRangeFields(
 	orderField string,
 	leaves []qir.Expr,
 	dst []mergedBaseScalarRangeField,
@@ -1032,7 +1032,7 @@ func (qv *queryView[K, V]) collectMergedBaseScalarRangeFields(
 	return dst, true
 }
 
-func (qv *queryView[K, V]) collectMergedBaseScalarRangeFieldsBuf(
+func (qv *queryView) collectMergedBaseScalarRangeFieldsBuf(
 	orderField string,
 	leaves *pooled.SliceBuf[qir.Expr],
 	dst []mergedBaseScalarRangeField,
@@ -1071,7 +1071,7 @@ func (qv *queryView[K, V]) collectMergedBaseScalarRangeFieldsBuf(
 	return dst, true
 }
 
-func (qv *queryView[K, V]) estimateMergedScalarRangeOrderCost(
+func (qv *queryView) estimateMergedScalarRangeOrderCost(
 	field string,
 	bounds rangeBounds,
 	universe uint64,
@@ -1131,7 +1131,7 @@ func (qv *queryView[K, V]) estimateMergedScalarRangeOrderCost(
 	return selectivity, fallbackWork, true
 }
 
-func (qv *queryView[K, V]) executionOrderShapeInfo(orderField string, leaves []qir.Expr) (hasOrderPrefix bool, compatible bool) {
+func (qv *queryView) executionOrderShapeInfo(orderField string, leaves []qir.Expr) (hasOrderPrefix bool, compatible bool) {
 	for _, e := range leaves {
 		if e.Op == qir.OpNOOP {
 			if e.Not {
@@ -1162,7 +1162,7 @@ func (qv *queryView[K, V]) executionOrderShapeInfo(orderField string, leaves []q
 	return hasOrderPrefix, true
 }
 
-func (qv *queryView[K, V]) executionOrderShapeInfoBuf(orderField string, leaves *pooled.SliceBuf[qir.Expr]) (hasOrderPrefix bool, compatible bool) {
+func (qv *queryView) executionOrderShapeInfoBuf(orderField string, leaves *pooled.SliceBuf[qir.Expr]) (hasOrderPrefix bool, compatible bool) {
 	for i := 0; i < leaves.Len(); i++ {
 		e := leaves.Get(i)
 		if e.Op == qir.OpNOOP {
@@ -1194,7 +1194,7 @@ func (qv *queryView[K, V]) executionOrderShapeInfoBuf(orderField string, leaves 
 	return hasOrderPrefix, true
 }
 
-func (qv *queryView[K, V]) decideExecutionOrderByCost(q *qir.Shape, leaves []qir.Expr) plannerExecutionOrderDecision {
+func (qv *queryView) decideExecutionOrderByCost(q *qir.Shape, leaves []qir.Expr) plannerExecutionOrderDecision {
 	var d plannerExecutionOrderDecision
 
 	if q.Expr.Not {
@@ -1280,7 +1280,7 @@ func (qv *queryView[K, V]) decideExecutionOrderByCost(q *qir.Shape, leaves []qir
 
 	if profile.selectivity <= 0 {
 		d.expectedProbeRows = 0
-		d.executionCost = 1.0 * qv.root.plannerCostMultiplier(calPlan)
+		d.executionCost = 1.0 * qv.engine.plannerCostMultiplier(calPlan)
 		return d
 	}
 
@@ -1315,14 +1315,14 @@ func (qv *queryView[K, V]) decideExecutionOrderByCost(q *qir.Shape, leaves []qir
 		}
 		executionCost += baseWorkCost
 	}
-	executionCost *= qv.root.plannerCostMultiplier(calPlan)
+	executionCost *= qv.engine.plannerCostMultiplier(calPlan)
 
 	d.expectedProbeRows = uint64(expectedProbeRows)
 	d.executionCost = executionCost
 	return d
 }
 
-func (qv *queryView[K, V]) decideExecutionOrderByCostBuf(q *qir.Shape, leaves *pooled.SliceBuf[qir.Expr]) plannerExecutionOrderDecision {
+func (qv *queryView) decideExecutionOrderByCostBuf(q *qir.Shape, leaves *pooled.SliceBuf[qir.Expr]) plannerExecutionOrderDecision {
 	var d plannerExecutionOrderDecision
 
 	if q.Expr.Not {
@@ -1408,7 +1408,7 @@ func (qv *queryView[K, V]) decideExecutionOrderByCostBuf(q *qir.Shape, leaves *p
 
 	if profile.selectivity <= 0 {
 		d.expectedProbeRows = 0
-		d.executionCost = 1.0 * qv.root.plannerCostMultiplier(calPlan)
+		d.executionCost = 1.0 * qv.engine.plannerCostMultiplier(calPlan)
 		return d
 	}
 
@@ -1443,14 +1443,14 @@ func (qv *queryView[K, V]) decideExecutionOrderByCostBuf(q *qir.Shape, leaves *p
 		}
 		executionCost += baseWorkCost
 	}
-	executionCost *= qv.root.plannerCostMultiplier(calPlan)
+	executionCost *= qv.engine.plannerCostMultiplier(calPlan)
 
 	d.expectedProbeRows = uint64(expectedProbeRows)
 	d.executionCost = executionCost
 	return d
 }
 
-func (qv *queryView[K, V]) shouldPreferExecutionPlan(q *qir.Shape, trace *queryTrace) bool {
+func (qv *queryView) shouldPreferExecutionPlan(q *qir.Shape, trace *queryTrace) bool {
 	if plannerObviousExecutionFastPath(q) {
 		if trace != nil {
 			trace.setEstimated(q.Limit, 1.0, 2.0)
@@ -1670,7 +1670,7 @@ func plannerExecutionNoOrderPrefixProbeShare(restCount int, restSelectivity floa
 	return plannerClampFloat(share, 0.25, 0.65)
 }
 
-func (qv *queryView[K, V]) shouldPreferExecutionNoOrderPrefix(q *qir.Shape, leaves []qir.Expr) bool {
+func (qv *queryView) shouldPreferExecutionNoOrderPrefix(q *qir.Shape, leaves []qir.Expr) bool {
 	if q.Limit == 0 || q.Offset != 0 {
 		return false
 	}
@@ -1779,7 +1779,7 @@ func (qv *queryView[K, V]) shouldPreferExecutionNoOrderPrefix(q *qir.Shape, leav
 	return expectedProbe <= float64(prefixRows)*probeShare
 }
 
-func (qv *queryView[K, V]) decideOrderedByCost(q *qir.Shape, leaves []qir.Expr) plannerOrderedDecision {
+func (qv *queryView) decideOrderedByCost(q *qir.Shape, leaves []qir.Expr) plannerOrderedDecision {
 	var d plannerOrderedDecision
 
 	if !q.HasOrder {
@@ -1914,7 +1914,7 @@ func (qv *queryView[K, V]) decideOrderedByCost(q *qir.Shape, leaves []qir.Expr) 
 		profile.coverage,
 		int(need),
 	)
-	orderedCost *= qv.root.plannerCostMultiplier(plannerCalOrdered)
+	orderedCost *= qv.engine.plannerCostMultiplier(plannerCalOrdered)
 
 	fallbackProbeFactor := plannerOrderedFallbackProbeFactor(orderSkew, profile, q.Offset)
 	fallbackCost := profile.fallbackWorkRows + expectedProbeRows*fallbackProbeFactor + float64(len(leaves))*20.0
@@ -1942,7 +1942,7 @@ func (qv *queryView[K, V]) decideOrderedByCost(q *qir.Shape, leaves []qir.Expr) 
 	return d
 }
 
-func (qv *queryView[K, V]) estimateOrderedAnchorSetupCost(
+func (qv *queryView) estimateOrderedAnchorSetupCost(
 	orderField string,
 	leaves []qir.Expr,
 	snap *plannerStatsSnapshot,
@@ -2097,7 +2097,7 @@ func (qv *queryView[K, V]) estimateOrderedAnchorSetupCost(
 		(1.0 + float64(nonLeadCount)*0.35 + float64(nonLeadRangeLikeCount)*0.25)
 }
 
-func (qv *queryView[K, V]) estimateOrderedProfile(orderField string, leaves []qir.Expr, orderSlice []index, snap *plannerStatsSnapshot, universe uint64) (plannerOrderedProfile, bool) {
+func (qv *queryView) estimateOrderedProfile(orderField string, leaves []qir.Expr, orderSlice []index, snap *plannerStatsSnapshot, universe uint64) (plannerOrderedProfile, bool) {
 	if universe == 0 {
 		return plannerOrderedProfile{}, false
 	}
@@ -2248,7 +2248,7 @@ func (qv *queryView[K, V]) estimateOrderedProfile(orderField string, leaves []qi
 	}, true
 }
 
-func (qv *queryView[K, V]) estimateOrderedProfileBuf(orderField string, leaves *pooled.SliceBuf[qir.Expr], orderSlice []index, snap *plannerStatsSnapshot, universe uint64) (plannerOrderedProfile, bool) {
+func (qv *queryView) estimateOrderedProfileBuf(orderField string, leaves *pooled.SliceBuf[qir.Expr], orderSlice []index, snap *plannerStatsSnapshot, universe uint64) (plannerOrderedProfile, bool) {
 	if universe == 0 {
 		return plannerOrderedProfile{}, false
 	}
@@ -2398,7 +2398,7 @@ func (qv *queryView[K, V]) estimateOrderedProfileBuf(orderField string, leaves *
 	}, true
 }
 
-func (qv *queryView[K, V]) estimateOrderedProfileOverlay(orderField string, leaves []qir.Expr, ov fieldOverlay, snap *plannerStatsSnapshot, universe uint64) (plannerOrderedProfile, bool) {
+func (qv *queryView) estimateOrderedProfileOverlay(orderField string, leaves []qir.Expr, ov fieldOverlay, snap *plannerStatsSnapshot, universe uint64) (plannerOrderedProfile, bool) {
 	if universe == 0 {
 		return plannerOrderedProfile{}, false
 	}
@@ -2547,7 +2547,7 @@ func (qv *queryView[K, V]) estimateOrderedProfileOverlay(orderField string, leav
 	}, true
 }
 
-func (qv *queryView[K, V]) estimateOrderedProfileOverlayBuf(orderField string, leaves *pooled.SliceBuf[qir.Expr], ov fieldOverlay, snap *plannerStatsSnapshot, universe uint64) (plannerOrderedProfile, bool) {
+func (qv *queryView) estimateOrderedProfileOverlayBuf(orderField string, leaves *pooled.SliceBuf[qir.Expr], ov fieldOverlay, snap *plannerStatsSnapshot, universe uint64) (plannerOrderedProfile, bool) {
 	if universe == 0 {
 		return plannerOrderedProfile{}, false
 	}
@@ -2697,7 +2697,7 @@ func (qv *queryView[K, V]) estimateOrderedProfileOverlayBuf(orderField string, l
 	}, true
 }
 
-func (qv *queryView[K, V]) extractOrderRangeCoverageLeaves(orderField string, leaves []qir.Expr, orderSlice []index) (int, int, *pooled.SliceBuf[bool], bool) {
+func (qv *queryView) extractOrderRangeCoverageLeaves(orderField string, leaves []qir.Expr, orderSlice []index) (int, int, *pooled.SliceBuf[bool], bool) {
 	rb := rangeBounds{}
 	coveredBuf := boolSlicePool.Get()
 	coveredBuf.SetLen(len(leaves))
@@ -2725,7 +2725,7 @@ func (qv *queryView[K, V]) extractOrderRangeCoverageLeaves(orderField string, le
 	return st, en, coveredBuf, true
 }
 
-func (qv *queryView[K, V]) extractOrderRangeCoverageLeavesBuf(orderField string, leaves *pooled.SliceBuf[qir.Expr], orderSlice []index) (int, int, *pooled.SliceBuf[bool], bool) {
+func (qv *queryView) extractOrderRangeCoverageLeavesBuf(orderField string, leaves *pooled.SliceBuf[qir.Expr], orderSlice []index) (int, int, *pooled.SliceBuf[bool], bool) {
 	rb := rangeBounds{}
 	coveredBuf := boolSlicePool.Get()
 	coveredBuf.SetLen(leaves.Len())
@@ -2753,7 +2753,7 @@ func (qv *queryView[K, V]) extractOrderRangeCoverageLeavesBuf(orderField string,
 	return st, en, coveredBuf, true
 }
 
-func (qv *queryView[K, V]) extractOrderRangeCoverageLeavesOverlay(orderField string, leaves []qir.Expr, ov fieldOverlay) (int, int, *pooled.SliceBuf[bool], bool) {
+func (qv *queryView) extractOrderRangeCoverageLeavesOverlay(orderField string, leaves []qir.Expr, ov fieldOverlay) (int, int, *pooled.SliceBuf[bool], bool) {
 	rb := rangeBounds{}
 	coveredBuf := boolSlicePool.Get()
 	coveredBuf.SetLen(len(leaves))
@@ -2793,7 +2793,7 @@ func (qv *queryView[K, V]) extractOrderRangeCoverageLeavesOverlay(orderField str
 	return in, total, coveredBuf, true
 }
 
-func (qv *queryView[K, V]) extractOrderRangeCoverageLeavesOverlayBuf(orderField string, leaves *pooled.SliceBuf[qir.Expr], ov fieldOverlay) (int, int, *pooled.SliceBuf[bool], bool) {
+func (qv *queryView) extractOrderRangeCoverageLeavesOverlayBuf(orderField string, leaves *pooled.SliceBuf[qir.Expr], ov fieldOverlay) (int, int, *pooled.SliceBuf[bool], bool) {
 	rb := rangeBounds{}
 	coveredBuf := boolSlicePool.Get()
 	coveredBuf.SetLen(leaves.Len())
@@ -2833,7 +2833,7 @@ func (qv *queryView[K, V]) extractOrderRangeCoverageLeavesOverlayBuf(orderField 
 	return in, total, coveredBuf, true
 }
 
-func (qv *queryView[K, V]) estimateLeafOrderCost(
+func (qv *queryView) estimateLeafOrderCost(
 	e qir.Expr,
 	snap *plannerStatsSnapshot,
 	universe uint64,
@@ -2935,7 +2935,7 @@ func (qv *queryView[K, V]) estimateLeafOrderCost(
 	return selectivity, fallbackWork, orderRange, hasPrefix, true
 }
 
-func (qv *queryView[K, V]) estimateEqSelectivity(field string, value any, universe uint64, stats PlannerFieldStats) (float64, bool) {
+func (qv *queryView) estimateEqSelectivity(field string, value any, universe uint64, stats PlannerFieldStats) (float64, bool) {
 	key, isSlice, isNil, err := qv.exprValueToIdxScalar(qir.Expr{
 		Op:           qir.OpEQ,
 		FieldOrdinal: qv.fieldOrdinalByName(field),
@@ -2978,7 +2978,7 @@ func (qv *queryView[K, V]) estimateEqSelectivity(field string, value any, univer
 	return sel, true
 }
 
-func (qv *queryView[K, V]) estimateInLikeSelectivity(field string, value any, universe uint64, intersect bool) (float64, int, bool) {
+func (qv *queryView) estimateInLikeSelectivity(field string, value any, universe uint64, intersect bool) (float64, int, bool) {
 	valsBuf, isSlice, hasNil, err := qv.exprValueToDistinctIdxBuf(qir.Expr{
 		Op:           qir.OpIN,
 		FieldOrdinal: qv.fieldOrdinalByName(field),
@@ -3052,7 +3052,7 @@ func (qv *queryView[K, V]) estimateInLikeSelectivity(field string, value any, un
 	return sel, valueCount, true
 }
 
-func (qv *queryView[K, V]) estimateRangeSelectivity(e qir.Expr, universe uint64, stats PlannerFieldStats) (float64, bool) {
+func (qv *queryView) estimateRangeSelectivity(e qir.Expr, universe uint64, stats PlannerFieldStats) (float64, bool) {
 	rb, ok, err := qv.rangeBoundsForScalarExpr(e)
 	if err != nil || !ok {
 		return 0, false
@@ -3096,7 +3096,7 @@ func (qv *queryView[K, V]) estimateRangeSelectivity(e qir.Expr, universe uint64,
 	return 0, false
 }
 
-func (qv *queryView[K, V]) plannerFieldStats(field string, snap *plannerStatsSnapshot, universe uint64) PlannerFieldStats {
+func (qv *queryView) plannerFieldStats(field string, snap *plannerStatsSnapshot, universe uint64) PlannerFieldStats {
 	distinct := uint64(qv.fieldOverlay(field).keyCount())
 	return qv.plannerOrderFieldStats(field, snap, universe, distinct)
 }

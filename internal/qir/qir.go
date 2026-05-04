@@ -224,7 +224,7 @@ func (q *Query) newOwnedExprSlice(n int) []Expr {
 	return s
 }
 
-func PrepareQueryResolved[R FieldResolver](src *qx.QX, resolve R) (*Query, error) {
+func PrepareQuery[R FieldResolver](src *qx.QX, resolve R) (*Query, error) {
 	if src == nil {
 		return nil, fmt.Errorf("QX is nil")
 	}

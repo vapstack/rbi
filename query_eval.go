@@ -35,14 +35,14 @@ func releasePostingResults(buf *pooled.SliceBuf[postingResult]) {
 	}
 }
 
-func (qv *queryView[K, V]) checkUsedQuery(q *qir.Shape) error {
+func (qv *queryView) checkUsedQuery(q *qir.Shape) error {
 	if q.HasOrder && qv.fieldMetaByOrder(q.Order) == nil {
 		return fmt.Errorf("no index for field: %v", qv.fieldNameByOrdinal(q.Order.FieldOrdinal))
 	}
 	return qv.checkUsedExpr(q.Expr)
 }
 
-func (qv *queryView[K, V]) checkUsedExpr(exp qir.Expr) error {
+func (qv *queryView) checkUsedExpr(exp qir.Expr) error {
 	if exp.FieldOrdinal >= 0 {
 		if qv.fieldMetaByExpr(exp) == nil {
 			return fmt.Errorf("no index for field: %v", qv.fieldNameByOrdinal(exp.FieldOrdinal))
@@ -60,7 +60,7 @@ func (qv *queryView[K, V]) checkUsedExpr(exp qir.Expr) error {
 //
 // Results may be positive sets or negative/complement sets to
 // postpone expensive universe materialization until it is actually required.
-func (qv *queryView[K, V]) evalExpr(e qir.Expr) (postingResult, error) {
+func (qv *queryView) evalExpr(e qir.Expr) (postingResult, error) {
 	switch e.Op {
 
 	case qir.OpNOOP:
@@ -154,7 +154,7 @@ func (qv *queryView[K, V]) evalExpr(e qir.Expr) (postingResult, error) {
 	}
 }
 
-func (qv *queryView[K, V]) evalAndOperands(ops []qir.Expr, negate bool) (postingResult, error) {
+func (qv *queryView) evalAndOperands(ops []qir.Expr, negate bool) (postingResult, error) {
 	if len(ops) == 0 {
 		return postingResult{}, fmt.Errorf("%w: empty AND expression", ErrInvalidQuery)
 	}
@@ -210,7 +210,7 @@ func (qv *queryView[K, V]) evalAndOperands(ops []qir.Expr, negate bool) (posting
 
 // evalSimple evaluates a single non-boolean predicate against the current
 // immutable snapshot indexes.
-func (qv *queryView[K, V]) evalSimple(e qir.Expr) (postingResult, error) {
+func (qv *queryView) evalSimple(e qir.Expr) (postingResult, error) {
 	fieldName := qv.fieldNameByOrdinal(e.FieldOrdinal)
 	ov := qv.fieldOverlayForExpr(e)
 	if !ov.hasData() && !qv.hasIndexedFieldForExpr(e) {
@@ -367,7 +367,7 @@ func (qv *queryView[K, V]) evalSimple(e qir.Expr) (postingResult, error) {
 		if bound.empty {
 			return postingResult{}, nil
 		}
-		var core preparedScalarRangePredicate[K, V]
+		var core preparedScalarRangePredicate
 		qv.initPreparedScalarRangePredicateFromBound(&core, e, f, bound)
 		return core.evalMaterializedPostingResult(ov), nil
 
@@ -494,7 +494,7 @@ func parallelBatchedPostingUnionOwned(posts []posting.List) posting.List {
 //
 // Callers pass distinct values; duplicates are removed before this point so
 // this path can stay read-only.
-func (qv *queryView[K, V]) evalSliceEQ(field string, fieldOrdinal int, vals stringKeyReader) (postingResult, error) {
+func (qv *queryView) evalSliceEQ(field string, fieldOrdinal int, vals stringKeyReader) (postingResult, error) {
 	valCount := stringKeyReaderLen(vals)
 	lenOV := qv.lenFieldOverlayRef(field, fieldOrdinal)
 	useZeroComplement := valCount == 0 && qv.isLenZeroComplementRef(field, fieldOrdinal)
@@ -891,7 +891,7 @@ func normalizeFloatRangeBound(op qir.Op, v reflect.Value) normalizedScalarBound 
 	return normalizedScalarBoundFromIndexKey(op, indexKeyFromU64(orderedFloat64Key(f)))
 }
 
-func (qv *queryView[K, V]) exprValueToNormalizedScalarBound(expr qir.Expr) (normalizedScalarBound, bool, error) {
+func (qv *queryView) exprValueToNormalizedScalarBound(expr qir.Expr) (normalizedScalarBound, bool, error) {
 	if expr.Value == nil {
 		return normalizedScalarBound{empty: true}, false, nil
 	}
@@ -1058,7 +1058,7 @@ func sliceValueToIdxStringBuf(v reflect.Value, fm *field) (*pooled.SliceBuf[stri
 	return ixsBuf, hasNil, nil
 }
 
-func (qv *queryView[K, V]) scalarLookupPostings(field string, fieldOrdinal int, keys stringKeyReader, includeNil bool) (*pooled.SliceBuf[posting.List], uint64) {
+func (qv *queryView) scalarLookupPostings(field string, fieldOrdinal int, keys stringKeyReader, includeNil bool) (*pooled.SliceBuf[posting.List], uint64) {
 	postsBuf := postingSlicePool.Get()
 	keyCount := stringKeyReaderLen(keys)
 	postsBuf.Grow(keyCount + btoi(includeNil))
@@ -1083,7 +1083,7 @@ func (qv *queryView[K, V]) scalarLookupPostings(field string, fieldOrdinal int, 
 	return postsBuf, est
 }
 
-func (qv *queryView[K, V]) exprValueToIdxScalar(expr qir.Expr) (string, bool, bool, error) {
+func (qv *queryView) exprValueToIdxScalar(expr qir.Expr) (string, bool, bool, error) {
 	if expr.Value == nil {
 		return "", false, true, nil
 	}
@@ -1105,7 +1105,7 @@ func (qv *queryView[K, V]) exprValueToIdxScalar(expr qir.Expr) (string, bool, bo
 	return key, false, false, nil
 }
 
-func (qv *queryView[K, V]) diffPostingResult(acc, sub postingResult) (postingResult, error) {
+func (qv *queryView) diffPostingResult(acc, sub postingResult) (postingResult, error) {
 	acc.ids = acc.ids.BuildAndNot(sub.ids)
 	sub.release()
 	return acc, nil
@@ -1113,7 +1113,7 @@ func (qv *queryView[K, V]) diffPostingResult(acc, sub postingResult) (postingRes
 
 // exprValueToDistinctIdxBuf returns caller-owned indexed values deduplicated
 // for set-like operators whose semantics do not depend on input order.
-func (qv *queryView[K, V]) exprValueToDistinctIdxBuf(expr qir.Expr) (*pooled.SliceBuf[string], bool, bool, error) {
+func (qv *queryView) exprValueToDistinctIdxBuf(expr qir.Expr) (*pooled.SliceBuf[string], bool, bool, error) {
 	fm := qv.fieldMetaByExpr(expr)
 
 	if expr.Value == nil {
@@ -1185,7 +1185,7 @@ func diffOwned(a, b posting.List) posting.List {
 	return res
 }
 
-func (qv *queryView[K, V]) andPostingResult(a, b postingResult) (postingResult, error) {
+func (qv *queryView) andPostingResult(a, b postingResult) (postingResult, error) {
 	// handle empty sets
 	if !a.neg && a.ids.IsEmpty() {
 		a.release()
@@ -1234,7 +1234,7 @@ func (qv *queryView[K, V]) andPostingResult(a, b postingResult) (postingResult, 
 	return postingResult{}, nil
 }
 
-func (qv *queryView[K, V]) orPostingResult(a, b postingResult) postingResult {
+func (qv *queryView) orPostingResult(a, b postingResult) postingResult {
 	// universe (negative empty)
 	if a.neg && a.ids.IsEmpty() {
 		a.release()

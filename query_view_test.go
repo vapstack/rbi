@@ -15,28 +15,19 @@ import (
 	"github.com/vapstack/rbi/internal/qir"
 )
 
-var (
-	_ preparedRouteEqUint64 = (*DB[uint64, Rec])(nil)
-	_ preparedRouteEqString = (*DB[string, Rec])(nil)
-	_ preparedRouteEqUint64 = (*queryView[uint64, Rec])(nil)
-	_ preparedRouteEqString = (*queryView[string, Rec])(nil)
-)
-
-func (db *DB[K, V]) rootDB() *DB[K, V] { return db }
-
-func (db *DB[K, V]) currentQueryViewForTests() *queryView[K, V] {
+func (db *DB[K, V]) currentQueryViewForTests() *queryView {
 	if db == nil {
 		snap := &indexSnapshot{strmap: &strMapSnapshot{}}
-		return &queryView[K, V]{snap: snap, strmapView: snap.strmap}
+		return &queryView{snap: snap, strMapView: snap.strmap}
 	}
 	if snap := db.snapshot.current.Load(); snap != nil {
-		return &queryView[K, V]{
-			root:              db,
+		return &queryView{
+			engine:            db.engine,
 			snap:              snap,
-			strkey:            db.strkey,
-			strmapView:        snap.strmap,
-			fields:            db.fields,
-			planner:           &db.planner,
+			strKey:            db.strKey,
+			strMapView:        snap.strmap,
+			fields:            db.indexFields,
+			planner:           db.engine.planner,
 			options:           db.options,
 			lenZeroComplement: snap.lenZeroComplement,
 		}
@@ -50,16 +41,16 @@ func (db *DB[K, V]) currentQueryViewForTests() *queryView[K, V] {
 		universe:          db.universe,
 		strmap:            &strMapSnapshot{},
 	}
-	if db.strmap != nil {
-		snap.strmap = db.strmap.snapshot()
+	if db.strMap != nil {
+		snap.strmap = db.strMap.snapshot()
 	}
-	return &queryView[K, V]{
-		root:              db,
+	return &queryView{
+		engine:            db.engine,
 		snap:              snap,
-		strkey:            db.strkey,
-		strmapView:        snap.strmap,
-		fields:            db.fields,
-		planner:           &db.planner,
+		strKey:            db.strKey,
+		strMapView:        snap.strmap,
+		fields:            db.indexFields,
+		planner:           db.engine.planner,
 		options:           db.options,
 		lenZeroComplement: snap.lenZeroComplement,
 	}
@@ -156,13 +147,11 @@ func (db *DB[K, V]) lenFieldOverlay(field string) fieldOverlay {
 	return db.currentQueryViewForTests().lenFieldOverlay(field)
 }
 
-func (qv *queryView[K, V]) rootDB() *DB[K, V] { return qv.root }
-
-func (qv *queryView[K, V]) fieldLookupPostingRetained(field, key string) posting.List {
+func (qv *queryView) fieldLookupPostingRetained(field, key string) posting.List {
 	return qv.snap.fieldLookupPostingRetained(field, key)
 }
 
-func (qv *queryView[K, V]) nilFieldLookupPostingRetained(field string) posting.List {
+func (qv *queryView) nilFieldLookupPostingRetained(field string) posting.List {
 	return newFieldOverlay(qv.snap.nilFieldIndexSlice(field)).lookupPostingRetained(nilIndexEntryKey)
 }
 
@@ -174,7 +163,7 @@ func prepareTestQuery[K ~string | ~uint64, V any](db *DB[K, V], q *qx.QX) (*qir.
 	if db == nil {
 		prepared, err = qir.PrepareQueryNoResolve(q)
 	} else {
-		prepared, err = qir.PrepareQueryResolved(q, preparedFieldResolver[K, V]{db: db})
+		prepared, err = qir.PrepareQuery(q, db.indexedFieldMap)
 	}
 	if err != nil {
 		return nil, qir.Shape{}, err
@@ -190,7 +179,7 @@ func prepareTestExpr[K ~string | ~uint64, V any](db *DB[K, V], expr qx.Expr) (*q
 	if db == nil {
 		prepared, err = qir.PrepareCountExprsNoResolve(expr)
 	} else {
-		prepared, err = qir.PrepareCountExprsResolved(preparedFieldResolver[K, V]{db: db}, expr)
+		prepared, err = qir.PrepareCountExprsResolved(db.indexedFieldMap, expr)
 	}
 	if err != nil {
 		return nil, qir.Expr{}, err
@@ -257,7 +246,7 @@ func (db *DB[K, V]) evalExpr(e qx.Expr) (postingResult, error) {
 	return db.currentQueryViewForTests().evalExpr(expr)
 }
 
-func (db *DB[K, V]) tryExecutionPlan(q *qx.QX, trace *queryTrace) ([]K, bool, error) {
+func (db *DB[K, V]) tryExecutionPlan(q *qx.QX, trace *queryTrace) ([]uint64, bool, error) {
 	prepared, viewQ, err := prepareTestQuery(db, q)
 	if err != nil {
 		return nil, false, err
@@ -266,7 +255,7 @@ func (db *DB[K, V]) tryExecutionPlan(q *qx.QX, trace *queryTrace) ([]K, bool, er
 	return db.currentQueryViewForTests().tryExecutionPlan(&viewQ, trace)
 }
 
-func (db *DB[K, V]) tryPlan(q *qx.QX, trace *queryTrace) ([]K, bool, error) {
+func (db *DB[K, V]) tryPlan(q *qx.QX, trace *queryTrace) ([]uint64, bool, error) {
 	prepared, viewQ, err := prepareTestQuery(db, q)
 	if err != nil {
 		return nil, false, err
@@ -284,7 +273,7 @@ func (db *DB[K, V]) countPreparedExpr(expr qx.Expr) (uint64, error) {
 	return db.currentQueryViewForTests().countPreparedExpr(compiled)
 }
 
-func (db *DB[K, V]) tryPlanCandidate(q *qx.QX, trace *queryTrace) ([]K, bool, error) {
+func (db *DB[K, V]) tryPlanCandidate(q *qx.QX, trace *queryTrace) ([]uint64, bool, error) {
 	prepared, viewQ, err := prepareTestQuery(db, q)
 	if err != nil {
 		return nil, false, err
@@ -293,7 +282,7 @@ func (db *DB[K, V]) tryPlanCandidate(q *qx.QX, trace *queryTrace) ([]K, bool, er
 	return db.currentQueryViewForTests().tryPlanCandidate(&viewQ, trace)
 }
 
-func (db *DB[K, V]) tryLimitQueryOrderBasic(q *qx.QX, leaves []qx.Expr, trace *queryTrace) ([]K, bool, error) {
+func (db *DB[K, V]) tryLimitQueryOrderBasic(q *qx.QX, leaves []qx.Expr, trace *queryTrace) ([]uint64, bool, error) {
 	preparedQ, viewQ, err := prepareTestQuery(db, q)
 	if err != nil {
 		return nil, false, err
@@ -309,7 +298,7 @@ func (db *DB[K, V]) tryLimitQueryOrderBasic(q *qx.QX, leaves []qx.Expr, trace *q
 	return db.currentQueryViewForTests().tryLimitQueryOrderBasic(&viewQ, compiledLeaves, trace)
 }
 
-func (db *DB[K, V]) tryLimitQueryRangeNoOrderByField(q *qx.QX, field string, bounds rangeBounds, rest []qx.Expr, trace *queryTrace) ([]K, bool, error) {
+func (db *DB[K, V]) tryLimitQueryRangeNoOrderByField(q *qx.QX, field string, bounds rangeBounds, rest []qx.Expr, trace *queryTrace) ([]uint64, bool, error) {
 	preparedQ, viewQ, err := prepareTestQuery(db, q)
 	if err != nil {
 		return nil, false, err
@@ -325,7 +314,7 @@ func (db *DB[K, V]) tryLimitQueryRangeNoOrderByField(q *qx.QX, field string, bou
 	return db.currentQueryViewForTests().tryLimitQueryRangeNoOrderByField(&viewQ, field, bounds, compiledRest, trace)
 }
 
-func (db *DB[K, V]) tryQueryOrderBasicWithLimit(q *qx.QX, trace *queryTrace) ([]K, bool, error) {
+func (db *DB[K, V]) tryQueryOrderBasicWithLimit(q *qx.QX, trace *queryTrace) ([]uint64, bool, error) {
 	prepared, viewQ, err := prepareTestQuery(db, q)
 	if err != nil {
 		return nil, false, err
@@ -334,7 +323,7 @@ func (db *DB[K, V]) tryQueryOrderBasicWithLimit(q *qx.QX, trace *queryTrace) ([]
 	return db.currentQueryViewForTests().tryQueryOrderBasicWithLimit(&viewQ, trace)
 }
 
-func (db *DB[K, V]) tryQueryOrderPrefixWithLimit(q *qx.QX, trace *queryTrace) ([]K, bool, error) {
+func (db *DB[K, V]) tryQueryOrderPrefixWithLimit(q *qx.QX, trace *queryTrace) ([]uint64, bool, error) {
 	prepared, viewQ, err := prepareTestQuery(db, q)
 	if err != nil {
 		return nil, false, err
@@ -343,7 +332,7 @@ func (db *DB[K, V]) tryQueryOrderPrefixWithLimit(q *qx.QX, trace *queryTrace) ([
 	return db.currentQueryViewForTests().tryQueryOrderPrefixWithLimit(&viewQ, trace)
 }
 
-func (db *DB[K, V]) tryQueryRangeNoOrderWithLimit(q *qx.QX, trace *queryTrace) ([]K, bool, error) {
+func (db *DB[K, V]) tryQueryRangeNoOrderWithLimit(q *qx.QX, trace *queryTrace) ([]uint64, bool, error) {
 	prepared, viewQ, err := prepareTestQuery(db, q)
 	if err != nil {
 		return nil, false, err
@@ -352,7 +341,7 @@ func (db *DB[K, V]) tryQueryRangeNoOrderWithLimit(q *qx.QX, trace *queryTrace) (
 	return db.currentQueryViewForTests().tryQueryRangeNoOrderWithLimit(&viewQ, trace)
 }
 
-func (db *DB[K, V]) tryQueryPrefixNoOrderWithLimit(q *qx.QX, trace *queryTrace) ([]K, bool, error) {
+func (db *DB[K, V]) tryQueryPrefixNoOrderWithLimit(q *qx.QX, trace *queryTrace) ([]uint64, bool, error) {
 	prepared, viewQ, err := prepareTestQuery(db, q)
 	if err != nil {
 		return nil, false, err
@@ -372,7 +361,7 @@ func (db *DB[K, V]) buildPredicatesOrderedWithMode(leaves []qx.Expr, orderField 
 	return detachPredicateSetForTests(preds), ok
 }
 
-func (db *DB[K, V]) execPlanOrderedBasic(q *qx.QX, preds []predicate, trace *queryTrace) ([]K, bool) {
+func (db *DB[K, V]) execPlanOrderedBasic(q *qx.QX, preds []predicate, trace *queryTrace) ([]uint64, bool) {
 	prepared, viewQ, err := prepareTestQuery(db, q)
 	if err != nil {
 		return nil, false
@@ -381,7 +370,7 @@ func (db *DB[K, V]) execPlanOrderedBasic(q *qx.QX, preds []predicate, trace *que
 	return db.currentQueryViewForTests().execPlanOrderedBasicReader(&viewQ, predicateSliceView(preds), trace)
 }
 
-func (db *DB[K, V]) execPlanOrderedBasicFallback(q *qx.QX, preds []predicate, active []int, start, end int, s []index, trace *queryTrace) []K {
+func (db *DB[K, V]) execPlanOrderedBasicFallback(q *qx.QX, preds []predicate, active []int, start, end int, s []index, trace *queryTrace) []uint64 {
 	prepared, viewQ, err := prepareTestQuery(db, q)
 	if err != nil {
 		return nil
@@ -422,7 +411,7 @@ func (db *DB[K, V]) buildORBranchesOrderedWithOffset(
 	return db.currentQueryViewForTests().buildORBranchesOrdered(compiledOps, orderField, orderedWindow, orderedOffset)
 }
 
-func (db *DB[K, V]) execPlanORNoOrderAdaptive(q *qx.QX, branches plannerORBranches, trace *queryTrace) ([]K, bool) {
+func (db *DB[K, V]) execPlanORNoOrderAdaptive(q *qx.QX, branches plannerORBranches, trace *queryTrace) ([]uint64, bool) {
 	prepared, viewQ, err := prepareTestQuery(db, q)
 	if err != nil {
 		return nil, false
@@ -431,7 +420,7 @@ func (db *DB[K, V]) execPlanORNoOrderAdaptive(q *qx.QX, branches plannerORBranch
 	return db.currentQueryViewForTests().execPlanORNoOrderAdaptive(&viewQ, branches, trace)
 }
 
-func (db *DB[K, V]) execPlanORNoOrderBaseline(q *qx.QX, branches plannerORBranches, trace *queryTrace) ([]K, bool) {
+func (db *DB[K, V]) execPlanORNoOrderBaseline(q *qx.QX, branches plannerORBranches, trace *queryTrace) ([]uint64, bool) {
 	prepared, viewQ, err := prepareTestQuery(db, q)
 	if err != nil {
 		return nil, false
@@ -440,7 +429,7 @@ func (db *DB[K, V]) execPlanORNoOrderBaseline(q *qx.QX, branches plannerORBranch
 	return db.currentQueryViewForTests().execPlanORNoOrderBaseline(&viewQ, branches, trace)
 }
 
-func (db *DB[K, V]) execPlanOROrderBasic(q *qx.QX, branches plannerORBranches, trace *queryTrace) ([]K, bool) {
+func (db *DB[K, V]) execPlanOROrderBasic(q *qx.QX, branches plannerORBranches, trace *queryTrace) ([]uint64, bool) {
 	prepared, viewQ, err := prepareTestQuery(db, q)
 	if err != nil {
 		return nil, false
@@ -449,7 +438,7 @@ func (db *DB[K, V]) execPlanOROrderBasic(q *qx.QX, branches plannerORBranches, t
 	return db.currentQueryViewForTests().execPlanOROrderBasic(&viewQ, branches, nil, trace, nil)
 }
 
-func (db *DB[K, V]) execPlanOROrderMergeFallback(q *qx.QX, branches plannerORBranches, trace *queryTrace) ([]K, bool, error) {
+func (db *DB[K, V]) execPlanOROrderMergeFallback(q *qx.QX, branches plannerORBranches, trace *queryTrace) ([]uint64, bool, error) {
 	prepared, viewQ, err := prepareTestQuery(db, q)
 	if err != nil {
 		return nil, false, err
@@ -458,7 +447,7 @@ func (db *DB[K, V]) execPlanOROrderMergeFallback(q *qx.QX, branches plannerORBra
 	return db.currentQueryViewForTests().execPlanOROrderMergeFallback(&viewQ, branches, trace)
 }
 
-func (db *DB[K, V]) execPlanOROrderKWay(q *qx.QX, branches plannerORBranches, trace *queryTrace) ([]K, bool, error) {
+func (db *DB[K, V]) execPlanOROrderKWay(q *qx.QX, branches plannerORBranches, trace *queryTrace) ([]uint64, bool, error) {
 	prepared, viewQ, err := prepareTestQuery(db, q)
 	if err != nil {
 		return nil, false, err
@@ -619,7 +608,7 @@ func (db *DB[K, V]) shouldUseCandidateOrder(o qx.Order, leaves []qx.Expr) bool {
 	if o.Desc {
 		dir = qx.DESC
 	}
-	order, err := qir.PrepareQueryResolved(qx.Query().SortBy(o.By, dir), preparedFieldResolver[K, V]{db: db})
+	order, err := qir.PrepareQuery(qx.Query().SortBy(o.By, dir), db.indexedFieldMap)
 	if err != nil {
 		return false
 	}
@@ -825,7 +814,7 @@ func (db *DB[K, V]) exprValueToIdxOwned(expr qx.Expr) ([]string, bool, bool, err
 		fm       *field
 		err      error
 	)
-	if qv.root == nil || len(qv.root.indexedFieldAccess) == 0 {
+	if qv.engine == nil || len(qv.engine.indexedFieldAccess) == 0 {
 		prepared, err = qir.PrepareCountExprResolved(testExprFieldResolver{}, expr)
 		if err != nil {
 			return nil, false, false, err
@@ -897,7 +886,7 @@ func (db *DB[K, V]) exprValueToDistinctIdxOwned(expr qx.Expr) ([]string, bool, b
 		compiled qir.Expr
 		err      error
 	)
-	if qv.root == nil || len(qv.root.indexedFieldAccess) == 0 {
+	if qv.engine == nil || len(qv.engine.indexedFieldAccess) == 0 {
 		prepared, err = qir.PrepareCountExprResolved(testExprFieldResolver{}, expr)
 		if err != nil {
 			return nil, false, false, err

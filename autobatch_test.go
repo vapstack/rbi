@@ -1585,7 +1585,7 @@ func TestBatch_StringKeyBeforeStoreError_DoesNotGrowStrMap(t *testing.T) {
 	if err := db.Set("p1", &Product{SKU: "p1", Price: 10}); err != nil {
 		t.Fatalf("seed Set: %v", err)
 	}
-	initial := len(db.strmap.Keys)
+	initial := len(db.strMap.Keys)
 
 	hookErr := errors.New("before store fail")
 	req := &autoBatchRequest[string, Product]{
@@ -1609,7 +1609,7 @@ func TestBatch_StringKeyBeforeStoreError_DoesNotGrowStrMap(t *testing.T) {
 	} else if got != nil {
 		t.Fatalf("ghost-before-store must not persist after BeforeStore failure, got %#v", got)
 	}
-	if after := len(db.strmap.Keys); after != initial {
+	if after := len(db.strMap.Keys); after != initial {
 		t.Fatalf("strmap grew after BeforeStore failure: initial=%d after=%d", initial, after)
 	}
 }
@@ -2504,13 +2504,15 @@ func TestAutoBatchExt_CoalescedInterleavedChains_TerminalCommitErrorPropagatesTo
 		t.Fatalf("Set(2): %v", err)
 	}
 
-	db.testHooks.beforeCommit = func(op string) error {
-		if op == "batch" {
-			return fmt.Errorf("failpoint: commit batch")
-		}
-		return nil
+	db.testHooks = &testHooks{
+		beforeCommit: func(op string) error {
+			if op == "batch" {
+				return fmt.Errorf("failpoint: commit batch")
+			}
+			return nil
+		},
 	}
-	t.Cleanup(func() { db.testHooks.beforeCommit = nil })
+	t.Cleanup(func() { db.testHooks = nil })
 
 	req1 := mustBuildSetAutoReq(t, db, 1, &Rec{Name: "A", Age: 30}, nil, nil, nil)
 	req2 := mustBuildSetAutoReq(t, db, 2, &Rec{Name: "B", Age: 40}, nil, nil, nil)
@@ -2605,7 +2607,7 @@ func TestAutoBatchExt_SharedStringSet_BeforeStoreErrorWithNeighbor_DoesNotGrowSt
 	if err := db.Set("p1", &Product{SKU: "p1", Price: 10}); err != nil {
 		t.Fatalf("seed Set: %v", err)
 	}
-	initial := len(db.strmap.Keys)
+	initial := len(db.strMap.Keys)
 
 	hookErr := errors.New("before store failed")
 	badReq := mustBuildSetAutoReq(
@@ -2639,7 +2641,7 @@ func TestAutoBatchExt_SharedStringSet_BeforeStoreErrorWithNeighbor_DoesNotGrowSt
 	} else if got == nil || got.Price != 22 {
 		t.Fatalf("unexpected p2 value: %#v", got)
 	}
-	if after := len(db.strmap.Keys); after != initial+1 {
+	if after := len(db.strMap.Keys); after != initial+1 {
 		t.Fatalf("strmap size = %d, want %d", after, initial+1)
 	}
 }
@@ -2650,7 +2652,7 @@ func TestAutoBatchExt_SharedStringSet_DecodePreparedValueErrorWithNeighbor_DoesN
 	if err := db.Set("p1", &Product{SKU: "p1", Price: 10}); err != nil {
 		t.Fatalf("seed Set: %v", err)
 	}
-	initial := len(db.strmap.Keys)
+	initial := len(db.strMap.Keys)
 
 	badReq := mustBuildSetAutoReq(
 		t,
@@ -2679,7 +2681,7 @@ func TestAutoBatchExt_SharedStringSet_DecodePreparedValueErrorWithNeighbor_DoesN
 	} else if got != nil {
 		t.Fatalf("ghost-decode must stay absent, got %#v", got)
 	}
-	if after := len(db.strmap.Keys); after != initial+1 {
+	if after := len(db.strMap.Keys); after != initial+1 {
 		t.Fatalf("strmap size = %d, want %d", after, initial+1)
 	}
 }
@@ -2690,7 +2692,7 @@ func TestAutoBatchExt_SharedStringSet_UniqueRejectWithNeighbor_DoesNotGrowStrMap
 	if err := db.Set("u1", &StringUniqueTestRec{Email: "a@x", Code: 1}); err != nil {
 		t.Fatalf("seed Set: %v", err)
 	}
-	initial := len(db.strmap.Keys)
+	initial := len(db.strMap.Keys)
 
 	badReq := mustBuildSetAutoReq(t, db, "u-dup", &StringUniqueTestRec{Email: "a@x", Code: 2}, nil, nil, nil)
 	goodReq := mustBuildSetAutoReq(t, db, "u-ok", &StringUniqueTestRec{Email: "c@x", Code: 3}, nil, nil, nil)
@@ -2713,7 +2715,7 @@ func TestAutoBatchExt_SharedStringSet_UniqueRejectWithNeighbor_DoesNotGrowStrMap
 	} else if got == nil || got.Email != "c@x" || got.Code != 3 {
 		t.Fatalf("unexpected u-ok value: %#v", got)
 	}
-	if after := len(db.strmap.Keys); after != initial+1 {
+	if after := len(db.strMap.Keys); after != initial+1 {
 		t.Fatalf("strmap size = %d, want %d", after, initial+1)
 	}
 }
@@ -2724,7 +2726,7 @@ func TestAutoBatchExt_SharedStringSet_CallbackFailureWithNeighbor_DoesNotGrowStr
 	if err := db.Set("p1", &Product{SKU: "p1", Price: 10}); err != nil {
 		t.Fatalf("seed Set: %v", err)
 	}
-	initial := len(db.strmap.Keys)
+	initial := len(db.strMap.Keys)
 
 	cbErr := errors.New("callback failed")
 	badReq := mustBuildSetAutoReq(
@@ -2758,7 +2760,7 @@ func TestAutoBatchExt_SharedStringSet_CallbackFailureWithNeighbor_DoesNotGrowStr
 	} else if got == nil || got.Price != 22 {
 		t.Fatalf("unexpected p2 value: %#v", got)
 	}
-	if after := len(db.strmap.Keys); after != initial+1 {
+	if after := len(db.strMap.Keys); after != initial+1 {
 		t.Fatalf("strmap size = %d, want %d", after, initial+1)
 	}
 }

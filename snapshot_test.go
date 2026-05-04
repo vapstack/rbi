@@ -600,7 +600,7 @@ func snapshotExtEvalNumericRangeBuckets(t *testing.T, db *DB[uint64, Rec], expr 
 	defer prepared.Release()
 
 	field := db.fieldNameByOrdinal(compiled.FieldOrdinal)
-	fm := db.fields[field]
+	fm := db.indexFields[field]
 	if fm == nil {
 		t.Fatalf("expected %q field metadata", field)
 	}
@@ -647,7 +647,7 @@ func TestSnapshotExt_CollectSnapshotBatchDiff_ReorderedSliceValuesProduceNoDelta
 	}
 
 	for _, f := range []string{"tags", "scores"} {
-		acc, ok := db.indexedFieldByName[f]
+		acc, ok := db.indexedFieldMap[f]
 		if !ok {
 			t.Fatalf("missing accessor for %q", f)
 		}
@@ -1676,12 +1676,12 @@ func TestSnapshotExt_InheritMaterializedPredCacheSkipsChangedFieldsAndKeepsOther
 	next := &indexSnapshot{matPredCacheMaxEntries: 8}
 	snapshotExtInitMaterializedPredCache(next)
 	db := &DB[uint64, struct{}]{
-		indexedFieldByName: map[string]indexedFieldAccessor{
+		indexedFieldMap: map[string]indexedFieldAccessor{
 			"name":  {ordinal: 0},
 			"email": {ordinal: 1},
 		},
 	}
-	changed := snapshotTestBoolSlots(map[string]bool{"name": true}, db.indexedFieldByName)
+	changed := snapshotTestBoolSlots(map[string]bool{"name": true}, db.indexedFieldMap)
 	defer fieldIndexBoolSlicePool.Put(changed)
 
 	inheritMaterializedPredCache(db, next, prev, changed)
@@ -2059,13 +2059,15 @@ func TestSpanshotExt_BeginQueryTxSnapshotSurvivesBrokenTruncatePublish(t *testin
 		t.Fatalf("beginQueryTxSnapshot: %v", err)
 	}
 
-	db.testHooks.afterCommitPublish = func(op string) {
-		if op == "truncate" {
-			panic("failpoint: publish truncate")
-		}
+	db.testHooks = &testHooks{
+		afterCommitPublish: func(op string) {
+			if op == "truncate" {
+				panic("failpoint: publish truncate")
+			}
+		},
 	}
 	t.Cleanup(func() {
-		db.testHooks.afterCommitPublish = nil
+		db.testHooks = nil
 	})
 
 	done := make(chan error, 1)

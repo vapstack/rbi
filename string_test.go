@@ -291,10 +291,10 @@ func TestStringExt_RollbackCreatedStrIdxRestoresCommittedSnapshotBase(t *testing
 		}
 	}
 
-	db.strmap.Lock()
-	before := db.strmap.committed
-	beforePublished := db.strmap.committedPub
-	db.strmap.Unlock()
+	db.strMap.Lock()
+	before := db.strMap.committed
+	beforePublished := db.strMap.committedPub
+	db.strMap.Unlock()
 	if before == nil || before.Next != uint64(len(seed)) {
 		t.Fatalf("unexpected committed base before reject: %#v", before)
 	}
@@ -307,32 +307,32 @@ func TestStringExt_RollbackCreatedStrIdxRestoresCommittedSnapshotBase(t *testing
 		t.Fatalf("duplicate Set error = %v, want %v", err, ErrUniqueViolation)
 	}
 
-	db.strmap.Lock()
-	if db.strmap.snap != before {
-		db.strmap.Unlock()
+	db.strMap.Lock()
+	if db.strMap.snap != before {
+		db.strMap.Unlock()
 		t.Fatalf("rollback did not restore committed state snapshot base")
 	}
-	if db.strmap.published != beforePublished {
-		db.strmap.Unlock()
+	if db.strMap.published != beforePublished {
+		db.strMap.Unlock()
 		t.Fatalf("rollback did not restore committed published snapshot")
 	}
-	if db.strmap.pubSource != before {
-		db.strmap.Unlock()
+	if db.strMap.pubSource != before {
+		db.strMap.Unlock()
 		t.Fatalf("rollback did not restore committed publish source")
 	}
-	if db.strmap.dirty {
-		db.strmap.Unlock()
+	if db.strMap.dirty {
+		db.strMap.Unlock()
 		t.Fatalf("rollback left strmap dirty")
 	}
-	db.strmap.Unlock()
+	db.strMap.Unlock()
 
 	if err := db.Set("real-ok", &StringUniqueTestRec{Email: "real@x", Code: 100}); err != nil {
 		t.Fatalf("good Set: %v", err)
 	}
 
-	db.strmap.Lock()
-	latest := db.strmap.snap
-	db.strmap.Unlock()
+	db.strMap.Lock()
+	latest := db.strMap.snap
+	db.strMap.Unlock()
 	if latest == nil {
 		t.Fatalf("missing latest state snapshot after successful insert")
 	}
@@ -517,7 +517,12 @@ func TestStringExt_BeginQueryTxSnapshotScanAndQueryStayConsistentDuringDeleteRei
 					if prepErr != nil {
 						scanErr = prepErr
 					} else {
-						queried, scanErr = view.execQuery(&viewQ, false, false)
+						queryIDs, err := view.execQuery(&viewQ, false, false)
+						if err != nil {
+							scanErr = err
+						} else {
+							queried = db.queryKeysFromIDs(snap, queryIDs)
+						}
 						prepared.Release()
 					}
 					db.releaseQueryView(view)

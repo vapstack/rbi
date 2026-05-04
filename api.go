@@ -156,7 +156,7 @@ func (db *DB[K, V]) ScanKeys(seek K, fn func(K) (bool, error)) error {
 	iter := universe.Iter()
 	defer iter.Release()
 
-	if db.strkey {
+	if db.strKey {
 		return db.scanStringKeys(snap.strmap, universe, iter, seek, fn)
 	}
 

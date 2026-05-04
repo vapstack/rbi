@@ -242,8 +242,8 @@ func leafPredsMatchActive(preds *pooled.SliceBuf[leafPred], checks []int, idx ui
 	return true
 }
 
-func leafPredsEmitCandidate[K ~uint64 | ~string, V any](
-	cursor *queryCursor[K, V],
+func leafPredsEmitCandidate(
+	cursor *queryCursor,
 	preds *pooled.SliceBuf[leafPred],
 	checks []int,
 	trace *queryTrace,
@@ -260,8 +260,8 @@ func leafPredsEmitCandidate[K ~uint64 | ~string, V any](
 	return cursor.emit(idx)
 }
 
-func leafPredsEmitMatchedPosting[K ~uint64 | ~string, V any](
-	cursor *queryCursor[K, V],
+func leafPredsEmitMatchedPosting(
+	cursor *queryCursor,
 	ids posting.List,
 	card uint64,
 	trace *queryTrace,
@@ -288,20 +288,15 @@ func leafPredsEmitMatchedPosting[K ~uint64 | ~string, V any](
 	return false
 }
 
-func leafPredsTryBucketPosting[K ~uint64 | ~string, V any](
-	cursor *queryCursor[K, V],
+func leafPredsTryBucketPosting(
+	cursor *queryCursor,
 	preds *pooled.SliceBuf[leafPred],
-	active []int,
-	exactActive []int,
-	residualActive []int,
-	exactOnly bool,
-	residualApplyOnly bool,
-	ids posting.List,
-	exactWork posting.List,
-	applyWork posting.List,
+	active, exactActive, residualActive []int,
+	exactOnly, residualApplyOnly bool,
+	ids, exactWork, applyWork posting.List,
 	trace *queryTrace,
 	examined *uint64,
-) (current posting.List, exactApplied bool, handled bool, stop bool, nextExactWork posting.List, nextApplyWork posting.List) {
+) (current posting.List, exactApplied, handled, stop bool, nextExactWork, nextApplyWork posting.List) {
 	nextExactWork = exactWork
 	nextApplyWork = applyWork
 	if ids.IsEmpty() {
@@ -366,14 +361,11 @@ func leafPredsTryBucketPosting[K ~uint64 | ~string, V any](
 		}
 	}
 
-	if exactApplied {
-		return current, true, false, false, nextExactWork, nextApplyWork
-	}
-	return ids, false, false, false, nextExactWork, nextApplyWork
+	return current, true, false, false, nextExactWork, nextApplyWork
 }
 
-func leafPredsEmitPosting[K ~uint64 | ~string, V any](
-	cursor *queryCursor[K, V],
+func leafPredsEmitPosting(
+	cursor *queryCursor,
 	preds *pooled.SliceBuf[leafPred],
 	active []int,
 	exactActive []int,
@@ -439,7 +431,7 @@ func leafPredsEmitPosting[K ~uint64 | ~string, V any](
 	return false, exactWork, applyWork
 }
 
-func (qv *queryView[K, V]) tryLimitQuery(q *qir.Shape, trace *queryTrace) ([]K, bool, PlanName, error) {
+func (qv *queryView) tryLimitQuery(q *qir.Shape, trace *queryTrace) ([]uint64, bool, PlanName, error) {
 	if q.Limit == 0 || q.Offset != 0 {
 		return nil, false, "", nil
 	}
@@ -492,7 +484,7 @@ func (qv *queryView[K, V]) tryLimitQuery(q *qir.Shape, trace *queryTrace) ([]K, 
 	return out, true, PlanLimit, err
 }
 
-func (qv *queryView[K, V]) extractNoOrderBounds(leaves []qir.Expr) (string, rangeBounds, bool, error) {
+func (qv *queryView) extractNoOrderBounds(leaves []qir.Expr) (string, rangeBounds, bool, error) {
 	var (
 		f      string
 		bounds rangeBounds
@@ -541,7 +533,7 @@ func (qv *queryView[K, V]) extractNoOrderBounds(leaves []qir.Expr) (string, rang
 //
 // The goal is to keep EQ(unique) queries on the same fast path regardless of
 // whether caller sets Max(1) explicitly.
-func (qv *queryView[K, V]) tryUniqueEqNoOrder(q *qir.Shape, trace *queryTrace) ([]K, bool, error) {
+func (qv *queryView) tryUniqueEqNoOrder(q *qir.Shape, trace *queryTrace) ([]uint64, bool, error) {
 	if q == nil || q.Expr.Not || q.Offset != 0 || q.HasOrder {
 		return nil, false, nil
 	}
@@ -617,7 +609,7 @@ func (qv *queryView[K, V]) tryUniqueEqNoOrder(q *qir.Shape, trace *queryTrace) (
 	}
 
 	needAll := q.Limit == 0
-	out := make([]K, 0, 1)
+	out := make([]uint64, 0, 1)
 	cursor := qv.newQueryCursor(out, 0, q.Limit, needAll, 0)
 
 	var examined uint64
@@ -655,7 +647,7 @@ func (qv *queryView[K, V]) tryUniqueEqNoOrder(q *qir.Shape, trace *queryTrace) (
 	return cursor.out, true, nil
 }
 
-func (qv *queryView[K, V]) tryDirectSingleUniqueEqNoOrder(q *qir.Shape, trace *queryTrace) ([]K, bool, error) {
+func (qv *queryView) tryDirectSingleUniqueEqNoOrder(q *qir.Shape, trace *queryTrace) ([]uint64, bool, error) {
 	if q == nil || q.Offset != 0 || q.HasOrder {
 		return nil, false, nil
 	}
@@ -695,8 +687,8 @@ func (qv *queryView[K, V]) tryDirectSingleUniqueEqNoOrder(q *qir.Shape, trace *q
 		trace.setPlan(PlanUniqueEq)
 	}
 	if idx, ok := ids.TrySingle(); ok {
-		out := make([]K, 1)
-		out[0] = qv.idFromIdxNoLock(idx)
+		out := make([]uint64, 1)
+		out[0] = idx
 		if trace != nil {
 			trace.addExamined(1)
 			if q.Limit == 1 {
@@ -713,7 +705,7 @@ func (qv *queryView[K, V]) tryDirectSingleUniqueEqNoOrder(q *qir.Shape, trace *q
 	if needAll {
 		capOut = clampUint64ToInt(ids.Cardinality())
 	}
-	out := make([]K, 0, capOut)
+	out := make([]uint64, 0, capOut)
 	cursor := qv.newQueryCursor(out, 0, q.Limit, needAll, 0)
 	var examined uint64
 	var examinedPtr *uint64
@@ -732,7 +724,7 @@ func (qv *queryView[K, V]) tryDirectSingleUniqueEqNoOrder(q *qir.Shape, trace *q
 	return cursor.out, true, nil
 }
 
-func (qv *queryView[K, V]) hasPrefixBoundForField(leaves []qir.Expr, field string) bool {
+func (qv *queryView) hasPrefixBoundForField(leaves []qir.Expr, field string) bool {
 	for _, e := range leaves {
 		if e.Not {
 			continue
@@ -744,7 +736,7 @@ func (qv *queryView[K, V]) hasPrefixBoundForField(leaves []qir.Expr, field strin
 	return false
 }
 
-func (qv *queryView[K, V]) tryLimitQueryNoOrder(q *qir.Shape, leaves []qir.Expr, trace *queryTrace) ([]K, bool, error) {
+func (qv *queryView) tryLimitQueryNoOrder(q *qir.Shape, leaves []qir.Expr, trace *queryTrace) ([]uint64, bool, error) {
 
 	predsBuf := leafPredSlicePool.Get()
 	predsBuf.Grow(len(leaves))
@@ -776,7 +768,7 @@ func (qv *queryView[K, V]) tryLimitQueryNoOrder(q *qir.Shape, leaves []qir.Expr,
 	leadNeedsCheck := lead.leadIterNeedsContainsCheck()
 
 	limit := int(q.Limit)
-	out := make([]K, 0, limit)
+	out := make([]uint64, 0, limit)
 	cursor := qv.newQueryCursor(out, 0, q.Limit, false, 0)
 
 	iter := lead.iterNew()
@@ -813,7 +805,7 @@ func (qv *queryView[K, V]) tryLimitQueryNoOrder(q *qir.Shape, leaves []qir.Expr,
 	return cursor.out, true, nil
 }
 
-func (qv *queryView[K, V]) tryLimitQueryOrderBasic(q *qir.Shape, leaves []qir.Expr, trace *queryTrace) ([]K, bool, error) {
+func (qv *queryView) tryLimitQueryOrderBasic(q *qir.Shape, leaves []qir.Expr, trace *queryTrace) ([]uint64, bool, error) {
 	order := q.Order
 	needWindow, _ := orderWindow(q)
 
@@ -914,7 +906,7 @@ func (qv *queryView[K, V]) tryLimitQueryOrderBasic(q *qir.Shape, leaves []qir.Ex
 	return out, true, nil
 }
 
-func (qv *queryView[K, V]) tryLimitQueryRangeNoOrderByField(q *qir.Shape, field string, bounds rangeBounds, leaves []qir.Expr, trace *queryTrace) ([]K, bool, error) {
+func (qv *queryView) tryLimitQueryRangeNoOrderByField(q *qir.Shape, field string, bounds rangeBounds, leaves []qir.Expr, trace *queryTrace) ([]uint64, bool, error) {
 
 	fm := qv.fields[field]
 	if fm == nil || fm.Slice {
@@ -949,7 +941,7 @@ func (qv *queryView[K, V]) tryLimitQueryRangeNoOrderByField(q *qir.Shape, field 
 	return qv.scanLimitByOverlayBounds(q, ov, br, false, predsBuf, "", trace), true, nil
 }
 
-func (qv *queryView[K, V]) buildLeafPredsExcludingBounds(leaves []qir.Expr, field string, orderedWindow int) (*pooled.SliceBuf[leafPred], bool, error) {
+func (qv *queryView) buildLeafPredsExcludingBounds(leaves []qir.Expr, field string, orderedWindow int) (*pooled.SliceBuf[leafPred], bool, error) {
 	predsBuf := leafPredSlicePool.Get()
 	predsBuf.Grow(len(leaves))
 	orderedUniverse := uint64(0)
@@ -1063,9 +1055,9 @@ func (qv *queryView[K, V]) buildLeafPredsExcludingBounds(leaves []qir.Expr, fiel
 	return predsBuf, true, nil
 }
 
-func (qv *queryView[K, V]) scanLimitByOverlayBounds(q *qir.Shape, ov fieldOverlay, br overlayRange, desc bool, preds *pooled.SliceBuf[leafPred], nilTailField string, trace *queryTrace) []K {
+func (qv *queryView) scanLimitByOverlayBounds(q *qir.Shape, ov fieldOverlay, br overlayRange, desc bool, preds *pooled.SliceBuf[leafPred], nilTailField string, trace *queryTrace) []uint64 {
 	limit := int(q.Limit)
-	out := make([]K, 0, limit)
+	out := make([]uint64, 0, limit)
 	cursor := qv.newQueryCursor(out, 0, q.Limit, false, 0)
 	trackScanWidth := q.HasOrder
 	var (
@@ -1197,7 +1189,7 @@ func isBoundOp(op qir.Op) bool {
 	}
 }
 
-func (qv *queryView[K, V]) extractBoundsForField(field string, leaves []qir.Expr) (rangeBounds, bool, error) {
+func (qv *queryView) extractBoundsForField(field string, leaves []qir.Expr) (rangeBounds, bool, error) {
 	var b rangeBounds
 	found := false
 
@@ -1290,7 +1282,7 @@ func applyBoundsToIndexRange(s []index, b rangeBounds) (start, end int) {
 	return start, end
 }
 
-func (qv *queryView[K, V]) buildLeafPred(e qir.Expr) (leafPred, bool, error) {
+func (qv *queryView) buildLeafPred(e qir.Expr) (leafPred, bool, error) {
 	if e.Not || e.FieldOrdinal < 0 {
 		return leafPred{}, false, nil
 	}
@@ -1486,7 +1478,7 @@ func (qv *queryView[K, V]) buildLeafPred(e qir.Expr) (leafPred, bool, error) {
 	return leafPred{}, false, nil
 }
 
-func (qv *queryView[K, V]) buildLimitLeafPred(e qir.Expr, orderedWindow int) (leafPred, bool, error) {
+func (qv *queryView) buildLimitLeafPred(e qir.Expr, orderedWindow int) (leafPred, bool, error) {
 	if orderedWindow > 0 && isSimpleScalarRangeOrPrefixLeaf(e) && !e.Not {
 		if candidate, ok := qv.prepareScalarRangeRoutingCandidate(e); ok &&
 			candidate.plan.orderedEagerMaterializeUseful(orderedWindow, qv.snapshotUniverseCardinality()) {
@@ -1512,7 +1504,7 @@ func (qv *queryView[K, V]) buildLimitLeafPred(e qir.Expr, orderedWindow int) (le
 	return qv.buildLeafPred(e)
 }
 
-func (qv *queryView[K, V]) buildMergedLimitLeafPred(e qir.Expr, bounds rangeBounds, orderedWindow int) (leafPred, bool, error) {
+func (qv *queryView) buildMergedLimitLeafPred(e qir.Expr, bounds rangeBounds, orderedWindow int) (leafPred, bool, error) {
 	fm := qv.fieldMetaByExpr(e)
 	if fm == nil || fm.Slice {
 		return leafPred{}, false, nil
@@ -1520,7 +1512,7 @@ func (qv *queryView[K, V]) buildMergedLimitLeafPred(e qir.Expr, bounds rangeBoun
 	fieldName := qv.fieldNameByOrdinal(e.FieldOrdinal)
 	allowMaterialize := false
 	if orderedWindow > 0 {
-		var core preparedScalarRangePredicate[K, V]
+		var core preparedScalarRangePredicate
 		qv.initPreparedExactScalarRangePredicate(&core, e, fm, bounds)
 		allowMaterialize = core.orderedEagerMaterializeUseful(orderedWindow)
 	}
@@ -1548,7 +1540,7 @@ func (qv *queryView[K, V]) buildMergedLimitLeafPred(e qir.Expr, bounds rangeBoun
 	}, true, nil
 }
 
-func (qv *queryView[K, V]) supportsLimitLeafPredExpr(e qir.Expr) bool {
+func (qv *queryView) supportsLimitLeafPredExpr(e qir.Expr) bool {
 	if e.Not || e.FieldOrdinal < 0 {
 		return false
 	}
@@ -1573,7 +1565,7 @@ func (qv *queryView[K, V]) supportsLimitLeafPredExpr(e qir.Expr) bool {
 	}
 }
 
-func (qv *queryView[K, V]) supportsLimitLeafPredsExcludingBounds(leaves []qir.Expr, field string) bool {
+func (qv *queryView) supportsLimitLeafPredsExcludingBounds(leaves []qir.Expr, field string) bool {
 	hasResidual := false
 	for _, e := range leaves {
 		if isBoundOp(e.Op) && !e.Not && qv.fieldNameByOrdinal(e.FieldOrdinal) == field {
@@ -1587,7 +1579,7 @@ func (qv *queryView[K, V]) supportsLimitLeafPredsExcludingBounds(leaves []qir.Ex
 	return hasResidual
 }
 
-func (qv *queryView[K, V]) hasWarmScalarLimitLeafPredsExcludingBounds(leaves []qir.Expr, field string) bool {
+func (qv *queryView) hasWarmScalarLimitLeafPredsExcludingBounds(leaves []qir.Expr, field string) bool {
 	for _, e := range leaves {
 		if isBoundOp(e.Op) && !e.Not && qv.fieldNameByOrdinal(e.FieldOrdinal) == field {
 			continue
@@ -1607,7 +1599,7 @@ func (qv *queryView[K, V]) hasWarmScalarLimitLeafPredsExcludingBounds(leaves []q
 	return false
 }
 
-func (qv *queryView[K, V]) attachLeafPredPostingFilter(p *leafPred) {
+func (qv *queryView) attachLeafPredPostingFilter(p *leafPred) {
 	if p == nil || p.postCount() <= 1 {
 		return
 	}

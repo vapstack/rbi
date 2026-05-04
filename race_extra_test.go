@@ -931,7 +931,7 @@ func TestRaceExtra_PublicNumericRangeQueriesStayExactAcrossConcurrentUnchangedFi
 
 	raceExtraSetNumericBucketKnobs(t, db, 128, 1, 1)
 
-	makeView := func() *queryView[uint64, raceExtraRec] {
+	makeView := func() *queryView {
 		return db.makeQueryView(db.getSnapshot())
 	}
 

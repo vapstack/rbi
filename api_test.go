@@ -2875,14 +2875,16 @@ func TestIOExt_Set_CommitFailure_RollsBackNeighborBucketAndKeepsSequence(t *test
 
 	beforeSeq := readBucketSequence(t, db.Bolt(), db.BucketName())
 	injected := errors.New("inject commit fail")
-	db.testHooks.beforeCommit = func(op string) error {
-		if op == "set" {
-			return injected
-		}
-		return nil
+	db.testHooks = &testHooks{
+		beforeCommit: func(op string) error {
+			if op == "set" {
+				return injected
+			}
+			return nil
+		},
 	}
 	defer func() {
-		db.testHooks.beforeCommit = nil
+		db.testHooks = nil
 	}()
 
 	err := db.Set("ghost", &Product{SKU: "ghost", Price: 11}, BeforeCommit(func(tx *bbolt.Tx, key string, oldValue, newValue *Product) error {

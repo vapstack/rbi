@@ -226,7 +226,18 @@ func execPreparedQueryForTest[K ~uint64 | ~string](db *DB[K, Rec], q *qx.QX) ([]
 		return nil, err
 	}
 	defer prepared.Release()
-	return db.execPreparedQuery(&viewQ)
+
+	snap, seq, ref, pinned := db.pinCurrentSnapshot()
+	defer db.unpinCurrentSnapshot(seq, ref, pinned)
+
+	view := db.makeQueryView(snap)
+	defer db.releaseQueryView(view)
+
+	ids, err := view.execPreparedQuery(&viewQ)
+	if err != nil {
+		return nil, err
+	}
+	return db.queryKeysFromIDs(snap, ids), nil
 }
 
 func queryContractNoOrderWindow(q *qx.QX) bool {

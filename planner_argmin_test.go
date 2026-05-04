@@ -90,8 +90,8 @@ func plannerArgminOrderedCandidatesForDecision(
 	}, true
 }
 
-func plannerArgminOROrderCandidatesForTest[K ~string | ~uint64, V any](
-	qv *queryView[K, V],
+func plannerArgminOROrderCandidatesForTest(
+	qv *queryView,
 	q *qir.Shape,
 	branches plannerORBranches,
 	analysis *plannerOROrderAnalysis,
@@ -144,7 +144,7 @@ func plannerArgminOROrderCandidatesForTest[K ~string | ~uint64, V any](
 
 	streamChecks := branches.orderStreamChecksByBranch(hasAlwaysTrue, analysis.mergeStats)
 	candidates.streamCost = float64(expectedRows) * streamChecks * orderStats.skew()
-	candidates.streamCost *= qv.root.plannerCostMultiplier(plannerCalOROrderStream)
+	candidates.streamCost *= qv.engine.plannerCostMultiplier(plannerCalOROrderStream)
 
 	mergeNeedLimit := plannerOROrderMergeNeedLimit(need, branches.Len(), unionCard, sumCard, q.Offset)
 	candidates.mergeApplicable = !hasAlwaysTrue && need <= mergeNeedLimit
@@ -171,7 +171,7 @@ func plannerArgminOROrderCandidatesForTest[K ~string | ~uint64, V any](
 		!branches.hasKWayExactBucketApplyWork(analysis.mergeStats) {
 		candidates.mergeCost = routeCost.kWay
 	}
-	candidates.mergeCost *= qv.root.plannerCostMultiplier(plannerCalOROrderMerge)
+	candidates.mergeCost *= qv.engine.plannerCostMultiplier(plannerCalOROrderMerge)
 	return candidates, true
 }
 

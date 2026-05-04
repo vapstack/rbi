@@ -196,7 +196,7 @@ func (st *autoBatchState[K, V]) clearPayload() {
 }
 
 func (st *autoBatchState[K, V]) setKeyFromID(db *DB[K, V], id K) {
-	if db.strkey {
+	if db.strKey {
 		s := *(*string)(unsafe.Pointer(&id))
 		st.key = unsafe.Slice(unsafe.StringData(s), len(s))
 		return
@@ -206,7 +206,7 @@ func (st *autoBatchState[K, V]) setKeyFromID(db *DB[K, V], id K) {
 }
 
 func (st *autoBatchAttemptState[K, V]) rollbackCreated(ops []autoBatchPrepared[K, V]) {
-	if !st.db.strkey {
+	if !st.db.strKey {
 		return
 	}
 	for i := range ops {
@@ -338,7 +338,7 @@ func runBeforeCommitHooks[K ~string | ~uint64, V any](tx *bbolt.Tx, id K, oldVal
 }
 
 func (db *DB[K, V]) rollbackCreatedStrIdxIfNeeded(op autoBatchPrepared[K, V]) {
-	if !db.strkey {
+	if !db.strKey {
 		return
 	}
 	if !op.idxNew || op.oldVal != nil || op.newVal == nil {
@@ -597,10 +597,8 @@ func (db *DB[K, V]) runAutoBatcherLoop() {
 	}
 }
 
-func autoBatchFrontLimit[K ~string | ~uint64, V any](ab *autoBatcher[K, V], limit int) int {
-	if limit <= 0 || limit > ab.queueLen() {
-		limit = ab.queueLen()
-	}
+func (ab *autoBatcher[K, V]) frontLimit() int {
+	limit := min(ab.maxOps, ab.queueSize)
 	if limit <= 1 {
 		return limit
 	}
@@ -678,7 +676,7 @@ func (db *DB[K, V]) popAutoBatch() []*autoBatchJob[K, V] {
 		return nil
 	}
 
-	frontLimit := autoBatchFrontLimit(&db.autoBatcher, db.autoBatcher.maxOps)
+	frontLimit := db.autoBatcher.frontLimit()
 	waitDur := db.autoBatchWaitDurationLocked(frontLimit)
 
 	if waitDur > 0 {
@@ -740,7 +738,7 @@ func (db *DB[K, V]) popAutoBatch() []*autoBatchJob[K, V] {
 		}
 	}
 
-	n := autoBatchFrontLimit(&db.autoBatcher, db.autoBatcher.maxOps)
+	n := db.autoBatcher.frontLimit()
 	n = db.autoBatchRepeatedIDLimitLocked(n)
 
 	batch := db.autoBatcher.dequeueFrontScratch(n)
@@ -810,11 +808,11 @@ func (db *DB[K, V]) patchTouchesUnique(patch []Field) bool {
 			return true
 		}
 		if f.DBName != "" {
-			if indexed, ok := db.fields[f.DBName]; ok && indexed.Unique {
+			if indexed, ok := db.indexFields[f.DBName]; ok && indexed.Unique {
 				return true
 			}
 		}
-		if indexed, ok := db.fields[f.Name]; ok && indexed.Unique {
+		if indexed, ok := db.indexFields[f.Name]; ok && indexed.Unique {
 			return true
 		}
 	}

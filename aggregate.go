@@ -173,7 +173,7 @@ func (db *DB[K, V]) prepareAggregate(src *qx.QX) (*aggregateQuery, error) {
 		return nil, fmt.Errorf("%w: aggregate projection is not supported", ErrInvalidQuery)
 	}
 
-	filter, err := qir.PrepareQueryResolved(&qx.QX{Filter: src.Filter}, preparedFieldResolver[K, V]{db: db})
+	filter, err := qir.PrepareQuery(&qx.QX{Filter: src.Filter}, db.indexedFieldMap)
 	if err != nil {
 		return nil, err
 	}
@@ -436,9 +436,9 @@ func (db *DB[K, V]) prepareAggregateGroup(expr qx.Expr) (aggregateFieldRef, erro
 	if expr.Kind != qx.KindREF || expr.Name == "" {
 		return aggregateFieldRef{}, fmt.Errorf("%w: GROUP BY supports only field references", ErrInvalidQuery)
 	}
-	acc, ok := db.indexedFieldByName[expr.Name]
+	acc, ok := db.indexedFieldMap[expr.Name]
 	if !ok {
-		if _, measure := db.measureFieldByName[expr.Name]; measure {
+		if _, measure := db.measureFieldMap[expr.Name]; measure {
 			return aggregateFieldRef{}, fmt.Errorf("%w: GROUP BY measure field %q is not supported", ErrInvalidQuery, expr.Name)
 		}
 		return aggregateFieldRef{}, fmt.Errorf("%w: no index for group field %q", ErrInvalidQuery, expr.Name)
@@ -511,13 +511,13 @@ func (db *DB[K, V]) prepareAggregateMetric(expr qx.Expr) (aggregateMetric, error
 }
 
 func (db *DB[K, V]) prepareAggregateMetricField(name string, op aggregateMetricOp) (aggregateFieldRef, error) {
-	if acc, ok := db.measureFieldByName[name]; ok {
+	if acc, ok := db.measureFieldMap[name]; ok {
 		if op == aggregateMetricDistinct || op == aggregateMetricCountDistinct {
 			return aggregateFieldRef{}, fmt.Errorf("%w: DISTINCT over measure field %q is not supported", ErrInvalidQuery, name)
 		}
 		return aggregateFieldRef{name: name, measure: acc, isMeasure: true, kind: aggregateMeasureValueKind(acc.kind)}, nil
 	}
-	acc, ok := db.indexedFieldByName[name]
+	acc, ok := db.indexedFieldMap[name]
 	if !ok {
 		return aggregateFieldRef{}, fmt.Errorf("%w: no index for aggregate field %q", ErrInvalidQuery, name)
 	}
@@ -629,7 +629,7 @@ func isAggregateFloatKind(kind reflect.Kind) bool {
 	}
 }
 
-func (qv *queryView[K, V]) aggregateMatchedIDs(q *qir.Query) (posting.List, error) {
+func (qv *queryView) aggregateMatchedIDs(q *qir.Query) (posting.List, error) {
 	if q == nil {
 		return qv.snapshotUniverseView(), nil
 	}
@@ -651,7 +651,7 @@ func (qv *queryView[K, V]) aggregateMatchedIDs(q *qir.Query) (posting.List, erro
 	return ids, nil
 }
 
-func (qv *queryView[K, V]) executeAggregate(q *aggregateQuery, ids posting.List) (Result, error) {
+func (qv *queryView) executeAggregate(q *aggregateQuery, ids posting.List) (Result, error) {
 	if ids.IsEmpty() {
 		if len(q.metrics) == 1 && q.metrics[0].op == aggregateMetricDistinct && len(q.groups) == 0 {
 			return Result{Layout: []string{q.metrics[0].out}, Rows: make([]Row, 0)}, nil
@@ -669,7 +669,7 @@ func (qv *queryView[K, V]) executeAggregate(q *aggregateQuery, ids posting.List)
 	return qv.executeUngroupedAggregate(q, ids)
 }
 
-func (qv *queryView[K, V]) executeUngroupedAggregate(q *aggregateQuery, ids posting.List) (Result, error) {
+func (qv *queryView) executeUngroupedAggregate(q *aggregateQuery, ids posting.List) (Result, error) {
 	layout := make([]string, len(q.metrics))
 	states := make([]aggregateMetricState, len(q.metrics))
 	empty := ids.IsEmpty()
@@ -701,7 +701,7 @@ func groupedAggregateLayout(q *aggregateQuery) []string {
 	return layout
 }
 
-func (qv *queryView[K, V]) executeDistinctAggregate(metric aggregateMetric, ids posting.List) (Result, error) {
+func (qv *queryView) executeDistinctAggregate(metric aggregateMetric, ids posting.List) (Result, error) {
 	rows := make([]Row, 0)
 	if err := qv.appendDistinctRows(&rows, metric.field.ordinary, ids); err != nil {
 		return Result{}, err
@@ -709,7 +709,7 @@ func (qv *queryView[K, V]) executeDistinctAggregate(metric aggregateMetric, ids 
 	return Result{Layout: []string{metric.out}, Rows: rows}, nil
 }
 
-func (qv *queryView[K, V]) executeGroupedAggregate(q *aggregateQuery, ids posting.List) (Result, error) {
+func (qv *queryView) executeGroupedAggregate(q *aggregateQuery, ids posting.List) (Result, error) {
 	if qv.canExecuteGroupedOrdinaryByID(q, ids) {
 		return qv.executeGroupedOrdinaryByID(q, ids)
 	}
@@ -722,7 +722,7 @@ func (qv *queryView[K, V]) executeGroupedAggregate(q *aggregateQuery, ids postin
 	return Result{Layout: layout, Rows: rows}, nil
 }
 
-func (qv *queryView[K, V]) canExecuteGroupedOrdinaryByID(q *aggregateQuery, ids posting.List) bool {
+func (qv *queryView) canExecuteGroupedOrdinaryByID(q *aggregateQuery, ids posting.List) bool {
 	hasOrdinary := false
 	for i := range q.metrics {
 		metric := q.metrics[i]
@@ -754,7 +754,7 @@ func (qv *queryView[K, V]) canExecuteGroupedOrdinaryByID(q *aggregateQuery, ids 
 	return aggregateMulGreater(groupEstimate, metricKeys, metricRows)
 }
 
-func (qv *queryView[K, V]) aggregateOrdinaryMetricWork(q *aggregateQuery) (uint64, uint64, uint64) {
+func (qv *queryView) aggregateOrdinaryMetricWork(q *aggregateQuery) (uint64, uint64, uint64) {
 	var keys uint64
 	var rows uint64
 	var minRows uint64
@@ -774,7 +774,7 @@ func (qv *queryView[K, V]) aggregateOrdinaryMetricWork(q *aggregateQuery) (uint6
 	return keys, rows, minRows
 }
 
-func (qv *queryView[K, V]) aggregateGroupCountUpperBound(q *aggregateQuery, filterCardinality uint64) uint64 {
+func (qv *queryView) aggregateGroupCountUpperBound(q *aggregateQuery, filterCardinality uint64) uint64 {
 	groups := uint64(1)
 	for i := range q.groups {
 		acc := q.groups[i].ordinary
@@ -814,7 +814,7 @@ func aggregateMulGreater(a uint64, b uint64, limit uint64) bool {
 	return b != 0 && a > limit/b
 }
 
-func (qv *queryView[K, V]) executeGroupedOrdinaryByID(q *aggregateQuery, ids posting.List) (Result, error) {
+func (qv *queryView) executeGroupedOrdinaryByID(q *aggregateQuery, ids posting.List) (Result, error) {
 	layout := groupedAggregateLayout(q)
 	rows := make([]Row, 0)
 	states := aggregateMetricStateSlicePool.Get()
@@ -854,7 +854,7 @@ func releaseAggregateGroupIDOrdinals(groupByID *pooled.SliceBuf[uint32], ids pos
 	aggregateGroupIDOrdinalSlicePool.Put(groupByID)
 }
 
-func (qv *queryView[K, V]) buildGroupedOrdinaryIDMap(
+func (qv *queryView) buildGroupedOrdinaryIDMap(
 	q *aggregateQuery,
 	current posting.List,
 	level int,
@@ -927,7 +927,7 @@ func (qv *queryView[K, V]) buildGroupedOrdinaryIDMap(
 	return nil
 }
 
-func (qv *queryView[K, V]) foldGroupedOrdinaryByID(
+func (qv *queryView) foldGroupedOrdinaryByID(
 	q *aggregateQuery,
 	rows []Row,
 	states *pooled.SliceBuf[aggregateMetricState],
@@ -958,7 +958,7 @@ func hasPriorOrdinaryAggregateMetric(metrics []aggregateMetric, pos int) bool {
 	return false
 }
 
-func (qv *queryView[K, V]) foldGroupedOrdinaryFieldByID(
+func (qv *queryView) foldGroupedOrdinaryFieldByID(
 	q *aggregateQuery,
 	rows []Row,
 	states *pooled.SliceBuf[aggregateMetricState],
@@ -1062,7 +1062,7 @@ func resetAggregateGroupBucketCounts(counts *pooled.SliceBuf[uint64], touched *p
 	touched.Truncate()
 }
 
-func (qv *queryView[K, V]) aggregateGroupRecursive(
+func (qv *queryView) aggregateGroupRecursive(
 	q *aggregateQuery,
 	current posting.List,
 	level int,
@@ -1121,7 +1121,7 @@ func (qv *queryView[K, V]) aggregateGroupRecursive(
 	return nil
 }
 
-func (qv *queryView[K, V]) appendDistinctRows(rows *[]Row, acc indexedFieldAccessor, ids posting.List) error {
+func (qv *queryView) appendDistinctRows(rows *[]Row, acc indexedFieldAccessor, ids posting.List) error {
 	ov := newFieldOverlayStorage(qv.snap.index.Get(acc.ordinal))
 	universe := qv.snapshotUniverseCardinality()
 	filterCardinality := ids.Cardinality()
@@ -1143,7 +1143,7 @@ func (qv *queryView[K, V]) appendDistinctRows(rows *[]Row, acc indexedFieldAcces
 	return nil
 }
 
-func (qv *queryView[K, V]) foldAggregateMetricStates(states []aggregateMetricState, ids posting.List) error {
+func (qv *queryView) foldAggregateMetricStates(states []aggregateMetricState, ids posting.List) error {
 	for i := range states {
 		metric := states[i].metric
 		if metric.rowCount {
@@ -1167,7 +1167,7 @@ func (qv *queryView[K, V]) foldAggregateMetricStates(states []aggregateMetricSta
 	return nil
 }
 
-func (qv *queryView[K, V]) foldMeasureMetric(state *aggregateMetricState, ids posting.List) error {
+func (qv *queryView) foldMeasureMetric(state *aggregateMetricState, ids posting.List) error {
 	acc := state.metric.field.measure
 	storage := qv.snap.measure.Get(acc.ordinal)
 	if ids.IsEmpty() || storage.rows() == 0 {
@@ -1319,7 +1319,7 @@ func aggregateMetricsShareOrdinaryField(a aggregateMetric, b aggregateMetric) bo
 		a.field.ordinary.ordinal == b.field.ordinary.ordinal
 }
 
-func (qv *queryView[K, V]) foldOrdinaryMetricStates(states []aggregateMetricState, ids posting.List, first int) error {
+func (qv *queryView) foldOrdinaryMetricStates(states []aggregateMetricState, ids posting.List, first int) error {
 	acc := states[first].metric.field.ordinary
 	ov := newFieldOverlayStorage(qv.snap.index.Get(acc.ordinal))
 	universe := qv.snapshotUniverseCardinality()

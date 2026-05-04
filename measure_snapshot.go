@@ -83,7 +83,7 @@ func (db *DB[K, V]) forEachSnapshotModifiedMeasureField(op snapshotBatchEntry[K,
 			if !ok {
 				continue
 			}
-			acc, ok := db.measureFieldByName[f.DBName]
+			acc, ok := db.measureFieldMap[f.DBName]
 			if !ok {
 				continue
 			}

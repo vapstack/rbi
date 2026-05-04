@@ -1411,46 +1411,91 @@ func queryStringIDsEqual(q *qx.QX, a, b []string) bool {
 	return slices.Equal(sortedStringIDs(a), sortedStringIDs(b))
 }
 
-type preparedRouteEqUint64 interface {
-	rootDB() *DB[uint64, Rec]
-}
-
-type preparedRouteEqString interface {
-	rootDB() *DB[string, Rec]
-}
-
-func preparedRouteViewUint64(src preparedRouteEqUint64) *queryView[uint64, Rec] {
+func preparedRouteViewUint64(src any) *queryView {
 	switch v := any(src).(type) {
 	case *DB[uint64, Rec]:
 		return v.currentQueryViewForTests()
-	case *queryView[uint64, Rec]:
+	case *queryView:
 		return v
 	default:
 		panic("unexpected uint64 prepared route source")
 	}
 }
 
-func preparedRouteViewString(src preparedRouteEqString) *queryView[string, Rec] {
+func preparedRouteViewString(src any) *queryView {
 	switch v := any(src).(type) {
 	case *DB[string, Rec]:
 		return v.currentQueryViewForTests()
-	case *queryView[string, Rec]:
+	case *queryView:
 		return v
 	default:
 		panic("unexpected string prepared route source")
 	}
 }
 
+func preparedRouteDBUint64(src any) *DB[uint64, Rec] {
+	if db, ok := any(src).(*DB[uint64, Rec]); ok {
+		return db
+	}
+	return nil
+}
+
+func preparedRouteDBString(src any) *DB[string, Rec] {
+	if db, ok := any(src).(*DB[string, Rec]); ok {
+		return db
+	}
+	return nil
+}
+
+func preparePreparedRouteQuery(src any, q *qx.QX) (*qir.Query, qir.Shape, error) {
+	if db := preparedRouteDBUint64(src); db != nil {
+		return prepareTestQuery(db, q)
+	}
+	view := preparedRouteViewUint64(src)
+	prepared, err := qir.PrepareQuery(q, view.engine.indexedFieldMap)
+	if err != nil {
+		return nil, qir.Shape{}, err
+	}
+	return prepared, qir.NewShape(prepared), nil
+}
+
+func preparePreparedRouteQueryString(src any, q *qx.QX) (*qir.Query, qir.Shape, error) {
+	if db := preparedRouteDBString(src); db != nil {
+		return prepareTestQuery(db, q)
+	}
+	view := preparedRouteViewString(src)
+	prepared, err := qir.PrepareQuery(q, view.engine.indexedFieldMap)
+	if err != nil {
+		return nil, qir.Shape{}, err
+	}
+	return prepared, qir.NewShape(prepared), nil
+}
+
+func queryStringKeysFromIDs(view *queryView, ids []uint64) []string {
+	if len(ids) == 0 {
+		return nil
+	}
+	out := make([]string, len(ids))
+	for i, idx := range ids {
+		s, ok := view.strMapView.getStringNoLock(idx)
+		if !ok {
+			panic("rbi: no string key associated with snapshot idx")
+		}
+		out[i] = s
+	}
+	return out
+}
+
 func assertPreparedRouteEquivalenceString(
 	t testing.TB,
-	db preparedRouteEqString,
+	db any,
 	q *qx.QX,
 ) (nq *qx.QX, ref []string, usedExecution bool, usedPlanner bool) {
 	t.Helper()
 
 	view := preparedRouteViewString(db)
 	nq = normalizeQueryForTest(q)
-	prepared, viewQ, err := prepareTestQuery(db.rootDB(), nq)
+	prepared, viewQ, err := preparePreparedRouteQueryString(db, nq)
 	if err != nil {
 		t.Fatalf("prepareQuery(%+v): %v", nq, err)
 	}
@@ -1460,10 +1505,11 @@ func assertPreparedRouteEquivalenceString(
 		t.Fatalf("checkUsedQuery(%+v): %v", nq, err)
 	}
 
-	ref, err = view.execPreparedQuery(&viewQ)
+	refIDs, err := view.execPreparedQuery(&viewQ)
 	if err != nil {
 		t.Fatalf("execPreparedQuery(%+v): %v", nq, err)
 	}
+	ref = queryStringKeysFromIDs(view, refIDs)
 	assertNoDuplicateStringIDs(t, "prepared", ref)
 
 	strictEqual := len(nq.Order) > 0 || (nq.Window.Limit == 0 && nq.Window.Offset == 0)
@@ -1473,36 +1519,44 @@ func assertPreparedRouteEquivalenceString(
 		fullQ.Window.Offset = 0
 		fullQ.Window.Limit = 0
 
-		fullPrepared, fullViewQ, ferr := prepareTestQuery(db.rootDB(), fullQ)
+		fullPrepared, fullViewQ, ferr := preparePreparedRouteQueryString(db, fullQ)
 		if ferr != nil {
 			t.Fatalf("prepareQuery(full %+v): %v", fullQ, ferr)
 		}
-		noOrderFull, err = view.execPreparedQuery(&fullViewQ)
+		noOrderFullIDs, err := view.execPreparedQuery(&fullViewQ)
 		fullPrepared.Release()
 		if err != nil {
 			t.Fatalf("execPreparedQuery(full %+v): %v", fullQ, err)
 		}
+		noOrderFull = queryStringKeysFromIDs(view, noOrderFullIDs)
 		assertNoOrderWindowSubsetString(t, nq, ref, noOrderFull, "prepared")
 	}
 
-	execOut, ok, err := view.tryExecutionPlan(&viewQ, nil)
+	execOutIDs, ok, err := view.tryExecutionPlan(&viewQ, nil)
 	if err != nil {
 		t.Fatalf("tryExecutionPlan(%+v): %v", nq, err)
 	}
 	if ok {
+		execOut := queryStringKeysFromIDs(view, execOutIDs)
 		assertNoDuplicateStringIDs(t, "execution", execOut)
 		if strictEqual {
 			if !queryStringIDsEqual(nq, ref, execOut) {
-				want, werr := expectedKeysString(t, db.rootDB(), q)
-				if werr != nil {
+				if rootDB := preparedRouteDBString(db); rootDB != nil {
+					want, werr := expectedKeysString(t, rootDB, q)
+					if werr != nil {
+						t.Fatalf(
+							"execution route mismatch:\nq=%+v\nnq=%+v\nref=%v\nexecution=%v\nseqscan_err=%v",
+							q, nq, ref, execOut, werr,
+						)
+					}
 					t.Fatalf(
-						"execution route mismatch:\nq=%+v\nnq=%+v\nref=%v\nexecution=%v\nseqscan_err=%v",
-						q, nq, ref, execOut, werr,
+						"execution route mismatch:\nq=%+v\nnq=%+v\nref=%v\nexecution=%v\nseqscan=%v",
+						q, nq, ref, execOut, want,
 					)
 				}
 				t.Fatalf(
-					"execution route mismatch:\nq=%+v\nnq=%+v\nref=%v\nexecution=%v\nseqscan=%v",
-					q, nq, ref, execOut, want,
+					"execution route mismatch:\nq=%+v\nnq=%+v\nref=%v\nexecution=%v",
+					q, nq, ref, execOut,
 				)
 			}
 		} else {
@@ -1511,24 +1565,31 @@ func assertPreparedRouteEquivalenceString(
 		usedExecution = true
 	}
 
-	planOut, ok, err := view.tryPlan(&viewQ, nil)
+	planOutIDs, ok, err := view.tryPlan(&viewQ, nil)
 	if err != nil {
 		t.Fatalf("tryPlan(%+v): %v", nq, err)
 	}
 	if ok {
+		planOut := queryStringKeysFromIDs(view, planOutIDs)
 		assertNoDuplicateStringIDs(t, "planner", planOut)
 		if strictEqual {
 			if !queryStringIDsEqual(nq, ref, planOut) {
-				want, werr := expectedKeysString(t, db.rootDB(), q)
-				if werr != nil {
+				if rootDB := preparedRouteDBString(db); rootDB != nil {
+					want, werr := expectedKeysString(t, rootDB, q)
+					if werr != nil {
+						t.Fatalf(
+							"planner route mismatch:\nq=%+v\nnq=%+v\nref=%v\nplanner=%v\nseqscan_err=%v",
+							q, nq, ref, planOut, werr,
+						)
+					}
 					t.Fatalf(
-						"planner route mismatch:\nq=%+v\nnq=%+v\nref=%v\nplanner=%v\nseqscan_err=%v",
-						q, nq, ref, planOut, werr,
+						"planner route mismatch:\nq=%+v\nnq=%+v\nref=%v\nplanner=%v\nseqscan=%v",
+						q, nq, ref, planOut, want,
 					)
 				}
 				t.Fatalf(
-					"planner route mismatch:\nq=%+v\nnq=%+v\nref=%v\nplanner=%v\nseqscan=%v",
-					q, nq, ref, planOut, want,
+					"planner route mismatch:\nq=%+v\nnq=%+v\nref=%v\nplanner=%v",
+					q, nq, ref, planOut,
 				)
 			}
 		} else {
@@ -2636,12 +2697,12 @@ func assertNoOrderWindowSubset(t testing.TB, q *qx.QX, got, full []uint64, label
 	}
 }
 
-func assertPreparedRouteEquivalence(t testing.TB, db preparedRouteEqUint64, q *qx.QX) (nq *qx.QX, ref []uint64, usedExecution bool, usedPlanner bool) {
+func assertPreparedRouteEquivalence(t testing.TB, db any, q *qx.QX) (nq *qx.QX, ref []uint64, usedExecution bool, usedPlanner bool) {
 	t.Helper()
 
 	view := preparedRouteViewUint64(db)
 	nq = normalizeQueryForTest(q)
-	prepared, viewQ, err := prepareTestQuery(db.rootDB(), nq)
+	prepared, viewQ, err := preparePreparedRouteQuery(db, nq)
 	if err != nil {
 		t.Fatalf("prepareQuery(%+v): %v", nq, err)
 	}
@@ -2664,7 +2725,7 @@ func assertPreparedRouteEquivalence(t testing.TB, db preparedRouteEqUint64, q *q
 		fullQ.Window.Offset = 0
 		fullQ.Window.Limit = 0
 
-		fullPrepared, fullViewQ, ferr := prepareTestQuery(db.rootDB(), fullQ)
+		fullPrepared, fullViewQ, ferr := preparePreparedRouteQuery(db, fullQ)
 		if ferr != nil {
 			t.Fatalf("prepareQuery(full %+v): %v", fullQ, ferr)
 		}
@@ -2685,7 +2746,11 @@ func assertPreparedRouteEquivalence(t testing.TB, db preparedRouteEqUint64, q *q
 		if strictEqual {
 			if !queryIDsEqual(nq, ref, execOut) {
 				if tt, ok := t.(*testing.T); ok {
-					want, werr := expectedKeysUint64(tt, db.rootDB(), q)
+					rootDB := preparedRouteDBUint64(db)
+					if rootDB == nil {
+						t.Fatalf("execution route mismatch:\nq=%+v\nnq=%+v\nref=%v\nexecution=%v", q, nq, ref, execOut)
+					}
+					want, werr := expectedKeysUint64(tt, rootDB, q)
 					if werr != nil {
 						t.Fatalf("execution route mismatch:\nq=%+v\nnq=%+v\nref=%v\nexecution=%v\nseqscan_err=%v", q, nq, ref, execOut, werr)
 					}
@@ -2708,7 +2773,11 @@ func assertPreparedRouteEquivalence(t testing.TB, db preparedRouteEqUint64, q *q
 		if strictEqual {
 			if !queryIDsEqual(nq, ref, planOut) {
 				if tt, ok := t.(*testing.T); ok {
-					want, werr := expectedKeysUint64(tt, db.rootDB(), q)
+					rootDB := preparedRouteDBUint64(db)
+					if rootDB == nil {
+						t.Fatalf("planner route mismatch:\nq=%+v\nnq=%+v\nref=%v\nplanner=%v", q, nq, ref, planOut)
+					}
+					want, werr := expectedKeysUint64(tt, rootDB, q)
 					if werr != nil {
 						t.Fatalf("planner route mismatch:\nq=%+v\nnq=%+v\nref=%v\nplanner=%v\nseqscan_err=%v", q, nq, ref, planOut, werr)
 					}

@@ -361,7 +361,7 @@ func TestOrderPredicatesEmitPostingReader_SingleBucketCountSkipsWithoutMatches(t
 		},
 	})
 
-	cursor := queryCursor[uint64, Rec]{
+	cursor := queryCursor{
 		skip: 4,
 		need: 1,
 	}
@@ -676,7 +676,7 @@ func TestQuery_NoOrder_UnboundedLimit_RespectsOffset(t *testing.T) {
 	}
 }
 
-func baselineEmitAcceptedPostingNoOrder[K ~uint64 | ~string, V any](cursor *queryCursor[K, V], ids posting.List, examined *uint64) bool {
+func baselineEmitAcceptedPostingNoOrder(cursor *queryCursor, ids posting.List, examined *uint64) bool {
 	if ids.IsEmpty() {
 		return false
 	}
@@ -692,12 +692,13 @@ func baselineEmitAcceptedPostingNoOrder[K ~uint64 | ~string, V any](cursor *quer
 	return stop
 }
 
-func (qv *queryView[K, V]) baselineTryQueryRangeNoOrderWithLimit(q *qx.QX) ([]K, bool, error) {
-	prepared, viewQ, err := prepareTestQuery(qv.root, q)
+func (qv *queryView) baselineTryQueryRangeNoOrderWithLimit(q *qx.QX) ([]uint64, bool, error) {
+	prepared, err := qir.PrepareQuery(q, qv.engine.indexedFieldMap)
 	if err != nil {
 		return nil, false, err
 	}
 	defer prepared.Release()
+	viewQ := qir.NewShape(prepared)
 
 	if viewQ.HasOrder || viewQ.Limit == 0 {
 		return nil, false, nil
@@ -748,7 +749,7 @@ func (qv *queryView[K, V]) baselineTryQueryRangeNoOrderWithLimit(q *qx.QX) ([]K,
 			if ids.IsEmpty() {
 				return nil, true, nil
 			}
-			out := make([]K, 0, viewQ.Limit)
+			out := make([]uint64, 0, viewQ.Limit)
 			cursor := qv.newQueryCursor(out, viewQ.Offset, viewQ.Limit, false, 0)
 			var examined uint64
 			baselineEmitAcceptedPostingNoOrder(&cursor, ids, &examined)
@@ -772,7 +773,7 @@ func (qv *queryView[K, V]) baselineTryQueryRangeNoOrderWithLimit(q *qx.QX) ([]K,
 		return nil, true, nil
 	}
 
-	out := make([]K, 0, viewQ.Limit)
+	out := make([]uint64, 0, viewQ.Limit)
 	cursor := qv.newQueryCursor(out, viewQ.Offset, viewQ.Limit, false, 0)
 
 	keyCur := ov.newCursor(br, false)
@@ -792,12 +793,13 @@ func (qv *queryView[K, V]) baselineTryQueryRangeNoOrderWithLimit(q *qx.QX) ([]K,
 	return cursor.out, true, nil
 }
 
-func (qv *queryView[K, V]) baselineTryQueryPrefixNoOrderWithLimit(q *qx.QX) ([]K, bool, error) {
-	prepared, viewQ, err := prepareTestQuery(qv.root, q)
+func (qv *queryView) baselineTryQueryPrefixNoOrderWithLimit(q *qx.QX) ([]uint64, bool, error) {
+	prepared, err := qir.PrepareQuery(q, qv.engine.indexedFieldMap)
 	if err != nil {
 		return nil, false, err
 	}
 	defer prepared.Release()
+	viewQ := qir.NewShape(prepared)
 
 	if viewQ.HasOrder || viewQ.Limit == 0 {
 		return nil, false, nil
@@ -848,7 +850,7 @@ func (qv *queryView[K, V]) baselineTryQueryPrefixNoOrderWithLimit(q *qx.QX) ([]K
 		return nil, true, nil
 	}
 
-	out := make([]K, 0, viewQ.Limit)
+	out := make([]uint64, 0, viewQ.Limit)
 	cursor := qv.newQueryCursor(out, viewQ.Offset, viewQ.Limit, false, 0)
 
 	keyCur := ov.newCursor(br, false)
@@ -868,9 +870,9 @@ func (qv *queryView[K, V]) baselineTryQueryPrefixNoOrderWithLimit(q *qx.QX) ([]K
 	return cursor.out, true, nil
 }
 
-func baselineScanLimitByOverlayBounds[K ~uint64 | ~string, V any](db *queryView[K, V], q *qx.QX, ov fieldOverlay, br overlayRange, desc bool, preds *pooled.SliceBuf[leafPred], nilTailField string) []K {
+func baselineScanLimitByOverlayBounds(db *queryView, q *qx.QX, ov fieldOverlay, br overlayRange, desc bool, preds *pooled.SliceBuf[leafPred], nilTailField string) []uint64 {
 	limit := int(q.Window.Limit)
-	out := make([]K, 0, limit)
+	out := make([]uint64, 0, limit)
 	cursor := db.newQueryCursor(out, 0, q.Window.Limit, false, 0)
 	predCount := 0
 	if preds != nil {
@@ -1845,9 +1847,9 @@ func TestQuery_OrderBasic_WarmQueryLoadsCollapsedNumericRangeSpan(t *testing.T) 
 	}
 }
 
-func mustPrepareOrderBasicBaseCoresForTest[K ~string | ~uint64, V any](
+func mustPrepareOrderBasicBaseCoresForTest(
 	t *testing.T,
-	view *queryView[K, V],
+	view *queryView,
 	baseOps []qir.Expr,
 ) (*pooled.SliceBuf[orderBasicBaseCore], *pooled.SliceBuf[int]) {
 	t.Helper()

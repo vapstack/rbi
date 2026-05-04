@@ -108,7 +108,7 @@ func formatDiagnosticBytesPrefix(b []byte, limit int) string {
 }
 
 func (db *DB[K, V]) formatBuildIndexKeyDiagnostic(key []byte) string {
-	if db.strkey {
+	if db.strKey {
 		s := string(key)
 		if len(s) > 64 {
 			return fmt.Sprintf("id=%q...(len=%d key_prefix_hex=%s)", s[:64], len(s), formatDiagnosticBytesPrefix(key, 24))
@@ -1103,15 +1103,15 @@ func (db *DB[K, V]) buildIndex(skipFields map[string]struct{}, skipMeasureFields
 		}
 		done := ctx.Done()
 		c := b.Cursor()
-		if db.strkey {
-			db.strmap.Lock()
-			defer db.strmap.Unlock()
+		if db.strKey {
+			db.strMap.Lock()
+			defer db.strMap.Unlock()
 		}
 		nextGCAt := uint64(indexBuildGCStride)
 		nextReleaseAt := uint64(indexBuildReleaseOSMemoryStride)
 		scanned := uint64(0)
 		for k, v := c.First(); k != nil; k, v = c.Next() {
-			if !db.strkey && len(k) != 8 {
+			if !db.strKey && len(k) != 8 {
 				return fmt.Errorf(
 					"invalid uint64 key size scan_pos=%d key_len=%d key_prefix_hex=%s",
 					scanned+1,
@@ -1254,9 +1254,9 @@ func (db *DB[K, V]) buildIndex(skipFields map[string]struct{}, skipMeasureFields
 	db.stats.BuildTime = time.Since(start)
 	db.stats.BuildRPS = int(float64(recordCount) / max(time.Since(start).Seconds(), 1))
 
-	for name, f := range db.fields {
+	for name, f := range db.indexFields {
 		if f.Slice {
-			acc, ok := db.indexedFieldByName[name]
+			acc, ok := db.indexedFieldMap[name]
 			if !ok || db.lenIndex.Get(acc.ordinal).keyCount() == 0 {
 				db.buildLenIndex()
 				break
@@ -1378,8 +1378,8 @@ func indexKeyFromStoredString(s string, fixed8 bool) indexKey {
 }
 
 func (db *DB[K, V]) idxFromKeyNoLock(key []byte) uint64 {
-	if db.strkey {
-		return db.strmap.createIdxNoLock(string(key))
+	if db.strKey {
+		return db.strMap.createIdxNoLock(string(key))
 	}
 	return binary.BigEndian.Uint64(key)
 }
@@ -1410,7 +1410,7 @@ func (db *DB[K, V]) isLenZeroComplementField(field string) bool {
 	if field == "" {
 		return false
 	}
-	acc, ok := db.indexedFieldByName[field]
+	acc, ok := db.indexedFieldMap[field]
 	if !ok || db.lenZeroComplement == nil || acc.ordinal >= db.lenZeroComplement.Len() {
 		return false
 	}
@@ -1527,7 +1527,7 @@ func (db *DB[K, V]) loadIndexPayload(
 		return nil, nil, nil, false, err
 	}
 
-	compatible, err := readFieldCompatibility(reader, db.fields)
+	compatible, err := readFieldCompatibility(reader, db.indexFields)
 	if err != nil {
 		return nil, nil, nil, false, err
 	}
@@ -1561,8 +1561,8 @@ func (db *DB[K, V]) loadIndexPayload(
 		return nil, nil, nil, false, fmt.Errorf("decode: reading planner stats: %w", err)
 	}
 
-	skipFields := make(map[string]struct{}, len(db.fields))
-	for name := range db.fields {
+	skipFields := make(map[string]struct{}, len(db.indexFields))
+	for name := range db.indexFields {
 		_, hasRegular := indexes[name]
 		_, hasNil := nilIndexes[name]
 		if compatible[name] && (hasRegular || hasNil) {
@@ -1579,7 +1579,7 @@ func (db *DB[K, V]) loadIndexPayload(
 	}
 
 	db.universe = universe
-	db.strmap = strmap
+	db.strMap = strmap
 	releaseFieldIndexStorageSlotsOwned(db.index)
 	releaseFieldIndexStorageSlotsOwned(db.nilIndex)
 	releaseFieldIndexStorageSlotsOwned(db.lenIndex)
@@ -1622,21 +1622,21 @@ func (db *DB[K, V]) loadIndexPayload(
 	db.lenZeroComplement = detectLenZeroComplement(db.lenIndex, db.indexedFieldAccess)
 
 	lenLoaded := true
-	for name := range db.fields {
+	for name := range db.indexFields {
 		if _, ok := skipFields[name]; !ok {
 			lenLoaded = false
 			break
 		}
 	}
 	if lenLoaded && !universe.IsEmpty() {
-		for name, f := range db.fields {
+		for name, f := range db.indexFields {
 			if f == nil || !f.Slice {
 				continue
 			}
 			if _, ok := skipFields[name]; !ok {
 				continue
 			}
-			acc, ok := db.indexedFieldByName[name]
+			acc, ok := db.indexedFieldMap[name]
 			if !ok {
 				lenLoaded = false
 				break
@@ -1722,9 +1722,11 @@ func sameFieldDefinition(a, b *field) bool {
 }
 
 func (db *DB[K, V]) storeIndex() error {
-	if hook := db.testHooks.beforeStoreIndex; hook != nil {
-		if err := hook(); err != nil {
-			return err
+	if db.testHooks != nil {
+		if hook := db.testHooks.beforeStoreIndex; hook != nil {
+			if err := hook(); err != nil {
+				return err
+			}
 		}
 	}
 
@@ -1792,7 +1794,7 @@ func (db *DB[K, V]) storeIndexPayload(writer *bufio.Writer) error {
 		return err
 	}
 
-	if err := writeFields(writer, db.fields); err != nil {
+	if err := writeFields(writer, db.indexFields); err != nil {
 		return err
 	}
 	if err := writeFields(writer, db.measureFields); err != nil {
@@ -1829,7 +1831,7 @@ func (db *DB[K, V]) storeIndexPayload(writer *bufio.Writer) error {
 	measureFieldNames := sortedMapFieldNames(db.measureFields)
 
 	if err := writeMeasureIndexFamily(writer, measureFieldNames, func(field string) measureFieldStorage {
-		acc := db.measureFieldByName[field]
+		acc := db.measureFieldMap[field]
 		if snap.measure == nil || acc.ordinal >= snap.measure.Len() {
 			return measureFieldStorage{}
 		}

@@ -1,6 +1,7 @@
 package rbi
 
 import (
+	"encoding/binary"
 	"fmt"
 	"unsafe"
 
@@ -23,7 +24,7 @@ func (db *DB[K, V]) Query(q *qx.QX) ([]*V, error) {
 	if q == nil {
 		return nil, fmt.Errorf("QX is nil")
 	}
-	prepared, err := qir.PrepareQueryResolved(q, preparedFieldResolver[K, V]{db: db})
+	prepared, err := qir.PrepareQuery(q, db.indexedFieldMap)
 	if err != nil {
 		return nil, err
 	}
@@ -40,7 +41,7 @@ func (db *DB[K, V]) Query(q *qx.QX) ([]*V, error) {
 	return db.queryRecords(tx, snap, &viewQ)
 }
 
-func (qv *queryView[K, V]) tryQueryEmptyOnSnapshot(q *qir.Shape) (bool, error) {
+func (qv *queryView) tryQueryEmptyOnSnapshot(q *qir.Shape) (bool, error) {
 	if q == nil || q.Offset != 0 || q.Limit != 0 || q.HasOrder {
 		return false, nil
 	}
@@ -147,11 +148,57 @@ func (db *DB[K, V]) queryRecords(tx *bbolt.Tx, snap *indexSnapshot, q *qir.Shape
 	if len(ids) == 0 {
 		return nil, nil
 	}
-	values, err := db.batchGetTxCompact(tx, ids)
+	values, err := db.batchGetTxCompactByIdx(tx, snap, ids)
 	if err != nil {
 		return nil, err
 	}
 	return values, nil
+}
+
+func (db *DB[K, V]) batchGetTxCompactByIdx(tx *bbolt.Tx, snap *indexSnapshot, ids []uint64) ([]*V, error) {
+	bucket := tx.Bucket(db.bucket)
+	if bucket == nil {
+		return nil, fmt.Errorf("bucket does not exist")
+	}
+	if len(ids) == 0 {
+		return nil, nil
+	}
+
+	out := make([]*V, 0, len(ids))
+	if db.strKey {
+		strmapView := snap.strmap
+		for _, idx := range ids {
+			s, ok := strmapView.getStringNoLock(idx)
+			if !ok {
+				panic("rbi: no string key associated with snapshot idx")
+			}
+			v := bucket.Get(unsafe.Slice(unsafe.StringData(s), len(s)))
+			if v == nil {
+				continue
+			}
+			value, err := db.decode(v)
+			if err != nil {
+				return out, fmt.Errorf("decode: %w", err)
+			}
+			out = append(out, value)
+		}
+		return out, nil
+	}
+
+	var key [8]byte
+	for _, idx := range ids {
+		binary.BigEndian.PutUint64(key[:], idx)
+		v := bucket.Get(key[:])
+		if v == nil {
+			continue
+		}
+		value, err := db.decode(v)
+		if err != nil {
+			return out, fmt.Errorf("decode: %w", err)
+		}
+		out = append(out, value)
+	}
+	return out, nil
 }
 
 func (db *DB[K, V]) pinCurrentSnapshot() (*indexSnapshot, uint64, *snapshotRef, bool) {
@@ -198,7 +245,7 @@ func (db *DB[K, V]) QueryKeys(q *qx.QX) ([]K, error) {
 	if q == nil {
 		return nil, fmt.Errorf("QX is nil")
 	}
-	prepared, err := qir.PrepareQueryResolved(q, preparedFieldResolver[K, V]{db: db})
+	prepared, err := qir.PrepareQuery(q, db.indexedFieldMap)
 	if err != nil {
 		return nil, err
 	}
@@ -211,12 +258,35 @@ func (db *DB[K, V]) QueryKeys(q *qx.QX) ([]K, error) {
 	view := db.makeQueryView(snap)
 	defer db.releaseQueryView(view)
 
-	return view.execQuery(&viewQ, true, false)
+	ids, err := view.execQuery(&viewQ, true, false)
+	if err != nil {
+		return nil, err
+	}
+	return db.queryKeysFromIDs(snap, ids), nil
+}
+
+func (db *DB[K, V]) queryKeysFromIDs(snap *indexSnapshot, ids []uint64) []K {
+	if len(ids) == 0 {
+		return nil
+	}
+	if !db.strKey {
+		return unsafe.Slice((*K)(unsafe.Pointer(&ids[0])), len(ids))
+	}
+	out := make([]K, len(ids))
+	strmapView := snap.strmap
+	for i, idx := range ids {
+		s, ok := strmapView.getStringNoLock(idx)
+		if !ok {
+			panic("rbi: no string key associated with snapshot idx")
+		}
+		out[i] = *(*K)(unsafe.Pointer(&s))
+	}
+	return out
 }
 
 // execPreparedQuery skips normalize/field-validation and tracing for internal
 // callers that already operate on validated/normalized QX.
-func (db *DB[K, V]) execPreparedQuery(q *qir.Shape) ([]K, error) {
+func (db *DB[K, V]) execPreparedQuery(q *qir.Shape) ([]uint64, error) {
 	snap, seq, ref, pinned := db.pinCurrentSnapshot()
 	defer db.unpinCurrentSnapshot(seq, ref, pinned)
 
@@ -238,38 +308,38 @@ func shouldSkipPlannerForArrayOrderShape(q *qir.Shape) bool {
 	}
 }
 
-func (db *DB[K, V]) makeQueryView(snap *indexSnapshot) *queryView[K, V] {
-	root := db
+func (db *DB[K, V]) makeQueryView(snap *indexSnapshot) *queryView {
+	root := db.engine
 	if db.traceRoot != nil {
-		root = db.traceRoot
+		root = db.traceRoot.engine
 	}
 	view := root.viewPool.Get()
-	*view = queryView[K, V]{
-		root:              root,
+	*view = queryView{
+		engine:            root,
 		snap:              snap,
-		strkey:            root.strkey,
-		strmapView:        snap.strmap,
+		strKey:            root.strkey,
+		strMapView:        snap.strmap,
 		fields:            root.fields,
-		planner:           &root.planner,
+		planner:           root.planner,
 		options:           root.options,
 		lenZeroComplement: snap.lenZeroComplement,
 	}
 	return view
 }
 
-func (db *DB[K, V]) releaseQueryView(view *queryView[K, V]) {
+func (db *DB[K, V]) releaseQueryView(view *queryView) {
 	if view == nil {
 		return
 	}
-	root := db
+	root := db.engine
 	if db.traceRoot != nil {
-		root = db.traceRoot
+		root = db.traceRoot.engine
 	}
-	*view = queryView[K, V]{}
+	*view = queryView{}
 	root.viewPool.Put(view)
 }
 
-func finishQueryTrace[K ~uint64 | ~string, V any](trace *queryTrace, out *[]K, err *error) {
+func finishQueryTrace(trace *queryTrace, out *[]uint64, err *error) {
 	if trace == nil {
 		return
 	}
@@ -289,12 +359,12 @@ func shouldMaterializeNegativeAllNumericKeys(universeCard, excludedCard uint64) 
 	return resultCard >= excludedCard*2
 }
 
-func (qv *queryView[K, V]) materializeNegativeResultKeys() []uint64 {
+func (qv *queryView) materializeNegativeResultKeys() []uint64 {
 	universe := qv.snapshotUniverseView()
 	return universe.ToArray()
 }
 
-func (qv *queryView[K, V]) materializeNegativeResultKeysExcluding(exclude posting.List) []uint64 {
+func (qv *queryView) materializeNegativeResultKeysExcluding(exclude posting.List) []uint64 {
 	if exclude.IsEmpty() {
 		return qv.materializeNegativeResultKeys()
 	}
@@ -307,7 +377,7 @@ func (qv *queryView[K, V]) materializeNegativeResultKeysExcluding(exclude postin
 	return out
 }
 
-func (qv *queryView[K, V]) execPreparedQuery(q *qir.Shape) ([]K, error) {
+func (qv *queryView) execPreparedQuery(q *qir.Shape) ([]uint64, error) {
 	return qv.execQuery(q, false, true)
 }
 
@@ -315,8 +385,8 @@ func (qv *queryView[K, V]) execPreparedQuery(q *qir.Shape) ([]K, error) {
 //
 // The method keeps all routing decisions in one place so fast-path/planner
 // selection remains consistent across QueryKeys and Query callers.
-func (qv *queryView[K, V]) execQuery(q *qir.Shape, emitTrace bool, prepared bool) (out []K, err error) {
-	traceEnabled := emitTrace && qv.root.traceOrCalibrationSamplingEnabled()
+func (qv *queryView) execQuery(q *qir.Shape, emitTrace bool, prepared bool) (out []uint64, err error) {
+	traceEnabled := emitTrace && qv.engine.traceOrCalibrationSamplingEnabled()
 
 	if !prepared && !traceEnabled {
 		if out, ok, fastErr := qv.tryDirectSingleUniqueEqNoOrder(q, nil); ok {
@@ -338,9 +408,9 @@ func (qv *queryView[K, V]) execQuery(q *qir.Shape, emitTrace bool, prepared bool
 
 	var trace *queryTrace
 	if traceEnabled {
-		trace = qv.root.beginTrace(*q)
+		trace = qv.engine.beginTrace(*q)
 		if trace != nil {
-			defer finishQueryTrace[K, V](trace, &out, &err)
+			defer finishQueryTrace(trace, &out, &err)
 		}
 	}
 
@@ -411,15 +481,15 @@ func (qv *queryView[K, V]) execQuery(q *qir.Shape, emitTrace bool, prepared bool
 
 	// case 1: no ordering, negative result: iterate over universe excluding the result set
 	if !q.HasOrder && result.neg {
-		if !qv.strkey && needAll && skip == 0 &&
+		if !qv.strKey && needAll && skip == 0 &&
 			shouldMaterializeNegativeAllNumericKeys(qv.snapshotUniverseCardinality(), result.ids.Cardinality()) {
 			ids := qv.materializeNegativeResultKeysExcluding(result.ids)
 			if len(ids) == 0 {
 				return nil, nil
 			}
-			return unsafe.Slice((*K)(unsafe.Pointer(&ids[0])), len(ids)), nil
+			return ids, nil
 		}
-		out = makeOutSlice[K](qv.postingResultCardinality(result), need)
+		out = makeOutSlice(qv.postingResultCardinality(result), need)
 		cursor := qv.newQueryCursor(out, skip, need, needAll, 0)
 
 		ex := result.ids
@@ -478,15 +548,15 @@ func (qv *queryView[K, V]) execQuery(q *qir.Shape, emitTrace bool, prepared bool
 
 	// Fast-path only when unbounded query also has no offset.
 	// Offset requires cursor-based pagination logic.
-	if !qv.strkey && needAll && skip == 0 {
+	if !qv.strKey && needAll && skip == 0 {
 		ids := result.ids.ToArray()
 		if len(ids) == 0 {
 			return nil, nil
 		}
-		return unsafe.Slice((*K)(unsafe.Pointer(&ids[0])), len(ids)), nil
+		return ids, nil
 	}
 
-	out = makeOutSlice[K](result.ids.Cardinality(), need)
+	out = makeOutSlice(result.ids.Cardinality(), need)
 	cursor := qv.newQueryCursor(out, skip, need, needAll, 0)
 
 	iter := result.ids.Iter()

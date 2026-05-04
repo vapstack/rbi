@@ -650,7 +650,7 @@ func inheritMaterializedPredCache[K ~string | ~uint64, V any](db *DB[K, V], next
 			continue
 		}
 		if changedFields != nil {
-			acc, ok := db.indexedFieldByName[f]
+			acc, ok := db.indexedFieldMap[f]
 			if !ok || changedFields.Get(acc.ordinal) {
 				continue
 			}
@@ -688,8 +688,8 @@ func inheritMaterializedPredCache[K ~string | ~uint64, V any](db *DB[K, V], next
 
 func (db *DB[K, V]) buildPublishedSnapshotNoLock(seq uint64) *indexSnapshot {
 	var strmap *strMapSnapshot
-	if db.strkey && db.strmap != nil {
-		strmap = db.strmap.snapshot()
+	if db.strKey && db.strMap != nil {
+		strmap = db.strMap.snapshot()
 	}
 	snap := &indexSnapshot{
 		seq:                seq,
@@ -698,7 +698,7 @@ func (db *DB[K, V]) buildPublishedSnapshotNoLock(seq uint64) *indexSnapshot {
 		lenIndex:           db.lenIndex,
 		lenZeroComplement:  db.lenZeroComplement,
 		measure:            db.measure,
-		indexedFieldByName: db.indexedFieldByName,
+		indexedFieldByName: db.indexedFieldMap,
 		universe:           db.universe,
 		strmap:             strmap,
 	}
@@ -731,8 +731,8 @@ func (db *DB[K, V]) finishSnapshotPublishNoLock(s *indexSnapshot) {
 	db.measure = s.measure
 	db.universe = s.universe
 	retired := db.publishSnapshotRef(s)
-	if db.strkey && db.strmap != nil {
-		db.strmap.markCommittedPublished(s.strmap)
+	if db.strKey && db.strMap != nil {
+		db.strMap.markCommittedPublished(s.strmap)
 	}
 	releaseRetiredSnapshots(retired)
 }
@@ -1608,9 +1608,9 @@ func (db *DB[K, V]) buildPreparedSnapshotFromEmptyBaseNoLock(seq uint64, prev *i
 		lenIndex:           nextLenIndex,
 		lenZeroComplement:  nextLenZeroComplement,
 		measure:            nextMeasure,
-		indexedFieldByName: db.indexedFieldByName,
+		indexedFieldByName: db.indexedFieldMap,
 		universe:           universe,
-		strmap:             db.strmap.snapshot(),
+		strmap:             db.strMap.snapshot(),
 	}
 	db.initSnapshotRuntimeCaches(snap)
 	inheritNumericRangeBucketCache(snap, prev)
@@ -1794,9 +1794,9 @@ func (db *DB[K, V]) buildPreparedSnapshotInsertOnlyNoLock(seq uint64, prev *inde
 		lenIndex:           cloneFieldIndexStorageSlots(prev.lenIndex, len(db.indexedFieldAccess)),
 		lenZeroComplement:  cloneFieldIndexBoolSlots(prev.lenZeroComplement, len(db.indexedFieldAccess)),
 		measure:            cloneMeasureFieldStorageSlots(prev.measure, len(db.measureFieldAccess)),
-		indexedFieldByName: db.indexedFieldByName,
+		indexedFieldByName: db.indexedFieldMap,
 		universe:           prev.universe.Clone(),
-		strmap:             db.strmap.snapshot(),
+		strmap:             db.strMap.snapshot(),
 	}
 	next.universe = next.universe.BuildMergedOwned(addedUniverse)
 	db.initSnapshotRuntimeCaches(next)

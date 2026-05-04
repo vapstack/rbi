@@ -235,8 +235,8 @@ func TestTransparentMode_IgnoresPersistedIndexAndDoesNotStoreSidecar(t *testing.
 	if !db.transparent {
 		t.Fatal("expected transparent mode")
 	}
-	if db.strmap != nil {
-		t.Fatalf("transparent mode must not allocate strmap: %#v", db.strmap)
+	if db.strMap != nil {
+		t.Fatalf("transparent mode must not allocate strmap: %#v", db.strMap)
 	}
 	if db.snapshot.current.Load() != nil {
 		t.Fatal("transparent mode must not publish snapshots")
@@ -421,20 +421,20 @@ func TestIndexTags_OptInSupportRBIOnlyAndIgnoresDBI(t *testing.T) {
 		"rbi_wins_unique",
 		"rbi_wins_enabled",
 	} {
-		if _, ok := db.fields[f]; !ok {
+		if _, ok := db.indexFields[f]; !ok {
 			t.Fatalf("expected indexed field %q", f)
 		}
 	}
-	if _, ok := db.fields["untagged"]; ok {
+	if _, ok := db.indexFields["untagged"]; ok {
 		t.Fatal("untagged field must stay non-indexed")
 	}
-	if _, ok := db.fields["db_default"]; ok {
+	if _, ok := db.indexFields["db_default"]; ok {
 		t.Fatal("dbi default must be ignored")
 	}
-	if _, ok := db.fields["db_unique"]; ok {
+	if _, ok := db.indexFields["db_unique"]; ok {
 		t.Fatal("dbi unique must be ignored")
 	}
-	if _, ok := db.fields["rbi_wins_disabled"]; ok {
+	if _, ok := db.indexFields["rbi_wins_disabled"]; ok {
 		t.Fatal("rbi disable must ignore dbi")
 	}
 
@@ -512,8 +512,8 @@ func TestIndexTags_OptInLeavesUntaggedStructTransparent(t *testing.T) {
 	if !db.transparent {
 		t.Fatal("expected transparent mode for untagged struct")
 	}
-	if len(db.fields) != 0 {
-		t.Fatalf("expected no indexed fields, got %d", len(db.fields))
+	if len(db.indexFields) != 0 {
+		t.Fatalf("expected no indexed fields, got %d", len(db.indexFields))
 	}
 }
 
@@ -596,8 +596,8 @@ func TestIndexTags_RBIDisableIgnoresForeignDBITag(t *testing.T) {
 	if !db.transparent {
 		t.Fatal("expected transparent mode")
 	}
-	if len(db.fields) != 0 {
-		t.Fatalf("expected no indexed fields, got %d", len(db.fields))
+	if len(db.indexFields) != 0 {
+		t.Fatalf("expected no indexed fields, got %d", len(db.indexFields))
 	}
 }
 
@@ -613,7 +613,7 @@ func TestIndexTags_RBIIndexIgnoresDBIDisable(t *testing.T) {
 	if db.transparent {
 		t.Fatal("expected indexed mode")
 	}
-	if _, ok := db.fields["name"]; !ok {
+	if _, ok := db.indexFields["name"]; !ok {
 		t.Fatal("expected name to be indexed")
 	}
 
@@ -641,10 +641,10 @@ func TestIndexTags_EmbeddedParentIndexDoesNotEnableSharedFields(t *testing.T) {
 	if db.transparent {
 		t.Fatal("expected indexed mode because embedded Email has its own unique tag")
 	}
-	if _, ok := db.fields["name"]; ok {
+	if _, ok := db.indexFields["name"]; ok {
 		t.Fatal("embedded parent index tag must not enable untagged child field")
 	}
-	if _, ok := db.fields["email"]; !ok {
+	if _, ok := db.indexFields["email"]; !ok {
 		t.Fatal("embedded child field with its own tag must stay indexed")
 	}
 
@@ -672,8 +672,8 @@ func TestIndexTags_EmbeddedParentDisableSuppressesSharedFields(t *testing.T) {
 	if !db.transparent {
 		t.Fatal("expected transparent mode")
 	}
-	if len(db.fields) != 0 {
-		t.Fatalf("expected no indexed fields, got %d", len(db.fields))
+	if len(db.indexFields) != 0 {
+		t.Fatalf("expected no indexed fields, got %d", len(db.indexFields))
 	}
 
 	if err := db.Set(1, &embeddedDisabledByParentRec{
@@ -700,7 +700,7 @@ func TestIndexTags_DBTagDashDoesNotDisableIndexing(t *testing.T) {
 	if db.transparent {
 		t.Fatal("expected indexed mode")
 	}
-	f, ok := db.fields["Name"]
+	f, ok := db.indexFields["Name"]
 	if !ok {
 		t.Fatal("expected field to be indexed under Go field name")
 	}
@@ -746,22 +746,22 @@ func TestIndexOptions_OverrideTagsAndResolveGoAndDBNames(t *testing.T) {
 	if db.transparent {
 		t.Fatal("expected indexed mode")
 	}
-	if _, ok := db.fields["name"]; !ok {
+	if _, ok := db.indexFields["name"]; !ok {
 		t.Fatal("Options.Index must accept Go field name")
 	}
-	if _, ok := db.fields["score_db"]; !ok {
+	if _, ok := db.indexFields["score_db"]; !ok {
 		t.Fatal("Options.Index must accept db field name")
 	}
-	if _, ok := db.fields["email"]; ok {
+	if _, ok := db.indexFields["email"]; ok {
 		t.Fatal("Options.Index must ignore rbi tags when map is non-nil")
 	}
-	if _, ok := db.fields["amount"]; ok {
+	if _, ok := db.indexFields["amount"]; ok {
 		t.Fatal("measure field must not be registered as ordinary index")
 	}
 	if _, ok := db.measureFields["amount"]; !ok {
 		t.Fatal("Options.Index measure field is missing")
 	}
-	if acc, ok := db.measureFieldByName["amount"]; !ok {
+	if acc, ok := db.measureFieldMap["amount"]; !ok {
 		t.Fatal("Options.Index measure accessor is missing")
 	} else if acc.kind != measureValueSigned {
 		t.Fatalf("measure accessor kind=%d want signed", acc.kind)
@@ -796,10 +796,10 @@ func TestIndexOptions_DBTagsResolveWhenEmbeddedGoNamesCollide(t *testing.T) {
 		_ = db.Close()
 		_ = rawDBTags.Close()
 	})
-	if _, ok := db.fields["left_id"]; !ok {
+	if _, ok := db.indexFields["left_id"]; !ok {
 		t.Fatal("Options.Index must accept left db tag despite colliding Go names")
 	}
-	if _, ok := db.fields["right_id"]; !ok {
+	if _, ok := db.indexFields["right_id"]; !ok {
 		t.Fatal("Options.Index must accept right db tag despite colliding Go names")
 	}
 
@@ -836,8 +836,8 @@ func TestIndexOptions_EmptyMapDisablesTags(t *testing.T) {
 	if !db.transparent {
 		t.Fatal("non-nil empty Options.Index must disable all indexes")
 	}
-	if len(db.fields) != 0 {
-		t.Fatalf("expected no ordinary fields, got %d", len(db.fields))
+	if len(db.indexFields) != 0 {
+		t.Fatalf("expected no ordinary fields, got %d", len(db.indexFields))
 	}
 	if len(db.measureFields) != 0 {
 		t.Fatalf("expected no measure fields, got %d", len(db.measureFields))
@@ -961,16 +961,16 @@ func TestIndexTags_MeasureMetadataIsSeparateFromOrdinaryIndex(t *testing.T) {
 	if db.transparent {
 		t.Fatal("measure DB must not be transparent")
 	}
-	if _, ok := db.fields["status"]; !ok {
+	if _, ok := db.indexFields["status"]; !ok {
 		t.Fatal("ordinary indexed field is missing")
 	}
-	if _, ok := db.fields["amount"]; ok {
+	if _, ok := db.indexFields["amount"]; ok {
 		t.Fatal("measure field must not be visible to ordinary indexes")
 	}
 	if _, ok := db.measureFields["amount"]; !ok {
 		t.Fatal("measure field is missing")
 	}
-	if acc, ok := db.measureFieldByName["amount"]; !ok {
+	if acc, ok := db.measureFieldMap["amount"]; !ok {
 		t.Fatal("measure accessor is missing")
 	} else if acc.ordinal != 0 {
 		t.Fatalf("measure accessor ordinal=%d want 0", acc.ordinal)
@@ -978,7 +978,7 @@ func TestIndexTags_MeasureMetadataIsSeparateFromOrdinaryIndex(t *testing.T) {
 	if err := db.Set(1, &measureTaggedRec{Status: "ok", Amount: 42}); err != nil {
 		t.Fatalf("Set measure record: %v", err)
 	}
-	acc := db.measureFieldByName["amount"]
+	acc := db.measureFieldMap["amount"]
 	if got, ok := db.getSnapshot().measure.Get(acc.ordinal).lookup(1); !ok || got != 42 {
 		t.Fatalf("measure storage lookup=(%d,%v) want (42,true)", got, ok)
 	}
@@ -1037,8 +1037,8 @@ func TestIndexTags_MeasureOnlyDBKeepsSnapshotMode(t *testing.T) {
 	if db.transparent {
 		t.Fatal("measure-only DB must not be transparent")
 	}
-	if len(db.fields) != 0 {
-		t.Fatalf("expected no ordinary fields, got %d", len(db.fields))
+	if len(db.indexFields) != 0 {
+		t.Fatalf("expected no ordinary fields, got %d", len(db.indexFields))
 	}
 	if _, ok := db.measureFields["amount"]; !ok {
 		t.Fatal("measure field is missing")
@@ -1049,7 +1049,7 @@ func TestIndexTags_MeasureOnlyDBKeepsSnapshotMode(t *testing.T) {
 	if err := db.Set(1, &measureOnlyRec{Amount: 7}); err != nil {
 		t.Fatalf("Set measure-only record: %v", err)
 	}
-	acc := db.measureFieldByName["amount"]
+	acc := db.measureFieldMap["amount"]
 	if got, ok := db.getSnapshot().measure.Get(acc.ordinal).lookup(1); !ok || got != 7 {
 		t.Fatalf("measure-only storage lookup=(%d,%v) want (7,true)", got, ok)
 	}
@@ -2190,19 +2190,21 @@ func TestBatchSet_CommitFail_DoesNotGrowStrMap(t *testing.T) {
 	if err := db.Set("p1", &Product{SKU: "p1", Price: 10}); err != nil {
 		t.Fatalf("seed Set: %v", err)
 	}
-	initial := len(db.strmap.Keys)
+	initial := len(db.strMap.Keys)
 
 	injected := errors.New("inject commit fail")
 	var failOnce atomic.Bool
 	failOnce.Store(true)
-	db.testHooks.beforeCommit = func(op string) error {
-		if op == "batch" && failOnce.CompareAndSwap(true, false) {
-			return injected
-		}
-		return nil
+	db.testHooks = &testHooks{
+		beforeCommit: func(op string) error {
+			if op == "batch" && failOnce.CompareAndSwap(true, false) {
+				return injected
+			}
+			return nil
+		},
 	}
 	defer func() {
-		db.testHooks.beforeCommit = nil
+		db.testHooks = nil
 	}()
 
 	err := db.Set("ghost-commit", &Product{SKU: "ghost-commit", Price: 11})
@@ -2214,7 +2216,7 @@ func TestBatchSet_CommitFail_DoesNotGrowStrMap(t *testing.T) {
 	} else if v != nil {
 		t.Fatalf("ghost-commit should not persist after commit fail, got %#v", v)
 	}
-	if after := len(db.strmap.Keys); after != initial {
+	if after := len(db.strMap.Keys); after != initial {
 		t.Fatalf("strmap grew after batch commit failure: initial=%d after=%d", initial, after)
 	}
 
@@ -3739,17 +3741,19 @@ func TestFailpoint_CommitSetRollsBackAndKeepsState(t *testing.T) {
 		AutoBatchMax: 1,
 	})
 
-	db.testHooks.beforeCommit = func(op string) error {
-		if op == "set" {
-			return fmt.Errorf("failpoint: commit set")
-		}
-		return nil
+	db.testHooks = &testHooks{
+		beforeCommit: func(op string) error {
+			if op == "set" {
+				return fmt.Errorf("failpoint: commit set")
+			}
+			return nil
+		},
 	}
 	err := db.Set(1, &Rec{Name: "alice", Age: 30})
 	if err == nil || !strings.Contains(err.Error(), "failpoint: commit set") {
 		t.Fatalf("expected failpoint commit error, got: %v", err)
 	}
-	db.testHooks.beforeCommit = nil
+	db.testHooks = nil
 
 	v, err := db.Get(1)
 	if err != nil {
@@ -3774,18 +3778,20 @@ func TestFailpoint_CommitBatchRollsBackAndKeepsState(t *testing.T) {
 	})
 
 	var once atomic.Bool
-	db.testHooks.beforeCommit = func(op string) error {
-		if op == "batch" && once.CompareAndSwap(false, true) {
-			return fmt.Errorf("failpoint: commit batch")
-		}
-		return nil
+	db.testHooks = &testHooks{
+		beforeCommit: func(op string) error {
+			if op == "batch" && once.CompareAndSwap(false, true) {
+				return fmt.Errorf("failpoint: commit batch")
+			}
+			return nil
+		},
 	}
 
 	err := db.Set(1, &Rec{Name: "alice", Age: 30})
 	if err == nil || !strings.Contains(err.Error(), "failpoint: commit batch") {
 		t.Fatalf("expected failpoint batch commit error, got: %v", err)
 	}
-	db.testHooks.beforeCommit = nil
+	db.testHooks = nil
 
 	v, err := db.Get(1)
 	if err != nil {
@@ -3803,10 +3809,12 @@ func TestFailpoint_CommitBatchRollsBackAndKeepsState(t *testing.T) {
 func TestFailpoint_PostCommitPublishSet_BreaksDBAndSkipsIndexStore(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{AutoBatchMax: 1})
 
-	db.testHooks.afterCommitPublish = func(op string) {
-		if op == "set" {
-			panic("failpoint: publish set")
-		}
+	db.testHooks = &testHooks{
+		afterCommitPublish: func(op string) {
+			if op == "set" {
+				panic("failpoint: publish set")
+			}
+		},
 	}
 	err := db.Set(1, &Rec{Name: "alice", Age: 30})
 	if !errors.Is(err, ErrBroken) {
@@ -3842,8 +3850,10 @@ func TestFailpoint_PostCommitPublishSet_BreaksDBAndSkipsIndexStore(t *testing.T)
 		t.Fatalf("expected Query to fail with ErrBroken after broken publish, got: %v", err)
 	}
 
-	db.testHooks.beforeStoreIndex = func() error {
-		return fmt.Errorf("storeIndex must be skipped for broken db")
+	db.testHooks = &testHooks{
+		beforeStoreIndex: func() error {
+			return fmt.Errorf("storeIndex must be skipped for broken db")
+		},
 	}
 	if err = db.Close(); !errors.Is(err, ErrBroken) {
 		t.Fatalf("expected Close to return ErrBroken for broken db, got: %v", err)
@@ -3857,10 +3867,12 @@ func TestFailpoint_PostCommitPublishBatch_BreaksDBAndClearsStagedSnapshot(t *tes
 		AutoBatchMaxQueue: 1024,
 	})
 
-	db.testHooks.afterCommitPublish = func(op string) {
-		if op == "batch" {
-			panic("failpoint: publish batch")
-		}
+	db.testHooks = &testHooks{
+		afterCommitPublish: func(op string) {
+			if op == "batch" {
+				panic("failpoint: publish batch")
+			}
+		},
 	}
 	err := db.Set(1, &Rec{Name: "alice", Age: 30})
 	if !errors.Is(err, ErrBroken) {
@@ -3877,17 +3889,19 @@ func TestFailpoint_CommitTruncateRollsBackAndKeepsData(t *testing.T) {
 		t.Fatalf("Set(1): %v", err)
 	}
 
-	db.testHooks.beforeCommit = func(op string) error {
-		if op == "truncate" {
-			return fmt.Errorf("failpoint: commit truncate")
-		}
-		return nil
+	db.testHooks = &testHooks{
+		beforeCommit: func(op string) error {
+			if op == "truncate" {
+				return fmt.Errorf("failpoint: commit truncate")
+			}
+			return nil
+		},
 	}
 	err := db.Truncate()
 	if err == nil || !strings.Contains(err.Error(), "failpoint: commit truncate") {
 		t.Fatalf("expected truncate commit failpoint error, got: %v", err)
 	}
-	db.testHooks.beforeCommit = nil
+	db.testHooks = nil
 
 	v, err := db.Get(1)
 	if err != nil {
@@ -3973,17 +3987,19 @@ func TestFailpoint_CommitPatchAndDelete_RollbackAndNoStagedSnapshots(t *testing.
 			t.Fatalf("Set(1): %v", err)
 		}
 
-		db.testHooks.beforeCommit = func(op string) error {
-			if op == "patch" {
-				return fmt.Errorf("failpoint: patch")
-			}
-			return nil
+		db.testHooks = &testHooks{
+			beforeCommit: func(op string) error {
+				if op == "patch" {
+					return fmt.Errorf("failpoint: patch")
+				}
+				return nil
+			},
 		}
 		err := db.Patch(1, []Field{{Name: "age", Value: 99}})
 		if err == nil || !strings.Contains(err.Error(), "failpoint: patch") {
 			t.Fatalf("expected failpoint patch error, got: %v", err)
 		}
-		db.testHooks.beforeCommit = nil
+		db.testHooks = nil
 
 		assertNoFutureSnapshotRefs(t, db)
 		v, err := db.Get(1)
@@ -4001,17 +4017,19 @@ func TestFailpoint_CommitPatchAndDelete_RollbackAndNoStagedSnapshots(t *testing.
 			t.Fatalf("Set(1): %v", err)
 		}
 
-		db.testHooks.beforeCommit = func(op string) error {
-			if op == "delete" {
-				return fmt.Errorf("failpoint: delete")
-			}
-			return nil
+		db.testHooks = &testHooks{
+			beforeCommit: func(op string) error {
+				if op == "delete" {
+					return fmt.Errorf("failpoint: delete")
+				}
+				return nil
+			},
 		}
 		err := db.Delete(1)
 		if err == nil || !strings.Contains(err.Error(), "failpoint: delete") {
 			t.Fatalf("expected failpoint delete error, got: %v", err)
 		}
-		db.testHooks.beforeCommit = nil
+		db.testHooks = nil
 
 		assertNoFutureSnapshotRefs(t, db)
 		v, err := db.Get(1)
@@ -4134,17 +4152,19 @@ func TestFailpoint_CommitMultiWritePaths_RollbackAndNoStagedSnapshots(t *testing
 				c.setup(t, db)
 			}
 
-			db.testHooks.beforeCommit = func(op string) error {
-				if op == c.op {
-					return fmt.Errorf("failpoint: %s", c.op)
-				}
-				return nil
+			db.testHooks = &testHooks{
+				beforeCommit: func(op string) error {
+					if op == c.op {
+						return fmt.Errorf("failpoint: %s", c.op)
+					}
+					return nil
+				},
 			}
 			err := c.run(db)
 			if err == nil || !strings.Contains(err.Error(), "failpoint: "+c.op) {
 				t.Fatalf("expected failpoint error for %s, got: %v", c.op, err)
 			}
-			db.testHooks.beforeCommit = nil
+			db.testHooks = nil
 
 			assertNoFutureSnapshotRefs(t, db)
 
@@ -4938,8 +4958,10 @@ func TestFailpoint_CloseStoreIndexErrorStillCloses(t *testing.T) {
 		t.Fatalf("Set(1): %v", err)
 	}
 
-	db.testHooks.beforeStoreIndex = func() error {
-		return fmt.Errorf("failpoint: store index")
+	db.testHooks = &testHooks{
+		beforeStoreIndex: func() error {
+			return fmt.Errorf("failpoint: store index")
+		},
 	}
 	err := db.Close()
 	if err == nil || !strings.Contains(err.Error(), "failpoint: store index") {
@@ -5037,8 +5059,10 @@ func TestPersistedIndex_RebuildsAfterCloseFailure(t *testing.T) {
 	if err := db2.Set(2, &Rec{Name: "bob", Age: 40}); err != nil {
 		t.Fatalf("Set(2): %v", err)
 	}
-	db2.testHooks.beforeStoreIndex = func() error {
-		return fmt.Errorf("failpoint: store index")
+	db2.testHooks = &testHooks{
+		beforeStoreIndex: func() error {
+			return fmt.Errorf("failpoint: store index")
+		},
 	}
 	if err := db2.Close(); err == nil || !strings.Contains(err.Error(), "failpoint: store index") {
 		t.Fatalf("expected failpoint store index error on Close, got: %v", err)
@@ -5238,7 +5262,7 @@ func TestMissingIDs_DoNotGrowStrMap(t *testing.T) {
 		t.Fatalf("Set: %v", err)
 	}
 
-	initial := len(db.strmap.Keys)
+	initial := len(db.strMap.Keys)
 
 	if err := db.Patch("missing", []Field{{Name: "price", Value: 1.0}}); err != nil {
 		t.Fatalf("Patch(missing): %v", err)
@@ -5253,7 +5277,7 @@ func TestMissingIDs_DoNotGrowStrMap(t *testing.T) {
 		t.Fatalf("BatchPatch: %v", err)
 	}
 
-	after := len(db.strmap.Keys)
+	after := len(db.strMap.Keys)
 
 	if after != initial {
 		t.Fatalf("expected strmap size %d, got %d", initial, after)
@@ -5270,10 +5294,10 @@ func TestReadPaths_MissingKeys_DoNotGrowStrMap(t *testing.T) {
 		t.Fatalf("Set(p2): %v", err)
 	}
 
-	initial := len(db.strmap.Keys)
+	initial := len(db.strMap.Keys)
 	assertNoGrow := func(label string) {
 		t.Helper()
-		if after := len(db.strmap.Keys); after != initial {
+		if after := len(db.strMap.Keys); after != initial {
 			t.Fatalf("%s grew strmap: initial=%d after=%d", label, initial, after)
 		}
 	}
@@ -5353,7 +5377,7 @@ func TestFailedSetPaths_DoNotGrowStrMap(t *testing.T) {
 		t.Fatalf("seed Set: %v", err)
 	}
 
-	initial := len(db.strmap.Keys)
+	initial := len(db.strMap.Keys)
 	cbErr := errors.New("before commit fail")
 	cb := func(_ *bbolt.Tx, _ string, _ *Product, _ *Product) error { return cbErr }
 
@@ -5365,7 +5389,7 @@ func TestFailedSetPaths_DoNotGrowStrMap(t *testing.T) {
 	} else if v != nil {
 		t.Fatalf("ghost-set should not persist after rollback, got %#v", v)
 	}
-	if after := len(db.strmap.Keys); after != initial {
+	if after := len(db.strMap.Keys); after != initial {
 		t.Fatalf("strmap grew after failed Set: initial=%d after=%d", initial, after)
 	}
 
@@ -5390,7 +5414,7 @@ func TestFailedSetPaths_DoNotGrowStrMap(t *testing.T) {
 	} else if v != nil {
 		t.Fatalf("ghost-many-2 should not persist after rollback, got %#v", v)
 	}
-	if after := len(db.strmap.Keys); after != initial {
+	if after := len(db.strMap.Keys); after != initial {
 		t.Fatalf("strmap grew after failed BatchSet: initial=%d after=%d", initial, after)
 	}
 }
@@ -5418,7 +5442,7 @@ func TestBatchSet_CallbackError_DoesNotGrowStrMap(t *testing.T) {
 	if err := db.Set("p1", &Product{SKU: "p1", Price: 10}); err != nil {
 		t.Fatalf("seed Set: %v", err)
 	}
-	initial := len(db.strmap.Keys)
+	initial := len(db.strMap.Keys)
 
 	cbErr := errors.New("cb fail")
 	err := db.Set("ghost-cb", &Product{SKU: "ghost-cb", Price: 11}, BeforeCommit(func(_ *bbolt.Tx, _ string, _ *Product, _ *Product) error {
@@ -5432,7 +5456,7 @@ func TestBatchSet_CallbackError_DoesNotGrowStrMap(t *testing.T) {
 	} else if v != nil {
 		t.Fatalf("ghost-cb should not persist after rollback, got %#v", v)
 	}
-	if after := len(db.strmap.Keys); after != initial {
+	if after := len(db.strMap.Keys); after != initial {
 		t.Fatalf("strmap grew after batch callback rollback: initial=%d after=%d", initial, after)
 	}
 
@@ -5448,7 +5472,7 @@ func TestBatchSet_UniqueReject_DoesNotGrowStrMap(t *testing.T) {
 	if err := db.Set("u1", &StringUniqueTestRec{Email: "a@x", Code: 1}); err != nil {
 		t.Fatalf("seed Set: %v", err)
 	}
-	initial := len(db.strmap.Keys)
+	initial := len(db.strMap.Keys)
 
 	err := db.Set("u-dup", &StringUniqueTestRec{Email: "a@x", Code: 2})
 	if err == nil || !errors.Is(err, ErrUniqueViolation) {
@@ -5459,7 +5483,7 @@ func TestBatchSet_UniqueReject_DoesNotGrowStrMap(t *testing.T) {
 	} else if v != nil {
 		t.Fatalf("u-dup should not persist after unique reject, got %#v", v)
 	}
-	if after := len(db.strmap.Keys); after != initial {
+	if after := len(db.strMap.Keys); after != initial {
 		t.Fatalf("strmap grew after batch unique reject: initial=%d after=%d", initial, after)
 	}
 
@@ -5661,8 +5685,8 @@ type stableOrdinalRec struct {
 
 func TestInitIndexedFieldAccessors_AssignsStableSortedOrdinals(t *testing.T) {
 	db := &DB[uint64, stableOrdinalRec]{
-		fields: make(map[string]*field),
-		vtype:  reflect.TypeFor[stableOrdinalRec](),
+		indexFields: make(map[string]*field),
+		vtype:       reflect.TypeFor[stableOrdinalRec](),
 	}
 	if err := db.populateFields(db.vtype, nil); err != nil {
 		t.Fatalf("populateFields: %v", err)

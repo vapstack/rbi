@@ -193,7 +193,7 @@ func (db *DB[K, V]) makePatch(oldVal, newVal *V, target []Field, useJSON bool) [
 }
 
 func (db *DB[K, V]) keyFromID(id K) []byte {
-	if db.strkey {
+	if db.strKey {
 		s := *(*string)(unsafe.Pointer(&id))
 		return unsafe.Slice(unsafe.StringData(s), len(s))
 	}
@@ -203,7 +203,7 @@ func (db *DB[K, V]) keyFromID(id K) []byte {
 }
 
 func (db *DB[K, V]) idFromKey(b []byte) K {
-	if db.strkey {
+	if db.strKey {
 		s := string(b) // must allocate here because bytes are from bbolt
 		return *(*K)(unsafe.Pointer(&s))
 	}
@@ -217,75 +217,75 @@ func (db *DB[K, V]) idxFromID(id K) uint64 {
 }
 
 func (db *DB[K, V]) idxFromIDWithCreated(id K) (uint64, bool) {
-	if db.strkey {
+	if db.strKey {
 		s := *(*string)(unsafe.Pointer(&id))
-		db.strmap.Lock()
-		defer db.strmap.Unlock()
-		if idx, ok := db.strmap.Keys[s]; ok {
+		db.strMap.Lock()
+		defer db.strMap.Unlock()
+		if idx, ok := db.strMap.Keys[s]; ok {
 			return idx, false
 		}
-		idx := db.strmap.createIdxNoLock(s)
+		idx := db.strMap.createIdxNoLock(s)
 		return idx, true
 	}
 	return *(*uint64)(unsafe.Pointer(&id)), false
 }
 
 func (db *DB[K, V]) rollbackCreatedStrIdx(id K, idx uint64) {
-	if !db.strkey || idx == 0 {
+	if !db.strKey || idx == 0 {
 		return
 	}
 	s := *(*string)(unsafe.Pointer(&id))
 
-	db.strmap.Lock()
-	defer db.strmap.Unlock()
+	db.strMap.Lock()
+	defer db.strMap.Unlock()
 
-	cur, ok := db.strmap.Keys[s]
+	cur, ok := db.strMap.Keys[s]
 	if !ok || cur != idx {
 		return
 	}
 
-	delete(db.strmap.Keys, s)
-	if db.strmap.sparseStrs != nil {
-		delete(db.strmap.sparseStrs, idx)
+	delete(db.strMap.Keys, s)
+	if db.strMap.sparseStrs != nil {
+		delete(db.strMap.sparseStrs, idx)
 	} else if idx <= uint64(^uint(0)>>1) {
 		i := int(idx)
-		if i < len(db.strmap.Strs) {
-			db.strmap.Strs[i] = ""
+		if i < len(db.strMap.Strs) {
+			db.strMap.Strs[i] = ""
 		}
-		if i < len(db.strmap.strsUsed) {
-			db.strmap.strsUsed[i] = false
+		if i < len(db.strMap.strsUsed) {
+			db.strMap.strsUsed[i] = false
 		}
 	}
 
-	if idx <= db.strmap.Next {
-		for db.strmap.Next > 0 {
-			if db.strmap.sparseStrs != nil {
-				if _, ok := db.strmap.sparseStrs[db.strmap.Next]; ok {
+	if idx <= db.strMap.Next {
+		for db.strMap.Next > 0 {
+			if db.strMap.sparseStrs != nil {
+				if _, ok := db.strMap.sparseStrs[db.strMap.Next]; ok {
 					break
 				}
-				db.strmap.Next--
+				db.strMap.Next--
 				continue
 			}
-			if db.strmap.Next > uint64(^uint(0)>>1) {
-				db.strmap.Next = 0
+			if db.strMap.Next > uint64(^uint(0)>>1) {
+				db.strMap.Next = 0
 				break
 			}
-			i := int(db.strmap.Next)
-			if i < len(db.strmap.strsUsed) && db.strmap.strsUsed[i] {
+			i := int(db.strMap.Next)
+			if i < len(db.strMap.strsUsed) && db.strMap.strsUsed[i] {
 				break
 			}
-			db.strmap.Next--
+			db.strMap.Next--
 		}
 
-		if db.strmap.sparseStrs == nil {
-			trim := int(db.strmap.Next) + 1
-			if trim < len(db.strmap.Strs) {
-				clear(db.strmap.Strs[trim:])
-				db.strmap.Strs = db.strmap.Strs[:trim]
+		if db.strMap.sparseStrs == nil {
+			trim := int(db.strMap.Next) + 1
+			if trim < len(db.strMap.Strs) {
+				clear(db.strMap.Strs[trim:])
+				db.strMap.Strs = db.strMap.Strs[:trim]
 			}
-			if trim < len(db.strmap.strsUsed) {
-				clear(db.strmap.strsUsed[trim:])
-				db.strmap.strsUsed = db.strmap.strsUsed[:trim]
+			if trim < len(db.strMap.strsUsed) {
+				clear(db.strMap.strsUsed[trim:])
+				db.strMap.strsUsed = db.strMap.strsUsed[:trim]
 			}
 		}
 	}
@@ -294,7 +294,7 @@ func (db *DB[K, V]) rollbackCreatedStrIdx(id K, idx uint64) {
 	// caches past the committed state. Restore the committed writer-side base
 	// so the next successful publish can stay on the cheap append-only delta
 	// path instead of rematerializing the whole mapper.
-	db.strmap.restoreCommittedNoLock()
+	db.strMap.restoreCommittedNoLock()
 }
 
 func (db *DB[K, V]) addCheckedIdxsFromIDs(ids []K, dst *postingLazySetBuilder) uint64 {
@@ -303,15 +303,15 @@ func (db *DB[K, V]) addCheckedIdxsFromIDs(ids []K, dst *postingLazySetBuilder) u
 	}
 
 	dedupe := uint64(0)
-	if db.strkey {
+	if db.strKey {
 		s := *(*[]string)(unsafe.Pointer(&ids))
-		db.strmap.Lock()
+		db.strMap.Lock()
 		for i := range s {
-			if !dst.addChecked(db.strmap.createIdxNoLock(s[i])) {
+			if !dst.addChecked(db.strMap.createIdxNoLock(s[i])) {
 				dedupe++
 			}
 		}
-		db.strmap.Unlock()
+		db.strMap.Unlock()
 		return dedupe
 	}
 

@@ -299,10 +299,10 @@ func (db *DB[K, V]) addIndexedField(sf reflect.StructField, index []int, indexKi
 		db.measureFields[f.DBName] = f
 		return nil
 	}
-	if db.fields == nil {
-		db.fields = make(map[string]*field)
+	if db.indexFields == nil {
+		db.indexFields = make(map[string]*field)
 	}
-	db.fields[f.DBName] = f // last wins
+	db.indexFields[f.DBName] = f // last wins
 	return nil
 }
 

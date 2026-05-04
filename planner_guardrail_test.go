@@ -23,8 +23,8 @@ type plannerGuardrailFamily struct {
 	name                  string
 	open                  func(*testing.T, *traceContractRecorder) *DB[uint64, Rec]
 	cases                 []plannerGuardrailCase
-	runChosen             func(*queryView[uint64, Rec], *qir.Shape, *queryTrace) ([]uint64, bool, error)
-	runAlternative        func(*queryView[uint64, Rec], *qir.Shape, *queryTrace) ([]uint64, bool, error)
+	runChosen             func(*queryView, *qir.Shape, *queryTrace) ([]uint64, bool, error)
+	runAlternative        func(*queryView, *qir.Shape, *queryTrace) ([]uint64, bool, error)
 	compareOrderScanWidth bool
 }
 
@@ -102,7 +102,7 @@ func plannerGuardrailOpenNoOrderORSkewedDB(
 }
 
 func plannerGuardrailRunTryPlanORMergeMode(
-	view *queryView[uint64, Rec],
+	view *queryView,
 	viewQ *qir.Shape,
 	trace *queryTrace,
 ) ([]uint64, bool, error) {
@@ -110,7 +110,7 @@ func plannerGuardrailRunTryPlanORMergeMode(
 }
 
 func plannerGuardrailRunForcedORNoOrderBaseline(
-	view *queryView[uint64, Rec],
+	view *queryView,
 	viewQ *qir.Shape,
 	trace *queryTrace,
 ) ([]uint64, bool, error) {
@@ -128,7 +128,7 @@ func plannerGuardrailRunForcedORNoOrderBaseline(
 }
 
 func plannerGuardrailRunForcedOROrderFallback(
-	view *queryView[uint64, Rec],
+	view *queryView,
 	viewQ *qir.Shape,
 	trace *queryTrace,
 ) ([]uint64, bool, error) {
@@ -154,7 +154,7 @@ func plannerGuardrailRunForcedOROrderFallback(
 }
 
 func plannerGuardrailRunTryExecutionPlan(
-	view *queryView[uint64, Rec],
+	view *queryView,
 	viewQ *qir.Shape,
 	trace *queryTrace,
 ) ([]uint64, bool, error) {
@@ -162,7 +162,7 @@ func plannerGuardrailRunTryExecutionPlan(
 }
 
 func plannerGuardrailRunForcedOrderedPlanner(
-	view *queryView[uint64, Rec],
+	view *queryView,
 	viewQ *qir.Shape,
 	trace *queryTrace,
 ) ([]uint64, bool, error) {
@@ -194,7 +194,7 @@ func plannerGuardrailRunForcedOrderedPlanner(
 }
 
 func plannerGuardrailRunTryPlanCandidate(
-	view *queryView[uint64, Rec],
+	view *queryView,
 	viewQ *qir.Shape,
 	trace *queryTrace,
 ) ([]uint64, bool, error) {
@@ -202,7 +202,7 @@ func plannerGuardrailRunTryPlanCandidate(
 }
 
 func plannerGuardrailRunForcedOrderedNoOrderPlanner(
-	view *queryView[uint64, Rec],
+	view *queryView,
 	viewQ *qir.Shape,
 	trace *queryTrace,
 ) ([]uint64, bool, error) {

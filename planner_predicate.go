@@ -797,7 +797,7 @@ func countBucketPostsAllNotBuf(posts *pooled.SliceBuf[posting.List], bucket post
 }
 
 // tryPlanCandidate attempts the internal plan candidate path and returns ok=false when fast-path preconditions are not satisfied.
-func (qv *queryView[K, V]) tryPlanCandidate(q *qir.Shape, trace *queryTrace) ([]K, bool, error) {
+func (qv *queryView) tryPlanCandidate(q *qir.Shape, trace *queryTrace) ([]uint64, bool, error) {
 
 	// candidate planner is focused on the latency-critical paged path.
 	if q.Limit == 0 {
@@ -865,7 +865,7 @@ func (qv *queryView[K, V]) tryPlanCandidate(q *qir.Shape, trace *queryTrace) ([]
 	return qv.execPlanLeadScanNoOrder(q, predSet, trace), true, nil
 }
 
-func (qv *queryView[K, V]) shouldUseCandidateOrder(o qir.Order, leaves []qir.Expr) bool {
+func (qv *queryView) shouldUseCandidateOrder(o qir.Order, leaves []qir.Expr) bool {
 	fm := qv.fieldMetaByOrder(o)
 	if fm == nil || fm.Slice {
 		return false
@@ -906,7 +906,7 @@ func (qv *queryView[K, V]) shouldUseCandidateOrder(o qir.Order, leaves []qir.Exp
 	return true
 }
 
-func (qv *queryView[K, V]) buildPredicatesCandidate(leaves []qir.Expr) (predicateSet, bool) {
+func (qv *queryView) buildPredicatesCandidate(leaves []qir.Expr) (predicateSet, bool) {
 	if len(leaves) == 1 && leaves[0].Op == qir.OpNOOP && leaves[0].Not {
 		preds := newPredicateSet(1)
 		preds.Append(predicate{alwaysFalse: true})
@@ -925,7 +925,7 @@ func (qv *queryView[K, V]) buildPredicatesCandidate(leaves []qir.Expr) (predicat
 	return preds, true
 }
 
-func (qv *queryView[K, V]) buildPredicateCandidate(e qir.Expr) (predicate, bool) {
+func (qv *queryView) buildPredicateCandidate(e qir.Expr) (predicate, bool) {
 	if e.Op == qir.OpNOOP {
 		if e.Not {
 			return predicate{expr: e, alwaysFalse: true}, true
@@ -982,7 +982,7 @@ func (qv *queryView[K, V]) buildPredicateCandidate(e qir.Expr) (predicate, bool)
 	}
 }
 
-func (qv *queryView[K, V]) buildPredEqCandidate(e qir.Expr, fm *field, ov fieldOverlay) (predicate, bool) {
+func (qv *queryView) buildPredEqCandidate(e qir.Expr, fm *field, ov fieldOverlay) (predicate, bool) {
 	key, isSlice, isNil, err := qv.exprValueToIdxScalar(qir.Expr{
 		Op:           e.Op,
 		FieldOrdinal: e.FieldOrdinal,
@@ -1094,7 +1094,7 @@ func (qv *queryView[K, V]) buildPredEqCandidate(e qir.Expr, fm *field, ov fieldO
 	}, true
 }
 
-func (qv *queryView[K, V]) buildPredInCandidate(e qir.Expr, fm *field, ov fieldOverlay) (predicate, bool) {
+func (qv *queryView) buildPredInCandidate(e qir.Expr, fm *field, ov fieldOverlay) (predicate, bool) {
 	if fm.Slice {
 		return predicate{}, false
 	}
@@ -1181,7 +1181,7 @@ func (qv *queryView[K, V]) buildPredInCandidate(e qir.Expr, fm *field, ov fieldO
 	}, true
 }
 
-func (qv *queryView[K, V]) buildPredHasCandidate(e qir.Expr, fm *field, ov fieldOverlay) (predicate, bool) {
+func (qv *queryView) buildPredHasCandidate(e qir.Expr, fm *field, ov fieldOverlay) (predicate, bool) {
 	if !fm.Slice {
 		return predicate{}, false
 	}
@@ -1307,7 +1307,7 @@ func (qv *queryView[K, V]) buildPredHasCandidate(e qir.Expr, fm *field, ov field
 	}, true
 }
 
-func (qv *queryView[K, V]) buildPredHasAnyCandidate(e qir.Expr, fm *field, ov fieldOverlay) (predicate, bool) {
+func (qv *queryView) buildPredHasAnyCandidate(e qir.Expr, fm *field, ov fieldOverlay) (predicate, bool) {
 	if !fm.Slice {
 		return predicate{}, false
 	}
@@ -1512,11 +1512,11 @@ func (it *overlayRangeIter) Next() uint64 {
 	return it.curIt.Next()
 }
 
-func (qv *queryView[K, V]) buildPredRangeCandidateWithMode(e qir.Expr, fm *field, ov fieldOverlay, allowMaterialize bool) (predicate, bool) {
+func (qv *queryView) buildPredRangeCandidateWithMode(e qir.Expr, fm *field, ov fieldOverlay, allowMaterialize bool) (predicate, bool) {
 	return qv.buildPredRangeCandidateWithColdMode(e, fm, ov, allowMaterialize, false)
 }
 
-func (qv *queryView[K, V]) buildPredRangeCandidateWithColdMode(e qir.Expr, fm *field, ov fieldOverlay, allowMaterialize bool, lazyColdMaterialize bool) (predicate, bool) {
+func (qv *queryView) buildPredRangeCandidateWithColdMode(e qir.Expr, fm *field, ov fieldOverlay, allowMaterialize bool, lazyColdMaterialize bool) (predicate, bool) {
 	return qv.buildPredRangeCandidateWithColdModeAndWarmLoad(
 		e,
 		fm,
@@ -1527,7 +1527,7 @@ func (qv *queryView[K, V]) buildPredRangeCandidateWithColdMode(e qir.Expr, fm *f
 	)
 }
 
-func (qv *queryView[K, V]) buildPredRangeCandidateWithColdModeAndWarmLoad(
+func (qv *queryView) buildPredRangeCandidateWithColdModeAndWarmLoad(
 	e qir.Expr,
 	fm *field,
 	ov fieldOverlay,
@@ -1535,7 +1535,7 @@ func (qv *queryView[K, V]) buildPredRangeCandidateWithColdModeAndWarmLoad(
 	lazyColdMaterialize bool,
 	allowWarmLoad bool,
 ) (predicate, bool) {
-	var core preparedScalarRangePredicate[K, V]
+	var core preparedScalarRangePredicate
 	pred, done, ok := qv.initPreparedScalarRangePredicate(&core, e, fm)
 	if !ok {
 		return predicate{}, false
@@ -1546,7 +1546,7 @@ func (qv *queryView[K, V]) buildPredRangeCandidateWithColdModeAndWarmLoad(
 	return core.buildFromOverlay(ov, allowMaterialize, lazyColdMaterialize, allowWarmLoad)
 }
 
-func (qv *queryView[K, V]) buildPredMaterializedCandidate(e qir.Expr) (predicate, bool) {
+func (qv *queryView) buildPredMaterializedCandidate(e qir.Expr) (predicate, bool) {
 	raw := e
 	raw.Not = false
 	cacheKey := qv.materializedPredKey(raw)
@@ -1575,7 +1575,7 @@ func (qv *queryView[K, V]) buildPredMaterializedCandidate(e qir.Expr) (predicate
 	}, true
 }
 
-func (qv *queryView[K, V]) evalLazyMaterializedPredicateWithKey(raw qir.Expr, cacheKey materializedPredKey) posting.List {
+func (qv *queryView) evalLazyMaterializedPredicateWithKey(raw qir.Expr, cacheKey materializedPredKey) posting.List {
 	if !cacheKey.isZero() {
 		if cached, ok := qv.snap.loadMaterializedPredKey(cacheKey); ok {
 			return cached
@@ -1584,7 +1584,7 @@ func (qv *queryView[K, V]) evalLazyMaterializedPredicateWithKey(raw qir.Expr, ca
 
 	if isScalarRangeOrPrefixOp(raw.Op) {
 		fm := qv.fieldMetaByExpr(raw)
-		var core preparedScalarRangePredicate[K, V]
+		var core preparedScalarRangePredicate
 		pred, done, ok := qv.initPreparedScalarRangePredicate(&core, raw, fm)
 		if ok {
 			if done {
@@ -1621,12 +1621,12 @@ func (qv *queryView[K, V]) evalLazyMaterializedPredicateWithKey(raw qir.Expr, ca
 	return tryShareMaterializedPredOnSnapshot(qv.snap, cacheKey, b.ids)
 }
 
-func (qv *queryView[K, V]) evalLazyMaterializedPredicate(raw qir.Expr, cacheKey string) posting.List {
+func (qv *queryView) evalLazyMaterializedPredicate(raw qir.Expr, cacheKey string) posting.List {
 	parsed, _ := materializedPredKeyFromEncoded(cacheKey)
 	return qv.evalLazyMaterializedPredicateWithKey(raw, parsed)
 }
 
-func (qv *queryView[K, V]) materializedPredKeyForScalar(field string, op qir.Op, key string) materializedPredKey {
+func (qv *queryView) materializedPredKeyForScalar(field string, op qir.Op, key string) materializedPredKey {
 	if qv.snap.matPredCacheMaxEntries <= 0 {
 		return materializedPredKey{}
 	}
@@ -1636,11 +1636,11 @@ func (qv *queryView[K, V]) materializedPredKeyForScalar(field string, op qir.Op,
 	return materializedPredKeyForScalar(field, op, key)
 }
 
-func (qv *queryView[K, V]) materializedPredCacheKeyForScalar(field string, op qir.Op, key string) string {
+func (qv *queryView) materializedPredCacheKeyForScalar(field string, op qir.Op, key string) string {
 	return qv.materializedPredKeyForScalar(field, op, key).String()
 }
 
-func (qv *queryView[K, V]) materializedPredComplementKeyForScalar(field string, op qir.Op, key string) materializedPredKey {
+func (qv *queryView) materializedPredComplementKeyForScalar(field string, op qir.Op, key string) materializedPredKey {
 	if qv.snap.matPredCacheMaxEntries <= 0 {
 		return materializedPredKey{}
 	}
@@ -1650,25 +1650,25 @@ func (qv *queryView[K, V]) materializedPredComplementKeyForScalar(field string, 
 	return materializedPredComplementKeyForScalar(field, op, key)
 }
 
-func (qv *queryView[K, V]) materializedPredComplementCacheKeyForScalar(field string, op qir.Op, key string) string {
+func (qv *queryView) materializedPredComplementCacheKeyForScalar(field string, op qir.Op, key string) string {
 	return qv.materializedPredComplementKeyForScalar(field, op, key).String()
 }
 
-func (qv *queryView[K, V]) materializedPredKeyForNormalizedScalarBound(field string, bound normalizedScalarBound) materializedPredKey {
+func (qv *queryView) materializedPredKeyForNormalizedScalarBound(field string, bound normalizedScalarBound) materializedPredKey {
 	if bound.hasIndexKey {
 		return materializedPredKeyForNumericScalar(field, bound.op, bound.keyIndex)
 	}
 	return qv.materializedPredKeyForScalar(field, bound.op, bound.key)
 }
 
-func (qv *queryView[K, V]) materializedPredComplementKeyForNormalizedScalarBound(field string, bound normalizedScalarBound) materializedPredKey {
+func (qv *queryView) materializedPredComplementKeyForNormalizedScalarBound(field string, bound normalizedScalarBound) materializedPredKey {
 	if bound.hasIndexKey {
 		return materializedPredComplementKeyForNumericScalar(field, bound.op, bound.keyIndex)
 	}
 	return qv.materializedPredComplementKeyForScalar(field, bound.op, bound.key)
 }
 
-func (qv *queryView[K, V]) materializedPredKey(e qir.Expr) materializedPredKey {
+func (qv *queryView) materializedPredKey(e qir.Expr) materializedPredKey {
 	fieldName := qv.fieldNameByOrdinal(e.FieldOrdinal)
 	if isScalarRangeOrPrefixOp(e.Op) {
 		bound, isSlice, err := qv.normalizedScalarBoundForExpr(e)
@@ -1688,7 +1688,7 @@ func (qv *queryView[K, V]) materializedPredKey(e qir.Expr) materializedPredKey {
 	return qv.materializedPredKeyForScalar(fieldName, e.Op, key)
 }
 
-func (qv *queryView[K, V]) materializedPredCacheKey(e qir.Expr) string {
+func (qv *queryView) materializedPredCacheKey(e qir.Expr) string {
 	return qv.materializedPredKey(e).String()
 }
 
@@ -1701,7 +1701,7 @@ func materializedPredCacheKeyFromScalar(field string, op qir.Op, key string) str
 
 // tryShareMaterializedPred caches ids and, on success, rewrites the caller
 // handle to a borrowed alias of the cached payload.
-func (qv *queryView[K, V]) tryShareMaterializedPred(cacheKey materializedPredKey, ids posting.List) posting.List {
+func (qv *queryView) tryShareMaterializedPred(cacheKey materializedPredKey, ids posting.List) posting.List {
 	return tryShareMaterializedPredOnSnapshot(qv.snap, cacheKey, ids)
 }
 
@@ -1777,7 +1777,7 @@ func (it *rangeIter) Next() uint64 {
 	return it.curIt.Next()
 }
 
-func (qv *queryView[K, V]) execPlanLeadScanNoOrder(q *qir.Shape, preds predicateReader, trace *queryTrace) []K {
+func (qv *queryView) execPlanLeadScanNoOrder(q *qir.Shape, preds predicateReader, trace *queryTrace) []uint64 {
 	var leadIdx = -1
 	var best uint64
 	for i := 0; i < preds.Len(); i++ {
@@ -1822,7 +1822,7 @@ func (qv *queryView[K, V]) execPlanLeadScanNoOrder(q *qir.Shape, preds predicate
 	}
 	sortActivePredicatesReader(active, preds)
 
-	out := make([]K, 0, int(q.Limit))
+	out := make([]uint64, 0, int(q.Limit))
 	cursor := qv.newQueryCursor(out, q.Offset, q.Limit, q.Limit == 0, 0)
 	singleActive := -1
 	if len(active) == 1 {
@@ -1874,7 +1874,7 @@ func (qv *queryView[K, V]) execPlanLeadScanNoOrder(q *qir.Shape, preds predicate
 	return cursor.out
 }
 
-func (qv *queryView[K, V]) tryExecLeadScanNoOrderBuckets(q *qir.Shape, preds predicateReader, leadIdx int, active []int, trace *queryTrace) ([]K, bool) {
+func (qv *queryView) tryExecLeadScanNoOrderBuckets(q *qir.Shape, preds predicateReader, leadIdx int, active []int, trace *queryTrace) ([]uint64, bool) {
 	if leadIdx < 0 || leadIdx >= preds.Len() {
 		return nil, false
 	}
@@ -1897,7 +1897,7 @@ func (qv *queryView[K, V]) tryExecLeadScanNoOrderBuckets(q *qir.Shape, preds pre
 	return out, true
 }
 
-func (qv *queryView[K, V]) execPlanCandidateOrderBasic(q *qir.Shape, preds predicateReader, trace *queryTrace) []K {
+func (qv *queryView) execPlanCandidateOrderBasic(q *qir.Shape, preds predicateReader, trace *queryTrace) []uint64 {
 	o := q.Order
 
 	fm := qv.fieldMetaByOrder(o)
@@ -1951,7 +1951,7 @@ func (qv *queryView[K, V]) execPlanCandidateOrderBasic(q *qir.Shape, preds predi
 	return out
 }
 
-func (qv *queryView[K, V]) extractOrderRangeCoverageOverlayWithBoundsReader(field string, preds predicateReader, ov fieldOverlay) (rangeBounds, overlayRange, *pooled.SliceBuf[bool], bool) {
+func (qv *queryView) extractOrderRangeCoverageOverlayWithBoundsReader(field string, preds predicateReader, ov fieldOverlay) (rangeBounds, overlayRange, *pooled.SliceBuf[bool], bool) {
 	rb, covered, _, ok := qv.collectPredicateRangeBoundsReader(field, preds)
 	if !ok {
 		return rangeBounds{}, overlayRange{}, nil, false
@@ -1960,7 +1960,7 @@ func (qv *queryView[K, V]) extractOrderRangeCoverageOverlayWithBoundsReader(fiel
 	return rb, ov.rangeForBounds(rb), covered, true
 }
 
-func (qv *queryView[K, V]) extractOrderRangeCoverageOverlayReader(field string, preds predicateReader, ov fieldOverlay) (overlayRange, *pooled.SliceBuf[bool], bool) {
+func (qv *queryView) extractOrderRangeCoverageOverlayReader(field string, preds predicateReader, ov fieldOverlay) (overlayRange, *pooled.SliceBuf[bool], bool) {
 	_, br, covered, ok := qv.extractOrderRangeCoverageOverlayWithBoundsReader(field, preds, ov)
 	return br, covered, ok
 }
@@ -2345,7 +2345,7 @@ func shouldUseFastSinglesUnion(probeLen, singletonCount int, est uint64) bool {
 }
 
 // tryPlanOrdered attempts the internal plan ordered path and returns false when fast-path preconditions are not satisfied.
-func (qv *queryView[K, V]) tryPlanOrdered(q *qir.Shape, trace *queryTrace) ([]K, bool, error) {
+func (qv *queryView) tryPlanOrdered(q *qir.Shape, trace *queryTrace) ([]uint64, bool, error) {
 	if q.Limit == 0 {
 		return nil, false, nil
 	}
@@ -2717,15 +2717,15 @@ func orderedBasicAnchoredFilterPostingBufReader(preds predicateReader, ids posti
 	return builder.finish(false)
 }
 
-func orderedScanEmitMatched[K ~uint64 | ~string, V any](cursor *queryCursor[K, V], trace *queryTrace, idx uint64) bool {
+func orderedScanEmitMatched(cursor *queryCursor, trace *queryTrace, idx uint64) bool {
 	if trace != nil {
 		trace.addMatched(1)
 	}
 	return cursor.emit(idx)
 }
 
-func orderedScanEmitPostingNoPredicates[K ~uint64 | ~string, V any](
-	cursor *queryCursor[K, V],
+func orderedScanEmitPostingNoPredicates(
+	cursor *queryCursor,
 	ids posting.List,
 	card uint64,
 	trace *queryTrace,
@@ -2751,8 +2751,8 @@ func orderedScanEmitPostingNoPredicates[K ~uint64 | ~string, V any](
 	return false
 }
 
-func orderedScanEmitPostingMatchedAll[K ~uint64 | ~string, V any](
-	cursor *queryCursor[K, V],
+func orderedScanEmitPostingMatchedAll(
+	cursor *queryCursor,
 	ids posting.List,
 	card uint64,
 	trace *queryTrace,
@@ -2778,8 +2778,8 @@ func orderedScanEmitPostingMatchedAll[K ~uint64 | ~string, V any](
 	return false
 }
 
-func orderedSkipSingleCheckBucket[K ~uint64 | ~string, V any](
-	cursor *queryCursor[K, V],
+func orderedSkipSingleCheckBucket(
+	cursor *queryCursor,
 	preds predicateReader,
 	singleCheck int,
 	ids posting.List,
@@ -2799,8 +2799,8 @@ func orderedSkipSingleCheckBucket[K ~uint64 | ~string, V any](
 	return true
 }
 
-func orderedScanEmitPostingByChecks[K ~uint64 | ~string, V any](
-	cursor *queryCursor[K, V],
+func orderedScanEmitPostingByChecks(
+	cursor *queryCursor,
 	ids posting.List,
 	preds predicateReader,
 	checks []int,
@@ -2834,8 +2834,8 @@ func orderedScanEmitPostingByChecks[K ~uint64 | ~string, V any](
 	return false
 }
 
-func orderedScanEmitBucketNoPredicates[K ~uint64 | ~string, V any](
-	cursor *queryCursor[K, V],
+func orderedScanEmitBucketNoPredicates(
+	cursor *queryCursor,
 	bucket posting.List,
 	trace *queryTrace,
 	scanWidth *uint64,
@@ -2851,8 +2851,8 @@ func orderedScanEmitBucketNoPredicates[K ~uint64 | ~string, V any](
 	return orderedScanEmitPostingNoPredicates(cursor, bucket, card, trace)
 }
 
-func orderedScanEmitBucketWithPredicates[K ~uint64 | ~string, V any](
-	cursor *queryCursor[K, V],
+func orderedScanEmitBucketWithPredicates(
+	cursor *queryCursor,
 	preds predicateReader,
 	active []int,
 	singleActive int,
@@ -2909,9 +2909,9 @@ func orderedScanEmitBucketWithPredicates[K ~uint64 | ~string, V any](
 	return orderedScanEmitPostingByChecks(cursor, bucket, preds, active, singleActive, trace), exactWork
 }
 
-func orderedBasicAnchoredEmitPosting[K ~uint64 | ~string, V any](
-	qv *queryView[K, V],
-	cursor *queryCursor[K, V],
+func orderedBasicAnchoredEmitPosting(
+	qv *queryView,
+	cursor *queryCursor,
 	candidateIDs posting.List,
 	preds predicateReader,
 	deferredChecks []int,
@@ -2957,9 +2957,9 @@ func orderedBasicAnchoredEmitPosting[K ~uint64 | ~string, V any](
 	return false
 }
 
-func orderedBasicAnchoredEmitPostingBuf[K ~uint64 | ~string, V any](
-	qv *queryView[K, V],
-	cursor *queryCursor[K, V],
+func orderedBasicAnchoredEmitPostingBuf(
+	qv *queryView,
+	cursor *queryCursor,
 	candidateIDs posting.List,
 	preds predicateReader,
 	deferredChecks *pooled.SliceBuf[int],
@@ -3135,7 +3135,7 @@ func releasePredicates(preds []predicate) {
 	}
 }
 
-func (qv *queryView[K, V]) buildPredicatesWithColdMode(leaves []qir.Expr, allowMaterialize bool, lazyColdMaterialize bool) (predicateSet, bool) {
+func (qv *queryView) buildPredicatesWithColdMode(leaves []qir.Expr, allowMaterialize bool, lazyColdMaterialize bool) (predicateSet, bool) {
 	if len(leaves) == 1 && leaves[0].Op == qir.OpNOOP && leaves[0].Not {
 		preds := newPredicateSet(1)
 		preds.Append(predicate{alwaysFalse: true})
@@ -3154,15 +3154,15 @@ func (qv *queryView[K, V]) buildPredicatesWithColdMode(leaves []qir.Expr, allowM
 	return preds, true
 }
 
-func (qv *queryView[K, V]) buildPredicatesWithMode(leaves []qir.Expr, allowMaterialize bool) (predicateSet, bool) {
+func (qv *queryView) buildPredicatesWithMode(leaves []qir.Expr, allowMaterialize bool) (predicateSet, bool) {
 	return qv.buildPredicatesWithColdMode(leaves, allowMaterialize, false)
 }
 
-func (qv *queryView[K, V]) buildPredicates(leaves []qir.Expr) (predicateSet, bool) {
+func (qv *queryView) buildPredicates(leaves []qir.Expr) (predicateSet, bool) {
 	return qv.buildPredicatesWithMode(leaves, true)
 }
 
-func (qv *queryView[K, V]) isOrderRangeCoveredLeaf(orderField string, e qir.Expr) bool {
+func (qv *queryView) isOrderRangeCoveredLeaf(orderField string, e qir.Expr) bool {
 	switch qv.classifyOrderFieldScalarLeaf(orderField, e) {
 	case orderFieldScalarLeafRange, orderFieldScalarLeafPrefix:
 		return true
@@ -3171,7 +3171,7 @@ func (qv *queryView[K, V]) isOrderRangeCoveredLeaf(orderField string, e qir.Expr
 	}
 }
 
-func (qv *queryView[K, V]) buildPredicatesOrdered(leaves []qir.Expr, orderField string) (predicateSet, bool) {
+func (qv *queryView) buildPredicatesOrdered(leaves []qir.Expr, orderField string) (predicateSet, bool) {
 	return qv.buildPredicatesOrderedWithMode(leaves, orderField, true, 0, 0, true, true)
 }
 
@@ -3185,11 +3185,11 @@ type orderedScalarRangeRouting struct {
 	useComplement      bool
 }
 
-func (qv *queryView[K, V]) orderedScalarRangeRouting(e qir.Expr, orderedWindow int, orderedOffset uint64, universe uint64) orderedScalarRangeRouting {
+func (qv *queryView) orderedScalarRangeRouting(e qir.Expr, orderedWindow int, orderedOffset uint64, universe uint64) orderedScalarRangeRouting {
 	return qv.orderedPredicateScalarRangeRouting(predicate{expr: e}, orderedWindow, orderedOffset, universe)
 }
 
-func (qv *queryView[K, V]) orderedPredicateScalarRangeRouting(
+func (qv *queryView) orderedPredicateScalarRangeRouting(
 	p predicate,
 	orderedWindow int,
 	orderedOffset uint64,
@@ -3219,7 +3219,7 @@ func (qv *queryView[K, V]) orderedPredicateScalarRangeRouting(
 	return route
 }
 
-func (qv *queryView[K, V]) orderedScalarRangeRoutingForBuild(
+func (qv *queryView) orderedScalarRangeRoutingForBuild(
 	p predicate,
 	predAllowMaterialize bool,
 	orderedWindow int,
@@ -3234,7 +3234,7 @@ func (qv *queryView[K, V]) orderedScalarRangeRoutingForBuild(
 	return route
 }
 
-func (qv *queryView[K, V]) orderedScalarRangeCanEagerMaterialize(route orderedScalarRangeRouting) bool {
+func (qv *queryView) orderedScalarRangeCanEagerMaterialize(route orderedScalarRangeRouting) bool {
 	if !route.eagerMaterialize {
 		return false
 	}
@@ -3252,7 +3252,7 @@ func overlayRangeEmpty(br overlayRange) bool {
 	return br.baseStart >= br.baseEnd
 }
 
-func (qv *queryView[K, V]) tryMaterializeBroadRangeComplementPredicateForOrdered(
+func (qv *queryView) tryMaterializeBroadRangeComplementPredicateForOrdered(
 	p *predicate,
 	broadComplement bool,
 	universe uint64,
@@ -3329,7 +3329,7 @@ func (qv *queryView[K, V]) tryMaterializeBroadRangeComplementPredicateForOrdered
 	return true
 }
 
-func (qv *queryView[K, V]) loadWarmComplementPredicateForOrdered(p *predicate, useComplement bool) bool {
+func (qv *queryView) loadWarmComplementPredicateForOrdered(p *predicate, useComplement bool) bool {
 	if p == nil || !useComplement {
 		return false
 	}
@@ -3348,7 +3348,7 @@ func (qv *queryView[K, V]) loadWarmComplementPredicateForOrdered(p *predicate, u
 	return true
 }
 
-func (qv *queryView[K, V]) isPositiveOrderedNumericRangeLeaf(e qir.Expr, orderField string) bool {
+func (qv *queryView) isPositiveOrderedNumericRangeLeaf(e qir.Expr, orderField string) bool {
 	if e.Not || e.FieldOrdinal < 0 || qv.fieldNameByOrdinal(e.FieldOrdinal) == orderField || !isNumericRangeOp(e.Op) {
 		return false
 	}
@@ -3356,7 +3356,7 @@ func (qv *queryView[K, V]) isPositiveOrderedNumericRangeLeaf(e qir.Expr, orderFi
 	return fieldUsesOrderedNumericKeys(fm)
 }
 
-func (qv *queryView[K, V]) buildMergedNumericRangePredicate(
+func (qv *queryView) buildMergedNumericRangePredicate(
 	e qir.Expr,
 	bounds rangeBounds,
 	allowMaterialize bool,
@@ -3364,7 +3364,7 @@ func (qv *queryView[K, V]) buildMergedNumericRangePredicate(
 	return qv.buildMergedNumericRangePredicateWithColdMode(e, bounds, allowMaterialize, false)
 }
 
-func (qv *queryView[K, V]) buildMergedNumericRangePredicateWithColdMode(
+func (qv *queryView) buildMergedNumericRangePredicateWithColdMode(
 	e qir.Expr,
 	bounds rangeBounds,
 	allowMaterialize bool,
@@ -3379,7 +3379,7 @@ func (qv *queryView[K, V]) buildMergedNumericRangePredicateWithColdMode(
 	)
 }
 
-func (qv *queryView[K, V]) buildMergedNumericRangePredicateWithColdModeAndWarmLoad(
+func (qv *queryView) buildMergedNumericRangePredicateWithColdModeAndWarmLoad(
 	e qir.Expr,
 	bounds rangeBounds,
 	allowMaterialize bool,
@@ -3390,7 +3390,7 @@ func (qv *queryView[K, V]) buildMergedNumericRangePredicateWithColdModeAndWarmLo
 	if fm == nil || fm.Slice {
 		return predicate{}, false
 	}
-	var core preparedScalarRangePredicate[K, V]
+	var core preparedScalarRangePredicate
 	qv.initPreparedExactScalarRangePredicate(&core, e, fm, bounds)
 	ov := qv.fieldOverlayForExpr(e)
 	if !ov.hasData() {
@@ -3416,7 +3416,7 @@ func (qv *queryView[K, V]) buildMergedNumericRangePredicateWithColdModeAndWarmLo
 	return p, ok
 }
 
-func (qv *queryView[K, V]) initOrderedPredicateExpectedContainsCalls(
+func (qv *queryView) initOrderedPredicateExpectedContainsCalls(
 	p *predicate,
 	orderedWindow int,
 	universe uint64,
@@ -3436,7 +3436,7 @@ func (qv *queryView[K, V]) initOrderedPredicateExpectedContainsCalls(
 	}
 }
 
-func (qv *queryView[K, V]) postprocessBuiltOrderedPredicate(
+func (qv *queryView) postprocessBuiltOrderedPredicate(
 	p *predicate,
 	orderedRoute orderedScalarRangeRouting,
 	predAllowMaterialize bool,
@@ -3490,7 +3490,7 @@ func (qv *queryView[K, V]) postprocessBuiltOrderedPredicate(
 	}
 }
 
-func (qv *queryView[K, V]) buildPredicatesOrderedWithMode(leaves []qir.Expr, orderField string, allowMaterialize bool, orderedWindow int, orderedOffset uint64, coverOrderRange bool, allowOrderedEagerMaterialize bool) (predicateSet, bool) {
+func (qv *queryView) buildPredicatesOrderedWithMode(leaves []qir.Expr, orderField string, allowMaterialize bool, orderedWindow int, orderedOffset uint64, coverOrderRange bool, allowOrderedEagerMaterialize bool) (predicateSet, bool) {
 	if len(leaves) == 1 && leaves[0].Op == qir.OpNOOP && leaves[0].Not {
 		preds := newPredicateSet(1)
 		preds.Append(predicate{alwaysFalse: true})
@@ -3633,7 +3633,7 @@ func (qv *queryView[K, V]) buildPredicatesOrderedWithMode(leaves []qir.Expr, ord
 	return preds, true
 }
 
-func (qv *queryView[K, V]) buildPredicatesOrderedWithModeBuf(
+func (qv *queryView) buildPredicatesOrderedWithModeBuf(
 	leaves *pooled.SliceBuf[qir.Expr],
 	orderField string,
 	allowMaterialize bool,
@@ -3786,15 +3786,15 @@ func (qv *queryView[K, V]) buildPredicatesOrderedWithModeBuf(
 	return preds, true
 }
 
-func (qv *queryView[K, V]) buildPredicateWithMode(e qir.Expr, allowMaterialize bool) (predicate, bool) {
+func (qv *queryView) buildPredicateWithMode(e qir.Expr, allowMaterialize bool) (predicate, bool) {
 	return qv.buildPredicateWithColdMode(e, allowMaterialize, false)
 }
 
-func (qv *queryView[K, V]) buildPredicateWithColdMode(e qir.Expr, allowMaterialize bool, lazyColdMaterialize bool) (predicate, bool) {
+func (qv *queryView) buildPredicateWithColdMode(e qir.Expr, allowMaterialize bool, lazyColdMaterialize bool) (predicate, bool) {
 	return qv.buildPredicateWithColdModeAndWarmLoad(e, allowMaterialize, lazyColdMaterialize, true)
 }
 
-func (qv *queryView[K, V]) buildPredicateWithColdModeAndWarmLoad(
+func (qv *queryView) buildPredicateWithColdModeAndWarmLoad(
 	e qir.Expr,
 	allowMaterialize bool,
 	lazyColdMaterialize bool,
@@ -3851,7 +3851,7 @@ func (qv *queryView[K, V]) buildPredicateWithColdModeAndWarmLoad(
 	return p, true
 }
 
-func (qv *queryView[K, V]) buildPredRangeWithColdMode(e qir.Expr, fm *field, slice *[]index, allowMaterialize bool, lazyColdMaterialize bool) (predicate, bool) {
+func (qv *queryView) buildPredRangeWithColdMode(e qir.Expr, fm *field, slice *[]index, allowMaterialize bool, lazyColdMaterialize bool) (predicate, bool) {
 	return qv.buildPredRangeWithColdModeAndWarmLoad(
 		e,
 		fm,
@@ -3862,7 +3862,7 @@ func (qv *queryView[K, V]) buildPredRangeWithColdMode(e qir.Expr, fm *field, sli
 	)
 }
 
-func (qv *queryView[K, V]) buildPredRangeWithColdModeAndWarmLoad(
+func (qv *queryView) buildPredRangeWithColdModeAndWarmLoad(
 	e qir.Expr,
 	fm *field,
 	slice *[]index,
@@ -3870,7 +3870,7 @@ func (qv *queryView[K, V]) buildPredRangeWithColdModeAndWarmLoad(
 	lazyColdMaterialize bool,
 	allowWarmLoad bool,
 ) (predicate, bool) {
-	var core preparedScalarRangePredicate[K, V]
+	var core preparedScalarRangePredicate
 	pred, done, ok := qv.initPreparedScalarRangePredicate(&core, e, fm)
 	if !ok {
 		return predicate{}, false
@@ -4635,7 +4635,7 @@ func orderedPredicateIsRangeLike(p predicate) bool {
 	return isScalarRangeOrPrefixOp(p.expr.Op)
 }
 
-func chooseOrderedAnchorLeadReader[K ~string | ~uint64, V any](qv *queryView[K, V], orderField string, preds predicateReader, active []int) (int, bool) {
+func chooseOrderedAnchorLeadReader(qv *queryView, orderField string, preds predicateReader, active []int) (int, bool) {
 	lead := -1
 	bestCard := uint64(0)
 	bestScore := 0.0
@@ -4667,7 +4667,7 @@ func chooseOrderedAnchorLeadReader[K ~string | ~uint64, V any](qv *queryView[K, 
 	return lead, lead >= 0
 }
 
-func chooseOrderedAnchorLeadBufReader[K ~string | ~uint64, V any](qv *queryView[K, V], orderField string, preds predicateReader, active *pooled.SliceBuf[int]) (int, bool) {
+func chooseOrderedAnchorLeadBufReader(qv *queryView, orderField string, preds predicateReader, active *pooled.SliceBuf[int]) (int, bool) {
 	lead := -1
 	bestCard := uint64(0)
 	bestScore := 0.0
@@ -4699,7 +4699,7 @@ func chooseOrderedAnchorLeadBufReader[K ~string | ~uint64, V any](qv *queryView[
 	return lead, lead >= 0
 }
 
-func (qv *queryView[K, V]) execPlanOrderedBasicAnchored(q *qir.Shape, preds predicateReader, active []int, ov fieldOverlay, br overlayRange, trace *queryTrace) ([]K, bool) {
+func (qv *queryView) execPlanOrderedBasicAnchored(q *qir.Shape, preds predicateReader, active []int, ov fieldOverlay, br overlayRange, trace *queryTrace) ([]uint64, bool) {
 	if len(active) < plannerOrderedAnchorMinActive {
 		return nil, false
 	}
@@ -4899,7 +4899,7 @@ func (qv *queryView[K, V]) execPlanOrderedBasicAnchored(q *qir.Shape, preds pred
 	o := q.Order
 	skip := q.Offset
 	need := q.Limit
-	out := make([]K, 0, need)
+	out := make([]uint64, 0, need)
 	totalCandidates := candidateIDs.Cardinality()
 	seenCandidates := uint64(0)
 	scanWidth := uint64(0)
@@ -4949,7 +4949,7 @@ func (qv *queryView[K, V]) execPlanOrderedBasicAnchored(q *qir.Shape, preds pred
 	return cursor.out, true
 }
 
-func (qv *queryView[K, V]) execPlanOrderedBasicAnchoredBuf(q *qir.Shape, preds predicateReader, active *pooled.SliceBuf[int], ov fieldOverlay, br overlayRange, trace *queryTrace) ([]K, bool) {
+func (qv *queryView) execPlanOrderedBasicAnchoredBuf(q *qir.Shape, preds predicateReader, active *pooled.SliceBuf[int], ov fieldOverlay, br overlayRange, trace *queryTrace) ([]uint64, bool) {
 	if active.Len() < plannerOrderedAnchorMinActive {
 		return nil, false
 	}
@@ -5153,7 +5153,7 @@ func (qv *queryView[K, V]) execPlanOrderedBasicAnchoredBuf(q *qir.Shape, preds p
 	o := q.Order
 	skip := q.Offset
 	need := q.Limit
-	out := make([]K, 0, need)
+	out := make([]uint64, 0, need)
 	totalCandidates := candidateIDs.Cardinality()
 	seenCandidates := uint64(0)
 	scanWidth := uint64(0)
@@ -5203,7 +5203,7 @@ func (qv *queryView[K, V]) execPlanOrderedBasicAnchoredBuf(q *qir.Shape, preds p
 	return cursor.out, true
 }
 
-func (qv *queryView[K, V]) execPlanOrderedBasicReader(q *qir.Shape, preds predicateReader, trace *queryTrace) ([]K, bool) {
+func (qv *queryView) execPlanOrderedBasicReader(q *qir.Shape, preds predicateReader, trace *queryTrace) ([]uint64, bool) {
 	o := q.Order
 
 	fm := qv.fieldMetaByOrder(o)
@@ -5292,16 +5292,16 @@ func (qv *queryView[K, V]) execPlanOrderedBasicReader(q *qir.Shape, preds predic
 
 // execPlanOrderedBasicFallback scans ordered buckets and applies remaining
 // predicates when ordered-anchor shortcuts are not available.
-func (qv *queryView[K, V]) execPlanOrderedBasicFallback(q *qir.Shape, preds []predicate, active []int, start, end int, s []index, trace *queryTrace) []K {
+func (qv *queryView) execPlanOrderedBasicFallback(q *qir.Shape, preds []predicate, active []int, start, end int, s []index, trace *queryTrace) []uint64 {
 	return qv.execPlanOrderedBasicFallbackWithNilTail(q, preds, active, start, end, s, "", trace)
 }
 
-func (qv *queryView[K, V]) execPlanOrderedBasicFallbackWithNilTail(q *qir.Shape, preds []predicate, active []int, start, end int, s []index, nilTailField string, trace *queryTrace) []K {
+func (qv *queryView) execPlanOrderedBasicFallbackWithNilTail(q *qir.Shape, preds []predicate, active []int, start, end int, s []index, nilTailField string, trace *queryTrace) []uint64 {
 	return qv.scanOrderedBaseSliceWithPredicatesWithNilTail(q, preds, active, start, end, s, q.Order.Desc, nilTailField, trace)
 }
 
-func (qv *queryView[K, V]) scanOrderedBaseSliceNoPredicatesWithNilTail(q *qir.Shape, start, end int, s []index, desc bool, nilTailField string, trace *queryTrace) []K {
-	out := make([]K, 0, int(q.Limit))
+func (qv *queryView) scanOrderedBaseSliceNoPredicatesWithNilTail(q *qir.Shape, start, end int, s []index, desc bool, nilTailField string, trace *queryTrace) []uint64 {
+	out := make([]uint64, 0, int(q.Limit))
 	cursor := qv.newQueryCursor(out, q.Offset, q.Limit, false, 0)
 
 	var scanWidth uint64
@@ -5340,12 +5340,12 @@ func (qv *queryView[K, V]) scanOrderedBaseSliceNoPredicatesWithNilTail(q *qir.Sh
 	return cursor.out
 }
 
-func (qv *queryView[K, V]) scanOrderedBaseSliceWithPredicatesWithNilTail(q *qir.Shape, preds []predicate, active []int, start, end int, s []index, desc bool, nilTailField string, trace *queryTrace) []K {
+func (qv *queryView) scanOrderedBaseSliceWithPredicatesWithNilTail(q *qir.Shape, preds []predicate, active []int, start, end int, s []index, desc bool, nilTailField string, trace *queryTrace) []uint64 {
 	if len(active) == 0 {
 		return qv.scanOrderedBaseSliceNoPredicatesWithNilTail(q, start, end, s, desc, nilTailField, trace)
 	}
 
-	out := make([]K, 0, int(q.Limit))
+	out := make([]uint64, 0, int(q.Limit))
 	cursor := qv.newQueryCursor(out, q.Offset, q.Limit, false, 0)
 
 	var exactActiveInline [plannerPredicateFastPathMaxLeaves]int
@@ -5445,7 +5445,7 @@ func (qv *queryView[K, V]) scanOrderedBaseSliceWithPredicatesWithNilTail(q *qir.
 	return cursor.out
 }
 
-func (qv *queryView[K, V]) collectOrderRangeBounds(field string, n int, exprAt func(i int) qir.Expr) (rangeBounds, *pooled.SliceBuf[bool], bool, bool) {
+func (qv *queryView) collectOrderRangeBounds(field string, n int, exprAt func(i int) qir.Expr) (rangeBounds, *pooled.SliceBuf[bool], bool, bool) {
 	var rb rangeBounds
 	covered := boolSlicePool.Get()
 	covered.SetLen(n)
@@ -5471,7 +5471,7 @@ func (qv *queryView[K, V]) collectOrderRangeBounds(field string, n int, exprAt f
 	return rb, covered, has, true
 }
 
-func (qv *queryView[K, V]) collectPredicateRangeBoundsReader(field string, preds predicateReader) (rangeBounds, *pooled.SliceBuf[bool], bool, bool) {
+func (qv *queryView) collectPredicateRangeBoundsReader(field string, preds predicateReader) (rangeBounds, *pooled.SliceBuf[bool], bool, bool) {
 	var rb rangeBounds
 	covered := boolSlicePool.Get()
 	covered.SetLen(preds.Len())
@@ -5503,7 +5503,7 @@ func (qv *queryView[K, V]) collectPredicateRangeBoundsReader(field string, preds
 	return rb, covered, has, true
 }
 
-func (qv *queryView[K, V]) collectPredicateRangeBoundsSet(field string, preds predicateSet) (rangeBounds, *pooled.SliceBuf[bool], bool, bool) {
+func (qv *queryView) collectPredicateRangeBoundsSet(field string, preds predicateSet) (rangeBounds, *pooled.SliceBuf[bool], bool, bool) {
 	var rb rangeBounds
 	covered := boolSlicePool.Get()
 	covered.SetLen(preds.Len())

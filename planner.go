@@ -1196,7 +1196,7 @@ type plannerOROrderMergeBranchStats struct {
 	rangeBounded bool
 }
 
-func (qv *queryView[K, V]) orderMergeBranchStats(orderField string, branches plannerORBranches, ov fieldOverlay) [plannerORBranchLimit]plannerOROrderMergeBranchStats {
+func (qv *queryView) orderMergeBranchStats(orderField string, branches plannerORBranches, ov fieldOverlay) [plannerORBranchLimit]plannerOROrderMergeBranchStats {
 	var stats [plannerORBranchLimit]plannerOROrderMergeBranchStats
 	n := branches.Len()
 	if n > plannerORBranchLimit {
@@ -1458,7 +1458,7 @@ func plannerORKWayRuntimeNearTieGain(shape plannerORKWayRuntimeShape) float64 {
 
 // estimateOROrderMergeRouteCost estimates relative work for the two merge
 // sub-routes: k-way stream merge vs fallback branch-collect+rank.
-func (qv *queryView[K, V]) estimateOROrderMergeRouteCost(
+func (qv *queryView) estimateOROrderMergeRouteCost(
 	q *qir.Shape,
 	branches plannerORBranches,
 	need int,
@@ -1657,7 +1657,7 @@ func releasePlannerORIters(iters []plannerORIter) {
 	}
 }
 
-func (qv *queryView[K, V]) tryPlan(q *qir.Shape, trace *queryTrace) ([]K, bool, error) {
+func (qv *queryView) tryPlan(q *qir.Shape, trace *queryTrace) ([]uint64, bool, error) {
 	orderedPtr := false
 	if q.HasOrder && q.Order.Kind == qir.OrderKindBasic {
 		if fm := qv.fieldMetaByOrder(q.Order); fm != nil && fm.Ptr {
@@ -1707,7 +1707,7 @@ func (it *plannerORIter) advanceWithBudget(budget uint64) (uint64, uint64, bool)
 //
 // This path exists to avoid full bitmap materialization when branch-aware
 // streaming/merge strategies can satisfy LIMIT/OFFSET cheaper.
-func (qv *queryView[K, V]) tryPlanORMergeMode(q *qir.Shape, trace *queryTrace) ([]K, bool, error) {
+func (qv *queryView) tryPlanORMergeMode(q *qir.Shape, trace *queryTrace) ([]uint64, bool, error) {
 	if q.Limit == 0 {
 		return nil, false, nil
 	}
@@ -1851,8 +1851,8 @@ type orderedORObservedStats struct {
 	active        bool
 }
 
-func initOrderedORObservedStats[K ~string | ~uint64, V any](
-	qv *queryView[K, V],
+func initOrderedORObservedStats(
+	qv *queryView,
 	field string,
 	observed *orderedORObservedStats,
 	branches plannerORBranches,
@@ -2048,7 +2048,7 @@ func setOROrderMergeFallbackTrace(trace *queryTrace, examined, scanWidth uint64,
 	trace.setEarlyStopReason(stopReason)
 }
 
-func (qv *queryView[K, V]) orderedORMaterializedRangeLeafCosts(
+func (qv *queryView) orderedORMaterializedRangeLeafCosts(
 	orderField string,
 	leaf qir.Expr,
 ) (materializedPredKey, uint64, uint64, uint64, bool) {
@@ -2103,7 +2103,7 @@ func (qv *queryView[K, V]) orderedORMaterializedRangeLeafCosts(
 		true
 }
 
-func (qv *queryView[K, V]) orderedORMaterializedExactRangePredicateCosts(
+func (qv *queryView) orderedORMaterializedExactRangePredicateCosts(
 	orderField string,
 	p predicate,
 ) (materializedPredKey, uint64, uint64, uint64, bool) {
@@ -2119,7 +2119,7 @@ func (qv *queryView[K, V]) orderedORMaterializedExactRangePredicateCosts(
 		return materializedPredKey{}, 0, 0, 0, false
 	}
 
-	var core preparedScalarRangePredicate[K, V]
+	var core preparedScalarRangePredicate
 	qv.initPreparedExactScalarRangePredicate(&core, p.expr, fm, p.effectiveBounds)
 	ov := qv.fieldOverlayForExpr(p.expr)
 	if !ov.hasData() {
@@ -2141,7 +2141,7 @@ func (qv *queryView[K, V]) orderedORMaterializedExactRangePredicateCosts(
 	if !ok || compPlan.buckets == 0 || compPlan.est == 0 {
 		return materializedPredKey{}, 0, 0, 0, false
 	}
-	candidate := preparedScalarRangeRoutingCandidate[K, V]{
+	candidate := preparedScalarRangeRoutingCandidate{
 		core:    core,
 		plan:    plan,
 		numeric: true,
@@ -2176,7 +2176,7 @@ func (qv *queryView[K, V]) orderedORMaterializedExactRangePredicateCosts(
 		true
 }
 
-func (qv *queryView[K, V]) orderedORMaterializedPrefixLeafBuildWork(
+func (qv *queryView) orderedORMaterializedPrefixLeafBuildWork(
 	orderField string,
 	leaf qir.Expr,
 ) (materializedPredKey, uint64, bool) {
@@ -2213,7 +2213,7 @@ type orderedORMaterializedPredicateBuildInfo struct {
 	ok              bool
 }
 
-func (qv *queryView[K, V]) orderedORMaterializedPredicateBuildInfo(
+func (qv *queryView) orderedORMaterializedPredicateBuildInfo(
 	orderField string,
 	p predicate,
 ) orderedORMaterializedPredicateBuildInfo {
@@ -2249,7 +2249,7 @@ func (qv *queryView[K, V]) orderedORMaterializedPredicateBuildInfo(
 	return orderedORMaterializedPredicateBuildInfo{}
 }
 
-func (qv *queryView[K, V]) buildOROrderPredicateBuildInfos(
+func (qv *queryView) buildOROrderPredicateBuildInfos(
 	orderField string,
 	branch plannerORBranch,
 	covered *pooled.SliceBuf[bool],
@@ -2282,7 +2282,7 @@ func (qv *queryView[K, V]) buildOROrderPredicateBuildInfos(
 	return buf
 }
 
-func (qv *queryView[K, V]) orderedORPredicateBuildInfoForBranch(
+func (qv *queryView) orderedORPredicateBuildInfoForBranch(
 	orderField string,
 	p predicate,
 	analysis *plannerOROrderAnalysis,
@@ -2306,7 +2306,7 @@ func (qv *queryView[K, V]) orderedORPredicateBuildInfoForBranch(
 	return qv.orderedORMaterializedPredicateBuildInfo(orderField, p)
 }
 
-func (qv *queryView[K, V]) materializeOrderedORPredicate(p *predicate) bool {
+func (qv *queryView) materializeOrderedORPredicate(p *predicate) bool {
 	if p == nil {
 		return false
 	}
@@ -2345,7 +2345,7 @@ func (qv *queryView[K, V]) materializeOrderedORPredicate(p *predicate) bool {
 	return qv.materializePositiveScalarRangePredicateWithCandidate(p, candidate)
 }
 
-func (qv *queryView[K, V]) materializePositiveScalarRangePredicate(p *predicate) bool {
+func (qv *queryView) materializePositiveScalarRangePredicate(p *predicate) bool {
 	if p == nil {
 		return false
 	}
@@ -2356,9 +2356,9 @@ func (qv *queryView[K, V]) materializePositiveScalarRangePredicate(p *predicate)
 	return qv.materializePositiveScalarRangePredicateWithCandidate(p, candidate)
 }
 
-func (qv *queryView[K, V]) materializePositiveScalarRangePredicateWithCandidate(
+func (qv *queryView) materializePositiveScalarRangePredicateWithCandidate(
 	p *predicate,
-	candidate preparedScalarRangeRoutingCandidate[K, V],
+	candidate preparedScalarRangeRoutingCandidate,
 ) bool {
 	ov := qv.fieldOverlayForExpr(p.expr)
 	if !ov.hasData() {
@@ -2387,7 +2387,7 @@ type plannerOROrderedBranchEstimate struct {
 	probeRows uint64
 }
 
-func (qv *queryView[K, V]) initOrderedORBranchEstimates(
+func (qv *queryView) initOrderedORBranchEstimates(
 	branches plannerORBranches,
 	branchUniverses *[plannerORBranchLimit]uint64,
 	needWindow int,
@@ -2449,7 +2449,7 @@ func (qv *queryView[K, V]) initOrderedORBranchEstimates(
 	}
 }
 
-func (qv *queryView[K, V]) initNoOrderORBranchEstimates(
+func (qv *queryView) initNoOrderORBranchEstimates(
 	branches plannerORBranches,
 	needWindow int,
 	out *[plannerORBranchLimit]plannerOROrderedBranchEstimate,
@@ -2562,7 +2562,7 @@ func orderedORAdvanceRowsForChecks(
 	return rows
 }
 
-func (qv *queryView[K, V]) orderedORMaterializedPredicateRequiresPromotion(
+func (qv *queryView) orderedORMaterializedPredicateRequiresPromotion(
 	p predicate,
 	branchNeed uint64,
 	orderedOffset uint64,
@@ -2609,7 +2609,7 @@ func orderedORMaterializedPredicateWarmHitWorth(
 	return savedWork >= cachedCheckWork
 }
 
-func (qv *queryView[K, V]) shouldEagerMaterializeOrderedORPredicate(
+func (qv *queryView) shouldEagerMaterializeOrderedORPredicate(
 	p predicate,
 	info orderedORMaterializedPredicateBuildInfo,
 	est plannerOROrderedBranchEstimate,
@@ -2647,7 +2647,7 @@ func (qv *queryView[K, V]) shouldEagerMaterializeOrderedORPredicate(
 	return true, false
 }
 
-func (qv *queryView[K, V]) maybeWarmMaterializeOrderedORPredicates(
+func (qv *queryView) maybeWarmMaterializeOrderedORPredicates(
 	q *qir.Shape,
 	branches plannerORBranches,
 	analysis *plannerOROrderAnalysis,
@@ -2659,7 +2659,7 @@ func (qv *queryView[K, V]) maybeWarmMaterializeOrderedORPredicates(
 	return qv.maybeMaterializeOrderedORPredicates(q, branches, analysis, false, false, trace)
 }
 
-func (qv *queryView[K, V]) maybeEagerMaterializeOrderedORPredicates(
+func (qv *queryView) maybeEagerMaterializeOrderedORPredicates(
 	q *qir.Shape,
 	branches plannerORBranches,
 	analysis *plannerOROrderAnalysis,
@@ -2669,7 +2669,7 @@ func (qv *queryView[K, V]) maybeEagerMaterializeOrderedORPredicates(
 	return qv.maybeMaterializeOrderedORPredicates(q, branches, analysis, merge, true, trace)
 }
 
-func (qv *queryView[K, V]) maybeMaterializeOrderedORPredicates(
+func (qv *queryView) maybeMaterializeOrderedORPredicates(
 	q *qir.Shape,
 	branches plannerORBranches,
 	analysis *plannerOROrderAnalysis,
@@ -2990,7 +2990,7 @@ func (qv *queryView[K, V]) maybeMaterializeOrderedORPredicates(
 	return changed
 }
 
-func (qv *queryView[K, V]) maybeEagerMaterializeNoOrderORPredicates(q *qir.Shape, branches plannerORBranches) {
+func (qv *queryView) maybeEagerMaterializeNoOrderORPredicates(q *qir.Shape, branches plannerORBranches) {
 	if q == nil || q.HasOrder || qv.snap == nil || qv.snap.matPredCacheMaxEntries <= 0 || branches.Len() == 0 {
 		return
 	}
@@ -3043,7 +3043,7 @@ func (qv *queryView[K, V]) maybeEagerMaterializeNoOrderORPredicates(q *qir.Shape
 	}
 }
 
-func (qv *queryView[K, V]) promoteOrderedORMaterializedBaseOps(
+func (qv *queryView) promoteOrderedORMaterializedBaseOps(
 	q *qir.Shape,
 	branches plannerORBranches,
 	branchChecks [plannerORBranchLimit]*pooled.SliceBuf[int],
@@ -3149,7 +3149,7 @@ func (qv *queryView[K, V]) promoteOrderedORMaterializedBaseOps(
 	}
 }
 
-func (qv *queryView[K, V]) promoteObservedOrderedORKWayMaterializedBaseOps(
+func (qv *queryView) promoteObservedOrderedORKWayMaterializedBaseOps(
 	q *qir.Shape,
 	branches plannerORBranches,
 	branchChecks [plannerORBranchLimit]*pooled.SliceBuf[int],
@@ -3259,7 +3259,7 @@ func (qv *queryView[K, V]) promoteObservedOrderedORKWayMaterializedBaseOps(
 	}
 }
 
-func (qv *queryView[K, V]) shouldObserveOrderedORPredicate(p predicate, info orderedORMaterializedPredicateBuildInfo) bool {
+func (qv *queryView) shouldObserveOrderedORPredicate(p predicate, info orderedORMaterializedPredicateBuildInfo) bool {
 	if !info.ok || info.cacheKey.isZero() || info.buildWork == 0 {
 		return false
 	}
@@ -3303,7 +3303,7 @@ func branchHasPositiveLeafOR(e qir.Expr) bool {
 	}
 }
 
-func (qv *queryView[K, V]) shouldKeepORBranchNumericRangeLazy(e qir.Expr) bool {
+func (qv *queryView) shouldKeepORBranchNumericRangeLazy(e qir.Expr) bool {
 	if qv == nil || qv.snap == nil || e.Not || e.FieldOrdinal < 0 || !isNumericRangeOp(e.Op) {
 		return false
 	}
@@ -3328,15 +3328,15 @@ func (qv *queryView[K, V]) shouldKeepORBranchNumericRangeLazy(e qir.Expr) bool {
 	return !allowRuntimePositiveRangeSecondHitShare(candidate.plan.est, universe)
 }
 
-func (qv *queryView[K, V]) shouldForceORBranchNumericRangeMaterializeWithCandidate(
-	candidate preparedScalarRangeRoutingCandidate[K, V],
+func (qv *queryView) shouldForceORBranchNumericRangeMaterializeWithCandidate(
+	candidate preparedScalarRangeRoutingCandidate,
 	_ uint64,
 ) bool {
 	return candidate.plan.useComplement &&
 		candidate.core.qv.nilFieldOverlayForExpr(candidate.core.expr).lookupCardinality(nilIndexEntryKey) > 0
 }
 
-func (qv *queryView[K, V]) shouldForceORBranchNumericRangeMaterialize(e qir.Expr) bool {
+func (qv *queryView) shouldForceORBranchNumericRangeMaterialize(e qir.Expr) bool {
 	if qv == nil || e.Not || e.FieldOrdinal < 0 || !isNumericRangeOp(e.Op) {
 		return false
 	}
@@ -3351,7 +3351,7 @@ func (qv *queryView[K, V]) shouldForceORBranchNumericRangeMaterialize(e qir.Expr
 	return qv.shouldForceORBranchNumericRangeMaterializeWithCandidate(candidate, qv.snapshotUniverseCardinality())
 }
 
-func (qv *queryView[K, V]) shouldBuildORBranchLeafLazy(e qir.Expr, branchLeafCount int) bool {
+func (qv *queryView) shouldBuildORBranchLeafLazy(e qir.Expr, branchLeafCount int) bool {
 	if qv == nil || qv.snap == nil || qv.snap.matPredCacheMaxEntries <= 0 || branchLeafCount <= 1 {
 		return false
 	}
@@ -3402,7 +3402,7 @@ func predicateHasBroadPositiveComplementRuntimeRange(p predicate) bool {
 	return false
 }
 
-func (qv *queryView[K, V]) mayNeedORBranchRangeRewrite(leaves []qir.Expr) bool {
+func (qv *queryView) mayNeedORBranchRangeRewrite(leaves []qir.Expr) bool {
 	if qv == nil || len(leaves) <= 1 {
 		return false
 	}
@@ -3439,7 +3439,7 @@ func noOrderOREagerMaterializeEligible(branches plannerORBranches) bool {
 	return false
 }
 
-func (qv *queryView[K, V]) buildORBranchPredicates(leaves []qir.Expr) (predicateSet, bool) {
+func (qv *queryView) buildORBranchPredicates(leaves []qir.Expr) (predicateSet, bool) {
 	if !qv.mayNeedORBranchRangeRewrite(leaves) {
 		return qv.buildPredicatesWithColdMode(leaves, true, false)
 	}
@@ -3484,7 +3484,7 @@ func (qv *queryView[K, V]) buildORBranchPredicates(leaves []qir.Expr) (predicate
 
 // buildORBranches compiles each OR branch into planner predicates and optional
 // lead iterators used by OR execution strategies.
-func (qv *queryView[K, V]) buildORBranches(ops []qir.Expr) (plannerORBranches, bool, bool) {
+func (qv *queryView) buildORBranches(ops []qir.Expr) (plannerORBranches, bool, bool) {
 	out := newPlannerORBranches(len(ops))
 	var leavesBuf [8]qir.Expr
 
@@ -3518,7 +3518,7 @@ func (qv *queryView[K, V]) buildORBranches(ops []qir.Expr) (plannerORBranches, b
 	return out, false, true
 }
 
-func (qv *queryView[K, V]) buildORBranchesOrdered(
+func (qv *queryView) buildORBranchesOrdered(
 	ops []qir.Expr,
 	orderField string,
 	orderedWindow int,
@@ -3596,7 +3596,7 @@ func (qv *queryView[K, V]) buildORBranchesOrdered(
 // checking branch predicates per candidate.
 //
 // It keeps deterministic ordering semantics and avoids full OR unions for LIMIT-heavy queries.
-func (qv *queryView[K, V]) execPlanOROrderBasic(q *qir.Shape, branches plannerORBranches, analysis *plannerOROrderAnalysis, trace *queryTrace, observed *orderedORObservedStats) ([]K, bool) {
+func (qv *queryView) execPlanOROrderBasic(q *qir.Shape, branches plannerORBranches, analysis *plannerOROrderAnalysis, trace *queryTrace, observed *orderedORObservedStats) ([]uint64, bool) {
 	o := q.Order
 	f := qv.fieldNameByOrdinal(o.FieldOrdinal)
 	if o.FieldOrdinal < 0 {
@@ -3668,7 +3668,7 @@ func (qv *queryView[K, V]) execPlanOROrderBasic(q *qir.Shape, branches plannerOR
 
 	skip := q.Offset
 	need := int(q.Limit)
-	out := make([]K, 0, need)
+	out := make([]uint64, 0, need)
 
 	var branchEvalOrder [plannerORBranchLimit]int
 	branchEvalN := 0
@@ -3740,7 +3740,7 @@ func (qv *queryView[K, V]) execPlanOROrderBasic(q *qir.Shape, branches plannerOR
 					skip--
 					continue
 				}
-				out = append(out, qv.idFromIdxNoLock(idx))
+				out = append(out, idx)
 				need--
 				continue
 			}
@@ -3782,7 +3782,7 @@ func (qv *queryView[K, V]) execPlanOROrderBasic(q *qir.Shape, branches plannerOR
 					skip--
 					continue
 				}
-				out = append(out, qv.idFromIdxNoLock(idx))
+				out = append(out, idx)
 				need--
 			}
 			it.Release()
@@ -3845,7 +3845,7 @@ func (qv *queryView[K, V]) execPlanOROrderBasic(q *qir.Shape, branches plannerOR
 				skip--
 				continue
 			}
-			out = append(out, qv.idFromIdxNoLock(idx))
+			out = append(out, idx)
 			need--
 			if need == 0 {
 				stopReason = "limit_reached"
@@ -3877,7 +3877,7 @@ func (qv *queryView[K, V]) execPlanOROrderBasic(q *qir.Shape, branches plannerOR
 				skip--
 				continue
 			}
-			out = append(out, qv.idFromIdxNoLock(idx))
+			out = append(out, idx)
 			need--
 			if need == 0 {
 				stopReason = "limit_reached"
@@ -3911,16 +3911,16 @@ func orderWindow(q *qir.Shape) (int, bool) {
 	return int(need), true
 }
 
-func (qv *queryView[K, V]) shouldPreferOROrderFallbackFirst(q *qir.Shape, branches plannerORBranches) bool {
+func (qv *queryView) shouldPreferOROrderFallbackFirst(q *qir.Shape, branches plannerORBranches) bool {
 	d, ok := qv.decideOROrderFallbackFirst(q, branches)
 	return ok && d.prefer
 }
 
-func (qv *queryView[K, V]) decideOROrderFallbackFirst(q *qir.Shape, branches plannerORBranches) (plannerOROrderFallbackDecision, bool) {
+func (qv *queryView) decideOROrderFallbackFirst(q *qir.Shape, branches plannerORBranches) (plannerOROrderFallbackDecision, bool) {
 	return qv.decideOROrderFallbackFirstWithAnalysis(q, branches, nil)
 }
 
-func (qv *queryView[K, V]) decideOROrderFallbackFirstWithAnalysis(
+func (qv *queryView) decideOROrderFallbackFirstWithAnalysis(
 	q *qir.Shape,
 	branches plannerORBranches,
 	analysis *plannerOROrderAnalysis,
@@ -4009,16 +4009,16 @@ func (qv *queryView[K, V]) decideOROrderFallbackFirstWithAnalysis(
 	return d, true
 }
 
-func (qv *queryView[K, V]) shouldUseOROrderKWayRuntimeFallback(q *qir.Shape, branches plannerORBranches, needWindow int) bool {
+func (qv *queryView) shouldUseOROrderKWayRuntimeFallback(q *qir.Shape, branches plannerORBranches, needWindow int) bool {
 	d, ok := qv.decideOROrderKWayRuntimeFallback(q, branches, needWindow)
 	return ok && d.enable
 }
 
-func (qv *queryView[K, V]) decideOROrderKWayRuntimeFallback(q *qir.Shape, branches plannerORBranches, needWindow int) (plannerOROrderRuntimeGuardDecision, bool) {
+func (qv *queryView) decideOROrderKWayRuntimeFallback(q *qir.Shape, branches plannerORBranches, needWindow int) (plannerOROrderRuntimeGuardDecision, bool) {
 	return qv.decideOROrderKWayRuntimeFallbackWithAnalysis(q, branches, needWindow, nil)
 }
 
-func (qv *queryView[K, V]) decideOROrderKWayRuntimeFallbackWithAnalysis(
+func (qv *queryView) decideOROrderKWayRuntimeFallbackWithAnalysis(
 	q *qir.Shape,
 	branches plannerORBranches,
 	needWindow int,
@@ -4250,12 +4250,12 @@ func plannerORKWayShouldFallbackRuntimeDetailedWithShape(needWindow, pops int, u
 	return d
 }
 
-func (qv *queryView[K, V]) execPlanOROrderMerge(
+func (qv *queryView) execPlanOROrderMerge(
 	q *qir.Shape,
 	branches plannerORBranches,
 	analysis *plannerOROrderAnalysis,
 	trace *queryTrace,
-) ([]K, bool, error) {
+) ([]uint64, bool, error) {
 	fallbackDec, decOK := qv.decideOROrderFallbackFirstWithAnalysis(q, branches, analysis)
 	if trace != nil && decOK {
 		route := "kway_first"
@@ -4471,7 +4471,7 @@ func (v plannerOrderIndexView) close() {
 }
 
 // plannerOrderIndexSnapshotViewByOrdinal returns the current immutable order-index slice.
-func (qv *queryView[K, V]) plannerOrderIndexSnapshotViewByOrdinal(fieldOrdinal int) (plannerOrderIndexView, bool) {
+func (qv *queryView) plannerOrderIndexSnapshotViewByOrdinal(fieldOrdinal int) (plannerOrderIndexView, bool) {
 	ov := qv.fieldOverlayByOrdinal(fieldOrdinal)
 	if !ov.hasData() {
 		return plannerOrderIndexView{}, false
@@ -4769,12 +4769,12 @@ func (it *plannerOROrderBranchIter) advance() (uint64, uint64, uint64, bool) {
 	}
 }
 
-func (qv *queryView[K, V]) execPlanOROrderKWay(
+func (qv *queryView) execPlanOROrderKWay(
 	q *qir.Shape,
 	branches plannerORBranches,
 	analysis *plannerOROrderAnalysis,
 	trace *queryTrace,
-) ([]K, bool, error) {
+) ([]uint64, bool, error) {
 	needWindow, ok := orderWindow(q)
 	if !ok || needWindow <= 0 {
 		return nil, false, nil
@@ -4994,7 +4994,7 @@ func (qv *queryView[K, V]) execPlanOROrderKWay(
 	if outCap <= 0 {
 		outCap = needWindow
 	}
-	out := make([]K, 0, outCap)
+	out := make([]uint64, 0, outCap)
 
 	seen := newU64Set(max(64, needWindow*2))
 	defer releaseU64Set(&seen)
@@ -5057,7 +5057,7 @@ func (qv *queryView[K, V]) execPlanOROrderKWay(
 			continue
 		}
 
-		out = append(out, qv.idFromIdxNoLock(item.idx))
+		out = append(out, item.idx)
 		needOut--
 		if needOut == 0 {
 			stopReason = "limit_reached"
@@ -5098,7 +5098,7 @@ func (qv *queryView[K, V]) execPlanOROrderKWay(
 	return out, true, nil
 }
 
-func (qv *queryView[K, V]) execPlanOROrderMergeFallback(q *qir.Shape, branches plannerORBranches, trace *queryTrace) ([]K, bool, error) {
+func (qv *queryView) execPlanOROrderMergeFallback(q *qir.Shape, branches plannerORBranches, trace *queryTrace) ([]uint64, bool, error) {
 	need, ok := orderWindow(q)
 	if !ok || need <= 0 {
 		return nil, false, nil
@@ -5185,7 +5185,13 @@ func (qv *queryView[K, V]) execPlanOROrderMergeFallback(q *qir.Shape, branches p
 			continue
 		}
 
-		if dedupe := qv.root.addCheckedIdxsFromIDs(ids, &candidateSet); dedupe > 0 && trace != nil {
+		dedupe := uint64(0)
+		for _, idx := range ids {
+			if !candidateSet.addChecked(idx) {
+				dedupe++
+			}
+		}
+		if dedupe > 0 && trace != nil {
 			trace.addDedupe(dedupe)
 		}
 	}
@@ -5227,7 +5233,7 @@ func (qv *queryView[K, V]) execPlanOROrderMergeFallback(q *qir.Shape, branches p
 	}
 
 	totalCandidates := candidateIDs.Cardinality()
-	out := make([]K, 0, int(min(needOut, totalCandidates)))
+	out := make([]uint64, 0, int(min(needOut, totalCandidates)))
 
 	seenCandidates := uint64(0)
 	scanWidth := uint64(0)
@@ -5251,7 +5257,7 @@ func (qv *queryView[K, V]) execPlanOROrderMergeFallback(q *qir.Shape, branches p
 			if skip > 0 {
 				skip--
 			} else {
-				out = append(out, qv.idFromIdxNoLock(idx))
+				out = append(out, idx)
 				needOut--
 				if needOut == 0 {
 					setOROrderMergeFallbackTrace(trace, seenCandidates, scanWidth, branchMetrics, "limit_reached")
@@ -5277,7 +5283,7 @@ func (qv *queryView[K, V]) execPlanOROrderMergeFallback(q *qir.Shape, branches p
 				skip--
 				continue
 			}
-			out = append(out, qv.idFromIdxNoLock(idx))
+			out = append(out, idx)
 			needOut--
 		}
 		it.Release()
@@ -5454,7 +5460,7 @@ func (c *plannerOROrderFallbackAccumulatorBuf) emitExact(idx uint64) bool {
 	return c.add(idx)
 }
 
-func (qv *queryView[K, V]) collectOROrderFallbackBranchCandidatesWithChecks(
+func (qv *queryView) collectOROrderFallbackBranchCandidatesWithChecks(
 	branch *plannerORBranch,
 	branchLimit int,
 	ov fieldOverlay,
@@ -5534,7 +5540,7 @@ func (qv *queryView[K, V]) collectOROrderFallbackBranchCandidatesWithChecks(
 	return acc.emitted, acc.examined, acc.dedupe
 }
 
-func (qv *queryView[K, V]) collectOROrderFallbackBranchCandidatesWithChecksBuf(
+func (qv *queryView) collectOROrderFallbackBranchCandidatesWithChecksBuf(
 	branch *plannerORBranch,
 	branchLimit int,
 	ov fieldOverlay,
@@ -5617,7 +5623,7 @@ func (qv *queryView[K, V]) collectOROrderFallbackBranchCandidatesWithChecksBuf(
 // collectOROrderFallbackBranchCandidates collects up to branchLimit matching ids
 // from one OR branch directly from the base order index and writes them into dst.
 // Returns ok=false when fast-path preconditions are not satisfied.
-func (qv *queryView[K, V]) collectOROrderFallbackBranchCandidates(
+func (qv *queryView) collectOROrderFallbackBranchCandidates(
 	branch *plannerORBranch,
 	order qir.Order,
 	branchLimit int,
@@ -5687,7 +5693,7 @@ func (qv *queryView[K, V]) collectOROrderFallbackBranchCandidates(
 	return emitted, examined, dedupe, true
 }
 
-func (qv *queryView[K, V]) planOROrderMergeBranchLimit(branch plannerORBranch, need int) (limit int, exhaustive bool, err error) {
+func (qv *queryView) planOROrderMergeBranchLimit(branch plannerORBranch, need int) (limit int, exhaustive bool, err error) {
 	if need <= 0 {
 		return 0, true, nil
 	}
@@ -5761,7 +5767,7 @@ func plannerOROrderMergePrecountWorth(branch plannerORBranch, need int) bool {
 	return preCountWork+postCountScanWork <= branchScanWork*plannerOROrderMergePrecountGain
 }
 
-func (qv *queryView[K, V]) canPrecountORBranchExpr(e qir.Expr) bool {
+func (qv *queryView) canPrecountORBranchExpr(e qir.Expr) bool {
 	if !isMaterializedScalarCacheOp(e.Op) {
 		return true
 	}
@@ -5773,7 +5779,7 @@ func (qv *queryView[K, V]) canPrecountORBranchExpr(e qir.Expr) bool {
 	return ok
 }
 
-func (qv *queryView[K, V]) countORBranchByUniqueLeadWithChecks(branch plannerORBranch, leadIdx int, checks []int) (uint64, bool) {
+func (qv *queryView) countORBranchByUniqueLeadWithChecks(branch plannerORBranch, leadIdx int, checks []int) (uint64, bool) {
 	lead := branch.pred(leadIdx)
 	it := lead.newIter()
 	if it == nil {
@@ -5798,7 +5804,7 @@ func (qv *queryView[K, V]) countORBranchByUniqueLeadWithChecks(branch plannerORB
 	return cnt, true
 }
 
-func (qv *queryView[K, V]) countORBranchByUniqueLeadWithChecksBuf(branch plannerORBranch, leadIdx int, checks *pooled.SliceBuf[int]) (uint64, bool) {
+func (qv *queryView) countORBranchByUniqueLeadWithChecksBuf(branch plannerORBranch, leadIdx int, checks *pooled.SliceBuf[int]) (uint64, bool) {
 	lead := branch.pred(leadIdx)
 	it := lead.newIter()
 	if it == nil {
@@ -5818,7 +5824,7 @@ func (qv *queryView[K, V]) countORBranchByUniqueLeadWithChecksBuf(branch planner
 
 // countORBranchByUniqueLead tries to count one OR branch by scanning a unique
 // EQ predicate lead and validating the remaining predicates with contains().
-func (qv *queryView[K, V]) countORBranchByUniqueLead(branch plannerORBranch) (uint64, bool) {
+func (qv *queryView) countORBranchByUniqueLead(branch plannerORBranch) (uint64, bool) {
 	if branch.predLen() == 0 {
 		return 0, false
 	}
@@ -6085,7 +6091,7 @@ func plannerORNoOrderAddCandidate(top *pooled.SliceBuf[uint64], idx uint64, need
 	plannerORNoOrderInsertTopN(top, idx, need)
 }
 
-func (qv *queryView[K, V]) execPlanORNoOrder(q *qir.Shape, branches plannerORBranches, trace *queryTrace) ([]K, bool) {
+func (qv *queryView) execPlanORNoOrder(q *qir.Shape, branches plannerORBranches, trace *queryTrace) ([]uint64, bool) {
 	switch plannerORNoOrderClassify(branches) {
 	case plannerORNoOrderModeUniverse:
 		return qv.execPlanORUniverseNoOrder(q, trace), true
@@ -6104,7 +6110,7 @@ func (qv *queryView[K, V]) execPlanORNoOrder(q *qir.Shape, branches plannerORBra
 // execPlanORNoOrderAdaptive collects top-N ids for no-order OR via adaptive per-branch probing.
 //
 // It starts with cheap branches and increases probe budgets only when needed to prove top-N completeness.
-func (qv *queryView[K, V]) execPlanORNoOrderAdaptive(q *qir.Shape, branches plannerORBranches, trace *queryTrace) ([]K, bool) {
+func (qv *queryView) execPlanORNoOrderAdaptive(q *qir.Shape, branches plannerORBranches, trace *queryTrace) ([]uint64, bool) {
 	switch plannerORNoOrderClassify(branches) {
 	case plannerORNoOrderModeUniverse:
 		return qv.execPlanORUniverseNoOrder(q, trace), true
@@ -6114,7 +6120,7 @@ func (qv *queryView[K, V]) execPlanORNoOrderAdaptive(q *qir.Shape, branches plan
 	return qv.execPlanORNoOrderAdaptiveCore(q, branches, trace)
 }
 
-func (qv *queryView[K, V]) execPlanORNoOrderAdaptiveCore(q *qir.Shape, branches plannerORBranches, trace *queryTrace) ([]K, bool) {
+func (qv *queryView) execPlanORNoOrderAdaptiveCore(q *qir.Shape, branches plannerORBranches, trace *queryTrace) ([]uint64, bool) {
 	if q.Limit == 0 || q.Offset != 0 {
 		return nil, false
 	}
@@ -6290,14 +6296,14 @@ func (qv *queryView[K, V]) execPlanORNoOrderAdaptiveCore(q *qir.Shape, branches 
 		return nil, true
 	}
 
-	out := make([]K, 0, topBuf.Len())
+	out := make([]uint64, 0, topBuf.Len())
 	for i := 0; i < topBuf.Len(); i++ {
-		out = append(out, qv.idFromIdxNoLock(topBuf.Get(i)))
+		out = append(out, topBuf.Get(i))
 	}
 	return out, true
 }
 
-func (qv *queryView[K, V]) execPlanORNoOrderBaseline(q *qir.Shape, branches plannerORBranches, trace *queryTrace) ([]K, bool) {
+func (qv *queryView) execPlanORNoOrderBaseline(q *qir.Shape, branches plannerORBranches, trace *queryTrace) ([]uint64, bool) {
 	switch plannerORNoOrderClassify(branches) {
 	case plannerORNoOrderModeUniverse:
 		return qv.execPlanORUniverseNoOrder(q, trace), true
@@ -6307,7 +6313,7 @@ func (qv *queryView[K, V]) execPlanORNoOrderBaseline(q *qir.Shape, branches plan
 	return qv.execPlanORNoOrderBaselineCore(q, branches, trace)
 }
 
-func (qv *queryView[K, V]) execPlanORNoOrderBaselineCore(q *qir.Shape, branches plannerORBranches, trace *queryTrace) ([]K, bool) {
+func (qv *queryView) execPlanORNoOrderBaselineCore(q *qir.Shape, branches plannerORBranches, trace *queryTrace) ([]uint64, bool) {
 	qv.maybeEagerMaterializeNoOrderORPredicates(q, branches)
 
 	fullTrace := trace.full()
@@ -6344,7 +6350,7 @@ func (qv *queryView[K, V]) execPlanORNoOrderBaselineCore(q *qir.Shape, branches 
 
 	skip := q.Offset
 	need := int(q.Limit)
-	out := make([]K, 0, need)
+	out := make([]uint64, 0, need)
 	stopReason := "input_exhausted"
 	needWindow := need
 	if skip > 0 {
@@ -6435,7 +6441,7 @@ func (qv *queryView[K, V]) execPlanORNoOrderBaselineCore(q *qir.Shape, branches 
 			continue
 		}
 
-		out = append(out, qv.idFromIdxNoLock(minIdx))
+		out = append(out, minIdx)
 		need--
 		if need == 0 {
 			stopReason = "limit_reached"
@@ -6451,10 +6457,10 @@ func (qv *queryView[K, V]) execPlanORNoOrderBaselineCore(q *qir.Shape, branches 
 	return out, true
 }
 
-func (qv *queryView[K, V]) execPlanORUniverseNoOrder(q *qir.Shape, trace *queryTrace) []K {
+func (qv *queryView) execPlanORUniverseNoOrder(q *qir.Shape, trace *queryTrace) []uint64 {
 	skip := q.Offset
 	need := int(q.Limit)
-	out := make([]K, 0, need)
+	out := make([]uint64, 0, need)
 	stopReason := "input_exhausted"
 
 	if trace != nil {
@@ -6469,7 +6475,7 @@ func (qv *queryView[K, V]) execPlanORUniverseNoOrder(q *qir.Shape, trace *queryT
 			skip--
 			continue
 		}
-		out = append(out, qv.idFromIdxNoLock(idx))
+		out = append(out, idx)
 		need--
 		if need == 0 {
 			stopReason = "limit_reached"

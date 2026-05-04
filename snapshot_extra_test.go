@@ -197,7 +197,7 @@ func snapshotExtraQuerySnapshotKeys[K ~string | ~uint64](t *testing.T, db *DB[K,
 	if err != nil {
 		t.Fatalf("snapshot query: %v", err)
 	}
-	return ids
+	return db.queryKeysFromIDs(snap, ids)
 }
 
 func snapshotExtraScanSnapshotStringKeys(t *testing.T, db *DB[string, snapshotExtraRec], snap *indexSnapshot, seek string) []string {
@@ -278,19 +278,19 @@ func snapshotExtraSetNumericBucketKnobs(t *testing.T, db *DB[uint64, snapshotExt
 func snapshotExtraLiveStrMapLookup(t *testing.T, db *DB[string, snapshotExtraRec], key string) (uint64, bool) {
 	t.Helper()
 
-	db.strmap.Lock()
-	defer db.strmap.Unlock()
+	db.strMap.Lock()
+	defer db.strMap.Unlock()
 
-	idx, ok := db.strmap.Keys[key]
+	idx, ok := db.strMap.Keys[key]
 	return idx, ok
 }
 
 func snapshotExtraLiveStrMapNext(t *testing.T, db *DB[string, snapshotExtraRec]) uint64 {
 	t.Helper()
 
-	db.strmap.Lock()
-	defer db.strmap.Unlock()
-	return db.strmap.Next
+	db.strMap.Lock()
+	defer db.strMap.Unlock()
+	return db.strMap.Next
 }
 
 func TestSnapshotExtra_BeginQueryTxSnapshotIgnoresRealStagedSetBeforeCommit(t *testing.T) {
@@ -312,20 +312,22 @@ func TestSnapshotExtra_BeginQueryTxSnapshotIgnoresRealStagedSetBeforeCommit(t *t
 
 	entered := make(chan struct{})
 	release := make(chan struct{})
-	db.testHooks.beforeCommit = func(op string) error {
-		if op != "set" {
+	db.testHooks = &testHooks{
+		beforeCommit: func(op string) error {
+			if op != "set" {
+				return nil
+			}
+			select {
+			case <-entered:
+			default:
+				close(entered)
+			}
+			<-release
 			return nil
-		}
-		select {
-		case <-entered:
-		default:
-			close(entered)
-		}
-		<-release
-		return nil
+		},
 	}
 	t.Cleanup(func() {
-		db.testHooks.beforeCommit = nil
+		db.testHooks = nil
 		select {
 		case <-release:
 		default:
@@ -419,20 +421,22 @@ func TestSnapshotExtra_BeginQueryTxSnapshotSurvivesRealStagedSetRollback(t *test
 
 	entered := make(chan struct{})
 	release := make(chan struct{})
-	db.testHooks.beforeCommit = func(op string) error {
-		if op != "set" {
-			return nil
-		}
-		select {
-		case <-entered:
-		default:
-			close(entered)
-		}
-		<-release
-		return fmt.Errorf("failpoint: rollback set")
+	db.testHooks = &testHooks{
+		beforeCommit: func(op string) error {
+			if op != "set" {
+				return nil
+			}
+			select {
+			case <-entered:
+			default:
+				close(entered)
+			}
+			<-release
+			return fmt.Errorf("failpoint: rollback set")
+		},
 	}
 	t.Cleanup(func() {
-		db.testHooks.beforeCommit = nil
+		db.testHooks = nil
 		select {
 		case <-release:
 		default:
@@ -528,20 +532,22 @@ func TestSnapshotExtra_BeginQueryTxSnapshotIgnoresRealStagedBatchSetBeforeCommit
 
 	entered := make(chan struct{})
 	release := make(chan struct{})
-	db.testHooks.beforeCommit = func(op string) error {
-		if op != "batch_set" {
+	db.testHooks = &testHooks{
+		beforeCommit: func(op string) error {
+			if op != "batch_set" {
+				return nil
+			}
+			select {
+			case <-entered:
+			default:
+				close(entered)
+			}
+			<-release
 			return nil
-		}
-		select {
-		case <-entered:
-		default:
-			close(entered)
-		}
-		<-release
-		return nil
+		},
 	}
 	t.Cleanup(func() {
-		db.testHooks.beforeCommit = nil
+		db.testHooks = nil
 		select {
 		case <-release:
 		default:
@@ -696,20 +702,22 @@ func TestSnapshotExtra_StringKeyPinnedSnapshotDoesNotSeeRealStagedFutureKey(t *t
 
 	entered := make(chan struct{})
 	release := make(chan struct{})
-	db.testHooks.beforeCommit = func(op string) error {
-		if op != "set" {
+	db.testHooks = &testHooks{
+		beforeCommit: func(op string) error {
+			if op != "set" {
+				return nil
+			}
+			select {
+			case <-entered:
+			default:
+				close(entered)
+			}
+			<-release
 			return nil
-		}
-		select {
-		case <-entered:
-		default:
-			close(entered)
-		}
-		<-release
-		return nil
+		},
 	}
 	t.Cleanup(func() {
-		db.testHooks.beforeCommit = nil
+		db.testHooks = nil
 		select {
 		case <-release:
 		default:
@@ -793,20 +801,22 @@ func TestSnapshotExtra_StringKeyRollbackRemovesLiveCreatedIdxAndReusesIt(t *test
 
 	entered := make(chan struct{})
 	release := make(chan struct{})
-	db.testHooks.beforeCommit = func(op string) error {
-		if op != "set" {
-			return nil
-		}
-		select {
-		case <-entered:
-		default:
-			close(entered)
-		}
-		<-release
-		return fmt.Errorf("failpoint: rollback string set")
+	db.testHooks = &testHooks{
+		beforeCommit: func(op string) error {
+			if op != "set" {
+				return nil
+			}
+			select {
+			case <-entered:
+			default:
+				close(entered)
+			}
+			<-release
+			return fmt.Errorf("failpoint: rollback string set")
+		},
 	}
 	t.Cleanup(func() {
-		db.testHooks.beforeCommit = nil
+		db.testHooks = nil
 		select {
 		case <-release:
 		default:
@@ -855,7 +865,7 @@ func TestSnapshotExtra_StringKeyRollbackRemovesLiveCreatedIdxAndReusesIt(t *test
 	if err == nil || !strings.Contains(err.Error(), "failpoint: rollback string set") {
 		t.Fatalf("expected rollback failpoint error, got: %v", err)
 	}
-	db.testHooks.beforeCommit = nil
+	db.testHooks = nil
 
 	if got := db.getSnapshot(); got != old {
 		t.Fatalf("rollback replaced published string snapshot: got=%p want=%p", got, old)
@@ -920,20 +930,22 @@ func TestSnapshotExtra_StringKeyBatchRollbackRemovesAllLiveCreatedIdxs(t *testin
 
 	entered := make(chan struct{})
 	release := make(chan struct{})
-	db.testHooks.beforeCommit = func(op string) error {
-		if op != "batch_set" {
-			return nil
-		}
-		select {
-		case <-entered:
-		default:
-			close(entered)
-		}
-		<-release
-		return fmt.Errorf("failpoint: rollback string batch_set")
+	db.testHooks = &testHooks{
+		beforeCommit: func(op string) error {
+			if op != "batch_set" {
+				return nil
+			}
+			select {
+			case <-entered:
+			default:
+				close(entered)
+			}
+			<-release
+			return fmt.Errorf("failpoint: rollback string batch_set")
+		},
 	}
 	t.Cleanup(func() {
-		db.testHooks.beforeCommit = nil
+		db.testHooks = nil
 		select {
 		case <-release:
 		default:
@@ -999,7 +1011,7 @@ func TestSnapshotExtra_StringKeyBatchRollbackRemovesAllLiveCreatedIdxs(t *testin
 	if err == nil || !strings.Contains(err.Error(), "failpoint: rollback string batch_set") {
 		t.Fatalf("expected rollback failpoint error, got: %v", err)
 	}
-	db.testHooks.beforeCommit = nil
+	db.testHooks = nil
 
 	if got := db.getSnapshot(); got != old {
 		t.Fatalf("rollback replaced published string snapshot: got=%p want=%p", got, old)
@@ -1250,20 +1262,22 @@ func TestSnapshotExtra_BeginQueryTxSnapshotIgnoresRealStagedDeleteBeforeCommit(t
 
 	entered := make(chan struct{})
 	release := make(chan struct{})
-	db.testHooks.beforeCommit = func(op string) error {
-		if op != "delete" {
+	db.testHooks = &testHooks{
+		beforeCommit: func(op string) error {
+			if op != "delete" {
+				return nil
+			}
+			select {
+			case <-entered:
+			default:
+				close(entered)
+			}
+			<-release
 			return nil
-		}
-		select {
-		case <-entered:
-		default:
-			close(entered)
-		}
-		<-release
-		return nil
+		},
 	}
 	t.Cleanup(func() {
-		db.testHooks.beforeCommit = nil
+		db.testHooks = nil
 		select {
 		case <-release:
 		default:
@@ -1360,20 +1374,22 @@ func TestSnapshotExtra_BeginQueryTxSnapshotSurvivesRealStagedDeleteRollback(t *t
 
 	entered := make(chan struct{})
 	release := make(chan struct{})
-	db.testHooks.beforeCommit = func(op string) error {
-		if op != "delete" {
-			return nil
-		}
-		select {
-		case <-entered:
-		default:
-			close(entered)
-		}
-		<-release
-		return fmt.Errorf("failpoint: rollback delete")
+	db.testHooks = &testHooks{
+		beforeCommit: func(op string) error {
+			if op != "delete" {
+				return nil
+			}
+			select {
+			case <-entered:
+			default:
+				close(entered)
+			}
+			<-release
+			return fmt.Errorf("failpoint: rollback delete")
+		},
 	}
 	t.Cleanup(func() {
-		db.testHooks.beforeCommit = nil
+		db.testHooks = nil
 		select {
 		case <-release:
 		default:
@@ -1465,20 +1481,22 @@ func TestSnapshotExtra_BeginQueryTxSnapshotIgnoresRealStagedBatchDeleteBeforeCom
 
 	entered := make(chan struct{})
 	release := make(chan struct{})
-	db.testHooks.beforeCommit = func(op string) error {
-		if op != "batch_delete" {
+	db.testHooks = &testHooks{
+		beforeCommit: func(op string) error {
+			if op != "batch_delete" {
+				return nil
+			}
+			select {
+			case <-entered:
+			default:
+				close(entered)
+			}
+			<-release
 			return nil
-		}
-		select {
-		case <-entered:
-		default:
-			close(entered)
-		}
-		<-release
-		return nil
+		},
 	}
 	t.Cleanup(func() {
-		db.testHooks.beforeCommit = nil
+		db.testHooks = nil
 		select {
 		case <-release:
 		default:
@@ -1572,20 +1590,22 @@ func TestSnapshotExtra_BeginQueryTxSnapshotSurvivesRealStagedBatchDeleteRollback
 
 	entered := make(chan struct{})
 	release := make(chan struct{})
-	db.testHooks.beforeCommit = func(op string) error {
-		if op != "batch_delete" {
-			return nil
-		}
-		select {
-		case <-entered:
-		default:
-			close(entered)
-		}
-		<-release
-		return fmt.Errorf("failpoint: rollback batch_delete")
+	db.testHooks = &testHooks{
+		beforeCommit: func(op string) error {
+			if op != "batch_delete" {
+				return nil
+			}
+			select {
+			case <-entered:
+			default:
+				close(entered)
+			}
+			<-release
+			return fmt.Errorf("failpoint: rollback batch_delete")
+		},
 	}
 	t.Cleanup(func() {
-		db.testHooks.beforeCommit = nil
+		db.testHooks = nil
 		select {
 		case <-release:
 		default:
@@ -1800,20 +1820,22 @@ func TestSnapshotExtra_BeginQueryTxSnapshotIgnoresRealStagedTruncateBeforeCommit
 
 	entered := make(chan struct{})
 	release := make(chan struct{})
-	db.testHooks.beforeCommit = func(op string) error {
-		if op != "truncate" {
+	db.testHooks = &testHooks{
+		beforeCommit: func(op string) error {
+			if op != "truncate" {
+				return nil
+			}
+			select {
+			case <-entered:
+			default:
+				close(entered)
+			}
+			<-release
 			return nil
-		}
-		select {
-		case <-entered:
-		default:
-			close(entered)
-		}
-		<-release
-		return nil
+		},
 	}
 	t.Cleanup(func() {
-		db.testHooks.beforeCommit = nil
+		db.testHooks = nil
 		select {
 		case <-release:
 		default:
@@ -1895,20 +1917,22 @@ func TestSnapshotExtra_BeginQueryTxSnapshotSurvivesRealStagedTruncateRollback(t 
 
 	entered := make(chan struct{})
 	release := make(chan struct{})
-	db.testHooks.beforeCommit = func(op string) error {
-		if op != "truncate" {
-			return nil
-		}
-		select {
-		case <-entered:
-		default:
-			close(entered)
-		}
-		<-release
-		return fmt.Errorf("failpoint: rollback truncate")
+	db.testHooks = &testHooks{
+		beforeCommit: func(op string) error {
+			if op != "truncate" {
+				return nil
+			}
+			select {
+			case <-entered:
+			default:
+				close(entered)
+			}
+			<-release
+			return fmt.Errorf("failpoint: rollback truncate")
+		},
 	}
 	t.Cleanup(func() {
-		db.testHooks.beforeCommit = nil
+		db.testHooks = nil
 		select {
 		case <-release:
 		default:

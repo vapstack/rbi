@@ -226,18 +226,18 @@ type autoBatchExtraStrMapState struct {
 }
 
 func captureAutoBatchExtraStrMapState[V any](db *DB[string, V]) autoBatchExtraStrMapState {
-	db.strmap.Lock()
-	defer db.strmap.Unlock()
+	db.strMap.Lock()
+	defer db.strMap.Unlock()
 
 	return autoBatchExtraStrMapState{
-		next:         db.strmap.Next,
-		keyCount:     len(db.strmap.Keys),
-		dirty:        db.strmap.dirty,
-		snap:         db.strmap.snap,
-		published:    db.strmap.published,
-		pubSource:    db.strmap.pubSource,
-		committed:    db.strmap.committed,
-		committedPub: db.strmap.committedPub,
+		next:         db.strMap.Next,
+		keyCount:     len(db.strMap.Keys),
+		dirty:        db.strMap.dirty,
+		snap:         db.strMap.snap,
+		published:    db.strMap.published,
+		pubSource:    db.strMap.pubSource,
+		committed:    db.strMap.committed,
+		committedPub: db.strMap.committedPub,
 	}
 }
 
@@ -246,25 +246,25 @@ func waitAutoBatchExtraStrMapHasKeys[V any](tb testing.TB, db *DB[string, V], ke
 
 	deadline := time.Now().Add(2 * time.Second)
 	for {
-		db.strmap.Lock()
+		db.strMap.Lock()
 		ok := true
 		for _, key := range keys {
-			if _, exists := db.strmap.Keys[key]; !exists {
+			if _, exists := db.strMap.Keys[key]; !exists {
 				ok = false
 				break
 			}
 		}
 		state := autoBatchExtraStrMapState{
-			next:         db.strmap.Next,
-			keyCount:     len(db.strmap.Keys),
-			dirty:        db.strmap.dirty,
-			snap:         db.strmap.snap,
-			published:    db.strmap.published,
-			pubSource:    db.strmap.pubSource,
-			committed:    db.strmap.committed,
-			committedPub: db.strmap.committedPub,
+			next:         db.strMap.Next,
+			keyCount:     len(db.strMap.Keys),
+			dirty:        db.strMap.dirty,
+			snap:         db.strMap.snap,
+			published:    db.strMap.published,
+			pubSource:    db.strMap.pubSource,
+			committed:    db.strMap.committed,
+			committedPub: db.strMap.committedPub,
 		}
-		db.strmap.Unlock()
+		db.strMap.Unlock()
 
 		if ok {
 			return state
@@ -1977,20 +1977,22 @@ func TestAutoBatchExtra_CloseUnblocksWaitingWriterEvenWithInFlightCommitAndQueue
 
 	entered := make(chan struct{})
 	release := make(chan struct{})
-	db.testHooks.beforeCommit = func(op string) error {
-		if op != "set" {
+	db.testHooks = &testHooks{
+		beforeCommit: func(op string) error {
+			if op != "set" {
+				return nil
+			}
+			select {
+			case <-entered:
+			default:
+				close(entered)
+			}
+			<-release
 			return nil
-		}
-		select {
-		case <-entered:
-		default:
-			close(entered)
-		}
-		<-release
-		return nil
+		},
 	}
 	t.Cleanup(func() {
-		db.testHooks.beforeCommit = nil
+		db.testHooks = nil
 		select {
 		case <-release:
 		default:

@@ -9,7 +9,7 @@ import (
 	"github.com/vapstack/rbi/internal/qir"
 )
 
-func (qv *queryView[K, V]) tryExecutionPlan(q *qir.Shape, trace *queryTrace) ([]K, bool, error) {
+func (qv *queryView) tryExecutionPlan(q *qir.Shape, trace *queryTrace) ([]uint64, bool, error) {
 	// Execution-plan fast paths support only single-column basic order.
 	// Non-basic order types must stay on planner/postingResult routes.
 	if q.HasOrder {
@@ -61,7 +61,7 @@ func (qv *queryView[K, V]) tryExecutionPlan(q *qir.Shape, trace *queryTrace) ([]
 	return nil, false, nil
 }
 
-func (qv *queryView[K, V]) tryOrderBasicNoFilterWithLimit(q *qir.Shape, trace *queryTrace) ([]K, bool, error) {
+func (qv *queryView) tryOrderBasicNoFilterWithLimit(q *qir.Shape, trace *queryTrace) ([]uint64, bool, error) {
 	if !q.HasOrder || q.Limit == 0 || !qir.IsTrueConst(q.Expr) {
 		return nil, false, nil
 	}
@@ -96,7 +96,7 @@ func (qv *queryView[K, V]) tryOrderBasicNoFilterWithLimit(q *qir.Shape, trace *q
 	return out, true, nil
 }
 
-func (qv *queryView[K, V]) tryNoFilterNoOrderWithLimit(q *qir.Shape, trace *queryTrace) ([]K, bool, error) {
+func (qv *queryView) tryNoFilterNoOrderWithLimit(q *qir.Shape, trace *queryTrace) ([]uint64, bool, error) {
 	if q.Limit == 0 || q.Offset != 0 || q.HasOrder || !qir.IsTrueConst(q.Expr) {
 		return nil, false, nil
 	}
@@ -115,7 +115,7 @@ func (qv *queryView[K, V]) tryNoFilterNoOrderWithLimit(q *qir.Shape, trace *quer
 	if outCap > card {
 		outCap = card
 	}
-	out := make([]K, 0, clampUint64ToInt(outCap))
+	out := make([]uint64, 0, clampUint64ToInt(outCap))
 	cursor := qv.newQueryCursor(out, 0, q.Limit, false, 0)
 	var examined uint64
 	var examinedPtr *uint64
@@ -134,7 +134,7 @@ func (qv *queryView[K, V]) tryNoFilterNoOrderWithLimit(q *qir.Shape, trace *quer
 	return cursor.out, true, nil
 }
 
-func emitAcceptedPostingNoOrder[K ~uint64 | ~string, V any](cursor *queryCursor[K, V], ids posting.List, examined *uint64) bool {
+func emitAcceptedPostingNoOrder(cursor *queryCursor, ids posting.List, examined *uint64) bool {
 	if ids.IsEmpty() {
 		return false
 	}
@@ -193,8 +193,8 @@ func predicatesMatchActiveReader(preds predicateReader, active []int, idx uint64
 	return true
 }
 
-func orderPredicatesEmitCandidateReader[K ~uint64 | ~string, V any](
-	cursor *queryCursor[K, V],
+func orderPredicatesEmitCandidateReader(
+	cursor *queryCursor,
 	preds predicateReader,
 	checks []int,
 	trace *queryTrace,
@@ -211,8 +211,8 @@ func orderPredicatesEmitCandidateReader[K ~uint64 | ~string, V any](
 	return cursor.emit(idx)
 }
 
-func orderPredicatesEmitCandidateBufReader[K ~uint64 | ~string, V any](
-	cursor *queryCursor[K, V],
+func orderPredicatesEmitCandidateBufReader(
+	cursor *queryCursor,
 	preds predicateReader,
 	checks *pooled.SliceBuf[int],
 	trace *queryTrace,
@@ -229,8 +229,8 @@ func orderPredicatesEmitCandidateBufReader[K ~uint64 | ~string, V any](
 	return cursor.emit(idx)
 }
 
-func orderPredicatesEmitAcceptedPosting[K ~uint64 | ~string, V any](
-	cursor *queryCursor[K, V],
+func orderPredicatesEmitAcceptedPosting(
+	cursor *queryCursor,
 	ids posting.List,
 	card uint64,
 	trace *queryTrace,
@@ -258,8 +258,8 @@ func orderPredicatesEmitAcceptedPosting[K ~uint64 | ~string, V any](
 	return false
 }
 
-func orderPredicatesTryBucketPostingReader[K ~uint64 | ~string, V any](
-	cursor *queryCursor[K, V],
+func orderPredicatesTryBucketPostingReader(
+	cursor *queryCursor,
 	preds predicateReader,
 	exactActive []int,
 	exactOnly bool,
@@ -305,8 +305,8 @@ func orderPredicatesTryBucketPostingReader[K ~uint64 | ~string, V any](
 	}
 }
 
-func orderPredicatesTryBucketPostingBufReader[K ~uint64 | ~string, V any](
-	cursor *queryCursor[K, V],
+func orderPredicatesTryBucketPostingBufReader(
+	cursor *queryCursor,
 	preds predicateReader,
 	exactActive *pooled.SliceBuf[int],
 	exactOnly bool,
@@ -352,8 +352,8 @@ func orderPredicatesTryBucketPostingBufReader[K ~uint64 | ~string, V any](
 	}
 }
 
-func orderPredicatesEmitPostingReader[K ~uint64 | ~string, V any](
-	cursor *queryCursor[K, V],
+func orderPredicatesEmitPostingReader(
+	cursor *queryCursor,
 	preds predicateReader,
 	active []int,
 	exactActive []int,
@@ -421,8 +421,8 @@ func orderPredicatesEmitPostingReader[K ~uint64 | ~string, V any](
 	return false, exactWork
 }
 
-func orderPredicatesEmitPostingBufReader[K ~uint64 | ~string, V any](
-	cursor *queryCursor[K, V],
+func orderPredicatesEmitPostingBufReader(
+	cursor *queryCursor,
 	preds predicateReader,
 	active *pooled.SliceBuf[int],
 	exactActive *pooled.SliceBuf[int],
@@ -497,8 +497,8 @@ func releaseOrderBasicResidualState(preds predicateSet, activeBuf *pooled.SliceB
 	preds.Release()
 }
 
-func emitOrderLimitPosting[K ~uint64 | ~string, V any](
-	cursor *queryCursor[K, V],
+func emitOrderLimitPosting(
+	cursor *queryCursor,
 	ids posting.List,
 	examined *uint64,
 	trace *queryTrace,
@@ -538,8 +538,8 @@ func emitOrderLimitPosting[K ~uint64 | ~string, V any](
 	return false
 }
 
-func emitOrderPrefixPostingByBase[K ~uint64 | ~string, V any](
-	cursor *queryCursor[K, V],
+func emitOrderPrefixPostingByBase(
+	cursor *queryCursor,
 	ids posting.List,
 	base postingResult,
 	baseBM posting.List,
@@ -651,8 +651,8 @@ func orderBasicContainsBufReader(preds predicateReader, active *pooled.SliceBuf[
 	return orderBasicResidualMatchesBufReader(preds, active, idx)
 }
 
-func orderBasicEmitFilteredPostingReader[K ~uint64 | ~string, V any](
-	cursor *queryCursor[K, V],
+func orderBasicEmitFilteredPostingReader(
+	cursor *queryCursor,
 	preds predicateReader,
 	active []int,
 	baseBM posting.List,
@@ -717,8 +717,8 @@ func orderBasicEmitFilteredPostingReader[K ~uint64 | ~string, V any](
 	return false, nextTmp
 }
 
-func orderBasicEmitFilteredPostingBufReader[K ~uint64 | ~string, V any](
-	cursor *queryCursor[K, V],
+func orderBasicEmitFilteredPostingBufReader(
+	cursor *queryCursor,
 	preds predicateReader,
 	active *pooled.SliceBuf[int],
 	baseBM posting.List,
@@ -783,7 +783,7 @@ func orderBasicEmitFilteredPostingBufReader[K ~uint64 | ~string, V any](
 	return false, nextTmp
 }
 
-func (qv *queryView[K, V]) runOrderBasicBaseQuery(
+func (qv *queryView) runOrderBasicBaseQuery(
 	q *qir.Shape,
 	orderField string,
 	baseOps []qir.Expr,
@@ -796,7 +796,7 @@ func (qv *queryView[K, V]) runOrderBasicBaseQuery(
 	residualPreds predicateReader,
 	residualActive []int,
 	trace *queryTrace,
-) ([]K, bool, error) {
+) ([]uint64, bool, error) {
 	defer base.release()
 
 	baseBM := base.ids
@@ -807,7 +807,7 @@ func (qv *queryView[K, V]) runOrderBasicBaseQuery(
 
 	skip := q.Offset
 	need := q.Limit
-	out := make([]K, 0, need)
+	out := make([]uint64, 0, need)
 	cursor := qv.newQueryCursor(out, skip, need, false, 0)
 
 	var tmp posting.List
@@ -884,7 +884,7 @@ func (qv *queryView[K, V]) runOrderBasicBaseQuery(
 	return cursor.out, true, nil
 }
 
-func (qv *queryView[K, V]) runOrderBasicBaseQueryBuf(
+func (qv *queryView) runOrderBasicBaseQueryBuf(
 	q *qir.Shape,
 	orderField string,
 	baseOps []qir.Expr,
@@ -897,7 +897,7 @@ func (qv *queryView[K, V]) runOrderBasicBaseQueryBuf(
 	residualPreds predicateReader,
 	residualActive *pooled.SliceBuf[int],
 	trace *queryTrace,
-) ([]K, bool, error) {
+) ([]uint64, bool, error) {
 	defer base.release()
 
 	baseBM := base.ids
@@ -908,7 +908,7 @@ func (qv *queryView[K, V]) runOrderBasicBaseQueryBuf(
 
 	skip := q.Offset
 	need := q.Limit
-	out := make([]K, 0, need)
+	out := make([]uint64, 0, need)
 	cursor := qv.newQueryCursor(out, skip, need, false, 0)
 
 	var tmp posting.List
@@ -1177,7 +1177,7 @@ func orderNilTailField(fm *field, field string, bounds rangeBounds) string {
 	return field
 }
 
-func (qv *queryView[K, V]) validateOrderBasicBaseOps(baseOps []qir.Expr) error {
+func (qv *queryView) validateOrderBasicBaseOps(baseOps []qir.Expr) error {
 	for _, op := range baseOps {
 		if err := qv.validateOrderBasicExpr(op); err != nil {
 			return err
@@ -1188,7 +1188,7 @@ func (qv *queryView[K, V]) validateOrderBasicBaseOps(baseOps []qir.Expr) error {
 
 // Validate operator/value compatibility without evaluating postings on paths
 // that are already proven empty by contradictory order-field predicates.
-func (qv *queryView[K, V]) validateOrderBasicExpr(e qir.Expr) error {
+func (qv *queryView) validateOrderBasicExpr(e qir.Expr) error {
 	switch e.Op {
 	case qir.OpNOOP:
 		if e.FieldOrdinal != qir.NoFieldOrdinal || e.Value != nil || len(e.Operands) != 0 {
@@ -1220,7 +1220,7 @@ func (qv *queryView[K, V]) validateOrderBasicExpr(e qir.Expr) error {
 	}
 }
 
-func (qv *queryView[K, V]) validateOrderBasicSimpleExpr(e qir.Expr) error {
+func (qv *queryView) validateOrderBasicSimpleExpr(e qir.Expr) error {
 	if e.FieldOrdinal < 0 {
 		return fmt.Errorf("%w: invalid expression, op: %v", ErrInvalidQuery, e.Op)
 	}
@@ -1398,7 +1398,7 @@ func isOrderBasicCollapsibleNumericRangeExpr(op qir.Expr, fm *field) bool {
 	return isScalarRangeEqOp(op.Op)
 }
 
-func (qv *queryView[K, V]) shouldCollapseOrderBasicNumericRange(field string, fieldOrdinal int, rb rangeBounds) bool {
+func (qv *queryView) shouldCollapseOrderBasicNumericRange(field string, fieldOrdinal int, rb rangeBounds) bool {
 	if field == "" || rb.empty {
 		return false
 	}
@@ -1437,7 +1437,7 @@ func (qv *queryView[K, V]) shouldCollapseOrderBasicNumericRange(field string, fi
 	return positiveWork <= complementWork
 }
 
-func (qv *queryView[K, V]) prepareOrderBasicBaseCores(baseOps []qir.Expr) (*pooled.SliceBuf[orderBasicBaseCore], *pooled.SliceBuf[int], bool, error) {
+func (qv *queryView) prepareOrderBasicBaseCores(baseOps []qir.Expr) (*pooled.SliceBuf[orderBasicBaseCore], *pooled.SliceBuf[int], bool, error) {
 	if len(baseOps) == 0 {
 		return nil, nil, false, nil
 	}
@@ -1523,7 +1523,7 @@ func (qv *queryView[K, V]) prepareOrderBasicBaseCores(baseOps []qir.Expr) (*pool
 	return coresBuf, rawCoreIdxBuf, false, nil
 }
 
-func (qv *queryView[K, V]) prepareOrderBasicBaseCoresBuf(baseOps *pooled.SliceBuf[qir.Expr]) (*pooled.SliceBuf[orderBasicBaseCore], *pooled.SliceBuf[int], bool, error) {
+func (qv *queryView) prepareOrderBasicBaseCoresBuf(baseOps *pooled.SliceBuf[qir.Expr]) (*pooled.SliceBuf[orderBasicBaseCore], *pooled.SliceBuf[int], bool, error) {
 	if baseOps == nil || baseOps.Len() == 0 {
 		return nil, nil, false, nil
 	}
@@ -1610,7 +1610,7 @@ func (qv *queryView[K, V]) prepareOrderBasicBaseCoresBuf(baseOps *pooled.SliceBu
 	return coresBuf, rawCoreIdxBuf, false, nil
 }
 
-func (qv *queryView[K, V]) loadWarmOrderBasicBaseCore(core orderBasicBaseCore) (postingResult, bool) {
+func (qv *queryView) loadWarmOrderBasicBaseCore(core orderBasicBaseCore) (postingResult, bool) {
 	switch core.kind {
 	case orderBasicBaseCoreCollapsedRange:
 		return qv.loadWarmPreparedScalarExactRange(core.collapsed)
@@ -1621,7 +1621,7 @@ func (qv *queryView[K, V]) loadWarmOrderBasicBaseCore(core orderBasicBaseCore) (
 	}
 }
 
-func (qv *queryView[K, V]) evalOrderBasicBaseCore(core orderBasicBaseCore) (postingResult, error) {
+func (qv *queryView) evalOrderBasicBaseCore(core orderBasicBaseCore) (postingResult, error) {
 	switch core.kind {
 	case orderBasicBaseCoreCollapsedRange:
 		return qv.evalPreparedScalarExactRange(core.collapsed)
@@ -1632,7 +1632,7 @@ func (qv *queryView[K, V]) evalOrderBasicBaseCore(core orderBasicBaseCore) (post
 	}
 }
 
-func (qv *queryView[K, V]) shouldPromoteObservedOrderBasicBaseCore(
+func (qv *queryView) shouldPromoteObservedOrderBasicBaseCore(
 	orderField string,
 	core orderBasicBaseCore,
 	universe uint64,
@@ -1658,7 +1658,7 @@ func (qv *queryView[K, V]) shouldPromoteObservedOrderBasicBaseCore(
 	}
 }
 
-func (qv *queryView[K, V]) promoteObservedOrderBasicBaseCore(core orderBasicBaseCore) {
+func (qv *queryView) promoteObservedOrderBasicBaseCore(core orderBasicBaseCore) {
 	switch core.kind {
 	case orderBasicBaseCoreCollapsedRange:
 		cacheKey := core.collapsed.cacheKey
@@ -1693,7 +1693,7 @@ func (qv *queryView[K, V]) promoteObservedOrderBasicBaseCore(core orderBasicBase
 	}
 }
 
-func (qv *queryView[K, V]) hasWarmOrderBasicBaseCores(cores *pooled.SliceBuf[orderBasicBaseCore]) bool {
+func (qv *queryView) hasWarmOrderBasicBaseCores(cores *pooled.SliceBuf[orderBasicBaseCore]) bool {
 	if cores == nil {
 		return false
 	}
@@ -1706,7 +1706,7 @@ func (qv *queryView[K, V]) hasWarmOrderBasicBaseCores(cores *pooled.SliceBuf[ord
 	return false
 }
 
-func (qv *queryView[K, V]) orderBasicRawBaseOpStats(
+func (qv *queryView) orderBasicRawBaseOpStats(
 	op qir.Expr,
 	universe uint64,
 ) (scalarMaterializationStats, bool) {
@@ -1721,7 +1721,7 @@ func (qv *queryView[K, V]) orderBasicRawBaseOpStats(
 	return candidate.core.orderBasicMaterializationStats(universe)
 }
 
-func (qv *queryView[K, V]) shouldPromoteObservedOrderBasicRawBaseOp(
+func (qv *queryView) shouldPromoteObservedOrderBasicRawBaseOp(
 	orderField string,
 	op qir.Expr,
 	universe uint64,
@@ -1753,7 +1753,7 @@ func (qv *queryView[K, V]) shouldPromoteObservedOrderBasicRawBaseOp(
 	return probeWork >= buildWork
 }
 
-func (qv *queryView[K, V]) materializeOrderBasicLimitComplementBaseOp(op qir.Expr, cacheKey materializedPredKey) bool {
+func (qv *queryView) materializeOrderBasicLimitComplementBaseOp(op qir.Expr, cacheKey materializedPredKey) bool {
 	if cacheKey.isZero() || op.FieldOrdinal < 0 {
 		return false
 	}
@@ -1779,7 +1779,7 @@ func (qv *queryView[K, V]) materializeOrderBasicLimitComplementBaseOp(op qir.Exp
 	return true
 }
 
-func (qv *queryView[K, V]) materializeOrderMaterializedBaseOpsBuf(orderField string, baseOps *pooled.SliceBuf[qir.Expr]) {
+func (qv *queryView) materializeOrderMaterializedBaseOpsBuf(orderField string, baseOps *pooled.SliceBuf[qir.Expr]) {
 	if qv.snap == nil || qv.snap.materializedPredCacheLimit() <= 0 || baseOps == nil || baseOps.Len() == 0 {
 		return
 	}
@@ -1833,7 +1833,7 @@ func (qv *queryView[K, V]) materializeOrderMaterializedBaseOpsBuf(orderField str
 	}
 }
 
-func (qv *queryView[K, V]) promoteOrderBasicLimitMaterializedBaseOps(orderField string, baseOps []qir.Expr, observedRows uint64, needWindow uint64) {
+func (qv *queryView) promoteOrderBasicLimitMaterializedBaseOps(orderField string, baseOps []qir.Expr, observedRows uint64, needWindow uint64) {
 	if qv.snap == nil || len(baseOps) == 0 || observedRows == 0 {
 		return
 	}
@@ -1896,7 +1896,7 @@ func (qv *queryView[K, V]) promoteOrderBasicLimitMaterializedBaseOps(orderField 
 	}
 }
 
-func (qv *queryView[K, V]) promoteObservedLimitLeafPreds(orderField string, preds *pooled.SliceBuf[leafPred], observedRows uint64, needWindow uint64) {
+func (qv *queryView) promoteObservedLimitLeafPreds(orderField string, preds *pooled.SliceBuf[leafPred], observedRows uint64, needWindow uint64) {
 	if qv.snap == nil || preds == nil || preds.Len() == 0 || observedRows == 0 {
 		return
 	}
@@ -1972,7 +1972,7 @@ func (qv *queryView[K, V]) promoteObservedLimitLeafPreds(orderField string, pred
 	}
 }
 
-func (qv *queryView[K, V]) evalOrderBasicRawBaseOp(op qir.Expr) (postingResult, error) {
+func (qv *queryView) evalOrderBasicRawBaseOp(op qir.Expr) (postingResult, error) {
 	stats, ok := qv.orderBasicRawBaseOpStats(op, qv.snapshotUniverseCardinality())
 	cacheKey := materializedPredKey{}
 	if ok {
@@ -1989,7 +1989,7 @@ func (qv *queryView[K, V]) evalOrderBasicRawBaseOp(op qir.Expr) (postingResult, 
 	return qv.evalExpr(op)
 }
 
-func (qv *queryView[K, V]) loadWarmOrderBasicRawBaseOp(op qir.Expr) (postingResult, bool) {
+func (qv *queryView) loadWarmOrderBasicRawBaseOp(op qir.Expr) (postingResult, bool) {
 	candidate, ok := qv.prepareScalarRangeRoutingCandidate(op)
 	if !ok {
 		return postingResult{}, false
@@ -1997,7 +1997,7 @@ func (qv *queryView[K, V]) loadWarmOrderBasicRawBaseOp(op qir.Expr) (postingResu
 	return candidate.core.loadWarmScalarPostingResult()
 }
 
-func (qv *queryView[K, V]) shouldPreferOrderBasicBaseCorePathForNonOrderPrefix(q *qir.Shape, orderField string, baseOps []qir.Expr) bool {
+func (qv *queryView) shouldPreferOrderBasicBaseCorePathForNonOrderPrefix(q *qir.Shape, orderField string, baseOps []qir.Expr) bool {
 	if len(baseOps) == 0 {
 		return false
 	}
@@ -2027,7 +2027,7 @@ func (qv *queryView[K, V]) shouldPreferOrderBasicBaseCorePathForNonOrderPrefix(q
 	return false
 }
 
-func (qv *queryView[K, V]) tryQueryOrderBasicWithLimit(q *qir.Shape, trace *queryTrace) ([]K, bool, error) {
+func (qv *queryView) tryQueryOrderBasicWithLimit(q *qir.Shape, trace *queryTrace) ([]uint64, bool, error) {
 
 	if !q.HasOrder || q.Limit == 0 {
 		return nil, false, nil
@@ -2307,7 +2307,7 @@ func (qv *queryView[K, V]) tryQueryOrderBasicWithLimit(q *qir.Shape, trace *quer
 		return nil, true, nil
 	}
 	var (
-		out  []K
+		out  []uint64
 		used bool
 	)
 	if residualActiveBuf != nil {
@@ -2319,8 +2319,8 @@ func (qv *queryView[K, V]) tryQueryOrderBasicWithLimit(q *qir.Shape, trace *quer
 	return out, used, err
 }
 
-func (qv *queryView[K, V]) scanOrderLimitNoPredicates(q *qir.Shape, ov fieldOverlay, br overlayRange, desc bool, nilTailField string, trace *queryTrace) ([]K, bool) {
-	out := make([]K, 0, q.Limit)
+func (qv *queryView) scanOrderLimitNoPredicates(q *qir.Shape, ov fieldOverlay, br overlayRange, desc bool, nilTailField string, trace *queryTrace) ([]uint64, bool) {
+	out := make([]uint64, 0, q.Limit)
 	cursor := qv.newQueryCursor(out, q.Offset, q.Limit, false, 0)
 
 	var (
@@ -2371,7 +2371,7 @@ func (qv *queryView[K, V]) scanOrderLimitNoPredicates(q *qir.Shape, ov fieldOver
 	return cursor.out, true
 }
 
-func (qv *queryView[K, V]) scanOrderLimitWithPredicatesReader(q *qir.Shape, ov fieldOverlay, br overlayRange, desc bool, preds predicateReader, nilTailField string, trace *queryTrace) ([]K, bool) {
+func (qv *queryView) scanOrderLimitWithPredicatesReader(q *qir.Shape, ov fieldOverlay, br overlayRange, desc bool, preds predicateReader, nilTailField string, trace *queryTrace) ([]uint64, bool) {
 	if preds.Len() > limitQueryFastPathMaxLeaves {
 		activeBuf := predicateCheckSlicePool.Get()
 		activeBuf.Grow(preds.Len())
@@ -2409,7 +2409,7 @@ func (qv *queryView[K, V]) scanOrderLimitWithPredicatesReader(q *qir.Shape, ov f
 
 		exactOnly := activeBuf.Len() > 0 && activeBuf.Len() == exactActiveBuf.Len()
 
-		out := make([]K, 0, q.Limit)
+		out := make([]uint64, 0, q.Limit)
 		cursor := qv.newQueryCursor(out, q.Offset, q.Limit, false, 0)
 
 		var (
@@ -2519,7 +2519,7 @@ func (qv *queryView[K, V]) scanOrderLimitWithPredicatesReader(q *qir.Shape, ov f
 	residualActive := plannerResidualChecks(residualActiveInline[:0], active, exactActive)
 	exactOnly := len(active) > 0 && len(active) == len(exactActive)
 
-	out := make([]K, 0, q.Limit)
+	out := make([]uint64, 0, q.Limit)
 	cursor := qv.newQueryCursor(out, q.Offset, q.Limit, false, 0)
 
 	var (
@@ -2600,7 +2600,7 @@ func (qv *queryView[K, V]) scanOrderLimitWithPredicatesReader(q *qir.Shape, ov f
 	return cursor.out, true
 }
 
-func (qv *queryView[K, V]) tryQueryOrderPrefixWithLimit(q *qir.Shape, trace *queryTrace) ([]K, bool, error) {
+func (qv *queryView) tryQueryOrderPrefixWithLimit(q *qir.Shape, trace *queryTrace) ([]uint64, bool, error) {
 
 	if !q.HasOrder || q.Limit == 0 {
 		return nil, false, nil
@@ -2718,7 +2718,7 @@ func (qv *queryView[K, V]) tryQueryOrderPrefixWithLimit(q *qir.Shape, trace *que
 
 	skip := q.Offset
 	need := q.Limit
-	out := make([]K, 0, need)
+	out := make([]uint64, 0, need)
 	cursor := qv.newQueryCursor(out, skip, need, false, 0)
 
 	keyCur := ov.newCursor(br, ord.Desc)
@@ -2749,7 +2749,7 @@ func (qv *queryView[K, V]) tryQueryOrderPrefixWithLimit(q *qir.Shape, trace *que
 	return cursor.out, true, nil
 }
 
-func (qv *queryView[K, V]) tryQueryRangeNoOrderWithLimit(q *qir.Shape, trace *queryTrace) ([]K, bool, error) {
+func (qv *queryView) tryQueryRangeNoOrderWithLimit(q *qir.Shape, trace *queryTrace) ([]uint64, bool, error) {
 
 	if q.HasOrder || q.Limit == 0 {
 		return nil, false, nil
@@ -2795,7 +2795,7 @@ func (qv *queryView[K, V]) tryQueryRangeNoOrderWithLimit(q *qir.Shape, trace *qu
 			}
 			skip := q.Offset
 			need := q.Limit
-			out := make([]K, 0, need)
+			out := make([]uint64, 0, need)
 			cursor := qv.newQueryCursor(out, skip, need, false, 0)
 			var examined uint64
 			var examinedPtr *uint64
@@ -2841,7 +2841,7 @@ func (qv *queryView[K, V]) tryQueryRangeNoOrderWithLimit(q *qir.Shape, trace *qu
 	skip := q.Offset
 	need := q.Limit
 
-	out := make([]K, 0, need)
+	out := make([]uint64, 0, need)
 	cursor := qv.newQueryCursor(out, skip, need, false, 0)
 
 	keyCur := ov.newCursor(br, false)
@@ -2874,7 +2874,7 @@ func (qv *queryView[K, V]) tryQueryRangeNoOrderWithLimit(q *qir.Shape, trace *qu
 	return cursor.out, true, nil
 }
 
-func (qv *queryView[K, V]) tryQueryPrefixNoOrderWithLimit(q *qir.Shape, trace *queryTrace) ([]K, bool, error) {
+func (qv *queryView) tryQueryPrefixNoOrderWithLimit(q *qir.Shape, trace *queryTrace) ([]uint64, bool, error) {
 
 	if q.HasOrder || q.Limit == 0 {
 		return nil, false, nil
@@ -2913,7 +2913,7 @@ func (qv *queryView[K, V]) tryQueryPrefixNoOrderWithLimit(q *qir.Shape, trace *q
 
 	skip := q.Offset
 	need := q.Limit
-	out := make([]K, 0, need)
+	out := make([]uint64, 0, need)
 	cursor := qv.newQueryCursor(out, skip, need, false, 0)
 
 	keyCur := prefixState.ov.newCursor(prefixState.br, false)

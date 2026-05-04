@@ -1193,14 +1193,14 @@ func (reuse materializedPredReuse) canSecondHitShareModeratelyOversizedEstimate(
 	return est <= limit*mul
 }
 
-func (qv *queryView[K, V]) materializedPredKeyForExactScalarRange(field string, bounds rangeBounds) materializedPredKey {
+func (qv *queryView) materializedPredKeyForExactScalarRange(field string, bounds rangeBounds) materializedPredKey {
 	if qv.snap.matPredCacheMaxEntries <= 0 {
 		return materializedPredKey{}
 	}
 	return materializedPredKeyForExactScalarRange(field, bounds)
 }
 
-func (qv *queryView[K, V]) materializedPredComplementKeyForExactScalarRange(field string, bounds rangeBounds) materializedPredKey {
+func (qv *queryView) materializedPredComplementKeyForExactScalarRange(field string, bounds rangeBounds) materializedPredKey {
 	if qv.snap.matPredCacheMaxEntries <= 0 {
 		return materializedPredKey{}
 	}

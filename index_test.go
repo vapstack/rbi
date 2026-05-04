@@ -161,39 +161,36 @@ func TestReadStrMap_RoundTripDense(t *testing.T) {
 
 func TestQueryViewIdxMapping_UsesPinnedStrMapSnapshot(t *testing.T) {
 	db := &DB[string, UserBench]{
-		strkey:  true,
-		strmap:  newStrMapper(0, defaultSnapshotStrMapCompactDepth),
-		fields:  map[string]*field{},
-		options: &Options{},
+		strKey:      true,
+		strMap:      newStrMapper(0, defaultSnapshotStrMapCompactDepth),
+		indexFields: map[string]*field{},
+		options:     &Options{},
 	}
-	snap := &strMapSnapshot{
+	strMapSnap := &strMapSnapshot{
 		Next: 1,
 		Strs: map[uint64]string{1: "snap-key"},
 	}
-	viewSnap := &indexSnapshot{
-		strmap:            snap,
+	indexSnap := &indexSnapshot{
+		strmap:            strMapSnap,
 		lenZeroComplement: snapshotTestBoolSlots(nil, nil),
 	}
-	view := &queryView[string, UserBench]{
-		root:              db,
-		snap:              viewSnap,
-		strkey:            true,
-		strmapView:        snap,
-		fields:            db.fields,
-		planner:           &db.planner,
+	view := &queryView{
+		engine:            db.engine,
+		snap:              indexSnap,
+		strKey:            true,
+		strMapView:        strMapSnap,
+		fields:            db.indexFields,
+		planner:           db.engine.planner,
 		options:           db.options,
-		lenZeroComplement: viewSnap.lenZeroComplement,
+		lenZeroComplement: indexSnap.lenZeroComplement,
 	}
 
-	db.strmap.Lock()
-	db.strmap.createIdxNoLock("live-key")
-	db.strmap.Unlock()
+	db.strMap.Lock()
+	db.strMap.createIdxNoLock("live-key")
+	db.strMap.Unlock()
 
-	if got := view.idFromIdxNoLock(1); got != "snap-key" {
-		t.Fatalf("idFromIdxNoLock mismatch: got=%q want=%q", got, "snap-key")
-	}
-	if got, ok := view.keyFromIdx(1); !ok || got != "snap-key" {
-		t.Fatalf("keyFromIdx mismatch: got=%q ok=%v want=%q", got, ok, "snap-key")
+	if got, ok := view.strMapView.getStringNoLock(1); !ok || got != "snap-key" {
+		t.Fatalf("strmap snapshot mismatch: got=%q ok=%v want=%q", got, ok, "snap-key")
 	}
 }
 

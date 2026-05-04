@@ -1771,7 +1771,7 @@ func (db *DB[K, V]) forEachSnapshotModifiedIndexedField(op snapshotBatchEntry[K,
 			if !ok {
 				continue
 			}
-			acc, ok := db.indexedFieldByName[f.DBName]
+			acc, ok := db.indexedFieldMap[f.DBName]
 			if !ok {
 				continue
 			}
@@ -1829,10 +1829,10 @@ func (db *DB[K, V]) buildPreparedSnapshotAggregatedNoLock(
 		lenIndex:           cloneFieldIndexStorageSlots(prev.lenIndex, len(db.indexedFieldAccess)),
 		lenZeroComplement:  cloneFieldIndexBoolSlots(prev.lenZeroComplement, len(db.indexedFieldAccess)),
 		measure:            cloneMeasureFieldStorageSlots(prev.measure, len(db.measureFieldAccess)),
-		indexedFieldByName: db.indexedFieldByName,
+		indexedFieldByName: db.indexedFieldMap,
 		universe:           prev.universe,
 		universeOwner:      prev.universeOwner,
-		strmap:             db.strmap.snapshot(),
+		strmap:             db.strMap.snapshot(),
 	}
 	db.initSnapshotRuntimeCaches(next)
 
