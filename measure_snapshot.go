@@ -7,11 +7,11 @@ import (
 )
 
 type measureFieldBatchDeltas struct {
-	fields  *pooled.SliceBuf[*pooled.SliceBuf[measureBatchDelta]]
-	touched *pooled.SliceBuf[int]
+	fields  *pooled.Slice[*pooled.Slice[measureBatchDelta]]
+	touched *pooled.Slice[int]
 }
 
-var measureBatchDeltaSlotSlicePool = pooled.Slices[*pooled.SliceBuf[measureBatchDelta]]{Clear: true}
+var measureBatchDeltaSlotSlicePool = pooled.Slices[*pooled.Slice[measureBatchDelta]]{Clear: true}
 
 func newMeasureFieldBatchDeltas(fieldCount int) measureFieldBatchDeltas {
 	fields := measureBatchDeltaSlotSlicePool.Get()
@@ -47,11 +47,11 @@ func (deltas *measureFieldBatchDeltas) release() {
 }
 
 func (db *DB[K, V]) forEachModifiedMeasureField(v1 *V, v2 *V, fn func(measureFieldAccessor) bool) {
-	if len(db.measureFieldAccess) == 0 {
+	if len(db.engine.measureFieldAccess) == 0 {
 		return
 	}
 	if v1 == nil || v2 == nil {
-		for _, acc := range db.measureFieldAccess {
+		for _, acc := range db.engine.measureFieldAccess {
 			if !fn(acc) {
 				return
 			}
@@ -60,7 +60,7 @@ func (db *DB[K, V]) forEachModifiedMeasureField(v1 *V, v2 *V, fn func(measureFie
 	}
 	ptr1 := unsafe.Pointer(v1)
 	ptr2 := unsafe.Pointer(v2)
-	for _, acc := range db.measureFieldAccess {
+	for _, acc := range db.engine.measureFieldAccess {
 		if acc.modified != nil && acc.modified(ptr1, ptr2) && !fn(acc) {
 			return
 		}
@@ -68,7 +68,7 @@ func (db *DB[K, V]) forEachModifiedMeasureField(v1 *V, v2 *V, fn func(measureFie
 }
 
 func (db *DB[K, V]) forEachSnapshotModifiedMeasureField(op snapshotBatchEntry[K, V], fn func(measureFieldAccessor) bool) {
-	if len(db.measureFieldAccess) == 0 {
+	if len(db.engine.measureFieldAccess) == 0 {
 		return
 	}
 	req := op.req
@@ -83,7 +83,7 @@ func (db *DB[K, V]) forEachSnapshotModifiedMeasureField(op snapshotBatchEntry[K,
 			if !ok {
 				continue
 			}
-			acc, ok := db.measureFieldMap[f.DBName]
+			acc, ok := db.engine.measureFieldMap[f.DBName]
 			if !ok {
 				continue
 			}

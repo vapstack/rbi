@@ -21,7 +21,7 @@ func stringKeyReaderLen(keys stringKeyReader) int {
 	switch v := keys.(type) {
 	case nil:
 		return 0
-	case *pooled.SliceBuf[string]:
+	case *pooled.Slice[string]:
 		if v == nil {
 			return 0
 		}
@@ -29,7 +29,7 @@ func stringKeyReaderLen(keys stringKeyReader) int {
 	return keys.Len()
 }
 
-func releasePostingResults(buf *pooled.SliceBuf[postingResult]) {
+func releasePostingResults(buf *pooled.Slice[postingResult]) {
 	for i := 0; i < buf.Len(); i++ {
 		buf.Get(i).release()
 	}
@@ -1005,7 +1005,7 @@ func applyNormalizedScalarBound(rb *rangeBounds, b normalizedScalarBound) {
 	}
 }
 
-func dedupStringBufInPlace(buf *pooled.SliceBuf[string]) {
+func dedupStringBufInPlace(buf *pooled.Slice[string]) {
 	if buf == nil || buf.Len() < 2 {
 		return
 	}
@@ -1023,7 +1023,7 @@ func dedupStringBufInPlace(buf *pooled.SliceBuf[string]) {
 	buf.SetLen(write)
 }
 
-func sliceValueToIdxStringBuf(v reflect.Value, fm *field) (*pooled.SliceBuf[string], bool, error) {
+func sliceValueToIdxStringBuf(v reflect.Value, fm *field) (*pooled.Slice[string], bool, error) {
 	ixsBuf := stringSlicePool.Get()
 	ixsBuf.Grow(v.Len())
 	hasNil := false
@@ -1060,7 +1060,7 @@ func sliceValueToIdxStringBuf(v reflect.Value, fm *field) (*pooled.SliceBuf[stri
 	return ixsBuf, hasNil, nil
 }
 
-func (qv *queryView) scalarLookupPostings(field string, fieldOrdinal int, keys stringKeyReader, includeNil bool) (*pooled.SliceBuf[posting.List], uint64) {
+func (qv *queryView) scalarLookupPostings(field string, fieldOrdinal int, keys stringKeyReader, includeNil bool) (*pooled.Slice[posting.List], uint64) {
 	postsBuf := postingSlicePool.Get()
 	keyCount := stringKeyReaderLen(keys)
 	postsBuf.Grow(keyCount + btoi(includeNil))
@@ -1115,7 +1115,7 @@ func (qv *queryView) diffPostingResult(acc, sub postingResult) (postingResult, e
 
 // exprValueToDistinctIdxBuf returns caller-owned indexed values deduplicated
 // for set-like operators whose semantics do not depend on input order.
-func (qv *queryView) exprValueToDistinctIdxBuf(expr qir.Expr) (*pooled.SliceBuf[string], bool, bool, error) {
+func (qv *queryView) exprValueToDistinctIdxBuf(expr qir.Expr) (*pooled.Slice[string], bool, bool, error) {
 	fm := qv.fieldMetaByExpr(expr)
 
 	if expr.Value == nil {

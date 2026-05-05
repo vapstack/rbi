@@ -527,7 +527,7 @@ func (qv *queryView) rangeBoundsForScalarExpr(e qir.Expr) (rangeBounds, bool, er
 	return rangeBoundsForNormalizedScalarBound(bound), true, nil
 }
 
-func findOrderedMergedScalarRangeField(groups *pooled.SliceBuf[orderedMergedScalarRangeField], field string) int {
+func findOrderedMergedScalarRangeField(groups *pooled.Slice[orderedMergedScalarRangeField], field string) int {
 	if groups == nil {
 		return -1
 	}
@@ -539,7 +539,7 @@ func findOrderedMergedScalarRangeField(groups *pooled.SliceBuf[orderedMergedScal
 	return -1
 }
 
-func orderedMergedScalarRangeFieldCount(groups *pooled.SliceBuf[orderedMergedScalarRangeField], field string) int {
+func orderedMergedScalarRangeFieldCount(groups *pooled.Slice[orderedMergedScalarRangeField], field string) int {
 	idx := findOrderedMergedScalarRangeField(groups, field)
 	if idx < 0 {
 		return 0
@@ -550,7 +550,7 @@ func orderedMergedScalarRangeFieldCount(groups *pooled.SliceBuf[orderedMergedSca
 func (qv *queryView) collectOrderedMergedScalarRangeFields(
 	orderField string,
 	leaves []qir.Expr,
-	dst *pooled.SliceBuf[orderedMergedScalarRangeField],
+	dst *pooled.Slice[orderedMergedScalarRangeField],
 ) bool {
 	dst.Truncate()
 	for i, e := range leaves {
@@ -583,8 +583,8 @@ func (qv *queryView) collectOrderedMergedScalarRangeFields(
 
 func (qv *queryView) collectOrderedMergedScalarRangeFieldsBuf(
 	orderField string,
-	leaves *pooled.SliceBuf[qir.Expr],
-	dst *pooled.SliceBuf[orderedMergedScalarRangeField],
+	leaves *pooled.Slice[qir.Expr],
+	dst *pooled.Slice[orderedMergedScalarRangeField],
 ) bool {
 	dst.Truncate()
 	for i := 0; i < leaves.Len(); i++ {
@@ -618,7 +618,7 @@ func (qv *queryView) collectOrderedMergedScalarRangeFieldsBuf(
 
 func (qv *queryView) collectMergedNumericRangeFields(
 	leaves []qir.Expr,
-	dst *pooled.SliceBuf[orderedMergedScalarRangeField],
+	dst *pooled.Slice[orderedMergedScalarRangeField],
 ) bool {
 	dst.Truncate()
 	for i, e := range leaves {

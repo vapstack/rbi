@@ -31,7 +31,7 @@ func (db *DB[K, V]) Count(exprs ...qx.Expr) (uint64, error) {
 	}
 	defer db.endOp()
 
-	if db.transparent {
+	if db.engine == nil {
 		return 0, ErrNoIndex
 	}
 	var (
@@ -40,9 +40,9 @@ func (db *DB[K, V]) Count(exprs ...qx.Expr) (uint64, error) {
 	)
 	switch len(exprs) {
 	case 1:
-		prepared, err = qir.PrepareCountExprResolved(db.indexedFieldMap, exprs[0])
+		prepared, err = qir.PrepareCountExprResolved(db.engine.indexedFieldMap, exprs[0])
 	default:
-		prepared, err = qir.PrepareCountExprsResolved(db.indexedFieldMap, exprs...)
+		prepared, err = qir.PrepareCountExprsResolved(db.engine.indexedFieldMap, exprs...)
 	}
 	if err != nil {
 		return 0, err
@@ -206,7 +206,7 @@ func countPostingUnionCardinality2(a, b posting.List) uint64 {
 	return satAddUint64(a.Cardinality(), b.Cardinality()) - a.AndCardinality(b)
 }
 
-func countPostingAllMatches(posts *pooled.SliceBuf[posting.List]) uint64 {
+func countPostingAllMatches(posts *pooled.Slice[posting.List]) uint64 {
 	if posts == nil || posts.Len() == 0 {
 		return 0
 	}
@@ -396,7 +396,7 @@ func shouldUseCountLeadResidualHasAnyExactFilter(p predicate) bool {
 	return p.estCard >= countPredLeadResidualHasAnyExactMinCard
 }
 
-func countLeadResidualExactFiltersContain(filters *pooled.SliceBuf[countLeadResidualExactFilter], idx int) bool {
+func countLeadResidualExactFiltersContain(filters *pooled.Slice[countLeadResidualExactFilter], idx int) bool {
 	if filters == nil {
 		return false
 	}
@@ -417,7 +417,7 @@ func countIndexSliceContains(active []int, idx int) bool {
 	return false
 }
 
-func (qv *queryView) buildCountLeadResidualExactFiltersByCandidatesInto(dst *pooled.SliceBuf[countLeadResidualExactFilter], preds predicateReader, candidates []int) {
+func (qv *queryView) buildCountLeadResidualExactFiltersByCandidatesInto(dst *pooled.Slice[countLeadResidualExactFilter], preds predicateReader, candidates []int) {
 	dst.Truncate()
 	for _, pi := range candidates {
 		if pi < 0 || pi >= preds.Len() {
@@ -447,7 +447,7 @@ func (qv *queryView) buildCountLeadResidualExactFiltersByCandidatesInto(dst *poo
 	}
 }
 
-func (qv *queryView) buildCountLeadResidualExactFiltersByCandidatesIntoSet(dst *pooled.SliceBuf[countLeadResidualExactFilter], preds predicateSet, candidates []int) {
+func (qv *queryView) buildCountLeadResidualExactFiltersByCandidatesIntoSet(dst *pooled.Slice[countLeadResidualExactFilter], preds predicateSet, candidates []int) {
 	dst.Truncate()
 	for _, pi := range candidates {
 		if pi < 0 || pi >= preds.Len() {
@@ -505,7 +505,7 @@ func (qv *queryView) collectCountLeadResidualExactCandidatesIntoSet(dst []int, p
 	return dst
 }
 
-func countApplyLeadResidualExactFilters(src, work posting.List, filters *pooled.SliceBuf[countLeadResidualExactFilter]) (posting.List, posting.List) {
+func countApplyLeadResidualExactFilters(src, work posting.List, filters *pooled.Slice[countLeadResidualExactFilter]) (posting.List, posting.List) {
 	if src.IsEmpty() {
 		return posting.List{}, work
 	}
@@ -575,7 +575,7 @@ func countApplyLeadResidualExactFilters(src, work posting.List, filters *pooled.
 	return current, work
 }
 
-func shouldApplyCountLeadResidualExactFilters(src posting.List, filters *pooled.SliceBuf[countLeadResidualExactFilter]) bool {
+func shouldApplyCountLeadResidualExactFilters(src posting.List, filters *pooled.Slice[countLeadResidualExactFilter]) bool {
 	if src.IsEmpty() || filters == nil || filters.Len() == 0 {
 		return false
 	}
@@ -602,7 +602,7 @@ func countPostingMatchesMultiSet(preds predicateSet, checks []int, ids posting.L
 }
 
 func countORBranchAcceptIdx(
-	branches *pooled.SliceBuf[countORBranch],
+	branches *pooled.Slice[countORBranch],
 	branchIdx int,
 	br *countORBranch,
 	useSeenDedup bool,
@@ -648,7 +648,7 @@ func countORBranchAcceptIdx(
 }
 
 func countORBranchAcceptPosting(
-	branches *pooled.SliceBuf[countORBranch],
+	branches *pooled.Slice[countORBranch],
 	branchIdx int,
 	br *countORBranch,
 	useSeenDedup bool,
@@ -676,12 +676,10 @@ func countORBranchAcceptPosting(
 
 func (qv *queryView) ensureCountLeadResidualExactFiltersSet(
 	preds predicateSet,
-	candidates []int,
-	residualExact []int,
-	residualBoth []int,
-	extraExactBuf *pooled.SliceBuf[countLeadResidualExactFilter],
+	candidates, residualExact, residualBoth []int,
+	extraExactBuf *pooled.Slice[countLeadResidualExactFilter],
 	extraExactBuilt bool,
-) (*pooled.SliceBuf[countLeadResidualExactFilter], bool, []int) {
+) (*pooled.Slice[countLeadResidualExactFilter], bool, []int) {
 	if extraExactBuilt {
 		return extraExactBuf, true, residualBoth
 	}
@@ -758,7 +756,7 @@ func (qv *queryView) evalAndOperandsExceptReordered(ops []qir.Expr, skip int) (p
 	var negBuf [countPredicateScanMaxLeaves]int
 	neg := negBuf[:0]
 
-	var mergedRangesBuf *pooled.SliceBuf[orderedMergedScalarRangeField]
+	var mergedRangesBuf *pooled.Slice[orderedMergedScalarRangeField]
 	if len(filtered) > 1 {
 		buf := orderedMergedScalarRangeFieldSlicePool.Get()
 		buf.Grow(len(filtered))
@@ -1313,7 +1311,7 @@ func (qv *queryView) buildCountPredicatesWithMode(leaves []qir.Expr, allowMateri
 		return preds, true
 	}
 
-	var mergedRangesBuf *pooled.SliceBuf[orderedMergedScalarRangeField]
+	var mergedRangesBuf *pooled.Slice[orderedMergedScalarRangeField]
 	if len(leaves) > 1 {
 		mergedRangesBuf = orderedMergedScalarRangeFieldSlicePool.Get()
 		mergedRangesBuf.Grow(len(leaves))
@@ -1393,7 +1391,7 @@ func newCountORBranch(index int, preds predicateSet, lead int, checks []int, est
 	return br
 }
 
-func countORBranchDupOrderLess(branches *pooled.SliceBuf[countORBranch], a, b int) bool {
+func countORBranchDupOrderLess(branches *pooled.Slice[countORBranch], a, b int) bool {
 	ba := branches.Get(a)
 	bb := branches.Get(b)
 	aw := ba.matchWeight
@@ -1418,7 +1416,7 @@ func countORBranchDupOrderLess(branches *pooled.SliceBuf[countORBranch], a, b in
 	return a < b
 }
 
-func countORPreparePrevOrderBuf(branches *pooled.SliceBuf[countORBranch]) {
+func countORPreparePrevOrderBuf(branches *pooled.Slice[countORBranch]) {
 	if branches == nil || branches.Len() <= 1 {
 		return
 	}
@@ -1492,7 +1490,7 @@ func countPredicateLeadPostingAt(p predicate, i int) posting.List {
 	return p.postAt(i)
 }
 
-func countORBranchesUnionUpperBoundBuf(branches *pooled.SliceBuf[countORBranch], universe uint64) uint64 {
+func countORBranchesUnionUpperBoundBuf(branches *pooled.Slice[countORBranch], universe uint64) uint64 {
 	var unionUpper uint64
 	for i := 0; i < branches.Len(); i++ {
 		unionUpper += branches.Get(i).est
@@ -1503,7 +1501,7 @@ func countORBranchesUnionUpperBoundBuf(branches *pooled.SliceBuf[countORBranch],
 	return unionUpper
 }
 
-func countORBranchesUnionEstimateBuf(branches *pooled.SliceBuf[countORBranch], universe uint64) uint64 {
+func countORBranchesUnionEstimateBuf(branches *pooled.Slice[countORBranch], universe uint64) uint64 {
 	if universe == 0 {
 		return countORBranchesUnionUpperBoundBuf(branches, 0)
 	}
@@ -1705,7 +1703,7 @@ func countORDedupDupShareBounds(branchCount int, universe uint64, expectedProbes
 	return minShare, forceShare
 }
 
-func countORBranchesMatchWorkBuf(branches *pooled.SliceBuf[countORBranch]) uint64 {
+func countORBranchesMatchWorkBuf(branches *pooled.Slice[countORBranch]) uint64 {
 	if branches == nil || branches.Len() == 0 {
 		return 0
 	}
@@ -1735,7 +1733,7 @@ func countORDedupWorkMultiplier(sumEst uint64, matchWork uint64) float64 {
 	return mult
 }
 
-func countORBranchesShouldUseSeenDedupBuf(branches *pooled.SliceBuf[countORBranch], universe uint64, expectedProbes uint64) bool {
+func countORBranchesShouldUseSeenDedupBuf(branches *pooled.Slice[countORBranch], universe uint64, expectedProbes uint64) bool {
 	if branches == nil || branches.Len() <= 2 {
 		return false
 	}
@@ -1787,7 +1785,7 @@ func countORBranchesShouldUseSeenDedupBuf(branches *pooled.SliceBuf[countORBranc
 	return expectedProbes >= sumEst
 }
 
-func countORSeenCapHintBuf(branches *pooled.SliceBuf[countORBranch], spillEst uint64, universe uint64) int {
+func countORSeenCapHintBuf(branches *pooled.Slice[countORBranch], spillEst uint64, universe uint64) int {
 	hint := satAddUint64(countORBranchesUnionEstimateBuf(branches, universe), spillEst)
 	if universe > 0 && hint > universe {
 		hint = universe
@@ -1798,7 +1796,7 @@ func countORSeenCapHintBuf(branches *pooled.SliceBuf[countORBranch], spillEst ui
 	return clampUint64ToInt(hint)
 }
 
-func newCountORSeenBuf(branches *pooled.SliceBuf[countORBranch], spillEst uint64, universe uint64) countORSeen {
+func newCountORSeenBuf(branches *pooled.Slice[countORBranch], spillEst uint64, universe uint64) countORSeen {
 	hint := countORSeenCapHintBuf(branches, spillEst, universe)
 	if hint <= countORSeenHashMaxHint {
 		return countORSeen{
@@ -1967,7 +1965,7 @@ func (qv *queryView) countORMaterializedSpillUnion(
 }
 
 func (qv *queryView) tryCountORBranchLeadPostingsBuf(
-	branches *pooled.SliceBuf[countORBranch],
+	branches *pooled.Slice[countORBranch],
 	branchIdx int,
 	useSeenDedup bool,
 	seen *countORSeen,
@@ -2012,7 +2010,7 @@ func (qv *queryView) tryCountORBranchLeadPostingsBuf(
 		residualBoth = append(residualBoth, pi)
 	}
 
-	var extraExactBuf *pooled.SliceBuf[countLeadResidualExactFilter]
+	var extraExactBuf *pooled.Slice[countLeadResidualExactFilter]
 	extraExactBuilt := len(extraExactCandidates) == 0
 
 	var bucketWork posting.List
@@ -2450,7 +2448,7 @@ func (qv *queryView) tryMaterializeBroadRangeComplementPredicateForCount(p *pred
 	return true
 }
 
-func (qv *queryView) materializePostingIntersection(posts *pooled.SliceBuf[posting.List]) posting.List {
+func (qv *queryView) materializePostingIntersection(posts *pooled.Slice[posting.List]) posting.List {
 	if posts == nil || posts.Len() == 0 {
 		return posting.List{}
 	}
@@ -2821,7 +2819,7 @@ func (qv *queryView) tryCountByPredicatesLeadBuckets(preds predicateSet, leadIdx
 			residualExactBuf[:0],
 			residualBothBuf[:0],
 		)
-		var extraExactBuf *pooled.SliceBuf[countLeadResidualExactFilter]
+		var extraExactBuf *pooled.Slice[countLeadResidualExactFilter]
 		extraExactBuilt := len(extraExactCandidates) == 0
 
 		var cnt uint64
@@ -2973,7 +2971,7 @@ func (qv *queryView) tryCountByPredicatesLeadBuckets(preds predicateSet, leadIdx
 		residualExactBuf[:0],
 		residualBothBuf[:0],
 	)
-	var extraExactBuf *pooled.SliceBuf[countLeadResidualExactFilter]
+	var extraExactBuf *pooled.Slice[countLeadResidualExactFilter]
 	extraExactBuilt := len(extraExactCandidates) == 0
 
 	var cnt uint64
@@ -3109,7 +3107,7 @@ func (qv *queryView) tryCountByPredicatesLeadPostings(preds predicateSet, leadId
 		residualExactBuf[:0],
 		residualBothBuf[:0],
 	)
-	var extraExactBuf *pooled.SliceBuf[countLeadResidualExactFilter]
+	var extraExactBuf *pooled.Slice[countLeadResidualExactFilter]
 	extraExactBuilt := len(extraExactCandidates) == 0
 
 	var cnt uint64

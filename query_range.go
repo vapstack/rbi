@@ -13,7 +13,7 @@ const numericRangeFullSpanCacheMaxEntries = 4
 
 type numericRangeBucketCache struct {
 	mu    sync.Mutex
-	slots *pooled.SliceBuf[numericRangeBucketCacheSlot]
+	slots *pooled.Slice[numericRangeBucketCacheSlot]
 }
 
 type numericRangeBucketIndex struct {
@@ -41,7 +41,7 @@ type numericRangeBucketCacheEntry struct {
 	mu            sync.Mutex
 	fullSpanClock uint64
 	fullSpanCache [numericRangeFullSpanCacheMaxEntries]numericRangeFullSpanCacheSlot
-	retired       *pooled.SliceBuf[posting.List]
+	retired       *pooled.Slice[posting.List]
 }
 
 var numericRangeBucketCachePool = pooled.Pointers[numericRangeBucketCache]{
@@ -62,7 +62,7 @@ var numericRangeBucketCacheEntryPool = pooled.Pointers[numericRangeBucketCacheEn
 }
 
 var numericRangeRetiredPostingPool = pooled.Slices[posting.List]{
-	Cleanup: func(buf *pooled.SliceBuf[posting.List]) {
+	Cleanup: func(buf *pooled.Slice[posting.List]) {
 		for i := 0; i < buf.Len(); i++ {
 			ids := buf.Get(i)
 			if !ids.IsEmpty() {

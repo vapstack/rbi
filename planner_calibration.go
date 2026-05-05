@@ -162,11 +162,11 @@ func calibrationStateFromSnapshot(s CalibrationSnapshot) (*calibration, error) {
 }
 
 func (db *DB[K, V]) initCalibration() {
-	if db.planner.calibrator.enabled && db.planner.calibrator.state.Load() == nil {
-		db.planner.calibrator.state.Store(newCalibration())
+	if db.engine.planner.calibrator.enabled && db.engine.planner.calibrator.state.Load() == nil {
+		db.engine.planner.calibrator.state.Store(newCalibration())
 	}
 
-	path := db.planner.calibrator.persistPath
+	path := db.engine.planner.calibrator.persistPath
 	if path == "" {
 		return
 	}
@@ -177,14 +177,14 @@ func (db *DB[K, V]) initCalibration() {
 }
 
 func (db *DB[K, V]) persistCalibrationOnClose() error {
-	path := db.planner.calibrator.persistPath
+	path := db.engine.planner.calibrator.persistPath
 	if path == "" {
 		return nil
 	}
-	if db.planner.calibrator.state.Load() == nil {
+	if db.engine.planner.calibrator.state.Load() == nil {
 		return nil
 	}
-	return db.SaveCalibration(path)
+	return db.saveCalibration(path)
 }
 
 // GetCalibrationSnapshot returns a copy of current planner calibration state.
@@ -192,10 +192,12 @@ func (db *DB[K, V]) persistCalibrationOnClose() error {
 // The bool result is false if state was not initialized yet.
 //
 // In indexed mode startup initializes calibration state when calibration is
-// enabled. In transparent mode startup does not initialize planner state, so
-// this method usually returns (zero, false) unless state was explicitly set
-// through SetCalibrationSnapshot or loaded manually.
+// enabled. In transparent mode no runtime planner exists, so this method
+// returns (zero, false).
 func (db *DB[K, V]) GetCalibrationSnapshot() (CalibrationSnapshot, bool) {
+	if db.engine == nil {
+		return CalibrationSnapshot{}, false
+	}
 	cur := db.engine.planner.calibrator.state.Load()
 	if cur == nil {
 		return CalibrationSnapshot{}, false
@@ -205,12 +207,13 @@ func (db *DB[K, V]) GetCalibrationSnapshot() (CalibrationSnapshot, bool) {
 
 // SetCalibrationSnapshot replaces planner calibration state with the provided snapshot.
 //
-// The method is allowed in both indexed and transparent modes. In transparent
-// mode it only updates stored calibration state for future use; no planner
-// execution paths consume that state while indexing is disabled.
+// In transparent mode no runtime planner exists, so the method returns ErrNoIndex.
 func (db *DB[K, V]) SetCalibrationSnapshot(s CalibrationSnapshot) error {
 	if err := db.unavailableErr(); err != nil {
 		return err
+	}
+	if db.engine == nil {
+		return ErrNoIndex
 	}
 	state, err := calibrationStateFromSnapshot(s)
 	if err != nil {
@@ -225,6 +228,13 @@ func (db *DB[K, V]) SetCalibrationSnapshot(s CalibrationSnapshot) error {
 
 // SaveCalibration writes planner calibration snapshot to a JSON file.
 func (db *DB[K, V]) SaveCalibration(path string) error {
+	if db.engine == nil {
+		return ErrNoIndex
+	}
+	return db.saveCalibration(path)
+}
+
+func (db *DB[K, V]) saveCalibration(path string) error {
 	if path == "" {
 		return errors.New("planner calibration path is empty")
 	}
@@ -246,6 +256,9 @@ func (db *DB[K, V]) SaveCalibration(path string) error {
 func (db *DB[K, V]) LoadCalibration(path string) error {
 	if err := db.unavailableErr(); err != nil {
 		return err
+	}
+	if db.engine == nil {
+		return ErrNoIndex
 	}
 	if path == "" {
 		return errors.New("planner calibration path is empty")

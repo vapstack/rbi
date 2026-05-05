@@ -106,7 +106,7 @@ type autoBatchRequest[K ~string | ~uint64, V any] struct {
 }
 
 type autoBatchJob[K ~string | ~uint64, V any] struct {
-	reqs       *pooled.SliceBuf[*autoBatchRequest[K, V]]
+	reqs       *pooled.Slice[*autoBatchRequest[K, V]]
 	isolated   bool
 	done       chan error
 	enqueuedAt int64
@@ -372,7 +372,7 @@ func (db *DB[K, V]) autoBatchPatchRequestPolicy(
 	beforeProcess []beforeProcessFunc[K, V],
 	beforeStore []beforeStoreFunc[K, V],
 ) autoBatchReqPolicy {
-	if !db.hasUnique {
+	if db.engine == nil || !db.engine.hasUnique {
 		return autoBatchReqRepeatIDSafeShared
 	}
 	if len(beforeProcess) != 0 || len(beforeStore) != 0 {
@@ -400,7 +400,7 @@ func assignAutoBatchPreparedErr[K ~string | ~uint64, V any](ops []autoBatchPrepa
 	}
 }
 
-func assignAutoBatchRequestErr[K ~string | ~uint64, V any](reqs *pooled.SliceBuf[*autoBatchRequest[K, V]], err error) {
+func assignAutoBatchRequestErr[K ~string | ~uint64, V any](reqs *pooled.Slice[*autoBatchRequest[K, V]], err error) {
 	for i := 0; i < reqs.Len(); i++ {
 		req := reqs.Get(i)
 		if req != nil && req.err == nil {
@@ -416,7 +416,7 @@ func roundedAutoBatchHint(hint int) int {
 	return 1 << bits.Len(uint(hint-1))
 }
 
-func collectActiveAutoBatchRequests[K ~string | ~uint64, V any](active, batch *pooled.SliceBuf[*autoBatchRequest[K, V]]) {
+func collectActiveAutoBatchRequests[K ~string | ~uint64, V any](active, batch *pooled.Slice[*autoBatchRequest[K, V]]) {
 	active.Truncate()
 	for i := 0; i < batch.Len(); i++ {
 		req := batch.Get(i)
@@ -426,7 +426,7 @@ func collectActiveAutoBatchRequests[K ~string | ~uint64, V any](active, batch *p
 	}
 }
 
-func removeAutoBatchRequest[K ~string | ~uint64, V any](active *pooled.SliceBuf[*autoBatchRequest[K, V]], failed *autoBatchRequest[K, V]) bool {
+func removeAutoBatchRequest[K ~string | ~uint64, V any](active *pooled.Slice[*autoBatchRequest[K, V]], failed *autoBatchRequest[K, V]) bool {
 	write := 0
 	removed := false
 	for i := 0; i < active.Len(); i++ {
@@ -501,7 +501,7 @@ func (db *DB[K, V]) buildDeleteAutoBatchRequest(id K, beforeCommit []beforeCommi
 	return req
 }
 
-func (db *DB[K, V]) submitAutoBatchRequests(reqs *pooled.SliceBuf[*autoBatchRequest[K, V]], isolated bool) error {
+func (db *DB[K, V]) submitAutoBatchRequests(reqs *pooled.Slice[*autoBatchRequest[K, V]], isolated bool) error {
 	if reqs.Len() == 0 {
 		return nil
 	}
@@ -799,6 +799,9 @@ func (db *DB[K, V]) recordExecutedAutoBatchStats(size int) {
 }
 
 func (db *DB[K, V]) patchTouchesUnique(patch []Field) bool {
+	if db.engine == nil {
+		return false
+	}
 	for _, p := range patch {
 		f, ok := db.patchMap[p.Name]
 		if !ok || f == nil {
@@ -808,11 +811,11 @@ func (db *DB[K, V]) patchTouchesUnique(patch []Field) bool {
 			return true
 		}
 		if f.DBName != "" {
-			if indexed, ok := db.indexFields[f.DBName]; ok && indexed.Unique {
+			if indexed, ok := db.engine.fields[f.DBName]; ok && indexed.Unique {
 				return true
 			}
 		}
-		if indexed, ok := db.indexFields[f.Name]; ok && indexed.Unique {
+		if indexed, ok := db.engine.fields[f.Name]; ok && indexed.Unique {
 			return true
 		}
 	}
@@ -845,7 +848,7 @@ func (db *DB[K, V]) markSupersededSetDeleteJobs(batch []*autoBatchJob[K, V]) {
 	db.autoBatcher.repeatIDPool.Put(lastByID)
 }
 
-func (db *DB[K, V]) prepareAutoBatchActive(att *autoBatchAttemptState[K, V], active *pooled.SliceBuf[*autoBatchRequest[K, V]]) {
+func (db *DB[K, V]) prepareAutoBatchActive(att *autoBatchAttemptState[K, V], active *pooled.Slice[*autoBatchRequest[K, V]]) {
 	for i := 0; i < active.Len(); i++ {
 		req := active.Get(i)
 		if req.err != nil {
@@ -930,7 +933,7 @@ func (db *DB[K, V]) prepareAutoBatchSet(att *autoBatchAttemptState[K, V], req *a
 		}
 	}
 
-	if !db.transparent {
+	if db.engine != nil {
 		att.ensureIdx(req.id, state, true)
 	}
 
@@ -1014,7 +1017,7 @@ func (db *DB[K, V]) prepareAutoBatchPatch(att *autoBatchAttemptState[K, V], req 
 	}
 	att.ownedPayloads = append(att.ownedPayloads, buf)
 
-	if !db.transparent {
+	if db.engine != nil {
 		att.ensureIdx(req.id, state, false)
 	}
 
@@ -1043,7 +1046,7 @@ func (db *DB[K, V]) prepareAutoBatchDelete(att *autoBatchAttemptState[K, V], req
 	}
 
 	oldVal := state.value
-	if !db.transparent {
+	if db.engine != nil {
 		att.ensureIdx(req.id, state, false)
 	}
 
@@ -1061,7 +1064,7 @@ func (db *DB[K, V]) prepareAutoBatchDelete(att *autoBatchAttemptState[K, V], req
 
 func (db *DB[K, V]) filterAutoBatchAcceptedLocked(att *autoBatchAttemptState[K, V], atomicAll bool) error {
 	att.accepted = att.prepared
-	if !db.hasUnique {
+	if db.engine == nil || !db.engine.hasUnique {
 		return nil
 	}
 
@@ -1247,7 +1250,7 @@ func (db *DB[K, V]) executeAutoBatchJobs(batch []*autoBatchJob[K, V]) {
 	}
 }
 
-func resolveAutoBatchRequestErrs[K ~string | ~uint64, V any](batch *pooled.SliceBuf[*autoBatchRequest[K, V]]) {
+func resolveAutoBatchRequestErrs[K ~string | ~uint64, V any](batch *pooled.Slice[*autoBatchRequest[K, V]]) {
 	for i := 0; i < batch.Len(); i++ {
 		req := batch.Get(i)
 		if req.replacedBy == nil {
@@ -1295,7 +1298,7 @@ func (db *DB[K, V]) executeAutoBatch(batch []*autoBatchRequest[K, V]) {
 	}
 }
 
-func (db *DB[K, V]) runAutoBatchShared(batch *pooled.SliceBuf[*autoBatchRequest[K, V]]) {
+func (db *DB[K, V]) runAutoBatchShared(batch *pooled.Slice[*autoBatchRequest[K, V]]) {
 	for i := 0; i < batch.Len(); i++ {
 		batch.Get(i).err = nil
 	}
@@ -1333,7 +1336,7 @@ func (db *DB[K, V]) runAutoBatchShared(batch *pooled.SliceBuf[*autoBatchRequest[
 	}
 }
 
-func firstAutoBatchRequestErr[K ~string | ~uint64, V any](reqs *pooled.SliceBuf[*autoBatchRequest[K, V]]) error {
+func firstAutoBatchRequestErr[K ~string | ~uint64, V any](reqs *pooled.Slice[*autoBatchRequest[K, V]]) error {
 	for i := 0; i < reqs.Len(); i++ {
 		req := reqs.Get(i)
 		if req != nil && req.err != nil {
@@ -1375,7 +1378,7 @@ func batchAutoBatchOpName[K ~string | ~uint64, V any](req *autoBatchRequest[K, V
 	}
 }
 
-func (db *DB[K, V]) autoBatchOpName(reqs *pooled.SliceBuf[*autoBatchRequest[K, V]], atomicAll bool) string {
+func (db *DB[K, V]) autoBatchOpName(reqs *pooled.Slice[*autoBatchRequest[K, V]], atomicAll bool) string {
 	if reqs.Len() == 0 {
 		return "batch"
 	}
@@ -1391,7 +1394,7 @@ func (db *DB[K, V]) autoBatchOpName(reqs *pooled.SliceBuf[*autoBatchRequest[K, V
 	return batchAutoBatchOpName(reqs.Get(0))
 }
 
-func (db *DB[K, V]) runAutoBatchAtomic(batch *pooled.SliceBuf[*autoBatchRequest[K, V]]) {
+func (db *DB[K, V]) runAutoBatchAtomic(batch *pooled.Slice[*autoBatchRequest[K, V]]) {
 	for i := 0; i < batch.Len(); i++ {
 		req := batch.Get(i)
 		req.err = nil
@@ -1407,7 +1410,7 @@ func (db *DB[K, V]) runAutoBatchAtomic(batch *pooled.SliceBuf[*autoBatchRequest[
 	}
 }
 
-func (db *DB[K, V]) executeAutoBatchAttempt(active *pooled.SliceBuf[*autoBatchRequest[K, V]], atomicAll bool) (*autoBatchRequest[K, V], bool, error) {
+func (db *DB[K, V]) executeAutoBatchAttempt(active *pooled.Slice[*autoBatchRequest[K, V]], atomicAll bool) (*autoBatchRequest[K, V], bool, error) {
 	stats := db.autoBatcher.statsEnabled
 	opName := db.autoBatchOpName(active, atomicAll)
 
@@ -1509,7 +1512,7 @@ func (db *DB[K, V]) executeAutoBatchAttempt(active *pooled.SliceBuf[*autoBatchRe
 		return retryWithoutReq, false, nil
 	}
 
-	if db.transparent {
+	if db.engine == nil {
 		if _, err = bucket.NextSequence(); err != nil {
 			if stats {
 				db.autoBatcher.txOpErrors.Add(1)
@@ -1541,13 +1544,13 @@ func (db *DB[K, V]) executeAutoBatchAttempt(active *pooled.SliceBuf[*autoBatchRe
 	}
 
 	snap := db.buildPreparedSnapshotNoLock(seq, att.accepted)
-	db.snapshot.stage(snap)
+	db.engine.snapshot.stage(snap)
 
 	if err = db.commit(tx, opName); err != nil {
 		if stats {
 			db.autoBatcher.txCommitErrors.Add(1)
 		}
-		db.snapshot.dropStaged(seq)
+		db.engine.snapshot.dropStaged(seq)
 		att.rollbackCreated(att.accepted)
 		db.mu.Unlock()
 		assignAutoBatchPreparedErr(att.accepted, err)

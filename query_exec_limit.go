@@ -16,7 +16,7 @@ type leafPred struct {
 	posting       posting.List
 	estCard       uint64
 	postingFilter func(posting.List) (posting.List, bool)
-	postsBuf      *pooled.SliceBuf[posting.List]
+	postsBuf      *pooled.Slice[posting.List]
 	postsAnyState *postsAnyFilterState
 }
 
@@ -233,7 +233,7 @@ func (p leafPred) applyToPosting(dst posting.List) (posting.List, bool) {
 	return posting.List{}, false
 }
 
-func leafPredsMatchActive(preds *pooled.SliceBuf[leafPred], checks []int, idx uint64) bool {
+func leafPredsMatchActive(preds *pooled.Slice[leafPred], checks []int, idx uint64) bool {
 	for _, pi := range checks {
 		if !preds.Get(pi).containsIdx(idx) {
 			return false
@@ -244,7 +244,7 @@ func leafPredsMatchActive(preds *pooled.SliceBuf[leafPred], checks []int, idx ui
 
 func leafPredsEmitCandidate(
 	cursor *queryCursor,
-	preds *pooled.SliceBuf[leafPred],
+	preds *pooled.Slice[leafPred],
 	checks []int,
 	trace *queryTrace,
 	idx uint64,
@@ -290,7 +290,7 @@ func leafPredsEmitMatchedPosting(
 
 func leafPredsTryBucketPosting(
 	cursor *queryCursor,
-	preds *pooled.SliceBuf[leafPred],
+	preds *pooled.Slice[leafPred],
 	active, exactActive, residualActive []int,
 	exactOnly, residualApplyOnly bool,
 	ids, exactWork, applyWork posting.List,
@@ -366,7 +366,7 @@ func leafPredsTryBucketPosting(
 
 func leafPredsEmitPosting(
 	cursor *queryCursor,
-	preds *pooled.SliceBuf[leafPred],
+	preds *pooled.Slice[leafPred],
 	active []int,
 	exactActive []int,
 	residualActive []int,
@@ -941,14 +941,14 @@ func (qv *queryView) tryLimitQueryRangeNoOrderByField(q *qir.Shape, field string
 	return qv.scanLimitByOverlayBounds(q, ov, br, false, predsBuf, "", trace), true, nil
 }
 
-func (qv *queryView) buildLeafPredsExcludingBounds(leaves []qir.Expr, field string, orderedWindow int) (*pooled.SliceBuf[leafPred], bool, error) {
+func (qv *queryView) buildLeafPredsExcludingBounds(leaves []qir.Expr, field string, orderedWindow int) (*pooled.Slice[leafPred], bool, error) {
 	predsBuf := leafPredSlicePool.Get()
 	predsBuf.Grow(len(leaves))
 	orderedUniverse := uint64(0)
 	if orderedWindow > 0 {
 		orderedUniverse = qv.snapshotUniverseCardinality()
 	}
-	var mergedRangesBuf *pooled.SliceBuf[orderedMergedScalarRangeField]
+	var mergedRangesBuf *pooled.Slice[orderedMergedScalarRangeField]
 	if len(leaves) > 1 {
 		mergedRangesBuf = orderedMergedScalarRangeFieldSlicePool.Get()
 		mergedRangesBuf.Grow(len(leaves))
@@ -1055,7 +1055,7 @@ func (qv *queryView) buildLeafPredsExcludingBounds(leaves []qir.Expr, field stri
 	return predsBuf, true, nil
 }
 
-func (qv *queryView) scanLimitByOverlayBounds(q *qir.Shape, ov fieldOverlay, br overlayRange, desc bool, preds *pooled.SliceBuf[leafPred], nilTailField string, trace *queryTrace) []uint64 {
+func (qv *queryView) scanLimitByOverlayBounds(q *qir.Shape, ov fieldOverlay, br overlayRange, desc bool, preds *pooled.Slice[leafPred], nilTailField string, trace *queryTrace) []uint64 {
 	limit := int(q.Limit)
 	out := make([]uint64, 0, limit)
 	cursor := qv.newQueryCursor(out, 0, q.Limit, false, 0)
@@ -1613,7 +1613,7 @@ func (qv *queryView) attachLeafPredPostingFilter(p *leafPred) {
 	p.postsAnyState.containsMaterializeAt = postsAnyContainsMaterializeAfterBuf(p.postsBuf)
 }
 
-func buildExactBucketPostingFilterActiveLeaf(dst, active []int, preds *pooled.SliceBuf[leafPred]) []int {
+func buildExactBucketPostingFilterActiveLeaf(dst, active []int, preds *pooled.Slice[leafPred]) []int {
 	dst = dst[:0]
 	if preds == nil {
 		return dst
@@ -1627,7 +1627,7 @@ func buildExactBucketPostingFilterActiveLeaf(dst, active []int, preds *pooled.Sl
 }
 
 func plannerFilterCompactPostingByLeafChecks(
-	preds *pooled.SliceBuf[leafPred],
+	preds *pooled.Slice[leafPred],
 	checks []int,
 	src posting.List,
 	work posting.List,
@@ -1680,7 +1680,7 @@ func plannerFilterCompactPostingByLeafChecks(
 }
 
 func plannerFilterPostingByLeafChecks(
-	preds *pooled.SliceBuf[leafPred],
+	preds *pooled.Slice[leafPred],
 	checks []int,
 	src posting.List,
 	work posting.List,
@@ -1751,7 +1751,7 @@ func plannerFilterPostingByLeafChecks(
 	return plannerPredicateBucketExact, work, work, card
 }
 
-func pickLeadIndex(ps *pooled.SliceBuf[leafPred]) int {
+func pickLeadIndex(ps *pooled.Slice[leafPred]) int {
 	if ps == nil || ps.Len() == 0 {
 		return -1
 	}
@@ -1768,7 +1768,7 @@ func pickLeadIndex(ps *pooled.SliceBuf[leafPred]) int {
 	return best
 }
 
-func hasEmptyLeafPred(preds *pooled.SliceBuf[leafPred]) bool {
+func hasEmptyLeafPred(preds *pooled.Slice[leafPred]) bool {
 	if preds == nil {
 		return false
 	}
@@ -1780,7 +1780,7 @@ func hasEmptyLeafPred(preds *pooled.SliceBuf[leafPred]) bool {
 	return false
 }
 
-func minCardPostingBuf(posts *pooled.SliceBuf[posting.List]) posting.List {
+func minCardPostingBuf(posts *pooled.Slice[posting.List]) posting.List {
 	if posts == nil || posts.Len() == 0 {
 		return posting.List{}
 	}
@@ -1810,12 +1810,12 @@ func (emptyIter) Release()      {}
 
 type postingConcatIter struct {
 	posts    []posting.List
-	postsBuf *pooled.SliceBuf[posting.List]
+	postsBuf *pooled.Slice[posting.List]
 	i        int
 	curIt    posting.Iterator
 }
 
-func newPostingConcatBufIter(posts *pooled.SliceBuf[posting.List]) posting.Iterator {
+func newPostingConcatBufIter(posts *pooled.Slice[posting.List]) posting.Iterator {
 	return &postingConcatIter{postsBuf: posts}
 }
 
@@ -1873,7 +1873,7 @@ func (it *postingConcatIter) Release() {
 
 type postingUnionIter struct {
 	posts    []posting.List
-	postsBuf *pooled.SliceBuf[posting.List]
+	postsBuf *pooled.Slice[posting.List]
 	i        int
 	curIt    posting.Iterator
 	seen     u64set
@@ -1883,7 +1883,7 @@ type postingUnionIter struct {
 
 type postingSmallUnionIter struct {
 	posts    []posting.List
-	postsBuf *pooled.SliceBuf[posting.List]
+	postsBuf *pooled.Slice[posting.List]
 	i        int
 	curIt    posting.Iterator
 	next     uint64
@@ -1962,7 +1962,7 @@ func newPostingUnionIter(posts []posting.List) posting.Iterator {
 	return it
 }
 
-func newPostingUnionBufIter(posts *pooled.SliceBuf[posting.List]) posting.Iterator {
+func newPostingUnionBufIter(posts *pooled.Slice[posting.List]) posting.Iterator {
 	if posts.Len() > 1 && posts.Len() <= 3 {
 		it := postingSmallUnionIterPool.Get()
 		it.postsBuf = posts

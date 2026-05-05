@@ -105,14 +105,21 @@ func inferFieldWriteKeyKind(kind reflect.Kind, useVI, nativeTime bool) fieldWrit
 	}
 }
 
-func (db *DB[K, V]) populateFields(t reflect.Type, idx []int) error {
-	if idx == nil && db.options != nil && db.options.Index != nil {
-		return db.populateFieldsFromOptions(t)
-	}
-	return db.populateFieldsFromTags(t, idx)
+type fieldCollector struct {
+	options       *Options
+	indexFields   map[string]*field
+	measureFields map[string]*field
+	hasUnique     bool
 }
 
-func (db *DB[K, V]) populateFieldsFromTags(t reflect.Type, idx []int) error {
+func (collector *fieldCollector) populateFields(t reflect.Type, idx []int) error {
+	if idx == nil && collector.options != nil && collector.options.Index != nil {
+		return collector.populateFieldsFromOptions(t)
+	}
+	return collector.populateFieldsFromTags(t, idx)
+}
+
+func (collector *fieldCollector) populateFieldsFromTags(t reflect.Type, idx []int) error {
 
 	for i := 0; i < t.NumField(); i++ {
 
@@ -137,7 +144,7 @@ func (db *DB[K, V]) populateFieldsFromTags(t reflect.Type, idx []int) error {
 					continue
 				}
 				newIdx := append(slices.Clone(idx), i)
-				if err := db.populateFieldsFromTags(f.Type, newIdx); err != nil {
+				if err := collector.populateFieldsFromTags(f.Type, newIdx); err != nil {
 					return err
 				}
 			}
@@ -146,7 +153,7 @@ func (db *DB[K, V]) populateFieldsFromTags(t reflect.Type, idx []int) error {
 		if skip || !use {
 			continue
 		}
-		if err := db.addIndexedField(f, append(slices.Clone(idx), i), indexKind); err != nil {
+		if err := collector.addIndexedField(f, append(slices.Clone(idx), i), indexKind); err != nil {
 			return err
 		}
 	}
@@ -189,15 +196,15 @@ type optionIndexField struct {
 	dbName      string
 }
 
-func (db *DB[K, V]) populateFieldsFromOptions(t reflect.Type) error {
+func (collector *fieldCollector) populateFieldsFromOptions(t reflect.Type) error {
 	byGo := make(map[string]optionIndexField, t.NumField())
 	byDB := make(map[string]optionIndexField, t.NumField())
 	if err := collectOptionIndexFields(t, nil, byGo, byDB); err != nil {
 		return err
 	}
 
-	seen := make(map[string]string, len(db.options.Index))
-	for name, indexKind := range db.options.Index {
+	seen := make(map[string]string, len(collector.options.Index))
+	for name, indexKind := range collector.options.Index {
 		if err := validateIndexKind(indexKind); err != nil {
 			return fmt.Errorf("field %q: %w", name, err)
 		}
@@ -223,7 +230,7 @@ func (db *DB[K, V]) populateFieldsFromOptions(t reflect.Type) error {
 		}
 		seen[fieldID] = name
 
-		if err := db.addIndexedField(info.structField, info.index, indexKind); err != nil {
+		if err := collector.addIndexedField(info.structField, info.index, indexKind); err != nil {
 			return err
 		}
 	}
@@ -281,7 +288,7 @@ func fieldIndexID(index []int) string {
 	return b.String()
 }
 
-func (db *DB[K, V]) addIndexedField(sf reflect.StructField, index []int, indexKind IndexKind) error {
+func (collector *fieldCollector) addIndexedField(sf reflect.StructField, index []int, indexKind IndexKind) error {
 	if err := validateIndexKind(indexKind); err != nil {
 		return fmt.Errorf("field %v: %w", sf.Name, err)
 	}
@@ -290,19 +297,19 @@ func (db *DB[K, V]) addIndexedField(sf reflect.StructField, index []int, indexKi
 		return err
 	}
 	if indexKind == IndexUnique {
-		db.hasUnique = true
+		collector.hasUnique = true
 	}
 	if indexKind == IndexMeasure {
-		if db.measureFields == nil {
-			db.measureFields = make(map[string]*field)
+		if collector.measureFields == nil {
+			collector.measureFields = make(map[string]*field)
 		}
-		db.measureFields[f.DBName] = f
+		collector.measureFields[f.DBName] = f
 		return nil
 	}
-	if db.indexFields == nil {
-		db.indexFields = make(map[string]*field)
+	if collector.indexFields == nil {
+		collector.indexFields = make(map[string]*field)
 	}
-	db.indexFields[f.DBName] = f // last wins
+	collector.indexFields[f.DBName] = f // last wins
 	return nil
 }
 
@@ -475,7 +482,10 @@ func (db *DB[K, V]) forEachModifiedAccessor(accessors []indexedFieldAccessor, v1
 }
 
 func (db *DB[K, V]) forEachModifiedIndexedField(v1 *V, v2 *V, fn func(indexedFieldAccessor) bool) {
-	db.forEachModifiedAccessor(db.indexedFieldAccess, v1, v2, fn)
+	if db.engine == nil {
+		return
+	}
+	db.forEachModifiedAccessor(db.engine.indexedFieldAccess, v1, v2, fn)
 }
 
 func (db *DB[K, V]) getModifiedIndexedFields(v1 *V, v2 *V) []string {

@@ -197,7 +197,7 @@ var fixedPostingMapPool = pooled.Maps[uint64, posting.List]{
 var keyedBatchPostingDeltaSlicePool = pooled.Slices[keyedBatchPostingDelta]{
 	MinCap: 16,
 	MaxCap: keyedBatchPostingDeltaSliceMaxCap,
-	Cleanup: func(buf *pooled.SliceBuf[keyedBatchPostingDelta]) {
+	Cleanup: func(buf *pooled.Slice[keyedBatchPostingDelta]) {
 		for i := 0; i < buf.Len(); i++ {
 			delta := buf.Get(i)
 			delta.delta.add.Release()
@@ -223,7 +223,7 @@ var postingResultSlicePool = pooled.Slices[postingResult]{
 var countORBranchSlicePool = pooled.Slices[countORBranch]{
 	MinCap: 8,
 	MaxCap: countORBranchSlicePoolMaxCap,
-	Cleanup: func(buf *pooled.SliceBuf[countORBranch]) {
+	Cleanup: func(buf *pooled.Slice[countORBranch]) {
 		for i := 0; i < buf.Len(); i++ {
 			br := buf.Get(i)
 			releaseCountORBranchPredicates(br)
@@ -237,7 +237,7 @@ var countORBranchSlicePool = pooled.Slices[countORBranch]{
 var countLeadResidualExactFilterSlicePool = pooled.Slices[countLeadResidualExactFilter]{
 	MinCap: 8,
 	MaxCap: countLeadResidualExactFilterPoolMaxCap,
-	Cleanup: func(buf *pooled.SliceBuf[countLeadResidualExactFilter]) {
+	Cleanup: func(buf *pooled.Slice[countLeadResidualExactFilter]) {
 		for i := 0; i < buf.Len(); i++ {
 			buf.Get(i).ids.Release()
 		}
@@ -250,7 +250,7 @@ var countLeadResidualExactFilterSlicePool = pooled.Slices[countLeadResidualExact
 var predicateSlicePool = pooled.Slices[predicate]{
 	MinCap: 8,
 	MaxCap: predicateSlicePoolMaxCap,
-	Cleanup: func(buf *pooled.SliceBuf[predicate]) {
+	Cleanup: func(buf *pooled.Slice[predicate]) {
 		for i := 0; i < buf.Len(); i++ {
 			releasePredicateOwnedState(buf.GetPtr(i))
 		}
@@ -263,7 +263,7 @@ var predicateSlicePool = pooled.Slices[predicate]{
 var leafPredSlicePool = pooled.Slices[leafPred]{
 	MinCap: 8,
 	MaxCap: leafPredSlicePoolMaxCap,
-	Cleanup: func(buf *pooled.SliceBuf[leafPred]) {
+	Cleanup: func(buf *pooled.Slice[leafPred]) {
 		for i := 0; i < buf.Len(); i++ {
 			pred := buf.Get(i)
 			if pred.kind == leafPredKindPredicate {
@@ -283,7 +283,7 @@ var leafPredSlicePool = pooled.Slices[leafPred]{
 var plannerORBranchSlicePool = pooled.Slices[plannerORBranch]{
 	MinCap: 8,
 	MaxCap: plannerORBranchSlicePoolMaxCap,
-	Cleanup: func(buf *pooled.SliceBuf[plannerORBranch]) {
+	Cleanup: func(buf *pooled.Slice[plannerORBranch]) {
 		for i := 0; i < buf.Len(); i++ {
 			releasePlannerORBranchPredicates(buf.Get(i))
 		}
@@ -300,7 +300,7 @@ var plannerORPredicateBuildInfoSlicePool = pooled.Slices[orderedORMaterializedPr
 var plannerOROrderIterSlicePool = pooled.Slices[plannerOROrderBranchIter]{
 	MinCap: 16,
 	MaxCap: plannerOROrderIterSlicePoolMaxCap,
-	Cleanup: func(buf *pooled.SliceBuf[plannerOROrderBranchIter]) {
+	Cleanup: func(buf *pooled.Slice[plannerOROrderBranchIter]) {
 		for i := 0; i < buf.Len(); i++ {
 			iter := buf.Get(i)
 			iter.close()

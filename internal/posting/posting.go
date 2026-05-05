@@ -329,7 +329,7 @@ func compactFilterByMembership(ids List, other List, keepMatches bool) List {
 	return ids
 }
 
-func postingBufContainsAny(posts *pooled.SliceBuf[List], id uint64) bool {
+func postingBufContainsAny(posts *pooled.Slice[List], id uint64) bool {
 	if posts == nil {
 		return false
 	}
@@ -341,7 +341,7 @@ func postingBufContainsAny(posts *pooled.SliceBuf[List], id uint64) bool {
 	return false
 }
 
-func compactFilterByAnyMembership(ids List, other *pooled.SliceBuf[List]) List {
+func compactFilterByAnyMembership(ids List, other *pooled.Slice[List]) List {
 	if sp := ids.small(); sp != nil {
 		if ids.IsBorrowed() {
 			var kept [SmallCap]uint64
@@ -918,7 +918,7 @@ func (p List) CloneInto(dst List) List {
 	return largeValue(src.cloneSharedInto(largePostingPool.Get()))
 }
 
-func (p List) TryBuildAndAnyBuf(other *pooled.SliceBuf[List]) (List, bool) {
+func (p List) TryBuildAndAnyBuf(other *pooled.Slice[List]) (List, bool) {
 	if p.IsEmpty() {
 		return p, true
 	}

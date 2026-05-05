@@ -25,7 +25,7 @@ type predicate struct {
 	posting        posting.List
 	ids            posting.List
 	rangeMat       bool
-	postsBuf       *pooled.SliceBuf[posting.List]
+	postsBuf       *pooled.Slice[posting.List]
 	releaseIDs     bool
 	postsAnyState  *postsAnyFilterState
 	baseRangeState *baseRangePredicateState
@@ -97,7 +97,7 @@ func (cap predicatePostingFilterCapability) isCheap() bool {
 }
 
 type predicateSet struct {
-	owner *pooled.SliceBuf[predicate]
+	owner *pooled.Slice[predicate]
 }
 
 type predicateReader interface {
@@ -714,7 +714,7 @@ func (p predicate) applyToPosting(dst posting.List) (posting.List, bool) {
 	return posting.List{}, false
 }
 
-func countBucketPostsAnyBuf(posts *pooled.SliceBuf[posting.List], bucket posting.List) (uint64, bool) {
+func countBucketPostsAnyBuf(posts *pooled.Slice[posting.List], bucket posting.List) (uint64, bool) {
 	if bucket.IsEmpty() {
 		return 0, true
 	}
@@ -732,7 +732,7 @@ func countBucketPostsAnyBuf(posts *pooled.SliceBuf[posting.List], bucket posting
 	return 0, true
 }
 
-func countBucketPostsAnyNotBuf(posts *pooled.SliceBuf[posting.List], bucket posting.List) (uint64, bool) {
+func countBucketPostsAnyNotBuf(posts *pooled.Slice[posting.List], bucket posting.List) (uint64, bool) {
 	if bucket.IsEmpty() {
 		return 0, true
 	}
@@ -755,7 +755,7 @@ func countBucketPostsAnyNotBuf(posts *pooled.SliceBuf[posting.List], bucket post
 	return bc, true
 }
 
-func countBucketPostsAllBuf(posts *pooled.SliceBuf[posting.List], bucket posting.List) (uint64, bool) {
+func countBucketPostsAllBuf(posts *pooled.Slice[posting.List], bucket posting.List) (uint64, bool) {
 	if bucket.IsEmpty() {
 		return 0, true
 	}
@@ -773,7 +773,7 @@ func countBucketPostsAllBuf(posts *pooled.SliceBuf[posting.List], bucket posting
 	return 0, false
 }
 
-func countBucketPostsAllNotBuf(posts *pooled.SliceBuf[posting.List], bucket posting.List) (uint64, bool) {
+func countBucketPostsAllNotBuf(posts *pooled.Slice[posting.List], bucket posting.List) (uint64, bool) {
 	if bucket.IsEmpty() {
 		return 0, true
 	}
@@ -1911,7 +1911,7 @@ func (qv *queryView) execPlanCandidateOrderBasic(q *qir.Shape, preds predicateRe
 	}
 
 	br := ov.rangeForBounds(rangeBounds{has: true})
-	var rangeCovered *pooled.SliceBuf[bool]
+	var rangeCovered *pooled.Slice[bool]
 	orderField := qv.engine.fieldNameByOrdinal(o.FieldOrdinal)
 	if coveredRange, covered, ok := qv.extractOrderRangeCoverageOverlayReader(orderField, preds, ov); ok {
 		br = coveredRange
@@ -1951,7 +1951,7 @@ func (qv *queryView) execPlanCandidateOrderBasic(q *qir.Shape, preds predicateRe
 	return out
 }
 
-func (qv *queryView) extractOrderRangeCoverageOverlayWithBoundsReader(field string, preds predicateReader, ov fieldOverlay) (rangeBounds, overlayRange, *pooled.SliceBuf[bool], bool) {
+func (qv *queryView) extractOrderRangeCoverageOverlayWithBoundsReader(field string, preds predicateReader, ov fieldOverlay) (rangeBounds, overlayRange, *pooled.Slice[bool], bool) {
 	rb, covered, _, ok := qv.collectPredicateRangeBoundsReader(field, preds)
 	if !ok {
 		return rangeBounds{}, overlayRange{}, nil, false
@@ -1960,7 +1960,7 @@ func (qv *queryView) extractOrderRangeCoverageOverlayWithBoundsReader(field stri
 	return rb, ov.rangeForBounds(rb), covered, true
 }
 
-func (qv *queryView) extractOrderRangeCoverageOverlayReader(field string, preds predicateReader, ov fieldOverlay) (overlayRange, *pooled.SliceBuf[bool], bool) {
+func (qv *queryView) extractOrderRangeCoverageOverlayReader(field string, preds predicateReader, ov fieldOverlay) (overlayRange, *pooled.Slice[bool], bool) {
 	_, br, covered, ok := qv.extractOrderRangeCoverageOverlayWithBoundsReader(field, preds, ov)
 	return br, covered, ok
 }
@@ -2601,7 +2601,7 @@ func sortActivePredicates(active []int, preds []predicate) {
 	}
 }
 
-func sortActivePredicatesBufReader(active *pooled.SliceBuf[int], preds predicateReader) {
+func sortActivePredicatesBufReader(active *pooled.Slice[int], preds predicateReader) {
 	if active.Len() <= 1 {
 		return
 	}
@@ -2630,7 +2630,7 @@ func orderedBasicAnchoredMatchesActiveReader(preds predicateReader, active []int
 	return true
 }
 
-func orderedBasicAnchoredMatchesActiveBufReader(preds predicateReader, active *pooled.SliceBuf[int], leadIdx int, leadNeedsCheck bool, idx uint64) bool {
+func orderedBasicAnchoredMatchesActiveBufReader(preds predicateReader, active *pooled.Slice[int], leadIdx int, leadNeedsCheck bool, idx uint64) bool {
 	for i := 0; i < active.Len(); i++ {
 		pi := active.Get(i)
 		if pi == leadIdx && !leadNeedsCheck {
@@ -2658,7 +2658,7 @@ func orderedPredicateChecksMatchReader(preds predicateReader, checks []int, sing
 	return true
 }
 
-func orderedPredicateChecksMatchBufReader(preds predicateReader, checks *pooled.SliceBuf[int], singleCheck int, idx uint64) bool {
+func orderedPredicateChecksMatchBufReader(preds predicateReader, checks *pooled.Slice[int], singleCheck int, idx uint64) bool {
 	if singleCheck >= 0 {
 		p := preds.GetPtr(singleCheck)
 		return p.hasContains() && p.matches(idx)
@@ -2695,7 +2695,7 @@ func orderedBasicAnchoredFilterPostingReader(preds predicateReader, ids posting.
 	return builder.finish(false)
 }
 
-func orderedBasicAnchoredFilterPostingBufReader(preds predicateReader, ids posting.List, checks *pooled.SliceBuf[int], singleCheck int) posting.List {
+func orderedBasicAnchoredFilterPostingBufReader(preds predicateReader, ids posting.List, checks *pooled.Slice[int], singleCheck int) posting.List {
 	if ids.IsEmpty() {
 		return posting.List{}
 	}
@@ -2962,7 +2962,7 @@ func orderedBasicAnchoredEmitPostingBuf(
 	cursor *queryCursor,
 	candidateIDs posting.List,
 	preds predicateReader,
-	deferredChecks *pooled.SliceBuf[int],
+	deferredChecks *pooled.Slice[int],
 	singleDeferred int,
 	ids posting.List,
 	trace *queryTrace,
@@ -3039,7 +3039,7 @@ func buildExactBucketPostingFilterActiveReader(dst, active []int, preds predicat
 	return dst
 }
 
-func buildExactBucketPostingFilterActiveBufReader(dst, active *pooled.SliceBuf[int], preds predicateReader) {
+func buildExactBucketPostingFilterActiveBufReader(dst, active *pooled.Slice[int], preds predicateReader) {
 	dst.Truncate()
 	for i := 0; i < active.Len(); i++ {
 		pi := active.Get(i)
@@ -3511,7 +3511,7 @@ func (qv *queryView) buildPredicatesOrderedWithMode(leaves []qir.Expr, orderFiel
 		routeUniverse = qv.snapshotUniverseCardinality()
 	}
 
-	var mergedRangesBuf *pooled.SliceBuf[orderedMergedScalarRangeField]
+	var mergedRangesBuf *pooled.Slice[orderedMergedScalarRangeField]
 	if len(leaves) > 1 {
 		mergedRangesBuf = orderedMergedScalarRangeFieldSlicePool.Get()
 		mergedRangesBuf.Grow(len(leaves))
@@ -3649,7 +3649,7 @@ func (qv *queryView) buildPredicatesOrderedWithMode(leaves []qir.Expr, orderFiel
 }
 
 func (qv *queryView) buildPredicatesOrderedWithModeBuf(
-	leaves *pooled.SliceBuf[qir.Expr],
+	leaves *pooled.Slice[qir.Expr],
 	orderField string,
 	allowMaterialize bool,
 	orderedWindow int,
@@ -3677,7 +3677,7 @@ func (qv *queryView) buildPredicatesOrderedWithModeBuf(
 	if routeUniverse == 0 && orderedWindow > 0 {
 		routeUniverse = qv.snapshotUniverseCardinality()
 	}
-	var mergedRangesBuf *pooled.SliceBuf[orderedMergedScalarRangeField]
+	var mergedRangesBuf *pooled.Slice[orderedMergedScalarRangeField]
 	if leaves.Len() > 1 {
 		mergedRangesBuf = orderedMergedScalarRangeFieldSlicePool.Get()
 		mergedRangesBuf.Grow(leaves.Len())
@@ -4040,7 +4040,7 @@ func postingListAppendIntersecting(dst, ids posting.List, builder postingUnionBu
 	return builder
 }
 
-func (p baseRangeProbe) appendPostings(dst *pooled.SliceBuf[posting.List]) {
+func (p baseRangeProbe) appendPostings(dst *pooled.Slice[posting.List]) {
 	if dst == nil {
 		return
 	}
@@ -4509,7 +4509,7 @@ func materializeBaseRangeProbeFast(probe baseRangeProbe) posting.List {
 	return out
 }
 
-func isSingletonHeavyPostingBuf(probe *pooled.SliceBuf[posting.List]) bool {
+func isSingletonHeavyPostingBuf(probe *pooled.Slice[posting.List]) bool {
 	probeLen := 0
 	singletons := 0
 	est := uint64(0)
@@ -4535,7 +4535,7 @@ func isSingletonHeavyPostingBuf(probe *pooled.SliceBuf[posting.List]) bool {
 	return shouldUseFastSinglesUnion(probeLen, singletons, est)
 }
 
-func materializePostingBufFast(probe *pooled.SliceBuf[posting.List]) posting.List {
+func materializePostingBufFast(probe *pooled.Slice[posting.List]) posting.List {
 	builder := newPostingUnionBuilder(true)
 	defer builder.release()
 
@@ -4548,7 +4548,7 @@ func materializePostingBufFast(probe *pooled.SliceBuf[posting.List]) posting.Lis
 	return builder.finish(true)
 }
 
-func materializePostingUnionBufOwned(posts *pooled.SliceBuf[posting.List]) posting.List {
+func materializePostingUnionBufOwned(posts *pooled.Slice[posting.List]) posting.List {
 	builder := newPostingUnionBuilder(true)
 	defer builder.release()
 
@@ -4682,7 +4682,7 @@ func chooseOrderedAnchorLeadReader(qv *queryView, orderField string, preds predi
 	return lead, lead >= 0
 }
 
-func chooseOrderedAnchorLeadBufReader(qv *queryView, orderField string, preds predicateReader, active *pooled.SliceBuf[int]) (int, bool) {
+func chooseOrderedAnchorLeadBufReader(qv *queryView, orderField string, preds predicateReader, active *pooled.Slice[int]) (int, bool) {
 	lead := -1
 	bestCard := uint64(0)
 	bestScore := 0.0
@@ -4964,7 +4964,7 @@ func (qv *queryView) execPlanOrderedBasicAnchored(q *qir.Shape, preds predicateR
 	return cursor.out, true
 }
 
-func (qv *queryView) execPlanOrderedBasicAnchoredBuf(q *qir.Shape, preds predicateReader, active *pooled.SliceBuf[int], ov fieldOverlay, br overlayRange, trace *queryTrace) ([]uint64, bool) {
+func (qv *queryView) execPlanOrderedBasicAnchoredBuf(q *qir.Shape, preds predicateReader, active *pooled.Slice[int], ov fieldOverlay, br overlayRange, trace *queryTrace) ([]uint64, bool) {
 	if active.Len() < plannerOrderedAnchorMinActive {
 		return nil, false
 	}
@@ -5460,7 +5460,7 @@ func (qv *queryView) scanOrderedBaseSliceWithPredicatesWithNilTail(q *qir.Shape,
 	return cursor.out
 }
 
-func (qv *queryView) collectOrderRangeBounds(field string, n int, exprAt func(i int) qir.Expr) (rangeBounds, *pooled.SliceBuf[bool], bool, bool) {
+func (qv *queryView) collectOrderRangeBounds(field string, n int, exprAt func(i int) qir.Expr) (rangeBounds, *pooled.Slice[bool], bool, bool) {
 	var rb rangeBounds
 	covered := boolSlicePool.Get()
 	covered.SetLen(n)
@@ -5486,7 +5486,7 @@ func (qv *queryView) collectOrderRangeBounds(field string, n int, exprAt func(i 
 	return rb, covered, has, true
 }
 
-func (qv *queryView) collectPredicateRangeBoundsReader(field string, preds predicateReader) (rangeBounds, *pooled.SliceBuf[bool], bool, bool) {
+func (qv *queryView) collectPredicateRangeBoundsReader(field string, preds predicateReader) (rangeBounds, *pooled.Slice[bool], bool, bool) {
 	var rb rangeBounds
 	covered := boolSlicePool.Get()
 	covered.SetLen(preds.Len())
@@ -5518,7 +5518,7 @@ func (qv *queryView) collectPredicateRangeBoundsReader(field string, preds predi
 	return rb, covered, has, true
 }
 
-func (qv *queryView) collectPredicateRangeBoundsSet(field string, preds predicateSet) (rangeBounds, *pooled.SliceBuf[bool], bool, bool) {
+func (qv *queryView) collectPredicateRangeBoundsSet(field string, preds predicateSet) (rangeBounds, *pooled.Slice[bool], bool, bool) {
 	var rb rangeBounds
 	covered := boolSlicePool.Get()
 	covered.SetLen(preds.Len())

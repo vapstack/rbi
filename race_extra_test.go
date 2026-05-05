@@ -617,7 +617,7 @@ func TestRaceExtra_PinnedSnapshotQueryViewStaysExactAcrossConcurrentPublishes(t 
 	}
 
 	seq := db.getSnapshot().seq
-	snap, ref, ok := db.snapshot.pinRefBySeq(seq)
+	snap, ref, ok := db.engine.snapshot.pinRefBySeq(seq)
 	if !ok || snap == nil {
 		t.Fatal("expected current snapshot to be pinnable")
 	}
@@ -626,7 +626,7 @@ func TestRaceExtra_PinnedSnapshotQueryViewStaysExactAcrossConcurrentPublishes(t 
 		if cleanupDone {
 			return
 		}
-		db.snapshot.unpinRef(seq, ref)
+		db.engine.snapshot.unpinRef(seq, ref)
 	}()
 
 	q := qx.Query(
@@ -730,9 +730,9 @@ func TestRaceExtra_PinnedSnapshotQueryViewStaysExactAcrossConcurrentPublishes(t 
 		t.Fatal(err)
 	}
 
-	db.snapshot.mu.RLock()
-	held := db.snapshot.bySeq[seq]
-	db.snapshot.mu.RUnlock()
+	db.engine.snapshot.mu.RLock()
+	held := db.engine.snapshot.bySeq[seq]
+	db.engine.snapshot.mu.RUnlock()
 	if held != ref || held == nil {
 		t.Fatal("expected old snapshot ref to remain registered while pinned")
 	}
@@ -740,12 +740,12 @@ func TestRaceExtra_PinnedSnapshotQueryViewStaysExactAcrossConcurrentPublishes(t 
 		t.Fatal("expected old snapshot ref to stay pinned across publishes")
 	}
 
-	db.snapshot.unpinRef(seq, ref)
+	db.engine.snapshot.unpinRef(seq, ref)
 	cleanupDone = true
 
-	db.snapshot.mu.RLock()
-	_, stillPresent := db.snapshot.bySeq[seq]
-	db.snapshot.mu.RUnlock()
+	db.engine.snapshot.mu.RLock()
+	_, stillPresent := db.engine.snapshot.bySeq[seq]
+	db.engine.snapshot.mu.RUnlock()
 	if stillPresent {
 		t.Fatal("expected old snapshot ref to be pruned after unpin")
 	}
@@ -776,11 +776,11 @@ func TestRaceExtra_PinnedStringSnapshotScanStaysStableAcrossConcurrentPublishes(
 	})
 
 	old := db.getSnapshot()
-	pinned, ref, ok := db.snapshot.pinRefBySeq(old.seq)
+	pinned, ref, ok := db.engine.snapshot.pinRefBySeq(old.seq)
 	if !ok || pinned != old {
 		t.Fatal("expected current string snapshot to be pinnable")
 	}
-	defer db.snapshot.unpinRef(old.seq, ref)
+	defer db.engine.snapshot.unpinRef(old.seq, ref)
 
 	expected := slices.Clone(keys)
 	checkPinnedScan := func() error {

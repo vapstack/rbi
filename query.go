@@ -18,13 +18,13 @@ func (db *DB[K, V]) Query(q *qx.QX) ([]*V, error) {
 	}
 	defer db.endOp()
 
-	if db.transparent {
+	if db.engine == nil {
 		return nil, ErrNoIndex
 	}
 	if q == nil {
 		return nil, fmt.Errorf("QX is nil")
 	}
-	prepared, err := qir.PrepareQuery(q, db.indexedFieldMap)
+	prepared, err := qir.PrepareQuery(q, db.engine.indexedFieldMap)
 	if err != nil {
 		return nil, err
 	}
@@ -35,7 +35,7 @@ func (db *DB[K, V]) Query(q *qx.QX) ([]*V, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer db.snapshot.unpinRef(seq, ref)
+	defer db.engine.snapshot.unpinRef(seq, ref)
 	defer rollback(tx)
 
 	return db.queryRecords(tx, snap, &viewQ)
@@ -101,24 +101,24 @@ func (db *DB[K, V]) beginQueryTxSnapshot() (*bbolt.Tx, *indexSnapshot, uint64, *
 	// Hold the registry read lock across Begin(false) -> Sequence() -> pin so a
 	// writer cannot publish/retire away the exact snapshot needed by this read tx
 	// in the gap between opening the tx and pinning its sequence-aligned snapshot.
-	db.snapshot.mu.RLock()
+	db.engine.snapshot.mu.RLock()
 	tx, err := db.bolt.Begin(false)
 	if err != nil {
-		db.snapshot.mu.RUnlock()
+		db.engine.snapshot.mu.RUnlock()
 		return nil, nil, 0, nil, fmt.Errorf("tx error: %w", err)
 	}
 
 	bucket := tx.Bucket(db.bucket)
 	if bucket == nil {
-		db.snapshot.mu.RUnlock()
+		db.engine.snapshot.mu.RUnlock()
 		_ = tx.Rollback()
 		return nil, nil, 0, nil, fmt.Errorf("bucket does not exist")
 	}
 
 	seq := bucket.Sequence()
-	ref := db.snapshot.bySeq[seq]
+	ref := db.engine.snapshot.bySeq[seq]
 	if ref == nil || ref.snap == nil {
-		db.snapshot.mu.RUnlock()
+		db.engine.snapshot.mu.RUnlock()
 		_ = tx.Rollback()
 		if err = db.unavailableErr(); err != nil {
 			return nil, nil, 0, nil, err
@@ -127,7 +127,7 @@ func (db *DB[K, V]) beginQueryTxSnapshot() (*bbolt.Tx, *indexSnapshot, uint64, *
 	}
 	ref.refs.Add(1)
 	snap := ref.snap
-	db.snapshot.mu.RUnlock()
+	db.engine.snapshot.mu.RUnlock()
 	return tx, snap, seq, ref, nil
 }
 
@@ -203,20 +203,20 @@ func (db *DB[K, V]) batchGetTxCompactByIdx(tx *bbolt.Tx, snap *indexSnapshot, id
 
 func (db *DB[K, V]) pinCurrentSnapshot() (*indexSnapshot, uint64, *snapshotRef, bool) {
 	for {
-		db.snapshot.mu.RLock()
-		ref := db.snapshot.currentRef.Load()
+		db.engine.snapshot.mu.RLock()
+		ref := db.engine.snapshot.currentRef.Load()
 		if ref == nil {
-			db.snapshot.mu.RUnlock()
+			db.engine.snapshot.mu.RUnlock()
 			return db.buildPublishedSnapshotNoLock(0), 0, nil, false
 		}
 		ref.refs.Add(1)
-		if db.snapshot.currentRef.Load() != ref {
-			db.snapshot.mu.RUnlock()
+		if db.engine.snapshot.currentRef.Load() != ref {
+			db.engine.snapshot.mu.RUnlock()
 			ref.refs.Add(-1)
 			continue
 		}
 		snap := ref.snap
-		db.snapshot.mu.RUnlock()
+		db.engine.snapshot.mu.RUnlock()
 		if snap == nil {
 			ref.refs.Add(-1)
 			continue
@@ -229,7 +229,7 @@ func (db *DB[K, V]) unpinCurrentSnapshot(seq uint64, ref *snapshotRef, pinned bo
 	if !pinned || ref == nil {
 		return
 	}
-	db.snapshot.unpinRef(seq, ref)
+	db.engine.snapshot.unpinRef(seq, ref)
 }
 
 // QueryKeys evaluates the given query against the index and returns all matching ids.
@@ -239,13 +239,13 @@ func (db *DB[K, V]) QueryKeys(q *qx.QX) ([]K, error) {
 	}
 	defer db.endOp()
 
-	if db.transparent {
+	if db.engine == nil {
 		return nil, ErrNoIndex
 	}
 	if q == nil {
 		return nil, fmt.Errorf("QX is nil")
 	}
-	prepared, err := qir.PrepareQuery(q, db.indexedFieldMap)
+	prepared, err := qir.PrepareQuery(q, db.engine.indexedFieldMap)
 	if err != nil {
 		return nil, err
 	}
@@ -313,11 +313,11 @@ func (db *DB[K, V]) makeQueryView(snap *indexSnapshot) *queryView {
 	*view = queryView{
 		engine:            db.engine,
 		snap:              snap,
-		strKey:            db.engine.strKey,
+		strKey:            snap.strmap != nil,
 		strMapView:        snap.strmap,
 		fields:            db.engine.fields,
 		planner:           db.engine.planner,
-		options:           db.engine.options,
+		options:           db.options,
 		lenZeroComplement: snap.lenZeroComplement,
 	}
 	return view

@@ -474,7 +474,7 @@ func TestPlannerCalibration_SampleEveryNormalization(t *testing.T) {
 		CalibrationEnabled:     true,
 		CalibrationSampleEvery: 0,
 	})
-	if got := dbEnabled.planner.calibrator.sampleEvery; got != defaultOptionsCalibrationSampleEvery {
+	if got := dbEnabled.engine.planner.calibrator.sampleEvery; got != defaultOptionsCalibrationSampleEvery {
 		t.Fatalf("expected default calibration sampleEvery=%d, got=%d", defaultOptionsCalibrationSampleEvery, got)
 	}
 
@@ -483,7 +483,7 @@ func TestPlannerCalibration_SampleEveryNormalization(t *testing.T) {
 		CalibrationEnabled:     false,
 		CalibrationSampleEvery: 1,
 	})
-	if got := dbDisabled.planner.calibrator.sampleEvery; got != 0 {
+	if got := dbDisabled.engine.planner.calibrator.sampleEvery; got != 0 {
 		t.Fatalf("expected calibration sampleEvery=0 when disabled, got=%d", got)
 	}
 }
@@ -762,7 +762,7 @@ func TestPlannerCalibration_AutoPersist(t *testing.T) {
 	}
 
 	db, raw := openBoltAndNew[uint64, Rec](t, dbPath, opts)
-	calPath := db.planner.calibrator.persistPath
+	calPath := db.engine.planner.calibrator.persistPath
 
 	if err := db.SetCalibrationSnapshot(CalibrationSnapshot{
 		UpdatedAt: time.Now(),
@@ -811,7 +811,7 @@ func TestPlannerCalibration_AutoPersist_DisabledUsesFrozenState(t *testing.T) {
 	}
 
 	db, raw := openBoltAndNew[uint64, Rec](t, dbPath, opts)
-	calPath := db.planner.calibrator.persistPath
+	calPath := db.engine.planner.calibrator.persistPath
 
 	if err := db.SetCalibrationSnapshot(CalibrationSnapshot{
 		UpdatedAt: time.Now(),
@@ -925,7 +925,7 @@ func makeORBranchForCalibrationDecisionTest(estCard uint64, extraChecks int) pla
 }
 
 func setORPlannerStatsSnapshotForTest(db *DB[uint64, Rec], universe uint64, scoreStats PlannerFieldStats) {
-	db.planner.stats.Store(&plannerStatsSnapshot{
+	db.engine.planner.stats.Store(&plannerStatsSnapshot{
 		Version:             1,
 		UniverseCardinality: universe,
 		Fields: map[string]PlannerFieldStats{

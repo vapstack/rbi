@@ -8,26 +8,6 @@ import (
 	"go.etcd.io/bbolt"
 )
 
-func runBeforeProcessHooks[K ~string | ~uint64, V any](id K, newVal *V, hooks []beforeProcessFunc[K, V]) error {
-	for _, fn := range hooks {
-		if err := fn(id, newVal); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func cloneBeforeStoreValue[K ~string | ~uint64, V any](id K, v *V, cloneFn func(K, *V) *V) (*V, error) {
-	if cloneFn == nil || v == nil {
-		return v, nil
-	}
-	cloned := cloneFn(id, v)
-	if cloned == nil {
-		return nil, fmt.Errorf("clone returned nil")
-	}
-	return cloned, nil
-}
-
 // Get returns the value stored by id or nil if key was not found.
 func (db *DB[K, V]) Get(id K) (*V, error) {
 	if err := db.beginOp(); err != nil {
@@ -54,6 +34,7 @@ func (db *DB[K, V]) Get(id K) (*V, error) {
 	if err != nil {
 		return nil, fmt.Errorf("decode: %w", err)
 	}
+
 	return r, nil
 }
 
@@ -65,6 +46,7 @@ func (db *DB[K, V]) BatchGet(ids ...K) ([]*V, error) {
 		return nil, err
 	}
 	defer db.endOp()
+
 	if len(ids) == 0 {
 		return nil, nil
 	}
@@ -74,6 +56,7 @@ func (db *DB[K, V]) BatchGet(ids ...K) ([]*V, error) {
 		return nil, fmt.Errorf("tx error: %w", err)
 	}
 	defer rollback(tx)
+
 	return db.batchGetTx(tx, ids...)
 }
 
@@ -145,7 +128,7 @@ func (db *DB[K, V]) ScanKeys(seek K, fn func(K) (bool, error)) error {
 	}
 	defer db.endOp()
 
-	if db.transparent {
+	if db.engine == nil {
 		return ErrNoIndex
 	}
 
@@ -174,6 +157,7 @@ func (db *DB[K, V]) ScanKeys(seek K, fn func(K) (bool, error)) error {
 			break
 		}
 	}
+
 	return nil
 }
 
@@ -187,6 +171,7 @@ func (db *DB[K, V]) scanStringKeys(snap *strMapSnapshot, universe posting.List, 
 	card := universe.Cardinality()
 	minIdx, hasMin := universe.Minimum()
 	maxIdx, hasMax := universe.Maximum()
+
 	if card == snap.Next && card > 0 && hasMin && hasMax && minIdx == 1 && maxIdx == snap.Next {
 		if len(snap.readDirs) == 0 {
 			for idx := uint64(1); idx <= snap.Next; idx++ {
@@ -500,12 +485,7 @@ func (db *DB[K, V]) BatchSet(ids []K, newVals []*V, execOpts ...ExecOption[K, V]
 // original (old) and final (new) values before commit. After a successful
 // commit, the in-memory index is updated.
 func (db *DB[K, V]) Patch(id K, patch []Field, execOpts ...ExecOption[K, V]) error {
-	return db.patch(id, patch, execOpts...)
-}
-
-// patch handles patch.
-func (db *DB[K, V]) patch(id K, fields []Field, execOpts ...ExecOption[K, V]) error {
-	if len(fields) == 0 {
+	if len(patch) == 0 {
 		return nil
 	}
 	cfg := db.resolveExecOptions(execOpts)
@@ -515,7 +495,7 @@ func (db *DB[K, V]) patch(id K, fields []Field, execOpts ...ExecOption[K, V]) er
 	}
 	defer db.endOp()
 
-	req := db.buildPatchAutoBatchRequest(id, fields, ignoreUnknown, cfg.beforeProcess, cfg.beforeStore, cfg.beforeCommit)
+	req := db.buildPatchAutoBatchRequest(id, patch, ignoreUnknown, cfg.beforeProcess, cfg.beforeStore, cfg.beforeCommit)
 
 	reqScratch := db.autoBatcher.requestScratchPool.Get()
 	defer db.autoBatcher.requestScratchPool.Put(reqScratch)
@@ -535,10 +515,6 @@ func (db *DB[K, V]) patch(id K, fields []Field, execOpts ...ExecOption[K, V]) er
 // BatchPatch allocates a buffer for each encoded value.
 // Patching a large number of values will consume a proportional amount of memory.
 func (db *DB[K, V]) BatchPatch(ids []K, patch []Field, execOpts ...ExecOption[K, V]) error {
-	return db.batchPatch(ids, patch, execOpts...)
-}
-
-func (db *DB[K, V]) batchPatch(ids []K, patch []Field, execOpts ...ExecOption[K, V]) error {
 	if len(ids) == 0 || len(patch) == 0 {
 		return nil
 	}
@@ -596,6 +572,7 @@ func (db *DB[K, V]) BatchDelete(ids []K, execOpts ...ExecOption[K, V]) error {
 	if len(ids) == 0 {
 		return nil
 	}
+
 	if err := db.beginOp(); err != nil {
 		return err
 	}
@@ -613,4 +590,24 @@ func (db *DB[K, V]) BatchDelete(ids []K, execOpts ...ExecOption[K, V]) error {
 	}
 
 	return db.submitAutoBatchRequests(reqScratch, true)
+}
+
+func runBeforeProcessHooks[K ~string | ~uint64, V any](id K, newVal *V, hooks []beforeProcessFunc[K, V]) error {
+	for _, fn := range hooks {
+		if err := fn(id, newVal); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func cloneBeforeStoreValue[K ~string | ~uint64, V any](id K, v *V, cloneFn func(K, *V) *V) (*V, error) {
+	if cloneFn == nil || v == nil {
+		return v, nil
+	}
+	cloned := cloneFn(id, v)
+	if cloned == nil {
+		return nil, fmt.Errorf("clone returned nil")
+	}
+	return cloned, nil
 }

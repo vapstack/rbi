@@ -112,7 +112,7 @@ func (db *DB[K, V]) Aggregate(q *qx.QX) (Result, error) {
 	}
 	defer db.endOp()
 
-	if db.transparent {
+	if db.engine == nil {
 		return Result{}, ErrNoIndex
 	}
 
@@ -842,7 +842,7 @@ func (qv *queryView) executeGroupedOrdinaryByID(q *aggregateQuery, ids posting.L
 	return Result{Layout: layout, Rows: rows}, nil
 }
 
-func releaseAggregateGroupIDOrdinals(groupByID *pooled.SliceBuf[uint32], ids posting.List) {
+func releaseAggregateGroupIDOrdinals(groupByID *pooled.Slice[uint32], ids posting.List) {
 	it := ids.Iter()
 	for it.HasNext() {
 		id := it.Next()
@@ -860,8 +860,8 @@ func (qv *queryView) buildGroupedOrdinaryIDMap(
 	level int,
 	groupValues []Value,
 	rows *[]Row,
-	states *pooled.SliceBuf[aggregateMetricState],
-	groupByID *pooled.SliceBuf[uint32],
+	states *pooled.Slice[aggregateMetricState],
+	groupByID *pooled.Slice[uint32],
 ) error {
 	if level == len(q.groups) {
 		rowIndex := len(*rows)
@@ -930,8 +930,8 @@ func (qv *queryView) buildGroupedOrdinaryIDMap(
 func (qv *queryView) foldGroupedOrdinaryByID(
 	q *aggregateQuery,
 	rows []Row,
-	states *pooled.SliceBuf[aggregateMetricState],
-	groupByID *pooled.SliceBuf[uint32],
+	states *pooled.Slice[aggregateMetricState],
+	groupByID *pooled.Slice[uint32],
 ) error {
 	for i := range q.metrics {
 		metric := q.metrics[i]
@@ -961,8 +961,8 @@ func hasPriorOrdinaryAggregateMetric(metrics []aggregateMetric, pos int) bool {
 func (qv *queryView) foldGroupedOrdinaryFieldByID(
 	q *aggregateQuery,
 	rows []Row,
-	states *pooled.SliceBuf[aggregateMetricState],
-	groupByID *pooled.SliceBuf[uint32],
+	states *pooled.Slice[aggregateMetricState],
+	groupByID *pooled.Slice[uint32],
 	first int,
 ) error {
 	if len(rows) == 0 {
@@ -1016,12 +1016,12 @@ func (qv *queryView) foldGroupedOrdinaryFieldByID(
 
 func addGroupedOrdinaryBucketValue(
 	q *aggregateQuery,
-	states *pooled.SliceBuf[aggregateMetricState],
+	states *pooled.Slice[aggregateMetricState],
 	first int,
 	field *field,
 	key indexKey,
-	counts *pooled.SliceBuf[uint64],
-	touched *pooled.SliceBuf[int],
+	counts *pooled.Slice[uint64],
+	touched *pooled.Slice[int],
 ) error {
 	var value Value
 	valueReady := false
@@ -1055,7 +1055,7 @@ func addGroupedOrdinaryBucketValue(
 	return nil
 }
 
-func resetAggregateGroupBucketCounts(counts *pooled.SliceBuf[uint64], touched *pooled.SliceBuf[int]) {
+func resetAggregateGroupBucketCounts(counts *pooled.Slice[uint64], touched *pooled.Slice[int]) {
 	for i := 0; i < touched.Len(); i++ {
 		counts.Set(touched.Get(i), 0)
 	}

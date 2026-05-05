@@ -9,7 +9,7 @@ import (
 )
 
 type postsAnyFilterState struct {
-	postsBuf              *pooled.SliceBuf[posting.List]
+	postsBuf              *pooled.Slice[posting.List]
 	ids                   posting.List
 	containsCalls         int
 	containsMaterializeAt int
@@ -55,7 +55,7 @@ func (state *postsAnyFilterState) materialize() posting.List {
 	return state.ids
 }
 
-func postsAnyContainsMaterializeAfterBuf(posts *pooled.SliceBuf[posting.List]) int {
+func postsAnyContainsMaterializeAfterBuf(posts *pooled.Slice[posting.List]) int {
 	termCount := postingBufLen(posts)
 	if termCount <= 1 {
 		return 0
@@ -105,7 +105,7 @@ func postsAnyContainsMaterializeAfterBuf(posts *pooled.SliceBuf[posting.List]) i
 	return int(threshold)
 }
 
-func postsAnyContainsWork(posts *pooled.SliceBuf[posting.List]) (uint64, uint64, uint64, bool) {
+func postsAnyContainsWork(posts *pooled.Slice[posting.List]) (uint64, uint64, uint64, bool) {
 	termCount := postingBufLen(posts)
 	if termCount <= 1 {
 		return 0, 0, 0, false
@@ -254,7 +254,7 @@ func postsAnyDirectBucketFilterMaxCard(termCount int) uint64 {
 	return limit
 }
 
-func postsAnyEstimatedUnionCardinality(posts *pooled.SliceBuf[posting.List]) (uint64, int) {
+func postsAnyEstimatedUnionCardinality(posts *pooled.Slice[posting.List]) (uint64, int) {
 	if posts == nil {
 		return 0, 0
 	}
@@ -270,7 +270,7 @@ func postsAnyEstimatedUnionCardinality(posts *pooled.SliceBuf[posting.List]) (ui
 	return est, singletons
 }
 
-func postsAnyDirectIntersectWork(posts *pooled.SliceBuf[posting.List], dstCard uint64) uint64 {
+func postsAnyDirectIntersectWork(posts *pooled.Slice[posting.List], dstCard uint64) uint64 {
 	if posts == nil || dstCard == 0 {
 		return 0
 	}
@@ -505,7 +505,7 @@ func (state *postsAnyFilterState) apply(dst posting.List) (posting.List, bool) {
 	return dst.BuildAnd(union), true
 }
 
-func postingBufLen(buf *pooled.SliceBuf[posting.List]) int {
+func postingBufLen(buf *pooled.Slice[posting.List]) int {
 	if buf == nil {
 		return 0
 	}
@@ -569,7 +569,7 @@ type overlayRangePredicateState struct {
 	postingFilterCalls    int
 	rangeMaterialized     bool
 	probeMaterialized     bool
-	linearPostsBuf        *pooled.SliceBuf[posting.List]
+	linearPostsBuf        *pooled.Slice[posting.List]
 	rangeIDs              posting.List
 	probeIDs              posting.List
 }
@@ -642,7 +642,7 @@ func (state *overlayRangePredicateState) materializeRange() posting.List {
 	return state.rangeIDs
 }
 
-func (state *overlayRangePredicateState) ensureLinearPosts() *pooled.SliceBuf[posting.List] {
+func (state *overlayRangePredicateState) ensureLinearPosts() *pooled.Slice[posting.List] {
 	if state == nil {
 		return nil
 	}
@@ -862,7 +862,7 @@ type baseRangePredicateState struct {
 	postingFilterCalls int
 	hasSet             bool
 	set                u64set
-	linearPostsBuf     *pooled.SliceBuf[posting.List]
+	linearPostsBuf     *pooled.Slice[posting.List]
 	ids                posting.List
 }
 
@@ -965,7 +965,7 @@ func materializePostingUnionBaseRange(probe baseRangeProbe) posting.List {
 	return out
 }
 
-func (state *baseRangePredicateState) ensureLinearPosts() *pooled.SliceBuf[posting.List] {
+func (state *baseRangePredicateState) ensureLinearPosts() *pooled.Slice[posting.List] {
 	if state == nil {
 		return nil
 	}

@@ -1507,7 +1507,7 @@ func TestCount_ORByPredicates_HybridTraceEmitsUseOriginalBranchIndex(t *testing.
 }
 
 func TestCountORBranches_ShouldUseSeenDedup_Adaptive(t *testing.T) {
-	newBranchesBuf := func(ests ...uint64) *pooled.SliceBuf[countORBranch] {
+	newBranchesBuf := func(ests ...uint64) *pooled.Slice[countORBranch] {
 		buf := countORBranchSlicePool.Get()
 		buf.Grow(len(ests))
 		for _, est := range ests {
@@ -1552,7 +1552,7 @@ func TestCountORDedupThresholds_Adaptive(t *testing.T) {
 }
 
 func TestCountORSeenStrategy_Adaptive(t *testing.T) {
-	newBranchesBuf := func(ests ...uint64) *pooled.SliceBuf[countORBranch] {
+	newBranchesBuf := func(ests ...uint64) *pooled.Slice[countORBranch] {
 		buf := countORBranchSlicePool.Get()
 		buf.Grow(len(ests))
 		for _, est := range ests {
@@ -1627,7 +1627,7 @@ func TestCountORPredicateBranchLimit_Adaptive(t *testing.T) {
 }
 
 func TestCountPredicateMaterializationThresholds_Adaptive(t *testing.T) {
-	newPostsBuf := func(n int) *pooled.SliceBuf[posting.List] {
+	newPostsBuf := func(n int) *pooled.Slice[posting.List] {
 		buf := postingSlicePool.Get()
 		buf.SetLen(n)
 		return buf
@@ -2213,12 +2213,12 @@ func TestCount_PreparePredicate_BroadRangeComplementCacheInvalidatedByNilFieldWr
 			releasePredicates([]predicate{p})
 			t.Fatalf("expected cached complement postingResult before nil insert")
 		}
-		heldSnap, heldRef, ok := db.snapshot.pinRefBySeq(prevSnap.seq)
+		heldSnap, heldRef, ok := db.engine.snapshot.pinRefBySeq(prevSnap.seq)
 		if !ok || heldSnap != prevSnap || heldRef == nil {
 			releasePredicates([]predicate{p})
 			t.Fatalf("pinSnapshotRefBySeq(seq=%d) failed", prevSnap.seq)
 		}
-		defer db.snapshot.unpinRef(prevSnap.seq, heldRef)
+		defer db.engine.snapshot.unpinRef(prevSnap.seq, heldRef)
 		releasePredicates([]predicate{p})
 
 		if err := db.Set(90_001, &Rec{
@@ -2265,12 +2265,12 @@ func TestCount_PreparePredicate_BroadRangeComplementCacheInvalidatedByNilFieldWr
 			releasePredicates([]predicate{p})
 			t.Fatalf("expected cached complement postingResult before nil delete")
 		}
-		heldSnap, heldRef, ok := db.snapshot.pinRefBySeq(prevSnap.seq)
+		heldSnap, heldRef, ok := db.engine.snapshot.pinRefBySeq(prevSnap.seq)
 		if !ok || heldSnap != prevSnap || heldRef == nil {
 			releasePredicates([]predicate{p})
 			t.Fatalf("pinSnapshotRefBySeq(seq=%d) failed", prevSnap.seq)
 		}
-		defer db.snapshot.unpinRef(prevSnap.seq, heldRef)
+		defer db.engine.snapshot.unpinRef(prevSnap.seq, heldRef)
 		releasePredicates([]predicate{p})
 
 		nilID := uint64(80_000)

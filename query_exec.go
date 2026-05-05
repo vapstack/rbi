@@ -214,7 +214,7 @@ func orderPredicatesEmitCandidateReader(
 func orderPredicatesEmitCandidateBufReader(
 	cursor *queryCursor,
 	preds predicateReader,
-	checks *pooled.SliceBuf[int],
+	checks *pooled.Slice[int],
 	trace *queryTrace,
 	idx uint64,
 	examined *uint64,
@@ -308,7 +308,7 @@ func orderPredicatesTryBucketPostingReader(
 func orderPredicatesTryBucketPostingBufReader(
 	cursor *queryCursor,
 	preds predicateReader,
-	exactActive *pooled.SliceBuf[int],
+	exactActive *pooled.Slice[int],
 	exactOnly bool,
 	ids posting.List,
 	exactWork posting.List,
@@ -424,9 +424,9 @@ func orderPredicatesEmitPostingReader(
 func orderPredicatesEmitPostingBufReader(
 	cursor *queryCursor,
 	preds predicateReader,
-	active *pooled.SliceBuf[int],
-	exactActive *pooled.SliceBuf[int],
-	residualActive *pooled.SliceBuf[int],
+	active *pooled.Slice[int],
+	exactActive *pooled.Slice[int],
+	residualActive *pooled.Slice[int],
 	exactOnly bool,
 	ids posting.List,
 	exactWork posting.List,
@@ -490,7 +490,7 @@ func orderPredicatesEmitPostingBufReader(
 	return false, exactWork
 }
 
-func releaseOrderBasicResidualState(preds predicateSet, activeBuf *pooled.SliceBuf[int]) {
+func releaseOrderBasicResidualState(preds predicateSet, activeBuf *pooled.Slice[int]) {
 	if activeBuf != nil {
 		predicateCheckSlicePool.Put(activeBuf)
 	}
@@ -582,7 +582,7 @@ func emitOrderPrefixPostingByBase(
 	return false
 }
 
-func predicatesMatchActiveBufReader(preds predicateReader, active *pooled.SliceBuf[int], idx uint64) bool {
+func predicatesMatchActiveBufReader(preds predicateReader, active *pooled.Slice[int], idx uint64) bool {
 	switch active.Len() {
 	case 0:
 		return true
@@ -616,7 +616,7 @@ func orderBasicResidualMatchesReader(preds predicateReader, active []int, idx ui
 	return predicatesMatchActiveReader(preds, active, idx)
 }
 
-func orderBasicResidualMatchesBufReader(preds predicateReader, active *pooled.SliceBuf[int], idx uint64) bool {
+func orderBasicResidualMatchesBufReader(preds predicateReader, active *pooled.Slice[int], idx uint64) bool {
 	if active == nil || active.Len() == 0 {
 		return true
 	}
@@ -637,7 +637,7 @@ func orderBasicContainsReader(preds predicateReader, active []int, baseBM postin
 	return orderBasicResidualMatchesReader(preds, active, idx)
 }
 
-func orderBasicContainsBufReader(preds predicateReader, active *pooled.SliceBuf[int], baseBM posting.List, baseNeg bool, baseNegUniverse bool, idx uint64) bool {
+func orderBasicContainsBufReader(preds predicateReader, active *pooled.Slice[int], baseBM posting.List, baseNeg bool, baseNegUniverse bool, idx uint64) bool {
 	if baseNeg {
 		if baseNegUniverse {
 			return orderBasicResidualMatchesBufReader(preds, active, idx)
@@ -720,7 +720,7 @@ func orderBasicEmitFilteredPostingReader(
 func orderBasicEmitFilteredPostingBufReader(
 	cursor *queryCursor,
 	preds predicateReader,
-	active *pooled.SliceBuf[int],
+	active *pooled.Slice[int],
 	baseBM posting.List,
 	baseNeg bool,
 	baseNegUniverse bool,
@@ -895,7 +895,7 @@ func (qv *queryView) runOrderBasicBaseQueryBuf(
 	nilTailField string,
 	base postingResult,
 	residualPreds predicateReader,
-	residualActive *pooled.SliceBuf[int],
+	residualActive *pooled.Slice[int],
 	trace *queryTrace,
 ) ([]uint64, bool, error) {
 	defer base.release()
@@ -1437,7 +1437,7 @@ func (qv *queryView) shouldCollapseOrderBasicNumericRange(field string, fieldOrd
 	return positiveWork <= complementWork
 }
 
-func (qv *queryView) prepareOrderBasicBaseCores(baseOps []qir.Expr) (*pooled.SliceBuf[orderBasicBaseCore], *pooled.SliceBuf[int], bool, error) {
+func (qv *queryView) prepareOrderBasicBaseCores(baseOps []qir.Expr) (*pooled.Slice[orderBasicBaseCore], *pooled.Slice[int], bool, error) {
 	if len(baseOps) == 0 {
 		return nil, nil, false, nil
 	}
@@ -1523,7 +1523,7 @@ func (qv *queryView) prepareOrderBasicBaseCores(baseOps []qir.Expr) (*pooled.Sli
 	return coresBuf, rawCoreIdxBuf, false, nil
 }
 
-func (qv *queryView) prepareOrderBasicBaseCoresBuf(baseOps *pooled.SliceBuf[qir.Expr]) (*pooled.SliceBuf[orderBasicBaseCore], *pooled.SliceBuf[int], bool, error) {
+func (qv *queryView) prepareOrderBasicBaseCoresBuf(baseOps *pooled.Slice[qir.Expr]) (*pooled.Slice[orderBasicBaseCore], *pooled.Slice[int], bool, error) {
 	if baseOps == nil || baseOps.Len() == 0 {
 		return nil, nil, false, nil
 	}
@@ -1693,7 +1693,7 @@ func (qv *queryView) promoteObservedOrderBasicBaseCore(core orderBasicBaseCore) 
 	}
 }
 
-func (qv *queryView) hasWarmOrderBasicBaseCores(cores *pooled.SliceBuf[orderBasicBaseCore]) bool {
+func (qv *queryView) hasWarmOrderBasicBaseCores(cores *pooled.Slice[orderBasicBaseCore]) bool {
 	if cores == nil {
 		return false
 	}
@@ -1779,7 +1779,7 @@ func (qv *queryView) materializeOrderBasicLimitComplementBaseOp(op qir.Expr, cac
 	return true
 }
 
-func (qv *queryView) materializeOrderMaterializedBaseOpsBuf(orderField string, baseOps *pooled.SliceBuf[qir.Expr]) {
+func (qv *queryView) materializeOrderMaterializedBaseOpsBuf(orderField string, baseOps *pooled.Slice[qir.Expr]) {
 	if qv.snap == nil || qv.snap.materializedPredCacheLimit() <= 0 || baseOps == nil || baseOps.Len() == 0 {
 		return
 	}
@@ -1896,7 +1896,7 @@ func (qv *queryView) promoteOrderBasicLimitMaterializedBaseOps(orderField string
 	}
 }
 
-func (qv *queryView) promoteObservedLimitLeafPreds(orderField string, preds *pooled.SliceBuf[leafPred], observedRows uint64, needWindow uint64) {
+func (qv *queryView) promoteObservedLimitLeafPreds(orderField string, preds *pooled.Slice[leafPred], observedRows uint64, needWindow uint64) {
 	if qv.snap == nil || preds == nil || preds.Len() == 0 || observedRows == 0 {
 		return
 	}
@@ -2203,14 +2203,14 @@ func (qv *queryView) tryQueryOrderBasicWithLimit(q *qir.Shape, trace *queryTrace
 
 	var base postingResult
 	var residualPredSet predicateSet
-	var residualActiveBuf *pooled.SliceBuf[int]
+	var residualActiveBuf *pooled.Slice[int]
 	var residualActive []int
 
 	if hasWarmBaseOps {
 		residualOpsBuf := exprSlicePool.Get()
 		residualOpsBuf.Grow(len(baseOps))
 		defer exprSlicePool.Put(residualOpsBuf)
-		var loadedCoreBuf *pooled.SliceBuf[bool]
+		var loadedCoreBuf *pooled.Slice[bool]
 		if baseCoresBuf != nil && baseCoresBuf.Len() > 0 {
 			loadedCoreBuf = boolSlicePool.Get()
 			loadedCoreBuf.SetLen(baseCoresBuf.Len())

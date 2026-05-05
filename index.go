@@ -445,9 +445,9 @@ type buildIndexRunHeap struct {
 }
 
 type buildIndexFieldRun struct {
-	stringBuf *pooled.SliceBuf[string]
-	u64Buf    *pooled.SliceBuf[uint64]
-	postBuf   *pooled.SliceBuf[posting.List]
+	stringBuf *pooled.Slice[string]
+	u64Buf    *pooled.Slice[uint64]
+	postBuf   *pooled.Slice[posting.List]
 }
 
 func buildIndexRunTargetEntries() int {
@@ -939,8 +939,8 @@ func (db *DB[K, V]) buildIndex(skipFields map[string]struct{}, skipMeasureFields
 		numeric bool
 	}
 
-	active := make([]buildField, 0, len(db.indexedFieldAccess))
-	for _, acc := range db.indexedFieldAccess {
+	active := make([]buildField, 0, len(db.engine.indexedFieldAccess))
+	for _, acc := range db.engine.indexedFieldAccess {
 		if _, skip := skipFields[acc.name]; skip {
 			continue
 		}
@@ -950,8 +950,8 @@ func (db *DB[K, V]) buildIndex(skipFields map[string]struct{}, skipMeasureFields
 			numeric: acc.field.KeyKind == fieldWriteKeysOrderedU64,
 		})
 	}
-	activeMeasures := make([]measureFieldAccessor, 0, len(db.measureFieldAccess))
-	for _, acc := range db.measureFieldAccess {
+	activeMeasures := make([]measureFieldAccessor, 0, len(db.engine.measureFieldAccess))
+	for _, acc := range db.engine.measureFieldAccess {
 		if _, skip := skipMeasureFields[acc.name]; skip {
 			continue
 		}
@@ -961,10 +961,10 @@ func (db *DB[K, V]) buildIndex(skipFields map[string]struct{}, skipMeasureFields
 	fcnt := len(active)
 	mcnt := len(activeMeasures)
 	if fcnt <= 0 && mcnt <= 0 {
-		if !db.lenIndexLoaded {
+		if !db.engine.lenIndexLoaded {
 			db.buildLenIndex()
 		}
-		db.lenIndexLoaded = false
+		db.engine.lenIndexLoaded = false
 		return nil
 	}
 
@@ -988,8 +988,9 @@ func (db *DB[K, V]) buildIndex(skipFields map[string]struct{}, skipMeasureFields
 	workerErrs := make([]error, workers)
 
 	localUniverse := make([]posting.List, workers)
-	localMeasureStates := make([][]*pooled.SliceBuf[measureEntry], workers)
+	localMeasureStates := make([][]*pooled.Slice[measureEntry], workers)
 	buildOK := false
+
 	defer cleanupBuildIndexFailure(&buildOK, fieldStates, localUniverse)
 	defer cleanupBuildMeasureStates(&buildOK, localMeasureStates)
 
@@ -1011,7 +1012,7 @@ func (db *DB[K, V]) buildIndex(skipFields map[string]struct{}, skipMeasureFields
 				localStates[i] = newBuildIndexFieldLocalState(active[i].numeric, active[i].slice)
 			}
 			defer releaseBuildIndexLocalStates(localStates)
-			localMeasures := make([]*pooled.SliceBuf[measureEntry], len(db.measureFieldAccess))
+			localMeasures := make([]*pooled.Slice[measureEntry], len(db.engine.measureFieldAccess))
 			measureOK := false
 			defer func() {
 				if !measureOK {
@@ -1147,82 +1148,82 @@ func (db *DB[K, V]) buildIndex(skipFields map[string]struct{}, skipMeasureFields
 		}
 	}
 
-	slotCount := len(db.indexedFieldAccess)
-	if db.index == nil || db.index.Len() != slotCount {
-		releaseFieldIndexStorageSlotsOwned(db.index)
-		db.index = fieldIndexStorageSlicePool.Get()
-		db.index.SetLen(slotCount)
+	slotCount := len(db.engine.indexedFieldAccess)
+	if db.engine.index == nil || db.engine.index.Len() != slotCount {
+		releaseFieldIndexStorageSlotsOwned(db.engine.index)
+		db.engine.index = fieldIndexStorageSlicePool.Get()
+		db.engine.index.SetLen(slotCount)
 	}
-	if db.nilIndex == nil || db.nilIndex.Len() != slotCount {
-		releaseFieldIndexStorageSlotsOwned(db.nilIndex)
-		db.nilIndex = fieldIndexStorageSlicePool.Get()
-		db.nilIndex.SetLen(slotCount)
+	if db.engine.nilIndex == nil || db.engine.nilIndex.Len() != slotCount {
+		releaseFieldIndexStorageSlotsOwned(db.engine.nilIndex)
+		db.engine.nilIndex = fieldIndexStorageSlicePool.Get()
+		db.engine.nilIndex.SetLen(slotCount)
 	}
-	if db.lenIndex == nil || db.lenIndex.Len() != slotCount {
-		releaseFieldIndexStorageSlotsOwned(db.lenIndex)
-		db.lenIndex = fieldIndexStorageSlicePool.Get()
-		db.lenIndex.SetLen(slotCount)
+	if db.engine.lenIndex == nil || db.engine.lenIndex.Len() != slotCount {
+		releaseFieldIndexStorageSlotsOwned(db.engine.lenIndex)
+		db.engine.lenIndex = fieldIndexStorageSlicePool.Get()
+		db.engine.lenIndex.SetLen(slotCount)
 	}
-	if db.lenZeroComplement == nil || db.lenZeroComplement.Len() != slotCount {
-		if db.lenZeroComplement != nil {
-			fieldIndexBoolSlicePool.Put(db.lenZeroComplement)
+	if db.engine.lenZeroComplement == nil || db.engine.lenZeroComplement.Len() != slotCount {
+		if db.engine.lenZeroComplement != nil {
+			fieldIndexBoolSlicePool.Put(db.engine.lenZeroComplement)
 		}
-		db.lenZeroComplement = fieldIndexBoolSlicePool.Get()
-		db.lenZeroComplement.SetLen(slotCount)
+		db.engine.lenZeroComplement = fieldIndexBoolSlicePool.Get()
+		db.engine.lenZeroComplement.SetLen(slotCount)
 	} else if len(skipFields) == 0 {
-		db.lenZeroComplement.Clear()
+		db.engine.lenZeroComplement.Clear()
 	} else {
 		for i := range active {
-			db.lenZeroComplement.Set(active[i].acc.ordinal, false)
+			db.engine.lenZeroComplement.Set(active[i].acc.ordinal, false)
 		}
 	}
-	if db.measure == nil || db.measure.Len() != len(db.measureFieldAccess) {
-		releaseMeasureFieldStorageSlotsOwned(db.measure)
-		db.measure = measureFieldStorageSlicePool.Get()
-		db.measure.SetLen(len(db.measureFieldAccess))
+	if db.engine.measure == nil || db.engine.measure.Len() != len(db.engine.measureFieldAccess) {
+		releaseMeasureFieldStorageSlotsOwned(db.engine.measure)
+		db.engine.measure = measureFieldStorageSlicePool.Get()
+		db.engine.measure.SetLen(len(db.engine.measureFieldAccess))
 	}
 
-	db.universe = posting.List{}
+	db.engine.universe = posting.List{}
 	for i := range localUniverse {
 		if localUniverse[i].IsEmpty() {
 			continue
 		}
-		db.universe = db.universe.BuildMergedOwned(localUniverse[i])
+		db.engine.universe = db.engine.universe.BuildMergedOwned(localUniverse[i])
 	}
 
 	for i := range fieldStates {
 		ordinal := active[i].acc.ordinal
-		oldIndexStorage := db.index.Get(ordinal)
+		oldIndexStorage := db.engine.index.Get(ordinal)
 		if storage := fieldStates[i].materializeStorage(); storage.keyCount() > 0 {
 			releaseFieldIndexStorageOwned(oldIndexStorage)
-			db.index.Set(ordinal, storage)
+			db.engine.index.Set(ordinal, storage)
 		} else {
 			releaseFieldIndexStorageOwned(oldIndexStorage)
-			db.index.Set(ordinal, fieldIndexStorage{})
+			db.engine.index.Set(ordinal, fieldIndexStorage{})
 		}
-		oldNilStorage := db.nilIndex.Get(ordinal)
+		oldNilStorage := db.engine.nilIndex.Get(ordinal)
 		if storage := fieldStates[i].materializeNilStorage(); storage.keyCount() > 0 {
 			releaseFieldIndexStorageOwned(oldNilStorage)
-			db.nilIndex.Set(ordinal, storage)
+			db.engine.nilIndex.Set(ordinal, storage)
 		} else {
 			releaseFieldIndexStorageOwned(oldNilStorage)
-			db.nilIndex.Set(ordinal, fieldIndexStorage{})
+			db.engine.nilIndex.Set(ordinal, fieldIndexStorage{})
 		}
-		oldLenStorage := db.lenIndex.Get(ordinal)
-		if storage, useZeroComplement := fieldStates[i].materializeLenStorage(db.universe); active[i].slice {
+		oldLenStorage := db.engine.lenIndex.Get(ordinal)
+		if storage, useZeroComplement := fieldStates[i].materializeLenStorage(db.engine.universe); active[i].slice {
 			if storage.keyCount() > 0 {
 				releaseFieldIndexStorageOwned(oldLenStorage)
-				db.lenIndex.Set(ordinal, storage)
+				db.engine.lenIndex.Set(ordinal, storage)
 			} else {
 				releaseFieldIndexStorageOwned(oldLenStorage)
-				db.lenIndex.Set(ordinal, fieldIndexStorage{})
+				db.engine.lenIndex.Set(ordinal, fieldIndexStorage{})
 			}
 			if useZeroComplement {
-				db.lenZeroComplement.Set(ordinal, true)
+				db.engine.lenZeroComplement.Set(ordinal, true)
 			}
 		}
 	}
-	var oldMeasureStorages *pooled.SliceBuf[measureFieldStorage]
+	var oldMeasureStorages *pooled.Slice[measureFieldStorage]
 	if len(activeMeasures) > 0 {
 		oldMeasureStorages = measureFieldStorageSlicePool.Get()
 		for _, acc := range activeMeasures {
@@ -1242,28 +1243,28 @@ func (db *DB[K, V]) buildIndex(skipFields map[string]struct{}, skipMeasureFields
 				measureEntrySlicePool.Put(buf)
 				localMeasureStates[worker][i] = nil
 			}
-			oldStorage := db.measure.Get(i)
+			oldStorage := db.engine.measure.Get(i)
 			storage := newMeasureStorageFromEntriesOwned(entries)
 			oldMeasureStorages.Append(oldStorage)
-			db.measure.Set(i, storage)
+			db.engine.measure.Set(i, storage)
 		}
 	}
 
-	recordCount := db.universe.Cardinality()
+	recordCount := db.engine.universe.Cardinality()
 
 	db.stats.BuildTime = time.Since(start)
 	db.stats.BuildRPS = int(float64(recordCount) / max(time.Since(start).Seconds(), 1))
 
-	for name, f := range db.indexFields {
+	for name, f := range db.engine.fields {
 		if f.Slice {
-			acc, ok := db.indexedFieldMap[name]
-			if !ok || db.lenIndex.Get(acc.ordinal).keyCount() == 0 {
+			acc, ok := db.engine.indexedFieldMap[name]
+			if !ok || db.engine.lenIndex.Get(acc.ordinal).keyCount() == 0 {
 				db.buildLenIndex()
 				break
 			}
 		}
 	}
-	db.lenIndexLoaded = false
+	db.engine.lenIndexLoaded = false
 	err = db.publishCurrentSequenceSnapshotNoLock()
 	if oldMeasureStorages != nil {
 		for i := 0; i < oldMeasureStorages.Len(); i++ {
@@ -1353,11 +1354,11 @@ func (s buildFieldWriteSink) addFixed(key uint64) {
 }
 
 func (db *DB[K, V]) validateIndexedStringValues(val *V) error {
-	if val == nil {
+	if db.engine == nil || val == nil {
 		return nil
 	}
 	ptr := unsafe.Pointer(val)
-	for _, acc := range db.indexedStringValidationAccess {
+	for _, acc := range db.engine.indexedStringValidationAccess {
 		var fieldErr error
 		acc.writeBuild(ptr, buildFieldWriteSink{
 			field: acc.name,
@@ -1385,23 +1386,23 @@ func (db *DB[K, V]) idxFromKeyNoLock(key []byte) uint64 {
 }
 
 func (db *DB[K, V]) buildLenIndex() {
-	releaseFieldIndexStorageSlotsOwned(db.lenIndex)
-	db.lenIndex = fieldIndexStorageSlicePool.Get()
-	db.lenIndex.SetLen(len(db.indexedFieldAccess))
-	if db.lenZeroComplement != nil {
-		fieldIndexBoolSlicePool.Put(db.lenZeroComplement)
+	releaseFieldIndexStorageSlotsOwned(db.engine.lenIndex)
+	db.engine.lenIndex = fieldIndexStorageSlicePool.Get()
+	db.engine.lenIndex.SetLen(len(db.engine.indexedFieldAccess))
+	if db.engine.lenZeroComplement != nil {
+		fieldIndexBoolSlicePool.Put(db.engine.lenZeroComplement)
 	}
-	db.lenZeroComplement = fieldIndexBoolSlicePool.Get()
-	db.lenZeroComplement.SetLen(len(db.indexedFieldAccess))
+	db.engine.lenZeroComplement = fieldIndexBoolSlicePool.Get()
+	db.engine.lenZeroComplement.SetLen(len(db.engine.indexedFieldAccess))
 
-	for _, acc := range db.indexedFieldAccess {
+	for _, acc := range db.engine.indexedFieldAccess {
 		if !acc.field.Slice {
 			continue
 		}
-		result, useZeroComplement := rebuildLenIndexField(db.universe, newFieldOverlayStorage(db.index.Get(acc.ordinal)))
-		db.lenIndex.Set(acc.ordinal, newFlatFieldIndexStorage(result))
+		result, useZeroComplement := rebuildLenIndexField(db.engine.universe, newFieldOverlayStorage(db.engine.index.Get(acc.ordinal)))
+		db.engine.lenIndex.Set(acc.ordinal, newFlatFieldIndexStorage(result))
 		if useZeroComplement {
-			db.lenZeroComplement.Set(acc.ordinal, true)
+			db.engine.lenZeroComplement.Set(acc.ordinal, true)
 		}
 	}
 }
@@ -1410,13 +1411,13 @@ func (db *DB[K, V]) isLenZeroComplementField(field string) bool {
 	if field == "" {
 		return false
 	}
-	acc, ok := db.indexedFieldMap[field]
-	if !ok || db.lenZeroComplement == nil || acc.ordinal >= db.lenZeroComplement.Len() {
+	acc, ok := db.engine.indexedFieldMap[field]
+	if !ok || db.engine.lenZeroComplement == nil || acc.ordinal >= db.engine.lenZeroComplement.Len() {
 		return false
 	}
 	db.mu.RLock()
 	defer db.mu.RUnlock()
-	return db.lenZeroComplement.Get(acc.ordinal)
+	return db.engine.lenZeroComplement.Get(acc.ordinal)
 }
 
 const (
@@ -1476,7 +1477,7 @@ func (db *DB[K, V]) loadIndex() (
 		return nil, nil, nil, diag.wrap("load_v26", fmt.Errorf("error loading index: %w", err))
 	}
 
-	db.lenIndexLoaded = lenLoaded
+	db.engine.lenIndexLoaded = lenLoaded
 	db.stats.LoadTime = time.Since(start)
 	if err = db.publishCurrentSequenceSnapshotNoLock(); err != nil {
 		return nil, nil, nil, diag.wrap("publish_snapshot", fmt.Errorf("publish snapshot: %w", err))
@@ -1524,11 +1525,11 @@ func (db *DB[K, V]) loadIndexPayload(
 		return nil, nil, nil, false, err
 	}
 
-	compatible, err := readFieldCompatibility(reader, db.indexFields)
+	compatible, err := readFieldCompatibility(reader, db.engine.fields)
 	if err != nil {
 		return nil, nil, nil, false, err
 	}
-	measureCompatible, err := readFieldCompatibility(reader, db.measureFields)
+	measureCompatible, err := readFieldCompatibility(reader, db.engine.measureFields)
 	if err != nil {
 		return nil, nil, nil, false, err
 	}
@@ -1558,16 +1559,16 @@ func (db *DB[K, V]) loadIndexPayload(
 		return nil, nil, nil, false, fmt.Errorf("decode: reading planner stats: %w", err)
 	}
 
-	skipFields := make(map[string]struct{}, len(db.indexFields))
-	for name := range db.indexFields {
+	skipFields := make(map[string]struct{}, len(db.engine.fields))
+	for name := range db.engine.fields {
 		_, hasRegular := indexes[name]
 		_, hasNil := nilIndexes[name]
 		if compatible[name] && (hasRegular || hasNil) {
 			skipFields[name] = struct{}{}
 		}
 	}
-	skipMeasureFields := make(map[string]struct{}, len(db.measureFields))
-	for name := range db.measureFields {
+	skipMeasureFields := make(map[string]struct{}, len(db.engine.measureFields))
+	for name := range db.engine.measureFields {
 		if measureCompatible[name] {
 			if _, hasMeasure := measureIndexes[name]; hasMeasure {
 				skipMeasureFields[name] = struct{}{}
@@ -1575,40 +1576,42 @@ func (db *DB[K, V]) loadIndexPayload(
 		}
 	}
 
-	db.universe = universe
-	db.strMap = strmap
-	releaseFieldIndexStorageSlotsOwned(db.index)
-	releaseFieldIndexStorageSlotsOwned(db.nilIndex)
-	releaseFieldIndexStorageSlotsOwned(db.lenIndex)
-	releaseMeasureFieldStorageSlotsOwned(db.measure)
-	if db.lenZeroComplement != nil {
-		fieldIndexBoolSlicePool.Put(db.lenZeroComplement)
+	db.engine.universe = universe
+	if db.strKey {
+		db.strMap = strmap
 	}
-	db.index = fieldIndexStorageSlicePool.Get()
-	db.index.SetLen(len(db.indexedFieldAccess))
-	db.nilIndex = fieldIndexStorageSlicePool.Get()
-	db.nilIndex.SetLen(len(db.indexedFieldAccess))
-	db.lenIndex = fieldIndexStorageSlicePool.Get()
-	db.lenIndex.SetLen(len(db.indexedFieldAccess))
-	db.measure = measureFieldStorageSlicePool.Get()
-	db.measure.SetLen(len(db.measureFieldAccess))
-	for _, acc := range db.indexedFieldAccess {
+	releaseFieldIndexStorageSlotsOwned(db.engine.index)
+	releaseFieldIndexStorageSlotsOwned(db.engine.nilIndex)
+	releaseFieldIndexStorageSlotsOwned(db.engine.lenIndex)
+	releaseMeasureFieldStorageSlotsOwned(db.engine.measure)
+	if db.engine.lenZeroComplement != nil {
+		fieldIndexBoolSlicePool.Put(db.engine.lenZeroComplement)
+	}
+	db.engine.index = fieldIndexStorageSlicePool.Get()
+	db.engine.index.SetLen(len(db.engine.indexedFieldAccess))
+	db.engine.nilIndex = fieldIndexStorageSlicePool.Get()
+	db.engine.nilIndex.SetLen(len(db.engine.indexedFieldAccess))
+	db.engine.lenIndex = fieldIndexStorageSlicePool.Get()
+	db.engine.lenIndex.SetLen(len(db.engine.indexedFieldAccess))
+	db.engine.measure = measureFieldStorageSlicePool.Get()
+	db.engine.measure.SetLen(len(db.engine.measureFieldAccess))
+	for _, acc := range db.engine.indexedFieldAccess {
 		if storage, ok := indexes[acc.name]; ok {
-			db.index.Set(acc.ordinal, storage)
+			db.engine.index.Set(acc.ordinal, storage)
 			delete(indexes, acc.name)
 		}
 		if storage, ok := nilIndexes[acc.name]; ok {
-			db.nilIndex.Set(acc.ordinal, storage)
+			db.engine.nilIndex.Set(acc.ordinal, storage)
 			delete(nilIndexes, acc.name)
 		}
 		if storage, ok := lenIndexes[acc.name]; ok {
-			db.lenIndex.Set(acc.ordinal, storage)
+			db.engine.lenIndex.Set(acc.ordinal, storage)
 			delete(lenIndexes, acc.name)
 		}
 	}
-	for _, acc := range db.measureFieldAccess {
+	for _, acc := range db.engine.measureFieldAccess {
 		if storage, ok := measureIndexes[acc.name]; ok {
-			db.measure.Set(acc.ordinal, storage)
+			db.engine.measure.Set(acc.ordinal, storage)
 			delete(measureIndexes, acc.name)
 		}
 	}
@@ -1616,29 +1619,29 @@ func (db *DB[K, V]) loadIndexPayload(
 	releaseFieldIndexStorageMapOwned(nilIndexes)
 	releaseFieldIndexStorageMapOwned(lenIndexes)
 	releaseMeasureFieldStorageMapOwned(measureIndexes)
-	db.lenZeroComplement = detectLenZeroComplement(db.lenIndex, db.indexedFieldAccess)
+	db.engine.lenZeroComplement = detectLenZeroComplement(db.engine.lenIndex, db.engine.indexedFieldAccess)
 
 	lenLoaded := true
-	for name := range db.indexFields {
+	for name := range db.engine.fields {
 		if _, ok := skipFields[name]; !ok {
 			lenLoaded = false
 			break
 		}
 	}
 	if lenLoaded && !universe.IsEmpty() {
-		for name, f := range db.indexFields {
+		for name, f := range db.engine.fields {
 			if f == nil || !f.Slice {
 				continue
 			}
 			if _, ok := skipFields[name]; !ok {
 				continue
 			}
-			acc, ok := db.indexedFieldMap[name]
+			acc, ok := db.engine.indexedFieldMap[name]
 			if !ok {
 				lenLoaded = false
 				break
 			}
-			base := db.lenIndex.Get(acc.ordinal).flatSlice()
+			base := db.engine.lenIndex.Get(acc.ordinal).flatSlice()
 			if base == nil || len(*base) == 0 {
 				lenLoaded = false
 				break
@@ -1649,7 +1652,7 @@ func (db *DB[K, V]) loadIndexPayload(
 	return skipFields, skipMeasureFields, plannerStats, lenLoaded, nil
 }
 
-func detectLenZeroComplement(indexes *pooled.SliceBuf[fieldIndexStorage], access []indexedFieldAccessor) *pooled.SliceBuf[bool] {
+func detectLenZeroComplement(indexes *pooled.Slice[fieldIndexStorage], access []indexedFieldAccessor) *pooled.Slice[bool] {
 	out := fieldIndexBoolSlicePool.Get()
 	out.SetLen(len(access))
 	if indexes == nil {
@@ -1791,10 +1794,10 @@ func (db *DB[K, V]) storeIndexPayload(writer *bufio.Writer) error {
 		return err
 	}
 
-	if err := writeFields(writer, db.indexFields); err != nil {
+	if err := writeFields(writer, db.engine.fields); err != nil {
 		return err
 	}
-	if err := writeFields(writer, db.measureFields); err != nil {
+	if err := writeFields(writer, db.engine.measureFields); err != nil {
 		return err
 	}
 
@@ -1825,10 +1828,10 @@ func (db *DB[K, V]) storeIndexPayload(writer *bufio.Writer) error {
 		return err
 	}
 
-	measureFieldNames := sortedMapFieldNames(db.measureFields)
+	measureFieldNames := sortedMapFieldNames(db.engine.measureFields)
 
 	if err := writeMeasureIndexFamily(writer, measureFieldNames, func(field string) measureFieldStorage {
-		acc := db.measureFieldMap[field]
+		acc := db.engine.measureFieldMap[field]
 		if snap.measure == nil || acc.ordinal >= snap.measure.Len() {
 			return measureFieldStorage{}
 		}
@@ -1837,7 +1840,7 @@ func (db *DB[K, V]) storeIndexPayload(writer *bufio.Writer) error {
 		return err
 	}
 
-	statsVersion := db.planner.statsVersion.Load()
+	statsVersion := db.engine.planner.statsVersion.Load()
 	if statsVersion == 0 {
 		statsVersion = 1
 	} else {
@@ -2841,7 +2844,7 @@ func readMeasureFieldStorage(reader *bufio.Reader, keep bool) (measureFieldStora
 	if count > uint64(^uint(0)>>1) {
 		return measureFieldStorage{}, fmt.Errorf("measure row count overflows int: %v", count)
 	}
-	var entries *pooled.SliceBuf[measureEntry]
+	var entries *pooled.Slice[measureEntry]
 	if keep {
 		entries = measureEntrySlicePool.Get()
 		entries.Grow(int(count))
@@ -3366,7 +3369,7 @@ func (o fieldOverlay) postingAt(rank int) posting.List {
 	return o.base[rank].IDs.Borrow()
 }
 
-func (o fieldOverlay) lookupPostings(keys stringKeyReader) (*pooled.SliceBuf[posting.List], uint64) {
+func (o fieldOverlay) lookupPostings(keys stringKeyReader) (*pooled.Slice[posting.List], uint64) {
 	postsBuf := postingSlicePool.Get()
 	keyCount := stringKeyReaderLen(keys)
 	postsBuf.Grow(keyCount)

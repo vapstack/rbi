@@ -1080,7 +1080,7 @@ func TestAggregateMeasureEmptyBaseBatchSetDuplicateIDsUsesLastValue(t *testing.T
 		t.Fatalf("BatchSet duplicate ids: %v", err)
 	}
 
-	acc := db.measureFieldMap["amount"]
+	acc := db.engine.measureFieldMap["amount"]
 	storage := db.getSnapshot().measure.Get(acc.ordinal)
 	if storage.rows() != 1 {
 		t.Fatalf("measure rows=%d, want 1", storage.rows())
@@ -1127,7 +1127,7 @@ func TestAggregateWideMeasureUsesFullAndMergeScans(t *testing.T) {
 		}
 	}
 
-	acc := db.measureFieldMap["amount"]
+	acc := db.engine.measureFieldMap["amount"]
 	storage := db.getSnapshot().measure.Get(acc.ordinal)
 	if !useMeasureMergeScan(keep, storage) {
 		t.Fatal("wide filtered measure aggregate must use merge scan")
@@ -1230,7 +1230,7 @@ func TestMeasureChunkedAppendFillsTailChunk(t *testing.T) {
 		t.Fatalf("BatchSet append: %v", err)
 	}
 
-	acc := db.measureFieldMap["amount"]
+	acc := db.engine.measureFieldMap["amount"]
 	storage := db.getSnapshot().measure.Get(acc.ordinal)
 	if storage.chunked == nil {
 		t.Fatal("measure storage must be chunked")
@@ -1365,7 +1365,7 @@ func TestPersistedMeasureLoadDoesNotSatisfyOrdinaryPlannerStats(t *testing.T) {
 		_ = raw2.Close()
 	})
 
-	stats := db2.planner.stats.Load()
+	stats := db2.engine.planner.stats.Load()
 	if stats == nil {
 		t.Fatalf("planner stats are missing")
 	}

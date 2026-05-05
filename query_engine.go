@@ -5,20 +5,30 @@ import (
 	"time"
 
 	"github.com/vapstack/rbi/internal/pooled"
+	"github.com/vapstack/rbi/internal/posting"
 	"github.com/vapstack/rbi/internal/qir"
 )
 
 type queryEngine struct {
-	strKey bool
-
-	fields             map[string]*field
-	indexedFieldAccess []indexedFieldAccessor
-	indexedFieldMap    indexedFieldMap
-	measureFieldAccess []measureFieldAccessor
-	measureFieldMap    measureFieldMap
+	snapshot                      *snapshotManager
+	fields                        map[string]*field
+	measureFields                 map[string]*field
+	indexedFieldAccess            []indexedFieldAccessor
+	indexedStringValidationAccess []indexedFieldAccessor
+	indexedFieldMap               indexedFieldMap
+	uniqueFieldAccessors          []indexedFieldAccessor
+	measureFieldAccess            []measureFieldAccessor
+	measureFieldMap               measureFieldMap
+	index                         *pooled.Slice[fieldIndexStorage]
+	nilIndex                      *pooled.Slice[fieldIndexStorage]
+	lenIndex                      *pooled.Slice[fieldIndexStorage]
+	lenZeroComplement             *pooled.Slice[bool]
+	measure                       *pooled.Slice[measureFieldStorage]
+	universe                      posting.List
+	hasUnique                     bool
+	lenIndexLoaded                bool
 
 	planner *planner
-	options *Options
 
 	viewPool *pooled.Pointers[queryView]
 }

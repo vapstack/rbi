@@ -44,7 +44,7 @@ type queryView struct {
 	fields            map[string]*field
 	planner           *planner
 	options           *Options
-	lenZeroComplement *pooled.SliceBuf[bool]
+	lenZeroComplement *pooled.Slice[bool]
 
 	normalizedScalarBoundCacheLen uint8
 	normalizedScalarBoundCache    [normalizedScalarBoundCacheMaxEntries]normalizedScalarBoundCacheEntry
@@ -96,9 +96,6 @@ func normalizedScalarBoundCacheValue(v reflect.Value, fm *field) (normalizedScal
 }
 
 func (qv *queryView) loadNormalizedScalarBound(expr qir.Expr, v reflect.Value) (normalizedScalarBound, bool) {
-	if qv == nil {
-		return normalizedScalarBound{}, false
-	}
 	key, ok := normalizedScalarBoundCacheValue(v, qv.fieldMetaByExpr(expr))
 	if !ok {
 		return normalizedScalarBound{}, false
@@ -142,9 +139,6 @@ func (qv *queryView) loadNormalizedScalarBound(expr qir.Expr, v reflect.Value) (
 }
 
 func (qv *queryView) storeNormalizedScalarBound(expr qir.Expr, v reflect.Value, bound normalizedScalarBound) {
-	if qv == nil {
-		return
-	}
 	key, ok := normalizedScalarBoundCacheValue(v, qv.fieldMetaByExpr(expr))
 	if !ok {
 		return

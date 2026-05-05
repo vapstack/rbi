@@ -133,7 +133,7 @@ func appendAndLeaf(dst []qir.Expr, e qir.Expr) ([]qir.Expr, andLeafStatus) {
 	return append(dst, e), andLeafStatusOK
 }
 
-func appendAndLeavesModeBuf(dst *pooled.SliceBuf[qir.Expr], e qir.Expr, mode andLeafMode) bool {
+func appendAndLeavesModeBuf(dst *pooled.Slice[qir.Expr], e qir.Expr, mode andLeafMode) bool {
 	switch e.Op {
 	case qir.OpNOOP:
 		if mode != andLeafModeCollect {

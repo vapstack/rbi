@@ -33,12 +33,12 @@ func (db *DB[K, V]) refreshPlannerStatsWithBudget(softBudget time.Duration, useC
 	}
 	defer db.endOp()
 
-	if db.transparent {
+	if db.engine == nil {
 		return ErrNoIndex
 	}
 
-	db.planner.analyzer.Lock()
-	defer db.planner.analyzer.Unlock()
+	db.engine.planner.analyzer.Lock()
+	defer db.engine.planner.analyzer.Unlock()
 
 	if err := db.unavailableErr(); err != nil {
 		return err
@@ -191,25 +191,28 @@ func plannerAnalyzeInterval(v time.Duration) time.Duration {
 }
 
 func (db *DB[K, V]) startPlannerAnalyzeLoop() {
-	interval := db.planner.analyzer.interval
+	interval := db.engine.planner.analyzer.interval
 	if interval <= 0 {
 		return
 	}
-	if db.planner.analyzer.stop != nil {
+	if db.engine.planner.analyzer.stop != nil {
 		return
 	}
 
 	stop := make(chan struct{})
 	done := make(chan struct{})
-	db.planner.analyzer.stop = stop
-	db.planner.analyzer.done = done
+	db.engine.planner.analyzer.stop = stop
+	db.engine.planner.analyzer.done = done
 
 	go db.runPlannerAnalyzeLoop(stop, done, interval)
 }
 
 func (db *DB[K, V]) stopAnalyzeLoop() {
-	stop := db.planner.analyzer.stop
-	done := db.planner.analyzer.done
+	if db.engine == nil {
+		return
+	}
+	stop := db.engine.planner.analyzer.stop
+	done := db.engine.planner.analyzer.done
 
 	if stop != nil {
 		select {
@@ -222,8 +225,8 @@ func (db *DB[K, V]) stopAnalyzeLoop() {
 		<-done
 	}
 
-	db.planner.analyzer.stop = nil
-	db.planner.analyzer.done = nil
+	db.engine.planner.analyzer.stop = nil
+	db.engine.planner.analyzer.done = nil
 }
 
 func (db *DB[K, V]) runPlannerAnalyzeLoop(stop <-chan struct{}, done chan<- struct{}, base time.Duration) {
@@ -242,7 +245,7 @@ func (db *DB[K, V]) runPlannerAnalyzeLoop(stop <-chan struct{}, done chan<- stru
 		case <-timer.C:
 		}
 
-		err := db.refreshPlannerStatsWithBudget(db.planner.analyzer.softBudget, true)
+		err := db.refreshPlannerStatsWithBudget(db.engine.planner.analyzer.softBudget, true)
 		if err != nil {
 			if errors.Is(err, ErrClosed) || errors.Is(err, ErrBroken) {
 				return
@@ -323,13 +326,13 @@ type PlannerFieldStats struct {
 }
 
 func (db *DB[K, V]) refreshPlannerStatsLocked() {
-	version := db.planner.statsVersion.Add(1)
+	version := db.engine.planner.statsVersion.Add(1)
 	s := db.buildPlannerStatsSnapshotLocked(version)
-	db.planner.stats.Store(s)
+	db.engine.planner.stats.Store(s)
 }
 
 func (db *DB[K, V]) plannerStatsSnapshotForPersistLocked(version uint64) *plannerStatsSnapshot {
-	current := db.planner.stats.Load()
+	current := db.engine.planner.stats.Load()
 	if current == nil {
 		return db.buildPlannerStatsSnapshotLocked(version)
 	}
@@ -377,13 +380,6 @@ func (qe *queryEngine) sortedPlannerFieldNames() []string {
 	}
 	sort.Strings(fields)
 	return fields
-}
-
-func (db *DB[K, V]) publishLoadedPlannerStats(s *plannerStatsSnapshot) {
-	if s == nil {
-		return
-	}
-	db.engine.publishLoadedPlannerStats(s, db.getSnapshot())
 }
 
 func (qe *queryEngine) publishLoadedPlannerStats(s *plannerStatsSnapshot, snap *indexSnapshot) {

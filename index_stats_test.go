@@ -75,7 +75,7 @@ func TestIndexStats_MatchesSnapshotStorage(t *testing.T) {
 
 	var structSum uint64
 	var heapSum uint64
-	for _, acc := range db.indexedFieldAccess {
+	for _, acc := range db.engine.indexedFieldAccess {
 		name := acc.name
 		fieldStruct := got.FieldApproxStructBytes[name]
 		fieldHeap := got.FieldApproxHeapBytes[name]
@@ -104,7 +104,7 @@ func indexStatsTestExpected[K ~string | ~uint64, V any](db *DB[K, V]) IndexStats
 		FieldApproxHeapBytes:   make(map[string]uint64),
 	}
 	sharedStructBytes := indexStatsTestSliceBufBytes(snap.index) + indexStatsTestSliceBufBytes(snap.nilIndex)
-	fieldCount := len(db.indexedFieldAccess)
+	fieldCount := len(db.engine.indexedFieldAccess)
 	sharedStructPerField := uint64(0)
 	sharedStructRemainder := uint64(0)
 	if fieldCount > 0 {
@@ -112,7 +112,7 @@ func indexStatsTestExpected[K ~string | ~uint64, V any](db *DB[K, V]) IndexStats
 		sharedStructRemainder = sharedStructBytes % uint64(fieldCount)
 	}
 
-	for i, acc := range db.indexedFieldAccess {
+	for i, acc := range db.engine.indexedFieldAccess {
 		fieldStats := indexStatsTestStorageStats(snap.index.Get(acc.ordinal), true)
 		nilStats := indexStatsTestStorageStats(snap.nilIndex.Get(acc.ordinal), false)
 
@@ -236,11 +236,11 @@ func indexStatsTestChunkedStructBytes(root *fieldIndexChunkedRoot) uint64 {
 	return total
 }
 
-func indexStatsTestSliceBufBytes[T any](buf *pooled.SliceBuf[T]) uint64 {
+func indexStatsTestSliceBufBytes[T any](buf *pooled.Slice[T]) uint64 {
 	if buf == nil {
 		return 0
 	}
 	var zero T
-	return uint64(unsafe.Sizeof(pooled.SliceBuf[T]{})) +
+	return uint64(unsafe.Sizeof(pooled.Slice[T]{})) +
 		uint64(buf.Cap())*uint64(unsafe.Sizeof(zero))
 }

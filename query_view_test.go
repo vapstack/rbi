@@ -16,17 +16,17 @@ import (
 )
 
 func (db *DB[K, V]) currentQueryViewForTests() *queryView {
-	if db == nil || db.engine == nil || db.snapshot == nil {
+	if db == nil || db.engine == nil || db.engine.snapshot == nil {
 		snap := &indexSnapshot{strmap: &strMapSnapshot{}}
 		return &queryView{snap: snap, strMapView: snap.strmap}
 	}
-	if snap := db.snapshot.current.Load(); snap != nil {
+	if snap := db.engine.snapshot.current.Load(); snap != nil {
 		return &queryView{
 			engine:            db.engine,
 			snap:              snap,
 			strKey:            db.strKey,
 			strMapView:        snap.strmap,
-			fields:            db.indexFields,
+			fields:            db.engine.fields,
 			planner:           db.engine.planner,
 			options:           db.options,
 			lenZeroComplement: snap.lenZeroComplement,
@@ -34,11 +34,11 @@ func (db *DB[K, V]) currentQueryViewForTests() *queryView {
 	}
 
 	snap := &indexSnapshot{
-		index:             db.index,
-		nilIndex:          db.nilIndex,
-		lenIndex:          db.lenIndex,
-		lenZeroComplement: db.lenZeroComplement,
-		universe:          db.universe,
+		index:             db.engine.index,
+		nilIndex:          db.engine.nilIndex,
+		lenIndex:          db.engine.lenIndex,
+		lenZeroComplement: db.engine.lenZeroComplement,
+		universe:          db.engine.universe,
 		strmap:            &strMapSnapshot{},
 	}
 	if db.strMap != nil {
@@ -49,7 +49,7 @@ func (db *DB[K, V]) currentQueryViewForTests() *queryView {
 		snap:              snap,
 		strKey:            db.strKey,
 		strMapView:        snap.strmap,
-		fields:            db.indexFields,
+		fields:            db.engine.fields,
 		planner:           db.engine.planner,
 		options:           db.options,
 		lenZeroComplement: snap.lenZeroComplement,
@@ -163,7 +163,7 @@ func prepareTestQuery[K ~string | ~uint64, V any](db *DB[K, V], q *qx.QX) (*qir.
 	if db == nil {
 		prepared, err = qir.PrepareQueryNoResolve(q)
 	} else {
-		prepared, err = qir.PrepareQuery(q, db.indexedFieldMap)
+		prepared, err = qir.PrepareQuery(q, db.engine.indexedFieldMap)
 	}
 	if err != nil {
 		return nil, qir.Shape{}, err
@@ -179,7 +179,7 @@ func prepareTestExpr[K ~string | ~uint64, V any](db *DB[K, V], expr qx.Expr) (*q
 	if db == nil {
 		prepared, err = qir.PrepareCountExprsNoResolve(expr)
 	} else {
-		prepared, err = qir.PrepareCountExprsResolved(db.indexedFieldMap, expr)
+		prepared, err = qir.PrepareCountExprsResolved(db.engine.indexedFieldMap, expr)
 	}
 	if err != nil {
 		return nil, qir.Expr{}, err
@@ -517,7 +517,7 @@ func (db *DB[K, V]) extractOrderRangeCoverageOverlay(field string, preds []predi
 	return br, copyBoolBufAndRelease(covered), ok
 }
 
-func copyBoolBufAndRelease(buf *pooled.SliceBuf[bool]) []bool {
+func copyBoolBufAndRelease(buf *pooled.Slice[bool]) []bool {
 	if buf == nil {
 		return nil
 	}
@@ -608,7 +608,7 @@ func (db *DB[K, V]) shouldUseCandidateOrder(o qx.Order, leaves []qx.Expr) bool {
 	if o.Desc {
 		dir = qx.DESC
 	}
-	order, err := qir.PrepareQuery(qx.Query().SortBy(o.By, dir), db.indexedFieldMap)
+	order, err := qir.PrepareQuery(qx.Query().SortBy(o.By, dir), db.engine.indexedFieldMap)
 	if err != nil {
 		return false
 	}
@@ -667,7 +667,7 @@ func detachPredicateSetForTests(preds predicateSet) []predicate {
 	return out
 }
 
-func detachCountLeadResidualExactFiltersForTests(owner *pooled.SliceBuf[countLeadResidualExactFilter]) []countLeadResidualExactFilter {
+func detachCountLeadResidualExactFiltersForTests(owner *pooled.Slice[countLeadResidualExactFilter]) []countLeadResidualExactFilter {
 	if owner == nil {
 		return nil
 	}

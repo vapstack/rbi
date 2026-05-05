@@ -24,7 +24,7 @@ type measureBatchDelta struct {
 }
 
 type measureEntryBufOrder struct {
-	buf *pooled.SliceBuf[measureEntry]
+	buf *pooled.Slice[measureEntry]
 }
 
 func (s measureEntryBufOrder) Len() int { return s.buf.Len() }
@@ -40,7 +40,7 @@ func (s measureEntryBufOrder) Less(i, j int) bool {
 }
 
 type measureBatchDeltaBufOrder struct {
-	buf *pooled.SliceBuf[measureBatchDelta]
+	buf *pooled.Slice[measureBatchDelta]
 }
 
 func (s measureBatchDeltaBufOrder) Len() int { return s.buf.Len() }
@@ -57,14 +57,14 @@ func (s measureBatchDeltaBufOrder) Less(i, j int) bool {
 
 type measureFlatRoot struct {
 	refs   atomic.Int32
-	ids    *pooled.SliceBuf[uint64]
-	values *pooled.SliceBuf[uint64]
+	ids    *pooled.Slice[uint64]
+	values *pooled.Slice[uint64]
 }
 
 type measureChunk struct {
 	refs   atomic.Int32
-	ids    *pooled.SliceBuf[uint64]
-	values *pooled.SliceBuf[uint64]
+	ids    *pooled.Slice[uint64]
+	values *pooled.Slice[uint64]
 }
 
 type measureChunkRef struct {
@@ -74,7 +74,7 @@ type measureChunkRef struct {
 
 type measureChunkedRoot struct {
 	refs     atomic.Int32
-	refsByID *pooled.SliceBuf[measureChunkRef]
+	refsByID *pooled.Slice[measureChunkRef]
 	rows     int
 }
 
@@ -104,21 +104,21 @@ var measureFlatRootPool = pooled.Pointers[measureFlatRoot]{Clear: true}
 var measureChunkPool = pooled.Pointers[measureChunk]{Clear: true}
 var measureChunkedRootPool = pooled.Pointers[measureChunkedRoot]{Clear: true}
 
-func sortMeasureEntryBuf(buf *pooled.SliceBuf[measureEntry]) {
+func sortMeasureEntryBuf(buf *pooled.Slice[measureEntry]) {
 	if buf == nil || buf.Len() <= 1 {
 		return
 	}
 	sort.Sort(measureEntryBufOrder{buf: buf})
 }
 
-func sortMeasureBatchDeltaBuf(buf *pooled.SliceBuf[measureBatchDelta]) {
+func sortMeasureBatchDeltaBuf(buf *pooled.Slice[measureBatchDelta]) {
 	if buf == nil || buf.Len() <= 1 {
 		return
 	}
 	sort.Sort(measureBatchDeltaBufOrder{buf: buf})
 }
 
-func releaseMeasureEntryBufs(bufs []*pooled.SliceBuf[measureEntry]) {
+func releaseMeasureEntryBufs(bufs []*pooled.Slice[measureEntry]) {
 	for i := range bufs {
 		if bufs[i] != nil {
 			measureEntrySlicePool.Put(bufs[i])
@@ -127,7 +127,7 @@ func releaseMeasureEntryBufs(bufs []*pooled.SliceBuf[measureEntry]) {
 	}
 }
 
-func cleanupBuildMeasureStates(buildOK *bool, states [][]*pooled.SliceBuf[measureEntry]) {
+func cleanupBuildMeasureStates(buildOK *bool, states [][]*pooled.Slice[measureEntry]) {
 	if *buildOK {
 		return
 	}
@@ -136,7 +136,7 @@ func cleanupBuildMeasureStates(buildOK *bool, states [][]*pooled.SliceBuf[measur
 	}
 }
 
-func newMeasureStorageFromEntriesOwned(entries *pooled.SliceBuf[measureEntry]) measureFieldStorage {
+func newMeasureStorageFromEntriesOwned(entries *pooled.Slice[measureEntry]) measureFieldStorage {
 	if entries == nil {
 		return measureFieldStorage{}
 	}
@@ -151,7 +151,7 @@ func newMeasureStorageFromEntriesOwned(entries *pooled.SliceBuf[measureEntry]) m
 	return newMeasureChunkedStorageFromEntriesOwned(entries)
 }
 
-func newMeasureFlatStorageFromEntriesOwned(entries *pooled.SliceBuf[measureEntry]) measureFieldStorage {
+func newMeasureFlatStorageFromEntriesOwned(entries *pooled.Slice[measureEntry]) measureFieldStorage {
 	root := measureFlatRootPool.Get()
 	root.ids = measureUint64SlicePool.Get()
 	root.values = measureUint64SlicePool.Get()
@@ -167,7 +167,7 @@ func newMeasureFlatStorageFromEntriesOwned(entries *pooled.SliceBuf[measureEntry
 	return measureFieldStorage{flat: root}
 }
 
-func newMeasureChunkedStorageFromEntriesOwned(entries *pooled.SliceBuf[measureEntry]) measureFieldStorage {
+func newMeasureChunkedStorageFromEntriesOwned(entries *pooled.Slice[measureEntry]) measureFieldStorage {
 	root := measureChunkedRootPool.Get()
 	root.refsByID = measureChunkRefSlicePool.Get()
 
@@ -182,12 +182,12 @@ func newMeasureChunkedStorageFromEntriesOwned(entries *pooled.SliceBuf[measureEn
 	return measureFieldStorage{chunked: root}
 }
 
-func appendMeasureEntryRangeAsChunk(root *measureChunkedRoot, entries *pooled.SliceBuf[measureEntry], start int, end int) {
+func appendMeasureEntryRangeAsChunk(root *measureChunkedRoot, entries *pooled.Slice[measureEntry], start int, end int) {
 	chunk := newMeasureChunkFromEntryRange(entries, start, end)
 	appendMeasureChunkRef(root, chunk)
 }
 
-func newMeasureChunkFromEntryRange(entries *pooled.SliceBuf[measureEntry], start int, end int) *measureChunk {
+func newMeasureChunkFromEntryRange(entries *pooled.Slice[measureEntry], start int, end int) *measureChunk {
 	size := end - start
 	chunk := measureChunkPool.Get()
 	chunk.ids = measureUint64SlicePool.Get()
@@ -212,7 +212,7 @@ func appendMeasureChunkRef(root *measureChunkedRoot, chunk *measureChunk) {
 	root.rows += rows
 }
 
-func applyMeasureDeltasOwned(base measureFieldStorage, deltas *pooled.SliceBuf[measureBatchDelta]) measureFieldStorage {
+func applyMeasureDeltasOwned(base measureFieldStorage, deltas *pooled.Slice[measureBatchDelta]) measureFieldStorage {
 	if deltas == nil {
 		return base
 	}
@@ -238,7 +238,7 @@ func applyMeasureDeltasOwned(base measureFieldStorage, deltas *pooled.SliceBuf[m
 	return newMeasureStorageFromEntriesOwned(entries)
 }
 
-func applyMeasureDeltasFlatOwned(base *measureFlatRoot, deltas *pooled.SliceBuf[measureBatchDelta]) measureFieldStorage {
+func applyMeasureDeltasFlatOwned(base *measureFlatRoot, deltas *pooled.Slice[measureBatchDelta]) measureFieldStorage {
 	entries := measureEntrySlicePool.Get()
 	i := 0
 	j := 0
@@ -275,7 +275,7 @@ func applyMeasureDeltasFlatOwned(base *measureFlatRoot, deltas *pooled.SliceBuf[
 	return newMeasureStorageFromEntriesOwned(entries)
 }
 
-func applyMeasureDeltasChunkedOwned(base *measureChunkedRoot, deltas *pooled.SliceBuf[measureBatchDelta]) measureFieldStorage {
+func applyMeasureDeltasChunkedOwned(base *measureChunkedRoot, deltas *pooled.Slice[measureBatchDelta]) measureFieldStorage {
 	root := measureChunkedRootPool.Get()
 	root.refsByID = measureChunkRefSlicePool.Get()
 
@@ -321,9 +321,9 @@ func applyMeasureDeltasChunkedOwned(base *measureChunkedRoot, deltas *pooled.Sli
 }
 
 func appendMeasureChunkMergedWithDeltas(
-	entries *pooled.SliceBuf[measureEntry],
+	entries *pooled.Slice[measureEntry],
 	chunk *measureChunk,
-	deltas *pooled.SliceBuf[measureBatchDelta],
+	deltas *pooled.Slice[measureBatchDelta],
 	startDelta int,
 	endDelta int,
 ) {
@@ -360,7 +360,7 @@ func appendMeasureChunkMergedWithDeltas(
 	}
 }
 
-func fillMeasureTailChunkWithDeltas(root *measureChunkedRoot, deltas *pooled.SliceBuf[measureBatchDelta], deltaPos *int) {
+func fillMeasureTailChunkWithDeltas(root *measureChunkedRoot, deltas *pooled.Slice[measureBatchDelta], deltaPos *int) {
 	if root.refsByID.Len() == 0 {
 		return
 	}
@@ -399,7 +399,7 @@ func fillMeasureTailChunkWithDeltas(root *measureChunkedRoot, deltas *pooled.Sli
 	measureEntrySlicePool.Put(entries)
 }
 
-func appendMeasureEntriesAsChunks(root *measureChunkedRoot, entries *pooled.SliceBuf[measureEntry]) {
+func appendMeasureEntriesAsChunks(root *measureChunkedRoot, entries *pooled.Slice[measureEntry]) {
 	for start := 0; start < entries.Len(); {
 		size := min(measureChunkTargetRows, entries.Len()-start)
 		appendMeasureEntryRangeAsChunk(root, entries, start, start+size)
@@ -477,7 +477,7 @@ func (r *measureChunkedRoot) release() {
 	measureChunkedRootPool.Put(r)
 }
 
-func cloneMeasureFieldStorageSlots(src *pooled.SliceBuf[measureFieldStorage], size int) *pooled.SliceBuf[measureFieldStorage] {
+func cloneMeasureFieldStorageSlots(src *pooled.Slice[measureFieldStorage], size int) *pooled.Slice[measureFieldStorage] {
 	out := measureFieldStorageSlicePool.Get()
 	out.SetLen(size)
 	if src == nil {
@@ -490,7 +490,7 @@ func cloneMeasureFieldStorageSlots(src *pooled.SliceBuf[measureFieldStorage], si
 	return out
 }
 
-func retainSharedMeasureFieldStorageSlots(next, prev *pooled.SliceBuf[measureFieldStorage]) {
+func retainSharedMeasureFieldStorageSlots(next, prev *pooled.Slice[measureFieldStorage]) {
 	if next == nil || prev == nil {
 		return
 	}
@@ -503,7 +503,7 @@ func retainSharedMeasureFieldStorageSlots(next, prev *pooled.SliceBuf[measureFie
 	}
 }
 
-func releaseMeasureFieldStorageSlotsOwned(slots *pooled.SliceBuf[measureFieldStorage]) {
+func releaseMeasureFieldStorageSlotsOwned(slots *pooled.Slice[measureFieldStorage]) {
 	if slots == nil {
 		return
 	}

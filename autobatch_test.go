@@ -15,8 +15,8 @@ import (
 	"go.etcd.io/bbolt"
 )
 
-func testAutoBatchRequestBuf[K ~string | ~uint64, V any](reqs ...*autoBatchRequest[K, V]) *pooled.SliceBuf[*autoBatchRequest[K, V]] {
-	buf := new(pooled.SliceBuf[*autoBatchRequest[K, V]])
+func testAutoBatchRequestBuf[K ~string | ~uint64, V any](reqs ...*autoBatchRequest[K, V]) *pooled.Slice[*autoBatchRequest[K, V]] {
+	buf := new(pooled.Slice[*autoBatchRequest[K, V]])
 	buf.AppendAll(reqs)
 	return buf
 }

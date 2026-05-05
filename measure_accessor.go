@@ -29,41 +29,46 @@ type measureFieldAccessor struct {
 }
 
 func (db *DB[K, V]) initMeasureFieldAccessors() error {
-	if len(db.measureFields) == 0 {
-		db.measureFieldAccess = nil
-		db.measureFieldMap = nil
-		return nil
+	access, fieldMap, err := makeMeasureFieldAccessors(db.vtype, db.engine.measureFields)
+	db.engine.measureFieldAccess = access
+	db.engine.measureFieldMap = fieldMap
+	return err
+}
+
+func makeMeasureFieldAccessors(vtype reflect.Type, fields map[string]*field) ([]measureFieldAccessor, measureFieldMap, error) {
+	if len(fields) == 0 {
+		return nil, nil, nil
 	}
 
-	db.measureFieldAccess = make([]measureFieldAccessor, 0, len(db.measureFields))
-	db.measureFieldMap = make(map[string]measureFieldAccessor, len(db.measureFields))
+	access := make([]measureFieldAccessor, 0, len(fields))
+	fieldMap := make(map[string]measureFieldAccessor, len(fields))
 
-	names := make([]string, 0, len(db.measureFields))
-	for name := range db.measureFields {
+	names := make([]string, 0, len(fields))
+	for name := range fields {
 		names = append(names, name)
 	}
 	slices.Sort(names)
 
 	for _, name := range names {
-		f := db.measureFields[name]
-		acc, err := db.makeMeasureFieldAccessor(f)
+		f := fields[name]
+		acc, err := makeMeasureFieldAccessor(vtype, f)
 		if err != nil {
-			return err
+			return nil, nil, err
 		}
-		acc.ordinal = len(db.measureFieldAccess)
-		db.measureFieldAccess = append(db.measureFieldAccess, acc)
-		db.measureFieldMap[f.DBName] = acc
+		acc.ordinal = len(access)
+		access = append(access, acc)
+		fieldMap[f.DBName] = acc
 	}
-	return nil
+	return access, fieldMap, nil
 }
 
-func (db *DB[K, V]) makeMeasureFieldAccessor(f *field) (measureFieldAccessor, error) {
+func makeMeasureFieldAccessor(vtype reflect.Type, f *field) (measureFieldAccessor, error) {
 	acc := measureFieldAccessor{
 		name:  f.DBName,
 		field: f,
 	}
 
-	fieldType, offset := resolveFieldTypeAndOffset(db.vtype, f.Index)
+	fieldType, offset := resolveFieldTypeAndOffset(vtype, f.Index)
 	kind, read, modified, err := buildMeasureAccessorFns(f, fieldType, offset)
 	if err != nil {
 		return measureFieldAccessor{}, err

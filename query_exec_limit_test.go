@@ -870,7 +870,7 @@ func (qv *queryView) baselineTryQueryPrefixNoOrderWithLimit(q *qx.QX) ([]uint64,
 	return cursor.out, true, nil
 }
 
-func baselineScanLimitByOverlayBounds(db *queryView, q *qx.QX, ov fieldOverlay, br overlayRange, desc bool, preds *pooled.SliceBuf[leafPred], nilTailField string) []uint64 {
+func baselineScanLimitByOverlayBounds(db *queryView, q *qx.QX, ov fieldOverlay, br overlayRange, desc bool, preds *pooled.Slice[leafPred], nilTailField string) []uint64 {
 	limit := int(q.Window.Limit)
 	out := make([]uint64, 0, limit)
 	cursor := db.newQueryCursor(out, 0, q.Window.Limit, false, 0)
@@ -1851,7 +1851,7 @@ func mustPrepareOrderBasicBaseCoresForTest(
 	t *testing.T,
 	view *queryView,
 	baseOps []qir.Expr,
-) (*pooled.SliceBuf[orderBasicBaseCore], *pooled.SliceBuf[int]) {
+) (*pooled.Slice[orderBasicBaseCore], *pooled.Slice[int]) {
 	t.Helper()
 	coresBuf, rawCoreIdxBuf, noMatch, err := view.prepareOrderBasicBaseCores(baseOps)
 	if err != nil {
@@ -1865,7 +1865,7 @@ func mustPrepareOrderBasicBaseCoresForTest(
 
 func mustFindCollapsedOrderBasicBaseCoreForTest(
 	t *testing.T,
-	coresBuf *pooled.SliceBuf[orderBasicBaseCore],
+	coresBuf *pooled.Slice[orderBasicBaseCore],
 ) orderBasicBaseCore {
 	t.Helper()
 	if coresBuf == nil {

@@ -34,8 +34,8 @@ var snapshotFieldInsertStateSlicePool = pooled.Slices[snapshotFieldInsertState]{
 }
 
 type fieldWriteScratch struct {
-	strings *pooled.SliceBuf[string]
-	fixed   *pooled.SliceBuf[uint64]
+	strings *pooled.Slice[string]
+	fixed   *pooled.Slice[uint64]
 	ok      bool
 	isNil   bool
 	length  int
@@ -274,7 +274,7 @@ func (acc indexedFieldAccessor) collectSnapshotInsertValue(
 }
 
 func initSnapshotFieldInsertStateHints(
-	states *pooled.SliceBuf[snapshotFieldInsertState],
+	states *pooled.Slice[snapshotFieldInsertState],
 	access []indexedFieldAccessor,
 	prev *indexSnapshot,
 	batchHint int,
@@ -419,7 +419,7 @@ func (acc indexedFieldAccessor) collectSnapshotBatchDiff(
 	var changed bool
 	if acc.field != nil && acc.field.KeyKind == fieldWriteKeysOrderedU64 {
 		if acc.field.Slice {
-			var oldMulti, newMulti *pooled.SliceBuf[uint64]
+			var oldMulti, newMulti *pooled.Slice[uint64]
 			if oldOK {
 				oldMulti = state.old.fixed
 			}
@@ -446,7 +446,7 @@ func (acc indexedFieldAccessor) collectSnapshotBatchDiff(
 			)
 		}
 	} else if acc.field != nil && acc.field.Slice {
-		var oldMulti, newMulti *pooled.SliceBuf[string]
+		var oldMulti, newMulti *pooled.Slice[string]
 		if oldOK {
 			oldMulti = state.old.strings
 		}

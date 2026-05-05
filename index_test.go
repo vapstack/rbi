@@ -19,6 +19,7 @@ import (
 	"unsafe"
 
 	"github.com/vapstack/qx"
+	"github.com/vapstack/rbi/internal/pooled"
 	"github.com/vapstack/rbi/internal/posting"
 	"go.etcd.io/bbolt"
 )
@@ -88,21 +89,23 @@ func TestAddDistinctFixedKeys_SinglePass(t *testing.T) {
 
 func TestValidateIndexedStringValues_UsesOnlyStringValidationAccessors(t *testing.T) {
 	db := &DB[uint64, Rec]{
-		indexedFieldAccess: []indexedFieldAccessor{
-			{
-				name:  "active",
-				field: &field{Kind: reflect.Bool},
-				writeBuild: func(_ unsafe.Pointer, _ buildFieldWriteSink) {
-					t.Fatal("bool accessor must not be called")
+		engine: &queryEngine{
+			indexedFieldAccess: []indexedFieldAccessor{
+				{
+					name:  "active",
+					field: &field{Kind: reflect.Bool},
+					writeBuild: func(_ unsafe.Pointer, _ buildFieldWriteSink) {
+						t.Fatal("bool accessor must not be called")
+					},
 				},
 			},
-		},
-		indexedStringValidationAccess: []indexedFieldAccessor{
-			{
-				name:  "email",
-				field: &field{Kind: reflect.String},
-				writeBuild: func(_ unsafe.Pointer, sink buildFieldWriteSink) {
-					sink.addString(strings.Repeat("x", fieldIndexStringRefMax+1))
+			indexedStringValidationAccess: []indexedFieldAccessor{
+				{
+					name:  "email",
+					field: &field{Kind: reflect.String},
+					writeBuild: func(_ unsafe.Pointer, sink buildFieldWriteSink) {
+						sink.addString(strings.Repeat("x", fieldIndexStringRefMax+1))
+					},
 				},
 			},
 		},
@@ -161,13 +164,17 @@ func TestReadStrMap_RoundTripDense(t *testing.T) {
 
 func TestQueryViewIdxMapping_UsesPinnedStrMapSnapshot(t *testing.T) {
 	db := &DB[string, UserBench]{
-		strKey:      true,
-		strMap:      newStrMapper(0, defaultSnapshotStrMapCompactDepth),
-		indexFields: map[string]*field{},
-		options:     &Options{},
+		strKey:  true,
+		strMap:  newStrMapper(0, defaultSnapshotStrMapCompactDepth),
+		options: &Options{},
+		engine: &queryEngine{
+			fields:  map[string]*field{},
+			planner: &planner{},
+			viewPool: &pooled.Pointers[queryView]{
+				Clear: true,
+			},
+		},
 	}
-	db.planner = &planner{}
-	db.initQueryEngine()
 	strMapSnap := &strMapSnapshot{
 		Next: 1,
 		Strs: map[uint64]string{1: "snap-key"},
@@ -181,7 +188,7 @@ func TestQueryViewIdxMapping_UsesPinnedStrMapSnapshot(t *testing.T) {
 		snap:              indexSnap,
 		strKey:            true,
 		strMapView:        strMapSnap,
-		fields:            db.indexFields,
+		fields:            db.engine.fields,
 		planner:           db.engine.planner,
 		options:           db.options,
 		lenZeroComplement: indexSnap.lenZeroComplement,
@@ -3975,11 +3982,11 @@ func TestIndexExt_SnapshotOverlayStableDuringConcurrentWrites(t *testing.T) {
 	})
 
 	snap := db.getSnapshot()
-	pinnedSnap, pinnedRef, ok := db.snapshot.pinRefBySeq(snap.seq)
+	pinnedSnap, pinnedRef, ok := db.engine.snapshot.pinRefBySeq(snap.seq)
 	if !ok {
 		t.Fatalf("pinSnapshotRefBySeq(%d): false", snap.seq)
 	}
-	defer db.snapshot.unpinRef(snap.seq, pinnedRef)
+	defer db.engine.snapshot.unpinRef(snap.seq, pinnedRef)
 	snap = pinnedSnap
 	storage, ok := snap.fieldIndexStorage("name")
 	if !ok {

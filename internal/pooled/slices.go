@@ -2,33 +2,32 @@ package pooled
 
 import (
 	"cmp"
-	"iter"
 	"slices"
 	"sync"
 )
 
-// Slices pools SliceBuf owners for []T backing arrays.
+// Slices pools []T backing arrays.
 type Slices[T any] struct {
-	MinCap  int                // minimum capacity
-	MaxCap  int                // maximum capacity (drop if greater)
-	Cleanup func(*SliceBuf[T]) // function that is called before returning SliceBuf to the pool
-	Clear   bool               // clears contents with clear(values[:cap(values)])
+	MinCap  int             // minimum capacity
+	MaxCap  int             // maximum capacity (drop if greater)
+	Cleanup func(*Slice[T]) // function that is called before returning Slice to the pool
+	Clear   bool            // clears contents with clear(values[:cap(values)])
 
 	pool sync.Pool
 }
 
 // Get returns a pooled slice buffer or allocates a new one.
-func (s *Slices[T]) Get() *SliceBuf[T] {
+func (s *Slices[T]) Get() *Slice[T] {
 	if v := s.pool.Get(); v != nil {
-		return v.(*SliceBuf[T])
+		return v.(*Slice[T])
 	}
-	return &SliceBuf[T]{
+	return &Slice[T]{
 		values: make([]T, 0, max(s.MinCap, 8)),
 	}
 }
 
 // Put releases v back to the pool after applying configured cleanup.
-func (s *Slices[T]) Put(v *SliceBuf[T]) {
+func (s *Slices[T]) Put(v *Slice[T]) {
 	if s.Cleanup != nil {
 		s.Cleanup(v)
 	}
@@ -44,29 +43,29 @@ func (s *Slices[T]) Put(v *SliceBuf[T]) {
 
 /**/
 
-// SliceBuf owns a pooled []T backing array.
-type SliceBuf[T any] struct{ values []T }
+// Slice owns a pooled []T backing array.
+type Slice[T any] struct{ values []T }
 
 // Len returns the current slice length.
-func (b *SliceBuf[T]) Len() int { return len(b.values) }
+func (b *Slice[T]) Len() int { return len(b.values) }
 
 // Cap returns the current slice capacity.
-func (b *SliceBuf[T]) Cap() int { return cap(b.values) }
+func (b *Slice[T]) Cap() int { return cap(b.values) }
 
 // Truncate resets the slice length to zero.
-func (b *SliceBuf[T]) Truncate() { b.values = b.values[:0] }
+func (b *Slice[T]) Truncate() { b.values = b.values[:0] }
 
 // Clear calls clear on the underlying slice.
-func (b *SliceBuf[T]) Clear() { clear(b.values) }
+func (b *Slice[T]) Clear() { clear(b.values) }
 
 // Append appends values to the buffer.
-func (b *SliceBuf[T]) Append(v T) { b.values = append(b.values, v) }
+func (b *Slice[T]) Append(v T) { b.values = append(b.values, v) }
 
 // AppendAll appends a slice of values to the buffer.
-func (b *SliceBuf[T]) AppendAll(s []T) { b.values = append(b.values, s...) }
+func (b *Slice[T]) AppendAll(s []T) { b.values = append(b.values, s...) }
 
 // SetLen sets the slice length, growing capacity if needed.
-func (b *SliceBuf[T]) SetLen(l int) {
+func (b *Slice[T]) SetLen(l int) {
 	if cap(b.values) < l {
 		b.values = slices.Grow(b.values, l-len(b.values))
 	}
@@ -74,19 +73,20 @@ func (b *SliceBuf[T]) SetLen(l int) {
 }
 
 // Grow ensures capacity for another l elements without changing the current length.
-func (b *SliceBuf[T]) Grow(l int) { b.values = slices.Grow(b.values, l) }
+func (b *Slice[T]) Grow(l int) { b.values = slices.Grow(b.values, l) }
 
 // Get returns the element at index i.
-func (b *SliceBuf[T]) Get(i int) T { return b.values[i] }
+func (b *Slice[T]) Get(i int) T { return b.values[i] }
 
 // GetPtr returns a pointer to the element at index i.
-func (b *SliceBuf[T]) GetPtr(i int) *T { return &b.values[i] }
+func (b *Slice[T]) GetPtr(i int) *T { return &b.values[i] }
 
 // Set sets the element at index i.
-func (b *SliceBuf[T]) Set(i int, v T) { b.values[i] = v }
+func (b *Slice[T]) Set(i int, v T) { b.values[i] = v }
 
 // Values returns an iterator over the current elements.
-func (b *SliceBuf[T]) Values() iter.Seq2[int, T] {
+/*
+func (b *Slice[T]) Values() iter.Seq2[int, T] {
 	return func(yield func(int, T) bool) {
 		for i, v := range b.values {
 			if !yield(i, v) {
@@ -95,13 +95,14 @@ func (b *SliceBuf[T]) Values() iter.Seq2[int, T] {
 		}
 	}
 }
+*/
 
-func SortSlice[T cmp.Ordered](s *SliceBuf[T]) {
+func SortSlice[T cmp.Ordered](s *Slice[T]) {
 	slices.Sort(s.values)
 }
 
 /*
-func (b *SliceBuf[T]) Scan(start, end int) iter.Seq2[int, T] {
+func (b *Slice[T]) Scan(start, end int) iter.Seq2[int, T] {
 	return func(yield func(int, T) bool) {
 		for i, v := range b.values {
 			if i >= start && i <= end {

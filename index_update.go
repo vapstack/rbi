@@ -122,7 +122,7 @@ func (db *DB[K, V]) checkUniqueBatchCandidateAndCollectSeen(
 }
 
 func (db *DB[K, V]) checkUniqueBatchAppend(state uniqueBatchCheckState, idx uint64, oldVal, newVal *V) error {
-	if len(db.uniqueFieldAccessors) == 0 {
+	if len(db.engine.uniqueFieldAccessors) == 0 {
 		return nil
 	}
 	var (
@@ -132,7 +132,7 @@ func (db *DB[K, V]) checkUniqueBatchAppend(state uniqueBatchCheckState, idx uint
 	if oldVal != nil {
 		ptrOld := unsafe.Pointer(oldVal)
 		if newVal == nil {
-			for _, acc := range db.uniqueFieldAccessors {
+			for _, acc := range db.engine.uniqueFieldAccessors {
 				single, ok, isNil := acc.uniqueGetter(ptrOld)
 				if !ok || isNil {
 					continue
@@ -141,7 +141,7 @@ func (db *DB[K, V]) checkUniqueBatchAppend(state uniqueBatchCheckState, idx uint
 			}
 		} else {
 			ptrNew := unsafe.Pointer(newVal)
-			for _, acc := range db.uniqueFieldAccessors {
+			for _, acc := range db.engine.uniqueFieldAccessors {
 				if acc.modified == nil || !acc.modified(ptrOld, ptrNew) {
 					continue
 				}
@@ -165,7 +165,7 @@ func (db *DB[K, V]) checkUniqueBatchAppend(state uniqueBatchCheckState, idx uint
 
 	ptrNew := unsafe.Pointer(newVal)
 	if oldVal == nil {
-		for _, acc := range db.uniqueFieldAccessors {
+		for _, acc := range db.engine.uniqueFieldAccessors {
 			var err error
 			seenWrites, err = db.checkUniqueBatchCandidateAndCollectSeen(state, idx, acc, ptrNew, seenWrites)
 			if err != nil {
@@ -175,7 +175,7 @@ func (db *DB[K, V]) checkUniqueBatchAppend(state uniqueBatchCheckState, idx uint
 		}
 	} else {
 		ptrOld := unsafe.Pointer(oldVal)
-		for _, acc := range db.uniqueFieldAccessors {
+		for _, acc := range db.engine.uniqueFieldAccessors {
 			if acc.modified == nil || !acc.modified(ptrOld, ptrNew) {
 				continue
 			}
@@ -228,7 +228,7 @@ func collapseUniqueWriteMulti[V any](idxs []uint64, oldVals, newVals []*V, pos m
 }
 
 func (db *DB[K, V]) checkUniqueOnWriteMulti(idxs []uint64, oldVals, newVals []*V) error {
-	if len(idxs) == 0 || len(db.uniqueFieldAccessors) == 0 {
+	if len(idxs) == 0 || len(db.engine.uniqueFieldAccessors) == 0 {
 		return nil
 	}
 
@@ -258,7 +258,7 @@ func (db *DB[K, V]) checkUniqueOnWriteMulti(idxs []uint64, oldVals, newVals []*V
 		// On delete (newVal == nil), the record releases all unique scalar values.
 		// On update, only modified unique fields can release previous values.
 		if newVal == nil {
-			for _, acc := range db.uniqueFieldAccessors {
+			for _, acc := range db.engine.uniqueFieldAccessors {
 				single, ok, isNil := acc.uniqueGetter(ptr)
 				if !ok || isNil {
 					continue
@@ -276,7 +276,7 @@ func (db *DB[K, V]) checkUniqueOnWriteMulti(idxs []uint64, oldVals, newVals []*V
 		}
 
 		ptrNew := unsafe.Pointer(newVal)
-		for _, acc := range db.uniqueFieldAccessors {
+		for _, acc := range db.engine.uniqueFieldAccessors {
 			if acc.modified == nil || !acc.modified(ptr, ptrNew) {
 				continue
 			}
@@ -308,7 +308,7 @@ func (db *DB[K, V]) checkUniqueOnWriteMulti(idxs []uint64, oldVals, newVals []*V
 
 		ptr := unsafe.Pointer(newVal)
 		if oldVals[i] == nil {
-			for _, acc := range db.uniqueFieldAccessors {
+			for _, acc := range db.engine.uniqueFieldAccessors {
 				if err := db.checkUniqueBatchCandidate(idx, ptr, acc, seen, leaving); err != nil {
 					return err
 				}
@@ -317,7 +317,7 @@ func (db *DB[K, V]) checkUniqueOnWriteMulti(idxs []uint64, oldVals, newVals []*V
 		}
 
 		ptrOld := unsafe.Pointer(oldVals[i])
-		for _, acc := range db.uniqueFieldAccessors {
+		for _, acc := range db.engine.uniqueFieldAccessors {
 			if acc.modified == nil || !acc.modified(ptrOld, ptr) {
 				continue
 			}

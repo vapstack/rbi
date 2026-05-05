@@ -44,16 +44,16 @@ func TestPlannerStatsCollector_PeriodicBudgetAdvancesCursor(t *testing.T) {
 	_ = seedData(t, db, 3_000)
 
 	db.mu.RLock()
-	fieldCount := len(db.indexedFieldAccess)
+	fieldCount := len(db.engine.indexedFieldAccess)
 	db.mu.RUnlock()
 	if fieldCount < 2 {
 		t.Skip("not enough indexed fields for cursor progression test")
 	}
 
-	db.planner.analyzer.Lock()
-	db.planner.analyzer.cursor = 0
-	db.planner.analyzer.softBudget = 1 // 1ns, effectively one heavy field per cycle
-	db.planner.analyzer.Unlock()
+	db.engine.planner.analyzer.Lock()
+	db.engine.planner.analyzer.cursor = 0
+	db.engine.planner.analyzer.softBudget = 1 // 1ns, effectively one heavy field per cycle
+	db.engine.planner.analyzer.Unlock()
 
 	s0 := db.PlannerStats()
 	prevVersion := s0.Version
@@ -61,13 +61,13 @@ func TestPlannerStatsCollector_PeriodicBudgetAdvancesCursor(t *testing.T) {
 
 	cycles := fieldCount + 3
 	for i := 0; i < cycles; i++ {
-		if err := db.refreshPlannerStatsWithBudget(db.planner.analyzer.softBudget, true); err != nil {
+		if err := db.refreshPlannerStatsWithBudget(db.engine.planner.analyzer.softBudget, true); err != nil {
 			t.Fatalf("refreshPlannerStatsPeriodic cycle %d: %v", i, err)
 		}
 
-		db.planner.analyzer.Lock()
-		curCursor := db.planner.analyzer.cursor
-		db.planner.analyzer.Unlock()
+		db.engine.planner.analyzer.Lock()
+		curCursor := db.engine.planner.analyzer.cursor
+		db.engine.planner.analyzer.Unlock()
 
 		wantCursor := (prevCursor + 1) % fieldCount
 		if curCursor != wantCursor {
@@ -99,7 +99,7 @@ func TestResolvePlannerAnalyzeInterval(t *testing.T) {
 func TestPlannerAnalyzeScheduler_Disabled(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
 
-	if db.planner.analyzer.stop != nil || db.planner.analyzer.done != nil {
+	if db.engine.planner.analyzer.stop != nil || db.engine.planner.analyzer.done != nil {
 		t.Fatalf("scheduler should be disabled for negative interval")
 	}
 
@@ -116,7 +116,7 @@ func TestPlannerAnalyzeScheduler_Disabled(t *testing.T) {
 func TestPlannerAnalyzeScheduler_StartAndStop(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: 10 * time.Millisecond})
 
-	if db.planner.analyzer.stop == nil || db.planner.analyzer.done == nil {
+	if db.engine.planner.analyzer.stop == nil || db.engine.planner.analyzer.done == nil {
 		t.Fatalf("scheduler should be started")
 	}
 
@@ -130,7 +130,7 @@ func TestPlannerAnalyzeScheduler_StartAndStop(t *testing.T) {
 		t.Fatalf("Close: %v", err)
 	}
 
-	if db.planner.analyzer.stop != nil || db.planner.analyzer.done != nil {
+	if db.engine.planner.analyzer.stop != nil || db.engine.planner.analyzer.done != nil {
 		t.Fatalf("scheduler channels must be cleared on close")
 	}
 

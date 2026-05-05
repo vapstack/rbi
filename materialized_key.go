@@ -377,7 +377,7 @@ func materializedPredKeyForNumericBucketSpan(field string, startBucket, endBucke
 	}
 }
 
-func materializedPredKeyForDistinctSetTerms(field string, op qir.Op, vals *pooled.SliceBuf[string], includeNil bool) materializedPredKey {
+func materializedPredKeyForDistinctSetTerms(field string, op qir.Op, vals *pooled.Slice[string], includeNil bool) materializedPredKey {
 	termCount := btoi(includeNil)
 	if vals != nil {
 		termCount += vals.Len()

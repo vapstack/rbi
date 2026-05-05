@@ -1223,13 +1223,13 @@ func buildFieldAccessorBundle(f *field, fieldType reflect.Type, offset uintptr) 
 	}
 }
 
-func (db *DB[K, V]) makeIndexedFieldAccessor(f *field) (indexedFieldAccessor, error) {
+func makeIndexedFieldAccessor(vtype reflect.Type, f *field) (indexedFieldAccessor, error) {
 	acc := indexedFieldAccessor{
 		name:  f.DBName,
 		field: f,
 	}
 
-	fieldType, offset := resolveFieldTypeAndOffset(db.vtype, f.Index)
+	fieldType, offset := resolveFieldTypeAndOffset(vtype, f.Index)
 	bundle, err := buildFieldAccessorBundle(f, fieldType, offset)
 	if err != nil {
 		return indexedFieldAccessor{}, err

@@ -232,14 +232,11 @@ func TestTransparentMode_IgnoresPersistedIndexAndDoesNotStoreSidecar(t *testing.
 		t.Fatalf("Set(2): %v", err)
 	}
 
-	if !db.transparent {
+	if db.engine != nil {
 		t.Fatal("expected transparent mode")
 	}
 	if db.strMap != nil {
 		t.Fatalf("transparent mode must not allocate strmap: %#v", db.strMap)
-	}
-	if db.snapshot.current.Load() != nil {
-		t.Fatal("transparent mode must not publish snapshots")
 	}
 	if strings.Contains(logBuf.String(), "persisted index") {
 		t.Fatalf("transparent mode must ignore sidecar load/store logs, got %q", logBuf.String())
@@ -267,10 +264,6 @@ func TestTransparentMode_IgnoresPersistedIndexAndDoesNotStoreSidecar(t *testing.
 	} else if got != nil {
 		t.Fatalf("Get(1)=%#v want nil", got)
 	}
-	if db.snapshot.current.Load() != nil {
-		t.Fatal("transparent writes must not publish snapshots")
-	}
-
 	if err := db.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
@@ -322,6 +315,24 @@ func TestTransparentMode_DisablesIndexedAPIsAndUsesDirectBoltSeqScans(t *testing
 	}
 	if err := db.RefreshPlannerStats(); !errors.Is(err, ErrNoIndex) {
 		t.Fatalf("RefreshPlannerStats err=%v want %v", err, ErrNoIndex)
+	}
+	if got := db.PlannerStats(); got.Version != 0 || got.FieldCount != 0 || got.AnalyzeInterval != 0 || got.TraceSampleEvery != 0 || len(got.Fields) != 0 {
+		t.Fatalf("PlannerStats in transparent mode=%+v want zero planner payload", got)
+	}
+	if got := db.CalibrationStats(); got.Enabled || got.SampleEvery != 0 || !got.UpdatedAt.IsZero() || got.SamplesTotal != 0 || len(got.Multipliers) != 0 || len(got.Samples) != 0 {
+		t.Fatalf("CalibrationStats in transparent mode=%+v want zero calibration payload", got)
+	}
+	if _, ok := db.GetCalibrationSnapshot(); ok {
+		t.Fatal("GetCalibrationSnapshot in transparent mode returned state")
+	}
+	if err := db.SetCalibrationSnapshot(CalibrationSnapshot{}); !errors.Is(err, ErrNoIndex) {
+		t.Fatalf("SetCalibrationSnapshot err=%v want %v", err, ErrNoIndex)
+	}
+	if err := db.SaveCalibration(filepath.Join(dir, "transparent.cal")); !errors.Is(err, ErrNoIndex) {
+		t.Fatalf("SaveCalibration err=%v want %v", err, ErrNoIndex)
+	}
+	if err := db.LoadCalibration(filepath.Join(dir, "transparent.cal")); !errors.Is(err, ErrNoIndex) {
+		t.Fatalf("LoadCalibration err=%v want %v", err, ErrNoIndex)
 	}
 
 	var seq []string
@@ -410,7 +421,7 @@ func TestIndexTags_OptInSupportRBIOnlyAndIgnoresDBI(t *testing.T) {
 		_ = raw.Close()
 	})
 
-	if db.transparent {
+	if db.engine == nil {
 		t.Fatal("expected indexed mode")
 	}
 
@@ -421,20 +432,20 @@ func TestIndexTags_OptInSupportRBIOnlyAndIgnoresDBI(t *testing.T) {
 		"rbi_wins_unique",
 		"rbi_wins_enabled",
 	} {
-		if _, ok := db.indexFields[f]; !ok {
+		if _, ok := db.engine.fields[f]; !ok {
 			t.Fatalf("expected indexed field %q", f)
 		}
 	}
-	if _, ok := db.indexFields["untagged"]; ok {
+	if _, ok := db.engine.fields["untagged"]; ok {
 		t.Fatal("untagged field must stay non-indexed")
 	}
-	if _, ok := db.indexFields["db_default"]; ok {
+	if _, ok := db.engine.fields["db_default"]; ok {
 		t.Fatal("dbi default must be ignored")
 	}
-	if _, ok := db.indexFields["db_unique"]; ok {
+	if _, ok := db.engine.fields["db_unique"]; ok {
 		t.Fatal("dbi unique must be ignored")
 	}
-	if _, ok := db.indexFields["rbi_wins_disabled"]; ok {
+	if _, ok := db.engine.fields["rbi_wins_disabled"]; ok {
 		t.Fatal("rbi disable must ignore dbi")
 	}
 
@@ -509,11 +520,8 @@ func TestIndexTags_OptInLeavesUntaggedStructTransparent(t *testing.T) {
 		_ = raw.Close()
 	})
 
-	if !db.transparent {
+	if db.engine != nil {
 		t.Fatal("expected transparent mode for untagged struct")
-	}
-	if len(db.indexFields) != 0 {
-		t.Fatalf("expected no indexed fields, got %d", len(db.indexFields))
 	}
 }
 
@@ -530,7 +538,7 @@ func TestIndexTags_InvalidActiveTagValueFailsFast(t *testing.T) {
 	if err != nil {
 		t.Fatalf("invalid dbi tag must be ignored, err=%v", err)
 	}
-	if !dbiDB.transparent {
+	if dbiDB.engine != nil {
 		t.Fatal("dbi-only struct must stay transparent")
 	}
 	_ = dbiDB.Close()
@@ -556,7 +564,7 @@ func TestIndexTags_InvalidActiveTagValueFailsFast(t *testing.T) {
 	if err != nil {
 		t.Fatalf("removed dbi auto tag must be ignored, err=%v", err)
 	}
-	if !dbiAutoDB.transparent {
+	if dbiAutoDB.engine != nil {
 		t.Fatal("dbi auto-only struct must stay transparent")
 	}
 	_ = dbiAutoDB.Close()
@@ -593,11 +601,8 @@ func TestIndexTags_RBIDisableIgnoresForeignDBITag(t *testing.T) {
 		_ = raw.Close()
 	})
 
-	if !db.transparent {
+	if db.engine != nil {
 		t.Fatal("expected transparent mode")
-	}
-	if len(db.indexFields) != 0 {
-		t.Fatalf("expected no indexed fields, got %d", len(db.indexFields))
 	}
 }
 
@@ -610,10 +615,10 @@ func TestIndexTags_RBIIndexIgnoresDBIDisable(t *testing.T) {
 		_ = raw.Close()
 	})
 
-	if db.transparent {
+	if db.engine == nil {
 		t.Fatal("expected indexed mode")
 	}
-	if _, ok := db.indexFields["name"]; !ok {
+	if _, ok := db.engine.fields["name"]; !ok {
 		t.Fatal("expected name to be indexed")
 	}
 
@@ -638,13 +643,13 @@ func TestIndexTags_EmbeddedParentIndexDoesNotEnableSharedFields(t *testing.T) {
 		_ = raw.Close()
 	})
 
-	if db.transparent {
+	if db.engine == nil {
 		t.Fatal("expected indexed mode because embedded Email has its own unique tag")
 	}
-	if _, ok := db.indexFields["name"]; ok {
+	if _, ok := db.engine.fields["name"]; ok {
 		t.Fatal("embedded parent index tag must not enable untagged child field")
 	}
-	if _, ok := db.indexFields["email"]; !ok {
+	if _, ok := db.engine.fields["email"]; !ok {
 		t.Fatal("embedded child field with its own tag must stay indexed")
 	}
 
@@ -669,11 +674,8 @@ func TestIndexTags_EmbeddedParentDisableSuppressesSharedFields(t *testing.T) {
 		_ = raw.Close()
 	})
 
-	if !db.transparent {
+	if db.engine != nil {
 		t.Fatal("expected transparent mode")
-	}
-	if len(db.indexFields) != 0 {
-		t.Fatalf("expected no indexed fields, got %d", len(db.indexFields))
 	}
 
 	if err := db.Set(1, &embeddedDisabledByParentRec{
@@ -697,10 +699,10 @@ func TestIndexTags_DBTagDashDoesNotDisableIndexing(t *testing.T) {
 		_ = raw.Close()
 	})
 
-	if db.transparent {
+	if db.engine == nil {
 		t.Fatal("expected indexed mode")
 	}
-	f, ok := db.indexFields["Name"]
+	f, ok := db.engine.fields["Name"]
 	if !ok {
 		t.Fatal("expected field to be indexed under Go field name")
 	}
@@ -743,25 +745,25 @@ func TestIndexOptions_OverrideTagsAndResolveGoAndDBNames(t *testing.T) {
 		_ = raw.Close()
 	})
 
-	if db.transparent {
+	if db.engine == nil {
 		t.Fatal("expected indexed mode")
 	}
-	if _, ok := db.indexFields["name"]; !ok {
+	if _, ok := db.engine.fields["name"]; !ok {
 		t.Fatal("Options.Index must accept Go field name")
 	}
-	if _, ok := db.indexFields["score_db"]; !ok {
+	if _, ok := db.engine.fields["score_db"]; !ok {
 		t.Fatal("Options.Index must accept db field name")
 	}
-	if _, ok := db.indexFields["email"]; ok {
+	if _, ok := db.engine.fields["email"]; ok {
 		t.Fatal("Options.Index must ignore rbi tags when map is non-nil")
 	}
-	if _, ok := db.indexFields["amount"]; ok {
+	if _, ok := db.engine.fields["amount"]; ok {
 		t.Fatal("measure field must not be registered as ordinary index")
 	}
-	if _, ok := db.measureFields["amount"]; !ok {
+	if _, ok := db.engine.measureFields["amount"]; !ok {
 		t.Fatal("Options.Index measure field is missing")
 	}
-	if acc, ok := db.measureFieldMap["amount"]; !ok {
+	if acc, ok := db.engine.measureFieldMap["amount"]; !ok {
 		t.Fatal("Options.Index measure accessor is missing")
 	} else if acc.kind != measureValueSigned {
 		t.Fatalf("measure accessor kind=%d want signed", acc.kind)
@@ -796,10 +798,10 @@ func TestIndexOptions_DBTagsResolveWhenEmbeddedGoNamesCollide(t *testing.T) {
 		_ = db.Close()
 		_ = rawDBTags.Close()
 	})
-	if _, ok := db.indexFields["left_id"]; !ok {
+	if _, ok := db.engine.fields["left_id"]; !ok {
 		t.Fatal("Options.Index must accept left db tag despite colliding Go names")
 	}
-	if _, ok := db.indexFields["right_id"]; !ok {
+	if _, ok := db.engine.fields["right_id"]; !ok {
 		t.Fatal("Options.Index must accept right db tag despite colliding Go names")
 	}
 
@@ -833,14 +835,8 @@ func TestIndexOptions_EmptyMapDisablesTags(t *testing.T) {
 		_ = raw.Close()
 	})
 
-	if !db.transparent {
+	if db.engine != nil {
 		t.Fatal("non-nil empty Options.Index must disable all indexes")
-	}
-	if len(db.indexFields) != 0 {
-		t.Fatalf("expected no ordinary fields, got %d", len(db.indexFields))
-	}
-	if len(db.measureFields) != 0 {
-		t.Fatalf("expected no measure fields, got %d", len(db.measureFields))
 	}
 }
 
@@ -958,19 +954,19 @@ func TestIndexTags_MeasureMetadataIsSeparateFromOrdinaryIndex(t *testing.T) {
 		_ = raw.Close()
 	})
 
-	if db.transparent {
+	if db.engine == nil {
 		t.Fatal("measure DB must not be transparent")
 	}
-	if _, ok := db.indexFields["status"]; !ok {
+	if _, ok := db.engine.fields["status"]; !ok {
 		t.Fatal("ordinary indexed field is missing")
 	}
-	if _, ok := db.indexFields["amount"]; ok {
+	if _, ok := db.engine.fields["amount"]; ok {
 		t.Fatal("measure field must not be visible to ordinary indexes")
 	}
-	if _, ok := db.measureFields["amount"]; !ok {
+	if _, ok := db.engine.measureFields["amount"]; !ok {
 		t.Fatal("measure field is missing")
 	}
-	if acc, ok := db.measureFieldMap["amount"]; !ok {
+	if acc, ok := db.engine.measureFieldMap["amount"]; !ok {
 		t.Fatal("measure accessor is missing")
 	} else if acc.ordinal != 0 {
 		t.Fatalf("measure accessor ordinal=%d want 0", acc.ordinal)
@@ -978,7 +974,7 @@ func TestIndexTags_MeasureMetadataIsSeparateFromOrdinaryIndex(t *testing.T) {
 	if err := db.Set(1, &measureTaggedRec{Status: "ok", Amount: 42}); err != nil {
 		t.Fatalf("Set measure record: %v", err)
 	}
-	acc := db.measureFieldMap["amount"]
+	acc := db.engine.measureFieldMap["amount"]
 	if got, ok := db.getSnapshot().measure.Get(acc.ordinal).lookup(1); !ok || got != 42 {
 		t.Fatalf("measure storage lookup=(%d,%v) want (42,true)", got, ok)
 	}
@@ -1034,22 +1030,22 @@ func TestIndexTags_MeasureOnlyDBKeepsSnapshotMode(t *testing.T) {
 		_ = raw.Close()
 	})
 
-	if db.transparent {
+	if db.engine == nil {
 		t.Fatal("measure-only DB must not be transparent")
 	}
-	if len(db.indexFields) != 0 {
-		t.Fatalf("expected no ordinary fields, got %d", len(db.indexFields))
+	if len(db.engine.fields) != 0 {
+		t.Fatalf("expected no ordinary fields, got %d", len(db.engine.fields))
 	}
-	if _, ok := db.measureFields["amount"]; !ok {
+	if _, ok := db.engine.measureFields["amount"]; !ok {
 		t.Fatal("measure field is missing")
 	}
-	if len(db.measureFieldAccess) != 1 {
-		t.Fatalf("measure accessor count=%d want 1", len(db.measureFieldAccess))
+	if len(db.engine.measureFieldAccess) != 1 {
+		t.Fatalf("measure accessor count=%d want 1", len(db.engine.measureFieldAccess))
 	}
 	if err := db.Set(1, &measureOnlyRec{Amount: 7}); err != nil {
 		t.Fatalf("Set measure-only record: %v", err)
 	}
-	acc := db.measureFieldMap["amount"]
+	acc := db.engine.measureFieldMap["amount"]
 	if got, ok := db.getSnapshot().measure.Get(acc.ordinal).lookup(1); !ok || got != 7 {
 		t.Fatalf("measure-only storage lookup=(%d,%v) want (7,true)", got, ok)
 	}
@@ -1241,9 +1237,9 @@ func assertNoFutureSnapshotRefs[K ~uint64 | ~string, V any](tb testing.TB, db *D
 		currentSeq = current.seq
 	}
 
-	db.snapshot.mu.RLock()
-	defer db.snapshot.mu.RUnlock()
-	for seq, ref := range db.snapshot.bySeq {
+	db.engine.snapshot.mu.RLock()
+	defer db.engine.snapshot.mu.RUnlock()
+	for seq, ref := range db.engine.snapshot.bySeq {
 		if ref == nil || ref.snap == nil {
 			tb.Fatalf("snapshot registry contains nil entry for seq=%d", seq)
 		}
@@ -5685,8 +5681,11 @@ type stableOrdinalRec struct {
 
 func TestInitIndexedFieldAccessors_AssignsStableSortedOrdinals(t *testing.T) {
 	db := &DB[uint64, stableOrdinalRec]{
-		indexFields: make(map[string]*field),
-		vtype:       reflect.TypeFor[stableOrdinalRec](),
+		vtype:   reflect.TypeFor[stableOrdinalRec](),
+		options: &Options{},
+		engine: &queryEngine{
+			fields: make(map[string]*field),
+		},
 	}
 	if err := db.populateFields(db.vtype, nil); err != nil {
 		t.Fatalf("populateFields: %v", err)
@@ -5695,8 +5694,8 @@ func TestInitIndexedFieldAccessors_AssignsStableSortedOrdinals(t *testing.T) {
 		t.Fatalf("initIndexedFieldAccessors: %v", err)
 	}
 
-	got := make([]string, len(db.indexedFieldAccess))
-	for i, acc := range db.indexedFieldAccess {
+	got := make([]string, len(db.engine.indexedFieldAccess))
+	for i, acc := range db.engine.indexedFieldAccess {
 		got[i] = acc.name
 		if acc.ordinal != i {
 			t.Fatalf("expected ordinal %d for %q, got %d", i, acc.name, acc.ordinal)
@@ -5707,4 +5706,24 @@ func TestInitIndexedFieldAccessors_AssignsStableSortedOrdinals(t *testing.T) {
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("unexpected field ordinal order:\n got=%v\nwant=%v", got, want)
 	}
+}
+
+func (db *DB[K, V]) populateFields(t reflect.Type, idx []int) error {
+	collector := fieldCollector{
+		options: db.options,
+	}
+	if db.engine != nil {
+		collector.indexFields = db.engine.fields
+		collector.measureFields = db.engine.measureFields
+		collector.hasUnique = db.engine.hasUnique
+	}
+	if err := collector.populateFields(t, idx); err != nil {
+		return err
+	}
+	if db.engine != nil {
+		db.engine.fields = collector.indexFields
+		db.engine.measureFields = collector.measureFields
+		db.engine.hasUnique = collector.hasUnique
+	}
+	return nil
 }

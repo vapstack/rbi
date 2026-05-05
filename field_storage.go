@@ -176,19 +176,19 @@ type fieldIndexChunkRef struct {
 
 type fieldIndexChunkDirPage struct {
 	refsCount atomic.Int32
-	refs      *pooled.SliceBuf[fieldIndexChunkRef]
-	prefix    *pooled.SliceBuf[int]
-	rowPrefix *pooled.SliceBuf[uint64]
+	refs      *pooled.Slice[fieldIndexChunkRef]
+	prefix    *pooled.Slice[int]
+	rowPrefix *pooled.Slice[uint64]
 }
 
 // fieldIndexChunkedRoot stores immutable directory pages over immutable chunks
 // plus top-level chunk/entry prefixes for fast rank/span calculations.
 type fieldIndexChunkedRoot struct {
 	refs        atomic.Int32
-	pages       *pooled.SliceBuf[*fieldIndexChunkDirPage]
-	chunkPrefix *pooled.SliceBuf[int]
-	prefix      *pooled.SliceBuf[int]
-	rowPrefix   *pooled.SliceBuf[uint64]
+	pages       *pooled.Slice[*fieldIndexChunkDirPage]
+	chunkPrefix *pooled.Slice[int]
+	prefix      *pooled.Slice[int]
+	rowPrefix   *pooled.Slice[uint64]
 	keyCount    int
 	chunkCount  int
 }
@@ -205,8 +205,8 @@ type fieldIndexStorage struct {
 }
 
 type fieldIndexChunkBuilder struct {
-	pages       *pooled.SliceBuf[*fieldIndexChunkDirPage]
-	pendingRefs *pooled.SliceBuf[fieldIndexChunkRef]
+	pages       *pooled.Slice[*fieldIndexChunkDirPage]
+	pendingRefs *pooled.Slice[fieldIndexChunkRef]
 	total       int
 	chunks      int
 }
@@ -268,7 +268,7 @@ var fieldIndexChunkRootRowPrefixPool = pooled.Slices[uint64]{
 
 var fieldIndexChunkDirPagePool = pooled.Pointers[fieldIndexChunkDirPage]{Clear: true}
 
-func newFieldIndexChunkRefBuf(capHint int) *pooled.SliceBuf[fieldIndexChunkRef] {
+func newFieldIndexChunkRefBuf(capHint int) *pooled.Slice[fieldIndexChunkRef] {
 	buf := fieldIndexChunkRefSlicePool.Get()
 	if capHint > 0 {
 		buf.Grow(capHint)
@@ -276,7 +276,7 @@ func newFieldIndexChunkRefBuf(capHint int) *pooled.SliceBuf[fieldIndexChunkRef] 
 	return buf
 }
 
-func newFieldIndexChunkDirPageSlice(capHint int) *pooled.SliceBuf[*fieldIndexChunkDirPage] {
+func newFieldIndexChunkDirPageSlice(capHint int) *pooled.Slice[*fieldIndexChunkDirPage] {
 	buf := fieldIndexChunkDirPagePtrSlicePool.Get()
 	if capHint > 0 {
 		buf.Grow(capHint)
@@ -284,7 +284,7 @@ func newFieldIndexChunkDirPageSlice(capHint int) *pooled.SliceBuf[*fieldIndexChu
 	return buf
 }
 
-func newFieldIndexChunkDirPageOwned(refs *pooled.SliceBuf[fieldIndexChunkRef]) *fieldIndexChunkDirPage {
+func newFieldIndexChunkDirPageOwned(refs *pooled.Slice[fieldIndexChunkRef]) *fieldIndexChunkDirPage {
 	page := fieldIndexChunkDirPagePool.Get()
 	page.refsCount.Store(1)
 	page.refs = refs
@@ -387,7 +387,7 @@ func (p *fieldIndexChunkDirPage) lastKey() indexKey {
 	return p.refs.Get(p.refs.Len() - 1).last
 }
 
-func releaseFieldIndexChunkDirPages(pages *pooled.SliceBuf[*fieldIndexChunkDirPage]) {
+func releaseFieldIndexChunkDirPages(pages *pooled.Slice[*fieldIndexChunkDirPage]) {
 	if pages == nil {
 		return
 	}
@@ -648,7 +648,7 @@ func releaseFieldIndexStorageMapOwned(m map[string]fieldIndexStorage) {
 	}
 }
 
-func retainSharedFieldIndexStorageSlots(next, prev *pooled.SliceBuf[fieldIndexStorage]) {
+func retainSharedFieldIndexStorageSlots(next, prev *pooled.Slice[fieldIndexStorage]) {
 	if next == nil || prev == nil {
 		return
 	}
@@ -661,7 +661,7 @@ func retainSharedFieldIndexStorageSlots(next, prev *pooled.SliceBuf[fieldIndexSt
 	}
 }
 
-func releaseFieldIndexStorageSlotsOwned(slots *pooled.SliceBuf[fieldIndexStorage]) {
+func releaseFieldIndexStorageSlotsOwned(slots *pooled.Slice[fieldIndexStorage]) {
 	if slots == nil {
 		return
 	}
@@ -1196,7 +1196,7 @@ func upperBoundIndexEntriesKey(entries []index, key indexKey) int {
 	return lo
 }
 
-func searchChunkPageAfterChunk(prefix *pooled.SliceBuf[int], chunk int) int {
+func searchChunkPageAfterChunk(prefix *pooled.Slice[int], chunk int) int {
 	lo, hi := 0, prefix.Len()-1
 	for lo < hi {
 		mid := (lo + hi) >> 1
@@ -1209,7 +1209,7 @@ func searchChunkPageAfterChunk(prefix *pooled.SliceBuf[int], chunk int) int {
 	return lo
 }
 
-func searchChunkPageAtOrAfterChunk(prefix *pooled.SliceBuf[int], limit int) int {
+func searchChunkPageAtOrAfterChunk(prefix *pooled.Slice[int], limit int) int {
 	lo, hi := 0, prefix.Len()-1
 	for lo < hi {
 		mid := (lo + hi) >> 1
@@ -1222,7 +1222,7 @@ func searchChunkPageAtOrAfterChunk(prefix *pooled.SliceBuf[int], limit int) int 
 	return lo
 }
 
-func searchChunkPageByLastKeyFrom(pages *pooled.SliceBuf[*fieldIndexChunkDirPage], start int, key indexKey) int {
+func searchChunkPageByLastKeyFrom(pages *pooled.Slice[*fieldIndexChunkDirPage], start int, key indexKey) int {
 	lo, hi := start, pages.Len()
 	for lo < hi {
 		mid := lo + (hi-lo)>>1
@@ -1748,7 +1748,7 @@ func newFieldIndexChunkedRootFromPages(pages []*fieldIndexChunkDirPage) *fieldIn
 	return newFieldIndexChunkedRootFromOwnedPages(pageBuf)
 }
 
-func newFieldIndexChunkedRootFromOwnedPages(pages *pooled.SliceBuf[*fieldIndexChunkDirPage]) *fieldIndexChunkedRoot {
+func newFieldIndexChunkedRootFromOwnedPages(pages *pooled.Slice[*fieldIndexChunkDirPage]) *fieldIndexChunkedRoot {
 	if pages == nil || pages.Len() == 0 {
 		return nil
 	}

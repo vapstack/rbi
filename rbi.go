@@ -376,44 +376,18 @@ func New[K ~uint64 | ~string, V any](bolt *bbolt.DB, options Options, execOpts .
 	}
 
 	db = &DB[K, V]{
-		bolt:   bolt,
-		vtype:  vtype,
-		strMap: newStrMapper(0, defaultSnapshotStrMapCompactDepth),
-		bucket: []byte(vname),
-
-		indexFields:   make(map[string]*field),
-		measureFields: make(map[string]*field),
-
-		universe: posting.List{},
+		vtype:     vtype,
+		bolt:      bolt,
+		bucket:    []byte(vname),
+		options:   &options,
+		logger:    options.Logger,
+		rebuilder: new(rebuilder),
 
 		rbiFile: bolt.Path() + "." + vname + ".rbi",
 
-		options:     &options,
 		execOptions: defaultExecOptions,
-		logger:      options.Logger,
 		encodeFn:    encodeFn,
 		decodeFn:    decodeFn,
-		snapshot: &snapshotManager{
-			bySeq:        make(map[uint64]*snapshotRef, 128),
-			statsEnabled: options.EnableSnapshotStats,
-		},
-
-		planner: &planner{
-			analyzer: &analyzer{
-				interval:   plannerAnalyzeInterval(options.AnalyzeInterval),
-				softBudget: defaultAnalyzeSoftBudget,
-			},
-			tracer: &tracer{
-				sink:        options.TraceSink,
-				sampleEvery: traceSampleEvery(options.TraceSampleEvery, options.TraceSink),
-			},
-			calibrator: &calibrator{
-				enabled:     options.CalibrationEnabled,
-				sampleEvery: calibrationSampleEvery(options.CalibrationEnabled, options.CalibrationSampleEvery),
-				persistPath: calPath,
-			},
-		},
-		rebuilder: new(rebuilder),
 	}
 	db.rebuilder.cond = sync.NewCond(&db.rebuilder.mu)
 
@@ -422,35 +396,63 @@ func New[K ~uint64 | ~string, V any](bolt *bbolt.DB, options Options, execOpts .
 		db.strKey = true
 	}
 
-	if err = db.populateFields(vtype, nil); err != nil {
+	collector := fieldCollector{
+		options: db.options,
+	}
+	if err = collector.populateFields(vtype, nil); err != nil {
 		return nil, fmt.Errorf("failed to populate index fields: %w", err)
 	}
-	if err = db.initIndexedFieldAccessors(); err != nil {
-		return nil, fmt.Errorf("failed to initialize field accessors: %w", err)
+
+	if len(collector.indexFields) != 0 || len(collector.measureFields) != 0 {
+		if db.strKey {
+			db.strMap = newStrMapper(0, defaultSnapshotStrMapCompactDepth)
+		}
+		db.engine = &queryEngine{
+			fields:        collector.indexFields,
+			measureFields: collector.measureFields,
+			hasUnique:     collector.hasUnique,
+			universe:      posting.List{},
+			snapshot: &snapshotManager{
+				bySeq:        make(map[uint64]*snapshotRef, 128),
+				statsEnabled: options.EnableSnapshotStats,
+			},
+			planner: &planner{
+				analyzer: &analyzer{
+					interval:   plannerAnalyzeInterval(options.AnalyzeInterval),
+					softBudget: defaultAnalyzeSoftBudget,
+				},
+				tracer: &tracer{
+					sink:        options.TraceSink,
+					sampleEvery: traceSampleEvery(options.TraceSampleEvery, options.TraceSink),
+				},
+				calibrator: &calibrator{
+					enabled:     options.CalibrationEnabled,
+					sampleEvery: calibrationSampleEvery(options.CalibrationEnabled, options.CalibrationSampleEvery),
+					persistPath: calPath,
+				},
+			},
+			viewPool: &pooled.Pointers[queryView]{
+				Clear: true,
+			},
+		}
+		if err = db.initIndexedFieldAccessors(); err != nil {
+			return nil, fmt.Errorf("failed to initialize field accessors: %w", err)
+		}
+		if err = db.initMeasureFieldAccessors(); err != nil {
+			return nil, fmt.Errorf("failed to initialize measure field accessors: %w", err)
+		}
+		db.engine.index = fieldIndexStorageSlicePool.Get()
+		db.engine.index.SetLen(len(db.engine.indexedFieldAccess))
+		db.engine.nilIndex = fieldIndexStorageSlicePool.Get()
+		db.engine.nilIndex.SetLen(len(db.engine.indexedFieldAccess))
+		db.engine.lenIndex = fieldIndexStorageSlicePool.Get()
+		db.engine.lenIndex.SetLen(len(db.engine.indexedFieldAccess))
+		db.engine.lenZeroComplement = fieldIndexBoolSlicePool.Get()
+		db.engine.lenZeroComplement.SetLen(len(db.engine.indexedFieldAccess))
+		db.engine.measure = measureFieldStorageSlicePool.Get()
+		db.engine.measure.SetLen(len(db.engine.measureFieldAccess))
 	}
-	if err = db.initMeasureFieldAccessors(); err != nil {
-		return nil, fmt.Errorf("failed to initialize measure field accessors: %w", err)
-	}
-	db.transparent = len(db.indexedFieldAccess) == 0 && len(db.measureFields) == 0
-	if db.transparent {
-		db.strMap = nil
-		db.index = nil
-		db.nilIndex = nil
-		db.lenIndex = nil
-		db.lenZeroComplement = nil
-	} else {
-		db.index = fieldIndexStorageSlicePool.Get()
-		db.index.SetLen(len(db.indexedFieldAccess))
-		db.nilIndex = fieldIndexStorageSlicePool.Get()
-		db.nilIndex.SetLen(len(db.indexedFieldAccess))
-		db.lenIndex = fieldIndexStorageSlicePool.Get()
-		db.lenIndex.SetLen(len(db.indexedFieldAccess))
-		db.lenZeroComplement = fieldIndexBoolSlicePool.Get()
-		db.lenZeroComplement.SetLen(len(db.indexedFieldAccess))
-		db.measure = measureFieldStorageSlicePool.Get()
-		db.measure.SetLen(len(db.measureFieldAccess))
-	}
-	db.initQueryEngine()
+
 	db.initBatcher()
 
 	err = bolt.Update(func(tx *bbolt.Tx) error {
@@ -467,13 +469,12 @@ func New[K ~uint64 | ~string, V any](bolt *bbolt.DB, options Options, execOpts .
 		loadedOrdinaryFieldCount int
 		buildMode                string
 	)
-	if !db.transparent {
+	if db.engine != nil {
 		var (
 			skipFields        map[string]struct{}
 			skipMeasureFields map[string]struct{}
 			rebuildReason     string
 		)
-
 		if _, err = os.Stat(db.rbiFile); err == nil {
 			if options.DisableIndexLoad {
 				rebuildReason = "persisted index load disabled"
@@ -491,7 +492,7 @@ func New[K ~uint64 | ~string, V any](bolt *bbolt.DB, options Options, execOpts .
 
 		loadedOrdinaryFieldCount = len(skipFields)
 		loadedFieldCount = loadedOrdinaryFieldCount + len(skipMeasureFields)
-		totalFieldCount := len(db.indexFields) + len(db.measureFields)
+		totalFieldCount := len(db.engine.fields) + len(db.engine.measureFields)
 		if rebuildReason != "" {
 			buildMode = "full"
 			db.logger.Printf("rbi: %s", rebuildReason)
@@ -531,20 +532,15 @@ func New[K ~uint64 | ~string, V any](bolt *bbolt.DB, options Options, execOpts .
 	}
 	db.initPatchFieldAccessors()
 
-	for name := range db.indexFields {
-		db.fieldSlice = append(db.fieldSlice, name)
-	}
-	for name := range db.measureFields {
-		db.fieldSlice = append(db.fieldSlice, name)
-	}
-	db.stats.FieldCount = len(db.fieldSlice)
-	if !db.transparent {
+	if db.engine != nil {
+		db.stats.FieldCount = len(db.engine.fields) + len(db.engine.measureFields)
 		if err = db.publishCurrentSequenceSnapshotNoLock(); err != nil {
 			return nil, fmt.Errorf("failed to publish initial snapshot: %w", err)
 		}
 
-		if loadedPlannerStats != nil && loadedOrdinaryFieldCount == len(db.indexFields) {
-			db.publishLoadedPlannerStats(loadedPlannerStats)
+		if loadedPlannerStats != nil && loadedOrdinaryFieldCount == len(db.engine.fields) {
+			db.engine.publishLoadedPlannerStats(loadedPlannerStats, db.getSnapshot())
+
 		} else {
 			if err = db.RefreshPlannerStats(); err != nil {
 				return nil, fmt.Errorf("failed to build planner stats snapshot: %w", err)
@@ -561,106 +557,100 @@ func New[K ~uint64 | ~string, V any](bolt *bbolt.DB, options Options, execOpts .
 	return db, nil
 }
 
-func (db *DB[K, V]) initQueryEngine() {
-	db.engine = &queryEngine{
-		strKey:             db.strKey,
-		fields:             db.indexFields,
-		indexedFieldAccess: db.indexedFieldAccess,
-		indexedFieldMap:    db.indexedFieldMap,
-		measureFieldAccess: db.measureFieldAccess,
-		measureFieldMap:    db.measureFieldMap,
-		planner:            db.planner,
-		options:            db.options,
-
-		viewPool: &pooled.Pointers[queryView]{
-			Clear: true,
-		},
-	}
+func (db *DB[K, V]) initIndexedFieldAccessors() error {
+	access, validationAccess, uniqueAccess, fieldMap, err := makeIndexedFieldAccessors(db.vtype, db.engine.fields)
+	db.engine.indexedFieldAccess = access
+	db.engine.indexedStringValidationAccess = validationAccess
+	db.engine.indexedFieldMap = fieldMap
+	db.engine.uniqueFieldAccessors = uniqueAccess
+	return err
 }
 
-func (db *DB[K, V]) initIndexedFieldAccessors() error {
-	if len(db.indexFields) == 0 {
-		db.indexedFieldAccess = nil
-		db.indexedStringValidationAccess = nil
-		db.indexedFieldMap = nil
-		db.uniqueFieldAccessors = nil
-		return nil
+func makeIndexedFieldAccessors(vtype reflect.Type, fields map[string]*field) (access, validationAccess, uniqueAccess []indexedFieldAccessor, fieldMap indexedFieldMap, err error) {
+	if len(fields) == 0 {
+		return nil, nil, nil, nil, nil
 	}
 
-	db.indexedFieldAccess = make([]indexedFieldAccessor, 0, len(db.indexFields))
-	db.indexedStringValidationAccess = make([]indexedFieldAccessor, 0, len(db.indexFields))
-	db.indexedFieldMap = make(map[string]indexedFieldAccessor, len(db.indexFields))
-	db.uniqueFieldAccessors = make([]indexedFieldAccessor, 0, 4)
+	access = make([]indexedFieldAccessor, 0, len(fields))
+	validationAccess = make([]indexedFieldAccessor, 0, len(fields))
+	uniqueAccess = make([]indexedFieldAccessor, 0, 4)
+	fieldMap = make(indexedFieldMap, len(fields))
 
-	names := make([]string, 0, len(db.indexFields))
-	for name := range db.indexFields {
+	names := make([]string, 0, len(fields))
+	for name := range fields {
 		names = append(names, name)
 	}
 	slices.Sort(names)
 
 	for _, name := range names {
-		f := db.indexFields[name]
-		acc, err := db.makeIndexedFieldAccessor(f)
+		f := fields[name]
+		acc, err := makeIndexedFieldAccessor(vtype, f)
 		if err != nil {
-			return err
+			return nil, nil, nil, nil, err
 		}
-		acc.ordinal = len(db.indexedFieldAccess)
-		db.indexedFieldAccess = append(db.indexedFieldAccess, acc)
+		acc.ordinal = len(access)
+		access = append(access, acc)
 		if f.UseVI || f.Kind == reflect.String {
-			db.indexedStringValidationAccess = append(db.indexedStringValidationAccess, acc)
+			validationAccess = append(validationAccess, acc)
 		}
-		db.indexedFieldMap[f.DBName] = acc
+		fieldMap[f.DBName] = acc
 		if f.Unique && !f.Slice {
-			db.uniqueFieldAccessors = append(db.uniqueFieldAccessors, acc)
+			uniqueAccess = append(uniqueAccess, acc)
 		}
 	}
-	return nil
+	return access, validationAccess, uniqueAccess, fieldMap, nil
 }
 
 func (db *DB[K, V]) initPatchFieldAccessors() {
-	if len(db.patchMap) == 0 {
-		db.patchFieldAccess = nil
-		db.patchFieldOrdinal = nil
+	access, ordinals := makePatchFieldAccessors(db.vtype, db.patchMap)
+	db.patchFieldAccess = access
+	db.patchFieldOrdinal = ordinals
+
+	if db.engine == nil {
 		return
 	}
+	for i := range db.engine.indexedFieldAccess {
+		ordinal, ok := db.patchFieldOrdinal[db.engine.indexedFieldAccess[i].field.Name]
+		if !ok {
+			db.engine.indexedFieldAccess[i].patchOrdinal = -1
+			continue
+		}
+		db.engine.indexedFieldAccess[i].patchOrdinal = ordinal
+	}
+}
 
-	db.patchFieldAccess = make([]patchFieldAccessor, 0, len(db.patchMap))
-	db.patchFieldOrdinal = make(map[string]int, len(db.patchMap))
+func makePatchFieldAccessors(vtype reflect.Type, fields map[string]*field) ([]patchFieldAccessor, map[string]int) {
+	if len(fields) == 0 {
+		return nil, nil
+	}
 
-	for patchKey, f := range db.patchMap {
+	access := make([]patchFieldAccessor, 0, len(fields))
+	ordinals := make(map[string]int, len(fields))
+
+	for patchKey, f := range fields {
 		if patchKey != f.Name {
 			continue
 		}
 
 		acc := patchFieldAccessor{field: f}
-		fieldType, offset := resolveFieldTypeAndOffset(db.vtype, f.Index)
+		fieldType, offset := resolveFieldTypeAndOffset(vtype, f.Index)
 		acc.valueEqual = buildPatchValueEqualFn(f, fieldType, offset)
 		acc.copyValue = buildPatchValueCopyFn(f, fieldType, offset)
 
-		ordinal := len(db.patchFieldAccess)
-		db.patchFieldAccess = append(db.patchFieldAccess, acc)
-		db.patchFieldOrdinal[f.Name] = ordinal
+		ordinal := len(access)
+		access = append(access, acc)
+		ordinals[f.Name] = ordinal
 	}
 
-	for i := range db.indexedFieldAccess {
-		ordinal, ok := db.patchFieldOrdinal[db.indexedFieldAccess[i].field.Name]
-		if !ok {
-			db.indexedFieldAccess[i].patchOrdinal = -1
-			continue
-		}
-		db.indexedFieldAccess[i].patchOrdinal = ordinal
-	}
+	return access, ordinals
 }
 
-func (qe *queryEngine) initSnapshotRuntimeCaches(s *indexSnapshot) {
-	if s == nil {
-		return
-	}
+func (db *DB[K, V]) initSnapshotRuntimeCaches(s *indexSnapshot) {
 	s.numericRangeBucketCache = numericRangeBucketCachePool.Get()
-	s.numericRangeBucketCache.init(len(qe.indexedFieldAccess))
-	s.matPredCacheMaxEntries = max(0, qe.options.SnapshotMaterializedPredCacheMaxEntries)
+	s.numericRangeBucketCache.init(len(db.engine.indexedFieldAccess))
+	s.matPredCacheMaxEntries = max(0, db.options.SnapshotMaterializedPredCacheMaxEntries)
 	s.matPredCacheMaxCard = materializedPredCacheMaxCardinality(
-		qe.options.SnapshotMaterializedPredCacheMaxCardinality,
+		db.options.SnapshotMaterializedPredCacheMaxCardinality,
 	)
 	if s.matPredCacheMaxEntries > 0 {
 		s.matPredCache = materializedPredCachePool.Get()
@@ -919,48 +909,29 @@ type (
 	//
 	// DB is safe for concurrent use.
 	DB[K ~string | ~uint64, V any] struct {
-		bolt  *bbolt.DB
 		vtype reflect.Type
 
+		bolt   *bbolt.DB
 		bucket []byte
+
+		options *Options
+		logger  *log.Logger
 
 		strKey bool
 		strMap *strMapper
 
-		transparent bool
+		patchMap          map[string]*field
+		patchFieldAccess  []patchFieldAccessor
+		patchFieldOrdinal map[string]int
 
-		universe posting.List
+		engine    *queryEngine // nil in transparent mode
+		rebuilder *rebuilder
 
-		indexFields   map[string]*field
-		measureFields map[string]*field
+		closed atomic.Bool
+		broken atomic.Bool
 
-		fieldSlice     []string
-		hasUnique      bool
-		lenIndexLoaded bool
-
-		indexedFieldAccess            []indexedFieldAccessor
-		indexedStringValidationAccess []indexedFieldAccessor
-		indexedFieldMap               indexedFieldMap
-		uniqueFieldAccessors          []indexedFieldAccessor
-		measureFieldAccess            []measureFieldAccessor
-		measureFieldMap               measureFieldMap
-		index                         *pooled.SliceBuf[fieldIndexStorage]
-		nilIndex                      *pooled.SliceBuf[fieldIndexStorage]
-		lenIndex                      *pooled.SliceBuf[fieldIndexStorage]
-		lenZeroComplement             *pooled.SliceBuf[bool]
-		measure                       *pooled.SliceBuf[measureFieldStorage]
-		patchMap                      map[string]*field
-		patchFieldAccess              []patchFieldAccessor
-		patchFieldOrdinal             map[string]int
-
-		planner     *planner
-		engine      *queryEngine
-		snapshot    *snapshotManager
 		autoBatcher *autoBatcher[K, V]
-		rebuilder   *rebuilder
-		logger      *log.Logger
 
-		options     *Options
 		execOptions execOptions[K, V]
 
 		rbiFile string
@@ -970,9 +941,7 @@ type (
 
 		recPool pooled.Pointers[V]
 
-		mu     sync.RWMutex
-		closed atomic.Bool
-		broken atomic.Bool
+		mu sync.RWMutex
 
 		stats Stats[K]
 
@@ -1367,7 +1336,7 @@ func (db *DB[K, V]) publishCurrentSequenceSnapshotNoLock() error {
 func (db *DB[K, V]) tripBrokenLocked(op string, cause any) error {
 	if db.broken.CompareAndSwap(false, true) {
 		db.logger.Printf("rbi: index entered broken state: post-commit snapshot publish failed (%v): %v", op, cause)
-		if stop := db.planner.analyzer.stop; stop != nil {
+		if stop := db.engine.planner.analyzer.stop; stop != nil {
 			select {
 			case <-stop:
 			default:
@@ -1418,7 +1387,7 @@ func (db *DB[K, V]) RebuildIndex() error {
 	if err := db.unavailableErr(); err != nil {
 		return err
 	}
-	if db.transparent {
+	if db.engine == nil {
 		return ErrNoIndex
 	}
 
@@ -1450,15 +1419,18 @@ func (db *DB[K, V]) Stats() Stats[K] {
 	}
 	defer db.endOp()
 
-	snap, seq, ref, pinned := db.pinCurrentSnapshot()
-	defer db.unpinCurrentSnapshot(seq, ref, pinned)
-
 	db.mu.RLock()
 	out := db.stats
 	db.mu.RUnlock()
 
-	out.KeyCount = snap.universeCardinality()
-	out.LastKey = db.statsLastKeyFromSnapshot(snap, out.KeyCount)
+	if db.engine != nil {
+		snap, seq, ref, pinned := db.pinCurrentSnapshot()
+		defer db.unpinCurrentSnapshot(seq, ref, pinned)
+
+		out.KeyCount = snap.universeCardinality()
+		out.LastKey = db.statsLastKeyFromSnapshot(snap, out.KeyCount)
+		out.SnapshotSequence = snap.seq
+	}
 
 	db.autoBatcher.mu.Lock()
 	out.AutoBatchQueueLen = db.autoBatcher.queueSize
@@ -1469,8 +1441,6 @@ func (db *DB[K, V]) Stats() Stats[K] {
 	if out.AutoBatchCount > 0 {
 		out.AutoBatchAvgSize = float64(db.autoBatcher.dequeued.Load()) / float64(out.AutoBatchCount)
 	}
-
-	out.SnapshotSequence = snap.seq
 
 	return out
 }
@@ -1521,6 +1491,10 @@ func (db *DB[K, V]) IndexStats() IndexStats {
 		return IndexStats{}
 	}
 	defer db.endOp()
+
+	if db.engine == nil {
+		return IndexStats{}
+	}
 
 	snap, seq, ref, pinned := db.pinCurrentSnapshot()
 	defer db.unpinCurrentSnapshot(seq, ref, pinned)
@@ -1586,7 +1560,7 @@ func unregInstanceOnError(err *error, boltPath string, vname string) {
 func recoverPublishAfterCommit[K ~string | ~uint64, V any](db *DB[K, V], seq uint64, op string, err *error) {
 	if r := recover(); r != nil {
 		*err = db.tripBrokenLocked(op, r)
-		db.snapshot.dropStaged(seq)
+		db.engine.snapshot.dropStaged(seq)
 	}
 }
 
@@ -1688,12 +1662,12 @@ func accumulateIndexEntryStats(key indexKey, ids posting.List, countDistinct boo
 	stats.entryCount++
 }
 
-func approxSliceBufBytes[T any](buf *pooled.SliceBuf[T]) uint64 {
+func approxSliceBufBytes[T any](buf *pooled.Slice[T]) uint64 {
 	if buf == nil {
 		return 0
 	}
 	var zero T
-	return uint64(unsafe.Sizeof(pooled.SliceBuf[T]{})) +
+	return uint64(unsafe.Sizeof(pooled.Slice[T]{})) +
 		uint64(buf.Cap())*uint64(unsafe.Sizeof(zero))
 }
 
@@ -1761,20 +1735,16 @@ func (db *DB[K, V]) AutoBatchStats() AutoBatchStats {
 // planner stats snapshot, whether it was loaded from a persisted sidecar or
 // rebuilt in memory.
 //
-// In transparent mode planner stats are not built or refreshed automatically,
-// so the returned planner payload stays zero-valued: Version,
-// UniverseCardinality, FieldCount, GeneratedAt, and per-field stats are all
-// unset. AnalyzeInterval and TraceSampleEvery still reflect the configured
-// options.
+// In transparent mode no query engine and no runtime planner exist, so the
+// returned planner payload is zero-valued.
 func (db *DB[K, V]) PlannerStats() PlannerStats {
-	return db.engine.plannerStats()
-}
-
-func (qe *queryEngine) plannerStats() PlannerStats {
-	out := PlannerStats{
-		Fields: make(map[string]PlannerFieldStats),
+	var out PlannerStats
+	if db.engine == nil {
+		return out
 	}
-	if ps := qe.planner.stats.Load(); ps != nil {
+	out.Fields = make(map[string]PlannerFieldStats)
+
+	if ps := db.engine.planner.stats.Load(); ps != nil {
 		out.Version = ps.Version
 		out.GeneratedAt = ps.GeneratedAt
 		out.UniverseCardinality = ps.UniverseCardinality
@@ -1786,10 +1756,10 @@ func (qe *queryEngine) plannerStats() PlannerStats {
 			}
 		}
 	}
-	out.TraceSampleEvery = qe.planner.tracer.sampleEvery
-	qe.planner.analyzer.Lock()
-	out.AnalyzeInterval = qe.planner.analyzer.interval
-	qe.planner.analyzer.Unlock()
+	out.TraceSampleEvery = db.engine.planner.tracer.sampleEvery
+	db.engine.planner.analyzer.Lock()
+	out.AnalyzeInterval = db.engine.planner.analyzer.interval
+	db.engine.planner.analyzer.Unlock()
 	return out
 }
 
@@ -1801,23 +1771,23 @@ func (qe *queryEngine) plannerStats() PlannerStats {
 // When calibration is disabled, or no calibration state has been initialized yet,
 // it returns the current settings with zeroed calibration data.
 //
-// In indexed mode calibration state is initialized on startup when
-// calibration is enabled. In transparent mode startup skips calibration
-// initialization, so this method usually returns configured settings with zero
-// calibration payload unless state was explicitly injected through
-// SetCalibrationSnapshot.
+// In transparent mode no query engine and no runtime planner exist, so the
+// returned calibration payload is zero-valued.
 func (db *DB[K, V]) CalibrationStats() CalibrationStats {
-	return db.engine.calibrationStats()
+	return db.calibrationStats()
 }
 
-func (qe *queryEngine) calibrationStats() CalibrationStats {
+func (db *DB[K, V]) calibrationStats() CalibrationStats {
 	out := CalibrationStats{
-		Enabled:     qe.planner.calibrator.enabled,
-		SampleEvery: qe.planner.calibrator.sampleEvery,
 		Multipliers: make(map[string]float64, int(plannerCalPlanCount)),
 		Samples:     make(map[string]uint64, int(plannerCalPlanCount)),
 	}
-	if cs := qe.planner.calibrator.state.Load(); cs != nil {
+	if db.engine == nil {
+		return out
+	}
+	out.Enabled = db.engine.planner.calibrator.enabled
+	out.SampleEvery = db.engine.planner.calibrator.sampleEvery
+	if cs := db.engine.planner.calibrator.state.Load(); cs != nil {
 		cal := calibrationSnapshotFromState(cs)
 		out.UpdatedAt = cal.UpdatedAt
 		out.Multipliers = cal.Multipliers
@@ -1855,15 +1825,17 @@ func (db *DB[K, V]) Close() error {
 
 	var err error
 
-	if !db.transparent && !db.options.DisableIndexStore && !db.broken.Load() {
+	if db.engine != nil && !db.options.DisableIndexStore && !db.broken.Load() {
 		err = db.storeIndex()
 	}
 
-	if e := db.persistCalibrationOnClose(); e != nil {
-		if err == nil {
-			err = e
-		} else {
-			db.logger.Println("rbi: failed to persist planner calibration:", e)
+	if db.engine != nil {
+		if e := db.persistCalibrationOnClose(); e != nil {
+			if err == nil {
+				err = e
+			} else {
+				db.logger.Println("rbi: failed to persist planner calibration:", e)
+			}
 		}
 	}
 	if err == nil && db.broken.Load() {
@@ -1913,7 +1885,7 @@ func (db *DB[K, V]) Truncate() error {
 	if err = bucket.SetSequence(prevSeq); err != nil {
 		return fmt.Errorf("restore bucket sequence: %w", err)
 	}
-	if db.transparent {
+	if db.engine == nil {
 		if _, err = bucket.NextSequence(); err != nil {
 			return fmt.Errorf("advance bucket sequence: %w", err)
 		}
@@ -1928,15 +1900,15 @@ func (db *DB[K, V]) Truncate() error {
 	}
 
 	nextIndex := fieldIndexStorageSlicePool.Get()
-	nextIndex.SetLen(len(db.indexedFieldAccess))
+	nextIndex.SetLen(len(db.engine.indexedFieldAccess))
 	nextNilIndex := fieldIndexStorageSlicePool.Get()
-	nextNilIndex.SetLen(len(db.indexedFieldAccess))
+	nextNilIndex.SetLen(len(db.engine.indexedFieldAccess))
 	nextLenIndex := fieldIndexStorageSlicePool.Get()
-	nextLenIndex.SetLen(len(db.indexedFieldAccess))
+	nextLenIndex.SetLen(len(db.engine.indexedFieldAccess))
 	nextLenZeroComplement := fieldIndexBoolSlicePool.Get()
-	nextLenZeroComplement.SetLen(len(db.indexedFieldAccess))
+	nextLenZeroComplement.SetLen(len(db.engine.indexedFieldAccess))
 	nextMeasure := measureFieldStorageSlicePool.Get()
-	nextMeasure.SetLen(len(db.measureFieldAccess))
+	nextMeasure.SetLen(len(db.engine.measureFieldAccess))
 	nextUniverse := posting.List{}
 	var nextStrMap *strMapSnapshot
 	if db.strKey {
@@ -1949,26 +1921,28 @@ func (db *DB[K, V]) Truncate() error {
 		lenIndex:           nextLenIndex,
 		lenZeroComplement:  nextLenZeroComplement,
 		measure:            nextMeasure,
-		indexedFieldByName: db.indexedFieldMap,
+		indexedFieldByName: db.engine.indexedFieldMap,
 		universe:           nextUniverse,
 		strmap:             nextStrMap,
 	}
-	db.engine.initSnapshotRuntimeCaches(snap)
-	db.snapshot.stage(snap)
+	db.initSnapshotRuntimeCaches(snap)
+	db.engine.snapshot.stage(snap)
 	if err = db.commit(tx, "truncate"); err != nil {
-		db.snapshot.dropStaged(seq)
+		db.engine.snapshot.dropStaged(seq)
 		return fmt.Errorf("commit error: %w", err)
 	}
 
-	db.strMap.truncate()
-	db.index = nextIndex
-	db.nilIndex = nextNilIndex
-	db.lenIndex = nextLenIndex
-	db.lenZeroComplement = nextLenZeroComplement
-	db.measure = nextMeasure
+	if db.strKey {
+		db.strMap.truncate()
+	}
+	db.engine.index = nextIndex
+	db.engine.nilIndex = nextNilIndex
+	db.engine.lenIndex = nextLenIndex
+	db.engine.lenZeroComplement = nextLenZeroComplement
+	db.engine.measure = nextMeasure
 
 	// Keep previously published snapshots immutable for concurrent readers.
-	db.universe = nextUniverse
+	db.engine.universe = nextUniverse
 	if err = db.publishAfterCommitLocked(seq, "truncate", func() {
 		db.finishSnapshotPublishNoLock(snap)
 	}); err != nil {

@@ -103,7 +103,7 @@ func warmNumericRangeBucketEntry(t *testing.T, db *DB[uint64, Rec], expr qx.Expr
 	}
 	defer prepared.Release()
 	f := db.engine.fieldNameByOrdinal(compiled.FieldOrdinal)
-	fm := db.indexFields[f]
+	fm := db.engine.fields[f]
 	if fm == nil {
 		t.Fatalf("expected %s field metadata", f)
 	}
@@ -479,7 +479,7 @@ func TestNumericRangeBucketSpanCache_ReusedForNearbyBounds(t *testing.T) {
 	setNumericBucketKnobs(t, db, 128, 1, 1)
 
 	snap := db.getSnapshot()
-	fm := db.indexFields["age"]
+	fm := db.engine.fields["age"]
 	if fm == nil {
 		t.Fatalf("expected age field metadata")
 	}
@@ -556,7 +556,7 @@ func TestNumericRangeBucketSpanCache_ReusedFullSpanStillMergesEdgeBuckets(t *tes
 	setNumericBucketKnobs(t, db, 128, 1, 1)
 
 	snap := db.getSnapshot()
-	fm := db.indexFields["age"]
+	fm := db.engine.fields["age"]
 	if fm == nil {
 		t.Fatalf("expected age field metadata")
 	}
@@ -652,7 +652,7 @@ func TestNumericRangeBucketSpanCache_ExtendedSuffixSpanStillMatchesRange(t *test
 	setNumericBucketKnobs(t, db, 128, 1, 1)
 
 	snap := db.getSnapshot()
-	fm := db.indexFields["age"]
+	fm := db.engine.fields["age"]
 	if fm == nil {
 		t.Fatalf("expected age field metadata")
 	}
@@ -850,7 +850,7 @@ func TestNumericRangeBucketSpanCache_RespectsCardinalityGuard(t *testing.T) {
 	setNumericBucketKnobs(t, db, 128, 1, 1)
 
 	snap := db.getSnapshot()
-	fm := db.indexFields["age"]
+	fm := db.engine.fields["age"]
 	if fm == nil {
 		t.Fatalf("expected age field metadata")
 	}
@@ -908,7 +908,7 @@ func TestNumericRangeBucketSpanCache_LoadHotPathAllocsStayLowAfterWarmup(t *test
 
 	setNumericBucketKnobs(t, db, 128, 1, 1)
 
-	fm := db.indexFields["age"]
+	fm := db.engine.fields["age"]
 	if fm == nil {
 		t.Fatalf("expected age field metadata")
 	}
@@ -959,7 +959,7 @@ func TestTryEvalNumericRangeBuckets_ColdBuildAllocsStayLowAfterWarmup(t *testing
 
 	setNumericBucketKnobs(t, db, 128, 1, 1)
 
-	fm := db.indexFields["age"]
+	fm := db.engine.fields["age"]
 	if fm == nil {
 		t.Fatalf("expected age field metadata")
 	}
@@ -1117,7 +1117,7 @@ func TestNumericRangeBucketIndex_CountBaseRangeMatchesExact(t *testing.T) {
 
 	setNumericBucketKnobs(t, db, 128, 1, 1)
 
-	fm := db.indexFields["age"]
+	fm := db.engine.fields["age"]
 	if fm == nil {
 		t.Fatalf("expected age field metadata")
 	}

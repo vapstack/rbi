@@ -43,8 +43,8 @@ type plannerOROrderBranchAnalysis struct {
 	rangeStart int
 	rangeEnd   int
 	universe   uint64
-	covered    *pooled.SliceBuf[bool]
-	predBuild  *pooled.SliceBuf[orderedORMaterializedPredicateBuildInfo]
+	covered    *pooled.Slice[bool]
+	predBuild  *pooled.Slice[orderedORMaterializedPredicateBuildInfo]
 	buildReady bool
 }
 
@@ -1034,7 +1034,7 @@ func (qv *queryView) collectMergedBaseScalarRangeFields(
 
 func (qv *queryView) collectMergedBaseScalarRangeFieldsBuf(
 	orderField string,
-	leaves *pooled.SliceBuf[qir.Expr],
+	leaves *pooled.Slice[qir.Expr],
 	dst []mergedBaseScalarRangeField,
 ) ([]mergedBaseScalarRangeField, bool) {
 	for i := 0; i < leaves.Len(); i++ {
@@ -1162,7 +1162,7 @@ func (qv *queryView) executionOrderShapeInfo(orderField string, leaves []qir.Exp
 	return hasOrderPrefix, true
 }
 
-func (qv *queryView) executionOrderShapeInfoBuf(orderField string, leaves *pooled.SliceBuf[qir.Expr]) (hasOrderPrefix bool, compatible bool) {
+func (qv *queryView) executionOrderShapeInfoBuf(orderField string, leaves *pooled.Slice[qir.Expr]) (hasOrderPrefix bool, compatible bool) {
 	for i := 0; i < leaves.Len(); i++ {
 		e := leaves.Get(i)
 		if e.Op == qir.OpNOOP {
@@ -1322,7 +1322,7 @@ func (qv *queryView) decideExecutionOrderByCost(q *qir.Shape, leaves []qir.Expr)
 	return d
 }
 
-func (qv *queryView) decideExecutionOrderByCostBuf(q *qir.Shape, leaves *pooled.SliceBuf[qir.Expr]) plannerExecutionOrderDecision {
+func (qv *queryView) decideExecutionOrderByCostBuf(q *qir.Shape, leaves *pooled.Slice[qir.Expr]) plannerExecutionOrderDecision {
 	var d plannerExecutionOrderDecision
 
 	if q.Expr.Not {
@@ -2248,7 +2248,7 @@ func (qv *queryView) estimateOrderedProfile(orderField string, leaves []qir.Expr
 	}, true
 }
 
-func (qv *queryView) estimateOrderedProfileBuf(orderField string, leaves *pooled.SliceBuf[qir.Expr], orderSlice []index, snap *plannerStatsSnapshot, universe uint64) (plannerOrderedProfile, bool) {
+func (qv *queryView) estimateOrderedProfileBuf(orderField string, leaves *pooled.Slice[qir.Expr], orderSlice []index, snap *plannerStatsSnapshot, universe uint64) (plannerOrderedProfile, bool) {
 	if universe == 0 {
 		return plannerOrderedProfile{}, false
 	}
@@ -2547,7 +2547,7 @@ func (qv *queryView) estimateOrderedProfileOverlay(orderField string, leaves []q
 	}, true
 }
 
-func (qv *queryView) estimateOrderedProfileOverlayBuf(orderField string, leaves *pooled.SliceBuf[qir.Expr], ov fieldOverlay, snap *plannerStatsSnapshot, universe uint64) (plannerOrderedProfile, bool) {
+func (qv *queryView) estimateOrderedProfileOverlayBuf(orderField string, leaves *pooled.Slice[qir.Expr], ov fieldOverlay, snap *plannerStatsSnapshot, universe uint64) (plannerOrderedProfile, bool) {
 	if universe == 0 {
 		return plannerOrderedProfile{}, false
 	}
@@ -2697,7 +2697,7 @@ func (qv *queryView) estimateOrderedProfileOverlayBuf(orderField string, leaves 
 	}, true
 }
 
-func (qv *queryView) extractOrderRangeCoverageLeaves(orderField string, leaves []qir.Expr, orderSlice []index) (int, int, *pooled.SliceBuf[bool], bool) {
+func (qv *queryView) extractOrderRangeCoverageLeaves(orderField string, leaves []qir.Expr, orderSlice []index) (int, int, *pooled.Slice[bool], bool) {
 	rb := rangeBounds{}
 	coveredBuf := boolSlicePool.Get()
 	coveredBuf.SetLen(len(leaves))
@@ -2725,7 +2725,7 @@ func (qv *queryView) extractOrderRangeCoverageLeaves(orderField string, leaves [
 	return st, en, coveredBuf, true
 }
 
-func (qv *queryView) extractOrderRangeCoverageLeavesBuf(orderField string, leaves *pooled.SliceBuf[qir.Expr], orderSlice []index) (int, int, *pooled.SliceBuf[bool], bool) {
+func (qv *queryView) extractOrderRangeCoverageLeavesBuf(orderField string, leaves *pooled.Slice[qir.Expr], orderSlice []index) (int, int, *pooled.Slice[bool], bool) {
 	rb := rangeBounds{}
 	coveredBuf := boolSlicePool.Get()
 	coveredBuf.SetLen(leaves.Len())
@@ -2753,7 +2753,7 @@ func (qv *queryView) extractOrderRangeCoverageLeavesBuf(orderField string, leave
 	return st, en, coveredBuf, true
 }
 
-func (qv *queryView) extractOrderRangeCoverageLeavesOverlay(orderField string, leaves []qir.Expr, ov fieldOverlay) (int, int, *pooled.SliceBuf[bool], bool) {
+func (qv *queryView) extractOrderRangeCoverageLeavesOverlay(orderField string, leaves []qir.Expr, ov fieldOverlay) (int, int, *pooled.Slice[bool], bool) {
 	rb := rangeBounds{}
 	coveredBuf := boolSlicePool.Get()
 	coveredBuf.SetLen(len(leaves))
@@ -2793,7 +2793,7 @@ func (qv *queryView) extractOrderRangeCoverageLeavesOverlay(orderField string, l
 	return in, total, coveredBuf, true
 }
 
-func (qv *queryView) extractOrderRangeCoverageLeavesOverlayBuf(orderField string, leaves *pooled.SliceBuf[qir.Expr], ov fieldOverlay) (int, int, *pooled.SliceBuf[bool], bool) {
+func (qv *queryView) extractOrderRangeCoverageLeavesOverlayBuf(orderField string, leaves *pooled.Slice[qir.Expr], ov fieldOverlay) (int, int, *pooled.Slice[bool], bool) {
 	rb := rangeBounds{}
 	coveredBuf := boolSlicePool.Get()
 	coveredBuf.SetLen(leaves.Len())
