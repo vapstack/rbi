@@ -161,15 +161,24 @@ func raceExtraSetNumericBucketKnobs(t *testing.T, db *DB[uint64, raceExtraRec], 
 	prevSize := db.options.NumericRangeBucketSize
 	prevMinField := db.options.NumericRangeBucketMinFieldKeys
 	prevMinSpan := db.options.NumericRangeBucketMinSpanKeys
+	prevEngineSize := db.engine.numericRangeBucketSize
+	prevEngineMinField := db.engine.numericRangeBucketMinFieldKeys
+	prevEngineMinSpan := db.engine.numericRangeBucketMinSpanKeys
 
 	db.options.NumericRangeBucketSize = size
 	db.options.NumericRangeBucketMinFieldKeys = minFieldKeys
 	db.options.NumericRangeBucketMinSpanKeys = minSpan
+	db.engine.numericRangeBucketSize = size
+	db.engine.numericRangeBucketMinFieldKeys = minFieldKeys
+	db.engine.numericRangeBucketMinSpanKeys = minSpan
 
 	t.Cleanup(func() {
 		db.options.NumericRangeBucketSize = prevSize
 		db.options.NumericRangeBucketMinFieldKeys = prevMinField
 		db.options.NumericRangeBucketMinSpanKeys = prevMinSpan
+		db.engine.numericRangeBucketSize = prevEngineSize
+		db.engine.numericRangeBucketMinFieldKeys = prevEngineMinField
+		db.engine.numericRangeBucketMinSpanKeys = prevEngineMinSpan
 	})
 }
 
@@ -584,7 +593,7 @@ func TestRaceExtra_PublicQueriesStayExactUnderConcurrentMaterializedCacheThrash(
 		t.Fatal(*msg)
 	}
 
-	snap := db.getSnapshot()
+	snap := db.engine.getSnapshot()
 	if got := snap.matPredCacheCount.Load(); got > 2 {
 		t.Fatalf("materialized predicate cache exceeded global limit: got=%d", got)
 	}
@@ -616,7 +625,7 @@ func TestRaceExtra_PinnedSnapshotQueryViewStaysExactAcrossConcurrentPublishes(t 
 		t.Fatalf("RebuildIndex: %v", err)
 	}
 
-	seq := db.getSnapshot().seq
+	seq := db.engine.getSnapshot().seq
 	snap, ref, ok := db.engine.snapshot.pinRefBySeq(seq)
 	if !ok || snap == nil {
 		t.Fatal("expected current snapshot to be pinnable")
@@ -636,10 +645,10 @@ func TestRaceExtra_PinnedSnapshotQueryViewStaysExactAcrossConcurrentPublishes(t 
 	want := raceExtraRangeKeys(2500, 2600, total)
 
 	checkPinnedSnapshot := func() error {
-		view := db.makeQueryView(snap)
-		defer db.releaseQueryView(view)
+		view := db.engine.makeQueryView(snap)
+		defer db.engine.releaseQueryView(view)
 
-		prepared, viewQ, err := prepareTestQuery(db, q)
+		prepared, viewQ, err := prepareTestQuery(db.engine, q)
 		if err != nil {
 			return err
 		}
@@ -775,7 +784,7 @@ func TestRaceExtra_PinnedStringSnapshotScanStaysStableAcrossConcurrentPublishes(
 		}
 	})
 
-	old := db.getSnapshot()
+	old := db.engine.getSnapshot()
 	pinned, ref, ok := db.engine.snapshot.pinRefBySeq(old.seq)
 	if !ok || pinned != old {
 		t.Fatal("expected current string snapshot to be pinnable")
@@ -932,16 +941,16 @@ func TestRaceExtra_PublicNumericRangeQueriesStayExactAcrossConcurrentUnchangedFi
 	raceExtraSetNumericBucketKnobs(t, db, 128, 1, 1)
 
 	makeView := func() *queryView {
-		return db.makeQueryView(db.getSnapshot())
+		return db.engine.makeQueryView(db.engine.getSnapshot())
 	}
 
 	spanFor := func(expr qx.Expr) (overlayRange, *numericRangeBucketCacheEntry) {
 		t.Helper()
 
 		view := makeView()
-		defer db.releaseQueryView(view)
+		defer db.engine.releaseQueryView(view)
 
-		prepared, compiled, err := prepareTestExpr(db, expr)
+		prepared, compiled, err := prepareTestExpr(db.engine, expr)
 		if err != nil {
 			t.Fatalf("prepareTestExpr(%v): %v", expr, err)
 		}
@@ -976,13 +985,13 @@ func TestRaceExtra_PublicNumericRangeQueriesStayExactAcrossConcurrentUnchangedFi
 		}
 		out.release()
 
-		return br, raceExtraRequireNumericRangeBucketCacheEntry(t, db.getSnapshot(), f)
+		return br, raceExtraRequireNumericRangeBucketCacheEntry(t, db.engine.getSnapshot(), f)
 	}
 
 	evalSimple := func(expr qx.Expr) (postingResult, error) {
 		view := makeView()
-		defer db.releaseQueryView(view)
-		prepared, compiled, err := prepareTestExpr(db, expr)
+		defer db.engine.releaseQueryView(view)
+		prepared, compiled, err := prepareTestExpr(db.engine, expr)
 		if err != nil {
 			return postingResult{}, err
 		}
@@ -992,8 +1001,8 @@ func TestRaceExtra_PublicNumericRangeQueriesStayExactAcrossConcurrentUnchangedFi
 
 	exprValueToIdxScalar := func(expr qx.Expr) (string, bool, bool, error) {
 		view := makeView()
-		defer db.releaseQueryView(view)
-		prepared, compiled, err := prepareTestExpr(db, expr)
+		defer db.engine.releaseQueryView(view)
+		prepared, compiled, err := prepareTestExpr(db.engine, expr)
 		if err != nil {
 			return "", false, false, err
 		}
@@ -1003,7 +1012,7 @@ func TestRaceExtra_PublicNumericRangeQueriesStayExactAcrossConcurrentUnchangedFi
 
 	materializedPredCacheKeyForScalar := func(field string, op qx.Op, key string) string {
 		view := makeView()
-		defer db.releaseQueryView(view)
+		defer db.engine.releaseQueryView(view)
 		return view.materializedPredCacheKeyForScalar(field, compileScalarOpForTest(op), key)
 	}
 
@@ -1046,7 +1055,7 @@ func TestRaceExtra_PublicNumericRangeQueriesStayExactAcrossConcurrentUnchangedFi
 	}
 	warmExact.release()
 
-	prevSnap := db.getSnapshot()
+	prevSnap := db.engine.getSnapshot()
 	prevEntry := raceExtraRequireNumericRangeBucketCacheEntry(t, prevSnap, "age")
 	key2500, isSlice, isNil, err := exprValueToIdxScalar(exprGTE2500)
 	if err != nil {
@@ -1069,7 +1078,7 @@ func TestRaceExtra_PublicNumericRangeQueriesStayExactAcrossConcurrentUnchangedFi
 		t.Fatalf("Patch(active warm publish): %v", err)
 	}
 
-	nextSnap := db.getSnapshot()
+	nextSnap := db.engine.getSnapshot()
 	nextEntry := raceExtraRequireNumericRangeBucketCacheEntry(t, nextSnap, "age")
 	if nextEntry != prevEntry {
 		t.Fatal("expected unrelated patch to inherit numeric range bucket cache entry")

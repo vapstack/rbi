@@ -36,7 +36,7 @@ func TestSet_ReindexesAllSliceValues_OnReplace(t *testing.T) {
 		t.Fatalf("Set(215): %v", err)
 	}
 
-	has := db.fieldLookupPostingRetained("tags", "db").Contains(215)
+	has := db.engine.currentQueryViewForTests().snap.fieldLookupPostingRetained("tags", "db").Contains(215)
 	if !has {
 		v, err := db.Get(215)
 		if err != nil {

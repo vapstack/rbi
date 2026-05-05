@@ -247,10 +247,10 @@ func TestAggregateGroupedOrdinaryByIDGateUsesSelectivity(t *testing.T) {
 	}
 	defer selective.release()
 
-	snap, seq, ref, pinned := db.pinCurrentSnapshot()
-	defer db.unpinCurrentSnapshot(seq, ref, pinned)
-	view := db.makeQueryView(snap)
-	defer db.releaseQueryView(view)
+	snap, seq, ref, pinned := db.engine.pinCurrentSnapshot()
+	defer db.engine.unpinCurrentSnapshot(seq, ref, pinned)
+	view := db.engine.makeQueryView(snap)
+	defer db.engine.releaseQueryView(view)
 
 	fullIDs, err := view.aggregateMatchedIDs(full.filter)
 	if err != nil {
@@ -1081,7 +1081,7 @@ func TestAggregateMeasureEmptyBaseBatchSetDuplicateIDsUsesLastValue(t *testing.T
 	}
 
 	acc := db.engine.measureFieldMap["amount"]
-	storage := db.getSnapshot().measure.Get(acc.ordinal)
+	storage := db.engine.getSnapshot().measure.Get(acc.ordinal)
 	if storage.rows() != 1 {
 		t.Fatalf("measure rows=%d, want 1", storage.rows())
 	}
@@ -1128,7 +1128,7 @@ func TestAggregateWideMeasureUsesFullAndMergeScans(t *testing.T) {
 	}
 
 	acc := db.engine.measureFieldMap["amount"]
-	storage := db.getSnapshot().measure.Get(acc.ordinal)
+	storage := db.engine.getSnapshot().measure.Get(acc.ordinal)
 	if !useMeasureMergeScan(keep, storage) {
 		t.Fatal("wide filtered measure aggregate must use merge scan")
 	}
@@ -1231,7 +1231,7 @@ func TestMeasureChunkedAppendFillsTailChunk(t *testing.T) {
 	}
 
 	acc := db.engine.measureFieldMap["amount"]
-	storage := db.getSnapshot().measure.Get(acc.ordinal)
+	storage := db.engine.getSnapshot().measure.Get(acc.ordinal)
 	if storage.chunked == nil {
 		t.Fatal("measure storage must be chunked")
 	}
@@ -1312,22 +1312,22 @@ func TestAggregatePinnedSnapshotIsolation(t *testing.T) {
 	}
 	defer prepared.release()
 
-	snap, seq, ref, pinned := db.pinCurrentSnapshot()
-	defer db.unpinCurrentSnapshot(seq, ref, pinned)
+	snap, seq, ref, pinned := db.engine.pinCurrentSnapshot()
+	defer db.engine.unpinCurrentSnapshot(seq, ref, pinned)
 
 	if err := db.Set(1, &measureOnlyRec{Amount: 99}); err != nil {
 		t.Fatalf("Set update: %v", err)
 	}
 
-	view := db.makeQueryView(snap)
+	view := db.engine.makeQueryView(snap)
 	ids, err := view.aggregateMatchedIDs(prepared.filter)
 	if err != nil {
-		db.releaseQueryView(view)
+		db.engine.releaseQueryView(view)
 		t.Fatalf("aggregateMatchedIDs: %v", err)
 	}
 	oldResult, err := view.executeAggregate(prepared, ids)
 	ids.Release()
-	db.releaseQueryView(view)
+	db.engine.releaseQueryView(view)
 	if err != nil {
 		t.Fatalf("executeAggregate old snapshot: %v", err)
 	}

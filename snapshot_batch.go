@@ -1821,6 +1821,10 @@ func (db *DB[K, V]) buildPreparedSnapshotAggregatedNoLock(
 	prev *indexSnapshot,
 	prepared []autoBatchPrepared[K, V],
 ) *indexSnapshot {
+	var strmap *strMapSnapshot
+	if db.strMap != nil {
+		strmap = db.strMap.snapshot()
+	}
 	next := &indexSnapshot{
 		seq: seq,
 
@@ -1832,9 +1836,9 @@ func (db *DB[K, V]) buildPreparedSnapshotAggregatedNoLock(
 		indexedFieldByName: db.engine.indexedFieldMap,
 		universe:           prev.universe,
 		universeOwner:      prev.universeOwner,
-		strmap:             db.snapshotStrMap(),
+		strmap:             strmap,
 	}
-	db.initSnapshotRuntimeCaches(next)
+	db.engine.initSnapshotRuntimeCaches(next)
 
 	normalized := normalizePreparedBatchForSnapshot(prepared)
 	deltas := indexedFieldBatchDeltas{

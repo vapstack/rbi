@@ -343,7 +343,7 @@ func TestPlannerCalibration_BeginTraceUsesMinimalCollectorWithoutTracerSink(t *t
 		),
 	).Sort("age", qx.ASC).Offset(5).Limit(10)
 
-	preparedQ, viewQ, err := prepareTestQuery(db, q)
+	preparedQ, viewQ, err := prepareTestQuery(db.engine, q)
 	if err != nil {
 		t.Fatalf("prepareTestQuery: %v", err)
 	}
@@ -414,8 +414,8 @@ func TestPlannerCalibration_QueryViewUsesRootSnapshot(t *testing.T) {
 		t.Fatalf("SetCalibrationSnapshot: %v", err)
 	}
 
-	view := db.makeQueryView(db.getSnapshot())
-	defer db.releaseQueryView(view)
+	view := db.engine.makeQueryView(db.engine.getSnapshot())
+	defer db.engine.releaseQueryView(view)
 
 	assertApproxMultiplier(t, view.engine.plannerCostMultiplier(plannerCalOrdered), 0.73)
 	assertApproxMultiplier(t, view.engine.plannerCostMultiplier(plannerCalLimitOrderBasic), 1.41)
@@ -441,8 +441,8 @@ func TestPlannerCalibration_DisabledUsesManualSnapshot(t *testing.T) {
 		t.Fatalf("SetCalibrationSnapshot: %v", err)
 	}
 
-	view := db.makeQueryView(db.getSnapshot())
-	defer db.releaseQueryView(view)
+	view := db.engine.makeQueryView(db.engine.getSnapshot())
+	defer db.engine.releaseQueryView(view)
 
 	assertApproxMultiplier(t, view.engine.plannerCostMultiplier(plannerCalOrdered), 0.73)
 	assertApproxMultiplier(t, view.engine.plannerCostMultiplier(plannerCalLimitOrderBasic), 1.41)
@@ -458,8 +458,8 @@ func TestPlannerCalibration_DisabledWithoutSnapshotUsesIdentityMultiplier(t *tes
 		CalibrationSampleEvery: 1,
 	})
 
-	view := db.makeQueryView(db.getSnapshot())
-	defer db.releaseQueryView(view)
+	view := db.engine.makeQueryView(db.engine.getSnapshot())
+	defer db.engine.releaseQueryView(view)
 
 	assertApproxMultiplier(t, view.engine.plannerCostMultiplier(plannerCalOrdered), 1.0)
 	assertApproxMultiplier(t, view.engine.plannerCostMultiplier(plannerCalLimitOrderBasic), 1.0)
@@ -501,7 +501,7 @@ func TestTraceAndCalibrationDisabled_BeginTraceReturnsNil(t *testing.T) {
 	}
 
 	q := qx.Query(qx.EQ("age", 10))
-	preparedQ, viewQ, err := prepareTestQuery(db, q)
+	preparedQ, viewQ, err := prepareTestQuery(db.engine, q)
 	if err != nil {
 		t.Fatalf("prepareTestQuery: %v", err)
 	}
@@ -546,11 +546,11 @@ func TestOrderRangeCoverage_ConsistencyBetweenPredicateKinds(t *testing.T) {
 		preds[i] = predicate{expr: mustTestQIRExprForDB(t, db, exprs[i])}
 	}
 
-	st1, en1, cov1, ok1 := db.extractOrderRangeCoverage("name", cands, s)
+	st1, en1, cov1, ok1 := db.engine.extractOrderRangeCoverage("name", cands, s)
 	if !ok1 {
 		t.Fatalf("extractOrderRangeCoverage failed")
 	}
-	st2, en2, cov2, ok2 := db.extractOrderRangeCoverage("name", preds, s)
+	st2, en2, cov2, ok2 := db.engine.extractOrderRangeCoverage("name", preds, s)
 	if !ok2 {
 		t.Fatalf("extractOrderRangeCoverage failed")
 	}
@@ -561,11 +561,11 @@ func TestOrderRangeCoverage_ConsistencyBetweenPredicateKinds(t *testing.T) {
 		t.Fatalf("covered mismatch: candidate=%v planner=%v", cov1, cov2)
 	}
 
-	br1, covOv1, okOv1 := db.extractOrderRangeCoverageOverlay("name", cands, ov)
+	br1, covOv1, okOv1 := db.engine.extractOrderRangeCoverageOverlay("name", cands, ov)
 	if !okOv1 {
 		t.Fatalf("extractOrderRangeCoverageOverlay failed")
 	}
-	br2, covOv2, okOv2 := db.extractOrderRangeCoverageOverlay("name", preds, ov)
+	br2, covOv2, okOv2 := db.engine.extractOrderRangeCoverageOverlay("name", preds, ov)
 	if !okOv2 {
 		t.Fatalf("extractOrderRangeCoverageOverlay failed")
 	}
@@ -675,7 +675,7 @@ func TestPlannerCalibration_InfluencesORNoOrderDecision(t *testing.T) {
 	branches.Append(makeORBranchForCalibrationDecisionTest(4_000, 4))
 	defer branches.Release()
 
-	base := db.decidePlanORNoOrder(q, branches)
+	base := db.engine.decidePlanORNoOrder(q, branches)
 	if !base.use {
 		t.Fatalf("expected base decision to use OR no-order plan")
 	}
@@ -690,7 +690,7 @@ func TestPlannerCalibration_InfluencesORNoOrderDecision(t *testing.T) {
 		t.Fatalf("SetCalibrationSnapshot: %v", err)
 	}
 
-	adjusted := db.decidePlanORNoOrder(q, branches)
+	adjusted := db.engine.decidePlanORNoOrder(q, branches)
 	if adjusted.use {
 		t.Fatalf("expected calibrated decision to reject OR no-order plan")
 	}
@@ -848,8 +848,8 @@ func TestPlannerCalibration_AutoPersist_DisabledUsesFrozenState(t *testing.T) {
 		t.Fatalf("unexpected sample count after reopen: %d", snap.Samples["plan_ordered"])
 	}
 
-	view := db2.makeQueryView(db2.getSnapshot())
-	defer db2.releaseQueryView(view)
+	view := db2.engine.makeQueryView(db2.engine.getSnapshot())
+	defer db2.engine.releaseQueryView(view)
 	assertApproxMultiplier(t, view.engine.plannerCostMultiplier(plannerCalOrdered), 1.42)
 	if db2.engine.traceOrCalibrationSamplingEnabled() {
 		t.Fatalf("expected online calibration sampling to remain disabled")
@@ -1013,7 +1013,7 @@ func TestPlannerORNoOrderAdaptive_MatchesBaseline(t *testing.T) {
 			qx.EQ("country", "NL"),
 		),
 	).Limit(150)
-	branchesAdaptive, alwaysFalse, ok := db.buildORBranches(q.Filter.Args)
+	branchesAdaptive, alwaysFalse, ok := db.engine.buildORBranches(q.Filter.Args)
 	if !ok {
 		t.Fatalf("buildORBranches adaptive: ok=false")
 	}
@@ -1022,12 +1022,12 @@ func TestPlannerORNoOrderAdaptive_MatchesBaseline(t *testing.T) {
 	}
 	defer branchesAdaptive.Release()
 
-	gotAdaptive, ok := db.execPlanORNoOrderAdaptive(q, branchesAdaptive, nil)
+	gotAdaptive, ok := db.engine.execPlanORNoOrderAdaptive(q, branchesAdaptive, nil)
 	if !ok {
 		t.Fatalf("execPlanORNoOrderAdaptive: ok=false")
 	}
 
-	branchesBaseline, alwaysFalse, ok := db.buildORBranches(q.Filter.Args)
+	branchesBaseline, alwaysFalse, ok := db.engine.buildORBranches(q.Filter.Args)
 	if !ok {
 		t.Fatalf("buildORBranches baseline: ok=false")
 	}
@@ -1036,7 +1036,7 @@ func TestPlannerORNoOrderAdaptive_MatchesBaseline(t *testing.T) {
 	}
 	defer branchesBaseline.Release()
 
-	gotBaseline, ok := db.execPlanORNoOrderBaseline(q, branchesBaseline, nil)
+	gotBaseline, ok := db.engine.execPlanORNoOrderBaseline(q, branchesBaseline, nil)
 	if !ok {
 		t.Fatalf("execPlanORNoOrderBaseline: ok=false")
 	}
@@ -1104,7 +1104,7 @@ func TestBuildORBranches_BroadNumericRangeStaysRuntimeOnSecondBuild(t *testing.T
 		}
 	}
 
-	branches, alwaysFalse, ok := db.buildORBranches(q.Filter.Args)
+	branches, alwaysFalse, ok := db.engine.buildORBranches(q.Filter.Args)
 	if !ok {
 		t.Fatalf("buildORBranches: ok=false")
 	}
@@ -1113,11 +1113,11 @@ func TestBuildORBranches_BroadNumericRangeStaysRuntimeOnSecondBuild(t *testing.T
 	}
 	checkRangePred(branches)
 	branches.Release()
-	if got := db.getSnapshot().matPredCacheCount.Load(); got != 0 {
+	if got := db.engine.getSnapshot().matPredCacheCount.Load(); got != 0 {
 		t.Fatalf("unexpected shared materialized predicate cache entry after first build: %d", got)
 	}
 
-	branches, alwaysFalse, ok = db.buildORBranches(q.Filter.Args)
+	branches, alwaysFalse, ok = db.engine.buildORBranches(q.Filter.Args)
 	if !ok {
 		t.Fatalf("buildORBranches second: ok=false")
 	}
@@ -1126,7 +1126,7 @@ func TestBuildORBranches_BroadNumericRangeStaysRuntimeOnSecondBuild(t *testing.T
 		t.Fatalf("unexpected alwaysFalse on second build")
 	}
 	checkRangePred(branches)
-	if got := db.getSnapshot().matPredCacheCount.Load(); got != 0 {
+	if got := db.engine.getSnapshot().matPredCacheCount.Load(); got != 0 {
 		t.Fatalf("unexpected shared materialized predicate cache entry after second build: %d", got)
 	}
 }
@@ -1189,7 +1189,7 @@ func TestPlannerORNoOrder_BroadResidualRangePromotesRouteAware(t *testing.T) {
 		}
 	}
 
-	branches, alwaysFalse, ok := db.buildORBranches(q.Filter.Args)
+	branches, alwaysFalse, ok := db.engine.buildORBranches(q.Filter.Args)
 	if !ok {
 		t.Fatalf("buildORBranches first: ok=false")
 	}
@@ -1199,7 +1199,7 @@ func TestPlannerORNoOrder_BroadResidualRangePromotesRouteAware(t *testing.T) {
 	checkScorePred(branches, predicateKindCustom)
 	branches.Release()
 
-	branches, alwaysFalse, ok = db.buildORBranches(q.Filter.Args)
+	branches, alwaysFalse, ok = db.engine.buildORBranches(q.Filter.Args)
 	if !ok {
 		t.Fatalf("buildORBranches second: ok=false")
 	}
@@ -1208,14 +1208,14 @@ func TestPlannerORNoOrder_BroadResidualRangePromotesRouteAware(t *testing.T) {
 	}
 	checkScorePred(branches, predicateKindCustom)
 
-	if _, ok := db.execPlanORNoOrderAdaptive(q, branches, nil); !ok {
+	if _, ok := db.engine.execPlanORNoOrderAdaptive(q, branches, nil); !ok {
 		branches.Release()
 		t.Fatalf("execPlanORNoOrderAdaptive: ok=false")
 	}
 	checkScorePred(branches, predicateKindMaterializedNot)
 	branches.Release()
 
-	if got := db.getSnapshot().matPredCacheCount.Load(); got == 0 {
+	if got := db.engine.getSnapshot().matPredCacheCount.Load(); got == 0 {
 		t.Fatalf("expected route-aware residual materialization to populate shared cache")
 	}
 }
@@ -1254,7 +1254,7 @@ func TestPlannerORNoOrder_NullableBroadResidualRangeDoesNotStayLazy(t *testing.T
 		),
 	).Limit(50)
 
-	branches, alwaysFalse, ok := db.buildORBranches(q.Filter.Args)
+	branches, alwaysFalse, ok := db.engine.buildORBranches(q.Filter.Args)
 	if !ok {
 		t.Fatalf("buildORBranches: ok=false")
 	}
@@ -1326,8 +1326,8 @@ func TestPlannerORNoOrder_NullableNonBroadComplementResidualRangeDoesNotStayLazy
 		t.Fatalf("RebuildIndex: %v", err)
 	}
 
-	view := db.currentQueryViewForTests()
-	defer db.releaseQueryView(view)
+	view := db.engine.currentQueryViewForTests()
+	defer db.engine.releaseQueryView(view)
 	expr := mustTestQIRExprForDB(t, db, qx.GTE("rank", 1))
 	candidate, ok := view.prepareScalarRangeRoutingCandidate(expr)
 	if !ok {
@@ -1357,7 +1357,7 @@ func TestPlannerORNoOrder_NullableNonBroadComplementResidualRangeDoesNotStayLazy
 		),
 	).Limit(50)
 
-	branches, alwaysFalse, ok := db.buildORBranches(q.Filter.Args)
+	branches, alwaysFalse, ok := db.engine.buildORBranches(q.Filter.Args)
 	if !ok {
 		t.Fatalf("buildORBranches: ok=false")
 	}
@@ -1429,8 +1429,8 @@ func TestPlannerORNoOrder_NullableNonBroadComplementResidualRangeDoesNotStayLazy
 		t.Fatalf("RebuildIndex: %v", err)
 	}
 
-	view := db.currentQueryViewForTests()
-	defer db.releaseQueryView(view)
+	view := db.engine.currentQueryViewForTests()
+	defer db.engine.releaseQueryView(view)
 	expr := mustTestQIRExprForDB(t, db, qx.GTE("rank", 1))
 	candidate, ok := view.prepareScalarRangeRoutingCandidate(expr)
 	if !ok {
@@ -1460,7 +1460,7 @@ func TestPlannerORNoOrder_NullableNonBroadComplementResidualRangeDoesNotStayLazy
 		),
 	).Limit(50)
 
-	branches, alwaysFalse, ok := db.buildORBranches(q.Filter.Args)
+	branches, alwaysFalse, ok := db.engine.buildORBranches(q.Filter.Args)
 	if !ok {
 		t.Fatalf("buildORBranches: ok=false")
 	}
@@ -1499,7 +1499,7 @@ func TestPlannerORNoOrder_NullableNonBroadComplementResidualRangeDoesNotStayLazy
 		t.Fatalf("expected rank range predicate in OR branches")
 	}
 
-	gotBaseline, ok := db.execPlanORNoOrderBaseline(q, branches, nil)
+	gotBaseline, ok := db.engine.execPlanORNoOrderBaseline(q, branches, nil)
 	if !ok {
 		t.Fatalf("execPlanORNoOrderBaseline: ok=false")
 	}
@@ -1549,7 +1549,7 @@ func TestPlannerORNoOrder_NullableNonBroadComplementOnlyPositiveLeafKeepsLead(t 
 		),
 	).Limit(50)
 
-	branches, alwaysFalse, ok := db.buildORBranches(q.Filter.Args)
+	branches, alwaysFalse, ok := db.engine.buildORBranches(q.Filter.Args)
 	if !ok {
 		t.Fatalf("buildORBranches: ok=false")
 	}
@@ -1594,7 +1594,7 @@ func TestPlannerORNoOrder_NullableNonBroadComplementOnlyPositiveLeafKeepsLead(t 
 		t.Fatalf("expected rank range branch with negative sibling leaf")
 	}
 
-	gotBaseline, ok := db.execPlanORNoOrderBaseline(q, branches, nil)
+	gotBaseline, ok := db.engine.execPlanORNoOrderBaseline(q, branches, nil)
 	if !ok {
 		t.Fatalf("execPlanORNoOrderBaseline: ok=false")
 	}
@@ -1604,7 +1604,7 @@ func TestPlannerORNoOrder_NullableNonBroadComplementOnlyPositiveLeafKeepsLead(t 
 		}
 	}
 
-	branches2, alwaysFalse, ok := db.buildORBranches(q.Filter.Args)
+	branches2, alwaysFalse, ok := db.engine.buildORBranches(q.Filter.Args)
 	if !ok {
 		t.Fatalf("buildORBranches second: ok=false")
 	}
@@ -1612,7 +1612,7 @@ func TestPlannerORNoOrder_NullableNonBroadComplementOnlyPositiveLeafKeepsLead(t 
 	if alwaysFalse {
 		t.Fatalf("unexpected alwaysFalse on second build")
 	}
-	gotAdaptive, ok := db.execPlanORNoOrderAdaptive(q, branches2, nil)
+	gotAdaptive, ok := db.engine.execPlanORNoOrderAdaptive(q, branches2, nil)
 	if !ok {
 		t.Fatalf("execPlanORNoOrderAdaptive: ok=false")
 	}
@@ -1642,7 +1642,7 @@ func TestPlannerOROrderKWay_MatchesFallbackMerge(t *testing.T) {
 			qx.PREFIX("full_name", "FN-1"),
 		),
 	).Sort("age", qx.ASC).Offset(30).Limit(120)
-	branchesKWay, alwaysFalse, ok := db.buildORBranches(q.Filter.Args)
+	branchesKWay, alwaysFalse, ok := db.engine.buildORBranches(q.Filter.Args)
 	if !ok {
 		t.Fatalf("buildORBranches kway: ok=false")
 	}
@@ -1651,7 +1651,7 @@ func TestPlannerOROrderKWay_MatchesFallbackMerge(t *testing.T) {
 	}
 	defer branchesKWay.Release()
 
-	gotKWay, ok, err := db.execPlanOROrderKWay(q, branchesKWay, nil)
+	gotKWay, ok, err := db.engine.execPlanOROrderKWay(q, branchesKWay, nil)
 	if err != nil {
 		t.Fatalf("execPlanOROrderKWay err: %v", err)
 	}
@@ -1659,7 +1659,7 @@ func TestPlannerOROrderKWay_MatchesFallbackMerge(t *testing.T) {
 		t.Fatalf("execPlanOROrderKWay: ok=false")
 	}
 
-	branchesBaseline, alwaysFalse, ok := db.buildORBranches(q.Filter.Args)
+	branchesBaseline, alwaysFalse, ok := db.engine.buildORBranches(q.Filter.Args)
 	if !ok {
 		t.Fatalf("buildORBranches fallback merge: ok=false")
 	}
@@ -1668,7 +1668,7 @@ func TestPlannerOROrderKWay_MatchesFallbackMerge(t *testing.T) {
 	}
 	defer branchesBaseline.Release()
 
-	gotBaseline, ok, err := db.execPlanOROrderMergeFallback(q, branchesBaseline, nil)
+	gotBaseline, ok, err := db.engine.execPlanOROrderMergeFallback(q, branchesBaseline, nil)
 	if err != nil {
 		t.Fatalf("execPlanOROrderMergeFallback err: %v", err)
 	}
@@ -1769,7 +1769,7 @@ func TestInitOrderedORBranchEstimates_ExcludesCoveredLeafFromCard(t *testing.T) 
 		t.Fatalf("RebuildIndex: %v", err)
 	}
 
-	view := db.currentQueryViewForTests()
+	view := db.engine.currentQueryViewForTests()
 	if got := view.snapshotUniverseCardinality(); got != 100 {
 		t.Fatalf("snapshotUniverse=%d, want 100", got)
 	}
@@ -1825,7 +1825,7 @@ func TestPlannerOROrder_RepeatedExecutionPromotesMaterializedRange(t *testing.T)
 	).Sort("score", qx.DESC).Limit(240)
 
 	db.clearCurrentSnapshotCachesForTesting()
-	if got := db.getSnapshot().matPredCacheCount.Load(); got != 0 {
+	if got := db.engine.getSnapshot().matPredCacheCount.Load(); got != 0 {
 		t.Fatalf("unexpected materialized predicate cache before ordered OR execution: %d", got)
 	}
 
@@ -1839,7 +1839,7 @@ func TestPlannerOROrder_RepeatedExecutionPromotesMaterializedRange(t *testing.T)
 		}
 	}
 
-	if got := db.getSnapshot().matPredCacheCount.Load(); got == 0 {
+	if got := db.engine.getSnapshot().matPredCacheCount.Load(); got == 0 {
 		t.Fatalf("expected repeated ordered OR execution to promote materialized predicate")
 	}
 }
@@ -1871,7 +1871,7 @@ func TestPlannerOROrderKWay_RepeatedExecutionPromotesExactOnlyMaterializedRange(
 	).Sort("score", qx.DESC).Limit(96)
 
 	db.clearCurrentSnapshotCachesForTesting()
-	if got := db.getSnapshot().matPredCacheCount.Load(); got != 0 {
+	if got := db.engine.getSnapshot().matPredCacheCount.Load(); got != 0 {
 		t.Fatalf("unexpected materialized predicate cache before ordered OR k-way execution: %d", got)
 	}
 
@@ -1881,7 +1881,7 @@ func TestPlannerOROrderKWay_RepeatedExecutionPromotesExactOnlyMaterializedRange(
 	}
 
 	for i := 0; i < 2; i++ {
-		branches, alwaysFalse, ok := db.buildORBranchesOrdered(q.Filter.Args, "score", window)
+		branches, alwaysFalse, ok := db.engine.buildORBranchesOrdered(q.Filter.Args, "score", window)
 		if !ok {
 			t.Fatalf("buildORBranchesOrdered run %d: ok=false", i+1)
 		}
@@ -1929,7 +1929,7 @@ func TestPlannerOROrderKWay_RepeatedExecutionPromotesExactOnlyMaterializedRange(
 			t.Fatalf("expected exact-only merged age branch on run %d", i+1)
 		}
 
-		got, ok, err := db.execPlanOROrderKWay(q, branches, nil)
+		got, ok, err := db.engine.execPlanOROrderKWay(q, branches, nil)
 		branches.Release()
 		if err != nil {
 			t.Fatalf("execPlanOROrderKWay run %d err: %v", i+1, err)
@@ -1942,7 +1942,7 @@ func TestPlannerOROrderKWay_RepeatedExecutionPromotesExactOnlyMaterializedRange(
 		}
 	}
 
-	if got := db.getSnapshot().matPredCacheCount.Load(); got == 0 {
+	if got := db.engine.getSnapshot().matPredCacheCount.Load(); got == 0 {
 		t.Fatalf("expected repeated ordered OR k-way execution to promote exact-only materialized predicate")
 	}
 }
@@ -1973,8 +1973,8 @@ func TestPlannerOROrder_WarmMaterializationRefreshesAnalysisBeforeDecision(t *te
 		),
 	).Sort("score", qx.DESC).Offset(32).Limit(120)
 
-	view := db.currentQueryViewForTests()
-	warm, ok := db.buildPredicatesOrderedWithMode(
+	view := db.engine.currentQueryViewForTests()
+	warm, ok := db.engine.buildPredicatesOrderedWithMode(
 		[]qx.Expr{qx.GTE("age", 30), qx.LTE("age", 250)},
 		"score",
 		false,
@@ -2001,7 +2001,7 @@ func TestPlannerOROrder_WarmMaterializationRefreshesAnalysisBeforeDecision(t *te
 	releasePredicates(warm)
 
 	window, _ := orderWindowForTest(q)
-	branches, alwaysFalse, ok := db.buildORBranchesOrderedWithOffset(q.Filter.Args, "score", window, q.Window.Offset)
+	branches, alwaysFalse, ok := db.engine.buildORBranchesOrderedWithOffset(q.Filter.Args, "score", window, q.Window.Offset)
 	if !ok {
 		t.Fatalf("buildORBranchesOrdered: ok=false")
 	}
@@ -2010,7 +2010,7 @@ func TestPlannerOROrder_WarmMaterializationRefreshesAnalysisBeforeDecision(t *te
 	}
 	defer branches.Release()
 
-	preparedQ, viewQ, err := prepareTestQuery(db, q)
+	preparedQ, viewQ, err := prepareTestQuery(db.engine, q)
 	if err != nil {
 		t.Fatalf("prepareTestQuery: %v", err)
 	}
@@ -2085,7 +2085,7 @@ func TestPlannerOROrder_RefreshBranchCollapsesCoveredTautology(t *testing.T) {
 	).Sort("score", qx.DESC).Limit(64)
 
 	window, _ := orderWindowForTest(q)
-	branches, alwaysFalse, ok := db.buildORBranchesOrdered(q.Filter.Args, "score", window)
+	branches, alwaysFalse, ok := db.engine.buildORBranchesOrdered(q.Filter.Args, "score", window)
 	if !ok {
 		t.Fatalf("buildORBranchesOrdered: ok=false")
 	}
@@ -2094,13 +2094,13 @@ func TestPlannerOROrder_RefreshBranchCollapsesCoveredTautology(t *testing.T) {
 	}
 	defer branches.Release()
 
-	preparedQ, viewQ, err := prepareTestQuery(db, q)
+	preparedQ, viewQ, err := prepareTestQuery(db.engine, q)
 	if err != nil {
 		t.Fatalf("prepareTestQuery: %v", err)
 	}
 	defer preparedQ.Release()
 
-	view := db.currentQueryViewForTests()
+	view := db.engine.currentQueryViewForTests()
 	analysis, ok := view.buildOROrderAnalysis(&viewQ, branches)
 	if !ok {
 		t.Fatalf("buildOROrderAnalysis: ok=false")
@@ -2200,7 +2200,7 @@ func TestPlannerOROrder_RefreshBranchCollapsesImpossibleBranch(t *testing.T) {
 	).Sort("score", qx.DESC).Limit(64)
 
 	window, _ := orderWindowForTest(q)
-	branches, alwaysFalse, ok := db.buildORBranchesOrdered(q.Filter.Args, "score", window)
+	branches, alwaysFalse, ok := db.engine.buildORBranchesOrdered(q.Filter.Args, "score", window)
 	if !ok {
 		t.Fatalf("buildORBranchesOrdered: ok=false")
 	}
@@ -2209,13 +2209,13 @@ func TestPlannerOROrder_RefreshBranchCollapsesImpossibleBranch(t *testing.T) {
 	}
 	defer branches.Release()
 
-	preparedQ, viewQ, err := prepareTestQuery(db, q)
+	preparedQ, viewQ, err := prepareTestQuery(db.engine, q)
 	if err != nil {
 		t.Fatalf("prepareTestQuery: %v", err)
 	}
 	defer preparedQ.Release()
 
-	view := db.currentQueryViewForTests()
+	view := db.engine.currentQueryViewForTests()
 	analysis, ok := view.buildOROrderAnalysis(&viewQ, branches)
 	if !ok {
 		t.Fatalf("buildOROrderAnalysis: ok=false")
@@ -2340,8 +2340,8 @@ func TestPlannerOROrder_MergeWarmupMaterializesExactPredicate(t *testing.T) {
 		t.Fatalf("RebuildIndex: %v", err)
 	}
 
-	view := db.currentQueryViewForTests()
-	warm, ok := db.buildPredicatesOrderedWithMode(
+	view := db.engine.currentQueryViewForTests()
+	warm, ok := db.engine.buildPredicatesOrderedWithMode(
 		[]qx.Expr{qx.GTE("age", 30), qx.LTE("age", 250)},
 		"score",
 		false,
@@ -2378,7 +2378,7 @@ func TestPlannerOROrder_MergeWarmupMaterializesExactPredicate(t *testing.T) {
 	).Sort("score", qx.DESC).Offset(32).Limit(120)
 
 	window, _ := orderWindowForTest(q)
-	branches, alwaysFalse, ok := db.buildORBranchesOrderedWithOffset(q.Filter.Args, "score", window, q.Window.Offset)
+	branches, alwaysFalse, ok := db.engine.buildORBranchesOrderedWithOffset(q.Filter.Args, "score", window, q.Window.Offset)
 	if !ok {
 		t.Fatalf("buildORBranchesOrdered: ok=false")
 	}
@@ -2387,7 +2387,7 @@ func TestPlannerOROrder_MergeWarmupMaterializesExactPredicate(t *testing.T) {
 	}
 	defer branches.Release()
 
-	preparedQ, viewQ, err := prepareTestQuery(db, q)
+	preparedQ, viewQ, err := prepareTestQuery(db.engine, q)
 	if err != nil {
 		t.Fatalf("prepareTestQuery: %v", err)
 	}
@@ -2506,7 +2506,7 @@ func TestPlannerORBranchesOrdered_CoversOrderRangeLeaves(t *testing.T) {
 	).Sort("age", qx.ASC).Limit(120)
 
 	window, _ := orderWindowForTest(q)
-	branches, alwaysFalse, ok := db.buildORBranchesOrdered(q.Filter.Args, "age", window)
+	branches, alwaysFalse, ok := db.engine.buildORBranchesOrdered(q.Filter.Args, "age", window)
 	if !ok {
 		t.Fatalf("buildORBranchesOrdered: ok=false")
 	}
@@ -2529,7 +2529,7 @@ func TestPlannerORBranchesOrdered_CoversOrderRangeLeaves(t *testing.T) {
 		t.Fatalf("expected ordered OR branches to cover order-field range leaves")
 	}
 
-	got, ok := db.execPlanOROrderBasic(q, branches, nil)
+	got, ok := db.engine.execPlanOROrderBasic(q, branches, nil)
 	if !ok {
 		t.Fatalf("execPlanOROrderBasic: ok=false")
 	}
@@ -2562,7 +2562,7 @@ func TestBuildOROrderAnalysis_NonRangeOrderPredicateKeepsOrderedPath(t *testing.
 	).Sort("full_name", qx.ASC).Limit(120)
 
 	window, _ := orderWindowForTest(q)
-	branchesBasic, alwaysFalse, ok := db.buildORBranchesOrdered(q.Filter.Args, "full_name", window)
+	branchesBasic, alwaysFalse, ok := db.engine.buildORBranchesOrdered(q.Filter.Args, "full_name", window)
 	if !ok {
 		t.Fatalf("buildORBranchesOrdered basic: ok=false")
 	}
@@ -2571,14 +2571,14 @@ func TestBuildOROrderAnalysis_NonRangeOrderPredicateKeepsOrderedPath(t *testing.
 	}
 	defer branchesBasic.Release()
 
-	preparedQ, viewQ, err := prepareTestQuery(db, q)
+	preparedQ, viewQ, err := prepareTestQuery(db.engine, q)
 	if err != nil {
 		t.Fatalf("prepareTestQuery: %v", err)
 	}
 	defer preparedQ.Release()
 
-	view := db.currentQueryViewForTests()
-	defer db.releaseQueryView(view)
+	view := db.engine.currentQueryViewForTests()
+	defer db.engine.releaseQueryView(view)
 
 	analysis, ok := view.buildOROrderAnalysis(&viewQ, branchesBasic)
 	if !ok {
@@ -2604,7 +2604,7 @@ func TestBuildOROrderAnalysis_NonRangeOrderPredicateKeepsOrderedPath(t *testing.
 		t.Fatalf("execPlanOROrderBasic: ok=false")
 	}
 
-	branchesFallback, alwaysFalse, ok := db.buildORBranchesOrdered(q.Filter.Args, "full_name", window)
+	branchesFallback, alwaysFalse, ok := db.engine.buildORBranchesOrdered(q.Filter.Args, "full_name", window)
 	if !ok {
 		t.Fatalf("buildORBranchesOrdered fallback: ok=false")
 	}
@@ -2652,9 +2652,9 @@ func TestPlannerOROrderDecision_PrefersStreamWhenAllBranchesAreOrderBounded(t *t
 		),
 	).Sort("age", qx.ASC).Limit(120)
 
-	view := db.currentQueryViewForTests()
+	view := db.engine.currentQueryViewForTests()
 	window, _ := orderWindowForTest(q)
-	branches, alwaysFalse, ok := db.buildORBranchesOrdered(q.Filter.Args, "age", window)
+	branches, alwaysFalse, ok := db.engine.buildORBranchesOrdered(q.Filter.Args, "age", window)
 	if !ok {
 		t.Fatalf("buildORBranchesOrdered: ok=false")
 	}
@@ -2663,7 +2663,7 @@ func TestPlannerOROrderDecision_PrefersStreamWhenAllBranchesAreOrderBounded(t *t
 	}
 	defer branches.Release()
 
-	preparedQ, viewQ, err := prepareTestQuery(db, q)
+	preparedQ, viewQ, err := prepareTestQuery(db.engine, q)
 	if err != nil {
 		t.Fatalf("prepareTestQuery: %v", err)
 	}
@@ -2697,9 +2697,9 @@ func TestPlannerORBranchesOrdered_BoundedCoveredOnlyBranchNotAlwaysTrue(t *testi
 		),
 	).Sort("age", qx.ASC).Limit(9)
 
-	view := db.currentQueryViewForTests()
+	view := db.engine.currentQueryViewForTests()
 	window, _ := orderWindowForTest(q)
-	branches, alwaysFalse, ok := db.buildORBranchesOrdered(q.Filter.Args, "age", window)
+	branches, alwaysFalse, ok := db.engine.buildORBranchesOrdered(q.Filter.Args, "age", window)
 	if !ok {
 		t.Fatalf("buildORBranchesOrdered: ok=false")
 	}
@@ -2766,9 +2766,9 @@ func TestPlannerORBranchesOrdered_EmptyCoveredOnlyBranchKeepsZeroEstimatedCard(t
 		),
 	).Sort("age", qx.ASC).Limit(9)
 
-	view := db.currentQueryViewForTests()
+	view := db.engine.currentQueryViewForTests()
 	window, _ := orderWindowForTest(q)
-	branches, alwaysFalse, ok := db.buildORBranchesOrdered(q.Filter.Args, "age", window)
+	branches, alwaysFalse, ok := db.engine.buildORBranchesOrdered(q.Filter.Args, "age", window)
 	if !ok {
 		t.Fatalf("buildORBranchesOrdered: ok=false")
 	}
@@ -2819,9 +2819,9 @@ func TestPlannerOROrderDecision_PrefersMergeWhenRouteEstimatorBeatsStream(t *tes
 		),
 	).Sort("score", qx.DESC).Limit(120)
 
-	view := db.currentQueryViewForTests()
+	view := db.engine.currentQueryViewForTests()
 	window, _ := orderWindowForTest(q)
-	branches, alwaysFalse, ok := db.buildORBranchesOrdered(q.Filter.Args, "score", window)
+	branches, alwaysFalse, ok := db.engine.buildORBranchesOrdered(q.Filter.Args, "score", window)
 	if !ok {
 		t.Fatalf("buildORBranchesOrdered: ok=false")
 	}
@@ -2851,7 +2851,7 @@ func TestPlannerOROrderDecision_PrefersMergeWhenRouteEstimatorBeatsStream(t *tes
 	orderStats := view.plannerOrderFieldStats("score", snap, universe, orderDistinct)
 	streamCost := float64(expectedRows) * streamChecks * orderStats.skew()
 
-	preparedQ, viewQ, err := prepareTestQuery(db, q)
+	preparedQ, viewQ, err := prepareTestQuery(db.engine, q)
 	if err != nil {
 		t.Fatalf("prepareTestQuery: %v", err)
 	}
@@ -2895,7 +2895,7 @@ func TestPlannerORBranchesOrdered_AvoidsMaterializingDeferredOrderRangeLeaves(t 
 		ageExpr,
 	}
 
-	preds, ok := db.buildPredicatesOrderedWithMode(leaves, "score", false, 4096, 0, false, true)
+	preds, ok := db.engine.buildPredicatesOrderedWithMode(leaves, "score", false, 4096, 0, false, true)
 	if !ok {
 		t.Fatalf("buildPredicatesOrderedWithMode: ok=false")
 	}
@@ -2917,11 +2917,11 @@ func TestPlannerORBranchesOrdered_AvoidsMaterializingDeferredOrderRangeLeaves(t 
 		t.Fatalf("expected residual non-order range to remain active predicate")
 	}
 
-	ageKey := db.materializedPredCacheKey(ageExpr)
+	ageKey := db.engine.materializedPredCacheKey(ageExpr)
 	_ = ageKey
-	scoreKey := db.materializedPredCacheKey(scoreExpr)
+	scoreKey := db.engine.materializedPredCacheKey(scoreExpr)
 	if scoreKey != "" {
-		if _, ok := db.getSnapshot().loadMaterializedPred(scoreKey); ok {
+		if _, ok := db.engine.getSnapshot().loadMaterializedPred(scoreKey); ok {
 			t.Fatalf("unexpected materialized cache entry for deferred order-field range")
 		}
 	}
@@ -2951,7 +2951,7 @@ func TestBuildPredicatesOrdered_MergesPositiveNumericRangeLeavesOnSameField(t *t
 		qx.LTE("age", 400),
 	}
 
-	preds, ok := db.buildPredicatesOrderedWithMode(leaves, "score", false, 4096, 0, false, true)
+	preds, ok := db.engine.buildPredicatesOrderedWithMode(leaves, "score", false, 4096, 0, false, true)
 	if !ok {
 		t.Fatalf("buildPredicatesOrderedWithMode: ok=false")
 	}
@@ -2990,9 +2990,9 @@ func TestPlannerOROrderMergeBranchStats_SkipFullSpanRowCountingWithoutOrderBound
 		),
 	).Sort("age", qx.ASC).Limit(120)
 
-	view := db.currentQueryViewForTests()
+	view := db.engine.currentQueryViewForTests()
 	window, _ := orderWindowForTest(q)
-	branches, alwaysFalse, ok := db.buildORBranchesOrdered(q.Filter.Args, "age", window)
+	branches, alwaysFalse, ok := db.engine.buildORBranchesOrdered(q.Filter.Args, "age", window)
 	if !ok {
 		t.Fatalf("buildORBranchesOrdered: ok=false")
 	}
@@ -3037,8 +3037,8 @@ func TestBuildPredRangeCandidateWithColdMode_NullableComplementRouteKeepsPositiv
 		t.Fatalf("RebuildIndex: %v", err)
 	}
 
-	view := db.currentQueryViewForTests()
-	defer db.releaseQueryView(view)
+	view := db.engine.currentQueryViewForTests()
+	defer db.engine.releaseQueryView(view)
 	expr := mustTestQIRExprForDB(t, db, qx.GTE("rank", 1))
 	fm := view.fieldMetaByExpr(expr)
 	if fm == nil {
@@ -3117,7 +3117,7 @@ func TestPlannerOROrderMergePaths_MixedExactAndNonExactChecks_MatchSeqScan(t *te
 		t.Fatalf("expected non-empty result set")
 	}
 
-	branchesKWay, alwaysFalse, ok := db.buildORBranches(q.Filter.Args)
+	branchesKWay, alwaysFalse, ok := db.engine.buildORBranches(q.Filter.Args)
 	if !ok {
 		t.Fatalf("buildORBranches kway: ok=false")
 	}
@@ -3126,7 +3126,7 @@ func TestPlannerOROrderMergePaths_MixedExactAndNonExactChecks_MatchSeqScan(t *te
 	}
 	defer branchesKWay.Release()
 
-	gotKWay, ok, err := db.execPlanOROrderKWay(q, branchesKWay, nil)
+	gotKWay, ok, err := db.engine.execPlanOROrderKWay(q, branchesKWay, nil)
 	if err != nil {
 		t.Fatalf("execPlanOROrderKWay err: %v", err)
 	}
@@ -3134,7 +3134,7 @@ func TestPlannerOROrderMergePaths_MixedExactAndNonExactChecks_MatchSeqScan(t *te
 		t.Fatalf("execPlanOROrderKWay: ok=false")
 	}
 
-	branchesFallback, alwaysFalse, ok := db.buildORBranches(q.Filter.Args)
+	branchesFallback, alwaysFalse, ok := db.engine.buildORBranches(q.Filter.Args)
 	if !ok {
 		t.Fatalf("buildORBranches fallback: ok=false")
 	}
@@ -3143,7 +3143,7 @@ func TestPlannerOROrderMergePaths_MixedExactAndNonExactChecks_MatchSeqScan(t *te
 	}
 	defer branchesFallback.Release()
 
-	gotFallback, ok, err := db.execPlanOROrderMergeFallback(q, branchesFallback, nil)
+	gotFallback, ok, err := db.engine.execPlanOROrderMergeFallback(q, branchesFallback, nil)
 	if err != nil {
 		t.Fatalf("execPlanOROrderMergeFallback err: %v", err)
 	}
@@ -3201,7 +3201,7 @@ func TestPlannerOROrderKWayRuntimeFallbackEnable(t *testing.T) {
 		),
 	).Sort("age", qx.ASC).Offset(140).Limit(120)
 
-	branchesPrefix, alwaysFalse, ok := db.buildORBranches(qPrefix.Filter.Args)
+	branchesPrefix, alwaysFalse, ok := db.engine.buildORBranches(qPrefix.Filter.Args)
 	if !ok {
 		t.Fatalf("buildORBranches prefix: ok=false")
 	}
@@ -3214,7 +3214,7 @@ func TestPlannerOROrderKWayRuntimeFallbackEnable(t *testing.T) {
 	if !ok {
 		t.Fatalf("orderWindow prefix: ok=false")
 	}
-	if !db.shouldUseOROrderKWayRuntimeFallback(qPrefix, branchesPrefix, needPrefix) {
+	if !db.engine.shouldUseOROrderKWayRuntimeFallback(qPrefix, branchesPrefix, needPrefix) {
 		t.Fatalf("expected runtime fallback guard to be enabled for prefix/non-order shape")
 	}
 
@@ -3225,7 +3225,7 @@ func TestPlannerOROrderKWayRuntimeFallbackEnable(t *testing.T) {
 		),
 	).Sort("age", qx.ASC).Limit(120)
 
-	branchesSimple, alwaysFalse, ok := db.buildORBranches(qSimple.Filter.Args)
+	branchesSimple, alwaysFalse, ok := db.engine.buildORBranches(qSimple.Filter.Args)
 	if !ok {
 		t.Fatalf("buildORBranches simple: ok=false")
 	}
@@ -3238,7 +3238,7 @@ func TestPlannerOROrderKWayRuntimeFallbackEnable(t *testing.T) {
 	if !ok {
 		t.Fatalf("orderWindow simple: ok=false")
 	}
-	if db.shouldUseOROrderKWayRuntimeFallback(qSimple, branchesSimple, needSimple) {
+	if db.engine.shouldUseOROrderKWayRuntimeFallback(qSimple, branchesSimple, needSimple) {
 		t.Fatalf("expected runtime fallback guard to stay disabled for simple OR shape")
 	}
 }
@@ -3260,28 +3260,28 @@ func TestPlannerOrderedAnchor_MatchesBaseline(t *testing.T) {
 		t.Fatalf("collectAndLeaves: ok=false")
 	}
 
-	predsA, ok := db.buildPredicates(leaves)
+	predsA, ok := db.engine.buildPredicates(leaves)
 	if !ok {
 		t.Fatalf("buildPredicates A: ok=false")
 	}
 	defer releasePredicates(predsA)
 
-	gotAnchor, ok := db.execPlanOrderedBasic(q, predsA, nil)
+	gotAnchor, ok := db.engine.execPlanOrderedBasic(q, predsA, nil)
 	if !ok {
 		t.Fatalf("execPlanOrderedBasic A: ok=false")
 	}
 
-	predsB, ok := db.buildPredicates(leaves)
+	predsB, ok := db.engine.buildPredicates(leaves)
 	if !ok {
 		t.Fatalf("buildPredicates B: ok=false")
 	}
 	defer releasePredicates(predsB)
 
 	orderField := q.Order[0].By.Name
-	ov := db.fieldOverlay(orderField)
+	ov := db.engine.currentQueryViewForTests().fieldOverlay(orderField)
 	s := flattenOverlayForTest(ov)
 	start, end := 0, len(s)
-	if st, en, cov, ok := db.extractOrderRangeCoverage(orderField, predsB, s); ok {
+	if st, en, cov, ok := db.engine.extractOrderRangeCoverage(orderField, predsB, s); ok {
 		start, end = st, en
 		for i := range cov {
 			if cov[i] {
@@ -3302,7 +3302,7 @@ func TestPlannerOrderedAnchor_MatchesBaseline(t *testing.T) {
 		active = append(active, i)
 	}
 
-	gotBaseline := db.execPlanOrderedBasicFallback(q, predsB, active, start, end, s, nil)
+	gotBaseline := db.engine.execPlanOrderedBasicFallback(q, predsB, active, start, end, s, nil)
 	if !slices.Equal(gotAnchor, gotBaseline) {
 		t.Fatalf("ordered anchor/fallback mismatch:\nanchor=%v\nfallback=%v", gotAnchor, gotBaseline)
 	}
@@ -3388,13 +3388,13 @@ func TestOrderedFallback_TracksMatchedRowsAndExactBitmapFilters(t *testing.T) {
 	if !ok {
 		t.Fatalf("collectAndLeaves: ok=false")
 	}
-	preds, ok := db.buildPredicatesOrdered(leaves, "country")
+	preds, ok := db.engine.buildPredicatesOrdered(leaves, "country")
 	if !ok {
 		t.Fatalf("buildPredicatesOrdered: ok=false")
 	}
 	defer releasePredicates(preds)
 
-	slice := db.snapshotFieldIndexSlice("country")
+	slice := db.engine.currentQueryViewForTests().snapshotFieldIndexSlice("country")
 	if slice == nil || len(*slice) == 0 {
 		t.Fatalf("country slice must be present")
 	}
@@ -3411,7 +3411,7 @@ func TestOrderedFallback_TracksMatchedRowsAndExactBitmapFilters(t *testing.T) {
 		active = append(active, i)
 	}
 
-	preparedQ, viewQ, err := prepareTestQuery(db, q)
+	preparedQ, viewQ, err := prepareTestQuery(db.engine, q)
 	if err != nil {
 		t.Fatalf("prepareTestQuery: %v", err)
 	}
@@ -3422,7 +3422,7 @@ func TestOrderedFallback_TracksMatchedRowsAndExactBitmapFilters(t *testing.T) {
 		t.Fatalf("expected trace to be enabled")
 	}
 	tr.setPlan(PlanOrdered)
-	got := db.execPlanOrderedBasicFallback(q, preds, active, 0, len(*slice), *slice, tr)
+	got := db.engine.execPlanOrderedBasicFallback(q, preds, active, 0, len(*slice), *slice, tr)
 	tr.finish(uint64(len(got)), nil)
 
 	want, err := expectedKeysUint64(t, db, q)
@@ -3587,7 +3587,7 @@ func TestPlannerRouting_PrefersExecutionForWidePrefixNoOrderLimit(t *testing.T) 
 	if !ok || len(leaves) == 0 {
 		t.Fatalf("extractAndLeaves: ok=%v len=%d", ok, len(leaves))
 	}
-	if !db.shouldPreferExecutionNoOrderPrefix(nq, leaves) {
+	if !db.engine.shouldPreferExecutionNoOrderPrefix(nq, leaves) {
 		t.Fatalf("expected execution preference for wide prefix with selective filter")
 	}
 
@@ -3617,7 +3617,7 @@ func TestPlannerRouting_AvoidsExecutionForWidePrefixLowHitRate(t *testing.T) {
 	if !ok || len(leaves) == 0 {
 		t.Fatalf("extractAndLeaves: ok=%v len=%d", ok, len(leaves))
 	}
-	if db.shouldPreferExecutionNoOrderPrefix(q, leaves) {
+	if db.engine.shouldPreferExecutionNoOrderPrefix(q, leaves) {
 		t.Fatalf("expected fallback/planner preference for low-hit wide prefix shape")
 	}
 }
@@ -3637,7 +3637,7 @@ func TestPlannerRouting_AvoidsExecutionForWidePrefixZeroHitRate(t *testing.T) {
 	if !ok || len(leaves) == 0 {
 		t.Fatalf("extractAndLeaves: ok=%v len=%d", ok, len(leaves))
 	}
-	if db.shouldPreferExecutionNoOrderPrefix(q, leaves) {
+	if db.engine.shouldPreferExecutionNoOrderPrefix(q, leaves) {
 		t.Fatalf("expected fallback/planner preference for zero-hit wide prefix shape")
 	}
 }
@@ -3668,7 +3668,7 @@ func TestPlannerOROrderMergeFallbackFirst_ComplexOffset(t *testing.T) {
 		),
 	).Sort("score", qx.DESC).Offset(500).Limit(100)
 
-	branchesComplex, alwaysFalse, ok := db.buildORBranches(qComplex.Filter.Args)
+	branchesComplex, alwaysFalse, ok := db.engine.buildORBranches(qComplex.Filter.Args)
 	if !ok {
 		t.Fatalf("buildORBranches complex: ok=false")
 	}
@@ -3677,18 +3677,18 @@ func TestPlannerOROrderMergeFallbackFirst_ComplexOffset(t *testing.T) {
 	}
 	defer branchesComplex.Release()
 
-	if !db.shouldPreferOROrderFallbackFirst(qComplex, branchesComplex) {
+	if !db.engine.shouldPreferOROrderFallbackFirst(qComplex, branchesComplex) {
 		needComplex, ok := orderWindowForTest(qComplex)
 		if !ok {
 			t.Fatalf("orderWindow complex: ok=false")
 		}
-		if !db.shouldUseOROrderKWayRuntimeFallback(qComplex, branchesComplex, needComplex) {
-			preparedQ, viewQ, err := prepareTestQuery(db, qComplex)
+		if !db.engine.shouldUseOROrderKWayRuntimeFallback(qComplex, branchesComplex, needComplex) {
+			preparedQ, viewQ, err := prepareTestQuery(db.engine, qComplex)
 			if err != nil {
 				t.Fatalf("prepareTestQuery: %v", err)
 			}
 			defer preparedQ.Release()
-			decision := db.currentQueryViewForTests().decidePlanOROrder(&viewQ, branchesComplex)
+			decision := db.engine.currentQueryViewForTests().decidePlanOROrder(&viewQ, branchesComplex)
 			if decision.plan != plannerOROrderStream {
 				t.Fatalf("expected fallback-first, runtime fallback guard, or stream plan for complex offset ordered OR")
 			}
@@ -3709,7 +3709,7 @@ func TestPlannerOROrderMergeFallbackFirst_ComplexOffset(t *testing.T) {
 		),
 	).Sort("age", qx.ASC).Limit(80)
 
-	branchesLight, alwaysFalse, ok := db.buildORBranches(qLight.Filter.Args)
+	branchesLight, alwaysFalse, ok := db.engine.buildORBranches(qLight.Filter.Args)
 	if !ok {
 		t.Fatalf("buildORBranches light: ok=false")
 	}
@@ -3718,7 +3718,7 @@ func TestPlannerOROrderMergeFallbackFirst_ComplexOffset(t *testing.T) {
 	}
 	defer branchesLight.Release()
 
-	if db.shouldPreferOROrderFallbackFirst(qLight, branchesLight) {
+	if db.engine.shouldPreferOROrderFallbackFirst(qLight, branchesLight) {
 		t.Fatalf("unexpected fallback-first preference for light ordered OR")
 	}
 }
@@ -3907,7 +3907,7 @@ func TestExecutionPlan_OrderLimitWithNegativeResidual_MatchesSeqScan(t *testing.
 	}
 	assertQueryIDsEqual(t, q, got, want)
 
-	execOut, ok, err := db.tryExecutionPlan(q, nil)
+	execOut, ok, err := db.engine.tryExecutionPlan(q, nil)
 	if err != nil {
 		t.Fatalf("tryExecutionPlan: %v", err)
 	}
@@ -3992,11 +3992,11 @@ func TestPlannerCandidateOrder_MatchesSeqScan(t *testing.T) {
 	if !ok || len(leaves) == 0 {
 		t.Fatalf("collectAndLeaves: ok=%v len=%d", ok, len(leaves))
 	}
-	if !db.shouldUseCandidateOrder(q.Order[0], leaves) {
+	if !db.engine.shouldUseCandidateOrder(q.Order[0], leaves) {
 		t.Fatalf("expected candidate-order precheck to pass for query shape")
 	}
 
-	got, used, err := db.tryPlanCandidate(q, nil)
+	got, used, err := db.engine.tryPlanCandidate(q, nil)
 	if err != nil {
 		t.Fatalf("tryPlanCandidate: %v", err)
 	}
@@ -4023,7 +4023,7 @@ func TestPlannerCandidateNoOrder_RespectsWindowAndPredicateSet(t *testing.T) {
 		qx.IN("name", []string{"alice", "bob", "carol"}),
 	).Limit(90)
 
-	got, used, err := db.tryPlanCandidate(q, nil)
+	got, used, err := db.engine.tryPlanCandidate(q, nil)
 	if err != nil {
 		t.Fatalf("tryPlanCandidate: %v", err)
 	}

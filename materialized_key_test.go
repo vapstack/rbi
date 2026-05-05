@@ -127,7 +127,7 @@ func TestMaterializedPredKeyDistinctSet_RoundTripThroughStringCacheAPI(t *testin
 	ids := posting.BuildFromSorted([]uint64{1, 3, 5, 8})
 	defer ids.Release()
 
-	snap := db.getSnapshot()
+	snap := db.engine.getSnapshot()
 	snap.storeMaterializedPred(key.String(), ids.Borrow())
 	got, ok := snap.loadMaterializedPred(key.String())
 	if !ok {

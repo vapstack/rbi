@@ -57,7 +57,7 @@ func TestIndexStats_MatchesSnapshotStorage(t *testing.T) {
 		}
 	}
 
-	snap := db.getSnapshot()
+	snap := db.engine.getSnapshot()
 	nameStorage, ok := snap.fieldIndexStorage("name")
 	if !ok || !nameStorage.isChunked() {
 		t.Fatalf("expected chunked name storage, got ok=%t chunked=%t", ok, ok && nameStorage.isChunked())
@@ -94,7 +94,7 @@ func TestIndexStats_MatchesSnapshotStorage(t *testing.T) {
 }
 
 func indexStatsTestExpected[K ~string | ~uint64, V any](db *DB[K, V]) IndexStats {
-	snap := db.getSnapshot()
+	snap := db.engine.getSnapshot()
 	out := IndexStats{
 		UniqueFieldKeys:        make(map[string]uint64),
 		FieldSize:              make(map[string]uint64),

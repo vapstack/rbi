@@ -237,10 +237,10 @@ func TestTracer_OROrderPlannerAnalysisMetrics(t *testing.T) {
 	).Sort("score", qx.DESC).Limit(240)
 
 	db.clearCurrentSnapshotCachesForTesting()
-	view := db.currentQueryViewForTests()
-	defer db.releaseQueryView(view)
+	view := db.engine.currentQueryViewForTests()
+	defer db.engine.releaseQueryView(view)
 
-	warm, ok := db.buildPredicatesOrderedWithMode(
+	warm, ok := db.engine.buildPredicatesOrderedWithMode(
 		[]qx.Expr{qx.GTE("age", 30), qx.LTE("age", 250)},
 		"score", false, 4096, 0, false, false,
 	)
@@ -260,18 +260,18 @@ func TestTracer_OROrderPlannerAnalysisMetrics(t *testing.T) {
 		t.Fatal("expected warm predicate to materialize")
 	}
 	releasePredicates(warm)
-	if got := db.getSnapshot().matPredCacheCount.Load(); got == 0 {
+	if got := db.engine.getSnapshot().matPredCacheCount.Load(); got == 0 {
 		t.Fatalf("expected prewarmed materialized predicate cache")
 	}
 
-	preparedQ, viewQ, err := prepareTestQuery(db, q)
+	preparedQ, viewQ, err := prepareTestQuery(db.engine, q)
 	if err != nil {
 		t.Fatalf("prepareTestQuery: %v", err)
 	}
 	defer preparedQ.Release()
 
 	window, _ := orderWindowForTest(q)
-	branches, alwaysFalse, ok := db.buildORBranchesOrdered(q.Filter.Args, "score", window)
+	branches, alwaysFalse, ok := db.engine.buildORBranchesOrdered(q.Filter.Args, "score", window)
 	if !ok {
 		t.Fatalf("buildORBranchesOrdered: ok=false")
 	}
@@ -339,10 +339,10 @@ func TestTracer_OROrderPlannerAnalysisRangeCountersNotDoubleCountAcrossPhases(t 
 	).Sort("score", qx.DESC).Limit(240)
 
 	db.clearCurrentSnapshotCachesForTesting()
-	view := db.currentQueryViewForTests()
-	defer db.releaseQueryView(view)
+	view := db.engine.currentQueryViewForTests()
+	defer db.engine.releaseQueryView(view)
 
-	warm, ok := db.buildPredicatesOrderedWithMode(
+	warm, ok := db.engine.buildPredicatesOrderedWithMode(
 		[]qx.Expr{qx.GTE("age", 30), qx.LTE("age", 250)},
 		"score", false, 4096, 0, false, false,
 	)
@@ -363,14 +363,14 @@ func TestTracer_OROrderPlannerAnalysisRangeCountersNotDoubleCountAcrossPhases(t 
 	}
 	releasePredicates(warm)
 
-	preparedQ, viewQ, err := prepareTestQuery(db, q)
+	preparedQ, viewQ, err := prepareTestQuery(db.engine, q)
 	if err != nil {
 		t.Fatalf("prepareTestQuery: %v", err)
 	}
 	defer preparedQ.Release()
 
 	window, _ := orderWindowForTest(q)
-	branches, alwaysFalse, ok := db.buildORBranchesOrdered(q.Filter.Args, "score", window)
+	branches, alwaysFalse, ok := db.engine.buildORBranchesOrdered(q.Filter.Args, "score", window)
 	if !ok {
 		t.Fatalf("buildORBranchesOrdered: ok=false")
 	}

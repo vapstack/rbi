@@ -190,7 +190,6 @@ func TestQueryViewIdxMapping_UsesPinnedStrMapSnapshot(t *testing.T) {
 		strMapView:        strMapSnap,
 		fields:            db.engine.fields,
 		planner:           db.engine.planner,
-		options:           db.options,
 		lenZeroComplement: indexSnap.lenZeroComplement,
 	}
 
@@ -734,7 +733,7 @@ func TestIndexPersistence_ChunkedFieldRoundTrip(t *testing.T) {
 		}
 	}
 
-	if storage, ok := db.getSnapshot().fieldIndexStorage("name"); !ok || !storage.isChunked() {
+	if storage, ok := db.engine.getSnapshot().fieldIndexStorage("name"); !ok || !storage.isChunked() {
 		t.Fatalf("expected chunked name index before close")
 	}
 
@@ -755,7 +754,7 @@ func TestIndexPersistence_ChunkedFieldRoundTrip(t *testing.T) {
 		}
 	})
 
-	if storage, ok := db2.getSnapshot().fieldIndexStorage("name"); !ok || !storage.isChunked() {
+	if storage, ok := db2.engine.getSnapshot().fieldIndexStorage("name"); !ok || !storage.isChunked() {
 		t.Fatalf("expected chunked name index after reopen")
 	}
 
@@ -2159,7 +2158,7 @@ func TestPlanCandidateOrder_SkipsPointerSortField(t *testing.T) {
 	assertSameSlice(t, got, want)
 
 	nq := normalizeQueryForTest(q)
-	planOut, ok, err := db.tryPlan(nq, nil)
+	planOut, ok, err := db.engine.tryPlan(nq, nil)
 	if err != nil {
 		t.Fatalf("tryPlan: %v", err)
 	}
@@ -2186,7 +2185,7 @@ func TestPointerNil_OrderExecutionFastPaths(t *testing.T) {
 
 	qLimit := qx.Query(qx.EQ("active", true)).Sort("opt", qx.ASC).Limit(3)
 	limitLeaves := mustExtractAndLeaves(t, qLimit.Filter)
-	out, used, err := db.tryLimitQueryOrderBasic(qLimit, limitLeaves, nil)
+	out, used, err := db.engine.tryLimitQueryOrderBasic(qLimit, limitLeaves, nil)
 	if err != nil {
 		t.Fatalf("tryLimitQueryOrderBasic: %v", err)
 	}
@@ -2205,7 +2204,7 @@ func TestPointerNil_OrderExecutionFastPaths(t *testing.T) {
 	}
 
 	qOffset := qx.Query(qx.EQ("active", true)).Sort("opt", qx.ASC).Offset(1).Limit(2)
-	out, used, err = db.tryQueryOrderBasicWithLimit(qOffset, nil)
+	out, used, err = db.engine.tryQueryOrderBasicWithLimit(qOffset, nil)
 	if err != nil {
 		t.Fatalf("tryQueryOrderBasicWithLimit: %v", err)
 	}
@@ -2220,7 +2219,7 @@ func TestPointerNil_OrderExecutionFastPaths(t *testing.T) {
 
 	qEqNilLimit := qx.Query(qx.EQ("opt", nil)).Sort("opt", qx.ASC).Limit(10)
 	eqNilLeaves := mustExtractAndLeaves(t, qEqNilLimit.Filter)
-	out, used, err = db.tryLimitQueryOrderBasic(qEqNilLimit, eqNilLeaves, nil)
+	out, used, err = db.engine.tryLimitQueryOrderBasic(qEqNilLimit, eqNilLeaves, nil)
 	if err != nil {
 		t.Fatalf("tryLimitQueryOrderBasic(eq nil): %v", err)
 	}
@@ -2231,7 +2230,7 @@ func TestPointerNil_OrderExecutionFastPaths(t *testing.T) {
 	if used {
 		assertSameSlice(t, out, want)
 	}
-	planOut, used, err := db.tryExecutionPlan(qEqNilLimit, nil)
+	planOut, used, err := db.engine.tryExecutionPlan(qEqNilLimit, nil)
 	if err != nil {
 		t.Fatalf("tryExecutionPlan(eq nil limit): %v", err)
 	}
@@ -2241,7 +2240,7 @@ func TestPointerNil_OrderExecutionFastPaths(t *testing.T) {
 	assertSameSlice(t, planOut, want)
 
 	qPrefix := qx.Query(qx.PREFIX("opt", "")).Sort("opt", qx.ASC).Offset(1).Limit(2)
-	out, used, err = db.tryQueryOrderPrefixWithLimit(qPrefix, nil)
+	out, used, err = db.engine.tryQueryOrderPrefixWithLimit(qPrefix, nil)
 	if err != nil {
 		t.Fatalf("tryQueryOrderPrefixWithLimit: %v", err)
 	}
@@ -2260,7 +2259,7 @@ func TestPointerNil_OrderExecutionFastPaths(t *testing.T) {
 	}
 
 	qPrefixDesc := qx.Query(qx.PREFIX("opt", "")).Sort("opt", qx.DESC).Offset(1).Limit(2)
-	out, used, err = db.tryQueryOrderPrefixWithLimit(qPrefixDesc, nil)
+	out, used, err = db.engine.tryQueryOrderPrefixWithLimit(qPrefixDesc, nil)
 	if err != nil {
 		t.Fatalf("tryQueryOrderPrefixWithLimit(desc): %v", err)
 	}
@@ -2323,7 +2322,7 @@ func TestPointerNil_ExecPlanOrderedBasic_BaseNilTail(t *testing.T) {
 		qx.NOT(qx.EQ("active", false)),
 	).Sort("opt", qx.ASC).Offset(1).Limit(3))
 
-	preparedQ, viewQ, err := prepareTestQuery(db, q)
+	preparedQ, viewQ, err := prepareTestQuery(db.engine, q)
 	if err != nil {
 		t.Fatalf("prepareTestQuery: %v", err)
 	}
@@ -2331,17 +2330,17 @@ func TestPointerNil_ExecPlanOrderedBasic_BaseNilTail(t *testing.T) {
 
 	leaves := mustExtractAndLeaves(t, q.Filter)
 	window, _ := orderWindow(&viewQ)
-	preds, ok := db.buildPredicatesOrderedWithMode(leaves, "opt", false, window, q.Window.Offset, true, true)
+	preds, ok := db.engine.buildPredicatesOrderedWithMode(leaves, "opt", false, window, q.Window.Offset, true, true)
 	if !ok {
 		t.Fatalf("buildPredicatesOrderedWithMode: ok=false")
 	}
 	defer releasePredicates(preds)
 
-	got, ok := db.execPlanOrderedBasic(q, preds, nil)
+	got, ok := db.engine.execPlanOrderedBasic(q, preds, nil)
 	if !ok {
 		t.Fatalf("execPlanOrderedBasic: ok=false")
 	}
-	want, err := db.currentQueryViewForTests().execPreparedQuery(&viewQ)
+	want, err := db.engine.currentQueryViewForTests().execPreparedQuery(&viewQ)
 	if err != nil {
 		t.Fatalf("execPreparedQuery: %v", err)
 	}
@@ -2395,20 +2394,20 @@ func TestPointerNil_TryPlanOrdered_AllowsPointerSortField(t *testing.T) {
 		qx.NOT(qx.EQ("active", false)),
 	).Sort("opt", qx.DESC).Offset(1).Limit(2))
 
-	got, ok, err := db.tryPlan(q, nil)
+	got, ok, err := db.engine.tryPlan(q, nil)
 	if err != nil {
 		t.Fatalf("tryPlan: %v", err)
 	}
 	if !ok {
 		t.Fatalf("expected tryPlan to use ordered planner path for pointer sort field")
 	}
-	preparedQ, viewQ, err := prepareTestQuery(db, q)
+	preparedQ, viewQ, err := prepareTestQuery(db.engine, q)
 	if err != nil {
 		t.Fatalf("prepareTestQuery: %v", err)
 	}
 	defer preparedQ.Release()
 
-	want, err := db.currentQueryViewForTests().execPreparedQuery(&viewQ)
+	want, err := db.engine.currentQueryViewForTests().execPreparedQuery(&viewQ)
 	if err != nil {
 		t.Fatalf("execPreparedQuery: %v", err)
 	}
@@ -2866,7 +2865,7 @@ func indexExtFloatSignedZeroChunkedDB(t *testing.T) *DB[uint64, Rec] {
 		}
 	}
 
-	if db.fieldOverlay("score").chunked == nil {
+	if db.engine.currentQueryViewForTests().fieldOverlay("score").chunked == nil {
 		t.Fatalf("expected chunked score overlay")
 	}
 
@@ -2902,7 +2901,7 @@ func indexExtFloatNaNChunkedDB(t *testing.T) *DB[uint64, Rec] {
 		}
 	}
 
-	if db.fieldOverlay("score").chunked == nil {
+	if db.engine.currentQueryViewForTests().fieldOverlay("score").chunked == nil {
 		t.Fatalf("expected chunked score overlay")
 	}
 
@@ -2922,10 +2921,10 @@ func indexExtNumericCoercionChunkedDB(t *testing.T) *DB[uint64, Rec] {
 		}
 	})
 
-	if db.fieldOverlay("age").chunked == nil {
+	if db.engine.currentQueryViewForTests().fieldOverlay("age").chunked == nil {
 		t.Fatalf("expected chunked age overlay")
 	}
-	if db.fieldOverlay("score").chunked == nil {
+	if db.engine.currentQueryViewForTests().fieldOverlay("score").chunked == nil {
 		t.Fatalf("expected chunked score overlay")
 	}
 
@@ -3674,14 +3673,14 @@ func TestIndexExt_DBFieldOverlayPromotesOnDistinctGrowth(t *testing.T) {
 	indexExtBatchSetGenerated(t, db, 1, 300, func(i int) *Rec {
 		return &Rec{Name: fmt.Sprintf("prom/%03d", i), Age: i}
 	})
-	if db.fieldOverlay("name").chunked != nil {
+	if db.engine.currentQueryViewForTests().fieldOverlay("name").chunked != nil {
 		t.Fatalf("expected flat name overlay below threshold")
 	}
 
 	indexExtBatchSetGenerated(t, db, 301, 420, func(i int) *Rec {
 		return &Rec{Name: fmt.Sprintf("prom/%03d", i), Age: i}
 	})
-	if db.fieldOverlay("name").chunked == nil {
+	if db.engine.currentQueryViewForTests().fieldOverlay("name").chunked == nil {
 		t.Fatalf("expected chunked name overlay above threshold")
 	}
 
@@ -3694,7 +3693,7 @@ func TestIndexExt_DBFieldOverlayDemotesOnDistinctCollapse(t *testing.T) {
 	indexExtBatchSetGenerated(t, db, 1, 420, func(i int) *Rec {
 		return &Rec{Name: fmt.Sprintf("dem/%03d", i), Age: i}
 	})
-	if db.fieldOverlay("name").chunked == nil {
+	if db.engine.currentQueryViewForTests().fieldOverlay("name").chunked == nil {
 		t.Fatalf("expected chunked name overlay before deletes")
 	}
 
@@ -3703,7 +3702,7 @@ func TestIndexExt_DBFieldOverlayDemotesOnDistinctCollapse(t *testing.T) {
 			t.Fatalf("Delete(%d): %v", i, err)
 		}
 	}
-	if db.fieldOverlay("name").chunked != nil {
+	if db.engine.currentQueryViewForTests().fieldOverlay("name").chunked != nil {
 		t.Fatalf("expected flat name overlay after deletes")
 	}
 
@@ -3911,7 +3910,7 @@ func TestIndexExt_DBNilPointerTransitionsPreserveIndexes(t *testing.T) {
 			t.Fatalf("Patch(%d value->nil): %v", id, err)
 		}
 	}
-	if db.fieldOverlay("opt").chunked == nil {
+	if db.engine.currentQueryViewForTests().fieldOverlay("opt").chunked == nil {
 		t.Fatalf("expected opt overlay to remain chunked")
 	}
 
@@ -3959,11 +3958,11 @@ func TestIndexExt_DBSliceReplaceRemovesStaleTermsAndLenBuckets(t *testing.T) {
 	}
 	indexExtAssertSameSlice(
 		t,
-		indexExtPostingIDs(db.lenFieldOverlay("tags").lookupPostingRetained(uint64ByteStr(0))),
+		indexExtPostingIDs(db.engine.currentQueryViewForTests().lenFieldOverlay("tags").lookupPostingRetained(uint64ByteStr(0))),
 		wantZero,
 	)
 
-	if db.fieldOverlay("tags").lookupPostingRetained("tag-005").Contains(5) {
+	if db.engine.currentQueryViewForTests().fieldOverlay("tags").lookupPostingRetained("tag-005").Contains(5) {
 		t.Fatalf("stale tag posting retained id=5 after slice replacement")
 	}
 }
@@ -3981,7 +3980,7 @@ func TestIndexExt_SnapshotOverlayStableDuringConcurrentWrites(t *testing.T) {
 		return &Rec{Name: name, Age: i}
 	})
 
-	snap := db.getSnapshot()
+	snap := db.engine.getSnapshot()
 	pinnedSnap, pinnedRef, ok := db.engine.snapshot.pinRefBySeq(snap.seq)
 	if !ok {
 		t.Fatalf("pinSnapshotRefBySeq(%d): false", snap.seq)
@@ -4060,7 +4059,7 @@ func TestIndexExt_DuplicateIDBatchPatchNetDiffKeepsIndexesConsistent(t *testing.
 		}
 	})
 
-	if db.fieldOverlay("name").chunked == nil || db.fieldOverlay("tags").chunked == nil {
+	if db.engine.currentQueryViewForTests().fieldOverlay("name").chunked == nil || db.engine.currentQueryViewForTests().fieldOverlay("tags").chunked == nil {
 		t.Fatalf("expected chunked overlays before duplicate-id patch")
 	}
 
@@ -4110,23 +4109,23 @@ func TestIndexExt_DuplicateIDBatchPatchNetDiffKeepsIndexesConsistent(t *testing.
 			t.Fatalf("%s unexpected final value: %#v", stage, got)
 		}
 
-		indexExtAssertOverlayMembership(t, db.fieldOverlay("name"), "seed/077", 77, false)
-		indexExtAssertOverlayMembership(t, db.fieldOverlay("name"), "dup/first", 77, false)
-		indexExtAssertOverlayMembership(t, db.fieldOverlay("name"), "dup/second", 77, false)
-		indexExtAssertOverlayMembership(t, db.fieldOverlay("name"), "dup/final", 77, true)
+		indexExtAssertOverlayMembership(t, db.engine.currentQueryViewForTests().fieldOverlay("name"), "seed/077", 77, false)
+		indexExtAssertOverlayMembership(t, db.engine.currentQueryViewForTests().fieldOverlay("name"), "dup/first", 77, false)
+		indexExtAssertOverlayMembership(t, db.engine.currentQueryViewForTests().fieldOverlay("name"), "dup/second", 77, false)
+		indexExtAssertOverlayMembership(t, db.engine.currentQueryViewForTests().fieldOverlay("name"), "dup/final", 77, true)
 
-		indexExtAssertOverlayMembership(t, db.fieldOverlay("tags"), "seed-tag/077", 77, false)
-		indexExtAssertOverlayMembership(t, db.fieldOverlay("tags"), "first", 77, false)
-		indexExtAssertOverlayMembership(t, db.fieldOverlay("tags"), "final", 77, true)
-		indexExtAssertOverlayMembership(t, db.fieldOverlay("tags"), "shared", 77, true)
+		indexExtAssertOverlayMembership(t, db.engine.currentQueryViewForTests().fieldOverlay("tags"), "seed-tag/077", 77, false)
+		indexExtAssertOverlayMembership(t, db.engine.currentQueryViewForTests().fieldOverlay("tags"), "first", 77, false)
+		indexExtAssertOverlayMembership(t, db.engine.currentQueryViewForTests().fieldOverlay("tags"), "final", 77, true)
+		indexExtAssertOverlayMembership(t, db.engine.currentQueryViewForTests().fieldOverlay("tags"), "shared", 77, true)
 
-		indexExtAssertOverlayMembership(t, db.fieldOverlay("opt"), "seed-opt/077", 77, false)
-		indexExtAssertOverlayMembership(t, db.fieldOverlay("opt"), "dup-live", 77, false)
-		indexExtAssertOverlayMembership(t, db.nilFieldOverlay("opt"), nilIndexEntryKey, 77, true)
+		indexExtAssertOverlayMembership(t, db.engine.currentQueryViewForTests().fieldOverlay("opt"), "seed-opt/077", 77, false)
+		indexExtAssertOverlayMembership(t, db.engine.currentQueryViewForTests().fieldOverlay("opt"), "dup-live", 77, false)
+		indexExtAssertOverlayMembership(t, db.engine.currentQueryViewForTests().nilFieldOverlay("opt"), nilIndexEntryKey, 77, true)
 
-		indexExtAssertOverlayMembership(t, db.lenFieldOverlay("tags"), uint64ByteStr(0), 77, false)
-		indexExtAssertOverlayMembership(t, db.lenFieldOverlay("tags"), uint64ByteStr(1), 77, false)
-		indexExtAssertOverlayMembership(t, db.lenFieldOverlay("tags"), uint64ByteStr(2), 77, true)
+		indexExtAssertOverlayMembership(t, db.engine.currentQueryViewForTests().lenFieldOverlay("tags"), uint64ByteStr(0), 77, false)
+		indexExtAssertOverlayMembership(t, db.engine.currentQueryViewForTests().lenFieldOverlay("tags"), uint64ByteStr(1), 77, false)
+		indexExtAssertOverlayMembership(t, db.engine.currentQueryViewForTests().lenFieldOverlay("tags"), uint64ByteStr(2), 77, true)
 
 		indexExtAssertQueryKeysExpected(t, db, qx.Query(qx.EQ("name", "dup/final")))
 		indexExtAssertQueryKeysExpected(t, db, qx.Query(qx.HASANY("tags", []string{"final"})))
@@ -4168,7 +4167,7 @@ func TestIndexExt_DBFloatSignedZeroLookupMatchesNumericEquality(t *testing.T) {
 
 	indexExtAssertSameSlice(
 		t,
-		indexExtPostingIDs(db.fieldOverlay("score").lookupPostingRetained(float64ByteStr(0.0))),
+		indexExtPostingIDs(db.engine.currentQueryViewForTests().fieldOverlay("score").lookupPostingRetained(float64ByteStr(0.0))),
 		[]uint64{1, 2},
 	)
 }

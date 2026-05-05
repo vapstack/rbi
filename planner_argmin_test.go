@@ -280,7 +280,7 @@ func TestPlannerArgmin_ORNoOrderDecisionMatchesCandidatePolicy(t *testing.T) {
 			branches.Append(makeORBranchForCalibrationDecisionTest(4_000, 4))
 			defer branches.Release()
 
-			decision := db.decidePlanORNoOrder(q, branches)
+			decision := db.engine.decidePlanORNoOrder(q, branches)
 			if decision.kWayCost <= 0 || decision.fallbackCost <= 0 {
 				t.Fatalf("expected positive candidate costs: kway=%v fallback=%v", decision.kWayCost, decision.fallbackCost)
 			}
@@ -348,7 +348,7 @@ func TestPlannerArgmin_OROrderDecisionMatchesCandidatePolicy(t *testing.T) {
 				t.Fatalf("orderWindow: ok=false")
 			}
 			orderField := q.Order[0].By.Name
-			branches, alwaysFalse, ok := db.buildORBranchesOrdered(q.Filter.Args, orderField, window)
+			branches, alwaysFalse, ok := db.engine.buildORBranchesOrdered(q.Filter.Args, orderField, window)
 			if !ok {
 				t.Fatalf("buildORBranchesOrdered: ok=false")
 			}
@@ -357,13 +357,13 @@ func TestPlannerArgmin_OROrderDecisionMatchesCandidatePolicy(t *testing.T) {
 			}
 			defer branches.Release()
 
-			preparedQ, viewQ, err := prepareTestQuery(db, q)
+			preparedQ, viewQ, err := prepareTestQuery(db.engine, q)
 			if err != nil {
 				t.Fatalf("prepareTestQuery: %v", err)
 			}
 			defer preparedQ.Release()
 
-			view := db.currentQueryViewForTests()
+			view := db.engine.currentQueryViewForTests()
 			analysis, ok := view.buildOROrderAnalysis(&viewQ, branches)
 			if !ok {
 				t.Fatalf("buildOROrderAnalysis: ok=false")
@@ -437,7 +437,7 @@ func TestPlannerArgmin_OROrderDecisionMatchesCandidatePolicy_FallbackSynthetic(t
 		),
 	).Sort("score", qx.DESC).Limit(100)
 
-	preparedQ, viewQ, err := prepareTestQuery(db, q)
+	preparedQ, viewQ, err := prepareTestQuery(db.engine, q)
 	if err != nil {
 		t.Fatalf("prepareTestQuery: %v", err)
 	}
@@ -459,7 +459,7 @@ func TestPlannerArgmin_OROrderDecisionMatchesCandidatePolicy_FallbackSynthetic(t
 		analysis.mergeStats[i].mergeChecks = checks
 	}
 
-	view := db.currentQueryViewForTests()
+	view := db.engine.currentQueryViewForTests()
 	candidates, ok := plannerArgminOROrderCandidatesForTest(view, &viewQ, branches, &analysis)
 	if !ok {
 		t.Fatalf("plannerArgminOROrderCandidatesForTest: ok=false")
@@ -532,7 +532,7 @@ func TestPlannerArgmin_OrderedDecisionMatchesCandidatePolicy(t *testing.T) {
 			}
 
 			q := plannerArgminOrderedQuery()
-			preparedQ, viewQ, err := prepareTestQuery(db, q)
+			preparedQ, viewQ, err := prepareTestQuery(db.engine, q)
 			if err != nil {
 				t.Fatalf("prepareTestQuery: %v", err)
 			}
@@ -544,7 +544,7 @@ func TestPlannerArgmin_OrderedDecisionMatchesCandidatePolicy(t *testing.T) {
 				t.Fatalf("collectAndLeavesScratch: ok=%v len=%d", ok, len(leaves))
 			}
 
-			view := db.currentQueryViewForTests()
+			view := db.engine.currentQueryViewForTests()
 			decision := view.decideOrderedByCost(&viewQ, leaves)
 			if decision.orderedCost <= 0 || decision.fallbackCost <= 0 {
 				t.Fatalf(

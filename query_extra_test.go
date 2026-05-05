@@ -758,7 +758,7 @@ func TestQueryExt_ConcurrentWriter_RootExecPreparedQuery_ReturnsHybridResults(t 
 
 	q := qx.Query(qx.EQ("active", true)).Sort("opt", qx.ASC).Offset(1).Limit(3)
 	nq := normalizeQueryForTest(q)
-	if err := db.checkUsedQuery(nq); err != nil {
+	if err := db.engine.checkUsedQuery(nq); err != nil {
 		t.Fatalf("checkUsedQuery(%+v): %v", nq, err)
 	}
 
@@ -1273,7 +1273,7 @@ func TestQueryExt_ConcurrentWriter_RootExecPreparedQuery_OnOrderedORNegativeResi
 	}
 
 	nq := normalizeQueryForTest(q)
-	if err := db.checkUsedQuery(nq); err != nil {
+	if err := db.engine.checkUsedQuery(nq); err != nil {
 		t.Fatalf("checkUsedQuery(%+v): %v", nq, err)
 	}
 
@@ -1495,7 +1495,7 @@ func TestQueryExt_StringKeys_ConcurrentWriter_RootExecPreparedQuery_OnOrderedOR_
 	}
 
 	nq := normalizeQueryForTest(q)
-	if err := db.checkUsedQuery(nq); err != nil {
+	if err := db.engine.checkUsedQuery(nq); err != nil {
 		t.Fatalf("checkUsedQuery(%+v): %v", nq, err)
 	}
 
@@ -1622,7 +1622,7 @@ func TestQueryExt_RefreshPlannerStatsDuringRuntimeFallbackEligibleOrderedOR_AllR
 		t.Fatalf("Count(baseQ): %v", err)
 	}
 	nq := normalizeQueryForTest(q)
-	if err := db.checkUsedQuery(nq); err != nil {
+	if err := db.engine.checkUsedQuery(nq); err != nil {
 		t.Fatalf("checkUsedQuery(%+v): %v", nq, err)
 	}
 
@@ -1763,7 +1763,7 @@ func TestQueryExt_ConcurrentAtomicBatchSetSnapshotConsistency_OnNoOrderORWindow_
 	}
 
 	nq := normalizeQueryForTest(q)
-	if err := db.checkUsedQuery(nq); err != nil {
+	if err := db.engine.checkUsedQuery(nq); err != nil {
 		t.Fatalf("checkUsedQuery(%+v): %v", nq, err)
 	}
 
@@ -1878,7 +1878,7 @@ func TestQueryExt_RefreshPlannerStatsDuringAdversarialNoOrderOR_AllReadPathsStay
 	wantCount := uint64(len(full))
 
 	nq := normalizeQueryForTest(q)
-	if err := db.checkUsedQuery(nq); err != nil {
+	if err := db.engine.checkUsedQuery(nq); err != nil {
 		t.Fatalf("checkUsedQuery(%+v): %v", nq, err)
 	}
 
@@ -2241,7 +2241,7 @@ func TestQueryExt_OrderBasicPointerNilContradictions_RemainEmpty(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			assertQueryExtAllReadPathsMatchExpected(t, db, tc.q)
 
-			got, used, err := db.tryExecutionPlan(tc.q, nil)
+			got, used, err := db.engine.tryExecutionPlan(tc.q, nil)
 			if err != nil {
 				t.Fatalf("tryExecutionPlan(%+v): %v", tc.q, err)
 			}
@@ -2293,7 +2293,7 @@ func TestQueryExt_OrderBasicNilShortCircuit_PreservesResidualValidation(t *testi
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			_, used, err := db.tryExecutionPlan(tc.q, nil)
+			_, used, err := db.engine.tryExecutionPlan(tc.q, nil)
 			if !used {
 				t.Fatalf("expected tryExecutionPlan to take ordered fast path")
 			}
@@ -2333,15 +2333,15 @@ func TestQueryExt_OrderBasicNilShortCircuit_DoesNotMaterializeResiduals(t *testi
 		qx.CONTAINS("name", "a"),
 	).Sort("opt", qx.ASC).Limit(8)
 
-	cacheKey := db.materializedPredCacheKey(qx.CONTAINS("name", "a"))
+	cacheKey := db.engine.materializedPredCacheKey(qx.CONTAINS("name", "a"))
 	if cacheKey == "" {
 		t.Fatalf("expected non-empty materialized cache key")
 	}
-	if _, ok := db.getSnapshot().loadMaterializedPred(cacheKey); ok {
+	if _, ok := db.engine.getSnapshot().loadMaterializedPred(cacheKey); ok {
 		t.Fatalf("unexpected residual cache entry before execution")
 	}
 
-	got, used, err := db.tryExecutionPlan(q, nil)
+	got, used, err := db.engine.tryExecutionPlan(q, nil)
 	if err != nil {
 		t.Fatalf("tryExecutionPlan(%+v): %v", q, err)
 	}
@@ -2351,7 +2351,7 @@ func TestQueryExt_OrderBasicNilShortCircuit_DoesNotMaterializeResiduals(t *testi
 	if len(got) != 0 {
 		t.Fatalf("expected empty fast-path result, got=%v", got)
 	}
-	if _, ok := db.getSnapshot().loadMaterializedPred(cacheKey); ok {
+	if _, ok := db.engine.getSnapshot().loadMaterializedPred(cacheKey); ok {
 		t.Fatalf("unexpected residual cache entry after empty nil-order short-circuit")
 	}
 }
@@ -2484,7 +2484,7 @@ func TestQueryExt_MixedCaching_NumericRangesRemainExactAcrossClearAndPublish(t *
 	}
 
 	checkQueries("warm")
-	if got := db.getSnapshot().matPredCacheCount.Load(); got == 0 {
+	if got := db.engine.getSnapshot().matPredCacheCount.Load(); got == 0 {
 		t.Fatalf("expected shared runtime caches to warm up")
 	}
 
@@ -2496,13 +2496,13 @@ func TestQueryExt_MixedCaching_NumericRangesRemainExactAcrossClearAndPublish(t *
 	checkQueries("after_unrelated_publish")
 
 	db.clearCurrentSnapshotCachesForTesting()
-	snap := db.getSnapshot()
+	snap := db.engine.getSnapshot()
 	if got := snap.matPredCacheCount.Load(); got != 0 {
 		t.Fatalf("expected cleared materialized predicate cache, got=%d", got)
 	}
 
 	checkQueries("after_clear")
-	if got := db.getSnapshot().matPredCacheCount.Load(); got == 0 {
+	if got := db.engine.getSnapshot().matPredCacheCount.Load(); got == 0 {
 		t.Fatalf("expected caches to repopulate after cold queries")
 	}
 }
@@ -2565,7 +2565,7 @@ func TestQueryExt_ConcurrentEvictingMaterializedPredicates_RemainStable(t *testi
 	if _, err := db.QueryKeys(queries[0]); err != nil {
 		t.Fatalf("warm QueryKeys: %v", err)
 	}
-	if got := db.getSnapshot().matPredCacheCount.Load(); got == 0 {
+	if got := db.engine.getSnapshot().matPredCacheCount.Load(); got == 0 {
 		t.Fatalf("expected deep ordered window to materialize a predicate cache entry")
 	}
 
@@ -2624,7 +2624,7 @@ func TestQueryExt_ConcurrentEvictingMaterializedPredicates_RemainStable(t *testi
 		t.Fatal(err)
 	}
 
-	if got := db.getSnapshot().matPredCacheCount.Load(); got > 1 {
+	if got := db.engine.getSnapshot().matPredCacheCount.Load(); got > 1 {
 		t.Fatalf("materialized predicate cache exceeded configured bound: got=%d", got)
 	}
 }
@@ -2817,7 +2817,7 @@ func TestQueryExt_NumericRangeFieldMutation_DoesNotReuseStaleCaches(t *testing.T
 	}
 
 	checkQueries("warm")
-	if got := db.getSnapshot().matPredCacheCount.Load(); got == 0 {
+	if got := db.engine.getSnapshot().matPredCacheCount.Load(); got == 0 {
 		t.Fatalf("expected warmed numeric-range query to populate predicate cache")
 	}
 

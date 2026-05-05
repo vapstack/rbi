@@ -36,14 +36,12 @@ type normalizedScalarBoundCacheEntry struct {
 // queryView is a fully initialized, snapshot-bound query state.
 // Zero value is invalid; construct it via makeQueryView.
 type queryView struct {
-	engine *queryEngine
-	snap   *indexSnapshot
-
+	engine            *queryEngine
+	snap              *indexSnapshot
 	strKey            bool
 	strMapView        *strMapSnapshot
 	fields            map[string]*field
 	planner           *planner
-	options           *Options
 	lenZeroComplement *pooled.Slice[bool]
 
 	normalizedScalarBoundCacheLen uint8

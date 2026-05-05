@@ -103,7 +103,7 @@ func (s *benchReadModeState[K, V]) beforeQuery(b *testing.B, db *DB[K, V]) {
 	switch s.mode.kind {
 	case benchCacheModeColdFresh:
 		s.applyTurnover(b, db)
-		db.getSnapshot().clearRuntimeCachesForTesting()
+		db.engine.getSnapshot().clearRuntimeCachesForTesting()
 	case benchCacheModeCold:
 		s.applyTurnover(b, db)
 	case benchCacheModeColdPinned:
@@ -146,7 +146,7 @@ func (s *benchReadModeState[K, V]) applyTurnover(tb testing.TB, db *DB[K, V]) {
 
 func (s *benchReadModeState[K, V]) pinCurrentSnapshot(tb testing.TB, db *DB[K, V]) {
 	tb.Helper()
-	snap := db.getSnapshot()
+	snap := db.engine.getSnapshot()
 	got, ref, ok := db.engine.snapshot.pinRefBySeq(snap.seq)
 	if !ok || got != snap || ref == nil {
 		tb.Fatalf("pinSnapshotRefBySeq(seq=%d) failed", snap.seq)
@@ -183,10 +183,10 @@ func warmBenchReadHotSteady[K ~string | ~uint64, V any](
 		return
 	}
 	stable := 0
-	prevCount := db.getSnapshot().matPredCacheCount.Load()
+	prevCount := db.engine.getSnapshot().matPredCacheCount.Load()
 	for i := 0; i < benchHotWarmMaxCycles; i++ {
 		run(b, db, q)
-		count := db.getSnapshot().matPredCacheCount.Load()
+		count := db.engine.getSnapshot().matPredCacheCount.Load()
 		if count == prevCount {
 			stable++
 			if stable >= benchHotWarmStableCycles {
@@ -348,7 +348,7 @@ func stressBenchAltPatch(rec *StressBenchUser) []Field {
 
 func buildUserBenchTurnoverRingUint64(tb testing.TB, db *DB[uint64, UserBench]) *benchTurnoverRing[uint64] {
 	tb.Helper()
-	total := int(db.getSnapshot().universe.Cardinality())
+	total := int(db.engine.getSnapshot().universe.Cardinality())
 	ords := benchTurnoverSampleOrdinals(total, benchTurnoverRingSize)
 	entries := make([]benchTurnoverEntry[uint64], 0, len(ords))
 	for _, ord := range ords {
@@ -372,7 +372,7 @@ func buildUserBenchTurnoverRingUint64(tb testing.TB, db *DB[uint64, UserBench]) 
 
 func buildUserBenchTurnoverRingString(tb testing.TB, db *DB[string, UserBench]) *benchTurnoverRing[string] {
 	tb.Helper()
-	total := int(db.getSnapshot().universe.Cardinality())
+	total := int(db.engine.getSnapshot().universe.Cardinality())
 	ords := benchTurnoverSampleOrdinals(total, benchTurnoverRingSize)
 	entries := make([]benchTurnoverEntry[string], 0, len(ords))
 	for _, ord := range ords {
@@ -396,7 +396,7 @@ func buildUserBenchTurnoverRingString(tb testing.TB, db *DB[string, UserBench]) 
 
 func buildStressBenchTurnoverRing(tb testing.TB, db *DB[uint64, StressBenchUser]) *benchTurnoverRing[uint64] {
 	tb.Helper()
-	total := int(db.getSnapshot().universe.Cardinality())
+	total := int(db.engine.getSnapshot().universe.Cardinality())
 	ords := benchTurnoverSampleOrdinals(total, benchTurnoverRingSize)
 	entries := make([]benchTurnoverEntry[uint64], 0, len(ords))
 	for _, ord := range ords {
@@ -457,7 +457,7 @@ func TestBenchMode_ColdFreshPublishesAndClearsNewSnapshotCaches(t *testing.T) {
 	if _, err := db.QueryKeys(q); err != nil {
 		t.Fatalf("warm QueryKeys: %v", err)
 	}
-	oldSnap := db.getSnapshot()
+	oldSnap := db.engine.getSnapshot()
 	if oldSnap.matPredCacheCount.Load() == 0 {
 		t.Fatalf("expected warm snapshot to populate materialized predicate cache")
 	}
@@ -474,7 +474,7 @@ func TestBenchMode_ColdFreshPublishesAndClearsNewSnapshotCaches(t *testing.T) {
 	t.Cleanup(func() { state.close(t, db) })
 	runBenchModeBeforeQueryForTest(t, db, state)
 
-	newSnap := db.getSnapshot()
+	newSnap := db.engine.getSnapshot()
 	if newSnap == oldSnap || newSnap.seq == oldSnap.seq {
 		t.Fatalf("expected ColdFresh to publish a new snapshot")
 	}
@@ -495,14 +495,14 @@ func TestBenchMode_ColdInheritsUnchangedFieldCaches(t *testing.T) {
 	})
 	seedBenchData(t, db, 10_000)
 	expr := qx.PREFIX("email", "user1")
-	cacheKey := db.materializedPredCacheKey(expr)
+	cacheKey := db.engine.materializedPredCacheKey(expr)
 	if cacheKey == "" {
 		t.Fatalf("expected non-empty cache key")
 	}
 	if _, err := db.QueryKeys(qx.Query(expr)); err != nil {
 		t.Fatalf("warm QueryKeys: %v", err)
 	}
-	oldSnap := db.getSnapshot()
+	oldSnap := db.engine.getSnapshot()
 	if _, ok := oldSnap.loadMaterializedPred(cacheKey); !ok {
 		t.Fatalf("expected old snapshot cache hit before turnover")
 	}
@@ -514,7 +514,7 @@ func TestBenchMode_ColdInheritsUnchangedFieldCaches(t *testing.T) {
 	t.Cleanup(func() { state.close(t, db) })
 	runBenchModeBeforeQueryForTest(t, db, state)
 
-	newSnap := db.getSnapshot()
+	newSnap := db.engine.getSnapshot()
 	if newSnap == oldSnap || newSnap.seq == oldSnap.seq {
 		t.Fatalf("expected Cold to publish a new snapshot")
 	}
@@ -559,7 +559,7 @@ func runBenchModeBeforeQueryForTest[K ~string | ~uint64, V any](tb testing.TB, d
 	switch state.mode.kind {
 	case benchCacheModeColdFresh:
 		state.applyTurnover(tb, db)
-		db.getSnapshot().clearRuntimeCachesForTesting()
+		db.engine.getSnapshot().clearRuntimeCachesForTesting()
 	case benchCacheModeCold:
 		state.applyTurnover(tb, db)
 	case benchCacheModeColdPinned:

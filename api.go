@@ -132,8 +132,8 @@ func (db *DB[K, V]) ScanKeys(seek K, fn func(K) (bool, error)) error {
 		return ErrNoIndex
 	}
 
-	snap, seq, ref, pinned := db.pinCurrentSnapshot()
-	defer db.unpinCurrentSnapshot(seq, ref, pinned)
+	snap, seq, ref, pinned := db.engine.pinCurrentSnapshot()
+	defer db.engine.unpinCurrentSnapshot(seq, ref, pinned)
 
 	universe := snap.universe
 	iter := universe.Iter()

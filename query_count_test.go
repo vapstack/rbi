@@ -59,32 +59,32 @@ func queryCountSingleton(id uint64) posting.List {
 
 func countByExprBitmap(t *testing.T, db *DB[uint64, Rec], expr qx.Expr) uint64 {
 	t.Helper()
-	b, err := db.evalExpr(expr)
+	b, err := db.engine.evalExpr(expr)
 	if err != nil {
 		t.Fatalf("evalExpr: %v", err)
 	}
 	defer b.release()
-	return db.countPostingResult(b)
+	return db.engine.currentQueryViewForTests().countPostingResult(b)
 }
 
 func countByExprBitmapUserBench(t *testing.T, db *DB[uint64, UserBench], expr qx.Expr) uint64 {
 	t.Helper()
-	b, err := db.evalExpr(expr)
+	b, err := db.engine.evalExpr(expr)
 	if err != nil {
 		t.Fatalf("evalExpr: %v", err)
 	}
 	defer b.release()
-	return db.countPostingResult(b)
+	return db.engine.currentQueryViewForTests().countPostingResult(b)
 }
 
 func countByExprBitmapCountORBench(t *testing.T, db *DB[uint64, countORBenchRec], expr qx.Expr) uint64 {
 	t.Helper()
-	b, err := db.evalExpr(expr)
+	b, err := db.engine.evalExpr(expr)
 	if err != nil {
 		t.Fatalf("evalExpr: %v", err)
 	}
 	defer b.release()
-	return db.countPostingResult(b)
+	return db.engine.currentQueryViewForTests().countPostingResult(b)
 }
 
 func mustCountQIRExpr(t testing.TB, expr qx.Expr) qir.Expr {
@@ -94,7 +94,7 @@ func mustCountQIRExpr(t testing.TB, expr qx.Expr) qir.Expr {
 
 func mustCountQIRExprForDB[K ~string | ~uint64, V any](t testing.TB, db *DB[K, V], expr qx.Expr) qir.Expr {
 	t.Helper()
-	prepared, compiled, err := prepareTestExpr(db, expr)
+	prepared, compiled, err := prepareTestExpr(db.engine, expr)
 	if err != nil {
 		t.Fatalf("prepareTestExpr(%+v): %v", expr, err)
 	}
@@ -173,7 +173,7 @@ func expectPredicateExactPostingFilterCount(t *testing.T, p predicate, src posti
 
 func cloneSnapshotUniverse(t *testing.T, db *DB[uint64, Rec]) posting.List {
 	t.Helper()
-	return db.snapshotUniverseView().Clone()
+	return db.engine.currentQueryViewForTests().snapshotUniverseView().Clone()
 }
 
 type countORBenchRec struct {
@@ -579,8 +579,8 @@ func TestCount_ScalarInSplit_ResidualFilterMatchesBitmap(t *testing.T) {
 		t.Fatalf("country IN lead not found")
 	}
 
-	qv := db.makeQueryView(db.getSnapshot())
-	defer db.releaseQueryView(qv)
+	qv := db.engine.makeQueryView(db.engine.getSnapshot())
+	defer db.engine.releaseQueryView(qv)
 
 	filter, ok, err := qv.evalAndOperandsExceptReordered(leaves, lead)
 	if err != nil {
@@ -625,8 +625,8 @@ func TestCount_EvalAndOperandsExceptReordered_BroadRangeAfterContainsMatchesBitm
 		qx.GTE("score", 20.0),
 	)
 
-	qv := db.makeQueryView(db.getSnapshot())
-	defer db.releaseQueryView(qv)
+	qv := db.engine.makeQueryView(db.engine.getSnapshot())
+	defer db.engine.releaseQueryView(qv)
 
 	var leavesBuf [countPredicateScanMaxLeaves]qir.Expr
 	leaves := mustCollectCountLeavesScratchForDB(t, db, expr, leavesBuf[:0])
@@ -715,7 +715,7 @@ func TestCount_ByPredicates_BucketLeadHasAnyResidual_MatchesBitmap(t *testing.T)
 		qx.HASANY("tags", []string{"go", "db"}),
 	)
 	leaves := mustExtractAndLeaves(t, expr)
-	preds, ok := db.buildPredicatesWithMode(leaves, false)
+	preds, ok := db.engine.buildPredicatesWithMode(leaves, false)
 	if !ok {
 		t.Fatalf("buildPredicatesWithMode failed")
 	}
@@ -732,9 +732,9 @@ func TestCount_ByPredicates_BucketLeadHasAnyResidual_MatchesBitmap(t *testing.T)
 		t.Fatalf("expected age range lead predicate")
 	}
 
-	universe := db.snapshotUniverseCardinality()
+	universe := db.engine.currentQueryViewForTests().snapshotUniverseCardinality()
 	leadEst := preds[leadIdx].estCard
-	if err := db.prepareCountPredicate(&preds[leadIdx], leadEst, universe); err != nil {
+	if err := db.engine.currentQueryViewForTests().prepareCountPredicate(&preds[leadIdx], leadEst, universe); err != nil {
 		t.Fatalf("prepareCountPredicate(lead): %v", err)
 	}
 
@@ -757,7 +757,7 @@ func TestCount_ByPredicates_BucketLeadHasAnyResidual_MatchesBitmap(t *testing.T)
 		active = append(active, i)
 	}
 	for _, pi := range active {
-		if err := db.prepareCountPredicate(&preds[pi], leadEst, universe); err != nil {
+		if err := db.engine.currentQueryViewForTests().prepareCountPredicate(&preds[pi], leadEst, universe); err != nil {
 			t.Fatalf("prepareCountPredicate(residual): %v", err)
 		}
 	}
@@ -780,7 +780,7 @@ func TestCount_ByPredicates_BucketLeadHasAnyResidual_MatchesBitmap(t *testing.T)
 		t.Fatalf("expected HASANY residual to stay out of postingResult-filter subset, got=%v", exactActive)
 	}
 
-	extraExact := db.buildCountLeadResidualExactFilters(t, preds, active)
+	extraExact := db.engine.buildCountLeadResidualExactFilters(t, preds, active)
 	defer func() {
 		for _, f := range extraExact {
 			f.ids.Release()
@@ -790,7 +790,7 @@ func TestCount_ByPredicates_BucketLeadHasAnyResidual_MatchesBitmap(t *testing.T)
 		t.Fatalf("expected one local HASANY exact residual filter, got=%d", len(extraExact))
 	}
 
-	got, examined, ok := db.tryCountByPredicatesLeadBuckets(preds, leadIdx, active)
+	got, examined, ok := db.engine.tryCountByPredicatesLeadBuckets(preds, leadIdx, active)
 	if !ok {
 		t.Fatalf("expected bucket-lead count fast path")
 	}
@@ -833,13 +833,13 @@ func TestCount_ByPredicates_PostingsLead_MatchesBitmap(t *testing.T) {
 		qx.HASANY("tags", []string{"go", "db"}),
 	)
 	leaves := mustExtractAndLeaves(t, expr)
-	preds, ok := db.buildPredicatesWithMode(leaves, false)
+	preds, ok := db.engine.buildPredicatesWithMode(leaves, false)
 	if !ok {
 		t.Fatalf("buildPredicatesWithMode failed")
 	}
 	defer releasePredicates(preds)
 
-	universe := db.snapshotUniverseCardinality()
+	universe := db.engine.currentQueryViewForTests().snapshotUniverseCardinality()
 	leadIdx := -1
 	leadScore := 0.0
 	leadEst := uint64(0)
@@ -867,7 +867,7 @@ func TestCount_ByPredicates_PostingsLead_MatchesBitmap(t *testing.T) {
 	if preds[leadIdx].expr.Op != qir.OpIN {
 		t.Fatalf("expected IN lead, got %v", preds[leadIdx].expr.Op)
 	}
-	if err := db.prepareCountPredicate(&preds[leadIdx], leadEst, universe); err != nil {
+	if err := db.engine.currentQueryViewForTests().prepareCountPredicate(&preds[leadIdx], leadEst, universe); err != nil {
 		t.Fatalf("prepareCountPredicate(lead): %v", err)
 	}
 
@@ -890,13 +890,13 @@ func TestCount_ByPredicates_PostingsLead_MatchesBitmap(t *testing.T) {
 		active = append(active, i)
 	}
 	for _, pi := range active {
-		if err := db.prepareCountPredicate(&preds[pi], leadEst, universe); err != nil {
+		if err := db.engine.currentQueryViewForTests().prepareCountPredicate(&preds[pi], leadEst, universe); err != nil {
 			t.Fatalf("prepareCountPredicate(residual): %v", err)
 		}
 	}
 	sortActivePredicates(active, preds)
 
-	got, examined, ok := db.tryCountByPredicatesLeadPostings(preds, leadIdx, active)
+	got, examined, ok := db.engine.tryCountByPredicatesLeadPostings(preds, leadIdx, active)
 	if !ok {
 		t.Fatalf("expected postings-lead count fast path")
 	}
@@ -933,14 +933,14 @@ func TestCount_ByPredicates_BucketLead_ContradictoryPrefixesReturnZero(t *testin
 		qx.PREFIX("email", "user02"),
 	)
 	leaves := mustExtractAndLeaves(t, expr)
-	preds, ok := db.buildPredicatesWithMode(leaves, false)
+	preds, ok := db.engine.buildPredicatesWithMode(leaves, false)
 	if !ok {
 		t.Fatalf("buildPredicatesWithMode failed")
 	}
 	defer releasePredicates(preds)
 
 	active := []int{0, 1}
-	got, examined, ok := db.tryCountByPredicatesLeadBuckets(preds, 0, active)
+	got, examined, ok := db.engine.tryCountByPredicatesLeadBuckets(preds, 0, active)
 	if !ok {
 		t.Fatalf("expected bucket-lead count fast path")
 	}
@@ -1042,7 +1042,7 @@ func TestCount_ORByPredicates_PostingLeadResidualExactFilters_MatchesBitmap(t *t
 		),
 	)
 
-	got, ok, err := db.tryCountORByPredicates(expr, nil)
+	got, ok, err := db.engine.tryCountORByPredicates(expr, nil)
 	if err != nil {
 		t.Fatalf("tryCountORByPredicates: %v", err)
 	}
@@ -1050,12 +1050,12 @@ func TestCount_ORByPredicates_PostingLeadResidualExactFilters_MatchesBitmap(t *t
 		t.Fatalf("expected count OR predicate fast path")
 	}
 
-	b, err := db.evalExpr(expr)
+	b, err := db.engine.evalExpr(expr)
 	if err != nil {
 		t.Fatalf("evalExpr: %v", err)
 	}
 	defer b.release()
-	want := db.countPostingResult(b)
+	want := db.engine.currentQueryViewForTests().countPostingResult(b)
 	if got != want {
 		t.Fatalf("count mismatch: got=%d want=%d", got, want)
 	}
@@ -1103,16 +1103,16 @@ func TestCount_ORByPredicates_StrictWidePrefixLeadBudgetUsesScanWeight(t *testin
 	)
 	q := qx.Query(expr)
 
-	uc := db.snapshotUniverseCardinality()
+	uc := db.engine.currentQueryViewForTests().snapshotUniverseCardinality()
 	var oldExpectedProbes uint64
 	var scanExpectedProbes uint64
 	for _, op := range expr.Args {
 		leaves := mustExtractAndLeaves(t, op)
-		preds, ok := db.buildPredicatesWithMode(leaves, false)
+		preds, ok := db.engine.buildPredicatesWithMode(leaves, false)
 		if !ok {
 			t.Fatalf("buildPredicatesWithMode failed for %v", op)
 		}
-		leadIdx, leadEst, _ := db.pickCountORLeadPredicate(preds, uc)
+		leadIdx, leadEst, _ := db.engine.pickCountORLeadPredicate(preds, uc)
 		if leadIdx < 0 {
 			releasePredicates(preds)
 			t.Fatalf("expected OR lead for branch %v", op)
@@ -1188,13 +1188,13 @@ func TestCount_ByPredicates_SinglePostingLead_MatchesBitmap(t *testing.T) {
 		qx.HASANY("tags", []string{"go", "db"}),
 	)
 	leaves := mustExtractAndLeaves(t, expr)
-	preds, ok := db.buildPredicatesWithMode(leaves, false)
+	preds, ok := db.engine.buildPredicatesWithMode(leaves, false)
 	if !ok {
 		t.Fatalf("buildPredicatesWithMode failed")
 	}
 	defer releasePredicates(preds)
 
-	universe := db.snapshotUniverseCardinality()
+	universe := db.engine.currentQueryViewForTests().snapshotUniverseCardinality()
 	leadIdx := -1
 	leadScore := 0.0
 	leadEst := uint64(0)
@@ -1222,7 +1222,7 @@ func TestCount_ByPredicates_SinglePostingLead_MatchesBitmap(t *testing.T) {
 	if preds[leadIdx].expr.Op != qir.OpEQ {
 		t.Fatalf("expected EQ lead, got %v", preds[leadIdx].expr.Op)
 	}
-	if err := db.prepareCountPredicate(&preds[leadIdx], leadEst, universe); err != nil {
+	if err := db.engine.currentQueryViewForTests().prepareCountPredicate(&preds[leadIdx], leadEst, universe); err != nil {
 		t.Fatalf("prepareCountPredicate(lead): %v", err)
 	}
 
@@ -1245,13 +1245,13 @@ func TestCount_ByPredicates_SinglePostingLead_MatchesBitmap(t *testing.T) {
 		active = append(active, i)
 	}
 	for _, pi := range active {
-		if err := db.prepareCountPredicate(&preds[pi], leadEst, universe); err != nil {
+		if err := db.engine.currentQueryViewForTests().prepareCountPredicate(&preds[pi], leadEst, universe); err != nil {
 			t.Fatalf("prepareCountPredicate(residual): %v", err)
 		}
 	}
 	sortActivePredicates(active, preds)
 
-	got, examined, ok := db.tryCountByPredicatesLeadPostings(preds, leadIdx, active)
+	got, examined, ok := db.engine.tryCountByPredicatesLeadPostings(preds, leadIdx, active)
 	if !ok {
 		t.Fatalf("expected single-posting lead count fast path")
 	}
@@ -1806,33 +1806,33 @@ func TestCount_BuildPredicates_DeferBroadRangeMaterialization(t *testing.T) {
 		qx.NOTIN("active", []bool{false}),
 	)
 	leaves := mustExtractAndLeaves(t, expr)
-	rangeKey, isSlice, isNil, err := db.exprValueToIdxScalar(qx.GTE("age", 1_000))
+	rangeKey, isSlice, isNil, err := db.engine.exprValueToIdxScalar(qx.GTE("age", 1_000))
 	if err != nil || isSlice || isNil {
 		t.Fatalf("exprValueToIdxScalar failed: err=%v isSlice=%v isNil=%v", err, isSlice, isNil)
 	}
-	cacheKey := db.materializedPredCacheKeyForScalar("age", qx.OpGTE, rangeKey)
+	cacheKey := db.engine.currentQueryViewForTests().materializedPredCacheKeyForScalar("age", compileScalarOpForTest(qx.OpGTE), rangeKey)
 	if cacheKey == "" {
 		t.Fatalf("expected non-empty materialized cache key for numeric range")
 	}
-	if _, ok := db.getSnapshot().loadMaterializedPred(cacheKey); ok {
+	if _, ok := db.engine.getSnapshot().loadMaterializedPred(cacheKey); ok {
 		t.Fatalf("expected empty materialized cache before building predicates")
 	}
 
-	predsCount, ok := db.buildCountPredicatesWithMode(leaves, false)
+	predsCount, ok := db.engine.buildCountPredicatesWithMode(leaves, false)
 	if !ok {
 		t.Fatalf("buildCountPredicatesWithMode failed")
 	}
 	releasePredicates(predsCount)
-	if _, ok := db.getSnapshot().loadMaterializedPred(cacheKey); ok {
+	if _, ok := db.engine.getSnapshot().loadMaterializedPred(cacheKey); ok {
 		t.Fatalf("count-path predicate build should not eagerly populate numeric range cache")
 	}
 
-	predsDefault, ok := db.buildPredicates(leaves)
+	predsDefault, ok := db.engine.buildPredicates(leaves)
 	if !ok {
 		t.Fatalf("buildPredicates failed")
 	}
 	releasePredicates(predsDefault)
-	cached, ok := db.getSnapshot().loadMaterializedPred(cacheKey)
+	cached, ok := db.engine.getSnapshot().loadMaterializedPred(cacheKey)
 	if !ok || cached.IsEmpty() {
 		t.Fatalf("expected default predicate build to populate numeric range cache")
 	}
@@ -1863,7 +1863,7 @@ func TestCount_BuildPredicates_MergesPositiveNumericRangesSameField(t *testing.T
 		qx.NOTIN("active", []bool{false}),
 	)
 	leaves := mustExtractAndLeaves(t, expr)
-	preds, ok := db.buildCountPredicatesWithMode(leaves, false)
+	preds, ok := db.engine.buildCountPredicatesWithMode(leaves, false)
 	if !ok {
 		t.Fatalf("buildCountPredicatesWithMode failed")
 	}
@@ -1888,7 +1888,7 @@ func TestCount_PreparePredicate_UsesBroadRangeComplementWithoutCache(t *testing.
 			AnalyzeInterval:                         -1,
 			SnapshotMaterializedPredCacheMaxEntries: -1,
 		})
-		p, ok := db.buildPredicateWithMode(expr, false)
+		p, ok := db.engine.buildPredicateWithMode(expr, false)
 		if !ok {
 			t.Fatalf("buildPredicateWithMode failed")
 		}
@@ -1896,11 +1896,11 @@ func TestCount_PreparePredicate_UsesBroadRangeComplementWithoutCache(t *testing.
 		if p.kind != predicateKindCustom {
 			t.Fatalf("expected initial custom predicate, got kind=%v", p.kind)
 		}
-		universe := db.snapshotUniverseCardinality()
+		universe := db.engine.currentQueryViewForTests().snapshotUniverseCardinality()
 		if universe < 70_000 {
 			t.Fatalf("unexpected small universe=%d", universe)
 		}
-		if err := db.prepareCountPredicate(&p, universe/2, universe); err != nil {
+		if err := db.engine.currentQueryViewForTests().prepareCountPredicate(&p, universe/2, universe); err != nil {
 			t.Fatalf("prepareCountPredicate: %v", err)
 		}
 		if p.kind != predicateKindCustom {
@@ -1955,7 +1955,7 @@ func TestCount_PreparePredicate_UsesTinyPostingBroadRangeComplement(t *testing.T
 		t.Fatalf("RebuildIndex: %v", err)
 	}
 
-	universe := db.snapshotUniverseCardinality()
+	universe := db.engine.currentQueryViewForTests().snapshotUniverseCardinality()
 	if universe < 100_000 {
 		t.Fatalf("unexpected small universe=%d", universe)
 	}
@@ -1974,13 +1974,13 @@ func TestCount_PreparePredicate_UsesTinyPostingBroadRangeComplement(t *testing.T
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			p, ok := db.buildPredicateWithMode(tc.expr, false)
+			p, ok := db.engine.buildPredicateWithMode(tc.expr, false)
 			if !ok {
 				t.Fatalf("buildPredicateWithMode failed")
 			}
 			defer releasePredicates([]predicate{p})
 
-			if err := db.prepareCountPredicate(&p, 8_000, universe); err != nil {
+			if err := db.engine.currentQueryViewForTests().prepareCountPredicate(&p, 8_000, universe); err != nil {
 				t.Fatalf("prepareCountPredicate: %v", err)
 			}
 			if p.kind != predicateKindCustom {
@@ -2024,13 +2024,13 @@ func TestCount_PreparePredicate_UsesProbeBoundedBroadRangeComplement(t *testing.
 			db := makeDB(t, tc.withCache)
 			buildPrepared := func() predicate {
 				t.Helper()
-				p, ok := db.buildPredicateWithMode(expr, false)
+				p, ok := db.engine.buildPredicateWithMode(expr, false)
 				if !ok {
 					t.Fatalf("buildPredicateWithMode failed")
 				}
-				universe := db.snapshotUniverseCardinality()
+				universe := db.engine.currentQueryViewForTests().snapshotUniverseCardinality()
 				leadProbeEst := uint64(40_000)
-				if err := db.prepareCountPredicate(&p, leadProbeEst, universe); err != nil {
+				if err := db.engine.currentQueryViewForTests().prepareCountPredicate(&p, leadProbeEst, universe); err != nil {
 					releasePredicates([]predicate{p})
 					t.Fatalf("prepareCountPredicate: %v", err)
 				}
@@ -2059,12 +2059,12 @@ func TestCount_PreparePredicate_UsesProbeBoundedBroadRangeComplement(t *testing.
 				if got := p2.ids.Cardinality(); got <= countPredBroadRangeComplementMaxCard {
 					t.Fatalf("expected complement wider than base cap, got=%d", got)
 				}
-				key, isSlice, isNil, err := db.exprValueToIdxScalar(expr)
+				key, isSlice, isNil, err := db.engine.exprValueToIdxScalar(expr)
 				if err != nil || isSlice || isNil {
 					t.Fatalf("exprValueToIdxScalar: err=%v isSlice=%v isNil=%v", err, isSlice, isNil)
 				}
-				cacheKey := db.materializedPredComplementCacheKeyForScalar("age", qx.OpGTE, key)
-				cached, ok := db.getSnapshot().loadMaterializedPred(cacheKey)
+				cacheKey := db.engine.currentQueryViewForTests().materializedPredComplementCacheKeyForScalar("age", compileScalarOpForTest(qx.OpGTE), key)
+				cached, ok := db.engine.getSnapshot().loadMaterializedPred(cacheKey)
 				if !ok || cached.IsEmpty() {
 					t.Fatalf("expected complement postingResult to be cached after promotion")
 				}
@@ -2141,12 +2141,12 @@ func seedBroadRangeComplementOptData(t *testing.T, db *DB[uint64, Rec], lowCount
 func prepareBroadRangeComplementPredicate(t *testing.T, db *DB[uint64, Rec], expr qx.Expr, leadProbeEst uint64) (predicate, string) {
 	t.Helper()
 
-	universe := db.snapshotUniverseCardinality()
-	p, ok := db.buildPredicateWithMode(expr, false)
+	universe := db.engine.currentQueryViewForTests().snapshotUniverseCardinality()
+	p, ok := db.engine.buildPredicateWithMode(expr, false)
 	if !ok {
 		t.Fatalf("buildPredicateWithMode failed")
 	}
-	if err := db.prepareCountPredicate(&p, leadProbeEst, universe); err != nil {
+	if err := db.engine.currentQueryViewForTests().prepareCountPredicate(&p, leadProbeEst, universe); err != nil {
 		releasePredicates([]predicate{p})
 		t.Fatalf("prepareCountPredicate: %v", err)
 	}
@@ -2156,7 +2156,7 @@ func prepareBroadRangeComplementPredicate(t *testing.T, db *DB[uint64, Rec], exp
 	}
 
 	compiledExpr := mustCountQIRExprForDB(t, db, expr)
-	view := db.currentQueryViewForTests()
+	view := db.engine.currentQueryViewForTests()
 	key, isSlice, isNil, err := view.exprValueToIdxScalar(compiledExpr)
 	if err != nil || isSlice || isNil {
 		releasePredicates([]predicate{p})
@@ -2173,12 +2173,12 @@ func prepareBroadRangeComplementPredicate(t *testing.T, db *DB[uint64, Rec], exp
 func preparePromotedBroadRangeComplementPredicate(t *testing.T, db *DB[uint64, Rec], expr qx.Expr, leadProbeEst uint64) (predicate, string) {
 	t.Helper()
 
-	first, ok := db.buildPredicateWithMode(expr, false)
+	first, ok := db.engine.buildPredicateWithMode(expr, false)
 	if !ok {
 		t.Fatalf("buildPredicateWithMode failed")
 	}
-	universe := db.snapshotUniverseCardinality()
-	if err := db.prepareCountPredicate(&first, leadProbeEst, universe); err != nil {
+	universe := db.engine.currentQueryViewForTests().snapshotUniverseCardinality()
+	if err := db.engine.currentQueryViewForTests().prepareCountPredicate(&first, leadProbeEst, universe); err != nil {
 		releasePredicates([]predicate{first})
 		t.Fatalf("prepareCountPredicate(first sight): %v", err)
 	}
@@ -2207,7 +2207,7 @@ func TestCount_PreparePredicate_BroadRangeComplementCacheInvalidatedByNilFieldWr
 		db := countOpenBroadRangeComplementOptDB(t, "count_prepare_predicate_broad_range_opt_no_nil.db", false)
 
 		p, cacheKey := prepareBroadRangeComplementPredicate(t, db, expr, 3_000)
-		prevSnap := db.getSnapshot()
+		prevSnap := db.engine.getSnapshot()
 		prevCached, ok := prevSnap.loadMaterializedPred(cacheKey)
 		if !ok || prevCached.IsEmpty() {
 			releasePredicates([]predicate{p})
@@ -2235,13 +2235,13 @@ func TestCount_PreparePredicate_BroadRangeComplementCacheInvalidatedByNilFieldWr
 			t.Fatalf("Set(nil insert): %v", err)
 		}
 
-		if _, ok := db.getSnapshot().loadMaterializedPred(cacheKey); ok {
+		if _, ok := db.engine.getSnapshot().loadMaterializedPred(cacheKey); ok {
 			t.Fatalf("expected nil-only insert to invalidate inherited complement cache")
 		}
 
 		p, _ = prepareBroadRangeComplementPredicate(t, db, expr, 3_000)
 		defer releasePredicates([]predicate{p})
-		nextCached, ok := db.getSnapshot().loadMaterializedPred(cacheKey)
+		nextCached, ok := db.engine.getSnapshot().loadMaterializedPred(cacheKey)
 		if !ok || nextCached.IsEmpty() {
 			t.Fatalf("expected complement cache to be rebuilt after nil insert")
 		}
@@ -2259,7 +2259,7 @@ func TestCount_PreparePredicate_BroadRangeComplementCacheInvalidatedByNilFieldWr
 		db := countOpenBroadRangeComplementOptDB(t, "count_prepare_predicate_broad_range_opt_delete.db", true)
 
 		p, cacheKey := prepareBroadRangeComplementPredicate(t, db, expr, 3_000)
-		prevSnap := db.getSnapshot()
+		prevSnap := db.engine.getSnapshot()
 		prevCached, ok := prevSnap.loadMaterializedPred(cacheKey)
 		if !ok || prevCached.IsEmpty() {
 			releasePredicates([]predicate{p})
@@ -2278,13 +2278,13 @@ func TestCount_PreparePredicate_BroadRangeComplementCacheInvalidatedByNilFieldWr
 			t.Fatalf("Delete(nil row): %v", err)
 		}
 
-		if _, ok := db.getSnapshot().loadMaterializedPred(cacheKey); ok {
+		if _, ok := db.engine.getSnapshot().loadMaterializedPred(cacheKey); ok {
 			t.Fatalf("expected nil-only delete to invalidate inherited complement cache")
 		}
 
 		p, _ = prepareBroadRangeComplementPredicate(t, db, expr, 3_000)
 		defer releasePredicates([]predicate{p})
-		nextCached, ok := db.getSnapshot().loadMaterializedPred(cacheKey)
+		nextCached, ok := db.engine.getSnapshot().loadMaterializedPred(cacheKey)
 		if !ok || nextCached.IsEmpty() {
 			t.Fatalf("expected complement cache to be rebuilt after nil delete")
 		}
@@ -2334,7 +2334,7 @@ func TestCount_PreparePredicate_BroadRangeComplementMatchesChunkedRangeAfterChur
 		}
 	}
 
-	if db.fieldOverlay("age").chunked == nil {
+	if db.engine.currentQueryViewForTests().fieldOverlay("age").chunked == nil {
 		t.Fatalf("expected age field to use chunked storage")
 	}
 
@@ -2368,7 +2368,7 @@ func TestCount_PreparePredicate_KeepsLegacyCapForComparableBroadLead(t *testing.
 	db := countOpenPreparePredicateBroadRangeDB(t, Options{AnalyzeInterval: -1})
 
 	expr := qx.GTE("age", 35_000)
-	p, ok := db.buildPredicateWithMode(expr, false)
+	p, ok := db.engine.buildPredicateWithMode(expr, false)
 	if !ok {
 		t.Fatalf("buildPredicateWithMode failed")
 	}
@@ -2377,9 +2377,9 @@ func TestCount_PreparePredicate_KeepsLegacyCapForComparableBroadLead(t *testing.
 		t.Fatalf("expected initial custom predicate, got kind=%v", p.kind)
 	}
 
-	universe := db.snapshotUniverseCardinality()
+	universe := db.engine.currentQueryViewForTests().snapshotUniverseCardinality()
 	leadProbeEst := uint64(80_000)
-	if err := db.prepareCountPredicate(&p, leadProbeEst, universe); err != nil {
+	if err := db.engine.currentQueryViewForTests().prepareCountPredicate(&p, leadProbeEst, universe); err != nil {
 		t.Fatalf("prepareCountPredicate: %v", err)
 	}
 	if p.kind != predicateKindCustom {
@@ -2474,7 +2474,7 @@ func TestCount_PreparePredicate_UsesExactNumericEstimateForSkewedBroadRange(t *t
 	setNumericBucketKnobs(t, db, 128, 1, 1)
 
 	expr := qx.GTE("age", rangeFrom)
-	p, ok := db.buildPredicateWithMode(expr, false)
+	p, ok := db.engine.buildPredicateWithMode(expr, false)
 	if !ok {
 		t.Fatalf("buildPredicateWithMode failed")
 	}
@@ -2487,11 +2487,11 @@ func TestCount_PreparePredicate_UsesExactNumericEstimateForSkewedBroadRange(t *t
 		t.Fatalf("expected exact numeric range estimate, got=%d want=%d", p.estCard, wantIn)
 	}
 
-	universe := db.snapshotUniverseCardinality()
+	universe := db.engine.currentQueryViewForTests().snapshotUniverseCardinality()
 	if universe != wantIn+wantOut {
 		t.Fatalf("unexpected universe: got=%d want=%d", universe, wantIn+wantOut)
 	}
-	if err := db.prepareCountPredicate(&p, 3_000, universe); err != nil {
+	if err := db.engine.currentQueryViewForTests().prepareCountPredicate(&p, 3_000, universe); err != nil {
 		t.Fatalf("prepareCountPredicate: %v", err)
 	}
 	if p.kind != predicateKindCustom {
@@ -2568,7 +2568,7 @@ func TestCount_PreparePredicate_UsesBroadRangeComplementOnFullSnapshot(t *testin
 	setNumericBucketKnobs(t, db, 128, 1, 1)
 
 	expr := qx.GTE("age", rangeFrom)
-	p, ok := db.buildPredicateWithMode(expr, false)
+	p, ok := db.engine.buildPredicateWithMode(expr, false)
 	if !ok {
 		t.Fatalf("buildPredicateWithMode failed")
 	}
@@ -2581,11 +2581,11 @@ func TestCount_PreparePredicate_UsesBroadRangeComplementOnFullSnapshot(t *testin
 		t.Fatalf("expected exact overlay range estimate, got=%d want=%d", p.estCard, wantIn)
 	}
 
-	universe := db.snapshotUniverseCardinality()
+	universe := db.engine.currentQueryViewForTests().snapshotUniverseCardinality()
 	if universe != wantIn+wantOut {
 		t.Fatalf("unexpected universe: got=%d want=%d", universe, wantIn+wantOut)
 	}
-	if err := db.prepareCountPredicate(&p, 3_000, universe); err != nil {
+	if err := db.engine.currentQueryViewForTests().prepareCountPredicate(&p, 3_000, universe); err != nil {
 		t.Fatalf("prepareCountPredicate: %v", err)
 	}
 	if p.kind != predicateKindCustom {
@@ -2643,7 +2643,7 @@ func TestCount_PickLeadPredicate_PrefersLeadThatUnlocksCustomResidualMaterializa
 		qx.CONTAINS("name", "needle"),
 	)
 	leaves := mustExtractAndLeaves(t, expr)
-	preds, ok := db.buildPredicatesWithMode(leaves, false)
+	preds, ok := db.engine.buildPredicatesWithMode(leaves, false)
 	if !ok {
 		t.Fatalf("buildPredicatesWithMode failed")
 	}
@@ -2683,14 +2683,14 @@ func TestCount_PickLeadPredicate_PrefersLeadThatUnlocksCustomResidualMaterializa
 		t.Fatalf("expected baseline score to prefer active EQ lead, got idx=%d field=%s op=%v", oldLeadIdx, db.engine.fieldNameByOrdinal(preds[oldLeadIdx].expr.FieldOrdinal), preds[oldLeadIdx].expr.Op)
 	}
 
-	universe := db.snapshotUniverseCardinality()
+	universe := db.engine.currentQueryViewForTests().snapshotUniverseCardinality()
 	if universe == 0 {
 		t.Fatalf("expected non-empty universe")
 	}
 
 	containsWithOldLead := preds[containsIdx]
 	defer releasePredicates([]predicate{containsWithOldLead})
-	if err := db.prepareCountPredicate(&containsWithOldLead, oldLeadEst, universe); err != nil {
+	if err := db.engine.currentQueryViewForTests().prepareCountPredicate(&containsWithOldLead, oldLeadEst, universe); err != nil {
 		t.Fatalf("prepareCountPredicate(old lead): %v", err)
 	}
 	if containsWithOldLead.kind != predicateKindCustom {
@@ -2699,14 +2699,14 @@ func TestCount_PickLeadPredicate_PrefersLeadThatUnlocksCustomResidualMaterializa
 
 	containsWithCountryLead := preds[containsIdx]
 	defer releasePredicates([]predicate{containsWithCountryLead})
-	if err := db.prepareCountPredicate(&containsWithCountryLead, preds[countryIdx].estCard, universe); err != nil {
+	if err := db.engine.currentQueryViewForTests().prepareCountPredicate(&containsWithCountryLead, preds[countryIdx].estCard, universe); err != nil {
 		t.Fatalf("prepareCountPredicate(country lead): %v", err)
 	}
 	if containsWithCountryLead.kind != predicateKindMaterialized {
 		t.Fatalf("expected broader IN lead probe to materialize CONTAINS residual, got kind=%v", containsWithCountryLead.kind)
 	}
 
-	leadIdx, leadEst, _ := db.pickCountLeadPredicate(preds, universe)
+	leadIdx, leadEst, _ := db.engine.currentQueryViewForTests().pickCountLeadPredicate(predicateSliceView(preds), universe)
 	if leadIdx != countryIdx {
 		t.Fatalf("expected residual-aware lead pick to prefer country IN, got idx=%d field=%s op=%v", leadIdx, db.engine.fieldNameByOrdinal(preds[leadIdx].expr.FieldOrdinal), preds[leadIdx].expr.Op)
 	}
@@ -2714,7 +2714,7 @@ func TestCount_PickLeadPredicate_PrefersLeadThatUnlocksCustomResidualMaterializa
 		t.Fatalf("unexpected chosen lead est: got=%d want=%d", leadEst, preds[countryIdx].estCard)
 	}
 
-	got, ok, err := db.tryCountByPredicates(expr, nil)
+	got, ok, err := db.engine.tryCountByPredicates(expr, nil)
 	if err != nil {
 		t.Fatalf("tryCountByPredicates: %v", err)
 	}
@@ -2760,7 +2760,7 @@ func TestCount_BroadMaterializedLeadCheapResiduals_UsesPredicateScan(t *testing.
 		t.Fatalf("count mismatch: got=%d want=%d", got, want)
 	}
 
-	gotFast, ok, err := db.tryCountByPredicates(expr, nil)
+	gotFast, ok, err := db.engine.tryCountByPredicates(expr, nil)
 	if err != nil {
 		t.Fatalf("tryCountByPredicates: %v", err)
 	}
@@ -2797,8 +2797,8 @@ func TestCount_LeadPostingsSingleResidualBucketCount_AllocsPerRunStayZeroAfterWa
 	compiledExpr := mustCountQIRExprForDB(t, db, q.Filter)
 
 	run := func() {
-		qv := db.makeQueryView(db.getSnapshot())
-		defer db.releaseQueryView(qv)
+		qv := db.engine.makeQueryView(db.engine.getSnapshot())
+		defer db.engine.releaseQueryView(qv)
 		var leavesBuf [countPredicateScanMaxLeaves]qir.Expr
 		leaves, ok := collectAndLeavesModeScratch(compiledExpr, leavesBuf[:0], andLeafModeCollect)
 		if !ok {
@@ -3044,7 +3044,7 @@ func TestCount_PickORLeadPredicate_PrefersPrefixLeadOverCheapEqLead(t *testing.T
 		qx.GTE("score", 60.0),
 	)
 	leaves := mustExtractAndLeaves(t, expr)
-	preds, ok := db.buildPredicatesWithMode(leaves, false)
+	preds, ok := db.engine.buildPredicatesWithMode(leaves, false)
 	if !ok {
 		t.Fatalf("buildPredicatesWithMode failed")
 	}
@@ -3078,8 +3078,8 @@ func TestCount_PickORLeadPredicate_PrefersPrefixLeadOverCheapEqLead(t *testing.T
 		t.Fatalf("expected old OR lead score to prefer active EQ lead, got idx=%d field=%s op=%v", oldLeadIdx, db.engine.fieldNameByOrdinal(preds[oldLeadIdx].expr.FieldOrdinal), preds[oldLeadIdx].expr.Op)
 	}
 
-	universe := db.snapshotUniverseCardinality()
-	leadIdx, leadEst, _ := db.pickCountORLeadPredicate(preds, universe)
+	universe := db.engine.currentQueryViewForTests().snapshotUniverseCardinality()
+	leadIdx, leadEst, _ := db.engine.pickCountORLeadPredicate(preds, universe)
 	if leadIdx != prefixIdx {
 		t.Fatalf("expected OR-specific lead score to prefer prefix lead, got idx=%d field=%s op=%v", leadIdx, db.engine.fieldNameByOrdinal(preds[leadIdx].expr.FieldOrdinal), preds[leadIdx].expr.Op)
 	}

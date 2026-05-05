@@ -50,11 +50,11 @@ func (db *DB[K, V]) Count(exprs ...qx.Expr) (uint64, error) {
 	defer prepared.Release()
 	viewQ := qir.NewShape(prepared)
 
-	snap, seq, ref, pinned := db.pinCurrentSnapshot()
-	defer db.unpinCurrentSnapshot(seq, ref, pinned)
+	snap, seq, ref, pinned := db.engine.pinCurrentSnapshot()
+	defer db.engine.unpinCurrentSnapshot(seq, ref, pinned)
 
-	view := db.makeQueryView(snap)
-	defer db.releaseQueryView(view)
+	view := db.engine.makeQueryView(snap)
+	defer db.engine.releaseQueryView(view)
 	return view.countInternal(&viewQ, true)
 }
 

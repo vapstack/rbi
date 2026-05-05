@@ -1558,7 +1558,10 @@ func (db *DB[K, V]) executeAutoBatchAttempt(active *pooled.Slice[*autoBatchReque
 	}
 
 	err = db.publishAfterCommitLocked(seq, opName, func() {
-		db.finishSnapshotPublishNoLock(snap)
+		db.engine.finishSnapshotPublishNoLock(snap)
+		if db.strMap != nil {
+			db.strMap.markCommittedPublished(snap.strmap)
+		}
 	})
 	if err != nil {
 		db.mu.Unlock()

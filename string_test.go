@@ -60,7 +60,7 @@ func TestStringExt_ReopenReinsertDeletedKeysPreserveOriginalInternalOrder(t *tes
 		}
 	}
 
-	initial := db.getSnapshot()
+	initial := db.engine.getSnapshot()
 	wantIdx := make(map[string]uint64, len(order))
 	for _, key := range order {
 		idx, ok := initial.strmap.getIdxNoLock(key)
@@ -97,7 +97,7 @@ func TestStringExt_ReopenReinsertDeletedKeysPreserveOriginalInternalOrder(t *tes
 		t.Fatalf("live order before reopen mismatch: got=%v want=%v", gotLive, liveOrder)
 	}
 
-	afterDelete := db.getSnapshot()
+	afterDelete := db.engine.getSnapshot()
 	for key := range deleted {
 		idx, ok := afterDelete.strmap.getIdxNoLock(key)
 		if !ok || idx != wantIdx[key] {
@@ -109,7 +109,7 @@ func TestStringExt_ReopenReinsertDeletedKeysPreserveOriginalInternalOrder(t *tes
 
 	db, raw = openBoltAndNew[string, Rec](t, path)
 
-	reopened := db.getSnapshot()
+	reopened := db.engine.getSnapshot()
 	for _, key := range order {
 		idx, ok := reopened.strmap.getIdxNoLock(key)
 		if !ok || idx != wantIdx[key] {
@@ -205,7 +205,7 @@ func TestStringExt_SharedAutoBatchUniqueRejectHolePersistsAcrossReopen(t *testin
 	assertHole := func(label string) {
 		t.Helper()
 
-		snap := db.getSnapshot()
+		snap := db.engine.getSnapshot()
 		if snap == nil || snap.strmap == nil {
 			t.Fatalf("%s: expected published strmap snapshot", label)
 		}
@@ -363,7 +363,7 @@ func TestStringExt_ConcurrentLazySnapshotKeyLookup(t *testing.T) {
 		}
 	}
 
-	snap := db.getSnapshot()
+	snap := db.engine.getSnapshot()
 	if snap == nil || snap.strmap == nil {
 		t.Fatalf("expected published string snapshot")
 	}
@@ -418,7 +418,7 @@ func TestStringExt_PublishedReadPagesPreserveQueryAndScanOrder(t *testing.T) {
 		}
 	}
 
-	snap := db.getSnapshot()
+	snap := db.engine.getSnapshot()
 	if snap == nil || snap.strmap == nil {
 		t.Fatalf("expected published string snapshot")
 	}
@@ -512,8 +512,8 @@ func TestStringExt_BeginQueryTxSnapshotScanAndQueryStayConsistentDuringDeleteRei
 				scanned, scanErr := stringTestScanSnapshotKeys(db, snap, "")
 				var queried []string
 				if scanErr == nil {
-					view := db.makeQueryView(snap)
-					prepared, viewQ, prepErr := prepareTestQuery(db, qx.Query())
+					view := db.engine.makeQueryView(snap)
+					prepared, viewQ, prepErr := prepareTestQuery(db.engine, qx.Query())
 					if prepErr != nil {
 						scanErr = prepErr
 					} else {
@@ -525,7 +525,7 @@ func TestStringExt_BeginQueryTxSnapshotScanAndQueryStayConsistentDuringDeleteRei
 						}
 						prepared.Release()
 					}
-					db.releaseQueryView(view)
+					db.engine.releaseQueryView(view)
 				}
 				if scanErr == nil && !slices.Equal(scanned, queried) {
 					scanErr = fmt.Errorf("scan/query mismatch: scanned=%v queried=%v", scanned, queried)

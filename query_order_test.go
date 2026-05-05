@@ -81,7 +81,7 @@ func TestLenIndex_ZeroComplement_BaseQueryAndOrder(t *testing.T) {
 	if !db.isLenZeroComplementField("tags") {
 		t.Fatalf("expected zero-complement mode for tags")
 	}
-	lenSlice := db.snapshotLenFieldIndexSlice("tags")
+	lenSlice := db.engine.currentQueryViewForTests().snapshotLenFieldIndexSlice("tags")
 	if !hasLenIndexKey(lenSlice, lenIndexNonEmptyKey) {
 		t.Fatalf("expected non-empty marker key in len index")
 	}
@@ -508,9 +508,9 @@ func TestQuery_BroadBasicOrder_NoLimit_MatchesExpected(t *testing.T) {
 		).Sort("score", qx.DESC),
 	}
 
-	qv := db.currentQueryViewForTests()
+	qv := db.engine.currentQueryViewForTests()
 	for _, q := range queries {
-		result, err := db.evalExpr(q.Filter)
+		result, err := db.engine.evalExpr(q.Filter)
 		if err != nil {
 			t.Fatalf("evalExpr(%+v): %v", q, err)
 		}
@@ -519,12 +519,12 @@ func TestQuery_BroadBasicOrder_NoLimit_MatchesExpected(t *testing.T) {
 			t.Fatalf("expected broad ordered result to exercise bucket materialization route, got %d rows for %+v", qv.postingResultCardinality(result), q)
 		}
 
-		prepared, viewQ, err := prepareTestQuery(db, q)
+		prepared, viewQ, err := prepareTestQuery(db.engine, q)
 		if err != nil {
 			result.release()
 			t.Fatalf("prepareTestQuery(%+v): %v", q, err)
 		}
-		got, err := qv.queryOrderBasic(result, qv.fieldOverlay(testOrderFieldName(db, viewQ.Order)), viewQ.Order, 0, 0, true)
+		got, err := qv.queryOrderBasic(result, qv.fieldOverlay(testOrderFieldName(db.engine, viewQ.Order)), viewQ.Order, 0, 0, true)
 		prepared.Release()
 		result.release()
 		if err != nil {

@@ -1783,7 +1783,7 @@ func (db *DB[K, V]) storeIndexV26(writer *bufio.Writer, bucketSeq uint64) error 
 }
 
 func (db *DB[K, V]) storeIndexPayload(writer *bufio.Writer) error {
-	snap := db.getSnapshot()
+	snap := db.engine.getSnapshot()
 	universe := snap.universe.Borrow()
 
 	if err := universe.WriteTo(writer); err != nil {

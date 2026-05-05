@@ -10,27 +10,141 @@ import (
 )
 
 type queryEngine struct {
-	snapshot                      *snapshotManager
-	fields                        map[string]*field
-	measureFields                 map[string]*field
-	indexedFieldAccess            []indexedFieldAccessor
-	indexedStringValidationAccess []indexedFieldAccessor
-	indexedFieldMap               indexedFieldMap
-	uniqueFieldAccessors          []indexedFieldAccessor
-	measureFieldAccess            []measureFieldAccessor
-	measureFieldMap               measureFieldMap
-	index                         *pooled.Slice[fieldIndexStorage]
-	nilIndex                      *pooled.Slice[fieldIndexStorage]
-	lenIndex                      *pooled.Slice[fieldIndexStorage]
-	lenZeroComplement             *pooled.Slice[bool]
-	measure                       *pooled.Slice[measureFieldStorage]
-	universe                      posting.List
-	hasUnique                     bool
-	lenIndexLoaded                bool
+	snapshot                       *snapshotManager
+	fields                         map[string]*field
+	measureFields                  map[string]*field
+	indexedFieldAccess             []indexedFieldAccessor
+	indexedStringValidationAccess  []indexedFieldAccessor
+	indexedFieldMap                indexedFieldMap
+	uniqueFieldAccessors           []indexedFieldAccessor
+	measureFieldAccess             []measureFieldAccessor
+	measureFieldMap                measureFieldMap
+	index                          *pooled.Slice[fieldIndexStorage]
+	nilIndex                       *pooled.Slice[fieldIndexStorage]
+	lenIndex                       *pooled.Slice[fieldIndexStorage]
+	lenZeroComplement              *pooled.Slice[bool]
+	measure                        *pooled.Slice[measureFieldStorage]
+	universe                       posting.List
+	hasUnique                      bool
+	lenIndexLoaded                 bool
+	matPredCacheMaxEntries         int
+	matPredCacheMaxCard            uint64
+	numericRangeBucketSize         int
+	numericRangeBucketMinFieldKeys int
+	numericRangeBucketMinSpanKeys  int
 
 	planner *planner
 
 	viewPool *pooled.Pointers[queryView]
+}
+
+func (qe *queryEngine) makeQueryView(snap *indexSnapshot) *queryView {
+	view := qe.viewPool.Get()
+	*view = queryView{
+		engine:            qe,
+		snap:              snap,
+		strKey:            snap.strmap != nil,
+		strMapView:        snap.strmap,
+		fields:            qe.fields,
+		planner:           qe.planner,
+		lenZeroComplement: snap.lenZeroComplement,
+	}
+	return view
+}
+
+func (qe *queryEngine) releaseQueryView(view *queryView) {
+	qe.viewPool.Put(view)
+}
+
+func (qe *queryEngine) initSnapshotRuntimeCaches(s *indexSnapshot) {
+	s.numericRangeBucketCache = numericRangeBucketCachePool.Get()
+	s.numericRangeBucketCache.init(len(qe.indexedFieldAccess))
+	s.matPredCacheMaxEntries = qe.matPredCacheMaxEntries
+	s.matPredCacheMaxCard = qe.matPredCacheMaxCard
+	if s.matPredCacheMaxEntries > 0 {
+		s.matPredCache = materializedPredCachePool.Get()
+		s.matPredCache.refs.Store(1)
+		s.matPredCache.init(s.matPredCacheMaxEntries)
+	}
+}
+
+func (qe *queryEngine) buildPublishedSnapshotNoLock(seq uint64, strmap *strMapSnapshot) *indexSnapshot {
+	snap := &indexSnapshot{
+		seq:                seq,
+		index:              qe.index,
+		nilIndex:           qe.nilIndex,
+		lenIndex:           qe.lenIndex,
+		lenZeroComplement:  qe.lenZeroComplement,
+		measure:            qe.measure,
+		indexedFieldByName: qe.indexedFieldMap,
+		universe:           qe.universe,
+		strmap:             strmap,
+	}
+	qe.initSnapshotRuntimeCaches(snap)
+	return snap
+}
+
+func (qe *queryEngine) publishSnapshotNoLock(seq uint64, strmap *strMapSnapshot) {
+	prev := qe.snapshot.current.Load()
+	snap := qe.buildPublishedSnapshotNoLock(seq, strmap)
+	if prev != nil {
+		snap.index = cloneFieldIndexStorageSlots(qe.index, len(qe.indexedFieldAccess))
+		snap.nilIndex = cloneFieldIndexStorageSlots(qe.nilIndex, len(qe.indexedFieldAccess))
+		snap.lenIndex = cloneFieldIndexStorageSlots(qe.lenIndex, len(qe.indexedFieldAccess))
+		snap.lenZeroComplement = cloneFieldIndexBoolSlots(qe.lenZeroComplement, len(qe.indexedFieldAccess))
+		snap.measure = cloneMeasureFieldStorageSlots(qe.measure, len(qe.measureFieldAccess))
+	}
+	snap.retainSharedOwnedStorageFrom(prev)
+	qe.finishSnapshotPublishNoLock(snap)
+}
+
+func (qe *queryEngine) finishSnapshotPublishNoLock(s *indexSnapshot) {
+	qe.index = s.index
+	qe.nilIndex = s.nilIndex
+	qe.lenIndex = s.lenIndex
+	qe.lenZeroComplement = s.lenZeroComplement
+	qe.measure = s.measure
+	qe.universe = s.universe
+	retired := qe.snapshot.publishRef(s)
+	releaseRetiredSnapshots(retired)
+}
+
+func (qe *queryEngine) getSnapshot() *indexSnapshot {
+	if s := qe.snapshot.current.Load(); s != nil {
+		return s
+	}
+	return qe.buildPublishedSnapshotNoLock(0, nil)
+}
+
+func (qe *queryEngine) pinCurrentSnapshot() (*indexSnapshot, uint64, *snapshotRef, bool) {
+	for {
+		qe.snapshot.mu.RLock()
+		ref := qe.snapshot.currentRef.Load()
+		if ref == nil {
+			qe.snapshot.mu.RUnlock()
+			return qe.buildPublishedSnapshotNoLock(0, nil), 0, nil, false
+		}
+		ref.refs.Add(1)
+		if qe.snapshot.currentRef.Load() != ref {
+			qe.snapshot.mu.RUnlock()
+			ref.refs.Add(-1)
+			continue
+		}
+		snap := ref.snap
+		qe.snapshot.mu.RUnlock()
+		if snap == nil {
+			ref.refs.Add(-1)
+			continue
+		}
+		return snap, snap.seq, ref, true
+	}
+}
+
+func (qe *queryEngine) unpinCurrentSnapshot(seq uint64, ref *snapshotRef, pinned bool) {
+	if !pinned {
+		return
+	}
+	qe.snapshot.unpinRef(seq, ref)
 }
 
 func (qe *queryEngine) fieldNameByOrdinal(ordinal int) string {

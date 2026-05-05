@@ -107,7 +107,7 @@ func (c queryContract[K]) AssertPreparedKeysMatchReference(q *qx.QX) []K {
 	c.t.Helper()
 
 	nq := normalizeQueryForTest(q)
-	if err := c.db.checkUsedQuery(nq); err != nil {
+	if err := c.db.engine.checkUsedQuery(nq); err != nil {
 		c.t.Fatalf("checkUsedQuery(%+v): %v", nq, err)
 	}
 
@@ -221,7 +221,7 @@ func (c queryContract[K]) assertPreparedCountMatchesReference(q *qx.QX, ref *que
 
 	nq := normalizeQueryForTest(q)
 	want := ref.count(c, q)
-	got, err := c.db.countPreparedExpr(nq.Filter)
+	got, err := c.db.engine.countPreparedExpr(nq.Filter)
 	if err != nil {
 		c.t.Fatalf("countPreparedExpr(%+v): %v", nq.Filter, err)
 	}
@@ -268,7 +268,7 @@ func (c queryContract[K]) assertAllReadPathsMatchReference(q *qx.QX) queryContra
 	c.assertCountMatchesReference(q, &ref)
 
 	nq := normalizeQueryForTest(q)
-	if err := c.db.checkUsedQuery(nq); err != nil {
+	if err := c.db.engine.checkUsedQuery(nq); err != nil {
 		c.t.Fatalf("checkUsedQuery(%+v): %v", nq, err)
 	}
 
@@ -301,17 +301,17 @@ func clearQueryOrderWindowForTest(q *qx.QX) {
 }
 
 func execPreparedQueryForTest[K ~uint64 | ~string](db *DB[K, Rec], q *qx.QX) ([]K, error) {
-	prepared, viewQ, err := prepareTestQuery(db, q)
+	prepared, viewQ, err := prepareTestQuery(db.engine, q)
 	if err != nil {
 		return nil, err
 	}
 	defer prepared.Release()
 
-	snap, seq, ref, pinned := db.pinCurrentSnapshot()
-	defer db.unpinCurrentSnapshot(seq, ref, pinned)
+	snap, seq, ref, pinned := db.engine.pinCurrentSnapshot()
+	defer db.engine.unpinCurrentSnapshot(seq, ref, pinned)
 
-	view := db.makeQueryView(snap)
-	defer db.releaseQueryView(view)
+	view := db.engine.makeQueryView(snap)
+	defer db.engine.releaseQueryView(view)
 
 	ids, err := view.execPreparedQuery(&viewQ)
 	if err != nil {

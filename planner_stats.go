@@ -43,8 +43,8 @@ func (db *DB[K, V]) refreshPlannerStatsWithBudget(softBudget time.Duration, useC
 	if err := db.unavailableErr(); err != nil {
 		return err
 	}
-	snap, seq, ref, pinned := db.pinCurrentSnapshot()
-	defer db.unpinCurrentSnapshot(seq, ref, pinned)
+	snap, seq, ref, pinned := db.engine.pinCurrentSnapshot()
+	defer db.engine.unpinCurrentSnapshot(seq, ref, pinned)
 
 	db.engine.refreshPlannerStatsWithBudgetOnSnapshot(snap, softBudget, useCursor)
 	return nil
@@ -336,8 +336,8 @@ func (db *DB[K, V]) plannerStatsSnapshotForPersistLocked(version uint64) *planne
 	if current == nil {
 		return db.buildPlannerStatsSnapshotLocked(version)
 	}
-	snap, seq, ref, pinned := db.pinCurrentSnapshot()
-	defer db.unpinCurrentSnapshot(seq, ref, pinned)
+	snap, seq, ref, pinned := db.engine.pinCurrentSnapshot()
+	defer db.engine.unpinCurrentSnapshot(seq, ref, pinned)
 
 	return &plannerStatsSnapshot{
 		Version:             version,
@@ -348,8 +348,8 @@ func (db *DB[K, V]) plannerStatsSnapshotForPersistLocked(version uint64) *planne
 }
 
 func (db *DB[K, V]) buildPlannerStatsSnapshotLocked(version uint64) *plannerStatsSnapshot {
-	snap, seq, ref, pinned := db.pinCurrentSnapshot()
-	defer db.unpinCurrentSnapshot(seq, ref, pinned)
+	snap, seq, ref, pinned := db.engine.pinCurrentSnapshot()
+	defer db.engine.unpinCurrentSnapshot(seq, ref, pinned)
 
 	return db.engine.buildPlannerStatsSnapshot(snap, version)
 }

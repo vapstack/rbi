@@ -413,14 +413,14 @@ func TestTraceContract_OrderedORMergeRouteDecision(t *testing.T) {
 	_ = seedData(t, db, 20_000)
 
 	q := plannerArgminOROrderMergeQuery()
-	preparedQ, viewQ, err := prepareTestQuery(db, q)
+	preparedQ, viewQ, err := prepareTestQuery(db.engine, q)
 	if err != nil {
 		t.Fatalf("prepareTestQuery: %v", err)
 	}
 	defer preparedQ.Release()
 
 	window, _ := orderWindowForTest(q)
-	branches, alwaysFalse, ok := db.buildORBranchesOrdered(q.Filter.Args, "score", window)
+	branches, alwaysFalse, ok := db.engine.buildORBranchesOrdered(q.Filter.Args, "score", window)
 	if !ok {
 		t.Fatalf("buildORBranchesOrdered: ok=false")
 	}
@@ -430,8 +430,8 @@ func TestTraceContract_OrderedORMergeRouteDecision(t *testing.T) {
 	}
 	defer branches.Release()
 
-	view := db.currentQueryViewForTests()
-	defer db.releaseQueryView(view)
+	view := db.engine.currentQueryViewForTests()
+	defer db.engine.releaseQueryView(view)
 
 	analysis, ok := view.buildOROrderAnalysis(&viewQ, branches)
 	if !ok {
@@ -522,7 +522,7 @@ func TestTraceContract_ExactFilterWorkCounters(t *testing.T) {
 				).Limit(25)
 
 				leaves := mustExtractAndLeaves(t, q.Filter)
-				fieldName, bounds, ok, err := db.extractNoOrderBounds(leaves)
+				fieldName, bounds, ok, err := db.engine.extractNoOrderBounds(leaves)
 				if err != nil {
 					t.Fatalf("extractNoOrderBounds: %v", err)
 				}
@@ -530,7 +530,7 @@ func TestTraceContract_ExactFilterWorkCounters(t *testing.T) {
 					t.Fatalf("expected no-order bounds to be recognized")
 				}
 
-				preparedQ, viewQ, err := prepareTestQuery(db, q)
+				preparedQ, viewQ, err := prepareTestQuery(db.engine, q)
 				if err != nil {
 					t.Fatalf("prepareTestQuery: %v", err)
 				}
@@ -541,7 +541,7 @@ func TestTraceContract_ExactFilterWorkCounters(t *testing.T) {
 					t.Fatalf("expected trace to be enabled")
 				}
 				tr.setPlan(PlanLimitRangeNoOrder)
-				got, used, err := db.tryLimitQueryRangeNoOrderByField(q, fieldName, bounds, leaves, tr)
+				got, used, err := db.engine.tryLimitQueryRangeNoOrderByField(q, fieldName, bounds, leaves, tr)
 				tr.finish(uint64(len(got)), err)
 				if err != nil {
 					t.Fatalf("tryLimitQueryRangeNoOrderByField: %v", err)
@@ -585,7 +585,7 @@ func TestTraceContract_ExactFilterWorkCounters(t *testing.T) {
 				).Sort("age", qx.ASC).Limit(20)
 
 				leaves := mustExtractAndLeaves(t, q.Filter)
-				preparedQ, viewQ, err := prepareTestQuery(db, q)
+				preparedQ, viewQ, err := prepareTestQuery(db.engine, q)
 				if err != nil {
 					t.Fatalf("prepareTestQuery: %v", err)
 				}
@@ -596,7 +596,7 @@ func TestTraceContract_ExactFilterWorkCounters(t *testing.T) {
 					t.Fatalf("expected trace to be enabled")
 				}
 				tr.setPlan(PlanLimitOrderBasic)
-				got, used, err := db.tryLimitQueryOrderBasic(q, leaves, tr)
+				got, used, err := db.engine.tryLimitQueryOrderBasic(q, leaves, tr)
 				tr.finish(uint64(len(got)), err)
 				if err != nil {
 					t.Fatalf("tryLimitQueryOrderBasic: %v", err)

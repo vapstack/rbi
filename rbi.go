@@ -408,10 +408,15 @@ func New[K ~uint64 | ~string, V any](bolt *bbolt.DB, options Options, execOpts .
 			db.strMap = newStrMapper(0, defaultSnapshotStrMapCompactDepth)
 		}
 		db.engine = &queryEngine{
-			fields:        collector.indexFields,
-			measureFields: collector.measureFields,
-			hasUnique:     collector.hasUnique,
-			universe:      posting.List{},
+			fields:                         collector.indexFields,
+			measureFields:                  collector.measureFields,
+			hasUnique:                      collector.hasUnique,
+			universe:                       posting.List{},
+			matPredCacheMaxEntries:         max(0, options.SnapshotMaterializedPredCacheMaxEntries),
+			matPredCacheMaxCard:            materializedPredCacheMaxCardinality(options.SnapshotMaterializedPredCacheMaxCardinality),
+			numericRangeBucketSize:         options.NumericRangeBucketSize,
+			numericRangeBucketMinFieldKeys: options.NumericRangeBucketMinFieldKeys,
+			numericRangeBucketMinSpanKeys:  options.NumericRangeBucketMinSpanKeys,
 			snapshot: &snapshotManager{
 				bySeq:        make(map[uint64]*snapshotRef, 128),
 				statsEnabled: options.EnableSnapshotStats,
@@ -539,7 +544,7 @@ func New[K ~uint64 | ~string, V any](bolt *bbolt.DB, options Options, execOpts .
 		}
 
 		if loadedPlannerStats != nil && loadedOrdinaryFieldCount == len(db.engine.fields) {
-			db.engine.publishLoadedPlannerStats(loadedPlannerStats, db.getSnapshot())
+			db.engine.publishLoadedPlannerStats(loadedPlannerStats, db.engine.getSnapshot())
 
 		} else {
 			if err = db.RefreshPlannerStats(); err != nil {
@@ -643,20 +648,6 @@ func makePatchFieldAccessors(vtype reflect.Type, fields map[string]*field) ([]pa
 	}
 
 	return access, ordinals
-}
-
-func (db *DB[K, V]) initSnapshotRuntimeCaches(s *indexSnapshot) {
-	s.numericRangeBucketCache = numericRangeBucketCachePool.Get()
-	s.numericRangeBucketCache.init(len(db.engine.indexedFieldAccess))
-	s.matPredCacheMaxEntries = max(0, db.options.SnapshotMaterializedPredCacheMaxEntries)
-	s.matPredCacheMaxCard = materializedPredCacheMaxCardinality(
-		db.options.SnapshotMaterializedPredCacheMaxCardinality,
-	)
-	if s.matPredCacheMaxEntries > 0 {
-		s.matPredCache = materializedPredCachePool.Get()
-		s.matPredCache.refs.Store(1)
-		s.matPredCache.init(s.matPredCacheMaxEntries)
-	}
 }
 
 func (db *DB[K, V]) initBatcher() {
@@ -1329,7 +1320,14 @@ func (db *DB[K, V]) publishCurrentSequenceSnapshotNoLock() error {
 	if err != nil {
 		return err
 	}
-	db.publishSnapshotNoLock(seq)
+	var strmap *strMapSnapshot
+	if db.strMap != nil {
+		strmap = db.strMap.snapshot()
+	}
+	db.engine.publishSnapshotNoLock(seq, strmap)
+	if db.strMap != nil {
+		db.strMap.markCommittedPublished(strmap)
+	}
 	return nil
 }
 
@@ -1424,8 +1422,8 @@ func (db *DB[K, V]) Stats() Stats[K] {
 	db.mu.RUnlock()
 
 	if db.engine != nil {
-		snap, seq, ref, pinned := db.pinCurrentSnapshot()
-		defer db.unpinCurrentSnapshot(seq, ref, pinned)
+		snap, seq, ref, pinned := db.engine.pinCurrentSnapshot()
+		defer db.engine.unpinCurrentSnapshot(seq, ref, pinned)
 
 		out.KeyCount = snap.universeCardinality()
 		out.LastKey = db.statsLastKeyFromSnapshot(snap, out.KeyCount)
@@ -1496,8 +1494,8 @@ func (db *DB[K, V]) IndexStats() IndexStats {
 		return IndexStats{}
 	}
 
-	snap, seq, ref, pinned := db.pinCurrentSnapshot()
-	defer db.unpinCurrentSnapshot(seq, ref, pinned)
+	snap, seq, ref, pinned := db.engine.pinCurrentSnapshot()
+	defer db.engine.unpinCurrentSnapshot(seq, ref, pinned)
 
 	return db.engine.indexStats(snap)
 }
@@ -1774,10 +1772,6 @@ func (db *DB[K, V]) PlannerStats() PlannerStats {
 // In transparent mode no query engine and no runtime planner exist, so the
 // returned calibration payload is zero-valued.
 func (db *DB[K, V]) CalibrationStats() CalibrationStats {
-	return db.calibrationStats()
-}
-
-func (db *DB[K, V]) calibrationStats() CalibrationStats {
 	out := CalibrationStats{
 		Multipliers: make(map[string]float64, int(plannerCalPlanCount)),
 		Samples:     make(map[string]uint64, int(plannerCalPlanCount)),
@@ -1925,7 +1919,7 @@ func (db *DB[K, V]) Truncate() error {
 		universe:           nextUniverse,
 		strmap:             nextStrMap,
 	}
-	db.initSnapshotRuntimeCaches(snap)
+	db.engine.initSnapshotRuntimeCaches(snap)
 	db.engine.snapshot.stage(snap)
 	if err = db.commit(tx, "truncate"); err != nil {
 		db.engine.snapshot.dropStaged(seq)
@@ -1944,7 +1938,10 @@ func (db *DB[K, V]) Truncate() error {
 	// Keep previously published snapshots immutable for concurrent readers.
 	db.engine.universe = nextUniverse
 	if err = db.publishAfterCommitLocked(seq, "truncate", func() {
-		db.finishSnapshotPublishNoLock(snap)
+		db.engine.finishSnapshotPublishNoLock(snap)
+		if db.strMap != nil {
+			db.strMap.markCommittedPublished(snap.strmap)
+		}
 	}); err != nil {
 		return err
 	}

@@ -132,8 +132,8 @@ func (db *DB[K, V]) beginQueryTxSnapshot() (*bbolt.Tx, *indexSnapshot, uint64, *
 }
 
 func (db *DB[K, V]) queryRecords(tx *bbolt.Tx, snap *indexSnapshot, q *qir.Shape) ([]*V, error) {
-	view := db.makeQueryView(snap)
-	defer db.releaseQueryView(view)
+	view := db.engine.makeQueryView(snap)
+	defer db.engine.releaseQueryView(view)
 
 	if !db.engine.traceOrCalibrationSamplingEnabled() {
 		if empty, err := view.tryQueryEmptyOnSnapshot(q); empty || err != nil {
@@ -201,37 +201,6 @@ func (db *DB[K, V]) batchGetTxCompactByIdx(tx *bbolt.Tx, snap *indexSnapshot, id
 	return out, nil
 }
 
-func (db *DB[K, V]) pinCurrentSnapshot() (*indexSnapshot, uint64, *snapshotRef, bool) {
-	for {
-		db.engine.snapshot.mu.RLock()
-		ref := db.engine.snapshot.currentRef.Load()
-		if ref == nil {
-			db.engine.snapshot.mu.RUnlock()
-			return db.buildPublishedSnapshotNoLock(0), 0, nil, false
-		}
-		ref.refs.Add(1)
-		if db.engine.snapshot.currentRef.Load() != ref {
-			db.engine.snapshot.mu.RUnlock()
-			ref.refs.Add(-1)
-			continue
-		}
-		snap := ref.snap
-		db.engine.snapshot.mu.RUnlock()
-		if snap == nil {
-			ref.refs.Add(-1)
-			continue
-		}
-		return snap, snap.seq, ref, true
-	}
-}
-
-func (db *DB[K, V]) unpinCurrentSnapshot(seq uint64, ref *snapshotRef, pinned bool) {
-	if !pinned || ref == nil {
-		return
-	}
-	db.engine.snapshot.unpinRef(seq, ref)
-}
-
 // QueryKeys evaluates the given query against the index and returns all matching ids.
 func (db *DB[K, V]) QueryKeys(q *qx.QX) ([]K, error) {
 	if err := db.beginOp(); err != nil {
@@ -252,11 +221,11 @@ func (db *DB[K, V]) QueryKeys(q *qx.QX) ([]K, error) {
 	defer prepared.Release()
 	viewQ := qir.NewShape(prepared)
 
-	snap, seq, ref, pinned := db.pinCurrentSnapshot()
-	defer db.unpinCurrentSnapshot(seq, ref, pinned)
+	snap, seq, ref, pinned := db.engine.pinCurrentSnapshot()
+	defer db.engine.unpinCurrentSnapshot(seq, ref, pinned)
 
-	view := db.makeQueryView(snap)
-	defer db.releaseQueryView(view)
+	view := db.engine.makeQueryView(snap)
+	defer db.engine.releaseQueryView(view)
 
 	ids, err := view.execQuery(&viewQ, true, false)
 	if err != nil {
@@ -287,11 +256,11 @@ func (db *DB[K, V]) queryKeysFromIDs(snap *indexSnapshot, ids []uint64) []K {
 // execPreparedQuery skips normalize/field-validation and tracing for internal
 // callers that already operate on validated/normalized QX.
 func (db *DB[K, V]) execPreparedQuery(q *qir.Shape) ([]uint64, error) {
-	snap, seq, ref, pinned := db.pinCurrentSnapshot()
-	defer db.unpinCurrentSnapshot(seq, ref, pinned)
+	snap, seq, ref, pinned := db.engine.pinCurrentSnapshot()
+	defer db.engine.unpinCurrentSnapshot(seq, ref, pinned)
 
-	view := db.makeQueryView(snap)
-	defer db.releaseQueryView(view)
+	view := db.engine.makeQueryView(snap)
+	defer db.engine.releaseQueryView(view)
 
 	return view.execPreparedQuery(q)
 }
@@ -306,25 +275,6 @@ func shouldSkipPlannerForArrayOrderShape(q *qir.Shape) bool {
 	default:
 		return false
 	}
-}
-
-func (db *DB[K, V]) makeQueryView(snap *indexSnapshot) *queryView {
-	view := db.engine.viewPool.Get()
-	*view = queryView{
-		engine:            db.engine,
-		snap:              snap,
-		strKey:            snap.strmap != nil,
-		strMapView:        snap.strmap,
-		fields:            db.engine.fields,
-		planner:           db.engine.planner,
-		options:           db.options,
-		lenZeroComplement: snap.lenZeroComplement,
-	}
-	return view
-}
-
-func (db *DB[K, V]) releaseQueryView(view *queryView) {
-	db.engine.viewPool.Put(view)
 }
 
 func finishQueryTrace(trace *queryTrace, out *[]uint64, err *error) {

@@ -34,11 +34,11 @@ func newPlannerShadowHarness(
 ) *plannerShadowHarness {
 	t.Helper()
 
-	prepared, viewQ, err := prepareTestQuery(db, q)
+	prepared, viewQ, err := prepareTestQuery(db.engine, q)
 	if err != nil {
 		t.Fatalf("prepareTestQuery(%+v): %v", q, err)
 	}
-	view := db.currentQueryViewForTests()
+	view := db.engine.currentQueryViewForTests()
 	h := &plannerShadowHarness{
 		t:        t,
 		db:       db,
@@ -50,7 +50,7 @@ func newPlannerShadowHarness(
 		viewQ:    viewQ,
 	}
 	t.Cleanup(func() {
-		db.releaseQueryView(view)
+		db.engine.releaseQueryView(view)
 		prepared.Release()
 	})
 	return h
@@ -312,7 +312,7 @@ func TestPlannerShadow_OrderedLimitExecutionVsPlanner(t *testing.T) {
 		qx.GTE("age", 22),
 		qx.LT("age", 45),
 	).Sort("age", qx.ASC).Limit(120)
-	if !db.shouldPreferExecutionPlan(q) {
+	if !db.engine.shouldPreferExecutionPlan(q) {
 		t.Fatalf("expected ordered-limit shape to prefer execution plan")
 	}
 
@@ -370,7 +370,7 @@ func TestPlannerShadow_CandidateOrderVsOrderedPlanner(t *testing.T) {
 	if !ok || len(leaves) == 0 {
 		t.Fatalf("collectAndLeaves: ok=%v len=%d", ok, len(leaves))
 	}
-	if !db.shouldUseCandidateOrder(q.Order[0], leaves) {
+	if !db.engine.shouldUseCandidateOrder(q.Order[0], leaves) {
 		t.Fatalf("expected candidate-order precheck to pass")
 	}
 

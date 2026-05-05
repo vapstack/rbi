@@ -41,13 +41,13 @@ func snapshotPostingContainsAll(t *testing.T, ids posting.List, want ...uint64) 
 func TestSnapshotSequence_PublishedOnWrite(t *testing.T) {
 	db, _ := openTempDBUint64(t)
 
-	before := db.getSnapshot().seq
+	before := db.engine.getSnapshot().seq
 
 	if err := db.Set(1, &Rec{Name: "alice", Age: 30}); err != nil {
 		t.Fatalf("Set: %v", err)
 	}
 
-	after := db.getSnapshot().seq
+	after := db.engine.getSnapshot().seq
 	if after <= before {
 		t.Fatalf("snapshot sequence did not advance: before=%d after=%d", before, after)
 	}
@@ -65,13 +65,13 @@ func TestSnapshotSequence_PreviousSnapshotIsRetiredAfterPublishWithoutPins(t *te
 		t.Fatalf("seed Set: %v", err)
 	}
 
-	oldSequence := db.getSnapshot().seq
+	oldSequence := db.engine.getSnapshot().seq
 
 	if err := db.Set(2, &Rec{Name: "new", Age: 20}); err != nil {
 		t.Fatalf("concurrent Set: %v", err)
 	}
 
-	latest := db.getSnapshot().seq
+	latest := db.engine.getSnapshot().seq
 	if latest <= oldSequence {
 		t.Fatalf("latest sequence did not advance: old=%d latest=%d", oldSequence, latest)
 	}
@@ -84,11 +84,11 @@ func TestSnapshotSequence_PreviousSnapshotIsRetiredAfterPublishWithoutPins(t *te
 func TestSnapshotSequence_AdvancesOnWrite(t *testing.T) {
 	db, _ := openTempDBUint64(t)
 
-	before := db.getSnapshot().seq
+	before := db.engine.getSnapshot().seq
 	if err := db.Set(1, &Rec{Name: "x", Age: 1}); err != nil {
 		t.Fatalf("Set: %v", err)
 	}
-	after := db.getSnapshot().seq
+	after := db.engine.getSnapshot().seq
 	if after <= before {
 		t.Fatalf("snapshot sequence did not advance on write: before=%d after=%d", before, after)
 	}
@@ -101,14 +101,14 @@ func TestSnapshot_PublishedAsFullState(t *testing.T) {
 		t.Fatalf("Set: %v", err)
 	}
 
-	s := db.getSnapshot()
+	s := db.engine.getSnapshot()
 	nameIDs := s.fieldLookupPostingRetained("name", "alice")
 	snapshotPostingContainsAll(t, nameIDs, 1)
 
 	tagsIDs := s.fieldLookupPostingRetained("tags", "go")
 	snapshotPostingContainsAll(t, tagsIDs, 1)
 
-	lenIDs := db.lenFieldOverlay("tags").lookupPostingRetained(uint64ByteStr(2))
+	lenIDs := db.engine.currentQueryViewForTests().lenFieldOverlay("tags").lookupPostingRetained(uint64ByteStr(2))
 	snapshotPostingContainsAll(t, lenIDs, 1)
 }
 
@@ -118,12 +118,12 @@ func TestSnapshot_PreviousSnapshotRemainsImmutable(t *testing.T) {
 	if err := db.Set(1, &Rec{Name: "alice"}); err != nil {
 		t.Fatalf("seed Set: %v", err)
 	}
-	s1 := db.getSnapshot()
+	s1 := db.engine.getSnapshot()
 
 	if err := db.Set(2, &Rec{Name: "bob"}); err != nil {
 		t.Fatalf("second Set: %v", err)
 	}
-	s2 := db.getSnapshot()
+	s2 := db.engine.getSnapshot()
 	if s1 == s2 {
 		t.Fatalf("expected a newly published snapshot instance")
 	}
@@ -143,7 +143,7 @@ func TestSnapshotStrMap_OldSnapshotDoesNotSeeFutureKeyMappings(t *testing.T) {
 	if err := db.Set("k1", &Rec{Name: "one"}); err != nil {
 		t.Fatalf("Set(k1): %v", err)
 	}
-	s1 := db.getSnapshot()
+	s1 := db.engine.getSnapshot()
 	idx1, ok := s1.strmap.getIdxNoLock("k1")
 	if !ok || idx1 == 0 {
 		t.Fatalf("expected k1 in first snapshot")
@@ -152,7 +152,7 @@ func TestSnapshotStrMap_OldSnapshotDoesNotSeeFutureKeyMappings(t *testing.T) {
 	if err := db.Set("k2", &Rec{Name: "two"}); err != nil {
 		t.Fatalf("Set(k2): %v", err)
 	}
-	s2 := db.getSnapshot()
+	s2 := db.engine.getSnapshot()
 	if _, ok := s1.strmap.getIdxNoLock("k2"); ok {
 		t.Fatalf("old snapshot unexpectedly sees k2 mapping")
 	}
@@ -175,7 +175,7 @@ func TestSnapshotStrMap_LatestSnapshotRetainsOldMappingsAcrossChain(t *testing.T
 	if err := db.Set("k1", &Rec{Name: "one"}); err != nil {
 		t.Fatalf("Set(k1): %v", err)
 	}
-	idx1, ok := db.getSnapshot().strmap.getIdxNoLock("k1")
+	idx1, ok := db.engine.getSnapshot().strmap.getIdxNoLock("k1")
 	if !ok || idx1 == 0 {
 		t.Fatalf("expected k1 mapping in first snapshot")
 	}
@@ -187,7 +187,7 @@ func TestSnapshotStrMap_LatestSnapshotRetainsOldMappingsAcrossChain(t *testing.T
 		}
 	}
 
-	latest := db.getSnapshot().strmap
+	latest := db.engine.getSnapshot().strmap
 	if got, ok := latest.getIdxNoLock("k1"); !ok || got != idx1 {
 		t.Fatalf("latest snapshot lost k1 idx: got=%d ok=%v want=%d", got, ok, idx1)
 	}
@@ -200,12 +200,12 @@ func TestSnapshot_EmptyBaseWriteInvalidatesTouchedMaterializedPredicateCache(t *
 	db, _ := openTempDBUint64(t)
 
 	expr := qx.PREFIX("email", "user")
-	cacheKey := db.materializedPredCacheKey(expr)
+	cacheKey := db.engine.materializedPredCacheKey(expr)
 	if cacheKey == "" {
 		t.Fatalf("expected materialized predicate cache key for prefix predicate")
 	}
 
-	emptySnap := db.getSnapshot()
+	emptySnap := db.engine.getSnapshot()
 	emptySnap.storeMaterializedPred(cacheKey, posting.List{})
 	if _, ok := emptySnap.loadMaterializedPred(cacheKey); !ok {
 		t.Fatalf("expected cached negative predicate result on empty snapshot")
@@ -218,7 +218,7 @@ func TestSnapshot_EmptyBaseWriteInvalidatesTouchedMaterializedPredicateCache(t *
 		t.Fatalf("Set(first row): %v", err)
 	}
 
-	if _, ok := db.getSnapshot().loadMaterializedPred(cacheKey); ok {
+	if _, ok := db.engine.getSnapshot().loadMaterializedPred(cacheKey); ok {
 		t.Fatalf("expected first write from empty base to invalidate touched predicate cache")
 	}
 
@@ -245,7 +245,7 @@ func TestSnapshot_EmptyBaseBatchSetBuildsDistinctLenIndex(t *testing.T) {
 		t.Fatalf("BatchSet: %v", err)
 	}
 
-	s := db.getSnapshot()
+	s := db.engine.getSnapshot()
 	if snapshotTestLenZeroComplementField(s, "tags") {
 		t.Fatalf("unexpected zero-complement mode for balanced empty/non-empty tags")
 	}
@@ -288,7 +288,7 @@ func TestSnapshot_UnpinPrunesRegistryWhenLastReaderExits(t *testing.T) {
 	if err := db.Set(1, &Rec{Name: "seed", Age: 10}); err != nil {
 		t.Fatalf("seed Set: %v", err)
 	}
-	oldSeq := db.getSnapshot().seq
+	oldSeq := db.engine.getSnapshot().seq
 
 	if _, ref, ok := db.engine.snapshot.pinRefBySeq(oldSeq); !ok {
 		t.Fatalf("expected to pin previous snapshot")
@@ -297,7 +297,7 @@ func TestSnapshot_UnpinPrunesRegistryWhenLastReaderExits(t *testing.T) {
 			t.Fatalf("second Set: %v", err)
 		}
 
-		latestSeq := db.getSnapshot().seq
+		latestSeq := db.engine.getSnapshot().seq
 		db.engine.snapshot.mu.RLock()
 		_, oldPresentWhilePinned := db.engine.snapshot.bySeq[oldSeq]
 		registryWhilePinned := len(db.engine.snapshot.bySeq)
@@ -397,7 +397,7 @@ func TestSnapshotFromEmptyBase_PublishedUniverseGetsOwnerAndPinnedScanStaysStabl
 		t.Fatalf("BatchSet(seed): %v", err)
 	}
 
-	old := db.getSnapshot()
+	old := db.engine.getSnapshot()
 	if old.universeOwner == nil {
 		t.Fatal("expected from-empty published snapshot to own universe")
 	}
@@ -581,7 +581,7 @@ func snapshotExtRunConcurrent(n int, fn func(i int)) {
 func snapshotExtQueryTxRecords[K ~string | ~uint64, V any](t *testing.T, db *DB[K, V], tx *bbolt.Tx, snap *indexSnapshot, q *qx.QX) []*V {
 	t.Helper()
 
-	prepared, viewQ, err := prepareTestQuery(db, q)
+	prepared, viewQ, err := prepareTestQuery(db.engine, q)
 	if err != nil {
 		t.Fatalf("prepareTestQuery(queryRecords): %v", err)
 	}
@@ -597,7 +597,7 @@ func snapshotExtQueryTxRecords[K ~string | ~uint64, V any](t *testing.T, db *DB[
 func snapshotExtEvalNumericRangeBuckets(t *testing.T, db *DB[uint64, Rec], expr qx.Expr) {
 	t.Helper()
 
-	prepared, compiled, err := prepareTestExpr(db, expr)
+	prepared, compiled, err := prepareTestExpr(db.engine, expr)
 	if err != nil {
 		t.Fatalf("prepareTestExpr(numeric range): %v", err)
 	}
@@ -608,12 +608,12 @@ func snapshotExtEvalNumericRangeBuckets(t *testing.T, db *DB[uint64, Rec], expr 
 	if fm == nil {
 		t.Fatalf("expected %q field metadata", f)
 	}
-	ov := db.fieldOverlay(f)
+	ov := db.engine.currentQueryViewForTests().fieldOverlay(f)
 	if !ov.hasData() {
 		t.Fatalf("expected %q field index data", f)
 	}
 
-	key, isSlice, isNil, err := db.exprValueToIdxScalar(expr)
+	key, isSlice, isNil, err := db.engine.exprValueToIdxScalar(expr)
 	if err != nil {
 		t.Fatalf("exprValueToIdxScalar(%s): %v", f, err)
 	}
@@ -626,7 +626,7 @@ func snapshotExtEvalNumericRangeBuckets(t *testing.T, db *DB[uint64, Rec], expr 
 		t.Fatalf("rangeBoundsForOp(%v) failed", compiled.Op)
 	}
 
-	out, ok := db.tryEvalNumericRangeBuckets(f, fm, ov, ov.rangeForBounds(rb))
+	out, ok := db.engine.currentQueryViewForTests().tryEvalNumericRangeBuckets(f, fm, ov, ov.rangeForBounds(rb))
 	if !ok {
 		t.Fatalf("expected numeric range bucket path for %q", f)
 	}
@@ -697,7 +697,7 @@ func TestSnapshotExt_PublishSameSeqReusesRefAndUpdatesCurrent(t *testing.T) {
 	second := &indexSnapshot{seq: first.seq, universe: posting.List{}}
 	db.engine.snapshot.publishRef(second)
 
-	if got := db.getSnapshot(); got != second {
+	if got := db.engine.getSnapshot(); got != second {
 		t.Fatalf("expected current snapshot to be replaced on same-seq publish")
 	}
 
@@ -827,7 +827,7 @@ func TestSnapshotExt_SnapshotStatsTracksPinnedRefAcrossPublish(t *testing.T) {
 	if err := db.Set(1, &Rec{Name: "alice", Age: 30}); err != nil {
 		t.Fatalf("Set(1): %v", err)
 	}
-	oldSeq := db.getSnapshot().seq
+	oldSeq := db.engine.getSnapshot().seq
 	if _, ref, ok := db.engine.snapshot.pinRefBySeq(oldSeq); !ok {
 		t.Fatalf("expected current snapshot to be pinnable")
 	} else {
@@ -841,7 +841,7 @@ func TestSnapshotExt_SnapshotStatsTracksPinnedRefAcrossPublish(t *testing.T) {
 		}
 
 		mid := db.SnapshotStats()
-		if mid.Sequence != db.getSnapshot().seq || mid.Sequence <= oldSeq {
+		if mid.Sequence != db.engine.getSnapshot().seq || mid.Sequence <= oldSeq {
 			t.Fatalf("expected stats sequence to advance after publish: %+v", mid)
 		}
 		if mid.RegistrySize != 2 || mid.PinnedRefs != 1 {
@@ -864,7 +864,7 @@ func TestSnapshotExt_BeginQueryTxSnapshotIgnoresStagedFutureSnapshot(t *testing.
 		t.Fatalf("Set(1): %v", err)
 	}
 
-	current := db.getSnapshot()
+	current := db.engine.getSnapshot()
 	staged := &indexSnapshot{seq: current.seq + 1}
 	db.engine.snapshot.stage(staged)
 	defer db.engine.snapshot.dropStaged(staged.seq)
@@ -936,7 +936,7 @@ func TestSnapshotExt_OldSnapshotFieldLookupImmutableAcrossSetUpdate(t *testing.T
 		t.Fatalf("Set(2): %v", err)
 	}
 
-	s1 := db.getSnapshot()
+	s1 := db.engine.getSnapshot()
 	pinnedS1, ref, ok := db.engine.snapshot.pinRefBySeq(s1.seq)
 	if !ok || pinnedS1 != s1 {
 		t.Fatalf("expected old snapshot to be pinnable")
@@ -947,7 +947,7 @@ func TestSnapshotExt_OldSnapshotFieldLookupImmutableAcrossSetUpdate(t *testing.T
 		t.Fatalf("Set(update): %v", err)
 	}
 
-	s2 := db.getSnapshot()
+	s2 := db.engine.getSnapshot()
 	if !snapshotExtFieldContainsID(t, pinnedS1, "name", "bob", 2) {
 		t.Fatalf("old snapshot lost original scalar posting")
 	}
@@ -969,7 +969,7 @@ func TestSnapshotExt_OldSnapshotLenIndexImmutableAcrossSetUpdate(t *testing.T) {
 		t.Fatalf("Set(1): %v", err)
 	}
 
-	s1 := db.getSnapshot()
+	s1 := db.engine.getSnapshot()
 	pinnedS1, ref, ok := db.engine.snapshot.pinRefBySeq(s1.seq)
 	if !ok || pinnedS1 != s1 {
 		t.Fatalf("expected old snapshot to be pinnable")
@@ -980,7 +980,7 @@ func TestSnapshotExt_OldSnapshotLenIndexImmutableAcrossSetUpdate(t *testing.T) {
 		t.Fatalf("Set(update): %v", err)
 	}
 
-	s2 := db.getSnapshot()
+	s2 := db.engine.getSnapshot()
 	if !snapshotExtLenContainsID(t, pinnedS1, "tags", 2, 1) {
 		t.Fatalf("old snapshot lost original len posting")
 	}
@@ -1009,7 +1009,7 @@ func TestSnapshotExt_ZeroComplementLenIndexImmutableAcrossPatchToEmpty(t *testin
 		t.Fatalf("BatchSet: %v", err)
 	}
 
-	s1 := db.getSnapshot()
+	s1 := db.engine.getSnapshot()
 	pinnedS1, ref, ok := db.engine.snapshot.pinRefBySeq(s1.seq)
 	if !ok || pinnedS1 != s1 {
 		t.Fatalf("expected old snapshot to be pinnable")
@@ -1026,7 +1026,7 @@ func TestSnapshotExt_ZeroComplementLenIndexImmutableAcrossPatchToEmpty(t *testin
 		t.Fatalf("Patch(tags): %v", err)
 	}
 
-	s2 := db.getSnapshot()
+	s2 := db.engine.getSnapshot()
 	if !snapshotExtLenNonEmptyContainsID(t, pinnedS1, "tags", 1) {
 		t.Fatalf("old snapshot lost non-empty sentinel membership")
 	}
@@ -1042,7 +1042,7 @@ func TestSnapshotExt_OldSnapshotNilIndexImmutableAcrossPatch(t *testing.T) {
 		t.Fatalf("Set(1): %v", err)
 	}
 
-	s1 := db.getSnapshot()
+	s1 := db.engine.getSnapshot()
 	pinnedS1, ref, ok := db.engine.snapshot.pinRefBySeq(s1.seq)
 	if !ok || pinnedS1 != s1 {
 		t.Fatalf("expected old snapshot to be pinnable")
@@ -1053,7 +1053,7 @@ func TestSnapshotExt_OldSnapshotNilIndexImmutableAcrossPatch(t *testing.T) {
 		t.Fatalf("Patch(opt): %v", err)
 	}
 
-	s2 := db.getSnapshot()
+	s2 := db.engine.getSnapshot()
 	if !snapshotExtNilContainsID(t, pinnedS1, "opt", 1) {
 		t.Fatalf("old snapshot lost nil-index membership")
 	}
@@ -1075,7 +1075,7 @@ func TestSnapshotExt_OldSnapshotUniverseImmutableAcrossDelete(t *testing.T) {
 		t.Fatalf("Set(2): %v", err)
 	}
 
-	s1 := db.getSnapshot()
+	s1 := db.engine.getSnapshot()
 	pinnedS1, ref, ok := db.engine.snapshot.pinRefBySeq(s1.seq)
 	if !ok || pinnedS1 != s1 {
 		t.Fatalf("expected old snapshot to be pinnable")
@@ -1085,7 +1085,7 @@ func TestSnapshotExt_OldSnapshotUniverseImmutableAcrossDelete(t *testing.T) {
 		t.Fatalf("Delete(2): %v", err)
 	}
 
-	s2 := db.getSnapshot()
+	s2 := db.engine.getSnapshot()
 	if !pinnedS1.universe.Contains(2) || pinnedS1.universe.Cardinality() != 2 {
 		t.Fatalf("old snapshot universe mutated after delete")
 	}
@@ -1104,7 +1104,7 @@ func TestSnapshotExt_PinnedSnapshotSurvivesTruncateAndPrunesAfterUnpin(t *testin
 		t.Fatalf("Set(2): %v", err)
 	}
 
-	old := db.getSnapshot()
+	old := db.engine.getSnapshot()
 	oldSeq := old.seq
 	pinned, ref, ok := db.engine.snapshot.pinRefBySeq(oldSeq)
 	if !ok || pinned != old {
@@ -1115,7 +1115,7 @@ func TestSnapshotExt_PinnedSnapshotSurvivesTruncateAndPrunesAfterUnpin(t *testin
 		t.Fatalf("Truncate: %v", err)
 	}
 
-	current := db.getSnapshot()
+	current := db.engine.getSnapshot()
 	if current.seq <= oldSeq {
 		t.Fatalf("expected truncate to publish newer snapshot: old=%d new=%d", oldSeq, current.seq)
 	}
@@ -1161,7 +1161,7 @@ func TestSnapshotExt_StringKeyPinnedSnapshotStrMapSurvivesTruncate(t *testing.T)
 		t.Fatalf("Set(k2): %v", err)
 	}
 
-	old := db.getSnapshot()
+	old := db.engine.getSnapshot()
 	idx1, ok := old.strmap.getIdxNoLock("k1")
 	if !ok || idx1 == 0 {
 		t.Fatalf("expected k1 mapping before truncate")
@@ -1175,7 +1175,7 @@ func TestSnapshotExt_StringKeyPinnedSnapshotStrMapSurvivesTruncate(t *testing.T)
 		t.Fatalf("Truncate: %v", err)
 	}
 
-	current := db.getSnapshot()
+	current := db.engine.getSnapshot()
 	if _, ok := current.strmap.getIdxNoLock("k1"); ok {
 		t.Fatalf("current truncated snapshot unexpectedly retained k1 mapping")
 	}
@@ -1196,7 +1196,7 @@ func TestSnapshotExt_StringKeyOldSnapshotMappingsSurviveDeleteAndNewKeys(t *test
 		t.Fatalf("Set(k2): %v", err)
 	}
 
-	s1 := db.getSnapshot()
+	s1 := db.engine.getSnapshot()
 	idx1, ok := s1.strmap.getIdxNoLock("k1")
 	if !ok || idx1 == 0 {
 		t.Fatalf("expected k1 mapping in old snapshot")
@@ -1212,7 +1212,7 @@ func TestSnapshotExt_StringKeyOldSnapshotMappingsSurviveDeleteAndNewKeys(t *test
 		}
 	}
 
-	s2 := db.getSnapshot()
+	s2 := db.engine.getSnapshot()
 	if _, ok := s1.strmap.getIdxNoLock("k3"); ok {
 		t.Fatalf("old snapshot unexpectedly sees future string key mapping")
 	}
@@ -1231,12 +1231,12 @@ func TestSnapshotExt_PatchUnchangedFieldInheritsPositiveMaterializedPredCache(t 
 		t.Fatalf("Set(1): %v", err)
 	}
 
-	key := db.materializedPredCacheKey(qx.PREFIX("email", "ali"))
+	key := db.engine.materializedPredCacheKey(qx.PREFIX("email", "ali"))
 	if key == "" {
 		t.Fatalf("expected non-empty cache key")
 	}
 
-	prev := db.getSnapshot()
+	prev := db.engine.getSnapshot()
 	ids := snapshotExtPosting(1)
 	prev.storeMaterializedPred(key, ids)
 
@@ -1244,7 +1244,7 @@ func TestSnapshotExt_PatchUnchangedFieldInheritsPositiveMaterializedPredCache(t 
 		t.Fatalf("Patch(age): %v", err)
 	}
 
-	next := db.getSnapshot()
+	next := db.engine.getSnapshot()
 	cached, ok := next.loadMaterializedPred(key)
 	if !ok || cached != ids {
 		t.Fatalf("expected positive untouched cache entry to be inherited")
@@ -1258,19 +1258,19 @@ func TestSnapshotExt_PatchUnchangedFieldInheritsNegativeMaterializedPredCache(t 
 		t.Fatalf("Set(1): %v", err)
 	}
 
-	key := db.materializedPredCacheKey(qx.PREFIX("email", "zz"))
+	key := db.engine.materializedPredCacheKey(qx.PREFIX("email", "zz"))
 	if key == "" {
 		t.Fatalf("expected non-empty cache key")
 	}
 
-	prev := db.getSnapshot()
+	prev := db.engine.getSnapshot()
 	prev.storeMaterializedPred(key, posting.List{})
 
 	if err := db.Patch(1, []Field{{Name: "age", Value: 31}}); err != nil {
 		t.Fatalf("Patch(age): %v", err)
 	}
 
-	next := db.getSnapshot()
+	next := db.engine.getSnapshot()
 	cached, ok := next.loadMaterializedPred(key)
 	if !ok || !cached.IsEmpty() {
 		t.Fatalf("expected negative untouched cache entry to be inherited")
@@ -1284,13 +1284,13 @@ func TestSnapshotExt_PatchTouchedFieldDropsOnlyTouchedMaterializedPredCache(t *t
 		t.Fatalf("Set(1): %v", err)
 	}
 
-	nameKey := db.materializedPredCacheKey(qx.PREFIX("name", "ali"))
-	emailKey := db.materializedPredCacheKey(qx.PREFIX("email", "ali"))
+	nameKey := db.engine.materializedPredCacheKey(qx.PREFIX("name", "ali"))
+	emailKey := db.engine.materializedPredCacheKey(qx.PREFIX("email", "ali"))
 	if nameKey == "" || emailKey == "" {
 		t.Fatalf("expected non-empty cache keys")
 	}
 
-	prev := db.getSnapshot()
+	prev := db.engine.getSnapshot()
 	nameIDs := snapshotExtPosting(1)
 	emailIDs := snapshotExtPosting(1)
 	prev.storeMaterializedPred(nameKey, nameIDs)
@@ -1300,7 +1300,7 @@ func TestSnapshotExt_PatchTouchedFieldDropsOnlyTouchedMaterializedPredCache(t *t
 		t.Fatalf("Patch(name): %v", err)
 	}
 
-	next := db.getSnapshot()
+	next := db.engine.getSnapshot()
 	if _, ok := next.loadMaterializedPred(nameKey); ok {
 		t.Fatalf("expected touched field cache entry to be dropped")
 	}
@@ -1317,13 +1317,13 @@ func TestSnapshotExt_PatchDuplicateTouchedFieldStillDropsTouchedCacheAndKeepsOth
 		t.Fatalf("Set(1): %v", err)
 	}
 
-	nameKey := db.materializedPredCacheKey(qx.PREFIX("name", "ali"))
-	emailKey := db.materializedPredCacheKey(qx.PREFIX("email", "ali"))
+	nameKey := db.engine.materializedPredCacheKey(qx.PREFIX("name", "ali"))
+	emailKey := db.engine.materializedPredCacheKey(qx.PREFIX("email", "ali"))
 	if nameKey == "" || emailKey == "" {
 		t.Fatalf("expected non-empty cache keys")
 	}
 
-	prev := db.getSnapshot()
+	prev := db.engine.getSnapshot()
 	emailIDs := snapshotExtPosting(1)
 	prev.storeMaterializedPred(nameKey, snapshotExtPosting(1))
 	prev.storeMaterializedPred(emailKey, emailIDs)
@@ -1335,7 +1335,7 @@ func TestSnapshotExt_PatchDuplicateTouchedFieldStillDropsTouchedCacheAndKeepsOth
 		t.Fatalf("Patch(duplicate name): %v", err)
 	}
 
-	next := db.getSnapshot()
+	next := db.engine.getSnapshot()
 	if _, ok := next.loadMaterializedPred(nameKey); ok {
 		t.Fatalf("expected duplicate touched field cache entry to be dropped")
 	}
@@ -1352,13 +1352,13 @@ func TestSnapshotExt_PatchTouchedNilFieldDropsNilPredicateCache(t *testing.T) {
 		t.Fatalf("Set(1): %v", err)
 	}
 
-	optKey := db.materializedPredCacheKey(qx.PREFIX("opt", "z"))
-	emailKey := db.materializedPredCacheKey(qx.PREFIX("email", "ali"))
+	optKey := db.engine.materializedPredCacheKey(qx.PREFIX("opt", "z"))
+	emailKey := db.engine.materializedPredCacheKey(qx.PREFIX("email", "ali"))
 	if optKey == "" || emailKey == "" {
 		t.Fatalf("expected non-empty cache keys")
 	}
 
-	prev := db.getSnapshot()
+	prev := db.engine.getSnapshot()
 	emailIDs := snapshotExtPosting(1)
 	prev.storeMaterializedPred(optKey, posting.List{})
 	prev.storeMaterializedPred(emailKey, emailIDs)
@@ -1368,7 +1368,7 @@ func TestSnapshotExt_PatchTouchedNilFieldDropsNilPredicateCache(t *testing.T) {
 		t.Fatalf("Patch(opt): %v", err)
 	}
 
-	next := db.getSnapshot()
+	next := db.engine.getSnapshot()
 	if _, ok := next.loadMaterializedPred(optKey); ok {
 		t.Fatalf("expected touched nil-field cache entry to be dropped")
 	}
@@ -1395,7 +1395,7 @@ func TestSnapshotExt_ClearRuntimeCachesForTestingClearsCurrentSnapshotCaches(t *
 	}
 
 	setNumericBucketKnobs(t, db, 128, 1, 1)
-	snap := db.getSnapshot()
+	snap := db.engine.getSnapshot()
 	snapshotExtEvalNumericRangeBuckets(t, db, qx.GTE("age", 500))
 	if snap.numericRangeBucketCache == nil || snap.numericRangeBucketCache.entryCount() == 0 {
 		t.Fatalf("expected numeric range bucket cache entries after evaluation")
@@ -1404,11 +1404,11 @@ func TestSnapshotExt_ClearRuntimeCachesForTestingClearsCurrentSnapshotCaches(t *
 		t.Fatalf("expected numeric range bucket helper to keep shared materialized predicate cache empty, got=%d", got)
 	}
 	expr := qx.PREFIX("name", "u_1")
-	cacheKey := db.materializedPredCacheKey(expr)
+	cacheKey := db.engine.materializedPredCacheKey(expr)
 	if cacheKey == "" {
 		t.Fatalf("expected non-empty materialized predicate cache key")
 	}
-	out, err := db.evalSimple(expr)
+	out, err := db.engine.evalSimple(expr)
 	if err != nil {
 		t.Fatalf("evalSimple(prefix): %v", err)
 	}
@@ -1428,7 +1428,7 @@ func TestSnapshotExt_ClearRuntimeCachesForTestingClearsCurrentSnapshotCaches(t *
 
 	db.clearCurrentSnapshotCachesForTesting()
 
-	if db.getSnapshot() != snap {
+	if db.engine.getSnapshot() != snap {
 		t.Fatalf("expected cache clear to keep current snapshot published")
 	}
 	if got := snap.numericRangeBucketCache.entryCount(); got != 0 {
@@ -1908,7 +1908,7 @@ func TestSpanshotExt_ScanKeysStringShouldStayOnSingleSnapshotAcrossTruncate(t *t
 		t.Fatalf("Set(k2): %v", err)
 	}
 
-	old := db.getSnapshot()
+	old := db.engine.getSnapshot()
 	if old == nil || old.strmap == nil {
 		t.Fatalf("expected published string-key snapshot")
 	}
@@ -1964,7 +1964,7 @@ func TestSpanshotExt_ScanKeysStringSplitSnapshotMustNotEmitFutureKeysAfterTrunca
 		t.Fatalf("Set(k2): %v", err)
 	}
 
-	old := db.getSnapshot()
+	old := db.engine.getSnapshot()
 	pinned, ref, ok := db.engine.snapshot.pinRefBySeq(old.seq)
 	if !ok || pinned != old {
 		t.Fatalf("expected current string snapshot to be pinnable")
@@ -1987,7 +1987,7 @@ func TestSpanshotExt_ScanKeysStringSplitSnapshotMustNotEmitFutureKeysAfterTrunca
 		return true, nil
 	})
 	if err != nil {
-		t.Fatalf("split snapshot emitted inconsistent string scan state: err=%v got=%v oldSeq=%d currentSeq=%d", err, got, old.seq, db.getSnapshot().seq)
+		t.Fatalf("split snapshot emitted inconsistent string scan state: err=%v got=%v oldSeq=%d currentSeq=%d", err, got, old.seq, db.engine.getSnapshot().seq)
 	}
 	if slices.Contains(got, "future") {
 		t.Fatalf("string scan leaked future key from newer snapshot: got=%v", got)
@@ -2007,7 +2007,7 @@ func TestSpanshotExt_BeginQueryTxSnapshotSurvivesConcurrentTruncate(t *testing.T
 		t.Fatalf("Set(2): %v", err)
 	}
 
-	before := db.getSnapshot()
+	before := db.engine.getSnapshot()
 	tx, snap, seq, ref, err := db.beginQueryTxSnapshot()
 	if err != nil {
 		t.Fatalf("beginQueryTxSnapshot: %v", err)
@@ -2035,7 +2035,7 @@ func TestSpanshotExt_BeginQueryTxSnapshotSurvivesConcurrentTruncate(t *testing.T
 		t.Fatalf("Truncate: %v", err)
 	}
 
-	after := db.getSnapshot()
+	after := db.engine.getSnapshot()
 	if after.seq <= before.seq {
 		t.Fatalf("truncate did not publish newer snapshot: before=%d after=%d", before.seq, after.seq)
 	}
@@ -2059,7 +2059,7 @@ func TestSpanshotExt_BeginQueryTxSnapshotSurvivesBrokenTruncatePublish(t *testin
 		t.Fatalf("Set(2): %v", err)
 	}
 
-	before := db.getSnapshot()
+	before := db.engine.getSnapshot()
 	tx, snap, seq, ref, err := db.beginQueryTxSnapshot()
 	if err != nil {
 		t.Fatalf("beginQueryTxSnapshot: %v", err)
@@ -2095,7 +2095,7 @@ func TestSpanshotExt_BeginQueryTxSnapshotSurvivesBrokenTruncatePublish(t *testin
 	}
 
 	assertNoFutureSnapshotRefs(t, db)
-	if got := db.getSnapshot(); got != before {
+	if got := db.engine.getSnapshot(); got != before {
 		t.Fatalf("broken truncate publish should keep previously published snapshot current")
 	}
 }
@@ -2294,8 +2294,8 @@ func TestSnapshotExt_PinCurrentSnapshotTracksReaderPinsAcrossPublish(t *testing.
 		t.Fatalf("Set(1): %v", err)
 	}
 
-	current := db.getSnapshot()
-	snap, seq, ref, pinned := db.pinCurrentSnapshot()
+	current := db.engine.getSnapshot()
+	snap, seq, ref, pinned := db.engine.pinCurrentSnapshot()
 	if !pinned || snap != current {
 		t.Fatalf("expected current snapshot pin")
 	}
@@ -2314,7 +2314,7 @@ func TestSnapshotExt_PinCurrentSnapshotTracksReaderPinsAcrossPublish(t *testing.
 		t.Fatalf("expected old snapshot ref pin to survive publish, got=%d", got)
 	}
 
-	db.unpinCurrentSnapshot(seq, ref, pinned)
+	db.engine.unpinCurrentSnapshot(seq, ref, pinned)
 	if got := ref.refs.Load(); got != 0 {
 		t.Fatalf("expected current snapshot ref pins to drop after unpin, got=%d", got)
 	}
@@ -2327,7 +2327,7 @@ func TestSnapshotExt_QueryKeysReleasesCurrentSnapshotPinOnError(t *testing.T) {
 		t.Fatalf("Set(1): %v", err)
 	}
 
-	snap := db.getSnapshot()
+	snap := db.engine.getSnapshot()
 	if _, err := db.QueryKeys(qx.Query(qx.EQ("does_not_exist", 1))); err == nil {
 		t.Fatalf("expected QueryKeys to fail for unknown field")
 	}
@@ -2347,7 +2347,7 @@ func TestSnapshotExt_CountReleasesCurrentSnapshotPinOnError(t *testing.T) {
 		t.Fatalf("Set(1): %v", err)
 	}
 
-	snap := db.getSnapshot()
+	snap := db.engine.getSnapshot()
 	if _, err := db.Count(qx.EQ("does_not_exist", 1)); err == nil {
 		t.Fatalf("expected Count to fail for unknown field")
 	}
@@ -2367,7 +2367,7 @@ func TestSnapshotExt_ScanKeysReleasesCurrentSnapshotPinOnCallbackError(t *testin
 		t.Fatalf("Set(1): %v", err)
 	}
 
-	snap := db.getSnapshot()
+	snap := db.engine.getSnapshot()
 	wantErr := errors.New("stop")
 	err := db.ScanKeys(0, func(uint64) (bool, error) {
 		return false, wantErr

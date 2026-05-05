@@ -449,36 +449,36 @@ func TestRace_ConcurrentWriters_SnapshotRouteEquivalence(t *testing.T) {
 		}
 
 		q := queries[r.IntN(len(queries))]
-		snap, seq, snapRef, pinned := db.pinCurrentSnapshot()
-		view := db.makeQueryView(snap)
+		snap, seq, snapRef, pinned := db.engine.pinCurrentSnapshot()
+		view := db.engine.makeQueryView(snap)
 
 		nq, ref, usedExec, usedPlan := assertPreparedRouteEquivalence(t, view, q)
 		sawExec = sawExec || usedExec
 		sawPlan = sawPlan || usedPlan
 
 		if q.Window.Limit == 0 && q.Window.Offset == 0 {
-			preparedCount, compiledCount, err := prepareTestExpr(db, nq.Filter)
+			preparedCount, compiledCount, err := prepareTestExpr(db.engine, nq.Filter)
 			if err != nil {
-				db.releaseQueryView(view)
-				db.unpinCurrentSnapshot(seq, snapRef, pinned)
+				db.engine.releaseQueryView(view)
+				db.engine.unpinCurrentSnapshot(seq, snapRef, pinned)
 				t.Fatalf("prepareTestExpr(count): %v", err)
 			}
 			cnt, err := view.countPreparedExpr(compiledCount)
 			preparedCount.Release()
 			if err != nil {
-				db.releaseQueryView(view)
-				db.unpinCurrentSnapshot(seq, snapRef, pinned)
+				db.engine.releaseQueryView(view)
+				db.engine.unpinCurrentSnapshot(seq, snapRef, pinned)
 				t.Fatalf("countPreparedExpr: %v", err)
 			}
 			if cnt != uint64(len(ref)) {
-				db.releaseQueryView(view)
-				db.unpinCurrentSnapshot(seq, snapRef, pinned)
+				db.engine.releaseQueryView(view)
+				db.engine.unpinCurrentSnapshot(seq, snapRef, pinned)
 				t.Fatalf("count mismatch on snapshot view: got=%d want=%d", cnt, len(ref))
 			}
 		}
 
-		db.releaseQueryView(view)
-		db.unpinCurrentSnapshot(seq, snapRef, pinned)
+		db.engine.releaseQueryView(view)
+		db.engine.unpinCurrentSnapshot(seq, snapRef, pinned)
 	}
 
 	close(stop)
@@ -651,14 +651,14 @@ func TestRace_ConcurrentWriters_OROrderScoreChurn_SnapshotRouteEquivalence(t *te
 		}
 
 		q := queries[r.IntN(len(queries))]
-		snap, seq, snapRef, pinned := db.pinCurrentSnapshot()
-		view := db.makeQueryView(snap)
+		snap, seq, snapRef, pinned := db.engine.pinCurrentSnapshot()
+		view := db.engine.makeQueryView(snap)
 
 		_, _, _, usedPlan := assertPreparedRouteEquivalence(t, view, q)
 		sawPlan = sawPlan || usedPlan
 
-		db.releaseQueryView(view)
-		db.unpinCurrentSnapshot(seq, snapRef, pinned)
+		db.engine.releaseQueryView(view)
+		db.engine.unpinCurrentSnapshot(seq, snapRef, pinned)
 	}
 
 	close(stop)
@@ -834,8 +834,8 @@ func TestRace_StringKeyGrowth_FastPaths_SnapshotRouteEquivalence(t *testing.T) {
 		}
 
 		q := queries[r.IntN(len(queries))]
-		snap, seq, snapRef, pinned := db.pinCurrentSnapshot()
-		view := db.makeQueryView(snap)
+		snap, seq, snapRef, pinned := db.engine.pinCurrentSnapshot()
+		view := db.engine.makeQueryView(snap)
 
 		nq, ref, usedExec, usedPlan := assertPreparedRouteEquivalenceString(t, view, q)
 		sawExec = sawExec || usedExec
@@ -845,41 +845,41 @@ func TestRace_StringKeyGrowth_FastPaths_SnapshotRouteEquivalence(t *testing.T) {
 		for _, key := range ref {
 			idx, ok := view.strMapView.getIdxNoLock(key)
 			if !ok {
-				db.releaseQueryView(view)
-				db.unpinCurrentSnapshot(seq, snapRef, pinned)
+				db.engine.releaseQueryView(view)
+				db.engine.unpinCurrentSnapshot(seq, snapRef, pinned)
 				t.Fatalf("missing idx mapping in strmap snapshot for key=%q", key)
 			}
 			back, ok := view.strMapView.getStringNoLock(idx)
 			if !ok || back != key {
-				db.releaseQueryView(view)
-				db.unpinCurrentSnapshot(seq, snapRef, pinned)
+				db.engine.releaseQueryView(view)
+				db.engine.unpinCurrentSnapshot(seq, snapRef, pinned)
 				t.Fatalf("strmap round-trip mismatch: key=%q idx=%d back=%q ok=%v", key, idx, back, ok)
 			}
 		}
 
 		if q.Window.Limit == 0 && q.Window.Offset == 0 {
-			preparedCount, compiledCount, err := prepareTestExpr(db, nq.Filter)
+			preparedCount, compiledCount, err := prepareTestExpr(db.engine, nq.Filter)
 			if err != nil {
-				db.releaseQueryView(view)
-				db.unpinCurrentSnapshot(seq, snapRef, pinned)
+				db.engine.releaseQueryView(view)
+				db.engine.unpinCurrentSnapshot(seq, snapRef, pinned)
 				t.Fatalf("prepareTestExpr(count): %v", err)
 			}
 			cnt, err := view.countPreparedExpr(compiledCount)
 			preparedCount.Release()
 			if err != nil {
-				db.releaseQueryView(view)
-				db.unpinCurrentSnapshot(seq, snapRef, pinned)
+				db.engine.releaseQueryView(view)
+				db.engine.unpinCurrentSnapshot(seq, snapRef, pinned)
 				t.Fatalf("countPreparedExpr: %v", err)
 			}
 			if cnt != uint64(len(ref)) {
-				db.releaseQueryView(view)
-				db.unpinCurrentSnapshot(seq, snapRef, pinned)
+				db.engine.releaseQueryView(view)
+				db.engine.unpinCurrentSnapshot(seq, snapRef, pinned)
 				t.Fatalf("count mismatch on string snapshot view: got=%d want=%d", cnt, len(ref))
 			}
 		}
 
-		db.releaseQueryView(view)
-		db.unpinCurrentSnapshot(seq, snapRef, pinned)
+		db.engine.releaseQueryView(view)
+		db.engine.unpinCurrentSnapshot(seq, snapRef, pinned)
 	}
 
 	close(stop)

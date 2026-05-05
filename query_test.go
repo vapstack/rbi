@@ -96,9 +96,9 @@ func TestQuery_TryQueryEmptyOnSnapshot_SimpleScalarLeaf(t *testing.T) {
 		}
 	}
 
-	qv := db.currentQueryViewForTests()
+	qv := db.engine.currentQueryViewForTests()
 
-	prepared, viewQ, err := prepareTestQuery(db, qx.Query(qx.GT("age", 100)))
+	prepared, viewQ, err := prepareTestQuery(db.engine, qx.Query(qx.GT("age", 100)))
 	if err != nil {
 		t.Fatalf("prepareTestQuery(no-match): %v", err)
 	}
@@ -111,7 +111,7 @@ func TestQuery_TryQueryEmptyOnSnapshot_SimpleScalarLeaf(t *testing.T) {
 		t.Fatalf("expected GT(age,100) to be proven empty without tx")
 	}
 
-	prepared, viewQ, err = prepareTestQuery(db, qx.Query(qx.GTE("age", 20)))
+	prepared, viewQ, err = prepareTestQuery(db.engine, qx.Query(qx.GTE("age", 20)))
 	if err != nil {
 		t.Fatalf("prepareTestQuery(hit): %v", err)
 	}
@@ -968,13 +968,13 @@ func expectedKeysUint64(t testing.TB, db *DB[uint64, Rec], q *qx.QX) ([]uint64, 
 	if len(q.Order) == 0 {
 		sort.Slice(rows, func(i, j int) bool { return rows[i].id < rows[j].id })
 	} else {
-		prepared, viewQ, err := prepareTestQuery(db, q)
+		prepared, viewQ, err := prepareTestQuery(db.engine, q)
 		if err != nil {
 			return nil, err
 		}
 		defer prepared.Release()
 		o := viewQ.Order
-		f := testOrderFieldName(db, o)
+		f := testOrderFieldName(db.engine, o)
 		switch o.Kind {
 		case qir.OrderKindBasic:
 			less := func(a, b row) bool {
@@ -1098,13 +1098,13 @@ func expectedKeysString(t testing.TB, db *DB[string, Rec], q *qx.QX) ([]string, 
 	if len(q.Order) == 0 {
 		sort.Slice(rows, func(i, j int) bool { return rows[i].idx < rows[j].idx })
 	} else {
-		prepared, viewQ, err := prepareTestQuery(db, q)
+		prepared, viewQ, err := prepareTestQuery(db.engine, q)
 		if err != nil {
 			return nil, err
 		}
 		defer prepared.Release()
 		o := viewQ.Order
-		f := testOrderFieldName(db, o)
+		f := testOrderFieldName(db.engine, o)
 		switch o.Kind {
 		case qir.OrderKindBasic:
 			less := func(a, b row) bool {
@@ -1432,7 +1432,7 @@ func queryStringIDsEqual(q *qx.QX, a, b []string) bool {
 func preparedRouteViewUint64(src any) *queryView {
 	switch v := any(src).(type) {
 	case *DB[uint64, Rec]:
-		return v.currentQueryViewForTests()
+		return v.engine.currentQueryViewForTests()
 	case *queryView:
 		return v
 	default:
@@ -1443,7 +1443,7 @@ func preparedRouteViewUint64(src any) *queryView {
 func preparedRouteViewString(src any) *queryView {
 	switch v := any(src).(type) {
 	case *DB[string, Rec]:
-		return v.currentQueryViewForTests()
+		return v.engine.currentQueryViewForTests()
 	case *queryView:
 		return v
 	default:
@@ -1467,7 +1467,7 @@ func preparedRouteDBString(src any) *DB[string, Rec] {
 
 func preparePreparedRouteQuery(src any, q *qx.QX) (*qir.Query, qir.Shape, error) {
 	if db := preparedRouteDBUint64(src); db != nil {
-		return prepareTestQuery(db, q)
+		return prepareTestQuery(db.engine, q)
 	}
 	view := preparedRouteViewUint64(src)
 	prepared, err := qir.PrepareQuery(q, view.engine.indexedFieldMap)
@@ -1479,7 +1479,7 @@ func preparePreparedRouteQuery(src any, q *qx.QX) (*qir.Query, qir.Shape, error)
 
 func preparePreparedRouteQueryString(src any, q *qx.QX) (*qir.Query, qir.Shape, error) {
 	if db := preparedRouteDBString(src); db != nil {
-		return prepareTestQuery(db, q)
+		return prepareTestQuery(db.engine, q)
 	}
 	view := preparedRouteViewString(src)
 	prepared, err := qir.PrepareQuery(q, view.engine.indexedFieldMap)
@@ -2250,7 +2250,7 @@ func TestQuery_ArrayOrder_RandomMutations_MatchSeqScan(t *testing.T) {
 								vals := queryTestOrderValues(q)
 								var bits []string
 								for _, tag := range vals {
-									ids := db.fieldLookupPostingRetained("tags", tag)
+									ids := db.engine.currentQueryViewForTests().snap.fieldLookupPostingRetained("tags", tag)
 									gHas := ids.Contains(gid)
 									wHas := ids.Contains(wid)
 									bits = append(bits, fmt.Sprintf("%s:g=%v,w=%v", tag, gHas, wHas))
@@ -2272,7 +2272,7 @@ func TestQuery_ArrayOrder_RandomMutations_MatchSeqScan(t *testing.T) {
 								vals := queryTestOrderValues(q)
 								var bits []string
 								for _, country := range vals {
-									ids := db.fieldLookupPostingRetained("country", country)
+									ids := db.engine.currentQueryViewForTests().snap.fieldLookupPostingRetained("country", country)
 									gHas := ids.Contains(gid)
 									wHas := ids.Contains(wid)
 									bits = append(bits, fmt.Sprintf("%s:g=%v,w=%v", country, gHas, wHas))
@@ -2509,7 +2509,7 @@ func TestQuery_RandomMixedMultiWrites_MatchSeqScanModel(t *testing.T) {
 						vals := queryTestOrderValues(q)
 						var gm, wm []string
 						for _, country := range vals {
-							ids := db.fieldLookupPostingRetained("country", country)
+							ids := db.engine.currentQueryViewForTests().snap.fieldLookupPostingRetained("country", country)
 							gHas := ids.Contains(gid)
 							wHas := ids.Contains(wid)
 							gm = append(gm, fmt.Sprintf("%s=%v", country, gHas))
@@ -2555,7 +2555,7 @@ func TestQuery_RandomMixedMultiWrites_MatchSeqScanModel(t *testing.T) {
 						}
 						var gm, wm []string
 						for _, tag := range []string{"rust", "java", "infra", "go", "db"} {
-							ids := db.fieldLookupPostingRetained("tags", tag)
+							ids := db.engine.currentQueryViewForTests().snap.fieldLookupPostingRetained("tags", tag)
 							gHas := ids.Contains(gid)
 							wHas := ids.Contains(wid)
 							gm = append(gm, fmt.Sprintf("%s=%v", tag, gHas))
@@ -3225,7 +3225,7 @@ func TestQuery_Metamorphic_RandomizedProfiles_RouteEquivalence(t *testing.T) {
 					)
 				}
 
-				preparedCount, err := db.countPreparedExpr(normalizeQueryForTest(q).Filter)
+				preparedCount, err := db.engine.countPreparedExpr(normalizeQueryForTest(q).Filter)
 				if err != nil {
 					t.Fatalf("countPreparedExpr(profile=%s i=%d): %v\nq=%+v", p.name, i, err, q)
 				}
@@ -3386,7 +3386,7 @@ func TestRegression_MultiTermHAS_LeadSelfCheck_RouteAndCount(t *testing.T) {
 			_, prepared, _, _ := assertPreparedRouteEquivalence(t, db, tc.q)
 			assertQueryIDsEqual(t, tc.q, got, prepared)
 
-			cntPred, ok, err := db.tryCountByPredicates(tc.q.Filter, nil)
+			cntPred, ok, err := db.engine.tryCountByPredicates(tc.q.Filter, nil)
 			if err != nil {
 				t.Fatalf("tryCountByPredicates: %v", err)
 			}
@@ -3447,7 +3447,7 @@ func TestRegression_CountORByPredicates_MultiTermHASLead(t *testing.T) {
 		t.Fatalf("expectedKeysUint64: %v", err)
 	}
 
-	cntFast, ok, err := db.tryCountORByPredicates(q.Filter, nil)
+	cntFast, ok, err := db.engine.tryCountORByPredicates(q.Filter, nil)
 	if err != nil {
 		t.Fatalf("tryCountORByPredicates: %v", err)
 	}
@@ -3597,7 +3597,7 @@ func TestQuery_RouteEquivalence_PreparedExecutionPlanner_BaseAndMutated(t *testi
 			}
 
 			if q.Window.Limit == 0 && q.Window.Offset == 0 {
-				cnt, err := db.countPreparedExpr(nq.Filter)
+				cnt, err := db.engine.countPreparedExpr(nq.Filter)
 				if err != nil {
 					t.Fatalf("%s q%d countPreparedExpr: %v", label, i, err)
 				}

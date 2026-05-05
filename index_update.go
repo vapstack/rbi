@@ -89,7 +89,7 @@ func (db *DB[K, V]) checkUniqueBatchCandidateAndCollectSeen(
 		}
 	}
 
-	ids := db.getSnapshot().fieldLookupPostingRetained(acc.name, single)
+	ids := db.engine.getSnapshot().fieldLookupPostingRetained(acc.name, single)
 	if ids.IsEmpty() {
 		return append(seenWrites, uniqueSeenWrite{field: acc.name, key: single}), nil
 	}
@@ -351,7 +351,7 @@ func (db *DB[K, V]) checkUniqueBatchCandidate(
 	}
 	sm[single] = idx
 
-	ids := db.getSnapshot().fieldLookupPostingRetained(acc.name, single)
+	ids := db.engine.getSnapshot().fieldLookupPostingRetained(acc.name, single)
 	if ids.IsEmpty() {
 		return nil
 	}

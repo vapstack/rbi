@@ -1034,7 +1034,7 @@ func TestPlannerExt_Bug_ExecPlanORNoOrderAdaptive_PanicsOnAlwaysTrueBranch(t *te
 		).Limit(43),
 	)
 
-	branches, alwaysFalse, ok := db.buildORBranches(q.Filter.Args)
+	branches, alwaysFalse, ok := db.engine.buildORBranches(q.Filter.Args)
 	if !ok {
 		t.Fatalf("buildORBranches: ok=false q=%+v", q)
 	}
@@ -1056,7 +1056,7 @@ func TestPlannerExt_Bug_ExecPlanORNoOrderAdaptive_PanicsOnAlwaysTrueBranch(t *te
 		}
 	}()
 
-	if _, ok = db.execPlanORNoOrderAdaptive(q, branches, nil); !ok {
+	if _, ok = db.engine.execPlanORNoOrderAdaptive(q, branches, nil); !ok {
 		t.Fatalf("expected adaptive OR planner to return a result or degrade safely for q=%+v", q)
 	}
 }
@@ -1073,7 +1073,7 @@ func TestPlannerExt_Bug_ExecPlanORNoOrderBaseline_PanicsOnAlwaysTrueBranch(t *te
 		).Limit(43),
 	)
 
-	branches, alwaysFalse, ok := db.buildORBranches(q.Filter.Args)
+	branches, alwaysFalse, ok := db.engine.buildORBranches(q.Filter.Args)
 	if !ok {
 		t.Fatalf("buildORBranches: ok=false q=%+v", q)
 	}
@@ -1095,7 +1095,7 @@ func TestPlannerExt_Bug_ExecPlanORNoOrderBaseline_PanicsOnAlwaysTrueBranch(t *te
 		}
 	}()
 
-	if _, ok = db.execPlanORNoOrderBaseline(q, branches, nil); !ok {
+	if _, ok = db.engine.execPlanORNoOrderBaseline(q, branches, nil); !ok {
 		t.Fatalf("expected baseline OR planner to return a result or degrade safely for q=%+v", q)
 	}
 }
@@ -1128,7 +1128,7 @@ func TestPlannerExt_Property_OrderedORInternalPlansMatchSeqScan(t *testing.T) {
 			t.Fatalf("case=%d public planner mismatch:\nq=%+v\ngot=%v\nwant=%v", i, q, gotQuery, want)
 		}
 
-		branchesBasic, alwaysFalse, ok := db.buildORBranches(q.Filter.Args)
+		branchesBasic, alwaysFalse, ok := db.engine.buildORBranches(q.Filter.Args)
 		if !ok {
 			t.Fatalf("case=%d buildORBranches basic: ok=false q=%+v", i, q)
 		}
@@ -1139,7 +1139,7 @@ func TestPlannerExt_Property_OrderedORInternalPlansMatchSeqScan(t *testing.T) {
 			}
 			continue
 		}
-		gotBasic, okBasic := db.execPlanOROrderBasic(q, branchesBasic, nil)
+		gotBasic, okBasic := db.engine.execPlanOROrderBasic(q, branchesBasic, nil)
 		branchesBasic.Release()
 		if okBasic {
 			sawBasic++
@@ -1148,7 +1148,7 @@ func TestPlannerExt_Property_OrderedORInternalPlansMatchSeqScan(t *testing.T) {
 			}
 		}
 
-		branchesFallback, alwaysFalse, ok := db.buildORBranches(q.Filter.Args)
+		branchesFallback, alwaysFalse, ok := db.engine.buildORBranches(q.Filter.Args)
 		if !ok {
 			t.Fatalf("case=%d buildORBranches fallback: ok=false q=%+v", i, q)
 		}
@@ -1156,7 +1156,7 @@ func TestPlannerExt_Property_OrderedORInternalPlansMatchSeqScan(t *testing.T) {
 			branchesFallback.Release()
 			continue
 		}
-		gotFallback, okFallback, err := db.execPlanOROrderMergeFallback(q, branchesFallback, nil)
+		gotFallback, okFallback, err := db.engine.execPlanOROrderMergeFallback(q, branchesFallback, nil)
 		branchesFallback.Release()
 		if err != nil {
 			t.Fatalf("case=%d execPlanOROrderMergeFallback(%+v): %v", i, q, err)
@@ -1168,7 +1168,7 @@ func TestPlannerExt_Property_OrderedORInternalPlansMatchSeqScan(t *testing.T) {
 			}
 		}
 
-		branchesKWay, alwaysFalse, ok := db.buildORBranches(q.Filter.Args)
+		branchesKWay, alwaysFalse, ok := db.engine.buildORBranches(q.Filter.Args)
 		if !ok {
 			t.Fatalf("case=%d buildORBranches kway: ok=false q=%+v", i, q)
 		}
@@ -1176,7 +1176,7 @@ func TestPlannerExt_Property_OrderedORInternalPlansMatchSeqScan(t *testing.T) {
 			branchesKWay.Release()
 			continue
 		}
-		gotKWay, okKWay, err := db.execPlanOROrderKWay(q, branchesKWay, nil)
+		gotKWay, okKWay, err := db.engine.execPlanOROrderKWay(q, branchesKWay, nil)
 		branchesKWay.Release()
 		if err != nil {
 			t.Fatalf("case=%d execPlanOROrderKWay(%+v): %v", i, q, err)
@@ -1235,7 +1235,7 @@ func TestPlannerExt_Property_NoOrderORInternalPlansPreserveWindow(t *testing.T) 
 			t.Fatalf("case=%d expected full no-order result when limit covers all rows:\nq=%+v\ngot=%v\nfull=%v", i, q, gotQuery, full)
 		}
 
-		branchesAdaptive, alwaysFalse, ok := db.buildORBranches(q.Filter.Args)
+		branchesAdaptive, alwaysFalse, ok := db.engine.buildORBranches(q.Filter.Args)
 		if !ok {
 			t.Fatalf("case=%d buildORBranches adaptive: ok=false q=%+v", i, q)
 		}
@@ -1257,7 +1257,7 @@ func TestPlannerExt_Property_NoOrderORInternalPlansPreserveWindow(t *testing.T) 
 		if skipAdaptive {
 			branchesAdaptive.Release()
 		} else {
-			gotAdaptive, okAdaptive := db.execPlanORNoOrderAdaptive(q, branchesAdaptive, nil)
+			gotAdaptive, okAdaptive := db.engine.execPlanORNoOrderAdaptive(q, branchesAdaptive, nil)
 			branchesAdaptive.Release()
 			if okAdaptive {
 				sawAdaptive++
@@ -1270,7 +1270,7 @@ func TestPlannerExt_Property_NoOrderORInternalPlansPreserveWindow(t *testing.T) 
 			}
 		}
 
-		branchesBaseline, alwaysFalse, ok := db.buildORBranches(q.Filter.Args)
+		branchesBaseline, alwaysFalse, ok := db.engine.buildORBranches(q.Filter.Args)
 		if !ok {
 			t.Fatalf("case=%d buildORBranches baseline: ok=false q=%+v", i, q)
 		}
@@ -1290,7 +1290,7 @@ func TestPlannerExt_Property_NoOrderORInternalPlansPreserveWindow(t *testing.T) 
 			branchesBaseline.Release()
 			continue
 		}
-		gotBaseline, okBaseline := db.execPlanORNoOrderBaseline(q, branchesBaseline, nil)
+		gotBaseline, okBaseline := db.engine.execPlanORNoOrderBaseline(q, branchesBaseline, nil)
 		branchesBaseline.Release()
 		if okBaseline {
 			sawBaseline++
@@ -1404,7 +1404,7 @@ func TestPlannerExt_PlannerORNoOrderSortBranchOrderByAscendingScoreThenIndex(t *
 func TestPlannerExt_BuildORBranchesDropsFalseBranchAndKeepsTautology(t *testing.T) {
 	db := plannerExtOpenSeededDB(t, Options{AnalyzeInterval: -1})
 
-	branches, alwaysFalse, ok := db.buildORBranches([]qx.Expr{
+	branches, alwaysFalse, ok := db.engine.buildORBranches([]qx.Expr{
 		qx.NOT(qx.Expr{}),
 		qx.Expr{},
 	})
@@ -1423,7 +1423,7 @@ func TestPlannerExt_BuildORBranchesDropsFalseBranchAndKeepsTautology(t *testing.
 func TestPlannerExt_BuildORBranches_KeepsNegativeOnlyBranchWithoutLead(t *testing.T) {
 	db := plannerExtOpenSeededDB(t, Options{AnalyzeInterval: -1})
 
-	branches, alwaysFalse, ok := db.buildORBranches([]qx.Expr{
+	branches, alwaysFalse, ok := db.engine.buildORBranches([]qx.Expr{
 		qx.NOTIN("country", []string{"NL", "DE"}),
 		qx.AND(
 			qx.EQ("name", "alice"),

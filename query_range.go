@@ -573,9 +573,9 @@ func (qv *queryView) tryEvalNumericRangeBuckets(field string, fm *field, ov fiel
 		return postingResult{}, false
 	}
 
-	bucketSize := qv.options.NumericRangeBucketSize
-	minFieldKeys := qv.options.NumericRangeBucketMinFieldKeys
-	minSpan := qv.options.NumericRangeBucketMinSpanKeys
+	bucketSize := qv.engine.numericRangeBucketSize
+	minFieldKeys := qv.engine.numericRangeBucketMinFieldKeys
+	minSpan := qv.engine.numericRangeBucketMinSpanKeys
 	if bucketSize <= 0 || minFieldKeys <= 0 || minSpan <= 0 {
 		return postingResult{}, false
 	}
@@ -666,9 +666,9 @@ func (qv *queryView) tryLoadNumericRangeBuckets(field string, fm *field, ov fiel
 		return postingResult{}, false
 	}
 
-	bucketSize := qv.options.NumericRangeBucketSize
-	minFieldKeys := qv.options.NumericRangeBucketMinFieldKeys
-	minSpan := qv.options.NumericRangeBucketMinSpanKeys
+	bucketSize := qv.engine.numericRangeBucketSize
+	minFieldKeys := qv.engine.numericRangeBucketMinFieldKeys
+	minSpan := qv.engine.numericRangeBucketMinSpanKeys
 	if bucketSize <= 0 || minFieldKeys <= 0 || minSpan <= 0 {
 		return postingResult{}, false
 	}
