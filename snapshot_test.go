@@ -76,7 +76,7 @@ func TestSnapshotSequence_PreviousSnapshotIsRetiredAfterPublishWithoutPins(t *te
 		t.Fatalf("latest sequence did not advance: old=%d latest=%d", oldSequence, latest)
 	}
 
-	if _, _, ok := db.pinSnapshotRefBySeq(oldSequence); ok {
+	if _, _, ok := db.snapshot.pinRefBySeq(oldSequence); ok {
 		t.Fatalf("previous snapshot unexpectedly remained pinable: sequence=%d", oldSequence)
 	}
 }
@@ -290,7 +290,7 @@ func TestSnapshot_UnpinPrunesRegistryWhenLastReaderExits(t *testing.T) {
 	}
 	oldSeq := db.getSnapshot().seq
 
-	if _, ref, ok := db.pinSnapshotRefBySeq(oldSeq); !ok {
+	if _, ref, ok := db.snapshot.pinRefBySeq(oldSeq); !ok {
 		t.Fatalf("expected to pin previous snapshot")
 	} else {
 		if err := db.Set(2, &Rec{Name: "next", Age: 20}); err != nil {
@@ -306,7 +306,7 @@ func TestSnapshot_UnpinPrunesRegistryWhenLastReaderExits(t *testing.T) {
 			t.Fatalf("expected pinned snapshot to keep registry entry alive before unpin")
 		}
 
-		db.unpinSnapshotRef(oldSeq, ref)
+		db.snapshot.unpinRef(oldSeq, ref)
 
 		db.snapshot.mu.RLock()
 		_, oldPresentAfterUnpin := db.snapshot.bySeq[oldSeq]
@@ -343,7 +343,9 @@ func TestSnapshotReleaseOwnedStorage_SkipsLiveSharedFlatRoot(t *testing.T) {
 
 	oldRef := &snapshotRef{snap: old}
 	currentRef := &snapshotRef{snap: current}
-	db := &DB[uint64, struct{}]{}
+	db := &DB[uint64, struct{}]{
+		snapshot: new(snapshotManager),
+	}
 	db.snapshot.bySeq = map[uint64]*snapshotRef{
 		old.seq:     oldRef,
 		current.seq: currentRef,
@@ -352,7 +354,7 @@ func TestSnapshotReleaseOwnedStorage_SkipsLiveSharedFlatRoot(t *testing.T) {
 	db.snapshot.currentRef.Store(currentRef)
 
 	db.snapshot.mu.Lock()
-	retired := db.releaseRetiredSnapshotRefLocked(old.seq, oldRef)
+	retired := db.snapshot.releaseRetiredSnapshotRefLocked(old.seq, oldRef)
 	db.snapshot.mu.Unlock()
 	releaseRetiredSnapshots(retired)
 	if !snapshotExtFieldContainsID(t, current, "f", "shared", 1) {
@@ -397,11 +399,11 @@ func TestSnapshotFromEmptyBase_PublishedUniverseGetsOwnerAndPinnedScanStaysStabl
 	if old.universeOwner == nil {
 		t.Fatal("expected from-empty published snapshot to own universe")
 	}
-	pinned, ref, ok := db.pinSnapshotRefBySeq(old.seq)
+	pinned, ref, ok := db.snapshot.pinRefBySeq(old.seq)
 	if !ok || pinned != old {
 		t.Fatal("expected seeded snapshot to be pinnable")
 	}
-	defer db.unpinSnapshotRef(old.seq, ref)
+	defer db.snapshot.unpinRef(old.seq, ref)
 
 	expect := slices.Clone(keys)
 	checkPinned := func() {
@@ -599,19 +601,19 @@ func snapshotExtEvalNumericRangeBuckets(t *testing.T, db *DB[uint64, Rec], expr 
 	}
 	defer prepared.Release()
 
-	field := db.fieldNameByOrdinal(compiled.FieldOrdinal)
-	fm := db.indexFields[field]
+	f := db.engine.fieldNameByOrdinal(compiled.FieldOrdinal)
+	fm := db.indexFields[f]
 	if fm == nil {
-		t.Fatalf("expected %q field metadata", field)
+		t.Fatalf("expected %q field metadata", f)
 	}
-	ov := db.fieldOverlay(field)
+	ov := db.fieldOverlay(f)
 	if !ov.hasData() {
-		t.Fatalf("expected %q field index data", field)
+		t.Fatalf("expected %q field index data", f)
 	}
 
 	key, isSlice, isNil, err := db.exprValueToIdxScalar(expr)
 	if err != nil {
-		t.Fatalf("exprValueToIdxScalar(%s): %v", field, err)
+		t.Fatalf("exprValueToIdxScalar(%s): %v", f, err)
 	}
 	if isSlice || isNil {
 		t.Fatalf("unexpected scalar flags: isSlice=%v isNil=%v", isSlice, isNil)
@@ -622,9 +624,9 @@ func snapshotExtEvalNumericRangeBuckets(t *testing.T, db *DB[uint64, Rec], expr 
 		t.Fatalf("rangeBoundsForOp(%v) failed", compiled.Op)
 	}
 
-	out, ok := db.tryEvalNumericRangeBuckets(field, fm, ov, ov.rangeForBounds(rb))
+	out, ok := db.tryEvalNumericRangeBuckets(f, fm, ov, ov.rangeForBounds(rb))
 	if !ok {
-		t.Fatalf("expected numeric range bucket path for %q", field)
+		t.Fatalf("expected numeric range bucket path for %q", f)
 	}
 	out.release()
 }
@@ -683,15 +685,15 @@ func TestSnapshotExt_PublishSameSeqReusesRefAndUpdatesCurrent(t *testing.T) {
 	db, _ := openTempDBUint64(t, snapshotExtOptions())
 
 	first := &indexSnapshot{seq: 7, universe: posting.List{}}
-	db.publishSnapshotRef(first)
+	db.snapshot.publishRef(first)
 
-	gotFirst, ref, ok := db.pinSnapshotRefBySeq(first.seq)
+	gotFirst, ref, ok := db.snapshot.pinRefBySeq(first.seq)
 	if !ok || gotFirst != first {
 		t.Fatalf("expected first snapshot to be pinnable")
 	}
 
 	second := &indexSnapshot{seq: first.seq, universe: posting.List{}}
-	db.publishSnapshotRef(second)
+	db.snapshot.publishRef(second)
 
 	if got := db.getSnapshot(); got != second {
 		t.Fatalf("expected current snapshot to be replaced on same-seq publish")
@@ -709,13 +711,13 @@ func TestSnapshotExt_PublishSameSeqReusesRefAndUpdatesCurrent(t *testing.T) {
 		t.Fatalf("expected single registry entry after same-seq publish, got=%d", registrySize)
 	}
 
-	gotSecond, ref2, ok := db.pinSnapshotRefBySeq(first.seq)
+	gotSecond, ref2, ok := db.snapshot.pinRefBySeq(first.seq)
 	if !ok || gotSecond != second || ref2 != ref {
 		t.Fatalf("expected second snapshot to reuse same ref")
 	}
 
-	db.unpinSnapshotRef(first.seq, ref)
-	db.unpinSnapshotRef(first.seq, ref2)
+	db.snapshot.unpinRef(first.seq, ref)
+	db.snapshot.unpinRef(first.seq, ref2)
 
 	db.snapshot.mu.RLock()
 	_, stillPresent := db.snapshot.bySeq[first.seq]
@@ -729,14 +731,14 @@ func TestSnapshotExt_DropStagedSnapshotPinnedEntryBecomesUnpinnableUntilUnpin(t 
 	db, _ := openTempDBUint64(t, snapshotExtOptions())
 
 	staged := &indexSnapshot{seq: 11}
-	db.stageSnapshot(staged)
+	db.snapshot.stage(staged)
 
-	got, ref, ok := db.pinSnapshotRefBySeq(staged.seq)
+	got, ref, ok := db.snapshot.pinRefBySeq(staged.seq)
 	if !ok || got != staged {
 		t.Fatalf("expected staged snapshot to be pinnable before drop")
 	}
 
-	db.dropStagedSnapshot(staged.seq)
+	db.snapshot.dropStaged(staged.seq)
 
 	db.snapshot.mu.RLock()
 	held := db.snapshot.bySeq[staged.seq]
@@ -745,11 +747,11 @@ func TestSnapshotExt_DropStagedSnapshotPinnedEntryBecomesUnpinnableUntilUnpin(t 
 		t.Fatalf("expected dropped pinned staged snapshot to keep ref but clear snap")
 	}
 
-	if _, _, ok := db.pinSnapshotRefBySeq(staged.seq); ok {
+	if _, _, ok = db.snapshot.pinRefBySeq(staged.seq); ok {
 		t.Fatalf("expected dropped staged snapshot to become unpinnable")
 	}
 
-	db.unpinSnapshotRef(staged.seq, ref)
+	db.snapshot.unpinRef(staged.seq, ref)
 
 	db.snapshot.mu.RLock()
 	_, stillPresent := db.snapshot.bySeq[staged.seq]
@@ -763,8 +765,8 @@ func TestSnapshotExt_DropStagedSnapshotUnpinnedDeletesEntry(t *testing.T) {
 	db, _ := openTempDBUint64(t, snapshotExtOptions())
 
 	staged := &indexSnapshot{seq: 12}
-	db.stageSnapshot(staged)
-	db.dropStagedSnapshot(staged.seq)
+	db.snapshot.stage(staged)
+	db.snapshot.dropStaged(staged.seq)
 
 	db.snapshot.mu.RLock()
 	_, present := db.snapshot.bySeq[staged.seq]
@@ -779,14 +781,14 @@ func TestSnapshotExt_RetirePinnedPublishedSnapshotNilsEntryUntilUnpin(t *testing
 
 	first := &indexSnapshot{seq: 1, universe: posting.List{}}
 	second := &indexSnapshot{seq: 2, universe: posting.List{}}
-	db.publishSnapshotRef(first)
+	db.snapshot.publishRef(first)
 
-	got, ref, ok := db.pinSnapshotRefBySeq(first.seq)
+	got, ref, ok := db.snapshot.pinRefBySeq(first.seq)
 	if !ok || got != first {
 		t.Fatalf("expected first snapshot to be pinnable")
 	}
 
-	db.publishSnapshotRef(second)
+	db.snapshot.publishRef(second)
 
 	db.snapshot.mu.RLock()
 	oldHeld := db.snapshot.bySeq[first.seq]
@@ -799,11 +801,11 @@ func TestSnapshotExt_RetirePinnedPublishedSnapshotNilsEntryUntilUnpin(t *testing
 	if !nextPresent {
 		t.Fatalf("expected latest snapshot to remain registered")
 	}
-	if _, _, ok := db.pinSnapshotRefBySeq(first.seq); ok {
+	if _, _, ok = db.snapshot.pinRefBySeq(first.seq); ok {
 		t.Fatalf("expected retired pinned snapshot to stop accepting new pins")
 	}
 
-	db.unpinSnapshotRef(first.seq, ref)
+	db.snapshot.unpinRef(first.seq, ref)
 
 	db.snapshot.mu.RLock()
 	_, oldPresent := db.snapshot.bySeq[first.seq]
@@ -824,7 +826,7 @@ func TestSnapshotExt_SnapshotStatsTracksPinnedRefAcrossPublish(t *testing.T) {
 		t.Fatalf("Set(1): %v", err)
 	}
 	oldSeq := db.getSnapshot().seq
-	if _, ref, ok := db.pinSnapshotRefBySeq(oldSeq); !ok {
+	if _, ref, ok := db.snapshot.pinRefBySeq(oldSeq); !ok {
 		t.Fatalf("expected current snapshot to be pinnable")
 	} else {
 		before := db.SnapshotStats()
@@ -844,7 +846,7 @@ func TestSnapshotExt_SnapshotStatsTracksPinnedRefAcrossPublish(t *testing.T) {
 			t.Fatalf("unexpected stats with pinned retired snapshot: %+v", mid)
 		}
 
-		db.unpinSnapshotRef(oldSeq, ref)
+		db.snapshot.unpinRef(oldSeq, ref)
 
 		after := db.SnapshotStats()
 		if after.RegistrySize != 1 || after.PinnedRefs != 0 {
@@ -862,15 +864,15 @@ func TestSnapshotExt_BeginQueryTxSnapshotIgnoresStagedFutureSnapshot(t *testing.
 
 	current := db.getSnapshot()
 	staged := &indexSnapshot{seq: current.seq + 1}
-	db.stageSnapshot(staged)
-	defer db.dropStagedSnapshot(staged.seq)
+	db.snapshot.stage(staged)
+	defer db.snapshot.dropStaged(staged.seq)
 
 	tx, snap, seq, ref, err := db.beginQueryTxSnapshot()
 	if err != nil {
 		t.Fatalf("beginQueryTxSnapshot: %v", err)
 	}
 	defer rollback(tx)
-	defer db.unpinSnapshotRef(seq, ref)
+	defer db.snapshot.unpinRef(seq, ref)
 
 	if seq != current.seq {
 		t.Fatalf("query tx pinned wrong sequence: got=%d want=%d", seq, current.seq)
@@ -907,7 +909,7 @@ func TestSnapshotExt_BeginQueryTxSnapshotSeesOldStateWhileNewSnapshotPublished(t
 	}
 
 	rollback(tx)
-	db.unpinSnapshotRef(seq, ref)
+	db.snapshot.unpinRef(seq, ref)
 
 	if err := <-done; err != nil {
 		t.Fatalf("Set(2): %v", err)
@@ -933,11 +935,11 @@ func TestSnapshotExt_OldSnapshotFieldLookupImmutableAcrossSetUpdate(t *testing.T
 	}
 
 	s1 := db.getSnapshot()
-	pinnedS1, ref, ok := db.pinSnapshotRefBySeq(s1.seq)
+	pinnedS1, ref, ok := db.snapshot.pinRefBySeq(s1.seq)
 	if !ok || pinnedS1 != s1 {
 		t.Fatalf("expected old snapshot to be pinnable")
 	}
-	defer db.unpinSnapshotRef(s1.seq, ref)
+	defer db.snapshot.unpinRef(s1.seq, ref)
 
 	if err := db.Set(2, &Rec{Name: "charlie", Age: 20}); err != nil {
 		t.Fatalf("Set(update): %v", err)
@@ -966,11 +968,11 @@ func TestSnapshotExt_OldSnapshotLenIndexImmutableAcrossSetUpdate(t *testing.T) {
 	}
 
 	s1 := db.getSnapshot()
-	pinnedS1, ref, ok := db.pinSnapshotRefBySeq(s1.seq)
+	pinnedS1, ref, ok := db.snapshot.pinRefBySeq(s1.seq)
 	if !ok || pinnedS1 != s1 {
 		t.Fatalf("expected old snapshot to be pinnable")
 	}
-	defer db.unpinSnapshotRef(s1.seq, ref)
+	defer db.snapshot.unpinRef(s1.seq, ref)
 
 	if err := db.Set(1, &Rec{Name: "alice", Tags: []string{"go"}}); err != nil {
 		t.Fatalf("Set(update): %v", err)
@@ -1006,11 +1008,11 @@ func TestSnapshotExt_ZeroComplementLenIndexImmutableAcrossPatchToEmpty(t *testin
 	}
 
 	s1 := db.getSnapshot()
-	pinnedS1, ref, ok := db.pinSnapshotRefBySeq(s1.seq)
+	pinnedS1, ref, ok := db.snapshot.pinRefBySeq(s1.seq)
 	if !ok || pinnedS1 != s1 {
 		t.Fatalf("expected old snapshot to be pinnable")
 	}
-	defer db.unpinSnapshotRef(s1.seq, ref)
+	defer db.snapshot.unpinRef(s1.seq, ref)
 	if !snapshotTestLenZeroComplementField(pinnedS1, "tags") {
 		t.Fatalf("expected zero-complement len index for sparse non-empty tags")
 	}
@@ -1039,11 +1041,11 @@ func TestSnapshotExt_OldSnapshotNilIndexImmutableAcrossPatch(t *testing.T) {
 	}
 
 	s1 := db.getSnapshot()
-	pinnedS1, ref, ok := db.pinSnapshotRefBySeq(s1.seq)
+	pinnedS1, ref, ok := db.snapshot.pinRefBySeq(s1.seq)
 	if !ok || pinnedS1 != s1 {
 		t.Fatalf("expected old snapshot to be pinnable")
 	}
-	defer db.unpinSnapshotRef(s1.seq, ref)
+	defer db.snapshot.unpinRef(s1.seq, ref)
 	val := "zzz"
 	if err := db.Patch(1, []Field{{Name: "opt", Value: &val}}); err != nil {
 		t.Fatalf("Patch(opt): %v", err)
@@ -1072,11 +1074,11 @@ func TestSnapshotExt_OldSnapshotUniverseImmutableAcrossDelete(t *testing.T) {
 	}
 
 	s1 := db.getSnapshot()
-	pinnedS1, ref, ok := db.pinSnapshotRefBySeq(s1.seq)
+	pinnedS1, ref, ok := db.snapshot.pinRefBySeq(s1.seq)
 	if !ok || pinnedS1 != s1 {
 		t.Fatalf("expected old snapshot to be pinnable")
 	}
-	defer db.unpinSnapshotRef(s1.seq, ref)
+	defer db.snapshot.unpinRef(s1.seq, ref)
 	if err := db.Delete(2); err != nil {
 		t.Fatalf("Delete(2): %v", err)
 	}
@@ -1102,7 +1104,7 @@ func TestSnapshotExt_PinnedSnapshotSurvivesTruncateAndPrunesAfterUnpin(t *testin
 
 	old := db.getSnapshot()
 	oldSeq := old.seq
-	pinned, ref, ok := db.pinSnapshotRefBySeq(oldSeq)
+	pinned, ref, ok := db.snapshot.pinRefBySeq(oldSeq)
 	if !ok || pinned != old {
 		t.Fatalf("expected current snapshot to be pinnable before truncate")
 	}
@@ -1133,7 +1135,7 @@ func TestSnapshotExt_PinnedSnapshotSurvivesTruncateAndPrunesAfterUnpin(t *testin
 		t.Fatalf("expected current snapshot to be empty after truncate, got=%v", keys)
 	}
 
-	db.unpinSnapshotRef(oldSeq, ref)
+	db.snapshot.unpinRef(oldSeq, ref)
 
 	db.snapshot.mu.RLock()
 	_, oldPresent := db.snapshot.bySeq[oldSeq]
@@ -1162,7 +1164,7 @@ func TestSnapshotExt_StringKeyPinnedSnapshotStrMapSurvivesTruncate(t *testing.T)
 	if !ok || idx1 == 0 {
 		t.Fatalf("expected k1 mapping before truncate")
 	}
-	pinned, ref, ok := db.pinSnapshotRefBySeq(old.seq)
+	pinned, ref, ok := db.snapshot.pinRefBySeq(old.seq)
 	if !ok || pinned != old {
 		t.Fatalf("expected pre-truncate snapshot to be pinnable")
 	}
@@ -1179,7 +1181,7 @@ func TestSnapshotExt_StringKeyPinnedSnapshotStrMapSurvivesTruncate(t *testing.T)
 		t.Fatalf("pinned pre-truncate snapshot lost k1 mapping: got=%q ok=%v", got, ok)
 	}
 
-	db.unpinSnapshotRef(old.seq, ref)
+	db.snapshot.unpinRef(old.seq, ref)
 }
 
 func TestSnapshotExt_StringKeyOldSnapshotMappingsSurviveDeleteAndNewKeys(t *testing.T) {
@@ -1684,7 +1686,7 @@ func TestSnapshotExt_InheritMaterializedPredCacheSkipsChangedFieldsAndKeepsOther
 	changed := snapshotTestBoolSlots(map[string]bool{"name": true}, db.indexedFieldMap)
 	defer fieldIndexBoolSlicePool.Put(changed)
 
-	inheritMaterializedPredCache(db, next, prev, changed)
+	inheritMaterializedPredCache(next, prev, db.indexedFieldMap, changed)
 
 	if _, ok := next.loadMaterializedPred("name\x1f1\x1fa"); ok {
 		t.Fatalf("expected changed-field cache entry to be skipped")
@@ -1703,7 +1705,7 @@ func TestSnapshotExt_InheritMaterializedPredCacheSkipsFieldlessKeys(t *testing.T
 
 	next := &indexSnapshot{matPredCacheMaxEntries: 8}
 	snapshotExtInitMaterializedPredCache(next)
-	inheritMaterializedPredCache[uint64, struct{}](nil, next, prev, nil)
+	inheritMaterializedPredCache(next, prev, nil, nil)
 
 	if got := next.matPredCacheCount.Load(); got != 1 {
 		t.Fatalf("expected exactly one valid inherited entry, got=%d", got)
@@ -1722,7 +1724,7 @@ func TestSnapshotExt_InheritMaterializedPredCacheAllowsTypedNilEntries(t *testin
 
 	next := &indexSnapshot{matPredCacheMaxEntries: 8}
 	snapshotExtInitMaterializedPredCache(next)
-	inheritMaterializedPredCache[uint64, struct{}](nil, next, prev, nil)
+	inheritMaterializedPredCache(next, prev, nil, nil)
 
 	if got := next.matPredCacheCount.Load(); got != 1 {
 		t.Fatalf("expected typed-nil entry to be inherited as negative cache entry, got=%d", got)
@@ -1746,7 +1748,7 @@ func TestSnapshotExt_InheritMaterializedPredCacheClampsOversizedCount(t *testing
 		matPredCacheMaxCard:    1,
 	}
 	snapshotExtInitMaterializedPredCache(next)
-	inheritMaterializedPredCache[uint64, struct{}](nil, next, prev, nil)
+	inheritMaterializedPredCache(next, prev, nil, nil)
 
 	if got := next.matPredCacheCount.Load(); got != 3 {
 		t.Fatalf("expected all entries to be inherited before oversized clamp, got=%d", got)
@@ -1771,7 +1773,7 @@ func TestSnapshotExt_InheritMaterializedPredCachePreservesRecencyStamps(t *testi
 
 	next := &indexSnapshot{matPredCacheMaxEntries: 8}
 	snapshotExtInitMaterializedPredCache(next)
-	inheritMaterializedPredCache[uint64, struct{}](nil, next, prev, nil)
+	inheritMaterializedPredCache(next, prev, nil, nil)
 
 	gotA, ok := snapshotExtLoadMaterializedPredEntry(t, next, "email\x1f1\x1fa")
 	if !ok {
@@ -1906,11 +1908,11 @@ func TestSpanshotExt_ScanKeysStringShouldStayOnSingleSnapshotAcrossTruncate(t *t
 	if old == nil || old.strmap == nil {
 		t.Fatalf("expected published string-key snapshot")
 	}
-	pinned, ref, ok := db.pinSnapshotRefBySeq(old.seq)
+	pinned, ref, ok := db.snapshot.pinRefBySeq(old.seq)
 	if !ok || pinned != old {
 		t.Fatalf("expected current string snapshot to be pinnable")
 	}
-	defer db.unpinSnapshotRef(old.seq, ref)
+	defer db.snapshot.unpinRef(old.seq, ref)
 
 	var want []string
 	iterOld := pinned.universe.Iter()
@@ -1959,11 +1961,11 @@ func TestSpanshotExt_ScanKeysStringSplitSnapshotMustNotEmitFutureKeysAfterTrunca
 	}
 
 	old := db.getSnapshot()
-	pinned, ref, ok := db.pinSnapshotRefBySeq(old.seq)
+	pinned, ref, ok := db.snapshot.pinRefBySeq(old.seq)
 	if !ok || pinned != old {
 		t.Fatalf("expected current string snapshot to be pinnable")
 	}
-	defer db.unpinSnapshotRef(old.seq, ref)
+	defer db.snapshot.unpinRef(old.seq, ref)
 	universe := pinned.universe
 	iter := universe.Iter()
 	defer iter.Release()
@@ -2023,7 +2025,7 @@ func TestSpanshotExt_BeginQueryTxSnapshotSurvivesConcurrentTruncate(t *testing.T
 	}
 
 	rollback(tx)
-	db.unpinSnapshotRef(seq, ref)
+	db.snapshot.unpinRef(seq, ref)
 
 	if err := <-done; err != nil {
 		t.Fatalf("Truncate: %v", err)
@@ -2081,7 +2083,7 @@ func TestSpanshotExt_BeginQueryTxSnapshotSurvivesBrokenTruncatePublish(t *testin
 	}
 
 	rollback(tx)
-	db.unpinSnapshotRef(seq, ref)
+	db.snapshot.unpinRef(seq, ref)
 
 	err = <-done
 	if !errors.Is(err, ErrBroken) {

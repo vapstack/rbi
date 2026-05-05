@@ -1340,21 +1340,27 @@ func TestQuery_RouteEquivalence_StringKeys_Randomized(t *testing.T) {
 		if err != nil {
 			t.Fatalf("step=%d QueryKeys(%+v): %v", step, q, err)
 		}
-		wantPage, err := expectedKeysString(t, db, q)
-		if err != nil {
-			t.Fatalf("step=%d expectedKeysString(page %+v): %v", step, q, err)
-		}
+		var wantPage []string
+		var wantFull []string
 		if len(q.Order) == 0 && (q.Window.Offset > 0 || q.Window.Limit > 0) {
 			fullQ := cloneQuery(q)
 			fullQ.Window.Offset = 0
 			fullQ.Window.Limit = 0
-			wantFull, err := expectedKeysString(t, db, fullQ)
+			var err error
+			wantFull, err = expectedKeysString(t, db, fullQ)
 			if err != nil {
 				t.Fatalf("step=%d expectedKeysString(full %+v): %v", step, q, err)
 			}
 			assertNoOrderWindowSubsetString(t, q, gotKeys, wantFull, fmt.Sprintf("step=%d QueryKeys", step))
-		} else if !slices.Equal(gotKeys, wantPage) {
-			t.Fatalf("step=%d page mismatch q=%+v\ngot=%v\nwant=%v", step, q, gotKeys, wantPage)
+		} else {
+			var err error
+			wantPage, err = expectedKeysString(t, db, q)
+			if err != nil {
+				t.Fatalf("step=%d expectedKeysString(page %+v): %v", step, q, err)
+			}
+			if !slices.Equal(gotKeys, wantPage) {
+				t.Fatalf("step=%d page mismatch q=%+v\ngot=%v\nwant=%v", step, q, gotKeys, wantPage)
+			}
 		}
 
 		gotItems, err := db.Query(q)
@@ -1381,16 +1387,25 @@ func TestQuery_RouteEquivalence_StringKeys_Randomized(t *testing.T) {
 		countQ.Order = nil
 		countQ.Window.Offset = 0
 		countQ.Window.Limit = 0
-		wantAll, err := expectedKeysString(t, db, countQ)
-		if err != nil {
-			t.Fatalf("step=%d expectedKeysString(all %+v): %v", step, q, err)
+		wantCount := 0
+		switch {
+		case q.Window.Offset == 0 && q.Window.Limit == 0:
+			wantCount = len(wantPage)
+		case wantFull != nil:
+			wantCount = len(wantFull)
+		default:
+			wantAll, err := expectedKeysString(t, db, countQ)
+			if err != nil {
+				t.Fatalf("step=%d expectedKeysString(all %+v): %v", step, q, err)
+			}
+			wantCount = len(wantAll)
 		}
 		cnt, err := db.Count(q.Filter)
 		if err != nil {
 			t.Fatalf("step=%d Count(%+v): %v", step, q, err)
 		}
-		if cnt != uint64(len(wantAll)) {
-			t.Fatalf("step=%d count mismatch q=%+v got=%d want=%d", step, q, cnt, len(wantAll))
+		if cnt != uint64(wantCount) {
+			t.Fatalf("step=%d count mismatch q=%+v got=%d want=%d", step, q, cnt, wantCount)
 		}
 	}
 }
@@ -1407,6 +1422,9 @@ func queryStringIDsEqual(q *qx.QX, a, b []string) bool {
 	}
 	if len(q.Order) > 0 {
 		return slices.Equal(a, b)
+	}
+	if slices.Equal(a, b) {
+		return true
 	}
 	return slices.Equal(sortedStringIDs(a), sortedStringIDs(b))
 }
@@ -2054,6 +2072,8 @@ func TestQuery_ArrayOrder_RandomMutations_MatchSeqScan(t *testing.T) {
 	for _, tc := range cases {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
 			db, _ := openTempDBUint64(t)
 			_ = seedData(t, db, 420)
 
@@ -2673,6 +2693,9 @@ func queryIDsEqual(q *qx.QX, a, b []uint64) bool {
 	if len(q.Order) > 0 {
 		return slices.Equal(a, b)
 	}
+	if slices.Equal(a, b) {
+		return true
+	}
 
 	sa := sortedIDs(a)
 	sb := sortedIDs(b)
@@ -3149,6 +3172,8 @@ func TestQuery_Metamorphic_RandomizedProfiles_RouteEquivalence(t *testing.T) {
 	for pi := range profiles {
 		p := profiles[pi]
 		t.Run(p.name, func(t *testing.T) {
+			t.Parallel()
+
 			db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
 			seedMetamorphicDataProfile(t, db, 8_000, p)
 

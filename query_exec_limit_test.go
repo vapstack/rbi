@@ -718,7 +718,7 @@ func (qv *queryView) baselineTryQueryRangeNoOrderWithLimit(q *qx.QX) ([]uint64, 
 		return nil, false, nil
 	}
 
-	f := qv.fieldNameByOrdinal(e.FieldOrdinal)
+	f := qv.engine.fieldNameByOrdinal(e.FieldOrdinal)
 	if f == "" {
 		return nil, false, nil
 	}
@@ -809,7 +809,7 @@ func (qv *queryView) baselineTryQueryPrefixNoOrderWithLimit(q *qx.QX) ([]uint64,
 	}
 
 	e := viewQ.Expr
-	f := qv.fieldNameByOrdinal(e.FieldOrdinal)
+	f := qv.engine.fieldNameByOrdinal(e.FieldOrdinal)
 	if e.Op != qir.OpPREFIX || f == "" {
 		return nil, false, nil
 	}
@@ -1111,7 +1111,7 @@ func TestQuery_LimitRangeNoOrder_ResidualsUseBucketExactFilter(t *testing.T) {
 	}
 	defer preparedQ.Release()
 
-	tr := db.beginTrace(viewQ)
+	tr := db.engine.beginTrace(viewQ)
 	if tr == nil {
 		t.Fatalf("expected trace to be enabled")
 	}
@@ -1210,7 +1210,7 @@ func TestQuery_LimitOrderBasic_ResidualsUseBucketExactFilter(t *testing.T) {
 	}
 	defer preparedQ.Release()
 
-	tr := db.beginTrace(viewQ)
+	tr := db.engine.beginTrace(viewQ)
 	if tr == nil {
 		t.Fatalf("expected trace to be enabled")
 	}

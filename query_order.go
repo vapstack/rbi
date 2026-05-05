@@ -480,7 +480,7 @@ func (qv *queryView) queryOrderArrayPosOverlay(result postingResult, ov fieldOve
 		return nil, err
 	}
 	if fm := qv.fieldMetaByOrder(o); fm != nil && !fm.Slice {
-		return qv.queryOrderArrayPosScalarOverlay(result, qv.fieldNameByOrdinal(o.FieldOrdinal), o.FieldOrdinal, ov, vals, o.Desc, skip, need, all)
+		return qv.queryOrderArrayPosScalarOverlay(result, qv.engine.fieldNameByOrdinal(o.FieldOrdinal), o.FieldOrdinal, ov, vals, o.Desc, skip, need, all)
 	}
 
 	out := makeOutSlice(resultCard, need)

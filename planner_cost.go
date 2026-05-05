@@ -193,7 +193,7 @@ func (qv *queryView) buildOROrderAnalysis(q *qir.Shape, branches plannerORBranch
 	if snapshotUniverse == 0 {
 		return analysis, false
 	}
-	orderField := qv.fieldNameByOrdinal(order.FieldOrdinal)
+	orderField := qv.engine.fieldNameByOrdinal(order.FieldOrdinal)
 	branchCount := branches.Len()
 	if branchCount > plannerORBranchLimit {
 		branchCount = plannerORBranchLimit
@@ -1000,7 +1000,7 @@ func (qv *queryView) collectMergedBaseScalarRangeFields(
 	dst []mergedBaseScalarRangeField,
 ) ([]mergedBaseScalarRangeField, bool) {
 	for _, e := range leaves {
-		fieldName := qv.fieldNameByOrdinal(e.FieldOrdinal)
+		fieldName := qv.engine.fieldNameByOrdinal(e.FieldOrdinal)
 		if e.Not || e.FieldOrdinal < 0 || fieldName == orderField || len(e.Operands) != 0 || !isScalarRangeEqOp(e.Op) {
 			continue
 		}
@@ -1039,7 +1039,7 @@ func (qv *queryView) collectMergedBaseScalarRangeFieldsBuf(
 ) ([]mergedBaseScalarRangeField, bool) {
 	for i := 0; i < leaves.Len(); i++ {
 		e := leaves.Get(i)
-		fieldName := qv.fieldNameByOrdinal(e.FieldOrdinal)
+		fieldName := qv.engine.fieldNameByOrdinal(e.FieldOrdinal)
 		if e.Not || e.FieldOrdinal < 0 || fieldName == orderField || len(e.Operands) != 0 || !isScalarRangeEqOp(e.Op) {
 			continue
 		}
@@ -1140,7 +1140,7 @@ func (qv *queryView) executionOrderShapeInfo(orderField string, leaves []qir.Exp
 			continue
 		}
 		if e.Not {
-			fieldName := qv.fieldNameByOrdinal(e.FieldOrdinal)
+			fieldName := qv.engine.fieldNameByOrdinal(e.FieldOrdinal)
 			if e.FieldOrdinal < 0 || fieldName == orderField {
 				return false, false
 			}
@@ -1172,7 +1172,7 @@ func (qv *queryView) executionOrderShapeInfoBuf(orderField string, leaves *poole
 			continue
 		}
 		if e.Not {
-			fieldName := qv.fieldNameByOrdinal(e.FieldOrdinal)
+			fieldName := qv.engine.fieldNameByOrdinal(e.FieldOrdinal)
 			if e.FieldOrdinal < 0 || fieldName == orderField {
 				return false, false
 			}
@@ -1219,7 +1219,7 @@ func (qv *queryView) decideExecutionOrderByCost(q *qir.Shape, leaves []qir.Expr)
 	if o.Kind != qir.OrderKindBasic || o.FieldOrdinal < 0 {
 		return d
 	}
-	orderField := qv.fieldNameByOrdinal(o.FieldOrdinal)
+	orderField := qv.engine.fieldNameByOrdinal(o.FieldOrdinal)
 
 	fm := qv.fieldMetaByOrder(o)
 	if fm == nil || fm.Slice {
@@ -1347,7 +1347,7 @@ func (qv *queryView) decideExecutionOrderByCostBuf(q *qir.Shape, leaves *pooled.
 	if o.Kind != qir.OrderKindBasic || o.FieldOrdinal < 0 {
 		return d
 	}
-	orderField := qv.fieldNameByOrdinal(o.FieldOrdinal)
+	orderField := qv.engine.fieldNameByOrdinal(o.FieldOrdinal)
 
 	fm := qv.fieldMetaByOrder(o)
 	if fm == nil || fm.Slice {
@@ -1476,8 +1476,8 @@ func (qv *queryView) shouldPreferExecutionPlan(q *qir.Shape, trace *queryTrace) 
 
 	if q.Offset == 0 && q.HasOrder && q.Order.Kind == qir.OrderKindBasic && len(leaves) == 1 {
 		e := leaves[0]
-		orderField := qv.fieldNameByOrdinal(q.Order.FieldOrdinal)
-		if !e.Not && e.FieldOrdinal >= 0 && qv.fieldNameByOrdinal(e.FieldOrdinal) != orderField && len(e.Operands) == 0 {
+		orderField := qv.engine.fieldNameByOrdinal(q.Order.FieldOrdinal)
+		if !e.Not && e.FieldOrdinal >= 0 && qv.engine.fieldNameByOrdinal(e.FieldOrdinal) != orderField && len(e.Operands) == 0 {
 			switch e.Op {
 			case qir.OpEQ, qir.OpIN, qir.OpHASALL, qir.OpHASANY:
 				return false
@@ -1491,7 +1491,7 @@ func (qv *queryView) shouldPreferExecutionPlan(q *qir.Shape, trace *queryTrace) 
 	}
 
 	if q.Offset == 0 && q.HasOrder && q.Order.Kind == qir.OrderKindBasic {
-		orderField := qv.fieldNameByOrdinal(q.Order.FieldOrdinal)
+		orderField := qv.engine.fieldNameByOrdinal(q.Order.FieldOrdinal)
 		if _, ok, err := qv.extractBoundsForField(orderField, leaves); err == nil && ok {
 			if qv.supportsLimitLeafPredsExcludingBounds(leaves, orderField) &&
 				!qv.hasWarmScalarLimitLeafPredsExcludingBounds(leaves, orderField) {
@@ -1801,7 +1801,7 @@ func (qv *queryView) decideOrderedByCost(q *qir.Shape, leaves []qir.Expr) planne
 	if o.Kind != qir.OrderKindBasic {
 		return d
 	}
-	orderField := qv.fieldNameByOrdinal(o.FieldOrdinal)
+	orderField := qv.engine.fieldNameByOrdinal(o.FieldOrdinal)
 
 	fm := qv.fieldMetaByOrder(o)
 	if fm == nil || fm.Slice {
@@ -1975,7 +1975,7 @@ func (qv *queryView) estimateOrderedAnchorSetupCost(
 	}
 
 	for _, e := range leaves {
-		fieldName := qv.fieldNameByOrdinal(e.FieldOrdinal)
+		fieldName := qv.engine.fieldNameByOrdinal(e.FieldOrdinal)
 		if e.Not || e.FieldOrdinal < 0 || e.Op == qir.OpNOOP {
 			continue
 		}
@@ -2136,7 +2136,7 @@ func (qv *queryView) estimateOrderedProfile(orderField string, leaves []qir.Expr
 	}
 
 	for i, e := range leaves {
-		if !e.Not && e.FieldOrdinal >= 0 && qv.fieldNameByOrdinal(e.FieldOrdinal) != orderField && len(e.Operands) == 0 && isScalarRangeEqOp(e.Op) {
+		if !e.Not && e.FieldOrdinal >= 0 && qv.engine.fieldNameByOrdinal(e.FieldOrdinal) != orderField && len(e.Operands) == 0 && isScalarRangeEqOp(e.Op) {
 			continue
 		}
 		leafSel, leafWork, leafOrderRange, leafHasPrefix, ok := qv.estimateLeafOrderCost(e, snap, universe, orderField, orderHasBuckets)
@@ -2182,7 +2182,7 @@ func (qv *queryView) estimateOrderedProfile(orderField string, leaves []qir.Expr
 		}
 		activeChecks++
 		baseWork += leafWork
-		if isBoundOp(e.Op) && qv.fieldNameByOrdinal(e.FieldOrdinal) != orderField {
+		if isBoundOp(e.Op) && qv.engine.fieldNameByOrdinal(e.FieldOrdinal) != orderField {
 			baseRangeLeaves++
 		}
 	}
@@ -2288,7 +2288,7 @@ func (qv *queryView) estimateOrderedProfileBuf(orderField string, leaves *pooled
 
 	for i := 0; i < leaves.Len(); i++ {
 		e := leaves.Get(i)
-		if !e.Not && e.FieldOrdinal >= 0 && qv.fieldNameByOrdinal(e.FieldOrdinal) != orderField && len(e.Operands) == 0 && isScalarRangeEqOp(e.Op) {
+		if !e.Not && e.FieldOrdinal >= 0 && qv.engine.fieldNameByOrdinal(e.FieldOrdinal) != orderField && len(e.Operands) == 0 && isScalarRangeEqOp(e.Op) {
 			continue
 		}
 		leafSel, leafWork, leafOrderRange, leafHasPrefix, ok := qv.estimateLeafOrderCost(e, snap, universe, orderField, orderHasBuckets)
@@ -2334,7 +2334,7 @@ func (qv *queryView) estimateOrderedProfileBuf(orderField string, leaves *pooled
 		}
 		activeChecks++
 		baseWork += leafWork
-		if isBoundOp(e.Op) && qv.fieldNameByOrdinal(e.FieldOrdinal) != orderField {
+		if isBoundOp(e.Op) && qv.engine.fieldNameByOrdinal(e.FieldOrdinal) != orderField {
 			baseRangeLeaves++
 		}
 	}
@@ -2437,7 +2437,7 @@ func (qv *queryView) estimateOrderedProfileOverlay(orderField string, leaves []q
 	}
 
 	for i, e := range leaves {
-		if !e.Not && e.FieldOrdinal >= 0 && qv.fieldNameByOrdinal(e.FieldOrdinal) != orderField && len(e.Operands) == 0 && isScalarRangeEqOp(e.Op) {
+		if !e.Not && e.FieldOrdinal >= 0 && qv.engine.fieldNameByOrdinal(e.FieldOrdinal) != orderField && len(e.Operands) == 0 && isScalarRangeEqOp(e.Op) {
 			continue
 		}
 		leafSel, leafWork, leafOrderRange, leafHasPrefix, ok := qv.estimateLeafOrderCost(e, snap, universe, orderField, orderHasBuckets)
@@ -2483,7 +2483,7 @@ func (qv *queryView) estimateOrderedProfileOverlay(orderField string, leaves []q
 		}
 		activeChecks++
 		baseWork += leafWork
-		if isBoundOp(e.Op) && qv.fieldNameByOrdinal(e.FieldOrdinal) != orderField {
+		if isBoundOp(e.Op) && qv.engine.fieldNameByOrdinal(e.FieldOrdinal) != orderField {
 			baseRangeLeaves++
 		}
 	}
@@ -2587,7 +2587,7 @@ func (qv *queryView) estimateOrderedProfileOverlayBuf(orderField string, leaves 
 
 	for i := 0; i < leaves.Len(); i++ {
 		e := leaves.Get(i)
-		if !e.Not && e.FieldOrdinal >= 0 && qv.fieldNameByOrdinal(e.FieldOrdinal) != orderField && len(e.Operands) == 0 && isScalarRangeEqOp(e.Op) {
+		if !e.Not && e.FieldOrdinal >= 0 && qv.engine.fieldNameByOrdinal(e.FieldOrdinal) != orderField && len(e.Operands) == 0 && isScalarRangeEqOp(e.Op) {
 			continue
 		}
 		leafSel, leafWork, leafOrderRange, leafHasPrefix, ok := qv.estimateLeafOrderCost(e, snap, universe, orderField, orderHasBuckets)
@@ -2633,7 +2633,7 @@ func (qv *queryView) estimateOrderedProfileOverlayBuf(orderField string, leaves 
 		}
 		activeChecks++
 		baseWork += leafWork
-		if isBoundOp(e.Op) && qv.fieldNameByOrdinal(e.FieldOrdinal) != orderField {
+		if isBoundOp(e.Op) && qv.engine.fieldNameByOrdinal(e.FieldOrdinal) != orderField {
 			baseRangeLeaves++
 		}
 	}
@@ -2705,7 +2705,7 @@ func (qv *queryView) extractOrderRangeCoverageLeaves(orderField string, leaves [
 	has := false
 	for i := range leaves {
 		e := leaves[i]
-		if e.Not || qv.fieldNameByOrdinal(e.FieldOrdinal) != orderField {
+		if e.Not || qv.engine.fieldNameByOrdinal(e.FieldOrdinal) != orderField {
 			continue
 		}
 		if applied, ok := qv.applyScalarExprToRangeBounds(e, &rb); !ok {
@@ -2733,7 +2733,7 @@ func (qv *queryView) extractOrderRangeCoverageLeavesBuf(orderField string, leave
 	has := false
 	for i := 0; i < leaves.Len(); i++ {
 		e := leaves.Get(i)
-		if e.Not || qv.fieldNameByOrdinal(e.FieldOrdinal) != orderField {
+		if e.Not || qv.engine.fieldNameByOrdinal(e.FieldOrdinal) != orderField {
 			continue
 		}
 		if applied, ok := qv.applyScalarExprToRangeBounds(e, &rb); !ok {
@@ -2761,7 +2761,7 @@ func (qv *queryView) extractOrderRangeCoverageLeavesOverlay(orderField string, l
 	has := false
 	for i := range leaves {
 		e := leaves[i]
-		if e.Not || qv.fieldNameByOrdinal(e.FieldOrdinal) != orderField {
+		if e.Not || qv.engine.fieldNameByOrdinal(e.FieldOrdinal) != orderField {
 			continue
 		}
 		if applied, ok := qv.applyScalarExprToRangeBounds(e, &rb); !ok {
@@ -2801,7 +2801,7 @@ func (qv *queryView) extractOrderRangeCoverageLeavesOverlayBuf(orderField string
 	has := false
 	for i := 0; i < leaves.Len(); i++ {
 		e := leaves.Get(i)
-		if e.Not || qv.fieldNameByOrdinal(e.FieldOrdinal) != orderField {
+		if e.Not || qv.engine.fieldNameByOrdinal(e.FieldOrdinal) != orderField {
 			continue
 		}
 		if applied, ok := qv.applyScalarExprToRangeBounds(e, &rb); !ok {
@@ -2859,7 +2859,7 @@ func (qv *queryView) estimateLeafOrderCost(
 		return 0, 0, false, false, false
 	}
 
-	fieldName := qv.fieldNameByOrdinal(e.FieldOrdinal)
+	fieldName := qv.engine.fieldNameByOrdinal(e.FieldOrdinal)
 	fieldStats := qv.plannerFieldStats(fieldName, snap, universe)
 	rawSel := 0.0
 	valueCount := 1

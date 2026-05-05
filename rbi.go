@@ -563,7 +563,7 @@ func New[K ~uint64 | ~string, V any](bolt *bbolt.DB, options Options, execOpts .
 
 func (db *DB[K, V]) initQueryEngine() {
 	db.engine = &queryEngine{
-		strkey:             db.strKey,
+		strKey:             db.strKey,
 		fields:             db.indexFields,
 		indexedFieldAccess: db.indexedFieldAccess,
 		indexedFieldMap:    db.indexedFieldMap,
@@ -571,7 +571,10 @@ func (db *DB[K, V]) initQueryEngine() {
 		measureFieldMap:    db.measureFieldMap,
 		planner:            db.planner,
 		options:            db.options,
-		viewPool:           new(pooled.Pointers[queryView]),
+
+		viewPool: &pooled.Pointers[queryView]{
+			Clear: true,
+		},
 	}
 }
 
@@ -649,15 +652,15 @@ func (db *DB[K, V]) initPatchFieldAccessors() {
 	}
 }
 
-func (db *DB[K, V]) initSnapshotRuntimeCaches(s *indexSnapshot) {
+func (qe *queryEngine) initSnapshotRuntimeCaches(s *indexSnapshot) {
 	if s == nil {
 		return
 	}
 	s.numericRangeBucketCache = numericRangeBucketCachePool.Get()
-	s.numericRangeBucketCache.init(len(db.indexedFieldAccess))
-	s.matPredCacheMaxEntries = max(0, db.options.SnapshotMaterializedPredCacheMaxEntries)
+	s.numericRangeBucketCache.init(len(qe.indexedFieldAccess))
+	s.matPredCacheMaxEntries = max(0, qe.options.SnapshotMaterializedPredCacheMaxEntries)
 	s.matPredCacheMaxCard = materializedPredCacheMaxCardinality(
-		db.options.SnapshotMaterializedPredCacheMaxCardinality,
+		qe.options.SnapshotMaterializedPredCacheMaxCardinality,
 	)
 	if s.matPredCacheMaxEntries > 0 {
 		s.matPredCache = materializedPredCachePool.Get()
@@ -973,7 +976,6 @@ type (
 
 		stats Stats[K]
 
-		traceRoot *DB[K, V]
 		testHooks *testHooks
 	}
 
@@ -1523,6 +1525,10 @@ func (db *DB[K, V]) IndexStats() IndexStats {
 	snap, seq, ref, pinned := db.pinCurrentSnapshot()
 	defer db.unpinCurrentSnapshot(seq, ref, pinned)
 
+	return db.engine.indexStats(snap)
+}
+
+func (qe *queryEngine) indexStats(snap *indexSnapshot) IndexStats {
 	idx := IndexStats{
 		UniqueFieldKeys:        make(map[string]uint64),
 		FieldSize:              make(map[string]uint64),
@@ -1532,7 +1538,7 @@ func (db *DB[K, V]) IndexStats() IndexStats {
 		FieldApproxHeapBytes:   make(map[string]uint64),
 	}
 	sharedStructBytes := approxSliceBufBytes(snap.index) + approxSliceBufBytes(snap.nilIndex)
-	fieldCount := len(db.indexedFieldAccess)
+	fieldCount := len(qe.indexedFieldAccess)
 	sharedStructPerField := uint64(0)
 	sharedStructRemainder := uint64(0)
 	if fieldCount > 0 {
@@ -1540,7 +1546,7 @@ func (db *DB[K, V]) IndexStats() IndexStats {
 		sharedStructRemainder = sharedStructBytes % uint64(fieldCount)
 	}
 
-	for i, acc := range db.indexedFieldAccess {
+	for i, acc := range qe.indexedFieldAccess {
 		name := acc.name
 		fieldStats := collectFieldIndexStats(snap.index.Get(acc.ordinal), true)
 		nilStats := collectFieldIndexStats(snap.nilIndex.Get(acc.ordinal), false)
@@ -1580,7 +1586,7 @@ func unregInstanceOnError(err *error, boltPath string, vname string) {
 func recoverPublishAfterCommit[K ~string | ~uint64, V any](db *DB[K, V], seq uint64, op string, err *error) {
 	if r := recover(); r != nil {
 		*err = db.tripBrokenLocked(op, r)
-		db.dropStagedSnapshot(seq)
+		db.snapshot.dropStaged(seq)
 	}
 }
 
@@ -1761,10 +1767,14 @@ func (db *DB[K, V]) AutoBatchStats() AutoBatchStats {
 // unset. AnalyzeInterval and TraceSampleEvery still reflect the configured
 // options.
 func (db *DB[K, V]) PlannerStats() PlannerStats {
+	return db.engine.plannerStats()
+}
+
+func (qe *queryEngine) plannerStats() PlannerStats {
 	out := PlannerStats{
 		Fields: make(map[string]PlannerFieldStats),
 	}
-	if ps := db.planner.stats.Load(); ps != nil {
+	if ps := qe.planner.stats.Load(); ps != nil {
 		out.Version = ps.Version
 		out.GeneratedAt = ps.GeneratedAt
 		out.UniverseCardinality = ps.UniverseCardinality
@@ -1776,10 +1786,10 @@ func (db *DB[K, V]) PlannerStats() PlannerStats {
 			}
 		}
 	}
-	out.TraceSampleEvery = db.planner.tracer.sampleEvery
-	db.planner.analyzer.Lock()
-	out.AnalyzeInterval = db.planner.analyzer.interval
-	db.planner.analyzer.Unlock()
+	out.TraceSampleEvery = qe.planner.tracer.sampleEvery
+	qe.planner.analyzer.Lock()
+	out.AnalyzeInterval = qe.planner.analyzer.interval
+	qe.planner.analyzer.Unlock()
 	return out
 }
 
@@ -1797,13 +1807,17 @@ func (db *DB[K, V]) PlannerStats() PlannerStats {
 // calibration payload unless state was explicitly injected through
 // SetCalibrationSnapshot.
 func (db *DB[K, V]) CalibrationStats() CalibrationStats {
+	return db.engine.calibrationStats()
+}
+
+func (qe *queryEngine) calibrationStats() CalibrationStats {
 	out := CalibrationStats{
-		Enabled:     db.planner.calibrator.enabled,
-		SampleEvery: db.planner.calibrator.sampleEvery,
+		Enabled:     qe.planner.calibrator.enabled,
+		SampleEvery: qe.planner.calibrator.sampleEvery,
 		Multipliers: make(map[string]float64, int(plannerCalPlanCount)),
 		Samples:     make(map[string]uint64, int(plannerCalPlanCount)),
 	}
-	if cs := db.planner.calibrator.state.Load(); cs != nil {
+	if cs := qe.planner.calibrator.state.Load(); cs != nil {
 		cal := calibrationSnapshotFromState(cs)
 		out.UpdatedAt = cal.UpdatedAt
 		out.Multipliers = cal.Multipliers
@@ -1939,10 +1953,10 @@ func (db *DB[K, V]) Truncate() error {
 		universe:           nextUniverse,
 		strmap:             nextStrMap,
 	}
-	db.initSnapshotRuntimeCaches(snap)
-	db.stageSnapshot(snap)
+	db.engine.initSnapshotRuntimeCaches(snap)
+	db.snapshot.stage(snap)
 	if err = db.commit(tx, "truncate"); err != nil {
-		db.dropStagedSnapshot(seq)
+		db.snapshot.dropStaged(seq)
 		return fmt.Errorf("commit error: %w", err)
 	}
 

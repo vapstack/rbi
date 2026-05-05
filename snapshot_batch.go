@@ -1834,7 +1834,7 @@ func (db *DB[K, V]) buildPreparedSnapshotAggregatedNoLock(
 		universeOwner:      prev.universeOwner,
 		strmap:             db.strMap.snapshot(),
 	}
-	db.initSnapshotRuntimeCaches(next)
+	db.engine.initSnapshotRuntimeCaches(next)
 
 	normalized := normalizePreparedBatchForSnapshot(prepared)
 	deltas := indexedFieldBatchDeltas{
@@ -1903,9 +1903,9 @@ func (db *DB[K, V]) buildPreparedSnapshotAggregatedNoLock(
 	measureDeltas.release()
 	inheritNumericRangeBucketCache(next, prev)
 	if changedCount > 0 {
-		inheritMaterializedPredCache(db, next, prev, deltas.changed)
+		inheritMaterializedPredCache(next, prev, db.indexedFieldMap, deltas.changed)
 	} else {
-		inheritMaterializedPredCache(db, next, prev, nil)
+		inheritMaterializedPredCache(next, prev, db.indexedFieldMap, nil)
 	}
 	snapshotFieldBatchStateSlicePool.Put(deltas.fields)
 	fieldIndexBoolSlicePool.Put(deltas.changed)

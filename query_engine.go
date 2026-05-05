@@ -9,7 +9,7 @@ import (
 )
 
 type queryEngine struct {
-	strkey bool
+	strKey bool
 
 	fields             map[string]*field
 	indexedFieldAccess []indexedFieldAccessor
@@ -23,30 +23,30 @@ type queryEngine struct {
 	viewPool *pooled.Pointers[queryView]
 }
 
-func (e *queryEngine) fieldNameByOrdinal(ordinal int) string {
-	if ordinal < 0 || ordinal >= len(e.indexedFieldAccess) {
+func (qe *queryEngine) fieldNameByOrdinal(ordinal int) string {
+	if ordinal < 0 || ordinal >= len(qe.indexedFieldAccess) {
 		return ""
 	}
-	return e.indexedFieldAccess[ordinal].name
+	return qe.indexedFieldAccess[ordinal].name
 }
 
-func (e *queryEngine) traceOrCalibrationSamplingEnabled() bool {
-	if e.planner.tracer.sink != nil && e.planner.tracer.sampleEvery > 0 {
+func (qe *queryEngine) traceOrCalibrationSamplingEnabled() bool {
+	if qe.planner.tracer.sink != nil && qe.planner.tracer.sampleEvery > 0 {
 		return true
 	}
-	return e.planner.calibrator.enabled && e.planner.calibrator.sampleEvery > 0
+	return qe.planner.calibrator.enabled && qe.planner.calibrator.sampleEvery > 0
 }
 
-func (e *queryEngine) beginTrace(q qir.Shape) *queryTrace {
+func (qe *queryEngine) beginTrace(q qir.Shape) *queryTrace {
 	emitTrace := false
-	sink := e.planner.tracer.sink
-	if sink != nil && e.planner.tracer.sampleEvery > 0 {
-		emitTrace = e.shouldSampleTrace()
+	sink := qe.planner.tracer.sink
+	if sink != nil && qe.planner.tracer.sampleEvery > 0 {
+		emitTrace = qe.shouldSampleTrace()
 	}
 
 	emitCalibration := false
-	if e.planner.calibrator.enabled && e.planner.calibrator.sampleEvery > 0 {
-		emitCalibration = e.shouldSampleCalibration()
+	if qe.planner.calibrator.enabled && qe.planner.calibrator.sampleEvery > 0 {
+		emitCalibration = qe.shouldSampleCalibration()
 	}
 
 	if !emitTrace && !emitCalibration {
@@ -62,7 +62,7 @@ func (e *queryEngine) beginTrace(q qir.Shape) *queryTrace {
 		}
 		if q.HasOrder {
 			tr.ev.HasOrder = true
-			tr.ev.OrderField = e.fieldNameByOrdinal(q.Order.FieldOrdinal)
+			tr.ev.OrderField = qe.fieldNameByOrdinal(q.Order.FieldOrdinal)
 			tr.ev.OrderDesc = q.Order.Desc
 		}
 
@@ -84,31 +84,31 @@ func (e *queryEngine) beginTrace(q qir.Shape) *queryTrace {
 		tr.sink = sink
 	}
 	if emitCalibration {
-		tr.onFinish = e.observeCalibration
+		tr.onFinish = qe.observeCalibration
 	}
 	return tr
 }
 
-func (e *queryEngine) shouldSampleTrace() bool {
-	every := e.planner.tracer.sampleEvery
+func (qe *queryEngine) shouldSampleTrace() bool {
+	every := qe.planner.tracer.sampleEvery
 	if every <= 1 {
 		return true
 	}
-	seq := e.planner.tracer.seq.Add(1)
+	seq := qe.planner.tracer.seq.Add(1)
 	return seq%every == 0
 }
 
-func (e *queryEngine) shouldSampleCalibration() bool {
-	every := e.planner.calibrator.sampleEvery
+func (qe *queryEngine) shouldSampleCalibration() bool {
+	every := qe.planner.calibrator.sampleEvery
 	if every <= 1 {
 		return true
 	}
-	seq := e.planner.calibrator.seq.Add(1)
+	seq := qe.planner.calibrator.seq.Add(1)
 	return seq%every == 0
 }
 
-func (e *queryEngine) plannerCostMultiplier(plan plannerCalPlan) float64 {
-	cur := e.planner.calibrator.state.Load()
+func (qe *queryEngine) plannerCostMultiplier(plan plannerCalPlan) float64 {
+	cur := qe.planner.calibrator.state.Load()
 	if cur == nil {
 		return 1.0
 	}
@@ -119,8 +119,8 @@ func (e *queryEngine) plannerCostMultiplier(plan plannerCalPlan) float64 {
 	return m
 }
 
-func (e *queryEngine) observeCalibration(ev TraceEvent) {
-	if !e.planner.calibrator.enabled {
+func (qe *queryEngine) observeCalibration(ev TraceEvent) {
+	if !qe.planner.calibrator.enabled {
 		return
 	}
 
@@ -144,10 +144,10 @@ func (e *queryEngine) observeCalibration(ev TraceEvent) {
 	ratio := float64(observed) / float64(ev.EstimatedRows)
 	ratio = plannerClampFloat(ratio, calibrationRatioMin, calibrationRatioMax)
 
-	e.planner.calibrator.Lock()
-	defer e.planner.calibrator.Unlock()
+	qe.planner.calibrator.Lock()
+	defer qe.planner.calibrator.Unlock()
 
-	cur := e.planner.calibrator.state.Load()
+	cur := qe.planner.calibrator.state.Load()
 	if cur == nil {
 		cur = newCalibration()
 	}
@@ -167,5 +167,5 @@ func (e *queryEngine) observeCalibration(ev TraceEvent) {
 	next.Samples[plan] = next.Samples[plan] + 1
 	next.UpdatedAt = time.Now()
 
-	e.planner.calibrator.state.Store(&next)
+	qe.planner.calibrator.state.Store(&next)
 }

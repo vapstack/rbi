@@ -102,33 +102,33 @@ func warmNumericRangeBucketEntry(t *testing.T, db *DB[uint64, Rec], expr qx.Expr
 		t.Fatalf("prepareTestExpr(%+v): %v", expr, err)
 	}
 	defer prepared.Release()
-	field := db.fieldNameByOrdinal(compiled.FieldOrdinal)
-	fm := db.indexFields[field]
+	f := db.engine.fieldNameByOrdinal(compiled.FieldOrdinal)
+	fm := db.indexFields[f]
 	if fm == nil {
-		t.Fatalf("expected %s field metadata", field)
+		t.Fatalf("expected %s field metadata", f)
 	}
-	ov := db.fieldOverlay(field)
+	ov := db.fieldOverlay(f)
 	if !ov.hasData() {
-		t.Fatalf("expected %s overlay data", field)
+		t.Fatalf("expected %s overlay data", f)
 	}
 	key, isSlice, isNil, err := db.exprValueToIdxScalar(expr)
 	if err != nil {
-		t.Fatalf("exprValueToIdxScalar(%s): %v", field, err)
+		t.Fatalf("exprValueToIdxScalar(%s): %v", f, err)
 	}
 	if isSlice || isNil {
-		t.Fatalf("unexpected scalar flags for %s: isSlice=%v isNil=%v", field, isSlice, isNil)
+		t.Fatalf("unexpected scalar flags for %s: isSlice=%v isNil=%v", f, isSlice, isNil)
 	}
 	rb, ok := rangeBoundsForOp(compiled.Op, key)
 	if !ok {
 		t.Fatalf("rangeBoundsForOp(%v) failed", compiled.Op)
 	}
 	br := ov.rangeForBounds(rb)
-	out, ok := db.tryEvalNumericRangeBuckets(field, fm, ov, br)
+	out, ok := db.tryEvalNumericRangeBuckets(f, fm, ov, br)
 	if !ok {
-		t.Fatalf("expected numeric range bucket path for %s", field)
+		t.Fatalf("expected numeric range bucket path for %s", f)
 	}
 	out.release()
-	return requireNumericRangeBucketCacheEntry(t, db.getSnapshot(), field), br
+	return requireNumericRangeBucketCacheEntry(t, db.getSnapshot(), f), br
 }
 
 func TestEvalSimple_NumericRangeBuckets_MatchClassicPath(t *testing.T) {

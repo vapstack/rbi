@@ -227,7 +227,7 @@ func TestAggregateGroupedOrdinaryByIDGateUsesSelectivity(t *testing.T) {
 		t.Fatalf("BatchSet: %v", err)
 	}
 
-	full, err := db.prepareAggregate(qx.Group("group").Metrics(
+	full, err := db.engine.prepareAggregate(qx.Group("group").Metrics(
 		qx.COUNT("score").AS("score_count"),
 		qx.SUM("score").AS("score_sum"),
 		qx.MIN("score").AS("score_min"),
@@ -237,7 +237,7 @@ func TestAggregateGroupedOrdinaryByIDGateUsesSelectivity(t *testing.T) {
 	}
 	defer full.release()
 
-	selective, err := db.prepareAggregate(qx.Query(qx.EQ("score", 1)).Group("group").Metrics(
+	selective, err := db.engine.prepareAggregate(qx.Query(qx.EQ("score", 1)).Group("group").Metrics(
 		qx.COUNT("score").AS("score_count"),
 		qx.SUM("score").AS("score_sum"),
 		qx.MIN("score").AS("score_min"),
@@ -1306,7 +1306,7 @@ func TestAggregatePinnedSnapshotIsolation(t *testing.T) {
 	if err := db.Set(1, &measureOnlyRec{Amount: 10}); err != nil {
 		t.Fatalf("Set initial: %v", err)
 	}
-	prepared, err := db.prepareAggregate(qx.Aggregate(qx.SUM("amount").AS("sum")))
+	prepared, err := db.engine.prepareAggregate(qx.Aggregate(qx.SUM("amount").AS("sum")))
 	if err != nil {
 		t.Fatalf("prepareAggregate: %v", err)
 	}

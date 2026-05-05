@@ -112,7 +112,7 @@ func (s *benchReadModeState[K, V]) beforeQuery(b *testing.B, db *DB[K, V]) {
 		if len(s.pinned) > benchPinnedSnapshotLimit {
 			oldest := s.pinned[0]
 			s.pinned = s.pinned[1:]
-			db.unpinSnapshotRef(oldest.seq, oldest.ref)
+			db.snapshot.unpinRef(oldest.seq, oldest.ref)
 		}
 	}
 	b.StartTimer()
@@ -123,7 +123,7 @@ func (s *benchReadModeState[K, V]) close(tb testing.TB, db *DB[K, V]) {
 		return
 	}
 	for i := range s.pinned {
-		db.unpinSnapshotRef(s.pinned[i].seq, s.pinned[i].ref)
+		db.snapshot.unpinRef(s.pinned[i].seq, s.pinned[i].ref)
 	}
 	s.pinned = s.pinned[:0]
 }
@@ -147,7 +147,7 @@ func (s *benchReadModeState[K, V]) applyTurnover(tb testing.TB, db *DB[K, V]) {
 func (s *benchReadModeState[K, V]) pinCurrentSnapshot(tb testing.TB, db *DB[K, V]) {
 	tb.Helper()
 	snap := db.getSnapshot()
-	got, ref, ok := db.pinSnapshotRefBySeq(snap.seq)
+	got, ref, ok := db.snapshot.pinRefBySeq(snap.seq)
 	if !ok || got != snap || ref == nil {
 		tb.Fatalf("pinSnapshotRefBySeq(seq=%d) failed", snap.seq)
 	}
@@ -461,11 +461,11 @@ func TestBenchMode_ColdFreshPublishesAndClearsNewSnapshotCaches(t *testing.T) {
 	if oldSnap.matPredCacheCount.Load() == 0 {
 		t.Fatalf("expected warm snapshot to populate materialized predicate cache")
 	}
-	heldSnap, heldRef, ok := db.pinSnapshotRefBySeq(oldSnap.seq)
+	heldSnap, heldRef, ok := db.snapshot.pinRefBySeq(oldSnap.seq)
 	if !ok || heldSnap != oldSnap || heldRef == nil {
 		t.Fatalf("pinSnapshotRefBySeq(seq=%d) failed", oldSnap.seq)
 	}
-	defer db.unpinSnapshotRef(oldSnap.seq, heldRef)
+	defer db.snapshot.unpinRef(oldSnap.seq, heldRef)
 	state := newBenchReadModeState[uint64, UserBench](
 		t,
 		benchCacheMode{suffix: "ColdFresh", kind: benchCacheModeColdFresh},
@@ -568,7 +568,7 @@ func runBenchModeBeforeQueryForTest[K ~string | ~uint64, V any](tb testing.TB, d
 		if len(state.pinned) > benchPinnedSnapshotLimit {
 			oldest := state.pinned[0]
 			state.pinned = state.pinned[1:]
-			db.unpinSnapshotRef(oldest.seq, oldest.ref)
+			db.snapshot.unpinRef(oldest.seq, oldest.ref)
 		}
 	}
 }

@@ -35,7 +35,7 @@ func (db *DB[K, V]) Query(q *qx.QX) ([]*V, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer db.unpinSnapshotRef(seq, ref)
+	defer db.snapshot.unpinRef(seq, ref)
 	defer rollback(tx)
 
 	return db.queryRecords(tx, snap, &viewQ)
@@ -135,7 +135,7 @@ func (db *DB[K, V]) queryRecords(tx *bbolt.Tx, snap *indexSnapshot, q *qir.Shape
 	view := db.makeQueryView(snap)
 	defer db.releaseQueryView(view)
 
-	if !db.traceOrCalibrationSamplingEnabled() {
+	if !db.engine.traceOrCalibrationSamplingEnabled() {
 		if empty, err := view.tryQueryEmptyOnSnapshot(q); empty || err != nil {
 			return nil, err
 		}
@@ -229,7 +229,7 @@ func (db *DB[K, V]) unpinCurrentSnapshot(seq uint64, ref *snapshotRef, pinned bo
 	if !pinned || ref == nil {
 		return
 	}
-	db.unpinSnapshotRef(seq, ref)
+	db.snapshot.unpinRef(seq, ref)
 }
 
 // QueryKeys evaluates the given query against the index and returns all matching ids.
@@ -309,34 +309,22 @@ func shouldSkipPlannerForArrayOrderShape(q *qir.Shape) bool {
 }
 
 func (db *DB[K, V]) makeQueryView(snap *indexSnapshot) *queryView {
-	root := db.engine
-	if db.traceRoot != nil {
-		root = db.traceRoot.engine
-	}
-	view := root.viewPool.Get()
+	view := db.engine.viewPool.Get()
 	*view = queryView{
-		engine:            root,
+		engine:            db.engine,
 		snap:              snap,
-		strKey:            root.strkey,
+		strKey:            db.engine.strKey,
 		strMapView:        snap.strmap,
-		fields:            root.fields,
-		planner:           root.planner,
-		options:           root.options,
+		fields:            db.engine.fields,
+		planner:           db.engine.planner,
+		options:           db.engine.options,
 		lenZeroComplement: snap.lenZeroComplement,
 	}
 	return view
 }
 
 func (db *DB[K, V]) releaseQueryView(view *queryView) {
-	if view == nil {
-		return
-	}
-	root := db.engine
-	if db.traceRoot != nil {
-		root = db.traceRoot.engine
-	}
-	*view = queryView{}
-	root.viewPool.Put(view)
+	db.engine.viewPool.Put(view)
 }
 
 func finishQueryTrace(trace *queryTrace, out *[]uint64, err *error) {
@@ -511,7 +499,7 @@ func (qv *queryView) execQuery(q *qir.Shape, emitTrace bool, prepared bool) (out
 	// case 2: ordering
 	if q.HasOrder {
 		order := q.Order
-		orderField := qv.fieldNameByOrdinal(order.FieldOrdinal)
+		orderField := qv.engine.fieldNameByOrdinal(order.FieldOrdinal)
 
 		switch order.Kind {
 

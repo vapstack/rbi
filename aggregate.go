@@ -116,7 +116,7 @@ func (db *DB[K, V]) Aggregate(q *qx.QX) (Result, error) {
 		return Result{}, ErrNoIndex
 	}
 
-	prepared, err := db.prepareAggregate(q)
+	prepared, err := db.engine.prepareAggregate(q)
 	if err != nil {
 		return Result{}, err
 	}
@@ -162,7 +162,7 @@ func (q *aggregateQuery) release() {
 	q.order = nil
 }
 
-func (db *DB[K, V]) prepareAggregate(src *qx.QX) (*aggregateQuery, error) {
+func (qe *queryEngine) prepareAggregate(src *qx.QX) (*aggregateQuery, error) {
 	if src == nil {
 		return nil, fmt.Errorf("QX is nil")
 	}
@@ -173,7 +173,7 @@ func (db *DB[K, V]) prepareAggregate(src *qx.QX) (*aggregateQuery, error) {
 		return nil, fmt.Errorf("%w: aggregate projection is not supported", ErrInvalidQuery)
 	}
 
-	filter, err := qir.PrepareQuery(&qx.QX{Filter: src.Filter}, db.indexedFieldMap)
+	filter, err := qir.PrepareQuery(&qx.QX{Filter: src.Filter}, qe.indexedFieldMap)
 	if err != nil {
 		return nil, err
 	}
@@ -186,7 +186,7 @@ func (db *DB[K, V]) prepareAggregate(src *qx.QX) (*aggregateQuery, error) {
 	outputPositions := make(map[string]int, len(src.Reduction.Group)+len(src.Reduction.Metrics))
 
 	for i := range src.Reduction.Group {
-		group, err := db.prepareAggregateGroup(src.Reduction.Group[i])
+		group, err := qe.prepareAggregateGroup(src.Reduction.Group[i])
 		if err != nil {
 			out.release()
 			return nil, err
@@ -199,12 +199,12 @@ func (db *DB[K, V]) prepareAggregate(src *qx.QX) (*aggregateQuery, error) {
 	}
 
 	for i := range src.Reduction.Metrics {
-		metric, err := db.prepareAggregateMetric(src.Reduction.Metrics[i])
+		metric, err := qe.prepareAggregateMetric(src.Reduction.Metrics[i])
 		if err != nil {
 			out.release()
 			return nil, err
 		}
-		if err := reserveAggregateOutputName(outputPositions, metric.out, len(outputPositions)); err != nil {
+		if err = reserveAggregateOutputName(outputPositions, metric.out, len(outputPositions)); err != nil {
 			out.release()
 			return nil, err
 		}
@@ -432,13 +432,13 @@ func aggregateLiteralValueSlice(expr qx.Expr) ([]Value, error) {
 	return values, nil
 }
 
-func (db *DB[K, V]) prepareAggregateGroup(expr qx.Expr) (aggregateFieldRef, error) {
+func (qe *queryEngine) prepareAggregateGroup(expr qx.Expr) (aggregateFieldRef, error) {
 	if expr.Kind != qx.KindREF || expr.Name == "" {
 		return aggregateFieldRef{}, fmt.Errorf("%w: GROUP BY supports only field references", ErrInvalidQuery)
 	}
-	acc, ok := db.indexedFieldMap[expr.Name]
+	acc, ok := qe.indexedFieldMap[expr.Name]
 	if !ok {
-		if _, measure := db.measureFieldMap[expr.Name]; measure {
+		if _, measure := qe.measureFieldMap[expr.Name]; measure {
 			return aggregateFieldRef{}, fmt.Errorf("%w: GROUP BY measure field %q is not supported", ErrInvalidQuery, expr.Name)
 		}
 		return aggregateFieldRef{}, fmt.Errorf("%w: no index for group field %q", ErrInvalidQuery, expr.Name)
@@ -453,7 +453,7 @@ func (db *DB[K, V]) prepareAggregateGroup(expr qx.Expr) (aggregateFieldRef, erro
 	return aggregateFieldRef{name: expr.Name, out: out, ordinary: acc, kind: aggregateFieldValueKind(acc.field)}, nil
 }
 
-func (db *DB[K, V]) prepareAggregateMetric(expr qx.Expr) (aggregateMetric, error) {
+func (qe *queryEngine) prepareAggregateMetric(expr qx.Expr) (aggregateMetric, error) {
 	if expr.Kind != qx.KindOP {
 		return aggregateMetric{}, fmt.Errorf("%w: aggregate metric must be an operation", ErrInvalidQuery)
 	}
@@ -473,7 +473,7 @@ func (db *DB[K, V]) prepareAggregateMetric(expr qx.Expr) (aggregateMetric, error
 			if len(expr.Args[0].Args) != 1 || expr.Args[0].Args[0].Kind != qx.KindREF || expr.Args[0].Args[0].Name == "" {
 				return aggregateMetric{}, fmt.Errorf("%w: COUNT(DISTINCT) supports only direct field reference", ErrInvalidQuery)
 			}
-			field, err := db.prepareAggregateMetricField(expr.Args[0].Args[0].Name, metric.op)
+			field, err := qe.prepareAggregateMetricField(expr.Args[0].Args[0].Name, metric.op)
 			if err != nil {
 				return aggregateMetric{}, err
 			}
@@ -499,25 +499,25 @@ func (db *DB[K, V]) prepareAggregateMetric(expr qx.Expr) (aggregateMetric, error
 	if len(expr.Args) != 1 || expr.Args[0].Kind != qx.KindREF || expr.Args[0].Name == "" {
 		return aggregateMetric{}, fmt.Errorf("%w: aggregate metric %q supports only direct field reference", ErrInvalidQuery, expr.Name)
 	}
-	field, err := db.prepareAggregateMetricField(expr.Args[0].Name, metric.op)
+	f, err := qe.prepareAggregateMetricField(expr.Args[0].Name, metric.op)
 	if err != nil {
 		return aggregateMetric{}, err
 	}
-	metric.field = field
+	metric.field = f
 	if metric.out == "" {
-		metric.out = defaultAggregateMetricName(metric.op, field.name)
+		metric.out = defaultAggregateMetricName(metric.op, f.name)
 	}
 	return metric, nil
 }
 
-func (db *DB[K, V]) prepareAggregateMetricField(name string, op aggregateMetricOp) (aggregateFieldRef, error) {
-	if acc, ok := db.measureFieldMap[name]; ok {
+func (qe *queryEngine) prepareAggregateMetricField(name string, op aggregateMetricOp) (aggregateFieldRef, error) {
+	if acc, ok := qe.measureFieldMap[name]; ok {
 		if op == aggregateMetricDistinct || op == aggregateMetricCountDistinct {
 			return aggregateFieldRef{}, fmt.Errorf("%w: DISTINCT over measure field %q is not supported", ErrInvalidQuery, name)
 		}
 		return aggregateFieldRef{name: name, measure: acc, isMeasure: true, kind: aggregateMeasureValueKind(acc.kind)}, nil
 	}
-	acc, ok := db.indexedFieldMap[name]
+	acc, ok := qe.indexedFieldMap[name]
 	if !ok {
 		return aggregateFieldRef{}, fmt.Errorf("%w: no index for aggregate field %q", ErrInvalidQuery, name)
 	}

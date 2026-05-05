@@ -265,7 +265,7 @@ func TestPlannerCalibration_ObserveUpdatesMultiplier(t *testing.T) {
 		t.Fatalf("unexpected base multiplier: %v", base)
 	}
 
-	db.observeCalibration(TraceEvent{
+	db.engine.observeCalibration(TraceEvent{
 		Plan:          "plan_or_merge_no_order",
 		EstimatedRows: 100,
 		RowsExamined:  300,
@@ -349,7 +349,7 @@ func TestPlannerCalibration_BeginTraceUsesMinimalCollectorWithoutTracerSink(t *t
 	}
 	defer preparedQ.Release()
 
-	tr := db.beginTrace(viewQ)
+	tr := db.engine.beginTrace(viewQ)
 	if tr == nil {
 		t.Fatalf("expected calibration-only trace collector")
 	}
@@ -446,7 +446,7 @@ func TestPlannerCalibration_DisabledUsesManualSnapshot(t *testing.T) {
 
 	assertApproxMultiplier(t, view.engine.plannerCostMultiplier(plannerCalOrdered), 0.73)
 	assertApproxMultiplier(t, view.engine.plannerCostMultiplier(plannerCalLimitOrderBasic), 1.41)
-	if db.traceOrCalibrationSamplingEnabled() {
+	if db.engine.traceOrCalibrationSamplingEnabled() {
 		t.Fatalf("expected online calibration sampling to remain disabled")
 	}
 }
@@ -496,7 +496,7 @@ func TestTraceAndCalibrationDisabled_BeginTraceReturnsNil(t *testing.T) {
 		TraceSink:              nil,
 		TraceSampleEvery:       1,
 	})
-	if db.traceOrCalibrationSamplingEnabled() {
+	if db.engine.traceOrCalibrationSamplingEnabled() {
 		t.Fatalf("expected trace/calibration sampling to be disabled")
 	}
 
@@ -506,7 +506,7 @@ func TestTraceAndCalibrationDisabled_BeginTraceReturnsNil(t *testing.T) {
 		t.Fatalf("prepareTestQuery: %v", err)
 	}
 	defer preparedQ.Release()
-	if tr := db.beginTrace(viewQ); tr != nil {
+	if tr := db.engine.beginTrace(viewQ); tr != nil {
 		t.Fatalf("expected nil trace when trace sink and calibration are disabled")
 	}
 }
@@ -851,7 +851,7 @@ func TestPlannerCalibration_AutoPersist_DisabledUsesFrozenState(t *testing.T) {
 	view := db2.makeQueryView(db2.getSnapshot())
 	defer db2.releaseQueryView(view)
 	assertApproxMultiplier(t, view.engine.plannerCostMultiplier(plannerCalOrdered), 1.42)
-	if db2.traceOrCalibrationSamplingEnabled() {
+	if db2.engine.traceOrCalibrationSamplingEnabled() {
 		t.Fatalf("expected online calibration sampling to remain disabled")
 	}
 }
@@ -1087,7 +1087,7 @@ func TestBuildORBranches_BroadNumericRangeStaysRuntimeOnSecondBuild(t *testing.T
 			branch := branches.Get(i)
 			for j := 0; j < branch.predLen(); j++ {
 				p := branch.pred(j)
-				if db.fieldNameByOrdinal(p.expr.FieldOrdinal) != "score" || p.expr.Op != compileScalarOpForTest(qx.OpGTE) {
+				if db.engine.fieldNameByOrdinal(p.expr.FieldOrdinal) != "score" || p.expr.Op != compileScalarOpForTest(qx.OpGTE) {
 					continue
 				}
 				found = true
@@ -1172,7 +1172,7 @@ func TestPlannerORNoOrder_BroadResidualRangePromotesRouteAware(t *testing.T) {
 			branch := branches.Get(i)
 			for j := 0; j < branch.predLen(); j++ {
 				p := branch.pred(j)
-				if db.fieldNameByOrdinal(p.expr.FieldOrdinal) != "score" || p.expr.Op != compileScalarOpForTest(qx.OpGTE) {
+				if db.engine.fieldNameByOrdinal(p.expr.FieldOrdinal) != "score" || p.expr.Op != compileScalarOpForTest(qx.OpGTE) {
 					continue
 				}
 				found = true
@@ -1268,7 +1268,7 @@ func TestPlannerORNoOrder_NullableBroadResidualRangeDoesNotStayLazy(t *testing.T
 		branch := branches.Get(bi)
 		for pi := 0; pi < branch.predLen(); pi++ {
 			p := branch.pred(pi)
-			if db.fieldNameByOrdinal(p.expr.FieldOrdinal) != "rank" || p.expr.Op != compileScalarOpForTest(qx.OpGTE) {
+			if db.engine.fieldNameByOrdinal(p.expr.FieldOrdinal) != "rank" || p.expr.Op != compileScalarOpForTest(qx.OpGTE) {
 				continue
 			}
 			found = true
@@ -1371,7 +1371,7 @@ func TestPlannerORNoOrder_NullableNonBroadComplementResidualRangeDoesNotStayLazy
 		branch := branches.Get(bi)
 		for pi := 0; pi < branch.predLen(); pi++ {
 			p := branch.pred(pi)
-			if db.fieldNameByOrdinal(p.expr.FieldOrdinal) != "rank" || p.expr.Op != compileScalarOpForTest(qx.OpGTE) {
+			if db.engine.fieldNameByOrdinal(p.expr.FieldOrdinal) != "rank" || p.expr.Op != compileScalarOpForTest(qx.OpGTE) {
 				continue
 			}
 			found = true
@@ -1474,7 +1474,7 @@ func TestPlannerORNoOrder_NullableNonBroadComplementResidualRangeDoesNotStayLazy
 		branch := branches.Get(bi)
 		for pi := 0; pi < branch.predLen(); pi++ {
 			p := branch.pred(pi)
-			if db.fieldNameByOrdinal(p.expr.FieldOrdinal) != "rank" || p.expr.Op != compileScalarOpForTest(qx.OpGTE) {
+			if db.engine.fieldNameByOrdinal(p.expr.FieldOrdinal) != "rank" || p.expr.Op != compileScalarOpForTest(qx.OpGTE) {
 				continue
 			}
 			found = true
@@ -1563,15 +1563,15 @@ func TestPlannerORNoOrder_NullableNonBroadComplementOnlyPositiveLeafKeepsLead(t 
 		branch := branches.Get(bi)
 		for pi := 0; pi < branch.predLen(); pi++ {
 			p := branch.pred(pi)
-			if db.fieldNameByOrdinal(p.expr.FieldOrdinal) != "rank" || p.expr.Op != compileScalarOpForTest(qx.OpGTE) {
+			if db.engine.fieldNameByOrdinal(p.expr.FieldOrdinal) != "rank" || p.expr.Op != compileScalarOpForTest(qx.OpGTE) {
 				continue
 			}
 			found = true
 			if !branch.hasLead() || branch.leadPtr() == nil {
 				t.Fatalf("expected forced nullable range branch to keep lead iterator")
 			}
-			if db.fieldNameByOrdinal(branch.leadPred().expr.FieldOrdinal) != "rank" {
-				t.Fatalf("expected nullable range leaf to remain the lead predicate, got field=%s", db.fieldNameByOrdinal(branch.leadPred().expr.FieldOrdinal))
+			if db.engine.fieldNameByOrdinal(branch.leadPred().expr.FieldOrdinal) != "rank" {
+				t.Fatalf("expected nullable range leaf to remain the lead predicate, got field=%s", db.engine.fieldNameByOrdinal(branch.leadPred().expr.FieldOrdinal))
 			}
 			if p.kind == predicateKindMaterializedNot {
 				t.Fatalf("expected only positive leaf to keep positive materialized side as branch lead")
@@ -1906,7 +1906,7 @@ func TestPlannerOROrderKWay_RepeatedExecutionPromotesExactOnlyMaterializedRange(
 			residualLen := residualChecks.Len()
 			ageBranch := false
 			for pi := 0; pi < branch.predLen(); pi++ {
-				if db.fieldNameByOrdinal(branch.pred(pi).expr.FieldOrdinal) == "age" {
+				if db.engine.fieldNameByOrdinal(branch.pred(pi).expr.FieldOrdinal) == "age" {
 					ageBranch = true
 					break
 				}
@@ -2113,7 +2113,7 @@ func TestPlannerOROrder_RefreshBranchCollapsesCoveredTautology(t *testing.T) {
 	for bi := 0; bi < branches.Len(); bi++ {
 		branch := branches.Get(bi)
 		for pi := 0; pi < branch.predLen(); pi++ {
-			if view.fieldNameByOrdinal(branch.pred(pi).expr.FieldOrdinal) != "age" {
+			if view.engine.fieldNameByOrdinal(branch.pred(pi).expr.FieldOrdinal) != "age" {
 				continue
 			}
 			targetBranch = bi
@@ -2228,7 +2228,7 @@ func TestPlannerOROrder_RefreshBranchCollapsesImpossibleBranch(t *testing.T) {
 	for bi := 0; bi < branches.Len(); bi++ {
 		branch := branches.Get(bi)
 		for pi := 0; pi < branch.predLen(); pi++ {
-			if view.fieldNameByOrdinal(branch.pred(pi).expr.FieldOrdinal) != "age" {
+			if view.engine.fieldNameByOrdinal(branch.pred(pi).expr.FieldOrdinal) != "age" {
 				continue
 			}
 			targetBranch = bi
@@ -2405,7 +2405,7 @@ func TestPlannerOROrder_MergeWarmupMaterializesExactPredicate(t *testing.T) {
 		branch := branches.Get(bi)
 		for pi := 0; pi < branch.predLen(); pi++ {
 			p := branch.pred(pi)
-			if view.fieldNameByOrdinal(p.expr.FieldOrdinal) != "age" {
+			if view.engine.fieldNameByOrdinal(p.expr.FieldOrdinal) != "age" {
 				continue
 			}
 			if !p.hasEffectiveBounds || !p.supportsExactBucketPostingFilter() {
@@ -2520,7 +2520,7 @@ func TestPlannerORBranchesOrdered_CoversOrderRangeLeaves(t *testing.T) {
 		branch := branches.Get(i)
 		for i := 0; i < branch.predLen(); i++ {
 			p := branch.pred(i)
-			if p.covered && db.fieldNameByOrdinal(p.expr.FieldOrdinal) == "age" {
+			if p.covered && db.engine.fieldNameByOrdinal(p.expr.FieldOrdinal) == "age" {
 				covered++
 			}
 		}
@@ -2714,7 +2714,7 @@ func TestPlannerORBranchesOrdered_BoundedCoveredOnlyBranchNotAlwaysTrue(t *testi
 	ov := view.fieldOverlay("age")
 	for i := 0; i < branches.Len(); i++ {
 		branch := branches.GetPtr(i)
-		if branch.expr.Op == compileScalarOpForTest(qx.OpGTE) && db.fieldNameByOrdinal(branch.expr.FieldOrdinal) == "age" {
+		if branch.expr.Op == compileScalarOpForTest(qx.OpGTE) && db.engine.fieldNameByOrdinal(branch.expr.FieldOrdinal) == "age" {
 			foundAgeRange = true
 			if branch.alwaysTrue {
 				t.Fatalf("bounded covered-only age branch must not become alwaysTrue")
@@ -2782,7 +2782,7 @@ func TestPlannerORBranchesOrdered_EmptyCoveredOnlyBranchKeepsZeroEstimatedCard(t
 	foundAgeRange := false
 	for i := 0; i < branches.Len(); i++ {
 		branch := branches.Get(i)
-		if branch.expr.Op != compileScalarOpForTest(qx.OpLT) || db.fieldNameByOrdinal(branch.expr.FieldOrdinal) != "age" {
+		if branch.expr.Op != compileScalarOpForTest(qx.OpLT) || db.engine.fieldNameByOrdinal(branch.expr.FieldOrdinal) != "age" {
 			continue
 		}
 		foundAgeRange = true
@@ -2904,7 +2904,7 @@ func TestPlannerORBranchesOrdered_AvoidsMaterializingDeferredOrderRangeLeaves(t 
 	if len(preds) != 2 {
 		t.Fatalf("unexpected preds len: %d", len(preds))
 	}
-	if db.fieldNameByOrdinal(preds[0].expr.FieldOrdinal) != "score" || db.fieldNameByOrdinal(preds[1].expr.FieldOrdinal) != "age" {
+	if db.engine.fieldNameByOrdinal(preds[0].expr.FieldOrdinal) != "score" || db.engine.fieldNameByOrdinal(preds[1].expr.FieldOrdinal) != "age" {
 		t.Fatalf("unexpected predicate order: %+v", preds)
 	}
 	if preds[0].kind == predicateKindMaterialized || preds[0].kind == predicateKindMaterializedNot {
@@ -2960,7 +2960,7 @@ func TestBuildPredicatesOrdered_MergesPositiveNumericRangeLeavesOnSameField(t *t
 	if len(preds) != 2 {
 		t.Fatalf("unexpected preds len: %d", len(preds))
 	}
-	if db.fieldNameByOrdinal(preds[0].expr.FieldOrdinal) != "score" || db.fieldNameByOrdinal(preds[1].expr.FieldOrdinal) != "age" {
+	if db.engine.fieldNameByOrdinal(preds[0].expr.FieldOrdinal) != "score" || db.engine.fieldNameByOrdinal(preds[1].expr.FieldOrdinal) != "age" {
 		t.Fatalf("unexpected predicate order: %+v", preds)
 	}
 	probeLen := 0
@@ -3417,7 +3417,7 @@ func TestOrderedFallback_TracksMatchedRowsAndExactBitmapFilters(t *testing.T) {
 	}
 	defer preparedQ.Release()
 
-	tr := db.beginTrace(viewQ)
+	tr := db.engine.beginTrace(viewQ)
 	if tr == nil {
 		t.Fatalf("expected trace to be enabled")
 	}

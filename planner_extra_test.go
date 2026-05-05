@@ -1101,6 +1101,8 @@ func TestPlannerExt_Bug_ExecPlanORNoOrderBaseline_PanicsOnAlwaysTrueBranch(t *te
 }
 
 func TestPlannerExt_Property_OrderedORInternalPlansMatchSeqScan(t *testing.T) {
+	t.Parallel()
+
 	db := plannerExtOpenSeededDB(t, Options{AnalyzeInterval: -1})
 	r := rand.New(rand.NewPCG(0x71c0ffee, 0x1234abcd))
 
@@ -1199,6 +1201,8 @@ func TestPlannerExt_Property_OrderedORInternalPlansMatchSeqScan(t *testing.T) {
 }
 
 func TestPlannerExt_Property_NoOrderORInternalPlansPreserveWindow(t *testing.T) {
+	t.Parallel()
+
 	db := plannerExtOpenSeededDB(t, Options{AnalyzeInterval: -1})
 	r := rand.New(rand.NewPCG(0xfeedbabe, 0x55aa33cc))
 

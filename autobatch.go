@@ -1541,13 +1541,13 @@ func (db *DB[K, V]) executeAutoBatchAttempt(active *pooled.SliceBuf[*autoBatchRe
 	}
 
 	snap := db.buildPreparedSnapshotNoLock(seq, att.accepted)
-	db.stageSnapshot(snap)
+	db.snapshot.stage(snap)
 
 	if err = db.commit(tx, opName); err != nil {
 		if stats {
 			db.autoBatcher.txCommitErrors.Add(1)
 		}
-		db.dropStagedSnapshot(seq)
+		db.snapshot.dropStaged(seq)
 		att.rollbackCreated(att.accepted)
 		db.mu.Unlock()
 		assignAutoBatchPreparedErr(att.accepted, err)

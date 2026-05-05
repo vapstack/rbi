@@ -71,7 +71,7 @@ func (qv *queryView) tryOrderBasicNoFilterWithLimit(q *qir.Shape, trace *queryTr
 		return nil, false, nil
 	}
 
-	orderField := qv.fieldNameByOrdinal(order.FieldOrdinal)
+	orderField := qv.engine.fieldNameByOrdinal(order.FieldOrdinal)
 	fm := qv.fieldMetaByOrder(order)
 	if fm == nil || fm.Slice {
 		return nil, false, nil
@@ -1224,7 +1224,7 @@ func (qv *queryView) validateOrderBasicSimpleExpr(e qir.Expr) error {
 	if e.FieldOrdinal < 0 {
 		return fmt.Errorf("%w: invalid expression, op: %v", ErrInvalidQuery, e.Op)
 	}
-	fieldName := qv.fieldNameByOrdinal(e.FieldOrdinal)
+	fieldName := qv.engine.fieldNameByOrdinal(e.FieldOrdinal)
 	ov := qv.fieldOverlayForExpr(e)
 	if !ov.hasData() && !qv.hasIndexedFieldForExpr(e) {
 		return fmt.Errorf("no index for field: %v", fieldName)
@@ -1457,7 +1457,7 @@ func (qv *queryView) prepareOrderBasicBaseCores(baseOps []qir.Expr) (*pooled.Sli
 		if !isOrderBasicCollapsibleNumericRangeExpr(op, fm) {
 			continue
 		}
-		fieldName := qv.fieldNameByOrdinal(op.FieldOrdinal)
+		fieldName := qv.engine.fieldNameByOrdinal(op.FieldOrdinal)
 
 		var rb rangeBounds
 		groupCount := 0
@@ -1544,7 +1544,7 @@ func (qv *queryView) prepareOrderBasicBaseCoresBuf(baseOps *pooled.SliceBuf[qir.
 		if !isOrderBasicCollapsibleNumericRangeExpr(op, fm) {
 			continue
 		}
-		fieldName := qv.fieldNameByOrdinal(op.FieldOrdinal)
+		fieldName := qv.engine.fieldNameByOrdinal(op.FieldOrdinal)
 
 		var rb rangeBounds
 		groupCount := 0
@@ -1728,7 +1728,7 @@ func (qv *queryView) shouldPromoteObservedOrderBasicRawBaseOp(
 	observedRows uint64,
 	needWindow uint64,
 ) bool {
-	if universe == 0 || observedRows == 0 || op.Not || op.FieldOrdinal < 0 || qv.fieldNameByOrdinal(op.FieldOrdinal) == orderField {
+	if universe == 0 || observedRows == 0 || op.Not || op.FieldOrdinal < 0 || qv.engine.fieldNameByOrdinal(op.FieldOrdinal) == orderField {
 		return false
 	}
 	if needWindow == 0 {
@@ -1807,7 +1807,7 @@ func (qv *queryView) materializeOrderMaterializedBaseOpsBuf(orderField string, b
 		case orderBasicBaseCoreCollapsedRange:
 			key = core.collapsed.cacheKey
 		case orderBasicBaseCoreRawExpr:
-			if core.expr.Not || core.expr.FieldOrdinal < 0 || qv.fieldNameByOrdinal(core.expr.FieldOrdinal) == orderField {
+			if core.expr.Not || core.expr.FieldOrdinal < 0 || qv.engine.fieldNameByOrdinal(core.expr.FieldOrdinal) == orderField {
 				continue
 			}
 			stats, ok := qv.orderBasicRawBaseOpStats(core.expr, qv.snapshotUniverseCardinality())
@@ -1922,7 +1922,7 @@ func (qv *queryView) promoteObservedLimitLeafPreds(orderField string, preds *poo
 			ok = true
 		} else {
 			op := pred.pred.expr
-			if !isSimpleScalarRangeOrPrefixLeaf(op) || op.FieldOrdinal < 0 || qv.fieldNameByOrdinal(op.FieldOrdinal) == orderField || op.Not {
+			if !isSimpleScalarRangeOrPrefixLeaf(op) || op.FieldOrdinal < 0 || qv.engine.fieldNameByOrdinal(op.FieldOrdinal) == orderField || op.Not {
 				continue
 			}
 			core = orderBasicBaseCore{
@@ -2052,7 +2052,7 @@ func (qv *queryView) tryQueryOrderBasicWithLimit(q *qir.Shape, trace *queryTrace
 		ops = single[:]
 	}
 
-	f := qv.fieldNameByOrdinal(order.FieldOrdinal)
+	f := qv.engine.fieldNameByOrdinal(order.FieldOrdinal)
 	needWindow, _ := orderWindow(q)
 	fm := qv.fieldMetaByOrder(order)
 	if fm == nil || fm.Slice {
@@ -2614,7 +2614,7 @@ func (qv *queryView) tryQueryOrderPrefixWithLimit(q *qir.Shape, trace *queryTrac
 		return nil, false, nil
 	}
 
-	f := qv.fieldNameByOrdinal(ord.FieldOrdinal)
+	f := qv.engine.fieldNameByOrdinal(ord.FieldOrdinal)
 	fm := qv.fieldMetaByOrder(ord)
 	if fm == nil || fm.Slice {
 		return nil, false, nil
@@ -2903,7 +2903,7 @@ func (qv *queryView) tryQueryPrefixNoOrderWithLimit(q *qir.Shape, trace *queryTr
 	}
 	if !prefixState.hasData {
 		if !qv.hasIndexedFieldForExpr(e) {
-			return nil, true, fmt.Errorf("no index for field: %v", qv.fieldNameByOrdinal(e.FieldOrdinal))
+			return nil, true, fmt.Errorf("no index for field: %v", qv.engine.fieldNameByOrdinal(e.FieldOrdinal))
 		}
 		return nil, true, nil
 	}

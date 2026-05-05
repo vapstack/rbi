@@ -530,11 +530,7 @@ func (c *materializedPredCache) findVictimLocked(mode materializedPredCacheEvict
 	return fallbackIdx
 }
 
-func (c *materializedPredCache) evictLocked(
-	mode materializedPredCacheEvictMode,
-	count *atomic.Int32,
-	oversizedCount *atomic.Int32,
-) bool {
+func (c *materializedPredCache) evictLocked(mode materializedPredCacheEvictMode, count *atomic.Int32, oversizedCount *atomic.Int32) bool {
 	idx := c.findVictimLocked(mode)
 	if idx < 0 {
 		return false
@@ -623,7 +619,7 @@ func inheritNumericRangeBucketCache(next, prev *indexSnapshot) {
 	}
 }
 
-func inheritMaterializedPredCache[K ~string | ~uint64, V any](db *DB[K, V], next, prev *indexSnapshot, changedFields *pooled.SliceBuf[bool]) {
+func inheritMaterializedPredCache(next, prev *indexSnapshot, indexedFieldMap indexedFieldMap, changedFields *pooled.SliceBuf[bool]) {
 	if next == nil || prev == nil {
 		return
 	}
@@ -650,7 +646,7 @@ func inheritMaterializedPredCache[K ~string | ~uint64, V any](db *DB[K, V], next
 			continue
 		}
 		if changedFields != nil {
-			acc, ok := db.indexedFieldMap[f]
+			acc, ok := indexedFieldMap[f]
 			if !ok || changedFields.Get(acc.ordinal) {
 				continue
 			}
@@ -702,7 +698,7 @@ func (db *DB[K, V]) buildPublishedSnapshotNoLock(seq uint64) *indexSnapshot {
 		universe:           db.universe,
 		strmap:             strmap,
 	}
-	db.initSnapshotRuntimeCaches(snap)
+	db.engine.initSnapshotRuntimeCaches(snap)
 	return snap
 }
 
@@ -730,7 +726,7 @@ func (db *DB[K, V]) finishSnapshotPublishNoLock(s *indexSnapshot) {
 	db.lenZeroComplement = s.lenZeroComplement
 	db.measure = s.measure
 	db.universe = s.universe
-	retired := db.publishSnapshotRef(s)
+	retired := db.snapshot.publishRef(s)
 	if db.strKey && db.strMap != nil {
 		db.strMap.markCommittedPublished(s.strmap)
 	}
@@ -782,11 +778,7 @@ func materializedPredCacheStoredIDs(ids posting.List) posting.List {
 	return ids
 }
 
-func newMaterializedPredCacheEntry(
-	ids posting.List,
-	oversized bool,
-	clock *atomic.Uint64,
-) *materializedPredCacheEntry {
+func newMaterializedPredCacheEntry(ids posting.List, oversized bool, clock *atomic.Uint64) *materializedPredCacheEntry {
 	entry := materializedPredCacheEntryPool.Get()
 	entry.refs.Store(1)
 	entry.ids = ids
@@ -889,19 +881,24 @@ func (s *indexSnapshot) loadOrStoreMaterializedPredKey(key materializedPredKey, 
 	if key.isZero() || ids.IsEmpty() || s == nil || s.matPredCache == nil {
 		return ids, false
 	}
+
 	limit := s.materializedPredCacheLimit()
 	if limit <= 0 {
 		return ids, false
 	}
+
 	if s.matPredCacheMaxCard > 0 &&
 		ids.Cardinality() > s.matPredCacheMaxCard {
 		return ids, false
 	}
+
 	if cached, ok := s.loadMaterializedPredKey(key); ok {
 		ids.Release()
 		return cached, true
 	}
+
 	s.matPredCache.mu.Lock()
+
 	if entry, ok := s.matPredCache.lookupLocked(key); ok {
 		s.matPredCache.mu.Unlock()
 		ids.Release()
@@ -911,6 +908,7 @@ func (s *indexSnapshot) loadOrStoreMaterializedPredKey(key materializedPredKey, 
 		entry.touch(&s.matPredCacheClock)
 		return entry.ids.Borrow(), true
 	}
+
 	if int(s.matPredCacheCount.Load()) >= limit &&
 		!s.matPredCache.evictLocked(matPredCacheEvictPreferRegular, &s.matPredCacheCount, &s.matPredCacheOversizedCount) {
 		s.matPredCache.mu.Unlock()
@@ -918,13 +916,16 @@ func (s *indexSnapshot) loadOrStoreMaterializedPredKey(key materializedPredKey, 
 	}
 	stored := materializedPredCacheStoredIDs(ids)
 	entry := newMaterializedPredCacheEntry(stored, false, &s.matPredCacheClock)
+
 	if !s.matPredCache.insertLocked(key, entry) {
 		s.matPredCache.mu.Unlock()
 		entry.release()
 		return ids, false
 	}
+
 	s.matPredCacheCount.Add(1)
 	s.matPredCache.mu.Unlock()
+
 	return stored.Borrow(), true
 }
 
@@ -932,18 +933,23 @@ func (s *indexSnapshot) tryLoadOrStoreMaterializedPredOversizedKey(key materiali
 	if key.isZero() || ids.IsEmpty() || s == nil || s.matPredCache == nil {
 		return ids, false
 	}
+
 	if s.matPredCacheMaxCard == 0 || ids.Cardinality() <= s.matPredCacheMaxCard {
 		return ids, false
 	}
+
 	limit := s.materializedPredCacheLimit()
 	if limit <= 0 {
 		return ids, false
 	}
+
 	if cached, ok := s.loadMaterializedPredKey(key); ok {
 		ids.Release()
 		return cached, true
 	}
+
 	s.matPredCache.mu.Lock()
+
 	if entry, ok := s.matPredCache.lookupLocked(key); ok {
 		s.matPredCache.mu.Unlock()
 		ids.Release()
@@ -953,16 +959,19 @@ func (s *indexSnapshot) tryLoadOrStoreMaterializedPredOversizedKey(key materiali
 		entry.touch(&s.matPredCacheClock)
 		return entry.ids.Borrow(), true
 	}
+
 	if s.matPredCacheOversizedCount.Load() >= materializedPredCacheOversizedLimit(limit) &&
 		!s.matPredCache.evictLocked(matPredCacheEvictOversizedOnly, &s.matPredCacheCount, &s.matPredCacheOversizedCount) {
 		s.matPredCache.mu.Unlock()
 		return ids, false
 	}
+
 	if int(s.matPredCacheCount.Load()) >= limit &&
 		!s.matPredCache.evictLocked(matPredCacheEvictPreferRegular, &s.matPredCacheCount, &s.matPredCacheOversizedCount) {
 		s.matPredCache.mu.Unlock()
 		return ids, false
 	}
+
 	stored := materializedPredCacheStoredIDs(ids)
 	entry := newMaterializedPredCacheEntry(stored, true, &s.matPredCacheClock)
 	if !s.matPredCache.insertLocked(key, entry) {
@@ -970,9 +979,12 @@ func (s *indexSnapshot) tryLoadOrStoreMaterializedPredOversizedKey(key materiali
 		entry.release()
 		return ids, false
 	}
+
 	s.matPredCacheCount.Add(1)
 	s.matPredCacheOversizedCount.Add(1)
+
 	s.matPredCache.mu.Unlock()
+
 	return stored.Borrow(), true
 }
 
@@ -1156,17 +1168,17 @@ func (s *indexSnapshot) fieldLookupPostingRetained(field, key string) posting.Li
 	return newFieldOverlayStorage(s.index.Get(acc.ordinal)).lookupPostingRetained(key)
 }
 
-func (db *DB[K, V]) publishSnapshotRef(s *indexSnapshot) *pooled.SliceBuf[*indexSnapshot] {
+func (sm *snapshotManager) publishRef(s *indexSnapshot) *pooled.SliceBuf[*indexSnapshot] {
 	if s == nil {
 		return nil
 	}
-	db.snapshot.mu.Lock()
+	sm.mu.Lock()
 
-	prev := db.snapshot.current.Load()
-	ref := db.snapshot.bySeq[s.seq]
+	prev := sm.current.Load()
+	ref := sm.bySeq[s.seq]
 	if ref == nil {
 		ref = snapshotRefPool.Get()
-		db.snapshot.bySeq[s.seq] = ref
+		sm.bySeq[s.seq] = ref
 	}
 	var retired *pooled.SliceBuf[*indexSnapshot]
 	if prev != nil && prev.seq == s.seq && ref.snap != nil && ref.snap != s {
@@ -1177,59 +1189,59 @@ func (db *DB[K, V]) publishSnapshotRef(s *indexSnapshot) *pooled.SliceBuf[*index
 		}
 	}
 	ref.snap = s
-	db.snapshot.current.Store(s)
-	db.snapshot.currentRef.Store(ref)
+	sm.current.Store(s)
+	sm.currentRef.Store(ref)
 	if prev != nil && prev.seq != s.seq {
-		retired = db.retireSnapshotLocked(prev.seq)
+		retired = sm.retireSnapshotLocked(prev.seq)
 	}
-	db.snapshot.mu.Unlock()
+	sm.mu.Unlock()
 	return retired
 }
 
-func (db *DB[K, V]) stageSnapshot(s *indexSnapshot) {
+func (sm *snapshotManager) stage(s *indexSnapshot) {
 	if s == nil {
 		return
 	}
-	db.snapshot.mu.Lock()
-	defer db.snapshot.mu.Unlock()
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
 
-	ref := db.snapshot.bySeq[s.seq]
+	ref := sm.bySeq[s.seq]
 	if ref == nil {
 		ref = snapshotRefPool.Get()
-		db.snapshot.bySeq[s.seq] = ref
+		sm.bySeq[s.seq] = ref
 	}
 	ref.snap = s
 }
 
-func (db *DB[K, V]) dropStagedSnapshot(seq uint64) {
-	db.snapshot.mu.Lock()
+func (sm *snapshotManager) dropStaged(seq uint64) {
+	sm.mu.Lock()
 
-	ref := db.snapshot.bySeq[seq]
+	ref := sm.bySeq[seq]
 	if ref == nil {
-		db.snapshot.mu.Unlock()
+		sm.mu.Unlock()
 		return
 	}
-	if current := db.snapshot.current.Load(); current != nil && current.seq == seq {
-		db.snapshot.mu.Unlock()
+	if current := sm.current.Load(); current != nil && current.seq == seq {
+		sm.mu.Unlock()
 		return
 	}
 	var retired *pooled.SliceBuf[*indexSnapshot]
 	if ref.refs.Load() <= 0 {
-		retired = db.releaseRetiredSnapshotRefLocked(seq, ref)
-		db.snapshot.mu.Unlock()
+		retired = sm.releaseRetiredSnapshotRefLocked(seq, ref)
+		sm.mu.Unlock()
 		releaseRetiredSnapshots(retired)
 		return
 	}
 	ref.retired = appendRetiredSnapshot(ref.retired, ref.snap)
 	ref.snap = nil
-	db.snapshot.mu.Unlock()
+	sm.mu.Unlock()
 }
 
-func (db *DB[K, V]) pinSnapshotRefBySeq(seq uint64) (*indexSnapshot, *snapshotRef, bool) {
-	db.snapshot.mu.RLock()
-	defer db.snapshot.mu.RUnlock()
+func (sm *snapshotManager) pinRefBySeq(seq uint64) (*indexSnapshot, *snapshotRef, bool) {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
 
-	ref := db.snapshot.bySeq[seq]
+	ref := sm.bySeq[seq]
 	if ref == nil || ref.snap == nil {
 		return nil, nil, false
 	}
@@ -1237,31 +1249,35 @@ func (db *DB[K, V]) pinSnapshotRefBySeq(seq uint64) (*indexSnapshot, *snapshotRe
 	return ref.snap, ref, true
 }
 
-func (db *DB[K, V]) unpinSnapshotRef(seq uint64, ref *snapshotRef) {
+func (sm *snapshotManager) unpinRef(seq uint64, ref *snapshotRef) {
 	if ref == nil {
 		return
 	}
 	if ref.refs.Add(-1) != 0 {
 		return
 	}
-	var drainCache *materializedPredCache
-	var retired *pooled.SliceBuf[*indexSnapshot]
-	db.snapshot.mu.Lock()
-	held := db.snapshot.bySeq[seq]
+	var (
+		drainCache *materializedPredCache
+		retired    *pooled.SliceBuf[*indexSnapshot]
+	)
+
+	sm.mu.Lock()
+	held := sm.bySeq[seq]
 	if held != ref || held.refs.Load() != 0 || held.snap != nil {
 		if held == ref && held != nil && held.refs.Load() == 0 && held.snap != nil &&
-			held == db.snapshot.currentRef.Load() && held.retired != nil {
+			held == sm.currentRef.Load() && held.retired != nil {
 			retired = held.retired
 			held.retired = nil
 		}
 		if held == ref && held != nil && held.snap != nil &&
-			held == db.snapshot.currentRef.Load() {
+			held == sm.currentRef.Load() {
 			drainCache = held.snap.matPredCache
 			if drainCache != nil {
 				drainCache.retain()
 			}
 		}
-		db.snapshot.mu.Unlock()
+		sm.mu.Unlock()
+
 		releaseRetiredSnapshots(retired)
 		if drainCache != nil {
 			drainCache.drainRetired()
@@ -1269,17 +1285,20 @@ func (db *DB[K, V]) unpinSnapshotRef(seq uint64, ref *snapshotRef) {
 		}
 		return
 	}
-	retired = db.releaseRetiredSnapshotRefLocked(seq, held)
-	db.snapshot.mu.Unlock()
+
+	retired = sm.releaseRetiredSnapshotRefLocked(seq, held)
+
+	sm.mu.Unlock()
+
 	releaseRetiredSnapshots(retired)
 }
 
-func (db *DB[K, V]) retireSnapshotLocked(seq uint64) *pooled.SliceBuf[*indexSnapshot] {
-	ref := db.snapshot.bySeq[seq]
+func (sm *snapshotManager) retireSnapshotLocked(seq uint64) *pooled.SliceBuf[*indexSnapshot] {
+	ref := sm.bySeq[seq]
 	if ref == nil {
 		return nil
 	}
-	if current := db.snapshot.current.Load(); current != nil && current.seq == seq {
+	if current := sm.current.Load(); current != nil && current.seq == seq {
 		return nil
 	}
 	if ref.refs.Load() != 0 {
@@ -1287,14 +1306,14 @@ func (db *DB[K, V]) retireSnapshotLocked(seq uint64) *pooled.SliceBuf[*indexSnap
 		ref.snap = nil
 		return nil
 	}
-	return db.releaseRetiredSnapshotRefLocked(seq, ref)
+	return sm.releaseRetiredSnapshotRefLocked(seq, ref)
 }
 
-func (db *DB[K, V]) releaseRetiredSnapshotRefLocked(seq uint64, ref *snapshotRef) *pooled.SliceBuf[*indexSnapshot] {
+func (sm *snapshotManager) releaseRetiredSnapshotRefLocked(seq uint64, ref *snapshotRef) *pooled.SliceBuf[*indexSnapshot] {
 	if ref == nil {
 		return nil
 	}
-	if current := db.snapshot.current.Load(); current != nil && current.seq == seq {
+	if current := sm.current.Load(); current != nil && current.seq == seq {
 		return nil
 	}
 	if ref.refs.Load() != 0 {
@@ -1306,9 +1325,9 @@ func (db *DB[K, V]) releaseRetiredSnapshotRefLocked(seq uint64, ref *snapshotRef
 	}
 	ref.snap = nil
 	ref.retired = nil
-	delete(db.snapshot.bySeq, seq)
-	if db.snapshot.currentRef.Load() == ref {
-		db.snapshot.currentRef.Store(nil)
+	delete(sm.bySeq, seq)
+	if sm.currentRef.Load() == ref {
+		sm.currentRef.Store(nil)
 	}
 	snapshotRefPool.Put(ref)
 	return retired
@@ -1337,6 +1356,7 @@ func (db *DB[K, V]) SnapshotStats() SnapshotStats {
 
 	s, seq, ref, pinned := db.pinCurrentSnapshot()
 	defer db.unpinCurrentSnapshot(seq, ref, pinned)
+
 	diag := SnapshotStats{
 		Sequence: s.seq,
 	}
@@ -1612,7 +1632,7 @@ func (db *DB[K, V]) buildPreparedSnapshotFromEmptyBaseNoLock(seq uint64, prev *i
 		universe:           universe,
 		strmap:             db.strMap.snapshot(),
 	}
-	db.initSnapshotRuntimeCaches(snap)
+	db.engine.initSnapshotRuntimeCaches(snap)
 	inheritNumericRangeBucketCache(snap, prev)
 	changedCount := 0
 	for i := range fieldStates {
@@ -1628,10 +1648,10 @@ func (db *DB[K, V]) buildPreparedSnapshotFromEmptyBaseNoLock(seq uint64, prev *i
 				changed.Set(i, true)
 			}
 		}
-		inheritMaterializedPredCache(db, snap, prev, changed)
+		inheritMaterializedPredCache(snap, prev, db.indexedFieldMap, changed)
 		fieldIndexBoolSlicePool.Put(changed)
 	} else {
-		inheritMaterializedPredCache(db, snap, prev, nil)
+		inheritMaterializedPredCache(snap, prev, db.indexedFieldMap, nil)
 	}
 	snap.ensureUniverseOwner()
 	return snap, true
@@ -1799,7 +1819,7 @@ func (db *DB[K, V]) buildPreparedSnapshotInsertOnlyNoLock(seq uint64, prev *inde
 		strmap:             db.strMap.snapshot(),
 	}
 	next.universe = next.universe.BuildMergedOwned(addedUniverse)
-	db.initSnapshotRuntimeCaches(next)
+	db.engine.initSnapshotRuntimeCaches(next)
 
 	fieldStates := snapshotFieldInsertStateSlicePool.Get()
 	fieldStates.SetLen(len(db.indexedFieldAccess))
@@ -1864,10 +1884,10 @@ func (db *DB[K, V]) buildPreparedSnapshotInsertOnlyNoLock(seq uint64, prev *inde
 				changed.Set(i, true)
 			}
 		}
-		inheritMaterializedPredCache(db, next, prev, changed)
+		inheritMaterializedPredCache(next, prev, db.indexedFieldMap, changed)
 		fieldIndexBoolSlicePool.Put(changed)
 	} else {
-		inheritMaterializedPredCache(db, next, prev, nil)
+		inheritMaterializedPredCache(next, prev, db.indexedFieldMap, nil)
 	}
 	next.retainSharedOwnedStorageFrom(prev)
 	snapshotFieldInsertStateSlicePool.Put(fieldStates)

@@ -1,10 +1,6 @@
 package rbi
 
-import (
-	"time"
-
-	"github.com/vapstack/rbi/internal/qir"
-)
+import "time"
 
 // TraceEvent is an optional per-query planner execution trace.
 // It is emitted only when TraceSink is configured.
@@ -139,82 +135,6 @@ func traceSampleEvery(sampleEvery int, sink func(TraceEvent)) uint64 {
 		return 1
 	}
 	return uint64(sampleEvery)
-}
-
-func (db *DB[K, V]) traceOrCalibrationSamplingEnabled() bool {
-	if db.traceRoot != nil {
-		return db.traceRoot.traceOrCalibrationSamplingEnabled()
-	}
-	if db.planner.tracer.sink != nil && db.planner.tracer.sampleEvery > 0 {
-		return true
-	}
-	return db.planner.calibrator.enabled && db.planner.calibrator.sampleEvery > 0
-}
-
-// beginTrace handles begin trace.
-func (db *DB[K, V]) beginTrace(q qir.Shape) *queryTrace {
-	if db.traceRoot != nil {
-		return db.traceRoot.beginTrace(q)
-	}
-
-	emitTrace := false
-	sink := db.planner.tracer.sink
-	if sink != nil && db.planner.tracer.sampleEvery > 0 {
-		emitTrace = db.shouldSampleTrace()
-	}
-
-	emitCalibration := false
-	if db.planner.calibrator.enabled && db.planner.calibrator.sampleEvery > 0 {
-		emitCalibration = db.shouldSampleCalibration()
-	}
-
-	if !emitTrace && !emitCalibration {
-		return nil
-	}
-
-	tr := new(queryTrace)
-	if emitTrace {
-		tr.ev = TraceEvent{
-			Timestamp: time.Now(),
-			Offset:    q.Offset,
-			Limit:     q.Limit,
-		}
-		if q.HasOrder {
-			tr.ev.HasOrder = true
-			tr.ev.OrderField = db.fieldNameByOrdinal(q.Order.FieldOrdinal)
-			tr.ev.OrderDesc = q.Order.Desc
-		}
-
-		var leavesBuf [8]qir.Expr
-		leaves, ok := collectAndLeavesModeScratch(q.Expr, leavesBuf[:0], andLeafModeCollect)
-		if ok {
-			tr.ev.LeafCount = len(leaves)
-			for _, e := range leaves {
-				if e.Not {
-					tr.ev.HasNeg = true
-				}
-				if e.Op == qir.OpPREFIX {
-					tr.ev.HasPrefix = true
-				}
-			}
-		}
-
-		tr.start = tr.ev.Timestamp
-		tr.sink = sink
-	}
-	if emitCalibration {
-		tr.onFinish = db.observeCalibration
-	}
-	return tr
-}
-
-func (db *DB[K, V]) shouldSampleTrace() bool {
-	every := db.planner.tracer.sampleEvery
-	if every <= 1 {
-		return true
-	}
-	seq := db.planner.tracer.seq.Add(1)
-	return seq%every == 0
 }
 
 func (t *queryTrace) setPlan(plan PlanName) {

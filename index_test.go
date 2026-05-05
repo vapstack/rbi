@@ -166,6 +166,8 @@ func TestQueryViewIdxMapping_UsesPinnedStrMapSnapshot(t *testing.T) {
 		indexFields: map[string]*field{},
 		options:     &Options{},
 	}
+	db.planner = &planner{}
+	db.initQueryEngine()
 	strMapSnap := &strMapSnapshot{
 		Next: 1,
 		Strs: map[uint64]string{1: "snap-key"},
@@ -3973,11 +3975,11 @@ func TestIndexExt_SnapshotOverlayStableDuringConcurrentWrites(t *testing.T) {
 	})
 
 	snap := db.getSnapshot()
-	pinnedSnap, pinnedRef, ok := db.pinSnapshotRefBySeq(snap.seq)
+	pinnedSnap, pinnedRef, ok := db.snapshot.pinRefBySeq(snap.seq)
 	if !ok {
 		t.Fatalf("pinSnapshotRefBySeq(%d): false", snap.seq)
 	}
-	defer db.unpinSnapshotRef(snap.seq, pinnedRef)
+	defer db.snapshot.unpinRef(snap.seq, pinnedRef)
 	snap = pinnedSnap
 	storage, ok := snap.fieldIndexStorage("name")
 	if !ok {

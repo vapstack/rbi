@@ -1414,9 +1414,6 @@ func (db *DB[K, V]) isLenZeroComplementField(field string) bool {
 	if !ok || db.lenZeroComplement == nil || acc.ordinal >= db.lenZeroComplement.Len() {
 		return false
 	}
-	if db.traceRoot != nil {
-		return db.lenZeroComplement.Get(acc.ordinal)
-	}
 	db.mu.RLock()
 	defer db.mu.RUnlock()
 	return db.lenZeroComplement.Get(acc.ordinal)

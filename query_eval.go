@@ -37,7 +37,7 @@ func releasePostingResults(buf *pooled.SliceBuf[postingResult]) {
 
 func (qv *queryView) checkUsedQuery(q *qir.Shape) error {
 	if q.HasOrder && qv.fieldMetaByOrder(q.Order) == nil {
-		return fmt.Errorf("no index for field: %v", qv.fieldNameByOrdinal(q.Order.FieldOrdinal))
+		return fmt.Errorf("no index for field: %v", qv.engine.fieldNameByOrdinal(q.Order.FieldOrdinal))
 	}
 	return qv.checkUsedExpr(q.Expr)
 }
@@ -45,7 +45,7 @@ func (qv *queryView) checkUsedQuery(q *qir.Shape) error {
 func (qv *queryView) checkUsedExpr(exp qir.Expr) error {
 	if exp.FieldOrdinal >= 0 {
 		if qv.fieldMetaByExpr(exp) == nil {
-			return fmt.Errorf("no index for field: %v", qv.fieldNameByOrdinal(exp.FieldOrdinal))
+			return fmt.Errorf("no index for field: %v", qv.engine.fieldNameByOrdinal(exp.FieldOrdinal))
 		}
 	}
 	for _, op := range exp.Operands {
@@ -211,7 +211,7 @@ func (qv *queryView) evalAndOperands(ops []qir.Expr, negate bool) (postingResult
 // evalSimple evaluates a single non-boolean predicate against the current
 // immutable snapshot indexes.
 func (qv *queryView) evalSimple(e qir.Expr) (postingResult, error) {
-	fieldName := qv.fieldNameByOrdinal(e.FieldOrdinal)
+	fieldName := qv.engine.fieldNameByOrdinal(e.FieldOrdinal)
 	ov := qv.fieldOverlayForExpr(e)
 	if !ov.hasData() && !qv.hasIndexedFieldForExpr(e) {
 		return postingResult{}, fmt.Errorf("no index for field: %v", fieldName)
@@ -497,14 +497,15 @@ func parallelBatchedPostingUnionOwned(posts []posting.List) posting.List {
 func (qv *queryView) evalSliceEQ(field string, fieldOrdinal int, vals stringKeyReader) (postingResult, error) {
 	valCount := stringKeyReaderLen(vals)
 	lenOV := qv.lenFieldOverlayRef(field, fieldOrdinal)
+
 	useZeroComplement := valCount == 0 && qv.isLenZeroComplementRef(field, fieldOrdinal)
+
 	if !lenOV.hasData() && qv.snapshotLenFieldIndexSliceRef(field, fieldOrdinal) == nil && !useZeroComplement {
 		return postingResult{}, fmt.Errorf("no lenIndex for slice field: %v", field)
 	}
 
-	var (
-		lenBM posting.List
-	)
+	var lenBM posting.List
+
 	if useZeroComplement {
 		nonEmpty := lenOV.lookupPostingRetained(lenIndexNonEmptyKey)
 		lenBM = qv.snapshotUniverseView().Clone()
@@ -513,6 +514,7 @@ func (qv *queryView) evalSliceEQ(field string, fieldOrdinal int, vals stringKeyR
 		lenKey := uint64ByteStr(uint64(valCount))
 		lenBM = lenOV.lookupPostingRetained(lenKey)
 	}
+
 	if lenBM.IsEmpty() {
 		return postingResult{}, nil
 	}

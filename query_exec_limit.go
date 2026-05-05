@@ -459,7 +459,7 @@ func (qv *queryView) tryLimitQuery(q *qir.Shape, trace *queryTrace) ([]uint64, b
 			return nil, false, "", err
 		}
 		plan := PlanLimitOrderBasic
-		if qv.hasPrefixBoundForField(leaves, qv.fieldNameByOrdinal(q.Order.FieldOrdinal)) {
+		if qv.hasPrefixBoundForField(leaves, qv.engine.fieldNameByOrdinal(q.Order.FieldOrdinal)) {
 			plan = PlanLimitOrderPrefix
 		}
 		return out, true, plan, err
@@ -498,7 +498,7 @@ func (qv *queryView) extractNoOrderBounds(leaves []qir.Expr) (string, rangeBound
 		if e.Not || e.FieldOrdinal < 0 {
 			return "", rangeBounds{}, false, nil
 		}
-		fieldName := qv.fieldNameByOrdinal(e.FieldOrdinal)
+		fieldName := qv.engine.fieldNameByOrdinal(e.FieldOrdinal)
 		if !found {
 			found = true
 			f = fieldName
@@ -729,7 +729,7 @@ func (qv *queryView) hasPrefixBoundForField(leaves []qir.Expr, field string) boo
 		if e.Not {
 			continue
 		}
-		if qv.fieldNameByOrdinal(e.FieldOrdinal) == field && e.Op == qir.OpPREFIX {
+		if qv.engine.fieldNameByOrdinal(e.FieldOrdinal) == field && e.Op == qir.OpPREFIX {
 			return true
 		}
 	}
@@ -809,7 +809,7 @@ func (qv *queryView) tryLimitQueryOrderBasic(q *qir.Shape, leaves []qir.Expr, tr
 	order := q.Order
 	needWindow, _ := orderWindow(q)
 
-	f := qv.fieldNameByOrdinal(order.FieldOrdinal)
+	f := qv.engine.fieldNameByOrdinal(order.FieldOrdinal)
 	if order.FieldOrdinal < 0 {
 		return nil, false, nil
 	}
@@ -960,11 +960,11 @@ func (qv *queryView) buildLeafPredsExcludingBounds(leaves []qir.Expr, field stri
 		defer orderedMergedScalarRangeFieldSlicePool.Put(mergedRangesBuf)
 	}
 	for i, e := range leaves {
-		if isBoundOp(e.Op) && !e.Not && qv.fieldNameByOrdinal(e.FieldOrdinal) == field {
+		if isBoundOp(e.Op) && !e.Not && qv.engine.fieldNameByOrdinal(e.FieldOrdinal) == field {
 			continue
 		}
 		if mergedRangesBuf != nil && qv.isPositiveMergedNumericRangeLeaf(e) {
-			idx := findOrderedMergedScalarRangeField(mergedRangesBuf, qv.fieldNameByOrdinal(e.FieldOrdinal))
+			idx := findOrderedMergedScalarRangeField(mergedRangesBuf, qv.engine.fieldNameByOrdinal(e.FieldOrdinal))
 			if idx >= 0 {
 				merged := mergedRangesBuf.Get(idx)
 				if merged.count > 1 {
@@ -1200,7 +1200,7 @@ func (qv *queryView) extractBoundsForField(field string, leaves []qir.Expr) (ran
 		if e.Not || e.FieldOrdinal < 0 {
 			return b, false, nil
 		}
-		if qv.fieldNameByOrdinal(e.FieldOrdinal) != field {
+		if qv.engine.fieldNameByOrdinal(e.FieldOrdinal) != field {
 			continue
 		}
 
@@ -1287,7 +1287,7 @@ func (qv *queryView) buildLeafPred(e qir.Expr) (leafPred, bool, error) {
 		return leafPred{}, false, nil
 	}
 
-	fieldName := qv.fieldNameByOrdinal(e.FieldOrdinal)
+	fieldName := qv.engine.fieldNameByOrdinal(e.FieldOrdinal)
 	ov := qv.fieldOverlayForExpr(e)
 	if !ov.hasData() && !qv.hasIndexedFieldForExpr(e) {
 		return leafPred{}, false, nil
@@ -1509,7 +1509,7 @@ func (qv *queryView) buildMergedLimitLeafPred(e qir.Expr, bounds rangeBounds, or
 	if fm == nil || fm.Slice {
 		return leafPred{}, false, nil
 	}
-	fieldName := qv.fieldNameByOrdinal(e.FieldOrdinal)
+	fieldName := qv.engine.fieldNameByOrdinal(e.FieldOrdinal)
 	allowMaterialize := false
 	if orderedWindow > 0 {
 		var core preparedScalarRangePredicate
@@ -1568,7 +1568,7 @@ func (qv *queryView) supportsLimitLeafPredExpr(e qir.Expr) bool {
 func (qv *queryView) supportsLimitLeafPredsExcludingBounds(leaves []qir.Expr, field string) bool {
 	hasResidual := false
 	for _, e := range leaves {
-		if isBoundOp(e.Op) && !e.Not && qv.fieldNameByOrdinal(e.FieldOrdinal) == field {
+		if isBoundOp(e.Op) && !e.Not && qv.engine.fieldNameByOrdinal(e.FieldOrdinal) == field {
 			continue
 		}
 		hasResidual = true
@@ -1581,7 +1581,7 @@ func (qv *queryView) supportsLimitLeafPredsExcludingBounds(leaves []qir.Expr, fi
 
 func (qv *queryView) hasWarmScalarLimitLeafPredsExcludingBounds(leaves []qir.Expr, field string) bool {
 	for _, e := range leaves {
-		if isBoundOp(e.Op) && !e.Not && qv.fieldNameByOrdinal(e.FieldOrdinal) == field {
+		if isBoundOp(e.Op) && !e.Not && qv.engine.fieldNameByOrdinal(e.FieldOrdinal) == field {
 			continue
 		}
 		if !isSimpleScalarRangeOrPrefixLeaf(e) {

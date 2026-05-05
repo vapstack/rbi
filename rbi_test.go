@@ -5509,7 +5509,7 @@ func TestComponentAccessors_ExposePlannerCalibrationAndSnapshotDiagnostics(t *te
 		t.Fatalf("Set(2): %v", err)
 	}
 
-	db.observeCalibration(TraceEvent{
+	db.engine.observeCalibration(TraceEvent{
 		Plan:          string(PlanOrdered),
 		EstimatedRows: 64,
 		RowsExamined:  96,
@@ -5628,7 +5628,7 @@ func TestComponentAccessors(t *testing.T) {
 		t.Fatalf("Set(2): %v", err)
 	}
 
-	db.observeCalibration(TraceEvent{
+	db.engine.observeCalibration(TraceEvent{
 		Plan:          string(PlanOrdered),
 		EstimatedRows: 64,
 		RowsExamined:  96,

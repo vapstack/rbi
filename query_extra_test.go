@@ -112,7 +112,7 @@ func assertQueryExtPreparedMatchesExpected(t *testing.T, db *DB[uint64, Rec], q 
 
 func assertQueryExtAllReadPathsMatchExpected(t *testing.T, db *DB[uint64, Rec], q *qx.QX) {
 	t.Helper()
-	newUint64QueryContract(t, db).AssertAllReadPathsMatchReference(q)
+	newUint64QueryContract(t, db).assertAllReadPathsMatchReference(q)
 }
 
 func queryExtItemNames(t testing.TB, items []*Rec) []string {

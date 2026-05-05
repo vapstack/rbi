@@ -299,7 +299,7 @@ func (qv *queryView) tryCountBySliceLookup(expr qir.Expr, trace *queryTrace) (ui
 	switch expr.Op {
 
 	case qir.OpHASANY:
-		postsBuf, _ := qv.scalarLookupPostings(qv.fieldNameByOrdinal(expr.FieldOrdinal), expr.FieldOrdinal, valsBuf, false)
+		postsBuf, _ := qv.scalarLookupPostings(qv.engine.fieldNameByOrdinal(expr.FieldOrdinal), expr.FieldOrdinal, valsBuf, false)
 		defer postingSlicePool.Put(postsBuf)
 		switch postsBuf.Len() {
 		case 0:
@@ -807,7 +807,7 @@ func (qv *queryView) evalAndOperandsExceptReordered(ops []qir.Expr, skip int) (p
 		if mergedRangesBuf != nil {
 			e := plans[pi].expr
 			if qv.isPositiveMergedNumericRangeLeaf(e) {
-				idx := findOrderedMergedScalarRangeField(mergedRangesBuf, qv.fieldNameByOrdinal(e.FieldOrdinal))
+				idx := findOrderedMergedScalarRangeField(mergedRangesBuf, qv.engine.fieldNameByOrdinal(e.FieldOrdinal))
 				if idx >= 0 {
 					merged := mergedRangesBuf.Get(idx)
 					if merged.count > 1 {
@@ -909,7 +909,7 @@ func (qv *queryView) evalMergedExactRangePostingResult(e qir.Expr, bounds rangeB
 		return postingResult{}, true
 	}
 	if core.expr.Op != qir.OpPREFIX {
-		if out, ok := qv.tryEvalNumericRangeBuckets(qv.fieldNameByOrdinal(core.expr.FieldOrdinal), core.fm, ov, br); ok {
+		if out, ok := qv.tryEvalNumericRangeBuckets(qv.engine.fieldNameByOrdinal(core.expr.FieldOrdinal), core.fm, ov, br); ok {
 			if out.ids.IsEmpty() {
 				return postingResult{}, true
 			}
@@ -1327,7 +1327,7 @@ func (qv *queryView) buildCountPredicatesWithMode(leaves []qir.Expr, allowMateri
 
 	for i, e := range leaves {
 		if mergedRangesBuf != nil && qv.isPositiveMergedNumericRangeLeaf(e) {
-			idx := findOrderedMergedScalarRangeField(mergedRangesBuf, qv.fieldNameByOrdinal(e.FieldOrdinal))
+			idx := findOrderedMergedScalarRangeField(mergedRangesBuf, qv.engine.fieldNameByOrdinal(e.FieldOrdinal))
 			if idx >= 0 {
 				merged := mergedRangesBuf.Get(idx)
 				if merged.count > 1 {
@@ -2782,7 +2782,7 @@ func (qv *queryView) tryCountByPredicatesLeadBuckets(preds predicateSet, leadIdx
 	}
 	ov := span.ov
 	if ov.chunked != nil {
-		rb, covered, hasBounds, ok := qv.collectPredicateRangeBoundsSet(qv.fieldNameByOrdinal(e.FieldOrdinal), preds)
+		rb, covered, hasBounds, ok := qv.collectPredicateRangeBoundsSet(qv.engine.fieldNameByOrdinal(e.FieldOrdinal), preds)
 		if !ok || !hasBounds {
 			if ok {
 				boolSlicePool.Put(covered)
@@ -2933,7 +2933,7 @@ func (qv *queryView) tryCountByPredicatesLeadBuckets(preds predicateSet, leadIdx
 	if !span.hasData {
 		return 0, 0, false
 	}
-	rb, covered, hasBounds, ok := qv.collectPredicateRangeBoundsSet(qv.fieldNameByOrdinal(e.FieldOrdinal), preds)
+	rb, covered, hasBounds, ok := qv.collectPredicateRangeBoundsSet(qv.engine.fieldNameByOrdinal(e.FieldOrdinal), preds)
 	if !ok || !hasBounds {
 		if ok {
 			boolSlicePool.Put(covered)

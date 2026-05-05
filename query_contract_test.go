@@ -16,6 +16,50 @@ type queryContract[K ~uint64 | ~string] struct {
 	equal     func(*qx.QX, []K, []K) bool
 }
 
+type queryContractReference[K ~uint64 | ~string] struct {
+	pageKeys []K
+	fullKeys []K
+	pageSet  bool
+	fullSet  bool
+}
+
+func (r *queryContractReference[K]) page(c queryContract[K], q *qx.QX) []K {
+	if !r.pageSet {
+		keys, err := c.reference(c.t, c.db, q)
+		if err != nil {
+			c.t.Fatalf("reference keys(%+v): %v", q, err)
+		}
+		r.pageKeys = keys
+		r.pageSet = true
+	}
+	return r.pageKeys
+}
+
+func (r *queryContractReference[K]) full(c queryContract[K], q *qx.QX) []K {
+	if !r.fullSet {
+		if q.Window.Offset == 0 && q.Window.Limit == 0 && len(q.Order) == 0 {
+			r.fullKeys = r.page(c, q)
+		} else {
+			fullQ := cloneQuery(q)
+			clearQueryOrderWindowForTest(fullQ)
+			keys, err := c.reference(c.t, c.db, fullQ)
+			if err != nil {
+				c.t.Fatalf("reference keys(%+v): %v", fullQ, err)
+			}
+			r.fullKeys = keys
+		}
+		r.fullSet = true
+	}
+	return r.fullKeys
+}
+
+func (r *queryContractReference[K]) count(c queryContract[K], q *qx.QX) uint64 {
+	if q.Window.Offset == 0 && q.Window.Limit == 0 && len(q.Order) == 0 {
+		return uint64(len(r.page(c, q)))
+	}
+	return uint64(len(r.full(c, q)))
+}
+
 func newUint64QueryContract(t testing.TB, db *DB[uint64, Rec]) queryContract[uint64] {
 	t.Helper()
 	return queryContract[uint64]{
@@ -38,18 +82,14 @@ func newStringQueryContract(t testing.TB, db *DB[string, Rec]) queryContract[str
 
 func (c queryContract[K]) ReferenceKeys(q *qx.QX) []K {
 	c.t.Helper()
-	keys, err := c.reference(c.t, c.db, q)
-	if err != nil {
-		c.t.Fatalf("reference keys(%+v): %v", q, err)
-	}
-	return keys
+	var ref queryContractReference[K]
+	return ref.page(c, q)
 }
 
 func (c queryContract[K]) ReferenceFullKeys(q *qx.QX) []K {
 	c.t.Helper()
-	fullQ := cloneQuery(q)
-	clearQueryOrderWindowForTest(fullQ)
-	return c.ReferenceKeys(fullQ)
+	var ref queryContractReference[K]
+	return ref.full(c, q)
 }
 
 func (c queryContract[K]) AssertQueryKeysMatchReference(q *qx.QX) []K {
@@ -58,7 +98,8 @@ func (c queryContract[K]) AssertQueryKeysMatchReference(q *qx.QX) []K {
 	if err != nil {
 		c.t.Fatalf("QueryKeys(%+v): %v", q, err)
 	}
-	c.AssertKeysMatchReference("QueryKeys", q, got)
+	var ref queryContractReference[K]
+	c.assertKeysMatchReference("QueryKeys", q, got, &ref)
 	return got
 }
 
@@ -74,25 +115,32 @@ func (c queryContract[K]) AssertPreparedKeysMatchReference(q *qx.QX) []K {
 	if err != nil {
 		c.t.Fatalf("execPreparedQuery(%+v): %v", nq, err)
 	}
-	c.AssertKeysMatchReference("execPreparedQuery", q, got)
+	var ref queryContractReference[K]
+	c.assertKeysMatchReference("execPreparedQuery", q, got, &ref)
 	return got
 }
 
 func (c queryContract[K]) AssertKeysMatchReference(label string, q *qx.QX, got []K) {
+	c.t.Helper()
+	var ref queryContractReference[K]
+	c.assertKeysMatchReference(label, q, got, &ref)
+}
+
+func (c queryContract[K]) assertKeysMatchReference(label string, q *qx.QX, got []K, ref *queryContractReference[K]) {
 	c.t.Helper()
 	if err := queryContractValidateNoDuplicateKeys(label, got); err != nil {
 		c.t.Fatal(err)
 	}
 
 	if queryContractNoOrderWindow(q) {
-		full := c.ReferenceFullKeys(q)
+		full := ref.full(c, q)
 		if err := queryContractValidateNoOrderWindow(q, got, full); err != nil {
 			c.t.Fatalf("%s no-order window mismatch: %v\ngot=%v\nfull=%v", label, err, got, full)
 		}
 		return
 	}
 
-	want := c.ReferenceKeys(q)
+	want := ref.page(c, q)
 	if !c.equal(q, got, want) {
 		c.t.Fatalf("%s mismatch:\nq=%+v\ngot=%v\nwant=%v", label, q, got, want)
 	}
@@ -143,7 +191,14 @@ func (c queryContract[K]) AssertQueryRecordsMatchKeys(q *qx.QX, keys []K) []*Rec
 func (c queryContract[K]) AssertCountMatchesReference(q *qx.QX) uint64 {
 	c.t.Helper()
 
-	want := uint64(len(c.ReferenceFullKeys(q)))
+	var ref queryContractReference[K]
+	return c.assertCountMatchesReference(q, &ref)
+}
+
+func (c queryContract[K]) assertCountMatchesReference(q *qx.QX, ref *queryContractReference[K]) uint64 {
+	c.t.Helper()
+
+	want := ref.count(c, q)
 	got, err := c.db.Count(q.Filter)
 	if err != nil {
 		c.t.Fatalf("Count(%+v): %v", q, err)
@@ -157,8 +212,15 @@ func (c queryContract[K]) AssertCountMatchesReference(q *qx.QX) uint64 {
 func (c queryContract[K]) AssertPreparedCountMatchesReference(q *qx.QX) uint64 {
 	c.t.Helper()
 
+	var ref queryContractReference[K]
+	return c.assertPreparedCountMatchesReference(q, &ref)
+}
+
+func (c queryContract[K]) assertPreparedCountMatchesReference(q *qx.QX, ref *queryContractReference[K]) uint64 {
+	c.t.Helper()
+
 	nq := normalizeQueryForTest(q)
-	want := uint64(len(c.ReferenceFullKeys(q)))
+	want := ref.count(c, q)
 	got, err := c.db.countPreparedExpr(nq.Filter)
 	if err != nil {
 		c.t.Fatalf("countPreparedExpr(%+v): %v", nq.Filter, err)
@@ -169,9 +231,15 @@ func (c queryContract[K]) AssertPreparedCountMatchesReference(q *qx.QX) uint64 {
 	return got
 }
 
-func (c queryContract[K]) AssertAllReadPathsMatchReference(q *qx.QX) {
+func (c queryContract[K]) assertAllReadPathsMatchReference(q *qx.QX) queryContractReference[K] {
 	c.t.Helper()
-	keys := c.AssertQueryKeysMatchReference(q)
+	var ref queryContractReference[K]
+
+	keys, err := c.db.QueryKeys(q)
+	if err != nil {
+		c.t.Fatalf("QueryKeys(%+v): %v", q, err)
+	}
+	c.assertKeysMatchReference("QueryKeys", q, keys, &ref)
 
 	got, err := c.db.Query(q)
 	if err != nil {
@@ -179,11 +247,11 @@ func (c queryContract[K]) AssertAllReadPathsMatchReference(q *qx.QX) {
 	}
 
 	if len(q.Order) > 0 {
-		wantIDs := c.ReferenceKeys(q)
+		wantIDs := ref.page(c, q)
 		want := c.batchGet("BatchGet(reference keys)", wantIDs)
 		queryContractAssertRecordSlicesEqual(c.t, "Query", q, got, want)
 	} else {
-		fullIDs := c.ReferenceFullKeys(q)
+		fullIDs := ref.full(c, q)
 		full := c.batchGet("BatchGet(full reference keys)", fullIDs)
 		if queryContractNoOrderWindow(q) {
 			if err := queryContractValidateNoOrderRecordsWindow(q, got, full); err != nil {
@@ -197,9 +265,21 @@ func (c queryContract[K]) AssertAllReadPathsMatchReference(q *qx.QX) {
 	wantByKeys := c.batchGet("BatchGet(QueryKeys result)", keys)
 	queryContractAssertRecordSlicesEqual(c.t, "Query vs QueryKeys", q, got, wantByKeys)
 
-	c.AssertCountMatchesReference(q)
-	c.AssertPreparedKeysMatchReference(q)
-	c.AssertPreparedCountMatchesReference(q)
+	c.assertCountMatchesReference(q, &ref)
+
+	nq := normalizeQueryForTest(q)
+	if err := c.db.checkUsedQuery(nq); err != nil {
+		c.t.Fatalf("checkUsedQuery(%+v): %v", nq, err)
+	}
+
+	preparedKeys, err := execPreparedQueryForTest(c.db, nq)
+	if err != nil {
+		c.t.Fatalf("execPreparedQuery(%+v): %v", nq, err)
+	}
+	c.assertKeysMatchReference("execPreparedQuery", q, preparedKeys, &ref)
+	c.assertPreparedCountMatchesReference(q, &ref)
+
+	return ref
 }
 
 func (c queryContract[K]) batchGet(label string, ids []K) []*Rec {

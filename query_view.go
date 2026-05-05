@@ -198,20 +198,6 @@ func (qv *queryView) fieldMetaByOrdinal(ordinal int) *field {
 	return acc.field
 }
 
-func (db *DB[K, V]) fieldNameByOrdinal(ordinal int) string {
-	if ordinal < 0 || ordinal >= len(db.indexedFieldAccess) {
-		return ""
-	}
-	return db.indexedFieldAccess[ordinal].name
-}
-
-func (qv *queryView) fieldNameByOrdinal(ordinal int) string {
-	if qv == nil || qv.engine == nil {
-		return ""
-	}
-	return qv.engine.fieldNameByOrdinal(ordinal)
-}
-
 func (qv *queryView) fieldMeta(field string, ordinal int) *field {
 	acc, ok := qv.indexedFieldAccessor(field, ordinal)
 	if !ok {

@@ -51,9 +51,6 @@ func copySeededFile(t *testing.T, src, dst string) {
 	if _, err = io.Copy(out, in); err != nil {
 		t.Fatalf("copy seeded file %q: %v", src, err)
 	}
-	if err = out.Sync(); err != nil {
-		t.Fatalf("sync copied file %q: %v", dst, err)
-	}
 }
 
 func queryCountSingleton(id uint64) posting.List {
@@ -573,7 +570,7 @@ func TestCount_ScalarInSplit_ResidualFilterMatchesBitmap(t *testing.T) {
 
 	lead := -1
 	for i := range leaves {
-		if leaves[i].Op == qir.OpIN && db.fieldNameByOrdinal(leaves[i].FieldOrdinal) == "country" && !leaves[i].Not {
+		if leaves[i].Op == qir.OpIN && db.engine.fieldNameByOrdinal(leaves[i].FieldOrdinal) == "country" && !leaves[i].Not {
 			lead = i
 			break
 		}
@@ -726,7 +723,7 @@ func TestCount_ByPredicates_BucketLeadHasAnyResidual_MatchesBitmap(t *testing.T)
 
 	leadIdx := -1
 	for i := range preds {
-		if db.fieldNameByOrdinal(preds[i].expr.FieldOrdinal) == "age" && preds[i].expr.Op == qir.OpGTE {
+		if db.engine.fieldNameByOrdinal(preds[i].expr.FieldOrdinal) == "age" && preds[i].expr.Op == qir.OpGTE {
 			leadIdx = i
 			break
 		}
@@ -768,7 +765,7 @@ func TestCount_ByPredicates_BucketLeadHasAnyResidual_MatchesBitmap(t *testing.T)
 
 	hasAnyIdx := -1
 	for _, pi := range active {
-		if db.fieldNameByOrdinal(preds[pi].expr.FieldOrdinal) == "tags" && preds[pi].expr.Op == qir.OpHASANY {
+		if db.engine.fieldNameByOrdinal(preds[pi].expr.FieldOrdinal) == "tags" && preds[pi].expr.Op == qir.OpHASANY {
 			hasAnyIdx = pi
 			break
 		}
@@ -1123,7 +1120,7 @@ func TestCount_ORByPredicates_StrictWidePrefixLeadBudgetUsesScanWeight(t *testin
 		lead := preds[leadIdx]
 		if lead.expr.Op != qir.OpPREFIX {
 			releasePredicates(preds)
-			t.Fatalf("expected prefix lead, got field=%s op=%v", db.fieldNameByOrdinal(lead.expr.FieldOrdinal), lead.expr.Op)
+			t.Fatalf("expected prefix lead, got field=%s op=%v", db.engine.fieldNameByOrdinal(lead.expr.FieldOrdinal), lead.expr.Op)
 		}
 		oldExpectedProbes += leadEst * countLeadOpWeight(lead.expr.Op)
 		scanExpectedProbes += leadEst * countPredicateLeadScanWeight(lead)
@@ -1874,7 +1871,7 @@ func TestCount_BuildPredicates_MergesPositiveNumericRangesSameField(t *testing.T
 
 	agePreds := 0
 	for i := range preds {
-		if db.fieldNameByOrdinal(preds[i].expr.FieldOrdinal) == "age" {
+		if db.engine.fieldNameByOrdinal(preds[i].expr.FieldOrdinal) == "age" {
 			agePreds++
 		}
 	}
@@ -2165,7 +2162,7 @@ func prepareBroadRangeComplementPredicate(t *testing.T, db *DB[uint64, Rec], exp
 		releasePredicates([]predicate{p})
 		t.Fatalf("exprValueToIdxScalar: err=%v isSlice=%v isNil=%v", err, isSlice, isNil)
 	}
-	cacheKey := view.materializedPredComplementCacheKeyForScalar(view.fieldNameByOrdinal(compiledExpr.FieldOrdinal), compiledExpr.Op, key)
+	cacheKey := view.materializedPredComplementCacheKeyForScalar(view.engine.fieldNameByOrdinal(compiledExpr.FieldOrdinal), compiledExpr.Op, key)
 	if cacheKey == "" {
 		releasePredicates([]predicate{p})
 		t.Fatalf("expected non-empty complement cache key")
@@ -2216,12 +2213,12 @@ func TestCount_PreparePredicate_BroadRangeComplementCacheInvalidatedByNilFieldWr
 			releasePredicates([]predicate{p})
 			t.Fatalf("expected cached complement postingResult before nil insert")
 		}
-		heldSnap, heldRef, ok := db.pinSnapshotRefBySeq(prevSnap.seq)
+		heldSnap, heldRef, ok := db.snapshot.pinRefBySeq(prevSnap.seq)
 		if !ok || heldSnap != prevSnap || heldRef == nil {
 			releasePredicates([]predicate{p})
 			t.Fatalf("pinSnapshotRefBySeq(seq=%d) failed", prevSnap.seq)
 		}
-		defer db.unpinSnapshotRef(prevSnap.seq, heldRef)
+		defer db.snapshot.unpinRef(prevSnap.seq, heldRef)
 		releasePredicates([]predicate{p})
 
 		if err := db.Set(90_001, &Rec{
@@ -2268,12 +2265,12 @@ func TestCount_PreparePredicate_BroadRangeComplementCacheInvalidatedByNilFieldWr
 			releasePredicates([]predicate{p})
 			t.Fatalf("expected cached complement postingResult before nil delete")
 		}
-		heldSnap, heldRef, ok := db.pinSnapshotRefBySeq(prevSnap.seq)
+		heldSnap, heldRef, ok := db.snapshot.pinRefBySeq(prevSnap.seq)
 		if !ok || heldSnap != prevSnap || heldRef == nil {
 			releasePredicates([]predicate{p})
 			t.Fatalf("pinSnapshotRefBySeq(seq=%d) failed", prevSnap.seq)
 		}
-		defer db.unpinSnapshotRef(prevSnap.seq, heldRef)
+		defer db.snapshot.unpinRef(prevSnap.seq, heldRef)
 		releasePredicates([]predicate{p})
 
 		nilID := uint64(80_000)
@@ -2660,13 +2657,13 @@ func TestCount_PickLeadPredicate_PrefersLeadThatUnlocksCustomResidualMaterializa
 	oldLeadScore := 0.0
 	for i := range preds {
 		p := preds[i]
-		if db.fieldNameByOrdinal(p.expr.FieldOrdinal) == "active" && p.expr.Op == qir.OpEQ {
+		if db.engine.fieldNameByOrdinal(p.expr.FieldOrdinal) == "active" && p.expr.Op == qir.OpEQ {
 			activeIdx = i
 		}
-		if db.fieldNameByOrdinal(p.expr.FieldOrdinal) == "country" && p.expr.Op == qir.OpIN {
+		if db.engine.fieldNameByOrdinal(p.expr.FieldOrdinal) == "country" && p.expr.Op == qir.OpIN {
 			countryIdx = i
 		}
-		if db.fieldNameByOrdinal(p.expr.FieldOrdinal) == "name" && p.expr.Op == qir.OpCONTAINS {
+		if db.engine.fieldNameByOrdinal(p.expr.FieldOrdinal) == "name" && p.expr.Op == qir.OpCONTAINS {
 			containsIdx = i
 		}
 		if p.alwaysTrue || p.covered || !p.hasIter() || p.estCard == 0 {
@@ -2683,7 +2680,7 @@ func TestCount_PickLeadPredicate_PrefersLeadThatUnlocksCustomResidualMaterializa
 		t.Fatalf("expected active/country/contains predicates, got active=%d country=%d contains=%d", activeIdx, countryIdx, containsIdx)
 	}
 	if oldLeadIdx != activeIdx {
-		t.Fatalf("expected baseline score to prefer active EQ lead, got idx=%d field=%s op=%v", oldLeadIdx, db.fieldNameByOrdinal(preds[oldLeadIdx].expr.FieldOrdinal), preds[oldLeadIdx].expr.Op)
+		t.Fatalf("expected baseline score to prefer active EQ lead, got idx=%d field=%s op=%v", oldLeadIdx, db.engine.fieldNameByOrdinal(preds[oldLeadIdx].expr.FieldOrdinal), preds[oldLeadIdx].expr.Op)
 	}
 
 	universe := db.snapshotUniverseCardinality()
@@ -2711,7 +2708,7 @@ func TestCount_PickLeadPredicate_PrefersLeadThatUnlocksCustomResidualMaterializa
 
 	leadIdx, leadEst, _ := db.pickCountLeadPredicate(preds, universe)
 	if leadIdx != countryIdx {
-		t.Fatalf("expected residual-aware lead pick to prefer country IN, got idx=%d field=%s op=%v", leadIdx, db.fieldNameByOrdinal(preds[leadIdx].expr.FieldOrdinal), preds[leadIdx].expr.Op)
+		t.Fatalf("expected residual-aware lead pick to prefer country IN, got idx=%d field=%s op=%v", leadIdx, db.engine.fieldNameByOrdinal(preds[leadIdx].expr.FieldOrdinal), preds[leadIdx].expr.Op)
 	}
 	if leadEst != preds[countryIdx].estCard {
 		t.Fatalf("unexpected chosen lead est: got=%d want=%d", leadEst, preds[countryIdx].estCard)
@@ -3059,10 +3056,10 @@ func TestCount_PickORLeadPredicate_PrefersPrefixLeadOverCheapEqLead(t *testing.T
 	oldLeadScore := 0.0
 	for i := range preds {
 		p := preds[i]
-		if db.fieldNameByOrdinal(p.expr.FieldOrdinal) == "email" && p.expr.Op == qir.OpPREFIX {
+		if db.engine.fieldNameByOrdinal(p.expr.FieldOrdinal) == "email" && p.expr.Op == qir.OpPREFIX {
 			prefixIdx = i
 		}
-		if db.fieldNameByOrdinal(p.expr.FieldOrdinal) == "active" && p.expr.Op == qir.OpEQ {
+		if db.engine.fieldNameByOrdinal(p.expr.FieldOrdinal) == "active" && p.expr.Op == qir.OpEQ {
 			activeIdx = i
 		}
 		if p.alwaysTrue || p.covered || !p.hasIter() || p.estCard == 0 {
@@ -3078,13 +3075,13 @@ func TestCount_PickORLeadPredicate_PrefersPrefixLeadOverCheapEqLead(t *testing.T
 		t.Fatalf("expected prefix and active predicates, got prefix=%d active=%d", prefixIdx, activeIdx)
 	}
 	if oldLeadIdx != activeIdx {
-		t.Fatalf("expected old OR lead score to prefer active EQ lead, got idx=%d field=%s op=%v", oldLeadIdx, db.fieldNameByOrdinal(preds[oldLeadIdx].expr.FieldOrdinal), preds[oldLeadIdx].expr.Op)
+		t.Fatalf("expected old OR lead score to prefer active EQ lead, got idx=%d field=%s op=%v", oldLeadIdx, db.engine.fieldNameByOrdinal(preds[oldLeadIdx].expr.FieldOrdinal), preds[oldLeadIdx].expr.Op)
 	}
 
 	universe := db.snapshotUniverseCardinality()
 	leadIdx, leadEst, _ := db.pickCountORLeadPredicate(preds, universe)
 	if leadIdx != prefixIdx {
-		t.Fatalf("expected OR-specific lead score to prefer prefix lead, got idx=%d field=%s op=%v", leadIdx, db.fieldNameByOrdinal(preds[leadIdx].expr.FieldOrdinal), preds[leadIdx].expr.Op)
+		t.Fatalf("expected OR-specific lead score to prefer prefix lead, got idx=%d field=%s op=%v", leadIdx, db.engine.fieldNameByOrdinal(preds[leadIdx].expr.FieldOrdinal), preds[leadIdx].expr.Op)
 	}
 	if leadEst != preds[prefixIdx].estCard {
 		t.Fatalf("unexpected chosen OR lead est: got=%d want=%d", leadEst, preds[prefixIdx].estCard)

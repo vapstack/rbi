@@ -46,10 +46,15 @@ func (db *DB[K, V]) refreshPlannerStatsWithBudget(softBudget time.Duration, useC
 	snap, seq, ref, pinned := db.pinCurrentSnapshot()
 	defer db.unpinCurrentSnapshot(seq, ref, pinned)
 
-	fieldNames := db.sortedPlannerFieldNames()
+	db.engine.refreshPlannerStatsWithBudgetOnSnapshot(snap, softBudget, useCursor)
+	return nil
+}
+
+func (qe *queryEngine) refreshPlannerStatsWithBudgetOnSnapshot(snap *indexSnapshot, softBudget time.Duration, useCursor bool) {
+	fieldNames := qe.sortedPlannerFieldNames()
 	universeCardinality := snap.universeCardinality()
 
-	prev := db.planner.stats.Load()
+	prev := qe.planner.stats.Load()
 	capHint := len(fieldNames)
 	if prev != nil && len(prev.Fields) > capHint {
 		capHint = len(prev.Fields)
@@ -70,10 +75,10 @@ func (db *DB[K, V]) refreshPlannerStatsWithBudget(softBudget time.Duration, useC
 
 	startIdx := 0
 	if useCursor && len(fieldNames) > 0 {
-		if db.planner.analyzer.cursor < 0 || db.planner.analyzer.cursor >= len(fieldNames) {
-			db.planner.analyzer.cursor = 0
+		if qe.planner.analyzer.cursor < 0 || qe.planner.analyzer.cursor >= len(fieldNames) {
+			qe.planner.analyzer.cursor = 0
 		}
-		startIdx = db.planner.analyzer.cursor
+		startIdx = qe.planner.analyzer.cursor
 	}
 
 	processed := 0
@@ -93,23 +98,19 @@ func (db *DB[K, V]) refreshPlannerStatsWithBudget(softBudget time.Duration, useC
 		}
 		fieldName := fieldNames[fieldIdx]
 
-		stats, e := db.collectPlannerFieldStatsFromOverlay(snap, fieldName)
-		if e != nil {
-			return e
-		}
+		stats := qe.collectPlannerFieldStatsFromOverlay(snap, fieldName)
 		out.Fields[fieldName] = stats
 		processed++
 	}
 
 	if useCursor && len(fieldNames) > 0 && processed > 0 {
-		db.planner.analyzer.cursor = (startIdx + processed) % len(fieldNames)
+		qe.planner.analyzer.cursor = (startIdx + processed) % len(fieldNames)
 	} else if !useCursor {
-		db.planner.analyzer.cursor = 0
+		qe.planner.analyzer.cursor = 0
 	}
 
-	out.Version = db.planner.statsVersion.Add(1)
-	db.planner.stats.Store(&out)
-	return nil
+	out.Version = qe.planner.statsVersion.Add(1)
+	qe.planner.stats.Store(&out)
 }
 
 func (s *indexSnapshot) universeCardinality() uint64 {
@@ -119,20 +120,16 @@ func (s *indexSnapshot) universeCardinality() uint64 {
 	return s.universe.Cardinality()
 }
 
-func (db *DB[K, V]) collectPlannerFieldStatsFromOverlay(s *indexSnapshot, fieldName string) (PlannerFieldStats, error) {
-	if err := db.unavailableErr(); err != nil {
-		return PlannerFieldStats{}, err
-	}
-
-	acc, ok := db.indexedFieldMap[fieldName]
+func (qe *queryEngine) collectPlannerFieldStatsFromOverlay(s *indexSnapshot, fieldName string) PlannerFieldStats {
+	acc, ok := qe.indexedFieldMap[fieldName]
 	if !ok || s.index == nil || acc.ordinal >= s.index.Len() {
-		return PlannerFieldStats{}, nil
+		return PlannerFieldStats{}
 	}
 	ov := newFieldOverlayStorage(s.index.Get(acc.ordinal))
 	if !ov.hasData() {
-		return PlannerFieldStats{}, nil
+		return PlannerFieldStats{}
 	}
-	return ov.fieldStats(), nil
+	return ov.fieldStats()
 }
 
 func (o fieldOverlay) fieldStats() PlannerFieldStats {
@@ -351,8 +348,11 @@ func (db *DB[K, V]) buildPlannerStatsSnapshotLocked(version uint64) *plannerStat
 	snap, seq, ref, pinned := db.pinCurrentSnapshot()
 	defer db.unpinCurrentSnapshot(seq, ref, pinned)
 
-	fields := db.sortedPlannerFieldNames()
+	return db.engine.buildPlannerStatsSnapshot(snap, version)
+}
 
+func (qe *queryEngine) buildPlannerStatsSnapshot(snap *indexSnapshot, version uint64) *plannerStatsSnapshot {
+	fields := qe.sortedPlannerFieldNames()
 	out := &plannerStatsSnapshot{
 		Version:             version,
 		GeneratedAt:         time.Now(),
@@ -361,23 +361,18 @@ func (db *DB[K, V]) buildPlannerStatsSnapshotLocked(version uint64) *plannerStat
 	}
 
 	for _, fieldName := range fields {
-		acc, ok := db.indexedFieldMap[fieldName]
-		if !ok || snap.index == nil || acc.ordinal >= snap.index.Len() {
-			continue
-		}
-		ov := newFieldOverlayStorage(snap.index.Get(acc.ordinal))
-		out.Fields[fieldName] = ov.fieldStats()
+		out.Fields[fieldName] = qe.collectPlannerFieldStatsFromOverlay(snap, fieldName)
 	}
 
 	return out
 }
 
-func (db *DB[K, V]) sortedPlannerFieldNames() []string {
-	if len(db.indexedFieldAccess) == 0 {
+func (qe *queryEngine) sortedPlannerFieldNames() []string {
+	if len(qe.indexedFieldAccess) == 0 {
 		return nil
 	}
-	fields := make([]string, 0, len(db.indexedFieldAccess))
-	for _, acc := range db.indexedFieldAccess {
+	fields := make([]string, 0, len(qe.indexedFieldAccess))
+	for _, acc := range qe.indexedFieldAccess {
 		fields = append(fields, acc.name)
 	}
 	sort.Strings(fields)
@@ -388,11 +383,15 @@ func (db *DB[K, V]) publishLoadedPlannerStats(s *plannerStatsSnapshot) {
 	if s == nil {
 		return
 	}
+	db.engine.publishLoadedPlannerStats(s, db.getSnapshot())
+}
+
+func (qe *queryEngine) publishLoadedPlannerStats(s *plannerStatsSnapshot, snap *indexSnapshot) {
 	out := &plannerStatsSnapshot{
 		Version:             s.Version,
 		GeneratedAt:         s.GeneratedAt,
-		UniverseCardinality: db.getSnapshot().universeCardinality(),
-		Fields:              make(map[string]PlannerFieldStats, len(db.indexedFieldAccess)),
+		UniverseCardinality: snap.universeCardinality(),
+		Fields:              make(map[string]PlannerFieldStats, len(qe.indexedFieldAccess)),
 	}
 	if out.Version == 0 {
 		out.Version = 1
@@ -400,11 +399,11 @@ func (db *DB[K, V]) publishLoadedPlannerStats(s *plannerStatsSnapshot) {
 	if out.GeneratedAt.IsZero() {
 		out.GeneratedAt = time.Now()
 	}
-	for _, f := range db.sortedPlannerFieldNames() {
+	for _, f := range qe.sortedPlannerFieldNames() {
 		out.Fields[f] = s.Fields[f]
 	}
-	db.planner.statsVersion.Store(out.Version)
-	db.planner.stats.Store(out)
+	qe.planner.statsVersion.Store(out.Version)
+	qe.planner.stats.Store(out)
 }
 
 type p2Quantile struct {

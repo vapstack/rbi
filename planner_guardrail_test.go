@@ -138,7 +138,7 @@ func plannerGuardrailRunForcedOROrderFallback(
 	}
 	branches, alwaysFalse, ok := view.buildORBranchesOrdered(
 		viewQ.Expr.Operands,
-		view.fieldNameByOrdinal(viewQ.Order.FieldOrdinal),
+		view.engine.fieldNameByOrdinal(viewQ.Order.FieldOrdinal),
 		window,
 		viewQ.Offset,
 	)
@@ -172,7 +172,7 @@ func plannerGuardrailRunForcedOrderedPlanner(
 		return nil, false, nil
 	}
 	window, _ := orderWindow(viewQ)
-	orderField := view.fieldNameByOrdinal(viewQ.Order.FieldOrdinal)
+	orderField := view.engine.fieldNameByOrdinal(viewQ.Order.FieldOrdinal)
 	predSet, ok := view.buildPredicatesOrderedWithMode(leaves, orderField, false, window, viewQ.Offset, true, true)
 	if !ok {
 		return nil, false, nil

@@ -35,18 +35,18 @@ func newQueryMetamorphicBaseline[K ~uint64 | ~string](
 	q *qx.QX,
 ) queryMetamorphicBaseline[K] {
 	c.t.Helper()
-	c.AssertAllReadPathsMatchReference(q)
+	ref := c.assertAllReadPathsMatchReference(q)
 
 	base := queryMetamorphicBaseline[K]{
 		q:     cloneQuery(q),
 		exact: !queryContractNoOrderWindow(q),
 	}
 	if base.exact {
-		base.keys = c.ReferenceKeys(q)
+		base.keys = ref.page(c, q)
 		return base
 	}
 
-	base.fullKeys = c.ReferenceFullKeys(q)
+	base.fullKeys = ref.full(c, q)
 	return base
 }
 
@@ -56,10 +56,10 @@ func (c queryContract[K]) AssertMetamorphicEquivalent(
 	q *qx.QX,
 ) {
 	c.t.Helper()
-	c.AssertAllReadPathsMatchReference(q)
+	ref := c.assertAllReadPathsMatchReference(q)
 
 	if base.exact {
-		got := c.ReferenceKeys(q)
+		got := ref.page(c, q)
 		if !c.equal(base.q, base.keys, got) {
 			c.t.Fatalf(
 				"%s exact equivalence mismatch:\nbase=%+v\nq=%+v\nbaseKeys=%v\ngot=%v",
@@ -69,7 +69,7 @@ func (c queryContract[K]) AssertMetamorphicEquivalent(
 		return
 	}
 
-	got := c.ReferenceFullKeys(q)
+	got := ref.full(c, q)
 	fullQ := cloneQuery(base.q)
 	clearQueryOrderWindowForTest(fullQ)
 	if !c.equal(fullQ, base.fullKeys, got) {
@@ -431,6 +431,8 @@ func runQueryMetamorphicExecutionRounds(
 func TestQueryMetamorphic_SmallWorldTransforms(t *testing.T) {
 	for _, world := range smallWorldCases() {
 		t.Run(world.name, func(t *testing.T) {
+			t.Parallel()
+
 			db := openSmallWorldDB(t, world)
 			for _, tc := range queryMetamorphicSmallWorldCases() {
 				t.Run(tc.name, func(t *testing.T) {
@@ -444,6 +446,8 @@ func TestQueryMetamorphic_SmallWorldTransforms(t *testing.T) {
 func TestQueryMetamorphic_CuratedCorpusTransforms(t *testing.T) {
 	for _, source := range queryMetamorphicCuratedSources() {
 		t.Run(source.name, func(t *testing.T) {
+			t.Parallel()
+
 			db := source.open(t)
 			for _, tc := range source.cases() {
 				t.Run(tc.name, func(t *testing.T) {
@@ -457,6 +461,8 @@ func TestQueryMetamorphic_CuratedCorpusTransforms(t *testing.T) {
 func TestQueryMetamorphic_CuratedExecutionRounds(t *testing.T) {
 	for _, source := range queryMetamorphicCuratedSources() {
 		t.Run(source.name, func(t *testing.T) {
+			t.Parallel()
+
 			db := source.open(t)
 			for _, tc := range source.cases() {
 				t.Run(tc.name, func(t *testing.T) {

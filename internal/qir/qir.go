@@ -95,12 +95,6 @@ type FieldResolver interface {
 	ResolveField(name string) (int, bool)
 }
 
-type noFieldResolver struct{}
-
-func (noFieldResolver) ResolveField(string) (int, bool) {
-	return 0, false
-}
-
 const (
 	queryExprOwnerInitCap = 4
 	queryExprOwnerMaxCap  = 256
@@ -119,8 +113,8 @@ var nilPrepareFieldOrdinals = pooled.Maps[string, int]{
 	MaxLen: 64,
 }
 
-type prepareCompiler[R FieldResolver] struct {
-	resolve             R
+type prepareCompiler struct {
+	resolve             FieldResolver
 	useResolver         bool
 	nilFieldOrdinals    map[string]int
 	nextNilFieldOrdinal int
@@ -154,29 +148,29 @@ func (q *Query) releaseOwned() {
 	q.Limit = 0
 }
 
-func newPrepareCompilerResolved[R FieldResolver](resolve R) prepareCompiler[R] {
-	return prepareCompiler[R]{
+func newPrepareCompilerResolved(resolve FieldResolver) prepareCompiler {
+	return prepareCompiler{
 		resolve:             resolve,
 		useResolver:         true,
 		nextNilFieldOrdinal: NoFieldOrdinal - 1,
 	}
 }
 
-func newPrepareCompilerNoResolve() prepareCompiler[noFieldResolver] {
-	return prepareCompiler[noFieldResolver]{
+func newPrepareCompilerNoResolve() prepareCompiler {
+	return prepareCompiler{
 		useResolver:         false,
 		nextNilFieldOrdinal: NoFieldOrdinal - 1,
 	}
 }
 
-func (c *prepareCompiler[R]) release() {
+func (c *prepareCompiler) release() {
 	if c.nilFieldOrdinals != nil {
 		nilPrepareFieldOrdinals.Put(c.nilFieldOrdinals)
 		c.nilFieldOrdinals = nil
 	}
 }
 
-func (c *prepareCompiler[R]) fieldOrdinal(name string) (int, bool) {
+func (c *prepareCompiler) fieldOrdinal(name string) (int, bool) {
 	if c.useResolver {
 		return c.resolve.ResolveField(name)
 	}
@@ -224,7 +218,7 @@ func (q *Query) newOwnedExprSlice(n int) []Expr {
 	return s
 }
 
-func PrepareQuery[R FieldResolver](src *qx.QX, resolve R) (*Query, error) {
+func PrepareQuery(src *qx.QX, resolve FieldResolver) (*Query, error) {
 	if src == nil {
 		return nil, fmt.Errorf("QX is nil")
 	}
@@ -240,9 +234,8 @@ func PrepareQuery[R FieldResolver](src *qx.QX, resolve R) (*Query, error) {
 
 	query := queryPool.Get()
 	compiler := newPrepareCompilerResolved(resolve)
-	defer compiler.release()
 
-	raw, err := compileFilter(query, src.Filter, &compiler)
+	raw, err := compileFilter(query, &src.Filter, &compiler)
 	if err != nil {
 		query.Release()
 		return nil, err
@@ -252,7 +245,7 @@ func PrepareQuery[R FieldResolver](src *qx.QX, resolve R) (*Query, error) {
 	query.Limit = src.Window.Limit
 
 	if len(src.Order) == 1 {
-		order, err := compileOrder(src.Order[0], &compiler)
+		order, err := compileOrder(&src.Order[0], &compiler)
 		if err != nil {
 			query.Release()
 			return nil, err
@@ -282,7 +275,7 @@ func PrepareQueryNoResolve(src *qx.QX) (*Query, error) {
 	compiler := newPrepareCompilerNoResolve()
 	defer compiler.release()
 
-	raw, err := compileFilter(query, src.Filter, &compiler)
+	raw, err := compileFilter(query, &src.Filter, &compiler)
 	if err != nil {
 		query.Release()
 		return nil, err
@@ -292,7 +285,7 @@ func PrepareQueryNoResolve(src *qx.QX) (*Query, error) {
 	query.Limit = src.Window.Limit
 
 	if len(src.Order) == 1 {
-		order, err := compileOrder(src.Order[0], &compiler)
+		order, err := compileOrder(&src.Order[0], &compiler)
 		if err != nil {
 			query.Release()
 			return nil, err
@@ -304,7 +297,7 @@ func PrepareQueryNoResolve(src *qx.QX) (*Query, error) {
 	return query, nil
 }
 
-func PrepareCountExprsResolved[R FieldResolver](resolve R, exprs ...qx.Expr) (*Query, error) {
+func PrepareCountExprsResolved(resolve FieldResolver, exprs ...qx.Expr) (*Query, error) {
 	switch len(exprs) {
 	case 0:
 		query := queryPool.Get()
@@ -315,10 +308,9 @@ func PrepareCountExprsResolved[R FieldResolver](resolve R, exprs ...qx.Expr) (*Q
 	default:
 		query := queryPool.Get()
 		compiler := newPrepareCompilerResolved(resolve)
-		defer compiler.release()
 		ops := query.newOwnedExprSlice(len(exprs))
 		for i := range exprs {
-			expr, err := compileFilter(query, exprs[i], &compiler)
+			expr, err := compileFilter(query, &exprs[i], &compiler)
 			if err != nil {
 				query.Release()
 				return nil, err
@@ -344,7 +336,7 @@ func PrepareCountExprsNoResolve(exprs ...qx.Expr) (*Query, error) {
 		defer compiler.release()
 		ops := query.newOwnedExprSlice(len(exprs))
 		for i := range exprs {
-			expr, err := compileFilter(query, exprs[i], &compiler)
+			expr, err := compileFilter(query, &exprs[i], &compiler)
 			if err != nil {
 				query.Release()
 				return nil, err
@@ -356,12 +348,11 @@ func PrepareCountExprsNoResolve(exprs ...qx.Expr) (*Query, error) {
 	}
 }
 
-func PrepareCountExprResolved[R FieldResolver](resolve R, expr qx.Expr) (*Query, error) {
+func PrepareCountExprResolved(resolve FieldResolver, expr qx.Expr) (*Query, error) {
 	query := queryPool.Get()
 	compiler := newPrepareCompilerResolved(resolve)
-	defer compiler.release()
 
-	raw, err := compileFilter(query, expr, &compiler)
+	raw, err := compileFilter(query, &expr, &compiler)
 	if err != nil {
 		query.Release()
 		return nil, err
@@ -375,7 +366,7 @@ func PrepareCountExprNoResolve(expr qx.Expr) (*Query, error) {
 	compiler := newPrepareCompilerNoResolve()
 	defer compiler.release()
 
-	raw, err := compileFilter(query, expr, &compiler)
+	raw, err := compileFilter(query, &expr, &compiler)
 	if err != nil {
 		query.Release()
 		return nil, err
@@ -397,7 +388,7 @@ func (q *Query) setNormalizedExpr(raw Expr) {
 	q.Expr = raw
 }
 
-func compileFilter[R FieldResolver](q *Query, src qx.Expr, compiler *prepareCompiler[R]) (Expr, error) {
+func compileFilter(q *Query, src *qx.Expr, compiler *prepareCompiler) (Expr, error) {
 	if src.Kind == qx.KindNONE {
 		if src.Name != "" || src.Value != nil || len(src.Args) != 0 {
 			return Expr{}, fmt.Errorf("rbi: invalid empty filter expression")
@@ -416,7 +407,7 @@ func compileFilter[R FieldResolver](q *Query, src qx.Expr, compiler *prepareComp
 		}
 		out.Operands = q.newOwnedExprSlice(len(src.Args))
 		for i := range src.Args {
-			child, err := compileFilter(q, src.Args[i], compiler)
+			child, err := compileFilter(q, &src.Args[i], compiler)
 			if err != nil {
 				return Expr{}, err
 			}
@@ -431,7 +422,7 @@ func compileFilter[R FieldResolver](q *Query, src qx.Expr, compiler *prepareComp
 		}
 		out.Operands = q.newOwnedExprSlice(len(src.Args))
 		for i := range src.Args {
-			child, err := compileFilter(q, src.Args[i], compiler)
+			child, err := compileFilter(q, &src.Args[i], compiler)
 			if err != nil {
 				return Expr{}, err
 			}
@@ -443,7 +434,7 @@ func compileFilter[R FieldResolver](q *Query, src qx.Expr, compiler *prepareComp
 		if len(src.Args) != 1 {
 			return Expr{}, fmt.Errorf("rbi: invalid NOT expression")
 		}
-		child, err := compileFilter(q, src.Args[0], compiler)
+		child, err := compileFilter(q, &src.Args[0], compiler)
 		if err != nil {
 			return Expr{}, err
 		}
@@ -472,7 +463,7 @@ func compileFilter[R FieldResolver](q *Query, src qx.Expr, compiler *prepareComp
 		if len(src.Args) != 1 {
 			return Expr{}, fmt.Errorf("rbi: invalid %s expression", qx.OpISNULL)
 		}
-		_, fieldOrdinal, err := compileFieldRef(src.Args[0], compiler)
+		_, fieldOrdinal, err := compileFieldRef(&src.Args[0], compiler)
 		if err != nil {
 			return Expr{}, err
 		}
@@ -492,11 +483,11 @@ func compileFilter[R FieldResolver](q *Query, src qx.Expr, compiler *prepareComp
 	}
 }
 
-func compileLeaf[R FieldResolver](op Op, not bool, args []qx.Expr, compiler *prepareCompiler[R]) (Expr, error) {
+func compileLeaf(op Op, not bool, args []qx.Expr, compiler *prepareCompiler) (Expr, error) {
 	if len(args) != 2 {
 		return Expr{}, fmt.Errorf("rbi: invalid %v expression", op)
 	}
-	field, fieldOrdinal, err := compileFieldRef(args[0], compiler)
+	field, fieldOrdinal, err := compileFieldRef(&args[0], compiler)
 	if err != nil {
 		return Expr{}, err
 	}
@@ -511,7 +502,7 @@ func compileLeaf[R FieldResolver](op Op, not bool, args []qx.Expr, compiler *pre
 	}, nil
 }
 
-func compileFieldRef[R FieldResolver](src qx.Expr, compiler *prepareCompiler[R]) (string, int, error) {
+func compileFieldRef(src *qx.Expr, compiler *prepareCompiler) (string, int, error) {
 	if src.Kind != qx.KindREF || src.Name == "" {
 		return "", NoFieldOrdinal, fmt.Errorf("rbi supports only source-field refs in filters/order")
 	}
@@ -522,8 +513,8 @@ func compileFieldRef[R FieldResolver](src qx.Expr, compiler *prepareCompiler[R])
 	return src.Name, fieldOrdinal, nil
 }
 
-func compileOrder[R FieldResolver](src qx.Order, compiler *prepareCompiler[R]) (Order, error) {
-	by := src.By
+func compileOrder(src *qx.Order, compiler *prepareCompiler) (Order, error) {
+	by := &src.By
 	switch by.Kind {
 	case qx.KindREF:
 		_, ordinal, err := compileFieldRef(by, compiler)
@@ -542,7 +533,7 @@ func compileOrder[R FieldResolver](src qx.Order, compiler *prepareCompiler[R]) (
 			if len(by.Args) != 1 {
 				return Order{}, fmt.Errorf("rbi: invalid LEN order expression")
 			}
-			_, ordinal, err := compileFieldRef(by.Args[0], compiler)
+			_, ordinal, err := compileFieldRef(&by.Args[0], compiler)
 			if err != nil {
 				return Order{}, err
 			}
@@ -556,7 +547,7 @@ func compileOrder[R FieldResolver](src qx.Order, compiler *prepareCompiler[R]) (
 			if len(by.Args) != 2 {
 				return Order{}, fmt.Errorf("rbi: invalid POS order expression")
 			}
-			field, ordinal, err := compileFieldRef(by.Args[0], compiler)
+			field, ordinal, err := compileFieldRef(&by.Args[0], compiler)
 			if err != nil {
 				return Order{}, err
 			}
@@ -992,6 +983,28 @@ func needLeafSortExprs(exprs []Expr) bool {
 
 func simplifyExactBoolTerms(op Op, terms []Expr, alloc exprBufAlloc) ([]Expr, bool, Expr, bool) {
 	if len(terms) < 2 {
+		return terms, false, Expr{}, false
+	}
+
+	mayMatch := false
+	for i, cur := range terms {
+		if len(cur.Operands) != 0 || cur.Op == OpNOOP {
+			continue
+		}
+		for _, prev := range terms[:i] {
+			if len(prev.Operands) == 0 &&
+				prev.Op != OpNOOP &&
+				prev.Op == cur.Op &&
+				prev.FieldOrdinal == cur.FieldOrdinal {
+				mayMatch = true
+				break
+			}
+		}
+		if mayMatch {
+			break
+		}
+	}
+	if !mayMatch {
 		return terms, false, Expr{}, false
 	}
 

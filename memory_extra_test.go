@@ -341,7 +341,7 @@ func TestMemoryExtra_MaterializedPredInheritedBorrowedMutationDetaches(t *testin
 	}
 	snapshotExtInitMaterializedPredCache(next)
 	defer next.releaseRuntimeCaches()
-	inheritMaterializedPredCache[uint64, struct{}](nil, next, prev, nil)
+	inheritMaterializedPredCache(next, prev, nil, nil)
 
 	fromPrev, ok := prev.loadMaterializedPredKey(key)
 	if !ok || fromPrev.IsEmpty() {
@@ -615,7 +615,7 @@ func TestMemoryExtra_MaterializedPredInheritedReleaseKeepsSiblingSnapshotEntry(t
 	}
 	snapshotExtInitMaterializedPredCache(next)
 	defer next.releaseRuntimeCaches()
-	inheritMaterializedPredCache[uint64, struct{}](nil, next, prev, nil)
+	inheritMaterializedPredCache(next, prev, nil, nil)
 
 	held, ok := next.loadMaterializedPredKey(key)
 	if !ok || held.IsEmpty() {
@@ -657,7 +657,7 @@ func TestMemoryExtra_MaterializedPredInheritedEvictAndDrainKeepsSiblingSnapshotE
 	}
 	snapshotExtInitMaterializedPredCache(next)
 	defer next.releaseRuntimeCaches()
-	inheritMaterializedPredCache[uint64, struct{}](nil, next, prev, nil)
+	inheritMaterializedPredCache(next, prev, nil, nil)
 
 	held, ok := next.loadMaterializedPredKey(key)
 	if !ok || held.IsEmpty() {

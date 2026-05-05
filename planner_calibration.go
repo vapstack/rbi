@@ -116,87 +116,6 @@ func plannerClampFloat(v, lo, hi float64) float64 {
 	return v
 }
 
-func (db *DB[K, V]) plannerCalibrationRoot() *DB[K, V] {
-	if db.traceRoot != nil {
-		return db.traceRoot
-	}
-	return db
-}
-
-func (db *DB[K, V]) shouldSampleCalibration() bool {
-	every := db.planner.calibrator.sampleEvery
-	if every <= 1 {
-		return true
-	}
-	seq := db.planner.calibrator.seq.Add(1)
-	return seq%every == 0
-}
-
-func (db *DB[K, V]) plannerCostMultiplier(plan plannerCalPlan) float64 {
-	root := db.plannerCalibrationRoot()
-	cur := root.planner.calibrator.state.Load()
-	if cur == nil {
-		return 1.0
-	}
-	m := cur.Multipliers[plan]
-	if m <= 0 || math.IsNaN(m) || math.IsInf(m, 0) {
-		return 1.0
-	}
-	return m
-}
-
-func (db *DB[K, V]) observeCalibration(ev TraceEvent) {
-	root := db.plannerCalibrationRoot()
-	if !root.planner.calibrator.enabled {
-		return
-	}
-
-	plan, ok := plannerCalPlanByName(ev.Plan)
-	if !ok {
-		return
-	}
-
-	if ev.EstimatedRows < calibrationMinEstimatedRows {
-		return
-	}
-
-	observed := ev.RowsExamined
-	if observed == 0 {
-		observed = ev.RowsReturned
-	}
-	if observed == 0 {
-		return
-	}
-
-	ratio := float64(observed) / float64(ev.EstimatedRows)
-	ratio = plannerClampFloat(ratio, calibrationRatioMin, calibrationRatioMax)
-
-	root.planner.calibrator.Lock()
-	defer root.planner.calibrator.Unlock()
-
-	cur := root.planner.calibrator.state.Load()
-	if cur == nil {
-		cur = newCalibration()
-	}
-
-	next := *cur
-	old := next.Multipliers[plan]
-	if old <= 0 || math.IsNaN(old) || math.IsInf(old, 0) {
-		old = 1.0
-	}
-
-	alpha := calibrationAlpha(next.Samples[plan])
-	next.Multipliers[plan] = plannerClampFloat(
-		old+alpha*(ratio-old),
-		calibrationMultiplierMin,
-		calibrationMultiplierMax,
-	)
-	next.Samples[plan] = next.Samples[plan] + 1
-	next.UpdatedAt = time.Now()
-
-	root.planner.calibrator.state.Store(&next)
-}
-
 func calibrationSnapshotFromState(s *calibration) CalibrationSnapshot {
 	out := CalibrationSnapshot{
 		UpdatedAt:   time.Now(),
@@ -277,8 +196,7 @@ func (db *DB[K, V]) persistCalibrationOnClose() error {
 // this method usually returns (zero, false) unless state was explicitly set
 // through SetCalibrationSnapshot or loaded manually.
 func (db *DB[K, V]) GetCalibrationSnapshot() (CalibrationSnapshot, bool) {
-	root := db.plannerCalibrationRoot()
-	cur := root.planner.calibrator.state.Load()
+	cur := db.engine.planner.calibrator.state.Load()
 	if cur == nil {
 		return CalibrationSnapshot{}, false
 	}
@@ -294,15 +212,14 @@ func (db *DB[K, V]) SetCalibrationSnapshot(s CalibrationSnapshot) error {
 	if err := db.unavailableErr(); err != nil {
 		return err
 	}
-	root := db.plannerCalibrationRoot()
 	state, err := calibrationStateFromSnapshot(s)
 	if err != nil {
 		return err
 	}
 
-	root.planner.calibrator.Lock()
-	root.planner.calibrator.state.Store(state)
-	root.planner.calibrator.Unlock()
+	db.engine.planner.calibrator.Lock()
+	db.engine.planner.calibrator.state.Store(state)
+	db.engine.planner.calibrator.Unlock()
 	return nil
 }
 

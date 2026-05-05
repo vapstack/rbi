@@ -440,7 +440,7 @@ func TestTraceContract_OrderedORMergeRouteDecision(t *testing.T) {
 	defer analysis.release()
 
 	mark := recorder.mark()
-	tr := db.beginTrace(viewQ)
+	tr := db.engine.beginTrace(viewQ)
 	if tr == nil {
 		t.Fatalf("expected trace to be enabled")
 	}
@@ -536,7 +536,7 @@ func TestTraceContract_ExactFilterWorkCounters(t *testing.T) {
 				}
 				defer preparedQ.Release()
 
-				tr := db.beginTrace(viewQ)
+				tr := db.engine.beginTrace(viewQ)
 				if tr == nil {
 					t.Fatalf("expected trace to be enabled")
 				}
@@ -591,7 +591,7 @@ func TestTraceContract_ExactFilterWorkCounters(t *testing.T) {
 				}
 				defer preparedQ.Release()
 
-				tr := db.beginTrace(viewQ)
+				tr := db.engine.beginTrace(viewQ)
 				if tr == nil {
 					t.Fatalf("expected trace to be enabled")
 				}

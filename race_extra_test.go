@@ -617,7 +617,7 @@ func TestRaceExtra_PinnedSnapshotQueryViewStaysExactAcrossConcurrentPublishes(t 
 	}
 
 	seq := db.getSnapshot().seq
-	snap, ref, ok := db.pinSnapshotRefBySeq(seq)
+	snap, ref, ok := db.snapshot.pinRefBySeq(seq)
 	if !ok || snap == nil {
 		t.Fatal("expected current snapshot to be pinnable")
 	}
@@ -626,7 +626,7 @@ func TestRaceExtra_PinnedSnapshotQueryViewStaysExactAcrossConcurrentPublishes(t 
 		if cleanupDone {
 			return
 		}
-		db.unpinSnapshotRef(seq, ref)
+		db.snapshot.unpinRef(seq, ref)
 	}()
 
 	q := qx.Query(
@@ -740,7 +740,7 @@ func TestRaceExtra_PinnedSnapshotQueryViewStaysExactAcrossConcurrentPublishes(t 
 		t.Fatal("expected old snapshot ref to stay pinned across publishes")
 	}
 
-	db.unpinSnapshotRef(seq, ref)
+	db.snapshot.unpinRef(seq, ref)
 	cleanupDone = true
 
 	db.snapshot.mu.RLock()
@@ -776,11 +776,11 @@ func TestRaceExtra_PinnedStringSnapshotScanStaysStableAcrossConcurrentPublishes(
 	})
 
 	old := db.getSnapshot()
-	pinned, ref, ok := db.pinSnapshotRefBySeq(old.seq)
+	pinned, ref, ok := db.snapshot.pinRefBySeq(old.seq)
 	if !ok || pinned != old {
 		t.Fatal("expected current string snapshot to be pinnable")
 	}
-	defer db.unpinSnapshotRef(old.seq, ref)
+	defer db.snapshot.unpinRef(old.seq, ref)
 
 	expected := slices.Clone(keys)
 	checkPinnedScan := func() error {
@@ -946,14 +946,14 @@ func TestRaceExtra_PublicNumericRangeQueriesStayExactAcrossConcurrentUnchangedFi
 			t.Fatalf("prepareTestExpr(%v): %v", expr, err)
 		}
 		defer prepared.Release()
-		field := db.fieldNameByOrdinal(compiled.FieldOrdinal)
-		fm := view.fields[field]
+		f := db.engine.fieldNameByOrdinal(compiled.FieldOrdinal)
+		fm := view.fields[f]
 		if fm == nil {
-			t.Fatalf("expected field metadata for %q", field)
+			t.Fatalf("expected field metadata for %q", f)
 		}
-		ov := view.fieldOverlay(field)
+		ov := view.fieldOverlay(f)
 		if !ov.hasData() {
-			t.Fatalf("expected field overlay for %q", field)
+			t.Fatalf("expected field overlay for %q", f)
 		}
 
 		key, isSlice, isNil, err := view.exprValueToIdxScalar(compiled)
@@ -970,13 +970,13 @@ func TestRaceExtra_PublicNumericRangeQueriesStayExactAcrossConcurrentUnchangedFi
 		}
 
 		br := ov.rangeForBounds(rb)
-		out, ok := view.tryEvalNumericRangeBuckets(field, fm, ov, br)
+		out, ok := view.tryEvalNumericRangeBuckets(f, fm, ov, br)
 		if !ok {
 			t.Fatalf("expected numeric range bucket path for %v", expr)
 		}
 		out.release()
 
-		return br, raceExtraRequireNumericRangeBucketCacheEntry(t, db.getSnapshot(), field)
+		return br, raceExtraRequireNumericRangeBucketCacheEntry(t, db.getSnapshot(), f)
 	}
 
 	evalSimple := func(expr qx.Expr) (postingResult, error) {

@@ -303,6 +303,8 @@ func TestQuerySmallWorld_BoundedExhaustiveContract(t *testing.T) {
 
 	for _, world := range smallWorldCases() {
 		t.Run(world.name, func(t *testing.T) {
+			t.Parallel()
+
 			db := openSmallWorldDB(t, world)
 
 			for _, exprCase := range exprs {
@@ -311,7 +313,7 @@ func TestQuerySmallWorld_BoundedExhaustiveContract(t *testing.T) {
 						for _, windowCase := range windows {
 							q := buildSmallWorldQuery(exprCase, orderCase, windowCase)
 							contract := newUint64QueryContract(t, db)
-							contract.AssertAllReadPathsMatchReference(q)
+							contract.assertAllReadPathsMatchReference(q)
 						}
 					}
 				})

@@ -16,7 +16,7 @@ import (
 )
 
 func (db *DB[K, V]) currentQueryViewForTests() *queryView {
-	if db == nil {
+	if db == nil || db.engine == nil || db.snapshot == nil {
 		snap := &indexSnapshot{strmap: &strMapSnapshot{}}
 		return &queryView{snap: snap, strMapView: snap.strmap}
 	}
@@ -105,14 +105,14 @@ func testExprFieldName[K ~string | ~uint64, V any](db *DB[K, V], expr qir.Expr) 
 	if db == nil {
 		return ""
 	}
-	return db.fieldNameByOrdinal(expr.FieldOrdinal)
+	return db.engine.fieldNameByOrdinal(expr.FieldOrdinal)
 }
 
 func testOrderFieldName[K ~string | ~uint64, V any](db *DB[K, V], order qir.Order) string {
 	if db == nil {
 		return ""
 	}
-	return db.fieldNameByOrdinal(order.FieldOrdinal)
+	return db.engine.fieldNameByOrdinal(order.FieldOrdinal)
 }
 
 func (db *DB[K, V]) snapshotFieldIndexSlice(field string) *[]index {
@@ -825,7 +825,7 @@ func (db *DB[K, V]) exprValueToIdxOwned(expr qx.Expr) ([]string, bool, bool, err
 		if err != nil {
 			return nil, false, false, err
 		}
-		fm = qv.fields[qv.fieldNameByOrdinal(compiled.FieldOrdinal)]
+		fm = qv.fields[qv.engine.fieldNameByOrdinal(compiled.FieldOrdinal)]
 	}
 	defer prepared.Release()
 
@@ -899,6 +899,36 @@ func (db *DB[K, V]) exprValueToDistinctIdxOwned(expr qx.Expr) ([]string, bool, b
 		}
 	}
 	defer prepared.Release()
+	if qv.engine == nil || len(qv.engine.indexedFieldAccess) == 0 {
+		if compiled.Value == nil {
+			if compiled.Op == qir.OpIN {
+				return nil, true, false, nil
+			}
+			return nil, false, true, nil
+		}
+		v := reflect.ValueOf(compiled.Value)
+		v, isNil := unwrapExprValue(v)
+		if isNil {
+			if compiled.Op == qir.OpIN {
+				return nil, true, false, nil
+			}
+			return nil, false, true, nil
+		}
+		if queryValueIsCollectionForField(v, nil) {
+			valsBuf, hasNil, err := sliceValueToIdxStringBuf(v, nil)
+			if err != nil || valsBuf == nil {
+				return nil, true, hasNil, err
+			}
+			defer stringSlicePool.Put(valsBuf)
+			dedupStringBufInPlace(valsBuf)
+			out := make([]string, valsBuf.Len())
+			for i := 0; i < valsBuf.Len(); i++ {
+				out[i] = valsBuf.Get(i)
+			}
+			return out, true, hasNil, nil
+		}
+		return nil, false, false, nil
+	}
 	valsBuf, isSlice, hasNil, err := qv.exprValueToDistinctIdxBuf(compiled)
 	if err != nil || valsBuf == nil {
 		return nil, isSlice, hasNil, err

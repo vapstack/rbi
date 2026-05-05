@@ -551,7 +551,7 @@ func TestStringExt_BeginQueryTxSnapshotScanAndQueryStayConsistentDuringDeleteRei
 				}
 
 				rollback(tx)
-				db.unpinSnapshotRef(seq, ref)
+				db.snapshot.unpinRef(seq, ref)
 
 				if scanErr != nil {
 					errCh <- fmt.Errorf("reader=%d iter=%d: %w", reader, i, scanErr)

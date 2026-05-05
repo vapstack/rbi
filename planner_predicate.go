@@ -1059,7 +1059,7 @@ func (qv *queryView) buildPredEqCandidate(e qir.Expr, fm *field, ov fieldOverlay
 		defer stringSlicePool.Put(valsBuf)
 	}
 
-	b, err := qv.evalSliceEQ(qv.fieldNameByOrdinal(e.FieldOrdinal), e.FieldOrdinal, valsBuf)
+	b, err := qv.evalSliceEQ(qv.engine.fieldNameByOrdinal(e.FieldOrdinal), e.FieldOrdinal, valsBuf)
 	if err != nil {
 		return predicate{}, false
 	}
@@ -1117,7 +1117,7 @@ func (qv *queryView) buildPredInCandidate(e qir.Expr, fm *field, ov fieldOverlay
 	if !isSlice || (valCount == 0 && !hasNil) {
 		return predicate{}, false
 	}
-	fieldName := qv.fieldNameByOrdinal(e.FieldOrdinal)
+	fieldName := qv.engine.fieldNameByOrdinal(e.FieldOrdinal)
 	postsBuf, est := qv.scalarLookupPostings(fieldName, e.FieldOrdinal, valsBuf, hasNil)
 	cacheKey := materializedPredKey{}
 	if qv.snap != nil && qv.snap.matPredCacheMaxEntries > 0 {
@@ -1205,7 +1205,7 @@ func (qv *queryView) buildPredHasCandidate(e qir.Expr, fm *field, ov fieldOverla
 	raw.Not = false
 	var cacheKey materializedPredKey
 	if qv.snap != nil && qv.snap.matPredCacheMaxEntries > 0 {
-		cacheKey = materializedPredKeyForDistinctSetTerms(qv.fieldNameByOrdinal(raw.FieldOrdinal), raw.Op, valsBuf, false)
+		cacheKey = materializedPredKeyForDistinctSetTerms(qv.engine.fieldNameByOrdinal(raw.FieldOrdinal), raw.Op, valsBuf, false)
 		if !cacheKey.isZero() {
 			if cached, ok := qv.snap.loadMaterializedPredKey(cacheKey); ok {
 				if e.Not {
@@ -1342,7 +1342,7 @@ func (qv *queryView) buildPredHasAnyCandidate(e qir.Expr, fm *field, ov fieldOve
 	}
 	cacheKey := materializedPredKey{}
 	if qv.snap != nil && qv.snap.matPredCacheMaxEntries > 0 {
-		cacheKey = materializedPredKeyForDistinctSetTerms(qv.fieldNameByOrdinal(e.FieldOrdinal), e.Op, valsBuf, false)
+		cacheKey = materializedPredKeyForDistinctSetTerms(qv.engine.fieldNameByOrdinal(e.FieldOrdinal), e.Op, valsBuf, false)
 	}
 	if e.Not {
 		if postsBuf.Len() == 0 {
@@ -1669,7 +1669,7 @@ func (qv *queryView) materializedPredComplementKeyForNormalizedScalarBound(field
 }
 
 func (qv *queryView) materializedPredKey(e qir.Expr) materializedPredKey {
-	fieldName := qv.fieldNameByOrdinal(e.FieldOrdinal)
+	fieldName := qv.engine.fieldNameByOrdinal(e.FieldOrdinal)
 	if isScalarRangeOrPrefixOp(e.Op) {
 		bound, isSlice, err := qv.normalizedScalarBoundForExpr(e)
 		if err != nil || isSlice || bound.empty || bound.full {
@@ -1912,7 +1912,7 @@ func (qv *queryView) execPlanCandidateOrderBasic(q *qir.Shape, preds predicateRe
 
 	br := ov.rangeForBounds(rangeBounds{has: true})
 	var rangeCovered *pooled.SliceBuf[bool]
-	orderField := qv.fieldNameByOrdinal(o.FieldOrdinal)
+	orderField := qv.engine.fieldNameByOrdinal(o.FieldOrdinal)
 	if coveredRange, covered, ok := qv.extractOrderRangeCoverageOverlayReader(orderField, preds, ov); ok {
 		br = coveredRange
 		rangeCovered = covered
@@ -2368,7 +2368,7 @@ func (qv *queryView) tryPlanOrdered(q *qir.Shape, trace *queryTrace) ([]uint64, 
 			return nil, false, nil
 		}
 		window, _ := orderWindow(q)
-		orderField := qv.fieldNameByOrdinal(o.FieldOrdinal)
+		orderField := qv.engine.fieldNameByOrdinal(o.FieldOrdinal)
 		predSet, ok := qv.buildPredicatesOrderedWithMode(leaves, orderField, false, window, q.Offset, true, true)
 		if !ok {
 			return nil, false, nil
@@ -3349,7 +3349,7 @@ func (qv *queryView) loadWarmComplementPredicateForOrdered(p *predicate, useComp
 }
 
 func (qv *queryView) isPositiveOrderedNumericRangeLeaf(e qir.Expr, orderField string) bool {
-	if e.Not || e.FieldOrdinal < 0 || qv.fieldNameByOrdinal(e.FieldOrdinal) == orderField || !isNumericRangeOp(e.Op) {
+	if e.Not || e.FieldOrdinal < 0 || qv.engine.fieldNameByOrdinal(e.FieldOrdinal) == orderField || !isNumericRangeOp(e.Op) {
 		return false
 	}
 	fm := qv.fieldMetaByExpr(e)
@@ -3502,12 +3502,15 @@ func (qv *queryView) buildPredicatesOrderedWithMode(leaves []qir.Expr, orderFiel
 	if !allowMaterialize {
 		universe = qv.snapshotUniverseCardinality()
 	}
+
 	allowWarmOrderedRangeLoad := allowMaterialize || allowOrderedEagerMaterialize || !coverOrderRange || orderedOffset == 0
 	allowWarmScalarRangeLoad := allowWarmOrderedRangeLoad
+
 	routeUniverse := universe
 	if routeUniverse == 0 && orderedWindow > 0 {
 		routeUniverse = qv.snapshotUniverseCardinality()
 	}
+
 	var mergedRangesBuf *pooled.SliceBuf[orderedMergedScalarRangeField]
 	if len(leaves) > 1 {
 		mergedRangesBuf = orderedMergedScalarRangeFieldSlicePool.Get()
@@ -3519,9 +3522,11 @@ func (qv *queryView) buildPredicatesOrderedWithMode(leaves []qir.Expr, orderFiel
 		}
 		defer orderedMergedScalarRangeFieldSlicePool.Put(mergedRangesBuf)
 	}
+
 	for i, e := range leaves {
-		fieldName := qv.fieldNameByOrdinal(e.FieldOrdinal)
+		fieldName := qv.engine.fieldNameByOrdinal(e.FieldOrdinal)
 		orderRangeDeferred := !coverOrderRange && qv.isOrderRangeCoveredLeaf(orderField, e)
+
 		if coverOrderRange && qv.isOrderRangeCoveredLeaf(orderField, e) {
 			// Keep conversion/typing validation, but avoid expensive predicate
 			// materialization for leaves that are fully covered by order range.
@@ -3550,6 +3555,7 @@ func (qv *queryView) buildPredicatesOrderedWithMode(leaves []qir.Expr, orderFiel
 						hasEffectiveBounds: true,
 						effectiveBounds:    merged.bounds,
 					}
+
 					predAllowMaterialize := allowMaterialize
 					orderedRoute := qv.orderedScalarRangeRoutingForBuild(
 						mergedPred,
@@ -3559,6 +3565,7 @@ func (qv *queryView) buildPredicatesOrderedWithMode(leaves []qir.Expr, orderFiel
 						universe,
 						routeUniverse,
 					)
+
 					orderedEagerMaterialize := false
 					if !predAllowMaterialize &&
 						allowOrderedEagerMaterialize &&
@@ -3566,6 +3573,7 @@ func (qv *queryView) buildPredicatesOrderedWithMode(leaves []qir.Expr, orderFiel
 						predAllowMaterialize = true
 						orderedEagerMaterialize = true
 					}
+
 					lazyColdMaterialize := predAllowMaterialize && !orderedRoute.eagerMaterialize
 					p, ok := qv.buildMergedNumericRangePredicateWithColdModeAndWarmLoad(
 						merged.expr,
@@ -3578,6 +3586,7 @@ func (qv *queryView) buildPredicatesOrderedWithMode(leaves []qir.Expr, orderFiel
 						preds.Release()
 						return predicateSet{}, false
 					}
+
 					qv.postprocessBuiltOrderedPredicate(
 						&p,
 						orderedRoute,
@@ -3593,12 +3602,15 @@ func (qv *queryView) buildPredicatesOrderedWithMode(leaves []qir.Expr, orderFiel
 				}
 			}
 		}
+
 		predAllowMaterialize := allowMaterialize
 		orderedEagerMaterialize := false
+
 		orderedRoute := qv.orderedScalarRangeRouting(e, orderedWindow, orderedOffset, routeUniverse)
 		if !predAllowMaterialize {
 			orderedRoute = qv.orderedScalarRangeRouting(e, orderedWindow, orderedOffset, universe)
 		}
+
 		if !predAllowMaterialize && allowOrderedEagerMaterialize &&
 			!orderRangeDeferred &&
 			orderedMergedScalarRangeFieldCount(mergedRangesBuf, fieldName) <= 1 &&
@@ -3607,6 +3619,7 @@ func (qv *queryView) buildPredicatesOrderedWithMode(leaves []qir.Expr, orderFiel
 			predAllowMaterialize = true
 			orderedEagerMaterialize = true
 		}
+
 		lazyColdMaterialize := predAllowMaterialize && !orderedRoute.eagerMaterialize
 		p, ok := qv.buildPredicateWithColdModeAndWarmLoad(
 			e,
@@ -3618,6 +3631,7 @@ func (qv *queryView) buildPredicatesOrderedWithMode(leaves []qir.Expr, orderFiel
 			preds.Release()
 			return predicateSet{}, false
 		}
+
 		qv.postprocessBuiltOrderedPredicate(
 			&p,
 			orderedRoute,
@@ -3630,6 +3644,7 @@ func (qv *queryView) buildPredicatesOrderedWithMode(leaves []qir.Expr, orderFiel
 		)
 		preds.Append(p)
 	}
+
 	return preds, true
 }
 
@@ -3675,7 +3690,7 @@ func (qv *queryView) buildPredicatesOrderedWithModeBuf(
 	}
 	for i := 0; i < leaves.Len(); i++ {
 		e := leaves.Get(i)
-		fieldName := qv.fieldNameByOrdinal(e.FieldOrdinal)
+		fieldName := qv.engine.fieldNameByOrdinal(e.FieldOrdinal)
 		orderRangeDeferred := !coverOrderRange && qv.isOrderRangeCoveredLeaf(orderField, e)
 		if coverOrderRange && qv.isOrderRangeCoveredLeaf(orderField, e) {
 			rb, ok, err := qv.rangeBoundsForScalarExpr(e)
@@ -4647,7 +4662,7 @@ func chooseOrderedAnchorLeadReader(qv *queryView, orderField string, preds predi
 			continue
 		}
 		weight := orderedAnchorLeadOpWeight(p.expr.Op)
-		if p.expr.FieldOrdinal >= 0 && qv.fieldNameByOrdinal(p.expr.FieldOrdinal) == orderField {
+		if p.expr.FieldOrdinal >= 0 && qv.engine.fieldNameByOrdinal(p.expr.FieldOrdinal) == orderField {
 			// Predicates on the order field usually provide weak anchor signal.
 			weight *= 2.8
 		}
@@ -4680,7 +4695,7 @@ func chooseOrderedAnchorLeadBufReader(qv *queryView, orderField string, preds pr
 			continue
 		}
 		weight := orderedAnchorLeadOpWeight(p.expr.Op)
-		if p.expr.FieldOrdinal >= 0 && qv.fieldNameByOrdinal(p.expr.FieldOrdinal) == orderField {
+		if p.expr.FieldOrdinal >= 0 && qv.engine.fieldNameByOrdinal(p.expr.FieldOrdinal) == orderField {
 			weight *= 2.8
 		}
 		score := float64(p.estCard) * weight
@@ -4707,7 +4722,7 @@ func (qv *queryView) execPlanOrderedBasicAnchored(q *qir.Shape, preds predicateR
 		return nil, false
 	}
 
-	leadIdx, ok := chooseOrderedAnchorLeadReader(qv, qv.fieldNameByOrdinal(q.Order.FieldOrdinal), preds, active)
+	leadIdx, ok := chooseOrderedAnchorLeadReader(qv, qv.engine.fieldNameByOrdinal(q.Order.FieldOrdinal), preds, active)
 	if !ok {
 		return nil, false
 	}
@@ -4957,7 +4972,7 @@ func (qv *queryView) execPlanOrderedBasicAnchoredBuf(q *qir.Shape, preds predica
 		return nil, false
 	}
 
-	leadIdx, ok := chooseOrderedAnchorLeadBufReader(qv, qv.fieldNameByOrdinal(q.Order.FieldOrdinal), preds, active)
+	leadIdx, ok := chooseOrderedAnchorLeadBufReader(qv, qv.engine.fieldNameByOrdinal(q.Order.FieldOrdinal), preds, active)
 	if !ok {
 		return nil, false
 	}
@@ -5216,7 +5231,7 @@ func (qv *queryView) execPlanOrderedBasicReader(q *qir.Shape, preds predicateRea
 		return nil, false
 	}
 
-	orderField := qv.fieldNameByOrdinal(o.FieldOrdinal)
+	orderField := qv.engine.fieldNameByOrdinal(o.FieldOrdinal)
 	rb, br, rangeCovered, ok := qv.extractOrderRangeCoverageOverlayWithBoundsReader(orderField, preds, ov)
 	if !ok {
 		return nil, false
@@ -5453,7 +5468,7 @@ func (qv *queryView) collectOrderRangeBounds(field string, n int, exprAt func(i 
 
 	for i := 0; i < n; i++ {
 		e := exprAt(i)
-		if e.Not || qv.fieldNameByOrdinal(e.FieldOrdinal) != field {
+		if e.Not || qv.engine.fieldNameByOrdinal(e.FieldOrdinal) != field {
 			continue
 		}
 		if applied, ok := qv.applyScalarExprToRangeBounds(e, &rb); !ok {
@@ -5479,7 +5494,7 @@ func (qv *queryView) collectPredicateRangeBoundsReader(field string, preds predi
 
 	for i := 0; i < preds.Len(); i++ {
 		p := preds.Get(i)
-		if p.expr.Not || qv.fieldNameByOrdinal(p.expr.FieldOrdinal) != field {
+		if p.expr.Not || qv.engine.fieldNameByOrdinal(p.expr.FieldOrdinal) != field {
 			continue
 		}
 		if p.hasEffectiveBounds {
@@ -5511,7 +5526,7 @@ func (qv *queryView) collectPredicateRangeBoundsSet(field string, preds predicat
 
 	for i := 0; i < preds.Len(); i++ {
 		p := preds.Get(i)
-		if p.expr.Not || qv.fieldNameByOrdinal(p.expr.FieldOrdinal) != field {
+		if p.expr.Not || qv.engine.fieldNameByOrdinal(p.expr.FieldOrdinal) != field {
 			continue
 		}
 		if p.hasEffectiveBounds {

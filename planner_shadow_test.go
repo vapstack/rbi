@@ -65,7 +65,7 @@ func (h *plannerShadowHarness) run(
 	h.db.clearCurrentSnapshotCachesForTesting()
 
 	mark := h.recorder.mark()
-	trace := h.db.beginTrace(h.viewQ)
+	trace := h.db.engine.beginTrace(h.viewQ)
 	if trace == nil {
 		h.t.Fatalf("%s: expected trace to be enabled", label)
 	}
@@ -223,7 +223,7 @@ func TestPlannerShadow_OrderedOR_StreamVsFallback(t *testing.T) {
 		}
 		branches, alwaysFalse, ok := view.buildORBranchesOrdered(
 			viewQ.Expr.Operands,
-			view.fieldNameByOrdinal(viewQ.Order.FieldOrdinal),
+			view.engine.fieldNameByOrdinal(viewQ.Order.FieldOrdinal),
 			window,
 			viewQ.Offset,
 		)
@@ -279,7 +279,7 @@ func TestPlannerShadow_OrderedORMergeVsFallback(t *testing.T) {
 		}
 		branches, alwaysFalse, ok := view.buildORBranchesOrdered(
 			viewQ.Expr.Operands,
-			view.fieldNameByOrdinal(viewQ.Order.FieldOrdinal),
+			view.engine.fieldNameByOrdinal(viewQ.Order.FieldOrdinal),
 			window,
 			viewQ.Offset,
 		)
@@ -332,7 +332,7 @@ func TestPlannerShadow_OrderedLimitExecutionVsPlanner(t *testing.T) {
 			return nil, false, nil
 		}
 		window, _ := orderWindow(viewQ)
-		orderField := view.fieldNameByOrdinal(viewQ.Order.FieldOrdinal)
+		orderField := view.engine.fieldNameByOrdinal(viewQ.Order.FieldOrdinal)
 		predSet, ok := view.buildPredicatesOrderedWithMode(leaves, orderField, false, window, viewQ.Offset, true, true)
 		if !ok {
 			return nil, false, nil
@@ -385,13 +385,13 @@ func TestPlannerShadow_CandidateOrderVsOrderedPlanner(t *testing.T) {
 
 	ordered := h.run("shadow_candidate_order_alt_planner", func(view *queryView, viewQ *qir.Shape, trace *queryTrace) ([]uint64, bool, error) {
 		var leavesBuf [plannerPredicateFastPathMaxLeaves]qir.Expr
-		leaves, ok := collectAndLeavesModeScratch(viewQ.Expr, leavesBuf[:0], andLeafModeCollect)
+		l, ok := collectAndLeavesModeScratch(viewQ.Expr, leavesBuf[:0], andLeafModeCollect)
 		if !ok {
 			return nil, false, nil
 		}
 		window, _ := orderWindow(viewQ)
-		orderField := view.fieldNameByOrdinal(viewQ.Order.FieldOrdinal)
-		predSet, ok := view.buildPredicatesOrderedWithMode(leaves, orderField, false, window, viewQ.Offset, true, true)
+		orderField := view.engine.fieldNameByOrdinal(viewQ.Order.FieldOrdinal)
+		predSet, ok := view.buildPredicatesOrderedWithMode(l, orderField, false, window, viewQ.Offset, true, true)
 		if !ok {
 			return nil, false, nil
 		}
