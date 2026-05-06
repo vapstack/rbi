@@ -388,7 +388,7 @@ func copyBorrowedPostingSlice(dst, src []posting.List) {
 func newNumericFieldIndexChunk(posts []posting.List, keys []uint64, rows uint64) *fieldIndexChunk {
 	if chunkAllSingletonPosts(posts) {
 		keyOwners := interleavedNumericChunkPairs(keys, posts)
-		posting.ReleaseSliceOwned(posts)
+		posting.ReleaseAll(posts)
 		return newUniqueNumericFieldIndexChunk(keyOwners)
 	}
 	for i := range posts {
@@ -470,7 +470,7 @@ func newUniqueStringFieldIndexChunk(owners []uint64, refs []fieldIndexStringRef,
 func newStringFieldIndexChunk(posts []posting.List, refs []fieldIndexStringRef, data []byte, rows uint64) *fieldIndexChunk {
 	if chunkAllSingletonPosts(posts) {
 		owners := stringChunkOwners(posts)
-		posting.ReleaseSliceOwned(posts)
+		posting.ReleaseAll(posts)
 		return newUniqueStringFieldIndexChunk(owners, refs, data)
 	}
 	for i := range posts {
@@ -538,7 +538,7 @@ func (c *fieldIndexChunk) release() {
 	if c == nil || c.refs.Add(-1) != 0 {
 		return
 	}
-	posting.ReleaseSliceOwned(c.posts)
+	posting.ReleaseAll(c.posts)
 }
 
 func (r *fieldIndexChunkedRoot) retain() {

@@ -4,6 +4,7 @@ import (
 	"math/bits"
 
 	"github.com/vapstack/rbi/internal/pooled"
+	"github.com/vapstack/rbi/internal/pools"
 	"github.com/vapstack/rbi/internal/posting"
 	"github.com/vapstack/rbi/internal/qir"
 )
@@ -16,7 +17,7 @@ type leafPred struct {
 	posting       posting.List
 	estCard       uint64
 	postingFilter func(posting.List) (posting.List, bool)
-	postsBuf      *pooled.Slice[posting.List]
+	postsBuf      []posting.List
 	postsAnyState *postsAnyFilterState
 }
 
@@ -38,7 +39,7 @@ func (p leafPred) postCount() int {
 }
 
 func (p leafPred) postAt(i int) posting.List {
-	return p.postsBuf.Get(i)
+	return p.postsBuf[i]
 }
 
 func (p *leafPred) setExpectedContainsCalls(expected int) {
@@ -86,7 +87,7 @@ func (p leafPred) iterNew() posting.Iterator {
 	case leafPredKindPostsConcat:
 		return newPostingConcatBufIter(p.postsBuf)
 	case leafPredKindPostsUnion:
-		return newPostingUnionBufIter(p.postsBuf)
+		return newPostingUnionIter(p.postsBuf)
 	case leafPredKindPostsAll:
 		return p.posting.Iter()
 	default:
@@ -1357,12 +1358,12 @@ func (qv *queryView) buildLeafPred(e qir.Expr) (leafPred, bool, error) {
 		}
 
 		postsBuf, est := qv.scalarLookupPostings(fieldName, e.FieldOrdinal, keysBuf, hasNil)
-		if postsBuf.Len() == 0 {
-			postingSlicePool.Put(postsBuf)
+		if len(postsBuf) == 0 {
+			pools.PutPostingSlice(postsBuf)
 			return emptyLeaf(), true, nil
 		}
-		if postsBuf.Len() == 1 {
-			ids := postsBuf.Get(0)
+		if len(postsBuf) == 1 {
+			ids := postsBuf[0]
 			return leafPred{
 				kind:     leafPredKindPosting,
 				posting:  ids,
@@ -1397,17 +1398,16 @@ func (qv *queryView) buildLeafPred(e qir.Expr) (leafPred, bool, error) {
 			return leafPred{}, false, nil
 		}
 
-		postsBuf := postingSlicePool.Get()
-		postsBuf.Grow(keyCount)
+		postsBuf := pools.GetPostingSlice(keyCount)
 
 		var est uint64
 		for i := 0; i < keyCount; i++ {
 			ids := ov.lookupPostingRetained(keysBuf.Get(i))
 			if ids.IsEmpty() {
-				postingSlicePool.Put(postsBuf)
+				pools.PutPostingSlice(postsBuf)
 				return emptyLeaf(), true, nil
 			}
-			postsBuf.Append(ids)
+			postsBuf = append(postsBuf, ids)
 			c := ids.Cardinality()
 			if est == 0 || c < est {
 				est = c
@@ -1439,12 +1439,12 @@ func (qv *queryView) buildLeafPred(e qir.Expr) (leafPred, bool, error) {
 		}
 
 		postsBuf, est := ov.lookupPostings(keysBuf)
-		if postsBuf.Len() == 0 {
-			postingSlicePool.Put(postsBuf)
+		if len(postsBuf) == 0 {
+			pools.PutPostingSlice(postsBuf)
 			return emptyLeaf(), true, nil
 		}
-		if postsBuf.Len() == 1 {
-			ids := postsBuf.Get(0)
+		if len(postsBuf) == 1 {
+			ids := postsBuf[0]
 			return leafPred{
 				kind:     leafPredKindPosting,
 				posting:  ids,
@@ -1780,15 +1780,15 @@ func hasEmptyLeafPred(preds *pooled.Slice[leafPred]) bool {
 	return false
 }
 
-func minCardPostingBuf(posts *pooled.Slice[posting.List]) posting.List {
-	if posts == nil || posts.Len() == 0 {
+func minCardPostingBuf(posts []posting.List) posting.List {
+	if len(posts) == 0 {
 		return posting.List{}
 	}
-	best := posts.Get(0)
+	best := posts[0]
 	bestC := best.Cardinality()
-	for i := 1; i < posts.Len(); i++ {
-		if c := posts.Get(i).Cardinality(); c < bestC {
-			best = posts.Get(i)
+	for i := 1; i < len(posts); i++ {
+		if c := posts[i].Cardinality(); c < bestC {
+			best = posts[i]
 			bestC = c
 		}
 	}
@@ -1809,27 +1809,20 @@ func (emptyIter) Next() uint64  { return 0 }
 func (emptyIter) Release()      {}
 
 type postingConcatIter struct {
-	posts    []posting.List
-	postsBuf *pooled.Slice[posting.List]
-	i        int
-	curIt    posting.Iterator
+	posts []posting.List
+	i     int
+	curIt posting.Iterator
 }
 
-func newPostingConcatBufIter(posts *pooled.Slice[posting.List]) posting.Iterator {
-	return &postingConcatIter{postsBuf: posts}
+func newPostingConcatBufIter(posts []posting.List) posting.Iterator {
+	return &postingConcatIter{posts: posts}
 }
 
 func (it *postingConcatIter) postCount() int {
-	if it.postsBuf != nil {
-		return it.postsBuf.Len()
-	}
 	return len(it.posts)
 }
 
 func (it *postingConcatIter) postAt(i int) posting.List {
-	if it.postsBuf != nil {
-		return it.postsBuf.Get(i)
-	}
 	return it.posts[i]
 }
 
@@ -1867,27 +1860,24 @@ func (it *postingConcatIter) Release() {
 		it.curIt = nil
 	}
 	it.posts = nil
-	it.postsBuf = nil
 	it.i = 0
 }
 
 type postingUnionIter struct {
-	posts    []posting.List
-	postsBuf *pooled.Slice[posting.List]
-	i        int
-	curIt    posting.Iterator
-	seen     u64set
-	next     uint64
-	has      bool
+	posts []posting.List
+	i     int
+	curIt posting.Iterator
+	seen  u64set
+	next  uint64
+	has   bool
 }
 
 type postingSmallUnionIter struct {
-	posts    []posting.List
-	postsBuf *pooled.Slice[posting.List]
-	i        int
-	curIt    posting.Iterator
-	next     uint64
-	has      bool
+	posts []posting.List
+	i     int
+	curIt posting.Iterator
+	next  uint64
+	has   bool
 }
 
 type u64setPoolBuf struct {
@@ -1944,62 +1934,26 @@ func newPostingUnionIter(posts []posting.List) posting.Iterator {
 		it.posts = posts
 		return it
 	}
-
-	/*
-		capHint := len(posts) * 16
-		if capHint < 64 {
-			capHint = 64
-		}
-		if capHint > 1024 {
-			capHint = 1024
-		}
-	*/
 	capHint := min(max(len(posts)*16, 64), 1024)
-
 	it := postingUnionIterPool.Get()
 	it.posts = posts
 	it.seen = newU64Set(capHint)
 	return it
 }
 
-func newPostingUnionBufIter(posts *pooled.Slice[posting.List]) posting.Iterator {
-	if posts.Len() > 1 && posts.Len() <= 3 {
-		it := postingSmallUnionIterPool.Get()
-		it.postsBuf = posts
-		return it
-	}
-	capHint := min(max(posts.Len()*16, 64), 1024)
-	it := postingUnionIterPool.Get()
-	it.postsBuf = posts
-	it.seen = newU64Set(capHint)
-	return it
-}
-
 func (u *postingSmallUnionIter) postCount() int {
-	if u.postsBuf != nil {
-		return u.postsBuf.Len()
-	}
 	return len(u.posts)
 }
 
 func (u *postingSmallUnionIter) postAt(i int) posting.List {
-	if u.postsBuf != nil {
-		return u.postsBuf.Get(i)
-	}
 	return u.posts[i]
 }
 
 func (u *postingUnionIter) postCount() int {
-	if u.postsBuf != nil {
-		return u.postsBuf.Len()
-	}
 	return len(u.posts)
 }
 
 func (u *postingUnionIter) postAt(i int) posting.List {
-	if u.postsBuf != nil {
-		return u.postsBuf.Get(i)
-	}
 	return u.posts[i]
 }
 
@@ -2095,7 +2049,6 @@ func (u *postingUnionIter) Release() {
 		u.curIt = nil
 	}
 	u.posts = nil
-	u.postsBuf = nil
 	releaseU64Set(&u.seen)
 	postingUnionIterPool.Put(u)
 }

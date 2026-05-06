@@ -4324,7 +4324,7 @@ func TestFieldIndexChunkPostingAtBorrowedDetachUnderConcurrency(t *testing.T) {
 	}
 
 	chunk := &fieldIndexChunk{posts: []posting.List{base}}
-	defer posting.ReleaseSliceOwned(chunk.posts)
+	defer posting.ReleaseAll(chunk.posts)
 	want := postingConsumerExpected(chunk.posts[0])
 
 	remove := snapshotExtPosting(3, 6, 9, 12)

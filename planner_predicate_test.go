@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/vapstack/qx"
+	"github.com/vapstack/rbi/internal/pools"
 	"github.com/vapstack/rbi/internal/posting"
 	"github.com/vapstack/rbi/internal/qir"
 )
@@ -241,14 +242,16 @@ func TestPredicateSupportsCheapPostingFilter_UsesUnifiedCapability(t *testing.T)
 }
 
 func TestPredicatePostsAnyNotRuntimeApplyToPosting(t *testing.T) {
-	posts := postingSlicePool.Get()
-	defer postingSlicePool.Put(posts)
-	posts.Append(posting.BuildFromSorted([]uint64{2, 4, 6}))
-	posts.Append(posting.BuildFromSorted([]uint64{1, 4, 7}))
-	posts.Append(posting.BuildFromSorted([]uint64{3, 5, 7}))
+	posts := pools.GetPostingSlice(3)
+	posts = append(posts,
+		posting.BuildFromSorted([]uint64{2, 4, 6}),
+		posting.BuildFromSorted([]uint64{1, 4, 7}),
+		posting.BuildFromSorted([]uint64{3, 5, 7}),
+	)
+	defer pools.PutPostingSlice(posts)
 	defer func() {
-		for i := 0; i < posts.Len(); i++ {
-			posts.Get(i).Release()
+		for i := 0; i < len(posts); i++ {
+			posts[i].Release()
 		}
 	}()
 

@@ -4,6 +4,7 @@ import (
 	"slices"
 	"testing"
 
+	"github.com/vapstack/rbi/internal/pools"
 	"github.com/vapstack/rbi/internal/posting"
 )
 
@@ -78,20 +79,18 @@ func TestPostsAnyFilterStateApply_DirectIntersectMatchesMaterializedUnion(t *tes
 		dstIDs[56], dstIDs[60], dstIDs[64], dstIDs[68], dstIDs[72], dstIDs[76],
 	})
 
-	postsBuf := postingSlicePool.Get()
-	postsBuf.Append(postA)
-	postsBuf.Append(postB)
+	postsBuf := pools.GetPostingSlice(2)
+	postsBuf = append(postsBuf, postA, postB)
 
 	state := postsAnyFilterStatePool.Get()
 	state.postsBuf = postsBuf
 
 	defer func() {
 		postsAnyFilterStatePool.Put(state)
-		for i := 0; i < postsBuf.Len(); i++ {
-			postsBuf.Get(i).Release()
-			postsBuf.Set(i, posting.List{})
+		for i := 0; i < len(postsBuf); i++ {
+			postsBuf[i].Release()
 		}
-		postingSlicePool.Put(postsBuf)
+		pools.PutPostingSlice(postsBuf)
 	}()
 
 	expectedBuilder := newPostingUnionBuilder(true)
@@ -138,20 +137,18 @@ func TestPostsAnyFilterStateApply_RepeatedDirectIntersectPromotesMaterializedUni
 	postA := posting.BuildFromSorted(postAIDs)
 	postB := posting.BuildFromSorted(postBIDs)
 
-	postsBuf := postingSlicePool.Get()
-	postsBuf.Append(postA)
-	postsBuf.Append(postB)
+	postsBuf := pools.GetPostingSlice(2)
+	postsBuf = append(postsBuf, postA, postB)
 
 	state := postsAnyFilterStatePool.Get()
 	state.postsBuf = postsBuf
 
 	defer func() {
 		postsAnyFilterStatePool.Put(state)
-		for i := 0; i < postsBuf.Len(); i++ {
-			postsBuf.Get(i).Release()
-			postsBuf.Set(i, posting.List{})
+		for i := 0; i < len(postsBuf); i++ {
+			postsBuf[i].Release()
 		}
-		postingSlicePool.Put(postsBuf)
+		pools.PutPostingSlice(postsBuf)
 	}()
 
 	expectedBuilder := newPostingUnionBuilder(true)
@@ -198,9 +195,8 @@ func TestPostsAnyFilterStateSetExpectedContainsCalls_PromotesFirstUseMaterializa
 	postA := posting.BuildFromSorted(postAIDs)
 	postB := posting.BuildFromSorted(postBIDs)
 
-	postsBuf := postingSlicePool.Get()
-	postsBuf.Append(postA)
-	postsBuf.Append(postB)
+	postsBuf := pools.GetPostingSlice(2)
+	postsBuf = append(postsBuf, postA, postB)
 
 	state := postsAnyFilterStatePool.Get()
 	state.postsBuf = postsBuf
@@ -208,11 +204,10 @@ func TestPostsAnyFilterStateSetExpectedContainsCalls_PromotesFirstUseMaterializa
 
 	defer func() {
 		postsAnyFilterStatePool.Put(state)
-		for i := 0; i < postsBuf.Len(); i++ {
-			postsBuf.Get(i).Release()
-			postsBuf.Set(i, posting.List{})
+		for i := 0; i < len(postsBuf); i++ {
+			postsBuf[i].Release()
 		}
-		postingSlicePool.Put(postsBuf)
+		pools.PutPostingSlice(postsBuf)
 	}()
 
 	if state.containsMaterializeAt == 1 {

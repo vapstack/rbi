@@ -6,6 +6,7 @@ import (
 	"sync/atomic"
 
 	"github.com/vapstack/rbi/internal/pooled"
+	"github.com/vapstack/rbi/internal/pools"
 	"github.com/vapstack/rbi/internal/posting"
 )
 
@@ -41,7 +42,7 @@ type numericRangeBucketCacheEntry struct {
 	mu            sync.Mutex
 	fullSpanClock uint64
 	fullSpanCache [numericRangeFullSpanCacheMaxEntries]numericRangeFullSpanCacheSlot
-	retired       *pooled.Slice[posting.List]
+	retired       []posting.List
 }
 
 var numericRangeBucketCachePool = pooled.Pointers[numericRangeBucketCache]{
@@ -57,18 +58,6 @@ var numericRangeBucketCacheSlotPool = pooled.Slices[numericRangeBucketCacheSlot]
 var numericRangeBucketCacheEntryPool = pooled.Pointers[numericRangeBucketCacheEntry]{
 	Cleanup: func(e *numericRangeBucketCacheEntry) {
 		e.releaseFullSpanCache()
-	},
-	Clear: true,
-}
-
-var numericRangeRetiredPostingPool = pooled.Slices[posting.List]{
-	Cleanup: func(buf *pooled.Slice[posting.List]) {
-		for i := 0; i < buf.Len(); i++ {
-			ids := buf.Get(i)
-			if !ids.IsEmpty() {
-				ids.Release()
-			}
-		}
 	},
 	Clear: true,
 }
@@ -189,7 +178,8 @@ func (e *numericRangeBucketCacheEntry) releaseFullSpanCache() {
 		e.fullSpanCache[i] = numericRangeFullSpanCacheSlot{}
 	}
 	if e.retired != nil {
-		numericRangeRetiredPostingPool.Put(e.retired)
+		posting.ReleaseAll(e.retired)
+		pools.PutPostingSlice(e.retired)
 		e.retired = nil
 	}
 	e.fullSpanClock = 0
@@ -200,9 +190,9 @@ func (e *numericRangeBucketCacheEntry) retirePosting(ids posting.List) {
 		return
 	}
 	if e.retired == nil {
-		e.retired = numericRangeRetiredPostingPool.Get()
+		e.retired = pools.GetPostingSlice(1)
 	}
-	e.retired.Append(ids)
+	e.retired = append(e.retired, ids)
 }
 
 func (e *numericRangeBucketCacheEntry) loadFullSpan(start, end int) (posting.List, bool) {

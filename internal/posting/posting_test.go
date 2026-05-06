@@ -1541,7 +1541,7 @@ func TestListLifecycleHelpers(t *testing.T) {
 			postingFromIDs(9, 11, 13, 15),
 		}
 		prev := values[0].small()
-		ReleaseSliceOwned(values)
+		ReleaseAll(values)
 		for i, value := range values {
 			if !value.IsEmpty() {
 				t.Fatalf("slice value #%d not cleared", i)
@@ -1552,25 +1552,6 @@ func TestListLifecycleHelpers(t *testing.T) {
 		defer reused.Release()
 		if !testRaceEnabled && reused.small() != prev {
 			t.Fatalf("ReleaseSliceOwned did not release pool-backed payload")
-		}
-	})
-
-	t.Run("ClearMapOwned", func(t *testing.T) {
-		values := map[string]List{
-			"a": postingFromIDs(1, 2, 3, 4),
-			"b": postingFromIDs(8, 9, 10, 11),
-		}
-		prevA := values["a"].small()
-		prevB := values["b"].small()
-		ClearMapOwned(values)
-		if len(values) != 0 {
-			t.Fatalf("ClearMapOwned did not empty map")
-		}
-
-		reused := postingFromIDs(31, 33, 35, 37)
-		defer reused.Release()
-		if !testRaceEnabled && reused.small() != prevA && reused.small() != prevB {
-			t.Fatalf("ClearMapOwned did not release pool-backed payload")
 		}
 	})
 
@@ -2505,13 +2486,13 @@ func TestParallelBatchedPostingUnionBorrowedInputsStayStable(t *testing.T) {
 		sourceWant = append(sourceWant, ids.ToArray())
 		sources = append(sources, ids)
 	}
-	defer ReleaseSliceOwned(sources)
+	defer ReleaseAll(sources)
 
 	posts := make([]List, len(sources))
 	for i := range sources {
 		posts[i] = sources[i].Borrow()
 	}
-	defer ReleaseSliceOwned(posts)
+	defer ReleaseAll(posts)
 
 	want := priorityUnionAll(func() []List {
 		out := make([]List, len(sources))

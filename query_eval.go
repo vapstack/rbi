@@ -9,6 +9,7 @@ import (
 	"github.com/vapstack/rbi/internal/qir"
 
 	"github.com/vapstack/rbi/internal/pooled"
+	"github.com/vapstack/rbi/internal/pools"
 	"github.com/vapstack/rbi/internal/posting"
 )
 
@@ -458,9 +459,8 @@ func parallelBatchedPostingUnionOwned(posts []posting.List) posting.List {
 	}
 
 	chunkSize := (n + workers - 1) / workers
-	resultsBuf := postingSlicePool.Get()
-	resultsBuf.SetLen(workers)
-	defer postingSlicePool.Put(resultsBuf)
+	resultsBuf := pools.GetPostingSlice(workers)[:workers]
+	defer pools.PutPostingSlice(resultsBuf)
 
 	var wg sync.WaitGroup
 	for i := 0; i < workers; i++ {
@@ -476,15 +476,15 @@ func parallelBatchedPostingUnionOwned(posts []posting.List) posting.List {
 		wg.Add(1)
 		go func(idx int, part []posting.List) {
 			defer wg.Done()
-			resultsBuf.Set(idx, linearPostingUnionOwned(part))
+			resultsBuf[idx] = linearPostingUnionOwned(part)
 		}(i, posts[start:end])
 	}
 
 	wg.Wait()
 
-	final := resultsBuf.Get(0)
-	for i := 1; i < resultsBuf.Len(); i++ {
-		final = final.BuildMergedOwned(resultsBuf.Get(i))
+	final := resultsBuf[0]
+	for i := 1; i < len(resultsBuf); i++ {
+		final = final.BuildMergedOwned(resultsBuf[i])
 	}
 	return final.BuildOptimized()
 }
@@ -1060,10 +1060,9 @@ func sliceValueToIdxStringBuf(v reflect.Value, fm *field) (*pooled.Slice[string]
 	return ixsBuf, hasNil, nil
 }
 
-func (qv *queryView) scalarLookupPostings(field string, fieldOrdinal int, keys stringKeyReader, includeNil bool) (*pooled.Slice[posting.List], uint64) {
-	postsBuf := postingSlicePool.Get()
+func (qv *queryView) scalarLookupPostings(field string, fieldOrdinal int, keys stringKeyReader, includeNil bool) ([]posting.List, uint64) {
 	keyCount := stringKeyReaderLen(keys)
-	postsBuf.Grow(keyCount + btoi(includeNil))
+	postsBuf := pools.GetPostingSlice(keyCount + btoi(includeNil))
 	var est uint64
 
 	ov := qv.fieldOverlayRef(field, fieldOrdinal)
@@ -1072,13 +1071,13 @@ func (qv *queryView) scalarLookupPostings(field string, fieldOrdinal int, keys s
 		if ids.IsEmpty() {
 			continue
 		}
-		postsBuf.Append(ids)
+		postsBuf = append(postsBuf, ids)
 		est += ids.Cardinality()
 	}
 	if includeNil {
 		ids := qv.nilFieldOverlayRef(field, fieldOrdinal).lookupPostingRetained(nilIndexEntryKey)
 		if !ids.IsEmpty() {
-			postsBuf.Append(ids)
+			postsBuf = append(postsBuf, ids)
 			est += ids.Cardinality()
 		}
 	}

@@ -448,7 +448,7 @@ type buildIndexRunHeap struct {
 type buildIndexFieldRun struct {
 	stringBuf *pooled.Slice[string]
 	u64Buf    []uint64
-	postBuf   *pooled.Slice[posting.List]
+	postBuf   []posting.List
 }
 
 func buildIndexRunTargetEntries() int {
@@ -525,8 +525,8 @@ func (r buildIndexFieldRun) keyAt(i int) indexKey {
 }
 
 func (r *buildIndexFieldRun) takePosting(i int) posting.List {
-	ids := r.postBuf.Get(i)
-	r.postBuf.Set(i, posting.List{})
+	ids := r.postBuf[i]
+	r.postBuf[i] = posting.List{}
 	return ids
 }
 
@@ -543,12 +543,8 @@ func (r *buildIndexFieldRun) release() {
 		r.u64Buf = nil
 	}
 	if r.postBuf != nil {
-		for i := 0; i < r.postBuf.Len(); i++ {
-			ids := r.postBuf.Get(i)
-			ids.Release()
-			r.postBuf.Set(i, posting.List{})
-		}
-		postingSlicePool.Put(r.postBuf)
+		posting.ReleaseAll(r.postBuf)
+		pools.PutPostingSlice(r.postBuf)
 		r.postBuf = nil
 	}
 }
@@ -573,10 +569,9 @@ func buildIndexStringRunFromPostingMap(m map[string]posting.List) buildIndexFiel
 		return buildIndexFieldRun{}
 	}
 	pooled.SortSlice(keyBuf)
-	postBuf := postingSlicePool.Get()
-	postBuf.SetLen(keyBuf.Len())
+	postBuf := pools.GetPostingSlice(keyBuf.Len())[:keyBuf.Len()]
 	for i := 0; i < keyBuf.Len(); i++ {
-		postBuf.Set(i, m[keyBuf.Get(i)])
+		postBuf[i] = m[keyBuf.Get(i)]
 	}
 	clear(m)
 	return buildIndexFieldRun{
@@ -604,10 +599,9 @@ func buildIndexFixedRunFromPostingMap(m map[uint64]posting.List) buildIndexField
 		return buildIndexFieldRun{}
 	}
 	slices.Sort(keyBuf)
-	postBuf := postingSlicePool.Get()
-	postBuf.SetLen(len(keyBuf))
+	postBuf := pools.GetPostingSlice(len(keyBuf))[:len(keyBuf)]
 	for i := 0; i < len(keyBuf); i++ {
-		postBuf.Set(i, m[keyBuf[i]])
+		postBuf[i] = m[keyBuf[i]]
 	}
 	clear(m)
 	return buildIndexFieldRun{
@@ -669,12 +663,16 @@ func (s *buildIndexFieldLocalState) release() {
 	if s == nil {
 		return
 	}
-	posting.ClearMapOwned(s.vals)
+
+	posting.ReleaseMap(s.vals)
 	s.vals = nil
-	posting.ClearMapOwned(s.fixed)
+
+	posting.ReleaseMap(s.fixed)
 	s.fixed = nil
-	posting.ClearMapOwned(s.lenMap)
+
+	posting.ReleaseMap(s.lenMap)
 	s.lenMap = nil
+
 	s.nils.Release()
 	s.nils = posting.List{}
 }
@@ -843,9 +841,11 @@ func (s *buildIndexFieldState) release() {
 		s.runs[i].release()
 	}
 	s.runs = nil
+
 	s.nils.Release()
 	s.nils = posting.List{}
-	posting.ClearMapOwned(s.lenMap)
+
+	posting.ReleaseMap(s.lenMap)
 	s.lenMap = nil
 }
 
@@ -3369,10 +3369,9 @@ func (o fieldOverlay) postingAt(rank int) posting.List {
 	return o.base[rank].IDs.Borrow()
 }
 
-func (o fieldOverlay) lookupPostings(keys stringKeyReader) (*pooled.Slice[posting.List], uint64) {
-	postsBuf := postingSlicePool.Get()
+func (o fieldOverlay) lookupPostings(keys stringKeyReader) ([]posting.List, uint64) {
 	keyCount := stringKeyReaderLen(keys)
-	postsBuf.Grow(keyCount)
+	postsBuf := pools.GetPostingSlice(keyCount)
 	var est uint64
 
 	for i := 0; i < keyCount; i++ {
@@ -3380,7 +3379,7 @@ func (o fieldOverlay) lookupPostings(keys stringKeyReader) (*pooled.Slice[postin
 		if ids.IsEmpty() {
 			continue
 		}
-		postsBuf.Append(ids)
+		postsBuf = append(postsBuf, ids)
 		est += ids.Cardinality()
 	}
 	return postsBuf, est

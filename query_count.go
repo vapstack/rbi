@@ -207,18 +207,18 @@ func countPostingUnionCardinality2(a, b posting.List) uint64 {
 	return satAddUint64(a.Cardinality(), b.Cardinality()) - a.AndCardinality(b)
 }
 
-func countPostingAllMatches(posts *pooled.Slice[posting.List]) uint64 {
-	if posts == nil || posts.Len() == 0 {
+func countPostingAllMatches(posts []posting.List) uint64 {
+	if len(posts) == 0 {
 		return 0
 	}
 	leadIdx := 0
-	lead := posts.Get(0)
+	lead := posts[0]
 	leadCard := lead.Cardinality()
 	if leadCard == 0 {
 		return 0
 	}
-	for i := 1; i < posts.Len(); i++ {
-		ids := posts.Get(i)
+	for i := 1; i < len(posts); i++ {
+		ids := posts[i]
 		card := ids.Cardinality()
 		if card == 0 {
 			return 0
@@ -230,11 +230,11 @@ func countPostingAllMatches(posts *pooled.Slice[posting.List]) uint64 {
 		}
 	}
 	if idx, ok := lead.TrySingle(); ok {
-		for i := 0; i < posts.Len(); i++ {
+		for i := 0; i < len(posts); i++ {
 			if i == leadIdx {
 				continue
 			}
-			if !posts.Get(i).Contains(idx) {
+			if !posts[i].Contains(idx) {
 				return 0
 			}
 		}
@@ -245,11 +245,11 @@ func countPostingAllMatches(posts *pooled.Slice[posting.List]) uint64 {
 	for it.HasNext() {
 		idx := it.Next()
 		match := true
-		for i := 0; i < posts.Len(); i++ {
+		for i := 0; i < len(posts); i++ {
 			if i == leadIdx {
 				continue
 			}
-			if !posts.Get(i).Contains(idx) {
+			if !posts[i].Contains(idx) {
 				match = false
 				break
 			}
@@ -301,8 +301,8 @@ func (qv *queryView) tryCountBySliceLookup(expr qir.Expr, trace *queryTrace) (ui
 
 	case qir.OpHASANY:
 		postsBuf, _ := qv.scalarLookupPostings(qv.engine.fieldNameByOrdinal(expr.FieldOrdinal), expr.FieldOrdinal, valsBuf, false)
-		defer postingSlicePool.Put(postsBuf)
-		switch postsBuf.Len() {
+		defer pools.PutPostingSlice(postsBuf)
+		switch len(postsBuf) {
 		case 0:
 			if trace != nil {
 				trace.setPlan(PlanCountScalarLookup)
@@ -310,15 +310,15 @@ func (qv *queryView) tryCountBySliceLookup(expr qir.Expr, trace *queryTrace) (ui
 			}
 			return countScalarLookupComplement(universe, 0, expr.Not), true, nil
 		case 1:
-			hit := postsBuf.Get(0).Cardinality()
+			hit := postsBuf[0].Cardinality()
 			if trace != nil {
 				trace.setPlan(PlanCountScalarLookup)
 				trace.addExamined(hit)
 			}
 			return countScalarLookupComplement(universe, hit, expr.Not), true, nil
 		case 2:
-			a := postsBuf.Get(0)
-			b := postsBuf.Get(1)
+			a := postsBuf[0]
+			b := postsBuf[1]
 			hit := countPostingUnionCardinality2(a, b)
 			if trace != nil {
 				trace.setPlan(PlanCountScalarLookup)
@@ -330,9 +330,8 @@ func (qv *queryView) tryCountBySliceLookup(expr qir.Expr, trace *queryTrace) (ui
 		}
 
 	case qir.OpHASALL:
-		postsBuf := postingSlicePool.Get()
-		postsBuf.Grow(valCount)
-		defer postingSlicePool.Put(postsBuf)
+		postsBuf := pools.GetPostingSlice(valCount)
+		defer pools.PutPostingSlice(postsBuf)
 
 		var examined uint64
 		for i := 0; i < valCount; i++ {
@@ -346,7 +345,7 @@ func (qv *queryView) tryCountBySliceLookup(expr qir.Expr, trace *queryTrace) (ui
 				}
 				return countScalarLookupComplement(universe, 0, expr.Not), true, nil
 			}
-			postsBuf.Append(ids)
+			postsBuf = append(postsBuf, ids)
 		}
 
 		hit := countPostingAllMatches(postsBuf)
@@ -2449,15 +2448,15 @@ func (qv *queryView) tryMaterializeBroadRangeComplementPredicateForCount(p *pred
 	return true
 }
 
-func (qv *queryView) materializePostingIntersection(posts *pooled.Slice[posting.List]) posting.List {
-	if posts == nil || posts.Len() == 0 {
+func (qv *queryView) materializePostingIntersection(posts []posting.List) posting.List {
+	if len(posts) == 0 {
 		return posting.List{}
 	}
 
 	seed := -1
 	var seedCard uint64
-	for i := 0; i < posts.Len(); i++ {
-		p := posts.Get(i)
+	for i := 0; i < len(posts); i++ {
+		p := posts[i]
 		c := p.Cardinality()
 		if c == 0 {
 			return posting.List{}
@@ -2468,12 +2467,12 @@ func (qv *queryView) materializePostingIntersection(posts *pooled.Slice[posting.
 		}
 	}
 
-	out := posts.Get(seed).Clone()
-	for i := 0; i < posts.Len(); i++ {
+	out := posts[seed].Clone()
+	for i := 0; i < len(posts); i++ {
 		if i == seed || out.IsEmpty() {
 			continue
 		}
-		out = out.BuildAnd(posts.Get(i))
+		out = out.BuildAnd(posts[i])
 	}
 	return out.BuildOptimized()
 }

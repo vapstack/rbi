@@ -82,10 +82,9 @@ func TestPlannerFilterPostingByPredicateChecksBuf_PostsAnyOwnedLargeAllocsPerRun
 	defer postA.Release()
 	defer postB.Release()
 
-	postsBuf := postingSlicePool.Get()
-	postsBuf.Append(postA)
-	postsBuf.Append(postB)
-	defer postingSlicePool.Put(postsBuf)
+	postsBuf := pools.GetPostingSlice(2)
+	postsBuf = append(postsBuf, postA, postB)
+	defer pools.PutPostingSlice(postsBuf)
 
 	state := postsAnyFilterStatePool.Get()
 	state.postsBuf = postsBuf
@@ -210,10 +209,9 @@ func TestPlannerFilterPostingByPredicateChecksBuf_PreferredExactBypassesSmallBuc
 	defer postA.Release()
 	defer postB.Release()
 
-	postsBuf := postingSlicePool.Get()
-	postsBuf.Append(postA)
-	postsBuf.Append(postB)
-	defer postingSlicePool.Put(postsBuf)
+	postsBuf := pools.GetPostingSlice(2)
+	postsBuf = append(postsBuf, postA, postB)
+	defer pools.PutPostingSlice(postsBuf)
 
 	state := postsAnyFilterStatePool.Get()
 	state.postsBuf = postsBuf

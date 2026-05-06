@@ -4,12 +4,13 @@ import (
 	"math/bits"
 
 	"github.com/vapstack/rbi/internal/pooled"
+	"github.com/vapstack/rbi/internal/pools"
 	"github.com/vapstack/rbi/internal/posting"
 	"github.com/vapstack/rbi/internal/qir"
 )
 
 type postsAnyFilterState struct {
-	postsBuf              *pooled.Slice[posting.List]
+	postsBuf              []posting.List
 	ids                   posting.List
 	containsCalls         int
 	containsMaterializeAt int
@@ -55,7 +56,7 @@ func (state *postsAnyFilterState) materialize() posting.List {
 	return state.ids
 }
 
-func postsAnyContainsMaterializeAfterBuf(posts *pooled.Slice[posting.List]) int {
+func postsAnyContainsMaterializeAfterBuf(posts []posting.List) int {
 	termCount := postingBufLen(posts)
 	if termCount <= 1 {
 		return 0
@@ -73,7 +74,7 @@ func postsAnyContainsMaterializeAfterBuf(posts *pooled.Slice[posting.List]) int 
 	}
 	var sampleTotal uint64
 	for i, sampled := 0, 0; i < termCount && sampled < sampleN; i, sampled = i+step, sampled+1 {
-		sampleTotal += posts.Get(i).Cardinality()
+		sampleTotal += posts[i].Cardinality()
 	}
 	if sampleTotal == 0 {
 		return 0
@@ -105,7 +106,7 @@ func postsAnyContainsMaterializeAfterBuf(posts *pooled.Slice[posting.List]) int 
 	return int(threshold)
 }
 
-func postsAnyContainsWork(posts *pooled.Slice[posting.List]) (uint64, uint64, uint64, bool) {
+func postsAnyContainsWork(posts []posting.List) (uint64, uint64, uint64, bool) {
 	termCount := postingBufLen(posts)
 	if termCount <= 1 {
 		return 0, 0, 0, false
@@ -119,8 +120,8 @@ func postsAnyContainsWork(posts *pooled.Slice[posting.List]) (uint64, uint64, ui
 		buildWork = postingUnionFastSinglesWork(termCount, singletons, unionCard)
 	}
 	directWork := uint64(0)
-	for i := 0; i < posts.Len(); i++ {
-		directWork = satAddUint64(directWork, postingContainsLookupWork(posts.Get(i).Cardinality()))
+	for i := 0; i < len(posts); i++ {
+		directWork = satAddUint64(directWork, postingContainsLookupWork(posts[i].Cardinality()))
 	}
 	return buildWork, directWork, postingContainsLookupWork(unionCard), true
 }
@@ -161,21 +162,21 @@ func (state *postsAnyFilterState) matches(idx uint64) bool {
 		case 0:
 			return false
 		case 1:
-			return state.postsBuf.Get(0).Contains(idx)
+			return state.postsBuf[0].Contains(idx)
 		case 2:
-			return state.postsBuf.Get(0).Contains(idx) || state.postsBuf.Get(1).Contains(idx)
+			return state.postsBuf[0].Contains(idx) || state.postsBuf[1].Contains(idx)
 		case 3:
-			return state.postsBuf.Get(0).Contains(idx) ||
-				state.postsBuf.Get(1).Contains(idx) ||
-				state.postsBuf.Get(2).Contains(idx)
+			return state.postsBuf[0].Contains(idx) ||
+				state.postsBuf[1].Contains(idx) ||
+				state.postsBuf[2].Contains(idx)
 		case 4:
-			return state.postsBuf.Get(0).Contains(idx) ||
-				state.postsBuf.Get(1).Contains(idx) ||
-				state.postsBuf.Get(2).Contains(idx) ||
-				state.postsBuf.Get(3).Contains(idx)
+			return state.postsBuf[0].Contains(idx) ||
+				state.postsBuf[1].Contains(idx) ||
+				state.postsBuf[2].Contains(idx) ||
+				state.postsBuf[3].Contains(idx)
 		}
-		for i := 0; i < state.postsBuf.Len(); i++ {
-			if state.postsBuf.Get(i).Contains(idx) {
+		for i := 0; i < len(state.postsBuf); i++ {
+			if state.postsBuf[i].Contains(idx) {
 				return true
 			}
 		}
@@ -195,21 +196,21 @@ func (state *postsAnyFilterState) matches(idx uint64) bool {
 	case 0:
 		return true
 	case 1:
-		return !state.postsBuf.Get(0).Contains(idx)
+		return !state.postsBuf[0].Contains(idx)
 	case 2:
-		return !state.postsBuf.Get(0).Contains(idx) && !state.postsBuf.Get(1).Contains(idx)
+		return !state.postsBuf[0].Contains(idx) && !state.postsBuf[1].Contains(idx)
 	case 3:
-		return !state.postsBuf.Get(0).Contains(idx) &&
-			!state.postsBuf.Get(1).Contains(idx) &&
-			!state.postsBuf.Get(2).Contains(idx)
+		return !state.postsBuf[0].Contains(idx) &&
+			!state.postsBuf[1].Contains(idx) &&
+			!state.postsBuf[2].Contains(idx)
 	case 4:
-		return !state.postsBuf.Get(0).Contains(idx) &&
-			!state.postsBuf.Get(1).Contains(idx) &&
-			!state.postsBuf.Get(2).Contains(idx) &&
-			!state.postsBuf.Get(3).Contains(idx)
+		return !state.postsBuf[0].Contains(idx) &&
+			!state.postsBuf[1].Contains(idx) &&
+			!state.postsBuf[2].Contains(idx) &&
+			!state.postsBuf[3].Contains(idx)
 	}
-	for i := 0; i < state.postsBuf.Len(); i++ {
-		if state.postsBuf.Get(i).Contains(idx) {
+	for i := 0; i < len(state.postsBuf); i++ {
+		if state.postsBuf[i].Contains(idx) {
 			return false
 		}
 	}
@@ -254,14 +255,14 @@ func postsAnyDirectBucketFilterMaxCard(termCount int) uint64 {
 	return limit
 }
 
-func postsAnyEstimatedUnionCardinality(posts *pooled.Slice[posting.List]) (uint64, int) {
+func postsAnyEstimatedUnionCardinality(posts []posting.List) (uint64, int) {
 	if posts == nil {
 		return 0, 0
 	}
 	est := uint64(0)
 	singletons := 0
-	for i := 0; i < posts.Len(); i++ {
-		card := posts.Get(i).Cardinality()
+	for i := 0; i < len(posts); i++ {
+		card := posts[i].Cardinality()
 		est = satAddUint64(est, card)
 		if card == 1 {
 			singletons++
@@ -270,13 +271,13 @@ func postsAnyEstimatedUnionCardinality(posts *pooled.Slice[posting.List]) (uint6
 	return est, singletons
 }
 
-func postsAnyDirectIntersectWork(posts *pooled.Slice[posting.List], dstCard uint64) uint64 {
+func postsAnyDirectIntersectWork(posts []posting.List, dstCard uint64) uint64 {
 	if posts == nil || dstCard == 0 {
 		return 0
 	}
 	work := uint64(0)
-	for i := 0; i < posts.Len(); i++ {
-		card := posts.Get(i).Cardinality()
+	for i := 0; i < len(posts); i++ {
+		card := posts[i].Cardinality()
 		iterRows := card
 		otherCard := dstCard
 		if dstCard < card {
@@ -292,7 +293,7 @@ func (state *postsAnyFilterState) applyWork(dstCard uint64) (uint64, uint64, uin
 	if state == nil || state.postsBuf == nil || dstCard == 0 {
 		return 0, 0, 0, 0, false
 	}
-	termCount := state.postsBuf.Len()
+	termCount := len(state.postsBuf)
 	if termCount <= 1 || termCount > 4 {
 		return 0, 0, 0, 0, false
 	}
@@ -333,8 +334,8 @@ func (state *postsAnyFilterState) applyOwnedLargeDirect(dst posting.List, card u
 	for it.HasNext() {
 		idx := it.Next()
 		hit := false
-		for i := 0; i < state.postsBuf.Len(); i++ {
-			if state.postsBuf.Get(i).Contains(idx) {
+		for i := 0; i < len(state.postsBuf); i++ {
+			if state.postsBuf[i].Contains(idx) {
 				hit = true
 				break
 			}
@@ -443,8 +444,8 @@ func (state *postsAnyFilterState) apply(dst posting.List) (posting.List, bool) {
 				matched := uint64(0)
 				for it.HasNext() {
 					idx := it.Next()
-					for i := 0; i < state.postsBuf.Len(); i++ {
-						if state.postsBuf.Get(i).Contains(idx) {
+					for i := 0; i < len(state.postsBuf); i++ {
+						if state.postsBuf[i].Contains(idx) {
 							builder.addSingle(idx)
 							matched++
 							break
@@ -475,8 +476,8 @@ func (state *postsAnyFilterState) apply(dst posting.List) (posting.List, bool) {
 					capHint = unionCard
 				}
 				builder := newPostingUnionBuilder(postingBatchSinglesEnabled(capHint))
-				for i := 0; i < state.postsBuf.Len(); i++ {
-					builder = postingListAppendIntersecting(dst, state.postsBuf.Get(i), builder)
+				for i := 0; i < len(state.postsBuf); i++ {
+					builder = postingListAppendIntersecting(dst, state.postsBuf[i], builder)
 				}
 				dst.Release()
 				out := builder.finish(false)
@@ -485,8 +486,8 @@ func (state *postsAnyFilterState) apply(dst posting.List) (posting.List, bool) {
 			}
 
 			hit := false
-			for i := 0; i < state.postsBuf.Len(); i++ {
-				if state.postsBuf.Get(i).Intersects(dst) {
+			for i := 0; i < len(state.postsBuf); i++ {
+				if state.postsBuf[i].Intersects(dst) {
 					hit = true
 					break
 				}
@@ -505,11 +506,8 @@ func (state *postsAnyFilterState) apply(dst posting.List) (posting.List, bool) {
 	return dst.BuildAnd(union), true
 }
 
-func postingBufLen(buf *pooled.Slice[posting.List]) int {
-	if buf == nil {
-		return 0
-	}
-	return buf.Len()
+func postingBufLen(buf []posting.List) int {
+	return len(buf)
 }
 
 type lazyMaterializedPredicateState struct {
@@ -569,7 +567,7 @@ type overlayRangePredicateState struct {
 	postingFilterCalls    int
 	rangeMaterialized     bool
 	probeMaterialized     bool
-	linearPostsBuf        *pooled.Slice[posting.List]
+	linearPostsBuf        []posting.List
 	rangeIDs              posting.List
 	probeIDs              posting.List
 }
@@ -614,7 +612,7 @@ func (state *overlayRangePredicateState) releaseLinearPosts() {
 	if state == nil || state.linearPostsBuf == nil {
 		return
 	}
-	postingSlicePool.Put(state.linearPostsBuf)
+	pools.PutPostingSlice(state.linearPostsBuf)
 	state.linearPostsBuf = nil
 }
 
@@ -642,15 +640,14 @@ func (state *overlayRangePredicateState) materializeRange() posting.List {
 	return state.rangeIDs
 }
 
-func (state *overlayRangePredicateState) ensureLinearPosts() *pooled.Slice[posting.List] {
+func (state *overlayRangePredicateState) ensureLinearPosts() []posting.List {
 	if state == nil {
 		return nil
 	}
 	if state.linearPostsBuf != nil {
 		return state.linearPostsBuf
 	}
-	state.linearPostsBuf = postingSlicePool.Get()
-	state.linearPostsBuf.Grow(state.bucketCount)
+	state.linearPostsBuf = pools.GetPostingSlice(state.bucketCount)
 	for i := 0; i < state.probe.spanCnt; i++ {
 		cur := state.ov.newCursor(state.probe.spans[i], false)
 		for {
@@ -661,7 +658,7 @@ func (state *overlayRangePredicateState) ensureLinearPosts() *pooled.Slice[posti
 			if ids.IsEmpty() {
 				continue
 			}
-			state.linearPostsBuf.Append(ids)
+			state.linearPostsBuf = append(state.linearPostsBuf, ids)
 		}
 	}
 	return state.linearPostsBuf
@@ -675,8 +672,8 @@ func (state *overlayRangePredicateState) linearContains(idx uint64) bool {
 		return state.probe.linearContains(idx)
 	}
 	posts := state.ensureLinearPosts()
-	for i := 0; i < posts.Len(); i++ {
-		if posts.Get(i).Contains(idx) {
+	for i := 0; i < len(posts); i++ {
+		if posts[i].Contains(idx) {
 			return true
 		}
 	}
@@ -862,7 +859,7 @@ type baseRangePredicateState struct {
 	postingFilterCalls int
 	hasSet             bool
 	set                u64set
-	linearPostsBuf     *pooled.Slice[posting.List]
+	linearPostsBuf     []posting.List
 	ids                posting.List
 }
 
@@ -882,7 +879,7 @@ func (state *baseRangePredicateState) releaseLinearPosts() {
 	if state == nil || state.linearPostsBuf == nil {
 		return
 	}
-	postingSlicePool.Put(state.linearPostsBuf)
+	pools.PutPostingSlice(state.linearPostsBuf)
 	state.linearPostsBuf = nil
 }
 
@@ -957,24 +954,22 @@ func materializePostingUnionBaseRange(probe baseRangeProbe) posting.List {
 	if probe.probeLen == 0 {
 		return posting.List{}
 	}
-	postsBuf := postingSlicePool.Get()
-	postsBuf.Grow(probe.probeLen)
-	probe.appendPostings(postsBuf)
+	postsBuf := pools.GetPostingSlice(probe.probeLen)
+	postsBuf = probe.appendPostings(postsBuf)
 	out := materializePostingUnionBufOwned(postsBuf)
-	postingSlicePool.Put(postsBuf)
+	pools.PutPostingSlice(postsBuf)
 	return out
 }
 
-func (state *baseRangePredicateState) ensureLinearPosts() *pooled.Slice[posting.List] {
+func (state *baseRangePredicateState) ensureLinearPosts() []posting.List {
 	if state == nil {
 		return nil
 	}
 	if state.linearPostsBuf != nil {
 		return state.linearPostsBuf
 	}
-	state.linearPostsBuf = postingSlicePool.Get()
-	state.linearPostsBuf.Grow(state.probe.probeLen)
-	state.probe.appendPostings(state.linearPostsBuf)
+	state.linearPostsBuf = pools.GetPostingSlice(state.probe.probeLen)
+	state.linearPostsBuf = state.probe.appendPostings(state.linearPostsBuf)
 	return state.linearPostsBuf
 }
 
@@ -986,8 +981,8 @@ func (state *baseRangePredicateState) linearContains(idx uint64) bool {
 		return state.probe.linearContains(idx)
 	}
 	posts := state.ensureLinearPosts()
-	for i := 0; i < posts.Len(); i++ {
-		if posts.Get(i).Contains(idx) {
+	for i := 0; i < len(posts); i++ {
+		if posts[i].Contains(idx) {
 			return true
 		}
 	}

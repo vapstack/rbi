@@ -27,9 +27,7 @@ func writeUvarint(writer *bufio.Writer, v uint64) error {
 // Encoding:
 //   - ptr == nil: empty
 //   - ptr == singleValue: single value (in single)
-//   - ptr != nil && single metadata says small: small
-//   - ptr != nil && single metadata says mid: mid
-//   - ptr != nil && single metadata says large: large posting
+//   - ptr != nil: kind is encoded in single
 type List struct {
 	ptr    unsafe.Pointer
 	single uint64
@@ -329,19 +327,16 @@ func compactFilterByMembership(ids List, other List, keepMatches bool) List {
 	return ids
 }
 
-func postingBufContainsAny(posts *pooled.Slice[List], id uint64) bool {
-	if posts == nil {
-		return false
-	}
-	for i := 0; i < posts.Len(); i++ {
-		if posts.Get(i).Contains(id) {
+func postingBufContainsAny(posts []List, id uint64) bool {
+	for i := 0; i < len(posts); i++ {
+		if posts[i].Contains(id) {
 			return true
 		}
 	}
 	return false
 }
 
-func compactFilterByAnyMembership(ids List, other *pooled.Slice[List]) List {
+func compactFilterByAnyMembership(ids List, other []List) List {
 	if sp := ids.small(); sp != nil {
 		if ids.IsBorrowed() {
 			var kept [SmallCap]uint64
@@ -918,16 +913,16 @@ func (p List) CloneInto(dst List) List {
 	return largeValue(src.cloneSharedInto(largePostingPool.Get()))
 }
 
-func (p List) TryBuildAndAnyBuf(other *pooled.Slice[List]) (List, bool) {
+func (p List) TryBuildAndAnyBuf(other []List) (List, bool) {
 	if p.IsEmpty() {
 		return p, true
 	}
-	if other == nil || other.Len() == 0 {
+	if len(other) == 0 {
 		p.Release()
 		return List{}, true
 	}
-	if other.Len() == 1 {
-		return p.BuildAnd(other.Get(0)), true
+	if len(other) == 1 {
+		return p.BuildAnd(other[0]), true
 	}
 	if id, ok := p.TrySingle(); ok {
 		if postingBufContainsAny(other, id) {
@@ -1699,44 +1694,33 @@ func ReadFrom(reader *bufio.Reader) (List, error) {
 }
 
 func (p List) Release() {
-	if p.IsBorrowed() {
+	if p.ptr == nil || p.ptr == singleValue || p.single&postingMetaBorrowed != 0 {
 		return
 	}
-	p.ReleasePayload()
-}
-
-func (p List) ReleasePayload() {
-	if p.IsBorrowed() {
+	if p.single&postingMetaBorrowed != 0 {
 		return
 	}
-	if sp := p.small(); sp != nil {
-		sp.release()
-		return
-	}
-	if mp := p.mid(); mp != nil {
-		mp.release()
-		return
-	}
-	if lp := p.largeRef(); lp != nil {
-		lp.release()
+	switch p.single & postingMetaKindMask {
+	case postingKindSmall:
+		(*smallPosting)(p.ptr).release()
+	case postingKindMid:
+		(*midPosting)(p.ptr).release()
+	case postingKindLarge:
+		(*largePosting)(p.ptr).release()
 	}
 }
 
-func ReleaseSliceOwned(ids []List) {
+func ReleaseAll(ids []List) {
 	for i := range ids {
 		ids[i].Release()
 		ids[i] = List{}
 	}
 }
 
-func ClearMapOwned[K comparable](m map[K]List) {
-	if m == nil {
-		return
-	}
+func ReleaseMap[K comparable](m map[K]List) {
 	for _, ids := range m {
 		ids.Release()
 	}
-	clear(m)
 }
 
 func (p List) BuildMergedOwned(add List) List {

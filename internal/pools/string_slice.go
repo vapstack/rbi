@@ -8,7 +8,7 @@ import (
 
 const (
 	minStringShift = 5
-	maxStringShift = 20
+	maxStringShift = 16
 
 	MinStringPooledCap = 1 << minStringShift
 	MaxStringPooledCap = 1 << maxStringShift
@@ -64,7 +64,7 @@ func PutStringSlice(s []string) {
 	} else {
 		shift = bits.Len(uint(c)) - 1 // floor(log2(c))
 	}
+	clear(s[:c])
 	n := 1 << shift
-	clear(s[:cap(s)])
 	stringPools[shift].Put(unsafe.SliceData(s[:n:n]))
 }

@@ -367,7 +367,7 @@ func TestSnapshotReleaseOwnedStorage_SkipsLiveSharedFlatRoot(t *testing.T) {
 		t.Fatalf("current snapshot shared posting corrupted after old prune")
 	}
 
-	shared.ReleasePayload()
+	shared.Release()
 }
 
 func TestSnapshotFromEmptyBase_PublishedUniverseGetsOwnerAndPinnedScanStaysStable(t *testing.T) {

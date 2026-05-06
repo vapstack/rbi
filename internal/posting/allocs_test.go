@@ -1,10 +1,6 @@
 package posting
 
-import (
-	"testing"
-
-	"github.com/vapstack/rbi/internal/pooled"
-)
+import "testing"
 
 var (
 	allocBoolSink              bool
@@ -239,15 +235,7 @@ func TestHotPathPools_NoAllocsAfterWarmup(t *testing.T) {
 		defer postA.Release()
 		defer postB.Release()
 
-		postBufPool := pooled.Slices[List]{
-			MinCap: 4,
-			MaxCap: 16,
-			Clear:  true,
-		}
-		postsBuf := postBufPool.Get()
-		postsBuf.Append(postA)
-		postsBuf.Append(postB)
-		defer postBufPool.Put(postsBuf)
+		postsBuf := []List{postA, postB}
 
 		requireZeroAllocsAfterPoolWarmup(t, func() {
 			out := mid.Clone()

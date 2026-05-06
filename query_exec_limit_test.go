@@ -262,9 +262,8 @@ func TestPlannerFilterPostingByLeafChecks_PreferredExactBypassesSmallBucketFallb
 	defer postA.Release()
 	defer postB.Release()
 
-	postsBuf := postingSlicePool.Get()
-	postsBuf.Append(postA)
-	postsBuf.Append(postB)
+	postsBuf := pools.GetPostingSlice(2)
+	postsBuf = append(postsBuf, postA, postB)
 
 	state := postsAnyFilterStatePool.Get()
 	state.postsBuf = postsBuf
@@ -301,9 +300,8 @@ func TestLeafPred_PostsAnyStateContainsIdxAndCountBucketUseRuntimeState(t *testi
 	bucket := posting.BuildFromSorted([]uint64{1, 2, 5, 6, 7, 9, 14, 15, 17})
 	defer bucket.Release()
 
-	postsBuf := postingSlicePool.Get()
-	postsBuf.Append(postA)
-	postsBuf.Append(postB)
+	postsBuf := pools.GetPostingSlice(2)
+	postsBuf = append(postsBuf, postA, postB)
 
 	state := postsAnyFilterStatePool.Get()
 	state.postsBuf = postsBuf
@@ -317,11 +315,10 @@ func TestLeafPred_PostsAnyStateContainsIdxAndCountBucketUseRuntimeState(t *testi
 
 	defer func() {
 		postsAnyFilterStatePool.Put(state)
-		for i := 0; i < postsBuf.Len(); i++ {
-			postsBuf.Get(i).Release()
-			postsBuf.Set(i, posting.List{})
+		for i := 0; i < len(postsBuf); i++ {
+			postsBuf[i].Release()
 		}
-		postingSlicePool.Put(postsBuf)
+		pools.PutPostingSlice(postsBuf)
 	}()
 
 	if !pred.containsIdx(7) {
@@ -526,19 +523,17 @@ func TestPostingUnionBufIter_SmallUnionAllocsPerRunStayZeroAfterWarmup(t *testin
 		defer posts[i].Release()
 	}
 
-	postsBuf := postingSlicePool.Get()
-	postsBuf.Append(posts[0])
-	postsBuf.Append(posts[1])
-	postsBuf.Append(posts[2])
-	defer postingSlicePool.Put(postsBuf)
+	postsBuf := pools.GetPostingSlice(3)
+	postsBuf = append(postsBuf, posts[0], posts[1], posts[2])
+	defer pools.PutPostingSlice(postsBuf)
 
-	warm := newPostingUnionBufIter(postsBuf)
+	warm := newPostingUnionIter(postsBuf)
 	if warm != nil {
 		warm.Release()
 	}
 
 	allocs := testing.AllocsPerRun(100, func() {
-		it := newPostingUnionBufIter(postsBuf)
+		it := newPostingUnionIter(postsBuf)
 		for it.HasNext() {
 			_ = it.Next()
 		}

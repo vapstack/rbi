@@ -40,7 +40,8 @@ func TestGetSliceReusesBucketWithinProbeWindow(t *testing.T) {
 	drainAllPools()
 	t.Cleanup(drainAllPools)
 
-	s := make([]uint64, 7, MinNumericPooledCap<<3)
+	withinWindowCap := MinNumericPooledCap << maxBucketDistance
+	s := make([]uint64, 7, withinWindowCap)
 	wantPtr := firstPtr(s)
 	PutUint64Slice(s)
 
@@ -48,8 +49,8 @@ func TestGetSliceReusesBucketWithinProbeWindow(t *testing.T) {
 	if len(got) != 0 {
 		t.Fatalf("reused slice len: got=%d want=0", len(got))
 	}
-	if cap(got) != MinNumericPooledCap<<3 {
-		t.Fatalf("reused slice cap: got=%d want=%d", cap(got), MinNumericPooledCap<<3)
+	if cap(got) != withinWindowCap {
+		t.Fatalf("reused slice cap: got=%d want=%d", cap(got), withinWindowCap)
 	}
 	if firstPtr(got) != wantPtr {
 		t.Fatalf("GetUint64Slice did not reuse bucket within probe window")
@@ -64,7 +65,8 @@ func TestGetSliceIgnoresBucketPastProbeWindow(t *testing.T) {
 	drainAllPools()
 	t.Cleanup(drainAllPools)
 
-	s := make([]uint64, 0, MinNumericPooledCap<<4)
+	pastWindowCap := MinNumericPooledCap << (maxBucketDistance + 1)
+	s := make([]uint64, 0, pastWindowCap)
 	savedPtr := firstPtr(s)
 	PutUint64Slice(s)
 

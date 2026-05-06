@@ -6,6 +6,7 @@ import (
 	"testing"
 	"unsafe"
 
+	"github.com/vapstack/rbi/internal/pools"
 	"github.com/vapstack/rbi/internal/posting"
 	"github.com/vmihailenco/msgpack/v5"
 )
@@ -201,7 +202,7 @@ func TestCountORBranchSliceBufReleaseClearsFullCapacity(t *testing.T) {
 	preds := newPredicateSet(1)
 	preds.Append(predicate{
 		kind:     predicateKindPostsAny,
-		postsBuf: postingSlicePool.Get(),
+		postsBuf: pools.GetPostingSlice(0),
 	})
 	var checks [countPredicateScanMaxLeaves]int
 	checks[0] = 7
@@ -233,7 +234,7 @@ func TestLeafPredSliceBufReleaseClearsFullCapacity(t *testing.T) {
 	buf.Append(leafPred{
 		kind:          leafPredKindPostsUnion,
 		postingFilter: func(ids posting.List) (posting.List, bool) { return ids, true },
-		postsBuf:      postingSlicePool.Get(),
+		postsBuf:      pools.GetPostingSlice(0),
 		postsAnyState: postsAnyFilterStatePool.Get(),
 	})
 	buf.Append(leafPred{
@@ -241,7 +242,7 @@ func TestLeafPredSliceBufReleaseClearsFullCapacity(t *testing.T) {
 		posting:       poolsSingleton(3),
 		estCard:       1,
 		postingFilter: func(ids posting.List) (posting.List, bool) { return ids, true },
-		postsBuf:      postingSlicePool.Get(),
+		postsBuf:      pools.GetPostingSlice(0),
 		postsAnyState: postsAnyFilterStatePool.Get(),
 	})
 	leafPredSlicePool.Put(buf)

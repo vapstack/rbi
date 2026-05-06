@@ -899,7 +899,7 @@ func TestQueryViewParallelBatchedPostingUnionKeepsInputsStable(t *testing.T) {
 		sourceWants = append(sourceWants, ids.ToArray())
 		sources = append(sources, ids)
 	}
-	defer posting.ReleaseSliceOwned(sources)
+	defer posting.ReleaseAll(sources)
 
 	posts := make([]posting.List, len(sources))
 	for i := range sources {

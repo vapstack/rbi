@@ -23,7 +23,7 @@ func TestPostingExtraBorrowedReleasePayloadCorruptsSmallOwner(t *testing.T) {
 		t.Fatalf("expected borrowed view")
 	}
 
-	borrowed.ReleasePayload()
+	borrowed.Release()
 
 	if got := base.ToArray(); !slices.Equal(got, want) {
 		t.Fatalf("borrowed ReleasePayload corrupted compact owner: got=%v want=%v", got, want)
@@ -55,7 +55,7 @@ func TestPostingExtraBorrowedReleasePayloadCorruptsLargeOwner(t *testing.T) {
 		t.Fatalf("expected borrowed view")
 	}
 
-	borrowed.ReleasePayload()
+	borrowed.Release()
 
 	if got := base.ToArray(); !slices.Equal(got, ids) {
 		t.Fatalf("borrowed ReleasePayload corrupted large owner: got=%v want=%v", got, ids)

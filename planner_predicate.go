@@ -26,7 +26,7 @@ type predicate struct {
 	posting        posting.List
 	ids            posting.List
 	rangeMat       bool
-	postsBuf       *pooled.Slice[posting.List]
+	postsBuf       []posting.List
 	releaseIDs     bool
 	postsAnyState  *postsAnyFilterState
 	baseRangeState *baseRangePredicateState
@@ -184,7 +184,7 @@ func (p predicate) postCount() int {
 }
 
 func (p predicate) postAt(i int) posting.List {
-	return p.postsBuf.Get(i)
+	return p.postsBuf[i]
 }
 
 func (p *predicate) setExpectedContainsCalls(expected int) {
@@ -403,7 +403,7 @@ func (p *predicate) newIter() posting.Iterator {
 	case predicateIterPostsConcat:
 		return newPostingConcatBufIter(p.postsBuf)
 	case predicateIterPostsUnion:
-		return newPostingUnionBufIter(p.postsBuf)
+		return newPostingUnionIter(p.postsBuf)
 	case predicateIterMaterialized:
 		if p.ids.IsEmpty() {
 			return nil
@@ -715,82 +715,82 @@ func (p predicate) applyToPosting(dst posting.List) (posting.List, bool) {
 	return posting.List{}, false
 }
 
-func countBucketPostsAnyBuf(posts *pooled.Slice[posting.List], bucket posting.List) (uint64, bool) {
+func countBucketPostsAnyBuf(posts []posting.List, bucket posting.List) (uint64, bool) {
 	if bucket.IsEmpty() {
 		return 0, true
 	}
-	if posts == nil || posts.Len() == 0 {
+	if len(posts) == 0 {
 		return 0, true
 	}
-	if posts.Len() == 1 {
-		return posts.Get(0).AndCardinality(bucket), true
+	if len(posts) == 1 {
+		return posts[0].AndCardinality(bucket), true
 	}
-	for i := 0; i < posts.Len(); i++ {
-		if posts.Get(i).Intersects(bucket) {
+	for i := 0; i < len(posts); i++ {
+		if posts[i].Intersects(bucket) {
 			return 0, false
 		}
 	}
 	return 0, true
 }
 
-func countBucketPostsAnyNotBuf(posts *pooled.Slice[posting.List], bucket posting.List) (uint64, bool) {
+func countBucketPostsAnyNotBuf(posts []posting.List, bucket posting.List) (uint64, bool) {
 	if bucket.IsEmpty() {
 		return 0, true
 	}
 	bc := bucket.Cardinality()
-	if posts == nil || posts.Len() == 0 {
+	if len(posts) == 0 {
 		return bc, true
 	}
-	if posts.Len() == 1 {
-		hit := posts.Get(0).AndCardinality(bucket)
+	if len(posts) == 1 {
+		hit := posts[0].AndCardinality(bucket)
 		if hit >= bc {
 			return 0, true
 		}
 		return bc - hit, true
 	}
-	for i := 0; i < posts.Len(); i++ {
-		if posts.Get(i).Intersects(bucket) {
+	for i := 0; i < len(posts); i++ {
+		if posts[i].Intersects(bucket) {
 			return 0, false
 		}
 	}
 	return bc, true
 }
 
-func countBucketPostsAllBuf(posts *pooled.Slice[posting.List], bucket posting.List) (uint64, bool) {
+func countBucketPostsAllBuf(posts []posting.List, bucket posting.List) (uint64, bool) {
 	if bucket.IsEmpty() {
 		return 0, true
 	}
-	if posts == nil || posts.Len() == 0 {
+	if len(posts) == 0 {
 		return 0, true
 	}
-	if posts.Len() == 1 {
-		return posts.Get(0).AndCardinality(bucket), true
+	if len(posts) == 1 {
+		return posts[0].AndCardinality(bucket), true
 	}
-	for i := 0; i < posts.Len(); i++ {
-		if !posts.Get(i).Intersects(bucket) {
+	for i := 0; i < len(posts); i++ {
+		if !posts[i].Intersects(bucket) {
 			return 0, true
 		}
 	}
 	return 0, false
 }
 
-func countBucketPostsAllNotBuf(posts *pooled.Slice[posting.List], bucket posting.List) (uint64, bool) {
+func countBucketPostsAllNotBuf(posts []posting.List, bucket posting.List) (uint64, bool) {
 	if bucket.IsEmpty() {
 		return 0, true
 	}
 	bc := bucket.Cardinality()
-	if posts == nil || posts.Len() == 0 {
+	if len(posts) == 0 {
 		return bc, true
 	}
-	if posts.Len() == 1 {
-		hit := posts.Get(0).AndCardinality(bucket)
+	if len(posts) == 1 {
+		hit := posts[0].AndCardinality(bucket)
 		if hit >= bc {
 			return 0, true
 		}
 		return bc - hit, true
 	}
-	for i := 0; i < posts.Len(); i++ {
-		if !posts.Get(i).Intersects(bucket) {
+	for i := 0; i < len(posts); i++ {
+		if !posts[i].Intersects(bucket) {
 			return bc, true
 		}
 	}
@@ -1126,15 +1126,15 @@ func (qv *queryView) buildPredInCandidate(e qir.Expr, fm *field, ov fieldOverlay
 	}
 
 	if e.Not {
-		if postsBuf.Len() == 0 {
-			postingSlicePool.Put(postsBuf)
+		if len(postsBuf) == 0 {
+			pools.PutPostingSlice(postsBuf)
 			return predicate{expr: e, alwaysTrue: true}, true
 		}
-		if postsBuf.Len() == 1 {
+		if len(postsBuf) == 1 {
 			return predicate{
 				expr:     e,
 				kind:     predicateKindPostingNot,
-				posting:  postsBuf.Get(0),
+				posting:  postsBuf[0],
 				postsBuf: postsBuf,
 			}, true
 		}
@@ -1151,12 +1151,12 @@ func (qv *queryView) buildPredInCandidate(e qir.Expr, fm *field, ov fieldOverlay
 		}, true
 	}
 
-	if postsBuf.Len() == 0 {
-		postingSlicePool.Put(postsBuf)
+	if len(postsBuf) == 0 {
+		pools.PutPostingSlice(postsBuf)
 		return predicate{expr: e, alwaysFalse: true}, true
 	}
-	if postsBuf.Len() == 1 {
-		ids := postsBuf.Get(0)
+	if len(postsBuf) == 1 {
+		ids := postsBuf[0]
 		return predicate{
 			expr:     e,
 			kind:     predicateKindPosting,
@@ -1260,21 +1260,20 @@ func (qv *queryView) buildPredHasCandidate(e qir.Expr, fm *field, ov fieldOverla
 		}
 	}
 
-	postsBuf := postingSlicePool.Get()
-	postsBuf.Grow(valsBuf.Len())
+	postsBuf := pools.GetPostingSlice(valsBuf.Len())
 
 	var minCard uint64
 
 	for i := 0; i < valsBuf.Len(); i++ {
 		ids := ov.lookupPostingRetained(valsBuf.Get(i))
 		if ids.IsEmpty() {
-			postingSlicePool.Put(postsBuf)
+			pools.PutPostingSlice(postsBuf)
 			if e.Not {
 				return predicate{expr: e, alwaysTrue: true}, true
 			}
 			return predicate{expr: e, alwaysFalse: true}, true
 		}
-		postsBuf.Append(ids)
+		postsBuf = append(postsBuf, ids)
 		c := ids.Cardinality()
 		if minCard == 0 || c < minCard {
 			minCard = c
@@ -1282,11 +1281,11 @@ func (qv *queryView) buildPredHasCandidate(e qir.Expr, fm *field, ov fieldOverla
 	}
 
 	if e.Not {
-		if postsBuf.Len() == 1 {
+		if len(postsBuf) == 1 {
 			return predicate{
 				expr:     e,
 				kind:     predicateKindPostingNot,
-				posting:  postsBuf.Get(0),
+				posting:  postsBuf[0],
 				postsBuf: postsBuf,
 			}, true
 		}
@@ -1328,8 +1327,7 @@ func (qv *queryView) buildPredHasAnyCandidate(e qir.Expr, fm *field, ov fieldOve
 		return predicate{}, false
 	}
 
-	postsBuf := postingSlicePool.Get()
-	postsBuf.Grow(valsBuf.Len())
+	postsBuf := pools.GetPostingSlice(valsBuf.Len())
 
 	var est uint64
 
@@ -1338,7 +1336,7 @@ func (qv *queryView) buildPredHasAnyCandidate(e qir.Expr, fm *field, ov fieldOve
 		if ids.IsEmpty() {
 			continue
 		}
-		postsBuf.Append(ids)
+		postsBuf = append(postsBuf, ids)
 		est += ids.Cardinality()
 	}
 	cacheKey := materializedPredKey{}
@@ -1346,15 +1344,15 @@ func (qv *queryView) buildPredHasAnyCandidate(e qir.Expr, fm *field, ov fieldOve
 		cacheKey = materializedPredKeyForDistinctSetTerms(qv.engine.fieldNameByOrdinal(e.FieldOrdinal), e.Op, valsBuf, false)
 	}
 	if e.Not {
-		if postsBuf.Len() == 0 {
-			postingSlicePool.Put(postsBuf)
+		if len(postsBuf) == 0 {
+			pools.PutPostingSlice(postsBuf)
 			return predicate{expr: e, alwaysTrue: true}, true
 		}
-		if postsBuf.Len() == 1 {
+		if len(postsBuf) == 1 {
 			return predicate{
 				expr:     e,
 				kind:     predicateKindPostingNot,
-				posting:  postsBuf.Get(0),
+				posting:  postsBuf[0],
 				postsBuf: postsBuf,
 			}, true
 		}
@@ -1371,13 +1369,13 @@ func (qv *queryView) buildPredHasAnyCandidate(e qir.Expr, fm *field, ov fieldOve
 		}, true
 	}
 
-	if postsBuf.Len() == 0 {
-		postingSlicePool.Put(postsBuf)
+	if len(postsBuf) == 0 {
+		pools.PutPostingSlice(postsBuf)
 		return predicate{expr: e, alwaysFalse: true}, true
 	}
 
-	if postsBuf.Len() == 1 {
-		ids := postsBuf.Get(0)
+	if len(postsBuf) == 1 {
+		ids := postsBuf[0]
 		return predicate{
 			expr:     e,
 			kind:     predicateKindPosting,
@@ -3069,7 +3067,7 @@ func releasePredicateRuntimeState(p *predicate) {
 		p.lazyMatState = nil
 	}
 	if p.postsBuf != nil {
-		postingSlicePool.Put(p.postsBuf)
+		pools.PutPostingSlice(p.postsBuf)
 		p.postsBuf = nil
 	}
 }
@@ -4039,28 +4037,29 @@ func postingListAppendIntersecting(dst, ids posting.List, builder postingUnionBu
 	return builder
 }
 
-func (p baseRangeProbe) appendPostings(dst *pooled.Slice[posting.List]) {
+func (p baseRangeProbe) appendPostings(dst []posting.List) []posting.List {
 	if dst == nil {
-		return
+		return nil
 	}
 	if p.useComplement {
 		for i := 0; i < p.start; i++ {
 			if ids := p.s[i].IDs; !ids.IsEmpty() {
-				dst.Append(ids)
+				dst = append(dst, ids)
 			}
 		}
 		for i := p.end; i < len(p.s); i++ {
 			if ids := p.s[i].IDs; !ids.IsEmpty() {
-				dst.Append(ids)
+				dst = append(dst, ids)
 			}
 		}
-		return
+		return dst
 	}
 	for i := p.start; i < p.end; i++ {
 		if ids := p.s[i].IDs; !ids.IsEmpty() {
-			dst.Append(ids)
+			dst = append(dst, ids)
 		}
 	}
+	return dst
 }
 
 func (p baseRangeProbe) addToSet(set *u64set) {
@@ -4508,15 +4507,15 @@ func materializeBaseRangeProbeFast(probe baseRangeProbe) posting.List {
 	return out
 }
 
-func isSingletonHeavyPostingBuf(probe *pooled.Slice[posting.List]) bool {
+func isSingletonHeavyPostingBuf(probe []posting.List) bool {
 	probeLen := 0
 	singletons := 0
 	est := uint64(0)
 	if probe == nil {
 		return false
 	}
-	for i := 0; i < probe.Len(); i++ {
-		p := probe.Get(i)
+	for i := 0; i < len(probe); i++ {
+		p := probe[i]
 		if p.IsEmpty() {
 			continue
 		}
@@ -4534,28 +4533,28 @@ func isSingletonHeavyPostingBuf(probe *pooled.Slice[posting.List]) bool {
 	return shouldUseFastSinglesUnion(probeLen, singletons, est)
 }
 
-func materializePostingBufFast(probe *pooled.Slice[posting.List]) posting.List {
+func materializePostingBufFast(probe []posting.List) posting.List {
 	builder := newPostingUnionBuilder(true)
 	defer builder.release()
 
 	if probe == nil {
 		return posting.List{}
 	}
-	for i := 0; i < probe.Len(); i++ {
-		builder.addPosting(probe.Get(i))
+	for i := 0; i < len(probe); i++ {
+		builder.addPosting(probe[i])
 	}
 	return builder.finish(true)
 }
 
-func materializePostingUnionBufOwned(posts *pooled.Slice[posting.List]) posting.List {
+func materializePostingUnionBufOwned(posts []posting.List) posting.List {
 	builder := newPostingUnionBuilder(true)
 	defer builder.release()
 
 	if posts == nil {
 		return posting.List{}
 	}
-	for i := 0; i < posts.Len(); i++ {
-		builder.addPosting(posts.Get(i))
+	for i := 0; i < len(posts); i++ {
+		builder.addPosting(posts[i])
 	}
 	return builder.finish(true)
 }

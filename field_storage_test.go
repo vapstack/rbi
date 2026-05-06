@@ -846,7 +846,7 @@ func TestNewFieldIndexChunkRefsWithInsertedEntry_OwnsUntouchedPostings(t *testin
 			}
 
 			releaseFieldIndexStorageOwned(replStorage)
-			posting.ReleaseSliceOwned(ref.chunk.posts)
+			posting.ReleaseAll(ref.chunk.posts)
 		})
 	}
 }
@@ -916,7 +916,7 @@ func TestApplySingleFieldPostingDiffChunked_OwnsUntouchedPostingsOnExistingKeyFa
 			}
 
 			releaseFieldIndexStorageOwned(storage)
-			posting.ReleaseSliceOwned(ref.chunk.posts)
+			posting.ReleaseAll(ref.chunk.posts)
 		})
 	}
 }
