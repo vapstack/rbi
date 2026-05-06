@@ -23,7 +23,7 @@ func GetBoolSlice(capHint int) []bool {
 		shift = bits.Len(uint(capHint - 1)) // ceil(log2(capHint))
 	}
 
-	lim := min(shift+3, maxNumericShift)
+	lim := min(shift+maxBucketDistance, maxNumericShift)
 	for sh := shift; sh <= lim; sh++ {
 		if v := boolPools[sh].Get(); v != nil {
 			ptr := v.(*bool)

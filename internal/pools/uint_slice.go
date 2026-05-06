@@ -27,7 +27,7 @@ func GetUint64Slice(capHint int) []uint64 {
 		shift = bits.Len(uint(capHint - 1)) // ceil(log2(capHint))
 	}
 
-	lim := min(shift+3, maxNumericShift)
+	lim := min(shift+maxBucketDistance, maxNumericShift)
 	for sh := shift; sh <= lim; sh++ {
 		if v := uint64Pools[sh].Get(); v != nil {
 			ptr := v.(*uint64)
@@ -74,7 +74,7 @@ func GetUint32Slice(capHint int) []uint32 {
 		shift = bits.Len(uint(capHint - 1)) // ceil(log2(capHint))
 	}
 
-	lim := min(shift+3, maxNumericShift)
+	lim := min(shift+maxBucketDistance, maxNumericShift)
 	for sh := shift; sh <= lim; sh++ {
 		if v := uint32Pools[sh].Get(); v != nil {
 			ptr := v.(*uint32)
@@ -121,7 +121,7 @@ func GetUintSlice(capHint int) []uint {
 		shift = bits.Len(uint(capHint - 1)) // ceil(log2(capHint))
 	}
 
-	lim := min(shift+3, maxNumericShift)
+	lim := min(shift+maxBucketDistance, maxNumericShift)
 	for sh := shift; sh <= lim; sh++ {
 		if v := uintPools[sh].Get(); v != nil {
 			ptr := v.(*uint)

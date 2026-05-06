@@ -26,7 +26,7 @@ func GetFloat64Slice(capHint int) []float64 {
 		shift = bits.Len(uint(capHint - 1)) // ceil(log2(capHint))
 	}
 
-	lim := min(shift+3, maxNumericShift)
+	lim := min(shift+maxBucketDistance, maxNumericShift)
 	for sh := shift; sh <= lim; sh++ {
 		if v := float64Pools[sh].Get(); v != nil {
 			ptr := v.(*float64)
@@ -73,7 +73,7 @@ func GetFloat32Slice(capHint int) []float32 {
 		shift = bits.Len(uint(capHint - 1)) // ceil(log2(capHint))
 	}
 
-	lim := min(shift+3, maxNumericShift)
+	lim := min(shift+maxBucketDistance, maxNumericShift)
 	for sh := shift; sh <= lim; sh++ {
 		if v := float32Pools[sh].Get(); v != nil {
 			ptr := v.(*float32)

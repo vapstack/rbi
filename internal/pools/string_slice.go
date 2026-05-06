@@ -36,7 +36,7 @@ func GetStringSlice(capHint int) []string {
 		shift = bits.Len(uint(capHint - 1)) // ceil(log2(capHint))
 	}
 
-	lim := min(shift+3, maxStringShift)
+	lim := min(shift+maxBucketDistance, maxStringShift)
 	for sh := shift; sh <= lim; sh++ {
 		if v := stringPools[sh].Get(); v != nil {
 			ptr := v.(*string)

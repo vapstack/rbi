@@ -11,4 +11,6 @@ const (
 	// demoted into the largest bucket. Larger slices are dropped to avoid
 	// retaining very large backing arrays through a smaller bucket.
 	MaxNumericRetainedCap = MaxNumericPooledCap + MaxNumericPooledCap/4
+
+	maxBucketDistance = 4
 )
