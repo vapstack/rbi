@@ -8,8 +8,6 @@ import (
 )
 
 const (
-	stringSlicePoolMaxCap                   = 64 << 10
-	fieldWriteScratchSlicePoolMaxCap        = 512
 	materializedPredKeySlicePoolMaxCap      = 512
 	stringSetPoolMaxLen                     = 4 << 10
 	uint64IntMapPoolMaxLen                  = 16 << 10
@@ -61,22 +59,6 @@ var orderedMergedScalarRangeFieldSlicePool = pooled.Slices[orderedMergedScalarRa
 var aggregateMetricStateSlicePool = pooled.Slices[aggregateMetricState]{
 	MinCap: 16,
 	MaxCap: aggregateMetricStateSlicePoolMaxCap,
-	Clear:  true,
-}
-
-/**/
-
-var stringSlicePool = pooled.Slices[string]{
-	MinCap: 64,
-	MaxCap: stringSlicePoolMaxCap,
-	Clear:  true,
-}
-
-/**/
-
-var fieldWriteScratchStringSlicePool = pooled.Slices[string]{
-	MinCap: 4,
-	MaxCap: fieldWriteScratchSlicePoolMaxCap,
 	Clear:  true,
 }
 

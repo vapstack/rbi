@@ -786,12 +786,10 @@ func (qe *queryEngine) exprValueToIdxOwned(expr qx.Expr) ([]string, bool, bool, 
 		if valsBuf == nil {
 			return nil, true, hasNil, nil
 		}
-		defer stringSlicePool.Put(valsBuf)
+		defer pools.PutStringSlice(valsBuf)
 
-		out := make([]string, valsBuf.Len())
-		for i := 0; i < valsBuf.Len(); i++ {
-			out[i] = valsBuf.Get(i)
-		}
+		out := make([]string, len(valsBuf))
+		copy(out, valsBuf)
 		return out, true, hasNil, nil
 	}
 
@@ -842,12 +840,10 @@ func (qe *queryEngine) exprValueToDistinctIdxOwned(expr qx.Expr) ([]string, bool
 			if err != nil || valsBuf == nil {
 				return nil, true, hasNil, err
 			}
-			defer stringSlicePool.Put(valsBuf)
-			dedupStringBufInPlace(valsBuf)
-			out := make([]string, valsBuf.Len())
-			for i := 0; i < valsBuf.Len(); i++ {
-				out[i] = valsBuf.Get(i)
-			}
+			defer pools.PutStringSlice(valsBuf)
+			valsBuf = dedupStringBufInPlace(valsBuf)
+			out := make([]string, len(valsBuf))
+			copy(out, valsBuf)
 			return out, true, hasNil, nil
 		}
 		return nil, false, false, nil
@@ -856,12 +852,10 @@ func (qe *queryEngine) exprValueToDistinctIdxOwned(expr qx.Expr) ([]string, bool
 	if err != nil || valsBuf == nil {
 		return nil, isSlice, hasNil, err
 	}
-	defer stringSlicePool.Put(valsBuf)
+	defer pools.PutStringSlice(valsBuf)
 
-	out := make([]string, valsBuf.Len())
-	for i := 0; i < valsBuf.Len(); i++ {
-		out[i] = valsBuf.Get(i)
-	}
+	out := make([]string, len(valsBuf))
+	copy(out, valsBuf)
 	return out, isSlice, hasNil, nil
 }
 

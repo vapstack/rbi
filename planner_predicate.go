@@ -179,14 +179,6 @@ func (p *predicate) isCustomUnmaterialized() bool {
 	return !p.rangeMat && p.kind == predicateKindCustom
 }
 
-func (p predicate) postCount() int {
-	return postingBufLen(p.postsBuf)
-}
-
-func (p predicate) postAt(i int) posting.List {
-	return p.postsBuf[i]
-}
-
 func (p *predicate) setExpectedContainsCalls(expected int) {
 	if p == nil {
 		return
@@ -279,7 +271,7 @@ func (p predicate) postingFilterCapability() predicatePostingFilterCapability {
 				predicatePostingFilterExactBucket |
 				predicatePostingFilterCheap
 		}
-		if p.postCount() > predicatePostsAnyNotExactPostingMaxTerms {
+		if len(p.postsBuf) > predicatePostsAnyNotExactPostingMaxTerms {
 			return 0
 		}
 		return predicatePostingFilterApply |
@@ -346,7 +338,7 @@ func (p *predicate) hasIter() bool {
 func (p *predicate) leadIterNeedsContainsCheck() bool {
 	// HAS(list) uses a single posting as iterator seed and validates the rest
 	// via contains checks; iterator alone is not exact when term count > 1.
-	return p.kind == predicateKindPostsAll && p.postCount() > 1
+	return p.kind == predicateKindPostsAll && len(p.postsBuf) > 1
 }
 
 func (p predicate) supportsPostingApply() bool {
@@ -459,8 +451,8 @@ func (p *predicate) matches(idx uint64) bool {
 		if p.postsAnyState != nil {
 			return p.postsAnyState.matches(idx)
 		}
-		for i := 0; i < p.postCount(); i++ {
-			ids := p.postAt(i)
+		for i := 0; i < len(p.postsBuf); i++ {
+			ids := p.postsBuf[i]
 			if ids.Contains(idx) {
 				return true
 			}
@@ -470,24 +462,24 @@ func (p *predicate) matches(idx uint64) bool {
 		if p.postsAnyState != nil {
 			return p.postsAnyState.matches(idx)
 		}
-		for i := 0; i < p.postCount(); i++ {
-			ids := p.postAt(i)
+		for i := 0; i < len(p.postsBuf); i++ {
+			ids := p.postsBuf[i]
 			if ids.Contains(idx) {
 				return false
 			}
 		}
 		return true
 	case predicateKindPostsAll:
-		for i := 0; i < p.postCount(); i++ {
-			ids := p.postAt(i)
+		for i := 0; i < len(p.postsBuf); i++ {
+			ids := p.postsBuf[i]
 			if !ids.Contains(idx) {
 				return false
 			}
 		}
 		return true
 	case predicateKindPostsAllNot:
-		for i := 0; i < p.postCount(); i++ {
-			ids := p.postAt(i)
+		for i := 0; i < len(p.postsBuf); i++ {
+			ids := p.postsBuf[i]
 			if !ids.Contains(idx) {
 				return true
 			}
@@ -621,11 +613,11 @@ func (p predicate) applyToPosting(dst posting.List) (posting.List, bool) {
 		if p.postsAnyState != nil {
 			return p.postsAnyState.apply(dst)
 		}
-		if p.postCount() > predicatePostsAnyNotExactPostingMaxTerms {
+		if len(p.postsBuf) > predicatePostsAnyNotExactPostingMaxTerms {
 			return posting.List{}, false
 		}
-		for i := 0; i < p.postCount(); i++ {
-			ids := p.postAt(i)
+		for i := 0; i < len(p.postsBuf); i++ {
+			ids := p.postsBuf[i]
 			dst = dst.BuildAndNot(ids)
 			if dst.IsEmpty() {
 				return dst, true
@@ -647,12 +639,12 @@ func (p predicate) applyToPosting(dst posting.List) (posting.List, bool) {
 		return posting.List{}, false
 
 	case predicateKindPostsAll:
-		if p.postCount() == 0 {
+		if len(p.postsBuf) == 0 {
 			dst.Release()
 			return posting.List{}, true
 		}
-		for i := 0; i < p.postCount(); i++ {
-			ids := p.postAt(i)
+		for i := 0; i < len(p.postsBuf); i++ {
+			ids := p.postsBuf[i]
 			if ids.IsEmpty() {
 				dst.Release()
 				return posting.List{}, true
@@ -1057,7 +1049,7 @@ func (qv *queryView) buildPredEqCandidate(e qir.Expr, fm *field, ov fieldOverlay
 		return predicate{}, false
 	}
 	if valsBuf != nil {
-		defer stringSlicePool.Put(valsBuf)
+		defer pools.PutStringSlice(valsBuf)
 	}
 
 	b, err := qv.evalSliceEQ(qv.engine.fieldNameByOrdinal(e.FieldOrdinal), e.FieldOrdinal, valsBuf)
@@ -1109,12 +1101,9 @@ func (qv *queryView) buildPredInCandidate(e qir.Expr, fm *field, ov fieldOverlay
 		return predicate{}, false
 	}
 	if valsBuf != nil {
-		defer stringSlicePool.Put(valsBuf)
+		defer pools.PutStringSlice(valsBuf)
 	}
-	valCount := 0
-	if valsBuf != nil {
-		valCount = valsBuf.Len()
-	}
+	valCount := len(valsBuf)
 	if !isSlice || (valCount == 0 && !hasNil) {
 		return predicate{}, false
 	}
@@ -1196,9 +1185,9 @@ func (qv *queryView) buildPredHasCandidate(e qir.Expr, fm *field, ov fieldOverla
 		return predicate{}, false
 	}
 	if valsBuf != nil {
-		defer stringSlicePool.Put(valsBuf)
+		defer pools.PutStringSlice(valsBuf)
 	}
-	if !isSlice || valsBuf == nil || valsBuf.Len() == 0 {
+	if !isSlice || len(valsBuf) == 0 {
 		return predicate{}, false
 	}
 
@@ -1260,12 +1249,12 @@ func (qv *queryView) buildPredHasCandidate(e qir.Expr, fm *field, ov fieldOverla
 		}
 	}
 
-	postsBuf := pools.GetPostingSlice(valsBuf.Len())
+	postsBuf := pools.GetPostingSlice(len(valsBuf))
 
 	var minCard uint64
 
-	for i := 0; i < valsBuf.Len(); i++ {
-		ids := ov.lookupPostingRetained(valsBuf.Get(i))
+	for i := 0; i < len(valsBuf); i++ {
+		ids := ov.lookupPostingRetained(valsBuf[i])
 		if ids.IsEmpty() {
 			pools.PutPostingSlice(postsBuf)
 			if e.Not {
@@ -1321,18 +1310,18 @@ func (qv *queryView) buildPredHasAnyCandidate(e qir.Expr, fm *field, ov fieldOve
 		return predicate{}, false
 	}
 	if valsBuf != nil {
-		defer stringSlicePool.Put(valsBuf)
+		defer pools.PutStringSlice(valsBuf)
 	}
-	if !isSlice || valsBuf == nil || valsBuf.Len() == 0 {
+	if !isSlice || len(valsBuf) == 0 {
 		return predicate{}, false
 	}
 
-	postsBuf := pools.GetPostingSlice(valsBuf.Len())
+	postsBuf := pools.GetPostingSlice(len(valsBuf))
 
 	var est uint64
 
-	for i := 0; i < valsBuf.Len(); i++ {
-		ids := ov.lookupPostingRetained(valsBuf.Get(i))
+	for i := 0; i < len(valsBuf); i++ {
+		ids := ov.lookupPostingRetained(valsBuf[i])
 		if ids.IsEmpty() {
 			continue
 		}
@@ -2446,7 +2435,7 @@ func (p predicate) checkCost() uint64 {
 		p.kind == predicateKindPostsAnyNot ||
 		p.kind == predicateKindPostsAll ||
 		p.kind == predicateKindPostsAllNot:
-		n := p.postCount()
+		n := len(p.postsBuf)
 		if n <= 1 {
 			cost = 1
 		} else {
@@ -2471,7 +2460,7 @@ func (p predicate) checkCost() uint64 {
 			cost = 3
 		}
 	case p.postsAnyState != nil:
-		n := p.postCount()
+		n := len(p.postsBuf)
 		if n <= 1 {
 			cost = 1
 		} else {

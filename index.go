@@ -446,7 +446,7 @@ type buildIndexRunHeap struct {
 }
 
 type buildIndexFieldRun struct {
-	stringBuf *pooled.Slice[string]
+	stringBuf []string
 	u64Buf    []uint64
 	postBuf   []posting.List
 }
@@ -514,14 +514,14 @@ func (r buildIndexFieldRun) keyCount() int {
 	if r.stringBuf == nil {
 		return 0
 	}
-	return r.stringBuf.Len()
+	return len(r.stringBuf)
 }
 
 func (r buildIndexFieldRun) keyAt(i int) indexKey {
 	if r.u64Buf != nil {
 		return indexKeyFromU64(r.u64Buf[i])
 	}
-	return indexKeyFromString(r.stringBuf.Get(i))
+	return indexKeyFromString(r.stringBuf[i])
 }
 
 func (r *buildIndexFieldRun) takePosting(i int) posting.List {
@@ -535,7 +535,7 @@ func (r *buildIndexFieldRun) release() {
 		return
 	}
 	if r.stringBuf != nil {
-		stringSlicePool.Put(r.stringBuf)
+		pools.PutStringSlice(r.stringBuf)
 		r.stringBuf = nil
 	}
 	if r.u64Buf != nil {
@@ -553,8 +553,7 @@ func buildIndexStringRunFromPostingMap(m map[string]posting.List) buildIndexFiel
 	if len(m) == 0 {
 		return buildIndexFieldRun{}
 	}
-	keyBuf := stringSlicePool.Get()
-	keyBuf.Grow(len(m))
+	keyBuf := pools.GetStringSlice(len(m))
 	for key, ids := range m {
 		ids = ids.BuildOptimized()
 		if ids.IsEmpty() {
@@ -562,16 +561,16 @@ func buildIndexStringRunFromPostingMap(m map[string]posting.List) buildIndexFiel
 			continue
 		}
 		m[key] = ids
-		keyBuf.Append(key)
+		keyBuf = append(keyBuf, key)
 	}
-	if keyBuf.Len() == 0 {
-		stringSlicePool.Put(keyBuf)
+	if len(keyBuf) == 0 {
+		pools.PutStringSlice(keyBuf)
 		return buildIndexFieldRun{}
 	}
-	pooled.SortSlice(keyBuf)
-	postBuf := pools.GetPostingSlice(keyBuf.Len())[:keyBuf.Len()]
-	for i := 0; i < keyBuf.Len(); i++ {
-		postBuf[i] = m[keyBuf.Get(i)]
+	slices.Sort(keyBuf)
+	postBuf := pools.GetPostingSlice(len(keyBuf))[:len(keyBuf)]
+	for i := 0; i < len(keyBuf); i++ {
+		postBuf[i] = m[keyBuf[i]]
 	}
 	clear(m)
 	return buildIndexFieldRun{
@@ -3369,13 +3368,13 @@ func (o fieldOverlay) postingAt(rank int) posting.List {
 	return o.base[rank].IDs.Borrow()
 }
 
-func (o fieldOverlay) lookupPostings(keys stringKeyReader) ([]posting.List, uint64) {
-	keyCount := stringKeyReaderLen(keys)
+func (o fieldOverlay) lookupPostings(keys []string) ([]posting.List, uint64) {
+	keyCount := len(keys)
 	postsBuf := pools.GetPostingSlice(keyCount)
 	var est uint64
 
 	for i := 0; i < keyCount; i++ {
-		ids := o.lookupPostingRetained(keys.Get(i))
+		ids := o.lookupPostingRetained(keys[i])
 		if ids.IsEmpty() {
 			continue
 		}

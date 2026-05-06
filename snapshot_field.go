@@ -36,7 +36,7 @@ var snapshotFieldInsertStateSlicePool = pooled.Slices[snapshotFieldInsertState]{
 }
 
 type fieldWriteScratch struct {
-	strings *pooled.Slice[string]
+	strings []string
 	fixed   []uint64
 	ok      bool
 	isNil   bool
@@ -60,7 +60,7 @@ var snapshotFieldBatchStateSlicePool = pooled.Slices[snapshotFieldBatchState]{
 
 func (s *fieldWriteScratch) reset() {
 	if s.strings != nil {
-		s.strings.Truncate()
+		s.strings = s.strings[:0]
 	}
 	if s.fixed != nil {
 		s.fixed = s.fixed[:0]
@@ -72,7 +72,7 @@ func (s *fieldWriteScratch) reset() {
 
 func (s *fieldWriteScratch) release() {
 	if s.strings != nil {
-		fieldWriteScratchStringSlicePool.Put(s.strings)
+		pools.PutStringSlice(s.strings)
 		s.strings = nil
 	}
 	if s.fixed != nil {
@@ -96,10 +96,10 @@ func (s *fieldWriteScratch) setLen(length int) {
 
 func (s *fieldWriteScratch) addString(key string) {
 	if s.strings == nil {
-		s.strings = fieldWriteScratchStringSlicePool.Get()
+		s.strings = pools.GetStringSlice(1)
 	}
 	s.ok = true
-	s.strings.Append(key)
+	s.strings = append(s.strings, key)
 }
 
 func (s *fieldWriteScratch) addFixed(key uint64) {
@@ -111,10 +111,7 @@ func (s *fieldWriteScratch) addFixed(key uint64) {
 }
 
 func (s *fieldWriteScratch) stringLen() int {
-	if s.strings == nil {
-		return 0
-	}
-	return s.strings.Len()
+	return len(s.strings)
 }
 
 func (s *fieldWriteScratch) fixedLen() int {
@@ -125,7 +122,7 @@ func (s *fieldWriteScratch) fixedLen() int {
 }
 
 func (s *fieldWriteScratch) stringAt(i int) string {
-	return s.strings.Get(i)
+	return s.strings[i]
 }
 
 func (s *fieldWriteScratch) fixedAt(i int) uint64 {
@@ -142,8 +139,8 @@ func (s *fieldWriteScratch) sortForField(f *field) {
 		}
 		return
 	}
-	if s.strings != nil && s.strings.Len() > 1 {
-		pooled.SortSlice(s.strings)
+	if len(s.strings) > 1 {
+		slices.Sort(s.strings)
 	}
 }
 
@@ -430,7 +427,7 @@ func (acc indexedFieldAccessor) collectSnapshotBatchDiff(
 			)
 		}
 	} else if acc.field != nil && acc.field.Slice {
-		var oldMulti, newMulti *pooled.Slice[string]
+		var oldMulti, newMulti []string
 		if oldOK {
 			oldMulti = state.old.strings
 		}

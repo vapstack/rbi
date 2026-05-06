@@ -35,7 +35,7 @@ const (
 const limitQueryFastPathMaxLeaves = 8
 
 func (p leafPred) postCount() int {
-	return postingBufLen(p.postsBuf)
+	return len(p.postsBuf)
 }
 
 func (p leafPred) postAt(i int) posting.List {
@@ -1347,12 +1347,9 @@ func (qv *queryView) buildLeafPred(e qir.Expr) (leafPred, bool, error) {
 			return leafPred{}, true, err
 		}
 		if keysBuf != nil {
-			defer stringSlicePool.Put(keysBuf)
+			defer pools.PutStringSlice(keysBuf)
 		}
-		keyCount := 0
-		if keysBuf != nil {
-			keyCount = keysBuf.Len()
-		}
+		keyCount := len(keysBuf)
 		if !isSlice || (keyCount == 0 && !hasNil) {
 			return leafPred{}, false, nil
 		}
@@ -1388,12 +1385,9 @@ func (qv *queryView) buildLeafPred(e qir.Expr) (leafPred, bool, error) {
 			return leafPred{}, true, err
 		}
 		if keysBuf != nil {
-			defer stringSlicePool.Put(keysBuf)
+			defer pools.PutStringSlice(keysBuf)
 		}
-		keyCount := 0
-		if keysBuf != nil {
-			keyCount = keysBuf.Len()
-		}
+		keyCount := len(keysBuf)
 		if !isSlice || keyCount == 0 {
 			return leafPred{}, false, nil
 		}
@@ -1402,7 +1396,7 @@ func (qv *queryView) buildLeafPred(e qir.Expr) (leafPred, bool, error) {
 
 		var est uint64
 		for i := 0; i < keyCount; i++ {
-			ids := ov.lookupPostingRetained(keysBuf.Get(i))
+			ids := ov.lookupPostingRetained(keysBuf[i])
 			if ids.IsEmpty() {
 				pools.PutPostingSlice(postsBuf)
 				return emptyLeaf(), true, nil
@@ -1432,9 +1426,9 @@ func (qv *queryView) buildLeafPred(e qir.Expr) (leafPred, bool, error) {
 			return leafPred{}, true, err
 		}
 		if keysBuf != nil {
-			defer stringSlicePool.Put(keysBuf)
+			defer pools.PutStringSlice(keysBuf)
 		}
-		if !isSlice || keysBuf == nil || keysBuf.Len() == 0 {
+		if !isSlice || len(keysBuf) == 0 {
 			return leafPred{}, false, nil
 		}
 

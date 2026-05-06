@@ -2986,12 +2986,9 @@ func (qv *queryView) estimateInLikeSelectivity(field string, value any, universe
 		Value:        value,
 	})
 	if valsBuf != nil {
-		defer stringSlicePool.Put(valsBuf)
+		defer pools.PutStringSlice(valsBuf)
 	}
-	valueCount := 0
-	if valsBuf != nil {
-		valueCount = valsBuf.Len()
-	}
+	valueCount := len(valsBuf)
 	if err != nil || !isSlice || (valueCount == 0 && !hasNil) {
 		return 0, 0, false
 	}
@@ -3007,7 +3004,7 @@ func (qv *queryView) estimateInLikeSelectivity(field string, value any, universe
 	}
 
 	for i := 0; i < valueCount; i++ {
-		card := ov.lookupCardinality(valsBuf.Get(i))
+		card := ov.lookupCardinality(valsBuf[i])
 		sum += card
 		if minCard == 0 || card < minCard {
 			minCard = card

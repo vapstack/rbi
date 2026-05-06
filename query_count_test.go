@@ -594,7 +594,7 @@ func TestCount_ScalarInSplit_ResidualFilterMatchesBitmap(t *testing.T) {
 
 	valsBuf, isSlice, hasNil, err := qv.exprValueToDistinctIdxBuf(mustCountQIRExprForDB(t, db, qx.IN("country", []string{"US", "DE", "FR"})))
 	if valsBuf != nil {
-		defer stringSlicePool.Put(valsBuf)
+		defer pools.PutStringSlice(valsBuf)
 	}
 	if err != nil || !isSlice || hasNil {
 		t.Fatalf("exprValueToDistinctIdxBuf: isSlice=%v hasNil=%v err=%v", isSlice, hasNil, err)
@@ -602,8 +602,8 @@ func TestCount_ScalarInSplit_ResidualFilterMatchesBitmap(t *testing.T) {
 
 	var got uint64
 	ov := qv.fieldOverlay("country")
-	for i := 0; i < valsBuf.Len(); i++ {
-		ids := ov.lookupPostingRetained(valsBuf.Get(i))
+	for i := 0; i < len(valsBuf); i++ {
+		ids := ov.lookupPostingRetained(valsBuf[i])
 		if ids.IsEmpty() {
 			continue
 		}

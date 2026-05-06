@@ -2294,11 +2294,10 @@ func TestBuildPredicateWithMode_RuntimeExactUnionPromotesOnSecondMaterialize(t *
 	}
 
 	t.Run("IN", func(t *testing.T) {
-		vals := stringSlicePool.Get()
-		vals.Append("DE")
-		vals.Append("FR")
+		vals := pools.GetStringSlice(2)
+		vals = append(vals, "DE", "FR")
 		cacheKey := materializedPredKeyForDistinctSetTerms("country", compileScalarOpForTest(qx.OpIN), vals, false)
-		stringSlicePool.Put(vals)
+		pools.PutStringSlice(vals)
 
 		run(t,
 			qx.IN("country", []string{"DE", "FR"}),
@@ -2322,11 +2321,10 @@ func TestBuildPredicateWithMode_RuntimeExactUnionPromotesOnSecondMaterialize(t *
 	})
 
 	t.Run("HASANY", func(t *testing.T) {
-		vals := stringSlicePool.Get()
-		vals.Append("db")
-		vals.Append("go")
+		vals := pools.GetStringSlice(2)
+		vals = append(vals, "db", "go")
 		cacheKey := materializedPredKeyForDistinctSetTerms("tags", compileScalarOpForTest(qx.OpHASANY), vals, false)
-		stringSlicePool.Put(vals)
+		pools.PutStringSlice(vals)
 
 		run(t,
 			qx.HASANY("tags", []string{"go", "db"}),
@@ -2353,11 +2351,10 @@ func TestBuildPredicateWithMode_RuntimeExactUnionPromotesOnSecondMaterialize(t *
 	})
 
 	t.Run("NOTIN", func(t *testing.T) {
-		vals := stringSlicePool.Get()
-		vals.Append("DE")
-		vals.Append("FR")
+		vals := pools.GetStringSlice(2)
+		vals = append(vals, "DE", "FR")
 		cacheKey := materializedPredKeyForDistinctSetTerms("country", compileScalarOpForTest(qx.OpIN), vals, false)
-		stringSlicePool.Put(vals)
+		pools.PutStringSlice(vals)
 
 		run(t,
 			qx.NOT(qx.IN("country", []string{"DE", "FR"})),
@@ -2381,11 +2378,10 @@ func TestBuildPredicateWithMode_RuntimeExactUnionPromotesOnSecondMaterialize(t *
 	})
 
 	t.Run("HASNONE", func(t *testing.T) {
-		vals := stringSlicePool.Get()
-		vals.Append("db")
-		vals.Append("go")
+		vals := pools.GetStringSlice(2)
+		vals = append(vals, "db", "go")
 		cacheKey := materializedPredKeyForDistinctSetTerms("tags", compileScalarOpForTest(qx.OpHASANY), vals, false)
-		stringSlicePool.Put(vals)
+		pools.PutStringSlice(vals)
 
 		run(t,
 			qx.NOT(qx.HASANY("tags", []string{"go", "db"})),
@@ -2437,11 +2433,10 @@ func TestBuildPredicateWithMode_HasPromotesOnSecondBuild(t *testing.T) {
 		t.Fatalf("RebuildIndex: %v", err)
 	}
 
-	vals := stringSlicePool.Get()
-	vals.Append("db")
-	vals.Append("go")
+	vals := pools.GetStringSlice(2)
+	vals = append(vals, "db", "go")
 	cacheKey := materializedPredKeyForDistinctSetTerms("tags", compileScalarOpForTest(qx.OpHASALL), vals, false)
-	stringSlicePool.Put(vals)
+	pools.PutStringSlice(vals)
 
 	expr := qx.HASALL("tags", []string{"go", "db"})
 

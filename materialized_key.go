@@ -4,7 +4,6 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/vapstack/rbi/internal/pooled"
 	"github.com/vapstack/rbi/internal/qir"
 )
 
@@ -377,11 +376,8 @@ func materializedPredKeyForNumericBucketSpan(field string, startBucket, endBucke
 	}
 }
 
-func materializedPredKeyForDistinctSetTerms(field string, op qir.Op, vals *pooled.Slice[string], includeNil bool) materializedPredKey {
-	termCount := btoi(includeNil)
-	if vals != nil {
-		termCount += vals.Len()
-	}
+func materializedPredKeyForDistinctSetTerms(field string, op qir.Op, vals []string, includeNil bool) materializedPredKey {
+	termCount := len(vals) + btoi(includeNil)
 	if field == "" || termCount < 2 {
 		return materializedPredKey{}
 	}
@@ -390,7 +386,7 @@ func materializedPredKeyForDistinctSetTerms(field string, op qir.Op, vals *poole
 	default:
 		return materializedPredKey{}
 	}
-	if vals != nil && vals.Len() > materializedPredKeyDistinctSetInlineMax {
+	if len(vals) > materializedPredKeyDistinctSetInlineMax {
 		return materializedPredKey{}
 	}
 	key := materializedPredKey{
@@ -398,11 +394,9 @@ func materializedPredKeyForDistinctSetTerms(field string, op qir.Op, vals *poole
 		field: field,
 		op:    op,
 	}
-	if vals != nil {
-		key.setValueCnt = uint8(vals.Len())
-		for i := 0; i < vals.Len(); i++ {
-			key.setTerms[i] = vals.Get(i)
-		}
+	key.setValueCnt = uint8(len(vals))
+	for i, v := range vals {
+		key.setTerms[i] = v
 	}
 	if includeNil {
 		key.flags |= materializedPredKeySetHasNil

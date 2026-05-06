@@ -1250,7 +1250,7 @@ func (qv *queryView) validateOrderBasicSimpleExpr(e qir.Expr) error {
 		}
 		valsBuf, isSlice, _, err := qv.exprValueToDistinctIdxBuf(e)
 		if valsBuf != nil {
-			defer stringSlicePool.Put(valsBuf)
+			defer pools.PutStringSlice(valsBuf)
 		}
 		if err != nil {
 			return err
@@ -1266,7 +1266,7 @@ func (qv *queryView) validateOrderBasicSimpleExpr(e qir.Expr) error {
 		}
 		valsBuf, isSlice, hasNil, err := qv.exprValueToDistinctIdxBuf(e)
 		if valsBuf != nil {
-			defer stringSlicePool.Put(valsBuf)
+			defer pools.PutStringSlice(valsBuf)
 		}
 		if err != nil {
 			return err
@@ -1274,10 +1274,7 @@ func (qv *queryView) validateOrderBasicSimpleExpr(e qir.Expr) error {
 		if !isSlice && e.Value != nil {
 			return fmt.Errorf("%w: %v expects a slice", ErrInvalidQuery, e.Op)
 		}
-		valCount := 0
-		if valsBuf != nil {
-			valCount = valsBuf.Len()
-		}
+		valCount := len(valsBuf)
 		if valCount == 0 && !hasNil {
 			return fmt.Errorf("%v: %v: no values provided", ErrInvalidQuery, e.Op)
 		}
@@ -1289,7 +1286,7 @@ func (qv *queryView) validateOrderBasicSimpleExpr(e qir.Expr) error {
 		}
 		valsBuf, isSlice, _, err := qv.exprValueToDistinctIdxBuf(e)
 		if valsBuf != nil {
-			defer stringSlicePool.Put(valsBuf)
+			defer pools.PutStringSlice(valsBuf)
 		}
 		if err != nil {
 			return err
@@ -1297,7 +1294,7 @@ func (qv *queryView) validateOrderBasicSimpleExpr(e qir.Expr) error {
 		if !isSlice && e.Value != nil {
 			return fmt.Errorf("%w: %v expects a slice", ErrInvalidQuery, e.Op)
 		}
-		if valsBuf == nil || valsBuf.Len() == 0 {
+		if len(valsBuf) == 0 {
 			return fmt.Errorf("%v: %v: no values provided", ErrInvalidQuery, e.Op)
 		}
 		return nil

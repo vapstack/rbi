@@ -3,6 +3,7 @@ package rbi
 import (
 	"reflect"
 
+	"github.com/vapstack/rbi/internal/pools"
 	"github.com/vapstack/rbi/internal/posting"
 	"github.com/vapstack/rbi/internal/qir"
 )
@@ -599,12 +600,10 @@ func (qv *queryView) orderDataValues(v any, fm *field) ([]string, error) {
 		if valsBuf == nil {
 			return nil, nil
 		}
-		defer stringSlicePool.Put(valsBuf)
+		defer pools.PutStringSlice(valsBuf)
 
-		out := make([]string, valsBuf.Len())
-		for i := 0; i < valsBuf.Len(); i++ {
-			out[i] = valsBuf.Get(i)
-		}
+		out := make([]string, len(valsBuf))
+		copy(out, valsBuf)
 		return out, nil
 	}
 

@@ -160,19 +160,16 @@ func (qv *queryView) tryCountByScalarLookup(expr qir.Expr, trace *queryTrace) (u
 	case qir.OpIN:
 		valsBuf, isSlice, hasNil, err := qv.exprValueToDistinctIdxBuf(expr)
 		if valsBuf != nil {
-			defer stringSlicePool.Put(valsBuf)
+			defer pools.PutStringSlice(valsBuf)
 		}
-		valCount := 0
-		if valsBuf != nil {
-			valCount = valsBuf.Len()
-		}
+		valCount := len(valsBuf)
 		if err != nil || !isSlice || (valCount == 0 && !hasNil) {
 			return 0, false, err
 		}
 
 		var sum uint64
 		for i := 0; i < valCount; i++ {
-			sum += ov.lookupCardinality(valsBuf.Get(i))
+			sum += ov.lookupCardinality(valsBuf[i])
 		}
 		if hasNil {
 			sum += qv.nilFieldOverlayForExpr(expr).lookupCardinality(nilIndexEntryKey)
@@ -279,12 +276,9 @@ func (qv *queryView) tryCountBySliceLookup(expr qir.Expr, trace *queryTrace) (ui
 
 	valsBuf, isSlice, _, err := qv.exprValueToDistinctIdxBuf(expr)
 	if valsBuf != nil {
-		defer stringSlicePool.Put(valsBuf)
+		defer pools.PutStringSlice(valsBuf)
 	}
-	valCount := 0
-	if valsBuf != nil {
-		valCount = valsBuf.Len()
-	}
+	valCount := len(valsBuf)
 	if err != nil {
 		return 0, false, err
 	}
@@ -335,7 +329,7 @@ func (qv *queryView) tryCountBySliceLookup(expr qir.Expr, trace *queryTrace) (ui
 
 		var examined uint64
 		for i := 0; i < valCount; i++ {
-			ids := ov.lookupPostingRetained(valsBuf.Get(i))
+			ids := ov.lookupPostingRetained(valsBuf[i])
 			card := ids.Cardinality()
 			examined = satAddUint64(examined, card)
 			if ids.IsEmpty() {
@@ -390,7 +384,8 @@ func shouldUseCountLeadResidualHasAnyExactFilter(p predicate) bool {
 	if p.kind != predicateKindPostsAny || p.expr.Not || p.expr.Op != qir.OpHASANY {
 		return false
 	}
-	if p.postCount() < 2 || p.postCount() > countPredLeadResidualHasAnyExactMaxTerms {
+	l := len(p.postsBuf)
+	if l < 2 || l > countPredLeadResidualHasAnyExactMaxTerms {
 		return false
 	}
 	return p.estCard >= countPredLeadResidualHasAnyExactMinCard
@@ -424,7 +419,7 @@ func (qv *queryView) buildCountLeadResidualExactFiltersByCandidatesInto(dst *poo
 			continue
 		}
 		p := preds.Get(pi)
-		if p.kind != predicateKindPostsAny || p.expr.Not || p.expr.Op != qir.OpHASANY || p.postCount() == 0 {
+		if p.kind != predicateKindPostsAny || p.expr.Not || p.expr.Op != qir.OpHASANY || len(p.postsBuf) == 0 {
 			continue
 		}
 		if p.postsAnyState != nil {
@@ -454,7 +449,7 @@ func (qv *queryView) buildCountLeadResidualExactFiltersByCandidatesIntoSet(dst *
 			continue
 		}
 		p := preds.Get(pi)
-		if p.kind != predicateKindPostsAny || p.expr.Not || p.expr.Op != qir.OpHASANY || p.postCount() == 0 {
+		if p.kind != predicateKindPostsAny || p.expr.Not || p.expr.Op != qir.OpHASANY || len(p.postsBuf) == 0 {
 			continue
 		}
 		if p.postsAnyState != nil {
@@ -956,8 +951,8 @@ func (qv *queryView) tryCountByScalarInSplit(expr qir.Expr, trace *queryTrace) (
 		})
 		totalVals := 0
 		if valsBuf != nil {
-			totalVals = valsBuf.Len()
-			stringSlicePool.Put(valsBuf)
+			totalVals = len(valsBuf)
+			pools.PutStringSlice(valsBuf)
 		}
 		if hasNil {
 			totalVals++
@@ -989,12 +984,9 @@ func (qv *queryView) tryCountByScalarInSplit(expr qir.Expr, trace *queryTrace) (
 		Value:        inLeaf.Value,
 	})
 	if valsBuf != nil {
-		defer stringSlicePool.Put(valsBuf)
+		defer pools.PutStringSlice(valsBuf)
 	}
-	valCount := 0
-	if valsBuf != nil {
-		valCount = valsBuf.Len()
-	}
+	valCount := len(valsBuf)
 	if err != nil || !isSlice || (valCount == 0 && !hasNil) {
 		return 0, false, nil
 	}
@@ -1035,7 +1027,7 @@ func (qv *queryView) tryCountByScalarInSplit(expr qir.Expr, trace *queryTrace) (
 	var cnt uint64
 	var examined uint64
 	for i := 0; i < valCount; i++ {
-		ids := ov.lookupPostingRetained(valsBuf.Get(i))
+		ids := ov.lookupPostingRetained(valsBuf[i])
 		if ids.IsEmpty() {
 			continue
 		}
@@ -1476,8 +1468,8 @@ func countPredicateLeadPostingCount(p predicate) int {
 	switch {
 	case p.iterKind == predicateIterPosting && !p.posting.IsEmpty():
 		return 1
-	case p.kind == predicateKindPostsAny && p.iterKind == predicateIterPostsConcat && p.postCount() >= 2:
-		return p.postCount()
+	case p.kind == predicateKindPostsAny && p.iterKind == predicateIterPostsConcat && len(p.postsBuf) >= 2:
+		return len(p.postsBuf)
 	default:
 		return 0
 	}
@@ -1487,7 +1479,7 @@ func countPredicateLeadPostingAt(p predicate, i int) posting.List {
 	if p.iterKind == predicateIterPosting {
 		return p.posting
 	}
-	return p.postAt(i)
+	return p.postsBuf[i]
 }
 
 func countORBranchesUnionUpperBoundBuf(branches *pooled.Slice[countORBranch], universe uint64) uint64 {
@@ -2201,13 +2193,14 @@ func shouldMaterializeCountSetPredicate(p predicate, probeEst uint64, universe u
 	default:
 		return false
 	}
-	if p.postCount() <= 1 {
+	l := len(p.postsBuf)
+	if l <= 1 {
 		return false
 	}
-	if p.postCount() < countSetMaterializeMinTerms(probeEst, universe) {
+	if l < countSetMaterializeMinTerms(probeEst, universe) {
 		return false
 	}
-	return probeEst >= countSetMaterializeMinProbe(p.postCount(), probeEst, universe)
+	return probeEst >= countSetMaterializeMinProbe(l, probeEst, universe)
 }
 
 func countCustomMaterializeMinProbe(op qir.Op, est uint64, probeEst uint64, universe uint64) uint64 {

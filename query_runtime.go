@@ -57,7 +57,7 @@ func (state *postsAnyFilterState) materialize() posting.List {
 }
 
 func postsAnyContainsMaterializeAfterBuf(posts []posting.List) int {
-	termCount := postingBufLen(posts)
+	termCount := len(posts)
 	if termCount <= 1 {
 		return 0
 	}
@@ -107,7 +107,7 @@ func postsAnyContainsMaterializeAfterBuf(posts []posting.List) int {
 }
 
 func postsAnyContainsWork(posts []posting.List) (uint64, uint64, uint64, bool) {
-	termCount := postingBufLen(posts)
+	termCount := len(posts)
 	if termCount <= 1 {
 		return 0, 0, 0, false
 	}
@@ -136,7 +136,7 @@ func (state *postsAnyFilterState) setExpectedContainsCalls(expectedCalls int) {
 	}
 	directTotal := satMulUint64(uint64(expectedCalls), directPerCall)
 	materializedTotal := satAddUint64(
-		satMulUint64(buildWork, materializedShareStructuralFactor(postingBufLen(state.postsBuf))),
+		satMulUint64(buildWork, materializedShareStructuralFactor(len(state.postsBuf))),
 		satMulUint64(uint64(expectedCalls), materializedPerCall),
 	)
 	if materializedTotal < directTotal {
@@ -158,7 +158,7 @@ func (state *postsAnyFilterState) matches(idx uint64) bool {
 				return state.materialize().Contains(idx)
 			}
 		}
-		switch postingBufLen(state.postsBuf) {
+		switch len(state.postsBuf) {
 		case 0:
 			return false
 		case 1:
@@ -192,7 +192,7 @@ func (state *postsAnyFilterState) matches(idx uint64) bool {
 			return !state.materialize().Contains(idx)
 		}
 	}
-	switch postingBufLen(state.postsBuf) {
+	switch len(state.postsBuf) {
 	case 0:
 		return true
 	case 1:
@@ -402,7 +402,7 @@ func (state *postsAnyFilterState) apply(dst posting.List) (posting.List, bool) {
 		}
 		return dst.BuildAndNot(union), true
 	}
-	postCount := postingBufLen(state.postsBuf)
+	postCount := len(state.postsBuf)
 	if postCount <= 4 {
 		card := dst.Cardinality()
 		if card > 0 {
@@ -504,10 +504,6 @@ func (state *postsAnyFilterState) apply(dst posting.List) (posting.List, bool) {
 		return posting.List{}, true
 	}
 	return dst.BuildAnd(union), true
-}
-
-func postingBufLen(buf []posting.List) int {
-	return len(buf)
 }
 
 type lazyMaterializedPredicateState struct {

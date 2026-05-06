@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/vapstack/qx"
+	"github.com/vapstack/rbi/internal/pools"
 	"github.com/vapstack/rbi/internal/posting"
 )
 
@@ -102,10 +103,9 @@ func TestMaterializedPredKeyScalar_NumericBoundsDoNotCollide(t *testing.T) {
 }
 
 func TestMaterializedPredKeyDistinctSet_RoundTripThroughStringCacheAPI(t *testing.T) {
-	vals := stringSlicePool.Get()
-	defer stringSlicePool.Put(vals)
-	vals.Append("DE")
-	vals.Append("FR")
+	vals := pools.GetStringSlice(2)
+	defer pools.PutStringSlice(vals)
+	vals = append(vals, "DE", "FR")
 
 	key := materializedPredKeyForDistinctSetTerms("country", compileScalarOpForTest(qx.OpIN), vals, true)
 	if key.isZero() {

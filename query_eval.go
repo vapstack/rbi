@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math"
 	"reflect"
+	"slices"
 	"sync"
 
 	"github.com/vapstack/rbi/internal/qir"
@@ -12,23 +13,6 @@ import (
 	"github.com/vapstack/rbi/internal/pools"
 	"github.com/vapstack/rbi/internal/posting"
 )
-
-type stringKeyReader interface {
-	Len() int
-	Get(i int) string
-}
-
-func stringKeyReaderLen(keys stringKeyReader) int {
-	switch v := keys.(type) {
-	case nil:
-		return 0
-	case *pooled.Slice[string]:
-		if v == nil {
-			return 0
-		}
-	}
-	return keys.Len()
-}
 
 func releasePostingResults(buf *pooled.Slice[postingResult]) {
 	for i := 0; i < buf.Len(); i++ {
@@ -251,7 +235,7 @@ func (qv *queryView) evalSimple(e qir.Expr) (postingResult, error) {
 				return postingResult{}, err
 			}
 			if valsBuf != nil {
-				defer stringSlicePool.Put(valsBuf)
+				defer pools.PutStringSlice(valsBuf)
 			}
 			if !isSlice {
 				return postingResult{}, fmt.Errorf("%w: %v expects a slice for slice field %v", ErrInvalidQuery, e.Op, fieldName)
@@ -268,15 +252,12 @@ func (qv *queryView) evalSimple(e qir.Expr) (postingResult, error) {
 			return postingResult{}, err
 		}
 		if valsBuf != nil {
-			defer stringSlicePool.Put(valsBuf)
+			defer pools.PutStringSlice(valsBuf)
 		}
 		if !isSlice && e.Value != nil {
 			return postingResult{}, fmt.Errorf("%w: %v expects a slice", ErrInvalidQuery, e.Op)
 		}
-		valCount := 0
-		if valsBuf != nil {
-			valCount = valsBuf.Len()
-		}
+		valCount := len(valsBuf)
 		if valCount == 0 && !hasNil {
 			return postingResult{}, fmt.Errorf("%v: %v: no values provided", ErrInvalidQuery, e.Op)
 		}
@@ -288,7 +269,7 @@ func (qv *queryView) evalSimple(e qir.Expr) (postingResult, error) {
 		builder := newPostingUnionBuilder(postingBatchSinglesEnabled(uint64(capHint)))
 		defer builder.release()
 		for i := 0; i < valCount; i++ {
-			ids := ov.lookupPostingRetained(valsBuf.Get(i))
+			ids := ov.lookupPostingRetained(valsBuf[i])
 			if ids.IsEmpty() {
 				continue
 			}
@@ -311,15 +292,12 @@ func (qv *queryView) evalSimple(e qir.Expr) (postingResult, error) {
 			return postingResult{}, err
 		}
 		if valsBuf != nil {
-			defer stringSlicePool.Put(valsBuf)
+			defer pools.PutStringSlice(valsBuf)
 		}
 		if !isSlice && e.Value != nil {
 			return postingResult{}, fmt.Errorf("%w: %v expects a slice", ErrInvalidQuery, e.Op)
 		}
-		valCount := 0
-		if valsBuf != nil {
-			valCount = valsBuf.Len()
-		}
+		valCount := len(valsBuf)
 		if valCount == 0 {
 			return postingResult{}, fmt.Errorf("%v: %v: no values provided", ErrInvalidQuery, e.Op)
 		}
@@ -327,7 +305,7 @@ func (qv *queryView) evalSimple(e qir.Expr) (postingResult, error) {
 		if e.Op == qir.OpHASALL {
 			var acc posting.List
 			for i := 0; i < valCount; i++ {
-				ids := ov.lookupPostingRetained(valsBuf.Get(i))
+				ids := ov.lookupPostingRetained(valsBuf[i])
 				if ids.IsEmpty() {
 					// if any value is missing, result is empty
 					acc.Release()
@@ -349,7 +327,7 @@ func (qv *queryView) evalSimple(e qir.Expr) (postingResult, error) {
 		builder := newPostingUnionBuilder(postingBatchSinglesEnabled(uint64(valCount)))
 		defer builder.release()
 		for i := 0; i < valCount; i++ {
-			ids := ov.lookupPostingRetained(valsBuf.Get(i))
+			ids := ov.lookupPostingRetained(valsBuf[i])
 			if ids.IsEmpty() {
 				continue
 			}
@@ -494,8 +472,8 @@ func parallelBatchedPostingUnionOwned(posts []posting.List) posting.List {
 //
 // Callers pass distinct values; duplicates are removed before this point so
 // this path can stay read-only.
-func (qv *queryView) evalSliceEQ(field string, fieldOrdinal int, vals stringKeyReader) (postingResult, error) {
-	valCount := stringKeyReaderLen(vals)
+func (qv *queryView) evalSliceEQ(field string, fieldOrdinal int, vals []string) (postingResult, error) {
+	valCount := len(vals)
 	lenOV := qv.lenFieldOverlayRef(field, fieldOrdinal)
 
 	useZeroComplement := valCount == 0 && qv.isLenZeroComplementRef(field, fieldOrdinal)
@@ -522,7 +500,7 @@ func (qv *queryView) evalSliceEQ(field string, fieldOrdinal int, vals stringKeyR
 	ov := qv.fieldOverlayRef(field, fieldOrdinal)
 	acc := lenBM.Clone()
 	for i := 0; i < valCount; i++ {
-		ids := ov.lookupPostingRetained(vals.Get(i))
+		ids := ov.lookupPostingRetained(vals[i])
 		if ids.IsEmpty() {
 			acc.Release()
 			return postingResult{}, nil
@@ -1005,27 +983,30 @@ func applyNormalizedScalarBound(rb *rangeBounds, b normalizedScalarBound) {
 	}
 }
 
-func dedupStringBufInPlace(buf *pooled.Slice[string]) {
-	if buf == nil || buf.Len() < 2 {
-		return
+func dedupStringBufInPlace(buf []string) []string {
+	if len(buf) < 2 {
+		return buf
 	}
-	pooled.SortSlice(buf)
+	slices.Sort(buf)
 	write := 1
-	for read := 1; read < buf.Len(); read++ {
-		if buf.Get(read) == buf.Get(write-1) {
+	for read := 1; read < len(buf); read++ {
+		if buf[read] == buf[write-1] {
 			continue
 		}
 		if write != read {
-			buf.Set(write, buf.Get(read))
+			buf[write] = buf[read]
 		}
 		write++
 	}
-	buf.SetLen(write)
+	return buf[:write]
 }
 
-func sliceValueToIdxStringBuf(v reflect.Value, fm *field) (*pooled.Slice[string], bool, error) {
-	ixsBuf := stringSlicePool.Get()
-	ixsBuf.Grow(v.Len())
+func sliceValueToIdxStringBuf(v reflect.Value, fm *field) ([]string, bool, error) {
+	if v.Len() == 0 {
+		return nil, false, nil
+	}
+
+	ixsBuf := pools.GetStringSlice(v.Len())
 	hasNil := false
 
 	for i := 0; i < v.Len(); i++ {
@@ -1041,33 +1022,33 @@ func sliceValueToIdxStringBuf(v reflect.Value, fm *field) (*pooled.Slice[string]
 			continue
 		}
 		if elem.Kind() == reflect.Slice {
-			stringSlicePool.Put(ixsBuf)
+			pools.PutStringSlice(ixsBuf)
 			return nil, false, fmt.Errorf("unsupported slice element type: %v", elem.Type())
 		}
 
 		key, err := scalarValueToIdxField(raw, elem, fm)
 		if err != nil {
-			stringSlicePool.Put(ixsBuf)
+			pools.PutStringSlice(ixsBuf)
 			return nil, false, err
 		}
-		ixsBuf.Append(key)
+		ixsBuf = append(ixsBuf, key)
 	}
 
-	if ixsBuf.Len() == 0 {
-		stringSlicePool.Put(ixsBuf)
+	if len(ixsBuf) == 0 {
+		pools.PutStringSlice(ixsBuf)
 		return nil, hasNil, nil
 	}
 	return ixsBuf, hasNil, nil
 }
 
-func (qv *queryView) scalarLookupPostings(field string, fieldOrdinal int, keys stringKeyReader, includeNil bool) ([]posting.List, uint64) {
-	keyCount := stringKeyReaderLen(keys)
+func (qv *queryView) scalarLookupPostings(field string, fieldOrdinal int, keys []string, includeNil bool) ([]posting.List, uint64) {
+	keyCount := len(keys)
 	postsBuf := pools.GetPostingSlice(keyCount + btoi(includeNil))
 	var est uint64
 
 	ov := qv.fieldOverlayRef(field, fieldOrdinal)
 	for i := 0; i < keyCount; i++ {
-		ids := ov.lookupPostingRetained(keys.Get(i))
+		ids := ov.lookupPostingRetained(keys[i])
 		if ids.IsEmpty() {
 			continue
 		}
@@ -1114,7 +1095,7 @@ func (qv *queryView) diffPostingResult(acc, sub postingResult) (postingResult, e
 
 // exprValueToDistinctIdxBuf returns caller-owned indexed values deduplicated
 // for set-like operators whose semantics do not depend on input order.
-func (qv *queryView) exprValueToDistinctIdxBuf(expr qir.Expr) (*pooled.Slice[string], bool, bool, error) {
+func (qv *queryView) exprValueToDistinctIdxBuf(expr qir.Expr) ([]string, bool, bool, error) {
 	fm := qv.fieldMetaByExpr(expr)
 
 	if expr.Value == nil {
@@ -1129,12 +1110,11 @@ func (qv *queryView) exprValueToDistinctIdxBuf(expr qir.Expr) (*pooled.Slice[str
 			if len(v) == 0 {
 				return nil, true, false, nil
 			}
-			valsBuf := stringSlicePool.Get()
-			valsBuf.Grow(len(v))
-			valsBuf.AppendAll(v)
-			dedupStringBufInPlace(valsBuf)
-			if valsBuf.Len() == 0 {
-				stringSlicePool.Put(valsBuf)
+			valsBuf := pools.GetStringSlice(len(v))
+			valsBuf = append(valsBuf, v...)
+			valsBuf = dedupStringBufInPlace(valsBuf)
+			if len(valsBuf) == 0 {
+				pools.PutStringSlice(valsBuf)
 				return nil, true, false, nil
 			}
 			return valsBuf, true, false, nil
@@ -1158,9 +1138,9 @@ func (qv *queryView) exprValueToDistinctIdxBuf(expr qir.Expr) (*pooled.Slice[str
 		if valsBuf == nil {
 			return nil, true, hasNil, nil
 		}
-		dedupStringBufInPlace(valsBuf)
-		if valsBuf.Len() == 0 {
-			stringSlicePool.Put(valsBuf)
+		valsBuf = dedupStringBufInPlace(valsBuf)
+		if len(valsBuf) == 0 {
+			pools.PutStringSlice(valsBuf)
 			return nil, true, hasNil, nil
 		}
 		return valsBuf, true, hasNil, nil
