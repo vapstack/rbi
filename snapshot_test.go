@@ -12,6 +12,7 @@ import (
 
 	"github.com/vapstack/qx"
 	"github.com/vapstack/rbi/internal/pooled"
+	"github.com/vapstack/rbi/internal/pools"
 	"github.com/vapstack/rbi/internal/posting"
 	"go.etcd.io/bbolt"
 )
@@ -1688,7 +1689,7 @@ func TestSnapshotExt_InheritMaterializedPredCacheSkipsChangedFieldsAndKeepsOther
 		},
 	}
 	changed := snapshotTestBoolSlots(map[string]bool{"name": true}, db.engine.indexedFieldMap)
-	defer fieldIndexBoolSlicePool.Put(changed)
+	defer pools.PutBoolSlice(changed)
 
 	inheritMaterializedPredCache(next, prev, db.engine.indexedFieldMap, changed)
 
@@ -2575,12 +2576,12 @@ func snapshotTestFieldIndexSlots(
 	return out
 }
 
-func snapshotTestBoolSlots(src map[string]bool, byName map[string]indexedFieldAccessor) *pooled.Slice[bool] {
-	out := fieldIndexBoolSlicePool.Get()
-	out.SetLen(len(byName))
+func snapshotTestBoolSlots(src map[string]bool, byName map[string]indexedFieldAccessor) []bool {
+	out := pools.GetBoolSlice(len(byName))[:len(byName)]
+	clear(out)
 	for name, value := range src {
 		if value {
-			out.Set(byName[name].ordinal, true)
+			out[byName[name].ordinal] = true
 		}
 	}
 	return out
@@ -2604,8 +2605,8 @@ func snapshotTestNewSnapshot(
 
 func snapshotTestLenZeroComplementField(s *indexSnapshot, name string) bool {
 	acc, ok := s.indexedFieldByName[name]
-	if !ok || s.lenZeroComplement == nil || acc.ordinal >= s.lenZeroComplement.Len() {
+	if !ok || acc.ordinal >= len(s.lenZeroComplement) {
 		return false
 	}
-	return s.lenZeroComplement.Get(acc.ordinal)
+	return s.lenZeroComplement[acc.ordinal]
 }

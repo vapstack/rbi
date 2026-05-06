@@ -22,7 +22,7 @@ type queryEngine struct {
 	index                          *pooled.Slice[fieldIndexStorage]
 	nilIndex                       *pooled.Slice[fieldIndexStorage]
 	lenIndex                       *pooled.Slice[fieldIndexStorage]
-	lenZeroComplement              *pooled.Slice[bool]
+	lenZeroComplement              []bool
 	measure                        *pooled.Slice[measureFieldStorage]
 	universe                       posting.List
 	hasUnique                      bool

@@ -3,6 +3,7 @@ package rbi
 import (
 	"github.com/vapstack/qx"
 	"github.com/vapstack/rbi/internal/pooled"
+	"github.com/vapstack/rbi/internal/pools"
 	"github.com/vapstack/rbi/internal/posting"
 	"github.com/vapstack/rbi/internal/qir"
 )
@@ -2783,29 +2784,29 @@ func (qv *queryView) tryCountByPredicatesLeadBuckets(preds predicateSet, leadIdx
 		rb, covered, hasBounds, ok := qv.collectPredicateRangeBoundsSet(qv.engine.fieldNameByOrdinal(e.FieldOrdinal), preds)
 		if !ok || !hasBounds {
 			if ok {
-				boolSlicePool.Put(covered)
+				pools.PutBoolSlice(covered)
 			}
 			return 0, 0, false
 		}
 		br := ov.rangeForBounds(rb)
 		if overlayRangeEmpty(br) {
-			boolSlicePool.Put(covered)
+			pools.PutBoolSlice(covered)
 			return 0, 0, true
 		}
 		if br.baseEnd-br.baseStart < 4 {
-			boolSlicePool.Put(covered)
+			pools.PutBoolSlice(covered)
 			return 0, 0, false
 		}
 
 		var activeBuf [countPredicateScanMaxLeaves]int
 		activeChecks := activeBuf[:0]
 		for _, pi := range active {
-			if pi >= 0 && pi < covered.Len() && covered.Get(pi) {
+			if covered[pi] {
 				continue
 			}
 			activeChecks = append(activeChecks, pi)
 		}
-		boolSlicePool.Put(covered)
+		pools.PutBoolSlice(covered)
 
 		var exactActiveBuf [countPredicateScanMaxLeaves]int
 		var extraExactCandidatesBuf [countPredicateScanMaxLeaves]int
@@ -2934,30 +2935,30 @@ func (qv *queryView) tryCountByPredicatesLeadBuckets(preds predicateSet, leadIdx
 	rb, covered, hasBounds, ok := qv.collectPredicateRangeBoundsSet(qv.engine.fieldNameByOrdinal(e.FieldOrdinal), preds)
 	if !ok || !hasBounds {
 		if ok {
-			boolSlicePool.Put(covered)
+			pools.PutBoolSlice(covered)
 		}
 		return 0, 0, false
 	}
 	br := ov.rangeForBounds(rb)
 	start, end := br.baseStart, br.baseEnd
 	if start >= end {
-		boolSlicePool.Put(covered)
+		pools.PutBoolSlice(covered)
 		return 0, 0, true
 	}
 	if end-start < 4 {
-		boolSlicePool.Put(covered)
+		pools.PutBoolSlice(covered)
 		return 0, 0, false
 	}
 
 	var activeBuf [countPredicateScanMaxLeaves]int
 	activeChecks := activeBuf[:0]
 	for _, pi := range active {
-		if pi >= 0 && pi < covered.Len() && covered.Get(pi) {
+		if covered[pi] {
 			continue
 		}
 		activeChecks = append(activeChecks, pi)
 	}
-	boolSlicePool.Put(covered)
+	pools.PutBoolSlice(covered)
 
 	var exactActiveBuf [countPredicateScanMaxLeaves]int
 	var extraExactCandidatesBuf [countPredicateScanMaxLeaves]int

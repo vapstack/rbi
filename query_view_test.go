@@ -11,6 +11,7 @@ import (
 
 	"github.com/vapstack/qx"
 	"github.com/vapstack/rbi/internal/pooled"
+	"github.com/vapstack/rbi/internal/pools"
 	"github.com/vapstack/rbi/internal/posting"
 	"github.com/vapstack/rbi/internal/qir"
 )
@@ -470,15 +471,12 @@ func (qe *queryEngine) extractOrderRangeCoverageOverlay(field string, preds []pr
 	return br, copyBoolBufAndRelease(covered), ok
 }
 
-func copyBoolBufAndRelease(buf *pooled.Slice[bool]) []bool {
+func copyBoolBufAndRelease(buf []bool) []bool {
 	if buf == nil {
 		return nil
 	}
-	out := make([]bool, buf.Len())
-	for i := 0; i < buf.Len(); i++ {
-		out[i] = buf.Get(i)
-	}
-	boolSlicePool.Put(buf)
+	out := append([]bool(nil), buf...)
+	pools.PutBoolSlice(buf)
 	return out
 }
 

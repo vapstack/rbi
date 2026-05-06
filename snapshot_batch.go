@@ -168,16 +168,10 @@ func cloneFieldIndexStorageSlots(src *pooled.Slice[fieldIndexStorage], size int)
 	return out
 }
 
-func cloneFieldIndexBoolSlots(src *pooled.Slice[bool], size int) *pooled.Slice[bool] {
-	out := fieldIndexBoolSlicePool.Get()
-	out.SetLen(size)
-	if src == nil {
-		return out
-	}
-	limit := min(size, src.Len())
-	for i := 0; i < limit; i++ {
-		out.Set(i, src.Get(i))
-	}
+func cloneFieldIndexBoolSlots(src []bool, size int) []bool {
+	out := pools.GetBoolSlice(size)[:size]
+	clear(out)
+	copy(out, src[:min(size, len(src))])
 	return out
 }
 
@@ -193,14 +187,14 @@ func ensureSnapshotUniverseOwned(next *indexSnapshot, universeOwned *bool) {
 type indexedFieldBatchDeltas struct {
 	fields  *pooled.Slice[snapshotFieldBatchState]
 	touched []int
-	changed *pooled.Slice[bool]
+	changed []bool
 }
 
 func (deltas *indexedFieldBatchDeltas) markTouched(ordinal int) {
-	if deltas.changed.Get(ordinal) {
+	if deltas.changed[ordinal] {
 		return
 	}
-	deltas.changed.Set(ordinal, true)
+	deltas.changed[ordinal] = true
 	deltas.touched = append(deltas.touched, ordinal)
 }
 
@@ -1793,7 +1787,7 @@ func (db *DB[K, V]) forEachSnapshotModifiedIndexedField(op snapshotBatchEntry[K,
 func (db *DB[K, V]) collectSnapshotBatchEntryDiffs(
 	op snapshotBatchEntry[K, V],
 	deltas *indexedFieldBatchDeltas,
-	lenZeroComplement *pooled.Slice[bool],
+	lenZeroComplement []bool,
 ) {
 	var ptrOld, ptrNew unsafe.Pointer
 	if op.oldVal != nil {
@@ -1805,7 +1799,7 @@ func (db *DB[K, V]) collectSnapshotBatchEntryDiffs(
 
 	db.forEachSnapshotModifiedIndexedField(op, func(acc indexedFieldAccessor) bool {
 		deltas.markTouched(acc.ordinal)
-		useZeroComplement := lenZeroComplement != nil && acc.ordinal < lenZeroComplement.Len() && lenZeroComplement.Get(acc.ordinal)
+		useZeroComplement := acc.ordinal < len(lenZeroComplement) && lenZeroComplement[acc.ordinal]
 		acc.collectSnapshotBatchDiff(op.idx, ptrOld, ptrNew, useZeroComplement, deltas.fields.GetPtr(acc.ordinal))
 		return true
 	})
@@ -1839,10 +1833,10 @@ func (db *DB[K, V]) buildPreparedSnapshotAggregatedNoLock(
 	deltas := indexedFieldBatchDeltas{
 		fields:  snapshotFieldBatchStateSlicePool.Get(),
 		touched: pools.GetIntSlice(len(db.engine.indexedFieldAccess)),
-		changed: fieldIndexBoolSlicePool.Get(),
+		changed: pools.GetBoolSlice(len(db.engine.indexedFieldAccess))[:len(db.engine.indexedFieldAccess)],
 	}
 	deltas.fields.SetLen(len(db.engine.indexedFieldAccess))
-	deltas.changed.SetLen(len(db.engine.indexedFieldAccess))
+	clear(deltas.changed)
 	measureDeltas := newMeasureFieldBatchDeltas(len(db.engine.measureFieldAccess))
 
 	universeOwned := false
@@ -1862,7 +1856,7 @@ func (db *DB[K, V]) buildPreparedSnapshotAggregatedNoLock(
 	}
 
 	for i := range deltas.touched {
-		deltas.changed.Set(deltas.touched[i], false)
+		deltas.changed[deltas.touched[i]] = false
 	}
 	changedCount := 0
 	for i := range deltas.touched {
@@ -1894,7 +1888,7 @@ func (db *DB[K, V]) buildPreparedSnapshotAggregatedNoLock(
 		}
 		if state.changed {
 			changedCount++
-			deltas.changed.Set(ordinal, true)
+			deltas.changed[ordinal] = true
 		}
 		state.releaseOwned()
 	}
@@ -1907,7 +1901,7 @@ func (db *DB[K, V]) buildPreparedSnapshotAggregatedNoLock(
 		inheritMaterializedPredCache(next, prev, db.engine.indexedFieldMap, nil)
 	}
 	snapshotFieldBatchStateSlicePool.Put(deltas.fields)
-	fieldIndexBoolSlicePool.Put(deltas.changed)
+	pools.PutBoolSlice(deltas.changed)
 	pools.PutIntSlice(deltas.touched)
 	next.retainSharedOwnedStorageFrom(prev)
 

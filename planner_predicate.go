@@ -1912,7 +1912,7 @@ func (qv *queryView) execPlanCandidateOrderBasic(q *qir.Shape, preds predicateRe
 	}
 
 	br := ov.rangeForBounds(rangeBounds{has: true})
-	var rangeCovered *pooled.Slice[bool]
+	var rangeCovered []bool
 	orderField := qv.engine.fieldNameByOrdinal(o.FieldOrdinal)
 	if coveredRange, covered, ok := qv.extractOrderRangeCoverageOverlayReader(orderField, preds, ov); ok {
 		br = coveredRange
@@ -1920,16 +1920,16 @@ func (qv *queryView) execPlanCandidateOrderBasic(q *qir.Shape, preds predicateRe
 	}
 	if overlayRangeEmpty(br) {
 		if rangeCovered != nil {
-			boolSlicePool.Put(rangeCovered)
+			pools.PutBoolSlice(rangeCovered)
 		}
 		return nil
 	}
-	for i := 0; i < rangeCovered.Len(); i++ {
-		if rangeCovered.Get(i) {
+	for i, is := range rangeCovered {
+		if is {
 			preds.GetPtr(i).covered = true
 		}
 	}
-	boolSlicePool.Put(rangeCovered)
+	pools.PutBoolSlice(rangeCovered)
 
 	var activeBuf [plannerPredicateFastPathMaxLeaves]int
 	active := activeBuf[:0]
@@ -1952,7 +1952,7 @@ func (qv *queryView) execPlanCandidateOrderBasic(q *qir.Shape, preds predicateRe
 	return out
 }
 
-func (qv *queryView) extractOrderRangeCoverageOverlayWithBoundsReader(field string, preds predicateReader, ov fieldOverlay) (rangeBounds, overlayRange, *pooled.Slice[bool], bool) {
+func (qv *queryView) extractOrderRangeCoverageOverlayWithBoundsReader(field string, preds predicateReader, ov fieldOverlay) (rangeBounds, overlayRange, []bool, bool) {
 	rb, covered, _, ok := qv.collectPredicateRangeBoundsReader(field, preds)
 	if !ok {
 		return rangeBounds{}, overlayRange{}, nil, false
@@ -1961,7 +1961,7 @@ func (qv *queryView) extractOrderRangeCoverageOverlayWithBoundsReader(field stri
 	return rb, ov.rangeForBounds(rb), covered, true
 }
 
-func (qv *queryView) extractOrderRangeCoverageOverlayReader(field string, preds predicateReader, ov fieldOverlay) (overlayRange, *pooled.Slice[bool], bool) {
+func (qv *queryView) extractOrderRangeCoverageOverlayReader(field string, preds predicateReader, ov fieldOverlay) (overlayRange, []bool, bool) {
 	_, br, covered, ok := qv.extractOrderRangeCoverageOverlayWithBoundsReader(field, preds, ov)
 	return br, covered, ok
 }
@@ -5232,15 +5232,15 @@ func (qv *queryView) execPlanOrderedBasicReader(q *qir.Shape, preds predicateRea
 	}
 	nilTailField := orderNilTailField(fm, orderField, rb)
 	if overlayRangeEmpty(br) && nilTailField == "" {
-		boolSlicePool.Put(rangeCovered)
+		pools.PutBoolSlice(rangeCovered)
 		return nil, true
 	}
-	for i := 0; i < rangeCovered.Len(); i++ {
-		if rangeCovered.Get(i) {
+	for i, is := range rangeCovered {
+		if is {
 			preds.GetPtr(i).covered = true
 		}
 	}
-	boolSlicePool.Put(rangeCovered)
+	pools.PutBoolSlice(rangeCovered)
 
 	if preds.Len() > plannerPredicateFastPathMaxLeaves {
 		activeBuf := pools.GetIntSlice(preds.Len())
@@ -5453,10 +5453,10 @@ func (qv *queryView) scanOrderedBaseSliceWithPredicatesWithNilTail(q *qir.Shape,
 	return cursor.out
 }
 
-func (qv *queryView) collectOrderRangeBounds(field string, n int, exprAt func(i int) qir.Expr) (rangeBounds, *pooled.Slice[bool], bool, bool) {
+func (qv *queryView) collectOrderRangeBounds(field string, n int, exprAt func(i int) qir.Expr) (rangeBounds, []bool, bool, bool) {
 	var rb rangeBounds
-	covered := boolSlicePool.Get()
-	covered.SetLen(n)
+	covered := pools.GetBoolSlice(n)[:n]
+	clear(covered)
 	has := false
 
 	for i := 0; i < n; i++ {
@@ -5465,24 +5465,24 @@ func (qv *queryView) collectOrderRangeBounds(field string, n int, exprAt func(i 
 			continue
 		}
 		if applied, ok := qv.applyScalarExprToRangeBounds(e, &rb); !ok {
-			boolSlicePool.Put(covered)
+			pools.PutBoolSlice(covered)
 			return rangeBounds{}, nil, false, false
 		} else if applied {
-			covered.Set(i, true)
+			covered[i] = true
 			has = true
 		}
 	}
 	if !has {
-		covered.Truncate()
+		covered = covered[:0]
 	}
 
 	return rb, covered, has, true
 }
 
-func (qv *queryView) collectPredicateRangeBoundsReader(field string, preds predicateReader) (rangeBounds, *pooled.Slice[bool], bool, bool) {
+func (qv *queryView) collectPredicateRangeBoundsReader(field string, preds predicateReader) (rangeBounds, []bool, bool, bool) {
 	var rb rangeBounds
-	covered := boolSlicePool.Get()
-	covered.SetLen(preds.Len())
+	covered := pools.GetBoolSlice(preds.Len())[:preds.Len()]
+	clear(covered)
 	has := false
 
 	for i := 0; i < preds.Len(); i++ {
@@ -5492,29 +5492,29 @@ func (qv *queryView) collectPredicateRangeBoundsReader(field string, preds predi
 		}
 		if p.hasEffectiveBounds {
 			mergeRangeBounds(&rb, p.effectiveBounds)
-			covered.Set(i, true)
+			covered[i] = true
 			has = true
 			continue
 		}
 		if applied, ok := qv.applyScalarExprToRangeBounds(p.expr, &rb); !ok {
-			boolSlicePool.Put(covered)
+			pools.PutBoolSlice(covered)
 			return rangeBounds{}, nil, false, false
 		} else if applied {
-			covered.Set(i, true)
+			covered[i] = true
 			has = true
 		}
 	}
 	if !has {
-		covered.Truncate()
+		covered = covered[:0]
 	}
 
 	return rb, covered, has, true
 }
 
-func (qv *queryView) collectPredicateRangeBoundsSet(field string, preds predicateSet) (rangeBounds, *pooled.Slice[bool], bool, bool) {
+func (qv *queryView) collectPredicateRangeBoundsSet(field string, preds predicateSet) (rangeBounds, []bool, bool, bool) {
 	var rb rangeBounds
-	covered := boolSlicePool.Get()
-	covered.SetLen(preds.Len())
+	covered := pools.GetBoolSlice(preds.Len())[:preds.Len()]
+	clear(covered)
 	has := false
 
 	for i := 0; i < preds.Len(); i++ {
@@ -5524,20 +5524,20 @@ func (qv *queryView) collectPredicateRangeBoundsSet(field string, preds predicat
 		}
 		if p.hasEffectiveBounds {
 			mergeRangeBounds(&rb, p.effectiveBounds)
-			covered.Set(i, true)
+			covered[i] = true
 			has = true
 			continue
 		}
 		if applied, ok := qv.applyScalarExprToRangeBounds(p.expr, &rb); !ok {
-			boolSlicePool.Put(covered)
+			pools.PutBoolSlice(covered)
 			return rangeBounds{}, nil, false, false
 		} else if applied {
-			covered.Set(i, true)
+			covered[i] = true
 			has = true
 		}
 	}
 	if !has {
-		covered.Truncate()
+		covered = covered[:0]
 	}
 
 	return rb, covered, has, true

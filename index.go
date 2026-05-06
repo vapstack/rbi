@@ -1164,17 +1164,17 @@ func (db *DB[K, V]) buildIndex(skipFields map[string]struct{}, skipMeasureFields
 		db.engine.lenIndex = fieldIndexStorageSlicePool.Get()
 		db.engine.lenIndex.SetLen(slotCount)
 	}
-	if db.engine.lenZeroComplement == nil || db.engine.lenZeroComplement.Len() != slotCount {
+	if len(db.engine.lenZeroComplement) != slotCount {
 		if db.engine.lenZeroComplement != nil {
-			fieldIndexBoolSlicePool.Put(db.engine.lenZeroComplement)
+			pools.PutBoolSlice(db.engine.lenZeroComplement)
 		}
-		db.engine.lenZeroComplement = fieldIndexBoolSlicePool.Get()
-		db.engine.lenZeroComplement.SetLen(slotCount)
+		db.engine.lenZeroComplement = pools.GetBoolSlice(slotCount)[:slotCount]
+		clear(db.engine.lenZeroComplement)
 	} else if len(skipFields) == 0 {
-		db.engine.lenZeroComplement.Clear()
+		clear(db.engine.lenZeroComplement)
 	} else {
 		for i := range active {
-			db.engine.lenZeroComplement.Set(active[i].acc.ordinal, false)
+			db.engine.lenZeroComplement[active[i].acc.ordinal] = false
 		}
 	}
 	if db.engine.measure == nil || db.engine.measure.Len() != len(db.engine.measureFieldAccess) {
@@ -1219,7 +1219,7 @@ func (db *DB[K, V]) buildIndex(skipFields map[string]struct{}, skipMeasureFields
 				db.engine.lenIndex.Set(ordinal, fieldIndexStorage{})
 			}
 			if useZeroComplement {
-				db.engine.lenZeroComplement.Set(ordinal, true)
+				db.engine.lenZeroComplement[ordinal] = true
 			}
 		}
 	}
@@ -1390,10 +1390,10 @@ func (db *DB[K, V]) buildLenIndex() {
 	db.engine.lenIndex = fieldIndexStorageSlicePool.Get()
 	db.engine.lenIndex.SetLen(len(db.engine.indexedFieldAccess))
 	if db.engine.lenZeroComplement != nil {
-		fieldIndexBoolSlicePool.Put(db.engine.lenZeroComplement)
+		pools.PutBoolSlice(db.engine.lenZeroComplement)
 	}
-	db.engine.lenZeroComplement = fieldIndexBoolSlicePool.Get()
-	db.engine.lenZeroComplement.SetLen(len(db.engine.indexedFieldAccess))
+	db.engine.lenZeroComplement = pools.GetBoolSlice(len(db.engine.indexedFieldAccess))[:len(db.engine.indexedFieldAccess)]
+	clear(db.engine.lenZeroComplement)
 
 	for _, acc := range db.engine.indexedFieldAccess {
 		if !acc.field.Slice {
@@ -1402,7 +1402,7 @@ func (db *DB[K, V]) buildLenIndex() {
 		result, useZeroComplement := rebuildLenIndexField(db.engine.universe, newFieldOverlayStorage(db.engine.index.Get(acc.ordinal)))
 		db.engine.lenIndex.Set(acc.ordinal, newFlatFieldIndexStorage(result))
 		if useZeroComplement {
-			db.engine.lenZeroComplement.Set(acc.ordinal, true)
+			db.engine.lenZeroComplement[acc.ordinal] = true
 		}
 	}
 }
@@ -1412,12 +1412,12 @@ func (db *DB[K, V]) isLenZeroComplementField(field string) bool {
 		return false
 	}
 	acc, ok := db.engine.indexedFieldMap[field]
-	if !ok || db.engine.lenZeroComplement == nil || acc.ordinal >= db.engine.lenZeroComplement.Len() {
+	if !ok || acc.ordinal >= len(db.engine.lenZeroComplement) {
 		return false
 	}
 	db.mu.RLock()
 	defer db.mu.RUnlock()
-	return db.engine.lenZeroComplement.Get(acc.ordinal)
+	return db.engine.lenZeroComplement[acc.ordinal]
 }
 
 const (
@@ -1585,7 +1585,7 @@ func (db *DB[K, V]) loadIndexPayload(
 	releaseFieldIndexStorageSlotsOwned(db.engine.lenIndex)
 	releaseMeasureFieldStorageSlotsOwned(db.engine.measure)
 	if db.engine.lenZeroComplement != nil {
-		fieldIndexBoolSlicePool.Put(db.engine.lenZeroComplement)
+		pools.PutBoolSlice(db.engine.lenZeroComplement)
 	}
 	db.engine.index = fieldIndexStorageSlicePool.Get()
 	db.engine.index.SetLen(len(db.engine.indexedFieldAccess))
@@ -1652,9 +1652,9 @@ func (db *DB[K, V]) loadIndexPayload(
 	return skipFields, skipMeasureFields, plannerStats, lenLoaded, nil
 }
 
-func detectLenZeroComplement(indexes *pooled.Slice[fieldIndexStorage], access []indexedFieldAccessor) *pooled.Slice[bool] {
-	out := fieldIndexBoolSlicePool.Get()
-	out.SetLen(len(access))
+func detectLenZeroComplement(indexes *pooled.Slice[fieldIndexStorage], access []indexedFieldAccessor) []bool {
+	out := pools.GetBoolSlice(len(access))[:len(access)]
+	clear(out)
 	if indexes == nil {
 		return out
 	}
@@ -1668,7 +1668,7 @@ func detectLenZeroComplement(indexes *pooled.Slice[fieldIndexStorage], access []
 		}
 		for _, ix := range *slice {
 			if indexKeyEqualsString(ix.Key, lenIndexNonEmptyKey) {
-				out.Set(acc.ordinal, true)
+				out[acc.ordinal] = true
 				break
 			}
 		}

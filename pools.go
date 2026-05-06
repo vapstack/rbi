@@ -14,7 +14,6 @@ const (
 	uint64IntMapPoolMaxLen                  = 16 << 10
 	u64SetPoolMaxCap                        = 16 << 10
 	exprSlicePoolMaxCap                     = 256
-	boolSlicePoolMaxCap                     = 256
 	postingSlicePoolMaxCap                  = 4 << 10
 	postingMapPoolMaxLen                    = 4 << 10
 	batchPostingDeltaMapPoolMaxLen          = 4 << 10
@@ -38,14 +37,6 @@ const (
 var exprSlicePool = pooled.Slices[qir.Expr]{
 	MinCap: 8,
 	MaxCap: exprSlicePoolMaxCap,
-	Clear:  true,
-}
-
-/**/
-
-var boolSlicePool = pooled.Slices[bool]{
-	MinCap: 8,
-	MaxCap: boolSlicePoolMaxCap,
 	Clear:  true,
 }
 

@@ -4,7 +4,6 @@ import (
 	"math"
 	"reflect"
 
-	"github.com/vapstack/rbi/internal/pooled"
 	"github.com/vapstack/rbi/internal/posting"
 	"github.com/vapstack/rbi/internal/qir"
 )
@@ -42,7 +41,7 @@ type queryView struct {
 	strMapView        *strMapSnapshot
 	fields            map[string]*field
 	planner           *planner
-	lenZeroComplement *pooled.Slice[bool]
+	lenZeroComplement []bool
 
 	normalizedScalarBoundCacheLen uint8
 	normalizedScalarBoundCache    [normalizedScalarBoundCacheMaxEntries]normalizedScalarBoundCacheEntry
@@ -446,10 +445,10 @@ func (qv *queryView) hasIndexedLenField(field string) bool {
 
 func (qv *queryView) isLenZeroComplementOrdinal(ordinal int) bool {
 	acc, ok := qv.indexedFieldAccessorByOrdinal(ordinal)
-	if !ok || qv.lenZeroComplement == nil || acc.ordinal >= qv.lenZeroComplement.Len() {
+	if !ok || acc.ordinal >= len(qv.lenZeroComplement) {
 		return false
 	}
-	return qv.lenZeroComplement.Get(acc.ordinal)
+	return qv.lenZeroComplement[acc.ordinal]
 }
 
 func (qv *queryView) isLenZeroComplementRef(field string, ordinal int) bool {

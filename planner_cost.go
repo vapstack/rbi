@@ -4,6 +4,7 @@ import (
 	"math"
 
 	"github.com/vapstack/rbi/internal/pooled"
+	"github.com/vapstack/rbi/internal/pools"
 	"github.com/vapstack/rbi/internal/qir"
 )
 
@@ -43,7 +44,7 @@ type plannerOROrderBranchAnalysis struct {
 	rangeStart int
 	rangeEnd   int
 	universe   uint64
-	covered    *pooled.Slice[bool]
+	covered    []bool
 	predBuild  *pooled.Slice[orderedORMaterializedPredicateBuildInfo]
 	buildReady bool
 }
@@ -68,7 +69,7 @@ func (a *plannerOROrderAnalysis) release() {
 	}
 	for i := 0; i < n; i++ {
 		if a.branches[i].covered != nil {
-			boolSlicePool.Put(a.branches[i].covered)
+			pools.PutBoolSlice(a.branches[i].covered)
 		}
 		if a.branches[i].predBuild != nil {
 			plannerORPredicateBuildInfoSlicePool.Put(a.branches[i].predBuild)
@@ -84,13 +85,13 @@ func (a *plannerOROrderAnalysis) applyCovered(branches plannerORBranches) {
 	n := min(a.branchCount, branches.Len())
 	for i := 0; i < n; i++ {
 		covered := a.branches[i].covered
-		if covered == nil || covered.Len() == 0 {
+		if len(covered) == 0 {
 			continue
 		}
 		branch := branches.GetPtr(i)
-		limit := min(covered.Len(), branch.predLen())
+		limit := min(len(covered), branch.predLen())
 		for pi := 0; pi < limit; pi++ {
-			if covered.Get(pi) {
+			if covered[pi] {
 				branch.predPtr(pi).covered = true
 			}
 		}
@@ -128,7 +129,7 @@ func (a *plannerOROrderAnalysis) refreshBranch(branches plannerORBranches, branc
 		if p.covered || p.alwaysTrue {
 			continue
 		}
-		if covered != nil && pi < covered.Len() && covered.Get(pi) {
+		if len(covered) != 0 && covered[pi] {
 			continue
 		}
 		allTrue = false
@@ -213,7 +214,7 @@ func (qv *queryView) buildOROrderAnalysis(q *qir.Shape, branches plannerORBranch
 		analysis.branches[i].covered = covered
 		analysis.branches[i].rangeStart = br.baseStart
 		analysis.branches[i].rangeEnd = br.baseEnd
-		if covered.Len() == 0 {
+		if len(covered) == 0 {
 			analysis.mergeStats[i].streamChecks, analysis.mergeStats[i].mergeChecks = plannerORBranchCheckCounts(*branch, nil)
 		} else {
 			analysis.mergeStats[i].streamChecks, analysis.mergeStats[i].mergeChecks = plannerORBranchCheckCounts(*branch, covered)
@@ -2106,7 +2107,7 @@ func (qv *queryView) estimateOrderedProfile(orderField string, leaves []qir.Expr
 	if !ok {
 		return plannerOrderedProfile{}, false
 	}
-	defer boolSlicePool.Put(coveredBuf)
+	defer pools.PutBoolSlice(coveredBuf)
 
 	coverage := 1.0
 	if len(orderSlice) > 0 {
@@ -2177,7 +2178,7 @@ func (qv *queryView) estimateOrderedProfile(orderField string, leaves []qir.Expr
 		if e.Op == qir.OpNOOP && !e.Not {
 			continue
 		}
-		if coveredBuf.Get(i) {
+		if coveredBuf[i] {
 			continue
 		}
 		activeChecks++
@@ -2257,7 +2258,7 @@ func (qv *queryView) estimateOrderedProfileBuf(orderField string, leaves *pooled
 	if !ok {
 		return plannerOrderedProfile{}, false
 	}
-	defer boolSlicePool.Put(coveredBuf)
+	defer pools.PutBoolSlice(coveredBuf)
 
 	coverage := 1.0
 	if len(orderSlice) > 0 {
@@ -2329,7 +2330,7 @@ func (qv *queryView) estimateOrderedProfileBuf(orderField string, leaves *pooled
 		if e.Op == qir.OpNOOP && !e.Not {
 			continue
 		}
-		if coveredBuf.Get(i) {
+		if coveredBuf[i] {
 			continue
 		}
 		activeChecks++
@@ -2407,7 +2408,7 @@ func (qv *queryView) estimateOrderedProfileOverlay(orderField string, leaves []q
 	if !ok {
 		return plannerOrderedProfile{}, false
 	}
-	defer boolSlicePool.Put(coveredBuf)
+	defer pools.PutBoolSlice(coveredBuf)
 
 	coverage := 1.0
 	if totalBuckets > 0 {
@@ -2478,7 +2479,7 @@ func (qv *queryView) estimateOrderedProfileOverlay(orderField string, leaves []q
 		if e.Op == qir.OpNOOP && !e.Not {
 			continue
 		}
-		if coveredBuf.Get(i) {
+		if coveredBuf[i] {
 			continue
 		}
 		activeChecks++
@@ -2556,7 +2557,7 @@ func (qv *queryView) estimateOrderedProfileOverlayBuf(orderField string, leaves 
 	if !ok {
 		return plannerOrderedProfile{}, false
 	}
-	defer boolSlicePool.Put(coveredBuf)
+	defer pools.PutBoolSlice(coveredBuf)
 
 	coverage := 1.0
 	if totalBuckets > 0 {
@@ -2628,7 +2629,7 @@ func (qv *queryView) estimateOrderedProfileOverlayBuf(orderField string, leaves 
 		if e.Op == qir.OpNOOP && !e.Not {
 			continue
 		}
-		if coveredBuf.Get(i) {
+		if coveredBuf[i] {
 			continue
 		}
 		activeChecks++
@@ -2697,10 +2698,10 @@ func (qv *queryView) estimateOrderedProfileOverlayBuf(orderField string, leaves 
 	}, true
 }
 
-func (qv *queryView) extractOrderRangeCoverageLeaves(orderField string, leaves []qir.Expr, orderSlice []index) (int, int, *pooled.Slice[bool], bool) {
+func (qv *queryView) extractOrderRangeCoverageLeaves(orderField string, leaves []qir.Expr, orderSlice []index) (int, int, []bool, bool) {
 	rb := rangeBounds{}
-	coveredBuf := boolSlicePool.Get()
-	coveredBuf.SetLen(len(leaves))
+	coveredBuf := pools.GetBoolSlice(len(leaves))[:len(leaves)]
+	clear(coveredBuf)
 
 	has := false
 	for i := range leaves {
@@ -2709,10 +2710,10 @@ func (qv *queryView) extractOrderRangeCoverageLeaves(orderField string, leaves [
 			continue
 		}
 		if applied, ok := qv.applyScalarExprToRangeBounds(e, &rb); !ok {
-			boolSlicePool.Put(coveredBuf)
+			pools.PutBoolSlice(coveredBuf)
 			return 0, 0, nil, false
 		} else if applied {
-			coveredBuf.Set(i, true)
+			coveredBuf[i] = true
 			has = true
 		}
 	}
@@ -2725,10 +2726,10 @@ func (qv *queryView) extractOrderRangeCoverageLeaves(orderField string, leaves [
 	return st, en, coveredBuf, true
 }
 
-func (qv *queryView) extractOrderRangeCoverageLeavesBuf(orderField string, leaves *pooled.Slice[qir.Expr], orderSlice []index) (int, int, *pooled.Slice[bool], bool) {
+func (qv *queryView) extractOrderRangeCoverageLeavesBuf(orderField string, leaves *pooled.Slice[qir.Expr], orderSlice []index) (int, int, []bool, bool) {
 	rb := rangeBounds{}
-	coveredBuf := boolSlicePool.Get()
-	coveredBuf.SetLen(leaves.Len())
+	coveredBuf := pools.GetBoolSlice(leaves.Len())[:leaves.Len()]
+	clear(coveredBuf)
 
 	has := false
 	for i := 0; i < leaves.Len(); i++ {
@@ -2737,10 +2738,10 @@ func (qv *queryView) extractOrderRangeCoverageLeavesBuf(orderField string, leave
 			continue
 		}
 		if applied, ok := qv.applyScalarExprToRangeBounds(e, &rb); !ok {
-			boolSlicePool.Put(coveredBuf)
+			pools.PutBoolSlice(coveredBuf)
 			return 0, 0, nil, false
 		} else if applied {
-			coveredBuf.Set(i, true)
+			coveredBuf[i] = true
 			has = true
 		}
 	}
@@ -2753,10 +2754,10 @@ func (qv *queryView) extractOrderRangeCoverageLeavesBuf(orderField string, leave
 	return st, en, coveredBuf, true
 }
 
-func (qv *queryView) extractOrderRangeCoverageLeavesOverlay(orderField string, leaves []qir.Expr, ov fieldOverlay) (int, int, *pooled.Slice[bool], bool) {
+func (qv *queryView) extractOrderRangeCoverageLeavesOverlay(orderField string, leaves []qir.Expr, ov fieldOverlay) (int, int, []bool, bool) {
 	rb := rangeBounds{}
-	coveredBuf := boolSlicePool.Get()
-	coveredBuf.SetLen(len(leaves))
+	coveredBuf := pools.GetBoolSlice(len(leaves))[:len(leaves)]
+	clear(coveredBuf)
 
 	has := false
 	for i := range leaves {
@@ -2765,10 +2766,10 @@ func (qv *queryView) extractOrderRangeCoverageLeavesOverlay(orderField string, l
 			continue
 		}
 		if applied, ok := qv.applyScalarExprToRangeBounds(e, &rb); !ok {
-			boolSlicePool.Put(coveredBuf)
+			pools.PutBoolSlice(coveredBuf)
 			return 0, 0, nil, false
 		} else if applied {
-			coveredBuf.Set(i, true)
+			coveredBuf[i] = true
 			has = true
 		}
 	}
@@ -2793,10 +2794,10 @@ func (qv *queryView) extractOrderRangeCoverageLeavesOverlay(orderField string, l
 	return in, total, coveredBuf, true
 }
 
-func (qv *queryView) extractOrderRangeCoverageLeavesOverlayBuf(orderField string, leaves *pooled.Slice[qir.Expr], ov fieldOverlay) (int, int, *pooled.Slice[bool], bool) {
+func (qv *queryView) extractOrderRangeCoverageLeavesOverlayBuf(orderField string, leaves *pooled.Slice[qir.Expr], ov fieldOverlay) (int, int, []bool, bool) {
 	rb := rangeBounds{}
-	coveredBuf := boolSlicePool.Get()
-	coveredBuf.SetLen(leaves.Len())
+	coveredBuf := pools.GetBoolSlice(leaves.Len())[:leaves.Len()]
+	clear(coveredBuf)
 
 	has := false
 	for i := 0; i < leaves.Len(); i++ {
@@ -2805,10 +2806,10 @@ func (qv *queryView) extractOrderRangeCoverageLeavesOverlayBuf(orderField string
 			continue
 		}
 		if applied, ok := qv.applyScalarExprToRangeBounds(e, &rb); !ok {
-			boolSlicePool.Put(coveredBuf)
+			pools.PutBoolSlice(coveredBuf)
 			return 0, 0, nil, false
 		} else if applied {
-			coveredBuf.Set(i, true)
+			coveredBuf[i] = true
 			has = true
 		}
 	}

@@ -16,6 +16,7 @@ import (
 	"unsafe"
 
 	"github.com/vapstack/rbi/internal/pooled"
+	"github.com/vapstack/rbi/internal/pools"
 	"github.com/vapstack/rbi/internal/posting"
 	"go.etcd.io/bbolt"
 )
@@ -452,8 +453,8 @@ func New[K ~uint64 | ~string, V any](bolt *bbolt.DB, options Options, execOpts .
 		db.engine.nilIndex.SetLen(len(db.engine.indexedFieldAccess))
 		db.engine.lenIndex = fieldIndexStorageSlicePool.Get()
 		db.engine.lenIndex.SetLen(len(db.engine.indexedFieldAccess))
-		db.engine.lenZeroComplement = fieldIndexBoolSlicePool.Get()
-		db.engine.lenZeroComplement.SetLen(len(db.engine.indexedFieldAccess))
+		db.engine.lenZeroComplement = pools.GetBoolSlice(len(db.engine.indexedFieldAccess))[:len(db.engine.indexedFieldAccess)]
+		clear(db.engine.lenZeroComplement)
 		db.engine.measure = measureFieldStorageSlicePool.Get()
 		db.engine.measure.SetLen(len(db.engine.measureFieldAccess))
 	}
@@ -1899,8 +1900,8 @@ func (db *DB[K, V]) Truncate() error {
 	nextNilIndex.SetLen(len(db.engine.indexedFieldAccess))
 	nextLenIndex := fieldIndexStorageSlicePool.Get()
 	nextLenIndex.SetLen(len(db.engine.indexedFieldAccess))
-	nextLenZeroComplement := fieldIndexBoolSlicePool.Get()
-	nextLenZeroComplement.SetLen(len(db.engine.indexedFieldAccess))
+	nextLenZeroComplement := pools.GetBoolSlice(len(db.engine.indexedFieldAccess))[:len(db.engine.indexedFieldAccess)]
+	clear(nextLenZeroComplement)
 	nextMeasure := measureFieldStorageSlicePool.Get()
 	nextMeasure.SetLen(len(db.engine.measureFieldAccess))
 	nextUniverse := posting.List{}

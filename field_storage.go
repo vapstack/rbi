@@ -242,10 +242,6 @@ var fieldIndexStorageSlicePool = pooled.Slices[fieldIndexStorage]{
 	Clear: true,
 }
 
-var fieldIndexBoolSlicePool = pooled.Slices[bool]{
-	Clear: true,
-}
-
 var fieldIndexChunkDirPagePool = pooled.Pointers[fieldIndexChunkDirPage]{Clear: true}
 
 func newFieldIndexChunkRefBuf(capHint int) *pooled.Slice[fieldIndexChunkRef] {

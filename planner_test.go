@@ -2306,9 +2306,8 @@ func TestPlannerORBranchCheckCounts_LargeImpossibleBranchWithZeroLenCoveredRetur
 	}
 	defer preds.Release()
 
-	covered := boolSlicePool.Get()
-	defer boolSlicePool.Put(covered)
-	covered.Truncate()
+	covered := pools.GetBoolSlice(0)
+	defer pools.PutBoolSlice(covered)
 
 	streamChecks, mergeChecks := plannerORBranchCheckCounts(
 		plannerORBranch{preds: preds, leadIdx: -1},
@@ -2590,8 +2589,8 @@ func TestBuildOROrderAnalysis_NonRangeOrderPredicateKeepsOrderedPath(t *testing.
 			orderOV.keyCount(),
 		)
 	}
-	if covered := analysis.branches[0].covered; covered != nil && covered.Len() != 0 {
-		t.Fatalf("expected non-range order predicate branch to keep zero covered leaves, got=%d", covered.Len())
+	if covered := analysis.branches[0].covered; covered != nil && len(covered) != 0 {
+		t.Fatalf("expected non-range order predicate branch to keep zero covered leaves, got=%d", len(covered))
 	}
 
 	gotBasic, ok := view.execPlanOROrderBasic(&viewQ, branchesBasic, &analysis, nil, nil)

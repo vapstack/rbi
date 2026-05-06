@@ -2209,11 +2209,11 @@ func (qv *queryView) tryQueryOrderBasicWithLimit(q *qir.Shape, trace *queryTrace
 		residualOpsBuf := exprSlicePool.Get()
 		residualOpsBuf.Grow(len(baseOps))
 		defer exprSlicePool.Put(residualOpsBuf)
-		var loadedCoreBuf *pooled.Slice[bool]
+		var loadedCoreBuf []bool
 		if baseCoresBuf != nil && baseCoresBuf.Len() > 0 {
-			loadedCoreBuf = boolSlicePool.Get()
-			loadedCoreBuf.SetLen(baseCoresBuf.Len())
-			defer boolSlicePool.Put(loadedCoreBuf)
+			loadedCoreBuf = pools.GetBoolSlice(baseCoresBuf.Len())[:baseCoresBuf.Len()]
+			clear(loadedCoreBuf)
+			defer pools.PutBoolSlice(loadedCoreBuf)
 		}
 
 		baseBuilt := false
@@ -2222,7 +2222,7 @@ func (qv *queryView) tryQueryOrderBasicWithLimit(q *qir.Shape, trace *queryTrace
 			if !ok {
 				continue
 			}
-			loadedCoreBuf.Set(i, true)
+			loadedCoreBuf[i] = true
 			if !baseBuilt {
 				base = b
 				baseBuilt = true
@@ -2236,7 +2236,7 @@ func (qv *queryView) tryQueryOrderBasicWithLimit(q *qir.Shape, trace *queryTrace
 			}
 		}
 		for i, op := range baseOps {
-			if loadedCoreBuf.Get(baseRawCoreIdxBuf[i]) {
+			if loadedCoreBuf[baseRawCoreIdxBuf[i]] {
 				continue
 			}
 			residualOpsBuf.Append(op)

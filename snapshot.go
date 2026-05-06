@@ -8,6 +8,7 @@ import (
 	"unsafe"
 
 	"github.com/vapstack/rbi/internal/pooled"
+	"github.com/vapstack/rbi/internal/pools"
 	"github.com/vapstack/rbi/internal/posting"
 )
 
@@ -18,7 +19,7 @@ type indexSnapshot struct {
 	index              *pooled.Slice[fieldIndexStorage]
 	nilIndex           *pooled.Slice[fieldIndexStorage]
 	lenIndex           *pooled.Slice[fieldIndexStorage]
-	lenZeroComplement  *pooled.Slice[bool]
+	lenZeroComplement  []bool
 	measure            *pooled.Slice[measureFieldStorage]
 	indexedFieldByName map[string]indexedFieldAccessor
 	universe           posting.List
@@ -619,7 +620,7 @@ func inheritNumericRangeBucketCache(next, prev *indexSnapshot) {
 	}
 }
 
-func inheritMaterializedPredCache(next, prev *indexSnapshot, indexedFieldMap indexedFieldMap, changedFields *pooled.Slice[bool]) {
+func inheritMaterializedPredCache(next, prev *indexSnapshot, indexedFieldMap indexedFieldMap, changedFields []bool) {
 	if next == nil || prev == nil {
 		return
 	}
@@ -647,7 +648,7 @@ func inheritMaterializedPredCache(next, prev *indexSnapshot, indexedFieldMap ind
 		}
 		if changedFields != nil {
 			acc, ok := indexedFieldMap[f]
-			if !ok || changedFields.Get(acc.ordinal) {
+			if !ok || changedFields[acc.ordinal] {
 				continue
 			}
 		}
@@ -1544,8 +1545,8 @@ func (db *DB[K, V]) buildPreparedSnapshotFromEmptyBaseNoLock(seq uint64, prev *i
 
 	nextLenIndex := fieldIndexStorageSlicePool.Get()
 	nextLenIndex.SetLen(len(db.engine.indexedFieldAccess))
-	nextLenZeroComplement := fieldIndexBoolSlicePool.Get()
-	nextLenZeroComplement.SetLen(len(db.engine.indexedFieldAccess))
+	nextLenZeroComplement := pools.GetBoolSlice(len(db.engine.indexedFieldAccess))[:len(db.engine.indexedFieldAccess)]
+	clear(nextLenZeroComplement)
 	for i, acc := range db.engine.indexedFieldAccess {
 		if !acc.field.Slice {
 			continue
@@ -1555,7 +1556,7 @@ func (db *DB[K, V]) buildPreparedSnapshotFromEmptyBaseNoLock(seq uint64, prev *i
 		storage, useZeroComplement := materializeLenFieldStorageOwned(universe, lengths)
 		nextLenIndex.Set(i, storage)
 		if useZeroComplement {
-			nextLenZeroComplement.Set(i, true)
+			nextLenZeroComplement[i] = true
 		}
 	}
 	nextMeasure := measureFieldStorageSlicePool.Get()
@@ -1590,15 +1591,15 @@ func (db *DB[K, V]) buildPreparedSnapshotFromEmptyBaseNoLock(seq uint64, prev *i
 		}
 	}
 	if changedCount > 0 {
-		changed := fieldIndexBoolSlicePool.Get()
-		changed.SetLen(len(db.engine.indexedFieldAccess))
+		changed := pools.GetBoolSlice(len(db.engine.indexedFieldAccess))[:len(db.engine.indexedFieldAccess)]
+		clear(changed)
 		for i := range fieldStates {
 			if fieldStates[i].changed {
-				changed.Set(i, true)
+				changed[i] = true
 			}
 		}
 		inheritMaterializedPredCache(snap, prev, db.engine.indexedFieldMap, changed)
-		fieldIndexBoolSlicePool.Put(changed)
+		pools.PutBoolSlice(changed)
 	} else {
 		inheritMaterializedPredCache(snap, prev, db.engine.indexedFieldMap, nil)
 	}
@@ -1784,7 +1785,7 @@ func (db *DB[K, V]) buildPreparedSnapshotInsertOnlyNoLock(seq uint64, prev *inde
 		ptr := unsafe.Pointer(op.newVal)
 
 		for _, acc := range db.engine.indexedFieldAccess {
-			useZeroComplement := prev.lenZeroComplement != nil && acc.ordinal < prev.lenZeroComplement.Len() && prev.lenZeroComplement.Get(acc.ordinal)
+			useZeroComplement := acc.ordinal < len(prev.lenZeroComplement) && prev.lenZeroComplement[acc.ordinal]
 			acc.collectSnapshotInsertValue(ptr, op.idx, useZeroComplement, fieldStates.GetPtr(acc.ordinal))
 		}
 		for _, acc := range db.engine.measureFieldAccess {
@@ -1830,15 +1831,15 @@ func (db *DB[K, V]) buildPreparedSnapshotInsertOnlyNoLock(seq uint64, prev *inde
 	inheritNumericRangeBucketCache(next, prev)
 
 	if changedCount > 0 {
-		changed := fieldIndexBoolSlicePool.Get()
-		changed.SetLen(len(db.engine.indexedFieldAccess))
+		changed := pools.GetBoolSlice(len(db.engine.indexedFieldAccess))[:len(db.engine.indexedFieldAccess)]
+		clear(changed)
 		for i := 0; i < fieldStates.Len(); i++ {
 			if fieldStates.Get(i).changed {
-				changed.Set(i, true)
+				changed[i] = true
 			}
 		}
 		inheritMaterializedPredCache(next, prev, db.engine.indexedFieldMap, changed)
-		fieldIndexBoolSlicePool.Put(changed)
+		pools.PutBoolSlice(changed)
 	} else {
 		inheritMaterializedPredCache(next, prev, db.engine.indexedFieldMap, nil)
 	}
@@ -1920,7 +1921,7 @@ func (s *indexSnapshot) releaseOwnedStorage() {
 	releaseFieldIndexStorageSlotsOwned(s.lenIndex)
 	releaseMeasureFieldStorageSlotsOwned(s.measure)
 	if s.lenZeroComplement != nil {
-		fieldIndexBoolSlicePool.Put(s.lenZeroComplement)
+		pools.PutBoolSlice(s.lenZeroComplement)
 	}
 	s.index = nil
 	s.nilIndex = nil
