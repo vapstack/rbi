@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/vapstack/rbi/internal/pooled"
+	"github.com/vapstack/rbi/internal/pools"
 	"github.com/vapstack/rbi/internal/posting"
 	"github.com/vapstack/rbi/internal/qir"
 )
@@ -534,67 +535,67 @@ func (b *plannerORBranch) matchesChecksObservedBuf(idx uint64, branch int, check
 		return true
 	case 1:
 		if observed != nil && observed.candidatesBuf.Get(offset) {
-			observed.countsBuf.Set(offset, observed.countsBuf.Get(offset)+1)
+			observed.countsBuf[offset]++
 		}
 		p0 := b.predPtr(checks.Get(0))
 		return !p0.alwaysFalse && p0.hasContains() && p0.matches(idx)
 	case 2:
 		if observed != nil && observed.candidatesBuf.Get(offset) {
-			observed.countsBuf.Set(offset, observed.countsBuf.Get(offset)+1)
+			observed.countsBuf[offset]++
 		}
 		p0 := b.predPtr(checks.Get(0))
 		if p0.alwaysFalse || !p0.hasContains() || !p0.matches(idx) {
 			return false
 		}
 		if observed != nil && observed.candidatesBuf.Get(offset+1) {
-			observed.countsBuf.Set(offset+1, observed.countsBuf.Get(offset+1)+1)
+			observed.countsBuf[offset+1]++
 		}
 		p1 := b.predPtr(checks.Get(1))
 		return !p1.alwaysFalse && p1.hasContains() && p1.matches(idx)
 	case 3:
 		if observed != nil && observed.candidatesBuf.Get(offset) {
-			observed.countsBuf.Set(offset, observed.countsBuf.Get(offset)+1)
+			observed.countsBuf[offset]++
 		}
 		p0 := b.predPtr(checks.Get(0))
 		if p0.alwaysFalse || !p0.hasContains() || !p0.matches(idx) {
 			return false
 		}
 		if observed != nil && observed.candidatesBuf.Get(offset+1) {
-			observed.countsBuf.Set(offset+1, observed.countsBuf.Get(offset+1)+1)
+			observed.countsBuf[offset+1]++
 		}
 		p1 := b.predPtr(checks.Get(1))
 		if p1.alwaysFalse || !p1.hasContains() || !p1.matches(idx) {
 			return false
 		}
 		if observed != nil && observed.candidatesBuf.Get(offset+2) {
-			observed.countsBuf.Set(offset+2, observed.countsBuf.Get(offset+2)+1)
+			observed.countsBuf[offset+2]++
 		}
 		p2 := b.predPtr(checks.Get(2))
 		return !p2.alwaysFalse && p2.hasContains() && p2.matches(idx)
 	case 4:
 		if observed != nil && observed.candidatesBuf.Get(offset) {
-			observed.countsBuf.Set(offset, observed.countsBuf.Get(offset)+1)
+			observed.countsBuf[offset]++
 		}
 		p0 := b.predPtr(checks.Get(0))
 		if p0.alwaysFalse || !p0.hasContains() || !p0.matches(idx) {
 			return false
 		}
 		if observed != nil && observed.candidatesBuf.Get(offset+1) {
-			observed.countsBuf.Set(offset+1, observed.countsBuf.Get(offset+1)+1)
+			observed.countsBuf[offset+1]++
 		}
 		p1 := b.predPtr(checks.Get(1))
 		if p1.alwaysFalse || !p1.hasContains() || !p1.matches(idx) {
 			return false
 		}
 		if observed != nil && observed.candidatesBuf.Get(offset+2) {
-			observed.countsBuf.Set(offset+2, observed.countsBuf.Get(offset+2)+1)
+			observed.countsBuf[offset+2]++
 		}
 		p2 := b.predPtr(checks.Get(2))
 		if p2.alwaysFalse || !p2.hasContains() || !p2.matches(idx) {
 			return false
 		}
 		if observed != nil && observed.candidatesBuf.Get(offset+3) {
-			observed.countsBuf.Set(offset+3, observed.countsBuf.Get(offset+3)+1)
+			observed.countsBuf[offset+3]++
 		}
 		p3 := b.predPtr(checks.Get(3))
 		return !p3.alwaysFalse && p3.hasContains() && p3.matches(idx)
@@ -602,7 +603,7 @@ func (b *plannerORBranch) matchesChecksObservedBuf(idx uint64, branch int, check
 	for ci := 0; ci < checks.Len(); ci++ {
 		if observed != nil && observed.candidatesBuf.Get(offset+ci) {
 			slot := offset + ci
-			observed.countsBuf.Set(slot, observed.countsBuf.Get(slot)+1)
+			observed.countsBuf[slot]++
 		}
 		i := checks.Get(ci)
 		p := b.predPtr(i)
@@ -1845,7 +1846,7 @@ func (qv *queryView) tryPlanORMergeMode(q *qir.Shape, trace *queryTrace) ([]uint
 }
 
 type orderedORObservedStats struct {
-	countsBuf     *pooled.Slice[uint64]
+	countsBuf     []uint64
 	candidatesBuf *pooled.Slice[bool]
 	offsets       [plannerORBranchLimit + 1]int
 	active        bool
@@ -1897,9 +1898,8 @@ func initOrderedORObservedStats(
 		observed.active = false
 		return
 	}
-	observed.countsBuf = uint64SlicePool.Get()
-	observed.countsBuf.SetLen(total)
-	observed.countsBuf.Clear()
+	observed.countsBuf = pools.GetUint64Slice(total)[:total]
+	clear(observed.countsBuf)
 
 	observed.candidatesBuf = boolSlicePool.Get()
 	observed.candidatesBuf.SetLen(total)
@@ -1925,7 +1925,7 @@ func (s *orderedORObservedStats) branchRange(branch int) (int, int, bool) {
 	}
 	start := s.offsets[branch]
 	end := s.offsets[branch+1]
-	if start >= end || s.countsBuf == nil || end > s.countsBuf.Len() {
+	if start >= end || s.countsBuf == nil || end > len(s.countsBuf) {
 		return 0, 0, false
 	}
 	return start, end, true
@@ -1936,7 +1936,7 @@ func (s *orderedORObservedStats) release() {
 		return
 	}
 	if s.countsBuf != nil {
-		uint64SlicePool.Put(s.countsBuf)
+		pools.PutUint64Slice(s.countsBuf)
 	}
 	if s.candidatesBuf != nil {
 		boolSlicePool.Put(s.candidatesBuf)
@@ -3034,13 +3034,11 @@ func (qv *queryView) promoteOrderedORMaterializedBaseOps(
 	repPredBuf.Grow(branches.Len() * 4)
 	defer predicateCheckSlicePool.Put(repPredBuf)
 
-	buildWorksBuf := uint64SlicePool.Get()
-	buildWorksBuf.Grow(branches.Len() * 4)
-	defer uint64SlicePool.Put(buildWorksBuf)
+	buildWorksBuf := pools.GetUint64Slice(branches.Len() * 4)
+	defer func() { pools.PutUint64Slice(buildWorksBuf) }()
 
-	observedWorksBuf := uint64SlicePool.Get()
-	observedWorksBuf.Grow(branches.Len() * 4)
-	defer uint64SlicePool.Put(observedWorksBuf)
+	observedWorksBuf := pools.GetUint64Slice(branches.Len() * 4)
+	defer func() { pools.PutUint64Slice(observedWorksBuf) }()
 
 	for bi := 0; bi < branches.Len(); bi++ {
 		branch := branches.Get(bi)
@@ -3058,7 +3056,7 @@ func (qv *queryView) promoteOrderedORMaterializedBaseOps(
 			if start+ci >= end || !observed.candidatesBuf.Get(start+ci) {
 				continue
 			}
-			leafChecks := observed.countsBuf.Get(start + ci)
+			leafChecks := observed.countsBuf[start+ci]
 			if leafChecks == 0 {
 				continue
 			}
@@ -3070,9 +3068,9 @@ func (qv *queryView) promoteOrderedORMaterializedBaseOps(
 			for slot := 0; slot < cacheKeysBuf.Len(); slot++ {
 				if cacheKeysBuf.Get(slot) == info.cacheKey {
 					if info.isPrefix {
-						observedWorksBuf.Set(slot, satAddUint64(observedWorksBuf.Get(slot), leafChecks))
+						observedWorksBuf[slot] = satAddUint64(observedWorksBuf[slot], leafChecks)
 					} else if info.checkWork > info.cachedCheckWork {
-						observedWorksBuf.Set(slot, satAddUint64(observedWorksBuf.Get(slot), satMulUint64(leafChecks, info.checkWork-info.cachedCheckWork)))
+						observedWorksBuf[slot] = satAddUint64(observedWorksBuf[slot], satMulUint64(leafChecks, info.checkWork-info.cachedCheckWork))
 					}
 					found = true
 					break
@@ -3084,13 +3082,13 @@ func (qv *queryView) promoteOrderedORMaterializedBaseOps(
 			cacheKeysBuf.Append(info.cacheKey)
 			repBranchBuf.Append(bi)
 			repPredBuf.Append(pi)
-			buildWorksBuf.Append(info.buildWork)
+			buildWorksBuf = append(buildWorksBuf, info.buildWork)
 			if info.isPrefix {
-				observedWorksBuf.Append(leafChecks)
+				observedWorksBuf = append(observedWorksBuf, leafChecks)
 			} else if info.checkWork > info.cachedCheckWork {
-				observedWorksBuf.Append(satMulUint64(leafChecks, info.checkWork-info.cachedCheckWork))
+				observedWorksBuf = append(observedWorksBuf, satMulUint64(leafChecks, info.checkWork-info.cachedCheckWork))
 			} else {
-				observedWorksBuf.Append(0)
+				observedWorksBuf = append(observedWorksBuf, 0)
 			}
 		}
 	}
@@ -3098,13 +3096,13 @@ func (qv *queryView) promoteOrderedORMaterializedBaseOps(
 		return
 	}
 	for i := 0; i < cacheKeysBuf.Len(); i++ {
-		if observedWorksBuf.Get(i) == 0 {
+		if observedWorksBuf[i] == 0 {
 			continue
 		}
 		if _, ok := qv.snap.loadMaterializedPredKey(cacheKeysBuf.Get(i)); ok {
 			continue
 		}
-		if !qv.snap.shouldPromoteObservedOrderedORMaterializedPredKey(cacheKeysBuf.Get(i), observedWorksBuf.Get(i), buildWorksBuf.Get(i)) {
+		if !qv.snap.shouldPromoteObservedOrderedORMaterializedPredKey(cacheKeysBuf.Get(i), observedWorksBuf[i], buildWorksBuf[i]) {
 			continue
 		}
 		branchIdx := repBranchBuf.Get(i)
@@ -3148,13 +3146,11 @@ func (qv *queryView) promoteObservedOrderedORKWayMaterializedBaseOps(
 	repPredBuf.Grow(branches.Len() * 4)
 	defer predicateCheckSlicePool.Put(repPredBuf)
 
-	buildWorksBuf := uint64SlicePool.Get()
-	buildWorksBuf.Grow(branches.Len() * 4)
-	defer uint64SlicePool.Put(buildWorksBuf)
+	buildWorksBuf := pools.GetUint64Slice(branches.Len() * 4)
+	defer func() { pools.PutUint64Slice(buildWorksBuf) }()
 
-	observedWorksBuf := uint64SlicePool.Get()
-	observedWorksBuf.Grow(branches.Len() * 4)
-	defer uint64SlicePool.Put(observedWorksBuf)
+	observedWorksBuf := pools.GetUint64Slice(branches.Len() * 4)
+	defer func() { pools.PutUint64Slice(observedWorksBuf) }()
 
 	branchCount := branches.Len()
 	if branchCount > plannerORBranchLimit {
@@ -3189,7 +3185,7 @@ func (qv *queryView) promoteObservedOrderedORKWayMaterializedBaseOps(
 					found := false
 					for slot := 0; slot < cacheKeysBuf.Len(); slot++ {
 						if cacheKeysBuf.Get(slot) == info.cacheKey {
-							observedWorksBuf.Set(slot, satAddUint64(observedWorksBuf.Get(slot), observedWork))
+							observedWorksBuf[slot] = satAddUint64(observedWorksBuf[slot], observedWork)
 							found = true
 							break
 						}
@@ -3198,8 +3194,8 @@ func (qv *queryView) promoteObservedOrderedORKWayMaterializedBaseOps(
 						cacheKeysBuf.Append(info.cacheKey)
 						repBranchBuf.Append(bi)
 						repPredBuf.Append(pi)
-						buildWorksBuf.Append(info.buildWork)
-						observedWorksBuf.Append(observedWork)
+						buildWorksBuf = append(buildWorksBuf, info.buildWork)
+						observedWorksBuf = append(observedWorksBuf, observedWork)
 					}
 				}
 			}
@@ -3208,13 +3204,13 @@ func (qv *queryView) promoteObservedOrderedORKWayMaterializedBaseOps(
 	}
 
 	for i := 0; i < cacheKeysBuf.Len(); i++ {
-		if observedWorksBuf.Get(i) == 0 {
+		if observedWorksBuf[i] == 0 {
 			continue
 		}
 		if _, ok := qv.snap.loadMaterializedPredKey(cacheKeysBuf.Get(i)); ok {
 			continue
 		}
-		if !qv.snap.shouldPromoteObservedOrderedORMaterializedPredKey(cacheKeysBuf.Get(i), observedWorksBuf.Get(i), buildWorksBuf.Get(i)) {
+		if !qv.snap.shouldPromoteObservedOrderedORMaterializedPredKey(cacheKeysBuf.Get(i), observedWorksBuf[i], buildWorksBuf[i]) {
 			continue
 		}
 		branchIdx := repBranchBuf.Get(i)
@@ -5996,14 +5992,14 @@ func plannerORNoOrderFindNextCapped(order []int, states []plannerORNoOrderBranch
 	return nil
 }
 
-func plannerORNoOrderInsertTopN(top *pooled.Slice[uint64], idx uint64, n int) {
+func plannerORNoOrderInsertTopN(top []uint64, idx uint64, n int) []uint64 {
 	if n <= 0 {
-		return
+		return top
 	}
-	lo, hi := 0, top.Len()
+	lo, hi := 0, len(top)
 	for lo < hi {
 		mid := lo + (hi-lo)/2
-		if top.Get(mid) < idx {
+		if top[mid] < idx {
 			lo = mid + 1
 			continue
 		}
@@ -6011,48 +6007,45 @@ func plannerORNoOrderInsertTopN(top *pooled.Slice[uint64], idx uint64, n int) {
 	}
 	pos := lo
 
-	if top.Len() < n {
-		top.Append(0)
-		for i := top.Len() - 1; i > pos; i-- {
-			top.Set(i, top.Get(i-1))
-		}
-		top.Set(pos, idx)
-		return
+	if len(top) < n {
+		top = append(top, 0)
+		copy(top[pos+1:], top[pos:len(top)-1])
+		top[pos] = idx
+		return top
 	}
-	if pos >= top.Len() {
-		return
+	if pos >= len(top) {
+		return top
 	}
 
-	for i := top.Len() - 1; i > pos; i-- {
-		top.Set(i, top.Get(i-1))
-	}
-	top.Set(pos, idx)
+	copy(top[pos+1:], top[pos:len(top)-1])
+	top[pos] = idx
+	return top
 }
 
-func plannerORNoOrderAddCandidate(top *pooled.Slice[uint64], idx uint64, need int, useLinearSeen bool, seen *u64set, trace *queryTrace) {
+func plannerORNoOrderAddCandidate(top []uint64, idx uint64, need int, useLinearSeen bool, seen *u64set, trace *queryTrace) []uint64 {
 	// Threshold prune prevents growing a candidate set that can no longer
 	// improve top-N; it is key for large OR unions with small LIMIT.
-	if top.Len() == need && idx > top.Get(top.Len()-1) {
-		return
+	if len(top) == need && idx > top[len(top)-1] {
+		return top
 	}
 
 	if useLinearSeen {
-		for i := 0; i < top.Len(); i++ {
-			if top.Get(i) == idx {
+		for i := 0; i < len(top); i++ {
+			if top[i] == idx {
 				if trace != nil {
 					trace.addDedupe(1)
 				}
-				return
+				return top
 			}
 		}
 	} else if !seen.Add(idx) {
 		if trace != nil {
 			trace.addDedupe(1)
 		}
-		return
+		return top
 	}
 
-	plannerORNoOrderInsertTopN(top, idx, need)
+	return plannerORNoOrderInsertTopN(top, idx, need)
 }
 
 func (qv *queryView) execPlanORNoOrder(q *qir.Shape, branches plannerORBranches, trace *queryTrace) ([]uint64, bool) {
@@ -6140,9 +6133,8 @@ func (qv *queryView) execPlanORNoOrderAdaptiveCore(q *qir.Shape, branches planne
 		seen = newU64Set(max(64, need*2))
 		defer releaseU64Set(&seen)
 	}
-	topBuf := uint64SlicePool.Get()
-	topBuf.Grow(need)
-	defer uint64SlicePool.Put(topBuf)
+	topBuf := pools.GetUint64Slice(need)
+	defer func() { pools.PutUint64Slice(topBuf) }()
 
 	initialActive := plannerORNoOrderInitActiveBranches
 	if initialActive > len(order) {
@@ -6159,10 +6151,10 @@ func (qv *queryView) execPlanORNoOrderAdaptiveCore(q *qir.Shape, branches planne
 	}
 
 	// Phase 1: gather enough unique candidates from cheap-first branches.
-	for topBuf.Len() < need {
+	for len(topBuf) < need {
 		st := plannerORNoOrderFindReadyMin(states, 0, false)
 		if st != nil {
-			plannerORNoOrderAddCandidate(topBuf, st.iter.cur, need, useLinearSeen, &seen, trace)
+			topBuf = plannerORNoOrderAddCandidate(topBuf, st.iter.cur, need, useLinearSeen, &seen, trace)
 			examinedDelta, emittedDelta := plannerORNoOrderConsumeBranch(st)
 			examined += examinedDelta
 			if fullTrace {
@@ -6197,12 +6189,12 @@ func (qv *queryView) execPlanORNoOrderAdaptiveCore(q *qir.Shape, branches planne
 
 	// Phase 2: if LIMIT is already filled, prove all unseen branches cannot
 	// contribute ids <= current threshold.
-	for topBuf.Len() == need {
-		threshold := topBuf.Get(topBuf.Len() - 1)
+	for len(topBuf) == need {
+		threshold := topBuf[len(topBuf)-1]
 
 		st := plannerORNoOrderFindReadyMin(states, threshold, true)
 		if st != nil {
-			plannerORNoOrderAddCandidate(topBuf, st.iter.cur, need, useLinearSeen, &seen, trace)
+			topBuf = plannerORNoOrderAddCandidate(topBuf, st.iter.cur, need, useLinearSeen, &seen, trace)
 			examinedDelta, emittedDelta := plannerORNoOrderConsumeBranch(st)
 			examined += examinedDelta
 			if fullTrace {
@@ -6238,8 +6230,8 @@ func (qv *queryView) execPlanORNoOrderAdaptiveCore(q *qir.Shape, branches planne
 	if trace != nil {
 		trace.addExamined(examined)
 
-		if fullTrace && topBuf.Len() == need {
-			threshold := topBuf.Get(topBuf.Len() - 1)
+		if fullTrace && len(topBuf) == need {
+			threshold := topBuf[len(topBuf)-1]
 			for i := range states {
 				st := &states[i]
 				if st.exhausted {
@@ -6256,14 +6248,12 @@ func (qv *queryView) execPlanORNoOrderAdaptiveCore(q *qir.Shape, branches planne
 		trace.setEarlyStopReason(earlyStopReason)
 	}
 
-	if topBuf.Len() == 0 {
+	if len(topBuf) == 0 {
 		return nil, true
 	}
 
-	out := make([]uint64, 0, topBuf.Len())
-	for i := 0; i < topBuf.Len(); i++ {
-		out = append(out, topBuf.Get(i))
-	}
+	out := make([]uint64, len(topBuf))
+	copy(out, topBuf)
 	return out, true
 }
 
@@ -6327,12 +6317,11 @@ func (qv *queryView) execPlanORNoOrderBaselineCore(q *qir.Shape, branches planne
 	useLinearSeen := needWindow <= plannerORNoOrderLinearSeenNeedMax
 	var (
 		seen    u64set
-		seenBuf *pooled.Slice[uint64]
+		seenBuf []uint64
 	)
 	if useLinearSeen {
-		seenBuf = uint64SlicePool.Get()
-		seenBuf.Grow(needWindow)
-		defer uint64SlicePool.Put(seenBuf)
+		seenBuf = pools.GetUint64Slice(needWindow)
+		defer func() { pools.PutUint64Slice(seenBuf) }()
 	} else {
 		seen = newU64Set(max(64, needWindow*2))
 		defer releaseU64Set(&seen)
@@ -6374,8 +6363,8 @@ func (qv *queryView) execPlanORNoOrderBaselineCore(q *qir.Shape, branches planne
 
 		if useLinearSeen {
 			dup := false
-			for i := 0; i < seenBuf.Len(); i++ {
-				if seenBuf.Get(i) == minIdx {
+			for i := 0; i < len(seenBuf); i++ {
+				if seenBuf[i] == minIdx {
 					dup = true
 					break
 				}
@@ -6386,7 +6375,7 @@ func (qv *queryView) execPlanORNoOrderBaselineCore(q *qir.Shape, branches planne
 				}
 				continue
 			}
-			seenBuf.Append(minIdx)
+			seenBuf = append(seenBuf, minIdx)
 		} else {
 			// No-order branch leads are only required to be iterable, not globally
 			// monotone by idx. Identical ids may therefore surface again long after

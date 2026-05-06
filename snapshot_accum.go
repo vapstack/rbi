@@ -145,7 +145,10 @@ func addFixedFieldBatchPostingAccum(
 
 /**/
 
-const insertPostingIDsBufPoolMinCap = posting.MidCap
+const (
+	insertPostingIDsBufPoolMinCap = posting.MidCap
+	insertPostingIDsBufPoolMaxCap = 4 << 10
+)
 
 type insertPostingIDsBuf struct{ values []uint64 }
 
@@ -169,7 +172,7 @@ func releaseInsertPostingIDsBuf(buf *insertPostingIDsBuf) {
 	if buf == nil {
 		return
 	}
-	if cap(buf.values) > uint64SlicePoolMaxCap {
+	if cap(buf.values) > insertPostingIDsBufPoolMaxCap {
 		return
 	}
 	buf.values = buf.values[:0]

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/vapstack/qx"
+	"github.com/vapstack/rbi/internal/pools"
 	"github.com/vapstack/rbi/internal/posting"
 	"github.com/vapstack/rbi/internal/qir"
 )
@@ -1369,18 +1370,18 @@ func TestPlannerExt_NextAnalyzeDelayCapsBackoffAtEightX(t *testing.T) {
 }
 
 func TestPlannerExt_PlannerORNoOrderInsertTopNStaysSortedAndCapped(t *testing.T) {
-	top := uint64SlicePool.Get()
-	defer uint64SlicePool.Put(top)
+	top := pools.GetUint64Slice(3)
+	defer func() { pools.PutUint64Slice(top) }()
 	for _, id := range []uint64{5, 2, 4, 1, 3} {
-		plannerORNoOrderInsertTopN(top, id, 3)
+		top = plannerORNoOrderInsertTopN(top, id, 3)
 	}
 	want := []uint64{1, 2, 3}
-	if top.Len() != len(want) {
-		t.Fatalf("unexpected len(top): got=%d want=%d", top.Len(), len(want))
+	if len(top) != len(want) {
+		t.Fatalf("unexpected len(top): got=%d want=%d", len(top), len(want))
 	}
 	for i := range want {
-		if top.Get(i) != want[i] {
-			t.Fatalf("unexpected top[%d]: got=%d want=%d", i, top.Get(i), want[i])
+		if top[i] != want[i] {
+			t.Fatalf("unexpected top[%d]: got=%d want=%d", i, top[i], want[i])
 		}
 	}
 }

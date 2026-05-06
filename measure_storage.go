@@ -4,7 +4,9 @@ import (
 	"sort"
 	"sync/atomic"
 
+	"github.com/vapstack/rbi/internal/binsearch"
 	"github.com/vapstack/rbi/internal/pooled"
+	"github.com/vapstack/rbi/internal/pools"
 )
 
 const (
@@ -57,14 +59,14 @@ func (s measureBatchDeltaBufOrder) Less(i, j int) bool {
 
 type measureFlatRoot struct {
 	refs   atomic.Int32
-	ids    *pooled.Slice[uint64]
-	values *pooled.Slice[uint64]
+	ids    []uint64
+	values []uint64
 }
 
 type measureChunk struct {
 	refs   atomic.Int32
-	ids    *pooled.Slice[uint64]
-	values *pooled.Slice[uint64]
+	ids    []uint64
+	values []uint64
 }
 
 type measureChunkRef struct {
@@ -85,11 +87,6 @@ type measureFieldStorage struct {
 
 var measureEntrySlicePool = pooled.Slices[measureEntry]{Clear: true}
 var measureBatchDeltaSlicePool = pooled.Slices[measureBatchDelta]{Clear: true}
-
-var measureUint64SlicePool = pooled.Slices[uint64]{
-	MinCap: measureChunkTargetRows,
-	Clear:  true,
-}
 
 var measureChunkRefSlicePool = pooled.Slices[measureChunkRef]{
 	MinCap: 8,
@@ -153,14 +150,12 @@ func newMeasureStorageFromEntriesOwned(entries *pooled.Slice[measureEntry]) meas
 
 func newMeasureFlatStorageFromEntriesOwned(entries *pooled.Slice[measureEntry]) measureFieldStorage {
 	root := measureFlatRootPool.Get()
-	root.ids = measureUint64SlicePool.Get()
-	root.values = measureUint64SlicePool.Get()
-	root.ids.SetLen(entries.Len())
-	root.values.SetLen(entries.Len())
+	root.ids = pools.GetUint64Slice(entries.Len())[:entries.Len()]
+	root.values = pools.GetUint64Slice(entries.Len())[:entries.Len()]
 	for i := 0; i < entries.Len(); i++ {
 		entry := entries.Get(i)
-		root.ids.Set(i, entry.id)
-		root.values.Set(i, entry.value)
+		root.ids[i] = entry.id
+		root.values[i] = entry.value
 	}
 	root.refs.Store(1)
 	measureEntrySlicePool.Put(entries)
@@ -190,23 +185,21 @@ func appendMeasureEntryRangeAsChunk(root *measureChunkedRoot, entries *pooled.Sl
 func newMeasureChunkFromEntryRange(entries *pooled.Slice[measureEntry], start int, end int) *measureChunk {
 	size := end - start
 	chunk := measureChunkPool.Get()
-	chunk.ids = measureUint64SlicePool.Get()
-	chunk.values = measureUint64SlicePool.Get()
-	chunk.ids.SetLen(size)
-	chunk.values.SetLen(size)
+	chunk.ids = pools.GetUint64Slice(size)[:size]
+	chunk.values = pools.GetUint64Slice(size)[:size]
 	for i := 0; i < size; i++ {
 		entry := entries.Get(start + i)
-		chunk.ids.Set(i, entry.id)
-		chunk.values.Set(i, entry.value)
+		chunk.ids[i] = entry.id
+		chunk.values[i] = entry.value
 	}
 	chunk.refs.Store(1)
 	return chunk
 }
 
 func appendMeasureChunkRef(root *measureChunkedRoot, chunk *measureChunk) {
-	rows := chunk.ids.Len()
+	rows := len(chunk.ids)
 	root.refsByID.Append(measureChunkRef{
-		lastID: chunk.ids.Get(rows - 1),
+		lastID: chunk.ids[rows-1],
 		chunk:  chunk,
 	})
 	root.rows += rows
@@ -242,12 +235,12 @@ func applyMeasureDeltasFlatOwned(base *measureFlatRoot, deltas *pooled.Slice[mea
 	entries := measureEntrySlicePool.Get()
 	i := 0
 	j := 0
-	for i < base.ids.Len() && j < deltas.Len() {
-		id := base.ids.Get(i)
+	for i < len(base.ids) && j < deltas.Len() {
+		id := base.ids[i]
 		delta := deltas.Get(j)
 		switch {
 		case id < delta.id:
-			entries.Append(measureEntry{id: id, value: base.values.Get(i)})
+			entries.Append(measureEntry{id: id, value: base.values[i]})
 			i++
 		case id > delta.id:
 			if delta.newOK {
@@ -262,8 +255,8 @@ func applyMeasureDeltasFlatOwned(base *measureFlatRoot, deltas *pooled.Slice[mea
 			j++
 		}
 	}
-	for ; i < base.ids.Len(); i++ {
-		entries.Append(measureEntry{id: base.ids.Get(i), value: base.values.Get(i)})
+	for ; i < len(base.ids); i++ {
+		entries.Append(measureEntry{id: base.ids[i], value: base.values[i]})
 	}
 	for ; j < deltas.Len(); j++ {
 		delta := deltas.Get(j)
@@ -329,12 +322,12 @@ func appendMeasureChunkMergedWithDeltas(
 ) {
 	idPos := 0
 	deltaPos := startDelta
-	for idPos < chunk.ids.Len() && deltaPos < endDelta {
-		id := chunk.ids.Get(idPos)
+	for idPos < len(chunk.ids) && deltaPos < endDelta {
+		id := chunk.ids[idPos]
 		delta := deltas.Get(deltaPos)
 		switch {
 		case id < delta.id:
-			entries.Append(measureEntry{id: id, value: chunk.values.Get(idPos)})
+			entries.Append(measureEntry{id: id, value: chunk.values[idPos]})
 			idPos++
 		case id > delta.id:
 			if delta.newOK {
@@ -349,8 +342,8 @@ func appendMeasureChunkMergedWithDeltas(
 			deltaPos++
 		}
 	}
-	for ; idPos < chunk.ids.Len(); idPos++ {
-		entries.Append(measureEntry{id: chunk.ids.Get(idPos), value: chunk.values.Get(idPos)})
+	for ; idPos < len(chunk.ids); idPos++ {
+		entries.Append(measureEntry{id: chunk.ids[idPos], value: chunk.values[idPos]})
 	}
 	for ; deltaPos < endDelta; deltaPos++ {
 		delta := deltas.Get(deltaPos)
@@ -366,14 +359,14 @@ func fillMeasureTailChunkWithDeltas(root *measureChunkedRoot, deltas *pooled.Sli
 	}
 	tailPos := root.refsByID.Len() - 1
 	tail := root.refsByID.Get(tailPos).chunk
-	tailLen := tail.ids.Len()
+	tailLen := len(tail.ids)
 	if tailLen >= measureChunkTargetRows {
 		return
 	}
 
 	entries := measureEntrySlicePool.Get()
 	for i := 0; i < tailLen; i++ {
-		entries.Append(measureEntry{id: tail.ids.Get(i), value: tail.values.Get(i)})
+		entries.Append(measureEntry{id: tail.ids[i], value: tail.values[i]})
 	}
 	pos := *deltaPos
 	for pos < deltas.Len() && entries.Len() < measureChunkTargetRows {
@@ -391,10 +384,10 @@ func fillMeasureTailChunkWithDeltas(root *measureChunkedRoot, deltas *pooled.Sli
 
 	chunk := newMeasureChunkFromEntryRange(entries, 0, entries.Len())
 	root.refsByID.Set(tailPos, measureChunkRef{
-		lastID: chunk.ids.Get(chunk.ids.Len() - 1),
+		lastID: chunk.ids[len(chunk.ids)-1],
 		chunk:  chunk,
 	})
-	root.rows += chunk.ids.Len() - tailLen
+	root.rows += len(chunk.ids) - tailLen
 	tail.release()
 	measureEntrySlicePool.Put(entries)
 }
@@ -440,8 +433,8 @@ func (r *measureFlatRoot) release() {
 	if r == nil || r.refs.Add(-1) != 0 {
 		return
 	}
-	measureUint64SlicePool.Put(r.ids)
-	measureUint64SlicePool.Put(r.values)
+	pools.PutUint64Slice(r.ids)
+	pools.PutUint64Slice(r.values)
 	r.ids = nil
 	r.values = nil
 	measureFlatRootPool.Put(r)
@@ -455,8 +448,8 @@ func (c *measureChunk) release() {
 	if c == nil || c.refs.Add(-1) != 0 {
 		return
 	}
-	measureUint64SlicePool.Put(c.ids)
-	measureUint64SlicePool.Put(c.values)
+	pools.PutUint64Slice(c.ids)
+	pools.PutUint64Slice(c.values)
 	c.ids = nil
 	c.values = nil
 	measureChunkPool.Put(c)
@@ -531,7 +524,7 @@ func (s measureFieldStorage) lookup(id uint64) (uint64, bool) {
 
 func (s measureFieldStorage) rows() int {
 	if s.flat != nil {
-		return s.flat.ids.Len()
+		return len(s.flat.ids)
 	}
 	if s.chunked != nil {
 		return s.chunked.rows
@@ -540,11 +533,8 @@ func (s measureFieldStorage) rows() int {
 }
 
 func (r *measureFlatRoot) lookup(id uint64) (uint64, bool) {
-	pos := sort.Search(r.ids.Len(), func(i int) bool {
-		return r.ids.Get(i) >= id
-	})
-	if pos < r.ids.Len() && r.ids.Get(pos) == id {
-		return r.values.Get(pos), true
+	if pos, ok := binsearch.Uint64(r.ids, id); ok {
+		return r.values[pos], true
 	}
 	return 0, false
 }
@@ -557,11 +547,8 @@ func (r *measureChunkedRoot) lookup(id uint64) (uint64, bool) {
 		return 0, false
 	}
 	chunk := r.refsByID.Get(chunkPos).chunk
-	pos := sort.Search(chunk.ids.Len(), func(i int) bool {
-		return chunk.ids.Get(i) >= id
-	})
-	if pos < chunk.ids.Len() && chunk.ids.Get(pos) == id {
-		return chunk.values.Get(pos), true
+	if pos, ok := binsearch.Uint64(chunk.ids, id); ok {
+		return chunk.values[pos], true
 	}
 	return 0, false
 }

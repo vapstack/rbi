@@ -7,6 +7,7 @@ import (
 	"sync/atomic"
 
 	"github.com/vapstack/rbi/internal/pooled"
+	"github.com/vapstack/rbi/internal/pools"
 	"github.com/vapstack/rbi/internal/posting"
 )
 
@@ -178,7 +179,7 @@ type fieldIndexChunkDirPage struct {
 	refsCount atomic.Int32
 	refs      *pooled.Slice[fieldIndexChunkRef]
 	prefix    *pooled.Slice[int]
-	rowPrefix *pooled.Slice[uint64]
+	rowPrefix []uint64
 }
 
 // fieldIndexChunkedRoot stores immutable directory pages over immutable chunks
@@ -188,7 +189,7 @@ type fieldIndexChunkedRoot struct {
 	pages       *pooled.Slice[*fieldIndexChunkDirPage]
 	chunkPrefix *pooled.Slice[int]
 	prefix      *pooled.Slice[int]
-	rowPrefix   *pooled.Slice[uint64]
+	rowPrefix   []uint64
 	keyCount    int
 	chunkCount  int
 }
@@ -250,19 +251,11 @@ var fieldIndexChunkDirPagePrefixPool = pooled.Slices[int]{
 	MinCap: fieldIndexDirPageTargetRefs + 1,
 }
 
-var fieldIndexChunkDirPageRowPrefixPool = pooled.Slices[uint64]{
-	MinCap: fieldIndexDirPageTargetRefs + 1,
-}
-
 var fieldIndexChunkRootChunkPrefixPool = pooled.Slices[int]{
 	MinCap: 8,
 }
 
 var fieldIndexChunkRootPrefixPool = pooled.Slices[int]{
-	MinCap: 8,
-}
-
-var fieldIndexChunkRootRowPrefixPool = pooled.Slices[uint64]{
 	MinCap: 8,
 }
 
@@ -291,9 +284,8 @@ func newFieldIndexChunkDirPageOwned(refs *pooled.Slice[fieldIndexChunkRef]) *fie
 	page.prefix = fieldIndexChunkDirPagePrefixPool.Get()
 	page.prefix.SetLen(refs.Len() + 1)
 	page.prefix.Set(0, 0)
-	page.rowPrefix = fieldIndexChunkDirPageRowPrefixPool.Get()
-	page.rowPrefix.SetLen(refs.Len() + 1)
-	page.rowPrefix.Set(0, 0)
+	page.rowPrefix = pools.GetUint64Slice(refs.Len() + 1)[:refs.Len()+1]
+	page.rowPrefix[0] = 0
 
 	total := 0
 	rows := uint64(0)
@@ -302,7 +294,7 @@ func newFieldIndexChunkDirPageOwned(refs *pooled.Slice[fieldIndexChunkRef]) *fie
 		total += ref.chunk.keyCount()
 		rows += ref.chunk.rowCount()
 		page.prefix.Set(i+1, total)
-		page.rowPrefix.Set(i+1, rows)
+		page.rowPrefix[i+1] = rows
 	}
 	return page
 }
@@ -339,7 +331,7 @@ func (p *fieldIndexChunkDirPage) release() {
 		p.prefix = nil
 	}
 	if p.rowPrefix != nil {
-		fieldIndexChunkDirPageRowPrefixPool.Put(p.rowPrefix)
+		pools.PutUint64Slice(p.rowPrefix)
 		p.rowPrefix = nil
 	}
 	fieldIndexChunkDirPagePool.Put(p)
@@ -377,7 +369,7 @@ func (p *fieldIndexChunkDirPage) rowPrefixAt(i int) uint64 {
 	if p == nil || p.rowPrefix == nil {
 		return 0
 	}
-	return p.rowPrefix.Get(i)
+	return p.rowPrefix[i]
 }
 
 func (p *fieldIndexChunkDirPage) lastKey() indexKey {
@@ -614,7 +606,7 @@ func (r *fieldIndexChunkedRoot) release() {
 		r.prefix = nil
 	}
 	if r.rowPrefix != nil {
-		fieldIndexChunkRootRowPrefixPool.Put(r.rowPrefix)
+		pools.PutUint64Slice(r.rowPrefix)
 		r.rowPrefix = nil
 	}
 }
@@ -1758,9 +1750,8 @@ func newFieldIndexChunkedRootFromOwnedPages(pages *pooled.Slice[*fieldIndexChunk
 	prefix := fieldIndexChunkRootPrefixPool.Get()
 	prefix.SetLen(pages.Len() + 1)
 	prefix.Set(0, 0)
-	rowPrefix := fieldIndexChunkRootRowPrefixPool.Get()
-	rowPrefix.SetLen(pages.Len() + 1)
-	rowPrefix.Set(0, 0)
+	rowPrefix := pools.GetUint64Slice(pages.Len() + 1)[:pages.Len()+1]
+	rowPrefix[0] = 0
 
 	chunks := 0
 	total := 0
@@ -1773,7 +1764,7 @@ func newFieldIndexChunkedRootFromOwnedPages(pages *pooled.Slice[*fieldIndexChunk
 		rows += page.rowPrefixAt(page.refsLen())
 		chunkPrefix.Set(i+1, chunks)
 		prefix.Set(i+1, total)
-		rowPrefix.Set(i+1, rows)
+		rowPrefix[i+1] = rows
 	}
 	if total == 0 {
 		releaseFieldIndexChunkDirPages(pages)
@@ -1936,20 +1927,20 @@ func (r *fieldIndexChunkedRoot) rowPrefixForChunk(limit int) uint64 {
 		return 0
 	}
 	if limit >= r.chunkCount {
-		if r.rowPrefix == nil || r.rowPrefix.Len() == 0 {
+		if len(r.rowPrefix) == 0 {
 			return 0
 		}
-		return r.rowPrefix.Get(r.rowPrefix.Len() - 1)
+		return r.rowPrefix[len(r.rowPrefix)-1]
 	}
 	page := searchChunkPageAtOrAfterChunk(r.chunkPrefix, limit)
 	if r.pages == nil || page >= r.pages.Len() {
-		if r.rowPrefix == nil || r.rowPrefix.Len() == 0 {
+		if len(r.rowPrefix) == 0 {
 			return 0
 		}
-		return r.rowPrefix.Get(r.rowPrefix.Len() - 1)
+		return r.rowPrefix[len(r.rowPrefix)-1]
 	}
 	off := limit - r.chunkPrefix.Get(page)
-	return r.rowPrefix.Get(page) + r.pages.Get(page).rowPrefixAt(off)
+	return r.rowPrefix[page] + r.pages.Get(page).rowPrefixAt(off)
 }
 
 func (r *fieldIndexChunkedRoot) chunkRowsRange(start, end int) uint64 {

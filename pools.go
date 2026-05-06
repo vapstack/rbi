@@ -7,7 +7,6 @@ import (
 )
 
 const (
-	uint64SlicePoolMaxCap                   = 4 << 10
 	stringSlicePoolMaxCap                   = 64 << 10
 	fieldWriteScratchSlicePoolMaxCap        = 512
 	materializedPredKeySlicePoolMaxCap      = 512
@@ -93,13 +92,6 @@ var aggregateGroupIDOrdinalSlicePool = pooled.Slices[uint32]{
 
 /**/
 
-var aggregateGroupBucketCountSlicePool = pooled.Slices[uint64]{
-	MinCap: 64,
-	MaxCap: aggregateGroupBucketSlicePoolMaxCap,
-}
-
-/**/
-
 var aggregateGroupBucketTouchedSlicePool = pooled.Slices[int]{
 	MinCap: 64,
 	MaxCap: aggregateGroupBucketSlicePoolMaxCap,
@@ -111,20 +103,6 @@ var aggregateMetricStateSlicePool = pooled.Slices[aggregateMetricState]{
 	MinCap: 16,
 	MaxCap: aggregateMetricStateSlicePoolMaxCap,
 	Clear:  true,
-}
-
-/**/
-
-var uint64SlicePool = pooled.Slices[uint64]{
-	MinCap: 64,
-	MaxCap: uint64SlicePoolMaxCap,
-}
-
-/**/
-
-var fieldWriteScratchUint64SlicePool = pooled.Slices[uint64]{
-	MinCap: 32,
-	MaxCap: fieldWriteScratchSlicePoolMaxCap,
 }
 
 /**/

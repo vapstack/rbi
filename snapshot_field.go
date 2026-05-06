@@ -1,9 +1,11 @@
 package rbi
 
 import (
+	"slices"
 	"unsafe"
 
 	"github.com/vapstack/rbi/internal/pooled"
+	"github.com/vapstack/rbi/internal/pools"
 	"github.com/vapstack/rbi/internal/posting"
 )
 
@@ -35,7 +37,7 @@ var snapshotFieldInsertStateSlicePool = pooled.Slices[snapshotFieldInsertState]{
 
 type fieldWriteScratch struct {
 	strings *pooled.Slice[string]
-	fixed   *pooled.Slice[uint64]
+	fixed   []uint64
 	ok      bool
 	isNil   bool
 	length  int
@@ -57,14 +59,11 @@ var snapshotFieldBatchStateSlicePool = pooled.Slices[snapshotFieldBatchState]{
 }
 
 func (s *fieldWriteScratch) reset() {
-	if s == nil {
-		return
-	}
 	if s.strings != nil {
 		s.strings.Truncate()
 	}
 	if s.fixed != nil {
-		s.fixed.Truncate()
+		s.fixed = s.fixed[:0]
 	}
 	s.ok = false
 	s.isNil = false
@@ -72,15 +71,12 @@ func (s *fieldWriteScratch) reset() {
 }
 
 func (s *fieldWriteScratch) release() {
-	if s == nil {
-		return
-	}
 	if s.strings != nil {
 		fieldWriteScratchStringSlicePool.Put(s.strings)
 		s.strings = nil
 	}
 	if s.fixed != nil {
-		fieldWriteScratchUint64SlicePool.Put(s.fixed)
+		pools.PutUint64Slice(s.fixed)
 		s.fixed = nil
 	}
 	s.ok = false
@@ -89,25 +85,16 @@ func (s *fieldWriteScratch) release() {
 }
 
 func (s *fieldWriteScratch) setNil() {
-	if s == nil {
-		return
-	}
 	s.ok = true
 	s.isNil = true
 }
 
 func (s *fieldWriteScratch) setLen(length int) {
-	if s == nil {
-		return
-	}
 	s.ok = true
 	s.length = length
 }
 
 func (s *fieldWriteScratch) addString(key string) {
-	if s == nil {
-		return
-	}
 	if s.strings == nil {
 		s.strings = fieldWriteScratchStringSlicePool.Get()
 	}
@@ -116,28 +103,25 @@ func (s *fieldWriteScratch) addString(key string) {
 }
 
 func (s *fieldWriteScratch) addFixed(key uint64) {
-	if s == nil {
-		return
-	}
 	if s.fixed == nil {
-		s.fixed = fieldWriteScratchUint64SlicePool.Get()
+		s.fixed = pools.GetUint64Slice(0)
 	}
 	s.ok = true
-	s.fixed.Append(key)
+	s.fixed = append(s.fixed, key)
 }
 
 func (s *fieldWriteScratch) stringLen() int {
-	if s == nil || s.strings == nil {
+	if s.strings == nil {
 		return 0
 	}
 	return s.strings.Len()
 }
 
 func (s *fieldWriteScratch) fixedLen() int {
-	if s == nil || s.fixed == nil {
+	if s.fixed == nil {
 		return 0
 	}
-	return s.fixed.Len()
+	return len(s.fixed)
 }
 
 func (s *fieldWriteScratch) stringAt(i int) string {
@@ -145,16 +129,16 @@ func (s *fieldWriteScratch) stringAt(i int) string {
 }
 
 func (s *fieldWriteScratch) fixedAt(i int) uint64 {
-	return s.fixed.Get(i)
+	return s.fixed[i]
 }
 
 func (s *fieldWriteScratch) sortForField(f *field) {
-	if s == nil || f == nil || !f.Slice {
+	if f == nil || !f.Slice {
 		return
 	}
 	if f.KeyKind == fieldWriteKeysOrderedU64 {
-		if s.fixed != nil && s.fixed.Len() > 1 {
-			pooled.SortSlice(s.fixed)
+		if len(s.fixed) > 1 {
+			slices.Sort(s.fixed)
 		}
 		return
 	}
@@ -419,7 +403,7 @@ func (acc indexedFieldAccessor) collectSnapshotBatchDiff(
 	var changed bool
 	if acc.field != nil && acc.field.KeyKind == fieldWriteKeysOrderedU64 {
 		if acc.field.Slice {
-			var oldMulti, newMulti *pooled.Slice[uint64]
+			var oldMulti, newMulti []uint64
 			if oldOK {
 				oldMulti = state.old.fixed
 			}

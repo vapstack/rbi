@@ -19,6 +19,7 @@ import (
 	"unsafe"
 
 	"github.com/vapstack/rbi/internal/pooled"
+	"github.com/vapstack/rbi/internal/pools"
 	"github.com/vapstack/rbi/internal/posting"
 	"go.etcd.io/bbolt"
 )
@@ -446,7 +447,7 @@ type buildIndexRunHeap struct {
 
 type buildIndexFieldRun struct {
 	stringBuf *pooled.Slice[string]
-	u64Buf    *pooled.Slice[uint64]
+	u64Buf    []uint64
 	postBuf   *pooled.Slice[posting.List]
 }
 
@@ -508,7 +509,7 @@ func (s *buildIndexFieldLocalState) shouldFlushRegular() bool {
 
 func (r buildIndexFieldRun) keyCount() int {
 	if r.u64Buf != nil {
-		return r.u64Buf.Len()
+		return len(r.u64Buf)
 	}
 	if r.stringBuf == nil {
 		return 0
@@ -518,7 +519,7 @@ func (r buildIndexFieldRun) keyCount() int {
 
 func (r buildIndexFieldRun) keyAt(i int) indexKey {
 	if r.u64Buf != nil {
-		return indexKeyFromU64(r.u64Buf.Get(i))
+		return indexKeyFromU64(r.u64Buf[i])
 	}
 	return indexKeyFromString(r.stringBuf.Get(i))
 }
@@ -538,7 +539,7 @@ func (r *buildIndexFieldRun) release() {
 		r.stringBuf = nil
 	}
 	if r.u64Buf != nil {
-		uint64SlicePool.Put(r.u64Buf)
+		pools.PutUint64Slice(r.u64Buf)
 		r.u64Buf = nil
 	}
 	if r.postBuf != nil {
@@ -588,8 +589,7 @@ func buildIndexFixedRunFromPostingMap(m map[uint64]posting.List) buildIndexField
 	if len(m) == 0 {
 		return buildIndexFieldRun{}
 	}
-	keyBuf := uint64SlicePool.Get()
-	keyBuf.Grow(len(m))
+	keyBuf := pools.GetUint64Slice(len(m))
 	for key, ids := range m {
 		ids = ids.BuildOptimized()
 		if ids.IsEmpty() {
@@ -597,17 +597,17 @@ func buildIndexFixedRunFromPostingMap(m map[uint64]posting.List) buildIndexField
 			continue
 		}
 		m[key] = ids
-		keyBuf.Append(key)
+		keyBuf = append(keyBuf, key)
 	}
-	if keyBuf.Len() == 0 {
-		uint64SlicePool.Put(keyBuf)
+	if len(keyBuf) == 0 {
+		pools.PutUint64Slice(keyBuf)
 		return buildIndexFieldRun{}
 	}
-	pooled.SortSlice(keyBuf)
+	slices.Sort(keyBuf)
 	postBuf := postingSlicePool.Get()
-	postBuf.SetLen(keyBuf.Len())
-	for i := 0; i < keyBuf.Len(); i++ {
-		postBuf.Set(i, m[keyBuf.Get(i)])
+	postBuf.SetLen(len(keyBuf))
+	for i := 0; i < len(keyBuf); i++ {
+		postBuf.Set(i, m[keyBuf[i]])
 	}
 	clear(m)
 	return buildIndexFieldRun{
@@ -1891,11 +1891,11 @@ func writeMeasureFieldStorage(writer *bufio.Writer, storage measureFieldStorage)
 		return nil
 	}
 	if storage.flat != nil {
-		for i := 0; i < storage.flat.ids.Len(); i++ {
-			if err := writeUvarint(writer, storage.flat.ids.Get(i)); err != nil {
+		for i, id := range storage.flat.ids {
+			if err := writeUvarint(writer, id); err != nil {
 				return err
 			}
-			if err := writeUvarint(writer, storage.flat.values.Get(i)); err != nil {
+			if err := writeUvarint(writer, storage.flat.values[i]); err != nil {
 				return err
 			}
 		}
@@ -1903,11 +1903,11 @@ func writeMeasureFieldStorage(writer *bufio.Writer, storage measureFieldStorage)
 	}
 	for i := 0; i < storage.chunked.refsByID.Len(); i++ {
 		chunk := storage.chunked.refsByID.Get(i).chunk
-		for j := 0; j < chunk.ids.Len(); j++ {
-			if err := writeUvarint(writer, chunk.ids.Get(j)); err != nil {
+		for j, id := range chunk.ids {
+			if err := writeUvarint(writer, id); err != nil {
 				return err
 			}
-			if err := writeUvarint(writer, chunk.values.Get(j)); err != nil {
+			if err := writeUvarint(writer, chunk.values[j]); err != nil {
 				return err
 			}
 		}

@@ -1239,7 +1239,7 @@ func TestMeasureChunkedAppendFillsTailChunk(t *testing.T) {
 		t.Fatalf("chunk count=%d, want 3", got)
 	}
 	last := storage.chunked.refsByID.Get(storage.chunked.refsByID.Len() - 1).chunk
-	if got, want := last.ids.Len(), seed-2*measureChunkTargetRows+appendCount; got != want {
+	if got, want := len(last.ids), seed-2*measureChunkTargetRows+appendCount; got != want {
 		t.Fatalf("tail chunk rows=%d, want %d", got, want)
 	}
 	if storage.rows() != seed+appendCount {

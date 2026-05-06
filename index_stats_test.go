@@ -200,7 +200,7 @@ func indexStatsTestChunkedStructBytes(root *fieldIndexChunkedRoot) uint64 {
 		indexStatsTestSliceBufBytes(root.pages) +
 		indexStatsTestSliceBufBytes(root.chunkPrefix) +
 		indexStatsTestSliceBufBytes(root.prefix) +
-		indexStatsTestSliceBufBytes(root.rowPrefix)
+		uint64(cap(root.rowPrefix))*uint64(unsafe.Sizeof(uint64(0)))
 
 	for i := 0; i < root.pages.Len(); i++ {
 		page := root.pages.Get(i)
@@ -210,7 +210,7 @@ func indexStatsTestChunkedStructBytes(root *fieldIndexChunkedRoot) uint64 {
 		total += uint64(unsafe.Sizeof(fieldIndexChunkDirPage{})) +
 			indexStatsTestSliceBufBytes(page.refs) +
 			indexStatsTestSliceBufBytes(page.prefix) +
-			indexStatsTestSliceBufBytes(page.rowPrefix)
+			uint64(cap(page.rowPrefix))*uint64(unsafe.Sizeof(uint64(0)))
 
 		for j := 0; j < page.refsLen(); j++ {
 			chunk := page.refAt(j).chunk
