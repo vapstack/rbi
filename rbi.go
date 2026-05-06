@@ -540,7 +540,7 @@ func New[K ~uint64 | ~string, V any](bolt *bbolt.DB, options Options, execOpts .
 
 	if db.engine != nil {
 		db.stats.FieldCount = len(db.engine.fields) + len(db.engine.measureFields)
-		if err = db.publishCurrentSequenceSnapshotNoLock(); err != nil {
+		if err = db.engine.publishCurrentSequenceSnapshotNoLock(db.bolt, db.bucket, db.strMap); err != nil {
 			return nil, fmt.Errorf("failed to publish initial snapshot: %w", err)
 		}
 
@@ -692,8 +692,14 @@ func (db *DB[K, V]) initBatcher() {
 				clear(st.prepared)
 				st.prepared = st.prepared[:0]
 
+				clear(st.preparedSnapshots)
+				st.preparedSnapshots = st.preparedSnapshots[:0]
+
 				clear(st.accepted)
 				st.accepted = st.accepted[:0]
+
+				clear(st.acceptedSnapshots)
+				st.acceptedSnapshots = st.acceptedSnapshots[:0]
 
 				clear(st.states)
 				st.states = st.states[:0]
@@ -1301,14 +1307,14 @@ func (db *DB[K, V]) waitForInFlightOps() {
 	db.rebuilder.mu.Unlock()
 }
 
-func (db *DB[K, V]) currentBucketSequence() (uint64, error) {
+func currentBucketSequence(bolt *bbolt.DB, bucket []byte) (uint64, error) {
 	var seq uint64
-	if err := db.bolt.View(func(tx *bbolt.Tx) error {
-		bucket := tx.Bucket(db.bucket)
-		if bucket == nil {
+	if err := bolt.View(func(tx *bbolt.Tx) error {
+		b := tx.Bucket(bucket)
+		if b == nil {
 			return fmt.Errorf("bucket does not exist")
 		}
-		seq = bucket.Sequence()
+		seq = b.Sequence()
 		return nil
 	}); err != nil {
 		return 0, err
@@ -1316,18 +1322,18 @@ func (db *DB[K, V]) currentBucketSequence() (uint64, error) {
 	return seq, nil
 }
 
-func (db *DB[K, V]) publishCurrentSequenceSnapshotNoLock() error {
-	seq, err := db.currentBucketSequence()
+func (qe *queryEngine) publishCurrentSequenceSnapshotNoLock(bolt *bbolt.DB, bucket []byte, strMap *strMapper) error {
+	seq, err := currentBucketSequence(bolt, bucket)
 	if err != nil {
 		return err
 	}
 	var strmap *strMapSnapshot
-	if db.strMap != nil {
-		strmap = db.strMap.snapshot()
+	if strMap != nil {
+		strmap = strMap.snapshot()
 	}
-	db.engine.publishSnapshotNoLock(seq, strmap)
-	if db.strMap != nil {
-		db.strMap.markCommittedPublished(strmap)
+	qe.publishSnapshotNoLock(seq, strmap)
+	if strMap != nil {
+		strMap.markCommittedPublished(strmap)
 	}
 	return nil
 }

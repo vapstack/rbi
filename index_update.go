@@ -23,7 +23,7 @@ type uniqueSeenWrite struct {
 	key   string
 }
 
-func (db *DB[K, V]) markUniqueBatchLeaving(state uniqueBatchCheckState, field, key string, idx uint64) bool {
+func markUniqueBatchLeaving(state uniqueBatchCheckState, field, key string, idx uint64) bool {
 	fm := state.leaving[field]
 	if fm == nil {
 		fm = uniqueLeavingInnerPool.Get()
@@ -39,8 +39,8 @@ func (db *DB[K, V]) markUniqueBatchLeaving(state uniqueBatchCheckState, field, k
 	return true
 }
 
-func (db *DB[K, V]) appendUniqueBatchLeavingTouch(state uniqueBatchCheckState, touched []uniqueLeavingTouch, field, key string, idx uint64) []uniqueLeavingTouch {
-	added := db.markUniqueBatchLeaving(state, field, key, idx)
+func appendUniqueBatchLeavingTouch(state uniqueBatchCheckState, touched []uniqueLeavingTouch, field, key string, idx uint64) []uniqueLeavingTouch {
+	added := markUniqueBatchLeaving(state, field, key, idx)
 	return append(touched, uniqueLeavingTouch{field: field, key: key, added: added})
 }
 
@@ -71,7 +71,7 @@ func rollbackUniqueBatchLeaving(state uniqueBatchCheckState, touched []uniqueLea
 	}
 }
 
-func (db *DB[K, V]) checkUniqueBatchCandidateAndCollectSeen(
+func (qe *queryEngine) checkUniqueBatchCandidateAndCollectSeen(
 	state uniqueBatchCheckState,
 	idx uint64,
 	acc indexedFieldAccessor,
@@ -89,7 +89,7 @@ func (db *DB[K, V]) checkUniqueBatchCandidateAndCollectSeen(
 		}
 	}
 
-	ids := db.engine.getSnapshot().fieldLookupPostingRetained(acc.name, single)
+	ids := qe.getSnapshot().fieldLookupPostingRetained(acc.name, single)
 	if ids.IsEmpty() {
 		return append(seenWrites, uniqueSeenWrite{field: acc.name, key: single}), nil
 	}
@@ -121,8 +121,8 @@ func (db *DB[K, V]) checkUniqueBatchCandidateAndCollectSeen(
 	return append(seenWrites, uniqueSeenWrite{field: acc.name, key: single}), nil
 }
 
-func (db *DB[K, V]) checkUniqueBatchAppend(state uniqueBatchCheckState, idx uint64, oldVal, newVal *V) error {
-	if len(db.engine.uniqueFieldAccessors) == 0 {
+func (qe *queryEngine) checkUniqueBatchAppend(state uniqueBatchCheckState, idx uint64, oldVal, newVal unsafe.Pointer) error {
+	if len(qe.uniqueFieldAccessors) == 0 {
 		return nil
 	}
 	var (
@@ -130,26 +130,24 @@ func (db *DB[K, V]) checkUniqueBatchAppend(state uniqueBatchCheckState, idx uint
 		touched       = touchedInline[:0]
 	)
 	if oldVal != nil {
-		ptrOld := unsafe.Pointer(oldVal)
 		if newVal == nil {
-			for _, acc := range db.engine.uniqueFieldAccessors {
-				single, ok, isNil := acc.uniqueGetter(ptrOld)
+			for _, acc := range qe.uniqueFieldAccessors {
+				single, ok, isNil := acc.uniqueGetter(oldVal)
 				if !ok || isNil {
 					continue
 				}
-				touched = db.appendUniqueBatchLeavingTouch(state, touched, acc.name, single, idx)
+				touched = appendUniqueBatchLeavingTouch(state, touched, acc.name, single, idx)
 			}
 		} else {
-			ptrNew := unsafe.Pointer(newVal)
-			for _, acc := range db.engine.uniqueFieldAccessors {
-				if acc.modified == nil || !acc.modified(ptrOld, ptrNew) {
+			for _, acc := range qe.uniqueFieldAccessors {
+				if acc.modified == nil || !acc.modified(oldVal, newVal) {
 					continue
 				}
-				single, ok, isNil := acc.uniqueGetter(ptrOld)
+				single, ok, isNil := acc.uniqueGetter(oldVal)
 				if !ok || isNil {
 					continue
 				}
-				touched = db.appendUniqueBatchLeavingTouch(state, touched, acc.name, single, idx)
+				touched = appendUniqueBatchLeavingTouch(state, touched, acc.name, single, idx)
 			}
 		}
 	}
@@ -163,24 +161,22 @@ func (db *DB[K, V]) checkUniqueBatchAppend(state uniqueBatchCheckState, idx uint
 		seenWrites       = seenWritesInline[:0]
 	)
 
-	ptrNew := unsafe.Pointer(newVal)
 	if oldVal == nil {
-		for _, acc := range db.engine.uniqueFieldAccessors {
+		for _, acc := range qe.uniqueFieldAccessors {
 			var err error
-			seenWrites, err = db.checkUniqueBatchCandidateAndCollectSeen(state, idx, acc, ptrNew, seenWrites)
+			seenWrites, err = qe.checkUniqueBatchCandidateAndCollectSeen(state, idx, acc, newVal, seenWrites)
 			if err != nil {
 				rollbackUniqueBatchLeaving(state, touched, idx)
 				return err
 			}
 		}
 	} else {
-		ptrOld := unsafe.Pointer(oldVal)
-		for _, acc := range db.engine.uniqueFieldAccessors {
-			if acc.modified == nil || !acc.modified(ptrOld, ptrNew) {
+		for _, acc := range qe.uniqueFieldAccessors {
+			if acc.modified == nil || !acc.modified(oldVal, newVal) {
 				continue
 			}
 			var err error
-			seenWrites, err = db.checkUniqueBatchCandidateAndCollectSeen(state, idx, acc, ptrNew, seenWrites)
+			seenWrites, err = qe.checkUniqueBatchCandidateAndCollectSeen(state, idx, acc, newVal, seenWrites)
 			if err != nil {
 				rollbackUniqueBatchLeaving(state, touched, idx)
 				return err
@@ -199,7 +195,7 @@ func (db *DB[K, V]) checkUniqueBatchAppend(state uniqueBatchCheckState, idx uint
 	return nil
 }
 
-func collapseUniqueWriteMulti[V any](idxs []uint64, oldVals, newVals []*V, pos map[uint64]int) ([]uint64, []*V, []*V) {
+func collapseUniqueWriteMulti(idxs []uint64, oldVals, newVals []unsafe.Pointer, pos map[uint64]int) ([]uint64, []unsafe.Pointer, []unsafe.Pointer) {
 	n := 0
 	for i, idx := range idxs {
 		p := pos[idx]
@@ -227,8 +223,8 @@ func collapseUniqueWriteMulti[V any](idxs []uint64, oldVals, newVals []*V, pos m
 	return idxs, oldVals, newVals
 }
 
-func (db *DB[K, V]) checkUniqueOnWriteMulti(idxs []uint64, oldVals, newVals []*V) error {
-	if len(idxs) == 0 || len(db.engine.uniqueFieldAccessors) == 0 {
+func (qe *queryEngine) checkUniqueOnWriteMulti(idxs []uint64, oldVals, newVals []unsafe.Pointer) error {
+	if len(idxs) == 0 || len(qe.uniqueFieldAccessors) == 0 {
 		return nil
 	}
 
@@ -245,7 +241,7 @@ func (db *DB[K, V]) checkUniqueOnWriteMulti(idxs []uint64, oldVals, newVals []*V
 
 	for i, idx := range idxs {
 		oldVal := oldVals[i]
-		var newVal *V
+		var newVal unsafe.Pointer
 		if newVals != nil {
 			newVal = newVals[i]
 		}
@@ -253,13 +249,11 @@ func (db *DB[K, V]) checkUniqueOnWriteMulti(idxs []uint64, oldVals, newVals []*V
 			continue
 		}
 
-		ptr := unsafe.Pointer(oldVal)
-
 		// On delete (newVal == nil), the record releases all unique scalar values.
 		// On update, only modified unique fields can release previous values.
 		if newVal == nil {
-			for _, acc := range db.engine.uniqueFieldAccessors {
-				single, ok, isNil := acc.uniqueGetter(ptr)
+			for _, acc := range qe.uniqueFieldAccessors {
+				single, ok, isNil := acc.uniqueGetter(oldVal)
 				if !ok || isNil {
 					continue
 				}
@@ -275,12 +269,11 @@ func (db *DB[K, V]) checkUniqueOnWriteMulti(idxs []uint64, oldVals, newVals []*V
 			continue
 		}
 
-		ptrNew := unsafe.Pointer(newVal)
-		for _, acc := range db.engine.uniqueFieldAccessors {
-			if acc.modified == nil || !acc.modified(ptr, ptrNew) {
+		for _, acc := range qe.uniqueFieldAccessors {
+			if acc.modified == nil || !acc.modified(oldVal, newVal) {
 				continue
 			}
-			single, ok, isNil := acc.uniqueGetter(ptr)
+			single, ok, isNil := acc.uniqueGetter(oldVal)
 			if !ok || isNil {
 				continue
 			}
@@ -306,22 +299,20 @@ func (db *DB[K, V]) checkUniqueOnWriteMulti(idxs []uint64, oldVals, newVals []*V
 			continue
 		}
 
-		ptr := unsafe.Pointer(newVal)
 		if oldVals[i] == nil {
-			for _, acc := range db.engine.uniqueFieldAccessors {
-				if err := db.checkUniqueBatchCandidate(idx, ptr, acc, seen, leaving); err != nil {
+			for _, acc := range qe.uniqueFieldAccessors {
+				if err := qe.checkUniqueBatchCandidate(idx, newVal, acc, seen, leaving); err != nil {
 					return err
 				}
 			}
 			continue
 		}
 
-		ptrOld := unsafe.Pointer(oldVals[i])
-		for _, acc := range db.engine.uniqueFieldAccessors {
-			if acc.modified == nil || !acc.modified(ptrOld, ptr) {
+		for _, acc := range qe.uniqueFieldAccessors {
+			if acc.modified == nil || !acc.modified(oldVals[i], newVal) {
 				continue
 			}
-			if err := db.checkUniqueBatchCandidate(idx, ptr, acc, seen, leaving); err != nil {
+			if err := qe.checkUniqueBatchCandidate(idx, newVal, acc, seen, leaving); err != nil {
 				return err
 			}
 		}
@@ -329,7 +320,7 @@ func (db *DB[K, V]) checkUniqueOnWriteMulti(idxs []uint64, oldVals, newVals []*V
 	return nil
 }
 
-func (db *DB[K, V]) checkUniqueBatchCandidate(
+func (qe *queryEngine) checkUniqueBatchCandidate(
 	idx uint64,
 	ptr unsafe.Pointer,
 	acc indexedFieldAccessor,
@@ -351,7 +342,7 @@ func (db *DB[K, V]) checkUniqueBatchCandidate(
 	}
 	sm[single] = idx
 
-	ids := db.engine.getSnapshot().fieldLookupPostingRetained(acc.name, single)
+	ids := qe.getSnapshot().fieldLookupPostingRetained(acc.name, single)
 	if ids.IsEmpty() {
 		return nil
 	}

@@ -108,8 +108,26 @@ func formatDiagnosticBytesPrefix(b []byte, limit int) string {
 	return fmt.Sprintf("%x...(len=%d)", b[:limit], len(b))
 }
 
-func (db *DB[K, V]) formatBuildIndexKeyDiagnostic(key []byte) string {
-	if db.strKey {
+type loadIndexResult struct {
+	skipFields        map[string]struct{}
+	skipMeasureFields map[string]struct{}
+	plannerStats      *plannerStatsSnapshot
+	strMap            *strMapper
+	loadTime          time.Duration
+}
+
+type buildIndexDecodeFn func([]byte) (unsafe.Pointer, error)
+
+type buildIndexReleaseFn func(unsafe.Pointer)
+
+type buildIndexResult struct {
+	stats     bool
+	buildTime time.Duration
+	buildRPS  int
+}
+
+func formatBuildIndexKeyDiagnostic(strKey bool, key []byte) string {
+	if strKey {
 		s := string(key)
 		if len(s) > 64 {
 			return fmt.Sprintf("id=%q...(len=%d key_prefix_hex=%s)", s[:64], len(s), formatDiagnosticBytesPrefix(key, 24))
@@ -925,6 +943,51 @@ func materializeLenFieldStorageOwned(universe posting.List, lenMap map[uint32]po
 }
 
 func (db *DB[K, V]) buildIndex(skipFields map[string]struct{}, skipMeasureFields map[string]struct{}) error {
+	result, err := db.engine.buildIndex(
+		db.bolt,
+		db.bucket,
+		db.strKey,
+		db.strMap,
+		skipFields,
+		skipMeasureFields,
+		db.decodeBuildIndexRecord,
+		db.releaseBuildIndexRecord,
+	)
+	if err != nil {
+		return err
+	}
+	if result.stats {
+		db.stats.BuildTime = result.buildTime
+		db.stats.BuildRPS = result.buildRPS
+	}
+	return nil
+}
+
+func (db *DB[K, V]) decodeBuildIndexRecord(data []byte) (unsafe.Pointer, error) {
+	val, err := db.decode(data)
+	if err != nil {
+		return nil, err
+	}
+	return unsafe.Pointer(val), nil
+}
+
+func (db *DB[K, V]) releaseBuildIndexRecord(ptr unsafe.Pointer) {
+	var zero V
+	val := (*V)(ptr)
+	*val = zero
+	db.recPool.Put(val)
+}
+
+func (qe *queryEngine) buildIndex(
+	bolt *bbolt.DB,
+	bucket []byte,
+	strKey bool,
+	strMap *strMapper,
+	skipFields map[string]struct{},
+	skipMeasureFields map[string]struct{},
+	decode buildIndexDecodeFn,
+	release buildIndexReleaseFn,
+) (buildIndexResult, error) {
 	if skipFields == nil {
 		skipFields = map[string]struct{}{}
 	}
@@ -938,8 +1001,8 @@ func (db *DB[K, V]) buildIndex(skipFields map[string]struct{}, skipMeasureFields
 		numeric bool
 	}
 
-	active := make([]buildField, 0, len(db.engine.indexedFieldAccess))
-	for _, acc := range db.engine.indexedFieldAccess {
+	active := make([]buildField, 0, len(qe.indexedFieldAccess))
+	for _, acc := range qe.indexedFieldAccess {
 		if _, skip := skipFields[acc.name]; skip {
 			continue
 		}
@@ -949,8 +1012,8 @@ func (db *DB[K, V]) buildIndex(skipFields map[string]struct{}, skipMeasureFields
 			numeric: acc.field.KeyKind == fieldWriteKeysOrderedU64,
 		})
 	}
-	activeMeasures := make([]measureFieldAccessor, 0, len(db.engine.measureFieldAccess))
-	for _, acc := range db.engine.measureFieldAccess {
+	activeMeasures := make([]measureFieldAccessor, 0, len(qe.measureFieldAccess))
+	for _, acc := range qe.measureFieldAccess {
 		if _, skip := skipMeasureFields[acc.name]; skip {
 			continue
 		}
@@ -960,11 +1023,11 @@ func (db *DB[K, V]) buildIndex(skipFields map[string]struct{}, skipMeasureFields
 	fcnt := len(active)
 	mcnt := len(activeMeasures)
 	if fcnt <= 0 && mcnt <= 0 {
-		if !db.engine.lenIndexLoaded {
-			db.buildLenIndex()
+		if !qe.lenIndexLoaded {
+			qe.buildLenIndex()
 		}
-		db.engine.lenIndexLoaded = false
-		return nil
+		qe.lenIndexLoaded = false
+		return buildIndexResult{}, nil
 	}
 
 	start := time.Now()
@@ -1011,7 +1074,7 @@ func (db *DB[K, V]) buildIndex(skipFields map[string]struct{}, skipMeasureFields
 				localStates[i] = newBuildIndexFieldLocalState(active[i].numeric, active[i].slice)
 			}
 			defer releaseBuildIndexLocalStates(localStates)
-			localMeasures := make([]*pooled.Slice[measureEntry], len(db.engine.measureFieldAccess))
+			localMeasures := make([]*pooled.Slice[measureEntry], len(qe.measureFieldAccess))
 			measureOK := false
 			defer func() {
 				if !measureOK {
@@ -1019,16 +1082,15 @@ func (db *DB[K, V]) buildIndex(skipFields map[string]struct{}, skipMeasureFields
 				}
 			}()
 
-			var zero V
 			for kv := range jobs {
-				val, err := db.decode(kv.v)
+				ptr, err := decode(kv.v)
 				if err != nil {
 					localUniverse[widx] = lu
 					workerErrs[widx] = fmt.Errorf(
 						"worker=%d stage=decode scan_pos=%d %s idx=%d value_len=%d value_prefix_hex=%s: %w",
 						widx,
 						kv.pos,
-						db.formatBuildIndexKeyDiagnostic(kv.key),
+						formatBuildIndexKeyDiagnostic(strKey, kv.key),
 						kv.idx,
 						len(kv.v),
 						formatDiagnosticBytesPrefix(kv.v, 32),
@@ -1037,7 +1099,6 @@ func (db *DB[K, V]) buildIndex(skipFields map[string]struct{}, skipMeasureFields
 					cancel()
 					return
 				}
-				ptr := unsafe.Pointer(val)
 				idx := kv.idx
 
 				lu = lu.BuildAdded(idx)
@@ -1051,14 +1112,13 @@ func (db *DB[K, V]) buildIndex(skipFields map[string]struct{}, skipMeasureFields
 						err:   &fieldErr,
 					})
 					if fieldErr != nil {
-						*val = zero
-						db.recPool.Put(val)
+						release(ptr)
 						localUniverse[widx] = lu
 						workerErrs[widx] = fmt.Errorf(
 							"worker=%d stage=index scan_pos=%d %s idx=%d field=%q: %w",
 							widx,
 							kv.pos,
-							db.formatBuildIndexKeyDiagnostic(kv.key),
+							formatBuildIndexKeyDiagnostic(strKey, kv.key),
 							kv.idx,
 							active[k].acc.name,
 							fieldErr,
@@ -1080,8 +1140,7 @@ func (db *DB[K, V]) buildIndex(skipFields map[string]struct{}, skipMeasureFields
 						buf.Append(measureEntry{id: idx, value: value})
 					}
 				}
-				*val = zero
-				db.recPool.Put(val)
+				release(ptr)
 			}
 			for i := range localStates {
 				localStates[i].flushAllInto(fieldStates[i])
@@ -1092,26 +1151,26 @@ func (db *DB[K, V]) buildIndex(skipFields map[string]struct{}, skipMeasureFields
 		}(i)
 	}
 
-	err := db.bolt.View(func(tx *bbolt.Tx) error {
+	err := bolt.View(func(tx *bbolt.Tx) error {
 
 		defer wg.Wait()
 		defer close(jobs)
 
-		b := tx.Bucket(db.bucket)
+		b := tx.Bucket(bucket)
 		if b == nil {
 			return nil
 		}
 		done := ctx.Done()
 		c := b.Cursor()
-		if db.strKey {
-			db.strMap.Lock()
-			defer db.strMap.Unlock()
+		if strKey {
+			strMap.Lock()
+			defer strMap.Unlock()
 		}
 		nextGCAt := uint64(indexBuildGCStride)
 		nextReleaseAt := uint64(indexBuildReleaseOSMemoryStride)
 		scanned := uint64(0)
 		for k, v := c.First(); k != nil; k, v = c.Next() {
-			if !db.strKey && len(k) != 8 {
+			if !strKey && len(k) != 8 {
 				return fmt.Errorf(
 					"invalid uint64 key size scan_pos=%d key_len=%d key_prefix_hex=%s",
 					scanned+1,
@@ -1119,7 +1178,7 @@ func (db *DB[K, V]) buildIndex(skipFields map[string]struct{}, skipMeasureFields
 					formatDiagnosticBytesPrefix(k, 24),
 				)
 			}
-			idx := db.idxFromKeyNoLock(k)
+			idx := idxFromKeyNoLock(strKey, strMap, k)
 			select {
 			case <-done:
 				return nil
@@ -1139,86 +1198,86 @@ func (db *DB[K, V]) buildIndex(skipFields map[string]struct{}, skipMeasureFields
 	})
 
 	if err != nil {
-		return fmt.Errorf("scan error: db=%q bucket=%q: %w", db.bolt.Path(), string(db.bucket), err)
+		return buildIndexResult{}, fmt.Errorf("scan error: db=%q bucket=%q: %w", bolt.Path(), string(bucket), err)
 	}
 	for _, err = range workerErrs {
 		if err != nil {
-			return fmt.Errorf("scan error: db=%q bucket=%q: %w", db.bolt.Path(), string(db.bucket), err)
+			return buildIndexResult{}, fmt.Errorf("scan error: db=%q bucket=%q: %w", bolt.Path(), string(bucket), err)
 		}
 	}
 
-	slotCount := len(db.engine.indexedFieldAccess)
-	if db.engine.index == nil || db.engine.index.Len() != slotCount {
-		releaseFieldIndexStorageSlotsOwned(db.engine.index)
-		db.engine.index = fieldIndexStorageSlicePool.Get()
-		db.engine.index.SetLen(slotCount)
+	slotCount := len(qe.indexedFieldAccess)
+	if qe.index == nil || qe.index.Len() != slotCount {
+		releaseFieldIndexStorageSlotsOwned(qe.index)
+		qe.index = fieldIndexStorageSlicePool.Get()
+		qe.index.SetLen(slotCount)
 	}
-	if db.engine.nilIndex == nil || db.engine.nilIndex.Len() != slotCount {
-		releaseFieldIndexStorageSlotsOwned(db.engine.nilIndex)
-		db.engine.nilIndex = fieldIndexStorageSlicePool.Get()
-		db.engine.nilIndex.SetLen(slotCount)
+	if qe.nilIndex == nil || qe.nilIndex.Len() != slotCount {
+		releaseFieldIndexStorageSlotsOwned(qe.nilIndex)
+		qe.nilIndex = fieldIndexStorageSlicePool.Get()
+		qe.nilIndex.SetLen(slotCount)
 	}
-	if db.engine.lenIndex == nil || db.engine.lenIndex.Len() != slotCount {
-		releaseFieldIndexStorageSlotsOwned(db.engine.lenIndex)
-		db.engine.lenIndex = fieldIndexStorageSlicePool.Get()
-		db.engine.lenIndex.SetLen(slotCount)
+	if qe.lenIndex == nil || qe.lenIndex.Len() != slotCount {
+		releaseFieldIndexStorageSlotsOwned(qe.lenIndex)
+		qe.lenIndex = fieldIndexStorageSlicePool.Get()
+		qe.lenIndex.SetLen(slotCount)
 	}
-	if len(db.engine.lenZeroComplement) != slotCount {
-		if db.engine.lenZeroComplement != nil {
-			pools.PutBoolSlice(db.engine.lenZeroComplement)
+	if len(qe.lenZeroComplement) != slotCount {
+		if qe.lenZeroComplement != nil {
+			pools.PutBoolSlice(qe.lenZeroComplement)
 		}
-		db.engine.lenZeroComplement = pools.GetBoolSlice(slotCount)[:slotCount]
-		clear(db.engine.lenZeroComplement)
+		qe.lenZeroComplement = pools.GetBoolSlice(slotCount)[:slotCount]
+		clear(qe.lenZeroComplement)
 	} else if len(skipFields) == 0 {
-		clear(db.engine.lenZeroComplement)
+		clear(qe.lenZeroComplement)
 	} else {
 		for i := range active {
-			db.engine.lenZeroComplement[active[i].acc.ordinal] = false
+			qe.lenZeroComplement[active[i].acc.ordinal] = false
 		}
 	}
-	if db.engine.measure == nil || db.engine.measure.Len() != len(db.engine.measureFieldAccess) {
-		releaseMeasureFieldStorageSlotsOwned(db.engine.measure)
-		db.engine.measure = measureFieldStorageSlicePool.Get()
-		db.engine.measure.SetLen(len(db.engine.measureFieldAccess))
+	if qe.measure == nil || qe.measure.Len() != len(qe.measureFieldAccess) {
+		releaseMeasureFieldStorageSlotsOwned(qe.measure)
+		qe.measure = measureFieldStorageSlicePool.Get()
+		qe.measure.SetLen(len(qe.measureFieldAccess))
 	}
 
-	db.engine.universe = posting.List{}
+	qe.universe = posting.List{}
 	for i := range localUniverse {
 		if localUniverse[i].IsEmpty() {
 			continue
 		}
-		db.engine.universe = db.engine.universe.BuildMergedOwned(localUniverse[i])
+		qe.universe = qe.universe.BuildMergedOwned(localUniverse[i])
 	}
 
 	for i := range fieldStates {
 		ordinal := active[i].acc.ordinal
-		oldIndexStorage := db.engine.index.Get(ordinal)
+		oldIndexStorage := qe.index.Get(ordinal)
 		if storage := fieldStates[i].materializeStorage(); storage.keyCount() > 0 {
 			releaseFieldIndexStorageOwned(oldIndexStorage)
-			db.engine.index.Set(ordinal, storage)
+			qe.index.Set(ordinal, storage)
 		} else {
 			releaseFieldIndexStorageOwned(oldIndexStorage)
-			db.engine.index.Set(ordinal, fieldIndexStorage{})
+			qe.index.Set(ordinal, fieldIndexStorage{})
 		}
-		oldNilStorage := db.engine.nilIndex.Get(ordinal)
+		oldNilStorage := qe.nilIndex.Get(ordinal)
 		if storage := fieldStates[i].materializeNilStorage(); storage.keyCount() > 0 {
 			releaseFieldIndexStorageOwned(oldNilStorage)
-			db.engine.nilIndex.Set(ordinal, storage)
+			qe.nilIndex.Set(ordinal, storage)
 		} else {
 			releaseFieldIndexStorageOwned(oldNilStorage)
-			db.engine.nilIndex.Set(ordinal, fieldIndexStorage{})
+			qe.nilIndex.Set(ordinal, fieldIndexStorage{})
 		}
-		oldLenStorage := db.engine.lenIndex.Get(ordinal)
-		if storage, useZeroComplement := fieldStates[i].materializeLenStorage(db.engine.universe); active[i].slice {
+		oldLenStorage := qe.lenIndex.Get(ordinal)
+		if storage, useZeroComplement := fieldStates[i].materializeLenStorage(qe.universe); active[i].slice {
 			if storage.keyCount() > 0 {
 				releaseFieldIndexStorageOwned(oldLenStorage)
-				db.engine.lenIndex.Set(ordinal, storage)
+				qe.lenIndex.Set(ordinal, storage)
 			} else {
 				releaseFieldIndexStorageOwned(oldLenStorage)
-				db.engine.lenIndex.Set(ordinal, fieldIndexStorage{})
+				qe.lenIndex.Set(ordinal, fieldIndexStorage{})
 			}
 			if useZeroComplement {
-				db.engine.lenZeroComplement[ordinal] = true
+				qe.lenZeroComplement[ordinal] = true
 			}
 		}
 	}
@@ -1242,29 +1301,28 @@ func (db *DB[K, V]) buildIndex(skipFields map[string]struct{}, skipMeasureFields
 				measureEntrySlicePool.Put(buf)
 				localMeasureStates[worker][i] = nil
 			}
-			oldStorage := db.engine.measure.Get(i)
+			oldStorage := qe.measure.Get(i)
 			storage := newMeasureStorageFromEntriesOwned(entries)
 			oldMeasureStorages.Append(oldStorage)
-			db.engine.measure.Set(i, storage)
+			qe.measure.Set(i, storage)
 		}
 	}
 
-	recordCount := db.engine.universe.Cardinality()
+	recordCount := qe.universe.Cardinality()
+	buildTime := time.Since(start)
+	buildRPS := int(float64(recordCount) / max(buildTime.Seconds(), 1))
 
-	db.stats.BuildTime = time.Since(start)
-	db.stats.BuildRPS = int(float64(recordCount) / max(time.Since(start).Seconds(), 1))
-
-	for name, f := range db.engine.fields {
+	for name, f := range qe.fields {
 		if f.Slice {
-			acc, ok := db.engine.indexedFieldMap[name]
-			if !ok || db.engine.lenIndex.Get(acc.ordinal).keyCount() == 0 {
-				db.buildLenIndex()
+			acc, ok := qe.indexedFieldMap[name]
+			if !ok || qe.lenIndex.Get(acc.ordinal).keyCount() == 0 {
+				qe.buildLenIndex()
 				break
 			}
 		}
 	}
-	db.engine.lenIndexLoaded = false
-	err = db.publishCurrentSequenceSnapshotNoLock()
+	qe.lenIndexLoaded = false
+	err = qe.publishCurrentSequenceSnapshotNoLock(bolt, bucket, strMap)
 	if oldMeasureStorages != nil {
 		for i := 0; i < oldMeasureStorages.Len(); i++ {
 			releaseMeasureFieldStorageOwned(oldMeasureStorages.Get(i))
@@ -1272,7 +1330,7 @@ func (db *DB[K, V]) buildIndex(skipFields map[string]struct{}, skipMeasureFields
 		measureFieldStorageSlicePool.Put(oldMeasureStorages)
 	}
 	if err != nil {
-		return fmt.Errorf("publish snapshot: %w", err)
+		return buildIndexResult{}, fmt.Errorf("publish snapshot: %w", err)
 	}
 
 	active = nil
@@ -1283,7 +1341,11 @@ func (db *DB[K, V]) buildIndex(skipFields map[string]struct{}, skipMeasureFields
 	forceMemoryCleanup(true)
 	buildOK = true
 
-	return nil
+	return buildIndexResult{
+		stats:     true,
+		buildTime: buildTime,
+		buildRPS:  buildRPS,
+	}, nil
 }
 
 func addDistinctStrings(n int, valueAt func(int) string, add func(string)) int {
@@ -1377,31 +1439,31 @@ func indexKeyFromStoredString(s string, fixed8 bool) indexKey {
 	return indexKeyFromString(s)
 }
 
-func (db *DB[K, V]) idxFromKeyNoLock(key []byte) uint64 {
-	if db.strKey {
-		return db.strMap.createIdxNoLock(string(key))
+func idxFromKeyNoLock(strKey bool, strMap *strMapper, key []byte) uint64 {
+	if strKey {
+		return strMap.createIdxNoLock(string(key))
 	}
 	return binary.BigEndian.Uint64(key)
 }
 
-func (db *DB[K, V]) buildLenIndex() {
-	releaseFieldIndexStorageSlotsOwned(db.engine.lenIndex)
-	db.engine.lenIndex = fieldIndexStorageSlicePool.Get()
-	db.engine.lenIndex.SetLen(len(db.engine.indexedFieldAccess))
-	if db.engine.lenZeroComplement != nil {
-		pools.PutBoolSlice(db.engine.lenZeroComplement)
+func (qe *queryEngine) buildLenIndex() {
+	releaseFieldIndexStorageSlotsOwned(qe.lenIndex)
+	qe.lenIndex = fieldIndexStorageSlicePool.Get()
+	qe.lenIndex.SetLen(len(qe.indexedFieldAccess))
+	if qe.lenZeroComplement != nil {
+		pools.PutBoolSlice(qe.lenZeroComplement)
 	}
-	db.engine.lenZeroComplement = pools.GetBoolSlice(len(db.engine.indexedFieldAccess))[:len(db.engine.indexedFieldAccess)]
-	clear(db.engine.lenZeroComplement)
+	qe.lenZeroComplement = pools.GetBoolSlice(len(qe.indexedFieldAccess))[:len(qe.indexedFieldAccess)]
+	clear(qe.lenZeroComplement)
 
-	for _, acc := range db.engine.indexedFieldAccess {
+	for _, acc := range qe.indexedFieldAccess {
 		if !acc.field.Slice {
 			continue
 		}
-		result, useZeroComplement := rebuildLenIndexField(db.engine.universe, newFieldOverlayStorage(db.engine.index.Get(acc.ordinal)))
-		db.engine.lenIndex.Set(acc.ordinal, newFlatFieldIndexStorage(result))
+		result, useZeroComplement := rebuildLenIndexField(qe.universe, newFieldOverlayStorage(qe.index.Get(acc.ordinal)))
+		qe.lenIndex.Set(acc.ordinal, newFlatFieldIndexStorage(result))
 		if useZeroComplement {
-			db.engine.lenZeroComplement[acc.ordinal] = true
+			qe.lenZeroComplement[acc.ordinal] = true
 		}
 	}
 }
@@ -1435,17 +1497,34 @@ func (db *DB[K, V]) loadIndex() (
 	plannerStats *plannerStatsSnapshot,
 	err error,
 ) {
+	result, err := db.engine.loadIndex(db.rbiFile, db.bolt, db.bucket, db.strKey)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	if db.strKey {
+		db.strMap = result.strMap
+	}
+	db.stats.LoadTime = result.loadTime
+	return result.skipFields, result.skipMeasureFields, result.plannerStats, nil
+}
+
+func (qe *queryEngine) loadIndex(
+	rbiFile string,
+	bolt *bbolt.DB,
+	bucket []byte,
+	strKey bool,
+) (result loadIndexResult, err error) {
 	diag := persistedIndexLoadDiag{
-		file:   db.rbiFile,
-		dbPath: db.bolt.Path(),
-		bucket: string(db.bucket),
+		file:   rbiFile,
+		dbPath: bolt.Path(),
+		bucket: string(bucket),
 		size:   -1,
 	}
 	defer recoverLoadIndex(&err, &diag)
 
-	f, err := os.Open(db.rbiFile)
+	f, err := os.Open(rbiFile)
 	if err != nil {
-		return nil, nil, nil, err
+		return loadIndexResult{}, err
 	}
 	defer closeFile(f)
 	if info, statErr := f.Stat(); statErr == nil {
@@ -1457,7 +1536,7 @@ func (db *DB[K, V]) loadIndex() (
 
 	ver, err := reader.ReadByte()
 	if err != nil {
-		return nil, nil, nil, diag.wrap("read_version", fmt.Errorf("%w: reading version: %w", errPersistedIndexInvalid, err))
+		return loadIndexResult{}, diag.wrap("read_version", fmt.Errorf("%w: reading version: %w", errPersistedIndexInvalid, err))
 	}
 	diag.version = ver
 	diag.versionKnown = true
@@ -1465,109 +1544,115 @@ func (db *DB[K, V]) loadIndex() (
 	var lenLoaded bool
 	switch ver {
 	case 26:
-		skipFields, skipMeasureFields, plannerStats, lenLoaded, err = db.loadIndexV26(reader)
+		result.skipFields, result.skipMeasureFields, result.plannerStats, result.strMap, lenLoaded, err = qe.loadIndexV26(reader, bolt, bucket)
 	default:
-		return nil, nil, nil, diag.wrap("version", fmt.Errorf("%w: unsupported persisted index version: %v", errPersistedIndexInvalid, ver))
+		return loadIndexResult{}, diag.wrap("version", fmt.Errorf("%w: unsupported persisted index version: %v", errPersistedIndexInvalid, ver))
 	}
 	if err != nil {
 		if errors.Is(err, errPersistedIndexStale) || errors.Is(err, errPersistedIndexInvalid) {
-			return nil, nil, nil, diag.wrap("load_v26", err)
+			return loadIndexResult{}, diag.wrap("load_v26", err)
 		}
-		return nil, nil, nil, diag.wrap("load_v26", fmt.Errorf("error loading index: %w", err))
+		return loadIndexResult{}, diag.wrap("load_v26", fmt.Errorf("error loading index: %w", err))
 	}
 
-	db.engine.lenIndexLoaded = lenLoaded
-	db.stats.LoadTime = time.Since(start)
-	if err = db.publishCurrentSequenceSnapshotNoLock(); err != nil {
-		return nil, nil, nil, diag.wrap("publish_snapshot", fmt.Errorf("publish snapshot: %w", err))
+	qe.lenIndexLoaded = lenLoaded
+	publishStrMap := result.strMap
+	if !strKey {
+		publishStrMap = nil
 	}
+	if err = qe.publishCurrentSequenceSnapshotNoLock(bolt, bucket, publishStrMap); err != nil {
+		return loadIndexResult{}, diag.wrap("publish_snapshot", fmt.Errorf("publish snapshot: %w", err))
+	}
+	result.loadTime = time.Since(start)
 	forceMemoryCleanup(true)
 
-	return skipFields, skipMeasureFields, plannerStats, nil
+	return result, nil
 }
 
-func (db *DB[K, V]) loadIndexV26(
+func (qe *queryEngine) loadIndexV26(
 	reader *bufio.Reader,
-) (map[string]struct{}, map[string]struct{}, *plannerStatsSnapshot, bool, error) {
+	bolt *bbolt.DB,
+	bucket []byte,
+) (map[string]struct{}, map[string]struct{}, *plannerStatsSnapshot, *strMapper, bool, error) {
 	storedSeq, err := binary.ReadUvarint(reader)
 	if err != nil {
-		return nil, nil, nil, false, fmt.Errorf("decode: reading bucket sequence: %w", err)
+		return nil, nil, nil, nil, false, fmt.Errorf("decode: reading bucket sequence: %w", err)
 	}
 
-	currentSeq, err := db.currentBucketSequence()
+	currentSeq, err := currentBucketSequence(bolt, bucket)
 	if err != nil {
-		return nil, nil, nil, false, fmt.Errorf("decode: reading current bucket sequence: %w", err)
+		return nil, nil, nil, nil, false, fmt.Errorf("decode: reading current bucket sequence: %w", err)
 	}
 	if storedSeq != currentSeq {
-		return nil, nil, nil, false, fmt.Errorf("%w: bucket sequence mismatch (stored=%v, current=%v)", errPersistedIndexStale, storedSeq, currentSeq)
+		return nil, nil, nil, nil, false, fmt.Errorf("%w: bucket sequence mismatch (stored=%v, current=%v)", errPersistedIndexStale, storedSeq, currentSeq)
 	}
 
-	skipFields, skipMeasureFields, plannerStats, lenLoaded, err := db.loadIndexPayload(reader)
+	skipFields, skipMeasureFields, plannerStats, strMap, lenLoaded, err := qe.loadIndexPayload(reader)
 	if err != nil {
-		return nil, nil, nil, false, fmt.Errorf("%w: %w", errPersistedIndexInvalid, err)
+		return nil, nil, nil, nil, false, fmt.Errorf("%w: %w", errPersistedIndexInvalid, err)
 	}
-	return skipFields, skipMeasureFields, plannerStats, lenLoaded, nil
+	return skipFields, skipMeasureFields, plannerStats, strMap, lenLoaded, nil
 }
 
-func (db *DB[K, V]) loadIndexPayload(
+func (qe *queryEngine) loadIndexPayload(
 	reader *bufio.Reader,
-) (map[string]struct{}, map[string]struct{}, *plannerStatsSnapshot, bool, error) {
+) (map[string]struct{}, map[string]struct{}, *plannerStatsSnapshot, *strMapper, bool, error) {
 
 	var universe posting.List
 	universe, err := posting.ReadFrom(reader)
 	if err != nil {
-		return nil, nil, nil, false, fmt.Errorf("decode: reading universe: %w", err)
+		return nil, nil, nil, nil, false, fmt.Errorf("decode: reading universe: %w", err)
 	}
 
 	strmap, err := readStrMap(reader, defaultSnapshotStrMapCompactDepth)
 	if err != nil {
-		return nil, nil, nil, false, err
+		return nil, nil, nil, nil, false, err
 	}
 
-	compatible, err := readFieldCompatibility(reader, db.engine.fields)
+	compatible, err := readFieldCompatibility(reader, qe.fields)
 	if err != nil {
-		return nil, nil, nil, false, err
+		return nil, nil, nil, nil, false, err
 	}
-	measureCompatible, err := readFieldCompatibility(reader, db.engine.measureFields)
+	measureCompatible, err := readFieldCompatibility(reader, qe.measureFields)
 	if err != nil {
-		return nil, nil, nil, false, err
+		return nil, nil, nil, nil, false, err
 	}
 
 	indexes, err := readIndexSections(reader, compatible, "regular index")
 	if err != nil {
-		return nil, nil, nil, false, fmt.Errorf("decode: reading index sections: %w", err)
+		return nil, nil, nil, nil, false, fmt.Errorf("decode: reading index sections: %w", err)
 	}
 
 	nilIndexes, err := readIndexSections(reader, compatible, "nil index")
 	if err != nil {
-		return nil, nil, nil, false, fmt.Errorf("decode: reading nil index sections: %w", err)
+		return nil, nil, nil, nil, false, fmt.Errorf("decode: reading nil index sections: %w", err)
 	}
 
 	lenIndexes, err := readIndexSections(reader, compatible, "len index")
 	if err != nil {
-		return nil, nil, nil, false, fmt.Errorf("decode: reading len index sections: %w", err)
+		return nil, nil, nil, nil, false, fmt.Errorf("decode: reading len index sections: %w", err)
 	}
 
 	measureIndexes, err := readMeasureIndexSections(reader, measureCompatible)
 	if err != nil {
-		return nil, nil, nil, false, fmt.Errorf("decode: reading measure index sections: %w", err)
+		return nil, nil, nil, nil, false, fmt.Errorf("decode: reading measure index sections: %w", err)
 	}
 
 	plannerStats, err := readPlannerStatsSnapshot(reader, compatible)
 	if err != nil {
-		return nil, nil, nil, false, fmt.Errorf("decode: reading planner stats: %w", err)
+		return nil, nil, nil, nil, false, fmt.Errorf("decode: reading planner stats: %w", err)
 	}
 
-	skipFields := make(map[string]struct{}, len(db.engine.fields))
-	for name := range db.engine.fields {
+	skipFields := make(map[string]struct{}, len(qe.fields))
+	for name := range qe.fields {
 		_, hasRegular := indexes[name]
 		_, hasNil := nilIndexes[name]
 		if compatible[name] && (hasRegular || hasNil) {
 			skipFields[name] = struct{}{}
 		}
 	}
-	skipMeasureFields := make(map[string]struct{}, len(db.engine.measureFields))
-	for name := range db.engine.measureFields {
+	skipMeasureFields := make(map[string]struct{}, len(qe.measureFields))
+	for name := range qe.measureFields {
 		if measureCompatible[name] {
 			if _, hasMeasure := measureIndexes[name]; hasMeasure {
 				skipMeasureFields[name] = struct{}{}
@@ -1575,42 +1660,39 @@ func (db *DB[K, V]) loadIndexPayload(
 		}
 	}
 
-	db.engine.universe = universe
-	if db.strKey {
-		db.strMap = strmap
+	qe.universe = universe
+	releaseFieldIndexStorageSlotsOwned(qe.index)
+	releaseFieldIndexStorageSlotsOwned(qe.nilIndex)
+	releaseFieldIndexStorageSlotsOwned(qe.lenIndex)
+	releaseMeasureFieldStorageSlotsOwned(qe.measure)
+	if qe.lenZeroComplement != nil {
+		pools.PutBoolSlice(qe.lenZeroComplement)
 	}
-	releaseFieldIndexStorageSlotsOwned(db.engine.index)
-	releaseFieldIndexStorageSlotsOwned(db.engine.nilIndex)
-	releaseFieldIndexStorageSlotsOwned(db.engine.lenIndex)
-	releaseMeasureFieldStorageSlotsOwned(db.engine.measure)
-	if db.engine.lenZeroComplement != nil {
-		pools.PutBoolSlice(db.engine.lenZeroComplement)
-	}
-	db.engine.index = fieldIndexStorageSlicePool.Get()
-	db.engine.index.SetLen(len(db.engine.indexedFieldAccess))
-	db.engine.nilIndex = fieldIndexStorageSlicePool.Get()
-	db.engine.nilIndex.SetLen(len(db.engine.indexedFieldAccess))
-	db.engine.lenIndex = fieldIndexStorageSlicePool.Get()
-	db.engine.lenIndex.SetLen(len(db.engine.indexedFieldAccess))
-	db.engine.measure = measureFieldStorageSlicePool.Get()
-	db.engine.measure.SetLen(len(db.engine.measureFieldAccess))
-	for _, acc := range db.engine.indexedFieldAccess {
+	qe.index = fieldIndexStorageSlicePool.Get()
+	qe.index.SetLen(len(qe.indexedFieldAccess))
+	qe.nilIndex = fieldIndexStorageSlicePool.Get()
+	qe.nilIndex.SetLen(len(qe.indexedFieldAccess))
+	qe.lenIndex = fieldIndexStorageSlicePool.Get()
+	qe.lenIndex.SetLen(len(qe.indexedFieldAccess))
+	qe.measure = measureFieldStorageSlicePool.Get()
+	qe.measure.SetLen(len(qe.measureFieldAccess))
+	for _, acc := range qe.indexedFieldAccess {
 		if storage, ok := indexes[acc.name]; ok {
-			db.engine.index.Set(acc.ordinal, storage)
+			qe.index.Set(acc.ordinal, storage)
 			delete(indexes, acc.name)
 		}
 		if storage, ok := nilIndexes[acc.name]; ok {
-			db.engine.nilIndex.Set(acc.ordinal, storage)
+			qe.nilIndex.Set(acc.ordinal, storage)
 			delete(nilIndexes, acc.name)
 		}
 		if storage, ok := lenIndexes[acc.name]; ok {
-			db.engine.lenIndex.Set(acc.ordinal, storage)
+			qe.lenIndex.Set(acc.ordinal, storage)
 			delete(lenIndexes, acc.name)
 		}
 	}
-	for _, acc := range db.engine.measureFieldAccess {
+	for _, acc := range qe.measureFieldAccess {
 		if storage, ok := measureIndexes[acc.name]; ok {
-			db.engine.measure.Set(acc.ordinal, storage)
+			qe.measure.Set(acc.ordinal, storage)
 			delete(measureIndexes, acc.name)
 		}
 	}
@@ -1618,29 +1700,29 @@ func (db *DB[K, V]) loadIndexPayload(
 	releaseFieldIndexStorageMapOwned(nilIndexes)
 	releaseFieldIndexStorageMapOwned(lenIndexes)
 	releaseMeasureFieldStorageMapOwned(measureIndexes)
-	db.engine.lenZeroComplement = detectLenZeroComplement(db.engine.lenIndex, db.engine.indexedFieldAccess)
+	qe.lenZeroComplement = detectLenZeroComplement(qe.lenIndex, qe.indexedFieldAccess)
 
 	lenLoaded := true
-	for name := range db.engine.fields {
+	for name := range qe.fields {
 		if _, ok := skipFields[name]; !ok {
 			lenLoaded = false
 			break
 		}
 	}
 	if lenLoaded && !universe.IsEmpty() {
-		for name, f := range db.engine.fields {
+		for name, f := range qe.fields {
 			if f == nil || !f.Slice {
 				continue
 			}
 			if _, ok := skipFields[name]; !ok {
 				continue
 			}
-			acc, ok := db.engine.indexedFieldMap[name]
+			acc, ok := qe.indexedFieldMap[name]
 			if !ok {
 				lenLoaded = false
 				break
 			}
-			base := db.engine.lenIndex.Get(acc.ordinal).flatSlice()
+			base := qe.lenIndex.Get(acc.ordinal).flatSlice()
 			if base == nil || len(*base) == 0 {
 				lenLoaded = false
 				break
@@ -1648,7 +1730,7 @@ func (db *DB[K, V]) loadIndexPayload(
 		}
 	}
 
-	return skipFields, skipMeasureFields, plannerStats, lenLoaded, nil
+	return skipFields, skipMeasureFields, plannerStats, strmap, lenLoaded, nil
 }
 
 func detectLenZeroComplement(indexes *pooled.Slice[fieldIndexStorage], access []indexedFieldAccessor) []bool {
@@ -1729,9 +1811,13 @@ func (db *DB[K, V]) storeIndex() error {
 		}
 	}
 
+	return db.engine.storeIndex(db.rbiFile, db.bolt, db.bucket)
+}
+
+func (qe *queryEngine) storeIndex(rbiFile string, bolt *bbolt.DB, bucket []byte) error {
 	forceMemoryCleanup(true)
 
-	tmpFile := db.rbiFile + ".temp"
+	tmpFile := rbiFile + ".temp"
 	defer os.Remove(tmpFile)
 
 	f, err := os.Create(tmpFile)
@@ -1742,12 +1828,12 @@ func (db *DB[K, V]) storeIndex() error {
 
 	buf := bufio.NewWriterSize(f, 32<<20)
 
-	seq, err := db.currentBucketSequence()
+	seq, err := currentBucketSequence(bolt, bucket)
 	if err != nil {
 		return fmt.Errorf("store: reading bucket sequence: %w", err)
 	}
 
-	if err = db.storeIndexV26(buf, seq); err != nil {
+	if err = qe.storeIndexV26(buf, seq); err != nil {
 		return err
 	}
 
@@ -1761,16 +1847,16 @@ func (db *DB[K, V]) storeIndex() error {
 	if err = f.Close(); err != nil {
 		return err
 	}
-	if err = os.Rename(tmpFile, db.rbiFile); err != nil {
+	if err = os.Rename(tmpFile, rbiFile); err != nil {
 		return err
 	}
-	if err = syncDir(db.rbiFile); err != nil {
+	if err = syncDir(rbiFile); err != nil {
 		return fmt.Errorf("syncing persisted index directory: %w", err)
 	}
 	return nil
 }
 
-func (db *DB[K, V]) storeIndexV26(writer *bufio.Writer, bucketSeq uint64) error {
+func (qe *queryEngine) storeIndexV26(writer *bufio.Writer, bucketSeq uint64) error {
 	if err := writer.WriteByte(26); err != nil {
 		return fmt.Errorf("store: writing version: %w", err)
 	}
@@ -1778,11 +1864,11 @@ func (db *DB[K, V]) storeIndexV26(writer *bufio.Writer, bucketSeq uint64) error 
 		return fmt.Errorf("store: writing bucket sequence: %w", err)
 	}
 
-	return db.storeIndexPayload(writer)
+	return qe.storeIndexPayload(writer)
 }
 
-func (db *DB[K, V]) storeIndexPayload(writer *bufio.Writer) error {
-	snap := db.engine.getSnapshot()
+func (qe *queryEngine) storeIndexPayload(writer *bufio.Writer) error {
+	snap := qe.getSnapshot()
 	universe := snap.universe.Borrow()
 
 	if err := universe.WriteTo(writer); err != nil {
@@ -1793,10 +1879,10 @@ func (db *DB[K, V]) storeIndexPayload(writer *bufio.Writer) error {
 		return err
 	}
 
-	if err := writeFields(writer, db.engine.fields); err != nil {
+	if err := writeFields(writer, qe.fields); err != nil {
 		return err
 	}
-	if err := writeFields(writer, db.engine.measureFields); err != nil {
+	if err := writeFields(writer, qe.measureFields); err != nil {
 		return err
 	}
 
@@ -1827,10 +1913,10 @@ func (db *DB[K, V]) storeIndexPayload(writer *bufio.Writer) error {
 		return err
 	}
 
-	measureFieldNames := sortedMapFieldNames(db.engine.measureFields)
+	measureFieldNames := sortedMapFieldNames(qe.measureFields)
 
 	if err := writeMeasureIndexFamily(writer, measureFieldNames, func(field string) measureFieldStorage {
-		acc := db.engine.measureFieldMap[field]
+		acc := qe.measureFieldMap[field]
 		if snap.measure == nil || acc.ordinal >= snap.measure.Len() {
 			return measureFieldStorage{}
 		}
@@ -1839,13 +1925,13 @@ func (db *DB[K, V]) storeIndexPayload(writer *bufio.Writer) error {
 		return err
 	}
 
-	statsVersion := db.engine.planner.statsVersion.Load()
+	statsVersion := qe.planner.statsVersion.Load()
 	if statsVersion == 0 {
 		statsVersion = 1
 	} else {
 		statsVersion++
 	}
-	if err := writePlannerStatsSnapshot(writer, db.plannerStatsSnapshotForPersistLocked(statsVersion)); err != nil {
+	if err := writePlannerStatsSnapshot(writer, qe.plannerStatsSnapshotForPersistLocked(statsVersion)); err != nil {
 		return err
 	}
 

@@ -9,11 +9,12 @@ import (
 	"github.com/vapstack/rbi/internal/posting"
 )
 
-type snapshotBatchEntry[K ~string | ~uint64, V any] struct {
-	req    *autoBatchRequest[K, V]
-	idx    uint64
-	oldVal *V
-	newVal *V
+type snapshotBatchEntry struct {
+	idx       uint64
+	oldVal    unsafe.Pointer
+	newVal    unsafe.Pointer
+	patch     []Field
+	patchOnly bool
 }
 
 type batchPostingDelta struct {
@@ -198,57 +199,52 @@ func (deltas *indexedFieldBatchDeltas) markTouched(ordinal int) {
 	deltas.touched = append(deltas.touched, ordinal)
 }
 
-func normalizePreparedBatchForSnapshot[K ~string | ~uint64, V any](prepared []autoBatchPrepared[K, V]) []snapshotBatchEntry[K, V] {
-	if len(prepared) == 0 {
+func normalizePreparedBatchForSnapshot(entries []snapshotBatchEntry) []snapshotBatchEntry {
+	if len(entries) == 0 {
 		return nil
 	}
-	if len(prepared) == 1 {
-		op := prepared[0]
+	if len(entries) == 1 {
+		op := entries[0]
 		if op.oldVal == nil && op.newVal == nil {
 			return nil
 		}
-		return []snapshotBatchEntry[K, V]{
-			{
-				req:    op.req,
-				idx:    op.idx,
-				oldVal: op.oldVal,
-				newVal: op.newVal,
-			},
-		}
+		return entries[:1]
 	}
 
-	out := make([]snapshotBatchEntry[K, V], 0, len(prepared))
-	pos := make(map[uint64]int, len(prepared))
+	pos := uint64IntMapPool.Get(len(entries))
+	defer uint64IntMapPool.Put(pos)
 
-	for i := range prepared {
-		op := prepared[i]
-		if p, ok := pos[op.idx]; ok {
+	n := 0
+	for i := range entries {
+		op := entries[i]
+		if p := pos[op.idx]; p != 0 {
 			// Repeated-id entries collapse to first oldVal -> last newVal.
 			// Patch metadata from any individual request is no longer sufficient
 			// to describe the aggregated diff across the whole chain, so disable
 			// the patch-only fast path for this normalized entry.
-			out[p].req = nil
-			out[p].newVal = op.newVal
+			entries[p-1].patch = nil
+			entries[p-1].patchOnly = false
+			entries[p-1].newVal = op.newVal
 			continue
 		}
-		pos[op.idx] = len(out)
-		out = append(out, snapshotBatchEntry[K, V]{
-			req:    op.req,
-			idx:    op.idx,
-			oldVal: op.oldVal,
-			newVal: op.newVal,
-		})
-	}
-
-	n := 0
-	for i := range out {
-		if out[i].oldVal == nil && out[i].newVal == nil {
-			continue
+		pos[op.idx] = n + 1
+		if n != i {
+			entries[n] = op
 		}
-		out[n] = out[i]
 		n++
 	}
-	return out[:n]
+
+	write := 0
+	for i := 0; i < n; i++ {
+		if entries[i].oldVal == nil && entries[i].newVal == nil {
+			continue
+		}
+		if write != i {
+			entries[write] = entries[i]
+		}
+		write++
+	}
+	return entries[:write]
 }
 
 func addFixedFieldBatchPostingDelta(fieldDelta map[uint64]batchPostingDelta, key uint64, idx uint64, isAdd bool) map[uint64]batchPostingDelta {
@@ -1738,30 +1734,26 @@ func mergeInsertOnlyFixedFieldStorageOwned(
 	return newRegularFieldIndexStorage(slice)
 }
 
-func (db *DB[K, V]) forEachSnapshotModifiedIndexedField(op snapshotBatchEntry[K, V], fn func(indexedFieldAccessor) bool) {
-	if fn == nil {
-		return
-	}
-	req := op.req
-	if req != nil &&
-		req.op == autoBatchPatch &&
-		op.oldVal != nil &&
-		op.newVal != nil &&
-		len(req.beforeProcess) == 0 &&
-		len(req.beforeStore) == 0 {
-		for i, patchField := range req.patch {
-			f, ok := db.patchMap[patchField.Name]
+func (qe *queryEngine) collectSnapshotBatchEntryDiffs(
+	op snapshotBatchEntry,
+	deltas *indexedFieldBatchDeltas,
+	lenZeroComplement []bool,
+	patchMap map[string]*field,
+) {
+	if op.patchOnly {
+		for i, patchField := range op.patch {
+			fieldDef, ok := patchMap[patchField.Name]
 			if !ok {
 				continue
 			}
-			acc, ok := db.engine.indexedFieldMap[f.DBName]
+			acc, ok := qe.indexedFieldMap[fieldDef.DBName]
 			if !ok {
 				continue
 			}
 			duplicate := false
 			for j := 0; j < i; j++ {
-				prev, ok := db.patchMap[req.patch[j].Name]
-				if ok && prev.DBName == f.DBName {
+				prev, ok := patchMap[op.patch[j].Name]
+				if ok && prev.DBName == fieldDef.DBName {
 					duplicate = true
 					break
 				}
@@ -1769,69 +1761,68 @@ func (db *DB[K, V]) forEachSnapshotModifiedIndexedField(op snapshotBatchEntry[K,
 			if duplicate {
 				continue
 			}
-			if !fn(acc) {
-				return
-			}
+			deltas.markTouched(acc.ordinal)
+			useZeroComplement := acc.ordinal < len(lenZeroComplement) && lenZeroComplement[acc.ordinal]
+			acc.collectSnapshotBatchDiff(op.idx, op.oldVal, op.newVal, useZeroComplement, deltas.fields.GetPtr(acc.ordinal))
 		}
 		return
 	}
-	db.forEachModifiedIndexedField(op.oldVal, op.newVal, fn)
-}
 
-func (db *DB[K, V]) collectSnapshotBatchEntryDiffs(
-	op snapshotBatchEntry[K, V],
-	deltas *indexedFieldBatchDeltas,
-	lenZeroComplement []bool,
-) {
-	var ptrOld, ptrNew unsafe.Pointer
-	if op.oldVal != nil {
-		ptrOld = unsafe.Pointer(op.oldVal)
-	}
-	if op.newVal != nil {
-		ptrNew = unsafe.Pointer(op.newVal)
+	if op.oldVal == nil || op.newVal == nil {
+		for _, acc := range qe.indexedFieldAccess {
+			deltas.markTouched(acc.ordinal)
+			useZeroComplement := acc.ordinal < len(lenZeroComplement) && lenZeroComplement[acc.ordinal]
+			acc.collectSnapshotBatchDiff(op.idx, op.oldVal, op.newVal, useZeroComplement, deltas.fields.GetPtr(acc.ordinal))
+		}
+		return
 	}
 
-	db.forEachSnapshotModifiedIndexedField(op, func(acc indexedFieldAccessor) bool {
+	for _, acc := range qe.indexedFieldAccess {
+		if acc.modified == nil || !acc.modified(op.oldVal, op.newVal) {
+			continue
+		}
 		deltas.markTouched(acc.ordinal)
 		useZeroComplement := acc.ordinal < len(lenZeroComplement) && lenZeroComplement[acc.ordinal]
-		acc.collectSnapshotBatchDiff(op.idx, ptrOld, ptrNew, useZeroComplement, deltas.fields.GetPtr(acc.ordinal))
-		return true
-	})
+		acc.collectSnapshotBatchDiff(op.idx, op.oldVal, op.newVal, useZeroComplement, deltas.fields.GetPtr(acc.ordinal))
+	}
 }
 
-func (db *DB[K, V]) buildPreparedSnapshotAggregatedNoLock(
+func (qe *queryEngine) buildPreparedSnapshotAggregatedNoLock(
 	seq uint64,
 	prev *indexSnapshot,
-	prepared []autoBatchPrepared[K, V],
+	strMap *strMapper,
+	patchMap map[string]*field,
+	entries []snapshotBatchEntry,
 ) *indexSnapshot {
+
 	var strmap *strMapSnapshot
-	if db.strMap != nil {
-		strmap = db.strMap.snapshot()
+	if strMap != nil {
+		strmap = strMap.snapshot()
 	}
 	next := &indexSnapshot{
 		seq: seq,
 
-		index:              cloneFieldIndexStorageSlots(prev.index, len(db.engine.indexedFieldAccess)),
-		nilIndex:           cloneFieldIndexStorageSlots(prev.nilIndex, len(db.engine.indexedFieldAccess)),
-		lenIndex:           cloneFieldIndexStorageSlots(prev.lenIndex, len(db.engine.indexedFieldAccess)),
-		lenZeroComplement:  cloneFieldIndexBoolSlots(prev.lenZeroComplement, len(db.engine.indexedFieldAccess)),
-		measure:            cloneMeasureFieldStorageSlots(prev.measure, len(db.engine.measureFieldAccess)),
-		indexedFieldByName: db.engine.indexedFieldMap,
+		index:              cloneFieldIndexStorageSlots(prev.index, len(qe.indexedFieldAccess)),
+		nilIndex:           cloneFieldIndexStorageSlots(prev.nilIndex, len(qe.indexedFieldAccess)),
+		lenIndex:           cloneFieldIndexStorageSlots(prev.lenIndex, len(qe.indexedFieldAccess)),
+		lenZeroComplement:  cloneFieldIndexBoolSlots(prev.lenZeroComplement, len(qe.indexedFieldAccess)),
+		measure:            cloneMeasureFieldStorageSlots(prev.measure, len(qe.measureFieldAccess)),
+		indexedFieldByName: qe.indexedFieldMap,
 		universe:           prev.universe,
 		universeOwner:      prev.universeOwner,
 		strmap:             strmap,
 	}
-	db.engine.initSnapshotRuntimeCaches(next)
+	qe.initSnapshotRuntimeCaches(next)
 
-	normalized := normalizePreparedBatchForSnapshot(prepared)
+	normalized := normalizePreparedBatchForSnapshot(entries)
 	deltas := indexedFieldBatchDeltas{
 		fields:  snapshotFieldBatchStateSlicePool.Get(),
-		touched: pools.GetIntSlice(len(db.engine.indexedFieldAccess)),
-		changed: pools.GetBoolSlice(len(db.engine.indexedFieldAccess))[:len(db.engine.indexedFieldAccess)],
+		touched: pools.GetIntSlice(len(qe.indexedFieldAccess)),
+		changed: pools.GetBoolSlice(len(qe.indexedFieldAccess))[:len(qe.indexedFieldAccess)],
 	}
-	deltas.fields.SetLen(len(db.engine.indexedFieldAccess))
+	deltas.fields.SetLen(len(qe.indexedFieldAccess))
 	clear(deltas.changed)
-	measureDeltas := newMeasureFieldBatchDeltas(len(db.engine.measureFieldAccess))
+	measureDeltas := newMeasureFieldBatchDeltas(len(qe.measureFieldAccess))
 
 	universeOwned := false
 
@@ -1845,17 +1836,19 @@ func (db *DB[K, V]) buildPreparedSnapshotAggregatedNoLock(
 			ensureSnapshotUniverseOwned(next, &universeOwned)
 			next.universe = next.universe.BuildRemoved(op.idx)
 		}
-		db.collectSnapshotBatchEntryDiffs(op, &deltas, prev.lenZeroComplement)
-		db.collectSnapshotMeasureEntryDiffs(op, &measureDeltas)
+		qe.collectSnapshotBatchEntryDiffs(op, &deltas, prev.lenZeroComplement, patchMap)
+		qe.collectSnapshotMeasureEntryDiffs(op, &measureDeltas, patchMap)
 	}
 
 	for i := range deltas.touched {
 		deltas.changed[deltas.touched[i]] = false
 	}
+
 	changedCount := 0
+
 	for i := range deltas.touched {
 		ordinal := deltas.touched[i]
-		acc := db.engine.indexedFieldAccess[ordinal]
+		acc := qe.indexedFieldAccess[ordinal]
 		state := deltas.fields.GetPtr(ordinal)
 		baseIndex := next.index.Get(ordinal)
 		if storage := acc.applySnapshotBatchStorageOwned(baseIndex, state, true); storage.keyCount() == 0 {
@@ -1890,9 +1883,9 @@ func (db *DB[K, V]) buildPreparedSnapshotAggregatedNoLock(
 	measureDeltas.release()
 	inheritNumericRangeBucketCache(next, prev)
 	if changedCount > 0 {
-		inheritMaterializedPredCache(next, prev, db.engine.indexedFieldMap, deltas.changed)
+		inheritMaterializedPredCache(next, prev, qe.indexedFieldMap, deltas.changed)
 	} else {
-		inheritMaterializedPredCache(next, prev, db.engine.indexedFieldMap, nil)
+		inheritMaterializedPredCache(next, prev, qe.indexedFieldMap, nil)
 	}
 	snapshotFieldBatchStateSlicePool.Put(deltas.fields)
 	pools.PutBoolSlice(deltas.changed)

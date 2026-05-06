@@ -20,7 +20,7 @@ import (
 func mustCurrentBucketSequence(t *testing.T, db *DB[uint64, Rec]) uint64 {
 	t.Helper()
 
-	seq, err := db.currentBucketSequence()
+	seq, err := currentBucketSequence(db.bolt, db.bucket)
 	if err != nil {
 		t.Fatalf("currentBucketSequence: %v", err)
 	}

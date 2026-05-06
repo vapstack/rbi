@@ -68,46 +68,6 @@ func (db *DB[K, V]) forEachModifiedMeasureField(v1 *V, v2 *V, fn func(measureFie
 	}
 }
 
-func (db *DB[K, V]) forEachSnapshotModifiedMeasureField(op snapshotBatchEntry[K, V], fn func(measureFieldAccessor) bool) {
-	if len(db.engine.measureFieldAccess) == 0 {
-		return
-	}
-	req := op.req
-	if req != nil &&
-		req.op == autoBatchPatch &&
-		op.oldVal != nil &&
-		op.newVal != nil &&
-		len(req.beforeProcess) == 0 &&
-		len(req.beforeStore) == 0 {
-		for i, patchField := range req.patch {
-			f, ok := db.patchMap[patchField.Name]
-			if !ok {
-				continue
-			}
-			acc, ok := db.engine.measureFieldMap[f.DBName]
-			if !ok {
-				continue
-			}
-			duplicate := false
-			for j := 0; j < i; j++ {
-				prev, ok := db.patchMap[req.patch[j].Name]
-				if ok && prev.DBName == f.DBName {
-					duplicate = true
-					break
-				}
-			}
-			if duplicate {
-				continue
-			}
-			if !fn(acc) {
-				return
-			}
-		}
-		return
-	}
-	db.forEachModifiedMeasureField(op.oldVal, op.newVal, fn)
-}
-
 func (acc measureFieldAccessor) collectSnapshotMeasureDelta(
 	idx uint64,
 	oldPtr unsafe.Pointer,
@@ -134,18 +94,43 @@ func (acc measureFieldAccessor) collectSnapshotMeasureDelta(
 	})
 }
 
-func (db *DB[K, V]) collectSnapshotMeasureEntryDiffs(op snapshotBatchEntry[K, V], deltas *measureFieldBatchDeltas) {
-	var ptrOld, ptrNew unsafe.Pointer
-	if op.oldVal != nil {
-		ptrOld = unsafe.Pointer(op.oldVal)
+func (qe *queryEngine) collectSnapshotMeasureEntryDiffs(op snapshotBatchEntry, deltas *measureFieldBatchDeltas, patchMap map[string]*field) {
+	if op.patchOnly {
+		for i, patchField := range op.patch {
+			fieldDef, ok := patchMap[patchField.Name]
+			if !ok {
+				continue
+			}
+			acc, ok := qe.measureFieldMap[fieldDef.DBName]
+			if !ok {
+				continue
+			}
+			duplicate := false
+			for j := 0; j < i; j++ {
+				prev, ok := patchMap[op.patch[j].Name]
+				if ok && prev.DBName == fieldDef.DBName {
+					duplicate = true
+					break
+				}
+			}
+			if duplicate {
+				continue
+			}
+			acc.collectSnapshotMeasureDelta(op.idx, op.oldVal, op.newVal, deltas)
+		}
+		return
 	}
-	if op.newVal != nil {
-		ptrNew = unsafe.Pointer(op.newVal)
+	if op.oldVal == nil || op.newVal == nil {
+		for _, acc := range qe.measureFieldAccess {
+			acc.collectSnapshotMeasureDelta(op.idx, op.oldVal, op.newVal, deltas)
+		}
+		return
 	}
-	db.forEachSnapshotModifiedMeasureField(op, func(acc measureFieldAccessor) bool {
-		acc.collectSnapshotMeasureDelta(op.idx, ptrOld, ptrNew, deltas)
-		return true
-	})
+	for _, acc := range qe.measureFieldAccess {
+		if acc.modified != nil && acc.modified(op.oldVal, op.newVal) {
+			acc.collectSnapshotMeasureDelta(op.idx, op.oldVal, op.newVal, deltas)
+		}
+	}
 }
 
 func applyMeasureFieldBatchDeltas(next *indexSnapshot, deltas *measureFieldBatchDeltas) {

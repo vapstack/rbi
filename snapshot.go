@@ -5,7 +5,6 @@ import (
 	"sort"
 	"sync"
 	"sync/atomic"
-	"unsafe"
 
 	"github.com/vapstack/rbi/internal/pooled"
 	"github.com/vapstack/rbi/internal/pools"
@@ -1457,35 +1456,35 @@ func addFixedFieldPostingListHint(fieldMap map[uint64]posting.List, key uint64, 
 	return fieldMap
 }
 
-func (db *DB[K, V]) buildPreparedSnapshotNoLock(seq uint64, prepared []autoBatchPrepared[K, V]) *indexSnapshot {
-	prev := db.engine.getSnapshot()
-	if snap, ok := db.buildPreparedSnapshotFromEmptyBaseNoLock(seq, prev, prepared); ok {
+func (qe *queryEngine) buildPreparedSnapshotNoLock(seq uint64, strMap *strMapper, patchMap map[string]*field, entries []snapshotBatchEntry) *indexSnapshot {
+	prev := qe.getSnapshot()
+	if snap, ok := qe.buildPreparedSnapshotFromEmptyBaseNoLock(seq, prev, strMap, entries); ok {
 		return snap
 	}
-	if snap, ok := db.buildPreparedSnapshotInsertOnlyNoLock(seq, prev, prepared); ok {
+	if snap, ok := qe.buildPreparedSnapshotInsertOnlyNoLock(seq, prev, strMap, entries); ok {
 		return snap
 	}
-	return db.buildPreparedSnapshotAggregatedNoLock(seq, prev, prepared)
+	return qe.buildPreparedSnapshotAggregatedNoLock(seq, prev, strMap, patchMap, entries)
 }
 
-func (db *DB[K, V]) buildPreparedSnapshotFromEmptyBaseNoLock(seq uint64, prev *indexSnapshot, prepared []autoBatchPrepared[K, V]) (*indexSnapshot, bool) {
+func (qe *queryEngine) buildPreparedSnapshotFromEmptyBaseNoLock(seq uint64, prev *indexSnapshot, strMap *strMapper, entries []snapshotBatchEntry) (*indexSnapshot, bool) {
 	if prev != nil && !prev.universe.IsEmpty() {
 		return nil, false
 	}
-	if len(prepared) == 0 {
+	if len(entries) == 0 {
 		return nil, false
 	}
-	for i := range prepared {
-		if prepared[i].oldVal != nil || prepared[i].newVal == nil {
+	for i := range entries {
+		if entries[i].oldVal != nil || entries[i].newVal == nil {
 			return nil, false
 		}
 	}
 
 	var universe posting.List
 	hasRepeated := false
-	for i := range prepared {
+	for i := range entries {
 		var added bool
-		universe, added = universe.BuildAddedChecked(prepared[i].idx)
+		universe, added = universe.BuildAddedChecked(entries[i].idx)
 		if !added {
 			hasRepeated = true
 		}
@@ -1493,26 +1492,26 @@ func (db *DB[K, V]) buildPreparedSnapshotFromEmptyBaseNoLock(seq uint64, prev *i
 
 	var lastByIdx map[uint64]int
 	if hasRepeated {
-		lastByIdx = uint64IntMapPool.Get(len(prepared))
-		for i := range prepared {
-			lastByIdx[prepared[i].idx] = i
+		lastByIdx = uint64IntMapPool.Get(len(entries))
+		for i := range entries {
+			lastByIdx[entries[i].idx] = i
 		}
 	}
 
-	fieldStates := make([]snapshotFieldOverlayState, len(db.engine.indexedFieldAccess))
-	measureStates := make([]*pooled.Slice[measureEntry], len(db.engine.measureFieldAccess))
+	fieldStates := make([]snapshotFieldOverlayState, len(qe.indexedFieldAccess))
+	measureStates := make([]*pooled.Slice[measureEntry], len(qe.measureFieldAccess))
 
-	for i := range prepared {
-		if hasRepeated && lastByIdx[prepared[i].idx] != i {
+	for i := range entries {
+		if hasRepeated && lastByIdx[entries[i].idx] != i {
 			continue
 		}
-		op := prepared[i]
-		ptr := unsafe.Pointer(op.newVal)
+		op := entries[i]
+		ptr := op.newVal
 
-		for _, acc := range db.engine.indexedFieldAccess {
+		for _, acc := range qe.indexedFieldAccess {
 			acc.collectSnapshotOverlayValue(ptr, op.idx, &fieldStates[acc.ordinal])
 		}
-		for _, acc := range db.engine.measureFieldAccess {
+		for _, acc := range qe.measureFieldAccess {
 			if value, ok := acc.read(ptr); ok {
 				buf := measureStates[acc.ordinal]
 				if buf == nil {
@@ -1528,26 +1527,26 @@ func (db *DB[K, V]) buildPreparedSnapshotFromEmptyBaseNoLock(seq uint64, prev *i
 	}
 
 	nextIndex := fieldIndexStorageSlicePool.Get()
-	nextIndex.SetLen(len(db.engine.indexedFieldAccess))
-	for i, acc := range db.engine.indexedFieldAccess {
+	nextIndex.SetLen(len(qe.indexedFieldAccess))
+	for i, acc := range qe.indexedFieldAccess {
 		if storage := acc.materializeSnapshotOverlayStorageOwned(&fieldStates[i]); storage.keyCount() > 0 {
 			nextIndex.Set(i, storage)
 		}
 	}
 
 	nextNilIndex := fieldIndexStorageSlicePool.Get()
-	nextNilIndex.SetLen(len(db.engine.indexedFieldAccess))
-	for i, acc := range db.engine.indexedFieldAccess {
+	nextNilIndex.SetLen(len(qe.indexedFieldAccess))
+	for i, acc := range qe.indexedFieldAccess {
 		if storage := acc.materializeSnapshotOverlayNilStorageOwned(&fieldStates[i]); storage.keyCount() > 0 {
 			nextNilIndex.Set(i, storage)
 		}
 	}
 
 	nextLenIndex := fieldIndexStorageSlicePool.Get()
-	nextLenIndex.SetLen(len(db.engine.indexedFieldAccess))
-	nextLenZeroComplement := pools.GetBoolSlice(len(db.engine.indexedFieldAccess))[:len(db.engine.indexedFieldAccess)]
+	nextLenIndex.SetLen(len(qe.indexedFieldAccess))
+	nextLenZeroComplement := pools.GetBoolSlice(len(qe.indexedFieldAccess))[:len(qe.indexedFieldAccess)]
 	clear(nextLenZeroComplement)
-	for i, acc := range db.engine.indexedFieldAccess {
+	for i, acc := range qe.indexedFieldAccess {
 		if !acc.field.Slice {
 			continue
 		}
@@ -1560,16 +1559,16 @@ func (db *DB[K, V]) buildPreparedSnapshotFromEmptyBaseNoLock(seq uint64, prev *i
 		}
 	}
 	nextMeasure := measureFieldStorageSlicePool.Get()
-	nextMeasure.SetLen(len(db.engine.measureFieldAccess))
-	for i := range db.engine.measureFieldAccess {
+	nextMeasure.SetLen(len(qe.measureFieldAccess))
+	for i := range qe.measureFieldAccess {
 		storage := newMeasureStorageFromEntriesOwned(measureStates[i])
 		nextMeasure.Set(i, storage)
 		measureStates[i] = nil
 	}
 
 	var strmap *strMapSnapshot
-	if db.strMap != nil {
-		strmap = db.strMap.snapshot()
+	if strMap != nil {
+		strmap = strMap.snapshot()
 	}
 	snap := &indexSnapshot{
 		seq:                seq,
@@ -1578,11 +1577,11 @@ func (db *DB[K, V]) buildPreparedSnapshotFromEmptyBaseNoLock(seq uint64, prev *i
 		lenIndex:           nextLenIndex,
 		lenZeroComplement:  nextLenZeroComplement,
 		measure:            nextMeasure,
-		indexedFieldByName: db.engine.indexedFieldMap,
+		indexedFieldByName: qe.indexedFieldMap,
 		universe:           universe,
 		strmap:             strmap,
 	}
-	db.engine.initSnapshotRuntimeCaches(snap)
+	qe.initSnapshotRuntimeCaches(snap)
 	inheritNumericRangeBucketCache(snap, prev)
 	changedCount := 0
 	for i := range fieldStates {
@@ -1591,17 +1590,17 @@ func (db *DB[K, V]) buildPreparedSnapshotFromEmptyBaseNoLock(seq uint64, prev *i
 		}
 	}
 	if changedCount > 0 {
-		changed := pools.GetBoolSlice(len(db.engine.indexedFieldAccess))[:len(db.engine.indexedFieldAccess)]
+		changed := pools.GetBoolSlice(len(qe.indexedFieldAccess))[:len(qe.indexedFieldAccess)]
 		clear(changed)
 		for i := range fieldStates {
 			if fieldStates[i].changed {
 				changed[i] = true
 			}
 		}
-		inheritMaterializedPredCache(snap, prev, db.engine.indexedFieldMap, changed)
+		inheritMaterializedPredCache(snap, prev, qe.indexedFieldMap, changed)
 		pools.PutBoolSlice(changed)
 	} else {
-		inheritMaterializedPredCache(snap, prev, db.engine.indexedFieldMap, nil)
+		inheritMaterializedPredCache(snap, prev, qe.indexedFieldMap, nil)
 	}
 	snap.ensureUniverseOwner()
 	return snap, true
@@ -1737,19 +1736,19 @@ func mergeInsertOnlyFieldEntries(base *[]index, addSlice []index) *[]index {
 	return &out
 }
 
-func (db *DB[K, V]) buildPreparedSnapshotInsertOnlyNoLock(seq uint64, prev *indexSnapshot, prepared []autoBatchPrepared[K, V]) (*indexSnapshot, bool) {
-	if len(prepared) == 0 {
+func (qe *queryEngine) buildPreparedSnapshotInsertOnlyNoLock(seq uint64, prev *indexSnapshot, strMap *strMapper, entries []snapshotBatchEntry) (*indexSnapshot, bool) {
+	if len(entries) == 0 {
 		return nil, false
 	}
-	for i := range prepared {
-		if prepared[i].oldVal != nil || prepared[i].newVal == nil {
+	for i := range entries {
+		if entries[i].oldVal != nil || entries[i].newVal == nil {
 			return nil, false
 		}
 	}
 	var addedUniverse posting.List
-	for i := range prepared {
+	for i := range entries {
 		var added bool
-		addedUniverse, added = addedUniverse.BuildAddedChecked(prepared[i].idx)
+		addedUniverse, added = addedUniverse.BuildAddedChecked(entries[i].idx)
 		if !added {
 			addedUniverse.Release()
 			return nil, false
@@ -1757,38 +1756,38 @@ func (db *DB[K, V]) buildPreparedSnapshotInsertOnlyNoLock(seq uint64, prev *inde
 	}
 
 	var strmap *strMapSnapshot
-	if db.strMap != nil {
-		strmap = db.strMap.snapshot()
+	if strMap != nil {
+		strmap = strMap.snapshot()
 	}
 	next := &indexSnapshot{
 		seq: seq,
 
-		index:              cloneFieldIndexStorageSlots(prev.index, len(db.engine.indexedFieldAccess)),
-		nilIndex:           cloneFieldIndexStorageSlots(prev.nilIndex, len(db.engine.indexedFieldAccess)),
-		lenIndex:           cloneFieldIndexStorageSlots(prev.lenIndex, len(db.engine.indexedFieldAccess)),
-		lenZeroComplement:  cloneFieldIndexBoolSlots(prev.lenZeroComplement, len(db.engine.indexedFieldAccess)),
-		measure:            cloneMeasureFieldStorageSlots(prev.measure, len(db.engine.measureFieldAccess)),
-		indexedFieldByName: db.engine.indexedFieldMap,
+		index:              cloneFieldIndexStorageSlots(prev.index, len(qe.indexedFieldAccess)),
+		nilIndex:           cloneFieldIndexStorageSlots(prev.nilIndex, len(qe.indexedFieldAccess)),
+		lenIndex:           cloneFieldIndexStorageSlots(prev.lenIndex, len(qe.indexedFieldAccess)),
+		lenZeroComplement:  cloneFieldIndexBoolSlots(prev.lenZeroComplement, len(qe.indexedFieldAccess)),
+		measure:            cloneMeasureFieldStorageSlots(prev.measure, len(qe.measureFieldAccess)),
+		indexedFieldByName: qe.indexedFieldMap,
 		universe:           prev.universe.Clone(),
 		strmap:             strmap,
 	}
 	next.universe = next.universe.BuildMergedOwned(addedUniverse)
-	db.engine.initSnapshotRuntimeCaches(next)
+	qe.initSnapshotRuntimeCaches(next)
 
 	fieldStates := snapshotFieldInsertStateSlicePool.Get()
-	fieldStates.SetLen(len(db.engine.indexedFieldAccess))
-	initSnapshotFieldInsertStateHints(fieldStates, db.engine.indexedFieldAccess, prev, len(prepared))
-	measureDeltas := newMeasureFieldBatchDeltas(len(db.engine.measureFieldAccess))
+	fieldStates.SetLen(len(qe.indexedFieldAccess))
+	initSnapshotFieldInsertStateHints(fieldStates, qe.indexedFieldAccess, prev, len(entries))
+	measureDeltas := newMeasureFieldBatchDeltas(len(qe.measureFieldAccess))
 
-	for i := range prepared {
-		op := prepared[i]
-		ptr := unsafe.Pointer(op.newVal)
+	for i := range entries {
+		op := entries[i]
+		ptr := op.newVal
 
-		for _, acc := range db.engine.indexedFieldAccess {
+		for _, acc := range qe.indexedFieldAccess {
 			useZeroComplement := acc.ordinal < len(prev.lenZeroComplement) && prev.lenZeroComplement[acc.ordinal]
 			acc.collectSnapshotInsertValue(ptr, op.idx, useZeroComplement, fieldStates.GetPtr(acc.ordinal))
 		}
-		for _, acc := range db.engine.measureFieldAccess {
+		for _, acc := range qe.measureFieldAccess {
 			if value, ok := acc.read(ptr); ok {
 				measureDeltas.append(acc.ordinal, measureBatchDelta{id: op.idx, newOK: true, new: value})
 			}
@@ -1796,7 +1795,7 @@ func (db *DB[K, V]) buildPreparedSnapshotInsertOnlyNoLock(seq uint64, prev *inde
 	}
 
 	changedCount := 0
-	for i, acc := range db.engine.indexedFieldAccess {
+	for i, acc := range qe.indexedFieldAccess {
 		state := fieldStates.GetPtr(i)
 		baseIndex := next.index.Get(i)
 		if storage := acc.mergeSnapshotInsertStorageOwned(baseIndex, state, true); storage.keyCount() > 0 {
@@ -1831,17 +1830,17 @@ func (db *DB[K, V]) buildPreparedSnapshotInsertOnlyNoLock(seq uint64, prev *inde
 	inheritNumericRangeBucketCache(next, prev)
 
 	if changedCount > 0 {
-		changed := pools.GetBoolSlice(len(db.engine.indexedFieldAccess))[:len(db.engine.indexedFieldAccess)]
+		changed := pools.GetBoolSlice(len(qe.indexedFieldAccess))[:len(qe.indexedFieldAccess)]
 		clear(changed)
 		for i := 0; i < fieldStates.Len(); i++ {
 			if fieldStates.Get(i).changed {
 				changed[i] = true
 			}
 		}
-		inheritMaterializedPredCache(next, prev, db.engine.indexedFieldMap, changed)
+		inheritMaterializedPredCache(next, prev, qe.indexedFieldMap, changed)
 		pools.PutBoolSlice(changed)
 	} else {
-		inheritMaterializedPredCache(next, prev, db.engine.indexedFieldMap, nil)
+		inheritMaterializedPredCache(next, prev, qe.indexedFieldMap, nil)
 	}
 	next.retainSharedOwnedStorageFrom(prev)
 	snapshotFieldInsertStateSlicePool.Put(fieldStates)

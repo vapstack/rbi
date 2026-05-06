@@ -331,13 +331,15 @@ func (db *DB[K, V]) refreshPlannerStatsLocked() {
 	db.engine.planner.stats.Store(s)
 }
 
-func (db *DB[K, V]) plannerStatsSnapshotForPersistLocked(version uint64) *plannerStatsSnapshot {
-	current := db.engine.planner.stats.Load()
+func (qe *queryEngine) plannerStatsSnapshotForPersistLocked(version uint64) *plannerStatsSnapshot {
+	current := qe.planner.stats.Load()
 	if current == nil {
-		return db.buildPlannerStatsSnapshotLocked(version)
+		snap, seq, ref, pinned := qe.pinCurrentSnapshot()
+		defer qe.unpinCurrentSnapshot(seq, ref, pinned)
+		return qe.buildPlannerStatsSnapshot(snap, version)
 	}
-	snap, seq, ref, pinned := db.engine.pinCurrentSnapshot()
-	defer db.engine.unpinCurrentSnapshot(seq, ref, pinned)
+	snap, seq, ref, pinned := qe.pinCurrentSnapshot()
+	defer qe.unpinCurrentSnapshot(seq, ref, pinned)
 
 	return &plannerStatsSnapshot{
 		Version:             version,

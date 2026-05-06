@@ -141,17 +141,19 @@ type autoBatchAttemptState[K ~string | ~uint64, V any] struct {
 	bucket       *bbolt.Bucket
 	statsEnabled bool
 
-	prepared      []autoBatchPrepared[K, V]
-	accepted      []autoBatchPrepared[K, V]
-	ownedPayloads []*bytes.Buffer
+	prepared          []autoBatchPrepared[K, V]
+	preparedSnapshots []snapshotBatchEntry
+	accepted          []autoBatchPrepared[K, V]
+	acceptedSnapshots []snapshotBatchEntry
+	ownedPayloads     []*bytes.Buffer
 
 	stateByID    map[K]int
 	stateByIDCap int
 	states       []autoBatchState[K, V]
 
 	uniqueIdxs    []uint64
-	uniqueOldVals []*V
-	uniqueNewVals []*V
+	uniqueOldVals []unsafe.Pointer
+	uniqueNewVals []unsafe.Pointer
 }
 
 func (req *autoBatchRequest[K, V]) payloadBytes() []byte {
@@ -946,6 +948,13 @@ func (db *DB[K, V]) prepareAutoBatchSet(att *autoBatchAttemptState[K, V], req *a
 		oldVal:  oldVal,
 		newVal:  newVal,
 	})
+	if db.engine != nil {
+		att.preparedSnapshots = append(att.preparedSnapshots, snapshotBatchEntry{
+			idx:    state.idx,
+			oldVal: unsafe.Pointer(oldVal),
+			newVal: unsafe.Pointer(newVal),
+		})
+	}
 	state.value = newVal
 	releaseDecodedNewVal = false
 	if ownedPayload != nil {
@@ -1030,6 +1039,15 @@ func (db *DB[K, V]) prepareAutoBatchPatch(att *autoBatchAttemptState[K, V], req 
 		oldVal:  oldVal,
 		newVal:  newVal,
 	})
+	if db.engine != nil {
+		att.preparedSnapshots = append(att.preparedSnapshots, snapshotBatchEntry{
+			idx:       state.idx,
+			oldVal:    unsafe.Pointer(oldVal),
+			newVal:    unsafe.Pointer(newVal),
+			patch:     req.patch,
+			patchOnly: len(req.beforeProcess) == 0 && len(req.beforeStore) == 0,
+		})
+	}
 	state.value = newVal
 	releaseDecodedNewVal = false
 	state.setOwnedPayload(buf)
@@ -1058,12 +1076,19 @@ func (db *DB[K, V]) prepareAutoBatchDelete(att *autoBatchAttemptState[K, V], req
 		oldVal: oldVal,
 		newVal: nil,
 	})
+	if db.engine != nil {
+		att.preparedSnapshots = append(att.preparedSnapshots, snapshotBatchEntry{
+			idx:    state.idx,
+			oldVal: unsafe.Pointer(oldVal),
+		})
+	}
 	state.value = nil
 	state.clearPayload()
 }
 
 func (db *DB[K, V]) filterAutoBatchAcceptedLocked(att *autoBatchAttemptState[K, V], atomicAll bool) error {
 	att.accepted = att.prepared
+	att.acceptedSnapshots = att.preparedSnapshots
 	if db.engine == nil || !db.engine.hasUnique {
 		return nil
 	}
@@ -1075,10 +1100,10 @@ func (db *DB[K, V]) filterAutoBatchAcceptedLocked(att *autoBatchAttemptState[K, 
 		for i := range att.prepared {
 			op := att.prepared[i]
 			att.uniqueIdxs[i] = op.idx
-			att.uniqueOldVals[i] = op.oldVal
-			att.uniqueNewVals[i] = op.newVal
+			att.uniqueOldVals[i] = unsafe.Pointer(op.oldVal)
+			att.uniqueNewVals[i] = unsafe.Pointer(op.newVal)
 		}
-		if err := db.checkUniqueOnWriteMulti(att.uniqueIdxs, att.uniqueOldVals, att.uniqueNewVals); err != nil {
+		if err := db.engine.checkUniqueOnWriteMulti(att.uniqueIdxs, att.uniqueOldVals, att.uniqueNewVals); err != nil {
 			if att.statsEnabled {
 				db.autoBatcher.uniqueRejected.Add(1)
 			}
@@ -1091,6 +1116,7 @@ func (db *DB[K, V]) filterAutoBatchAcceptedLocked(att *autoBatchAttemptState[K, 
 	}
 
 	att.accepted = slices.Grow(att.accepted[:0], len(att.prepared))[:0]
+	att.acceptedSnapshots = slices.Grow(att.acceptedSnapshots[:0], len(att.prepared))[:0]
 	uniqueState := uniqueBatchCheckState{
 		leaving: uniqueLeavingOuterPool.Get(),
 		seen:    uniqueSeenOuterPool.Get(),
@@ -1098,8 +1124,9 @@ func (db *DB[K, V]) filterAutoBatchAcceptedLocked(att *autoBatchAttemptState[K, 
 	defer uniqueLeavingOuterPool.Put(uniqueState.leaving)
 	defer uniqueSeenOuterPool.Put(uniqueState.seen)
 
-	for _, op := range att.prepared {
-		if err := db.checkUniqueBatchAppend(uniqueState, op.idx, op.oldVal, op.newVal); err != nil {
+	for i := range att.prepared {
+		op := att.prepared[i]
+		if err := db.engine.checkUniqueBatchAppend(uniqueState, op.idx, unsafe.Pointer(op.oldVal), unsafe.Pointer(op.newVal)); err != nil {
 			op.req.err = err
 			if att.statsEnabled {
 				db.autoBatcher.uniqueRejected.Add(1)
@@ -1108,6 +1135,7 @@ func (db *DB[K, V]) filterAutoBatchAcceptedLocked(att *autoBatchAttemptState[K, 
 			continue
 		}
 		att.accepted = append(att.accepted, op)
+		att.acceptedSnapshots = append(att.acceptedSnapshots, att.preparedSnapshots[i])
 	}
 	return nil
 }
@@ -1459,6 +1487,14 @@ func (db *DB[K, V]) executeAutoBatchAttempt(active *pooled.Slice[*autoBatchReque
 	if cap(att.uniqueNewVals) < capHint {
 		att.uniqueNewVals = slices.Grow(att.uniqueNewVals, capHint)
 	}
+	if db.engine != nil {
+		if cap(att.preparedSnapshots) < capHint {
+			att.preparedSnapshots = slices.Grow(att.preparedSnapshots, capHint)
+		}
+		if cap(att.acceptedSnapshots) < capHint {
+			att.acceptedSnapshots = slices.Grow(att.acceptedSnapshots, capHint)
+		}
+	}
 	switch {
 	case att.stateByID == nil:
 		att.stateByID = make(map[K]int, capHint)
@@ -1543,7 +1579,7 @@ func (db *DB[K, V]) executeAutoBatchAttempt(active *pooled.Slice[*autoBatchReque
 		return nil, true, fmt.Errorf("advance bucket sequence: %w", err)
 	}
 
-	snap := db.buildPreparedSnapshotNoLock(seq, att.accepted)
+	snap := db.engine.buildPreparedSnapshotNoLock(seq, db.strMap, db.patchMap, att.acceptedSnapshots)
 	db.engine.snapshot.stage(snap)
 
 	if err = db.commit(tx, opName); err != nil {
