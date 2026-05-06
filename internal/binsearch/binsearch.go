@@ -42,6 +42,34 @@ func Int32(s []int32, v int32) (int, bool) {
 	return i, i < l && s[i] == v
 }
 
+func IntLower(s []int, v int) int {
+	l := len(s)
+	i, j := 0, l
+	for i < j {
+		h := int(uint(i+j) >> 1)
+		if s[h] < v {
+			i = h + 1
+		} else {
+			j = h
+		}
+	}
+	return i
+}
+
+func IntUpper(s []int, v int) int {
+	l := len(s)
+	i, j := 0, l
+	for i < j {
+		h := int(uint(i+j) >> 1)
+		if s[h] <= v {
+			i = h + 1
+		} else {
+			j = h
+		}
+	}
+	return i
+}
+
 func Uint(s []uint, v uint) (int, bool) {
 	l := len(s)
 	i, j := 0, l

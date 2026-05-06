@@ -1606,8 +1606,8 @@ func collectChunkedFieldIndexStats(root *fieldIndexChunkedRoot, countDistinct bo
 	stats := fieldIndexStats{
 		approxStructBytes: uint64(unsafe.Sizeof(fieldIndexChunkedRoot{})) +
 			approxSliceBufBytes(root.pages) +
-			approxSliceBufBytes(root.chunkPrefix) +
-			approxSliceBufBytes(root.prefix) +
+			uint64(cap(root.chunkPrefix))*uint64(unsafe.Sizeof(int(0))) +
+			uint64(cap(root.prefix))*uint64(unsafe.Sizeof(int(0))) +
 			uint64(cap(root.rowPrefix))*uint64(unsafe.Sizeof(uint64(0))),
 	}
 	for i := 0; i < root.pages.Len(); i++ {
@@ -1617,11 +1617,11 @@ func collectChunkedFieldIndexStats(root *fieldIndexChunkedRoot, countDistinct bo
 		}
 		stats.approxStructBytes += uint64(unsafe.Sizeof(fieldIndexChunkDirPage{})) +
 			approxSliceBufBytes(page.refs) +
-			approxSliceBufBytes(page.prefix) +
+			uint64(cap(page.prefix))*uint64(unsafe.Sizeof(int(0))) +
 			uint64(cap(page.rowPrefix))*uint64(unsafe.Sizeof(uint64(0)))
 
-		for j := 0; j < page.refsLen(); j++ {
-			chunk := page.refAt(j).chunk
+		for j := 0; j < page.refs.Len(); j++ {
+			chunk := page.refs.Get(j).chunk
 			if chunk == nil {
 				continue
 			}

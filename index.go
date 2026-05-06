@@ -1948,11 +1948,11 @@ func writeFieldIndexStorage(writer *bufio.Writer, storage fieldIndexStorage) err
 		}
 		for i := 0; i < root.pages.Len(); i++ {
 			page := root.pages.Get(i)
-			if err := writeUvarint(writer, uint64(page.refsLen())); err != nil {
+			if err := writeUvarint(writer, uint64(page.refs.Len())); err != nil {
 				return fmt.Errorf("encode: writing page refs: %w", err)
 			}
-			for j := 0; j < page.refsLen(); j++ {
-				if err := writeFieldIndexChunk(writer, page.refAt(j).chunk); err != nil {
+			for j := 0; j < page.refs.Len(); j++ {
+				if err := writeFieldIndexChunk(writer, page.refs.Get(j).chunk); err != nil {
 					return err
 				}
 			}
@@ -3597,7 +3597,7 @@ func (o fieldOverlay) newCursor(br overlayRange, desc bool) overlayKeyCursor {
 				c.remaining = 0
 				return c
 			}
-			c.chunk = o.chunked.pages.Get(c.pageIdx).refAt(c.refIdx).chunk
+			c.chunk = o.chunked.pages.Get(c.pageIdx).refs.Get(c.refIdx).chunk
 			return c
 		}
 		c.chunkIdx = br.startPos.chunk
@@ -3607,7 +3607,7 @@ func (o fieldOverlay) newCursor(br overlayRange, desc bool) overlayKeyCursor {
 			c.remaining = 0
 			return c
 		}
-		c.chunk = o.chunked.pages.Get(c.pageIdx).refAt(c.refIdx).chunk
+		c.chunk = o.chunked.pages.Get(c.pageIdx).refs.Get(c.refIdx).chunk
 		return c
 	}
 	if desc {
@@ -3642,9 +3642,9 @@ func (c *overlayKeyCursor) next() (indexKey, posting.List, bool) {
 							c.chunk = nil
 							return indexKey{}, posting.List{}, false
 						}
-						c.refIdx = c.chunked.pages.Get(c.pageIdx).refsLen() - 1
+						c.refIdx = c.chunked.pages.Get(c.pageIdx).refs.Len() - 1
 					}
-					c.chunk = c.chunked.pages.Get(c.pageIdx).refAt(c.refIdx).chunk
+					c.chunk = c.chunked.pages.Get(c.pageIdx).refs.Get(c.refIdx).chunk
 					c.entryIdx = c.chunk.keyCount() - 1
 				}
 			}
@@ -3669,7 +3669,7 @@ func (c *overlayKeyCursor) next() (indexKey, posting.List, bool) {
 			if c.entryIdx >= c.chunk.keyCount() {
 				c.chunkIdx++
 				c.refIdx++
-				if c.refIdx >= c.chunked.pages.Get(c.pageIdx).refsLen() {
+				if c.refIdx >= c.chunked.pages.Get(c.pageIdx).refs.Len() {
 					c.pageIdx++
 					if c.pageIdx >= c.chunked.pages.Len() {
 						c.chunk = nil
@@ -3677,7 +3677,7 @@ func (c *overlayKeyCursor) next() (indexKey, posting.List, bool) {
 					}
 					c.refIdx = 0
 				}
-				c.chunk = c.chunked.pages.Get(c.pageIdx).refAt(c.refIdx).chunk
+				c.chunk = c.chunked.pages.Get(c.pageIdx).refs.Get(c.refIdx).chunk
 				c.entryIdx = 0
 			}
 		}

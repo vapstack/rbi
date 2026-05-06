@@ -4,11 +4,12 @@ import (
 	"unsafe"
 
 	"github.com/vapstack/rbi/internal/pooled"
+	"github.com/vapstack/rbi/internal/pools"
 )
 
 type measureFieldBatchDeltas struct {
 	fields  *pooled.Slice[*pooled.Slice[measureBatchDelta]]
-	touched *pooled.Slice[int]
+	touched []int
 }
 
 var measureBatchDeltaSlotSlicePool = pooled.Slices[*pooled.Slice[measureBatchDelta]]{Clear: true}
@@ -18,7 +19,7 @@ func newMeasureFieldBatchDeltas(fieldCount int) measureFieldBatchDeltas {
 	fields.SetLen(fieldCount)
 	return measureFieldBatchDeltas{
 		fields:  fields,
-		touched: fieldIndexOrdinalSlicePool.Get(),
+		touched: pools.GetIntSlice(fieldCount),
 	}
 }
 
@@ -27,7 +28,7 @@ func (deltas *measureFieldBatchDeltas) append(ordinal int, delta measureBatchDel
 	if buf == nil {
 		buf = measureBatchDeltaSlicePool.Get()
 		deltas.fields.Set(ordinal, buf)
-		deltas.touched.Append(ordinal)
+		deltas.touched = append(deltas.touched, ordinal)
 	}
 	buf.Append(delta)
 }
@@ -42,7 +43,7 @@ func (deltas *measureFieldBatchDeltas) release() {
 	}
 	measureBatchDeltaSlotSlicePool.Put(deltas.fields)
 	deltas.fields = nil
-	fieldIndexOrdinalSlicePool.Put(deltas.touched)
+	pools.PutIntSlice(deltas.touched)
 	deltas.touched = nil
 }
 
@@ -148,8 +149,8 @@ func (db *DB[K, V]) collectSnapshotMeasureEntryDiffs(op snapshotBatchEntry[K, V]
 }
 
 func applyMeasureFieldBatchDeltas(next *indexSnapshot, deltas *measureFieldBatchDeltas) {
-	for i := 0; i < deltas.touched.Len(); i++ {
-		ordinal := deltas.touched.Get(i)
+	for i := range deltas.touched {
+		ordinal := deltas.touched[i]
 		base := next.measure.Get(ordinal)
 		storage := applyMeasureDeltasOwned(base, deltas.fields.Get(ordinal))
 		deltas.fields.Set(ordinal, nil)

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/vapstack/qx"
+	"github.com/vapstack/rbi/internal/pools"
 	"github.com/vapstack/rbi/internal/posting"
 	"github.com/vapstack/rbi/internal/qir"
 )
@@ -96,9 +97,9 @@ func TestPlannerFilterPostingByPredicateChecksBuf_PostsAnyOwnedLargeAllocsPerRun
 	})
 	defer preds.Release()
 
-	checks := predicateCheckSlicePool.Get()
-	checks.Append(0)
-	defer predicateCheckSlicePool.Put(checks)
+	checks := pools.GetIntSlice(1)
+	checks = append(checks, 0)
+	defer pools.PutIntSlice(checks)
 
 	var work posting.List
 	defer func() {
@@ -167,12 +168,9 @@ func TestPlannerFilterPostingByPredicateChecksBuf_CompactBorrowedAllocsPerRunSta
 	})
 	defer preds.Release()
 
-	checks := predicateCheckSlicePool.Get()
-	checks.Append(0)
-	checks.Append(1)
-	checks.Append(2)
-	checks.Append(3)
-	defer predicateCheckSlicePool.Put(checks)
+	checks := pools.GetIntSlice(4)
+	checks = append(checks, 0, 1, 2, 3)
+	defer pools.PutIntSlice(checks)
 
 	var work posting.List
 	defer func() {
@@ -227,9 +225,9 @@ func TestPlannerFilterPostingByPredicateChecksBuf_PreferredExactBypassesSmallBuc
 	})
 	defer preds.Release()
 
-	checks := predicateCheckSlicePool.Get()
-	checks.Append(0)
-	defer predicateCheckSlicePool.Put(checks)
+	checks := pools.GetIntSlice(1)
+	checks = append(checks, 0)
+	defer pools.PutIntSlice(checks)
 
 	mode, exact, work, card := plannerFilterPostingByPredicateChecksBuf(preds, checks, src.Borrow(), posting.List{}, false)
 	defer work.Release()
@@ -1706,13 +1704,12 @@ func TestPlannerOROrderBranchIter_ResidualRowsExcludeExactOnlyChecks(t *testing.
 	})
 	defer preds.Release()
 
-	checks := predicateCheckSlicePool.Get()
-	checks.Append(0)
-	checks.Append(1)
-	exactChecks := predicateCheckSlicePool.Get()
-	exactChecks.Append(0)
-	residualChecks := predicateCheckSlicePool.Get()
-	residualChecks.Append(1)
+	checks := pools.GetIntSlice(2)
+	checks = append(checks, 0, 1)
+	exactChecks := pools.GetIntSlice(1)
+	exactChecks = append(exactChecks, 0)
+	residualChecks := pools.GetIntSlice(1)
+	residualChecks = append(residualChecks, 1)
 
 	iter := plannerOROrderBranchIter{
 		branch:         &plannerORBranch{preds: preds, leadIdx: -1},
@@ -1893,17 +1890,15 @@ func TestPlannerOROrderKWay_RepeatedExecutionPromotesExactOnlyMaterializedRange(
 		foundExactOnlyAge := false
 		for bi := 0; bi < branches.Len(); bi++ {
 			branch := branches.Get(bi)
-			checks := predicateCheckSlicePool.Get()
-			exactChecks := predicateCheckSlicePool.Get()
-			residualChecks := predicateCheckSlicePool.Get()
-			branch.buildMatchChecksBuf(checks)
-			exactChecks.Grow(checks.Len())
-			buildExactBucketPostingFilterActiveBufReader(exactChecks, checks, branch.preds)
-			residualChecks.Grow(checks.Len())
-			plannerResidualChecksBuf(residualChecks, checks, exactChecks)
-			checkLen := checks.Len()
-			exactLen := exactChecks.Len()
-			residualLen := residualChecks.Len()
+			checks := pools.GetIntSlice(branch.predLen())
+			exactChecks := pools.GetIntSlice(branch.predLen())
+			residualChecks := pools.GetIntSlice(branch.predLen())
+			checks = branch.buildMatchChecksBuf(checks)
+			exactChecks = buildExactBucketPostingFilterActiveBufReader(exactChecks, checks, branch.preds)
+			residualChecks = plannerResidualChecksBuf(residualChecks, checks, exactChecks)
+			checkLen := len(checks)
+			exactLen := len(exactChecks)
+			residualLen := len(residualChecks)
 			ageBranch := false
 			for pi := 0; pi < branch.predLen(); pi++ {
 				if db.engine.fieldNameByOrdinal(branch.pred(pi).expr.FieldOrdinal) == "age" {
@@ -1911,9 +1906,9 @@ func TestPlannerOROrderKWay_RepeatedExecutionPromotesExactOnlyMaterializedRange(
 					break
 				}
 			}
-			predicateCheckSlicePool.Put(residualChecks)
-			predicateCheckSlicePool.Put(exactChecks)
-			predicateCheckSlicePool.Put(checks)
+			pools.PutIntSlice(residualChecks)
+			pools.PutIntSlice(exactChecks)
+			pools.PutIntSlice(checks)
 			if !ageBranch {
 				continue
 			}

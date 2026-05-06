@@ -22,7 +22,6 @@ const (
 	bitmapResultSlicePoolMaxCap             = 2 << 10
 	countORBranchSlicePoolMaxCap            = 512
 	countLeadResidualExactFilterPoolMaxCap  = 512
-	predicateCheckSlicePoolMaxCap           = 4 << 10
 	predicateSlicePoolMaxCap                = 256
 	leafPredSlicePoolMaxCap                 = 256
 	plannerORBranchSlicePoolMaxCap          = plannerORBranchLimit
@@ -30,9 +29,7 @@ const (
 	plannerOROrderIterSlicePoolMaxCap       = 512
 	plannerOROrderMergeItemSliceMaxCap      = 512
 	orderBasicBaseCoreSlicePoolMaxCap       = 128
-	orderBasicBaseCoreIndexSlicePoolMaxCap  = 128
 	orderedMergedScalarRangeFieldPoolMaxCap = 64
-	aggregateGroupBucketSlicePoolMaxCap     = 1 << 20
 	aggregateMetricStateSlicePoolMaxCap     = 1 << 20
 )
 
@@ -62,31 +59,10 @@ var orderBasicBaseCoreSlicePool = pooled.Slices[orderBasicBaseCore]{
 
 /**/
 
-var orderBasicBaseCoreIndexSlicePool = pooled.Slices[int]{
-	MinCap: 8,
-	MaxCap: orderBasicBaseCoreIndexSlicePoolMaxCap,
-}
-
-/**/
-
-var predicateCheckSlicePool = pooled.Slices[int]{
-	MinCap: 8,
-	MaxCap: predicateCheckSlicePoolMaxCap,
-}
-
-/**/
-
 var orderedMergedScalarRangeFieldSlicePool = pooled.Slices[orderedMergedScalarRangeField]{
 	MinCap: 4,
 	MaxCap: orderedMergedScalarRangeFieldPoolMaxCap,
 	Clear:  true,
-}
-
-/**/
-
-var aggregateGroupBucketTouchedSlicePool = pooled.Slices[int]{
-	MinCap: 64,
-	MaxCap: aggregateGroupBucketSlicePoolMaxCap,
 }
 
 /**/

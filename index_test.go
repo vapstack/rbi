@@ -3386,8 +3386,8 @@ func TestIndexExt_MultiPageStringDirectoryMatchesFlat(t *testing.T) {
 		ranks[rank] = struct{}{}
 	}
 
-	for i := 0; i < fx.root.prefix.Len(); i++ {
-		prefix := fx.root.prefix.Get(i)
+	for i := 0; i < len(fx.root.prefix); i++ {
+		prefix := fx.root.prefix[i]
 		addRank(prefix - 1)
 		addRank(prefix)
 	}
@@ -3454,8 +3454,8 @@ func TestIndexExt_ApplyFieldPostingDiffChunkedMultiPageBoundariesMatchFlat(t *te
 	addBoundary(0)
 	addBoundary(fieldIndexChunkTargetEntries - 1)
 	addBoundary(fieldIndexChunkTargetEntries)
-	for i := 0; i < fx.root.prefix.Len(); i++ {
-		prefix := fx.root.prefix.Get(i)
+	for i := 0; i < len(fx.root.prefix); i++ {
+		prefix := fx.root.prefix[i]
 		addBoundary(prefix - 1)
 		addBoundary(prefix)
 	}
@@ -3487,8 +3487,8 @@ func TestIndexExt_ApplyFieldPostingDiffChunkedMultiPageBoundariesMatchFlat(t *te
 	}
 	ops = append(ops,
 		indexExtDeltaOp{key: "mp/00-before", add: []uint64{1_100_001}},
-		indexExtDeltaOp{key: fx.keys[fx.root.prefix.Get(1)-1] + "/after", add: []uint64{1_100_002}},
-		indexExtDeltaOp{key: fx.keys[fx.root.prefix.Get(1)] + "/after", add: []uint64{1_100_003}},
+		indexExtDeltaOp{key: fx.keys[fx.root.prefix[1]-1] + "/after", add: []uint64{1_100_002}},
+		indexExtDeltaOp{key: fx.keys[fx.root.prefix[1]] + "/after", add: []uint64{1_100_003}},
 		indexExtDeltaOp{key: "mp/z-after", add: []uint64{1_100_004}},
 	)
 

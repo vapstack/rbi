@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/vapstack/rbi/internal/pooled"
+	"github.com/vapstack/rbi/internal/pools"
 	"github.com/vapstack/rbi/internal/posting"
 	"github.com/vapstack/rbi/internal/qir"
 )
@@ -214,7 +215,7 @@ func orderPredicatesEmitCandidateReader(
 func orderPredicatesEmitCandidateBufReader(
 	cursor *queryCursor,
 	preds predicateReader,
-	checks *pooled.Slice[int],
+	checks []int,
 	trace *queryTrace,
 	idx uint64,
 	examined *uint64,
@@ -308,7 +309,7 @@ func orderPredicatesTryBucketPostingReader(
 func orderPredicatesTryBucketPostingBufReader(
 	cursor *queryCursor,
 	preds predicateReader,
-	exactActive *pooled.Slice[int],
+	exactActive []int,
 	exactOnly bool,
 	ids posting.List,
 	exactWork posting.List,
@@ -319,11 +320,11 @@ func orderPredicatesTryBucketPostingBufReader(
 	if ids.IsEmpty() {
 		return posting.List{}, false, true, false, nextExactWork
 	}
-	if exactActive == nil || exactActive.Len() == 0 {
+	if len(exactActive) == 0 {
 		return ids, false, false, false, nextExactWork
 	}
 	card := ids.Cardinality()
-	allowExact := plannerAllowExactBucketFilter(cursor.skip, cursor.need, card, exactOnly, exactActive.Len())
+	allowExact := plannerAllowExactBucketFilter(cursor.skip, cursor.need, card, exactOnly, len(exactActive))
 	mode, exactIDs, updatedExactWork, _ := plannerFilterPostingByPredicateChecksBuf(preds, exactActive, ids, exactWork, allowExact)
 	nextExactWork = updatedExactWork
 	switch mode {
@@ -424,9 +425,9 @@ func orderPredicatesEmitPostingReader(
 func orderPredicatesEmitPostingBufReader(
 	cursor *queryCursor,
 	preds predicateReader,
-	active *pooled.Slice[int],
-	exactActive *pooled.Slice[int],
-	residualActive *pooled.Slice[int],
+	active []int,
+	exactActive []int,
+	residualActive []int,
 	exactOnly bool,
 	ids posting.List,
 	exactWork posting.List,
@@ -469,11 +470,11 @@ func orderPredicatesEmitPostingBufReader(
 	singleCheck := -1
 	if exactApplied {
 		checks = residualActive
-		if residualActive.Len() == 1 {
-			singleCheck = residualActive.Get(0)
+		if len(residualActive) == 1 {
+			singleCheck = residualActive[0]
 		}
-	} else if active.Len() == 1 {
-		singleCheck = active.Get(0)
+	} else if len(active) == 1 {
+		singleCheck = active[0]
 	}
 	if orderedSkipSingleCheckBucket(cursor, preds, singleCheck, currentIDs, trace) {
 		*examined += currentIDs.Cardinality()
@@ -490,9 +491,9 @@ func orderPredicatesEmitPostingBufReader(
 	return false, exactWork
 }
 
-func releaseOrderBasicResidualState(preds predicateSet, activeBuf *pooled.Slice[int]) {
+func releaseOrderBasicResidualState(preds predicateSet, activeBuf []int) {
 	if activeBuf != nil {
-		predicateCheckSlicePool.Put(activeBuf)
+		pools.PutIntSlice(activeBuf)
 	}
 	preds.Release()
 }
@@ -582,27 +583,27 @@ func emitOrderPrefixPostingByBase(
 	return false
 }
 
-func predicatesMatchActiveBufReader(preds predicateReader, active *pooled.Slice[int], idx uint64) bool {
-	switch active.Len() {
+func predicatesMatchActiveBufReader(preds predicateReader, active []int, idx uint64) bool {
+	switch len(active) {
 	case 0:
 		return true
 	case 1:
-		return preds.GetPtr(active.Get(0)).matches(idx)
+		return preds.GetPtr(active[0]).matches(idx)
 	case 2:
-		return preds.GetPtr(active.Get(0)).matches(idx) &&
-			preds.GetPtr(active.Get(1)).matches(idx)
+		return preds.GetPtr(active[0]).matches(idx) &&
+			preds.GetPtr(active[1]).matches(idx)
 	case 3:
-		return preds.GetPtr(active.Get(0)).matches(idx) &&
-			preds.GetPtr(active.Get(1)).matches(idx) &&
-			preds.GetPtr(active.Get(2)).matches(idx)
+		return preds.GetPtr(active[0]).matches(idx) &&
+			preds.GetPtr(active[1]).matches(idx) &&
+			preds.GetPtr(active[2]).matches(idx)
 	case 4:
-		return preds.GetPtr(active.Get(0)).matches(idx) &&
-			preds.GetPtr(active.Get(1)).matches(idx) &&
-			preds.GetPtr(active.Get(2)).matches(idx) &&
-			preds.GetPtr(active.Get(3)).matches(idx)
+		return preds.GetPtr(active[0]).matches(idx) &&
+			preds.GetPtr(active[1]).matches(idx) &&
+			preds.GetPtr(active[2]).matches(idx) &&
+			preds.GetPtr(active[3]).matches(idx)
 	}
-	for i := 0; i < active.Len(); i++ {
-		if !preds.GetPtr(active.Get(i)).matches(idx) {
+	for i := range active {
+		if !preds.GetPtr(active[i]).matches(idx) {
 			return false
 		}
 	}
@@ -616,8 +617,8 @@ func orderBasicResidualMatchesReader(preds predicateReader, active []int, idx ui
 	return predicatesMatchActiveReader(preds, active, idx)
 }
 
-func orderBasicResidualMatchesBufReader(preds predicateReader, active *pooled.Slice[int], idx uint64) bool {
-	if active == nil || active.Len() == 0 {
+func orderBasicResidualMatchesBufReader(preds predicateReader, active []int, idx uint64) bool {
+	if len(active) == 0 {
 		return true
 	}
 	return predicatesMatchActiveBufReader(preds, active, idx)
@@ -637,7 +638,7 @@ func orderBasicContainsReader(preds predicateReader, active []int, baseBM postin
 	return orderBasicResidualMatchesReader(preds, active, idx)
 }
 
-func orderBasicContainsBufReader(preds predicateReader, active *pooled.Slice[int], baseBM posting.List, baseNeg bool, baseNegUniverse bool, idx uint64) bool {
+func orderBasicContainsBufReader(preds predicateReader, active []int, baseBM posting.List, baseNeg bool, baseNegUniverse bool, idx uint64) bool {
 	if baseNeg {
 		if baseNegUniverse {
 			return orderBasicResidualMatchesBufReader(preds, active, idx)
@@ -720,7 +721,7 @@ func orderBasicEmitFilteredPostingReader(
 func orderBasicEmitFilteredPostingBufReader(
 	cursor *queryCursor,
 	preds predicateReader,
-	active *pooled.Slice[int],
+	active []int,
 	baseBM posting.List,
 	baseNeg bool,
 	baseNegUniverse bool,
@@ -768,7 +769,7 @@ func orderBasicEmitFilteredPostingBufReader(
 	if nextTmp.IsEmpty() {
 		return false, nextTmp
 	}
-	if active == nil || active.Len() == 0 {
+	if len(active) == 0 {
 		return cursor.emitPosting(nextTmp), nextTmp
 	}
 	it := nextTmp.Iter()
@@ -895,7 +896,7 @@ func (qv *queryView) runOrderBasicBaseQueryBuf(
 	nilTailField string,
 	base postingResult,
 	residualPreds predicateReader,
-	residualActive *pooled.Slice[int],
+	residualActive []int,
 	trace *queryTrace,
 ) ([]uint64, bool, error) {
 	defer base.release()
@@ -1437,20 +1438,19 @@ func (qv *queryView) shouldCollapseOrderBasicNumericRange(field string, fieldOrd
 	return positiveWork <= complementWork
 }
 
-func (qv *queryView) prepareOrderBasicBaseCores(baseOps []qir.Expr) (*pooled.Slice[orderBasicBaseCore], *pooled.Slice[int], bool, error) {
+func (qv *queryView) prepareOrderBasicBaseCores(baseOps []qir.Expr) (*pooled.Slice[orderBasicBaseCore], []int, bool, error) {
 	if len(baseOps) == 0 {
 		return nil, nil, false, nil
 	}
 	coresBuf := orderBasicBaseCoreSlicePool.Get()
 	coresBuf.Grow(len(baseOps))
-	rawCoreIdxBuf := orderBasicBaseCoreIndexSlicePool.Get()
-	rawCoreIdxBuf.SetLen(len(baseOps))
-	for i := 0; i < rawCoreIdxBuf.Len(); i++ {
-		rawCoreIdxBuf.Set(i, -1)
+	rawCoreIdxBuf := pools.GetIntSlice(len(baseOps))[:len(baseOps)]
+	for i := range rawCoreIdxBuf {
+		rawCoreIdxBuf[i] = -1
 	}
 
 	for i, op := range baseOps {
-		if rawCoreIdxBuf.Get(i) >= 0 {
+		if rawCoreIdxBuf[i] >= 0 {
 			continue
 		}
 		fm := qv.fieldMetaByExpr(op)
@@ -1462,7 +1462,7 @@ func (qv *queryView) prepareOrderBasicBaseCores(baseOps []qir.Expr) (*pooled.Sli
 		var rb rangeBounds
 		groupCount := 0
 		for j := i; j < len(baseOps); j++ {
-			if rawCoreIdxBuf.Get(j) >= 0 {
+			if rawCoreIdxBuf[j] >= 0 {
 				continue
 			}
 			other := baseOps[j]
@@ -1472,7 +1472,7 @@ func (qv *queryView) prepareOrderBasicBaseCores(baseOps []qir.Expr) (*pooled.Sli
 			nextRB, ok, err := qv.rangeBoundsForScalarExpr(other)
 			if err != nil {
 				orderBasicBaseCoreSlicePool.Put(coresBuf)
-				orderBasicBaseCoreIndexSlicePool.Put(rawCoreIdxBuf)
+				pools.PutIntSlice(rawCoreIdxBuf)
 				return nil, nil, false, err
 			}
 			if !ok {
@@ -1486,7 +1486,7 @@ func (qv *queryView) prepareOrderBasicBaseCores(baseOps []qir.Expr) (*pooled.Sli
 		}
 		if rb.empty {
 			orderBasicBaseCoreSlicePool.Put(coresBuf)
-			orderBasicBaseCoreIndexSlicePool.Put(rawCoreIdxBuf)
+			pools.PutIntSlice(rawCoreIdxBuf)
 			return nil, nil, true, nil
 		}
 		if !qv.shouldCollapseOrderBasicNumericRange(fieldName, op.FieldOrdinal, rb) {
@@ -1505,16 +1505,16 @@ func (qv *queryView) prepareOrderBasicBaseCores(baseOps []qir.Expr) (*pooled.Sli
 		for j := i; j < len(baseOps); j++ {
 			other := baseOps[j]
 			if other.FieldOrdinal == op.FieldOrdinal && isOrderBasicCollapsibleNumericRangeExpr(other, fm) {
-				rawCoreIdxBuf.Set(j, coreIdx)
+				rawCoreIdxBuf[j] = coreIdx
 			}
 		}
 	}
 
 	for i, op := range baseOps {
-		if rawCoreIdxBuf.Get(i) >= 0 {
+		if rawCoreIdxBuf[i] >= 0 {
 			continue
 		}
-		rawCoreIdxBuf.Set(i, coresBuf.Len())
+		rawCoreIdxBuf[i] = coresBuf.Len()
 		coresBuf.Append(orderBasicBaseCore{
 			kind: orderBasicBaseCoreRawExpr,
 			expr: op,
@@ -1523,20 +1523,19 @@ func (qv *queryView) prepareOrderBasicBaseCores(baseOps []qir.Expr) (*pooled.Sli
 	return coresBuf, rawCoreIdxBuf, false, nil
 }
 
-func (qv *queryView) prepareOrderBasicBaseCoresBuf(baseOps *pooled.Slice[qir.Expr]) (*pooled.Slice[orderBasicBaseCore], *pooled.Slice[int], bool, error) {
+func (qv *queryView) prepareOrderBasicBaseCoresBuf(baseOps *pooled.Slice[qir.Expr]) (*pooled.Slice[orderBasicBaseCore], []int, bool, error) {
 	if baseOps == nil || baseOps.Len() == 0 {
 		return nil, nil, false, nil
 	}
 	coresBuf := orderBasicBaseCoreSlicePool.Get()
 	coresBuf.Grow(baseOps.Len())
-	rawCoreIdxBuf := orderBasicBaseCoreIndexSlicePool.Get()
-	rawCoreIdxBuf.SetLen(baseOps.Len())
-	for i := 0; i < rawCoreIdxBuf.Len(); i++ {
-		rawCoreIdxBuf.Set(i, -1)
+	rawCoreIdxBuf := pools.GetIntSlice(baseOps.Len())[:baseOps.Len()]
+	for i := range rawCoreIdxBuf {
+		rawCoreIdxBuf[i] = -1
 	}
 
 	for i := 0; i < baseOps.Len(); i++ {
-		if rawCoreIdxBuf.Get(i) >= 0 {
+		if rawCoreIdxBuf[i] >= 0 {
 			continue
 		}
 		op := baseOps.Get(i)
@@ -1549,7 +1548,7 @@ func (qv *queryView) prepareOrderBasicBaseCoresBuf(baseOps *pooled.Slice[qir.Exp
 		var rb rangeBounds
 		groupCount := 0
 		for j := i; j < baseOps.Len(); j++ {
-			if rawCoreIdxBuf.Get(j) >= 0 {
+			if rawCoreIdxBuf[j] >= 0 {
 				continue
 			}
 			other := baseOps.Get(j)
@@ -1559,7 +1558,7 @@ func (qv *queryView) prepareOrderBasicBaseCoresBuf(baseOps *pooled.Slice[qir.Exp
 			nextRB, ok, err := qv.rangeBoundsForScalarExpr(other)
 			if err != nil {
 				orderBasicBaseCoreSlicePool.Put(coresBuf)
-				orderBasicBaseCoreIndexSlicePool.Put(rawCoreIdxBuf)
+				pools.PutIntSlice(rawCoreIdxBuf)
 				return nil, nil, false, err
 			}
 			if !ok {
@@ -1573,7 +1572,7 @@ func (qv *queryView) prepareOrderBasicBaseCoresBuf(baseOps *pooled.Slice[qir.Exp
 		}
 		if rb.empty {
 			orderBasicBaseCoreSlicePool.Put(coresBuf)
-			orderBasicBaseCoreIndexSlicePool.Put(rawCoreIdxBuf)
+			pools.PutIntSlice(rawCoreIdxBuf)
 			return nil, nil, true, nil
 		}
 		if !qv.shouldCollapseOrderBasicNumericRange(fieldName, op.FieldOrdinal, rb) {
@@ -1592,16 +1591,16 @@ func (qv *queryView) prepareOrderBasicBaseCoresBuf(baseOps *pooled.Slice[qir.Exp
 		for j := i; j < baseOps.Len(); j++ {
 			other := baseOps.Get(j)
 			if other.FieldOrdinal == op.FieldOrdinal && isOrderBasicCollapsibleNumericRangeExpr(other, fm) {
-				rawCoreIdxBuf.Set(j, coreIdx)
+				rawCoreIdxBuf[j] = coreIdx
 			}
 		}
 	}
 
 	for i := 0; i < baseOps.Len(); i++ {
-		if rawCoreIdxBuf.Get(i) >= 0 {
+		if rawCoreIdxBuf[i] >= 0 {
 			continue
 		}
-		rawCoreIdxBuf.Set(i, coresBuf.Len())
+		rawCoreIdxBuf[i] = coresBuf.Len()
 		coresBuf.Append(orderBasicBaseCore{
 			kind: orderBasicBaseCoreRawExpr,
 			expr: baseOps.Get(i),
@@ -1789,12 +1788,12 @@ func (qv *queryView) materializeOrderMaterializedBaseOpsBuf(orderField string, b
 			orderBasicBaseCoreSlicePool.Put(coresBuf)
 		}
 		if rawCoreIdxBuf != nil {
-			orderBasicBaseCoreIndexSlicePool.Put(rawCoreIdxBuf)
+			pools.PutIntSlice(rawCoreIdxBuf)
 		}
 		return
 	}
 	defer orderBasicBaseCoreSlicePool.Put(coresBuf)
-	defer orderBasicBaseCoreIndexSlicePool.Put(rawCoreIdxBuf)
+	defer pools.PutIntSlice(rawCoreIdxBuf)
 
 	keysBuf := materializedPredKeySlicePool.Get()
 	keysBuf.Grow(coresBuf.Len())
@@ -1847,12 +1846,12 @@ func (qv *queryView) promoteOrderBasicLimitMaterializedBaseOps(orderField string
 			orderBasicBaseCoreSlicePool.Put(coresBuf)
 		}
 		if rawCoreIdxBuf != nil {
-			orderBasicBaseCoreIndexSlicePool.Put(rawCoreIdxBuf)
+			pools.PutIntSlice(rawCoreIdxBuf)
 		}
 		return
 	}
 	defer orderBasicBaseCoreSlicePool.Put(coresBuf)
-	defer orderBasicBaseCoreIndexSlicePool.Put(rawCoreIdxBuf)
+	defer pools.PutIntSlice(rawCoreIdxBuf)
 
 	keysBuf := materializedPredKeySlicePool.Get()
 	keysBuf.Grow(coresBuf.Len())
@@ -2124,7 +2123,7 @@ func (qv *queryView) tryQueryOrderBasicWithLimit(q *qir.Shape, trace *queryTrace
 		defer orderBasicBaseCoreSlicePool.Put(baseCoresBuf)
 	}
 	if baseRawCoreIdxBuf != nil {
-		defer orderBasicBaseCoreIndexSlicePool.Put(baseRawCoreIdxBuf)
+		defer pools.PutIntSlice(baseRawCoreIdxBuf)
 	}
 	if noMatch {
 		return nil, true, nil
@@ -2203,7 +2202,7 @@ func (qv *queryView) tryQueryOrderBasicWithLimit(q *qir.Shape, trace *queryTrace
 
 	var base postingResult
 	var residualPredSet predicateSet
-	var residualActiveBuf *pooled.Slice[int]
+	var residualActiveBuf []int
 	var residualActive []int
 
 	if hasWarmBaseOps {
@@ -2237,7 +2236,7 @@ func (qv *queryView) tryQueryOrderBasicWithLimit(q *qir.Shape, trace *queryTrace
 			}
 		}
 		for i, op := range baseOps {
-			if loadedCoreBuf.Get(baseRawCoreIdxBuf.Get(i)) {
+			if loadedCoreBuf.Get(baseRawCoreIdxBuf[i]) {
 				continue
 			}
 			residualOpsBuf.Append(op)
@@ -2258,8 +2257,7 @@ func (qv *queryView) tryQueryOrderBasicWithLimit(q *qir.Shape, trace *queryTrace
 				if residualPredSet.Len() <= limitQueryFastPathMaxLeaves {
 					residualActive = residualActiveInline[:0]
 				} else {
-					residualActiveBuf = predicateCheckSlicePool.Get()
-					residualActiveBuf.Grow(residualPredSet.Len())
+					residualActiveBuf = pools.GetIntSlice(residualPredSet.Len())
 				}
 				for i := 0; i < residualPredSet.Len(); i++ {
 					p := residualPredSet.Get(i)
@@ -2272,7 +2270,7 @@ func (qv *queryView) tryQueryOrderBasicWithLimit(q *qir.Shape, trace *queryTrace
 						continue
 					}
 					if residualActiveBuf != nil {
-						residualActiveBuf.Append(i)
+						residualActiveBuf = append(residualActiveBuf, i)
 						continue
 					}
 					residualActive = append(residualActive, i)
@@ -2373,9 +2371,8 @@ func (qv *queryView) scanOrderLimitNoPredicates(q *qir.Shape, ov fieldOverlay, b
 
 func (qv *queryView) scanOrderLimitWithPredicatesReader(q *qir.Shape, ov fieldOverlay, br overlayRange, desc bool, preds predicateReader, nilTailField string, trace *queryTrace) ([]uint64, bool) {
 	if preds.Len() > limitQueryFastPathMaxLeaves {
-		activeBuf := predicateCheckSlicePool.Get()
-		activeBuf.Grow(preds.Len())
-		defer predicateCheckSlicePool.Put(activeBuf)
+		activeBuf := pools.GetIntSlice(preds.Len())
+		defer pools.PutIntSlice(activeBuf)
 		for i := 0; i < preds.Len(); i++ {
 			p := preds.Get(i)
 			if p.alwaysFalse {
@@ -2390,24 +2387,22 @@ func (qv *queryView) scanOrderLimitWithPredicatesReader(q *qir.Shape, ov fieldOv
 			if !p.hasContains() {
 				return nil, false
 			}
-			activeBuf.Append(i)
+			activeBuf = append(activeBuf, i)
 		}
-		if activeBuf.Len() == 0 {
+		if len(activeBuf) == 0 {
 			return qv.scanOrderLimitNoPredicates(q, ov, br, desc, nilTailField, trace)
 		}
 		sortActivePredicatesBufReader(activeBuf, preds)
 
-		exactActiveBuf := predicateCheckSlicePool.Get()
-		exactActiveBuf.Grow(activeBuf.Len())
-		defer predicateCheckSlicePool.Put(exactActiveBuf)
-		buildExactBucketPostingFilterActiveBufReader(exactActiveBuf, activeBuf, preds)
+		exactActiveBuf := pools.GetIntSlice(len(activeBuf))
+		defer pools.PutIntSlice(exactActiveBuf)
+		exactActiveBuf = buildExactBucketPostingFilterActiveBufReader(exactActiveBuf, activeBuf, preds)
 
-		residualActiveBuf := predicateCheckSlicePool.Get()
-		residualActiveBuf.Grow(activeBuf.Len())
-		defer predicateCheckSlicePool.Put(residualActiveBuf)
-		plannerResidualChecksBuf(residualActiveBuf, activeBuf, exactActiveBuf)
+		residualActiveBuf := pools.GetIntSlice(len(activeBuf))
+		defer pools.PutIntSlice(residualActiveBuf)
+		residualActiveBuf = plannerResidualChecksBuf(residualActiveBuf, activeBuf, exactActiveBuf)
 
-		exactOnly := activeBuf.Len() > 0 && activeBuf.Len() == exactActiveBuf.Len()
+		exactOnly := len(activeBuf) > 0 && len(activeBuf) == len(exactActiveBuf)
 
 		out := make([]uint64, 0, q.Limit)
 		cursor := qv.newQueryCursor(out, q.Offset, q.Limit, false, 0)

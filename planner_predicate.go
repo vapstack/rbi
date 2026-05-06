@@ -6,6 +6,7 @@ import (
 	"strconv"
 
 	"github.com/vapstack/rbi/internal/pooled"
+	"github.com/vapstack/rbi/internal/pools"
 	"github.com/vapstack/rbi/internal/posting"
 	"github.com/vapstack/rbi/internal/qir"
 )
@@ -2601,19 +2602,19 @@ func sortActivePredicates(active []int, preds []predicate) {
 	}
 }
 
-func sortActivePredicatesBufReader(active *pooled.Slice[int], preds predicateReader) {
-	if active.Len() <= 1 {
+func sortActivePredicatesBufReader(active []int, preds predicateReader) {
+	if len(active) <= 1 {
 		return
 	}
 
-	for i := 1; i < active.Len(); i++ {
-		cur := active.Get(i)
+	for i := 1; i < len(active); i++ {
+		cur := active[i]
 		j := i
-		for j > 0 && predicateOrderLess(preds, cur, active.Get(j-1)) {
-			active.Set(j, active.Get(j-1))
+		for j > 0 && predicateOrderLess(preds, cur, active[j-1]) {
+			active[j] = active[j-1]
 			j--
 		}
-		active.Set(j, cur)
+		active[j] = cur
 	}
 }
 
@@ -2630,9 +2631,8 @@ func orderedBasicAnchoredMatchesActiveReader(preds predicateReader, active []int
 	return true
 }
 
-func orderedBasicAnchoredMatchesActiveBufReader(preds predicateReader, active *pooled.Slice[int], leadIdx int, leadNeedsCheck bool, idx uint64) bool {
-	for i := 0; i < active.Len(); i++ {
-		pi := active.Get(i)
+func orderedBasicAnchoredMatchesActiveBufReader(preds predicateReader, active []int, leadIdx int, leadNeedsCheck bool, idx uint64) bool {
+	for _, pi := range active {
 		if pi == leadIdx && !leadNeedsCheck {
 			continue
 		}
@@ -2658,13 +2658,12 @@ func orderedPredicateChecksMatchReader(preds predicateReader, checks []int, sing
 	return true
 }
 
-func orderedPredicateChecksMatchBufReader(preds predicateReader, checks *pooled.Slice[int], singleCheck int, idx uint64) bool {
+func orderedPredicateChecksMatchBufReader(preds predicateReader, checks []int, singleCheck int, idx uint64) bool {
 	if singleCheck >= 0 {
 		p := preds.GetPtr(singleCheck)
 		return p.hasContains() && p.matches(idx)
 	}
-	for i := 0; i < checks.Len(); i++ {
-		pi := checks.Get(i)
+	for _, pi := range checks {
 		p := preds.GetPtr(pi)
 		if !p.hasContains() || !p.matches(idx) {
 			return false
@@ -2695,7 +2694,7 @@ func orderedBasicAnchoredFilterPostingReader(preds predicateReader, ids posting.
 	return builder.finish(false)
 }
 
-func orderedBasicAnchoredFilterPostingBufReader(preds predicateReader, ids posting.List, checks *pooled.Slice[int], singleCheck int) posting.List {
+func orderedBasicAnchoredFilterPostingBufReader(preds predicateReader, ids posting.List, checks []int, singleCheck int) posting.List {
 	if ids.IsEmpty() {
 		return posting.List{}
 	}
@@ -2962,7 +2961,7 @@ func orderedBasicAnchoredEmitPostingBuf(
 	cursor *queryCursor,
 	candidateIDs posting.List,
 	preds predicateReader,
-	deferredChecks *pooled.Slice[int],
+	deferredChecks []int,
 	singleDeferred int,
 	ids posting.List,
 	trace *queryTrace,
@@ -3039,14 +3038,14 @@ func buildExactBucketPostingFilterActiveReader(dst, active []int, preds predicat
 	return dst
 }
 
-func buildExactBucketPostingFilterActiveBufReader(dst, active *pooled.Slice[int], preds predicateReader) {
-	dst.Truncate()
-	for i := 0; i < active.Len(); i++ {
-		pi := active.Get(i)
+func buildExactBucketPostingFilterActiveBufReader(dst, active []int, preds predicateReader) []int {
+	dst = dst[:0]
+	for _, pi := range active {
 		if preds.Get(pi).supportsExactBucketPostingFilter() {
-			dst.Append(pi)
+			dst = append(dst, pi)
 		}
 	}
+	return dst
 }
 
 func releasePredicateRuntimeState(p *predicate) {
@@ -4682,14 +4681,13 @@ func chooseOrderedAnchorLeadReader(qv *queryView, orderField string, preds predi
 	return lead, lead >= 0
 }
 
-func chooseOrderedAnchorLeadBufReader(qv *queryView, orderField string, preds predicateReader, active *pooled.Slice[int]) (int, bool) {
+func chooseOrderedAnchorLeadBufReader(qv *queryView, orderField string, preds predicateReader, active []int) (int, bool) {
 	lead := -1
 	bestCard := uint64(0)
 	bestScore := 0.0
 	bestWeight := 0.0
 
-	for i := 0; i < active.Len(); i++ {
-		pi := active.Get(i)
+	for _, pi := range active {
 		p := preds.Get(pi)
 		if !p.hasIter() || p.estCard == 0 {
 			continue
@@ -4964,8 +4962,8 @@ func (qv *queryView) execPlanOrderedBasicAnchored(q *qir.Shape, preds predicateR
 	return cursor.out, true
 }
 
-func (qv *queryView) execPlanOrderedBasicAnchoredBuf(q *qir.Shape, preds predicateReader, active *pooled.Slice[int], ov fieldOverlay, br overlayRange, trace *queryTrace) ([]uint64, bool) {
-	if active.Len() < plannerOrderedAnchorMinActive {
+func (qv *queryView) execPlanOrderedBasicAnchoredBuf(q *qir.Shape, preds predicateReader, active []int, ov fieldOverlay, br overlayRange, trace *queryTrace) ([]uint64, bool) {
+	if len(active) < plannerOrderedAnchorMinActive {
 		return nil, false
 	}
 	if br.baseEnd-br.baseStart < plannerOrderedAnchorSpanMin {
@@ -4989,7 +4987,7 @@ func (qv *queryView) execPlanOrderedBasicAnchoredBuf(q *qir.Shape, preds predica
 		}
 	}
 
-	leadBudget, candidateCap := plannerOrderedAnchorBudgets(needWindow, active.Len(), preds.Get(leadIdx).estCard)
+	leadBudget, candidateCap := plannerOrderedAnchorBudgets(needWindow, len(active), preds.Get(leadIdx).estCard)
 	if br.baseStart == 0 && br.baseEnd == ov.keyCount() {
 		wideLeadMax := candidateCap * 8
 		if wideLeadMax < candidateCap {
@@ -5007,33 +5005,29 @@ func (qv *queryView) execPlanOrderedBasicAnchoredBuf(q *qir.Shape, preds predica
 	defer leadIt.Release()
 	leadNeedsCheck := preds.GetPtr(leadIdx).leadIterNeedsContainsCheck()
 
-	exactChecksBuf := predicateCheckSlicePool.Get()
-	exactChecksBuf.Grow(active.Len())
-	defer predicateCheckSlicePool.Put(exactChecksBuf)
-	residualChecksBuf := predicateCheckSlicePool.Get()
-	residualChecksBuf.Grow(active.Len())
-	defer predicateCheckSlicePool.Put(residualChecksBuf)
-	deferredChecksBuf := predicateCheckSlicePool.Get()
-	deferredChecksBuf.Grow(active.Len())
-	defer predicateCheckSlicePool.Put(deferredChecksBuf)
+	exactChecksBuf := pools.GetIntSlice(len(active))
+	defer pools.PutIntSlice(exactChecksBuf)
+	residualChecksBuf := pools.GetIntSlice(len(active))
+	defer pools.PutIntSlice(residualChecksBuf)
+	deferredChecksBuf := pools.GetIntSlice(len(active))
+	defer pools.PutIntSlice(deferredChecksBuf)
 
 	orderedExactPreferred := false
-	for i := 0; i < active.Len(); i++ {
-		pi := active.Get(i)
+	for _, pi := range active {
 		if pi == leadIdx && !leadNeedsCheck {
 			continue
 		}
-		deferredChecksBuf.Append(pi)
+		deferredChecksBuf = append(deferredChecksBuf, pi)
 	}
-	buildExactBucketPostingFilterActiveBufReader(exactChecksBuf, deferredChecksBuf, preds)
-	for i := 0; i < exactChecksBuf.Len(); i++ {
-		if preds.Get(exactChecksBuf.Get(i)).prefersExactBucketPostingFilter() {
+	exactChecksBuf = buildExactBucketPostingFilterActiveBufReader(exactChecksBuf, deferredChecksBuf, preds)
+	for _, pi := range exactChecksBuf {
+		if preds.Get(pi).prefersExactBucketPostingFilter() {
 			orderedExactPreferred = true
 			break
 		}
 	}
-	plannerResidualChecksBuf(residualChecksBuf, deferredChecksBuf, exactChecksBuf)
-	useExactPosting := exactChecksBuf.Len() > 0 && (residualChecksBuf.Len() == 0 || orderedExactPreferred)
+	residualChecksBuf = plannerResidualChecksBuf(residualChecksBuf, deferredChecksBuf, exactChecksBuf)
+	useExactPosting := len(exactChecksBuf) > 0 && (len(residualChecksBuf) == 0 || orderedExactPreferred)
 
 	var candidates posting.List
 
@@ -5141,10 +5135,10 @@ func (qv *queryView) execPlanOrderedBasicAnchoredBuf(q *qir.Shape, preds predica
 			exactWork.Release()
 			return nil, true
 		}
-		if exactApplied && residualChecksBuf.Len() > 0 {
+		if exactApplied && len(residualChecksBuf) > 0 {
 			singleResidual := -1
-			if residualChecksBuf.Len() == 1 {
-				singleResidual = residualChecksBuf.Get(0)
+			if len(residualChecksBuf) == 1 {
+				singleResidual = residualChecksBuf[0]
 			}
 			filtered := orderedBasicAnchoredFilterPostingBufReader(preds, candidateIDs, residualChecksBuf, singleResidual)
 			if filtered.IsEmpty() {
@@ -5157,7 +5151,7 @@ func (qv *queryView) execPlanOrderedBasicAnchoredBuf(q *qir.Shape, preds predica
 			candidateIDs = filtered
 		}
 		if exactApplied {
-			deferredChecksBuf.Truncate()
+			deferredChecksBuf = deferredChecksBuf[:0]
 		}
 		if candidateIDs.Cardinality() > candidateCap {
 			exactWork.Release()
@@ -5173,8 +5167,8 @@ func (qv *queryView) execPlanOrderedBasicAnchoredBuf(q *qir.Shape, preds predica
 	seenCandidates := uint64(0)
 	scanWidth := uint64(0)
 	singleDeferred := -1
-	if deferredChecksBuf.Len() == 1 {
-		singleDeferred = deferredChecksBuf.Get(0)
+	if len(deferredChecksBuf) == 1 {
+		singleDeferred = deferredChecksBuf[0]
 	}
 	cursor := qv.newQueryCursor(out, skip, need, false, 0)
 
@@ -5249,9 +5243,8 @@ func (qv *queryView) execPlanOrderedBasicReader(q *qir.Shape, preds predicateRea
 	boolSlicePool.Put(rangeCovered)
 
 	if preds.Len() > plannerPredicateFastPathMaxLeaves {
-		activeBuf := predicateCheckSlicePool.Get()
-		activeBuf.Grow(preds.Len())
-		defer predicateCheckSlicePool.Put(activeBuf)
+		activeBuf := pools.GetIntSlice(preds.Len())
+		defer pools.PutIntSlice(activeBuf)
 		for i := 0; i < preds.Len(); i++ {
 			p := preds.Get(i)
 			if p.covered || p.alwaysTrue {
@@ -5260,7 +5253,7 @@ func (qv *queryView) execPlanOrderedBasicReader(q *qir.Shape, preds predicateRea
 			if p.alwaysFalse {
 				return nil, true
 			}
-			activeBuf.Append(i)
+			activeBuf = append(activeBuf, i)
 		}
 		if !fm.Ptr {
 			if out, ok := qv.execPlanOrderedBasicAnchoredBuf(q, preds, activeBuf, ov, br, trace); ok {
@@ -5270,7 +5263,7 @@ func (qv *queryView) execPlanOrderedBasicReader(q *qir.Shape, preds predicateRea
 				return out, true
 			}
 		}
-		if activeBuf.Len() == 0 {
+		if len(activeBuf) == 0 {
 			return qv.scanOrderLimitNoPredicates(q, ov, br, o.Desc, nilTailField, trace)
 		}
 		return qv.scanOrderLimitWithPredicatesReader(q, ov, br, o.Desc, preds, nilTailField, trace)

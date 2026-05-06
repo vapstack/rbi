@@ -273,19 +273,20 @@ func (b *plannerORBranch) buildMatchChecks(dst []int) []int {
 	return dst
 }
 
-func (b *plannerORBranch) buildMatchChecksBuf(dst *pooled.Slice[int]) {
-	dst.Truncate()
+func (b *plannerORBranch) buildMatchChecksBuf(dst []int) []int {
+	dst = dst[:0]
 	if b.alwaysTrue {
-		return
+		return dst
 	}
 	for i := 0; i < b.predLen(); i++ {
 		p := b.pred(i)
 		if p.covered || p.alwaysTrue {
 			continue
 		}
-		dst.Append(i)
+		dst = append(dst, i)
 	}
 	sortActivePredicatesBufReader(dst, b.preds)
+	return dst
 }
 
 func (b *plannerORBranch) buildPostingFilterChecks(dst []int, checks []int) []int {
@@ -301,52 +302,52 @@ func (b *plannerORBranch) buildPostingFilterChecks(dst []int, checks []int) []in
 	return dst
 }
 
-func (b *plannerORBranch) matchesChecksBuf(idx uint64, checks *pooled.Slice[int]) bool {
+func (b *plannerORBranch) matchesChecksBuf(idx uint64, checks []int) bool {
 	if b.alwaysTrue {
 		return true
 	}
-	switch checks.Len() {
+	switch len(checks) {
 	case 0:
 		return true
 	case 1:
-		p0 := b.predPtr(checks.Get(0))
+		p0 := b.predPtr(checks[0])
 		return !p0.alwaysFalse && p0.hasContains() && p0.matches(idx)
 	case 2:
-		p0 := b.predPtr(checks.Get(0))
+		p0 := b.predPtr(checks[0])
 		if p0.alwaysFalse || !p0.hasContains() || !p0.matches(idx) {
 			return false
 		}
-		p1 := b.predPtr(checks.Get(1))
+		p1 := b.predPtr(checks[1])
 		return !p1.alwaysFalse && p1.hasContains() && p1.matches(idx)
 	case 3:
-		p0 := b.predPtr(checks.Get(0))
+		p0 := b.predPtr(checks[0])
 		if p0.alwaysFalse || !p0.hasContains() || !p0.matches(idx) {
 			return false
 		}
-		p1 := b.predPtr(checks.Get(1))
+		p1 := b.predPtr(checks[1])
 		if p1.alwaysFalse || !p1.hasContains() || !p1.matches(idx) {
 			return false
 		}
-		p2 := b.predPtr(checks.Get(2))
+		p2 := b.predPtr(checks[2])
 		return !p2.alwaysFalse && p2.hasContains() && p2.matches(idx)
 	case 4:
-		p0 := b.predPtr(checks.Get(0))
+		p0 := b.predPtr(checks[0])
 		if p0.alwaysFalse || !p0.hasContains() || !p0.matches(idx) {
 			return false
 		}
-		p1 := b.predPtr(checks.Get(1))
+		p1 := b.predPtr(checks[1])
 		if p1.alwaysFalse || !p1.hasContains() || !p1.matches(idx) {
 			return false
 		}
-		p2 := b.predPtr(checks.Get(2))
+		p2 := b.predPtr(checks[2])
 		if p2.alwaysFalse || !p2.hasContains() || !p2.matches(idx) {
 			return false
 		}
-		p3 := b.predPtr(checks.Get(3))
+		p3 := b.predPtr(checks[3])
 		return !p3.alwaysFalse && p3.hasContains() && p3.matches(idx)
 	}
-	for i := 0; i < checks.Len(); i++ {
-		p := b.predPtr(checks.Get(i))
+	for _, check := range checks {
+		p := b.predPtr(check)
 		if p.alwaysFalse || !p.hasContains() || !p.matches(idx) {
 			return false
 		}
@@ -373,43 +374,37 @@ func plannerResidualChecks(dst []int, checks []int, exactChecks []int) []int {
 	return dst
 }
 
-func plannerResidualChecksBuf(dst, checks, exactChecks *pooled.Slice[int]) {
-	dst.Truncate()
-	if checks.Len() == 0 {
-		return
+func plannerResidualChecksBuf(dst, checks, exactChecks []int) []int {
+	dst = dst[:0]
+	if len(checks) == 0 {
+		return dst
 	}
-	if exactChecks.Len() == 0 {
-		for i := 0; i < checks.Len(); i++ {
-			dst.Append(checks.Get(i))
-		}
-		return
+	if len(exactChecks) == 0 {
+		return append(dst, checks...)
 	}
 	ei := 0
-	for i := 0; i < checks.Len(); i++ {
-		check := checks.Get(i)
-		if ei < exactChecks.Len() && exactChecks.Get(ei) == check {
+	for _, check := range checks {
+		if ei < len(exactChecks) && exactChecks[ei] == check {
 			ei++
 			continue
 		}
-		dst.Append(check)
+		dst = append(dst, check)
 	}
+	return dst
 }
 
-func plannerORBranchBuildActiveChecksWithCoveredBuf(dst *pooled.Slice[int], branch *plannerORBranch, covered *pooled.Slice[bool]) {
-	dst.Truncate()
+func plannerORBranchBuildActiveChecksWithCoveredBuf(dst []int, branch *plannerORBranch, covered *pooled.Slice[bool]) []int {
+	dst = dst[:0]
 	if branch == nil {
-		return
+		return dst
 	}
 	if covered == nil {
-		branch.buildMatchChecksBuf(dst)
-		return
+		return branch.buildMatchChecksBuf(dst)
 	}
-	dst.Grow(branch.predLen())
 	for pi := 0; pi < branch.predLen(); pi++ {
 		p := branch.pred(pi)
 		if p.alwaysFalse {
-			dst.Truncate()
-			return
+			return dst[:0]
 		}
 		if p.alwaysTrue || !p.hasContains() {
 			continue
@@ -417,9 +412,10 @@ func plannerORBranchBuildActiveChecksWithCoveredBuf(dst *pooled.Slice[int], bran
 		if pi < covered.Len() && covered.Get(pi) {
 			continue
 		}
-		dst.Append(pi)
+		dst = append(dst, pi)
 	}
 	sortActivePredicatesBufReader(dst, branch.preds)
+	return dst
 }
 
 func plannerORBranchCheckCounts(branch plannerORBranch, covered *pooled.Slice[bool]) (int, int) {
@@ -452,20 +448,17 @@ func plannerORBranchCheckCounts(branch plannerORBranch, covered *pooled.Slice[bo
 		return len(checks), len(residualChecks)
 	}
 
-	checksBuf := predicateCheckSlicePool.Get()
-	checksBuf.Grow(branch.predLen())
-	plannerORBranchBuildActiveChecksWithCoveredBuf(checksBuf, &branch, covered)
-	exactChecksBuf := predicateCheckSlicePool.Get()
-	exactChecksBuf.Grow(checksBuf.Len())
-	buildExactBucketPostingFilterActiveBufReader(exactChecksBuf, checksBuf, branch.preds)
-	residualChecksBuf := predicateCheckSlicePool.Get()
-	residualChecksBuf.Grow(checksBuf.Len())
-	plannerResidualChecksBuf(residualChecksBuf, checksBuf, exactChecksBuf)
-	streamChecks := checksBuf.Len()
-	mergeChecks := residualChecksBuf.Len()
-	predicateCheckSlicePool.Put(residualChecksBuf)
-	predicateCheckSlicePool.Put(exactChecksBuf)
-	predicateCheckSlicePool.Put(checksBuf)
+	checksBuf := pools.GetIntSlice(branch.predLen())
+	checksBuf = plannerORBranchBuildActiveChecksWithCoveredBuf(checksBuf, &branch, covered)
+	exactChecksBuf := pools.GetIntSlice(len(checksBuf))
+	exactChecksBuf = buildExactBucketPostingFilterActiveBufReader(exactChecksBuf, checksBuf, branch.preds)
+	residualChecksBuf := pools.GetIntSlice(len(checksBuf))
+	residualChecksBuf = plannerResidualChecksBuf(residualChecksBuf, checksBuf, exactChecksBuf)
+	streamChecks := len(checksBuf)
+	mergeChecks := len(residualChecksBuf)
+	pools.PutIntSlice(residualChecksBuf)
+	pools.PutIntSlice(exactChecksBuf)
+	pools.PutIntSlice(checksBuf)
 	return streamChecks, mergeChecks
 }
 
@@ -522,7 +515,7 @@ func (b *plannerORBranch) matchesChecks(idx uint64, checks []int) bool {
 	return true
 }
 
-func (b *plannerORBranch) matchesChecksObservedBuf(idx uint64, branch int, checks *pooled.Slice[int], observed *orderedORObservedStats) bool {
+func (b *plannerORBranch) matchesChecksObservedBuf(idx uint64, branch int, checks []int, observed *orderedORObservedStats) bool {
 	if b.alwaysTrue {
 		return true
 	}
@@ -530,83 +523,82 @@ func (b *plannerORBranch) matchesChecksObservedBuf(idx uint64, branch int, check
 	if observed != nil {
 		offset = observed.offsets[branch]
 	}
-	switch checks.Len() {
+	switch len(checks) {
 	case 0:
 		return true
 	case 1:
 		if observed != nil && observed.candidatesBuf.Get(offset) {
 			observed.countsBuf[offset]++
 		}
-		p0 := b.predPtr(checks.Get(0))
+		p0 := b.predPtr(checks[0])
 		return !p0.alwaysFalse && p0.hasContains() && p0.matches(idx)
 	case 2:
 		if observed != nil && observed.candidatesBuf.Get(offset) {
 			observed.countsBuf[offset]++
 		}
-		p0 := b.predPtr(checks.Get(0))
+		p0 := b.predPtr(checks[0])
 		if p0.alwaysFalse || !p0.hasContains() || !p0.matches(idx) {
 			return false
 		}
 		if observed != nil && observed.candidatesBuf.Get(offset+1) {
 			observed.countsBuf[offset+1]++
 		}
-		p1 := b.predPtr(checks.Get(1))
+		p1 := b.predPtr(checks[1])
 		return !p1.alwaysFalse && p1.hasContains() && p1.matches(idx)
 	case 3:
 		if observed != nil && observed.candidatesBuf.Get(offset) {
 			observed.countsBuf[offset]++
 		}
-		p0 := b.predPtr(checks.Get(0))
+		p0 := b.predPtr(checks[0])
 		if p0.alwaysFalse || !p0.hasContains() || !p0.matches(idx) {
 			return false
 		}
 		if observed != nil && observed.candidatesBuf.Get(offset+1) {
 			observed.countsBuf[offset+1]++
 		}
-		p1 := b.predPtr(checks.Get(1))
+		p1 := b.predPtr(checks[1])
 		if p1.alwaysFalse || !p1.hasContains() || !p1.matches(idx) {
 			return false
 		}
 		if observed != nil && observed.candidatesBuf.Get(offset+2) {
 			observed.countsBuf[offset+2]++
 		}
-		p2 := b.predPtr(checks.Get(2))
+		p2 := b.predPtr(checks[2])
 		return !p2.alwaysFalse && p2.hasContains() && p2.matches(idx)
 	case 4:
 		if observed != nil && observed.candidatesBuf.Get(offset) {
 			observed.countsBuf[offset]++
 		}
-		p0 := b.predPtr(checks.Get(0))
+		p0 := b.predPtr(checks[0])
 		if p0.alwaysFalse || !p0.hasContains() || !p0.matches(idx) {
 			return false
 		}
 		if observed != nil && observed.candidatesBuf.Get(offset+1) {
 			observed.countsBuf[offset+1]++
 		}
-		p1 := b.predPtr(checks.Get(1))
+		p1 := b.predPtr(checks[1])
 		if p1.alwaysFalse || !p1.hasContains() || !p1.matches(idx) {
 			return false
 		}
 		if observed != nil && observed.candidatesBuf.Get(offset+2) {
 			observed.countsBuf[offset+2]++
 		}
-		p2 := b.predPtr(checks.Get(2))
+		p2 := b.predPtr(checks[2])
 		if p2.alwaysFalse || !p2.hasContains() || !p2.matches(idx) {
 			return false
 		}
 		if observed != nil && observed.candidatesBuf.Get(offset+3) {
 			observed.countsBuf[offset+3]++
 		}
-		p3 := b.predPtr(checks.Get(3))
+		p3 := b.predPtr(checks[3])
 		return !p3.alwaysFalse && p3.hasContains() && p3.matches(idx)
 	}
-	for ci := 0; ci < checks.Len(); ci++ {
+	for ci, check := range checks {
 		if observed != nil && observed.candidatesBuf.Get(offset+ci) {
 			slot := offset + ci
 			observed.countsBuf[slot]++
 		}
-		i := checks.Get(ci)
-		p := b.predPtr(i)
+		p := b.predPtr(check)
 		if p.alwaysFalse || !p.hasContains() || !p.matches(idx) {
 			return false
 		}
@@ -672,9 +664,9 @@ func plannerHasPreferredExactBucketFilterReader(preds predicateReader, checks []
 	return false
 }
 
-func plannerHasPreferredExactBucketFilterBufReader(preds predicateReader, checks *pooled.Slice[int]) bool {
-	for i := 0; i < checks.Len(); i++ {
-		if preds.Get(checks.Get(i)).prefersExactBucketPostingFilter() {
+func plannerHasPreferredExactBucketFilterBufReader(preds predicateReader, checks []int) bool {
+	for _, pi := range checks {
+		if preds.Get(pi).prefersExactBucketPostingFilter() {
 			return true
 		}
 	}
@@ -736,7 +728,7 @@ func plannerFilterCompactPostingByPredicateChecks(
 
 func plannerFilterCompactPostingByPredicateChecksBuf(
 	preds predicateReader,
-	checks *pooled.Slice[int],
+	checks []int,
 	src posting.List,
 	work posting.List,
 	card uint64,
@@ -745,8 +737,8 @@ func plannerFilterCompactPostingByPredicateChecksBuf(
 		return 0, posting.List{}, work, false
 	}
 	if idx, ok := src.TrySingle(); ok {
-		for i := 0; i < checks.Len(); i++ {
-			if !preds.GetPtr(checks.Get(i)).matches(idx) {
+		for _, pi := range checks {
+			if !preds.GetPtr(pi).matches(idx) {
 				return plannerPredicateBucketEmpty, posting.List{}, work, true
 			}
 		}
@@ -758,8 +750,8 @@ func plannerFilterCompactPostingByPredicateChecksBuf(
 	for it.HasNext() {
 		idx := it.Next()
 		keep := true
-		for i := 0; i < checks.Len(); i++ {
-			if !preds.GetPtr(checks.Get(i)).matches(idx) {
+		for _, pi := range checks {
+			if !preds.GetPtr(pi).matches(idx) {
 				keep = false
 				break
 			}
@@ -982,7 +974,7 @@ func plannerFilterPostingByPredicateSetChecks(
 
 func plannerFilterPostingByPredicateChecksBuf(
 	preds predicateReader,
-	checks *pooled.Slice[int],
+	checks []int,
 	src posting.List,
 	work posting.List,
 	allowExact bool,
@@ -991,18 +983,17 @@ func plannerFilterPostingByPredicateChecksBuf(
 		return plannerPredicateBucketEmpty, posting.List{}, work, 0
 	}
 	card := src.Cardinality()
-	if checks.Len() == 0 {
+	if len(checks) == 0 {
 		return plannerPredicateBucketAll, src, work, card
 	}
 
-	smallCard := card <= plannerPredicateBucketExactMinCardForChecks(checks.Len())
+	smallCard := card <= plannerPredicateBucketExactMinCardForChecks(len(checks))
 	preferExact := smallCard && plannerHasPreferredExactBucketFilterBufReader(preds, checks)
 
 	if (!allowExact || smallCard) && !preferExact {
 		skipBucket := false
 		fullBucket := true
-		for i := 0; i < checks.Len(); i++ {
-			pi := checks.Get(i)
+		for _, pi := range checks {
 			cnt, ok := preds.Get(pi).countBucket(src)
 			if !ok {
 				fullBucket = false
@@ -1030,8 +1021,7 @@ func plannerFilterPostingByPredicateChecksBuf(
 	}
 
 	work = src.CloneInto(work)
-	for i := 0; i < checks.Len(); i++ {
-		pi := checks.Get(i)
+	for _, pi := range checks {
 		var ok bool
 		work, ok = preds.Get(pi).applyToPosting(work)
 		if !ok {
@@ -1857,7 +1847,7 @@ func initOrderedORObservedStats(
 	field string,
 	observed *orderedORObservedStats,
 	branches plannerORBranches,
-	branchChecks [plannerORBranchLimit]*pooled.Slice[int],
+	branchChecks [plannerORBranchLimit][]int,
 	analysis *plannerOROrderAnalysis,
 ) {
 	if observed == nil {
@@ -1870,7 +1860,7 @@ func initOrderedORObservedStats(
 		branchCount = plannerORBranchLimit
 	}
 	for i := 0; i < branchCount; i++ {
-		total += branchChecks[i].Len()
+		total += len(branchChecks[i])
 		observed.offsets[i+1] = total
 	}
 	if total == 0 {
@@ -1883,8 +1873,7 @@ func initOrderedORObservedStats(
 	for bi := 0; bi < branchCount; bi++ {
 		branch := branches.Get(bi)
 		checks := branchChecks[bi]
-		for ci := 0; ci < checks.Len(); ci++ {
-			pi := checks.Get(ci)
+		for _, pi := range checks {
 			p := branch.pred(pi)
 			info := qv.orderedORPredicateBuildInfoForBranch(field, p, analysis, branch, bi, pi)
 			if qv.shouldObserveOrderedORPredicate(p, info) {
@@ -1908,8 +1897,7 @@ func initOrderedORObservedStats(
 		branch := branches.Get(bi)
 		start := observed.offsets[bi]
 		checks := branchChecks[bi]
-		for ci := 0; ci < checks.Len(); ci++ {
-			pi := checks.Get(ci)
+		for ci, pi := range checks {
 			p := branch.pred(pi)
 			info := qv.orderedORPredicateBuildInfoForBranch(field, p, analysis, branch, bi, pi)
 			if qv.shouldObserveOrderedORPredicate(p, info) {
@@ -1946,7 +1934,7 @@ func (s *orderedORObservedStats) release() {
 
 func releasePlannerOROrderBasicCheckBufs(
 	branchCount int,
-	checkBufs *[plannerORBranchLimit]*pooled.Slice[int],
+	checkBufs *[plannerORBranchLimit][]int,
 ) {
 	if branchCount > plannerORBranchLimit {
 		branchCount = plannerORBranchLimit
@@ -1955,7 +1943,7 @@ func releasePlannerOROrderBasicCheckBufs(
 		if checkBufs[i] == nil {
 			continue
 		}
-		predicateCheckSlicePool.Put(checkBufs[i])
+		pools.PutIntSlice(checkBufs[i])
 		checkBufs[i] = nil
 	}
 }
@@ -1966,7 +1954,7 @@ func plannerOROrderBasicMatches(
 	branchEvalN int,
 	branchStart *[plannerORBranchLimit]int,
 	branchEnd *[plannerORBranchLimit]int,
-	branchChecks *[plannerORBranchLimit]*pooled.Slice[int],
+	branchChecks *[plannerORBranchLimit][]int,
 	idx uint64,
 	bucket int,
 ) bool {
@@ -1988,7 +1976,7 @@ func plannerOROrderBasicMatchesObserved(
 	branchEvalN int,
 	branchStart *[plannerORBranchLimit]int,
 	branchEnd *[plannerORBranchLimit]int,
-	branchChecks *[plannerORBranchLimit]*pooled.Slice[int],
+	branchChecks *[plannerORBranchLimit][]int,
 	idx uint64,
 	bucket int,
 	observed *orderedORObservedStats,
@@ -2009,7 +1997,7 @@ func plannerOROrderBasicMatchWithMetrics(
 	branches plannerORBranches,
 	branchStart *[plannerORBranchLimit]int,
 	branchEnd *[plannerORBranchLimit]int,
-	branchChecks *[plannerORBranchLimit]*pooled.Slice[int],
+	branchChecks *[plannerORBranchLimit][]int,
 	branchMetrics []TraceORBranch,
 	idx uint64,
 	bucket int,
@@ -2535,12 +2523,15 @@ func orderedORNextPredicateRows(rows, predCard, branchCard, branchUniverse uint6
 	return next
 }
 
-func orderedORAdvanceRowsForChecks(branch *plannerORBranch, checks *pooled.Slice[int], est plannerOROrderedBranchEstimate, rows uint64) uint64 {
-	if branch == nil || checks == nil || rows == 0 {
+func orderedORAdvanceRowsForChecks(branch *plannerORBranch, checks []int, est plannerOROrderedBranchEstimate, rows uint64) uint64 {
+	if branch == nil || len(checks) == 0 || rows == 0 {
 		return rows
 	}
-	for i := 0; i < checks.Len() && rows > 0; i++ {
-		rows = orderedORNextPredicateRows(rows, branch.pred(checks.Get(i)).estCard, est.card, est.universe)
+	for _, check := range checks {
+		if rows == 0 {
+			break
+		}
+		rows = orderedORNextPredicateRows(rows, branch.pred(check).estCard, est.card, est.universe)
 	}
 	return rows
 }
@@ -2707,12 +2698,14 @@ func (qv *queryView) maybeMaterializeOrderedORPredicates(
 			continue
 		}
 		covered := analysis.branches[bi].covered
-		fullChecks := predicateCheckSlicePool.Get()
-		plannerORBranchBuildActiveChecksWithCoveredBuf(fullChecks, branch, covered)
+		fullChecks := pools.GetIntSlice(branch.predLen())
+		fullChecks = plannerORBranchBuildActiveChecksWithCoveredBuf(fullChecks, branch, covered)
 		branchDone := false
 		if !merge {
-			for ci := 0; ci < fullChecks.Len() && rows > 0; ci++ {
-				pi := fullChecks.Get(ci)
+			for _, pi := range fullChecks {
+				if rows == 0 {
+					break
+				}
 				p := branch.pred(pi)
 				considered++
 				info := qv.orderedORPredicateBuildInfoForBranch(orderField, p, analysis, *branch, bi, pi)
@@ -2746,23 +2739,23 @@ func (qv *queryView) maybeMaterializeOrderedORPredicates(
 				}
 				rows = orderedORNextPredicateRows(rows, p.estCard, est.card, est.universe)
 			}
-			predicateCheckSlicePool.Put(fullChecks)
+			pools.PutIntSlice(fullChecks)
 			if branchDone {
 				continue
 			}
 			continue
 		}
 
-		exactChecks := predicateCheckSlicePool.Get()
-		exactChecks.Grow(fullChecks.Len())
-		buildExactBucketPostingFilterActiveBufReader(exactChecks, fullChecks, branch.preds)
-		residualChecks := predicateCheckSlicePool.Get()
-		residualChecks.Grow(fullChecks.Len())
-		plannerResidualChecksBuf(residualChecks, fullChecks, exactChecks)
-		predicateCheckSlicePool.Put(fullChecks)
+		exactChecks := pools.GetIntSlice(len(fullChecks))
+		exactChecks = buildExactBucketPostingFilterActiveBufReader(exactChecks, fullChecks, branch.preds)
+		residualChecks := pools.GetIntSlice(len(fullChecks))
+		residualChecks = plannerResidualChecksBuf(residualChecks, fullChecks, exactChecks)
+		pools.PutIntSlice(fullChecks)
 
-		for ci := 0; ci < exactChecks.Len() && rows > 0; ci++ {
-			pi := exactChecks.Get(ci)
+		for _, pi := range exactChecks {
+			if rows == 0 {
+				break
+			}
 			p := branch.pred(pi)
 			considered++
 			info := qv.orderedORPredicateBuildInfoForBranch(orderField, p, analysis, *branch, bi, pi)
@@ -2797,8 +2790,10 @@ func (qv *queryView) maybeMaterializeOrderedORPredicates(
 			rows = orderedORNextPredicateRows(rows, p.estCard, est.card, est.universe)
 		}
 		if !branchDone {
-			for ci := 0; ci < residualChecks.Len() && rows > 0; ci++ {
-				pi := residualChecks.Get(ci)
+			for _, pi := range residualChecks {
+				if rows == 0 {
+					break
+				}
 				p := branch.pred(pi)
 				considered++
 				info := qv.orderedORPredicateBuildInfoForBranch(orderField, p, analysis, *branch, bi, pi)
@@ -2833,8 +2828,8 @@ func (qv *queryView) maybeMaterializeOrderedORPredicates(
 				rows = orderedORNextPredicateRows(rows, p.estCard, est.card, est.universe)
 			}
 		}
-		predicateCheckSlicePool.Put(residualChecks)
-		predicateCheckSlicePool.Put(exactChecks)
+		pools.PutIntSlice(residualChecks)
+		pools.PutIntSlice(exactChecks)
 	}
 	if !allowBuild || !hasBuildCandidates {
 		if changed {
@@ -2875,8 +2870,8 @@ func (qv *queryView) maybeMaterializeOrderedORPredicates(
 		return changed
 	}
 
-	var branchChecks [plannerORBranchLimit]*pooled.Slice[int]
-	var branchExactChecks [plannerORBranchLimit]*pooled.Slice[int]
+	var branchChecks [plannerORBranchLimit][]int
+	var branchExactChecks [plannerORBranchLimit][]int
 	defer releasePlannerOROrderBasicCheckBufs(branchCount, &branchChecks)
 	defer releasePlannerOROrderBasicCheckBufs(branchCount, &branchExactChecks)
 
@@ -2885,24 +2880,22 @@ func (qv *queryView) maybeMaterializeOrderedORPredicates(
 			continue
 		}
 		branch := branches.GetPtr(bi)
-		fullChecks := predicateCheckSlicePool.Get()
-		plannerORBranchBuildActiveChecksWithCoveredBuf(fullChecks, branch, analysis.branches[bi].covered)
-		exactChecks := predicateCheckSlicePool.Get()
-		exactChecks.Grow(fullChecks.Len())
-		buildExactBucketPostingFilterActiveBufReader(exactChecks, fullChecks, branch.preds)
+		fullChecks := pools.GetIntSlice(branch.predLen())
+		fullChecks = plannerORBranchBuildActiveChecksWithCoveredBuf(fullChecks, branch, analysis.branches[bi].covered)
+		exactChecks := pools.GetIntSlice(len(fullChecks))
+		exactChecks = buildExactBucketPostingFilterActiveBufReader(exactChecks, fullChecks, branch.preds)
 		branchExactChecks[bi] = exactChecks
-		residualChecks := predicateCheckSlicePool.Get()
-		residualChecks.Grow(fullChecks.Len())
-		plannerResidualChecksBuf(residualChecks, fullChecks, exactChecks)
+		residualChecks := pools.GetIntSlice(len(fullChecks))
+		residualChecks = plannerResidualChecksBuf(residualChecks, fullChecks, exactChecks)
 		branchChecks[bi] = residualChecks
-		predicateCheckSlicePool.Put(fullChecks)
+		pools.PutIntSlice(fullChecks)
 	}
 
 	for bi := 0; bi < branchCount; bi++ {
 		checks := branchChecks[bi]
 		exactChecks := branchExactChecks[bi]
 		marks := candidateMarks[bi]
-		if marks == nil || ((checks == nil || checks.Len() == 0) && (exactChecks == nil || exactChecks.Len() == 0)) {
+		if marks == nil || (len(checks) == 0 && len(exactChecks) == 0) {
 			continue
 		}
 		branch := branches.GetPtr(bi)
@@ -2911,25 +2904,27 @@ func (qv *queryView) maybeMaterializeOrderedORPredicates(
 		if est.universe == 0 {
 			continue
 		}
-		if exactChecks != nil {
-			for ci := 0; ci < exactChecks.Len() && rows > 0; ci++ {
-				pi := exactChecks.Get(ci)
-				p := branch.pred(pi)
-				if p.alwaysFalse || p.alwaysTrue || p.covered {
-					rows = orderedORNextPredicateRows(rows, p.estCard, est.card, est.universe)
-					continue
-				}
-				if marks.Get(pi) && qv.materializeOrderedORPredicate(branch.predPtr(pi)) {
-					builds++
-					dirtyBranches[bi] = true
-					changed = true
-					p = branch.pred(pi)
-				}
-				rows = orderedORNextPredicateRows(rows, p.estCard, est.card, est.universe)
+		for _, pi := range exactChecks {
+			if rows == 0 {
+				break
 			}
+			p := branch.pred(pi)
+			if p.alwaysFalse || p.alwaysTrue || p.covered {
+				rows = orderedORNextPredicateRows(rows, p.estCard, est.card, est.universe)
+				continue
+			}
+			if marks.Get(pi) && qv.materializeOrderedORPredicate(branch.predPtr(pi)) {
+				builds++
+				dirtyBranches[bi] = true
+				changed = true
+				p = branch.pred(pi)
+			}
+			rows = orderedORNextPredicateRows(rows, p.estCard, est.card, est.universe)
 		}
-		for ci := 0; ci < checks.Len() && rows > 0; ci++ {
-			pi := checks.Get(ci)
+		for _, pi := range checks {
+			if rows == 0 {
+				break
+			}
 			p := branch.pred(pi)
 			if p.alwaysFalse || p.alwaysTrue || p.covered {
 				rows = orderedORNextPredicateRows(rows, p.estCard, est.card, est.universe)
@@ -3010,7 +3005,7 @@ func (qv *queryView) maybeEagerMaterializeNoOrderORPredicates(q *qir.Shape, bran
 func (qv *queryView) promoteOrderedORMaterializedBaseOps(
 	q *qir.Shape,
 	branches plannerORBranches,
-	branchChecks [plannerORBranchLimit]*pooled.Slice[int],
+	branchChecks [plannerORBranchLimit][]int,
 	observed *orderedORObservedStats,
 	analysis *plannerOROrderAnalysis,
 ) {
@@ -3021,34 +3016,39 @@ func (qv *queryView) promoteOrderedORMaterializedBaseOps(
 	if q.Order.FieldOrdinal < 0 {
 		return
 	}
+	branchCount := branches.Len()
+	if branchCount > plannerORBranchLimit {
+		branchCount = plannerORBranchLimit
+	}
+	repCap := 0
+	for bi := 0; bi < branchCount; bi++ {
+		repCap += len(branchChecks[bi])
+	}
 
 	cacheKeysBuf := materializedPredKeySlicePool.Get()
-	cacheKeysBuf.Grow(branches.Len() * 4)
+	cacheKeysBuf.Grow(repCap)
 	defer materializedPredKeySlicePool.Put(cacheKeysBuf)
 
-	repBranchBuf := predicateCheckSlicePool.Get()
-	repBranchBuf.Grow(branches.Len() * 4)
-	defer predicateCheckSlicePool.Put(repBranchBuf)
+	repBranchBuf := pools.GetIntSlice(repCap)
+	defer pools.PutIntSlice(repBranchBuf)
 
-	repPredBuf := predicateCheckSlicePool.Get()
-	repPredBuf.Grow(branches.Len() * 4)
-	defer predicateCheckSlicePool.Put(repPredBuf)
+	repPredBuf := pools.GetIntSlice(repCap)
+	defer pools.PutIntSlice(repPredBuf)
 
-	buildWorksBuf := pools.GetUint64Slice(branches.Len() * 4)
+	buildWorksBuf := pools.GetUint64Slice(repCap)
 	defer func() { pools.PutUint64Slice(buildWorksBuf) }()
 
-	observedWorksBuf := pools.GetUint64Slice(branches.Len() * 4)
+	observedWorksBuf := pools.GetUint64Slice(repCap)
 	defer func() { pools.PutUint64Slice(observedWorksBuf) }()
 
-	for bi := 0; bi < branches.Len(); bi++ {
+	for bi := 0; bi < branchCount; bi++ {
 		branch := branches.Get(bi)
 		checks := branchChecks[bi]
 		start, end, ok := observed.branchRange(bi)
 		if !ok {
 			continue
 		}
-		for ci := 0; ci < checks.Len(); ci++ {
-			pi := checks.Get(ci)
+		for ci, pi := range checks {
 			p := branch.pred(pi)
 			if p.alwaysFalse || p.covered || p.alwaysTrue {
 				continue
@@ -3080,8 +3080,8 @@ func (qv *queryView) promoteOrderedORMaterializedBaseOps(
 				continue
 			}
 			cacheKeysBuf.Append(info.cacheKey)
-			repBranchBuf.Append(bi)
-			repPredBuf.Append(pi)
+			repBranchBuf = append(repBranchBuf, bi)
+			repPredBuf = append(repPredBuf, pi)
 			buildWorksBuf = append(buildWorksBuf, info.buildWork)
 			if info.isPrefix {
 				observedWorksBuf = append(observedWorksBuf, leafChecks)
@@ -3105,8 +3105,8 @@ func (qv *queryView) promoteOrderedORMaterializedBaseOps(
 		if !qv.snap.shouldPromoteObservedOrderedORMaterializedPredKey(cacheKeysBuf.Get(i), observedWorksBuf[i], buildWorksBuf[i]) {
 			continue
 		}
-		branchIdx := repBranchBuf.Get(i)
-		predIdx := repPredBuf.Get(i)
+		branchIdx := repBranchBuf[i]
+		predIdx := repPredBuf[i]
 		qv.materializeOrderedORPredicate(branches.GetPtr(branchIdx).predPtr(predIdx))
 	}
 }
@@ -3114,7 +3114,7 @@ func (qv *queryView) promoteOrderedORMaterializedBaseOps(
 func (qv *queryView) promoteObservedOrderedORKWayMaterializedBaseOps(
 	q *qir.Shape,
 	branches plannerORBranches,
-	branchChecks [plannerORBranchLimit]*pooled.Slice[int],
+	branchChecks [plannerORBranchLimit][]int,
 	branchObservedRows *[plannerORBranchLimit]uint64,
 	branchUniverses *[plannerORBranchLimit]uint64,
 	analysis *plannerOROrderAnalysis,
@@ -3133,32 +3133,34 @@ func (qv *queryView) promoteObservedOrderedORKWayMaterializedBaseOps(
 
 	var estimates [plannerORBranchLimit]plannerOROrderedBranchEstimate
 	qv.initOrderedORBranchEstimates(branches, branchUniverses, needWindow, &estimates)
-
-	cacheKeysBuf := materializedPredKeySlicePool.Get()
-	cacheKeysBuf.Grow(branches.Len() * 4)
-	defer materializedPredKeySlicePool.Put(cacheKeysBuf)
-
-	repBranchBuf := predicateCheckSlicePool.Get()
-	repBranchBuf.Grow(branches.Len() * 4)
-	defer predicateCheckSlicePool.Put(repBranchBuf)
-
-	repPredBuf := predicateCheckSlicePool.Get()
-	repPredBuf.Grow(branches.Len() * 4)
-	defer predicateCheckSlicePool.Put(repPredBuf)
-
-	buildWorksBuf := pools.GetUint64Slice(branches.Len() * 4)
-	defer func() { pools.PutUint64Slice(buildWorksBuf) }()
-
-	observedWorksBuf := pools.GetUint64Slice(branches.Len() * 4)
-	defer func() { pools.PutUint64Slice(observedWorksBuf) }()
-
 	branchCount := branches.Len()
 	if branchCount > plannerORBranchLimit {
 		branchCount = plannerORBranchLimit
 	}
+	repCap := 0
+	for bi := 0; bi < branchCount; bi++ {
+		repCap += len(branchChecks[bi])
+	}
+
+	cacheKeysBuf := materializedPredKeySlicePool.Get()
+	cacheKeysBuf.Grow(repCap)
+	defer materializedPredKeySlicePool.Put(cacheKeysBuf)
+
+	repBranchBuf := pools.GetIntSlice(repCap)
+	defer pools.PutIntSlice(repBranchBuf)
+
+	repPredBuf := pools.GetIntSlice(repCap)
+	defer pools.PutIntSlice(repPredBuf)
+
+	buildWorksBuf := pools.GetUint64Slice(repCap)
+	defer func() { pools.PutUint64Slice(buildWorksBuf) }()
+
+	observedWorksBuf := pools.GetUint64Slice(repCap)
+	defer func() { pools.PutUint64Slice(observedWorksBuf) }()
+
 	for bi := 0; bi < branchCount; bi++ {
 		checks := branchChecks[bi]
-		if checks == nil || checks.Len() == 0 {
+		if len(checks) == 0 {
 			continue
 		}
 		rows := branchObservedRows[bi]
@@ -3167,8 +3169,10 @@ func (qv *queryView) promoteObservedOrderedORKWayMaterializedBaseOps(
 			continue
 		}
 		branch := branches.Get(bi)
-		for ci := 0; ci < checks.Len() && rows > 0; ci++ {
-			pi := checks.Get(ci)
+		for _, pi := range checks {
+			if rows == 0 {
+				break
+			}
 			p := branch.pred(pi)
 			if p.alwaysFalse || p.covered || p.alwaysTrue {
 				continue
@@ -3192,8 +3196,8 @@ func (qv *queryView) promoteObservedOrderedORKWayMaterializedBaseOps(
 					}
 					if !found {
 						cacheKeysBuf.Append(info.cacheKey)
-						repBranchBuf.Append(bi)
-						repPredBuf.Append(pi)
+						repBranchBuf = append(repBranchBuf, bi)
+						repPredBuf = append(repPredBuf, pi)
 						buildWorksBuf = append(buildWorksBuf, info.buildWork)
 						observedWorksBuf = append(observedWorksBuf, observedWork)
 					}
@@ -3213,8 +3217,8 @@ func (qv *queryView) promoteObservedOrderedORKWayMaterializedBaseOps(
 		if !qv.snap.shouldPromoteObservedOrderedORMaterializedPredKey(cacheKeysBuf.Get(i), observedWorksBuf[i], buildWorksBuf[i]) {
 			continue
 		}
-		branchIdx := repBranchBuf.Get(i)
-		predIdx := repPredBuf.Get(i)
+		branchIdx := repBranchBuf[i]
+		predIdx := repPredBuf[i]
 		qv.materializeOrderedORPredicate(branches.GetPtr(branchIdx).predPtr(predIdx))
 	}
 }
@@ -3405,9 +3409,8 @@ func (qv *queryView) buildORBranchPredicates(leaves []qir.Expr) (predicateSet, b
 	}
 
 	preds := newPredicateSet(len(leaves))
-	forced := predicateCheckSlicePool.Get()
-	forced.Grow(len(leaves))
-	defer predicateCheckSlicePool.Put(forced)
+	forced := pools.GetIntSlice(len(leaves))
+	defer pools.PutIntSlice(forced)
 	leadIdx := -1
 	leadEst := uint64(0)
 	for _, e := range leaves {
@@ -3420,7 +3423,7 @@ func (qv *queryView) buildORBranchPredicates(leaves []qir.Expr) (predicateSet, b
 		preds.Append(p)
 		pi := preds.Len() - 1
 		if forceMaterialize && p.hasRuntimeRangeState() {
-			forced.Append(pi)
+			forced = append(forced, pi)
 			continue
 		}
 		if p.alwaysTrue || p.covered || p.alwaysFalse || !p.hasContains() || !p.hasIter() {
@@ -3431,8 +3434,7 @@ func (qv *queryView) buildORBranchPredicates(leaves []qir.Expr) (predicateSet, b
 			leadEst = p.estCard
 		}
 	}
-	for i := 0; i < forced.Len(); i++ {
-		pi := forced.Get(i)
+	for _, pi := range forced {
 		p := preds.GetPtr(pi)
 		if !qv.materializePositiveScalarRangePredicate(p) {
 			preds.Release()
@@ -3585,7 +3587,7 @@ func (qv *queryView) execPlanOROrderBasic(q *qir.Shape, branches plannerORBranch
 
 	branchCount := branches.Len()
 	var (
-		branchChecks [plannerORBranchLimit]*pooled.Slice[int]
+		branchChecks [plannerORBranchLimit][]int
 		branchStart  [plannerORBranchLimit]int
 		branchEnd    [plannerORBranchLimit]int
 	)
@@ -3613,8 +3615,8 @@ func (qv *queryView) execPlanOROrderBasic(q *qir.Shape, branches plannerORBranch
 		if analysis == nil || i >= analysis.branchCount {
 			boolSlicePool.Put(covered)
 		}
-		branchChecks[i] = predicateCheckSlicePool.Get()
-		branch.buildMatchChecksBuf(branchChecks[i])
+		branchChecks[i] = pools.GetIntSlice(branch.predLen())
+		branchChecks[i] = branch.buildMatchChecksBuf(branchChecks[i])
 	}
 	promoteObserved := false
 	if observed != nil {
@@ -4391,9 +4393,9 @@ func closePlannerOROrderInlineIters(iters *[8]plannerOROrderBranchIter, n int) {
 
 type plannerOROrderBranchIter struct {
 	branch         *plannerORBranch
-	checks         *pooled.Slice[int]
-	exactChecks    *pooled.Slice[int]
-	residualChecks *pooled.Slice[int]
+	checks         []int
+	exactChecks    []int
+	residualChecks []int
 	overlay        fieldOverlay
 	desc           bool
 	single         int
@@ -4408,7 +4410,7 @@ type plannerOROrderBranchIter struct {
 	curBucket     int
 	curIter       posting.Iterator
 	curExact      bool
-	curChecks     *pooled.Slice[int]
+	curChecks     []int
 	curSingle     int
 	curResidual   bool
 	curSplitExact bool
@@ -4465,15 +4467,15 @@ func (it *plannerOROrderBranchIter) close() {
 	it.bucketWork.Release()
 	it.bucketWork = posting.List{}
 	if it.checks != nil {
-		predicateCheckSlicePool.Put(it.checks)
+		pools.PutIntSlice(it.checks)
 		it.checks = nil
 	}
 	if it.exactChecks != nil {
-		predicateCheckSlicePool.Put(it.exactChecks)
+		pools.PutIntSlice(it.exactChecks)
 		it.exactChecks = nil
 	}
 	if it.residualChecks != nil {
-		predicateCheckSlicePool.Put(it.residualChecks)
+		pools.PutIntSlice(it.residualChecks)
 		it.residualChecks = nil
 	}
 	it.curChecks = nil
@@ -4481,8 +4483,8 @@ func (it *plannerOROrderBranchIter) close() {
 	it.curSplitExact = false
 }
 
-func (it *plannerOROrderBranchIter) matchesChecks(idx uint64, checks *pooled.Slice[int], single int) bool {
-	if checks == nil || checks.Len() == 0 {
+func (it *plannerOROrderBranchIter) matchesChecks(idx uint64, checks []int, single int) bool {
+	if len(checks) == 0 {
 		return true
 	}
 	if single >= 0 {
@@ -4493,16 +4495,16 @@ func (it *plannerOROrderBranchIter) matchesChecks(idx uint64, checks *pooled.Sli
 }
 
 func (it *plannerOROrderBranchIter) matchBucketCandidate(idx uint64) (bool, bool) {
-	if it.exactChecks != nil && it.exactChecks.Len() > 0 {
+	if len(it.exactChecks) > 0 {
 		if !it.matchesChecks(idx, it.exactChecks, it.exactSingle) {
 			return false, false
 		}
-		if it.allChecksExact || it.residualChecks == nil || it.residualChecks.Len() == 0 {
+		if it.allChecksExact || len(it.residualChecks) == 0 {
 			return true, false
 		}
 		return it.matchesChecks(idx, it.residualChecks, it.residualSingle), true
 	}
-	if it.checks == nil || it.checks.Len() == 0 {
+	if len(it.checks) == 0 {
 		return true, false
 	}
 	return it.matchesChecks(idx, it.checks, it.single), true
@@ -4513,12 +4515,12 @@ func (it *plannerOROrderBranchIter) matchCurrentCandidate(idx uint64) (bool, boo
 		if !it.matchesChecks(idx, it.exactChecks, it.exactSingle) {
 			return false, false
 		}
-		if it.residualChecks == nil || it.residualChecks.Len() == 0 {
+		if len(it.residualChecks) == 0 {
 			return true, false
 		}
 		return it.matchesChecks(idx, it.residualChecks, it.residualSingle), true
 	}
-	if it.curChecks == nil || it.curChecks.Len() == 0 {
+	if len(it.curChecks) == 0 {
 		return true, false
 	}
 	return it.matchesChecks(idx, it.curChecks, it.curSingle), it.curResidual
@@ -4588,7 +4590,7 @@ func (it *plannerOROrderBranchIter) advance() (uint64, uint64, uint64, bool) {
 				emittedDelta++
 				return examinedDelta, residualExaminedDelta, emittedDelta, true
 			}
-			if it.exactChecks.Len() > 0 {
+			if len(it.exactChecks) > 0 {
 				mode, exactIDs, nextBucketWork, card := plannerFilterPostingByPredicateChecksBuf(it.branch.preds, it.exactChecks, bucket, it.bucketWork, true)
 				it.bucketWork = nextBucketWork
 				switch mode {
@@ -4611,7 +4613,7 @@ func (it *plannerOROrderBranchIter) advance() (uint64, uint64, uint64, bool) {
 					it.curExact = false
 					it.curChecks = it.residualChecks
 					it.curSingle = it.residualSingle
-					it.curResidual = it.residualChecks != nil && it.residualChecks.Len() > 0
+					it.curResidual = len(it.residualChecks) > 0
 					it.curSplitExact = false
 					continue
 				case plannerPredicateBucketExact:
@@ -4630,7 +4632,7 @@ func (it *plannerOROrderBranchIter) advance() (uint64, uint64, uint64, bool) {
 					it.curExact = false
 					it.curChecks = it.residualChecks
 					it.curSingle = it.residualSingle
-					it.curResidual = it.residualChecks != nil && it.residualChecks.Len() > 0
+					it.curResidual = len(it.residualChecks) > 0
 					it.curSplitExact = false
 					continue
 				}
@@ -4639,9 +4641,8 @@ func (it *plannerOROrderBranchIter) advance() (uint64, uint64, uint64, bool) {
 			it.curExact = false
 			it.curChecks = it.checks
 			it.curSingle = it.single
-			it.curResidual = it.checks != nil && it.checks.Len() > 0
-			it.curSplitExact = it.exactChecks != nil && it.exactChecks.Len() > 0 &&
-				it.residualChecks != nil && it.residualChecks.Len() > 0
+			it.curResidual = len(it.checks) > 0
+			it.curSplitExact = len(it.exactChecks) > 0 && len(it.residualChecks) > 0
 			continue
 		}
 
@@ -4672,7 +4673,7 @@ func (it *plannerOROrderBranchIter) advance() (uint64, uint64, uint64, bool) {
 			emittedDelta++
 			return examinedDelta, residualExaminedDelta, emittedDelta, true
 		}
-		if it.exactChecks.Len() > 0 {
+		if len(it.exactChecks) > 0 {
 			mode, exactIDs, nextBucketWork, card := plannerFilterPostingByPredicateChecksBuf(it.branch.preds, it.exactChecks, bucket, it.bucketWork, true)
 			it.bucketWork = nextBucketWork
 			switch mode {
@@ -4695,7 +4696,7 @@ func (it *plannerOROrderBranchIter) advance() (uint64, uint64, uint64, bool) {
 				it.curExact = false
 				it.curChecks = it.residualChecks
 				it.curSingle = it.residualSingle
-				it.curResidual = it.residualChecks != nil && it.residualChecks.Len() > 0
+				it.curResidual = len(it.residualChecks) > 0
 				it.curSplitExact = false
 				continue
 			case plannerPredicateBucketExact:
@@ -4714,7 +4715,7 @@ func (it *plannerOROrderBranchIter) advance() (uint64, uint64, uint64, bool) {
 				it.curExact = false
 				it.curChecks = it.residualChecks
 				it.curSingle = it.residualSingle
-				it.curResidual = it.residualChecks != nil && it.residualChecks.Len() > 0
+				it.curResidual = len(it.residualChecks) > 0
 				it.curSplitExact = false
 				continue
 			}
@@ -4723,9 +4724,8 @@ func (it *plannerOROrderBranchIter) advance() (uint64, uint64, uint64, bool) {
 		it.curExact = false
 		it.curChecks = it.checks
 		it.curSingle = it.single
-		it.curResidual = it.checks != nil && it.checks.Len() > 0
-		it.curSplitExact = it.exactChecks != nil && it.exactChecks.Len() > 0 &&
-			it.residualChecks != nil && it.residualChecks.Len() > 0
+		it.curResidual = len(it.checks) > 0
+		it.curSplitExact = len(it.exactChecks) > 0 && len(it.residualChecks) > 0
 	}
 }
 
@@ -4803,7 +4803,7 @@ func (qv *queryView) execPlanOROrderKWay(
 	var (
 		observedCheckRows    [plannerORBranchLimit]uint64
 		branchUniverses      [plannerORBranchLimit]uint64
-		branchObservedChecks [plannerORBranchLimit]*pooled.Slice[int]
+		branchObservedChecks [plannerORBranchLimit][]int
 	)
 	if branches.Len() <= len(iters.inline) {
 		defer closePlannerOROrderInlineIters(&iters.inline, branches.Len())
@@ -4864,30 +4864,28 @@ func (qv *queryView) execPlanOROrderKWay(
 		}
 		branchUniverses[i] = branchUniverse
 
-		checksBuf := predicateCheckSlicePool.Get()
-		branch.buildMatchChecksBuf(checksBuf)
-		exactChecksBuf := predicateCheckSlicePool.Get()
-		exactChecksBuf.Grow(checksBuf.Len())
-		buildExactBucketPostingFilterActiveBufReader(exactChecksBuf, checksBuf, branch.preds)
-		residualChecksBuf := predicateCheckSlicePool.Get()
-		residualChecksBuf.Grow(checksBuf.Len())
-		plannerResidualChecksBuf(residualChecksBuf, checksBuf, exactChecksBuf)
-		if residualChecksBuf.Len() > 0 {
+		checksBuf := pools.GetIntSlice(branch.predLen())
+		checksBuf = branch.buildMatchChecksBuf(checksBuf)
+		exactChecksBuf := pools.GetIntSlice(len(checksBuf))
+		exactChecksBuf = buildExactBucketPostingFilterActiveBufReader(exactChecksBuf, checksBuf, branch.preds)
+		residualChecksBuf := pools.GetIntSlice(len(checksBuf))
+		residualChecksBuf = plannerResidualChecksBuf(residualChecksBuf, checksBuf, exactChecksBuf)
+		if len(residualChecksBuf) > 0 {
 			branchObservedChecks[i] = residualChecksBuf
-		} else if exactChecksBuf.Len() > 0 {
+		} else if len(exactChecksBuf) > 0 {
 			branchObservedChecks[i] = exactChecksBuf
 		}
 		singleCheck := -1
-		if checksBuf.Len() == 1 {
-			singleCheck = checksBuf.Get(0)
+		if len(checksBuf) == 1 {
+			singleCheck = checksBuf[0]
 		}
 		exactSingle := -1
-		if exactChecksBuf.Len() == 1 {
-			exactSingle = exactChecksBuf.Get(0)
+		if len(exactChecksBuf) == 1 {
+			exactSingle = exactChecksBuf[0]
 		}
 		residualSingle := -1
-		if residualChecksBuf.Len() == 1 {
-			residualSingle = residualChecksBuf.Get(0)
+		if len(residualChecksBuf) == 1 {
+			residualSingle = residualChecksBuf[0]
 		}
 		iter := plannerOROrderBranchIter{
 			branch:         branch,
@@ -4899,7 +4897,7 @@ func (qv *queryView) execPlanOROrderKWay(
 			single:         singleCheck,
 			exactSingle:    exactSingle,
 			residualSingle: residualSingle,
-			allChecksExact: checksBuf.Len() > 0 && exactChecksBuf.Len() == checksBuf.Len(),
+			allChecksExact: len(checksBuf) > 0 && len(exactChecksBuf) == len(checksBuf),
 			startBucket:    branchStart,
 			endBucket:      branchEnd,
 			bucketSeen:     bucketSeen,
@@ -4908,7 +4906,7 @@ func (qv *queryView) execPlanOROrderKWay(
 		examinedDelta, residualExaminedDelta, emittedDelta, ok := iter.advance()
 		examined += examinedDelta
 		observedDelta := residualExaminedDelta
-		if residualChecksBuf.Len() == 0 && exactChecksBuf.Len() > 0 {
+		if len(residualChecksBuf) == 0 && len(exactChecksBuf) > 0 {
 			observedDelta = examinedDelta
 		}
 		observedCheckRows[i] = satAddUint64(observedCheckRows[i], observedDelta)
@@ -4973,7 +4971,7 @@ func (qv *queryView) execPlanOROrderKWay(
 		examinedDelta, residualExaminedDelta, emittedDelta, ok := iter.advance()
 		examined += examinedDelta
 		observedDelta := residualExaminedDelta
-		if iter.residualChecks.Len() == 0 && iter.exactChecks.Len() > 0 {
+		if len(iter.residualChecks) == 0 && len(iter.exactChecks) > 0 {
 			observedDelta = examinedDelta
 		}
 		observedCheckRows[bi] = satAddUint64(observedCheckRows[bi], observedDelta)
@@ -5284,8 +5282,8 @@ type plannerOROrderFallbackAccumulator struct {
 type plannerOROrderFallbackAccumulatorBuf struct {
 	branch         *plannerORBranch
 	dst            *postingLazySetBuilder
-	checks         *pooled.Slice[int]
-	residualChecks *pooled.Slice[int]
+	checks         []int
+	residualChecks []int
 	singleCheck    int
 	residualSingle int
 	limit          uint64
@@ -5507,18 +5505,18 @@ func (qv *queryView) collectOROrderFallbackBranchCandidatesWithChecksBuf(
 	desc bool,
 	start, end int,
 	dst *postingLazySetBuilder,
-	checks, exactChecks, residualChecks *pooled.Slice[int],
+	checks, exactChecks, residualChecks []int,
 ) (uint64, uint64, uint64) {
 	singleCheck := -1
-	if checks.Len() == 1 {
-		singleCheck = checks.Get(0)
+	if len(checks) == 1 {
+		singleCheck = checks[0]
 	}
 	residualSingle := -1
-	if residualChecks.Len() == 1 {
-		residualSingle = residualChecks.Get(0)
+	if len(residualChecks) == 1 {
+		residualSingle = residualChecks[0]
 	}
 	var bucketWork posting.List
-	allChecksExact := checks.Len() > 0 && exactChecks.Len() == checks.Len()
+	allChecksExact := len(checks) > 0 && len(exactChecks) == len(checks)
 	acc := plannerOROrderFallbackAccumulatorBuf{
 		branch:         branch,
 		dst:            dst,
@@ -5544,7 +5542,7 @@ func (qv *queryView) collectOROrderFallbackBranchCandidatesWithChecksBuf(
 			}
 			continue
 		}
-		if exactChecks.Len() > 0 {
+		if len(exactChecks) > 0 {
 			mode, exactIDs, nextBucketWork, card := plannerFilterPostingByPredicateChecksBuf(branch.preds, exactChecks, bucket, bucketWork, true)
 			bucketWork = nextBucketWork
 			switch mode {
@@ -5635,21 +5633,18 @@ func (qv *queryView) collectOROrderFallbackBranchCandidates(
 		return emitted, examined, dedupe, true
 	}
 
-	checksBuf := predicateCheckSlicePool.Get()
-	checksBuf.Grow(branch.predLen())
-	branch.buildMatchChecksBuf(checksBuf)
-	exactChecksBuf := predicateCheckSlicePool.Get()
-	exactChecksBuf.Grow(checksBuf.Len())
-	buildExactBucketPostingFilterActiveBufReader(exactChecksBuf, checksBuf, branch.preds)
-	residualChecksBuf := predicateCheckSlicePool.Get()
-	residualChecksBuf.Grow(checksBuf.Len())
-	plannerResidualChecksBuf(residualChecksBuf, checksBuf, exactChecksBuf)
+	checksBuf := pools.GetIntSlice(branch.predLen())
+	checksBuf = branch.buildMatchChecksBuf(checksBuf)
+	exactChecksBuf := pools.GetIntSlice(len(checksBuf))
+	exactChecksBuf = buildExactBucketPostingFilterActiveBufReader(exactChecksBuf, checksBuf, branch.preds)
+	residualChecksBuf := pools.GetIntSlice(len(checksBuf))
+	residualChecksBuf = plannerResidualChecksBuf(residualChecksBuf, checksBuf, exactChecksBuf)
 	emitted, examined, dedupe := qv.collectOROrderFallbackBranchCandidatesWithChecksBuf(
 		branch, branchLimit, ov, order.Desc, start, end, dst, checksBuf, exactChecksBuf, residualChecksBuf,
 	)
-	predicateCheckSlicePool.Put(residualChecksBuf)
-	predicateCheckSlicePool.Put(exactChecksBuf)
-	predicateCheckSlicePool.Put(checksBuf)
+	pools.PutIntSlice(residualChecksBuf)
+	pools.PutIntSlice(exactChecksBuf)
+	pools.PutIntSlice(checksBuf)
 	return emitted, examined, dedupe, true
 }
 
@@ -5764,7 +5759,7 @@ func (qv *queryView) countORBranchByUniqueLeadWithChecks(branch plannerORBranch,
 	return cnt, true
 }
 
-func (qv *queryView) countORBranchByUniqueLeadWithChecksBuf(branch plannerORBranch, leadIdx int, checks *pooled.Slice[int]) (uint64, bool) {
+func (qv *queryView) countORBranchByUniqueLeadWithChecksBuf(branch plannerORBranch, leadIdx int, checks []int) (uint64, bool) {
 	lead := branch.pred(leadIdx)
 	it := lead.newIter()
 	if it == nil {
@@ -5830,8 +5825,7 @@ func (qv *queryView) countORBranchByUniqueLead(branch plannerORBranch) (uint64, 
 		return qv.countORBranchByUniqueLeadWithChecks(branch, leadIdx, checks)
 	}
 
-	checksBuf := predicateCheckSlicePool.Get()
-	checksBuf.Grow(branch.predLen())
+	checksBuf := pools.GetIntSlice(branch.predLen())
 	for i := 0; i < branch.predLen(); i++ {
 		if i == leadIdx {
 			continue
@@ -5841,14 +5835,14 @@ func (qv *queryView) countORBranchByUniqueLead(branch plannerORBranch) (uint64, 
 			continue
 		}
 		if p.alwaysFalse || !p.hasContains() {
-			predicateCheckSlicePool.Put(checksBuf)
+			pools.PutIntSlice(checksBuf)
 			return 0, true
 		}
-		checksBuf.Append(i)
+		checksBuf = append(checksBuf, i)
 	}
 	sortActivePredicatesBufReader(checksBuf, branch.preds)
 	cnt, ok := qv.countORBranchByUniqueLeadWithChecksBuf(branch, leadIdx, checksBuf)
-	predicateCheckSlicePool.Put(checksBuf)
+	pools.PutIntSlice(checksBuf)
 	return cnt, ok
 }
 

@@ -963,7 +963,7 @@ func (qv *queryView) foldGroupedOrdinaryFieldByID(
 
 	counts := pools.GetUint64Slice(len(rows))[:len(rows)]
 	clear(counts)
-	touched := aggregateGroupBucketTouchedSlicePool.Get()
+	touched := pools.GetIntSlice(len(rows))
 
 	acc := q.metrics[first].field.ordinary
 	ov := newFieldOverlayStorage(qv.snap.index.Get(acc.ordinal))
@@ -986,22 +986,22 @@ func (qv *queryView) foldGroupedOrdinaryFieldByID(
 			}
 			groupIndex := int(groupOrdinal - 1)
 			if counts[groupIndex] == 0 {
-				touched.Append(groupIndex)
+				touched = append(touched, groupIndex)
 			}
 			counts[groupIndex]++
 		}
 		it.Release()
-		if touched.Len() > 0 {
+		if len(touched) > 0 {
 			err = addGroupedOrdinaryBucketValue(q, states, first, acc.field, key, counts, touched)
-			resetAggregateGroupBucketCounts(counts, touched)
+			touched = resetAggregateGroupBucketCounts(counts, touched)
 			if err != nil {
 				break
 			}
 		}
 	}
 
-	resetAggregateGroupBucketCounts(counts, touched)
-	aggregateGroupBucketTouchedSlicePool.Put(touched)
+	touched = resetAggregateGroupBucketCounts(counts, touched)
+	pools.PutIntSlice(touched)
 	pools.PutUint64Slice(counts)
 	return err
 }
@@ -1013,12 +1013,12 @@ func addGroupedOrdinaryBucketValue(
 	field *field,
 	key indexKey,
 	counts []uint64,
-	touched *pooled.Slice[int],
+	touched []int,
 ) error {
 	var value Value
 	valueReady := false
-	for pos := 0; pos < touched.Len(); pos++ {
-		groupIndex := touched.Get(pos)
+	for pos := range touched {
+		groupIndex := touched[pos]
 		n := counts[groupIndex]
 		stateBase := groupIndex * len(q.metrics)
 		for metricIdx := first; metricIdx < len(q.metrics); metricIdx++ {
@@ -1047,11 +1047,11 @@ func addGroupedOrdinaryBucketValue(
 	return nil
 }
 
-func resetAggregateGroupBucketCounts(counts []uint64, touched *pooled.Slice[int]) {
-	for i := 0; i < touched.Len(); i++ {
-		counts[touched.Get(i)] = 0
+func resetAggregateGroupBucketCounts(counts []uint64, touched []int) []int {
+	for i := range touched {
+		counts[touched[i]] = 0
 	}
-	touched.Truncate()
+	return touched[:0]
 }
 
 func (qv *queryView) aggregateGroupRecursive(

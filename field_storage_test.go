@@ -955,8 +955,8 @@ func TestApplySingleFieldPostingDiffChunked_RebalancesOversizedDirectoryPagesAft
 	if root == nil {
 		t.Fatalf("expected chunked root")
 	}
-	if root.pages.Len() != 1 || root.pages.Get(0).refsLen() != fieldIndexDirPageTargetRefs {
-		t.Fatalf("expected exactly one full directory page, got pages=%d refs=%d", root.pages.Len(), root.pages.Get(0).refsLen())
+	if root.pages.Len() != 1 || root.pages.Get(0).refs.Len() != fieldIndexDirPageTargetRefs {
+		t.Fatalf("expected exactly one full directory page, got pages=%d refs=%d", root.pages.Len(), root.pages.Get(0).refs.Len())
 	}
 
 	insertKey := indexKeyFromU64(splitChunkBase + 2)
@@ -976,8 +976,8 @@ func TestApplySingleFieldPostingDiffChunked_RebalancesOversizedDirectoryPagesAft
 		t.Fatalf("expected split to rebalance into multiple pages, got %d", got.chunked.pages.Len())
 	}
 	for i := 0; i < got.chunked.pages.Len(); i++ {
-		if got.chunked.pages.Get(i).refsLen() > fieldIndexDirPageTargetRefs {
-			t.Fatalf("page %d exceeds ref bound: got=%d want<=%d", i, got.chunked.pages.Get(i).refsLen(), fieldIndexDirPageTargetRefs)
+		if got.chunked.pages.Get(i).refs.Len() > fieldIndexDirPageTargetRefs {
+			t.Fatalf("page %d exceeds ref bound: got=%d want<=%d", i, got.chunked.pages.Get(i).refs.Len(), fieldIndexDirPageTargetRefs)
 		}
 	}
 

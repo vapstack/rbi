@@ -5,6 +5,7 @@ import (
 	"unsafe"
 
 	"github.com/vapstack/rbi/internal/pooled"
+	"github.com/vapstack/rbi/internal/pools"
 	"github.com/vapstack/rbi/internal/posting"
 )
 
@@ -191,7 +192,7 @@ func ensureSnapshotUniverseOwned(next *indexSnapshot, universeOwned *bool) {
 
 type indexedFieldBatchDeltas struct {
 	fields  *pooled.Slice[snapshotFieldBatchState]
-	touched *pooled.Slice[int]
+	touched []int
 	changed *pooled.Slice[bool]
 }
 
@@ -200,7 +201,7 @@ func (deltas *indexedFieldBatchDeltas) markTouched(ordinal int) {
 		return
 	}
 	deltas.changed.Set(ordinal, true)
-	deltas.touched.Append(ordinal)
+	deltas.touched = append(deltas.touched, ordinal)
 }
 
 func normalizePreparedBatchForSnapshot[K ~string | ~uint64, V any](prepared []autoBatchPrepared[K, V]) []snapshotBatchEntry[K, V] {
@@ -1473,22 +1474,22 @@ func newFieldIndexChunkRefBufWithReplacedRef(
 	off int,
 	replRefs []fieldIndexChunkRef,
 ) *pooled.Slice[fieldIndexChunkRef] {
-	if page == nil || off < 0 || off >= page.refsLen() {
+	if page == nil || off < 0 || off >= page.refs.Len() {
 		return nil
 	}
-	total := page.refsLen() - 1 + len(replRefs)
+	total := page.refs.Len() - 1 + len(replRefs)
 	if total <= 0 {
 		return nil
 	}
 	refs := newFieldIndexChunkRefBuf(total)
 	for i := 0; i < off; i++ {
-		refs.Append(retainedFieldIndexChunkRef(page.refAt(i)))
+		refs.Append(retainedFieldIndexChunkRef(page.refs.Get(i)))
 	}
 	for i := range replRefs {
 		refs.Append(replRefs[i])
 	}
-	for i := off + 1; i < page.refsLen(); i++ {
-		refs.Append(retainedFieldIndexChunkRef(page.refAt(i)))
+	for i := off + 1; i < page.refs.Len(); i++ {
+		refs.Append(retainedFieldIndexChunkRef(page.refs.Get(i)))
 	}
 	return refs
 }
@@ -1837,7 +1838,7 @@ func (db *DB[K, V]) buildPreparedSnapshotAggregatedNoLock(
 	normalized := normalizePreparedBatchForSnapshot(prepared)
 	deltas := indexedFieldBatchDeltas{
 		fields:  snapshotFieldBatchStateSlicePool.Get(),
-		touched: fieldIndexOrdinalSlicePool.Get(),
+		touched: pools.GetIntSlice(len(db.engine.indexedFieldAccess)),
 		changed: fieldIndexBoolSlicePool.Get(),
 	}
 	deltas.fields.SetLen(len(db.engine.indexedFieldAccess))
@@ -1860,12 +1861,12 @@ func (db *DB[K, V]) buildPreparedSnapshotAggregatedNoLock(
 		db.collectSnapshotMeasureEntryDiffs(op, &measureDeltas)
 	}
 
-	for i := 0; i < deltas.touched.Len(); i++ {
-		deltas.changed.Set(deltas.touched.Get(i), false)
+	for i := range deltas.touched {
+		deltas.changed.Set(deltas.touched[i], false)
 	}
 	changedCount := 0
-	for i := 0; i < deltas.touched.Len(); i++ {
-		ordinal := deltas.touched.Get(i)
+	for i := range deltas.touched {
+		ordinal := deltas.touched[i]
 		acc := db.engine.indexedFieldAccess[ordinal]
 		state := deltas.fields.GetPtr(ordinal)
 		baseIndex := next.index.Get(ordinal)
@@ -1907,7 +1908,7 @@ func (db *DB[K, V]) buildPreparedSnapshotAggregatedNoLock(
 	}
 	snapshotFieldBatchStateSlicePool.Put(deltas.fields)
 	fieldIndexBoolSlicePool.Put(deltas.changed)
-	fieldIndexOrdinalSlicePool.Put(deltas.touched)
+	pools.PutIntSlice(deltas.touched)
 	next.retainSharedOwnedStorageFrom(prev)
 
 	return next

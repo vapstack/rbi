@@ -842,7 +842,7 @@ func TestMemoryExtra_ApplySingleFieldPostingDiffChunked_FullPageSplitDoesNotMuta
 	defer root.release()
 
 	basePages := root.pages.Len()
-	baseRefs := root.pages.Get(0).refsLen()
+	baseRefs := root.pages.Get(0).refs.Len()
 	baseChunks := root.chunkCount
 	baseKeys := root.keyCount
 	baseRows := root.chunkRowsRange(0, root.chunkCount)
@@ -864,8 +864,8 @@ func TestMemoryExtra_ApplySingleFieldPostingDiffChunked_FullPageSplitDoesNotMuta
 	if root.pages.Len() != basePages {
 		t.Fatalf("base root page count changed after split rebuild: got=%d want=%d", root.pages.Len(), basePages)
 	}
-	if root.pages.Get(0).refsLen() != baseRefs {
-		t.Fatalf("base root ref count changed after split rebuild: got=%d want=%d", root.pages.Get(0).refsLen(), baseRefs)
+	if root.pages.Get(0).refs.Len() != baseRefs {
+		t.Fatalf("base root ref count changed after split rebuild: got=%d want=%d", root.pages.Get(0).refs.Len(), baseRefs)
 	}
 	if got := root.chunkCount; got != baseChunks {
 		t.Fatalf("base root chunkCount changed after split rebuild: got=%d want=%d", got, baseChunks)
