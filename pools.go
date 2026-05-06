@@ -32,7 +32,6 @@ const (
 	orderBasicBaseCoreSlicePoolMaxCap       = 128
 	orderBasicBaseCoreIndexSlicePoolMaxCap  = 128
 	orderedMergedScalarRangeFieldPoolMaxCap = 64
-	aggregateGroupIDOrdinalSlicePoolMaxCap  = 8 << 20
 	aggregateGroupBucketSlicePoolMaxCap     = 1 << 20
 	aggregateMetricStateSlicePoolMaxCap     = 1 << 20
 )
@@ -81,13 +80,6 @@ var orderedMergedScalarRangeFieldSlicePool = pooled.Slices[orderedMergedScalarRa
 	MinCap: 4,
 	MaxCap: orderedMergedScalarRangeFieldPoolMaxCap,
 	Clear:  true,
-}
-
-/**/
-
-var aggregateGroupIDOrdinalSlicePool = pooled.Slices[uint32]{
-	MinCap: 1024,
-	MaxCap: aggregateGroupIDOrdinalSlicePoolMaxCap,
 }
 
 /**/

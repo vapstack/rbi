@@ -26,6 +26,8 @@ const (
 	aggregateMetricCountDistinct
 )
 
+const aggregateGroupIDOrdinalMaxLen = 8 << 20
+
 type aggregateValueKind uint8
 
 const (
@@ -739,7 +741,7 @@ func (qv *queryView) canExecuteGroupedOrdinaryByID(q *aggregateQuery, ids postin
 		return false
 	}
 	maxID, ok := ids.Maximum()
-	if !ok || maxID >= aggregateGroupIDOrdinalSlicePoolMaxCap {
+	if !ok || maxID >= aggregateGroupIDOrdinalMaxLen {
 		return false
 	}
 	filterCardinality := ids.Cardinality()
@@ -819,16 +821,17 @@ func (qv *queryView) executeGroupedOrdinaryByID(q *aggregateQuery, ids posting.L
 	layout := groupedAggregateLayout(q)
 	rows := make([]Row, 0)
 	states := aggregateMetricStateSlicePool.Get()
-	groupByID := aggregateGroupIDOrdinalSlicePool.Get()
 	maxID, _ := ids.Maximum()
-	groupByID.SetLen(int(maxID) + 1)
+	groupByIDLen := int(maxID) + 1
+	groupByID := pools.GetUint32Slice(groupByIDLen)[:groupByIDLen]
+	clear(groupByID)
 
 	groupValues := make([]Value, len(q.groups))
 	err := qv.buildGroupedOrdinaryIDMap(q, ids, 0, groupValues, &rows, states, groupByID)
 	if err == nil {
 		err = qv.foldGroupedOrdinaryByID(q, rows, states, groupByID)
 	}
-	releaseAggregateGroupIDOrdinals(groupByID, ids)
+	pools.PutUint32Slice(groupByID)
 	if err != nil {
 		aggregateMetricStateSlicePool.Put(states)
 		return Result{}, err
@@ -843,18 +846,6 @@ func (qv *queryView) executeGroupedOrdinaryByID(q *aggregateQuery, ids posting.L
 	return Result{Layout: layout, Rows: rows}, nil
 }
 
-func releaseAggregateGroupIDOrdinals(groupByID *pooled.Slice[uint32], ids posting.List) {
-	it := ids.Iter()
-	for it.HasNext() {
-		id := it.Next()
-		if id < uint64(groupByID.Len()) {
-			groupByID.Set(int(id), 0)
-		}
-	}
-	it.Release()
-	aggregateGroupIDOrdinalSlicePool.Put(groupByID)
-}
-
 func (qv *queryView) buildGroupedOrdinaryIDMap(
 	q *aggregateQuery,
 	current posting.List,
@@ -862,7 +853,7 @@ func (qv *queryView) buildGroupedOrdinaryIDMap(
 	groupValues []Value,
 	rows *[]Row,
 	states *pooled.Slice[aggregateMetricState],
-	groupByID *pooled.Slice[uint32],
+	groupByID []uint32,
 ) error {
 	if level == len(q.groups) {
 		rowIndex := len(*rows)
@@ -887,7 +878,7 @@ func (qv *queryView) buildGroupedOrdinaryIDMap(
 		it := current.Iter()
 		for it.HasNext() {
 			id := it.Next()
-			groupByID.Set(int(id), groupOrdinal)
+			groupByID[int(id)] = groupOrdinal
 		}
 		it.Release()
 		return nil
@@ -932,7 +923,7 @@ func (qv *queryView) foldGroupedOrdinaryByID(
 	q *aggregateQuery,
 	rows []Row,
 	states *pooled.Slice[aggregateMetricState],
-	groupByID *pooled.Slice[uint32],
+	groupByID []uint32,
 ) error {
 	for i := range q.metrics {
 		metric := q.metrics[i]
@@ -963,7 +954,7 @@ func (qv *queryView) foldGroupedOrdinaryFieldByID(
 	q *aggregateQuery,
 	rows []Row,
 	states *pooled.Slice[aggregateMetricState],
-	groupByID *pooled.Slice[uint32],
+	groupByID []uint32,
 	first int,
 ) error {
 	if len(rows) == 0 {
@@ -986,10 +977,10 @@ func (qv *queryView) foldGroupedOrdinaryFieldByID(
 		it := bucketIDs.Iter()
 		for it.HasNext() {
 			id := it.Next()
-			if id >= uint64(groupByID.Len()) {
+			if id >= uint64(len(groupByID)) {
 				continue
 			}
-			groupOrdinal := groupByID.Get(int(id))
+			groupOrdinal := groupByID[int(id)]
 			if groupOrdinal == 0 {
 				continue
 			}
