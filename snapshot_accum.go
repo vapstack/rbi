@@ -4,6 +4,7 @@ import (
 	"slices"
 
 	"github.com/vapstack/rbi/internal/pooled"
+	"github.com/vapstack/rbi/internal/pools"
 	"github.com/vapstack/rbi/internal/posting"
 )
 
@@ -145,42 +146,8 @@ func addFixedFieldBatchPostingAccum(
 
 /**/
 
-const (
-	insertPostingIDsBufPoolMinCap = posting.MidCap
-	insertPostingIDsBufPoolMaxCap = 4 << 10
-)
-
-type insertPostingIDsBuf struct{ values []uint64 }
-
-var insertPostingIDsBufPool = pooled.Pointers[insertPostingIDsBuf]{
-	New: func() *insertPostingIDsBuf {
-		return &insertPostingIDsBuf{
-			values: make([]uint64, 0, insertPostingIDsBufPoolMinCap),
-		}
-	},
-}
-
-func getInsertPostingIDsBuf(capHint int) *insertPostingIDsBuf {
-	buf := insertPostingIDsBufPool.Get()
-	if cap(buf.values) < capHint {
-		buf.values = slices.Grow(buf.values, capHint)
-	}
-	return buf
-}
-
-func releaseInsertPostingIDsBuf(buf *insertPostingIDsBuf) {
-	if buf == nil {
-		return
-	}
-	if cap(buf.values) > insertPostingIDsBufPoolMaxCap {
-		return
-	}
-	buf.values = buf.values[:0]
-	insertPostingIDsBufPool.Put(buf)
-}
-
 type insertPostingAccum struct {
-	spill     *insertPostingIDsBuf
+	spill     []uint64
 	inlineLen uint8
 	inline    [posting.SmallCap]uint64
 }
@@ -243,14 +210,14 @@ func (arena *insertPostingAccumArena) accum(ref uint32) *insertPostingAccum {
 }
 
 func resetInsertPostingAccum(acc *insertPostingAccum) {
-	releaseInsertPostingIDsBuf(acc.spill)
+	pools.PutUint64Slice(acc.spill)
 	acc.spill = nil
 	acc.inlineLen = 0
 }
 
 func (acc *insertPostingAccum) add(id uint64) {
 	if acc.spill != nil {
-		acc.spill.values = append(acc.spill.values, id)
+		acc.spill = append(acc.spill, id)
 		return
 	}
 	n := int(acc.inlineLen)
@@ -260,10 +227,10 @@ func (acc *insertPostingAccum) add(id uint64) {
 		return
 	}
 
-	buf := getInsertPostingIDsBuf(posting.MidCap)
-	buf.values = append(buf.values, acc.inline[:]...)
-	buf.values = append(buf.values, id)
-	acc.spill = buf
+	spill := pools.GetUint64Slice(posting.MidCap)
+	spill = append(spill, acc.inline[:]...)
+	spill = append(spill, id)
+	acc.spill = spill
 	acc.inlineLen = 0
 }
 
@@ -300,8 +267,8 @@ func (acc *insertPostingAccum) materializeOwned() posting.List {
 		return posting.List{}
 	}
 	if acc.spill != nil {
-		out := materializeInsertPostingIDsOwned(acc.spill.values)
-		releaseInsertPostingIDsBuf(acc.spill)
+		out := materializeInsertPostingIDsOwned(acc.spill)
+		pools.PutUint64Slice(acc.spill)
 		acc.spill = nil
 		return out
 	}
