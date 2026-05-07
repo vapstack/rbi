@@ -712,9 +712,6 @@ func newAutoBatcher(options *Options, runtime *autoBatchRuntime) *autoBatcher {
 		repeatStringIDPool: pooled.Maps[string, int]{
 			NewCap: 8,
 		},
-		setKeyScratchPool: pooled.Slices[keycodec.DataKey]{
-			Clear: true,
-		},
 		requestScratchPool: pooled.Slices[*autoBatchRequest]{
 			Clear: true,
 		},
@@ -934,7 +931,6 @@ type autoBatcher struct {
 	runtime            *autoBatchRuntime
 	repeatUintIDPool   pooled.Maps[uint64, int]
 	repeatStringIDPool pooled.Maps[string, int]
-	setKeyScratchPool  pooled.Slices[keycodec.DataKey]
 	requestScratchPool pooled.Slices[*autoBatchRequest]
 	attemptStatePool   pooled.Pointers[autoBatchAttemptState]
 	requestPool        pooled.Pointers[autoBatchRequest]

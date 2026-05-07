@@ -468,15 +468,15 @@ const (
 	maxBucketDistance = 4
 )
 
-var stringPools [maxDataKeyShift + 1]sync.Pool
+var dataKeyPools [maxDataKeyShift + 1]sync.Pool
 
-func GetDataKeySlice(capHint int) []string {
+func GetDataKeySlice(capHint int) []DataKey {
 	if capHint < 0 {
-		panic("GetStringSlice: negative capHint")
+		panic("GetDataKeySlice: negative capHint")
 	}
 
 	if capHint > MaxDataKeyPooledCap {
-		return make([]string, 0, capHint)
+		return make([]DataKey, 0, capHint)
 	}
 	var shift int
 	if capHint <= MinDataKeyPooledCap {
@@ -487,18 +487,18 @@ func GetDataKeySlice(capHint int) []string {
 
 	lim := min(shift+maxBucketDistance, maxDataKeyShift)
 	for sh := shift; sh <= lim; sh++ {
-		if v := stringPools[sh].Get(); v != nil {
-			ptr := v.(*string)
+		if v := dataKeyPools[sh].Get(); v != nil {
+			ptr := v.(*DataKey)
 			n := 1 << sh
 			s := unsafe.Slice(ptr, n)
 			return s[:0:n]
 		}
 	}
 
-	return make([]string, 0, 1<<shift)
+	return make([]DataKey, 0, 1<<shift)
 }
 
-func PutDataKeySlice(s []string) {
+func PutDataKeySlice(s []DataKey) {
 	c := cap(s)
 	if c < MinDataKeyPooledCap {
 		return
@@ -515,5 +515,5 @@ func PutDataKeySlice(s []string) {
 	}
 	clear(s[:c])
 	n := 1 << shift
-	stringPools[shift].Put(unsafe.SliceData(s[:n:n]))
+	dataKeyPools[shift].Put(unsafe.SliceData(s[:n:n]))
 }

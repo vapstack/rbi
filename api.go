@@ -5,7 +5,6 @@ import (
 	"unsafe"
 
 	"github.com/vapstack/rbi/internal/keycodec"
-	"github.com/vapstack/rbi/internal/pooled"
 	"github.com/vapstack/rbi/internal/posting"
 	"go.etcd.io/bbolt"
 )
@@ -448,18 +447,17 @@ func (db *DB[K, V]) BatchSet(ids []K, newVals []*V, execOpts ...ExecOption[K, V]
 	}
 
 	cfg := db.resolveExecOptions(execOpts)
-	var keyScratch *pooled.Slice[keycodec.DataKey]
+	var keyScratch []keycodec.DataKey
 	if len(cfg.beforeProcess) != 0 {
-		keyScratch = db.autoBatcher.setKeyScratchPool.Get()
-		defer db.autoBatcher.setKeyScratchPool.Put(keyScratch)
+		keyScratch = keycodec.GetDataKeySlice(len(ids))
+		defer keycodec.PutDataKeySlice(keyScratch)
 
-		keyScratch.Grow(len(ids))
 		for i := range newVals {
 			key := keycodec.DataKeyFromUserKey(ids[i], db.strKey)
 			if err := runBeforeProcessHooks(key, unsafe.Pointer(newVals[i]), cfg.beforeProcess); err != nil {
 				return err
 			}
-			keyScratch.Append(key)
+			keyScratch = append(keyScratch, key)
 		}
 	}
 	if err := db.beginOp(); err != nil {
@@ -475,7 +473,7 @@ func (db *DB[K, V]) BatchSet(ids []K, newVals []*V, execOpts ...ExecOption[K, V]
 	for i := range ids {
 		key := keycodec.DataKeyFromUserKey(ids[i], db.strKey)
 		if keyScratch != nil {
-			key = keyScratch.Get(i)
+			key = keyScratch[i]
 		}
 		req, err := db.buildSetAutoBatchRequest(key, newVals[i], cfg.beforeStore, cfg.beforeCommit, cfg.cloneValue)
 		if err != nil {
