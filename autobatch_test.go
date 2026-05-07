@@ -4,27 +4,103 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"reflect"
 	"slices"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+	"unsafe"
 
 	"github.com/vapstack/qx"
 	"github.com/vapstack/rbi/internal/pooled"
 	"go.etcd.io/bbolt"
 )
 
-func testAutoBatchRequestBuf[K ~string | ~uint64, V any](reqs ...*autoBatchRequest[K, V]) *pooled.Slice[*autoBatchRequest[K, V]] {
-	buf := new(pooled.Slice[*autoBatchRequest[K, V]])
+func autoBatchKeyFromID[K ~string | ~uint64](id K) autoBatchKey {
+	return autoBatchKeyFromIDWithKind(id, reflect.TypeFor[K]().Kind() == reflect.String)
+}
+
+func autoBatchKeyID[K ~string | ~uint64](key autoBatchKey) K {
+	if reflect.TypeFor[K]().Kind() == reflect.String {
+		return *(*K)(unsafe.Pointer(&key.s))
+	}
+	return *(*K)(unsafe.Pointer(&key.u))
+}
+
+func testAutoBatchRequestBuf(reqs ...*autoBatchRequest) *pooled.Slice[*autoBatchRequest] {
+	buf := new(pooled.Slice[*autoBatchRequest])
 	buf.AppendAll(reqs)
 	return buf
 }
 
-func queuedSingleJob[K ~string | ~uint64, V any](req *autoBatchRequest[K, V]) *autoBatchJob[K, V] {
-	return &autoBatchJob[K, V]{
+func queuedSingleJob(req *autoBatchRequest) *autoBatchJob {
+	return &autoBatchJob{
 		reqs: testAutoBatchRequestBuf(req),
 		done: req.done,
+	}
+}
+
+func TestAutoBatchMissingBucketRollsBackWriteTx(t *testing.T) {
+	db, _ := openTempDBUint64(t)
+	if err := db.bolt.Update(func(tx *bbolt.Tx) error {
+		return tx.DeleteBucket(db.bucket)
+	}); err != nil {
+		t.Fatalf("delete bucket: %v", err)
+	}
+
+	err := db.Set(1, &Rec{Name: "missing"}, NoBatch[uint64, Rec])
+	if err == nil || !strings.Contains(err.Error(), "bucket does not exist") {
+		t.Fatalf("expected missing bucket error, got %v", err)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		tx, err := db.bolt.Begin(true)
+		if err == nil {
+			err = tx.Rollback()
+		}
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("begin write tx after missing bucket: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatalf("write tx blocked after missing bucket error")
+	}
+}
+
+func TestAutoBatchStatsReadsQueueCapacityUnderLock(t *testing.T) {
+	db := &DB[uint64, Rec]{autoBatcher: &autoBatcher{}}
+	ab := &db.autoBatcher.autoBatchScheduler
+	ab.statsEnabled = true
+	ab.queue = make([]*autoBatchJob, 1)
+
+	done := make(chan struct{})
+	go func() {
+		for i := 0; i < 4096; i++ {
+			ab.mu.Lock()
+			if len(ab.queue) >= 64 {
+				ab.queue = make([]*autoBatchJob, 1)
+			} else {
+				ab.queueSize = len(ab.queue)
+				ab.growQueue()
+				ab.queueSize = 0
+			}
+			ab.mu.Unlock()
+		}
+		close(done)
+	}()
+
+	for {
+		select {
+		case <-done:
+			return
+		default:
+			_ = db.AutoBatchStats()
+		}
 	}
 }
 
@@ -48,7 +124,7 @@ func rawAutoBatchPayload(tb testing.TB, payload []byte) *bytes.Buffer {
 	return b
 }
 
-func replaceAutoBatchPayloadForTest[K ~string | ~uint64, V any](req *autoBatchRequest[K, V], payload *bytes.Buffer) {
+func replaceAutoBatchPayloadForTest(req *autoBatchRequest, payload *bytes.Buffer) {
 	if req == nil {
 		encodePool.Put(payload)
 		return
@@ -158,7 +234,7 @@ func TestBatch_RepeatedPatchIDMaintainsIndexConsistency(t *testing.T) {
 	reqAge := db.buildPatchAutoBatchRequest(1, []Field{{Name: "age", Value: 31}}, false, nil, nil, nil)
 	reqTags := db.buildPatchAutoBatchRequest(1, []Field{{Name: "tags", Value: []string{"rust", "db"}}}, false, nil, nil, nil)
 
-	_, done, fatalErr := db.executeAutoBatchAttempt(testAutoBatchRequestBuf(reqAge, reqTags), false)
+	_, done, fatalErr := db.autoBatcher.executeAutoBatchAttempt(testAutoBatchRequestBuf(reqAge, reqTags), false)
 	if fatalErr != nil {
 		t.Fatalf("executeAutoBatchAttempt: %v", fatalErr)
 	}
@@ -217,30 +293,30 @@ func TestBatch_RepeatedPatchIDMaintainsIndexConsistency(t *testing.T) {
 func TestBatch_StatsTrackBatchSizeDistribution(t *testing.T) {
 	db, _ := openTempDBUint64(t)
 
-	makeSetReq := func(id uint64, name string) *autoBatchRequest[uint64, Rec] {
+	makeSetReq := func(id uint64, name string) *autoBatchRequest {
 		rec := &Rec{Name: name, Age: int(id)}
-		return &autoBatchRequest[uint64, Rec]{
+		return &autoBatchRequest{
 			op:         autoBatchSet,
-			id:         id,
-			setValue:   rec,
+			id:         autoBatchKeyFromID(id),
+			setValue:   unsafe.Pointer(rec),
 			setPayload: mustEncodeAutoBatchPayload(t, db, rec),
 			done:       make(chan error, 1),
 		}
 	}
 
 	single := makeSetReq(1, "single")
-	db.executeAutoBatch([]*autoBatchRequest[uint64, Rec]{single})
+	db.autoBatcher.executeAutoBatch([]*autoBatchRequest{single})
 	if err := <-single.done; err != nil {
 		t.Fatalf("single batch failed: %v", err)
 	}
 
-	reqs := []*autoBatchRequest[uint64, Rec]{
+	reqs := []*autoBatchRequest{
 		makeSetReq(2, "a"),
 		makeSetReq(3, "b"),
 		makeSetReq(4, "c"),
 		makeSetReq(5, "d"),
 	}
-	db.executeAutoBatch(reqs)
+	db.autoBatcher.executeAutoBatch(reqs)
 	for i, req := range reqs {
 		if err := <-req.done; err != nil {
 			t.Fatalf("batch req #%d failed: %v", i+1, err)
@@ -260,23 +336,19 @@ func TestBatch_StatsTrackBatchSizeDistribution(t *testing.T) {
 }
 
 func TestBatch_OpNamesMatchExecutionMode(t *testing.T) {
-	makeReq := func(op autoBatchOp) *autoBatchRequest[uint64, Rec] {
-		return &autoBatchRequest[uint64, Rec]{op: op, id: 1}
-	}
-
 	sharedDB, _ := openTempDBUint64(t)
-	if got := sharedDB.autoBatchOpName(testAutoBatchRequestBuf(makeReq(autoBatchSet)), false); got != "batch" {
+	if got := autoBatchOpName(autoBatchSet, 1, false, sharedDB.autoBatcher.maxOps); got != "batch" {
 		t.Fatalf("shared single request op = %q, want batch", got)
 	}
-	if got := sharedDB.autoBatchOpName(testAutoBatchRequestBuf(makeReq(autoBatchSet)), true); got != "set" {
+	if got := autoBatchOpName(autoBatchSet, 1, true, sharedDB.autoBatcher.maxOps); got != "set" {
 		t.Fatalf("isolated single request op = %q, want set", got)
 	}
-	if got := sharedDB.autoBatchOpName(testAutoBatchRequestBuf(makeReq(autoBatchSet), makeReq(autoBatchSet)), true); got != "batch_set" {
+	if got := autoBatchOpName(autoBatchSet, 2, true, sharedDB.autoBatcher.maxOps); got != "batch_set" {
 		t.Fatalf("isolated multi set op = %q, want batch_set", got)
 	}
 
 	soloDB, _ := openTempDBUint64(t, Options{AutoBatchMax: 1})
-	if got := soloDB.autoBatchOpName(testAutoBatchRequestBuf(makeReq(autoBatchPatch)), false); got != "patch" {
+	if got := autoBatchOpName(autoBatchPatch, 1, false, soloDB.autoBatcher.maxOps); got != "patch" {
 		t.Fatalf("single-only patch op = %q, want patch", got)
 	}
 }
@@ -315,10 +387,10 @@ func TestBatch_NoBatch_IsolatesRequestInsideBatcher(t *testing.T) {
 		encodePool.Put(b)
 		t.Fatalf("encode(seed): %v", err)
 	}
-	seedReq := &autoBatchRequest[uint64, Rec]{
+	seedReq := &autoBatchRequest{
 		op:         autoBatchSet,
-		id:         100,
-		setValue:   seed,
+		id:         autoBatchKeyFromID(uint64(100)),
+		setValue:   unsafe.Pointer(seed),
 		setPayload: b,
 		done:       make(chan error, 1),
 	}
@@ -360,14 +432,14 @@ func TestBatch_PopSkipsCoalescingWindowForIsolatedHead(t *testing.T) {
 		AutoBatchMaxQueue: 64,
 	})
 
-	isolatedReq := &autoBatchRequest[uint64, Rec]{op: autoBatchSet, id: 1, done: make(chan error, 1)}
-	followerReq := &autoBatchRequest[uint64, Rec]{op: autoBatchSet, id: 2, done: make(chan error, 1)}
+	isolatedReq := &autoBatchRequest{op: autoBatchSet, id: autoBatchKeyFromID(uint64(1)), done: make(chan error, 1)}
+	followerReq := &autoBatchRequest{op: autoBatchSet, id: autoBatchKeyFromID(uint64(2)), done: make(chan error, 1)}
 
 	db.autoBatcher.mu.Lock()
 	db.autoBatcher.running = true
 	db.autoBatcher.hotUntil = time.Time{}
 	setAutoBatchQueueJobsForTest(db,
-		&autoBatchJob[uint64, Rec]{
+		&autoBatchJob{
 			reqs:     testAutoBatchRequestBuf(isolatedReq),
 			isolated: true,
 			done:     isolatedReq.done,
@@ -377,10 +449,11 @@ func TestBatch_PopSkipsCoalescingWindowForIsolatedHead(t *testing.T) {
 	db.autoBatcher.mu.Unlock()
 
 	before := db.AutoBatchStats()
-	batch := db.popAutoBatch()
+	batch := db.autoBatcher.popAutoBatch()
 	after := db.AutoBatchStats()
 
-	if len(batch) != 1 || batch[0].reqs.Len() != 1 || batch[0].reqs.Get(0) != isolatedReq {
+	poppedReqs := batch[0].reqs
+	if len(batch) != 1 || poppedReqs.Len() != 1 || poppedReqs.Get(0) != isolatedReq {
 		t.Fatalf("expected isolated head to pop immediately alone, got=%+v", batch)
 	}
 	if after.CoalesceWaits != before.CoalesceWaits {
@@ -401,16 +474,16 @@ func TestBatch_PopSkipsCoalescingWindowBeforeIsolatedFollower(t *testing.T) {
 		AutoBatchMaxQueue: 64,
 	})
 
-	headReq := &autoBatchRequest[uint64, Rec]{op: autoBatchSet, id: 1, done: make(chan error, 1)}
-	isolatedReq := &autoBatchRequest[uint64, Rec]{op: autoBatchSet, id: 2, done: make(chan error, 1)}
-	tailReq := &autoBatchRequest[uint64, Rec]{op: autoBatchSet, id: 3, done: make(chan error, 1)}
+	headReq := &autoBatchRequest{op: autoBatchSet, id: autoBatchKeyFromID(uint64(1)), done: make(chan error, 1)}
+	isolatedReq := &autoBatchRequest{op: autoBatchSet, id: autoBatchKeyFromID(uint64(2)), done: make(chan error, 1)}
+	tailReq := &autoBatchRequest{op: autoBatchSet, id: autoBatchKeyFromID(uint64(3)), done: make(chan error, 1)}
 
 	db.autoBatcher.mu.Lock()
 	db.autoBatcher.running = true
 	db.autoBatcher.hotUntil = time.Time{}
 	setAutoBatchQueueJobsForTest(db,
 		queuedSingleJob(headReq),
-		&autoBatchJob[uint64, Rec]{
+		&autoBatchJob{
 			reqs:     testAutoBatchRequestBuf(isolatedReq),
 			isolated: true,
 			done:     isolatedReq.done,
@@ -420,10 +493,11 @@ func TestBatch_PopSkipsCoalescingWindowBeforeIsolatedFollower(t *testing.T) {
 	db.autoBatcher.mu.Unlock()
 
 	before := db.AutoBatchStats()
-	batch := db.popAutoBatch()
+	batch := db.autoBatcher.popAutoBatch()
 	after := db.AutoBatchStats()
 
-	if len(batch) != 1 || batch[0].reqs.Len() != 1 || batch[0].reqs.Get(0) != headReq {
+	poppedReqs := batch[0].reqs
+	if len(batch) != 1 || poppedReqs.Len() != 1 || poppedReqs.Get(0) != headReq {
 		t.Fatalf("expected head request before isolated follower to pop immediately alone, got=%+v", batch)
 	}
 	if after.CoalesceWaits != before.CoalesceWaits {
@@ -482,10 +556,10 @@ func TestBatch_CallbackRequestsStayBatchable(t *testing.T) {
 	})
 
 	cb := func(*bbolt.Tx, uint64, *Rec, *Rec) error { return nil }
-	makeReq := func(id uint64, withCB bool) *autoBatchRequest[uint64, Rec] {
-		req := &autoBatchRequest[uint64, Rec]{op: autoBatchSet, id: id}
+	makeReq := func(id uint64, withCB bool) *autoBatchRequest {
+		req := &autoBatchRequest{op: autoBatchSet, id: autoBatchKeyFromID(id)}
 		if withCB {
-			req.beforeCommit = []beforeCommitFunc[uint64, Rec]{cb}
+			req.beforeCommit = testBeforeCommitHooks([]beforeCommitFunc[uint64, Rec]{cb})
 		}
 		return req
 	}
@@ -501,11 +575,12 @@ func TestBatch_CallbackRequestsStayBatchable(t *testing.T) {
 	)
 	db.autoBatcher.mu.Unlock()
 
-	batch := db.popAutoBatch()
+	batch := db.autoBatcher.popAutoBatch()
 	if len(batch) != 3 {
 		t.Fatalf("expected callbacks to remain batchable, got %d", len(batch))
 	}
-	if batch[1].reqs.Len() != 1 || len(batch[1].reqs.Get(0).beforeCommit) == 0 {
+	middleReqs := batch[1].reqs
+	if middleReqs.Len() != 1 || len(middleReqs.Get(0).beforeCommit) == 0 {
 		t.Fatalf("expected middle request with callback to stay in a multi-request batch")
 	}
 }
@@ -517,8 +592,8 @@ func TestBatch_RepeatIDPool_ClearsBetweenPops(t *testing.T) {
 		AutoBatchMaxQueue: 2048,
 	})
 
-	req1 := &autoBatchRequest[uint64, Rec]{op: autoBatchSet, id: 1, done: make(chan error, 1)}
-	req2 := &autoBatchRequest[uint64, Rec]{op: autoBatchSet, id: 2, done: make(chan error, 1)}
+	req1 := &autoBatchRequest{op: autoBatchSet, id: autoBatchKeyFromID(uint64(1)), done: make(chan error, 1)}
+	req2 := &autoBatchRequest{op: autoBatchSet, id: autoBatchKeyFromID(uint64(2)), done: make(chan error, 1)}
 
 	db.autoBatcher.mu.Lock()
 	db.autoBatcher.window = 0
@@ -526,13 +601,13 @@ func TestBatch_RepeatIDPool_ClearsBetweenPops(t *testing.T) {
 	setAutoBatchQueueJobsForTest(db, queuedSingleJob(req1), queuedSingleJob(req2))
 	db.autoBatcher.mu.Unlock()
 
-	batch := db.popAutoBatch()
+	batch := db.autoBatcher.popAutoBatch()
 	if len(batch) != 2 {
 		t.Fatalf("unexpected popped batch size: got=%d want=2", len(batch))
 	}
 
-	req3 := &autoBatchRequest[uint64, Rec]{op: autoBatchSet, id: 3, done: make(chan error, 1)}
-	req4 := &autoBatchRequest[uint64, Rec]{op: autoBatchSet, id: 4, done: make(chan error, 1)}
+	req3 := &autoBatchRequest{op: autoBatchSet, id: autoBatchKeyFromID(uint64(3)), done: make(chan error, 1)}
+	req4 := &autoBatchRequest{op: autoBatchSet, id: autoBatchKeyFromID(uint64(4)), done: make(chan error, 1)}
 
 	db.autoBatcher.mu.Lock()
 	db.autoBatcher.window = 0
@@ -540,7 +615,7 @@ func TestBatch_RepeatIDPool_ClearsBetweenPops(t *testing.T) {
 	setAutoBatchQueueJobsForTest(db, queuedSingleJob(req3), queuedSingleJob(req4))
 	db.autoBatcher.mu.Unlock()
 
-	next := db.popAutoBatch()
+	next := db.autoBatcher.popAutoBatch()
 	if len(next) != 2 {
 		t.Fatalf("unexpected next popped batch size: got=%d want=2", len(next))
 	}
@@ -553,11 +628,11 @@ func TestBatch_RepeatIDPool_RemainsReusableAfterLargeBurst(t *testing.T) {
 		AutoBatchMaxQueue: 256,
 	})
 
-	burst := make([]*autoBatchJob[uint64, Rec], 64)
+	burst := make([]*autoBatchJob, 64)
 	for i := range burst {
-		req := &autoBatchRequest[uint64, Rec]{
+		req := &autoBatchRequest{
 			op:   autoBatchSet,
-			id:   uint64(i + 1),
+			id:   autoBatchKeyFromID(uint64(i + 1)),
 			done: make(chan error, 1),
 		}
 		burst[i] = queuedSingleJob(req)
@@ -569,7 +644,7 @@ func TestBatch_RepeatIDPool_RemainsReusableAfterLargeBurst(t *testing.T) {
 	setAutoBatchQueueJobsForTest(db, burst...)
 	db.autoBatcher.mu.Unlock()
 
-	if batch := db.popAutoBatch(); len(batch) != len(burst) {
+	if batch := db.autoBatcher.popAutoBatch(); len(batch) != len(burst) {
 		t.Fatalf("unexpected burst batch size: got=%d want=%d", len(batch), len(burst))
 	}
 
@@ -578,12 +653,12 @@ func TestBatch_RepeatIDPool_RemainsReusableAfterLargeBurst(t *testing.T) {
 	db.autoBatcher.running = true
 	setAutoBatchQueueJobsForTest(
 		db,
-		queuedSingleJob(&autoBatchRequest[uint64, Rec]{op: autoBatchSet, id: 1001, done: make(chan error, 1)}),
-		queuedSingleJob(&autoBatchRequest[uint64, Rec]{op: autoBatchSet, id: 1002, done: make(chan error, 1)}),
+		queuedSingleJob(&autoBatchRequest{op: autoBatchSet, id: autoBatchKeyFromID(uint64(1001)), done: make(chan error, 1)}),
+		queuedSingleJob(&autoBatchRequest{op: autoBatchSet, id: autoBatchKeyFromID(uint64(1002)), done: make(chan error, 1)}),
 	)
 	db.autoBatcher.mu.Unlock()
 
-	if batch := db.popAutoBatch(); len(batch) != 2 {
+	if batch := db.autoBatcher.popAutoBatch(); len(batch) != 2 {
 		t.Fatalf("unexpected small batch size after burst: got=%d want=2", len(batch))
 	}
 
@@ -601,14 +676,14 @@ func TestBatch_RepeatIDPool_StringKeysClearedAfterPop(t *testing.T) {
 		AutoBatchMaxQueue: 128,
 	})
 
-	req1 := &autoBatchRequest[string, Rec]{
+	req1 := &autoBatchRequest{
 		op:   autoBatchSet,
-		id:   strings.Repeat("a", 256),
+		id:   autoBatchKeyFromID(strings.Repeat("a", 256)),
 		done: make(chan error, 1),
 	}
-	req2 := &autoBatchRequest[string, Rec]{
+	req2 := &autoBatchRequest{
 		op:   autoBatchSet,
-		id:   strings.Repeat("b", 256),
+		id:   autoBatchKeyFromID(strings.Repeat("b", 256)),
 		done: make(chan error, 1),
 	}
 
@@ -618,18 +693,18 @@ func TestBatch_RepeatIDPool_StringKeysClearedAfterPop(t *testing.T) {
 	setAutoBatchQueueJobsForTest(db, queuedSingleJob(req1), queuedSingleJob(req2))
 	db.autoBatcher.mu.Unlock()
 
-	if batch := db.popAutoBatch(); len(batch) != 2 {
+	if batch := db.autoBatcher.popAutoBatch(); len(batch) != 2 {
 		t.Fatalf("unexpected popped batch size: got=%d want=2", len(batch))
 	}
 
-	req3 := &autoBatchRequest[string, Rec]{
+	req3 := &autoBatchRequest{
 		op:   autoBatchSet,
-		id:   strings.Repeat("c", 256),
+		id:   autoBatchKeyFromID(strings.Repeat("c", 256)),
 		done: make(chan error, 1),
 	}
-	req4 := &autoBatchRequest[string, Rec]{
+	req4 := &autoBatchRequest{
 		op:   autoBatchSet,
-		id:   strings.Repeat("d", 256),
+		id:   autoBatchKeyFromID(strings.Repeat("d", 256)),
 		done: make(chan error, 1),
 	}
 
@@ -639,7 +714,7 @@ func TestBatch_RepeatIDPool_StringKeysClearedAfterPop(t *testing.T) {
 	setAutoBatchQueueJobsForTest(db, queuedSingleJob(req3), queuedSingleJob(req4))
 	db.autoBatcher.mu.Unlock()
 
-	if next := db.popAutoBatch(); len(next) != 2 {
+	if next := db.autoBatcher.popAutoBatch(); len(next) != 2 {
 		t.Fatalf("unexpected string batch size after reuse: got=%d want=2", len(next))
 	}
 }
@@ -696,28 +771,28 @@ func TestBatch_DuplicatePatchSameID_NonUniqueFieldsStayBatched(t *testing.T) {
 	}
 	waitAutoBatcherIdleForTest(t, db)
 
-	req1 := &autoBatchRequest[uint64, UniqueTestRec]{
+	req1 := &autoBatchRequest{
 		op:                 autoBatchPatch,
-		id:                 1,
+		id:                 autoBatchKeyFromID(uint64(1)),
 		patch:              []Field{{Name: "tags", Value: []string{"x"}}},
 		patchIgnoreUnknown: true,
-		policy:             db.autoBatchPatchRequestPolicy([]Field{{Name: "tags", Value: []string{"x"}}}, nil, nil),
+		policy:             autoBatchReqRepeatIDSafeShared,
 		done:               make(chan error, 1),
 	}
-	req2 := &autoBatchRequest[uint64, UniqueTestRec]{
+	req2 := &autoBatchRequest{
 		op:                 autoBatchPatch,
-		id:                 1,
+		id:                 autoBatchKeyFromID(uint64(1)),
 		patch:              []Field{{Name: "tags", Value: []string{"y"}}},
 		patchIgnoreUnknown: true,
-		policy:             db.autoBatchPatchRequestPolicy([]Field{{Name: "tags", Value: []string{"y"}}}, nil, nil),
+		policy:             autoBatchReqRepeatIDSafeShared,
 		done:               make(chan error, 1),
 	}
-	req3 := &autoBatchRequest[uint64, UniqueTestRec]{
+	req3 := &autoBatchRequest{
 		op:                 autoBatchPatch,
-		id:                 2,
+		id:                 autoBatchKeyFromID(uint64(2)),
 		patch:              []Field{{Name: "tags", Value: []string{"z"}}},
 		patchIgnoreUnknown: true,
-		policy:             db.autoBatchPatchRequestPolicy([]Field{{Name: "tags", Value: []string{"z"}}}, nil, nil),
+		policy:             autoBatchReqRepeatIDSafeShared,
 		done:               make(chan error, 1),
 	}
 
@@ -732,14 +807,14 @@ func TestBatch_DuplicatePatchSameID_NonUniqueFieldsStayBatched(t *testing.T) {
 	)
 	db.autoBatcher.mu.Unlock()
 
-	batch := db.popAutoBatch()
+	batch := db.autoBatcher.popAutoBatch()
 	if len(batch) != 3 {
 		t.Fatalf("expected repeated non-unique patches to stay batched, got=%d", len(batch))
 	}
 
-	db.executeAutoBatchJobs(batch)
+	db.autoBatcher.executeAutoBatchJobs(batch)
 
-	for i, req := range []*autoBatchRequest[uint64, UniqueTestRec]{req1, req2, req3} {
+	for i, req := range []*autoBatchRequest{req1, req2, req3} {
 		if err := <-req.done; err != nil {
 			t.Fatalf("request #%d failed: %v", i+1, err)
 		}
@@ -779,22 +854,22 @@ func TestBatch_DuplicatePatchSameID_DecodeFailurePropagatesToLaterRequests(t *te
 		t.Fatalf("seed invalid payload: %v", err)
 	}
 
-	req1 := &autoBatchRequest[uint64, Rec]{
+	req1 := &autoBatchRequest{
 		op:                 autoBatchPatch,
-		id:                 1,
+		id:                 autoBatchKeyFromID(uint64(1)),
 		patch:              []Field{{Name: "age", Value: 31}},
 		patchIgnoreUnknown: true,
 		done:               make(chan error, 1),
 	}
-	req2 := &autoBatchRequest[uint64, Rec]{
+	req2 := &autoBatchRequest{
 		op:                 autoBatchPatch,
-		id:                 1,
+		id:                 autoBatchKeyFromID(uint64(1)),
 		patch:              []Field{{Name: "age", Value: 32}},
 		patchIgnoreUnknown: true,
 		done:               make(chan error, 1),
 	}
 
-	db.executeAutoBatch([]*autoBatchRequest[uint64, Rec]{req1, req2})
+	db.autoBatcher.executeAutoBatch([]*autoBatchRequest{req1, req2})
 
 	if err := <-req1.done; err == nil || !strings.Contains(err.Error(), "failed to decode existing value") {
 		t.Fatalf("req1 error = %v, want decode existing value", err)
@@ -811,23 +886,23 @@ func TestBatch_DuplicatePatchSameID_UniqueFieldCutsBatch(t *testing.T) {
 		AutoBatchMaxQueue: 64,
 	})
 
-	req1 := &autoBatchRequest[uint64, UniqueTestRec]{
+	req1 := &autoBatchRequest{
 		op:                 autoBatchPatch,
-		id:                 1,
+		id:                 autoBatchKeyFromID(uint64(1)),
 		patch:              []Field{{Name: "email", Value: "next@x"}},
 		patchIgnoreUnknown: true,
 		done:               make(chan error, 1),
 	}
-	req2 := &autoBatchRequest[uint64, UniqueTestRec]{
+	req2 := &autoBatchRequest{
 		op:                 autoBatchPatch,
-		id:                 1,
+		id:                 autoBatchKeyFromID(uint64(1)),
 		patch:              []Field{{Name: "tags", Value: []string{"y"}}},
 		patchIgnoreUnknown: true,
 		done:               make(chan error, 1),
 	}
-	req3 := &autoBatchRequest[uint64, UniqueTestRec]{
+	req3 := &autoBatchRequest{
 		op:                 autoBatchPatch,
-		id:                 2,
+		id:                 autoBatchKeyFromID(uint64(2)),
 		patch:              []Field{{Name: "tags", Value: []string{"z"}}},
 		patchIgnoreUnknown: true,
 		done:               make(chan error, 1),
@@ -844,11 +919,12 @@ func TestBatch_DuplicatePatchSameID_UniqueFieldCutsBatch(t *testing.T) {
 	)
 	db.autoBatcher.mu.Unlock()
 
-	batch := db.popAutoBatch()
+	batch := db.autoBatcher.popAutoBatch()
 	if len(batch) != 1 {
 		t.Fatalf("expected repeated unique-touching patches to cut batch, got=%d", len(batch))
 	}
-	if batch[0].reqs.Len() != 1 || batch[0].reqs.Get(0) != req1 {
+	poppedReqs := batch[0].reqs
+	if poppedReqs.Len() != 1 || poppedReqs.Get(0) != req1 {
 		t.Fatalf("expected first request to stay alone in batch")
 	}
 }
@@ -865,25 +941,25 @@ func TestBatch_DuplicatePatchSameID_BeforeStoreOnUniqueDBCutsBatch(t *testing.T)
 		return nil
 	}
 
-	req1 := &autoBatchRequest[uint64, UniqueTestRec]{
+	req1 := &autoBatchRequest{
 		op:                 autoBatchPatch,
-		id:                 1,
+		id:                 autoBatchKeyFromID(uint64(1)),
 		patch:              []Field{{Name: "tags", Value: []string{"x"}}},
 		patchIgnoreUnknown: true,
-		beforeStore:        []beforeStoreFunc[uint64, UniqueTestRec]{cb},
+		beforeStore:        testBeforeStoreHooks([]beforeStoreFunc[uint64, UniqueTestRec]{cb}),
 		done:               make(chan error, 1),
 	}
-	req2 := &autoBatchRequest[uint64, UniqueTestRec]{
+	req2 := &autoBatchRequest{
 		op:                 autoBatchPatch,
-		id:                 1,
+		id:                 autoBatchKeyFromID(uint64(1)),
 		patch:              []Field{{Name: "tags", Value: []string{"y"}}},
 		patchIgnoreUnknown: true,
-		beforeStore:        []beforeStoreFunc[uint64, UniqueTestRec]{cb},
+		beforeStore:        testBeforeStoreHooks([]beforeStoreFunc[uint64, UniqueTestRec]{cb}),
 		done:               make(chan error, 1),
 	}
-	req3 := &autoBatchRequest[uint64, UniqueTestRec]{
+	req3 := &autoBatchRequest{
 		op:                 autoBatchPatch,
-		id:                 2,
+		id:                 autoBatchKeyFromID(uint64(2)),
 		patch:              []Field{{Name: "email", Value: "other@x"}},
 		patchIgnoreUnknown: true,
 		done:               make(chan error, 1),
@@ -900,19 +976,22 @@ func TestBatch_DuplicatePatchSameID_BeforeStoreOnUniqueDBCutsBatch(t *testing.T)
 	)
 	db.autoBatcher.mu.Unlock()
 
-	batch := db.popAutoBatch()
+	batch := db.autoBatcher.popAutoBatch()
 	if len(batch) != 1 {
 		t.Fatalf("expected BeforeStore-bearing repeated same-id patch to cut batch on unique DB, got=%d", len(batch))
 	}
-	if batch[0].reqs.Len() != 1 || batch[0].reqs.Get(0) != req1 {
+	poppedReqs := batch[0].reqs
+	if poppedReqs.Len() != 1 || poppedReqs.Get(0) != req1 {
 		t.Fatalf("expected first request to stay alone in batch")
 	}
 
 	db.autoBatcher.mu.Lock()
 	defer db.autoBatcher.mu.Unlock()
+	queuedReqs0 := db.autoBatcher.queueAt(0).reqs
+	queuedReqs1 := db.autoBatcher.queueAt(1).reqs
 	if db.autoBatcher.queueLen() != 2 ||
-		db.autoBatcher.queueAt(0).reqs.Len() != 1 || db.autoBatcher.queueAt(0).reqs.Get(0) != req2 ||
-		db.autoBatcher.queueAt(1).reqs.Len() != 1 || db.autoBatcher.queueAt(1).reqs.Get(0) != req3 {
+		queuedReqs0.Len() != 1 || queuedReqs0.Get(0) != req2 ||
+		queuedReqs1.Len() != 1 || queuedReqs1.Get(0) != req3 {
 		t.Fatalf("expected remaining requests to stay queued in order")
 	}
 }
@@ -929,25 +1008,25 @@ func TestBatch_DuplicatePatchSameID_BeforeProcessOnUniqueDBCutsBatch(t *testing.
 		return nil
 	}
 
-	req1 := &autoBatchRequest[uint64, UniqueTestRec]{
+	req1 := &autoBatchRequest{
 		op:                 autoBatchPatch,
-		id:                 1,
+		id:                 autoBatchKeyFromID(uint64(1)),
 		patch:              []Field{{Name: "tags", Value: []string{"x"}}},
 		patchIgnoreUnknown: true,
-		beforeProcess:      []beforeProcessFunc[uint64, UniqueTestRec]{cb},
+		beforeProcess:      testBeforeProcessHooks([]beforeProcessFunc[uint64, UniqueTestRec]{cb}),
 		done:               make(chan error, 1),
 	}
-	req2 := &autoBatchRequest[uint64, UniqueTestRec]{
+	req2 := &autoBatchRequest{
 		op:                 autoBatchPatch,
-		id:                 1,
+		id:                 autoBatchKeyFromID(uint64(1)),
 		patch:              []Field{{Name: "tags", Value: []string{"y"}}},
 		patchIgnoreUnknown: true,
-		beforeProcess:      []beforeProcessFunc[uint64, UniqueTestRec]{cb},
+		beforeProcess:      testBeforeProcessHooks([]beforeProcessFunc[uint64, UniqueTestRec]{cb}),
 		done:               make(chan error, 1),
 	}
-	req3 := &autoBatchRequest[uint64, UniqueTestRec]{
+	req3 := &autoBatchRequest{
 		op:                 autoBatchPatch,
-		id:                 2,
+		id:                 autoBatchKeyFromID(uint64(2)),
 		patch:              []Field{{Name: "email", Value: "other@x"}},
 		patchIgnoreUnknown: true,
 		done:               make(chan error, 1),
@@ -964,19 +1043,22 @@ func TestBatch_DuplicatePatchSameID_BeforeProcessOnUniqueDBCutsBatch(t *testing.
 	)
 	db.autoBatcher.mu.Unlock()
 
-	batch := db.popAutoBatch()
+	batch := db.autoBatcher.popAutoBatch()
 	if len(batch) != 1 {
 		t.Fatalf("expected BeforeProcess-bearing repeated same-id patch to cut batch on unique DB, got=%d", len(batch))
 	}
-	if batch[0].reqs.Len() != 1 || batch[0].reqs.Get(0) != req1 {
+	poppedReqs := batch[0].reqs
+	if poppedReqs.Len() != 1 || poppedReqs.Get(0) != req1 {
 		t.Fatalf("expected first request to stay alone in batch")
 	}
 
 	db.autoBatcher.mu.Lock()
 	defer db.autoBatcher.mu.Unlock()
+	queuedReqs0 := db.autoBatcher.queueAt(0).reqs
+	queuedReqs1 := db.autoBatcher.queueAt(1).reqs
 	if db.autoBatcher.queueLen() != 2 ||
-		db.autoBatcher.queueAt(0).reqs.Len() != 1 || db.autoBatcher.queueAt(0).reqs.Get(0) != req2 ||
-		db.autoBatcher.queueAt(1).reqs.Len() != 1 || db.autoBatcher.queueAt(1).reqs.Get(0) != req3 {
+		queuedReqs0.Len() != 1 || queuedReqs0.Get(0) != req2 ||
+		queuedReqs1.Len() != 1 || queuedReqs1.Get(0) != req3 {
 		t.Fatalf("expected remaining requests to stay queued in order")
 	}
 }
@@ -997,33 +1079,33 @@ func TestBatch_SetDeleteSameID_CoalescedToLastWrite(t *testing.T) {
 	setB := &Rec{Name: "B", Age: 30}
 	setOther := &Rec{Name: "X", Age: 40}
 
-	req1 := &autoBatchRequest[uint64, Rec]{
+	req1 := &autoBatchRequest{
 		op:         autoBatchSet,
-		id:         1,
-		policy:     db.autoBatchSetRequestPolicy(nil, nil),
-		setValue:   setA,
+		id:         autoBatchKeyFromID(uint64(1)),
+		policy:     autoBatchReqSetDeleteCoalescible,
+		setValue:   unsafe.Pointer(setA),
 		setPayload: mustEncodeAutoBatchPayload(t, db, setA),
 		done:       make(chan error, 1),
 	}
-	req2 := &autoBatchRequest[uint64, Rec]{
+	req2 := &autoBatchRequest{
 		op:     autoBatchDelete,
-		id:     1,
-		policy: db.autoBatchDeleteRequestPolicy(nil),
+		id:     autoBatchKeyFromID(uint64(1)),
+		policy: autoBatchReqRepeatIDSafeShared | autoBatchReqSetDeleteCoalescible,
 		done:   make(chan error, 1),
 	}
-	req3 := &autoBatchRequest[uint64, Rec]{
+	req3 := &autoBatchRequest{
 		op:         autoBatchSet,
-		id:         1,
-		policy:     db.autoBatchSetRequestPolicy(nil, nil),
-		setValue:   setB,
+		id:         autoBatchKeyFromID(uint64(1)),
+		policy:     autoBatchReqSetDeleteCoalescible,
+		setValue:   unsafe.Pointer(setB),
 		setPayload: mustEncodeAutoBatchPayload(t, db, setB),
 		done:       make(chan error, 1),
 	}
-	req4 := &autoBatchRequest[uint64, Rec]{
+	req4 := &autoBatchRequest{
 		op:         autoBatchSet,
-		id:         2,
-		policy:     db.autoBatchSetRequestPolicy(nil, nil),
-		setValue:   setOther,
+		id:         autoBatchKeyFromID(uint64(2)),
+		policy:     autoBatchReqSetDeleteCoalescible,
+		setValue:   unsafe.Pointer(setOther),
 		setPayload: mustEncodeAutoBatchPayload(t, db, setOther),
 		done:       make(chan error, 1),
 	}
@@ -1040,7 +1122,7 @@ func TestBatch_SetDeleteSameID_CoalescedToLastWrite(t *testing.T) {
 	)
 	db.autoBatcher.mu.Unlock()
 
-	batch := db.popAutoBatch()
+	batch := db.autoBatcher.popAutoBatch()
 	if len(batch) != 4 {
 		t.Fatalf("unexpected popped batch size: got=%d want=4", len(batch))
 	}
@@ -1048,9 +1130,9 @@ func TestBatch_SetDeleteSameID_CoalescedToLastWrite(t *testing.T) {
 		t.Fatalf("unexpected coalesce chain: req1->%p req2->%p req3->%p", req1.replacedBy, req2.replacedBy, req3.replacedBy)
 	}
 
-	db.executeAutoBatchJobs(batch)
+	db.autoBatcher.executeAutoBatchJobs(batch)
 
-	for i, req := range []*autoBatchRequest[uint64, Rec]{req1, req2, req3, req4} {
+	for i, req := range []*autoBatchRequest{req1, req2, req3, req4} {
 		if err := <-req.done; err != nil {
 			t.Fatalf("request #%d failed: %v", i+1, err)
 		}
@@ -1091,33 +1173,33 @@ func TestBatch_CoalescedChain_PropagatesTerminalError(t *testing.T) {
 	}
 	waitAutoBatcherIdleForTest(t, db)
 
-	req1 := &autoBatchRequest[uint64, UniqueTestRec]{
+	req1 := &autoBatchRequest{
 		op:         autoBatchSet,
-		id:         1,
-		policy:     db.autoBatchSetRequestPolicy(nil, nil),
-		setValue:   &UniqueTestRec{Email: "mid@x", Code: 10},
+		id:         autoBatchKeyFromID(uint64(1)),
+		policy:     autoBatchReqSetDeleteCoalescible,
+		setValue:   unsafe.Pointer(&UniqueTestRec{Email: "mid@x", Code: 10}),
 		setPayload: mustEncodeAutoBatchPayload(t, db, &UniqueTestRec{Email: "mid@x", Code: 10}),
 		done:       make(chan error, 1),
 	}
-	req2 := &autoBatchRequest[uint64, UniqueTestRec]{
+	req2 := &autoBatchRequest{
 		op:     autoBatchDelete,
-		id:     1,
-		policy: db.autoBatchDeleteRequestPolicy(nil),
+		id:     autoBatchKeyFromID(uint64(1)),
+		policy: autoBatchReqRepeatIDSafeShared | autoBatchReqSetDeleteCoalescible,
 		done:   make(chan error, 1),
 	}
-	req3 := &autoBatchRequest[uint64, UniqueTestRec]{
+	req3 := &autoBatchRequest{
 		op:         autoBatchSet,
-		id:         1,
-		policy:     db.autoBatchSetRequestPolicy(nil, nil),
-		setValue:   &UniqueTestRec{Email: "taken@x", Code: 11},
+		id:         autoBatchKeyFromID(uint64(1)),
+		policy:     autoBatchReqSetDeleteCoalescible,
+		setValue:   unsafe.Pointer(&UniqueTestRec{Email: "taken@x", Code: 11}),
 		setPayload: mustEncodeAutoBatchPayload(t, db, &UniqueTestRec{Email: "taken@x", Code: 11}),
 		done:       make(chan error, 1),
 	}
-	req4 := &autoBatchRequest[uint64, UniqueTestRec]{
+	req4 := &autoBatchRequest{
 		op:         autoBatchSet,
-		id:         3,
-		policy:     db.autoBatchSetRequestPolicy(nil, nil),
-		setValue:   &UniqueTestRec{Email: "ok@x", Code: 3},
+		id:         autoBatchKeyFromID(uint64(3)),
+		policy:     autoBatchReqSetDeleteCoalescible,
+		setValue:   unsafe.Pointer(&UniqueTestRec{Email: "ok@x", Code: 3}),
 		setPayload: mustEncodeAutoBatchPayload(t, db, &UniqueTestRec{Email: "ok@x", Code: 3}),
 		done:       make(chan error, 1),
 	}
@@ -1134,7 +1216,7 @@ func TestBatch_CoalescedChain_PropagatesTerminalError(t *testing.T) {
 	)
 	db.autoBatcher.mu.Unlock()
 
-	batch := db.popAutoBatch()
+	batch := db.autoBatcher.popAutoBatch()
 	if len(batch) != 4 {
 		t.Fatalf("unexpected popped batch size: got=%d want=4", len(batch))
 	}
@@ -1142,7 +1224,7 @@ func TestBatch_CoalescedChain_PropagatesTerminalError(t *testing.T) {
 		t.Fatalf("unexpected coalesce chain: req1->%p req2->%p req3->%p", req1.replacedBy, req2.replacedBy, req3.replacedBy)
 	}
 
-	db.executeAutoBatchJobs(batch)
+	db.autoBatcher.executeAutoBatchJobs(batch)
 
 	if err := <-req1.done; !errors.Is(err, ErrUniqueViolation) {
 		t.Fatalf("req1 expected ErrUniqueViolation via coalesced chain, got: %v", err)
@@ -1183,17 +1265,17 @@ func TestBatch_CoalescedChain_PropagatesTerminalError(t *testing.T) {
 func TestBatch_PatchFailures_IsolateFailedRequest(t *testing.T) {
 	type tc struct {
 		name       string
-		makeBadReq func() *autoBatchRequest[uint64, Rec]
+		makeBadReq func() *autoBatchRequest
 		checkErr   func(error) bool
 	}
 
 	cases := []tc{
 		{
 			name: "missing_record",
-			makeBadReq: func() *autoBatchRequest[uint64, Rec] {
-				return &autoBatchRequest[uint64, Rec]{
+			makeBadReq: func() *autoBatchRequest {
+				return &autoBatchRequest{
 					op:                 autoBatchPatch,
-					id:                 999,
+					id:                 autoBatchKeyFromID(uint64(999)),
 					patch:              []Field{{Name: "age", Value: 77}},
 					patchIgnoreUnknown: true,
 					done:               make(chan error, 1),
@@ -1203,10 +1285,10 @@ func TestBatch_PatchFailures_IsolateFailedRequest(t *testing.T) {
 		},
 		{
 			name: "invalid_patch",
-			makeBadReq: func() *autoBatchRequest[uint64, Rec] {
-				return &autoBatchRequest[uint64, Rec]{
+			makeBadReq: func() *autoBatchRequest {
+				return &autoBatchRequest{
 					op:                 autoBatchPatch,
-					id:                 1,
+					id:                 autoBatchKeyFromID(uint64(1)),
 					patch:              []Field{{Name: "age", Value: "not-an-int"}},
 					patchIgnoreUnknown: true,
 					done:               make(chan error, 1),
@@ -1234,15 +1316,15 @@ func TestBatch_PatchFailures_IsolateFailedRequest(t *testing.T) {
 
 			badReq := c.makeBadReq()
 			goodVal := &Rec{Name: "good-" + c.name, Age: 99, Meta: Meta{Country: "US"}}
-			goodReq := &autoBatchRequest[uint64, Rec]{
+			goodReq := &autoBatchRequest{
 				op:         autoBatchSet,
-				id:         2,
-				setValue:   goodVal,
+				id:         autoBatchKeyFromID(uint64(2)),
+				setValue:   unsafe.Pointer(goodVal),
 				setPayload: mustEncodeAutoBatchPayload(t, db, goodVal),
 				done:       make(chan error, 1),
 			}
 
-			db.executeAutoBatch([]*autoBatchRequest[uint64, Rec]{badReq, goodReq})
+			db.autoBatcher.executeAutoBatch([]*autoBatchRequest{badReq, goodReq})
 
 			if err := <-badReq.done; !c.checkErr(err) {
 				t.Fatalf("unexpected bad request error: %v", err)
@@ -1283,10 +1365,10 @@ func TestBatch_QueueFull_WaitsAndStaysQueued(t *testing.T) {
 		encodePool.Put(b)
 		t.Fatalf("encode(blocked): %v", err)
 	}
-	blockedReq := &autoBatchRequest[uint64, Rec]{
+	blockedReq := &autoBatchRequest{
 		op:         autoBatchSet,
-		id:         123,
-		setValue:   blocked,
+		id:         autoBatchKeyFromID(uint64(123)),
+		setValue:   unsafe.Pointer(blocked),
 		setPayload: b,
 		done:       make(chan error, 1),
 	}
@@ -1350,25 +1432,25 @@ func TestBatch_BeforeCommitError_IsolatesFailedRequest(t *testing.T) {
 	badVal := &Rec{Name: "bad", Age: 1}
 	goodVal := &Rec{Name: "good", Age: 2}
 
-	badReq := &autoBatchRequest[uint64, Rec]{
+	badReq := &autoBatchRequest{
 		op:         autoBatchSet,
-		id:         1,
-		setValue:   badVal,
+		id:         autoBatchKeyFromID(uint64(1)),
+		setValue:   unsafe.Pointer(badVal),
 		setPayload: mustEncodeAutoBatchPayload(t, db, badVal),
-		beforeCommit: []beforeCommitFunc[uint64, Rec]{
+		beforeCommit: testBeforeCommitHooks([]beforeCommitFunc[uint64, Rec]{
 			func(_ *bbolt.Tx, _ uint64, _, _ *Rec) error { return cbErr },
-		},
+		}),
 		done: make(chan error, 1),
 	}
-	goodReq := &autoBatchRequest[uint64, Rec]{
+	goodReq := &autoBatchRequest{
 		op:         autoBatchSet,
-		id:         2,
-		setValue:   goodVal,
+		id:         autoBatchKeyFromID(uint64(2)),
+		setValue:   unsafe.Pointer(goodVal),
 		setPayload: mustEncodeAutoBatchPayload(t, db, goodVal),
 		done:       make(chan error, 1),
 	}
 
-	db.executeAutoBatch([]*autoBatchRequest[uint64, Rec]{badReq, goodReq})
+	db.autoBatcher.executeAutoBatch([]*autoBatchRequest{badReq, goodReq})
 
 	if err := <-badReq.done; !errors.Is(err, cbErr) {
 		t.Fatalf("bad request must fail with callback error, got: %v", err)
@@ -1395,22 +1477,22 @@ func TestBatch_OversizeIndexedString_IsolatesFailedRequest(t *testing.T) {
 	badVal := &Rec{Name: "bad", Email: strings.Repeat("x", fieldIndexStringRefMax+1)}
 	goodVal := &Rec{Name: "good", Email: "good@example.com"}
 
-	badReq := &autoBatchRequest[uint64, Rec]{
+	badReq := &autoBatchRequest{
 		op:         autoBatchSet,
-		id:         1,
-		setValue:   badVal,
+		id:         autoBatchKeyFromID(uint64(1)),
+		setValue:   unsafe.Pointer(badVal),
 		setPayload: mustEncodeAutoBatchPayload(t, db, badVal),
 		done:       make(chan error, 1),
 	}
-	goodReq := &autoBatchRequest[uint64, Rec]{
+	goodReq := &autoBatchRequest{
 		op:         autoBatchSet,
-		id:         2,
-		setValue:   goodVal,
+		id:         autoBatchKeyFromID(uint64(2)),
+		setValue:   unsafe.Pointer(goodVal),
 		setPayload: mustEncodeAutoBatchPayload(t, db, goodVal),
 		done:       make(chan error, 1),
 	}
 
-	db.executeAutoBatch([]*autoBatchRequest[uint64, Rec]{badReq, goodReq})
+	db.autoBatcher.executeAutoBatch([]*autoBatchRequest{badReq, goodReq})
 
 	if err := <-badReq.done; err == nil || !strings.Contains(err.Error(), "exceeds limit") {
 		t.Fatalf("bad request must fail with indexed string limit error, got: %v", err)
@@ -1455,7 +1537,7 @@ func TestAutoBatchExt_RepeatedPatchSameID_OversizeIndexedString_IsolatesOnlyBadR
 	if len(batch) != 3 {
 		t.Fatalf("popped batch size = %d, want 3", len(batch))
 	}
-	db.executeAutoBatchJobs(batch)
+	db.autoBatcher.executeAutoBatchJobs(batch)
 
 	if err := mustAutoBatchErr(t, req1); err != nil {
 		t.Fatalf("req1 error = %v", err)
@@ -1486,25 +1568,25 @@ func TestBatch_BeforeCommitError_Isolation_RechecksUniqueAfterRetry(t *testing.T
 	badVal := &UniqueTestRec{Email: "shared@x", Code: 1}
 	goodVal := &UniqueTestRec{Email: "shared@x", Code: 2}
 
-	badReq := &autoBatchRequest[uint64, UniqueTestRec]{
+	badReq := &autoBatchRequest{
 		op:         autoBatchSet,
-		id:         1,
-		setValue:   badVal,
+		id:         autoBatchKeyFromID(uint64(1)),
+		setValue:   unsafe.Pointer(badVal),
 		setPayload: mustEncodeAutoBatchPayload(t, db, badVal),
-		beforeCommit: []beforeCommitFunc[uint64, UniqueTestRec]{
+		beforeCommit: testBeforeCommitHooks([]beforeCommitFunc[uint64, UniqueTestRec]{
 			func(_ *bbolt.Tx, _ uint64, _, _ *UniqueTestRec) error { return cbErr },
-		},
+		}),
 		done: make(chan error, 1),
 	}
-	goodReq := &autoBatchRequest[uint64, UniqueTestRec]{
+	goodReq := &autoBatchRequest{
 		op:         autoBatchSet,
-		id:         2,
-		setValue:   goodVal,
+		id:         autoBatchKeyFromID(uint64(2)),
+		setValue:   unsafe.Pointer(goodVal),
 		setPayload: mustEncodeAutoBatchPayload(t, db, goodVal),
 		done:       make(chan error, 1),
 	}
 
-	db.executeAutoBatch([]*autoBatchRequest[uint64, UniqueTestRec]{badReq, goodReq})
+	db.autoBatcher.executeAutoBatch([]*autoBatchRequest{badReq, goodReq})
 
 	if err := <-badReq.done; !errors.Is(err, cbErr) {
 		t.Fatalf("bad request must fail with callback error, got: %v", err)
@@ -1530,35 +1612,35 @@ func TestBatch_BeforeStore_RerunsFromBaselineOnRetry(t *testing.T) {
 
 	beforeStoreCalls := 0
 	goodVal := &Rec{Name: "good", Age: 10}
-	goodReq := &autoBatchRequest[uint64, Rec]{
+	goodReq := &autoBatchRequest{
 		op:         autoBatchSet,
-		id:         1,
-		setValue:   goodVal,
+		id:         autoBatchKeyFromID(uint64(1)),
+		setValue:   unsafe.Pointer(goodVal),
 		setPayload: mustEncodeAutoBatchPayload(t, db, goodVal),
-		beforeStore: []beforeStoreFunc[uint64, Rec]{
+		beforeStore: testBeforeStoreHooks([]beforeStoreFunc[uint64, Rec]{
 			func(_ uint64, _ *Rec, newValue *Rec) error {
 				beforeStoreCalls++
 				newValue.Age++
 				return nil
 			},
-		},
+		}),
 		done: make(chan error, 1),
 	}
 
 	cbErr := errors.New("before commit fail")
 	badVal := &Rec{Name: "bad", Age: 20}
-	badReq := &autoBatchRequest[uint64, Rec]{
+	badReq := &autoBatchRequest{
 		op:         autoBatchSet,
-		id:         2,
-		setValue:   badVal,
+		id:         autoBatchKeyFromID(uint64(2)),
+		setValue:   unsafe.Pointer(badVal),
 		setPayload: mustEncodeAutoBatchPayload(t, db, badVal),
-		beforeCommit: []beforeCommitFunc[uint64, Rec]{
+		beforeCommit: testBeforeCommitHooks([]beforeCommitFunc[uint64, Rec]{
 			func(_ *bbolt.Tx, _ uint64, _, _ *Rec) error { return cbErr },
-		},
+		}),
 		done: make(chan error, 1),
 	}
 
-	db.executeAutoBatch([]*autoBatchRequest[uint64, Rec]{badReq, goodReq})
+	db.autoBatcher.executeAutoBatch([]*autoBatchRequest{badReq, goodReq})
 
 	if err := <-badReq.done; !errors.Is(err, cbErr) {
 		t.Fatalf("bad request must fail with BeforeCommit error, got: %v", err)
@@ -1588,18 +1670,18 @@ func TestBatch_StringKeyBeforeStoreError_DoesNotGrowStrMap(t *testing.T) {
 	initial := len(db.strMap.Keys)
 
 	hookErr := errors.New("before store fail")
-	req := &autoBatchRequest[string, Product]{
+	req := &autoBatchRequest{
 		op:         autoBatchSet,
-		id:         "ghost-before-store",
-		setValue:   &Product{SKU: "ghost-before-store", Price: 11},
+		id:         autoBatchKeyFromID("ghost-before-store"),
+		setValue:   unsafe.Pointer(&Product{SKU: "ghost-before-store", Price: 11}),
 		setPayload: mustEncodeAutoBatchPayload(t, db, &Product{SKU: "ghost-before-store", Price: 11}),
-		beforeStore: []beforeStoreFunc[string, Product]{
+		beforeStore: testBeforeStoreHooks([]beforeStoreFunc[string, Product]{
 			func(_ string, _ *Product, _ *Product) error { return hookErr },
-		},
+		}),
 		done: make(chan error, 1),
 	}
 
-	db.executeAutoBatch([]*autoBatchRequest[string, Product]{req})
+	db.autoBatcher.executeAutoBatch([]*autoBatchRequest{req})
 
 	if err := <-req.done; !errors.Is(err, hookErr) {
 		t.Fatalf("request must fail with BeforeStore error, got: %v", err)
@@ -1634,7 +1716,7 @@ func TestBatch_CompletedRequest_ReleasesResources(t *testing.T) {
 		t.Fatal("expected prepared payload before execution")
 	}
 
-	db.executeAutoBatch([]*autoBatchRequest[uint64, Rec]{req})
+	db.autoBatcher.executeAutoBatch([]*autoBatchRequest{req})
 
 	if err := mustAutoBatchErr(t, req); err != nil {
 		t.Fatalf("req error = %v", err)
@@ -1670,7 +1752,7 @@ func keysOfMap[V any](m map[uint64]V) []uint64 {
 
 /**/
 
-func mustAutoBatchErr[K ~string | ~uint64, V any](tb testing.TB, req *autoBatchRequest[K, V]) error {
+func mustAutoBatchErr(tb testing.TB, req *autoBatchRequest) error {
 	tb.Helper()
 	if req == nil || req.done == nil {
 		tb.Fatal("request has no done channel")
@@ -1684,6 +1766,58 @@ func mustAutoBatchErr[K ~string | ~uint64, V any](tb testing.TB, req *autoBatchR
 	}
 }
 
+func testBeforeProcessHooks[K ~string | ~uint64, V any](hooks []beforeProcessFunc[K, V]) []autoBatchBeforeProcessHook {
+	if len(hooks) == 0 {
+		return nil
+	}
+	out := make([]autoBatchBeforeProcessHook, 0, len(hooks))
+	for _, fn := range hooks {
+		out = append(out, func(key autoBatchKey, value unsafe.Pointer) error {
+			return fn(autoBatchKeyID[K](key), (*V)(value))
+		})
+	}
+	return out
+}
+
+func testBeforeStoreHooks[K ~string | ~uint64, V any](hooks []beforeStoreFunc[K, V]) []autoBatchBeforeStoreHook {
+	if len(hooks) == 0 {
+		return nil
+	}
+	out := make([]autoBatchBeforeStoreHook, 0, len(hooks))
+	for _, fn := range hooks {
+		out = append(out, func(key autoBatchKey, oldValue, newValue unsafe.Pointer) error {
+			return fn(autoBatchKeyID[K](key), (*V)(oldValue), (*V)(newValue))
+		})
+	}
+	return out
+}
+
+func testBeforeCommitHooks[K ~string | ~uint64, V any](hooks []beforeCommitFunc[K, V]) []autoBatchBeforeCommitHook {
+	if len(hooks) == 0 {
+		return nil
+	}
+	out := make([]autoBatchBeforeCommitHook, 0, len(hooks))
+	for _, fn := range hooks {
+		out = append(out, func(tx *bbolt.Tx, key autoBatchKey, oldValue, newValue unsafe.Pointer) error {
+			return fn(tx, autoBatchKeyID[K](key), (*V)(oldValue), (*V)(newValue))
+		})
+	}
+	return out
+}
+
+func testCloneFunc[K ~string | ~uint64, V any](fn func(K, *V) *V) autoBatchCloneFunc {
+	if fn == nil {
+		return nil
+	}
+	return func(key autoBatchKey, value unsafe.Pointer) (unsafe.Pointer, error) {
+		cloned := fn(autoBatchKeyID[K](key), (*V)(value))
+		if cloned == nil {
+			return nil, errAutoBatchCloneNil
+		}
+		return unsafe.Pointer(cloned), nil
+	}
+}
+
 func mustBuildSetAutoReq[K ~string | ~uint64, V any](
 	tb testing.TB,
 	db *DB[K, V],
@@ -1692,9 +1826,15 @@ func mustBuildSetAutoReq[K ~string | ~uint64, V any](
 	beforeStore []beforeStoreFunc[K, V],
 	beforeCommit []beforeCommitFunc[K, V],
 	cloneValue func(K, *V) *V,
-) *autoBatchRequest[K, V] {
+) *autoBatchRequest {
 	tb.Helper()
-	req, err := db.buildSetAutoBatchRequest(id, newVal, beforeStore, beforeCommit, cloneValue)
+	req, err := db.buildSetAutoBatchRequest(
+		autoBatchKeyFromID(id),
+		newVal,
+		testBeforeStoreHooks(beforeStore),
+		testBeforeCommitHooks(beforeCommit),
+		testCloneFunc(cloneValue),
+	)
 	if err != nil {
 		tb.Fatalf("buildSetAutoBatchRequest(%v): %v", id, err)
 	}
@@ -1710,8 +1850,15 @@ func mustBuildPatchAutoReq[K ~string | ~uint64, V any](
 	beforeProcess []beforeProcessFunc[K, V],
 	beforeStore []beforeStoreFunc[K, V],
 	beforeCommit []beforeCommitFunc[K, V],
-) *autoBatchRequest[K, V] {
-	req := db.buildPatchAutoBatchRequest(id, patch, ignoreUnknown, beforeProcess, beforeStore, beforeCommit)
+) *autoBatchRequest {
+	req := db.buildPatchAutoBatchRequest(
+		id,
+		patch,
+		ignoreUnknown,
+		testBeforeProcessHooks(beforeProcess),
+		testBeforeStoreHooks(beforeStore),
+		testBeforeCommitHooks(beforeCommit),
+	)
 	req.done = make(chan error, 1)
 	return req
 }
@@ -1721,20 +1868,20 @@ func mustBuildDeleteAutoReq[K ~string | ~uint64, V any](
 	db *DB[K, V],
 	id K,
 	beforeCommit []beforeCommitFunc[K, V],
-) *autoBatchRequest[K, V] {
-	req := db.buildDeleteAutoBatchRequest(id, beforeCommit)
+) *autoBatchRequest {
+	req := db.buildDeleteAutoBatchRequest(id, testBeforeCommitHooks(beforeCommit))
 	req.done = make(chan error, 1)
 	return req
 }
 
-func setAutoBatchQueueJobsForTest[K ~string | ~uint64, V any](db *DB[K, V], jobs ...*autoBatchJob[K, V]) {
+func setAutoBatchQueueJobsForTest[K ~string | ~uint64, V any](db *DB[K, V], jobs ...*autoBatchJob) {
 	db.autoBatcher.queueHead = 0
 	db.autoBatcher.queueSize = len(jobs)
-	db.autoBatcher.queue = make([]*autoBatchJob[K, V], len(jobs))
+	db.autoBatcher.queue = make([]*autoBatchJob, len(jobs))
 	copy(db.autoBatcher.queue, jobs)
 }
 
-func popQueuedSingleReqBatch[K ~string | ~uint64, V any](tb testing.TB, db *DB[K, V], reqs ...*autoBatchRequest[K, V]) []*autoBatchJob[K, V] {
+func popQueuedSingleReqBatch[K ~string | ~uint64, V any](tb testing.TB, db *DB[K, V], reqs ...*autoBatchRequest) []*autoBatchJob {
 	tb.Helper()
 	waitAutoBatcherIdleForTest(tb, db)
 
@@ -1749,13 +1896,13 @@ func popQueuedSingleReqBatch[K ~string | ~uint64, V any](tb testing.TB, db *DB[K
 	db.autoBatcher.hotUntil = time.Time{}
 	db.autoBatcher.queueHead = 0
 	db.autoBatcher.queueSize = len(reqs)
-	db.autoBatcher.queue = make([]*autoBatchJob[K, V], len(reqs))
+	db.autoBatcher.queue = make([]*autoBatchJob, len(reqs))
 	for i, req := range reqs {
 		db.autoBatcher.queue[i] = queuedSingleJob(req)
 	}
 	db.autoBatcher.mu.Unlock()
 
-	return db.popAutoBatch()
+	return db.autoBatcher.popAutoBatch()
 }
 
 func TestAutoBatchExt_SharedSet_BeforeStoreError_IsolatesFailedRequest(t *testing.T) {
@@ -1775,7 +1922,7 @@ func TestAutoBatchExt_SharedSet_BeforeStoreError_IsolatesFailedRequest(t *testin
 	)
 	goodReq := mustBuildSetAutoReq(t, db, 2, &Rec{Name: "good", Age: 22}, nil, nil, nil)
 
-	db.executeAutoBatch([]*autoBatchRequest[uint64, Rec]{badReq, goodReq})
+	db.autoBatcher.executeAutoBatch([]*autoBatchRequest{badReq, goodReq})
 
 	if err := mustAutoBatchErr(t, badReq); !errors.Is(err, hookErr) {
 		t.Fatalf("bad request error = %v, want %v", err, hookErr)
@@ -1814,7 +1961,7 @@ func TestAutoBatchExt_SharedSet_DecodePreparedValueError_IsolatesFailedRequest(t
 
 	goodReq := mustBuildSetAutoReq(t, db, 2, &Rec{Name: "good", Age: 22}, nil, nil, nil)
 
-	db.executeAutoBatch([]*autoBatchRequest[uint64, Rec]{badReq, goodReq})
+	db.autoBatcher.executeAutoBatch([]*autoBatchRequest{badReq, goodReq})
 
 	if err := mustAutoBatchErr(t, badReq); err == nil || !strings.Contains(err.Error(), "decode prepared value") {
 		t.Fatalf("bad request error = %v, want decode prepared value", err)
@@ -1843,7 +1990,7 @@ func TestAutoBatchExt_SharedSet_EmptyMsgpackPayload_IsolatesFailedRequest(t *tes
 
 	goodReq := mustBuildSetAutoReq(t, db, 2, &Rec{Name: "good", Age: 22}, nil, nil, nil)
 
-	db.executeAutoBatch([]*autoBatchRequest[uint64, Rec]{badReq, goodReq})
+	db.autoBatcher.executeAutoBatch([]*autoBatchRequest{badReq, goodReq})
 
 	if err := mustAutoBatchErr(t, badReq); err == nil || !strings.Contains(err.Error(), "empty msgpack payload") {
 		t.Fatalf("bad request error = %v, want empty msgpack payload", err)
@@ -1872,7 +2019,7 @@ func TestAutoBatchExt_AtomicSet_EmptyMsgpackPayload_FailsWholeBatch(t *testing.T
 
 	goodReq := mustBuildSetAutoReq(t, db, 2, &Rec{Name: "good", Age: 22}, nil, nil, nil)
 
-	db.runAutoBatchAtomic(testAutoBatchRequestBuf(badReq, goodReq))
+	db.autoBatcher.runAutoBatchAtomic(testAutoBatchRequestBuf(badReq, goodReq))
 
 	if badReq.err == nil || !strings.Contains(badReq.err.Error(), "empty msgpack payload") {
 		t.Fatalf("bad request error = %v, want empty msgpack payload", badReq.err)
@@ -1892,7 +2039,7 @@ func TestAutoBatchExt_AtomicSet_EmptyMsgpackPayload_FailsWholeBatch(t *testing.T
 		t.Fatalf("id=2 must stay absent after atomic failure, got %#v", got)
 	}
 
-	db.finishAutoBatch([]*autoBatchRequest[uint64, Rec]{badReq, goodReq})
+	db.autoBatcher.finishAutoBatch([]*autoBatchRequest{badReq, goodReq})
 }
 
 func TestAutoBatchExt_SharedPatch_BeforeProcessError_IsolatesFailedRequest(t *testing.T) {
@@ -1920,7 +2067,7 @@ func TestAutoBatchExt_SharedPatch_BeforeProcessError_IsolatesFailedRequest(t *te
 	)
 	goodReq := mustBuildPatchAutoReq(t, db, 2, []Field{{Name: "age", Value: 66}}, true, nil, nil, nil)
 
-	db.executeAutoBatch([]*autoBatchRequest[uint64, Rec]{badReq, goodReq})
+	db.autoBatcher.executeAutoBatch([]*autoBatchRequest{badReq, goodReq})
 
 	if err := mustAutoBatchErr(t, badReq); !errors.Is(err, hookErr) {
 		t.Fatalf("bad request error = %v, want %v", err, hookErr)
@@ -1966,7 +2113,7 @@ func TestAutoBatchExt_SharedPatch_BeforeStoreError_IsolatesFailedRequest(t *test
 	)
 	goodReq := mustBuildPatchAutoReq(t, db, 2, []Field{{Name: "age", Value: 66}}, true, nil, nil, nil)
 
-	db.executeAutoBatch([]*autoBatchRequest[uint64, Rec]{badReq, goodReq})
+	db.autoBatcher.executeAutoBatch([]*autoBatchRequest{badReq, goodReq})
 
 	if err := mustAutoBatchErr(t, badReq); !errors.Is(err, hookErr) {
 		t.Fatalf("bad request error = %v, want %v", err, hookErr)
@@ -2000,7 +2147,7 @@ func TestAutoBatchExt_SharedPatch_PatchStrictUnknownField_IsolatesFailedRequest(
 	badReq := mustBuildPatchAutoReq(t, db, 1, []Field{{Name: "missing", Value: 1}}, false, nil, nil, nil)
 	goodReq := mustBuildPatchAutoReq(t, db, 2, []Field{{Name: "age", Value: 66}}, true, nil, nil, nil)
 
-	db.executeAutoBatch([]*autoBatchRequest[uint64, Rec]{badReq, goodReq})
+	db.autoBatcher.executeAutoBatch([]*autoBatchRequest{badReq, goodReq})
 
 	if err := mustAutoBatchErr(t, badReq); err == nil || !strings.Contains(err.Error(), "cannot patch field") {
 		t.Fatalf("bad request error = %v, want strict patch error", err)
@@ -2042,7 +2189,7 @@ func TestAutoBatchExt_SharedDelete_BeforeCommitError_IsolatesFailedRequest(t *te
 	)
 	goodReq := mustBuildDeleteAutoReq(t, db, 2, nil)
 
-	db.executeAutoBatch([]*autoBatchRequest[uint64, Rec]{badReq, goodReq})
+	db.autoBatcher.executeAutoBatch([]*autoBatchRequest{badReq, goodReq})
 
 	if err := mustAutoBatchErr(t, badReq); !errors.Is(err, cbErr) {
 		t.Fatalf("bad request error = %v, want %v", err, cbErr)
@@ -2085,7 +2232,7 @@ func TestAutoBatchExt_SharedDelete_DecodeError_IsolatesFailedRequest(t *testing.
 	badReq := mustBuildDeleteAutoReq(t, db, 1, nil)
 	goodReq := mustBuildDeleteAutoReq(t, db, 2, nil)
 
-	db.executeAutoBatch([]*autoBatchRequest[uint64, Rec]{badReq, goodReq})
+	db.autoBatcher.executeAutoBatch([]*autoBatchRequest{badReq, goodReq})
 
 	if err := mustAutoBatchErr(t, badReq); err == nil || !strings.Contains(err.Error(), "decode") {
 		t.Fatalf("bad request error = %v, want decode error", err)
@@ -2139,7 +2286,7 @@ func TestAutoBatchExt_RepeatedPatchSameID_FirstBeforeCommitError_RetriesFollower
 	if len(batch) != 2 {
 		t.Fatalf("popped batch size = %d, want 2", len(batch))
 	}
-	db.executeAutoBatchJobs(batch)
+	db.autoBatcher.executeAutoBatchJobs(batch)
 
 	if err := mustAutoBatchErr(t, req1); !errors.Is(err, cbErr) {
 		t.Fatalf("req1 error = %v, want %v", err, cbErr)
@@ -2184,7 +2331,7 @@ func TestAutoBatchExt_RepeatedPatchSameID_MiddleBeforeCommitError_RetriesNeighbo
 	if len(batch) != 3 {
 		t.Fatalf("popped batch size = %d, want 3", len(batch))
 	}
-	db.executeAutoBatchJobs(batch)
+	db.autoBatcher.executeAutoBatchJobs(batch)
 
 	if err := mustAutoBatchErr(t, req1); err != nil {
 		t.Fatalf("req1 error = %v", err)
@@ -2243,7 +2390,7 @@ func TestAutoBatchExt_RepeatedPatchSameID_BeforeStoreSeesSteppedOldValue(t *test
 	if len(batch) != 2 {
 		t.Fatalf("popped batch size = %d, want 2", len(batch))
 	}
-	db.executeAutoBatchJobs(batch)
+	db.autoBatcher.executeAutoBatchJobs(batch)
 
 	if err := mustAutoBatchErr(t, req1); err != nil {
 		t.Fatalf("req1 error = %v", err)
@@ -2304,7 +2451,7 @@ func TestAutoBatchExt_RepeatedPatchSameID_BeforeCommitSeesSteppedOldValue(t *tes
 	if len(batch) != 2 {
 		t.Fatalf("popped batch size = %d, want 2", len(batch))
 	}
-	db.executeAutoBatchJobs(batch)
+	db.autoBatcher.executeAutoBatchJobs(batch)
 
 	if err := mustAutoBatchErr(t, req1); err != nil {
 		t.Fatalf("req1 error = %v", err)
@@ -2369,7 +2516,7 @@ func TestAutoBatchExt_RepeatedPatchSameID_BeforeProcessMutationsAreSequential(t 
 	if len(batch) != 2 {
 		t.Fatalf("popped batch size = %d, want 2", len(batch))
 	}
-	db.executeAutoBatchJobs(batch)
+	db.autoBatcher.executeAutoBatchJobs(batch)
 
 	if err := mustAutoBatchErr(t, req1); err != nil {
 		t.Fatalf("req1 error = %v", err)
@@ -2407,7 +2554,7 @@ func TestAutoBatchExt_RepeatedDeleteSameID_BeforeCommitRunsOnce(t *testing.T) {
 	if len(batch) != 2 {
 		t.Fatalf("popped batch size = %d, want 2", len(batch))
 	}
-	db.executeAutoBatchJobs(batch)
+	db.autoBatcher.executeAutoBatchJobs(batch)
 
 	if err := mustAutoBatchErr(t, req1); err != nil {
 		t.Fatalf("req1 error = %v", err)
@@ -2453,9 +2600,9 @@ func TestAutoBatchExt_CoalescedInterleavedChains_PreserveFinalState(t *testing.T
 		t.Fatalf("unexpected id=2 coalesce chain: req2->%p req4->%p", req2.replacedBy, req4.replacedBy)
 	}
 
-	db.executeAutoBatchJobs(batch)
+	db.autoBatcher.executeAutoBatchJobs(batch)
 
-	for i, req := range []*autoBatchRequest[uint64, Rec]{req1, req2, req3, req4, req5, req6} {
+	for i, req := range []*autoBatchRequest{req1, req2, req3, req4, req5, req6} {
 		if err := mustAutoBatchErr(t, req); err != nil {
 			t.Fatalf("req%d error = %v", i+1, err)
 		}
@@ -2524,9 +2671,9 @@ func TestAutoBatchExt_CoalescedInterleavedChains_TerminalCommitErrorPropagatesTo
 		t.Fatalf("popped batch size = %d, want 4", len(batch))
 	}
 
-	db.executeAutoBatchJobs(batch)
+	db.autoBatcher.executeAutoBatchJobs(batch)
 
-	for i, req := range []*autoBatchRequest[uint64, Rec]{req1, req2, req3, req4} {
+	for i, req := range []*autoBatchRequest{req1, req2, req3, req4} {
 		err := mustAutoBatchErr(t, req)
 		if err == nil || !strings.Contains(err.Error(), "failpoint: commit batch") {
 			t.Fatalf("req%d error = %v, want commit failpoint", i+1, err)
@@ -2577,7 +2724,7 @@ func TestAutoBatchExt_CoalescedChain_NeighborCallbackFailureDoesNotPoisonChain(t
 		t.Fatalf("expected req1 to coalesce to req3, got %p", req1.replacedBy)
 	}
 
-	db.executeAutoBatchJobs(batch)
+	db.autoBatcher.executeAutoBatchJobs(batch)
 
 	if err := mustAutoBatchErr(t, req1); err != nil {
 		t.Fatalf("req1 error = %v", err)
@@ -2623,7 +2770,7 @@ func TestAutoBatchExt_SharedStringSet_BeforeStoreErrorWithNeighbor_DoesNotGrowSt
 	)
 	goodReq := mustBuildSetAutoReq(t, db, "p2", &Product{SKU: "p2", Price: 22}, nil, nil, nil)
 
-	db.executeAutoBatch([]*autoBatchRequest[string, Product]{badReq, goodReq})
+	db.autoBatcher.executeAutoBatch([]*autoBatchRequest{badReq, goodReq})
 
 	if err := mustAutoBatchErr(t, badReq); !errors.Is(err, hookErr) {
 		t.Fatalf("bad request error = %v, want %v", err, hookErr)
@@ -2668,7 +2815,7 @@ func TestAutoBatchExt_SharedStringSet_DecodePreparedValueErrorWithNeighbor_DoesN
 	replaceAutoBatchPayloadForTest(badReq, rawAutoBatchPayload(t, []byte{0xc1}))
 	goodReq := mustBuildSetAutoReq(t, db, "p2", &Product{SKU: "p2", Price: 22}, nil, nil, nil)
 
-	db.executeAutoBatch([]*autoBatchRequest[string, Product]{badReq, goodReq})
+	db.autoBatcher.executeAutoBatch([]*autoBatchRequest{badReq, goodReq})
 
 	if err := mustAutoBatchErr(t, badReq); err == nil || !strings.Contains(err.Error(), "decode prepared value") {
 		t.Fatalf("bad request error = %v, want decode prepared value", err)
@@ -2697,7 +2844,7 @@ func TestAutoBatchExt_SharedStringSet_UniqueRejectWithNeighbor_DoesNotGrowStrMap
 	badReq := mustBuildSetAutoReq(t, db, "u-dup", &StringUniqueTestRec{Email: "a@x", Code: 2}, nil, nil, nil)
 	goodReq := mustBuildSetAutoReq(t, db, "u-ok", &StringUniqueTestRec{Email: "c@x", Code: 3}, nil, nil, nil)
 
-	db.executeAutoBatch([]*autoBatchRequest[string, StringUniqueTestRec]{badReq, goodReq})
+	db.autoBatcher.executeAutoBatch([]*autoBatchRequest{badReq, goodReq})
 
 	if err := mustAutoBatchErr(t, badReq); !errors.Is(err, ErrUniqueViolation) {
 		t.Fatalf("bad request error = %v, want ErrUniqueViolation", err)
@@ -2742,7 +2889,7 @@ func TestAutoBatchExt_SharedStringSet_CallbackFailureWithNeighbor_DoesNotGrowStr
 	)
 	goodReq := mustBuildSetAutoReq(t, db, "p2", &Product{SKU: "p2", Price: 22}, nil, nil, nil)
 
-	db.executeAutoBatch([]*autoBatchRequest[string, Product]{badReq, goodReq})
+	db.autoBatcher.executeAutoBatch([]*autoBatchRequest{badReq, goodReq})
 
 	if err := mustAutoBatchErr(t, badReq); !errors.Is(err, cbErr) {
 		t.Fatalf("bad request error = %v, want %v", err, cbErr)
@@ -2812,7 +2959,7 @@ func TestAutoBatchExt_BatchAtomic_CloneFuncRetryStartsFromFreshClone(t *testing.
 		cloneValue,
 	)
 
-	db.executeAutoBatch([]*autoBatchRequest[uint64, beforeStoreCloneRec]{badReq, goodReq})
+	db.autoBatcher.executeAutoBatch([]*autoBatchRequest{badReq, goodReq})
 
 	if err := mustAutoBatchErr(t, badReq); !errors.Is(err, cbErr) {
 		t.Fatalf("bad request error = %v, want %v", err, cbErr)
@@ -2959,7 +3106,7 @@ func TestAutoBatchExt_SharedPatch_MissingThenPresent_OnlyExistingBeforeCommit(t 
 		[]beforeCommitFunc[uint64, Rec]{hook},
 	)
 
-	db.executeAutoBatch([]*autoBatchRequest[uint64, Rec]{missingReq, presentReq})
+	db.autoBatcher.executeAutoBatch([]*autoBatchRequest{missingReq, presentReq})
 
 	if err := mustAutoBatchErr(t, missingReq); err != nil {
 		t.Fatalf("missing request error = %v", err)
@@ -2993,7 +3140,7 @@ func TestAutoBatchExt_SharedDelete_MissingThenPresent_OnlyExistingBeforeCommit(t
 	missingReq := mustBuildDeleteAutoReq(t, db, 1, []beforeCommitFunc[uint64, Rec]{hook})
 	presentReq := mustBuildDeleteAutoReq(t, db, 2, []beforeCommitFunc[uint64, Rec]{hook})
 
-	db.executeAutoBatch([]*autoBatchRequest[uint64, Rec]{missingReq, presentReq})
+	db.autoBatcher.executeAutoBatch([]*autoBatchRequest{missingReq, presentReq})
 
 	if err := mustAutoBatchErr(t, missingReq); err != nil {
 		t.Fatalf("missing request error = %v", err)
@@ -3027,7 +3174,7 @@ func TestAutoBatchExt_SharedPatch_UniqueConflict_SelectsOnlyConflictingRequest(t
 	badReq := mustBuildPatchAutoReq(t, db, 3, []Field{{Name: "email", Value: "b@x"}}, true, nil, nil, nil)
 	goodReq := mustBuildPatchAutoReq(t, db, 1, []Field{{Name: "tags", Value: []string{"ok"}}}, true, nil, nil, nil)
 
-	db.executeAutoBatch([]*autoBatchRequest[uint64, UniqueTestRec]{badReq, goodReq})
+	db.autoBatcher.executeAutoBatch([]*autoBatchRequest{badReq, goodReq})
 
 	if err := mustAutoBatchErr(t, badReq); !errors.Is(err, ErrUniqueViolation) {
 		t.Fatalf("bad request error = %v, want ErrUniqueViolation", err)
@@ -3090,7 +3237,7 @@ func TestAutoBatchExt_RepeatedPatchSameID_UniqueDB_FirstBeforeCommitError_Retrie
 	if len(batch) != 2 {
 		t.Fatalf("popped batch size = %d, want 2", len(batch))
 	}
-	db.executeAutoBatchJobs(batch)
+	db.autoBatcher.executeAutoBatchJobs(batch)
 
 	if err := mustAutoBatchErr(t, req1); !errors.Is(err, cbErr) {
 		t.Fatalf("req1 error = %v, want %v", err, cbErr)
@@ -3487,7 +3634,7 @@ func TestAutoBatchExt_New_CoalescedSetDeleteUnique_MatchesCollapsedSequentialMod
 	for step := 0; step < 160; step++ {
 		n := 3 + r.IntN(5)
 		specs := make([]spec, n)
-		reqs := make([]*autoBatchRequest[uint64, UniqueTestRec], n)
+		reqs := make([]*autoBatchRequest, n)
 		last := make(map[uint64]int, n)
 
 		for i := 0; i < n; i++ {
@@ -3513,7 +3660,7 @@ func TestAutoBatchExt_New_CoalescedSetDeleteUnique_MatchesCollapsedSequentialMod
 		if len(batch) != len(reqs) {
 			t.Fatalf("step=%d popped batch size=%d want=%d", step, len(batch), len(reqs))
 		}
-		dbBatch.executeAutoBatchJobs(batch)
+		dbBatch.autoBatcher.executeAutoBatchJobs(batch)
 
 		gotErrs := make([]error, len(reqs))
 		for i, req := range reqs {
@@ -3718,7 +3865,7 @@ func TestAutoBatchExt_New_SharedPatchRetry_MatchesSequentialModel(t *testing.T) 
 		}
 
 		specs := make([]spec, n)
-		reqs := make([]*autoBatchRequest[uint64, Rec], n)
+		reqs := make([]*autoBatchRequest, n)
 
 		for i := 0; i < n; i++ {
 			id := uint64(1 + r.IntN(4))
@@ -3793,7 +3940,7 @@ func TestAutoBatchExt_New_SharedPatchRetry_MatchesSequentialModel(t *testing.T) 
 		if len(batch) != len(reqs) {
 			t.Fatalf("step=%d popped batch size=%d want=%d", step, len(batch), len(reqs))
 		}
-		dbBatch.executeAutoBatchJobs(batch)
+		dbBatch.autoBatcher.executeAutoBatchJobs(batch)
 
 		gotErrs := make([]error, len(reqs))
 		for i, req := range reqs {

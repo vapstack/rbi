@@ -9,6 +9,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"unsafe"
 
 	"github.com/vapstack/qx"
 )
@@ -522,20 +523,20 @@ func TestUnique_BatchDeleteThenSet_ReusesFreedValueInSameTx(t *testing.T) {
 	newVal := &UniqueTestRec{Email: "a@x", Code: 2}
 	payload := mustEncodeAutoBatchPayload(t, db, newVal)
 
-	delReq := &autoBatchRequest[uint64, UniqueTestRec]{
+	delReq := &autoBatchRequest{
 		op:   autoBatchDelete,
-		id:   1,
+		id:   autoBatchKeyFromID(uint64(1)),
 		done: make(chan error, 1),
 	}
-	setReq := &autoBatchRequest[uint64, UniqueTestRec]{
+	setReq := &autoBatchRequest{
 		op:         autoBatchSet,
-		id:         2,
-		setValue:   newVal,
+		id:         autoBatchKeyFromID(uint64(2)),
+		setValue:   unsafe.Pointer(newVal),
 		setPayload: payload,
 		done:       make(chan error, 1),
 	}
 
-	db.executeAutoBatch([]*autoBatchRequest[uint64, UniqueTestRec]{delReq, setReq})
+	db.autoBatcher.executeAutoBatch([]*autoBatchRequest{delReq, setReq})
 
 	if err := <-delReq.done; err != nil {
 		t.Fatalf("batch delete request failed: %v", err)
@@ -588,22 +589,22 @@ func TestUnique_BatchPartialReject_PreservesAcceptedOpsAndIndex(t *testing.T) {
 	goodVal := &UniqueTestRec{Email: "d@x", Code: 2}
 	goodPayload := mustEncodeAutoBatchPayload(t, db, goodVal)
 
-	badReq := &autoBatchRequest[uint64, UniqueTestRec]{
+	badReq := &autoBatchRequest{
 		op:         autoBatchSet,
-		id:         3,
-		setValue:   badVal,
+		id:         autoBatchKeyFromID(uint64(3)),
+		setValue:   unsafe.Pointer(badVal),
 		setPayload: badPayload,
 		done:       make(chan error, 1),
 	}
-	goodReq := &autoBatchRequest[uint64, UniqueTestRec]{
+	goodReq := &autoBatchRequest{
 		op:         autoBatchSet,
-		id:         2,
-		setValue:   goodVal,
+		id:         autoBatchKeyFromID(uint64(2)),
+		setValue:   unsafe.Pointer(goodVal),
 		setPayload: goodPayload,
 		done:       make(chan error, 1),
 	}
 
-	db.executeAutoBatch([]*autoBatchRequest[uint64, UniqueTestRec]{badReq, goodReq})
+	db.autoBatcher.executeAutoBatch([]*autoBatchRequest{badReq, goodReq})
 
 	if err := <-badReq.done; err == nil || !errors.Is(err, ErrUniqueViolation) {
 		t.Fatalf("bad request must fail with ErrUniqueViolation, got: %v", err)
@@ -828,35 +829,36 @@ func TestUnique_ExecuteBatch_MixedOps_MatchesSequentialModel(t *testing.T) {
 			}
 		}
 
-		reqs := make([]*autoBatchRequest[uint64, UniqueTestRec], 0, len(ops))
+		reqs := make([]*autoBatchRequest, 0, len(ops))
 		for _, op := range ops {
 			switch op.kind {
 			case 0:
-				reqs = append(reqs, &autoBatchRequest[uint64, UniqueTestRec]{
+				val := cloneUniqueRec(op.value)
+				reqs = append(reqs, &autoBatchRequest{
 					op:         autoBatchSet,
-					id:         op.id,
-					setValue:   cloneUniqueRec(op.value),
+					id:         autoBatchKeyFromID(op.id),
+					setValue:   unsafe.Pointer(val),
 					setPayload: mustEncodeAutoBatchPayload(t, dbBatch, op.value),
 					done:       make(chan error, 1),
 				})
 			case 1:
-				reqs = append(reqs, &autoBatchRequest[uint64, UniqueTestRec]{
+				reqs = append(reqs, &autoBatchRequest{
 					op:                 autoBatchPatch,
-					id:                 op.id,
+					id:                 autoBatchKeyFromID(op.id),
 					patch:              cloneFields(op.patch),
 					patchIgnoreUnknown: true,
 					done:               make(chan error, 1),
 				})
 			default:
-				reqs = append(reqs, &autoBatchRequest[uint64, UniqueTestRec]{
+				reqs = append(reqs, &autoBatchRequest{
 					op:   autoBatchDelete,
-					id:   op.id,
+					id:   autoBatchKeyFromID(op.id),
 					done: make(chan error, 1),
 				})
 			}
 		}
 
-		dbBatch.executeAutoBatch(reqs)
+		dbBatch.autoBatcher.executeAutoBatch(reqs)
 
 		batchErrs := make([]error, len(reqs))
 		for i := range reqs {

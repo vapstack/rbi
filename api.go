@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"unsafe"
 
+	"github.com/vapstack/rbi/internal/pooled"
 	"github.com/vapstack/rbi/internal/posting"
 	"go.etcd.io/bbolt"
 )
@@ -381,15 +382,18 @@ func (db *DB[K, V]) Set(id K, newVal *V, execOpts ...ExecOption[K, V]) error {
 	}
 
 	cfg := db.resolveExecOptions(execOpts)
-	if err := runBeforeProcessHooks(id, newVal, cfg.beforeProcess); err != nil {
-		return err
+	key := autoBatchKeyFromIDWithKind(id, db.strKey)
+	if len(cfg.beforeProcess) != 0 {
+		if err := runBeforeProcessHooks(key, unsafe.Pointer(newVal), cfg.beforeProcess); err != nil {
+			return err
+		}
 	}
 	if err := db.beginOp(); err != nil {
 		return err
 	}
 	defer db.endOp()
 
-	req, err := db.buildSetAutoBatchRequest(id, newVal, cfg.beforeStore, cfg.beforeCommit, cfg.cloneValue)
+	req, err := db.buildSetAutoBatchRequest(key, newVal, cfg.beforeStore, cfg.beforeCommit, cfg.cloneValue)
 	if err != nil {
 		return err
 	}
@@ -398,7 +402,7 @@ func (db *DB[K, V]) Set(id K, newVal *V, execOpts ...ExecOption[K, V]) error {
 
 	reqScratch.Append(req)
 
-	return db.submitAutoBatchRequests(reqScratch, cfg.noBatch)
+	return db.autoBatcher.submitAutoBatchRequests(reqScratch, cfg.noBatch)
 }
 
 // BatchSet stores multiple values under the provided IDs in a single write
@@ -438,9 +442,18 @@ func (db *DB[K, V]) BatchSet(ids []K, newVals []*V, execOpts ...ExecOption[K, V]
 	}
 
 	cfg := db.resolveExecOptions(execOpts)
-	for i := range newVals {
-		if err := runBeforeProcessHooks(ids[i], newVals[i], cfg.beforeProcess); err != nil {
-			return err
+	var keyScratch *pooled.Slice[autoBatchKey]
+	if len(cfg.beforeProcess) != 0 {
+		keyScratch = db.autoBatcher.setKeyScratchPool.Get()
+		defer db.autoBatcher.setKeyScratchPool.Put(keyScratch)
+
+		keyScratch.Grow(len(ids))
+		for i := range newVals {
+			key := autoBatchKeyFromIDWithKind(ids[i], db.strKey)
+			if err := runBeforeProcessHooks(key, unsafe.Pointer(newVals[i]), cfg.beforeProcess); err != nil {
+				return err
+			}
+			keyScratch.Append(key)
 		}
 	}
 	if err := db.beginOp(); err != nil {
@@ -454,7 +467,11 @@ func (db *DB[K, V]) BatchSet(ids []K, newVals []*V, execOpts ...ExecOption[K, V]
 	reqScratch.Grow(len(ids))
 
 	for i := range ids {
-		req, err := db.buildSetAutoBatchRequest(ids[i], newVals[i], cfg.beforeStore, cfg.beforeCommit, cfg.cloneValue)
+		key := autoBatchKeyFromIDWithKind(ids[i], db.strKey)
+		if keyScratch != nil {
+			key = keyScratch.Get(i)
+		}
+		req, err := db.buildSetAutoBatchRequest(key, newVals[i], cfg.beforeStore, cfg.beforeCommit, cfg.cloneValue)
 		if err != nil {
 			for j := 0; j < reqScratch.Len(); j++ {
 				db.autoBatcher.requestPool.Put(reqScratch.Get(j))
@@ -464,7 +481,7 @@ func (db *DB[K, V]) BatchSet(ids []K, newVals []*V, execOpts ...ExecOption[K, V]
 		reqScratch.Append(req)
 	}
 
-	return db.submitAutoBatchRequests(reqScratch, true)
+	return db.autoBatcher.submitAutoBatchRequests(reqScratch, true)
 }
 
 // Patch applies a partial update to the value stored under the given id,
@@ -501,7 +518,7 @@ func (db *DB[K, V]) Patch(id K, patch []Field, execOpts ...ExecOption[K, V]) err
 	defer db.autoBatcher.requestScratchPool.Put(reqScratch)
 
 	reqScratch.Append(req)
-	return db.submitAutoBatchRequests(reqScratch, cfg.noBatch)
+	return db.autoBatcher.submitAutoBatchRequests(reqScratch, cfg.noBatch)
 }
 
 // BatchPatch applies the same patch to all values stored under the given IDs
@@ -535,7 +552,7 @@ func (db *DB[K, V]) BatchPatch(ids []K, patch []Field, execOpts ...ExecOption[K,
 		reqScratch.Append(db.buildPatchAutoBatchRequest(ids[i], patch, ignoreUnknown, cfg.beforeProcess, cfg.beforeStore, cfg.beforeCommit))
 	}
 
-	return db.submitAutoBatchRequests(reqScratch, true)
+	return db.autoBatcher.submitAutoBatchRequests(reqScratch, true)
 }
 
 // Delete removes the value stored under the given id, if any.
@@ -558,7 +575,7 @@ func (db *DB[K, V]) Delete(id K, execOpts ...ExecOption[K, V]) error {
 
 	reqScratch.Append(req)
 
-	return db.submitAutoBatchRequests(reqScratch, cfg.noBatch)
+	return db.autoBatcher.submitAutoBatchRequests(reqScratch, cfg.noBatch)
 }
 
 // BatchDelete removes all values stored under the provided ids in a single
@@ -589,25 +606,14 @@ func (db *DB[K, V]) BatchDelete(ids []K, execOpts ...ExecOption[K, V]) error {
 		reqScratch.Append(db.buildDeleteAutoBatchRequest(ids[i], cfg.beforeCommit))
 	}
 
-	return db.submitAutoBatchRequests(reqScratch, true)
+	return db.autoBatcher.submitAutoBatchRequests(reqScratch, true)
 }
 
-func runBeforeProcessHooks[K ~string | ~uint64, V any](id K, newVal *V, hooks []beforeProcessFunc[K, V]) error {
+func runBeforeProcessHooks(id autoBatchKey, newVal unsafe.Pointer, hooks []autoBatchBeforeProcessHook) error {
 	for _, fn := range hooks {
 		if err := fn(id, newVal); err != nil {
 			return err
 		}
 	}
 	return nil
-}
-
-func cloneBeforeStoreValue[K ~string | ~uint64, V any](id K, v *V, cloneFn func(K, *V) *V) (*V, error) {
-	if cloneFn == nil || v == nil {
-		return v, nil
-	}
-	cloned := cloneFn(id, v)
-	if cloned == nil {
-		return nil, fmt.Errorf("clone returned nil")
-	}
-	return cloned, nil
 }

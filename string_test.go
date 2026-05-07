@@ -178,14 +178,14 @@ func TestStringExt_SharedAutoBatchUniqueRejectHolePersistsAcrossReopen(t *testin
 		t.Fatalf("seed Set: %v", err)
 	}
 
-	badReq, err := db.buildSetAutoBatchRequest("ghost-hole", &StringUniqueTestRec{
+	badReq, err := db.buildSetAutoBatchRequest(autoBatchKeyFromID("ghost-hole"), &StringUniqueTestRec{
 		Email: "seed@x",
 		Code:  2,
 	}, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("build bad request: %v", err)
 	}
-	goodReq, err := db.buildSetAutoBatchRequest("real-hole", &StringUniqueTestRec{
+	goodReq, err := db.buildSetAutoBatchRequest(autoBatchKeyFromID("real-hole"), &StringUniqueTestRec{
 		Email: "real@x",
 		Code:  3,
 	}, nil, nil, nil)
@@ -193,7 +193,7 @@ func TestStringExt_SharedAutoBatchUniqueRejectHolePersistsAcrossReopen(t *testin
 		t.Fatalf("build good request: %v", err)
 	}
 
-	db.executeAutoBatch([]*autoBatchRequest[string, StringUniqueTestRec]{badReq, goodReq})
+	db.autoBatcher.executeAutoBatch([]*autoBatchRequest{badReq, goodReq})
 
 	if !errors.Is(badReq.err, ErrUniqueViolation) {
 		t.Fatalf("bad request error = %v, want %v", badReq.err, ErrUniqueViolation)

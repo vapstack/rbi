@@ -2,6 +2,7 @@ package rbi
 
 import (
 	"reflect"
+	"unsafe"
 
 	"go.etcd.io/bbolt"
 )
@@ -11,10 +12,10 @@ type beforeStoreFunc[K ~string | ~uint64, V any] = func(key K, oldValue, newValu
 type beforeCommitFunc[K ~string | ~uint64, V any] = func(tx *bbolt.Tx, key K, oldValue, newValue *V) error
 
 type execOptions[K ~string | ~uint64, V any] struct {
-	beforeProcess []beforeProcessFunc[K, V]
-	beforeStore   []beforeStoreFunc[K, V]
-	beforeCommit  []beforeCommitFunc[K, V]
-	cloneValue    func(K, *V) *V
+	beforeProcess []autoBatchBeforeProcessHook
+	beforeStore   []autoBatchBeforeStoreHook
+	beforeCommit  []autoBatchBeforeCommitHook
+	cloneValue    autoBatchCloneFunc
 	noBatch       bool
 	patchStrict   bool
 }
@@ -54,11 +55,23 @@ type ExecOption[K ~string | ~uint64, V any] func(*execOptions[K, V])
 // BeforeProcess may be passed more than once. Hooks passed to New are invoked
 // before per-operation hooks.
 func BeforeProcess[K ~string | ~uint64, V any](fn func(key K, value *V) error) ExecOption[K, V] {
-	return func(cfg *execOptions[K, V]) {
-		if cfg == nil || fn == nil {
-			return
+	if fn == nil {
+		return nil
+	}
+	strKey := reflect.TypeFor[K]().Kind() == reflect.String
+	if strKey {
+		f := func(key autoBatchKey, value unsafe.Pointer) error {
+			return fn(*(*K)(unsafe.Pointer(&key.s)), (*V)(value))
 		}
-		cfg.beforeProcess = append(cfg.beforeProcess, fn)
+		return func(cfg *execOptions[K, V]) {
+			cfg.beforeProcess = append(cfg.beforeProcess, f)
+		}
+	}
+	f := func(key autoBatchKey, value unsafe.Pointer) error {
+		return fn(*(*K)(unsafe.Pointer(&key.u)), (*V)(value))
+	}
+	return func(cfg *execOptions[K, V]) {
+		cfg.beforeProcess = append(cfg.beforeProcess, f)
 	}
 }
 
@@ -70,9 +83,6 @@ func BeforeProcess[K ~string | ~uint64, V any](fn func(key K, value *V) error) E
 // For BatchSet, BatchPatch, and BatchDelete it is redundant because those
 // methods already execute as isolated internal batches.
 func NoBatch[K ~string | ~uint64, V any](cfg *execOptions[K, V]) {
-	if cfg == nil {
-		return
-	}
 	cfg.noBatch = true
 }
 
@@ -103,11 +113,23 @@ func NoBatch[K ~string | ~uint64, V any](cfg *execOptions[K, V]) {
 // BeforeStore may be passed more than once. Hooks passed to New are invoked
 // before per-operation hooks.
 func BeforeStore[K ~string | ~uint64, V any](fn func(key K, oldValue, newValue *V) error) ExecOption[K, V] {
-	return func(cfg *execOptions[K, V]) {
-		if cfg == nil || fn == nil {
-			return
+	if fn == nil {
+		return nil
+	}
+	strKey := reflect.TypeFor[K]().Kind() == reflect.String
+	if strKey {
+		f := func(key autoBatchKey, oldValue, newValue unsafe.Pointer) error {
+			return fn(*(*K)(unsafe.Pointer(&key.s)), (*V)(oldValue), (*V)(newValue))
 		}
-		cfg.beforeStore = append(cfg.beforeStore, fn)
+		return func(cfg *execOptions[K, V]) {
+			cfg.beforeStore = append(cfg.beforeStore, f)
+		}
+	}
+	f := func(key autoBatchKey, oldValue, newValue unsafe.Pointer) error {
+		return fn(*(*K)(unsafe.Pointer(&key.u)), (*V)(oldValue), (*V)(newValue))
+	}
+	return func(cfg *execOptions[K, V]) {
+		cfg.beforeStore = append(cfg.beforeStore, f)
 	}
 }
 
@@ -138,12 +160,28 @@ func BeforeStore[K ~string | ~uint64, V any](fn func(key K, oldValue, newValue *
 // When passed to New, CloneFunc becomes the default for matching write
 // operations on the returned DB.
 func CloneFunc[K ~string | ~uint64, V any](fn func(key K, v *V) *V) ExecOption[K, V] {
-	return func(cfg *execOptions[K, V]) {
-		if cfg == nil || fn == nil {
-			return
-		}
-		cfg.cloneValue = fn
+	if fn == nil {
+		return nil
 	}
+	strKey := reflect.TypeFor[K]().Kind() == reflect.String
+	if strKey {
+		f := func(key autoBatchKey, value unsafe.Pointer) (unsafe.Pointer, error) {
+			cloned := fn(*(*K)(unsafe.Pointer(&key.s)), (*V)(value))
+			if cloned == nil {
+				return nil, errAutoBatchCloneNil
+			}
+			return unsafe.Pointer(cloned), nil
+		}
+		return func(cfg *execOptions[K, V]) { cfg.cloneValue = f }
+	}
+	f := func(key autoBatchKey, value unsafe.Pointer) (unsafe.Pointer, error) {
+		cloned := fn(*(*K)(unsafe.Pointer(&key.u)), (*V)(value))
+		if cloned == nil {
+			return nil, errAutoBatchCloneNil
+		}
+		return unsafe.Pointer(cloned), nil
+	}
+	return func(cfg *execOptions[K, V]) { cfg.cloneValue = f }
 }
 
 // BeforeCommit registers a callback invoked inside the write transaction just
@@ -168,11 +206,21 @@ func CloneFunc[K ~string | ~uint64, V any](fn func(key K, v *V) *V) ExecOption[K
 // BeforeCommit may be passed more than once. Callbacks passed to New are invoked
 // before per-operation callbacks.
 func BeforeCommit[K ~string | ~uint64, V any](fn func(tx *bbolt.Tx, key K, oldValue, newValue *V) error) ExecOption[K, V] {
-	return func(cfg *execOptions[K, V]) {
-		if cfg == nil || fn == nil {
-			return
+	if fn == nil {
+		return nil
+	}
+	strKey := reflect.TypeFor[K]().Kind() == reflect.String
+	if strKey {
+		return func(cfg *execOptions[K, V]) {
+			cfg.beforeCommit = append(cfg.beforeCommit, func(tx *bbolt.Tx, key autoBatchKey, oldValue, newValue unsafe.Pointer) error {
+				return fn(tx, *(*K)(unsafe.Pointer(&key.s)), (*V)(oldValue), (*V)(newValue))
+			})
 		}
-		cfg.beforeCommit = append(cfg.beforeCommit, fn)
+	}
+	return func(cfg *execOptions[K, V]) {
+		cfg.beforeCommit = append(cfg.beforeCommit, func(tx *bbolt.Tx, key autoBatchKey, oldValue, newValue unsafe.Pointer) error {
+			return fn(tx, *(*K)(unsafe.Pointer(&key.u)), (*V)(oldValue), (*V)(newValue))
+		})
 	}
 }
 
@@ -182,9 +230,6 @@ func BeforeCommit[K ~string | ~uint64, V any](fn func(tx *bbolt.Tx, key K, oldVa
 // When passed to New, PatchStrict becomes the default for all patch operations
 // on the returned DB. Passing PatchStrict to non-patch write methods has no effect.
 func PatchStrict[K ~string | ~uint64, V any](cfg *execOptions[K, V]) {
-	if cfg == nil {
-		return
-	}
 	cfg.patchStrict = true
 }
 
@@ -196,7 +241,7 @@ func applyExecOptions[K ~string | ~uint64, V any](cfg *execOptions[K, V], opts [
 	}
 }
 
-func defaultCloneValue[K ~string | ~uint64, V any]() func(K, *V) *V {
+func defaultCloneValue[V any]() func(*V) *V {
 	method, ok := reflect.TypeFor[*V]().MethodByName("Clone")
 	if !ok {
 		return nil
@@ -205,28 +250,32 @@ func defaultCloneValue[K ~string | ~uint64, V any]() func(K, *V) *V {
 	if !ok {
 		return nil
 	}
-	return func(_ K, v *V) *V {
-		if v == nil {
-			return nil
-		}
-		return clone(v)
-	}
+	return clone
 }
 
 func freezeExecOptions[K ~string | ~uint64, V any](cfg execOptions[K, V]) execOptions[K, V] {
 	if cfg.cloneValue == nil {
-		cfg.cloneValue = defaultCloneValue[K, V]()
+		clone := defaultCloneValue[V]()
+		if clone != nil {
+			cfg.cloneValue = func(_ autoBatchKey, value unsafe.Pointer) (unsafe.Pointer, error) {
+				cloned := clone((*V)(value))
+				if cloned == nil {
+					return nil, errAutoBatchCloneNil
+				}
+				return unsafe.Pointer(cloned), nil
+			}
+		}
 	}
 	if len(cfg.beforeProcess) > 0 {
-		cfg.beforeProcess = append([]beforeProcessFunc[K, V](nil), cfg.beforeProcess...)
+		cfg.beforeProcess = append([]autoBatchBeforeProcessHook(nil), cfg.beforeProcess...)
 		cfg.beforeProcess = cfg.beforeProcess[:len(cfg.beforeProcess):len(cfg.beforeProcess)]
 	}
 	if len(cfg.beforeStore) > 0 {
-		cfg.beforeStore = append([]beforeStoreFunc[K, V](nil), cfg.beforeStore...)
+		cfg.beforeStore = append([]autoBatchBeforeStoreHook(nil), cfg.beforeStore...)
 		cfg.beforeStore = cfg.beforeStore[:len(cfg.beforeStore):len(cfg.beforeStore)]
 	}
 	if len(cfg.beforeCommit) > 0 {
-		cfg.beforeCommit = append([]beforeCommitFunc[K, V](nil), cfg.beforeCommit...)
+		cfg.beforeCommit = append([]autoBatchBeforeCommitHook(nil), cfg.beforeCommit...)
 		cfg.beforeCommit = cfg.beforeCommit[:len(cfg.beforeCommit):len(cfg.beforeCommit)]
 	}
 	return cfg

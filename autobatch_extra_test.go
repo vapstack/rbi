@@ -16,8 +16,8 @@ import (
 func drainQueuedAutoBatchStep[K ~string | ~uint64, V any](
 	tb testing.TB,
 	db *DB[K, V],
-	reqs []*autoBatchRequest[K, V],
-	onBatch func([]*autoBatchJob[K, V]),
+	reqs []*autoBatchRequest,
+	onBatch func([]*autoBatchJob),
 ) {
 	tb.Helper()
 	waitAutoBatcherIdleForTest(tb, db)
@@ -34,40 +34,40 @@ func drainQueuedAutoBatchStep[K ~string | ~uint64, V any](
 	db.autoBatcher.hotUntil = time.Time{}
 	db.autoBatcher.queueHead = 0
 	db.autoBatcher.queueSize = len(reqs)
-	db.autoBatcher.queue = make([]*autoBatchJob[K, V], len(reqs))
+	db.autoBatcher.queue = make([]*autoBatchJob, len(reqs))
 	for i, req := range reqs {
 		db.autoBatcher.queue[i] = queuedSingleJob(req)
 	}
 	db.autoBatcher.mu.Unlock()
 
 	for {
-		batch := db.popAutoBatch()
+		batch := db.autoBatcher.popAutoBatch()
 		if len(batch) == 0 {
 			return
 		}
 		if onBatch != nil {
 			onBatch(batch)
 		}
-		db.executeAutoBatchJobs(batch)
+		db.autoBatcher.executeAutoBatchJobs(batch)
 	}
 }
 
 func drainCurrentAutoBatchQueue[K ~string | ~uint64, V any](
 	tb testing.TB,
 	db *DB[K, V],
-	onBatch func([]*autoBatchJob[K, V]),
+	onBatch func([]*autoBatchJob),
 ) {
 	tb.Helper()
 
 	for {
-		batch := db.popAutoBatch()
+		batch := db.autoBatcher.popAutoBatch()
 		if len(batch) == 0 {
 			return
 		}
 		if onBatch != nil {
 			onBatch(batch)
 		}
-		db.executeAutoBatchJobs(batch)
+		db.autoBatcher.executeAutoBatchJobs(batch)
 		clear(batch)
 		db.autoBatcher.mu.Lock()
 		if cap(batch) > cap(db.autoBatcher.batchScratch) {
@@ -79,28 +79,29 @@ func drainCurrentAutoBatchQueue[K ~string | ~uint64, V any](
 	}
 }
 
-func describeAutoBatchJobForTest[K ~string | ~uint64, V any](job *autoBatchJob[K, V]) string {
+func describeAutoBatchJobForTest[K ~string | ~uint64, V any](job *autoBatchJob) string {
 	if job == nil {
 		return "<nil>"
 	}
-	ids := make([]K, job.reqs.Len())
-	for i := 0; i < job.reqs.Len(); i++ {
-		ids[i] = job.reqs.Get(i).id
+	reqs := job.reqs
+	ids := make([]K, reqs.Len())
+	for i := 0; i < reqs.Len(); i++ {
+		ids[i] = autoBatchKeyID[K](reqs.Get(i).id)
 	}
 	kind := "shared"
 	if job.isolated {
 		kind = "isolated"
 	}
-	return fmt.Sprintf("%s:reqs=%d ids=%v", kind, job.reqs.Len(), ids)
+	return fmt.Sprintf("%s:reqs=%d ids=%v", kind, reqs.Len(), ids)
 }
 
-func describeAutoBatchBatchForTest[K ~string | ~uint64, V any](batch []*autoBatchJob[K, V]) string {
+func describeAutoBatchBatchForTest[K ~string | ~uint64, V any](batch []*autoBatchJob) string {
 	if len(batch) == 0 {
 		return "[]"
 	}
 	parts := make([]string, len(batch))
 	for i := range batch {
-		parts[i] = describeAutoBatchJobForTest(batch[i])
+		parts[i] = describeAutoBatchJobForTest[K, V](batch[i])
 	}
 	return "[" + strings.Join(parts, ", ") + "]"
 }
@@ -111,13 +112,13 @@ func describeAutoBatchQueueForTest[K ~string | ~uint64, V any](db *DB[K, V]) str
 	head := db.autoBatcher.queueHead
 	parts := make([]string, size)
 	for i := 0; i < size; i++ {
-		parts[i] = describeAutoBatchJobForTest(db.autoBatcher.queueAt(i))
+		parts[i] = describeAutoBatchJobForTest[K, V](db.autoBatcher.queueAt(i))
 	}
 	db.autoBatcher.mu.Unlock()
 	return fmt.Sprintf("head=%d size=%d jobs=[%s]", head, size, strings.Join(parts, ", "))
 }
 
-func recycleAutoBatchScratchForTest[K ~string | ~uint64, V any](db *DB[K, V], batch []*autoBatchJob[K, V]) {
+func recycleAutoBatchScratchForTest[K ~string | ~uint64, V any](db *DB[K, V], batch []*autoBatchJob) {
 	clear(batch)
 	db.autoBatcher.mu.Lock()
 	if cap(batch) > cap(db.autoBatcher.batchScratch) {
@@ -128,7 +129,7 @@ func recycleAutoBatchScratchForTest[K ~string | ~uint64, V any](db *DB[K, V], ba
 	db.autoBatcher.mu.Unlock()
 }
 
-func terminalAutoBatchReq[K ~string | ~uint64, V any](req *autoBatchRequest[K, V]) *autoBatchRequest[K, V] {
+func terminalAutoBatchReq(req *autoBatchRequest) *autoBatchRequest {
 	for req != nil && req.replacedBy != nil {
 		req = req.replacedBy
 	}
@@ -276,10 +277,10 @@ func waitAutoBatchExtraStrMapHasKeys[V any](tb testing.TB, db *DB[string, V], ke
 	}
 }
 
-func newAutoBatchPopReqForTest(id uint64) *autoBatchRequest[uint64, Rec] {
-	return &autoBatchRequest[uint64, Rec]{
+func newAutoBatchPopReqForTest(id uint64) *autoBatchRequest {
+	return &autoBatchRequest{
 		op:   autoBatchPatch,
-		id:   id,
+		id:   autoBatchKeyFromID(id),
 		done: make(chan error, 1),
 	}
 }
@@ -298,8 +299,11 @@ func configureGroupedBetweenSharedQueueForTest(
 	setAutoBatchQueueJobsForTest(
 		db,
 		queuedSingleJob(newAutoBatchPopReqForTest(headID)),
-		&autoBatchJob[uint64, Rec]{
-			reqs:     testAutoBatchRequestBuf(newAutoBatchPopReqForTest(groupIDs[0]), newAutoBatchPopReqForTest(groupIDs[1])),
+		&autoBatchJob{
+			reqs: testAutoBatchRequestBuf(
+				newAutoBatchPopReqForTest(groupIDs[0]),
+				newAutoBatchPopReqForTest(groupIDs[1]),
+			),
 			isolated: true,
 			done:     make(chan error, 1),
 		},
@@ -311,46 +315,73 @@ func configureGroupedBetweenSharedQueueForTest(
 func assertGroupedBetweenSharedPopSequenceForTest(tb testing.TB, db *DB[uint64, Rec], iteration int) {
 	tb.Helper()
 
-	first := db.popAutoBatch()
-	if len(first) != 1 || first[0].isolated || first[0].reqs.Len() != 1 || first[0].reqs.Get(0).id != 1 {
+	first := db.autoBatcher.popAutoBatch()
+	if len(first) != 1 {
 		tb.Fatalf(
 			"iter=%d pop1=%s queue=%s",
 			iteration,
-			describeAutoBatchBatchForTest(first),
+			describeAutoBatchBatchForTest[uint64, Rec](first),
+			describeAutoBatchQueueForTest(db),
+		)
+	}
+	firstReqs := first[0].reqs
+	if first[0].isolated || firstReqs.Len() != 1 || autoBatchKeyID[uint64](firstReqs.Get(0).id) != 1 {
+		tb.Fatalf(
+			"iter=%d pop1=%s queue=%s",
+			iteration,
+			describeAutoBatchBatchForTest[uint64, Rec](first),
 			describeAutoBatchQueueForTest(db),
 		)
 	}
 	recycleAutoBatchScratchForTest(db, first)
 
-	second := db.popAutoBatch()
-	if len(second) != 1 || !second[0].isolated || second[0].reqs.Len() != 2 ||
-		second[0].reqs.Get(0).id != 2 || second[0].reqs.Get(1).id != 3 {
+	second := db.autoBatcher.popAutoBatch()
+	if len(second) != 1 {
 		tb.Fatalf(
 			"iter=%d pop2=%s queue=%s",
 			iteration,
-			describeAutoBatchBatchForTest(second),
+			describeAutoBatchBatchForTest[uint64, Rec](second),
+			describeAutoBatchQueueForTest(db),
+		)
+	}
+	secondReqs := second[0].reqs
+	if !second[0].isolated || secondReqs.Len() != 2 ||
+		autoBatchKeyID[uint64](secondReqs.Get(0).id) != 2 || autoBatchKeyID[uint64](secondReqs.Get(1).id) != 3 {
+		tb.Fatalf(
+			"iter=%d pop2=%s queue=%s",
+			iteration,
+			describeAutoBatchBatchForTest[uint64, Rec](second),
 			describeAutoBatchQueueForTest(db),
 		)
 	}
 	recycleAutoBatchScratchForTest(db, second)
 
-	third := db.popAutoBatch()
-	if len(third) != 1 || third[0].isolated || third[0].reqs.Len() != 1 || third[0].reqs.Get(0).id != 4 {
+	third := db.autoBatcher.popAutoBatch()
+	if len(third) != 1 {
 		tb.Fatalf(
 			"iter=%d pop3=%s queue=%s",
 			iteration,
-			describeAutoBatchBatchForTest(third),
+			describeAutoBatchBatchForTest[uint64, Rec](third),
+			describeAutoBatchQueueForTest(db),
+		)
+	}
+	thirdReqs := third[0].reqs
+	if third[0].isolated || thirdReqs.Len() != 1 || autoBatchKeyID[uint64](thirdReqs.Get(0).id) != 4 {
+		tb.Fatalf(
+			"iter=%d pop3=%s queue=%s",
+			iteration,
+			describeAutoBatchBatchForTest[uint64, Rec](third),
 			describeAutoBatchQueueForTest(db),
 		)
 	}
 	recycleAutoBatchScratchForTest(db, third)
 
-	empty := db.popAutoBatch()
+	empty := db.autoBatcher.popAutoBatch()
 	if len(empty) != 0 {
 		tb.Fatalf(
 			"iter=%d trailing-pop=%s queue=%s",
 			iteration,
-			describeAutoBatchBatchForTest(empty),
+			describeAutoBatchBatchForTest[uint64, Rec](empty),
 			describeAutoBatchQueueForTest(db),
 		)
 	}
@@ -370,7 +401,7 @@ func warmAutoBatchScratchForTest(db *DB[uint64, Rec]) {
 	)
 	db.autoBatcher.mu.Unlock()
 
-	batch := db.popAutoBatch()
+	batch := db.autoBatcher.popAutoBatch()
 	recycleAutoBatchScratchForTest(db, batch)
 }
 
@@ -526,7 +557,7 @@ func buildAutoBatchExtraRecReq(
 	tb testing.TB,
 	db *DB[uint64, Rec],
 	spec autoBatchExtraRecSpec,
-) *autoBatchRequest[uint64, Rec] {
+) *autoBatchRequest {
 	tb.Helper()
 
 	var beforeCommit []beforeCommitFunc[uint64, Rec]
@@ -668,7 +699,7 @@ func buildAutoBatchExtraUniqueReq(
 	tb testing.TB,
 	db *DB[uint64, UniqueTestRec],
 	spec autoBatchExtraUniqueSpec,
-) *autoBatchRequest[uint64, UniqueTestRec] {
+) *autoBatchRequest {
 	tb.Helper()
 
 	var beforeCommit []beforeCommitFunc[uint64, UniqueTestRec]
@@ -829,8 +860,8 @@ func TestAutoBatchExtra_MixedQueuedOps_MatchSequentialModel(t *testing.T) {
 		}
 
 		specs := make([]autoBatchExtraRecSpec, n)
-		reqs := make([]*autoBatchRequest[uint64, Rec], n)
-		reqIndex := make(map[*autoBatchRequest[uint64, Rec]]int, n)
+		reqs := make([]*autoBatchRequest, n)
+		reqIndex := make(map[*autoBatchRequest]int, n)
 		wantErrs := make([]error, n)
 
 		for i := 0; i < n; i++ {
@@ -886,7 +917,7 @@ func TestAutoBatchExtra_MixedQueuedOps_MatchSequentialModel(t *testing.T) {
 			reqIndex[reqs[i]] = i
 		}
 
-		drainQueuedAutoBatchStep(t, dbBatch, reqs, func(batch []*autoBatchJob[uint64, Rec]) {
+		drainQueuedAutoBatchStep(t, dbBatch, reqs, func(batch []*autoBatchJob) {
 			for _, job := range batch {
 				req := job.reqs.Get(0)
 				if req.replacedBy != nil {
@@ -1031,8 +1062,8 @@ func TestAutoBatchExtra_UniqueMixedQueuedOps_MatchSequentialModel(t *testing.T) 
 		}
 
 		specs := make([]autoBatchExtraUniqueSpec, n)
-		reqs := make([]*autoBatchRequest[uint64, UniqueTestRec], n)
-		reqIndex := make(map[*autoBatchRequest[uint64, UniqueTestRec]]int, n)
+		reqs := make([]*autoBatchRequest, n)
+		reqIndex := make(map[*autoBatchRequest]int, n)
 		wantErrs := make([]error, n)
 
 		for i := 0; i < n; i++ {
@@ -1080,7 +1111,7 @@ func TestAutoBatchExtra_UniqueMixedQueuedOps_MatchSequentialModel(t *testing.T) 
 			reqIndex[reqs[i]] = i
 		}
 
-		drainQueuedAutoBatchStep(t, dbBatch, reqs, func(batch []*autoBatchJob[uint64, UniqueTestRec]) {
+		drainQueuedAutoBatchStep(t, dbBatch, reqs, func(batch []*autoBatchJob) {
 			for _, job := range batch {
 				req := job.reqs.Get(0)
 				if req.replacedBy != nil {
@@ -1134,7 +1165,7 @@ func TestAutoBatchExtra_GrowQueuePreservesRingOrderAndCoalesceAcrossWrap(t *test
 	db.autoBatcher.maxOps = 16
 	db.autoBatcher.running = true
 	db.autoBatcher.hotUntil = time.Time{}
-	db.autoBatcher.queue = make([]*autoBatchJob[uint64, Rec], 4)
+	db.autoBatcher.queue = make([]*autoBatchJob, 4)
 	db.autoBatcher.queueHead = 3
 	db.autoBatcher.queueSize = 4
 	db.autoBatcher.queue[3] = queuedSingleJob(req1)
@@ -1148,11 +1179,11 @@ func TestAutoBatchExtra_GrowQueuePreservesRingOrderAndCoalesceAcrossWrap(t *test
 		t.Fatalf("queue did not grow, len=%d", got)
 	}
 	gotOrder := []uint64{
-		db.autoBatcher.queueAt(0).reqs.Get(0).id,
-		db.autoBatcher.queueAt(1).reqs.Get(0).id,
-		db.autoBatcher.queueAt(2).reqs.Get(0).id,
-		db.autoBatcher.queueAt(3).reqs.Get(0).id,
-		db.autoBatcher.queueAt(4).reqs.Get(0).id,
+		autoBatchKeyID[uint64](db.autoBatcher.queueAt(0).reqs.Get(0).id),
+		autoBatchKeyID[uint64](db.autoBatcher.queueAt(1).reqs.Get(0).id),
+		autoBatchKeyID[uint64](db.autoBatcher.queueAt(2).reqs.Get(0).id),
+		autoBatchKeyID[uint64](db.autoBatcher.queueAt(3).reqs.Get(0).id),
+		autoBatchKeyID[uint64](db.autoBatcher.queueAt(4).reqs.Get(0).id),
 	}
 	db.autoBatcher.mu.Unlock()
 
@@ -1160,7 +1191,7 @@ func TestAutoBatchExtra_GrowQueuePreservesRingOrderAndCoalesceAcrossWrap(t *test
 		t.Fatalf("queue order after grow = %v, want [1 1 2 3 1]", gotOrder)
 	}
 
-	batch := db.popAutoBatch()
+	batch := db.autoBatcher.popAutoBatch()
 	if len(batch) != 5 {
 		t.Fatalf("popped batch size = %d, want 5", len(batch))
 	}
@@ -1168,7 +1199,7 @@ func TestAutoBatchExtra_GrowQueuePreservesRingOrderAndCoalesceAcrossWrap(t *test
 		t.Fatalf("unexpected coalesce chain after grow: req1->%p req2->%p req5->%p", req1.replacedBy, req2.replacedBy, req5.replacedBy)
 	}
 
-	db.executeAutoBatchJobs(batch)
+	db.autoBatcher.executeAutoBatchJobs(batch)
 	clear(batch)
 	db.autoBatcher.mu.Lock()
 	if cap(batch) > cap(db.autoBatcher.batchScratch) {
@@ -1178,7 +1209,7 @@ func TestAutoBatchExtra_GrowQueuePreservesRingOrderAndCoalesceAcrossWrap(t *test
 	}
 	db.autoBatcher.mu.Unlock()
 
-	for i, req := range []*autoBatchRequest[uint64, Rec]{req1, req2, req3, req4, req5} {
+	for i, req := range []*autoBatchRequest{req1, req2, req3, req4, req5} {
 		if err := mustAutoBatchErr(t, req); err != nil {
 			t.Fatalf("req%d error = %v", i+1, err)
 		}
@@ -1260,7 +1291,7 @@ func TestAutoBatchExtra_InterleavedIsolatedSameID_PreservesSequentialState(t *te
 	setAutoBatchQueueJobsForTest(
 		db,
 		queuedSingleJob(req1),
-		&autoBatchJob[uint64, Rec]{
+		&autoBatchJob{
 			reqs:     testAutoBatchRequestBuf(req2),
 			isolated: true,
 			done:     req2.done,
@@ -1270,14 +1301,14 @@ func TestAutoBatchExtra_InterleavedIsolatedSameID_PreservesSequentialState(t *te
 	db.autoBatcher.mu.Unlock()
 
 	var popped []int
-	drainCurrentAutoBatchQueue(t, db, func(batch []*autoBatchJob[uint64, Rec]) {
+	drainCurrentAutoBatchQueue(t, db, func(batch []*autoBatchJob) {
 		popped = append(popped, len(batch))
 	})
 
 	if !slices.Equal(popped, []int{1, 1, 1}) {
 		t.Fatalf("popped batch sizes = %v, want [1 1 1]", popped)
 	}
-	for i, req := range []*autoBatchRequest[uint64, Rec]{req1, req2, req3} {
+	for i, req := range []*autoBatchRequest{req1, req2, req3} {
 		if err := mustAutoBatchErr(t, req); err != nil {
 			t.Fatalf("req%d error = %v", i+1, err)
 		}
@@ -1372,7 +1403,7 @@ func TestAutoBatchExtra_GroupedJobBetweenSharedRequests_StaysIsolatedAndOrdered(
 	setAutoBatchQueueJobsForTest(
 		db,
 		queuedSingleJob(headReq),
-		&autoBatchJob[uint64, Rec]{
+		&autoBatchJob{
 			reqs:     testAutoBatchRequestBuf(groupReq1, groupReq2),
 			isolated: true,
 			done:     groupDone,
@@ -1382,7 +1413,7 @@ func TestAutoBatchExtra_GroupedJobBetweenSharedRequests_StaysIsolatedAndOrdered(
 	db.autoBatcher.mu.Unlock()
 
 	var popped []string
-	drainCurrentAutoBatchQueue(t, db, func(batch []*autoBatchJob[uint64, Rec]) {
+	drainCurrentAutoBatchQueue(t, db, func(batch []*autoBatchJob) {
 		switch {
 		case len(batch) != 1:
 			popped = append(popped, fmt.Sprintf("size=%d", len(batch)))
@@ -1825,7 +1856,7 @@ func TestAutoBatchExtra_StringSharedCloseAfterPrepare_RollsBackCreatedStrMap(t *
 	execDone := make(chan struct{})
 	go func() {
 		defer close(execDone)
-		db.executeAutoBatch([]*autoBatchRequest[string, Product]{req1, req2})
+		db.autoBatcher.executeAutoBatch([]*autoBatchRequest{req1, req2})
 	}()
 
 	during := waitAutoBatchExtraStrMapHasKeys(t, db, "ghost-a", "ghost-b")
@@ -1892,7 +1923,7 @@ func TestAutoBatchExtra_StringAtomicCloseAfterPrepare_RollsBackCreatedStrMap(t *
 	req2 := mustBuildSetAutoReq(t, db, "atomic-b", &Product{SKU: "atomic-b", Price: 22}, nil, nil, nil)
 
 	jobDone := make(chan error, 1)
-	job := &autoBatchJob[string, Product]{
+	job := &autoBatchJob{
 		reqs:     testAutoBatchRequestBuf(req1, req2),
 		isolated: true,
 		done:     jobDone,
@@ -1902,7 +1933,7 @@ func TestAutoBatchExtra_StringAtomicCloseAfterPrepare_RollsBackCreatedStrMap(t *
 	execDone := make(chan struct{})
 	go func() {
 		defer close(execDone)
-		db.executeAutoBatchJobs([]*autoBatchJob[string, Product]{job})
+		db.autoBatcher.executeAutoBatchJobs([]*autoBatchJob{job})
 	}()
 
 	during := waitAutoBatchExtraStrMapHasKeys(t, db, "atomic-a", "atomic-b")

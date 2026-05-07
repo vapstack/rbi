@@ -28,10 +28,10 @@ type measureFieldAccessor struct {
 	modified fieldModifiedFn
 }
 
-func (db *DB[K, V]) initMeasureFieldAccessors() error {
-	access, fieldMap, err := makeMeasureFieldAccessors(db.vtype, db.engine.measureFields)
-	db.engine.measureFieldAccess = access
-	db.engine.measureFieldMap = fieldMap
+func (qe *queryEngine) initMeasureFieldAccessors(vtype reflect.Type) error {
+	access, fieldMap, err := makeMeasureFieldAccessors(vtype, qe.measureFields)
+	qe.measureFieldAccess = access
+	qe.measureFieldMap = fieldMap
 	return err
 }
 

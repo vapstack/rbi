@@ -5690,7 +5690,7 @@ func TestInitIndexedFieldAccessors_AssignsStableSortedOrdinals(t *testing.T) {
 	if err := db.populateFields(db.vtype, nil); err != nil {
 		t.Fatalf("populateFields: %v", err)
 	}
-	if err := db.initIndexedFieldAccessors(); err != nil {
+	if err := db.engine.initIndexedFieldAccessors(db.vtype); err != nil {
 		t.Fatalf("initIndexedFieldAccessors: %v", err)
 	}
 

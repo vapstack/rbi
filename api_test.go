@@ -13,6 +13,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unsafe"
 
 	"github.com/vapstack/qx"
 	"github.com/vmihailenco/msgpack/v5"
@@ -501,12 +502,12 @@ func TestBatchSet_FailedBuild_ReleasesPreparedRequestsBeforePooling(t *testing.T
 	}
 
 	req, err := db.buildSetAutoBatchRequest(
-		3,
+		autoBatchKeyFromID(uint64(3)),
 		&beforeStoreCloneRec{Name: "hooked", Ready: true},
 		nil,
-		[]beforeCommitFunc[uint64, beforeStoreCloneRec]{
+		testBeforeCommitHooks([]beforeCommitFunc[uint64, beforeStoreCloneRec]{
 			func(_ *bbolt.Tx, _ uint64, _ *beforeStoreCloneRec, _ *beforeStoreCloneRec) error { return nil },
-		},
+		}),
 		nil,
 	)
 	if err != nil {
@@ -1045,10 +1046,10 @@ func TestTruncate_NoDeadlock_WithConcurrentExecuteBatchWriter(t *testing.T) {
 	newVal := &Rec{Name: "after", Age: 2}
 	payload := mustEncodeAutoBatchPayload(t, db, newVal)
 
-	req := &autoBatchRequest[uint64, Rec]{
+	req := &autoBatchRequest{
 		op:         autoBatchSet,
-		id:         1,
-		setValue:   newVal,
+		id:         autoBatchKeyFromID(uint64(1)),
+		setValue:   unsafe.Pointer(newVal),
 		setPayload: payload,
 		done:       make(chan error, 1),
 	}
@@ -1062,7 +1063,7 @@ func TestTruncate_NoDeadlock_WithConcurrentExecuteBatchWriter(t *testing.T) {
 	go func() {
 		truncateDone <- db.Truncate()
 	}()
-	go db.executeAutoBatch([]*autoBatchRequest[uint64, Rec]{req})
+	go db.autoBatcher.executeAutoBatch([]*autoBatchRequest{req})
 	time.Sleep(20 * time.Millisecond)
 	db.mu.Unlock()
 

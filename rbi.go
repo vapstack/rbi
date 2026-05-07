@@ -1,6 +1,7 @@
 package rbi
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
@@ -397,69 +398,10 @@ func New[K ~uint64 | ~string, V any](bolt *bbolt.DB, options Options, execOpts .
 		db.strKey = true
 	}
 
-	collector := fieldCollector{
-		options: db.options,
+	db.engine, db.strMap, err = newQueryEngineForType(vtype, db.options, db.strKey, calPath)
+	if err != nil {
+		return nil, err
 	}
-	if err = collector.populateFields(vtype, nil); err != nil {
-		return nil, fmt.Errorf("failed to populate index fields: %w", err)
-	}
-
-	if len(collector.indexFields) != 0 || len(collector.measureFields) != 0 {
-		if db.strKey {
-			db.strMap = newStrMapper(0, defaultSnapshotStrMapCompactDepth)
-		}
-		db.engine = &queryEngine{
-			fields:                         collector.indexFields,
-			measureFields:                  collector.measureFields,
-			hasUnique:                      collector.hasUnique,
-			universe:                       posting.List{},
-			matPredCacheMaxEntries:         max(0, options.SnapshotMaterializedPredCacheMaxEntries),
-			matPredCacheMaxCard:            materializedPredCacheMaxCardinality(options.SnapshotMaterializedPredCacheMaxCardinality),
-			numericRangeBucketSize:         options.NumericRangeBucketSize,
-			numericRangeBucketMinFieldKeys: options.NumericRangeBucketMinFieldKeys,
-			numericRangeBucketMinSpanKeys:  options.NumericRangeBucketMinSpanKeys,
-			snapshot: &snapshotManager{
-				bySeq:        make(map[uint64]*snapshotRef, 128),
-				statsEnabled: options.EnableSnapshotStats,
-			},
-			planner: &planner{
-				analyzer: &analyzer{
-					interval:   plannerAnalyzeInterval(options.AnalyzeInterval),
-					softBudget: defaultAnalyzeSoftBudget,
-				},
-				tracer: &tracer{
-					sink:        options.TraceSink,
-					sampleEvery: traceSampleEvery(options.TraceSampleEvery, options.TraceSink),
-				},
-				calibrator: &calibrator{
-					enabled:     options.CalibrationEnabled,
-					sampleEvery: calibrationSampleEvery(options.CalibrationEnabled, options.CalibrationSampleEvery),
-					persistPath: calPath,
-				},
-			},
-			viewPool: &pooled.Pointers[queryView]{
-				Clear: true,
-			},
-		}
-		if err = db.initIndexedFieldAccessors(); err != nil {
-			return nil, fmt.Errorf("failed to initialize field accessors: %w", err)
-		}
-		if err = db.initMeasureFieldAccessors(); err != nil {
-			return nil, fmt.Errorf("failed to initialize measure field accessors: %w", err)
-		}
-		db.engine.index = fieldIndexStorageSlicePool.Get()
-		db.engine.index.SetLen(len(db.engine.indexedFieldAccess))
-		db.engine.nilIndex = fieldIndexStorageSlicePool.Get()
-		db.engine.nilIndex.SetLen(len(db.engine.indexedFieldAccess))
-		db.engine.lenIndex = fieldIndexStorageSlicePool.Get()
-		db.engine.lenIndex.SetLen(len(db.engine.indexedFieldAccess))
-		db.engine.lenZeroComplement = pools.GetBoolSlice(len(db.engine.indexedFieldAccess))[:len(db.engine.indexedFieldAccess)]
-		clear(db.engine.lenZeroComplement)
-		db.engine.measure = measureFieldStorageSlicePool.Get()
-		db.engine.measure.SetLen(len(db.engine.measureFieldAccess))
-	}
-
-	db.initBatcher()
 
 	err = bolt.Update(func(tx *bbolt.Tx) error {
 		_, e := tx.CreateBucketIfNotExists(db.bucket)
@@ -533,10 +475,11 @@ func New[K ~uint64 | ~string, V any](bolt *bbolt.DB, options Options, execOpts .
 	}
 
 	db.patchMap = make(map[string]*field)
-	if err = db.populatePatcher(vtype, nil); err != nil {
+	if err = populatePatcher(db.patchMap, vtype, nil); err != nil {
 		return nil, fmt.Errorf("failed to populate patch fields: %w", err)
 	}
-	db.initPatchFieldAccessors()
+	db.patchFieldAccess, db.patchFieldOrdinal = initPatchFieldAccessors(vtype, db.patchMap, db.engine)
+	db.initBatcher()
 
 	if db.engine != nil {
 		db.stats.FieldCount = len(db.engine.fields) + len(db.engine.measureFields)
@@ -563,12 +506,81 @@ func New[K ~uint64 | ~string, V any](bolt *bbolt.DB, options Options, execOpts .
 	return db, nil
 }
 
-func (db *DB[K, V]) initIndexedFieldAccessors() error {
-	access, validationAccess, uniqueAccess, fieldMap, err := makeIndexedFieldAccessors(db.vtype, db.engine.fields)
-	db.engine.indexedFieldAccess = access
-	db.engine.indexedStringValidationAccess = validationAccess
-	db.engine.indexedFieldMap = fieldMap
-	db.engine.uniqueFieldAccessors = uniqueAccess
+func newQueryEngineForType(vtype reflect.Type, options *Options, strKey bool, calPath string) (*queryEngine, *strMapper, error) {
+	collector := fieldCollector{
+		options: options,
+	}
+	if err := collector.populateFields(vtype, nil); err != nil {
+		return nil, nil, fmt.Errorf("failed to populate index fields: %w", err)
+	}
+
+	if len(collector.indexFields) == 0 && len(collector.measureFields) == 0 {
+		return nil, nil, nil
+	}
+
+	var strMap *strMapper
+	if strKey {
+		strMap = newStrMapper(0, defaultSnapshotStrMapCompactDepth)
+	}
+
+	qe := &queryEngine{
+		fields:                         collector.indexFields,
+		measureFields:                  collector.measureFields,
+		hasUnique:                      collector.hasUnique,
+		universe:                       posting.List{},
+		matPredCacheMaxEntries:         max(0, options.SnapshotMaterializedPredCacheMaxEntries),
+		matPredCacheMaxCard:            materializedPredCacheMaxCardinality(options.SnapshotMaterializedPredCacheMaxCardinality),
+		numericRangeBucketSize:         options.NumericRangeBucketSize,
+		numericRangeBucketMinFieldKeys: options.NumericRangeBucketMinFieldKeys,
+		numericRangeBucketMinSpanKeys:  options.NumericRangeBucketMinSpanKeys,
+		snapshot: &snapshotManager{
+			bySeq:        make(map[uint64]*snapshotRef, 128),
+			statsEnabled: options.EnableSnapshotStats,
+		},
+		planner: &planner{
+			analyzer: &analyzer{
+				interval:   plannerAnalyzeInterval(options.AnalyzeInterval),
+				softBudget: defaultAnalyzeSoftBudget,
+			},
+			tracer: &tracer{
+				sink:        options.TraceSink,
+				sampleEvery: traceSampleEvery(options.TraceSampleEvery, options.TraceSink),
+			},
+			calibrator: &calibrator{
+				enabled:     options.CalibrationEnabled,
+				sampleEvery: calibrationSampleEvery(options.CalibrationEnabled, options.CalibrationSampleEvery),
+				persistPath: calPath,
+			},
+		},
+		viewPool: &pooled.Pointers[queryView]{
+			Clear: true,
+		},
+	}
+	if err := qe.initIndexedFieldAccessors(vtype); err != nil {
+		return nil, nil, fmt.Errorf("failed to initialize field accessors: %w", err)
+	}
+	if err := qe.initMeasureFieldAccessors(vtype); err != nil {
+		return nil, nil, fmt.Errorf("failed to initialize measure field accessors: %w", err)
+	}
+	qe.index = fieldIndexStorageSlicePool.Get()
+	qe.index.SetLen(len(qe.indexedFieldAccess))
+	qe.nilIndex = fieldIndexStorageSlicePool.Get()
+	qe.nilIndex.SetLen(len(qe.indexedFieldAccess))
+	qe.lenIndex = fieldIndexStorageSlicePool.Get()
+	qe.lenIndex.SetLen(len(qe.indexedFieldAccess))
+	qe.lenZeroComplement = pools.GetBoolSlice(len(qe.indexedFieldAccess))[:len(qe.indexedFieldAccess)]
+	clear(qe.lenZeroComplement)
+	qe.measure = measureFieldStorageSlicePool.Get()
+	qe.measure.SetLen(len(qe.measureFieldAccess))
+	return qe, strMap, nil
+}
+
+func (qe *queryEngine) initIndexedFieldAccessors(vtype reflect.Type) error {
+	access, validationAccess, uniqueAccess, fieldMap, err := makeIndexedFieldAccessors(vtype, qe.fields)
+	qe.indexedFieldAccess = access
+	qe.indexedStringValidationAccess = validationAccess
+	qe.indexedFieldMap = fieldMap
+	qe.uniqueFieldAccessors = uniqueAccess
 	return err
 }
 
@@ -607,22 +619,20 @@ func makeIndexedFieldAccessors(vtype reflect.Type, fields map[string]*field) (ac
 	return access, validationAccess, uniqueAccess, fieldMap, nil
 }
 
-func (db *DB[K, V]) initPatchFieldAccessors() {
-	access, ordinals := makePatchFieldAccessors(db.vtype, db.patchMap)
-	db.patchFieldAccess = access
-	db.patchFieldOrdinal = ordinals
-
-	if db.engine == nil {
-		return
+func initPatchFieldAccessors(vtype reflect.Type, patchMap map[string]*field, engine *queryEngine) ([]patchFieldAccessor, map[string]int) {
+	access, ordinals := makePatchFieldAccessors(vtype, patchMap)
+	if engine == nil {
+		return access, ordinals
 	}
-	for i := range db.engine.indexedFieldAccess {
-		ordinal, ok := db.patchFieldOrdinal[db.engine.indexedFieldAccess[i].field.Name]
+	for i := range engine.indexedFieldAccess {
+		ordinal, ok := ordinals[engine.indexedFieldAccess[i].field.Name]
 		if !ok {
-			db.engine.indexedFieldAccess[i].patchOrdinal = -1
+			engine.indexedFieldAccess[i].patchOrdinal = -1
 			continue
 		}
-		db.engine.indexedFieldAccess[i].patchOrdinal = ordinal
+		engine.indexedFieldAccess[i].patchOrdinal = ordinal
 	}
+	return access, ordinals
 }
 
 func makePatchFieldAccessors(vtype reflect.Type, fields map[string]*field) ([]patchFieldAccessor, map[string]int) {
@@ -652,81 +662,89 @@ func makePatchFieldAccessors(vtype reflect.Type, fields map[string]*field) ([]pa
 }
 
 func (db *DB[K, V]) initBatcher() {
-	maxOps := db.options.AutoBatchMax
-	window := db.options.AutoBatchWindow
-	if maxOps <= 1 || window <= 0 {
-		maxOps = 1
-		window = 0
+	runtime := &autoBatchRuntime{
+		bolt:               db.bolt,
+		bucket:             db.bucket,
+		bucketFillPercent:  db.options.BucketFillPercent,
+		strKey:             db.strKey,
+		strMap:             db.strMap,
+		engine:             db.engine,
+		patchMap:           db.patchMap,
+		testHookAccessor:   func() *testHooks { return db.testHooks },
+		broken:             &db.broken,
+		logger:             db.logger,
+		mu:                 &db.mu,
+		closed:             &db.closed,
+		rejectEmptyPayload: db.decodeFn == nil,
+		ops: autoBatchRecordOps{
+			encode: func(ptr unsafe.Pointer, buf *bytes.Buffer) error {
+				return db.encode((*V)(ptr), buf)
+			},
+			decode: func(data []byte) (unsafe.Pointer, error) {
+				val, err := db.decode(data)
+				if err != nil {
+					return nil, err
+				}
+				return unsafe.Pointer(val), nil
+			},
+			release: func(ptr unsafe.Pointer) {
+				db.ReleaseRecords((*V)(ptr))
+			},
+			applyPatch: func(ptr unsafe.Pointer, patch []Field, ignoreUnknown bool) error {
+				return db.applyPatch((*V)(ptr), patch, ignoreUnknown)
+			},
+			validateIndex: func(ptr unsafe.Pointer) error {
+				return db.validateIndexedStringValues((*V)(ptr))
+			},
+		},
 	}
-	maxQueue := db.options.AutoBatchMaxQueue
-	if maxQueue < 0 {
-		maxQueue = 0
-	}
-	capHint := max(64, maxOps*4)
-	if maxQueue > 0 && maxQueue < capHint {
-		capHint = maxQueue
-	}
-	db.autoBatcher = &autoBatcher[K, V]{
-		statsEnabled: db.options.EnableAutoBatchStats,
-		window:       window,
-		maxOps:       maxOps,
-		maxQ:         maxQueue,
-		waitNotify:   make(chan struct{}, 1),
-		queue:        make([]*autoBatchJob[K, V], capHint),
-		repeatIDPool: pooled.Maps[K, int]{
+	db.autoBatcher = newAutoBatcher(db.options, runtime)
+}
+
+func newAutoBatcher(options *Options, runtime *autoBatchRuntime) *autoBatcher {
+	ab := &autoBatcher{
+		autoBatchScheduler: newAutoBatchScheduler(options),
+		runtime:            runtime,
+		repeatUintIDPool: pooled.Maps[uint64, int]{
 			NewCap: 8,
 		},
-		requestScratchPool: pooled.Slices[*autoBatchRequest[K, V]]{
+		repeatStringIDPool: pooled.Maps[string, int]{
+			NewCap: 8,
+		},
+		setKeyScratchPool: pooled.Slices[autoBatchKey]{
 			Clear: true,
 		},
-		attemptStatePool: pooled.Pointers[autoBatchAttemptState[K, V]]{
-			Cleanup: func(st *autoBatchAttemptState[K, V]) {
-				for _, buf := range st.ownedPayloads {
-					if buf != nil {
-						encodePool.Put(buf)
-					}
-				}
-				clear(st.ownedPayloads)
-				st.ownedPayloads = st.ownedPayloads[:0]
+		requestScratchPool: pooled.Slices[*autoBatchRequest]{
+			Clear: true,
+		},
+		attemptStatePool: pooled.Pointers[autoBatchAttemptState]{
+			Cleanup: func(st *autoBatchAttemptState) {
+				st.autoBatchAttemptCore.cleanup()
 
 				clear(st.prepared)
 				st.prepared = st.prepared[:0]
 
-				clear(st.preparedSnapshots)
-				st.preparedSnapshots = st.preparedSnapshots[:0]
-
 				clear(st.accepted)
 				st.accepted = st.accepted[:0]
-
-				clear(st.acceptedSnapshots)
-				st.acceptedSnapshots = st.acceptedSnapshots[:0]
 
 				clear(st.states)
 				st.states = st.states[:0]
 
-				st.uniqueIdxs = st.uniqueIdxs[:0]
-
-				clear(st.uniqueOldVals)
-				st.uniqueOldVals = st.uniqueOldVals[:0]
-
-				clear(st.uniqueNewVals)
-				st.uniqueNewVals = st.uniqueNewVals[:0]
-
-				if st.stateByID != nil {
-					clear(st.stateByID)
+				if st.stateByUintID != nil {
+					clear(st.stateByUintID)
 				}
-				st.db = nil
-				st.bucket = nil
-				st.statsEnabled = false
+				if st.stateByStringID != nil {
+					clear(st.stateByStringID)
+				}
 			},
 		},
-		requestPool: pooled.Pointers[autoBatchRequest[K, V]]{
-			Init: func(req *autoBatchRequest[K, V]) {
+		requestPool: pooled.Pointers[autoBatchRequest]{
+			Init: func(req *autoBatchRequest) {
 				if req.done == nil {
 					req.done = make(chan error, 1)
 				}
 			},
-			Cleanup: func(req *autoBatchRequest[K, V]) {
+			Cleanup: func(req *autoBatchRequest) {
 				if req.setPayload != nil {
 					encodePool.Put(req.setPayload)
 					req.setPayload = nil
@@ -747,18 +765,44 @@ func (db *DB[K, V]) initBatcher() {
 				default:
 				}
 				req.op = 0
-				var zeroID K
-				req.id = zeroID
+				req.id = autoBatchKey{}
 				req.err = nil
 			},
 		},
-		jobPool: pooled.Pointers[autoBatchJob[K, V]]{
-			Init: func(job *autoBatchJob[K, V]) {
+	}
+	ab.cond = sync.NewCond(&ab.mu)
+	return ab
+}
+
+func newAutoBatchScheduler(options *Options) autoBatchScheduler {
+	maxOps := options.AutoBatchMax
+	window := options.AutoBatchWindow
+	if maxOps <= 1 || window <= 0 {
+		maxOps = 1
+		window = 0
+	}
+	maxQueue := options.AutoBatchMaxQueue
+	if maxQueue < 0 {
+		maxQueue = 0
+	}
+	capHint := max(64, maxOps*4)
+	if maxQueue > 0 && maxQueue < capHint {
+		capHint = maxQueue
+	}
+	return autoBatchScheduler{
+		statsEnabled: options.EnableAutoBatchStats,
+		window:       window,
+		maxOps:       maxOps,
+		maxQ:         maxQueue,
+		waitNotify:   make(chan struct{}, 1),
+		queue:        make([]*autoBatchJob, capHint),
+		jobPool: pooled.Pointers[autoBatchJob]{
+			Init: func(job *autoBatchJob) {
 				if job.done == nil {
 					job.done = make(chan error, 1)
 				}
 			},
-			Cleanup: func(job *autoBatchJob[K, V]) {
+			Cleanup: func(job *autoBatchJob) {
 				select {
 				case <-job.done:
 				default:
@@ -769,7 +813,6 @@ func (db *DB[K, V]) initBatcher() {
 			},
 		},
 	}
-	db.autoBatcher.cond = sync.NewCond(&db.autoBatcher.mu)
 }
 
 type planner struct {
@@ -836,28 +879,25 @@ type patchFieldAccessor struct {
 	copyValue  patchValueCopyFn
 }
 
-type autoBatcher[K ~string | ~uint64, V any] struct {
+type autoBatchScheduler struct {
 	statsEnabled bool
 	window       time.Duration
 	maxOps       int
 	maxQ         int
 
-	mu                 sync.Mutex
-	cond               *sync.Cond
-	waitNotify         chan struct{}
-	waitTimer          *time.Timer
-	running            bool
-	queue              []*autoBatchJob[K, V]
-	queueHead          int
-	queueSize          int
-	batchScratch       []*autoBatchJob[K, V]
-	repeatIDPool       pooled.Maps[K, int]
-	requestScratchPool pooled.Slices[*autoBatchRequest[K, V]]
-	attemptStatePool   pooled.Pointers[autoBatchAttemptState[K, V]]
-	requestPool        pooled.Pointers[autoBatchRequest[K, V]]
-	jobPool            pooled.Pointers[autoBatchJob[K, V]]
-	hotUntil           time.Time
-	hotBatchSize       int
+	queue        []*autoBatchJob
+	batchScratch []*autoBatchJob
+	jobPool      pooled.Pointers[autoBatchJob]
+
+	mu           sync.Mutex
+	cond         *sync.Cond
+	waitNotify   chan struct{}
+	waitTimer    *time.Timer
+	running      bool
+	queueHead    int
+	queueSize    int
+	hotUntil     time.Time
+	hotBatchSize int
 
 	submitted          atomic.Uint64
 	enqueued           atomic.Uint64
@@ -885,6 +925,18 @@ type autoBatcher[K ~string | ~uint64, V any] struct {
 	txOpErrors     atomic.Uint64
 	txCommitErrors atomic.Uint64
 	callbackErrors atomic.Uint64
+}
+
+type autoBatcher struct {
+	autoBatchScheduler
+
+	runtime            *autoBatchRuntime
+	repeatUintIDPool   pooled.Maps[uint64, int]
+	repeatStringIDPool pooled.Maps[string, int]
+	setKeyScratchPool  pooled.Slices[autoBatchKey]
+	requestScratchPool pooled.Slices[*autoBatchRequest]
+	attemptStatePool   pooled.Pointers[autoBatchAttemptState]
+	requestPool        pooled.Pointers[autoBatchRequest]
 }
 
 type rebuilder struct {
@@ -928,7 +980,7 @@ type (
 		closed atomic.Bool
 		broken atomic.Bool
 
-		autoBatcher *autoBatcher[K, V]
+		autoBatcher *autoBatcher
 
 		execOptions execOptions[K, V]
 
@@ -1338,24 +1390,25 @@ func (qe *queryEngine) publishCurrentSequenceSnapshotNoLock(bolt *bbolt.DB, buck
 	return nil
 }
 
-func (db *DB[K, V]) tripBrokenLocked(op string, cause any) error {
-	if db.broken.CompareAndSwap(false, true) {
-		db.logger.Printf("rbi: index entered broken state: post-commit snapshot publish failed (%v): %v", op, cause)
-		if stop := db.engine.planner.analyzer.stop; stop != nil {
-			select {
-			case <-stop:
-			default:
-				close(stop)
+func publishAfterCommitLocked(testHooks *testHooks, broken *atomic.Bool, logger *log.Logger, engine *queryEngine, seq uint64, op string, publish func()) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			if broken.CompareAndSwap(false, true) {
+				logger.Printf("rbi: index entered broken state: post-commit snapshot publish failed (%v): %v", op, r)
+				if stop := engine.planner.analyzer.stop; stop != nil {
+					select {
+					case <-stop:
+					default:
+						close(stop)
+					}
+				}
 			}
+			err = ErrBroken
+			engine.snapshot.dropStaged(seq)
 		}
-	}
-	return ErrBroken
-}
-
-func (db *DB[K, V]) publishAfterCommitLocked(seq uint64, op string, publish func()) (err error) {
-	defer recoverPublishAfterCommit(db, seq, op, &err)
-	if db.testHooks != nil {
-		if hook := db.testHooks.afterCommitPublish; hook != nil {
+	}()
+	if testHooks != nil {
+		if hook := testHooks.afterCommitPublish; hook != nil {
 			hook(op)
 		}
 	}
@@ -1363,9 +1416,9 @@ func (db *DB[K, V]) publishAfterCommitLocked(seq uint64, op string, publish func
 	return nil
 }
 
-func (db *DB[K, V]) commit(tx *bbolt.Tx, op string) error {
-	if db.testHooks != nil {
-		if hook := db.testHooks.beforeCommit; hook != nil {
+func commitTx(tx *bbolt.Tx, op string, testHooks *testHooks) error {
+	if testHooks != nil {
+		if hook := testHooks.beforeCommit; hook != nil {
 			if err := hook(op); err != nil {
 				return err
 			}
@@ -1562,13 +1615,6 @@ func unregInstanceOnError(err *error, boltPath string, vname string) {
 	}
 }
 
-func recoverPublishAfterCommit[K ~string | ~uint64, V any](db *DB[K, V], seq uint64, op string, err *error) {
-	if r := recover(); r != nil {
-		*err = db.tripBrokenLocked(op, r)
-		db.engine.snapshot.dropStaged(seq)
-	}
-}
-
 type fieldIndexStats struct {
 	unique             uint64
 	postingBytes       uint64
@@ -1685,47 +1731,51 @@ func approxSliceBufBytes[T any](buf *pooled.Slice[T]) uint64 {
 // batching remains active in both modes, so when stats collection is enabled
 // the returned counters and queue state reflect the current write workload.
 func (db *DB[K, V]) AutoBatchStats() AutoBatchStats {
-	if !db.autoBatcher.statsEnabled {
+	return db.autoBatcher.autoBatchScheduler.snapshotStats()
+}
+
+func (ab *autoBatchScheduler) snapshotStats() AutoBatchStats {
+	if !ab.statsEnabled {
 		return AutoBatchStats{}
 	}
 	out := AutoBatchStats{
-		Window:              db.autoBatcher.window,
-		MaxBatch:            db.autoBatcher.maxOps,
-		MaxQueue:            db.autoBatcher.maxQ,
-		Submitted:           db.autoBatcher.submitted.Load(),
-		Enqueued:            db.autoBatcher.enqueued.Load(),
-		Dequeued:            db.autoBatcher.dequeued.Load(),
-		QueueHighWater:      db.autoBatcher.queueHighWater.Load(),
-		ExecutedBatches:     db.autoBatcher.executedBatches.Load(),
-		MultiRequestBatches: db.autoBatcher.multiReqBatches.Load(),
-		MultiRequestOps:     db.autoBatcher.multiReqOps.Load(),
-		BatchSize1:          db.autoBatcher.batchSize1.Load(),
-		BatchSize2To4:       db.autoBatcher.batchSize2To4.Load(),
-		BatchSize5To8:       db.autoBatcher.batchSize5To8.Load(),
-		BatchSize9Plus:      db.autoBatcher.batchSize9Plus.Load(),
-		MaxBatchSeen:        db.autoBatcher.maxBatchSeen.Load(),
-		CallbackOps:         db.autoBatcher.callbackOps.Load(),
-		CoalescedSetDelete:  db.autoBatcher.coalescedSetDelete.Load(),
-		CoalesceWaits:       db.autoBatcher.coalesceWaits.Load(),
-		CoalesceWaitTime:    time.Duration(db.autoBatcher.coalesceWaitNanos.Load()),
-		QueueWaitTime:       time.Duration(db.autoBatcher.queueWaitNanos.Load()),
-		ExecuteTime:         time.Duration(db.autoBatcher.executeNanos.Load()),
-		FallbackClosed:      db.autoBatcher.fallbackClosed.Load(),
-		UniqueRejected:      db.autoBatcher.uniqueRejected.Load(),
-		TxBeginErrors:       db.autoBatcher.txBeginErrors.Load(),
-		TxOpErrors:          db.autoBatcher.txOpErrors.Load(),
-		TxCommitErrors:      db.autoBatcher.txCommitErrors.Load(),
-		CallbackErrors:      db.autoBatcher.callbackErrors.Load(),
+		Window:              ab.window,
+		MaxBatch:            ab.maxOps,
+		MaxQueue:            ab.maxQ,
+		Submitted:           ab.submitted.Load(),
+		Enqueued:            ab.enqueued.Load(),
+		Dequeued:            ab.dequeued.Load(),
+		QueueHighWater:      ab.queueHighWater.Load(),
+		ExecutedBatches:     ab.executedBatches.Load(),
+		MultiRequestBatches: ab.multiReqBatches.Load(),
+		MultiRequestOps:     ab.multiReqOps.Load(),
+		BatchSize1:          ab.batchSize1.Load(),
+		BatchSize2To4:       ab.batchSize2To4.Load(),
+		BatchSize5To8:       ab.batchSize5To8.Load(),
+		BatchSize9Plus:      ab.batchSize9Plus.Load(),
+		MaxBatchSeen:        ab.maxBatchSeen.Load(),
+		CallbackOps:         ab.callbackOps.Load(),
+		CoalescedSetDelete:  ab.coalescedSetDelete.Load(),
+		CoalesceWaits:       ab.coalesceWaits.Load(),
+		CoalesceWaitTime:    time.Duration(ab.coalesceWaitNanos.Load()),
+		QueueWaitTime:       time.Duration(ab.queueWaitNanos.Load()),
+		ExecuteTime:         time.Duration(ab.executeNanos.Load()),
+		FallbackClosed:      ab.fallbackClosed.Load(),
+		UniqueRejected:      ab.uniqueRejected.Load(),
+		TxBeginErrors:       ab.txBeginErrors.Load(),
+		TxOpErrors:          ab.txOpErrors.Load(),
+		TxCommitErrors:      ab.txCommitErrors.Load(),
+		CallbackErrors:      ab.callbackErrors.Load(),
 	}
 
-	db.autoBatcher.mu.Lock()
-	out.QueueLen = db.autoBatcher.queueSize
-	out.QueueCap = cap(db.autoBatcher.queue)
-	out.WorkerRunning = db.autoBatcher.running
-	out.HotWindowActive = db.autoBatcher.window > 0 &&
-		time.Now().Before(db.autoBatcher.hotUntil) &&
-		(db.autoBatcher.hotBatchSize == 0 || db.autoBatcher.hotBatchSize >= 3)
-	db.autoBatcher.mu.Unlock()
+	ab.mu.Lock()
+	out.QueueLen = ab.queueSize
+	out.QueueCap = cap(ab.queue)
+	out.WorkerRunning = ab.running
+	out.HotWindowActive = ab.window > 0 &&
+		time.Now().Before(ab.hotUntil) &&
+		(ab.hotBatchSize == 0 || ab.hotBatchSize >= 3)
+	ab.mu.Unlock()
 
 	if out.ExecutedBatches > 0 {
 		out.AvgBatchSize = float64(out.Dequeued) / float64(out.ExecutedBatches)
@@ -1890,7 +1940,7 @@ func (db *DB[K, V]) Truncate() error {
 		if _, err = bucket.NextSequence(); err != nil {
 			return fmt.Errorf("advance bucket sequence: %w", err)
 		}
-		if err = db.commit(tx, "truncate"); err != nil {
+		if err = commitTx(tx, "truncate", db.testHooks); err != nil {
 			return fmt.Errorf("commit error: %w", err)
 		}
 		return nil
@@ -1928,7 +1978,7 @@ func (db *DB[K, V]) Truncate() error {
 	}
 	db.engine.initSnapshotRuntimeCaches(snap)
 	db.engine.snapshot.stage(snap)
-	if err = db.commit(tx, "truncate"); err != nil {
+	if err = commitTx(tx, "truncate", db.testHooks); err != nil {
 		db.engine.snapshot.dropStaged(seq)
 		return fmt.Errorf("commit error: %w", err)
 	}
@@ -1944,7 +1994,7 @@ func (db *DB[K, V]) Truncate() error {
 
 	// Keep previously published snapshots immutable for concurrent readers.
 	db.engine.universe = nextUniverse
-	if err = db.publishAfterCommitLocked(seq, "truncate", func() {
+	if err = publishAfterCommitLocked(db.testHooks, &db.broken, db.logger, db.engine, seq, "truncate", func() {
 		db.engine.finishSnapshotPublishNoLock(snap)
 		if db.strMap != nil {
 			db.strMap.markCommittedPublished(snap.strmap)

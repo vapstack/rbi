@@ -5,8 +5,11 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"log"
 	"math/bits"
 	"slices"
+	"strconv"
+	"sync"
 	"sync/atomic"
 	"time"
 	"unsafe"
@@ -14,44 +17,6 @@ import (
 	"github.com/vapstack/rbi/internal/pooled"
 	"go.etcd.io/bbolt"
 )
-
-/*
-
-Auto-batcher execution model:
-
-- Public Set/Patch/Delete and explicit Batch* writes are first translated into
-  autoBatchRequest objects by build*AutoBatchRequest.
-- Single-request jobs may be merged into one shared write transaction when
-  repeated IDs are compatible. Set/Delete jobs without hooks may also be
-  coalesced in queue order; superseded requests point to the terminal request
-  via replacedBy and inherit its final error.
-- Isolated jobs and explicit multi-request jobs run as atomic batches. Shared
-  jobs run in a retry loop that can drop one failed request and commit the rest.
-
-Request / job / attempt ownership:
-
-- autoBatchRequest is the user-operation carrier. Builder phase initializes its
-  immutable input state and eager queue policy. Execution only mutates err and
-  replacedBy.
-- req.done is the completion surface for direct executeAutoBatch paths.
-- job.done is the completion surface for queued submitAutoBatchRequests paths.
-- autoBatchAttemptState is per-transaction scratch. It owns prepared/accepted
-  ops, per-ID runtime state, unique-check scratch, and any transient encoded
-  payloads produced inside the attempt.
-- autoBatchState caches the current per-ID value within one attempt. Its
-  payload may borrow Bolt bytes or point to an attempt-owned re-encoded buffer.
-
-Memory / hot-path rules:
-
-- Steady-state hot paths rely on pooled request, job, request-scratch, and
-  attempt-state objects. Heap growth is expected only from encode/decode work
-  and capacity growth on new high-water marks.
-- Pool configurations own canonical cleanup of pooled request/job/scratch/
-  attempt objects before they return to the pool.
-- Call sites must perform any per-use initialization explicitly after Get and
-  before Put. Pools only manage storage reuse and canonical cleanup.
-
-*/
 
 type autoBatchOp uint8
 
@@ -81,49 +46,155 @@ const (
 	autoBatchReqSetDeleteCoalescible
 )
 
-type autoBatchRequest[K ~string | ~uint64, V any] struct {
-	op autoBatchOp
-	id K
+type autoBatchKey struct {
+	s string
+	u uint64
+}
 
-	setValue    *V
-	setBaseline *V
+func autoBatchKeyFromIDWithKind[K ~string | ~uint64](id K, strKey bool) autoBatchKey {
+	if strKey {
+		return autoBatchKey{s: *(*string)(unsafe.Pointer(&id))}
+	}
+	return autoBatchKey{u: *(*uint64)(unsafe.Pointer(&id))}
+}
+
+var (
+	errAutoBatchEmptyPayload = errors.New("empty msgpack payload")
+	errAutoBatchUnknownOp    = errors.New("unknown auto-batch op")
+	errAutoBatchCloneNil     = errors.New("clone returned nil")
+)
+
+type autoBatchPrepareErr uint8
+
+const (
+	autoBatchPrepareErrDecode autoBatchPrepareErr = iota + 1
+	autoBatchPrepareErrDecodePreparedValue
+	autoBatchPrepareErrDecodeExistingValue
+	autoBatchPrepareErrRedecodeEmpty
+	autoBatchPrepareErrRedecodeValue
+	autoBatchPrepareErrApplyPatch
+	autoBatchPrepareErrEncode
+)
+
+func formatAutoBatchPrepareErr(kind autoBatchPrepareErr, err error) error {
+	switch kind {
+	case autoBatchPrepareErrDecode:
+		return fmt.Errorf("decode: %w", err)
+	case autoBatchPrepareErrDecodePreparedValue:
+		return fmt.Errorf("decode prepared value: %w", err)
+	case autoBatchPrepareErrDecodeExistingValue:
+		return fmt.Errorf("failed to decode existing value: %w", err)
+	case autoBatchPrepareErrRedecodeEmpty:
+		return errors.New("failed to re-decode value for patching: source payload is empty")
+	case autoBatchPrepareErrRedecodeValue:
+		return fmt.Errorf("failed to re-decode value for patching: %w", err)
+	case autoBatchPrepareErrApplyPatch:
+		return fmt.Errorf("failed to apply patch: %w", err)
+	case autoBatchPrepareErrEncode:
+		return fmt.Errorf("encode: %w", err)
+	default:
+		return err
+	}
+}
+
+type (
+	autoBatchBeforeProcessHook func(autoBatchKey, unsafe.Pointer) error
+	autoBatchBeforeStoreHook   func(autoBatchKey, unsafe.Pointer, unsafe.Pointer) error
+	autoBatchBeforeCommitHook  func(*bbolt.Tx, autoBatchKey, unsafe.Pointer, unsafe.Pointer) error
+	autoBatchCloneFunc         func(autoBatchKey, unsafe.Pointer) (unsafe.Pointer, error)
+)
+
+type autoBatchRecordOps struct {
+	encode        func(unsafe.Pointer, *bytes.Buffer) error
+	decode        func([]byte) (unsafe.Pointer, error)
+	release       func(unsafe.Pointer)
+	applyPatch    func(unsafe.Pointer, []Field, bool) error
+	validateIndex func(unsafe.Pointer) error
+}
+
+type autoBatchRuntime struct {
+	bolt               *bbolt.DB
+	bucket             []byte
+	bucketFillPercent  float64
+	strKey             bool
+	strMap             *strMapper
+	engine             *queryEngine
+	patchMap           map[string]*field
+	testHookAccessor   func() *testHooks
+	broken             *atomic.Bool
+	logger             *log.Logger
+	mu                 *sync.RWMutex
+	ops                autoBatchRecordOps
+	closed             *atomic.Bool
+	rejectEmptyPayload bool
+}
+
+func (rt *autoBatchRuntime) keyBytes(key autoBatchKey, buf *[8]byte) []byte {
+	if rt.strKey {
+		return unsafe.Slice(unsafe.StringData(key.s), len(key.s))
+	}
+	binary.BigEndian.PutUint64(buf[:], key.u)
+	return buf[:]
+}
+
+func (rt *autoBatchRuntime) keyFormat(key autoBatchKey) string {
+	if rt.strKey {
+		return key.s
+	}
+	return strconv.FormatUint(key.u, 10)
+}
+
+func (rt *autoBatchRuntime) keyString(key autoBatchKey) string {
+	return key.s
+}
+
+func (rt *autoBatchRuntime) keyUint(key autoBatchKey) uint64 {
+	return key.u
+}
+
+type autoBatchRequest struct {
+	op autoBatchOp
+	id autoBatchKey
+
+	setValue    unsafe.Pointer
+	setBaseline unsafe.Pointer
 	setPayload  *bytes.Buffer
 
 	patch []Field
 
 	patchIgnoreUnknown bool
 
-	beforeProcess []beforeProcessFunc[K, V]
-	beforeStore   []beforeStoreFunc[K, V]
-	beforeCommit  []beforeCommitFunc[K, V]
-	cloneValue    func(K, *V) *V
+	beforeProcess []autoBatchBeforeProcessHook
+	beforeStore   []autoBatchBeforeStoreHook
+	beforeCommit  []autoBatchBeforeCommitHook
+	cloneValue    autoBatchCloneFunc
 	policy        autoBatchReqPolicy
 
-	replacedBy *autoBatchRequest[K, V]
+	replacedBy *autoBatchRequest
 
 	err  error
 	done chan error
 }
 
-type autoBatchJob[K ~string | ~uint64, V any] struct {
-	reqs       *pooled.Slice[*autoBatchRequest[K, V]]
+type autoBatchJob struct {
+	reqs       *pooled.Slice[*autoBatchRequest]
 	isolated   bool
 	done       chan error
 	enqueuedAt int64
 }
 
-type autoBatchPrepared[K ~string | ~uint64, V any] struct {
-	req *autoBatchRequest[K, V]
+type autoBatchPrepared struct {
+	req *autoBatchRequest
 
 	key     []byte
 	payload []byte
 	idx     uint64
 	idxNew  bool
-	oldVal  *V
-	newVal  *V
+	oldVal  unsafe.Pointer
+	newVal  unsafe.Pointer
 }
 
-type autoBatchState[K ~string | ~uint64, V any] struct {
+type autoBatchState struct {
 	key    []byte
 	keyBuf [8]byte
 
@@ -131,84 +202,222 @@ type autoBatchState[K ~string | ~uint64, V any] struct {
 	idxKnown bool
 	idxNew   bool
 
-	value           *V
+	value           unsafe.Pointer
 	ownedPayload    *bytes.Buffer
 	borrowedPayload []byte
 }
 
-type autoBatchAttemptState[K ~string | ~uint64, V any] struct {
-	db           *DB[K, V]
+type autoBatchAttemptCore struct {
 	bucket       *bbolt.Bucket
 	statsEnabled bool
 
-	prepared          []autoBatchPrepared[K, V]
 	preparedSnapshots []snapshotBatchEntry
-	accepted          []autoBatchPrepared[K, V]
 	acceptedSnapshots []snapshotBatchEntry
 	ownedPayloads     []*bytes.Buffer
-
-	stateByID    map[K]int
-	stateByIDCap int
-	states       []autoBatchState[K, V]
 
 	uniqueIdxs    []uint64
 	uniqueOldVals []unsafe.Pointer
 	uniqueNewVals []unsafe.Pointer
 }
 
-func (req *autoBatchRequest[K, V]) payloadBytes() []byte {
+type autoBatchAttemptState struct {
+	autoBatchAttemptCore
+
+	prepared []autoBatchPrepared
+	accepted []autoBatchPrepared
+
+	stateByUintID      map[uint64]int
+	stateByUintIDCap   int
+	stateByStringID    map[string]int
+	stateByStringIDCap int
+	states             []autoBatchState
+}
+
+func (core *autoBatchAttemptCore) prepare(bucket *bbolt.Bucket, statsEnabled bool, capHint int, withSnapshots bool) {
+	core.bucket = bucket
+	core.statsEnabled = statsEnabled
+	if cap(core.ownedPayloads) < capHint {
+		core.ownedPayloads = slices.Grow(core.ownedPayloads, capHint)
+	}
+	if cap(core.uniqueIdxs) < capHint {
+		core.uniqueIdxs = slices.Grow(core.uniqueIdxs, capHint)
+	}
+	if cap(core.uniqueOldVals) < capHint {
+		core.uniqueOldVals = slices.Grow(core.uniqueOldVals, capHint)
+	}
+	if cap(core.uniqueNewVals) < capHint {
+		core.uniqueNewVals = slices.Grow(core.uniqueNewVals, capHint)
+	}
+	if withSnapshots {
+		if cap(core.preparedSnapshots) < capHint {
+			core.preparedSnapshots = slices.Grow(core.preparedSnapshots, capHint)
+		}
+		if cap(core.acceptedSnapshots) < capHint {
+			core.acceptedSnapshots = slices.Grow(core.acceptedSnapshots, capHint)
+		}
+	}
+}
+
+func (core *autoBatchAttemptCore) cleanup() {
+	for _, buf := range core.ownedPayloads {
+		encodePool.Put(buf)
+	}
+	clear(core.ownedPayloads)
+	core.ownedPayloads = core.ownedPayloads[:0]
+
+	clear(core.preparedSnapshots)
+	core.preparedSnapshots = core.preparedSnapshots[:0]
+
+	clear(core.acceptedSnapshots)
+	core.acceptedSnapshots = core.acceptedSnapshots[:0]
+
+	core.uniqueIdxs = core.uniqueIdxs[:0]
+
+	clear(core.uniqueOldVals)
+	core.uniqueOldVals = core.uniqueOldVals[:0]
+
+	clear(core.uniqueNewVals)
+	core.uniqueNewVals = core.uniqueNewVals[:0]
+
+	core.bucket = nil
+	core.statsEnabled = false
+}
+
+func (req *autoBatchRequest) payloadBytes() []byte {
 	if req.setPayload == nil {
 		return nil
 	}
 	return req.setPayload.Bytes()
 }
 
-func (req *autoBatchRequest[K, V]) hasPolicy(policy autoBatchReqPolicy) bool {
+func (req *autoBatchRequest) hasPolicy(policy autoBatchReqPolicy) bool {
 	return req.policy&policy != 0
 }
 
-func (req *autoBatchRequest[K, V]) canCoalesceSetDelete() bool {
+func (req *autoBatchRequest) canCoalesceSetDelete() bool {
 	return req.replacedBy == nil && req.hasPolicy(autoBatchReqSetDeleteCoalescible)
 }
 
-func (req *autoBatchRequest[K, V]) canShareRepeatedID() bool {
+func (req *autoBatchRequest) canShareRepeatedID() bool {
 	return req.replacedBy == nil && req.hasPolicy(autoBatchReqRepeatIDSafeShared)
 }
 
-func (st *autoBatchState[K, V]) payloadBytes() []byte {
+func (st *autoBatchState) payloadBytes() []byte {
 	if st.ownedPayload != nil {
 		return st.ownedPayload.Bytes()
 	}
 	return st.borrowedPayload
 }
 
-func (st *autoBatchState[K, V]) setOwnedPayload(buf *bytes.Buffer) {
+func (st *autoBatchState) setOwnedPayload(buf *bytes.Buffer) {
 	st.ownedPayload = buf
 	st.borrowedPayload = nil
 }
 
-func (st *autoBatchState[K, V]) setBorrowedPayload(payload []byte) {
+func (st *autoBatchState) setBorrowedPayload(payload []byte) {
 	st.ownedPayload = nil
 	st.borrowedPayload = payload
 }
 
-func (st *autoBatchState[K, V]) clearPayload() {
+func (st *autoBatchState) clearPayload() {
 	st.ownedPayload = nil
 	st.borrowedPayload = nil
 }
 
-func (st *autoBatchState[K, V]) setKeyFromID(db *DB[K, V], id K) {
-	if db.strKey {
-		s := *(*string)(unsafe.Pointer(&id))
-		st.key = unsafe.Slice(unsafe.StringData(s), len(s))
-		return
-	}
-	binary.BigEndian.PutUint64(st.keyBuf[:], *(*uint64)(unsafe.Pointer(&id)))
-	st.key = st.keyBuf[:]
+func (st *autoBatchState) setKey(rt *autoBatchRuntime, key autoBatchKey) {
+	st.key = rt.keyBytes(key, &st.keyBuf)
 }
 
-func (st *autoBatchAttemptState[K, V]) rollbackCreated(ops []autoBatchPrepared[K, V]) {
-	if !st.db.strKey {
+func (rt *autoBatchRuntime) unavailableErr() error {
+	if rt.closed.Load() {
+		return ErrClosed
+	}
+	if rt.broken.Load() {
+		return ErrBroken
+	}
+	return nil
+}
+
+func (rt *autoBatchRuntime) idxFromKeyWithCreated(key autoBatchKey) (uint64, bool) {
+	if rt.strKey {
+		s := rt.keyString(key)
+		rt.strMap.Lock()
+		if idx, ok := rt.strMap.Keys[s]; ok {
+			rt.strMap.Unlock()
+			return idx, false
+		}
+		idx := rt.strMap.createIdxNoLock(s)
+		rt.strMap.Unlock()
+		return idx, true
+	}
+	return rt.keyUint(key), false
+}
+
+func (rt *autoBatchRuntime) rollbackCreatedStrIdx(key autoBatchKey, idx uint64) {
+	if !rt.strKey || idx == 0 {
+		return
+	}
+
+	s := rt.keyString(key)
+	rt.strMap.Lock()
+	cur, ok := rt.strMap.Keys[s]
+	if !ok || cur != idx {
+		rt.strMap.Unlock()
+		return
+	}
+
+	delete(rt.strMap.Keys, s)
+	if rt.strMap.sparseStrs != nil {
+		delete(rt.strMap.sparseStrs, idx)
+	} else if idx <= uint64(^uint(0)>>1) {
+		i := int(idx)
+		if i < len(rt.strMap.Strs) {
+			rt.strMap.Strs[i] = ""
+		}
+		if i < len(rt.strMap.strsUsed) {
+			rt.strMap.strsUsed[i] = false
+		}
+	}
+
+	if idx <= rt.strMap.Next {
+		for rt.strMap.Next > 0 {
+			if rt.strMap.sparseStrs != nil {
+				if _, ok := rt.strMap.sparseStrs[rt.strMap.Next]; ok {
+					break
+				}
+				rt.strMap.Next--
+				continue
+			}
+			if rt.strMap.Next > uint64(^uint(0)>>1) {
+				rt.strMap.Next = 0
+				break
+			}
+			i := int(rt.strMap.Next)
+			if i < len(rt.strMap.strsUsed) && rt.strMap.strsUsed[i] {
+				break
+			}
+			rt.strMap.Next--
+		}
+
+		if rt.strMap.sparseStrs == nil {
+			trim := int(rt.strMap.Next) + 1
+			if trim < len(rt.strMap.Strs) {
+				clear(rt.strMap.Strs[trim:])
+				rt.strMap.Strs = rt.strMap.Strs[:trim]
+			}
+			if trim < len(rt.strMap.strsUsed) {
+				clear(rt.strMap.strsUsed[trim:])
+				rt.strMap.strsUsed = rt.strMap.strsUsed[:trim]
+			}
+		}
+	}
+
+	rt.strMap.restoreCommittedNoLock()
+	rt.strMap.Unlock()
+}
+
+func (rt *autoBatchRuntime) rollbackCreated(ops []autoBatchPrepared) {
+	if !rt.strKey {
 		return
 	}
 	for i := range ops {
@@ -216,21 +425,85 @@ func (st *autoBatchAttemptState[K, V]) rollbackCreated(ops []autoBatchPrepared[K
 		if !op.idxNew || op.oldVal != nil || op.newVal == nil {
 			continue
 		}
-		st.db.rollbackCreatedStrIdx(op.req.id, op.idx)
+		rt.rollbackCreatedStrIdx(op.req.id, op.idx)
 	}
 }
 
-func (st *autoBatchAttemptState[K, V]) loadState(req *autoBatchRequest[K, V]) (*autoBatchState[K, V], error) {
-	if pos, ok := st.stateByID[req.id]; ok {
+func (rt *autoBatchRuntime) patchTouchesUnique(patch []Field) bool {
+	if rt.engine == nil {
+		return false
+	}
+	for _, p := range patch {
+		f, ok := rt.patchMap[p.Name]
+		if !ok {
+			continue
+		}
+		if f.Unique {
+			return true
+		}
+		if f.DBName != "" {
+			if indexed, ok := rt.engine.fields[f.DBName]; ok && indexed.Unique {
+				return true
+			}
+		}
+		if indexed, ok := rt.engine.fields[f.Name]; ok && indexed.Unique {
+			return true
+		}
+	}
+	return false
+}
+
+func (rt *autoBatchRuntime) prepareAttemptStateMap(st *autoBatchAttemptState, capHint int) {
+	if rt.strKey {
+		switch {
+		case st.stateByStringID == nil:
+			st.stateByStringID = make(map[string]int, capHint)
+			st.stateByStringIDCap = capHint
+		case capHint > st.stateByStringIDCap:
+			st.stateByStringID = make(map[string]int, capHint)
+			st.stateByStringIDCap = capHint
+		}
+		return
+	}
+
+	switch {
+	case st.stateByUintID == nil:
+		st.stateByUintID = make(map[uint64]int, capHint)
+		st.stateByUintIDCap = capHint
+	case capHint > st.stateByUintIDCap:
+		st.stateByUintID = make(map[uint64]int, capHint)
+		st.stateByUintIDCap = capHint
+	}
+}
+
+func (rt *autoBatchRuntime) attemptStatePos(st *autoBatchAttemptState, key autoBatchKey) (int, bool) {
+	if rt.strKey {
+		pos, ok := st.stateByStringID[rt.keyString(key)]
+		return pos, ok
+	}
+	pos, ok := st.stateByUintID[rt.keyUint(key)]
+	return pos, ok
+}
+
+func (rt *autoBatchRuntime) setAttemptStatePos(st *autoBatchAttemptState, key autoBatchKey, pos int) {
+	if rt.strKey {
+		st.stateByStringID[rt.keyString(key)] = pos
+		return
+	}
+	st.stateByUintID[rt.keyUint(key)] = pos
+}
+
+func (st *autoBatchAttemptState) loadState(rt *autoBatchRuntime, req *autoBatchRequest) (*autoBatchState, error) {
+	if pos, ok := rt.attemptStatePos(st, req.id); ok {
 		return &st.states[pos], nil
 	}
 
 	pos := len(st.states)
-	st.states = append(st.states, autoBatchState[K, V]{})
+	st.states = append(st.states, autoBatchState{})
 	state := &st.states[pos]
-	state.setKeyFromID(st.db, req.id)
+	state.setKey(rt, req.id)
 	if prev := st.bucket.Get(state.key); prev != nil {
-		oldVal, err := st.db.decode(prev)
+		oldVal, err := rt.ops.decode(prev)
 		if err != nil {
 			st.states = st.states[:pos]
 			return nil, err
@@ -239,27 +512,27 @@ func (st *autoBatchAttemptState[K, V]) loadState(req *autoBatchRequest[K, V]) (*
 		state.setBorrowedPayload(prev)
 	}
 
-	st.stateByID[req.id] = pos
+	rt.setAttemptStatePos(st, req.id, pos)
 	return state, nil
 }
 
-func (st *autoBatchAttemptState[K, V]) ensureIdx(id K, state *autoBatchState[K, V], create bool) {
+func (st *autoBatchAttemptState) ensureIdx(rt *autoBatchRuntime, id autoBatchKey, state *autoBatchState, create bool) {
 	if state.idxKnown {
 		return
 	}
 	if create {
-		state.idx, state.idxNew = st.db.idxFromIDWithCreated(id)
+		state.idx, state.idxNew = rt.idxFromKeyWithCreated(id)
 	} else {
-		state.idx = st.db.idxFromID(id)
+		state.idx, _ = rt.idxFromKeyWithCreated(id)
 	}
 	state.idxKnown = true
 }
 
-func (ab *autoBatcher[K, V]) queueLen() int {
+func (ab *autoBatchScheduler) queueLen() int {
 	return ab.queueSize
 }
 
-func (ab *autoBatcher[K, V]) queueIndex(i int) int {
+func (ab *autoBatchScheduler) queueIndex(i int) int {
 	idx := ab.queueHead + i
 	if idx >= len(ab.queue) {
 		idx -= len(ab.queue)
@@ -267,11 +540,11 @@ func (ab *autoBatcher[K, V]) queueIndex(i int) int {
 	return idx
 }
 
-func (ab *autoBatcher[K, V]) queueAt(i int) *autoBatchJob[K, V] {
+func (ab *autoBatchScheduler) queueAt(i int) *autoBatchJob {
 	return ab.queue[ab.queueIndex(i)]
 }
 
-func (ab *autoBatcher[K, V]) growQueue() {
+func (ab *autoBatchScheduler) growQueue() {
 	newCap := len(ab.queue) * 2
 	if newCap < 64 {
 		newCap = 64
@@ -282,7 +555,7 @@ func (ab *autoBatcher[K, V]) growQueue() {
 	if newCap < ab.queueSize+1 {
 		newCap = ab.queueSize + 1
 	}
-	grown := make([]*autoBatchJob[K, V], newCap)
+	grown := make([]*autoBatchJob, newCap)
 	for i := 0; i < ab.queueSize; i++ {
 		grown[i] = ab.queueAt(i)
 	}
@@ -290,7 +563,7 @@ func (ab *autoBatcher[K, V]) growQueue() {
 	ab.queueHead = 0
 }
 
-func (ab *autoBatcher[K, V]) enqueue(job *autoBatchJob[K, V]) {
+func (ab *autoBatchScheduler) enqueue(job *autoBatchJob) {
 	if ab.queueSize == len(ab.queue) {
 		ab.growQueue()
 	}
@@ -302,7 +575,7 @@ func (ab *autoBatcher[K, V]) enqueue(job *autoBatchJob[K, V]) {
 	ab.queueSize++
 }
 
-func (ab *autoBatcher[K, V]) dequeueFrontScratch(n int) []*autoBatchJob[K, V] {
+func (ab *autoBatchScheduler) dequeueFrontScratch(n int) []*autoBatchJob {
 	batch := slices.Grow(ab.batchScratch, n)[:n]
 	for i := 0; i < n; i++ {
 		idx := ab.queueIndex(i)
@@ -321,7 +594,7 @@ func (ab *autoBatcher[K, V]) dequeueFrontScratch(n int) []*autoBatchJob[K, V] {
 	return batch
 }
 
-func runBeforeStoreHooks[K ~string | ~uint64, V any](id K, oldVal, newVal *V, hooks []beforeStoreFunc[K, V]) error {
+func runBeforeStoreHooks(id autoBatchKey, oldVal, newVal unsafe.Pointer, hooks []autoBatchBeforeStoreHook) error {
 	for _, fn := range hooks {
 		if err := fn(id, oldVal, newVal); err != nil {
 			return err
@@ -330,23 +603,13 @@ func runBeforeStoreHooks[K ~string | ~uint64, V any](id K, oldVal, newVal *V, ho
 	return nil
 }
 
-func runBeforeCommitHooks[K ~string | ~uint64, V any](tx *bbolt.Tx, id K, oldVal, newVal *V, hooks []beforeCommitFunc[K, V]) error {
+func runBeforeCommitHooks(tx *bbolt.Tx, id autoBatchKey, oldVal, newVal unsafe.Pointer, hooks []autoBatchBeforeCommitHook) error {
 	for _, fn := range hooks {
 		if err := fn(tx, id, oldVal, newVal); err != nil {
 			return err
 		}
 	}
 	return nil
-}
-
-func (db *DB[K, V]) rollbackCreatedStrIdxIfNeeded(op autoBatchPrepared[K, V]) {
-	if !db.strKey {
-		return
-	}
-	if !op.idxNew || op.oldVal != nil || op.newVal == nil {
-		return
-	}
-	db.rollbackCreatedStrIdx(op.req.id, op.idx)
 }
 
 func atomicSetMax(dst *atomic.Uint64, v uint64) {
@@ -361,40 +624,7 @@ func atomicSetMax(dst *atomic.Uint64, v uint64) {
 	}
 }
 
-func (db *DB[K, V]) autoBatchSetRequestPolicy(beforeStore []beforeStoreFunc[K, V], beforeCommit []beforeCommitFunc[K, V]) autoBatchReqPolicy {
-	var policy autoBatchReqPolicy
-	if len(beforeStore) == 0 && len(beforeCommit) == 0 {
-		policy |= autoBatchReqSetDeleteCoalescible
-	}
-	return policy
-}
-
-func (db *DB[K, V]) autoBatchPatchRequestPolicy(
-	patch []Field,
-	beforeProcess []beforeProcessFunc[K, V],
-	beforeStore []beforeStoreFunc[K, V],
-) autoBatchReqPolicy {
-	if db.engine == nil || !db.engine.hasUnique {
-		return autoBatchReqRepeatIDSafeShared
-	}
-	if len(beforeProcess) != 0 || len(beforeStore) != 0 {
-		return 0
-	}
-	if db.patchTouchesUnique(patch) {
-		return 0
-	}
-	return autoBatchReqRepeatIDSafeShared
-}
-
-func (db *DB[K, V]) autoBatchDeleteRequestPolicy(beforeCommit []beforeCommitFunc[K, V]) autoBatchReqPolicy {
-	policy := autoBatchReqRepeatIDSafeShared
-	if len(beforeCommit) == 0 {
-		policy |= autoBatchReqSetDeleteCoalescible
-	}
-	return policy
-}
-
-func assignAutoBatchPreparedErr[K ~string | ~uint64, V any](ops []autoBatchPrepared[K, V], err error) {
+func assignAutoBatchPreparedErr(ops []autoBatchPrepared, err error) {
 	for _, op := range ops {
 		if op.req.err == nil {
 			op.req.err = err
@@ -402,85 +632,52 @@ func assignAutoBatchPreparedErr[K ~string | ~uint64, V any](ops []autoBatchPrepa
 	}
 }
 
-func assignAutoBatchRequestErr[K ~string | ~uint64, V any](reqs *pooled.Slice[*autoBatchRequest[K, V]], err error) {
+func assignAutoBatchRequestErr(reqs *pooled.Slice[*autoBatchRequest], err error) {
 	for i := 0; i < reqs.Len(); i++ {
 		req := reqs.Get(i)
-		if req != nil && req.err == nil {
+		if req.err == nil {
 			req.err = err
 		}
 	}
 }
 
-func roundedAutoBatchHint(hint int) int {
-	if hint <= 8 {
-		return 8
-	}
-	return 1 << bits.Len(uint(hint-1))
-}
-
-func collectActiveAutoBatchRequests[K ~string | ~uint64, V any](active, batch *pooled.Slice[*autoBatchRequest[K, V]]) {
-	active.Truncate()
-	for i := 0; i < batch.Len(); i++ {
-		req := batch.Get(i)
-		if req.replacedBy == nil {
-			active.Append(req)
-		}
-	}
-}
-
-func removeAutoBatchRequest[K ~string | ~uint64, V any](active *pooled.Slice[*autoBatchRequest[K, V]], failed *autoBatchRequest[K, V]) bool {
-	write := 0
-	removed := false
-	for i := 0; i < active.Len(); i++ {
-		req := active.Get(i)
-		if !removed && req == failed {
-			removed = true
-			continue
-		}
-		if write != i {
-			active.Set(write, req)
-		}
-		write++
-	}
-	active.SetLen(write)
-	return removed
-}
-
-func (db *DB[K, V]) buildSetAutoBatchRequest(id K, newVal *V, beforeStore []beforeStoreFunc[K, V], beforeCommit []beforeCommitFunc[K, V], cloneValue func(K, *V) *V) (*autoBatchRequest[K, V], error) {
+func (db *DB[K, V]) buildSetAutoBatchRequest(key autoBatchKey, newVal *V, beforeStore []autoBatchBeforeStoreHook, beforeCommit []autoBatchBeforeCommitHook, cloneValue autoBatchCloneFunc) (*autoBatchRequest, error) {
 	if newVal == nil {
 		return nil, ErrNilValue
 	}
 
 	req := db.autoBatcher.requestPool.Get()
 	req.op = autoBatchSet
-	req.id = id
+	req.id = key
 	req.beforeStore = beforeStore
 	req.beforeCommit = beforeCommit
 	req.cloneValue = cloneValue
 	if len(beforeStore) > 0 && cloneValue != nil {
 		var err error
-		if req.setBaseline, err = cloneBeforeStoreValue(id, newVal, cloneValue); err != nil {
+		if req.setBaseline, err = cloneValue(req.id, unsafe.Pointer(newVal)); err != nil {
 			db.autoBatcher.requestPool.Put(req)
 			return nil, err
 		}
 	} else {
 		b := encodePool.Get()
-		if err := db.encode(newVal, b); err != nil {
+		if err := db.autoBatcher.runtime.ops.encode(unsafe.Pointer(newVal), b); err != nil {
 			encodePool.Put(b)
 			db.autoBatcher.requestPool.Put(req)
-			return nil, fmt.Errorf("encode: %w", err)
+			return nil, formatAutoBatchPrepareErr(autoBatchPrepareErrEncode, err)
 		}
-		req.setValue = newVal
+		req.setValue = unsafe.Pointer(newVal)
 		req.setPayload = b
 	}
-	req.policy = db.autoBatchSetRequestPolicy(beforeStore, beforeCommit)
+	if len(beforeStore) == 0 && len(beforeCommit) == 0 {
+		req.policy = autoBatchReqSetDeleteCoalescible
+	}
 	return req, nil
 }
 
-func (db *DB[K, V]) buildPatchAutoBatchRequest(id K, fields []Field, ignoreUnknown bool, beforeProcess []beforeProcessFunc[K, V], beforeStore []beforeStoreFunc[K, V], beforeCommit []beforeCommitFunc[K, V]) *autoBatchRequest[K, V] {
+func (db *DB[K, V]) buildPatchAutoBatchRequest(id K, fields []Field, ignoreUnknown bool, beforeProcess []autoBatchBeforeProcessHook, beforeStore []autoBatchBeforeStoreHook, beforeCommit []autoBatchBeforeCommitHook) *autoBatchRequest {
 	req := db.autoBatcher.requestPool.Get()
 	req.op = autoBatchPatch
-	req.id = id
+	req.id = autoBatchKeyFromIDWithKind(id, db.strKey)
 	if cap(req.patch) < len(fields) {
 		req.patch = slices.Grow(req.patch, len(fields))
 	}
@@ -490,116 +687,116 @@ func (db *DB[K, V]) buildPatchAutoBatchRequest(id K, fields []Field, ignoreUnkno
 	req.beforeProcess = beforeProcess
 	req.beforeStore = beforeStore
 	req.beforeCommit = beforeCommit
-	req.policy = db.autoBatchPatchRequestPolicy(fields, beforeProcess, beforeStore)
+	rt := db.autoBatcher.runtime
+	if rt.engine == nil || !rt.engine.hasUnique {
+		req.policy = autoBatchReqRepeatIDSafeShared
+	} else if len(beforeProcess) == 0 && len(beforeStore) == 0 && !rt.patchTouchesUnique(fields) {
+		req.policy = autoBatchReqRepeatIDSafeShared
+	}
 	return req
 }
 
-func (db *DB[K, V]) buildDeleteAutoBatchRequest(id K, beforeCommit []beforeCommitFunc[K, V]) *autoBatchRequest[K, V] {
+func (db *DB[K, V]) buildDeleteAutoBatchRequest(id K, beforeCommit []autoBatchBeforeCommitHook) *autoBatchRequest {
 	req := db.autoBatcher.requestPool.Get()
 	req.op = autoBatchDelete
-	req.id = id
+	req.id = autoBatchKeyFromIDWithKind(id, db.strKey)
 	req.beforeCommit = beforeCommit
-	req.policy = db.autoBatchDeleteRequestPolicy(beforeCommit)
+	req.policy = autoBatchReqRepeatIDSafeShared
+	if len(beforeCommit) == 0 {
+		req.policy |= autoBatchReqSetDeleteCoalescible
+	}
 	return req
 }
 
-func (db *DB[K, V]) submitAutoBatchRequests(reqs *pooled.Slice[*autoBatchRequest[K, V]], isolated bool) error {
+func (ab *autoBatcher) submitAutoBatchRequests(reqs *pooled.Slice[*autoBatchRequest], isolated bool) error {
 	if reqs.Len() == 0 {
 		return nil
 	}
 
-	stats := db.autoBatcher.statsEnabled
+	stats := ab.statsEnabled
 	if stats {
-		db.autoBatcher.submitted.Add(1)
+		ab.submitted.Add(1)
 	}
-	if err := db.unavailableErr(); err != nil {
+	if err := ab.runtime.unavailableErr(); err != nil {
 		for i := 0; i < reqs.Len(); i++ {
-			db.autoBatcher.requestPool.Put(reqs.Get(i))
+			ab.requestPool.Put(reqs.Get(i))
 		}
 		if stats {
-			db.autoBatcher.fallbackClosed.Add(1)
+			ab.fallbackClosed.Add(1)
 		}
 		return err
 	}
 
-	job := db.autoBatcher.jobPool.Get()
+	job := ab.jobPool.Get()
 	job.reqs = reqs
 	job.isolated = isolated || reqs.Len() != 1
 
-	db.autoBatcher.mu.Lock()
+	ab.mu.Lock()
 	for {
-		if err := db.unavailableErr(); err != nil {
-			db.autoBatcher.mu.Unlock()
+		if err := ab.runtime.unavailableErr(); err != nil {
+			ab.mu.Unlock()
 			for i := 0; i < reqs.Len(); i++ {
-				db.autoBatcher.requestPool.Put(reqs.Get(i))
+				ab.requestPool.Put(reqs.Get(i))
 			}
-			db.autoBatcher.jobPool.Put(job)
+			ab.jobPool.Put(job)
 			if stats {
-				db.autoBatcher.fallbackClosed.Add(1)
+				ab.fallbackClosed.Add(1)
 			}
 			return err
 		}
-		if !db.autoBatcher.running {
-			db.autoBatcher.running = true
-			go db.runAutoBatcherLoop()
+		if !ab.running {
+			ab.running = true
+			go ab.runAutoBatcherLoop()
 		}
-		if db.autoBatcher.maxQ <= 0 || db.autoBatcher.queueLen() < db.autoBatcher.maxQ {
+		if ab.maxQ <= 0 || ab.queueSize < ab.maxQ {
 			break
 		}
-		db.autoBatcher.cond.Wait()
+		ab.cond.Wait()
 	}
 
-	db.autoBatcher.enqueue(job)
+	ab.enqueue(job)
 	select {
-	case db.autoBatcher.waitNotify <- struct{}{}:
+	case ab.waitNotify <- struct{}{}:
 	default:
 	}
-	if stats {
+	if ab.statsEnabled {
 		job.enqueuedAt = time.Now().UnixNano()
-		db.autoBatcher.enqueued.Add(1)
-		atomicSetMax(&db.autoBatcher.queueHighWater, uint64(db.autoBatcher.queueLen()))
+		ab.enqueued.Add(1)
+		atomicSetMax(&ab.queueHighWater, uint64(ab.queueSize))
 	}
-	db.autoBatcher.mu.Unlock()
+	ab.mu.Unlock()
 
 	err := <-job.done
 	for i := 0; i < reqs.Len(); i++ {
-		db.autoBatcher.requestPool.Put(reqs.Get(i))
+		ab.requestPool.Put(reqs.Get(i))
 	}
-	db.autoBatcher.jobPool.Put(job)
+	ab.jobPool.Put(job)
 	return err
 }
 
-func (db *DB[K, V]) runAutoBatcherLoop() {
+func (ab *autoBatcher) runAutoBatcherLoop() {
 	for {
-		batch := db.popAutoBatch()
+		batch := ab.popAutoBatch()
 		if len(batch) == 0 {
 			return
 		}
-		if err := db.unavailableErr(); err != nil {
-			db.failAutoBatchJobs(batch, err)
+		if err := ab.runtime.unavailableErr(); err != nil {
+			ab.failAutoBatchJobs(batch, err)
 			clear(batch)
-			db.autoBatcher.mu.Lock()
-			if cap(batch) > cap(db.autoBatcher.batchScratch) {
-				db.autoBatcher.batchScratch = batch[:0]
-			} else if db.autoBatcher.batchScratch == nil {
-				db.autoBatcher.batchScratch = batch[:0]
-			}
-			db.autoBatcher.mu.Unlock()
+			ab.mu.Lock()
+			ab.recycleBatchScratchLocked(batch)
+			ab.mu.Unlock()
 			continue
 		}
-		db.executeAutoBatchJobs(batch)
+		ab.executeAutoBatchJobs(batch)
 		clear(batch)
-		db.autoBatcher.mu.Lock()
-		if cap(batch) > cap(db.autoBatcher.batchScratch) {
-			db.autoBatcher.batchScratch = batch[:0]
-		} else if db.autoBatcher.batchScratch == nil {
-			db.autoBatcher.batchScratch = batch[:0]
-		}
-		db.autoBatcher.mu.Unlock()
+		ab.mu.Lock()
+		ab.recycleBatchScratchLocked(batch)
+		ab.mu.Unlock()
 	}
 }
 
-func (ab *autoBatcher[K, V]) frontLimit() int {
+func (ab *autoBatchScheduler) frontLimit() int {
 	limit := min(ab.maxOps, ab.queueSize)
 	if limit <= 1 {
 		return limit
@@ -615,13 +812,13 @@ func (ab *autoBatcher[K, V]) frontLimit() int {
 	return limit
 }
 
-func autoBatchRepeatedIDCompatible[K ~string | ~uint64, V any](prev, req *autoBatchRequest[K, V]) bool {
+func autoBatchRepeatedIDCompatible(prev, req *autoBatchRequest) bool {
 	return (req.canCoalesceSetDelete() && prev.canCoalesceSetDelete()) ||
 		(req.canShareRepeatedID() && prev.canShareRepeatedID())
 }
 
-func (db *DB[K, V]) autoBatchWaitDurationLocked(frontLimit int) time.Duration {
-	if db.autoBatcher.window <= 0 || db.autoBatcher.queueLen() >= db.autoBatcher.maxOps {
+func (ab *autoBatchScheduler) waitDurationLocked(frontLimit int) time.Duration {
+	if ab.window <= 0 || ab.queueLen() >= ab.maxOps {
 		return 0
 	}
 
@@ -629,12 +826,12 @@ func (db *DB[K, V]) autoBatchWaitDurationLocked(frontLimit int) time.Duration {
 	switch {
 
 	case frontLimit > 1:
-		return db.autoBatcher.window
+		return ab.window
 
-	case db.autoBatcher.queueLen() == 1 &&
-		(db.autoBatcher.hotBatchSize == 0 || db.autoBatcher.hotBatchSize >= 3) &&
-		now.Before(db.autoBatcher.hotUntil):
-		waitDur := db.autoBatcher.window
+	case ab.queueLen() == 1 &&
+		(ab.hotBatchSize == 0 || ab.hotBatchSize >= 3) &&
+		now.Before(ab.hotUntil):
+		waitDur := ab.window
 		if waitDur > 50*time.Microsecond {
 			waitDur /= 2
 		}
@@ -645,212 +842,255 @@ func (db *DB[K, V]) autoBatchWaitDurationLocked(frontLimit int) time.Duration {
 	}
 }
 
-func (db *DB[K, V]) autoBatchRepeatedIDLimitLocked(limit int) int {
+func (ab *autoBatchScheduler) waitAutoBatchWindowLocked(frontLimit int) bool {
+	waitDur := ab.waitDurationLocked(frontLimit)
+	if waitDur <= 0 {
+		return true
+	}
+
+	start := time.Now()
+	ab.mu.Unlock()
+
+	if frontLimit > 1 {
+		time.Sleep(waitDur)
+	} else {
+		deadline := start.Add(waitDur)
+		timer := ab.waitTimer
+
+		for {
+			remaining := time.Until(deadline)
+			if remaining <= 0 {
+				break
+			}
+			if timer == nil {
+				timer = time.NewTimer(remaining)
+				ab.waitTimer = timer
+			} else {
+				timer.Reset(remaining)
+			}
+
+			select {
+			case <-timer.C:
+			case <-ab.waitNotify:
+			}
+			timer.Stop()
+
+			ab.mu.Lock()
+			if ab.queueSize == 0 {
+				if ab.statsEnabled {
+					ab.coalesceWaits.Add(1)
+					ab.coalesceWaitNanos.Add(uint64(time.Since(start)))
+				}
+				ab.running = false
+				ab.mu.Unlock()
+				return false
+			}
+			if ab.hotBatchSize > 0 && ab.queueSize >= ab.hotBatchSize {
+				ab.mu.Unlock()
+				break
+			}
+			ab.mu.Unlock()
+		}
+	}
+
+	if ab.statsEnabled {
+		ab.coalesceWaits.Add(1)
+		ab.coalesceWaitNanos.Add(uint64(time.Since(start)))
+	}
+	ab.mu.Lock()
+	if ab.queueSize == 0 {
+		ab.running = false
+		ab.mu.Unlock()
+		return false
+	}
+	return true
+}
+
+func (ab *autoBatchScheduler) updateHotAfterDequeueLocked(n int, now time.Time) {
+	if n > 1 {
+		keepHot := 4 * ab.window
+		if keepHot < 500*time.Microsecond {
+			keepHot = 500 * time.Microsecond
+		}
+		ab.hotUntil = now.Add(keepHot)
+		ab.hotBatchSize = n
+		return
+	}
+	ab.hotUntil = time.Time{}
+	ab.hotBatchSize = 0
+}
+
+func (ab *autoBatchScheduler) recordDequeuedStatsLocked(batch []*autoBatchJob, now time.Time) {
+	if !ab.statsEnabled {
+		return
+	}
+	nowUnix := now.UnixNano()
+	var queueWait uint64
+	for _, job := range batch {
+		if job.enqueuedAt == 0 || nowUnix <= job.enqueuedAt {
+			continue
+		}
+		queueWait += uint64(nowUnix - job.enqueuedAt)
+	}
+	ab.dequeued.Add(uint64(len(batch)))
+	ab.queueWaitNanos.Add(queueWait)
+}
+
+func (ab *autoBatchScheduler) recycleBatchScratchLocked(batch []*autoBatchJob) {
+	if cap(batch) > cap(ab.batchScratch) {
+		ab.batchScratch = batch[:0]
+	} else if ab.batchScratch == nil {
+		ab.batchScratch = batch[:0]
+	}
+}
+
+func (ab *autoBatcher) autoBatchRepeatedIDLimitLocked(limit int) int {
 	if limit <= 1 {
 		return limit
 	}
 
-	lastByID := db.autoBatcher.repeatIDPool.Get(limit)
-	for i := 0; i < limit; i++ {
-		req := db.autoBatcher.queueAt(i).reqs.Get(0)
+	if ab.runtime.strKey {
+		lastByID := ab.repeatStringIDPool.Get(limit)
+		for i := 0; i < limit; i++ {
+			req := ab.queueAt(i).reqs.Get(0)
+			id := ab.runtime.keyString(req.id)
 
-		prevIdx, seen := lastByID[req.id]
+			prevIdx, seen := lastByID[id]
+			if seen {
+				prev := ab.queueAt(prevIdx).reqs.Get(0)
+				if !autoBatchRepeatedIDCompatible(prev, req) {
+					limit = i
+					break
+				}
+			}
+			lastByID[id] = i
+		}
+		ab.repeatStringIDPool.Put(lastByID)
+		return limit
+	}
+
+	lastByID := ab.repeatUintIDPool.Get(limit)
+	for i := 0; i < limit; i++ {
+		req := ab.queueAt(i).reqs.Get(0)
+		id := ab.runtime.keyUint(req.id)
+
+		prevIdx, seen := lastByID[id]
 		if seen {
-			prev := db.autoBatcher.queueAt(prevIdx).reqs.Get(0)
+			prev := ab.queueAt(prevIdx).reqs.Get(0)
 			if !autoBatchRepeatedIDCompatible(prev, req) {
 				limit = i
 				break
 			}
 		}
-		lastByID[req.id] = i
+		lastByID[id] = i
 	}
-	db.autoBatcher.repeatIDPool.Put(lastByID)
+	ab.repeatUintIDPool.Put(lastByID)
 	return limit
 }
 
-func (db *DB[K, V]) popAutoBatch() []*autoBatchJob[K, V] {
-	stats := db.autoBatcher.statsEnabled
-
-	db.autoBatcher.mu.Lock()
-	if db.autoBatcher.queueLen() == 0 {
-		db.autoBatcher.running = false
-		db.autoBatcher.mu.Unlock()
+func (ab *autoBatcher) popAutoBatch() []*autoBatchJob {
+	ab.mu.Lock()
+	if ab.queueSize == 0 {
+		ab.running = false
+		ab.mu.Unlock()
 		return nil
 	}
 
-	frontLimit := db.autoBatcher.frontLimit()
-	waitDur := db.autoBatchWaitDurationLocked(frontLimit)
-
-	if waitDur > 0 {
-		start := time.Now()
-
-		db.autoBatcher.mu.Unlock()
-
-		if frontLimit > 1 {
-			time.Sleep(waitDur)
-
-		} else {
-			deadline := start.Add(waitDur)
-			timer := db.autoBatcher.waitTimer
-
-			for {
-				remaining := time.Until(deadline)
-				if remaining <= 0 {
-					break
-				}
-				if timer == nil {
-					timer = time.NewTimer(remaining)
-					db.autoBatcher.waitTimer = timer
-				} else {
-					timer.Reset(remaining)
-				}
-
-				select {
-				case <-timer.C:
-				case <-db.autoBatcher.waitNotify:
-				}
-				timer.Stop()
-
-				db.autoBatcher.mu.Lock()
-				if db.autoBatcher.queueLen() == 0 {
-					if stats {
-						db.autoBatcher.coalesceWaits.Add(1)
-						db.autoBatcher.coalesceWaitNanos.Add(uint64(time.Since(start)))
-					}
-					db.autoBatcher.running = false
-					db.autoBatcher.mu.Unlock()
-					return nil
-				}
-				if db.autoBatcher.hotBatchSize > 0 && db.autoBatcher.queueLen() >= db.autoBatcher.hotBatchSize {
-					db.autoBatcher.mu.Unlock()
-					break
-				}
-				db.autoBatcher.mu.Unlock()
-			}
-		}
-		if stats {
-			db.autoBatcher.coalesceWaits.Add(1)
-			db.autoBatcher.coalesceWaitNanos.Add(uint64(time.Since(start)))
-		}
-		db.autoBatcher.mu.Lock()
-		if db.autoBatcher.queueLen() == 0 {
-			db.autoBatcher.running = false
-			db.autoBatcher.mu.Unlock()
-			return nil
-		}
+	frontLimit := ab.frontLimit()
+	if !ab.waitAutoBatchWindowLocked(frontLimit) {
+		return nil
 	}
 
-	n := db.autoBatcher.frontLimit()
-	n = db.autoBatchRepeatedIDLimitLocked(n)
+	n := ab.frontLimit()
+	n = ab.autoBatchRepeatedIDLimitLocked(n)
 
-	batch := db.autoBatcher.dequeueFrontScratch(n)
+	batch := ab.dequeueFrontScratch(n)
 	now := time.Now()
-	if n > 1 {
-		keepHot := 4 * db.autoBatcher.window
-		if keepHot < 500*time.Microsecond {
-			keepHot = 500 * time.Microsecond
-		}
-		db.autoBatcher.hotUntil = now.Add(keepHot)
-		db.autoBatcher.hotBatchSize = n
-	} else {
-		db.autoBatcher.hotUntil = time.Time{}
-		db.autoBatcher.hotBatchSize = 0
-	}
+	ab.updateHotAfterDequeueLocked(n, now)
 	if len(batch) > 1 {
-		db.markSupersededSetDeleteJobs(batch)
+		ab.markSupersededSetDeleteJobs(batch)
 	}
-	if stats {
-		nowUnix := now.UnixNano()
-		var queueWait uint64
-		for _, job := range batch {
-			if job.enqueuedAt == 0 || nowUnix <= job.enqueuedAt {
-				continue
-			}
-			queueWait += uint64(nowUnix - job.enqueuedAt)
-		}
-		db.autoBatcher.dequeued.Add(uint64(len(batch)))
-		db.autoBatcher.queueWaitNanos.Add(queueWait)
+	ab.recordDequeuedStatsLocked(batch, now)
+	if ab.cond != nil {
+		ab.cond.Broadcast()
 	}
-	if db.autoBatcher.cond != nil {
-		db.autoBatcher.cond.Broadcast()
-	}
-	db.autoBatcher.mu.Unlock()
+	ab.mu.Unlock()
 	return batch
 }
 
-func (db *DB[K, V]) recordExecutedAutoBatchStats(size int) {
-	if !db.autoBatcher.statsEnabled {
+func (ab *autoBatchScheduler) recordExecutedStats(size int) {
+	if !ab.statsEnabled {
 		return
 	}
-	db.autoBatcher.executedBatches.Add(1)
+	ab.executedBatches.Add(1)
 	if size > 1 {
-		db.autoBatcher.multiReqBatches.Add(1)
-		db.autoBatcher.multiReqOps.Add(uint64(size))
+		ab.multiReqBatches.Add(1)
+		ab.multiReqOps.Add(uint64(size))
 	}
 	switch {
 	case size <= 1:
-		db.autoBatcher.batchSize1.Add(1)
+		ab.batchSize1.Add(1)
 	case size <= 4:
-		db.autoBatcher.batchSize2To4.Add(1)
+		ab.batchSize2To4.Add(1)
 	case size <= 8:
-		db.autoBatcher.batchSize5To8.Add(1)
+		ab.batchSize5To8.Add(1)
 	default:
-		db.autoBatcher.batchSize9Plus.Add(1)
+		ab.batchSize9Plus.Add(1)
 	}
-	atomicSetMax(&db.autoBatcher.maxBatchSeen, uint64(size))
+	atomicSetMax(&ab.maxBatchSeen, uint64(size))
 }
 
-func (db *DB[K, V]) patchTouchesUnique(patch []Field) bool {
-	if db.engine == nil {
-		return false
-	}
-	for _, p := range patch {
-		f, ok := db.patchMap[p.Name]
-		if !ok || f == nil {
-			continue
-		}
-		if f.Unique {
-			return true
-		}
-		if f.DBName != "" {
-			if indexed, ok := db.engine.fields[f.DBName]; ok && indexed.Unique {
-				return true
-			}
-		}
-		if indexed, ok := db.engine.fields[f.Name]; ok && indexed.Unique {
-			return true
-		}
-	}
-	return false
-}
-
-func (db *DB[K, V]) markSupersededSetDeleteJobs(batch []*autoBatchJob[K, V]) {
+func (ab *autoBatcher) markSupersededSetDeleteJobs(batch []*autoBatchJob) {
 	if len(batch) < 2 {
 		return
 	}
-	stats := db.autoBatcher.statsEnabled
+	stats := ab.statsEnabled
 
-	lastByID := db.autoBatcher.repeatIDPool.Get(len(batch))
+	if ab.runtime.strKey {
+		lastByID := ab.repeatStringIDPool.Get(len(batch))
+		for i := range batch {
+			req := batch[i].reqs.Get(0)
+			req.replacedBy = nil
+			id := ab.runtime.keyString(req.id)
+
+			prevIdx, seen := lastByID[id]
+			if seen && req.canCoalesceSetDelete() {
+				prev := batch[prevIdx].reqs.Get(0)
+				if prev.canCoalesceSetDelete() {
+					prev.replacedBy = req
+					if stats {
+						ab.coalescedSetDelete.Add(1)
+					}
+				}
+			}
+			lastByID[id] = i
+		}
+		ab.repeatStringIDPool.Put(lastByID)
+		return
+	}
+
+	lastByID := ab.repeatUintIDPool.Get(len(batch))
 	for i := range batch {
 		req := batch[i].reqs.Get(0)
 		req.replacedBy = nil
+		id := ab.runtime.keyUint(req.id)
 
-		prevIdx, seen := lastByID[req.id]
+		prevIdx, seen := lastByID[id]
 		if seen && req.canCoalesceSetDelete() {
 			prev := batch[prevIdx].reqs.Get(0)
 			if prev.canCoalesceSetDelete() {
 				prev.replacedBy = req
 				if stats {
-					db.autoBatcher.coalescedSetDelete.Add(1)
+					ab.coalescedSetDelete.Add(1)
 				}
 			}
 		}
-		lastByID[req.id] = i
+		lastByID[id] = i
 	}
-	db.autoBatcher.repeatIDPool.Put(lastByID)
+	ab.repeatUintIDPool.Put(lastByID)
 }
 
-func (db *DB[K, V]) prepareAutoBatchActive(att *autoBatchAttemptState[K, V], active *pooled.Slice[*autoBatchRequest[K, V]]) {
+func (ab *autoBatcher) prepareAutoBatchActive(att *autoBatchAttemptState, active *pooled.Slice[*autoBatchRequest]) {
 	for i := 0; i < active.Len(); i++ {
 		req := active.Get(i)
 		if req.err != nil {
@@ -859,19 +1099,20 @@ func (db *DB[K, V]) prepareAutoBatchActive(att *autoBatchAttemptState[K, V], act
 
 		switch req.op {
 		case autoBatchSet:
-			db.prepareAutoBatchSet(att, req)
+			ab.prepareAutoBatchSet(att, req)
 		case autoBatchPatch:
-			db.prepareAutoBatchPatch(att, req)
+			ab.prepareAutoBatchPatch(att, req)
 		case autoBatchDelete:
-			db.prepareAutoBatchDelete(att, req)
+			ab.prepareAutoBatchDelete(att, req)
 		}
 	}
 }
 
-func (db *DB[K, V]) prepareAutoBatchSet(att *autoBatchAttemptState[K, V], req *autoBatchRequest[K, V]) {
-	state, err := att.loadState(req)
+func (ab *autoBatcher) prepareAutoBatchSet(att *autoBatchAttemptState, req *autoBatchRequest) {
+	rt := ab.runtime
+	state, err := att.loadState(rt, req)
 	if err != nil {
-		req.err = fmt.Errorf("decode: %w", err)
+		req.err = formatAutoBatchPrepareErr(autoBatchPrepareErrDecode, err)
 		return
 	}
 
@@ -882,24 +1123,24 @@ func (db *DB[K, V]) prepareAutoBatchSet(att *autoBatchAttemptState[K, V], req *a
 	releaseDecodedNewVal := false
 	defer func() {
 		if releaseDecodedNewVal {
-			db.ReleaseRecords(newVal)
+			rt.ops.release(newVal)
 		}
 	}()
 
 	if len(req.beforeStore) > 0 {
 		if att.statsEnabled {
-			db.autoBatcher.callbackOps.Add(1)
+			ab.callbackOps.Add(1)
 		}
 		if req.cloneValue != nil {
-			newVal, err = cloneBeforeStoreValue(req.id, req.setBaseline, req.cloneValue)
+			newVal, err = req.cloneValue(req.id, req.setBaseline)
 			if err != nil {
 				req.err = err
 				return
 			}
 		} else {
-			newVal, err = db.decode(req.payloadBytes())
+			newVal, err = rt.ops.decode(req.payloadBytes())
 			if err != nil {
-				req.err = fmt.Errorf("decode prepared value: %w", err)
+				req.err = formatAutoBatchPrepareErr(autoBatchPrepareErrDecodePreparedValue, err)
 				return
 			}
 			releaseDecodedNewVal = true
@@ -907,20 +1148,20 @@ func (db *DB[K, V]) prepareAutoBatchSet(att *autoBatchAttemptState[K, V], req *a
 		if err = runBeforeStoreHooks(req.id, oldVal, newVal, req.beforeStore); err != nil {
 			req.err = err
 			if att.statsEnabled {
-				db.autoBatcher.callbackErrors.Add(1)
+				ab.callbackErrors.Add(1)
 			}
 			return
 		}
 
-		if err = db.validateIndexedStringValues(newVal); err != nil {
+		if err = rt.ops.validateIndex(newVal); err != nil {
 			req.err = err
 			return
 		}
 
 		buf := encodePool.Get()
-		if err = db.encode(newVal, buf); err != nil {
+		if err = rt.ops.encode(newVal, buf); err != nil {
 			encodePool.Put(buf)
-			req.err = fmt.Errorf("encode: %w", err)
+			req.err = formatAutoBatchPrepareErr(autoBatchPrepareErrEncode, err)
 			return
 		}
 		ownedPayload = buf
@@ -929,17 +1170,17 @@ func (db *DB[K, V]) prepareAutoBatchSet(att *autoBatchAttemptState[K, V], req *a
 	}
 
 	if len(req.beforeStore) == 0 {
-		if err = db.validateIndexedStringValues(newVal); err != nil {
+		if err = rt.ops.validateIndex(newVal); err != nil {
 			req.err = err
 			return
 		}
 	}
 
-	if db.engine != nil {
-		att.ensureIdx(req.id, state, true)
+	if rt.engine != nil {
+		att.ensureIdx(rt, req.id, state, true)
 	}
 
-	att.prepared = append(att.prepared, autoBatchPrepared[K, V]{
+	att.prepared = append(att.prepared, autoBatchPrepared{
 		req:     req,
 		key:     state.key,
 		payload: payload,
@@ -948,11 +1189,11 @@ func (db *DB[K, V]) prepareAutoBatchSet(att *autoBatchAttemptState[K, V], req *a
 		oldVal:  oldVal,
 		newVal:  newVal,
 	})
-	if db.engine != nil {
+	if rt.engine != nil {
 		att.preparedSnapshots = append(att.preparedSnapshots, snapshotBatchEntry{
 			idx:    state.idx,
-			oldVal: unsafe.Pointer(oldVal),
-			newVal: unsafe.Pointer(newVal),
+			oldVal: oldVal,
+			newVal: newVal,
 		})
 	}
 	state.value = newVal
@@ -964,34 +1205,35 @@ func (db *DB[K, V]) prepareAutoBatchSet(att *autoBatchAttemptState[K, V], req *a
 	}
 }
 
-func (db *DB[K, V]) prepareAutoBatchPatch(att *autoBatchAttemptState[K, V], req *autoBatchRequest[K, V]) {
-	state, err := att.loadState(req)
+func (ab *autoBatcher) prepareAutoBatchPatch(att *autoBatchAttemptState, req *autoBatchRequest) {
+	rt := ab.runtime
+	state, err := att.loadState(rt, req)
 	if err != nil {
-		req.err = fmt.Errorf("failed to decode existing value: %w", err)
+		req.err = formatAutoBatchPrepareErr(autoBatchPrepareErrDecodeExistingValue, err)
 		return
 	}
 	if state.value == nil {
 		return
 	}
 	if state.ownedPayload == nil && state.borrowedPayload == nil {
-		req.err = fmt.Errorf("failed to re-decode value for patching: source payload is empty")
+		req.err = formatAutoBatchPrepareErr(autoBatchPrepareErrRedecodeEmpty, nil)
 		return
 	}
 
 	oldVal := state.value
-	newVal, err := db.decode(state.payloadBytes())
+	newVal, err := rt.ops.decode(state.payloadBytes())
 	if err != nil {
-		req.err = fmt.Errorf("failed to re-decode value for patching: %w", err)
+		req.err = formatAutoBatchPrepareErr(autoBatchPrepareErrRedecodeValue, err)
 		return
 	}
 	releaseDecodedNewVal := true
 	defer func() {
 		if releaseDecodedNewVal {
-			db.ReleaseRecords(newVal)
+			rt.ops.release(newVal)
 		}
 	}()
-	if err = db.applyPatch(newVal, req.patch, req.patchIgnoreUnknown); err != nil {
-		req.err = fmt.Errorf("failed to apply patch: %w", err)
+	if err = rt.ops.applyPatch(newVal, req.patch, req.patchIgnoreUnknown); err != nil {
+		req.err = formatAutoBatchPrepareErr(autoBatchPrepareErrApplyPatch, err)
 		return
 	}
 	if len(req.beforeProcess) > 0 {
@@ -1002,35 +1244,35 @@ func (db *DB[K, V]) prepareAutoBatchPatch(att *autoBatchAttemptState[K, V], req 
 	}
 	if len(req.beforeStore) > 0 {
 		if att.statsEnabled {
-			db.autoBatcher.callbackOps.Add(1)
+			ab.callbackOps.Add(1)
 		}
 		if err = runBeforeStoreHooks(req.id, oldVal, newVal, req.beforeStore); err != nil {
 			req.err = err
 			if att.statsEnabled {
-				db.autoBatcher.callbackErrors.Add(1)
+				ab.callbackErrors.Add(1)
 			}
 			return
 		}
 	}
 
-	if err = db.validateIndexedStringValues(newVal); err != nil {
+	if err = rt.ops.validateIndex(newVal); err != nil {
 		req.err = err
 		return
 	}
 
 	buf := encodePool.Get()
-	if err = db.encode(newVal, buf); err != nil {
+	if err = rt.ops.encode(newVal, buf); err != nil {
 		encodePool.Put(buf)
-		req.err = fmt.Errorf("encode: %w", err)
+		req.err = formatAutoBatchPrepareErr(autoBatchPrepareErrEncode, err)
 		return
 	}
 	att.ownedPayloads = append(att.ownedPayloads, buf)
 
-	if db.engine != nil {
-		att.ensureIdx(req.id, state, false)
+	if rt.engine != nil {
+		att.ensureIdx(rt, req.id, state, false)
 	}
 
-	att.prepared = append(att.prepared, autoBatchPrepared[K, V]{
+	att.prepared = append(att.prepared, autoBatchPrepared{
 		req:     req,
 		key:     state.key,
 		payload: buf.Bytes(),
@@ -1039,11 +1281,11 @@ func (db *DB[K, V]) prepareAutoBatchPatch(att *autoBatchAttemptState[K, V], req 
 		oldVal:  oldVal,
 		newVal:  newVal,
 	})
-	if db.engine != nil {
+	if rt.engine != nil {
 		att.preparedSnapshots = append(att.preparedSnapshots, snapshotBatchEntry{
 			idx:       state.idx,
-			oldVal:    unsafe.Pointer(oldVal),
-			newVal:    unsafe.Pointer(newVal),
+			oldVal:    oldVal,
+			newVal:    newVal,
 			patch:     req.patch,
 			patchOnly: len(req.beforeProcess) == 0 && len(req.beforeStore) == 0,
 		})
@@ -1053,10 +1295,11 @@ func (db *DB[K, V]) prepareAutoBatchPatch(att *autoBatchAttemptState[K, V], req 
 	state.setOwnedPayload(buf)
 }
 
-func (db *DB[K, V]) prepareAutoBatchDelete(att *autoBatchAttemptState[K, V], req *autoBatchRequest[K, V]) {
-	state, err := att.loadState(req)
+func (ab *autoBatcher) prepareAutoBatchDelete(att *autoBatchAttemptState, req *autoBatchRequest) {
+	rt := ab.runtime
+	state, err := att.loadState(rt, req)
 	if err != nil {
-		req.err = fmt.Errorf("decode: %w", err)
+		req.err = formatAutoBatchPrepareErr(autoBatchPrepareErrDecode, err)
 		return
 	}
 	if state.value == nil {
@@ -1064,11 +1307,11 @@ func (db *DB[K, V]) prepareAutoBatchDelete(att *autoBatchAttemptState[K, V], req
 	}
 
 	oldVal := state.value
-	if db.engine != nil {
-		att.ensureIdx(req.id, state, false)
+	if rt.engine != nil {
+		att.ensureIdx(rt, req.id, state, false)
 	}
 
-	att.prepared = append(att.prepared, autoBatchPrepared[K, V]{
+	att.prepared = append(att.prepared, autoBatchPrepared{
 		req:    req,
 		key:    state.key,
 		idx:    state.idx,
@@ -1076,20 +1319,21 @@ func (db *DB[K, V]) prepareAutoBatchDelete(att *autoBatchAttemptState[K, V], req
 		oldVal: oldVal,
 		newVal: nil,
 	})
-	if db.engine != nil {
+	if rt.engine != nil {
 		att.preparedSnapshots = append(att.preparedSnapshots, snapshotBatchEntry{
 			idx:    state.idx,
-			oldVal: unsafe.Pointer(oldVal),
+			oldVal: oldVal,
 		})
 	}
 	state.value = nil
 	state.clearPayload()
 }
 
-func (db *DB[K, V]) filterAutoBatchAcceptedLocked(att *autoBatchAttemptState[K, V], atomicAll bool) error {
+func (ab *autoBatcher) filterAutoBatchAcceptedLocked(att *autoBatchAttemptState, atomicAll bool) error {
+	rt := ab.runtime
 	att.accepted = att.prepared
 	att.acceptedSnapshots = att.preparedSnapshots
-	if db.engine == nil || !db.engine.hasUnique {
+	if rt.engine == nil || !rt.engine.hasUnique {
 		return nil
 	}
 
@@ -1100,12 +1344,12 @@ func (db *DB[K, V]) filterAutoBatchAcceptedLocked(att *autoBatchAttemptState[K, 
 		for i := range att.prepared {
 			op := att.prepared[i]
 			att.uniqueIdxs[i] = op.idx
-			att.uniqueOldVals[i] = unsafe.Pointer(op.oldVal)
-			att.uniqueNewVals[i] = unsafe.Pointer(op.newVal)
+			att.uniqueOldVals[i] = op.oldVal
+			att.uniqueNewVals[i] = op.newVal
 		}
-		if err := db.engine.checkUniqueOnWriteMulti(att.uniqueIdxs, att.uniqueOldVals, att.uniqueNewVals); err != nil {
-			if att.statsEnabled {
-				db.autoBatcher.uniqueRejected.Add(1)
+		if err := rt.engine.checkUniqueOnWriteMulti(att.uniqueIdxs, att.uniqueOldVals, att.uniqueNewVals); err != nil {
+			if ab.statsEnabled {
+				ab.uniqueRejected.Add(1)
 			}
 			for _, op := range att.prepared {
 				op.req.err = err
@@ -1126,12 +1370,14 @@ func (db *DB[K, V]) filterAutoBatchAcceptedLocked(att *autoBatchAttemptState[K, 
 
 	for i := range att.prepared {
 		op := att.prepared[i]
-		if err := db.engine.checkUniqueBatchAppend(uniqueState, op.idx, unsafe.Pointer(op.oldVal), unsafe.Pointer(op.newVal)); err != nil {
-			op.req.err = err
-			if att.statsEnabled {
-				db.autoBatcher.uniqueRejected.Add(1)
+		if err := rt.engine.checkUniqueBatchAppend(uniqueState, op.idx, op.oldVal, op.newVal); err != nil {
+			if ab.statsEnabled {
+				ab.uniqueRejected.Add(1)
 			}
-			db.rollbackCreatedStrIdxIfNeeded(op)
+			op.req.err = err
+			if rt.strKey && op.idxNew && op.oldVal == nil && op.newVal != nil {
+				rt.rollbackCreatedStrIdx(op.req.id, op.idx)
+			}
 			continue
 		}
 		att.accepted = append(att.accepted, op)
@@ -1140,82 +1386,93 @@ func (db *DB[K, V]) filterAutoBatchAcceptedLocked(att *autoBatchAttemptState[K, 
 	return nil
 }
 
-func (db *DB[K, V]) applyAutoBatchAcceptedLocked(
+func formatAutoBatchBoltWriteErr(err error, op autoBatchOp, id string, idx uint64, key, payload []byte) error {
+	switch {
+	case errors.Is(err, errAutoBatchEmptyPayload):
+		return fmt.Errorf(
+			"invalid write payload op=%s id=%s idx=%d key_len=%d payload_len=0: empty msgpack payload",
+			autoBatchOpString(op),
+			id,
+			idx,
+			len(key),
+		)
+	case errors.Is(err, errAutoBatchUnknownOp):
+		return fmt.Errorf("unknown auto-batch op: %v", op)
+	case op == autoBatchSet || op == autoBatchPatch:
+		return fmt.Errorf(
+			"put op=%s id=%s idx=%d key_len=%d payload_len=%d payload_prefix_hex=%s: %w",
+			autoBatchOpString(op),
+			id,
+			idx,
+			len(key),
+			len(payload),
+			formatDiagnosticBytesPrefix(payload, 32),
+			err,
+		)
+	case op == autoBatchDelete:
+		return fmt.Errorf(
+			"delete op=%s id=%s idx=%d key_len=%d: %w",
+			autoBatchOpString(op),
+			id,
+			idx,
+			len(key),
+			err,
+		)
+	default:
+		return fmt.Errorf("unknown auto-batch op: %v", op)
+	}
+}
+
+func (ab *autoBatcher) applyAutoBatchAcceptedLocked(
 	tx *bbolt.Tx,
 	bucket *bbolt.Bucket,
-	accepted []autoBatchPrepared[K, V],
+	accepted []autoBatchPrepared,
 	atomicAll bool,
-) (*autoBatchRequest[K, V], error) {
-	stats := db.autoBatcher.statsEnabled
-	var callbackFailedReq *autoBatchRequest[K, V]
+) (*autoBatchRequest, error) {
+	stats := ab.statsEnabled
+	rejectEmptyPayload := ab.runtime.rejectEmptyPayload
+	var callbackFailedReq *autoBatchRequest
 
 acceptedLoop:
 	for _, op := range accepted {
 		var err error
 		switch op.req.op {
 		case autoBatchSet, autoBatchPatch:
-			if db.decodeFn == nil && len(op.payload) == 0 {
-				err = fmt.Errorf(
-					"invalid write payload op=%s id=%v idx=%d key_len=%d payload_len=0: empty msgpack payload",
-					autoBatchOpString(op.req.op),
-					op.req.id,
-					op.idx,
-					len(op.key),
-				)
-				op.req.err = err
-				if stats {
-					db.autoBatcher.txOpErrors.Add(1)
-				}
-				if !atomicAll {
-					callbackFailedReq = op.req
-					break acceptedLoop
-				}
-				return nil, err
-			}
-			err = bucket.Put(op.key, op.payload)
-			if err != nil {
-				err = fmt.Errorf(
-					"put op=%s id=%v idx=%d key_len=%d payload_len=%d payload_prefix_hex=%s: %w",
-					autoBatchOpString(op.req.op),
-					op.req.id,
-					op.idx,
-					len(op.key),
-					len(op.payload),
-					formatDiagnosticBytesPrefix(op.payload, 32),
-					err,
-				)
+			if rejectEmptyPayload && len(op.payload) == 0 {
+				err = errAutoBatchEmptyPayload
+			} else {
+				err = bucket.Put(op.key, op.payload)
 			}
 		case autoBatchDelete:
 			err = bucket.Delete(op.key)
-			if err != nil {
-				err = fmt.Errorf(
-					"delete op=%s id=%v idx=%d key_len=%d: %w",
-					autoBatchOpString(op.req.op),
-					op.req.id,
-					op.idx,
-					len(op.key),
-					err,
-				)
-			}
 		default:
-			err = fmt.Errorf("unknown auto-batch op: %v", op.req.op)
+			err = errAutoBatchUnknownOp
 		}
 		if err != nil {
+			rawErr := err
+			err = formatAutoBatchBoltWriteErr(err, op.req.op, ab.runtime.keyFormat(op.req.id), op.idx, op.key, op.payload)
+			if errors.Is(rawErr, errAutoBatchEmptyPayload) {
+				op.req.err = err
+			}
 			if stats {
-				db.autoBatcher.txOpErrors.Add(1)
+				ab.txOpErrors.Add(1)
+			}
+			if errors.Is(rawErr, errAutoBatchEmptyPayload) && !atomicAll {
+				callbackFailedReq = op.req
+				break acceptedLoop
 			}
 			return nil, err
 		}
 
 		if len(op.req.beforeCommit) > 0 {
 			if stats && len(op.req.beforeStore) == 0 {
-				db.autoBatcher.callbackOps.Add(1)
+				ab.callbackOps.Add(1)
 			}
 			if err = runBeforeCommitHooks(tx, op.req.id, op.oldVal, op.newVal, op.req.beforeCommit); err != nil {
 				err = fmt.Errorf(
-					"before_commit op=%s id=%v idx=%d key_len=%d payload_len=%d: %w",
+					"before_commit op=%s id=%s idx=%d key_len=%d payload_len=%d: %w",
 					autoBatchOpString(op.req.op),
-					op.req.id,
+					ab.runtime.keyFormat(op.req.id),
 					op.idx,
 					len(op.key),
 					len(op.payload),
@@ -1223,8 +1480,8 @@ acceptedLoop:
 				)
 				op.req.err = err
 				if stats {
-					db.autoBatcher.callbackErrors.Add(1)
-					db.autoBatcher.txOpErrors.Add(1)
+					ab.callbackErrors.Add(1)
+					ab.txOpErrors.Add(1)
 				}
 				if !atomicAll {
 					callbackFailedReq = op.req
@@ -1241,44 +1498,45 @@ acceptedLoop:
 	return nil, nil
 }
 
-func (db *DB[K, V]) executeAutoBatchJobs(batch []*autoBatchJob[K, V]) {
-	db.recordExecutedAutoBatchStats(len(batch))
-	stats := db.autoBatcher.statsEnabled
+func (ab *autoBatcher) executeAutoBatchJobs(batch []*autoBatchJob) {
+	ab.autoBatchScheduler.recordExecutedStats(len(batch))
+	stats := ab.statsEnabled
 	var started time.Time
 	if stats {
 		started = time.Now()
 	}
 
 	if len(batch) == 1 && batch[0].isolated {
-		db.runAutoBatchAtomic(batch[0].reqs)
-		db.finishAutoBatchJobs(batch)
+		ab.runAutoBatchAtomic(batch[0].reqs)
+		ab.finishAutoBatchJobs(batch)
 		if stats {
-			db.autoBatcher.executeNanos.Add(uint64(time.Since(started)))
+			ab.executeNanos.Add(uint64(time.Since(started)))
 		}
 		return
 	}
 
-	reqScratch := db.autoBatcher.requestScratchPool.Get()
+	reqScratch := ab.requestScratchPool.Get()
 	reqScratch.Grow(len(batch))
 
 	for _, job := range batch {
-		if job.reqs.Len() != 1 {
-			assignAutoBatchRequestErr(job.reqs, fmt.Errorf("internal auto-batch error: mixed grouped request in shared batch"))
+		reqs := job.reqs
+		if reqs.Len() != 1 {
+			assignAutoBatchRequestErr(reqs, fmt.Errorf("internal auto-batch error: mixed grouped request in shared batch"))
 			continue
 		}
-		reqScratch.Append(job.reqs.Get(0))
+		reqScratch.Append(reqs.Get(0))
 	}
 	if reqScratch.Len() != 0 {
-		db.runAutoBatchShared(reqScratch)
+		ab.runAutoBatchShared(reqScratch)
 	}
-	db.finishAutoBatchJobs(batch)
-	db.autoBatcher.requestScratchPool.Put(reqScratch)
+	ab.finishAutoBatchJobs(batch)
+	ab.requestScratchPool.Put(reqScratch)
 	if stats {
-		db.autoBatcher.executeNanos.Add(uint64(time.Since(started)))
+		ab.executeNanos.Add(uint64(time.Since(started)))
 	}
 }
 
-func resolveAutoBatchRequestErrs[K ~string | ~uint64, V any](batch *pooled.Slice[*autoBatchRequest[K, V]]) {
+func resolveAutoBatchRequestErrs(batch *pooled.Slice[*autoBatchRequest]) {
 	for i := 0; i < batch.Len(); i++ {
 		req := batch.Get(i)
 		if req.replacedBy == nil {
@@ -1292,54 +1550,57 @@ func resolveAutoBatchRequestErrs[K ~string | ~uint64, V any](batch *pooled.Slice
 	}
 }
 
-func autoBatchJobErr[K ~string | ~uint64, V any](job *autoBatchJob[K, V]) error {
-	if job.reqs.Len() == 1 {
-		return job.reqs.Get(0).err
-	}
-	return firstAutoBatchRequestErr(job.reqs)
-}
-
-func (db *DB[K, V]) finishAutoBatchJobs(batch []*autoBatchJob[K, V]) {
+func (ab *autoBatcher) finishAutoBatchJobs(batch []*autoBatchJob) {
 	for _, job := range batch {
 		resolveAutoBatchRequestErrs(job.reqs)
 	}
 	for _, job := range batch {
-		err := autoBatchJobErr(job)
+		var err error
+		if job.reqs.Len() == 1 {
+			err = job.reqs.Get(0).err
+		} else {
+			err = firstAutoBatchRequestErr(job.reqs)
+		}
 		job.done <- err
 	}
 }
 
-func (db *DB[K, V]) executeAutoBatch(batch []*autoBatchRequest[K, V]) {
-	db.recordExecutedAutoBatchStats(len(batch))
-	stats := db.autoBatcher.statsEnabled
+func (ab *autoBatcher) executeAutoBatch(batch []*autoBatchRequest) {
+	ab.autoBatchScheduler.recordExecutedStats(len(batch))
+	stats := ab.statsEnabled
 	var started time.Time
 	if stats {
 		started = time.Now()
 	}
-	reqScratch := db.autoBatcher.requestScratchPool.Get()
+	reqScratch := ab.requestScratchPool.Get()
 	reqScratch.AppendAll(batch)
-	db.runAutoBatchShared(reqScratch)
-	db.autoBatcher.requestScratchPool.Put(reqScratch)
-	db.finishAutoBatch(batch)
+	ab.runAutoBatchShared(reqScratch)
+	ab.requestScratchPool.Put(reqScratch)
+	ab.finishAutoBatch(batch)
 	if stats {
-		db.autoBatcher.executeNanos.Add(uint64(time.Since(started)))
+		ab.executeNanos.Add(uint64(time.Since(started)))
 	}
 }
 
-func (db *DB[K, V]) runAutoBatchShared(batch *pooled.Slice[*autoBatchRequest[K, V]]) {
+func (ab *autoBatcher) runAutoBatchShared(batch *pooled.Slice[*autoBatchRequest]) {
 	for i := 0; i < batch.Len(); i++ {
 		batch.Get(i).err = nil
 	}
 
-	activeScratch := db.autoBatcher.requestScratchPool.Get()
-	defer db.autoBatcher.requestScratchPool.Put(activeScratch)
+	activeScratch := ab.requestScratchPool.Get()
+	defer ab.requestScratchPool.Put(activeScratch)
 
 	activeScratch.Grow(batch.Len())
 
-	collectActiveAutoBatchRequests(activeScratch, batch)
+	for i := 0; i < batch.Len(); i++ {
+		req := batch.Get(i)
+		if req.replacedBy == nil {
+			activeScratch.Append(req)
+		}
+	}
 
 	for {
-		retryWithoutReq, done, fatalErr := db.executeAutoBatchAttempt(activeScratch, false)
+		retryWithoutReq, done, fatalErr := ab.executeAutoBatchAttempt(activeScratch, false)
 		if fatalErr != nil {
 			assignAutoBatchRequestErr(batch, fatalErr)
 			return
@@ -1348,7 +1609,21 @@ func (db *DB[K, V]) runAutoBatchShared(batch *pooled.Slice[*autoBatchRequest[K, 
 			return
 		}
 
-		if !removeAutoBatchRequest(activeScratch, retryWithoutReq) {
+		write := 0
+		removed := false
+		for i := 0; i < activeScratch.Len(); i++ {
+			req := activeScratch.Get(i)
+			if !removed && req == retryWithoutReq {
+				removed = true
+				continue
+			}
+			if write != i {
+				activeScratch.Set(write, req)
+			}
+			write++
+		}
+		activeScratch.SetLen(write)
+		if !removed {
 			assignAutoBatchRequestErr(batch, fmt.Errorf("internal auto-batch retry error: failed request not found"))
 			return
 		}
@@ -1364,37 +1639,48 @@ func (db *DB[K, V]) runAutoBatchShared(batch *pooled.Slice[*autoBatchRequest[K, 
 	}
 }
 
-func firstAutoBatchRequestErr[K ~string | ~uint64, V any](reqs *pooled.Slice[*autoBatchRequest[K, V]]) error {
+func firstAutoBatchRequestErr(reqs *pooled.Slice[*autoBatchRequest]) error {
 	for i := 0; i < reqs.Len(); i++ {
 		req := reqs.Get(i)
-		if req != nil && req.err != nil {
+		if req.err != nil {
 			return req.err
 		}
 	}
 	return nil
 }
 
-func singleAutoBatchOpName[K ~string | ~uint64, V any](req *autoBatchRequest[K, V]) string {
-	if req == nil {
+func autoBatchOpName(op autoBatchOp, reqLen int, atomicAll bool, maxOps int) string {
+	if reqLen == 0 {
 		return "batch"
 	}
-	switch req.op {
-	case autoBatchSet:
-		return "set"
-	case autoBatchPatch:
-		return "patch"
-	case autoBatchDelete:
-		return "delete"
-	default:
-		return "batch"
+	if !atomicAll {
+		if reqLen != 1 || maxOps > 1 {
+			return "batch"
+		}
+		switch op {
+		case autoBatchSet:
+			return "set"
+		case autoBatchPatch:
+			return "patch"
+		case autoBatchDelete:
+			return "delete"
+		default:
+			return "batch"
+		}
 	}
-}
-
-func batchAutoBatchOpName[K ~string | ~uint64, V any](req *autoBatchRequest[K, V]) string {
-	if req == nil {
-		return "batch"
+	if reqLen == 1 {
+		switch op {
+		case autoBatchSet:
+			return "set"
+		case autoBatchPatch:
+			return "patch"
+		case autoBatchDelete:
+			return "delete"
+		default:
+			return "batch"
+		}
 	}
-	switch req.op {
+	switch op {
 	case autoBatchSet:
 		return "batch_set"
 	case autoBatchPatch:
@@ -1406,29 +1692,13 @@ func batchAutoBatchOpName[K ~string | ~uint64, V any](req *autoBatchRequest[K, V
 	}
 }
 
-func (db *DB[K, V]) autoBatchOpName(reqs *pooled.Slice[*autoBatchRequest[K, V]], atomicAll bool) string {
-	if reqs.Len() == 0 {
-		return "batch"
-	}
-	if !atomicAll {
-		if reqs.Len() == 1 && db.autoBatcher.maxOps <= 1 {
-			return singleAutoBatchOpName(reqs.Get(0))
-		}
-		return "batch"
-	}
-	if reqs.Len() == 1 {
-		return singleAutoBatchOpName(reqs.Get(0))
-	}
-	return batchAutoBatchOpName(reqs.Get(0))
-}
-
-func (db *DB[K, V]) runAutoBatchAtomic(batch *pooled.Slice[*autoBatchRequest[K, V]]) {
+func (ab *autoBatcher) runAutoBatchAtomic(batch *pooled.Slice[*autoBatchRequest]) {
 	for i := 0; i < batch.Len(); i++ {
 		req := batch.Get(i)
 		req.err = nil
 		req.replacedBy = nil
 	}
-	_, done, fatalErr := db.executeAutoBatchAttempt(batch, true)
+	_, done, fatalErr := ab.executeAutoBatchAttempt(batch, true)
 	if fatalErr != nil {
 		assignAutoBatchRequestErr(batch, fatalErr)
 		return
@@ -1438,77 +1708,56 @@ func (db *DB[K, V]) runAutoBatchAtomic(batch *pooled.Slice[*autoBatchRequest[K, 
 	}
 }
 
-func (db *DB[K, V]) executeAutoBatchAttempt(active *pooled.Slice[*autoBatchRequest[K, V]], atomicAll bool) (*autoBatchRequest[K, V], bool, error) {
-	stats := db.autoBatcher.statsEnabled
-	opName := db.autoBatchOpName(active, atomicAll)
+func (ab *autoBatcher) executeAutoBatchAttempt(active *pooled.Slice[*autoBatchRequest], atomicAll bool) (*autoBatchRequest, bool, error) {
+	rt := ab.runtime
+	var firstOp autoBatchOp
+	if active.Len() != 0 {
+		firstOp = active.Get(0).op
+	}
+	opName := autoBatchOpName(firstOp, active.Len(), atomicAll, ab.maxOps)
 
-	tx, err := db.bolt.Begin(true)
+	tx, err := rt.bolt.Begin(true)
 	if err != nil {
-		if stats {
-			db.autoBatcher.txBeginErrors.Add(1)
+		if ab.statsEnabled {
+			ab.txBeginErrors.Add(1)
 		}
 		return nil, true, fmt.Errorf("tx error: %w", err)
 	}
-	defer rollback(tx)
-
-	bucket := tx.Bucket(db.bucket)
+	bucket := tx.Bucket(rt.bucket)
 	if bucket == nil {
-		if stats {
-			db.autoBatcher.txOpErrors.Add(1)
+		if ab.statsEnabled {
+			ab.txOpErrors.Add(1)
 		}
+		rollback(tx)
 		return nil, true, fmt.Errorf("bucket does not exist")
 	}
+	bucket.FillPercent = rt.bucketFillPercent
+	defer rollback(tx)
 
-	bucket.FillPercent = db.options.BucketFillPercent
-
-	capHint := roundedAutoBatchHint(max(active.Len(), 1))
-	att := db.autoBatcher.attemptStatePool.Get()
-	att.db = db
-	att.bucket = bucket
-	att.statsEnabled = db.autoBatcher.statsEnabled
+	capHint := max(active.Len(), 1)
+	if capHint <= 8 {
+		capHint = 8
+	} else {
+		capHint = 1 << bits.Len(uint(capHint-1))
+	}
+	att := ab.attemptStatePool.Get()
+	att.autoBatchAttemptCore.prepare(bucket, ab.statsEnabled, capHint, rt.engine != nil)
 	if cap(att.prepared) < capHint {
 		att.prepared = slices.Grow(att.prepared, capHint)
 	}
 	if cap(att.accepted) < capHint {
 		att.accepted = slices.Grow(att.accepted, capHint)
 	}
-	if cap(att.ownedPayloads) < capHint {
-		att.ownedPayloads = slices.Grow(att.ownedPayloads, capHint)
-	}
 	if cap(att.states) < capHint {
 		att.states = slices.Grow(att.states, capHint)
 	}
-	if cap(att.uniqueIdxs) < capHint {
-		att.uniqueIdxs = slices.Grow(att.uniqueIdxs, capHint)
-	}
-	if cap(att.uniqueOldVals) < capHint {
-		att.uniqueOldVals = slices.Grow(att.uniqueOldVals, capHint)
-	}
-	if cap(att.uniqueNewVals) < capHint {
-		att.uniqueNewVals = slices.Grow(att.uniqueNewVals, capHint)
-	}
-	if db.engine != nil {
-		if cap(att.preparedSnapshots) < capHint {
-			att.preparedSnapshots = slices.Grow(att.preparedSnapshots, capHint)
-		}
-		if cap(att.acceptedSnapshots) < capHint {
-			att.acceptedSnapshots = slices.Grow(att.acceptedSnapshots, capHint)
-		}
-	}
-	switch {
-	case att.stateByID == nil:
-		att.stateByID = make(map[K]int, capHint)
-		att.stateByIDCap = capHint
-	case capHint > att.stateByIDCap:
-		att.stateByID = make(map[K]int, capHint)
-		att.stateByIDCap = capHint
-	}
-	defer db.autoBatcher.attemptStatePool.Put(att)
-	db.prepareAutoBatchActive(att, active)
+	rt.prepareAttemptStateMap(att, capHint)
+	defer ab.attemptStatePool.Put(att)
+	ab.prepareAutoBatchActive(att, active)
 
 	if atomicAll {
 		if reqErr := firstAutoBatchRequestErr(active); reqErr != nil {
-			att.rollbackCreated(att.prepared)
+			rt.rollbackCreated(att.prepared)
 			return nil, true, reqErr
 		}
 	}
@@ -1517,106 +1766,113 @@ func (db *DB[K, V]) executeAutoBatchAttempt(active *pooled.Slice[*autoBatchReque
 		return nil, true, nil
 	}
 
-	db.mu.Lock()
-	if err = db.unavailableErr(); err != nil {
-		att.rollbackCreated(att.prepared)
-		db.mu.Unlock()
+	rt.mu.Lock()
+	if err = rt.unavailableErr(); err != nil {
+		rt.rollbackCreated(att.prepared)
+		rt.mu.Unlock()
 		assignAutoBatchPreparedErr(att.prepared, err)
 		return nil, true, nil
 	}
 
-	if err = db.filterAutoBatchAcceptedLocked(att, atomicAll); err != nil {
-		att.rollbackCreated(att.prepared)
-		db.mu.Unlock()
+	if err = ab.filterAutoBatchAcceptedLocked(att, atomicAll); err != nil {
+		rt.rollbackCreated(att.prepared)
+		rt.mu.Unlock()
 		return nil, true, err
 	}
 
 	if len(att.accepted) == 0 {
-		db.mu.Unlock()
+		rt.mu.Unlock()
 		return nil, true, nil
 	}
 
-	retryWithoutReq, err := db.applyAutoBatchAcceptedLocked(tx, bucket, att.accepted, atomicAll)
+	retryWithoutReq, err := ab.applyAutoBatchAcceptedLocked(tx, bucket, att.accepted, atomicAll)
 	if err != nil {
-		att.rollbackCreated(att.accepted)
-		db.mu.Unlock()
+		rt.rollbackCreated(att.accepted)
+		rt.mu.Unlock()
 		return nil, true, err
 	}
 	if retryWithoutReq != nil {
-		att.rollbackCreated(att.accepted)
-		db.mu.Unlock()
+		rt.rollbackCreated(att.accepted)
+		rt.mu.Unlock()
 		return retryWithoutReq, false, nil
 	}
 
-	if db.engine == nil {
+	if rt.engine == nil {
 		if _, err = bucket.NextSequence(); err != nil {
-			if stats {
-				db.autoBatcher.txOpErrors.Add(1)
+			if ab.statsEnabled {
+				ab.txOpErrors.Add(1)
 			}
-			att.rollbackCreated(att.accepted)
-			db.mu.Unlock()
+			rt.rollbackCreated(att.accepted)
+			rt.mu.Unlock()
 			return nil, true, fmt.Errorf("advance bucket sequence: %w", err)
 		}
-		if err = db.commit(tx, opName); err != nil {
-			if stats {
-				db.autoBatcher.txCommitErrors.Add(1)
+		if err = commitTx(tx, opName, rt.testHookAccessor()); err != nil {
+			if ab.statsEnabled {
+				ab.txCommitErrors.Add(1)
 			}
-			db.mu.Unlock()
+			rt.mu.Unlock()
 			assignAutoBatchPreparedErr(att.accepted, err)
 			return nil, true, nil
 		}
-		db.mu.Unlock()
+		rt.mu.Unlock()
 		return nil, true, nil
 	}
 
 	seq, err := bucket.NextSequence()
 	if err != nil {
-		if stats {
-			db.autoBatcher.txOpErrors.Add(1)
+		if ab.statsEnabled {
+			ab.txOpErrors.Add(1)
 		}
-		att.rollbackCreated(att.accepted)
-		db.mu.Unlock()
+		rt.rollbackCreated(att.accepted)
+		rt.mu.Unlock()
 		return nil, true, fmt.Errorf("advance bucket sequence: %w", err)
 	}
+	snap := rt.engine.buildPreparedSnapshotNoLock(seq, rt.strMap, rt.patchMap, att.acceptedSnapshots)
+	rt.engine.snapshot.stage(snap)
 
-	snap := db.engine.buildPreparedSnapshotNoLock(seq, db.strMap, db.patchMap, att.acceptedSnapshots)
-	db.engine.snapshot.stage(snap)
-
-	if err = db.commit(tx, opName); err != nil {
-		if stats {
-			db.autoBatcher.txCommitErrors.Add(1)
+	if err = commitTx(tx, opName, rt.testHookAccessor()); err != nil {
+		if ab.statsEnabled {
+			ab.txCommitErrors.Add(1)
 		}
-		db.engine.snapshot.dropStaged(seq)
-		att.rollbackCreated(att.accepted)
-		db.mu.Unlock()
+		rt.engine.snapshot.dropStaged(seq)
+		rt.rollbackCreated(att.accepted)
+		rt.mu.Unlock()
 		assignAutoBatchPreparedErr(att.accepted, err)
 		return nil, true, nil
 	}
 
-	err = db.publishAfterCommitLocked(seq, opName, func() {
-		db.engine.finishSnapshotPublishNoLock(snap)
-		if db.strMap != nil {
-			db.strMap.markCommittedPublished(snap.strmap)
-		}
-	})
+	err = publishAfterCommitLocked(
+		rt.testHookAccessor(),
+		rt.broken,
+		rt.logger,
+		rt.engine,
+		seq,
+		opName,
+		func() {
+			rt.engine.finishSnapshotPublishNoLock(snap)
+			if rt.strMap != nil {
+				rt.strMap.markCommittedPublished(snap.strmap)
+			}
+		},
+	)
 	if err != nil {
-		db.mu.Unlock()
+		rt.mu.Unlock()
 		assignAutoBatchPreparedErr(att.accepted, err)
 		return nil, true, nil
 	}
-	db.mu.Unlock()
+	rt.mu.Unlock()
 
 	return nil, true, nil
 }
 
-func (db *DB[K, V]) failAutoBatchJobs(batch []*autoBatchJob[K, V], err error) {
+func (ab *autoBatcher) failAutoBatchJobs(batch []*autoBatchJob, err error) {
 	for _, job := range batch {
 		assignAutoBatchRequestErr(job.reqs, err)
 	}
-	db.finishAutoBatchJobs(batch)
+	ab.finishAutoBatchJobs(batch)
 }
 
-func (db *DB[K, V]) finishAutoBatch(batch []*autoBatchRequest[K, V]) {
+func (ab *autoBatcher) finishAutoBatch(batch []*autoBatchRequest) {
 	for _, req := range batch {
 		if req.replacedBy == nil {
 			continue

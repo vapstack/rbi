@@ -526,14 +526,14 @@ func (db *DB[K, V]) applyPatch(v *V, patch []Field, ignoreUnknown bool) error {
 			continue
 		}
 
-		if err := db.setReflectValue(fv, p.Value); err != nil {
+		if err := setReflectValue(fv, p.Value); err != nil {
 			return fmt.Errorf("field %v: %w", p.Name, err)
 		}
 	}
 	return nil
 }
 
-func (db *DB[K, V]) setReflectValue(fv reflect.Value, val any) error {
+func setReflectValue(fv reflect.Value, val any) error {
 
 	sv := reflect.ValueOf(val)
 	if !sv.IsValid() {
@@ -562,7 +562,7 @@ func (db *DB[K, V]) setReflectValue(fv reflect.Value, val any) error {
 					return fmt.Errorf("cannot set nil to non-pointer slice element at index %v", i)
 				}
 			}
-			if err := db.setReflectValue(rsv, src); err != nil {
+			if err := setReflectValue(rsv, src); err != nil {
 				return fmt.Errorf("slice index %v: %w", i, err)
 			}
 		}
@@ -581,7 +581,7 @@ func (db *DB[K, V]) setReflectValue(fv reflect.Value, val any) error {
 
 		ptr := reflect.New(fv.Type().Elem())
 
-		if err := db.setReflectValue(ptr.Elem(), val); err != nil {
+		if err := setReflectValue(ptr.Elem(), val); err != nil {
 			return err
 		}
 
@@ -759,7 +759,7 @@ func isReflectFloatKind(kind reflect.Kind) bool {
 	return kind == reflect.Float32 || kind == reflect.Float64
 }
 
-func (db *DB[K, V]) populatePatcher(t reflect.Type, idx []int) error {
+func populatePatcher(patchMap map[string]*field, t reflect.Type, idx []int) error {
 	for i := 0; i < t.NumField(); i++ {
 
 		rf := t.Field(i)
@@ -771,7 +771,7 @@ func (db *DB[K, V]) populatePatcher(t reflect.Type, idx []int) error {
 		if rf.Anonymous {
 			if rf.Type.Kind() == reflect.Struct {
 				nidx := append(slices.Clone(idx), i)
-				if err := db.populatePatcher(rf.Type, nidx); err != nil {
+				if err := populatePatcher(patchMap, rf.Type, nidx); err != nil {
 					return err
 				}
 			}
@@ -802,14 +802,14 @@ func (db *DB[K, V]) populatePatcher(t reflect.Type, idx []int) error {
 			f.UseVI = elem.Implements(viType)
 		}
 
-		db.patchMap[rf.Name] = f
+		patchMap[rf.Name] = f
 
 		if dbTag := rf.Tag.Get("db"); dbTag != "" && dbTag != "-" {
 			f.DBName = dbTag
-			if existing, ok := db.patchMap[dbTag]; ok && existing.Name != f.Name {
+			if existing, ok := patchMap[dbTag]; ok && existing.Name != f.Name {
 				return fmt.Errorf("ambiguous db tag '%v' used by fields %v and %v", dbTag, existing.Name, f.Name)
 			}
-			db.patchMap[dbTag] = f
+			patchMap[dbTag] = f
 		}
 
 		if jsonTag := rf.Tag.Get("json"); jsonTag != "" && jsonTag != "-" {
@@ -819,10 +819,10 @@ func (db *DB[K, V]) populatePatcher(t reflect.Type, idx []int) error {
 				continue
 			}
 			f.JSONName = jsonName
-			if existing, ok := db.patchMap[jsonName]; ok && existing.Name != f.Name {
+			if existing, ok := patchMap[jsonName]; ok && existing.Name != f.Name {
 				return fmt.Errorf("ambiguous json tag '%v' used by fields %v and %v", jsonName, existing.Name, f.Name)
 			}
-			db.patchMap[jsonName] = f
+			patchMap[jsonName] = f
 		}
 	}
 	return nil
