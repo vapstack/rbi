@@ -124,7 +124,7 @@ func (ii *intIterator) initialize(a *bitmap32) {
 }
 
 func (ii *intIterator) release() {
-	intIteratorPool.Put(ii)
+	putIntIterator(ii)
 }
 
 // manyIntIterable supports bulk iteration over values in a bitmap32.
@@ -206,26 +206,22 @@ func (ii *manyIntIterator) initialize(a *bitmap32) {
 }
 
 func (ii *manyIntIterator) release() {
-	manyIntIteratorPool.Put(ii)
+	putManyIntIterator(ii)
 }
 
 // iterator creates a new intPeekable to iterate over the integers contained in the bitmap.
 func (rb *bitmap32) iterator() intPeekable {
-	it := intIteratorPool.Get()
-	it.initialize(rb)
-	return it
+	return getIntIterator(rb)
 }
 
 // manyIterator creates a new manyIntIterable for bulk iteration.
 func (rb *bitmap32) manyIterator() manyIntIterable {
-	it := manyIntIteratorPool.Get()
-	it.initialize(rb)
-	return it
+	return getManyIntIterator(rb)
 }
 
 // clone creates a copy of the bitmap32.
 func (rb *bitmap32) clone() *bitmap32 {
-	ptr := bitmapPool.Get()
+	ptr := getBitmap32()
 	ptr.highlowcontainer.copyFrom(&rb.highlowcontainer)
 	return ptr
 }
@@ -233,7 +229,7 @@ func (rb *bitmap32) clone() *bitmap32 {
 // cloneSharedInto overwrites dst with a copy-on-write clone of rb and returns dst.
 func (rb *bitmap32) cloneSharedInto(dst *bitmap32) *bitmap32 {
 	if dst == nil {
-		dst = bitmapPool.Get()
+		dst = getBitmap32()
 	}
 	if dst == rb {
 		return dst
@@ -267,7 +263,7 @@ func (rb *bitmap32) release() {
 	if rb.refs.Add(-1) != 0 {
 		return
 	}
-	bitmapPool.Put(rb)
+	putBitmap32(rb)
 }
 
 func (rb *bitmap32) Release() { rb.release() }
@@ -1690,7 +1686,7 @@ func readBitmap32WireContainer(reader io.Reader, kind byte, meta uint16) (contai
 		return container, readBytes, nil
 	case bitmap32WireContainerRun:
 		intervalCount := int(meta) + 1
-		container := newContainerRun()
+		container := getRunContainer()
 		container.iv = slices.Grow(container.iv, intervalCount)
 		container.iv = container.iv[:intervalCount]
 		readBytes, err := readBitmap32Run(reader, container)

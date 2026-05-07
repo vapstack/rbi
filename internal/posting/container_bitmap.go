@@ -4,26 +4,9 @@ import (
 	"math/bits"
 	"sync/atomic"
 	"unsafe"
-
-	"github.com/vapstack/rbi/internal/pooled"
 )
 
 const bitmapContainerWords = maxCapacity / 64
-
-var bitmapContainerPool = pooled.Pointers[containerBitmap]{
-	New: func() *containerBitmap {
-		return &containerBitmap{
-			bitmap: make([]uint64, bitmapContainerWords),
-		}
-	},
-	Init: func(bc *containerBitmap) {
-		bc.refs.Store(1)
-	},
-	Cleanup: func(bc *containerBitmap) {
-		bc.cardinality = 0
-		clear(bc.bitmap)
-	},
-}
 
 type containerBitmap struct {
 	refs        atomic.Int32
@@ -266,7 +249,7 @@ func setBitmapRangeAndCardinalityChange(bitmap []uint64, start int, end int) int
 }
 
 func newContainerBitmap() *containerBitmap {
-	return bitmapContainerPool.Get()
+	return getContainerBitmap()
 }
 
 func (bc *containerBitmap) retain() container16 {
@@ -285,10 +268,7 @@ func (bc *containerBitmap) release() {
 	if bc.refs.Add(-1) != 0 {
 		return
 	}
-	if len(bc.bitmap) != bitmapContainerWords {
-		return
-	}
-	bitmapContainerPool.Put(bc)
+	putContainerBitmap(bc)
 }
 
 func (bc *containerBitmap) Release() { bc.release() }
@@ -363,13 +343,6 @@ type bitmapContainerShortIterator struct {
 	i   int
 }
 
-var bitmapContainerShortIteratorPool = pooled.Pointers[bitmapContainerShortIterator]{
-	Cleanup: func(it *bitmapContainerShortIterator) {
-		it.ptr = nil
-		it.i = 0
-	},
-}
-
 func (it *bitmapContainerShortIterator) next() uint16 {
 	j := it.i
 	it.i = it.ptr.nextSetBit(uint(it.i) + 1)
@@ -391,14 +364,11 @@ func (it *bitmapContainerShortIterator) advanceIfNeeded(minval uint16) {
 }
 
 func (it *bitmapContainerShortIterator) release() {
-	bitmapContainerShortIteratorPool.Put(it)
+	putBitmapContainerShortIterator(it)
 }
 
 func newContainerBitmapShortIterator(a *containerBitmap) *bitmapContainerShortIterator {
-	it := bitmapContainerShortIteratorPool.Get()
-	it.ptr = a
-	it.i = a.nextSetBit(0)
-	return it
+	return getBitmapContainerShortIterator(a)
 }
 
 func (bc *containerBitmap) getShortIterator() shortPeekable {
@@ -409,14 +379,6 @@ type bitmapContainerManyIterator struct {
 	ptr    *containerBitmap
 	base   int
 	bitset uint64
-}
-
-var bitmapContainerManyIteratorPool = pooled.Pointers[bitmapContainerManyIterator]{
-	Cleanup: func(it *bitmapContainerManyIterator) {
-		it.ptr = nil
-		it.base = 0
-		it.bitset = 0
-	},
 }
 
 func (it *bitmapContainerManyIterator) nextMany(hs uint32, buf []uint32) int {
@@ -471,15 +433,11 @@ func (it *bitmapContainerManyIterator) nextMany64(hs uint64, buf []uint64) int {
 }
 
 func (it *bitmapContainerManyIterator) release() {
-	bitmapContainerManyIteratorPool.Put(it)
+	putBitmapContainerManyIterator(it)
 }
 
 func (bc *containerBitmap) getManyIterator() *bitmapContainerManyIterator {
-	it := bitmapContainerManyIteratorPool.Get()
-	it.ptr = bc
-	it.base = 0
-	it.bitset = bc.bitmap[0]
-	return it
+	return getBitmapContainerManyIterator(bc)
 }
 
 func (bc *containerBitmap) getSizeInBytes() int {

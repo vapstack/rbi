@@ -4,8 +4,6 @@ import (
 	"math"
 	"math/bits"
 	"unsafe"
-
-	"github.com/vapstack/rbi/internal/pooled"
 )
 
 type container16 interface {
@@ -127,8 +125,6 @@ var containerIndexPoolCapacities = [...]int{
 
 const maxPooledContainerIndexCapacity = 1 << 16
 
-var containerIndexStoragePools [len(containerIndexPoolCapacities)]pooled.Pointers[containerIndexStorage]
-
 func (ra *containerIndex) ensureInline() {
 	if ra == nil || ra.keys != nil || ra.containers != nil {
 		return
@@ -145,31 +141,6 @@ func containerIndexPoolIndex(size int) int {
 		return -1
 	}
 	return bits.Len(uint(size-1)) - 3
-}
-
-func getContainerIndexStorageWithLen(l int) *containerIndexStorage {
-	if l <= 0 {
-		l = containerIndexPoolCapacities[0]
-	}
-	idx := containerIndexPoolIndex(l)
-	if idx < 0 {
-		panic("containerIndex size exceeds pooled capacity")
-	}
-	out := containerIndexStoragePools[idx].Get()
-	out.keys = out.keys[:l]
-	out.containers = out.containers[:l]
-	return out
-}
-
-func putContainerIndexStorage(storage *containerIndexStorage) {
-	if storage == nil {
-		return
-	}
-	idx := containerIndexPoolIndex(cap(storage.keys))
-	if idx < 0 {
-		panic("containerIndex storage capacity exceeds pooled capacity")
-	}
-	containerIndexStoragePools[idx].Put(storage)
 }
 
 func (ra *containerIndex) aliases(other *containerIndex) bool {
@@ -694,13 +665,6 @@ type shortIterator struct {
 	loc   int
 }
 
-var shortIteratorPool = pooled.Pointers[shortIterator]{
-	Cleanup: func(it *shortIterator) {
-		it.slice = nil
-		it.loc = 0
-	},
-}
-
 func (si *shortIterator) hasNext() bool {
 	return si.loc < len(si.slice)
 }
@@ -722,7 +686,7 @@ func (si *shortIterator) advanceIfNeeded(minval uint16) {
 }
 
 func (si *shortIterator) release() {
-	shortIteratorPool.Put(si)
+	putShortIterator(si)
 }
 
 type manyIterable interface {
@@ -1244,28 +1208,6 @@ func binarySearch(array []uint16, ikey uint16) int {
 	return -(low + 1)
 }
 
-var bitmapPool = pooled.Pointers[bitmap32]{
-	New: func() *bitmap32 {
-		return new(bitmap32)
-	},
-	Init: func(rb *bitmap32) {
-		rb.refs.Store(1)
-	},
-	Cleanup: func(rb *bitmap32) {
-		rb.highlowcontainer.clear()
-	},
-}
-
-var runContainerPool = pooled.Pointers[containerRun]{
-	Init: func(rc *containerRun) {
-		rc.refs.Store(1)
-	},
-	Cleanup: func(rc *containerRun) {
-		clear(rc.iv)
-		rc.iv = rc.iv[:0]
-	},
-}
-
 // containerArrayPoolCapacities uses power-of-two classes so get/put
 // can classify storage in O(1) via bits.Len.
 //
@@ -1293,45 +1235,6 @@ var maxContainerArrayPoolCapacity = 4 * arrayDefaultMaxSize
 
 const maxPooledRunContainerCapacity = 4 * arrayDefaultMaxSize
 
-var containerArrayClassPools [len(containerArrayPoolCapacities)]pooled.Pointers[containerArray]
-
-func init() {
-	for i, maxcap := range containerIndexPoolCapacities {
-		c := maxcap
-		containerIndexStoragePools[i] = pooled.Pointers[containerIndexStorage]{
-			New: func() *containerIndexStorage {
-				return &containerIndexStorage{
-					keys:       make([]uint16, 0, c),
-					containers: make([]container16, 0, c),
-				}
-			},
-			Cleanup: func(storage *containerIndexStorage) {
-				clear(storage.keys[:cap(storage.keys)])
-				storage.keys = storage.keys[:0]
-				clear(storage.containers[:cap(storage.containers)])
-				storage.containers = storage.containers[:0]
-			},
-		}
-	}
-	for i, maxcap := range containerArrayPoolCapacities {
-		c := maxcap
-		containerArrayClassPools[i] = pooled.Pointers[containerArray]{
-			New: func() *containerArray {
-				return &containerArray{
-					content: make([]uint16, 0, c),
-				}
-			},
-			Init: func(ac *containerArray) {
-				ac.refs.Store(1)
-			},
-			Cleanup: func(ac *containerArray) {
-				clear(ac.content)
-				ac.content = ac.content[:0]
-			},
-		}
-	}
-}
-
 // containerArrayPoolIndex returns the smallest pooled class that can satisfy
 // size. Requests round up so objects taken from a class always have enough
 // capacity without an extra check on the Get path.
@@ -1356,42 +1259,6 @@ func containerArrayPoolPutIndex(capacity int) int {
 	return bits.Len(uint(capacity)) - 6
 }
 
-func getContainerArray() *containerArray {
-	return containerArrayClassPools[0].Get()
-}
-
-func getContainerArrayWithCap(c int) *containerArray {
-	if c <= 0 {
-		return getContainerArray()
-	}
-	if idx := containerArrayPoolIndex(c); idx >= 0 {
-		return containerArrayClassPools[idx].Get()
-	}
-	ac := &containerArray{
-		content: make([]uint16, 0, c),
-	}
-	ac.refs.Store(1)
-	return ac
-}
-
-func getContainerArrayWithLen(l int) *containerArray {
-	if l <= 0 {
-		return getContainerArray()
-	}
-	ac := getContainerArrayWithCap(l)
-	ac.content = ac.content[:l]
-	return ac
-}
-
-func getContainerArrayFromSlice(src []uint16) *containerArray {
-	if len(src) == 0 {
-		return getContainerArray()
-	}
-	ac := getContainerArrayWithLen(len(src))
-	copy(ac.content, src)
-	return ac
-}
-
 func replaceContainerArrayStorage(ac, donor *containerArray) {
 	oldContent := ac.content
 	ac.content = donor.content
@@ -1405,15 +1272,6 @@ func replaceContainerRunStorage(rc, donor *containerRun) {
 	donor.iv = oldIV
 	donor.release()
 }
-
-var (
-	intIteratorPool = pooled.Pointers[intIterator]{
-		Clear: true,
-	}
-	manyIntIteratorPool = pooled.Pointers[manyIntIterator]{
-		Clear: true,
-	}
-)
 
 func popcount(x uint64) uint64 {
 	return uint64(bits.OnesCount64(x))

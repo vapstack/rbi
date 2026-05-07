@@ -525,7 +525,7 @@ func TestHotPathPools_NoAllocsAfterWarmup(t *testing.T) {
 
 	t.Run("Bitmap32AddManySorted", func(t *testing.T) {
 		requireZeroAllocsAfterPoolWarmup(t, func() {
-			out := bitmapPool.Get()
+			out := getBitmap32()
 			out.addManySorted(bitmapAddSortedIDs)
 			allocUint64Sink = out.cardinality()
 			out.Release()

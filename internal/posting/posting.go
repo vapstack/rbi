@@ -5,8 +5,6 @@ import (
 	"encoding/binary"
 	"fmt"
 	"unsafe"
-
-	"github.com/vapstack/rbi/internal/pooled"
 )
 
 func writeUvarint(writer *bufio.Writer, v uint64) error {
@@ -69,13 +67,13 @@ type arrayIter struct {
 }
 
 func cloneSmallPosting(sp *smallPosting) *smallPosting {
-	clone := smallSetPool.Get()
+	clone := getSmallPosting()
 	*clone = *sp
 	return clone
 }
 
 func cloneMidPosting(mp *midPosting) *midPosting {
-	clone := midSetPool.Get()
+	clone := getMidPosting()
 	*clone = *mp
 	return clone
 }
@@ -115,7 +113,7 @@ func newSmall(ids ...uint64) List {
 	case 1:
 		return singleton(ids[0])
 	}
-	sp := smallSetPool.Get()
+	sp := getSmallPosting()
 	sp.n = uint8(len(ids))
 	copy(sp.ids[:], ids)
 	return smallValue(sp)
@@ -129,12 +127,12 @@ func compactListFromSorted(ids []uint64) List {
 		return singleton(ids[0])
 	}
 	if len(ids) <= SmallCap {
-		sp := smallSetPool.Get()
+		sp := getSmallPosting()
 		sp.n = uint8(len(ids))
 		copy(sp.ids[:len(ids)], ids)
 		return smallValue(sp)
 	}
-	mp := midSetPool.Get()
+	mp := getMidPosting()
 	mp.n = uint8(len(ids))
 	copy(mp.ids[:len(ids)], ids)
 	return midValue(mp)
@@ -147,19 +145,19 @@ func BuildFromSorted(ids []uint64) List {
 	case 1:
 		return singleton(ids[0])
 	case 2, 3, 4, 5, 6, 7, 8:
-		sp := smallSetPool.Get()
+		sp := getSmallPosting()
 		sp.n = uint8(len(ids))
 		copy(sp.ids[:len(ids)], ids)
 		return smallValue(sp)
 	case 9, 10, 11, 12, 13, 14, 15, 16,
 		17, 18, 19, 20, 21, 22, 23, 24,
 		25, 26, 27, 28, 29, 30, 31, 32:
-		mp := midSetPool.Get()
+		mp := getMidPosting()
 		mp.n = uint8(len(ids))
 		copy(mp.ids[:len(ids)], ids)
 		return midValue(mp)
 	default:
-		lp := largePostingPool.Get()
+		lp := getLargePosting()
 		lp.addMany(ids)
 		out := largeValue(lp)
 		return out.BuildOptimized()
@@ -314,7 +312,7 @@ func compactFilterByMembership(ids List, other List, keepMatches bool) List {
 			mp.release()
 			return singleton(keep)
 		case n <= SmallCap:
-			sp := smallSetPool.Get()
+			sp := getSmallPosting()
 			sp.n = uint8(n)
 			copy(sp.ids[:n], mp.ids[:n])
 			mp.release()
@@ -403,7 +401,7 @@ func compactFilterByAnyMembership(ids List, other []List) List {
 			mp.release()
 			return singleton(keep)
 		case n <= SmallCap:
-			sp := smallSetPool.Get()
+			sp := getSmallPosting()
 			sp.n = uint8(n)
 			copy(sp.ids[:n], mp.ids[:n])
 			mp.release()
@@ -441,7 +439,7 @@ func fromLargeOwnedWithCardinality(lp *largePosting, card uint64) List {
 		return singleton(id)
 	}
 	if card <= SmallCap {
-		sp := smallSetPool.Get()
+		sp := getSmallPosting()
 		sp.n = uint8(card)
 		it := lp.iterator()
 		defer it.Release()
@@ -454,7 +452,7 @@ func fromLargeOwnedWithCardinality(lp *largePosting, card uint64) List {
 		return smallValue(sp)
 	}
 	if card <= MidCap {
-		mp := midSetPool.Get()
+		mp := getMidPosting()
 		mp.n = uint8(card)
 		it := lp.iterator()
 		defer it.Release()
@@ -799,16 +797,10 @@ func (p List) Iter() Iterator {
 		return getSingletonIter(p.single)
 	}
 	if sp := p.small(); sp != nil {
-		it := compactPostingIterPool.Get()
-		it.ids = sp.ids[:sp.n]
-		it.i = 0
-		return it
+		return getArrayIter(sp.ids[:sp.n])
 	}
 	if mp := p.mid(); mp != nil {
-		it := compactPostingIterPool.Get()
-		it.ids = mp.ids[:mp.n]
-		it.i = 0
-		return it
+		return getArrayIter(mp.ids[:mp.n])
 	}
 	return p.largeRef().iterator()
 }
@@ -873,7 +865,7 @@ func (p List) Clone() List {
 	if mp := p.mid(); mp != nil {
 		return midValue(cloneMidPosting(mp))
 	}
-	return largeValue(p.largeRef().cloneSharedInto(largePostingPool.Get()))
+	return largeValue(p.largeRef().cloneSharedInto(getLargePosting()))
 }
 
 func (p List) CloneInto(dst List) List {
@@ -910,7 +902,7 @@ func (p List) CloneInto(dst List) List {
 		return largeValue(cur)
 	}
 	dst.Release()
-	return largeValue(src.cloneSharedInto(largePostingPool.Get()))
+	return largeValue(src.cloneSharedInto(getLargePosting()))
 }
 
 func (p List) TryBuildAndAnyBuf(other []List) (List, bool) {
@@ -945,7 +937,7 @@ func (p List) TryResetOwnedCompactLikeFromSorted(src List, ids []uint64) (List, 
 		cur := p.small()
 		if cur == nil || p.IsBorrowed() {
 			p.Release()
-			cur = smallSetPool.Get()
+			cur = getSmallPosting()
 		}
 		copy(cur.ids[:len(ids)], ids)
 		cur.n = uint8(len(ids))
@@ -966,7 +958,7 @@ func (p List) TryResetOwnedCompactLikeFromSorted(src List, ids []uint64) (List, 
 		cur := p.mid()
 		if cur == nil || p.IsBorrowed() {
 			p.Release()
-			cur = midSetPool.Get()
+			cur = getMidPosting()
 		}
 		copy(cur.ids[:len(ids)], ids)
 		cur.n = uint8(len(ids))
@@ -1031,7 +1023,7 @@ func buildRemoved(ids List, idx uint64) List {
 				sp.n--
 				return ids
 			}
-			next := smallSetPool.Get()
+			next := getSmallPosting()
 			next.n = uint8(n - 1)
 			copy(next.ids[:pos], sp.ids[:pos])
 			copy(next.ids[pos:], sp.ids[pos+1:n])
@@ -1067,7 +1059,7 @@ func buildRemoved(ids List, idx uint64) List {
 			return singleton(keep)
 		default:
 			if n-1 <= SmallCap {
-				next := smallSetPool.Get()
+				next := getSmallPosting()
 				next.n = uint8(n - 1)
 				copy(next.ids[:pos], mp.ids[:pos])
 				copy(next.ids[pos:], mp.ids[pos+1:n])
@@ -1081,7 +1073,7 @@ func buildRemoved(ids List, idx uint64) List {
 				mp.n--
 				return ids
 			}
-			next := midSetPool.Get()
+			next := getMidPosting()
 			next.n = uint8(n - 1)
 			copy(next.ids[:pos], mp.ids[:pos])
 			copy(next.ids[pos:], mp.ids[pos+1:n])
@@ -1090,7 +1082,7 @@ func buildRemoved(ids List, idx uint64) List {
 	default:
 		lp := ids.largeRef()
 		if borrowed {
-			lp = lp.cloneSharedInto(largePostingPool.Get())
+			lp = lp.cloneSharedInto(getLargePosting())
 		}
 		lp.remove(idx)
 		if lp.isEmpty() {
@@ -1134,7 +1126,7 @@ func (p List) BuildAddedMany(ids []uint64) List {
 	}
 
 	current := p
-	lp := largePostingPool.Get()
+	lp := getLargePosting()
 	switch {
 	case current.IsEmpty():
 	case current.ptr == singleValue:
@@ -1189,14 +1181,14 @@ func buildAddedChecked(ids List, idx uint64) (List, bool) {
 		}
 		if ids.IsBorrowed() {
 			if n < SmallCap {
-				next := smallSetPool.Get()
+				next := getSmallPosting()
 				next.n = uint8(n + 1)
 				copy(next.ids[:insert], sp.ids[:insert])
 				next.ids[insert] = idx
 				copy(next.ids[insert+1:n+1], sp.ids[insert:n])
 				return smallValue(next), true
 			}
-			mp := midSetPool.Get()
+			mp := getMidPosting()
 			mp.n = uint8(n + 1)
 			copy(mp.ids[:insert], sp.ids[:insert])
 			mp.ids[insert] = idx
@@ -1209,7 +1201,7 @@ func buildAddedChecked(ids List, idx uint64) (List, bool) {
 			sp.n++
 			return ids, true
 		}
-		mp := midSetPool.Get()
+		mp := getMidPosting()
 		mp.n = uint8(n + 1)
 		copy(mp.ids[:insert], sp.ids[:insert])
 		mp.ids[insert] = idx
@@ -1231,14 +1223,14 @@ func buildAddedChecked(ids List, idx uint64) (List, bool) {
 		}
 		if ids.IsBorrowed() {
 			if n < MidCap {
-				next := midSetPool.Get()
+				next := getMidPosting()
 				next.n = uint8(n + 1)
 				copy(next.ids[:insert], mp.ids[:insert])
 				next.ids[insert] = idx
 				copy(next.ids[insert+1:n+1], mp.ids[insert:n])
 				return midValue(next), true
 			}
-			lp := largePostingPool.Get()
+			lp := getLargePosting()
 			for i := 0; i < n; i++ {
 				lp.add(mp.ids[i])
 			}
@@ -1251,7 +1243,7 @@ func buildAddedChecked(ids List, idx uint64) (List, bool) {
 			mp.n++
 			return ids, true
 		}
-		lp := largePostingPool.Get()
+		lp := getLargePosting()
 		for i := 0; i < n; i++ {
 			lp.add(mp.ids[i])
 		}
@@ -1264,7 +1256,7 @@ func buildAddedChecked(ids List, idx uint64) (List, bool) {
 			if lp.contains(idx) {
 				return ids, false
 			}
-			lp = lp.cloneSharedInto(largePostingPool.Get())
+			lp = lp.cloneSharedInto(getLargePosting())
 			lp.checkedAdd(idx)
 			return largeValue(lp), true
 		}
@@ -1306,7 +1298,7 @@ func buildAdded(ids List, idx uint64) List {
 			sp.n++
 			return ids
 		}
-		mp := midSetPool.Get()
+		mp := getMidPosting()
 		mp.n = uint8(n + 1)
 		copy(mp.ids[:insert], sp.ids[:insert])
 		mp.ids[insert] = idx
@@ -1332,7 +1324,7 @@ func buildAdded(ids List, idx uint64) List {
 			mp.n++
 			return ids
 		}
-		lp := largePostingPool.Get()
+		lp := getLargePosting()
 		for i := 0; i < n; i++ {
 			lp.add(mp.ids[i])
 		}
@@ -1437,13 +1429,13 @@ func (p List) BuildOr(other List) List {
 		return p
 	}
 	if p.ptr == singleValue {
-		lp := largePostingPool.Get()
+		lp := getLargePosting()
 		lp.add(p.single)
 		lp.or(other.largeRef())
 		return largeValue(lp)
 	}
 	if sp := p.small(); sp != nil {
-		lp := largePostingPool.Get()
+		lp := getLargePosting()
 		for i := 0; i < int(sp.n); i++ {
 			lp.add(sp.ids[i])
 		}
@@ -1454,7 +1446,7 @@ func (p List) BuildOr(other List) List {
 		return largeValue(lp)
 	}
 	if mp := p.mid(); mp != nil {
-		lp := largePostingPool.Get()
+		lp := getLargePosting()
 		for i := 0; i < int(mp.n); i++ {
 			lp.add(mp.ids[i])
 		}
@@ -1649,7 +1641,7 @@ func ReadFrom(reader *bufio.Reader) (List, error) {
 		if n == 0 || n > SmallCap {
 			return List{}, fmt.Errorf("invalid small posting len %v", n)
 		}
-		sp := smallSetPool.Get()
+		sp := getSmallPosting()
 		sp.n = uint8(n)
 		if err := readCompactPostingValues(reader, sp.ids[:n], "small"); err != nil {
 			sp.release()
@@ -1669,7 +1661,7 @@ func ReadFrom(reader *bufio.Reader) (List, error) {
 		if n == 0 || n <= SmallCap || n > MidCap {
 			return List{}, fmt.Errorf("invalid mid posting len %v", n)
 		}
-		mp := midSetPool.Get()
+		mp := getMidPosting()
 		mp.n = uint8(n)
 		if err := readCompactPostingValues(reader, mp.ids[:n], "mid"); err != nil {
 			mp.release()
@@ -1788,13 +1780,6 @@ type singletonIter struct {
 	has bool
 }
 
-func getSingletonIter(v uint64) Iterator {
-	it := singletonIterPool.Get()
-	it.v = v
-	it.has = true
-	return it
-}
-
 func (it *singletonIter) HasNext() bool { return it.has }
 
 func (it *singletonIter) Next() uint64 {
@@ -1806,42 +1791,17 @@ func (it *singletonIter) Next() uint64 {
 }
 
 func (it *singletonIter) Release() {
-	singletonIterPool.Put(it)
+	putSingletonIter(it)
 }
 
-var (
-	smallSetPool = pooled.Pointers[smallPosting]{
-		Cleanup: func(sp *smallPosting) {
-			sp.n = 0
-		},
-	}
-	midSetPool = pooled.Pointers[midPosting]{
-		Cleanup: func(mp *midPosting) {
-			mp.n = 0
-		},
-	}
-	compactPostingIterPool = pooled.Pointers[arrayIter]{
-		Cleanup: func(it *arrayIter) {
-			it.ids = nil
-			it.i = 0
-		},
-	}
-	singletonIterPool = pooled.Pointers[singletonIter]{
-		Cleanup: func(it *singletonIter) {
-			it.v = 0
-			it.has = false
-		},
-	}
-)
-
-func (sp *smallPosting) release() { smallSetPool.Put(sp) }
+func (sp *smallPosting) release() { putSmallPosting(sp) }
 
 func (sp *smallPosting) Release() { sp.release() }
 
-func (mp *midPosting) release() { midSetPool.Put(mp) }
+func (mp *midPosting) release() { putMidPosting(mp) }
 
 func (mp *midPosting) Release() { mp.release() }
 
 func (it *arrayIter) Release() {
-	compactPostingIterPool.Put(it)
+	putArrayIter(it)
 }

@@ -62,7 +62,7 @@ func listFromUint64Slice(ids []uint64) List {
 }
 
 func bitmap32FromUint32Slice(ids []uint32) *bitmap32 {
-	rb := bitmapPool.Get()
+	rb := getBitmap32()
 	rb.addMany(ids)
 	return rb
 }

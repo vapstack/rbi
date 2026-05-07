@@ -233,7 +233,7 @@ func cleanupContainerPair(base, result container16) {
 }
 
 func buildBitmap32(ids ...uint32) *bitmap32 {
-	rb := bitmapPool.Get()
+	rb := getBitmap32()
 	rb.addMany(canonicalUint32s(ids))
 	return rb
 }

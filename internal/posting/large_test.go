@@ -175,14 +175,14 @@ func TestLargePostingSharedCloneInvariant_SourceReleaseAndPoolReuse(t *testing.T
 	for _, tc := range cases {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
-			src := largePostingPool.Get()
+			src := getLargePosting()
 			tc.fill(src)
 			want := src.toArray()
 
 			clone := src.cloneSharedInto(newLargePosting())
 			src.Release()
 
-			reused := largePostingPool.Get()
+			reused := getLargePosting()
 			for _, id := range tc.poison {
 				reused.add(id)
 			}
@@ -245,20 +245,18 @@ func TestLargeIteratorPool_ReusedIteratorStartsFromNewPosting(t *testing.T) {
 	first.add(2)
 	first.add(uint64(1)<<32 | 3)
 
-	it := largeIteratorPool.Get()
-	it.initialize(first)
+	it := getLargeIterator(first)
 	if got := it.Next(); got != 1 {
 		t.Fatalf("first iterator first value: got=%d", got)
 	}
-	largeIteratorPool.Put(it)
+	putLargeIterator(it)
 
 	second := newLargePosting()
 	second.add(7)
 	second.add(uint64(1)<<32 | 9)
 
-	reused := largeIteratorPool.Get()
-	reused.initialize(second)
-	defer largeIteratorPool.Put(reused)
+	reused := getLargeIterator(second)
+	defer putLargeIterator(reused)
 	if !testRaceEnabled && reused != it {
 		t.Fatalf("large iterator pool did not reuse iterator")
 	}
@@ -549,9 +547,8 @@ func TestLargeIteratorAdvanceAndTransitions(t *testing.T) {
 	)
 	defer lp.Release()
 
-	it := largeIteratorPool.Get()
-	it.initialize(lp)
-	defer largeIteratorPool.Put(it)
+	it := getLargeIterator(lp)
+	defer putLargeIterator(it)
 
 	if got := it.peekNext(); got != 1 {
 		t.Fatalf("peekNext mismatch: got=%d want=1", got)
@@ -580,9 +577,8 @@ func TestLargeIteratorAdvanceEdgeCasesAndIntersectsSkips(t *testing.T) {
 		lp := largePostingOf(1, 4, 7, 1<<32|1)
 		defer lp.Release()
 
-		it := largeIteratorPool.Get()
-		it.initialize(lp)
-		defer largeIteratorPool.Put(it)
+		it := getLargeIterator(lp)
+		defer putLargeIterator(it)
 
 		it.advanceIfNeeded(0)
 		if got := it.peekNext(); got != 1 {
@@ -923,7 +919,7 @@ func TestLargePostingConcurrentIteratorCreateReleaseStable(t *testing.T) {
 			for i := 0; i < 400; i++ {
 				it := lp.iterator()
 				got := collectLargeIterator(it)
-				largeIteratorPool.Put(it)
+				putLargeIterator(it)
 				if !slices.Equal(got, want) {
 					setFailed("large iterator mismatch under concurrent create/release")
 					return

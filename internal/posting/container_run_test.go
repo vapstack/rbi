@@ -390,7 +390,7 @@ func TestContainerRunIntersectsEdgeCases(t *testing.T) {
 func TestContainerRunAndNotRunCopyAndXorEmptyRegressions(t *testing.T) {
 	nonEmpty := buildContainerRun([]uint16{10, 11, 12, 100, 101}).(*containerRun)
 	defer nonEmpty.release()
-	empty := newContainerRun()
+	empty := getRunContainer()
 	defer empty.release()
 
 	diff := nonEmpty.andNotRunCopy(empty)
@@ -780,7 +780,7 @@ func TestContainerRunDirectAddDeleteAndInvertHelpers(t *testing.T) {
 			add  uint16
 			want []uint16
 		}{
-			{name: "Empty", rc: newContainerRun(), add: 5, want: []uint16{5}},
+			{name: "Empty", rc: getRunContainer(), add: 5, want: []uint16{5}},
 			{name: "ExtendFirstBackward", rc: newContainerRunRange(5, 5), add: 4, want: []uint16{4, 5}},
 			{name: "ExtendLastAtEnd", rc: newContainerRunRange(1, 2), add: 3, want: []uint16{1, 2, 3}},
 			{name: "AppendAtEnd", rc: newContainerRunRange(1, 2), add: 5, want: []uint16{1, 2, 5}},
@@ -856,7 +856,7 @@ func TestContainerRunDirectAddDeleteAndInvertHelpers(t *testing.T) {
 			endx  int
 			want  []uint16
 		}{
-			{name: "Empty", rc: newContainerRun(), start: 5, endx: 8, want: []uint16{5, 6, 7}},
+			{name: "Empty", rc: getRunContainer(), start: 5, endx: 8, want: []uint16{5, 6, 7}},
 			{name: "InsertBeforeFirst", rc: newContainerRunCopyIv([]interval16{newInterval16Range(10, 12), newInterval16Range(20, 22)}), start: 1, endx: 4, want: []uint16{1, 2, 3, 10, 11, 12, 20, 21, 22}},
 			{name: "MergeLeftOnly", rc: newContainerRunCopyIv([]interval16{newInterval16Range(10, 12), newInterval16Range(20, 22)}), start: 13, endx: 15, want: []uint16{10, 11, 12, 13, 14, 20, 21, 22}},
 			{name: "MergeRightOnly", rc: newContainerRunCopyIv([]interval16{newInterval16Range(10, 12), newInterval16Range(20, 22)}), start: 17, endx: 20, want: []uint16{10, 11, 12, 17, 18, 19, 20, 21, 22}},
@@ -934,7 +934,7 @@ func TestContainerRunISubtractBranchMatrix(t *testing.T) {
 	}{
 		{
 			name: "EmptyNoop",
-			rc:   newContainerRun(),
+			rc:   getRunContainer(),
 			del:  newInterval16Range(10, 20),
 			want: nil,
 		},

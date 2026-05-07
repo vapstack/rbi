@@ -23,16 +23,7 @@ func (ac *containerArray) release() {
 	if ac.refs.Add(-1) != 0 {
 		return
 	}
-	capacity := cap(ac.content)
-	if capacity > maxContainerArrayPoolCapacity {
-		return
-	}
-	clear(ac.content)
-	idx := containerArrayPoolPutIndex(capacity)
-	if idx < 0 {
-		return
-	}
-	containerArrayClassPools[idx].Put(ac)
+	putContainerArray(ac)
 }
 
 func (ac *containerArray) Release() { ac.release() }
@@ -65,17 +56,11 @@ func (ac *containerArray) iterate(cb func(x uint16) bool) bool {
 }
 
 func (ac *containerArray) getShortIterator() shortPeekable {
-	it := shortIteratorPool.Get()
-	it.slice = ac.content
-	it.loc = 0
-	return it
+	return getShortIterator(ac.content)
 }
 
 func (ac *containerArray) getManyIterator() manyIterable {
-	it := shortIteratorPool.Get()
-	it.slice = ac.content
-	it.loc = 0
-	return it
+	return getShortIterator(ac.content)
 }
 
 func (ac *containerArray) minimum() uint16 {

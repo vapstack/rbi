@@ -18,7 +18,7 @@ func collectIntIterator32(it *intIterator) []uint32 {
 }
 
 func TestBitmapCloneSharedIntoPreservesSourceOnMutation(t *testing.T) {
-	src := bitmapPool.Get()
+	src := getBitmap32()
 	src.addRange(0, 512)
 	src.addRange(1<<16, (1<<16)+512)
 	src.addRange(3<<16, (3<<16)+32)
@@ -26,13 +26,13 @@ func TestBitmapCloneSharedIntoPreservesSourceOnMutation(t *testing.T) {
 
 	want := src.clone()
 
-	dst := bitmapPool.Get()
+	dst := getBitmap32()
 	src.cloneSharedInto(dst)
 
 	dst.add(777)
 	dst.remove(10)
 	dst.remove((1 << 16) + 3)
-	dst.or(bitmapPool.Get())
+	dst.or(getBitmap32())
 	dst.runOptimize()
 
 	if !src.equals(want) {
@@ -50,7 +50,7 @@ func TestBitmapCloneSharedIntoPreservesSourceOnMutation(t *testing.T) {
 }
 
 func TestBitmapPool_ReusedBitmapStartsEmpty(t *testing.T) {
-	rb := bitmapPool.Get()
+	rb := getBitmap32()
 	rb.add(1)
 	rb.add(2)
 	for i := uint32(0); i < 5000; i++ {
@@ -59,7 +59,7 @@ func TestBitmapPool_ReusedBitmapStartsEmpty(t *testing.T) {
 	rb.addRange(uint64(2<<16), uint64((2<<16)+1024))
 	rb.release()
 
-	reused := bitmapPool.Get()
+	reused := getBitmap32()
 	defer reused.release()
 	if !testRaceEnabled && reused != rb {
 		t.Fatalf("bitmap pool did not reuse bitmap")
@@ -79,23 +79,21 @@ func TestBitmapPool_ReusedBitmapStartsEmpty(t *testing.T) {
 }
 
 func TestIntIteratorPool_ReusedIteratorResetsEmbeddedState(t *testing.T) {
-	arrayBitmap := bitmapPool.Get()
+	arrayBitmap := getBitmap32()
 	arrayBitmap.add(1)
 	arrayBitmap.add(2)
 	arrayBitmap.add(3)
 
-	it := intIteratorPool.Get()
-	it.initialize(arrayBitmap)
+	it := getIntIterator(arrayBitmap)
 	if got := it.next(); got != 1 {
 		t.Fatalf("array iterator first value: got=%d", got)
 	}
-	intIteratorPool.Put(it)
+	putIntIterator(it)
 
-	runBitmap := bitmapPool.Get()
+	runBitmap := getBitmap32()
 	runBitmap.addRange(uint64(1<<16), uint64((1<<16)+4))
 
-	reused := intIteratorPool.Get()
-	reused.initialize(runBitmap)
+	reused := getIntIterator(runBitmap)
 	if !testRaceEnabled && reused != it {
 		t.Fatalf("intIterator pool did not reuse iterator")
 	}
@@ -107,16 +105,15 @@ func TestIntIteratorPool_ReusedIteratorResetsEmbeddedState(t *testing.T) {
 	if !slices.Equal(gotRun, wantRun) {
 		t.Fatalf("run iteration mismatch after reuse: got=%v want=%v", gotRun, wantRun)
 	}
-	intIteratorPool.Put(reused)
+	putIntIterator(reused)
 
-	bitmapBitmap := bitmapPool.Get()
+	bitmapBitmap := getBitmap32()
 	for i := uint32(0); i < 5000; i++ {
 		bitmapBitmap.add((2 << 16) | (i << 1))
 	}
 
-	reused2 := intIteratorPool.Get()
-	reused2.initialize(bitmapBitmap)
-	defer intIteratorPool.Put(reused2)
+	reused2 := getIntIterator(bitmapBitmap)
+	defer putIntIterator(reused2)
 	if !testRaceEnabled && reused2 != it {
 		t.Fatalf("intIterator pool did not reuse iterator on second pass")
 	}
@@ -130,15 +127,15 @@ func TestIntIteratorPool_ReusedIteratorResetsEmbeddedState(t *testing.T) {
 }
 
 func TestReleaseBitmap_SharedCloneSurvivesPoolReuse(t *testing.T) {
-	src := bitmapPool.Get()
+	src := getBitmap32()
 	src.add(7)
 	src.add(9)
 	src.addRange(uint64(1<<16), uint64((1<<16)+128))
 
-	clone := src.cloneSharedInto(bitmapPool.Get())
+	clone := src.cloneSharedInto(getBitmap32())
 	src.release()
 
-	reused := bitmapPool.Get()
+	reused := getBitmap32()
 	reused.add(12345)
 	reused.release()
 
@@ -152,7 +149,7 @@ func TestReleaseBitmap_SharedCloneSurvivesPoolReuse(t *testing.T) {
 }
 
 func TestBitmap32BasicsAndBoundaries(t *testing.T) {
-	rb := bitmapPool.Get()
+	rb := getBitmap32()
 	defer rb.release()
 
 	if !rb.isEmpty() {
@@ -198,7 +195,7 @@ func TestBitmap32BasicsAndBoundaries(t *testing.T) {
 }
 
 func TestBitmap32AddManyHandlesUnsortedAndDuplicates(t *testing.T) {
-	rb := bitmapPool.Get()
+	rb := getBitmap32()
 	defer rb.release()
 
 	input := []uint32{
@@ -223,7 +220,7 @@ func TestBitmap32AddManySortedFullContainerMinimizesToRun(t *testing.T) {
 	}
 
 	t.Run("Fresh", func(t *testing.T) {
-		rb := bitmapPool.Get()
+		rb := getBitmap32()
 		defer rb.release()
 
 		want := makeBatch(0, maxCapacity)
@@ -239,7 +236,7 @@ func TestBitmap32AddManySortedFullContainerMinimizesToRun(t *testing.T) {
 	})
 
 	t.Run("ExistingArrayAndBitmap", func(t *testing.T) {
-		rb := bitmapPool.Get()
+		rb := getBitmap32()
 		defer rb.release()
 
 		want := makeBatch(0, maxCapacity)
@@ -251,7 +248,7 @@ func TestBitmap32AddManySortedFullContainerMinimizesToRun(t *testing.T) {
 			t.Fatalf("sorted bulk fill through existing array must minimize to run, got %T", rb.highlowcontainer.getContainerAtIndex(0))
 		}
 
-		rb2 := bitmapPool.Get()
+		rb2 := getBitmap32()
 		defer rb2.release()
 		rb2.addMany(want[:arrayDefaultMaxSize+32])
 		rb2.addMany(want[arrayDefaultMaxSize+32:])
@@ -317,7 +314,7 @@ func TestMergeArrayWithSorted32ReusesCapacity(t *testing.T) {
 
 func TestBitmap32SortedHelperPaths(t *testing.T) {
 	t.Run("LoadManySorted64", func(t *testing.T) {
-		rb := bitmapPool.Get()
+		rb := getBitmap32()
 		defer rb.release()
 
 		rb.loadManySorted64([]uint64{
@@ -333,7 +330,7 @@ func TestBitmap32SortedHelperPaths(t *testing.T) {
 	})
 
 	t.Run("AddSortedSameHighbitsArrayBitmapAndRun", func(t *testing.T) {
-		arrayRB := bitmapPool.Get()
+		arrayRB := getBitmap32()
 		defer arrayRB.release()
 		arrayRB.addMany([]uint32{1, 3, 5})
 		arrayRB.addSortedSameHighbits(0, []uint32{3, 4, 7, 8, 8})
@@ -342,7 +339,7 @@ func TestBitmap32SortedHelperPaths(t *testing.T) {
 			t.Fatalf("array merge path must keep array for sparse result, got %T", arrayRB.highlowcontainer.getContainerAtIndex(0))
 		}
 
-		bitmapRB := bitmapPool.Get()
+		bitmapRB := getBitmap32()
 		defer bitmapRB.release()
 		dense := make([]uint32, 0, arrayDefaultMaxSize+64)
 		for i := 0; i < arrayDefaultMaxSize+64; i++ {
@@ -357,7 +354,7 @@ func TestBitmap32SortedHelperPaths(t *testing.T) {
 			t.Fatalf("bitmap merge path lost sorted additions")
 		}
 
-		runRB := bitmapPool.Get()
+		runRB := getBitmap32()
 		defer runRB.release()
 		runRB.addRange(1<<16, (1<<16)+8)
 		runRB.runOptimize()
@@ -418,7 +415,7 @@ func TestBitmap32SetOpsAndRunOptimize(t *testing.T) {
 		t.Fatalf("andCardinality mismatch: got=%d want=%d", got, len(wantAnd))
 	}
 
-	sparse := bitmapPool.Get()
+	sparse := getBitmap32()
 	defer sparse.release()
 	sparse.addMany([]uint32{1, 3, 7, 11})
 	sparse.runOptimize()
@@ -426,7 +423,7 @@ func TestBitmap32SetOpsAndRunOptimize(t *testing.T) {
 		t.Fatalf("sparse container should stay array after runOptimize")
 	}
 
-	runFriendly := bitmapPool.Get()
+	runFriendly := getBitmap32()
 	defer runFriendly.release()
 	runFriendly.addRange(1<<16, (1<<16)+1024)
 	runFriendly.runOptimize()
@@ -434,7 +431,7 @@ func TestBitmap32SetOpsAndRunOptimize(t *testing.T) {
 		t.Fatalf("run-friendly container should become run after runOptimize")
 	}
 
-	dense := bitmapPool.Get()
+	dense := getBitmap32()
 	defer dense.release()
 	for i := uint32(0); i < 5000; i++ {
 		dense.add((2 << 16) | (i << 1))
@@ -446,7 +443,7 @@ func TestBitmap32SetOpsAndRunOptimize(t *testing.T) {
 }
 
 func TestBitmap32IteratorsAcrossMixedContainers(t *testing.T) {
-	rb := bitmapPool.Get()
+	rb := getBitmap32()
 	defer rb.release()
 
 	rb.addMany([]uint32{1, 3, 7})
@@ -677,7 +674,7 @@ func TestBitmap32ReadFromRejectsNonMonotonicKeys(t *testing.T) {
 }
 
 func TestBitmap32ReadWriteRoundTripAndReceiverReuseOnError(t *testing.T) {
-	rb := bitmapPool.Get()
+	rb := getBitmap32()
 	defer rb.release()
 	rb.addMany([]uint32{1, 3, 7, 11})
 	rb.addRange(1<<16, (1<<16)+32)
@@ -712,12 +709,12 @@ func TestBitmap32ReadWriteRoundTripAndReceiverReuseOnError(t *testing.T) {
 }
 
 func TestBitmap32SharedCloneDetachWritableContainer(t *testing.T) {
-	src := bitmapPool.Get()
+	src := getBitmap32()
 	src.addRange(0, 512)
 	src.addRange(1<<16, (1<<16)+16)
 	src.runOptimize()
 
-	shared := src.cloneSharedInto(bitmapPool.Get())
+	shared := src.cloneSharedInto(getBitmap32())
 	defer shared.release()
 
 	original := shared.highlowcontainer.getContainerAtIndex(0)
@@ -739,9 +736,9 @@ func TestBitmap32SharedCloneDetachWritableContainer(t *testing.T) {
 }
 
 func TestBitmap32OrInterleavedSharedCloneKeepsSource(t *testing.T) {
-	src := bitmapPool.Get()
+	src := getBitmap32()
 	defer src.release()
-	right := bitmapPool.Get()
+	right := getBitmap32()
 	defer right.release()
 
 	leftIDs := make([]uint32, 0, 96)
@@ -767,7 +764,7 @@ func TestBitmap32OrInterleavedSharedCloneKeepsSource(t *testing.T) {
 		}
 	}
 
-	dst := src.cloneSharedInto(bitmapPool.Get())
+	dst := src.cloneSharedInto(getBitmap32())
 	defer dst.release()
 	dst.or(right)
 
@@ -776,9 +773,9 @@ func TestBitmap32OrInterleavedSharedCloneKeepsSource(t *testing.T) {
 }
 
 func TestBitmap32XorInterleavedSharedCloneKeepsSource(t *testing.T) {
-	src := bitmapPool.Get()
+	src := getBitmap32()
 	defer src.release()
-	right := bitmapPool.Get()
+	right := getBitmap32()
 	defer right.release()
 
 	leftIDs := make([]uint32, 0, 128)
@@ -814,7 +811,7 @@ func TestBitmap32XorInterleavedSharedCloneKeepsSource(t *testing.T) {
 		}
 	}
 
-	dst := src.cloneSharedInto(bitmapPool.Get())
+	dst := src.cloneSharedInto(getBitmap32())
 	defer dst.release()
 	dst.xor(right)
 
@@ -823,7 +820,7 @@ func TestBitmap32XorInterleavedSharedCloneKeepsSource(t *testing.T) {
 }
 
 func TestBitmap32ConcurrentIteratorCreateReleaseStable(t *testing.T) {
-	rb := bitmapPool.Get()
+	rb := getBitmap32()
 	defer rb.release()
 	rb.addRange(0, 1024)
 	rb.addRange(1<<16, (1<<16)+256)

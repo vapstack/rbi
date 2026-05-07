@@ -8,8 +8,6 @@ import (
 	"math/bits"
 	"slices"
 	"unsafe"
-
-	"github.com/vapstack/rbi/internal/pooled"
 )
 
 type largePosting struct {
@@ -86,7 +84,7 @@ func (lp *largePosting) ReadFrom(stream io.Reader) (p int64, err error) {
 		}
 		prevKey = key
 		lp.highlowcontainer.keys[i] = key
-		lp.highlowcontainer.containers[i] = bitmapPool.Get()
+		lp.highlowcontainer.containers[i] = getBitmap32()
 		n64, readErr := lp.highlowcontainer.containers[i].ReadFrom(stream)
 		p += n64
 		if n64 == 0 || readErr != nil {
@@ -185,13 +183,11 @@ func (lp *largePosting) serializedSizeInBytes() uint64 {
 }
 
 func (lp *largePosting) iterator() *largeIterator {
-	it := largeIteratorPool.Get()
-	it.initialize(lp)
-	return it
+	return getLargeIterator(lp)
 }
 
 func (lp *largePosting) release() {
-	largePostingPool.Put(lp)
+	putLargePosting(lp)
 }
 
 func (lp *largePosting) Release() { lp.release() }
@@ -261,7 +257,7 @@ func (lp *largePosting) add(x uint64) {
 		la.getWritableContainerAtIndex(i).add(lowbits64(x))
 		return
 	}
-	next := bitmapPool.Get()
+	next := getBitmap32()
 	next.add(lowbits64(x))
 	la.insertNewKeyValueAt(-i-1, hb, next)
 }
@@ -272,7 +268,7 @@ func (lp *largePosting) checkedAdd(x uint64) bool {
 	if i >= 0 {
 		return lp.highlowcontainer.getWritableContainerAtIndex(i).checkedAdd(lowbits64(x))
 	}
-	next := bitmapPool.Get()
+	next := getBitmap32()
 	next.add(lowbits64(x))
 	lp.highlowcontainer.insertNewKeyValueAt(-i-1, hb, next)
 	return true
@@ -330,7 +326,7 @@ func (lp *largePosting) addSortedHighBitsBatch(hb uint32, dat []uint64) {
 	la := &lp.highlowcontainer
 	i := la.getIndex(hb)
 	if i < 0 {
-		next := bitmapPool.Get()
+		next := getBitmap32()
 		next.loadManySorted64(dat)
 		la.insertNewKeyValueAt(-i-1, hb, next)
 		return
@@ -367,7 +363,7 @@ func (lp *largePosting) getOrCreateContainer(hb uint32) *bitmap32 {
 	if i >= 0 {
 		return la.getWritableContainerAtIndex(i)
 	}
-	next := bitmapPool.Get()
+	next := getBitmap32()
 	la.insertNewKeyValueAt(-i-1, hb, next)
 	return next
 }
@@ -737,12 +733,8 @@ func (it *largeIterator) advanceIfNeeded(minval uint64) {
 }
 
 func (it *largeIterator) initialize(lp *largePosting) {
-	if it.iter != nil {
-		it.iter.release()
-	}
 	it.pos = 0
 	it.hs = 0
-	it.iter = nil
 	// Retain a shared top-level snapshot so owner Release cannot invalidate
 	// iterator traversal mid-stream.
 	it.highlowcontainer.copySharedFrom(&lp.highlowcontainer)
@@ -750,7 +742,7 @@ func (it *largeIterator) initialize(lp *largePosting) {
 }
 
 func (it *largeIterator) Release() {
-	largeIteratorPool.Put(it)
+	putLargeIterator(it)
 }
 
 func writeLarge(writer *bufio.Writer, lp *largePosting) error {
@@ -781,13 +773,13 @@ func readLarge(reader *bufio.Reader) (lp *largePosting, err error) {
 		return nil, err
 	}
 	if size == 0 {
-		lp = largePostingPool.Get()
+		lp = getLargePosting()
 		return lp, nil
 	}
 	if size > (^uint64(0) >> 1) {
 		return nil, fmt.Errorf("large posting size overflows int64: %v", size)
 	}
-	lp = largePostingPool.Get()
+	lp = getLargePosting()
 	lp.clear()
 	defer recoverLargeRead(&lp, &err)
 	var n int64
@@ -824,49 +816,6 @@ func skipLarge(reader *bufio.Reader) error {
 	}
 	_, err = io.CopyN(io.Discard, reader, int64(size))
 	return err
-}
-
-var (
-	largePostingPool = pooled.Pointers[largePosting]{
-		New: func() *largePosting {
-			return new(largePosting)
-		},
-		Cleanup: func(lp *largePosting) {
-			lp.clear()
-		},
-	}
-	largeIteratorPool = pooled.Pointers[largeIterator]{
-		Cleanup: func(it *largeIterator) {
-			if it.iter != nil {
-				it.iter.release()
-			}
-			it.pos = 0
-			it.hs = 0
-			it.iter = nil
-			it.highlowcontainer.clear()
-			it.highlowcontainer.releaseBacking()
-		},
-	}
-)
-
-func init() {
-	for i, maxcap := range largeArrayPoolCapacities {
-		c := maxcap
-		largeArrayStoragePools[i] = pooled.Pointers[largeArrayStorage]{
-			New: func() *largeArrayStorage {
-				return &largeArrayStorage{
-					keys:       make([]uint32, 0, c),
-					containers: make([]*bitmap32, 0, c),
-				}
-			},
-			Cleanup: func(storage *largeArrayStorage) {
-				clear(storage.keys[:cap(storage.keys)])
-				storage.keys = storage.keys[:0]
-				clear(storage.containers[:cap(storage.containers)])
-				storage.containers = storage.containers[:0]
-			},
-		}
-	}
 }
 
 func highbits64(x uint64) uint32 {
@@ -915,8 +864,6 @@ var largeArrayPoolCapacities = [...]int{
 
 const maxPooledLargeArrayCapacity = 1 << 20
 
-var largeArrayStoragePools [len(largeArrayPoolCapacities)]pooled.Pointers[largeArrayStorage]
-
 func (la *largeArray) ensureInline() {
 	if la == nil || la.keys != nil || la.containers != nil {
 		return
@@ -933,34 +880,6 @@ func largeArrayPoolIndex(size int) int {
 		return -1
 	}
 	return bits.Len(uint(size-1)) - 3
-}
-
-func getLargeArrayStorageWithLen(l int) *largeArrayStorage {
-	if l <= 0 {
-		l = largeArrayPoolCapacities[0]
-	}
-	idx := largeArrayPoolIndex(l)
-	if idx < 0 {
-		return &largeArrayStorage{
-			keys:       make([]uint32, l),
-			containers: make([]*bitmap32, l),
-		}
-	}
-	out := largeArrayStoragePools[idx].Get()
-	out.keys = out.keys[:l]
-	out.containers = out.containers[:l]
-	return out
-}
-
-func putLargeArrayStorage(storage *largeArrayStorage) {
-	if storage == nil {
-		return
-	}
-	idx := largeArrayPoolIndex(cap(storage.keys))
-	if idx < 0 {
-		return
-	}
-	largeArrayStoragePools[idx].Put(storage)
 }
 
 func (la *largeArray) aliases(other *largeArray) bool {
@@ -1216,7 +1135,7 @@ func (la *largeArray) getWritableContainerAtIndex(i int) *bitmap32 {
 	if current.isUniquelyOwned() {
 		return current
 	}
-	cloned := current.cloneSharedInto(bitmapPool.Get())
+	cloned := current.cloneSharedInto(getBitmap32())
 	current.release()
 	la.containers[i] = cloned
 	return cloned
