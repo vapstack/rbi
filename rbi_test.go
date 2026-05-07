@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/vapstack/qx"
+	"github.com/vapstack/rbi/internal/keycodec"
 	"go.etcd.io/bbolt"
 )
 
@@ -1336,7 +1337,7 @@ func TestWrap_BuildIndexError_DoesNotCloseCallerBolt(t *testing.T) {
 			return err
 		}
 		// Invalid msgpack payload to force buildIndex decode error in Wrap.
-		return b.Put(uint64Bytes(1), []byte{0xc1})
+		return b.Put(keycodec.U64Bytes(1), []byte{0xc1})
 	}); err != nil {
 		t.Fatalf("seed invalid payload: %v", err)
 	}
@@ -3825,7 +3826,8 @@ func TestFailpoint_PostCommitPublishSet_BreaksDBAndSkipsIndexStore(t *testing.T)
 		if bucket == nil {
 			return fmt.Errorf("bucket does not exist")
 		}
-		raw := bucket.Get(db.keyFromID(1))
+		var keyBuf [8]byte
+		raw := bucket.Get(keycodec.UserKeyBytesWithBuf(uint64(1), db.strKey, &keyBuf))
 		if raw == nil {
 			return fmt.Errorf("record not committed")
 		}
@@ -4242,7 +4244,8 @@ func TestBatchSet_DuplicateIDs_BeforeCommit_SeesPerStepTxState(t *testing.T) {
 			{Name: "second", Age: 40},
 		},
 		BeforeCommit(func(tx *bbolt.Tx, key uint64, oldValue, newValue *Rec) error {
-			raw := tx.Bucket(db.bucket).Get(db.keyFromID(key))
+			var keyBuf [8]byte
+			raw := tx.Bucket(db.bucket).Get(keycodec.UserKeyBytesWithBuf(key, db.strKey, &keyBuf))
 			if raw == nil {
 				return fmt.Errorf("missing value for id=%d inside BeforeCommit", key)
 			}
@@ -4449,7 +4452,8 @@ func TestBatchPatch_DuplicateIDs_BeforeCommit_SeesPerStepTxState(t *testing.T) {
 			return nil
 		}),
 		BeforeCommit(func(tx *bbolt.Tx, key uint64, oldValue, newValue *Rec) error {
-			raw := tx.Bucket(db.bucket).Get(db.keyFromID(key))
+			var keyBuf [8]byte
+			raw := tx.Bucket(db.bucket).Get(keycodec.UserKeyBytesWithBuf(key, db.strKey, &keyBuf))
 			if raw == nil {
 				return fmt.Errorf("missing value for id=%d inside BeforeCommit", key)
 			}
@@ -4489,7 +4493,8 @@ func TestBatchPatch_DecodeError_RollsBackEarlierWrites(t *testing.T) {
 		if b == nil {
 			return fmt.Errorf("bucket does not exist")
 		}
-		v := b.Get(db.keyFromID(1))
+		var keyBuf [8]byte
+		v := b.Get(keycodec.UserKeyBytesWithBuf(uint64(1), db.strKey, &keyBuf))
 		if v == nil {
 			return fmt.Errorf("missing raw value for id=1")
 		}
@@ -4504,7 +4509,8 @@ func TestBatchPatch_DecodeError_RollsBackEarlierWrites(t *testing.T) {
 		if b == nil {
 			return fmt.Errorf("bucket does not exist")
 		}
-		return b.Put(db.keyFromID(2), []byte{0xff, 0x00, 0x7f, 0x42})
+		var keyBuf [8]byte
+		return b.Put(keycodec.UserKeyBytesWithBuf(uint64(2), db.strKey, &keyBuf), []byte{0xff, 0x00, 0x7f, 0x42})
 	}); err != nil {
 		t.Fatalf("corrupt id=2 payload: %v", err)
 	}
@@ -4523,7 +4529,8 @@ func TestBatchPatch_DecodeError_RollsBackEarlierWrites(t *testing.T) {
 		if b == nil {
 			return fmt.Errorf("bucket does not exist")
 		}
-		v := b.Get(db.keyFromID(1))
+		var keyBuf [8]byte
+		v := b.Get(keycodec.UserKeyBytesWithBuf(uint64(1), db.strKey, &keyBuf))
 		if v == nil {
 			return fmt.Errorf("missing raw value for id=1 after failed batch")
 		}
@@ -4561,7 +4568,8 @@ func TestBatchDelete_DecodeError_RollsBackEarlierDeletes(t *testing.T) {
 		if b == nil {
 			return fmt.Errorf("bucket does not exist")
 		}
-		v := b.Get(db.keyFromID(1))
+		var keyBuf [8]byte
+		v := b.Get(keycodec.UserKeyBytesWithBuf(uint64(1), db.strKey, &keyBuf))
 		if v == nil {
 			return fmt.Errorf("missing raw value for id=1")
 		}
@@ -4576,7 +4584,8 @@ func TestBatchDelete_DecodeError_RollsBackEarlierDeletes(t *testing.T) {
 		if b == nil {
 			return fmt.Errorf("bucket does not exist")
 		}
-		return b.Put(db.keyFromID(2), []byte{0xff, 0x00, 0x7f, 0x42})
+		var keyBuf [8]byte
+		return b.Put(keycodec.UserKeyBytesWithBuf(uint64(2), db.strKey, &keyBuf), []byte{0xff, 0x00, 0x7f, 0x42})
 	}); err != nil {
 		t.Fatalf("corrupt id=2 payload: %v", err)
 	}
@@ -4595,7 +4604,8 @@ func TestBatchDelete_DecodeError_RollsBackEarlierDeletes(t *testing.T) {
 		if b == nil {
 			return fmt.Errorf("bucket does not exist")
 		}
-		v := b.Get(db.keyFromID(1))
+		var keyBuf [8]byte
+		v := b.Get(keycodec.UserKeyBytesWithBuf(uint64(1), db.strKey, &keyBuf))
 		if v == nil {
 			return fmt.Errorf("id=1 was deleted despite rollback")
 		}
@@ -4979,7 +4989,8 @@ func TestFailpoint_CloseStoreIndexErrorStillCloses(t *testing.T) {
 		if b == nil {
 			return fmt.Errorf("bucket missing after close")
 		}
-		if b.Get(db.keyFromID(1)) == nil {
+		var keyBuf [8]byte
+		if b.Get(keycodec.UserKeyBytesWithBuf(uint64(1), db.strKey, &keyBuf)) == nil {
 			return fmt.Errorf("record missing after close")
 		}
 		return nil

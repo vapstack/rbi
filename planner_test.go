@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/vapstack/qx"
+	"github.com/vapstack/rbi/internal/keycodec"
 	"github.com/vapstack/rbi/internal/pools"
 	"github.com/vapstack/rbi/internal/posting"
 	"github.com/vapstack/rbi/internal/qir"
@@ -522,9 +523,9 @@ func TestOrderRangeCoverage_ConsistencyBetweenPredicateKinds(t *testing.T) {
 	db, _ := openTempDBUint64(t)
 
 	s := []index{
-		{Key: indexKeyFromString("alice"), IDs: postingOf(1)},
-		{Key: indexKeyFromString("alina"), IDs: postingOf(2)},
-		{Key: indexKeyFromString("bob"), IDs: postingOf(3)},
+		{Key: keycodec.FromString("alice"), IDs: postingOf(1)},
+		{Key: keycodec.FromString("alina"), IDs: postingOf(2)},
+		{Key: keycodec.FromString("bob"), IDs: postingOf(3)},
 	}
 	ov := newFieldOverlay(&s)
 

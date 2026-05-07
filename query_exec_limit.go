@@ -3,6 +3,7 @@ package rbi
 import (
 	"math/bits"
 
+	"github.com/vapstack/rbi/internal/keycodec"
 	"github.com/vapstack/rbi/internal/pooled"
 	"github.com/vapstack/rbi/internal/pools"
 	"github.com/vapstack/rbi/internal/posting"
@@ -1242,8 +1243,8 @@ func applyBoundsToIndexRange(s []index, b rangeBounds) (start, end int) {
 		}
 		if !b.loInc {
 			if lo < len(s) &&
-				((b.loNumeric && compareIndexKeys(s[lo].Key, b.loIndex) == 0) ||
-					(!b.loNumeric && indexKeyEqualsString(s[lo].Key, b.loKey))) {
+				((b.loNumeric && keycodec.Compare(s[lo].Key, b.loIndex) == 0) ||
+					(!b.loNumeric && keycodec.EqualsString(s[lo].Key, b.loKey))) {
 				lo++
 			}
 		}

@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/vapstack/qx"
+	"github.com/vapstack/rbi/internal/keycodec"
 )
 
 func memoryExtraTwoChunkNumericRoot() *fieldIndexChunkedRoot {
@@ -848,7 +849,7 @@ func TestMemoryExtra_ApplySingleFieldPostingDiffChunked_FullPageSplitDoesNotMuta
 	baseRows := root.chunkRowsRange(0, root.chunkCount)
 	baseLastChunkStart := root.entryPrefixForChunk(root.chunkCount - 1)
 
-	insertKey := indexKeyFromU64((1 << 32) + 2)
+	insertKey := keycodec.FromU64((1 << 32) + 2)
 	out := applySingleFieldPostingDiffChunked(root, keyedBatchPostingDelta{
 		key: insertKey,
 		delta: batchPostingDelta{

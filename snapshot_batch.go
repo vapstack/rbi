@@ -4,6 +4,7 @@ import (
 	"sort"
 	"unsafe"
 
+	"github.com/vapstack/rbi/internal/keycodec"
 	"github.com/vapstack/rbi/internal/pooled"
 	"github.com/vapstack/rbi/internal/pools"
 	"github.com/vapstack/rbi/internal/posting"
@@ -23,7 +24,7 @@ type batchPostingDelta struct {
 }
 
 type keyedBatchPostingDelta struct {
-	key   indexKey
+	key   keycodec.IndexKey
 	delta batchPostingDelta
 }
 
@@ -40,7 +41,7 @@ func (s keyedBatchPostingDeltaBufOrder) Swap(i, j int) {
 }
 
 func (s keyedBatchPostingDeltaBufOrder) Less(i, j int) bool {
-	return compareIndexKeys(s.buf.Get(i).key, s.buf.Get(j).key) < 0
+	return keycodec.Compare(s.buf.Get(i).key, s.buf.Get(j).key) < 0
 }
 
 func sortKeyedBatchPostingDeltasBuf(buf *pooled.Slice[keyedBatchPostingDelta]) {
@@ -564,7 +565,7 @@ func sortedBatchPostingDeltasBufOwned(
 			continue
 		}
 		buf.Append(keyedBatchPostingDelta{
-			key:   indexKeyFromStoredString(raw, fixed8),
+			key:   keycodec.FromStoredString(raw, fixed8),
 			delta: delta,
 		})
 	}
@@ -596,7 +597,7 @@ func sortedFixedBatchPostingDeltasBufOwned(
 			continue
 		}
 		buf.Append(keyedBatchPostingDelta{
-			key:   indexKeyFromU64(raw),
+			key:   keycodec.FromU64(raw),
 			delta: delta,
 		})
 	}
@@ -637,7 +638,7 @@ func applyFieldPostingDiffSorted(base *[]index, deltaKeys []keyedBatchPostingDel
 			}
 			j++
 		default:
-			cmp := compareIndexKeys(src[i].Key, deltaKeys[j].key)
+			cmp := keycodec.Compare(src[i].Key, deltaKeys[j].key)
 			switch {
 			case cmp < 0:
 				out = append(out, borrowedFieldIndexEntry(src[i]))
@@ -694,7 +695,7 @@ func applyFieldPostingDiffSortedBuf(base *[]index, deltaKeys *pooled.Slice[keyed
 			j++
 		default:
 			delta := deltaKeys.Get(j)
-			cmp := compareIndexKeys(src[i].Key, delta.key)
+			cmp := keycodec.Compare(src[i].Key, delta.key)
 			switch {
 			case cmp < 0:
 				out = append(out, borrowedFieldIndexEntry(src[i]))
@@ -736,7 +737,7 @@ func applySingleFieldPostingDiffSorted(base *[]index, delta keyedBatchPostingDel
 	}
 
 	pos := lowerBoundIndexEntriesKey(src, delta.key)
-	if pos >= len(src) || compareIndexKeys(src[pos].Key, delta.key) > 0 {
+	if pos >= len(src) || keycodec.Compare(src[pos].Key, delta.key) > 0 {
 		ids := applyBatchPostingDeltaOwned(posting.List{}, &delta.delta)
 		if ids.IsEmpty() {
 			return base
@@ -780,9 +781,9 @@ func appendFieldPostingDiffFlatSorted(builder *fieldIndexChunkBuilder, base *[]i
 
 	numeric := false
 	if len(src) > 0 {
-		numeric = src[0].Key.isNumeric()
+		numeric = src[0].Key.IsNumeric()
 	} else if len(deltaKeys) > 0 {
-		numeric = deltaKeys[0].key.isNumeric()
+		numeric = deltaKeys[0].key.IsNumeric()
 	}
 	out := newFieldIndexChunkStreamBuilder(builder, numeric)
 
@@ -799,7 +800,7 @@ func appendFieldPostingDiffFlatSorted(builder *fieldIndexChunkBuilder, base *[]i
 			}
 			j++
 		default:
-			cmp := compareIndexKeys(src[i].Key, deltaKeys[j].key)
+			cmp := keycodec.Compare(src[i].Key, deltaKeys[j].key)
 			switch {
 			case cmp < 0:
 				out.append(src[i].Key, src[i].IDs.Borrow())
@@ -838,9 +839,9 @@ func appendFieldPostingDiffFlatSortedBuf(builder *fieldIndexChunkBuilder, base *
 
 	numeric := false
 	if len(src) > 0 {
-		numeric = src[0].Key.isNumeric()
+		numeric = src[0].Key.IsNumeric()
 	} else if deltaKeys != nil && deltaKeys.Len() > 0 {
-		numeric = deltaKeys.Get(0).key.isNumeric()
+		numeric = deltaKeys.Get(0).key.IsNumeric()
 	}
 	out := newFieldIndexChunkStreamBuilder(builder, numeric)
 
@@ -859,7 +860,7 @@ func appendFieldPostingDiffFlatSortedBuf(builder *fieldIndexChunkBuilder, base *
 			j++
 		default:
 			delta := deltaKeys.Get(j)
-			cmp := compareIndexKeys(src[i].Key, delta.key)
+			cmp := keycodec.Compare(src[i].Key, delta.key)
 			switch {
 			case cmp < 0:
 				out.append(src[i].Key, src[i].IDs.Borrow())
@@ -942,7 +943,7 @@ func appendFieldPostingDiffChunkRangeSorted(
 			numeric = true
 		}
 	} else if len(deltaKeys) > 0 {
-		numeric = deltaKeys[0].key.isNumeric()
+		numeric = deltaKeys[0].key.IsNumeric()
 	}
 	out := newFieldIndexChunkStreamBuilder(builder, numeric)
 
@@ -966,7 +967,7 @@ func appendFieldPostingDiffChunkRangeSorted(
 			out.append(baseEnt.Key, baseEnt.IDs)
 			advanceFieldPostingDiffBaseEntry(base, endChunk, &chunkIdx, &entryIdx)
 		default:
-			cmp := compareIndexKeys(baseEnt.Key, deltaKeys[j].key)
+			cmp := keycodec.Compare(baseEnt.Key, deltaKeys[j].key)
 			switch {
 			case cmp < 0:
 				out.append(baseEnt.Key, baseEnt.IDs)
@@ -1011,7 +1012,7 @@ func appendFieldPostingDiffChunkRangeSortedBuf(
 			numeric = true
 		}
 	} else {
-		numeric = deltaKeys.Get(deltaStart).key.isNumeric()
+		numeric = deltaKeys.Get(deltaStart).key.IsNumeric()
 	}
 	out := newFieldIndexChunkStreamBuilder(builder, numeric)
 
@@ -1037,7 +1038,7 @@ func appendFieldPostingDiffChunkRangeSortedBuf(
 			advanceFieldPostingDiffBaseEntry(base, endChunk, &chunkIdx, &entryIdx)
 		default:
 			delta := deltaKeys.Get(j)
-			cmp := compareIndexKeys(baseEnt.Key, delta.key)
+			cmp := keycodec.Compare(baseEnt.Key, delta.key)
 			switch {
 			case cmp < 0:
 				out.append(baseEnt.Key, baseEnt.IDs)
@@ -1139,13 +1140,13 @@ func sortedLenFieldPostingDeltasBufOwned(deltas *lenFieldPostingDelta) *pooled.S
 			continue
 		}
 		buf.Append(keyedBatchPostingDelta{
-			key:   indexKeyFromU64(raw),
+			key:   keycodec.FromU64(raw),
 			delta: delta,
 		})
 	}
 	if deltas.hasNonEmpty && (!deltas.nonEmpty.add.IsEmpty() || !deltas.nonEmpty.remove.IsEmpty()) {
 		buf.Append(keyedBatchPostingDelta{
-			key:   indexKeyFromString(lenIndexNonEmptyKey),
+			key:   keycodec.FromString(lenIndexNonEmptyKey),
 			delta: deltas.nonEmpty,
 		})
 	}
@@ -1185,7 +1186,7 @@ func takeLenFieldPostingDeltasOwned(deltas *lenFieldPostingDelta, dst []keyedBat
 			continue
 		}
 		dst[n] = keyedBatchPostingDelta{
-			key:   indexKeyFromU64(raw),
+			key:   keycodec.FromU64(raw),
 			delta: delta,
 		}
 		n++
@@ -1195,7 +1196,7 @@ func takeLenFieldPostingDeltasOwned(deltas *lenFieldPostingDelta, dst []keyedBat
 	}
 	if n < len(dst) && deltas.hasNonEmpty && (!deltas.nonEmpty.add.IsEmpty() || !deltas.nonEmpty.remove.IsEmpty()) {
 		dst[n] = keyedBatchPostingDelta{
-			key:   indexKeyFromString(lenIndexNonEmptyKey),
+			key:   keycodec.FromString(lenIndexNonEmptyKey),
 			delta: deltas.nonEmpty,
 		}
 		n++
@@ -1233,7 +1234,7 @@ func applyLenFieldPostingDiffStorageOwned(base fieldIndexStorage, deltas *lenFie
 	if count <= len(inline) {
 		n := takeLenFieldPostingDeltasOwned(deltas, inline[:count])
 		deltaKeys = inline[:n]
-		if len(deltaKeys) > 1 && compareIndexKeys(deltaKeys[0].key, deltaKeys[1].key) > 0 {
+		if len(deltaKeys) > 1 && keycodec.Compare(deltaKeys[0].key, deltaKeys[1].key) > 0 {
 			deltaKeys[0], deltaKeys[1] = deltaKeys[1], deltaKeys[0]
 		}
 	} else {
@@ -1267,7 +1268,7 @@ func takeSingleLenFieldPostingDeltaOwned(deltas *lenFieldPostingDelta) (keyedBat
 		}
 		putLenFieldPostingDelta(deltas)
 		return keyedBatchPostingDelta{
-			key:   indexKeyFromU64(raw),
+			key:   keycodec.FromU64(raw),
 			delta: delta,
 		}, true
 	}
@@ -1275,7 +1276,7 @@ func takeSingleLenFieldPostingDeltaOwned(deltas *lenFieldPostingDelta) (keyedBat
 		delta := deltas.nonEmpty
 		putLenFieldPostingDelta(deltas)
 		return keyedBatchPostingDelta{
-			key:   indexKeyFromString(lenIndexNonEmptyKey),
+			key:   keycodec.FromString(lenIndexNonEmptyKey),
 			delta: delta,
 		}, true
 	}
@@ -1501,7 +1502,7 @@ func applySingleFieldPostingDiffChunked(base *fieldIndexChunkedRoot, delta keyed
 	if delta.delta.remove.IsEmpty() &&
 		!delta.delta.add.IsEmpty() &&
 		entryIdx < ref.chunk.keyCount() &&
-		compareIndexKeys(ref.chunk.keyAt(entryIdx), delta.key) == 0 {
+		keycodec.Compare(ref.chunk.keyAt(entryIdx), delta.key) == 0 {
 		baseIDs := ref.chunk.postingAt(entryIdx)
 		updatedIDs := applyBatchPostingDeltaOwned(baseIDs, &delta.delta)
 		if updatedIDs.SharesPayload(baseIDs) {
@@ -1524,7 +1525,7 @@ func applySingleFieldPostingDiffChunked(base *fieldIndexChunkedRoot, delta keyed
 			if ref.chunk.hasUniqueNumericOwners() {
 				keys := make([]uint64, ref.chunk.keyCount())
 				for i := range keys {
-					keys[i] = ref.chunk.keyAt(i).meta
+					keys[i] = ref.chunk.keyAt(i).U64()
 				}
 				chunk = newNumericFieldIndexChunk(posts, keys, rows)
 			} else {
@@ -1590,7 +1591,7 @@ func sortedInsertPostingAddsBufOwned(
 	for raw, ref := range adds {
 		ids := arena.accum(ref).materializeOwned()
 		buf.Append(keyedBatchPostingDelta{
-			key: indexKeyFromStoredString(raw, fixed8),
+			key: keycodec.FromStoredString(raw, fixed8),
 			delta: batchPostingDelta{
 				add: ids,
 			},
@@ -1614,7 +1615,7 @@ func sortedFixedInsertPostingAddsBufOwned(
 	for raw, ref := range adds {
 		ids := arena.accum(ref).materializeOwned()
 		buf.Append(keyedBatchPostingDelta{
-			key: indexKeyFromU64(raw),
+			key: keycodec.FromU64(raw),
 			delta: batchPostingDelta{
 				add: ids,
 			},
@@ -1646,7 +1647,7 @@ func mergeInsertOnlyFieldStorageOwned(
 		if len(adds) == 1 {
 			for raw, ref := range adds {
 				add := keyedBatchPostingDelta{
-					key: indexKeyFromStoredString(raw, fixed8),
+					key: keycodec.FromStoredString(raw, fixed8),
 					delta: batchPostingDelta{
 						add: arena.accum(ref).materializeOwned(),
 					},
@@ -1700,7 +1701,7 @@ func mergeInsertOnlyFixedFieldStorageOwned(
 		if len(adds) == 1 {
 			for raw, ref := range adds {
 				add := keyedBatchPostingDelta{
-					key: indexKeyFromU64(raw),
+					key: keycodec.FromU64(raw),
 					delta: batchPostingDelta{
 						add: arena.accum(ref).materializeOwned(),
 					},

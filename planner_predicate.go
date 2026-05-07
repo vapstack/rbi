@@ -5,6 +5,7 @@ import (
 	"math/bits"
 	"strconv"
 
+	"github.com/vapstack/rbi/internal/keycodec"
 	"github.com/vapstack/rbi/internal/pooled"
 	"github.com/vapstack/rbi/internal/pools"
 	"github.com/vapstack/rbi/internal/posting"
@@ -1619,7 +1620,7 @@ func (qv *queryView) materializedPredKeyForScalar(field string, op qir.Op, key s
 		return materializedPredKey{}
 	}
 	if fm := qv.fields[field]; fieldUsesOrderedNumericKeys(fm) && len(key) == 8 {
-		return materializedPredKeyForNumericScalar(field, op, indexKeyFromFixed8String(key))
+		return materializedPredKeyForNumericScalar(field, op, keycodec.FromFixed8String(key))
 	}
 	return materializedPredKeyForScalar(field, op, key)
 }
@@ -1633,7 +1634,7 @@ func (qv *queryView) materializedPredComplementKeyForScalar(field string, op qir
 		return materializedPredKey{}
 	}
 	if fm := qv.fields[field]; fieldUsesOrderedNumericKeys(fm) && len(key) == 8 {
-		return materializedPredComplementKeyForNumericScalar(field, op, indexKeyFromFixed8String(key))
+		return materializedPredComplementKeyForNumericScalar(field, op, keycodec.FromFixed8String(key))
 	}
 	return materializedPredComplementKeyForScalar(field, op, key)
 }

@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/vapstack/qx"
+	"github.com/vapstack/rbi/internal/keycodec"
 	"go.etcd.io/bbolt"
 )
 
@@ -198,7 +199,8 @@ func readAutoBatchExtraRawValue[K ~string | ~uint64, V any](tb testing.TB, db *D
 		if bucket == nil {
 			return fmt.Errorf("bucket does not exist")
 		}
-		raw := bucket.Get(db.keyFromID(id))
+		var keyBuf [8]byte
+		raw := bucket.Get(keycodec.UserKeyBytesWithBuf(id, db.strKey, &keyBuf))
 		if raw == nil {
 			return nil
 		}

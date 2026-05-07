@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/vapstack/qx"
+	"github.com/vapstack/rbi/internal/keycodec"
 	"github.com/vapstack/rbi/internal/pools"
 	"github.com/vapstack/rbi/internal/posting"
 )
@@ -15,11 +16,11 @@ func TestMaterializedPredKeyExactScalarRange_RoundTripNumeric(t *testing.T) {
 		hasLo:     true,
 		loInc:     true,
 		loNumeric: true,
-		loIndex:   indexKeyFromU64(orderedInt64Key(30)),
+		loIndex:   keycodec.FromU64(keycodec.OrderedInt64Key(30)),
 		hasHi:     true,
 		hiInc:     false,
 		hiNumeric: true,
-		hiIndex:   indexKeyFromU64(orderedInt64Key(60)),
+		hiIndex:   keycodec.FromU64(keycodec.OrderedInt64Key(60)),
 	}
 
 	key := materializedPredKeyForExactScalarRange("age", bounds)
@@ -42,11 +43,11 @@ func TestMaterializedPredKeyExactScalarRangeComplement_RoundTripNumeric(t *testi
 		hasLo:     true,
 		loInc:     true,
 		loNumeric: true,
-		loIndex:   indexKeyFromU64(orderedInt64Key(30)),
+		loIndex:   keycodec.FromU64(keycodec.OrderedInt64Key(30)),
 		hasHi:     true,
 		hiInc:     false,
 		hiNumeric: true,
-		hiIndex:   indexKeyFromU64(orderedInt64Key(60)),
+		hiIndex:   keycodec.FromU64(keycodec.OrderedInt64Key(60)),
 	}
 
 	key := materializedPredComplementKeyForExactScalarRange("age", bounds)
@@ -81,8 +82,8 @@ func TestMaterializedPredKeyExactScalarRange_ParseLegacyEncoding(t *testing.T) {
 }
 
 func TestMaterializedPredKeyScalar_NumericBoundsDoNotCollide(t *testing.T) {
-	k30 := materializedPredKeyForNumericScalar("age", compileScalarOpForTest(qx.OpGTE), indexKeyFromU64(orderedInt64Key(30)))
-	k40 := materializedPredKeyForNumericScalar("age", compileScalarOpForTest(qx.OpGTE), indexKeyFromU64(orderedInt64Key(40)))
+	k30 := materializedPredKeyForNumericScalar("age", compileScalarOpForTest(qx.OpGTE), keycodec.FromU64(keycodec.OrderedInt64Key(30)))
+	k40 := materializedPredKeyForNumericScalar("age", compileScalarOpForTest(qx.OpGTE), keycodec.FromU64(keycodec.OrderedInt64Key(40)))
 	if k30 == k40 {
 		t.Fatal("expected distinct numeric scalar cache keys")
 	}
@@ -95,8 +96,8 @@ func TestMaterializedPredKeyScalar_NumericBoundsDoNotCollide(t *testing.T) {
 		t.Fatalf("scalar round-trip mismatch:\n got=%#v\nwant=%#v", p30, k30)
 	}
 
-	c30 := materializedPredComplementKeyForNumericScalar("age", compileScalarOpForTest(qx.OpGTE), indexKeyFromU64(orderedInt64Key(30)))
-	c40 := materializedPredComplementKeyForNumericScalar("age", compileScalarOpForTest(qx.OpGTE), indexKeyFromU64(orderedInt64Key(40)))
+	c30 := materializedPredComplementKeyForNumericScalar("age", compileScalarOpForTest(qx.OpGTE), keycodec.FromU64(keycodec.OrderedInt64Key(30)))
+	c40 := materializedPredComplementKeyForNumericScalar("age", compileScalarOpForTest(qx.OpGTE), keycodec.FromU64(keycodec.OrderedInt64Key(40)))
 	if c30 == c40 {
 		t.Fatal("expected distinct numeric scalar complement cache keys")
 	}

@@ -1085,7 +1085,7 @@ func expectedKeysString(t testing.TB, db *DB[string, Rec], q *qx.QX) ([]string, 
 		if ok {
 			rows = append(rows, row{
 				id:  id,
-				idx: db.idxFromID(id),
+				idx: db.idxFromUserKey(id),
 				rec: v,
 			})
 		}

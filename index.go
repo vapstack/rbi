@@ -13,28 +13,16 @@ import (
 	"runtime/debug"
 	"slices"
 	"sort"
-	"strings"
 	"sync"
 	"time"
 	"unsafe"
 
+	"github.com/vapstack/rbi/internal/keycodec"
 	"github.com/vapstack/rbi/internal/pooled"
 	"github.com/vapstack/rbi/internal/pools"
 	"github.com/vapstack/rbi/internal/posting"
 	"go.etcd.io/bbolt"
 )
-
-var indexKeyNumericSentinel = new(byte)
-
-// indexKey stores either:
-// - numeric fixed-width key as uint64 (ptr == indexKeyNumericSentinel), or
-// - string key bytes (ptr points to first byte, meta stores length).
-//
-// It is intentionally compact to keep index entry footprint low.
-type indexKey struct {
-	ptr  *byte
-	meta uint64
-}
 
 func releaseBuildIndexRuns(runs []buildIndexFieldRun) {
 	for i := range runs {
@@ -140,296 +128,6 @@ func formatBuildIndexKeyDiagnostic(strKey bool, key []byte) string {
 	return fmt.Sprintf("key_len=%d key_prefix_hex=%s", len(key), formatDiagnosticBytesPrefix(key, 24))
 }
 
-func indexKeyFromString(s string) indexKey {
-	if len(s) == 0 {
-		return indexKey{}
-	}
-	return indexKey{
-		ptr:  unsafe.StringData(s),
-		meta: uint64(len(s)),
-	}
-}
-
-func indexKeyFromBytes(b []byte) indexKey {
-	if len(b) == 0 {
-		return indexKey{}
-	}
-	return indexKey{
-		ptr:  unsafe.SliceData(b),
-		meta: uint64(len(b)),
-	}
-}
-
-func indexKeyFromU64(v uint64) indexKey {
-	return indexKey{
-		ptr:  indexKeyNumericSentinel,
-		meta: v,
-	}
-}
-
-func indexKeyFromFixed8String(s string) indexKey {
-	if len(s) != 8 {
-		return indexKeyFromString(s)
-	}
-	return indexKeyFromU64(fixed8StringToU64(s))
-}
-
-func (k indexKey) isNumeric() bool {
-	return k.ptr == indexKeyNumericSentinel
-}
-
-func (k indexKey) byteLen() int {
-	if k.isNumeric() {
-		return 8
-	}
-	if k.ptr == nil {
-		return 0
-	}
-	if k.meta > uint64(^uint(0)>>1) {
-		panic("index key len overflows int")
-	}
-	return int(k.meta)
-}
-
-func (k indexKey) asUnsafeString() string {
-	if k.isNumeric() {
-		return uint64ByteStr(k.meta)
-	}
-	if k.ptr == nil {
-		return ""
-	}
-	return unsafe.String(k.ptr, k.byteLen())
-}
-
-func (k indexKey) byteAt(i int) byte {
-	if k.isNumeric() {
-		shift := uint(56 - i*8)
-		return byte(k.meta >> shift)
-	}
-	return *(*byte)(unsafe.Add(unsafe.Pointer(k.ptr), i))
-}
-
-func fixed8StringToU64(s string) uint64 {
-	_ = s[7]
-	return uint64(s[0])<<56 |
-		uint64(s[1])<<48 |
-		uint64(s[2])<<40 |
-		uint64(s[3])<<32 |
-		uint64(s[4])<<24 |
-		uint64(s[5])<<16 |
-		uint64(s[6])<<8 |
-		uint64(s[7])
-}
-
-func compareIndexKeys(a, b indexKey) int {
-	if a.isNumeric() && b.isNumeric() {
-		if a.meta < b.meta {
-			return -1
-		}
-		if a.meta > b.meta {
-			return 1
-		}
-		return 0
-	}
-	if !a.isNumeric() && !b.isNumeric() {
-		return strings.Compare(a.asUnsafeString(), b.asUnsafeString())
-	}
-	alen := a.byteLen()
-	blen := b.byteLen()
-	n := min(alen, blen)
-	for i := 0; i < n; i++ {
-		ab := a.byteAt(i)
-		bb := b.byteAt(i)
-		if ab < bb {
-			return -1
-		}
-		if ab > bb {
-			return 1
-		}
-	}
-	if alen < blen {
-		return -1
-	}
-	if alen > blen {
-		return 1
-	}
-	return 0
-}
-
-func compareIndexKeyString(a indexKey, b string) int {
-	if a.isNumeric() && len(b) == 8 {
-		v := fixed8StringToU64(b)
-		if a.meta < v {
-			return -1
-		}
-		if a.meta > v {
-			return 1
-		}
-		return 0
-	}
-	if !a.isNumeric() {
-		return strings.Compare(a.asUnsafeString(), b)
-	}
-	alen := a.byteLen()
-	blen := len(b)
-	n := min(alen, blen)
-	for i := 0; i < n; i++ {
-		ab := a.byteAt(i)
-		bb := b[i]
-		if ab < bb {
-			return -1
-		}
-		if ab > bb {
-			return 1
-		}
-	}
-	if alen < blen {
-		return -1
-	}
-	if alen > blen {
-		return 1
-	}
-	return 0
-}
-
-func indexKeyEqualsString(a indexKey, b string) bool {
-	if a.isNumeric() {
-		return len(b) == 8 && a.meta == fixed8StringToU64(b)
-	}
-	return a.asUnsafeString() == b
-}
-
-func indexKeyHasPrefixString(a indexKey, prefix string) bool {
-	if len(prefix) == 0 {
-		return true
-	}
-	alen := a.byteLen()
-	if len(prefix) > alen {
-		return false
-	}
-	for i := 0; i < len(prefix); i++ {
-		if a.byteAt(i) != prefix[i] {
-			return false
-		}
-	}
-	return true
-}
-
-type prefixUpperBound struct {
-	prefix   string
-	cutLen   int
-	lastByte byte
-}
-
-func newPrefixUpperBound(prefix string) (prefixUpperBound, bool) {
-	for i := len(prefix) - 1; i >= 0; i-- {
-		if prefix[i] == 0xFF {
-			continue
-		}
-		return prefixUpperBound{
-			prefix:   prefix,
-			cutLen:   i + 1,
-			lastByte: prefix[i] + 1,
-		}, true
-	}
-	return prefixUpperBound{}, false
-}
-
-func compareStringPrefixUpperBound(s string, upper prefixUpperBound) int {
-	n := min(len(s), upper.cutLen)
-	last := upper.cutLen - 1
-	for i := 0; i < n; i++ {
-		ub := upper.prefix[i]
-		if i == last {
-			ub = upper.lastByte
-		}
-		if s[i] < ub {
-			return -1
-		}
-		if s[i] > ub {
-			return 1
-		}
-	}
-	if len(s) < upper.cutLen {
-		return -1
-	}
-	if len(s) > upper.cutLen {
-		return 1
-	}
-	return 0
-}
-
-func compareIndexKeyPrefixUpperBound(a indexKey, upper prefixUpperBound) int {
-	alen := a.byteLen()
-	n := min(alen, upper.cutLen)
-	last := upper.cutLen - 1
-	for i := 0; i < n; i++ {
-		ub := upper.prefix[i]
-		if i == last {
-			ub = upper.lastByte
-		}
-		ab := a.byteAt(i)
-		if ab < ub {
-			return -1
-		}
-		if ab > ub {
-			return 1
-		}
-	}
-	if alen < upper.cutLen {
-		return -1
-	}
-	if alen > upper.cutLen {
-		return 1
-	}
-	return 0
-}
-
-func indexKeyHasSuffixString(a indexKey, suffix string) bool {
-	if len(suffix) == 0 {
-		return true
-	}
-	alen := a.byteLen()
-	if len(suffix) > alen {
-		return false
-	}
-	start := alen - len(suffix)
-	for i := 0; i < len(suffix); i++ {
-		if a.byteAt(start+i) != suffix[i] {
-			return false
-		}
-	}
-	return true
-}
-
-func indexKeyContainsString(a indexKey, needle string) bool {
-	if len(needle) == 0 {
-		return true
-	}
-	alen := a.byteLen()
-	nlen := len(needle)
-	if nlen > alen {
-		return false
-	}
-	limit := alen - nlen
-	for i := 0; i <= limit; i++ {
-		if a.byteAt(i) != needle[0] {
-			continue
-		}
-		ok := true
-		for j := 1; j < nlen; j++ {
-			if a.byteAt(i+j) != needle[j] {
-				ok = false
-				break
-			}
-		}
-		if ok {
-			return true
-		}
-	}
-	return false
-}
-
 /**/
 
 type buildIndexFieldState struct {
@@ -455,7 +153,7 @@ type buildIndexFieldLocalState struct {
 type buildIndexRunCursor struct {
 	run int
 	pos int
-	key indexKey
+	key keycodec.IndexKey
 }
 
 type buildIndexRunHeap struct {
@@ -535,11 +233,11 @@ func (r buildIndexFieldRun) keyCount() int {
 	return len(r.stringBuf)
 }
 
-func (r buildIndexFieldRun) keyAt(i int) indexKey {
+func (r buildIndexFieldRun) keyAt(i int) keycodec.IndexKey {
 	if r.u64Buf != nil {
-		return indexKeyFromU64(r.u64Buf[i])
+		return keycodec.FromU64(r.u64Buf[i])
 	}
-	return indexKeyFromString(r.stringBuf[i])
+	return keycodec.FromString(r.stringBuf[i])
 }
 
 func (r *buildIndexFieldRun) takePosting(i int) posting.List {
@@ -697,7 +395,7 @@ func (s *buildIndexFieldLocalState) release() {
 func (h buildIndexRunHeap) Len() int { return len(h.buf) }
 
 func (h buildIndexRunHeap) less(i, j int) bool {
-	return compareIndexKeys(h.buf[i].key, h.buf[j].key) < 0
+	return keycodec.Compare(h.buf[i].key, h.buf[j].key) < 0
 }
 
 func (h buildIndexRunHeap) swap(i, j int) {
@@ -814,7 +512,7 @@ func (s *buildIndexFieldState) materializeStorage() fieldIndexStorage {
 
 		for h.Len() > 0 {
 			next := h.buf[0]
-			if compareIndexKeys(next.key, key) != 0 {
+			if keycodec.Compare(next.key, key) != 0 {
 				break
 			}
 			item = h.pop()
@@ -877,7 +575,7 @@ func (s *buildIndexFieldState) materializeNilStorage() fieldIndexStorage {
 		return fieldIndexStorage{}
 	}
 	entries := []index{{
-		Key: indexKeyFromStoredString(nilIndexEntryKey, false),
+		Key: keycodec.FromStoredString(nilIndexEntryKey, false),
 		IDs: ids,
 	}}
 	return newFlatFieldIndexStorage(&entries)
@@ -915,7 +613,7 @@ func materializeLenFieldStorageOwned(universe posting.List, lenMap map[uint32]po
 			continue
 		}
 		entries = append(entries, index{
-			Key: indexKeyFromU64(uint64(ln)),
+			Key: keycodec.FromU64(uint64(ln)),
 			IDs: ids,
 		})
 	}
@@ -927,7 +625,7 @@ func materializeLenFieldStorageOwned(universe posting.List, lenMap map[uint32]po
 		nonEmptyPosting = nonEmptyPosting.BuildOptimized()
 		if !nonEmptyPosting.IsEmpty() {
 			entries = append(entries, index{
-				Key: indexKeyFromString(lenIndexNonEmptyKey),
+				Key: keycodec.FromString(lenIndexNonEmptyKey),
 				IDs: nonEmptyPosting,
 			})
 		}
@@ -937,7 +635,7 @@ func materializeLenFieldStorageOwned(universe posting.List, lenMap map[uint32]po
 	}
 
 	slices.SortFunc(entries, func(a, b index) int {
-		return compareIndexKeys(a.Key, b.Key)
+		return keycodec.Compare(a.Key, b.Key)
 	})
 	return newFlatFieldIndexStorage(&entries), useZeroComplement
 }
@@ -1432,13 +1130,6 @@ func (db *DB[K, V]) validateIndexedStringValues(val *V) error {
 	return nil
 }
 
-func indexKeyFromStoredString(s string, fixed8 bool) indexKey {
-	if fixed8 && len(s) == 8 {
-		return indexKeyFromFixed8String(s)
-	}
-	return indexKeyFromString(s)
-}
-
 func idxFromKeyNoLock(strKey bool, strMap *strMapper, key []byte) uint64 {
 	if strKey {
 		return strMap.createIdxNoLock(string(key))
@@ -1748,7 +1439,7 @@ func detectLenZeroComplement(indexes *pooled.Slice[fieldIndexStorage], access []
 			continue
 		}
 		for _, ix := range *slice {
-			if indexKeyEqualsString(ix.Key, lenIndexNonEmptyKey) {
+			if keycodec.EqualsString(ix.Key, lenIndexNonEmptyKey) {
 				out[acc.ordinal] = true
 				break
 			}
@@ -2070,7 +1761,7 @@ func writeFieldIndexChunk(writer *bufio.Writer, chunk *fieldIndexChunk) error {
 		}
 		var buf [8]byte
 		for i := 0; i < chunk.keyCount(); i++ {
-			binary.BigEndian.PutUint64(buf[:], chunk.keyAt(i).meta)
+			binary.BigEndian.PutUint64(buf[:], chunk.keyAt(i).U64())
 			if _, err := writer.Write(buf[:]); err != nil {
 				return fmt.Errorf("encode: writing numeric chunk key: %w", err)
 			}
@@ -2125,20 +1816,20 @@ func writeIndexEntry(writer *bufio.Writer, entry index) error {
 	return nil
 }
 
-func writeIndexKey(writer *bufio.Writer, key indexKey) error {
-	if key.isNumeric() {
+func writeIndexKey(writer *bufio.Writer, key keycodec.IndexKey) error {
+	if key.IsNumeric() {
 		if err := writer.WriteByte(indexKeyEncodingRaw8); err != nil {
 			return err
 		}
 		var b [8]byte
-		binary.BigEndian.PutUint64(b[:], key.meta)
+		binary.BigEndian.PutUint64(b[:], key.U64())
 		_, err := writer.Write(b[:])
 		return err
 	}
 	if err := writer.WriteByte(indexKeyEncodingString); err != nil {
 		return err
 	}
-	return writeString(writer, key.asUnsafeString())
+	return writeString(writer, key.UnsafeString())
 }
 
 func writeFields(writer *bufio.Writer, fields map[string]*field) error {
@@ -3195,29 +2886,29 @@ func skipIndexEntry(reader *bufio.Reader) error {
 	return nil
 }
 
-func readIndexKey(reader *bufio.Reader) (indexKey, error) {
+func readIndexKey(reader *bufio.Reader) (keycodec.IndexKey, error) {
 	tag, err := reader.ReadByte()
 	if err != nil {
-		return indexKey{}, err
+		return keycodec.IndexKey{}, err
 	}
 	switch tag {
 	case indexKeyEncodingString:
 		s, err := readString(reader)
 		if err != nil {
-			return indexKey{}, err
+			return keycodec.IndexKey{}, err
 		}
 		if err := validateIndexedStringKeyLen(len(s)); err != nil {
-			return indexKey{}, err
+			return keycodec.IndexKey{}, err
 		}
-		return indexKeyFromString(s), nil
+		return keycodec.FromString(s), nil
 	case indexKeyEncodingRaw8:
 		var buf [8]byte
 		if _, err := io.ReadFull(reader, buf[:]); err != nil {
-			return indexKey{}, err
+			return keycodec.IndexKey{}, err
 		}
-		return indexKeyFromU64(binary.BigEndian.Uint64(buf[:])), nil
+		return keycodec.FromU64(binary.BigEndian.Uint64(buf[:])), nil
 	default:
-		return indexKey{}, fmt.Errorf("invalid index key encoding %v", tag)
+		return keycodec.IndexKey{}, fmt.Errorf("invalid index key encoding %v", tag)
 	}
 }
 
@@ -3390,7 +3081,7 @@ func (o fieldOverlay) lowerBound(key string) int {
 	return lowerBoundIndex(o.base, key)
 }
 
-func (o fieldOverlay) lowerBoundKey(key indexKey) int {
+func (o fieldOverlay) lowerBoundKey(key keycodec.IndexKey) int {
 	if o.chunked != nil {
 		_, rank := o.chunked.lowerBoundPosKey(key)
 		return rank
@@ -3405,7 +3096,7 @@ func (o fieldOverlay) upperBound(key string) int {
 	return upperBoundIndex(o.base, key)
 }
 
-func (o fieldOverlay) upperBoundKey(key indexKey) int {
+func (o fieldOverlay) upperBoundKey(key keycodec.IndexKey) int {
 	if o.chunked != nil {
 		_, rank := o.chunked.upperBoundPosKey(key)
 		return rank
@@ -3433,7 +3124,7 @@ func (o fieldOverlay) lookupPostingRetained(key string) posting.List {
 		return posting.List{}
 	}
 	i := lowerBoundIndex(o.base, key)
-	if i >= len(o.base) || !indexKeyEqualsString(o.base[i].Key, key) {
+	if i >= len(o.base) || !keycodec.EqualsString(o.base[i].Key, key) {
 		return posting.List{}
 	}
 	return o.base[i].IDs.Borrow()
@@ -3500,7 +3191,7 @@ func (o fieldOverlay) rangeForBounds(b rangeBounds) overlayRange {
 		}
 		if !b.loInc {
 			if b.loNumeric {
-				if bl < len(o.base) && compareIndexKeys(o.base[bl].Key, b.loIndex) == 0 {
+				if bl < len(o.base) && keycodec.Compare(o.base[bl].Key, b.loIndex) == 0 {
 					bl++
 				}
 			} else {
@@ -3585,8 +3276,8 @@ func (o fieldOverlay) rangeForBoundsChunked(b rangeBounds) overlayRange {
 		}
 		if !b.loInc {
 			if key, ok := o.chunked.posKey(bl); ok &&
-				((b.loNumeric && compareIndexKeys(key, b.loIndex) == 0) ||
-					(!b.loNumeric && indexKeyEqualsString(key, b.loKey))) {
+				((b.loNumeric && keycodec.Compare(key, b.loIndex) == 0) ||
+					(!b.loNumeric && keycodec.EqualsString(key, b.loKey))) {
 				bl = o.chunked.advancePos(bl)
 				blRank++
 			}
@@ -3704,11 +3395,11 @@ func (o fieldOverlay) newCursor(br overlayRange, desc bool) overlayKeyCursor {
 	return c
 }
 
-func (c *overlayKeyCursor) next() (indexKey, posting.List, bool) {
+func (c *overlayKeyCursor) next() (keycodec.IndexKey, posting.List, bool) {
 	if c.desc {
 		if c.chunked != nil {
 			if c.remaining <= 0 || c.chunk == nil {
-				return indexKey{}, posting.List{}, false
+				return keycodec.IndexKey{}, posting.List{}, false
 			}
 			key := c.chunk.keyAt(c.entryIdx)
 			ids := c.chunk.postingAt(c.entryIdx)
@@ -3724,7 +3415,7 @@ func (c *overlayKeyCursor) next() (indexKey, posting.List, bool) {
 						c.pageIdx--
 						if c.pageIdx < 0 {
 							c.chunk = nil
-							return indexKey{}, posting.List{}, false
+							return keycodec.IndexKey{}, posting.List{}, false
 						}
 						c.refIdx = c.chunked.pages.Get(c.pageIdx).refs.Len() - 1
 					}
@@ -3735,7 +3426,7 @@ func (c *overlayKeyCursor) next() (indexKey, posting.List, bool) {
 			return key, ids, true
 		}
 		if c.pos < c.end {
-			return indexKey{}, posting.List{}, false
+			return keycodec.IndexKey{}, posting.List{}, false
 		}
 		ent := c.base[c.pos]
 		c.pos--
@@ -3743,7 +3434,7 @@ func (c *overlayKeyCursor) next() (indexKey, posting.List, bool) {
 	}
 	if c.chunked != nil {
 		if c.remaining <= 0 || c.chunk == nil {
-			return indexKey{}, posting.List{}, false
+			return keycodec.IndexKey{}, posting.List{}, false
 		}
 		key := c.chunk.keyAt(c.entryIdx)
 		ids := c.chunk.postingAt(c.entryIdx)
@@ -3757,7 +3448,7 @@ func (c *overlayKeyCursor) next() (indexKey, posting.List, bool) {
 					c.pageIdx++
 					if c.pageIdx >= c.chunked.pages.Len() {
 						c.chunk = nil
-						return indexKey{}, posting.List{}, false
+						return keycodec.IndexKey{}, posting.List{}, false
 					}
 					c.refIdx = 0
 				}
@@ -3768,7 +3459,7 @@ func (c *overlayKeyCursor) next() (indexKey, posting.List, bool) {
 		return key, ids, true
 	}
 	if c.pos >= c.end {
-		return indexKey{}, posting.List{}, false
+		return keycodec.IndexKey{}, posting.List{}, false
 	}
 	ent := c.base[c.pos]
 	c.pos++

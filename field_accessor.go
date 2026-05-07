@@ -2,6 +2,7 @@ package rbi
 
 import (
 	"fmt"
+	"github.com/vapstack/rbi/internal/keycodec"
 	"reflect"
 	"slices"
 	"time"
@@ -278,14 +279,14 @@ func addDistinctFloatFixedKeysToSink[S fixedValueSink, T floatFieldValue](vals [
 		return 0
 	}
 	if len(vals) == 1 {
-		sink.addFixed(orderedFloat64Key(float64(vals[0])))
+		sink.addFixed(keycodec.OrderedFloat64Key(float64(vals[0])))
 		return 1
 	}
 	seen := newU64Set(len(vals))
 	defer releaseU64Set(&seen)
 	distinct := 0
 	for i := range vals {
-		cur := orderedFloat64Key(float64(vals[i]))
+		cur := keycodec.OrderedFloat64Key(float64(vals[i]))
 		if !seen.Add(cur) {
 			continue
 		}
@@ -415,14 +416,14 @@ func writePtrFloatField[S nilFixedValueSink, T floatFieldValue](ptr unsafe.Point
 		sink.setNil()
 		return
 	}
-	sink.addFixed(orderedFloat64Key(float64(*v)))
+	sink.addFixed(keycodec.OrderedFloat64Key(float64(*v)))
 }
 
 func writeScalarFloatField[S fixedValueSink, T floatFieldValue](ptr unsafe.Pointer, sink S, offset uintptr) {
 	if ptr == nil {
 		return
 	}
-	sink.addFixed(orderedFloat64Key(float64(scalarFieldValue[T](ptr, offset))))
+	sink.addFixed(keycodec.OrderedFloat64Key(float64(scalarFieldValue[T](ptr, offset))))
 }
 
 func writeStringSliceField[S lenStringValueSink](ptr unsafe.Pointer, sink S, offset uintptr) {
@@ -594,7 +595,7 @@ func timeFieldAccessorBundle(offset uintptr, ptr bool) fieldAccessorBundle {
 				if v == nil {
 					return "", true, true
 				}
-				return int64ByteStr(v.Unix()), true, false
+				return keycodec.Int64ByteString(v.Unix()), true, false
 			},
 			writeBuild:   func(ptr unsafe.Pointer, sink buildFieldWriteSink) { writePtrTimeField(ptr, sink, offset) },
 			writeOverlay: func(ptr unsafe.Pointer, sink snapshotOverlayWriteSink) { writePtrTimeField(ptr, sink, offset) },
@@ -615,7 +616,7 @@ func timeFieldAccessorBundle(offset uintptr, ptr bool) fieldAccessorBundle {
 			if ptr == nil {
 				return "", false, false
 			}
-			return int64ByteStr(scalarFieldValue[time.Time](ptr, offset).Unix()), true, false
+			return keycodec.Int64ByteString(scalarFieldValue[time.Time](ptr, offset).Unix()), true, false
 		},
 		writeBuild:   func(ptr unsafe.Pointer, sink buildFieldWriteSink) { writeScalarTimeField(ptr, sink, offset) },
 		writeOverlay: func(ptr unsafe.Pointer, sink snapshotOverlayWriteSink) { writeScalarTimeField(ptr, sink, offset) },
@@ -732,7 +733,7 @@ func intFieldAccessorBundle[T signedFieldValue](offset uintptr, ptr bool) fieldA
 				if v == nil {
 					return "", true, true
 				}
-				return int64ByteStr(int64(*v)), true, false
+				return keycodec.Int64ByteString(int64(*v)), true, false
 			},
 			writeBuild: func(ptr unsafe.Pointer, sink buildFieldWriteSink) {
 				writePtrIntField[buildFieldWriteSink, T](ptr, sink, offset)
@@ -761,7 +762,7 @@ func intFieldAccessorBundle[T signedFieldValue](offset uintptr, ptr bool) fieldA
 			if ptr == nil {
 				return "", false, false
 			}
-			return int64ByteStr(int64(scalarFieldValue[T](ptr, offset))), true, false
+			return keycodec.Int64ByteString(int64(scalarFieldValue[T](ptr, offset))), true, false
 		},
 		writeBuild: func(ptr unsafe.Pointer, sink buildFieldWriteSink) {
 			writeScalarIntField[buildFieldWriteSink, T](ptr, sink, offset)
@@ -792,7 +793,7 @@ func uintFieldAccessorBundle[T unsignedFieldValue](offset uintptr, ptr bool) fie
 				if v == nil {
 					return "", true, true
 				}
-				return uint64ByteStr(uint64(*v)), true, false
+				return keycodec.U64ByteString(uint64(*v)), true, false
 			},
 			writeBuild: func(ptr unsafe.Pointer, sink buildFieldWriteSink) {
 				writePtrUintField[buildFieldWriteSink, T](ptr, sink, offset)
@@ -821,7 +822,7 @@ func uintFieldAccessorBundle[T unsignedFieldValue](offset uintptr, ptr bool) fie
 			if ptr == nil {
 				return "", false, false
 			}
-			return uint64ByteStr(uint64(scalarFieldValue[T](ptr, offset))), true, false
+			return keycodec.U64ByteString(uint64(scalarFieldValue[T](ptr, offset))), true, false
 		},
 		writeBuild: func(ptr unsafe.Pointer, sink buildFieldWriteSink) {
 			writeScalarUintField[buildFieldWriteSink, T](ptr, sink, offset)
@@ -852,7 +853,7 @@ func floatFieldAccessorBundle[T floatFieldValue](offset uintptr, ptr bool) field
 				if v == nil {
 					return "", true, true
 				}
-				return float64ByteStr(float64(*v)), true, false
+				return keycodec.Float64ByteString(float64(*v)), true, false
 			},
 			writeBuild: func(ptr unsafe.Pointer, sink buildFieldWriteSink) {
 				writePtrFloatField[buildFieldWriteSink, T](ptr, sink, offset)
@@ -881,7 +882,7 @@ func floatFieldAccessorBundle[T floatFieldValue](offset uintptr, ptr bool) field
 			if ptr == nil {
 				return "", false, false
 			}
-			return float64ByteStr(float64(scalarFieldValue[T](ptr, offset))), true, false
+			return keycodec.Float64ByteString(float64(scalarFieldValue[T](ptr, offset))), true, false
 		},
 		writeBuild: func(ptr unsafe.Pointer, sink buildFieldWriteSink) {
 			writeScalarFloatField[buildFieldWriteSink, T](ptr, sink, offset)

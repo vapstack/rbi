@@ -19,6 +19,7 @@ import (
 	"unsafe"
 
 	"github.com/vapstack/qx"
+	"github.com/vapstack/rbi/internal/keycodec"
 	"github.com/vapstack/rbi/internal/pooled"
 	"github.com/vapstack/rbi/internal/posting"
 	"go.etcd.io/bbolt"
@@ -1012,7 +1013,8 @@ func TestRebuildIndex_ScanErrorClearsActiveFlag(t *testing.T) {
 		if b == nil {
 			return fmt.Errorf("bucket missing")
 		}
-		return b.Put(db.keyFromID(1), []byte{0xff})
+		var keyBuf [8]byte
+		return b.Put(keycodec.UserKeyBytesWithBuf(uint64(1), db.strKey, &keyBuf), []byte{0xff})
 	}); err != nil {
 		t.Fatalf("corrupt value: %v", err)
 	}
@@ -2497,7 +2499,7 @@ func indexExtSortedNumericKeys() []string {
 	slices.Sort(values)
 	out := make([]string, len(values))
 	for i, v := range values {
-		out[i] = uint64ByteStr(v)
+		out[i] = keycodec.U64ByteString(v)
 	}
 	return out
 }
@@ -2508,12 +2510,12 @@ func indexExtNewOverlayFixture(t *testing.T, keys []string, fixed8 bool) indexEx
 	entries := make([]index, len(keys))
 	for i, key := range keys {
 		entries[i] = index{
-			Key: indexKeyFromStoredString(key, fixed8),
+			Key: keycodec.FromStoredString(key, fixed8),
 			IDs: indexExtPosting(uint64(i*64+1), i%11+1),
 		}
 	}
 	slices.SortFunc(entries, func(a, b index) int {
-		return compareIndexKeys(a.Key, b.Key)
+		return keycodec.Compare(a.Key, b.Key)
 	})
 
 	root := buildChunkedFieldIndexRoot(entries)
@@ -2524,7 +2526,7 @@ func indexExtNewOverlayFixture(t *testing.T, keys []string, fixed8 bool) indexEx
 	flatEntries := append([]index(nil), entries...)
 	sortedKeys := make([]string, len(entries))
 	for i := range entries {
-		sortedKeys[i] = entries[i].Key.asUnsafeString()
+		sortedKeys[i] = entries[i].Key.UnsafeString()
 	}
 
 	return indexExtOverlayFixture{
@@ -2543,12 +2545,12 @@ func indexExtNewSingletonOverlayFixture(t *testing.T, keys []string, fixed8 bool
 	entries := make([]index, len(keys))
 	for i, key := range keys {
 		entries[i] = index{
-			Key: indexKeyFromStoredString(key, fixed8),
+			Key: keycodec.FromStoredString(key, fixed8),
 			IDs: indexTestSingleton(uint64(i + 1)),
 		}
 	}
 	slices.SortFunc(entries, func(a, b index) int {
-		return compareIndexKeys(a.Key, b.Key)
+		return keycodec.Compare(a.Key, b.Key)
 	})
 
 	root := buildChunkedFieldIndexRoot(entries)
@@ -2559,7 +2561,7 @@ func indexExtNewSingletonOverlayFixture(t *testing.T, keys []string, fixed8 bool
 	flatEntries := append([]index(nil), entries...)
 	sortedKeys := make([]string, len(entries))
 	for i := range entries {
-		sortedKeys[i] = entries[i].Key.asUnsafeString()
+		sortedKeys[i] = entries[i].Key.UnsafeString()
 	}
 
 	return indexExtOverlayFixture{
@@ -2614,7 +2616,7 @@ func indexExtCollectCursor(ov fieldOverlay, br overlayRange, desc bool) ([]strin
 		if !ok {
 			return keys, cards
 		}
-		keys = append(keys, key.asUnsafeString())
+		keys = append(keys, key.UnsafeString())
 		cards = append(cards, ids.Cardinality())
 	}
 }
@@ -2699,7 +2701,7 @@ func indexExtDeltaKeys(ops []indexExtDeltaOp, fixed8 bool) []keyedBatchPostingDe
 	out := make([]keyedBatchPostingDelta, 0, len(ops))
 	for _, op := range ops {
 		out = append(out, keyedBatchPostingDelta{
-			key: indexKeyFromStoredString(op.key, fixed8),
+			key: keycodec.FromStoredString(op.key, fixed8),
 			delta: batchPostingDelta{
 				add:    indexExtPostingFromIDs(op.add),
 				remove: indexExtPostingFromIDs(op.remove),
@@ -2707,7 +2709,7 @@ func indexExtDeltaKeys(ops []indexExtDeltaOp, fixed8 bool) []keyedBatchPostingDe
 		})
 	}
 	slices.SortFunc(out, func(a, b keyedBatchPostingDelta) int {
-		return compareIndexKeys(a.key, b.key)
+		return keycodec.Compare(a.key, b.key)
 	})
 	return out
 }
@@ -2715,7 +2717,7 @@ func indexExtDeltaKeys(ops []indexExtDeltaOp, fixed8 bool) []keyedBatchPostingDe
 func indexExtExpectedMapFromEntries(entries []index) map[string][]uint64 {
 	out := make(map[string][]uint64, len(entries))
 	for i := range entries {
-		out[entries[i].Key.asUnsafeString()] = indexExtPostingIDs(entries[i].IDs)
+		out[entries[i].Key.UnsafeString()] = indexExtPostingIDs(entries[i].IDs)
 	}
 	return out
 }
@@ -2760,7 +2762,7 @@ func indexExtAssertStorageMatchesEntries(t *testing.T, storage fieldIndexStorage
 	wantKeys := make([]string, len(entries))
 	wantPosts := make([][]uint64, len(entries))
 	for i := range entries {
-		wantKeys[i] = entries[i].Key.asUnsafeString()
+		wantKeys[i] = entries[i].Key.UnsafeString()
 		wantPosts[i] = indexExtPostingIDs(entries[i].IDs)
 	}
 
@@ -3234,9 +3236,9 @@ func TestIndexExt_NumericBoundsMatchFlat(t *testing.T) {
 		fx.keys[149],
 		fx.keys[150],
 		fx.keys[len(fx.keys)-1],
-		uint64ByteStr(uint64(0x10)<<56 | uint64(999)),
-		uint64ByteStr(uint64(0x20)<<56 | uint64(0x4000)),
-		uint64ByteStr(uint64(0xff)<<56 | uint64(999)),
+		keycodec.U64ByteString(uint64(0x10)<<56 | uint64(999)),
+		keycodec.U64ByteString(uint64(0x20)<<56 | uint64(0x4000)),
+		keycodec.U64ByteString(uint64(0xff)<<56 | uint64(999)),
 	}
 	for _, probe := range probes {
 		if got, want := fx.chunked.lowerBound(probe), fx.flat.lowerBound(probe); got != want {
@@ -3265,9 +3267,9 @@ func TestIndexExt_NumericPrefixRangeEndMatchesFlat(t *testing.T) {
 		{prefix: string([]byte{0x20}), start: fx.flat.lowerBound(string([]byte{0x20}))},
 		{prefix: string([]byte{0x20}), start: fx.flat.lowerBound(fx.keys[155])},
 		{prefix: string([]byte{0x20, 0x00}), start: fx.flat.lowerBound(fx.keys[150])},
-		{prefix: string([]byte{0x20, 0x80}), start: fx.flat.lowerBound(uint64ByteStr(uint64(0x20)<<56 | uint64(0x8000)))},
-		{prefix: string([]byte{0x20, 0x80}), start: fx.flat.lowerBound(uint64ByteStr(uint64(0xff) << 56))},
-		{prefix: string([]byte{0xff}), start: fx.flat.lowerBound(uint64ByteStr(uint64(0xff) << 56))},
+		{prefix: string([]byte{0x20, 0x80}), start: fx.flat.lowerBound(keycodec.U64ByteString(uint64(0x20)<<56 | uint64(0x8000)))},
+		{prefix: string([]byte{0x20, 0x80}), start: fx.flat.lowerBound(keycodec.U64ByteString(uint64(0xff) << 56))},
+		{prefix: string([]byte{0xff}), start: fx.flat.lowerBound(keycodec.U64ByteString(uint64(0xff) << 56))},
 	}
 	for _, tc := range cases {
 		if got, want := fx.chunked.prefixRangeEnd(tc.prefix, tc.start), fx.flat.prefixRangeEnd(tc.prefix, tc.start); got != want {
@@ -3332,7 +3334,7 @@ func TestIndexExt_ChunkedRootPosForRankRoundTrip(t *testing.T) {
 		if !ok {
 			t.Fatalf("posKey(rank=%d) failed", rank)
 		}
-		if compareIndexKeys(key, fx.entries[rank].Key) != 0 {
+		if keycodec.Compare(key, fx.entries[rank].Key) != 0 {
 			t.Fatalf("rank=%d key mismatch", rank)
 		}
 		if got := fx.root.entryPrefixForChunk(pos.chunk) + pos.entry; got != rank {
@@ -3364,7 +3366,7 @@ func TestIndexExt_ChunkedRootTouchChunkIndexFromFindsTargetChunk(t *testing.T) {
 			}
 		}
 	}
-	if got := fx.root.touchChunkIndexFrom(0, indexKeyFromBytes([]byte{0xff, 0xff, 0xff})); got != fx.root.chunkCount-1 {
+	if got := fx.root.touchChunkIndexFrom(0, keycodec.FromBytes([]byte{0xff, 0xff, 0xff})); got != fx.root.chunkCount-1 {
 		t.Fatalf("touchChunkIndexFrom(after-last): got=%d want=%d", got, fx.root.chunkCount-1)
 	}
 }
@@ -3646,8 +3648,8 @@ func TestIndexExt_MergeInsertOnlyFixedFieldStorageOwnedDedupsAccumulatorAdds(t *
 	out := mergeInsertOnlyFixedFieldStorageOwned(fieldIndexStorage{}, adds, arena, false)
 	releaseInsertPostingAccumArena(arena)
 	expected := map[string][]uint64{
-		uint64ByteStr(3): {11, 12, 18},
-		uint64ByteStr(7): {2, 4, 9},
+		keycodec.U64ByteString(3): {11, 12, 18},
+		keycodec.U64ByteString(7): {2, 4, 9},
 	}
 	indexExtAssertStorageMatchesExpected(t, out, expected)
 }
@@ -3958,7 +3960,7 @@ func TestIndexExt_DBSliceReplaceRemovesStaleTermsAndLenBuckets(t *testing.T) {
 	}
 	indexExtAssertSameSlice(
 		t,
-		indexExtPostingIDs(db.engine.currentQueryViewForTests().lenFieldOverlay("tags").lookupPostingRetained(uint64ByteStr(0))),
+		indexExtPostingIDs(db.engine.currentQueryViewForTests().lenFieldOverlay("tags").lookupPostingRetained(keycodec.U64ByteString(0))),
 		wantZero,
 	)
 
@@ -4123,9 +4125,9 @@ func TestIndexExt_DuplicateIDBatchPatchNetDiffKeepsIndexesConsistent(t *testing.
 		indexExtAssertOverlayMembership(t, db.engine.currentQueryViewForTests().fieldOverlay("opt"), "dup-live", 77, false)
 		indexExtAssertOverlayMembership(t, db.engine.currentQueryViewForTests().nilFieldOverlay("opt"), nilIndexEntryKey, 77, true)
 
-		indexExtAssertOverlayMembership(t, db.engine.currentQueryViewForTests().lenFieldOverlay("tags"), uint64ByteStr(0), 77, false)
-		indexExtAssertOverlayMembership(t, db.engine.currentQueryViewForTests().lenFieldOverlay("tags"), uint64ByteStr(1), 77, false)
-		indexExtAssertOverlayMembership(t, db.engine.currentQueryViewForTests().lenFieldOverlay("tags"), uint64ByteStr(2), 77, true)
+		indexExtAssertOverlayMembership(t, db.engine.currentQueryViewForTests().lenFieldOverlay("tags"), keycodec.U64ByteString(0), 77, false)
+		indexExtAssertOverlayMembership(t, db.engine.currentQueryViewForTests().lenFieldOverlay("tags"), keycodec.U64ByteString(1), 77, false)
+		indexExtAssertOverlayMembership(t, db.engine.currentQueryViewForTests().lenFieldOverlay("tags"), keycodec.U64ByteString(2), 77, true)
 
 		indexExtAssertQueryKeysExpected(t, db, qx.Query(qx.EQ("name", "dup/final")))
 		indexExtAssertQueryKeysExpected(t, db, qx.Query(qx.HASANY("tags", []string{"final"})))
@@ -4167,7 +4169,7 @@ func TestIndexExt_DBFloatSignedZeroLookupMatchesNumericEquality(t *testing.T) {
 
 	indexExtAssertSameSlice(
 		t,
-		indexExtPostingIDs(db.engine.currentQueryViewForTests().fieldOverlay("score").lookupPostingRetained(float64ByteStr(0.0))),
+		indexExtPostingIDs(db.engine.currentQueryViewForTests().fieldOverlay("score").lookupPostingRetained(keycodec.Float64ByteString(0.0))),
 		[]uint64{1, 2},
 	)
 }
@@ -4298,7 +4300,7 @@ func TestIndexExt_DBIntFieldUintRangeMatchesExpected(t *testing.T) {
 func TestIndexExt_DBIntFieldBinaryStringEqualityMatchesExpected(t *testing.T) {
 	db := indexExtNumericCoercionChunkedDB(t)
 
-	q := qx.Query(qx.EQ("age", int64ByteStr(42)))
+	q := qx.Query(qx.EQ("age", keycodec.Int64ByteString(42)))
 	indexExtAssertQueryKeysExpected(t, db, q)
 	indexExtAssertCountExpected(t, db, q)
 }
@@ -4306,7 +4308,7 @@ func TestIndexExt_DBIntFieldBinaryStringEqualityMatchesExpected(t *testing.T) {
 func TestIndexExt_DBFloatFieldBinaryStringEqualityMatchesExpected(t *testing.T) {
 	db := indexExtNumericCoercionChunkedDB(t)
 
-	q := qx.Query(qx.EQ("score", float64ByteStr(42.0)))
+	q := qx.Query(qx.EQ("score", keycodec.Float64ByteString(42.0)))
 	indexExtAssertQueryKeysExpected(t, db, q)
 	indexExtAssertCountExpected(t, db, q)
 }

@@ -8,6 +8,7 @@ import (
 	"testing"
 	"unsafe"
 
+	"github.com/vapstack/rbi/internal/keycodec"
 	"github.com/vapstack/rbi/internal/posting"
 )
 
@@ -35,20 +36,20 @@ func fieldStorageOwnedChunkRef(size int, fixed8 bool) fieldIndexChunkRef {
 		}
 		return fieldIndexChunkRef{last: chunk.keyAt(size - 1), chunk: chunk}
 	}
-	keys := make([]indexKey, size)
+	keys := make([]keycodec.IndexKey, size)
 	for i := 0; i < size; i++ {
-		keys[i] = indexKeyFromStoredString(fmt.Sprintf("k/%04d", i*2), false)
+		keys[i] = keycodec.FromStoredString(fmt.Sprintf("k/%04d", i*2), false)
 		posts[i] = fieldStorageOwnedTestPosting(uint64(i + 1))
 	}
 	chunk := newFieldIndexChunkFromKeys(posts, keys, rows)
 	return fieldIndexChunkRef{last: chunk.keyAt(size - 1), chunk: chunk}
 }
 
-func fieldStorageInsertedTestKey(pos int, fixed8 bool) indexKey {
+func fieldStorageInsertedTestKey(pos int, fixed8 bool) keycodec.IndexKey {
 	if fixed8 {
-		return indexKeyFromU64(uint64(pos*2 + 1))
+		return keycodec.FromU64(uint64(pos*2 + 1))
 	}
-	return indexKeyFromStoredString(fmt.Sprintf("k/%04d", pos*2+1), false)
+	return keycodec.FromStoredString(fmt.Sprintf("k/%04d", pos*2+1), false)
 }
 
 func fieldStorageSingleChunkRoot(ref fieldIndexChunkRef) *fieldIndexChunkedRoot {
@@ -62,9 +63,9 @@ func TestFieldIndexStringRefSize(t *testing.T) {
 }
 
 func TestNewFieldIndexChunkFromKeys_StringRefsFitUint16(t *testing.T) {
-	keys := []indexKey{
-		indexKeyFromStoredString(strings.Repeat("a", 40000), false),
-		indexKeyFromStoredString(strings.Repeat("b", 40000), false),
+	keys := []keycodec.IndexKey{
+		keycodec.FromStoredString(strings.Repeat("a", 40000), false),
+		keycodec.FromStoredString(strings.Repeat("b", 40000), false),
 	}
 	posts := []posting.List{
 		fieldStorageSingleton(1),
@@ -77,10 +78,10 @@ func TestNewFieldIndexChunkFromKeys_StringRefsFitUint16(t *testing.T) {
 	if chunk.keyCount() != len(keys) {
 		t.Fatalf("unexpected key count: got %d want %d", chunk.keyCount(), len(keys))
 	}
-	if got := chunk.keyAt(0).byteLen(); got != 40000 {
+	if got := chunk.keyAt(0).ByteLen(); got != 40000 {
 		t.Fatalf("unexpected first key len: got %d want 40000", got)
 	}
-	if got := chunk.keyAt(1).byteLen(); got != 40000 {
+	if got := chunk.keyAt(1).ByteLen(); got != 40000 {
 		t.Fatalf("unexpected second key len: got %d want 40000", got)
 	}
 	if got := int(chunk.stringRefs[1].off); got != 40000 {
@@ -95,10 +96,10 @@ func TestNewFieldIndexChunkFromKeys_StringRefOffsetOverflowPanics(t *testing.T) 
 		}
 	}()
 
-	keys := []indexKey{
-		indexKeyFromStoredString(strings.Repeat("a", fieldIndexStringRefMax), false),
-		indexKeyFromStoredString("b", false),
-		indexKeyFromStoredString("c", false),
+	keys := []keycodec.IndexKey{
+		keycodec.FromStoredString(strings.Repeat("a", fieldIndexStringRefMax), false),
+		keycodec.FromStoredString("b", false),
+		keycodec.FromStoredString("c", false),
 	}
 	posts := []posting.List{
 		fieldStorageSingleton(1),
@@ -109,9 +110,9 @@ func TestNewFieldIndexChunkFromKeys_StringRefOffsetOverflowPanics(t *testing.T) 
 }
 
 func TestNewFieldIndexChunkFromKeys_StringSingletonsUseOwnerLayout(t *testing.T) {
-	keys := []indexKey{
-		indexKeyFromStoredString("alpha", false),
-		indexKeyFromStoredString("beta", false),
+	keys := []keycodec.IndexKey{
+		keycodec.FromStoredString("alpha", false),
+		keycodec.FromStoredString("beta", false),
 	}
 	posts := []posting.List{
 		fieldStorageSingleton(101),
@@ -160,7 +161,7 @@ func TestNewNumericFieldIndexChunk_SingletonsUseOwnerLayout(t *testing.T) {
 	if got := chunk.keyCount(); got != len(keys) {
 		t.Fatalf("unexpected key count: got %d want %d", got, len(keys))
 	}
-	if got := chunk.keyAt(0).meta; got != 11 {
+	if got := chunk.keyAt(0).U64(); got != 11 {
 		t.Fatalf("unexpected first key: got %d want 11", got)
 	}
 	if got := chunk.rowCount(); got != 2 {
@@ -176,9 +177,9 @@ func TestNewNumericFieldIndexChunk_SingletonsUseOwnerLayout(t *testing.T) {
 }
 
 func TestFieldIndexChunk_StringSingletonRoundTripUsesOwnerLayout(t *testing.T) {
-	keys := []indexKey{
-		indexKeyFromStoredString("alpha", false),
-		indexKeyFromStoredString("beta", false),
+	keys := []keycodec.IndexKey{
+		keycodec.FromStoredString("alpha", false),
+		keycodec.FromStoredString("beta", false),
 	}
 	posts := []posting.List{
 		fieldStorageSingleton(11),
@@ -211,7 +212,7 @@ func TestFieldIndexChunk_StringSingletonRoundTripUsesOwnerLayout(t *testing.T) {
 	if !roundTrip.hasUniqueStringOwners() {
 		t.Fatalf("expected owner layout after serialization round-trip")
 	}
-	if got := roundTrip.keyAt(0).asUnsafeString(); got != "alpha" {
+	if got := roundTrip.keyAt(0).UnsafeString(); got != "alpha" {
 		t.Fatalf("unexpected first key: got %q want %q", got, "alpha")
 	}
 	if ids := roundTrip.postingAt(1); ids.Cardinality() != 1 || !ids.Contains(22) {
@@ -250,7 +251,7 @@ func TestFieldIndexChunk_NumericSingletonRoundTripUsesOwnerLayout(t *testing.T) 
 	if !roundTrip.hasUniqueNumericOwners() {
 		t.Fatalf("expected owner layout after serialization round-trip")
 	}
-	if got := roundTrip.keyAt(0).meta; got != 111 {
+	if got := roundTrip.keyAt(0).U64(); got != 111 {
 		t.Fatalf("unexpected first key: got %d want 111", got)
 	}
 	if ids := roundTrip.postingAt(1); ids.Cardinality() != 1 || !ids.Contains(22) {
@@ -262,7 +263,7 @@ func TestApplyFieldPostingDiffChunked_StringOwnerChunkKeepsStringLayout(t *testi
 	entries := make([]index, fieldIndexChunkThreshold)
 	for i := range entries {
 		entries[i] = index{
-			Key: indexKeyFromStoredString(fmt.Sprintf("k%04d", i), false),
+			Key: keycodec.FromStoredString(fmt.Sprintf("k%04d", i), false),
 			IDs: fieldStorageSingleton(uint64(i + 1)),
 		}
 	}
@@ -282,13 +283,13 @@ func TestApplyFieldPostingDiffChunked_StringOwnerChunkKeepsStringLayout(t *testi
 	newKey := "k0095a"
 	deltas := []keyedBatchPostingDelta{
 		{
-			key: indexKeyFromStoredString(oldKey, false),
+			key: keycodec.FromStoredString(oldKey, false),
 			delta: batchPostingDelta{
 				remove: fieldStorageSingleton(96),
 			},
 		},
 		{
-			key: indexKeyFromStoredString(newKey, false),
+			key: keycodec.FromStoredString(newKey, false),
 			delta: batchPostingDelta{
 				add: fieldStorageSingleton(900_001),
 			},
@@ -324,7 +325,7 @@ func TestApplyFieldPostingDiffChunked_NumericOwnerChunkKeepsNumericLayout(t *tes
 	entries := make([]index, fieldIndexChunkThreshold)
 	for i := range entries {
 		entries[i] = index{
-			Key: indexKeyFromU64(uint64(i * 2)),
+			Key: keycodec.FromU64(uint64(i * 2)),
 			IDs: fieldStorageSingleton(uint64(i + 1)),
 		}
 	}
@@ -344,13 +345,13 @@ func TestApplyFieldPostingDiffChunked_NumericOwnerChunkKeepsNumericLayout(t *tes
 	newKey := oldKey + 1
 	deltas := []keyedBatchPostingDelta{
 		{
-			key: indexKeyFromU64(oldKey),
+			key: keycodec.FromU64(oldKey),
 			delta: batchPostingDelta{
 				remove: fieldStorageSingleton(96),
 			},
 		},
 		{
-			key: indexKeyFromU64(newKey),
+			key: keycodec.FromU64(newKey),
 			delta: batchPostingDelta{
 				add: fieldStorageSingleton(900_001),
 			},
@@ -370,14 +371,14 @@ func TestApplyFieldPostingDiffChunked_NumericOwnerChunkKeepsNumericLayout(t *tes
 	if !repl.chunk.hasUniqueNumericOwners() {
 		t.Fatalf("expected owner layout to be preserved for singleton result numeric chunk")
 	}
-	if ids := storage.chunked.lookupPostingRetained(uint64ByteStr(oldKey)); !ids.IsEmpty() {
+	if ids := storage.chunked.lookupPostingRetained(keycodec.U64ByteString(oldKey)); !ids.IsEmpty() {
 		t.Fatalf("expected old key to be removed, got %v", ids)
 	}
-	ids := storage.chunked.lookupPostingRetained(uint64ByteStr(newKey))
+	ids := storage.chunked.lookupPostingRetained(keycodec.U64ByteString(newKey))
 	if ids.Cardinality() != 1 || !ids.Contains(900_001) {
 		t.Fatalf("unexpected new key posting: %v", ids)
 	}
-	if ids := storage.chunked.lookupPostingRetained(uint64ByteStr(oldKey + 2)); ids.Cardinality() != 1 || !ids.Contains(97) {
+	if ids := storage.chunked.lookupPostingRetained(keycodec.U64ByteString(oldKey + 2)); ids.Cardinality() != 1 || !ids.Contains(97) {
 		t.Fatalf("neighbor key lookup broken: %v", ids)
 	}
 }
@@ -386,7 +387,7 @@ func TestApplySingleFieldPostingDiffChunked_StringOwnerChunkDemotesOnMultiPostin
 	entries := make([]index, fieldIndexChunkThreshold)
 	for i := range entries {
 		entries[i] = index{
-			Key: indexKeyFromStoredString(fmt.Sprintf("k%04d", i), false),
+			Key: keycodec.FromStoredString(fmt.Sprintf("k%04d", i), false),
 			IDs: fieldStorageSingleton(uint64(i + 1)),
 		}
 	}
@@ -398,7 +399,7 @@ func TestApplySingleFieldPostingDiffChunked_StringOwnerChunkDemotesOnMultiPostin
 	defer root.release()
 
 	storage := applySingleFieldPostingDiffChunked(root, keyedBatchPostingDelta{
-		key: indexKeyFromStoredString("k0095", false),
+		key: keycodec.FromStoredString("k0095", false),
 		delta: batchPostingDelta{
 			add: fieldStorageSingleton(900_002),
 		},
@@ -422,7 +423,7 @@ func TestApplySingleFieldPostingDiffChunked_StringOwnerChunkDemotesOnMultiPostin
 	if ids.Cardinality() != 2 || !ids.Contains(96) || !ids.Contains(900_002) {
 		t.Fatalf("unexpected expanded posting: %v", ids)
 	}
-	if got := repl.chunk.keyAt(95).asUnsafeString(); got != "k0095" {
+	if got := repl.chunk.keyAt(95).UnsafeString(); got != "k0095" {
 		t.Fatalf("unexpected updated key: got %q want %q", got, "k0095")
 	}
 }
@@ -431,7 +432,7 @@ func TestApplySingleFieldPostingDiffChunked_NumericOwnerChunkDemotesOnMultiPosti
 	entries := make([]index, fieldIndexChunkThreshold)
 	for i := range entries {
 		entries[i] = index{
-			Key: indexKeyFromU64(uint64(i * 2)),
+			Key: keycodec.FromU64(uint64(i * 2)),
 			IDs: fieldStorageSingleton(uint64(i + 1)),
 		}
 	}
@@ -443,7 +444,7 @@ func TestApplySingleFieldPostingDiffChunked_NumericOwnerChunkDemotesOnMultiPosti
 	defer root.release()
 
 	storage := applySingleFieldPostingDiffChunked(root, keyedBatchPostingDelta{
-		key: indexKeyFromU64(uint64(95 * 2)),
+		key: keycodec.FromU64(uint64(95 * 2)),
 		delta: batchPostingDelta{
 			add: fieldStorageSingleton(900_002),
 		},
@@ -463,11 +464,11 @@ func TestApplySingleFieldPostingDiffChunked_NumericOwnerChunkDemotesOnMultiPosti
 	if repl.chunk.hasUniqueNumericOwners() {
 		t.Fatalf("expected owner layout to be dropped after multi-posting numeric update")
 	}
-	ids := storage.chunked.lookupPostingRetained(uint64ByteStr(uint64(95 * 2)))
+	ids := storage.chunked.lookupPostingRetained(keycodec.U64ByteString(uint64(95 * 2)))
 	if ids.Cardinality() != 2 || !ids.Contains(96) || !ids.Contains(900_002) {
 		t.Fatalf("unexpected expanded posting: %v", ids)
 	}
-	if got := repl.chunk.keyAt(95).meta; got != uint64(95*2) {
+	if got := repl.chunk.keyAt(95).U64(); got != uint64(95*2) {
 		t.Fatalf("unexpected updated key: got %d want %d", got, uint64(95*2))
 	}
 }
@@ -525,7 +526,7 @@ func TestNewFieldIndexChunkRefsFromEntries_StringChunksRespectOffsetLimit(t *tes
 		key := fmt.Sprintf("%04d/%s", i, strings.Repeat("x", 395))
 		wantKeys[i] = key
 		entries[i] = index{
-			Key: indexKeyFromStoredString(key, false),
+			Key: keycodec.FromStoredString(key, false),
 			IDs: fieldStorageSingleton(uint64(i + 1)),
 		}
 	}
@@ -556,7 +557,7 @@ func TestNewFieldIndexChunkRefsFromEntries_StringChunksRespectOffsetLimit(t *tes
 		t.Fatalf("unexpected flattened len: got %d want %d", len(*flat), total)
 	}
 	for i := range *flat {
-		if got := (*flat)[i].Key.asUnsafeString(); got != wantKeys[i] {
+		if got := (*flat)[i].Key.UnsafeString(); got != wantKeys[i] {
 			t.Fatalf("key[%d]: got %q want %q", i, got, wantKeys[i])
 		}
 	}
@@ -567,7 +568,7 @@ func TestNewFieldIndexChunkRefsFromEntries_StringChunksPreserveBalancedTail(t *t
 	entries := make([]index, total)
 	for i := range entries {
 		entries[i] = index{
-			Key: indexKeyFromStoredString(fmt.Sprintf("k%04d", i), false),
+			Key: keycodec.FromStoredString(fmt.Sprintf("k%04d", i), false),
 			IDs: fieldStorageSingleton(uint64(i + 1)),
 		}
 	}
@@ -628,7 +629,7 @@ func TestFlattenChunkedFieldIndexRoot_RoundTrip(t *testing.T) {
 	entries := make([]index, fieldIndexChunkThreshold)
 	for i := range entries {
 		entries[i] = index{
-			Key: indexKeyFromStoredString(fmt.Sprintf("k%04d", i), false),
+			Key: keycodec.FromStoredString(fmt.Sprintf("k%04d", i), false),
 			IDs: fieldStorageSingleton(uint64(i + 1)),
 		}
 	}
@@ -646,7 +647,7 @@ func TestFlattenChunkedFieldIndexRoot_RoundTrip(t *testing.T) {
 		t.Fatalf("unexpected materialized len: got %d want %d", len(*flat), len(entries))
 	}
 	for i := range entries {
-		if compareIndexKeys((*flat)[i].Key, entries[i].Key) != 0 {
+		if keycodec.Compare((*flat)[i].Key, entries[i].Key) != 0 {
 			t.Fatalf("unexpected key at %d", i)
 		}
 		if (*flat)[i].IDs.Cardinality() != entries[i].IDs.Cardinality() || !(*flat)[i].IDs.Contains(uint64(i+1)) {
@@ -693,7 +694,7 @@ func TestOverlayRangeStats_ChunkedMatchesPostingCardinality(t *testing.T) {
 			expected += ids.Cardinality()
 		}
 		entries = append(entries, index{
-			Key: indexKeyFromStoredString(fmt.Sprintf("k%04d", i), false),
+			Key: keycodec.FromStoredString(fmt.Sprintf("k%04d", i), false),
 			IDs: ids,
 		})
 	}
@@ -735,14 +736,14 @@ func TestFieldIndexChunkStreamBuilder_RoundTripAfterFlushes(t *testing.T) {
 				id := uint64(i + 1)
 				wantIDs[i] = id
 
-				var key indexKey
+				var key keycodec.IndexKey
 				if tc.numeric {
 					raw := uint64(i*3 + 7)
-					wantKeys[i] = uint64ByteStr(raw)
-					key = indexKeyFromStoredString(wantKeys[i], true)
+					wantKeys[i] = keycodec.U64ByteString(raw)
+					key = keycodec.FromStoredString(wantKeys[i], true)
 				} else {
 					wantKeys[i] = fmt.Sprintf("k/%02d/%05d", i%17, i)
-					key = indexKeyFromStoredString(wantKeys[i], false)
+					key = keycodec.FromStoredString(wantKeys[i], false)
 				}
 
 				stream.append(key, fieldStorageSingleton(id))
@@ -765,7 +766,7 @@ func TestFieldIndexChunkStreamBuilder_RoundTripAfterFlushes(t *testing.T) {
 				t.Fatalf("unexpected flattened len: got %d want %d", len(*flat), total)
 			}
 			for i := range *flat {
-				if got := (*flat)[i].Key.asUnsafeString(); got != wantKeys[i] {
+				if got := (*flat)[i].Key.UnsafeString(); got != wantKeys[i] {
 					t.Fatalf("key[%d]: got %q want %q", i, got, wantKeys[i])
 				}
 				if !(*flat)[i].IDs.Contains(wantIDs[i]) || (*flat)[i].IDs.Cardinality() != 1 {
@@ -820,7 +821,7 @@ func TestNewFieldIndexChunkRefsWithInsertedEntry_OwnsUntouchedPostings(t *testin
 				for i := 0; i < repl.chunk.keyCount(); i++ {
 					key := repl.chunk.keyAt(i)
 					ids := repl.chunk.posts[i]
-					if compareIndexKeys(key, add.Key) == 0 {
+					if keycodec.Compare(key, add.Key) == 0 {
 						if ids.IsBorrowed() {
 							t.Fatalf("inserted posting unexpectedly borrowed")
 						}
@@ -959,7 +960,7 @@ func TestApplySingleFieldPostingDiffChunked_RebalancesOversizedDirectoryPagesAft
 		t.Fatalf("expected exactly one full directory page, got pages=%d refs=%d", root.pages.Len(), root.pages.Get(0).refs.Len())
 	}
 
-	insertKey := indexKeyFromU64(splitChunkBase + 2)
+	insertKey := keycodec.FromU64(splitChunkBase + 2)
 	got := applySingleFieldPostingDiffChunked(root, keyedBatchPostingDelta{
 		key: insertKey,
 		delta: batchPostingDelta{

@@ -8,6 +8,7 @@ import (
 	"sort"
 
 	"github.com/vapstack/qx"
+	"github.com/vapstack/rbi/internal/keycodec"
 	"github.com/vapstack/rbi/internal/pooled"
 	"github.com/vapstack/rbi/internal/pools"
 	"github.com/vapstack/rbi/internal/posting"
@@ -1011,7 +1012,7 @@ func addGroupedOrdinaryBucketValue(
 	states *pooled.Slice[aggregateMetricState],
 	first int,
 	field *field,
-	key indexKey,
+	key keycodec.IndexKey,
 	counts []uint64,
 	touched []int,
 ) error {
@@ -1604,10 +1605,10 @@ func compareString(a string, b string) int {
 	return 0
 }
 
-func aggregateValueFromIndexKey(f *field, key indexKey) Value {
-	raw := key.meta
-	if !key.isNumeric() {
-		s := key.asUnsafeString()
+func aggregateValueFromIndexKey(f *field, key keycodec.IndexKey) Value {
+	raw := key.U64()
+	if !key.IsNumeric() {
+		s := key.UnsafeString()
 		if !f.UseVI && f.Kind == reflect.Bool {
 			if s == "1" {
 				return Value{num: 1, any: ValueKindBool}
@@ -1638,12 +1639,12 @@ func float64FromOrderedKey(key uint64) float64 {
 	return math.Float64frombits(^key)
 }
 
-func (o fieldOverlay) keyAt(rank int) indexKey {
+func (o fieldOverlay) keyAt(rank int) keycodec.IndexKey {
 	if o.chunked != nil {
 		pos := o.chunked.posForRank(rank)
 		ref, ok := o.chunked.refAtChunk(pos.chunk)
 		if !ok {
-			return indexKey{}
+			return keycodec.IndexKey{}
 		}
 		return ref.chunk.keyAt(pos.entry)
 	}
@@ -1858,7 +1859,7 @@ func aggregateCompareNumericValues(a Value, b Value) (int, bool) {
 }
 
 func aggregateCompareInt64Float64(i int64, f float64) int {
-	f = canonicalizeFloat64ForIndex(f)
+	f = keycodec.CanonicalizeFloat64ForIndex(f)
 	switch {
 	case math.IsNaN(f), math.IsInf(f, 1):
 		return -1
@@ -1882,7 +1883,7 @@ func aggregateCompareInt64Float64(i int64, f float64) int {
 }
 
 func aggregateCompareUint64Float64(u uint64, f float64) int {
-	f = canonicalizeFloat64ForIndex(f)
+	f = keycodec.CanonicalizeFloat64ForIndex(f)
 	switch {
 	case math.IsNaN(f), math.IsInf(f, 1):
 		return -1

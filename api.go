@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"unsafe"
 
+	"github.com/vapstack/rbi/internal/keycodec"
 	"github.com/vapstack/rbi/internal/pooled"
 	"github.com/vapstack/rbi/internal/posting"
 	"go.etcd.io/bbolt"
@@ -27,7 +28,8 @@ func (db *DB[K, V]) Get(id K) (*V, error) {
 		return nil, fmt.Errorf("bucket does not exist")
 	}
 
-	v := bucket.Get(db.keyFromID(id))
+	var keyBuf [8]byte
+	v := bucket.Get(keycodec.UserKeyBytesWithBuf(id, db.strKey, &keyBuf))
 	if v == nil {
 		return nil, nil
 	}
@@ -69,8 +71,9 @@ func (db *DB[K, V]) batchGetTx(tx *bbolt.Tx, ids ...K) ([]*V, error) {
 	}
 
 	s := make([]*V, len(ids))
+	var keyBuf [8]byte
 	for i, id := range ids {
-		v := bucket.Get(db.keyFromID(id))
+		v := bucket.Get(keycodec.UserKeyBytesWithBuf(id, db.strKey, &keyBuf))
 		if v == nil {
 			continue
 		}
@@ -95,8 +98,9 @@ func (db *DB[K, V]) batchGetTxCompact(tx *bbolt.Tx, ids []K) ([]*V, error) {
 	}
 
 	out := make([]*V, 0, len(ids))
+	var keyBuf [8]byte
 	for _, id := range ids {
-		v := bucket.Get(db.keyFromID(id))
+		v := bucket.Get(keycodec.UserKeyBytesWithBuf(id, db.strKey, &keyBuf))
 		if v == nil {
 			continue
 		}
@@ -282,7 +286,8 @@ func (db *DB[K, V]) SeqScan(seek K, fn func(K, *V) (bool, error)) error {
 	}
 	c := b.Cursor()
 
-	key, value := c.Seek(db.keyFromID(seek))
+	var keyBuf [8]byte
+	key, value := c.Seek(keycodec.UserKeyBytesWithBuf(seek, db.strKey, &keyBuf))
 	if key == nil {
 		return nil
 	}
@@ -291,7 +296,7 @@ func (db *DB[K, V]) SeqScan(seek K, fn func(K, *V) (bool, error)) error {
 		return fmt.Errorf("decode: %w", err)
 	}
 
-	more, err := fn(db.idFromKey(key), val)
+	more, err := fn(db.userKeyFromBytes(key), val)
 	if err != nil {
 		return err
 	}
@@ -303,7 +308,7 @@ func (db *DB[K, V]) SeqScan(seek K, fn func(K, *V) (bool, error)) error {
 		if val, err = db.decode(value); err != nil {
 			return fmt.Errorf("decode: %w", err)
 		}
-		if more, err = fn(db.idFromKey(key), val); err != nil {
+		if more, err = fn(db.userKeyFromBytes(key), val); err != nil {
 			return err
 		}
 	}
@@ -336,12 +341,13 @@ func (db *DB[K, V]) SeqScanRaw(seek K, fn func(K, []byte) (bool, error)) error {
 	}
 	c := b.Cursor()
 
-	key, value := c.Seek(db.keyFromID(seek))
+	var keyBuf [8]byte
+	key, value := c.Seek(keycodec.UserKeyBytesWithBuf(seek, db.strKey, &keyBuf))
 	if key == nil {
 		return nil
 	}
 
-	more, err := fn(db.idFromKey(key), value)
+	more, err := fn(db.userKeyFromBytes(key), value)
 	if err != nil {
 		return err
 	}
@@ -350,7 +356,7 @@ func (db *DB[K, V]) SeqScanRaw(seek K, fn func(K, []byte) (bool, error)) error {
 		if key == nil {
 			return nil
 		}
-		if more, err = fn(db.idFromKey(key), value); err != nil {
+		if more, err = fn(db.userKeyFromBytes(key), value); err != nil {
 			return err
 		}
 	}
@@ -382,7 +388,7 @@ func (db *DB[K, V]) Set(id K, newVal *V, execOpts ...ExecOption[K, V]) error {
 	}
 
 	cfg := db.resolveExecOptions(execOpts)
-	key := autoBatchKeyFromIDWithKind(id, db.strKey)
+	key := keycodec.DataKeyFromUserKey(id, db.strKey)
 	if len(cfg.beforeProcess) != 0 {
 		if err := runBeforeProcessHooks(key, unsafe.Pointer(newVal), cfg.beforeProcess); err != nil {
 			return err
@@ -442,14 +448,14 @@ func (db *DB[K, V]) BatchSet(ids []K, newVals []*V, execOpts ...ExecOption[K, V]
 	}
 
 	cfg := db.resolveExecOptions(execOpts)
-	var keyScratch *pooled.Slice[autoBatchKey]
+	var keyScratch *pooled.Slice[keycodec.DataKey]
 	if len(cfg.beforeProcess) != 0 {
 		keyScratch = db.autoBatcher.setKeyScratchPool.Get()
 		defer db.autoBatcher.setKeyScratchPool.Put(keyScratch)
 
 		keyScratch.Grow(len(ids))
 		for i := range newVals {
-			key := autoBatchKeyFromIDWithKind(ids[i], db.strKey)
+			key := keycodec.DataKeyFromUserKey(ids[i], db.strKey)
 			if err := runBeforeProcessHooks(key, unsafe.Pointer(newVals[i]), cfg.beforeProcess); err != nil {
 				return err
 			}
@@ -467,7 +473,7 @@ func (db *DB[K, V]) BatchSet(ids []K, newVals []*V, execOpts ...ExecOption[K, V]
 	reqScratch.Grow(len(ids))
 
 	for i := range ids {
-		key := autoBatchKeyFromIDWithKind(ids[i], db.strKey)
+		key := keycodec.DataKeyFromUserKey(ids[i], db.strKey)
 		if keyScratch != nil {
 			key = keyScratch.Get(i)
 		}
@@ -609,7 +615,7 @@ func (db *DB[K, V]) BatchDelete(ids []K, execOpts ...ExecOption[K, V]) error {
 	return db.autoBatcher.submitAutoBatchRequests(reqScratch, true)
 }
 
-func runBeforeProcessHooks(id autoBatchKey, newVal unsafe.Pointer, hooks []autoBatchBeforeProcessHook) error {
+func runBeforeProcessHooks(id keycodec.DataKey, newVal unsafe.Pointer, hooks []autoBatchBeforeProcessHook) error {
 	for _, fn := range hooks {
 		if err := fn(id, newVal); err != nil {
 			return err

@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/vapstack/qx"
+	"github.com/vapstack/rbi/internal/keycodec"
 	"github.com/vapstack/rbi/internal/posting"
 )
 
@@ -14,7 +15,7 @@ func hasLenIndexKey(slice *[]index, key string) bool {
 		return false
 	}
 	for _, ix := range *slice {
-		if indexKeyEqualsString(ix.Key, key) {
+		if keycodec.EqualsString(ix.Key, key) {
 			return true
 		}
 	}
@@ -85,7 +86,7 @@ func TestLenIndex_ZeroComplement_BaseQueryAndOrder(t *testing.T) {
 	if !hasLenIndexKey(lenSlice, lenIndexNonEmptyKey) {
 		t.Fatalf("expected non-empty marker key in len index")
 	}
-	if hasLenIndexKey(lenSlice, uint64ByteStr(0)) {
+	if hasLenIndexKey(lenSlice, keycodec.U64ByteString(0)) {
 		t.Fatalf("len=0 key should not be materialized in complement mode")
 	}
 

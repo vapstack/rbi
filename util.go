@@ -2,7 +2,6 @@ package rbi
 
 import (
 	"bytes"
-	"encoding/binary"
 	"fmt"
 	"io"
 	"math"
@@ -17,6 +16,7 @@ import (
 	"sync"
 	"unsafe"
 
+	"github.com/vapstack/rbi/internal/keycodec"
 	"github.com/vapstack/rbi/internal/pooled"
 	"github.com/vmihailenco/msgpack/v5"
 	"go.etcd.io/bbolt"
@@ -192,31 +192,16 @@ func (db *DB[K, V]) makePatch(oldVal, newVal *V, target []Field, useJSON bool) [
 	return target
 }
 
-func (db *DB[K, V]) keyFromID(id K) []byte {
-	if db.strKey {
-		s := *(*string)(unsafe.Pointer(&id))
-		return unsafe.Slice(unsafe.StringData(s), len(s))
-	}
-	var key [8]byte
-	binary.BigEndian.PutUint64(key[:], *(*uint64)(unsafe.Pointer(&id)))
-	return key[:]
+func (db *DB[K, V]) userKeyFromBytes(b []byte) K {
+	return keycodec.UserKeyFromBytes[K](b, db.strKey)
 }
 
-func (db *DB[K, V]) idFromKey(b []byte) K {
-	if db.strKey {
-		s := string(b) // must allocate here because bytes are from bbolt
-		return *(*K)(unsafe.Pointer(&s))
-	}
-	v := binary.BigEndian.Uint64(b)
-	return *(*K)(unsafe.Pointer(&v))
-}
-
-func (db *DB[K, V]) idxFromID(id K) uint64 {
-	idx, _ := db.idxFromIDWithCreated(id)
+func (db *DB[K, V]) idxFromUserKey(id K) uint64 {
+	idx, _ := db.idxFromUserKeyWithCreated(id)
 	return idx
 }
 
-func (db *DB[K, V]) idxFromIDWithCreated(id K) (uint64, bool) {
+func (db *DB[K, V]) idxFromUserKeyWithCreated(id K) (uint64, bool) {
 	if db.strKey {
 		s := *(*string)(unsafe.Pointer(&id))
 		db.strMap.Lock()
@@ -230,7 +215,7 @@ func (db *DB[K, V]) idxFromIDWithCreated(id K) (uint64, bool) {
 	return *(*uint64)(unsafe.Pointer(&id)), false
 }
 
-func (db *DB[K, V]) addCheckedIdxsFromIDs(ids []K, dst *postingLazySetBuilder) uint64 {
+func (db *DB[K, V]) addCheckedIdxsFromUserKeys(ids []K, dst *postingLazySetBuilder) uint64 {
 	if len(ids) == 0 || dst == nil {
 		return 0
 	}
@@ -407,50 +392,9 @@ func dedupStringsInplace(s []string) []string {
 	return s[:w]
 }
 
-func uint64Bytes(v uint64) []byte {
-	var key [8]byte
-	binary.BigEndian.PutUint64(key[:], v)
-	return key[:]
-}
-
-func uint64ByteStr(v uint64) string {
-	b := uint64Bytes(v)
-	return unsafe.String(unsafe.SliceData(b), len(b))
-}
-
-func orderedInt64Key(v int64) uint64 {
-	return uint64(v) ^ (uint64(1) << 63)
-}
-
-func int64ByteStr(v int64) string {
-	return uint64ByteStr(orderedInt64Key(v))
-}
-
-const canonicalFloat64NaNBits uint64 = 0x7ff8000000000001
-
-func canonicalizeFloat64ForIndex(f float64) float64 {
-	switch {
-	case math.IsNaN(f):
-		return math.Float64frombits(canonicalFloat64NaNBits)
-	case f == 0:
-		return 0
-	default:
-		return f
-	}
-}
-
-func orderedFloat64Key(f float64) uint64 {
-	u := math.Float64bits(canonicalizeFloat64ForIndex(f))
-	const sign = uint64(1) << 63
-	if u&sign != 0 {
-		return ^u
-	}
-	return u ^ sign
-}
-
 func compareFloat64QuerySemantics(a, b float64) int {
-	a = canonicalizeFloat64ForIndex(a)
-	b = canonicalizeFloat64ForIndex(b)
+	a = keycodec.CanonicalizeFloat64ForIndex(a)
+	b = keycodec.CanonicalizeFloat64ForIndex(b)
 
 	aNaN := math.IsNaN(a)
 	bNaN := math.IsNaN(b)
@@ -468,10 +412,6 @@ func compareFloat64QuerySemantics(a, b float64) int {
 	default:
 		return 0
 	}
-}
-
-func float64ByteStr(f float64) string {
-	return uint64ByteStr(orderedFloat64Key(f))
 }
 
 var (

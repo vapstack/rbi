@@ -11,6 +11,7 @@ import (
 	"unsafe"
 
 	"github.com/vapstack/qx"
+	"github.com/vapstack/rbi/internal/keycodec"
 	"github.com/vapstack/rbi/internal/pooled"
 	"github.com/vapstack/rbi/internal/pools"
 	"github.com/vapstack/rbi/internal/posting"
@@ -109,7 +110,7 @@ func TestSnapshot_PublishedAsFullState(t *testing.T) {
 	tagsIDs := s.fieldLookupPostingRetained("tags", "go")
 	snapshotPostingContainsAll(t, tagsIDs, 1)
 
-	lenIDs := db.engine.currentQueryViewForTests().lenFieldOverlay("tags").lookupPostingRetained(uint64ByteStr(2))
+	lenIDs := db.engine.currentQueryViewForTests().lenFieldOverlay("tags").lookupPostingRetained(keycodec.U64ByteString(2))
 	snapshotPostingContainsAll(t, lenIDs, 1)
 }
 
@@ -333,7 +334,7 @@ func TestSnapshotReleaseOwnedStorage_SkipsLiveSharedFlatRoot(t *testing.T) {
 		shared = shared.BuildAdded((i << 1) + 1)
 	}
 	sharedStorage := snapshotExtFlatStorageOwned(
-		index{Key: indexKeyFromString("shared"), IDs: shared},
+		index{Key: keycodec.FromString("shared"), IDs: shared},
 	)
 
 	old := snapshotTestNewSnapshot(map[string]fieldIndexStorage{"f": sharedStorage}, nil, nil, nil)
@@ -554,7 +555,7 @@ func snapshotExtNilContainsID(tb testing.TB, s *indexSnapshot, field string, id 
 func snapshotExtLenContainsID(tb testing.TB, s *indexSnapshot, field string, ln uint64, id uint64) bool {
 	tb.Helper()
 	acc := s.indexedFieldByName[field]
-	return newFieldOverlayStorage(s.lenIndex.Get(acc.ordinal)).lookupPostingRetained(uint64ByteStr(ln)).Contains(id)
+	return newFieldOverlayStorage(s.lenIndex.Get(acc.ordinal)).lookupPostingRetained(keycodec.U64ByteString(ln)).Contains(id)
 }
 
 func snapshotExtLenNonEmptyContainsID(tb testing.TB, s *indexSnapshot, field string, id uint64) bool {

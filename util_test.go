@@ -12,6 +12,7 @@ import (
 	"unsafe"
 
 	"github.com/vapstack/qx"
+	"github.com/vapstack/rbi/internal/keycodec"
 	"go.etcd.io/bbolt"
 )
 
@@ -230,7 +231,7 @@ func TestCodec_SetBeforeStoreSnapshotUsesCodecMethods(t *testing.T) {
 		if b == nil {
 			return fmt.Errorf("bucket missing")
 		}
-		payload := b.Get(uint64Bytes(1))
+		payload := b.Get(keycodec.U64Bytes(1))
 		if len(payload) == 0 {
 			return fmt.Errorf("stored payload missing")
 		}
@@ -271,7 +272,7 @@ func TestCodec_NewBuildIndexUsesCodecDecode(t *testing.T) {
 		if err != nil {
 			return err
 		}
-		return b.Put(uint64Bytes(1), payload.Bytes())
+		return b.Put(keycodec.U64Bytes(1), payload.Bytes())
 	}); err != nil {
 		t.Fatalf("seed custom payload: %v", err)
 	}

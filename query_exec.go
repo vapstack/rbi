@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/vapstack/rbi/internal/keycodec"
 	"github.com/vapstack/rbi/internal/pooled"
 	"github.com/vapstack/rbi/internal/pools"
 	"github.com/vapstack/rbi/internal/posting"
@@ -993,13 +994,13 @@ type rangeBounds struct {
 
 	hasLo     bool
 	loKey     string
-	loIndex   indexKey
+	loIndex   keycodec.IndexKey
 	loNumeric bool
 	loInc     bool
 
 	hasHi     bool
 	hiKey     string
-	hiIndex   indexKey
+	hiIndex   keycodec.IndexKey
 	hiNumeric bool
 	hiInc     bool
 
@@ -1009,17 +1010,17 @@ type rangeBounds struct {
 
 func compareRangeBoundKeys(
 	aKey string,
-	aIndex indexKey,
+	aIndex keycodec.IndexKey,
 	aNumeric bool,
 	bKey string,
-	bIndex indexKey,
+	bIndex keycodec.IndexKey,
 	bNumeric bool,
 ) int {
 	if aNumeric != bNumeric {
 		panic("rbi: mixed range bound key representations")
 	}
 	if aNumeric {
-		return compareIndexKeys(aIndex, bIndex)
+		return keycodec.Compare(aIndex, bIndex)
 	}
 	return strings.Compare(aKey, bKey)
 }
@@ -1049,7 +1050,7 @@ func (rb *rangeBounds) normalize() {
 	if rb.hasHi {
 		cmp := strings.Compare(rb.hiKey, rb.prefix)
 		if rb.hiNumeric {
-			cmp = compareIndexKeyString(rb.hiIndex, rb.prefix)
+			cmp = keycodec.CompareString(rb.hiIndex, rb.prefix)
 		}
 		if cmp < 0 || (cmp == 0 && !rb.hiInc) {
 			rb.setEmpty()
@@ -1058,10 +1059,10 @@ func (rb *rangeBounds) normalize() {
 	}
 
 	if rb.hasLo {
-		if upper, ok := newPrefixUpperBound(rb.prefix); ok {
-			cmp := compareStringPrefixUpperBound(rb.loKey, upper)
+		if upper, ok := keycodec.NewPrefixUpperBound(rb.prefix); ok {
+			cmp := keycodec.CompareStringPrefixUpperBound(rb.loKey, upper)
 			if rb.loNumeric {
-				cmp = compareIndexKeyPrefixUpperBound(rb.loIndex, upper)
+				cmp = keycodec.ComparePrefixUpperBound(rb.loIndex, upper)
 			}
 			if cmp >= 0 {
 				rb.setEmpty()
@@ -1077,18 +1078,18 @@ func (rb *rangeBounds) applyLo(key string, inc bool) {
 	if !rb.hasLo || rb.loKey < key || (rb.loKey == key && !rb.loInc && inc) {
 		rb.hasLo = true
 		rb.loKey = key
-		rb.loIndex = indexKey{}
+		rb.loIndex = keycodec.IndexKey{}
 		rb.loNumeric = false
 		rb.loInc = inc
 	}
 	rb.normalize()
 }
 
-func (rb *rangeBounds) applyLoIndex(key indexKey, inc bool) {
+func (rb *rangeBounds) applyLoIndex(key keycodec.IndexKey, inc bool) {
 	if rb.empty {
 		return
 	}
-	if !rb.hasLo || compareIndexKeys(rb.loIndex, key) < 0 || (compareIndexKeys(rb.loIndex, key) == 0 && !rb.loInc && inc) {
+	if !rb.hasLo || keycodec.Compare(rb.loIndex, key) < 0 || (keycodec.Compare(rb.loIndex, key) == 0 && !rb.loInc && inc) {
 		rb.hasLo = true
 		rb.loKey = ""
 		rb.loIndex = key
@@ -1105,18 +1106,18 @@ func (rb *rangeBounds) applyHi(key string, inc bool) {
 	if !rb.hasHi || rb.hiKey > key || (rb.hiKey == key && !rb.hiInc && inc) {
 		rb.hasHi = true
 		rb.hiKey = key
-		rb.hiIndex = indexKey{}
+		rb.hiIndex = keycodec.IndexKey{}
 		rb.hiNumeric = false
 		rb.hiInc = inc
 	}
 	rb.normalize()
 }
 
-func (rb *rangeBounds) applyHiIndex(key indexKey, inc bool) {
+func (rb *rangeBounds) applyHiIndex(key keycodec.IndexKey, inc bool) {
 	if rb.empty {
 		return
 	}
-	if !rb.hasHi || compareIndexKeys(rb.hiIndex, key) > 0 || (compareIndexKeys(rb.hiIndex, key) == 0 && !rb.hiInc && inc) {
+	if !rb.hasHi || keycodec.Compare(rb.hiIndex, key) > 0 || (keycodec.Compare(rb.hiIndex, key) == 0 && !rb.hiInc && inc) {
 		rb.hasHi = true
 		rb.hiKey = ""
 		rb.hiIndex = key
@@ -1328,7 +1329,7 @@ func lowerBoundIndex(s []index, key string) int {
 	lo, hi := 0, len(s)
 	for lo < hi {
 		mid := (lo + hi) >> 1
-		if compareIndexKeyString(s[mid].Key, key) < 0 {
+		if keycodec.CompareString(s[mid].Key, key) < 0 {
 			lo = mid + 1
 		} else {
 			hi = mid
@@ -1341,7 +1342,7 @@ func upperBoundIndex(s []index, key string) int {
 	lo, hi := 0, len(s)
 	for lo < hi {
 		mid := (lo + hi) >> 1
-		if compareIndexKeyString(s[mid].Key, key) <= 0 {
+		if keycodec.CompareString(s[mid].Key, key) <= 0 {
 			lo = mid + 1
 		} else {
 			hi = mid
@@ -1354,10 +1355,10 @@ func prefixRangeEndIndex(s []index, prefix string, start int) int {
 	if start < 0 || start >= len(s) {
 		return start
 	}
-	if compareIndexKeyString(s[start].Key, prefix) < 0 || !indexKeyHasPrefixString(s[start].Key, prefix) {
+	if keycodec.CompareString(s[start].Key, prefix) < 0 || !keycodec.HasPrefixString(s[start].Key, prefix) {
 		return start
 	}
-	upper, ok := newPrefixUpperBound(prefix)
+	upper, ok := keycodec.NewPrefixUpperBound(prefix)
 	if !ok {
 		return len(s)
 	}
@@ -1365,7 +1366,7 @@ func prefixRangeEndIndex(s []index, prefix string, start int) int {
 	lo, hi := start, len(s)
 	for lo < hi {
 		mid := int(uint(lo+hi) >> 1)
-		if compareIndexKeyPrefixUpperBound(s[mid].Key, upper) >= 0 {
+		if keycodec.ComparePrefixUpperBound(s[mid].Key, upper) >= 0 {
 			hi = mid
 		} else {
 			lo = mid + 1

@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/vapstack/qx"
+	"github.com/vapstack/rbi/internal/keycodec"
 	"github.com/vapstack/rbi/internal/pools"
 	"github.com/vapstack/rbi/internal/posting"
 	"github.com/vapstack/rbi/internal/qir"
@@ -334,10 +335,10 @@ func TestOverlayRangePredicateState_Matches_MaterializedComplementProbe(t *testi
 
 func TestPredicateSetExpectedContainsCalls_UpdatesOverlayRangeState(t *testing.T) {
 	state := overlayRangePredicateStatePool.Get()
-	state.ov = fieldOverlay{base: []index{{Key: indexKeyFromString("a")}, {Key: indexKeyFromString("b")}, {Key: indexKeyFromString("c")}}}
+	state.ov = fieldOverlay{base: []index{{Key: keycodec.FromString("a")}, {Key: keycodec.FromString("b")}, {Key: keycodec.FromString("c")}}}
 	state.br = overlayRange{baseStart: 0, baseEnd: 3}
 	state.probe = overlayRangeProbe{
-		ov:       fieldOverlay{base: []index{{Key: indexKeyFromString("a")}, {Key: indexKeyFromString("b")}, {Key: indexKeyFromString("c")}}},
+		ov:       fieldOverlay{base: []index{{Key: keycodec.FromString("a")}, {Key: keycodec.FromString("b")}, {Key: keycodec.FromString("c")}}},
 		spans:    [2]overlayRange{{baseStart: 0, baseEnd: 3}},
 		spanCnt:  1,
 		probeLen: 32,
@@ -387,8 +388,8 @@ func TestBaseRangePredicateState_LinearContains_NonLinearModeSkipsLinearPosts(t 
 
 func TestOverlayRangePredicateState_LinearContains_NonLinearModeSkipsLinearPosts(t *testing.T) {
 	base := []index{
-		{Key: indexKeyFromString("a"), IDs: posting.BuildFromSorted([]uint64{1, 2})},
-		{Key: indexKeyFromString("b"), IDs: posting.BuildFromSorted([]uint64{3, 4})},
+		{Key: keycodec.FromString("a"), IDs: posting.BuildFromSorted([]uint64{1, 2})},
+		{Key: keycodec.FromString("b"), IDs: posting.BuildFromSorted([]uint64{3, 4})},
 	}
 	state := overlayRangePredicateStatePool.Get()
 	state.ov = fieldOverlay{base: base}
@@ -414,10 +415,10 @@ func TestOverlayRangePredicateState_LinearContains_NonLinearModeSkipsLinearPosts
 
 func TestAcquireOverlayRangePredicateState_PositiveDirectProbeKeepsProbeHitsWithoutPostingFilter(t *testing.T) {
 	state := overlayRangePredicateStatePool.Get()
-	state.ov = fieldOverlay{base: []index{{Key: indexKeyFromString("a")}, {Key: indexKeyFromString("b")}}}
+	state.ov = fieldOverlay{base: []index{{Key: keycodec.FromString("a")}, {Key: keycodec.FromString("b")}}}
 	state.br = overlayRange{baseStart: 0, baseEnd: 1}
 	state.probe = overlayRangeProbe{
-		ov:       fieldOverlay{base: []index{{Key: indexKeyFromString("a")}, {Key: indexKeyFromString("b")}}},
+		ov:       fieldOverlay{base: []index{{Key: keycodec.FromString("a")}, {Key: keycodec.FromString("b")}}},
 		spans:    [2]overlayRange{{baseStart: 0, baseEnd: 1}},
 		spanCnt:  1,
 		probeLen: 1,
@@ -793,11 +794,11 @@ func TestOverlayRangeStats_ChunkedMatchesCursorScanOnSeededScore(t *testing.T) {
 	}
 
 	cases := []rangeBounds{
-		{has: true, hasLo: true, loKey: float64ByteStr(81), loInc: false},
-		{has: true, hasLo: true, loKey: float64ByteStr(4), loInc: false},
-		{has: true, hasLo: true, loKey: float64ByteStr(40), loInc: true},
-		{has: true, hasHi: true, hiKey: float64ByteStr(50), hiInc: false},
-		{has: true, hasLo: true, loKey: float64ByteStr(10), loInc: true, hasHi: true, hiKey: float64ByteStr(20), hiInc: true},
+		{has: true, hasLo: true, loKey: keycodec.Float64ByteString(81), loInc: false},
+		{has: true, hasLo: true, loKey: keycodec.Float64ByteString(4), loInc: false},
+		{has: true, hasLo: true, loKey: keycodec.Float64ByteString(40), loInc: true},
+		{has: true, hasHi: true, hiKey: keycodec.Float64ByteString(50), hiInc: false},
+		{has: true, hasLo: true, loKey: keycodec.Float64ByteString(10), loInc: true, hasHi: true, hiKey: keycodec.Float64ByteString(20), hiInc: true},
 	}
 
 	for i, rb := range cases {
@@ -2512,10 +2513,10 @@ func TestOverlayRangeStats_ChunkedMatchesCursorScanOnLargeUniqueRange(t *testing
 	}
 
 	cases := []rangeBounds{
-		{has: true, hasLo: true, loKey: int64ByteStr(3_500), loInc: true},
-		{has: true, hasLo: true, loKey: int64ByteStr(3_500), loInc: false},
-		{has: true, hasHi: true, hiKey: int64ByteStr(3_500), hiInc: false},
-		{has: true, hasLo: true, loKey: int64ByteStr(1_000), loInc: true, hasHi: true, hiKey: int64ByteStr(12_000), hiInc: false},
+		{has: true, hasLo: true, loKey: keycodec.Int64ByteString(3_500), loInc: true},
+		{has: true, hasLo: true, loKey: keycodec.Int64ByteString(3_500), loInc: false},
+		{has: true, hasHi: true, hiKey: keycodec.Int64ByteString(3_500), hiInc: false},
+		{has: true, hasLo: true, loKey: keycodec.Int64ByteString(1_000), loInc: true, hasHi: true, hiKey: keycodec.Int64ByteString(12_000), hiInc: false},
 	}
 
 	for i, rb := range cases {

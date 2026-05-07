@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/vapstack/qx"
+	"github.com/vapstack/rbi/internal/keycodec"
 	"github.com/vapstack/rbi/internal/pooled"
 	"github.com/vapstack/rbi/internal/pools"
 	"github.com/vapstack/rbi/internal/posting"
@@ -394,11 +395,11 @@ func TestOrderPredicatesEmitPostingReader_SingleBucketCountSkipsWithoutMatches(t
 
 func TestApplyBoundsToIndexRange_PrefixIntersectsRange(t *testing.T) {
 	s := []index{
-		{Key: indexKeyFromString("aa")},
-		{Key: indexKeyFromString("ab")},
-		{Key: indexKeyFromString("ac")},
-		{Key: indexKeyFromString("ad")},
-		{Key: indexKeyFromString("b0")},
+		{Key: keycodec.FromString("aa")},
+		{Key: keycodec.FromString("ab")},
+		{Key: keycodec.FromString("ac")},
+		{Key: keycodec.FromString("ad")},
+		{Key: keycodec.FromString("b0")},
 	}
 
 	rb := rangeBounds{has: true}
@@ -413,7 +414,7 @@ func TestApplyBoundsToIndexRange_PrefixIntersectsRange(t *testing.T) {
 
 	got := make([]string, 0, end-start)
 	for _, ent := range s[start:end] {
-		got = append(got, ent.Key.asUnsafeString())
+		got = append(got, ent.Key.UnsafeString())
 	}
 	want := []string{"ab", "ac"}
 	if !reflect.DeepEqual(got, want) {

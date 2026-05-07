@@ -16,6 +16,7 @@ import (
 	"time"
 	"unsafe"
 
+	"github.com/vapstack/rbi/internal/keycodec"
 	"github.com/vapstack/rbi/internal/pooled"
 	"github.com/vapstack/rbi/internal/pools"
 	"github.com/vapstack/rbi/internal/posting"
@@ -711,7 +712,7 @@ func newAutoBatcher(options *Options, runtime *autoBatchRuntime) *autoBatcher {
 		repeatStringIDPool: pooled.Maps[string, int]{
 			NewCap: 8,
 		},
-		setKeyScratchPool: pooled.Slices[autoBatchKey]{
+		setKeyScratchPool: pooled.Slices[keycodec.DataKey]{
 			Clear: true,
 		},
 		requestScratchPool: pooled.Slices[*autoBatchRequest]{
@@ -765,7 +766,7 @@ func newAutoBatcher(options *Options, runtime *autoBatchRuntime) *autoBatcher {
 				default:
 				}
 				req.op = 0
-				req.id = autoBatchKey{}
+				req.id = keycodec.DataKey{}
 				req.err = nil
 			},
 		},
@@ -933,7 +934,7 @@ type autoBatcher struct {
 	runtime            *autoBatchRuntime
 	repeatUintIDPool   pooled.Maps[uint64, int]
 	repeatStringIDPool pooled.Maps[string, int]
-	setKeyScratchPool  pooled.Slices[autoBatchKey]
+	setKeyScratchPool  pooled.Slices[keycodec.DataKey]
 	requestScratchPool pooled.Slices[*autoBatchRequest]
 	attemptStatePool   pooled.Pointers[autoBatchAttemptState]
 	requestPool        pooled.Pointers[autoBatchRequest]
@@ -999,7 +1000,7 @@ type (
 	}
 
 	index struct {
-		Key indexKey
+		Key keycodec.IndexKey
 		IDs posting.List
 	}
 
@@ -1644,7 +1645,7 @@ func collectFlatFieldIndexStats(root *fieldIndexFlatRoot, countDistinct bool) fi
 	}
 	for i := range root.entries {
 		entry := root.entries[i]
-		if entry.Key.isNumeric() {
+		if entry.Key.IsNumeric() {
 			stats.approxStructBytes -= uint64(unsafe.Sizeof(uint64(0)))
 		}
 		accumulateIndexEntryStats(entry.Key, entry.IDs, countDistinct, &stats)
@@ -1699,13 +1700,13 @@ func collectChunkedFieldIndexStats(root *fieldIndexChunkedRoot, countDistinct bo
 	return stats
 }
 
-func accumulateIndexEntryStats(key indexKey, ids posting.List, countDistinct bool, stats *fieldIndexStats) {
+func accumulateIndexEntryStats(key keycodec.IndexKey, ids posting.List, countDistinct bool, stats *fieldIndexStats) {
 	if ids.IsEmpty() {
 		return
 	}
 	if countDistinct {
 		stats.unique++
-		stats.keyBytes += uint64(key.byteLen())
+		stats.keyBytes += uint64(key.ByteLen())
 	}
 	stats.postingBytes += ids.SizeInBytes()
 	card := ids.Cardinality()

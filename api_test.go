@@ -16,6 +16,7 @@ import (
 	"unsafe"
 
 	"github.com/vapstack/qx"
+	"github.com/vapstack/rbi/internal/keycodec"
 	"github.com/vmihailenco/msgpack/v5"
 	"go.etcd.io/bbolt"
 )
@@ -2323,7 +2324,8 @@ func ioExtMustReadUint64Raw(t *testing.T, db *DB[uint64, Rec], id uint64) []byte
 		if b == nil {
 			return fmt.Errorf("bucket does not exist")
 		}
-		v := b.Get(db.keyFromID(id))
+		var keyBuf [8]byte
+		v := b.Get(keycodec.UserKeyBytesWithBuf(id, db.strKey, &keyBuf))
 		if v == nil {
 			return fmt.Errorf("missing raw value for id=%d", id)
 		}
@@ -2343,7 +2345,8 @@ func ioExtMustReadStringRaw(t *testing.T, db *DB[string, Product], id string) []
 		if b == nil {
 			return fmt.Errorf("bucket does not exist")
 		}
-		v := b.Get(db.keyFromID(id))
+		var keyBuf [8]byte
+		v := b.Get(keycodec.UserKeyBytesWithBuf(id, db.strKey, &keyBuf))
 		if v == nil {
 			return fmt.Errorf("missing raw value for id=%q", id)
 		}
@@ -2362,7 +2365,8 @@ func ioExtMustCorruptUint64Raw(t *testing.T, db *DB[uint64, Rec], id uint64, raw
 		if b == nil {
 			return fmt.Errorf("bucket does not exist")
 		}
-		return b.Put(db.keyFromID(id), raw)
+		var keyBuf [8]byte
+		return b.Put(keycodec.UserKeyBytesWithBuf(id, db.strKey, &keyBuf), raw)
 	}); err != nil {
 		t.Fatalf("corrupt raw(%d): %v", id, err)
 	}
@@ -2831,7 +2835,8 @@ func TestIOExt_Set_BeforeCommit_CanAtomicallyWriteNeighborBucket(t *testing.T) {
 		if managed == nil {
 			return fmt.Errorf("managed bucket missing")
 		}
-		raw := managed.Get(db.keyFromID(key))
+		var keyBuf [8]byte
+		raw := managed.Get(keycodec.UserKeyBytesWithBuf(key, db.strKey, &keyBuf))
 		if raw == nil {
 			return fmt.Errorf("managed key missing inside BeforeCommit")
 		}
@@ -3044,7 +3049,8 @@ func TestIOExt_Delete_BeforeCommit_SeesKeyRemovedAndRollbackKeepsNeighborBucketE
 		if managed == nil {
 			return fmt.Errorf("managed bucket missing")
 		}
-		if raw := managed.Get(db.keyFromID(key)); raw != nil {
+		var keyBuf [8]byte
+		if raw := managed.Get(keycodec.UserKeyBytesWithBuf(key, db.strKey, &keyBuf)); raw != nil {
 			return fmt.Errorf("managed key still present inside delete BeforeCommit")
 		}
 

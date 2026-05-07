@@ -4,6 +4,7 @@ import (
 	"reflect"
 	"unsafe"
 
+	"github.com/vapstack/rbi/internal/keycodec"
 	"go.etcd.io/bbolt"
 )
 
@@ -58,21 +59,18 @@ func BeforeProcess[K ~string | ~uint64, V any](fn func(key K, value *V) error) E
 	if fn == nil {
 		return nil
 	}
-	strKey := reflect.TypeFor[K]().Kind() == reflect.String
-	if strKey {
-		f := func(key autoBatchKey, value unsafe.Pointer) error {
-			return fn(*(*K)(unsafe.Pointer(&key.s)), (*V)(value))
+
+	if reflect.TypeFor[K]().Kind() == reflect.String {
+		f := func(key keycodec.DataKey, value unsafe.Pointer) error {
+			return fn(keycodec.UserKeyFromDataKey[K](key, true), (*V)(value))
 		}
-		return func(cfg *execOptions[K, V]) {
-			cfg.beforeProcess = append(cfg.beforeProcess, f)
-		}
+		return func(cfg *execOptions[K, V]) { cfg.beforeProcess = append(cfg.beforeProcess, f) }
 	}
-	f := func(key autoBatchKey, value unsafe.Pointer) error {
-		return fn(*(*K)(unsafe.Pointer(&key.u)), (*V)(value))
+
+	f := func(key keycodec.DataKey, value unsafe.Pointer) error {
+		return fn(keycodec.UserKeyFromDataKey[K](key, false), (*V)(value))
 	}
-	return func(cfg *execOptions[K, V]) {
-		cfg.beforeProcess = append(cfg.beforeProcess, f)
-	}
+	return func(cfg *execOptions[K, V]) { cfg.beforeProcess = append(cfg.beforeProcess, f) }
 }
 
 // NoBatch forces a write call to execute in its own internal batch.
@@ -116,21 +114,18 @@ func BeforeStore[K ~string | ~uint64, V any](fn func(key K, oldValue, newValue *
 	if fn == nil {
 		return nil
 	}
-	strKey := reflect.TypeFor[K]().Kind() == reflect.String
-	if strKey {
-		f := func(key autoBatchKey, oldValue, newValue unsafe.Pointer) error {
-			return fn(*(*K)(unsafe.Pointer(&key.s)), (*V)(oldValue), (*V)(newValue))
+
+	if reflect.TypeFor[K]().Kind() == reflect.String {
+		f := func(key keycodec.DataKey, oldValue, newValue unsafe.Pointer) error {
+			return fn(keycodec.UserKeyFromDataKey[K](key, true), (*V)(oldValue), (*V)(newValue))
 		}
-		return func(cfg *execOptions[K, V]) {
-			cfg.beforeStore = append(cfg.beforeStore, f)
-		}
+		return func(cfg *execOptions[K, V]) { cfg.beforeStore = append(cfg.beforeStore, f) }
 	}
-	f := func(key autoBatchKey, oldValue, newValue unsafe.Pointer) error {
-		return fn(*(*K)(unsafe.Pointer(&key.u)), (*V)(oldValue), (*V)(newValue))
+
+	f := func(key keycodec.DataKey, oldValue, newValue unsafe.Pointer) error {
+		return fn(keycodec.UserKeyFromDataKey[K](key, false), (*V)(oldValue), (*V)(newValue))
 	}
-	return func(cfg *execOptions[K, V]) {
-		cfg.beforeStore = append(cfg.beforeStore, f)
-	}
+	return func(cfg *execOptions[K, V]) { cfg.beforeStore = append(cfg.beforeStore, f) }
 }
 
 // CloneFunc registers a cloning function used by Set/BatchSet when BeforeStore
@@ -163,10 +158,10 @@ func CloneFunc[K ~string | ~uint64, V any](fn func(key K, v *V) *V) ExecOption[K
 	if fn == nil {
 		return nil
 	}
-	strKey := reflect.TypeFor[K]().Kind() == reflect.String
-	if strKey {
-		f := func(key autoBatchKey, value unsafe.Pointer) (unsafe.Pointer, error) {
-			cloned := fn(*(*K)(unsafe.Pointer(&key.s)), (*V)(value))
+
+	if reflect.TypeFor[K]().Kind() == reflect.String {
+		f := func(key keycodec.DataKey, value unsafe.Pointer) (unsafe.Pointer, error) {
+			cloned := fn(keycodec.UserKeyFromDataKey[K](key, true), (*V)(value))
 			if cloned == nil {
 				return nil, errAutoBatchCloneNil
 			}
@@ -174,8 +169,9 @@ func CloneFunc[K ~string | ~uint64, V any](fn func(key K, v *V) *V) ExecOption[K
 		}
 		return func(cfg *execOptions[K, V]) { cfg.cloneValue = f }
 	}
-	f := func(key autoBatchKey, value unsafe.Pointer) (unsafe.Pointer, error) {
-		cloned := fn(*(*K)(unsafe.Pointer(&key.u)), (*V)(value))
+
+	f := func(key keycodec.DataKey, value unsafe.Pointer) (unsafe.Pointer, error) {
+		cloned := fn(keycodec.UserKeyFromDataKey[K](key, false), (*V)(value))
 		if cloned == nil {
 			return nil, errAutoBatchCloneNil
 		}
@@ -209,19 +205,17 @@ func BeforeCommit[K ~string | ~uint64, V any](fn func(tx *bbolt.Tx, key K, oldVa
 	if fn == nil {
 		return nil
 	}
-	strKey := reflect.TypeFor[K]().Kind() == reflect.String
-	if strKey {
-		return func(cfg *execOptions[K, V]) {
-			cfg.beforeCommit = append(cfg.beforeCommit, func(tx *bbolt.Tx, key autoBatchKey, oldValue, newValue unsafe.Pointer) error {
-				return fn(tx, *(*K)(unsafe.Pointer(&key.s)), (*V)(oldValue), (*V)(newValue))
-			})
+	if reflect.TypeFor[K]().Kind() == reflect.String {
+		f := func(tx *bbolt.Tx, key keycodec.DataKey, oldValue, newValue unsafe.Pointer) error {
+			return fn(tx, keycodec.UserKeyFromDataKey[K](key, true), (*V)(oldValue), (*V)(newValue))
 		}
+		return func(cfg *execOptions[K, V]) { cfg.beforeCommit = append(cfg.beforeCommit, f) }
 	}
-	return func(cfg *execOptions[K, V]) {
-		cfg.beforeCommit = append(cfg.beforeCommit, func(tx *bbolt.Tx, key autoBatchKey, oldValue, newValue unsafe.Pointer) error {
-			return fn(tx, *(*K)(unsafe.Pointer(&key.u)), (*V)(oldValue), (*V)(newValue))
-		})
+
+	f := func(tx *bbolt.Tx, key keycodec.DataKey, oldValue, newValue unsafe.Pointer) error {
+		return fn(tx, keycodec.UserKeyFromDataKey[K](key, false), (*V)(oldValue), (*V)(newValue))
 	}
+	return func(cfg *execOptions[K, V]) { cfg.beforeCommit = append(cfg.beforeCommit, f) }
 }
 
 // PatchStrict configures Patch and BatchPatch to return an error if the patch
@@ -257,7 +251,7 @@ func freezeExecOptions[K ~string | ~uint64, V any](cfg execOptions[K, V]) execOp
 	if cfg.cloneValue == nil {
 		clone := defaultCloneValue[V]()
 		if clone != nil {
-			cfg.cloneValue = func(_ autoBatchKey, value unsafe.Pointer) (unsafe.Pointer, error) {
+			cfg.cloneValue = func(_ keycodec.DataKey, value unsafe.Pointer) (unsafe.Pointer, error) {
 				cloned := clone((*V)(value))
 				if cloned == nil {
 					return nil, errAutoBatchCloneNil

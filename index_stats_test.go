@@ -159,7 +159,7 @@ func indexStatsTestStorageStats(storage fieldIndexStorage, countDistinct bool) i
 		}
 		if countDistinct {
 			stats.unique++
-			stats.keyBytes += uint64(key.byteLen())
+			stats.keyBytes += uint64(key.ByteLen())
 		}
 		stats.postingBytes += ids.SizeInBytes()
 		card := ids.Cardinality()
@@ -185,7 +185,7 @@ func indexStatsTestFlatStructBytes(root *fieldIndexFlatRoot) uint64 {
 	total := uint64(unsafe.Sizeof(fieldIndexFlatRoot{})) +
 		uint64(cap(root.entries))*uint64(unsafe.Sizeof(index{}))
 	for i := range root.entries {
-		if root.entries[i].Key.isNumeric() {
+		if root.entries[i].Key.IsNumeric() {
 			total -= uint64(unsafe.Sizeof(uint64(0)))
 		}
 	}

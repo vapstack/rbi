@@ -13,19 +13,20 @@ import (
 	"unsafe"
 
 	"github.com/vapstack/qx"
+	"github.com/vapstack/rbi/internal/keycodec"
 	"github.com/vapstack/rbi/internal/pooled"
 	"go.etcd.io/bbolt"
 )
 
-func autoBatchKeyFromID[K ~string | ~uint64](id K) autoBatchKey {
-	return autoBatchKeyFromIDWithKind(id, reflect.TypeFor[K]().Kind() == reflect.String)
+func autoBatchKeyFromID[K ~string | ~uint64](id K) keycodec.DataKey {
+	return keycodec.DataKeyFromUserKey(id, reflect.TypeFor[K]().Kind() == reflect.String)
 }
 
-func autoBatchKeyID[K ~string | ~uint64](key autoBatchKey) K {
+func autoBatchKeyID[K ~string | ~uint64](key keycodec.DataKey) K {
 	if reflect.TypeFor[K]().Kind() == reflect.String {
-		return *(*K)(unsafe.Pointer(&key.s))
+		return keycodec.UserKeyFromDataKey[K](key, true)
 	}
-	return *(*K)(unsafe.Pointer(&key.u))
+	return keycodec.UserKeyFromDataKey[K](key, false)
 }
 
 func testAutoBatchRequestBuf(reqs ...*autoBatchRequest) *pooled.Slice[*autoBatchRequest] {
@@ -849,7 +850,8 @@ func TestBatch_DuplicatePatchSameID_DecodeFailurePropagatesToLaterRequests(t *te
 		if b == nil {
 			return fmt.Errorf("bucket does not exist")
 		}
-		return b.Put(db.keyFromID(1), []byte{0xc1})
+		var keyBuf [8]byte
+		return b.Put(keycodec.UserKeyBytesWithBuf(uint64(1), db.strKey, &keyBuf), []byte{0xc1})
 	}); err != nil {
 		t.Fatalf("seed invalid payload: %v", err)
 	}
@@ -1772,7 +1774,7 @@ func testBeforeProcessHooks[K ~string | ~uint64, V any](hooks []beforeProcessFun
 	}
 	out := make([]autoBatchBeforeProcessHook, 0, len(hooks))
 	for _, fn := range hooks {
-		out = append(out, func(key autoBatchKey, value unsafe.Pointer) error {
+		out = append(out, func(key keycodec.DataKey, value unsafe.Pointer) error {
 			return fn(autoBatchKeyID[K](key), (*V)(value))
 		})
 	}
@@ -1785,7 +1787,7 @@ func testBeforeStoreHooks[K ~string | ~uint64, V any](hooks []beforeStoreFunc[K,
 	}
 	out := make([]autoBatchBeforeStoreHook, 0, len(hooks))
 	for _, fn := range hooks {
-		out = append(out, func(key autoBatchKey, oldValue, newValue unsafe.Pointer) error {
+		out = append(out, func(key keycodec.DataKey, oldValue, newValue unsafe.Pointer) error {
 			return fn(autoBatchKeyID[K](key), (*V)(oldValue), (*V)(newValue))
 		})
 	}
@@ -1798,7 +1800,7 @@ func testBeforeCommitHooks[K ~string | ~uint64, V any](hooks []beforeCommitFunc[
 	}
 	out := make([]autoBatchBeforeCommitHook, 0, len(hooks))
 	for _, fn := range hooks {
-		out = append(out, func(tx *bbolt.Tx, key autoBatchKey, oldValue, newValue unsafe.Pointer) error {
+		out = append(out, func(tx *bbolt.Tx, key keycodec.DataKey, oldValue, newValue unsafe.Pointer) error {
 			return fn(tx, autoBatchKeyID[K](key), (*V)(oldValue), (*V)(newValue))
 		})
 	}
@@ -1809,7 +1811,7 @@ func testCloneFunc[K ~string | ~uint64, V any](fn func(K, *V) *V) autoBatchClone
 	if fn == nil {
 		return nil
 	}
-	return func(key autoBatchKey, value unsafe.Pointer) (unsafe.Pointer, error) {
+	return func(key keycodec.DataKey, value unsafe.Pointer) (unsafe.Pointer, error) {
 		cloned := fn(autoBatchKeyID[K](key), (*V)(value))
 		if cloned == nil {
 			return nil, errAutoBatchCloneNil
@@ -2224,7 +2226,8 @@ func TestAutoBatchExt_SharedDelete_DecodeError_IsolatesFailedRequest(t *testing.
 		if b == nil {
 			return fmt.Errorf("bucket does not exist")
 		}
-		return b.Put(db.keyFromID(1), []byte{0xff, 0x00, 0x7f, 0x42})
+		var keyBuf [8]byte
+		return b.Put(keycodec.UserKeyBytesWithBuf(uint64(1), db.strKey, &keyBuf), []byte{0xff, 0x00, 0x7f, 0x42})
 	}); err != nil {
 		t.Fatalf("corrupt id=1: %v", err)
 	}
@@ -2246,7 +2249,8 @@ func TestAutoBatchExt_SharedDelete_DecodeError_IsolatesFailedRequest(t *testing.
 		if b == nil {
 			return fmt.Errorf("bucket does not exist")
 		}
-		if raw := b.Get(db.keyFromID(1)); raw == nil {
+		var keyBuf [8]byte
+		if raw := b.Get(keycodec.UserKeyBytesWithBuf(uint64(1), db.strKey, &keyBuf)); raw == nil {
 			return fmt.Errorf("id=1 was deleted despite decode failure")
 		}
 		return nil
@@ -2414,7 +2418,8 @@ func TestAutoBatchExt_RepeatedPatchSameID_BeforeCommitSeesSteppedOldValue(t *tes
 
 	var seen []string
 	hook := func(tx *bbolt.Tx, key uint64, oldValue, newValue *Rec) error {
-		raw := tx.Bucket(db.bucket).Get(db.keyFromID(key))
+		var keyBuf [8]byte
+		raw := tx.Bucket(db.bucket).Get(keycodec.UserKeyBytesWithBuf(key, db.strKey, &keyBuf))
 		if raw == nil {
 			return fmt.Errorf("missing raw value in BeforeCommit")
 		}

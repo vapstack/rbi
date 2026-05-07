@@ -4,6 +4,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/vapstack/rbi/internal/keycodec"
 	"github.com/vapstack/rbi/internal/qir"
 )
 
@@ -41,11 +42,11 @@ type materializedPredKey struct {
 	field       string
 	op          qir.Op
 	key         string
-	keyIndex    indexKey
+	keyIndex    keycodec.IndexKey
 	loKey       string
 	hiKey       string
-	loIndex     indexKey
-	hiIndex     indexKey
+	loIndex     keycodec.IndexKey
+	hiIndex     keycodec.IndexKey
 	flags       uint8
 	startBucket int
 	endBucket   int
@@ -99,14 +100,14 @@ func (key materializedPredKey) String() string {
 
 	case materializedPredKeyScalar:
 		if key.flags&materializedPredKeyScalarNumeric != 0 {
-			return key.field + "\x1f" + strconv.Itoa(int(key.op)) + "\x1f" + "n" + "\x1f" + key.keyIndex.asUnsafeString()
+			return key.field + "\x1f" + strconv.Itoa(int(key.op)) + "\x1f" + "n" + "\x1f" + key.keyIndex.UnsafeString()
 		}
 		return key.field + "\x1f" + strconv.Itoa(int(key.op)) + "\x1f" + key.key
 
 	case materializedPredKeyScalarComplement:
 		if key.flags&materializedPredKeyScalarNumeric != 0 {
 			return key.field + "\x1f" + "count_range_complement" + "\x1f" +
-				strconv.Itoa(int(key.op)) + "\x1f" + "n" + "\x1f" + key.keyIndex.asUnsafeString()
+				strconv.Itoa(int(key.op)) + "\x1f" + "n" + "\x1f" + key.keyIndex.UnsafeString()
 		}
 		return key.field + "\x1f" + "count_range_complement" + "\x1f" +
 			strconv.Itoa(int(key.op)) + "\x1f" + key.key
@@ -119,7 +120,7 @@ func (key materializedPredKey) String() string {
 		if key.flags&materializedPredKeyHasLo != 0 {
 			if key.flags&materializedPredKeyLoNumeric != 0 {
 				loTag = "n"
-				loVal = key.loIndex.asUnsafeString()
+				loVal = key.loIndex.UnsafeString()
 			} else {
 				loTag = "s"
 				loVal = key.loKey
@@ -133,7 +134,7 @@ func (key materializedPredKey) String() string {
 		if key.flags&materializedPredKeyHasHi != 0 {
 			if key.flags&materializedPredKeyHiNumeric != 0 {
 				hiTag = "n"
-				hiVal = key.hiIndex.asUnsafeString()
+				hiVal = key.hiIndex.UnsafeString()
 			} else {
 				hiTag = "s"
 				hiVal = key.hiKey
@@ -172,8 +173,8 @@ func materializedPredKeyForScalar(field string, op qir.Op, key string) materiali
 	}
 }
 
-func materializedPredKeyForNumericScalar(field string, op qir.Op, key indexKey) materializedPredKey {
-	if field == "" || !key.isNumeric() || !isMaterializedScalarCacheOp(op) {
+func materializedPredKeyForNumericScalar(field string, op qir.Op, key keycodec.IndexKey) materializedPredKey {
+	if field == "" || !key.IsNumeric() || !isMaterializedScalarCacheOp(op) {
 		return materializedPredKey{}
 	}
 	return materializedPredKey{
@@ -197,8 +198,8 @@ func materializedPredComplementKeyForScalar(field string, op qir.Op, key string)
 	}
 }
 
-func materializedPredComplementKeyForNumericScalar(field string, op qir.Op, key indexKey) materializedPredKey {
-	if field == "" || !key.isNumeric() || !isNumericRangeOp(op) {
+func materializedPredComplementKeyForNumericScalar(field string, op qir.Op, key keycodec.IndexKey) materializedPredKey {
+	if field == "" || !key.IsNumeric() || !isNumericRangeOp(op) {
 		return materializedPredKey{}
 	}
 	return materializedPredKey{
@@ -289,7 +290,7 @@ func parseMaterializedPredKeyExactScalarRange(kind materializedPredKeyKind, fiel
 							return materializedPredKey{}, false
 						}
 						out.flags |= materializedPredKeyLoNumeric
-						out.loIndex = indexKeyFromU64(fixed8StringToU64(loVal))
+						out.loIndex = keycodec.FromU64(keycodec.Fixed8StringToU64(loVal))
 					case 's':
 						out.loKey = loVal
 					default:
@@ -314,7 +315,7 @@ func parseMaterializedPredKeyExactScalarRange(kind materializedPredKeyKind, fiel
 							return materializedPredKey{}, false
 						}
 						out.flags |= materializedPredKeyHiNumeric
-						out.hiIndex = indexKeyFromU64(fixed8StringToU64(hiVal))
+						out.hiIndex = keycodec.FromU64(keycodec.Fixed8StringToU64(hiVal))
 					case 's':
 						out.hiKey = hiVal
 					default:
@@ -493,7 +494,7 @@ func materializedPredKeyFromEncoded(key string) (materializedPredKey, bool) {
 				kind:     materializedPredKeyScalarComplement,
 				field:    f,
 				op:       qir.Op(op),
-				keyIndex: indexKeyFromU64(fixed8StringToU64(val)),
+				keyIndex: keycodec.FromU64(keycodec.Fixed8StringToU64(val)),
 				flags:    materializedPredKeyScalarNumeric,
 			}, true
 		}
@@ -539,7 +540,7 @@ func materializedPredKeyFromEncoded(key string) (materializedPredKey, bool) {
 				kind:     materializedPredKeyScalar,
 				field:    f,
 				op:       qir.Op(op),
-				keyIndex: indexKeyFromU64(fixed8StringToU64(val)),
+				keyIndex: keycodec.FromU64(keycodec.Fixed8StringToU64(val)),
 				flags:    materializedPredKeyScalarNumeric,
 			}, true
 		}

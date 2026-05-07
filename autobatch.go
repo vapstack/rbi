@@ -2,18 +2,17 @@ package rbi
 
 import (
 	"bytes"
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"log"
 	"math/bits"
 	"slices"
-	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
 	"unsafe"
 
+	"github.com/vapstack/rbi/internal/keycodec"
 	"github.com/vapstack/rbi/internal/pooled"
 	"go.etcd.io/bbolt"
 )
@@ -45,18 +44,6 @@ const (
 	autoBatchReqRepeatIDSafeShared autoBatchReqPolicy = 1 << iota
 	autoBatchReqSetDeleteCoalescible
 )
-
-type autoBatchKey struct {
-	s string
-	u uint64
-}
-
-func autoBatchKeyFromIDWithKind[K ~string | ~uint64](id K, strKey bool) autoBatchKey {
-	if strKey {
-		return autoBatchKey{s: *(*string)(unsafe.Pointer(&id))}
-	}
-	return autoBatchKey{u: *(*uint64)(unsafe.Pointer(&id))}
-}
 
 var (
 	errAutoBatchEmptyPayload = errors.New("empty msgpack payload")
@@ -98,10 +85,10 @@ func formatAutoBatchPrepareErr(kind autoBatchPrepareErr, err error) error {
 }
 
 type (
-	autoBatchBeforeProcessHook func(autoBatchKey, unsafe.Pointer) error
-	autoBatchBeforeStoreHook   func(autoBatchKey, unsafe.Pointer, unsafe.Pointer) error
-	autoBatchBeforeCommitHook  func(*bbolt.Tx, autoBatchKey, unsafe.Pointer, unsafe.Pointer) error
-	autoBatchCloneFunc         func(autoBatchKey, unsafe.Pointer) (unsafe.Pointer, error)
+	autoBatchBeforeProcessHook func(keycodec.DataKey, unsafe.Pointer) error
+	autoBatchBeforeStoreHook   func(keycodec.DataKey, unsafe.Pointer, unsafe.Pointer) error
+	autoBatchBeforeCommitHook  func(*bbolt.Tx, keycodec.DataKey, unsafe.Pointer, unsafe.Pointer) error
+	autoBatchCloneFunc         func(keycodec.DataKey, unsafe.Pointer) (unsafe.Pointer, error)
 )
 
 type autoBatchRecordOps struct {
@@ -129,32 +116,9 @@ type autoBatchRuntime struct {
 	rejectEmptyPayload bool
 }
 
-func (rt *autoBatchRuntime) keyBytes(key autoBatchKey, buf *[8]byte) []byte {
-	if rt.strKey {
-		return unsafe.Slice(unsafe.StringData(key.s), len(key.s))
-	}
-	binary.BigEndian.PutUint64(buf[:], key.u)
-	return buf[:]
-}
-
-func (rt *autoBatchRuntime) keyFormat(key autoBatchKey) string {
-	if rt.strKey {
-		return key.s
-	}
-	return strconv.FormatUint(key.u, 10)
-}
-
-func (rt *autoBatchRuntime) keyString(key autoBatchKey) string {
-	return key.s
-}
-
-func (rt *autoBatchRuntime) keyUint(key autoBatchKey) uint64 {
-	return key.u
-}
-
 type autoBatchRequest struct {
 	op autoBatchOp
-	id autoBatchKey
+	id keycodec.DataKey
 
 	setValue    unsafe.Pointer
 	setBaseline unsafe.Pointer
@@ -324,8 +288,8 @@ func (st *autoBatchState) clearPayload() {
 	st.borrowedPayload = nil
 }
 
-func (st *autoBatchState) setKey(rt *autoBatchRuntime, key autoBatchKey) {
-	st.key = rt.keyBytes(key, &st.keyBuf)
+func (st *autoBatchState) setKey(rt *autoBatchRuntime, key keycodec.DataKey) {
+	st.key = key.Bytes(rt.strKey, &st.keyBuf)
 }
 
 func (rt *autoBatchRuntime) unavailableErr() error {
@@ -338,9 +302,9 @@ func (rt *autoBatchRuntime) unavailableErr() error {
 	return nil
 }
 
-func (rt *autoBatchRuntime) idxFromKeyWithCreated(key autoBatchKey) (uint64, bool) {
+func (rt *autoBatchRuntime) idxFromKeyWithCreated(key keycodec.DataKey) (uint64, bool) {
 	if rt.strKey {
-		s := rt.keyString(key)
+		s := key.String()
 		rt.strMap.Lock()
 		if idx, ok := rt.strMap.Keys[s]; ok {
 			rt.strMap.Unlock()
@@ -350,15 +314,15 @@ func (rt *autoBatchRuntime) idxFromKeyWithCreated(key autoBatchKey) (uint64, boo
 		rt.strMap.Unlock()
 		return idx, true
 	}
-	return rt.keyUint(key), false
+	return key.Uint(), false
 }
 
-func (rt *autoBatchRuntime) rollbackCreatedStrIdx(key autoBatchKey, idx uint64) {
+func (rt *autoBatchRuntime) rollbackCreatedStrIdx(key keycodec.DataKey, idx uint64) {
 	if !rt.strKey || idx == 0 {
 		return
 	}
 
-	s := rt.keyString(key)
+	s := key.String()
 	rt.strMap.Lock()
 	cur, ok := rt.strMap.Keys[s]
 	if !ok || cur != idx {
@@ -476,21 +440,21 @@ func (rt *autoBatchRuntime) prepareAttemptStateMap(st *autoBatchAttemptState, ca
 	}
 }
 
-func (rt *autoBatchRuntime) attemptStatePos(st *autoBatchAttemptState, key autoBatchKey) (int, bool) {
+func (rt *autoBatchRuntime) attemptStatePos(st *autoBatchAttemptState, key keycodec.DataKey) (int, bool) {
 	if rt.strKey {
-		pos, ok := st.stateByStringID[rt.keyString(key)]
+		pos, ok := st.stateByStringID[key.String()]
 		return pos, ok
 	}
-	pos, ok := st.stateByUintID[rt.keyUint(key)]
+	pos, ok := st.stateByUintID[key.Uint()]
 	return pos, ok
 }
 
-func (rt *autoBatchRuntime) setAttemptStatePos(st *autoBatchAttemptState, key autoBatchKey, pos int) {
+func (rt *autoBatchRuntime) setAttemptStatePos(st *autoBatchAttemptState, key keycodec.DataKey, pos int) {
 	if rt.strKey {
-		st.stateByStringID[rt.keyString(key)] = pos
+		st.stateByStringID[key.String()] = pos
 		return
 	}
-	st.stateByUintID[rt.keyUint(key)] = pos
+	st.stateByUintID[key.Uint()] = pos
 }
 
 func (st *autoBatchAttemptState) loadState(rt *autoBatchRuntime, req *autoBatchRequest) (*autoBatchState, error) {
@@ -516,7 +480,7 @@ func (st *autoBatchAttemptState) loadState(rt *autoBatchRuntime, req *autoBatchR
 	return state, nil
 }
 
-func (st *autoBatchAttemptState) ensureIdx(rt *autoBatchRuntime, id autoBatchKey, state *autoBatchState, create bool) {
+func (st *autoBatchAttemptState) ensureIdx(rt *autoBatchRuntime, id keycodec.DataKey, state *autoBatchState, create bool) {
 	if state.idxKnown {
 		return
 	}
@@ -594,7 +558,7 @@ func (ab *autoBatchScheduler) dequeueFrontScratch(n int) []*autoBatchJob {
 	return batch
 }
 
-func runBeforeStoreHooks(id autoBatchKey, oldVal, newVal unsafe.Pointer, hooks []autoBatchBeforeStoreHook) error {
+func runBeforeStoreHooks(id keycodec.DataKey, oldVal, newVal unsafe.Pointer, hooks []autoBatchBeforeStoreHook) error {
 	for _, fn := range hooks {
 		if err := fn(id, oldVal, newVal); err != nil {
 			return err
@@ -603,7 +567,7 @@ func runBeforeStoreHooks(id autoBatchKey, oldVal, newVal unsafe.Pointer, hooks [
 	return nil
 }
 
-func runBeforeCommitHooks(tx *bbolt.Tx, id autoBatchKey, oldVal, newVal unsafe.Pointer, hooks []autoBatchBeforeCommitHook) error {
+func runBeforeCommitHooks(tx *bbolt.Tx, id keycodec.DataKey, oldVal, newVal unsafe.Pointer, hooks []autoBatchBeforeCommitHook) error {
 	for _, fn := range hooks {
 		if err := fn(tx, id, oldVal, newVal); err != nil {
 			return err
@@ -641,7 +605,7 @@ func assignAutoBatchRequestErr(reqs *pooled.Slice[*autoBatchRequest], err error)
 	}
 }
 
-func (db *DB[K, V]) buildSetAutoBatchRequest(key autoBatchKey, newVal *V, beforeStore []autoBatchBeforeStoreHook, beforeCommit []autoBatchBeforeCommitHook, cloneValue autoBatchCloneFunc) (*autoBatchRequest, error) {
+func (db *DB[K, V]) buildSetAutoBatchRequest(key keycodec.DataKey, newVal *V, beforeStore []autoBatchBeforeStoreHook, beforeCommit []autoBatchBeforeCommitHook, cloneValue autoBatchCloneFunc) (*autoBatchRequest, error) {
 	if newVal == nil {
 		return nil, ErrNilValue
 	}
@@ -677,7 +641,7 @@ func (db *DB[K, V]) buildSetAutoBatchRequest(key autoBatchKey, newVal *V, before
 func (db *DB[K, V]) buildPatchAutoBatchRequest(id K, fields []Field, ignoreUnknown bool, beforeProcess []autoBatchBeforeProcessHook, beforeStore []autoBatchBeforeStoreHook, beforeCommit []autoBatchBeforeCommitHook) *autoBatchRequest {
 	req := db.autoBatcher.requestPool.Get()
 	req.op = autoBatchPatch
-	req.id = autoBatchKeyFromIDWithKind(id, db.strKey)
+	req.id = keycodec.DataKeyFromUserKey(id, db.strKey)
 	if cap(req.patch) < len(fields) {
 		req.patch = slices.Grow(req.patch, len(fields))
 	}
@@ -699,7 +663,7 @@ func (db *DB[K, V]) buildPatchAutoBatchRequest(id K, fields []Field, ignoreUnkno
 func (db *DB[K, V]) buildDeleteAutoBatchRequest(id K, beforeCommit []autoBatchBeforeCommitHook) *autoBatchRequest {
 	req := db.autoBatcher.requestPool.Get()
 	req.op = autoBatchDelete
-	req.id = autoBatchKeyFromIDWithKind(id, db.strKey)
+	req.id = keycodec.DataKeyFromUserKey(id, db.strKey)
 	req.beforeCommit = beforeCommit
 	req.policy = autoBatchReqRepeatIDSafeShared
 	if len(beforeCommit) == 0 {
@@ -953,7 +917,7 @@ func (ab *autoBatcher) autoBatchRepeatedIDLimitLocked(limit int) int {
 		lastByID := ab.repeatStringIDPool.Get(limit)
 		for i := 0; i < limit; i++ {
 			req := ab.queueAt(i).reqs.Get(0)
-			id := ab.runtime.keyString(req.id)
+			id := req.id.String()
 
 			prevIdx, seen := lastByID[id]
 			if seen {
@@ -972,7 +936,7 @@ func (ab *autoBatcher) autoBatchRepeatedIDLimitLocked(limit int) int {
 	lastByID := ab.repeatUintIDPool.Get(limit)
 	for i := 0; i < limit; i++ {
 		req := ab.queueAt(i).reqs.Get(0)
-		id := ab.runtime.keyUint(req.id)
+		id := req.id.Uint()
 
 		prevIdx, seen := lastByID[id]
 		if seen {
@@ -1051,7 +1015,7 @@ func (ab *autoBatcher) markSupersededSetDeleteJobs(batch []*autoBatchJob) {
 		for i := range batch {
 			req := batch[i].reqs.Get(0)
 			req.replacedBy = nil
-			id := ab.runtime.keyString(req.id)
+			id := req.id.String()
 
 			prevIdx, seen := lastByID[id]
 			if seen && req.canCoalesceSetDelete() {
@@ -1073,7 +1037,7 @@ func (ab *autoBatcher) markSupersededSetDeleteJobs(batch []*autoBatchJob) {
 	for i := range batch {
 		req := batch[i].reqs.Get(0)
 		req.replacedBy = nil
-		id := ab.runtime.keyUint(req.id)
+		id := req.id.Uint()
 
 		prevIdx, seen := lastByID[id]
 		if seen && req.canCoalesceSetDelete() {
@@ -1450,7 +1414,7 @@ acceptedLoop:
 		}
 		if err != nil {
 			rawErr := err
-			err = formatAutoBatchBoltWriteErr(err, op.req.op, ab.runtime.keyFormat(op.req.id), op.idx, op.key, op.payload)
+			err = formatAutoBatchBoltWriteErr(err, op.req.op, op.req.id.Format(ab.runtime.strKey), op.idx, op.key, op.payload)
 			if errors.Is(rawErr, errAutoBatchEmptyPayload) {
 				op.req.err = err
 			}
@@ -1472,7 +1436,7 @@ acceptedLoop:
 				err = fmt.Errorf(
 					"before_commit op=%s id=%s idx=%d key_len=%d payload_len=%d: %w",
 					autoBatchOpString(op.req.op),
-					ab.runtime.keyFormat(op.req.id),
+					op.req.id.Format(ab.runtime.strKey),
 					op.idx,
 					len(op.key),
 					len(op.payload),

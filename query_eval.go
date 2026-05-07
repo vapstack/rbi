@@ -7,6 +7,7 @@ import (
 	"slices"
 	"sync"
 
+	"github.com/vapstack/rbi/internal/keycodec"
 	"github.com/vapstack/rbi/internal/qir"
 
 	"github.com/vapstack/rbi/internal/pooled"
@@ -382,8 +383,8 @@ func (qv *queryView) evalSimple(e qir.Expr) (postingResult, error) {
 			if !ok {
 				break
 			}
-			match := e.Op == qir.OpSUFFIX && indexKeyHasSuffixString(key, v) ||
-				e.Op == qir.OpCONTAINS && indexKeyContainsString(key, v)
+			match := e.Op == qir.OpSUFFIX && keycodec.HasSuffixString(key, v) ||
+				e.Op == qir.OpCONTAINS && keycodec.ContainsString(key, v)
 			if !match {
 				continue
 			}
@@ -489,7 +490,7 @@ func (qv *queryView) evalSliceEQ(field string, fieldOrdinal int, vals []string) 
 		lenBM = qv.snapshotUniverseView().Clone()
 		lenBM = lenBM.BuildAndNot(nonEmpty)
 	} else {
-		lenKey := uint64ByteStr(uint64(valCount))
+		lenKey := keycodec.U64ByteString(uint64(valCount))
 		lenBM = lenOV.lookupPostingRetained(lenKey)
 	}
 
@@ -543,13 +544,13 @@ const impossibleLookupKey = "\x00"
 type normalizedScalarBound struct {
 	op          qir.Op
 	key         string
-	keyIndex    indexKey
+	keyIndex    keycodec.IndexKey
 	hasIndexKey bool
 	full        bool
 	empty       bool
 }
 
-func normalizedScalarBoundFromIndexKey(op qir.Op, key indexKey) normalizedScalarBound {
+func normalizedScalarBoundFromIndexKey(op qir.Op, key keycodec.IndexKey) normalizedScalarBound {
 	return normalizedScalarBound{
 		op:          op,
 		keyIndex:    key,
@@ -560,11 +561,11 @@ func normalizedScalarBoundFromIndexKey(op qir.Op, key indexKey) normalizedScalar
 func scalarValueToIdxRaw(raw any, v reflect.Value) (string, error) {
 	switch v.Kind() {
 	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
-		return int64ByteStr(v.Int()), nil
+		return keycodec.Int64ByteString(v.Int()), nil
 	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
-		return uint64ByteStr(v.Uint()), nil
+		return keycodec.U64ByteString(v.Uint()), nil
 	case reflect.Float32, reflect.Float64:
-		return float64ByteStr(v.Float()), nil
+		return keycodec.Float64ByteString(v.Float()), nil
 	case reflect.String:
 		return v.String(), nil
 	case reflect.Bool:
@@ -610,7 +611,7 @@ func numericQueryValueToFloat64(v reflect.Value) (float64, bool) {
 	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
 		return float64(v.Uint()), true
 	case reflect.Float32, reflect.Float64:
-		return canonicalizeFloat64ForIndex(v.Float()), true
+		return keycodec.CanonicalizeFloat64ForIndex(v.Float()), true
 	default:
 		return 0, false
 	}
@@ -627,7 +628,7 @@ func numericQueryValueToInt64Exact(v reflect.Value) (int64, bool) {
 		}
 		return int64(u), true
 	case reflect.Float32, reflect.Float64:
-		f := canonicalizeFloat64ForIndex(v.Float())
+		f := keycodec.CanonicalizeFloat64ForIndex(v.Float())
 		if math.IsNaN(f) || math.IsInf(f, 0) || f != math.Trunc(f) || f < math.MinInt64 || f > math.MaxInt64 {
 			return 0, false
 		}
@@ -649,7 +650,7 @@ func numericQueryValueToUint64Exact(v reflect.Value) (uint64, bool) {
 	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
 		return v.Uint(), true
 	case reflect.Float32, reflect.Float64:
-		f := canonicalizeFloat64ForIndex(v.Float())
+		f := keycodec.CanonicalizeFloat64ForIndex(v.Float())
 		if math.IsNaN(f) || math.IsInf(f, 0) || f != math.Trunc(f) || f < 0 || f > float64(^uint64(0)) {
 			return 0, false
 		}
@@ -690,22 +691,22 @@ func scalarValueToIdxField(raw any, v reflect.Value, fm *field) (string, error) 
 	switch {
 	case isNativeTimeField(fm):
 		if unix, ok := timeQueryValueToInt64Exact(v); ok {
-			return int64ByteStr(unix), nil
+			return keycodec.Int64ByteString(unix), nil
 		}
 		return impossibleLookupKey, nil
 	case signedIntFieldKind(fm.Kind):
 		if i, ok := numericQueryValueToInt64Exact(v); ok {
-			return int64ByteStr(i), nil
+			return keycodec.Int64ByteString(i), nil
 		}
 		return impossibleLookupKey, nil
 	case unsignedIntFieldKind(fm.Kind):
 		if u, ok := numericQueryValueToUint64Exact(v); ok {
-			return uint64ByteStr(u), nil
+			return keycodec.U64ByteString(u), nil
 		}
 		return impossibleLookupKey, nil
 	case fm.Kind == reflect.Float32 || fm.Kind == reflect.Float64:
 		if f, ok := numericQueryValueToFloat64(v); ok {
-			return float64ByteStr(f), nil
+			return keycodec.Float64ByteString(f), nil
 		}
 		return impossibleLookupKey, nil
 	default:
@@ -715,7 +716,7 @@ func scalarValueToIdxField(raw any, v reflect.Value, fm *field) (string, error) 
 
 func normalizeUnixTimeRangeBound(op qir.Op, v reflect.Value) normalizedScalarBound {
 	if unix, ok := queryValueToUnixSeconds(v); ok {
-		return normalizedScalarBoundFromIndexKey(op, indexKeyFromU64(orderedInt64Key(unix)))
+		return normalizedScalarBoundFromIndexKey(op, keycodec.FromU64(keycodec.OrderedInt64Key(unix)))
 	}
 	return normalizeSignedIntRangeBound(op, v)
 }
@@ -723,7 +724,7 @@ func normalizeUnixTimeRangeBound(op qir.Op, v reflect.Value) normalizedScalarBou
 func normalizeSignedIntRangeBound(op qir.Op, v reflect.Value) normalizedScalarBound {
 	switch v.Kind() {
 	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
-		return normalizedScalarBoundFromIndexKey(op, indexKeyFromU64(orderedInt64Key(v.Int())))
+		return normalizedScalarBoundFromIndexKey(op, keycodec.FromU64(keycodec.OrderedInt64Key(v.Int())))
 	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
 		u := v.Uint()
 		if u > math.MaxInt64 {
@@ -734,9 +735,9 @@ func normalizeSignedIntRangeBound(op qir.Op, v reflect.Value) normalizedScalarBo
 				return normalizedScalarBound{full: true}
 			}
 		}
-		return normalizedScalarBoundFromIndexKey(op, indexKeyFromU64(orderedInt64Key(int64(u))))
+		return normalizedScalarBoundFromIndexKey(op, keycodec.FromU64(keycodec.OrderedInt64Key(int64(u))))
 	case reflect.Float32, reflect.Float64:
-		f := canonicalizeFloat64ForIndex(v.Float())
+		f := keycodec.CanonicalizeFloat64ForIndex(v.Float())
 		switch {
 		case math.IsNaN(f), math.IsInf(f, 1):
 			switch op {
@@ -767,7 +768,7 @@ func normalizeSignedIntRangeBound(op qir.Op, v reflect.Value) normalizedScalarBo
 					return normalizedScalarBound{full: true}
 				}
 			}
-			return normalizedScalarBoundFromIndexKey(op, indexKeyFromU64(orderedInt64Key(int64(f))))
+			return normalizedScalarBoundFromIndexKey(op, keycodec.FromU64(keycodec.OrderedInt64Key(int64(f))))
 		case op == qir.OpEQ:
 			return normalizedScalarBound{empty: true}
 		case op == qir.OpGT || op == qir.OpGTE:
@@ -778,7 +779,7 @@ func normalizeSignedIntRangeBound(op qir.Op, v reflect.Value) normalizedScalarBo
 			if floor > math.MaxInt64 {
 				return normalizedScalarBound{empty: true}
 			}
-			return normalizedScalarBoundFromIndexKey(qir.OpGT, indexKeyFromU64(orderedInt64Key(int64(floor))))
+			return normalizedScalarBoundFromIndexKey(qir.OpGT, keycodec.FromU64(keycodec.OrderedInt64Key(int64(floor))))
 		default:
 			ceil := math.Ceil(f)
 			if ceil < math.MinInt64 {
@@ -787,7 +788,7 @@ func normalizeSignedIntRangeBound(op qir.Op, v reflect.Value) normalizedScalarBo
 			if ceil > math.MaxInt64 {
 				return normalizedScalarBound{full: true}
 			}
-			return normalizedScalarBoundFromIndexKey(qir.OpLT, indexKeyFromU64(orderedInt64Key(int64(ceil))))
+			return normalizedScalarBoundFromIndexKey(qir.OpLT, keycodec.FromU64(keycodec.OrderedInt64Key(int64(ceil))))
 		}
 	default:
 		return normalizedScalarBound{empty: true}
@@ -806,11 +807,11 @@ func normalizeUnsignedIntRangeBound(op qir.Op, v reflect.Value) normalizedScalar
 				return normalizedScalarBound{empty: true}
 			}
 		}
-		return normalizedScalarBoundFromIndexKey(op, indexKeyFromU64(uint64(i)))
+		return normalizedScalarBoundFromIndexKey(op, keycodec.FromU64(uint64(i)))
 	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
-		return normalizedScalarBoundFromIndexKey(op, indexKeyFromU64(v.Uint()))
+		return normalizedScalarBoundFromIndexKey(op, keycodec.FromU64(v.Uint()))
 	case reflect.Float32, reflect.Float64:
-		f := canonicalizeFloat64ForIndex(v.Float())
+		f := keycodec.CanonicalizeFloat64ForIndex(v.Float())
 		switch {
 		case math.IsNaN(f), math.IsInf(f, 1):
 			switch op {
@@ -842,7 +843,7 @@ func normalizeUnsignedIntRangeBound(op qir.Op, v reflect.Value) normalizedScalar
 					return normalizedScalarBound{full: true}
 				}
 			}
-			return normalizedScalarBoundFromIndexKey(op, indexKeyFromU64(uint64(f)))
+			return normalizedScalarBoundFromIndexKey(op, keycodec.FromU64(uint64(f)))
 		case op == qir.OpEQ:
 			return normalizedScalarBound{empty: true}
 		case op == qir.OpGT || op == qir.OpGTE:
@@ -850,13 +851,13 @@ func normalizeUnsignedIntRangeBound(op qir.Op, v reflect.Value) normalizedScalar
 			if floor > float64(^uint64(0)) {
 				return normalizedScalarBound{empty: true}
 			}
-			return normalizedScalarBoundFromIndexKey(qir.OpGT, indexKeyFromU64(uint64(floor)))
+			return normalizedScalarBoundFromIndexKey(qir.OpGT, keycodec.FromU64(uint64(floor)))
 		default:
 			ceil := math.Ceil(f)
 			if ceil > float64(^uint64(0)) {
 				return normalizedScalarBound{full: true}
 			}
-			return normalizedScalarBoundFromIndexKey(qir.OpLT, indexKeyFromU64(uint64(ceil)))
+			return normalizedScalarBoundFromIndexKey(qir.OpLT, keycodec.FromU64(uint64(ceil)))
 		}
 	default:
 		return normalizedScalarBound{empty: true}
@@ -868,7 +869,7 @@ func normalizeFloatRangeBound(op qir.Op, v reflect.Value) normalizedScalarBound 
 	if !ok {
 		return normalizedScalarBound{empty: true}
 	}
-	return normalizedScalarBoundFromIndexKey(op, indexKeyFromU64(orderedFloat64Key(f)))
+	return normalizedScalarBoundFromIndexKey(op, keycodec.FromU64(keycodec.OrderedFloat64Key(f)))
 }
 
 func (qv *queryView) exprValueToNormalizedScalarBound(expr qir.Expr) (normalizedScalarBound, bool, error) {

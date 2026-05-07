@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/vapstack/rbi/internal/keycodec"
 	"github.com/vmihailenco/msgpack/v5"
 	"go.etcd.io/bbolt"
 )
@@ -197,7 +198,8 @@ func rawSetBench(db *DB[uint64, UserBench], raw *bbolt.DB, id uint64, rec *UserB
 			return fmt.Errorf("bucket does not exist")
 		}
 		bucket.FillPercent = db.options.BucketFillPercent
-		if err := bucket.Put(db.keyFromID(id), b.Bytes()); err != nil {
+		var keyBuf [8]byte
+		if err := bucket.Put(keycodec.UserKeyBytesWithBuf(id, db.strKey, &keyBuf), b.Bytes()); err != nil {
 			return fmt.Errorf("put: %w", err)
 		}
 		return nil
@@ -211,7 +213,8 @@ func rawPatchBench(db *DB[uint64, UserBench], raw *bbolt.DB, id uint64, patch []
 			return fmt.Errorf("bucket does not exist")
 		}
 
-		key := db.keyFromID(id)
+		var keyBuf [8]byte
+		key := keycodec.UserKeyBytesWithBuf(id, db.strKey, &keyBuf)
 		oldBytes := bucket.Get(key)
 		if oldBytes == nil {
 			return nil

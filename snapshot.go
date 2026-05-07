@@ -6,6 +6,7 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/vapstack/rbi/internal/keycodec"
 	"github.com/vapstack/rbi/internal/pooled"
 	"github.com/vapstack/rbi/internal/pools"
 	"github.com/vapstack/rbi/internal/posting"
@@ -96,7 +97,7 @@ type indexKeyOrder []index
 func (s indexKeyOrder) Len() int      { return len(s) }
 func (s indexKeyOrder) Swap(i, j int) { s[i], s[j] = s[j], s[i] }
 func (s indexKeyOrder) Less(i, j int) bool {
-	return compareIndexKeys(s[i].Key, s[j].Key) < 0
+	return keycodec.Compare(s[i].Key, s[j].Key) < 0
 }
 
 var snapshotRefPool = pooled.Pointers[snapshotRef]{Clear: true}
@@ -1407,7 +1408,7 @@ func rebuildLenIndexField(universe posting.List, fieldOV fieldOverlay) (*[]index
 			continue
 		}
 		result = append(result, index{
-			Key: indexKeyFromU64(uint64(ln)),
+			Key: keycodec.FromU64(uint64(ln)),
 			IDs: ids,
 		})
 	}
@@ -1415,14 +1416,14 @@ func rebuildLenIndexField(universe posting.List, fieldOV fieldOverlay) (*[]index
 		nonEmptyPosting = nonEmptyPosting.BuildOptimized()
 		if !nonEmptyPosting.IsEmpty() {
 			result = append(result, index{
-				Key: indexKeyFromString(lenIndexNonEmptyKey),
+				Key: keycodec.FromString(lenIndexNonEmptyKey),
 				IDs: nonEmptyPosting,
 			})
 		}
 	}
 
 	slices.SortFunc(result, func(a, b index) int {
-		return compareIndexKeys(a.Key, b.Key)
+		return keycodec.Compare(a.Key, b.Key)
 	})
 	nonEmpty.Release()
 	return &result, useZeroComplement
@@ -1620,7 +1621,7 @@ func mergeInsertOnlyFieldSliceOwned(
 		var add index
 		for key, ref := range adds {
 			add = index{
-				Key: indexKeyFromStoredString(key, fixed8),
+				Key: keycodec.FromStoredString(key, fixed8),
 				IDs: arena.accum(ref).materializeOwned(),
 			}
 		}
@@ -1632,7 +1633,7 @@ func mergeInsertOnlyFieldSliceOwned(
 	for key, ref := range adds {
 		ids := arena.accum(ref).materializeOwned()
 		addSlice = append(addSlice, index{
-			Key: indexKeyFromStoredString(key, fixed8),
+			Key: keycodec.FromStoredString(key, fixed8),
 			IDs: ids,
 		})
 	}
@@ -1654,7 +1655,7 @@ func mergeInsertOnlyFixedFieldSliceOwned(
 		var add index
 		for key, ref := range adds {
 			add = index{
-				Key: indexKeyFromU64(key),
+				Key: keycodec.FromU64(key),
 				IDs: arena.accum(ref).materializeOwned(),
 			}
 		}
@@ -1666,7 +1667,7 @@ func mergeInsertOnlyFixedFieldSliceOwned(
 	for key, ref := range adds {
 		ids := arena.accum(ref).materializeOwned()
 		addSlice = append(addSlice, index{
-			Key: indexKeyFromU64(key),
+			Key: keycodec.FromU64(key),
 			IDs: ids,
 		})
 	}
@@ -1686,7 +1687,7 @@ func mergeInsertOnlySingleFieldEntry(base *[]index, add index) *[]index {
 
 	src := *base
 	pos := lowerBoundIndexEntriesKey(src, add.Key)
-	if pos < len(src) && compareIndexKeys(src[pos].Key, add.Key) == 0 {
+	if pos < len(src) && keycodec.Compare(src[pos].Key, add.Key) == 0 {
 		out := make([]index, len(src))
 		copyBorrowedIndexEntries(out, src)
 		out[pos].IDs = unionPostingListsOwned(src[pos].IDs, add.IDs)
@@ -1711,7 +1712,7 @@ func mergeInsertOnlyFieldEntries(base *[]index, addSlice []index) *[]index {
 	out := make([]index, 0, len(src)+len(addSlice))
 	i, j := 0, 0
 	for i < len(src) && j < len(addSlice) {
-		cmp := compareIndexKeys(src[i].Key, addSlice[j].Key)
+		cmp := keycodec.Compare(src[i].Key, addSlice[j].Key)
 		switch {
 		case cmp < 0:
 			out = append(out, borrowedFieldIndexEntry(src[i]))

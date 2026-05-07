@@ -3,6 +3,7 @@ package rbi
 import (
 	"reflect"
 
+	"github.com/vapstack/rbi/internal/keycodec"
 	"github.com/vapstack/rbi/internal/pools"
 	"github.com/vapstack/rbi/internal/posting"
 	"github.com/vapstack/rbi/internal/qir"
@@ -454,7 +455,7 @@ func scalarArrayPosPriorityCoversAllKeysOverlay(ov fieldOverlay, vals []string) 
 		if !ok {
 			return true
 		}
-		if _, ok = set[key.asUnsafeString()]; !ok {
+		if _, ok = set[key.UnsafeString()]; !ok {
 			return false
 		}
 	}
@@ -629,7 +630,7 @@ func (qv *queryView) queryOrderArrayCount(result postingResult, s []index, o qir
 	var nonEmpty posting.List
 	if useZeroComplement {
 		for _, ix := range s {
-			if indexKeyEqualsString(ix.Key, lenIndexNonEmptyKey) {
+			if keycodec.EqualsString(ix.Key, lenIndexNonEmptyKey) {
 				nonEmpty = ix.IDs
 				break
 			}
@@ -647,7 +648,7 @@ func (qv *queryView) queryOrderArrayCount(result postingResult, s []index, o qir
 		if !o.Desc {
 			appendZero()
 			for _, ix := range s {
-				if indexKeyEqualsString(ix.Key, lenIndexNonEmptyKey) || ix.IDs.IsEmpty() {
+				if keycodec.EqualsString(ix.Key, lenIndexNonEmptyKey) || ix.IDs.IsEmpty() {
 					continue
 				}
 				ids := ix.IDs.Borrow().BuildAnd(result.ids)
@@ -658,7 +659,7 @@ func (qv *queryView) queryOrderArrayCount(result postingResult, s []index, o qir
 		}
 		for i := len(s) - 1; i >= 0; i-- {
 			ix := s[i]
-			if indexKeyEqualsString(ix.Key, lenIndexNonEmptyKey) || ix.IDs.IsEmpty() {
+			if keycodec.EqualsString(ix.Key, lenIndexNonEmptyKey) || ix.IDs.IsEmpty() {
 				continue
 			}
 			ids := ix.IDs.Borrow().BuildAnd(result.ids)
@@ -676,7 +677,7 @@ func (qv *queryView) queryOrderArrayCount(result postingResult, s []index, o qir
 		}
 
 		for _, ix := range s {
-			if indexKeyEqualsString(ix.Key, lenIndexNonEmptyKey) {
+			if keycodec.EqualsString(ix.Key, lenIndexNonEmptyKey) {
 				continue
 			}
 			if ix.IDs.IsEmpty() {
@@ -695,7 +696,7 @@ func (qv *queryView) queryOrderArrayCount(result postingResult, s []index, o qir
 
 		for i := len(s) - 1; i >= 0; i-- {
 			ix := s[i]
-			if indexKeyEqualsString(ix.Key, lenIndexNonEmptyKey) {
+			if keycodec.EqualsString(ix.Key, lenIndexNonEmptyKey) {
 				continue
 			}
 			if ix.IDs.IsEmpty() {
