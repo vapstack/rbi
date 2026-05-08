@@ -1838,6 +1838,57 @@ func TestListSerializationRoundTripSkipAndReuse(t *testing.T) {
 	}
 }
 
+type finalEOFReader struct {
+	data []byte
+}
+
+func (r *finalEOFReader) Read(p []byte) (int, error) {
+	if len(r.data) == 0 {
+		return 0, io.EOF
+	}
+	n := copy(p, r.data)
+	r.data = r.data[n:]
+	if len(r.data) == 0 {
+		return n, io.EOF
+	}
+	return n, nil
+}
+
+func TestReadFullBufioAcceptsFullFinalReadWithEOF(t *testing.T) {
+	payload := bytes.Repeat([]byte{0x5a}, 128)
+	reader := bufio.NewReaderSize(&finalEOFReader{data: payload}, 16)
+	got := make([]byte, len(payload))
+
+	n, err := readFullBufio(reader, got)
+	if err != nil {
+		t.Fatalf("readFullBufio: %v", err)
+	}
+	if n != len(payload) {
+		t.Fatalf("readFullBufio bytes: got=%d want=%d", n, len(payload))
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatalf("readFullBufio payload mismatch")
+	}
+}
+
+func TestListReadFromAcceptsFullFinalReadWithEOF(t *testing.T) {
+	ids := make([]uint64, arrayDefaultMaxSize+1)
+	for i := range ids {
+		ids[i] = uint64(i*2 + 1)
+	}
+
+	list := BuildFromSorted(ids)
+	payload := mustWriteListPayload(t, list)
+	list.Release()
+
+	got, err := ReadFrom(bufio.NewReaderSize(&finalEOFReader{data: payload}, 16))
+	if err != nil {
+		t.Fatalf("ReadFrom: %v", err)
+	}
+	defer got.Release()
+	assertSameListSet(t, got, ids)
+}
+
 func TestListReadFromRejectsInvalidPayloads(t *testing.T) {
 	validLarge := func() []byte {
 		list := postingFromIDs(func() []uint64 {

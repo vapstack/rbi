@@ -25,6 +25,10 @@ func largePostingOf(dat ...uint64) *largePosting {
 }
 
 func (lp *largePosting) WriteTo(stream io.Writer) (int64, error) {
+	if writer, ok := stream.(*bufio.Writer); ok {
+		return lp.writeToBufio(writer)
+	}
+
 	var (
 		n   int64
 		buf [8]byte
@@ -57,7 +61,38 @@ func (lp *largePosting) WriteTo(stream io.Writer) (int64, error) {
 	return n, nil
 }
 
+func (lp *largePosting) writeToBufio(writer *bufio.Writer) (int64, error) {
+	var n int64
+
+	written, err := writeLEUint64(writer, uint64(lp.highlowcontainer.size()))
+	n += int64(written)
+	if err != nil {
+		return n, err
+	}
+
+	for pos := 0; pos < lp.highlowcontainer.size(); pos++ {
+		c := lp.highlowcontainer.getContainerAtIndex(pos)
+		written, err = writeLEUint32(writer, lp.highlowcontainer.getKeyAtIndex(pos))
+		n += int64(written)
+		if err != nil {
+			return n, err
+		}
+		n64, writeErr := c.writeToBufio(writer)
+		n += n64
+		err = writeErr
+		if err != nil {
+			return n, err
+		}
+	}
+
+	return n, nil
+}
+
 func (lp *largePosting) ReadFrom(stream io.Reader) (p int64, err error) {
+	if reader, ok := stream.(*bufio.Reader); ok {
+		return lp.readFromBufio(reader)
+	}
+
 	var sizeBuf [8]byte
 	var prevKey uint32
 
@@ -86,6 +121,67 @@ func (lp *largePosting) ReadFrom(stream io.Reader) (p int64, err error) {
 		lp.highlowcontainer.keys[i] = key
 		lp.highlowcontainer.containers[i] = getBitmap32()
 		n64, readErr := lp.highlowcontainer.containers[i].ReadFrom(stream)
+		p += n64
+		if n64 == 0 || readErr != nil {
+			return p, fmt.Errorf("could not deserialize container for key #%d: %w", i, readErr)
+		}
+		if lp.highlowcontainer.containers[i].isEmpty() {
+			return p, fmt.Errorf("large posting container #%d is empty", i)
+		}
+	}
+
+	return p, nil
+}
+
+func (lp *largePosting) readFromBufio(reader *bufio.Reader) (p int64, err error) {
+	var prevKey uint32
+
+	sizeBytes, err := reader.Peek(8)
+	var size uint64
+	if err == nil {
+		size = binary.LittleEndian.Uint64(sizeBytes)
+		if _, err = reader.Discard(8); err != nil {
+			return 0, err
+		}
+		p = 8
+	} else {
+		var sizeBuf [8]byte
+		n, readErr := readFullBufio(reader, sizeBuf[:])
+		if readErr != nil {
+			return int64(n), readErr
+		}
+		p += int64(n)
+		size = binary.LittleEndian.Uint64(sizeBuf[:])
+	}
+
+	lp.highlowcontainer.clear()
+	lp.highlowcontainer.setSize(int(size))
+
+	for i := uint64(0); i < size; i++ {
+		keyBytes, peekErr := reader.Peek(4)
+		var key uint32
+		if peekErr == nil {
+			key = binary.LittleEndian.Uint32(keyBytes)
+			if _, err = reader.Discard(4); err != nil {
+				return p, err
+			}
+			p += 4
+		} else {
+			var keyBuf [4]byte
+			n, readErr := readFullBufio(reader, keyBuf[:])
+			if readErr != nil {
+				return int64(n), fmt.Errorf("error in largePosting.ReadFrom: could not read key #%d: %w", i, readErr)
+			}
+			p += int64(n)
+			key = binary.LittleEndian.Uint32(keyBuf[:])
+		}
+		if i != 0 && key <= prevKey {
+			return p, fmt.Errorf("large posting keys are not strictly increasing")
+		}
+		prevKey = key
+		lp.highlowcontainer.keys[i] = key
+		lp.highlowcontainer.containers[i] = getBitmap32()
+		n64, readErr := lp.highlowcontainer.containers[i].readFromBufio(reader)
 		p += n64
 		if n64 == 0 || readErr != nil {
 			return p, fmt.Errorf("could not deserialize container for key #%d: %w", i, readErr)
@@ -322,6 +418,24 @@ func (lp *largePosting) addManySorted(dat []uint64) {
 	lp.addSortedHighBitsBatch(batchHighBits, dat[start:])
 }
 
+func (lp *largePosting) loadSortedUnique(dat []uint64) {
+	start := 0
+	batchHighBits := highbits64(dat[0])
+	for end := 1; end < len(dat); end++ {
+		hi := highbits64(dat[end])
+		if hi != batchHighBits {
+			next := getBitmap32()
+			next.loadSortedUnique64(dat[start:end])
+			lp.highlowcontainer.appendContainer(batchHighBits, next)
+			batchHighBits = hi
+			start = end
+		}
+	}
+	next := getBitmap32()
+	next.loadSortedUnique64(dat[start:])
+	lp.highlowcontainer.appendContainer(batchHighBits, next)
+}
+
 func (lp *largePosting) addSortedHighBitsBatch(hb uint32, dat []uint64) {
 	la := &lp.highlowcontainer
 	i := la.getIndex(hb)
@@ -394,15 +508,22 @@ main:
 			s2 := other.highlowcontainer.getKeyAtIndex(pos2)
 			for {
 				if s1 == s2 {
-					c1 := lp.highlowcontainer.getWritableContainerAtIndex(pos1)
 					c2 := other.highlowcontainer.getContainerAtIndex(pos2)
-					c1.and(c2)
+					current := lp.highlowcontainer.getContainerAtIndex(pos1)
+					c1 := current
+					if current.isUniquelyOwned() {
+						c1.and(c2)
+					} else {
+						c1 = current.andFresh(c2)
+					}
 					if !c1.isEmpty() {
 						lp.highlowcontainer.replaceKeyAndContainerAtIndex(outSize, s1, c1)
-						if outSize != pos1 {
+						if outSize != pos1 && c1 == current {
 							lp.highlowcontainer.clearContainerAtIndex(pos1)
 						}
 						outSize++
+					} else if c1 != current {
+						c1.release()
 					}
 					pos1++
 					pos2++
@@ -525,29 +646,93 @@ main:
 }
 
 func (lp *largePosting) forEachIntersecting(other *largePosting, fn func(uint64) bool) bool {
-	it := lp.iterator()
-	defer it.Release()
+	var left *largeIterator
+	if v := largeIteratorPool.Get(); v != nil {
+		left = v.(*largeIterator)
+	} else {
+		left = new(largeIterator)
+	}
+	left.initializeSnapshot(lp)
 
-	otherIt := other.iterator()
-	defer otherIt.Release()
+	var right *largeIterator
+	if v := largeIteratorPool.Get(); v != nil {
+		right = v.(*largeIterator)
+	} else {
+		right = new(largeIterator)
+	}
+	right.initializeSnapshot(other)
 
-	for it.HasNext() && otherIt.HasNext() {
-		v := it.peekNext()
-		otherV := otherIt.peekNext()
+	stopped := forEachLargeArrayIntersecting(&left.highlowcontainer, &right.highlowcontainer, fn)
+	putLargeIterator(left)
+	putLargeIterator(right)
+	return stopped
+}
 
-		if v < otherV {
-			it.advanceIfNeeded(otherV)
-			continue
+func (lp *largePosting) forEach(fn func(uint64) bool) bool {
+	var snapshot *largeIterator
+	if v := largeIteratorPool.Get(); v != nil {
+		snapshot = v.(*largeIterator)
+	} else {
+		snapshot = new(largeIterator)
+	}
+	snapshot.initializeSnapshot(lp)
+	ok := forEachLargeArray(&snapshot.highlowcontainer, fn)
+	putLargeIterator(snapshot)
+	return ok
+}
+
+func forEachLargeArray(la *largeArray, fn func(uint64) bool) bool {
+	for i := 0; i < la.size(); i++ {
+		base := uint64(la.getKeyAtIndex(i)) << 32
+		if !la.getContainerAtIndex(i).forEach64(base, fn) {
+			return false
 		}
-		if otherV < v {
-			otherIt.advanceIfNeeded(v)
-			continue
+	}
+	return true
+}
+
+func forEachLargeArrayIntersecting(left, right *largeArray, fn func(uint64) bool) bool {
+	pos1 := 0
+	pos2 := 0
+	length1 := left.size()
+	length2 := right.size()
+
+main:
+	for {
+		if pos1 < length1 && pos2 < length2 {
+			s1 := left.getKeyAtIndex(pos1)
+			s2 := right.getKeyAtIndex(pos2)
+			for {
+				if s1 == s2 {
+					c1 := left.getContainerAtIndex(pos1)
+					c2 := right.getContainerAtIndex(pos2)
+					if c1.forEachIntersecting64(uint64(s1)<<32, c2, fn) {
+						return true
+					}
+					pos1++
+					pos2++
+					if pos1 == length1 || pos2 == length2 {
+						break main
+					}
+					s1 = left.getKeyAtIndex(pos1)
+					s2 = right.getKeyAtIndex(pos2)
+				} else if s1 < s2 {
+					pos1 = left.advanceUntil(s2, pos1)
+					if pos1 == length1 {
+						break main
+					}
+					s1 = left.getKeyAtIndex(pos1)
+				} else {
+					pos2 = right.advanceUntil(s1, pos2)
+					if pos2 == length2 {
+						break main
+					}
+					s2 = right.getKeyAtIndex(pos2)
+				}
+			}
+		} else {
+			break
 		}
-		if fn(v) {
-			return true
-		}
-		it.Next()
-		otherIt.Next()
 	}
 	return false
 }
@@ -589,8 +774,19 @@ func (lp *largePosting) or(other *largePosting) {
 			continue
 		}
 
-		lp.highlowcontainer.getWritableContainerAtIndex(pos1).or(other.highlowcontainer.getContainerAtIndex(pos2))
-		lp.highlowcontainer.moveKeyValueAt(pos1, out)
+		current := lp.highlowcontainer.containers[pos1]
+		if current.isUniquelyOwned() {
+			current.or(other.highlowcontainer.containers[pos2])
+			lp.highlowcontainer.moveKeyValueAt(pos1, out)
+		} else {
+			merged := current.orFresh(other.highlowcontainer.containers[pos2])
+			current.release()
+			lp.highlowcontainer.keys[out] = s1
+			lp.highlowcontainer.containers[out] = merged
+			if out != pos1 {
+				lp.highlowcontainer.clearContainerAtIndex(pos1)
+			}
+		}
 		pos1--
 		pos2--
 		out--
@@ -622,15 +818,22 @@ main:
 			s2 := other.highlowcontainer.getKeyAtIndex(pos2)
 			for {
 				if s1 == s2 {
-					c1 := lp.highlowcontainer.getWritableContainerAtIndex(pos1)
 					c2 := other.highlowcontainer.getContainerAtIndex(pos2)
-					c1.andNot(c2)
+					current := lp.highlowcontainer.getContainerAtIndex(pos1)
+					c1 := current
+					if current.isUniquelyOwned() {
+						c1.andNot(c2)
+					} else {
+						c1 = current.andNotFresh(c2)
+					}
 					if !c1.isEmpty() {
 						lp.highlowcontainer.replaceKeyAndContainerAtIndex(outSize, s1, c1)
-						if outSize != pos1 {
+						if outSize != pos1 && c1 == current {
 							lp.highlowcontainer.clearContainerAtIndex(pos1)
 						}
 						outSize++
+					} else if c1 != current {
+						c1.release()
 					}
 					pos1++
 					pos2++
@@ -733,12 +936,16 @@ func (it *largeIterator) advanceIfNeeded(minval uint64) {
 }
 
 func (it *largeIterator) initialize(lp *largePosting) {
+	it.initializeSnapshot(lp)
+	it.init()
+}
+
+func (it *largeIterator) initializeSnapshot(lp *largePosting) {
 	it.pos = 0
 	it.hs = 0
 	// Retain a shared top-level snapshot so owner Release cannot invalidate
 	// iterator traversal mid-stream.
 	it.highlowcontainer.copySharedFrom(&lp.highlowcontainer)
-	it.init()
 }
 
 func (it *largeIterator) Release() {
@@ -756,7 +963,7 @@ func writeLarge(writer *bufio.Writer, lp *largePosting) error {
 	if size == 0 {
 		return nil
 	}
-	n, err := lp.WriteTo(writer)
+	n, err := lp.writeToBufio(writer)
 	if err != nil {
 		return err
 	}
@@ -768,7 +975,7 @@ func writeLarge(writer *bufio.Writer, lp *largePosting) error {
 
 func readLarge(reader *bufio.Reader) (lp *largePosting, err error) {
 	var size uint64
-	size, err = binary.ReadUvarint(reader)
+	size, err = readUvarint(reader)
 	if err != nil {
 		return nil, err
 	}
@@ -783,7 +990,7 @@ func readLarge(reader *bufio.Reader) (lp *largePosting, err error) {
 	lp.clear()
 	defer recoverLargeRead(&lp, &err)
 	var n int64
-	n, err = lp.ReadFrom(reader)
+	n, err = lp.readFromBufio(reader)
 	if err != nil {
 		lp.release()
 		return nil, err
@@ -804,7 +1011,7 @@ func recoverLargeRead(lp **largePosting, err *error) {
 }
 
 func skipLarge(reader *bufio.Reader) error {
-	size, err := binary.ReadUvarint(reader)
+	size, err := readUvarint(reader)
 	if err != nil {
 		return err
 	}
@@ -814,7 +1021,7 @@ func skipLarge(reader *bufio.Reader) error {
 	if size > (^uint64(0) >> 1) {
 		return fmt.Errorf("large posting size overflows int64: %v", size)
 	}
-	_, err = io.CopyN(io.Discard, reader, int64(size))
+	_, err = reader.Discard(int(size))
 	return err
 }
 

@@ -4,14 +4,198 @@ import (
 	"bufio"
 	"encoding/binary"
 	"fmt"
+	"io"
 	"unsafe"
 )
 
 func writeUvarint(writer *bufio.Writer, v uint64) error {
-	var buf [binary.MaxVarintLen64]byte
-	n := binary.PutUvarint(buf[:], v)
-	_, err := writer.Write(buf[:n])
-	return err
+	for v >= 0x80 {
+		if err := writer.WriteByte(byte(v) | 0x80); err != nil {
+			return err
+		}
+		v >>= 7
+	}
+	return writer.WriteByte(byte(v))
+}
+
+func writeLEUint16(writer *bufio.Writer, v uint16) (int, error) {
+	if writer.Available() >= 2 {
+		buf := writer.AvailableBuffer()
+		buf = binary.LittleEndian.AppendUint16(buf, v)
+		return writer.Write(buf)
+	}
+	if err := writer.WriteByte(byte(v)); err != nil {
+		return 0, err
+	}
+	if err := writer.WriteByte(byte(v >> 8)); err != nil {
+		return 1, err
+	}
+	return 2, nil
+}
+
+func writeLEUint32(writer *bufio.Writer, v uint32) (int, error) {
+	if writer.Available() >= 4 {
+		buf := writer.AvailableBuffer()
+		buf = binary.LittleEndian.AppendUint32(buf, v)
+		return writer.Write(buf)
+	}
+	if err := writer.WriteByte(byte(v)); err != nil {
+		return 0, err
+	}
+	if err := writer.WriteByte(byte(v >> 8)); err != nil {
+		return 1, err
+	}
+	if err := writer.WriteByte(byte(v >> 16)); err != nil {
+		return 2, err
+	}
+	if err := writer.WriteByte(byte(v >> 24)); err != nil {
+		return 3, err
+	}
+	return 4, nil
+}
+
+func writeLEUint64(writer *bufio.Writer, v uint64) (int, error) {
+	if writer.Available() >= 8 {
+		buf := writer.AvailableBuffer()
+		buf = binary.LittleEndian.AppendUint64(buf, v)
+		return writer.Write(buf)
+	}
+	if err := writer.WriteByte(byte(v)); err != nil {
+		return 0, err
+	}
+	if err := writer.WriteByte(byte(v >> 8)); err != nil {
+		return 1, err
+	}
+	if err := writer.WriteByte(byte(v >> 16)); err != nil {
+		return 2, err
+	}
+	if err := writer.WriteByte(byte(v >> 24)); err != nil {
+		return 3, err
+	}
+	if err := writer.WriteByte(byte(v >> 32)); err != nil {
+		return 4, err
+	}
+	if err := writer.WriteByte(byte(v >> 40)); err != nil {
+		return 5, err
+	}
+	if err := writer.WriteByte(byte(v >> 48)); err != nil {
+		return 6, err
+	}
+	if err := writer.WriteByte(byte(v >> 56)); err != nil {
+		return 7, err
+	}
+	return 8, nil
+}
+
+func appendUvarint(dst []byte, v uint64) []byte {
+	for v >= 0x80 {
+		dst = append(dst, byte(v)|0x80)
+		v >>= 7
+	}
+	return append(dst, byte(v))
+}
+
+func writeCompactPosting(writer *bufio.Writer, tag byte, ids []uint64) error {
+	if writer.Available() >= 11+len(ids)*10 {
+		buf := writer.AvailableBuffer()
+		buf = append(buf, tag)
+		buf = appendUvarint(buf, uint64(len(ids)))
+		var prev uint64
+		for i := 0; i < len(ids); i++ {
+			v := ids[i]
+			delta := v
+			if i > 0 {
+				delta -= prev
+			}
+			buf = appendUvarint(buf, delta)
+			prev = v
+		}
+		_, err := writer.Write(buf)
+		return err
+	}
+
+	if err := writer.WriteByte(tag); err != nil {
+		return err
+	}
+	if err := writeUvarint(writer, uint64(len(ids))); err != nil {
+		return err
+	}
+	var prev uint64
+	for i := 0; i < len(ids); i++ {
+		v := ids[i]
+		delta := v
+		if i > 0 {
+			delta -= prev
+		}
+		if err := writeUvarint(writer, delta); err != nil {
+			return err
+		}
+		prev = v
+	}
+	return nil
+}
+
+func readUvarint(reader *bufio.Reader) (uint64, error) {
+	var x uint64
+	var s uint
+	for i := 0; i < 10; i++ {
+		b, err := reader.ReadByte()
+		if err != nil {
+			if i > 0 && err == io.EOF {
+				return x, io.ErrUnexpectedEOF
+			}
+			return x, err
+		}
+		if b < 0x80 {
+			if i == 9 && b > 1 {
+				return 0, fmt.Errorf("binary: varint overflows a 64-bit integer")
+			}
+			return x | uint64(b)<<s, nil
+		}
+		x |= uint64(b&0x7f) << s
+		s += 7
+	}
+	return 0, fmt.Errorf("binary: varint overflows a 64-bit integer")
+}
+
+func readFullBufio(reader *bufio.Reader, buf []byte) (int, error) {
+	n := 0
+	for n < len(buf) {
+		read, err := reader.Read(buf[n:])
+		n += read
+		if n == len(buf) {
+			return n, nil
+		}
+		if err != nil {
+			if err == io.EOF && n > 0 {
+				return n, io.ErrUnexpectedEOF
+			}
+			return n, err
+		}
+		if read == 0 {
+			return n, io.ErrNoProgress
+		}
+	}
+	return n, nil
+}
+
+func skipUvarint(reader *bufio.Reader) error {
+	for i := 0; i < 10; i++ {
+		b, err := reader.ReadByte()
+		if err != nil {
+			if i > 0 && err == io.EOF {
+				return io.ErrUnexpectedEOF
+			}
+			return err
+		}
+		if b < 0x80 {
+			if i == 9 && b > 1 {
+				return fmt.Errorf("binary: varint overflows a 64-bit integer")
+			}
+			return nil
+		}
+	}
+	return fmt.Errorf("binary: varint overflows a 64-bit integer")
 }
 
 // List is a 16-byte value handle over adaptive posting payloads.
@@ -158,9 +342,14 @@ func BuildFromSorted(ids []uint64) List {
 		return midValue(mp)
 	default:
 		lp := getLargePosting()
-		lp.addMany(ids)
-		out := largeValue(lp)
-		return out.BuildOptimized()
+		first := ids[0]
+		last := ids[len(ids)-1]
+		if last != ^uint64(0) && last-first == uint64(len(ids)-1) {
+			lp.addRange(first, last+1)
+			return largeValue(lp)
+		}
+		lp.loadSortedUnique(ids)
+		return largeValue(lp)
 	}
 }
 
@@ -247,6 +436,12 @@ func (p List) SharesPayload(other List) bool {
 
 func compactFilterByMembership(ids List, other List, keepMatches bool) List {
 	if sp := ids.small(); sp != nil {
+		if otherSp := other.small(); otherSp != nil {
+			return compactFilterBySorted(ids, sp.ids[:sp.n], otherSp.ids[:otherSp.n], keepMatches)
+		}
+		if otherMp := other.mid(); otherMp != nil {
+			return compactFilterBySorted(ids, sp.ids[:sp.n], otherMp.ids[:otherMp.n], keepMatches)
+		}
 		if ids.IsBorrowed() {
 			var kept [SmallCap]uint64
 			n := 0
@@ -282,6 +477,12 @@ func compactFilterByMembership(ids List, other List, keepMatches bool) List {
 		}
 	}
 	if mp := ids.mid(); mp != nil {
+		if otherSp := other.small(); otherSp != nil {
+			return compactFilterBySorted(ids, mp.ids[:mp.n], otherSp.ids[:otherSp.n], keepMatches)
+		}
+		if otherMp := other.mid(); otherMp != nil {
+			return compactFilterBySorted(ids, mp.ids[:mp.n], otherMp.ids[:otherMp.n], keepMatches)
+		}
 		if ids.IsBorrowed() {
 			var kept [MidCap]uint64
 			n := 0
@@ -323,6 +524,181 @@ func compactFilterByMembership(ids List, other List, keepMatches bool) List {
 		}
 	}
 	return ids
+}
+
+func compactFilterBySorted(ids List, values, other []uint64, keepMatches bool) List {
+	var kept [MidCap]uint64
+	n := 0
+	j := 0
+	if keepMatches {
+		i := 0
+		for j < len(other) && i < len(values) {
+			id := other[j]
+			for i < len(values) && values[i] < id {
+				i++
+			}
+			if i == len(values) {
+				break
+			}
+			if values[i] == id {
+				kept[n] = id
+				n++
+				i++
+			}
+			j++
+		}
+	} else {
+		for i := 0; i < len(values); i++ {
+			id := values[i]
+			for j < len(other) && other[j] < id {
+				j++
+			}
+			if j == len(other) {
+				copy(kept[n:], values[i:])
+				n += len(values) - i
+				break
+			}
+			if other[j] != id {
+				kept[n] = id
+				n++
+			}
+		}
+	}
+	return compactFilterResult(ids, kept[:], n)
+}
+
+func compactFilterResult(ids List, kept []uint64, n int) List {
+	if ids.IsBorrowed() {
+		return compactListFromSorted(kept[:n])
+	}
+	if sp := ids.small(); sp != nil {
+		switch n {
+		case 0:
+			sp.release()
+			return List{}
+		case 1:
+			keep := kept[0]
+			sp.release()
+			return singleton(keep)
+		default:
+			sp.n = uint8(n)
+			copy(sp.ids[:n], kept[:n])
+			return ids
+		}
+	}
+	mp := ids.mid()
+	switch {
+	case n == 0:
+		mp.release()
+		return List{}
+	case n == 1:
+		keep := kept[0]
+		mp.release()
+		return singleton(keep)
+	case n <= SmallCap:
+		sp := getSmallPosting()
+		sp.n = uint8(n)
+		copy(sp.ids[:n], kept[:n])
+		mp.release()
+		return smallValue(sp)
+	default:
+		mp.n = uint8(n)
+		copy(mp.ids[:n], kept[:n])
+		return ids
+	}
+}
+
+func buildCompactUnion(ids List, left, right []uint64) List {
+	var merged [MidCap * 2]uint64
+	i := 0
+	j := 0
+	n := 0
+	for i < len(left) && j < len(right) {
+		lv := left[i]
+		rv := right[j]
+		if lv < rv {
+			merged[n] = lv
+			n++
+			i++
+			continue
+		}
+		if rv < lv {
+			merged[n] = rv
+			n++
+			j++
+			continue
+		}
+		merged[n] = lv
+		n++
+		i++
+		j++
+	}
+	for i < len(left) {
+		merged[n] = left[i]
+		n++
+		i++
+	}
+	for j < len(right) {
+		merged[n] = right[j]
+		n++
+		j++
+	}
+
+	if n <= MidCap {
+		return compactUnionResult(ids, merged[:], n)
+	}
+
+	lp := getLargePosting()
+	lp.loadSortedUnique(merged[:n])
+	if !ids.IsBorrowed() {
+		switch ids.single & postingMetaKindMask {
+		case postingKindSmall:
+			(*smallPosting)(ids.ptr).release()
+		case postingKindMid:
+			(*midPosting)(ids.ptr).release()
+		}
+	}
+	return largeValue(lp)
+}
+
+func compactUnionResult(ids List, merged []uint64, n int) List {
+	if ids.IsBorrowed() {
+		return compactListFromSorted(merged[:n])
+	}
+	if n == 1 {
+		keep := merged[0]
+		switch ids.single & postingMetaKindMask {
+		case postingKindSmall:
+			(*smallPosting)(ids.ptr).release()
+		case postingKindMid:
+			(*midPosting)(ids.ptr).release()
+		}
+		return singleton(keep)
+	}
+	if n <= SmallCap {
+		if sp := ids.small(); sp != nil {
+			sp.n = uint8(n)
+			copy(sp.ids[:n], merged[:n])
+			return ids
+		}
+		mp := ids.mid()
+		sp := getSmallPosting()
+		sp.n = uint8(n)
+		copy(sp.ids[:n], merged[:n])
+		mp.release()
+		return smallValue(sp)
+	}
+	if mp := ids.mid(); mp != nil {
+		mp.n = uint8(n)
+		copy(mp.ids[:n], merged[:n])
+		return ids
+	}
+	sp := ids.small()
+	mp := getMidPosting()
+	mp.n = uint8(n)
+	copy(mp.ids[:n], merged[:n])
+	sp.release()
+	return midValue(mp)
 }
 
 func postingBufContainsAny(posts []List, id uint64) bool {
@@ -336,6 +712,13 @@ func postingBufContainsAny(posts []List, id uint64) bool {
 
 func compactFilterByAnyMembership(ids List, other []List) List {
 	if sp := ids.small(); sp != nil {
+		if len(other) == 2 {
+			if left, ok := compactPostingValues(other[0]); ok {
+				if right, ok := compactPostingValues(other[1]); ok {
+					return compactFilterByAny2Sorted(ids, sp.ids[:sp.n], left, right)
+				}
+			}
+		}
 		if ids.IsBorrowed() {
 			var kept [SmallCap]uint64
 			n := 0
@@ -371,6 +754,13 @@ func compactFilterByAnyMembership(ids List, other []List) List {
 		}
 	}
 	if mp := ids.mid(); mp != nil {
+		if len(other) == 2 {
+			if left, ok := compactPostingValues(other[0]); ok {
+				if right, ok := compactPostingValues(other[1]); ok {
+					return compactFilterByAny2Sorted(ids, mp.ids[:mp.n], left, right)
+				}
+			}
+		}
 		if ids.IsBorrowed() {
 			var kept [MidCap]uint64
 			n := 0
@@ -412,6 +802,41 @@ func compactFilterByAnyMembership(ids List, other []List) List {
 		}
 	}
 	return ids
+}
+
+func compactPostingValues(ids List) ([]uint64, bool) {
+	if sp := ids.small(); sp != nil {
+		return sp.ids[:sp.n], true
+	}
+	if mp := ids.mid(); mp != nil {
+		return mp.ids[:mp.n], true
+	}
+	return nil, false
+}
+
+func compactFilterByAny2Sorted(ids List, values, left, right []uint64) List {
+	var kept [MidCap]uint64
+	n := 0
+	j := 0
+	k := 0
+	for i := 0; i < len(values); i++ {
+		id := values[i]
+		for j < len(left) && left[j] < id {
+			j++
+		}
+		matched := j < len(left) && left[j] == id
+		if !matched {
+			for k < len(right) && right[k] < id {
+				k++
+			}
+			matched = k < len(right) && right[k] == id
+		}
+		if matched {
+			kept[n] = id
+			n++
+		}
+	}
+	return compactFilterResult(ids, kept[:], n)
 }
 
 func (p List) largeRef() *largePosting {
@@ -478,19 +903,21 @@ func (p List) TrySingle() (uint64, bool) {
 	if p.ptr == singleValue {
 		return p.single, true
 	}
-	if sp := p.small(); sp != nil {
+	switch p.single & postingMetaKindMask {
+	case postingKindSmall:
+		sp := (*smallPosting)(p.ptr)
 		if sp.n == 1 {
 			return sp.ids[0], true
 		}
 		return 0, false
-	}
-	if mp := p.mid(); mp != nil {
+	case postingKindMid:
+		mp := (*midPosting)(p.ptr)
 		if mp.n == 1 {
 			return mp.ids[0], true
 		}
 		return 0, false
-	}
-	if lp := p.largeRef(); lp != nil {
+	default:
+		lp := (*largePosting)(p.ptr)
 		if id, ok := lp.trySingle(); ok {
 			return id, true
 		}
@@ -505,10 +932,12 @@ func (p List) TryAppendCompactTo(dst []uint64) ([]uint64, bool) {
 	if p.ptr == singleValue {
 		return append(dst, p.single), true
 	}
-	if sp := p.small(); sp != nil {
+	switch p.single & postingMetaKindMask {
+	case postingKindSmall:
+		sp := (*smallPosting)(p.ptr)
 		return append(dst, sp.ids[:sp.n]...), true
-	}
-	if mp := p.mid(); mp != nil {
+	case postingKindMid:
+		mp := (*midPosting)(p.ptr)
 		return append(dst, mp.ids[:mp.n]...), true
 	}
 	return dst, false
@@ -521,13 +950,16 @@ func (p List) Cardinality() uint64 {
 	if p.ptr == singleValue {
 		return 1
 	}
-	if sp := p.small(); sp != nil {
+	switch p.single & postingMetaKindMask {
+	case postingKindSmall:
+		sp := (*smallPosting)(p.ptr)
 		return uint64(sp.n)
-	}
-	if mp := p.mid(); mp != nil {
+	case postingKindMid:
+		mp := (*midPosting)(p.ptr)
 		return uint64(mp.n)
+	default:
+		return (*largePosting)(p.ptr).cardinality()
 	}
-	return p.largeRef().cardinality()
 }
 
 func (p List) Contains(id uint64) bool {
@@ -537,7 +969,9 @@ func (p List) Contains(id uint64) bool {
 	if p.ptr == singleValue {
 		return p.single == id
 	}
-	if sp := p.small(); sp != nil {
+	switch p.single & postingMetaKindMask {
+	case postingKindSmall:
+		sp := (*smallPosting)(p.ptr)
 		for i := 0; i < int(sp.n); i++ {
 			if sp.ids[i] == id {
 				return true
@@ -547,19 +981,26 @@ func (p List) Contains(id uint64) bool {
 			}
 		}
 		return false
-	}
-	if mp := p.mid(); mp != nil {
-		for i := 0; i < int(mp.n); i++ {
-			if mp.ids[i] == id {
+	case postingKindMid:
+		mp := (*midPosting)(p.ptr)
+		lo := 0
+		hi := int(mp.n) - 1
+		for lo <= hi {
+			mid := int(uint(lo+hi) >> 1)
+			v := mp.ids[mid]
+			if v < id {
+				lo = mid + 1
+				continue
+			}
+			if v == id {
 				return true
 			}
-			if mp.ids[i] > id {
-				return false
-			}
+			hi = mid - 1
 		}
 		return false
+	default:
+		return (*largePosting)(p.ptr).contains(id)
 	}
-	return p.largeRef().contains(id)
 }
 
 func isNonDecreasingU64(dat []uint64) bool {
@@ -578,13 +1019,14 @@ func (p List) Minimum() (uint64, bool) {
 	if p.ptr == singleValue {
 		return p.single, true
 	}
-	if sp := p.small(); sp != nil {
-		return sp.ids[0], true
+	switch p.single & postingMetaKindMask {
+	case postingKindSmall:
+		return (*smallPosting)(p.ptr).ids[0], true
+	case postingKindMid:
+		return (*midPosting)(p.ptr).ids[0], true
+	default:
+		return (*largePosting)(p.ptr).minimum(), true
 	}
-	if mp := p.mid(); mp != nil {
-		return mp.ids[0], true
-	}
-	return p.largeRef().minimum(), true
 }
 
 func (p List) Maximum() (uint64, bool) {
@@ -594,13 +1036,16 @@ func (p List) Maximum() (uint64, bool) {
 	if p.ptr == singleValue {
 		return p.single, true
 	}
-	if sp := p.small(); sp != nil {
+	switch p.single & postingMetaKindMask {
+	case postingKindSmall:
+		sp := (*smallPosting)(p.ptr)
 		return sp.ids[sp.n-1], true
-	}
-	if mp := p.mid(); mp != nil {
+	case postingKindMid:
+		mp := (*midPosting)(p.ptr)
 		return mp.ids[mp.n-1], true
+	default:
+		return (*largePosting)(p.ptr).maximum(), true
 	}
-	return p.largeRef().maximum(), true
 }
 
 func (p List) SizeInBytes() uint64 {
@@ -610,13 +1055,16 @@ func (p List) SizeInBytes() uint64 {
 	if p.ptr == singleValue {
 		return 8
 	}
-	if sp := p.small(); sp != nil {
+	switch p.single & postingMetaKindMask {
+	case postingKindSmall:
+		sp := (*smallPosting)(p.ptr)
 		return uint64(sp.n) * 8
-	}
-	if mp := p.mid(); mp != nil {
+	case postingKindMid:
+		mp := (*midPosting)(p.ptr)
 		return uint64(mp.n) * 8
+	default:
+		return (*largePosting)(p.ptr).sizeInBytes()
 	}
-	return p.largeRef().sizeInBytes()
 }
 
 func (p List) ToArray() []uint64 {
@@ -650,30 +1098,26 @@ func (p List) ForEach(fn func(uint64) bool) bool {
 	if p.ptr == singleValue {
 		return fn(p.single)
 	}
-	if sp := p.small(); sp != nil {
+	switch p.single & postingMetaKindMask {
+	case postingKindSmall:
+		sp := (*smallPosting)(p.ptr)
 		for i := 0; i < int(sp.n); i++ {
 			if !fn(sp.ids[i]) {
 				return false
 			}
 		}
 		return true
-	}
-	if mp := p.mid(); mp != nil {
+	case postingKindMid:
+		mp := (*midPosting)(p.ptr)
 		for i := 0; i < int(mp.n); i++ {
 			if !fn(mp.ids[i]) {
 				return false
 			}
 		}
 		return true
+	default:
+		return (*largePosting)(p.ptr).forEach(fn)
 	}
-	it := p.largeRef().iterator()
-	defer it.Release()
-	for it.HasNext() {
-		if !fn(it.Next()) {
-			return false
-		}
-	}
-	return true
 }
 
 func intersectionSides(p, other List) (List, List) {
@@ -796,13 +1240,16 @@ func (p List) Iter() Iterator {
 	if p.ptr == singleValue {
 		return getSingletonIter(p.single)
 	}
-	if sp := p.small(); sp != nil {
+	switch p.single & postingMetaKindMask {
+	case postingKindSmall:
+		sp := (*smallPosting)(p.ptr)
 		return getArrayIter(sp.ids[:sp.n])
-	}
-	if mp := p.mid(); mp != nil {
+	case postingKindMid:
+		mp := (*midPosting)(p.ptr)
 		return getArrayIter(mp.ids[:mp.n])
+	default:
+		return (*largePosting)(p.ptr).iterator()
 	}
-	return p.largeRef().iterator()
 }
 
 func (p List) andIntoLarge(dst *largePosting) {
@@ -926,7 +1373,7 @@ func (p List) TryBuildAndAnyBuf(other []List) (List, bool) {
 	if p.isSmall() || p.isMid() {
 		return compactFilterByAnyMembership(p, other), true
 	}
-	return List{}, false
+	return p, false
 }
 
 func (p List) TryResetOwnedCompactLikeFromSorted(src List, ids []uint64) (List, List, bool) {
@@ -1110,6 +1557,32 @@ func (p List) BuildAddedMany(ids []uint64) List {
 	}
 
 	if lp := p.largeRef(); lp != nil {
+		if highbits64(ids[0]) > lp.highlowcontainer.keys[len(lp.highlowcontainer.keys)-1] {
+			prev := ids[0]
+			strict := true
+			for i := 1; i < len(ids); i++ {
+				id := ids[i]
+				if id <= prev {
+					strict = false
+					break
+				}
+				prev = id
+			}
+			if strict {
+				if p.IsBorrowed() {
+					p = p.Clone()
+					lp = p.largeRef()
+				}
+				first := ids[0]
+				last := ids[len(ids)-1]
+				if last != ^uint64(0) && last-first == uint64(len(ids)-1) {
+					lp.addRange(first, last+1)
+				} else {
+					lp.loadSortedUnique(ids)
+				}
+				return p
+			}
+		}
 		if p.IsBorrowed() {
 			p = p.Clone()
 			lp = p.largeRef()
@@ -1129,6 +1602,26 @@ func (p List) BuildAddedMany(ids []uint64) List {
 	lp := getLargePosting()
 	switch {
 	case current.IsEmpty():
+		prev := ids[0]
+		strict := true
+		for i := 1; i < len(ids); i++ {
+			id := ids[i]
+			if id <= prev {
+				strict = false
+				break
+			}
+			prev = id
+		}
+		if strict {
+			first := ids[0]
+			last := ids[len(ids)-1]
+			if last != ^uint64(0) && last-first == uint64(len(ids)-1) {
+				lp.addRange(first, last+1)
+			} else {
+				lp.loadSortedUnique(ids)
+			}
+			return largeValue(lp)
+		}
 	case current.ptr == singleValue:
 		lp.add(current.single)
 	case current.isSmall():
@@ -1417,12 +1910,24 @@ func (p List) BuildOr(other List) List {
 		return buildAdded(p, other.single)
 	}
 	if sp := other.small(); sp != nil {
+		if psp := p.small(); psp != nil {
+			return buildCompactUnion(p, psp.ids[:psp.n], sp.ids[:sp.n])
+		}
+		if pmp := p.mid(); pmp != nil {
+			return buildCompactUnion(p, pmp.ids[:pmp.n], sp.ids[:sp.n])
+		}
 		for i := 0; i < int(sp.n); i++ {
 			p = buildAdded(p, sp.ids[i])
 		}
 		return p
 	}
 	if mp := other.mid(); mp != nil {
+		if psp := p.small(); psp != nil {
+			return buildCompactUnion(p, psp.ids[:psp.n], mp.ids[:mp.n])
+		}
+		if pmp := p.mid(); pmp != nil {
+			return buildCompactUnion(p, pmp.ids[:pmp.n], mp.ids[:mp.n])
+		}
 		for i := 0; i < int(mp.n); i++ {
 			p = buildAdded(p, mp.ids[i])
 		}
@@ -1533,7 +2038,13 @@ func (p List) TryResetOwnedLargeFromSorted(ids []uint64) (List, bool) {
 		lp.release()
 		return List{}, true
 	}
-	lp.addManySorted(ids)
+	first := ids[0]
+	last := ids[len(ids)-1]
+	if last != ^uint64(0) && last-first == uint64(len(ids)-1) {
+		lp.addRange(first, last+1)
+		return p, true
+	}
+	lp.loadSortedUnique(ids)
 	return p, true
 }
 
@@ -1548,46 +2059,10 @@ func (p List) WriteTo(writer *bufio.Writer) error {
 		return writeUvarint(writer, id)
 	}
 	if sp := p.small(); sp != nil {
-		if err := writer.WriteByte(encodingSmall); err != nil {
-			return err
-		}
-		if err := writeUvarint(writer, uint64(sp.n)); err != nil {
-			return err
-		}
-		var prev uint64
-		for i := 0; i < int(sp.n); i++ {
-			v := sp.ids[i]
-			delta := v
-			if i > 0 {
-				delta -= prev
-			}
-			if err := writeUvarint(writer, delta); err != nil {
-				return err
-			}
-			prev = v
-		}
-		return nil
+		return writeCompactPosting(writer, encodingSmall, sp.ids[:sp.n])
 	}
 	if mp := p.mid(); mp != nil {
-		if err := writer.WriteByte(encodingMid); err != nil {
-			return err
-		}
-		if err := writeUvarint(writer, uint64(mp.n)); err != nil {
-			return err
-		}
-		var prev uint64
-		for i := 0; i < int(mp.n); i++ {
-			v := mp.ids[i]
-			delta := v
-			if i > 0 {
-				delta -= prev
-			}
-			if err := writeUvarint(writer, delta); err != nil {
-				return err
-			}
-			prev = v
-		}
-		return nil
+		return writeCompactPosting(writer, encodingMid, mp.ids[:mp.n])
 	}
 	if err := writer.WriteByte(encodingLarge); err != nil {
 		return err
@@ -1596,9 +2071,39 @@ func (p List) WriteTo(writer *bufio.Writer) error {
 }
 
 func readCompactPostingValues(reader *bufio.Reader, ids []uint64, kind string) error {
+	if len(ids) != 0 {
+		if buf, err := reader.Peek(len(ids)); err == nil {
+			var prev uint64
+			ok := true
+			for i := 0; i < len(buf); i++ {
+				b := buf[i]
+				if b >= 0x80 {
+					ok = false
+					break
+				}
+				delta := uint64(b)
+				if i == 0 {
+					ids[i] = delta
+					prev = delta
+					continue
+				}
+				next := prev + delta
+				if delta == 0 || next <= prev {
+					return fmt.Errorf("invalid %s posting data: ids must be strictly increasing", kind)
+				}
+				ids[i] = next
+				prev = next
+			}
+			if ok {
+				_, err = reader.Discard(len(ids))
+				return err
+			}
+		}
+	}
+
 	var prev uint64
 	for i := range ids {
-		delta, err := binary.ReadUvarint(reader)
+		delta, err := readUvarint(reader)
 		if err != nil {
 			return err
 		}
@@ -1628,13 +2133,13 @@ func ReadFrom(reader *bufio.Reader) (List, error) {
 	case encodingEmpty:
 		return List{}, nil
 	case encodingSingleton:
-		id, err := binary.ReadUvarint(reader)
+		id, err := readUvarint(reader)
 		if err != nil {
 			return List{}, err
 		}
 		return singleton(id), nil
 	case encodingSmall:
-		n, err := binary.ReadUvarint(reader)
+		n, err := readUvarint(reader)
 		if err != nil {
 			return List{}, err
 		}
@@ -1654,7 +2159,7 @@ func ReadFrom(reader *bufio.Reader) (List, error) {
 		}
 		return smallValue(sp), nil
 	case encodingMid:
-		n, err := binary.ReadUvarint(reader)
+		n, err := readUvarint(reader)
 		if err != nil {
 			return List{}, err
 		}
@@ -1741,24 +2246,43 @@ func Skip(reader *bufio.Reader) error {
 	case encodingEmpty:
 		return nil
 	case encodingSingleton:
-		_, err = binary.ReadUvarint(reader)
-		return err
+		return skipUvarint(reader)
 	case encodingSmall, encodingMid:
-		n, err := binary.ReadUvarint(reader)
+		n, err := readUvarint(reader)
 		if err != nil {
 			return err
 		}
-		for i := uint64(0); i < n; i++ {
-			if _, err = binary.ReadUvarint(reader); err != nil {
-				return err
-			}
-		}
-		return nil
+		return skipCompactUvarints(reader, n)
 	case encodingLarge:
 		return skipLarge(reader)
 	default:
 		return fmt.Errorf("invalid posting encoding tag %v", tag)
 	}
+}
+
+func skipCompactUvarints(reader *bufio.Reader, n uint64) error {
+	if n <= MidCap {
+		if buf, err := reader.Peek(int(n)); err == nil {
+			oneByte := true
+			for i := 0; i < len(buf); i++ {
+				if buf[i] >= 0x80 {
+					oneByte = false
+					break
+				}
+			}
+			if oneByte {
+				_, err = reader.Discard(int(n))
+				return err
+			}
+		}
+	}
+
+	for i := uint64(0); i < n; i++ {
+		if err := skipUvarint(reader); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 type Iterator interface {

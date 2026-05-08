@@ -1,9 +1,11 @@
 package posting
 
 import (
+	"bufio"
 	"encoding/binary"
 	"fmt"
 	"io"
+	"math/bits"
 	"slices"
 	"sync/atomic"
 )
@@ -518,7 +520,24 @@ func (rb *bitmap32) loadManySorted64(dat []uint64) {
 	rb.highlowcontainer.appendContainer(batchHighBits, buildContainerFromSorted64Low(dat[start:]))
 }
 
+func (rb *bitmap32) loadSortedUnique64(dat []uint64) {
+	start := 0
+	batchHighBits := highbits(lowbits64(dat[0]))
+	for end := 1; end < len(dat); end++ {
+		hi := highbits(lowbits64(dat[end]))
+		if hi != batchHighBits {
+			rb.highlowcontainer.appendContainer(batchHighBits, buildContainerFromSortedUnique64Low(dat[start:end]))
+			batchHighBits = hi
+			start = end
+		}
+	}
+	rb.highlowcontainer.appendContainer(batchHighBits, buildContainerFromSortedUnique64Low(dat[start:]))
+}
+
 func buildContainerFromSorted32(dat []uint32) container16 {
+	if run := tryBuildRunContainerFromSorted32(dat); run != nil {
+		return run
+	}
 	unique := countUniqueSorted32(dat, arrayDefaultMaxSize+1)
 	if unique <= arrayDefaultMaxSize {
 		ac := getContainerArrayWithLen(unique)
@@ -531,6 +550,9 @@ func buildContainerFromSorted32(dat []uint32) container16 {
 }
 
 func buildContainerFromSorted64Low(dat []uint64) container16 {
+	if run := tryBuildRunContainerFromSorted64Low(dat); run != nil {
+		return run
+	}
 	unique := countUniqueSorted64Low(dat, arrayDefaultMaxSize+1)
 	if unique <= arrayDefaultMaxSize {
 		ac := getContainerArrayWithLen(unique)
@@ -540,6 +562,74 @@ func buildContainerFromSorted64Low(dat []uint64) container16 {
 	bc := newContainerBitmap()
 	addSorted64LowToBitmap(bc, dat)
 	return minimizeFreshSortedBitmapContainer(bc)
+}
+
+func buildContainerFromSortedUnique64Low(dat []uint64) container16 {
+	if len(dat) >= 4 {
+		start := lowbits64(dat[0])
+		last := lowbits64(dat[len(dat)-1])
+		if last-start == uint32(len(dat)-1) {
+			return newContainerRunRange(uint16(start), uint16(last))
+		}
+	}
+	if len(dat) <= arrayDefaultMaxSize {
+		ac := getContainerArrayWithLen(len(dat))
+		for i := 0; i < len(dat); i++ {
+			ac.content[i] = uint16(lowbits64(dat[i]))
+		}
+		return ac
+	}
+	bc := newContainerBitmap()
+	addSorted64LowToBitmap(bc, dat)
+	return minimizeFreshSortedBitmapContainer(bc)
+}
+
+func tryBuildRunContainerFromSorted32(dat []uint32) container16 {
+	if len(dat) < 4 {
+		return nil
+	}
+	start := uint32(lowbits(dat[0]))
+	prev := start
+	unique := 1
+	for _, raw := range dat[1:] {
+		v := uint32(lowbits(raw))
+		if v == prev {
+			continue
+		}
+		if v != prev+1 {
+			return nil
+		}
+		prev = v
+		unique++
+	}
+	if unique < 4 {
+		return nil
+	}
+	return newContainerRunRange(uint16(start), uint16(prev))
+}
+
+func tryBuildRunContainerFromSorted64Low(dat []uint64) container16 {
+	if len(dat) < 4 {
+		return nil
+	}
+	start := lowbits64(dat[0])
+	prev := start
+	unique := 1
+	for _, raw := range dat[1:] {
+		v := lowbits64(raw)
+		if v == prev {
+			continue
+		}
+		if v != prev+1 {
+			return nil
+		}
+		prev = v
+		unique++
+	}
+	if unique < 4 {
+		return nil
+	}
+	return newContainerRunRange(uint16(start), uint16(prev))
 }
 
 func countUniqueSorted32(dat []uint32, limit int) int {
@@ -1109,6 +1199,54 @@ main:
 	rb.highlowcontainer.resize(intersectionsize)
 }
 
+func (rb *bitmap32) andFresh(x2 *bitmap32) *bitmap32 {
+	out := getBitmap32()
+	pos1 := 0
+	pos2 := 0
+	length1 := rb.highlowcontainer.size()
+	length2 := x2.highlowcontainer.size()
+
+main:
+	for {
+		if pos1 < length1 && pos2 < length2 {
+			s1 := rb.highlowcontainer.getKeyAtIndex(pos1)
+			s2 := x2.highlowcontainer.getKeyAtIndex(pos2)
+			for {
+				if s1 == s2 {
+					c := rb.highlowcontainer.getContainerAtIndex(pos1).and(x2.highlowcontainer.getContainerAtIndex(pos2))
+					if !c.isEmpty() {
+						out.highlowcontainer.appendContainer(s1, c)
+					} else {
+						c.release()
+					}
+					pos1++
+					pos2++
+					if pos1 == length1 || pos2 == length2 {
+						break main
+					}
+					s1 = rb.highlowcontainer.getKeyAtIndex(pos1)
+					s2 = x2.highlowcontainer.getKeyAtIndex(pos2)
+				} else if s1 < s2 {
+					pos1 = rb.highlowcontainer.advanceUntil(s2, pos1)
+					if pos1 == length1 {
+						break main
+					}
+					s1 = rb.highlowcontainer.getKeyAtIndex(pos1)
+				} else {
+					pos2 = x2.highlowcontainer.advanceUntil(s1, pos2)
+					if pos2 == length2 {
+						break main
+					}
+					s2 = x2.highlowcontainer.getKeyAtIndex(pos2)
+				}
+			}
+		} else {
+			break
+		}
+	}
+	return out
+}
+
 // andCardinality returns the cardinality of the intersection between two bitmaps.
 func (rb *bitmap32) andCardinality(x2 *bitmap32) uint64 {
 	pos1 := 0
@@ -1197,6 +1335,287 @@ main:
 			}
 		} else {
 			break
+		}
+	}
+	return false
+}
+
+func (rb *bitmap32) forEachIntersecting64(base uint64, other *bitmap32, fn func(uint64) bool) bool {
+	pos1 := 0
+	pos2 := 0
+	length1 := rb.highlowcontainer.size()
+	length2 := other.highlowcontainer.size()
+
+main:
+	for {
+		if pos1 < length1 && pos2 < length2 {
+			s1 := rb.highlowcontainer.getKeyAtIndex(pos1)
+			s2 := other.highlowcontainer.getKeyAtIndex(pos2)
+			for {
+				if s1 == s2 {
+					c1 := rb.highlowcontainer.getContainerAtIndex(pos1)
+					c2 := other.highlowcontainer.getContainerAtIndex(pos2)
+					if forEachContainerIntersection64(base|uint64(s1)<<16, c1, c2, fn) {
+						return true
+					}
+					pos1++
+					pos2++
+					if pos1 == length1 || pos2 == length2 {
+						break main
+					}
+					s1 = rb.highlowcontainer.getKeyAtIndex(pos1)
+					s2 = other.highlowcontainer.getKeyAtIndex(pos2)
+				} else if s1 < s2 {
+					pos1 = rb.highlowcontainer.advanceUntil(s2, pos1)
+					if pos1 == length1 {
+						break main
+					}
+					s1 = rb.highlowcontainer.getKeyAtIndex(pos1)
+				} else {
+					pos2 = other.highlowcontainer.advanceUntil(s1, pos2)
+					if pos2 == length2 {
+						break main
+					}
+					s2 = other.highlowcontainer.getKeyAtIndex(pos2)
+				}
+			}
+		} else {
+			break
+		}
+	}
+	return false
+}
+
+func (rb *bitmap32) forEach64(base uint64, fn func(uint64) bool) bool {
+	for i := 0; i < rb.highlowcontainer.size(); i++ {
+		hs := base | uint64(rb.highlowcontainer.getKeyAtIndex(i))<<16
+		if !forEachContainer64(hs, rb.highlowcontainer.getContainerAtIndex(i), fn) {
+			return false
+		}
+	}
+	return true
+}
+
+func forEachContainer64(base uint64, c container16, fn func(uint64) bool) bool {
+	switch x := c.(type) {
+	case *containerArray:
+		for i := 0; i < len(x.content); i++ {
+			if !fn(base | uint64(x.content[i])) {
+				return false
+			}
+		}
+		return true
+	case *containerBitmap:
+		for i := 0; i < len(x.bitmap); i++ {
+			word := x.bitmap[i]
+			for word != 0 {
+				v := uint64(i*64 + bits.TrailingZeros64(word))
+				if !fn(base | v) {
+					return false
+				}
+				word &= word - 1
+			}
+		}
+		return true
+	case *containerRun:
+		for i := 0; i < len(x.iv); i++ {
+			last := int(x.iv[i].last())
+			for v := int(x.iv[i].start); v <= last; v++ {
+				if !fn(base | uint64(v)) {
+					return false
+				}
+			}
+		}
+		return true
+	}
+	panic("unsupported container16 type")
+}
+
+func forEachContainerIntersection64(base uint64, left, right container16, fn func(uint64) bool) bool {
+	switch l := left.(type) {
+	case *containerArray:
+		switch r := right.(type) {
+		case *containerArray:
+			return forEachArrayArrayIntersection64(base, l.content, r.content, fn)
+		case *containerBitmap:
+			return forEachArrayBitmapIntersection64(base, l.content, r, fn)
+		case *containerRun:
+			return forEachArrayRunIntersection64(base, l.content, r, fn)
+		}
+	case *containerBitmap:
+		switch r := right.(type) {
+		case *containerArray:
+			return forEachArrayBitmapIntersection64(base, r.content, l, fn)
+		case *containerBitmap:
+			return forEachBitmapBitmapIntersection64(base, l, r, fn)
+		case *containerRun:
+			return forEachBitmapRunIntersection64(base, l, r, fn)
+		}
+	case *containerRun:
+		switch r := right.(type) {
+		case *containerArray:
+			return forEachArrayRunIntersection64(base, r.content, l, fn)
+		case *containerBitmap:
+			return forEachBitmapRunIntersection64(base, r, l, fn)
+		case *containerRun:
+			return forEachRunRunIntersection64(base, l, r, fn)
+		}
+	}
+	panic("unsupported container16 type")
+}
+
+func forEachArrayArrayIntersection64(base uint64, left, right []uint16, fn func(uint64) bool) bool {
+	if len(left) == 0 || len(right) == 0 {
+		return false
+	}
+	i := 0
+	j := 0
+	lv := left[0]
+	rv := right[0]
+	for {
+		if lv < rv {
+			i++
+			if i == len(left) {
+				return false
+			}
+			lv = left[i]
+			continue
+		}
+		if rv < lv {
+			j++
+			if j == len(right) {
+				return false
+			}
+			rv = right[j]
+			continue
+		}
+		if fn(base | uint64(lv)) {
+			return true
+		}
+		i++
+		if i == len(left) {
+			return false
+		}
+		j++
+		if j == len(right) {
+			return false
+		}
+		lv = left[i]
+		rv = right[j]
+	}
+}
+
+func forEachArrayBitmapIntersection64(base uint64, array []uint16, bitmap *containerBitmap, fn func(uint64) bool) bool {
+	for i := 0; i < len(array); i++ {
+		v := array[i]
+		if bitmap.contains(v) && fn(base|uint64(v)) {
+			return true
+		}
+	}
+	return false
+}
+
+func forEachArrayRunIntersection64(base uint64, array []uint16, run *containerRun, fn func(uint64) bool) bool {
+	for i := 0; i < len(array); i++ {
+		v := array[i]
+		if run.contains(v) && fn(base|uint64(v)) {
+			return true
+		}
+	}
+	return false
+}
+
+func forEachBitmapBitmapIntersection64(base uint64, left, right *containerBitmap, fn func(uint64) bool) bool {
+	for i := 0; i < len(left.bitmap); i++ {
+		word := left.bitmap[i] & right.bitmap[i]
+		for word != 0 {
+			v := uint64(i*64 + bits.TrailingZeros64(word))
+			if fn(base | v) {
+				return true
+			}
+			word &= word - 1
+		}
+	}
+	return false
+}
+
+func forEachBitmapRunIntersection64(base uint64, bitmap *containerBitmap, run *containerRun, fn func(uint64) bool) bool {
+	const allones = ^uint64(0)
+
+	for i := 0; i < len(run.iv); i++ {
+		start := int(run.iv[i].start)
+		end := int(run.iv[i].last()) + 1
+		firstWord := start / 64
+		endWord := (end - 1) / 64
+		if firstWord == endWord {
+			mask := (allones << uint(start&63)) & (allones >> (uint(-end) & 63))
+			word := bitmap.bitmap[firstWord] & mask
+			for word != 0 {
+				v := uint64(firstWord*64 + bits.TrailingZeros64(word))
+				if fn(base | v) {
+					return true
+				}
+				word &= word - 1
+			}
+			continue
+		}
+
+		word := bitmap.bitmap[firstWord] & (allones << uint(start&63))
+		for word != 0 {
+			v := uint64(firstWord*64 + bits.TrailingZeros64(word))
+			if fn(base | v) {
+				return true
+			}
+			word &= word - 1
+		}
+		for idx := firstWord + 1; idx < endWord; idx++ {
+			word = bitmap.bitmap[idx]
+			for word != 0 {
+				v := uint64(idx*64 + bits.TrailingZeros64(word))
+				if fn(base | v) {
+					return true
+				}
+				word &= word - 1
+			}
+		}
+		word = bitmap.bitmap[endWord] & (allones >> (uint(-end) & 63))
+		for word != 0 {
+			v := uint64(endWord*64 + bits.TrailingZeros64(word))
+			if fn(base | v) {
+				return true
+			}
+			word &= word - 1
+		}
+	}
+	return false
+}
+
+func forEachRunRunIntersection64(base uint64, left, right *containerRun, fn func(uint64) bool) bool {
+	i := 0
+	j := 0
+	for i < len(left.iv) && j < len(right.iv) {
+		leftStart := int(left.iv[i].start)
+		leftLast := int(left.iv[i].last())
+		rightStart := int(right.iv[j].start)
+		rightLast := int(right.iv[j].last())
+
+		start := leftStart
+		if rightStart > start {
+			start = rightStart
+		}
+		last := leftLast
+		if rightLast < last {
+			last = rightLast
+		}
+		for v := start; v <= last; v++ {
+			if fn(base | uint64(v)) {
+				return true
+			}
+		}
+		if leftLast < rightLast {
+			i++
+		} else {
+			j++
 		}
 	}
 	return false
@@ -1357,6 +1776,47 @@ func (rb *bitmap32) or(x2 *bitmap32) {
 	}
 }
 
+func (rb *bitmap32) orFresh(x2 *bitmap32) *bitmap32 {
+	out := getBitmap32()
+	pos1 := 0
+	pos2 := 0
+	length1 := rb.highlowcontainer.size()
+	length2 := x2.highlowcontainer.size()
+
+	for pos1 < length1 && pos2 < length2 {
+		s1 := rb.highlowcontainer.getKeyAtIndex(pos1)
+		s2 := x2.highlowcontainer.getKeyAtIndex(pos2)
+		if s1 < s2 {
+			out.highlowcontainer.appendContainer(s1, rb.highlowcontainer.getContainerAtIndex(pos1).retain())
+			pos1++
+			continue
+		}
+		if s2 < s1 {
+			out.highlowcontainer.appendContainer(s2, x2.highlowcontainer.getContainerAtIndex(pos2).clone())
+			pos2++
+			continue
+		}
+		out.highlowcontainer.appendContainer(s1, rb.highlowcontainer.getContainerAtIndex(pos1).or(x2.highlowcontainer.getContainerAtIndex(pos2)))
+		pos1++
+		pos2++
+	}
+	for pos1 < length1 {
+		out.highlowcontainer.appendContainer(
+			rb.highlowcontainer.getKeyAtIndex(pos1),
+			rb.highlowcontainer.getContainerAtIndex(pos1).retain(),
+		)
+		pos1++
+	}
+	for pos2 < length2 {
+		out.highlowcontainer.appendContainer(
+			x2.highlowcontainer.getKeyAtIndex(pos2),
+			x2.highlowcontainer.getContainerAtIndex(pos2).clone(),
+		)
+		pos2++
+	}
+	return out
+}
+
 func (rb *bitmap32) xorKeyCount(x2 *bitmap32) int {
 	pos1 := 0
 	pos2 := 0
@@ -1459,6 +1919,62 @@ main:
 	rb.highlowcontainer.resize(intersectionsize)
 }
 
+func (rb *bitmap32) andNotFresh(x2 *bitmap32) *bitmap32 {
+	out := getBitmap32()
+	pos1 := 0
+	pos2 := 0
+	length1 := rb.highlowcontainer.size()
+	length2 := x2.highlowcontainer.size()
+
+main:
+	for {
+		if pos1 < length1 && pos2 < length2 {
+			s1 := rb.highlowcontainer.getKeyAtIndex(pos1)
+			s2 := x2.highlowcontainer.getKeyAtIndex(pos2)
+			for {
+				if s1 == s2 {
+					c := rb.highlowcontainer.getContainerAtIndex(pos1).andNot(x2.highlowcontainer.getContainerAtIndex(pos2))
+					if !c.isEmpty() {
+						out.highlowcontainer.appendContainer(s1, c)
+					} else {
+						c.release()
+					}
+					pos1++
+					pos2++
+					if pos1 == length1 || pos2 == length2 {
+						break main
+					}
+					s1 = rb.highlowcontainer.getKeyAtIndex(pos1)
+					s2 = x2.highlowcontainer.getKeyAtIndex(pos2)
+				} else if s1 < s2 {
+					out.highlowcontainer.appendContainer(s1, rb.highlowcontainer.getContainerAtIndex(pos1).retain())
+					pos1++
+					if pos1 == length1 {
+						break main
+					}
+					s1 = rb.highlowcontainer.getKeyAtIndex(pos1)
+				} else {
+					pos2 = x2.highlowcontainer.advanceUntil(s1, pos2)
+					if pos2 == length2 {
+						break main
+					}
+					s2 = x2.highlowcontainer.getKeyAtIndex(pos2)
+				}
+			}
+		} else {
+			break
+		}
+	}
+	for pos1 < length1 {
+		out.highlowcontainer.appendContainer(
+			rb.highlowcontainer.getKeyAtIndex(pos1),
+			rb.highlowcontainer.getContainerAtIndex(pos1).retain(),
+		)
+		pos1++
+	}
+	return out
+}
+
 // xorBitmap32 computes the symmetric difference between two bitmaps and returns the result.
 func xorBitmap32(x1, x2 *bitmap32) *bitmap32 {
 	answer := x1.clone()
@@ -1477,6 +1993,10 @@ const (
 
 // WriteTo writes a posting-owned serialized version of this bitmap to stream.
 func (rb *bitmap32) WriteTo(stream io.Writer) (int64, error) {
+	if writer, ok := stream.(*bufio.Writer); ok {
+		return rb.writeToBufio(writer)
+	}
+
 	var (
 		n      int64
 		header [bitmap32WireContainerHeaderSize]byte
@@ -1519,8 +2039,69 @@ func (rb *bitmap32) WriteTo(stream io.Writer) (int64, error) {
 	return n, nil
 }
 
+func (rb *bitmap32) writeToBufio(writer *bufio.Writer) (int64, error) {
+	var n int64
+
+	containerCount := rb.highlowcontainer.size()
+	written, err := writeLEUint32(writer, uint32(containerCount))
+	n += int64(written)
+	if err != nil {
+		return n, err
+	}
+
+	for i := 0; i < containerCount; i++ {
+		key := rb.highlowcontainer.getKeyAtIndex(i)
+		container := rb.highlowcontainer.getContainerAtIndex(i)
+
+		kind, meta, payload, err := bitmap32WireEncoding(container)
+		if err != nil {
+			return n, err
+		}
+
+		written, err = writeBitmap32WireContainerHeader(writer, key, kind, meta)
+		n += int64(written)
+		if err != nil {
+			return n, err
+		}
+
+		written, err = writer.Write(payload)
+		n += int64(written)
+		if err != nil {
+			return n, err
+		}
+	}
+
+	return n, nil
+}
+
+func writeBitmap32WireContainerHeader(writer *bufio.Writer, key uint16, kind byte, meta uint16) (int, error) {
+	if writer.Available() >= bitmap32WireContainerHeaderSize {
+		buf := writer.AvailableBuffer()
+		buf = binary.LittleEndian.AppendUint16(buf, key)
+		buf = append(buf, kind)
+		buf = binary.LittleEndian.AppendUint16(buf, meta)
+		return writer.Write(buf)
+	}
+
+	written, err := writeLEUint16(writer, key)
+	if err != nil {
+		return written, err
+	}
+	if err = writer.WriteByte(kind); err != nil {
+		return written, err
+	}
+	written++
+	n, err := writeLEUint16(writer, meta)
+	written += n
+	return written, err
+}
+
 // ReadFrom reads a posting-owned serialized version of this bitmap from stream.
 func (rb *bitmap32) ReadFrom(reader io.Reader) (p int64, err error) {
+	if bufReader, ok := reader.(*bufio.Reader); ok {
+		return rb.readFromBufio(bufReader)
+	}
+
 	var header [bitmap32WireContainerHeaderSize]byte
 	var prevKey uint16
 
@@ -1559,6 +2140,83 @@ func (rb *bitmap32) ReadFrom(reader io.Reader) (p int64, err error) {
 		p += readBytes
 		if readErr != nil {
 			err = fmt.Errorf("bitmap32 read container #%d: %w", i, readErr)
+			return p, err
+		}
+
+		rb.highlowcontainer.keys[i] = key
+		rb.highlowcontainer.containers[i] = container
+	}
+
+	return p, nil
+}
+
+func (rb *bitmap32) readFromBufio(reader *bufio.Reader) (p int64, err error) {
+	var prevKey uint16
+
+	countBytes, err := reader.Peek(bitmap32WireHeaderSize)
+	var containerCount int
+	if err == nil {
+		containerCount = int(binary.LittleEndian.Uint32(countBytes))
+		if _, err = reader.Discard(bitmap32WireHeaderSize); err != nil {
+			return 0, err
+		}
+		p = bitmap32WireHeaderSize
+	} else {
+		var header [bitmap32WireContainerHeaderSize]byte
+		n, readErr := readFullBufio(reader, header[:bitmap32WireHeaderSize])
+		p += int64(n)
+		if readErr != nil {
+			return p, readErr
+		}
+		containerCount = int(binary.LittleEndian.Uint32(header[:bitmap32WireHeaderSize]))
+	}
+
+	if containerCount > maxCapacity {
+		return p, fmt.Errorf("bitmap32 container count exceeds %d: %d", maxCapacity, containerCount)
+	}
+
+	rb.highlowcontainer.clear()
+	rb.highlowcontainer.setSize(containerCount)
+
+	for i := 0; i < containerCount; i++ {
+		headerBytes, peekErr := reader.Peek(bitmap32WireContainerHeaderSize)
+		var key uint16
+		var kind byte
+		var meta uint16
+		if peekErr == nil {
+			key = binary.LittleEndian.Uint16(headerBytes[0:2])
+			kind = headerBytes[2]
+			meta = binary.LittleEndian.Uint16(headerBytes[3:5])
+			if _, err = reader.Discard(bitmap32WireContainerHeaderSize); err != nil {
+				rb.highlowcontainer.clear()
+				return p, err
+			}
+			p += bitmap32WireContainerHeaderSize
+		} else {
+			var header [bitmap32WireContainerHeaderSize]byte
+			n, readErr := readFullBufio(reader, header[:])
+			p += int64(n)
+			if readErr != nil {
+				rb.highlowcontainer.clear()
+				return p, fmt.Errorf("bitmap32 read container header #%d: %w", i, readErr)
+			}
+			key = binary.LittleEndian.Uint16(header[0:2])
+			kind = header[2]
+			meta = binary.LittleEndian.Uint16(header[3:5])
+		}
+
+		if i != 0 && key <= prevKey {
+			err = fmt.Errorf("bitmap32 keys are not strictly increasing")
+			rb.highlowcontainer.clear()
+			return p, err
+		}
+		prevKey = key
+
+		container, readBytes, readErr := readBitmap32WireContainerBufio(reader, kind, meta)
+		p += readBytes
+		if readErr != nil {
+			err = fmt.Errorf("bitmap32 read container #%d: %w", i, readErr)
+			rb.highlowcontainer.clear()
 			return p, err
 		}
 
@@ -1704,8 +2362,65 @@ func readBitmap32WireContainer(reader io.Reader, kind byte, meta uint16) (contai
 	}
 }
 
+func readBitmap32WireContainerBufio(reader *bufio.Reader, kind byte, meta uint16) (container16, int64, error) {
+	switch kind {
+	case bitmap32WireContainerArray:
+		cardinality := int(meta) + 1
+		container := getContainerArrayWithLen(cardinality)
+		readBytes, err := readBitmap32ArrayBufio(reader, container)
+		if err != nil {
+			container.release()
+			return nil, readBytes, err
+		}
+		if err := validateBitmap32ArrayContainer(container); err != nil {
+			container.release()
+			return nil, readBytes, err
+		}
+		return container, readBytes, nil
+	case bitmap32WireContainerBitmap:
+		cardinality := int(meta) + 1
+		if cardinality <= arrayDefaultMaxSize {
+			return nil, 0, fmt.Errorf("invalid containerBitmap cardinality %d", cardinality)
+		}
+		container := newContainerBitmap()
+		container.cardinality = cardinality
+		readBytes, err := readBitmap32BitmapBufio(reader, container)
+		if err != nil {
+			container.release()
+			return nil, readBytes, err
+		}
+		if err := validateBitmap32BitmapContainer(container); err != nil {
+			container.release()
+			return nil, readBytes, err
+		}
+		return container, readBytes, nil
+	case bitmap32WireContainerRun:
+		intervalCount := int(meta) + 1
+		container := getRunContainer()
+		container.iv = slices.Grow(container.iv, intervalCount)
+		container.iv = container.iv[:intervalCount]
+		readBytes, err := readBitmap32RunBufio(reader, container)
+		if err != nil {
+			container.release()
+			return nil, readBytes, err
+		}
+		if err := validateBitmap32RunContainer(container); err != nil {
+			container.release()
+			return nil, readBytes, err
+		}
+		return container, readBytes, nil
+	default:
+		return nil, 0, fmt.Errorf("invalid bitmap32 container kind %d", kind)
+	}
+}
+
 func readBitmap32Array(reader io.Reader, container *containerArray) (int64, error) {
 	n, err := io.ReadFull(reader, uint16SliceAsByteSlice(container.content))
+	return int64(n), err
+}
+
+func readBitmap32ArrayBufio(reader *bufio.Reader, container *containerArray) (int64, error) {
+	n, err := readFullBufio(reader, uint16SliceAsByteSlice(container.content))
 	return int64(n), err
 }
 
@@ -1714,7 +2429,17 @@ func readBitmap32Bitmap(reader io.Reader, container *containerBitmap) (int64, er
 	return int64(n), err
 }
 
+func readBitmap32BitmapBufio(reader *bufio.Reader, container *containerBitmap) (int64, error) {
+	n, err := readFullBufio(reader, uint64SliceAsByteSlice(container.bitmap))
+	return int64(n), err
+}
+
 func readBitmap32Run(reader io.Reader, container *containerRun) (int64, error) {
 	n, err := io.ReadFull(reader, interval16SliceAsByteSlice(container.iv))
+	return int64(n), err
+}
+
+func readBitmap32RunBufio(reader *bufio.Reader, container *containerRun) (int64, error) {
+	n, err := readFullBufio(reader, interval16SliceAsByteSlice(container.iv))
 	return int64(n), err
 }

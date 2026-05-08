@@ -52,10 +52,8 @@ func equalArrayBitmap(ac *containerArray, bc *containerBitmap) bool {
 	if len(ac.content) != bc.cardinality {
 		return false
 	}
-	ait := shortIterator{slice: ac.content}
-	bit := bitmapContainerShortIterator{ptr: bc, i: bc.nextSetBit(0)}
-	for ait.hasNext() {
-		if ait.next() != bit.next() {
+	for i := 0; i < len(ac.content); i++ {
+		if bc.bitValue(ac.content[i]) == 0 {
 			return false
 		}
 	}
@@ -78,19 +76,43 @@ func equalArrayRun(ac *containerArray, rc *containerRun) bool {
 }
 
 func equalBitmapRun(bc *containerBitmap, rc *containerRun) bool {
-	bit := bitmapContainerShortIterator{ptr: bc, i: bc.nextSetBit(0)}
-	remaining := bc.cardinality
+	if len(rc.iv) == 0 {
+		return bc.cardinality == 0
+	}
+	if bc.minimum() != rc.minimum() || bc.maximum() != rc.maximum() {
+		return false
+	}
+
+	const allones = ^uint64(0)
+	cardinality := 0
 	for i := range rc.iv {
 		start := int(rc.iv[i].start)
-		end := int(rc.iv[i].last())
-		for value := start; value <= end; value++ {
-			if !bit.hasNext() || bit.next() != uint16(value) {
+		end := int(rc.iv[i].last()) + 1
+		cardinality += end - start
+		firstWord := start / 64
+		endWord := (end - 1) / 64
+		if firstWord == endWord {
+			mask := (allones << uint(start&63)) & (allones >> (uint(-end) & 63))
+			if bc.bitmap[firstWord]&mask != mask {
 				return false
 			}
-			remaining--
+			continue
+		}
+		mask := allones << uint(start&63)
+		if bc.bitmap[firstWord]&mask != mask {
+			return false
+		}
+		for idx := firstWord + 1; idx < endWord; idx++ {
+			if bc.bitmap[idx] != allones {
+				return false
+			}
+		}
+		mask = allones >> (uint(-end) & 63)
+		if bc.bitmap[endWord]&mask != mask {
+			return false
 		}
 	}
-	return remaining == 0
+	return cardinality == bc.cardinality
 }
 
 type containerIndex struct {
