@@ -171,8 +171,8 @@ func TestNewFieldIndexChunkRefsFromEntries_StringChunksRespectOffsetLimit(t *tes
 	if len(flat) != total {
 		t.Fatalf("unexpected flattened len: got %d want %d", len(flat), total)
 	}
-	defer PutFieldEntrySlice(flat)
-	defer pooled.PutByteSlice(data)
+	defer ReleaseFieldEntrySlice(flat)
+	defer pooled.ReleaseByteSlice(data)
 	for i := range flat {
 		if got := flat[i].Key.UnsafeString(); got != wantKeys[i] {
 			t.Fatalf("key[%d]: got %q want %q", i, got, wantKeys[i])
@@ -194,7 +194,7 @@ func TestNewFieldIndexChunkRefsFromEntries_StringChunksPreserveBalancedTail(t *t
 	if refs == nil {
 		t.Fatalf("expected chunk refs")
 	}
-	defer putOwnedFieldIndexChunkRefSlice(refs)
+	defer releaseOwnedFieldIndexChunkRefSlice(refs)
 	if len(refs) != 3 {
 		t.Fatalf("unexpected chunk count: got %d want 3", len(refs))
 	}
@@ -237,8 +237,8 @@ func TestFlattenChunkedFieldIndexRoot_RoundTrip(t *testing.T) {
 	if flat == nil {
 		t.Fatalf("expected flattened slice")
 	}
-	defer PutFieldEntrySlice(flat)
-	defer pooled.PutByteSlice(data)
+	defer ReleaseFieldEntrySlice(flat)
+	defer pooled.ReleaseByteSlice(data)
 	if len(flat) != len(entries) {
 		t.Fatalf("unexpected materialized len: got %d want %d", len(flat), len(entries))
 	}
@@ -376,8 +376,8 @@ func TestFieldIndexChunkStreamBuilder_RoundTripAfterFlushes(t *testing.T) {
 			if flat == nil {
 				t.Fatalf("expected flattened slice")
 			}
-			defer PutFieldEntrySlice(flat)
-			defer pooled.PutByteSlice(data)
+			defer ReleaseFieldEntrySlice(flat)
+			defer pooled.ReleaseByteSlice(data)
 			if len(flat) != total {
 				t.Fatalf("unexpected flattened len: got %d want %d", len(flat), total)
 			}
@@ -495,13 +495,13 @@ func TestFieldStorageFromRunsOwned_MergesStringRuns(t *testing.T) {
 	left := GetPostingMap()
 	left["name"] = fieldStoragePosting(777)
 	runLeft := NewStringFieldStorageRunFromPostingMap(left)
-	PutPostingMap(left)
+	ReleasePostingMap(left)
 
 	right := GetPostingMap()
 	right["name"] = fieldStoragePosting(1, 2)
 	right["zip"] = fieldStoragePosting(9)
 	runRight := NewStringFieldStorageRunFromPostingMap(right)
-	PutPostingMap(right)
+	ReleasePostingMap(right)
 
 	storage := NewRegularFieldStorageFromRunsOwned([]FieldStorageRun{runLeft, runRight})
 	defer storage.Release()
@@ -524,7 +524,7 @@ func TestFieldStorageRunFromPostingMapOwned_DrainsMaps(t *testing.T) {
 	if len(strings) != 0 {
 		t.Fatalf("string map retained entries after run construction")
 	}
-	PutPostingMap(strings)
+	ReleasePostingMap(strings)
 	if stringRun.KeyCount() != 2 {
 		t.Fatalf("string run key count: got %d want 2", stringRun.KeyCount())
 	}
@@ -542,7 +542,7 @@ func TestFieldStorageRunFromPostingMapOwned_DrainsMaps(t *testing.T) {
 	if len(fixed) != 0 {
 		t.Fatalf("fixed map retained entries after run construction")
 	}
-	PutFixedPostingMap(fixed)
+	ReleaseFixedPostingMap(fixed)
 	if fixedRun.KeyCount() != 2 {
 		t.Fatalf("fixed run key count: got %d want 2", fixedRun.KeyCount())
 	}
@@ -555,13 +555,13 @@ func TestFieldStorageFromRunsOwned_MergesFixedRuns(t *testing.T) {
 	left := GetFixedPostingMap()
 	left[4] = fieldStoragePosting(40)
 	runLeft := NewFixedFieldStorageRunFromPostingMap(left)
-	PutFixedPostingMap(left)
+	ReleaseFixedPostingMap(left)
 
 	right := GetFixedPostingMap()
 	right[2] = fieldStoragePosting(20)
 	right[4] = fieldStoragePosting(41, 42)
 	runRight := NewFixedFieldStorageRunFromPostingMap(right)
-	PutFixedPostingMap(right)
+	ReleaseFixedPostingMap(right)
 
 	runs := []FieldStorageRun{runLeft, runRight}
 	storage := NewRegularFieldStorageFromRunsOwned(runs)
@@ -583,14 +583,14 @@ func TestFieldStorageFromRunsOwned_FixedRunsChunkAtThreshold(t *testing.T) {
 		left[uint64(i*2)] = fieldStorageOwnedTestPosting(uint64(i + 1))
 	}
 	runLeft := NewFixedFieldStorageRunFromPostingMap(left)
-	PutFixedPostingMap(left)
+	ReleaseFixedPostingMap(left)
 
 	right := GetFixedPostingMap()
 	for i := FieldChunkThreshold / 2; i < FieldChunkThreshold; i++ {
 		right[uint64(i*2)] = fieldStorageOwnedTestPosting(uint64(i + 1))
 	}
 	runRight := NewFixedFieldStorageRunFromPostingMap(right)
-	PutFixedPostingMap(right)
+	ReleaseFixedPostingMap(right)
 
 	storage := NewRegularFieldStorageFromRunsOwned([]FieldStorageRun{runLeft, runRight})
 	defer storage.Release()

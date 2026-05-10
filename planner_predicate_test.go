@@ -225,7 +225,7 @@ func TestPredicatePostsAnyNotRuntimeApplyToPosting(t *testing.T) {
 		posting.BuildFromSorted([]uint64{1, 4, 7}),
 		posting.BuildFromSorted([]uint64{3, 5, 7}),
 	)
-	defer posting.PutSlice(posts)
+	defer posting.ReleaseSlice(posts)
 	defer func() {
 		for i := 0; i < len(posts); i++ {
 			posts[i].Release()
@@ -1343,14 +1343,14 @@ func TestBuildPredicatesOrderedBuf_CoveredExactRangeWarmCacheHitLoadsWhenPredica
 	view := db.engine.currentQueryViewForTests()
 	defer db.engine.releaseQueryView(view)
 
-	compiled := exprSlicePool.Get()
-	defer exprSlicePool.Put(compiled)
-	compiled.Append(mustTestQIRExprForDB(t, db, qx.GTE("age", 30)))
-	compiled.Append(mustTestQIRExprForDB(t, db, qx.LTE("age", 250)))
+	compiled := qir.GetExprSlice(2)
+	defer qir.ReleaseExprSlice(compiled)
+	compiled = append(compiled, mustTestQIRExprForDB(t, db, qx.GTE("age", 30)))
+	compiled = append(compiled, mustTestQIRExprForDB(t, db, qx.LTE("age", 250)))
 
-	warm, ok := view.buildPredicatesOrderedWithModeBuf(compiled, "score", false, 4096, 0, false, false)
+	warm, ok := view.buildPredicatesOrderedWithMode(compiled, "score", false, 4096, 0, false, false)
 	if !ok {
-		t.Fatalf("warm buildPredicatesOrderedWithModeBuf: ok=false")
+		t.Fatalf("warm buildPredicatesOrderedWithMode: ok=false")
 	}
 	if warm.Len() != 1 {
 		warm.Release()
@@ -1377,9 +1377,9 @@ func TestBuildPredicatesOrderedBuf_CoveredExactRangeWarmCacheHitLoadsWhenPredica
 	}
 	cached.Release()
 
-	preds, ok := view.buildPredicatesOrderedWithModeBuf(compiled, "score", false, 4096, 0, true, true)
+	preds, ok := view.buildPredicatesOrderedWithMode(compiled, "score", false, 4096, 0, true, true)
 	if !ok {
-		t.Fatalf("buildPredicatesOrderedWithModeBuf: ok=false")
+		t.Fatalf("buildPredicatesOrderedWithMode: ok=false")
 	}
 	defer preds.Release()
 	if preds.Len() != 1 {
@@ -2190,7 +2190,7 @@ func TestBuildPredicateWithMode_RuntimeExactUnionPromotesOnSecondMaterialize(t *
 		vals := pooled.GetStringSlice(2)
 		vals = append(vals, "DE", "FR")
 		cacheKey := materializedPredKeyForDistinctSetTerms("country", compileScalarOpForTest(qx.OpIN), vals, false)
-		pooled.PutStringSlice(vals)
+		pooled.ReleaseStringSlice(vals)
 
 		run(t,
 			qx.IN("country", []string{"DE", "FR"}),
@@ -2217,7 +2217,7 @@ func TestBuildPredicateWithMode_RuntimeExactUnionPromotesOnSecondMaterialize(t *
 		vals := pooled.GetStringSlice(2)
 		vals = append(vals, "db", "go")
 		cacheKey := materializedPredKeyForDistinctSetTerms("tags", compileScalarOpForTest(qx.OpHASANY), vals, false)
-		pooled.PutStringSlice(vals)
+		pooled.ReleaseStringSlice(vals)
 
 		run(t,
 			qx.HASANY("tags", []string{"go", "db"}),
@@ -2247,7 +2247,7 @@ func TestBuildPredicateWithMode_RuntimeExactUnionPromotesOnSecondMaterialize(t *
 		vals := pooled.GetStringSlice(2)
 		vals = append(vals, "DE", "FR")
 		cacheKey := materializedPredKeyForDistinctSetTerms("country", compileScalarOpForTest(qx.OpIN), vals, false)
-		pooled.PutStringSlice(vals)
+		pooled.ReleaseStringSlice(vals)
 
 		run(t,
 			qx.NOT(qx.IN("country", []string{"DE", "FR"})),
@@ -2274,7 +2274,7 @@ func TestBuildPredicateWithMode_RuntimeExactUnionPromotesOnSecondMaterialize(t *
 		vals := pooled.GetStringSlice(2)
 		vals = append(vals, "db", "go")
 		cacheKey := materializedPredKeyForDistinctSetTerms("tags", compileScalarOpForTest(qx.OpHASANY), vals, false)
-		pooled.PutStringSlice(vals)
+		pooled.ReleaseStringSlice(vals)
 
 		run(t,
 			qx.NOT(qx.HASANY("tags", []string{"go", "db"})),
@@ -2329,7 +2329,7 @@ func TestBuildPredicateWithMode_HasPromotesOnSecondBuild(t *testing.T) {
 	vals := pooled.GetStringSlice(2)
 	vals = append(vals, "db", "go")
 	cacheKey := materializedPredKeyForDistinctSetTerms("tags", compileScalarOpForTest(qx.OpHASALL), vals, false)
-	pooled.PutStringSlice(vals)
+	pooled.ReleaseStringSlice(vals)
 
 	expr := qx.HASALL("tags", []string{"go", "db"})
 

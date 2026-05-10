@@ -318,7 +318,7 @@ func TestLeafPred_PostsAnyStateContainsIdxAndCountBucketUseRuntimeState(t *testi
 		for i := 0; i < len(postsBuf); i++ {
 			postsBuf[i].Release()
 		}
-		posting.PutSlice(postsBuf)
+		posting.ReleaseSlice(postsBuf)
 	}()
 
 	if !pred.containsIdx(7) {
@@ -488,7 +488,7 @@ func TestPostingUnionBufIter_SmallUnionAllocsPerRunStayZeroAfterWarmup(t *testin
 
 	postsBuf := posting.GetSlice(3)
 	postsBuf = append(postsBuf, posts[0], posts[1], posts[2])
-	defer posting.PutSlice(postsBuf)
+	defer posting.ReleaseSlice(postsBuf)
 
 	warm := newPostingUnionIter(postsBuf)
 	if warm != nil {
@@ -1752,7 +1752,7 @@ func TestQuery_OrderBasic_ComplementCachedBaseOpCountsAsMaterialized(t *testing.
 	baseOps := filterQIRLeavesByField(db, leaves, "score")
 	coresBuf, rawCoreIdxBuf := mustPrepareOrderBasicBaseCoresForTest(t, view, baseOps)
 	defer orderBasicBaseCoreSlicePool.Put(coresBuf)
-	defer pooled.PutIntSlice(rawCoreIdxBuf)
+	defer pooled.ReleaseIntSlice(rawCoreIdxBuf)
 	if !view.hasWarmOrderBasicBaseCores(coresBuf) {
 		_, gteHit := db.engine.getSnapshot().loadMaterializedPred(gteComplementKey)
 		_, lteHit := db.engine.getSnapshot().loadMaterializedPred(lteScalarKey)
@@ -1793,7 +1793,7 @@ func TestQuery_OrderBasic_WarmQueryLoadsCollapsedNumericRangeSpan(t *testing.T) 
 	baseOps := filterQIRLeavesByField(db, leaves, "score")
 	coresBuf, rawCoreIdxBuf := mustPrepareOrderBasicBaseCoresForTest(t, view, baseOps)
 	defer orderBasicBaseCoreSlicePool.Put(coresBuf)
-	defer pooled.PutIntSlice(rawCoreIdxBuf)
+	defer pooled.ReleaseIntSlice(rawCoreIdxBuf)
 	collapsed := mustFindCollapsedOrderBasicBaseCoreForTest(t, coresBuf)
 	view.promoteOrderBasicLimitMaterializedBaseOps("score", baseOps, 250, 100)
 	spanHit, ok := view.loadWarmOrderBasicBaseCore(collapsed)
@@ -1884,7 +1884,7 @@ func TestQuery_OrderBasic_WarmQueryPromotesMaterializedRangeBaseOps(t *testing.T
 	baseOps := filterQIRLeavesByField(db, leaves, "score")
 	coresBuf, rawCoreIdxBuf := mustPrepareOrderBasicBaseCoresForTest(t, view, baseOps)
 	defer orderBasicBaseCoreSlicePool.Put(coresBuf)
-	defer pooled.PutIntSlice(rawCoreIdxBuf)
+	defer pooled.ReleaseIntSlice(rawCoreIdxBuf)
 	collapsed := mustFindCollapsedOrderBasicBaseCoreForTest(t, coresBuf)
 	if !view.hasWarmOrderBasicBaseCores(coresBuf) {
 		var missing []string
@@ -1948,7 +1948,7 @@ func TestQuery_OrderBasic_WarmAnalyticsRangeUsesLimitOrderBasicPlan(t *testing.T
 	baseOps := filterQIRLeavesByField(db, leaves, "score")
 	coresBuf, rawCoreIdxBuf := mustPrepareOrderBasicBaseCoresForTest(t, view, baseOps)
 	defer orderBasicBaseCoreSlicePool.Put(coresBuf)
-	defer pooled.PutIntSlice(rawCoreIdxBuf)
+	defer pooled.ReleaseIntSlice(rawCoreIdxBuf)
 	collapsed := mustFindCollapsedOrderBasicBaseCoreForTest(t, coresBuf)
 	if hit, ok := view.loadWarmOrderBasicBaseCore(collapsed); !ok {
 		db.engine.releaseQueryView(view)

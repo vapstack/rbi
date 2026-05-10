@@ -115,20 +115,20 @@ func (deltas *MeasureDeltaBatch) Release() {
 		ordinal := deltas.touched[i]
 		buf := deltas.fields[ordinal]
 		if buf != nil {
-			PutMeasureDeltaSlice(buf)
+			ReleaseMeasureDeltaSlice(buf)
 			deltas.fields[ordinal] = nil
 		}
 	}
 	measureDeltaSlotSlicePool.Put(deltas.fields)
 	deltas.fields = nil
-	pooled.PutIntSlice(deltas.touched)
+	pooled.ReleaseIntSlice(deltas.touched)
 	deltas.touched = nil
 }
 
 func ReleaseMeasureEntryBufs(bufs [][]MeasureEntry) {
 	for i := range bufs {
 		if bufs[i] != nil {
-			PutMeasureEntrySlice(bufs[i])
+			ReleaseMeasureEntrySlice(bufs[i])
 			bufs[i] = nil
 		}
 	}
@@ -149,7 +149,7 @@ func NewMeasureStorageFromEntriesOwned(entries []MeasureEntry) MeasureStorage {
 	}
 
 	if len(entries) == 0 {
-		PutMeasureEntrySlice(entries)
+		ReleaseMeasureEntrySlice(entries)
 		return MeasureStorage{}
 	}
 	sortMeasureEntryBuf(entries)
@@ -173,7 +173,7 @@ func newMeasureFlatStorageFromEntriesOwned(entries []MeasureEntry) MeasureStorag
 	}
 	root.refs.Store(1)
 
-	PutMeasureEntrySlice(entries)
+	ReleaseMeasureEntrySlice(entries)
 
 	return MeasureStorage{flat: root}
 }
@@ -189,14 +189,14 @@ func newMeasureChunkedStorageFromEntriesOwned(entries []MeasureEntry) MeasureSto
 	}
 	root.refs.Store(1)
 
-	PutMeasureEntrySlice(entries)
+	ReleaseMeasureEntrySlice(entries)
 
 	return MeasureStorage{chunked: root}
 }
 
-func (root *measureChunkedRoot) appendEntryRangeAsChunk(entries []MeasureEntry, start int, end int) {
+func (r *measureChunkedRoot) appendEntryRangeAsChunk(entries []MeasureEntry, start int, end int) {
 	chunk := newMeasureChunkFromEntryRange(entries, start, end)
-	root.appendChunkRef(chunk)
+	r.appendChunkRef(chunk)
 }
 
 func newMeasureChunkFromEntryRange(entries []MeasureEntry, start int, end int) *measureChunk {
@@ -213,31 +213,31 @@ func newMeasureChunkFromEntryRange(entries []MeasureEntry, start int, end int) *
 	return chunk
 }
 
-func (root *measureChunkedRoot) appendChunkRef(chunk *measureChunk) {
+func (r *measureChunkedRoot) appendChunkRef(chunk *measureChunk) {
 	rows := len(chunk.ids)
-	root.refsByID = append(root.refsByID, measureChunkRef{
+	r.refsByID = append(r.refsByID, measureChunkRef{
 		LastID: chunk.ids[rows-1],
 		chunk:  chunk,
 	})
-	root.rows += rows
+	r.rows += rows
 }
 
-func (base MeasureStorage) ApplyDeltasOwned(deltas []MeasureDelta) MeasureStorage {
+func (s MeasureStorage) ApplyDeltasOwned(deltas []MeasureDelta) MeasureStorage {
 	if deltas == nil {
-		return base
+		return s
 	}
 
 	if len(deltas) == 0 {
-		PutMeasureDeltaSlice(deltas)
-		return base
+		ReleaseMeasureDeltaSlice(deltas)
+		return s
 	}
 	sortMeasureBatchDeltaBuf(deltas)
 
-	if base.flat != nil {
-		return base.flat.applyDeltasOwned(deltas)
+	if s.flat != nil {
+		return s.flat.applyDeltasOwned(deltas)
 	}
-	if base.chunked != nil {
-		return base.chunked.applyDeltasOwned(deltas)
+	if s.chunked != nil {
+		return s.chunked.applyDeltasOwned(deltas)
 	}
 
 	entries := GetMeasureEntrySlice(0)
@@ -248,23 +248,23 @@ func (base MeasureStorage) ApplyDeltasOwned(deltas []MeasureDelta) MeasureStorag
 		}
 	}
 
-	PutMeasureDeltaSlice(deltas)
+	ReleaseMeasureDeltaSlice(deltas)
 
 	return NewMeasureStorageFromEntriesOwned(entries)
 }
 
-func (base *measureFlatRoot) applyDeltasOwned(deltas []MeasureDelta) MeasureStorage {
+func (r *measureFlatRoot) applyDeltasOwned(deltas []MeasureDelta) MeasureStorage {
 	entries := GetMeasureEntrySlice(0)
 	i := 0
 	j := 0
 
-	for i < len(base.ids) && j < len(deltas) {
-		ID := base.ids[i]
+	for i < len(r.ids) && j < len(deltas) {
+		ID := r.ids[i]
 		delta := deltas[j]
 
 		switch {
 		case ID < delta.ID:
-			entries = append(entries, MeasureEntry{ID: ID, Value: base.values[i]})
+			entries = append(entries, MeasureEntry{ID: ID, Value: r.values[i]})
 			i++
 
 		case ID > delta.ID:
@@ -282,8 +282,8 @@ func (base *measureFlatRoot) applyDeltasOwned(deltas []MeasureDelta) MeasureStor
 		}
 	}
 
-	for ; i < len(base.ids); i++ {
-		entries = append(entries, MeasureEntry{ID: base.ids[i], Value: base.values[i]})
+	for ; i < len(r.ids); i++ {
+		entries = append(entries, MeasureEntry{ID: r.ids[i], Value: r.values[i]})
 	}
 
 	for ; j < len(deltas); j++ {
@@ -293,18 +293,18 @@ func (base *measureFlatRoot) applyDeltasOwned(deltas []MeasureDelta) MeasureStor
 		}
 	}
 
-	PutMeasureDeltaSlice(deltas)
+	ReleaseMeasureDeltaSlice(deltas)
 
 	return NewMeasureStorageFromEntriesOwned(entries)
 }
 
-func (base *measureChunkedRoot) applyDeltasOwned(deltas []MeasureDelta) MeasureStorage {
+func (r *measureChunkedRoot) applyDeltasOwned(deltas []MeasureDelta) MeasureStorage {
 	root := measureChunkedRootPool.Get()
 	root.refsByID = measureChunkRefSlicePool.Get(0)
 
 	deltaPos := 0
-	for chunkPos := 0; chunkPos < len(base.refsByID); chunkPos++ {
-		ref := base.refsByID[chunkPos]
+	for chunkPos := 0; chunkPos < len(r.refsByID); chunkPos++ {
+		ref := r.refsByID[chunkPos]
 		startDelta := deltaPos
 		for deltaPos < len(deltas) && deltas[deltaPos].ID <= ref.LastID {
 			deltaPos++
@@ -334,7 +334,7 @@ func (base *measureChunkedRoot) applyDeltasOwned(deltas []MeasureDelta) MeasureS
 		root.appendEntriesAsChunks(entries)
 	}
 
-	PutMeasureDeltaSlice(deltas)
+	ReleaseMeasureDeltaSlice(deltas)
 	if root.rows == 0 {
 		measureChunkedRootPool.Put(root)
 		return MeasureStorage{}
@@ -386,12 +386,12 @@ func (chunk *measureChunk) appendMergedWithDeltas(entries []MeasureEntry, deltas
 	return entries
 }
 
-func (root *measureChunkedRoot) fillTailChunkWithDeltas(deltas []MeasureDelta, deltaPos *int) {
-	if len(root.refsByID) == 0 {
+func (r *measureChunkedRoot) fillTailChunkWithDeltas(deltas []MeasureDelta, deltaPos *int) {
+	if len(r.refsByID) == 0 {
 		return
 	}
-	tailPos := len(root.refsByID) - 1
-	tail := root.refsByID[tailPos].chunk
+	tailPos := len(r.refsByID) - 1
+	tail := r.refsByID[tailPos].chunk
 	tailLen := len(tail.ids)
 
 	if tailLen >= MeasureChunkTargetRows {
@@ -414,29 +414,29 @@ func (root *measureChunkedRoot) fillTailChunkWithDeltas(deltas []MeasureDelta, d
 	*deltaPos = pos
 
 	if len(entries) == tailLen {
-		PutMeasureEntrySlice(entries)
+		ReleaseMeasureEntrySlice(entries)
 		return
 	}
 
 	chunk := newMeasureChunkFromEntryRange(entries, 0, len(entries))
-	root.refsByID[tailPos] = measureChunkRef{
+	r.refsByID[tailPos] = measureChunkRef{
 		LastID: chunk.ids[len(chunk.ids)-1],
 		chunk:  chunk,
 	}
 
-	root.rows += len(chunk.ids) - tailLen
+	r.rows += len(chunk.ids) - tailLen
 	tail.release()
 
-	PutMeasureEntrySlice(entries)
+	ReleaseMeasureEntrySlice(entries)
 }
 
-func (root *measureChunkedRoot) appendEntriesAsChunks(entries []MeasureEntry) {
+func (r *measureChunkedRoot) appendEntriesAsChunks(entries []MeasureEntry) {
 	for start := 0; start < len(entries); {
 		size := min(MeasureChunkTargetRows, len(entries)-start)
-		root.appendEntryRangeAsChunk(entries, start, start+size)
+		r.appendEntryRangeAsChunk(entries, start, start+size)
 		start += size
 	}
-	PutMeasureEntrySlice(entries)
+	ReleaseMeasureEntrySlice(entries)
 }
 
 func (s MeasureStorage) Retain() {
@@ -474,15 +474,15 @@ func (r *measureFlatRoot) release() {
 	measureFlatRootPool.Put(r)
 }
 
-func (c *measureChunk) retain() {
-	c.refs.Add(1)
+func (chunk *measureChunk) retain() {
+	chunk.refs.Add(1)
 }
 
-func (c *measureChunk) release() {
-	if c == nil || c.refs.Add(-1) != 0 {
+func (chunk *measureChunk) release() {
+	if chunk == nil || chunk.refs.Add(-1) != 0 {
 		return
 	}
-	measureChunkPool.Put(c)
+	measureChunkPool.Put(chunk)
 }
 
 func (r *measureChunkedRoot) release() {
@@ -524,7 +524,7 @@ func ReleaseMeasureStorageSlots(slots []MeasureStorage) {
 	for i := 0; i < len(slots); i++ {
 		slots[i].Release()
 	}
-	PutMeasureStorageSlice(slots)
+	ReleaseMeasureStorageSlice(slots)
 }
 
 func ReleaseMeasureStorageMap(m map[string]MeasureStorage) {

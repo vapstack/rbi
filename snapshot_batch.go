@@ -443,8 +443,8 @@ func (qe *queryEngine) buildPreparedSnapshotAggregatedNoLock(
 		inheritMaterializedPredCache(next, prev, qe.indexedFieldMap, nil)
 	}
 	snapshotFieldBatchStateSlicePool.Put(deltas.fields)
-	pooled.PutBoolSlice(deltas.changed)
-	pooled.PutIntSlice(deltas.touched)
+	pooled.ReleaseBoolSlice(deltas.changed)
+	pooled.ReleaseIntSlice(deltas.touched)
 	next.retainSharedOwnedStorageFrom(prev)
 
 	return next

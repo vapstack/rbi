@@ -174,7 +174,7 @@ func (arena *PostingAddArena) accum(ref uint32) *postingAddAccum {
 }
 
 func (acc *postingAddAccum) reset() {
-	pooled.PutUint64Slice(acc.spill)
+	pooled.ReleaseUint64Slice(acc.spill)
 	acc.spill = nil
 	acc.inlineLen = 0
 }
@@ -229,7 +229,7 @@ func materializePostingAddOwned(ids []uint64) posting.List {
 func (acc *postingAddAccum) materializeOwned() posting.List {
 	if acc.spill != nil {
 		out := materializePostingAddOwned(acc.spill)
-		pooled.PutUint64Slice(acc.spill)
+		pooled.ReleaseUint64Slice(acc.spill)
 		acc.spill = nil
 		return out
 	}
@@ -282,32 +282,32 @@ func AddFixedPostingAdd(
 	return fieldMap
 }
 
-func (delta *LenPostingDiff) putAfterMove() {
-	if delta == nil {
+func (d *LenPostingDiff) putAfterMove() {
+	if d == nil {
 		return
 	}
-	if delta.lengths != nil {
-		PutBatchPostingDeltaMap(delta.lengths)
-		delta.lengths = nil
+	if d.lengths != nil {
+		ReleaseBatchPostingDeltaMap(d.lengths)
+		d.lengths = nil
 	}
-	lenPostingDiffPool.Put(delta)
+	lenPostingDiffPool.Put(d)
 }
 
-func (delta *LenPostingDiff) Release() {
-	if delta == nil {
+func (d *LenPostingDiff) Release() {
+	if d == nil {
 		return
 	}
-	if delta.lengths != nil {
-		for _, lengthDelta := range delta.lengths {
+	if d.lengths != nil {
+		for _, lengthDelta := range d.lengths {
 			lengthDelta.Add.Release()
 			lengthDelta.Remove.Release()
 		}
-		PutBatchPostingDeltaMap(delta.lengths)
-		delta.lengths = nil
+		ReleaseBatchPostingDeltaMap(d.lengths)
+		d.lengths = nil
 	}
-	delta.nonEmpty.Add.Release()
-	delta.nonEmpty.Remove.Release()
-	lenPostingDiffPool.Put(delta)
+	d.nonEmpty.Add.Release()
+	d.nonEmpty.Remove.Release()
+	lenPostingDiffPool.Put(d)
 }
 
 func ensureLenPostingDiff(delta **LenPostingDiff) *LenPostingDiff {
@@ -366,7 +366,7 @@ func sortedStringPostingDeltasBufOwned(deltas map[string]uint32, arena *PostingD
 		})
 	}
 	if len(buf) == 0 {
-		PutPostingDeltaSlice(buf)
+		ReleasePostingDeltaSlice(buf)
 		return nil
 	}
 
@@ -391,7 +391,7 @@ func sortedFixedPostingDeltasBufOwned(deltas map[uint64]uint32, arena *PostingDi
 		})
 	}
 	if len(buf) == 0 {
-		PutPostingDeltaSlice(buf)
+		ReleasePostingDeltaSlice(buf)
 		return nil
 	}
 
@@ -399,7 +399,7 @@ func sortedFixedPostingDeltasBufOwned(deltas map[uint64]uint32, arena *PostingDi
 	return buf
 }
 
-func (base FieldStorage) ApplyStringPostingDiffOwned(
+func (s FieldStorage) ApplyStringPostingDiffOwned(
 	deltas map[string]uint32,
 	arena *PostingDiffArena,
 	fixed8 bool,
@@ -408,12 +408,12 @@ func (base FieldStorage) ApplyStringPostingDiffOwned(
 	defer PutStringPostingDiffMap(deltas)
 	buf := sortedStringPostingDeltasBufOwned(deltas, arena, fixed8)
 	if buf == nil {
-		return base
+		return s
 	}
-	return base.applyPostingDiffBufOwned(buf, allowChunk)
+	return s.applyPostingDiffBufOwned(buf, allowChunk)
 }
 
-func (base FieldStorage) ApplyFixedPostingDiffOwned(
+func (s FieldStorage) ApplyFixedPostingDiffOwned(
 	deltas map[uint64]uint32,
 	arena *PostingDiffArena,
 	allowChunk bool,
@@ -421,9 +421,9 @@ func (base FieldStorage) ApplyFixedPostingDiffOwned(
 	defer PutFixedPostingDiffMap(deltas)
 	buf := sortedFixedPostingDeltasBufOwned(deltas, arena)
 	if buf == nil {
-		return base
+		return s
 	}
-	return base.applyPostingDiffBufOwned(buf, allowChunk)
+	return s.applyPostingDiffBufOwned(buf, allowChunk)
 }
 
 func sortedStringPostingAddsBufOwned(adds map[string]uint32, arena *PostingAddArena, fixed8 bool) []PostingDelta {
@@ -462,7 +462,7 @@ func sortedFixedPostingAddsBufOwned(adds map[uint64]uint32, arena *PostingAddAre
 	return buf
 }
 
-func (base FieldStorage) MergeStringPostingAddsOwned(
+func (s FieldStorage) MergeStringPostingAddsOwned(
 	adds map[string]uint32,
 	arena *PostingAddArena,
 	fixed8 bool,
@@ -470,46 +470,46 @@ func (base FieldStorage) MergeStringPostingAddsOwned(
 ) FieldStorage {
 	defer PutStringPostingAddMap(adds)
 	if len(adds) == 0 {
-		return base
+		return s
 	}
 	buf := sortedStringPostingAddsBufOwned(adds, arena, fixed8)
 	if buf == nil {
-		return base
+		return s
 	}
-	return base.applyPostingDiffBufOwned(buf, allowChunk)
+	return s.applyPostingDiffBufOwned(buf, allowChunk)
 }
 
-func (base FieldStorage) MergeFixedPostingAddsOwned(
+func (s FieldStorage) MergeFixedPostingAddsOwned(
 	adds map[uint64]uint32,
 	arena *PostingAddArena,
 	allowChunk bool,
 ) FieldStorage {
 	defer PutFixedPostingAddMap(adds)
 	if len(adds) == 0 {
-		return base
+		return s
 	}
 	buf := sortedFixedPostingAddsBufOwned(adds, arena)
 	if buf == nil {
-		return base
+		return s
 	}
-	return base.applyPostingDiffBufOwned(buf, allowChunk)
+	return s.applyPostingDiffBufOwned(buf, allowChunk)
 }
 
-func (deltas *LenPostingDiff) sortedBufOwned() []PostingDelta {
-	if deltas == nil {
+func (d *LenPostingDiff) sortedBufOwned() []PostingDelta {
+	if d == nil {
 		return nil
 	}
-	count := len(deltas.lengths)
-	if deltas.hasNonEmpty {
+	count := len(d.lengths)
+	if d.hasNonEmpty {
 		count++
 	}
 	if count == 0 {
-		deltas.putAfterMove()
+		d.putAfterMove()
 		return nil
 	}
 
 	buf := GetPostingDeltaSlice(count)
-	for raw, delta := range deltas.lengths {
+	for raw, delta := range d.lengths {
 		if delta.Add.IsEmpty() && delta.Remove.IsEmpty() {
 			continue
 		}
@@ -518,44 +518,44 @@ func (deltas *LenPostingDiff) sortedBufOwned() []PostingDelta {
 			Delta: delta,
 		})
 	}
-	if deltas.hasNonEmpty && (!deltas.nonEmpty.Add.IsEmpty() || !deltas.nonEmpty.Remove.IsEmpty()) {
+	if d.hasNonEmpty && (!d.nonEmpty.Add.IsEmpty() || !d.nonEmpty.Remove.IsEmpty()) {
 		buf = append(buf, PostingDelta{
 			Key:   keycodec.FromString(LenIndexNonEmptyKey),
-			Delta: deltas.nonEmpty,
+			Delta: d.nonEmpty,
 		})
 	}
-	deltas.putAfterMove()
+	d.putAfterMove()
 	if len(buf) == 0 {
-		PutPostingDeltaSlice(buf)
+		ReleasePostingDeltaSlice(buf)
 		return nil
 	}
 	sortPostingDeltasBuf(buf)
 	return buf
 }
 
-func (deltas *LenPostingDiff) count() int {
-	if deltas == nil {
+func (d *LenPostingDiff) count() int {
+	if d == nil {
 		return 0
 	}
 	count := 0
-	for _, delta := range deltas.lengths {
+	for _, delta := range d.lengths {
 		if delta.Add.IsEmpty() && delta.Remove.IsEmpty() {
 			continue
 		}
 		count++
 	}
-	if deltas.hasNonEmpty && (!deltas.nonEmpty.Add.IsEmpty() || !deltas.nonEmpty.Remove.IsEmpty()) {
+	if d.hasNonEmpty && (!d.nonEmpty.Add.IsEmpty() || !d.nonEmpty.Remove.IsEmpty()) {
 		count++
 	}
 	return count
 }
 
-func (deltas *LenPostingDiff) takeOwned(dst []PostingDelta) int {
-	if deltas == nil || len(dst) == 0 {
+func (d *LenPostingDiff) takeOwned(dst []PostingDelta) int {
+	if d == nil || len(dst) == 0 {
 		return 0
 	}
 	n := 0
-	for raw, delta := range deltas.lengths {
+	for raw, delta := range d.lengths {
 		if delta.Add.IsEmpty() && delta.Remove.IsEmpty() {
 			continue
 		}
@@ -568,29 +568,29 @@ func (deltas *LenPostingDiff) takeOwned(dst []PostingDelta) int {
 			break
 		}
 	}
-	if n < len(dst) && deltas.hasNonEmpty && (!deltas.nonEmpty.Add.IsEmpty() || !deltas.nonEmpty.Remove.IsEmpty()) {
+	if n < len(dst) && d.hasNonEmpty && (!d.nonEmpty.Add.IsEmpty() || !d.nonEmpty.Remove.IsEmpty()) {
 		dst[n] = PostingDelta{
 			Key:   keycodec.FromString(LenIndexNonEmptyKey),
-			Delta: deltas.nonEmpty,
+			Delta: d.nonEmpty,
 		}
 		n++
 	}
-	deltas.putAfterMove()
+	d.putAfterMove()
 	return n
 }
 
-func (base FieldStorage) ApplyLenPostingDiffOwned(deltas *LenPostingDiff) FieldStorage {
+func (s FieldStorage) ApplyLenPostingDiffOwned(deltas *LenPostingDiff) FieldStorage {
 	count := deltas.count()
 	if count == 0 {
 		deltas.putAfterMove()
-		return base
+		return s
 	}
 	if count == 1 {
 		delta, ok := deltas.takeSingleOwned()
 		if !ok {
-			return base
+			return s
 		}
-		storage := base.applyPostingDiff([]PostingDelta{delta}, base.IsChunked())
+		storage := s.applyPostingDiff([]PostingDelta{delta}, s.IsChunked())
 		if storage.KeyCount() > 0 {
 			return storage
 		}
@@ -608,15 +608,15 @@ func (base FieldStorage) ApplyLenPostingDiffOwned(deltas *LenPostingDiff) FieldS
 	} else {
 		buf = deltas.sortedBufOwned()
 		if buf == nil {
-			return base
+			return s
 		}
 	}
 
 	var storage FieldStorage
 	if buf != nil {
-		storage = base.applyPostingDiffBufOwned(buf, base.IsChunked())
+		storage = s.applyPostingDiffBufOwned(buf, s.IsChunked())
 	} else {
-		storage = base.applyPostingDiff(deltaKeys, base.IsChunked())
+		storage = s.applyPostingDiff(deltaKeys, s.IsChunked())
 	}
 	if storage.KeyCount() > 0 {
 		return storage
@@ -624,29 +624,29 @@ func (base FieldStorage) ApplyLenPostingDiffOwned(deltas *LenPostingDiff) FieldS
 	return FieldStorage{}
 }
 
-func (deltas *LenPostingDiff) takeSingleOwned() (PostingDelta, bool) {
-	if deltas == nil {
+func (d *LenPostingDiff) takeSingleOwned() (PostingDelta, bool) {
+	if d == nil {
 		return PostingDelta{}, false
 	}
-	for raw, delta := range deltas.lengths {
+	for raw, delta := range d.lengths {
 		if delta.Add.IsEmpty() && delta.Remove.IsEmpty() {
 			continue
 		}
-		deltas.putAfterMove()
+		d.putAfterMove()
 		return PostingDelta{
 			Key:   keycodec.FromU64(raw),
 			Delta: delta,
 		}, true
 	}
-	if deltas.hasNonEmpty && (!deltas.nonEmpty.Add.IsEmpty() || !deltas.nonEmpty.Remove.IsEmpty()) {
-		delta := deltas.nonEmpty
-		deltas.putAfterMove()
+	if d.hasNonEmpty && (!d.nonEmpty.Add.IsEmpty() || !d.nonEmpty.Remove.IsEmpty()) {
+		delta := d.nonEmpty
+		d.putAfterMove()
 		return PostingDelta{
 			Key:   keycodec.FromString(LenIndexNonEmptyKey),
 			Delta: delta,
 		}, true
 	}
-	deltas.putAfterMove()
+	d.putAfterMove()
 	return PostingDelta{}, false
 }
 
@@ -702,9 +702,9 @@ func takePostingDeltaBuf(buf []PostingDelta, i int) PostingDelta {
 	return delta
 }
 
-func (base *fieldIndexChunkedRoot) nextPostingDiffEntry(endChunk, chunkIdx, entryIdx int) (Entry, bool) {
+func (r *fieldIndexChunkedRoot) nextPostingDiffEntry(endChunk, chunkIdx, entryIdx int) (Entry, bool) {
 	for chunkIdx < endChunk {
-		ref, _ := base.refAtChunk(chunkIdx)
+		ref, _ := r.refAtChunk(chunkIdx)
 		chunk := ref.chunk
 		if entryIdx < chunk.keyCount() {
 			return Entry{Key: chunk.keyAt(entryIdx), IDs: chunk.postingAt(entryIdx)}, true
@@ -715,10 +715,10 @@ func (base *fieldIndexChunkedRoot) nextPostingDiffEntry(endChunk, chunkIdx, entr
 	return Entry{}, false
 }
 
-func (base *fieldIndexChunkedRoot) advancePostingDiffEntry(endChunk int, chunkIdx *int, entryIdx *int) {
+func (r *fieldIndexChunkedRoot) advancePostingDiffEntry(endChunk int, chunkIdx *int, entryIdx *int) {
 	*entryIdx += 1
 	for *chunkIdx < endChunk {
-		ref, _ := base.refAtChunk(*chunkIdx)
+		ref, _ := r.refAtChunk(*chunkIdx)
 		if *entryIdx < ref.chunk.keyCount() {
 			return
 		}
@@ -727,8 +727,8 @@ func (base *fieldIndexChunkedRoot) advancePostingDiffEntry(endChunk int, chunkId
 	}
 }
 
-func (delta BatchPostingDelta) mutationCardinality() uint64 {
-	return delta.Add.Cardinality() + delta.Remove.Cardinality()
+func (d BatchPostingDelta) mutationCardinality() uint64 {
+	return d.Add.Cardinality() + d.Remove.Cardinality()
 }
 
 func postingListLooksRunFriendly(ids posting.List) bool {
@@ -754,14 +754,14 @@ func postingListLooksRunFriendly(ids posting.List) bool {
 	return span <= card*2
 }
 
-func (delta BatchPostingDelta) shouldOptimize(base posting.List, out posting.List) bool {
+func (d BatchPostingDelta) shouldOptimize(base posting.List, out posting.List) bool {
 	if out.IsEmpty() {
 		return false
 	}
 	if _, ok := out.TrySingle(); ok {
 		return false
 	}
-	if postingListLooksRunFriendly(delta.Add) || postingListLooksRunFriendly(delta.Remove) || postingListLooksRunFriendly(out) {
+	if postingListLooksRunFriendly(d.Add) || postingListLooksRunFriendly(d.Remove) || postingListLooksRunFriendly(out) {
 		return true
 	}
 	if base.IsEmpty() {
@@ -770,7 +770,7 @@ func (delta BatchPostingDelta) shouldOptimize(base posting.List, out posting.Lis
 	if _, ok := base.TrySingle(); ok {
 		return false
 	}
-	mutation := delta.mutationCardinality()
+	mutation := d.mutationCardinality()
 	if mutation == 0 {
 		return false
 	}
@@ -778,8 +778,8 @@ func (delta BatchPostingDelta) shouldOptimize(base posting.List, out posting.Lis
 	return baseCard > 0 && mutation*4 >= baseCard
 }
 
-func (delta *BatchPostingDelta) applyOwned(base posting.List) posting.List {
-	deltaValue := *delta
+func (d *BatchPostingDelta) applyOwned(base posting.List) posting.List {
+	deltaValue := *d
 	out := base
 	changed := false
 	releaseRemove := !deltaValue.Remove.IsEmpty()
@@ -814,8 +814,8 @@ func (delta *BatchPostingDelta) applyOwned(base posting.List) posting.List {
 	if releaseAdd {
 		deltaValue.Add.Release()
 	}
-	delta.Remove = posting.List{}
-	delta.Add = posting.List{}
+	d.Remove = posting.List{}
+	d.Add = posting.List{}
 	return out
 }
 
@@ -876,7 +876,7 @@ func applyFieldPostingDiffSorted(base []Entry, deltaKeys []PostingDelta) ([]Entr
 	}
 
 	if len(out) == 0 {
-		PutFieldEntrySlice(out)
+		ReleaseFieldEntrySlice(out)
 		return nil, false
 	}
 
@@ -944,7 +944,7 @@ func applyFieldPostingDiffSortedBuf(base []Entry, deltaKeys []PostingDelta) ([]E
 	}
 
 	if len(out) == 0 {
-		PutFieldEntrySlice(out)
+		ReleaseFieldEntrySlice(out)
 		return nil, false
 	}
 	return out, false
@@ -996,8 +996,8 @@ func applySingleFieldPostingDiffSorted(base []Entry, delta PostingDelta) ([]Entr
 	return out, false
 }
 
-func (builder *fieldIndexChunkBuilder) appendPostingDiffFlatSorted(src []Entry, deltaKeys []PostingDelta) {
-	if builder == nil {
+func (b *fieldIndexChunkBuilder) appendPostingDiffFlatSorted(src []Entry, deltaKeys []PostingDelta) {
+	if b == nil {
 		return
 	}
 
@@ -1018,13 +1018,13 @@ func (builder *fieldIndexChunkBuilder) appendPostingDiffFlatSorted(src []Entry, 
 		switch {
 
 		case j >= len(deltaKeys):
-			out.append(builder, src[i].Key, src[i].IDs.Borrow())
+			out.append(b, src[i].Key, src[i].IDs.Borrow())
 			i++
 
 		case i >= len(src):
 			ids := deltaKeys[j].Delta.applyOwned(posting.List{})
 			if !ids.IsEmpty() {
-				out.append(builder, deltaKeys[j].Key, ids)
+				out.append(b, deltaKeys[j].Key, ids)
 			}
 			j++
 
@@ -1033,13 +1033,13 @@ func (builder *fieldIndexChunkBuilder) appendPostingDiffFlatSorted(src []Entry, 
 			switch {
 
 			case cmp < 0:
-				out.append(builder, src[i].Key, src[i].IDs.Borrow())
+				out.append(b, src[i].Key, src[i].IDs.Borrow())
 				i++
 
 			case cmp > 0:
 				ids := deltaKeys[j].Delta.applyOwned(posting.List{})
 				if !ids.IsEmpty() {
-					out.append(builder, deltaKeys[j].Key, ids)
+					out.append(b, deltaKeys[j].Key, ids)
 				}
 				j++
 
@@ -1047,9 +1047,9 @@ func (builder *fieldIndexChunkBuilder) appendPostingDiffFlatSorted(src []Entry, 
 				ids := deltaKeys[j].Delta.applyOwned(src[i].IDs)
 				if !ids.IsEmpty() {
 					if ids.SharesPayload(src[i].IDs) {
-						out.append(builder, src[i].Key, src[i].IDs.Borrow())
+						out.append(b, src[i].Key, src[i].IDs.Borrow())
 					} else {
-						out.append(builder, src[i].Key, ids)
+						out.append(b, src[i].Key, ids)
 					}
 				}
 				i++
@@ -1058,11 +1058,11 @@ func (builder *fieldIndexChunkBuilder) appendPostingDiffFlatSorted(src []Entry, 
 		}
 	}
 
-	out.finish(builder)
+	out.finish(b)
 }
 
-func (builder *fieldIndexChunkBuilder) appendPostingDiffFlatSortedBuf(src []Entry, deltaKeys []PostingDelta) {
-	if builder == nil {
+func (b *fieldIndexChunkBuilder) appendPostingDiffFlatSortedBuf(src []Entry, deltaKeys []PostingDelta) {
+	if b == nil {
 		return
 	}
 
@@ -1083,14 +1083,14 @@ func (builder *fieldIndexChunkBuilder) appendPostingDiffFlatSortedBuf(src []Entr
 		switch {
 
 		case deltaKeys == nil || j >= len(deltaKeys):
-			out.append(builder, src[i].Key, src[i].IDs.Borrow())
+			out.append(b, src[i].Key, src[i].IDs.Borrow())
 			i++
 
 		case i >= len(src):
 			delta := takePostingDeltaBuf(deltaKeys, j)
 			ids := delta.Delta.applyOwned(posting.List{})
 			if !ids.IsEmpty() {
-				out.append(builder, delta.Key, ids)
+				out.append(b, delta.Key, ids)
 			}
 			j++
 
@@ -1100,14 +1100,14 @@ func (builder *fieldIndexChunkBuilder) appendPostingDiffFlatSortedBuf(src []Entr
 			switch {
 
 			case cmp < 0:
-				out.append(builder, src[i].Key, src[i].IDs.Borrow())
+				out.append(b, src[i].Key, src[i].IDs.Borrow())
 				i++
 
 			case cmp > 0:
 				delta = takePostingDeltaBuf(deltaKeys, j)
 				ids := delta.Delta.applyOwned(posting.List{})
 				if !ids.IsEmpty() {
-					out.append(builder, delta.Key, ids)
+					out.append(b, delta.Key, ids)
 				}
 				j++
 
@@ -1116,9 +1116,9 @@ func (builder *fieldIndexChunkBuilder) appendPostingDiffFlatSortedBuf(src []Entr
 				ids := delta.Delta.applyOwned(src[i].IDs)
 				if !ids.IsEmpty() {
 					if ids.SharesPayload(src[i].IDs) {
-						out.append(builder, src[i].Key, src[i].IDs.Borrow())
+						out.append(b, src[i].Key, src[i].IDs.Borrow())
 					} else {
-						out.append(builder, src[i].Key, ids)
+						out.append(b, src[i].Key, ids)
 					}
 				}
 				i++
@@ -1127,7 +1127,7 @@ func (builder *fieldIndexChunkBuilder) appendPostingDiffFlatSortedBuf(src []Entr
 		}
 	}
 
-	out.finish(builder)
+	out.finish(b)
 }
 
 func applyFieldPostingDiffFlatMaybeChunked(base []Entry, deltaKeys []PostingDelta) FieldStorage {
@@ -1175,30 +1175,30 @@ func applyFieldPostingDiffFlatMaybeChunkedBuf(base []Entry, deltaKeys []PostingD
 	return newChunkedFieldStorage(root)
 }
 
-func (base FieldStorage) applyPostingDiff(deltaKeys []PostingDelta, allowChunk bool) FieldStorage {
+func (s FieldStorage) applyPostingDiff(deltaKeys []PostingDelta, allowChunk bool) FieldStorage {
 	if len(deltaKeys) == 0 {
-		return base
+		return s
 	}
 
 	if !allowChunk {
 		var flat []Entry
-		if base.flat != nil {
-			flat = base.flat.entries
+		if s.flat != nil {
+			flat = s.flat.entries
 		}
 		updated, same := applyFieldPostingDiffSorted(flat, deltaKeys)
 		if same {
-			return base
+			return s
 		}
 		return newFlatFieldStorage(updated, nil)
 	}
 
-	if base.chunked != nil {
-		return base.chunked.applyPostingDiff(deltaKeys)
+	if s.chunked != nil {
+		return s.chunked.applyPostingDiff(deltaKeys)
 	}
 
 	var flat []Entry
-	if base.flat != nil {
-		flat = base.flat.entries
+	if s.flat != nil {
+		flat = s.flat.entries
 	}
 
 	if len(deltaKeys)+len(flat) >= fieldIndexChunkThreshold {
@@ -1207,41 +1207,41 @@ func (base FieldStorage) applyPostingDiff(deltaKeys []PostingDelta, allowChunk b
 
 	updated, same := applyFieldPostingDiffSorted(flat, deltaKeys)
 	if same {
-		return base
+		return s
 	}
 
 	return newRegularFieldStorage(updated)
 }
 
-func (base FieldStorage) applyPostingDiffBufOwned(buf []PostingDelta, allowChunk bool) FieldStorage {
+func (s FieldStorage) applyPostingDiffBufOwned(buf []PostingDelta, allowChunk bool) FieldStorage {
 	if buf == nil {
-		return base
+		return s
 	}
-	defer PutPostingDeltaSlice(buf)
+	defer ReleasePostingDeltaSlice(buf)
 
 	if len(buf) == 0 {
-		return base
+		return s
 	}
 
 	if !allowChunk {
 		var flat []Entry
-		if base.flat != nil {
-			flat = base.flat.entries
+		if s.flat != nil {
+			flat = s.flat.entries
 		}
 		updated, same := applyFieldPostingDiffSortedBuf(flat, buf)
 		if same {
-			return base
+			return s
 		}
 		return newFlatFieldStorage(updated, nil)
 	}
 
-	if base.chunked != nil {
-		return base.chunked.applyPostingDiffBuf(buf)
+	if s.chunked != nil {
+		return s.chunked.applyPostingDiffBuf(buf)
 	}
 
 	var flat []Entry
-	if base.flat != nil {
-		flat = base.flat.entries
+	if s.flat != nil {
+		flat = s.flat.entries
 	}
 
 	if len(buf)+len(flat) >= fieldIndexChunkThreshold {
@@ -1250,23 +1250,23 @@ func (base FieldStorage) applyPostingDiffBufOwned(buf []PostingDelta, allowChunk
 
 	updated, same := applyFieldPostingDiffSortedBuf(flat, buf)
 	if same {
-		return base
+		return s
 	}
 
 	return newRegularFieldStorage(updated)
 }
 
-func (builder *fieldIndexChunkBuilder) appendPostingDiffChunkRangeSorted(
+func (b *fieldIndexChunkBuilder) appendPostingDiffChunkRangeSorted(
 	base *fieldIndexChunkedRoot,
 	startChunk, endChunk int,
 	deltaKeys []PostingDelta,
 ) {
-	if builder == nil || base == nil || startChunk < 0 || endChunk < startChunk || endChunk > base.chunkCount {
+	if b == nil || base == nil || startChunk < 0 || endChunk < startChunk || endChunk > base.chunkCount {
 		return
 	}
 
 	if len(deltaKeys) == 0 {
-		builder.appendRefsRange(base, startChunk, endChunk)
+		b.appendRefsRange(base, startChunk, endChunk)
 		return
 	}
 
@@ -1290,18 +1290,18 @@ func (builder *fieldIndexChunkBuilder) appendPostingDiffChunkRangeSorted(
 		switch {
 
 		case !hasBase && j >= len(deltaKeys):
-			out.finish(builder)
+			out.finish(b)
 			return
 
 		case !hasBase:
 			ids := deltaKeys[j].Delta.applyOwned(posting.List{})
 			if !ids.IsEmpty() {
-				out.append(builder, deltaKeys[j].Key, ids)
+				out.append(b, deltaKeys[j].Key, ids)
 			}
 			j++
 
 		case j >= len(deltaKeys):
-			out.append(builder, baseEnt.Key, baseEnt.IDs)
+			out.append(b, baseEnt.Key, baseEnt.IDs)
 			base.advancePostingDiffEntry(endChunk, &chunkIdx, &entryIdx)
 
 		default:
@@ -1309,20 +1309,20 @@ func (builder *fieldIndexChunkBuilder) appendPostingDiffChunkRangeSorted(
 			switch {
 
 			case cmp < 0:
-				out.append(builder, baseEnt.Key, baseEnt.IDs)
+				out.append(b, baseEnt.Key, baseEnt.IDs)
 				base.advancePostingDiffEntry(endChunk, &chunkIdx, &entryIdx)
 
 			case cmp > 0:
 				ids := deltaKeys[j].Delta.applyOwned(posting.List{})
 				if !ids.IsEmpty() {
-					out.append(builder, deltaKeys[j].Key, ids)
+					out.append(b, deltaKeys[j].Key, ids)
 				}
 				j++
 
 			default:
 				ids := deltaKeys[j].Delta.applyOwned(baseEnt.IDs)
 				if !ids.IsEmpty() {
-					out.append(builder, baseEnt.Key, ids)
+					out.append(b, baseEnt.Key, ids)
 				}
 				base.advancePostingDiffEntry(endChunk, &chunkIdx, &entryIdx)
 				j++
@@ -1331,18 +1331,18 @@ func (builder *fieldIndexChunkBuilder) appendPostingDiffChunkRangeSorted(
 	}
 }
 
-func (builder *fieldIndexChunkBuilder) appendPostingDiffChunkRangeSortedBuf(
+func (b *fieldIndexChunkBuilder) appendPostingDiffChunkRangeSortedBuf(
 	base *fieldIndexChunkedRoot,
 	startChunk, endChunk int,
 	deltaKeys []PostingDelta,
 	deltaStart, deltaEnd int,
 ) {
-	if builder == nil || base == nil || startChunk < 0 || endChunk < startChunk || endChunk > base.chunkCount {
+	if b == nil || base == nil || startChunk < 0 || endChunk < startChunk || endChunk > base.chunkCount {
 		return
 	}
 
 	if deltaKeys == nil || deltaStart >= deltaEnd {
-		builder.appendRefsRange(base, startChunk, endChunk)
+		b.appendRefsRange(base, startChunk, endChunk)
 		return
 	}
 
@@ -1366,19 +1366,19 @@ func (builder *fieldIndexChunkBuilder) appendPostingDiffChunkRangeSortedBuf(
 
 		switch {
 		case !hasBase && j >= deltaEnd:
-			out.finish(builder)
+			out.finish(b)
 			return
 
 		case !hasBase:
 			delta := takePostingDeltaBuf(deltaKeys, j)
 			ids := delta.Delta.applyOwned(posting.List{})
 			if !ids.IsEmpty() {
-				out.append(builder, delta.Key, ids)
+				out.append(b, delta.Key, ids)
 			}
 			j++
 
 		case j >= deltaEnd:
-			out.append(builder, baseEnt.Key, baseEnt.IDs)
+			out.append(b, baseEnt.Key, baseEnt.IDs)
 			base.advancePostingDiffEntry(endChunk, &chunkIdx, &entryIdx)
 
 		default:
@@ -1387,14 +1387,14 @@ func (builder *fieldIndexChunkBuilder) appendPostingDiffChunkRangeSortedBuf(
 
 			switch {
 			case cmp < 0:
-				out.append(builder, baseEnt.Key, baseEnt.IDs)
+				out.append(b, baseEnt.Key, baseEnt.IDs)
 				base.advancePostingDiffEntry(endChunk, &chunkIdx, &entryIdx)
 
 			case cmp > 0:
 				delta = takePostingDeltaBuf(deltaKeys, j)
 				ids := delta.Delta.applyOwned(posting.List{})
 				if !ids.IsEmpty() {
-					out.append(builder, delta.Key, ids)
+					out.append(b, delta.Key, ids)
 				}
 				j++
 
@@ -1402,7 +1402,7 @@ func (builder *fieldIndexChunkBuilder) appendPostingDiffChunkRangeSortedBuf(
 				delta = takePostingDeltaBuf(deltaKeys, j)
 				ids := delta.Delta.applyOwned(baseEnt.IDs)
 				if !ids.IsEmpty() {
-					out.append(builder, baseEnt.Key, ids)
+					out.append(b, baseEnt.Key, ids)
 				}
 				base.advancePostingDiffEntry(endChunk, &chunkIdx, &entryIdx)
 				j++
@@ -1411,29 +1411,29 @@ func (builder *fieldIndexChunkBuilder) appendPostingDiffChunkRangeSortedBuf(
 	}
 }
 
-func (base *fieldIndexChunkedRoot) applyPostingDiff(deltaKeys []PostingDelta) FieldStorage {
-	if base == nil || base.keyCount == 0 {
+func (r *fieldIndexChunkedRoot) applyPostingDiff(deltaKeys []PostingDelta) FieldStorage {
+	if r == nil || r.keyCount == 0 {
 		return applyFieldPostingDiffFlatMaybeChunked(nil, deltaKeys)
 	}
 	if len(deltaKeys) == 0 {
-		return newChunkedFieldStorage(base)
+		return newChunkedFieldStorage(r)
 	}
 	if len(deltaKeys) == 1 {
-		return base.applySinglePostingDiff(deltaKeys[0])
+		return r.applySinglePostingDiff(deltaKeys[0])
 	}
 
-	builder := newFieldIndexChunkBuilder(base.keyCount + len(deltaKeys))
+	builder := newFieldIndexChunkBuilder(r.keyCount + len(deltaKeys))
 	chunkIdx := 0
 	deltaPos := 0
 	touchIdx := 0
 
 	for deltaPos < len(deltaKeys) {
-		touchIdx = base.touchChunkIndexFrom(max(touchIdx, chunkIdx), deltaKeys[deltaPos].Key)
+		touchIdx = r.touchChunkIndexFrom(max(touchIdx, chunkIdx), deltaKeys[deltaPos].Key)
 		if touchIdx < 0 {
 			break
 		}
 		if chunkIdx < touchIdx {
-			builder.appendRefsRange(base, chunkIdx, touchIdx)
+			builder.appendRefsRange(r, chunkIdx, touchIdx)
 		}
 
 		runStart := touchIdx
@@ -1441,7 +1441,7 @@ func (base *fieldIndexChunkedRoot) applyPostingDiff(deltaKeys []PostingDelta) Fi
 		deltaStart := deltaPos
 		deltaPos++
 		for deltaPos < len(deltaKeys) {
-			touchIdx = base.touchChunkIndexFrom(touchIdx, deltaKeys[deltaPos].Key)
+			touchIdx = r.touchChunkIndexFrom(touchIdx, deltaKeys[deltaPos].Key)
 			if touchIdx > runEnd {
 				break
 			}
@@ -1451,12 +1451,12 @@ func (base *fieldIndexChunkedRoot) applyPostingDiff(deltaKeys []PostingDelta) Fi
 			deltaPos++
 		}
 
-		builder.appendPostingDiffChunkRangeSorted(base, runStart, runEnd, deltaKeys[deltaStart:deltaPos])
+		builder.appendPostingDiffChunkRangeSorted(r, runStart, runEnd, deltaKeys[deltaStart:deltaPos])
 		chunkIdx = runEnd
 	}
 
-	if chunkIdx < base.chunkCount {
-		builder.appendRefsRange(base, chunkIdx, base.chunkCount)
+	if chunkIdx < r.chunkCount {
+		builder.appendRefsRange(r, chunkIdx, r.chunkCount)
 	}
 
 	root := builder.root()
@@ -1474,28 +1474,28 @@ func (base *fieldIndexChunkedRoot) applyPostingDiff(deltaKeys []PostingDelta) Fi
 	return newChunkedFieldStorage(root)
 }
 
-func (base *fieldIndexChunkedRoot) applyPostingDiffBuf(deltaKeys []PostingDelta) FieldStorage {
-	if base == nil || base.keyCount == 0 {
+func (r *fieldIndexChunkedRoot) applyPostingDiffBuf(deltaKeys []PostingDelta) FieldStorage {
+	if r == nil || r.keyCount == 0 {
 		return applyFieldPostingDiffFlatMaybeChunkedBuf(nil, deltaKeys)
 	}
 	if deltaKeys == nil || len(deltaKeys) == 0 {
-		return newChunkedFieldStorage(base)
+		return newChunkedFieldStorage(r)
 	}
 	if len(deltaKeys) == 1 {
-		return base.applySinglePostingDiff(takePostingDeltaBuf(deltaKeys, 0))
+		return r.applySinglePostingDiff(takePostingDeltaBuf(deltaKeys, 0))
 	}
 
-	builder := newFieldIndexChunkBuilder(base.keyCount + len(deltaKeys))
+	builder := newFieldIndexChunkBuilder(r.keyCount + len(deltaKeys))
 	chunkIdx := 0
 	deltaPos := 0
 	touchIdx := 0
 	for deltaPos < len(deltaKeys) {
-		touchIdx = base.touchChunkIndexFrom(max(touchIdx, chunkIdx), deltaKeys[deltaPos].Key)
+		touchIdx = r.touchChunkIndexFrom(max(touchIdx, chunkIdx), deltaKeys[deltaPos].Key)
 		if touchIdx < 0 {
 			break
 		}
 		if chunkIdx < touchIdx {
-			builder.appendRefsRange(base, chunkIdx, touchIdx)
+			builder.appendRefsRange(r, chunkIdx, touchIdx)
 		}
 
 		runStart := touchIdx
@@ -1503,7 +1503,7 @@ func (base *fieldIndexChunkedRoot) applyPostingDiffBuf(deltaKeys []PostingDelta)
 		deltaStart := deltaPos
 		deltaPos++
 		for deltaPos < len(deltaKeys) {
-			touchIdx = base.touchChunkIndexFrom(touchIdx, deltaKeys[deltaPos].Key)
+			touchIdx = r.touchChunkIndexFrom(touchIdx, deltaKeys[deltaPos].Key)
 			if touchIdx > runEnd {
 				break
 			}
@@ -1513,12 +1513,12 @@ func (base *fieldIndexChunkedRoot) applyPostingDiffBuf(deltaKeys []PostingDelta)
 			deltaPos++
 		}
 
-		builder.appendPostingDiffChunkRangeSortedBuf(base, runStart, runEnd, deltaKeys, deltaStart, deltaPos)
+		builder.appendPostingDiffChunkRangeSortedBuf(r, runStart, runEnd, deltaKeys, deltaStart, deltaPos)
 		chunkIdx = runEnd
 	}
 
-	if chunkIdx < base.chunkCount {
-		builder.appendRefsRange(base, chunkIdx, base.chunkCount)
+	if chunkIdx < r.chunkCount {
+		builder.appendRefsRange(r, chunkIdx, r.chunkCount)
 	}
 
 	root := builder.root()
@@ -1536,15 +1536,15 @@ func (base *fieldIndexChunkedRoot) applyPostingDiffBuf(deltaKeys []PostingDelta)
 	return newChunkedFieldStorage(root)
 }
 
-func (base *fieldIndexChunkedRoot) rebuildWithOwnedPageRefsReplaced(page int, replRefs []fieldIndexChunkRef) *fieldIndexChunkedRoot {
-	if base == nil || base.pages == nil || page < 0 || page >= len(base.pages) {
+func (r *fieldIndexChunkedRoot) rebuildWithOwnedPageRefsReplaced(page int, replRefs []fieldIndexChunkRef) *fieldIndexChunkedRoot {
+	if r == nil || r.pages == nil || page < 0 || page >= len(r.pages) {
 		if replRefs != nil {
-			putOwnedFieldIndexChunkRefSlice(replRefs)
+			releaseOwnedFieldIndexChunkRefSlice(replRefs)
 		}
 		return nil
 	}
 
-	est := base.keyCount - base.pages[page].keyCount()
+	est := r.keyCount - r.pages[page].keyCount()
 	if replRefs != nil {
 		for i := range replRefs {
 			if chunk := replRefs[i].chunk; chunk != nil {
@@ -1559,7 +1559,7 @@ func (base *fieldIndexChunkedRoot) rebuildWithOwnedPageRefsReplaced(page int, re
 
 	builder := newFieldIndexChunkBuilder(est)
 	for i := 0; i < page; i++ {
-		builder.appendPage(base.pages[i])
+		builder.appendPage(r.pages[i])
 	}
 
 	if replRefs != nil {
@@ -1569,17 +1569,17 @@ func (base *fieldIndexChunkedRoot) rebuildWithOwnedPageRefsReplaced(page int, re
 		fieldIndexChunkRefSlicePool.Put(replRefs)
 	}
 
-	for i := page + 1; i < len(base.pages); i++ {
-		builder.appendPage(base.pages[i])
+	for i := page + 1; i < len(r.pages); i++ {
+		builder.appendPage(r.pages[i])
 	}
 
 	return builder.root()
 }
 
-func (page *fieldIndexChunkDirPage) refsWithReplacedRef(off int, replRefs []fieldIndexChunkRef) []fieldIndexChunkRef {
-	if page == nil || off < 0 || off >= len(page.refs) {
+func (p *fieldIndexChunkDirPage) refsWithReplacedRef(off int, replRefs []fieldIndexChunkRef) []fieldIndexChunkRef {
+	if p == nil || off < 0 || off >= len(p.refs) {
 		if replRefs != nil {
-			putOwnedFieldIndexChunkRefSlice(replRefs)
+			releaseOwnedFieldIndexChunkRefSlice(replRefs)
 		}
 		return nil
 	}
@@ -1589,17 +1589,17 @@ func (page *fieldIndexChunkDirPage) refsWithReplacedRef(off int, replRefs []fiel
 		replLen = len(replRefs)
 	}
 
-	total := len(page.refs) - 1 + replLen
+	total := len(p.refs) - 1 + replLen
 	if total <= 0 {
 		if replRefs != nil {
-			putOwnedFieldIndexChunkRefSlice(replRefs)
+			releaseOwnedFieldIndexChunkRefSlice(replRefs)
 		}
 		return nil
 	}
 
 	refs := fieldIndexChunkRefSlicePool.Get(total)
 	for i := 0; i < off; i++ {
-		refs = append(refs, page.refs[i].retained())
+		refs = append(refs, p.refs[i].retained())
 	}
 
 	for i := 0; i < replLen; i++ {
@@ -1611,33 +1611,33 @@ func (page *fieldIndexChunkDirPage) refsWithReplacedRef(off int, replRefs []fiel
 		fieldIndexChunkRefSlicePool.Put(replRefs)
 	}
 
-	for i := off + 1; i < len(page.refs); i++ {
-		refs = append(refs, page.refs[i].retained())
+	for i := off + 1; i < len(p.refs); i++ {
+		refs = append(refs, p.refs[i].retained())
 	}
 
 	return refs
 }
 
-func (base *fieldIndexChunkedRoot) applySinglePostingDiff(delta PostingDelta) FieldStorage {
-	if base == nil || base.keyCount == 0 {
+func (r *fieldIndexChunkedRoot) applySinglePostingDiff(delta PostingDelta) FieldStorage {
+	if r == nil || r.keyCount == 0 {
 		return applyFieldPostingDiffFlatMaybeChunked(nil, []PostingDelta{delta})
 	}
 
-	touchIdx := base.touchChunkIndexFrom(0, delta.Key)
+	touchIdx := r.touchChunkIndexFrom(0, delta.Key)
 	if touchIdx < 0 {
-		return newChunkedFieldStorage(base)
+		return newChunkedFieldStorage(r)
 	}
 
-	page, off := base.pagePosForChunk(touchIdx)
-	if base.pages == nil || page >= len(base.pages) {
-		return newChunkedFieldStorage(base)
+	page, off := r.pagePosForChunk(touchIdx)
+	if r.pages == nil || page >= len(r.pages) {
+		return newChunkedFieldStorage(r)
 	}
 
-	pageRef := base.pages[page]
+	pageRef := r.pages[page]
 
-	ref, ok := base.refAtChunk(touchIdx)
+	ref, ok := r.refAtChunk(touchIdx)
 	if !ok || ref.chunk == nil {
-		return newChunkedFieldStorage(base)
+		return newChunkedFieldStorage(r)
 	}
 
 	entryIdx := ref.chunk.lowerBoundKey(delta.Key)
@@ -1647,7 +1647,7 @@ func (base *fieldIndexChunkedRoot) applySinglePostingDiff(delta PostingDelta) Fi
 		baseIDs := ref.chunk.postingAt(entryIdx)
 		updatedIDs := delta.Delta.applyOwned(baseIDs)
 		if updatedIDs.SharesPayload(baseIDs) {
-			return newChunkedFieldStorage(base)
+			return newChunkedFieldStorage(r)
 		}
 
 		rowsDelta := int64(updatedIDs.Cardinality()) - int64(baseIDs.Cardinality())
@@ -1688,7 +1688,7 @@ func (base *fieldIndexChunkedRoot) applySinglePostingDiff(delta PostingDelta) Fi
 			chunk: chunk,
 		})
 
-		root := base.rebuildWithOwnedPageRefsReplaced(page, pageRef.refsWithReplacedRef(off, repl))
+		root := r.rebuildWithOwnedPageRefsReplaced(page, pageRef.refsWithReplacedRef(off, repl))
 		if root == nil {
 			return FieldStorage{}
 		}
@@ -1703,7 +1703,7 @@ func (base *fieldIndexChunkedRoot) applySinglePostingDiff(delta PostingDelta) Fi
 		})
 
 		if len(replRefs) > 0 {
-			root := base.rebuildWithOwnedPageRefsReplaced(page, pageRef.refsWithReplacedRef(off, replRefs))
+			root := r.rebuildWithOwnedPageRefsReplaced(page, pageRef.refsWithReplacedRef(off, replRefs))
 			if root == nil {
 				return FieldStorage{}
 			}
@@ -1728,11 +1728,11 @@ func (base *fieldIndexChunkedRoot) applySinglePostingDiff(delta PostingDelta) Fi
 		replRefs = newFieldIndexChunkRefsFromEntries(updated)
 	}
 	if updated != nil && !same {
-		PutFieldEntrySlice(updated)
+		ReleaseFieldEntrySlice(updated)
 	}
-	PutFieldEntrySlice(entries)
+	ReleaseFieldEntrySlice(entries)
 
-	root := base.rebuildWithOwnedPageRefsReplaced(page, pageRef.refsWithReplacedRef(off, replRefs))
+	root := r.rebuildWithOwnedPageRefsReplaced(page, pageRef.refsWithReplacedRef(off, replRefs))
 	if root == nil {
 		return FieldStorage{}
 	}

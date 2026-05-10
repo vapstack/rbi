@@ -23,7 +23,13 @@ func (ac *containerArray) release() {
 	if ac.refs.Add(-1) != 0 {
 		return
 	}
-	putContainerArray(ac)
+	idx := containerArrayPoolPutIndex(cap(ac.content))
+	if idx < 0 {
+		return
+	}
+	clear(ac.content)
+	ac.content = ac.content[:0]
+	containerArrayClassPools[idx].Put(ac)
 }
 
 func (ac *containerArray) Release() { ac.release() }

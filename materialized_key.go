@@ -101,14 +101,31 @@ func (key materializedPredKey) String() string {
 
 	case materializedPredKeyScalar:
 		if key.flags&materializedPredKeyScalarNumeric != 0 {
-			return key.field + "\x1f" + strconv.Itoa(int(key.op)) + "\x1f" + "n" + "\x1f" + key.keyIndex.UnsafeString()
+			var raw [8]byte
+			var buf strings.Builder
+			buf.Grow(len(key.field) + 8 + 8)
+			buf.WriteString(key.field)
+			buf.WriteByte('\x1f')
+			buf.WriteString(strconv.Itoa(int(key.op)))
+			buf.WriteString("\x1fn\x1f")
+			buf.Write(key.keyIndex.AppendBytes(raw[:0]))
+			return buf.String()
 		}
 		return key.field + "\x1f" + strconv.Itoa(int(key.op)) + "\x1f" + key.key
 
 	case materializedPredKeyScalarComplement:
 		if key.flags&materializedPredKeyScalarNumeric != 0 {
-			return key.field + "\x1f" + "count_range_complement" + "\x1f" +
-				strconv.Itoa(int(key.op)) + "\x1f" + "n" + "\x1f" + key.keyIndex.UnsafeString()
+			var raw [8]byte
+			var buf strings.Builder
+			buf.Grow(len(key.field) + len("count_range_complement") + 8 + 8)
+			buf.WriteString(key.field)
+			buf.WriteByte('\x1f')
+			buf.WriteString("count_range_complement")
+			buf.WriteByte('\x1f')
+			buf.WriteString(strconv.Itoa(int(key.op)))
+			buf.WriteString("\x1fn\x1f")
+			buf.Write(key.keyIndex.AppendBytes(raw[:0]))
+			return buf.String()
 		}
 		return key.field + "\x1f" + "count_range_complement" + "\x1f" +
 			strconv.Itoa(int(key.op)) + "\x1f" + key.key
@@ -121,7 +138,6 @@ func (key materializedPredKey) String() string {
 		if key.flags&materializedPredKeyHasLo != 0 {
 			if key.flags&materializedPredKeyLoNumeric != 0 {
 				loTag = "n"
-				loVal = key.loIndex.UnsafeString()
 			} else {
 				loTag = "s"
 				loVal = key.loKey
@@ -135,7 +151,6 @@ func (key materializedPredKey) String() string {
 		if key.flags&materializedPredKeyHasHi != 0 {
 			if key.flags&materializedPredKeyHiNumeric != 0 {
 				hiTag = "n"
-				hiVal = key.hiIndex.UnsafeString()
 			} else {
 				hiTag = "s"
 				hiVal = key.hiKey
@@ -150,8 +165,29 @@ func (key materializedPredKey) String() string {
 		if key.kind == materializedPredKeyExactScalarRangeComplement {
 			head = "count_range_exact_complement"
 		}
-		return key.field + "\x1f" + head + "\x1f" +
-			loTag + "\x1f" + loVal + "\x1f" + hiTag + "\x1f" + hiVal
+		var raw [8]byte
+		var buf strings.Builder
+		buf.Grow(len(key.field) + len(head) + len(loTag) + len(loVal) + len(hiTag) + len(hiVal) + 40)
+		buf.WriteString(key.field)
+		buf.WriteByte('\x1f')
+		buf.WriteString(head)
+		buf.WriteByte('\x1f')
+		buf.WriteString(loTag)
+		buf.WriteByte('\x1f')
+		if key.flags&materializedPredKeyLoNumeric != 0 {
+			buf.Write(key.loIndex.AppendBytes(raw[:0]))
+		} else {
+			buf.WriteString(loVal)
+		}
+		buf.WriteByte('\x1f')
+		buf.WriteString(hiTag)
+		buf.WriteByte('\x1f')
+		if key.flags&materializedPredKeyHiNumeric != 0 {
+			buf.Write(key.hiIndex.AppendBytes(raw[:0]))
+		} else {
+			buf.WriteString(hiVal)
+		}
+		return buf.String()
 
 	case materializedPredKeyNumericBucketSpan:
 		return key.field + "\x1f" + "range_bucket" + "\x1f" +
@@ -185,6 +221,13 @@ func materializedPredKeyForNumericScalar(field string, op qir.Op, key keycodec.I
 		keyIndex: key,
 		flags:    materializedPredKeyScalarNumeric,
 	}
+}
+
+func materializedPredKeyForLookupKey(field string, op qir.Op, key keycodec.IndexLookupKey) materializedPredKey {
+	if key.IsNumeric() {
+		return materializedPredKeyForNumericScalar(field, op, key.IndexKey())
+	}
+	return materializedPredKeyForScalar(field, op, key.StringKey())
 }
 
 func materializedPredComplementKeyForScalar(field string, op qir.Op, key string) materializedPredKey {

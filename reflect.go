@@ -8,6 +8,8 @@ import (
 	"strings"
 	"time"
 	"unsafe"
+
+	"github.com/vapstack/rbi/internal/keycodec"
 )
 
 type field struct {
@@ -450,7 +452,7 @@ func buildFieldDefinition(sf reflect.StructField, index []int, indexKind IndexKi
 }
 
 type (
-	uniqueScalarGetterFn        func(ptr unsafe.Pointer) (string, bool, bool)
+	uniqueScalarGetterFn        func(ptr unsafe.Pointer) (keycodec.IndexLookupKey, bool, bool)
 	buildFieldWriteAccessorFn   func(ptr unsafe.Pointer, sink buildFieldWriteSink)
 	overlayFieldWriteAccessorFn func(ptr unsafe.Pointer, sink snapshotOverlayWriteSink)
 	insertFieldWriteAccessorFn  func(ptr unsafe.Pointer, sink snapshotInsertWriteSink)

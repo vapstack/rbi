@@ -1,9 +1,9 @@
 package rbi
 
 import (
+	"github.com/vapstack/rbi/internal/keycodec"
 	"github.com/vapstack/rbi/internal/pooled"
 	"github.com/vapstack/rbi/internal/posting"
-	"github.com/vapstack/rbi/internal/qir"
 )
 
 const (
@@ -11,7 +11,6 @@ const (
 	stringSetPoolMaxLen                     = 4 << 10
 	uint64IntMapPoolMaxLen                  = 16 << 10
 	u64SetPoolMaxCap                        = 16 << 10
-	exprSlicePoolMaxCap                     = 256
 	bitmapResultSlicePoolMaxCap             = 2 << 10
 	countORBranchSlicePoolMaxCap            = 512
 	countLeadResidualExactFilterPoolMaxCap  = 512
@@ -25,16 +24,6 @@ const (
 	orderedMergedScalarRangeFieldPoolMaxCap = 64
 	aggregateMetricStateSlicePoolMaxCap     = 1 << 20
 )
-
-/**/
-
-var exprSlicePool = pooled.Slices[qir.Expr]{
-	MinCap: 8,
-	MaxCap: exprSlicePoolMaxCap,
-	Clear:  true,
-}
-
-/**/
 
 var orderBasicBaseCoreSlicePool = pooled.Slices[orderBasicBaseCore]{
 	MinCap: 4,
@@ -149,7 +138,7 @@ var leafPredSlicePool = pooled.Slices[leafPred]{
 				postsAnyFilterStatePool.Put(pred.postsAnyState)
 			}
 			if pred.postsBuf != nil {
-				posting.PutSlice(pred.postsBuf)
+				posting.ReleaseSlice(pred.postsBuf)
 			}
 		}
 	},
@@ -196,40 +185,40 @@ var plannerOROrderMergeItemSlicePool = pooled.Slices[plannerOROrderMergeItem]{
 /**/
 
 var (
-	uniqueLeavingOuterPool = pooled.Maps[string, map[string]posting.List]{
+	uniqueLeavingOuterPool = pooled.Maps[string, map[keycodec.IndexLookupKey]posting.List]{
 		NewCap: 8,
 		MaxLen: pooledUniqueOuterMaxLen,
-		Cleanup: func(m map[string]map[string]posting.List) {
+		Cleanup: func(m map[string]map[keycodec.IndexLookupKey]posting.List) {
 			for _, inner := range m {
 				uniqueLeavingInnerPool.Put(inner)
 			}
 			clear(m)
 		},
 	}
-	uniqueLeavingInnerPool = pooled.Maps[string, posting.List]{
+	uniqueLeavingInnerPool = pooled.Maps[keycodec.IndexLookupKey, posting.List]{
 		NewCap: 8,
 		MaxLen: pooledUniqueInnerMaxLen,
-		Cleanup: func(m map[string]posting.List) {
+		Cleanup: func(m map[keycodec.IndexLookupKey]posting.List) {
 			for _, ids := range m {
 				ids.Release()
 			}
 			clear(m)
 		},
 	}
-	uniqueSeenOuterPool = pooled.Maps[string, map[string]uint64]{
+	uniqueSeenOuterPool = pooled.Maps[string, map[keycodec.IndexLookupKey]uint64]{
 		NewCap: 8,
 		MaxLen: pooledUniqueOuterMaxLen,
-		Cleanup: func(m map[string]map[string]uint64) {
+		Cleanup: func(m map[string]map[keycodec.IndexLookupKey]uint64) {
 			for _, inner := range m {
 				uniqueSeenInnerPool.Put(inner)
 			}
 			clear(m)
 		},
 	}
-	uniqueSeenInnerPool = pooled.Maps[string, uint64]{
+	uniqueSeenInnerPool = pooled.Maps[keycodec.IndexLookupKey, uint64]{
 		NewCap: 8,
 		MaxLen: pooledUniqueInnerMaxLen,
-		Cleanup: func(m map[string]uint64) {
+		Cleanup: func(m map[keycodec.IndexLookupKey]uint64) {
 			clear(m)
 		},
 	}

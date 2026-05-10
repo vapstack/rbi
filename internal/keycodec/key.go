@@ -3,10 +3,8 @@ package keycodec
 import (
 	"encoding/binary"
 	"math"
-	"math/bits"
 	"strconv"
 	"strings"
-	"sync"
 	"unsafe"
 )
 
@@ -81,6 +79,13 @@ func (k IndexKey) UnsafeString() string {
 		return U64ByteString(k.meta)
 	}
 	return unsafe.String(k.ptr, int(k.meta))
+}
+
+func (k IndexKey) AppendBytes(dst []byte) []byte {
+	if k.IsNumeric() {
+		return AppendU64Bytes(dst, k.meta)
+	}
+	return append(dst, unsafe.Slice(k.ptr, int(k.meta))...)
 }
 
 func (k IndexKey) ByteAt(i int) byte {
@@ -341,6 +346,26 @@ func U64Bytes(v uint64) []byte {
 	return key[:]
 }
 
+func AppendU64Bytes(dst []byte, v uint64) []byte {
+	return append(dst,
+		byte(v>>56),
+		byte(v>>48),
+		byte(v>>40),
+		byte(v>>32),
+		byte(v>>24),
+		byte(v>>16),
+		byte(v>>8),
+		byte(v),
+	)
+}
+
+func U64BytesWithBuf(v uint64, buf *[8]byte) []byte {
+	binary.BigEndian.PutUint64(buf[:], v)
+	return buf[:]
+}
+
+// U64ByteString is an allocationful compatibility helper. Hot paths should
+// pass numeric keys as IndexKey/uint64 or write bytes into caller-owned storage.
 func U64ByteString(v uint64) string {
 	b := U64Bytes(v)
 	return unsafe.String(unsafe.SliceData(b), len(b))
@@ -350,6 +375,11 @@ func OrderedInt64Key(v int64) uint64 {
 	return uint64(v) ^ (uint64(1) << 63)
 }
 
+func Int64FromOrderedKey(key uint64) int64 {
+	return int64(key ^ (uint64(1) << 63))
+}
+
+// Int64ByteString is an allocationful compatibility helper.
 func Int64ByteString(v int64) string {
 	return U64ByteString(OrderedInt64Key(v))
 }
@@ -385,8 +415,50 @@ func OrderedFloat64Key(f float64) uint64 {
 	return u ^ sign
 }
 
+func Float64FromOrderedKey(key uint64) float64 {
+	const sign = uint64(1) << 63
+	if key&sign != 0 {
+		return math.Float64frombits(key ^ sign)
+	}
+	return math.Float64frombits(^key)
+}
+
+// Float64ByteString is an allocationful compatibility helper.
 func Float64ByteString(f float64) string {
 	return U64ByteString(OrderedFloat64Key(f))
+}
+
+type IndexLookupKey struct {
+	s       string
+	u       uint64
+	numeric bool
+}
+
+func IndexLookupString(s string) IndexLookupKey {
+	return IndexLookupKey{s: s}
+}
+
+func IndexLookupU64(u uint64) IndexLookupKey {
+	return IndexLookupKey{u: u, numeric: true}
+}
+
+func (key IndexLookupKey) IsNumeric() bool {
+	return key.numeric
+}
+
+func (key IndexLookupKey) StringKey() string {
+	return key.s
+}
+
+func (key IndexLookupKey) U64() uint64 {
+	return key.u
+}
+
+func (key IndexLookupKey) IndexKey() IndexKey {
+	if key.numeric {
+		return FromU64(key.u)
+	}
+	return FromString(key.s)
 }
 
 type DataKey struct {
@@ -413,10 +485,9 @@ func UserKeyFromDataKey[K ~string | ~uint64](key DataKey, strKey bool) K {
 func UserKeyBytesWithBuf[K ~string | ~uint64](id K, strKey bool, buf *[8]byte) []byte {
 	if strKey {
 		s := *(*string)(unsafe.Pointer(&id))
-		return unsafe.Slice(unsafe.StringData(s), len(s))
+		return StringBytes(s)
 	}
-	binary.BigEndian.PutUint64(buf[:], *(*uint64)(unsafe.Pointer(&id)))
-	return buf[:]
+	return U64BytesWithBuf(*(*uint64)(unsafe.Pointer(&id)), buf)
 }
 
 func UserKeyFromBytes[K ~string | ~uint64](b []byte, strKey bool) K {
@@ -424,16 +495,23 @@ func UserKeyFromBytes[K ~string | ~uint64](b []byte, strKey bool) K {
 		s := string(b)
 		return *(*K)(unsafe.Pointer(&s))
 	}
-	v := binary.BigEndian.Uint64(b)
+	v := U64FromBytes(b)
 	return *(*K)(unsafe.Pointer(&v))
+}
+
+func StringBytes(s string) []byte {
+	return unsafe.Slice(unsafe.StringData(s), len(s))
+}
+
+func U64FromBytes(b []byte) uint64 {
+	return binary.BigEndian.Uint64(b)
 }
 
 func (key DataKey) Bytes(strKey bool, buf *[8]byte) []byte {
 	if strKey {
-		return unsafe.Slice(unsafe.StringData(key.s), len(key.s))
+		return StringBytes(key.s)
 	}
-	binary.BigEndian.PutUint64(buf[:], key.u)
-	return buf[:]
+	return U64BytesWithBuf(key.u, buf)
 }
 
 func (key DataKey) Format(strKey bool) string {
@@ -443,77 +521,5 @@ func (key DataKey) Format(strKey bool) string {
 	return strconv.FormatUint(key.u, 10)
 }
 
-func (key DataKey) String() string {
-	return key.s
-}
-
-func (key DataKey) Uint() uint64 {
-	return key.u
-}
-
-/**/
-
-const (
-	minDataKeyShift = 5
-	maxDataKeyShift = 16
-
-	MinDataKeyPooledCap = 1 << minDataKeyShift
-	MaxDataKeyPooledCap = 1 << maxDataKeyShift
-
-	// MaxDataKeyRetainedCap is the largest external capacity that may be
-	// demoted into the largest bucket. Larger slices are dropped to avoid
-	// retaining very large backing arrays through a smaller bucket.
-	MaxDataKeyRetainedCap = MaxDataKeyPooledCap + MaxDataKeyPooledCap/4
-
-	maxBucketDistance = 4
-)
-
-var dataKeyPools [maxDataKeyShift + 1]sync.Pool
-
-func GetDataKeySlice(capHint int) []DataKey {
-	if capHint < 0 {
-		panic("GetDataKeySlice: negative capHint")
-	}
-
-	if capHint > MaxDataKeyPooledCap {
-		return make([]DataKey, 0, capHint)
-	}
-	var shift int
-	if capHint <= MinDataKeyPooledCap {
-		shift = minDataKeyShift
-	} else {
-		shift = bits.Len(uint(capHint - 1)) // ceil(log2(capHint))
-	}
-
-	lim := min(shift+maxBucketDistance, maxDataKeyShift)
-	for sh := shift; sh <= lim; sh++ {
-		if v := dataKeyPools[sh].Get(); v != nil {
-			ptr := v.(*DataKey)
-			n := 1 << sh
-			s := unsafe.Slice(ptr, n)
-			return s[:0:n]
-		}
-	}
-
-	return make([]DataKey, 0, 1<<shift)
-}
-
-func PutDataKeySlice(s []DataKey) {
-	c := cap(s)
-	if c < MinDataKeyPooledCap {
-		return
-	}
-	var shift int
-	if c >= MaxDataKeyPooledCap {
-		if c <= MaxDataKeyRetainedCap {
-			shift = maxDataKeyShift
-		} else {
-			return
-		}
-	} else {
-		shift = bits.Len(uint(c)) - 1 // floor(log2(c))
-	}
-	clear(s[:c])
-	n := 1 << shift
-	dataKeyPools[shift].Put(unsafe.SliceData(s[:n:n]))
-}
+func (key DataKey) String() string { return key.s }
+func (key DataKey) Uint() uint64   { return key.u }

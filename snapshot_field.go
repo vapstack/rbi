@@ -72,11 +72,11 @@ func (s *fieldWriteScratch) reset() {
 
 func (s *fieldWriteScratch) release() {
 	if s.strings != nil {
-		pooled.PutStringSlice(s.strings)
+		pooled.ReleaseStringSlice(s.strings)
 		s.strings = nil
 	}
 	if s.fixed != nil {
-		pooled.PutUint64Slice(s.fixed)
+		pooled.ReleaseUint64Slice(s.fixed)
 		s.fixed = nil
 	}
 	s.ok = false

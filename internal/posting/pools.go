@@ -51,7 +51,7 @@ func GetSlice(capHint int) []List {
 	return make([]List, 0, 1<<shift)
 }
 
-func PutSlice(s []List) {
+func ReleaseSlice(s []List) {
 	c := cap(s)
 	if c < minPostingPooledCap {
 		return
@@ -115,7 +115,7 @@ func getContainerIndexStorageWithLen(l int) *containerIndexStorage {
 	}
 }
 
-func putContainerIndexStorage(storage *containerIndexStorage) {
+func releaseContainerIndexStorage(storage *containerIndexStorage) {
 	idx := containerIndexPoolIndex(cap(storage.keys))
 	if idx < 0 {
 		panic("containerIndex storage capacity exceeds pooled capacity")
@@ -136,11 +136,6 @@ func getShortIterator(slice []uint16) *shortIterator {
 	return &shortIterator{slice: slice}
 }
 
-func putShortIterator(it *shortIterator) {
-	it.slice = nil
-	shortIteratorPool.Put(it)
-}
-
 func getBitmap32() *bitmap32 {
 	var rb *bitmap32
 	if v := bitmap32Pool.Get(); v != nil {
@@ -152,11 +147,6 @@ func getBitmap32() *bitmap32 {
 	return rb
 }
 
-func putBitmap32(rb *bitmap32) {
-	rb.highlowcontainer.clear()
-	bitmap32Pool.Put(rb)
-}
-
 func getRunContainer() *containerRun {
 	var rc *containerRun
 	if v := runContainerPool.Get(); v != nil {
@@ -166,15 +156,6 @@ func getRunContainer() *containerRun {
 	}
 	rc.refs.Store(1)
 	return rc
-}
-
-func putRunContainer(rc *containerRun) {
-	if cap(rc.iv) > maxPooledRunContainerCapacity {
-		return
-	}
-	clear(rc.iv)
-	rc.iv = rc.iv[:0]
-	runContainerPool.Put(rc)
 }
 
 func getContainerArray() *containerArray {
@@ -223,16 +204,6 @@ func getContainerArrayFromSlice(src []uint16) *containerArray {
 	return ac
 }
 
-func putContainerArray(ac *containerArray) {
-	idx := containerArrayPoolPutIndex(cap(ac.content))
-	if idx < 0 {
-		return
-	}
-	clear(ac.content)
-	ac.content = ac.content[:0]
-	containerArrayClassPools[idx].Put(ac)
-}
-
 func getIntIterator(rb *bitmap32) *intIterator {
 	var it *intIterator
 	if v := intIteratorPool.Get(); v != nil {
@@ -244,11 +215,6 @@ func getIntIterator(rb *bitmap32) *intIterator {
 	return it
 }
 
-func putIntIterator(it *intIterator) {
-	*it = intIterator{}
-	intIteratorPool.Put(it)
-}
-
 func getManyIntIterator(rb *bitmap32) *manyIntIterator {
 	var it *manyIntIterator
 	if v := manyIntIteratorPool.Get(); v != nil {
@@ -258,11 +224,6 @@ func getManyIntIterator(rb *bitmap32) *manyIntIterator {
 	}
 	it.initialize(rb)
 	return it
-}
-
-func putManyIntIterator(it *manyIntIterator) {
-	*it = manyIntIterator{}
-	manyIntIteratorPool.Put(it)
 }
 
 func getContainerBitmap() *containerBitmap {
@@ -278,15 +239,6 @@ func getContainerBitmap() *containerBitmap {
 	return bc
 }
 
-func putContainerBitmap(bc *containerBitmap) {
-	if len(bc.bitmap) != bitmapContainerWords {
-		return
-	}
-	bc.cardinality = 0
-	clear(bc.bitmap)
-	bitmapContainerPool.Put(bc)
-}
-
 func getBitmapContainerShortIterator(bc *containerBitmap) *bitmapContainerShortIterator {
 	if v := bitmapShortIteratorPool.Get(); v != nil {
 		it := v.(*bitmapContainerShortIterator)
@@ -295,11 +247,6 @@ func getBitmapContainerShortIterator(bc *containerBitmap) *bitmapContainerShortI
 		return it
 	}
 	return &bitmapContainerShortIterator{ptr: bc, i: bc.nextSetBit(0)}
-}
-
-func putBitmapContainerShortIterator(it *bitmapContainerShortIterator) {
-	it.ptr = nil
-	bitmapShortIteratorPool.Put(it)
 }
 
 func getBitmapContainerManyIterator(bc *containerBitmap) *bitmapContainerManyIterator {
@@ -313,11 +260,6 @@ func getBitmapContainerManyIterator(bc *containerBitmap) *bitmapContainerManyIte
 	return &bitmapContainerManyIterator{ptr: bc, bitset: bc.bitmap[0]}
 }
 
-func putBitmapContainerManyIterator(it *bitmapContainerManyIterator) {
-	it.ptr = nil
-	bitmapManyIteratorPool.Put(it)
-}
-
 func getRunIterator16(rc *containerRun) *runIterator16 {
 	if v := runIteratorPool.Get(); v != nil {
 		it := v.(*runIterator16)
@@ -329,11 +271,6 @@ func getRunIterator16(rc *containerRun) *runIterator16 {
 	return &runIterator16{rc: rc}
 }
 
-func putRunIterator16(it *runIterator16) {
-	it.rc = nil
-	runIteratorPool.Put(it)
-}
-
 func getSmallPosting() *smallPosting {
 	if v := smallPostingPool.Get(); v != nil {
 		return v.(*smallPosting)
@@ -341,21 +278,11 @@ func getSmallPosting() *smallPosting {
 	return new(smallPosting)
 }
 
-func putSmallPosting(sp *smallPosting) {
-	sp.n = 0
-	smallPostingPool.Put(sp)
-}
-
 func getMidPosting() *midPosting {
 	if v := midPostingPool.Get(); v != nil {
 		return v.(*midPosting)
 	}
 	return new(midPosting)
-}
-
-func putMidPosting(mp *midPosting) {
-	mp.n = 0
-	midPostingPool.Put(mp)
 }
 
 func getArrayIter(ids []uint64) *arrayIter {
@@ -366,11 +293,6 @@ func getArrayIter(ids []uint64) *arrayIter {
 		return it
 	}
 	return &arrayIter{ids: ids}
-}
-
-func putArrayIter(it *arrayIter) {
-	it.ids = nil
-	arrayIterPool.Put(it)
 }
 
 func getSingletonIter(v uint64) Iterator {
@@ -385,10 +307,6 @@ func getSingletonIter(v uint64) Iterator {
 	return it
 }
 
-func putSingletonIter(it *singletonIter) {
-	singletonIterPool.Put(it)
-}
-
 func getLargePosting() *largePosting {
 	if v := largePostingPool.Get(); v != nil {
 		return v.(*largePosting)
@@ -396,30 +314,21 @@ func getLargePosting() *largePosting {
 	return new(largePosting)
 }
 
-func putLargePosting(lp *largePosting) {
-	lp.clear()
-	largePostingPool.Put(lp)
+func getLargeIterator(lp *largePosting) *largeIterator {
+	it := getLargeIteratorSnapshot(lp)
+	it.init()
+	return it
 }
 
-func getLargeIterator(lp *largePosting) *largeIterator {
+func getLargeIteratorSnapshot(lp *largePosting) *largeIterator {
 	var it *largeIterator
 	if v := largeIteratorPool.Get(); v != nil {
 		it = v.(*largeIterator)
 	} else {
 		it = new(largeIterator)
 	}
-	it.initialize(lp)
+	it.initializeSnapshot(lp)
 	return it
-}
-
-func putLargeIterator(it *largeIterator) {
-	if it.iter != nil {
-		it.iter.release()
-	}
-	it.iter = nil
-	it.highlowcontainer.clear()
-	it.highlowcontainer.releaseBacking()
-	largeIteratorPool.Put(it)
 }
 
 func getLargeArrayStorageWithLen(l int) *largeArrayStorage {
@@ -446,7 +355,7 @@ func getLargeArrayStorageWithLen(l int) *largeArrayStorage {
 	}
 }
 
-func putLargeArrayStorage(storage *largeArrayStorage) {
+func releaseLargeArrayStorage(storage *largeArrayStorage) {
 	idx := largeArrayPoolIndex(cap(storage.keys))
 	if idx < 0 {
 		return

@@ -450,7 +450,7 @@ func (db *DB[K, V]) BatchSet(ids []K, newVals []*V, execOpts ...ExecOption[K, V]
 	var keyScratch []keycodec.DataKey
 	if len(cfg.beforeProcess) != 0 {
 		keyScratch = keycodec.GetDataKeySlice(len(ids))
-		defer keycodec.PutDataKeySlice(keyScratch)
+		defer keycodec.ReleaseDataKeySlice(keyScratch)
 
 		for i := range newVals {
 			key := keycodec.DataKeyFromUserKey(ids[i], db.strKey)

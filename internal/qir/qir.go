@@ -6,7 +6,6 @@ import (
 	"sort"
 
 	"github.com/vapstack/qx"
-	"github.com/vapstack/rbi/internal/pooled"
 )
 
 type Op byte
@@ -101,18 +100,6 @@ const (
 	queryExprOwnersMaxLen = 128
 )
 
-var queryPool = pooled.Pointers[Query]{
-	Cleanup: func(q *Query) {
-		q.releaseOwned()
-	},
-	Clear: false,
-}
-
-var nilPrepareFieldOrdinals = pooled.Maps[string, int]{
-	NewCap: 8,
-	MaxLen: 64,
-}
-
 type prepareCompiler struct {
 	resolve             FieldResolver
 	useResolver         bool
@@ -165,7 +152,7 @@ func newPrepareCompilerNoResolve() prepareCompiler {
 
 func (c *prepareCompiler) release() {
 	if c.nilFieldOrdinals != nil {
-		nilPrepareFieldOrdinals.Put(c.nilFieldOrdinals)
+		nilPrepareFieldOrdinalsPool.Put(c.nilFieldOrdinals)
 		c.nilFieldOrdinals = nil
 	}
 }
@@ -175,7 +162,7 @@ func (c *prepareCompiler) fieldOrdinal(name string) (int, bool) {
 		return c.resolve.ResolveField(name)
 	}
 	if c.nilFieldOrdinals == nil {
-		c.nilFieldOrdinals = nilPrepareFieldOrdinals.Get()
+		c.nilFieldOrdinals = nilPrepareFieldOrdinalsPool.Get()
 	}
 	if fieldOrdinal, ok := c.nilFieldOrdinals[name]; ok {
 		return fieldOrdinal, true
@@ -587,7 +574,7 @@ func posOrderLiteralIsScalarString(v any) bool {
 	return false
 }
 
-func NewQuery(exprs ...Expr) *Query {
+func BuildQuery(exprs ...Expr) *Query {
 	query := queryPool.Get()
 	switch len(exprs) {
 	case 0:

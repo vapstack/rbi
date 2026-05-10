@@ -268,7 +268,12 @@ func (bc *containerBitmap) release() {
 	if bc.refs.Add(-1) != 0 {
 		return
 	}
-	putContainerBitmap(bc)
+	if len(bc.bitmap) != bitmapContainerWords {
+		return
+	}
+	bc.cardinality = 0
+	clear(bc.bitmap)
+	bitmapContainerPool.Put(bc)
 }
 
 func (bc *containerBitmap) Release() { bc.release() }
@@ -364,7 +369,8 @@ func (it *bitmapContainerShortIterator) advanceIfNeeded(minval uint16) {
 }
 
 func (it *bitmapContainerShortIterator) release() {
-	putBitmapContainerShortIterator(it)
+	it.ptr = nil
+	bitmapShortIteratorPool.Put(it)
 }
 
 func newContainerBitmapShortIterator(a *containerBitmap) *bitmapContainerShortIterator {
@@ -433,7 +439,8 @@ func (it *bitmapContainerManyIterator) nextMany64(hs uint64, buf []uint64) int {
 }
 
 func (it *bitmapContainerManyIterator) release() {
-	putBitmapContainerManyIterator(it)
+	it.ptr = nil
+	bitmapManyIteratorPool.Put(it)
 }
 
 func (bc *containerBitmap) getManyIterator() *bitmapContainerManyIterator {

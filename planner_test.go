@@ -71,7 +71,7 @@ func TestPlannerFilterPostingByPredicateChecksBuf_PostsAnyOwnedLargeAllocsPerRun
 
 	postsBuf := posting.GetSlice(2)
 	postsBuf = append(postsBuf, postA, postB)
-	defer posting.PutSlice(postsBuf)
+	defer posting.ReleaseSlice(postsBuf)
 
 	state := postsAnyFilterStatePool.Get()
 	state.postsBuf = postsBuf
@@ -85,7 +85,7 @@ func TestPlannerFilterPostingByPredicateChecksBuf_PostsAnyOwnedLargeAllocsPerRun
 
 	checks := pooled.GetIntSlice(1)
 	checks = append(checks, 0)
-	defer pooled.PutIntSlice(checks)
+	defer pooled.ReleaseIntSlice(checks)
 
 	var work posting.List
 	defer func() {
@@ -156,7 +156,7 @@ func TestPlannerFilterPostingByPredicateChecksBuf_CompactBorrowedAllocsPerRunSta
 
 	checks := pooled.GetIntSlice(4)
 	checks = append(checks, 0, 1, 2, 3)
-	defer pooled.PutIntSlice(checks)
+	defer pooled.ReleaseIntSlice(checks)
 
 	var work posting.List
 	defer func() {
@@ -198,7 +198,7 @@ func TestPlannerFilterPostingByPredicateChecksBuf_PreferredExactBypassesSmallBuc
 
 	postsBuf := posting.GetSlice(2)
 	postsBuf = append(postsBuf, postA, postB)
-	defer posting.PutSlice(postsBuf)
+	defer posting.ReleaseSlice(postsBuf)
 
 	state := postsAnyFilterStatePool.Get()
 	state.postsBuf = postsBuf
@@ -212,7 +212,7 @@ func TestPlannerFilterPostingByPredicateChecksBuf_PreferredExactBypassesSmallBuc
 
 	checks := pooled.GetIntSlice(1)
 	checks = append(checks, 0)
-	defer pooled.PutIntSlice(checks)
+	defer pooled.ReleaseIntSlice(checks)
 
 	mode, exact, work, card := plannerFilterPostingByPredicateChecksBuf(preds, checks, src.Borrow(), posting.List{}, false)
 	defer work.Release()
@@ -1876,9 +1876,9 @@ func TestPlannerOROrderKWay_RepeatedExecutionPromotesExactOnlyMaterializedRange(
 					break
 				}
 			}
-			pooled.PutIntSlice(residualChecks)
-			pooled.PutIntSlice(exactChecks)
-			pooled.PutIntSlice(checks)
+			pooled.ReleaseIntSlice(residualChecks)
+			pooled.ReleaseIntSlice(exactChecks)
+			pooled.ReleaseIntSlice(checks)
 			if !ageBranch {
 				continue
 			}
@@ -2277,7 +2277,7 @@ func TestPlannerORBranchCheckCounts_LargeImpossibleBranchWithZeroLenCoveredRetur
 	defer preds.Release()
 
 	covered := pooled.GetBoolSlice(0)
-	defer pooled.PutBoolSlice(covered)
+	defer pooled.ReleaseBoolSlice(covered)
 
 	streamChecks, mergeChecks := plannerORBranchCheckCounts(
 		plannerORBranch{preds: preds, leadIdx: -1},

@@ -441,8 +441,18 @@ func scalarArrayPosPriorityCoversAllKeysOverlay(ov indexdata.FieldOverlay, vals 
 	}
 	set := stringSetPool.Get(len(vals))
 	defer stringSetPool.Put(set)
+	var fixed u64set
+	hasFixed := false
 	for _, v := range vals {
 		set[v] = struct{}{}
+		if len(v) == 8 {
+			if !hasFixed {
+				fixed = newU64Set(len(vals))
+				defer releaseU64Set(&fixed)
+				hasFixed = true
+			}
+			fixed.Add(keycodec.Fixed8StringToU64(v))
+		}
 	}
 	if len(set) < ov.KeyCount() {
 		return false
@@ -453,7 +463,11 @@ func scalarArrayPosPriorityCoversAllKeysOverlay(ov indexdata.FieldOverlay, vals 
 		if !ok {
 			return true
 		}
-		if _, ok = set[key.UnsafeString()]; !ok {
+		if key.IsNumeric() {
+			if !hasFixed || !fixed.Has(key.U64()) {
+				return false
+			}
+		} else if _, ok = set[key.UnsafeString()]; !ok {
 			return false
 		}
 	}
@@ -599,7 +613,7 @@ func (qv *queryView) orderDataValues(v any, fm *field) ([]string, error) {
 		if valsBuf == nil {
 			return nil, nil
 		}
-		defer pooled.PutStringSlice(valsBuf)
+		defer pooled.ReleaseStringSlice(valsBuf)
 
 		out := make([]string, len(valsBuf))
 		copy(out, valsBuf)

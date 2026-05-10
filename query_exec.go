@@ -493,7 +493,7 @@ func orderPredicatesEmitPostingBufReader(
 
 func releaseOrderBasicResidualState(preds predicateSet, activeBuf []int) {
 	if activeBuf != nil {
-		pooled.PutIntSlice(activeBuf)
+		pooled.ReleaseIntSlice(activeBuf)
 	}
 	preds.Release()
 }
@@ -1079,7 +1079,7 @@ func (qv *queryView) validateOrderBasicSimpleExpr(e qir.Expr) error {
 	switch e.Op {
 	case qir.OpEQ:
 		if !fm.Slice {
-			_, isSlice, _, err := qv.exprValueToIdxScalar(e)
+			_, isSlice, _, err := qv.exprValueToLookupKey(e)
 			if err != nil {
 				return err
 			}
@@ -1090,7 +1090,7 @@ func (qv *queryView) validateOrderBasicSimpleExpr(e qir.Expr) error {
 		}
 		valsBuf, isSlice, _, err := qv.exprValueToDistinctIdxBuf(e)
 		if valsBuf != nil {
-			defer pooled.PutStringSlice(valsBuf)
+			defer pooled.ReleaseStringSlice(valsBuf)
 		}
 		if err != nil {
 			return err
@@ -1106,7 +1106,7 @@ func (qv *queryView) validateOrderBasicSimpleExpr(e qir.Expr) error {
 		}
 		valsBuf, isSlice, hasNil, err := qv.exprValueToDistinctIdxBuf(e)
 		if valsBuf != nil {
-			defer pooled.PutStringSlice(valsBuf)
+			defer pooled.ReleaseStringSlice(valsBuf)
 		}
 		if err != nil {
 			return err
@@ -1126,7 +1126,7 @@ func (qv *queryView) validateOrderBasicSimpleExpr(e qir.Expr) error {
 		}
 		valsBuf, isSlice, _, err := qv.exprValueToDistinctIdxBuf(e)
 		if valsBuf != nil {
-			defer pooled.PutStringSlice(valsBuf)
+			defer pooled.ReleaseStringSlice(valsBuf)
 		}
 		if err != nil {
 			return err
@@ -1259,7 +1259,7 @@ func (qv *queryView) prepareOrderBasicBaseCores(baseOps []qir.Expr) (*pooled.Sli
 			nextRB, ok, err := qv.rangeBoundsForScalarExpr(other)
 			if err != nil {
 				orderBasicBaseCoreSlicePool.Put(coresBuf)
-				pooled.PutIntSlice(rawCoreIdxBuf)
+				pooled.ReleaseIntSlice(rawCoreIdxBuf)
 				return nil, nil, false, err
 			}
 			if !ok {
@@ -1273,7 +1273,7 @@ func (qv *queryView) prepareOrderBasicBaseCores(baseOps []qir.Expr) (*pooled.Sli
 		}
 		if rb.Empty {
 			orderBasicBaseCoreSlicePool.Put(coresBuf)
-			pooled.PutIntSlice(rawCoreIdxBuf)
+			pooled.ReleaseIntSlice(rawCoreIdxBuf)
 			return nil, nil, true, nil
 		}
 		if !qv.shouldCollapseOrderBasicNumericRange(fieldName, op.FieldOrdinal, rb) {
@@ -1305,92 +1305,6 @@ func (qv *queryView) prepareOrderBasicBaseCores(baseOps []qir.Expr) (*pooled.Sli
 		coresBuf.Append(orderBasicBaseCore{
 			kind: orderBasicBaseCoreRawExpr,
 			expr: op,
-		})
-	}
-	return coresBuf, rawCoreIdxBuf, false, nil
-}
-
-func (qv *queryView) prepareOrderBasicBaseCoresBuf(baseOps *pooled.Slice[qir.Expr]) (*pooled.Slice[orderBasicBaseCore], []int, bool, error) {
-	if baseOps == nil || baseOps.Len() == 0 {
-		return nil, nil, false, nil
-	}
-	coresBuf := orderBasicBaseCoreSlicePool.Get()
-	coresBuf.Grow(baseOps.Len())
-	rawCoreIdxBuf := pooled.GetIntSlice(baseOps.Len())[:baseOps.Len()]
-	for i := range rawCoreIdxBuf {
-		rawCoreIdxBuf[i] = -1
-	}
-
-	for i := 0; i < baseOps.Len(); i++ {
-		if rawCoreIdxBuf[i] >= 0 {
-			continue
-		}
-		op := baseOps.Get(i)
-		fm := qv.fieldMetaByExpr(op)
-		if !isOrderBasicCollapsibleNumericRangeExpr(op, fm) {
-			continue
-		}
-		fieldName := qv.engine.fieldNameByOrdinal(op.FieldOrdinal)
-
-		var rb indexdata.Bounds
-		groupCount := 0
-		for j := i; j < baseOps.Len(); j++ {
-			if rawCoreIdxBuf[j] >= 0 {
-				continue
-			}
-			other := baseOps.Get(j)
-			if other.FieldOrdinal != op.FieldOrdinal || !isOrderBasicCollapsibleNumericRangeExpr(other, fm) {
-				continue
-			}
-			nextRB, ok, err := qv.rangeBoundsForScalarExpr(other)
-			if err != nil {
-				orderBasicBaseCoreSlicePool.Put(coresBuf)
-				pooled.PutIntSlice(rawCoreIdxBuf)
-				return nil, nil, false, err
-			}
-			if !ok {
-				continue
-			}
-			mergeRangeBounds(&rb, nextRB)
-			groupCount++
-		}
-		if groupCount <= 1 {
-			continue
-		}
-		if rb.Empty {
-			orderBasicBaseCoreSlicePool.Put(coresBuf)
-			pooled.PutIntSlice(rawCoreIdxBuf)
-			return nil, nil, true, nil
-		}
-		if !qv.shouldCollapseOrderBasicNumericRange(fieldName, op.FieldOrdinal, rb) {
-			continue
-		}
-
-		coreIdx := coresBuf.Len()
-		coresBuf.Append(orderBasicBaseCore{
-			kind: orderBasicBaseCoreCollapsedRange,
-			collapsed: preparedScalarExactRange{
-				field:    fieldName,
-				bounds:   rb,
-				cacheKey: qv.materializedPredKeyForExactScalarRange(fieldName, rb),
-			},
-		})
-		for j := i; j < baseOps.Len(); j++ {
-			other := baseOps.Get(j)
-			if other.FieldOrdinal == op.FieldOrdinal && isOrderBasicCollapsibleNumericRangeExpr(other, fm) {
-				rawCoreIdxBuf[j] = coreIdx
-			}
-		}
-	}
-
-	for i := 0; i < baseOps.Len(); i++ {
-		if rawCoreIdxBuf[i] >= 0 {
-			continue
-		}
-		rawCoreIdxBuf[i] = coresBuf.Len()
-		coresBuf.Append(orderBasicBaseCore{
-			kind: orderBasicBaseCoreRawExpr,
-			expr: baseOps.Get(i),
 		})
 	}
 	return coresBuf, rawCoreIdxBuf, false, nil
@@ -1565,60 +1479,6 @@ func (qv *queryView) materializeOrderBasicLimitComplementBaseOp(op qir.Expr, cac
 	return true
 }
 
-func (qv *queryView) materializeOrderMaterializedBaseOpsBuf(orderField string, baseOps *pooled.Slice[qir.Expr]) {
-	if qv.snap == nil || qv.snap.materializedPredCacheLimit() <= 0 || baseOps == nil || baseOps.Len() == 0 {
-		return
-	}
-	coresBuf, rawCoreIdxBuf, empty, err := qv.prepareOrderBasicBaseCoresBuf(baseOps)
-	if err != nil || empty {
-		if coresBuf != nil {
-			orderBasicBaseCoreSlicePool.Put(coresBuf)
-		}
-		if rawCoreIdxBuf != nil {
-			pooled.PutIntSlice(rawCoreIdxBuf)
-		}
-		return
-	}
-	defer orderBasicBaseCoreSlicePool.Put(coresBuf)
-	defer pooled.PutIntSlice(rawCoreIdxBuf)
-
-	keysBuf := materializedPredKeySlicePool.Get()
-	keysBuf.Grow(coresBuf.Len())
-	defer materializedPredKeySlicePool.Put(keysBuf)
-
-	for i := 0; i < coresBuf.Len(); i++ {
-		core := coresBuf.Get(i)
-		key := materializedPredKey{}
-		switch core.kind {
-		case orderBasicBaseCoreCollapsedRange:
-			key = core.collapsed.cacheKey
-		case orderBasicBaseCoreRawExpr:
-			if core.expr.Not || core.expr.FieldOrdinal < 0 || qv.engine.fieldNameByOrdinal(core.expr.FieldOrdinal) == orderField {
-				continue
-			}
-			stats, ok := qv.orderBasicRawBaseOpStats(core.expr, qv.snapshotUniverseCardinality())
-			if ok {
-				key = stats.cacheKey
-			}
-		}
-		if key.isZero() {
-			continue
-		}
-		seen := false
-		for j := 0; j < keysBuf.Len(); j++ {
-			if keysBuf.Get(j) == key {
-				seen = true
-				break
-			}
-		}
-		if seen {
-			continue
-		}
-		keysBuf.Append(key)
-		qv.promoteObservedOrderBasicBaseCore(core)
-	}
-}
-
 func (qv *queryView) promoteOrderBasicLimitMaterializedBaseOps(orderField string, baseOps []qir.Expr, observedRows uint64, needWindow uint64) {
 	if qv.snap == nil || len(baseOps) == 0 || observedRows == 0 {
 		return
@@ -1633,12 +1493,12 @@ func (qv *queryView) promoteOrderBasicLimitMaterializedBaseOps(orderField string
 			orderBasicBaseCoreSlicePool.Put(coresBuf)
 		}
 		if rawCoreIdxBuf != nil {
-			pooled.PutIntSlice(rawCoreIdxBuf)
+			pooled.ReleaseIntSlice(rawCoreIdxBuf)
 		}
 		return
 	}
 	defer orderBasicBaseCoreSlicePool.Put(coresBuf)
-	defer pooled.PutIntSlice(rawCoreIdxBuf)
+	defer pooled.ReleaseIntSlice(rawCoreIdxBuf)
 
 	keysBuf := materializedPredKeySlicePool.Get()
 	keysBuf.Grow(coresBuf.Len())
@@ -1864,7 +1724,7 @@ func (qv *queryView) tryQueryOrderBasicWithLimit(q *qir.Shape, trace *queryTrace
 				return nil, false, nil
 			}
 			if op.Op == qir.OpEQ {
-				_, isSlice, isNil, err := qv.exprValueToIdxScalar(op)
+				_, isSlice, isNil, err := qv.exprValueToLookupKey(op)
 				if err != nil {
 					return nil, true, err
 				}
@@ -1910,7 +1770,7 @@ func (qv *queryView) tryQueryOrderBasicWithLimit(q *qir.Shape, trace *queryTrace
 		defer orderBasicBaseCoreSlicePool.Put(baseCoresBuf)
 	}
 	if baseRawCoreIdxBuf != nil {
-		defer pooled.PutIntSlice(baseRawCoreIdxBuf)
+		defer pooled.ReleaseIntSlice(baseRawCoreIdxBuf)
 	}
 	if noMatch {
 		return nil, true, nil
@@ -1945,38 +1805,42 @@ func (qv *queryView) tryQueryOrderBasicWithLimit(q *qir.Shape, trace *queryTrace
 
 	hasWarmBaseOps := baseCoresBuf != nil && baseCoresBuf.Len() > 0 && qv.hasWarmOrderBasicBaseCores(baseCoresBuf)
 	if !preferBaseCores && !fm.Ptr && len(baseOps) > 0 {
-		leavesBuf := exprSlicePool.Get()
-		leavesBuf.Grow(len(baseOps) + 2)
-		if appendAndLeavesModeBuf(leavesBuf, q.Expr, andLeafModeCollect) {
-			execDecision := qv.decideExecutionOrderByCostBuf(q, leavesBuf)
-			if execDecision.use {
-				window, _ := orderWindow(q)
-				predSet, ok := qv.buildPredicatesOrderedWithModeBuf(leavesBuf, f, false, window, q.Offset, true, true)
-				if ok {
-					defer predSet.Release()
-					for i := 0; i < predSet.Len(); i++ {
-						if predSet.Get(i).alwaysFalse {
-							exprSlicePool.Put(leavesBuf)
-							return nil, true, nil
+		leafCount, ok := countAndLeavesMode(q.Expr, andLeafModeCollect)
+		if ok && leafCount > 0 {
+			leavesBuf := qir.GetExprSlice(leafCount)
+			appended, status := appendAndLeavesMode(leavesBuf, q.Expr, andLeafModeCollect)
+			if status == andLeafStatusOK {
+				leavesBuf = appended
+				execDecision := qv.decideExecutionOrderByCost(q, leavesBuf)
+				if execDecision.use {
+					window, _ := orderWindow(q)
+					predSet, ok := qv.buildPredicatesOrderedWithMode(leavesBuf, f, false, window, q.Offset, true, true)
+					if ok {
+						defer predSet.Release()
+						for i := 0; i < predSet.Len(); i++ {
+							if predSet.Get(i).alwaysFalse {
+								qir.ReleaseExprSlice(leavesBuf)
+								return nil, true, nil
+							}
 						}
-					}
-					execTrace := trace
-					var observedTrace queryTrace
-					observedStart := uint64(0)
-					if execTrace == nil {
-						execTrace = &observedTrace
-					} else {
-						observedStart = execTrace.ev.RowsExamined
-					}
-					if out, ok := qv.execPlanOrderedBasicReader(q, predSet, execTrace); ok {
-						exprSlicePool.Put(leavesBuf)
-						qv.promoteOrderBasicLimitMaterializedBaseOps(f, baseOps, execTrace.ev.RowsExamined-observedStart, uint64(needWindow))
-						return out, true, nil
+						execTrace := trace
+						var observedTrace queryTrace
+						observedStart := uint64(0)
+						if execTrace == nil {
+							execTrace = &observedTrace
+						} else {
+							observedStart = execTrace.ev.RowsExamined
+						}
+						if out, ok := qv.execPlanOrderedBasicReader(q, predSet, execTrace); ok {
+							qir.ReleaseExprSlice(leavesBuf)
+							qv.promoteOrderBasicLimitMaterializedBaseOps(f, baseOps, execTrace.ev.RowsExamined-observedStart, uint64(needWindow))
+							return out, true, nil
+						}
 					}
 				}
 			}
+			qir.ReleaseExprSlice(leavesBuf)
 		}
-		exprSlicePool.Put(leavesBuf)
 		if !hasWarmBaseOps {
 			return nil, false, nil
 		}
@@ -1993,14 +1857,13 @@ func (qv *queryView) tryQueryOrderBasicWithLimit(q *qir.Shape, trace *queryTrace
 	var residualActive []int
 
 	if hasWarmBaseOps {
-		residualOpsBuf := exprSlicePool.Get()
-		residualOpsBuf.Grow(len(baseOps))
-		defer exprSlicePool.Put(residualOpsBuf)
+		residualOpsBuf := qir.GetExprSlice(len(baseOps))
+		defer qir.ReleaseExprSlice(residualOpsBuf)
 		var loadedCoreBuf []bool
 		if baseCoresBuf != nil && baseCoresBuf.Len() > 0 {
 			loadedCoreBuf = pooled.GetBoolSlice(baseCoresBuf.Len())[:baseCoresBuf.Len()]
 			clear(loadedCoreBuf)
-			defer pooled.PutBoolSlice(loadedCoreBuf)
+			defer pooled.ReleaseBoolSlice(loadedCoreBuf)
 		}
 
 		baseBuilt := false
@@ -2026,14 +1889,14 @@ func (qv *queryView) tryQueryOrderBasicWithLimit(q *qir.Shape, trace *queryTrace
 			if loadedCoreBuf[baseRawCoreIdxBuf[i]] {
 				continue
 			}
-			residualOpsBuf.Append(op)
+			residualOpsBuf = append(residualOpsBuf, op)
 		}
 		if !baseBuilt {
 			hasWarmBaseOps = false
-		} else if residualOpsBuf.Len() > 0 {
+		} else if len(residualOpsBuf) > 0 {
 			window, _ := orderWindow(q)
 			var ok bool
-			residualPredSet, ok = qv.buildPredicatesOrderedWithModeBuf(residualOpsBuf, f, false, window, q.Offset, false, true)
+			residualPredSet, ok = qv.buildPredicatesOrderedWithMode(residualOpsBuf, f, false, window, q.Offset, false, true)
 			if !ok {
 				base.release()
 				base = postingResult{}
@@ -2159,7 +2022,7 @@ func (qv *queryView) scanOrderLimitNoPredicates(q *qir.Shape, ov indexdata.Field
 func (qv *queryView) scanOrderLimitWithPredicatesReader(q *qir.Shape, ov indexdata.FieldOverlay, br indexdata.OverlayRange, desc bool, preds predicateReader, nilTailField string, trace *queryTrace) ([]uint64, bool) {
 	if preds.Len() > limitQueryFastPathMaxLeaves {
 		activeBuf := pooled.GetIntSlice(preds.Len())
-		defer pooled.PutIntSlice(activeBuf)
+		defer pooled.ReleaseIntSlice(activeBuf)
 		for i := 0; i < preds.Len(); i++ {
 			p := preds.Get(i)
 			if p.alwaysFalse {
@@ -2182,11 +2045,11 @@ func (qv *queryView) scanOrderLimitWithPredicatesReader(q *qir.Shape, ov indexda
 		sortActivePredicatesBufReader(activeBuf, preds)
 
 		exactActiveBuf := pooled.GetIntSlice(len(activeBuf))
-		defer pooled.PutIntSlice(exactActiveBuf)
+		defer pooled.ReleaseIntSlice(exactActiveBuf)
 		exactActiveBuf = buildExactBucketPostingFilterActiveBufReader(exactActiveBuf, activeBuf, preds)
 
 		residualActiveBuf := pooled.GetIntSlice(len(activeBuf))
-		defer pooled.PutIntSlice(residualActiveBuf)
+		defer pooled.ReleaseIntSlice(residualActiveBuf)
 		residualActiveBuf = plannerResidualChecksBuf(residualActiveBuf, activeBuf, exactActiveBuf)
 
 		exactOnly := len(activeBuf) > 0 && len(activeBuf) == len(exactActiveBuf)
@@ -2562,7 +2425,7 @@ func (qv *queryView) tryQueryRangeNoOrderWithLimit(q *qir.Shape, trace *queryTra
 	isNil := false
 	rb := indexdata.Bounds{Has: true}
 	if e.Op == qir.OpEQ {
-		key, isSlice, eqNil, err := qv.exprValueToIdxScalar(e)
+		key, isSlice, eqNil, err := qv.exprValueToLookupKey(e)
 		if err != nil {
 			return nil, true, err
 		}
@@ -2597,8 +2460,15 @@ func (qv *queryView) tryQueryRangeNoOrderWithLimit(q *qir.Shape, trace *queryTra
 			}
 			return cursor.out, true, nil
 		}
-		rb.ApplyLo(key, true)
-		rb.ApplyHi(key, true)
+		if key.IsNumeric() {
+			idxKey := key.IndexKey()
+			rb.ApplyLoIndex(idxKey, true)
+			rb.ApplyHiIndex(idxKey, true)
+		} else {
+			s := key.StringKey()
+			rb.ApplyLo(s, true)
+			rb.ApplyHi(s, true)
+		}
 	} else {
 		nextRB, ok, err := qv.rangeBoundsForScalarExpr(e)
 		if err != nil {

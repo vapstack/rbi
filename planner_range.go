@@ -546,41 +546,6 @@ func (qv *queryView) collectOrderedMergedScalarRangeFields(
 	return true
 }
 
-func (qv *queryView) collectOrderedMergedScalarRangeFieldsBuf(
-	orderField string,
-	leaves *pooled.Slice[qir.Expr],
-	dst *pooled.Slice[orderedMergedScalarRangeField],
-) bool {
-	dst.Truncate()
-	for i := 0; i < leaves.Len(); i++ {
-		e := leaves.Get(i)
-		if !qv.isPositiveOrderedNumericRangeLeaf(e, orderField) {
-			continue
-		}
-		rb, ok, err := qv.rangeBoundsForScalarExpr(e)
-		if err != nil || !ok {
-			return false
-		}
-		fieldName := qv.engine.fieldNameByOrdinal(e.FieldOrdinal)
-		idx := findOrderedMergedScalarRangeField(dst, fieldName)
-		if idx < 0 {
-			dst.Append(orderedMergedScalarRangeField{
-				field:  fieldName,
-				expr:   e,
-				bounds: rb,
-				first:  i,
-				count:  1,
-			})
-			continue
-		}
-		group := dst.Get(idx)
-		mergeRangeBounds(&group.bounds, rb)
-		group.count++
-		dst.Set(idx, group)
-	}
-	return true
-}
-
 func (qv *queryView) collectMergedNumericRangeFields(
 	leaves []qir.Expr,
 	dst *pooled.Slice[orderedMergedScalarRangeField],

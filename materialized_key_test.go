@@ -106,7 +106,7 @@ func TestMaterializedPredKeyScalar_NumericBoundsDoNotCollide(t *testing.T) {
 
 func TestMaterializedPredKeyDistinctSet_RoundTripThroughStringCacheAPI(t *testing.T) {
 	vals := pooled.GetStringSlice(2)
-	defer pooled.PutStringSlice(vals)
+	defer pooled.ReleaseStringSlice(vals)
 	vals = append(vals, "DE", "FR")
 
 	key := materializedPredKeyForDistinctSetTerms("country", compileScalarOpForTest(qx.OpIN), vals, true)

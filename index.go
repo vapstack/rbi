@@ -18,6 +18,7 @@ import (
 	"unsafe"
 
 	"github.com/vapstack/rbi/internal/indexdata"
+	"github.com/vapstack/rbi/internal/keycodec"
 	"github.com/vapstack/rbi/internal/pooled"
 	"github.com/vapstack/rbi/internal/posting"
 	"go.etcd.io/bbolt"
@@ -116,7 +117,7 @@ func formatBuildIndexKeyDiagnostic(strKey bool, key []byte) string {
 		return fmt.Sprintf("id=%q", s)
 	}
 	if len(key) == 8 {
-		return fmt.Sprintf("id=%d", binary.BigEndian.Uint64(key))
+		return fmt.Sprintf("id=%d", keycodec.U64FromBytes(key))
 	}
 	return fmt.Sprintf("key_len=%d key_prefix_hex=%s", len(key), formatDiagnosticBytesPrefix(key, 24))
 }
@@ -253,11 +254,11 @@ func (s *buildIndexFieldLocalState) release() {
 	}
 
 	posting.ReleaseMap(s.vals)
-	indexdata.PutPostingMap(s.vals)
+	indexdata.ReleasePostingMap(s.vals)
 	s.vals = nil
 
 	posting.ReleaseMap(s.fixed)
-	indexdata.PutFixedPostingMap(s.fixed)
+	indexdata.ReleaseFixedPostingMap(s.fixed)
 	s.fixed = nil
 
 	posting.ReleaseMap(s.lenMap)
@@ -588,7 +589,7 @@ func (qe *queryEngine) buildIndex(
 	}
 	if len(qe.lenZeroComplement) != slotCount {
 		if qe.lenZeroComplement != nil {
-			pooled.PutBoolSlice(qe.lenZeroComplement)
+			pooled.ReleaseBoolSlice(qe.lenZeroComplement)
 		}
 		qe.lenZeroComplement = pooled.GetBoolSlice(slotCount)[:slotCount]
 		clear(qe.lenZeroComplement)
@@ -662,7 +663,7 @@ func (qe *queryEngine) buildIndex(
 				for entryPos := 0; entryPos < len(buf); entryPos++ {
 					entries = append(entries, buf[entryPos])
 				}
-				indexdata.PutMeasureEntrySlice(buf)
+				indexdata.ReleaseMeasureEntrySlice(buf)
 				localMeasureStates[worker][i] = nil
 			}
 			oldStorage := qe.measure[i]
@@ -691,7 +692,7 @@ func (qe *queryEngine) buildIndex(
 		for i := 0; i < len(oldMeasureStorages); i++ {
 			oldMeasureStorages[i].Release()
 		}
-		indexdata.PutMeasureStorageSlice(oldMeasureStorages)
+		indexdata.ReleaseMeasureStorageSlice(oldMeasureStorages)
 	}
 	if err != nil {
 		return buildIndexResult{}, fmt.Errorf("publish snapshot: %w", err)
@@ -800,7 +801,7 @@ func idxFromKeyNoLock(strKey bool, strMap *strMapper, key []byte) uint64 {
 	if strKey {
 		return strMap.createIdxNoLock(string(key))
 	}
-	return binary.BigEndian.Uint64(key)
+	return keycodec.U64FromBytes(key)
 }
 
 func (qe *queryEngine) buildLenIndex() {
@@ -808,7 +809,7 @@ func (qe *queryEngine) buildLenIndex() {
 	slotCount := len(qe.indexedFieldAccess)
 	qe.lenIndex = indexdata.GetFieldStorageSlice(slotCount)[:slotCount]
 	if qe.lenZeroComplement != nil {
-		pooled.PutBoolSlice(qe.lenZeroComplement)
+		pooled.ReleaseBoolSlice(qe.lenZeroComplement)
 	}
 	qe.lenZeroComplement = pooled.GetBoolSlice(slotCount)[:slotCount]
 	clear(qe.lenZeroComplement)
@@ -1021,7 +1022,7 @@ func (qe *queryEngine) loadIndexPayload(
 	indexdata.ReleaseFieldStorageSlots(qe.lenIndex)
 	indexdata.ReleaseMeasureStorageSlots(qe.measure)
 	if qe.lenZeroComplement != nil {
-		pooled.PutBoolSlice(qe.lenZeroComplement)
+		pooled.ReleaseBoolSlice(qe.lenZeroComplement)
 	}
 	slotCount := len(qe.indexedFieldAccess)
 	qe.index = indexdata.GetFieldStorageSlice(slotCount)[:slotCount]

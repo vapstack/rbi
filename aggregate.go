@@ -817,7 +817,7 @@ func (qv *queryView) executeGroupedOrdinaryByID(q *aggregateQuery, ids posting.L
 	if err == nil {
 		err = qv.foldGroupedOrdinaryByID(q, rows, states, groupByID)
 	}
-	pooled.PutUint32Slice(groupByID)
+	pooled.ReleaseUint32Slice(groupByID)
 	if err != nil {
 		aggregateMetricStateSlicePool.Put(states)
 		return Result{}, err
@@ -987,8 +987,8 @@ func (qv *queryView) foldGroupedOrdinaryFieldByID(
 	}
 
 	touched = resetAggregateGroupBucketCounts(counts, touched)
-	pooled.PutIntSlice(touched)
-	pooled.PutUint64Slice(counts)
+	pooled.ReleaseIntSlice(touched)
+	pooled.ReleaseUint64Slice(counts)
 	return err
 }
 
@@ -1583,24 +1583,16 @@ func aggregateValueFromIndexKey(f *field, key keycodec.IndexKey) Value {
 	}
 	switch {
 	case isNativeTimeField(f):
-		return Value{num: uint64(int64(raw ^ (uint64(1) << 63))), any: ValueKindInt}
+		return Value{num: uint64(keycodec.Int64FromOrderedKey(raw)), any: ValueKindInt}
 	case isAggregateSignedKind(f.Kind):
-		return Value{num: uint64(int64(raw ^ (uint64(1) << 63))), any: ValueKindInt}
+		return Value{num: uint64(keycodec.Int64FromOrderedKey(raw)), any: ValueKindInt}
 	case isAggregateUnsignedKind(f.Kind):
 		return Value{num: raw, any: ValueKindUint}
 	case isAggregateFloatKind(f.Kind):
-		return Value{num: math.Float64bits(float64FromOrderedKey(raw)), any: ValueKindFloat}
+		return Value{num: math.Float64bits(keycodec.Float64FromOrderedKey(raw)), any: ValueKindFloat}
 	default:
 		return Value{num: raw, any: ValueKindUint}
 	}
-}
-
-func float64FromOrderedKey(key uint64) float64 {
-	const sign = uint64(1) << 63
-	if key&sign != 0 {
-		return math.Float64frombits(key ^ sign)
-	}
-	return math.Float64frombits(^key)
 }
 
 func applyAggregateHaving(result Result, having aggregateHavingExpr) Result {

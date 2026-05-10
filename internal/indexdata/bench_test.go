@@ -975,7 +975,7 @@ func BenchmarkFieldOverlayLookupPostingsChunked(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		posts, est := ov.LookupPostings(keys)
 		total += est + uint64(len(posts))
-		posting.PutSlice(posts)
+		posting.ReleaseSlice(posts)
 	}
 	benchUint64 = total
 }
@@ -1040,7 +1040,7 @@ func BenchmarkFieldStorageBuilderChunked(b *testing.B) {
 				keys[i] = ov.KeyAt(i)
 				posts = append(posts, ov.PostingAt(i))
 			}
-			defer posting.PutSlice(posts)
+			defer posting.ReleaseSlice(posts)
 
 			b.ReportAllocs()
 			b.ResetTimer()
@@ -1144,7 +1144,7 @@ func BenchmarkNewRegularFieldStorageFromRunsOwned(b *testing.B) {
 					m[fmt.Sprintf("k/%06d", j)] = (posting.List{}).BuildAdded(base + uint64(j))
 				}
 				runs[r] = NewStringFieldStorageRunFromPostingMap(m)
-				PutPostingMap(m)
+				ReleasePostingMap(m)
 			}
 			b.StartTimer()
 
@@ -1172,7 +1172,7 @@ func BenchmarkNewRegularFieldStorageFromRunsOwned(b *testing.B) {
 					m[uint64(j*2)] = (posting.List{}).BuildAdded(base + uint64(j))
 				}
 				runs[r] = NewFixedFieldStorageRunFromPostingMap(m)
-				PutFixedPostingMap(m)
+				ReleaseFixedPostingMap(m)
 			}
 			b.StartTimer()
 
@@ -1207,7 +1207,7 @@ func BenchmarkFieldStorageRunFromPostingMap(b *testing.B) {
 
 			b.StopTimer()
 			run.ReleaseOwned()
-			PutPostingMap(m)
+			ReleasePostingMap(m)
 			b.StartTimer()
 		}
 		benchUint64 = total
@@ -1230,7 +1230,7 @@ func BenchmarkFieldStorageRunFromPostingMap(b *testing.B) {
 
 			b.StopTimer()
 			run.ReleaseOwned()
-			PutFixedPostingMap(m)
+			ReleaseFixedPostingMap(m)
 			b.StartTimer()
 		}
 		benchUint64 = total
@@ -1373,7 +1373,7 @@ func BenchmarkSortPostingDeltasBuf(b *testing.B) {
 		}
 		sortPostingDeltasBuf(buf)
 		total += buf[0].Key.U64()
-		PutPostingDeltaSlice(buf)
+		ReleasePostingDeltaSlice(buf)
 	}
 	benchUint64 = total
 }

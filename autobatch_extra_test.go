@@ -87,7 +87,7 @@ func describeAutoBatchJobForTest[K ~string | ~uint64, V any](job *autoBatchJob) 
 	reqs := job.reqs
 	ids := make([]K, reqs.Len())
 	for i := 0; i < reqs.Len(); i++ {
-		ids[i] = autoBatchKeyID[K](reqs.Get(i).id)
+		ids[i] = dataKeyID[K](reqs.Get(i).id)
 	}
 	kind := "shared"
 	if job.isolated {
@@ -282,7 +282,7 @@ func waitAutoBatchExtraStrMapHasKeys[V any](tb testing.TB, db *DB[string, V], ke
 func newAutoBatchPopReqForTest(id uint64) *autoBatchRequest {
 	return &autoBatchRequest{
 		op:   autoBatchPatch,
-		id:   autoBatchKeyFromID(id),
+		id:   dataKeyFromID(id),
 		done: make(chan error, 1),
 	}
 }
@@ -327,7 +327,7 @@ func assertGroupedBetweenSharedPopSequenceForTest(tb testing.TB, db *DB[uint64, 
 		)
 	}
 	firstReqs := first[0].reqs
-	if first[0].isolated || firstReqs.Len() != 1 || autoBatchKeyID[uint64](firstReqs.Get(0).id) != 1 {
+	if first[0].isolated || firstReqs.Len() != 1 || dataKeyID[uint64](firstReqs.Get(0).id) != 1 {
 		tb.Fatalf(
 			"iter=%d pop1=%s queue=%s",
 			iteration,
@@ -348,7 +348,7 @@ func assertGroupedBetweenSharedPopSequenceForTest(tb testing.TB, db *DB[uint64, 
 	}
 	secondReqs := second[0].reqs
 	if !second[0].isolated || secondReqs.Len() != 2 ||
-		autoBatchKeyID[uint64](secondReqs.Get(0).id) != 2 || autoBatchKeyID[uint64](secondReqs.Get(1).id) != 3 {
+		dataKeyID[uint64](secondReqs.Get(0).id) != 2 || dataKeyID[uint64](secondReqs.Get(1).id) != 3 {
 		tb.Fatalf(
 			"iter=%d pop2=%s queue=%s",
 			iteration,
@@ -368,7 +368,7 @@ func assertGroupedBetweenSharedPopSequenceForTest(tb testing.TB, db *DB[uint64, 
 		)
 	}
 	thirdReqs := third[0].reqs
-	if third[0].isolated || thirdReqs.Len() != 1 || autoBatchKeyID[uint64](thirdReqs.Get(0).id) != 4 {
+	if third[0].isolated || thirdReqs.Len() != 1 || dataKeyID[uint64](thirdReqs.Get(0).id) != 4 {
 		tb.Fatalf(
 			"iter=%d pop3=%s queue=%s",
 			iteration,
@@ -1181,11 +1181,11 @@ func TestAutoBatchExtra_GrowQueuePreservesRingOrderAndCoalesceAcrossWrap(t *test
 		t.Fatalf("queue did not grow, len=%d", got)
 	}
 	gotOrder := []uint64{
-		autoBatchKeyID[uint64](db.autoBatcher.queueAt(0).reqs.Get(0).id),
-		autoBatchKeyID[uint64](db.autoBatcher.queueAt(1).reqs.Get(0).id),
-		autoBatchKeyID[uint64](db.autoBatcher.queueAt(2).reqs.Get(0).id),
-		autoBatchKeyID[uint64](db.autoBatcher.queueAt(3).reqs.Get(0).id),
-		autoBatchKeyID[uint64](db.autoBatcher.queueAt(4).reqs.Get(0).id),
+		dataKeyID[uint64](db.autoBatcher.queueAt(0).reqs.Get(0).id),
+		dataKeyID[uint64](db.autoBatcher.queueAt(1).reqs.Get(0).id),
+		dataKeyID[uint64](db.autoBatcher.queueAt(2).reqs.Get(0).id),
+		dataKeyID[uint64](db.autoBatcher.queueAt(3).reqs.Get(0).id),
+		dataKeyID[uint64](db.autoBatcher.queueAt(4).reqs.Get(0).id),
 	}
 	db.autoBatcher.mu.Unlock()
 

@@ -467,7 +467,7 @@ func copyBoolBufAndRelease(buf []bool) []bool {
 		return nil
 	}
 	out := append([]bool(nil), buf...)
-	pooled.PutBoolSlice(buf)
+	pooled.ReleaseBoolSlice(buf)
 	return out
 }
 
@@ -777,7 +777,7 @@ func (qe *queryEngine) exprValueToIdxOwned(expr qx.Expr) ([]string, bool, bool, 
 		if valsBuf == nil {
 			return nil, true, hasNil, nil
 		}
-		defer pooled.PutStringSlice(valsBuf)
+		defer pooled.ReleaseStringSlice(valsBuf)
 
 		out := make([]string, len(valsBuf))
 		copy(out, valsBuf)
@@ -831,7 +831,7 @@ func (qe *queryEngine) exprValueToDistinctIdxOwned(expr qx.Expr) ([]string, bool
 			if err != nil || valsBuf == nil {
 				return nil, true, hasNil, err
 			}
-			defer pooled.PutStringSlice(valsBuf)
+			defer pooled.ReleaseStringSlice(valsBuf)
 			valsBuf = dedupStringBufInPlace(valsBuf)
 			out := make([]string, len(valsBuf))
 			copy(out, valsBuf)
@@ -843,7 +843,7 @@ func (qe *queryEngine) exprValueToDistinctIdxOwned(expr qx.Expr) ([]string, bool
 	if err != nil || valsBuf == nil {
 		return nil, isSlice, hasNil, err
 	}
-	defer pooled.PutStringSlice(valsBuf)
+	defer pooled.ReleaseStringSlice(valsBuf)
 
 	out := make([]string, len(valsBuf))
 	copy(out, valsBuf)

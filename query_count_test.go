@@ -593,7 +593,7 @@ func TestCount_ScalarInSplit_ResidualFilterMatchesBitmap(t *testing.T) {
 
 	valsBuf, isSlice, hasNil, err := qv.exprValueToDistinctIdxBuf(mustCountQIRExprForDB(t, db, qx.IN("country", []string{"US", "DE", "FR"})))
 	if valsBuf != nil {
-		defer pooled.PutStringSlice(valsBuf)
+		defer pooled.ReleaseStringSlice(valsBuf)
 	}
 	if err != nil || !isSlice || hasNil {
 		t.Fatalf("exprValueToDistinctIdxBuf: isSlice=%v hasNil=%v err=%v", isSlice, hasNil, err)
@@ -1635,7 +1635,7 @@ func TestCountPredicateMaterializationThresholds_Adaptive(t *testing.T) {
 		kind:     predicateKindPostsAny,
 		postsBuf: newPostsBuf(12),
 	}
-	defer posting.PutSlice(setPred.postsBuf)
+	defer posting.ReleaseSlice(setPred.postsBuf)
 	if shouldMaterializeCountSetPredicate(setPred, 500, 500_000) {
 		t.Fatalf("set predicate should not materialize on low probe estimate")
 	}
@@ -1661,7 +1661,7 @@ func TestCountPredicateMaterializationThresholds_Adaptive(t *testing.T) {
 		postsBuf: newPostsBuf(3),
 		estCard:  80_000,
 	}
-	defer posting.PutSlice(smallHasAnyResidual.postsBuf)
+	defer posting.ReleaseSlice(smallHasAnyResidual.postsBuf)
 	if !shouldUseCountLeadResidualHasAnyExactFilter(smallHasAnyResidual) {
 		t.Fatalf("expected small HASANY residual exact filter above threshold")
 	}
@@ -1671,7 +1671,7 @@ func TestCountPredicateMaterializationThresholds_Adaptive(t *testing.T) {
 		postsBuf: newPostsBuf(4),
 		estCard:  80_000,
 	}
-	defer posting.PutSlice(fourTermHasAnyResidual.postsBuf)
+	defer posting.ReleaseSlice(fourTermHasAnyResidual.postsBuf)
 	if !shouldUseCountLeadResidualHasAnyExactFilter(fourTermHasAnyResidual) {
 		t.Fatalf("expected four-term HASANY residual exact filter above threshold")
 	}
@@ -1681,7 +1681,7 @@ func TestCountPredicateMaterializationThresholds_Adaptive(t *testing.T) {
 		postsBuf: newPostsBuf(5),
 		estCard:  80_000,
 	}
-	defer posting.PutSlice(tooWide.postsBuf)
+	defer posting.ReleaseSlice(tooWide.postsBuf)
 	if shouldUseCountLeadResidualHasAnyExactFilter(tooWide) {
 		t.Fatalf("unexpected residual exact filter beyond max term threshold")
 	}
@@ -2921,8 +2921,8 @@ func TestCountApplyLeadResidualExactFilters_StateOnlyAllocsPerRunStayZeroAfterWa
 		countLeadResidualExactFilterSlicePool.Put(filters)
 		postsAnyFilterStatePool.Put(state1)
 		postsAnyFilterStatePool.Put(state2)
-		posting.PutSlice(postsBuf1)
-		posting.PutSlice(postsBuf2)
+		posting.ReleaseSlice(postsBuf1)
+		posting.ReleaseSlice(postsBuf2)
 	}()
 
 	var work posting.List
@@ -2974,7 +2974,7 @@ func TestCountApplyLeadResidualExactFilters_MixedStateAndIDsMatchesExpected(t *t
 	defer func() {
 		countLeadResidualExactFilterSlicePool.Put(filters)
 		postsAnyFilterStatePool.Put(state)
-		posting.PutSlice(postsBuf)
+		posting.ReleaseSlice(postsBuf)
 	}()
 
 	out, nextWork := countApplyLeadResidualExactFilters(src.Borrow(), posting.List{}, filters)

@@ -660,7 +660,7 @@ func (qv *queryView) tryDirectSingleUniqueEqNoOrder(q *qir.Shape, trace *queryTr
 		return nil, false, nil
 	}
 
-	key, isSlice, isNil, err := qv.exprValueToIdxScalar(e)
+	key, isSlice, isNil, err := qv.exprValueToLookupKey(e)
 	if err != nil {
 		return nil, true, err
 	}
@@ -672,7 +672,7 @@ func (qv *queryView) tryDirectSingleUniqueEqNoOrder(q *qir.Shape, trace *queryTr
 	if isNil {
 		ids = qv.nilFieldOverlayForExpr(e).LookupPostingRetained(nilIndexEntryKey)
 	} else {
-		ids = qv.fieldOverlayForExpr(e).LookupPostingRetained(key)
+		ids = lookupScalarPostingRetained(qv.fieldOverlayForExpr(e), key)
 	}
 	if ids.IsEmpty() {
 		if trace != nil {
@@ -1242,7 +1242,7 @@ func (qv *queryView) buildLeafPred(e qir.Expr) (leafPred, bool, error) {
 			return leafPred{}, false, nil
 		}
 
-		key, isSlice, isNil, err := qv.exprValueToIdxScalar(e)
+		key, isSlice, isNil, err := qv.exprValueToLookupKey(e)
 		if err != nil {
 			return leafPred{}, true, err
 		}
@@ -1262,7 +1262,7 @@ func (qv *queryView) buildLeafPred(e qir.Expr) (leafPred, bool, error) {
 			}, true, nil
 		}
 
-		ids := ov.LookupPostingRetained(key)
+		ids := lookupScalarPostingRetained(ov, key)
 		if ids.IsEmpty() {
 			return emptyLeaf(), true, nil
 		}
@@ -1283,7 +1283,7 @@ func (qv *queryView) buildLeafPred(e qir.Expr) (leafPred, bool, error) {
 			return leafPred{}, true, err
 		}
 		if keysBuf != nil {
-			defer pooled.PutStringSlice(keysBuf)
+			defer pooled.ReleaseStringSlice(keysBuf)
 		}
 		keyCount := len(keysBuf)
 		if !isSlice || (keyCount == 0 && !hasNil) {
@@ -1292,7 +1292,7 @@ func (qv *queryView) buildLeafPred(e qir.Expr) (leafPred, bool, error) {
 
 		postsBuf, est := qv.scalarLookupPostings(fieldName, e.FieldOrdinal, keysBuf, hasNil)
 		if len(postsBuf) == 0 {
-			posting.PutSlice(postsBuf)
+			posting.ReleaseSlice(postsBuf)
 			return emptyLeaf(), true, nil
 		}
 		if len(postsBuf) == 1 {
@@ -1321,7 +1321,7 @@ func (qv *queryView) buildLeafPred(e qir.Expr) (leafPred, bool, error) {
 			return leafPred{}, true, err
 		}
 		if keysBuf != nil {
-			defer pooled.PutStringSlice(keysBuf)
+			defer pooled.ReleaseStringSlice(keysBuf)
 		}
 		keyCount := len(keysBuf)
 		if !isSlice || keyCount == 0 {
@@ -1334,7 +1334,7 @@ func (qv *queryView) buildLeafPred(e qir.Expr) (leafPred, bool, error) {
 		for i := 0; i < keyCount; i++ {
 			ids := ov.LookupPostingRetained(keysBuf[i])
 			if ids.IsEmpty() {
-				posting.PutSlice(postsBuf)
+				posting.ReleaseSlice(postsBuf)
 				return emptyLeaf(), true, nil
 			}
 			postsBuf = append(postsBuf, ids)
@@ -1362,7 +1362,7 @@ func (qv *queryView) buildLeafPred(e qir.Expr) (leafPred, bool, error) {
 			return leafPred{}, true, err
 		}
 		if keysBuf != nil {
-			defer pooled.PutStringSlice(keysBuf)
+			defer pooled.ReleaseStringSlice(keysBuf)
 		}
 		if !isSlice || len(keysBuf) == 0 {
 			return leafPred{}, false, nil
@@ -1370,7 +1370,7 @@ func (qv *queryView) buildLeafPred(e qir.Expr) (leafPred, bool, error) {
 
 		postsBuf, est := ov.LookupPostings(keysBuf)
 		if len(postsBuf) == 0 {
-			posting.PutSlice(postsBuf)
+			posting.ReleaseSlice(postsBuf)
 			return emptyLeaf(), true, nil
 		}
 		if len(postsBuf) == 1 {

@@ -211,7 +211,7 @@ func (qv *queryView) evalSimple(e qir.Expr) (postingResult, error) {
 	switch e.Op {
 	case qir.OpEQ:
 		if !f.Slice {
-			key, isSlice, isNil, err := qv.exprValueToIdxScalar(e)
+			key, isSlice, isNil, err := qv.exprValueToLookupKey(e)
 			if err != nil {
 				return postingResult{}, err
 			}
@@ -223,7 +223,7 @@ func (qv *queryView) evalSimple(e qir.Expr) (postingResult, error) {
 			if isNil {
 				ids = qv.nilFieldOverlayForExpr(e).LookupPostingRetained(nilIndexEntryKey)
 			} else {
-				ids = ov.LookupPostingRetained(key)
+				ids = lookupScalarPostingRetained(ov, key)
 			}
 			if !ids.IsEmpty() {
 				return postingResult{ids: ids}, nil
@@ -236,7 +236,7 @@ func (qv *queryView) evalSimple(e qir.Expr) (postingResult, error) {
 				return postingResult{}, err
 			}
 			if valsBuf != nil {
-				defer pooled.PutStringSlice(valsBuf)
+				defer pooled.ReleaseStringSlice(valsBuf)
 			}
 			if !isSlice {
 				return postingResult{}, fmt.Errorf("%w: %v expects a slice for slice field %v", ErrInvalidQuery, e.Op, fieldName)
@@ -253,7 +253,7 @@ func (qv *queryView) evalSimple(e qir.Expr) (postingResult, error) {
 			return postingResult{}, err
 		}
 		if valsBuf != nil {
-			defer pooled.PutStringSlice(valsBuf)
+			defer pooled.ReleaseStringSlice(valsBuf)
 		}
 		if !isSlice && e.Value != nil {
 			return postingResult{}, fmt.Errorf("%w: %v expects a slice", ErrInvalidQuery, e.Op)
@@ -293,7 +293,7 @@ func (qv *queryView) evalSimple(e qir.Expr) (postingResult, error) {
 			return postingResult{}, err
 		}
 		if valsBuf != nil {
-			defer pooled.PutStringSlice(valsBuf)
+			defer pooled.ReleaseStringSlice(valsBuf)
 		}
 		if !isSlice && e.Value != nil {
 			return postingResult{}, fmt.Errorf("%w: %v expects a slice", ErrInvalidQuery, e.Op)
@@ -440,7 +440,7 @@ func parallelBatchedPostingUnionOwned(posts []posting.List) posting.List {
 	chunkSize := (n + workers - 1) / workers
 	workerCount := (n + chunkSize - 1) / chunkSize
 	resultsBuf := posting.GetSlice(workerCount)[:workerCount]
-	defer posting.PutSlice(resultsBuf)
+	defer posting.ReleaseSlice(resultsBuf)
 
 	var wg sync.WaitGroup
 	for i := 0; i < workerCount; i++ {
@@ -491,8 +491,7 @@ func (qv *queryView) evalSliceEQ(field string, fieldOrdinal int, vals []string) 
 		lenBM = qv.snapshotUniverseView().Clone()
 		lenBM = lenBM.BuildAndNot(nonEmpty)
 	} else {
-		lenKey := keycodec.U64ByteString(uint64(valCount))
-		lenBM = lenOV.LookupPostingRetained(lenKey)
+		lenBM = lenOV.LookupPostingRetainedKey(keycodec.FromU64(uint64(valCount)))
 	}
 
 	if lenBM.IsEmpty() {
@@ -559,32 +558,57 @@ func normalizedScalarBoundFromIndexKey(op qir.Op, key keycodec.IndexKey) normali
 	}
 }
 
-func scalarValueToIdxRaw(raw any, v reflect.Value) (string, error) {
+func lookupScalarPostingRetained(ov indexdata.FieldOverlay, key keycodec.IndexLookupKey) posting.List {
+	if key.IsNumeric() {
+		return ov.LookupPostingRetainedKey(key.IndexKey())
+	}
+	return ov.LookupPostingRetained(key.StringKey())
+}
+
+func lookupScalarCardinality(ov indexdata.FieldOverlay, key keycodec.IndexLookupKey) uint64 {
+	if key.IsNumeric() {
+		return ov.LookupCardinalityKey(key.IndexKey())
+	}
+	return ov.LookupCardinality(key.StringKey())
+}
+
+func scalarValueToLookupKeyRaw(raw any, v reflect.Value) (keycodec.IndexLookupKey, error) {
 	switch v.Kind() {
 	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
-		return keycodec.Int64ByteString(v.Int()), nil
+		return keycodec.IndexLookupU64(keycodec.OrderedInt64Key(v.Int())), nil
 	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
-		return keycodec.U64ByteString(v.Uint()), nil
+		return keycodec.IndexLookupU64(v.Uint()), nil
 	case reflect.Float32, reflect.Float64:
-		return keycodec.Float64ByteString(v.Float()), nil
+		return keycodec.IndexLookupU64(keycodec.OrderedFloat64Key(v.Float())), nil
 	case reflect.String:
-		return v.String(), nil
+		return keycodec.IndexLookupString(v.String()), nil
 	case reflect.Bool:
 		if v.Bool() {
-			return "1", nil
+			return keycodec.IndexLookupString("1"), nil
 		}
-		return "0", nil
+		return keycodec.IndexLookupString("0"), nil
 	default:
 		if vi, ok := raw.(ValueIndexer); ok {
-			return vi.IndexingValue(), nil
+			return keycodec.IndexLookupString(vi.IndexingValue()), nil
 		}
 		if v.IsValid() && v.CanInterface() {
 			if vi, ok := v.Interface().(ValueIndexer); ok {
-				return vi.IndexingValue(), nil
+				return keycodec.IndexLookupString(vi.IndexingValue()), nil
 			}
 		}
-		return "", fmt.Errorf("unsupported value type: %v", v.Type())
+		return keycodec.IndexLookupKey{}, fmt.Errorf("unsupported value type: %v", v.Type())
 	}
+}
+
+func scalarValueToIdxRaw(raw any, v reflect.Value) (string, error) {
+	key, err := scalarValueToLookupKeyRaw(raw, v)
+	if err != nil {
+		return "", err
+	}
+	if key.IsNumeric() {
+		return keycodec.U64ByteString(key.U64()), nil
+	}
+	return key.StringKey(), nil
 }
 
 func signedIntFieldKind(kind reflect.Kind) bool {
@@ -669,50 +693,61 @@ func timeQueryValueToInt64Exact(v reflect.Value) (int64, bool) {
 	return numericQueryValueToInt64Exact(v)
 }
 
-func scalarValueToIdxField(raw any, v reflect.Value, fm *field) (string, error) {
+func scalarValueToLookupKeyField(raw any, v reflect.Value, fm *field) (keycodec.IndexLookupKey, error) {
 	if fm != nil && fm.UseVI {
 		if vi, ok := raw.(ValueIndexer); ok {
-			return vi.IndexingValue(), nil
+			return keycodec.IndexLookupString(vi.IndexingValue()), nil
 		}
 		if v.IsValid() && v.CanInterface() {
 			if vi, ok := v.Interface().(ValueIndexer); ok {
-				return vi.IndexingValue(), nil
+				return keycodec.IndexLookupString(vi.IndexingValue()), nil
 			}
 		}
 		if v.Kind() == reflect.String {
-			return v.String(), nil
+			return keycodec.IndexLookupString(v.String()), nil
 		}
-		return "", fmt.Errorf("unsupported value type: %v", v.Type())
+		return keycodec.IndexLookupKey{}, fmt.Errorf("unsupported value type: %v", v.Type())
 	}
 
 	if fm == nil {
-		return scalarValueToIdxRaw(raw, v)
+		return scalarValueToLookupKeyRaw(raw, v)
 	}
 
 	switch {
 	case isNativeTimeField(fm):
 		if unix, ok := timeQueryValueToInt64Exact(v); ok {
-			return keycodec.Int64ByteString(unix), nil
+			return keycodec.IndexLookupU64(keycodec.OrderedInt64Key(unix)), nil
 		}
-		return impossibleLookupKey, nil
+		return keycodec.IndexLookupString(impossibleLookupKey), nil
 	case signedIntFieldKind(fm.Kind):
 		if i, ok := numericQueryValueToInt64Exact(v); ok {
-			return keycodec.Int64ByteString(i), nil
+			return keycodec.IndexLookupU64(keycodec.OrderedInt64Key(i)), nil
 		}
-		return impossibleLookupKey, nil
+		return keycodec.IndexLookupString(impossibleLookupKey), nil
 	case unsignedIntFieldKind(fm.Kind):
 		if u, ok := numericQueryValueToUint64Exact(v); ok {
-			return keycodec.U64ByteString(u), nil
+			return keycodec.IndexLookupU64(u), nil
 		}
-		return impossibleLookupKey, nil
+		return keycodec.IndexLookupString(impossibleLookupKey), nil
 	case fm.Kind == reflect.Float32 || fm.Kind == reflect.Float64:
 		if f, ok := numericQueryValueToFloat64(v); ok {
-			return keycodec.Float64ByteString(f), nil
+			return keycodec.IndexLookupU64(keycodec.OrderedFloat64Key(f)), nil
 		}
-		return impossibleLookupKey, nil
+		return keycodec.IndexLookupString(impossibleLookupKey), nil
 	default:
-		return scalarValueToIdxRaw(raw, v)
+		return scalarValueToLookupKeyRaw(raw, v)
 	}
+}
+
+func scalarValueToIdxField(raw any, v reflect.Value, fm *field) (string, error) {
+	key, err := scalarValueToLookupKeyField(raw, v, fm)
+	if err != nil {
+		return "", err
+	}
+	if key.IsNumeric() {
+		return keycodec.U64ByteString(key.U64()), nil
+	}
+	return key.StringKey(), nil
 }
 
 func normalizeUnixTimeRangeBound(op qir.Op, v reflect.Value) normalizedScalarBound {
@@ -1024,20 +1059,20 @@ func sliceValueToIdxStringBuf(v reflect.Value, fm *field) ([]string, bool, error
 			continue
 		}
 		if elem.Kind() == reflect.Slice {
-			pooled.PutStringSlice(ixsBuf)
+			pooled.ReleaseStringSlice(ixsBuf)
 			return nil, false, fmt.Errorf("unsupported slice element type: %v", elem.Type())
 		}
 
 		key, err := scalarValueToIdxField(raw, elem, fm)
 		if err != nil {
-			pooled.PutStringSlice(ixsBuf)
+			pooled.ReleaseStringSlice(ixsBuf)
 			return nil, false, err
 		}
 		ixsBuf = append(ixsBuf, key)
 	}
 
 	if len(ixsBuf) == 0 {
-		pooled.PutStringSlice(ixsBuf)
+		pooled.ReleaseStringSlice(ixsBuf)
 		return nil, hasNil, nil
 	}
 	return ixsBuf, hasNil, nil
@@ -1068,23 +1103,34 @@ func (qv *queryView) scalarLookupPostings(field string, fieldOrdinal int, keys [
 }
 
 func (qv *queryView) exprValueToIdxScalar(expr qir.Expr) (string, bool, bool, error) {
+	key, isSlice, isNil, err := qv.exprValueToLookupKey(expr)
+	if err != nil || isSlice || isNil {
+		return "", isSlice, isNil, err
+	}
+	if key.IsNumeric() {
+		return keycodec.U64ByteString(key.U64()), false, false, nil
+	}
+	return key.StringKey(), false, false, nil
+}
+
+func (qv *queryView) exprValueToLookupKey(expr qir.Expr) (keycodec.IndexLookupKey, bool, bool, error) {
 	if expr.Value == nil {
-		return "", false, true, nil
+		return keycodec.IndexLookupKey{}, false, true, nil
 	}
 
 	fm := qv.fieldMetaByExpr(expr)
 	v := reflect.ValueOf(expr.Value)
 	v, isNil := unwrapExprValue(v)
 	if isNil {
-		return "", false, true, nil
+		return keycodec.IndexLookupKey{}, false, true, nil
 	}
 	if queryValueIsCollectionForField(v, fm) {
-		return "", true, false, nil
+		return keycodec.IndexLookupKey{}, true, false, nil
 	}
 
-	key, err := scalarValueToIdxField(expr.Value, v, fm)
+	key, err := scalarValueToLookupKeyField(expr.Value, v, fm)
 	if err != nil {
-		return "", false, false, err
+		return keycodec.IndexLookupKey{}, false, false, err
 	}
 	return key, false, false, nil
 }
@@ -1116,7 +1162,7 @@ func (qv *queryView) exprValueToDistinctIdxBuf(expr qir.Expr) ([]string, bool, b
 			valsBuf = append(valsBuf, v...)
 			valsBuf = dedupStringBufInPlace(valsBuf)
 			if len(valsBuf) == 0 {
-				pooled.PutStringSlice(valsBuf)
+				pooled.ReleaseStringSlice(valsBuf)
 				return nil, true, false, nil
 			}
 			return valsBuf, true, false, nil
@@ -1142,7 +1188,7 @@ func (qv *queryView) exprValueToDistinctIdxBuf(expr qir.Expr) ([]string, bool, b
 		}
 		valsBuf = dedupStringBufInPlace(valsBuf)
 		if len(valsBuf) == 0 {
-			pooled.PutStringSlice(valsBuf)
+			pooled.ReleaseStringSlice(valsBuf)
 			return nil, true, hasNil, nil
 		}
 		return valsBuf, true, hasNil, nil

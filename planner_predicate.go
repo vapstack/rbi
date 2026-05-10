@@ -959,7 +959,7 @@ func (qv *queryView) buildPredicateCandidate(e qir.Expr) (predicate, bool) {
 }
 
 func (qv *queryView) buildPredEqCandidate(e qir.Expr, fm *field, ov indexdata.FieldOverlay) (predicate, bool) {
-	key, isSlice, isNil, err := qv.exprValueToIdxScalar(qir.Expr{
+	key, isSlice, isNil, err := qv.exprValueToLookupKey(qir.Expr{
 		Op:           e.Op,
 		FieldOrdinal: e.FieldOrdinal,
 		Value:        e.Value,
@@ -995,7 +995,7 @@ func (qv *queryView) buildPredEqCandidate(e qir.Expr, fm *field, ov indexdata.Fi
 				estCard:  ids.Cardinality(),
 			}, true
 		} else {
-			ids := ov.LookupPostingRetained(key)
+			ids := lookupScalarPostingRetained(ov, key)
 			if e.Not {
 				if ids.IsEmpty() {
 					return predicate{expr: e, alwaysTrue: true}, true
@@ -1032,7 +1032,7 @@ func (qv *queryView) buildPredEqCandidate(e qir.Expr, fm *field, ov indexdata.Fi
 		return predicate{}, false
 	}
 	if valsBuf != nil {
-		defer pooled.PutStringSlice(valsBuf)
+		defer pooled.ReleaseStringSlice(valsBuf)
 	}
 
 	b, err := qv.evalSliceEQ(qv.engine.fieldNameByOrdinal(e.FieldOrdinal), e.FieldOrdinal, valsBuf)
@@ -1084,7 +1084,7 @@ func (qv *queryView) buildPredInCandidate(e qir.Expr, fm *field, ov indexdata.Fi
 		return predicate{}, false
 	}
 	if valsBuf != nil {
-		defer pooled.PutStringSlice(valsBuf)
+		defer pooled.ReleaseStringSlice(valsBuf)
 	}
 	valCount := len(valsBuf)
 	if !isSlice || (valCount == 0 && !hasNil) {
@@ -1099,7 +1099,7 @@ func (qv *queryView) buildPredInCandidate(e qir.Expr, fm *field, ov indexdata.Fi
 
 	if e.Not {
 		if len(postsBuf) == 0 {
-			posting.PutSlice(postsBuf)
+			posting.ReleaseSlice(postsBuf)
 			return predicate{expr: e, alwaysTrue: true}, true
 		}
 		if len(postsBuf) == 1 {
@@ -1124,7 +1124,7 @@ func (qv *queryView) buildPredInCandidate(e qir.Expr, fm *field, ov indexdata.Fi
 	}
 
 	if len(postsBuf) == 0 {
-		posting.PutSlice(postsBuf)
+		posting.ReleaseSlice(postsBuf)
 		return predicate{expr: e, alwaysFalse: true}, true
 	}
 	if len(postsBuf) == 1 {
@@ -1168,7 +1168,7 @@ func (qv *queryView) buildPredHasCandidate(e qir.Expr, fm *field, ov indexdata.F
 		return predicate{}, false
 	}
 	if valsBuf != nil {
-		defer pooled.PutStringSlice(valsBuf)
+		defer pooled.ReleaseStringSlice(valsBuf)
 	}
 	if !isSlice || len(valsBuf) == 0 {
 		return predicate{}, false
@@ -1239,7 +1239,7 @@ func (qv *queryView) buildPredHasCandidate(e qir.Expr, fm *field, ov indexdata.F
 	for i := 0; i < len(valsBuf); i++ {
 		ids := ov.LookupPostingRetained(valsBuf[i])
 		if ids.IsEmpty() {
-			posting.PutSlice(postsBuf)
+			posting.ReleaseSlice(postsBuf)
 			if e.Not {
 				return predicate{expr: e, alwaysTrue: true}, true
 			}
@@ -1293,7 +1293,7 @@ func (qv *queryView) buildPredHasAnyCandidate(e qir.Expr, fm *field, ov indexdat
 		return predicate{}, false
 	}
 	if valsBuf != nil {
-		defer pooled.PutStringSlice(valsBuf)
+		defer pooled.ReleaseStringSlice(valsBuf)
 	}
 	if !isSlice || len(valsBuf) == 0 {
 		return predicate{}, false
@@ -1317,7 +1317,7 @@ func (qv *queryView) buildPredHasAnyCandidate(e qir.Expr, fm *field, ov indexdat
 	}
 	if e.Not {
 		if len(postsBuf) == 0 {
-			posting.PutSlice(postsBuf)
+			posting.ReleaseSlice(postsBuf)
 			return predicate{expr: e, alwaysTrue: true}, true
 		}
 		if len(postsBuf) == 1 {
@@ -1342,7 +1342,7 @@ func (qv *queryView) buildPredHasAnyCandidate(e qir.Expr, fm *field, ov indexdat
 	}
 
 	if len(postsBuf) == 0 {
-		posting.PutSlice(postsBuf)
+		posting.ReleaseSlice(postsBuf)
 		return predicate{expr: e, alwaysFalse: true}, true
 	}
 
@@ -1605,7 +1605,7 @@ func (qv *queryView) materializedPredKey(e qir.Expr) materializedPredKey {
 		}
 		return qv.materializedPredKeyForNormalizedScalarBound(fieldName, bound)
 	}
-	key, isSlice, isNil, err := qv.exprValueToIdxScalar(qir.Expr{
+	key, isSlice, isNil, err := qv.exprValueToLookupKey(qir.Expr{
 		Op:           e.Op,
 		FieldOrdinal: e.FieldOrdinal,
 		Value:        e.Value,
@@ -1613,7 +1613,7 @@ func (qv *queryView) materializedPredKey(e qir.Expr) materializedPredKey {
 	if err != nil || isSlice || isNil {
 		return materializedPredKey{}
 	}
-	return qv.materializedPredKeyForScalar(fieldName, e.Op, key)
+	return materializedPredKeyForLookupKey(fieldName, e.Op, key)
 }
 
 func (qv *queryView) materializedPredCacheKey(e qir.Expr) string {
@@ -1775,7 +1775,7 @@ func (qv *queryView) execPlanCandidateOrderBasic(q *qir.Shape, preds predicateRe
 	}
 	if br.Empty() {
 		if rangeCovered != nil {
-			pooled.PutBoolSlice(rangeCovered)
+			pooled.ReleaseBoolSlice(rangeCovered)
 		}
 		return nil
 	}
@@ -1784,7 +1784,7 @@ func (qv *queryView) execPlanCandidateOrderBasic(q *qir.Shape, preds predicateRe
 			preds.GetPtr(i).covered = true
 		}
 	}
-	pooled.PutBoolSlice(rangeCovered)
+	pooled.ReleaseBoolSlice(rangeCovered)
 
 	var activeBuf [plannerPredicateFastPathMaxLeaves]int
 	active := activeBuf[:0]
@@ -2912,7 +2912,7 @@ func releasePredicateRuntimeState(p *predicate) {
 		p.lazyMatState = nil
 	}
 	if p.postsBuf != nil {
-		posting.PutSlice(p.postsBuf)
+		posting.ReleaseSlice(p.postsBuf)
 		p.postsBuf = nil
 	}
 }
@@ -3463,159 +3463,6 @@ func (qv *queryView) buildPredicatesOrderedWithMode(
 		preds.Append(p)
 	}
 
-	return preds, true
-}
-
-func (qv *queryView) buildPredicatesOrderedWithModeBuf(
-	leaves *pooled.Slice[qir.Expr],
-	orderField string,
-	allowMaterialize bool,
-	orderedWindow int,
-	orderedOffset uint64,
-	coverOrderRange bool,
-	allowOrderedEagerMaterialize bool,
-) (predicateSet, bool) {
-	if leaves.Len() == 1 {
-		leaf := leaves.Get(0)
-		if leaf.Op == qir.OpNOOP && leaf.Not {
-			preds := newPredicateSet(1)
-			preds.Append(predicate{alwaysFalse: true})
-			return preds, true
-		}
-	}
-
-	preds := newPredicateSet(leaves.Len())
-	universe := uint64(0)
-	if !allowMaterialize {
-		universe = qv.snapshotUniverseCardinality()
-	}
-	allowWarmOrderedRangeLoad := allowMaterialize || allowOrderedEagerMaterialize || !coverOrderRange || orderedOffset == 0
-	allowWarmScalarRangeLoad := allowWarmOrderedRangeLoad
-	routeUniverse := universe
-	if routeUniverse == 0 && orderedWindow > 0 {
-		routeUniverse = qv.snapshotUniverseCardinality()
-	}
-	var mergedRangesBuf *pooled.Slice[orderedMergedScalarRangeField]
-	if leaves.Len() > 1 {
-		mergedRangesBuf = orderedMergedScalarRangeFieldSlicePool.Get()
-		mergedRangesBuf.Grow(leaves.Len())
-		if !qv.collectOrderedMergedScalarRangeFieldsBuf(orderField, leaves, mergedRangesBuf) {
-			preds.Release()
-			orderedMergedScalarRangeFieldSlicePool.Put(mergedRangesBuf)
-			return predicateSet{}, false
-		}
-		defer orderedMergedScalarRangeFieldSlicePool.Put(mergedRangesBuf)
-	}
-	for i := 0; i < leaves.Len(); i++ {
-		e := leaves.Get(i)
-		fieldName := qv.engine.fieldNameByOrdinal(e.FieldOrdinal)
-		orderRangeDeferred := !coverOrderRange && qv.isOrderRangeCoveredLeaf(orderField, e)
-		if coverOrderRange && qv.isOrderRangeCoveredLeaf(orderField, e) {
-			rb, ok, err := qv.rangeBoundsForScalarExpr(e)
-			if err != nil || !ok || rb.Empty {
-				preds.Release()
-				return predicateSet{}, false
-			}
-			preds.Append(predicate{
-				expr:    e,
-				covered: true,
-			})
-			continue
-		}
-
-		if qv.isPositiveOrderedNumericRangeLeaf(e, orderField) {
-			idx := findOrderedMergedScalarRangeField(mergedRangesBuf, fieldName)
-			if idx >= 0 {
-				merged := mergedRangesBuf.Get(idx)
-				if merged.count > 1 {
-					if merged.first != i {
-						continue
-					}
-					mergedPred := predicate{
-						expr:               merged.expr,
-						hasEffectiveBounds: true,
-						effectiveBounds:    merged.bounds,
-					}
-					predAllowMaterialize := allowMaterialize
-					orderedRoute := qv.orderedScalarRangeRoutingForBuild(
-						mergedPred,
-						predAllowMaterialize,
-						orderedWindow,
-						orderedOffset,
-						universe,
-						routeUniverse,
-					)
-					orderedEagerMaterialize := false
-					if !predAllowMaterialize &&
-						allowOrderedEagerMaterialize &&
-						qv.orderedScalarRangeCanEagerMaterialize(orderedRoute) {
-						predAllowMaterialize = true
-						orderedEagerMaterialize = true
-					}
-					lazyColdMaterialize := predAllowMaterialize && !orderedRoute.eagerMaterialize
-					p, ok := qv.buildMergedNumericRangePredicateWithColdModeAndWarmLoad(
-						merged.expr,
-						merged.bounds,
-						predAllowMaterialize,
-						lazyColdMaterialize,
-						allowWarmScalarRangeLoad,
-					)
-					if !ok {
-						preds.Release()
-						return predicateSet{}, false
-					}
-					qv.postprocessBuiltOrderedPredicate(
-						&p,
-						orderedRoute,
-						predAllowMaterialize,
-						orderedEagerMaterialize,
-						false,
-						allowWarmOrderedRangeLoad,
-						orderedWindow,
-						universe,
-					)
-					preds.Append(p)
-					continue
-				}
-			}
-		}
-		predAllowMaterialize := allowMaterialize
-		orderedEagerMaterialize := false
-		orderedRoute := qv.orderedScalarRangeRouting(e, orderedWindow, orderedOffset, routeUniverse)
-		if !predAllowMaterialize {
-			orderedRoute = qv.orderedScalarRangeRouting(e, orderedWindow, orderedOffset, universe)
-		}
-		if !predAllowMaterialize && allowOrderedEagerMaterialize &&
-			!orderRangeDeferred &&
-			orderedMergedScalarRangeFieldCount(mergedRangesBuf, fieldName) <= 1 &&
-			fieldName != orderField &&
-			qv.orderedScalarRangeCanEagerMaterialize(orderedRoute) {
-			predAllowMaterialize = true
-			orderedEagerMaterialize = true
-		}
-		lazyColdMaterialize := predAllowMaterialize && !orderedRoute.eagerMaterialize
-		p, ok := qv.buildPredicateWithColdModeAndWarmLoad(
-			e,
-			predAllowMaterialize,
-			lazyColdMaterialize,
-			allowWarmScalarRangeLoad,
-		)
-		if !ok {
-			preds.Release()
-			return predicateSet{}, false
-		}
-		qv.postprocessBuiltOrderedPredicate(
-			&p,
-			orderedRoute,
-			predAllowMaterialize,
-			orderedEagerMaterialize,
-			orderRangeDeferred,
-			allowWarmOrderedRangeLoad,
-			orderedWindow,
-			universe,
-		)
-		preds.Append(p)
-	}
 	return preds, true
 }
 
@@ -4514,11 +4361,11 @@ func (qv *queryView) execPlanOrderedBasicAnchoredBuf(q *qir.Shape, preds predica
 	leadNeedsCheck := preds.GetPtr(leadIdx).leadIterNeedsContainsCheck()
 
 	exactChecksBuf := pooled.GetIntSlice(len(active))
-	defer pooled.PutIntSlice(exactChecksBuf)
+	defer pooled.ReleaseIntSlice(exactChecksBuf)
 	residualChecksBuf := pooled.GetIntSlice(len(active))
-	defer pooled.PutIntSlice(residualChecksBuf)
+	defer pooled.ReleaseIntSlice(residualChecksBuf)
 	deferredChecksBuf := pooled.GetIntSlice(len(active))
-	defer pooled.PutIntSlice(deferredChecksBuf)
+	defer pooled.ReleaseIntSlice(deferredChecksBuf)
 
 	orderedExactPreferred := false
 	for _, pi := range active {
@@ -4740,7 +4587,7 @@ func (qv *queryView) execPlanOrderedBasicReader(q *qir.Shape, preds predicateRea
 	}
 	nilTailField := orderNilTailField(fm, orderField, rb)
 	if br.Empty() && nilTailField == "" {
-		pooled.PutBoolSlice(rangeCovered)
+		pooled.ReleaseBoolSlice(rangeCovered)
 		return nil, true
 	}
 	for i, is := range rangeCovered {
@@ -4748,11 +4595,11 @@ func (qv *queryView) execPlanOrderedBasicReader(q *qir.Shape, preds predicateRea
 			preds.GetPtr(i).covered = true
 		}
 	}
-	pooled.PutBoolSlice(rangeCovered)
+	pooled.ReleaseBoolSlice(rangeCovered)
 
 	if preds.Len() > plannerPredicateFastPathMaxLeaves {
 		activeBuf := pooled.GetIntSlice(preds.Len())
-		defer pooled.PutIntSlice(activeBuf)
+		defer pooled.ReleaseIntSlice(activeBuf)
 		for i := 0; i < preds.Len(); i++ {
 			p := preds.Get(i)
 			if p.covered || p.alwaysTrue {
@@ -4946,7 +4793,7 @@ func (qv *queryView) collectOrderRangeBounds(field string, n int, exprAt func(i 
 			continue
 		}
 		if applied, ok := qv.applyScalarExprToRangeBounds(e, &rb); !ok {
-			pooled.PutBoolSlice(covered)
+			pooled.ReleaseBoolSlice(covered)
 			return indexdata.Bounds{}, nil, false, false
 		} else if applied {
 			covered[i] = true
@@ -4978,7 +4825,7 @@ func (qv *queryView) collectPredicateRangeBoundsReader(field string, preds predi
 			continue
 		}
 		if applied, ok := qv.applyScalarExprToRangeBounds(p.expr, &rb); !ok {
-			pooled.PutBoolSlice(covered)
+			pooled.ReleaseBoolSlice(covered)
 			return indexdata.Bounds{}, nil, false, false
 		} else if applied {
 			covered[i] = true
@@ -5010,7 +4857,7 @@ func (qv *queryView) collectPredicateRangeBoundsSet(field string, preds predicat
 			continue
 		}
 		if applied, ok := qv.applyScalarExprToRangeBounds(p.expr, &rb); !ok {
-			pooled.PutBoolSlice(covered)
+			pooled.ReleaseBoolSlice(covered)
 			return indexdata.Bounds{}, nil, false, false
 		} else if applied {
 			covered[i] = true

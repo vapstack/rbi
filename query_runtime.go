@@ -361,14 +361,14 @@ func (state *postsAnyFilterState) applyOwnedLargeDirect(dst posting.List, card u
 
 	if matched == 0 {
 		if singles != nil {
-			pooled.PutUint64Slice(singles)
+			pooled.ReleaseUint64Slice(singles)
 		}
 		dst.Release()
 		return posting.List{}, true
 	}
 	if matched == card {
 		if singles != nil {
-			pooled.PutUint64Slice(singles)
+			pooled.ReleaseUint64Slice(singles)
 		}
 		return dst, true
 	}
@@ -376,7 +376,7 @@ func (state *postsAnyFilterState) applyOwnedLargeDirect(dst posting.List, card u
 		var out posting.List
 		if singles != nil {
 			out = posting.BuildFromSorted(singles)
-			pooled.PutUint64Slice(singles)
+			pooled.ReleaseUint64Slice(singles)
 		} else {
 			out = posting.BuildFromSorted(inline[:inlineLen])
 		}
@@ -386,7 +386,7 @@ func (state *postsAnyFilterState) applyOwnedLargeDirect(dst posting.List, card u
 
 	if singles != nil {
 		out, ok := dst.TryResetOwnedLargeFromSorted(singles)
-		pooled.PutUint64Slice(singles)
+		pooled.ReleaseUint64Slice(singles)
 		return out, ok
 	}
 	return dst.TryResetOwnedLargeFromSorted(inline[:inlineLen])
@@ -609,7 +609,7 @@ func (state *overlayRangePredicateState) releaseLinearPosts() {
 	if state == nil || state.linearPostsBuf == nil {
 		return
 	}
-	posting.PutSlice(state.linearPostsBuf)
+	posting.ReleaseSlice(state.linearPostsBuf)
 	state.linearPostsBuf = nil
 }
 
@@ -1064,7 +1064,7 @@ func (b *postingUnionBuilder) finish(optimize bool) posting.List {
 	b.ids = posting.List{}
 	b.inlineLen = 0
 	if b.singles != nil {
-		pooled.PutUint64Slice(b.singles)
+		pooled.ReleaseUint64Slice(b.singles)
 		b.singles = nil
 	}
 	if optimize {
@@ -1078,7 +1078,7 @@ func (b *postingUnionBuilder) release() {
 	b.ids = posting.List{}
 	b.inlineLen = 0
 	if b.singles != nil {
-		pooled.PutUint64Slice(b.singles)
+		pooled.ReleaseUint64Slice(b.singles)
 		b.singles = nil
 	}
 }
@@ -1201,7 +1201,7 @@ func (b *postingSetBuilder) finish(optimize bool) posting.List {
 	releaseU64Set(&b.seen)
 	b.inlineLen = 0
 	if b.singles != nil {
-		pooled.PutUint64Slice(b.singles)
+		pooled.ReleaseUint64Slice(b.singles)
 		b.singles = nil
 	}
 	b.count = 0
@@ -1217,7 +1217,7 @@ func (b *postingSetBuilder) release() {
 	releaseU64Set(&b.seen)
 	b.inlineLen = 0
 	if b.singles != nil {
-		pooled.PutUint64Slice(b.singles)
+		pooled.ReleaseUint64Slice(b.singles)
 		b.singles = nil
 	}
 	b.count = 0

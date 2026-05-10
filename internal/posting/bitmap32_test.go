@@ -88,7 +88,7 @@ func TestIntIteratorPool_ReusedIteratorResetsEmbeddedState(t *testing.T) {
 	if got := it.next(); got != 1 {
 		t.Fatalf("array iterator first value: got=%d", got)
 	}
-	putIntIterator(it)
+	it.release()
 
 	runBitmap := getBitmap32()
 	runBitmap.addRange(uint64(1<<16), uint64((1<<16)+4))
@@ -105,7 +105,7 @@ func TestIntIteratorPool_ReusedIteratorResetsEmbeddedState(t *testing.T) {
 	if !slices.Equal(gotRun, wantRun) {
 		t.Fatalf("run iteration mismatch after reuse: got=%v want=%v", gotRun, wantRun)
 	}
-	putIntIterator(reused)
+	reused.release()
 
 	bitmapBitmap := getBitmap32()
 	for i := uint32(0); i < 5000; i++ {
@@ -113,7 +113,7 @@ func TestIntIteratorPool_ReusedIteratorResetsEmbeddedState(t *testing.T) {
 	}
 
 	reused2 := getIntIterator(bitmapBitmap)
-	defer putIntIterator(reused2)
+	defer reused2.release()
 	if !testRaceEnabled && reused2 != it {
 		t.Fatalf("intIterator pool did not reuse iterator on second pass")
 	}

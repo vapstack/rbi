@@ -1684,7 +1684,7 @@ func TestSnapshotExt_InheritMaterializedPredCacheSkipsChangedFieldsAndKeepsOther
 		},
 	}
 	changed := snapshotTestBoolSlots(map[string]bool{"name": true}, db.engine.indexedFieldMap)
-	defer pooled.PutBoolSlice(changed)
+	defer pooled.ReleaseBoolSlice(changed)
 
 	inheritMaterializedPredCache(next, prev, db.engine.indexedFieldMap, changed)
 

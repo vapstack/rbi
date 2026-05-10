@@ -25,13 +25,13 @@ func (s FieldStorage) Stats(countDistinct bool) FieldStats {
 	return FieldStats{}
 }
 
-func (root *fieldIndexFlatRoot) stats(countDistinct bool) FieldStats {
+func (r *fieldIndexFlatRoot) stats(countDistinct bool) FieldStats {
 	stats := FieldStats{
 		ApproxStructBytes: uint64(unsafe.Sizeof(fieldIndexFlatRoot{})) +
-			uint64(cap(root.entries))*uint64(unsafe.Sizeof(Entry{})),
+			uint64(cap(r.entries))*uint64(unsafe.Sizeof(Entry{})),
 	}
-	for i := range root.entries {
-		entry := root.entries[i]
+	for i := range r.entries {
+		entry := r.entries[i]
 		if entry.Key.IsNumeric() {
 			stats.ApproxStructBytes -= uint64(unsafe.Sizeof(uint64(0)))
 		}
@@ -40,16 +40,16 @@ func (root *fieldIndexFlatRoot) stats(countDistinct bool) FieldStats {
 	return stats
 }
 
-func (root *fieldIndexChunkedRoot) stats(countDistinct bool) FieldStats {
+func (r *fieldIndexChunkedRoot) stats(countDistinct bool) FieldStats {
 	stats := FieldStats{
 		ApproxStructBytes: uint64(unsafe.Sizeof(fieldIndexChunkedRoot{})) +
-			uint64(cap(root.pages))*uint64(unsafe.Sizeof((*fieldIndexChunkDirPage)(nil))) +
-			uint64(cap(root.chunkPrefix))*uint64(unsafe.Sizeof(int(0))) +
-			uint64(cap(root.prefix))*uint64(unsafe.Sizeof(int(0))) +
-			uint64(cap(root.rowPrefix))*uint64(unsafe.Sizeof(uint64(0))),
+			uint64(cap(r.pages))*uint64(unsafe.Sizeof((*fieldIndexChunkDirPage)(nil))) +
+			uint64(cap(r.chunkPrefix))*uint64(unsafe.Sizeof(int(0))) +
+			uint64(cap(r.prefix))*uint64(unsafe.Sizeof(int(0))) +
+			uint64(cap(r.rowPrefix))*uint64(unsafe.Sizeof(uint64(0))),
 	}
-	for i := range root.pages {
-		page := root.pages[i]
+	for i := range r.pages {
+		page := r.pages[i]
 		stats.ApproxStructBytes += uint64(unsafe.Sizeof(fieldIndexChunkDirPage{})) +
 			uint64(cap(page.refs))*uint64(unsafe.Sizeof(fieldIndexChunkRef{})) +
 			uint64(cap(page.prefix))*uint64(unsafe.Sizeof(int(0))) +

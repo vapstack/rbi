@@ -503,7 +503,7 @@ func TestBatchSet_FailedBuild_ReleasesPreparedRequestsBeforePooling(t *testing.T
 	}
 
 	req, err := db.buildSetAutoBatchRequest(
-		autoBatchKeyFromID(uint64(3)),
+		dataKeyFromID(uint64(3)),
 		&beforeStoreCloneRec{Name: "hooked", Ready: true},
 		nil,
 		testBeforeCommitHooks([]beforeCommitFunc[uint64, beforeStoreCloneRec]{
@@ -1049,7 +1049,7 @@ func TestTruncate_NoDeadlock_WithConcurrentExecuteBatchWriter(t *testing.T) {
 
 	req := &autoBatchRequest{
 		op:         autoBatchSet,
-		id:         autoBatchKeyFromID(uint64(1)),
+		id:         dataKeyFromID(uint64(1)),
 		setValue:   unsafe.Pointer(newVal),
 		setPayload: payload,
 		done:       make(chan error, 1),

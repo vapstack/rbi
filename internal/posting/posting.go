@@ -2319,17 +2319,24 @@ func (it *singletonIter) Next() uint64 {
 }
 
 func (it *singletonIter) Release() {
-	putSingletonIter(it)
+	singletonIterPool.Put(it)
 }
 
-func (sp *smallPosting) release() { putSmallPosting(sp) }
+func (sp *smallPosting) release() {
+	sp.n = 0
+	smallPostingPool.Put(sp)
+}
 
 func (sp *smallPosting) Release() { sp.release() }
 
-func (mp *midPosting) release() { putMidPosting(mp) }
+func (mp *midPosting) release() {
+	mp.n = 0
+	midPostingPool.Put(mp)
+}
 
 func (mp *midPosting) Release() { mp.release() }
 
 func (it *arrayIter) Release() {
-	putArrayIter(it)
+	it.ids = nil
+	arrayIterPool.Put(it)
 }

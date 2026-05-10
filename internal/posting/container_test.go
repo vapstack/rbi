@@ -126,9 +126,9 @@ func TestRunContainerPoolCleanupContract(t *testing.T) {
 			{start: 30, length: 3},
 			{start: 40, length: 4},
 		}
-		rc := &containerRun{iv: backing[:]}
+		rc := ownContainerRun(&containerRun{iv: backing[:]})
 
-		putRunContainer(rc)
+		rc.release()
 
 		zero := [4]interval16{}
 		if backing != zero {
@@ -146,9 +146,9 @@ func TestRunContainerPoolCleanupContract(t *testing.T) {
 			{start: 30, length: 3},
 			{start: 40, length: 4},
 		}
-		rc := &containerRun{iv: backing[:2]}
+		rc := ownContainerRun(&containerRun{iv: backing[:2]})
 
-		putRunContainer(rc)
+		rc.release()
 
 		if !slices.Equal(backing[:2], []interval16{{}, {}}) {
 			t.Fatalf("run container cleanup leaked released prefix: %v", backing)
@@ -169,9 +169,9 @@ func TestArrayContainerPoolCleanupContract(t *testing.T) {
 	t.Run("SizedContainerZeroesReleasedPrefix", func(t *testing.T) {
 		backing := make([]uint16, 4, containerArrayPoolCapacities[0])
 		copy(backing, []uint16{11, 22, 33, 44})
-		ac := &containerArray{content: backing}
+		ac := ownContainerArray(&containerArray{content: backing})
 
-		putContainerArray(ac)
+		ac.release()
 
 		if !slices.Equal(backing, []uint16{0, 0, 0, 0}) {
 			t.Fatalf("array container cleanup leaked released prefix: %v", backing)
@@ -184,9 +184,9 @@ func TestArrayContainerPoolCleanupContract(t *testing.T) {
 	t.Run("ShorterLenPreservesUnreleasedTail", func(t *testing.T) {
 		backing := make([]uint16, 4, containerArrayPoolCapacities[0])
 		copy(backing, []uint16{11, 22, 33, 44})
-		ac := &containerArray{content: backing[:2]}
+		ac := ownContainerArray(&containerArray{content: backing[:2]})
 
-		putContainerArray(ac)
+		ac.release()
 
 		if !slices.Equal(backing[:2], []uint16{0, 0}) {
 			t.Fatalf("array container cleanup leaked released prefix: %v", backing)

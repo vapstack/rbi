@@ -1371,7 +1371,7 @@ func TestPlannerExt_NextAnalyzeDelayCapsBackoffAtEightX(t *testing.T) {
 
 func TestPlannerExt_PlannerORNoOrderInsertTopNStaysSortedAndCapped(t *testing.T) {
 	top := pooled.GetUint64Slice(3)
-	defer func() { pooled.PutUint64Slice(top) }()
+	defer func() { pooled.ReleaseUint64Slice(top) }()
 	for _, id := range []uint64{5, 2, 4, 1, 3} {
 		top = plannerORNoOrderInsertTopN(top, id, 3)
 	}

@@ -235,14 +235,14 @@ func addDistinctSignedFixedKeysToSink[S fixedValueSink, T signedFieldValue](vals
 		return 0
 	}
 	if len(vals) == 1 {
-		sink.addFixed(uint64(int64(vals[0])) ^ (uint64(1) << 63))
+		sink.addFixed(keycodec.OrderedInt64Key(int64(vals[0])))
 		return 1
 	}
 	seen := newU64Set(len(vals))
 	defer releaseU64Set(&seen)
 	distinct := 0
 	for i := range vals {
-		cur := uint64(int64(vals[i])) ^ (uint64(1) << 63)
+		cur := keycodec.OrderedInt64Key(int64(vals[i]))
 		if !seen.Add(cur) {
 			continue
 		}
@@ -378,14 +378,14 @@ func writePtrIntField[S nilFixedValueSink, T signedFieldValue](ptr unsafe.Pointe
 		sink.setNil()
 		return
 	}
-	sink.addFixed(uint64(int64(*v)) ^ (uint64(1) << 63))
+	sink.addFixed(keycodec.OrderedInt64Key(int64(*v)))
 }
 
 func writeScalarIntField[S fixedValueSink, T signedFieldValue](ptr unsafe.Pointer, sink S, offset uintptr) {
 	if ptr == nil {
 		return
 	}
-	sink.addFixed(uint64(int64(scalarFieldValue[T](ptr, offset))) ^ (uint64(1) << 63))
+	sink.addFixed(keycodec.OrderedInt64Key(int64(scalarFieldValue[T](ptr, offset))))
 }
 
 func writePtrUintField[S nilFixedValueSink, T unsignedFieldValue](ptr unsafe.Pointer, sink S, offset uintptr) {
@@ -470,14 +470,14 @@ func writePtrTimeField[S nilFixedValueSink](ptr unsafe.Pointer, sink S, offset u
 		sink.setNil()
 		return
 	}
-	sink.addFixed(uint64(v.Unix()) ^ (uint64(1) << 63))
+	sink.addFixed(keycodec.OrderedInt64Key(v.Unix()))
 }
 
 func writeScalarTimeField[S fixedValueSink](ptr unsafe.Pointer, sink S, offset uintptr) {
 	if ptr == nil {
 		return
 	}
-	sink.addFixed(uint64(scalarFieldValue[time.Time](ptr, offset).Unix()) ^ (uint64(1) << 63))
+	sink.addFixed(keycodec.OrderedInt64Key(scalarFieldValue[time.Time](ptr, offset).Unix()))
 }
 
 func slicesModified[T comparable](lhs, rhs []T) bool {
@@ -494,12 +494,12 @@ func slicesModified[T comparable](lhs, rhs []T) bool {
 
 func valueIndexerScalarReflectAccessorBundle(fieldType reflect.Type, offset uintptr) fieldAccessorBundle {
 	return fieldAccessorBundle{
-		unique: func(ptr unsafe.Pointer) (string, bool, bool) {
+		unique: func(ptr unsafe.Pointer) (keycodec.IndexLookupKey, bool, bool) {
 			if ptr == nil {
-				return "", false, false
+				return keycodec.IndexLookupKey{}, false, false
 			}
 			fv := reflect.NewAt(fieldType, unsafe.Add(ptr, offset)).Elem()
-			return fv.Interface().(ValueIndexer).IndexingValue(), true, false
+			return keycodec.IndexLookupString(fv.Interface().(ValueIndexer).IndexingValue()), true, false
 		},
 		writeBuild: func(ptr unsafe.Pointer, sink buildFieldWriteSink) {
 			if ptr == nil {
@@ -587,15 +587,15 @@ func valueIndexerSliceReflectAccessorBundle(sliceType reflect.Type, offset uintp
 func timeFieldAccessorBundle(offset uintptr, ptr bool) fieldAccessorBundle {
 	if ptr {
 		return fieldAccessorBundle{
-			unique: func(ptr unsafe.Pointer) (string, bool, bool) {
+			unique: func(ptr unsafe.Pointer) (keycodec.IndexLookupKey, bool, bool) {
 				if ptr == nil {
-					return "", false, false
+					return keycodec.IndexLookupKey{}, false, false
 				}
 				v := ptrFieldValue[time.Time](ptr, offset)
 				if v == nil {
-					return "", true, true
+					return keycodec.IndexLookupKey{}, true, true
 				}
-				return keycodec.Int64ByteString(v.Unix()), true, false
+				return keycodec.IndexLookupU64(keycodec.OrderedInt64Key(v.Unix())), true, false
 			},
 			writeBuild:   func(ptr unsafe.Pointer, sink buildFieldWriteSink) { writePtrTimeField(ptr, sink, offset) },
 			writeOverlay: func(ptr unsafe.Pointer, sink snapshotOverlayWriteSink) { writePtrTimeField(ptr, sink, offset) },
@@ -612,11 +612,11 @@ func timeFieldAccessorBundle(offset uintptr, ptr bool) fieldAccessorBundle {
 		}
 	}
 	return fieldAccessorBundle{
-		unique: func(ptr unsafe.Pointer) (string, bool, bool) {
+		unique: func(ptr unsafe.Pointer) (keycodec.IndexLookupKey, bool, bool) {
 			if ptr == nil {
-				return "", false, false
+				return keycodec.IndexLookupKey{}, false, false
 			}
-			return keycodec.Int64ByteString(scalarFieldValue[time.Time](ptr, offset).Unix()), true, false
+			return keycodec.IndexLookupU64(keycodec.OrderedInt64Key(scalarFieldValue[time.Time](ptr, offset).Unix())), true, false
 		},
 		writeBuild:   func(ptr unsafe.Pointer, sink buildFieldWriteSink) { writeScalarTimeField(ptr, sink, offset) },
 		writeOverlay: func(ptr unsafe.Pointer, sink snapshotOverlayWriteSink) { writeScalarTimeField(ptr, sink, offset) },
@@ -631,15 +631,15 @@ func timeFieldAccessorBundle(offset uintptr, ptr bool) fieldAccessorBundle {
 func stringFieldAccessorBundle(offset uintptr, ptr bool) fieldAccessorBundle {
 	if ptr {
 		return fieldAccessorBundle{
-			unique: func(ptr unsafe.Pointer) (string, bool, bool) {
+			unique: func(ptr unsafe.Pointer) (keycodec.IndexLookupKey, bool, bool) {
 				if ptr == nil {
-					return "", false, false
+					return keycodec.IndexLookupKey{}, false, false
 				}
 				v := ptrFieldValue[string](ptr, offset)
 				if v == nil {
-					return "", true, true
+					return keycodec.IndexLookupKey{}, true, true
 				}
-				return *v, true, false
+				return keycodec.IndexLookupString(*v), true, false
 			},
 			writeBuild:   func(ptr unsafe.Pointer, sink buildFieldWriteSink) { writePtrStringField(ptr, sink, offset) },
 			writeOverlay: func(ptr unsafe.Pointer, sink snapshotOverlayWriteSink) { writePtrStringField(ptr, sink, offset) },
@@ -656,11 +656,11 @@ func stringFieldAccessorBundle(offset uintptr, ptr bool) fieldAccessorBundle {
 		}
 	}
 	return fieldAccessorBundle{
-		unique: func(ptr unsafe.Pointer) (string, bool, bool) {
+		unique: func(ptr unsafe.Pointer) (keycodec.IndexLookupKey, bool, bool) {
 			if ptr == nil {
-				return "", false, false
+				return keycodec.IndexLookupKey{}, false, false
 			}
-			return scalarFieldValue[string](ptr, offset), true, false
+			return keycodec.IndexLookupString(scalarFieldValue[string](ptr, offset)), true, false
 		},
 		writeBuild:   func(ptr unsafe.Pointer, sink buildFieldWriteSink) { writeScalarStringField(ptr, sink, offset) },
 		writeOverlay: func(ptr unsafe.Pointer, sink snapshotOverlayWriteSink) { writeScalarStringField(ptr, sink, offset) },
@@ -675,18 +675,18 @@ func stringFieldAccessorBundle(offset uintptr, ptr bool) fieldAccessorBundle {
 func boolFieldAccessorBundle(offset uintptr, ptr bool) fieldAccessorBundle {
 	if ptr {
 		return fieldAccessorBundle{
-			unique: func(ptr unsafe.Pointer) (string, bool, bool) {
+			unique: func(ptr unsafe.Pointer) (keycodec.IndexLookupKey, bool, bool) {
 				if ptr == nil {
-					return "", false, false
+					return keycodec.IndexLookupKey{}, false, false
 				}
 				v := ptrFieldValue[bool](ptr, offset)
 				if v == nil {
-					return "", true, true
+					return keycodec.IndexLookupKey{}, true, true
 				}
 				if *v {
-					return "1", true, false
+					return keycodec.IndexLookupString("1"), true, false
 				}
-				return "0", true, false
+				return keycodec.IndexLookupString("0"), true, false
 			},
 			writeBuild:   func(ptr unsafe.Pointer, sink buildFieldWriteSink) { writePtrBoolField(ptr, sink, offset) },
 			writeOverlay: func(ptr unsafe.Pointer, sink snapshotOverlayWriteSink) { writePtrBoolField(ptr, sink, offset) },
@@ -703,14 +703,14 @@ func boolFieldAccessorBundle(offset uintptr, ptr bool) fieldAccessorBundle {
 		}
 	}
 	return fieldAccessorBundle{
-		unique: func(ptr unsafe.Pointer) (string, bool, bool) {
+		unique: func(ptr unsafe.Pointer) (keycodec.IndexLookupKey, bool, bool) {
 			if ptr == nil {
-				return "", false, false
+				return keycodec.IndexLookupKey{}, false, false
 			}
 			if scalarFieldValue[bool](ptr, offset) {
-				return "1", true, false
+				return keycodec.IndexLookupString("1"), true, false
 			}
-			return "0", true, false
+			return keycodec.IndexLookupString("0"), true, false
 		},
 		writeBuild:   func(ptr unsafe.Pointer, sink buildFieldWriteSink) { writeScalarBoolField(ptr, sink, offset) },
 		writeOverlay: func(ptr unsafe.Pointer, sink snapshotOverlayWriteSink) { writeScalarBoolField(ptr, sink, offset) },
@@ -725,15 +725,15 @@ func boolFieldAccessorBundle(offset uintptr, ptr bool) fieldAccessorBundle {
 func intFieldAccessorBundle[T signedFieldValue](offset uintptr, ptr bool) fieldAccessorBundle {
 	if ptr {
 		return fieldAccessorBundle{
-			unique: func(ptr unsafe.Pointer) (string, bool, bool) {
+			unique: func(ptr unsafe.Pointer) (keycodec.IndexLookupKey, bool, bool) {
 				if ptr == nil {
-					return "", false, false
+					return keycodec.IndexLookupKey{}, false, false
 				}
 				v := ptrFieldValue[T](ptr, offset)
 				if v == nil {
-					return "", true, true
+					return keycodec.IndexLookupKey{}, true, true
 				}
-				return keycodec.Int64ByteString(int64(*v)), true, false
+				return keycodec.IndexLookupU64(keycodec.OrderedInt64Key(int64(*v))), true, false
 			},
 			writeBuild: func(ptr unsafe.Pointer, sink buildFieldWriteSink) {
 				writePtrIntField[buildFieldWriteSink, T](ptr, sink, offset)
@@ -758,11 +758,11 @@ func intFieldAccessorBundle[T signedFieldValue](offset uintptr, ptr bool) fieldA
 		}
 	}
 	return fieldAccessorBundle{
-		unique: func(ptr unsafe.Pointer) (string, bool, bool) {
+		unique: func(ptr unsafe.Pointer) (keycodec.IndexLookupKey, bool, bool) {
 			if ptr == nil {
-				return "", false, false
+				return keycodec.IndexLookupKey{}, false, false
 			}
-			return keycodec.Int64ByteString(int64(scalarFieldValue[T](ptr, offset))), true, false
+			return keycodec.IndexLookupU64(keycodec.OrderedInt64Key(int64(scalarFieldValue[T](ptr, offset)))), true, false
 		},
 		writeBuild: func(ptr unsafe.Pointer, sink buildFieldWriteSink) {
 			writeScalarIntField[buildFieldWriteSink, T](ptr, sink, offset)
@@ -785,15 +785,15 @@ func intFieldAccessorBundle[T signedFieldValue](offset uintptr, ptr bool) fieldA
 func uintFieldAccessorBundle[T unsignedFieldValue](offset uintptr, ptr bool) fieldAccessorBundle {
 	if ptr {
 		return fieldAccessorBundle{
-			unique: func(ptr unsafe.Pointer) (string, bool, bool) {
+			unique: func(ptr unsafe.Pointer) (keycodec.IndexLookupKey, bool, bool) {
 				if ptr == nil {
-					return "", false, false
+					return keycodec.IndexLookupKey{}, false, false
 				}
 				v := ptrFieldValue[T](ptr, offset)
 				if v == nil {
-					return "", true, true
+					return keycodec.IndexLookupKey{}, true, true
 				}
-				return keycodec.U64ByteString(uint64(*v)), true, false
+				return keycodec.IndexLookupU64(uint64(*v)), true, false
 			},
 			writeBuild: func(ptr unsafe.Pointer, sink buildFieldWriteSink) {
 				writePtrUintField[buildFieldWriteSink, T](ptr, sink, offset)
@@ -818,11 +818,11 @@ func uintFieldAccessorBundle[T unsignedFieldValue](offset uintptr, ptr bool) fie
 		}
 	}
 	return fieldAccessorBundle{
-		unique: func(ptr unsafe.Pointer) (string, bool, bool) {
+		unique: func(ptr unsafe.Pointer) (keycodec.IndexLookupKey, bool, bool) {
 			if ptr == nil {
-				return "", false, false
+				return keycodec.IndexLookupKey{}, false, false
 			}
-			return keycodec.U64ByteString(uint64(scalarFieldValue[T](ptr, offset))), true, false
+			return keycodec.IndexLookupU64(uint64(scalarFieldValue[T](ptr, offset))), true, false
 		},
 		writeBuild: func(ptr unsafe.Pointer, sink buildFieldWriteSink) {
 			writeScalarUintField[buildFieldWriteSink, T](ptr, sink, offset)
@@ -845,15 +845,15 @@ func uintFieldAccessorBundle[T unsignedFieldValue](offset uintptr, ptr bool) fie
 func floatFieldAccessorBundle[T floatFieldValue](offset uintptr, ptr bool) fieldAccessorBundle {
 	if ptr {
 		return fieldAccessorBundle{
-			unique: func(ptr unsafe.Pointer) (string, bool, bool) {
+			unique: func(ptr unsafe.Pointer) (keycodec.IndexLookupKey, bool, bool) {
 				if ptr == nil {
-					return "", false, false
+					return keycodec.IndexLookupKey{}, false, false
 				}
 				v := ptrFieldValue[T](ptr, offset)
 				if v == nil {
-					return "", true, true
+					return keycodec.IndexLookupKey{}, true, true
 				}
-				return keycodec.Float64ByteString(float64(*v)), true, false
+				return keycodec.IndexLookupU64(keycodec.OrderedFloat64Key(float64(*v))), true, false
 			},
 			writeBuild: func(ptr unsafe.Pointer, sink buildFieldWriteSink) {
 				writePtrFloatField[buildFieldWriteSink, T](ptr, sink, offset)
@@ -878,11 +878,11 @@ func floatFieldAccessorBundle[T floatFieldValue](offset uintptr, ptr bool) field
 		}
 	}
 	return fieldAccessorBundle{
-		unique: func(ptr unsafe.Pointer) (string, bool, bool) {
+		unique: func(ptr unsafe.Pointer) (keycodec.IndexLookupKey, bool, bool) {
 			if ptr == nil {
-				return "", false, false
+				return keycodec.IndexLookupKey{}, false, false
 			}
-			return keycodec.Float64ByteString(float64(scalarFieldValue[T](ptr, offset))), true, false
+			return keycodec.IndexLookupU64(keycodec.OrderedFloat64Key(float64(scalarFieldValue[T](ptr, offset)))), true, false
 		},
 		writeBuild: func(ptr unsafe.Pointer, sink buildFieldWriteSink) {
 			writeScalarFloatField[buildFieldWriteSink, T](ptr, sink, offset)

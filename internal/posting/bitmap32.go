@@ -126,7 +126,8 @@ func (ii *intIterator) initialize(a *bitmap32) {
 }
 
 func (ii *intIterator) release() {
-	putIntIterator(ii)
+	*ii = intIterator{}
+	intIteratorPool.Put(ii)
 }
 
 // manyIntIterable supports bulk iteration over values in a bitmap32.
@@ -208,7 +209,8 @@ func (ii *manyIntIterator) initialize(a *bitmap32) {
 }
 
 func (ii *manyIntIterator) release() {
-	putManyIntIterator(ii)
+	*ii = manyIntIterator{}
+	manyIntIteratorPool.Put(ii)
 }
 
 // iterator creates a new intPeekable to iterate over the integers contained in the bitmap.
@@ -265,7 +267,8 @@ func (rb *bitmap32) release() {
 	if rb.refs.Add(-1) != 0 {
 		return
 	}
-	putBitmap32(rb)
+	rb.highlowcontainer.clear()
+	bitmap32Pool.Put(rb)
 }
 
 func (rb *bitmap32) Release() { rb.release() }

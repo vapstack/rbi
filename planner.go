@@ -456,9 +456,9 @@ func plannerORBranchCheckCounts(branch plannerORBranch, covered []bool) (int, in
 	residualChecksBuf = plannerResidualChecksBuf(residualChecksBuf, checksBuf, exactChecksBuf)
 	streamChecks := len(checksBuf)
 	mergeChecks := len(residualChecksBuf)
-	pooled.PutIntSlice(residualChecksBuf)
-	pooled.PutIntSlice(exactChecksBuf)
-	pooled.PutIntSlice(checksBuf)
+	pooled.ReleaseIntSlice(residualChecksBuf)
+	pooled.ReleaseIntSlice(exactChecksBuf)
+	pooled.ReleaseIntSlice(checksBuf)
 	return streamChecks, mergeChecks
 }
 
@@ -1232,12 +1232,12 @@ func (qv *queryView) orderMergeBranchStats(orderField string, branches plannerOR
 			}
 			stats[i].streamChecks, stats[i].mergeChecks = plannerORBranchCheckCounts(*branch, nil)
 			if ok {
-				pooled.PutBoolSlice(covered)
+				pooled.ReleaseBoolSlice(covered)
 			}
 			continue
 		}
 		stats[i].streamChecks, stats[i].mergeChecks = plannerORBranchCheckCounts(*branch, covered)
-		pooled.PutBoolSlice(covered)
+		pooled.ReleaseBoolSlice(covered)
 		if br.BaseStart == 0 && br.BaseEnd == ov.KeyCount() {
 			continue
 		}
@@ -1932,10 +1932,10 @@ func (s *orderedORObservedStats) release() {
 		return
 	}
 	if s.countsBuf != nil {
-		pooled.PutUint64Slice(s.countsBuf)
+		pooled.ReleaseUint64Slice(s.countsBuf)
 	}
 	if s.candidatesBuf != nil {
-		pooled.PutBoolSlice(s.candidatesBuf)
+		pooled.ReleaseBoolSlice(s.candidatesBuf)
 	}
 	*s = orderedORObservedStats{}
 }
@@ -1951,7 +1951,7 @@ func releasePlannerOROrderBasicCheckBufs(
 		if checkBufs[i] == nil {
 			continue
 		}
-		pooled.PutIntSlice(checkBufs[i])
+		pooled.ReleaseIntSlice(checkBufs[i])
 		checkBufs[i] = nil
 	}
 }
@@ -2692,7 +2692,7 @@ func (qv *queryView) maybeMaterializeOrderedORPredicates(
 	defer func() {
 		for i := 0; i < branchCount; i++ {
 			if candidateMarks[i] != nil {
-				pooled.PutBoolSlice(candidateMarks[i])
+				pooled.ReleaseBoolSlice(candidateMarks[i])
 			}
 		}
 	}()
@@ -2747,7 +2747,7 @@ func (qv *queryView) maybeMaterializeOrderedORPredicates(
 				}
 				rows = orderedORNextPredicateRows(rows, p.estCard, est.card, est.universe)
 			}
-			pooled.PutIntSlice(fullChecks)
+			pooled.ReleaseIntSlice(fullChecks)
 			if branchDone {
 				continue
 			}
@@ -2758,7 +2758,7 @@ func (qv *queryView) maybeMaterializeOrderedORPredicates(
 		exactChecks = buildExactBucketPostingFilterActiveBufReader(exactChecks, fullChecks, branch.preds)
 		residualChecks := pooled.GetIntSlice(len(fullChecks))
 		residualChecks = plannerResidualChecksBuf(residualChecks, fullChecks, exactChecks)
-		pooled.PutIntSlice(fullChecks)
+		pooled.ReleaseIntSlice(fullChecks)
 
 		for _, pi := range exactChecks {
 			if rows == 0 {
@@ -2836,8 +2836,8 @@ func (qv *queryView) maybeMaterializeOrderedORPredicates(
 				rows = orderedORNextPredicateRows(rows, p.estCard, est.card, est.universe)
 			}
 		}
-		pooled.PutIntSlice(residualChecks)
-		pooled.PutIntSlice(exactChecks)
+		pooled.ReleaseIntSlice(residualChecks)
+		pooled.ReleaseIntSlice(exactChecks)
 	}
 	if !allowBuild || !hasBuildCandidates {
 		if changed {
@@ -2896,7 +2896,7 @@ func (qv *queryView) maybeMaterializeOrderedORPredicates(
 		residualChecks := pooled.GetIntSlice(len(fullChecks))
 		residualChecks = plannerResidualChecksBuf(residualChecks, fullChecks, exactChecks)
 		branchChecks[bi] = residualChecks
-		pooled.PutIntSlice(fullChecks)
+		pooled.ReleaseIntSlice(fullChecks)
 	}
 
 	for bi := 0; bi < branchCount; bi++ {
@@ -3038,16 +3038,16 @@ func (qv *queryView) promoteOrderedORMaterializedBaseOps(
 	defer materializedPredKeySlicePool.Put(cacheKeysBuf)
 
 	repBranchBuf := pooled.GetIntSlice(repCap)
-	defer pooled.PutIntSlice(repBranchBuf)
+	defer pooled.ReleaseIntSlice(repBranchBuf)
 
 	repPredBuf := pooled.GetIntSlice(repCap)
-	defer pooled.PutIntSlice(repPredBuf)
+	defer pooled.ReleaseIntSlice(repPredBuf)
 
 	buildWorksBuf := pooled.GetUint64Slice(repCap)
-	defer func() { pooled.PutUint64Slice(buildWorksBuf) }()
+	defer func() { pooled.ReleaseUint64Slice(buildWorksBuf) }()
 
 	observedWorksBuf := pooled.GetUint64Slice(repCap)
-	defer func() { pooled.PutUint64Slice(observedWorksBuf) }()
+	defer func() { pooled.ReleaseUint64Slice(observedWorksBuf) }()
 
 	for bi := 0; bi < branchCount; bi++ {
 		branch := branches.Get(bi)
@@ -3155,16 +3155,16 @@ func (qv *queryView) promoteObservedOrderedORKWayMaterializedBaseOps(
 	defer materializedPredKeySlicePool.Put(cacheKeysBuf)
 
 	repBranchBuf := pooled.GetIntSlice(repCap)
-	defer pooled.PutIntSlice(repBranchBuf)
+	defer pooled.ReleaseIntSlice(repBranchBuf)
 
 	repPredBuf := pooled.GetIntSlice(repCap)
-	defer pooled.PutIntSlice(repPredBuf)
+	defer pooled.ReleaseIntSlice(repPredBuf)
 
 	buildWorksBuf := pooled.GetUint64Slice(repCap)
-	defer func() { pooled.PutUint64Slice(buildWorksBuf) }()
+	defer func() { pooled.ReleaseUint64Slice(buildWorksBuf) }()
 
 	observedWorksBuf := pooled.GetUint64Slice(repCap)
-	defer func() { pooled.PutUint64Slice(observedWorksBuf) }()
+	defer func() { pooled.ReleaseUint64Slice(observedWorksBuf) }()
 
 	for bi := 0; bi < branchCount; bi++ {
 		checks := branchChecks[bi]
@@ -3415,7 +3415,7 @@ func (qv *queryView) buildORBranchPredicates(leaves []qir.Expr) (predicateSet, b
 
 	preds := newPredicateSet(len(leaves))
 	forced := pooled.GetIntSlice(len(leaves))
-	defer pooled.PutIntSlice(forced)
+	defer pooled.ReleaseIntSlice(forced)
 	leadIdx := -1
 	leadEst := uint64(0)
 	for _, e := range leaves {
@@ -3541,7 +3541,7 @@ func (qv *queryView) buildORBranchesOrdered(
 			return plannerORBranches{}, false, false
 		}
 		if len(covered) == 0 {
-			pooled.PutBoolSlice(covered)
+			pooled.ReleaseBoolSlice(covered)
 			continue
 		}
 		if br.BaseStart != 0 || br.BaseEnd != ov.KeyCount() {
@@ -3554,7 +3554,7 @@ func (qv *queryView) buildORBranchesOrdered(
 				branch.estKnown = true
 			}
 		}
-		pooled.PutBoolSlice(covered)
+		pooled.ReleaseBoolSlice(covered)
 	}
 	return branches, false, true
 }
@@ -3618,7 +3618,7 @@ func (qv *queryView) execPlanOROrderBasic(q *qir.Shape, branches plannerORBranch
 			}
 		}
 		if analysis == nil || i >= analysis.branchCount {
-			pooled.PutBoolSlice(covered)
+			pooled.ReleaseBoolSlice(covered)
 		}
 		branchChecks[i] = pooled.GetIntSlice(branch.predLen())
 		branchChecks[i] = branch.buildMatchChecksBuf(branchChecks[i])
@@ -4472,15 +4472,15 @@ func (it *plannerOROrderBranchIter) close() {
 	it.bucketWork.Release()
 	it.bucketWork = posting.List{}
 	if it.checks != nil {
-		pooled.PutIntSlice(it.checks)
+		pooled.ReleaseIntSlice(it.checks)
 		it.checks = nil
 	}
 	if it.exactChecks != nil {
-		pooled.PutIntSlice(it.exactChecks)
+		pooled.ReleaseIntSlice(it.exactChecks)
 		it.exactChecks = nil
 	}
 	if it.residualChecks != nil {
-		pooled.PutIntSlice(it.residualChecks)
+		pooled.ReleaseIntSlice(it.residualChecks)
 		it.residualChecks = nil
 	}
 	it.curChecks = nil
@@ -4857,7 +4857,7 @@ func (qv *queryView) execPlanOROrderKWay(
 				}
 			}
 			if !reuseAnalysis {
-				pooled.PutBoolSlice(covered)
+				pooled.ReleaseBoolSlice(covered)
 			}
 		}
 		if branchStart >= branchEnd {
@@ -5619,7 +5619,7 @@ func (qv *queryView) collectOROrderFallbackBranchCandidates(
 			branch.predPtr(pi).covered = true
 		}
 	}
-	pooled.PutBoolSlice(covered)
+	pooled.ReleaseBoolSlice(covered)
 	start, end := br.BaseStart, br.BaseEnd
 	if start >= end {
 		return 0, 0, 0, true
@@ -5647,9 +5647,9 @@ func (qv *queryView) collectOROrderFallbackBranchCandidates(
 	emitted, examined, dedupe := qv.collectOROrderFallbackBranchCandidatesWithChecksBuf(
 		branch, branchLimit, ov, order.Desc, start, end, dst, checksBuf, exactChecksBuf, residualChecksBuf,
 	)
-	pooled.PutIntSlice(residualChecksBuf)
-	pooled.PutIntSlice(exactChecksBuf)
-	pooled.PutIntSlice(checksBuf)
+	pooled.ReleaseIntSlice(residualChecksBuf)
+	pooled.ReleaseIntSlice(exactChecksBuf)
+	pooled.ReleaseIntSlice(checksBuf)
 	return emitted, examined, dedupe, true
 }
 
@@ -5840,14 +5840,14 @@ func (qv *queryView) countORBranchByUniqueLead(branch plannerORBranch) (uint64, 
 			continue
 		}
 		if p.alwaysFalse || !p.hasContains() {
-			pooled.PutIntSlice(checksBuf)
+			pooled.ReleaseIntSlice(checksBuf)
 			return 0, true
 		}
 		checksBuf = append(checksBuf, i)
 	}
 	sortActivePredicatesBufReader(checksBuf, branch.preds)
 	cnt, ok := qv.countORBranchByUniqueLeadWithChecksBuf(branch, leadIdx, checksBuf)
-	pooled.PutIntSlice(checksBuf)
+	pooled.ReleaseIntSlice(checksBuf)
 	return cnt, ok
 }
 
@@ -6133,7 +6133,7 @@ func (qv *queryView) execPlanORNoOrderAdaptiveCore(q *qir.Shape, branches planne
 		defer releaseU64Set(&seen)
 	}
 	topBuf := pooled.GetUint64Slice(need)
-	defer func() { pooled.PutUint64Slice(topBuf) }()
+	defer func() { pooled.ReleaseUint64Slice(topBuf) }()
 
 	initialActive := plannerORNoOrderInitActiveBranches
 	if initialActive > len(order) {
@@ -6320,7 +6320,7 @@ func (qv *queryView) execPlanORNoOrderBaselineCore(q *qir.Shape, branches planne
 	)
 	if useLinearSeen {
 		seenBuf = pooled.GetUint64Slice(needWindow)
-		defer func() { pooled.PutUint64Slice(seenBuf) }()
+		defer func() { pooled.ReleaseUint64Slice(seenBuf) }()
 	} else {
 		seen = newU64Set(max(64, needWindow*2))
 		defer releaseU64Set(&seen)

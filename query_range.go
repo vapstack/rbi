@@ -180,7 +180,7 @@ func (e *numericRangeBucketCacheEntry) releaseFullSpanCache() {
 	}
 	if e.retired != nil {
 		posting.ReleaseAll(e.retired)
-		posting.PutSlice(e.retired)
+		posting.ReleaseSlice(e.retired)
 		e.retired = nil
 	}
 	e.fullSpanClock = 0

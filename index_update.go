@@ -4,26 +4,27 @@ import (
 	"fmt"
 	"unsafe"
 
+	"github.com/vapstack/rbi/internal/keycodec"
 	"github.com/vapstack/rbi/internal/posting"
 )
 
 type uniqueBatchCheckState struct {
-	leaving map[string]map[string]posting.List
-	seen    map[string]map[string]uint64
+	leaving map[string]map[keycodec.IndexLookupKey]posting.List
+	seen    map[string]map[keycodec.IndexLookupKey]uint64
 }
 
 type uniqueLeavingTouch struct {
 	field string
-	key   string
+	key   keycodec.IndexLookupKey
 	added bool
 }
 
 type uniqueSeenWrite struct {
 	field string
-	key   string
+	key   keycodec.IndexLookupKey
 }
 
-func markUniqueBatchLeaving(state uniqueBatchCheckState, field, key string, idx uint64) bool {
+func markUniqueBatchLeaving(state uniqueBatchCheckState, field string, key keycodec.IndexLookupKey, idx uint64) bool {
 	fm := state.leaving[field]
 	if fm == nil {
 		fm = uniqueLeavingInnerPool.Get()
@@ -39,7 +40,7 @@ func markUniqueBatchLeaving(state uniqueBatchCheckState, field, key string, idx 
 	return true
 }
 
-func appendUniqueBatchLeavingTouch(state uniqueBatchCheckState, touched []uniqueLeavingTouch, field, key string, idx uint64) []uniqueLeavingTouch {
+func appendUniqueBatchLeavingTouch(state uniqueBatchCheckState, touched []uniqueLeavingTouch, field string, key keycodec.IndexLookupKey, idx uint64) []uniqueLeavingTouch {
 	added := markUniqueBatchLeaving(state, field, key, idx)
 	return append(touched, uniqueLeavingTouch{field: field, key: key, added: added})
 }
@@ -89,7 +90,7 @@ func (qe *queryEngine) checkUniqueBatchCandidateAndCollectSeen(
 		}
 	}
 
-	ids := qe.getSnapshot().fieldLookupPostingRetained(acc.name, single)
+	ids := qe.getSnapshot().fieldLookupPostingRetainedKey(acc.name, single)
 	if ids.IsEmpty() {
 		return append(seenWrites, uniqueSeenWrite{field: acc.name, key: single}), nil
 	}
@@ -324,8 +325,8 @@ func (qe *queryEngine) checkUniqueBatchCandidate(
 	idx uint64,
 	ptr unsafe.Pointer,
 	acc indexedFieldAccessor,
-	seen map[string]map[string]uint64,
-	leaving map[string]map[string]posting.List,
+	seen map[string]map[keycodec.IndexLookupKey]uint64,
+	leaving map[string]map[keycodec.IndexLookupKey]posting.List,
 ) error {
 	single, ok, isNil := acc.uniqueGetter(ptr)
 	if !ok || isNil {
@@ -342,7 +343,7 @@ func (qe *queryEngine) checkUniqueBatchCandidate(
 	}
 	sm[single] = idx
 
-	ids := qe.getSnapshot().fieldLookupPostingRetained(acc.name, single)
+	ids := qe.getSnapshot().fieldLookupPostingRetainedKey(acc.name, single)
 	if ids.IsEmpty() {
 		return nil
 	}

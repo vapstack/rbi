@@ -283,7 +283,8 @@ func (lp *largePosting) iterator() *largeIterator {
 }
 
 func (lp *largePosting) release() {
-	putLargePosting(lp)
+	lp.clear()
+	largePostingPool.Put(lp)
 }
 
 func (lp *largePosting) Release() { lp.release() }
@@ -646,38 +647,18 @@ main:
 }
 
 func (lp *largePosting) forEachIntersecting(other *largePosting, fn func(uint64) bool) bool {
-	var left *largeIterator
-	if v := largeIteratorPool.Get(); v != nil {
-		left = v.(*largeIterator)
-	} else {
-		left = new(largeIterator)
-	}
-	left.initializeSnapshot(lp)
-
-	var right *largeIterator
-	if v := largeIteratorPool.Get(); v != nil {
-		right = v.(*largeIterator)
-	} else {
-		right = new(largeIterator)
-	}
-	right.initializeSnapshot(other)
-
+	left := getLargeIteratorSnapshot(lp)
+	right := getLargeIteratorSnapshot(other)
 	stopped := forEachLargeArrayIntersecting(&left.highlowcontainer, &right.highlowcontainer, fn)
-	putLargeIterator(left)
-	putLargeIterator(right)
+	left.Release()
+	right.Release()
 	return stopped
 }
 
 func (lp *largePosting) forEach(fn func(uint64) bool) bool {
-	var snapshot *largeIterator
-	if v := largeIteratorPool.Get(); v != nil {
-		snapshot = v.(*largeIterator)
-	} else {
-		snapshot = new(largeIterator)
-	}
-	snapshot.initializeSnapshot(lp)
+	snapshot := getLargeIteratorSnapshot(lp)
 	ok := forEachLargeArray(&snapshot.highlowcontainer, fn)
-	putLargeIterator(snapshot)
+	snapshot.Release()
 	return ok
 }
 
@@ -949,7 +930,13 @@ func (it *largeIterator) initializeSnapshot(lp *largePosting) {
 }
 
 func (it *largeIterator) Release() {
-	putLargeIterator(it)
+	if it.iter != nil {
+		it.iter.release()
+	}
+	it.iter = nil
+	it.highlowcontainer.clear()
+	it.highlowcontainer.releaseBacking()
+	largeIteratorPool.Put(it)
 }
 
 func writeLarge(writer *bufio.Writer, lp *largePosting) error {
@@ -1128,7 +1115,7 @@ func (la *largeArray) appendCopyMany(src largeArray, start, end int) {
 
 func (la *largeArray) releaseBacking() {
 	if la.storage != nil {
-		putLargeArrayStorage(la.storage)
+		releaseLargeArrayStorage(la.storage)
 		la.storage = nil
 	}
 	la.keys = nil
@@ -1175,7 +1162,7 @@ func (la *largeArray) setSize(newsize int) {
 	clear(la.containers[copied:newsize])
 
 	if oldStorage != nil {
-		putLargeArrayStorage(oldStorage)
+		releaseLargeArrayStorage(oldStorage)
 	}
 }
 

@@ -105,37 +105,37 @@ var (
 )
 
 func GetBoolSlice(capHint int) []bool { return boolPool.Get(capHint) }
-func PutBoolSlice(s []bool)           { boolPool.Put(s) }
+func ReleaseBoolSlice(s []bool)       { boolPool.Put(s) }
 
 func GetIntSlice(capHint int) []int { return intPool.Get(capHint) }
-func PutIntSlice(s []int)           { intPool.Put(s) }
+func ReleaseIntSlice(s []int)       { intPool.Put(s) }
 
 func GetInt32Slice(capHint int) []int32 { return int32Pool.Get(capHint) }
-func PutInt32Slice(s []int32)           { int32Pool.Put(s) }
+func ReleaseInt32Slice(s []int32)       { int32Pool.Put(s) }
 
 func GetInt64Slice(capHint int) []int64 { return int64Pool.Get(capHint) }
-func PutInt64Slice(s []int64)           { int64Pool.Put(s) }
+func ReleaseInt64Slice(s []int64)       { int64Pool.Put(s) }
 
 func GetUintSlice(capHint int) []uint { return uintPool.Get(capHint) }
-func PutUintSlice(s []uint)           { uintPool.Put(s) }
+func ReleaseUintSlice(s []uint)       { uintPool.Put(s) }
 
 func GetUint32Slice(capHint int) []uint32 { return uint32Pool.Get(capHint) }
-func PutUint32Slice(s []uint32)           { uint32Pool.Put(s) }
+func ReleaseUint32Slice(s []uint32)       { uint32Pool.Put(s) }
 
 func GetUint64Slice(capHint int) []uint64 { return uint64Pool.Get(capHint) }
-func PutUint64Slice(s []uint64)           { uint64Pool.Put(s) }
+func ReleaseUint64Slice(s []uint64)       { uint64Pool.Put(s) }
 
 func GetStringSlice(capHint int) []string { return stringPool.Get(capHint) }
-func PutStringSlice(s []string)           { stringPool.Put(s) }
+func ReleaseStringSlice(s []string)       { stringPool.Put(s) }
 
 func GetByteSlice(capHint int) []byte { return bytePool.Get(capHint) }
-func PutByteSlice(s []byte)           { bytePool.Put(s) }
+func ReleaseByteSlice(s []byte)       { bytePool.Put(s) }
 
 func GetFloat32Slice(capHint int) []float32 { return float32Pool.Get(capHint) }
-func PutFloat32Slice(s []float32)           { float32Pool.Put(s) }
+func ReleaseFloat32Slice(s []float32)       { float32Pool.Put(s) }
 
 func GetFloat64Slice(capHint int) []float64 { return float64Pool.Get(capHint) }
-func PutFloat64Slice(s []float64)           { float64Pool.Put(s) }
+func ReleaseFloat64Slice(s []float64)       { float64Pool.Put(s) }
 
 /**/
 

@@ -1028,7 +1028,12 @@ func (rc *containerRun) release() {
 	if rc.refs.Add(-1) != 0 {
 		return
 	}
-	putRunContainer(rc)
+	if cap(rc.iv) > maxPooledRunContainerCapacity {
+		return
+	}
+	clear(rc.iv)
+	rc.iv = rc.iv[:0]
+	runContainerPool.Put(rc)
 }
 
 func (rc *containerRun) Release() { rc.release() }
@@ -1229,7 +1234,8 @@ func (ri *runIterator16) advanceIfNeeded(minval uint16) {
 }
 
 func (ri *runIterator16) release() {
-	putRunIterator16(ri)
+	ri.rc = nil
+	runIteratorPool.Put(ri)
 }
 
 func (rc *containerRun) newRunManyIterator() *runIterator16 {

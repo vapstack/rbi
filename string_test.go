@@ -178,14 +178,14 @@ func TestStringExt_SharedAutoBatchUniqueRejectHolePersistsAcrossReopen(t *testin
 		t.Fatalf("seed Set: %v", err)
 	}
 
-	badReq, err := db.buildSetAutoBatchRequest(autoBatchKeyFromID("ghost-hole"), &StringUniqueTestRec{
+	badReq, err := db.buildSetAutoBatchRequest(dataKeyFromID("ghost-hole"), &StringUniqueTestRec{
 		Email: "seed@x",
 		Code:  2,
 	}, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("build bad request: %v", err)
 	}
-	goodReq, err := db.buildSetAutoBatchRequest(autoBatchKeyFromID("real-hole"), &StringUniqueTestRec{
+	goodReq, err := db.buildSetAutoBatchRequest(dataKeyFromID("real-hole"), &StringUniqueTestRec{
 		Email: "real@x",
 		Code:  3,
 	}, nil, nil, nil)

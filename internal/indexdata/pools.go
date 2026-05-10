@@ -1,7 +1,6 @@
 package indexdata
 
 import (
-	"github.com/vapstack/rbi/internal/keycodec"
 	"github.com/vapstack/rbi/internal/pooled"
 	"github.com/vapstack/rbi/internal/posting"
 )
@@ -64,8 +63,8 @@ var (
 			for i := range r.entries {
 				r.entries[i].IDs.Release()
 			}
-			PutFieldEntrySlice(r.entries)
-			pooled.PutByteSlice(r.stringData)
+			ReleaseFieldEntrySlice(r.entries)
+			pooled.ReleaseByteSlice(r.stringData)
 			r.entries = nil
 			r.stringData = nil
 			r.refs.Store(0)
@@ -75,19 +74,19 @@ var (
 		Cleanup: func(c *fieldIndexChunk) {
 			if c.posts != nil {
 				posting.ReleaseAll(c.posts)
-				posting.PutSlice(c.posts)
+				posting.ReleaseSlice(c.posts)
 				c.posts = nil
 			}
 			if c.numeric != nil {
-				pooled.PutUint64Slice(c.numeric)
+				pooled.ReleaseUint64Slice(c.numeric)
 				c.numeric = nil
 			}
 			if c.stringRefs != nil {
-				pooled.PutUint32Slice(c.stringRefs)
+				pooled.ReleaseUint32Slice(c.stringRefs)
 				c.stringRefs = nil
 			}
 			if c.stringData != nil {
-				pooled.PutByteSlice(c.stringData)
+				pooled.ReleaseByteSlice(c.stringData)
 				c.stringData = nil
 			}
 			c.rows = 0
@@ -97,9 +96,9 @@ var (
 	fieldIndexChunkedRootPool = pooled.Pointers[fieldIndexChunkedRoot]{
 		Cleanup: func(r *fieldIndexChunkedRoot) {
 			releaseFieldIndexChunkDirPages(r.pages)
-			pooled.PutIntSlice(r.chunkPrefix)
-			pooled.PutIntSlice(r.prefix)
-			pooled.PutUint64Slice(r.rowPrefix)
+			pooled.ReleaseIntSlice(r.chunkPrefix)
+			pooled.ReleaseIntSlice(r.prefix)
+			pooled.ReleaseUint64Slice(r.rowPrefix)
 			r.pages = nil
 			r.chunkPrefix = nil
 			r.prefix = nil
@@ -115,8 +114,8 @@ var (
 				p.refs[i].chunk.release()
 			}
 			fieldIndexChunkRefSlicePool.Put(p.refs)
-			pooled.PutIntSlice(p.prefix)
-			pooled.PutUint64Slice(p.rowPrefix)
+			pooled.ReleaseIntSlice(p.prefix)
+			pooled.ReleaseUint64Slice(p.rowPrefix)
 			p.refs = nil
 			p.prefix = nil
 			p.rowPrefix = nil
@@ -126,8 +125,8 @@ var (
 
 	measureFlatRootPool = pooled.Pointers[measureFlatRoot]{
 		Cleanup: func(r *measureFlatRoot) {
-			pooled.PutUint64Slice(r.ids)
-			pooled.PutUint64Slice(r.values)
+			pooled.ReleaseUint64Slice(r.ids)
+			pooled.ReleaseUint64Slice(r.values)
 			r.ids = nil
 			r.values = nil
 			r.refs.Store(0)
@@ -135,8 +134,8 @@ var (
 	}
 	measureChunkPool = pooled.Pointers[measureChunk]{
 		Cleanup: func(c *measureChunk) {
-			pooled.PutUint64Slice(c.ids)
-			pooled.PutUint64Slice(c.values)
+			pooled.ReleaseUint64Slice(c.ids)
+			pooled.ReleaseUint64Slice(c.values)
 			c.ids = nil
 			c.values = nil
 			c.refs.Store(0)
@@ -165,7 +164,6 @@ var (
 	fieldStorageRunCursorSlicePool  = pooled.NewSlicePool[fieldStorageRunCursor](4<<10, pooled.ClearCap)
 	fieldIndexChunkRefSlicePool     = pooled.NewSlicePool[fieldIndexChunkRef](1<<8, pooled.ClearCap)
 	fieldIndexChunkDirPageSlicePool = pooled.NewSlicePool[*fieldIndexChunkDirPage](16<<10, pooled.ClearCap)
-	fieldIndexKeySlicePool          = pooled.NewSlicePool[keycodec.IndexKey](4<<10, pooled.ClearCap)
 	measureEntrySlicePool           = pooled.NewSlicePool[MeasureEntry](16<<10, pooled.NoClear)
 	measureBatchDeltaSlicePool      = pooled.NewSlicePool[MeasureDelta](8<<10, pooled.NoClear)
 	measureDeltaSlotSlicePool       = pooled.NewSlicePool[[]MeasureDelta](4<<10, pooled.ClearCap)
@@ -175,38 +173,34 @@ var (
 
 // ---
 
-func GetPostingMap() map[string]posting.List  { return postingMapPool.Get() }
-func PutPostingMap(m map[string]posting.List) { postingMapPool.Put(m) }
+func GetPostingMap() map[string]posting.List      { return postingMapPool.Get() }
+func ReleasePostingMap(m map[string]posting.List) { postingMapPool.Put(m) }
 
-func GetFixedPostingMap() map[uint64]posting.List  { return fixedPostingMapPool.Get() }
-func PutFixedPostingMap(m map[uint64]posting.List) { fixedPostingMapPool.Put(m) }
+func GetFixedPostingMap() map[uint64]posting.List      { return fixedPostingMapPool.Get() }
+func ReleaseFixedPostingMap(m map[uint64]posting.List) { fixedPostingMapPool.Put(m) }
 
 func GetPostingDeltaSlice(capHint int) []PostingDelta { return postingDeltaSlicePool.Get(capHint) }
-func PutPostingDeltaSlice(buf []PostingDelta)         { postingDeltaSlicePool.Put(buf) }
+func ReleasePostingDeltaSlice(buf []PostingDelta)     { postingDeltaSlicePool.Put(buf) }
 
 func GetFieldEntrySlice(capHint int) []Entry { return fieldEntrySlicePool.Get(capHint) }
-func PutFieldEntrySlice(buf []Entry)         { fieldEntrySlicePool.Put(buf) }
+func ReleaseFieldEntrySlice(buf []Entry)     { fieldEntrySlicePool.Put(buf) }
 
-func getFieldIndexKeySlice(capHint int) []keycodec.IndexKey {
-	return fieldIndexKeySlicePool.Get(capHint)
-}
+func GetBatchPostingDeltaMap() map[uint64]BatchPostingDelta      { return batchPostingDeltaMapPool.Get() }
+func ReleaseBatchPostingDeltaMap(m map[uint64]BatchPostingDelta) { batchPostingDeltaMapPool.Put(m) }
 
-func putFieldIndexKeySlice(buf []keycodec.IndexKey) {
-	fieldIndexKeySlicePool.Put(buf)
-}
-
-func GetBatchPostingDeltaMap() map[uint64]BatchPostingDelta  { return batchPostingDeltaMapPool.Get() }
-func PutBatchPostingDeltaMap(m map[uint64]BatchPostingDelta) { batchPostingDeltaMapPool.Put(m) }
+// todo: rework this >>
 
 func PutStringPostingDiffMap(m map[string]uint32) { stringPostingDiffMapPool.Put(m) }
 func PutFixedPostingDiffMap(m map[uint64]uint32)  { fixedPostingDiffMapPool.Put(m) }
 func PutStringPostingAddMap(m map[string]uint32)  { stringPostingAddMapPool.Put(m) }
 func PutFixedPostingAddMap(m map[uint64]uint32)   { fixedPostingAddMapPool.Put(m) }
 
-func GetFieldStorageSlice(capHint int) []FieldStorage { return fieldStorageSlicePool.Get(capHint) }
-func PutFieldStorageSlice(slots []FieldStorage)       { fieldStorageSlicePool.Put(slots) }
+// <<
 
-func putOwnedFieldIndexChunkRefSlice(buf []fieldIndexChunkRef) {
+func GetFieldStorageSlice(capHint int) []FieldStorage { return fieldStorageSlicePool.Get(capHint) }
+func ReleaseFieldStorageSlice(slots []FieldStorage)   { fieldStorageSlicePool.Put(slots) }
+
+func releaseOwnedFieldIndexChunkRefSlice(buf []fieldIndexChunkRef) {
 	for i := range buf {
 		if buf[i].chunk != nil {
 			buf[i].chunk.release()
@@ -217,10 +211,10 @@ func putOwnedFieldIndexChunkRefSlice(buf []fieldIndexChunkRef) {
 }
 
 func GetMeasureEntrySlice(hint int) []MeasureEntry { return measureEntrySlicePool.Get(hint) }
-func PutMeasureEntrySlice(buf []MeasureEntry)      { measureEntrySlicePool.Put(buf) }
+func ReleaseMeasureEntrySlice(buf []MeasureEntry)  { measureEntrySlicePool.Put(buf) }
 
 func GetMeasureDeltaSlice(hint int) []MeasureDelta { return measureBatchDeltaSlicePool.Get(hint) }
-func PutMeasureDeltaSlice(buf []MeasureDelta)      { measureBatchDeltaSlicePool.Put(buf) }
+func ReleaseMeasureDeltaSlice(buf []MeasureDelta)  { measureBatchDeltaSlicePool.Put(buf) }
 
-func GetMeasureStorageSlice(hint int) []MeasureStorage { return measureStorageSlicePool.Get(hint) }
-func PutMeasureStorageSlice(slots []MeasureStorage)    { measureStorageSlicePool.Put(slots) }
+func GetMeasureStorageSlice(hint int) []MeasureStorage  { return measureStorageSlicePool.Get(hint) }
+func ReleaseMeasureStorageSlice(slots []MeasureStorage) { measureStorageSlicePool.Put(slots) }

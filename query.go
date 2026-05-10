@@ -1,12 +1,12 @@
 package rbi
 
 import (
-	"encoding/binary"
 	"fmt"
 	"unsafe"
 
 	"github.com/vapstack/qx"
 	"github.com/vapstack/rbi/internal/indexdata"
+	"github.com/vapstack/rbi/internal/keycodec"
 	"github.com/vapstack/rbi/internal/posting"
 	"github.com/vapstack/rbi/internal/qir"
 	"go.etcd.io/bbolt"
@@ -58,7 +58,7 @@ func (qv *queryView) tryQueryEmptyOnSnapshot(q *qir.Shape) (bool, error) {
 		if fm == nil || fm.Slice {
 			return false, nil
 		}
-		key, isSlice, isNil, err := qv.exprValueToIdxScalar(e)
+		key, isSlice, isNil, err := qv.exprValueToLookupKey(e)
 		if err != nil {
 			return false, err
 		}
@@ -68,7 +68,7 @@ func (qv *queryView) tryQueryEmptyOnSnapshot(q *qir.Shape) (bool, error) {
 		if isNil {
 			return qv.nilFieldOverlayForExpr(e).LookupCardinality(nilIndexEntryKey) == 0, nil
 		}
-		return qv.fieldOverlayForExpr(e).LookupCardinality(key) == 0, nil
+		return lookupScalarCardinality(qv.fieldOverlayForExpr(e), key) == 0, nil
 
 	case qir.OpGT, qir.OpGTE, qir.OpLT, qir.OpLTE, qir.OpPREFIX:
 		fm := qv.fieldMetaByExpr(e)
@@ -173,7 +173,7 @@ func (db *DB[K, V]) batchGetTxCompactByIdx(tx *bbolt.Tx, snap *indexSnapshot, id
 			if !ok {
 				panic("rbi: no string key associated with snapshot idx")
 			}
-			v := bucket.Get(unsafe.Slice(unsafe.StringData(s), len(s)))
+			v := bucket.Get(keycodec.StringBytes(s))
 			if v == nil {
 				continue
 			}
@@ -188,8 +188,7 @@ func (db *DB[K, V]) batchGetTxCompactByIdx(tx *bbolt.Tx, snap *indexSnapshot, id
 
 	var key [8]byte
 	for _, idx := range ids {
-		binary.BigEndian.PutUint64(key[:], idx)
-		v := bucket.Get(key[:])
+		v := bucket.Get(keycodec.U64BytesWithBuf(idx, &key))
 		if v == nil {
 			continue
 		}

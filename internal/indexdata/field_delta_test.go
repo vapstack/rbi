@@ -323,7 +323,7 @@ func TestSortPostingDeltasBufOrdersByKey(t *testing.T) {
 	buf = append(buf, newPostingDelta(keycodec.FromU64(6), fieldStorageSingleton(3), posting.List{}))
 	buf = append(buf, newPostingDelta(keycodec.FromU64(2), fieldStorageSingleton(1), posting.List{}))
 	buf = append(buf, newPostingDelta(keycodec.FromU64(4), fieldStorageSingleton(2), posting.List{}))
-	defer PutPostingDeltaSlice(buf)
+	defer ReleasePostingDeltaSlice(buf)
 
 	sortPostingDeltasBuf(buf)
 	for i, want := range []uint64{2, 4, 6} {
@@ -468,8 +468,8 @@ func TestFieldStorageApplyPostingDiffBufOwned_ChunkedMatchesUnbuffered(t *testin
 	if want == nil {
 		t.Fatalf("expected flattened unbuffered storage")
 	}
-	defer PutFieldEntrySlice(want)
-	defer pooled.PutByteSlice(wantData)
+	defer ReleaseFieldEntrySlice(want)
+	defer pooled.ReleaseByteSlice(wantData)
 	fieldStorageAssertStorageMatchesEntries(t, buffered, want)
 }
 
@@ -687,7 +687,7 @@ func TestApplySingleFieldPostingDiffChunked_StringFastPathRefreshesRefLastOwner(
 	for i := range reuse {
 		reuse[i] = '!'
 	}
-	defer pooled.PutByteSlice(reuse)
+	defer pooled.ReleaseByteSlice(reuse)
 	defer storage.Release()
 
 	replRef, ok := storage.chunked.refAtChunk(0)
@@ -898,8 +898,8 @@ func TestApplySingleFieldPostingDiffChunked_RebalancesOversizedDirectoryPagesAft
 	if baseEntries == nil {
 		t.Fatalf("expected flattened base entries")
 	}
-	defer PutFieldEntrySlice(baseEntries)
-	defer pooled.PutByteSlice(baseData)
+	defer ReleaseFieldEntrySlice(baseEntries)
+	defer pooled.ReleaseByteSlice(baseData)
 	want, same := applySingleFieldPostingDiffSorted(baseEntries, PostingDelta{
 		Key: insertKey,
 		Delta: BatchPostingDelta{
@@ -910,7 +910,7 @@ func TestApplySingleFieldPostingDiffChunked_RebalancesOversizedDirectoryPagesAft
 		t.Fatalf("expected non-empty expected entries")
 	}
 	if !same {
-		defer PutFieldEntrySlice(want)
+		defer ReleaseFieldEntrySlice(want)
 	}
 	fieldStorageAssertStorageMatchesEntries(t, got, want)
 }

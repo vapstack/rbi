@@ -5,6 +5,7 @@ import (
 	"sync/atomic"
 
 	"github.com/vapstack/rbi/internal/indexdata"
+	"github.com/vapstack/rbi/internal/keycodec"
 	"github.com/vapstack/rbi/internal/pooled"
 	"github.com/vapstack/rbi/internal/posting"
 )
@@ -1089,6 +1090,21 @@ func (s *indexSnapshot) fieldLookupPostingRetained(field, key string) posting.Li
 	return indexdata.NewFieldOverlayStorage(s.index[acc.ordinal]).LookupPostingRetained(key)
 }
 
+func (s *indexSnapshot) fieldLookupPostingRetainedKey(field string, key keycodec.IndexLookupKey) posting.List {
+	if s == nil || s.index == nil {
+		return posting.List{}
+	}
+	acc, ok := s.indexedFieldByName[field]
+	if !ok || acc.ordinal >= len(s.index) {
+		return posting.List{}
+	}
+	ov := indexdata.NewFieldOverlayStorage(s.index[acc.ordinal])
+	if key.IsNumeric() {
+		return ov.LookupPostingRetainedKey(key.IndexKey())
+	}
+	return ov.LookupPostingRetained(key.StringKey())
+}
+
 func (sm *snapshotManager) publishRef(s *indexSnapshot) *pooled.Slice[*indexSnapshot] {
 	if s == nil {
 		return nil
@@ -1485,7 +1501,7 @@ func (qe *queryEngine) buildPreparedSnapshotFromEmptyBaseNoLock(seq uint64, prev
 			}
 		}
 		inheritMaterializedPredCache(snap, prev, qe.indexedFieldMap, changed)
-		pooled.PutBoolSlice(changed)
+		pooled.ReleaseBoolSlice(changed)
 	} else {
 		inheritMaterializedPredCache(snap, prev, qe.indexedFieldMap, nil)
 	}
@@ -1595,7 +1611,7 @@ func (qe *queryEngine) buildPreparedSnapshotInsertOnlyNoLock(seq uint64, prev *i
 			}
 		}
 		inheritMaterializedPredCache(next, prev, qe.indexedFieldMap, changed)
-		pooled.PutBoolSlice(changed)
+		pooled.ReleaseBoolSlice(changed)
 	} else {
 		inheritMaterializedPredCache(next, prev, qe.indexedFieldMap, nil)
 	}
@@ -1677,7 +1693,7 @@ func (s *indexSnapshot) releaseStorage() {
 	indexdata.ReleaseFieldStorageSlots(s.lenIndex)
 	indexdata.ReleaseMeasureStorageSlots(s.measure)
 	if s.lenZeroComplement != nil {
-		pooled.PutBoolSlice(s.lenZeroComplement)
+		pooled.ReleaseBoolSlice(s.lenZeroComplement)
 	}
 	s.index = nil
 	s.nilIndex = nil

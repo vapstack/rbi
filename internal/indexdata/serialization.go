@@ -25,8 +25,8 @@ const (
 	indexKeyEncodingRaw8   byte = 2
 )
 
-func (storage MeasureStorage) WriteInto(writer *bufio.Writer) error {
-	rows := storage.Rows()
+func (s MeasureStorage) WriteInto(writer *bufio.Writer) error {
+	rows := s.Rows()
 	if err := writeUvarint(writer, uint64(rows)); err != nil {
 		return err
 	}
@@ -34,19 +34,19 @@ func (storage MeasureStorage) WriteInto(writer *bufio.Writer) error {
 		return nil
 	}
 
-	if storage.flat != nil {
-		for i, id := range storage.flat.ids {
+	if s.flat != nil {
+		for i, id := range s.flat.ids {
 			if err := writeUvarint(writer, id); err != nil {
 				return err
 			}
-			if err := writeUvarint(writer, storage.flat.values[i]); err != nil {
+			if err := writeUvarint(writer, s.flat.values[i]); err != nil {
 				return err
 			}
 		}
 		return nil
 	}
-	for i := 0; i < len(storage.chunked.refsByID); i++ {
-		chunk := storage.chunked.refsByID[i].chunk
+	for i := 0; i < len(s.chunked.refsByID); i++ {
+		chunk := s.chunked.refsByID[i].chunk
 		for j, id := range chunk.ids {
 			if err := writeUvarint(writer, id); err != nil {
 				return err
@@ -59,14 +59,14 @@ func (storage MeasureStorage) WriteInto(writer *bufio.Writer) error {
 	return nil
 }
 
-func (storage FieldStorage) WriteInto(writer *bufio.Writer) error {
+func (s FieldStorage) WriteInto(writer *bufio.Writer) error {
 	switch {
 
-	case storage.chunked != nil:
+	case s.chunked != nil:
 		if err := writer.WriteByte(fieldStorageEncodingChunked); err != nil {
 			return fmt.Errorf("encode: writing storage encoding: %w", err)
 		}
-		root := storage.chunked
+		root := s.chunked
 		if err := writeUvarint(writer, uint64(len(root.pages))); err != nil {
 			return fmt.Errorf("encode: writing page count: %w", err)
 		}
@@ -83,11 +83,11 @@ func (storage FieldStorage) WriteInto(writer *bufio.Writer) error {
 		}
 		return nil
 
-	case storage.flat != nil:
+	case s.flat != nil:
 		if err := writer.WriteByte(fieldStorageEncodingFlat); err != nil {
 			return fmt.Errorf("encode: writing storage encoding: %w", err)
 		}
-		entries := storage.flat.entries
+		entries := s.flat.entries
 		if err := writeUvarint(writer, uint64(len(entries))); err != nil {
 			return fmt.Errorf("encode: writing flat len: %w", err)
 		}
@@ -354,7 +354,7 @@ func ReadFieldStorage(reader *bufio.Reader, keep bool, section string, fieldName
 					if cap(data)-len(data) < keyLen {
 						next := pooled.GetByteSlice(len(data) + keyLen)
 						next = append(next, data...)
-						pooled.PutByteSlice(data)
+						pooled.ReleaseByteSlice(data)
 						data = next
 					}
 					data = data[:start+keyLen]
@@ -391,8 +391,8 @@ func ReadFieldStorage(reader *bufio.Reader, keep bool, section string, fieldName
 		}
 		entries = entries[:n]
 		if len(entries) == 0 {
-			PutFieldEntrySlice(entries)
-			pooled.PutByteSlice(data)
+			ReleaseFieldEntrySlice(entries)
+			pooled.ReleaseByteSlice(data)
 			return FieldStorage{}, nil
 		}
 		return newFlatFieldStorage(entries, data), nil
@@ -430,7 +430,7 @@ func ReadFieldStorage(reader *bufio.Reader, keep bool, section string, fieldName
 			for j := uint64(0); j < refCount; j++ {
 				chunk, err := readFieldIndexChunk(reader)
 				if err != nil {
-					putOwnedFieldIndexChunkRefSlice(refs)
+					releaseOwnedFieldIndexChunkRefSlice(refs)
 					builder.releaseOwned()
 					return FieldStorage{}, fmt.Errorf("reading chunk page=%d/%d ref=%d/%d for field %q in %s: %w", i+1, pageCount, j+1, refCount, fieldName, section, err)
 				}
@@ -485,14 +485,14 @@ func readFieldIndexChunk(reader *bufio.Reader) (*fieldIndexChunk, error) {
 			key, err := readBEUint64(reader)
 			if err != nil {
 				releaseReadFieldChunkBuffers(posts, keys, nil, nil)
-				pooled.PutUint64Slice(keyOwners)
+				pooled.ReleaseUint64Slice(keyOwners)
 				return nil, fmt.Errorf("reading numeric chunk key %d/%d: %w", i+1, n, err)
 			}
 
 			ids, err := posting.ReadFrom(reader)
 			if err != nil {
 				releaseReadFieldChunkBuffers(posts, keys, nil, nil)
-				pooled.PutUint64Slice(keyOwners)
+				pooled.ReleaseUint64Slice(keyOwners)
 				return nil, fmt.Errorf("reading numeric chunk posting %d/%d: %w", i+1, n, err)
 			}
 
@@ -523,7 +523,7 @@ func readFieldIndexChunk(reader *bufio.Reader) (*fieldIndexChunk, error) {
 				var single posting.List
 				posts[j] = single.BuildAdded(keyOwners[base+1])
 			}
-			pooled.PutUint64Slice(keyOwners)
+			pooled.ReleaseUint64Slice(keyOwners)
 			keyOwners = nil
 			keys[i] = key
 			posts[i] = ids
@@ -557,13 +557,13 @@ func readFieldIndexChunk(reader *bufio.Reader) (*fieldIndexChunk, error) {
 			n, err := readUvarint(reader)
 			if err != nil {
 				releaseReadFieldChunkBuffers(posts, nil, refs, data)
-				pooled.PutUint64Slice(owners)
+				pooled.ReleaseUint64Slice(owners)
 				return nil, fmt.Errorf("reading string chunk key len %d/%d: %w", i+1, len(refs), err)
 			}
 
 			if n > uint64(^uint(0)>>1) {
 				releaseReadFieldChunkBuffers(posts, nil, refs, data)
-				pooled.PutUint64Slice(owners)
+				pooled.ReleaseUint64Slice(owners)
 				return nil, fmt.Errorf("string chunk key len overflows int at entry %d/%d: %v", i+1, len(refs), n)
 			}
 
@@ -573,7 +573,7 @@ func readFieldIndexChunk(reader *bufio.Reader) (*fieldIndexChunk, error) {
 			if cap(data)-len(data) < keyLen {
 				next := pooled.GetByteSlice(len(data) + keyLen)
 				next = append(next, data...)
-				pooled.PutByteSlice(data)
+				pooled.ReleaseByteSlice(data)
 				data = next
 			}
 
@@ -581,14 +581,14 @@ func readFieldIndexChunk(reader *bufio.Reader) (*fieldIndexChunk, error) {
 			if keyLen > 0 {
 				if err = readFull(reader, data[start:start+keyLen]); err != nil {
 					releaseReadFieldChunkBuffers(posts, nil, refs, data)
-					pooled.PutUint64Slice(owners)
+					pooled.ReleaseUint64Slice(owners)
 					return nil, fmt.Errorf("reading string chunk key %d/%d: %w", i+1, len(refs), err)
 				}
 			}
 
 			if !fieldIndexStringRefFits(start, keyLen) {
 				releaseReadFieldChunkBuffers(posts, nil, refs, data)
-				pooled.PutUint64Slice(owners)
+				pooled.ReleaseUint64Slice(owners)
 				if keyLen > fieldIndexStringRefMax {
 					return nil, fmt.Errorf("string chunk key len exceeds uint16 at entry %d/%d: %d", i+1, len(refs), keyLen)
 				}
@@ -599,7 +599,7 @@ func readFieldIndexChunk(reader *bufio.Reader) (*fieldIndexChunk, error) {
 			ids, err := posting.ReadFrom(reader)
 			if err != nil {
 				releaseReadFieldChunkBuffers(posts, nil, refs, data)
-				pooled.PutUint64Slice(owners)
+				pooled.ReleaseUint64Slice(owners)
 				return nil, fmt.Errorf("reading string chunk posting %d/%d: %w", i+1, len(refs), err)
 			}
 
@@ -624,7 +624,7 @@ func readFieldIndexChunk(reader *bufio.Reader) (*fieldIndexChunk, error) {
 				var single posting.List
 				posts[j] = single.BuildAdded(owners[j])
 			}
-			pooled.PutUint64Slice(owners)
+			pooled.ReleaseUint64Slice(owners)
 			owners = nil
 			posts[i] = ids
 			rows += ids.Cardinality()
@@ -642,18 +642,18 @@ func readFieldIndexChunk(reader *bufio.Reader) (*fieldIndexChunk, error) {
 
 func releaseReadFieldChunkBuffers(posts []posting.List, keys []uint64, refs []fieldIndexStringRef, data []byte) {
 	posting.ReleaseAll(posts)
-	posting.PutSlice(posts)
-	pooled.PutUint64Slice(keys)
-	pooled.PutUint32Slice(refs)
-	pooled.PutByteSlice(data)
+	posting.ReleaseSlice(posts)
+	pooled.ReleaseUint64Slice(keys)
+	pooled.ReleaseUint32Slice(refs)
+	pooled.ReleaseByteSlice(data)
 }
 
 func releaseReadFlatBuffers(entries []Entry, n int, data []byte) {
 	for i := 0; i < n; i++ {
 		entries[i].IDs.Release()
 	}
-	PutFieldEntrySlice(entries)
-	pooled.PutByteSlice(data)
+	ReleaseFieldEntrySlice(entries)
+	pooled.ReleaseByteSlice(data)
 }
 
 func skipFieldIndexChunk(reader *bufio.Reader) error {

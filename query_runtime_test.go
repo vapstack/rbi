@@ -89,7 +89,7 @@ func TestPostsAnyFilterStateApply_DirectIntersectMatchesMaterializedUnion(t *tes
 		for i := 0; i < len(postsBuf); i++ {
 			postsBuf[i].Release()
 		}
-		posting.PutSlice(postsBuf)
+		posting.ReleaseSlice(postsBuf)
 	}()
 
 	expectedBuilder := newPostingUnionBuilder(true)
@@ -147,7 +147,7 @@ func TestPostsAnyFilterStateApply_RepeatedDirectIntersectPromotesMaterializedUni
 		for i := 0; i < len(postsBuf); i++ {
 			postsBuf[i].Release()
 		}
-		posting.PutSlice(postsBuf)
+		posting.ReleaseSlice(postsBuf)
 	}()
 
 	expectedBuilder := newPostingUnionBuilder(true)
@@ -206,7 +206,7 @@ func TestPostsAnyFilterStateSetExpectedContainsCalls_PromotesFirstUseMaterializa
 		for i := 0; i < len(postsBuf); i++ {
 			postsBuf[i].Release()
 		}
-		posting.PutSlice(postsBuf)
+		posting.ReleaseSlice(postsBuf)
 	}()
 
 	if state.containsMaterializeAt == 1 {

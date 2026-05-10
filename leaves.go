@@ -1,9 +1,6 @@
 package rbi
 
-import (
-	"github.com/vapstack/rbi/internal/pooled"
-	"github.com/vapstack/rbi/internal/qir"
-)
+import "github.com/vapstack/rbi/internal/qir"
 
 type andLeafMode uint8
 
@@ -131,37 +128,4 @@ func appendAndLeaf(dst []qir.Expr, e qir.Expr) ([]qir.Expr, andLeafStatus) {
 		return nil, andLeafStatusOverflow
 	}
 	return append(dst, e), andLeafStatusOK
-}
-
-func appendAndLeavesModeBuf(dst *pooled.Slice[qir.Expr], e qir.Expr, mode andLeafMode) bool {
-	switch e.Op {
-	case qir.OpNOOP:
-		if mode != andLeafModeCollect {
-			return false
-		}
-		if !e.Not {
-			return true
-		}
-		dst.Append(qir.Expr{Op: qir.OpNOOP, Not: true, FieldOrdinal: qir.NoFieldOrdinal})
-		return true
-	case qir.OpAND:
-		if e.Not || len(e.Operands) == 0 {
-			return false
-		}
-		for _, ch := range e.Operands {
-			if !appendAndLeavesModeBuf(dst, ch, mode) {
-				return false
-			}
-		}
-		return true
-	default:
-		if e.Op == qir.OpOR || len(e.Operands) != 0 {
-			return false
-		}
-		if mode == andLeafModeExtract && e.Not {
-			return false
-		}
-		dst.Append(e)
-		return true
-	}
 }

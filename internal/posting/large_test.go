@@ -249,14 +249,14 @@ func TestLargeIteratorPool_ReusedIteratorStartsFromNewPosting(t *testing.T) {
 	if got := it.Next(); got != 1 {
 		t.Fatalf("first iterator first value: got=%d", got)
 	}
-	putLargeIterator(it)
+	it.Release()
 
 	second := newLargePosting()
 	second.add(7)
 	second.add(uint64(1)<<32 | 9)
 
 	reused := getLargeIterator(second)
-	defer putLargeIterator(reused)
+	defer reused.Release()
 	if !testRaceEnabled && reused != it {
 		t.Fatalf("large iterator pool did not reuse iterator")
 	}
@@ -548,7 +548,7 @@ func TestLargeIteratorAdvanceAndTransitions(t *testing.T) {
 	defer lp.Release()
 
 	it := getLargeIterator(lp)
-	defer putLargeIterator(it)
+	defer it.Release()
 
 	if got := it.peekNext(); got != 1 {
 		t.Fatalf("peekNext mismatch: got=%d want=1", got)
@@ -578,7 +578,7 @@ func TestLargeIteratorAdvanceEdgeCasesAndIntersectsSkips(t *testing.T) {
 		defer lp.Release()
 
 		it := getLargeIterator(lp)
-		defer putLargeIterator(it)
+		defer it.Release()
 
 		it.advanceIfNeeded(0)
 		if got := it.peekNext(); got != 1 {
@@ -919,7 +919,7 @@ func TestLargePostingConcurrentIteratorCreateReleaseStable(t *testing.T) {
 			for i := 0; i < 400; i++ {
 				it := lp.iterator()
 				got := collectLargeIterator(it)
-				putLargeIterator(it)
+				it.Release()
 				if !slices.Equal(got, want) {
 					setFailed("large iterator mismatch under concurrent create/release")
 					return

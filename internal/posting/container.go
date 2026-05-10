@@ -228,7 +228,7 @@ func (ra *containerIndex) appendCopyMany(sa containerIndex, startingindex, end i
 
 func (ra *containerIndex) releaseBacking() {
 	if ra.storage != nil {
-		putContainerIndexStorage(ra.storage)
+		releaseContainerIndexStorage(ra.storage)
 		ra.storage = nil
 	}
 	ra.keys = nil
@@ -275,7 +275,7 @@ func (ra *containerIndex) setSize(newsize int) {
 	clear(ra.containers[copied:newsize])
 
 	if oldStorage != nil {
-		putContainerIndexStorage(oldStorage)
+		releaseContainerIndexStorage(oldStorage)
 	}
 }
 
@@ -708,7 +708,8 @@ func (si *shortIterator) advanceIfNeeded(minval uint16) {
 }
 
 func (si *shortIterator) release() {
-	putShortIterator(si)
+	si.slice = nil
+	shortIteratorPool.Put(si)
 }
 
 type manyIterable interface {

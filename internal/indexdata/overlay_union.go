@@ -98,7 +98,7 @@ func (b *overlayPostingUnionBuilder) finish(optimize bool) posting.List {
 	b.ids = posting.List{}
 	b.inlineLen = 0
 	if b.singles != nil {
-		pooled.PutUint64Slice(b.singles)
+		pooled.ReleaseUint64Slice(b.singles)
 		b.singles = nil
 	}
 	if optimize {

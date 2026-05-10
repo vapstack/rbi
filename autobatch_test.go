@@ -19,11 +19,11 @@ import (
 	"go.etcd.io/bbolt"
 )
 
-func autoBatchKeyFromID[K ~string | ~uint64](id K) keycodec.DataKey {
+func dataKeyFromID[K ~string | ~uint64](id K) keycodec.DataKey {
 	return keycodec.DataKeyFromUserKey(id, reflect.TypeFor[K]().Kind() == reflect.String)
 }
 
-func autoBatchKeyID[K ~string | ~uint64](key keycodec.DataKey) K {
+func dataKeyID[K ~string | ~uint64](key keycodec.DataKey) K {
 	if reflect.TypeFor[K]().Kind() == reflect.String {
 		return keycodec.UserKeyFromDataKey[K](key, true)
 	}
@@ -299,7 +299,7 @@ func TestBatch_StatsTrackBatchSizeDistribution(t *testing.T) {
 		rec := &Rec{Name: name, Age: int(id)}
 		return &autoBatchRequest{
 			op:         autoBatchSet,
-			id:         autoBatchKeyFromID(id),
+			id:         dataKeyFromID(id),
 			setValue:   unsafe.Pointer(rec),
 			setPayload: mustEncodeAutoBatchPayload(t, db, rec),
 			done:       make(chan error, 1),
@@ -391,7 +391,7 @@ func TestBatch_NoBatch_IsolatesRequestInsideBatcher(t *testing.T) {
 	}
 	seedReq := &autoBatchRequest{
 		op:         autoBatchSet,
-		id:         autoBatchKeyFromID(uint64(100)),
+		id:         dataKeyFromID(uint64(100)),
 		setValue:   unsafe.Pointer(seed),
 		setPayload: b,
 		done:       make(chan error, 1),
@@ -434,8 +434,8 @@ func TestBatch_PopSkipsCoalescingWindowForIsolatedHead(t *testing.T) {
 		AutoBatchMaxQueue: 64,
 	})
 
-	isolatedReq := &autoBatchRequest{op: autoBatchSet, id: autoBatchKeyFromID(uint64(1)), done: make(chan error, 1)}
-	followerReq := &autoBatchRequest{op: autoBatchSet, id: autoBatchKeyFromID(uint64(2)), done: make(chan error, 1)}
+	isolatedReq := &autoBatchRequest{op: autoBatchSet, id: dataKeyFromID(uint64(1)), done: make(chan error, 1)}
+	followerReq := &autoBatchRequest{op: autoBatchSet, id: dataKeyFromID(uint64(2)), done: make(chan error, 1)}
 
 	db.autoBatcher.mu.Lock()
 	db.autoBatcher.running = true
@@ -476,9 +476,9 @@ func TestBatch_PopSkipsCoalescingWindowBeforeIsolatedFollower(t *testing.T) {
 		AutoBatchMaxQueue: 64,
 	})
 
-	headReq := &autoBatchRequest{op: autoBatchSet, id: autoBatchKeyFromID(uint64(1)), done: make(chan error, 1)}
-	isolatedReq := &autoBatchRequest{op: autoBatchSet, id: autoBatchKeyFromID(uint64(2)), done: make(chan error, 1)}
-	tailReq := &autoBatchRequest{op: autoBatchSet, id: autoBatchKeyFromID(uint64(3)), done: make(chan error, 1)}
+	headReq := &autoBatchRequest{op: autoBatchSet, id: dataKeyFromID(uint64(1)), done: make(chan error, 1)}
+	isolatedReq := &autoBatchRequest{op: autoBatchSet, id: dataKeyFromID(uint64(2)), done: make(chan error, 1)}
+	tailReq := &autoBatchRequest{op: autoBatchSet, id: dataKeyFromID(uint64(3)), done: make(chan error, 1)}
 
 	db.autoBatcher.mu.Lock()
 	db.autoBatcher.running = true
@@ -559,7 +559,7 @@ func TestBatch_CallbackRequestsStayBatchable(t *testing.T) {
 
 	cb := func(*bbolt.Tx, uint64, *Rec, *Rec) error { return nil }
 	makeReq := func(id uint64, withCB bool) *autoBatchRequest {
-		req := &autoBatchRequest{op: autoBatchSet, id: autoBatchKeyFromID(id)}
+		req := &autoBatchRequest{op: autoBatchSet, id: dataKeyFromID(id)}
 		if withCB {
 			req.beforeCommit = testBeforeCommitHooks([]beforeCommitFunc[uint64, Rec]{cb})
 		}
@@ -594,8 +594,8 @@ func TestBatch_RepeatIDPool_ClearsBetweenPops(t *testing.T) {
 		AutoBatchMaxQueue: 2048,
 	})
 
-	req1 := &autoBatchRequest{op: autoBatchSet, id: autoBatchKeyFromID(uint64(1)), done: make(chan error, 1)}
-	req2 := &autoBatchRequest{op: autoBatchSet, id: autoBatchKeyFromID(uint64(2)), done: make(chan error, 1)}
+	req1 := &autoBatchRequest{op: autoBatchSet, id: dataKeyFromID(uint64(1)), done: make(chan error, 1)}
+	req2 := &autoBatchRequest{op: autoBatchSet, id: dataKeyFromID(uint64(2)), done: make(chan error, 1)}
 
 	db.autoBatcher.mu.Lock()
 	db.autoBatcher.window = 0
@@ -608,8 +608,8 @@ func TestBatch_RepeatIDPool_ClearsBetweenPops(t *testing.T) {
 		t.Fatalf("unexpected popped batch size: got=%d want=2", len(batch))
 	}
 
-	req3 := &autoBatchRequest{op: autoBatchSet, id: autoBatchKeyFromID(uint64(3)), done: make(chan error, 1)}
-	req4 := &autoBatchRequest{op: autoBatchSet, id: autoBatchKeyFromID(uint64(4)), done: make(chan error, 1)}
+	req3 := &autoBatchRequest{op: autoBatchSet, id: dataKeyFromID(uint64(3)), done: make(chan error, 1)}
+	req4 := &autoBatchRequest{op: autoBatchSet, id: dataKeyFromID(uint64(4)), done: make(chan error, 1)}
 
 	db.autoBatcher.mu.Lock()
 	db.autoBatcher.window = 0
@@ -634,7 +634,7 @@ func TestBatch_RepeatIDPool_RemainsReusableAfterLargeBurst(t *testing.T) {
 	for i := range burst {
 		req := &autoBatchRequest{
 			op:   autoBatchSet,
-			id:   autoBatchKeyFromID(uint64(i + 1)),
+			id:   dataKeyFromID(uint64(i + 1)),
 			done: make(chan error, 1),
 		}
 		burst[i] = queuedSingleJob(req)
@@ -655,8 +655,8 @@ func TestBatch_RepeatIDPool_RemainsReusableAfterLargeBurst(t *testing.T) {
 	db.autoBatcher.running = true
 	setAutoBatchQueueJobsForTest(
 		db,
-		queuedSingleJob(&autoBatchRequest{op: autoBatchSet, id: autoBatchKeyFromID(uint64(1001)), done: make(chan error, 1)}),
-		queuedSingleJob(&autoBatchRequest{op: autoBatchSet, id: autoBatchKeyFromID(uint64(1002)), done: make(chan error, 1)}),
+		queuedSingleJob(&autoBatchRequest{op: autoBatchSet, id: dataKeyFromID(uint64(1001)), done: make(chan error, 1)}),
+		queuedSingleJob(&autoBatchRequest{op: autoBatchSet, id: dataKeyFromID(uint64(1002)), done: make(chan error, 1)}),
 	)
 	db.autoBatcher.mu.Unlock()
 
@@ -680,12 +680,12 @@ func TestBatch_RepeatIDPool_StringKeysClearedAfterPop(t *testing.T) {
 
 	req1 := &autoBatchRequest{
 		op:   autoBatchSet,
-		id:   autoBatchKeyFromID(strings.Repeat("a", 256)),
+		id:   dataKeyFromID(strings.Repeat("a", 256)),
 		done: make(chan error, 1),
 	}
 	req2 := &autoBatchRequest{
 		op:   autoBatchSet,
-		id:   autoBatchKeyFromID(strings.Repeat("b", 256)),
+		id:   dataKeyFromID(strings.Repeat("b", 256)),
 		done: make(chan error, 1),
 	}
 
@@ -701,12 +701,12 @@ func TestBatch_RepeatIDPool_StringKeysClearedAfterPop(t *testing.T) {
 
 	req3 := &autoBatchRequest{
 		op:   autoBatchSet,
-		id:   autoBatchKeyFromID(strings.Repeat("c", 256)),
+		id:   dataKeyFromID(strings.Repeat("c", 256)),
 		done: make(chan error, 1),
 	}
 	req4 := &autoBatchRequest{
 		op:   autoBatchSet,
-		id:   autoBatchKeyFromID(strings.Repeat("d", 256)),
+		id:   dataKeyFromID(strings.Repeat("d", 256)),
 		done: make(chan error, 1),
 	}
 
@@ -775,7 +775,7 @@ func TestBatch_DuplicatePatchSameID_NonUniqueFieldsStayBatched(t *testing.T) {
 
 	req1 := &autoBatchRequest{
 		op:                 autoBatchPatch,
-		id:                 autoBatchKeyFromID(uint64(1)),
+		id:                 dataKeyFromID(uint64(1)),
 		patch:              []Field{{Name: "tags", Value: []string{"x"}}},
 		patchIgnoreUnknown: true,
 		policy:             autoBatchReqRepeatIDSafeShared,
@@ -783,7 +783,7 @@ func TestBatch_DuplicatePatchSameID_NonUniqueFieldsStayBatched(t *testing.T) {
 	}
 	req2 := &autoBatchRequest{
 		op:                 autoBatchPatch,
-		id:                 autoBatchKeyFromID(uint64(1)),
+		id:                 dataKeyFromID(uint64(1)),
 		patch:              []Field{{Name: "tags", Value: []string{"y"}}},
 		patchIgnoreUnknown: true,
 		policy:             autoBatchReqRepeatIDSafeShared,
@@ -791,7 +791,7 @@ func TestBatch_DuplicatePatchSameID_NonUniqueFieldsStayBatched(t *testing.T) {
 	}
 	req3 := &autoBatchRequest{
 		op:                 autoBatchPatch,
-		id:                 autoBatchKeyFromID(uint64(2)),
+		id:                 dataKeyFromID(uint64(2)),
 		patch:              []Field{{Name: "tags", Value: []string{"z"}}},
 		patchIgnoreUnknown: true,
 		policy:             autoBatchReqRepeatIDSafeShared,
@@ -859,14 +859,14 @@ func TestBatch_DuplicatePatchSameID_DecodeFailurePropagatesToLaterRequests(t *te
 
 	req1 := &autoBatchRequest{
 		op:                 autoBatchPatch,
-		id:                 autoBatchKeyFromID(uint64(1)),
+		id:                 dataKeyFromID(uint64(1)),
 		patch:              []Field{{Name: "age", Value: 31}},
 		patchIgnoreUnknown: true,
 		done:               make(chan error, 1),
 	}
 	req2 := &autoBatchRequest{
 		op:                 autoBatchPatch,
-		id:                 autoBatchKeyFromID(uint64(1)),
+		id:                 dataKeyFromID(uint64(1)),
 		patch:              []Field{{Name: "age", Value: 32}},
 		patchIgnoreUnknown: true,
 		done:               make(chan error, 1),
@@ -891,21 +891,21 @@ func TestBatch_DuplicatePatchSameID_UniqueFieldCutsBatch(t *testing.T) {
 
 	req1 := &autoBatchRequest{
 		op:                 autoBatchPatch,
-		id:                 autoBatchKeyFromID(uint64(1)),
+		id:                 dataKeyFromID(uint64(1)),
 		patch:              []Field{{Name: "email", Value: "next@x"}},
 		patchIgnoreUnknown: true,
 		done:               make(chan error, 1),
 	}
 	req2 := &autoBatchRequest{
 		op:                 autoBatchPatch,
-		id:                 autoBatchKeyFromID(uint64(1)),
+		id:                 dataKeyFromID(uint64(1)),
 		patch:              []Field{{Name: "tags", Value: []string{"y"}}},
 		patchIgnoreUnknown: true,
 		done:               make(chan error, 1),
 	}
 	req3 := &autoBatchRequest{
 		op:                 autoBatchPatch,
-		id:                 autoBatchKeyFromID(uint64(2)),
+		id:                 dataKeyFromID(uint64(2)),
 		patch:              []Field{{Name: "tags", Value: []string{"z"}}},
 		patchIgnoreUnknown: true,
 		done:               make(chan error, 1),
@@ -946,7 +946,7 @@ func TestBatch_DuplicatePatchSameID_BeforeStoreOnUniqueDBCutsBatch(t *testing.T)
 
 	req1 := &autoBatchRequest{
 		op:                 autoBatchPatch,
-		id:                 autoBatchKeyFromID(uint64(1)),
+		id:                 dataKeyFromID(uint64(1)),
 		patch:              []Field{{Name: "tags", Value: []string{"x"}}},
 		patchIgnoreUnknown: true,
 		beforeStore:        testBeforeStoreHooks([]beforeStoreFunc[uint64, UniqueTestRec]{cb}),
@@ -954,7 +954,7 @@ func TestBatch_DuplicatePatchSameID_BeforeStoreOnUniqueDBCutsBatch(t *testing.T)
 	}
 	req2 := &autoBatchRequest{
 		op:                 autoBatchPatch,
-		id:                 autoBatchKeyFromID(uint64(1)),
+		id:                 dataKeyFromID(uint64(1)),
 		patch:              []Field{{Name: "tags", Value: []string{"y"}}},
 		patchIgnoreUnknown: true,
 		beforeStore:        testBeforeStoreHooks([]beforeStoreFunc[uint64, UniqueTestRec]{cb}),
@@ -962,7 +962,7 @@ func TestBatch_DuplicatePatchSameID_BeforeStoreOnUniqueDBCutsBatch(t *testing.T)
 	}
 	req3 := &autoBatchRequest{
 		op:                 autoBatchPatch,
-		id:                 autoBatchKeyFromID(uint64(2)),
+		id:                 dataKeyFromID(uint64(2)),
 		patch:              []Field{{Name: "email", Value: "other@x"}},
 		patchIgnoreUnknown: true,
 		done:               make(chan error, 1),
@@ -1013,7 +1013,7 @@ func TestBatch_DuplicatePatchSameID_BeforeProcessOnUniqueDBCutsBatch(t *testing.
 
 	req1 := &autoBatchRequest{
 		op:                 autoBatchPatch,
-		id:                 autoBatchKeyFromID(uint64(1)),
+		id:                 dataKeyFromID(uint64(1)),
 		patch:              []Field{{Name: "tags", Value: []string{"x"}}},
 		patchIgnoreUnknown: true,
 		beforeProcess:      testBeforeProcessHooks([]beforeProcessFunc[uint64, UniqueTestRec]{cb}),
@@ -1021,7 +1021,7 @@ func TestBatch_DuplicatePatchSameID_BeforeProcessOnUniqueDBCutsBatch(t *testing.
 	}
 	req2 := &autoBatchRequest{
 		op:                 autoBatchPatch,
-		id:                 autoBatchKeyFromID(uint64(1)),
+		id:                 dataKeyFromID(uint64(1)),
 		patch:              []Field{{Name: "tags", Value: []string{"y"}}},
 		patchIgnoreUnknown: true,
 		beforeProcess:      testBeforeProcessHooks([]beforeProcessFunc[uint64, UniqueTestRec]{cb}),
@@ -1029,7 +1029,7 @@ func TestBatch_DuplicatePatchSameID_BeforeProcessOnUniqueDBCutsBatch(t *testing.
 	}
 	req3 := &autoBatchRequest{
 		op:                 autoBatchPatch,
-		id:                 autoBatchKeyFromID(uint64(2)),
+		id:                 dataKeyFromID(uint64(2)),
 		patch:              []Field{{Name: "email", Value: "other@x"}},
 		patchIgnoreUnknown: true,
 		done:               make(chan error, 1),
@@ -1084,7 +1084,7 @@ func TestBatch_SetDeleteSameID_CoalescedToLastWrite(t *testing.T) {
 
 	req1 := &autoBatchRequest{
 		op:         autoBatchSet,
-		id:         autoBatchKeyFromID(uint64(1)),
+		id:         dataKeyFromID(uint64(1)),
 		policy:     autoBatchReqSetDeleteCoalescible,
 		setValue:   unsafe.Pointer(setA),
 		setPayload: mustEncodeAutoBatchPayload(t, db, setA),
@@ -1092,13 +1092,13 @@ func TestBatch_SetDeleteSameID_CoalescedToLastWrite(t *testing.T) {
 	}
 	req2 := &autoBatchRequest{
 		op:     autoBatchDelete,
-		id:     autoBatchKeyFromID(uint64(1)),
+		id:     dataKeyFromID(uint64(1)),
 		policy: autoBatchReqRepeatIDSafeShared | autoBatchReqSetDeleteCoalescible,
 		done:   make(chan error, 1),
 	}
 	req3 := &autoBatchRequest{
 		op:         autoBatchSet,
-		id:         autoBatchKeyFromID(uint64(1)),
+		id:         dataKeyFromID(uint64(1)),
 		policy:     autoBatchReqSetDeleteCoalescible,
 		setValue:   unsafe.Pointer(setB),
 		setPayload: mustEncodeAutoBatchPayload(t, db, setB),
@@ -1106,7 +1106,7 @@ func TestBatch_SetDeleteSameID_CoalescedToLastWrite(t *testing.T) {
 	}
 	req4 := &autoBatchRequest{
 		op:         autoBatchSet,
-		id:         autoBatchKeyFromID(uint64(2)),
+		id:         dataKeyFromID(uint64(2)),
 		policy:     autoBatchReqSetDeleteCoalescible,
 		setValue:   unsafe.Pointer(setOther),
 		setPayload: mustEncodeAutoBatchPayload(t, db, setOther),
@@ -1178,7 +1178,7 @@ func TestBatch_CoalescedChain_PropagatesTerminalError(t *testing.T) {
 
 	req1 := &autoBatchRequest{
 		op:         autoBatchSet,
-		id:         autoBatchKeyFromID(uint64(1)),
+		id:         dataKeyFromID(uint64(1)),
 		policy:     autoBatchReqSetDeleteCoalescible,
 		setValue:   unsafe.Pointer(&UniqueTestRec{Email: "mid@x", Code: 10}),
 		setPayload: mustEncodeAutoBatchPayload(t, db, &UniqueTestRec{Email: "mid@x", Code: 10}),
@@ -1186,13 +1186,13 @@ func TestBatch_CoalescedChain_PropagatesTerminalError(t *testing.T) {
 	}
 	req2 := &autoBatchRequest{
 		op:     autoBatchDelete,
-		id:     autoBatchKeyFromID(uint64(1)),
+		id:     dataKeyFromID(uint64(1)),
 		policy: autoBatchReqRepeatIDSafeShared | autoBatchReqSetDeleteCoalescible,
 		done:   make(chan error, 1),
 	}
 	req3 := &autoBatchRequest{
 		op:         autoBatchSet,
-		id:         autoBatchKeyFromID(uint64(1)),
+		id:         dataKeyFromID(uint64(1)),
 		policy:     autoBatchReqSetDeleteCoalescible,
 		setValue:   unsafe.Pointer(&UniqueTestRec{Email: "taken@x", Code: 11}),
 		setPayload: mustEncodeAutoBatchPayload(t, db, &UniqueTestRec{Email: "taken@x", Code: 11}),
@@ -1200,7 +1200,7 @@ func TestBatch_CoalescedChain_PropagatesTerminalError(t *testing.T) {
 	}
 	req4 := &autoBatchRequest{
 		op:         autoBatchSet,
-		id:         autoBatchKeyFromID(uint64(3)),
+		id:         dataKeyFromID(uint64(3)),
 		policy:     autoBatchReqSetDeleteCoalescible,
 		setValue:   unsafe.Pointer(&UniqueTestRec{Email: "ok@x", Code: 3}),
 		setPayload: mustEncodeAutoBatchPayload(t, db, &UniqueTestRec{Email: "ok@x", Code: 3}),
@@ -1278,7 +1278,7 @@ func TestBatch_PatchFailures_IsolateFailedRequest(t *testing.T) {
 			makeBadReq: func() *autoBatchRequest {
 				return &autoBatchRequest{
 					op:                 autoBatchPatch,
-					id:                 autoBatchKeyFromID(uint64(999)),
+					id:                 dataKeyFromID(uint64(999)),
 					patch:              []Field{{Name: "age", Value: 77}},
 					patchIgnoreUnknown: true,
 					done:               make(chan error, 1),
@@ -1291,7 +1291,7 @@ func TestBatch_PatchFailures_IsolateFailedRequest(t *testing.T) {
 			makeBadReq: func() *autoBatchRequest {
 				return &autoBatchRequest{
 					op:                 autoBatchPatch,
-					id:                 autoBatchKeyFromID(uint64(1)),
+					id:                 dataKeyFromID(uint64(1)),
 					patch:              []Field{{Name: "age", Value: "not-an-int"}},
 					patchIgnoreUnknown: true,
 					done:               make(chan error, 1),
@@ -1321,7 +1321,7 @@ func TestBatch_PatchFailures_IsolateFailedRequest(t *testing.T) {
 			goodVal := &Rec{Name: "good-" + c.name, Age: 99, Meta: Meta{Country: "US"}}
 			goodReq := &autoBatchRequest{
 				op:         autoBatchSet,
-				id:         autoBatchKeyFromID(uint64(2)),
+				id:         dataKeyFromID(uint64(2)),
 				setValue:   unsafe.Pointer(goodVal),
 				setPayload: mustEncodeAutoBatchPayload(t, db, goodVal),
 				done:       make(chan error, 1),
@@ -1370,7 +1370,7 @@ func TestBatch_QueueFull_WaitsAndStaysQueued(t *testing.T) {
 	}
 	blockedReq := &autoBatchRequest{
 		op:         autoBatchSet,
-		id:         autoBatchKeyFromID(uint64(123)),
+		id:         dataKeyFromID(uint64(123)),
 		setValue:   unsafe.Pointer(blocked),
 		setPayload: b,
 		done:       make(chan error, 1),
@@ -1437,7 +1437,7 @@ func TestBatch_BeforeCommitError_IsolatesFailedRequest(t *testing.T) {
 
 	badReq := &autoBatchRequest{
 		op:         autoBatchSet,
-		id:         autoBatchKeyFromID(uint64(1)),
+		id:         dataKeyFromID(uint64(1)),
 		setValue:   unsafe.Pointer(badVal),
 		setPayload: mustEncodeAutoBatchPayload(t, db, badVal),
 		beforeCommit: testBeforeCommitHooks([]beforeCommitFunc[uint64, Rec]{
@@ -1447,7 +1447,7 @@ func TestBatch_BeforeCommitError_IsolatesFailedRequest(t *testing.T) {
 	}
 	goodReq := &autoBatchRequest{
 		op:         autoBatchSet,
-		id:         autoBatchKeyFromID(uint64(2)),
+		id:         dataKeyFromID(uint64(2)),
 		setValue:   unsafe.Pointer(goodVal),
 		setPayload: mustEncodeAutoBatchPayload(t, db, goodVal),
 		done:       make(chan error, 1),
@@ -1482,14 +1482,14 @@ func TestBatch_OversizeIndexedString_IsolatesFailedRequest(t *testing.T) {
 
 	badReq := &autoBatchRequest{
 		op:         autoBatchSet,
-		id:         autoBatchKeyFromID(uint64(1)),
+		id:         dataKeyFromID(uint64(1)),
 		setValue:   unsafe.Pointer(badVal),
 		setPayload: mustEncodeAutoBatchPayload(t, db, badVal),
 		done:       make(chan error, 1),
 	}
 	goodReq := &autoBatchRequest{
 		op:         autoBatchSet,
-		id:         autoBatchKeyFromID(uint64(2)),
+		id:         dataKeyFromID(uint64(2)),
 		setValue:   unsafe.Pointer(goodVal),
 		setPayload: mustEncodeAutoBatchPayload(t, db, goodVal),
 		done:       make(chan error, 1),
@@ -1573,7 +1573,7 @@ func TestBatch_BeforeCommitError_Isolation_RechecksUniqueAfterRetry(t *testing.T
 
 	badReq := &autoBatchRequest{
 		op:         autoBatchSet,
-		id:         autoBatchKeyFromID(uint64(1)),
+		id:         dataKeyFromID(uint64(1)),
 		setValue:   unsafe.Pointer(badVal),
 		setPayload: mustEncodeAutoBatchPayload(t, db, badVal),
 		beforeCommit: testBeforeCommitHooks([]beforeCommitFunc[uint64, UniqueTestRec]{
@@ -1583,7 +1583,7 @@ func TestBatch_BeforeCommitError_Isolation_RechecksUniqueAfterRetry(t *testing.T
 	}
 	goodReq := &autoBatchRequest{
 		op:         autoBatchSet,
-		id:         autoBatchKeyFromID(uint64(2)),
+		id:         dataKeyFromID(uint64(2)),
 		setValue:   unsafe.Pointer(goodVal),
 		setPayload: mustEncodeAutoBatchPayload(t, db, goodVal),
 		done:       make(chan error, 1),
@@ -1617,7 +1617,7 @@ func TestBatch_BeforeStore_RerunsFromBaselineOnRetry(t *testing.T) {
 	goodVal := &Rec{Name: "good", Age: 10}
 	goodReq := &autoBatchRequest{
 		op:         autoBatchSet,
-		id:         autoBatchKeyFromID(uint64(1)),
+		id:         dataKeyFromID(uint64(1)),
 		setValue:   unsafe.Pointer(goodVal),
 		setPayload: mustEncodeAutoBatchPayload(t, db, goodVal),
 		beforeStore: testBeforeStoreHooks([]beforeStoreFunc[uint64, Rec]{
@@ -1634,7 +1634,7 @@ func TestBatch_BeforeStore_RerunsFromBaselineOnRetry(t *testing.T) {
 	badVal := &Rec{Name: "bad", Age: 20}
 	badReq := &autoBatchRequest{
 		op:         autoBatchSet,
-		id:         autoBatchKeyFromID(uint64(2)),
+		id:         dataKeyFromID(uint64(2)),
 		setValue:   unsafe.Pointer(badVal),
 		setPayload: mustEncodeAutoBatchPayload(t, db, badVal),
 		beforeCommit: testBeforeCommitHooks([]beforeCommitFunc[uint64, Rec]{
@@ -1675,7 +1675,7 @@ func TestBatch_StringKeyBeforeStoreError_DoesNotGrowStrMap(t *testing.T) {
 	hookErr := errors.New("before store fail")
 	req := &autoBatchRequest{
 		op:         autoBatchSet,
-		id:         autoBatchKeyFromID("ghost-before-store"),
+		id:         dataKeyFromID("ghost-before-store"),
 		setValue:   unsafe.Pointer(&Product{SKU: "ghost-before-store", Price: 11}),
 		setPayload: mustEncodeAutoBatchPayload(t, db, &Product{SKU: "ghost-before-store", Price: 11}),
 		beforeStore: testBeforeStoreHooks([]beforeStoreFunc[string, Product]{
@@ -1776,7 +1776,7 @@ func testBeforeProcessHooks[K ~string | ~uint64, V any](hooks []beforeProcessFun
 	out := make([]autoBatchBeforeProcessHook, 0, len(hooks))
 	for _, fn := range hooks {
 		out = append(out, func(key keycodec.DataKey, value unsafe.Pointer) error {
-			return fn(autoBatchKeyID[K](key), (*V)(value))
+			return fn(dataKeyID[K](key), (*V)(value))
 		})
 	}
 	return out
@@ -1789,7 +1789,7 @@ func testBeforeStoreHooks[K ~string | ~uint64, V any](hooks []beforeStoreFunc[K,
 	out := make([]autoBatchBeforeStoreHook, 0, len(hooks))
 	for _, fn := range hooks {
 		out = append(out, func(key keycodec.DataKey, oldValue, newValue unsafe.Pointer) error {
-			return fn(autoBatchKeyID[K](key), (*V)(oldValue), (*V)(newValue))
+			return fn(dataKeyID[K](key), (*V)(oldValue), (*V)(newValue))
 		})
 	}
 	return out
@@ -1802,7 +1802,7 @@ func testBeforeCommitHooks[K ~string | ~uint64, V any](hooks []beforeCommitFunc[
 	out := make([]autoBatchBeforeCommitHook, 0, len(hooks))
 	for _, fn := range hooks {
 		out = append(out, func(tx *bbolt.Tx, key keycodec.DataKey, oldValue, newValue unsafe.Pointer) error {
-			return fn(tx, autoBatchKeyID[K](key), (*V)(oldValue), (*V)(newValue))
+			return fn(tx, dataKeyID[K](key), (*V)(oldValue), (*V)(newValue))
 		})
 	}
 	return out
@@ -1813,7 +1813,7 @@ func testCloneFunc[K ~string | ~uint64, V any](fn func(K, *V) *V) autoBatchClone
 		return nil
 	}
 	return func(key keycodec.DataKey, value unsafe.Pointer) (unsafe.Pointer, error) {
-		cloned := fn(autoBatchKeyID[K](key), (*V)(value))
+		cloned := fn(dataKeyID[K](key), (*V)(value))
 		if cloned == nil {
 			return nil, errAutoBatchCloneNil
 		}
@@ -1832,7 +1832,7 @@ func mustBuildSetAutoReq[K ~string | ~uint64, V any](
 ) *autoBatchRequest {
 	tb.Helper()
 	req, err := db.buildSetAutoBatchRequest(
-		autoBatchKeyFromID(id),
+		dataKeyFromID(id),
 		newVal,
 		testBeforeStoreHooks(beforeStore),
 		testBeforeCommitHooks(beforeCommit),

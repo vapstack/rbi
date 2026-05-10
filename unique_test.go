@@ -525,12 +525,12 @@ func TestUnique_BatchDeleteThenSet_ReusesFreedValueInSameTx(t *testing.T) {
 
 	delReq := &autoBatchRequest{
 		op:   autoBatchDelete,
-		id:   autoBatchKeyFromID(uint64(1)),
+		id:   dataKeyFromID(uint64(1)),
 		done: make(chan error, 1),
 	}
 	setReq := &autoBatchRequest{
 		op:         autoBatchSet,
-		id:         autoBatchKeyFromID(uint64(2)),
+		id:         dataKeyFromID(uint64(2)),
 		setValue:   unsafe.Pointer(newVal),
 		setPayload: payload,
 		done:       make(chan error, 1),
@@ -591,14 +591,14 @@ func TestUnique_BatchPartialReject_PreservesAcceptedOpsAndIndex(t *testing.T) {
 
 	badReq := &autoBatchRequest{
 		op:         autoBatchSet,
-		id:         autoBatchKeyFromID(uint64(3)),
+		id:         dataKeyFromID(uint64(3)),
 		setValue:   unsafe.Pointer(badVal),
 		setPayload: badPayload,
 		done:       make(chan error, 1),
 	}
 	goodReq := &autoBatchRequest{
 		op:         autoBatchSet,
-		id:         autoBatchKeyFromID(uint64(2)),
+		id:         dataKeyFromID(uint64(2)),
 		setValue:   unsafe.Pointer(goodVal),
 		setPayload: goodPayload,
 		done:       make(chan error, 1),
@@ -836,7 +836,7 @@ func TestUnique_ExecuteBatch_MixedOps_MatchesSequentialModel(t *testing.T) {
 				val := cloneUniqueRec(op.value)
 				reqs = append(reqs, &autoBatchRequest{
 					op:         autoBatchSet,
-					id:         autoBatchKeyFromID(op.id),
+					id:         dataKeyFromID(op.id),
 					setValue:   unsafe.Pointer(val),
 					setPayload: mustEncodeAutoBatchPayload(t, dbBatch, op.value),
 					done:       make(chan error, 1),
@@ -844,7 +844,7 @@ func TestUnique_ExecuteBatch_MixedOps_MatchesSequentialModel(t *testing.T) {
 			case 1:
 				reqs = append(reqs, &autoBatchRequest{
 					op:                 autoBatchPatch,
-					id:                 autoBatchKeyFromID(op.id),
+					id:                 dataKeyFromID(op.id),
 					patch:              cloneFields(op.patch),
 					patchIgnoreUnknown: true,
 					done:               make(chan error, 1),
@@ -852,7 +852,7 @@ func TestUnique_ExecuteBatch_MixedOps_MatchesSequentialModel(t *testing.T) {
 			default:
 				reqs = append(reqs, &autoBatchRequest{
 					op:   autoBatchDelete,
-					id:   autoBatchKeyFromID(op.id),
+					id:   dataKeyFromID(op.id),
 					done: make(chan error, 1),
 				})
 			}

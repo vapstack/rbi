@@ -141,7 +141,7 @@ func (qv *queryView) tryCountByScalarLookup(expr qir.Expr, trace *queryTrace) (u
 
 	switch expr.Op {
 	case qir.OpEQ:
-		key, isSlice, isNil, err := qv.exprValueToIdxScalar(expr)
+		key, isSlice, isNil, err := qv.exprValueToLookupKey(expr)
 		if err != nil || isSlice {
 			return 0, false, err
 		}
@@ -149,7 +149,7 @@ func (qv *queryView) tryCountByScalarLookup(expr qir.Expr, trace *queryTrace) (u
 		if isNil {
 			hit = qv.nilFieldOverlayForExpr(expr).LookupCardinality(nilIndexEntryKey)
 		} else {
-			hit = ov.LookupCardinality(key)
+			hit = lookupScalarCardinality(ov, key)
 		}
 		if trace != nil {
 			trace.setPlan(PlanCountScalarLookup)
@@ -160,7 +160,7 @@ func (qv *queryView) tryCountByScalarLookup(expr qir.Expr, trace *queryTrace) (u
 	case qir.OpIN:
 		valsBuf, isSlice, hasNil, err := qv.exprValueToDistinctIdxBuf(expr)
 		if valsBuf != nil {
-			defer pooled.PutStringSlice(valsBuf)
+			defer pooled.ReleaseStringSlice(valsBuf)
 		}
 		valCount := len(valsBuf)
 		if err != nil || !isSlice || (valCount == 0 && !hasNil) {
@@ -276,7 +276,7 @@ func (qv *queryView) tryCountBySliceLookup(expr qir.Expr, trace *queryTrace) (ui
 
 	valsBuf, isSlice, _, err := qv.exprValueToDistinctIdxBuf(expr)
 	if valsBuf != nil {
-		defer pooled.PutStringSlice(valsBuf)
+		defer pooled.ReleaseStringSlice(valsBuf)
 	}
 	valCount := len(valsBuf)
 	if err != nil {
@@ -295,7 +295,7 @@ func (qv *queryView) tryCountBySliceLookup(expr qir.Expr, trace *queryTrace) (ui
 
 	case qir.OpHASANY:
 		postsBuf, _ := qv.scalarLookupPostings(qv.engine.fieldNameByOrdinal(expr.FieldOrdinal), expr.FieldOrdinal, valsBuf, false)
-		defer posting.PutSlice(postsBuf)
+		defer posting.ReleaseSlice(postsBuf)
 		switch len(postsBuf) {
 		case 0:
 			if trace != nil {
@@ -325,7 +325,7 @@ func (qv *queryView) tryCountBySliceLookup(expr qir.Expr, trace *queryTrace) (ui
 
 	case qir.OpHASALL:
 		postsBuf := posting.GetSlice(valCount)
-		defer posting.PutSlice(postsBuf)
+		defer posting.ReleaseSlice(postsBuf)
 
 		var examined uint64
 		for i := 0; i < valCount; i++ {
@@ -952,7 +952,7 @@ func (qv *queryView) tryCountByScalarInSplit(expr qir.Expr, trace *queryTrace) (
 		totalVals := 0
 		if valsBuf != nil {
 			totalVals = len(valsBuf)
-			pooled.PutStringSlice(valsBuf)
+			pooled.ReleaseStringSlice(valsBuf)
 		}
 		if hasNil {
 			totalVals++
@@ -984,7 +984,7 @@ func (qv *queryView) tryCountByScalarInSplit(expr qir.Expr, trace *queryTrace) (
 		Value:        inLeaf.Value,
 	})
 	if valsBuf != nil {
-		defer pooled.PutStringSlice(valsBuf)
+		defer pooled.ReleaseStringSlice(valsBuf)
 	}
 	valCount := len(valsBuf)
 	if err != nil || !isSlice || (valCount == 0 && !hasNil) {
@@ -2757,17 +2757,17 @@ func (qv *queryView) tryCountByPredicatesLeadBuckets(preds predicateSet, leadIdx
 		rb, covered, hasBounds, ok := qv.collectPredicateRangeBoundsSet(qv.engine.fieldNameByOrdinal(e.FieldOrdinal), preds)
 		if !ok || !hasBounds {
 			if ok {
-				pooled.PutBoolSlice(covered)
+				pooled.ReleaseBoolSlice(covered)
 			}
 			return 0, 0, false
 		}
 		br := ov.RangeForBounds(rb)
 		if br.Empty() {
-			pooled.PutBoolSlice(covered)
+			pooled.ReleaseBoolSlice(covered)
 			return 0, 0, true
 		}
 		if br.BaseEnd-br.BaseStart < 4 {
-			pooled.PutBoolSlice(covered)
+			pooled.ReleaseBoolSlice(covered)
 			return 0, 0, false
 		}
 
@@ -2779,7 +2779,7 @@ func (qv *queryView) tryCountByPredicatesLeadBuckets(preds predicateSet, leadIdx
 			}
 			activeChecks = append(activeChecks, pi)
 		}
-		pooled.PutBoolSlice(covered)
+		pooled.ReleaseBoolSlice(covered)
 
 		var exactActiveBuf [countPredicateScanMaxLeaves]int
 		var extraExactCandidatesBuf [countPredicateScanMaxLeaves]int
@@ -2908,18 +2908,18 @@ func (qv *queryView) tryCountByPredicatesLeadBuckets(preds predicateSet, leadIdx
 	rb, covered, hasBounds, ok := qv.collectPredicateRangeBoundsSet(qv.engine.fieldNameByOrdinal(e.FieldOrdinal), preds)
 	if !ok || !hasBounds {
 		if ok {
-			pooled.PutBoolSlice(covered)
+			pooled.ReleaseBoolSlice(covered)
 		}
 		return 0, 0, false
 	}
 	br := ov.RangeForBounds(rb)
 	start, end := br.BaseStart, br.BaseEnd
 	if start >= end {
-		pooled.PutBoolSlice(covered)
+		pooled.ReleaseBoolSlice(covered)
 		return 0, 0, true
 	}
 	if end-start < 4 {
-		pooled.PutBoolSlice(covered)
+		pooled.ReleaseBoolSlice(covered)
 		return 0, 0, false
 	}
 
@@ -2931,7 +2931,7 @@ func (qv *queryView) tryCountByPredicatesLeadBuckets(preds predicateSet, leadIdx
 		}
 		activeChecks = append(activeChecks, pi)
 	}
-	pooled.PutBoolSlice(covered)
+	pooled.ReleaseBoolSlice(covered)
 
 	var exactActiveBuf [countPredicateScanMaxLeaves]int
 	var extraExactCandidatesBuf [countPredicateScanMaxLeaves]int

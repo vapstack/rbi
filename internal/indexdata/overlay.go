@@ -349,6 +349,17 @@ func (o FieldOverlay) LookupCardinality(key string) uint64 {
 	return o.base[i].IDs.Cardinality()
 }
 
+func (o FieldOverlay) LookupCardinalityKey(key keycodec.IndexKey) uint64 {
+	if o.chunked != nil {
+		return o.chunked.lookupCardinalityKey(key)
+	}
+	i := lowerBoundIndexEntriesKey(o.base, key)
+	if i >= len(o.base) || keycodec.Compare(o.base[i].Key, key) != 0 {
+		return 0
+	}
+	return o.base[i].IDs.Cardinality()
+}
+
 func (o FieldOverlay) LookupPostingRetained(key string) posting.List {
 	if o.chunked != nil {
 		return o.chunked.lookupPostingRetained(key)
@@ -358,6 +369,20 @@ func (o FieldOverlay) LookupPostingRetained(key string) posting.List {
 	}
 	i := lowerBoundIndex(o.base, key)
 	if i >= len(o.base) || !keycodec.EqualsString(o.base[i].Key, key) {
+		return posting.List{}
+	}
+	return o.base[i].IDs.Borrow()
+}
+
+func (o FieldOverlay) LookupPostingRetainedKey(key keycodec.IndexKey) posting.List {
+	if o.chunked != nil {
+		return o.chunked.lookupPostingRetainedKey(key)
+	}
+	if len(o.base) == 0 {
+		return posting.List{}
+	}
+	i := lowerBoundIndexEntriesKey(o.base, key)
+	if i >= len(o.base) || keycodec.Compare(o.base[i].Key, key) != 0 {
 		return posting.List{}
 	}
 	return o.base[i].IDs.Borrow()

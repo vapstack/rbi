@@ -247,6 +247,26 @@ func TestOrderedNumericByteStrings(t *testing.T) {
 	}
 }
 
+func TestIndexLookupKey(t *testing.T) {
+	str := IndexLookupString("alpha")
+	if str.IsNumeric() || str.StringKey() != "alpha" || Compare(str.IndexKey(), FromString("alpha")) != 0 {
+		t.Fatalf("string lookup key mismatch")
+	}
+
+	num := IndexLookupU64(0x0102030405060708)
+	if !num.IsNumeric() || num.U64() != 0x0102030405060708 || Compare(num.IndexKey(), FromU64(0x0102030405060708)) != 0 {
+		t.Fatalf("numeric lookup key mismatch")
+	}
+
+	seen := map[IndexLookupKey]uint64{
+		IndexLookupString("alpha"): 1,
+		IndexLookupU64(42):         2,
+	}
+	if seen[IndexLookupString("alpha")] != 1 || seen[IndexLookupU64(42)] != 2 {
+		t.Fatalf("lookup key must be comparable by value")
+	}
+}
+
 func TestNumericKeyFormattingAndOrdering(t *testing.T) {
 	if got := U64Bytes(0x0102030405060708); !slices.Equal(got, []byte{1, 2, 3, 4, 5, 6, 7, 8}) {
 		t.Fatalf("U64Bytes mismatch: %x", got)
@@ -313,6 +333,52 @@ func TestDBKeyBytesNoAllocation(t *testing.T) {
 		benchBytes = UserKeyBytesWithBuf(uint64(42), false, &buf)
 	}); allocs != 0 {
 		t.Fatalf("numeric IDBytesWithKindBuf allocated: %.2f", allocs)
+	}
+}
+
+func TestIndexKeyAppendBytesNoAllocation(t *testing.T) {
+	num := FromU64(0x0102030405060708)
+	var buf [8]byte
+	if got := num.AppendBytes(buf[:0]); !slices.Equal(got, []byte{1, 2, 3, 4, 5, 6, 7, 8}) {
+		t.Fatalf("numeric IndexKey.AppendBytes mismatch: %x", got)
+	}
+	if allocs := testing.AllocsPerRun(1000, func() {
+		got := num.AppendBytes(buf[:0])
+		benchInt = len(got)
+	}); allocs != 0 {
+		t.Fatalf("numeric IndexKey.AppendBytes allocated: %.2f", allocs)
+	}
+
+	str := FromString("user-42")
+	if got := str.AppendBytes(buf[:0]); string(got) != "user-42" {
+		t.Fatalf("string IndexKey.AppendBytes mismatch: %q", got)
+	}
+	if allocs := testing.AllocsPerRun(1000, func() {
+		got := str.AppendBytes(buf[:0])
+		benchInt = len(got)
+	}); allocs != 0 {
+		t.Fatalf("string IndexKey.AppendBytes allocated: %.2f", allocs)
+	}
+}
+
+func TestOrderedNumericKeyRoundTrip(t *testing.T) {
+	for _, v := range []int64{math.MinInt64, -1, 0, 1, math.MaxInt64} {
+		if got := Int64FromOrderedKey(OrderedInt64Key(v)); got != v {
+			t.Fatalf("int64 ordered roundtrip: got=%d want=%d", got, v)
+		}
+	}
+	for _, v := range []float64{math.Inf(-1), -1.5, 0, 2.25, math.Inf(1), math.NaN()} {
+		got := Float64FromOrderedKey(OrderedFloat64Key(v))
+		want := CanonicalizeFloat64ForIndex(v)
+		if math.IsNaN(want) {
+			if !math.IsNaN(got) || math.Float64bits(got) != CanonicalFloat64NaNBits {
+				t.Fatalf("float64 ordered NaN roundtrip: got=%x", math.Float64bits(got))
+			}
+			continue
+		}
+		if math.Float64bits(got) != math.Float64bits(want) {
+			t.Fatalf("float64 ordered roundtrip: got=%x want=%x", math.Float64bits(got), math.Float64bits(want))
+		}
 	}
 }
 
@@ -453,6 +519,29 @@ func BenchmarkU64ByteString(b *testing.B) {
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
 		benchString = U64ByteString(uint64(i))
+	}
+}
+
+func BenchmarkInt64ByteString(b *testing.B) {
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		benchString = Int64ByteString(int64(i))
+	}
+}
+
+func BenchmarkFloat64ByteString(b *testing.B) {
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		benchString = Float64ByteString(float64(i))
+	}
+}
+
+func BenchmarkIndexKeyAppendBytesNumeric(b *testing.B) {
+	b.ReportAllocs()
+	key := FromU64(0x0102030405060708)
+	var buf [8]byte
+	for b.Loop() {
+		benchBytes = key.AppendBytes(buf[:0])
 	}
 }
 

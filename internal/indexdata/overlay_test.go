@@ -587,7 +587,7 @@ func TestFieldOverlayLookupPostingsSkipsMissingAndReturnsEstimate(t *testing.T) 
 	ov := NewFieldOverlayStorage(storage)
 
 	posts, est := ov.LookupPostings([]string{"k/000001", "missing", "k/000004"})
-	defer posting.PutSlice(posts)
+	defer posting.ReleaseSlice(posts)
 	if len(posts) != 2 {
 		t.Fatalf("lookup postings len: got %d want 2", len(posts))
 	}
