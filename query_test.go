@@ -1495,7 +1495,7 @@ func queryStringKeysFromIDs(view *queryView, ids []uint64) []string {
 	}
 	out := make([]string, len(ids))
 	for i, idx := range ids {
-		s, ok := view.strMapView.getStringNoLock(idx)
+		s, ok := view.strMapView.String(idx)
 		if !ok {
 			panic("rbi: no string key associated with snapshot idx")
 		}

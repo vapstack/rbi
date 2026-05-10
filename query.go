@@ -168,8 +168,9 @@ func (db *DB[K, V]) batchGetTxCompactByIdx(tx *bbolt.Tx, snap *indexSnapshot, id
 	out := make([]*V, 0, len(ids))
 	if db.strKey {
 		strmapView := snap.strmap
+		lookup := strmapView.Lookup()
 		for _, idx := range ids {
-			s, ok := strmapView.getStringNoLock(idx)
+			s, ok := lookup.String(idx)
 			if !ok {
 				panic("rbi: no string key associated with snapshot idx")
 			}
@@ -243,8 +244,9 @@ func (db *DB[K, V]) queryKeysFromIDs(snap *indexSnapshot, ids []uint64) []K {
 	}
 	out := make([]K, len(ids))
 	strmapView := snap.strmap
+	lookup := strmapView.Lookup()
 	for i, idx := range ids {
-		s, ok := strmapView.getStringNoLock(idx)
+		s, ok := lookup.String(idx)
 		if !ok {
 			panic("rbi: no string key associated with snapshot idx")
 		}

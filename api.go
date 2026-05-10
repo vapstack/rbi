@@ -6,6 +6,7 @@ import (
 
 	"github.com/vapstack/rbi/internal/keycodec"
 	"github.com/vapstack/rbi/internal/posting"
+	"github.com/vapstack/rbi/internal/strmap"
 	"go.etcd.io/bbolt"
 )
 
@@ -165,80 +166,39 @@ func (db *DB[K, V]) ScanKeys(seek K, fn func(K) (bool, error)) error {
 	return nil
 }
 
-func (db *DB[K, V]) scanStringKeys(snap *strMapSnapshot, universe posting.List, iter posting.Iterator, seek K, fn func(K) (bool, error)) error {
+func (db *DB[K, V]) scanStringKeys(snap *strmap.Snapshot, universe posting.List, iter posting.Iterator, seek K, fn func(K) (bool, error)) error {
 	if snap == nil || universe.IsEmpty() {
 		return nil
 	}
 
 	seekStr := *(*string)(unsafe.Pointer(&seek))
+	next := snap.Next()
 
 	card := universe.Cardinality()
 	minIdx, hasMin := universe.Minimum()
 	maxIdx, hasMax := universe.Maximum()
 
-	if card == snap.Next && card > 0 && hasMin && hasMax && minIdx == 1 && maxIdx == snap.Next {
-		if len(snap.readDirs) == 0 {
-			for idx := uint64(1); idx <= snap.Next; idx++ {
-				s, ok := snap.getStringNoLock(idx)
-				if !ok {
-					return fmt.Errorf("%w: %v", ErrNoValidKeyIndex, idx)
-				}
-				cont, err := db.emitScannedStringKey(seekStr, s, fn)
-				if err != nil {
-					return err
-				}
-				if !cont {
-					return nil
-				}
+	lookup := snap.Lookup()
+	if card == next && card > 0 && hasMin && hasMax && minIdx == 1 && maxIdx == next {
+		for idx := uint64(1); idx <= next; idx++ {
+			s, ok := lookup.String(idx)
+			if !ok {
+				return fmt.Errorf("%w: %v", ErrNoValidKeyIndex, idx)
 			}
-			return nil
-		}
-
-		pageCount := strMapReadPageCount(snap.Next)
-		for page := 0; page < pageCount; page++ {
-			readPage := snap.readPageAtNoLock(page)
-			if readPage == nil {
-				pageStart, _ := strMapReadPageBounds(page, snap.Next)
-				return fmt.Errorf("%w: %v", ErrNoValidKeyIndex, pageStart)
+			cont, err := db.emitScannedStringKey(seekStr, s, fn)
+			if err != nil {
+				return err
 			}
-			for idx := readPage.Start; idx <= readPage.Next; idx++ {
-				s, ok := readPage.getStringNoLock(idx)
-				if !ok {
-					return fmt.Errorf("%w: %v", ErrNoValidKeyIndex, idx)
-				}
-				cont, err := db.emitScannedStringKey(seekStr, s, fn)
-				if err != nil {
-					return err
-				}
-				if !cont {
-					return nil
-				}
+			if !cont {
+				return nil
 			}
 		}
 		return nil
 	}
 
-	var (
-		pageIdx  = -1
-		readPage *strMapReadPage
-	)
 	for iter.HasNext() {
 		idx := iter.Next()
-		s := ""
-		ok := false
-		if len(snap.readDirs) > 0 {
-			curPage := strMapReadPageIndex(idx)
-			if curPage != pageIdx {
-				pageIdx = curPage
-				readPage = snap.readPageAtNoLock(curPage)
-			}
-			if readPage != nil {
-				s, ok = readPage.getStringNoLock(idx)
-			}
-		}
-		if !ok {
-			s, ok = snap.getStringNoLock(idx)
-		}
+		s, ok := lookup.String(idx)
 		if !ok {
 			return fmt.Errorf("%w: %v", ErrNoValidKeyIndex, idx)
 		}

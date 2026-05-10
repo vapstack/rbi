@@ -14,6 +14,7 @@ import (
 
 	"github.com/vapstack/rbi/internal/keycodec"
 	"github.com/vapstack/rbi/internal/pooled"
+	"github.com/vapstack/rbi/internal/strmap"
 	"go.etcd.io/bbolt"
 )
 
@@ -104,7 +105,7 @@ type autoBatchRuntime struct {
 	bucket             []byte
 	bucketFillPercent  float64
 	strKey             bool
-	strMap             *strMapper
+	strMap             *strmap.Mapper
 	engine             *queryEngine
 	patchMap           map[string]*field
 	testHookAccessor   func() *testHooks
@@ -304,80 +305,16 @@ func (rt *autoBatchRuntime) unavailableErr() error {
 
 func (rt *autoBatchRuntime) idxFromKeyWithCreated(key keycodec.DataKey) (uint64, bool) {
 	if rt.strKey {
-		s := key.String()
-		rt.strMap.Lock()
-		if idx, ok := rt.strMap.Keys[s]; ok {
-			rt.strMap.Unlock()
-			return idx, false
-		}
-		idx := rt.strMap.createIdxNoLock(s)
-		rt.strMap.Unlock()
-		return idx, true
+		return rt.strMap.Create(key.String())
 	}
 	return key.Uint(), false
 }
 
 func (rt *autoBatchRuntime) rollbackCreatedStrIdx(key keycodec.DataKey, idx uint64) {
-	if !rt.strKey || idx == 0 {
+	if !rt.strKey {
 		return
 	}
-
-	s := key.String()
-	rt.strMap.Lock()
-	cur, ok := rt.strMap.Keys[s]
-	if !ok || cur != idx {
-		rt.strMap.Unlock()
-		return
-	}
-
-	delete(rt.strMap.Keys, s)
-	if rt.strMap.sparseStrs != nil {
-		delete(rt.strMap.sparseStrs, idx)
-	} else if idx <= uint64(^uint(0)>>1) {
-		i := int(idx)
-		if i < len(rt.strMap.Strs) {
-			rt.strMap.Strs[i] = ""
-		}
-		if i < len(rt.strMap.strsUsed) {
-			rt.strMap.strsUsed[i] = false
-		}
-	}
-
-	if idx <= rt.strMap.Next {
-		for rt.strMap.Next > 0 {
-			if rt.strMap.sparseStrs != nil {
-				if _, ok := rt.strMap.sparseStrs[rt.strMap.Next]; ok {
-					break
-				}
-				rt.strMap.Next--
-				continue
-			}
-			if rt.strMap.Next > uint64(^uint(0)>>1) {
-				rt.strMap.Next = 0
-				break
-			}
-			i := int(rt.strMap.Next)
-			if i < len(rt.strMap.strsUsed) && rt.strMap.strsUsed[i] {
-				break
-			}
-			rt.strMap.Next--
-		}
-
-		if rt.strMap.sparseStrs == nil {
-			trim := int(rt.strMap.Next) + 1
-			if trim < len(rt.strMap.Strs) {
-				clear(rt.strMap.Strs[trim:])
-				rt.strMap.Strs = rt.strMap.Strs[:trim]
-			}
-			if trim < len(rt.strMap.strsUsed) {
-				clear(rt.strMap.strsUsed[trim:])
-				rt.strMap.strsUsed = rt.strMap.strsUsed[:trim]
-			}
-		}
-	}
-
-	rt.strMap.restoreCommittedNoLock()
-	rt.strMap.Unlock()
+	rt.strMap.RollbackCreated(key.String(), idx)
 }
 
 func (rt *autoBatchRuntime) rollbackCreated(ops []autoBatchPrepared) {
@@ -1815,7 +1752,7 @@ func (ab *autoBatcher) executeAutoBatchAttempt(active *pooled.Slice[*autoBatchRe
 		func() {
 			rt.engine.finishSnapshotPublishNoLock(snap)
 			if rt.strMap != nil {
-				rt.strMap.markCommittedPublished(snap.strmap)
+				rt.strMap.MarkCommittedPublished(snap.strmap)
 			}
 		},
 	)

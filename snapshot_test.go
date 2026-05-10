@@ -146,7 +146,7 @@ func TestSnapshotStrMap_OldSnapshotDoesNotSeeFutureKeyMappings(t *testing.T) {
 		t.Fatalf("Set(k1): %v", err)
 	}
 	s1 := db.engine.getSnapshot()
-	idx1, ok := s1.strmap.getIdxNoLock("k1")
+	idx1, ok := s1.strmap.Index("k1")
 	if !ok || idx1 == 0 {
 		t.Fatalf("expected k1 in first snapshot")
 	}
@@ -155,18 +155,18 @@ func TestSnapshotStrMap_OldSnapshotDoesNotSeeFutureKeyMappings(t *testing.T) {
 		t.Fatalf("Set(k2): %v", err)
 	}
 	s2 := db.engine.getSnapshot()
-	if _, ok := s1.strmap.getIdxNoLock("k2"); ok {
+	if _, ok := s1.strmap.Index("k2"); ok {
 		t.Fatalf("old snapshot unexpectedly sees k2 mapping")
 	}
 
-	idx2, ok := s2.strmap.getIdxNoLock("k2")
+	idx2, ok := s2.strmap.Index("k2")
 	if !ok || idx2 == 0 {
 		t.Fatalf("expected k2 in latest snapshot")
 	}
-	if got, ok := s1.strmap.getStringNoLock(idx1); !ok || got != "k1" {
+	if got, ok := s1.strmap.String(idx1); !ok || got != "k1" {
 		t.Fatalf("old snapshot lost k1 mapping: got=%q ok=%v", got, ok)
 	}
-	if got, ok := s2.strmap.getStringNoLock(idx2); !ok || got != "k2" {
+	if got, ok := s2.strmap.String(idx2); !ok || got != "k2" {
 		t.Fatalf("latest snapshot missing k2 mapping: got=%q ok=%v", got, ok)
 	}
 }
@@ -177,7 +177,7 @@ func TestSnapshotStrMap_LatestSnapshotRetainsOldMappingsAcrossChain(t *testing.T
 	if err := db.Set("k1", &Rec{Name: "one"}); err != nil {
 		t.Fatalf("Set(k1): %v", err)
 	}
-	idx1, ok := db.engine.getSnapshot().strmap.getIdxNoLock("k1")
+	idx1, ok := db.engine.getSnapshot().strmap.Index("k1")
 	if !ok || idx1 == 0 {
 		t.Fatalf("expected k1 mapping in first snapshot")
 	}
@@ -190,10 +190,10 @@ func TestSnapshotStrMap_LatestSnapshotRetainsOldMappingsAcrossChain(t *testing.T
 	}
 
 	latest := db.engine.getSnapshot().strmap
-	if got, ok := latest.getIdxNoLock("k1"); !ok || got != idx1 {
+	if got, ok := latest.Index("k1"); !ok || got != idx1 {
 		t.Fatalf("latest snapshot lost k1 idx: got=%d ok=%v want=%d", got, ok, idx1)
 	}
-	if got, ok := latest.getStringNoLock(idx1); !ok || got != "k1" {
+	if got, ok := latest.String(idx1); !ok || got != "k1" {
 		t.Fatalf("latest snapshot lost k1 reverse mapping: got=%q ok=%v", got, ok)
 	}
 }
@@ -1158,7 +1158,7 @@ func TestSnapshotExt_StringKeyPinnedSnapshotStrMapSurvivesTruncate(t *testing.T)
 	}
 
 	old := db.engine.getSnapshot()
-	idx1, ok := old.strmap.getIdxNoLock("k1")
+	idx1, ok := old.strmap.Index("k1")
 	if !ok || idx1 == 0 {
 		t.Fatalf("expected k1 mapping before truncate")
 	}
@@ -1172,10 +1172,10 @@ func TestSnapshotExt_StringKeyPinnedSnapshotStrMapSurvivesTruncate(t *testing.T)
 	}
 
 	current := db.engine.getSnapshot()
-	if _, ok := current.strmap.getIdxNoLock("k1"); ok {
+	if _, ok := current.strmap.Index("k1"); ok {
 		t.Fatalf("current truncated snapshot unexpectedly retained k1 mapping")
 	}
-	if got, ok := pinned.strmap.getStringNoLock(idx1); !ok || got != "k1" {
+	if got, ok := pinned.strmap.String(idx1); !ok || got != "k1" {
 		t.Fatalf("pinned pre-truncate snapshot lost k1 mapping: got=%q ok=%v", got, ok)
 	}
 
@@ -1193,7 +1193,7 @@ func TestSnapshotExt_StringKeyOldSnapshotMappingsSurviveDeleteAndNewKeys(t *test
 	}
 
 	s1 := db.engine.getSnapshot()
-	idx1, ok := s1.strmap.getIdxNoLock("k1")
+	idx1, ok := s1.strmap.Index("k1")
 	if !ok || idx1 == 0 {
 		t.Fatalf("expected k1 mapping in old snapshot")
 	}
@@ -1209,13 +1209,13 @@ func TestSnapshotExt_StringKeyOldSnapshotMappingsSurviveDeleteAndNewKeys(t *test
 	}
 
 	s2 := db.engine.getSnapshot()
-	if _, ok := s1.strmap.getIdxNoLock("k3"); ok {
+	if _, ok := s1.strmap.Index("k3"); ok {
 		t.Fatalf("old snapshot unexpectedly sees future string key mapping")
 	}
-	if got, ok := s1.strmap.getStringNoLock(idx1); !ok || got != "k1" {
+	if got, ok := s1.strmap.String(idx1); !ok || got != "k1" {
 		t.Fatalf("old snapshot lost original reverse mapping: got=%q ok=%v", got, ok)
 	}
-	if _, ok := s2.strmap.getIdxNoLock("k3"); !ok {
+	if _, ok := s2.strmap.Index("k3"); !ok {
 		t.Fatalf("new snapshot is missing future string key mapping")
 	}
 }
@@ -1919,7 +1919,7 @@ func TestSpanshotExt_ScanKeysStringShouldStayOnSingleSnapshotAcrossTruncate(t *t
 	defer iterOld.Release()
 	for iterOld.HasNext() {
 		idx := iterOld.Next()
-		key, ok := pinned.strmap.getStringNoLock(idx)
+		key, ok := pinned.strmap.String(idx)
 		if !ok {
 			t.Fatalf("old snapshot lost key mapping for idx=%d", idx)
 		}

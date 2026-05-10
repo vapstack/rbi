@@ -8,6 +8,7 @@ import (
 	"github.com/vapstack/rbi/internal/pooled"
 	"github.com/vapstack/rbi/internal/posting"
 	"github.com/vapstack/rbi/internal/qir"
+	"github.com/vapstack/rbi/internal/strmap"
 )
 
 type queryEngine struct {
@@ -69,7 +70,7 @@ func (qe *queryEngine) initSnapshotRuntimeCaches(s *indexSnapshot) {
 	}
 }
 
-func (qe *queryEngine) buildPublishedSnapshotNoLock(seq uint64, strmap *strMapSnapshot) *indexSnapshot {
+func (qe *queryEngine) buildPublishedSnapshotNoLock(seq uint64, sm *strmap.Snapshot) *indexSnapshot {
 	snap := &indexSnapshot{
 		seq:                seq,
 		index:              qe.index,
@@ -79,15 +80,15 @@ func (qe *queryEngine) buildPublishedSnapshotNoLock(seq uint64, strmap *strMapSn
 		measure:            qe.measure,
 		indexedFieldByName: qe.indexedFieldMap,
 		universe:           qe.universe,
-		strmap:             strmap,
+		strmap:             sm,
 	}
 	qe.initSnapshotRuntimeCaches(snap)
 	return snap
 }
 
-func (qe *queryEngine) publishSnapshotNoLock(seq uint64, strmap *strMapSnapshot) {
+func (qe *queryEngine) publishSnapshotNoLock(seq uint64, sm *strmap.Snapshot) {
 	prev := qe.snapshot.current.Load()
-	snap := qe.buildPublishedSnapshotNoLock(seq, strmap)
+	snap := qe.buildPublishedSnapshotNoLock(seq, sm)
 	if prev != nil {
 		snap.index = indexdata.CloneFieldStorageSlots(qe.index, len(qe.indexedFieldAccess))
 		snap.nilIndex = indexdata.CloneFieldStorageSlots(qe.nilIndex, len(qe.indexedFieldAccess))

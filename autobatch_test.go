@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
-	"github.com/vapstack/rbi/internal/indexdata"
 	"reflect"
 	"slices"
 	"strings"
@@ -14,10 +13,28 @@ import (
 	"unsafe"
 
 	"github.com/vapstack/qx"
+	"github.com/vapstack/rbi/internal/indexdata"
 	"github.com/vapstack/rbi/internal/keycodec"
 	"github.com/vapstack/rbi/internal/pooled"
+	"github.com/vapstack/rbi/internal/strmap"
 	"go.etcd.io/bbolt"
 )
+
+func testStrMapCount[V any](tb testing.TB, db *DB[string, V]) int {
+	tb.Helper()
+	return testStrMapSnapshotCount(db.strMap.Snapshot())
+}
+
+func testStrMapSnapshotCount(snap *strmap.Snapshot) int {
+	lookup := snap.Lookup()
+	count := 0
+	for idx, next := uint64(1), snap.Next(); idx <= next; idx++ {
+		if _, ok := lookup.String(idx); ok {
+			count++
+		}
+	}
+	return count
+}
 
 func dataKeyFromID[K ~string | ~uint64](id K) keycodec.DataKey {
 	return keycodec.DataKeyFromUserKey(id, reflect.TypeFor[K]().Kind() == reflect.String)
@@ -1670,7 +1687,7 @@ func TestBatch_StringKeyBeforeStoreError_DoesNotGrowStrMap(t *testing.T) {
 	if err := db.Set("p1", &Product{SKU: "p1", Price: 10}); err != nil {
 		t.Fatalf("seed Set: %v", err)
 	}
-	initial := len(db.strMap.Keys)
+	initial := testStrMapCount(t, db)
 
 	hookErr := errors.New("before store fail")
 	req := &autoBatchRequest{
@@ -1694,7 +1711,7 @@ func TestBatch_StringKeyBeforeStoreError_DoesNotGrowStrMap(t *testing.T) {
 	} else if got != nil {
 		t.Fatalf("ghost-before-store must not persist after BeforeStore failure, got %#v", got)
 	}
-	if after := len(db.strMap.Keys); after != initial {
+	if after := testStrMapCount(t, db); after != initial {
 		t.Fatalf("strmap grew after BeforeStore failure: initial=%d after=%d", initial, after)
 	}
 }
@@ -2760,7 +2777,7 @@ func TestAutoBatchExt_SharedStringSet_BeforeStoreErrorWithNeighbor_DoesNotGrowSt
 	if err := db.Set("p1", &Product{SKU: "p1", Price: 10}); err != nil {
 		t.Fatalf("seed Set: %v", err)
 	}
-	initial := len(db.strMap.Keys)
+	initial := testStrMapCount(t, db)
 
 	hookErr := errors.New("before store failed")
 	badReq := mustBuildSetAutoReq(
@@ -2794,7 +2811,7 @@ func TestAutoBatchExt_SharedStringSet_BeforeStoreErrorWithNeighbor_DoesNotGrowSt
 	} else if got == nil || got.Price != 22 {
 		t.Fatalf("unexpected p2 value: %#v", got)
 	}
-	if after := len(db.strMap.Keys); after != initial+1 {
+	if after := testStrMapCount(t, db); after != initial+1 {
 		t.Fatalf("strmap size = %d, want %d", after, initial+1)
 	}
 }
@@ -2805,7 +2822,7 @@ func TestAutoBatchExt_SharedStringSet_DecodePreparedValueErrorWithNeighbor_DoesN
 	if err := db.Set("p1", &Product{SKU: "p1", Price: 10}); err != nil {
 		t.Fatalf("seed Set: %v", err)
 	}
-	initial := len(db.strMap.Keys)
+	initial := testStrMapCount(t, db)
 
 	badReq := mustBuildSetAutoReq(
 		t,
@@ -2834,7 +2851,7 @@ func TestAutoBatchExt_SharedStringSet_DecodePreparedValueErrorWithNeighbor_DoesN
 	} else if got != nil {
 		t.Fatalf("ghost-decode must stay absent, got %#v", got)
 	}
-	if after := len(db.strMap.Keys); after != initial+1 {
+	if after := testStrMapCount(t, db); after != initial+1 {
 		t.Fatalf("strmap size = %d, want %d", after, initial+1)
 	}
 }
@@ -2845,7 +2862,7 @@ func TestAutoBatchExt_SharedStringSet_UniqueRejectWithNeighbor_DoesNotGrowStrMap
 	if err := db.Set("u1", &StringUniqueTestRec{Email: "a@x", Code: 1}); err != nil {
 		t.Fatalf("seed Set: %v", err)
 	}
-	initial := len(db.strMap.Keys)
+	initial := testStrMapCount(t, db)
 
 	badReq := mustBuildSetAutoReq(t, db, "u-dup", &StringUniqueTestRec{Email: "a@x", Code: 2}, nil, nil, nil)
 	goodReq := mustBuildSetAutoReq(t, db, "u-ok", &StringUniqueTestRec{Email: "c@x", Code: 3}, nil, nil, nil)
@@ -2868,7 +2885,7 @@ func TestAutoBatchExt_SharedStringSet_UniqueRejectWithNeighbor_DoesNotGrowStrMap
 	} else if got == nil || got.Email != "c@x" || got.Code != 3 {
 		t.Fatalf("unexpected u-ok value: %#v", got)
 	}
-	if after := len(db.strMap.Keys); after != initial+1 {
+	if after := testStrMapCount(t, db); after != initial+1 {
 		t.Fatalf("strmap size = %d, want %d", after, initial+1)
 	}
 }
@@ -2879,7 +2896,7 @@ func TestAutoBatchExt_SharedStringSet_CallbackFailureWithNeighbor_DoesNotGrowStr
 	if err := db.Set("p1", &Product{SKU: "p1", Price: 10}); err != nil {
 		t.Fatalf("seed Set: %v", err)
 	}
-	initial := len(db.strMap.Keys)
+	initial := testStrMapCount(t, db)
 
 	cbErr := errors.New("callback failed")
 	badReq := mustBuildSetAutoReq(
@@ -2913,7 +2930,7 @@ func TestAutoBatchExt_SharedStringSet_CallbackFailureWithNeighbor_DoesNotGrowStr
 	} else if got == nil || got.Price != 22 {
 		t.Fatalf("unexpected p2 value: %#v", got)
 	}
-	if after := len(db.strMap.Keys); after != initial+1 {
+	if after := testStrMapCount(t, db); after != initial+1 {
 		t.Fatalf("strmap size = %d, want %d", after, initial+1)
 	}
 }

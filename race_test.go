@@ -843,13 +843,13 @@ func TestRace_StringKeyGrowth_FastPaths_SnapshotRouteEquivalence(t *testing.T) {
 
 		// strmap snapshot must provide stable idx<->key round-trip for returned ids.
 		for _, key := range ref {
-			idx, ok := view.strMapView.getIdxNoLock(key)
+			idx, ok := view.strMapView.Index(key)
 			if !ok {
 				db.engine.releaseQueryView(view)
 				db.engine.unpinCurrentSnapshot(seq, snapRef, pinned)
 				t.Fatalf("missing idx mapping in strmap snapshot for key=%q", key)
 			}
-			back, ok := view.strMapView.getStringNoLock(idx)
+			back, ok := view.strMapView.String(idx)
 			if !ok || back != key {
 				db.engine.releaseQueryView(view)
 				db.engine.unpinCurrentSnapshot(seq, snapRef, pinned)

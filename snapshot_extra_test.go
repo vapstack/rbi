@@ -286,20 +286,12 @@ func snapshotExtraSetNumericBucketKnobs(t *testing.T, db *DB[uint64, snapshotExt
 
 func snapshotExtraLiveStrMapLookup(t *testing.T, db *DB[string, snapshotExtraRec], key string) (uint64, bool) {
 	t.Helper()
-
-	db.strMap.Lock()
-	defer db.strMap.Unlock()
-
-	idx, ok := db.strMap.Keys[key]
-	return idx, ok
+	return db.strMap.Snapshot().Index(key)
 }
 
 func snapshotExtraLiveStrMapNext(t *testing.T, db *DB[string, snapshotExtraRec]) uint64 {
 	t.Helper()
-
-	db.strMap.Lock()
-	defer db.strMap.Unlock()
-	return db.strMap.Next
+	return db.strMap.Snapshot().Next()
 }
 
 func TestSnapshotExtra_BeginQueryTxSnapshotIgnoresRealStagedSetBeforeCommit(t *testing.T) {
@@ -746,7 +738,7 @@ func TestSnapshotExtra_StringKeyPinnedSnapshotDoesNotSeeRealStagedFutureKey(t *t
 	if got := db.engine.getSnapshot(); got != old {
 		t.Fatalf("current string snapshot changed before publish")
 	}
-	if _, ok := old.strmap.getIdxNoLock("future"); ok {
+	if _, ok := old.strmap.Index("future"); ok {
 		t.Fatalf("old published strmap observed staged future key before publish")
 	}
 
@@ -771,7 +763,7 @@ func TestSnapshotExtra_StringKeyPinnedSnapshotDoesNotSeeRealStagedFutureKey(t *t
 		t.Fatalf("Set(future): %v", err)
 	}
 
-	if _, ok := pinned.strmap.getIdxNoLock("future"); ok {
+	if _, ok := pinned.strmap.Index("future"); ok {
 		t.Fatalf("pinned old string snapshot observed future key after publish")
 	}
 	oldFuture := snapshotExtraQuerySnapshotKeys(t, db, pinned, qx.Query(qx.EQ("name", "future")))
@@ -840,7 +832,7 @@ func TestSnapshotExtra_StringKeyRollbackRemovesLiveCreatedIdxAndReusesIt(t *test
 
 	snapshotExtraWait(t, entered, "string rollback set commit hook")
 
-	if _, ok := old.strmap.getIdxNoLock("ghost"); ok {
+	if _, ok := old.strmap.Index("ghost"); ok {
 		t.Fatalf("published old snapshot observed ghost key before rollback")
 	}
 
@@ -885,7 +877,7 @@ func TestSnapshotExtra_StringKeyRollbackRemovesLiveCreatedIdxAndReusesIt(t *test
 	if next := snapshotExtraLiveStrMapNext(t, db); next != 2 {
 		t.Fatalf("strmap.Next not restored after rollback: got=%d want=2", next)
 	}
-	if _, ok := pinned.strmap.getIdxNoLock("ghost"); ok {
+	if _, ok := pinned.strmap.Index("ghost"); ok {
 		t.Fatalf("pinned old string snapshot observed ghost key after rollback")
 	}
 
@@ -908,14 +900,14 @@ func TestSnapshotExtra_StringKeyRollbackRemovesLiveCreatedIdxAndReusesIt(t *test
 	}
 
 	current := db.engine.getSnapshot()
-	laterIdx, ok := current.strmap.getIdxNoLock("later")
+	laterIdx, ok := current.strmap.Index("later")
 	if !ok {
 		t.Fatalf("current snapshot missing later key after rollback recovery; liveIdx=%d seq=%d", liveLaterIdx, current.seq)
 	}
 	if laterIdx != 3 {
 		t.Fatalf("expected later key to reuse rolled-back idx=3, got=%d", laterIdx)
 	}
-	if _, ok := current.strmap.getIdxNoLock("ghost"); ok {
+	if _, ok := current.strmap.Index("ghost"); ok {
 		t.Fatalf("current snapshot retained ghost key after successful later publish")
 	}
 
@@ -975,10 +967,10 @@ func TestSnapshotExtra_StringKeyBatchRollbackRemovesAllLiveCreatedIdxs(t *testin
 
 	snapshotExtraWait(t, entered, "string rollback batch_set commit hook")
 
-	if _, ok := old.strmap.getIdxNoLock("ghostA"); ok {
+	if _, ok := old.strmap.Index("ghostA"); ok {
 		t.Fatalf("published old snapshot observed ghostA before rollback")
 	}
-	if _, ok := old.strmap.getIdxNoLock("ghostB"); ok {
+	if _, ok := old.strmap.Index("ghostB"); ok {
 		t.Fatalf("published old snapshot observed ghostB before rollback")
 	}
 
@@ -1034,10 +1026,10 @@ func TestSnapshotExtra_StringKeyBatchRollbackRemovesAllLiveCreatedIdxs(t *testin
 	if next := snapshotExtraLiveStrMapNext(t, db); next != 1 {
 		t.Fatalf("strmap.Next not restored after batch rollback: got=%d want=1", next)
 	}
-	if _, ok := pinned.strmap.getIdxNoLock("ghostA"); ok {
+	if _, ok := pinned.strmap.Index("ghostA"); ok {
 		t.Fatalf("pinned old string snapshot observed ghostA after rollback")
 	}
-	if _, ok := pinned.strmap.getIdxNoLock("ghostB"); ok {
+	if _, ok := pinned.strmap.Index("ghostB"); ok {
 		t.Fatalf("pinned old string snapshot observed ghostB after rollback")
 	}
 
@@ -1070,21 +1062,21 @@ func TestSnapshotExtra_StringKeyBatchRollbackRemovesAllLiveCreatedIdxs(t *testin
 	}
 
 	current := db.engine.getSnapshot()
-	realAIdx, ok := current.strmap.getIdxNoLock("realA")
+	realAIdx, ok := current.strmap.Index("realA")
 	if !ok {
 		t.Fatalf("current snapshot missing realA after rollback recovery; liveRealA=%d liveRealB=%d seq=%d", liveRealAIdx, liveRealBIdx, current.seq)
 	}
-	realBIdx, ok := current.strmap.getIdxNoLock("realB")
+	realBIdx, ok := current.strmap.Index("realB")
 	if !ok {
 		t.Fatalf("current snapshot missing realB after rollback recovery")
 	}
 	if realAIdx != 2 || realBIdx != 3 {
 		t.Fatalf("expected real keys to reuse rolled-back idxs 2,3; got realA=%d realB=%d", realAIdx, realBIdx)
 	}
-	if _, ok := current.strmap.getIdxNoLock("ghostA"); ok {
+	if _, ok := current.strmap.Index("ghostA"); ok {
 		t.Fatalf("current snapshot retained ghostA after successful recovery publish")
 	}
-	if _, ok := current.strmap.getIdxNoLock("ghostB"); ok {
+	if _, ok := current.strmap.Index("ghostB"); ok {
 		t.Fatalf("current snapshot retained ghostB after successful recovery publish")
 	}
 
@@ -2830,16 +2822,16 @@ func TestSnapshotExtra_StringKeyPinnedSnapshotChainSurvivesTruncateRotationAndPr
 	}
 
 	current := db.engine.getSnapshot()
-	if _, ok := current.strmap.getIdxNoLock("k1"); ok {
+	if _, ok := current.strmap.Index("k1"); ok {
 		t.Fatalf("current snapshot retained pre-truncate key k1")
 	}
-	if _, ok := current.strmap.getIdxNoLock("k2"); ok {
+	if _, ok := current.strmap.Index("k2"); ok {
 		t.Fatalf("current snapshot retained pre-truncate key k2")
 	}
-	if _, ok := current.strmap.getIdxNoLock("k3"); ok {
+	if _, ok := current.strmap.Index("k3"); ok {
 		t.Fatalf("current snapshot retained pre-truncate key k3")
 	}
-	if idx, ok := current.strmap.getIdxNoLock("k4"); !ok || idx != 1 {
+	if idx, ok := current.strmap.Index("k4"); !ok || idx != 1 {
 		t.Fatalf("current snapshot failed to rebuild post-truncate strmap: idx=%d ok=%v", idx, ok)
 	}
 

@@ -218,29 +218,15 @@ func readAutoBatchExtraRawValue[K ~string | ~uint64, V any](tb testing.TB, db *D
 }
 
 type autoBatchExtraStrMapState struct {
-	next         uint64
-	keyCount     int
-	dirty        bool
-	snap         *strMapSnapshot
-	published    *strMapSnapshot
-	pubSource    *strMapSnapshot
-	committed    *strMapSnapshot
-	committedPub *strMapSnapshot
+	next     uint64
+	keyCount int
 }
 
 func captureAutoBatchExtraStrMapState[V any](db *DB[string, V]) autoBatchExtraStrMapState {
-	db.strMap.Lock()
-	defer db.strMap.Unlock()
-
+	snap := db.strMap.Snapshot()
 	return autoBatchExtraStrMapState{
-		next:         db.strMap.Next,
-		keyCount:     len(db.strMap.Keys),
-		dirty:        db.strMap.dirty,
-		snap:         db.strMap.snap,
-		published:    db.strMap.published,
-		pubSource:    db.strMap.pubSource,
-		committed:    db.strMap.committed,
-		committedPub: db.strMap.committedPub,
+		next:     snap.Next(),
+		keyCount: testStrMapSnapshotCount(snap),
 	}
 }
 
@@ -249,25 +235,18 @@ func waitAutoBatchExtraStrMapHasKeys[V any](tb testing.TB, db *DB[string, V], ke
 
 	deadline := time.Now().Add(2 * time.Second)
 	for {
-		db.strMap.Lock()
+		snap := db.strMap.Snapshot()
 		ok := true
 		for _, key := range keys {
-			if _, exists := db.strMap.Keys[key]; !exists {
+			if _, exists := snap.Index(key); !exists {
 				ok = false
 				break
 			}
 		}
 		state := autoBatchExtraStrMapState{
-			next:         db.strMap.Next,
-			keyCount:     len(db.strMap.Keys),
-			dirty:        db.strMap.dirty,
-			snap:         db.strMap.snap,
-			published:    db.strMap.published,
-			pubSource:    db.strMap.pubSource,
-			committed:    db.strMap.committed,
-			committedPub: db.strMap.committedPub,
+			next:     snap.Next(),
+			keyCount: testStrMapSnapshotCount(snap),
 		}
-		db.strMap.Unlock()
 
 		if ok {
 			return state
@@ -1862,7 +1841,7 @@ func TestAutoBatchExtra_StringSharedCloseAfterPrepare_RollsBackCreatedStrMap(t *
 	}()
 
 	during := waitAutoBatchExtraStrMapHasKeys(t, db, "ghost-a", "ghost-b")
-	if during.keyCount != before.keyCount+2 || during.next != before.next+2 || !during.dirty {
+	if during.keyCount != before.keyCount+2 || during.next != before.next+2 {
 		db.mu.Unlock()
 		t.Fatalf("unexpected strmap state during prepared shared close path: before=%+v during=%+v", before, during)
 	}
@@ -1895,14 +1874,8 @@ func TestAutoBatchExtra_StringSharedCloseAfterPrepare_RollsBackCreatedStrMap(t *
 	}
 
 	after := captureAutoBatchExtraStrMapState(db)
-	if after.keyCount != before.keyCount || after.next != before.next || after.dirty {
+	if after.keyCount != before.keyCount || after.next != before.next {
 		t.Fatalf("strmap state mismatch after rollback on shared close: before=%+v after=%+v", before, after)
-	}
-	if after.snap != before.snap || after.published != before.published || after.pubSource != before.pubSource {
-		t.Fatalf("published strmap pointers changed after shared close rollback: before=%+v after=%+v", before, after)
-	}
-	if after.committed != before.committed || after.committedPub != before.committedPub {
-		t.Fatalf("committed strmap pointers changed after shared close rollback: before=%+v after=%+v", before, after)
 	}
 
 	if got := readAutoBatchExtraRawValue(t, db, "ghost-a"); got != nil {
@@ -1939,7 +1912,7 @@ func TestAutoBatchExtra_StringAtomicCloseAfterPrepare_RollsBackCreatedStrMap(t *
 	}()
 
 	during := waitAutoBatchExtraStrMapHasKeys(t, db, "atomic-a", "atomic-b")
-	if during.keyCount != before.keyCount+2 || during.next != before.next+2 || !during.dirty {
+	if during.keyCount != before.keyCount+2 || during.next != before.next+2 {
 		db.mu.Unlock()
 		t.Fatalf("unexpected strmap state during prepared atomic close path: before=%+v during=%+v", before, during)
 	}
@@ -1981,14 +1954,8 @@ func TestAutoBatchExtra_StringAtomicCloseAfterPrepare_RollsBackCreatedStrMap(t *
 	}
 
 	after := captureAutoBatchExtraStrMapState(db)
-	if after.keyCount != before.keyCount || after.next != before.next || after.dirty {
+	if after.keyCount != before.keyCount || after.next != before.next {
 		t.Fatalf("strmap state mismatch after rollback on atomic close: before=%+v after=%+v", before, after)
-	}
-	if after.snap != before.snap || after.published != before.published || after.pubSource != before.pubSource {
-		t.Fatalf("published strmap pointers changed after atomic close rollback: before=%+v after=%+v", before, after)
-	}
-	if after.committed != before.committed || after.committedPub != before.committedPub {
-		t.Fatalf("committed strmap pointers changed after atomic close rollback: before=%+v after=%+v", before, after)
 	}
 
 	if got := readAutoBatchExtraRawValue(t, db, "atomic-a"); got != nil {

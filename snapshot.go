@@ -8,6 +8,7 @@ import (
 	"github.com/vapstack/rbi/internal/keycodec"
 	"github.com/vapstack/rbi/internal/pooled"
 	"github.com/vapstack/rbi/internal/posting"
+	"github.com/vapstack/rbi/internal/strmap"
 )
 
 // indexSnapshot is an immutable read-view published atomically for query paths.
@@ -22,7 +23,7 @@ type indexSnapshot struct {
 	indexedFieldByName map[string]indexedFieldAccessor
 	universe           posting.List
 	universeOwner      *snapshotPostingOwner
-	strmap             *strMapSnapshot
+	strmap             *strmap.Snapshot
 
 	numericRangeBucketCache *numericRangeBucketCache
 
@@ -1346,7 +1347,7 @@ func addFixedFieldPostingList(fieldMap map[uint64]posting.List, key uint64, idx 
 	return fieldMap
 }
 
-func (qe *queryEngine) buildPreparedSnapshotNoLock(seq uint64, strMap *strMapper, patchMap map[string]*field, entries []snapshotBatchEntry) *indexSnapshot {
+func (qe *queryEngine) buildPreparedSnapshotNoLock(seq uint64, strMap *strmap.Mapper, patchMap map[string]*field, entries []snapshotBatchEntry) *indexSnapshot {
 	prev := qe.getSnapshot()
 	if snap, ok := qe.buildPreparedSnapshotFromEmptyBaseNoLock(seq, prev, strMap, entries); ok {
 		return snap
@@ -1357,7 +1358,7 @@ func (qe *queryEngine) buildPreparedSnapshotNoLock(seq uint64, strMap *strMapper
 	return qe.buildPreparedSnapshotAggregatedNoLock(seq, prev, strMap, patchMap, entries)
 }
 
-func (qe *queryEngine) buildPreparedSnapshotFromEmptyBaseNoLock(seq uint64, prev *indexSnapshot, strMap *strMapper, entries []snapshotBatchEntry) (*indexSnapshot, bool) {
+func (qe *queryEngine) buildPreparedSnapshotFromEmptyBaseNoLock(seq uint64, prev *indexSnapshot, strMap *strmap.Mapper, entries []snapshotBatchEntry) (*indexSnapshot, bool) {
 	if prev != nil && !prev.universe.IsEmpty() {
 		return nil, false
 	}
@@ -1469,9 +1470,9 @@ func (qe *queryEngine) buildPreparedSnapshotFromEmptyBaseNoLock(seq uint64, prev
 		measureStates[i] = nil
 	}
 
-	var strmap *strMapSnapshot
+	var sm *strmap.Snapshot
 	if strMap != nil {
-		strmap = strMap.snapshot()
+		sm = strMap.Snapshot()
 	}
 	snap := &indexSnapshot{
 		seq:                seq,
@@ -1482,7 +1483,7 @@ func (qe *queryEngine) buildPreparedSnapshotFromEmptyBaseNoLock(seq uint64, prev
 		measure:            nextMeasure,
 		indexedFieldByName: qe.indexedFieldMap,
 		universe:           universe,
-		strmap:             strmap,
+		strmap:             sm,
 	}
 	qe.initSnapshotRuntimeCaches(snap)
 	inheritNumericRangeBucketCache(snap, prev)
@@ -1509,7 +1510,7 @@ func (qe *queryEngine) buildPreparedSnapshotFromEmptyBaseNoLock(seq uint64, prev
 	return snap, true
 }
 
-func (qe *queryEngine) buildPreparedSnapshotInsertOnlyNoLock(seq uint64, prev *indexSnapshot, strMap *strMapper, entries []snapshotBatchEntry) (*indexSnapshot, bool) {
+func (qe *queryEngine) buildPreparedSnapshotInsertOnlyNoLock(seq uint64, prev *indexSnapshot, strMap *strmap.Mapper, entries []snapshotBatchEntry) (*indexSnapshot, bool) {
 	if len(entries) == 0 {
 		return nil, false
 	}
@@ -1528,9 +1529,9 @@ func (qe *queryEngine) buildPreparedSnapshotInsertOnlyNoLock(seq uint64, prev *i
 		}
 	}
 
-	var strmap *strMapSnapshot
+	var sm *strmap.Snapshot
 	if strMap != nil {
-		strmap = strMap.snapshot()
+		sm = strMap.Snapshot()
 	}
 	next := &indexSnapshot{
 		seq: seq,
@@ -1542,7 +1543,7 @@ func (qe *queryEngine) buildPreparedSnapshotInsertOnlyNoLock(seq uint64, prev *i
 		measure:            indexdata.CloneMeasureStorageSlots(prev.measure, len(qe.measureFieldAccess)),
 		indexedFieldByName: qe.indexedFieldMap,
 		universe:           prev.universe.Clone(),
-		strmap:             strmap,
+		strmap:             sm,
 	}
 	next.universe = next.universe.BuildMergedOwned(addedUniverse)
 	qe.initSnapshotRuntimeCaches(next)

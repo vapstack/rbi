@@ -21,6 +21,7 @@ import (
 	"github.com/vapstack/rbi/internal/keycodec"
 	"github.com/vapstack/rbi/internal/pooled"
 	"github.com/vapstack/rbi/internal/posting"
+	"github.com/vapstack/rbi/internal/strmap"
 	"go.etcd.io/bbolt"
 )
 
@@ -94,7 +95,7 @@ type loadIndexResult struct {
 	skipFields        map[string]struct{}
 	skipMeasureFields map[string]struct{}
 	plannerStats      *plannerStatsSnapshot
-	strMap            *strMapper
+	strMap            *strmap.Mapper
 	loadTime          time.Duration
 }
 
@@ -349,7 +350,7 @@ func (qe *queryEngine) buildIndex(
 	bolt *bbolt.DB,
 	bucket []byte,
 	strKey bool,
-	strMap *strMapper,
+	strMap *strmap.Mapper,
 	skipFields map[string]struct{},
 	skipMeasureFields map[string]struct{},
 	decode buildIndexDecodeFn,
@@ -530,9 +531,10 @@ func (qe *queryEngine) buildIndex(
 		}
 		done := ctx.Done()
 		c := b.Cursor()
+		var strWriter strmap.Writer
 		if strKey {
-			strMap.Lock()
-			defer strMap.Unlock()
+			strWriter = strMap.LockWriter()
+			defer strWriter.Unlock()
 		}
 		nextGCAt := uint64(indexBuildGCStride)
 		nextReleaseAt := uint64(indexBuildReleaseOSMemoryStride)
@@ -546,7 +548,12 @@ func (qe *queryEngine) buildIndex(
 					formatDiagnosticBytesPrefix(k, 24),
 				)
 			}
-			idx := idxFromKeyNoLock(strKey, strMap, k)
+			var idx uint64
+			if strKey {
+				idx, _ = strWriter.Create(string(k))
+			} else {
+				idx = keycodec.U64FromBytes(k)
+			}
 			select {
 			case <-done:
 				return nil
@@ -797,13 +804,6 @@ func (db *DB[K, V]) validateIndexedStringValues(val *V) error {
 	return nil
 }
 
-func idxFromKeyNoLock(strKey bool, strMap *strMapper, key []byte) uint64 {
-	if strKey {
-		return strMap.createIdxNoLock(string(key))
-	}
-	return keycodec.U64FromBytes(key)
-}
-
 func (qe *queryEngine) buildLenIndex() {
 	indexdata.ReleaseFieldStorageSlots(qe.lenIndex)
 	slotCount := len(qe.indexedFieldAccess)
@@ -929,7 +929,7 @@ func (qe *queryEngine) loadIndexV26(
 	reader *bufio.Reader,
 	bolt *bbolt.DB,
 	bucket []byte,
-) (map[string]struct{}, map[string]struct{}, *plannerStatsSnapshot, *strMapper, bool, error) {
+) (map[string]struct{}, map[string]struct{}, *plannerStatsSnapshot, *strmap.Mapper, bool, error) {
 	storedSeq, err := binary.ReadUvarint(reader)
 	if err != nil {
 		return nil, nil, nil, nil, false, fmt.Errorf("decode: reading bucket sequence: %w", err)
@@ -952,7 +952,7 @@ func (qe *queryEngine) loadIndexV26(
 
 func (qe *queryEngine) loadIndexPayload(
 	reader *bufio.Reader,
-) (map[string]struct{}, map[string]struct{}, *plannerStatsSnapshot, *strMapper, bool, error) {
+) (map[string]struct{}, map[string]struct{}, *plannerStatsSnapshot, *strmap.Mapper, bool, error) {
 
 	var universe posting.List
 	universe, err := posting.ReadFrom(reader)
@@ -960,7 +960,7 @@ func (qe *queryEngine) loadIndexPayload(
 		return nil, nil, nil, nil, false, fmt.Errorf("decode: reading universe: %w", err)
 	}
 
-	strmap, err := readStrMap(reader, defaultSnapshotStrMapCompactDepth)
+	sm, err := strmap.Read(reader, defaultSnapshotStrMapCompactDepth)
 	if err != nil {
 		return nil, nil, nil, nil, false, err
 	}
@@ -1083,7 +1083,7 @@ func (qe *queryEngine) loadIndexPayload(
 		}
 	}
 
-	return skipFields, skipMeasureFields, plannerStats, strmap, lenLoaded, nil
+	return skipFields, skipMeasureFields, plannerStats, sm, lenLoaded, nil
 }
 
 func detectLenZeroComplement(indexes []indexdata.FieldStorage, access []indexedFieldAccessor) []bool {
@@ -1221,7 +1221,7 @@ func (qe *queryEngine) storeIndexPayload(writer *bufio.Writer) error {
 		return fmt.Errorf("encode: writing universe: %w", err)
 	}
 
-	if err := writeStrMapSnapshot(writer, snap.strmap); err != nil {
+	if err := strmap.WriteSnapshot(writer, snap.strmap); err != nil {
 		return err
 	}
 
@@ -1310,11 +1310,6 @@ func (qe *queryEngine) storeIndexPayload(writer *bufio.Writer) error {
 
 	return nil
 }
-
-const (
-	strMapEncodingDense  byte = 1
-	strMapEncodingSparse byte = 2
-)
 
 func writeFields(writer *bufio.Writer, fields map[string]*field) error {
 	names := make([]string, 0, len(fields))
@@ -1438,408 +1433,6 @@ func readField(reader *bufio.Reader) (string, *field, error) {
 		DBName:    dbName,
 		Index:     valIndex,
 	}, nil
-}
-
-func writeStrMapSnapshot(writer *bufio.Writer, sm *strMapSnapshot) error {
-	if sm == nil {
-		if err := writeSidecarUvarint(writer, 0); err != nil {
-			return fmt.Errorf("encode: writing strmap next: %w", err)
-		}
-		if err := writer.WriteByte(strMapEncodingSparse); err != nil {
-			return fmt.Errorf("encode: writing strmap encoding: %w", err)
-		}
-		return writeSidecarUvarint(writer, 0)
-	}
-
-	if err := writeSidecarUvarint(writer, sm.Next); err != nil {
-		return fmt.Errorf("encode: writing strmap next: %w", err)
-	}
-
-	var chainInline [32]strMapSnapshotPersistNode
-	chain, usedCount := strMapSnapshotPersistNodes(sm, chainInline[:0])
-
-	if strMapSnapshotShouldPersistSparse(sm, usedCount) {
-		if err := writer.WriteByte(strMapEncodingSparse); err != nil {
-			return fmt.Errorf("encode: writing strmap encoding: %w", err)
-		}
-		if err := writeSidecarUvarint(writer, uint64(usedCount)); err != nil {
-			return fmt.Errorf("encode: writing strmap sparse len: %w", err)
-		}
-		it := strMapSnapshotPersistIter{chain: chain}
-		for {
-			idx, value, ok := it.next()
-			if !ok {
-				break
-			}
-			if err := writeSidecarUvarint(writer, idx); err != nil {
-				return fmt.Errorf("encode: writing strmap sparse idx: %w", err)
-			}
-			if err := writeSidecarString(writer, value); err != nil {
-				return fmt.Errorf("encode: writing strmap sparse string: %w", err)
-			}
-		}
-		return nil
-	}
-
-	if err := writer.WriteByte(strMapEncodingDense); err != nil {
-		return fmt.Errorf("encode: writing strmap encoding: %w", err)
-	}
-
-	denseLen := int(sm.Next) + 1
-	if err := writeSidecarUvarint(writer, uint64(denseLen)); err != nil {
-		return fmt.Errorf("encode: writing strmap dense len: %w", err)
-	}
-
-	flagIter := strMapSnapshotPersistIter{chain: chain}
-	idx, _, ok := flagIter.next()
-	for base := 0; base < denseLen; base += 8 {
-		baseIdx := uint64(base)
-		limit := baseIdx + 8
-		var flags byte
-		for ok && idx < limit {
-			flags |= 1 << uint(idx-baseIdx)
-			idx, _, ok = flagIter.next()
-		}
-		if err := writer.WriteByte(flags); err != nil {
-			return fmt.Errorf("encode: writing strmap flags: %w", err)
-		}
-	}
-
-	valueIter := strMapSnapshotPersistIter{chain: chain}
-	for {
-		_, value, ok := valueIter.next()
-		if !ok {
-			break
-		}
-		if err := writeSidecarString(writer, value); err != nil {
-			return fmt.Errorf("encode: writing strmap string: %w", err)
-		}
-	}
-	return nil
-}
-
-type strMapSnapshotPersistNode struct {
-	start     uint64
-	next      uint64
-	strs      map[uint64]string
-	denseStrs []string
-	denseUsed []bool
-}
-
-func strMapSnapshotPersistNodes(sm *strMapSnapshot, inline []strMapSnapshotPersistNode) ([]strMapSnapshotPersistNode, int) {
-	if sm == nil {
-		return nil, 0
-	}
-	if len(sm.readDirs) > 0 {
-		var nodes []strMapSnapshotPersistNode
-		usedCount := 0
-		pageCount := strMapReadPageCount(sm.Next)
-		for page := 0; page < pageCount; page++ {
-			readPage := sm.readPageAtNoLock(page)
-			if readPage == nil {
-				continue
-			}
-			nodes = append(nodes, strMapSnapshotPersistNode{
-				start:     readPage.Start,
-				next:      readPage.Next,
-				strs:      readPage.Strs,
-				denseStrs: readPage.DenseStrs,
-				denseUsed: readPage.DenseUsed,
-			})
-			usedCount += readPage.usedCountNoLock()
-		}
-		if len(nodes) == 0 {
-			return nil, usedCount
-		}
-		if len(nodes) <= cap(inline) {
-			copy(inline[:len(nodes)], nodes)
-			nodes = inline[:len(nodes)]
-		}
-		return nodes, usedCount
-	}
-
-	depth := 0
-	usedCount := 0
-	for cur := sm; cur != nil; cur = cur.base {
-		depth++
-		usedCount += strMapSnapshotOwnUsedCount(cur)
-	}
-	if depth == 0 {
-		return nil, 0
-	}
-
-	var nodes []strMapSnapshotPersistNode
-	if depth <= cap(inline) {
-		nodes = inline[:depth]
-	} else {
-		nodes = make([]strMapSnapshotPersistNode, depth)
-	}
-	i := depth
-	for cur := sm; cur != nil; cur = cur.base {
-		i--
-		start := cur.baseNextNoLock() + 1
-		if cur.base == nil {
-			start = 1
-		}
-		denseStrs, denseUsed := strMapDenseWindowNoLock(cur.DenseStrs, cur.DenseUsed, start, cur.Next)
-		nodes[i] = strMapSnapshotPersistNode{
-			start:     start,
-			next:      cur.Next,
-			strs:      cur.Strs,
-			denseStrs: denseStrs,
-			denseUsed: denseUsed,
-		}
-	}
-	return nodes, usedCount
-}
-
-type strMapSnapshotPersistIter struct {
-	chain      []strMapSnapshotPersistNode
-	node       int
-	mode       byte
-	densePos   int
-	denseLimit int
-	sparse     []strMapSparseEntry
-	sparsePos  int
-}
-
-func (it *strMapSnapshotPersistIter) next() (uint64, string, bool) {
-	for it.node < len(it.chain) {
-		switch it.mode {
-		case 1:
-			node := it.chain[it.node]
-			for it.densePos < it.denseLimit {
-				idx := uint64(it.densePos)
-				it.densePos++
-				pos := int(idx - node.start)
-				if pos < 0 || pos >= len(node.denseUsed) || !node.denseUsed[pos] {
-					continue
-				}
-				return idx, node.denseStrs[pos], true
-			}
-			it.mode = 0
-			it.node++
-			continue
-		case 2:
-			if it.sparsePos < len(it.sparse) {
-				entry := it.sparse[it.sparsePos]
-				it.sparsePos++
-				return entry.idx, entry.value, true
-			}
-			it.sparse = it.sparse[:0]
-			it.sparsePos = 0
-			it.mode = 0
-			it.node++
-			continue
-		}
-
-		node := it.chain[it.node]
-		if len(node.denseStrs) > 0 || len(node.denseUsed) > 0 {
-			start := int(node.start)
-			limit := start + min(len(node.denseStrs), len(node.denseUsed))
-			if start >= limit {
-				it.node++
-				continue
-			}
-			it.densePos = start
-			it.denseLimit = limit
-			it.mode = 1
-			continue
-		}
-		if len(node.strs) == 0 {
-			it.node++
-			continue
-		}
-
-		it.sparse = it.sparse[:0]
-		for idx, value := range node.strs {
-			if idx < node.start || idx > node.next {
-				continue
-			}
-			it.sparse = append(it.sparse, strMapSparseEntry{idx: idx, value: value})
-		}
-		slices.SortFunc(it.sparse, func(a, b strMapSparseEntry) int {
-			switch {
-			case a.idx < b.idx:
-				return -1
-			case a.idx > b.idx:
-				return 1
-			default:
-				return 0
-			}
-		})
-		it.mode = 2
-	}
-	return 0, "", false
-}
-
-func readStrMap(reader *bufio.Reader, compactAt int) (*strMapper, error) {
-	next, err := binary.ReadUvarint(reader)
-	if err != nil {
-		return nil, fmt.Errorf("decode: reading strmap next: %w", err)
-	}
-	enc, err := reader.ReadByte()
-	if err != nil {
-		return nil, fmt.Errorf("decode: reading strmap encoding: %w", err)
-	}
-	switch enc {
-	case strMapEncodingDense:
-		denseLen, err := binary.ReadUvarint(reader)
-		if err != nil {
-			return nil, fmt.Errorf("decode: reading strmap dense len: %w", err)
-		}
-		if denseLen == 0 {
-			return nil, fmt.Errorf("decode: invalid zero strmap dense len")
-		}
-		if denseLen > uint64(^uint(0)>>1) {
-			return nil, fmt.Errorf("decode: strmap dense len overflows int: %v", denseLen)
-		}
-		if next >= denseLen {
-			return nil, fmt.Errorf("decode: strmap next out of range: next=%v denseLen=%v", next, denseLen)
-		}
-
-		flags := make([]byte, (int(denseLen)+7)>>3)
-		if _, err := io.ReadFull(reader, flags); err != nil {
-			return nil, fmt.Errorf("decode: reading strmap flags: %w", err)
-		}
-
-		usedCount := 0
-		for _, b := range flags {
-			for x := b; x != 0; x &= x - 1 {
-				usedCount++
-			}
-		}
-
-		strs := make([]string, int(denseLen))
-		used := make([]bool, int(denseLen))
-		keys := make(map[string]uint64, max(0, usedCount-1))
-
-		for i := 0; i < int(denseLen); i++ {
-			if flags[i>>3]&(1<<uint(i&7)) == 0 {
-				continue
-			}
-			s, err := readSidecarString(reader)
-			if err != nil {
-				return nil, fmt.Errorf("decode: reading strmap dense string idx=%d: %w", i, err)
-			}
-			strs[i] = s
-			used[i] = true
-			if i > 0 {
-				keys[s] = uint64(i)
-			}
-		}
-
-		strmap := newStrMapper(uint64(max(0, usedCount-1)), compactAt)
-		strmap.replaceAllDenseNoLock(keys, strs, used, next)
-		return strmap, nil
-
-	case strMapEncodingSparse:
-		count, err := binary.ReadUvarint(reader)
-		if err != nil {
-			return nil, fmt.Errorf("decode: reading strmap sparse len: %w", err)
-		}
-		if count > uint64(^uint(0)>>1) {
-			return nil, fmt.Errorf("decode: strmap sparse len overflows int: %v", count)
-		}
-		keys := make(map[string]uint64, int(count))
-		strs := make(map[uint64]string, int(count))
-		for i := uint64(0); i < count; i++ {
-			idx, err := binary.ReadUvarint(reader)
-			if err != nil {
-				return nil, fmt.Errorf("decode: reading strmap sparse idx entry=%d/%d: %w", i+1, count, err)
-			}
-			if idx == 0 || idx > next {
-				return nil, fmt.Errorf("decode: strmap sparse idx out of range at entry=%d/%d: idx=%v next=%v", i+1, count, idx, next)
-			}
-			if _, exists := strs[idx]; exists {
-				return nil, fmt.Errorf("decode: duplicate strmap sparse idx at entry=%d/%d: %v", i+1, count, idx)
-			}
-			s, err := readSidecarString(reader)
-			if err != nil {
-				return nil, fmt.Errorf("decode: reading strmap sparse string idx=%d entry=%d/%d: %w", idx, i+1, count, err)
-			}
-			if _, exists := keys[s]; exists {
-				return nil, fmt.Errorf("decode: duplicate strmap sparse key at entry=%d/%d: %q", i+1, count, s)
-			}
-			keys[s] = idx
-			strs[idx] = s
-		}
-		strmap := newStrMapper(count, compactAt)
-		strmap.replaceAllSparseNoLock(keys, strs, next)
-		return strmap, nil
-
-	default:
-		return nil, fmt.Errorf("decode: invalid strmap encoding %v", enc)
-	}
-}
-
-type strMapSparseEntry struct {
-	idx   uint64
-	value string
-}
-
-func strMapSnapshotShouldPersistSparse(sm *strMapSnapshot, usedCount int) bool {
-	if sm == nil {
-		return false
-	}
-	if sm.Next > uint64(^uint(0)>>1) {
-		return true
-	}
-	denseLen := max(len(sm.DenseStrs), len(sm.DenseUsed))
-	if denseLen <= 1 {
-		denseLen = int(sm.Next) + 1
-	}
-	if denseLen <= 1 {
-		return false
-	}
-	if usedCount == 0 {
-		return false
-	}
-	return estimateSparseStrMapReverseBytes(usedCount) < estimateDenseStrMapReverseBytes(denseLen)
-}
-
-func strMapSnapshotOwnUsedCount(sm *strMapSnapshot) int {
-	if sm == nil {
-		return 0
-	}
-	if len(sm.Keys) > 0 {
-		return len(sm.Keys)
-	}
-	if sm.Strs != nil {
-		return len(sm.Strs)
-	}
-	limit := min(len(sm.DenseStrs), len(sm.DenseUsed))
-	if limit <= 1 {
-		return 0
-	}
-	count := 0
-	for i := 1; i < limit; i++ {
-		if sm.DenseUsed[i] {
-			count++
-		}
-	}
-	return count
-}
-
-func estimateDenseStrMapReverseBytes(denseLen int) uint64 {
-	if denseLen <= 0 {
-		return 0
-	}
-	return uint64(denseLen) * uint64(unsafe.Sizeof("")+unsafe.Sizeof(false))
-}
-
-func estimateSparseStrMapReverseBytes(usedCount int) uint64 {
-	if usedCount <= 0 {
-		return 0
-	}
-	const sparseMapLoadNumerator = 2
-	const sparseMapLoadDenominator = 13 // ceil(n / 6.5) == ceil(2n / 13)
-	buckets := (usedCount*sparseMapLoadNumerator + sparseMapLoadDenominator - 1) / sparseMapLoadDenominator
-	if buckets < 1 {
-		buckets = 1
-	}
-	bucketSize := uint64(8 + 8*unsafe.Sizeof(uint64(0)) + 8*unsafe.Sizeof("") + unsafe.Sizeof(uintptr(0)))
-	return bucketSize * uint64(buckets)
 }
 
 func writePlannerStatsSnapshot(writer *bufio.Writer, s *plannerStatsSnapshot) error {

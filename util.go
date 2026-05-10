@@ -204,13 +204,7 @@ func (db *DB[K, V]) idxFromUserKey(id K) uint64 {
 func (db *DB[K, V]) idxFromUserKeyWithCreated(id K) (uint64, bool) {
 	if db.strKey {
 		s := *(*string)(unsafe.Pointer(&id))
-		db.strMap.Lock()
-		defer db.strMap.Unlock()
-		if idx, ok := db.strMap.Keys[s]; ok {
-			return idx, false
-		}
-		idx := db.strMap.createIdxNoLock(s)
-		return idx, true
+		return db.strMap.Create(s)
 	}
 	return *(*uint64)(unsafe.Pointer(&id)), false
 }
@@ -223,13 +217,14 @@ func (db *DB[K, V]) addCheckedIdxsFromUserKeys(ids []K, dst *postingLazySetBuild
 	dedupe := uint64(0)
 	if db.strKey {
 		s := *(*[]string)(unsafe.Pointer(&ids))
-		db.strMap.Lock()
+		writer := db.strMap.LockWriter()
 		for i := range s {
-			if !dst.addChecked(db.strMap.createIdxNoLock(s[i])) {
+			idx, _ := writer.Create(s[i])
+			if !dst.addChecked(idx) {
 				dedupe++
 			}
 		}
-		db.strMap.Unlock()
+		writer.Unlock()
 		return dedupe
 	}
 

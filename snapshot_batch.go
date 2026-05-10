@@ -5,6 +5,7 @@ import (
 
 	"github.com/vapstack/rbi/internal/indexdata"
 	"github.com/vapstack/rbi/internal/pooled"
+	"github.com/vapstack/rbi/internal/strmap"
 )
 
 type snapshotBatchEntry struct {
@@ -345,14 +346,14 @@ func (qe *queryEngine) collectSnapshotBatchEntryDiffs(
 func (qe *queryEngine) buildPreparedSnapshotAggregatedNoLock(
 	seq uint64,
 	prev *indexSnapshot,
-	strMap *strMapper,
+	strMap *strmap.Mapper,
 	patchMap map[string]*field,
 	entries []snapshotBatchEntry,
 ) *indexSnapshot {
 
-	var strmap *strMapSnapshot
+	var sm *strmap.Snapshot
 	if strMap != nil {
-		strmap = strMap.snapshot()
+		sm = strMap.Snapshot()
 	}
 	next := &indexSnapshot{
 		seq: seq,
@@ -365,7 +366,7 @@ func (qe *queryEngine) buildPreparedSnapshotAggregatedNoLock(
 		indexedFieldByName: qe.indexedFieldMap,
 		universe:           prev.universe,
 		universeOwner:      prev.universeOwner,
-		strmap:             strmap,
+		strmap:             sm,
 	}
 	qe.initSnapshotRuntimeCaches(next)
 

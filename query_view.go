@@ -7,6 +7,7 @@ import (
 
 	"github.com/vapstack/rbi/internal/posting"
 	"github.com/vapstack/rbi/internal/qir"
+	"github.com/vapstack/rbi/internal/strmap"
 )
 
 const normalizedScalarBoundCacheMaxEntries = 8
@@ -39,7 +40,7 @@ type queryView struct {
 	engine            *queryEngine
 	snap              *indexSnapshot
 	strKey            bool
-	strMapView        *strMapSnapshot
+	strMapView        *strmap.Snapshot
 	fields            map[string]*field
 	planner           *planner
 	lenZeroComplement []bool

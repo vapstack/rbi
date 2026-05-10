@@ -2187,7 +2187,7 @@ func TestBatchSet_CommitFail_DoesNotGrowStrMap(t *testing.T) {
 	if err := db.Set("p1", &Product{SKU: "p1", Price: 10}); err != nil {
 		t.Fatalf("seed Set: %v", err)
 	}
-	initial := len(db.strMap.Keys)
+	initial := testStrMapCount(t, db)
 
 	injected := errors.New("inject commit fail")
 	var failOnce atomic.Bool
@@ -2213,7 +2213,7 @@ func TestBatchSet_CommitFail_DoesNotGrowStrMap(t *testing.T) {
 	} else if v != nil {
 		t.Fatalf("ghost-commit should not persist after commit fail, got %#v", v)
 	}
-	if after := len(db.strMap.Keys); after != initial {
+	if after := testStrMapCount(t, db); after != initial {
 		t.Fatalf("strmap grew after batch commit failure: initial=%d after=%d", initial, after)
 	}
 
@@ -5269,7 +5269,7 @@ func TestMissingIDs_DoNotGrowStrMap(t *testing.T) {
 		t.Fatalf("Set: %v", err)
 	}
 
-	initial := len(db.strMap.Keys)
+	initial := testStrMapCount(t, db)
 
 	if err := db.Patch("missing", []Field{{Name: "price", Value: 1.0}}); err != nil {
 		t.Fatalf("Patch(missing): %v", err)
@@ -5284,7 +5284,7 @@ func TestMissingIDs_DoNotGrowStrMap(t *testing.T) {
 		t.Fatalf("BatchPatch: %v", err)
 	}
 
-	after := len(db.strMap.Keys)
+	after := testStrMapCount(t, db)
 
 	if after != initial {
 		t.Fatalf("expected strmap size %d, got %d", initial, after)
@@ -5301,10 +5301,10 @@ func TestReadPaths_MissingKeys_DoNotGrowStrMap(t *testing.T) {
 		t.Fatalf("Set(p2): %v", err)
 	}
 
-	initial := len(db.strMap.Keys)
+	initial := testStrMapCount(t, db)
 	assertNoGrow := func(label string) {
 		t.Helper()
-		if after := len(db.strMap.Keys); after != initial {
+		if after := testStrMapCount(t, db); after != initial {
 			t.Fatalf("%s grew strmap: initial=%d after=%d", label, initial, after)
 		}
 	}
@@ -5384,7 +5384,7 @@ func TestFailedSetPaths_DoNotGrowStrMap(t *testing.T) {
 		t.Fatalf("seed Set: %v", err)
 	}
 
-	initial := len(db.strMap.Keys)
+	initial := testStrMapCount(t, db)
 	cbErr := errors.New("before commit fail")
 	cb := func(_ *bbolt.Tx, _ string, _ *Product, _ *Product) error { return cbErr }
 
@@ -5396,7 +5396,7 @@ func TestFailedSetPaths_DoNotGrowStrMap(t *testing.T) {
 	} else if v != nil {
 		t.Fatalf("ghost-set should not persist after rollback, got %#v", v)
 	}
-	if after := len(db.strMap.Keys); after != initial {
+	if after := testStrMapCount(t, db); after != initial {
 		t.Fatalf("strmap grew after failed Set: initial=%d after=%d", initial, after)
 	}
 
@@ -5421,7 +5421,7 @@ func TestFailedSetPaths_DoNotGrowStrMap(t *testing.T) {
 	} else if v != nil {
 		t.Fatalf("ghost-many-2 should not persist after rollback, got %#v", v)
 	}
-	if after := len(db.strMap.Keys); after != initial {
+	if after := testStrMapCount(t, db); after != initial {
 		t.Fatalf("strmap grew after failed BatchSet: initial=%d after=%d", initial, after)
 	}
 }
@@ -5449,7 +5449,7 @@ func TestBatchSet_CallbackError_DoesNotGrowStrMap(t *testing.T) {
 	if err := db.Set("p1", &Product{SKU: "p1", Price: 10}); err != nil {
 		t.Fatalf("seed Set: %v", err)
 	}
-	initial := len(db.strMap.Keys)
+	initial := testStrMapCount(t, db)
 
 	cbErr := errors.New("cb fail")
 	err := db.Set("ghost-cb", &Product{SKU: "ghost-cb", Price: 11}, BeforeCommit(func(_ *bbolt.Tx, _ string, _ *Product, _ *Product) error {
@@ -5463,7 +5463,7 @@ func TestBatchSet_CallbackError_DoesNotGrowStrMap(t *testing.T) {
 	} else if v != nil {
 		t.Fatalf("ghost-cb should not persist after rollback, got %#v", v)
 	}
-	if after := len(db.strMap.Keys); after != initial {
+	if after := testStrMapCount(t, db); after != initial {
 		t.Fatalf("strmap grew after batch callback rollback: initial=%d after=%d", initial, after)
 	}
 
@@ -5479,7 +5479,7 @@ func TestBatchSet_UniqueReject_DoesNotGrowStrMap(t *testing.T) {
 	if err := db.Set("u1", &StringUniqueTestRec{Email: "a@x", Code: 1}); err != nil {
 		t.Fatalf("seed Set: %v", err)
 	}
-	initial := len(db.strMap.Keys)
+	initial := testStrMapCount(t, db)
 
 	err := db.Set("u-dup", &StringUniqueTestRec{Email: "a@x", Code: 2})
 	if err == nil || !errors.Is(err, ErrUniqueViolation) {
@@ -5490,7 +5490,7 @@ func TestBatchSet_UniqueReject_DoesNotGrowStrMap(t *testing.T) {
 	} else if v != nil {
 		t.Fatalf("u-dup should not persist after unique reject, got %#v", v)
 	}
-	if after := len(db.strMap.Keys); after != initial {
+	if after := testStrMapCount(t, db); after != initial {
 		t.Fatalf("strmap grew after batch unique reject: initial=%d after=%d", initial, after)
 	}
 
