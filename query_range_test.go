@@ -2,6 +2,7 @@ package rbi
 
 import (
 	"fmt"
+	"github.com/vapstack/rbi/internal/indexdata"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -103,7 +104,7 @@ func TestNumericRangeBucketSpanCache_LoadExtendedFullSpan(t *testing.T) {
 	cachedPrefix.Release()
 }
 
-func warmNumericRangeBucketEntry(t *testing.T, db *DB[uint64, Rec], expr qx.Expr) (*numericRangeBucketCacheEntry, overlayRange) {
+func warmNumericRangeBucketEntry(t *testing.T, db *DB[uint64, Rec], expr qx.Expr) (*numericRangeBucketCacheEntry, indexdata.OverlayRange) {
 	t.Helper()
 
 	prepared, compiled, err := prepareTestExpr(db.engine, expr)
@@ -117,7 +118,7 @@ func warmNumericRangeBucketEntry(t *testing.T, db *DB[uint64, Rec], expr qx.Expr
 		t.Fatalf("expected %s field metadata", f)
 	}
 	ov := db.engine.currentQueryViewForTests().fieldOverlay(f)
-	if !ov.hasData() {
+	if !ov.HasData() {
 		t.Fatalf("expected %s overlay data", f)
 	}
 	key, isSlice, isNil, err := db.engine.exprValueToIdxScalar(expr)
@@ -131,7 +132,7 @@ func warmNumericRangeBucketEntry(t *testing.T, db *DB[uint64, Rec], expr qx.Expr
 	if !ok {
 		t.Fatalf("rangeBoundsForOp(%v) failed", compiled.Op)
 	}
-	br := ov.rangeForBounds(rb)
+	br := ov.RangeForBounds(rb)
 	out, ok := db.engine.currentQueryViewForTests().tryEvalNumericRangeBuckets(f, fm, ov, br)
 	if !ok {
 		t.Fatalf("expected numeric range bucket path for %s", f)
@@ -353,7 +354,7 @@ func TestEvalSimple_NumericRangeBuckets_WorkWithoutPredicateCacheWhenReuseEnable
 	got1.release()
 
 	entry := requireNumericRangeBucketCacheEntry(t, db.engine.getSnapshot(), "age")
-	if entry.storage.keyCount() == 0 {
+	if entry.storage.KeyCount() == 0 {
 		t.Fatalf("expected cached numeric range entry to point at live field storage")
 	}
 
@@ -493,11 +494,11 @@ func TestNumericRangeBucketSpanCache_ReusedForNearbyBounds(t *testing.T) {
 		t.Fatalf("expected age field metadata")
 	}
 	ov := db.engine.currentQueryViewForTests().fieldOverlay("age")
-	if !ov.hasData() {
+	if !ov.HasData() {
 		t.Fatalf("expected age overlay data")
 	}
 
-	makeRange := func(v int) overlayRange {
+	makeRange := func(v int) indexdata.OverlayRange {
 		t.Helper()
 		key, isSlice, isNil, err := db.engine.exprValueToIdxScalar(qx.GTE("age", v))
 		if err != nil {
@@ -506,9 +507,9 @@ func TestNumericRangeBucketSpanCache_ReusedForNearbyBounds(t *testing.T) {
 		if isSlice || isNil {
 			t.Fatalf("unexpected scalar flags for age: isSlice=%v isNil=%v", isSlice, isNil)
 		}
-		var rb rangeBounds
-		rb.applyLo(key, true)
-		return ov.rangeForBounds(rb)
+		var rb indexdata.Bounds
+		rb.ApplyLo(key, true)
+		return ov.RangeForBounds(rb)
 	}
 
 	br1 := makeRange(2500)
@@ -570,11 +571,11 @@ func TestNumericRangeBucketSpanCache_ReusedFullSpanStillMergesEdgeBuckets(t *tes
 		t.Fatalf("expected age field metadata")
 	}
 	ov := db.engine.currentQueryViewForTests().fieldOverlay("age")
-	if !ov.hasData() {
+	if !ov.HasData() {
 		t.Fatalf("expected age overlay data")
 	}
 
-	makeRange := func(v int) overlayRange {
+	makeRange := func(v int) indexdata.OverlayRange {
 		t.Helper()
 		key, isSlice, isNil, err := db.engine.exprValueToIdxScalar(qx.GTE("age", v))
 		if err != nil {
@@ -583,9 +584,9 @@ func TestNumericRangeBucketSpanCache_ReusedFullSpanStillMergesEdgeBuckets(t *tes
 		if isSlice || isNil {
 			t.Fatalf("unexpected scalar flags for age: isSlice=%v isNil=%v", isSlice, isNil)
 		}
-		var rb rangeBounds
-		rb.applyLo(key, true)
-		return ov.rangeForBounds(rb)
+		var rb indexdata.Bounds
+		rb.ApplyLo(key, true)
+		return ov.RangeForBounds(rb)
 	}
 
 	br1 := makeRange(2500)
@@ -666,11 +667,11 @@ func TestNumericRangeBucketSpanCache_ExtendedSuffixSpanStillMatchesRange(t *test
 		t.Fatalf("expected age field metadata")
 	}
 	ov := db.engine.currentQueryViewForTests().fieldOverlay("age")
-	if !ov.hasData() {
+	if !ov.HasData() {
 		t.Fatalf("expected age overlay data")
 	}
 
-	makeRange := func(v int) overlayRange {
+	makeRange := func(v int) indexdata.OverlayRange {
 		t.Helper()
 		key, isSlice, isNil, err := db.engine.exprValueToIdxScalar(qx.GTE("age", v))
 		if err != nil {
@@ -679,9 +680,9 @@ func TestNumericRangeBucketSpanCache_ExtendedSuffixSpanStillMatchesRange(t *test
 		if isSlice || isNil {
 			t.Fatalf("unexpected scalar flags for age: isSlice=%v isNil=%v", isSlice, isNil)
 		}
-		var rb rangeBounds
-		rb.applyLo(key, true)
-		return ov.rangeForBounds(rb)
+		var rb indexdata.Bounds
+		rb.ApplyLo(key, true)
+		return ov.RangeForBounds(rb)
 	}
 
 	brNarrow := makeRange(2500)
@@ -864,7 +865,7 @@ func TestNumericRangeBucketSpanCache_RespectsCardinalityGuard(t *testing.T) {
 		t.Fatalf("expected age field metadata")
 	}
 	ov := db.engine.currentQueryViewForTests().fieldOverlay("age")
-	if !ov.hasData() {
+	if !ov.HasData() {
 		t.Fatalf("expected age overlay data")
 	}
 
@@ -875,9 +876,9 @@ func TestNumericRangeBucketSpanCache_RespectsCardinalityGuard(t *testing.T) {
 	if isSlice || isNil {
 		t.Fatalf("unexpected scalar flags for age: isSlice=%v isNil=%v", isSlice, isNil)
 	}
-	var rb rangeBounds
-	rb.applyLo(key, true)
-	br := ov.rangeForBounds(rb)
+	var rb indexdata.Bounds
+	rb.ApplyLo(key, true)
+	br := ov.RangeForBounds(rb)
 
 	out, ok := db.engine.currentQueryViewForTests().tryEvalNumericRangeBuckets("age", fm, ov, br)
 	if !ok {
@@ -922,12 +923,12 @@ func TestNumericRangeBucketSpanCache_LoadHotPathAllocsStayLowAfterWarmup(t *test
 		t.Fatalf("expected age field metadata")
 	}
 	ov := db.engine.currentQueryViewForTests().fieldOverlay("age")
-	if !ov.hasData() {
+	if !ov.HasData() {
 		t.Fatalf("expected age overlay data")
 	}
 	qv := db.engine.currentQueryViewForTests()
 
-	br := ov.rangeByRanks(2501, 3001)
+	br := ov.RangeByRanks(2501, 3001)
 	warm, ok := db.engine.currentQueryViewForTests().tryEvalNumericRangeBuckets("age", fm, ov, br)
 	if !ok {
 		t.Fatal("expected numeric range bucket warmup path")
@@ -973,11 +974,11 @@ func TestTryEvalNumericRangeBuckets_ColdBuildAllocsStayLowAfterWarmup(t *testing
 		t.Fatalf("expected age field metadata")
 	}
 	ov := db.engine.currentQueryViewForTests().fieldOverlay("age")
-	if !ov.hasData() {
+	if !ov.HasData() {
 		t.Fatalf("expected age overlay data")
 	}
 	qv := db.engine.currentQueryViewForTests()
-	br := ov.rangeByRanks(2501, 3001)
+	br := ov.RangeByRanks(2501, 3001)
 
 	warm, ok := qv.tryEvalNumericRangeBuckets("age", fm, ov, br)
 	if !ok {
@@ -1131,7 +1132,7 @@ func TestNumericRangeBucketIndex_CountBaseRangeMatchesExact(t *testing.T) {
 		t.Fatalf("expected age field metadata")
 	}
 	ov := db.engine.currentQueryViewForTests().fieldOverlay("age")
-	if !ov.hasData() {
+	if !ov.HasData() {
 		t.Fatalf("expected age field index data")
 	}
 
@@ -1150,7 +1151,7 @@ func TestNumericRangeBucketIndex_CountBaseRangeMatchesExact(t *testing.T) {
 		if !ok {
 			t.Fatalf("tryCountSnapshotNumericRange(%d,%d) failed", tc.start, tc.end)
 		}
-		_, want := overlayRangeStats(ov, ov.rangeByRanks(tc.start, tc.end))
+		_, want := ov.RangeStats(ov.RangeByRanks(tc.start, tc.end))
 		if got != want {
 			t.Fatalf("range count mismatch for [%d:%d): got=%d want=%d", tc.start, tc.end, got, want)
 		}

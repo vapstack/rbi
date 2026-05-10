@@ -3,8 +3,9 @@ package rbi
 import (
 	"math/bits"
 
+	"github.com/vapstack/rbi/internal/indexdata"
+
 	"github.com/vapstack/rbi/internal/pooled"
-	"github.com/vapstack/rbi/internal/pools"
 	"github.com/vapstack/rbi/internal/posting"
 	"github.com/vapstack/rbi/internal/qir"
 )
@@ -329,7 +330,7 @@ func (state *postsAnyFilterState) applyOwnedLargeDirect(dst posting.List, card u
 	it := dst.Iter()
 	var inline [singleInlineCap]uint64
 	inlineLen := 0
-	var singles *singleIDsBuffer
+	var singles []uint64
 	matched := uint64(0)
 	for it.HasNext() {
 		idx := it.Next()
@@ -350,32 +351,32 @@ func (state *postsAnyFilterState) applyOwnedLargeDirect(dst posting.List, card u
 				inlineLen++
 				continue
 			}
-			singles = getSingleIDsBuf()
-			singles.values = append(singles.values, inline[:]...)
+			singles = pooled.GetUint64Slice(singleChunkCap)
+			singles = append(singles, inline[:]...)
 			inlineLen = 0
 		}
-		singles.values = append(singles.values, idx)
+		singles = append(singles, idx)
 	}
 	it.Release()
 
 	if matched == 0 {
 		if singles != nil {
-			releaseSingleIDs(singles)
+			pooled.PutUint64Slice(singles)
 		}
 		dst.Release()
 		return posting.List{}, true
 	}
 	if matched == card {
 		if singles != nil {
-			releaseSingleIDs(singles)
+			pooled.PutUint64Slice(singles)
 		}
 		return dst, true
 	}
 	if matched <= posting.MidCap {
 		var out posting.List
 		if singles != nil {
-			out = posting.BuildFromSorted(singles.values)
-			releaseSingleIDs(singles)
+			out = posting.BuildFromSorted(singles)
+			pooled.PutUint64Slice(singles)
 		} else {
 			out = posting.BuildFromSorted(inline[:inlineLen])
 		}
@@ -384,8 +385,8 @@ func (state *postsAnyFilterState) applyOwnedLargeDirect(dst posting.List, card u
 	}
 
 	if singles != nil {
-		out, ok := dst.TryResetOwnedLargeFromSorted(singles.values)
-		releaseSingleIDs(singles)
+		out, ok := dst.TryResetOwnedLargeFromSorted(singles)
+		pooled.PutUint64Slice(singles)
 		return out, ok
 	}
 	return dst.TryResetOwnedLargeFromSorted(inline[:inlineLen])
@@ -534,7 +535,7 @@ var overlayRangeIterPool = pooled.Pointers[overlayRangeIter]{
 			it.curIt.Release()
 			it.curIt = nil
 		}
-		it.cur = overlayKeyCursor{}
+		it.cur = indexdata.OverlayCursor{}
 		it.single = struct {
 			set bool
 			v   uint64
@@ -544,8 +545,8 @@ var overlayRangeIterPool = pooled.Pointers[overlayRangeIter]{
 }
 
 type overlayRangePredicateState struct {
-	ov                    fieldOverlay
-	br                    overlayRange
+	ov                    indexdata.FieldOverlay
+	br                    indexdata.OverlayRange
 	probe                 overlayRangeProbe
 	reuse                 materializedPredReuse
 	neg                   bool
@@ -555,7 +556,7 @@ type overlayRangePredicateState struct {
 	materializeAfter      int
 	expectedContainsCalls int
 	containsCalls         int
-	containsMode          baseRangeContainsMode
+	containsMode          rangeContainsMode
 	probePostingFilter    bool
 	postingFilterCheap    bool
 	probeMaterializeAt    int
@@ -588,7 +589,7 @@ func (state *overlayRangePredicateState) setExpectedContainsCalls(expectedCalls 
 		expectedCalls = 1
 	}
 	state.expectedContainsCalls = expectedCalls
-	state.containsMode = chooseBaseRangeContainsMode(
+	state.containsMode = chooseRangeContainsMode(
 		state.probe.probeLen,
 		state.probe.probeEst,
 		state.expectedContainsCalls,
@@ -608,7 +609,7 @@ func (state *overlayRangePredicateState) releaseLinearPosts() {
 	if state == nil || state.linearPostsBuf == nil {
 		return
 	}
-	pools.PutPostingSlice(state.linearPostsBuf)
+	posting.PutSlice(state.linearPostsBuf)
 	state.linearPostsBuf = nil
 }
 
@@ -627,7 +628,7 @@ func (state *overlayRangePredicateState) materializeRange() posting.List {
 			return state.rangeIDs
 		}
 	}
-	state.rangeIDs = overlayUnionRanges(state.ov, state.br, overlayRange{})
+	state.rangeIDs = state.ov.UnionRangePostings(state.br, indexdata.OverlayRange{})
 	state.rangeMaterialized = true
 	state.releaseLinearPosts()
 	if !state.probe.useComplement {
@@ -643,11 +644,11 @@ func (state *overlayRangePredicateState) ensureLinearPosts() []posting.List {
 	if state.linearPostsBuf != nil {
 		return state.linearPostsBuf
 	}
-	state.linearPostsBuf = pools.GetPostingSlice(state.bucketCount)
+	state.linearPostsBuf = posting.GetSlice(state.bucketCount)
 	for i := 0; i < state.probe.spanCnt; i++ {
-		cur := state.ov.newCursor(state.probe.spans[i], false)
+		cur := state.ov.NewCursor(state.probe.spans[i], false)
 		for {
-			_, ids, ok := cur.next()
+			_, ids, ok := cur.Next()
 			if !ok {
 				break
 			}
@@ -664,7 +665,7 @@ func (state *overlayRangePredicateState) linearContains(idx uint64) bool {
 	if state == nil {
 		return false
 	}
-	if state.expectedContainsCalls <= 1 || state.containsMode != baseRangeContainsLinear {
+	if state.expectedContainsCalls <= 1 || state.containsMode != rangeContainsLinear {
 		return state.probe.linearContains(idx)
 	}
 	posts := state.ensureLinearPosts()
@@ -691,11 +692,11 @@ func (state *overlayRangePredicateState) materializeProbe() posting.List {
 		state.releaseLinearPosts()
 		return posting.List{}
 	}
-	var second overlayRange
+	var second indexdata.OverlayRange
 	if state.probe.spanCnt > 1 {
 		second = state.probe.spans[1]
 	}
-	state.probeIDs = overlayUnionRanges(state.ov, state.probe.spans[0], second)
+	state.probeIDs = state.ov.UnionRangePostings(state.probe.spans[0], second)
 	state.probeMaterialized = true
 	state.releaseLinearPosts()
 	return state.probeIDs
@@ -715,11 +716,11 @@ func (state *overlayRangePredicateState) rawHit(idx uint64) bool {
 		return state.linearContains(idx)
 	}
 	state.containsCalls++
-	if state.containsMode == baseRangeContainsLinear && state.materializeAfter > 0 &&
+	if state.containsMode == rangeContainsLinear && state.materializeAfter > 0 &&
 		state.containsCalls >= state.materializeAfter {
 		state.growContainsMode(state.containsCalls)
 	}
-	if state.containsMode == baseRangeContainsPosting &&
+	if state.containsMode == rangeContainsPosting &&
 		state.materializeAfter > 0 &&
 		state.containsCalls >= state.materializeAfter {
 		return state.materializeProbe().Contains(idx)
@@ -835,48 +836,8 @@ func (state *overlayRangePredicateState) newIter() posting.Iterator {
 		return nil
 	}
 	it := overlayRangeIterPool.Get()
-	it.cur = state.ov.newCursor(state.br, false)
+	it.cur = state.ov.NewCursor(state.br, false)
 	return it
-}
-
-type baseRangePredicateState struct {
-	probe                      baseRangeProbe
-	reuse                      materializedPredReuse
-	keepProbeHits              bool
-	neg                        bool
-	linearContainsMax          int
-	hashSetAfter               int
-	materializeAfter           int
-	expectedContainsCalls      int
-	postingFilterMaterializeAt int
-	containsMode               baseRangeContainsMode
-
-	containsCalls      int
-	postingFilterCalls int
-	hasSet             bool
-	set                u64set
-	linearPostsBuf     []posting.List
-	ids                posting.List
-}
-
-var baseRangePredicateStatePool = pooled.Pointers[baseRangePredicateState]{
-	Cleanup: func(state *baseRangePredicateState) {
-		if state.hasSet {
-			releaseU64Set(&state.set)
-			state.hasSet = false
-		}
-		state.releaseLinearPosts()
-		state.ids.Release()
-	},
-	Clear: true,
-}
-
-func (state *baseRangePredicateState) releaseLinearPosts() {
-	if state == nil || state.linearPostsBuf == nil {
-		return
-	}
-	pools.PutPostingSlice(state.linearPostsBuf)
-	state.linearPostsBuf = nil
 }
 
 func tryShareMaterializedPredOnSnapshot(snap *indexSnapshot, cacheKey materializedPredKey, ids posting.List) posting.List {
@@ -897,197 +858,6 @@ func tryShareMaterializedPredOnSnapshot(snap *indexSnapshot, cacheKey materializ
 		return next
 	}
 	return ids
-}
-
-func (state *baseRangePredicateState) materialize() posting.List {
-	if state == nil {
-		return posting.List{}
-	}
-	if !state.ids.IsEmpty() {
-		return state.ids
-	}
-	if cached, ok := state.reuse.load(); ok {
-		state.ids = cached
-		return state.ids
-	}
-	if state.probe.singletonHeavy() {
-		state.ids = materializeBaseRangeProbeFast(state.probe)
-	} else {
-		state.ids = materializePostingUnionBaseRange(state.probe)
-	}
-	state.ids = state.reuse.share(state.ids)
-	return state.ids
-}
-
-func (state *baseRangePredicateState) setExpectedContainsCalls(expectedCalls int) {
-	if state == nil {
-		return
-	}
-	if expectedCalls <= 0 {
-		expectedCalls = state.materializeAfter
-	}
-	if expectedCalls <= 0 {
-		expectedCalls = 1
-	}
-	state.expectedContainsCalls = expectedCalls
-	state.containsMode = chooseBaseRangeContainsMode(
-		state.probe.probeLen,
-		state.probe.probeEst,
-		state.expectedContainsCalls,
-		state.hashSetAfter,
-		state.materializeAfter,
-	)
-}
-
-func (state *baseRangePredicateState) growContainsMode(expectedCalls int) {
-	if state == nil || expectedCalls <= state.expectedContainsCalls {
-		return
-	}
-	state.setExpectedContainsCalls(expectedCalls)
-}
-
-func materializePostingUnionBaseRange(probe baseRangeProbe) posting.List {
-	if probe.probeLen == 0 {
-		return posting.List{}
-	}
-	postsBuf := pools.GetPostingSlice(probe.probeLen)
-	postsBuf = probe.appendPostings(postsBuf)
-	out := materializePostingUnionBufOwned(postsBuf)
-	pools.PutPostingSlice(postsBuf)
-	return out
-}
-
-func (state *baseRangePredicateState) ensureLinearPosts() []posting.List {
-	if state == nil {
-		return nil
-	}
-	if state.linearPostsBuf != nil {
-		return state.linearPostsBuf
-	}
-	state.linearPostsBuf = pools.GetPostingSlice(state.probe.probeLen)
-	state.linearPostsBuf = state.probe.appendPostings(state.linearPostsBuf)
-	return state.linearPostsBuf
-}
-
-func (state *baseRangePredicateState) linearContains(idx uint64) bool {
-	if state == nil {
-		return false
-	}
-	if state.expectedContainsCalls <= 1 || state.containsMode != baseRangeContainsLinear {
-		return state.probe.linearContains(idx)
-	}
-	posts := state.ensureLinearPosts()
-	for i := 0; i < len(posts); i++ {
-		if posts[i].Contains(idx) {
-			return true
-		}
-	}
-	return false
-}
-
-func (state *baseRangePredicateState) rawHit(idx uint64) bool {
-	if state == nil {
-		return false
-	}
-	if state.probe.probeLen <= state.linearContainsMax {
-		return state.linearContains(idx)
-	}
-	if state.hasSet {
-		return state.set.Has(idx)
-	}
-	if !state.ids.IsEmpty() {
-		return state.ids.Contains(idx)
-	}
-
-	state.containsCalls++
-	if state.containsMode == baseRangeContainsLinear {
-		nextBuildAfter := state.materializeAfter
-		if state.hashSetAfter > 0 && (nextBuildAfter == 0 || state.hashSetAfter < nextBuildAfter) {
-			nextBuildAfter = state.hashSetAfter
-		}
-		if nextBuildAfter > 0 && state.containsCalls >= nextBuildAfter {
-			state.growContainsMode(state.containsCalls)
-		}
-	}
-	switch state.containsMode {
-	case baseRangeContainsHashSet:
-		if state.containsCalls >= state.hashSetAfter {
-			capHint := int(state.probe.probeEst)
-			if capHint < 64 {
-				capHint = 64
-			}
-			state.set = newU64Set(capHint)
-			state.hasSet = true
-			state.probe.addToSet(&state.set)
-			return state.set.Has(idx)
-		}
-	case baseRangeContainsPosting:
-		if state.containsCalls >= state.materializeAfter && state.probe.probeLen > state.linearContainsMax {
-			return state.materialize().Contains(idx)
-		}
-	}
-
-	return state.linearContains(idx)
-}
-
-func (state *baseRangePredicateState) matches(idx uint64) bool {
-	hit := state.rawHit(idx)
-	if state.keepProbeHits {
-		return hit
-	}
-	return !hit
-}
-
-func (state *baseRangePredicateState) countBucket(bucket posting.List) (uint64, bool) {
-	if state == nil {
-		return 0, false
-	}
-	in, ok := state.probe.countBucket(bucket)
-	if !ok {
-		return 0, false
-	}
-	if !state.neg {
-		return in, true
-	}
-	bc := bucket.Cardinality()
-	if in >= bc {
-		return 0, true
-	}
-	return bc - in, true
-}
-
-func (state *baseRangePredicateState) applyToPosting(dst posting.List) (posting.List, bool) {
-	if dst.IsEmpty() {
-		return dst, true
-	}
-
-	state.postingFilterCalls++
-	forceMaterialize := state.postingFilterCalls >= state.postingFilterMaterializeAt
-	if !forceMaterialize {
-		return applyRangeProbePostingFilter(dst, state.keepProbeHits, state.probe.probeLen, state.probe)
-	}
-
-	ids := state.materialize()
-	if ids.IsEmpty() {
-		if state.keepProbeHits {
-			dst.Release()
-			dst = posting.List{}
-		}
-		return dst, true
-	}
-	if state.keepProbeHits {
-		dst = dst.BuildAnd(ids)
-	} else {
-		dst = dst.BuildAndNot(ids)
-	}
-	return dst, true
-}
-
-func (state *baseRangePredicateState) newIter() posting.Iterator {
-	if state == nil || state.neg {
-		return nil
-	}
-	return newRangeIter(state.probe.s, state.probe.start, state.probe.end)
 }
 
 /**/
@@ -1184,14 +954,14 @@ func (reuse materializedPredReuse) canSecondHitShareModeratelyOversizedEstimate(
 	return est <= limit*mul
 }
 
-func (qv *queryView) materializedPredKeyForExactScalarRange(field string, bounds rangeBounds) materializedPredKey {
+func (qv *queryView) materializedPredKeyForExactScalarRange(field string, bounds indexdata.Bounds) materializedPredKey {
 	if qv.snap.matPredCacheMaxEntries <= 0 {
 		return materializedPredKey{}
 	}
 	return materializedPredKeyForExactScalarRange(field, bounds)
 }
 
-func (qv *queryView) materializedPredComplementKeyForExactScalarRange(field string, bounds rangeBounds) materializedPredKey {
+func (qv *queryView) materializedPredComplementKeyForExactScalarRange(field string, bounds indexdata.Bounds) materializedPredKey {
 	if qv.snap.matPredCacheMaxEntries <= 0 {
 		return materializedPredKey{}
 	}
@@ -1206,35 +976,9 @@ const (
 	singleInlineCap      = 16
 )
 
-var singleIDsPool = pooled.Pointers[singleIDsBuffer]{
-	New: func() *singleIDsBuffer {
-		return &singleIDsBuffer{
-			values: make([]uint64, 0, singleChunkCap),
-		}
-	},
-	Cleanup: func(buf *singleIDsBuffer) {
-		buf.values = buf.values[:0]
-	},
-}
-
-type singleIDsBuffer struct {
-	values []uint64
-}
-
-func getSingleIDsBuf() *singleIDsBuffer {
-	return singleIDsPool.Get()
-}
-
-func releaseSingleIDs(buf *singleIDsBuffer) {
-	if buf == nil || cap(buf.values) != singleChunkCap {
-		return
-	}
-	singleIDsPool.Put(buf)
-}
-
 type postingUnionBuilder struct {
 	ids           posting.List
-	singles       *singleIDsBuffer
+	singles       []uint64
 	inlineSingles [singleInlineCap]uint64
 	inlineLen     int
 	batchSingles  bool
@@ -1250,11 +994,11 @@ func newPostingUnionBuilder(batchSingles bool) postingUnionBuilder {
 
 func (b *postingUnionBuilder) flushSingles() {
 	if b.singles != nil {
-		if len(b.singles.values) == 0 {
+		if len(b.singles) == 0 {
 			return
 		}
-		b.ids = b.ids.BuildAddedMany(b.singles.values)
-		b.singles.values = b.singles.values[:0]
+		b.ids = b.ids.BuildAddedMany(b.singles)
+		b.singles = b.singles[:0]
 		return
 	}
 	if b.inlineLen == 0 {
@@ -1276,12 +1020,12 @@ func (b *postingUnionBuilder) addSingle(idx uint64) {
 			b.inlineLen++
 			return
 		}
-		b.singles = getSingleIDsBuf()
-		b.singles.values = append(b.singles.values, b.inlineSingles[:]...)
+		b.singles = pooled.GetUint64Slice(singleChunkCap)
+		b.singles = append(b.singles, b.inlineSingles[:]...)
 		b.inlineLen = 0
 	}
-	b.singles.values = append(b.singles.values, idx)
-	if len(b.singles.values) == cap(b.singles.values) {
+	b.singles = append(b.singles, idx)
+	if len(b.singles) == cap(b.singles) {
 		b.flushSingles()
 	}
 }
@@ -1314,16 +1058,16 @@ func (b *postingUnionBuilder) addPosting(ids posting.List) {
 func (b *postingUnionBuilder) finish(optimize bool) posting.List {
 	b.flushSingles()
 	out := b.ids
+	if out.IsBorrowed() {
+		out = out.Clone()
+	}
 	b.ids = posting.List{}
 	b.inlineLen = 0
 	if b.singles != nil {
-		releaseSingleIDs(b.singles)
+		pooled.PutUint64Slice(b.singles)
 		b.singles = nil
 	}
 	if optimize {
-		if out.IsBorrowed() {
-			return out
-		}
 		return out.BuildOptimized()
 	}
 	return out
@@ -1334,7 +1078,7 @@ func (b *postingUnionBuilder) release() {
 	b.ids = posting.List{}
 	b.inlineLen = 0
 	if b.singles != nil {
-		releaseSingleIDs(b.singles)
+		pooled.PutUint64Slice(b.singles)
 		b.singles = nil
 	}
 }
@@ -1342,7 +1086,7 @@ func (b *postingUnionBuilder) release() {
 type postingSetBuilder struct {
 	ids           posting.List
 	seen          u64set
-	singles       *singleIDsBuffer
+	singles       []uint64
 	inlineSingles [singleInlineCap]uint64
 	inlineLen     int
 	count         uint64
@@ -1405,11 +1149,11 @@ func normalizePostingSetCapHint(capHint uint64) int {
 
 func (b *postingSetBuilder) flushSingles() {
 	if b.singles != nil {
-		if len(b.singles.values) == 0 {
+		if len(b.singles) == 0 {
 			return
 		}
-		b.ids = b.ids.BuildAddedMany(b.singles.values)
-		b.singles.values = b.singles.values[:0]
+		b.ids = b.ids.BuildAddedMany(b.singles)
+		b.singles = b.singles[:0]
 		return
 	}
 	if b.inlineLen == 0 {
@@ -1435,12 +1179,12 @@ func (b *postingSetBuilder) addChecked(idx uint64) bool {
 			b.inlineLen++
 			return true
 		}
-		b.singles = getSingleIDsBuf()
-		b.singles.values = append(b.singles.values, b.inlineSingles[:]...)
+		b.singles = pooled.GetUint64Slice(singleChunkCap)
+		b.singles = append(b.singles, b.inlineSingles[:]...)
 		b.inlineLen = 0
 	}
-	b.singles.values = append(b.singles.values, idx)
-	if len(b.singles.values) == cap(b.singles.values) {
+	b.singles = append(b.singles, idx)
+	if len(b.singles) == cap(b.singles) {
 		b.flushSingles()
 	}
 	return true
@@ -1457,7 +1201,7 @@ func (b *postingSetBuilder) finish(optimize bool) posting.List {
 	releaseU64Set(&b.seen)
 	b.inlineLen = 0
 	if b.singles != nil {
-		releaseSingleIDs(b.singles)
+		pooled.PutUint64Slice(b.singles)
 		b.singles = nil
 	}
 	b.count = 0
@@ -1473,7 +1217,7 @@ func (b *postingSetBuilder) release() {
 	releaseU64Set(&b.seen)
 	b.inlineLen = 0
 	if b.singles != nil {
-		releaseSingleIDs(b.singles)
+		pooled.PutUint64Slice(b.singles)
 		b.singles = nil
 	}
 	b.count = 0

@@ -887,31 +887,31 @@ func TestIndexOptions_InvalidReferencesFailFast(t *testing.T) {
 func TestReadFieldRejectsOutOfRangePersistedIndexKind(t *testing.T) {
 	var buf bytes.Buffer
 	writer := bufio.NewWriter(&buf)
-	if err := writeString(writer, "field"); err != nil {
+	if err := writeSidecarString(writer, "field"); err != nil {
 		t.Fatalf("write name: %v", err)
 	}
-	if err := writeBool(writer, false); err != nil {
+	if err := writeSidecarBool(writer, false); err != nil {
 		t.Fatalf("write unique: %v", err)
 	}
-	if err := writeUvarint(writer, 256); err != nil {
+	if err := writeSidecarUvarint(writer, 256); err != nil {
 		t.Fatalf("write index kind: %v", err)
 	}
-	if err := writeUvarint(writer, uint64(reflect.Int)); err != nil {
+	if err := writeSidecarUvarint(writer, uint64(reflect.Int)); err != nil {
 		t.Fatalf("write kind: %v", err)
 	}
-	if err := writeBool(writer, false); err != nil {
+	if err := writeSidecarBool(writer, false); err != nil {
 		t.Fatalf("write ptr: %v", err)
 	}
-	if err := writeBool(writer, false); err != nil {
+	if err := writeSidecarBool(writer, false); err != nil {
 		t.Fatalf("write slice: %v", err)
 	}
-	if err := writeBool(writer, false); err != nil {
+	if err := writeSidecarBool(writer, false); err != nil {
 		t.Fatalf("write use vi: %v", err)
 	}
-	if err := writeString(writer, "field"); err != nil {
+	if err := writeSidecarString(writer, "field"); err != nil {
 		t.Fatalf("write db name: %v", err)
 	}
-	if err := writeUvarint(writer, 0); err != nil {
+	if err := writeSidecarUvarint(writer, 0); err != nil {
 		t.Fatalf("write index len: %v", err)
 	}
 	if err := writer.Flush(); err != nil {
@@ -976,37 +976,37 @@ func TestIndexTags_MeasureMetadataIsSeparateFromOrdinaryIndex(t *testing.T) {
 		t.Fatalf("Set measure record: %v", err)
 	}
 	acc := db.engine.measureFieldMap["amount"]
-	if got, ok := db.engine.getSnapshot().measure.Get(acc.ordinal).lookup(1); !ok || got != 42 {
+	if got, ok := db.engine.getSnapshot().measure[acc.ordinal].Lookup(1); !ok || got != 42 {
 		t.Fatalf("measure storage lookup=(%d,%v) want (42,true)", got, ok)
 	}
 	if err := db.Set(2, &measureTaggedRec{Status: "ok", Amount: 100}); err != nil {
 		t.Fatalf("Set second measure record: %v", err)
 	}
-	if got, ok := db.engine.getSnapshot().measure.Get(acc.ordinal).lookup(2); !ok || got != 100 {
+	if got, ok := db.engine.getSnapshot().measure[acc.ordinal].Lookup(2); !ok || got != 100 {
 		t.Fatalf("measure storage lookup id=2=(%d,%v) want (100,true)", got, ok)
 	}
 	if err := db.Set(1, &measureTaggedRec{Status: "ok", Amount: 43}); err != nil {
 		t.Fatalf("Update measure record: %v", err)
 	}
-	if got, ok := db.engine.getSnapshot().measure.Get(acc.ordinal).lookup(1); !ok || got != 43 {
+	if got, ok := db.engine.getSnapshot().measure[acc.ordinal].Lookup(1); !ok || got != 43 {
 		t.Fatalf("measure storage update lookup=(%d,%v) want (43,true)", got, ok)
 	}
 	if err := db.Patch(2, []Field{{Name: "amount", Value: int64(55)}}); err != nil {
 		t.Fatalf("Patch measure record: %v", err)
 	}
-	if got, ok := db.engine.getSnapshot().measure.Get(acc.ordinal).lookup(2); !ok || got != 55 {
+	if got, ok := db.engine.getSnapshot().measure[acc.ordinal].Lookup(2); !ok || got != 55 {
 		t.Fatalf("measure storage patch lookup=(%d,%v) want (55,true)", got, ok)
 	}
 	if err := db.Delete(1); err != nil {
 		t.Fatalf("Delete measure record: %v", err)
 	}
-	if got, ok := db.engine.getSnapshot().measure.Get(acc.ordinal).lookup(1); ok {
+	if got, ok := db.engine.getSnapshot().measure[acc.ordinal].Lookup(1); ok {
 		t.Fatalf("deleted measure storage lookup=(%d,%v) want missing", got, ok)
 	}
 	if err := db.RebuildIndex(); err != nil {
 		t.Fatalf("RebuildIndex: %v", err)
 	}
-	if got, ok := db.engine.getSnapshot().measure.Get(acc.ordinal).lookup(2); !ok || got != 55 {
+	if got, ok := db.engine.getSnapshot().measure[acc.ordinal].Lookup(2); !ok || got != 55 {
 		t.Fatalf("rebuilt measure storage lookup=(%d,%v) want (55,true)", got, ok)
 	}
 	if _, err := db.QueryKeys(qx.Query(qx.EQ("amount", int64(100)))); err == nil {
@@ -1047,13 +1047,13 @@ func TestIndexTags_MeasureOnlyDBKeepsSnapshotMode(t *testing.T) {
 		t.Fatalf("Set measure-only record: %v", err)
 	}
 	acc := db.engine.measureFieldMap["amount"]
-	if got, ok := db.engine.getSnapshot().measure.Get(acc.ordinal).lookup(1); !ok || got != 7 {
+	if got, ok := db.engine.getSnapshot().measure[acc.ordinal].Lookup(1); !ok || got != 7 {
 		t.Fatalf("measure-only storage lookup=(%d,%v) want (7,true)", got, ok)
 	}
 	if err := db.Set(1, &measureOnlyRec{Amount: 8}); err != nil {
 		t.Fatalf("Update measure-only record: %v", err)
 	}
-	if got, ok := db.engine.getSnapshot().measure.Get(acc.ordinal).lookup(1); !ok || got != 8 {
+	if got, ok := db.engine.getSnapshot().measure[acc.ordinal].Lookup(1); !ok || got != 8 {
 		t.Fatalf("measure-only storage update lookup=(%d,%v) want (8,true)", got, ok)
 	}
 }

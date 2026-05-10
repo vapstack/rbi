@@ -2,11 +2,9 @@ package rbi
 
 import (
 	"fmt"
-	"strings"
 
-	"github.com/vapstack/rbi/internal/keycodec"
+	"github.com/vapstack/rbi/internal/indexdata"
 	"github.com/vapstack/rbi/internal/pooled"
-	"github.com/vapstack/rbi/internal/pools"
 	"github.com/vapstack/rbi/internal/posting"
 	"github.com/vapstack/rbi/internal/qir"
 )
@@ -79,18 +77,18 @@ func (qv *queryView) tryOrderBasicNoFilterWithLimit(q *qir.Shape, trace *queryTr
 		return nil, false, nil
 	}
 
-	fullBounds := rangeBounds{has: true}
+	fullBounds := indexdata.Bounds{Has: true}
 	nilTailField := orderNilTailField(fm, orderField, fullBounds)
 	ov := qv.fieldOverlayForOrder(order)
-	if !ov.hasData() && nilTailField == "" {
+	if !ov.HasData() && nilTailField == "" {
 		if !qv.hasIndexedFieldForOrder(order) {
 			return nil, false, nil
 		}
 		return nil, true, nil
 	}
 
-	br := ov.rangeForBounds(fullBounds)
-	if overlayRangeEmpty(br) && nilTailField == "" {
+	br := ov.RangeForBounds(fullBounds)
+	if br.Empty() && nilTailField == "" {
 		return nil, true, nil
 	}
 
@@ -140,27 +138,28 @@ func emitAcceptedPostingNoOrder(cursor *queryCursor, ids posting.List, examined 
 	if ids.IsEmpty() {
 		return false
 	}
-	addExamined := func(n uint64) {
-		if examined != nil {
-			*examined += n
-		}
-	}
 	if cursor.skip > 0 {
 		card := ids.Cardinality()
 		if cursor.skip >= card {
-			addExamined(card)
+			if examined != nil {
+				*examined += card
+			}
 			cursor.skip -= card
 			return false
 		}
 	}
 	if idx, ok := ids.TrySingle(); ok {
-		addExamined(1)
+		if examined != nil {
+			*examined++
+		}
 		return cursor.emit(idx)
 	}
 	it := ids.Iter()
 	defer it.Release()
 	for it.HasNext() {
-		addExamined(1)
+		if examined != nil {
+			*examined++
+		}
 		if cursor.emit(it.Next()) {
 			return true
 		}
@@ -494,7 +493,7 @@ func orderPredicatesEmitPostingBufReader(
 
 func releaseOrderBasicResidualState(preds predicateSet, activeBuf []int) {
 	if activeBuf != nil {
-		pools.PutIntSlice(activeBuf)
+		pooled.PutIntSlice(activeBuf)
 	}
 	preds.Release()
 }
@@ -791,8 +790,8 @@ func (qv *queryView) runOrderBasicBaseQuery(
 	baseOps []qir.Expr,
 	needWindow int,
 	order qir.Order,
-	ov fieldOverlay,
-	br overlayRange,
+	ov indexdata.FieldOverlay,
+	br indexdata.OverlayRange,
 	nilTailField string,
 	base postingResult,
 	residualPreds predicateReader,
@@ -814,14 +813,14 @@ func (qv *queryView) runOrderBasicBaseQuery(
 
 	var tmp posting.List
 
-	keyCur := ov.newCursor(br, order.Desc)
+	keyCur := ov.NewCursor(br, order.Desc)
 	var (
 		examined  uint64
 		scanWidth uint64
 	)
 	nilOV := qv.nilFieldOverlay(nilTailField)
 	for {
-		_, ids, ok := keyCur.next()
+		_, ids, ok := keyCur.Next()
 		if !ok {
 			break
 		}
@@ -852,7 +851,7 @@ func (qv *queryView) runOrderBasicBaseQuery(
 	}
 
 	if nilTailField != "" {
-		ids := nilOV.lookupPostingRetained(nilIndexEntryKey)
+		ids := nilOV.LookupPostingRetained(nilIndexEntryKey)
 		if !ids.IsEmpty() {
 			scanWidth++
 			stop, nextTmp := orderBasicEmitFilteredPostingReader(
@@ -892,8 +891,8 @@ func (qv *queryView) runOrderBasicBaseQueryBuf(
 	baseOps []qir.Expr,
 	needWindow int,
 	order qir.Order,
-	ov fieldOverlay,
-	br overlayRange,
+	ov indexdata.FieldOverlay,
+	br indexdata.OverlayRange,
 	nilTailField string,
 	base postingResult,
 	residualPreds predicateReader,
@@ -915,14 +914,14 @@ func (qv *queryView) runOrderBasicBaseQueryBuf(
 
 	var tmp posting.List
 
-	keyCur := ov.newCursor(br, order.Desc)
+	keyCur := ov.NewCursor(br, order.Desc)
 	var (
 		examined  uint64
 		scanWidth uint64
 	)
 	nilOV := qv.nilFieldOverlay(nilTailField)
 	for {
-		_, ids, ok := keyCur.next()
+		_, ids, ok := keyCur.Next()
 		if !ok {
 			break
 		}
@@ -953,7 +952,7 @@ func (qv *queryView) runOrderBasicBaseQueryBuf(
 	}
 
 	if nilTailField != "" {
-		ids := nilOV.lookupPostingRetained(nilIndexEntryKey)
+		ids := nilOV.LookupPostingRetained(nilIndexEntryKey)
 		if !ids.IsEmpty() {
 			scanWidth++
 			stop, nextTmp := orderBasicEmitFilteredPostingBufReader(
@@ -987,193 +986,33 @@ func (qv *queryView) runOrderBasicBaseQueryBuf(
 	return cursor.out, true, nil
 }
 
-type rangeBounds struct {
-	has bool
-
-	empty bool
-
-	hasLo     bool
-	loKey     string
-	loIndex   keycodec.IndexKey
-	loNumeric bool
-	loInc     bool
-
-	hasHi     bool
-	hiKey     string
-	hiIndex   keycodec.IndexKey
-	hiNumeric bool
-	hiInc     bool
-
-	hasPrefix bool
-	prefix    string
-}
-
-func compareRangeBoundKeys(
-	aKey string,
-	aIndex keycodec.IndexKey,
-	aNumeric bool,
-	bKey string,
-	bIndex keycodec.IndexKey,
-	bNumeric bool,
-) int {
-	if aNumeric != bNumeric {
-		panic("rbi: mixed range bound key representations")
-	}
-	if aNumeric {
-		return keycodec.Compare(aIndex, bIndex)
-	}
-	return strings.Compare(aKey, bKey)
-}
-
-func (rb *rangeBounds) setEmpty() {
-	rb.has = true
-	rb.empty = true
-}
-
-func (rb *rangeBounds) normalize() {
-	if rb.empty {
-		return
-	}
-
-	if rb.hasLo && rb.hasHi {
-		cmp := compareRangeBoundKeys(rb.loKey, rb.loIndex, rb.loNumeric, rb.hiKey, rb.hiIndex, rb.hiNumeric)
-		if cmp > 0 || (cmp == 0 && (!rb.loInc || !rb.hiInc)) {
-			rb.setEmpty()
-			return
-		}
-	}
-
-	if !rb.hasPrefix {
-		return
-	}
-
-	if rb.hasHi {
-		cmp := strings.Compare(rb.hiKey, rb.prefix)
-		if rb.hiNumeric {
-			cmp = keycodec.CompareString(rb.hiIndex, rb.prefix)
-		}
-		if cmp < 0 || (cmp == 0 && !rb.hiInc) {
-			rb.setEmpty()
-			return
-		}
-	}
-
-	if rb.hasLo {
-		if upper, ok := keycodec.NewPrefixUpperBound(rb.prefix); ok {
-			cmp := keycodec.CompareStringPrefixUpperBound(rb.loKey, upper)
-			if rb.loNumeric {
-				cmp = keycodec.ComparePrefixUpperBound(rb.loIndex, upper)
-			}
-			if cmp >= 0 {
-				rb.setEmpty()
-			}
-		}
-	}
-}
-
-func (rb *rangeBounds) applyLo(key string, inc bool) {
-	if rb.empty {
-		return
-	}
-	if !rb.hasLo || rb.loKey < key || (rb.loKey == key && !rb.loInc && inc) {
-		rb.hasLo = true
-		rb.loKey = key
-		rb.loIndex = keycodec.IndexKey{}
-		rb.loNumeric = false
-		rb.loInc = inc
-	}
-	rb.normalize()
-}
-
-func (rb *rangeBounds) applyLoIndex(key keycodec.IndexKey, inc bool) {
-	if rb.empty {
-		return
-	}
-	if !rb.hasLo || keycodec.Compare(rb.loIndex, key) < 0 || (keycodec.Compare(rb.loIndex, key) == 0 && !rb.loInc && inc) {
-		rb.hasLo = true
-		rb.loKey = ""
-		rb.loIndex = key
-		rb.loNumeric = true
-		rb.loInc = inc
-	}
-	rb.normalize()
-}
-
-func (rb *rangeBounds) applyHi(key string, inc bool) {
-	if rb.empty {
-		return
-	}
-	if !rb.hasHi || rb.hiKey > key || (rb.hiKey == key && !rb.hiInc && inc) {
-		rb.hasHi = true
-		rb.hiKey = key
-		rb.hiIndex = keycodec.IndexKey{}
-		rb.hiNumeric = false
-		rb.hiInc = inc
-	}
-	rb.normalize()
-}
-
-func (rb *rangeBounds) applyHiIndex(key keycodec.IndexKey, inc bool) {
-	if rb.empty {
-		return
-	}
-	if !rb.hasHi || keycodec.Compare(rb.hiIndex, key) > 0 || (keycodec.Compare(rb.hiIndex, key) == 0 && !rb.hiInc && inc) {
-		rb.hasHi = true
-		rb.hiKey = ""
-		rb.hiIndex = key
-		rb.hiNumeric = true
-		rb.hiInc = inc
-	}
-	rb.normalize()
-}
-
-func (rb *rangeBounds) applyPrefix(prefix string) {
-	if rb.empty {
-		return
-	}
-	if rb.hasPrefix {
-		switch {
-		case strings.HasPrefix(rb.prefix, prefix):
-		case strings.HasPrefix(prefix, rb.prefix):
-			rb.prefix = prefix
-		default:
-			rb.setEmpty()
-			return
-		}
-	} else {
-		rb.hasPrefix = true
-		rb.prefix = prefix
-	}
-	rb.normalize()
-}
-
-func (rb *rangeBounds) applyOp(op qir.Op, key string) bool {
-	rb.has = true
+func applyRangeOp(rb *indexdata.Bounds, op qir.Op, key string) bool {
+	rb.Has = true
 	switch op {
 	case qir.OpGT:
-		rb.applyLo(key, false)
+		rb.ApplyLo(key, false)
 	case qir.OpGTE:
-		rb.applyLo(key, true)
+		rb.ApplyLo(key, true)
 	case qir.OpLT:
-		rb.applyHi(key, false)
+		rb.ApplyHi(key, false)
 	case qir.OpLTE:
-		rb.applyHi(key, true)
+		rb.ApplyHi(key, true)
 	case qir.OpEQ:
-		rb.applyLo(key, true)
-		rb.applyHi(key, true)
+		rb.ApplyLo(key, true)
+		rb.ApplyHi(key, true)
 	case qir.OpPREFIX:
-		rb.applyPrefix(key)
+		rb.ApplyPrefix(key)
 	default:
 		return false
 	}
 	return true
 }
 
-func orderNilTailField(fm *field, field string, bounds rangeBounds) string {
+func orderNilTailField(fm *field, field string, bounds indexdata.Bounds) string {
 	if fm == nil || !fm.Ptr || field == "" {
 		return ""
 	}
-	if bounds.empty || bounds.hasLo || bounds.hasHi || bounds.hasPrefix {
+	if bounds.Empty || bounds.HasLo || bounds.HasHi || bounds.HasPrefix {
 		return ""
 	}
 	return field
@@ -1228,7 +1067,7 @@ func (qv *queryView) validateOrderBasicSimpleExpr(e qir.Expr) error {
 	}
 	fieldName := qv.engine.fieldNameByOrdinal(e.FieldOrdinal)
 	ov := qv.fieldOverlayForExpr(e)
-	if !ov.hasData() && !qv.hasIndexedFieldForExpr(e) {
+	if !ov.HasData() && !qv.hasIndexedFieldForExpr(e) {
 		return fmt.Errorf("no index for field: %v", fieldName)
 	}
 
@@ -1251,7 +1090,7 @@ func (qv *queryView) validateOrderBasicSimpleExpr(e qir.Expr) error {
 		}
 		valsBuf, isSlice, _, err := qv.exprValueToDistinctIdxBuf(e)
 		if valsBuf != nil {
-			defer pools.PutStringSlice(valsBuf)
+			defer pooled.PutStringSlice(valsBuf)
 		}
 		if err != nil {
 			return err
@@ -1267,7 +1106,7 @@ func (qv *queryView) validateOrderBasicSimpleExpr(e qir.Expr) error {
 		}
 		valsBuf, isSlice, hasNil, err := qv.exprValueToDistinctIdxBuf(e)
 		if valsBuf != nil {
-			defer pools.PutStringSlice(valsBuf)
+			defer pooled.PutStringSlice(valsBuf)
 		}
 		if err != nil {
 			return err
@@ -1287,7 +1126,7 @@ func (qv *queryView) validateOrderBasicSimpleExpr(e qir.Expr) error {
 		}
 		valsBuf, isSlice, _, err := qv.exprValueToDistinctIdxBuf(e)
 		if valsBuf != nil {
-			defer pools.PutStringSlice(valsBuf)
+			defer pooled.PutStringSlice(valsBuf)
 		}
 		if err != nil {
 			return err
@@ -1325,56 +1164,6 @@ func (qv *queryView) validateOrderBasicSimpleExpr(e qir.Expr) error {
 	}
 }
 
-func lowerBoundIndex(s []index, key string) int {
-	lo, hi := 0, len(s)
-	for lo < hi {
-		mid := (lo + hi) >> 1
-		if keycodec.CompareString(s[mid].Key, key) < 0 {
-			lo = mid + 1
-		} else {
-			hi = mid
-		}
-	}
-	return lo
-}
-
-func upperBoundIndex(s []index, key string) int {
-	lo, hi := 0, len(s)
-	for lo < hi {
-		mid := (lo + hi) >> 1
-		if keycodec.CompareString(s[mid].Key, key) <= 0 {
-			lo = mid + 1
-		} else {
-			hi = mid
-		}
-	}
-	return lo
-}
-
-func prefixRangeEndIndex(s []index, prefix string, start int) int {
-	if start < 0 || start >= len(s) {
-		return start
-	}
-	if keycodec.CompareString(s[start].Key, prefix) < 0 || !keycodec.HasPrefixString(s[start].Key, prefix) {
-		return start
-	}
-	upper, ok := keycodec.NewPrefixUpperBound(prefix)
-	if !ok {
-		return len(s)
-	}
-
-	lo, hi := start, len(s)
-	for lo < hi {
-		mid := int(uint(lo+hi) >> 1)
-		if keycodec.ComparePrefixUpperBound(s[mid].Key, upper) >= 0 {
-			hi = mid
-		} else {
-			lo = mid + 1
-		}
-	}
-	return lo
-}
-
 const iteratorThreshold = 2048 // 256
 
 type orderBasicBaseCoreKind uint8
@@ -1397,19 +1186,19 @@ func isOrderBasicCollapsibleNumericRangeExpr(op qir.Expr, fm *field) bool {
 	return isScalarRangeEqOp(op.Op)
 }
 
-func (qv *queryView) shouldCollapseOrderBasicNumericRange(field string, fieldOrdinal int, rb rangeBounds) bool {
-	if field == "" || rb.empty {
+func (qv *queryView) shouldCollapseOrderBasicNumericRange(field string, fieldOrdinal int, rb indexdata.Bounds) bool {
+	if field == "" || rb.Empty {
 		return false
 	}
 	ov := qv.fieldOverlayRef(field, fieldOrdinal)
-	if !ov.hasData() {
+	if !ov.HasData() {
 		return true
 	}
-	br := ov.rangeForBounds(rb)
-	if overlayRangeEmpty(br) {
+	br := ov.RangeForBounds(rb)
+	if br.Empty() {
 		return true
 	}
-	bucketCount, est := overlayRangeStats(ov, br)
+	bucketCount, est := ov.RangeStats(br)
 	if bucketCount == 0 || est == 0 {
 		return true
 	}
@@ -1421,8 +1210,8 @@ func (qv *queryView) shouldCollapseOrderBasicNumericRange(field string, fieldOrd
 	if positiveWork == 0 {
 		return false
 	}
-	complementBuckets := ov.keyCount() - bucketCount
-	if qv.nilFieldOverlayRef(field, fieldOrdinal).lookupCardinality(nilIndexEntryKey) > 0 {
+	complementBuckets := ov.KeyCount() - bucketCount
+	if qv.nilFieldOverlayRef(field, fieldOrdinal).LookupCardinality(nilIndexEntryKey) > 0 {
 		complementBuckets++
 	}
 	complementEst := uint64(0)
@@ -1442,7 +1231,7 @@ func (qv *queryView) prepareOrderBasicBaseCores(baseOps []qir.Expr) (*pooled.Sli
 	}
 	coresBuf := orderBasicBaseCoreSlicePool.Get()
 	coresBuf.Grow(len(baseOps))
-	rawCoreIdxBuf := pools.GetIntSlice(len(baseOps))[:len(baseOps)]
+	rawCoreIdxBuf := pooled.GetIntSlice(len(baseOps))[:len(baseOps)]
 	for i := range rawCoreIdxBuf {
 		rawCoreIdxBuf[i] = -1
 	}
@@ -1457,7 +1246,7 @@ func (qv *queryView) prepareOrderBasicBaseCores(baseOps []qir.Expr) (*pooled.Sli
 		}
 		fieldName := qv.engine.fieldNameByOrdinal(op.FieldOrdinal)
 
-		var rb rangeBounds
+		var rb indexdata.Bounds
 		groupCount := 0
 		for j := i; j < len(baseOps); j++ {
 			if rawCoreIdxBuf[j] >= 0 {
@@ -1470,7 +1259,7 @@ func (qv *queryView) prepareOrderBasicBaseCores(baseOps []qir.Expr) (*pooled.Sli
 			nextRB, ok, err := qv.rangeBoundsForScalarExpr(other)
 			if err != nil {
 				orderBasicBaseCoreSlicePool.Put(coresBuf)
-				pools.PutIntSlice(rawCoreIdxBuf)
+				pooled.PutIntSlice(rawCoreIdxBuf)
 				return nil, nil, false, err
 			}
 			if !ok {
@@ -1482,9 +1271,9 @@ func (qv *queryView) prepareOrderBasicBaseCores(baseOps []qir.Expr) (*pooled.Sli
 		if groupCount <= 1 {
 			continue
 		}
-		if rb.empty {
+		if rb.Empty {
 			orderBasicBaseCoreSlicePool.Put(coresBuf)
-			pools.PutIntSlice(rawCoreIdxBuf)
+			pooled.PutIntSlice(rawCoreIdxBuf)
 			return nil, nil, true, nil
 		}
 		if !qv.shouldCollapseOrderBasicNumericRange(fieldName, op.FieldOrdinal, rb) {
@@ -1527,7 +1316,7 @@ func (qv *queryView) prepareOrderBasicBaseCoresBuf(baseOps *pooled.Slice[qir.Exp
 	}
 	coresBuf := orderBasicBaseCoreSlicePool.Get()
 	coresBuf.Grow(baseOps.Len())
-	rawCoreIdxBuf := pools.GetIntSlice(baseOps.Len())[:baseOps.Len()]
+	rawCoreIdxBuf := pooled.GetIntSlice(baseOps.Len())[:baseOps.Len()]
 	for i := range rawCoreIdxBuf {
 		rawCoreIdxBuf[i] = -1
 	}
@@ -1543,7 +1332,7 @@ func (qv *queryView) prepareOrderBasicBaseCoresBuf(baseOps *pooled.Slice[qir.Exp
 		}
 		fieldName := qv.engine.fieldNameByOrdinal(op.FieldOrdinal)
 
-		var rb rangeBounds
+		var rb indexdata.Bounds
 		groupCount := 0
 		for j := i; j < baseOps.Len(); j++ {
 			if rawCoreIdxBuf[j] >= 0 {
@@ -1556,7 +1345,7 @@ func (qv *queryView) prepareOrderBasicBaseCoresBuf(baseOps *pooled.Slice[qir.Exp
 			nextRB, ok, err := qv.rangeBoundsForScalarExpr(other)
 			if err != nil {
 				orderBasicBaseCoreSlicePool.Put(coresBuf)
-				pools.PutIntSlice(rawCoreIdxBuf)
+				pooled.PutIntSlice(rawCoreIdxBuf)
 				return nil, nil, false, err
 			}
 			if !ok {
@@ -1568,9 +1357,9 @@ func (qv *queryView) prepareOrderBasicBaseCoresBuf(baseOps *pooled.Slice[qir.Exp
 		if groupCount <= 1 {
 			continue
 		}
-		if rb.empty {
+		if rb.Empty {
 			orderBasicBaseCoreSlicePool.Put(coresBuf)
-			pools.PutIntSlice(rawCoreIdxBuf)
+			pooled.PutIntSlice(rawCoreIdxBuf)
 			return nil, nil, true, nil
 		}
 		if !qv.shouldCollapseOrderBasicNumericRange(fieldName, op.FieldOrdinal, rb) {
@@ -1786,12 +1575,12 @@ func (qv *queryView) materializeOrderMaterializedBaseOpsBuf(orderField string, b
 			orderBasicBaseCoreSlicePool.Put(coresBuf)
 		}
 		if rawCoreIdxBuf != nil {
-			pools.PutIntSlice(rawCoreIdxBuf)
+			pooled.PutIntSlice(rawCoreIdxBuf)
 		}
 		return
 	}
 	defer orderBasicBaseCoreSlicePool.Put(coresBuf)
-	defer pools.PutIntSlice(rawCoreIdxBuf)
+	defer pooled.PutIntSlice(rawCoreIdxBuf)
 
 	keysBuf := materializedPredKeySlicePool.Get()
 	keysBuf.Grow(coresBuf.Len())
@@ -1844,12 +1633,12 @@ func (qv *queryView) promoteOrderBasicLimitMaterializedBaseOps(orderField string
 			orderBasicBaseCoreSlicePool.Put(coresBuf)
 		}
 		if rawCoreIdxBuf != nil {
-			pools.PutIntSlice(rawCoreIdxBuf)
+			pooled.PutIntSlice(rawCoreIdxBuf)
 		}
 		return
 	}
 	defer orderBasicBaseCoreSlicePool.Put(coresBuf)
-	defer pools.PutIntSlice(rawCoreIdxBuf)
+	defer pooled.PutIntSlice(rawCoreIdxBuf)
 
 	keysBuf := materializedPredKeySlicePool.Get()
 	keysBuf.Grow(coresBuf.Len())
@@ -2056,7 +1845,7 @@ func (qv *queryView) tryQueryOrderBasicWithLimit(q *qir.Shape, trace *queryTrace
 		return nil, false, nil
 	}
 
-	var rb rangeBounds
+	var rb indexdata.Bounds
 	orderEqNil := false
 	orderEqNilConflict := false
 	orderNonNilConstraint := false
@@ -2087,7 +1876,7 @@ func (qv *queryView) tryQueryOrderBasicWithLimit(q *qir.Shape, trace *queryTrace
 						orderEqNilConflict = true
 					}
 					orderEqNil = true
-					rb.setEmpty()
+					rb.SetEmpty()
 					continue
 				}
 			}
@@ -2121,7 +1910,7 @@ func (qv *queryView) tryQueryOrderBasicWithLimit(q *qir.Shape, trace *queryTrace
 		defer orderBasicBaseCoreSlicePool.Put(baseCoresBuf)
 	}
 	if baseRawCoreIdxBuf != nil {
-		defer pools.PutIntSlice(baseRawCoreIdxBuf)
+		defer pooled.PutIntSlice(baseRawCoreIdxBuf)
 	}
 	if noMatch {
 		return nil, true, nil
@@ -2138,19 +1927,19 @@ func (qv *queryView) tryQueryOrderBasicWithLimit(q *qir.Shape, trace *queryTrace
 		nilTailField = f
 	}
 	ov := qv.fieldOverlayForOrder(order)
-	if !ov.hasData() && nilTailField == "" {
+	if !ov.HasData() && nilTailField == "" {
 		if !qv.hasIndexedFieldForOrder(order) {
 			return nil, false, nil
 		}
 		return nil, true, nil
 	}
 
-	br := ov.rangeForBounds(rb)
-	if overlayRangeEmpty(br) && nilTailField == "" {
+	br := ov.RangeForBounds(rb)
+	if br.Empty() && nilTailField == "" {
 		return nil, true, nil
 	}
 
-	preferBaseCores := !rb.hasLo && !rb.hasHi && !rb.hasPrefix &&
+	preferBaseCores := !rb.HasLo && !rb.HasHi && !rb.HasPrefix &&
 		q.Offset == 0 &&
 		qv.shouldPreferOrderBasicBaseCorePathForNonOrderPrefix(q, f, baseOps)
 
@@ -2209,9 +1998,9 @@ func (qv *queryView) tryQueryOrderBasicWithLimit(q *qir.Shape, trace *queryTrace
 		defer exprSlicePool.Put(residualOpsBuf)
 		var loadedCoreBuf []bool
 		if baseCoresBuf != nil && baseCoresBuf.Len() > 0 {
-			loadedCoreBuf = pools.GetBoolSlice(baseCoresBuf.Len())[:baseCoresBuf.Len()]
+			loadedCoreBuf = pooled.GetBoolSlice(baseCoresBuf.Len())[:baseCoresBuf.Len()]
 			clear(loadedCoreBuf)
-			defer pools.PutBoolSlice(loadedCoreBuf)
+			defer pooled.PutBoolSlice(loadedCoreBuf)
 		}
 
 		baseBuilt := false
@@ -2255,7 +2044,7 @@ func (qv *queryView) tryQueryOrderBasicWithLimit(q *qir.Shape, trace *queryTrace
 				if residualPredSet.Len() <= limitQueryFastPathMaxLeaves {
 					residualActive = residualActiveInline[:0]
 				} else {
-					residualActiveBuf = pools.GetIntSlice(residualPredSet.Len())
+					residualActiveBuf = pooled.GetIntSlice(residualPredSet.Len())
 				}
 				for i := 0; i < residualPredSet.Len(); i++ {
 					p := residualPredSet.Get(i)
@@ -2315,7 +2104,7 @@ func (qv *queryView) tryQueryOrderBasicWithLimit(q *qir.Shape, trace *queryTrace
 	return out, used, err
 }
 
-func (qv *queryView) scanOrderLimitNoPredicates(q *qir.Shape, ov fieldOverlay, br overlayRange, desc bool, nilTailField string, trace *queryTrace) ([]uint64, bool) {
+func (qv *queryView) scanOrderLimitNoPredicates(q *qir.Shape, ov indexdata.FieldOverlay, br indexdata.OverlayRange, desc bool, nilTailField string, trace *queryTrace) ([]uint64, bool) {
 	out := make([]uint64, 0, q.Limit)
 	cursor := qv.newQueryCursor(out, q.Offset, q.Limit, false, 0)
 
@@ -2324,9 +2113,9 @@ func (qv *queryView) scanOrderLimitNoPredicates(q *qir.Shape, ov fieldOverlay, b
 		scanWidth uint64
 	)
 
-	keyCur := ov.newCursor(br, desc)
+	keyCur := ov.NewCursor(br, desc)
 	for {
-		_, ids, ok := keyCur.next()
+		_, ids, ok := keyCur.Next()
 		if !ok {
 			break
 		}
@@ -2345,7 +2134,7 @@ func (qv *queryView) scanOrderLimitNoPredicates(q *qir.Shape, ov fieldOverlay, b
 	}
 
 	if nilTailField != "" {
-		ids := qv.nilFieldOverlay(nilTailField).lookupPostingRetained(nilIndexEntryKey)
+		ids := qv.nilFieldOverlay(nilTailField).LookupPostingRetained(nilIndexEntryKey)
 		if !ids.IsEmpty() {
 			scanWidth++
 			if emitOrderLimitPosting(&cursor, ids, &examined, trace) {
@@ -2367,10 +2156,10 @@ func (qv *queryView) scanOrderLimitNoPredicates(q *qir.Shape, ov fieldOverlay, b
 	return cursor.out, true
 }
 
-func (qv *queryView) scanOrderLimitWithPredicatesReader(q *qir.Shape, ov fieldOverlay, br overlayRange, desc bool, preds predicateReader, nilTailField string, trace *queryTrace) ([]uint64, bool) {
+func (qv *queryView) scanOrderLimitWithPredicatesReader(q *qir.Shape, ov indexdata.FieldOverlay, br indexdata.OverlayRange, desc bool, preds predicateReader, nilTailField string, trace *queryTrace) ([]uint64, bool) {
 	if preds.Len() > limitQueryFastPathMaxLeaves {
-		activeBuf := pools.GetIntSlice(preds.Len())
-		defer pools.PutIntSlice(activeBuf)
+		activeBuf := pooled.GetIntSlice(preds.Len())
+		defer pooled.PutIntSlice(activeBuf)
 		for i := 0; i < preds.Len(); i++ {
 			p := preds.Get(i)
 			if p.alwaysFalse {
@@ -2392,12 +2181,12 @@ func (qv *queryView) scanOrderLimitWithPredicatesReader(q *qir.Shape, ov fieldOv
 		}
 		sortActivePredicatesBufReader(activeBuf, preds)
 
-		exactActiveBuf := pools.GetIntSlice(len(activeBuf))
-		defer pools.PutIntSlice(exactActiveBuf)
+		exactActiveBuf := pooled.GetIntSlice(len(activeBuf))
+		defer pooled.PutIntSlice(exactActiveBuf)
 		exactActiveBuf = buildExactBucketPostingFilterActiveBufReader(exactActiveBuf, activeBuf, preds)
 
-		residualActiveBuf := pools.GetIntSlice(len(activeBuf))
-		defer pools.PutIntSlice(residualActiveBuf)
+		residualActiveBuf := pooled.GetIntSlice(len(activeBuf))
+		defer pooled.PutIntSlice(residualActiveBuf)
 		residualActiveBuf = plannerResidualChecksBuf(residualActiveBuf, activeBuf, exactActiveBuf)
 
 		exactOnly := len(activeBuf) > 0 && len(activeBuf) == len(exactActiveBuf)
@@ -2412,9 +2201,9 @@ func (qv *queryView) scanOrderLimitWithPredicatesReader(q *qir.Shape, ov fieldOv
 
 		var exactWork posting.List
 
-		keyCur := ov.newCursor(br, desc)
+		keyCur := ov.NewCursor(br, desc)
 		for {
-			_, ids, ok := keyCur.next()
+			_, ids, ok := keyCur.Next()
 			if !ok {
 				break
 			}
@@ -2446,7 +2235,7 @@ func (qv *queryView) scanOrderLimitWithPredicatesReader(q *qir.Shape, ov fieldOv
 		}
 
 		if nilTailField != "" {
-			ids := qv.nilFieldOverlay(nilTailField).lookupPostingRetained(nilIndexEntryKey)
+			ids := qv.nilFieldOverlay(nilTailField).LookupPostingRetained(nilIndexEntryKey)
 			if !ids.IsEmpty() {
 				scanWidth++
 				stop, nextExactWork := orderPredicatesEmitPostingBufReader(
@@ -2522,9 +2311,9 @@ func (qv *queryView) scanOrderLimitWithPredicatesReader(q *qir.Shape, ov fieldOv
 
 	var exactWork posting.List
 
-	keyCur := ov.newCursor(br, desc)
+	keyCur := ov.NewCursor(br, desc)
 	for {
-		_, ids, ok := keyCur.next()
+		_, ids, ok := keyCur.Next()
 		if !ok {
 			break
 		}
@@ -2556,7 +2345,7 @@ func (qv *queryView) scanOrderLimitWithPredicatesReader(q *qir.Shape, ov fieldOv
 	}
 
 	if nilTailField != "" {
-		ids := qv.nilFieldOverlay(nilTailField).lookupPostingRetained(nilIndexEntryKey)
+		ids := qv.nilFieldOverlay(nilTailField).LookupPostingRetained(nilIndexEntryKey)
 		if !ids.IsEmpty() {
 			scanWidth++
 			stop, nextExactWork := orderPredicatesEmitPostingReader(
@@ -2614,7 +2403,7 @@ func (qv *queryView) tryQueryOrderPrefixWithLimit(q *qir.Shape, trace *queryTrac
 	}
 
 	ov := qv.fieldOverlayForOrder(ord)
-	if !ov.hasData() {
+	if !ov.HasData() {
 		return nil, true, nil
 	}
 
@@ -2650,7 +2439,7 @@ func (qv *queryView) tryQueryOrderPrefixWithLimit(q *qir.Shape, trace *queryTrac
 			if !ok {
 				return nil, false, nil
 			}
-			if !prefixState.hasData || overlayRangeEmpty(prefixState.br) {
+			if !prefixState.hasData || prefixState.br.Empty() {
 				return nil, false, nil
 			}
 			hasPrefix = true
@@ -2664,12 +2453,12 @@ func (qv *queryView) tryQueryOrderPrefixWithLimit(q *qir.Shape, trace *queryTrac
 		return nil, false, nil
 	}
 
-	br := ov.rangeForBounds(rangeBounds{
-		has:       true,
-		hasPrefix: true,
-		prefix:    prefix,
-	})
-	if overlayRangeEmpty(br) {
+	br := ov.RangeForBounds((indexdata.Bounds{
+		Has:       true,
+		HasPrefix: true,
+		Prefix:    prefix,
+	}))
+	if br.Empty() {
 		return nil, true, nil
 	}
 
@@ -2714,13 +2503,13 @@ func (qv *queryView) tryQueryOrderPrefixWithLimit(q *qir.Shape, trace *queryTrac
 	out := make([]uint64, 0, need)
 	cursor := qv.newQueryCursor(out, skip, need, false, 0)
 
-	keyCur := ov.newCursor(br, ord.Desc)
+	keyCur := ov.NewCursor(br, ord.Desc)
 	var (
 		examined  uint64
 		scanWidth uint64
 	)
 	for {
-		_, ids, ok := keyCur.next()
+		_, ids, ok := keyCur.Next()
 		if !ok {
 			break
 		}
@@ -2771,7 +2560,7 @@ func (qv *queryView) tryQueryRangeNoOrderWithLimit(q *qir.Shape, trace *queryTra
 	}
 
 	isNil := false
-	rb := rangeBounds{has: true}
+	rb := indexdata.Bounds{Has: true}
 	if e.Op == qir.OpEQ {
 		key, isSlice, eqNil, err := qv.exprValueToIdxScalar(e)
 		if err != nil {
@@ -2782,7 +2571,7 @@ func (qv *queryView) tryQueryRangeNoOrderWithLimit(q *qir.Shape, trace *queryTra
 		}
 		isNil = eqNil
 		if isNil {
-			ids := qv.nilFieldOverlayForExpr(e).lookupPostingRetained(nilIndexEntryKey)
+			ids := qv.nilFieldOverlayForExpr(e).LookupPostingRetained(nilIndexEntryKey)
 			if ids.IsEmpty() {
 				return nil, true, nil
 			}
@@ -2808,8 +2597,8 @@ func (qv *queryView) tryQueryRangeNoOrderWithLimit(q *qir.Shape, trace *queryTra
 			}
 			return cursor.out, true, nil
 		}
-		rb.applyLo(key, true)
-		rb.applyHi(key, true)
+		rb.ApplyLo(key, true)
+		rb.ApplyHi(key, true)
 	} else {
 		nextRB, ok, err := qv.rangeBoundsForScalarExpr(e)
 		if err != nil {
@@ -2822,12 +2611,12 @@ func (qv *queryView) tryQueryRangeNoOrderWithLimit(q *qir.Shape, trace *queryTra
 	}
 
 	ov := qv.fieldOverlayForExpr(e)
-	if !ov.hasData() {
+	if !ov.HasData() {
 		return nil, true, nil
 	}
 
-	br := ov.rangeForBounds(rb)
-	if overlayRangeEmpty(br) {
+	br := ov.RangeForBounds(rb)
+	if br.Empty() {
 		return nil, true, nil
 	}
 
@@ -2837,14 +2626,14 @@ func (qv *queryView) tryQueryRangeNoOrderWithLimit(q *qir.Shape, trace *queryTra
 	out := make([]uint64, 0, need)
 	cursor := qv.newQueryCursor(out, skip, need, false, 0)
 
-	keyCur := ov.newCursor(br, false)
+	keyCur := ov.NewCursor(br, false)
 	var examined uint64
 	var examinedPtr *uint64
 	if trace != nil {
 		examinedPtr = &examined
 	}
 	for {
-		_, ids, ok := keyCur.next()
+		_, ids, ok := keyCur.Next()
 		if !ok {
 			break
 		}
@@ -2900,7 +2689,7 @@ func (qv *queryView) tryQueryPrefixNoOrderWithLimit(q *qir.Shape, trace *queryTr
 		}
 		return nil, true, nil
 	}
-	if overlayRangeEmpty(prefixState.br) {
+	if prefixState.br.Empty() {
 		return nil, true, nil
 	}
 
@@ -2909,14 +2698,14 @@ func (qv *queryView) tryQueryPrefixNoOrderWithLimit(q *qir.Shape, trace *queryTr
 	out := make([]uint64, 0, need)
 	cursor := qv.newQueryCursor(out, skip, need, false, 0)
 
-	keyCur := prefixState.ov.newCursor(prefixState.br, false)
+	keyCur := prefixState.ov.NewCursor(prefixState.br, false)
 	var examined uint64
 	var examinedPtr *uint64
 	if trace != nil {
 		examinedPtr = &examined
 	}
 	for {
-		_, ids, ok := keyCur.next()
+		_, ids, ok := keyCur.Next()
 		if !ok {
 			break
 		}

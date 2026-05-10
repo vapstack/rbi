@@ -12,5 +12,5 @@ const (
 	// retaining very large backing arrays through a smaller bucket.
 	MaxNumericRetainedCap = MaxNumericPooledCap + MaxNumericPooledCap/4
 
-	maxBucketDistance = 4
+	maxBucketDistance = 3
 )

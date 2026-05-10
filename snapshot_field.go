@@ -4,8 +4,8 @@ import (
 	"slices"
 	"unsafe"
 
+	"github.com/vapstack/rbi/internal/indexdata"
 	"github.com/vapstack/rbi/internal/pooled"
-	"github.com/vapstack/rbi/internal/pools"
 	"github.com/vapstack/rbi/internal/posting"
 )
 
@@ -21,8 +21,8 @@ type snapshotFieldInsertState struct {
 	index   map[string]uint32
 	fixed   map[uint64]uint32
 	nils    map[string]uint32
-	arena   *insertPostingAccumArena
-	lengths *lenFieldPostingDelta
+	arena   *indexdata.PostingAddArena
+	lengths *indexdata.LenPostingDiff
 	changed bool
 
 	indexHint   int
@@ -47,8 +47,8 @@ type snapshotFieldBatchState struct {
 	index   map[string]uint32
 	fixed   map[uint64]uint32
 	nils    map[string]uint32
-	arena   *batchPostingAccumArena
-	lengths *lenFieldPostingDelta
+	arena   *indexdata.PostingDiffArena
+	lengths *indexdata.LenPostingDiff
 	changed bool
 	old     fieldWriteScratch
 	new     fieldWriteScratch
@@ -72,11 +72,11 @@ func (s *fieldWriteScratch) reset() {
 
 func (s *fieldWriteScratch) release() {
 	if s.strings != nil {
-		pools.PutStringSlice(s.strings)
+		pooled.PutStringSlice(s.strings)
 		s.strings = nil
 	}
 	if s.fixed != nil {
-		pools.PutUint64Slice(s.fixed)
+		pooled.PutUint64Slice(s.fixed)
 		s.fixed = nil
 	}
 	s.ok = false
@@ -96,7 +96,7 @@ func (s *fieldWriteScratch) setLen(length int) {
 
 func (s *fieldWriteScratch) addString(key string) {
 	if s.strings == nil {
-		s.strings = pools.GetStringSlice(1)
+		s.strings = pooled.GetStringSlice(1)
 	}
 	s.ok = true
 	s.strings = append(s.strings, key)
@@ -104,7 +104,7 @@ func (s *fieldWriteScratch) addString(key string) {
 
 func (s *fieldWriteScratch) addFixed(key uint64) {
 	if s.fixed == nil {
-		s.fixed = pools.GetUint64Slice(0)
+		s.fixed = pooled.GetUint64Slice(0)
 	}
 	s.ok = true
 	s.fixed = append(s.fixed, key)
@@ -153,7 +153,7 @@ func (s snapshotOverlayWriteSink) setNil() {
 	if s.state == nil {
 		return
 	}
-	s.state.nils = addFieldPostingListHint(s.state.nils, nilIndexEntryKey, s.idx, 0)
+	s.state.nils = addFieldPostingList(s.state.nils, nilIndexEntryKey, s.idx)
 	s.state.changed = true
 }
 
@@ -175,7 +175,7 @@ func (s snapshotOverlayWriteSink) addString(key string) {
 	if s.state == nil {
 		return
 	}
-	s.state.index = addFieldPostingListHint(s.state.index, key, s.idx, 0)
+	s.state.index = addFieldPostingList(s.state.index, key, s.idx)
 	s.state.changed = true
 }
 
@@ -183,7 +183,7 @@ func (s snapshotOverlayWriteSink) addFixed(key uint64) {
 	if s.state == nil {
 		return
 	}
-	s.state.fixed = addFixedFieldPostingListHint(s.state.fixed, key, s.idx, 0)
+	s.state.fixed = addFixedFieldPostingList(s.state.fixed, key, s.idx)
 	s.state.changed = true
 }
 
@@ -197,7 +197,7 @@ func (s snapshotInsertWriteSink) setNil() {
 	if s.state == nil {
 		return
 	}
-	s.state.nils = addInsertPostingAccum(s.state.nils, &s.state.arena, nilIndexEntryKey, s.idx, s.state.nilsHint)
+	s.state.nils = indexdata.AddStringPostingAdd(s.state.nils, &s.state.arena, nilIndexEntryKey, s.idx, s.state.nilsHint)
 	s.state.changed = true
 }
 
@@ -219,7 +219,7 @@ func (s snapshotInsertWriteSink) addString(key string) {
 	if s.state == nil {
 		return
 	}
-	s.state.index = addInsertPostingAccum(s.state.index, &s.state.arena, key, s.idx, s.state.indexHint)
+	s.state.index = indexdata.AddStringPostingAdd(s.state.index, &s.state.arena, key, s.idx, s.state.indexHint)
 	s.state.changed = true
 }
 
@@ -227,7 +227,7 @@ func (s snapshotInsertWriteSink) addFixed(key uint64) {
 	if s.state == nil {
 		return
 	}
-	s.state.fixed = addFixedInsertPostingAccum(s.state.fixed, &s.state.arena, key, s.idx, s.state.fixedHint)
+	s.state.fixed = indexdata.AddFixedPostingAdd(s.state.fixed, &s.state.arena, key, s.idx, s.state.fixedHint)
 	s.state.changed = true
 }
 
@@ -267,28 +267,28 @@ func initSnapshotFieldInsertStateHints(
 		acc := access[i]
 		state := states.GetPtr(i)
 		var indexHint int
-		if prev.index != nil && acc.ordinal < prev.index.Len() {
-			indexHint = snapshotFieldStorageHint(prev.index.Get(acc.ordinal), batchHint)
+		if prev.index != nil && acc.ordinal < len(prev.index) {
+			indexHint = snapshotFieldStorageHint(prev.index[acc.ordinal], batchHint)
 		}
 		if acc.field != nil && acc.field.KeyKind == fieldWriteKeysOrderedU64 {
 			state.fixedHint = indexHint
 		} else {
 			state.indexHint = indexHint
 		}
-		if prev.nilIndex != nil && acc.ordinal < prev.nilIndex.Len() {
-			state.nilsHint = snapshotFieldStorageHint(prev.nilIndex.Get(acc.ordinal), batchHint)
+		if prev.nilIndex != nil && acc.ordinal < len(prev.nilIndex) {
+			state.nilsHint = snapshotFieldStorageHint(prev.nilIndex[acc.ordinal], batchHint)
 		}
-		if acc.field != nil && acc.field.Slice && prev.lenIndex != nil && acc.ordinal < prev.lenIndex.Len() {
-			state.lengthsHint = snapshotFieldStorageHint(prev.lenIndex.Get(acc.ordinal), batchHint)
+		if acc.field != nil && acc.field.Slice && prev.lenIndex != nil && acc.ordinal < len(prev.lenIndex) {
+			state.lengthsHint = snapshotFieldStorageHint(prev.lenIndex[acc.ordinal], batchHint)
 		}
 	}
 }
 
-func snapshotFieldStorageHint(base fieldIndexStorage, batchHint int) int {
+func snapshotFieldStorageHint(base indexdata.FieldStorage, batchHint int) int {
 	if batchHint <= 0 {
 		return 0
 	}
-	hint := base.keyCount()
+	hint := base.KeyCount()
 	if hint < 8 {
 		hint = 8
 	}
@@ -298,67 +298,44 @@ func snapshotFieldStorageHint(base fieldIndexStorage, batchHint int) int {
 	return hint
 }
 
-func (acc indexedFieldAccessor) materializeSnapshotOverlayStorageOwned(state *snapshotFieldOverlayState) fieldIndexStorage {
-	if state == nil {
-		return fieldIndexStorage{}
-	}
-	if acc.field != nil && acc.field.KeyKind == fieldWriteKeysOrderedU64 {
-		fixed := state.fixed
-		state.fixed = nil
-		return newRegularFieldIndexStorageFromFixedPostingMapOwned(fixed)
-	}
-	i := state.index
-	state.index = nil
-	return newRegularFieldIndexStorageFromPostingMapOwned(i, false)
-}
-
-func (acc indexedFieldAccessor) materializeSnapshotOverlayNilStorageOwned(state *snapshotFieldOverlayState) fieldIndexStorage {
-	if state == nil {
-		return fieldIndexStorage{}
-	}
-	nils := state.nils
-	state.nils = nil
-	return newFlatFieldIndexStorageFromPostingMapOwned(nils, false)
-}
-
 func (acc indexedFieldAccessor) mergeSnapshotInsertStorageOwned(
-	base fieldIndexStorage,
+	base indexdata.FieldStorage,
 	state *snapshotFieldInsertState,
 	allowChunk bool,
-) fieldIndexStorage {
+) indexdata.FieldStorage {
 	if state == nil {
 		return base
 	}
 	if acc.field != nil && acc.field.KeyKind == fieldWriteKeysOrderedU64 {
 		fixed := state.fixed
 		state.fixed = nil
-		return mergeInsertOnlyFixedFieldStorageOwned(base, fixed, state.arena, allowChunk)
+		return base.MergeFixedPostingAddsOwned(fixed, state.arena, allowChunk)
 	}
 	i := state.index
 	state.index = nil
-	return mergeInsertOnlyFieldStorageOwned(base, i, state.arena, false, allowChunk)
+	return base.MergeStringPostingAddsOwned(i, state.arena, false, allowChunk)
 }
 
-func (acc indexedFieldAccessor) mergeSnapshotInsertNilStorageOwned(base fieldIndexStorage, state *snapshotFieldInsertState) fieldIndexStorage {
+func (acc indexedFieldAccessor) mergeSnapshotInsertNilStorageOwned(base indexdata.FieldStorage, state *snapshotFieldInsertState) indexdata.FieldStorage {
 	if state == nil {
 		return base
 	}
 	nils := state.nils
 	state.nils = nil
-	return mergeInsertOnlyFieldStorageOwned(base, nils, state.arena, false, false)
+	return base.MergeStringPostingAddsOwned(nils, state.arena, false, false)
 }
 
-func (state *snapshotFieldInsertState) releaseOwned() {
-	insertPostingMapPool.Put(state.index)
-	fixedInsertPostingMapPool.Put(state.fixed)
-	insertPostingMapPool.Put(state.nils)
+func (state *snapshotFieldInsertState) release() {
+	indexdata.PutStringPostingAddMap(state.index)
+	indexdata.PutFixedPostingAddMap(state.fixed)
+	indexdata.PutStringPostingAddMap(state.nils)
 	state.index = nil
 	state.fixed = nil
 	state.nils = nil
-	releaseInsertPostingAccumArena(state.arena)
+	state.arena.Release()
 	state.arena = nil
 	if state.lengths != nil {
-		releaseLenFieldPostingDeltaOwned(state.lengths)
+		state.lengths.Release()
 		state.lengths = nil
 	}
 }
@@ -386,10 +363,10 @@ func (acc indexedFieldAccessor) collectSnapshotBatchDiff(
 
 	if state.old.isNil != state.new.isNil {
 		if state.old.isNil {
-			state.nils = addFieldBatchPostingAccum(state.nils, &state.arena, nilIndexEntryKey, idx, false, 0)
+			state.nils = indexdata.AddStringPostingDiff(state.nils, &state.arena, nilIndexEntryKey, idx, false, 0)
 		}
 		if state.new.isNil {
-			state.nils = addFieldBatchPostingAccum(state.nils, &state.arena, nilIndexEntryKey, idx, true, 0)
+			state.nils = indexdata.AddStringPostingDiff(state.nils, &state.arena, nilIndexEntryKey, idx, true, 0)
 		}
 		state.changed = true
 	}
@@ -473,45 +450,45 @@ func (acc indexedFieldAccessor) collectSnapshotBatchDiff(
 }
 
 func (acc indexedFieldAccessor) applySnapshotBatchStorageOwned(
-	base fieldIndexStorage,
+	base indexdata.FieldStorage,
 	state *snapshotFieldBatchState,
 	allowChunk bool,
-) fieldIndexStorage {
+) indexdata.FieldStorage {
 	if state == nil {
 		return base
 	}
 	if acc.field != nil && acc.field.KeyKind == fieldWriteKeysOrderedU64 {
 		deltas := state.fixed
 		state.fixed = nil
-		return applyFixedFieldPostingDiffStorageOwned(base, deltas, state.arena, allowChunk)
+		return base.ApplyFixedPostingDiffOwned(deltas, state.arena, allowChunk)
 	}
 	deltas := state.index
 	state.index = nil
-	return applyFieldPostingDiffStorageOwned(base, deltas, state.arena, false, allowChunk)
+	return base.ApplyStringPostingDiffOwned(deltas, state.arena, false, allowChunk)
 }
 
-func (acc indexedFieldAccessor) applySnapshotBatchNilStorageOwned(base fieldIndexStorage, state *snapshotFieldBatchState) fieldIndexStorage {
+func (acc indexedFieldAccessor) applySnapshotBatchNilStorageOwned(base indexdata.FieldStorage, state *snapshotFieldBatchState) indexdata.FieldStorage {
 	if state == nil {
 		return base
 	}
 	deltas := state.nils
 	state.nils = nil
-	return applyFieldPostingDiffStorageOwned(base, deltas, state.arena, false, false)
+	return base.ApplyStringPostingDiffOwned(deltas, state.arena, false, false)
 }
 
-func (state *snapshotFieldBatchState) releaseOwned() {
+func (state *snapshotFieldBatchState) release() {
 	state.old.release()
 	state.new.release()
-	batchPostingAccumMapPool.Put(state.index)
-	fixedBatchPostingAccumMapPool.Put(state.fixed)
-	batchPostingAccumMapPool.Put(state.nils)
+	indexdata.PutStringPostingDiffMap(state.index)
+	indexdata.PutFixedPostingDiffMap(state.fixed)
+	indexdata.PutStringPostingDiffMap(state.nils)
 	state.index = nil
 	state.fixed = nil
 	state.nils = nil
-	releaseBatchPostingAccumArena(state.arena)
+	state.arena.Release()
 	state.arena = nil
 	if state.lengths != nil {
-		releaseLenFieldPostingDeltaOwned(state.lengths)
+		state.lengths.Release()
 		state.lengths = nil
 	}
 }

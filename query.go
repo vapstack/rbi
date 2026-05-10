@@ -6,6 +6,7 @@ import (
 	"unsafe"
 
 	"github.com/vapstack/qx"
+	"github.com/vapstack/rbi/internal/indexdata"
 	"github.com/vapstack/rbi/internal/posting"
 	"github.com/vapstack/rbi/internal/qir"
 	"go.etcd.io/bbolt"
@@ -65,9 +66,9 @@ func (qv *queryView) tryQueryEmptyOnSnapshot(q *qir.Shape) (bool, error) {
 			return false, nil
 		}
 		if isNil {
-			return qv.nilFieldOverlayForExpr(e).lookupCardinality(nilIndexEntryKey) == 0, nil
+			return qv.nilFieldOverlayForExpr(e).LookupCardinality(nilIndexEntryKey) == 0, nil
 		}
-		return qv.fieldOverlayForExpr(e).lookupCardinality(key) == 0, nil
+		return qv.fieldOverlayForExpr(e).LookupCardinality(key) == 0, nil
 
 	case qir.OpGT, qir.OpGTE, qir.OpLT, qir.OpLTE, qir.OpPREFIX:
 		fm := qv.fieldMetaByExpr(e)
@@ -81,17 +82,17 @@ func (qv *queryView) tryQueryEmptyOnSnapshot(q *qir.Shape) (bool, error) {
 		if isSlice {
 			return false, nil
 		}
-		var bounds rangeBounds
-		bounds.has = true
+		var bounds indexdata.Bounds
+		bounds.Has = true
 		applyNormalizedScalarBound(&bounds, bound)
-		if bounds.empty {
+		if bounds.Empty {
 			return true, nil
 		}
 		ov := qv.fieldOverlayForExpr(e)
-		if !ov.hasData() {
+		if !ov.HasData() {
 			return true, nil
 		}
-		return overlayRangeEmpty(ov.rangeForBounds(bounds)), nil
+		return ov.RangeForBounds(bounds).Empty(), nil
 	}
 
 	return false, nil
@@ -455,7 +456,7 @@ func (qv *queryView) execQuery(q *qir.Shape, emitTrace bool, prepared bool) (out
 
 		case qir.OrderKindArrayPos:
 			ov := qv.fieldOverlayForOrder(order)
-			if !ov.hasData() && !qv.hasIndexedFieldForOrder(order) {
+			if !ov.HasData() && !qv.hasIndexedFieldForOrder(order) {
 				return nil, fmt.Errorf("cannot sort non-indexed field: %v", orderField)
 			}
 			return qv.queryOrderArrayPosOverlay(result, ov, order, skip, need, needAll)
@@ -463,18 +464,14 @@ func (qv *queryView) execQuery(q *qir.Shape, emitTrace bool, prepared bool) (out
 		case qir.OrderKindArrayCount:
 			lenOV := qv.lenFieldOverlayForOrder(order)
 			useZeroComplement := qv.isLenZeroComplementOrdinal(order.FieldOrdinal)
-			if !lenOV.hasData() && !qv.hasIndexedLenField(orderField) {
-				return nil, fmt.Errorf("cannot sort non-indexed field: %v", orderField)
+			if !lenOV.HasData() && !useZeroComplement {
+				return nil, fmt.Errorf("no lenIndex for slice field: %v", orderField)
 			}
-			slice := qv.snapshotLenFieldIndexSliceForOrder(order)
-			if slice == nil {
-				return nil, fmt.Errorf("cannot sort non-indexed field: %v", orderField)
-			}
-			return qv.queryOrderArrayCount(result, *slice, order, skip, need, needAll, useZeroComplement)
+			return qv.queryOrderArrayCount(result, lenOV, order, skip, need, needAll, useZeroComplement)
 		}
 
 		ov := qv.fieldOverlayForOrder(order)
-		if !ov.hasData() && !qv.hasIndexedFieldForOrder(order) {
+		if !ov.HasData() && !qv.hasIndexedFieldForOrder(order) {
 			return nil, fmt.Errorf("cannot sort non-indexed field: %v", orderField)
 		}
 		return qv.queryOrderBasic(result, ov, order, skip, need, needAll)

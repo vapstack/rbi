@@ -5,22 +5,23 @@ import (
 	"testing"
 
 	"github.com/vapstack/qx"
+	"github.com/vapstack/rbi/internal/indexdata"
 	"github.com/vapstack/rbi/internal/keycodec"
-	"github.com/vapstack/rbi/internal/pools"
+	"github.com/vapstack/rbi/internal/pooled"
 	"github.com/vapstack/rbi/internal/posting"
 )
 
 func TestMaterializedPredKeyExactScalarRange_RoundTripNumeric(t *testing.T) {
-	bounds := rangeBounds{
-		has:       true,
-		hasLo:     true,
-		loInc:     true,
-		loNumeric: true,
-		loIndex:   keycodec.FromU64(keycodec.OrderedInt64Key(30)),
-		hasHi:     true,
-		hiInc:     false,
-		hiNumeric: true,
-		hiIndex:   keycodec.FromU64(keycodec.OrderedInt64Key(60)),
+	bounds := indexdata.Bounds{
+		Has:       true,
+		HasLo:     true,
+		LoInc:     true,
+		LoNumeric: true,
+		LoIndex:   keycodec.FromU64(keycodec.OrderedInt64Key(30)),
+		HasHi:     true,
+		HiInc:     false,
+		HiNumeric: true,
+		HiIndex:   keycodec.FromU64(keycodec.OrderedInt64Key(60)),
 	}
 
 	key := materializedPredKeyForExactScalarRange("age", bounds)
@@ -38,16 +39,16 @@ func TestMaterializedPredKeyExactScalarRange_RoundTripNumeric(t *testing.T) {
 }
 
 func TestMaterializedPredKeyExactScalarRangeComplement_RoundTripNumeric(t *testing.T) {
-	bounds := rangeBounds{
-		has:       true,
-		hasLo:     true,
-		loInc:     true,
-		loNumeric: true,
-		loIndex:   keycodec.FromU64(keycodec.OrderedInt64Key(30)),
-		hasHi:     true,
-		hiInc:     false,
-		hiNumeric: true,
-		hiIndex:   keycodec.FromU64(keycodec.OrderedInt64Key(60)),
+	bounds := indexdata.Bounds{
+		Has:       true,
+		HasLo:     true,
+		LoInc:     true,
+		LoNumeric: true,
+		LoIndex:   keycodec.FromU64(keycodec.OrderedInt64Key(30)),
+		HasHi:     true,
+		HiInc:     false,
+		HiNumeric: true,
+		HiIndex:   keycodec.FromU64(keycodec.OrderedInt64Key(60)),
 	}
 
 	key := materializedPredComplementKeyForExactScalarRange("age", bounds)
@@ -104,8 +105,8 @@ func TestMaterializedPredKeyScalar_NumericBoundsDoNotCollide(t *testing.T) {
 }
 
 func TestMaterializedPredKeyDistinctSet_RoundTripThroughStringCacheAPI(t *testing.T) {
-	vals := pools.GetStringSlice(2)
-	defer pools.PutStringSlice(vals)
+	vals := pooled.GetStringSlice(2)
+	defer pooled.PutStringSlice(vals)
 	vals = append(vals, "DE", "FR")
 
 	key := materializedPredKeyForDistinctSetTerms("country", compileScalarOpForTest(qx.OpIN), vals, true)

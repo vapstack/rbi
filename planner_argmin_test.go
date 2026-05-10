@@ -110,10 +110,10 @@ func plannerArgminOROrderCandidatesForTest(
 	}
 
 	ov := qv.fieldOverlayForOrder(o)
-	if !ov.hasData() {
+	if !ov.HasData() {
 		return plannerOROrderArgminCandidates{}, false
 	}
-	orderDistinct := uint64(ov.keyCount())
+	orderDistinct := uint64(ov.KeyCount())
 	if orderDistinct == 0 {
 		return plannerOROrderArgminCandidates{}, false
 	}

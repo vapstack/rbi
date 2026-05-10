@@ -2,6 +2,7 @@ package rbi
 
 import (
 	"fmt"
+	"github.com/vapstack/rbi/internal/indexdata"
 	"path/filepath"
 	"runtime"
 	"slices"
@@ -944,7 +945,7 @@ func TestRaceExtra_PublicNumericRangeQueriesStayExactAcrossConcurrentUnchangedFi
 		return db.engine.makeQueryView(db.engine.getSnapshot())
 	}
 
-	spanFor := func(expr qx.Expr) (overlayRange, *numericRangeBucketCacheEntry) {
+	spanFor := func(expr qx.Expr) (indexdata.OverlayRange, *numericRangeBucketCacheEntry) {
 		t.Helper()
 
 		view := makeView()
@@ -961,7 +962,7 @@ func TestRaceExtra_PublicNumericRangeQueriesStayExactAcrossConcurrentUnchangedFi
 			t.Fatalf("expected field metadata for %q", f)
 		}
 		ov := view.fieldOverlay(f)
-		if !ov.hasData() {
+		if !ov.HasData() {
 			t.Fatalf("expected field overlay for %q", f)
 		}
 
@@ -978,7 +979,7 @@ func TestRaceExtra_PublicNumericRangeQueriesStayExactAcrossConcurrentUnchangedFi
 			t.Fatalf("rangeBoundsForOp(%v) failed", compiled.Op)
 		}
 
-		br := ov.rangeForBounds(rb)
+		br := ov.RangeForBounds(rb)
 		out, ok := view.tryEvalNumericRangeBuckets(f, fm, ov, br)
 		if !ok {
 			t.Fatalf("expected numeric range bucket path for %v", expr)

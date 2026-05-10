@@ -2,6 +2,7 @@ package rbi
 
 import (
 	"errors"
+	"github.com/vapstack/rbi/internal/indexdata"
 	"math"
 	"math/rand/v2"
 	"sort"
@@ -122,33 +123,33 @@ func (s *indexSnapshot) universeCardinality() uint64 {
 
 func (qe *queryEngine) collectPlannerFieldStatsFromOverlay(s *indexSnapshot, fieldName string) PlannerFieldStats {
 	acc, ok := qe.indexedFieldMap[fieldName]
-	if !ok || s.index == nil || acc.ordinal >= s.index.Len() {
+	if !ok || s.index == nil || acc.ordinal >= len(s.index) {
 		return PlannerFieldStats{}
 	}
-	ov := newFieldOverlayStorage(s.index.Get(acc.ordinal))
-	if !ov.hasData() {
+	ov := indexdata.NewFieldOverlayStorage(s.index[acc.ordinal])
+	if !ov.HasData() {
 		return PlannerFieldStats{}
 	}
-	return ov.fieldStats()
+	return plannerFieldOverlayStats(ov)
 }
 
-func (o fieldOverlay) fieldStats() PlannerFieldStats {
+func plannerFieldOverlayStats(o indexdata.FieldOverlay) PlannerFieldStats {
 	var (
 		total    uint64
 		maxCard  uint64
 		nonEmpty uint64
 		distinct uint64
 	)
-	br := o.rangeForBounds(rangeBounds{has: true})
-	if br.baseStart >= br.baseEnd {
+	br := o.RangeForBounds((indexdata.Bounds{Has: true}))
+	if br.BaseStart >= br.BaseEnd {
 		return PlannerFieldStats{}
 	}
 
 	q50 := newP2Quantile(0.50)
 	q95 := newP2Quantile(0.95)
-	cur := o.newCursor(br, false)
+	cur := o.NewCursor(br, false)
 	for {
-		_, ids, ok := cur.next()
+		_, ids, ok := cur.Next()
 		if !ok {
 			break
 		}

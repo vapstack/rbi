@@ -16,9 +16,9 @@ import (
 	"time"
 	"unsafe"
 
+	"github.com/vapstack/rbi/internal/indexdata"
 	"github.com/vapstack/rbi/internal/keycodec"
 	"github.com/vapstack/rbi/internal/pooled"
-	"github.com/vapstack/rbi/internal/pools"
 	"github.com/vapstack/rbi/internal/posting"
 	"go.etcd.io/bbolt"
 )
@@ -563,16 +563,14 @@ func newQueryEngineForType(vtype reflect.Type, options *Options, strKey bool, ca
 	if err := qe.initMeasureFieldAccessors(vtype); err != nil {
 		return nil, nil, fmt.Errorf("failed to initialize measure field accessors: %w", err)
 	}
-	qe.index = fieldIndexStorageSlicePool.Get()
-	qe.index.SetLen(len(qe.indexedFieldAccess))
-	qe.nilIndex = fieldIndexStorageSlicePool.Get()
-	qe.nilIndex.SetLen(len(qe.indexedFieldAccess))
-	qe.lenIndex = fieldIndexStorageSlicePool.Get()
-	qe.lenIndex.SetLen(len(qe.indexedFieldAccess))
-	qe.lenZeroComplement = pools.GetBoolSlice(len(qe.indexedFieldAccess))[:len(qe.indexedFieldAccess)]
+	slotCount := len(qe.indexedFieldAccess)
+	qe.index = indexdata.GetFieldStorageSlice(slotCount)[:slotCount]
+	qe.nilIndex = indexdata.GetFieldStorageSlice(slotCount)[:slotCount]
+	qe.lenIndex = indexdata.GetFieldStorageSlice(slotCount)[:slotCount]
+	qe.lenZeroComplement = pooled.GetBoolSlice(slotCount)[:slotCount]
 	clear(qe.lenZeroComplement)
-	qe.measure = measureFieldStorageSlicePool.Get()
-	qe.measure.SetLen(len(qe.measureFieldAccess))
+	measureSlotCount := len(qe.measureFieldAccess)
+	qe.measure = indexdata.GetMeasureStorageSlice(measureSlotCount)[:measureSlotCount]
 	return qe, strMap, nil
 }
 
@@ -993,11 +991,6 @@ type (
 		stats Stats[K]
 
 		testHooks *testHooks
-	}
-
-	index struct {
-		Key keycodec.IndexKey
-		IDs posting.List
 	}
 
 	indexedFieldMap map[string]indexedFieldAccessor
@@ -1566,7 +1559,7 @@ func (qe *queryEngine) indexStats(snap *indexSnapshot) IndexStats {
 		FieldApproxStructBytes: make(map[string]uint64),
 		FieldApproxHeapBytes:   make(map[string]uint64),
 	}
-	sharedStructBytes := approxSliceBufBytes(snap.index) + approxSliceBufBytes(snap.nilIndex)
+	sharedStructBytes := indexdata.FieldStorageSlotsApproxBytes(snap.index) + indexdata.FieldStorageSlotsApproxBytes(snap.nilIndex)
 	fieldCount := len(qe.indexedFieldAccess)
 	sharedStructPerField := uint64(0)
 	sharedStructRemainder := uint64(0)
@@ -1577,19 +1570,19 @@ func (qe *queryEngine) indexStats(snap *indexSnapshot) IndexStats {
 
 	for i, acc := range qe.indexedFieldAccess {
 		name := acc.name
-		fieldStats := collectFieldIndexStats(snap.index.Get(acc.ordinal), true)
-		nilStats := collectFieldIndexStats(snap.nilIndex.Get(acc.ordinal), false)
+		fieldStats := snap.index[acc.ordinal].Stats(true)
+		nilStats := snap.nilIndex[acc.ordinal].Stats(false)
 
-		unique := fieldStats.unique + nilStats.unique
-		size := fieldStats.postingBytes + nilStats.postingBytes
-		keyLen := fieldStats.keyBytes + nilStats.keyBytes
-		card := fieldStats.postingCardinality + nilStats.postingCardinality
+		unique := fieldStats.Unique + nilStats.Unique
+		size := fieldStats.PostingBytes + nilStats.PostingBytes
+		keyLen := fieldStats.KeyBytes + nilStats.KeyBytes
+		card := fieldStats.PostingCardinality + nilStats.PostingCardinality
 
 		idx.UniqueFieldKeys[name] = unique
 		idx.FieldSize[name] = size
 		idx.FieldKeyBytes[name] = keyLen
 		idx.FieldTotalCardinality[name] = card
-		fieldStructBytes := fieldStats.approxStructBytes + nilStats.approxStructBytes + sharedStructPerField
+		fieldStructBytes := fieldStats.ApproxStructBytes + nilStats.ApproxStructBytes + sharedStructPerField
 		if uint64(i) < sharedStructRemainder {
 			fieldStructBytes++
 		}
@@ -1597,7 +1590,7 @@ func (qe *queryEngine) indexStats(snap *indexSnapshot) IndexStats {
 		idx.FieldApproxHeapBytes[name] = size + keyLen + fieldStructBytes
 
 		idx.Size += size
-		idx.EntryCount += fieldStats.entryCount + nilStats.entryCount
+		idx.EntryCount += fieldStats.EntryCount + nilStats.EntryCount
 		idx.KeyBytes += keyLen
 		idx.PostingCardinality += card
 		idx.ApproxStructBytes += fieldStructBytes
@@ -1610,113 +1603,6 @@ func unregInstanceOnError(err *error, boltPath string, vname string) {
 	if *err != nil {
 		unregInstance(boltPath, vname)
 	}
-}
-
-type fieldIndexStats struct {
-	unique             uint64
-	postingBytes       uint64
-	keyBytes           uint64
-	postingCardinality uint64
-	entryCount         uint64
-	approxStructBytes  uint64
-}
-
-func collectFieldIndexStats(storage fieldIndexStorage, countDistinct bool) fieldIndexStats {
-	if storage.flat != nil {
-		return collectFlatFieldIndexStats(storage.flat, countDistinct)
-	}
-	if storage.chunked != nil {
-		return collectChunkedFieldIndexStats(storage.chunked, countDistinct)
-	}
-	return fieldIndexStats{}
-}
-
-func collectFlatFieldIndexStats(root *fieldIndexFlatRoot, countDistinct bool) fieldIndexStats {
-	if root == nil {
-		return fieldIndexStats{}
-	}
-	stats := fieldIndexStats{
-		approxStructBytes: uint64(unsafe.Sizeof(fieldIndexFlatRoot{})) +
-			uint64(cap(root.entries))*uint64(unsafe.Sizeof(index{})),
-	}
-	for i := range root.entries {
-		entry := root.entries[i]
-		if entry.Key.IsNumeric() {
-			stats.approxStructBytes -= uint64(unsafe.Sizeof(uint64(0)))
-		}
-		accumulateIndexEntryStats(entry.Key, entry.IDs, countDistinct, &stats)
-	}
-	return stats
-}
-
-func collectChunkedFieldIndexStats(root *fieldIndexChunkedRoot, countDistinct bool) fieldIndexStats {
-	if root == nil {
-		return fieldIndexStats{}
-	}
-	stats := fieldIndexStats{
-		approxStructBytes: uint64(unsafe.Sizeof(fieldIndexChunkedRoot{})) +
-			approxSliceBufBytes(root.pages) +
-			uint64(cap(root.chunkPrefix))*uint64(unsafe.Sizeof(int(0))) +
-			uint64(cap(root.prefix))*uint64(unsafe.Sizeof(int(0))) +
-			uint64(cap(root.rowPrefix))*uint64(unsafe.Sizeof(uint64(0))),
-	}
-	for i := 0; i < root.pages.Len(); i++ {
-		page := root.pages.Get(i)
-		if page == nil {
-			continue
-		}
-		stats.approxStructBytes += uint64(unsafe.Sizeof(fieldIndexChunkDirPage{})) +
-			approxSliceBufBytes(page.refs) +
-			uint64(cap(page.prefix))*uint64(unsafe.Sizeof(int(0))) +
-			uint64(cap(page.rowPrefix))*uint64(unsafe.Sizeof(uint64(0)))
-
-		for j := 0; j < page.refs.Len(); j++ {
-			chunk := page.refs.Get(j).chunk
-			if chunk == nil {
-				continue
-			}
-			stats.approxStructBytes += uint64(unsafe.Sizeof(fieldIndexChunk{}))
-			if chunk.hasStringKeys() {
-				stats.approxStructBytes += uint64(cap(chunk.stringRefs)) * uint64(unsafe.Sizeof(fieldIndexStringRef{}))
-				if chunk.hasUniqueStringOwners() {
-					stats.approxStructBytes += uint64(cap(chunk.numeric)) * uint64(unsafe.Sizeof(uint64(0)))
-				} else {
-					stats.approxStructBytes += uint64(cap(chunk.posts)) * uint64(unsafe.Sizeof(posting.List{}))
-				}
-			} else if chunk.hasUniqueNumericOwners() {
-				stats.approxStructBytes += uint64(cap(chunk.numeric)/2) * uint64(unsafe.Sizeof(uint64(0)))
-			} else {
-				stats.approxStructBytes += uint64(cap(chunk.posts)) * uint64(unsafe.Sizeof(posting.List{}))
-			}
-			for k := 0; k < chunk.keyCount(); k++ {
-				accumulateIndexEntryStats(chunk.keyAt(k), chunk.postingAt(k), countDistinct, &stats)
-			}
-		}
-	}
-	return stats
-}
-
-func accumulateIndexEntryStats(key keycodec.IndexKey, ids posting.List, countDistinct bool, stats *fieldIndexStats) {
-	if ids.IsEmpty() {
-		return
-	}
-	if countDistinct {
-		stats.unique++
-		stats.keyBytes += uint64(key.ByteLen())
-	}
-	stats.postingBytes += ids.SizeInBytes()
-	card := ids.Cardinality()
-	stats.postingCardinality += card
-	stats.entryCount++
-}
-
-func approxSliceBufBytes[T any](buf *pooled.Slice[T]) uint64 {
-	if buf == nil {
-		return 0
-	}
-	var zero T
-	return uint64(unsafe.Sizeof(pooled.Slice[T]{})) +
-		uint64(buf.Cap())*uint64(unsafe.Sizeof(zero))
 }
 
 // AutoBatchStats returns auto-batcher queue, batch, and availability diagnostics.
@@ -1947,16 +1833,14 @@ func (db *DB[K, V]) Truncate() error {
 		return fmt.Errorf("advance bucket sequence: %w", err)
 	}
 
-	nextIndex := fieldIndexStorageSlicePool.Get()
-	nextIndex.SetLen(len(db.engine.indexedFieldAccess))
-	nextNilIndex := fieldIndexStorageSlicePool.Get()
-	nextNilIndex.SetLen(len(db.engine.indexedFieldAccess))
-	nextLenIndex := fieldIndexStorageSlicePool.Get()
-	nextLenIndex.SetLen(len(db.engine.indexedFieldAccess))
-	nextLenZeroComplement := pools.GetBoolSlice(len(db.engine.indexedFieldAccess))[:len(db.engine.indexedFieldAccess)]
+	slotCount := len(db.engine.indexedFieldAccess)
+	nextIndex := indexdata.GetFieldStorageSlice(slotCount)[:slotCount]
+	nextNilIndex := indexdata.GetFieldStorageSlice(slotCount)[:slotCount]
+	nextLenIndex := indexdata.GetFieldStorageSlice(slotCount)[:slotCount]
+	nextLenZeroComplement := pooled.GetBoolSlice(slotCount)[:slotCount]
 	clear(nextLenZeroComplement)
-	nextMeasure := measureFieldStorageSlicePool.Get()
-	nextMeasure.SetLen(len(db.engine.measureFieldAccess))
+	measureSlotCount := len(db.engine.measureFieldAccess)
+	nextMeasure := indexdata.GetMeasureStorageSlice(measureSlotCount)[:measureSlotCount]
 	nextUniverse := posting.List{}
 	var nextStrMap *strMapSnapshot
 	if db.strKey {

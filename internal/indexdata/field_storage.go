@@ -1,15 +1,16 @@
-package rbi
+package indexdata
 
 import (
 	"fmt"
 	"slices"
 	"sort"
+	"strings"
 	"sync/atomic"
+	"unsafe"
 
 	"github.com/vapstack/rbi/internal/binsearch"
 	"github.com/vapstack/rbi/internal/keycodec"
 	"github.com/vapstack/rbi/internal/pooled"
-	"github.com/vapstack/rbi/internal/pools"
 	"github.com/vapstack/rbi/internal/posting"
 )
 
@@ -20,14 +21,24 @@ const (
 	fieldIndexChunkThreshold     = fieldIndexChunkTargetEntries * 2
 	fieldIndexDirPageTargetRefs  = fieldIndexChunkTargetEntries
 	fieldIndexStringRefMax       = 1<<16 - 1
+
+	FieldChunkTargetEntries = fieldIndexChunkTargetEntries
+	FieldChunkMaxEntries    = fieldIndexChunkMaxEntries
+	FieldChunkThreshold     = fieldIndexChunkThreshold
+	FieldDirPageTargetRefs  = fieldIndexDirPageTargetRefs
+	FieldStringRefMax       = fieldIndexStringRefMax
+
+	NilIndexEntryKey = ""
 )
 
-type fieldIndexStringRef struct {
-	off uint16
-	len uint16
+type Entry struct {
+	Key keycodec.IndexKey
+	IDs posting.List
 }
 
-func validateIndexedStringKeyLen(n int) error {
+type fieldIndexStringRef = uint32
+
+func ValidateIndexedStringKeyLen(n int) error {
 	if n > fieldIndexStringRefMax {
 		return fmt.Errorf("indexed string value len %d exceeds limit %d", n, fieldIndexStringRefMax)
 	}
@@ -43,18 +54,23 @@ func fieldIndexStringRefFits(off, n int) bool {
 
 func newFieldIndexStringRef(off, n int) fieldIndexStringRef {
 	if n == 0 {
-		return fieldIndexStringRef{}
+		return fieldIndexStringRef(0)
 	}
 	if off > fieldIndexStringRefMax {
-		panic("field index string ref offset exceeds uint16")
+		panic("field Entry string ref offset exceeds uint16")
 	}
 	if n > fieldIndexStringRefMax {
-		panic("field index string ref len exceeds uint16")
+		panic("field Entry string ref len exceeds uint16")
 	}
-	return fieldIndexStringRef{
-		off: uint16(off),
-		len: uint16(n),
-	}
+	return uint32(off)<<16 | uint32(n)
+}
+
+func fieldIndexStringRefOff(ref fieldIndexStringRef) int {
+	return int(ref >> 16)
+}
+
+func fieldIndexStringRefLen(ref fieldIndexStringRef) int {
+	return int(ref & fieldIndexStringRefMax)
 }
 
 func nextStringFieldIndexChunkSizeStrings(keys []string, start int) int {
@@ -62,6 +78,7 @@ func nextStringFieldIndexChunkSizeStrings(keys []string, start int) int {
 	size := 0
 	bytes := 0
 	limit := min(len(keys)-start, fieldIndexChunkTargetEntries)
+
 	for i := start; size < limit; i++ {
 		keyLen := len(keys[i])
 		if keyLen > fieldIndexStringRefMax {
@@ -84,6 +101,7 @@ func nextStringFieldIndexChunkSizeIndexKeys(keys []keycodec.IndexKey, start int)
 	size := 0
 	bytes := 0
 	limit := min(len(keys)-start, fieldIndexChunkTargetEntries)
+
 	for i := start; size < limit; i++ {
 		keyLen := keys[i].ByteLen()
 		if keyLen > fieldIndexStringRefMax {
@@ -101,11 +119,12 @@ func nextStringFieldIndexChunkSizeIndexKeys(keys []keycodec.IndexKey, start int)
 	return size
 }
 
-func nextStringFieldIndexChunkSizeEntries(entries []index, start int) int {
+func nextStringFieldIndexChunkSizeEntries(entries []Entry, start int) int {
 	target := balancedFieldIndexChunkSize(len(entries) - start)
 	size := 0
 	bytes := 0
 	limit := min(len(entries)-start, fieldIndexChunkTargetEntries)
+
 	for i := start; size < limit; i++ {
 		keyLen := entries[i].Key.ByteLen()
 		if keyLen > fieldIndexStringRefMax {
@@ -123,7 +142,7 @@ func nextStringFieldIndexChunkSizeEntries(entries []index, start int) int {
 	return size
 }
 
-func stringEntriesFitSingleChunk(entries []index) bool {
+func stringEntriesFitSingleChunk(entries []Entry) bool {
 	bytes := 0
 	for i := range entries {
 		keyLen := entries[i].Key.ByteLen()
@@ -144,7 +163,7 @@ func shouldSealStringFieldIndexChunk(keyCount, bytes int) bool {
 
 type fieldIndexFlatRoot struct {
 	refs    atomic.Int32
-	entries []index
+	entries []Entry
 }
 
 type fieldIndexChunk struct {
@@ -179,7 +198,7 @@ type fieldIndexChunkRef struct {
 
 type fieldIndexChunkDirPage struct {
 	refsCount atomic.Int32
-	refs      *pooled.Slice[fieldIndexChunkRef]
+	refs      []fieldIndexChunkRef
 	prefix    []int
 	rowPrefix []uint64
 }
@@ -188,7 +207,7 @@ type fieldIndexChunkDirPage struct {
 // plus top-level chunk/entry prefixes for fast rank/span calculations.
 type fieldIndexChunkedRoot struct {
 	refs        atomic.Int32
-	pages       *pooled.Slice[*fieldIndexChunkDirPage]
+	pages       []*fieldIndexChunkDirPage
 	chunkPrefix []int
 	prefix      []int
 	rowPrefix   []uint64
@@ -201,15 +220,19 @@ type fieldIndexChunkPos struct {
 	entry int
 }
 
-// fieldIndexStorage is a compact nil-based union for one field index backend.
-type fieldIndexStorage struct {
+// FieldStorage is a compact nil-based union for one field Entry backend.
+type FieldStorage struct {
 	flat    *fieldIndexFlatRoot
 	chunked *fieldIndexChunkedRoot
 }
 
+func FieldStorageSlotsApproxBytes(slots []FieldStorage) uint64 {
+	return uint64(cap(slots)) * uint64(unsafe.Sizeof(FieldStorage{}))
+}
+
 type fieldIndexChunkBuilder struct {
-	pages       *pooled.Slice[*fieldIndexChunkDirPage]
-	pendingRefs *pooled.Slice[fieldIndexChunkRef]
+	pages       []*fieldIndexChunkDirPage
+	pendingRefs []fieldIndexChunkRef
 	total       int
 	chunks      int
 }
@@ -229,51 +252,41 @@ type fieldIndexChunkStreamBuilder struct {
 	pendingStringKeys []keycodec.IndexKey
 }
 
-var fieldIndexChunkRefSlicePool = pooled.Slices[fieldIndexChunkRef]{
-	MinCap: fieldIndexDirPageTargetRefs,
-	Clear:  true,
+type FieldStorageRun struct {
+	stringBuf []string
+	u64Buf    []uint64
+	postBuf   []posting.List
 }
 
-var fieldIndexChunkDirPagePtrSlicePool = pooled.Slices[*fieldIndexChunkDirPage]{
-	MinCap: 8,
-	Clear:  true,
+type fieldStorageRunCursor struct {
+	run int
+	pos int
+	key keycodec.IndexKey
 }
 
-var fieldIndexStorageSlicePool = pooled.Slices[fieldIndexStorage]{
-	Clear: true,
+type fieldStorageRunHeap struct {
+	runs []FieldStorageRun
+	buf  []fieldStorageRunCursor
 }
 
-var fieldIndexChunkDirPagePool = pooled.Pointers[fieldIndexChunkDirPage]{Clear: true}
+func fieldPostingSlice(n int) []posting.List          { return posting.GetSlice(n)[:n] }
+func fieldUint64Slice(n int) []uint64                 { return pooled.GetUint64Slice(n)[:n] }
+func fieldStringRefSlice(n int) []fieldIndexStringRef { return pooled.GetUint32Slice(n)[:n] }
+func fieldByteSlice(n int) []byte                     { return pooled.GetByteSlice(n)[:n] }
 
-func newFieldIndexChunkRefBuf(capHint int) *pooled.Slice[fieldIndexChunkRef] {
-	buf := fieldIndexChunkRefSlicePool.Get()
-	if capHint > 0 {
-		buf.Grow(capHint)
-	}
-	return buf
-}
-
-func newFieldIndexChunkDirPageSlice(capHint int) *pooled.Slice[*fieldIndexChunkDirPage] {
-	buf := fieldIndexChunkDirPagePtrSlicePool.Get()
-	if capHint > 0 {
-		buf.Grow(capHint)
-	}
-	return buf
-}
-
-func newFieldIndexChunkDirPageOwned(refs *pooled.Slice[fieldIndexChunkRef]) *fieldIndexChunkDirPage {
+func newFieldIndexChunkDirPageOwned(refs []fieldIndexChunkRef) *fieldIndexChunkDirPage {
 	page := fieldIndexChunkDirPagePool.Get()
 	page.refsCount.Store(1)
 	page.refs = refs
-	page.prefix = pools.GetIntSlice(refs.Len() + 1)[:refs.Len()+1]
+	page.prefix = pooled.GetIntSlice(len(refs) + 1)[:len(refs)+1]
 	page.prefix[0] = 0
-	page.rowPrefix = pools.GetUint64Slice(refs.Len() + 1)[:refs.Len()+1]
+	page.rowPrefix = pooled.GetUint64Slice(len(refs) + 1)[:len(refs)+1]
 	page.rowPrefix[0] = 0
 
 	total := 0
 	rows := uint64(0)
-	for i := 0; i < refs.Len(); i++ {
-		ref := refs.Get(i)
+	for i := range refs {
+		ref := refs[i]
 		total += ref.chunk.keyCount()
 		rows += ref.chunk.rowCount()
 		page.prefix[i+1] = total
@@ -290,32 +303,14 @@ func newFieldIndexChunkDirPage(refs []fieldIndexChunkRef) *fieldIndexChunkDirPag
 	if len(refs) == 0 {
 		return nil
 	}
-	buf := newFieldIndexChunkRefBuf(len(refs))
-	buf.AppendAll(refs)
+	buf := fieldIndexChunkRefSlicePool.Get(len(refs))
+	buf = append(buf, refs...)
 	return newFieldIndexChunkDirPageOwned(buf)
 }
 
 func (p *fieldIndexChunkDirPage) release() {
 	if p == nil || p.refsCount.Add(-1) != 0 {
 		return
-	}
-	if p.refs != nil {
-		for i := 0; i < p.refs.Len(); i++ {
-			ref := p.refs.Get(i)
-			if ref.chunk != nil {
-				ref.chunk.release()
-			}
-		}
-		fieldIndexChunkRefSlicePool.Put(p.refs)
-		p.refs = nil
-	}
-	if p.prefix != nil {
-		pools.PutIntSlice(p.prefix)
-		p.prefix = nil
-	}
-	if p.rowPrefix != nil {
-		pools.PutUint64Slice(p.rowPrefix)
-		p.rowPrefix = nil
 	}
 	fieldIndexChunkDirPagePool.Put(p)
 }
@@ -328,23 +323,23 @@ func (p *fieldIndexChunkDirPage) keyCount() int {
 }
 
 func (p *fieldIndexChunkDirPage) lastKey() keycodec.IndexKey {
-	if p.refs.Len() == 0 {
+	if len(p.refs) == 0 {
 		return keycodec.IndexKey{}
 	}
-	return p.refs.Get(p.refs.Len() - 1).last
+	return p.refs[len(p.refs)-1].last
 }
 
-func releaseFieldIndexChunkDirPages(pages *pooled.Slice[*fieldIndexChunkDirPage]) {
+func releaseFieldIndexChunkDirPages(pages []*fieldIndexChunkDirPage) {
 	if pages == nil {
 		return
 	}
-	for i := 0; i < pages.Len(); i++ {
-		page := pages.Get(i)
+	for i := range pages {
+		page := pages[i]
 		if page != nil {
 			page.release()
 		}
 	}
-	fieldIndexChunkDirPagePtrSlicePool.Put(pages)
+	fieldIndexChunkDirPageSlicePool.Put(pages)
 }
 
 func postingRows(posts []posting.List) uint64 {
@@ -362,20 +357,20 @@ func storedFieldPosting(ids posting.List) posting.List {
 	return ids
 }
 
-func borrowedFieldIndexEntry(ent index) index {
+func (ent Entry) borrow() Entry {
 	ent.IDs = ent.IDs.Borrow()
 	return ent
 }
 
-func copyBorrowedIndexEntries(dst, src []index) {
+func copyBorrowedIndexEntries(dst, src []Entry) {
 	for i := range src {
-		dst[i] = borrowedFieldIndexEntry(src[i])
+		dst[i] = src[i].borrow()
 	}
 }
 
-func appendBorrowedIndexEntries(dst []index, src []index) []index {
+func appendBorrowedIndexEntries(dst []Entry, src []Entry) []Entry {
 	for i := range src {
-		dst = append(dst, borrowedFieldIndexEntry(src[i]))
+		dst = append(dst, src[i].borrow())
 	}
 	return dst
 }
@@ -390,16 +385,17 @@ func newNumericFieldIndexChunk(posts []posting.List, keys []uint64, rows uint64)
 	if chunkAllSingletonPosts(posts) {
 		keyOwners := interleavedNumericChunkPairs(keys, posts)
 		posting.ReleaseAll(posts)
+		posting.PutSlice(posts)
+		pooled.PutUint64Slice(keys)
 		return newUniqueNumericFieldIndexChunk(keyOwners)
 	}
 	for i := range posts {
 		posts[i] = storedFieldPosting(posts[i])
 	}
-	chunk := &fieldIndexChunk{
-		posts:   posts,
-		numeric: keys,
-		rows:    rows,
-	}
+	chunk := fieldIndexChunkPool.Get()
+	chunk.posts = posts
+	chunk.numeric = keys
+	chunk.rows = rows
 	chunk.refs.Store(1)
 	return chunk
 }
@@ -414,7 +410,7 @@ func chunkAllSingletonPosts(posts []posting.List) bool {
 }
 
 func stringChunkOwners(posts []posting.List) []uint64 {
-	owners := make([]uint64, len(posts))
+	owners := fieldUint64Slice(len(posts))
 	for i := range posts {
 		owner, ok := posts[i].TrySingle()
 		if !ok {
@@ -429,7 +425,7 @@ func interleavedNumericChunkPairs(keys []uint64, posts []posting.List) []uint64 
 	if len(keys) != len(posts) {
 		panic("numeric owner chunk keys/posts len mismatch")
 	}
-	keyOwners := make([]uint64, len(keys)*2)
+	keyOwners := fieldUint64Slice(len(keys) * 2)
 	for i := range keys {
 		owner, ok := posts[i].TrySingle()
 		if !ok {
@@ -446,10 +442,9 @@ func newUniqueNumericFieldIndexChunk(keyOwners []uint64) *fieldIndexChunk {
 	if len(keyOwners)&1 != 0 {
 		panic("numeric owner chunk key/owner data len mismatch")
 	}
-	chunk := &fieldIndexChunk{
-		numeric: keyOwners,
-		rows:    uint64(len(keyOwners) >> 1),
-	}
+	chunk := fieldIndexChunkPool.Get()
+	chunk.numeric = keyOwners
+	chunk.rows = uint64(len(keyOwners) >> 1)
 	chunk.refs.Store(1)
 	return chunk
 }
@@ -458,12 +453,11 @@ func newUniqueStringFieldIndexChunk(owners []uint64, refs []fieldIndexStringRef,
 	if len(owners) != len(refs) {
 		panic("string owner chunk owners/refs len mismatch")
 	}
-	chunk := &fieldIndexChunk{
-		numeric:    owners,
-		stringRefs: refs,
-		stringData: data,
-		rows:       uint64(len(refs)),
-	}
+	chunk := fieldIndexChunkPool.Get()
+	chunk.numeric = owners
+	chunk.stringRefs = refs
+	chunk.stringData = data
+	chunk.rows = uint64(len(refs))
 	chunk.refs.Store(1)
 	return chunk
 }
@@ -472,50 +466,68 @@ func newStringFieldIndexChunk(posts []posting.List, refs []fieldIndexStringRef, 
 	if chunkAllSingletonPosts(posts) {
 		owners := stringChunkOwners(posts)
 		posting.ReleaseAll(posts)
+		posting.PutSlice(posts)
 		return newUniqueStringFieldIndexChunk(owners, refs, data)
 	}
 	for i := range posts {
 		posts[i] = storedFieldPosting(posts[i])
 	}
-	chunk := &fieldIndexChunk{
-		posts:      posts,
-		stringRefs: refs,
-		stringData: data,
-		rows:       rows,
-	}
+	chunk := fieldIndexChunkPool.Get()
+	chunk.posts = posts
+	chunk.stringRefs = refs
+	chunk.stringData = data
+	chunk.rows = rows
 	chunk.refs.Store(1)
 	return chunk
 }
 
-func newFlatFieldIndexStorage(slice *[]index) fieldIndexStorage {
-	if slice == nil {
-		return fieldIndexStorage{}
+func newFlatFieldStorage(slice *[]Entry) FieldStorage {
+	if slice == nil || len(*slice) == 0 {
+		return FieldStorage{}
 	}
-	root := &fieldIndexFlatRoot{
-		entries: *slice,
-	}
+	root := fieldIndexFlatRootPool.Get()
+	root.entries = *slice
 	for i := range root.entries {
 		root.entries[i].IDs = storedFieldPosting(root.entries[i].IDs)
 	}
 	root.refs.Store(1)
-	return fieldIndexStorage{flat: root}
+	return FieldStorage{flat: root}
 }
 
-func newChunkedFieldIndexStorage(root *fieldIndexChunkedRoot) fieldIndexStorage {
+func newChunkedFieldStorage(root *fieldIndexChunkedRoot) FieldStorage {
 	if root == nil || root.keyCount == 0 {
-		return fieldIndexStorage{}
+		return FieldStorage{}
 	}
-	return fieldIndexStorage{chunked: root}
+	return FieldStorage{chunked: root}
 }
 
-func newRegularFieldIndexStorage(slice *[]index) fieldIndexStorage {
+type fieldStorageBuilder struct {
+	builder fieldIndexChunkBuilder
+	stream  fieldIndexChunkStreamBuilder
+}
+
+func (b *fieldStorageBuilder) init(capEntries int, numeric bool) {
+	b.builder = newFieldIndexChunkBuilder(capEntries)
+	b.stream = newFieldIndexChunkStreamBuilder(&b.builder, numeric)
+}
+
+func (b *fieldStorageBuilder) append(key keycodec.IndexKey, ids posting.List) {
+	b.stream.append(key, ids)
+}
+
+func (b *fieldStorageBuilder) finish() FieldStorage {
+	b.stream.finish()
+	return newChunkedFieldStorage(b.builder.root())
+}
+
+func newRegularFieldStorage(slice *[]Entry) FieldStorage {
 	if slice == nil || len(*slice) == 0 {
-		return fieldIndexStorage{}
+		return FieldStorage{}
 	}
 	if len(*slice) < fieldIndexChunkThreshold {
-		return newFlatFieldIndexStorage(slice)
+		return newFlatFieldStorage(slice)
 	}
-	return newChunkedFieldIndexStorage(buildChunkedFieldIndexRoot(*slice))
+	return newChunkedFieldStorage(buildChunkedFieldIndexRoot(*slice))
 }
 
 func (r *fieldIndexFlatRoot) retain() {
@@ -526,9 +538,7 @@ func (r *fieldIndexFlatRoot) release() {
 	if r == nil || r.refs.Add(-1) != 0 {
 		return
 	}
-	for i := range r.entries {
-		r.entries[i].IDs.Release()
-	}
+	fieldIndexFlatRootPool.Put(r)
 }
 
 func (c *fieldIndexChunk) retain() {
@@ -539,7 +549,7 @@ func (c *fieldIndexChunk) release() {
 	if c == nil || c.refs.Add(-1) != 0 {
 		return
 	}
-	posting.ReleaseAll(c.posts)
+	fieldIndexChunkPool.Put(c)
 }
 
 func (r *fieldIndexChunkedRoot) retain() {
@@ -550,23 +560,10 @@ func (r *fieldIndexChunkedRoot) release() {
 	if r == nil || r.refs.Add(-1) != 0 {
 		return
 	}
-	releaseFieldIndexChunkDirPages(r.pages)
-	r.pages = nil
-	if r.chunkPrefix != nil {
-		pools.PutIntSlice(r.chunkPrefix)
-		r.chunkPrefix = nil
-	}
-	if r.prefix != nil {
-		pools.PutIntSlice(r.prefix)
-		r.prefix = nil
-	}
-	if r.rowPrefix != nil {
-		pools.PutUint64Slice(r.rowPrefix)
-		r.rowPrefix = nil
-	}
+	fieldIndexChunkedRootPool.Put(r)
 }
 
-func (s fieldIndexStorage) retain() {
+func (s FieldStorage) retain() {
 	if s.flat != nil {
 		s.flat.retain()
 		return
@@ -576,7 +573,7 @@ func (s fieldIndexStorage) retain() {
 	}
 }
 
-func releaseFieldIndexStorageOwned(s fieldIndexStorage) {
+func (s FieldStorage) Release() {
 	if s.flat != nil {
 		s.flat.release()
 		return
@@ -586,44 +583,344 @@ func releaseFieldIndexStorageOwned(s fieldIndexStorage) {
 	}
 }
 
-func releaseFieldIndexStorageMapOwned(m map[string]fieldIndexStorage) {
+func ReleaseFieldStorageMap(m map[string]FieldStorage) {
 	if m == nil {
 		return
 	}
 	for _, storage := range m {
-		releaseFieldIndexStorageOwned(storage)
+		storage.Release()
 	}
 }
 
-func retainSharedFieldIndexStorageSlots(next, prev *pooled.Slice[fieldIndexStorage]) {
+func RetainSharedFieldStorageSlots(next, prev []FieldStorage) {
 	if next == nil || prev == nil {
 		return
 	}
-	limit := min(next.Len(), prev.Len())
+	limit := min(len(next), len(prev))
 	for i := 0; i < limit; i++ {
-		storage := next.Get(i)
-		if storage == prev.Get(i) {
+		storage := next[i]
+		if storage == prev[i] {
 			storage.retain()
 		}
 	}
 }
 
-func releaseFieldIndexStorageSlotsOwned(slots *pooled.Slice[fieldIndexStorage]) {
+func CloneFieldStorageSlots(src []FieldStorage, size int) []FieldStorage {
+	out := GetFieldStorageSlice(size)[:size]
+	if src == nil {
+		return out
+	}
+	limit := min(size, len(src))
+	for i := 0; i < limit; i++ {
+		out[i] = src[i]
+	}
+	return out
+}
+
+func ReleaseFieldStorageSlots(slots []FieldStorage) {
 	if slots == nil {
 		return
 	}
-	for i := 0; i < slots.Len(); i++ {
-		releaseFieldIndexStorageOwned(slots.Get(i))
+	for i := range slots {
+		slots[i].Release()
 	}
-	fieldIndexStorageSlicePool.Put(slots)
+	PutFieldStorageSlice(slots)
 }
 
-func newFlatFieldIndexStorageFromPostingMapOwned(m map[string]posting.List, fixed8 bool) fieldIndexStorage {
-	if len(m) == 0 {
-		postingMapPool.Put(m)
-		return fieldIndexStorage{}
+func (r FieldStorageRun) KeyCount() int {
+	if r.u64Buf != nil {
+		return len(r.u64Buf)
 	}
-	keys := make([]string, 0, len(m))
+	if r.stringBuf == nil {
+		return 0
+	}
+	return len(r.stringBuf)
+}
+
+func (r FieldStorageRun) keyAt(i int) keycodec.IndexKey {
+	if r.u64Buf != nil {
+		return keycodec.FromU64(r.u64Buf[i])
+	}
+	return keycodec.FromString(r.stringBuf[i])
+}
+
+func (r *FieldStorageRun) takePosting(i int) posting.List {
+	ids := r.postBuf[i]
+	r.postBuf[i] = posting.List{}
+	return ids
+}
+
+func (r *FieldStorageRun) ReleaseOwned() {
+	if r.stringBuf != nil {
+		pooled.PutStringSlice(r.stringBuf)
+		r.stringBuf = nil
+	}
+	if r.u64Buf != nil {
+		pooled.PutUint64Slice(r.u64Buf)
+		r.u64Buf = nil
+	}
+	if r.postBuf != nil {
+		posting.ReleaseAll(r.postBuf)
+		posting.PutSlice(r.postBuf)
+		r.postBuf = nil
+	}
+}
+
+func ReleaseFieldStorageRunsOwned(runs []FieldStorageRun) {
+	for i := range runs {
+		runs[i].ReleaseOwned()
+	}
+}
+
+func NewStringFieldStorageRunFromPostingMap(m map[string]posting.List) FieldStorageRun {
+	if len(m) == 0 {
+		return FieldStorageRun{}
+	}
+	keyBuf := pooled.GetStringSlice(len(m))
+	for key, ids := range m {
+		ids = ids.BuildOptimized()
+		if ids.IsEmpty() {
+			delete(m, key)
+			continue
+		}
+		m[key] = ids
+		keyBuf = append(keyBuf, key)
+	}
+	if len(keyBuf) == 0 {
+		pooled.PutStringSlice(keyBuf)
+		return FieldStorageRun{}
+	}
+	sort.Strings(keyBuf)
+	postBuf := posting.GetSlice(len(keyBuf))[:len(keyBuf)]
+	for i := 0; i < len(keyBuf); i++ {
+		postBuf[i] = m[keyBuf[i]]
+	}
+	clear(m)
+	return FieldStorageRun{
+		stringBuf: keyBuf,
+		postBuf:   postBuf,
+	}
+}
+
+func NewFixedFieldStorageRunFromPostingMap(m map[uint64]posting.List) FieldStorageRun {
+	if len(m) == 0 {
+		return FieldStorageRun{}
+	}
+	keyBuf := pooled.GetUint64Slice(len(m))
+	for key, ids := range m {
+		ids = ids.BuildOptimized()
+		if ids.IsEmpty() {
+			delete(m, key)
+			continue
+		}
+		m[key] = ids
+		keyBuf = append(keyBuf, key)
+	}
+	if len(keyBuf) == 0 {
+		pooled.PutUint64Slice(keyBuf)
+		return FieldStorageRun{}
+	}
+	slices.Sort(keyBuf)
+	postBuf := posting.GetSlice(len(keyBuf))[:len(keyBuf)]
+	for i := 0; i < len(keyBuf); i++ {
+		postBuf[i] = m[keyBuf[i]]
+	}
+	clear(m)
+	return FieldStorageRun{
+		u64Buf:  keyBuf,
+		postBuf: postBuf,
+	}
+}
+
+func (h fieldStorageRunHeap) Len() int { return len(h.buf) }
+
+func (h fieldStorageRunHeap) less(i, j int) bool {
+	return keycodec.Compare(h.buf[i].key, h.buf[j].key) < 0
+}
+
+func (h fieldStorageRunHeap) swap(i, j int) {
+	h.buf[i], h.buf[j] = h.buf[j], h.buf[i]
+}
+
+func (h *fieldStorageRunHeap) init() {
+	for i := len(h.buf)/2 - 1; i >= 0; i-- {
+		h.down(i)
+	}
+}
+
+func (h *fieldStorageRunHeap) up(pos int) {
+	for pos > 0 {
+		parent := (pos - 1) >> 1
+		if !h.less(pos, parent) {
+			return
+		}
+		h.swap(parent, pos)
+		pos = parent
+	}
+}
+
+func (h *fieldStorageRunHeap) down(pos int) {
+	for {
+		left := pos*2 + 1
+		if left >= len(h.buf) {
+			return
+		}
+		smallest := left
+		right := left + 1
+		if right < len(h.buf) && h.less(right, left) {
+			smallest = right
+		}
+		if !h.less(smallest, pos) {
+			return
+		}
+		h.swap(pos, smallest)
+		pos = smallest
+	}
+}
+
+func (h *fieldStorageRunHeap) push(run, pos int) {
+	cur := h.runs[run]
+	if pos < 0 || pos >= cur.KeyCount() {
+		return
+	}
+	h.buf = append(h.buf, fieldStorageRunCursor{
+		run: run,
+		pos: pos,
+		key: cur.keyAt(pos),
+	})
+	h.up(len(h.buf) - 1)
+}
+
+func (h *fieldStorageRunHeap) pop() fieldStorageRunCursor {
+	item := h.buf[0]
+	last := len(h.buf) - 1
+	h.buf[0] = h.buf[last]
+	h.buf = h.buf[:last]
+	if len(h.buf) > 0 {
+		h.down(0)
+	}
+	return item
+}
+
+func NewRegularFieldStorageFromRunsOwned(runs []FieldStorageRun) FieldStorage {
+	if len(runs) == 0 {
+		return FieldStorage{}
+	}
+
+	total := 0
+	numeric := false
+	for i := range runs {
+		if runs[i].KeyCount() == 0 {
+			continue
+		}
+		if total == 0 {
+			numeric = runs[i].u64Buf != nil
+		}
+		total += runs[i].KeyCount()
+	}
+	if total == 0 {
+		ReleaseFieldStorageRunsOwned(runs)
+		return FieldStorage{}
+	}
+
+	h := fieldStorageRunHeap{
+		runs: runs,
+		buf:  fieldStorageRunCursorSlicePool.Get(len(runs)),
+	}
+	for i := range runs {
+		run := runs[i]
+		if run.KeyCount() == 0 {
+			continue
+		}
+		h.buf = append(h.buf, fieldStorageRunCursor{
+			run: i,
+			pos: 0,
+			key: run.keyAt(0),
+		})
+	}
+	if len(h.buf) == 0 {
+		fieldStorageRunCursorSlicePool.Put(h.buf)
+		ReleaseFieldStorageRunsOwned(runs)
+		return FieldStorage{}
+	}
+	h.init()
+
+	entries := GetFieldEntrySlice(min(total, fieldIndexChunkThreshold))
+	var builder fieldStorageBuilder
+	chunked := false
+
+	for h.Len() > 0 {
+		item := h.pop()
+		run := &h.runs[item.run]
+		key := item.key
+		merged := run.takePosting(item.pos)
+		h.push(item.run, item.pos+1)
+
+		for h.Len() > 0 {
+			next := h.buf[0]
+			if keycodec.Compare(next.key, key) != 0 {
+				break
+			}
+			item = h.pop()
+			run = &h.runs[item.run]
+			merged = merged.BuildMergedOwned(run.takePosting(item.pos))
+			h.push(item.run, item.pos+1)
+		}
+		merged = merged.BuildOptimized()
+		if !chunked {
+			entries = append(entries, Entry{Key: key, IDs: merged})
+			if len(entries) >= fieldIndexChunkThreshold {
+				builder.init(total, numeric)
+				for i := range entries {
+					builder.append(entries[i].Key, entries[i].IDs)
+				}
+				PutFieldEntrySlice(entries)
+				entries = nil
+				chunked = true
+			}
+			continue
+		}
+		builder.append(key, merged)
+	}
+
+	if !chunked {
+		if len(entries) == 0 {
+			PutFieldEntrySlice(entries)
+			fieldStorageRunCursorSlicePool.Put(h.buf)
+			ReleaseFieldStorageRunsOwned(runs)
+			return FieldStorage{}
+		}
+		storage := newFlatFieldStorage(&entries)
+		fieldStorageRunCursorSlicePool.Put(h.buf)
+		ReleaseFieldStorageRunsOwned(runs)
+		return storage
+	}
+
+	storage := builder.finish()
+	fieldStorageRunCursorSlicePool.Put(h.buf)
+	ReleaseFieldStorageRunsOwned(runs)
+	return storage
+}
+
+func NewNilFieldStorageOwned(ids posting.List) FieldStorage {
+	ids = ids.BuildOptimized()
+	if ids.IsEmpty() {
+		return FieldStorage{}
+	}
+	entries := GetFieldEntrySlice(1)
+	entries = append(entries, Entry{
+		Key: keycodec.FromStoredString(NilIndexEntryKey, false),
+		IDs: ids,
+	})
+	return newFlatFieldStorage(&entries)
+}
+
+func NewFlatFieldStorageFromPostingMapOwned(m map[string]posting.List, fixed8 bool) FieldStorage {
+	if len(m) == 0 {
+		PutPostingMap(m)
+		return FieldStorage{}
+	}
+	keys := pooled.GetStringSlice(len(m))
 	for key, ids := range m {
 		ids = ids.BuildOptimized()
 		if ids.IsEmpty() {
@@ -633,52 +930,29 @@ func newFlatFieldIndexStorageFromPostingMapOwned(m map[string]posting.List, fixe
 		keys = append(keys, key)
 	}
 	if len(keys) == 0 {
-		postingMapPool.Put(m)
-		return fieldIndexStorage{}
+		pooled.PutStringSlice(keys)
+		PutPostingMap(m)
+		return FieldStorage{}
 	}
 	sort.Strings(keys)
-	entries := make([]index, 0, len(keys))
+	entries := GetFieldEntrySlice(len(keys))[:len(keys)]
 	for i := range keys {
-		entries = append(entries, index{
+		entries[i] = Entry{
 			Key: keycodec.FromStoredString(keys[i], fixed8),
 			IDs: m[keys[i]],
-		})
+		}
 	}
-	postingMapPool.Put(m)
-	return newFlatFieldIndexStorage(&entries)
+	pooled.PutStringSlice(keys)
+	PutPostingMap(m)
+	return newFlatFieldStorage(&entries)
 }
 
-func newFlatFieldIndexStorageFromInsertPostingAccumsOwned(
-	m map[string]uint32,
-	arena *insertPostingAccumArena,
-	fixed8 bool,
-) fieldIndexStorage {
+func NewRegularFieldStorageFromPostingMapOwned(m map[string]posting.List, fixed8 bool) FieldStorage {
 	if len(m) == 0 {
-		insertPostingMapPool.Put(m)
-		return fieldIndexStorage{}
+		PutPostingMap(m)
+		return FieldStorage{}
 	}
-	keys := make([]string, 0, len(m))
-	for key := range m {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
-	entries := make([]index, 0, len(keys))
-	for i := range keys {
-		entries = append(entries, index{
-			Key: keycodec.FromStoredString(keys[i], fixed8),
-			IDs: arena.accum(m[keys[i]]).materializeOwned(),
-		})
-	}
-	insertPostingMapPool.Put(m)
-	return newFlatFieldIndexStorage(&entries)
-}
-
-func newRegularFieldIndexStorageFromPostingMapOwned(m map[string]posting.List, fixed8 bool) fieldIndexStorage {
-	if len(m) == 0 {
-		postingMapPool.Put(m)
-		return fieldIndexStorage{}
-	}
-	keys := make([]string, 0, len(m))
+	keys := pooled.GetStringSlice(len(m))
 	for key, ids := range m {
 		ids = ids.BuildOptimized()
 		if ids.IsEmpty() {
@@ -688,20 +962,22 @@ func newRegularFieldIndexStorageFromPostingMapOwned(m map[string]posting.List, f
 		keys = append(keys, key)
 	}
 	if len(keys) == 0 {
-		postingMapPool.Put(m)
-		return fieldIndexStorage{}
+		pooled.PutStringSlice(keys)
+		PutPostingMap(m)
+		return FieldStorage{}
 	}
 	sort.Strings(keys)
 	if len(keys) < fieldIndexChunkThreshold {
-		entries := make([]index, 0, len(keys))
+		entries := GetFieldEntrySlice(len(keys))[:len(keys)]
 		for i := range keys {
-			entries = append(entries, index{
+			entries[i] = Entry{
 				Key: keycodec.FromStoredString(keys[i], fixed8),
 				IDs: m[keys[i]],
-			})
+			}
 		}
-		postingMapPool.Put(m)
-		return newFlatFieldIndexStorage(&entries)
+		pooled.PutStringSlice(keys)
+		PutPostingMap(m)
+		return newFlatFieldStorage(&entries)
 	}
 
 	builder := newFieldIndexChunkBuilder(len(keys))
@@ -709,8 +985,8 @@ func newRegularFieldIndexStorageFromPostingMapOwned(m map[string]posting.List, f
 		size := nextStringFieldIndexChunkSizeStrings(keys, start)
 		end := start + size
 		if fixed8 {
-			numeric := make([]uint64, end-start)
-			posts := make([]posting.List, end-start)
+			numeric := fieldUint64Slice(end - start)
+			posts := fieldPostingSlice(end - start)
 			for i, key := range keys[start:end] {
 				numeric[i] = keycodec.Fixed8StringToU64(key)
 				posts[i] = m[key]
@@ -721,9 +997,9 @@ func newRegularFieldIndexStorageFromPostingMapOwned(m map[string]posting.List, f
 			for _, key := range keys[start:end] {
 				totalBytes += len(key)
 			}
-			data := make([]byte, totalBytes)
-			refs := make([]fieldIndexStringRef, end-start)
-			posts := make([]posting.List, end-start)
+			data := fieldByteSlice(totalBytes)
+			refs := fieldStringRefSlice(end - start)
+			posts := fieldPostingSlice(end - start)
 			off := 0
 			for i, key := range keys[start:end] {
 				n := copy(data[off:], key)
@@ -735,104 +1011,17 @@ func newRegularFieldIndexStorageFromPostingMapOwned(m map[string]posting.List, f
 		}
 		start = end
 	}
-	postingMapPool.Put(m)
-	return newChunkedFieldIndexStorage(builder.root())
+	pooled.PutStringSlice(keys)
+	PutPostingMap(m)
+	return newChunkedFieldStorage(builder.root())
 }
 
-func newRegularFieldIndexStorageFromInsertPostingAccumsOwned(
-	m map[string]uint32,
-	arena *insertPostingAccumArena,
-	fixed8 bool,
-) fieldIndexStorage {
+func NewRegularFieldStorageFromFixedPostingMapOwned(m map[uint64]posting.List) FieldStorage {
 	if len(m) == 0 {
-		insertPostingMapPool.Put(m)
-		return fieldIndexStorage{}
+		PutFixedPostingMap(m)
+		return FieldStorage{}
 	}
-	keys := make([]string, 0, len(m))
-	for key := range m {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
-	if len(keys) < fieldIndexChunkThreshold {
-		entries := make([]index, 0, len(keys))
-		for i := range keys {
-			entries = append(entries, index{
-				Key: keycodec.FromStoredString(keys[i], fixed8),
-				IDs: arena.accum(m[keys[i]]).materializeOwned(),
-			})
-		}
-		insertPostingMapPool.Put(m)
-		return newFlatFieldIndexStorage(&entries)
-	}
-
-	builder := newFieldIndexChunkBuilder(len(keys))
-
-	for start := 0; start < len(keys); {
-		size := nextStringFieldIndexChunkSizeStrings(keys, start)
-		end := start + size
-		if fixed8 {
-			numeric := make([]uint64, end-start)
-			posts := make([]posting.List, end-start)
-			for i, key := range keys[start:end] {
-				numeric[i] = keycodec.Fixed8StringToU64(key)
-				posts[i] = arena.accum(m[key]).materializeOwned()
-			}
-			builder.appendChunk(newNumericFieldIndexChunk(posts, numeric, postingRows(posts)))
-		} else {
-			totalBytes := 0
-			for _, key := range keys[start:end] {
-				totalBytes += len(key)
-			}
-			data := make([]byte, totalBytes)
-			refs := make([]fieldIndexStringRef, end-start)
-			posts := make([]posting.List, end-start)
-			off := 0
-			for i, key := range keys[start:end] {
-				n := copy(data[off:], key)
-				refs[i] = newFieldIndexStringRef(off, n)
-				posts[i] = arena.accum(m[key]).materializeOwned()
-				off += n
-			}
-			builder.appendChunk(newStringFieldIndexChunk(posts, refs, data, postingRows(posts)))
-		}
-		start = end
-	}
-
-	insertPostingMapPool.Put(m)
-
-	return newChunkedFieldIndexStorage(builder.root())
-}
-
-func newFlatFieldIndexStorageFromFixedInsertPostingAccumsOwned(
-	m map[uint64]uint32,
-	arena *insertPostingAccumArena,
-) fieldIndexStorage {
-	if len(m) == 0 {
-		fixedInsertPostingMapPool.Put(m)
-		return fieldIndexStorage{}
-	}
-	keys := make([]uint64, 0, len(m))
-	for key := range m {
-		keys = append(keys, key)
-	}
-	slices.Sort(keys)
-	entries := make([]index, 0, len(keys))
-	for i := range keys {
-		entries = append(entries, index{
-			Key: keycodec.FromU64(keys[i]),
-			IDs: arena.accum(m[keys[i]]).materializeOwned(),
-		})
-	}
-	fixedInsertPostingMapPool.Put(m)
-	return newFlatFieldIndexStorage(&entries)
-}
-
-func newRegularFieldIndexStorageFromFixedPostingMapOwned(m map[uint64]posting.List) fieldIndexStorage {
-	if len(m) == 0 {
-		fixedPostingMapPool.Put(m)
-		return fieldIndexStorage{}
-	}
-	keys := make([]uint64, 0, len(m))
+	keys := pooled.GetUint64Slice(len(m))
 	for key, ids := range m {
 		ids = ids.BuildOptimized()
 		if ids.IsEmpty() {
@@ -842,28 +1031,30 @@ func newRegularFieldIndexStorageFromFixedPostingMapOwned(m map[uint64]posting.Li
 		keys = append(keys, key)
 	}
 	if len(keys) == 0 {
-		fixedPostingMapPool.Put(m)
-		return fieldIndexStorage{}
+		pooled.PutUint64Slice(keys)
+		PutFixedPostingMap(m)
+		return FieldStorage{}
 	}
 	slices.Sort(keys)
 	if len(keys) < fieldIndexChunkThreshold {
-		entries := make([]index, 0, len(keys))
+		entries := GetFieldEntrySlice(len(keys))[:len(keys)]
 		for i := range keys {
-			entries = append(entries, index{
+			entries[i] = Entry{
 				Key: keycodec.FromU64(keys[i]),
 				IDs: m[keys[i]],
-			})
+			}
 		}
-		fixedPostingMapPool.Put(m)
-		return newFlatFieldIndexStorage(&entries)
+		pooled.PutUint64Slice(keys)
+		PutFixedPostingMap(m)
+		return newFlatFieldStorage(&entries)
 	}
 
 	builder := newFieldIndexChunkBuilder(len(keys))
 	for start := 0; start < len(keys); {
 		size := balancedFieldIndexChunkSize(len(keys) - start)
 		end := start + size
-		numeric := make([]uint64, end-start)
-		posts := make([]posting.List, end-start)
+		numeric := fieldUint64Slice(end - start)
+		posts := fieldPostingSlice(end - start)
 		copy(numeric, keys[start:end])
 		for i, key := range keys[start:end] {
 			posts[i] = m[key]
@@ -871,60 +1062,155 @@ func newRegularFieldIndexStorageFromFixedPostingMapOwned(m map[uint64]posting.Li
 		builder.appendChunk(newNumericFieldIndexChunk(posts, numeric, postingRows(posts)))
 		start = end
 	}
-	fixedPostingMapPool.Put(m)
-	return newChunkedFieldIndexStorage(builder.root())
+	pooled.PutUint64Slice(keys)
+	PutFixedPostingMap(m)
+	return newChunkedFieldStorage(builder.root())
 }
 
-func newRegularFieldIndexStorageFromFixedInsertPostingAccumsOwned(
-	m map[uint64]uint32,
-	arena *insertPostingAccumArena,
-) fieldIndexStorage {
-	if len(m) == 0 {
-		fixedInsertPostingMapPool.Put(m)
-		return fieldIndexStorage{}
-	}
-	keys := make([]uint64, 0, len(m))
-	for key := range m {
-		keys = append(keys, key)
+func NewLenFieldStorageFromMapOwned(universe posting.List, lengths map[uint32]posting.List) (FieldStorage, bool) {
+	return newLenFieldStorageFromMapOwned(universe, lengths, posting.List{})
+}
+
+func RebuildLenFieldStorageFromOverlay(universe posting.List, fieldOV FieldOverlay) (FieldStorage, bool) {
+	if universe.IsEmpty() {
+		return FieldStorage{}, false
 	}
 
+	var nonEmpty posting.List
+	counts := lenCountMapPool.Get(1024)
+
+	br := fieldOV.RangeForBounds(Bounds{Has: true})
+	if !br.Empty() {
+		cur := fieldOV.NewCursor(br, false)
+		for {
+			_, ids, ok := cur.Next()
+			if !ok {
+				break
+			}
+			if ids.IsEmpty() {
+				continue
+			}
+			if nonEmpty.IsEmpty() {
+				nonEmpty = ids.Clone()
+			} else {
+				nonEmpty = nonEmpty.BuildOr(ids)
+			}
+			it := ids.Iter()
+			for it.HasNext() {
+				counts[it.Next()]++
+			}
+			it.Release()
+		}
+	}
+
+	lengths := lenPostingMapPool.Get(len(counts) + 1)
+	for idx, ln := range counts {
+		if ln == 0 {
+			continue
+		}
+		ids := lengths[ln]
+		ids = ids.BuildAdded(idx)
+		lengths[ln] = ids
+	}
+	lenCountMapPool.Put(counts)
+
+	empty := universe.Clone()
+	empty = empty.BuildAndNot(nonEmpty)
+	if !empty.IsEmpty() {
+		lengths[0] = empty
+	}
+
+	storage, useZeroComplement := newLenFieldStorageFromMapOwned(universe, lengths, nonEmpty)
+	lenPostingMapPool.Put(lengths)
+	nonEmpty.Release()
+	return storage, useZeroComplement
+}
+
+func newLenFieldStorageFromMapOwned(universe posting.List, lengths map[uint32]posting.List, nonEmpty posting.List) (FieldStorage, bool) {
+	if len(lengths) == 0 || universe.IsEmpty() {
+		posting.ReleaseMap(lengths)
+		clear(lengths)
+		return FieldStorage{}, false
+	}
+
+	empty := lengths[0]
+	emptyCard := empty.Cardinality()
+	nonEmptyCard := uint64(0)
+	if nonEmpty.IsEmpty() {
+		universeCard := universe.Cardinality()
+		if universeCard > emptyCard {
+			nonEmptyCard = universeCard - emptyCard
+		}
+	} else {
+		nonEmptyCard = nonEmpty.Cardinality()
+	}
+	useZeroComplement := nonEmptyCard > 0 && nonEmptyCard < emptyCard
+
+	keys := pooled.GetUint32Slice(len(lengths))
+	for ln, ids := range lengths {
+		if useZeroComplement && ln == 0 {
+			continue
+		}
+		ids = ids.BuildOptimized()
+		if ids.IsEmpty() {
+			delete(lengths, ln)
+			continue
+		}
+		lengths[ln] = ids
+		keys = append(keys, ln)
+	}
 	slices.Sort(keys)
-	if len(keys) < fieldIndexChunkThreshold {
-		entries := make([]index, 0, len(keys))
-		for i := range keys {
-			entries = append(entries, index{
-				Key: keycodec.FromU64(keys[i]),
-				IDs: arena.accum(m[keys[i]]).materializeOwned(),
+
+	capHint := len(keys)
+	if useZeroComplement {
+		capHint++
+	}
+	entries := GetFieldEntrySlice(capHint)
+	for i := range keys {
+		ln := keys[i]
+		entries = append(entries, Entry{
+			Key: keycodec.FromU64(uint64(ln)),
+			IDs: lengths[ln],
+		})
+		delete(lengths, ln)
+	}
+	pooled.PutUint32Slice(keys)
+
+	if useZeroComplement {
+		var ids posting.List
+		if nonEmpty.IsEmpty() {
+			ids = universe.Clone()
+			if !empty.IsEmpty() {
+				ids = ids.BuildAndNot(empty)
+			}
+		} else {
+			ids = nonEmpty.Clone()
+		}
+		empty.Release()
+		delete(lengths, 0)
+
+		ids = ids.BuildOptimized()
+		if !ids.IsEmpty() {
+			// The marker starts with 0xff, after every uint32 length encoded as u64.
+			entries = append(entries, Entry{
+				Key: keycodec.FromString(LenIndexNonEmptyKey),
+				IDs: ids,
 			})
 		}
-		fixedInsertPostingMapPool.Put(m)
-		return newFlatFieldIndexStorage(&entries)
 	}
 
-	builder := newFieldIndexChunkBuilder(len(keys))
-	for start := 0; start < len(keys); {
-		size := balancedFieldIndexChunkSize(len(keys) - start)
-		end := start + size
-		numeric := make([]uint64, end-start)
-		posts := make([]posting.List, end-start)
-		copy(numeric, keys[start:end])
-		for i, key := range keys[start:end] {
-			posts[i] = arena.accum(m[key]).materializeOwned()
-		}
-		builder.appendChunk(newNumericFieldIndexChunk(posts, numeric, postingRows(posts)))
-		start = end
+	if len(entries) == 0 {
+		PutFieldEntrySlice(entries)
+		return FieldStorage{}, false
 	}
-
-	fixedInsertPostingMapPool.Put(m)
-
-	return newChunkedFieldIndexStorage(builder.root())
+	return newFlatFieldStorage(&entries), useZeroComplement
 }
 
-func (s fieldIndexStorage) isChunked() bool {
+func (s FieldStorage) IsChunked() bool {
 	return s.chunked != nil
 }
 
-func (s fieldIndexStorage) keyCount() int {
+func (s FieldStorage) KeyCount() int {
 	if s.chunked != nil {
 		return s.chunked.keyCount
 	}
@@ -934,82 +1220,50 @@ func (s fieldIndexStorage) keyCount() int {
 	return len(s.flat.entries)
 }
 
-func (s fieldIndexStorage) flatSlice() *[]index {
-	if s.chunked != nil {
-		return nil
-	}
-	if s.flat == nil {
-		return nil
-	}
-	return &s.flat.entries
-}
-
 func (c *fieldIndexChunk) keyCount() int {
-	if c == nil {
-		return 0
-	}
-	if c.hasUniqueNumericOwners() {
-		return len(c.numeric) >> 1
-	}
-	if c.hasStringKeys() {
+	if c.stringRefs != nil {
 		return len(c.stringRefs)
+	}
+	if c.posts == nil {
+		return len(c.numeric) >> 1
 	}
 	return len(c.numeric)
 }
 
 func (c *fieldIndexChunk) keyAt(i int) keycodec.IndexKey {
-	if c == nil || i < 0 || i >= c.keyCount() {
-		return keycodec.IndexKey{}
-	}
-	if c.hasStringKeys() {
+	if c.stringRefs != nil {
 		ref := c.stringRefs[i]
-		return keycodec.FromBytes(c.stringData[int(ref.off) : int(ref.off)+int(ref.len)])
+		return keycodec.FromBytes(c.stringData[fieldIndexStringRefOff(ref) : fieldIndexStringRefOff(ref)+fieldIndexStringRefLen(ref)])
 	}
-	if c.hasUniqueNumericOwners() {
+	if c.posts == nil {
 		return keycodec.FromU64(c.numeric[i<<1])
 	}
 	return keycodec.FromU64(c.numeric[i])
 }
 
 func (c *fieldIndexChunk) postingAt(i int) posting.List {
-	var p posting.List
-	if c == nil || i < 0 {
-		return p
-	}
-	if c.hasUniqueStringOwners() {
-		if i >= len(c.numeric) {
-			return p
-		}
+	if c.stringRefs != nil && c.posts == nil {
+		var p posting.List
 		return p.BuildAdded(c.numeric[i])
 	}
-	if c.hasUniqueNumericOwners() {
+	if c.posts == nil {
 		base := i << 1
-		if base+1 >= len(c.numeric) {
-			return p
-		}
+		var p posting.List
 		return p.BuildAdded(c.numeric[base+1])
-	}
-	if i >= len(c.posts) {
-		return p
 	}
 	return c.posts[i].Borrow()
 }
 
 func (c *fieldIndexChunk) rowCount() uint64 {
-	if c == nil {
-		return 0
-	}
 	return c.rows
 }
 
 func (c *fieldIndexChunk) rowsInRange(start, end int) uint64 {
-	if c == nil {
-		return 0
-	}
 	limit := len(c.posts)
-	if c.hasUniqueStringOwners() {
-		limit = len(c.numeric)
-	} else if c.hasUniqueNumericOwners() {
+	unique := c.posts == nil
+	if c.stringRefs != nil {
+		limit = len(c.stringRefs)
+	} else if unique {
 		limit = len(c.numeric) >> 1
 	}
 	if start < 0 {
@@ -1021,7 +1275,7 @@ func (c *fieldIndexChunk) rowsInRange(start, end int) uint64 {
 	if start >= end {
 		return 0
 	}
-	if c.hasUniqueStringOwners() || c.hasUniqueNumericOwners() {
+	if unique {
 		return uint64(end - start)
 	}
 	var total uint64
@@ -1031,14 +1285,14 @@ func (c *fieldIndexChunk) rowsInRange(start, end int) uint64 {
 	return total
 }
 
-func newFieldIndexChunkFromEntries(entries []index) *fieldIndexChunk {
+func newFieldIndexChunkFromEntries(entries []Entry) *fieldIndexChunk {
 	if len(entries) == 0 {
 		return nil
 	}
-	posts := make([]posting.List, len(entries))
+	posts := fieldPostingSlice(len(entries))
 	var rows uint64
 	if entries[0].Key.IsNumeric() {
-		keys := make([]uint64, len(entries))
+		keys := fieldUint64Slice(len(entries))
 		for i := range entries {
 			keys[i] = entries[i].Key.U64()
 			posts[i] = storedFieldPosting(entries[i].IDs)
@@ -1051,8 +1305,8 @@ func newFieldIndexChunkFromEntries(entries []index) *fieldIndexChunk {
 	for i := range entries {
 		totalBytes += entries[i].Key.ByteLen()
 	}
-	refs := make([]fieldIndexStringRef, len(entries))
-	data := make([]byte, totalBytes)
+	refs := fieldStringRefSlice(len(entries))
+	data := fieldByteSlice(totalBytes)
 	off := 0
 	for i := range entries {
 		s := entries[i].Key.UnsafeString()
@@ -1065,12 +1319,12 @@ func newFieldIndexChunkFromEntries(entries []index) *fieldIndexChunk {
 	return newStringFieldIndexChunk(posts, refs, data, rows)
 }
 
-func newFieldIndexChunkRefsFromEntries(entries []index) []fieldIndexChunkRef {
+func newFieldIndexChunkRefsFromEntries(entries []Entry) []fieldIndexChunkRef {
 	if len(entries) == 0 {
 		return nil
 	}
 
-	refs := make([]fieldIndexChunkRef, 0, max(1, len(entries)/fieldIndexChunkTargetEntries+1))
+	refs := fieldIndexChunkRefSlicePool.Get(max(1, len(entries)/fieldIndexChunkTargetEntries+1))
 	numeric := entries[0].Key.IsNumeric()
 
 	for start := 0; start < len(entries); {
@@ -1091,7 +1345,7 @@ func newFieldIndexChunkRefsFromEntries(entries []index) []fieldIndexChunkRef {
 	return refs
 }
 
-func lowerBoundFieldIndexChunk(chunk *fieldIndexChunk, key string) int {
+func (chunk *fieldIndexChunk) lowerBound(key string) int {
 	lo, hi := 0, chunk.keyCount()
 	for lo < hi {
 		mid := (lo + hi) >> 1
@@ -1104,7 +1358,7 @@ func lowerBoundFieldIndexChunk(chunk *fieldIndexChunk, key string) int {
 	return lo
 }
 
-func lowerBoundFieldIndexChunkKey(chunk *fieldIndexChunk, key keycodec.IndexKey) int {
+func (chunk *fieldIndexChunk) lowerBoundKey(key keycodec.IndexKey) int {
 	lo, hi := 0, chunk.keyCount()
 	for lo < hi {
 		mid := (lo + hi) >> 1
@@ -1117,7 +1371,7 @@ func lowerBoundFieldIndexChunkKey(chunk *fieldIndexChunk, key keycodec.IndexKey)
 	return lo
 }
 
-func lowerBoundIndexEntriesKey(entries []index, key keycodec.IndexKey) int {
+func lowerBoundIndexEntriesKey(entries []Entry, key keycodec.IndexKey) int {
 	lo, hi := 0, len(entries)
 	for lo < hi {
 		mid := (lo + hi) >> 1
@@ -1130,7 +1384,7 @@ func lowerBoundIndexEntriesKey(entries []index, key keycodec.IndexKey) int {
 	return lo
 }
 
-func upperBoundIndexEntriesKey(entries []index, key keycodec.IndexKey) int {
+func upperBoundIndexEntriesKey(entries []Entry, key keycodec.IndexKey) int {
 	lo, hi := 0, len(entries)
 	for lo < hi {
 		mid := (lo + hi) >> 1
@@ -1143,11 +1397,11 @@ func upperBoundIndexEntriesKey(entries []index, key keycodec.IndexKey) int {
 	return lo
 }
 
-func searchChunkPageByLastKeyFrom(pages *pooled.Slice[*fieldIndexChunkDirPage], start int, key keycodec.IndexKey) int {
-	lo, hi := start, pages.Len()
+func (r *fieldIndexChunkedRoot) searchPageByLastKeyFrom(start int, key keycodec.IndexKey) int {
+	lo, hi := start, len(r.pages)
 	for lo < hi {
 		mid := lo + (hi-lo)>>1
-		if keycodec.Compare(pages.Get(mid).lastKey(), key) >= 0 {
+		if keycodec.Compare(r.pages[mid].lastKey(), key) >= 0 {
 			hi = mid
 		} else {
 			lo = mid + 1
@@ -1156,11 +1410,11 @@ func searchChunkPageByLastKeyFrom(pages *pooled.Slice[*fieldIndexChunkDirPage], 
 	return lo
 }
 
-func searchChunkRefByLastKeyFrom(page *fieldIndexChunkDirPage, start int, key keycodec.IndexKey) int {
-	lo, hi := start, page.refs.Len()
+func (page *fieldIndexChunkDirPage) searchRefByLastKeyFrom(start int, key keycodec.IndexKey) int {
+	lo, hi := start, len(page.refs)
 	for lo < hi {
 		mid := lo + (hi-lo)>>1
-		if keycodec.Compare(page.refs.Get(mid).last, key) >= 0 {
+		if keycodec.Compare(page.refs[mid].last, key) >= 0 {
 			hi = mid
 		} else {
 			lo = mid + 1
@@ -1169,7 +1423,33 @@ func searchChunkRefByLastKeyFrom(page *fieldIndexChunkDirPage, start int, key ke
 	return lo
 }
 
-func upperBoundFieldIndexChunk(chunk *fieldIndexChunk, key string) int {
+func (r *fieldIndexChunkedRoot) searchPageByLastString(key string) int {
+	lo, hi := 0, len(r.pages)
+	for lo < hi {
+		mid := lo + (hi-lo)>>1
+		if keycodec.CompareString(r.pages[mid].lastKey(), key) >= 0 {
+			hi = mid
+		} else {
+			lo = mid + 1
+		}
+	}
+	return lo
+}
+
+func (page *fieldIndexChunkDirPage) searchRefByLastString(key string) int {
+	lo, hi := 0, len(page.refs)
+	for lo < hi {
+		mid := lo + (hi-lo)>>1
+		if keycodec.CompareString(page.refs[mid].last, key) >= 0 {
+			hi = mid
+		} else {
+			lo = mid + 1
+		}
+	}
+	return lo
+}
+
+func (chunk *fieldIndexChunk) upperBound(key string) int {
 	lo, hi := 0, chunk.keyCount()
 	for lo < hi {
 		mid := (lo + hi) >> 1
@@ -1182,7 +1462,7 @@ func upperBoundFieldIndexChunk(chunk *fieldIndexChunk, key string) int {
 	return lo
 }
 
-func upperBoundFieldIndexChunkKey(chunk *fieldIndexChunk, key keycodec.IndexKey) int {
+func (chunk *fieldIndexChunk) upperBoundKey(key keycodec.IndexKey) int {
 	lo, hi := 0, chunk.keyCount()
 	for lo < hi {
 		mid := (lo + hi) >> 1
@@ -1195,7 +1475,7 @@ func upperBoundFieldIndexChunkKey(chunk *fieldIndexChunk, key keycodec.IndexKey)
 	return lo
 }
 
-func lowerBoundFieldIndexChunkPrefixUpperBound(chunk *fieldIndexChunk, upper keycodec.PrefixUpperBound) int {
+func (chunk *fieldIndexChunk) lowerBoundPrefixUpperBound(upper keycodec.PrefixUpperBound) int {
 	lo, hi := 0, chunk.keyCount()
 	for lo < hi {
 		mid := (lo + hi) >> 1
@@ -1226,7 +1506,7 @@ func balancedFieldIndexChunkSize(remaining int) int {
 	return size
 }
 
-func retainedFieldIndexChunkRef(ref fieldIndexChunkRef) fieldIndexChunkRef {
+func (ref fieldIndexChunkRef) retained() fieldIndexChunkRef {
 	ref.chunk.retain()
 	return ref
 }
@@ -1235,12 +1515,12 @@ func newFieldIndexChunkStreamBuilder(builder *fieldIndexChunkBuilder, numeric bo
 	out := fieldIndexChunkStreamBuilder{
 		builder: builder,
 		numeric: numeric,
-		posts:   make([]posting.List, 0, fieldIndexChunkTargetEntries),
+		posts:   posting.GetSlice(fieldIndexChunkTargetEntries),
 	}
 	if numeric {
-		out.numericKey = make([]uint64, 0, fieldIndexChunkTargetEntries)
+		out.numericKey = pooled.GetUint64Slice(fieldIndexChunkTargetEntries)
 	} else {
-		out.stringKeys = make([]keycodec.IndexKey, 0, fieldIndexChunkTargetEntries)
+		out.stringKeys = getFieldIndexKeySlice(fieldIndexChunkTargetEntries)
 	}
 	return out
 }
@@ -1293,6 +1573,25 @@ func (b *fieldIndexChunkStreamBuilder) publishPendingChunk() {
 	b.pendingStringKeys = nil
 }
 
+func (b *fieldIndexChunkStreamBuilder) releaseActiveScratch() {
+	if b.posts != nil {
+		posting.PutSlice(b.posts)
+		b.posts = nil
+	}
+	if b.numeric && b.numericKey != nil {
+		pooled.PutUint64Slice(b.numericKey)
+		b.numericKey = nil
+	}
+	if !b.numeric && b.stringKeys != nil {
+		putFieldIndexKeySlice(b.stringKeys)
+	}
+	if b.freeStringKeys != nil {
+		putFieldIndexKeySlice(b.freeStringKeys)
+	}
+	b.stringKeys = nil
+	b.freeStringKeys = nil
+}
+
 func (b *fieldIndexChunkStreamBuilder) sealActiveChunk() {
 	if b == nil || b.builder == nil || len(b.posts) == 0 {
 		return
@@ -1302,17 +1601,21 @@ func (b *fieldIndexChunkStreamBuilder) sealActiveChunk() {
 	b.pendingRows = b.rows
 	if b.numeric {
 		b.pendingNumericKey = b.numericKey
-		b.numericKey = make([]uint64, 0, fieldIndexChunkTargetEntries)
+		b.numericKey = pooled.GetUint64Slice(fieldIndexChunkTargetEntries)
 	} else {
 		b.pendingStringKeys = b.stringKeys
 		if cap(b.freeStringKeys) >= fieldIndexChunkTargetEntries {
 			b.stringKeys = b.freeStringKeys[:0]
 			b.freeStringKeys = nil
 		} else {
-			b.stringKeys = make([]keycodec.IndexKey, 0, fieldIndexChunkTargetEntries)
+			if b.freeStringKeys != nil {
+				putFieldIndexKeySlice(b.freeStringKeys)
+				b.freeStringKeys = nil
+			}
+			b.stringKeys = getFieldIndexKeySlice(fieldIndexChunkTargetEntries)
 		}
 	}
-	b.posts = make([]posting.List, 0, fieldIndexChunkTargetEntries)
+	b.posts = posting.GetSlice(fieldIndexChunkTargetEntries)
 	b.rows = 0
 	b.stringBytes = 0
 }
@@ -1323,6 +1626,7 @@ func (b *fieldIndexChunkStreamBuilder) finish() {
 	}
 	if len(b.pendingPosts) == 0 {
 		if len(b.posts) == 0 {
+			b.releaseActiveScratch()
 			return
 		}
 		b.publishActiveChunk()
@@ -1330,6 +1634,7 @@ func (b *fieldIndexChunkStreamBuilder) finish() {
 	}
 	if len(b.posts) == 0 {
 		b.publishPendingChunk()
+		b.releaseActiveScratch()
 		return
 	}
 	if len(b.posts) >= fieldIndexChunkMinEntries {
@@ -1351,8 +1656,8 @@ func newFieldIndexChunkFromKeys(posts []posting.List, keys []keycodec.IndexKey, 
 	for i := range keys {
 		totalBytes += keys[i].ByteLen()
 	}
-	refs := make([]fieldIndexStringRef, len(keys))
-	data := make([]byte, totalBytes)
+	refs := fieldStringRefSlice(len(keys))
+	data := fieldByteSlice(totalBytes)
 	off := 0
 	for i := range keys {
 		n := copy(data[off:], keys[i].UnsafeString())
@@ -1362,8 +1667,7 @@ func newFieldIndexChunkFromKeys(posts []posting.List, keys []keycodec.IndexKey, 
 	return newStringFieldIndexChunk(posts, refs, data, rows)
 }
 
-func newNumericFieldIndexChunkRefsWithInsertedEntry(ref fieldIndexChunkRef, pos int, add index) []fieldIndexChunkRef {
-	chunk := ref.chunk
+func (chunk *fieldIndexChunk) numericRefsWithInsertedEntry(pos int, add Entry) []fieldIndexChunkRef {
 	if chunk == nil {
 		return nil
 	}
@@ -1373,8 +1677,8 @@ func newNumericFieldIndexChunkRefsWithInsertedEntry(ref fieldIndexChunkRef, pos 
 	}
 
 	if total <= fieldIndexChunkMaxEntries {
-		keys := make([]uint64, total)
-		posts := make([]posting.List, total)
+		keys := fieldUint64Slice(total)
+		posts := fieldPostingSlice(total)
 		src := 0
 		for dst := 0; dst < total; dst++ {
 			if dst == pos {
@@ -1387,16 +1691,18 @@ func newNumericFieldIndexChunkRefsWithInsertedEntry(ref fieldIndexChunkRef, pos 
 			src++
 		}
 		next := newNumericFieldIndexChunk(posts, keys, chunk.rows+add.IDs.Cardinality())
-		return []fieldIndexChunkRef{{last: next.keyAt(total - 1), chunk: next}}
+		refs := fieldIndexChunkRefSlicePool.Get(1)
+		refs = append(refs, fieldIndexChunkRef{last: next.keyAt(total - 1), chunk: next})
+		return refs
 	}
 
 	firstSize := balancedFieldIndexChunkSize(total)
 	secondSize := total - firstSize
 
-	firstKeys := make([]uint64, firstSize)
-	firstPosts := make([]posting.List, firstSize)
-	secondKeys := make([]uint64, secondSize)
-	secondPosts := make([]posting.List, secondSize)
+	firstKeys := fieldUint64Slice(firstSize)
+	firstPosts := fieldPostingSlice(firstSize)
+	secondKeys := fieldUint64Slice(secondSize)
+	secondPosts := fieldPostingSlice(secondSize)
 
 	var firstRows uint64
 	var secondRows uint64
@@ -1427,54 +1733,82 @@ func newNumericFieldIndexChunkRefsWithInsertedEntry(ref fieldIndexChunkRef, pos 
 
 	first := newNumericFieldIndexChunk(firstPosts, firstKeys, firstRows)
 	second := newNumericFieldIndexChunk(secondPosts, secondKeys, secondRows)
-	return []fieldIndexChunkRef{
-		{last: first.keyAt(firstSize - 1), chunk: first},
-		{last: second.keyAt(secondSize - 1), chunk: second},
-	}
+	refs := fieldIndexChunkRefSlicePool.Get(2)
+	refs = append(refs, fieldIndexChunkRef{last: first.keyAt(firstSize - 1), chunk: first})
+	refs = append(refs, fieldIndexChunkRef{last: second.keyAt(secondSize - 1), chunk: second})
+	return refs
 }
 
-func newStringFieldIndexChunkRefsWithInsertedEntry(ref fieldIndexChunkRef, pos int, add index) []fieldIndexChunkRef {
-	chunk := ref.chunk
+func (chunk *fieldIndexChunk) stringRefsWithInsertedEntry(pos int, add Entry) []fieldIndexChunkRef {
 	if chunk == nil {
 		return nil
 	}
-	entries := fieldIndexChunkEntriesBorrowed(chunk)
-	if len(entries) == 0 {
+	baseLen := chunk.keyCount()
+	if baseLen == 0 {
 		return nil
 	}
-	entries = append(entries, index{})
-	copy(entries[pos+1:], entries[pos:])
-	entries[pos] = index{Key: add.Key, IDs: add.IDs}
+	entries := GetFieldEntrySlice(baseLen + 1)[:baseLen+1]
+	for i := 0; i < pos; i++ {
+		entries[i] = Entry{Key: chunk.keyAt(i), IDs: chunk.postingAt(i)}
+	}
+	entries[pos] = Entry{Key: add.Key, IDs: add.IDs}
+	for i := pos; i < baseLen; i++ {
+		entries[i+1] = Entry{Key: chunk.keyAt(i), IDs: chunk.postingAt(i)}
+	}
 	if len(entries) <= fieldIndexChunkMaxEntries && stringEntriesFitSingleChunk(entries) {
 		next := newFieldIndexChunkFromEntries(entries)
-		return []fieldIndexChunkRef{{last: next.keyAt(len(entries) - 1), chunk: next}}
+		PutFieldEntrySlice(entries)
+		refs := fieldIndexChunkRefSlicePool.Get(1)
+		refs = append(refs, fieldIndexChunkRef{last: next.keyAt(len(entries) - 1), chunk: next})
+		return refs
 	}
-	return newFieldIndexChunkRefsFromEntries(entries)
+	refs := newFieldIndexChunkRefsFromEntries(entries)
+	PutFieldEntrySlice(entries)
+	return refs
 }
 
-func newFieldIndexChunkRefsWithInsertedEntry(ref fieldIndexChunkRef, pos int, add index) []fieldIndexChunkRef {
-	if ref.chunk == nil {
+func (chunk *fieldIndexChunk) refsWithInsertedEntry(pos int, add Entry) []fieldIndexChunkRef {
+	if chunk == nil {
 		return nil
 	}
-	if ref.chunk.hasNumericKeys() {
-		return newNumericFieldIndexChunkRefsWithInsertedEntry(ref, pos, add)
+	if chunk.hasNumericKeys() {
+		return chunk.numericRefsWithInsertedEntry(pos, add)
 	}
-	return newStringFieldIndexChunkRefsWithInsertedEntry(ref, pos, add)
+	return chunk.stringRefsWithInsertedEntry(pos, add)
+}
+
+func (chunk *fieldIndexChunk) borrowEntries() []Entry {
+	if chunk == nil || chunk.keyCount() == 0 {
+		return nil
+	}
+	entries := GetFieldEntrySlice(chunk.keyCount())[:chunk.keyCount()]
+	for i := range entries {
+		entries[i] = Entry{
+			Key: chunk.keyAt(i),
+			IDs: chunk.postingAt(i),
+		}
+	}
+	return entries
 }
 
 func (b *fieldIndexChunkStreamBuilder) publishActiveChunk() {
 	if b == nil || b.builder == nil || len(b.posts) == 0 {
 		return
 	}
-	posts := slices.Clone(b.posts)
+	posts := b.posts
 	if b.numeric {
-		b.builder.appendChunk(newNumericFieldIndexChunk(posts, slices.Clone(b.numericKey), b.rows))
-		b.numericKey = b.numericKey[:0]
+		b.builder.appendChunk(newNumericFieldIndexChunk(posts, b.numericKey, b.rows))
+		b.numericKey = nil
 	} else {
 		b.builder.appendChunk(newFieldIndexChunkFromKeys(posts, b.stringKeys, b.rows))
-		b.stringKeys = b.stringKeys[:0]
+		putFieldIndexKeySlice(b.stringKeys)
+		b.stringKeys = nil
+		if b.freeStringKeys != nil {
+			putFieldIndexKeySlice(b.freeStringKeys)
+			b.freeStringKeys = nil
+		}
 	}
-	b.posts = b.posts[:0]
+	b.posts = nil
 	b.rows = 0
 	b.stringBytes = 0
 }
@@ -1484,37 +1818,54 @@ func (b *fieldIndexChunkStreamBuilder) rebalancePendingWithTail() {
 		return
 	}
 	total := len(b.pendingPosts) + len(b.posts)
-	combinedPosts := make([]posting.List, 0, total)
+	combinedPosts := posting.GetSlice(total)
 	combinedPosts = append(combinedPosts, b.pendingPosts...)
 	combinedPosts = append(combinedPosts, b.posts...)
 	if b.numeric {
 		firstSize := balancedFieldIndexChunkSize(total)
 		secondSize := total - firstSize
-		firstPosts := slices.Clone(combinedPosts[:firstSize])
-		secondPosts := slices.Clone(combinedPosts[firstSize:])
-		combinedKeys := make([]uint64, 0, total)
+		firstPosts := fieldPostingSlice(firstSize)
+		copy(firstPosts, combinedPosts[:firstSize])
+		secondPosts := fieldPostingSlice(secondSize)
+		copy(secondPosts, combinedPosts[firstSize:])
+		combinedKeys := pooled.GetUint64Slice(total)
 		combinedKeys = append(combinedKeys, b.pendingNumericKey...)
 		combinedKeys = append(combinedKeys, b.numericKey...)
-		b.builder.appendChunk(newNumericFieldIndexChunk(firstPosts, slices.Clone(combinedKeys[:firstSize]), postingRows(firstPosts)))
-		b.builder.appendChunk(newNumericFieldIndexChunk(secondPosts, slices.Clone(combinedKeys[firstSize:firstSize+secondSize]), postingRows(secondPosts)))
+		firstKeys := fieldUint64Slice(firstSize)
+		copy(firstKeys, combinedKeys[:firstSize])
+		secondKeys := fieldUint64Slice(secondSize)
+		copy(secondKeys, combinedKeys[firstSize:firstSize+secondSize])
+		b.builder.appendChunk(newNumericFieldIndexChunk(firstPosts, firstKeys, postingRows(firstPosts)))
+		b.builder.appendChunk(newNumericFieldIndexChunk(secondPosts, secondKeys, postingRows(secondPosts)))
+		pooled.PutUint64Slice(combinedKeys)
+		pooled.PutUint64Slice(b.pendingNumericKey)
+		pooled.PutUint64Slice(b.numericKey)
 		b.pendingNumericKey = nil
-		b.numericKey = b.numericKey[:0]
+		b.numericKey = nil
 	} else {
-		combinedKeys := make([]keycodec.IndexKey, 0, total)
+		combinedKeys := getFieldIndexKeySlice(total)
 		combinedKeys = append(combinedKeys, b.pendingStringKeys...)
 		combinedKeys = append(combinedKeys, b.stringKeys...)
 		for start := 0; start < len(combinedKeys); {
 			size := nextStringFieldIndexChunkSizeIndexKeys(combinedKeys, start)
 			end := start + size
-			b.builder.appendChunk(newFieldIndexChunkFromKeys(combinedPosts[start:end], combinedKeys[start:end], postingRows(combinedPosts[start:end])))
+			chunkPosts := fieldPostingSlice(size)
+			copy(chunkPosts, combinedPosts[start:end])
+			b.builder.appendChunk(newFieldIndexChunkFromKeys(chunkPosts, combinedKeys[start:end], postingRows(chunkPosts)))
 			start = end
 		}
+		putFieldIndexKeySlice(combinedKeys)
+		putFieldIndexKeySlice(b.pendingStringKeys)
+		putFieldIndexKeySlice(b.stringKeys)
 		b.pendingStringKeys = nil
-		b.stringKeys = b.stringKeys[:0]
+		b.stringKeys = nil
 	}
+	posting.PutSlice(b.pendingPosts)
+	posting.PutSlice(b.posts)
 	b.pendingPosts = nil
 	b.pendingRows = 0
-	b.posts = b.posts[:0]
+	posting.PutSlice(combinedPosts)
+	b.posts = nil
 	b.rows = 0
 	b.stringBytes = 0
 }
@@ -1523,8 +1874,8 @@ func newFieldIndexChunkBuilder(capEntries int) fieldIndexChunkBuilder {
 	chunkCap := max(1, capEntries/fieldIndexChunkTargetEntries+1)
 	pageCap := max(1, chunkCap/fieldIndexDirPageTargetRefs+2)
 	return fieldIndexChunkBuilder{
-		pages:       newFieldIndexChunkDirPageSlice(pageCap),
-		pendingRefs: newFieldIndexChunkRefBuf(min(chunkCap, fieldIndexDirPageTargetRefs)),
+		pages:       fieldIndexChunkDirPageSlicePool.Get(pageCap),
+		pendingRefs: fieldIndexChunkRefSlicePool.Get(min(chunkCap, fieldIndexDirPageTargetRefs)),
 	}
 }
 
@@ -1543,11 +1894,11 @@ func (b *fieldIndexChunkBuilder) appendOwnedRef(ref fieldIndexChunkRef) {
 	if b == nil || ref.chunk == nil || ref.chunk.keyCount() == 0 {
 		return
 	}
-	b.pendingRefs.Append(ref)
+	b.pendingRefs = append(b.pendingRefs, ref)
 	size := ref.chunk.keyCount()
 	b.total += size
 	b.chunks++
-	if b.pendingRefs.Len() >= fieldIndexDirPageTargetRefs {
+	if len(b.pendingRefs) >= fieldIndexDirPageTargetRefs {
 		b.flushPendingPage()
 	}
 }
@@ -1558,27 +1909,27 @@ func (b *fieldIndexChunkBuilder) appendRefsRange(root *fieldIndexChunkedRoot, st
 	}
 	startPage, startOff := root.pagePosForChunk(start)
 	endPage, endOff := root.pagePosForChunk(end)
-	if startPage == root.pages.Len() {
+	if startPage == len(root.pages) {
 		return
 	}
-	startPageRef := root.pages.Get(startPage)
+	startPageRef := root.pages[startPage]
 	if startPage == endPage {
 		b.appendRefSlice(startPageRef, startOff, endOff)
 		return
 	}
 	if startOff > 0 {
-		b.appendRefSlice(startPageRef, startOff, startPageRef.refs.Len())
+		b.appendRefSlice(startPageRef, startOff, len(startPageRef.refs))
 		startPage++
 	}
 	for page := startPage; page < endPage; page++ {
-		b.appendPage(root.pages.Get(page))
+		b.appendPage(root.pages[page])
 	}
 	if endOff > 0 {
-		b.appendRefSlice(root.pages.Get(endPage), 0, endOff)
+		b.appendRefSlice(root.pages[endPage], 0, endOff)
 	}
 }
 
-func (b *fieldIndexChunkBuilder) appendEntries(entries []index) {
+func (b *fieldIndexChunkBuilder) appendEntries(entries []Entry) {
 	if b == nil || len(entries) == 0 {
 		return
 	}
@@ -1595,47 +1946,58 @@ func (b *fieldIndexChunkBuilder) appendEntries(entries []index) {
 }
 
 func (b *fieldIndexChunkBuilder) appendRefSlice(page *fieldIndexChunkDirPage, start, end int) {
-	if page == nil || start < 0 || end < start || end > page.refs.Len() {
+	if page == nil || start < 0 || end < start || end > len(page.refs) {
 		return
 	}
 	for i := start; i < end; i++ {
-		b.appendOwnedRef(retainedFieldIndexChunkRef(page.refs.Get(i)))
+		b.appendOwnedRef(page.refs[i].retained())
 	}
 }
 
 func (b *fieldIndexChunkBuilder) flushPendingPage() {
-	if b == nil || b.pendingRefs == nil || b.pendingRefs.Len() == 0 {
+	if b == nil || b.pendingRefs == nil || len(b.pendingRefs) == 0 {
 		return
 	}
 	page := newFieldIndexChunkDirPageOwned(b.pendingRefs)
-	b.pages.Append(page)
-	b.pendingRefs = newFieldIndexChunkRefBuf(fieldIndexDirPageTargetRefs)
+	b.pages = append(b.pages, page)
+	b.pendingRefs = fieldIndexChunkRefSlicePool.Get(fieldIndexDirPageTargetRefs)
+}
+
+func (b *fieldIndexChunkBuilder) releaseOwned() {
+	if b.pendingRefs != nil {
+		putOwnedFieldIndexChunkRefSlice(b.pendingRefs)
+		b.pendingRefs = nil
+	}
+	releaseFieldIndexChunkDirPages(b.pages)
+	b.pages = nil
+	b.total = 0
+	b.chunks = 0
 }
 
 func (b *fieldIndexChunkBuilder) appendPage(page *fieldIndexChunkDirPage) {
-	if b == nil || page == nil || page.refs.Len() == 0 {
+	if b == nil || page == nil || len(page.refs) == 0 {
 		return
 	}
-	if page.refs.Len() != fieldIndexDirPageTargetRefs || (b.pendingRefs != nil && b.pendingRefs.Len() != 0) {
-		b.appendRefSlice(page, 0, page.refs.Len())
+	if len(page.refs) != fieldIndexDirPageTargetRefs || (b.pendingRefs != nil && len(b.pendingRefs) != 0) {
+		b.appendRefSlice(page, 0, len(page.refs))
 		return
 	}
 	page.retain()
-	b.pages.Append(page)
+	b.pages = append(b.pages, page)
 	b.total += page.keyCount()
-	b.chunks += page.refs.Len()
+	b.chunks += len(page.refs)
 }
 
 func (b *fieldIndexChunkBuilder) appendOwnedPage(page *fieldIndexChunkDirPage) {
-	if b == nil || page == nil || page.refs.Len() == 0 {
+	if b == nil || page == nil || len(page.refs) == 0 {
 		return
 	}
-	if b.pendingRefs != nil && b.pendingRefs.Len() != 0 {
+	if b.pendingRefs != nil && len(b.pendingRefs) != 0 {
 		b.flushPendingPage()
 	}
-	b.pages.Append(page)
+	b.pages = append(b.pages, page)
 	b.total += page.keyCount()
-	b.chunks += page.refs.Len()
+	b.chunks += len(page.refs)
 }
 
 func (b *fieldIndexChunkBuilder) root() *fieldIndexChunkedRoot {
@@ -1664,55 +2026,54 @@ func newFieldIndexChunkedRootFromPages(pages []*fieldIndexChunkDirPage) *fieldIn
 	if len(pages) == 0 {
 		return nil
 	}
-	pageBuf := newFieldIndexChunkDirPageSlice(len(pages))
-	pageBuf.AppendAll(pages)
+	pageBuf := fieldIndexChunkDirPageSlicePool.Get(len(pages))
+	pageBuf = append(pageBuf, pages...)
 	return newFieldIndexChunkedRootFromOwnedPages(pageBuf)
 }
 
-func newFieldIndexChunkedRootFromOwnedPages(pages *pooled.Slice[*fieldIndexChunkDirPage]) *fieldIndexChunkedRoot {
-	if pages == nil || pages.Len() == 0 {
+func newFieldIndexChunkedRootFromOwnedPages(pages []*fieldIndexChunkDirPage) *fieldIndexChunkedRoot {
+	if len(pages) == 0 {
 		return nil
 	}
-	chunkPrefix := pools.GetIntSlice(pages.Len() + 1)[:pages.Len()+1]
+	chunkPrefix := pooled.GetIntSlice(len(pages) + 1)[:len(pages)+1]
 	chunkPrefix[0] = 0
-	prefix := pools.GetIntSlice(pages.Len() + 1)[:pages.Len()+1]
+	prefix := pooled.GetIntSlice(len(pages) + 1)[:len(pages)+1]
 	prefix[0] = 0
-	rowPrefix := pools.GetUint64Slice(pages.Len() + 1)[:pages.Len()+1]
+	rowPrefix := pooled.GetUint64Slice(len(pages) + 1)[:len(pages)+1]
 	rowPrefix[0] = 0
 
 	chunks := 0
 	total := 0
 	rows := uint64(0)
 
-	for i := 0; i < pages.Len(); i++ {
-		page := pages.Get(i)
-		chunks += page.refs.Len()
+	for i := 0; i < len(pages); i++ {
+		page := pages[i]
+		chunks += len(page.refs)
 		total += page.keyCount()
-		rows += page.rowPrefix[page.refs.Len()]
+		rows += page.rowPrefix[len(page.refs)]
 		chunkPrefix[i+1] = chunks
 		prefix[i+1] = total
 		rowPrefix[i+1] = rows
 	}
 	if total == 0 {
 		releaseFieldIndexChunkDirPages(pages)
-		pools.PutIntSlice(chunkPrefix)
-		pools.PutIntSlice(prefix)
-		pools.PutUint64Slice(rowPrefix)
+		pooled.PutIntSlice(chunkPrefix)
+		pooled.PutIntSlice(prefix)
+		pooled.PutUint64Slice(rowPrefix)
 		return nil
 	}
-	root := &fieldIndexChunkedRoot{
-		pages:       pages,
-		chunkPrefix: chunkPrefix,
-		prefix:      prefix,
-		rowPrefix:   rowPrefix,
-		keyCount:    total,
-		chunkCount:  chunks,
-	}
+	root := fieldIndexChunkedRootPool.Get()
+	root.pages = pages
+	root.chunkPrefix = chunkPrefix
+	root.prefix = prefix
+	root.rowPrefix = rowPrefix
+	root.keyCount = total
+	root.chunkCount = chunks
 	root.refs.Store(1)
 	return root
 }
 
-func buildChunkedFieldIndexRoot(entries []index) *fieldIndexChunkedRoot {
+func buildChunkedFieldIndexRoot(entries []Entry) *fieldIndexChunkedRoot {
 	if len(entries) == 0 {
 		return nil
 	}
@@ -1721,26 +2082,35 @@ func buildChunkedFieldIndexRoot(entries []index) *fieldIndexChunkedRoot {
 	return builder.root()
 }
 
-func flattenChunkedFieldIndexRoot(r *fieldIndexChunkedRoot) *[]index {
+func (r *fieldIndexChunkedRoot) flatten() *[]Entry {
 	if r == nil || r.keyCount == 0 {
 		return nil
 	}
-	out := make([]index, 0, r.keyCount)
-	for i := 0; i < r.pages.Len(); i++ {
-		page := r.pages.Get(i)
-		for j := 0; j < page.refs.Len(); j++ {
-			chunk := page.refs.Get(j).chunk
+	out := GetFieldEntrySlice(r.keyCount)[:r.keyCount]
+	pos := 0
+	for i := 0; i < len(r.pages); i++ {
+		page := r.pages[i]
+		for j := 0; j < len(page.refs); j++ {
+			chunk := page.refs[j].chunk
 			for k := 0; k < chunk.keyCount(); k++ {
-				out = append(out, index{
-					Key: chunk.keyAt(k),
+				key := chunk.keyAt(k)
+				if !key.IsNumeric() {
+					// Flat storage may outlive pooled chunk byte buffers after flattening.
+					key = keycodec.FromString(strings.Clone(key.UnsafeString()))
+				}
+				out[pos] = Entry{
+					Key: key,
 					IDs: chunk.postingAt(k),
-				})
+				}
+				pos++
 			}
 		}
 	}
-	if len(out) == 0 {
+	if pos == 0 {
+		PutFieldEntrySlice(out)
 		return nil
 	}
+	out = out[:pos]
 	return &out
 }
 
@@ -1816,25 +2186,25 @@ func (r *fieldIndexChunkedRoot) prevPos(end fieldIndexChunkPos) (fieldIndexChunk
 }
 
 func (r *fieldIndexChunkedRoot) pagePosForChunk(chunk int) (int, int) {
-	if r == nil || r.pages == nil || r.pages.Len() == 0 {
+	if r == nil || r.pages == nil || len(r.pages) == 0 {
 		return 0, 0
 	}
 	if chunk < 0 || chunk >= r.chunkCount {
-		return r.pages.Len(), 0
+		return len(r.pages), 0
 	}
 	page := binsearch.IntUpper(r.chunkPrefix[1:], chunk)
-	if page >= r.pages.Len() {
-		return r.pages.Len(), 0
+	if page >= len(r.pages) {
+		return len(r.pages), 0
 	}
 	return page, chunk - r.chunkPrefix[page]
 }
 
 func (r *fieldIndexChunkedRoot) refAtChunk(chunk int) (fieldIndexChunkRef, bool) {
 	page, off := r.pagePosForChunk(chunk)
-	if r.pages == nil || page >= r.pages.Len() {
+	if r.pages == nil || page >= len(r.pages) {
 		return fieldIndexChunkRef{}, false
 	}
-	return r.pages.Get(page).refs.Get(off), true
+	return r.pages[page].refs[off], true
 }
 
 func (r *fieldIndexChunkedRoot) entryPrefixForChunk(limit int) int {
@@ -1845,11 +2215,11 @@ func (r *fieldIndexChunkedRoot) entryPrefixForChunk(limit int) int {
 		return r.keyCount
 	}
 	page := binsearch.IntLower(r.chunkPrefix[1:], limit)
-	if r.pages == nil || page >= r.pages.Len() {
+	if r.pages == nil || page >= len(r.pages) {
 		return r.keyCount
 	}
 	off := limit - r.chunkPrefix[page]
-	return r.prefix[page] + r.pages.Get(page).prefix[off]
+	return r.prefix[page] + r.pages[page].prefix[off]
 }
 
 func (r *fieldIndexChunkedRoot) rowPrefixForChunk(limit int) uint64 {
@@ -1863,14 +2233,14 @@ func (r *fieldIndexChunkedRoot) rowPrefixForChunk(limit int) uint64 {
 		return r.rowPrefix[len(r.rowPrefix)-1]
 	}
 	page := binsearch.IntLower(r.chunkPrefix[1:], limit)
-	if r.pages == nil || page >= r.pages.Len() {
+	if r.pages == nil || page >= len(r.pages) {
 		if len(r.rowPrefix) == 0 {
 			return 0
 		}
 		return r.rowPrefix[len(r.rowPrefix)-1]
 	}
 	off := limit - r.chunkPrefix[page]
-	return r.rowPrefix[page] + r.pages.Get(page).rowPrefix[off]
+	return r.rowPrefix[page] + r.pages[page].rowPrefix[off]
 }
 
 func (r *fieldIndexChunkedRoot) chunkRowsRange(start, end int) uint64 {
@@ -1930,13 +2300,13 @@ func (r *fieldIndexChunkedRoot) posForRank(rank int) fieldIndexChunkPos {
 		return r.endPos()
 	}
 	page := binsearch.IntUpper(r.prefix[1:], rank)
-	if page >= r.pages.Len() {
+	if page >= len(r.pages) {
 		return r.endPos()
 	}
-	pageRef := r.pages.Get(page)
+	pageRef := r.pages[page]
 	localRank := rank - r.prefix[page]
 	refIdx := binsearch.IntUpper(pageRef.prefix[1:], localRank)
-	if refIdx >= pageRef.refs.Len() {
+	if refIdx >= len(pageRef.refs) {
 		return r.endPos()
 	}
 	return fieldIndexChunkPos{
@@ -1949,22 +2319,18 @@ func (r *fieldIndexChunkedRoot) lowerBoundPos(key string) (fieldIndexChunkPos, i
 	if r == nil || r.chunkCount == 0 {
 		return fieldIndexChunkPos{}, 0
 	}
-	page := sort.Search(r.pages.Len(), func(i int) bool {
-		return keycodec.CompareString(r.pages.Get(i).lastKey(), key) >= 0
-	})
-	if page >= r.pages.Len() {
+	page := r.searchPageByLastString(key)
+	if page >= len(r.pages) {
 		return r.endPos(), r.keyCount
 	}
-	pageRef := r.pages.Get(page)
-	refIdx := sort.Search(pageRef.refs.Len(), func(i int) bool {
-		return keycodec.CompareString(pageRef.refs.Get(i).last, key) >= 0
-	})
-	if refIdx >= pageRef.refs.Len() {
+	pageRef := r.pages[page]
+	refIdx := pageRef.searchRefByLastString(key)
+	if refIdx >= len(pageRef.refs) {
 		return r.endPos(), r.keyCount
 	}
-	ref := pageRef.refs.Get(refIdx)
+	ref := pageRef.refs[refIdx]
 	chunk := ref.chunk
-	entryIdx := lowerBoundFieldIndexChunk(chunk, key)
+	entryIdx := chunk.lowerBound(key)
 	rank := r.prefix[page] + pageRef.prefix[refIdx] + entryIdx
 	if entryIdx >= chunk.keyCount() {
 		nextChunk := r.chunkPrefix[page] + refIdx + 1
@@ -1980,22 +2346,36 @@ func (r *fieldIndexChunkedRoot) upperBoundPos(key string) (fieldIndexChunkPos, i
 	if r == nil || r.chunkCount == 0 {
 		return fieldIndexChunkPos{}, 0
 	}
-	page := sort.Search(r.pages.Len(), func(i int) bool {
-		return keycodec.CompareString(r.pages.Get(i).lastKey(), key) > 0
-	})
-	if page >= r.pages.Len() {
+	pageLo, pageHi := 0, len(r.pages)
+	for pageLo < pageHi {
+		mid := pageLo + (pageHi-pageLo)>>1
+		if keycodec.CompareString(r.pages[mid].lastKey(), key) > 0 {
+			pageHi = mid
+		} else {
+			pageLo = mid + 1
+		}
+	}
+	page := pageLo
+	if page >= len(r.pages) {
 		return r.endPos(), r.keyCount
 	}
-	pageRef := r.pages.Get(page)
-	refIdx := sort.Search(pageRef.refs.Len(), func(i int) bool {
-		return keycodec.CompareString(pageRef.refs.Get(i).last, key) > 0
-	})
-	if refIdx >= pageRef.refs.Len() {
+	pageRef := r.pages[page]
+	refLo, refHi := 0, len(pageRef.refs)
+	for refLo < refHi {
+		mid := refLo + (refHi-refLo)>>1
+		if keycodec.CompareString(pageRef.refs[mid].last, key) > 0 {
+			refHi = mid
+		} else {
+			refLo = mid + 1
+		}
+	}
+	refIdx := refLo
+	if refIdx >= len(pageRef.refs) {
 		return r.endPos(), r.keyCount
 	}
-	ref := pageRef.refs.Get(refIdx)
+	ref := pageRef.refs[refIdx]
 	chunk := ref.chunk
-	entryIdx := upperBoundFieldIndexChunk(chunk, key)
+	entryIdx := chunk.upperBound(key)
 	rank := r.prefix[page] + pageRef.prefix[refIdx] + entryIdx
 	if entryIdx >= chunk.keyCount() {
 		nextChunk := r.chunkPrefix[page] + refIdx + 1
@@ -2011,22 +2391,18 @@ func (r *fieldIndexChunkedRoot) lowerBoundPosKey(key keycodec.IndexKey) (fieldIn
 	if r == nil || r.chunkCount == 0 {
 		return fieldIndexChunkPos{}, 0
 	}
-	page := sort.Search(r.pages.Len(), func(i int) bool {
-		return keycodec.Compare(r.pages.Get(i).lastKey(), key) >= 0
-	})
-	if page >= r.pages.Len() {
+	page := r.searchPageByLastKeyFrom(0, key)
+	if page >= len(r.pages) {
 		return r.endPos(), r.keyCount
 	}
-	pageRef := r.pages.Get(page)
-	refIdx := sort.Search(pageRef.refs.Len(), func(i int) bool {
-		return keycodec.Compare(pageRef.refs.Get(i).last, key) >= 0
-	})
-	if refIdx >= pageRef.refs.Len() {
+	pageRef := r.pages[page]
+	refIdx := pageRef.searchRefByLastKeyFrom(0, key)
+	if refIdx >= len(pageRef.refs) {
 		return r.endPos(), r.keyCount
 	}
-	ref := pageRef.refs.Get(refIdx)
+	ref := pageRef.refs[refIdx]
 	chunk := ref.chunk
-	entryIdx := lowerBoundFieldIndexChunkKey(chunk, key)
+	entryIdx := chunk.lowerBoundKey(key)
 	rank := r.prefix[page] + pageRef.prefix[refIdx] + entryIdx
 	if entryIdx >= chunk.keyCount() {
 		nextChunk := r.chunkPrefix[page] + refIdx + 1
@@ -2042,22 +2418,36 @@ func (r *fieldIndexChunkedRoot) upperBoundPosKey(key keycodec.IndexKey) (fieldIn
 	if r == nil || r.chunkCount == 0 {
 		return fieldIndexChunkPos{}, 0
 	}
-	page := sort.Search(r.pages.Len(), func(i int) bool {
-		return keycodec.Compare(r.pages.Get(i).lastKey(), key) > 0
-	})
-	if page >= r.pages.Len() {
+	pageLo, pageHi := 0, len(r.pages)
+	for pageLo < pageHi {
+		mid := pageLo + (pageHi-pageLo)>>1
+		if keycodec.Compare(r.pages[mid].lastKey(), key) > 0 {
+			pageHi = mid
+		} else {
+			pageLo = mid + 1
+		}
+	}
+	page := pageLo
+	if page >= len(r.pages) {
 		return r.endPos(), r.keyCount
 	}
-	pageRef := r.pages.Get(page)
-	refIdx := sort.Search(pageRef.refs.Len(), func(i int) bool {
-		return keycodec.Compare(pageRef.refs.Get(i).last, key) > 0
-	})
-	if refIdx >= pageRef.refs.Len() {
+	pageRef := r.pages[page]
+	refLo, refHi := 0, len(pageRef.refs)
+	for refLo < refHi {
+		mid := refLo + (refHi-refLo)>>1
+		if keycodec.Compare(pageRef.refs[mid].last, key) > 0 {
+			refHi = mid
+		} else {
+			refLo = mid + 1
+		}
+	}
+	refIdx := refLo
+	if refIdx >= len(pageRef.refs) {
 		return r.endPos(), r.keyCount
 	}
-	ref := pageRef.refs.Get(refIdx)
+	ref := pageRef.refs[refIdx]
 	chunk := ref.chunk
-	entryIdx := upperBoundFieldIndexChunkKey(chunk, key)
+	entryIdx := chunk.upperBoundKey(key)
 	rank := r.prefix[page] + pageRef.prefix[refIdx] + entryIdx
 	if entryIdx >= chunk.keyCount() {
 		nextChunk := r.chunkPrefix[page] + refIdx + 1
@@ -2073,22 +2463,36 @@ func (r *fieldIndexChunkedRoot) lowerBoundPosPrefixUpperBound(upper keycodec.Pre
 	if r == nil || r.chunkCount == 0 {
 		return fieldIndexChunkPos{}, 0
 	}
-	page := sort.Search(r.pages.Len(), func(i int) bool {
-		return keycodec.ComparePrefixUpperBound(r.pages.Get(i).lastKey(), upper) >= 0
-	})
-	if page >= r.pages.Len() {
+	pageLo, pageHi := 0, len(r.pages)
+	for pageLo < pageHi {
+		mid := pageLo + (pageHi-pageLo)>>1
+		if keycodec.ComparePrefixUpperBound(r.pages[mid].lastKey(), upper) >= 0 {
+			pageHi = mid
+		} else {
+			pageLo = mid + 1
+		}
+	}
+	page := pageLo
+	if page >= len(r.pages) {
 		return r.endPos(), r.keyCount
 	}
-	pageRef := r.pages.Get(page)
-	refIdx := sort.Search(pageRef.refs.Len(), func(i int) bool {
-		return keycodec.ComparePrefixUpperBound(pageRef.refs.Get(i).last, upper) >= 0
-	})
-	if refIdx >= pageRef.refs.Len() {
+	pageRef := r.pages[page]
+	refLo, refHi := 0, len(pageRef.refs)
+	for refLo < refHi {
+		mid := refLo + (refHi-refLo)>>1
+		if keycodec.ComparePrefixUpperBound(pageRef.refs[mid].last, upper) >= 0 {
+			refHi = mid
+		} else {
+			refLo = mid + 1
+		}
+	}
+	refIdx := refLo
+	if refIdx >= len(pageRef.refs) {
 		return r.endPos(), r.keyCount
 	}
-	ref := pageRef.refs.Get(refIdx)
+	ref := pageRef.refs[refIdx]
 	chunk := ref.chunk
-	entryIdx := lowerBoundFieldIndexChunkPrefixUpperBound(chunk, upper)
+	entryIdx := chunk.lowerBoundPrefixUpperBound(upper)
 	rank := r.prefix[page] + pageRef.prefix[refIdx] + entryIdx
 	if entryIdx >= chunk.keyCount() {
 		nextChunk := r.chunkPrefix[page] + refIdx + 1
@@ -2120,26 +2524,47 @@ func (r *fieldIndexChunkedRoot) lookupPostingRetained(key string) posting.List {
 	if r == nil || r.chunkCount == 0 {
 		return posting.List{}
 	}
-	page := sort.Search(r.pages.Len(), func(i int) bool {
-		return keycodec.CompareString(r.pages.Get(i).lastKey(), key) >= 0
-	})
-	if page >= r.pages.Len() {
+	page := r.searchPageByLastString(key)
+	if page >= len(r.pages) {
 		return posting.List{}
 	}
-	pageRef := r.pages.Get(page)
-	refIdx := sort.Search(pageRef.refs.Len(), func(i int) bool {
-		return keycodec.CompareString(pageRef.refs.Get(i).last, key) >= 0
-	})
-	if refIdx >= pageRef.refs.Len() {
+	pageRef := r.pages[page]
+	refIdx := pageRef.searchRefByLastString(key)
+	if refIdx >= len(pageRef.refs) {
 		return posting.List{}
 	}
-	ref := pageRef.refs.Get(refIdx)
+	ref := pageRef.refs[refIdx]
 	chunk := ref.chunk
-	entryIdx := lowerBoundFieldIndexChunk(chunk, key)
+	entryIdx := chunk.lowerBound(key)
 	if entryIdx >= chunk.keyCount() || !keycodec.EqualsString(chunk.keyAt(entryIdx), key) {
 		return posting.List{}
 	}
 	return chunk.postingAt(entryIdx)
+}
+
+func (r *fieldIndexChunkedRoot) lookupCardinality(key string) uint64 {
+	if r == nil || r.chunkCount == 0 {
+		return 0
+	}
+	page := r.searchPageByLastString(key)
+	if page >= len(r.pages) {
+		return 0
+	}
+	pageRef := r.pages[page]
+	refIdx := pageRef.searchRefByLastString(key)
+	if refIdx >= len(pageRef.refs) {
+		return 0
+	}
+	ref := pageRef.refs[refIdx]
+	chunk := ref.chunk
+	entryIdx := chunk.lowerBound(key)
+	if entryIdx >= chunk.keyCount() || !keycodec.EqualsString(chunk.keyAt(entryIdx), key) {
+		return 0
+	}
+	if chunk.posts == nil {
+		return 1
+	}
+	return chunk.posts[entryIdx].Cardinality()
 }
 
 func (r *fieldIndexChunkedRoot) lowerBound(key string) int {
@@ -2173,17 +2598,17 @@ func (r *fieldIndexChunkedRoot) touchChunkIndexFrom(start int, key keycodec.Inde
 		start = r.chunkCount - 1
 	}
 	startPage, startOff := r.pagePosForChunk(start)
-	page := searchChunkPageByLastKeyFrom(r.pages, startPage, key)
-	if r.pages == nil || page >= r.pages.Len() {
+	page := r.searchPageByLastKeyFrom(startPage, key)
+	if r.pages == nil || page >= len(r.pages) {
 		return r.chunkCount - 1
 	}
-	pageRef := r.pages.Get(page)
+	pageRef := r.pages[page]
 	refStart := 0
 	if page == startPage {
 		refStart = startOff
 	}
-	refIdx := searchChunkRefByLastKeyFrom(pageRef, refStart, key)
-	if refIdx >= pageRef.refs.Len() {
+	refIdx := pageRef.searchRefByLastKeyFrom(refStart, key)
+	if refIdx >= len(pageRef.refs) {
 		return r.chunkPrefix[page+1] - 1
 	}
 	return r.chunkPrefix[page] + refIdx

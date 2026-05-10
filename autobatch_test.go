@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"github.com/vapstack/rbi/internal/indexdata"
 	"reflect"
 	"slices"
 	"strings"
@@ -1476,7 +1477,7 @@ func TestBatch_BeforeCommitError_IsolatesFailedRequest(t *testing.T) {
 func TestBatch_OversizeIndexedString_IsolatesFailedRequest(t *testing.T) {
 	db, _ := openTempDBUint64(t)
 
-	badVal := &Rec{Name: "bad", Email: strings.Repeat("x", fieldIndexStringRefMax+1)}
+	badVal := &Rec{Name: "bad", Email: strings.Repeat("x", indexdata.FieldStringRefMax+1)}
 	goodVal := &Rec{Name: "good", Email: "good@example.com"}
 
 	badReq := &autoBatchRequest{
@@ -1527,7 +1528,7 @@ func TestAutoBatchExt_RepeatedPatchSameID_OversizeIndexedString_IsolatesOnlyBadR
 		t,
 		db,
 		1,
-		[]Field{{Name: "email", Value: strings.Repeat("x", fieldIndexStringRefMax+1)}},
+		[]Field{{Name: "email", Value: strings.Repeat("x", indexdata.FieldStringRefMax+1)}},
 		true,
 		nil,
 		nil,

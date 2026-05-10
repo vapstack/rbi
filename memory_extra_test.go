@@ -1,49 +1,12 @@
 package rbi
 
 import (
+	"github.com/vapstack/rbi/internal/indexdata"
 	"slices"
 	"testing"
 
 	"github.com/vapstack/qx"
-	"github.com/vapstack/rbi/internal/keycodec"
 )
-
-func memoryExtraTwoChunkNumericRoot() *fieldIndexChunkedRoot {
-	left := fieldStorageOwnedChunkRef(fieldIndexChunkTargetEntries, true)
-	right := fieldStorageOwnedChunkRef(fieldIndexChunkTargetEntries, true)
-
-	const offset = uint64(1 << 20)
-	for i := range right.chunk.numeric {
-		right.chunk.numeric[i] += offset
-	}
-	right.last = right.chunk.keyAt(right.chunk.keyCount() - 1)
-
-	return newFieldIndexChunkedRootFromPages([]*fieldIndexChunkDirPage{
-		newFieldIndexChunkDirPage([]fieldIndexChunkRef{left, right}),
-	})
-}
-
-func memoryExtraFullPageSplitNumericRoot() *fieldIndexChunkedRoot {
-	refs := make([]fieldIndexChunkRef, 0, fieldIndexDirPageTargetRefs)
-	for i := 0; i < fieldIndexDirPageTargetRefs-1; i++ {
-		ref := fieldStorageOwnedChunkRef(1, true)
-		ref.chunk.numeric[0] = uint64(i * 4)
-		ref.last = ref.chunk.keyAt(0)
-		refs = append(refs, ref)
-	}
-
-	ref := fieldStorageOwnedChunkRef(fieldIndexChunkMaxEntries, true)
-	const splitChunkBase = uint64(1 << 32)
-	for i := range ref.chunk.numeric {
-		ref.chunk.numeric[i] = splitChunkBase + uint64(i*4)
-	}
-	ref.last = ref.chunk.keyAt(ref.chunk.keyCount() - 1)
-	refs = append(refs, ref)
-
-	return newFieldIndexChunkedRootFromPages([]*fieldIndexChunkDirPage{
-		newFieldIndexChunkDirPage(refs),
-	})
-}
 
 func TestMemoryExtra_MaterializedPredCacheStoreBorrowedDetachesFromSourceOwner(t *testing.T) {
 	snap := &indexSnapshot{
@@ -402,7 +365,7 @@ func TestMemoryExtra_MaterializedPredInheritedBorrowedMutationDetaches(t *testin
 
 func TestMemoryExtra_NumericRangeInheritedBorrowedMutationDetaches(t *testing.T) {
 	shared := snapshotExtStorage("10", "20")
-	defer releaseFieldIndexStorageOwned(shared)
+	defer shared.Release()
 
 	entry := numericRangeBucketCacheEntryPool.Get()
 	entry.refs.Store(1)
@@ -423,13 +386,13 @@ func TestMemoryExtra_NumericRangeInheritedBorrowedMutationDetaches(t *testing.T)
 	stored.Release()
 	base.Release()
 
-	prev := snapshotTestNewSnapshot(map[string]fieldIndexStorage{"age": shared}, nil, nil, nil)
+	prev := snapshotTestNewSnapshot(map[string]indexdata.FieldStorage{"age": shared}, nil, nil, nil)
 	prev.numericRangeBucketCache = numericRangeBucketCachePool.Get()
 	prev.numericRangeBucketCache.init(1)
 	prev.numericRangeBucketCache.storeSlot("age", 0, entry)
 	defer prev.releaseRuntimeCaches()
 
-	next := snapshotTestNewSnapshot(map[string]fieldIndexStorage{"age": shared}, nil, nil, nil)
+	next := snapshotTestNewSnapshot(map[string]indexdata.FieldStorage{"age": shared}, nil, nil, nil)
 	next.numericRangeBucketCache = numericRangeBucketCachePool.Get()
 	next.numericRangeBucketCache.init(1)
 	defer next.releaseRuntimeCaches()
@@ -697,7 +660,7 @@ func TestMemoryExtra_MaterializedPredInheritedEvictAndDrainKeepsSiblingSnapshotE
 
 func TestMemoryExtra_NumericRangeInheritedReleaseKeepsSiblingSnapshotEntry(t *testing.T) {
 	shared := snapshotExtStorage("10", "20")
-	defer releaseFieldIndexStorageOwned(shared)
+	defer shared.Release()
 
 	entry := numericRangeBucketCacheEntryPool.Get()
 	entry.refs.Store(1)
@@ -718,13 +681,13 @@ func TestMemoryExtra_NumericRangeInheritedReleaseKeepsSiblingSnapshotEntry(t *te
 	stored.Release()
 	base.Release()
 
-	prev := snapshotTestNewSnapshot(map[string]fieldIndexStorage{"age": shared}, nil, nil, nil)
+	prev := snapshotTestNewSnapshot(map[string]indexdata.FieldStorage{"age": shared}, nil, nil, nil)
 	prev.numericRangeBucketCache = numericRangeBucketCachePool.Get()
 	prev.numericRangeBucketCache.init(1)
 	prev.numericRangeBucketCache.storeSlot("age", 0, entry)
 	defer prev.releaseRuntimeCaches()
 
-	next := snapshotTestNewSnapshot(map[string]fieldIndexStorage{"age": shared}, nil, nil, nil)
+	next := snapshotTestNewSnapshot(map[string]indexdata.FieldStorage{"age": shared}, nil, nil, nil)
 	next.numericRangeBucketCache = numericRangeBucketCachePool.Get()
 	next.numericRangeBucketCache.init(1)
 	defer next.releaseRuntimeCaches()
@@ -754,140 +717,5 @@ func TestMemoryExtra_NumericRangeInheritedReleaseKeepsSiblingSnapshotEntry(t *te
 	}
 	if !slices.Equal(reloaded.ToArray(), want) {
 		t.Fatalf("reloaded inherited numeric full-span posting changed after prev release: got=%v want=%v", reloaded.ToArray(), want)
-	}
-}
-
-func TestMemoryExtra_ApplySingleFieldPostingDiffChunked_DetachesEntryPrefixMetadata(t *testing.T) {
-	root := memoryExtraTwoChunkNumericRoot()
-	if root == nil {
-		t.Fatal("expected chunked root")
-	}
-	defer root.release()
-
-	baseFirstChunkKeys := root.entryPrefixForChunk(1)
-	baseTotalKeys := root.keyCount
-
-	delta := keyedBatchPostingDelta{
-		key: fieldStorageInsertedTestKey(17, true),
-		delta: batchPostingDelta{
-			add: fieldStorageSingleton(1<<32 | 17),
-		},
-	}
-	out := applySingleFieldPostingDiffChunked(root, delta)
-	defer releaseFieldIndexStorageOwned(out)
-
-	if out.chunked == nil {
-		t.Fatal("expected chunked storage after insert")
-	}
-	if got := root.entryPrefixForChunk(1); got != baseFirstChunkKeys {
-		t.Fatalf("base root first-chunk prefix changed after insert: got=%d want=%d", got, baseFirstChunkKeys)
-	}
-	if got := root.keyCount; got != baseTotalKeys {
-		t.Fatalf("base root keyCount changed after insert: got=%d want=%d", got, baseTotalKeys)
-	}
-	if got := out.chunked.entryPrefixForChunk(1); got != baseFirstChunkKeys+1 {
-		t.Fatalf("new root first-chunk prefix mismatch after insert: got=%d want=%d", got, baseFirstChunkKeys+1)
-	}
-	if got := out.chunked.keyCount; got != baseTotalKeys+1 {
-		t.Fatalf("new root keyCount mismatch after insert: got=%d want=%d", got, baseTotalKeys+1)
-	}
-}
-
-func TestMemoryExtra_ApplySingleFieldPostingDiffChunked_DetachesRowPrefixMetadata(t *testing.T) {
-	root := memoryExtraTwoChunkNumericRoot()
-	if root == nil {
-		t.Fatal("expected chunked root")
-	}
-	defer root.release()
-
-	ref, ok := root.refAtChunk(0)
-	if !ok || ref.chunk == nil {
-		t.Fatal("expected first chunk ref")
-	}
-
-	baseFirstChunkRows := root.chunkRowsRange(0, 1)
-	baseTotalRows := root.chunkRowsRange(0, root.chunkCount)
-	key := ref.chunk.keyAt(fieldIndexChunkTargetEntries / 2)
-
-	delta := keyedBatchPostingDelta{
-		key: key,
-		delta: batchPostingDelta{
-			add: fieldStorageSingleton(1<<32 | 33),
-		},
-	}
-	out := applySingleFieldPostingDiffChunked(root, delta)
-	defer releaseFieldIndexStorageOwned(out)
-
-	if out.chunked == nil {
-		t.Fatal("expected chunked storage after posting update")
-	}
-	if got := root.chunkRowsRange(0, 1); got != baseFirstChunkRows {
-		t.Fatalf("base root first-chunk rows changed after update: got=%d want=%d", got, baseFirstChunkRows)
-	}
-	if got := root.chunkRowsRange(0, root.chunkCount); got != baseTotalRows {
-		t.Fatalf("base root total rows changed after update: got=%d want=%d", got, baseTotalRows)
-	}
-	if got := out.chunked.chunkRowsRange(0, 1); got != baseFirstChunkRows+1 {
-		t.Fatalf("new root first-chunk rows mismatch after update: got=%d want=%d", got, baseFirstChunkRows+1)
-	}
-	if got := out.chunked.chunkRowsRange(0, out.chunked.chunkCount); got != baseTotalRows+1 {
-		t.Fatalf("new root total rows mismatch after update: got=%d want=%d", got, baseTotalRows+1)
-	}
-}
-
-func TestMemoryExtra_ApplySingleFieldPostingDiffChunked_FullPageSplitDoesNotMutateBaseMetadata(t *testing.T) {
-	root := memoryExtraFullPageSplitNumericRoot()
-	if root == nil {
-		t.Fatal("expected chunked root")
-	}
-	defer root.release()
-
-	basePages := root.pages.Len()
-	baseRefs := root.pages.Get(0).refs.Len()
-	baseChunks := root.chunkCount
-	baseKeys := root.keyCount
-	baseRows := root.chunkRowsRange(0, root.chunkCount)
-	baseLastChunkStart := root.entryPrefixForChunk(root.chunkCount - 1)
-
-	insertKey := keycodec.FromU64((1 << 32) + 2)
-	out := applySingleFieldPostingDiffChunked(root, keyedBatchPostingDelta{
-		key: insertKey,
-		delta: batchPostingDelta{
-			add: fieldStorageSingleton(17 << 32),
-		},
-	})
-	defer releaseFieldIndexStorageOwned(out)
-
-	if out.chunked == nil {
-		t.Fatal("expected chunked storage after full-page split insert")
-	}
-
-	if root.pages.Len() != basePages {
-		t.Fatalf("base root page count changed after split rebuild: got=%d want=%d", root.pages.Len(), basePages)
-	}
-	if root.pages.Get(0).refs.Len() != baseRefs {
-		t.Fatalf("base root ref count changed after split rebuild: got=%d want=%d", root.pages.Get(0).refs.Len(), baseRefs)
-	}
-	if got := root.chunkCount; got != baseChunks {
-		t.Fatalf("base root chunkCount changed after split rebuild: got=%d want=%d", got, baseChunks)
-	}
-	if got := root.keyCount; got != baseKeys {
-		t.Fatalf("base root keyCount changed after split rebuild: got=%d want=%d", got, baseKeys)
-	}
-	if got := root.chunkRowsRange(0, root.chunkCount); got != baseRows {
-		t.Fatalf("base root total rows changed after split rebuild: got=%d want=%d", got, baseRows)
-	}
-	if got := root.entryPrefixForChunk(root.chunkCount - 1); got != baseLastChunkStart {
-		t.Fatalf("base root last chunk prefix changed after split rebuild: got=%d want=%d", got, baseLastChunkStart)
-	}
-
-	if got := out.chunked.chunkCount; got != baseChunks+1 {
-		t.Fatalf("new root chunkCount mismatch after split rebuild: got=%d want=%d", got, baseChunks+1)
-	}
-	if got := out.chunked.keyCount; got != baseKeys+1 {
-		t.Fatalf("new root keyCount mismatch after split rebuild: got=%d want=%d", got, baseKeys+1)
-	}
-	if got := out.chunked.chunkRowsRange(0, out.chunked.chunkCount); got != baseRows+1 {
-		t.Fatalf("new root total rows mismatch after split rebuild: got=%d want=%d", got, baseRows+1)
 	}
 }

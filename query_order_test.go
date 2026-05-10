@@ -3,24 +3,12 @@ package rbi
 import (
 	"fmt"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/vapstack/qx"
-	"github.com/vapstack/rbi/internal/keycodec"
 	"github.com/vapstack/rbi/internal/posting"
 )
-
-func hasLenIndexKey(slice *[]index, key string) bool {
-	if slice == nil {
-		return false
-	}
-	for _, ix := range *slice {
-		if keycodec.EqualsString(ix.Key, key) {
-			return true
-		}
-	}
-	return false
-}
 
 func collectIDsByTagDistinctLen(t *testing.T, db *DB[uint64, Rec], wantLen int) []uint64 {
 	t.Helper()
@@ -82,13 +70,6 @@ func TestLenIndex_ZeroComplement_BaseQueryAndOrder(t *testing.T) {
 	if !db.isLenZeroComplementField("tags") {
 		t.Fatalf("expected zero-complement mode for tags")
 	}
-	lenSlice := db.engine.currentQueryViewForTests().snapshotLenFieldIndexSlice("tags")
-	if !hasLenIndexKey(lenSlice, lenIndexNonEmptyKey) {
-		t.Fatalf("expected non-empty marker key in len index")
-	}
-	if hasLenIndexKey(lenSlice, keycodec.U64ByteString(0)) {
-		t.Fatalf("len=0 key should not be materialized in complement mode")
-	}
 
 	emptyQ := qx.Query(qx.EQ("tags", []string{}))
 	gotEmpty, err := db.QueryKeys(emptyQ)
@@ -119,6 +100,48 @@ func TestLenIndex_ZeroComplement_BaseQueryAndOrder(t *testing.T) {
 		t.Fatalf("expectedKeysUint64(DESC array count): %v", err)
 	}
 	assertSameSlice(t, gotDesc, wantDesc)
+}
+
+func TestQuery_ByArrayCount_AfterLenIndexEmptied(t *testing.T) {
+	db, _ := openTempDBUint64(t)
+
+	if err := db.Set(1, &Rec{Name: "one", Email: "one@example.test", Tags: []string{"go"}}); err != nil {
+		t.Fatalf("Set(1): %v", err)
+	}
+	if err := db.Set(2, &Rec{Name: "two", Email: "two@example.test"}); err != nil {
+		t.Fatalf("Set(2): %v", err)
+	}
+	if err := db.RebuildIndex(); err != nil {
+		t.Fatalf("RebuildIndex: %v", err)
+	}
+	if err := db.Set(1, &Rec{Name: "one", Email: "one@example.test"}); err != nil {
+		t.Fatalf("Set(1 empty tags): %v", err)
+	}
+
+	q := queryOrderSortByArrayCount(qx.Query(), "tags", qx.ASC)
+	got, err := db.QueryKeys(q)
+	if err != nil {
+		t.Fatalf("QueryKeys(array count after empty len index): %v", err)
+	}
+	want, err := expectedKeysUint64(t, db, q)
+	if err != nil {
+		t.Fatalf("expectedKeysUint64(array count after empty len index): %v", err)
+	}
+	assertSameSlice(t, got, want)
+}
+
+func TestQuery_ByArrayCount_MissingLenIndexStorageReturnsError(t *testing.T) {
+	db, _ := openTempDBUint64(t)
+	if err := db.Set(1, &Rec{Name: "one", Email: "one@example.test", Tags: []string{"go"}}); err != nil {
+		t.Fatalf("Set(1): %v", err)
+	}
+	hideLenIndexForTest(t, db, "tags")
+
+	q := queryOrderSortByArrayCount(qx.Query(), "tags", qx.ASC)
+	_, err := db.QueryKeys(q)
+	if err == nil || !strings.Contains(err.Error(), "no lenIndex for slice field: tags") {
+		t.Fatalf("expected missing lenIndex error, got %v", err)
+	}
 }
 
 func TestQuery_ByArrayCount_ZeroComplementSkipWholeBucket(t *testing.T) {
@@ -570,6 +593,34 @@ func TestAppendMaterializedNumericPostingKeys_DoesNotAllocateIntermediateArray(t
 	})
 	if allocs != 0 {
 		t.Fatalf("unexpected allocs: got=%v want=0", allocs)
+	}
+}
+
+func TestOrderedBucketFilterSmallLimitUsesOnePass(t *testing.T) {
+	const n = iteratorThreshold*4 + 1
+	idsBuf := make([]uint64, n)
+	filterBuf := make([]uint64, n)
+	for i := range idsBuf {
+		idsBuf[i] = uint64(i) * 2
+		filterBuf[i] = uint64(i) * 2
+	}
+	ids := posting.BuildFromSorted(idsBuf)
+	defer ids.Release()
+	filter := posting.BuildFromSorted(filterBuf)
+	defer filter.Release()
+
+	result := postingResult{ids: filter}
+	if !shouldUseOnePassPostingResultFilter(ids, result, 1, false) {
+		t.Fatalf("small ordered limit must keep streaming bucket filtering")
+	}
+	if !shouldUseOnePassPostingResultFilter(ids, result, 1024, false) {
+		t.Fatalf("small ordered limit boundary must keep streaming bucket filtering")
+	}
+	if shouldUseOnePassPostingResultFilter(ids, result, 1025, false) {
+		t.Fatalf("large ordered limit must not force one-pass on high-cardinality postings")
+	}
+	if shouldUseOnePassPostingResultFilter(ids, result, 0, true) {
+		t.Fatalf("unbounded ordered scan must not force one-pass on high-cardinality postings")
 	}
 }
 

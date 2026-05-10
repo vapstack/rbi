@@ -2,8 +2,8 @@ package rbi
 
 import (
 	"github.com/vapstack/qx"
+	"github.com/vapstack/rbi/internal/indexdata"
 	"github.com/vapstack/rbi/internal/pooled"
-	"github.com/vapstack/rbi/internal/pools"
 	"github.com/vapstack/rbi/internal/posting"
 	"github.com/vapstack/rbi/internal/qir"
 )
@@ -135,7 +135,7 @@ func (qv *queryView) tryCountByScalarLookup(expr qir.Expr, trace *queryTrace) (u
 	}
 
 	ov := qv.fieldOverlayForExpr(expr)
-	if !ov.hasData() && !qv.hasIndexedFieldForExpr(expr) {
+	if !ov.HasData() && !qv.hasIndexedFieldForExpr(expr) {
 		return 0, false, nil
 	}
 
@@ -147,9 +147,9 @@ func (qv *queryView) tryCountByScalarLookup(expr qir.Expr, trace *queryTrace) (u
 		}
 		hit := uint64(0)
 		if isNil {
-			hit = qv.nilFieldOverlayForExpr(expr).lookupCardinality(nilIndexEntryKey)
+			hit = qv.nilFieldOverlayForExpr(expr).LookupCardinality(nilIndexEntryKey)
 		} else {
-			hit = ov.lookupCardinality(key)
+			hit = ov.LookupCardinality(key)
 		}
 		if trace != nil {
 			trace.setPlan(PlanCountScalarLookup)
@@ -160,7 +160,7 @@ func (qv *queryView) tryCountByScalarLookup(expr qir.Expr, trace *queryTrace) (u
 	case qir.OpIN:
 		valsBuf, isSlice, hasNil, err := qv.exprValueToDistinctIdxBuf(expr)
 		if valsBuf != nil {
-			defer pools.PutStringSlice(valsBuf)
+			defer pooled.PutStringSlice(valsBuf)
 		}
 		valCount := len(valsBuf)
 		if err != nil || !isSlice || (valCount == 0 && !hasNil) {
@@ -169,10 +169,10 @@ func (qv *queryView) tryCountByScalarLookup(expr qir.Expr, trace *queryTrace) (u
 
 		var sum uint64
 		for i := 0; i < valCount; i++ {
-			sum += ov.lookupCardinality(valsBuf[i])
+			sum += ov.LookupCardinality(valsBuf[i])
 		}
 		if hasNil {
-			sum += qv.nilFieldOverlayForExpr(expr).lookupCardinality(nilIndexEntryKey)
+			sum += qv.nilFieldOverlayForExpr(expr).LookupCardinality(nilIndexEntryKey)
 		}
 		if trace != nil {
 			trace.setPlan(PlanCountScalarLookup)
@@ -270,13 +270,13 @@ func (qv *queryView) tryCountBySliceLookup(expr qir.Expr, trace *queryTrace) (ui
 	}
 
 	ov := qv.fieldOverlayForExpr(expr)
-	if !ov.hasData() && !qv.hasIndexedFieldForExpr(expr) {
+	if !ov.HasData() && !qv.hasIndexedFieldForExpr(expr) {
 		return 0, false, nil
 	}
 
 	valsBuf, isSlice, _, err := qv.exprValueToDistinctIdxBuf(expr)
 	if valsBuf != nil {
-		defer pools.PutStringSlice(valsBuf)
+		defer pooled.PutStringSlice(valsBuf)
 	}
 	valCount := len(valsBuf)
 	if err != nil {
@@ -295,7 +295,7 @@ func (qv *queryView) tryCountBySliceLookup(expr qir.Expr, trace *queryTrace) (ui
 
 	case qir.OpHASANY:
 		postsBuf, _ := qv.scalarLookupPostings(qv.engine.fieldNameByOrdinal(expr.FieldOrdinal), expr.FieldOrdinal, valsBuf, false)
-		defer pools.PutPostingSlice(postsBuf)
+		defer posting.PutSlice(postsBuf)
 		switch len(postsBuf) {
 		case 0:
 			if trace != nil {
@@ -324,12 +324,12 @@ func (qv *queryView) tryCountBySliceLookup(expr qir.Expr, trace *queryTrace) (ui
 		}
 
 	case qir.OpHASALL:
-		postsBuf := pools.GetPostingSlice(valCount)
-		defer pools.PutPostingSlice(postsBuf)
+		postsBuf := posting.GetSlice(valCount)
+		defer posting.PutSlice(postsBuf)
 
 		var examined uint64
 		for i := 0; i < valCount; i++ {
-			ids := ov.lookupPostingRetained(valsBuf[i])
+			ids := ov.LookupPostingRetained(valsBuf[i])
 			card := ids.Cardinality()
 			examined = satAddUint64(examined, card)
 			if ids.IsEmpty() {
@@ -846,7 +846,7 @@ func (qv *queryView) applyAndMergedExactRangePostingResult(
 	acc *postingResult,
 	hasAcc *bool,
 	e qir.Expr,
-	bounds rangeBounds,
+	bounds indexdata.Bounds,
 ) (bool, error) {
 	b, ok := qv.evalMergedExactRangePostingResult(e, bounds)
 	if !ok {
@@ -876,7 +876,7 @@ func (qv *queryView) applyAndMergedExactRangePostingResult(
 	return false, nil
 }
 
-func (qv *queryView) evalMergedExactRangePostingResult(e qir.Expr, bounds rangeBounds) (postingResult, bool) {
+func (qv *queryView) evalMergedExactRangePostingResult(e qir.Expr, bounds indexdata.Bounds) (postingResult, bool) {
 	if e.Not || e.FieldOrdinal < 0 {
 		return postingResult{}, false
 	}
@@ -885,7 +885,7 @@ func (qv *queryView) evalMergedExactRangePostingResult(e qir.Expr, bounds rangeB
 		return postingResult{}, false
 	}
 	ov := qv.fieldOverlayForExpr(e)
-	if !ov.hasData() {
+	if !ov.HasData() {
 		return postingResult{}, false
 	}
 	var core preparedScalarRangePredicate
@@ -897,8 +897,8 @@ func (qv *queryView) evalMergedExactRangePostingResult(e qir.Expr, bounds rangeB
 		return postingResult{ids: cached}, true
 	}
 
-	br := ov.rangeForBounds(core.bounds)
-	if overlayRangeEmpty(br) {
+	br := ov.RangeForBounds(core.bounds)
+	if br.Empty() {
 		return postingResult{}, true
 	}
 	if core.expr.Op != qir.OpPREFIX {
@@ -911,7 +911,7 @@ func (qv *queryView) evalMergedExactRangePostingResult(e qir.Expr, bounds rangeB
 		}
 	}
 
-	ids := overlayUnionRanges(ov, br, overlayRange{})
+	ids := ov.UnionRangePostings(br, indexdata.OverlayRange{})
 	if ids.IsEmpty() {
 		return postingResult{}, true
 	}
@@ -952,7 +952,7 @@ func (qv *queryView) tryCountByScalarInSplit(expr qir.Expr, trace *queryTrace) (
 		totalVals := 0
 		if valsBuf != nil {
 			totalVals = len(valsBuf)
-			pools.PutStringSlice(valsBuf)
+			pooled.PutStringSlice(valsBuf)
 		}
 		if hasNil {
 			totalVals++
@@ -974,7 +974,7 @@ func (qv *queryView) tryCountByScalarInSplit(expr qir.Expr, trace *queryTrace) (
 
 	inLeaf := leaves[lead]
 	ov := qv.fieldOverlayForExpr(inLeaf)
-	if !ov.hasData() {
+	if !ov.HasData() {
 		return 0, false, nil
 	}
 
@@ -984,7 +984,7 @@ func (qv *queryView) tryCountByScalarInSplit(expr qir.Expr, trace *queryTrace) (
 		Value:        inLeaf.Value,
 	})
 	if valsBuf != nil {
-		defer pools.PutStringSlice(valsBuf)
+		defer pooled.PutStringSlice(valsBuf)
 	}
 	valCount := len(valsBuf)
 	if err != nil || !isSlice || (valCount == 0 && !hasNil) {
@@ -1027,7 +1027,7 @@ func (qv *queryView) tryCountByScalarInSplit(expr qir.Expr, trace *queryTrace) (
 	var cnt uint64
 	var examined uint64
 	for i := 0; i < valCount; i++ {
-		ids := ov.lookupPostingRetained(valsBuf[i])
+		ids := ov.LookupPostingRetained(valsBuf[i])
 		if ids.IsEmpty() {
 			continue
 		}
@@ -1039,7 +1039,7 @@ func (qv *queryView) tryCountByScalarInSplit(expr qir.Expr, trace *queryTrace) (
 		cnt += ids.Cardinality()
 	}
 	if hasNil {
-		ids := qv.nilFieldOverlayForExpr(inLeaf).lookupPostingRetained(nilIndexEntryKey)
+		ids := qv.nilFieldOverlayForExpr(inLeaf).LookupPostingRetained(nilIndexEntryKey)
 		if !ids.IsEmpty() {
 			examined += ids.Cardinality()
 			if useFilter {
@@ -2358,25 +2358,6 @@ func shouldUseFastCountBroadRangeComplementMaterializationForShape(probeLen int,
 	return avgPerBucket <= countPredBroadRangeComplementFastAvgPerBucketMax
 }
 
-func countBaseIndexRangeCardinality(s []index, start, end int) uint64 {
-	if start >= end {
-		return 0
-	}
-	var total uint64
-	for i := start; i < end; i++ {
-		ids := s[i].IDs
-		if ids.IsEmpty() {
-			continue
-		}
-		card := ids.Cardinality()
-		if ^uint64(0)-total < card {
-			return ^uint64(0)
-		}
-		total += card
-	}
-	return total
-}
-
 func (qv *queryView) tryMaterializeBroadRangeComplementPredicateForCount(p *predicate, leadProbeEst uint64, universe uint64, trace *queryTrace) bool {
 	if p == nil {
 		return false
@@ -2772,21 +2753,21 @@ func (qv *queryView) tryCountByPredicatesLeadBuckets(preds predicateSet, leadIdx
 		return 0, 0, false
 	}
 	ov := span.ov
-	if ov.chunked != nil {
+	if ov.IsChunked() {
 		rb, covered, hasBounds, ok := qv.collectPredicateRangeBoundsSet(qv.engine.fieldNameByOrdinal(e.FieldOrdinal), preds)
 		if !ok || !hasBounds {
 			if ok {
-				pools.PutBoolSlice(covered)
+				pooled.PutBoolSlice(covered)
 			}
 			return 0, 0, false
 		}
-		br := ov.rangeForBounds(rb)
-		if overlayRangeEmpty(br) {
-			pools.PutBoolSlice(covered)
+		br := ov.RangeForBounds(rb)
+		if br.Empty() {
+			pooled.PutBoolSlice(covered)
 			return 0, 0, true
 		}
-		if br.baseEnd-br.baseStart < 4 {
-			pools.PutBoolSlice(covered)
+		if br.BaseEnd-br.BaseStart < 4 {
+			pooled.PutBoolSlice(covered)
 			return 0, 0, false
 		}
 
@@ -2798,7 +2779,7 @@ func (qv *queryView) tryCountByPredicatesLeadBuckets(preds predicateSet, leadIdx
 			}
 			activeChecks = append(activeChecks, pi)
 		}
-		pools.PutBoolSlice(covered)
+		pooled.PutBoolSlice(covered)
 
 		var exactActiveBuf [countPredicateScanMaxLeaves]int
 		var extraExactCandidatesBuf [countPredicateScanMaxLeaves]int
@@ -2820,9 +2801,9 @@ func (qv *queryView) tryCountByPredicatesLeadBuckets(preds predicateSet, leadIdx
 		var bucketWork posting.List
 		var extraWork posting.List
 
-		cur := ov.newCursor(br, false)
+		cur := ov.NewCursor(br, false)
 		for {
-			_, ids, ok := cur.next()
+			_, ids, ok := cur.Next()
 			if !ok {
 				break
 			}
@@ -2927,18 +2908,18 @@ func (qv *queryView) tryCountByPredicatesLeadBuckets(preds predicateSet, leadIdx
 	rb, covered, hasBounds, ok := qv.collectPredicateRangeBoundsSet(qv.engine.fieldNameByOrdinal(e.FieldOrdinal), preds)
 	if !ok || !hasBounds {
 		if ok {
-			pools.PutBoolSlice(covered)
+			pooled.PutBoolSlice(covered)
 		}
 		return 0, 0, false
 	}
-	br := ov.rangeForBounds(rb)
-	start, end := br.baseStart, br.baseEnd
+	br := ov.RangeForBounds(rb)
+	start, end := br.BaseStart, br.BaseEnd
 	if start >= end {
-		pools.PutBoolSlice(covered)
+		pooled.PutBoolSlice(covered)
 		return 0, 0, true
 	}
 	if end-start < 4 {
-		pools.PutBoolSlice(covered)
+		pooled.PutBoolSlice(covered)
 		return 0, 0, false
 	}
 
@@ -2950,7 +2931,7 @@ func (qv *queryView) tryCountByPredicatesLeadBuckets(preds predicateSet, leadIdx
 		}
 		activeChecks = append(activeChecks, pi)
 	}
-	pools.PutBoolSlice(covered)
+	pooled.PutBoolSlice(covered)
 
 	var exactActiveBuf [countPredicateScanMaxLeaves]int
 	var extraExactCandidatesBuf [countPredicateScanMaxLeaves]int
@@ -2972,9 +2953,9 @@ func (qv *queryView) tryCountByPredicatesLeadBuckets(preds predicateSet, leadIdx
 	var bucketWork posting.List
 	var extraWork posting.List
 
-	cur := ov.newCursor(ov.rangeByRanks(start, end), false)
+	cur := ov.NewCursor(ov.RangeByRanks(start, end), false)
 	for {
-		_, ids, ok := cur.next()
+		_, ids, ok := cur.Next()
 		if !ok {
 			break
 		}

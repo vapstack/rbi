@@ -1,6 +1,77 @@
 package posting
 
-import "sync"
+import (
+	"math/bits"
+	"sync"
+	"unsafe"
+)
+
+const (
+	minPostingShift = 5
+	maxPostingShift = 18
+
+	minPostingPooledCap = 1 << minPostingShift
+	maxPostingPooledCap = 1 << maxPostingShift
+
+	// maxPostingRetainedCap is the largest external capacity that may be
+	// demoted into the largest bucket. Larger slices are dropped to avoid
+	// retaining very large backing arrays through a smaller bucket.
+	maxPostingRetainedCap = maxPostingPooledCap + maxPostingPooledCap/4
+
+	maxPostingBucketDistance = 4
+)
+
+var postingPools [maxPostingShift + 1]sync.Pool
+
+func GetSlice(capHint int) []List {
+	if capHint < 0 {
+		panic("posting.GetSlice: negative capHint")
+	}
+
+	if capHint > maxPostingPooledCap {
+		return make([]List, 0, capHint)
+	}
+	var shift int
+	if capHint <= minPostingPooledCap {
+		shift = minPostingShift
+	} else {
+		shift = bits.Len(uint(capHint - 1)) // ceil(log2(capHint))
+	}
+
+	lim := min(shift+maxPostingBucketDistance, maxPostingShift)
+	for sh := shift; sh <= lim; sh++ {
+		if v := postingPools[sh].Get(); v != nil {
+			ptr := v.(*List)
+			n := 1 << sh
+			s := unsafe.Slice(ptr, n)
+			return s[:0:n]
+		}
+	}
+
+	return make([]List, 0, 1<<shift)
+}
+
+func PutSlice(s []List) {
+	c := cap(s)
+	if c < minPostingPooledCap {
+		return
+	}
+	var shift int
+	if c >= maxPostingPooledCap {
+		if c <= maxPostingRetainedCap {
+			shift = maxPostingShift
+		} else {
+			return
+		}
+	} else {
+		shift = bits.Len(uint(c)) - 1 // floor(log2(c))
+	}
+	clear(s[:c])
+	n := 1 << shift
+	postingPools[shift].Put(unsafe.SliceData(s[:n:n]))
+}
+
+/**/
 
 var (
 	containerIndexStoragePools [len(containerIndexPoolCapacities)]sync.Pool

@@ -7,11 +7,11 @@ import (
 	"slices"
 	"sync"
 
+	"github.com/vapstack/rbi/internal/indexdata"
 	"github.com/vapstack/rbi/internal/keycodec"
 	"github.com/vapstack/rbi/internal/qir"
 
 	"github.com/vapstack/rbi/internal/pooled"
-	"github.com/vapstack/rbi/internal/pools"
 	"github.com/vapstack/rbi/internal/posting"
 )
 
@@ -199,7 +199,7 @@ func (qv *queryView) evalAndOperands(ops []qir.Expr, negate bool) (postingResult
 func (qv *queryView) evalSimple(e qir.Expr) (postingResult, error) {
 	fieldName := qv.engine.fieldNameByOrdinal(e.FieldOrdinal)
 	ov := qv.fieldOverlayForExpr(e)
-	if !ov.hasData() && !qv.hasIndexedFieldForExpr(e) {
+	if !ov.HasData() && !qv.hasIndexedFieldForExpr(e) {
 		return postingResult{}, fmt.Errorf("no index for field: %v", fieldName)
 	}
 
@@ -221,9 +221,9 @@ func (qv *queryView) evalSimple(e qir.Expr) (postingResult, error) {
 
 			var ids posting.List
 			if isNil {
-				ids = qv.nilFieldOverlayForExpr(e).lookupPostingRetained(nilIndexEntryKey)
+				ids = qv.nilFieldOverlayForExpr(e).LookupPostingRetained(nilIndexEntryKey)
 			} else {
-				ids = ov.lookupPostingRetained(key)
+				ids = ov.LookupPostingRetained(key)
 			}
 			if !ids.IsEmpty() {
 				return postingResult{ids: ids}, nil
@@ -236,7 +236,7 @@ func (qv *queryView) evalSimple(e qir.Expr) (postingResult, error) {
 				return postingResult{}, err
 			}
 			if valsBuf != nil {
-				defer pools.PutStringSlice(valsBuf)
+				defer pooled.PutStringSlice(valsBuf)
 			}
 			if !isSlice {
 				return postingResult{}, fmt.Errorf("%w: %v expects a slice for slice field %v", ErrInvalidQuery, e.Op, fieldName)
@@ -253,7 +253,7 @@ func (qv *queryView) evalSimple(e qir.Expr) (postingResult, error) {
 			return postingResult{}, err
 		}
 		if valsBuf != nil {
-			defer pools.PutStringSlice(valsBuf)
+			defer pooled.PutStringSlice(valsBuf)
 		}
 		if !isSlice && e.Value != nil {
 			return postingResult{}, fmt.Errorf("%w: %v expects a slice", ErrInvalidQuery, e.Op)
@@ -270,14 +270,14 @@ func (qv *queryView) evalSimple(e qir.Expr) (postingResult, error) {
 		builder := newPostingUnionBuilder(postingBatchSinglesEnabled(uint64(capHint)))
 		defer builder.release()
 		for i := 0; i < valCount; i++ {
-			ids := ov.lookupPostingRetained(valsBuf[i])
+			ids := ov.LookupPostingRetained(valsBuf[i])
 			if ids.IsEmpty() {
 				continue
 			}
 			builder.addPosting(ids)
 		}
 		if hasNil {
-			ids := qv.nilFieldOverlayForExpr(e).lookupPostingRetained(nilIndexEntryKey)
+			ids := qv.nilFieldOverlayForExpr(e).LookupPostingRetained(nilIndexEntryKey)
 			if !ids.IsEmpty() {
 				builder.addPosting(ids)
 			}
@@ -293,7 +293,7 @@ func (qv *queryView) evalSimple(e qir.Expr) (postingResult, error) {
 			return postingResult{}, err
 		}
 		if valsBuf != nil {
-			defer pools.PutStringSlice(valsBuf)
+			defer pooled.PutStringSlice(valsBuf)
 		}
 		if !isSlice && e.Value != nil {
 			return postingResult{}, fmt.Errorf("%w: %v expects a slice", ErrInvalidQuery, e.Op)
@@ -306,7 +306,7 @@ func (qv *queryView) evalSimple(e qir.Expr) (postingResult, error) {
 		if e.Op == qir.OpHASALL {
 			var acc posting.List
 			for i := 0; i < valCount; i++ {
-				ids := ov.lookupPostingRetained(valsBuf[i])
+				ids := ov.LookupPostingRetained(valsBuf[i])
 				if ids.IsEmpty() {
 					// if any value is missing, result is empty
 					acc.Release()
@@ -328,7 +328,7 @@ func (qv *queryView) evalSimple(e qir.Expr) (postingResult, error) {
 		builder := newPostingUnionBuilder(postingBatchSinglesEnabled(uint64(valCount)))
 		defer builder.release()
 		for i := 0; i < valCount; i++ {
-			ids := ov.lookupPostingRetained(valsBuf[i])
+			ids := ov.LookupPostingRetained(valsBuf[i])
 			if ids.IsEmpty() {
 				continue
 			}
@@ -372,14 +372,14 @@ func (qv *queryView) evalSimple(e qir.Expr) (postingResult, error) {
 			}
 		}
 
-		full := ov.rangeForBounds(rangeBounds{has: true})
-		spanLen := full.baseEnd - full.baseStart
+		full := ov.RangeForBounds((indexdata.Bounds{Has: true}))
+		spanLen := full.BaseEnd - full.BaseStart
 		builder := newPostingUnionBuilder(spanLen > 0 && spanLen <= singleAdaptiveMaxLen)
 		defer builder.release()
 
-		cur := ov.newCursor(full, false)
+		cur := ov.NewCursor(full, false)
 		for {
-			key, ids, ok := cur.next()
+			key, ids, ok := cur.Next()
 			if !ok {
 				break
 			}
@@ -438,25 +438,23 @@ func parallelBatchedPostingUnionOwned(posts []posting.List) posting.List {
 	}
 
 	chunkSize := (n + workers - 1) / workers
-	resultsBuf := pools.GetPostingSlice(workers)[:workers]
-	defer pools.PutPostingSlice(resultsBuf)
+	workerCount := (n + chunkSize - 1) / chunkSize
+	resultsBuf := posting.GetSlice(workerCount)[:workerCount]
+	defer posting.PutSlice(resultsBuf)
 
 	var wg sync.WaitGroup
-	for i := 0; i < workers; i++ {
+	for i := 0; i < workerCount; i++ {
 		start := i * chunkSize
-		if start >= n {
-			break
-		}
 		end := start + chunkSize
 		if end > n {
 			end = n
 		}
 
 		wg.Add(1)
-		go func(idx int, part []posting.List) {
-			defer wg.Done()
-			resultsBuf[idx] = linearPostingUnionOwned(part)
-		}(i, posts[start:end])
+		go func(wg *sync.WaitGroup, results []posting.List, idx int, part []posting.List) {
+			results[idx] = linearPostingUnionOwned(part)
+			wg.Done()
+		}(&wg, resultsBuf, i, posts[start:end])
 	}
 
 	wg.Wait()
@@ -479,19 +477,22 @@ func (qv *queryView) evalSliceEQ(field string, fieldOrdinal int, vals []string) 
 
 	useZeroComplement := valCount == 0 && qv.isLenZeroComplementRef(field, fieldOrdinal)
 
-	if !lenOV.hasData() && qv.snapshotLenFieldIndexSliceRef(field, fieldOrdinal) == nil && !useZeroComplement {
+	if !lenOV.HasData() && !useZeroComplement {
+		if qv.snapshotUniverseCardinality() == 0 {
+			return postingResult{}, nil
+		}
 		return postingResult{}, fmt.Errorf("no lenIndex for slice field: %v", field)
 	}
 
 	var lenBM posting.List
 
 	if useZeroComplement {
-		nonEmpty := lenOV.lookupPostingRetained(lenIndexNonEmptyKey)
+		nonEmpty := lenOV.LookupPostingRetained(indexdata.LenIndexNonEmptyKey)
 		lenBM = qv.snapshotUniverseView().Clone()
 		lenBM = lenBM.BuildAndNot(nonEmpty)
 	} else {
 		lenKey := keycodec.U64ByteString(uint64(valCount))
-		lenBM = lenOV.lookupPostingRetained(lenKey)
+		lenBM = lenOV.LookupPostingRetained(lenKey)
 	}
 
 	if lenBM.IsEmpty() {
@@ -501,7 +502,7 @@ func (qv *queryView) evalSliceEQ(field string, fieldOrdinal int, vals []string) 
 	ov := qv.fieldOverlayRef(field, fieldOrdinal)
 	acc := lenBM.Clone()
 	for i := 0; i < valCount; i++ {
-		ids := ov.lookupPostingRetained(vals[i])
+		ids := ov.LookupPostingRetained(vals[i])
 		if ids.IsEmpty() {
 			acc.Release()
 			return postingResult{}, nil
@@ -934,13 +935,13 @@ func (qv *queryView) exprValueToNormalizedScalarBound(expr qir.Expr) (normalized
 	return bound, false, nil
 }
 
-func applyNormalizedScalarBound(rb *rangeBounds, b normalizedScalarBound) {
+func applyNormalizedScalarBound(rb *indexdata.Bounds, b normalizedScalarBound) {
 	if rb == nil {
 		return
 	}
-	rb.has = true
+	rb.Has = true
 	if b.empty {
-		rb.setEmpty()
+		rb.SetEmpty()
 		return
 	}
 	if b.full {
@@ -949,38 +950,38 @@ func applyNormalizedScalarBound(rb *rangeBounds, b normalizedScalarBound) {
 	switch b.op {
 	case qir.OpGT:
 		if b.hasIndexKey {
-			rb.applyLoIndex(b.keyIndex, false)
+			rb.ApplyLoIndex(b.keyIndex, false)
 		} else {
-			rb.applyLo(b.key, false)
+			rb.ApplyLo(b.key, false)
 		}
 	case qir.OpGTE:
 		if b.hasIndexKey {
-			rb.applyLoIndex(b.keyIndex, true)
+			rb.ApplyLoIndex(b.keyIndex, true)
 		} else {
-			rb.applyLo(b.key, true)
+			rb.ApplyLo(b.key, true)
 		}
 	case qir.OpLT:
 		if b.hasIndexKey {
-			rb.applyHiIndex(b.keyIndex, false)
+			rb.ApplyHiIndex(b.keyIndex, false)
 		} else {
-			rb.applyHi(b.key, false)
+			rb.ApplyHi(b.key, false)
 		}
 	case qir.OpLTE:
 		if b.hasIndexKey {
-			rb.applyHiIndex(b.keyIndex, true)
+			rb.ApplyHiIndex(b.keyIndex, true)
 		} else {
-			rb.applyHi(b.key, true)
+			rb.ApplyHi(b.key, true)
 		}
 	case qir.OpEQ:
 		if b.hasIndexKey {
-			rb.applyLoIndex(b.keyIndex, true)
-			rb.applyHiIndex(b.keyIndex, true)
+			rb.ApplyLoIndex(b.keyIndex, true)
+			rb.ApplyHiIndex(b.keyIndex, true)
 		} else {
-			rb.applyLo(b.key, true)
-			rb.applyHi(b.key, true)
+			rb.ApplyLo(b.key, true)
+			rb.ApplyHi(b.key, true)
 		}
 	case qir.OpPREFIX:
-		rb.applyPrefix(b.key)
+		rb.ApplyPrefix(b.key)
 	}
 }
 
@@ -1007,7 +1008,7 @@ func sliceValueToIdxStringBuf(v reflect.Value, fm *field) ([]string, bool, error
 		return nil, false, nil
 	}
 
-	ixsBuf := pools.GetStringSlice(v.Len())
+	ixsBuf := pooled.GetStringSlice(v.Len())
 	hasNil := false
 
 	for i := 0; i < v.Len(); i++ {
@@ -1023,20 +1024,20 @@ func sliceValueToIdxStringBuf(v reflect.Value, fm *field) ([]string, bool, error
 			continue
 		}
 		if elem.Kind() == reflect.Slice {
-			pools.PutStringSlice(ixsBuf)
+			pooled.PutStringSlice(ixsBuf)
 			return nil, false, fmt.Errorf("unsupported slice element type: %v", elem.Type())
 		}
 
 		key, err := scalarValueToIdxField(raw, elem, fm)
 		if err != nil {
-			pools.PutStringSlice(ixsBuf)
+			pooled.PutStringSlice(ixsBuf)
 			return nil, false, err
 		}
 		ixsBuf = append(ixsBuf, key)
 	}
 
 	if len(ixsBuf) == 0 {
-		pools.PutStringSlice(ixsBuf)
+		pooled.PutStringSlice(ixsBuf)
 		return nil, hasNil, nil
 	}
 	return ixsBuf, hasNil, nil
@@ -1044,12 +1045,12 @@ func sliceValueToIdxStringBuf(v reflect.Value, fm *field) ([]string, bool, error
 
 func (qv *queryView) scalarLookupPostings(field string, fieldOrdinal int, keys []string, includeNil bool) ([]posting.List, uint64) {
 	keyCount := len(keys)
-	postsBuf := pools.GetPostingSlice(keyCount + btoi(includeNil))
+	postsBuf := posting.GetSlice(keyCount + btoi(includeNil))
 	var est uint64
 
 	ov := qv.fieldOverlayRef(field, fieldOrdinal)
 	for i := 0; i < keyCount; i++ {
-		ids := ov.lookupPostingRetained(keys[i])
+		ids := ov.LookupPostingRetained(keys[i])
 		if ids.IsEmpty() {
 			continue
 		}
@@ -1057,7 +1058,7 @@ func (qv *queryView) scalarLookupPostings(field string, fieldOrdinal int, keys [
 		est += ids.Cardinality()
 	}
 	if includeNil {
-		ids := qv.nilFieldOverlayRef(field, fieldOrdinal).lookupPostingRetained(nilIndexEntryKey)
+		ids := qv.nilFieldOverlayRef(field, fieldOrdinal).LookupPostingRetained(nilIndexEntryKey)
 		if !ids.IsEmpty() {
 			postsBuf = append(postsBuf, ids)
 			est += ids.Cardinality()
@@ -1111,11 +1112,11 @@ func (qv *queryView) exprValueToDistinctIdxBuf(expr qir.Expr) ([]string, bool, b
 			if len(v) == 0 {
 				return nil, true, false, nil
 			}
-			valsBuf := pools.GetStringSlice(len(v))
+			valsBuf := pooled.GetStringSlice(len(v))
 			valsBuf = append(valsBuf, v...)
 			valsBuf = dedupStringBufInPlace(valsBuf)
 			if len(valsBuf) == 0 {
-				pools.PutStringSlice(valsBuf)
+				pooled.PutStringSlice(valsBuf)
 				return nil, true, false, nil
 			}
 			return valsBuf, true, false, nil
@@ -1141,7 +1142,7 @@ func (qv *queryView) exprValueToDistinctIdxBuf(expr qir.Expr) ([]string, bool, b
 		}
 		valsBuf = dedupStringBufInPlace(valsBuf)
 		if len(valsBuf) == 0 {
-			pools.PutStringSlice(valsBuf)
+			pooled.PutStringSlice(valsBuf)
 			return nil, true, hasNil, nil
 		}
 		return valsBuf, true, hasNil, nil

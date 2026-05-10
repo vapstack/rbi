@@ -5,8 +5,9 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/vapstack/rbi/internal/indexdata"
+
 	"github.com/vapstack/rbi/internal/pooled"
-	"github.com/vapstack/rbi/internal/pools"
 	"github.com/vapstack/rbi/internal/posting"
 )
 
@@ -36,7 +37,7 @@ type numericRangeFullSpanCacheSlot struct {
 
 type numericRangeBucketCacheEntry struct {
 	refs          atomic.Int32
-	storage       fieldIndexStorage
+	storage       indexdata.FieldStorage
 	idx           numericRangeBucketIndex
 	maxCard       uint64
 	mu            sync.Mutex
@@ -179,7 +180,7 @@ func (e *numericRangeBucketCacheEntry) releaseFullSpanCache() {
 	}
 	if e.retired != nil {
 		posting.ReleaseAll(e.retired)
-		pools.PutPostingSlice(e.retired)
+		posting.PutSlice(e.retired)
 		e.retired = nil
 	}
 	e.fullSpanClock = 0
@@ -190,7 +191,7 @@ func (e *numericRangeBucketCacheEntry) retirePosting(ids posting.List) {
 		return
 	}
 	if e.retired == nil {
-		e.retired = pools.GetPostingSlice(1)
+		e.retired = posting.GetSlice(1)
 	}
 	e.retired = append(e.retired, ids)
 }
@@ -329,16 +330,16 @@ func (e *numericRangeBucketCacheEntry) tryStoreFullSpan(start, end int, ids post
 	return stored.Borrow(), true
 }
 
-func (idx *numericRangeBucketIndex) fullBucketSpan(br overlayRange) (start, end int, ok bool) {
+func (idx *numericRangeBucketIndex) fullBucketSpan(br indexdata.OverlayRange) (start, end int, ok bool) {
 	if idx == nil || idx.bucketSize <= 0 || idx.keyCount <= 0 {
 		return 0, 0, false
 	}
-	if br.baseStart < 0 || br.baseStart >= br.baseEnd {
+	if br.BaseStart < 0 || br.BaseStart >= br.BaseEnd {
 		return 0, 0, false
 	}
 
-	startBucket := br.baseStart / idx.bucketSize
-	endBucket := (br.baseEnd - 1) / idx.bucketSize
+	startBucket := br.BaseStart / idx.bucketSize
+	endBucket := (br.BaseEnd - 1) / idx.bucketSize
 	if startBucket < 0 {
 		startBucket = 0
 	}
@@ -354,11 +355,11 @@ func (idx *numericRangeBucketIndex) fullBucketSpan(br overlayRange) (start, end 
 	}
 
 	start = startBucket
-	if idx.bucketStart(start) < br.baseStart {
+	if idx.bucketStart(start) < br.BaseStart {
 		start++
 	}
 	end = endBucket
-	if end >= 0 && idx.bucketEnd(end) > br.baseEnd {
+	if end >= 0 && idx.bucketEnd(end) > br.BaseEnd {
 		end--
 	}
 	if start > end {
@@ -386,82 +387,6 @@ func (idx *numericRangeBucketIndex) bucketEnd(bucket int) int {
 	return end
 }
 
-func satAddUint64(total, add uint64) uint64 {
-	if ^uint64(0)-total < add {
-		return ^uint64(0)
-	}
-	return total + add
-}
-
-func overlayRangeSpanLen(br overlayRange) int {
-	if br.baseStart >= br.baseEnd {
-		return 0
-	}
-	return br.baseEnd - br.baseStart
-}
-
-func appendOverlayRangeUnion(builder *postingUnionBuilder, ov fieldOverlay, br overlayRange) {
-	if builder == nil || overlayRangeEmpty(br) {
-		return
-	}
-	cur := ov.newCursor(br, false)
-	for {
-		_, ids, ok := cur.next()
-		if !ok {
-			break
-		}
-		if ids.IsEmpty() {
-			continue
-		}
-		builder.addPosting(ids)
-	}
-}
-
-func overlayUnionBatchSinglesEnabled(ov fieldOverlay, first, second overlayRange) bool {
-	totalSpan := overlayRangeSpanLen(first) + overlayRangeSpanLen(second)
-	if totalSpan == 0 {
-		return false
-	}
-	if totalSpan <= singleAdaptiveMaxLen {
-		return true
-	}
-	if ov.chunked == nil {
-		return false
-	}
-	_, estFirst := overlayRangeStats(ov, first)
-	_, estSecond := overlayRangeStats(ov, second)
-	return postingBatchSinglesEnabled(satAddUint64(estFirst, estSecond))
-}
-
-func overlayUnionRanges(ov fieldOverlay, first, second overlayRange) posting.List {
-	if overlayRangeEmpty(first) && overlayRangeEmpty(second) {
-		return posting.List{}
-	}
-	builder := newPostingUnionBuilder(overlayUnionBatchSinglesEnabled(ov, first, second))
-	defer builder.release()
-	appendOverlayRangeUnion(&builder, ov, first)
-	appendOverlayRangeUnion(&builder, ov, second)
-	return builder.finish(true)
-}
-
-func mergeOverlayRangesInto(dst posting.List, ov fieldOverlay, first, second overlayRange) posting.List {
-	totalSpan := overlayRangeSpanLen(first) + overlayRangeSpanLen(second)
-	if totalSpan == 0 {
-		return dst
-	}
-	const mergeOverlayRangeDirectMaxBuckets = 32
-	builder := newPostingUnionBuilder(totalSpan <= singleAdaptiveMaxLen)
-	if !dst.IsEmpty() && totalSpan > mergeOverlayRangeDirectMaxBuckets {
-		appendOverlayRangeUnion(&builder, ov, first)
-		appendOverlayRangeUnion(&builder, ov, second)
-		return dst.BuildMergedOwned(builder.finish(false))
-	}
-	builder.ids = dst
-	appendOverlayRangeUnion(&builder, ov, first)
-	appendOverlayRangeUnion(&builder, ov, second)
-	return builder.finish(false)
-}
-
 func isNumericScalarKind(kind reflect.Kind) bool {
 	switch kind {
 	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
@@ -473,52 +398,32 @@ func isNumericScalarKind(kind reflect.Kind) bool {
 	}
 }
 
-func buildNumericRangeBucketIndex(base []index, bucketSize, minFieldKeys int) (numericRangeBucketIndex, bool) {
+func buildNumericRangeBucketIndex(ov indexdata.FieldOverlay, bucketSize, minFieldKeys int) (numericRangeBucketIndex, bool) {
+	if !ov.HasData() {
+		return numericRangeBucketIndex{}, false
+	}
 	if bucketSize <= 0 || minFieldKeys <= 0 {
 		return numericRangeBucketIndex{}, false
 	}
-	if len(base) < minFieldKeys {
+	if ov.KeyCount() < minFieldKeys {
 		return numericRangeBucketIndex{}, false
 	}
 	if bucketSize < 16 {
 		bucketSize = 16
 	}
 
-	return numericRangeBucketIndex{
-		bucketSize: bucketSize,
-		keyCount:   len(base),
-	}, true
-}
-
-func buildNumericRangeBucketIndexOverlay(ov fieldOverlay, bucketSize, minFieldKeys int) (numericRangeBucketIndex, bool) {
-	if !ov.hasData() {
-		return numericRangeBucketIndex{}, false
-	}
-	if ov.chunked == nil {
-		return buildNumericRangeBucketIndex(ov.base, bucketSize, minFieldKeys)
-	}
-	if bucketSize <= 0 || minFieldKeys <= 0 {
-		return numericRangeBucketIndex{}, false
-	}
-	if ov.keyCount() < minFieldKeys {
-		return numericRangeBucketIndex{}, false
-	}
-	if bucketSize < 16 {
-		bucketSize = 16
-	}
-
-	keyCount := ov.keyCount()
+	keyCount := ov.KeyCount()
 	return numericRangeBucketIndex{
 		bucketSize: bucketSize,
 		keyCount:   keyCount,
 	}, true
 }
 
-func (s *indexSnapshot) getNumericRangeBucketCacheEntry(field string, ordinal int, storage fieldIndexStorage, bucketSize, minFieldKeys int) *numericRangeBucketCacheEntry {
-	if s == nil || storage.keyCount() == 0 {
+func (s *indexSnapshot) getNumericRangeBucketCacheEntry(field string, ordinal int, storage indexdata.FieldStorage, bucketSize, minFieldKeys int) *numericRangeBucketCacheEntry {
+	if s == nil || storage.KeyCount() == 0 {
 		return nil
 	}
-	ov := newFieldOverlayStorage(storage)
+	ov := indexdata.NewFieldOverlayStorage(storage)
 	cache := s.numericRangeBucketCache
 	if cache == nil {
 		return nil
@@ -528,7 +433,7 @@ func (s *indexSnapshot) getNumericRangeBucketCacheEntry(field string, ordinal in
 		return entry
 	}
 
-	idx, _ := buildNumericRangeBucketIndexOverlay(ov, bucketSize, minFieldKeys)
+	idx, _ := buildNumericRangeBucketIndex(ov, bucketSize, minFieldKeys)
 	entry := numericRangeBucketCacheEntryPool.Get()
 	entry.refs.Store(1)
 	entry.storage = storage
@@ -550,7 +455,7 @@ func (qv *queryView) numericRangeFieldOrdinal(field string) (int, bool) {
 	return acc.ordinal, true
 }
 
-func (qv *queryView) numericRangeBucketCacheEntry(field string, storage fieldIndexStorage, bucketSize, minFieldKeys int) *numericRangeBucketCacheEntry {
+func (qv *queryView) numericRangeBucketCacheEntry(field string, storage indexdata.FieldStorage, bucketSize, minFieldKeys int) *numericRangeBucketCacheEntry {
 	ordinal, ok := qv.numericRangeFieldOrdinal(field)
 	if !ok {
 		return nil
@@ -558,7 +463,7 @@ func (qv *queryView) numericRangeBucketCacheEntry(field string, storage fieldInd
 	return qv.snap.getNumericRangeBucketCacheEntry(field, ordinal, storage, bucketSize, minFieldKeys)
 }
 
-func (qv *queryView) tryEvalNumericRangeBuckets(field string, fm *field, ov fieldOverlay, br overlayRange) (postingResult, bool) {
+func (qv *queryView) tryEvalNumericRangeBuckets(field string, fm *field, ov indexdata.FieldOverlay, br indexdata.OverlayRange) (postingResult, bool) {
 	if !fieldUsesOrderedNumericKeys(fm) {
 		return postingResult{}, false
 	}
@@ -569,16 +474,16 @@ func (qv *queryView) tryEvalNumericRangeBuckets(field string, fm *field, ov fiel
 	if bucketSize <= 0 || minFieldKeys <= 0 || minSpan <= 0 {
 		return postingResult{}, false
 	}
-	span := br.baseEnd - br.baseStart
+	span := br.BaseEnd - br.BaseStart
 	if span < minSpan {
 		return postingResult{}, false
 	}
-	if br.baseStart >= br.baseEnd || ov.keyCount() == 0 {
+	if br.BaseStart >= br.BaseEnd || ov.KeyCount() == 0 {
 		return postingResult{}, false
 	}
 
 	storage, ok := qv.snap.fieldIndexStorage(field)
-	if !ok || storage.keyCount() == 0 {
+	if !ok || storage.KeyCount() == 0 {
 		return postingResult{}, false
 	}
 	entry := qv.numericRangeBucketCacheEntry(field, storage, bucketSize, minFieldKeys)
@@ -589,7 +494,7 @@ func (qv *queryView) tryEvalNumericRangeBuckets(field string, fm *field, ov fiel
 	if idx.bucketSize <= 0 || idx.bucketCount() == 0 {
 		return postingResult{}, false
 	}
-	if idx.keyCount != ov.keyCount() {
+	if idx.keyCount != ov.KeyCount() {
 		return postingResult{}, false
 	}
 
@@ -617,41 +522,38 @@ func (qv *queryView) tryEvalNumericRangeBuckets(field string, fm *field, ov fiel
 			res = cached
 			switch {
 			case cachedStart == startFull && cachedEnd < endFull:
-				res = mergeOverlayRangesInto(
+				res = ov.MergeRangePostingsInto(
 					res,
-					ov,
-					ov.rangeByRanks(idx.bucketStart(cachedEnd+1), idx.bucketEnd(endFull)),
-					overlayRange{},
+					ov.RangeByRanks(idx.bucketStart(cachedEnd+1), idx.bucketEnd(endFull)),
+					indexdata.OverlayRange{},
 				)
 			case cachedEnd == endFull && cachedStart > startFull:
-				res = mergeOverlayRangesInto(
+				res = ov.MergeRangePostingsInto(
 					res,
-					ov,
-					ov.rangeByRanks(idx.bucketStart(startFull), idx.bucketStart(cachedStart)),
-					overlayRange{},
+					ov.RangeByRanks(idx.bucketStart(startFull), idx.bucketStart(cachedStart)),
+					indexdata.OverlayRange{},
 				)
 			}
 		} else {
-			res = mergeOverlayRangesInto(res, ov, ov.rangeByRanks(idx.bucketStart(startFull), idx.bucketEnd(endFull)), overlayRange{})
+			res = ov.MergeRangePostingsInto(res, ov.RangeByRanks(idx.bucketStart(startFull), idx.bucketEnd(endFull)), indexdata.OverlayRange{})
 		}
 		res, _ = entry.tryStoreFullSpan(startFull, endFull, res)
 	}
 
-	leftEnd := min(br.baseEnd, idx.bucketStart(startFull))
-	rightStart := max(br.baseStart, idx.bucketEnd(endFull))
-	if (leftEnd > br.baseStart) || (rightStart < br.baseEnd) {
-		res = mergeOverlayRangesInto(
+	leftEnd := min(br.BaseEnd, idx.bucketStart(startFull))
+	rightStart := max(br.BaseStart, idx.bucketEnd(endFull))
+	if (leftEnd > br.BaseStart) || (rightStart < br.BaseEnd) {
+		res = ov.MergeRangePostingsInto(
 			res,
-			ov,
-			ov.rangeByRanks(br.baseStart, leftEnd),
-			ov.rangeByRanks(rightStart, br.baseEnd),
+			ov.RangeByRanks(br.BaseStart, leftEnd),
+			ov.RangeByRanks(rightStart, br.BaseEnd),
 		)
 	}
 
 	return postingResult{ids: res}, true
 }
 
-func (qv *queryView) tryLoadNumericRangeBuckets(field string, fm *field, ov fieldOverlay, br overlayRange) (postingResult, bool) {
+func (qv *queryView) tryLoadNumericRangeBuckets(field string, fm *field, ov indexdata.FieldOverlay, br indexdata.OverlayRange) (postingResult, bool) {
 	if !fieldUsesOrderedNumericKeys(fm) {
 		return postingResult{}, false
 	}
@@ -662,16 +564,16 @@ func (qv *queryView) tryLoadNumericRangeBuckets(field string, fm *field, ov fiel
 	if bucketSize <= 0 || minFieldKeys <= 0 || minSpan <= 0 {
 		return postingResult{}, false
 	}
-	span := br.baseEnd - br.baseStart
+	span := br.BaseEnd - br.BaseStart
 	if span < minSpan {
 		return postingResult{}, false
 	}
-	if br.baseStart >= br.baseEnd || ov.keyCount() == 0 {
+	if br.BaseStart >= br.BaseEnd || ov.KeyCount() == 0 {
 		return postingResult{}, false
 	}
 
 	storage, ok := qv.snap.fieldIndexStorage(field)
-	if !ok || storage.keyCount() == 0 {
+	if !ok || storage.KeyCount() == 0 {
 		return postingResult{}, false
 	}
 	entry := qv.numericRangeBucketCacheEntry(field, storage, bucketSize, minFieldKeys)
@@ -682,7 +584,7 @@ func (qv *queryView) tryLoadNumericRangeBuckets(field string, fm *field, ov fiel
 	if idx.bucketSize <= 0 || idx.bucketCount() == 0 {
 		return postingResult{}, false
 	}
-	if idx.keyCount != ov.keyCount() {
+	if idx.keyCount != ov.KeyCount() {
 		return postingResult{}, false
 	}
 
@@ -709,42 +611,33 @@ func (qv *queryView) tryLoadNumericRangeBuckets(field string, fm *field, ov fiel
 		return postingResult{}, false
 	}
 
-	leftEnd := min(br.baseEnd, idx.bucketStart(startFull))
-	rightStart := max(br.baseStart, idx.bucketEnd(endFull))
-	if (leftEnd > br.baseStart) || (rightStart < br.baseEnd) {
-		res = mergeOverlayRangesInto(
+	leftEnd := min(br.BaseEnd, idx.bucketStart(startFull))
+	rightStart := max(br.BaseStart, idx.bucketEnd(endFull))
+	if (leftEnd > br.BaseStart) || (rightStart < br.BaseEnd) {
+		res = ov.MergeRangePostingsInto(
 			res,
-			ov,
-			ov.rangeByRanks(br.baseStart, leftEnd),
-			ov.rangeByRanks(rightStart, br.baseEnd),
+			ov.RangeByRanks(br.BaseStart, leftEnd),
+			ov.RangeByRanks(rightStart, br.BaseEnd),
 		)
 	}
 
 	return postingResult{ids: res}, true
 }
 
-func (qv *queryView) tryCountSnapshotNumericRange(field string, fm *field, ov fieldOverlay, start, end int) (uint64, bool) {
+func (qv *queryView) tryCountSnapshotNumericRange(field string, fm *field, ov indexdata.FieldOverlay, start, end int) (uint64, bool) {
 	if !fieldUsesOrderedNumericKeys(fm) {
 		return 0, false
 	}
-	if start < 0 || start > end || end > ov.keyCount() {
+	if start < 0 || start > end || end > ov.KeyCount() {
 		return 0, false
 	}
 
 	storage, ok := qv.snap.fieldIndexStorage(field)
-	if !ok || storage.keyCount() == 0 {
+	if !ok || storage.KeyCount() == 0 {
 		return 0, false
 	}
-	if storage.keyCount() != ov.keyCount() {
+	if storage.KeyCount() != ov.KeyCount() {
 		return 0, false
 	}
-	if storage.chunked != nil {
-		root := storage.chunked
-		return root.rangeRows(root.posForRank(start), root.posForRank(end)), true
-	}
-	flat := storage.flatSlice()
-	if flat == nil {
-		return 0, false
-	}
-	return countBaseIndexRangeCardinality(*flat, start, end), true
+	return indexdata.NewFieldOverlayStorage(storage).RangeRows(start, end), true
 }

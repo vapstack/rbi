@@ -1081,11 +1081,11 @@ func TestAggregateMeasureEmptyBaseBatchSetDuplicateIDsUsesLastValue(t *testing.T
 	}
 
 	acc := db.engine.measureFieldMap["amount"]
-	storage := db.engine.getSnapshot().measure.Get(acc.ordinal)
-	if storage.rows() != 1 {
-		t.Fatalf("measure rows=%d, want 1", storage.rows())
+	storage := db.engine.getSnapshot().measure[acc.ordinal]
+	if storage.Rows() != 1 {
+		t.Fatalf("measure rows=%d, want 1", storage.Rows())
 	}
-	if got, ok := storage.lookup(1); !ok || got != 20 {
+	if got, ok := storage.Lookup(1); !ok || got != 20 {
 		t.Fatalf("measure lookup=(%d,%v), want (20,true)", got, ok)
 	}
 
@@ -1128,7 +1128,7 @@ func TestAggregateWideMeasureUsesFullAndMergeScans(t *testing.T) {
 	}
 
 	acc := db.engine.measureFieldMap["amount"]
-	storage := db.engine.getSnapshot().measure.Get(acc.ordinal)
+	storage := db.engine.getSnapshot().measure[acc.ordinal]
 	if !useMeasureMergeScan(keep, storage) {
 		t.Fatal("wide filtered measure aggregate must use merge scan")
 	}
@@ -1197,7 +1197,7 @@ func TestAggregateRebuildIndexKeepsMultipleMeasureFields(t *testing.T) {
 	requireAggregateInt(t, result.Rows[0][3], 60)
 }
 
-func TestMeasureChunkedAppendFillsTailChunk(t *testing.T) {
+func TestAggregateMeasureAppendAfterLargeSeed(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "measure_tail_fill.db")
 	db, raw := openBoltAndNew[uint64, aggregateWideMeasureRec](t, path, Options{AnalyzeInterval: -1})
@@ -1230,21 +1230,6 @@ func TestMeasureChunkedAppendFillsTailChunk(t *testing.T) {
 		t.Fatalf("BatchSet append: %v", err)
 	}
 
-	acc := db.engine.measureFieldMap["amount"]
-	storage := db.engine.getSnapshot().measure.Get(acc.ordinal)
-	if storage.chunked == nil {
-		t.Fatal("measure storage must be chunked")
-	}
-	if got := storage.chunked.refsByID.Len(); got != 3 {
-		t.Fatalf("chunk count=%d, want 3", got)
-	}
-	last := storage.chunked.refsByID.Get(storage.chunked.refsByID.Len() - 1).chunk
-	if got, want := len(last.ids), seed-2*measureChunkTargetRows+appendCount; got != want {
-		t.Fatalf("tail chunk rows=%d, want %d", got, want)
-	}
-	if storage.rows() != seed+appendCount {
-		t.Fatalf("measure rows=%d, want %d", storage.rows(), seed+appendCount)
-	}
 	result, err := db.Aggregate(qx.Aggregate(qx.COUNT("amount").AS("count"), qx.SUM("amount").AS("sum")))
 	if err != nil {
 		t.Fatalf("Aggregate: %v", err)

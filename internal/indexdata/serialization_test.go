@@ -1,0 +1,427 @@
+package indexdata
+
+import (
+	"bufio"
+	"bytes"
+	"fmt"
+	"strings"
+	"testing"
+
+	"github.com/vapstack/rbi/internal/keycodec"
+	"github.com/vapstack/rbi/internal/posting"
+)
+
+func TestFieldIndexChunk_StringSingletonRoundTripUsesOwnerLayout(t *testing.T) {
+	keys := []keycodec.IndexKey{
+		keycodec.FromStoredString("alpha", false),
+		keycodec.FromStoredString("beta", false),
+	}
+	posts := []posting.List{
+		fieldStorageSingleton(11),
+		fieldStorageSingleton(22),
+	}
+	chunk := newFieldIndexChunkFromKeys(posts, keys, 2)
+	if chunk == nil {
+		t.Fatalf("expected string chunk")
+	}
+	if !chunk.hasUniqueStringOwners() {
+		t.Fatalf("expected owner layout before serialization")
+	}
+
+	var raw bytes.Buffer
+	writer := bufio.NewWriter(&raw)
+	if err := chunk.writeInto(writer); err != nil {
+		t.Fatalf("write chunk: %v", err)
+	}
+	if err := writer.Flush(); err != nil {
+		t.Fatalf("flush chunk: %v", err)
+	}
+
+	roundTrip, err := readFieldIndexChunk(bufio.NewReader(bytes.NewReader(raw.Bytes())))
+	if err != nil {
+		t.Fatalf("read chunk: %v", err)
+	}
+	if roundTrip == nil {
+		t.Fatalf("expected round-trip chunk")
+	}
+	if !roundTrip.hasUniqueStringOwners() {
+		t.Fatalf("expected owner layout after serialization round-trip")
+	}
+	if got := roundTrip.keyAt(0).UnsafeString(); got != "alpha" {
+		t.Fatalf("unexpected first Key: got %q want %q", got, "alpha")
+	}
+	if ids := roundTrip.postingAt(1); ids.Cardinality() != 1 || !ids.Contains(22) {
+		t.Fatalf("unexpected round-trip posting: %v", ids)
+	}
+}
+
+func TestFieldIndexChunk_NumericSingletonRoundTripUsesOwnerLayout(t *testing.T) {
+	chunk := newNumericFieldIndexChunk([]posting.List{
+		fieldStorageSingleton(11),
+		fieldStorageSingleton(22),
+	}, []uint64{111, 222}, 2)
+	if chunk == nil {
+		t.Fatalf("expected numeric chunk")
+	}
+	if !chunk.hasUniqueNumericOwners() {
+		t.Fatalf("expected owner layout before serialization")
+	}
+
+	var raw bytes.Buffer
+	writer := bufio.NewWriter(&raw)
+	if err := chunk.writeInto(writer); err != nil {
+		t.Fatalf("write chunk: %v", err)
+	}
+	if err := writer.Flush(); err != nil {
+		t.Fatalf("flush chunk: %v", err)
+	}
+
+	roundTrip, err := readFieldIndexChunk(bufio.NewReader(bytes.NewReader(raw.Bytes())))
+	if err != nil {
+		t.Fatalf("read chunk: %v", err)
+	}
+	if roundTrip == nil {
+		t.Fatalf("expected round-trip chunk")
+	}
+	if !roundTrip.hasUniqueNumericOwners() {
+		t.Fatalf("expected owner layout after serialization round-trip")
+	}
+	if got := roundTrip.keyAt(0).U64(); got != 111 {
+		t.Fatalf("unexpected first Key: got %d want 111", got)
+	}
+	if ids := roundTrip.postingAt(1); ids.Cardinality() != 1 || !ids.Contains(22) {
+		t.Fatalf("unexpected round-trip posting: %v", ids)
+	}
+}
+
+func TestReadIndexKeyRejectsTooLongString(t *testing.T) {
+	var raw bytes.Buffer
+	writer := bufio.NewWriter(&raw)
+	if err := writer.WriteByte(indexKeyEncodingString); err != nil {
+		t.Fatalf("write tag: %v", err)
+	}
+	if err := writeString(writer, strings.Repeat("x", fieldIndexStringRefMax+1)); err != nil {
+		t.Fatalf("write string: %v", err)
+	}
+	if err := writer.Flush(); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+
+	_, err := ReadKey(bufio.NewReader(bytes.NewReader(raw.Bytes())))
+	if err == nil {
+		t.Fatalf("expected indexed string validation error")
+	}
+	if !strings.Contains(err.Error(), "exceeds limit") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestStoredStringSerializationRejectsStoredStringLimit(t *testing.T) {
+	var raw bytes.Buffer
+	writer := bufio.NewWriter(&raw)
+	if err := writeUvarint(writer, MaxStoredStringLen+1); err != nil {
+		t.Fatalf("write len: %v", err)
+	}
+	if err := writer.Flush(); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+
+	_, err := readString(bufio.NewReader(bytes.NewReader(raw.Bytes())))
+	if err == nil {
+		t.Fatalf("expected readString length error")
+	}
+	if !strings.Contains(err.Error(), "exceeds limit") {
+		t.Fatalf("unexpected readString error: %v", err)
+	}
+
+	err = skipString(bufio.NewReader(bytes.NewReader(raw.Bytes())))
+	if err == nil {
+		t.Fatalf("expected skipString length error")
+	}
+	if !strings.Contains(err.Error(), "exceeds limit") {
+		t.Fatalf("unexpected skipString error: %v", err)
+	}
+}
+
+func TestFieldStorageSerializationRoundTrip_FlatAndChunked(t *testing.T) {
+	fixedFlat := GetFixedPostingMap()
+	fixedFlat[3] = fieldStorageOwnedTestPosting(30)
+	fixedFlat[9] = fieldStorageOwnedTestPosting(90)
+	flat := NewRegularFieldStorageFromFixedPostingMapOwned(fixedFlat)
+	if flat.IsChunked() {
+		t.Fatalf("expected flat storage")
+	}
+	flatRound, err := fieldStorageRoundTripForTest(flat)
+	if err != nil {
+		flat.Release()
+		t.Fatalf("flat round trip: %v", err)
+	}
+	if flatRound.IsChunked() {
+		flat.Release()
+		flatRound.Release()
+		t.Fatalf("expected flat storage after round trip")
+	}
+	fieldStorageAssertPostingContains(t, flatRound, keycodec.U64ByteString(3), 30, 1_000_030)
+	flat.Release()
+	flatRound.Release()
+
+	stringMap := GetPostingMap()
+	for i := 0; i < FieldChunkThreshold+17; i++ {
+		stringMap[fmt.Sprintf("k/%04d", i)] = fieldStorageOwnedTestPosting(uint64(i + 1))
+	}
+	chunkedString := NewRegularFieldStorageFromPostingMapOwned(stringMap, false)
+	if !chunkedString.IsChunked() {
+		t.Fatalf("expected string storage to be chunked")
+	}
+	stringRound, err := fieldStorageRoundTripForTest(chunkedString)
+	if err != nil {
+		chunkedString.Release()
+		t.Fatalf("string chunked round trip: %v", err)
+	}
+	if !stringRound.IsChunked() {
+		chunkedString.Release()
+		stringRound.Release()
+		t.Fatalf("expected string storage to stay chunked")
+	}
+	stringProbe := FieldChunkTargetEntries
+	fieldStorageAssertPostingContains(
+		t,
+		stringRound,
+		fmt.Sprintf("k/%04d", stringProbe),
+		uint64(stringProbe+1),
+		uint64(stringProbe+1_000_001),
+	)
+	chunkedString.Release()
+	stringRound.Release()
+
+	fixedChunked := GetFixedPostingMap()
+	for i := 0; i < FieldChunkThreshold+23; i++ {
+		fixedChunked[uint64(i*2)] = fieldStorageOwnedTestPosting(uint64(i + 10_000))
+	}
+	chunkedNumeric := NewRegularFieldStorageFromFixedPostingMapOwned(fixedChunked)
+	if !chunkedNumeric.IsChunked() {
+		t.Fatalf("expected numeric storage to be chunked")
+	}
+	numericRound, err := fieldStorageRoundTripForTest(chunkedNumeric)
+	if err != nil {
+		chunkedNumeric.Release()
+		t.Fatalf("numeric chunked round trip: %v", err)
+	}
+	if !numericRound.IsChunked() {
+		chunkedNumeric.Release()
+		numericRound.Release()
+		t.Fatalf("expected numeric storage to stay chunked")
+	}
+	numericProbe := uint64(FieldChunkTargetEntries * 2)
+	fieldStorageAssertPostingContains(t, numericRound, keycodec.U64ByteString(numericProbe), 10_000+uint64(FieldChunkTargetEntries), 1_010_000+uint64(FieldChunkTargetEntries))
+	chunkedNumeric.Release()
+	numericRound.Release()
+}
+
+func TestSerializationSkipEntryAndKey(t *testing.T) {
+	first := Entry{
+		Key: keycodec.FromStoredString("skip", false),
+		IDs: fieldStorageOwnedTestPosting(1),
+	}
+	second := Entry{
+		Key: keycodec.FromStoredString("read", false),
+		IDs: fieldStorageOwnedTestPosting(2),
+	}
+	defer first.IDs.Release()
+	defer second.IDs.Release()
+
+	var entriesRaw bytes.Buffer
+	writer := bufio.NewWriter(&entriesRaw)
+	if err := first.WriteInto(writer); err != nil {
+		t.Fatalf("write first entry: %v", err)
+	}
+	if err := second.WriteInto(writer); err != nil {
+		t.Fatalf("write second entry: %v", err)
+	}
+	if err := writer.Flush(); err != nil {
+		t.Fatalf("flush entries: %v", err)
+	}
+	reader := bufio.NewReader(bytes.NewReader(entriesRaw.Bytes()))
+	if err := SkipEntry(reader); err != nil {
+		t.Fatalf("skip entry: %v", err)
+	}
+	gotEntry, err := ReadEntry(reader)
+	if err != nil {
+		t.Fatalf("read entry after skip: %v", err)
+	}
+	defer gotEntry.IDs.Release()
+	if !keycodec.EqualsString(gotEntry.Key, "read") || gotEntry.IDs.Cardinality() != 2 || !gotEntry.IDs.Contains(2) || !gotEntry.IDs.Contains(1_000_002) {
+		t.Fatalf("unexpected entry after skip: key=%q ids=%v", gotEntry.Key.UnsafeString(), gotEntry.IDs)
+	}
+
+	var keysRaw bytes.Buffer
+	writer = bufio.NewWriter(&keysRaw)
+	if err := WriteKey(writer, keycodec.FromStoredString("skip-key", false)); err != nil {
+		t.Fatalf("write first key: %v", err)
+	}
+	if err := WriteKey(writer, keycodec.FromStoredString("read-key", false)); err != nil {
+		t.Fatalf("write second key: %v", err)
+	}
+	if err := writer.Flush(); err != nil {
+		t.Fatalf("flush keys: %v", err)
+	}
+	reader = bufio.NewReader(bytes.NewReader(keysRaw.Bytes()))
+	if err := SkipKey(reader); err != nil {
+		t.Fatalf("skip key: %v", err)
+	}
+	gotKey, err := ReadKey(reader)
+	if err != nil {
+		t.Fatalf("read key after skip: %v", err)
+	}
+	if !keycodec.EqualsString(gotKey, "read-key") {
+		t.Fatalf("unexpected key after skip: got %q want read-key", gotKey.UnsafeString())
+	}
+}
+
+func TestReadStorageSkipConsumesExactlyOneStorage(t *testing.T) {
+	fieldTests := []struct {
+		name string
+		rows int
+	}{
+		{name: "FieldFlat", rows: 8},
+		{name: "FieldChunked", rows: fieldIndexChunkThreshold + 17},
+	}
+	for _, tc := range fieldTests {
+		t.Run(tc.name, func(t *testing.T) {
+			entries := fieldStorageEntriesForTest(tc.rows, false)
+			storage := newRegularFieldStorage(&entries)
+			defer storage.Release()
+
+			var raw bytes.Buffer
+			writer := bufio.NewWriter(&raw)
+			if err := storage.WriteInto(writer); err != nil {
+				t.Fatalf("write field storage: %v", err)
+			}
+			if err := writer.WriteByte(0xA7); err != nil {
+				t.Fatalf("write sentinel: %v", err)
+			}
+			if err := writer.Flush(); err != nil {
+				t.Fatalf("flush: %v", err)
+			}
+			reader := bufio.NewReader(bytes.NewReader(raw.Bytes()))
+			skipped, err := ReadFieldStorage(reader, false, "test", "field")
+			if err != nil {
+				t.Fatalf("skip field storage: %v", err)
+			}
+			if skipped.KeyCount() != 0 {
+				skipped.Release()
+				t.Fatalf("skip returned non-empty field storage")
+			}
+			b, err := reader.ReadByte()
+			if err != nil || b != 0xA7 {
+				t.Fatalf("field skip consumed wrong bytes: byte=%x err=%v", b, err)
+			}
+		})
+	}
+
+	measureTests := []struct {
+		name string
+		rows int
+	}{
+		{name: "MeasureFlat", rows: 8},
+		{name: "MeasureChunked", rows: MeasureChunkThreshold + 17},
+	}
+	for _, tc := range measureTests {
+		t.Run(tc.name, func(t *testing.T) {
+			storage := measureStorageForTest(tc.rows)
+			defer storage.Release()
+
+			var raw bytes.Buffer
+			writer := bufio.NewWriter(&raw)
+			if err := storage.WriteInto(writer); err != nil {
+				t.Fatalf("write measure storage: %v", err)
+			}
+			if err := writer.WriteByte(0xA8); err != nil {
+				t.Fatalf("write sentinel: %v", err)
+			}
+			if err := writer.Flush(); err != nil {
+				t.Fatalf("flush: %v", err)
+			}
+			reader := bufio.NewReader(bytes.NewReader(raw.Bytes()))
+			skipped, err := ReadMeasureStorage(reader, false)
+			if err != nil {
+				t.Fatalf("skip measure storage: %v", err)
+			}
+			if skipped.Rows() != 0 {
+				skipped.Release()
+				t.Fatalf("skip returned non-empty measure storage")
+			}
+			b, err := reader.ReadByte()
+			if err != nil || b != 0xA8 {
+				t.Fatalf("measure skip consumed wrong bytes: byte=%x err=%v", b, err)
+			}
+		})
+	}
+}
+
+func TestMeasureStorageSerializationRoundTrip_FlatAndChunked(t *testing.T) {
+	flat := measureStorageForTest(8)
+	flatRound, err := measureStorageRoundTripForTest(flat)
+	if err != nil {
+		flat.Release()
+		t.Fatalf("flat measure round trip: %v", err)
+	}
+	if flatRound.IsChunked() {
+		flat.Release()
+		flatRound.Release()
+		t.Fatalf("expected flat measure storage after round trip")
+	}
+	if flatRound.Rows() != 8 {
+		flat.Release()
+		flatRound.Release()
+		t.Fatalf("flat rows: got %d want 8", flatRound.Rows())
+	}
+	measureStorageAssertValue(t, flatRound, 7, 30)
+	flat.Release()
+	flatRound.Release()
+
+	chunked := measureStorageForTest(MeasureChunkThreshold + 11)
+	chunkedRound, err := measureStorageRoundTripForTest(chunked)
+	if err != nil {
+		chunked.Release()
+		t.Fatalf("chunked measure round trip: %v", err)
+	}
+	if !chunkedRound.IsChunked() {
+		chunked.Release()
+		chunkedRound.Release()
+		t.Fatalf("expected chunked measure storage after round trip")
+	}
+	if chunkedRound.Rows() != MeasureChunkThreshold+11 {
+		chunked.Release()
+		chunkedRound.Release()
+		t.Fatalf("chunked rows: got %d want %d", chunkedRound.Rows(), MeasureChunkThreshold+11)
+	}
+	measureProbe := uint64((MeasureChunkThreshold/2)*2 + 1)
+	measureStorageAssertValue(t, chunkedRound, measureProbe, uint64(MeasureChunkThreshold/2*10))
+	chunked.Release()
+	chunkedRound.Release()
+}
+
+func fieldStorageRoundTripForTest(storage FieldStorage) (FieldStorage, error) {
+	var buf bytes.Buffer
+	writer := bufio.NewWriter(&buf)
+	if err := storage.WriteInto(writer); err != nil {
+		return FieldStorage{}, err
+	}
+	if err := writer.Flush(); err != nil {
+		return FieldStorage{}, err
+	}
+	return ReadFieldStorage(bufio.NewReader(bytes.NewReader(buf.Bytes())), true, "test", "field")
+}
+
+func measureStorageRoundTripForTest(storage MeasureStorage) (MeasureStorage, error) {
+	var buf bytes.Buffer
+	writer := bufio.NewWriter(&buf)
+	if err := storage.WriteInto(writer); err != nil {
+		return MeasureStorage{}, err
+	}
+	if err := writer.Flush(); err != nil {
+		return MeasureStorage{}, err
+	}
+	return ReadMeasureStorage(bufio.NewReader(bytes.NewReader(buf.Bytes())), true)
+}

@@ -2,6 +2,7 @@ package rbi
 
 import (
 	"fmt"
+	"github.com/vapstack/rbi/internal/indexdata"
 	"math"
 	"os"
 	"path/filepath"
@@ -12,7 +13,7 @@ import (
 
 	"github.com/vapstack/qx"
 	"github.com/vapstack/rbi/internal/keycodec"
-	"github.com/vapstack/rbi/internal/pools"
+	"github.com/vapstack/rbi/internal/pooled"
 	"github.com/vapstack/rbi/internal/posting"
 	"github.com/vapstack/rbi/internal/qir"
 )
@@ -23,21 +24,6 @@ func postingOf(ids ...uint64) posting.List {
 		out = out.BuildAdded(id)
 	}
 	return out
-}
-
-func flattenOverlayForTest(ov fieldOverlay) []index {
-	if !ov.hasData() {
-		return nil
-	}
-	out := make([]index, 0, ov.keyCount())
-	cur := ov.newCursor(ov.rangeByRanks(0, ov.keyCount()), false)
-	for {
-		key, ids, ok := cur.next()
-		if !ok {
-			return out
-		}
-		out = append(out, index{Key: key, IDs: ids})
-	}
 }
 
 func TestPlannerORBranches_AllocsPerRunStayZeroAfterWarmup(t *testing.T) {
@@ -83,9 +69,9 @@ func TestPlannerFilterPostingByPredicateChecksBuf_PostsAnyOwnedLargeAllocsPerRun
 	defer postA.Release()
 	defer postB.Release()
 
-	postsBuf := pools.GetPostingSlice(2)
+	postsBuf := posting.GetSlice(2)
 	postsBuf = append(postsBuf, postA, postB)
-	defer pools.PutPostingSlice(postsBuf)
+	defer posting.PutSlice(postsBuf)
 
 	state := postsAnyFilterStatePool.Get()
 	state.postsBuf = postsBuf
@@ -97,9 +83,9 @@ func TestPlannerFilterPostingByPredicateChecksBuf_PostsAnyOwnedLargeAllocsPerRun
 	})
 	defer preds.Release()
 
-	checks := pools.GetIntSlice(1)
+	checks := pooled.GetIntSlice(1)
 	checks = append(checks, 0)
-	defer pools.PutIntSlice(checks)
+	defer pooled.PutIntSlice(checks)
 
 	var work posting.List
 	defer func() {
@@ -168,9 +154,9 @@ func TestPlannerFilterPostingByPredicateChecksBuf_CompactBorrowedAllocsPerRunSta
 	})
 	defer preds.Release()
 
-	checks := pools.GetIntSlice(4)
+	checks := pooled.GetIntSlice(4)
 	checks = append(checks, 0, 1, 2, 3)
-	defer pools.PutIntSlice(checks)
+	defer pooled.PutIntSlice(checks)
 
 	var work posting.List
 	defer func() {
@@ -210,9 +196,9 @@ func TestPlannerFilterPostingByPredicateChecksBuf_PreferredExactBypassesSmallBuc
 	defer postA.Release()
 	defer postB.Release()
 
-	postsBuf := pools.GetPostingSlice(2)
+	postsBuf := posting.GetSlice(2)
 	postsBuf = append(postsBuf, postA, postB)
-	defer pools.PutPostingSlice(postsBuf)
+	defer posting.PutSlice(postsBuf)
 
 	state := postsAnyFilterStatePool.Get()
 	state.postsBuf = postsBuf
@@ -224,9 +210,9 @@ func TestPlannerFilterPostingByPredicateChecksBuf_PreferredExactBypassesSmallBuc
 	})
 	defer preds.Release()
 
-	checks := pools.GetIntSlice(1)
+	checks := pooled.GetIntSlice(1)
 	checks = append(checks, 0)
-	defer pools.PutIntSlice(checks)
+	defer pooled.PutIntSlice(checks)
 
 	mode, exact, work, card := plannerFilterPostingByPredicateChecksBuf(preds, checks, src.Borrow(), posting.List{}, false)
 	defer work.Release()
@@ -522,12 +508,12 @@ func TestPlannerResidualChecks_RemovesExactChecksByMembershipOrder(t *testing.T)
 func TestOrderRangeCoverage_ConsistencyBetweenPredicateKinds(t *testing.T) {
 	db, _ := openTempDBUint64(t)
 
-	s := []index{
+	s := []indexdata.Entry{
 		{Key: keycodec.FromString("alice"), IDs: postingOf(1)},
 		{Key: keycodec.FromString("alina"), IDs: postingOf(2)},
 		{Key: keycodec.FromString("bob"), IDs: postingOf(3)},
 	}
-	ov := newFieldOverlay(&s)
+	ov := indexdata.NewFieldOverlay(&s)
 
 	exprs := []qx.Expr{
 		qx.PREFIX("name", "al"),
@@ -543,21 +529,6 @@ func TestOrderRangeCoverage_ConsistencyBetweenPredicateKinds(t *testing.T) {
 		preds[i] = predicate{expr: mustTestQIRExprForDB(t, db, exprs[i])}
 	}
 
-	st1, en1, cov1, ok1 := db.engine.extractOrderRangeCoverage("name", cands, s)
-	if !ok1 {
-		t.Fatalf("extractOrderRangeCoverage failed")
-	}
-	st2, en2, cov2, ok2 := db.engine.extractOrderRangeCoverage("name", preds, s)
-	if !ok2 {
-		t.Fatalf("extractOrderRangeCoverage failed")
-	}
-	if st1 != st2 || en1 != en2 {
-		t.Fatalf("range mismatch: candidate=(%d,%d) planner=(%d,%d)", st1, en1, st2, en2)
-	}
-	if !slices.Equal(cov1, cov2) {
-		t.Fatalf("covered mismatch: candidate=%v planner=%v", cov1, cov2)
-	}
-
 	br1, covOv1, okOv1 := db.engine.extractOrderRangeCoverageOverlay("name", cands, ov)
 	if !okOv1 {
 		t.Fatalf("extractOrderRangeCoverageOverlay failed")
@@ -566,7 +537,7 @@ func TestOrderRangeCoverage_ConsistencyBetweenPredicateKinds(t *testing.T) {
 	if !okOv2 {
 		t.Fatalf("extractOrderRangeCoverageOverlay failed")
 	}
-	if br1.baseStart != br2.baseStart || br1.baseEnd != br2.baseEnd {
+	if br1.BaseStart != br2.BaseStart || br1.BaseEnd != br2.BaseEnd {
 		t.Fatalf("overlay range mismatch: candidate=%+v planner=%+v", br1, br2)
 	}
 	if !slices.Equal(covOv1, covOv2) {
@@ -1091,7 +1062,7 @@ func TestBuildORBranches_BroadNumericRangeStaysRuntimeOnSecondBuild(t *testing.T
 				if p.isMaterializedLike() || p.lazyMatState != nil {
 					t.Fatalf("expected broad range leaf to stay on runtime state")
 				}
-				if p.baseRangeState == nil && p.overlayState == nil {
+				if p.overlayState == nil {
 					t.Fatalf("expected broad range leaf runtime state")
 				}
 			}
@@ -1703,11 +1674,11 @@ func TestPlannerOROrderBranchIter_ResidualRowsExcludeExactOnlyChecks(t *testing.
 	})
 	defer preds.Release()
 
-	checks := pools.GetIntSlice(2)
+	checks := pooled.GetIntSlice(2)
 	checks = append(checks, 0, 1)
-	exactChecks := pools.GetIntSlice(1)
+	exactChecks := pooled.GetIntSlice(1)
 	exactChecks = append(exactChecks, 0)
-	residualChecks := pools.GetIntSlice(1)
+	residualChecks := pooled.GetIntSlice(1)
 	residualChecks = append(residualChecks, 1)
 
 	iter := plannerOROrderBranchIter{
@@ -1715,7 +1686,7 @@ func TestPlannerOROrderBranchIter_ResidualRowsExcludeExactOnlyChecks(t *testing.
 		checks:         checks,
 		exactChecks:    exactChecks,
 		residualChecks: residualChecks,
-		overlay:        fieldOverlay{base: []index{{IDs: bucket.Borrow()}}},
+		overlay:        indexdata.NewFieldOverlay(&[]indexdata.Entry{{IDs: bucket.Borrow()}}),
 		single:         -1,
 		exactSingle:    0,
 		residualSingle: 1,
@@ -1889,9 +1860,9 @@ func TestPlannerOROrderKWay_RepeatedExecutionPromotesExactOnlyMaterializedRange(
 		foundExactOnlyAge := false
 		for bi := 0; bi < branches.Len(); bi++ {
 			branch := branches.Get(bi)
-			checks := pools.GetIntSlice(branch.predLen())
-			exactChecks := pools.GetIntSlice(branch.predLen())
-			residualChecks := pools.GetIntSlice(branch.predLen())
+			checks := pooled.GetIntSlice(branch.predLen())
+			exactChecks := pooled.GetIntSlice(branch.predLen())
+			residualChecks := pooled.GetIntSlice(branch.predLen())
 			checks = branch.buildMatchChecksBuf(checks)
 			exactChecks = buildExactBucketPostingFilterActiveBufReader(exactChecks, checks, branch.preds)
 			residualChecks = plannerResidualChecksBuf(residualChecks, checks, exactChecks)
@@ -1905,9 +1876,9 @@ func TestPlannerOROrderKWay_RepeatedExecutionPromotesExactOnlyMaterializedRange(
 					break
 				}
 			}
-			pools.PutIntSlice(residualChecks)
-			pools.PutIntSlice(exactChecks)
-			pools.PutIntSlice(checks)
+			pooled.PutIntSlice(residualChecks)
+			pooled.PutIntSlice(exactChecks)
+			pooled.PutIntSlice(checks)
 			if !ageBranch {
 				continue
 			}
@@ -2305,8 +2276,8 @@ func TestPlannerORBranchCheckCounts_LargeImpossibleBranchWithZeroLenCoveredRetur
 	}
 	defer preds.Release()
 
-	covered := pools.GetBoolSlice(0)
-	defer pools.PutBoolSlice(covered)
+	covered := pooled.GetBoolSlice(0)
+	defer pooled.PutBoolSlice(covered)
 
 	streamChecks, mergeChecks := plannerORBranchCheckCounts(
 		plannerORBranch{preds: preds, leadIdx: -1},
@@ -2580,12 +2551,12 @@ func TestBuildOROrderAnalysis_NonRangeOrderPredicateKeepsOrderedPath(t *testing.
 	defer analysis.release()
 
 	orderOV := view.fieldOverlayForOrder(viewQ.Order)
-	if analysis.branches[0].rangeStart != 0 || analysis.branches[0].rangeEnd != orderOV.keyCount() {
+	if analysis.branches[0].rangeStart != 0 || analysis.branches[0].rangeEnd != orderOV.KeyCount() {
 		t.Fatalf(
 			"expected non-range order predicate branch to keep full-span order coverage, got start=%d end=%d want_end=%d",
 			analysis.branches[0].rangeStart,
 			analysis.branches[0].rangeEnd,
-			orderOV.keyCount(),
+			orderOV.KeyCount(),
 		)
 	}
 	if covered := analysis.branches[0].covered; covered != nil && len(covered) != 0 {
@@ -2719,7 +2690,7 @@ func TestPlannerORBranchesOrdered_BoundedCoveredOnlyBranchNotAlwaysTrue(t *testi
 			if !ok {
 				t.Fatalf("extractOrderRangeCoverageOverlay: ok=false")
 			}
-			_, wantCard := overlayRangeStats(ov, br)
+			_, wantCard := ov.RangeStats(br)
 			mergeStats := view.orderMergeBranchStats("age", branches, ov)
 			if mergeStats[i].rangeRows != wantCard {
 				t.Fatalf("rangeRows=%d, want %d", mergeStats[i].rangeRows, wantCard)
@@ -2829,7 +2800,7 @@ func TestPlannerOROrderDecision_PrefersMergeWhenRouteEstimatorBeatsStream(t *tes
 		t.Fatalf("unexpected zero universe")
 	}
 	ov := view.fieldOverlay("score")
-	orderDistinct := uint64(ov.keyCount())
+	orderDistinct := uint64(ov.KeyCount())
 	if orderDistinct == 0 {
 		t.Fatalf("unexpected zero order distinct")
 	}
@@ -2958,8 +2929,6 @@ func TestBuildPredicatesOrdered_MergesPositiveNumericRangeLeavesOnSameField(t *t
 	}
 	probeLen := 0
 	switch {
-	case preds[1].baseRangeState != nil:
-		probeLen = preds[1].baseRangeState.probe.probeLen
 	case preds[1].overlayState != nil:
 		probeLen = preds[1].overlayState.probe.probeLen
 	default:
@@ -3038,7 +3007,7 @@ func TestBuildPredRangeCandidateWithColdMode_NullableComplementRouteKeepsPositiv
 		t.Fatal("expected field metadata")
 	}
 	ov := view.fieldOverlayForExpr(expr)
-	if !ov.hasData() {
+	if !ov.HasData() {
 		t.Fatal("expected overlay data")
 	}
 
@@ -3272,10 +3241,9 @@ func TestPlannerOrderedAnchor_MatchesBaseline(t *testing.T) {
 
 	orderField := q.Order[0].By.Name
 	ov := db.engine.currentQueryViewForTests().fieldOverlay(orderField)
-	s := flattenOverlayForTest(ov)
-	start, end := 0, len(s)
-	if st, en, cov, ok := db.engine.extractOrderRangeCoverage(orderField, predsB, s); ok {
-		start, end = st, en
+	br := ov.RangeByRanks(0, ov.KeyCount())
+	if coveredRange, cov, ok := db.engine.extractOrderRangeCoverageOverlay(orderField, predsB, ov); ok {
+		br = coveredRange
 		for i := range cov {
 			if cov[i] {
 				predsB[i].covered = true
@@ -3295,7 +3263,7 @@ func TestPlannerOrderedAnchor_MatchesBaseline(t *testing.T) {
 		active = append(active, i)
 	}
 
-	gotBaseline := db.engine.execPlanOrderedBasicFallback(q, predsB, active, start, end, s, nil)
+	gotBaseline := db.engine.execPlanOrderedBasicFallback(q, predsB, active, ov, br, nil)
 	if !slices.Equal(gotAnchor, gotBaseline) {
 		t.Fatalf("ordered anchor/fallback mismatch:\nanchor=%v\nfallback=%v", gotAnchor, gotBaseline)
 	}
@@ -3387,9 +3355,10 @@ func TestOrderedFallback_TracksMatchedRowsAndExactBitmapFilters(t *testing.T) {
 	}
 	defer releasePredicates(preds)
 
-	slice := db.engine.currentQueryViewForTests().snapshotFieldIndexSlice("country")
-	if slice == nil || len(*slice) == 0 {
-		t.Fatalf("country slice must be present")
+	ov := db.engine.currentQueryViewForTests().fieldOverlay("country")
+	br := ov.RangeByRanks(0, ov.KeyCount())
+	if br.Empty() {
+		t.Fatalf("country overlay must be present")
 	}
 
 	active := make([]int, 0, len(preds))
@@ -3415,7 +3384,7 @@ func TestOrderedFallback_TracksMatchedRowsAndExactBitmapFilters(t *testing.T) {
 		t.Fatalf("expected trace to be enabled")
 	}
 	tr.setPlan(PlanOrdered)
-	got := db.engine.execPlanOrderedBasicFallback(q, preds, active, 0, len(*slice), *slice, tr)
+	got := db.engine.execPlanOrderedBasicFallback(q, preds, active, ov, br, tr)
 	tr.finish(uint64(len(got)), nil)
 
 	want, err := expectedKeysUint64(t, db, q)

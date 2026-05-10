@@ -8,9 +8,8 @@ import (
 	"testing"
 
 	"github.com/vapstack/qx"
-	"github.com/vapstack/rbi/internal/keycodec"
+	"github.com/vapstack/rbi/internal/indexdata"
 	"github.com/vapstack/rbi/internal/pooled"
-	"github.com/vapstack/rbi/internal/pools"
 	"github.com/vapstack/rbi/internal/posting"
 	"github.com/vapstack/rbi/internal/qir"
 )
@@ -263,7 +262,7 @@ func TestPlannerFilterPostingByLeafChecks_PreferredExactBypassesSmallBucketFallb
 	defer postA.Release()
 	defer postB.Release()
 
-	postsBuf := pools.GetPostingSlice(2)
+	postsBuf := posting.GetSlice(2)
 	postsBuf = append(postsBuf, postA, postB)
 
 	state := postsAnyFilterStatePool.Get()
@@ -301,7 +300,7 @@ func TestLeafPred_PostsAnyStateContainsIdxAndCountBucketUseRuntimeState(t *testi
 	bucket := posting.BuildFromSorted([]uint64{1, 2, 5, 6, 7, 9, 14, 15, 17})
 	defer bucket.Release()
 
-	postsBuf := pools.GetPostingSlice(2)
+	postsBuf := posting.GetSlice(2)
 	postsBuf = append(postsBuf, postA, postB)
 
 	state := postsAnyFilterStatePool.Get()
@@ -319,7 +318,7 @@ func TestLeafPred_PostsAnyStateContainsIdxAndCountBucketUseRuntimeState(t *testi
 		for i := 0; i < len(postsBuf); i++ {
 			postsBuf[i].Release()
 		}
-		pools.PutPostingSlice(postsBuf)
+		posting.PutSlice(postsBuf)
 	}()
 
 	if !pred.containsIdx(7) {
@@ -390,43 +389,6 @@ func TestOrderPredicatesEmitPostingReader_SingleBucketCountSkipsWithoutMatches(t
 	}
 	if examined != ids.Cardinality() {
 		t.Fatalf("unexpected examined rows: got=%d want=%d", examined, ids.Cardinality())
-	}
-}
-
-func TestApplyBoundsToIndexRange_PrefixIntersectsRange(t *testing.T) {
-	s := []index{
-		{Key: keycodec.FromString("aa")},
-		{Key: keycodec.FromString("ab")},
-		{Key: keycodec.FromString("ac")},
-		{Key: keycodec.FromString("ad")},
-		{Key: keycodec.FromString("b0")},
-	}
-
-	rb := rangeBounds{has: true}
-	rb.applyPrefix("a")
-	rb.applyLo("ab", true)
-	rb.applyHi("ad", false)
-
-	start, end := applyBoundsToIndexRange(s, rb)
-	if start != 1 || end != 3 {
-		t.Fatalf("unexpected range: start=%d end=%d", start, end)
-	}
-
-	got := make([]string, 0, end-start)
-	for _, ent := range s[start:end] {
-		got = append(got, ent.Key.UnsafeString())
-	}
-	want := []string{"ab", "ac"}
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("keys mismatch: got=%v want=%v", got, want)
-	}
-
-	empty := rangeBounds{has: true}
-	empty.applyPrefix("b")
-	empty.applyHi("aa", true)
-	start, end = applyBoundsToIndexRange(s, empty)
-	if start != 0 || end != 0 {
-		t.Fatalf("expected empty range, got start=%d end=%d", start, end)
 	}
 }
 
@@ -524,9 +486,9 @@ func TestPostingUnionBufIter_SmallUnionAllocsPerRunStayZeroAfterWarmup(t *testin
 		defer posts[i].Release()
 	}
 
-	postsBuf := pools.GetPostingSlice(3)
+	postsBuf := posting.GetSlice(3)
 	postsBuf = append(postsBuf, posts[0], posts[1], posts[2])
-	defer pools.PutPostingSlice(postsBuf)
+	defer posting.PutSlice(postsBuf)
 
 	warm := newPostingUnionIter(postsBuf)
 	if warm != nil {
@@ -726,12 +688,12 @@ func (qv *queryView) baselineTryQueryRangeNoOrderWithLimit(q *qx.QX) ([]uint64, 
 	}
 
 	ov := qv.fieldOverlay(f)
-	if !ov.hasData() {
+	if !ov.HasData() {
 		return nil, true, nil
 	}
 
 	isNil := false
-	rb := rangeBounds{has: true}
+	rb := indexdata.Bounds{Has: true}
 	if e.Op == qir.OpEQ {
 		key, isSlice, eqNil, err := qv.exprValueToIdxScalar(e)
 		if err != nil {
@@ -742,7 +704,7 @@ func (qv *queryView) baselineTryQueryRangeNoOrderWithLimit(q *qx.QX) ([]uint64, 
 		}
 		isNil = eqNil
 		if isNil {
-			ids := newFieldOverlay(qv.snap.nilFieldIndexSlice(f)).lookupPostingRetained(nilIndexEntryKey)
+			ids := qv.nilFieldOverlay(f).LookupPostingRetained(nilIndexEntryKey)
 			if ids.IsEmpty() {
 				return nil, true, nil
 			}
@@ -752,8 +714,8 @@ func (qv *queryView) baselineTryQueryRangeNoOrderWithLimit(q *qx.QX) ([]uint64, 
 			baselineEmitAcceptedPostingNoOrder(&cursor, ids, &examined)
 			return cursor.out, true, nil
 		}
-		rb.applyLo(key, true)
-		rb.applyHi(key, true)
+		rb.ApplyLo(key, true)
+		rb.ApplyHi(key, true)
 	} else {
 		bound, isSlice, err := qv.exprValueToNormalizedScalarBound(e)
 		if err != nil {
@@ -765,18 +727,18 @@ func (qv *queryView) baselineTryQueryRangeNoOrderWithLimit(q *qx.QX) ([]uint64, 
 		applyNormalizedScalarBound(&rb, bound)
 	}
 
-	br := ov.rangeForBounds(rb)
-	if overlayRangeEmpty(br) {
+	br := ov.RangeForBounds(rb)
+	if br.Empty() {
 		return nil, true, nil
 	}
 
 	out := make([]uint64, 0, viewQ.Limit)
 	cursor := qv.newQueryCursor(out, viewQ.Offset, viewQ.Limit, false, 0)
 
-	keyCur := ov.newCursor(br, false)
+	keyCur := ov.NewCursor(br, false)
 	var examined uint64
 	for {
-		_, ids, ok := keyCur.next()
+		_, ids, ok := keyCur.Next()
 		if !ok {
 			break
 		}
@@ -831,29 +793,29 @@ func (qv *queryView) baselineTryQueryPrefixNoOrderWithLimit(q *qx.QX) ([]uint64,
 	}
 
 	ov := qv.fieldOverlay(f)
-	if !ov.hasData() {
+	if !ov.HasData() {
 		if !qv.hasIndexedField(f) {
 			return nil, true, fmt.Errorf("no index for field: %v", f)
 		}
 		return nil, true, nil
 	}
 
-	br := ov.rangeForBounds(rangeBounds{
-		has:       true,
-		hasPrefix: true,
-		prefix:    bound.key,
-	})
-	if overlayRangeEmpty(br) {
+	br := ov.RangeForBounds((indexdata.Bounds{
+		Has:       true,
+		HasPrefix: true,
+		Prefix:    bound.key,
+	}))
+	if br.Empty() {
 		return nil, true, nil
 	}
 
 	out := make([]uint64, 0, viewQ.Limit)
 	cursor := qv.newQueryCursor(out, viewQ.Offset, viewQ.Limit, false, 0)
 
-	keyCur := ov.newCursor(br, false)
+	keyCur := ov.NewCursor(br, false)
 	var examined uint64
 	for {
-		_, ids, ok := keyCur.next()
+		_, ids, ok := keyCur.Next()
 		if !ok {
 			break
 		}
@@ -867,7 +829,7 @@ func (qv *queryView) baselineTryQueryPrefixNoOrderWithLimit(q *qx.QX) ([]uint64,
 	return cursor.out, true, nil
 }
 
-func baselineScanLimitByOverlayBounds(db *queryView, q *qx.QX, ov fieldOverlay, br overlayRange, desc bool, preds *pooled.Slice[leafPred], nilTailField string) []uint64 {
+func baselineScanLimitByOverlayBounds(db *queryView, q *qx.QX, ov indexdata.FieldOverlay, br indexdata.OverlayRange, desc bool, preds *pooled.Slice[leafPred], nilTailField string) []uint64 {
 	limit := int(q.Window.Limit)
 	out := make([]uint64, 0, limit)
 	cursor := db.newQueryCursor(out, 0, q.Window.Limit, false, 0)
@@ -902,9 +864,9 @@ func baselineScanLimitByOverlayBounds(db *queryView, q *qx.QX, ov fieldOverlay, 
 		return false
 	}
 
-	keyCur := ov.newCursor(br, desc)
+	keyCur := ov.NewCursor(br, desc)
 	for {
-		_, ids, ok := keyCur.next()
+		_, ids, ok := keyCur.Next()
 		if !ok {
 			break
 		}
@@ -917,7 +879,7 @@ func baselineScanLimitByOverlayBounds(db *queryView, q *qx.QX, ov fieldOverlay, 
 	}
 
 	if nilTailField != "" {
-		ids := db.engine.currentQueryViewForTests().nilFieldOverlay(nilTailField).lookupPostingRetained(nilIndexEntryKey)
+		ids := db.engine.currentQueryViewForTests().nilFieldOverlay(nilTailField).LookupPostingRetained(nilIndexEntryKey)
 		if !ids.IsEmpty() && emitBucketPosting(ids) {
 			return cursor.out
 		}
@@ -1099,7 +1061,7 @@ func TestQuery_LimitRangeNoOrder_ResidualsUseBucketExactFilter(t *testing.T) {
 		defer leafPredSlicePool.Put(predsBuf)
 	}
 
-	br := view.fieldOverlay(f).rangeForBounds(bounds)
+	br := view.fieldOverlay(f).RangeForBounds(bounds)
 	want := baselineScanLimitByOverlayBounds(view, q, view.fieldOverlay(f), br, false, predsBuf, "")
 
 	preparedQ, viewQ, err := prepareTestQuery(db.engine, q)
@@ -1198,7 +1160,7 @@ func TestQuery_LimitOrderBasic_ResidualsUseBucketExactFilter(t *testing.T) {
 	}
 
 	ov := view.fieldOverlay("age")
-	br := ov.rangeForBounds(bounds)
+	br := ov.RangeForBounds(bounds)
 	want := baselineScanLimitByOverlayBounds(view, q, ov, br, false, predsBuf, "")
 
 	preparedQ, viewQ, err := prepareTestQuery(db.engine, q)
@@ -1790,7 +1752,7 @@ func TestQuery_OrderBasic_ComplementCachedBaseOpCountsAsMaterialized(t *testing.
 	baseOps := filterQIRLeavesByField(db, leaves, "score")
 	coresBuf, rawCoreIdxBuf := mustPrepareOrderBasicBaseCoresForTest(t, view, baseOps)
 	defer orderBasicBaseCoreSlicePool.Put(coresBuf)
-	defer pools.PutIntSlice(rawCoreIdxBuf)
+	defer pooled.PutIntSlice(rawCoreIdxBuf)
 	if !view.hasWarmOrderBasicBaseCores(coresBuf) {
 		_, gteHit := db.engine.getSnapshot().loadMaterializedPred(gteComplementKey)
 		_, lteHit := db.engine.getSnapshot().loadMaterializedPred(lteScalarKey)
@@ -1831,7 +1793,7 @@ func TestQuery_OrderBasic_WarmQueryLoadsCollapsedNumericRangeSpan(t *testing.T) 
 	baseOps := filterQIRLeavesByField(db, leaves, "score")
 	coresBuf, rawCoreIdxBuf := mustPrepareOrderBasicBaseCoresForTest(t, view, baseOps)
 	defer orderBasicBaseCoreSlicePool.Put(coresBuf)
-	defer pools.PutIntSlice(rawCoreIdxBuf)
+	defer pooled.PutIntSlice(rawCoreIdxBuf)
 	collapsed := mustFindCollapsedOrderBasicBaseCoreForTest(t, coresBuf)
 	view.promoteOrderBasicLimitMaterializedBaseOps("score", baseOps, 250, 100)
 	spanHit, ok := view.loadWarmOrderBasicBaseCore(collapsed)
@@ -1922,7 +1884,7 @@ func TestQuery_OrderBasic_WarmQueryPromotesMaterializedRangeBaseOps(t *testing.T
 	baseOps := filterQIRLeavesByField(db, leaves, "score")
 	coresBuf, rawCoreIdxBuf := mustPrepareOrderBasicBaseCoresForTest(t, view, baseOps)
 	defer orderBasicBaseCoreSlicePool.Put(coresBuf)
-	defer pools.PutIntSlice(rawCoreIdxBuf)
+	defer pooled.PutIntSlice(rawCoreIdxBuf)
 	collapsed := mustFindCollapsedOrderBasicBaseCoreForTest(t, coresBuf)
 	if !view.hasWarmOrderBasicBaseCores(coresBuf) {
 		var missing []string
@@ -1986,7 +1948,7 @@ func TestQuery_OrderBasic_WarmAnalyticsRangeUsesLimitOrderBasicPlan(t *testing.T
 	baseOps := filterQIRLeavesByField(db, leaves, "score")
 	coresBuf, rawCoreIdxBuf := mustPrepareOrderBasicBaseCoresForTest(t, view, baseOps)
 	defer orderBasicBaseCoreSlicePool.Put(coresBuf)
-	defer pools.PutIntSlice(rawCoreIdxBuf)
+	defer pooled.PutIntSlice(rawCoreIdxBuf)
 	collapsed := mustFindCollapsedOrderBasicBaseCoreForTest(t, coresBuf)
 	if hit, ok := view.loadWarmOrderBasicBaseCore(collapsed); !ok {
 		db.engine.releaseQueryView(view)
@@ -2074,10 +2036,10 @@ func TestQuery_OrderBasic_ExtractBoundsForField_IgnoresSecondaryRangeBounds(t *t
 	if !ok {
 		t.Fatalf("expected order-field bounds to be recognized")
 	}
-	if !bounds.hasLo {
+	if !bounds.HasLo {
 		t.Fatalf("unexpected lower bound: %+v", bounds)
 	}
-	if bounds.hasHi {
+	if bounds.HasHi {
 		t.Fatalf("unexpected high bound: %+v", bounds)
 	}
 }

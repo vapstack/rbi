@@ -11,9 +11,9 @@ import (
 	"unsafe"
 
 	"github.com/vapstack/qx"
+	"github.com/vapstack/rbi/internal/indexdata"
 	"github.com/vapstack/rbi/internal/keycodec"
 	"github.com/vapstack/rbi/internal/pooled"
-	"github.com/vapstack/rbi/internal/pools"
 	"github.com/vapstack/rbi/internal/posting"
 	"go.etcd.io/bbolt"
 )
@@ -110,7 +110,7 @@ func TestSnapshot_PublishedAsFullState(t *testing.T) {
 	tagsIDs := s.fieldLookupPostingRetained("tags", "go")
 	snapshotPostingContainsAll(t, tagsIDs, 1)
 
-	lenIDs := db.engine.currentQueryViewForTests().lenFieldOverlay("tags").lookupPostingRetained(keycodec.U64ByteString(2))
+	lenIDs := db.engine.currentQueryViewForTests().lenFieldOverlay("tags").LookupPostingRetained(keycodec.U64ByteString(2))
 	snapshotPostingContainsAll(t, lenIDs, 1)
 }
 
@@ -328,18 +328,18 @@ func TestSnapshot_UnpinPrunesRegistryWhenLastReaderExits(t *testing.T) {
 	}
 }
 
-func TestSnapshotReleaseOwnedStorage_SkipsLiveSharedFlatRoot(t *testing.T) {
+func TestSnapshotReleaseStorage_SkipsLiveSharedFlatRoot(t *testing.T) {
 	shared := snapshotExtPosting()
 	for i := uint64(0); i < 96; i++ {
 		shared = shared.BuildAdded((i << 1) + 1)
 	}
-	sharedStorage := snapshotExtFlatStorageOwned(
-		index{Key: keycodec.FromString("shared"), IDs: shared},
-	)
+	sharedMap := indexdata.GetPostingMap()
+	sharedMap["shared"] = shared
+	sharedStorage := indexdata.NewFlatFieldStorageFromPostingMapOwned(sharedMap, false)
 
-	old := snapshotTestNewSnapshot(map[string]fieldIndexStorage{"f": sharedStorage}, nil, nil, nil)
+	old := snapshotTestNewSnapshot(map[string]indexdata.FieldStorage{"f": sharedStorage}, nil, nil, nil)
 	old.seq = 1
-	current := snapshotTestNewSnapshot(map[string]fieldIndexStorage{"f": sharedStorage}, nil, nil, nil)
+	current := snapshotTestNewSnapshot(map[string]indexdata.FieldStorage{"f": sharedStorage}, nil, nil, nil)
 	current.seq = 2
 	current.retainSharedOwnedStorageFrom(old)
 
@@ -522,24 +522,15 @@ func snapshotExtLoadMaterializedPredEntry(
 	return entry, hit
 }
 
-func snapshotExtStorage(keys ...string) fieldIndexStorage {
+func snapshotExtStorage(keys ...string) indexdata.FieldStorage {
 	if len(keys) == 0 {
-		return fieldIndexStorage{}
+		return indexdata.FieldStorage{}
 	}
-	m := postingMapPool.Get()
+	m := indexdata.GetPostingMap()
 	for i, key := range keys {
 		m[key] = (posting.List{}).BuildAdded(uint64(i + 1))
 	}
-	return newFlatFieldIndexStorageFromPostingMapOwned(m, false)
-}
-
-func snapshotExtFlatStorageOwned(entries ...index) fieldIndexStorage {
-	if len(entries) == 0 {
-		return fieldIndexStorage{}
-	}
-	out := make([]index, len(entries))
-	copy(out, entries)
-	return newFlatFieldIndexStorage(&out)
+	return indexdata.NewFlatFieldStorageFromPostingMapOwned(m, false)
 }
 
 func snapshotExtFieldContainsID(tb testing.TB, s *indexSnapshot, field, key string, id uint64) bool {
@@ -549,19 +540,14 @@ func snapshotExtFieldContainsID(tb testing.TB, s *indexSnapshot, field, key stri
 
 func snapshotExtNilContainsID(tb testing.TB, s *indexSnapshot, field string, id uint64) bool {
 	tb.Helper()
-	return newFieldOverlay(s.nilFieldIndexSlice(field)).lookupPostingRetained(nilIndexEntryKey).Contains(id)
+	acc := s.indexedFieldByName[field]
+	return indexdata.NewFieldOverlayStorage(s.nilIndex[acc.ordinal]).LookupPostingRetained(nilIndexEntryKey).Contains(id)
 }
 
 func snapshotExtLenContainsID(tb testing.TB, s *indexSnapshot, field string, ln uint64, id uint64) bool {
 	tb.Helper()
 	acc := s.indexedFieldByName[field]
-	return newFieldOverlayStorage(s.lenIndex.Get(acc.ordinal)).lookupPostingRetained(keycodec.U64ByteString(ln)).Contains(id)
-}
-
-func snapshotExtLenNonEmptyContainsID(tb testing.TB, s *indexSnapshot, field string, id uint64) bool {
-	tb.Helper()
-	acc := s.indexedFieldByName[field]
-	return newFieldOverlayStorage(s.lenIndex.Get(acc.ordinal)).lookupPostingRetained(lenIndexNonEmptyKey).Contains(id)
+	return indexdata.NewFieldOverlayStorage(s.lenIndex[acc.ordinal]).LookupPostingRetained(keycodec.U64ByteString(ln)).Contains(id)
 }
 
 func snapshotExtRunConcurrent(n int, fn func(i int)) {
@@ -611,7 +597,7 @@ func snapshotExtEvalNumericRangeBuckets(t *testing.T, db *DB[uint64, Rec], expr 
 		t.Fatalf("expected %q field metadata", f)
 	}
 	ov := db.engine.currentQueryViewForTests().fieldOverlay(f)
-	if !ov.hasData() {
+	if !ov.HasData() {
 		t.Fatalf("expected %q field index data", f)
 	}
 
@@ -628,7 +614,7 @@ func snapshotExtEvalNumericRangeBuckets(t *testing.T, db *DB[uint64, Rec], expr 
 		t.Fatalf("rangeBoundsForOp(%v) failed", compiled.Op)
 	}
 
-	out, ok := db.engine.currentQueryViewForTests().tryEvalNumericRangeBuckets(f, fm, ov, ov.rangeForBounds(rb))
+	out, ok := db.engine.currentQueryViewForTests().tryEvalNumericRangeBuckets(f, fm, ov, ov.RangeForBounds(rb))
 	if !ok {
 		t.Fatalf("expected numeric range bucket path for %q", f)
 	}
@@ -662,26 +648,26 @@ func TestSnapshotExt_CollectSnapshotBatchDiff_ReorderedSliceValuesProduceNoDelta
 		acc.collectSnapshotBatchDiff(1, unsafe.Pointer(oldVal), unsafe.Pointer(newVal), false, &state)
 
 		if state.changed {
-			state.releaseOwned()
+			state.release()
 			t.Fatalf("%s: reorder-only diff unexpectedly marked field as changed", f)
 		}
 		if state.index != nil {
-			state.releaseOwned()
+			state.release()
 			t.Fatalf("%s: reorder-only diff produced string deltas: %#v", f, state.index)
 		}
 		if state.fixed != nil {
-			state.releaseOwned()
+			state.release()
 			t.Fatalf("%s: reorder-only diff produced fixed deltas: %#v", f, state.fixed)
 		}
 		if state.nils != nil {
-			state.releaseOwned()
+			state.release()
 			t.Fatalf("%s: reorder-only diff produced nil deltas: %#v", f, state.nils)
 		}
 		if state.lengths != nil {
-			state.releaseOwned()
+			state.release()
 			t.Fatalf("%s: reorder-only diff produced len deltas: %#v", f, state.lengths)
 		}
-		state.releaseOwned()
+		state.release()
 	}
 }
 
@@ -1020,8 +1006,8 @@ func TestSnapshotExt_ZeroComplementLenIndexImmutableAcrossPatchToEmpty(t *testin
 	if !snapshotTestLenZeroComplementField(pinnedS1, "tags") {
 		t.Fatalf("expected zero-complement len index for sparse non-empty tags")
 	}
-	if !snapshotExtLenNonEmptyContainsID(t, pinnedS1, "tags", 1) {
-		t.Fatalf("expected old snapshot non-empty sentinel to include id=1")
+	if !snapshotExtLenContainsID(t, pinnedS1, "tags", 1, 1) {
+		t.Fatalf("expected old snapshot len=1 posting to include id=1")
 	}
 
 	if err := db.Patch(1, []Field{{Name: "tags", Value: []string{}}}); err != nil {
@@ -1029,11 +1015,19 @@ func TestSnapshotExt_ZeroComplementLenIndexImmutableAcrossPatchToEmpty(t *testin
 	}
 
 	s2 := db.engine.getSnapshot()
-	if !snapshotExtLenNonEmptyContainsID(t, pinnedS1, "tags", 1) {
-		t.Fatalf("old snapshot lost non-empty sentinel membership")
+	if !snapshotExtLenContainsID(t, pinnedS1, "tags", 1, 1) {
+		t.Fatalf("old snapshot lost len=1 posting")
 	}
-	if snapshotExtLenNonEmptyContainsID(t, s2, "tags", 1) {
-		t.Fatalf("new snapshot kept stale non-empty sentinel membership")
+	if snapshotExtLenContainsID(t, s2, "tags", 1, 1) {
+		t.Fatalf("new snapshot kept stale len=1 posting")
+	}
+	got, err := db.QueryKeys(qx.Query(qx.EQ("tags", []string{})))
+	if err != nil {
+		t.Fatalf("QueryKeys(empty tags): %v", err)
+	}
+	want := []uint64{1, 2, 3, 4}
+	if !slices.Equal(got, want) {
+		t.Fatalf("empty-tags query mismatch: got=%v want=%v", got, want)
 	}
 }
 
@@ -1690,7 +1684,7 @@ func TestSnapshotExt_InheritMaterializedPredCacheSkipsChangedFieldsAndKeepsOther
 		},
 	}
 	changed := snapshotTestBoolSlots(map[string]bool{"name": true}, db.engine.indexedFieldMap)
-	defer pools.PutBoolSlice(changed)
+	defer pooled.PutBoolSlice(changed)
 
 	inheritMaterializedPredCache(next, prev, db.engine.indexedFieldMap, changed)
 
@@ -1823,7 +1817,7 @@ func TestSnapshotExt_InheritNumericRangeBucketCacheCopiesOnlyMatchingStorage(t *
 	}
 
 	prev := snapshotTestNewSnapshot(
-		map[string]fieldIndexStorage{"age": shared, "score": prevChanged},
+		map[string]indexdata.FieldStorage{"age": shared, "score": prevChanged},
 		nil,
 		nil,
 		nil,
@@ -1834,7 +1828,7 @@ func TestSnapshotExt_InheritNumericRangeBucketCacheCopiesOnlyMatchingStorage(t *
 	prev.numericRangeBucketCache.storeSlot("score", 1, scoreEntry)
 
 	next := snapshotTestNewSnapshot(
-		map[string]fieldIndexStorage{"age": shared, "score": nextChanged},
+		map[string]indexdata.FieldStorage{"age": shared, "score": nextChanged},
 		nil,
 		nil,
 		nil,
@@ -1868,12 +1862,12 @@ func TestSnapshotExt_InheritNumericRangeBucketCacheSkipsMalformedAndEmptyEntries
 		},
 	}
 
-	prev := snapshotTestNewSnapshot(map[string]fieldIndexStorage{"age": valid}, nil, nil, nil)
+	prev := snapshotTestNewSnapshot(map[string]indexdata.FieldStorage{"age": valid}, nil, nil, nil)
 	prev.numericRangeBucketCache = numericRangeBucketCachePool.Get()
 	prev.numericRangeBucketCache.init(3)
 	prev.numericRangeBucketCache.storeSlot("", 0, validEntry)
 	prev.numericRangeBucketCache.storeSlot("score", 1, &numericRangeBucketCacheEntry{
-		storage: fieldIndexStorage{},
+		storage: indexdata.FieldStorage{},
 		idx: numericRangeBucketIndex{
 			bucketSize: 1,
 			keyCount:   1,
@@ -1881,7 +1875,7 @@ func TestSnapshotExt_InheritNumericRangeBucketCacheSkipsMalformedAndEmptyEntries
 	})
 	prev.numericRangeBucketCache.storeSlot("age", 2, validEntry)
 
-	next := snapshotTestNewSnapshot(map[string]fieldIndexStorage{"age": valid}, nil, nil, nil)
+	next := snapshotTestNewSnapshot(map[string]indexdata.FieldStorage{"age": valid}, nil, nil, nil)
 	next.numericRangeBucketCache = numericRangeBucketCachePool.Get()
 	next.numericRangeBucketCache.init(3)
 	inheritNumericRangeBucketCache(next, prev)
@@ -2212,73 +2206,6 @@ func TestIndexSnapshotMaterializedPredCacheDetachedLoadsUnderConcurrency(t *test
 	assertPostingConsumerSet(t, cached, want)
 }
 
-func TestApplyBatchPostingDeltaOwnedDetachedBorrowedBase(t *testing.T) {
-	base := snapshotExtPosting()
-	for i := uint64(1); i <= 48; i++ {
-		base = base.BuildAdded(i * 2)
-	}
-	wantBase := base.ToArray()
-
-	removeIDs := []uint64{wantBase[0], wantBase[1], wantBase[2], wantBase[3]}
-	addIDs := []uint64{1<<32 | 5, 1<<32 | 9, 2<<32 | 11}
-
-	expected := make([]uint64, 0, len(wantBase))
-	removeSet := make(map[uint64]struct{}, len(removeIDs))
-	for _, id := range removeIDs {
-		removeSet[id] = struct{}{}
-	}
-	for _, id := range wantBase {
-		if _, drop := removeSet[id]; !drop {
-			expected = append(expected, id)
-		}
-	}
-	expected = append(expected, addIDs...)
-	slices.Sort(expected)
-
-	var failed atomic.Pointer[string]
-	setFailed := func(msg string) {
-		if failed.Load() != nil {
-			return
-		}
-		copyMsg := msg
-		failed.CompareAndSwap(nil, &copyMsg)
-	}
-
-	var wg sync.WaitGroup
-	for g := 0; g < 4; g++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for i := 0; i < 200; i++ {
-				delta := batchPostingDelta{
-					remove: snapshotExtPosting(removeIDs...),
-					add:    snapshotExtPosting(addIDs...),
-				}
-				out := applyBatchPostingDeltaOwned(base.Borrow(), &delta)
-				if !slices.Equal(out.ToArray(), expected) {
-					setFailed(fmt.Sprintf("delta result mismatch: got=%v want=%v", out.ToArray(), expected))
-					out.Release()
-					return
-				}
-				if !delta.add.IsEmpty() || !delta.remove.IsEmpty() {
-					setFailed("applyBatchPostingDeltaOwned must consume delta buffers")
-					out.Release()
-					return
-				}
-				out.Release()
-			}
-		}()
-	}
-
-	wg.Wait()
-	if msg := failed.Load(); msg != nil {
-		t.Fatal(*msg)
-	}
-
-	defer base.Release()
-	assertPostingConsumerSet(t, base, wantBase)
-}
-
 func assertPostingConsumerSet(t *testing.T, got posting.List, want []uint64) {
 	t.Helper()
 	gotIDs := got.ToArray()
@@ -2527,9 +2454,9 @@ func TestMaterializedPredCache_InsertNilEntriesAllocsPerRunStayZeroAfterWarmup(t
 }
 
 func snapshotTestIndexedFieldByName(
-	index map[string]fieldIndexStorage,
-	nilIndex map[string]fieldIndexStorage,
-	lenIndex map[string]fieldIndexStorage,
+	index map[string]indexdata.FieldStorage,
+	nilIndex map[string]indexdata.FieldStorage,
+	lenIndex map[string]indexdata.FieldStorage,
 	lenZeroComplement map[string]bool,
 ) map[string]indexedFieldAccessor {
 	keys := make([]string, 0, len(index)+len(nilIndex)+len(lenIndex)+len(lenZeroComplement))
@@ -2559,26 +2486,25 @@ func snapshotTestIndexedFieldByName(
 		out[name] = indexedFieldAccessor{
 			ordinal: i,
 			name:    name,
-			field:   &field{Slice: lenIndex[name].keyCount() > 0 || lenZeroComplement[name]},
+			field:   &field{Slice: lenIndex[name].KeyCount() > 0 || lenZeroComplement[name]},
 		}
 	}
 	return out
 }
 
 func snapshotTestFieldIndexSlots(
-	src map[string]fieldIndexStorage,
+	src map[string]indexdata.FieldStorage,
 	byName map[string]indexedFieldAccessor,
-) *pooled.Slice[fieldIndexStorage] {
-	out := fieldIndexStorageSlicePool.Get()
-	out.SetLen(len(byName))
+) []indexdata.FieldStorage {
+	out := indexdata.GetFieldStorageSlice(len(byName))[:len(byName)]
 	for name, storage := range src {
-		out.Set(byName[name].ordinal, storage)
+		out[byName[name].ordinal] = storage
 	}
 	return out
 }
 
 func snapshotTestBoolSlots(src map[string]bool, byName map[string]indexedFieldAccessor) []bool {
-	out := pools.GetBoolSlice(len(byName))[:len(byName)]
+	out := pooled.GetBoolSlice(len(byName))[:len(byName)]
 	clear(out)
 	for name, value := range src {
 		if value {
@@ -2589,9 +2515,9 @@ func snapshotTestBoolSlots(src map[string]bool, byName map[string]indexedFieldAc
 }
 
 func snapshotTestNewSnapshot(
-	index map[string]fieldIndexStorage,
-	nilIndex map[string]fieldIndexStorage,
-	lenIndex map[string]fieldIndexStorage,
+	index map[string]indexdata.FieldStorage,
+	nilIndex map[string]indexdata.FieldStorage,
+	lenIndex map[string]indexdata.FieldStorage,
 	lenZeroComplement map[string]bool,
 ) *indexSnapshot {
 	byName := snapshotTestIndexedFieldByName(index, nilIndex, lenIndex, lenZeroComplement)

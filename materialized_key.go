@@ -4,6 +4,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/vapstack/rbi/internal/indexdata"
 	"github.com/vapstack/rbi/internal/keycodec"
 	"github.com/vapstack/rbi/internal/qir"
 )
@@ -211,26 +212,26 @@ func materializedPredComplementKeyForNumericScalar(field string, op qir.Op, key 
 	}
 }
 
-func materializedPredKeyForExactScalarRangeKind(kind materializedPredKeyKind, field string, bounds rangeBounds) materializedPredKey {
-	if field == "" || bounds.empty || (!bounds.hasLo && !bounds.hasHi) {
+func materializedPredKeyForExactScalarRangeKind(kind materializedPredKeyKind, field string, bounds indexdata.Bounds) materializedPredKey {
+	if field == "" || bounds.Empty || (!bounds.HasLo && !bounds.HasHi) {
 		return materializedPredKey{}
 	}
 	var flags uint8
-	if bounds.hasLo {
+	if bounds.HasLo {
 		flags |= materializedPredKeyHasLo
-		if bounds.loInc {
+		if bounds.LoInc {
 			flags |= materializedPredKeyLoInc
 		}
-		if bounds.loNumeric {
+		if bounds.LoNumeric {
 			flags |= materializedPredKeyLoNumeric
 		}
 	}
-	if bounds.hasHi {
+	if bounds.HasHi {
 		flags |= materializedPredKeyHasHi
-		if bounds.hiInc {
+		if bounds.HiInc {
 			flags |= materializedPredKeyHiInc
 		}
-		if bounds.hiNumeric {
+		if bounds.HiNumeric {
 			flags |= materializedPredKeyHiNumeric
 		}
 	}
@@ -239,28 +240,28 @@ func materializedPredKeyForExactScalarRangeKind(kind materializedPredKeyKind, fi
 		field: field,
 		flags: flags,
 	}
-	if bounds.hasLo {
-		if bounds.loNumeric {
-			key.loIndex = bounds.loIndex
+	if bounds.HasLo {
+		if bounds.LoNumeric {
+			key.loIndex = bounds.LoIndex
 		} else {
-			key.loKey = bounds.loKey
+			key.loKey = bounds.LoKey
 		}
 	}
-	if bounds.hasHi {
-		if bounds.hiNumeric {
-			key.hiIndex = bounds.hiIndex
+	if bounds.HasHi {
+		if bounds.HiNumeric {
+			key.hiIndex = bounds.HiIndex
 		} else {
-			key.hiKey = bounds.hiKey
+			key.hiKey = bounds.HiKey
 		}
 	}
 	return key
 }
 
-func materializedPredKeyForExactScalarRange(field string, bounds rangeBounds) materializedPredKey {
+func materializedPredKeyForExactScalarRange(field string, bounds indexdata.Bounds) materializedPredKey {
 	return materializedPredKeyForExactScalarRangeKind(materializedPredKeyExactScalarRange, field, bounds)
 }
 
-func materializedPredComplementKeyForExactScalarRange(field string, bounds rangeBounds) materializedPredKey {
+func materializedPredComplementKeyForExactScalarRange(field string, bounds indexdata.Bounds) materializedPredKey {
 	return materializedPredKeyForExactScalarRangeKind(materializedPredKeyExactScalarRangeComplement, field, bounds)
 }
 

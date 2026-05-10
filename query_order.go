@@ -3,8 +3,9 @@ package rbi
 import (
 	"reflect"
 
+	"github.com/vapstack/rbi/internal/indexdata"
 	"github.com/vapstack/rbi/internal/keycodec"
-	"github.com/vapstack/rbi/internal/pools"
+	"github.com/vapstack/rbi/internal/pooled"
 	"github.com/vapstack/rbi/internal/posting"
 	"github.com/vapstack/rbi/internal/qir"
 )
@@ -114,13 +115,10 @@ func tmpIntersectPosting(tmp posting.List, a posting.List, b posting.List) posti
 	if a.IsEmpty() || b.IsEmpty() {
 		return tmp
 	}
-	upper := min(a.Cardinality(), b.Cardinality())
-	builder := newPostingUnionBuilder(upper > posting.SmallCap && upper <= singleAdaptiveMaxLen)
-	a.ForEachIntersecting(b, func(idx uint64) bool {
-		builder.addSingle(idx)
-		return false
-	})
-	return builder.finish(false)
+	if a.Cardinality() > b.Cardinality() {
+		a, b = b, a
+	}
+	return a.Clone().BuildAnd(b)
 }
 
 func makeOutSlice(cardinality, limit uint64) []uint64 {
@@ -324,7 +322,7 @@ func (qv *queryView) emitArrayCountZeroBucketResult(cursor *queryCursor, result 
 	return false
 }
 
-func (qv *queryView) queryOrderBasic(result postingResult, ov fieldOverlay, o qir.Order, skip, need uint64, all bool) ([]uint64, error) {
+func (qv *queryView) queryOrderBasic(result postingResult, ov indexdata.FieldOverlay, o qir.Order, skip, need uint64, all bool) ([]uint64, error) {
 	resultCard := qv.postingResultCardinality(result)
 	if resultCard == 0 {
 		return nil, nil
@@ -339,10 +337,10 @@ func (qv *queryView) queryOrderBasic(result postingResult, ov fieldOverlay, o qi
 
 	out := makeOutSlice(resultCard, need)
 	if !isSliceOrderField && shouldMaterializeOrderedAllNumericBuckets(qv, skip, all, resultCard) {
-		br := ov.rangeForBounds(rangeBounds{has: true})
-		cur := ov.newCursor(br, o.Desc)
+		br := ov.RangeForBounds((indexdata.Bounds{Has: true}))
+		cur := ov.NewCursor(br, o.Desc)
 		for {
-			_, ids, ok := cur.next()
+			_, ids, ok := cur.Next()
 			if !ok {
 				break
 			}
@@ -351,7 +349,7 @@ func (qv *queryView) queryOrderBasic(result postingResult, ov fieldOverlay, o qi
 		if fm := qv.fieldMetaByOrder(o); fm != nil && fm.Ptr {
 			out = appendMaterializedNumericPostingResultKeys(
 				out,
-				qv.nilFieldOverlayForOrder(o).lookupPostingRetained(nilIndexEntryKey),
+				qv.nilFieldOverlayForOrder(o).LookupPostingRetained(nilIndexEntryKey),
 				result,
 			)
 		}
@@ -364,10 +362,10 @@ func (qv *queryView) queryOrderBasic(result postingResult, ov fieldOverlay, o qi
 	cursor := qv.newQueryCursor(out, skip, need, all, dedupeCap)
 	defer cursor.release()
 
-	br := ov.rangeForBounds(rangeBounds{has: true})
-	cur := ov.newCursor(br, o.Desc)
+	br := ov.RangeForBounds((indexdata.Bounds{Has: true}))
+	cur := ov.NewCursor(br, o.Desc)
 	for {
-		_, ids, ok := cur.next()
+		_, ids, ok := cur.Next()
 		if !ok {
 			break
 		}
@@ -380,7 +378,7 @@ func (qv *queryView) queryOrderBasic(result postingResult, ov fieldOverlay, o qi
 	}
 
 	if fm := qv.fieldMetaByOrder(o); fm != nil && fm.Ptr {
-		nilIDs := qv.nilFieldOverlayForOrder(o).lookupPostingRetained(nilIndexEntryKey)
+		nilIDs := qv.nilFieldOverlayForOrder(o).LookupPostingRetained(nilIndexEntryKey)
 		if !nilIDs.IsEmpty() {
 			var done bool
 			tmp, done = emitPostingResultBucketToCursor(qv, &cursor, tmp, nilIDs, result)
@@ -434,8 +432,8 @@ func orderedDistinctStrings(vals []string, desc bool) []string {
 	return vals
 }
 
-func scalarArrayPosPriorityCoversAllKeysOverlay(ov fieldOverlay, vals []string) bool {
-	if !ov.hasData() {
+func scalarArrayPosPriorityCoversAllKeysOverlay(ov indexdata.FieldOverlay, vals []string) bool {
+	if !ov.HasData() {
 		return true
 	}
 	if len(vals) == 0 {
@@ -446,12 +444,12 @@ func scalarArrayPosPriorityCoversAllKeysOverlay(ov fieldOverlay, vals []string) 
 	for _, v := range vals {
 		set[v] = struct{}{}
 	}
-	if len(set) < ov.keyCount() {
+	if len(set) < ov.KeyCount() {
 		return false
 	}
-	cur := ov.newCursor(ov.rangeByRanks(0, ov.keyCount()), false)
+	cur := ov.NewCursor(ov.RangeByRanks(0, ov.KeyCount()), false)
 	for {
-		key, _, ok := cur.next()
+		key, _, ok := cur.Next()
 		if !ok {
 			return true
 		}
@@ -461,17 +459,17 @@ func scalarArrayPosPriorityCoversAllKeysOverlay(ov fieldOverlay, vals []string) 
 	}
 }
 
-func scalarArrayPosPriorityCoversAllResultsOverlay(resultBM posting.List, ov, nilOV fieldOverlay, vals []string) bool {
+func scalarArrayPosPriorityCoversAllResultsOverlay(resultBM posting.List, ov, nilOV indexdata.FieldOverlay, vals []string) bool {
 	if !scalarArrayPosPriorityCoversAllKeysOverlay(ov, vals) {
 		return false
 	}
-	if !nilOV.hasData() {
+	if !nilOV.HasData() {
 		return true
 	}
-	return !nilOV.lookupPostingRetained(nilIndexEntryKey).Intersects(resultBM)
+	return !nilOV.LookupPostingRetained(nilIndexEntryKey).Intersects(resultBM)
 }
 
-func (qv *queryView) queryOrderArrayPosOverlay(result postingResult, ov fieldOverlay, o qir.Order, skip, need uint64, all bool) ([]uint64, error) {
+func (qv *queryView) queryOrderArrayPosOverlay(result postingResult, ov indexdata.FieldOverlay, o qir.Order, skip, need uint64, all bool) ([]uint64, error) {
 	resultCard := qv.postingResultCardinality(result)
 	if resultCard == 0 {
 		return nil, nil
@@ -493,7 +491,7 @@ func (qv *queryView) queryOrderArrayPosOverlay(result postingResult, ov fieldOve
 	if !o.Desc {
 		for _, v := range vals {
 			var done bool
-			tmp, done = emitPostingResultBucketToCursor(qv, &cursor, tmp, ov.lookupPostingRetained(v), result)
+			tmp, done = emitPostingResultBucketToCursor(qv, &cursor, tmp, ov.LookupPostingRetained(v), result)
 			if done {
 				tmp.Release()
 				return cursor.out, nil
@@ -502,7 +500,7 @@ func (qv *queryView) queryOrderArrayPosOverlay(result postingResult, ov fieldOve
 	} else {
 		for i := len(vals) - 1; i >= 0; i-- {
 			var done bool
-			tmp, done = emitPostingResultBucketToCursor(qv, &cursor, tmp, ov.lookupPostingRetained(vals[i]), result)
+			tmp, done = emitPostingResultBucketToCursor(qv, &cursor, tmp, ov.LookupPostingRetained(vals[i]), result)
 			if done {
 				tmp.Release()
 				return cursor.out, nil
@@ -516,12 +514,12 @@ func (qv *queryView) queryOrderArrayPosOverlay(result postingResult, ov fieldOve
 	return cursor.out, nil
 }
 
-func (qv *queryView) queryOrderArrayPosScalarOverlay(result postingResult, field string, fieldOrdinal int, ov fieldOverlay, vals []string, desc bool, skip, need uint64, all bool) ([]uint64, error) {
+func (qv *queryView) queryOrderArrayPosScalarOverlay(result postingResult, field string, fieldOrdinal int, ov indexdata.FieldOverlay, vals []string, desc bool, skip, need uint64, all bool) ([]uint64, error) {
 	resultCard := qv.postingResultCardinality(result)
 	if resultCard == 0 {
 		return nil, nil
 	}
-	nilOV := fieldOverlay{}
+	nilOV := indexdata.FieldOverlay{}
 	if fm := qv.fieldMeta(field, fieldOrdinal); fm != nil && fm.Ptr {
 		nilOV = qv.nilFieldOverlayRef(field, fieldOrdinal)
 	}
@@ -537,7 +535,7 @@ func (qv *queryView) queryOrderArrayPosScalarOverlay(result postingResult, field
 		!result.neg &&
 		shouldMaterializeOrderedAllNumericBuckets(qv, skip, all, resultCard) {
 		for _, v := range orderedVals {
-			ids := ov.lookupPostingRetained(v).Borrow().BuildAnd(result.ids)
+			ids := ov.LookupPostingRetained(v).Borrow().BuildAnd(result.ids)
 			out = appendMaterializedNumericPostingKeys(out, ids)
 			ids.Release()
 		}
@@ -554,7 +552,7 @@ func (qv *queryView) queryOrderArrayPosScalarOverlay(result postingResult, field
 
 	for _, v := range orderedVals {
 		var done bool
-		tmp, done = emitPostingResultBucketToCursor(qv, &cursor, tmp, ov.lookupPostingRetained(v), result)
+		tmp, done = emitPostingResultBucketToCursor(qv, &cursor, tmp, ov.LookupPostingRetained(v), result)
 		if done {
 			tmp.Release()
 			return cursor.out, nil
@@ -601,7 +599,7 @@ func (qv *queryView) orderDataValues(v any, fm *field) ([]string, error) {
 		if valsBuf == nil {
 			return nil, nil
 		}
-		defer pools.PutStringSlice(valsBuf)
+		defer pooled.PutStringSlice(valsBuf)
 
 		out := make([]string, len(valsBuf))
 		copy(out, valsBuf)
@@ -615,7 +613,7 @@ func (qv *queryView) orderDataValues(v any, fm *field) ([]string, error) {
 	return []string{key}, nil
 }
 
-func (qv *queryView) queryOrderArrayCount(result postingResult, s []index, o qir.Order, skip, need uint64, all bool, useZeroComplement bool) ([]uint64, error) {
+func (qv *queryView) queryOrderArrayCount(result postingResult, ov indexdata.FieldOverlay, o qir.Order, skip, need uint64, all bool, useZeroComplement bool) ([]uint64, error) {
 	resultCard := qv.postingResultCardinality(result)
 	if resultCard == 0 {
 		return nil, nil
@@ -629,82 +627,90 @@ func (qv *queryView) queryOrderArrayCount(result postingResult, s []index, o qir
 	defer cursor.release()
 	var nonEmpty posting.List
 	if useZeroComplement {
-		for _, ix := range s {
-			if keycodec.EqualsString(ix.Key, lenIndexNonEmptyKey) {
-				nonEmpty = ix.IDs
-				break
-			}
-		}
+		nonEmpty = ov.LookupPostingRetained(indexdata.LenIndexNonEmptyKey)
 	}
 	if !result.neg && shouldMaterializeOrderedAllNumericBuckets(qv, skip, all, resultCard) {
-		appendZero := func() {
-			if !useZeroComplement {
-				return
+		br := ov.RangeByRanks(0, ov.KeyCount())
+		if !o.Desc {
+			if useZeroComplement {
+				ids := result.ids.Borrow().BuildAndNot(nonEmpty)
+				out = appendMaterializedNumericPostingKeys(out, ids)
+				ids.Release()
 			}
+			cur := ov.NewCursor(br, false)
+			for {
+				key, ids, ok := cur.Next()
+				if !ok {
+					break
+				}
+				if keycodec.EqualsString(key, indexdata.LenIndexNonEmptyKey) || ids.IsEmpty() {
+					continue
+				}
+				out = appendMaterializedNumericPostingResultKeys(out, ids, result)
+			}
+			return out, nil
+		}
+		cur := ov.NewCursor(br, true)
+		for {
+			key, ids, ok := cur.Next()
+			if !ok {
+				break
+			}
+			if keycodec.EqualsString(key, indexdata.LenIndexNonEmptyKey) || ids.IsEmpty() {
+				continue
+			}
+			out = appendMaterializedNumericPostingResultKeys(out, ids, result)
+		}
+		if useZeroComplement {
 			ids := result.ids.Borrow().BuildAndNot(nonEmpty)
 			out = appendMaterializedNumericPostingKeys(out, ids)
 			ids.Release()
 		}
-		if !o.Desc {
-			appendZero()
-			for _, ix := range s {
-				if keycodec.EqualsString(ix.Key, lenIndexNonEmptyKey) || ix.IDs.IsEmpty() {
-					continue
-				}
-				ids := ix.IDs.Borrow().BuildAnd(result.ids)
-				out = appendMaterializedNumericPostingKeys(out, ids)
-				ids.Release()
-			}
-			return out, nil
-		}
-		for i := len(s) - 1; i >= 0; i-- {
-			ix := s[i]
-			if keycodec.EqualsString(ix.Key, lenIndexNonEmptyKey) || ix.IDs.IsEmpty() {
-				continue
-			}
-			ids := ix.IDs.Borrow().BuildAnd(result.ids)
-			out = appendMaterializedNumericPostingKeys(out, ids)
-			ids.Release()
-		}
-		appendZero()
 		return out, nil
 	}
 
+	br := ov.RangeByRanks(0, ov.KeyCount())
 	if !o.Desc {
 		if useZeroComplement && qv.emitArrayCountZeroBucketResult(&cursor, result, nonEmpty) {
 			tmp.Release()
 			return cursor.out, nil
 		}
-
-		for _, ix := range s {
-			if keycodec.EqualsString(ix.Key, lenIndexNonEmptyKey) {
+		cur := ov.NewCursor(br, false)
+		for {
+			key, ids, ok := cur.Next()
+			if !ok {
+				break
+			}
+			if keycodec.EqualsString(key, indexdata.LenIndexNonEmptyKey) {
 				continue
 			}
-			if ix.IDs.IsEmpty() {
+			if ids.IsEmpty() {
 				continue
 			}
 
 			var done bool
-			tmp, done = emitPostingResultBucketToCursor(qv, &cursor, tmp, ix.IDs, result)
+			tmp, done = emitPostingResultBucketToCursor(qv, &cursor, tmp, ids, result)
 			if done {
 				tmp.Release()
 				return cursor.out, nil
 			}
 		}
-
 	} else {
-
-		for i := len(s) - 1; i >= 0; i-- {
-			ix := s[i]
-			if keycodec.EqualsString(ix.Key, lenIndexNonEmptyKey) {
+		cur := ov.NewCursor(br, true)
+		for {
+			key, ids, ok := cur.Next()
+			if !ok {
+				break
+			}
+			if keycodec.EqualsString(key, indexdata.LenIndexNonEmptyKey) {
 				continue
 			}
-			if ix.IDs.IsEmpty() {
+			if ids.IsEmpty() {
 				continue
 			}
 
 			var done bool
-			tmp, done = emitPostingResultBucketToCursor(qv, &cursor, tmp, ix.IDs, result)
+			tmp, done = emitPostingResultBucketToCursor(qv, &cursor, tmp, ids, result)
 			if done {
 				tmp.Release()
 				return cursor.out, nil

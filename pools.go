@@ -2,7 +2,6 @@ package rbi
 
 import (
 	"github.com/vapstack/rbi/internal/pooled"
-	"github.com/vapstack/rbi/internal/pools"
 	"github.com/vapstack/rbi/internal/posting"
 	"github.com/vapstack/rbi/internal/qir"
 )
@@ -13,9 +12,6 @@ const (
 	uint64IntMapPoolMaxLen                  = 16 << 10
 	u64SetPoolMaxCap                        = 16 << 10
 	exprSlicePoolMaxCap                     = 256
-	postingMapPoolMaxLen                    = 4 << 10
-	batchPostingDeltaMapPoolMaxLen          = 4 << 10
-	keyedBatchPostingDeltaSliceMaxCap       = 4 << 10
 	bitmapResultSlicePoolMaxCap             = 2 << 10
 	countORBranchSlicePoolMaxCap            = 512
 	countLeadResidualExactFilterPoolMaxCap  = 512
@@ -92,39 +88,6 @@ var uint64IntMapPool = pooled.Maps[uint64, int]{
 
 /**/
 
-var postingMapPool = pooled.Maps[string, posting.List]{
-	NewCap: 8,
-	MaxLen: postingMapPoolMaxLen,
-	Cleanup: func(m map[string]posting.List) {
-		clear(m)
-	},
-}
-var fixedPostingMapPool = pooled.Maps[uint64, posting.List]{
-	NewCap: 8,
-	MaxLen: postingMapPoolMaxLen,
-	Cleanup: func(m map[uint64]posting.List) {
-		clear(m)
-	},
-}
-
-var keyedBatchPostingDeltaSlicePool = pooled.Slices[keyedBatchPostingDelta]{
-	MinCap: 16,
-	MaxCap: keyedBatchPostingDeltaSliceMaxCap,
-	Cleanup: func(buf *pooled.Slice[keyedBatchPostingDelta]) {
-		for i := 0; i < buf.Len(); i++ {
-			delta := buf.Get(i)
-			delta.delta.add.Release()
-			delta.delta.remove.Release()
-		}
-	},
-	Clear: true,
-}
-
-var fixedBatchPostingDeltaMapPool = pooled.Maps[uint64, batchPostingDelta]{
-	NewCap: 8,
-	MaxLen: batchPostingDeltaMapPoolMaxLen,
-}
-
 var postingResultSlicePool = pooled.Slices[postingResult]{
 	MinCap: 16,
 	MaxCap: bitmapResultSlicePoolMaxCap,
@@ -186,7 +149,7 @@ var leafPredSlicePool = pooled.Slices[leafPred]{
 				postsAnyFilterStatePool.Put(pred.postsAnyState)
 			}
 			if pred.postsBuf != nil {
-				pools.PutPostingSlice(pred.postsBuf)
+				posting.PutSlice(pred.postsBuf)
 			}
 		}
 	},

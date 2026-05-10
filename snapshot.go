@@ -1,14 +1,11 @@
 package rbi
 
 import (
-	"slices"
-	"sort"
 	"sync"
 	"sync/atomic"
 
-	"github.com/vapstack/rbi/internal/keycodec"
+	"github.com/vapstack/rbi/internal/indexdata"
 	"github.com/vapstack/rbi/internal/pooled"
-	"github.com/vapstack/rbi/internal/pools"
 	"github.com/vapstack/rbi/internal/posting"
 )
 
@@ -16,11 +13,11 @@ import (
 type indexSnapshot struct {
 	seq uint64
 
-	index              *pooled.Slice[fieldIndexStorage]
-	nilIndex           *pooled.Slice[fieldIndexStorage]
-	lenIndex           *pooled.Slice[fieldIndexStorage]
+	index              []indexdata.FieldStorage
+	nilIndex           []indexdata.FieldStorage
+	lenIndex           []indexdata.FieldStorage
 	lenZeroComplement  []bool
-	measure            *pooled.Slice[measureFieldStorage]
+	measure            []indexdata.MeasureStorage
 	indexedFieldByName map[string]indexedFieldAccessor
 	universe           posting.List
 	universeOwner      *snapshotPostingOwner
@@ -90,14 +87,6 @@ type snapshotRef struct {
 	snap    *indexSnapshot
 	retired *pooled.Slice[*indexSnapshot]
 	refs    atomic.Int64
-}
-
-type indexKeyOrder []index
-
-func (s indexKeyOrder) Len() int      { return len(s) }
-func (s indexKeyOrder) Swap(i, j int) { s[i], s[j] = s[j], s[i] }
-func (s indexKeyOrder) Less(i, j int) bool {
-	return keycodec.Compare(s[i].Key, s[j].Key) < 0
 }
 
 var snapshotRefPool = pooled.Pointers[snapshotRef]{Clear: true}
@@ -584,7 +573,7 @@ func releaseRetiredSnapshots(buf *pooled.Slice[*indexSnapshot]) {
 		if retired == nil {
 			continue
 		}
-		retired.releaseOwnedStorage()
+		retired.releaseStorage()
 		retired.releaseRuntimeCaches()
 	}
 	snapshotRetiredListPool.Put(buf)
@@ -604,14 +593,14 @@ func inheritNumericRangeBucketCache(next, prev *indexSnapshot) {
 	defer prev.numericRangeBucketCache.mu.Unlock()
 	for i := 0; i < prev.numericRangeBucketCache.slots.Len(); i++ {
 		slot := prev.numericRangeBucketCache.slots.Get(i)
-		if slot.field == "" || slot.entry == nil || slot.entry.storage.keyCount() == 0 {
+		if slot.field == "" || slot.entry == nil || slot.entry.storage.KeyCount() == 0 {
 			continue
 		}
 		acc, ok := next.indexedFieldByName[slot.field]
-		if !ok || next.index == nil || acc.ordinal >= next.index.Len() {
+		if !ok || next.index == nil || acc.ordinal >= len(next.index) {
 			continue
 		}
-		nextStorage := next.index.Get(acc.ordinal)
+		nextStorage := next.index[acc.ordinal]
 		if nextStorage != slot.entry.storage {
 			continue
 		}
@@ -1037,27 +1026,16 @@ func (db *DB[K, V]) clearCurrentSnapshotCachesForTesting() {
 	db.engine.getSnapshot().clearRuntimeCachesForTesting()
 }
 
-func (s *indexSnapshot) fieldIndexStorage(field string) (fieldIndexStorage, bool) {
+func (s *indexSnapshot) fieldIndexStorage(field string) (indexdata.FieldStorage, bool) {
 	if s == nil || s.index == nil {
-		return fieldIndexStorage{}, false
+		return indexdata.FieldStorage{}, false
 	}
 	acc, ok := s.indexedFieldByName[field]
-	if !ok || acc.ordinal >= s.index.Len() {
-		return fieldIndexStorage{}, false
+	if !ok || acc.ordinal >= len(s.index) {
+		return indexdata.FieldStorage{}, false
 	}
-	storage := s.index.Get(acc.ordinal)
-	return storage, storage.keyCount() > 0
-}
-
-func (s *indexSnapshot) nilFieldIndexSlice(field string) *[]index {
-	if s == nil || s.nilIndex == nil {
-		return nil
-	}
-	acc, ok := s.indexedFieldByName[field]
-	if !ok || acc.ordinal >= s.nilIndex.Len() {
-		return nil
-	}
-	return s.nilIndex.Get(acc.ordinal).flatSlice()
+	storage := s.index[acc.ordinal]
+	return storage, storage.KeyCount() > 0
 }
 
 func (s *indexSnapshot) nilFieldNameSet() map[string]struct{} {
@@ -1066,7 +1044,7 @@ func (s *indexSnapshot) nilFieldNameSet() map[string]struct{} {
 	}
 	fields := make(map[string]struct{}, len(s.indexedFieldByName))
 	for f, acc := range s.indexedFieldByName {
-		if acc.ordinal < s.nilIndex.Len() && s.nilIndex.Get(acc.ordinal).keyCount() > 0 {
+		if acc.ordinal < len(s.nilIndex) && s.nilIndex[acc.ordinal].KeyCount() > 0 {
 			fields[f] = struct{}{}
 		}
 	}
@@ -1079,7 +1057,7 @@ func (s *indexSnapshot) fieldNameSet() map[string]struct{} {
 	}
 	fields := make(map[string]struct{}, len(s.indexedFieldByName))
 	for f, acc := range s.indexedFieldByName {
-		if acc.ordinal < s.index.Len() && s.index.Get(acc.ordinal).keyCount() > 0 {
+		if acc.ordinal < len(s.index) && s.index[acc.ordinal].KeyCount() > 0 {
 			fields[f] = struct{}{}
 		}
 	}
@@ -1092,7 +1070,7 @@ func (s *indexSnapshot) lenFieldNameSet() map[string]struct{} {
 	}
 	fields := make(map[string]struct{}, len(s.indexedFieldByName))
 	for f, acc := range s.indexedFieldByName {
-		if !acc.field.Slice || acc.ordinal >= s.lenIndex.Len() || s.lenIndex.Get(acc.ordinal).keyCount() == 0 {
+		if !acc.field.Slice || acc.ordinal >= len(s.lenIndex) || s.lenIndex[acc.ordinal].KeyCount() == 0 {
 			continue
 		}
 		fields[f] = struct{}{}
@@ -1105,10 +1083,10 @@ func (s *indexSnapshot) fieldLookupPostingRetained(field, key string) posting.Li
 		return posting.List{}
 	}
 	acc, ok := s.indexedFieldByName[field]
-	if !ok || acc.ordinal >= s.index.Len() {
+	if !ok || acc.ordinal >= len(s.index) {
 		return posting.List{}
 	}
-	return newFieldOverlayStorage(s.index.Get(acc.ordinal)).lookupPostingRetained(key)
+	return indexdata.NewFieldOverlayStorage(s.index[acc.ordinal]).LookupPostingRetained(key)
 }
 
 func (sm *snapshotManager) publishRef(s *indexSnapshot) *pooled.Slice[*indexSnapshot] {
@@ -1332,110 +1310,9 @@ func unionPostingListsOwned(base, add posting.List) posting.List {
 	return merged
 }
 
-func rebuildLenIndexField(universe posting.List, fieldOV fieldOverlay) (*[]index, bool) {
-	result := make([]index, 0)
-	if universe.IsEmpty() {
-		return &result, false
-	}
-
-	var nonEmpty posting.List
-
-	counts := make(map[uint64]uint32, 1024)
-	br := fieldOV.rangeForBounds(rangeBounds{has: true})
-	if !overlayRangeEmpty(br) {
-		cur := fieldOV.newCursor(br, false)
-		for {
-			_, ids, ok := cur.next()
-			if !ok {
-				break
-			}
-			if ids.IsEmpty() {
-				continue
-			}
-			if nonEmpty.IsEmpty() {
-				nonEmpty = ids.Clone()
-			} else {
-				nonEmpty = nonEmpty.BuildOr(ids)
-			}
-			ids.ForEach(func(idx uint64) bool {
-				counts[idx]++
-				return true
-			})
-		}
-	}
-
-	lenMap := make(map[uint32]posting.List, len(counts)+1)
-	for idx, ln := range counts {
-		if ln == 0 {
-			continue
-		}
-		p := lenMap[ln]
-		p = p.BuildAdded(idx)
-		lenMap[ln] = p
-	}
-
-	empty := universe.Clone()
-	empty = empty.BuildAndNot(nonEmpty)
-
-	useZeroComplement := false
-	var nonEmptyPosting posting.List
-	if !empty.IsEmpty() {
-		emptyCard := empty.Cardinality()
-		nonEmptyCard := nonEmpty.Cardinality()
-		if nonEmptyCard > 0 && nonEmptyCard < emptyCard {
-			nonEmptyPosting = nonEmpty.Clone()
-			useZeroComplement = !nonEmptyPosting.IsEmpty()
-		}
-	}
-	if useZeroComplement {
-		empty.Release()
-	} else if !empty.IsEmpty() {
-		zeroPosting := lenMap[0]
-		zeroPosting = zeroPosting.BuildMergedOwned(empty)
-		lenMap[0] = zeroPosting
-	} else {
-		empty.Release()
-	}
-
-	resultCap := len(lenMap)
-	if useZeroComplement {
-		resultCap++
-	}
-	result = make([]index, 0, resultCap)
-	for ln, ids := range lenMap {
-		ids = ids.BuildOptimized()
-		if ids.IsEmpty() {
-			continue
-		}
-		result = append(result, index{
-			Key: keycodec.FromU64(uint64(ln)),
-			IDs: ids,
-		})
-	}
-	if useZeroComplement {
-		nonEmptyPosting = nonEmptyPosting.BuildOptimized()
-		if !nonEmptyPosting.IsEmpty() {
-			result = append(result, index{
-				Key: keycodec.FromString(lenIndexNonEmptyKey),
-				IDs: nonEmptyPosting,
-			})
-		}
-	}
-
-	slices.SortFunc(result, func(a, b index) int {
-		return keycodec.Compare(a.Key, b.Key)
-	})
-	nonEmpty.Release()
-	return &result, useZeroComplement
-}
-
-func addFieldPostingListHint(fieldMap map[string]posting.List, key string, idx uint64, capHint int) map[string]posting.List {
+func addFieldPostingList(fieldMap map[string]posting.List, key string, idx uint64) map[string]posting.List {
 	if fieldMap == nil {
-		if capHint >= 64 {
-			fieldMap = make(map[string]posting.List, min(capHint, postingMapPoolMaxLen))
-		} else {
-			fieldMap = postingMapPool.Get()
-		}
+		fieldMap = indexdata.GetPostingMap()
 	}
 	p := fieldMap[key]
 	p = p.BuildAdded(idx)
@@ -1443,13 +1320,9 @@ func addFieldPostingListHint(fieldMap map[string]posting.List, key string, idx u
 	return fieldMap
 }
 
-func addFixedFieldPostingListHint(fieldMap map[uint64]posting.List, key uint64, idx uint64, capHint int) map[uint64]posting.List {
+func addFixedFieldPostingList(fieldMap map[uint64]posting.List, key uint64, idx uint64) map[uint64]posting.List {
 	if fieldMap == nil {
-		if capHint >= 64 {
-			fieldMap = make(map[uint64]posting.List, min(capHint, postingMapPoolMaxLen))
-		} else {
-			fieldMap = fixedPostingMapPool.Get()
-		}
+		fieldMap = indexdata.GetFixedPostingMap()
 	}
 	p := fieldMap[key]
 	p = p.BuildAdded(idx)
@@ -1500,7 +1373,7 @@ func (qe *queryEngine) buildPreparedSnapshotFromEmptyBaseNoLock(seq uint64, prev
 	}
 
 	fieldStates := make([]snapshotFieldOverlayState, len(qe.indexedFieldAccess))
-	measureStates := make([]*pooled.Slice[measureEntry], len(qe.measureFieldAccess))
+	measureStates := make([][]indexdata.MeasureEntry, len(qe.measureFieldAccess))
 
 	for i := range entries {
 		if hasRepeated && lastByIdx[entries[i].idx] != i {
@@ -1516,10 +1389,11 @@ func (qe *queryEngine) buildPreparedSnapshotFromEmptyBaseNoLock(seq uint64, prev
 			if value, ok := acc.read(ptr); ok {
 				buf := measureStates[acc.ordinal]
 				if buf == nil {
-					buf = measureEntrySlicePool.Get()
+					buf = indexdata.GetMeasureEntrySlice(0)
 					measureStates[acc.ordinal] = buf
 				}
-				buf.Append(measureEntry{id: op.idx, value: value})
+				buf = append(buf, indexdata.MeasureEntry{ID: op.idx, Value: value})
+				measureStates[acc.ordinal] = buf
 			}
 		}
 	}
@@ -1527,25 +1401,37 @@ func (qe *queryEngine) buildPreparedSnapshotFromEmptyBaseNoLock(seq uint64, prev
 		uint64IntMapPool.Put(lastByIdx)
 	}
 
-	nextIndex := fieldIndexStorageSlicePool.Get()
-	nextIndex.SetLen(len(qe.indexedFieldAccess))
+	slotCount := len(qe.indexedFieldAccess)
+	nextIndex := indexdata.GetFieldStorageSlice(slotCount)[:slotCount]
 	for i, acc := range qe.indexedFieldAccess {
-		if storage := acc.materializeSnapshotOverlayStorageOwned(&fieldStates[i]); storage.keyCount() > 0 {
-			nextIndex.Set(i, storage)
+		state := &fieldStates[i]
+		var storage indexdata.FieldStorage
+		if acc.field != nil && acc.field.KeyKind == fieldWriteKeysOrderedU64 {
+			fixed := state.fixed
+			state.fixed = nil
+			storage = indexdata.NewRegularFieldStorageFromFixedPostingMapOwned(fixed)
+		} else {
+			idx := state.index
+			state.index = nil
+			storage = indexdata.NewRegularFieldStorageFromPostingMapOwned(idx, false)
+		}
+		if storage.KeyCount() > 0 {
+			nextIndex[i] = storage
 		}
 	}
 
-	nextNilIndex := fieldIndexStorageSlicePool.Get()
-	nextNilIndex.SetLen(len(qe.indexedFieldAccess))
-	for i, acc := range qe.indexedFieldAccess {
-		if storage := acc.materializeSnapshotOverlayNilStorageOwned(&fieldStates[i]); storage.keyCount() > 0 {
-			nextNilIndex.Set(i, storage)
+	nextNilIndex := indexdata.GetFieldStorageSlice(slotCount)[:slotCount]
+	for i := range qe.indexedFieldAccess {
+		state := &fieldStates[i]
+		nils := state.nils
+		state.nils = nil
+		if storage := indexdata.NewFlatFieldStorageFromPostingMapOwned(nils, false); storage.KeyCount() > 0 {
+			nextNilIndex[i] = storage
 		}
 	}
 
-	nextLenIndex := fieldIndexStorageSlicePool.Get()
-	nextLenIndex.SetLen(len(qe.indexedFieldAccess))
-	nextLenZeroComplement := pools.GetBoolSlice(len(qe.indexedFieldAccess))[:len(qe.indexedFieldAccess)]
+	nextLenIndex := indexdata.GetFieldStorageSlice(slotCount)[:slotCount]
+	nextLenZeroComplement := pooled.GetBoolSlice(slotCount)[:slotCount]
 	clear(nextLenZeroComplement)
 	for i, acc := range qe.indexedFieldAccess {
 		if !acc.field.Slice {
@@ -1553,17 +1439,17 @@ func (qe *queryEngine) buildPreparedSnapshotFromEmptyBaseNoLock(seq uint64, prev
 		}
 		lengths := fieldStates[i].lengths
 		fieldStates[i].lengths = nil
-		storage, useZeroComplement := materializeLenFieldStorageOwned(universe, lengths)
-		nextLenIndex.Set(i, storage)
+		storage, useZeroComplement := indexdata.NewLenFieldStorageFromMapOwned(universe, lengths)
+		nextLenIndex[i] = storage
 		if useZeroComplement {
 			nextLenZeroComplement[i] = true
 		}
 	}
-	nextMeasure := measureFieldStorageSlicePool.Get()
-	nextMeasure.SetLen(len(qe.measureFieldAccess))
+	measureSlotCount := len(qe.measureFieldAccess)
+	nextMeasure := indexdata.GetMeasureStorageSlice(measureSlotCount)[:measureSlotCount]
 	for i := range qe.measureFieldAccess {
-		storage := newMeasureStorageFromEntriesOwned(measureStates[i])
-		nextMeasure.Set(i, storage)
+		storage := indexdata.NewMeasureStorageFromEntriesOwned(measureStates[i])
+		nextMeasure[i] = storage
 		measureStates[i] = nil
 	}
 
@@ -1591,7 +1477,7 @@ func (qe *queryEngine) buildPreparedSnapshotFromEmptyBaseNoLock(seq uint64, prev
 		}
 	}
 	if changedCount > 0 {
-		changed := pools.GetBoolSlice(len(qe.indexedFieldAccess))[:len(qe.indexedFieldAccess)]
+		changed := pooled.GetBoolSlice(len(qe.indexedFieldAccess))[:len(qe.indexedFieldAccess)]
 		clear(changed)
 		for i := range fieldStates {
 			if fieldStates[i].changed {
@@ -1599,142 +1485,12 @@ func (qe *queryEngine) buildPreparedSnapshotFromEmptyBaseNoLock(seq uint64, prev
 			}
 		}
 		inheritMaterializedPredCache(snap, prev, qe.indexedFieldMap, changed)
-		pools.PutBoolSlice(changed)
+		pooled.PutBoolSlice(changed)
 	} else {
 		inheritMaterializedPredCache(snap, prev, qe.indexedFieldMap, nil)
 	}
 	snap.ensureUniverseOwner()
 	return snap, true
-}
-
-func mergeInsertOnlyFieldSliceOwned(
-	base *[]index,
-	adds map[string]uint32,
-	arena *insertPostingAccumArena,
-	fixed8 bool,
-) *[]index {
-	if len(adds) == 0 {
-		insertPostingMapPool.Put(adds)
-		return base
-	}
-	if len(adds) == 1 {
-		var add index
-		for key, ref := range adds {
-			add = index{
-				Key: keycodec.FromStoredString(key, fixed8),
-				IDs: arena.accum(ref).materializeOwned(),
-			}
-		}
-		insertPostingMapPool.Put(adds)
-		return mergeInsertOnlySingleFieldEntry(base, add)
-	}
-
-	addSlice := make([]index, 0, len(adds))
-	for key, ref := range adds {
-		ids := arena.accum(ref).materializeOwned()
-		addSlice = append(addSlice, index{
-			Key: keycodec.FromStoredString(key, fixed8),
-			IDs: ids,
-		})
-	}
-	insertPostingMapPool.Put(adds)
-
-	return mergeInsertOnlyFieldEntries(base, addSlice)
-}
-
-func mergeInsertOnlyFixedFieldSliceOwned(
-	base *[]index,
-	adds map[uint64]uint32,
-	arena *insertPostingAccumArena,
-) *[]index {
-	if len(adds) == 0 {
-		fixedInsertPostingMapPool.Put(adds)
-		return base
-	}
-	if len(adds) == 1 {
-		var add index
-		for key, ref := range adds {
-			add = index{
-				Key: keycodec.FromU64(key),
-				IDs: arena.accum(ref).materializeOwned(),
-			}
-		}
-		fixedInsertPostingMapPool.Put(adds)
-		return mergeInsertOnlySingleFieldEntry(base, add)
-	}
-
-	addSlice := make([]index, 0, len(adds))
-	for key, ref := range adds {
-		ids := arena.accum(ref).materializeOwned()
-		addSlice = append(addSlice, index{
-			Key: keycodec.FromU64(key),
-			IDs: ids,
-		})
-	}
-	fixedInsertPostingMapPool.Put(adds)
-
-	return mergeInsertOnlyFieldEntries(base, addSlice)
-}
-
-func mergeInsertOnlySingleFieldEntry(base *[]index, add index) *[]index {
-	if add.IDs.IsEmpty() {
-		return base
-	}
-	if base == nil || len(*base) == 0 {
-		out := []index{add}
-		return &out
-	}
-
-	src := *base
-	pos := lowerBoundIndexEntriesKey(src, add.Key)
-	if pos < len(src) && keycodec.Compare(src[pos].Key, add.Key) == 0 {
-		out := make([]index, len(src))
-		copyBorrowedIndexEntries(out, src)
-		out[pos].IDs = unionPostingListsOwned(src[pos].IDs, add.IDs)
-		return &out
-	}
-
-	out := make([]index, len(src)+1)
-	copyBorrowedIndexEntries(out[:pos], src[:pos])
-	out[pos] = add
-	copyBorrowedIndexEntries(out[pos+1:], src[pos:])
-	return &out
-}
-
-func mergeInsertOnlyFieldEntries(base *[]index, addSlice []index) *[]index {
-	sort.Sort(indexKeyOrder(addSlice))
-
-	if base == nil || len(*base) == 0 {
-		return &addSlice
-	}
-
-	src := *base
-	out := make([]index, 0, len(src)+len(addSlice))
-	i, j := 0, 0
-	for i < len(src) && j < len(addSlice) {
-		cmp := keycodec.Compare(src[i].Key, addSlice[j].Key)
-		switch {
-		case cmp < 0:
-			out = append(out, borrowedFieldIndexEntry(src[i]))
-			i++
-		case cmp > 0:
-			out = append(out, addSlice[j])
-			j++
-		default:
-			merged := src[i]
-			merged.IDs = unionPostingListsOwned(src[i].IDs, addSlice[j].IDs)
-			out = append(out, merged)
-			i++
-			j++
-		}
-	}
-	if i < len(src) {
-		out = appendBorrowedIndexEntries(out, src[i:])
-	}
-	if j < len(addSlice) {
-		out = append(out, addSlice[j:]...)
-	}
-	return &out
 }
 
 func (qe *queryEngine) buildPreparedSnapshotInsertOnlyNoLock(seq uint64, prev *indexSnapshot, strMap *strMapper, entries []snapshotBatchEntry) (*indexSnapshot, bool) {
@@ -1763,11 +1519,11 @@ func (qe *queryEngine) buildPreparedSnapshotInsertOnlyNoLock(seq uint64, prev *i
 	next := &indexSnapshot{
 		seq: seq,
 
-		index:              cloneFieldIndexStorageSlots(prev.index, len(qe.indexedFieldAccess)),
-		nilIndex:           cloneFieldIndexStorageSlots(prev.nilIndex, len(qe.indexedFieldAccess)),
-		lenIndex:           cloneFieldIndexStorageSlots(prev.lenIndex, len(qe.indexedFieldAccess)),
+		index:              indexdata.CloneFieldStorageSlots(prev.index, len(qe.indexedFieldAccess)),
+		nilIndex:           indexdata.CloneFieldStorageSlots(prev.nilIndex, len(qe.indexedFieldAccess)),
+		lenIndex:           indexdata.CloneFieldStorageSlots(prev.lenIndex, len(qe.indexedFieldAccess)),
 		lenZeroComplement:  cloneFieldIndexBoolSlots(prev.lenZeroComplement, len(qe.indexedFieldAccess)),
-		measure:            cloneMeasureFieldStorageSlots(prev.measure, len(qe.measureFieldAccess)),
+		measure:            indexdata.CloneMeasureStorageSlots(prev.measure, len(qe.measureFieldAccess)),
 		indexedFieldByName: qe.indexedFieldMap,
 		universe:           prev.universe.Clone(),
 		strmap:             strmap,
@@ -1778,7 +1534,7 @@ func (qe *queryEngine) buildPreparedSnapshotInsertOnlyNoLock(seq uint64, prev *i
 	fieldStates := snapshotFieldInsertStateSlicePool.Get()
 	fieldStates.SetLen(len(qe.indexedFieldAccess))
 	initSnapshotFieldInsertStateHints(fieldStates, qe.indexedFieldAccess, prev, len(entries))
-	measureDeltas := newMeasureFieldBatchDeltas(len(qe.measureFieldAccess))
+	measureDeltas := indexdata.NewMeasureDeltaBatch(len(qe.measureFieldAccess))
 
 	for i := range entries {
 		op := entries[i]
@@ -1790,7 +1546,7 @@ func (qe *queryEngine) buildPreparedSnapshotInsertOnlyNoLock(seq uint64, prev *i
 		}
 		for _, acc := range qe.measureFieldAccess {
 			if value, ok := acc.read(ptr); ok {
-				measureDeltas.append(acc.ordinal, measureBatchDelta{id: op.idx, newOK: true, new: value})
+				measureDeltas.Append(acc.ordinal, op.idx, true, value)
 			}
 		}
 	}
@@ -1798,40 +1554,40 @@ func (qe *queryEngine) buildPreparedSnapshotInsertOnlyNoLock(seq uint64, prev *i
 	changedCount := 0
 	for i, acc := range qe.indexedFieldAccess {
 		state := fieldStates.GetPtr(i)
-		baseIndex := next.index.Get(i)
-		if storage := acc.mergeSnapshotInsertStorageOwned(baseIndex, state, true); storage.keyCount() > 0 {
+		baseIndex := next.index[i]
+		if storage := acc.mergeSnapshotInsertStorageOwned(baseIndex, state, true); storage.KeyCount() > 0 {
 			if storage != baseIndex {
-				next.index.Set(i, storage)
+				next.index[i] = storage
 			}
-		} else if baseIndex.keyCount() > 0 {
-			next.index.Set(i, fieldIndexStorage{})
+		} else if baseIndex.KeyCount() > 0 {
+			next.index[i] = indexdata.FieldStorage{}
 		}
-		baseNil := next.nilIndex.Get(i)
-		if storage := acc.mergeSnapshotInsertNilStorageOwned(baseNil, state); storage.keyCount() > 0 {
+		baseNil := next.nilIndex[i]
+		if storage := acc.mergeSnapshotInsertNilStorageOwned(baseNil, state); storage.KeyCount() > 0 {
 			if storage != baseNil {
-				next.nilIndex.Set(i, storage)
+				next.nilIndex[i] = storage
 			}
-		} else if baseNil.keyCount() > 0 {
-			next.nilIndex.Set(i, fieldIndexStorage{})
+		} else if baseNil.KeyCount() > 0 {
+			next.nilIndex[i] = indexdata.FieldStorage{}
 		}
 		if state.lengths != nil {
-			baseLen := next.lenIndex.Get(i)
-			if storage := applyLenFieldPostingDiffStorageOwned(baseLen, state.lengths); storage != baseLen {
-				next.lenIndex.Set(i, storage)
+			baseLen := next.lenIndex[i]
+			if storage := baseLen.ApplyLenPostingDiffOwned(state.lengths); storage != baseLen {
+				next.lenIndex[i] = storage
 			}
 			state.lengths = nil
 		}
 		if state.changed {
 			changedCount++
 		}
-		state.releaseOwned()
+		state.release()
 	}
-	applyMeasureFieldBatchDeltas(next, &measureDeltas)
-	measureDeltas.release()
+	measureDeltas.ApplyToMeasureStorageSlotsOwned(next.measure)
+	measureDeltas.Release()
 	inheritNumericRangeBucketCache(next, prev)
 
 	if changedCount > 0 {
-		changed := pools.GetBoolSlice(len(qe.indexedFieldAccess))[:len(qe.indexedFieldAccess)]
+		changed := pooled.GetBoolSlice(len(qe.indexedFieldAccess))[:len(qe.indexedFieldAccess)]
 		clear(changed)
 		for i := 0; i < fieldStates.Len(); i++ {
 			if fieldStates.Get(i).changed {
@@ -1839,7 +1595,7 @@ func (qe *queryEngine) buildPreparedSnapshotInsertOnlyNoLock(seq uint64, prev *i
 			}
 		}
 		inheritMaterializedPredCache(next, prev, qe.indexedFieldMap, changed)
-		pools.PutBoolSlice(changed)
+		pooled.PutBoolSlice(changed)
 	} else {
 		inheritMaterializedPredCache(next, prev, qe.indexedFieldMap, nil)
 	}
@@ -1902,26 +1658,26 @@ func (s *indexSnapshot) retainSharedOwnedStorageFrom(prev *indexSnapshot) {
 		s.ensureUniverseOwner()
 	}
 	if prev != nil {
-		retainSharedFieldIndexStorageSlots(s.index, prev.index)
-		retainSharedFieldIndexStorageSlots(s.nilIndex, prev.nilIndex)
-		retainSharedFieldIndexStorageSlots(s.lenIndex, prev.lenIndex)
-		retainSharedMeasureFieldStorageSlots(s.measure, prev.measure)
+		indexdata.RetainSharedFieldStorageSlots(s.index, prev.index)
+		indexdata.RetainSharedFieldStorageSlots(s.nilIndex, prev.nilIndex)
+		indexdata.RetainSharedFieldStorageSlots(s.lenIndex, prev.lenIndex)
+		indexdata.RetainSharedMeasureStorageSlots(s.measure, prev.measure)
 	}
 }
 
-func (s *indexSnapshot) releaseOwnedStorage() {
+func (s *indexSnapshot) releaseStorage() {
 	if s == nil {
 		return
 	}
 	if s.universeOwner != nil {
 		s.universeOwner.release()
 	}
-	releaseFieldIndexStorageSlotsOwned(s.index)
-	releaseFieldIndexStorageSlotsOwned(s.nilIndex)
-	releaseFieldIndexStorageSlotsOwned(s.lenIndex)
-	releaseMeasureFieldStorageSlotsOwned(s.measure)
+	indexdata.ReleaseFieldStorageSlots(s.index)
+	indexdata.ReleaseFieldStorageSlots(s.nilIndex)
+	indexdata.ReleaseFieldStorageSlots(s.lenIndex)
+	indexdata.ReleaseMeasureStorageSlots(s.measure)
 	if s.lenZeroComplement != nil {
-		pools.PutBoolSlice(s.lenZeroComplement)
+		pooled.PutBoolSlice(s.lenZeroComplement)
 	}
 	s.index = nil
 	s.nilIndex = nil

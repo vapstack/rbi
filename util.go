@@ -452,3 +452,10 @@ func newRand(seed int64) *rand.Rand {
 	s := uint64(seed)
 	return rand.New(rand.NewPCG(s, s^randStreamMix))
 }
+
+func satAddUint64(total, add uint64) uint64 {
+	if ^uint64(0)-total < add {
+		return ^uint64(0)
+	}
+	return total + add
+}

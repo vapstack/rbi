@@ -10,8 +10,8 @@ import (
 	"time"
 
 	"github.com/vapstack/qx"
+	"github.com/vapstack/rbi/internal/indexdata"
 	"github.com/vapstack/rbi/internal/pooled"
-	"github.com/vapstack/rbi/internal/pools"
 	"github.com/vapstack/rbi/internal/posting"
 	"github.com/vapstack/rbi/internal/qir"
 )
@@ -252,7 +252,7 @@ func (qe *queryEngine) tryLimitQueryOrderBasic(q *qx.QX, leaves []qx.Expr, trace
 	return qe.currentQueryViewForTests().tryLimitQueryOrderBasic(&viewQ, compiledLeaves, trace)
 }
 
-func (qe *queryEngine) tryLimitQueryRangeNoOrderByField(q *qx.QX, field string, bounds rangeBounds, rest []qx.Expr, trace *queryTrace) ([]uint64, bool, error) {
+func (qe *queryEngine) tryLimitQueryRangeNoOrderByField(q *qx.QX, field string, bounds indexdata.Bounds, rest []qx.Expr, trace *queryTrace) ([]uint64, bool, error) {
 	preparedQ, viewQ, err := prepareTestQuery(qe, q)
 	if err != nil {
 		return nil, false, err
@@ -324,13 +324,13 @@ func (qe *queryEngine) execPlanOrderedBasic(q *qx.QX, preds []predicate, trace *
 	return qe.currentQueryViewForTests().execPlanOrderedBasicReader(&viewQ, predicateSliceView(preds), trace)
 }
 
-func (qe *queryEngine) execPlanOrderedBasicFallback(q *qx.QX, preds []predicate, active []int, start, end int, s []index, trace *queryTrace) []uint64 {
+func (qe *queryEngine) execPlanOrderedBasicFallback(q *qx.QX, preds []predicate, active []int, ov indexdata.FieldOverlay, br indexdata.OverlayRange, trace *queryTrace) []uint64 {
 	prepared, viewQ, err := prepareTestQuery(qe, q)
 	if err != nil {
 		return nil
 	}
 	defer prepared.Release()
-	return qe.currentQueryViewForTests().execPlanOrderedBasicFallback(&viewQ, preds, active, start, end, s, trace)
+	return qe.currentQueryViewForTests().execPlanOrderedBasicFallback(&viewQ, preds, active, ov, br, trace)
 }
 
 func (qe *queryEngine) buildORBranches(ops []qx.Expr) (plannerORBranches, bool, bool) {
@@ -419,7 +419,7 @@ func (qe *queryEngine) materializedPredCacheKey(e qx.Expr) string {
 	return qe.currentQueryViewForTests().materializedPredCacheKey(expr)
 }
 
-func (qe *queryEngine) buildPredRangeCandidateWithMode(e qx.Expr, fm *field, ov fieldOverlay, allowMaterialize bool) (predicate, bool) {
+func (qe *queryEngine) buildPredRangeCandidateWithMode(e qx.Expr, fm *field, ov indexdata.FieldOverlay, allowMaterialize bool) (predicate, bool) {
 	prepared, expr, err := prepareTestExpr(qe, e)
 	if err != nil {
 		return predicate{}, false
@@ -437,14 +437,14 @@ func (qe *queryEngine) buildPredicateWithMode(e qx.Expr, allowMaterialize bool) 
 	return qe.currentQueryViewForTests().buildPredicateWithMode(expr, allowMaterialize)
 }
 
-func (qe *queryEngine) collectOrderRangeBounds(field string, n int, exprAt func(i int) qx.Expr) (rangeBounds, []bool, bool, bool) {
+func (qe *queryEngine) collectOrderRangeBounds(field string, n int, exprAt func(i int) qx.Expr) (indexdata.Bounds, []bool, bool, bool) {
 	prepared := make([]*qir.Query, 0, n)
 	compiled := make([]qir.Expr, 0, n)
 	for i := 0; i < n; i++ {
 		p, expr, err := prepareTestExpr(qe, exprAt(i))
 		if err != nil {
 			releasePreparedQueriesForTest(prepared)
-			return rangeBounds{}, nil, false, false
+			return indexdata.Bounds{}, nil, false, false
 		}
 		prepared = append(prepared, p)
 		compiled = append(compiled, expr)
@@ -457,16 +457,7 @@ func (qe *queryEngine) collectOrderRangeBounds(field string, n int, exprAt func(
 	return rb, copyBoolBufAndRelease(covered), has, ok
 }
 
-func (qe *queryEngine) extractOrderRangeCoverage(field string, preds []predicate, s []index) (int, int, []bool, bool) {
-	ov := fieldOverlay{base: s}
-	br, covered, ok := qe.currentQueryViewForTests().extractOrderRangeCoverageOverlayReader(field, predicateSliceView(preds), ov)
-	if !ok {
-		return 0, 0, nil, false
-	}
-	return br.baseStart, br.baseEnd, copyBoolBufAndRelease(covered), true
-}
-
-func (qe *queryEngine) extractOrderRangeCoverageOverlay(field string, preds []predicate, ov fieldOverlay) (overlayRange, []bool, bool) {
+func (qe *queryEngine) extractOrderRangeCoverageOverlay(field string, preds []predicate, ov indexdata.FieldOverlay) (indexdata.OverlayRange, []bool, bool) {
 	br, covered, ok := qe.currentQueryViewForTests().extractOrderRangeCoverageOverlayReader(field, predicateSliceView(preds), ov)
 	return br, copyBoolBufAndRelease(covered), ok
 }
@@ -476,7 +467,7 @@ func copyBoolBufAndRelease(buf []bool) []bool {
 		return nil
 	}
 	out := append([]bool(nil), buf...)
-	pools.PutBoolSlice(buf)
+	pooled.PutBoolSlice(buf)
 	return out
 }
 
@@ -702,10 +693,10 @@ func (qe *queryEngine) tryCountByPredicates(expr qx.Expr, trace *queryTrace) (ui
 	return qe.currentQueryViewForTests().tryCountByPredicates(compiled, trace)
 }
 
-func (qe *queryEngine) extractNoOrderBounds(leaves []qx.Expr) (string, rangeBounds, bool, error) {
+func (qe *queryEngine) extractNoOrderBounds(leaves []qx.Expr) (string, indexdata.Bounds, bool, error) {
 	prepared, compiledLeaves, err := prepareTestExprs(qe, leaves)
 	if err != nil {
-		return "", rangeBounds{}, false, err
+		return "", indexdata.Bounds{}, false, err
 	}
 	defer releasePreparedQueriesForTest(prepared)
 	return qe.currentQueryViewForTests().extractNoOrderBounds(compiledLeaves)
@@ -786,7 +777,7 @@ func (qe *queryEngine) exprValueToIdxOwned(expr qx.Expr) ([]string, bool, bool, 
 		if valsBuf == nil {
 			return nil, true, hasNil, nil
 		}
-		defer pools.PutStringSlice(valsBuf)
+		defer pooled.PutStringSlice(valsBuf)
 
 		out := make([]string, len(valsBuf))
 		copy(out, valsBuf)
@@ -840,7 +831,7 @@ func (qe *queryEngine) exprValueToDistinctIdxOwned(expr qx.Expr) ([]string, bool
 			if err != nil || valsBuf == nil {
 				return nil, true, hasNil, err
 			}
-			defer pools.PutStringSlice(valsBuf)
+			defer pooled.PutStringSlice(valsBuf)
 			valsBuf = dedupStringBufInPlace(valsBuf)
 			out := make([]string, len(valsBuf))
 			copy(out, valsBuf)
@@ -852,7 +843,7 @@ func (qe *queryEngine) exprValueToDistinctIdxOwned(expr qx.Expr) ([]string, bool
 	if err != nil || valsBuf == nil {
 		return nil, isSlice, hasNil, err
 	}
-	defer pools.PutStringSlice(valsBuf)
+	defer pooled.PutStringSlice(valsBuf)
 
 	out := make([]string, len(valsBuf))
 	copy(out, valsBuf)

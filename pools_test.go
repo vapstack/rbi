@@ -6,7 +6,7 @@ import (
 	"testing"
 	"unsafe"
 
-	"github.com/vapstack/rbi/internal/pools"
+	"github.com/vapstack/rbi/internal/indexdata"
 	"github.com/vapstack/rbi/internal/posting"
 	"github.com/vmihailenco/msgpack/v5"
 )
@@ -202,7 +202,7 @@ func TestCountORBranchSliceBufReleaseClearsFullCapacity(t *testing.T) {
 	preds := newPredicateSet(1)
 	preds.Append(predicate{
 		kind:     predicateKindPostsAny,
-		postsBuf: pools.GetPostingSlice(0),
+		postsBuf: posting.GetSlice(0),
 	})
 	var checks [countPredicateScanMaxLeaves]int
 	checks[0] = 7
@@ -234,7 +234,7 @@ func TestLeafPredSliceBufReleaseClearsFullCapacity(t *testing.T) {
 	buf.Append(leafPred{
 		kind:          leafPredKindPostsUnion,
 		postingFilter: func(ids posting.List) (posting.List, bool) { return ids, true },
-		postsBuf:      pools.GetPostingSlice(0),
+		postsBuf:      posting.GetSlice(0),
 		postsAnyState: postsAnyFilterStatePool.Get(),
 	})
 	buf.Append(leafPred{
@@ -242,7 +242,7 @@ func TestLeafPredSliceBufReleaseClearsFullCapacity(t *testing.T) {
 		posting:       poolsSingleton(3),
 		estCard:       1,
 		postingFilter: func(ids posting.List) (posting.List, bool) { return ids, true },
-		postsBuf:      pools.GetPostingSlice(0),
+		postsBuf:      posting.GetSlice(0),
 		postsAnyState: postsAnyFilterStatePool.Get(),
 	})
 	leafPredSlicePool.Put(buf)
@@ -319,7 +319,7 @@ func TestBuildIndexFieldLocalStateFlushAllIntoMergesNilSource(t *testing.T) {
 		state.addNil(uint64(i))
 	}
 
-	dst := newBuildIndexFieldState(false, false)
+	dst := newBuildIndexFieldState(false)
 	dst.nils = poolsSingleton(777)
 
 	state.flushAllInto(dst)
@@ -337,7 +337,7 @@ func TestBuildIndexFieldLocalStateFlushAllIntoMergesLenSource(t *testing.T) {
 		state.addLen(3, uint64(i))
 	}
 
-	dst := newBuildIndexFieldState(false, true)
+	dst := newBuildIndexFieldState(true)
 	dst.lenMap[3] = poolsSingleton(888)
 
 	state.flushAllInto(dst)
@@ -349,38 +349,20 @@ func TestBuildIndexFieldLocalStateFlushAllIntoMergesLenSource(t *testing.T) {
 	}
 }
 
-func TestBuildIndexFieldStateMaterializeStorageMergesRunSource(t *testing.T) {
-	left := postingMapPool.Get()
-	left["name"] = left["name"].BuildAdded(777)
-	runLeft := buildIndexStringRunFromPostingMap(left)
-
-	right := postingMapPool.Get()
-	for i := 1; i <= posting.MidCap+1; i++ {
-		right["name"] = right["name"].BuildAdded(uint64(i))
-	}
-	runRight := buildIndexStringRunFromPostingMap(right)
-
-	state := newBuildIndexFieldState(false, false)
-	state.runs = []buildIndexFieldRun{runLeft, runRight}
+func TestBuildIndexFieldStateMaterializeStorageDetachesRuns(t *testing.T) {
+	state := newBuildIndexFieldState(false)
+	state.runs = []indexdata.FieldStorageRun{{}}
 
 	storage := state.materializeStorage()
-	if storage.keyCount() != 1 {
-		t.Fatalf("unexpected key count after materialize: %d", storage.keyCount())
-	}
+	defer storage.Release()
 	if len(state.runs) != 0 {
 		t.Fatalf("expected runs to be detached during materialization")
 	}
 }
 
 func TestBuildIndexFieldStateReleaseClearsRuns(t *testing.T) {
-	m := postingMapPool.Get()
-	for i := 1; i <= posting.MidCap+1; i++ {
-		m["name"] = m["name"].BuildAdded(uint64(i))
-	}
-	run := buildIndexStringRunFromPostingMap(m)
-
-	state := newBuildIndexFieldState(false, false)
-	state.runs = []buildIndexFieldRun{run}
+	state := newBuildIndexFieldState(false)
+	state.runs = []indexdata.FieldStorageRun{{}}
 	state.release()
 	if state.runs != nil {
 		t.Fatalf("expected runs to be cleared")
@@ -388,7 +370,7 @@ func TestBuildIndexFieldStateReleaseClearsRuns(t *testing.T) {
 }
 
 func TestBuildIndexFieldStateReleaseClearsNils(t *testing.T) {
-	state := newBuildIndexFieldState(false, false)
+	state := newBuildIndexFieldState(false)
 	for i := 1; i <= posting.MidCap+1; i++ {
 		state.nils = state.nils.BuildAdded(uint64(i))
 	}
@@ -400,7 +382,7 @@ func TestBuildIndexFieldStateReleaseClearsNils(t *testing.T) {
 }
 
 func TestBuildIndexFieldStateReleaseClearsLenMap(t *testing.T) {
-	state := newBuildIndexFieldState(false, true)
+	state := newBuildIndexFieldState(true)
 	for i := 1; i <= posting.MidCap+1; i++ {
 		state.lenMap[3] = state.lenMap[3].BuildAdded(uint64(i))
 	}

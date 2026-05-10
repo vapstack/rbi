@@ -19,29 +19,30 @@ import (
 	"unsafe"
 
 	"github.com/vapstack/qx"
+	"github.com/vapstack/rbi/internal/indexdata"
 	"github.com/vapstack/rbi/internal/keycodec"
 	"github.com/vapstack/rbi/internal/pooled"
 	"github.com/vapstack/rbi/internal/posting"
 	"go.etcd.io/bbolt"
 )
 
-func TestReadString_RoundTrip(t *testing.T) {
+func TestReadSidecarString_RoundTrip(t *testing.T) {
 	var payload bytes.Buffer
 	writer := bufio.NewWriter(&payload)
 	const want = "plain-string"
-	if err := writeString(writer, want); err != nil {
-		t.Fatalf("writeString: %v", err)
+	if err := writeSidecarString(writer, want); err != nil {
+		t.Fatalf("writeSidecarString: %v", err)
 	}
 	if err := writer.Flush(); err != nil {
 		t.Fatalf("Flush: %v", err)
 	}
 
-	got, err := readString(bufio.NewReader(bytes.NewReader(payload.Bytes())))
+	got, err := readSidecarString(bufio.NewReader(bytes.NewReader(payload.Bytes())))
 	if err != nil {
-		t.Fatalf("readString: %v", err)
+		t.Fatalf("readSidecarString: %v", err)
 	}
 	if got != want {
-		t.Fatalf("readString mismatch: got %q", got)
+		t.Fatalf("readSidecarString mismatch: got %q", got)
 	}
 }
 
@@ -105,7 +106,7 @@ func TestValidateIndexedStringValues_UsesOnlyStringValidationAccessors(t *testin
 					name:  "email",
 					field: &field{Kind: reflect.String},
 					writeBuild: func(_ unsafe.Pointer, sink buildFieldWriteSink) {
-						sink.addString(strings.Repeat("x", fieldIndexStringRefMax+1))
+						sink.addString(strings.Repeat("x", indexdata.FieldStringRefMax+1))
 					},
 				},
 			},
@@ -724,7 +725,7 @@ func TestIndexPersistence_ChunkedFieldRoundTrip(t *testing.T) {
 	path := filepath.Join(dir, "persist_chunked.db")
 
 	db, raw := openBoltAndNew[uint64, Rec](t, path)
-	for i := 0; i < fieldIndexChunkThreshold+64; i++ {
+	for i := 0; i < indexdata.FieldChunkThreshold+64; i++ {
 		if err := db.Set(uint64(i+1), &Rec{
 			Name:  fmt.Sprintf("user_%04d", i),
 			Email: fmt.Sprintf("user_%04d@example.test", i),
@@ -734,7 +735,7 @@ func TestIndexPersistence_ChunkedFieldRoundTrip(t *testing.T) {
 		}
 	}
 
-	if storage, ok := db.engine.getSnapshot().fieldIndexStorage("name"); !ok || !storage.isChunked() {
+	if storage, ok := db.engine.getSnapshot().fieldIndexStorage("name"); !ok || !storage.IsChunked() {
 		t.Fatalf("expected chunked name index before close")
 	}
 
@@ -755,7 +756,7 @@ func TestIndexPersistence_ChunkedFieldRoundTrip(t *testing.T) {
 		}
 	})
 
-	if storage, ok := db2.engine.getSnapshot().fieldIndexStorage("name"); !ok || !storage.isChunked() {
+	if storage, ok := db2.engine.getSnapshot().fieldIndexStorage("name"); !ok || !storage.IsChunked() {
 		t.Fatalf("expected chunked name index after reopen")
 	}
 
@@ -2418,370 +2419,6 @@ func TestPointerNil_TryPlanOrdered_AllowsPointerSortField(t *testing.T) {
 
 /**/
 
-type indexExtOverlayFixture struct {
-	keys    []string
-	entries []index
-	flat    fieldOverlay
-	chunked fieldOverlay
-	root    *fieldIndexChunkedRoot
-	fixed8  bool
-}
-
-type indexExtDeltaOp struct {
-	key    string
-	add    []uint64
-	remove []uint64
-}
-
-func indexExtPosting(start uint64, card int) posting.List {
-	if card <= 0 {
-		return posting.List{}
-	}
-	var out posting.List
-	for i := 0; i < card; i++ {
-		out = out.BuildAdded(start + uint64(i))
-	}
-	return out
-}
-
-func indexExtPostingFromIDs(ids []uint64) posting.List {
-	if len(ids) == 0 {
-		return posting.List{}
-	}
-	var out posting.List
-	for _, id := range ids {
-		out = out.BuildAdded(id)
-	}
-	return out
-}
-
-func indexExtPostingIDs(ids posting.List) []uint64 {
-	return ids.ToArray()
-}
-
-func indexExtAssertSameSlice[T comparable](t *testing.T, got, want []T) {
-	t.Helper()
-	if !slices.Equal(got, want) {
-		t.Fatalf("slice mismatch\ngot=%v\nwant=%v", got, want)
-	}
-}
-
-func indexExtSortedStringKeys() []string {
-	keys := make([]string, 0, fieldIndexChunkThreshold+32)
-	for i := 0; i < 140; i++ {
-		keys = append(keys, fmt.Sprintf("aa/%03d", i))
-	}
-	for i := 0; i < 132; i++ {
-		keys = append(keys, fmt.Sprintf("ab/%03d", i))
-	}
-	for i := 0; i < 126; i++ {
-		keys = append(keys, fmt.Sprintf("b/%03d", i))
-	}
-	keys = append(keys, "\xff", "\xff\x00", "\xff\xff")
-	slices.Sort(keys)
-	return keys
-}
-
-func indexExtSortedNumericKeys() []string {
-	values := make([]uint64, 0, fieldIndexChunkThreshold+64)
-	for i := 0; i < 150; i++ {
-		values = append(values, uint64(0x10)<<56|uint64(i))
-	}
-	for i := 0; i < 140; i++ {
-		values = append(values, uint64(0x20)<<56|uint64(i))
-	}
-	for i := 0; i < 120; i++ {
-		values = append(values, uint64(0x20)<<56|uint64(0x8000+i))
-	}
-	for i := 0; i < 12; i++ {
-		values = append(values, uint64(0xff)<<56|uint64(i))
-	}
-	slices.Sort(values)
-	out := make([]string, len(values))
-	for i, v := range values {
-		out[i] = keycodec.U64ByteString(v)
-	}
-	return out
-}
-
-func indexExtNewOverlayFixture(t *testing.T, keys []string, fixed8 bool) indexExtOverlayFixture {
-	t.Helper()
-
-	entries := make([]index, len(keys))
-	for i, key := range keys {
-		entries[i] = index{
-			Key: keycodec.FromStoredString(key, fixed8),
-			IDs: indexExtPosting(uint64(i*64+1), i%11+1),
-		}
-	}
-	slices.SortFunc(entries, func(a, b index) int {
-		return keycodec.Compare(a.Key, b.Key)
-	})
-
-	root := buildChunkedFieldIndexRoot(entries)
-	if root == nil {
-		t.Fatalf("expected chunked root for %d keys", len(entries))
-	}
-
-	flatEntries := append([]index(nil), entries...)
-	sortedKeys := make([]string, len(entries))
-	for i := range entries {
-		sortedKeys[i] = entries[i].Key.UnsafeString()
-	}
-
-	return indexExtOverlayFixture{
-		keys:    sortedKeys,
-		entries: flatEntries,
-		flat:    newFieldOverlay(&flatEntries),
-		chunked: fieldOverlay{chunked: root},
-		root:    root,
-		fixed8:  fixed8,
-	}
-}
-
-func indexExtNewSingletonOverlayFixture(t *testing.T, keys []string, fixed8 bool) indexExtOverlayFixture {
-	t.Helper()
-
-	entries := make([]index, len(keys))
-	for i, key := range keys {
-		entries[i] = index{
-			Key: keycodec.FromStoredString(key, fixed8),
-			IDs: indexTestSingleton(uint64(i + 1)),
-		}
-	}
-	slices.SortFunc(entries, func(a, b index) int {
-		return keycodec.Compare(a.Key, b.Key)
-	})
-
-	root := buildChunkedFieldIndexRoot(entries)
-	if root == nil {
-		t.Fatalf("expected chunked root for %d keys", len(entries))
-	}
-
-	flatEntries := append([]index(nil), entries...)
-	sortedKeys := make([]string, len(entries))
-	for i := range entries {
-		sortedKeys[i] = entries[i].Key.UnsafeString()
-	}
-
-	return indexExtOverlayFixture{
-		keys:    sortedKeys,
-		entries: flatEntries,
-		flat:    newFieldOverlay(&flatEntries),
-		chunked: fieldOverlay{chunked: root},
-		root:    root,
-		fixed8:  fixed8,
-	}
-}
-
-func indexExtStringFixture(t *testing.T) indexExtOverlayFixture {
-	t.Helper()
-	return indexExtNewOverlayFixture(t, indexExtSortedStringKeys(), false)
-}
-
-func indexExtNumericFixture(t *testing.T) indexExtOverlayFixture {
-	t.Helper()
-	return indexExtNewOverlayFixture(t, indexExtSortedNumericKeys(), true)
-}
-
-func indexExtMultiPageStringFixture(t *testing.T) indexExtOverlayFixture {
-	t.Helper()
-
-	total := fieldIndexChunkTargetEntries*(fieldIndexDirPageTargetRefs+1) + fieldIndexChunkTargetEntries/2 + 17
-	keys := make([]string, 0, total)
-	for i := 0; i < total; i++ {
-		switch {
-		case i < total/3:
-			keys = append(keys, fmt.Sprintf("mp/aa/%05d", i))
-		case i < 2*total/3:
-			keys = append(keys, fmt.Sprintf("mp/ab/%05d", i))
-		default:
-			keys = append(keys, fmt.Sprintf("mp/b/%05d", i))
-		}
-	}
-
-	fx := indexExtNewSingletonOverlayFixture(t, keys, false)
-	if fx.root.pages.Len() < 2 {
-		t.Fatalf("expected multi-page root, got %d pages", fx.root.pages.Len())
-	}
-	return fx
-}
-
-func indexExtCollectCursor(ov fieldOverlay, br overlayRange, desc bool) ([]string, []uint64) {
-	cur := ov.newCursor(br, desc)
-	keys := make([]string, 0, max(0, br.baseEnd-br.baseStart))
-	cards := make([]uint64, 0, max(0, br.baseEnd-br.baseStart))
-	for {
-		key, ids, ok := cur.next()
-		if !ok {
-			return keys, cards
-		}
-		keys = append(keys, key.UnsafeString())
-		cards = append(cards, ids.Cardinality())
-	}
-}
-
-func indexExtRangeWindows(n int) [][2]int {
-	return [][2]int{
-		{0, 0},
-		{0, 1},
-		{0, 5},
-		{1, 7},
-		{fieldIndexChunkTargetEntries - 1, fieldIndexChunkTargetEntries + 3},
-		{fieldIndexChunkTargetEntries + 11, fieldIndexChunkThreshold - 5},
-		{n/2 - 7, n/2 + 7},
-		{n - 5, n},
-		{0, n},
-		{n, n},
-	}
-}
-
-func indexExtNormalizeWindow(start, end, n int) (int, int) {
-	start = max(0, min(start, n))
-	end = max(0, min(end, n))
-	if start > end {
-		start = end
-	}
-	return start, end
-}
-
-func indexExtAssertRangeEquivalent(
-	t *testing.T,
-	flat, chunked fieldOverlay,
-	brFlat, brChunk overlayRange,
-	desc bool,
-) {
-	t.Helper()
-	if brFlat.baseStart != brChunk.baseStart || brFlat.baseEnd != brChunk.baseEnd {
-		t.Fatalf(
-			"range rank mismatch: flat=[%d,%d) chunked=[%d,%d)",
-			brFlat.baseStart,
-			brFlat.baseEnd,
-			brChunk.baseStart,
-			brChunk.baseEnd,
-		)
-	}
-
-	wantKeys, wantCards := indexExtCollectCursor(flat, brFlat, desc)
-	gotKeys, gotCards := indexExtCollectCursor(chunked, brChunk, desc)
-	indexExtAssertSameSlice(t, gotKeys, wantKeys)
-	indexExtAssertSameSlice(t, gotCards, wantCards)
-}
-
-func indexExtBoundCase(t *testing.T, ops ...struct {
-	op  qx.Op
-	key string
-}) rangeBounds {
-	t.Helper()
-	rb := rangeBounds{has: true}
-	for _, op := range ops {
-		if !rb.applyOp(compileScalarOpForTest(op.op), op.key) {
-			t.Fatalf("applyOp(%v, %q) failed", op.op, op.key)
-		}
-	}
-	return rb
-}
-
-func indexExtStorageKeysAndPostings(storage fieldIndexStorage) ([]string, [][]uint64) {
-	ov := newFieldOverlayStorage(storage)
-	br := ov.rangeByRanks(0, ov.keyCount())
-	keys, _ := indexExtCollectCursor(ov, br, false)
-	posts := make([][]uint64, 0, ov.keyCount())
-	cur := ov.newCursor(br, false)
-	for {
-		_, ids, ok := cur.next()
-		if !ok {
-			return keys, posts
-		}
-		posts = append(posts, indexExtPostingIDs(ids))
-	}
-}
-
-func indexExtDeltaKeys(ops []indexExtDeltaOp, fixed8 bool) []keyedBatchPostingDelta {
-	out := make([]keyedBatchPostingDelta, 0, len(ops))
-	for _, op := range ops {
-		out = append(out, keyedBatchPostingDelta{
-			key: keycodec.FromStoredString(op.key, fixed8),
-			delta: batchPostingDelta{
-				add:    indexExtPostingFromIDs(op.add),
-				remove: indexExtPostingFromIDs(op.remove),
-			},
-		})
-	}
-	slices.SortFunc(out, func(a, b keyedBatchPostingDelta) int {
-		return keycodec.Compare(a.key, b.key)
-	})
-	return out
-}
-
-func indexExtExpectedMapFromEntries(entries []index) map[string][]uint64 {
-	out := make(map[string][]uint64, len(entries))
-	for i := range entries {
-		out[entries[i].Key.UnsafeString()] = indexExtPostingIDs(entries[i].IDs)
-	}
-	return out
-}
-
-func indexExtApplyOpsExpected(expected map[string][]uint64, ops []indexExtDeltaOp) {
-	for _, op := range ops {
-		switch {
-		case len(op.remove) != 0 && len(op.add) == 0:
-			delete(expected, op.key)
-		case len(op.add) != 0:
-			expected[op.key] = append([]uint64(nil), op.add...)
-		}
-	}
-}
-
-func indexExtAssertStorageMatchesExpected(
-	t *testing.T,
-	storage fieldIndexStorage,
-	expected map[string][]uint64,
-) {
-	t.Helper()
-
-	keys, postings := indexExtStorageKeysAndPostings(storage)
-	wantKeys := make([]string, 0, len(expected))
-	for key := range expected {
-		wantKeys = append(wantKeys, key)
-	}
-	sort.Strings(wantKeys)
-	indexExtAssertSameSlice(t, keys, wantKeys)
-	if len(postings) != len(wantKeys) {
-		t.Fatalf("posting count mismatch: got=%d want=%d", len(postings), len(wantKeys))
-	}
-	for i, key := range wantKeys {
-		indexExtAssertSameSlice(t, postings[i], expected[key])
-	}
-}
-
-func indexExtAssertStorageMatchesEntries(t *testing.T, storage fieldIndexStorage, entries []index) {
-	t.Helper()
-
-	keys, postings := indexExtStorageKeysAndPostings(storage)
-	wantKeys := make([]string, len(entries))
-	wantPosts := make([][]uint64, len(entries))
-	for i := range entries {
-		wantKeys[i] = entries[i].Key.UnsafeString()
-		wantPosts[i] = indexExtPostingIDs(entries[i].IDs)
-	}
-
-	indexExtAssertSameSlice(t, keys, wantKeys)
-	if len(postings) != len(wantPosts) {
-		t.Fatalf("posting count mismatch: got=%d want=%d", len(postings), len(wantPosts))
-	}
-	for i := range wantPosts {
-		indexExtAssertSameSlice(t, postings[i], wantPosts[i])
-	}
-}
-
-func indexExtAssertOverlayMembership(t *testing.T, ov fieldOverlay, key string, id uint64, want bool) {
-	t.Helper()
-	if got := ov.lookupPostingRetained(key).Contains(id); got != want {
-		t.Fatalf("lookup(%q).Contains(%d): got=%v want=%v", key, id, got, want)
-	}
-}
-
 func indexExtBatchSetGenerated(t *testing.T, db *DB[uint64, Rec], start, end int, gen func(i int) *Rec) {
 	t.Helper()
 	if start > end {
@@ -2840,7 +2477,7 @@ func indexExtAssertCountExpected(t *testing.T, db *DB[uint64, Rec], q *qx.QX) {
 	}
 }
 
-func indexExtFloatSignedZeroChunkedDB(t *testing.T) *DB[uint64, Rec] {
+func indexExtFloatSignedZeroDB(t *testing.T) *DB[uint64, Rec] {
 	t.Helper()
 
 	db, _ := openTempDBUint64(t)
@@ -2867,14 +2504,10 @@ func indexExtFloatSignedZeroChunkedDB(t *testing.T) *DB[uint64, Rec] {
 		}
 	}
 
-	if db.engine.currentQueryViewForTests().fieldOverlay("score").chunked == nil {
-		t.Fatalf("expected chunked score overlay")
-	}
-
 	return db
 }
 
-func indexExtFloatNaNChunkedDB(t *testing.T) *DB[uint64, Rec] {
+func indexExtFloatNaNDB(t *testing.T) *DB[uint64, Rec] {
 	t.Helper()
 
 	db, _ := openTempDBUint64(t)
@@ -2903,14 +2536,10 @@ func indexExtFloatNaNChunkedDB(t *testing.T) *DB[uint64, Rec] {
 		}
 	}
 
-	if db.engine.currentQueryViewForTests().fieldOverlay("score").chunked == nil {
-		t.Fatalf("expected chunked score overlay")
-	}
-
 	return db
 }
 
-func indexExtNumericCoercionChunkedDB(t *testing.T) *DB[uint64, Rec] {
+func indexExtNumericCoercionDB(t *testing.T) *DB[uint64, Rec] {
 	t.Helper()
 
 	db, _ := openTempDBUint64(t)
@@ -2923,792 +2552,37 @@ func indexExtNumericCoercionChunkedDB(t *testing.T) *DB[uint64, Rec] {
 		}
 	})
 
-	if db.engine.currentQueryViewForTests().fieldOverlay("age").chunked == nil {
-		t.Fatalf("expected chunked age overlay")
-	}
-	if db.engine.currentQueryViewForTests().fieldOverlay("score").chunked == nil {
-		t.Fatalf("expected chunked score overlay")
-	}
-
 	return db
 }
 
-func TestIndexExt_StringLowerBoundMatchesFlat(t *testing.T) {
-	fx := indexExtStringFixture(t)
-	probes := []string{
-		"",
-		"aa/",
-		"aa/000",
-		"aa/071",
-		"aa/999",
-		"ab/000",
-		"ab/131",
-		"ab/999",
-		"b/000",
-		"b/999",
-		"c/",
-		"\xff",
-		"\xff\x00",
-		"\xff\xff",
-		"\xff\xff\xff",
-	}
-	for _, probe := range probes {
-		if got, want := fx.chunked.lowerBound(probe), fx.flat.lowerBound(probe); got != want {
-			t.Fatalf("lowerBound(%q): got=%d want=%d", probe, got, want)
-		}
-	}
-}
-
-func TestIndexExt_StringUpperBoundMatchesFlat(t *testing.T) {
-	fx := indexExtStringFixture(t)
-	probes := []string{
-		"",
-		"aa/",
-		"aa/000",
-		"aa/071",
-		"aa/999",
-		"ab/000",
-		"ab/131",
-		"ab/999",
-		"b/000",
-		"b/999",
-		"c/",
-		"\xff",
-		"\xff\x00",
-		"\xff\xff",
-		"\xff\xff\xff",
-	}
-	for _, probe := range probes {
-		if got, want := fx.chunked.upperBound(probe), fx.flat.upperBound(probe); got != want {
-			t.Fatalf("upperBound(%q): got=%d want=%d", probe, got, want)
-		}
-	}
-}
-
-func TestIndexExt_StringPrefixRangeEndMatchesFlat(t *testing.T) {
-	fx := indexExtStringFixture(t)
-	cases := []struct {
-		prefix string
-		start  int
-	}{
-		{prefix: "", start: 0},
-		{prefix: "", start: fx.flat.keyCount() / 2},
-		{prefix: "aa/", start: 0},
-		{prefix: "aa/", start: fx.flat.lowerBound("aa/050")},
-		{prefix: "aa/", start: fx.flat.lowerBound("ab/000")},
-		{prefix: "ab/09", start: fx.flat.lowerBound("ab/090")},
-		{prefix: "ab/09", start: fx.flat.lowerBound("b/000")},
-		{prefix: "b/", start: fx.flat.lowerBound("b/010")},
-		{prefix: "missing/", start: 0},
-		{prefix: "\xff", start: fx.flat.lowerBound("\xff")},
-		{prefix: "\xff\xff", start: fx.flat.lowerBound("\xff\xff")},
-	}
-	for _, tc := range cases {
-		if got, want := fx.chunked.prefixRangeEnd(tc.prefix, tc.start), fx.flat.prefixRangeEnd(tc.prefix, tc.start); got != want {
-			t.Fatalf("prefixRangeEnd(prefix=%q,start=%d): got=%d want=%d", tc.prefix, tc.start, got, want)
-		}
-	}
-}
-
-func TestIndexExt_StringRangeForBoundsMatchesFlat(t *testing.T) {
-	fx := indexExtStringFixture(t)
-	cases := []rangeBounds{
-		{has: true, empty: true},
-		indexExtBoundCase(t, struct {
-			op  qx.Op
-			key string
-		}{op: qx.OpPREFIX, key: "aa/"}),
-		indexExtBoundCase(t,
-			struct {
-				op  qx.Op
-				key string
-			}{op: qx.OpPREFIX, key: "aa/"},
-			struct {
-				op  qx.Op
-				key string
-			}{op: qx.OpGTE, key: "aa/050"},
-			struct {
-				op  qx.Op
-				key string
-			}{op: qx.OpLT, key: "aa/101"},
-		),
-		indexExtBoundCase(t,
-			struct {
-				op  qx.Op
-				key string
-			}{op: qx.OpGT, key: "ab/010"},
-			struct {
-				op  qx.Op
-				key string
-			}{op: qx.OpLTE, key: "b/003"},
-		),
-		indexExtBoundCase(t, struct {
-			op  qx.Op
-			key string
-		}{op: qx.OpEQ, key: "\xff"}),
-		indexExtBoundCase(t,
-			struct {
-				op  qx.Op
-				key string
-			}{op: qx.OpPREFIX, key: "\xff"},
-			struct {
-				op  qx.Op
-				key string
-			}{op: qx.OpLTE, key: "\xff\xff"},
-		),
-		indexExtBoundCase(t,
-			struct {
-				op  qx.Op
-				key string
-			}{op: qx.OpGTE, key: "zzzz"},
-			struct {
-				op  qx.Op
-				key string
-			}{op: qx.OpLTE, key: "zzzz"},
-		),
-	}
-
-	for _, rb := range cases {
-		indexExtAssertRangeEquivalent(t, fx.flat, fx.chunked, fx.flat.rangeForBounds(rb), fx.chunked.rangeForBounds(rb), false)
-	}
-}
-
-func TestIndexExt_StringCursorAscMatchesFlat(t *testing.T) {
-	fx := indexExtStringFixture(t)
-	for _, window := range indexExtRangeWindows(len(fx.keys)) {
-		start, end := indexExtNormalizeWindow(window[0], window[1], len(fx.keys))
-		indexExtAssertRangeEquivalent(t, fx.flat, fx.chunked, fx.flat.rangeByRanks(start, end), fx.chunked.rangeByRanks(start, end), false)
-	}
-}
-
-func TestIndexExt_StringCursorDescMatchesFlat(t *testing.T) {
-	fx := indexExtStringFixture(t)
-	for _, window := range indexExtRangeWindows(len(fx.keys)) {
-		start, end := indexExtNormalizeWindow(window[0], window[1], len(fx.keys))
-		indexExtAssertRangeEquivalent(t, fx.flat, fx.chunked, fx.flat.rangeByRanks(start, end), fx.chunked.rangeByRanks(start, end), true)
-	}
-}
-
-func TestIndexExt_StringPostingAtMatchesFlat(t *testing.T) {
-	fx := indexExtStringFixture(t)
-	for i := range fx.keys {
-		indexExtAssertSameSlice(t, indexExtPostingIDs(fx.chunked.postingAt(i)), indexExtPostingIDs(fx.flat.postingAt(i)))
-		indexExtAssertSameSlice(
-			t,
-			indexExtPostingIDs(fx.chunked.lookupPostingRetained(fx.keys[i])),
-			indexExtPostingIDs(fx.flat.lookupPostingRetained(fx.keys[i])),
-		)
-	}
-	if !fx.chunked.lookupPostingRetained("missing/key").IsEmpty() {
-		t.Fatalf("expected empty lookup for missing key")
-	}
-}
-
-func TestIndexExt_StringOverlayRangeStatsMatchesFlat(t *testing.T) {
-	fx := indexExtStringFixture(t)
-	for _, window := range indexExtRangeWindows(len(fx.keys)) {
-		start, end := indexExtNormalizeWindow(window[0], window[1], len(fx.keys))
-		gotBuckets, gotRows := overlayRangeStats(fx.chunked, fx.chunked.rangeByRanks(start, end))
-		wantBuckets, wantRows := overlayRangeStats(fx.flat, fx.flat.rangeByRanks(start, end))
-		if gotBuckets != wantBuckets || gotRows != wantRows {
-			t.Fatalf(
-				"overlayRangeStats(%d,%d): got=(%d,%d) want=(%d,%d)",
-				start,
-				end,
-				gotBuckets,
-				gotRows,
-				wantBuckets,
-				wantRows,
-			)
-		}
-	}
-}
-
-func TestIndexExt_StringOverlayUnionRangeMatchesFlat(t *testing.T) {
-	fx := indexExtStringFixture(t)
-	for _, window := range indexExtRangeWindows(len(fx.keys)) {
-		start, end := indexExtNormalizeWindow(window[0], window[1], len(fx.keys))
-		got := overlayUnionRanges(fx.chunked, fx.chunked.rangeByRanks(start, end), overlayRange{})
-		want := overlayUnionRanges(fx.flat, fx.flat.rangeByRanks(start, end), overlayRange{})
-		indexExtAssertSameSlice(t, got.ToArray(), want.ToArray())
-		got.Release()
-		want.Release()
-	}
-}
-
-func TestIndexExt_StringMergeOverlayRangeIntoMatchesFlat(t *testing.T) {
-	fx := indexExtStringFixture(t)
-	seedIDs := []uint64{1, 9, 64, 127}
-	for _, window := range indexExtRangeWindows(len(fx.keys)) {
-		start, end := indexExtNormalizeWindow(window[0], window[1], len(fx.keys))
-
-		seedFlat := posting.BuildFromSorted(seedIDs)
-		got := mergeOverlayRangesInto(seedFlat, fx.chunked, fx.chunked.rangeByRanks(start, end), overlayRange{})
-
-		seedChunked := posting.BuildFromSorted(seedIDs)
-		want := mergeOverlayRangesInto(seedChunked, fx.flat, fx.flat.rangeByRanks(start, end), overlayRange{})
-
-		indexExtAssertSameSlice(t, got.ToArray(), want.ToArray())
-		got.Release()
-		want.Release()
-	}
-}
-
-func TestIndexExt_StringMergeOverlayRangeIntoMatchesBaselineUnion(t *testing.T) {
-	fx := indexExtStringFixture(t)
-	seedIDs := []uint64{1, 9, 64, 127}
-	for _, window := range indexExtRangeWindows(len(fx.keys)) {
-		start, end := indexExtNormalizeWindow(window[0], window[1], len(fx.keys))
-		br := fx.chunked.rangeByRanks(start, end)
-
-		gotBase := posting.BuildFromSorted(seedIDs)
-		got := mergeOverlayRangesInto(gotBase, fx.chunked, br, overlayRange{})
-
-		wantBase := posting.BuildFromSorted(seedIDs)
-		add := overlayUnionRanges(fx.chunked, br, overlayRange{})
-		want := wantBase.BuildMergedOwned(add)
-
-		indexExtAssertSameSlice(t, got.ToArray(), want.ToArray())
-		got.Release()
-		want.Release()
-	}
-}
-
-func TestIndexExt_StringOverlayUnionRangesMatchesBaselineUnion(t *testing.T) {
-	fx := indexExtStringFixture(t)
-	cases := [][4]int{
-		{0, 24, 48, 96},
-		{7, 31, 31, 63},
-		{16, 64, 96, 144},
-		{0, 0, 32, 64},
-		{120, 160, 160, len(fx.keys)},
-	}
-	for _, tc := range cases {
-		firstStart, firstEnd := indexExtNormalizeWindow(tc[0], tc[1], len(fx.keys))
-		secondStart, secondEnd := indexExtNormalizeWindow(tc[2], tc[3], len(fx.keys))
-		first := fx.chunked.rangeByRanks(firstStart, firstEnd)
-		second := fx.chunked.rangeByRanks(secondStart, secondEnd)
-
-		got := overlayUnionRanges(fx.chunked, first, second)
-		want := overlayUnionRanges(fx.chunked, first, overlayRange{})
-		want = want.BuildMergedOwned(overlayUnionRanges(fx.chunked, second, overlayRange{}))
-
-		indexExtAssertSameSlice(t, got.ToArray(), want.ToArray())
-		got.Release()
-		want.Release()
-	}
-}
-
-func TestIndexExt_StringMergeOverlayRangesIntoMatchesBaselineUnion(t *testing.T) {
-	fx := indexExtStringFixture(t)
-	seedIDs := []uint64{1, 9, 64, 127}
-	cases := [][4]int{
-		{0, 24, 48, 96},
-		{7, 31, 31, 63},
-		{16, 64, 96, 144},
-		{0, 0, 32, 64},
-		{120, 160, 160, len(fx.keys)},
-	}
-	for _, tc := range cases {
-		firstStart, firstEnd := indexExtNormalizeWindow(tc[0], tc[1], len(fx.keys))
-		secondStart, secondEnd := indexExtNormalizeWindow(tc[2], tc[3], len(fx.keys))
-		first := fx.chunked.rangeByRanks(firstStart, firstEnd)
-		second := fx.chunked.rangeByRanks(secondStart, secondEnd)
-
-		gotBase := posting.BuildFromSorted(seedIDs)
-		got := mergeOverlayRangesInto(gotBase, fx.chunked, first, second)
-
-		wantBase := posting.BuildFromSorted(seedIDs)
-		want := wantBase.BuildMergedOwned(overlayUnionRanges(fx.chunked, first, overlayRange{}))
-		want = want.BuildMergedOwned(overlayUnionRanges(fx.chunked, second, overlayRange{}))
-
-		indexExtAssertSameSlice(t, got.ToArray(), want.ToArray())
-		got.Release()
-		want.Release()
-	}
-}
-
-func TestIndexExt_NumericBoundsMatchFlat(t *testing.T) {
-	fx := indexExtNumericFixture(t)
-	probes := []string{
-		fx.keys[0],
-		fx.keys[17],
-		fx.keys[149],
-		fx.keys[150],
-		fx.keys[len(fx.keys)-1],
-		keycodec.U64ByteString(uint64(0x10)<<56 | uint64(999)),
-		keycodec.U64ByteString(uint64(0x20)<<56 | uint64(0x4000)),
-		keycodec.U64ByteString(uint64(0xff)<<56 | uint64(999)),
-	}
-	for _, probe := range probes {
-		if got, want := fx.chunked.lowerBound(probe), fx.flat.lowerBound(probe); got != want {
-			t.Fatalf("lowerBound(%x): got=%d want=%d", []byte(probe), got, want)
-		}
-		if got, want := fx.chunked.upperBound(probe), fx.flat.upperBound(probe); got != want {
-			t.Fatalf("upperBound(%x): got=%d want=%d", []byte(probe), got, want)
-		}
-	}
-	for _, key := range []string{fx.keys[0], fx.keys[27], fx.keys[191], fx.keys[len(fx.keys)-1]} {
-		indexExtAssertSameSlice(
-			t,
-			indexExtPostingIDs(fx.chunked.lookupPostingRetained(key)),
-			indexExtPostingIDs(fx.flat.lookupPostingRetained(key)),
-		)
-	}
-}
-
-func TestIndexExt_NumericPrefixRangeEndMatchesFlat(t *testing.T) {
-	fx := indexExtNumericFixture(t)
-	cases := []struct {
-		prefix string
-		start  int
-	}{
-		{prefix: string([]byte{0x10}), start: 0},
-		{prefix: string([]byte{0x20}), start: fx.flat.lowerBound(string([]byte{0x20}))},
-		{prefix: string([]byte{0x20}), start: fx.flat.lowerBound(fx.keys[155])},
-		{prefix: string([]byte{0x20, 0x00}), start: fx.flat.lowerBound(fx.keys[150])},
-		{prefix: string([]byte{0x20, 0x80}), start: fx.flat.lowerBound(keycodec.U64ByteString(uint64(0x20)<<56 | uint64(0x8000)))},
-		{prefix: string([]byte{0x20, 0x80}), start: fx.flat.lowerBound(keycodec.U64ByteString(uint64(0xff) << 56))},
-		{prefix: string([]byte{0xff}), start: fx.flat.lowerBound(keycodec.U64ByteString(uint64(0xff) << 56))},
-	}
-	for _, tc := range cases {
-		if got, want := fx.chunked.prefixRangeEnd(tc.prefix, tc.start), fx.flat.prefixRangeEnd(tc.prefix, tc.start); got != want {
-			t.Fatalf("prefixRangeEnd(prefix=%x,start=%d): got=%d want=%d", []byte(tc.prefix), tc.start, got, want)
-		}
-	}
-}
-
-func TestIndexExt_NumericRangeForBoundsMatchesFlat(t *testing.T) {
-	fx := indexExtNumericFixture(t)
-	cases := []rangeBounds{
-		indexExtBoundCase(t, struct {
-			op  qx.Op
-			key string
-		}{op: qx.OpPREFIX, key: string([]byte{0x10})}),
-		indexExtBoundCase(t,
-			struct {
-				op  qx.Op
-				key string
-			}{op: qx.OpGTE, key: fx.keys[40]},
-			struct {
-				op  qx.Op
-				key string
-			}{op: qx.OpLT, key: fx.keys[155]},
-		),
-		indexExtBoundCase(t,
-			struct {
-				op  qx.Op
-				key string
-			}{op: qx.OpPREFIX, key: string([]byte{0x20})},
-			struct {
-				op  qx.Op
-				key string
-			}{op: qx.OpGT, key: fx.keys[150]},
-			struct {
-				op  qx.Op
-				key string
-			}{op: qx.OpLTE, key: fx.keys[320]},
-		),
-		indexExtBoundCase(t, struct {
-			op  qx.Op
-			key string
-		}{op: qx.OpEQ, key: fx.keys[len(fx.keys)-1]}),
-	}
-
-	for _, rb := range cases {
-		indexExtAssertRangeEquivalent(t, fx.flat, fx.chunked, fx.flat.rangeForBounds(rb), fx.chunked.rangeForBounds(rb), false)
-	}
-}
-
-func TestIndexExt_ChunkedRootPosForRankRoundTrip(t *testing.T) {
-	fx := indexExtStringFixture(t)
-	for rank := 0; rank <= len(fx.entries); rank++ {
-		pos := fx.root.posForRank(rank)
-		if rank == len(fx.entries) {
-			if !fx.root.isEndPos(pos) {
-				t.Fatalf("expected end pos for rank=%d, got=%+v", rank, pos)
-			}
-			continue
-		}
-		key, ok := fx.root.posKey(pos)
-		if !ok {
-			t.Fatalf("posKey(rank=%d) failed", rank)
-		}
-		if keycodec.Compare(key, fx.entries[rank].Key) != 0 {
-			t.Fatalf("rank=%d key mismatch", rank)
-		}
-		if got := fx.root.entryPrefixForChunk(pos.chunk) + pos.entry; got != rank {
-			t.Fatalf("rank=%d prefix+entry mismatch: got=%d", rank, got)
-		}
-	}
-}
-
-func TestIndexExt_ChunkedRootRangeRowsMatchesCursor(t *testing.T) {
-	fx := indexExtStringFixture(t)
-	for _, window := range indexExtRangeWindows(len(fx.keys)) {
-		start, end := indexExtNormalizeWindow(window[0], window[1], len(fx.keys))
-		br := fx.chunked.rangeByRanks(start, end)
-		got := fx.root.rangeRows(br.startPos, br.endPos)
-		_, want := overlayRangeStats(fx.flat, fx.flat.rangeByRanks(start, end))
-		if got != want {
-			t.Fatalf("rangeRows(%d,%d): got=%d want=%d", start, end, got, want)
-		}
-	}
-}
-
-func TestIndexExt_ChunkedRootTouchChunkIndexFromFindsTargetChunk(t *testing.T) {
-	fx := indexExtStringFixture(t)
-	for i := 0; i < len(fx.keys); i += 17 {
-		expectedChunk := fx.root.posForRank(i).chunk
-		for _, start := range []int{0, max(0, expectedChunk-1), expectedChunk} {
-			if got := fx.root.touchChunkIndexFrom(start, fx.entries[i].Key); got != expectedChunk {
-				t.Fatalf("touchChunkIndexFrom(start=%d,rank=%d): got=%d want=%d", start, i, got, expectedChunk)
-			}
-		}
-	}
-	if got := fx.root.touchChunkIndexFrom(0, keycodec.FromBytes([]byte{0xff, 0xff, 0xff})); got != fx.root.chunkCount-1 {
-		t.Fatalf("touchChunkIndexFrom(after-last): got=%d want=%d", got, fx.root.chunkCount-1)
-	}
-}
-
-func TestIndexExt_MultiPageStringDirectoryMatchesFlat(t *testing.T) {
-	fx := indexExtMultiPageStringFixture(t)
-
-	ranks := map[int]struct{}{
-		0:                {},
-		fx.root.keyCount: {},
-	}
-	addRank := func(rank int) {
-		if rank < 0 {
-			rank = 0
-		}
-		if rank > fx.root.keyCount {
-			rank = fx.root.keyCount
-		}
-		ranks[rank] = struct{}{}
-	}
-
-	for i := 0; i < len(fx.root.prefix); i++ {
-		prefix := fx.root.prefix[i]
-		addRank(prefix - 1)
-		addRank(prefix)
-	}
-	for chunk := 0; chunk <= fx.root.chunkCount; chunk++ {
-		rank := fx.root.entryPrefixForChunk(chunk)
-		addRank(rank - 1)
-		addRank(rank)
-	}
-
-	probes := make([]string, 0, len(ranks)*3+2)
-	probes = append(probes, "", "mp/zzzz")
-	for rank := range ranks {
-		if rank >= 0 && rank < len(fx.keys) {
-			key := fx.keys[rank]
-			probes = append(probes, key, key+"/tail")
-		}
-		if rank > 0 && rank <= len(fx.keys) {
-			probes = append(probes, fx.keys[rank-1]+"/tail")
-		}
-	}
-	sort.Strings(probes)
-	probes = slices.Compact(probes)
-
-	for _, probe := range probes {
-		if got, want := fx.chunked.lowerBound(probe), fx.flat.lowerBound(probe); got != want {
-			t.Fatalf("lowerBound(%q): got=%d want=%d", probe, got, want)
-		}
-		if got, want := fx.chunked.upperBound(probe), fx.flat.upperBound(probe); got != want {
-			t.Fatalf("upperBound(%q): got=%d want=%d", probe, got, want)
-		}
-	}
-
-	for rank := range ranks {
-		start, end := indexExtNormalizeWindow(rank-5, rank+5, len(fx.keys))
-		indexExtAssertRangeEquivalent(
-			t,
-			fx.flat,
-			fx.chunked,
-			fx.flat.rangeByRanks(start, end),
-			fx.chunked.rangeByRanks(start, end),
-			false,
-		)
-		indexExtAssertRangeEquivalent(
-			t,
-			fx.flat,
-			fx.chunked,
-			fx.flat.rangeByRanks(start, end),
-			fx.chunked.rangeByRanks(start, end),
-			true,
-		)
-	}
-}
-
-func TestIndexExt_ApplyFieldPostingDiffChunkedMultiPageBoundariesMatchFlat(t *testing.T) {
-	fx := indexExtMultiPageStringFixture(t)
-
-	boundaryRanks := make([]int, 0, 16)
-	addBoundary := func(rank int) {
-		if rank < 0 || rank >= len(fx.keys) {
-			return
-		}
-		boundaryRanks = append(boundaryRanks, rank)
-	}
-	addBoundary(0)
-	addBoundary(fieldIndexChunkTargetEntries - 1)
-	addBoundary(fieldIndexChunkTargetEntries)
-	for i := 0; i < len(fx.root.prefix); i++ {
-		prefix := fx.root.prefix[i]
-		addBoundary(prefix - 1)
-		addBoundary(prefix)
-	}
-	addBoundary(len(fx.keys) - 1)
-	slices.Sort(boundaryRanks)
-	boundaryRanks = slices.Compact(boundaryRanks)
-
-	ops := make([]indexExtDeltaOp, 0, len(boundaryRanks)+4)
-	for i, rank := range boundaryRanks {
-		key := fx.keys[rank]
-		switch i % 3 {
-		case 0:
-			ops = append(ops, indexExtDeltaOp{
-				key:    key,
-				remove: indexExtPostingIDs(fx.entries[rank].IDs),
-			})
-		case 1:
-			ops = append(ops, indexExtDeltaOp{
-				key:    key,
-				remove: indexExtPostingIDs(fx.entries[rank].IDs),
-				add:    []uint64{900_000 + uint64(i), 950_000 + uint64(i)},
-			})
-		default:
-			ops = append(ops, indexExtDeltaOp{
-				key: fmt.Sprintf("%s/x", key),
-				add: []uint64{990_000 + uint64(i)},
-			})
-		}
-	}
-	ops = append(ops,
-		indexExtDeltaOp{key: "mp/00-before", add: []uint64{1_100_001}},
-		indexExtDeltaOp{key: fx.keys[fx.root.prefix[1]-1] + "/after", add: []uint64{1_100_002}},
-		indexExtDeltaOp{key: fx.keys[fx.root.prefix[1]] + "/after", add: []uint64{1_100_003}},
-		indexExtDeltaOp{key: "mp/z-after", add: []uint64{1_100_004}},
-	)
-
-	wantFlat := applyFieldPostingDiffSorted(&fx.entries, indexExtDeltaKeys(ops, false))
-	if wantFlat == nil {
-		t.Fatalf("expected non-empty flat diff result")
-	}
-
-	got := applyFieldPostingDiffChunked(fx.root, indexExtDeltaKeys(ops, false))
-	if !got.isChunked() {
-		t.Fatalf("expected multi-page diff to remain chunked")
-	}
-	indexExtAssertStorageMatchesEntries(t, got, *wantFlat)
-}
-
-func TestIndexExt_ApplyFieldPostingDiffFlatMaybeChunkedPromotes(t *testing.T) {
-	allKeys := indexExtSortedStringKeys()
-	baseFix := indexExtNewOverlayFixture(t, allKeys[:260], false)
-	baseEntries := append([]index(nil), baseFix.entries...)
-	expected := indexExtExpectedMapFromEntries(baseFix.entries)
-
-	var ops []indexExtDeltaOp
-	for i, key := range allKeys[260:] {
-		ids := indexExtPostingIDs(indexExtPosting(uint64(100_000+i*16), i%7+1))
-		ops = append(ops, indexExtDeltaOp{key: key, add: ids})
-	}
-	indexExtApplyOpsExpected(expected, ops)
-
-	out := applyFieldPostingDiffFlatMaybeChunked(&baseEntries, indexExtDeltaKeys(ops, false))
-	if !out.isChunked() {
-		t.Fatalf("expected promotion to chunked storage")
-	}
-	indexExtAssertStorageMatchesExpected(t, out, expected)
-}
-
-func TestIndexExt_ApplyFieldPostingDiffChunkedDemotes(t *testing.T) {
-	baseFix := indexExtNewOverlayFixture(t, indexExtSortedStringKeys()[:396], false)
-	expected := indexExtExpectedMapFromEntries(baseFix.entries)
-
-	var ops []indexExtDeltaOp
-	for _, rank := range []int{0, 7, 14, 21, 28, 35, 120, 121, 122, 123, 191, 192, 193, 250, 251, 252, 320, 321, 322, 395} {
-		key := baseFix.keys[rank]
-		ops = append(ops, indexExtDeltaOp{key: key, remove: expected[key]})
-	}
-	indexExtApplyOpsExpected(expected, ops)
-
-	out := applyFieldPostingDiffChunked(baseFix.root, indexExtDeltaKeys(ops, false))
-	if out.isChunked() {
-		t.Fatalf("expected demotion to flat storage")
-	}
-	indexExtAssertStorageMatchesExpected(t, out, expected)
-}
-
-func TestIndexExt_ApplyFieldPostingDiffChunkedMixedAddRemovePreservesOrder(t *testing.T) {
-	baseFix := indexExtNewOverlayFixture(t, indexExtSortedStringKeys()[:396], false)
-	expected := indexExtExpectedMapFromEntries(baseFix.entries)
-
-	var ops []indexExtDeltaOp
-	replaceRanks := []int{10, 191, 192, 193, 381, 395}
-	for i, rank := range replaceRanks {
-		key := baseFix.keys[rank]
-		ops = append(ops, indexExtDeltaOp{
-			key:    key,
-			remove: expected[key],
-			add:    indexExtPostingIDs(indexExtPosting(uint64(200_000+i*32), 4+i%3)),
-		})
-	}
-	for _, rank := range []int{0, 1, 2, 180, 194, 195, 196, 300, 301, 302, 350, 351, 352, 353, 354, 355, 356, 357, 358, 359} {
-		key := baseFix.keys[rank]
-		ops = append(ops, indexExtDeltaOp{key: key, remove: expected[key]})
-	}
-	for i := 0; i < 25; i++ {
-		key := fmt.Sprintf("az/new/%03d", i)
-		ops = append(ops, indexExtDeltaOp{
-			key: key,
-			add: indexExtPostingIDs(indexExtPosting(uint64(300_000+i*16), 2+i%5)),
-		})
-	}
-	indexExtApplyOpsExpected(expected, ops)
-
-	out := applyFieldPostingDiffChunked(baseFix.root, indexExtDeltaKeys(ops, false))
-	if !out.isChunked() {
-		t.Fatalf("expected mixed diff to remain chunked")
-	}
-	indexExtAssertStorageMatchesExpected(t, out, expected)
-}
-
-func TestIndexExt_MergeInsertOnlyFieldStorageOwnedUnionsExistingKeysAndKeepsSorted(t *testing.T) {
-	baseFix := indexExtNewOverlayFixture(t, indexExtSortedStringKeys()[:390], false)
-	baseEntries := append([]index(nil), baseFix.entries...)
-	baseStorage := newRegularFieldIndexStorage(&baseEntries)
-	expected := indexExtExpectedMapFromEntries(baseFix.entries)
-
-	adds := insertPostingMapPool.Get()
-	var arena *insertPostingAccumArena
-	for i, rank := range []int{1, 189, 190, 191, 389} {
-		key := baseFix.keys[rank]
-		addIDs := indexExtPostingIDs(indexExtPosting(uint64(400_000+i*16), 3+i))
-		expected[key] = append(append([]uint64(nil), expected[key]...), addIDs...)
-		for j := len(addIDs) - 1; j >= 0; j-- {
-			adds = addInsertPostingAccum(adds, &arena, key, addIDs[j], 0)
-		}
-		adds = addInsertPostingAccum(adds, &arena, key, addIDs[0], 0)
-	}
-	for i := 0; i < 20; i++ {
-		key := fmt.Sprintf("bb/new/%03d", i)
-		addIDs := indexExtPostingIDs(indexExtPosting(uint64(410_000+i*16), 1+i%4))
-		expected[key] = addIDs
-		for j := len(addIDs) - 1; j >= 0; j-- {
-			adds = addInsertPostingAccum(adds, &arena, key, addIDs[j], 0)
-		}
-		adds = addInsertPostingAccum(adds, &arena, key, addIDs[len(addIDs)-1], 0)
-	}
-	for key := range expected {
-		slices.Sort(expected[key])
-	}
-
-	out := mergeInsertOnlyFieldStorageOwned(baseStorage, adds, arena, false, true)
-	releaseInsertPostingAccumArena(arena)
-	if !out.isChunked() {
-		t.Fatalf("expected chunked storage after insert-only merge")
-	}
-	indexExtAssertStorageMatchesExpected(t, out, expected)
-}
-
-func TestIndexExt_MergeInsertOnlyFieldStorageOwnedDedupsAccumulatorAdds(t *testing.T) {
-	adds := insertPostingMapPool.Get()
-	var arena *insertPostingAccumArena
-	for _, id := range []uint64{30, 10, 30, 20, 10} {
-		adds = addInsertPostingAccum(adds, &arena, "dup", id, 0)
-	}
-	for _, id := range []uint64{9, 7, 8} {
-		adds = addInsertPostingAccum(adds, &arena, "other", id, 0)
-	}
-
-	out := mergeInsertOnlyFieldStorageOwned(fieldIndexStorage{}, adds, arena, false, false)
-	releaseInsertPostingAccumArena(arena)
-	expected := map[string][]uint64{
-		"dup":   {10, 20, 30},
-		"other": {7, 8, 9},
-	}
-	indexExtAssertStorageMatchesExpected(t, out, expected)
-}
-
-func TestIndexExt_MergeInsertOnlyFixedFieldStorageOwnedDedupsAccumulatorAdds(t *testing.T) {
-	adds := fixedInsertPostingMapPool.Get()
-	var arena *insertPostingAccumArena
-	for _, id := range []uint64{4, 2, 4, 9} {
-		adds = addFixedInsertPostingAccum(adds, &arena, 7, id, 0)
-	}
-	for _, id := range []uint64{18, 11, 18, 12} {
-		adds = addFixedInsertPostingAccum(adds, &arena, 3, id, 0)
-	}
-
-	out := mergeInsertOnlyFixedFieldStorageOwned(fieldIndexStorage{}, adds, arena, false)
-	releaseInsertPostingAccumArena(arena)
-	expected := map[string][]uint64{
-		keycodec.U64ByteString(3): {11, 12, 18},
-		keycodec.U64ByteString(7): {2, 4, 9},
-	}
-	indexExtAssertStorageMatchesExpected(t, out, expected)
-}
-
-func TestIndexExt_StorageFromPostingMapOwnedDropsEmptyPostings(t *testing.T) {
-	adds := postingMapPool.Get()
-	adds["drop/1"] = posting.List{}
-	adds["keep/1"] = indexExtPostingFromIDs([]uint64{10})
-	adds["keep/2"] = indexExtPostingFromIDs([]uint64{20, 21, 22})
-	adds["drop/2"] = posting.List{}
-
-	out := newRegularFieldIndexStorageFromPostingMapOwned(adds, false)
-	expected := map[string][]uint64{
-		"keep/1": {10},
-		"keep/2": {20, 21, 22},
-	}
-	indexExtAssertStorageMatchesExpected(t, out, expected)
-}
-
-func TestIndexExt_DBFieldOverlayPromotesOnDistinctGrowth(t *testing.T) {
+func TestIndexExt_DBQueryAfterDistinctGrowthMatchesExpected(t *testing.T) {
 	db, _ := openTempDBUint64(t)
 
 	indexExtBatchSetGenerated(t, db, 1, 300, func(i int) *Rec {
 		return &Rec{Name: fmt.Sprintf("prom/%03d", i), Age: i}
 	})
-	if db.engine.currentQueryViewForTests().fieldOverlay("name").chunked != nil {
-		t.Fatalf("expected flat name overlay below threshold")
-	}
+	indexExtAssertQueryKeysExpected(t, db, qx.Query(qx.GTE("age", 0)).Sort("age", qx.ASC))
 
 	indexExtBatchSetGenerated(t, db, 301, 420, func(i int) *Rec {
 		return &Rec{Name: fmt.Sprintf("prom/%03d", i), Age: i}
 	})
-	if db.engine.currentQueryViewForTests().fieldOverlay("name").chunked == nil {
-		t.Fatalf("expected chunked name overlay above threshold")
-	}
-
-	indexExtAssertQueryKeysExpected(t, db, qx.Query(qx.PREFIX("name", "prom/")).Sort("name", qx.ASC))
+	indexExtAssertQueryKeysExpected(t, db, qx.Query(qx.GTE("age", 0)).Sort("age", qx.ASC))
 }
 
-func TestIndexExt_DBFieldOverlayDemotesOnDistinctCollapse(t *testing.T) {
+func TestIndexExt_DBQueryAfterDistinctCollapseMatchesExpected(t *testing.T) {
 	db, _ := openTempDBUint64(t)
 
 	indexExtBatchSetGenerated(t, db, 1, 420, func(i int) *Rec {
 		return &Rec{Name: fmt.Sprintf("dem/%03d", i), Age: i}
 	})
-	if db.engine.currentQueryViewForTests().fieldOverlay("name").chunked == nil {
-		t.Fatalf("expected chunked name overlay before deletes")
-	}
+	indexExtAssertQueryKeysExpected(t, db, qx.Query(qx.GTE("age", 0)).Sort("age", qx.ASC))
 
 	for i := 1; i <= 50; i++ {
 		if err := db.Delete(uint64(i)); err != nil {
 			t.Fatalf("Delete(%d): %v", i, err)
 		}
 	}
-	if db.engine.currentQueryViewForTests().fieldOverlay("name").chunked != nil {
-		t.Fatalf("expected flat name overlay after deletes")
-	}
-
-	indexExtAssertQueryKeysExpected(t, db, qx.Query(qx.PREFIX("name", "dem/")).Sort("name", qx.ASC))
+	indexExtAssertQueryKeysExpected(t, db, qx.Query(qx.GTE("age", 0)).Sort("age", qx.ASC))
 }
 
 func TestIndexExt_DBPrefixQueryAfterSetPatchDeleteMatchesExpected(t *testing.T) {
@@ -3912,9 +2786,6 @@ func TestIndexExt_DBNilPointerTransitionsPreserveIndexes(t *testing.T) {
 			t.Fatalf("Patch(%d value->nil): %v", id, err)
 		}
 	}
-	if db.engine.currentQueryViewForTests().fieldOverlay("opt").chunked == nil {
-		t.Fatalf("expected opt overlay to remain chunked")
-	}
 
 	indexExtAssertQueryKeysExpected(t, db, qx.Query(qx.PREFIX("opt", "opt-hot-")).Sort("opt", qx.ASC))
 	indexExtAssertQueryKeysExpected(t, db, qx.Query(qx.EQ("opt", nil)))
@@ -3953,23 +2824,20 @@ func TestIndexExt_DBSliceReplaceRemovesStaleTermsAndLenBuckets(t *testing.T) {
 
 	indexExtAssertQueryKeysExpected(t, db, qx.Query(qx.HASANY("tags", []string{"hot"})))
 	indexExtAssertQueryKeysExpected(t, db, qx.Query(qx.HASALL("tags", []string{"shared", "hot"})))
+	indexExtAssertQueryKeysExpected(t, db, qx.Query(qx.HASANY("tags", []string{"tag-005"})))
 
 	var wantZero []uint64
 	for i := 1; i <= 30; i++ {
 		wantZero = append(wantZero, uint64(i))
 	}
-	indexExtAssertSameSlice(
-		t,
-		indexExtPostingIDs(db.engine.currentQueryViewForTests().lenFieldOverlay("tags").lookupPostingRetained(keycodec.U64ByteString(0))),
-		wantZero,
-	)
-
-	if db.engine.currentQueryViewForTests().fieldOverlay("tags").lookupPostingRetained("tag-005").Contains(5) {
-		t.Fatalf("stale tag posting retained id=5 after slice replacement")
+	gotZero, err := db.QueryKeys(qx.Query(qx.EQ("tags", []string{})))
+	if err != nil {
+		t.Fatalf("QueryKeys(empty tags): %v", err)
 	}
+	assertSameSlice(t, gotZero, wantZero)
 }
 
-func TestIndexExt_SnapshotOverlayStableDuringConcurrentWrites(t *testing.T) {
+func TestIndexExt_SnapshotQueryStableDuringConcurrentWrites(t *testing.T) {
 	db, _ := openTempDBUint64(t)
 
 	indexExtBatchSetGenerated(t, db, 1, 420, func(i int) *Rec {
@@ -3989,17 +2857,19 @@ func TestIndexExt_SnapshotOverlayStableDuringConcurrentWrites(t *testing.T) {
 	}
 	defer db.engine.snapshot.unpinRef(snap.seq, pinnedRef)
 	snap = pinnedSnap
-	storage, ok := snap.fieldIndexStorage("name")
-	if !ok {
-		t.Fatalf("expected pinned snapshot storage for name")
+
+	prepared, viewQ, err := prepareTestQuery(db.engine, qx.Query(qx.PREFIX("name", "aa/")).Sort("name", qx.ASC))
+	if err != nil {
+		t.Fatalf("prepareTestQuery: %v", err)
 	}
-	oldOV := newFieldOverlayStorage(storage)
-	br := oldOV.rangeForBounds(indexExtBoundCase(t, struct {
-		op  qx.Op
-		key string
-	}{op: qx.OpPREFIX, key: "aa/"}))
-	wantKeys, wantCards := indexExtCollectCursor(oldOV, br, false)
-	wantBuckets, wantRows := overlayRangeStats(oldOV, br)
+	defer prepared.Release()
+
+	view := db.engine.makeQueryView(snap)
+	wantKeys, err := view.execQuery(&viewQ, false, false)
+	db.engine.releaseQueryView(view)
+	if err != nil {
+		t.Fatalf("pinned snapshot query: %v", err)
+	}
 
 	var failed atomic.Pointer[string]
 	setFailed := func(msg string) {
@@ -4016,14 +2886,15 @@ func TestIndexExt_SnapshotOverlayStableDuringConcurrentWrites(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for i := 0; i < 200; i++ {
-				gotKeys, gotCards := indexExtCollectCursor(oldOV, br, false)
-				if !slices.Equal(gotKeys, wantKeys) || !slices.Equal(gotCards, wantCards) {
-					setFailed("old snapshot cursor changed under concurrent writes")
+				view := db.engine.makeQueryView(snap)
+				gotKeys, err := view.execQuery(&viewQ, false, false)
+				db.engine.releaseQueryView(view)
+				if err != nil {
+					setFailed(fmt.Sprintf("pinned snapshot query: %v", err))
 					return
 				}
-				gotBuckets, gotRows := overlayRangeStats(oldOV, br)
-				if gotBuckets != wantBuckets || gotRows != wantRows {
-					setFailed("old snapshot stats changed under concurrent writes")
+				if !slices.Equal(gotKeys, wantKeys) {
+					setFailed("old snapshot query changed under concurrent writes")
 					return
 				}
 			}
@@ -4060,10 +2931,6 @@ func TestIndexExt_DuplicateIDBatchPatchNetDiffKeepsIndexesConsistent(t *testing.
 			Opt:  &opt,
 		}
 	})
-
-	if db.engine.currentQueryViewForTests().fieldOverlay("name").chunked == nil || db.engine.currentQueryViewForTests().fieldOverlay("tags").chunked == nil {
-		t.Fatalf("expected chunked overlays before duplicate-id patch")
-	}
 
 	var step atomic.Int32
 	err := db.BatchPatch(
@@ -4111,27 +2978,22 @@ func TestIndexExt_DuplicateIDBatchPatchNetDiffKeepsIndexesConsistent(t *testing.
 			t.Fatalf("%s unexpected final value: %#v", stage, got)
 		}
 
-		indexExtAssertOverlayMembership(t, db.engine.currentQueryViewForTests().fieldOverlay("name"), "seed/077", 77, false)
-		indexExtAssertOverlayMembership(t, db.engine.currentQueryViewForTests().fieldOverlay("name"), "dup/first", 77, false)
-		indexExtAssertOverlayMembership(t, db.engine.currentQueryViewForTests().fieldOverlay("name"), "dup/second", 77, false)
-		indexExtAssertOverlayMembership(t, db.engine.currentQueryViewForTests().fieldOverlay("name"), "dup/final", 77, true)
-
-		indexExtAssertOverlayMembership(t, db.engine.currentQueryViewForTests().fieldOverlay("tags"), "seed-tag/077", 77, false)
-		indexExtAssertOverlayMembership(t, db.engine.currentQueryViewForTests().fieldOverlay("tags"), "first", 77, false)
-		indexExtAssertOverlayMembership(t, db.engine.currentQueryViewForTests().fieldOverlay("tags"), "final", 77, true)
-		indexExtAssertOverlayMembership(t, db.engine.currentQueryViewForTests().fieldOverlay("tags"), "shared", 77, true)
-
-		indexExtAssertOverlayMembership(t, db.engine.currentQueryViewForTests().fieldOverlay("opt"), "seed-opt/077", 77, false)
-		indexExtAssertOverlayMembership(t, db.engine.currentQueryViewForTests().fieldOverlay("opt"), "dup-live", 77, false)
-		indexExtAssertOverlayMembership(t, db.engine.currentQueryViewForTests().nilFieldOverlay("opt"), nilIndexEntryKey, 77, true)
-
-		indexExtAssertOverlayMembership(t, db.engine.currentQueryViewForTests().lenFieldOverlay("tags"), keycodec.U64ByteString(0), 77, false)
-		indexExtAssertOverlayMembership(t, db.engine.currentQueryViewForTests().lenFieldOverlay("tags"), keycodec.U64ByteString(1), 77, false)
-		indexExtAssertOverlayMembership(t, db.engine.currentQueryViewForTests().lenFieldOverlay("tags"), keycodec.U64ByteString(2), 77, true)
-
 		indexExtAssertQueryKeysExpected(t, db, qx.Query(qx.EQ("name", "dup/final")))
+		indexExtAssertQueryKeysExpected(t, db, qx.Query(qx.EQ("name", "seed/077")))
+		indexExtAssertQueryKeysExpected(t, db, qx.Query(qx.EQ("name", "dup/first")))
+		indexExtAssertQueryKeysExpected(t, db, qx.Query(qx.EQ("name", "dup/second")))
 		indexExtAssertQueryKeysExpected(t, db, qx.Query(qx.HASANY("tags", []string{"final"})))
+		indexExtAssertQueryKeysExpected(t, db, qx.Query(qx.HASANY("tags", []string{"seed-tag/077"})))
+		indexExtAssertQueryKeysExpected(t, db, qx.Query(qx.HASANY("tags", []string{"first"})))
 		indexExtAssertQueryKeysExpected(t, db, qx.Query(qx.EQ("opt", nil)))
+		indexExtAssertQueryKeysExpected(t, db, qx.Query(qx.EQ("opt", "seed-opt/077")))
+		indexExtAssertQueryKeysExpected(t, db, qx.Query(qx.EQ("opt", "dup-live")))
+
+		gotEmptyTags, err := db.QueryKeys(qx.Query(qx.EQ("tags", []string{})))
+		if err != nil {
+			t.Fatalf("%s QueryKeys(empty tags): %v", stage, err)
+		}
+		assertSameSlice(t, gotEmptyTags, nil)
 	}
 
 	assertState("incremental")
@@ -4143,7 +3005,7 @@ func TestIndexExt_DuplicateIDBatchPatchNetDiffKeepsIndexesConsistent(t *testing.
 }
 
 func TestIndexExt_DBFloatSignedZeroBetweenBoundsMatchesExpected(t *testing.T) {
-	db := indexExtFloatSignedZeroChunkedDB(t)
+	db := indexExtFloatSignedZeroDB(t)
 
 	q := qx.Query(
 		qx.GTE("score", 0.0),
@@ -4155,7 +3017,7 @@ func TestIndexExt_DBFloatSignedZeroBetweenBoundsMatchesExpected(t *testing.T) {
 }
 
 func TestIndexExt_DBFloatSignedZeroOrderAscMatchesExpected(t *testing.T) {
-	db := indexExtFloatSignedZeroChunkedDB(t)
+	db := indexExtFloatSignedZeroDB(t)
 
 	q := qx.Query(
 		qx.GTE("score", -1.0),
@@ -4164,18 +3026,8 @@ func TestIndexExt_DBFloatSignedZeroOrderAscMatchesExpected(t *testing.T) {
 	indexExtAssertQueryKeysExpected(t, db, q)
 }
 
-func TestIndexExt_DBFloatSignedZeroLookupMatchesNumericEquality(t *testing.T) {
-	db := indexExtFloatSignedZeroChunkedDB(t)
-
-	indexExtAssertSameSlice(
-		t,
-		indexExtPostingIDs(db.engine.currentQueryViewForTests().fieldOverlay("score").lookupPostingRetained(keycodec.Float64ByteString(0.0))),
-		[]uint64{1, 2},
-	)
-}
-
 func TestIndexExt_DBFloatSignedZeroEqualityMatchesExpected(t *testing.T) {
-	db := indexExtFloatSignedZeroChunkedDB(t)
+	db := indexExtFloatSignedZeroDB(t)
 
 	q := qx.Query(qx.EQ("score", 0.0))
 	indexExtAssertQueryKeysExpected(t, db, q)
@@ -4183,7 +3035,7 @@ func TestIndexExt_DBFloatSignedZeroEqualityMatchesExpected(t *testing.T) {
 }
 
 func TestIndexExt_DBFloatSignedZeroINMatchesExpected(t *testing.T) {
-	db := indexExtFloatSignedZeroChunkedDB(t)
+	db := indexExtFloatSignedZeroDB(t)
 
 	q := qx.Query(qx.IN("score", []float64{0.0}))
 	indexExtAssertQueryKeysExpected(t, db, q)
@@ -4191,7 +3043,7 @@ func TestIndexExt_DBFloatSignedZeroINMatchesExpected(t *testing.T) {
 }
 
 func TestIndexExt_DBFloatNegativeZeroEqualityMatchesExpected(t *testing.T) {
-	db := indexExtFloatSignedZeroChunkedDB(t)
+	db := indexExtFloatSignedZeroDB(t)
 
 	q := qx.Query(qx.EQ("score", math.Copysign(0, -1)))
 	indexExtAssertQueryKeysExpected(t, db, q)
@@ -4199,35 +3051,35 @@ func TestIndexExt_DBFloatNegativeZeroEqualityMatchesExpected(t *testing.T) {
 }
 
 func TestIndexExt_DBFloatSignedZeroNotEqualCountMatchesExpected(t *testing.T) {
-	db := indexExtFloatSignedZeroChunkedDB(t)
+	db := indexExtFloatSignedZeroDB(t)
 
 	q := qx.Query(qx.NOT(qx.EQ("score", 0.0)))
 	indexExtAssertCountExpected(t, db, q)
 }
 
 func TestIndexExt_DBFloatNaNEqualityMatchesExpected(t *testing.T) {
-	db := indexExtFloatNaNChunkedDB(t)
+	db := indexExtFloatNaNDB(t)
 
 	q := qx.Query(qx.EQ("score", math.NaN()))
 	indexExtAssertQueryKeysExpected(t, db, q)
 }
 
 func TestIndexExt_DBFloatNaNCountMatchesExpected(t *testing.T) {
-	db := indexExtFloatNaNChunkedDB(t)
+	db := indexExtFloatNaNDB(t)
 
 	q := qx.Query(qx.EQ("score", math.NaN()))
 	indexExtAssertCountExpected(t, db, q)
 }
 
 func TestIndexExt_DBFloatNaNLessEqualMatchesExpected(t *testing.T) {
-	db := indexExtFloatNaNChunkedDB(t)
+	db := indexExtFloatNaNDB(t)
 
 	q := qx.Query(qx.LTE("score", math.NaN())).Sort("score", qx.ASC).Limit(16)
 	indexExtAssertQueryKeysExpected(t, db, q)
 }
 
 func TestIndexExt_DBFloatNaNGreaterEqualMatchesExpected(t *testing.T) {
-	db := indexExtFloatNaNChunkedDB(t)
+	db := indexExtFloatNaNDB(t)
 
 	q := qx.Query(qx.GTE("score", math.NaN())).Sort("score", qx.ASC).Limit(16)
 	indexExtAssertQueryKeysExpected(t, db, q)
@@ -4235,14 +3087,14 @@ func TestIndexExt_DBFloatNaNGreaterEqualMatchesExpected(t *testing.T) {
 }
 
 func TestIndexExt_DBFloatNaNNotEqualCountMatchesExpected(t *testing.T) {
-	db := indexExtFloatNaNChunkedDB(t)
+	db := indexExtFloatNaNDB(t)
 
 	q := qx.Query(qx.NOT(qx.EQ("score", math.NaN())))
 	indexExtAssertCountExpected(t, db, q)
 }
 
 func TestIndexExt_DBFloatNaNINMatchesExpected(t *testing.T) {
-	db := indexExtFloatNaNChunkedDB(t)
+	db := indexExtFloatNaNDB(t)
 
 	q := qx.Query(qx.IN("score", []float64{math.NaN(), 1.0}))
 	indexExtAssertQueryKeysExpected(t, db, q)
@@ -4250,7 +3102,7 @@ func TestIndexExt_DBFloatNaNINMatchesExpected(t *testing.T) {
 }
 
 func TestIndexExt_DBIntFieldFloatEqualityMatchesExpected(t *testing.T) {
-	db := indexExtNumericCoercionChunkedDB(t)
+	db := indexExtNumericCoercionDB(t)
 
 	q := qx.Query(qx.EQ("age", 42.0))
 	indexExtAssertQueryKeysExpected(t, db, q)
@@ -4258,7 +3110,7 @@ func TestIndexExt_DBIntFieldFloatEqualityMatchesExpected(t *testing.T) {
 }
 
 func TestIndexExt_DBIntFieldFloatRangeMatchesExpected(t *testing.T) {
-	db := indexExtNumericCoercionChunkedDB(t)
+	db := indexExtNumericCoercionDB(t)
 
 	q := qx.Query(qx.GTE("age", 200.0), qx.LT("age", 205.0)).Sort("age", qx.ASC)
 	indexExtAssertQueryKeysExpected(t, db, q)
@@ -4266,7 +3118,7 @@ func TestIndexExt_DBIntFieldFloatRangeMatchesExpected(t *testing.T) {
 }
 
 func TestIndexExt_DBFloatFieldIntEqualityMatchesExpected(t *testing.T) {
-	db := indexExtNumericCoercionChunkedDB(t)
+	db := indexExtNumericCoercionDB(t)
 
 	q := qx.Query(qx.EQ("score", 42))
 	indexExtAssertQueryKeysExpected(t, db, q)
@@ -4274,7 +3126,7 @@ func TestIndexExt_DBFloatFieldIntEqualityMatchesExpected(t *testing.T) {
 }
 
 func TestIndexExt_DBFloatFieldIntRangeMatchesExpected(t *testing.T) {
-	db := indexExtNumericCoercionChunkedDB(t)
+	db := indexExtNumericCoercionDB(t)
 
 	q := qx.Query(qx.GTE("score", 200), qx.LT("score", 205)).Sort("score", qx.ASC)
 	indexExtAssertQueryKeysExpected(t, db, q)
@@ -4282,7 +3134,7 @@ func TestIndexExt_DBFloatFieldIntRangeMatchesExpected(t *testing.T) {
 }
 
 func TestIndexExt_DBIntFieldUintEqualityMatchesExpected(t *testing.T) {
-	db := indexExtNumericCoercionChunkedDB(t)
+	db := indexExtNumericCoercionDB(t)
 
 	q := qx.Query(qx.EQ("age", uint64(42)))
 	indexExtAssertQueryKeysExpected(t, db, q)
@@ -4290,7 +3142,7 @@ func TestIndexExt_DBIntFieldUintEqualityMatchesExpected(t *testing.T) {
 }
 
 func TestIndexExt_DBIntFieldUintRangeMatchesExpected(t *testing.T) {
-	db := indexExtNumericCoercionChunkedDB(t)
+	db := indexExtNumericCoercionDB(t)
 
 	q := qx.Query(qx.GTE("age", uint64(200)), qx.LT("age", uint64(205))).Sort("age", qx.ASC)
 	indexExtAssertQueryKeysExpected(t, db, q)
@@ -4298,7 +3150,7 @@ func TestIndexExt_DBIntFieldUintRangeMatchesExpected(t *testing.T) {
 }
 
 func TestIndexExt_DBIntFieldBinaryStringEqualityMatchesExpected(t *testing.T) {
-	db := indexExtNumericCoercionChunkedDB(t)
+	db := indexExtNumericCoercionDB(t)
 
 	q := qx.Query(qx.EQ("age", keycodec.Int64ByteString(42)))
 	indexExtAssertQueryKeysExpected(t, db, q)
@@ -4306,7 +3158,7 @@ func TestIndexExt_DBIntFieldBinaryStringEqualityMatchesExpected(t *testing.T) {
 }
 
 func TestIndexExt_DBFloatFieldBinaryStringEqualityMatchesExpected(t *testing.T) {
-	db := indexExtNumericCoercionChunkedDB(t)
+	db := indexExtNumericCoercionDB(t)
 
 	q := qx.Query(qx.EQ("score", keycodec.Float64ByteString(42.0)))
 	indexExtAssertQueryKeysExpected(t, db, q)
@@ -4317,77 +3169,4 @@ func TestIndexExt_DBFloatFieldBinaryStringEqualityMatchesExpected(t *testing.T) 
 
 func postingConsumerExpected(ids posting.List) []uint64 {
 	return ids.ToArray()
-}
-
-func TestFieldIndexChunkPostingAtBorrowedDetachUnderConcurrency(t *testing.T) {
-	base := snapshotExtPosting()
-	for i := uint64(1); i <= 48; i++ {
-		base = base.BuildAdded(i * 3)
-	}
-
-	chunk := &fieldIndexChunk{posts: []posting.List{base}}
-	defer posting.ReleaseAll(chunk.posts)
-	want := postingConsumerExpected(chunk.posts[0])
-
-	remove := snapshotExtPosting(3, 6, 9, 12)
-	add := snapshotExtPosting(1<<32|7, 1<<32|9, 2<<32|11)
-	defer remove.Release()
-	defer add.Release()
-
-	var failed atomic.Pointer[string]
-	setFailed := func(msg string) {
-		if failed.Load() != nil {
-			return
-		}
-		copyMsg := msg
-		failed.CompareAndSwap(nil, &copyMsg)
-	}
-
-	start := make(chan struct{})
-	var wg sync.WaitGroup
-
-	for g := 0; g < 6; g++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			<-start
-			for i := 0; i < 1000; i++ {
-				ids := chunk.postingAt(0)
-				if ids.Cardinality() != uint64(len(want)) {
-					setFailed(fmt.Sprintf("cardinality mismatch: got=%d want=%d", ids.Cardinality(), len(want)))
-					return
-				}
-				if !slices.Equal(ids.ToArray(), want) {
-					setFailed(fmt.Sprintf("reader view mismatch: got=%v want=%v", ids.ToArray(), want))
-					return
-				}
-			}
-		}()
-	}
-
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		<-start
-		for i := 0; i < 300; i++ {
-			ids := chunk.postingAt(0)
-			ids = ids.BuildAndNot(remove)
-			ids = ids.BuildOr(add)
-			ids = ids.BuildAdded(5<<32 | uint64(i))
-			ids = ids.BuildOptimized()
-			if chunk.posts[0].Contains(5<<32 | uint64(i)) {
-				setFailed("mutated borrowed chunk view changed source posting")
-				return
-			}
-			ids.Release()
-		}
-	}()
-
-	close(start)
-	wg.Wait()
-	if msg := failed.Load(); msg != nil {
-		t.Fatal(*msg)
-	}
-
-	assertPostingConsumerSet(t, chunk.posts[0], want)
 }

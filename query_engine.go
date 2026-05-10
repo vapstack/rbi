@@ -1,6 +1,7 @@
 package rbi
 
 import (
+	"github.com/vapstack/rbi/internal/indexdata"
 	"math"
 	"time"
 
@@ -19,11 +20,11 @@ type queryEngine struct {
 	uniqueFieldAccessors           []indexedFieldAccessor
 	measureFieldAccess             []measureFieldAccessor
 	measureFieldMap                measureFieldMap
-	index                          *pooled.Slice[fieldIndexStorage]
-	nilIndex                       *pooled.Slice[fieldIndexStorage]
-	lenIndex                       *pooled.Slice[fieldIndexStorage]
+	index                          []indexdata.FieldStorage
+	nilIndex                       []indexdata.FieldStorage
+	lenIndex                       []indexdata.FieldStorage
 	lenZeroComplement              []bool
-	measure                        *pooled.Slice[measureFieldStorage]
+	measure                        []indexdata.MeasureStorage
 	universe                       posting.List
 	hasUnique                      bool
 	lenIndexLoaded                 bool
@@ -88,11 +89,11 @@ func (qe *queryEngine) publishSnapshotNoLock(seq uint64, strmap *strMapSnapshot)
 	prev := qe.snapshot.current.Load()
 	snap := qe.buildPublishedSnapshotNoLock(seq, strmap)
 	if prev != nil {
-		snap.index = cloneFieldIndexStorageSlots(qe.index, len(qe.indexedFieldAccess))
-		snap.nilIndex = cloneFieldIndexStorageSlots(qe.nilIndex, len(qe.indexedFieldAccess))
-		snap.lenIndex = cloneFieldIndexStorageSlots(qe.lenIndex, len(qe.indexedFieldAccess))
+		snap.index = indexdata.CloneFieldStorageSlots(qe.index, len(qe.indexedFieldAccess))
+		snap.nilIndex = indexdata.CloneFieldStorageSlots(qe.nilIndex, len(qe.indexedFieldAccess))
+		snap.lenIndex = indexdata.CloneFieldStorageSlots(qe.lenIndex, len(qe.indexedFieldAccess))
 		snap.lenZeroComplement = cloneFieldIndexBoolSlots(qe.lenZeroComplement, len(qe.indexedFieldAccess))
-		snap.measure = cloneMeasureFieldStorageSlots(qe.measure, len(qe.measureFieldAccess))
+		snap.measure = indexdata.CloneMeasureStorageSlots(qe.measure, len(qe.measureFieldAccess))
 	}
 	snap.retainSharedOwnedStorageFrom(prev)
 	qe.finishSnapshotPublishNoLock(snap)

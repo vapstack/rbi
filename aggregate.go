@@ -3,14 +3,13 @@ package rbi
 import (
 	"fmt"
 	"math"
-	"math/bits"
 	"reflect"
 	"sort"
 
 	"github.com/vapstack/qx"
+	"github.com/vapstack/rbi/internal/indexdata"
 	"github.com/vapstack/rbi/internal/keycodec"
 	"github.com/vapstack/rbi/internal/pooled"
-	"github.com/vapstack/rbi/internal/pools"
 	"github.com/vapstack/rbi/internal/posting"
 	"github.com/vapstack/rbi/internal/qir"
 )
@@ -767,9 +766,9 @@ func (qv *queryView) aggregateOrdinaryMetricWork(q *aggregateQuery) (uint64, uin
 		if metric.rowCount || hasPriorOrdinaryAggregateMetric(q.metrics, i) {
 			continue
 		}
-		ov := newFieldOverlayStorage(qv.snap.index.Get(metric.field.ordinary.ordinal))
-		fieldRows := aggregateOverlayRows(ov)
-		keys += uint64(ov.keyCount())
+		ov := indexdata.NewFieldOverlayStorage(qv.snap.index[metric.field.ordinary.ordinal])
+		fieldRows := ov.Rows()
+		keys += uint64(ov.KeyCount())
 		rows += fieldRows
 		if minRows == 0 || fieldRows < minRows {
 			minRows = fieldRows
@@ -782,8 +781,8 @@ func (qv *queryView) aggregateGroupCountUpperBound(q *aggregateQuery, filterCard
 	groups := uint64(1)
 	for i := range q.groups {
 		acc := q.groups[i].ordinary
-		distinct := uint64(newFieldOverlayStorage(qv.snap.index.Get(acc.ordinal)).keyCount())
-		if newFieldOverlayStorage(qv.snap.nilIndex.Get(acc.ordinal)).keyCount() > 0 {
+		distinct := uint64(indexdata.NewFieldOverlayStorage(qv.snap.index[acc.ordinal]).KeyCount())
+		if indexdata.NewFieldOverlayStorage(qv.snap.nilIndex[acc.ordinal]).KeyCount() > 0 {
 			distinct++
 		}
 		if distinct == 0 {
@@ -800,20 +799,6 @@ func (qv *queryView) aggregateGroupCountUpperBound(q *aggregateQuery, filterCard
 	return groups
 }
 
-func aggregateOverlayRows(ov fieldOverlay) uint64 {
-	if ov.chunked != nil {
-		if len(ov.chunked.rowPrefix) > 0 {
-			return ov.chunked.rowPrefix[len(ov.chunked.rowPrefix)-1]
-		}
-		return ov.chunked.chunkRowsRange(0, ov.chunked.chunkCount)
-	}
-	var rows uint64
-	for i := range ov.base {
-		rows += ov.base[i].IDs.Cardinality()
-	}
-	return rows
-}
-
 func aggregateMulGreater(a uint64, b uint64, limit uint64) bool {
 	return b != 0 && a > limit/b
 }
@@ -824,7 +809,7 @@ func (qv *queryView) executeGroupedOrdinaryByID(q *aggregateQuery, ids posting.L
 	states := aggregateMetricStateSlicePool.Get()
 	maxID, _ := ids.Maximum()
 	groupByIDLen := int(maxID) + 1
-	groupByID := pools.GetUint32Slice(groupByIDLen)[:groupByIDLen]
+	groupByID := pooled.GetUint32Slice(groupByIDLen)[:groupByIDLen]
 	clear(groupByID)
 
 	groupValues := make([]Value, len(q.groups))
@@ -832,7 +817,7 @@ func (qv *queryView) executeGroupedOrdinaryByID(q *aggregateQuery, ids posting.L
 	if err == nil {
 		err = qv.foldGroupedOrdinaryByID(q, rows, states, groupByID)
 	}
-	pools.PutUint32Slice(groupByID)
+	pooled.PutUint32Slice(groupByID)
 	if err != nil {
 		aggregateMetricStateSlicePool.Put(states)
 		return Result{}, err
@@ -886,10 +871,10 @@ func (qv *queryView) buildGroupedOrdinaryIDMap(
 	}
 
 	acc := q.groups[level].ordinary
-	ov := newFieldOverlayStorage(qv.snap.index.Get(acc.ordinal))
-	cur := ov.newCursor(ov.rangeByRanks(0, ov.keyCount()), false)
+	ov := indexdata.NewFieldOverlayStorage(qv.snap.index[acc.ordinal])
+	cur := ov.NewCursor(ov.RangeByRanks(0, ov.KeyCount()), false)
 	for {
-		key, bucketIDs, ok := cur.next()
+		key, bucketIDs, ok := cur.Next()
 		if !ok {
 			break
 		}
@@ -905,7 +890,7 @@ func (qv *queryView) buildGroupedOrdinaryIDMap(
 		}
 		next.Release()
 	}
-	nilIDs := newFieldOverlayStorage(qv.snap.nilIndex.Get(acc.ordinal)).lookupPostingRetained(nilIndexEntryKey)
+	nilIDs := indexdata.NewFieldOverlayStorage(qv.snap.nilIndex[acc.ordinal]).LookupPostingRetained(nilIndexEntryKey)
 	if !nilIDs.IsEmpty() {
 		next := current.Borrow().BuildAnd(nilIDs)
 		if !next.IsEmpty() {
@@ -962,16 +947,16 @@ func (qv *queryView) foldGroupedOrdinaryFieldByID(
 		return nil
 	}
 
-	counts := pools.GetUint64Slice(len(rows))[:len(rows)]
+	counts := pooled.GetUint64Slice(len(rows))[:len(rows)]
 	clear(counts)
-	touched := pools.GetIntSlice(len(rows))
+	touched := pooled.GetIntSlice(len(rows))
 
 	acc := q.metrics[first].field.ordinary
-	ov := newFieldOverlayStorage(qv.snap.index.Get(acc.ordinal))
-	cur := ov.newCursor(ov.rangeByRanks(0, ov.keyCount()), false)
+	ov := indexdata.NewFieldOverlayStorage(qv.snap.index[acc.ordinal])
+	cur := ov.NewCursor(ov.RangeByRanks(0, ov.KeyCount()), false)
 	var err error
 	for {
-		key, bucketIDs, ok := cur.next()
+		key, bucketIDs, ok := cur.Next()
 		if !ok {
 			break
 		}
@@ -1002,8 +987,8 @@ func (qv *queryView) foldGroupedOrdinaryFieldByID(
 	}
 
 	touched = resetAggregateGroupBucketCounts(counts, touched)
-	pools.PutIntSlice(touched)
-	pools.PutUint64Slice(counts)
+	pooled.PutIntSlice(touched)
+	pooled.PutUint64Slice(counts)
 	return err
 }
 
@@ -1080,10 +1065,10 @@ func (qv *queryView) aggregateGroupRecursive(
 	}
 
 	acc := q.groups[level].ordinary
-	ov := newFieldOverlayStorage(qv.snap.index.Get(acc.ordinal))
-	cur := ov.newCursor(ov.rangeByRanks(0, ov.keyCount()), false)
+	ov := indexdata.NewFieldOverlayStorage(qv.snap.index[acc.ordinal])
+	cur := ov.NewCursor(ov.RangeByRanks(0, ov.KeyCount()), false)
 	for {
-		key, bucketIDs, ok := cur.next()
+		key, bucketIDs, ok := cur.Next()
 		if !ok {
 			break
 		}
@@ -1099,7 +1084,7 @@ func (qv *queryView) aggregateGroupRecursive(
 		}
 		next.Release()
 	}
-	nilIDs := newFieldOverlayStorage(qv.snap.nilIndex.Get(acc.ordinal)).lookupPostingRetained(nilIndexEntryKey)
+	nilIDs := indexdata.NewFieldOverlayStorage(qv.snap.nilIndex[acc.ordinal]).LookupPostingRetained(nilIndexEntryKey)
 	if !nilIDs.IsEmpty() {
 		next := current.Borrow().BuildAnd(nilIDs)
 		if !next.IsEmpty() {
@@ -1115,12 +1100,12 @@ func (qv *queryView) aggregateGroupRecursive(
 }
 
 func (qv *queryView) appendDistinctRows(rows *[]Row, acc indexedFieldAccessor, ids posting.List) error {
-	ov := newFieldOverlayStorage(qv.snap.index.Get(acc.ordinal))
+	ov := indexdata.NewFieldOverlayStorage(qv.snap.index[acc.ordinal])
 	universe := qv.snapshotUniverseCardinality()
 	filterCardinality := ids.Cardinality()
-	cur := ov.newCursor(ov.rangeByRanks(0, ov.keyCount()), false)
+	cur := ov.NewCursor(ov.RangeByRanks(0, ov.KeyCount()), false)
 	for {
-		key, bucketIDs, ok := cur.next()
+		key, bucketIDs, ok := cur.Next()
 		if !ok {
 			break
 		}
@@ -1129,7 +1114,7 @@ func (qv *queryView) appendDistinctRows(rows *[]Row, acc indexedFieldAccessor, i
 		}
 		*rows = append(*rows, Row{aggregateValueFromIndexKey(acc.field, key)})
 	}
-	nilIDs := newFieldOverlayStorage(qv.snap.nilIndex.Get(acc.ordinal)).lookupPostingRetained(nilIndexEntryKey)
+	nilIDs := indexdata.NewFieldOverlayStorage(qv.snap.nilIndex[acc.ordinal]).LookupPostingRetained(nilIndexEntryKey)
 	if aggregateIntersectCardinalityKnown(ids, nilIDs, filterCardinality, universe) > 0 {
 		*rows = append(*rows, Row{Value{}})
 	}
@@ -1162,13 +1147,13 @@ func (qv *queryView) foldAggregateMetricStates(states []aggregateMetricState, id
 
 func (qv *queryView) foldMeasureMetric(state *aggregateMetricState, ids posting.List) error {
 	acc := state.metric.field.measure
-	storage := qv.snap.measure.Get(acc.ordinal)
-	if ids.IsEmpty() || storage.rows() == 0 {
+	storage := qv.snap.measure[acc.ordinal]
+	if ids.IsEmpty() || storage.Rows() == 0 {
 		return nil
 	}
 	if ids.Cardinality() == qv.snapshotUniverseCardinality() {
 		if state.metric.op == aggregateMetricCount {
-			state.count += uint64(storage.rows())
+			state.count += uint64(storage.Rows())
 			state.seen = true
 			return nil
 		}
@@ -1180,7 +1165,7 @@ func (qv *queryView) foldMeasureMetric(state *aggregateMetricState, ids posting.
 	it := ids.Iter()
 	for it.HasNext() {
 		id := it.Next()
-		raw, ok := storage.lookup(id)
+		raw, ok := storage.Lookup(id)
 		if !ok {
 			continue
 		}
@@ -1193,48 +1178,28 @@ func (qv *queryView) foldMeasureMetric(state *aggregateMetricState, ids posting.
 	return nil
 }
 
-func useMeasureMergeScan(idCardinality uint64, storage measureFieldStorage) bool {
-	lookupSteps := measureStorageLookupSteps(storage)
+func useMeasureMergeScan(idCardinality uint64, storage indexdata.MeasureStorage) bool {
+	lookupSteps := storage.LookupSteps()
 	if lookupSteps <= 1 {
 		return false
 	}
-	return idCardinality > uint64(storage.rows())/(lookupSteps-1)
+	return idCardinality > uint64(storage.Rows())/(lookupSteps-1)
 }
 
-func measureStorageLookupSteps(storage measureFieldStorage) uint64 {
-	if storage.flat != nil {
-		return uint64(bits.Len64(uint64(len(storage.flat.ids))))
-	}
-	if storage.chunked != nil {
-		return uint64(bits.Len64(uint64(storage.chunked.refsByID.Len())) + bits.Len64(measureChunkTargetRows))
-	}
-	return 1
-}
-
-func (state *aggregateMetricState) addMeasureStorageAll(storage measureFieldStorage, kind measureValueKind) error {
-	if storage.flat != nil {
-		return state.addMeasureFlatAll(storage.flat, kind)
-	}
-	if storage.chunked != nil {
-		return state.addMeasureChunkedAll(storage.chunked, kind)
-	}
-	return nil
-}
-
-func (state *aggregateMetricState) addMeasureFlatAll(root *measureFlatRoot, kind measureValueKind) error {
-	for _, v := range root.values {
-		if err := state.addRawMeasure(v, kind, 1); err != nil {
-			return err
+func (state *aggregateMetricState) addMeasureStorageAll(storage indexdata.MeasureStorage, kind measureValueKind) error {
+	_, values, ok := storage.FlatSlices()
+	if ok {
+		for i := range values {
+			if err := state.addRawMeasure(values[i], kind, 1); err != nil {
+				return err
+			}
 		}
+		return nil
 	}
-	return nil
-}
-
-func (state *aggregateMetricState) addMeasureChunkedAll(root *measureChunkedRoot, kind measureValueKind) error {
-	for chunkPos := 0; chunkPos < root.refsByID.Len(); chunkPos++ {
-		chunk := root.refsByID.Get(chunkPos).chunk
-		for _, v := range chunk.values {
-			if err := state.addRawMeasure(v, kind, 1); err != nil {
+	for chunkPos := 0; chunkPos < storage.ChunkCount(); chunkPos++ {
+		_, chunkValues := storage.ChunkSlices(chunkPos)
+		for i := range chunkValues {
+			if err := state.addRawMeasure(chunkValues[i], kind, 1); err != nil {
 				return err
 			}
 		}
@@ -1242,15 +1207,16 @@ func (state *aggregateMetricState) addMeasureChunkedAll(root *measureChunkedRoot
 	return nil
 }
 
-func (state *aggregateMetricState) addMeasureStorageIntersect(storage measureFieldStorage, kind measureValueKind, ids posting.List) error {
+func (state *aggregateMetricState) addMeasureStorageIntersect(storage indexdata.MeasureStorage, kind measureValueKind, ids posting.List) error {
 	it := ids.Iter()
 	if !it.HasNext() {
 		it.Release()
 		return nil
 	}
 	filterID := it.Next()
-	if storage.flat != nil {
-		for i, measureID := range storage.flat.ids {
+	measureIDs, values, ok := storage.FlatSlices()
+	if ok {
+		for i, measureID := range measureIDs {
 			for filterID < measureID {
 				if !it.HasNext() {
 					it.Release()
@@ -1259,7 +1225,7 @@ func (state *aggregateMetricState) addMeasureStorageIntersect(storage measureFie
 				filterID = it.Next()
 			}
 			if filterID == measureID {
-				if err := state.addRawMeasure(storage.flat.values[i], kind, 1); err != nil {
+				if err := state.addRawMeasure(values[i], kind, 1); err != nil {
 					it.Release()
 					return err
 				}
@@ -1268,22 +1234,20 @@ func (state *aggregateMetricState) addMeasureStorageIntersect(storage measureFie
 		it.Release()
 		return nil
 	}
-	if storage.chunked != nil {
-		for chunkPos := 0; chunkPos < storage.chunked.refsByID.Len(); chunkPos++ {
-			chunk := storage.chunked.refsByID.Get(chunkPos).chunk
-			for i, measureID := range chunk.ids {
-				for filterID < measureID {
-					if !it.HasNext() {
-						it.Release()
-						return nil
-					}
-					filterID = it.Next()
+	for chunkPos := 0; chunkPos < storage.ChunkCount(); chunkPos++ {
+		measureIDs, values = storage.ChunkSlices(chunkPos)
+		for i, measureID := range measureIDs {
+			for filterID < measureID {
+				if !it.HasNext() {
+					it.Release()
+					return nil
 				}
-				if filterID == measureID {
-					if err := state.addRawMeasure(chunk.values[i], kind, 1); err != nil {
-						it.Release()
-						return err
-					}
+				filterID = it.Next()
+			}
+			if filterID == measureID {
+				if err := state.addRawMeasure(values[i], kind, 1); err != nil {
+					it.Release()
+					return err
 				}
 			}
 		}
@@ -1312,12 +1276,12 @@ func aggregateMetricsShareOrdinaryField(a aggregateMetric, b aggregateMetric) bo
 
 func (qv *queryView) foldOrdinaryMetricStates(states []aggregateMetricState, ids posting.List, first int) error {
 	acc := states[first].metric.field.ordinary
-	ov := newFieldOverlayStorage(qv.snap.index.Get(acc.ordinal))
+	ov := indexdata.NewFieldOverlayStorage(qv.snap.index[acc.ordinal])
 	universe := qv.snapshotUniverseCardinality()
 	filterCardinality := ids.Cardinality()
-	cur := ov.newCursor(ov.rangeByRanks(0, ov.keyCount()), false)
+	cur := ov.NewCursor(ov.RangeByRanks(0, ov.KeyCount()), false)
 	for {
-		key, bucketIDs, ok := cur.next()
+		key, bucketIDs, ok := cur.Next()
 		if !ok {
 			break
 		}
@@ -1637,18 +1601,6 @@ func float64FromOrderedKey(key uint64) float64 {
 		return math.Float64frombits(key ^ sign)
 	}
 	return math.Float64frombits(^key)
-}
-
-func (o fieldOverlay) keyAt(rank int) keycodec.IndexKey {
-	if o.chunked != nil {
-		pos := o.chunked.posForRank(rank)
-		ref, ok := o.chunked.refAtChunk(pos.chunk)
-		if !ok {
-			return keycodec.IndexKey{}
-		}
-		return ref.chunk.keyAt(pos.entry)
-	}
-	return o.base[rank].Key
 }
 
 func applyAggregateHaving(result Result, having aggregateHavingExpr) Result {

@@ -12,7 +12,6 @@ import (
 
 	"github.com/vapstack/qx"
 	"github.com/vapstack/rbi/internal/pooled"
-	"github.com/vapstack/rbi/internal/pools"
 	"github.com/vapstack/rbi/internal/posting"
 	"github.com/vapstack/rbi/internal/qir"
 )
@@ -594,7 +593,7 @@ func TestCount_ScalarInSplit_ResidualFilterMatchesBitmap(t *testing.T) {
 
 	valsBuf, isSlice, hasNil, err := qv.exprValueToDistinctIdxBuf(mustCountQIRExprForDB(t, db, qx.IN("country", []string{"US", "DE", "FR"})))
 	if valsBuf != nil {
-		defer pools.PutStringSlice(valsBuf)
+		defer pooled.PutStringSlice(valsBuf)
 	}
 	if err != nil || !isSlice || hasNil {
 		t.Fatalf("exprValueToDistinctIdxBuf: isSlice=%v hasNil=%v err=%v", isSlice, hasNil, err)
@@ -603,7 +602,7 @@ func TestCount_ScalarInSplit_ResidualFilterMatchesBitmap(t *testing.T) {
 	var got uint64
 	ov := qv.fieldOverlay("country")
 	for i := 0; i < len(valsBuf); i++ {
-		ids := ov.lookupPostingRetained(valsBuf[i])
+		ids := ov.LookupPostingRetained(valsBuf[i])
 		if ids.IsEmpty() {
 			continue
 		}
@@ -1629,14 +1628,14 @@ func TestCountORPredicateBranchLimit_Adaptive(t *testing.T) {
 
 func TestCountPredicateMaterializationThresholds_Adaptive(t *testing.T) {
 	newPostsBuf := func(n int) []posting.List {
-		return pools.GetPostingSlice(n)[:n]
+		return posting.GetSlice(n)[:n]
 	}
 
 	setPred := predicate{
 		kind:     predicateKindPostsAny,
 		postsBuf: newPostsBuf(12),
 	}
-	defer pools.PutPostingSlice(setPred.postsBuf)
+	defer posting.PutSlice(setPred.postsBuf)
 	if shouldMaterializeCountSetPredicate(setPred, 500, 500_000) {
 		t.Fatalf("set predicate should not materialize on low probe estimate")
 	}
@@ -1662,7 +1661,7 @@ func TestCountPredicateMaterializationThresholds_Adaptive(t *testing.T) {
 		postsBuf: newPostsBuf(3),
 		estCard:  80_000,
 	}
-	defer pools.PutPostingSlice(smallHasAnyResidual.postsBuf)
+	defer posting.PutSlice(smallHasAnyResidual.postsBuf)
 	if !shouldUseCountLeadResidualHasAnyExactFilter(smallHasAnyResidual) {
 		t.Fatalf("expected small HASANY residual exact filter above threshold")
 	}
@@ -1672,7 +1671,7 @@ func TestCountPredicateMaterializationThresholds_Adaptive(t *testing.T) {
 		postsBuf: newPostsBuf(4),
 		estCard:  80_000,
 	}
-	defer pools.PutPostingSlice(fourTermHasAnyResidual.postsBuf)
+	defer posting.PutSlice(fourTermHasAnyResidual.postsBuf)
 	if !shouldUseCountLeadResidualHasAnyExactFilter(fourTermHasAnyResidual) {
 		t.Fatalf("expected four-term HASANY residual exact filter above threshold")
 	}
@@ -1682,7 +1681,7 @@ func TestCountPredicateMaterializationThresholds_Adaptive(t *testing.T) {
 		postsBuf: newPostsBuf(5),
 		estCard:  80_000,
 	}
-	defer pools.PutPostingSlice(tooWide.postsBuf)
+	defer posting.PutSlice(tooWide.postsBuf)
 	if shouldUseCountLeadResidualHasAnyExactFilter(tooWide) {
 		t.Fatalf("unexpected residual exact filter beyond max term threshold")
 	}
@@ -2333,7 +2332,7 @@ func TestCount_PreparePredicate_BroadRangeComplementMatchesChunkedRangeAfterChur
 		}
 	}
 
-	if db.engine.currentQueryViewForTests().fieldOverlay("age").chunked == nil {
+	if !db.engine.currentQueryViewForTests().fieldOverlay("age").IsChunked() {
 		t.Fatalf("expected age field to use chunked storage")
 	}
 
@@ -2904,12 +2903,12 @@ func TestCountApplyLeadResidualExactFilters_StateOnlyAllocsPerRunStayZeroAfterWa
 	defer postC.Release()
 	defer postD.Release()
 
-	postsBuf1 := pools.GetPostingSlice(2)
+	postsBuf1 := posting.GetSlice(2)
 	postsBuf1 = append(postsBuf1, postA, postB)
 	state1 := postsAnyFilterStatePool.Get()
 	state1.postsBuf = postsBuf1
 
-	postsBuf2 := pools.GetPostingSlice(2)
+	postsBuf2 := posting.GetSlice(2)
 	postsBuf2 = append(postsBuf2, postC, postD)
 	state2 := postsAnyFilterStatePool.Get()
 	state2.postsBuf = postsBuf2
@@ -2922,8 +2921,8 @@ func TestCountApplyLeadResidualExactFilters_StateOnlyAllocsPerRunStayZeroAfterWa
 		countLeadResidualExactFilterSlicePool.Put(filters)
 		postsAnyFilterStatePool.Put(state1)
 		postsAnyFilterStatePool.Put(state2)
-		pools.PutPostingSlice(postsBuf1)
-		pools.PutPostingSlice(postsBuf2)
+		posting.PutSlice(postsBuf1)
+		posting.PutSlice(postsBuf2)
 	}()
 
 	var work posting.List
@@ -2963,7 +2962,7 @@ func TestCountApplyLeadResidualExactFilters_MixedStateAndIDsMatchesExpected(t *t
 	defer postB.Release()
 	defer exact.Release()
 
-	postsBuf := pools.GetPostingSlice(2)
+	postsBuf := posting.GetSlice(2)
 	postsBuf = append(postsBuf, postA, postB)
 	state := postsAnyFilterStatePool.Get()
 	state.postsBuf = postsBuf
@@ -2975,7 +2974,7 @@ func TestCountApplyLeadResidualExactFilters_MixedStateAndIDsMatchesExpected(t *t
 	defer func() {
 		countLeadResidualExactFilterSlicePool.Put(filters)
 		postsAnyFilterStatePool.Put(state)
-		pools.PutPostingSlice(postsBuf)
+		posting.PutSlice(postsBuf)
 	}()
 
 	out, nextWork := countApplyLeadResidualExactFilters(src.Borrow(), posting.List{}, filters)

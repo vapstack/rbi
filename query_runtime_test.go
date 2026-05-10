@@ -4,7 +4,6 @@ import (
 	"slices"
 	"testing"
 
-	"github.com/vapstack/rbi/internal/pools"
 	"github.com/vapstack/rbi/internal/posting"
 )
 
@@ -16,7 +15,7 @@ func buildQueryRuntimeTestLargePosting() posting.List {
 	return posting.BuildFromSorted(ids)
 }
 
-func TestPostingUnionBuilder_SinglePostingKeepsBorrowedPayload(t *testing.T) {
+func TestPostingUnionBuilder_SinglePostingReturnsOwnedPayload(t *testing.T) {
 	base := buildQueryRuntimeTestLargePosting()
 	defer base.Release()
 
@@ -25,11 +24,11 @@ func TestPostingUnionBuilder_SinglePostingKeepsBorrowedPayload(t *testing.T) {
 	out := builder.finish(true)
 	defer out.Release()
 
-	if !out.IsBorrowed() {
-		t.Fatalf("single posting union must keep borrowed payload")
+	if out.IsBorrowed() {
+		t.Fatalf("single posting union must return owned payload")
 	}
-	if !out.SharesPayload(base) {
-		t.Fatalf("single posting union lost source payload sharing")
+	if out.SharesPayload(base) {
+		t.Fatalf("single posting union must detach from source payload")
 	}
 	if got, want := out.Cardinality(), base.Cardinality(); got != want {
 		t.Fatalf("cardinality mismatch: got=%d want=%d", got, want)
@@ -79,7 +78,7 @@ func TestPostsAnyFilterStateApply_DirectIntersectMatchesMaterializedUnion(t *tes
 		dstIDs[56], dstIDs[60], dstIDs[64], dstIDs[68], dstIDs[72], dstIDs[76],
 	})
 
-	postsBuf := pools.GetPostingSlice(2)
+	postsBuf := posting.GetSlice(2)
 	postsBuf = append(postsBuf, postA, postB)
 
 	state := postsAnyFilterStatePool.Get()
@@ -90,7 +89,7 @@ func TestPostsAnyFilterStateApply_DirectIntersectMatchesMaterializedUnion(t *tes
 		for i := 0; i < len(postsBuf); i++ {
 			postsBuf[i].Release()
 		}
-		pools.PutPostingSlice(postsBuf)
+		posting.PutSlice(postsBuf)
 	}()
 
 	expectedBuilder := newPostingUnionBuilder(true)
@@ -137,7 +136,7 @@ func TestPostsAnyFilterStateApply_RepeatedDirectIntersectPromotesMaterializedUni
 	postA := posting.BuildFromSorted(postAIDs)
 	postB := posting.BuildFromSorted(postBIDs)
 
-	postsBuf := pools.GetPostingSlice(2)
+	postsBuf := posting.GetSlice(2)
 	postsBuf = append(postsBuf, postA, postB)
 
 	state := postsAnyFilterStatePool.Get()
@@ -148,7 +147,7 @@ func TestPostsAnyFilterStateApply_RepeatedDirectIntersectPromotesMaterializedUni
 		for i := 0; i < len(postsBuf); i++ {
 			postsBuf[i].Release()
 		}
-		pools.PutPostingSlice(postsBuf)
+		posting.PutSlice(postsBuf)
 	}()
 
 	expectedBuilder := newPostingUnionBuilder(true)
@@ -195,7 +194,7 @@ func TestPostsAnyFilterStateSetExpectedContainsCalls_PromotesFirstUseMaterializa
 	postA := posting.BuildFromSorted(postAIDs)
 	postB := posting.BuildFromSorted(postBIDs)
 
-	postsBuf := pools.GetPostingSlice(2)
+	postsBuf := posting.GetSlice(2)
 	postsBuf = append(postsBuf, postA, postB)
 
 	state := postsAnyFilterStatePool.Get()
@@ -207,7 +206,7 @@ func TestPostsAnyFilterStateSetExpectedContainsCalls_PromotesFirstUseMaterializa
 		for i := 0; i < len(postsBuf); i++ {
 			postsBuf[i].Release()
 		}
-		pools.PutPostingSlice(postsBuf)
+		posting.PutSlice(postsBuf)
 	}()
 
 	if state.containsMaterializeAt == 1 {

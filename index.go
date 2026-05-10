@@ -17,18 +17,11 @@ import (
 	"time"
 	"unsafe"
 
-	"github.com/vapstack/rbi/internal/keycodec"
+	"github.com/vapstack/rbi/internal/indexdata"
 	"github.com/vapstack/rbi/internal/pooled"
-	"github.com/vapstack/rbi/internal/pools"
 	"github.com/vapstack/rbi/internal/posting"
 	"go.etcd.io/bbolt"
 )
-
-func releaseBuildIndexRuns(runs []buildIndexFieldRun) {
-	for i := range runs {
-		runs[i].release()
-	}
-}
 
 func cleanupBuildIndexFailure(buildOK *bool, fieldStates []*buildIndexFieldState, localUniverse []posting.List) {
 	if *buildOK {
@@ -131,9 +124,8 @@ func formatBuildIndexKeyDiagnostic(strKey bool, key []byte) string {
 /**/
 
 type buildIndexFieldState struct {
-	numeric bool
-	runsMu  sync.Mutex
-	runs    []buildIndexFieldRun
+	runsMu sync.Mutex
+	runs   []indexdata.FieldStorageRun
 
 	nilMu sync.Mutex
 	nils  posting.List
@@ -150,29 +142,12 @@ type buildIndexFieldLocalState struct {
 	nils    posting.List
 }
 
-type buildIndexRunCursor struct {
-	run int
-	pos int
-	key keycodec.IndexKey
-}
-
-type buildIndexRunHeap struct {
-	runs []buildIndexFieldRun
-	buf  []buildIndexRunCursor
-}
-
-type buildIndexFieldRun struct {
-	stringBuf []string
-	u64Buf    []uint64
-	postBuf   []posting.List
-}
-
 func buildIndexRunTargetEntries() int {
-	return max(postingMapPoolMaxLen, fieldIndexChunkTargetEntries*16)
+	return max(4<<10, indexdata.FieldChunkTargetEntries*16)
 }
 
-func newBuildIndexFieldState(numeric bool, slice bool) *buildIndexFieldState {
-	state := &buildIndexFieldState{numeric: numeric}
+func newBuildIndexFieldState(slice bool) *buildIndexFieldState {
+	state := &buildIndexFieldState{}
 	if slice {
 		state.lenMap = make(map[uint32]posting.List, 8)
 	}
@@ -189,14 +164,14 @@ func newBuildIndexFieldLocalState(numeric bool, slice bool) buildIndexFieldLocal
 
 func (s *buildIndexFieldLocalState) addValue(key string, idx uint64) {
 	if s.vals == nil {
-		s.vals = postingMapPool.Get()
+		s.vals = indexdata.GetPostingMap()
 	}
 	s.vals[key] = s.vals[key].BuildAdded(idx)
 }
 
 func (s *buildIndexFieldLocalState) addFixedValue(key uint64, idx uint64) {
 	if s.fixed == nil {
-		s.fixed = make(map[uint64]posting.List, 8)
+		s.fixed = indexdata.GetFixedPostingMap()
 	}
 	s.fixed[key] = s.fixed[key].BuildAdded(idx)
 }
@@ -223,110 +198,8 @@ func (s *buildIndexFieldLocalState) shouldFlushRegular() bool {
 	return len(s.vals) >= buildIndexRunTargetEntries()
 }
 
-func (r buildIndexFieldRun) keyCount() int {
-	if r.u64Buf != nil {
-		return len(r.u64Buf)
-	}
-	if r.stringBuf == nil {
-		return 0
-	}
-	return len(r.stringBuf)
-}
-
-func (r buildIndexFieldRun) keyAt(i int) keycodec.IndexKey {
-	if r.u64Buf != nil {
-		return keycodec.FromU64(r.u64Buf[i])
-	}
-	return keycodec.FromString(r.stringBuf[i])
-}
-
-func (r *buildIndexFieldRun) takePosting(i int) posting.List {
-	ids := r.postBuf[i]
-	r.postBuf[i] = posting.List{}
-	return ids
-}
-
-func (r *buildIndexFieldRun) release() {
-	if r == nil {
-		return
-	}
-	if r.stringBuf != nil {
-		pools.PutStringSlice(r.stringBuf)
-		r.stringBuf = nil
-	}
-	if r.u64Buf != nil {
-		pools.PutUint64Slice(r.u64Buf)
-		r.u64Buf = nil
-	}
-	if r.postBuf != nil {
-		posting.ReleaseAll(r.postBuf)
-		pools.PutPostingSlice(r.postBuf)
-		r.postBuf = nil
-	}
-}
-
-func buildIndexStringRunFromPostingMap(m map[string]posting.List) buildIndexFieldRun {
-	if len(m) == 0 {
-		return buildIndexFieldRun{}
-	}
-	keyBuf := pools.GetStringSlice(len(m))
-	for key, ids := range m {
-		ids = ids.BuildOptimized()
-		if ids.IsEmpty() {
-			delete(m, key)
-			continue
-		}
-		m[key] = ids
-		keyBuf = append(keyBuf, key)
-	}
-	if len(keyBuf) == 0 {
-		pools.PutStringSlice(keyBuf)
-		return buildIndexFieldRun{}
-	}
-	slices.Sort(keyBuf)
-	postBuf := pools.GetPostingSlice(len(keyBuf))[:len(keyBuf)]
-	for i := 0; i < len(keyBuf); i++ {
-		postBuf[i] = m[keyBuf[i]]
-	}
-	clear(m)
-	return buildIndexFieldRun{
-		stringBuf: keyBuf,
-		postBuf:   postBuf,
-	}
-}
-
-func buildIndexFixedRunFromPostingMap(m map[uint64]posting.List) buildIndexFieldRun {
-	if len(m) == 0 {
-		return buildIndexFieldRun{}
-	}
-	keyBuf := pools.GetUint64Slice(len(m))
-	for key, ids := range m {
-		ids = ids.BuildOptimized()
-		if ids.IsEmpty() {
-			delete(m, key)
-			continue
-		}
-		m[key] = ids
-		keyBuf = append(keyBuf, key)
-	}
-	if len(keyBuf) == 0 {
-		pools.PutUint64Slice(keyBuf)
-		return buildIndexFieldRun{}
-	}
-	slices.Sort(keyBuf)
-	postBuf := pools.GetPostingSlice(len(keyBuf))[:len(keyBuf)]
-	for i := 0; i < len(keyBuf); i++ {
-		postBuf[i] = m[keyBuf[i]]
-	}
-	clear(m)
-	return buildIndexFieldRun{
-		u64Buf:  keyBuf,
-		postBuf: postBuf,
-	}
-}
-
-func (s *buildIndexFieldState) appendRun(run buildIndexFieldRun) {
-	if s == nil || run.keyCount() == 0 {
+func (s *buildIndexFieldState) appendRun(run indexdata.FieldStorageRun) {
+	if s == nil || run.KeyCount() == 0 {
 		return
 	}
 	s.runsMu.Lock()
@@ -339,12 +212,12 @@ func (s *buildIndexFieldLocalState) flushRegularInto(dst *buildIndexFieldState) 
 		return
 	}
 	if s.numeric {
-		if run := buildIndexFixedRunFromPostingMap(s.fixed); run.keyCount() > 0 {
+		if run := indexdata.NewFixedFieldStorageRunFromPostingMap(s.fixed); run.KeyCount() > 0 {
 			dst.appendRun(run)
 		}
 		return
 	}
-	if run := buildIndexStringRunFromPostingMap(s.vals); run.keyCount() > 0 {
+	if run := indexdata.NewStringFieldStorageRunFromPostingMap(s.vals); run.KeyCount() > 0 {
 		dst.appendRun(run)
 	}
 }
@@ -380,9 +253,11 @@ func (s *buildIndexFieldLocalState) release() {
 	}
 
 	posting.ReleaseMap(s.vals)
+	indexdata.PutPostingMap(s.vals)
 	s.vals = nil
 
 	posting.ReleaseMap(s.fixed)
+	indexdata.PutFixedPostingMap(s.fixed)
 	s.fixed = nil
 
 	posting.ReleaseMap(s.lenMap)
@@ -392,169 +267,20 @@ func (s *buildIndexFieldLocalState) release() {
 	s.nils = posting.List{}
 }
 
-func (h buildIndexRunHeap) Len() int { return len(h.buf) }
-
-func (h buildIndexRunHeap) less(i, j int) bool {
-	return keycodec.Compare(h.buf[i].key, h.buf[j].key) < 0
-}
-
-func (h buildIndexRunHeap) swap(i, j int) {
-	h.buf[i], h.buf[j] = h.buf[j], h.buf[i]
-}
-
-func (h *buildIndexRunHeap) init() {
-	for i := len(h.buf)/2 - 1; i >= 0; i-- {
-		h.down(i)
-	}
-}
-
-func (h *buildIndexRunHeap) up(pos int) {
-	for pos > 0 {
-		parent := (pos - 1) >> 1
-		if !h.less(pos, parent) {
-			return
-		}
-		h.swap(parent, pos)
-		pos = parent
-	}
-}
-
-func (h *buildIndexRunHeap) down(pos int) {
-	for {
-		left := pos*2 + 1
-		if left >= len(h.buf) {
-			return
-		}
-		smallest := left
-		right := left + 1
-		if right < len(h.buf) && h.less(right, left) {
-			smallest = right
-		}
-		if !h.less(smallest, pos) {
-			return
-		}
-		h.swap(pos, smallest)
-		pos = smallest
-	}
-}
-
-func (h *buildIndexRunHeap) push(run, pos int) {
-	cur := h.runs[run]
-	if pos < 0 || pos >= cur.keyCount() {
-		return
-	}
-	h.buf = append(h.buf, buildIndexRunCursor{
-		run: run,
-		pos: pos,
-		key: cur.keyAt(pos),
-	})
-	h.up(len(h.buf) - 1)
-}
-
-func (h *buildIndexRunHeap) pop() buildIndexRunCursor {
-	item := h.buf[0]
-	last := len(h.buf) - 1
-	h.buf[0] = h.buf[last]
-	h.buf = h.buf[:last]
-	if len(h.buf) > 0 {
-		h.down(0)
-	}
-	return item
-}
-
-func (s *buildIndexFieldState) materializeStorage() fieldIndexStorage {
+func (s *buildIndexFieldState) materializeStorage() indexdata.FieldStorage {
 	if s == nil || len(s.runs) == 0 {
-		return fieldIndexStorage{}
+		return indexdata.FieldStorage{}
 	}
 	runs := s.runs
 	s.runs = nil
-	defer releaseBuildIndexRuns(runs)
-	total := 0
-	numeric := s.numeric
-	for i := range runs {
-		total += runs[i].keyCount()
-	}
-	if total == 0 {
-		return fieldIndexStorage{}
-	}
-
-	h := buildIndexRunHeap{
-		runs: runs,
-		buf:  make([]buildIndexRunCursor, 0, len(runs)),
-	}
-	for i := range runs {
-		run := runs[i]
-		if run.keyCount() == 0 {
-			continue
-		}
-		h.buf = append(h.buf, buildIndexRunCursor{
-			run: i,
-			pos: 0,
-			key: run.keyAt(0),
-		})
-	}
-	if len(h.buf) == 0 {
-		return fieldIndexStorage{}
-	}
-	h.init()
-
-	entries := make([]index, 0, min(total, fieldIndexChunkThreshold))
-	var builder fieldIndexChunkBuilder
-	var stream fieldIndexChunkStreamBuilder
-	chunked := false
-
-	for h.Len() > 0 {
-		item := h.pop()
-		run := &h.runs[item.run]
-		key := item.key
-		merged := run.takePosting(item.pos)
-		h.push(item.run, item.pos+1)
-
-		for h.Len() > 0 {
-			next := h.buf[0]
-			if keycodec.Compare(next.key, key) != 0 {
-				break
-			}
-			item = h.pop()
-			run = &h.runs[item.run]
-			merged = merged.BuildMergedOwned(run.takePosting(item.pos))
-			h.push(item.run, item.pos+1)
-		}
-		merged = merged.BuildOptimized()
-		if !chunked {
-			entries = append(entries, index{Key: key, IDs: merged})
-			if len(entries) >= fieldIndexChunkThreshold {
-				builder = newFieldIndexChunkBuilder(total)
-				stream = newFieldIndexChunkStreamBuilder(&builder, numeric)
-				for i := range entries {
-					stream.append(entries[i].Key, entries[i].IDs)
-				}
-				entries = nil
-				chunked = true
-			}
-			continue
-		}
-		stream.append(key, merged)
-	}
-
-	if !chunked {
-		if len(entries) == 0 {
-			return fieldIndexStorage{}
-		}
-		return newFlatFieldIndexStorage(&entries)
-	}
-
-	stream.finish()
-	return newChunkedFieldIndexStorage(builder.root())
+	return indexdata.NewRegularFieldStorageFromRunsOwned(runs)
 }
 
 func (s *buildIndexFieldState) release() {
 	if s == nil {
 		return
 	}
-	for i := range s.runs {
-		s.runs[i].release()
-	}
+	indexdata.ReleaseFieldStorageRunsOwned(s.runs)
 	s.runs = nil
 
 	s.nils.Release()
@@ -564,80 +290,22 @@ func (s *buildIndexFieldState) release() {
 	s.lenMap = nil
 }
 
-func (s *buildIndexFieldState) materializeNilStorage() fieldIndexStorage {
+func (s *buildIndexFieldState) materializeNilStorage() indexdata.FieldStorage {
 	if s == nil {
-		return fieldIndexStorage{}
+		return indexdata.FieldStorage{}
 	}
 	ids := s.nils
 	s.nils = posting.List{}
-	ids = ids.BuildOptimized()
-	if ids.IsEmpty() {
-		return fieldIndexStorage{}
-	}
-	entries := []index{{
-		Key: keycodec.FromStoredString(nilIndexEntryKey, false),
-		IDs: ids,
-	}}
-	return newFlatFieldIndexStorage(&entries)
+	return indexdata.NewNilFieldStorageOwned(ids)
 }
 
-func (s *buildIndexFieldState) materializeLenStorage(universe posting.List) (fieldIndexStorage, bool) {
+func (s *buildIndexFieldState) materializeLenStorage(universe posting.List) (indexdata.FieldStorage, bool) {
 	if s == nil {
-		return fieldIndexStorage{}, false
+		return indexdata.FieldStorage{}, false
 	}
 	lenMap := s.lenMap
 	s.lenMap = nil
-	return materializeLenFieldStorageOwned(universe, lenMap)
-}
-
-func materializeLenFieldStorageOwned(universe posting.List, lenMap map[uint32]posting.List) (fieldIndexStorage, bool) {
-	if len(lenMap) == 0 || universe.IsEmpty() {
-		return fieldIndexStorage{}, false
-	}
-	empty := lenMap[0]
-	emptyCard := empty.Cardinality()
-	universeCard := universe.Cardinality()
-	nonEmptyCard := uint64(0)
-	if universeCard > emptyCard {
-		nonEmptyCard = universeCard - emptyCard
-	}
-
-	useZeroComplement := nonEmptyCard > 0 && nonEmptyCard < emptyCard
-	entries := make([]index, 0, len(lenMap)+1)
-	for ln, ids := range lenMap {
-		if useZeroComplement && ln == 0 {
-			continue
-		}
-		ids = ids.BuildOptimized()
-		if ids.IsEmpty() {
-			continue
-		}
-		entries = append(entries, index{
-			Key: keycodec.FromU64(uint64(ln)),
-			IDs: ids,
-		})
-	}
-	if useZeroComplement {
-		nonEmptyPosting := universe.Clone()
-		if !empty.IsEmpty() {
-			nonEmptyPosting = nonEmptyPosting.BuildAndNot(empty)
-		}
-		nonEmptyPosting = nonEmptyPosting.BuildOptimized()
-		if !nonEmptyPosting.IsEmpty() {
-			entries = append(entries, index{
-				Key: keycodec.FromString(lenIndexNonEmptyKey),
-				IDs: nonEmptyPosting,
-			})
-		}
-	}
-	if len(entries) == 0 {
-		return fieldIndexStorage{}, false
-	}
-
-	slices.SortFunc(entries, func(a, b index) int {
-		return keycodec.Compare(a.Key, b.Key)
-	})
-	return newFlatFieldIndexStorage(&entries), useZeroComplement
+	return indexdata.NewLenFieldStorageFromMapOwned(universe, lenMap)
 }
 
 func (db *DB[K, V]) buildIndex(skipFields map[string]struct{}, skipMeasureFields map[string]struct{}) error {
@@ -739,7 +407,7 @@ func (qe *queryEngine) buildIndex(
 
 	fieldStates := make([]*buildIndexFieldState, len(active))
 	for i := range active {
-		fieldStates[i] = newBuildIndexFieldState(active[i].numeric, active[i].slice)
+		fieldStates[i] = newBuildIndexFieldState(active[i].slice)
 	}
 
 	jobs := make(chan rawdata, 10000)
@@ -748,11 +416,11 @@ func (qe *queryEngine) buildIndex(
 	workerErrs := make([]error, workers)
 
 	localUniverse := make([]posting.List, workers)
-	localMeasureStates := make([][]*pooled.Slice[measureEntry], workers)
+	localMeasureStates := make([][][]indexdata.MeasureEntry, workers)
 	buildOK := false
 
 	defer cleanupBuildIndexFailure(&buildOK, fieldStates, localUniverse)
-	defer cleanupBuildMeasureStates(&buildOK, localMeasureStates)
+	defer indexdata.CleanupBuildMeasureStates(&buildOK, localMeasureStates)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -772,11 +440,11 @@ func (qe *queryEngine) buildIndex(
 				localStates[i] = newBuildIndexFieldLocalState(active[i].numeric, active[i].slice)
 			}
 			defer releaseBuildIndexLocalStates(localStates)
-			localMeasures := make([]*pooled.Slice[measureEntry], len(qe.measureFieldAccess))
+			localMeasures := make([][]indexdata.MeasureEntry, len(qe.measureFieldAccess))
 			measureOK := false
 			defer func() {
 				if !measureOK {
-					releaseMeasureEntryBufs(localMeasures)
+					indexdata.ReleaseMeasureEntryBufs(localMeasures)
 				}
 			}()
 
@@ -832,10 +500,11 @@ func (qe *queryEngine) buildIndex(
 					if value, ok := acc.read(ptr); ok {
 						buf := localMeasures[acc.ordinal]
 						if buf == nil {
-							buf = measureEntrySlicePool.Get()
+							buf = indexdata.GetMeasureEntrySlice(0)
 							localMeasures[acc.ordinal] = buf
 						}
-						buf.Append(measureEntry{id: idx, value: value})
+						buf = append(buf, indexdata.MeasureEntry{ID: idx, Value: value})
+						localMeasures[acc.ordinal] = buf
 					}
 				}
 				release(ptr)
@@ -905,26 +574,23 @@ func (qe *queryEngine) buildIndex(
 	}
 
 	slotCount := len(qe.indexedFieldAccess)
-	if qe.index == nil || qe.index.Len() != slotCount {
-		releaseFieldIndexStorageSlotsOwned(qe.index)
-		qe.index = fieldIndexStorageSlicePool.Get()
-		qe.index.SetLen(slotCount)
+	if qe.index == nil || len(qe.index) != slotCount {
+		indexdata.ReleaseFieldStorageSlots(qe.index)
+		qe.index = indexdata.GetFieldStorageSlice(slotCount)[:slotCount]
 	}
-	if qe.nilIndex == nil || qe.nilIndex.Len() != slotCount {
-		releaseFieldIndexStorageSlotsOwned(qe.nilIndex)
-		qe.nilIndex = fieldIndexStorageSlicePool.Get()
-		qe.nilIndex.SetLen(slotCount)
+	if qe.nilIndex == nil || len(qe.nilIndex) != slotCount {
+		indexdata.ReleaseFieldStorageSlots(qe.nilIndex)
+		qe.nilIndex = indexdata.GetFieldStorageSlice(slotCount)[:slotCount]
 	}
-	if qe.lenIndex == nil || qe.lenIndex.Len() != slotCount {
-		releaseFieldIndexStorageSlotsOwned(qe.lenIndex)
-		qe.lenIndex = fieldIndexStorageSlicePool.Get()
-		qe.lenIndex.SetLen(slotCount)
+	if qe.lenIndex == nil || len(qe.lenIndex) != slotCount {
+		indexdata.ReleaseFieldStorageSlots(qe.lenIndex)
+		qe.lenIndex = indexdata.GetFieldStorageSlice(slotCount)[:slotCount]
 	}
 	if len(qe.lenZeroComplement) != slotCount {
 		if qe.lenZeroComplement != nil {
-			pools.PutBoolSlice(qe.lenZeroComplement)
+			pooled.PutBoolSlice(qe.lenZeroComplement)
 		}
-		qe.lenZeroComplement = pools.GetBoolSlice(slotCount)[:slotCount]
+		qe.lenZeroComplement = pooled.GetBoolSlice(slotCount)[:slotCount]
 		clear(qe.lenZeroComplement)
 	} else if len(skipFields) == 0 {
 		clear(qe.lenZeroComplement)
@@ -933,10 +599,10 @@ func (qe *queryEngine) buildIndex(
 			qe.lenZeroComplement[active[i].acc.ordinal] = false
 		}
 	}
-	if qe.measure == nil || qe.measure.Len() != len(qe.measureFieldAccess) {
-		releaseMeasureFieldStorageSlotsOwned(qe.measure)
-		qe.measure = measureFieldStorageSlicePool.Get()
-		qe.measure.SetLen(len(qe.measureFieldAccess))
+	if qe.measure == nil || len(qe.measure) != len(qe.measureFieldAccess) {
+		indexdata.ReleaseMeasureStorageSlots(qe.measure)
+		measureSlotCount := len(qe.measureFieldAccess)
+		qe.measure = indexdata.GetMeasureStorageSlice(measureSlotCount)[:measureSlotCount]
 	}
 
 	qe.universe = posting.List{}
@@ -949,42 +615,42 @@ func (qe *queryEngine) buildIndex(
 
 	for i := range fieldStates {
 		ordinal := active[i].acc.ordinal
-		oldIndexStorage := qe.index.Get(ordinal)
-		if storage := fieldStates[i].materializeStorage(); storage.keyCount() > 0 {
-			releaseFieldIndexStorageOwned(oldIndexStorage)
-			qe.index.Set(ordinal, storage)
+		oldIndexStorage := qe.index[ordinal]
+		if storage := fieldStates[i].materializeStorage(); storage.KeyCount() > 0 {
+			oldIndexStorage.Release()
+			qe.index[ordinal] = storage
 		} else {
-			releaseFieldIndexStorageOwned(oldIndexStorage)
-			qe.index.Set(ordinal, fieldIndexStorage{})
+			oldIndexStorage.Release()
+			qe.index[ordinal] = indexdata.FieldStorage{}
 		}
-		oldNilStorage := qe.nilIndex.Get(ordinal)
-		if storage := fieldStates[i].materializeNilStorage(); storage.keyCount() > 0 {
-			releaseFieldIndexStorageOwned(oldNilStorage)
-			qe.nilIndex.Set(ordinal, storage)
+		oldNilStorage := qe.nilIndex[ordinal]
+		if storage := fieldStates[i].materializeNilStorage(); storage.KeyCount() > 0 {
+			oldNilStorage.Release()
+			qe.nilIndex[ordinal] = storage
 		} else {
-			releaseFieldIndexStorageOwned(oldNilStorage)
-			qe.nilIndex.Set(ordinal, fieldIndexStorage{})
+			oldNilStorage.Release()
+			qe.nilIndex[ordinal] = indexdata.FieldStorage{}
 		}
-		oldLenStorage := qe.lenIndex.Get(ordinal)
+		oldLenStorage := qe.lenIndex[ordinal]
 		if storage, useZeroComplement := fieldStates[i].materializeLenStorage(qe.universe); active[i].slice {
-			if storage.keyCount() > 0 {
-				releaseFieldIndexStorageOwned(oldLenStorage)
-				qe.lenIndex.Set(ordinal, storage)
+			if storage.KeyCount() > 0 {
+				oldLenStorage.Release()
+				qe.lenIndex[ordinal] = storage
 			} else {
-				releaseFieldIndexStorageOwned(oldLenStorage)
-				qe.lenIndex.Set(ordinal, fieldIndexStorage{})
+				oldLenStorage.Release()
+				qe.lenIndex[ordinal] = indexdata.FieldStorage{}
 			}
 			if useZeroComplement {
 				qe.lenZeroComplement[ordinal] = true
 			}
 		}
 	}
-	var oldMeasureStorages *pooled.Slice[measureFieldStorage]
+	var oldMeasureStorages []indexdata.MeasureStorage
 	if len(activeMeasures) > 0 {
-		oldMeasureStorages = measureFieldStorageSlicePool.Get()
+		oldMeasureStorages = indexdata.GetMeasureStorageSlice(len(activeMeasures))
 		for _, acc := range activeMeasures {
 			i := acc.ordinal
-			entries := measureEntrySlicePool.Get()
+			entries := indexdata.GetMeasureEntrySlice(0)
 			for worker := range localMeasureStates {
 				if i >= len(localMeasureStates[worker]) {
 					continue
@@ -993,16 +659,16 @@ func (qe *queryEngine) buildIndex(
 				if buf == nil {
 					continue
 				}
-				for entryPos := 0; entryPos < buf.Len(); entryPos++ {
-					entries.Append(buf.Get(entryPos))
+				for entryPos := 0; entryPos < len(buf); entryPos++ {
+					entries = append(entries, buf[entryPos])
 				}
-				measureEntrySlicePool.Put(buf)
+				indexdata.PutMeasureEntrySlice(buf)
 				localMeasureStates[worker][i] = nil
 			}
-			oldStorage := qe.measure.Get(i)
-			storage := newMeasureStorageFromEntriesOwned(entries)
-			oldMeasureStorages.Append(oldStorage)
-			qe.measure.Set(i, storage)
+			oldStorage := qe.measure[i]
+			storage := indexdata.NewMeasureStorageFromEntriesOwned(entries)
+			oldMeasureStorages = append(oldMeasureStorages, oldStorage)
+			qe.measure[i] = storage
 		}
 	}
 
@@ -1013,7 +679,7 @@ func (qe *queryEngine) buildIndex(
 	for name, f := range qe.fields {
 		if f.Slice {
 			acc, ok := qe.indexedFieldMap[name]
-			if !ok || qe.lenIndex.Get(acc.ordinal).keyCount() == 0 {
+			if !ok || qe.lenIndex[acc.ordinal].KeyCount() == 0 {
 				qe.buildLenIndex()
 				break
 			}
@@ -1022,10 +688,10 @@ func (qe *queryEngine) buildIndex(
 	qe.lenIndexLoaded = false
 	err = qe.publishCurrentSequenceSnapshotNoLock(bolt, bucket, strMap)
 	if oldMeasureStorages != nil {
-		for i := 0; i < oldMeasureStorages.Len(); i++ {
-			releaseMeasureFieldStorageOwned(oldMeasureStorages.Get(i))
+		for i := 0; i < len(oldMeasureStorages); i++ {
+			oldMeasureStorages[i].Release()
 		}
-		measureFieldStorageSlicePool.Put(oldMeasureStorages)
+		indexdata.PutMeasureStorageSlice(oldMeasureStorages)
 	}
 	if err != nil {
 		return buildIndexResult{}, fmt.Errorf("publish snapshot: %w", err)
@@ -1091,11 +757,11 @@ func (s buildFieldWriteSink) setLen(length int) {
 }
 
 func (s buildFieldWriteSink) addString(key string) {
-	if s.err != nil && *s.err == nil && len(key) > fieldIndexStringRefMax {
+	if s.err != nil && *s.err == nil && len(key) > indexdata.FieldStringRefMax {
 		if s.field != "" {
-			*s.err = fmt.Errorf("field %q indexed string value len %d exceeds limit %d", s.field, len(key), fieldIndexStringRefMax)
+			*s.err = fmt.Errorf("field %q indexed string value len %d exceeds limit %d", s.field, len(key), indexdata.FieldStringRefMax)
 		} else {
-			*s.err = validateIndexedStringKeyLen(len(key))
+			*s.err = indexdata.ValidateIndexedStringKeyLen(len(key))
 		}
 		return
 	}
@@ -1138,21 +804,21 @@ func idxFromKeyNoLock(strKey bool, strMap *strMapper, key []byte) uint64 {
 }
 
 func (qe *queryEngine) buildLenIndex() {
-	releaseFieldIndexStorageSlotsOwned(qe.lenIndex)
-	qe.lenIndex = fieldIndexStorageSlicePool.Get()
-	qe.lenIndex.SetLen(len(qe.indexedFieldAccess))
+	indexdata.ReleaseFieldStorageSlots(qe.lenIndex)
+	slotCount := len(qe.indexedFieldAccess)
+	qe.lenIndex = indexdata.GetFieldStorageSlice(slotCount)[:slotCount]
 	if qe.lenZeroComplement != nil {
-		pools.PutBoolSlice(qe.lenZeroComplement)
+		pooled.PutBoolSlice(qe.lenZeroComplement)
 	}
-	qe.lenZeroComplement = pools.GetBoolSlice(len(qe.indexedFieldAccess))[:len(qe.indexedFieldAccess)]
+	qe.lenZeroComplement = pooled.GetBoolSlice(slotCount)[:slotCount]
 	clear(qe.lenZeroComplement)
 
 	for _, acc := range qe.indexedFieldAccess {
 		if !acc.field.Slice {
 			continue
 		}
-		result, useZeroComplement := rebuildLenIndexField(qe.universe, newFieldOverlayStorage(qe.index.Get(acc.ordinal)))
-		qe.lenIndex.Set(acc.ordinal, newFlatFieldIndexStorage(result))
+		storage, useZeroComplement := indexdata.RebuildLenFieldStorageFromOverlay(qe.universe, indexdata.NewFieldOverlayStorage(qe.index[acc.ordinal]))
+		qe.lenIndex[acc.ordinal] = storage
 		if useZeroComplement {
 			qe.lenZeroComplement[acc.ordinal] = true
 		}
@@ -1174,12 +840,10 @@ func (db *DB[K, V]) isLenZeroComplementField(field string) bool {
 
 const (
 	initialIndexLen                 = 32 << 10
-	maxStoredStringLen              = 64 << 30
 	indexBuildGCStride              = 100_000
 	indexBuildReleaseOSMemoryStride = 1_000_000
 
-	nilIndexEntryKey    = ""
-	lenIndexNonEmptyKey = "\xFFNONEMPTY"
+	nilIndexEntryKey = indexdata.NilIndexEntryKey
 )
 
 func (db *DB[K, V]) loadIndex() (
@@ -1352,45 +1016,43 @@ func (qe *queryEngine) loadIndexPayload(
 	}
 
 	qe.universe = universe
-	releaseFieldIndexStorageSlotsOwned(qe.index)
-	releaseFieldIndexStorageSlotsOwned(qe.nilIndex)
-	releaseFieldIndexStorageSlotsOwned(qe.lenIndex)
-	releaseMeasureFieldStorageSlotsOwned(qe.measure)
+	indexdata.ReleaseFieldStorageSlots(qe.index)
+	indexdata.ReleaseFieldStorageSlots(qe.nilIndex)
+	indexdata.ReleaseFieldStorageSlots(qe.lenIndex)
+	indexdata.ReleaseMeasureStorageSlots(qe.measure)
 	if qe.lenZeroComplement != nil {
-		pools.PutBoolSlice(qe.lenZeroComplement)
+		pooled.PutBoolSlice(qe.lenZeroComplement)
 	}
-	qe.index = fieldIndexStorageSlicePool.Get()
-	qe.index.SetLen(len(qe.indexedFieldAccess))
-	qe.nilIndex = fieldIndexStorageSlicePool.Get()
-	qe.nilIndex.SetLen(len(qe.indexedFieldAccess))
-	qe.lenIndex = fieldIndexStorageSlicePool.Get()
-	qe.lenIndex.SetLen(len(qe.indexedFieldAccess))
-	qe.measure = measureFieldStorageSlicePool.Get()
-	qe.measure.SetLen(len(qe.measureFieldAccess))
+	slotCount := len(qe.indexedFieldAccess)
+	qe.index = indexdata.GetFieldStorageSlice(slotCount)[:slotCount]
+	qe.nilIndex = indexdata.GetFieldStorageSlice(slotCount)[:slotCount]
+	qe.lenIndex = indexdata.GetFieldStorageSlice(slotCount)[:slotCount]
+	measureSlotCount := len(qe.measureFieldAccess)
+	qe.measure = indexdata.GetMeasureStorageSlice(measureSlotCount)[:measureSlotCount]
 	for _, acc := range qe.indexedFieldAccess {
 		if storage, ok := indexes[acc.name]; ok {
-			qe.index.Set(acc.ordinal, storage)
+			qe.index[acc.ordinal] = storage
 			delete(indexes, acc.name)
 		}
 		if storage, ok := nilIndexes[acc.name]; ok {
-			qe.nilIndex.Set(acc.ordinal, storage)
+			qe.nilIndex[acc.ordinal] = storage
 			delete(nilIndexes, acc.name)
 		}
 		if storage, ok := lenIndexes[acc.name]; ok {
-			qe.lenIndex.Set(acc.ordinal, storage)
+			qe.lenIndex[acc.ordinal] = storage
 			delete(lenIndexes, acc.name)
 		}
 	}
 	for _, acc := range qe.measureFieldAccess {
 		if storage, ok := measureIndexes[acc.name]; ok {
-			qe.measure.Set(acc.ordinal, storage)
+			qe.measure[acc.ordinal] = storage
 			delete(measureIndexes, acc.name)
 		}
 	}
-	releaseFieldIndexStorageMapOwned(indexes)
-	releaseFieldIndexStorageMapOwned(nilIndexes)
-	releaseFieldIndexStorageMapOwned(lenIndexes)
-	releaseMeasureFieldStorageMapOwned(measureIndexes)
+	indexdata.ReleaseFieldStorageMap(indexes)
+	indexdata.ReleaseFieldStorageMap(nilIndexes)
+	indexdata.ReleaseFieldStorageMap(lenIndexes)
+	indexdata.ReleaseMeasureStorageMap(measureIndexes)
 	qe.lenZeroComplement = detectLenZeroComplement(qe.lenIndex, qe.indexedFieldAccess)
 
 	lenLoaded := true
@@ -1413,8 +1075,7 @@ func (qe *queryEngine) loadIndexPayload(
 				lenLoaded = false
 				break
 			}
-			base := qe.lenIndex.Get(acc.ordinal).flatSlice()
-			if base == nil || len(*base) == 0 {
+			if qe.lenIndex[acc.ordinal].KeyCount() == 0 {
 				lenLoaded = false
 				break
 			}
@@ -1424,25 +1085,18 @@ func (qe *queryEngine) loadIndexPayload(
 	return skipFields, skipMeasureFields, plannerStats, strmap, lenLoaded, nil
 }
 
-func detectLenZeroComplement(indexes *pooled.Slice[fieldIndexStorage], access []indexedFieldAccessor) []bool {
-	out := pools.GetBoolSlice(len(access))[:len(access)]
+func detectLenZeroComplement(indexes []indexdata.FieldStorage, access []indexedFieldAccessor) []bool {
+	out := pooled.GetBoolSlice(len(access))[:len(access)]
 	clear(out)
 	if indexes == nil {
 		return out
 	}
 	for _, acc := range access {
-		if acc.ordinal >= indexes.Len() {
+		if acc.ordinal >= len(indexes) {
 			continue
 		}
-		slice := indexes.Get(acc.ordinal).flatSlice()
-		if slice == nil || len(*slice) == 0 {
-			continue
-		}
-		for _, ix := range *slice {
-			if keycodec.EqualsString(ix.Key, lenIndexNonEmptyKey) {
-				out[acc.ordinal] = true
-				break
-			}
+		if indexdata.NewFieldOverlayStorage(indexes[acc.ordinal]).LookupCardinality(indexdata.LenIndexNonEmptyKey) > 0 {
+			out[acc.ordinal] = true
 		}
 	}
 	return out
@@ -1551,7 +1205,7 @@ func (qe *queryEngine) storeIndexV26(writer *bufio.Writer, bucketSeq uint64) err
 	if err := writer.WriteByte(26); err != nil {
 		return fmt.Errorf("store: writing version: %w", err)
 	}
-	if err := writeUvarint(writer, bucketSeq); err != nil {
+	if err := writeSidecarUvarint(writer, bucketSeq); err != nil {
 		return fmt.Errorf("store: writing bucket sequence: %w", err)
 	}
 
@@ -1579,41 +1233,68 @@ func (qe *queryEngine) storeIndexPayload(writer *bufio.Writer) error {
 
 	fieldNames := sortedFieldNames(snap.fieldNameSet())
 
-	if err := writeIndexFamily(writer, fieldNames, func(field string) fieldIndexStorage {
+	if err := writeSidecarUvarint(writer, uint64(len(fieldNames))); err != nil {
+		return fmt.Errorf("encode: writing index family len: %w", err)
+	}
+	for _, field := range fieldNames {
+		if err := writeSidecarString(writer, field); err != nil {
+			return fmt.Errorf("encode: writing index field %q name: %w", field, err)
+		}
 		storage, _ := snap.fieldIndexStorage(field)
-		return storage
-	}); err != nil {
-		return err
+		if err := storage.WriteInto(writer); err != nil {
+			return fmt.Errorf("encode: writing index field %q: %w", field, err)
+		}
 	}
 
 	nilFieldNames := sortedFieldNames(snap.nilFieldNameSet())
 
-	if err := writeIndexFamily(writer, nilFieldNames, func(field string) fieldIndexStorage {
+	if err := writeSidecarUvarint(writer, uint64(len(nilFieldNames))); err != nil {
+		return fmt.Errorf("encode: writing index family len: %w", err)
+	}
+	for _, field := range nilFieldNames {
+		if err := writeSidecarString(writer, field); err != nil {
+			return fmt.Errorf("encode: writing index field %q name: %w", field, err)
+		}
 		acc := snap.indexedFieldByName[field]
-		return snap.nilIndex.Get(acc.ordinal)
-	}); err != nil {
-		return err
+		if err := snap.nilIndex[acc.ordinal].WriteInto(writer); err != nil {
+			return fmt.Errorf("encode: writing index field %q: %w", field, err)
+		}
 	}
 
 	lenFieldNames := sortedFieldNames(snap.lenFieldNameSet())
 
-	if err := writeIndexFamily(writer, lenFieldNames, func(field string) fieldIndexStorage {
+	if err := writeSidecarUvarint(writer, uint64(len(lenFieldNames))); err != nil {
+		return fmt.Errorf("encode: writing index family len: %w", err)
+	}
+	for _, field := range lenFieldNames {
+		if err := writeSidecarString(writer, field); err != nil {
+			return fmt.Errorf("encode: writing index field %q name: %w", field, err)
+		}
 		acc := snap.indexedFieldByName[field]
-		return snap.lenIndex.Get(acc.ordinal)
-	}); err != nil {
-		return err
+		if err := snap.lenIndex[acc.ordinal].WriteInto(writer); err != nil {
+			return fmt.Errorf("encode: writing index field %q: %w", field, err)
+		}
 	}
 
 	measureFieldNames := sortedMapFieldNames(qe.measureFields)
 
-	if err := writeMeasureIndexFamily(writer, measureFieldNames, func(field string) measureFieldStorage {
-		acc := qe.measureFieldMap[field]
-		if snap.measure == nil || acc.ordinal >= snap.measure.Len() {
-			return measureFieldStorage{}
+	if err := writeSidecarUvarint(writer, uint64(len(measureFieldNames))); err != nil {
+		return fmt.Errorf("encode: writing measure index family len: %w", err)
+	}
+	for _, field := range measureFieldNames {
+		if err := writeSidecarString(writer, field); err != nil {
+			return fmt.Errorf("encode: writing measure field %q name: %w", field, err)
 		}
-		return snap.measure.Get(acc.ordinal)
-	}); err != nil {
-		return err
+		acc := qe.measureFieldMap[field]
+		var storage indexdata.MeasureStorage
+		if snap.measure == nil || acc.ordinal >= len(snap.measure) {
+			storage = indexdata.MeasureStorage{}
+		} else {
+			storage = snap.measure[acc.ordinal]
+		}
+		if err := storage.WriteInto(writer); err != nil {
+			return fmt.Errorf("encode: writing measure field %q: %w", field, err)
+		}
 	}
 
 	statsVersion := qe.planner.statsVersion.Load()
@@ -1629,208 +1310,10 @@ func (qe *queryEngine) storeIndexPayload(writer *bufio.Writer) error {
 	return nil
 }
 
-func writeIndexFamily(writer *bufio.Writer, fields []string, storageFor func(string) fieldIndexStorage) error {
-	if err := writeUvarint(writer, uint64(len(fields))); err != nil {
-		return fmt.Errorf("encode: writing index family len: %w", err)
-	}
-
-	for _, f := range fields {
-		if err := writeFieldIndexSection(writer, f, storageFor(f)); err != nil {
-			return fmt.Errorf("encode: writing index field %q: %w", f, err)
-		}
-	}
-	return nil
-}
-
-func writeMeasureIndexFamily(writer *bufio.Writer, fields []string, storageFor func(string) measureFieldStorage) error {
-	if err := writeUvarint(writer, uint64(len(fields))); err != nil {
-		return fmt.Errorf("encode: writing measure index family len: %w", err)
-	}
-
-	for _, f := range fields {
-		if err := writeString(writer, f); err != nil {
-			return fmt.Errorf("encode: writing measure field %q name: %w", f, err)
-		}
-		if err := writeMeasureFieldStorage(writer, storageFor(f)); err != nil {
-			return fmt.Errorf("encode: writing measure field %q: %w", f, err)
-		}
-	}
-	return nil
-}
-
-func writeMeasureFieldStorage(writer *bufio.Writer, storage measureFieldStorage) error {
-	rows := storage.rows()
-	if err := writeUvarint(writer, uint64(rows)); err != nil {
-		return err
-	}
-	if rows == 0 {
-		return nil
-	}
-	if storage.flat != nil {
-		for i, id := range storage.flat.ids {
-			if err := writeUvarint(writer, id); err != nil {
-				return err
-			}
-			if err := writeUvarint(writer, storage.flat.values[i]); err != nil {
-				return err
-			}
-		}
-		return nil
-	}
-	for i := 0; i < storage.chunked.refsByID.Len(); i++ {
-		chunk := storage.chunked.refsByID.Get(i).chunk
-		for j, id := range chunk.ids {
-			if err := writeUvarint(writer, id); err != nil {
-				return err
-			}
-			if err := writeUvarint(writer, chunk.values[j]); err != nil {
-				return err
-			}
-		}
-	}
-	return nil
-}
-
-func writeFieldIndexSection(writer *bufio.Writer, field string, storage fieldIndexStorage) error {
-	if err := writeString(writer, field); err != nil {
-		return fmt.Errorf("encode: writing index field name: %w", err)
-	}
-	return writeFieldIndexStorage(writer, storage)
-}
-
 const (
-	fieldStorageEncodingFlat    byte = 1
-	fieldStorageEncodingChunked byte = 2
-
-	fieldIndexChunkEncodingString byte = 1
-	fieldIndexChunkEncodingRaw8   byte = 2
-
-	indexKeyEncodingString byte = 1
-	indexKeyEncodingRaw8   byte = 2
-
 	strMapEncodingDense  byte = 1
 	strMapEncodingSparse byte = 2
 )
-
-func writeFieldIndexStorage(writer *bufio.Writer, storage fieldIndexStorage) error {
-	switch {
-	case storage.chunked != nil:
-		if err := writer.WriteByte(fieldStorageEncodingChunked); err != nil {
-			return fmt.Errorf("encode: writing storage encoding: %w", err)
-		}
-		root := storage.chunked
-		if err := writeUvarint(writer, uint64(root.pages.Len())); err != nil {
-			return fmt.Errorf("encode: writing page count: %w", err)
-		}
-		for i := 0; i < root.pages.Len(); i++ {
-			page := root.pages.Get(i)
-			if err := writeUvarint(writer, uint64(page.refs.Len())); err != nil {
-				return fmt.Errorf("encode: writing page refs: %w", err)
-			}
-			for j := 0; j < page.refs.Len(); j++ {
-				if err := writeFieldIndexChunk(writer, page.refs.Get(j).chunk); err != nil {
-					return err
-				}
-			}
-		}
-		return nil
-	case storage.flat != nil:
-		if err := writer.WriteByte(fieldStorageEncodingFlat); err != nil {
-			return fmt.Errorf("encode: writing storage encoding: %w", err)
-		}
-		entries := storage.flat.entries
-		if err := writeUvarint(writer, uint64(len(entries))); err != nil {
-			return fmt.Errorf("encode: writing flat len: %w", err)
-		}
-		return writeIndexEntries(writer, entries)
-	default:
-		return fmt.Errorf("encode: empty field storage")
-	}
-}
-
-func writeFieldIndexChunk(writer *bufio.Writer, chunk *fieldIndexChunk) error {
-	if chunk == nil || chunk.keyCount() == 0 {
-		return fmt.Errorf("encode: empty chunk")
-	}
-	if chunk.hasNumericKeys() {
-		if err := writer.WriteByte(fieldIndexChunkEncodingRaw8); err != nil {
-			return fmt.Errorf("encode: writing chunk encoding: %w", err)
-		}
-		if err := writeUvarint(writer, uint64(chunk.keyCount())); err != nil {
-			return fmt.Errorf("encode: writing numeric chunk len: %w", err)
-		}
-		var buf [8]byte
-		for i := 0; i < chunk.keyCount(); i++ {
-			binary.BigEndian.PutUint64(buf[:], chunk.keyAt(i).U64())
-			if _, err := writer.Write(buf[:]); err != nil {
-				return fmt.Errorf("encode: writing numeric chunk key: %w", err)
-			}
-			if err := chunk.postingAt(i).WriteTo(writer); err != nil {
-				return fmt.Errorf("encode: writing numeric chunk posting: %w", err)
-			}
-		}
-		return nil
-	}
-
-	if err := writer.WriteByte(fieldIndexChunkEncodingString); err != nil {
-		return fmt.Errorf("encode: writing chunk encoding: %w", err)
-	}
-	if err := writeUvarint(writer, uint64(len(chunk.stringRefs))); err != nil {
-		return fmt.Errorf("encode: writing string chunk len: %w", err)
-	}
-	for i := 0; i < chunk.keyCount(); i++ {
-		ref := chunk.stringRefs[i]
-		if err := writeUvarint(writer, uint64(ref.len)); err != nil {
-			return fmt.Errorf("encode: writing string chunk key len: %w", err)
-		}
-		if ref.len > 0 {
-			start := int(ref.off)
-			end := start + int(ref.len)
-			if _, err := writer.Write(chunk.stringData[start:end]); err != nil {
-				return fmt.Errorf("encode: writing string chunk key: %w", err)
-			}
-		}
-		if err := chunk.postingAt(i).WriteTo(writer); err != nil {
-			return fmt.Errorf("encode: writing string chunk posting: %w", err)
-		}
-	}
-	return nil
-}
-
-func writeIndexEntries(writer *bufio.Writer, entries []index) error {
-	for i := range entries {
-		if err := writeIndexEntry(writer, entries[i]); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func writeIndexEntry(writer *bufio.Writer, entry index) error {
-	if err := writeIndexKey(writer, entry.Key); err != nil {
-		return fmt.Errorf("encode: writing entry key: %w", err)
-	}
-	if err := entry.IDs.WriteTo(writer); err != nil {
-		return fmt.Errorf("encode: writing entry posting: %w", err)
-	}
-	return nil
-}
-
-func writeIndexKey(writer *bufio.Writer, key keycodec.IndexKey) error {
-	if key.IsNumeric() {
-		if err := writer.WriteByte(indexKeyEncodingRaw8); err != nil {
-			return err
-		}
-		var b [8]byte
-		binary.BigEndian.PutUint64(b[:], key.U64())
-		_, err := writer.Write(b[:])
-		return err
-	}
-	if err := writer.WriteByte(indexKeyEncodingString); err != nil {
-		return err
-	}
-	return writeString(writer, key.UnsafeString())
-}
 
 func writeFields(writer *bufio.Writer, fields map[string]*field) error {
 	names := make([]string, 0, len(fields))
@@ -1839,7 +1322,7 @@ func writeFields(writer *bufio.Writer, fields map[string]*field) error {
 	}
 	sort.Strings(names)
 
-	if err := writeUvarint(writer, uint64(len(names))); err != nil {
+	if err := writeSidecarUvarint(writer, uint64(len(names))); err != nil {
 		return fmt.Errorf("encode: writing fields len: %w", err)
 	}
 	for _, name := range names {
@@ -1851,38 +1334,38 @@ func writeFields(writer *bufio.Writer, fields map[string]*field) error {
 }
 
 func writeField(writer *bufio.Writer, name string, f *field) error {
-	if err := writeString(writer, name); err != nil {
+	if err := writeSidecarString(writer, name); err != nil {
 		return err
 	}
-	if err := writeBool(writer, f.Unique); err != nil {
+	if err := writeSidecarBool(writer, f.Unique); err != nil {
 		return err
 	}
-	if err := writeUvarint(writer, uint64(f.IndexKind)); err != nil {
+	if err := writeSidecarUvarint(writer, uint64(f.IndexKind)); err != nil {
 		return err
 	}
-	if err := writeUvarint(writer, uint64(f.Kind)); err != nil {
+	if err := writeSidecarUvarint(writer, uint64(f.Kind)); err != nil {
 		return err
 	}
-	if err := writeBool(writer, f.Ptr); err != nil {
+	if err := writeSidecarBool(writer, f.Ptr); err != nil {
 		return err
 	}
-	if err := writeBool(writer, f.Slice); err != nil {
+	if err := writeSidecarBool(writer, f.Slice); err != nil {
 		return err
 	}
-	if err := writeBool(writer, f.UseVI); err != nil {
+	if err := writeSidecarBool(writer, f.UseVI); err != nil {
 		return err
 	}
-	if err := writeString(writer, f.DBName); err != nil {
+	if err := writeSidecarString(writer, f.DBName); err != nil {
 		return err
 	}
-	if err := writeUvarint(writer, uint64(len(f.Index))); err != nil {
+	if err := writeSidecarUvarint(writer, uint64(len(f.Index))); err != nil {
 		return err
 	}
 	for _, idx := range f.Index {
 		if idx < 0 {
 			return fmt.Errorf("negative field index")
 		}
-		if err := writeUvarint(writer, uint64(idx)); err != nil {
+		if err := writeSidecarUvarint(writer, uint64(idx)); err != nil {
 			return err
 		}
 	}
@@ -1890,11 +1373,11 @@ func writeField(writer *bufio.Writer, name string, f *field) error {
 }
 
 func readField(reader *bufio.Reader) (string, *field, error) {
-	name, err := readString(reader)
+	name, err := readSidecarString(reader)
 	if err != nil {
 		return "", nil, err
 	}
-	unique, err := readBool(reader)
+	unique, err := readSidecarBool(reader)
 	if err != nil {
 		return "", nil, err
 	}
@@ -1913,19 +1396,19 @@ func readField(reader *bufio.Reader) (string, *field, error) {
 	if err != nil {
 		return "", nil, err
 	}
-	ptr, err := readBool(reader)
+	ptr, err := readSidecarBool(reader)
 	if err != nil {
 		return "", nil, err
 	}
-	slice, err := readBool(reader)
+	slice, err := readSidecarBool(reader)
 	if err != nil {
 		return "", nil, err
 	}
-	useVI, err := readBool(reader)
+	useVI, err := readSidecarBool(reader)
 	if err != nil {
 		return "", nil, err
 	}
-	dbName, err := readString(reader)
+	dbName, err := readSidecarString(reader)
 	if err != nil {
 		return "", nil, err
 	}
@@ -1958,16 +1441,16 @@ func readField(reader *bufio.Reader) (string, *field, error) {
 
 func writeStrMapSnapshot(writer *bufio.Writer, sm *strMapSnapshot) error {
 	if sm == nil {
-		if err := writeUvarint(writer, 0); err != nil {
+		if err := writeSidecarUvarint(writer, 0); err != nil {
 			return fmt.Errorf("encode: writing strmap next: %w", err)
 		}
 		if err := writer.WriteByte(strMapEncodingSparse); err != nil {
 			return fmt.Errorf("encode: writing strmap encoding: %w", err)
 		}
-		return writeUvarint(writer, 0)
+		return writeSidecarUvarint(writer, 0)
 	}
 
-	if err := writeUvarint(writer, sm.Next); err != nil {
+	if err := writeSidecarUvarint(writer, sm.Next); err != nil {
 		return fmt.Errorf("encode: writing strmap next: %w", err)
 	}
 
@@ -1978,7 +1461,7 @@ func writeStrMapSnapshot(writer *bufio.Writer, sm *strMapSnapshot) error {
 		if err := writer.WriteByte(strMapEncodingSparse); err != nil {
 			return fmt.Errorf("encode: writing strmap encoding: %w", err)
 		}
-		if err := writeUvarint(writer, uint64(usedCount)); err != nil {
+		if err := writeSidecarUvarint(writer, uint64(usedCount)); err != nil {
 			return fmt.Errorf("encode: writing strmap sparse len: %w", err)
 		}
 		it := strMapSnapshotPersistIter{chain: chain}
@@ -1987,10 +1470,10 @@ func writeStrMapSnapshot(writer *bufio.Writer, sm *strMapSnapshot) error {
 			if !ok {
 				break
 			}
-			if err := writeUvarint(writer, idx); err != nil {
+			if err := writeSidecarUvarint(writer, idx); err != nil {
 				return fmt.Errorf("encode: writing strmap sparse idx: %w", err)
 			}
-			if err := writeString(writer, value); err != nil {
+			if err := writeSidecarString(writer, value); err != nil {
 				return fmt.Errorf("encode: writing strmap sparse string: %w", err)
 			}
 		}
@@ -2002,7 +1485,7 @@ func writeStrMapSnapshot(writer *bufio.Writer, sm *strMapSnapshot) error {
 	}
 
 	denseLen := int(sm.Next) + 1
-	if err := writeUvarint(writer, uint64(denseLen)); err != nil {
+	if err := writeSidecarUvarint(writer, uint64(denseLen)); err != nil {
 		return fmt.Errorf("encode: writing strmap dense len: %w", err)
 	}
 
@@ -2027,7 +1510,7 @@ func writeStrMapSnapshot(writer *bufio.Writer, sm *strMapSnapshot) error {
 		if !ok {
 			break
 		}
-		if err := writeString(writer, value); err != nil {
+		if err := writeSidecarString(writer, value); err != nil {
 			return fmt.Errorf("encode: writing strmap string: %w", err)
 		}
 	}
@@ -2234,7 +1717,7 @@ func readStrMap(reader *bufio.Reader, compactAt int) (*strMapper, error) {
 			if flags[i>>3]&(1<<uint(i&7)) == 0 {
 				continue
 			}
-			s, err := readString(reader)
+			s, err := readSidecarString(reader)
 			if err != nil {
 				return nil, fmt.Errorf("decode: reading strmap dense string idx=%d: %w", i, err)
 			}
@@ -2270,7 +1753,7 @@ func readStrMap(reader *bufio.Reader, compactAt int) (*strMapper, error) {
 			if _, exists := strs[idx]; exists {
 				return nil, fmt.Errorf("decode: duplicate strmap sparse idx at entry=%d/%d: %v", i+1, count, idx)
 			}
-			s, err := readString(reader)
+			s, err := readSidecarString(reader)
 			if err != nil {
 				return nil, fmt.Errorf("decode: reading strmap sparse string idx=%d entry=%d/%d: %w", idx, i+1, count, err)
 			}
@@ -2360,19 +1843,19 @@ func estimateSparseStrMapReverseBytes(usedCount int) uint64 {
 
 func writePlannerStatsSnapshot(writer *bufio.Writer, s *plannerStatsSnapshot) error {
 	if s == nil {
-		if err := writeUvarint(writer, 0); err != nil {
+		if err := writeSidecarUvarint(writer, 0); err != nil {
 			return fmt.Errorf("encode: writing planner stats version: %w", err)
 		}
-		if err := writeUvarint(writer, 0); err != nil {
+		if err := writeSidecarUvarint(writer, 0); err != nil {
 			return fmt.Errorf("encode: writing planner stats generated_at: %w", err)
 		}
-		if err := writeUvarint(writer, 0); err != nil {
+		if err := writeSidecarUvarint(writer, 0); err != nil {
 			return fmt.Errorf("encode: writing planner stats universe: %w", err)
 		}
-		return writeUvarint(writer, 0)
+		return writeSidecarUvarint(writer, 0)
 	}
 
-	if err := writeUvarint(writer, s.Version); err != nil {
+	if err := writeSidecarUvarint(writer, s.Version); err != nil {
 		return fmt.Errorf("encode: writing planner stats version: %w", err)
 	}
 
@@ -2380,19 +1863,19 @@ func writePlannerStatsSnapshot(writer *bufio.Writer, s *plannerStatsSnapshot) er
 	if !s.GeneratedAt.IsZero() {
 		generatedAt = uint64(s.GeneratedAt.UnixNano())
 	}
-	if err := writeUvarint(writer, generatedAt); err != nil {
+	if err := writeSidecarUvarint(writer, generatedAt); err != nil {
 		return fmt.Errorf("encode: writing planner stats generated_at: %w", err)
 	}
-	if err := writeUvarint(writer, s.UniverseCardinality); err != nil {
+	if err := writeSidecarUvarint(writer, s.UniverseCardinality); err != nil {
 		return fmt.Errorf("encode: writing planner stats universe: %w", err)
 	}
 
 	fields := sortedMapFieldNames(s.Fields)
-	if err := writeUvarint(writer, uint64(len(fields))); err != nil {
+	if err := writeSidecarUvarint(writer, uint64(len(fields))); err != nil {
 		return fmt.Errorf("encode: writing planner stats field count: %w", err)
 	}
 	for _, f := range fields {
-		if err := writeString(writer, f); err != nil {
+		if err := writeSidecarString(writer, f); err != nil {
 			return fmt.Errorf("encode: writing planner stats field name: %w", err)
 		}
 		if err := writePlannerFieldStats(writer, s.Fields[f]); err != nil {
@@ -2428,7 +1911,7 @@ func readPlannerStatsSnapshot(reader *bufio.Reader, compatible map[string]bool) 
 
 	fields := make(map[string]PlannerFieldStats, min(int(fieldCount), len(compatible)))
 	for i := uint64(0); i < fieldCount; i++ {
-		f, err := readString(reader)
+		f, err := readSidecarString(reader)
 		if err != nil {
 			return nil, fmt.Errorf("decode: reading planner stats field name %d/%d: %w", i+1, fieldCount, err)
 		}
@@ -2464,22 +1947,22 @@ func readPlannerStatsSnapshot(reader *bufio.Reader, compatible map[string]bool) 
 }
 
 func writePlannerFieldStats(writer *bufio.Writer, s PlannerFieldStats) error {
-	if err := writeUvarint(writer, s.DistinctKeys); err != nil {
+	if err := writeSidecarUvarint(writer, s.DistinctKeys); err != nil {
 		return err
 	}
-	if err := writeUvarint(writer, s.NonEmptyKeys); err != nil {
+	if err := writeSidecarUvarint(writer, s.NonEmptyKeys); err != nil {
 		return err
 	}
-	if err := writeUvarint(writer, s.TotalBucketCard); err != nil {
+	if err := writeSidecarUvarint(writer, s.TotalBucketCard); err != nil {
 		return err
 	}
-	if err := writeUvarint(writer, s.MaxBucketCard); err != nil {
+	if err := writeSidecarUvarint(writer, s.MaxBucketCard); err != nil {
 		return err
 	}
-	if err := writeUvarint(writer, s.P50BucketCard); err != nil {
+	if err := writeSidecarUvarint(writer, s.P50BucketCard); err != nil {
 		return err
 	}
-	if err := writeUvarint(writer, s.P95BucketCard); err != nil {
+	if err := writeSidecarUvarint(writer, s.P95BucketCard); err != nil {
 		return err
 	}
 	return nil
@@ -2541,19 +2024,19 @@ func readIndexSections(
 	reader *bufio.Reader,
 	compatible map[string]bool,
 	section string,
-) (map[string]fieldIndexStorage, error) {
+) (map[string]indexdata.FieldStorage, error) {
 	count, err := binary.ReadUvarint(reader)
 	if err != nil {
 		return nil, fmt.Errorf("reading %s field count: %w", section, err)
 	}
 	if count == 0 {
-		return make(map[string]fieldIndexStorage), nil
+		return make(map[string]indexdata.FieldStorage), nil
 	}
 
-	out := make(map[string]fieldIndexStorage, min(int(count), len(compatible)))
+	out := make(map[string]indexdata.FieldStorage, min(int(count), len(compatible)))
 	seen := make(map[string]struct{}, min(int(count), len(compatible)))
 	for i := uint64(0); i < count; i++ {
-		f, err := readString(reader)
+		f, err := readSidecarString(reader)
 		if err != nil {
 			return nil, fmt.Errorf("reading %s field name %d/%d: %w", section, i+1, count, err)
 		}
@@ -2563,11 +2046,11 @@ func readIndexSections(
 		seen[f] = struct{}{}
 
 		keep := compatible[f]
-		storage, err := readFieldIndexStorage(reader, keep, section, f)
+		storage, err := indexdata.ReadFieldStorage(reader, keep, section, f)
 		if err != nil {
 			return nil, fmt.Errorf("reading %s storage for field %q (%d/%d keep=%t): %w", section, f, i+1, count, keep, err)
 		}
-		if keep && storage.keyCount() > 0 {
+		if keep && storage.KeyCount() > 0 {
 			out[f] = storage
 		}
 	}
@@ -2578,19 +2061,19 @@ func readIndexSections(
 func readMeasureIndexSections(
 	reader *bufio.Reader,
 	compatible map[string]bool,
-) (map[string]measureFieldStorage, error) {
+) (map[string]indexdata.MeasureStorage, error) {
 	count, err := binary.ReadUvarint(reader)
 	if err != nil {
 		return nil, fmt.Errorf("reading measure index field count: %w", err)
 	}
 	if count == 0 {
-		return make(map[string]measureFieldStorage), nil
+		return make(map[string]indexdata.MeasureStorage), nil
 	}
 
-	out := make(map[string]measureFieldStorage, min(int(count), len(compatible)))
+	out := make(map[string]indexdata.MeasureStorage, min(int(count), len(compatible)))
 	seen := make(map[string]struct{}, min(int(count), len(compatible)))
 	for i := uint64(0); i < count; i++ {
-		f, err := readString(reader)
+		f, err := readSidecarString(reader)
 		if err != nil {
 			return nil, fmt.Errorf("reading measure index field name %d/%d: %w", i+1, count, err)
 		}
@@ -2600,7 +2083,7 @@ func readMeasureIndexSections(
 		seen[f] = struct{}{}
 
 		keep := compatible[f]
-		storage, err := readMeasureFieldStorage(reader, keep)
+		storage, err := indexdata.ReadMeasureStorage(reader, keep)
 		if err != nil {
 			return nil, fmt.Errorf("reading measure index storage for field %q (%d/%d keep=%t): %w", f, i+1, count, keep, err)
 		}
@@ -2610,322 +2093,6 @@ func readMeasureIndexSections(
 	}
 
 	return out, nil
-}
-
-func readMeasureFieldStorage(reader *bufio.Reader, keep bool) (measureFieldStorage, error) {
-	count, err := binary.ReadUvarint(reader)
-	if err != nil {
-		return measureFieldStorage{}, err
-	}
-	if count > uint64(^uint(0)>>1) {
-		return measureFieldStorage{}, fmt.Errorf("measure row count overflows int: %v", count)
-	}
-	var entries *pooled.Slice[measureEntry]
-	if keep {
-		entries = measureEntrySlicePool.Get()
-		entries.Grow(int(count))
-	}
-	for i := uint64(0); i < count; i++ {
-		id, err := binary.ReadUvarint(reader)
-		if err != nil {
-			if entries != nil {
-				measureEntrySlicePool.Put(entries)
-			}
-			return measureFieldStorage{}, fmt.Errorf("reading measure row %d/%d id: %w", i+1, count, err)
-		}
-		value, err := binary.ReadUvarint(reader)
-		if err != nil {
-			if entries != nil {
-				measureEntrySlicePool.Put(entries)
-			}
-			return measureFieldStorage{}, fmt.Errorf("reading measure row %d/%d value: %w", i+1, count, err)
-		}
-		if keep {
-			entries.Append(measureEntry{id: id, value: value})
-		}
-	}
-	if !keep {
-		return measureFieldStorage{}, nil
-	}
-	return newMeasureStorageFromEntriesOwned(entries), nil
-}
-
-func readFieldIndexStorage(reader *bufio.Reader, keep bool, section string, fieldName string) (fieldIndexStorage, error) {
-	tag, err := reader.ReadByte()
-	if err != nil {
-		return fieldIndexStorage{}, fmt.Errorf("reading storage encoding: %w", err)
-	}
-	switch tag {
-	case fieldStorageEncodingFlat:
-		count, err := binary.ReadUvarint(reader)
-		if err != nil {
-			return fieldIndexStorage{}, fmt.Errorf("reading flat len: %w", err)
-		}
-		if !keep {
-			for i := uint64(0); i < count; i++ {
-				if err := skipIndexEntry(reader); err != nil {
-					return fieldIndexStorage{}, fmt.Errorf("skipping flat entry %d/%d for field %q in %s: %w", i+1, count, fieldName, section, err)
-				}
-			}
-			return fieldIndexStorage{}, nil
-		}
-		entries := make([]index, 0, count)
-		for i := uint64(0); i < count; i++ {
-			ent, err := readIndexEntry(reader)
-			if err != nil {
-				return fieldIndexStorage{}, fmt.Errorf("reading flat entry %d/%d for field %q in %s: %w", i+1, count, fieldName, section, err)
-			}
-			if ent.IDs.IsEmpty() {
-				continue
-			}
-			entries = append(entries, ent)
-		}
-		return newFlatFieldIndexStorage(&entries), nil
-
-	case fieldStorageEncodingChunked:
-		pageCount, err := binary.ReadUvarint(reader)
-		if err != nil {
-			return fieldIndexStorage{}, fmt.Errorf("reading page count: %w", err)
-		}
-		if !keep {
-			for i := uint64(0); i < pageCount; i++ {
-				refCount, err := binary.ReadUvarint(reader)
-				if err != nil {
-					return fieldIndexStorage{}, fmt.Errorf("reading page ref count %d/%d for field %q in %s: %w", i+1, pageCount, fieldName, section, err)
-				}
-				for j := uint64(0); j < refCount; j++ {
-					if err := skipFieldIndexChunk(reader); err != nil {
-						return fieldIndexStorage{}, fmt.Errorf("skipping chunk page=%d/%d ref=%d/%d for field %q in %s: %w", i+1, pageCount, j+1, refCount, fieldName, section, err)
-					}
-				}
-			}
-			return fieldIndexStorage{}, nil
-		}
-		builder := newFieldIndexChunkBuilder(0)
-		for i := uint64(0); i < pageCount; i++ {
-			refCount, err := binary.ReadUvarint(reader)
-			if err != nil {
-				return fieldIndexStorage{}, fmt.Errorf("reading page ref count %d/%d for field %q in %s: %w", i+1, pageCount, fieldName, section, err)
-			}
-			refs := make([]fieldIndexChunkRef, 0, refCount)
-			for j := uint64(0); j < refCount; j++ {
-				chunk, err := readFieldIndexChunk(reader)
-				if err != nil {
-					return fieldIndexStorage{}, fmt.Errorf("reading chunk page=%d/%d ref=%d/%d for field %q in %s: %w", i+1, pageCount, j+1, refCount, fieldName, section, err)
-				}
-				if chunk == nil || chunk.keyCount() == 0 {
-					continue
-				}
-				last := chunk.keyCount() - 1
-				refs = append(refs, fieldIndexChunkRef{
-					last:  chunk.keyAt(last),
-					chunk: chunk,
-				})
-			}
-			if len(refs) > 0 {
-				builder.appendOwnedPage(newFieldIndexChunkDirPage(refs))
-			}
-		}
-		return newChunkedFieldIndexStorage(builder.root()), nil
-
-	default:
-		return fieldIndexStorage{}, fmt.Errorf("invalid field storage encoding %v", tag)
-	}
-}
-
-func readFieldIndexChunk(reader *bufio.Reader) (*fieldIndexChunk, error) {
-	tag, err := reader.ReadByte()
-	if err != nil {
-		return nil, fmt.Errorf("reading field chunk encoding: %w", err)
-	}
-	switch tag {
-	case fieldIndexChunkEncodingRaw8:
-		count, err := binary.ReadUvarint(reader)
-		if err != nil {
-			return nil, fmt.Errorf("reading numeric chunk len: %w", err)
-		}
-		if count == 0 {
-			return nil, nil
-		}
-		if count > uint64(^uint(0)>>1) {
-			return nil, fmt.Errorf("numeric chunk len overflows int: %v", count)
-		}
-		keys := make([]uint64, int(count))
-		posts := make([]posting.List, int(count))
-		var buf [8]byte
-		for i := range keys {
-			if _, err := io.ReadFull(reader, buf[:]); err != nil {
-				return nil, fmt.Errorf("reading numeric chunk key %d/%d: %w", i+1, len(keys), err)
-			}
-			keys[i] = binary.BigEndian.Uint64(buf[:])
-			ids, err := posting.ReadFrom(reader)
-			if err != nil {
-				return nil, fmt.Errorf("reading numeric chunk posting %d/%d: %w", i+1, len(keys), err)
-			}
-			posts[i] = ids
-		}
-		return newNumericFieldIndexChunk(posts, keys, postingRows(posts)), nil
-
-	case fieldIndexChunkEncodingString:
-		count, err := binary.ReadUvarint(reader)
-		if err != nil {
-			return nil, fmt.Errorf("reading string chunk len: %w", err)
-		}
-		if count == 0 {
-			return nil, nil
-		}
-		if count > uint64(^uint(0)>>1) {
-			return nil, fmt.Errorf("string chunk len overflows int: %v", count)
-		}
-		refs := make([]fieldIndexStringRef, int(count))
-		posts := make([]posting.List, int(count))
-		data := make([]byte, 0, int(count)*8)
-		for i := range refs {
-			n, err := binary.ReadUvarint(reader)
-			if err != nil {
-				return nil, fmt.Errorf("reading string chunk key len %d/%d: %w", i+1, len(refs), err)
-			}
-			if n > uint64(^uint(0)>>1) {
-				return nil, fmt.Errorf("string chunk key len overflows int at entry %d/%d: %v", i+1, len(refs), n)
-			}
-			keyLen := int(n)
-			start := len(data)
-			data = slices.Grow(data, keyLen)
-			data = data[:start+keyLen]
-			if keyLen > 0 {
-				if _, err := io.ReadFull(reader, data[start:start+keyLen]); err != nil {
-					return nil, fmt.Errorf("reading string chunk key %d/%d: %w", i+1, len(refs), err)
-				}
-			}
-			if !fieldIndexStringRefFits(start, keyLen) {
-				if keyLen > fieldIndexStringRefMax {
-					return nil, fmt.Errorf("string chunk key len exceeds uint16 at entry %d/%d: %d", i+1, len(refs), keyLen)
-				}
-				return nil, fmt.Errorf("string chunk key offset exceeds uint16 at entry %d/%d: %d", i+1, len(refs), start)
-			}
-			refs[i] = newFieldIndexStringRef(start, keyLen)
-			ids, err := posting.ReadFrom(reader)
-			if err != nil {
-				return nil, fmt.Errorf("reading string chunk posting %d/%d: %w", i+1, len(refs), err)
-			}
-			posts[i] = ids
-		}
-		return newStringFieldIndexChunk(posts, refs, data, postingRows(posts)), nil
-
-	default:
-		return nil, fmt.Errorf("invalid field chunk encoding %v", tag)
-	}
-}
-
-func skipFieldIndexChunk(reader *bufio.Reader) error {
-	tag, err := reader.ReadByte()
-	if err != nil {
-		return fmt.Errorf("reading field chunk encoding: %w", err)
-	}
-	switch tag {
-	case fieldIndexChunkEncodingRaw8:
-		count, err := binary.ReadUvarint(reader)
-		if err != nil {
-			return fmt.Errorf("reading numeric chunk len: %w", err)
-		}
-		for i := uint64(0); i < count; i++ {
-			if _, err := io.CopyN(io.Discard, reader, 8); err != nil {
-				return fmt.Errorf("skipping numeric chunk key %d/%d: %w", i+1, count, err)
-			}
-			if err := posting.Skip(reader); err != nil {
-				return fmt.Errorf("skipping numeric chunk posting %d/%d: %w", i+1, count, err)
-			}
-		}
-		return nil
-
-	case fieldIndexChunkEncodingString:
-		count, err := binary.ReadUvarint(reader)
-		if err != nil {
-			return fmt.Errorf("reading string chunk len: %w", err)
-		}
-		for i := uint64(0); i < count; i++ {
-			n, err := binary.ReadUvarint(reader)
-			if err != nil {
-				return fmt.Errorf("reading string chunk key len %d/%d: %w", i+1, count, err)
-			}
-			if n > 0 {
-				if _, err := io.CopyN(io.Discard, reader, int64(n)); err != nil {
-					return fmt.Errorf("skipping string chunk key %d/%d: %w", i+1, count, err)
-				}
-			}
-			if err := posting.Skip(reader); err != nil {
-				return fmt.Errorf("skipping string chunk posting %d/%d: %w", i+1, count, err)
-			}
-		}
-		return nil
-
-	default:
-		return fmt.Errorf("invalid field chunk encoding %v", tag)
-	}
-}
-
-func readIndexEntry(reader *bufio.Reader) (index, error) {
-	key, err := readIndexKey(reader)
-	if err != nil {
-		return index{}, fmt.Errorf("reading index key: %w", err)
-	}
-	ids, err := posting.ReadFrom(reader)
-	if err != nil {
-		return index{}, fmt.Errorf("reading index posting: %w", err)
-	}
-	return index{Key: key, IDs: ids}, nil
-}
-
-func skipIndexEntry(reader *bufio.Reader) error {
-	if err := skipIndexKey(reader); err != nil {
-		return fmt.Errorf("skipping index key: %w", err)
-	}
-	if err := posting.Skip(reader); err != nil {
-		return fmt.Errorf("skipping index posting: %w", err)
-	}
-	return nil
-}
-
-func readIndexKey(reader *bufio.Reader) (keycodec.IndexKey, error) {
-	tag, err := reader.ReadByte()
-	if err != nil {
-		return keycodec.IndexKey{}, err
-	}
-	switch tag {
-	case indexKeyEncodingString:
-		s, err := readString(reader)
-		if err != nil {
-			return keycodec.IndexKey{}, err
-		}
-		if err := validateIndexedStringKeyLen(len(s)); err != nil {
-			return keycodec.IndexKey{}, err
-		}
-		return keycodec.FromString(s), nil
-	case indexKeyEncodingRaw8:
-		var buf [8]byte
-		if _, err := io.ReadFull(reader, buf[:]); err != nil {
-			return keycodec.IndexKey{}, err
-		}
-		return keycodec.FromU64(binary.BigEndian.Uint64(buf[:])), nil
-	default:
-		return keycodec.IndexKey{}, fmt.Errorf("invalid index key encoding %v", tag)
-	}
-}
-
-func skipIndexKey(reader *bufio.Reader) error {
-	tag, err := reader.ReadByte()
-	if err != nil {
-		return err
-	}
-	switch tag {
-	case indexKeyEncodingString:
-		return skipString(reader)
-	case indexKeyEncodingRaw8:
-		_, err := io.CopyN(io.Discard, reader, 8)
-		return err
-	default:
-		return fmt.Errorf("invalid index key encoding %v", tag)
-	}
 }
 
 func sortedFieldNames(set map[string]struct{}) []string {
@@ -2940,7 +2107,7 @@ func sortedFieldNames(set map[string]struct{}) []string {
 	return out
 }
 
-func writeUvarint(writer *bufio.Writer, v uint64) error {
+func writeSidecarUvarint(writer *bufio.Writer, v uint64) error {
 	var buf [binary.MaxVarintLen64]byte
 	n := binary.PutUvarint(buf[:], v)
 	if _, err := writer.Write(buf[:n]); err != nil {
@@ -2949,14 +2116,14 @@ func writeUvarint(writer *bufio.Writer, v uint64) error {
 	return nil
 }
 
-func writeBool(writer *bufio.Writer, v bool) error {
+func writeSidecarBool(writer *bufio.Writer, v bool) error {
 	if v {
 		return writer.WriteByte(1)
 	}
 	return writer.WriteByte(0)
 }
 
-func readBool(reader *bufio.Reader) (bool, error) {
+func readSidecarBool(reader *bufio.Reader) (bool, error) {
 	v, err := reader.ReadByte()
 	if v != 0 && v != 1 {
 		return false, fmt.Errorf("corrupted bool value: %v", v)
@@ -2964,8 +2131,8 @@ func readBool(reader *bufio.Reader) (bool, error) {
 	return v > 0, err
 }
 
-func writeString(writer *bufio.Writer, s string) error {
-	if err := writeUvarint(writer, uint64(len(s))); err != nil {
+func writeSidecarString(writer *bufio.Writer, s string) error {
+	if err := writeSidecarUvarint(writer, uint64(len(s))); err != nil {
 		return err
 	}
 	if len(s) == 0 {
@@ -2977,7 +2144,7 @@ func writeString(writer *bufio.Writer, s string) error {
 	return nil
 }
 
-func readString(reader *bufio.Reader) (string, error) {
+func readSidecarString(reader *bufio.Reader) (string, error) {
 	n, err := binary.ReadUvarint(reader)
 	if err != nil {
 		return "", err
@@ -2985,8 +2152,8 @@ func readString(reader *bufio.Reader) (string, error) {
 	if n == 0 {
 		return "", nil
 	}
-	if n > maxStoredStringLen {
-		return "", fmt.Errorf("string len %v exceeds limit (%v)", n, maxStoredStringLen)
+	if n > indexdata.MaxStoredStringLen {
+		return "", fmt.Errorf("string len %v exceeds limit (%v)", n, indexdata.MaxStoredStringLen)
 	}
 	if n > uint64(^uint(0)>>1) {
 		return "", fmt.Errorf("string len %v overflows int", n)
@@ -2997,471 +2164,4 @@ func readString(reader *bufio.Reader) (string, error) {
 	}
 	s := unsafe.String(unsafe.SliceData(b), len(b))
 	return s, nil
-}
-
-func skipString(reader *bufio.Reader) error {
-	n, err := binary.ReadUvarint(reader)
-	if err != nil {
-		return err
-	}
-	if n == 0 {
-		return nil
-	}
-	if n > maxStoredStringLen {
-		return fmt.Errorf("string len %v exceeds limit (%v)", n, maxStoredStringLen)
-	}
-	if n > uint64(^uint(0)>>1) {
-		return fmt.Errorf("string len %v overflows int", n)
-	}
-	if _, err = io.CopyN(io.Discard, reader, int64(n)); err != nil {
-		return err
-	}
-	return nil
-}
-
-// fieldOverlay provides read helpers over one immutable sorted index slice.
-type fieldOverlay struct {
-	base    []index
-	chunked *fieldIndexChunkedRoot
-}
-
-type overlayRange struct {
-	baseStart int
-	baseEnd   int
-
-	startPos fieldIndexChunkPos
-	endPos   fieldIndexChunkPos
-}
-
-type overlayKeyCursor struct {
-	base    []index
-	chunked *fieldIndexChunkedRoot
-
-	pos       int
-	end       int
-	remaining int
-
-	chunkIdx int
-	entryIdx int
-	pageIdx  int
-	refIdx   int
-	chunk    *fieldIndexChunk
-	desc     bool
-}
-
-func newFieldOverlay(base *[]index) fieldOverlay {
-	if base == nil {
-		return fieldOverlay{}
-	}
-	return fieldOverlay{base: *base}
-}
-
-func newFieldOverlayStorage(storage fieldIndexStorage) fieldOverlay {
-	if storage.chunked != nil {
-		return fieldOverlay{chunked: storage.chunked}
-	}
-	return newFieldOverlay(storage.flatSlice())
-}
-
-func (o fieldOverlay) hasData() bool {
-	return o.keyCount() > 0
-}
-
-func (o fieldOverlay) keyCount() int {
-	if o.chunked != nil {
-		return o.chunked.keyCount
-	}
-	return len(o.base)
-}
-
-func (o fieldOverlay) lowerBound(key string) int {
-	if o.chunked != nil {
-		return o.chunked.lowerBound(key)
-	}
-	return lowerBoundIndex(o.base, key)
-}
-
-func (o fieldOverlay) lowerBoundKey(key keycodec.IndexKey) int {
-	if o.chunked != nil {
-		_, rank := o.chunked.lowerBoundPosKey(key)
-		return rank
-	}
-	return lowerBoundIndexEntriesKey(o.base, key)
-}
-
-func (o fieldOverlay) upperBound(key string) int {
-	if o.chunked != nil {
-		return o.chunked.upperBound(key)
-	}
-	return upperBoundIndex(o.base, key)
-}
-
-func (o fieldOverlay) upperBoundKey(key keycodec.IndexKey) int {
-	if o.chunked != nil {
-		_, rank := o.chunked.upperBoundPosKey(key)
-		return rank
-	}
-	return upperBoundIndexEntriesKey(o.base, key)
-}
-
-func (o fieldOverlay) prefixRangeEnd(prefix string, start int) int {
-	if o.chunked != nil {
-		return o.chunked.prefixRangeEnd(prefix, start)
-	}
-	return prefixRangeEndIndex(o.base, prefix, start)
-}
-
-func (o fieldOverlay) lookupCardinality(key string) uint64 {
-	ids := o.lookupPostingRetained(key)
-	return ids.Cardinality()
-}
-
-func (o fieldOverlay) lookupPostingRetained(key string) posting.List {
-	if o.chunked != nil {
-		return o.chunked.lookupPostingRetained(key)
-	}
-	if len(o.base) == 0 {
-		return posting.List{}
-	}
-	i := lowerBoundIndex(o.base, key)
-	if i >= len(o.base) || !keycodec.EqualsString(o.base[i].Key, key) {
-		return posting.List{}
-	}
-	return o.base[i].IDs.Borrow()
-}
-
-func (o fieldOverlay) postingAt(rank int) posting.List {
-	if rank < 0 || rank >= o.keyCount() {
-		return posting.List{}
-	}
-	if o.chunked != nil {
-		pos := o.chunked.posForRank(rank)
-		ref, ok := o.chunked.refAtChunk(pos.chunk)
-		if !ok {
-			return posting.List{}
-		}
-		return ref.chunk.postingAt(pos.entry)
-	}
-	return o.base[rank].IDs.Borrow()
-}
-
-func (o fieldOverlay) lookupPostings(keys []string) ([]posting.List, uint64) {
-	keyCount := len(keys)
-	postsBuf := pools.GetPostingSlice(keyCount)
-	var est uint64
-
-	for i := 0; i < keyCount; i++ {
-		ids := o.lookupPostingRetained(keys[i])
-		if ids.IsEmpty() {
-			continue
-		}
-		postsBuf = append(postsBuf, ids)
-		est += ids.Cardinality()
-	}
-	return postsBuf, est
-}
-
-func (o fieldOverlay) rangeForBounds(b rangeBounds) overlayRange {
-	if o.chunked != nil {
-		return o.rangeForBoundsChunked(b)
-	}
-
-	br := overlayRange{
-		baseStart: 0,
-		baseEnd:   o.keyCount(),
-	}
-	if b.empty {
-		br.baseEnd = 0
-		return br
-	}
-
-	if b.hasPrefix {
-		ps := o.lowerBound(b.prefix)
-		pe := o.prefixRangeEnd(b.prefix, ps)
-		br.baseStart = max(br.baseStart, ps)
-		br.baseEnd = min(br.baseEnd, pe)
-	}
-
-	if b.hasLo {
-		bl := 0
-		if b.loNumeric {
-			bl = o.lowerBoundKey(b.loIndex)
-		} else {
-			bl = o.lowerBound(b.loKey)
-		}
-		if !b.loInc {
-			if b.loNumeric {
-				if bl < len(o.base) && keycodec.Compare(o.base[bl].Key, b.loIndex) == 0 {
-					bl++
-				}
-			} else {
-				ids := o.lookupPostingRetained(b.loKey)
-				if !ids.IsEmpty() {
-					bl++
-				}
-			}
-		}
-		br.baseStart = max(br.baseStart, bl)
-	}
-
-	if b.hasHi {
-		var bh int
-		if b.hiNumeric {
-			if b.hiInc {
-				bh = o.upperBoundKey(b.hiIndex)
-			} else {
-				bh = o.lowerBoundKey(b.hiIndex)
-			}
-		} else {
-			if b.hiInc {
-				bh = o.upperBound(b.hiKey)
-			} else {
-				bh = o.lowerBound(b.hiKey)
-			}
-		}
-		br.baseEnd = min(br.baseEnd, bh)
-	}
-
-	if br.baseStart < 0 {
-		br.baseStart = 0
-	}
-	if maxEnd := o.keyCount(); br.baseEnd > maxEnd {
-		br.baseEnd = maxEnd
-	}
-	if br.baseStart > br.baseEnd {
-		br.baseStart = br.baseEnd
-	}
-
-	return br
-}
-
-func (o fieldOverlay) rangeForBoundsChunked(b rangeBounds) overlayRange {
-	br := overlayRange{
-		baseStart: 0,
-		baseEnd:   o.keyCount(),
-	}
-	if o.chunked == nil {
-		return br
-	}
-	br.startPos = fieldIndexChunkPos{}
-	br.endPos = o.chunked.endPos()
-	if b.empty {
-		br.baseEnd = 0
-		br.endPos = br.startPos
-		return br
-	}
-
-	if b.hasPrefix {
-		ps, psRank := o.chunked.lowerBoundPos(b.prefix)
-		pe, peRank := o.chunked.prefixRangeEndPos(b.prefix, ps, psRank)
-		if psRank > br.baseStart {
-			br.baseStart = psRank
-			br.startPos = ps
-		}
-		if peRank < br.baseEnd {
-			br.baseEnd = peRank
-			br.endPos = pe
-		}
-	}
-
-	if b.hasLo {
-		var (
-			bl     fieldIndexChunkPos
-			blRank int
-		)
-		if b.loNumeric {
-			bl, blRank = o.chunked.lowerBoundPosKey(b.loIndex)
-		} else {
-			bl, blRank = o.chunked.lowerBoundPos(b.loKey)
-		}
-		if !b.loInc {
-			if key, ok := o.chunked.posKey(bl); ok &&
-				((b.loNumeric && keycodec.Compare(key, b.loIndex) == 0) ||
-					(!b.loNumeric && keycodec.EqualsString(key, b.loKey))) {
-				bl = o.chunked.advancePos(bl)
-				blRank++
-			}
-		}
-		if blRank > br.baseStart {
-			br.baseStart = blRank
-			br.startPos = bl
-		}
-	}
-
-	if b.hasHi {
-		var (
-			bh     fieldIndexChunkPos
-			bhRank int
-		)
-		if b.hiNumeric {
-			if b.hiInc {
-				bh, bhRank = o.chunked.upperBoundPosKey(b.hiIndex)
-			} else {
-				bh, bhRank = o.chunked.lowerBoundPosKey(b.hiIndex)
-			}
-		} else {
-			if b.hiInc {
-				bh, bhRank = o.chunked.upperBoundPos(b.hiKey)
-			} else {
-				bh, bhRank = o.chunked.lowerBoundPos(b.hiKey)
-			}
-		}
-		if bhRank < br.baseEnd {
-			br.baseEnd = bhRank
-			br.endPos = bh
-		}
-	}
-
-	if br.baseStart < 0 {
-		br.baseStart = 0
-		br.startPos = fieldIndexChunkPos{}
-	}
-	if maxEnd := o.keyCount(); br.baseEnd > maxEnd {
-		br.baseEnd = maxEnd
-		br.endPos = o.chunked.endPos()
-	}
-	if br.baseStart > br.baseEnd {
-		br.baseStart = br.baseEnd
-		br.startPos = br.endPos
-	}
-	return br
-}
-
-func (o fieldOverlay) rangeByRanks(start, end int) overlayRange {
-	if start < 0 {
-		start = 0
-	}
-	if maxEnd := o.keyCount(); end > maxEnd {
-		end = maxEnd
-	}
-	if start > end {
-		start = end
-	}
-	br := overlayRange{
-		baseStart: start,
-		baseEnd:   end,
-	}
-	if o.chunked != nil {
-		br.startPos = o.chunked.posForRank(start)
-		br.endPos = o.chunked.posForRank(end)
-	}
-	return br
-}
-
-func (o fieldOverlay) newCursor(br overlayRange, desc bool) overlayKeyCursor {
-	c := overlayKeyCursor{
-		base:    o.base,
-		chunked: o.chunked,
-		desc:    desc,
-	}
-	if o.chunked != nil {
-		c.remaining = br.baseEnd - br.baseStart
-		if c.remaining <= 0 {
-			return c
-		}
-		if desc {
-			pos, ok := o.chunked.prevPos(br.endPos)
-			if !ok {
-				c.remaining = 0
-				return c
-			}
-			c.chunkIdx = pos.chunk
-			c.entryIdx = pos.entry
-			c.pageIdx, c.refIdx = o.chunked.pagePosForChunk(pos.chunk)
-			if c.pageIdx >= o.chunked.pages.Len() {
-				c.remaining = 0
-				return c
-			}
-			c.chunk = o.chunked.pages.Get(c.pageIdx).refs.Get(c.refIdx).chunk
-			return c
-		}
-		c.chunkIdx = br.startPos.chunk
-		c.entryIdx = br.startPos.entry
-		c.pageIdx, c.refIdx = o.chunked.pagePosForChunk(br.startPos.chunk)
-		if c.pageIdx >= o.chunked.pages.Len() {
-			c.remaining = 0
-			return c
-		}
-		c.chunk = o.chunked.pages.Get(c.pageIdx).refs.Get(c.refIdx).chunk
-		return c
-	}
-	if desc {
-		c.pos = br.baseEnd - 1
-		c.end = br.baseStart
-		return c
-	}
-	c.pos = br.baseStart
-	c.end = br.baseEnd
-	return c
-}
-
-func (c *overlayKeyCursor) next() (keycodec.IndexKey, posting.List, bool) {
-	if c.desc {
-		if c.chunked != nil {
-			if c.remaining <= 0 || c.chunk == nil {
-				return keycodec.IndexKey{}, posting.List{}, false
-			}
-			key := c.chunk.keyAt(c.entryIdx)
-			ids := c.chunk.postingAt(c.entryIdx)
-			c.remaining--
-			if c.remaining > 0 {
-				if c.entryIdx > 0 {
-					c.entryIdx--
-				} else {
-					c.chunkIdx--
-					if c.refIdx > 0 {
-						c.refIdx--
-					} else {
-						c.pageIdx--
-						if c.pageIdx < 0 {
-							c.chunk = nil
-							return keycodec.IndexKey{}, posting.List{}, false
-						}
-						c.refIdx = c.chunked.pages.Get(c.pageIdx).refs.Len() - 1
-					}
-					c.chunk = c.chunked.pages.Get(c.pageIdx).refs.Get(c.refIdx).chunk
-					c.entryIdx = c.chunk.keyCount() - 1
-				}
-			}
-			return key, ids, true
-		}
-		if c.pos < c.end {
-			return keycodec.IndexKey{}, posting.List{}, false
-		}
-		ent := c.base[c.pos]
-		c.pos--
-		return ent.Key, ent.IDs, true
-	}
-	if c.chunked != nil {
-		if c.remaining <= 0 || c.chunk == nil {
-			return keycodec.IndexKey{}, posting.List{}, false
-		}
-		key := c.chunk.keyAt(c.entryIdx)
-		ids := c.chunk.postingAt(c.entryIdx)
-		c.remaining--
-		if c.remaining > 0 {
-			c.entryIdx++
-			if c.entryIdx >= c.chunk.keyCount() {
-				c.chunkIdx++
-				c.refIdx++
-				if c.refIdx >= c.chunked.pages.Get(c.pageIdx).refs.Len() {
-					c.pageIdx++
-					if c.pageIdx >= c.chunked.pages.Len() {
-						c.chunk = nil
-						return keycodec.IndexKey{}, posting.List{}, false
-					}
-					c.refIdx = 0
-				}
-				c.chunk = c.chunked.pages.Get(c.pageIdx).refs.Get(c.refIdx).chunk
-				c.entryIdx = 0
-			}
-		}
-		return key, ids, true
-	}
-	if c.pos >= c.end {
-		return keycodec.IndexKey{}, posting.List{}, false
-	}
-	ent := c.base[c.pos]
-	c.pos++
-	return ent.Key, ent.IDs, true
 }

@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/vapstack/qx"
+	"github.com/vapstack/rbi/internal/indexdata"
 )
 
 func TestQueryUnknownFieldReturnsError(t *testing.T) {
@@ -75,6 +76,42 @@ func TestQuery_SliceEQ_EmptyDBAndAfterLastDelete(t *testing.T) {
 	}
 	if cnt != 0 {
 		t.Fatalf("expected zero count after last delete, got %d", cnt)
+	}
+}
+
+func hideLenIndexForTest[K ~string | ~uint64, V any](t *testing.T, db *DB[K, V], field string) {
+	t.Helper()
+	snap := db.engine.getSnapshot()
+	acc, ok := db.engine.indexedFieldMap[field]
+	if !ok {
+		t.Fatalf("missing indexed field %q", field)
+	}
+	oldStorage := snap.lenIndex[acc.ordinal]
+	oldZeroComplement := false
+	if acc.ordinal < len(snap.lenZeroComplement) {
+		oldZeroComplement = snap.lenZeroComplement[acc.ordinal]
+		snap.lenZeroComplement[acc.ordinal] = false
+	}
+	snap.lenIndex[acc.ordinal] = indexdata.FieldStorage{}
+	t.Cleanup(func() {
+		snap.lenIndex[acc.ordinal] = oldStorage
+		if acc.ordinal < len(snap.lenZeroComplement) {
+			snap.lenZeroComplement[acc.ordinal] = oldZeroComplement
+		}
+	})
+}
+
+func TestQuery_SliceEQ_MissingLenIndexStorageReturnsError(t *testing.T) {
+	db, _ := openTempDBUint64(t)
+	if err := db.Set(1, &Rec{Tags: []string{"go"}}); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+	hideLenIndexForTest(t, db, "tags")
+
+	res, err := db.engine.evalSimple(qx.EQ("tags", []string{"go"}))
+	defer res.release()
+	if err == nil || !strings.Contains(err.Error(), "no lenIndex for slice field: tags") {
+		t.Fatalf("expected missing lenIndex error, got err=%v", err)
 	}
 }
 

@@ -1,6 +1,7 @@
 package rbi
 
 import (
+	"github.com/vapstack/rbi/internal/indexdata"
 	"github.com/vapstack/rbi/internal/pooled"
 	"github.com/vapstack/rbi/internal/posting"
 	"github.com/vapstack/rbi/internal/qir"
@@ -11,7 +12,7 @@ type preparedScalarRangePredicate struct {
 	expr               qir.Expr
 	fm                 *field
 	bound              normalizedScalarBound
-	bounds             rangeBounds
+	bounds             indexdata.Bounds
 	complementCacheKey materializedPredKey
 	loadReuse          materializedPredReuse
 	sharedReuse        materializedPredReuse
@@ -19,16 +20,8 @@ type preparedScalarRangePredicate struct {
 	usePostingFilter   bool
 }
 
-type preparedBaseRangePredicatePlan struct {
-	start         int
-	end           int
-	inBuckets     int
-	est           uint64
-	useComplement bool
-}
-
 type preparedOverlayRangePredicatePlan struct {
-	br                  overlayRange
+	br                  indexdata.OverlayRange
 	bucketCount         int
 	est                 uint64
 	useComplement       bool
@@ -47,8 +40,8 @@ type scalarMaterializationStats struct {
 
 type scalarComplementMaterializationPlan struct {
 	sharedReuse materializedPredReuse
-	before      overlayRange
-	after       overlayRange
+	before      indexdata.OverlayRange
+	after       indexdata.OverlayRange
 	nilPosting  posting.List
 	buckets     int
 	est         uint64
@@ -56,7 +49,7 @@ type scalarComplementMaterializationPlan struct {
 
 type preparedScalarExactRange struct {
 	field    string
-	bounds   rangeBounds
+	bounds   indexdata.Bounds
 	cacheKey materializedPredKey
 }
 
@@ -78,23 +71,23 @@ type preparedScalarRangeRoutingCandidate struct {
 type orderedMergedScalarRangeField struct {
 	field  string
 	expr   qir.Expr
-	bounds rangeBounds
+	bounds indexdata.Bounds
 	first  int
 	count  int
 }
 
 type preparedScalarPrefixSpan struct {
 	prefix  string
-	ov      fieldOverlay
-	br      overlayRange
+	ov      indexdata.FieldOverlay
+	br      indexdata.OverlayRange
 	hasData bool
 	span    int
 	rows    uint64
 }
 
 type preparedScalarOverlaySpan struct {
-	ov      fieldOverlay
-	br      overlayRange
+	ov      indexdata.FieldOverlay
+	br      indexdata.OverlayRange
 	hasData bool
 }
 
@@ -205,8 +198,8 @@ func (qv *queryView) normalizedScalarBoundForExpr(e qir.Expr) (normalizedScalarB
 	})
 }
 
-func rangeBoundsForNormalizedScalarBound(bound normalizedScalarBound) rangeBounds {
-	rb := rangeBounds{has: true}
+func rangeBoundsForNormalizedScalarBound(bound normalizedScalarBound) indexdata.Bounds {
+	rb := indexdata.Bounds{Has: true}
 	applyNormalizedScalarBound(&rb, bound)
 	return rb
 }
@@ -245,7 +238,7 @@ func (qv *queryView) initPreparedExactScalarRangePredicate(
 	core *preparedScalarRangePredicate,
 	e qir.Expr,
 	fm *field,
-	bounds rangeBounds,
+	bounds indexdata.Bounds,
 ) {
 	cacheKey := qv.materializedPredKeyForExactScalarRange(qv.engine.fieldNameByOrdinal(e.FieldOrdinal), bounds)
 	complementCacheKey := materializedPredKey{}
@@ -308,7 +301,7 @@ func (qv *queryView) prepareScalarRangeRoutingCandidate(
 		return preparedScalarRangeRoutingCandidate{}, false
 	}
 	ov := qv.fieldOverlayForExpr(e)
-	if !ov.hasData() {
+	if !ov.HasData() {
 		return preparedScalarRangeRoutingCandidate{}, false
 	}
 	plan, _, done := core.planOverlay(ov)
@@ -336,7 +329,7 @@ func (qv *queryView) preparePredicateScalarRangeRoutingCandidate(
 		return qv.prepareScalarRangeRoutingCandidate(p.expr)
 	}
 	ov := qv.fieldOverlayForExpr(p.expr)
-	if !ov.hasData() {
+	if !ov.HasData() {
 		return preparedScalarRangeRoutingCandidate{}, false
 	}
 	var core preparedScalarRangePredicate
@@ -376,42 +369,14 @@ func (core *preparedScalarRangePredicate) orderedEagerMaterializeUseful(orderedW
 		return false
 	}
 	ov := core.qv.fieldOverlayForExpr(core.expr)
-	if ov.hasData() {
-		plan, _, done := core.planOverlay(ov)
-		if done {
-			return false
-		}
-		return plan.orderedEagerMaterializeUseful(orderedWindow, universe)
-	}
-	slice := core.qv.snapshotFieldIndexSliceForExpr(core.expr)
-	if slice == nil {
+	if !ov.HasData() {
 		return false
 	}
-	plan, _, done := core.planBase(*slice)
+	plan, _, done := core.planOverlay(ov)
 	if done {
 		return false
 	}
-	buildWork := rangeProbeMaterializeWork(plan.inBuckets, plan.est)
-	expectedRows := orderedPredicateExpectedRows(orderedWindow, plan.est, universe)
-	if expectedRows == 0 {
-		return false
-	}
-	probeBuckets := plan.inBuckets
-	probeEst := plan.est
-	if core.usesRuntimeComplement(plan.useComplement) {
-		probeBuckets = len(*slice) - plan.inBuckets
-		if universe > plan.est {
-			probeEst = universe - plan.est
-		} else {
-			probeEst = 0
-		}
-	}
-	probeWork := rangeProbeTotalWorkForRows(int(expectedRows), probeBuckets, probeEst)
-	if probeWork < buildWork {
-		return false
-	}
-	retainedPenalty := satMulUint64(plan.est, postingContainsLookupWork(plan.est))
-	return probeWork >= satAddUint64(buildWork, retainedPenalty)
+	return plan.orderedEagerMaterializeUseful(orderedWindow, universe)
 }
 
 func (qv *queryView) prepareScalarOverlaySpan(e qir.Expr) (preparedScalarOverlaySpan, bool, error) {
@@ -426,18 +391,18 @@ func (qv *queryView) prepareScalarOverlaySpan(e qir.Expr) (preparedScalarOverlay
 	if err != nil {
 		return preparedScalarOverlaySpan{}, false, err
 	}
-	if !ok || rb.empty {
+	if !ok || rb.Empty {
 		return preparedScalarOverlaySpan{}, false, nil
 	}
 
 	out := preparedScalarOverlaySpan{
 		ov: qv.fieldOverlayForExpr(e),
 	}
-	if !out.ov.hasData() {
+	if !out.ov.HasData() {
 		return out, true, nil
 	}
 	out.hasData = true
-	out.br = out.ov.rangeForBounds(rb)
+	out.br = out.ov.RangeForBounds(rb)
 	return out, true, nil
 }
 
@@ -446,13 +411,13 @@ func (qv *queryView) prepareScalarPrefixSpan(e qir.Expr) (preparedScalarPrefixSp
 	if err != nil || !ok {
 		return preparedScalarPrefixSpan{}, ok, err
 	}
-	if !out.hasData || overlayRangeEmpty(out.br) {
+	if !out.hasData || out.br.Empty() {
 		return out, true, nil
 	}
 
-	cur := out.ov.newCursor(out.br, false)
+	cur := out.ov.NewCursor(out.br, false)
 	for {
-		_, ids, ok := cur.next()
+		_, ids, ok := cur.Next()
 		if !ok {
 			break
 		}
@@ -479,12 +444,12 @@ func (qv *queryView) prepareScalarPrefixRoute(e qir.Expr) (preparedScalarPrefixS
 	if err != nil {
 		return preparedScalarPrefixSpan{}, false, err
 	}
-	if !ok || rb.empty || !rb.hasPrefix || rb.prefix == "" {
+	if !ok || rb.Empty || !rb.HasPrefix || rb.Prefix == "" {
 		return preparedScalarPrefixSpan{}, false, nil
 	}
 
 	out := preparedScalarPrefixSpan{
-		prefix: rb.prefix,
+		prefix: rb.Prefix,
 		ov:     span.ov,
 		br:     span.br,
 	}
@@ -496,7 +461,7 @@ func (qv *queryView) prepareScalarPrefixRoute(e qir.Expr) (preparedScalarPrefixS
 	return out, true, nil
 }
 
-func (qv *queryView) applyScalarExprToRangeBounds(e qir.Expr, rb *rangeBounds) (bool, bool) {
+func (qv *queryView) applyScalarExprToRangeBounds(e qir.Expr, rb *indexdata.Bounds) (bool, bool) {
 	if isScalarRangeEqOp(e.Op) {
 		bound, isSlice, err := qv.normalizedScalarBoundForExpr(e)
 		if err != nil || isSlice {
@@ -510,19 +475,19 @@ func (qv *queryView) applyScalarExprToRangeBounds(e qir.Expr, rb *rangeBounds) (
 		if err != nil || isSlice || bound.empty || bound.full {
 			return false, false
 		}
-		rb.applyPrefix(bound.key)
+		rb.ApplyPrefix(bound.key)
 		return true, true
 	}
 	return false, true
 }
 
-func (qv *queryView) rangeBoundsForScalarExpr(e qir.Expr) (rangeBounds, bool, error) {
+func (qv *queryView) rangeBoundsForScalarExpr(e qir.Expr) (indexdata.Bounds, bool, error) {
 	bound, isSlice, err := qv.normalizedScalarBoundForExpr(e)
 	if err != nil {
-		return rangeBounds{}, false, err
+		return indexdata.Bounds{}, false, err
 	}
 	if isSlice {
-		return rangeBounds{}, false, nil
+		return indexdata.Bounds{}, false, nil
 	}
 	return rangeBoundsForNormalizedScalarBound(bound), true, nil
 }
@@ -649,34 +614,34 @@ func (qv *queryView) collectMergedNumericRangeFields(
 	return true
 }
 
-func mergeRangeBounds(dst *rangeBounds, src rangeBounds) {
-	if !dst.has {
+func mergeRangeBounds(dst *indexdata.Bounds, src indexdata.Bounds) {
+	if !dst.Has {
 		*dst = src
 		return
 	}
-	if src.empty {
-		dst.setEmpty()
+	if src.Empty {
+		dst.SetEmpty()
 		return
 	}
-	if src.hasLo {
-		if src.loNumeric {
-			dst.applyLoIndex(src.loIndex, src.loInc)
+	if src.HasLo {
+		if src.LoNumeric {
+			dst.ApplyLoIndex(src.LoIndex, src.LoInc)
 		} else {
-			dst.applyLo(src.loKey, src.loInc)
+			dst.ApplyLo(src.LoKey, src.LoInc)
 		}
 	}
-	if src.hasHi {
-		if src.hiNumeric {
-			dst.applyHiIndex(src.hiIndex, src.hiInc)
+	if src.HasHi {
+		if src.HiNumeric {
+			dst.ApplyHiIndex(src.HiIndex, src.HiInc)
 		} else {
-			dst.applyHi(src.hiKey, src.hiInc)
+			dst.ApplyHi(src.HiKey, src.HiInc)
 		}
 	}
-	if src.hasPrefix {
-		dst.applyPrefix(src.prefix)
+	if src.HasPrefix {
+		dst.ApplyPrefix(src.Prefix)
 	}
-	if src.has {
-		dst.has = true
+	if src.Has {
+		dst.Has = true
 	}
 }
 
@@ -695,90 +660,23 @@ func (core *preparedScalarRangePredicate) runtimeReuse(est uint64, useComplement
 func (core *preparedScalarRangePredicate) hasNilTail() bool {
 	return core.fm != nil &&
 		core.fm.Ptr &&
-		core.qv.nilFieldOverlayForExpr(core.expr).lookupCardinality(nilIndexEntryKey) > 0
+		core.qv.nilFieldOverlayForExpr(core.expr).LookupCardinality(nilIndexEntryKey) > 0
 }
 
 func (core *preparedScalarRangePredicate) usesRuntimeComplement(useComplement bool) bool {
 	return useComplement && !core.hasNilTail()
 }
 
-func (core *preparedScalarRangePredicate) planBase(slice []index) (preparedBaseRangePredicatePlan, predicate, bool) {
-	start, end := applyBoundsToIndexRange(slice, core.bounds)
-	if start >= end {
-		if core.expr.Not {
-			return preparedBaseRangePredicatePlan{}, predicate{expr: core.expr, alwaysTrue: true}, true
-		}
-		return preparedBaseRangePredicatePlan{}, predicate{expr: core.expr, alwaysFalse: true}, true
-	}
-	ptrHasNilTail := core.hasNilTail()
-	fullSpanHasNilTail := start == 0 && end == len(slice) && ptrHasNilTail
-	if start == 0 && end == len(slice) && !fullSpanHasNilTail {
-		if core.expr.Not {
-			return preparedBaseRangePredicatePlan{}, predicate{expr: core.expr, alwaysFalse: true}, true
-		}
-		return preparedBaseRangePredicatePlan{}, predicate{expr: core.expr, alwaysTrue: true}, true
-	}
-
-	inBuckets := end - start
-	est := uint64(0)
-	ov := fieldOverlay{base: slice}
-	fieldName := core.qv.engine.fieldNameByOrdinal(core.expr.FieldOrdinal)
-	if exact, ok := core.qv.tryCountSnapshotNumericRange(fieldName, core.fm, ov, start, end); ok {
-		est = exact
-	} else if inBuckets == 1 {
-		if ids := slice[start].IDs; !ids.IsEmpty() {
-			est = ids.Cardinality()
-		}
-	} else {
-		ix0 := start
-		ix1 := start + inBuckets/2
-		ix2 := end - 1
-		var sum uint64
-		var n uint64
-
-		if ids := slice[ix0].IDs; !ids.IsEmpty() {
-			sum += ids.Cardinality()
-			n++
-		}
-		if ix1 != ix0 && ix1 != ix2 {
-			if ids := slice[ix1].IDs; !ids.IsEmpty() {
-				sum += ids.Cardinality()
-				n++
-			}
-		}
-		if ix2 != ix0 {
-			if ids := slice[ix2].IDs; !ids.IsEmpty() {
-				sum += ids.Cardinality()
-				n++
-			}
-		}
-		if n > 0 {
-			est = (sum / n) * uint64(inBuckets)
-		}
-	}
-	if est == 0 {
-		est = uint64(inBuckets)
-	}
-
-	return preparedBaseRangePredicatePlan{
-		start:         start,
-		end:           end,
-		inBuckets:     inBuckets,
-		est:           est,
-		useComplement: len(slice)-inBuckets < inBuckets,
-	}, predicate{}, false
-}
-
-func (core *preparedScalarRangePredicate) planOverlay(ov fieldOverlay) (preparedOverlayRangePredicatePlan, predicate, bool) {
-	br := ov.rangeForBounds(core.bounds)
-	if overlayRangeEmpty(br) {
+func (core *preparedScalarRangePredicate) planOverlay(ov indexdata.FieldOverlay) (preparedOverlayRangePredicatePlan, predicate, bool) {
+	br := ov.RangeForBounds(core.bounds)
+	if br.Empty() {
 		if core.expr.Not {
 			return preparedOverlayRangePredicatePlan{}, predicate{expr: core.expr, alwaysTrue: true}, true
 		}
 		return preparedOverlayRangePredicatePlan{}, predicate{expr: core.expr, alwaysFalse: true}, true
 	}
 
-	bucketCount, est := overlayRangeStats(ov, br)
+	bucketCount, est := ov.RangeStats(br)
 	if bucketCount == 0 {
 		if core.expr.Not {
 			return preparedOverlayRangePredicatePlan{}, predicate{expr: core.expr, alwaysTrue: true}, true
@@ -786,7 +684,7 @@ func (core *preparedScalarRangePredicate) planOverlay(ov fieldOverlay) (prepared
 		return preparedOverlayRangePredicatePlan{}, predicate{expr: core.expr, alwaysFalse: true}, true
 	}
 
-	totalBuckets := ov.keyCount()
+	totalBuckets := ov.KeyCount()
 	ptrHasNilTail := core.hasNilTail()
 	fullSpanHasNilTail := bucketCount == totalBuckets && ptrHasNilTail
 	if bucketCount == totalBuckets && !fullSpanHasNilTail {
@@ -813,7 +711,7 @@ func (core *preparedScalarRangePredicate) planOverlay(ov fieldOverlay) (prepared
 		} else {
 			plan.runtimeProbeEst = 0
 		}
-		if core.qv.nilFieldOverlayForExpr(core.expr).lookupCardinality(nilIndexEntryKey) > 0 {
+		if core.qv.nilFieldOverlayForExpr(core.expr).LookupCardinality(nilIndexEntryKey) > 0 {
 			plan.runtimeProbeBuckets++
 		}
 		if plan.runtimeProbeBuckets == 0 && plan.runtimeProbeEst > 0 {
@@ -824,89 +722,8 @@ func (core *preparedScalarRangePredicate) planOverlay(ov fieldOverlay) (prepared
 	return plan, predicate{}, false
 }
 
-func (core *preparedScalarRangePredicate) buildFromSlice(
-	slice []index,
-	allowMaterialize bool,
-	lazyColdMaterialize bool,
-	allowWarmLoad bool,
-) (predicate, bool) {
-	plan, pred, done := core.planBase(slice)
-	if done {
-		return pred, true
-	}
-
-	if allowWarmLoad {
-		if cached, ok := core.loadReuse.load(); ok {
-			return materializedRangePredicateWithMode(core.expr, cached), true
-		}
-	}
-
-	// Nullable value indexes do not contain nil-tail rows, so a direct complement
-	// probe would treat nil as "not seen" and invert it incorrectly at runtime.
-	useRuntimeComplement := core.usesRuntimeComplement(plan.useComplement)
-	probe := newBaseRangeProbe(slice, plan.start, plan.end, useRuntimeComplement)
-	coldMaterializeAllowed := allowMaterialize
-	if coldMaterializeAllowed && lazyColdMaterialize && core.usePostingFilter &&
-		rangePostingFilterMaterializeAfterForProbe(probe.probeLen, probe.probeEst) > 1 {
-		coldMaterializeAllowed = false
-	}
-
-	if allowMaterialize {
-		ov := fieldOverlay{base: slice}
-		br := overlayRange{
-			baseStart: plan.start,
-			baseEnd:   plan.end,
-		}
-		fieldName := core.qv.engine.fieldNameByOrdinal(core.expr.FieldOrdinal)
-		if coldMaterializeAllowed {
-			if out, ok := core.qv.tryEvalNumericRangeBuckets(fieldName, core.fm, ov, br); ok {
-				out.ids = core.sharedReuse.share(out.ids)
-				return materializedRangePredicateWithMode(core.expr, out.ids), true
-			}
-		} else if out, ok := core.qv.tryLoadNumericRangeBuckets(fieldName, core.fm, ov, br); ok {
-			out.ids = core.sharedReuse.share(out.ids)
-			return materializedRangePredicateWithMode(core.expr, out.ids), true
-		}
-	}
-	reuse := core.runtimeReuse(plan.est, useRuntimeComplement)
-	if allowMaterialize && !useRuntimeComplement && !fieldUsesOrderedNumericKeys(core.fm) {
-		reuse = core.sharedReuse
-	}
-	keepProbeHits := probe.useComplement == core.expr.Not
-	materializeAfter := rangeMaterializeAfterForProbe(probe.probeLen, probe.probeEst)
-	state := baseRangePredicateStatePool.Get()
-	state.probe = probe
-	state.reuse = reuse
-	state.keepProbeHits = keepProbeHits
-	state.neg = core.expr.Not
-	state.linearContainsMax = rangeLinearContainsLimit(probe.probeLen, probe.probeEst)
-	state.hashSetAfter = rangeHashSetAfterForProbe(probe.probeLen, probe.probeEst)
-	state.materializeAfter = materializeAfter
-	state.postingFilterMaterializeAt = rangePostingFilterMaterializeAfterForProbe(probe.probeLen, probe.probeEst)
-	state.setExpectedContainsCalls(materializeAfter)
-	postingFilterCheap := false
-	if core.usePostingFilter && probe.probeLen != 0 {
-		postingFilterCheap = rangeProbeSupportsCheapPostingFilter(state.keepProbeHits, probe.probeLen)
-	}
-
-	if core.expr.Not {
-		return predicate{
-			expr:               core.expr,
-			baseRangeState:     state,
-			postingFilterCheap: postingFilterCheap,
-		}, true
-	}
-
-	return predicate{
-		expr:               core.expr,
-		baseRangeState:     state,
-		estCard:            plan.est,
-		postingFilterCheap: postingFilterCheap,
-	}, true
-}
-
 func (core *preparedScalarRangePredicate) buildFromOverlay(
-	ov fieldOverlay,
+	ov indexdata.FieldOverlay,
 	allowMaterialize bool,
 	lazyColdMaterialize bool,
 	allowWarmLoad bool,
@@ -933,10 +750,10 @@ func (core *preparedScalarRangePredicate) buildFromOverlay(
 
 	coldMaterializeAllowed := allowMaterialize
 	if coldMaterializeAllowed && lazyColdMaterialize && core.usePostingFilter {
-		totalBuckets := probe.ov.keyCount()
+		totalBuckets := probe.ov.KeyCount()
 		inBuckets := 0
 		for i := 0; i < probe.spanCnt; i++ {
-			inBuckets += probe.spans[i].baseEnd - probe.spans[i].baseStart
+			inBuckets += probe.spans[i].BaseEnd - probe.spans[i].BaseStart
 		}
 		if probe.useComplement {
 			inBuckets = totalBuckets - inBuckets
@@ -979,10 +796,10 @@ func (core *preparedScalarRangePredicate) buildFromOverlay(
 	state.postingFilterCheap = false
 	state.probeMaterializeAt = 0
 	if core.usePostingFilter {
-		totalBuckets := probe.ov.keyCount()
+		totalBuckets := probe.ov.KeyCount()
 		inBuckets := 0
 		for i := 0; i < probe.spanCnt; i++ {
-			inBuckets += probe.spans[i].baseEnd - probe.spans[i].baseStart
+			inBuckets += probe.spans[i].BaseEnd - probe.spans[i].BaseStart
 		}
 		if probe.useComplement {
 			inBuckets = totalBuckets - inBuckets
@@ -1011,7 +828,7 @@ func (core *preparedScalarRangePredicate) buildFromOverlay(
 	}, true
 }
 
-func (core *preparedScalarRangePredicate) evalMaterializedPostingResult(ov fieldOverlay) postingResult {
+func (core *preparedScalarRangePredicate) evalMaterializedPostingResult(ov indexdata.FieldOverlay) postingResult {
 	if cached, ok := core.loadReuse.load(); ok {
 		if cached.IsEmpty() {
 			return postingResult{}
@@ -1019,8 +836,8 @@ func (core *preparedScalarRangePredicate) evalMaterializedPostingResult(ov field
 		return postingResult{ids: cached}
 	}
 
-	br := ov.rangeForBounds(core.bounds)
-	if overlayRangeEmpty(br) {
+	br := ov.RangeForBounds(core.bounds)
+	if br.Empty() {
 		if core.sharedReuse.snap != nil && !core.sharedReuse.cacheKey.isZero() {
 			core.sharedReuse.snap.storeMaterializedPredKey(core.sharedReuse.cacheKey, posting.List{})
 		}
@@ -1037,7 +854,7 @@ func (core *preparedScalarRangePredicate) evalMaterializedPostingResult(ov field
 		}
 	}
 
-	ids := overlayUnionRanges(ov, br, overlayRange{})
+	ids := ov.UnionRangePostings(br, indexdata.OverlayRange{})
 	ids = core.sharedReuse.share(ids)
 	if ids.IsEmpty() {
 		return postingResult{}
@@ -1051,7 +868,7 @@ func (core *preparedScalarRangePredicate) orderBasicMaterializationStats(univers
 	}
 
 	ov := core.qv.fieldOverlayForExpr(core.expr)
-	if !ov.hasData() {
+	if !ov.HasData() {
 		return scalarMaterializationStats{}, false
 	}
 	plan, _, done := core.planOverlay(ov)
@@ -1068,12 +885,12 @@ func (core *preparedScalarRangePredicate) orderBasicMaterializationStats(univers
 	}
 
 	if plan.useComplement {
-		complementBuckets := ov.keyCount() - plan.bucketCount
+		complementBuckets := ov.KeyCount() - plan.bucketCount
 		complementEst := uint64(0)
 		if universe > plan.est {
 			complementEst = universe - plan.est
 		}
-		if core.qv.nilFieldOverlayForExpr(core.expr).lookupCardinality(nilIndexEntryKey) > 0 {
+		if core.qv.nilFieldOverlayForExpr(core.expr).LookupCardinality(nilIndexEntryKey) > 0 {
 			complementBuckets++
 		}
 		if complementBuckets == 0 && complementEst > 0 {
@@ -1106,7 +923,7 @@ func (core *preparedScalarRangePredicate) loadWarmScalarPostingResult() (posting
 	}
 
 	ov := core.qv.fieldOverlayForExpr(core.expr)
-	if !ov.hasData() {
+	if !ov.HasData() {
 		return postingResult{}, false
 	}
 	plan, _, done := core.planOverlay(ov)
@@ -1130,11 +947,11 @@ func (qv *queryView) loadWarmPreparedScalarExactRange(op preparedScalarExactRang
 		return postingResult{}, false
 	}
 	ov := qv.fieldOverlay(op.field)
-	if !ov.hasData() {
+	if !ov.HasData() {
 		return postingResult{}, false
 	}
-	br := ov.rangeForBounds(op.bounds)
-	if overlayRangeEmpty(br) {
+	br := ov.RangeForBounds(op.bounds)
+	if br.Empty() {
 		return postingResult{}, false
 	}
 	return qv.tryLoadNumericRangeBuckets(op.field, fm, ov, br)
@@ -1151,11 +968,11 @@ func (qv *queryView) evalPreparedScalarExactRange(op preparedScalarExactRange) (
 		return postingResult{}, nil
 	}
 	ov := qv.fieldOverlay(op.field)
-	if !ov.hasData() {
+	if !ov.HasData() {
 		return postingResult{}, nil
 	}
-	br := ov.rangeForBounds(op.bounds)
-	if overlayRangeEmpty(br) {
+	br := ov.RangeForBounds(op.bounds)
+	if br.Empty() {
 		return postingResult{}, nil
 	}
 	if out, ok := qv.tryEvalNumericRangeBuckets(op.field, fm, ov, br); ok {
@@ -1164,7 +981,7 @@ func (qv *queryView) evalPreparedScalarExactRange(op preparedScalarExactRange) (
 		}
 		return out, nil
 	}
-	ids := overlayUnionRanges(ov, br, overlayRange{})
+	ids := ov.UnionRangePostings(br, indexdata.OverlayRange{})
 	if !op.cacheKey.isZero() {
 		ids = qv.tryShareMaterializedPred(op.cacheKey, ids)
 	}
@@ -1186,11 +1003,11 @@ func (qv *queryView) shouldPromoteObservedPreparedScalarExactRange(
 		return false
 	}
 	ov := qv.fieldOverlay(op.field)
-	if !ov.hasData() {
+	if !ov.HasData() {
 		return false
 	}
-	br := ov.rangeForBounds(op.bounds)
-	return !overlayRangeEmpty(br)
+	br := ov.RangeForBounds(op.bounds)
+	return !br.Empty()
 }
 
 func (core *preparedScalarRangePredicate) prepareComplementMaterialization() (scalarComplementMaterializationPlan, bool) {
@@ -1199,13 +1016,13 @@ func (core *preparedScalarRangePredicate) prepareComplementMaterialization() (sc
 	}
 
 	ov := core.qv.fieldOverlayForExpr(core.expr)
-	if !ov.hasData() {
+	if !ov.HasData() {
 		return scalarComplementMaterializationPlan{}, false
 	}
 
-	br := ov.rangeForBounds(core.bounds)
+	br := ov.RangeForBounds(core.bounds)
 	before, after := overlayComplementRangeSpans(ov, br)
-	nilPosting := core.qv.nilFieldOverlayForExpr(core.expr).lookupPostingRetained(nilIndexEntryKey)
+	nilPosting := core.qv.nilFieldOverlayForExpr(core.expr).LookupPostingRetained(nilIndexEntryKey)
 
 	plan := scalarComplementMaterializationPlan{
 		sharedReuse: newMaterializedPredSharedReuse(core.qv.snap, core.complementCacheKey),
@@ -1223,11 +1040,11 @@ func (core *preparedScalarRangePredicate) prepareComplementMaterialization() (sc
 	return plan, true
 }
 
-func addScalarComplementPlanSpan(plan *scalarComplementMaterializationPlan, ov fieldOverlay, span overlayRange) {
-	if overlayRangeEmpty(span) {
+func addScalarComplementPlanSpan(plan *scalarComplementMaterializationPlan, ov indexdata.FieldOverlay, span indexdata.OverlayRange) {
+	if span.Empty() {
 		return
 	}
-	buckets, est := overlayRangeStats(ov, span)
+	buckets, est := ov.RangeStats(span)
 	plan.buckets += buckets
 	plan.est = satAddUint64(plan.est, est)
 }
@@ -1250,8 +1067,8 @@ func (core *preparedScalarRangePredicate) materializeComplement(plan scalarCompl
 	var ids posting.List
 	ov := core.qv.fieldOverlayForExpr(core.expr)
 	fieldName := core.qv.engine.fieldNameByOrdinal(core.expr.FieldOrdinal)
-	var pendingBefore, pendingAfter overlayRange
-	if !overlayRangeEmpty(plan.before) {
+	var pendingBefore, pendingAfter indexdata.OverlayRange
+	if !plan.before.Empty() {
 		if out, ok := core.qv.tryEvalNumericRangeBuckets(fieldName, core.fm, ov, plan.before); ok {
 			if ids.IsEmpty() {
 				ids = out.ids
@@ -1262,7 +1079,7 @@ func (core *preparedScalarRangePredicate) materializeComplement(plan scalarCompl
 			pendingBefore = plan.before
 		}
 	}
-	if !overlayRangeEmpty(plan.after) {
+	if !plan.after.Empty() {
 		if out, ok := core.qv.tryEvalNumericRangeBuckets(fieldName, core.fm, ov, plan.after); ok {
 			if ids.IsEmpty() {
 				ids = out.ids
@@ -1273,11 +1090,11 @@ func (core *preparedScalarRangePredicate) materializeComplement(plan scalarCompl
 			pendingAfter = plan.after
 		}
 	}
-	if !overlayRangeEmpty(pendingBefore) || !overlayRangeEmpty(pendingAfter) {
+	if !pendingBefore.Empty() || !pendingAfter.Empty() {
 		if ids.IsEmpty() {
-			ids = overlayUnionRanges(ov, pendingBefore, pendingAfter)
+			ids = ov.UnionRangePostings(pendingBefore, pendingAfter)
 		} else {
-			ids = mergeOverlayRangesInto(ids, ov, pendingBefore, pendingAfter)
+			ids = ov.MergeRangePostingsInto(ids, pendingBefore, pendingAfter)
 		}
 	}
 	if !plan.nilPosting.IsEmpty() {
