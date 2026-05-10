@@ -53,6 +53,14 @@ func (arena *PostingDiffArena) Release() {
 	if arena == nil {
 		return
 	}
+	arena.Reset()
+	postingDiffArenaPool.Put(arena)
+}
+
+func (arena *PostingDiffArena) Reset() {
+	if arena == nil {
+		return
+	}
 	for i := range arena.values {
 		arena.values[i].reset()
 	}
@@ -61,7 +69,6 @@ func (arena *PostingDiffArena) Release() {
 	} else {
 		arena.values = arena.values[:0]
 	}
-	postingDiffArenaPool.Put(arena)
 }
 
 func (arena *PostingDiffArena) alloc() uint32 {
@@ -152,6 +159,14 @@ func (arena *PostingAddArena) Release() {
 	if arena == nil {
 		return
 	}
+	arena.Reset()
+	postingAddArenaPool.Put(arena)
+}
+
+func (arena *PostingAddArena) Reset() {
+	if arena == nil {
+		return
+	}
 	for i := range arena.values {
 		arena.values[i].reset()
 	}
@@ -160,7 +175,6 @@ func (arena *PostingAddArena) Release() {
 	} else {
 		arena.values = arena.values[:0]
 	}
-	postingAddArenaPool.Put(arena)
 }
 
 func (arena *PostingAddArena) alloc() uint32 {
@@ -290,6 +304,8 @@ func (d *LenPostingDiff) putAfterMove() {
 		ReleaseBatchPostingDeltaMap(d.lengths)
 		d.lengths = nil
 	}
+	d.nonEmpty = BatchPostingDelta{}
+	d.hasNonEmpty = false
 	lenPostingDiffPool.Put(d)
 }
 
@@ -307,7 +323,37 @@ func (d *LenPostingDiff) Release() {
 	}
 	d.nonEmpty.Add.Release()
 	d.nonEmpty.Remove.Release()
+	d.nonEmpty = BatchPostingDelta{}
+	d.hasNonEmpty = false
 	lenPostingDiffPool.Put(d)
+}
+
+func (d *LenPostingDiff) Reset() {
+	if d == nil {
+		return
+	}
+	if d.lengths != nil {
+		for _, lengthDelta := range d.lengths {
+			lengthDelta.Add.Release()
+			lengthDelta.Remove.Release()
+		}
+		clear(d.lengths)
+	}
+	d.nonEmpty.Add.Release()
+	d.nonEmpty.Remove.Release()
+	d.nonEmpty = BatchPostingDelta{}
+	d.hasNonEmpty = false
+}
+
+func (d *LenPostingDiff) resetAfterMove() {
+	if d == nil {
+		return
+	}
+	if d.lengths != nil {
+		clear(d.lengths)
+	}
+	d.nonEmpty = BatchPostingDelta{}
+	d.hasNonEmpty = false
 }
 
 func ensureLenPostingDiff(delta **LenPostingDiff) *LenPostingDiff {
@@ -406,6 +452,15 @@ func (s FieldStorage) ApplyStringPostingDiffOwned(
 	allowChunk bool,
 ) FieldStorage {
 	defer PutStringPostingDiffMap(deltas)
+	return s.ApplyStringPostingDiffRetainMapOwned(deltas, arena, fixed8, allowChunk)
+}
+
+func (s FieldStorage) ApplyStringPostingDiffRetainMapOwned(
+	deltas map[string]uint32,
+	arena *PostingDiffArena,
+	fixed8 bool,
+	allowChunk bool,
+) FieldStorage {
 	buf := sortedStringPostingDeltasBufOwned(deltas, arena, fixed8)
 	if buf == nil {
 		return s
@@ -419,6 +474,14 @@ func (s FieldStorage) ApplyFixedPostingDiffOwned(
 	allowChunk bool,
 ) FieldStorage {
 	defer PutFixedPostingDiffMap(deltas)
+	return s.ApplyFixedPostingDiffRetainMapOwned(deltas, arena, allowChunk)
+}
+
+func (s FieldStorage) ApplyFixedPostingDiffRetainMapOwned(
+	deltas map[uint64]uint32,
+	arena *PostingDiffArena,
+	allowChunk bool,
+) FieldStorage {
 	buf := sortedFixedPostingDeltasBufOwned(deltas, arena)
 	if buf == nil {
 		return s
@@ -469,6 +532,15 @@ func (s FieldStorage) MergeStringPostingAddsOwned(
 	allowChunk bool,
 ) FieldStorage {
 	defer PutStringPostingAddMap(adds)
+	return s.MergeStringPostingAddsRetainMapOwned(adds, arena, fixed8, allowChunk)
+}
+
+func (s FieldStorage) MergeStringPostingAddsRetainMapOwned(
+	adds map[string]uint32,
+	arena *PostingAddArena,
+	fixed8 bool,
+	allowChunk bool,
+) FieldStorage {
 	if len(adds) == 0 {
 		return s
 	}
@@ -485,6 +557,14 @@ func (s FieldStorage) MergeFixedPostingAddsOwned(
 	allowChunk bool,
 ) FieldStorage {
 	defer PutFixedPostingAddMap(adds)
+	return s.MergeFixedPostingAddsRetainMapOwned(adds, arena, allowChunk)
+}
+
+func (s FieldStorage) MergeFixedPostingAddsRetainMapOwned(
+	adds map[uint64]uint32,
+	arena *PostingAddArena,
+	allowChunk bool,
+) FieldStorage {
 	if len(adds) == 0 {
 		return s
 	}
@@ -504,7 +584,6 @@ func (d *LenPostingDiff) sortedBufOwned() []PostingDelta {
 		count++
 	}
 	if count == 0 {
-		d.putAfterMove()
 		return nil
 	}
 
@@ -524,7 +603,6 @@ func (d *LenPostingDiff) sortedBufOwned() []PostingDelta {
 			Delta: d.nonEmpty,
 		})
 	}
-	d.putAfterMove()
 	if len(buf) == 0 {
 		ReleasePostingDeltaSlice(buf)
 		return nil
@@ -575,18 +653,26 @@ func (d *LenPostingDiff) takeOwned(dst []PostingDelta) int {
 		}
 		n++
 	}
-	d.putAfterMove()
 	return n
 }
 
 func (s FieldStorage) ApplyLenPostingDiffOwned(deltas *LenPostingDiff) FieldStorage {
+	return s.applyLenPostingDiffOwned(deltas, false)
+}
+
+func (s FieldStorage) ApplyLenPostingDiffRetainOwned(deltas *LenPostingDiff) FieldStorage {
+	return s.applyLenPostingDiffOwned(deltas, true)
+}
+
+func (s FieldStorage) applyLenPostingDiffOwned(deltas *LenPostingDiff, retain bool) FieldStorage {
 	count := deltas.count()
 	if count == 0 {
-		deltas.putAfterMove()
+		deltas.finishAfterMove(retain)
 		return s
 	}
 	if count == 1 {
 		delta, ok := deltas.takeSingleOwned()
+		deltas.finishAfterMove(retain)
 		if !ok {
 			return s
 		}
@@ -601,12 +687,14 @@ func (s FieldStorage) ApplyLenPostingDiffOwned(deltas *LenPostingDiff) FieldStor
 	var buf []PostingDelta
 	if count <= len(inline) {
 		n := deltas.takeOwned(inline[:count])
+		deltas.finishAfterMove(retain)
 		deltaKeys = inline[:n]
 		if len(deltaKeys) > 1 && keycodec.Compare(deltaKeys[0].Key, deltaKeys[1].Key) > 0 {
 			deltaKeys[0], deltaKeys[1] = deltaKeys[1], deltaKeys[0]
 		}
 	} else {
 		buf = deltas.sortedBufOwned()
+		deltas.finishAfterMove(retain)
 		if buf == nil {
 			return s
 		}
@@ -624,6 +712,14 @@ func (s FieldStorage) ApplyLenPostingDiffOwned(deltas *LenPostingDiff) FieldStor
 	return FieldStorage{}
 }
 
+func (d *LenPostingDiff) finishAfterMove(retain bool) {
+	if retain {
+		d.resetAfterMove()
+		return
+	}
+	d.putAfterMove()
+}
+
 func (d *LenPostingDiff) takeSingleOwned() (PostingDelta, bool) {
 	if d == nil {
 		return PostingDelta{}, false
@@ -632,7 +728,6 @@ func (d *LenPostingDiff) takeSingleOwned() (PostingDelta, bool) {
 		if delta.Add.IsEmpty() && delta.Remove.IsEmpty() {
 			continue
 		}
-		d.putAfterMove()
 		return PostingDelta{
 			Key:   keycodec.FromU64(raw),
 			Delta: delta,
@@ -640,13 +735,11 @@ func (d *LenPostingDiff) takeSingleOwned() (PostingDelta, bool) {
 	}
 	if d.hasNonEmpty && (!d.nonEmpty.Add.IsEmpty() || !d.nonEmpty.Remove.IsEmpty()) {
 		delta := d.nonEmpty
-		d.putAfterMove()
 		return PostingDelta{
 			Key:   keycodec.FromString(LenIndexNonEmptyKey),
 			Delta: delta,
 		}, true
 	}
-	d.putAfterMove()
 	return PostingDelta{}, false
 }
 

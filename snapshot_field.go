@@ -31,9 +31,15 @@ type snapshotFieldInsertState struct {
 	lengthsHint int
 }
 
-var snapshotFieldInsertStateSlicePool = pooled.Slices[snapshotFieldInsertState]{
-	Clear: true,
-}
+const (
+	snapshotFieldStateSlicePoolMaxCap = 64 << 10
+)
+
+var snapshotFieldInsertStateSlicePool = pooled.NewSlicePool[snapshotFieldInsertState](
+	snapshotFieldStateSlicePoolMaxCap,
+	pooled.NoClear,
+	cleanupSnapshotFieldInsertStateSlice,
+)
 
 type fieldWriteScratch struct {
 	strings []string
@@ -54,12 +60,15 @@ type snapshotFieldBatchState struct {
 	new     fieldWriteScratch
 }
 
-var snapshotFieldBatchStateSlicePool = pooled.Slices[snapshotFieldBatchState]{
-	Clear: true,
-}
+var snapshotFieldBatchStateSlicePool = pooled.NewSlicePool[snapshotFieldBatchState](
+	snapshotFieldStateSlicePoolMaxCap,
+	pooled.NoClear,
+	cleanupSnapshotFieldBatchStateSlice,
+)
 
 func (s *fieldWriteScratch) reset() {
 	if s.strings != nil {
+		clear(s.strings)
 		s.strings = s.strings[:0]
 	}
 	if s.fixed != nil {
@@ -255,7 +264,7 @@ func (acc indexedFieldAccessor) collectSnapshotInsertValue(
 }
 
 func initSnapshotFieldInsertStateHints(
-	states *pooled.Slice[snapshotFieldInsertState],
+	states []snapshotFieldInsertState,
 	access []indexedFieldAccessor,
 	prev *indexSnapshot,
 	batchHint int,
@@ -265,7 +274,7 @@ func initSnapshotFieldInsertStateHints(
 	}
 	for i := range access {
 		acc := access[i]
-		state := states.GetPtr(i)
+		state := &states[i]
 		var indexHint int
 		if prev.index != nil && acc.ordinal < len(prev.index) {
 			indexHint = snapshotFieldStorageHint(prev.index[acc.ordinal], batchHint)
@@ -307,25 +316,34 @@ func (acc indexedFieldAccessor) mergeSnapshotInsertStorageOwned(
 		return base
 	}
 	if acc.field != nil && acc.field.KeyKind == fieldWriteKeysOrderedU64 {
-		fixed := state.fixed
-		state.fixed = nil
-		return base.MergeFixedPostingAddsOwned(fixed, state.arena, allowChunk)
+		return base.MergeFixedPostingAddsRetainMapOwned(state.fixed, state.arena, allowChunk)
 	}
-	i := state.index
-	state.index = nil
-	return base.MergeStringPostingAddsOwned(i, state.arena, false, allowChunk)
+	return base.MergeStringPostingAddsRetainMapOwned(state.index, state.arena, false, allowChunk)
 }
 
 func (acc indexedFieldAccessor) mergeSnapshotInsertNilStorageOwned(base indexdata.FieldStorage, state *snapshotFieldInsertState) indexdata.FieldStorage {
 	if state == nil {
 		return base
 	}
-	nils := state.nils
-	state.nils = nil
-	return base.MergeStringPostingAddsOwned(nils, state.arena, false, false)
+	return base.MergeStringPostingAddsRetainMapOwned(state.nils, state.arena, false, false)
 }
 
 func (state *snapshotFieldInsertState) release() {
+	clear(state.index)
+	clear(state.fixed)
+	clear(state.nils)
+	state.arena.Reset()
+	if state.lengths != nil {
+		state.lengths.Reset()
+	}
+	state.changed = false
+	state.indexHint = 0
+	state.fixedHint = 0
+	state.nilsHint = 0
+	state.lengthsHint = 0
+}
+
+func (state *snapshotFieldInsertState) discard() {
 	indexdata.PutStringPostingAddMap(state.index)
 	indexdata.PutFixedPostingAddMap(state.fixed)
 	indexdata.PutStringPostingAddMap(state.nils)
@@ -338,6 +356,11 @@ func (state *snapshotFieldInsertState) release() {
 		state.lengths.Release()
 		state.lengths = nil
 	}
+	state.changed = false
+	state.indexHint = 0
+	state.fixedHint = 0
+	state.nilsHint = 0
+	state.lengthsHint = 0
 }
 
 func (acc indexedFieldAccessor) collectSnapshotBatchDiff(
@@ -458,25 +481,32 @@ func (acc indexedFieldAccessor) applySnapshotBatchStorageOwned(
 		return base
 	}
 	if acc.field != nil && acc.field.KeyKind == fieldWriteKeysOrderedU64 {
-		deltas := state.fixed
-		state.fixed = nil
-		return base.ApplyFixedPostingDiffOwned(deltas, state.arena, allowChunk)
+		return base.ApplyFixedPostingDiffRetainMapOwned(state.fixed, state.arena, allowChunk)
 	}
-	deltas := state.index
-	state.index = nil
-	return base.ApplyStringPostingDiffOwned(deltas, state.arena, false, allowChunk)
+	return base.ApplyStringPostingDiffRetainMapOwned(state.index, state.arena, false, allowChunk)
 }
 
 func (acc indexedFieldAccessor) applySnapshotBatchNilStorageOwned(base indexdata.FieldStorage, state *snapshotFieldBatchState) indexdata.FieldStorage {
 	if state == nil {
 		return base
 	}
-	deltas := state.nils
-	state.nils = nil
-	return base.ApplyStringPostingDiffOwned(deltas, state.arena, false, false)
+	return base.ApplyStringPostingDiffRetainMapOwned(state.nils, state.arena, false, false)
 }
 
 func (state *snapshotFieldBatchState) release() {
+	state.old.reset()
+	state.new.reset()
+	clear(state.index)
+	clear(state.fixed)
+	clear(state.nils)
+	state.arena.Reset()
+	if state.lengths != nil {
+		state.lengths.Reset()
+	}
+	state.changed = false
+}
+
+func (state *snapshotFieldBatchState) discard() {
 	state.old.release()
 	state.new.release()
 	indexdata.PutStringPostingDiffMap(state.index)
@@ -490,5 +520,26 @@ func (state *snapshotFieldBatchState) release() {
 	if state.lengths != nil {
 		state.lengths.Release()
 		state.lengths = nil
+	}
+	state.changed = false
+}
+
+func cleanupSnapshotFieldInsertStateSlice(states []snapshotFieldInsertState) {
+	if cap(states) <= snapshotFieldStateSlicePoolMaxCap {
+		return
+	}
+	states = states[:cap(states)]
+	for i := range states {
+		states[i].discard()
+	}
+}
+
+func cleanupSnapshotFieldBatchStateSlice(states []snapshotFieldBatchState) {
+	if cap(states) <= snapshotFieldStateSlicePoolMaxCap {
+		return
+	}
+	states = states[:cap(states)]
+	for i := range states {
+		states[i].discard()
 	}
 }

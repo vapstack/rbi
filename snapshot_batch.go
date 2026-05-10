@@ -39,7 +39,7 @@ func ensureSnapshotUniverseOwned(next *indexSnapshot, universeOwned *bool) {
 }
 
 type indexedFieldBatchDeltas struct {
-	fields  *pooled.Slice[snapshotFieldBatchState]
+	fields  []snapshotFieldBatchState
 	touched []int
 	changed []bool
 }
@@ -318,7 +318,7 @@ func (qe *queryEngine) collectSnapshotBatchEntryDiffs(
 			}
 			deltas.markTouched(acc.ordinal)
 			useZeroComplement := acc.ordinal < len(lenZeroComplement) && lenZeroComplement[acc.ordinal]
-			acc.collectSnapshotBatchDiff(op.idx, op.oldVal, op.newVal, useZeroComplement, deltas.fields.GetPtr(acc.ordinal))
+			acc.collectSnapshotBatchDiff(op.idx, op.oldVal, op.newVal, useZeroComplement, &deltas.fields[acc.ordinal])
 		}
 		return
 	}
@@ -327,7 +327,7 @@ func (qe *queryEngine) collectSnapshotBatchEntryDiffs(
 		for _, acc := range qe.indexedFieldAccess {
 			deltas.markTouched(acc.ordinal)
 			useZeroComplement := acc.ordinal < len(lenZeroComplement) && lenZeroComplement[acc.ordinal]
-			acc.collectSnapshotBatchDiff(op.idx, op.oldVal, op.newVal, useZeroComplement, deltas.fields.GetPtr(acc.ordinal))
+			acc.collectSnapshotBatchDiff(op.idx, op.oldVal, op.newVal, useZeroComplement, &deltas.fields[acc.ordinal])
 		}
 		return
 	}
@@ -338,7 +338,7 @@ func (qe *queryEngine) collectSnapshotBatchEntryDiffs(
 		}
 		deltas.markTouched(acc.ordinal)
 		useZeroComplement := acc.ordinal < len(lenZeroComplement) && lenZeroComplement[acc.ordinal]
-		acc.collectSnapshotBatchDiff(op.idx, op.oldVal, op.newVal, useZeroComplement, deltas.fields.GetPtr(acc.ordinal))
+		acc.collectSnapshotBatchDiff(op.idx, op.oldVal, op.newVal, useZeroComplement, &deltas.fields[acc.ordinal])
 	}
 }
 
@@ -371,11 +371,11 @@ func (qe *queryEngine) buildPreparedSnapshotAggregatedNoLock(
 
 	normalized := normalizePreparedBatchForSnapshot(entries)
 	deltas := indexedFieldBatchDeltas{
-		fields:  snapshotFieldBatchStateSlicePool.Get(),
+		fields:  snapshotFieldBatchStateSlicePool.Get(len(qe.indexedFieldAccess)),
 		touched: pooled.GetIntSlice(len(qe.indexedFieldAccess)),
 		changed: pooled.GetBoolSlice(len(qe.indexedFieldAccess))[:len(qe.indexedFieldAccess)],
 	}
-	deltas.fields.SetLen(len(qe.indexedFieldAccess))
+	deltas.fields = deltas.fields[:len(qe.indexedFieldAccess)]
 	clear(deltas.changed)
 	measureDeltas := indexdata.NewMeasureDeltaBatch(len(qe.measureFieldAccess))
 
@@ -404,7 +404,7 @@ func (qe *queryEngine) buildPreparedSnapshotAggregatedNoLock(
 	for i := range deltas.touched {
 		ordinal := deltas.touched[i]
 		acc := qe.indexedFieldAccess[ordinal]
-		state := deltas.fields.GetPtr(ordinal)
+		state := &deltas.fields[ordinal]
 		baseIndex := next.index[ordinal]
 		if storage := acc.applySnapshotBatchStorageOwned(baseIndex, state, true); storage.KeyCount() == 0 {
 			if baseIndex.KeyCount() > 0 {
@@ -423,10 +423,9 @@ func (qe *queryEngine) buildPreparedSnapshotAggregatedNoLock(
 		}
 		if state.lengths != nil {
 			baseLen := next.lenIndex[ordinal]
-			if storage := baseLen.ApplyLenPostingDiffOwned(state.lengths); storage != baseLen {
+			if storage := baseLen.ApplyLenPostingDiffRetainOwned(state.lengths); storage != baseLen {
 				next.lenIndex[ordinal] = storage
 			}
-			state.lengths = nil
 		}
 		if state.changed {
 			changedCount++

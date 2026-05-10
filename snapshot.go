@@ -1547,8 +1547,8 @@ func (qe *queryEngine) buildPreparedSnapshotInsertOnlyNoLock(seq uint64, prev *i
 	next.universe = next.universe.BuildMergedOwned(addedUniverse)
 	qe.initSnapshotRuntimeCaches(next)
 
-	fieldStates := snapshotFieldInsertStateSlicePool.Get()
-	fieldStates.SetLen(len(qe.indexedFieldAccess))
+	fieldStates := snapshotFieldInsertStateSlicePool.Get(len(qe.indexedFieldAccess))
+	fieldStates = fieldStates[:len(qe.indexedFieldAccess)]
 	initSnapshotFieldInsertStateHints(fieldStates, qe.indexedFieldAccess, prev, len(entries))
 	measureDeltas := indexdata.NewMeasureDeltaBatch(len(qe.measureFieldAccess))
 
@@ -1558,7 +1558,7 @@ func (qe *queryEngine) buildPreparedSnapshotInsertOnlyNoLock(seq uint64, prev *i
 
 		for _, acc := range qe.indexedFieldAccess {
 			useZeroComplement := acc.ordinal < len(prev.lenZeroComplement) && prev.lenZeroComplement[acc.ordinal]
-			acc.collectSnapshotInsertValue(ptr, op.idx, useZeroComplement, fieldStates.GetPtr(acc.ordinal))
+			acc.collectSnapshotInsertValue(ptr, op.idx, useZeroComplement, &fieldStates[acc.ordinal])
 		}
 		for _, acc := range qe.measureFieldAccess {
 			if value, ok := acc.read(ptr); ok {
@@ -1568,8 +1568,9 @@ func (qe *queryEngine) buildPreparedSnapshotInsertOnlyNoLock(seq uint64, prev *i
 	}
 
 	changedCount := 0
+	var changed []bool
 	for i, acc := range qe.indexedFieldAccess {
-		state := fieldStates.GetPtr(i)
+		state := &fieldStates[i]
 		baseIndex := next.index[i]
 		if storage := acc.mergeSnapshotInsertStorageOwned(baseIndex, state, true); storage.KeyCount() > 0 {
 			if storage != baseIndex {
@@ -1588,13 +1589,17 @@ func (qe *queryEngine) buildPreparedSnapshotInsertOnlyNoLock(seq uint64, prev *i
 		}
 		if state.lengths != nil {
 			baseLen := next.lenIndex[i]
-			if storage := baseLen.ApplyLenPostingDiffOwned(state.lengths); storage != baseLen {
+			if storage := baseLen.ApplyLenPostingDiffRetainOwned(state.lengths); storage != baseLen {
 				next.lenIndex[i] = storage
 			}
-			state.lengths = nil
 		}
 		if state.changed {
 			changedCount++
+			if changed == nil {
+				changed = pooled.GetBoolSlice(len(qe.indexedFieldAccess))[:len(qe.indexedFieldAccess)]
+				clear(changed)
+			}
+			changed[i] = true
 		}
 		state.release()
 	}
@@ -1603,13 +1608,6 @@ func (qe *queryEngine) buildPreparedSnapshotInsertOnlyNoLock(seq uint64, prev *i
 	inheritNumericRangeBucketCache(next, prev)
 
 	if changedCount > 0 {
-		changed := pooled.GetBoolSlice(len(qe.indexedFieldAccess))[:len(qe.indexedFieldAccess)]
-		clear(changed)
-		for i := 0; i < fieldStates.Len(); i++ {
-			if fieldStates.Get(i).changed {
-				changed[i] = true
-			}
-		}
 		inheritMaterializedPredCache(next, prev, qe.indexedFieldMap, changed)
 		pooled.ReleaseBoolSlice(changed)
 	} else {
