@@ -289,7 +289,7 @@ func TestReadStorageSkipConsumesExactlyOneStorage(t *testing.T) {
 	for _, tc := range fieldTests {
 		t.Run(tc.name, func(t *testing.T) {
 			entries := fieldStorageEntriesForTest(tc.rows, false)
-			storage := newRegularFieldStorage(&entries)
+			storage := newRegularFieldStorage(entries)
 			defer storage.Release()
 
 			var raw bytes.Buffer

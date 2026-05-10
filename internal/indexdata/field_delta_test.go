@@ -341,7 +341,7 @@ func TestApplyFieldPostingDiffStorage_NoOpFlatRemoveReturnsBase(t *testing.T) {
 		Key: keycodec.FromStoredString("a", false),
 		IDs: fieldStorageOwnedTestPosting(1),
 	}}
-	storage := newFlatFieldStorage(&entries)
+	storage := newFlatFieldStorage(entries, nil)
 	defer storage.Release()
 
 	missing := keycodec.FromStoredString("b", false)
@@ -385,7 +385,7 @@ func TestFieldStorageApplyPostingDiff_EmptyExistingDeltaDoesNotSharePayload(t *t
 		Key: keycodec.FromStoredString("a", false),
 		IDs: fieldStorageOwnedTestPosting(1),
 	}}
-	base := newFlatFieldStorage(&entries)
+	base := newFlatFieldStorage(entries, nil)
 	defer base.Release()
 
 	deltas := []PostingDelta{
@@ -414,7 +414,7 @@ func TestFieldStorageApplyPostingDiff_EmptyExistingDeltaDoesNotSharePayload(t *t
 
 func TestFieldStorageApplyPostingDiffBufOwned_ChunkedMatchesUnbuffered(t *testing.T) {
 	entries := fieldStorageEntriesForTest(fieldIndexChunkThreshold+37, true)
-	base := newRegularFieldStorage(&entries)
+	base := newRegularFieldStorage(entries)
 	defer base.Release()
 	if !base.IsChunked() {
 		t.Fatalf("expected chunked base")
@@ -464,11 +464,13 @@ func TestFieldStorageApplyPostingDiffBufOwned_ChunkedMatchesUnbuffered(t *testin
 	buffered := base.applyPostingDiffBufOwned(buf, true)
 	defer buffered.Release()
 
-	want := unbuffered.chunked.flatten()
+	want, wantData := unbuffered.chunked.flatten()
 	if want == nil {
 		t.Fatalf("expected flattened unbuffered storage")
 	}
-	fieldStorageAssertStorageMatchesEntries(t, buffered, *want)
+	defer PutFieldEntrySlice(want)
+	defer pooled.PutByteSlice(wantData)
+	fieldStorageAssertStorageMatchesEntries(t, buffered, want)
 }
 
 func TestFieldStorageMergeStringPostingAddsOwned_SortsAndDeduplicates(t *testing.T) {
@@ -524,7 +526,7 @@ func TestFieldStorageApplyStringPostingDiffOwned_UpdatesAndRemoves(t *testing.T)
 		{Key: keycodec.FromStoredString("a", false), IDs: fieldStorageSingleton(1)},
 		{Key: keycodec.FromStoredString("b", false), IDs: fieldStorageSingleton(2)},
 	}
-	base := newRegularFieldStorage(&entries)
+	base := newRegularFieldStorage(entries)
 	defer base.Release()
 
 	var arena *PostingDiffArena
@@ -549,7 +551,7 @@ func TestFieldStorageApplyFixedPostingDiffOwned_UpdatesAndRemoves(t *testing.T) 
 		{Key: keycodec.FromU64(2), IDs: fieldStorageSingleton(1)},
 		{Key: keycodec.FromU64(4), IDs: fieldStorageSingleton(2)},
 	}
-	base := newRegularFieldStorage(&entries)
+	base := newRegularFieldStorage(entries)
 	defer base.Release()
 
 	var arena *PostingDiffArena
@@ -574,7 +576,7 @@ func TestFieldStorageApplyLenPostingDiffOwned_UpdatesNonEmptyMarker(t *testing.T
 		{Key: keycodec.FromU64(1), IDs: fieldStorageSingleton(1)},
 		{Key: keycodec.FromString(LenIndexNonEmptyKey), IDs: fieldStorageSingleton(1)},
 	}
-	base := newRegularFieldStorage(&entries)
+	base := newRegularFieldStorage(entries)
 	defer base.Release()
 
 	var deltas *LenPostingDiff
@@ -852,7 +854,7 @@ func TestApplySingleFieldPostingDiffChunked_RebalancesOversizedDirectoryPagesAft
 	splitChunk := &fieldIndexChunk{
 		posts:   splitPosts,
 		numeric: splitKeys,
-		rows:    postingRows(splitPosts),
+		rows:    uint64(len(splitPosts)),
 	}
 	splitChunk.refs.Store(1)
 	refs = append(refs, fieldIndexChunkRef{
@@ -892,11 +894,13 @@ func TestApplySingleFieldPostingDiffChunked_RebalancesOversizedDirectoryPagesAft
 		}
 	}
 
-	baseEntries := root.flatten()
+	baseEntries, baseData := root.flatten()
 	if baseEntries == nil {
 		t.Fatalf("expected flattened base entries")
 	}
-	want := applySingleFieldPostingDiffSorted(baseEntries, PostingDelta{
+	defer PutFieldEntrySlice(baseEntries)
+	defer pooled.PutByteSlice(baseData)
+	want, same := applySingleFieldPostingDiffSorted(baseEntries, PostingDelta{
 		Key: insertKey,
 		Delta: BatchPostingDelta{
 			Add: fieldStorageSingleton(999_999),
@@ -905,5 +909,8 @@ func TestApplySingleFieldPostingDiffChunked_RebalancesOversizedDirectoryPagesAft
 	if want == nil {
 		t.Fatalf("expected non-empty expected entries")
 	}
-	fieldStorageAssertStorageMatchesEntries(t, got, *want)
+	if !same {
+		defer PutFieldEntrySlice(want)
+	}
+	fieldStorageAssertStorageMatchesEntries(t, got, want)
 }

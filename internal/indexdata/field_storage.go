@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"slices"
 	"sort"
-	"strings"
 	"sync/atomic"
 	"unsafe"
 
@@ -162,8 +161,9 @@ func shouldSealStringFieldIndexChunk(keyCount, bytes int) bool {
 }
 
 type fieldIndexFlatRoot struct {
-	refs    atomic.Int32
-	entries []Entry
+	refs       atomic.Int32
+	entries    []Entry
+	stringData []byte
 }
 
 type fieldIndexChunk struct {
@@ -238,7 +238,6 @@ type fieldIndexChunkBuilder struct {
 }
 
 type fieldIndexChunkStreamBuilder struct {
-	builder           *fieldIndexChunkBuilder
 	numeric           bool
 	posts             []posting.List
 	rows              uint64
@@ -342,14 +341,6 @@ func releaseFieldIndexChunkDirPages(pages []*fieldIndexChunkDirPage) {
 	fieldIndexChunkDirPageSlicePool.Put(pages)
 }
 
-func postingRows(posts []posting.List) uint64 {
-	var rows uint64
-	for i := range posts {
-		rows += posts[i].Cardinality()
-	}
-	return rows
-}
-
 func storedFieldPosting(ids posting.List) posting.List {
 	if ids.IsBorrowed() {
 		return ids.Clone()
@@ -382,13 +373,28 @@ func copyBorrowedPostingSlice(dst, src []posting.List) {
 }
 
 func newNumericFieldIndexChunk(posts []posting.List, keys []uint64, rows uint64) *fieldIndexChunk {
-	if chunkAllSingletonPosts(posts) {
-		keyOwners := interleavedNumericChunkPairs(keys, posts)
-		posting.ReleaseAll(posts)
-		posting.PutSlice(posts)
-		pooled.PutUint64Slice(keys)
-		return newUniqueNumericFieldIndexChunk(keyOwners)
+	if len(posts) > 0 {
+		if owner, ok := posts[0].TrySingle(); ok {
+			keyOwners := fieldUint64Slice(len(posts) * 2)
+			keyOwners[0] = keys[0]
+			keyOwners[1] = owner
+			for i := 1; i < len(posts); i++ {
+				owner, ok = posts[i].TrySingle()
+				if !ok {
+					pooled.PutUint64Slice(keyOwners)
+					goto regular
+				}
+				base := i << 1
+				keyOwners[base] = keys[i]
+				keyOwners[base+1] = owner
+			}
+			posting.ReleaseAll(posts)
+			posting.PutSlice(posts)
+			pooled.PutUint64Slice(keys)
+			return newUniqueNumericFieldIndexChunk(keyOwners)
+		}
 	}
+regular:
 	for i := range posts {
 		posts[i] = storedFieldPosting(posts[i])
 	}
@@ -398,44 +404,6 @@ func newNumericFieldIndexChunk(posts []posting.List, keys []uint64, rows uint64)
 	chunk.rows = rows
 	chunk.refs.Store(1)
 	return chunk
-}
-
-func chunkAllSingletonPosts(posts []posting.List) bool {
-	for i := range posts {
-		if _, ok := posts[i].TrySingle(); !ok {
-			return false
-		}
-	}
-	return true
-}
-
-func stringChunkOwners(posts []posting.List) []uint64 {
-	owners := fieldUint64Slice(len(posts))
-	for i := range posts {
-		owner, ok := posts[i].TrySingle()
-		if !ok {
-			panic("string owner chunk requires singleton postings")
-		}
-		owners[i] = owner
-	}
-	return owners
-}
-
-func interleavedNumericChunkPairs(keys []uint64, posts []posting.List) []uint64 {
-	if len(keys) != len(posts) {
-		panic("numeric owner chunk keys/posts len mismatch")
-	}
-	keyOwners := fieldUint64Slice(len(keys) * 2)
-	for i := range keys {
-		owner, ok := posts[i].TrySingle()
-		if !ok {
-			panic("numeric owner chunk requires singleton postings")
-		}
-		base := i << 1
-		keyOwners[base] = keys[i]
-		keyOwners[base+1] = owner
-	}
-	return keyOwners
 }
 
 func newUniqueNumericFieldIndexChunk(keyOwners []uint64) *fieldIndexChunk {
@@ -463,12 +431,24 @@ func newUniqueStringFieldIndexChunk(owners []uint64, refs []fieldIndexStringRef,
 }
 
 func newStringFieldIndexChunk(posts []posting.List, refs []fieldIndexStringRef, data []byte, rows uint64) *fieldIndexChunk {
-	if chunkAllSingletonPosts(posts) {
-		owners := stringChunkOwners(posts)
-		posting.ReleaseAll(posts)
-		posting.PutSlice(posts)
-		return newUniqueStringFieldIndexChunk(owners, refs, data)
+	if len(posts) > 0 {
+		if owner, ok := posts[0].TrySingle(); ok {
+			owners := fieldUint64Slice(len(posts))
+			owners[0] = owner
+			for i := 1; i < len(posts); i++ {
+				owner, ok = posts[i].TrySingle()
+				if !ok {
+					pooled.PutUint64Slice(owners)
+					goto regular
+				}
+				owners[i] = owner
+			}
+			posting.ReleaseAll(posts)
+			posting.PutSlice(posts)
+			return newUniqueStringFieldIndexChunk(owners, refs, data)
+		}
 	}
+regular:
 	for i := range posts {
 		posts[i] = storedFieldPosting(posts[i])
 	}
@@ -481,12 +461,14 @@ func newStringFieldIndexChunk(posts []posting.List, refs []fieldIndexStringRef, 
 	return chunk
 }
 
-func newFlatFieldStorage(slice *[]Entry) FieldStorage {
-	if slice == nil || len(*slice) == 0 {
+func newFlatFieldStorage(entries []Entry, stringData []byte) FieldStorage {
+	if len(entries) == 0 {
+		pooled.PutByteSlice(stringData)
 		return FieldStorage{}
 	}
 	root := fieldIndexFlatRootPool.Get()
-	root.entries = *slice
+	root.entries = entries
+	root.stringData = stringData
 	for i := range root.entries {
 		root.entries[i].IDs = storedFieldPosting(root.entries[i].IDs)
 	}
@@ -508,26 +490,26 @@ type fieldStorageBuilder struct {
 
 func (b *fieldStorageBuilder) init(capEntries int, numeric bool) {
 	b.builder = newFieldIndexChunkBuilder(capEntries)
-	b.stream = newFieldIndexChunkStreamBuilder(&b.builder, numeric)
+	b.stream = newFieldIndexChunkStreamBuilder(numeric)
 }
 
 func (b *fieldStorageBuilder) append(key keycodec.IndexKey, ids posting.List) {
-	b.stream.append(key, ids)
+	b.stream.append(&b.builder, key, ids)
 }
 
 func (b *fieldStorageBuilder) finish() FieldStorage {
-	b.stream.finish()
+	b.stream.finish(&b.builder)
 	return newChunkedFieldStorage(b.builder.root())
 }
 
-func newRegularFieldStorage(slice *[]Entry) FieldStorage {
-	if slice == nil || len(*slice) == 0 {
+func newRegularFieldStorage(entries []Entry) FieldStorage {
+	if len(entries) == 0 {
 		return FieldStorage{}
 	}
-	if len(*slice) < fieldIndexChunkThreshold {
-		return newFlatFieldStorage(slice)
+	if len(entries) < fieldIndexChunkThreshold {
+		return newFlatFieldStorage(entries, nil)
 	}
-	return newChunkedFieldStorage(buildChunkedFieldIndexRoot(*slice))
+	return newChunkedFieldStorage(buildChunkedFieldIndexRoot(entries))
 }
 
 func (r *fieldIndexFlatRoot) retain() {
@@ -890,7 +872,7 @@ func NewRegularFieldStorageFromRunsOwned(runs []FieldStorageRun) FieldStorage {
 			ReleaseFieldStorageRunsOwned(runs)
 			return FieldStorage{}
 		}
-		storage := newFlatFieldStorage(&entries)
+		storage := newFlatFieldStorage(entries, nil)
 		fieldStorageRunCursorSlicePool.Put(h.buf)
 		ReleaseFieldStorageRunsOwned(runs)
 		return storage
@@ -912,7 +894,7 @@ func NewNilFieldStorageOwned(ids posting.List) FieldStorage {
 		Key: keycodec.FromStoredString(NilIndexEntryKey, false),
 		IDs: ids,
 	})
-	return newFlatFieldStorage(&entries)
+	return newFlatFieldStorage(entries, nil)
 }
 
 func NewFlatFieldStorageFromPostingMapOwned(m map[string]posting.List, fixed8 bool) FieldStorage {
@@ -944,7 +926,7 @@ func NewFlatFieldStorageFromPostingMapOwned(m map[string]posting.List, fixed8 bo
 	}
 	pooled.PutStringSlice(keys)
 	PutPostingMap(m)
-	return newFlatFieldStorage(&entries)
+	return newFlatFieldStorage(entries, nil)
 }
 
 func NewRegularFieldStorageFromPostingMapOwned(m map[string]posting.List, fixed8 bool) FieldStorage {
@@ -977,7 +959,7 @@ func NewRegularFieldStorageFromPostingMapOwned(m map[string]posting.List, fixed8
 		}
 		pooled.PutStringSlice(keys)
 		PutPostingMap(m)
-		return newFlatFieldStorage(&entries)
+		return newFlatFieldStorage(entries, nil)
 	}
 
 	builder := newFieldIndexChunkBuilder(len(keys))
@@ -987,11 +969,13 @@ func NewRegularFieldStorageFromPostingMapOwned(m map[string]posting.List, fixed8
 		if fixed8 {
 			numeric := fieldUint64Slice(end - start)
 			posts := fieldPostingSlice(end - start)
+			var rows uint64
 			for i, key := range keys[start:end] {
 				numeric[i] = keycodec.Fixed8StringToU64(key)
 				posts[i] = m[key]
+				rows += posts[i].Cardinality()
 			}
-			builder.appendChunk(newNumericFieldIndexChunk(posts, numeric, postingRows(posts)))
+			builder.appendChunk(newNumericFieldIndexChunk(posts, numeric, rows))
 		} else {
 			totalBytes := 0
 			for _, key := range keys[start:end] {
@@ -1001,13 +985,15 @@ func NewRegularFieldStorageFromPostingMapOwned(m map[string]posting.List, fixed8
 			refs := fieldStringRefSlice(end - start)
 			posts := fieldPostingSlice(end - start)
 			off := 0
+			var rows uint64
 			for i, key := range keys[start:end] {
 				n := copy(data[off:], key)
 				refs[i] = newFieldIndexStringRef(off, n)
 				posts[i] = m[key]
+				rows += posts[i].Cardinality()
 				off += n
 			}
-			builder.appendChunk(newStringFieldIndexChunk(posts, refs, data, postingRows(posts)))
+			builder.appendChunk(newStringFieldIndexChunk(posts, refs, data, rows))
 		}
 		start = end
 	}
@@ -1046,7 +1032,7 @@ func NewRegularFieldStorageFromFixedPostingMapOwned(m map[uint64]posting.List) F
 		}
 		pooled.PutUint64Slice(keys)
 		PutFixedPostingMap(m)
-		return newFlatFieldStorage(&entries)
+		return newFlatFieldStorage(entries, nil)
 	}
 
 	builder := newFieldIndexChunkBuilder(len(keys))
@@ -1056,10 +1042,12 @@ func NewRegularFieldStorageFromFixedPostingMapOwned(m map[uint64]posting.List) F
 		numeric := fieldUint64Slice(end - start)
 		posts := fieldPostingSlice(end - start)
 		copy(numeric, keys[start:end])
+		var rows uint64
 		for i, key := range keys[start:end] {
 			posts[i] = m[key]
+			rows += posts[i].Cardinality()
 		}
-		builder.appendChunk(newNumericFieldIndexChunk(posts, numeric, postingRows(posts)))
+		builder.appendChunk(newNumericFieldIndexChunk(posts, numeric, rows))
 		start = end
 	}
 	pooled.PutUint64Slice(keys)
@@ -1203,7 +1191,7 @@ func newLenFieldStorageFromMapOwned(universe posting.List, lengths map[uint32]po
 		PutFieldEntrySlice(entries)
 		return FieldStorage{}, false
 	}
-	return newFlatFieldStorage(&entries), useZeroComplement
+	return newFlatFieldStorage(entries, nil), useZeroComplement
 }
 
 func (s FieldStorage) IsChunked() bool {
@@ -1511,9 +1499,8 @@ func (ref fieldIndexChunkRef) retained() fieldIndexChunkRef {
 	return ref
 }
 
-func newFieldIndexChunkStreamBuilder(builder *fieldIndexChunkBuilder, numeric bool) fieldIndexChunkStreamBuilder {
+func newFieldIndexChunkStreamBuilder(numeric bool) fieldIndexChunkStreamBuilder {
 	out := fieldIndexChunkStreamBuilder{
-		builder: builder,
 		numeric: numeric,
 		posts:   posting.GetSlice(fieldIndexChunkTargetEntries),
 	}
@@ -1525,8 +1512,8 @@ func newFieldIndexChunkStreamBuilder(builder *fieldIndexChunkBuilder, numeric bo
 	return out
 }
 
-func (b *fieldIndexChunkStreamBuilder) append(key keycodec.IndexKey, ids posting.List) {
-	if b == nil || b.builder == nil || ids.IsEmpty() {
+func (b *fieldIndexChunkStreamBuilder) append(builder *fieldIndexChunkBuilder, key keycodec.IndexKey, ids posting.List) {
+	if ids.IsEmpty() {
 		return
 	}
 	if !b.numeric {
@@ -1535,7 +1522,7 @@ func (b *fieldIndexChunkStreamBuilder) append(key keycodec.IndexKey, ids posting
 			panic(fmt.Sprintf("indexed string value len %d exceeds limit %d", keyLen, fieldIndexStringRefMax))
 		}
 		if len(b.posts) > 0 && shouldSealStringFieldIndexChunk(len(b.posts), b.stringBytes) {
-			b.sealActiveChunk()
+			b.sealActiveChunk(builder)
 		}
 	}
 	b.posts = append(b.posts, ids)
@@ -1548,23 +1535,23 @@ func (b *fieldIndexChunkStreamBuilder) append(key keycodec.IndexKey, ids posting
 	}
 	if b.numeric {
 		if len(b.posts) == fieldIndexChunkTargetEntries {
-			b.sealActiveChunk()
+			b.sealActiveChunk(builder)
 		}
 		return
 	}
 	if shouldSealStringFieldIndexChunk(len(b.posts), b.stringBytes) {
-		b.sealActiveChunk()
+		b.sealActiveChunk(builder)
 	}
 }
 
-func (b *fieldIndexChunkStreamBuilder) publishPendingChunk() {
-	if b == nil || b.builder == nil || len(b.pendingPosts) == 0 {
+func (b *fieldIndexChunkStreamBuilder) publishPendingChunk(builder *fieldIndexChunkBuilder) {
+	if len(b.pendingPosts) == 0 {
 		return
 	}
 	if b.numeric {
-		b.builder.appendChunk(newNumericFieldIndexChunk(b.pendingPosts, b.pendingNumericKey, b.pendingRows))
+		builder.appendChunk(newNumericFieldIndexChunk(b.pendingPosts, b.pendingNumericKey, b.pendingRows))
 	} else {
-		b.builder.appendChunk(newFieldIndexChunkFromKeys(b.pendingPosts, b.pendingStringKeys, b.pendingRows))
+		builder.appendChunk(newFieldIndexChunkFromKeys(b.pendingPosts, b.pendingStringKeys, b.pendingRows))
 		b.freeStringKeys = b.pendingStringKeys[:0]
 	}
 	b.pendingPosts = nil
@@ -1592,11 +1579,11 @@ func (b *fieldIndexChunkStreamBuilder) releaseActiveScratch() {
 	b.freeStringKeys = nil
 }
 
-func (b *fieldIndexChunkStreamBuilder) sealActiveChunk() {
-	if b == nil || b.builder == nil || len(b.posts) == 0 {
+func (b *fieldIndexChunkStreamBuilder) sealActiveChunk(builder *fieldIndexChunkBuilder) {
+	if len(b.posts) == 0 {
 		return
 	}
-	b.publishPendingChunk()
+	b.publishPendingChunk(builder)
 	b.pendingPosts = b.posts
 	b.pendingRows = b.rows
 	if b.numeric {
@@ -1620,29 +1607,26 @@ func (b *fieldIndexChunkStreamBuilder) sealActiveChunk() {
 	b.stringBytes = 0
 }
 
-func (b *fieldIndexChunkStreamBuilder) finish() {
-	if b == nil {
-		return
-	}
+func (b *fieldIndexChunkStreamBuilder) finish(builder *fieldIndexChunkBuilder) {
 	if len(b.pendingPosts) == 0 {
 		if len(b.posts) == 0 {
 			b.releaseActiveScratch()
 			return
 		}
-		b.publishActiveChunk()
+		b.publishActiveChunk(builder)
 		return
 	}
 	if len(b.posts) == 0 {
-		b.publishPendingChunk()
+		b.publishPendingChunk(builder)
 		b.releaseActiveScratch()
 		return
 	}
 	if len(b.posts) >= fieldIndexChunkMinEntries {
-		b.publishPendingChunk()
-		b.publishActiveChunk()
+		b.publishPendingChunk(builder)
+		b.publishActiveChunk(builder)
 		return
 	}
-	b.rebalancePendingWithTail()
+	b.rebalancePendingWithTail(builder)
 }
 
 func newFieldIndexChunkFromKeys(posts []posting.List, keys []keycodec.IndexKey, rows uint64) *fieldIndexChunk {
@@ -1791,16 +1775,16 @@ func (chunk *fieldIndexChunk) borrowEntries() []Entry {
 	return entries
 }
 
-func (b *fieldIndexChunkStreamBuilder) publishActiveChunk() {
-	if b == nil || b.builder == nil || len(b.posts) == 0 {
+func (b *fieldIndexChunkStreamBuilder) publishActiveChunk(builder *fieldIndexChunkBuilder) {
+	if len(b.posts) == 0 {
 		return
 	}
 	posts := b.posts
 	if b.numeric {
-		b.builder.appendChunk(newNumericFieldIndexChunk(posts, b.numericKey, b.rows))
+		builder.appendChunk(newNumericFieldIndexChunk(posts, b.numericKey, b.rows))
 		b.numericKey = nil
 	} else {
-		b.builder.appendChunk(newFieldIndexChunkFromKeys(posts, b.stringKeys, b.rows))
+		builder.appendChunk(newFieldIndexChunkFromKeys(posts, b.stringKeys, b.rows))
 		putFieldIndexKeySlice(b.stringKeys)
 		b.stringKeys = nil
 		if b.freeStringKeys != nil {
@@ -1813,8 +1797,8 @@ func (b *fieldIndexChunkStreamBuilder) publishActiveChunk() {
 	b.stringBytes = 0
 }
 
-func (b *fieldIndexChunkStreamBuilder) rebalancePendingWithTail() {
-	if b == nil || b.builder == nil || len(b.pendingPosts) == 0 || len(b.posts) == 0 {
+func (b *fieldIndexChunkStreamBuilder) rebalancePendingWithTail(builder *fieldIndexChunkBuilder) {
+	if len(b.pendingPosts) == 0 || len(b.posts) == 0 {
 		return
 	}
 	total := len(b.pendingPosts) + len(b.posts)
@@ -1825,9 +1809,19 @@ func (b *fieldIndexChunkStreamBuilder) rebalancePendingWithTail() {
 		firstSize := balancedFieldIndexChunkSize(total)
 		secondSize := total - firstSize
 		firstPosts := fieldPostingSlice(firstSize)
-		copy(firstPosts, combinedPosts[:firstSize])
 		secondPosts := fieldPostingSlice(secondSize)
-		copy(secondPosts, combinedPosts[firstSize:])
+		var firstRows uint64
+		var secondRows uint64
+		for i := 0; i < firstSize; i++ {
+			ids := combinedPosts[i]
+			firstPosts[i] = ids
+			firstRows += ids.Cardinality()
+		}
+		for i := 0; i < secondSize; i++ {
+			ids := combinedPosts[firstSize+i]
+			secondPosts[i] = ids
+			secondRows += ids.Cardinality()
+		}
 		combinedKeys := pooled.GetUint64Slice(total)
 		combinedKeys = append(combinedKeys, b.pendingNumericKey...)
 		combinedKeys = append(combinedKeys, b.numericKey...)
@@ -1835,8 +1829,8 @@ func (b *fieldIndexChunkStreamBuilder) rebalancePendingWithTail() {
 		copy(firstKeys, combinedKeys[:firstSize])
 		secondKeys := fieldUint64Slice(secondSize)
 		copy(secondKeys, combinedKeys[firstSize:firstSize+secondSize])
-		b.builder.appendChunk(newNumericFieldIndexChunk(firstPosts, firstKeys, postingRows(firstPosts)))
-		b.builder.appendChunk(newNumericFieldIndexChunk(secondPosts, secondKeys, postingRows(secondPosts)))
+		builder.appendChunk(newNumericFieldIndexChunk(firstPosts, firstKeys, firstRows))
+		builder.appendChunk(newNumericFieldIndexChunk(secondPosts, secondKeys, secondRows))
 		pooled.PutUint64Slice(combinedKeys)
 		pooled.PutUint64Slice(b.pendingNumericKey)
 		pooled.PutUint64Slice(b.numericKey)
@@ -1850,8 +1844,13 @@ func (b *fieldIndexChunkStreamBuilder) rebalancePendingWithTail() {
 			size := nextStringFieldIndexChunkSizeIndexKeys(combinedKeys, start)
 			end := start + size
 			chunkPosts := fieldPostingSlice(size)
-			copy(chunkPosts, combinedPosts[start:end])
-			b.builder.appendChunk(newFieldIndexChunkFromKeys(chunkPosts, combinedKeys[start:end], postingRows(chunkPosts)))
+			var rows uint64
+			for i := 0; i < size; i++ {
+				ids := combinedPosts[start+i]
+				chunkPosts[i] = ids
+				rows += ids.Cardinality()
+			}
+			builder.appendChunk(newFieldIndexChunkFromKeys(chunkPosts, combinedKeys[start:end], rows))
 			start = end
 		}
 		putFieldIndexKeySlice(combinedKeys)
@@ -2082,11 +2081,12 @@ func buildChunkedFieldIndexRoot(entries []Entry) *fieldIndexChunkedRoot {
 	return builder.root()
 }
 
-func (r *fieldIndexChunkedRoot) flatten() *[]Entry {
+func (r *fieldIndexChunkedRoot) flatten() ([]Entry, []byte) {
 	if r == nil || r.keyCount == 0 {
-		return nil
+		return nil, nil
 	}
 	out := GetFieldEntrySlice(r.keyCount)[:r.keyCount]
+	var data []byte
 	pos := 0
 	for i := 0; i < len(r.pages); i++ {
 		page := r.pages[i]
@@ -2095,8 +2095,21 @@ func (r *fieldIndexChunkedRoot) flatten() *[]Entry {
 			for k := 0; k < chunk.keyCount(); k++ {
 				key := chunk.keyAt(k)
 				if !key.IsNumeric() {
-					// Flat storage may outlive pooled chunk byte buffers after flattening.
-					key = keycodec.FromString(strings.Clone(key.UnsafeString()))
+					s := key.UnsafeString()
+					if len(s) > 0 {
+						if data == nil {
+							data = pooled.GetByteSlice(r.keyCount * 8)
+						}
+						start := len(data)
+						if cap(data)-len(data) < len(s) {
+							next := pooled.GetByteSlice(len(data) + len(s))
+							next = append(next, data...)
+							pooled.PutByteSlice(data)
+							data = next
+						}
+						data = append(data, s...)
+						key = keycodec.FromBytes(data[start:len(data)])
+					}
 				}
 				out[pos] = Entry{
 					Key: key,
@@ -2108,10 +2121,11 @@ func (r *fieldIndexChunkedRoot) flatten() *[]Entry {
 	}
 	if pos == 0 {
 		PutFieldEntrySlice(out)
-		return nil
+		pooled.PutByteSlice(data)
+		return nil, nil
 	}
 	out = out[:pos]
-	return &out
+	return out, data
 }
 
 func (r *fieldIndexChunkedRoot) endPos() fieldIndexChunkPos {

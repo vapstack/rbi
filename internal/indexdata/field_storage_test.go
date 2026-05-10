@@ -7,6 +7,7 @@ import (
 	"unsafe"
 
 	"github.com/vapstack/rbi/internal/keycodec"
+	"github.com/vapstack/rbi/internal/pooled"
 	"github.com/vapstack/rbi/internal/posting"
 )
 
@@ -166,12 +167,14 @@ func TestNewFieldIndexChunkRefsFromEntries_StringChunksRespectOffsetLimit(t *tes
 
 	root := newFieldIndexChunkedRootFromPages([]*fieldIndexChunkDirPage{newFieldIndexChunkDirPageOwned(refs)})
 	defer root.release()
-	flat := root.flatten()
-	if flat == nil || len(*flat) != total {
-		t.Fatalf("unexpected flattened len: got %d want %d", len(*flat), total)
+	flat, data := root.flatten()
+	if len(flat) != total {
+		t.Fatalf("unexpected flattened len: got %d want %d", len(flat), total)
 	}
-	for i := range *flat {
-		if got := (*flat)[i].Key.UnsafeString(); got != wantKeys[i] {
+	defer PutFieldEntrySlice(flat)
+	defer pooled.PutByteSlice(data)
+	for i := range flat {
+		if got := flat[i].Key.UnsafeString(); got != wantKeys[i] {
 			t.Fatalf("key[%d]: got %q want %q", i, got, wantKeys[i])
 		}
 	}
@@ -230,18 +233,20 @@ func TestFlattenChunkedFieldIndexRoot_RoundTrip(t *testing.T) {
 		t.Fatalf("expected chunked root")
 	}
 
-	flat := root.flatten()
+	flat, data := root.flatten()
 	if flat == nil {
 		t.Fatalf("expected flattened slice")
 	}
-	if len(*flat) != len(entries) {
-		t.Fatalf("unexpected materialized len: got %d want %d", len(*flat), len(entries))
+	defer PutFieldEntrySlice(flat)
+	defer pooled.PutByteSlice(data)
+	if len(flat) != len(entries) {
+		t.Fatalf("unexpected materialized len: got %d want %d", len(flat), len(entries))
 	}
 	for i := range entries {
-		if keycodec.Compare((*flat)[i].Key, entries[i].Key) != 0 {
+		if keycodec.Compare(flat[i].Key, entries[i].Key) != 0 {
 			t.Fatalf("unexpected key at %d", i)
 		}
-		if (*flat)[i].IDs.Cardinality() != entries[i].IDs.Cardinality() || !(*flat)[i].IDs.Contains(uint64(i+1)) {
+		if flat[i].IDs.Cardinality() != entries[i].IDs.Cardinality() || !flat[i].IDs.Contains(uint64(i+1)) {
 			t.Fatalf("unexpected posting at %d", i)
 		}
 	}
@@ -337,7 +342,7 @@ func TestFieldIndexChunkStreamBuilder_RoundTripAfterFlushes(t *testing.T) {
 			const total = fieldIndexChunkThreshold + fieldIndexChunkTargetEntries + 17
 
 			builder := newFieldIndexChunkBuilder(total)
-			stream := newFieldIndexChunkStreamBuilder(&builder, tc.numeric)
+			stream := newFieldIndexChunkStreamBuilder(tc.numeric)
 
 			wantKeys := make([]string, total)
 			wantIDs := make([]uint64, total)
@@ -355,9 +360,9 @@ func TestFieldIndexChunkStreamBuilder_RoundTripAfterFlushes(t *testing.T) {
 					key = keycodec.FromStoredString(wantKeys[i], false)
 				}
 
-				stream.append(key, fieldStorageSingleton(id))
+				stream.append(&builder, key, fieldStorageSingleton(id))
 			}
-			stream.finish()
+			stream.finish(&builder)
 
 			root := builder.root()
 			if root == nil {
@@ -367,19 +372,21 @@ func TestFieldIndexChunkStreamBuilder_RoundTripAfterFlushes(t *testing.T) {
 				t.Fatalf("expected multiple chunks, got %d", root.chunkCount)
 			}
 
-			flat := root.flatten()
+			flat, data := root.flatten()
 			if flat == nil {
 				t.Fatalf("expected flattened slice")
 			}
-			if len(*flat) != total {
-				t.Fatalf("unexpected flattened len: got %d want %d", len(*flat), total)
+			defer PutFieldEntrySlice(flat)
+			defer pooled.PutByteSlice(data)
+			if len(flat) != total {
+				t.Fatalf("unexpected flattened len: got %d want %d", len(flat), total)
 			}
-			for i := range *flat {
-				if got := (*flat)[i].Key.UnsafeString(); got != wantKeys[i] {
+			for i := range flat {
+				if got := flat[i].Key.UnsafeString(); got != wantKeys[i] {
 					t.Fatalf("key[%d]: got %q want %q", i, got, wantKeys[i])
 				}
-				if !(*flat)[i].IDs.Contains(wantIDs[i]) || (*flat)[i].IDs.Cardinality() != 1 {
-					t.Fatalf("posting[%d]: got=%v want singleton(%d)", i, (*flat)[i].IDs, wantIDs[i])
+				if !flat[i].IDs.Contains(wantIDs[i]) || flat[i].IDs.Cardinality() != 1 {
+					t.Fatalf("posting[%d]: got=%v want singleton(%d)", i, flat[i].IDs, wantIDs[i])
 				}
 			}
 		})
@@ -681,7 +688,7 @@ func TestRebuildLenFieldStorageFromOverlay_CountsValuesAndStoresZero(t *testing.
 		{Key: keycodec.FromStoredString("b", false), IDs: fieldStoragePosting(1, 2, 3)},
 		{Key: keycodec.FromStoredString("c", false), IDs: fieldStoragePosting(3)},
 	}
-	base := newRegularFieldStorage(&entries)
+	base := newRegularFieldStorage(entries)
 	defer base.Release()
 
 	storage, useZeroComplement := RebuildLenFieldStorageFromOverlay(universe, NewFieldOverlayStorage(base))
@@ -707,7 +714,7 @@ func TestRebuildLenFieldStorageFromOverlay_UsesZeroComplement(t *testing.T) {
 		{Key: keycodec.FromStoredString("b", false), IDs: fieldStoragePosting(8, 9)},
 		{Key: keycodec.FromStoredString("c", false), IDs: fieldStoragePosting(10)},
 	}
-	base := newRegularFieldStorage(&entries)
+	base := newRegularFieldStorage(entries)
 	defer base.Release()
 
 	storage, useZeroComplement := RebuildLenFieldStorageFromOverlay(universe, NewFieldOverlayStorage(base))
@@ -738,7 +745,7 @@ func TestFieldStorageSlotsRetainSharedStorage(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			entries := fieldStorageEntriesForTest(tc.rows, true)
-			storage := newRegularFieldStorage(&entries)
+			storage := newRegularFieldStorage(entries)
 			prev := GetFieldStorageSlice(1)
 			prev = append(prev, storage)
 			if FieldStorageSlotsApproxBytes(prev) == 0 {

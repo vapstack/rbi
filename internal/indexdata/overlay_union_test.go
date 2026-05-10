@@ -14,7 +14,7 @@ func TestFieldOverlayRangePostingsUnionAndMerge(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			entries := fieldStorageEntriesForTest(tc.rows, true)
-			storage := newRegularFieldStorage(&entries)
+			storage := newRegularFieldStorage(entries)
 			defer storage.Release()
 			ov := NewFieldOverlayStorage(storage)
 

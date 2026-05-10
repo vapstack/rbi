@@ -50,7 +50,7 @@ func TestFieldStorageStats_FlatAndChunked(t *testing.T) {
 		{Key: keycodec.FromStoredString("b", false), IDs: fieldStorageSingleton(2).BuildAdded(22)},
 		{Key: keycodec.FromStoredString("c", false), IDs: fieldStorageSingleton(3)},
 	}
-	flat := newRegularFieldStorage(&flatEntries)
+	flat := newRegularFieldStorage(flatEntries)
 	flatStats := flat.Stats(true)
 	if flatStats.EntryCount != 3 || flatStats.Unique != 3 || flatStats.PostingCardinality != 4 || flatStats.KeyBytes != 3 {
 		flat.Release()
@@ -64,7 +64,7 @@ func TestFieldStorageStats_FlatAndChunked(t *testing.T) {
 	flat.Release()
 
 	chunkedEntries := fieldStorageEntriesForTest(fieldIndexChunkThreshold+17, true)
-	chunked := newRegularFieldStorage(&chunkedEntries)
+	chunked := newRegularFieldStorage(chunkedEntries)
 	if !chunked.IsChunked() {
 		chunked.Release()
 		t.Fatalf("expected chunked storage")

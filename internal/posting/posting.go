@@ -2053,10 +2053,7 @@ func (p List) WriteTo(writer *bufio.Writer) error {
 		return writer.WriteByte(encodingEmpty)
 	}
 	if id, ok := p.TrySingle(); ok {
-		if err := writer.WriteByte(encodingSingleton); err != nil {
-			return err
-		}
-		return writeUvarint(writer, id)
+		return WriteSingleton(writer, id)
 	}
 	if sp := p.small(); sp != nil {
 		return writeCompactPosting(writer, encodingSmall, sp.ids[:sp.n])
@@ -2068,6 +2065,13 @@ func (p List) WriteTo(writer *bufio.Writer) error {
 		return err
 	}
 	return writeLarge(writer, p.largeRef())
+}
+
+func WriteSingleton(writer *bufio.Writer, id uint64) error {
+	if err := writer.WriteByte(encodingSingleton); err != nil {
+		return err
+	}
+	return writeUvarint(writer, id)
 }
 
 func readCompactPostingValues(reader *bufio.Reader, ids []uint64, kind string) error {

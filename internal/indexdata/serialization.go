@@ -110,13 +110,23 @@ func (chunk *fieldIndexChunk) writeInto(writer *bufio.Writer) error {
 			return fmt.Errorf("encode: writing numeric chunk len: %w", err)
 		}
 
-		var buf [8]byte
-		for i := 0; i < chunk.keyCount(); i++ {
-			binary.BigEndian.PutUint64(buf[:], chunk.keyAt(i).U64())
-			if _, err := writer.Write(buf[:]); err != nil {
+		if chunk.posts == nil {
+			for i := 0; i < len(chunk.numeric); i += 2 {
+				if err := writeBEUint64(writer, chunk.numeric[i]); err != nil {
+					return fmt.Errorf("encode: writing numeric chunk key: %w", err)
+				}
+				if err := posting.WriteSingleton(writer, chunk.numeric[i+1]); err != nil {
+					return fmt.Errorf("encode: writing numeric chunk posting: %w", err)
+				}
+			}
+			return nil
+		}
+
+		for i := range chunk.numeric {
+			if err := writeBEUint64(writer, chunk.numeric[i]); err != nil {
 				return fmt.Errorf("encode: writing numeric chunk key: %w", err)
 			}
-			if err := chunk.postingAt(i).WriteTo(writer); err != nil {
+			if err := chunk.posts[i].WriteTo(writer); err != nil {
 				return fmt.Errorf("encode: writing numeric chunk posting: %w", err)
 			}
 		}
@@ -130,7 +140,29 @@ func (chunk *fieldIndexChunk) writeInto(writer *bufio.Writer) error {
 		return fmt.Errorf("encode: writing string chunk len: %w", err)
 	}
 
-	for i := 0; i < chunk.keyCount(); i++ {
+	if chunk.posts == nil {
+		for i := range chunk.stringRefs {
+			ref := chunk.stringRefs[i]
+			if err := writeUvarint(writer, uint64(fieldIndexStringRefLen(ref))); err != nil {
+				return fmt.Errorf("encode: writing string chunk key len: %w", err)
+			}
+
+			if fieldIndexStringRefLen(ref) > 0 {
+				start := fieldIndexStringRefOff(ref)
+				end := start + fieldIndexStringRefLen(ref)
+				if _, err := writer.Write(chunk.stringData[start:end]); err != nil {
+					return fmt.Errorf("encode: writing string chunk key: %w", err)
+				}
+			}
+
+			if err := posting.WriteSingleton(writer, chunk.numeric[i]); err != nil {
+				return fmt.Errorf("encode: writing string chunk posting: %w", err)
+			}
+		}
+		return nil
+	}
+
+	for i := range chunk.stringRefs {
 		ref := chunk.stringRefs[i]
 		if err := writeUvarint(writer, uint64(fieldIndexStringRefLen(ref))); err != nil {
 			return fmt.Errorf("encode: writing string chunk key len: %w", err)
@@ -144,7 +176,7 @@ func (chunk *fieldIndexChunk) writeInto(writer *bufio.Writer) error {
 			}
 		}
 
-		if err := chunk.postingAt(i).WriteTo(writer); err != nil {
+		if err := chunk.posts[i].WriteTo(writer); err != nil {
 			return fmt.Errorf("encode: writing string chunk posting: %w", err)
 		}
 	}
@@ -175,10 +207,7 @@ func WriteKey(writer *bufio.Writer, key keycodec.IndexKey) error {
 		if err := writer.WriteByte(indexKeyEncodingRaw8); err != nil {
 			return err
 		}
-		var b [8]byte
-		binary.BigEndian.PutUint64(b[:], key.U64())
-		_, err := writer.Write(b[:])
-		return err
+		return writeBEUint64(writer, key.U64())
 	}
 	if err := writer.WriteByte(indexKeyEncodingString); err != nil {
 		return err
@@ -187,45 +216,83 @@ func WriteKey(writer *bufio.Writer, key keycodec.IndexKey) error {
 }
 
 func ReadMeasureStorage(reader *bufio.Reader, keep bool) (MeasureStorage, error) {
-	count, err := binary.ReadUvarint(reader)
+	count, err := readUvarint(reader)
 	if err != nil {
 		return MeasureStorage{}, err
 	}
 	if count > uint64(^uint(0)>>1) {
 		return MeasureStorage{}, fmt.Errorf("measure row count overflows int: %v", count)
 	}
-
-	var entries []MeasureEntry
-	if keep {
-		entries = GetMeasureEntrySlice(int(count))
-	}
-
-	for i := uint64(0); i < count; i++ {
-		id, err := binary.ReadUvarint(reader)
-		if err != nil {
-			if entries != nil {
-				PutMeasureEntrySlice(entries)
-			}
-			return MeasureStorage{}, fmt.Errorf("reading measure row %d/%d id: %w", i+1, count, err)
-		}
-
-		value, err := binary.ReadUvarint(reader)
-		if err != nil {
-			if entries != nil {
-				PutMeasureEntrySlice(entries)
-			}
-			return MeasureStorage{}, fmt.Errorf("reading measure row %d/%d value: %w", i+1, count, err)
-		}
-
-		if keep {
-			entries = append(entries, MeasureEntry{ID: id, Value: value})
-		}
-	}
+	rows := int(count)
 
 	if !keep {
+		for i := 0; i < rows; i++ {
+			if _, err = readUvarint(reader); err != nil {
+				return MeasureStorage{}, fmt.Errorf("reading measure row %d/%d id: %w", i+1, rows, err)
+			}
+			if _, err = readUvarint(reader); err != nil {
+				return MeasureStorage{}, fmt.Errorf("reading measure row %d/%d value: %w", i+1, rows, err)
+			}
+		}
 		return MeasureStorage{}, nil
 	}
-	return NewMeasureStorageFromEntriesOwned(entries), nil
+
+	if rows == 0 {
+		return MeasureStorage{}, nil
+	}
+
+	if rows <= MeasureChunkThreshold {
+		root := measureFlatRootPool.Get()
+		root.ids = pooled.GetUint64Slice(rows)[:rows]
+		root.values = pooled.GetUint64Slice(rows)[:rows]
+		for i := 0; i < rows; i++ {
+			id, err := readUvarint(reader)
+			if err != nil {
+				measureFlatRootPool.Put(root)
+				return MeasureStorage{}, fmt.Errorf("reading measure row %d/%d id: %w", i+1, rows, err)
+			}
+			value, err := readUvarint(reader)
+			if err != nil {
+				measureFlatRootPool.Put(root)
+				return MeasureStorage{}, fmt.Errorf("reading measure row %d/%d value: %w", i+1, rows, err)
+			}
+			root.ids[i] = id
+			root.values[i] = value
+		}
+		root.refs.Store(1)
+		return MeasureStorage{flat: root}, nil
+	}
+
+	root := measureChunkedRootPool.Get()
+	root.refsByID = measureChunkRefSlicePool.Get(rows/MeasureChunkTargetRows + 1)
+	for start := 0; start < rows; {
+		size := min(MeasureChunkTargetRows, rows-start)
+		chunk := measureChunkPool.Get()
+		chunk.ids = pooled.GetUint64Slice(size)[:size]
+		chunk.values = pooled.GetUint64Slice(size)[:size]
+		for i := 0; i < size; i++ {
+			row := start + i
+			id, err := readUvarint(reader)
+			if err != nil {
+				measureChunkPool.Put(chunk)
+				measureChunkedRootPool.Put(root)
+				return MeasureStorage{}, fmt.Errorf("reading measure row %d/%d id: %w", row+1, rows, err)
+			}
+			value, err := readUvarint(reader)
+			if err != nil {
+				measureChunkPool.Put(chunk)
+				measureChunkedRootPool.Put(root)
+				return MeasureStorage{}, fmt.Errorf("reading measure row %d/%d value: %w", row+1, rows, err)
+			}
+			chunk.ids[i] = id
+			chunk.values[i] = value
+		}
+		chunk.refs.Store(1)
+		root.appendChunkRef(chunk)
+		start += size
+	}
+	root.refs.Store(1)
+	return MeasureStorage{chunked: root}, nil
 }
 
 func ReadFieldStorage(reader *bufio.Reader, keep bool, section string, fieldName string) (FieldStorage, error) {
@@ -236,7 +303,7 @@ func ReadFieldStorage(reader *bufio.Reader, keep bool, section string, fieldName
 	switch tag {
 
 	case fieldStorageEncodingFlat:
-		count, err := binary.ReadUvarint(reader)
+		count, err := readUvarint(reader)
 		if err != nil {
 			return FieldStorage{}, fmt.Errorf("reading flat len: %w", err)
 		}
@@ -254,38 +321,91 @@ func ReadFieldStorage(reader *bufio.Reader, keep bool, section string, fieldName
 		}
 
 		entries := GetFieldEntrySlice(int(count))[:int(count)]
+		var data []byte
 		n := 0
 		for i := uint64(0); i < count; i++ {
-			ent, err := ReadEntry(reader)
+			tag, err := reader.ReadByte()
 			if err != nil {
-				for j := 0; j < n; j++ {
-					entries[j].IDs.Release()
-				}
-				PutFieldEntrySlice(entries)
+				releaseReadFlatBuffers(entries, n, data)
 				return FieldStorage{}, fmt.Errorf("reading flat entry %d/%d for field %q in %s: %w", i+1, count, fieldName, section, err)
 			}
-			if ent.IDs.IsEmpty() {
+			var key keycodec.IndexKey
+			switch tag {
+			case indexKeyEncodingString:
+				keyBytes, err := readUvarint(reader)
+				if err != nil {
+					releaseReadFlatBuffers(entries, n, data)
+					return FieldStorage{}, fmt.Errorf("reading flat entry %d/%d for field %q in %s: %w", i+1, count, fieldName, section, err)
+				}
+				if keyBytes > uint64(^uint(0)>>1) {
+					releaseReadFlatBuffers(entries, n, data)
+					return FieldStorage{}, fmt.Errorf("reading flat entry %d/%d for field %q in %s: string len %v overflows int", i+1, count, fieldName, section, keyBytes)
+				}
+				keyLen := int(keyBytes)
+				if err = ValidateIndexedStringKeyLen(keyLen); err != nil {
+					releaseReadFlatBuffers(entries, n, data)
+					return FieldStorage{}, fmt.Errorf("reading flat entry %d/%d for field %q in %s: %w", i+1, count, fieldName, section, err)
+				}
+				if keyLen > 0 {
+					if data == nil {
+						data = pooled.GetByteSlice(int(count) * 8)
+					}
+					start := len(data)
+					if cap(data)-len(data) < keyLen {
+						next := pooled.GetByteSlice(len(data) + keyLen)
+						next = append(next, data...)
+						pooled.PutByteSlice(data)
+						data = next
+					}
+					data = data[:start+keyLen]
+					if err = readFull(reader, data[start:start+keyLen]); err != nil {
+						releaseReadFlatBuffers(entries, n, data)
+						return FieldStorage{}, fmt.Errorf("reading flat entry %d/%d for field %q in %s: %w", i+1, count, fieldName, section, err)
+					}
+					key = keycodec.FromBytes(data[start : start+keyLen])
+				}
+
+			case indexKeyEncodingRaw8:
+				v, err := readBEUint64(reader)
+				if err != nil {
+					releaseReadFlatBuffers(entries, n, data)
+					return FieldStorage{}, fmt.Errorf("reading flat entry %d/%d for field %q in %s: %w", i+1, count, fieldName, section, err)
+				}
+				key = keycodec.FromU64(v)
+
+			default:
+				releaseReadFlatBuffers(entries, n, data)
+				return FieldStorage{}, fmt.Errorf("reading flat entry %d/%d for field %q in %s: invalid Entry key encoding %v", i+1, count, fieldName, section, tag)
+			}
+
+			ids, err := posting.ReadFrom(reader)
+			if err != nil {
+				releaseReadFlatBuffers(entries, n, data)
+				return FieldStorage{}, fmt.Errorf("reading flat entry %d/%d for field %q in %s: reading Entry posting: %w", i+1, count, fieldName, section, err)
+			}
+			if ids.IsEmpty() {
 				continue
 			}
-			entries[n] = ent
+			entries[n] = Entry{Key: key, IDs: ids}
 			n++
 		}
 		entries = entries[:n]
 		if len(entries) == 0 {
 			PutFieldEntrySlice(entries)
+			pooled.PutByteSlice(data)
 			return FieldStorage{}, nil
 		}
-		return newFlatFieldStorage(&entries), nil
+		return newFlatFieldStorage(entries, data), nil
 
 	case fieldStorageEncodingChunked:
-		pageCount, err := binary.ReadUvarint(reader)
+		pageCount, err := readUvarint(reader)
 		if err != nil {
 			return FieldStorage{}, fmt.Errorf("reading page count: %w", err)
 		}
 
 		if !keep {
 			for i := uint64(0); i < pageCount; i++ {
-				refCount, err := binary.ReadUvarint(reader)
+				refCount, err := readUvarint(reader)
 				if err != nil {
 					return FieldStorage{}, fmt.Errorf("reading page ref count %d/%d for field %q in %s: %w", i+1, pageCount, fieldName, section, err)
 				}
@@ -300,7 +420,7 @@ func ReadFieldStorage(reader *bufio.Reader, keep bool, section string, fieldName
 
 		builder := newFieldIndexChunkBuilder(0)
 		for i := uint64(0); i < pageCount; i++ {
-			refCount, err := binary.ReadUvarint(reader)
+			refCount, err := readUvarint(reader)
 			if err != nil {
 				builder.releaseOwned()
 				return FieldStorage{}, fmt.Errorf("reading page ref count %d/%d for field %q in %s: %w", i+1, pageCount, fieldName, section, err)
@@ -345,7 +465,7 @@ func readFieldIndexChunk(reader *bufio.Reader) (*fieldIndexChunk, error) {
 	switch tag {
 
 	case fieldIndexChunkEncodingRaw8:
-		count, err := binary.ReadUvarint(reader)
+		count, err := readUvarint(reader)
 		if err != nil {
 			return nil, fmt.Errorf("reading numeric chunk len: %w", err)
 		}
@@ -355,28 +475,67 @@ func readFieldIndexChunk(reader *bufio.Reader) (*fieldIndexChunk, error) {
 		if count > uint64(^uint(0)>>1) {
 			return nil, fmt.Errorf("numeric chunk len overflows int: %v", count)
 		}
-		keys := fieldUint64Slice(int(count))
-		posts := fieldPostingSlice(int(count))
-		var buf [8]byte
+		n := int(count)
+		var keys []uint64
+		var keyOwners []uint64
+		var posts []posting.List
+		var rows uint64
 
-		for i := range keys {
-			if _, err = io.ReadFull(reader, buf[:]); err != nil {
+		for i := 0; i < n; i++ {
+			key, err := readBEUint64(reader)
+			if err != nil {
 				releaseReadFieldChunkBuffers(posts, keys, nil, nil)
-				return nil, fmt.Errorf("reading numeric chunk key %d/%d: %w", i+1, len(keys), err)
+				pooled.PutUint64Slice(keyOwners)
+				return nil, fmt.Errorf("reading numeric chunk key %d/%d: %w", i+1, n, err)
 			}
 
-			keys[i] = binary.BigEndian.Uint64(buf[:])
 			ids, err := posting.ReadFrom(reader)
 			if err != nil {
 				releaseReadFieldChunkBuffers(posts, keys, nil, nil)
-				return nil, fmt.Errorf("reading numeric chunk posting %d/%d: %w", i+1, len(keys), err)
+				pooled.PutUint64Slice(keyOwners)
+				return nil, fmt.Errorf("reading numeric chunk posting %d/%d: %w", i+1, n, err)
 			}
+
+			if posts != nil {
+				keys[i] = key
+				posts[i] = ids
+				rows += ids.Cardinality()
+				continue
+			}
+
+			owner, ok := ids.TrySingle()
+			if ok {
+				if keyOwners == nil {
+					keyOwners = fieldUint64Slice(n * 2)
+				}
+				base := i << 1
+				keyOwners[base] = key
+				keyOwners[base+1] = owner
+				rows++
+				continue
+			}
+
+			keys = fieldUint64Slice(n)
+			posts = fieldPostingSlice(n)
+			for j := 0; j < i; j++ {
+				base := j << 1
+				keys[j] = keyOwners[base]
+				var single posting.List
+				posts[j] = single.BuildAdded(keyOwners[base+1])
+			}
+			pooled.PutUint64Slice(keyOwners)
+			keyOwners = nil
+			keys[i] = key
 			posts[i] = ids
+			rows += ids.Cardinality()
 		}
-		return newNumericFieldIndexChunk(posts, keys, postingRows(posts)), nil
+		if posts == nil {
+			return newUniqueNumericFieldIndexChunk(keyOwners), nil
+		}
+		return newNumericFieldIndexChunk(posts, keys, rows), nil
 
 	case fieldIndexChunkEncodingString:
-		count, err := binary.ReadUvarint(reader)
+		count, err := readUvarint(reader)
 		if err != nil {
 			return nil, fmt.Errorf("reading string chunk len: %w", err)
 		}
@@ -387,19 +546,24 @@ func readFieldIndexChunk(reader *bufio.Reader) (*fieldIndexChunk, error) {
 			return nil, fmt.Errorf("string chunk len overflows int: %v", count)
 		}
 
-		refs := fieldStringRefSlice(int(count))
-		posts := fieldPostingSlice(int(count))
-		data := pooled.GetByteSlice(int(count) * 8)
+		n := int(count)
+		refs := fieldStringRefSlice(n)
+		var owners []uint64
+		var posts []posting.List
+		data := pooled.GetByteSlice(n * 8)
+		var rows uint64
 
 		for i := range refs {
-			n, err := binary.ReadUvarint(reader)
+			n, err := readUvarint(reader)
 			if err != nil {
 				releaseReadFieldChunkBuffers(posts, nil, refs, data)
+				pooled.PutUint64Slice(owners)
 				return nil, fmt.Errorf("reading string chunk key len %d/%d: %w", i+1, len(refs), err)
 			}
 
 			if n > uint64(^uint(0)>>1) {
 				releaseReadFieldChunkBuffers(posts, nil, refs, data)
+				pooled.PutUint64Slice(owners)
 				return nil, fmt.Errorf("string chunk key len overflows int at entry %d/%d: %v", i+1, len(refs), n)
 			}
 
@@ -415,14 +579,16 @@ func readFieldIndexChunk(reader *bufio.Reader) (*fieldIndexChunk, error) {
 
 			data = data[:start+keyLen]
 			if keyLen > 0 {
-				if _, err = io.ReadFull(reader, data[start:start+keyLen]); err != nil {
+				if err = readFull(reader, data[start:start+keyLen]); err != nil {
 					releaseReadFieldChunkBuffers(posts, nil, refs, data)
+					pooled.PutUint64Slice(owners)
 					return nil, fmt.Errorf("reading string chunk key %d/%d: %w", i+1, len(refs), err)
 				}
 			}
 
 			if !fieldIndexStringRefFits(start, keyLen) {
 				releaseReadFieldChunkBuffers(posts, nil, refs, data)
+				pooled.PutUint64Slice(owners)
 				if keyLen > fieldIndexStringRefMax {
 					return nil, fmt.Errorf("string chunk key len exceeds uint16 at entry %d/%d: %d", i+1, len(refs), keyLen)
 				}
@@ -433,12 +599,41 @@ func readFieldIndexChunk(reader *bufio.Reader) (*fieldIndexChunk, error) {
 			ids, err := posting.ReadFrom(reader)
 			if err != nil {
 				releaseReadFieldChunkBuffers(posts, nil, refs, data)
+				pooled.PutUint64Slice(owners)
 				return nil, fmt.Errorf("reading string chunk posting %d/%d: %w", i+1, len(refs), err)
 			}
+
+			if posts != nil {
+				posts[i] = ids
+				rows += ids.Cardinality()
+				continue
+			}
+
+			owner, ok := ids.TrySingle()
+			if ok {
+				if owners == nil {
+					owners = fieldUint64Slice(len(refs))
+				}
+				owners[i] = owner
+				rows++
+				continue
+			}
+
+			posts = fieldPostingSlice(len(refs))
+			for j := 0; j < i; j++ {
+				var single posting.List
+				posts[j] = single.BuildAdded(owners[j])
+			}
+			pooled.PutUint64Slice(owners)
+			owners = nil
 			posts[i] = ids
+			rows += ids.Cardinality()
 		}
 
-		return newStringFieldIndexChunk(posts, refs, data, postingRows(posts)), nil
+		if posts == nil {
+			return newUniqueStringFieldIndexChunk(owners, refs, data), nil
+		}
+		return newStringFieldIndexChunk(posts, refs, data, rows), nil
 
 	default:
 		return nil, fmt.Errorf("invalid field chunk encoding %v", tag)
@@ -453,6 +648,14 @@ func releaseReadFieldChunkBuffers(posts []posting.List, keys []uint64, refs []fi
 	pooled.PutByteSlice(data)
 }
 
+func releaseReadFlatBuffers(entries []Entry, n int, data []byte) {
+	for i := 0; i < n; i++ {
+		entries[i].IDs.Release()
+	}
+	PutFieldEntrySlice(entries)
+	pooled.PutByteSlice(data)
+}
+
 func skipFieldIndexChunk(reader *bufio.Reader) error {
 	tag, err := reader.ReadByte()
 	if err != nil {
@@ -461,12 +664,12 @@ func skipFieldIndexChunk(reader *bufio.Reader) error {
 	switch tag {
 
 	case fieldIndexChunkEncodingRaw8:
-		count, err := binary.ReadUvarint(reader)
+		count, err := readUvarint(reader)
 		if err != nil {
 			return fmt.Errorf("reading numeric chunk len: %w", err)
 		}
 		for i := uint64(0); i < count; i++ {
-			if _, err = io.CopyN(io.Discard, reader, 8); err != nil {
+			if err = discardN(reader, 8); err != nil {
 				return fmt.Errorf("skipping numeric chunk key %d/%d: %w", i+1, count, err)
 			}
 			if err = posting.Skip(reader); err != nil {
@@ -476,17 +679,17 @@ func skipFieldIndexChunk(reader *bufio.Reader) error {
 		return nil
 
 	case fieldIndexChunkEncodingString:
-		count, err := binary.ReadUvarint(reader)
+		count, err := readUvarint(reader)
 		if err != nil {
 			return fmt.Errorf("reading string chunk len: %w", err)
 		}
 		for i := uint64(0); i < count; i++ {
-			n, err := binary.ReadUvarint(reader)
+			n, err := readUvarint(reader)
 			if err != nil {
 				return fmt.Errorf("reading string chunk key len %d/%d: %w", i+1, count, err)
 			}
 			if n > 0 {
-				if _, err = io.CopyN(io.Discard, reader, int64(n)); err != nil {
+				if err = discardN(reader, n); err != nil {
 					return fmt.Errorf("skipping string chunk key %d/%d: %w", i+1, count, err)
 				}
 			}
@@ -541,11 +744,11 @@ func ReadKey(reader *bufio.Reader) (keycodec.IndexKey, error) {
 		return keycodec.FromString(s), nil
 
 	case indexKeyEncodingRaw8:
-		var buf [8]byte
-		if _, err = io.ReadFull(reader, buf[:]); err != nil {
+		v, err := readBEUint64(reader)
+		if err != nil {
 			return keycodec.IndexKey{}, err
 		}
-		return keycodec.FromU64(binary.BigEndian.Uint64(buf[:])), nil
+		return keycodec.FromU64(v), nil
 
 	default:
 		return keycodec.IndexKey{}, fmt.Errorf("invalid Entry key encoding %v", tag)
@@ -561,8 +764,7 @@ func SkipKey(reader *bufio.Reader) error {
 	case indexKeyEncodingString:
 		return skipString(reader)
 	case indexKeyEncodingRaw8:
-		_, err = io.CopyN(io.Discard, reader, 8)
-		return err
+		return discardN(reader, 8)
 	default:
 		return fmt.Errorf("invalid Entry key encoding %v", tag)
 	}
@@ -575,23 +777,149 @@ func writeString(writer *bufio.Writer, s string) error {
 	if len(s) == 0 {
 		return nil
 	}
-	if _, err := io.WriteString(writer, s); err != nil {
+	if _, err := writer.WriteString(s); err != nil {
 		return err
 	}
 	return nil
 }
 
 func writeUvarint(writer *bufio.Writer, v uint64) error {
-	var buf [binary.MaxVarintLen64]byte
-	n := binary.PutUvarint(buf[:], v)
-	if _, err := writer.Write(buf[:n]); err != nil {
+	if v < 0x80 {
+		return writer.WriteByte(byte(v))
+	}
+	if writer.Available() >= binary.MaxVarintLen64 {
+		buf := writer.AvailableBuffer()
+		for v >= 0x80 {
+			buf = append(buf, byte(v)|0x80)
+			v >>= 7
+		}
+		buf = append(buf, byte(v))
+		_, err := writer.Write(buf)
 		return err
+	}
+	for v >= 0x80 {
+		if err := writer.WriteByte(byte(v) | 0x80); err != nil {
+			return err
+		}
+		v >>= 7
+	}
+	return writer.WriteByte(byte(v))
+}
+
+func writeBEUint64(writer *bufio.Writer, v uint64) error {
+	if writer.Available() >= 8 {
+		buf := writer.AvailableBuffer()
+		buf = binary.BigEndian.AppendUint64(buf, v)
+		_, err := writer.Write(buf)
+		return err
+	}
+	if err := writer.WriteByte(byte(v >> 56)); err != nil {
+		return err
+	}
+	if err := writer.WriteByte(byte(v >> 48)); err != nil {
+		return err
+	}
+	if err := writer.WriteByte(byte(v >> 40)); err != nil {
+		return err
+	}
+	if err := writer.WriteByte(byte(v >> 32)); err != nil {
+		return err
+	}
+	if err := writer.WriteByte(byte(v >> 24)); err != nil {
+		return err
+	}
+	if err := writer.WriteByte(byte(v >> 16)); err != nil {
+		return err
+	}
+	if err := writer.WriteByte(byte(v >> 8)); err != nil {
+		return err
+	}
+	return writer.WriteByte(byte(v))
+}
+
+func readUvarint(reader *bufio.Reader) (uint64, error) {
+	var x uint64
+	var s uint
+	for i := 0; i < 10; i++ {
+		b, err := reader.ReadByte()
+		if err != nil {
+			if i > 0 && err == io.EOF {
+				return x, io.ErrUnexpectedEOF
+			}
+			return x, err
+		}
+		if b < 0x80 {
+			if i == 9 && b > 1 {
+				return 0, fmt.Errorf("binary: varint overflows a 64-bit integer")
+			}
+			return x | uint64(b)<<s, nil
+		}
+		x |= uint64(b&0x7f) << s
+		s += 7
+	}
+	return 0, fmt.Errorf("binary: varint overflows a 64-bit integer")
+}
+
+func readBEUint64(reader *bufio.Reader) (uint64, error) {
+	if b, err := reader.Peek(8); err == nil {
+		v := binary.BigEndian.Uint64(b)
+		_, err = reader.Discard(8)
+		return v, err
+	}
+	var v uint64
+	for i := 0; i < 8; i++ {
+		b, err := reader.ReadByte()
+		if err != nil {
+			if i > 0 && err == io.EOF {
+				return 0, io.ErrUnexpectedEOF
+			}
+			return 0, err
+		}
+		v = v<<8 | uint64(b)
+	}
+	return v, nil
+}
+
+func readFull(reader *bufio.Reader, buf []byte) error {
+	for len(buf) > 0 {
+		n, err := reader.Read(buf)
+		buf = buf[n:]
+		if len(buf) == 0 {
+			return nil
+		}
+		if err != nil {
+			if err == io.EOF && n > 0 {
+				return io.ErrUnexpectedEOF
+			}
+			return err
+		}
+		if n == 0 {
+			return io.ErrNoProgress
+		}
+	}
+	return nil
+}
+
+func discardN(reader *bufio.Reader, n uint64) error {
+	for n > 0 {
+		step := 64 << 10
+		if n < uint64(step) {
+			step = int(n)
+		}
+		skipped, err := reader.Discard(step)
+		n -= uint64(skipped)
+		if err != nil {
+			return err
+		}
+		if skipped != step {
+			return io.ErrNoProgress
+		}
 	}
 	return nil
 }
 
 func readString(reader *bufio.Reader) (string, error) {
-	n, err := binary.ReadUvarint(reader)
+	n, err := readUvarint(reader)
 	if err != nil {
 		return "", err
 	}
@@ -604,8 +932,13 @@ func readString(reader *bufio.Reader) (string, error) {
 	if n > uint64(^uint(0)>>1) {
 		return "", fmt.Errorf("string len %v overflows int", n)
 	}
+	if b, err := reader.Peek(int(n)); err == nil {
+		s := string(b)
+		_, err = reader.Discard(int(n))
+		return s, err
+	}
 	b := make([]byte, int(n))
-	if _, err = io.ReadFull(reader, b); err != nil {
+	if err = readFull(reader, b); err != nil {
 		return "", err
 	}
 	s := unsafe.String(unsafe.SliceData(b), len(b))
@@ -613,7 +946,7 @@ func readString(reader *bufio.Reader) (string, error) {
 }
 
 func skipString(reader *bufio.Reader) error {
-	n, err := binary.ReadUvarint(reader)
+	n, err := readUvarint(reader)
 	if err != nil {
 		return err
 	}
@@ -626,8 +959,5 @@ func skipString(reader *bufio.Reader) error {
 	if n > uint64(^uint(0)>>1) {
 		return fmt.Errorf("string len %v overflows int", n)
 	}
-	if _, err = io.CopyN(io.Discard, reader, int64(n)); err != nil {
-		return err
-	}
-	return nil
+	return discardN(reader, n)
 }

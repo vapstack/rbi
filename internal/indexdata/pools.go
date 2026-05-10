@@ -65,7 +65,9 @@ var (
 				r.entries[i].IDs.Release()
 			}
 			PutFieldEntrySlice(r.entries)
+			pooled.PutByteSlice(r.stringData)
 			r.entries = nil
+			r.stringData = nil
 			r.refs.Store(0)
 		},
 	}
