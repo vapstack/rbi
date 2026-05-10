@@ -648,26 +648,26 @@ func TestSnapshotExt_CollectSnapshotBatchDiff_ReorderedSliceValuesProduceNoDelta
 		acc.collectSnapshotBatchDiff(1, unsafe.Pointer(oldVal), unsafe.Pointer(newVal), false, &state)
 
 		if state.changed {
-			state.release()
+			state.reset()
 			t.Fatalf("%s: reorder-only diff unexpectedly marked field as changed", f)
 		}
 		if state.index != nil {
-			state.release()
+			state.reset()
 			t.Fatalf("%s: reorder-only diff produced string deltas: %#v", f, state.index)
 		}
 		if state.fixed != nil {
-			state.release()
+			state.reset()
 			t.Fatalf("%s: reorder-only diff produced fixed deltas: %#v", f, state.fixed)
 		}
 		if state.nils != nil {
-			state.release()
+			state.reset()
 			t.Fatalf("%s: reorder-only diff produced nil deltas: %#v", f, state.nils)
 		}
 		if state.lengths != nil {
-			state.release()
+			state.reset()
 			t.Fatalf("%s: reorder-only diff produced len deltas: %#v", f, state.lengths)
 		}
-		state.release()
+		state.reset()
 	}
 }
 

@@ -68,26 +68,28 @@ var snapshotFieldBatchStateSlicePool = pooled.NewSlicePool[snapshotFieldBatchSta
 
 func (s *fieldWriteScratch) reset() {
 	if s.strings != nil {
-		clear(s.strings)
-		s.strings = s.strings[:0]
+		if cap(s.strings) > 64<<10 {
+			s.strings = nil
+		} else {
+			clear(s.strings)
+			s.strings = s.strings[:0]
+		}
 	}
 	if s.fixed != nil {
-		s.fixed = s.fixed[:0]
+		if cap(s.fixed) > 64<<10 {
+			s.fixed = nil
+		} else {
+			s.fixed = s.fixed[:0]
+		}
 	}
 	s.ok = false
 	s.isNil = false
 	s.length = 0
 }
 
-func (s *fieldWriteScratch) release() {
-	if s.strings != nil {
-		pooled.ReleaseStringSlice(s.strings)
-		s.strings = nil
-	}
-	if s.fixed != nil {
-		pooled.ReleaseUint64Slice(s.fixed)
-		s.fixed = nil
-	}
+func (s *fieldWriteScratch) discard() {
+	s.strings = nil
+	s.fixed = nil
 	s.ok = false
 	s.isNil = false
 	s.length = 0
@@ -105,7 +107,7 @@ func (s *fieldWriteScratch) setLen(length int) {
 
 func (s *fieldWriteScratch) addString(key string) {
 	if s.strings == nil {
-		s.strings = pooled.GetStringSlice(1)
+		s.strings = make([]string, 0, 1)
 	}
 	s.ok = true
 	s.strings = append(s.strings, key)
@@ -113,7 +115,7 @@ func (s *fieldWriteScratch) addString(key string) {
 
 func (s *fieldWriteScratch) addFixed(key uint64) {
 	if s.fixed == nil {
-		s.fixed = pooled.GetUint64Slice(0)
+		s.fixed = make([]uint64, 0, 1)
 	}
 	s.ok = true
 	s.fixed = append(s.fixed, key)
@@ -206,7 +208,7 @@ func (s snapshotInsertWriteSink) setNil() {
 	if s.state == nil {
 		return
 	}
-	s.state.nils = indexdata.AddStringPostingAdd(s.state.nils, &s.state.arena, nilIndexEntryKey, s.idx, s.state.nilsHint)
+	s.state.nils = indexdata.AddStringPostingAddOwned(s.state.nils, &s.state.arena, nilIndexEntryKey, s.idx, s.state.nilsHint)
 	s.state.changed = true
 }
 
@@ -228,7 +230,7 @@ func (s snapshotInsertWriteSink) addString(key string) {
 	if s.state == nil {
 		return
 	}
-	s.state.index = indexdata.AddStringPostingAdd(s.state.index, &s.state.arena, key, s.idx, s.state.indexHint)
+	s.state.index = indexdata.AddStringPostingAddOwned(s.state.index, &s.state.arena, key, s.idx, s.state.indexHint)
 	s.state.changed = true
 }
 
@@ -236,7 +238,7 @@ func (s snapshotInsertWriteSink) addFixed(key uint64) {
 	if s.state == nil {
 		return
 	}
-	s.state.fixed = indexdata.AddFixedPostingAdd(s.state.fixed, &s.state.arena, key, s.idx, s.state.fixedHint)
+	s.state.fixed = indexdata.AddFixedPostingAddOwned(s.state.fixed, &s.state.arena, key, s.idx, s.state.fixedHint)
 	s.state.changed = true
 }
 
@@ -328,10 +330,22 @@ func (acc indexedFieldAccessor) mergeSnapshotInsertNilStorageOwned(base indexdat
 	return base.MergeStringPostingAddsRetainMapOwned(state.nils, state.arena, false, false)
 }
 
-func (state *snapshotFieldInsertState) release() {
-	clear(state.index)
-	clear(state.fixed)
-	clear(state.nils)
+func (state *snapshotFieldInsertState) reset() {
+	if len(state.index) > 4<<10 {
+		state.index = nil
+	} else {
+		clear(state.index)
+	}
+	if len(state.fixed) > 4<<10 {
+		state.fixed = nil
+	} else {
+		clear(state.fixed)
+	}
+	if len(state.nils) > 4<<10 {
+		state.nils = nil
+	} else {
+		clear(state.nils)
+	}
 	state.arena.Reset()
 	if state.lengths != nil {
 		state.lengths.Reset()
@@ -344,16 +358,13 @@ func (state *snapshotFieldInsertState) release() {
 }
 
 func (state *snapshotFieldInsertState) discard() {
-	indexdata.PutStringPostingAddMap(state.index)
-	indexdata.PutFixedPostingAddMap(state.fixed)
-	indexdata.PutStringPostingAddMap(state.nils)
 	state.index = nil
 	state.fixed = nil
 	state.nils = nil
-	state.arena.Release()
+	state.arena.Reset()
 	state.arena = nil
 	if state.lengths != nil {
-		state.lengths.Release()
+		state.lengths.Reset()
 		state.lengths = nil
 	}
 	state.changed = false
@@ -386,10 +397,10 @@ func (acc indexedFieldAccessor) collectSnapshotBatchDiff(
 
 	if state.old.isNil != state.new.isNil {
 		if state.old.isNil {
-			state.nils = indexdata.AddStringPostingDiff(state.nils, &state.arena, nilIndexEntryKey, idx, false, 0)
+			state.nils = indexdata.AddStringPostingDiffOwned(state.nils, &state.arena, nilIndexEntryKey, idx, false)
 		}
 		if state.new.isNil {
-			state.nils = indexdata.AddStringPostingDiff(state.nils, &state.arena, nilIndexEntryKey, idx, true, 0)
+			state.nils = indexdata.AddStringPostingDiffOwned(state.nils, &state.arena, nilIndexEntryKey, idx, true)
 		}
 		state.changed = true
 	}
@@ -493,12 +504,24 @@ func (acc indexedFieldAccessor) applySnapshotBatchNilStorageOwned(base indexdata
 	return base.ApplyStringPostingDiffRetainMapOwned(state.nils, state.arena, false, false)
 }
 
-func (state *snapshotFieldBatchState) release() {
+func (state *snapshotFieldBatchState) reset() {
 	state.old.reset()
 	state.new.reset()
-	clear(state.index)
-	clear(state.fixed)
-	clear(state.nils)
+	if len(state.index) > 4<<10 {
+		state.index = nil
+	} else {
+		clear(state.index)
+	}
+	if len(state.fixed) > 4<<10 {
+		state.fixed = nil
+	} else {
+		clear(state.fixed)
+	}
+	if len(state.nils) > 4<<10 {
+		state.nils = nil
+	} else {
+		clear(state.nils)
+	}
 	state.arena.Reset()
 	if state.lengths != nil {
 		state.lengths.Reset()
@@ -507,18 +530,15 @@ func (state *snapshotFieldBatchState) release() {
 }
 
 func (state *snapshotFieldBatchState) discard() {
-	state.old.release()
-	state.new.release()
-	indexdata.PutStringPostingDiffMap(state.index)
-	indexdata.PutFixedPostingDiffMap(state.fixed)
-	indexdata.PutStringPostingDiffMap(state.nils)
+	state.old.discard()
+	state.new.discard()
 	state.index = nil
 	state.fixed = nil
 	state.nils = nil
-	state.arena.Release()
+	state.arena.Reset()
 	state.arena = nil
 	if state.lengths != nil {
-		state.lengths.Release()
+		state.lengths.Reset()
 		state.lengths = nil
 	}
 	state.changed = false

@@ -119,11 +119,11 @@ func collectFieldBatchPostingDiffBuf(
 		newVal := newVals[j]
 		switch {
 		case oldVal < newVal:
-			fieldDelta = indexdata.AddStringPostingDiff(fieldDelta, arena, oldVal, idx, false, 0)
+			fieldDelta = indexdata.AddStringPostingDiffOwned(fieldDelta, arena, oldVal, idx, false)
 			changed = true
 			i++
 		case oldVal > newVal:
-			fieldDelta = indexdata.AddStringPostingDiff(fieldDelta, arena, newVal, idx, true, 0)
+			fieldDelta = indexdata.AddStringPostingDiffOwned(fieldDelta, arena, newVal, idx, true)
 			changed = true
 			j++
 		default:
@@ -132,11 +132,11 @@ func collectFieldBatchPostingDiffBuf(
 		}
 	}
 	for ; i < oldLen; i++ {
-		fieldDelta = indexdata.AddStringPostingDiff(fieldDelta, arena, oldVals[i], idx, false, 0)
+		fieldDelta = indexdata.AddStringPostingDiffOwned(fieldDelta, arena, oldVals[i], idx, false)
 		changed = true
 	}
 	for ; j < newLen; j++ {
-		fieldDelta = indexdata.AddStringPostingDiff(fieldDelta, arena, newVals[j], idx, true, 0)
+		fieldDelta = indexdata.AddStringPostingDiffOwned(fieldDelta, arena, newVals[j], idx, true)
 		changed = true
 	}
 	return fieldDelta, changed
@@ -161,11 +161,11 @@ func collectFixedFieldBatchPostingDiffBuf(
 		newVal := newVals[j]
 		switch {
 		case oldVal < newVal:
-			fieldDelta = indexdata.AddFixedPostingDiff(fieldDelta, arena, oldVal, idx, false, 0)
+			fieldDelta = indexdata.AddFixedPostingDiffOwned(fieldDelta, arena, oldVal, idx, false)
 			changed = true
 			i++
 		case oldVal > newVal:
-			fieldDelta = indexdata.AddFixedPostingDiff(fieldDelta, arena, newVal, idx, true, 0)
+			fieldDelta = indexdata.AddFixedPostingDiffOwned(fieldDelta, arena, newVal, idx, true)
 			changed = true
 			j++
 		default:
@@ -174,11 +174,11 @@ func collectFixedFieldBatchPostingDiffBuf(
 		}
 	}
 	for ; i < oldLen; i++ {
-		fieldDelta = indexdata.AddFixedPostingDiff(fieldDelta, arena, oldVals[i], idx, false, 0)
+		fieldDelta = indexdata.AddFixedPostingDiffOwned(fieldDelta, arena, oldVals[i], idx, false)
 		changed = true
 	}
 	for ; j < newLen; j++ {
-		fieldDelta = indexdata.AddFixedPostingDiff(fieldDelta, arena, newVals[j], idx, true, 0)
+		fieldDelta = indexdata.AddFixedPostingDiffOwned(fieldDelta, arena, newVals[j], idx, true)
 		changed = true
 	}
 	return fieldDelta, changed
@@ -198,14 +198,14 @@ func collectScalarFieldBatchPostingDiff(
 		if oldVal == newVal {
 			return fieldDelta, false
 		}
-		fieldDelta = indexdata.AddStringPostingDiff(fieldDelta, arena, oldVal, idx, false, 0)
-		fieldDelta = indexdata.AddStringPostingDiff(fieldDelta, arena, newVal, idx, true, 0)
+		fieldDelta = indexdata.AddStringPostingDiffOwned(fieldDelta, arena, oldVal, idx, false)
+		fieldDelta = indexdata.AddStringPostingDiffOwned(fieldDelta, arena, newVal, idx, true)
 		return fieldDelta, true
 	case oldOK:
-		fieldDelta = indexdata.AddStringPostingDiff(fieldDelta, arena, oldVal, idx, false, 0)
+		fieldDelta = indexdata.AddStringPostingDiffOwned(fieldDelta, arena, oldVal, idx, false)
 		return fieldDelta, true
 	case newOK:
-		fieldDelta = indexdata.AddStringPostingDiff(fieldDelta, arena, newVal, idx, true, 0)
+		fieldDelta = indexdata.AddStringPostingDiffOwned(fieldDelta, arena, newVal, idx, true)
 		return fieldDelta, true
 	default:
 		return fieldDelta, false
@@ -226,14 +226,14 @@ func collectScalarFixedFieldBatchPostingDiff(
 		if oldVal == newVal {
 			return fieldDelta, false
 		}
-		fieldDelta = indexdata.AddFixedPostingDiff(fieldDelta, arena, oldVal, idx, false, 0)
-		fieldDelta = indexdata.AddFixedPostingDiff(fieldDelta, arena, newVal, idx, true, 0)
+		fieldDelta = indexdata.AddFixedPostingDiffOwned(fieldDelta, arena, oldVal, idx, false)
+		fieldDelta = indexdata.AddFixedPostingDiffOwned(fieldDelta, arena, newVal, idx, true)
 		return fieldDelta, true
 	case oldOK:
-		fieldDelta = indexdata.AddFixedPostingDiff(fieldDelta, arena, oldVal, idx, false, 0)
+		fieldDelta = indexdata.AddFixedPostingDiffOwned(fieldDelta, arena, oldVal, idx, false)
 		return fieldDelta, true
 	case newOK:
-		fieldDelta = indexdata.AddFixedPostingDiff(fieldDelta, arena, newVal, idx, true, 0)
+		fieldDelta = indexdata.AddFixedPostingDiffOwned(fieldDelta, arena, newVal, idx, true)
 		return fieldDelta, true
 	default:
 		return fieldDelta, false
@@ -255,11 +255,11 @@ func collectFieldBatchLenDiff(
 
 	if !useZeroComplement {
 		if diff.oldExists {
-			indexdata.AddLenPostingBucketDiff(&fieldDelta, idx, diff.oldLen, false)
+			fieldDelta = indexdata.AddLenPostingBucket(fieldDelta, idx, diff.oldLen, false)
 			changed = true
 		}
 		if diff.newExists {
-			indexdata.AddLenPostingBucketDiff(&fieldDelta, idx, diff.newLen, true)
+			fieldDelta = indexdata.AddLenPostingBucket(fieldDelta, idx, diff.newLen, true)
 			changed = true
 		}
 		return fieldDelta, changed
@@ -267,21 +267,21 @@ func collectFieldBatchLenDiff(
 
 	if diff.oldExists {
 		if diff.oldLen > 0 {
-			indexdata.AddLenPostingBucketDiff(&fieldDelta, idx, diff.oldLen, false)
+			fieldDelta = indexdata.AddLenPostingBucket(fieldDelta, idx, diff.oldLen, false)
 			changed = true
 		}
 		if diff.oldLen > 0 && (!diff.newExists || diff.newLen == 0) {
-			indexdata.AddLenPostingNonEmptyDiff(&fieldDelta, idx, false)
+			fieldDelta = indexdata.AddLenPostingNonEmpty(fieldDelta, idx, false)
 			changed = true
 		}
 	}
 	if diff.newExists {
 		if diff.newLen > 0 {
-			indexdata.AddLenPostingBucketDiff(&fieldDelta, idx, diff.newLen, true)
+			fieldDelta = indexdata.AddLenPostingBucket(fieldDelta, idx, diff.newLen, true)
 			changed = true
 		}
 		if diff.newLen > 0 && (!diff.oldExists || diff.oldLen == 0) {
-			indexdata.AddLenPostingNonEmptyDiff(&fieldDelta, idx, true)
+			fieldDelta = indexdata.AddLenPostingNonEmpty(fieldDelta, idx, true)
 			changed = true
 		}
 	}
@@ -431,7 +431,7 @@ func (qe *queryEngine) buildPreparedSnapshotAggregatedNoLock(
 			changedCount++
 			deltas.changed[ordinal] = true
 		}
-		state.release()
+		state.reset()
 	}
 	measureDeltas.ApplyToMeasureStorageSlotsOwned(next.measure)
 	measureDeltas.Release()

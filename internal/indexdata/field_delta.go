@@ -112,10 +112,39 @@ func AddStringPostingDiff(
 	if fieldDelta == nil {
 		fieldDelta = stringPostingDiffMapPool.Get(min(capHint, postingAccumMapMaxLen))
 	}
+	return addStringPostingDiff(fieldDelta, arena, key, idx, isAdd, capHint, true)
+}
+
+func AddStringPostingDiffOwned(
+	fieldDelta map[string]uint32,
+	arena **PostingDiffArena,
+	key string,
+	idx uint64,
+	isAdd bool,
+) map[string]uint32 {
+	if fieldDelta == nil {
+		fieldDelta = make(map[string]uint32, 8)
+	}
+	return addStringPostingDiff(fieldDelta, arena, key, idx, isAdd, 0, false)
+}
+
+func addStringPostingDiff(
+	fieldDelta map[string]uint32,
+	arena **PostingDiffArena,
+	key string,
+	idx uint64,
+	isAdd bool,
+	capHint int,
+	pooledArena bool,
+) map[string]uint32 {
 	ref, ok := fieldDelta[key]
 	if !ok {
 		if *arena == nil {
-			*arena = getPostingDiffArena(capHint)
+			if pooledArena {
+				*arena = getPostingDiffArena(capHint)
+			} else {
+				*arena = &PostingDiffArena{}
+			}
 		}
 		ref = (*arena).alloc()
 		fieldDelta[key] = ref
@@ -135,10 +164,39 @@ func AddFixedPostingDiff(
 	if fieldDelta == nil {
 		fieldDelta = fixedPostingDiffMapPool.Get(min(capHint, postingAccumMapMaxLen))
 	}
+	return addFixedPostingDiff(fieldDelta, arena, key, idx, isAdd, capHint, true)
+}
+
+func AddFixedPostingDiffOwned(
+	fieldDelta map[uint64]uint32,
+	arena **PostingDiffArena,
+	key uint64,
+	idx uint64,
+	isAdd bool,
+) map[uint64]uint32 {
+	if fieldDelta == nil {
+		fieldDelta = make(map[uint64]uint32, 8)
+	}
+	return addFixedPostingDiff(fieldDelta, arena, key, idx, isAdd, 0, false)
+}
+
+func addFixedPostingDiff(
+	fieldDelta map[uint64]uint32,
+	arena **PostingDiffArena,
+	key uint64,
+	idx uint64,
+	isAdd bool,
+	capHint int,
+	pooledArena bool,
+) map[uint64]uint32 {
 	ref, ok := fieldDelta[key]
 	if !ok {
 		if *arena == nil {
-			*arena = getPostingDiffArena(capHint)
+			if pooledArena {
+				*arena = getPostingDiffArena(capHint)
+			} else {
+				*arena = &PostingDiffArena{}
+			}
 		}
 		ref = (*arena).alloc()
 		fieldDelta[key] = ref
@@ -262,10 +320,38 @@ func AddStringPostingAdd(
 	if fieldMap == nil {
 		fieldMap = stringPostingAddMapPool.Get(min(capHint, postingAccumMapMaxLen))
 	}
+	return addStringPostingAdd(fieldMap, arena, key, idx, capHint, true)
+}
+
+func AddStringPostingAddOwned(
+	fieldMap map[string]uint32,
+	arena **PostingAddArena,
+	key string,
+	idx uint64,
+	capHint int,
+) map[string]uint32 {
+	if fieldMap == nil {
+		fieldMap = make(map[string]uint32, max(8, min(capHint, postingAccumMapMaxLen)))
+	}
+	return addStringPostingAdd(fieldMap, arena, key, idx, capHint, false)
+}
+
+func addStringPostingAdd(
+	fieldMap map[string]uint32,
+	arena **PostingAddArena,
+	key string,
+	idx uint64,
+	capHint int,
+	pooledArena bool,
+) map[string]uint32 {
 	ref, ok := fieldMap[key]
 	if !ok {
 		if *arena == nil {
-			*arena = getPostingAddArena(capHint)
+			if pooledArena {
+				*arena = getPostingAddArena(capHint)
+			} else {
+				*arena = &PostingAddArena{}
+			}
 		}
 		ref = (*arena).alloc()
 		fieldMap[key] = ref
@@ -284,10 +370,38 @@ func AddFixedPostingAdd(
 	if fieldMap == nil {
 		fieldMap = fixedPostingAddMapPool.Get(min(capHint, postingAccumMapMaxLen))
 	}
+	return addFixedPostingAdd(fieldMap, arena, key, idx, capHint, true)
+}
+
+func AddFixedPostingAddOwned(
+	fieldMap map[uint64]uint32,
+	arena **PostingAddArena,
+	key uint64,
+	idx uint64,
+	capHint int,
+) map[uint64]uint32 {
+	if fieldMap == nil {
+		fieldMap = make(map[uint64]uint32, max(8, min(capHint, postingAccumMapMaxLen)))
+	}
+	return addFixedPostingAdd(fieldMap, arena, key, idx, capHint, false)
+}
+
+func addFixedPostingAdd(
+	fieldMap map[uint64]uint32,
+	arena **PostingAddArena,
+	key uint64,
+	idx uint64,
+	capHint int,
+	pooledArena bool,
+) map[uint64]uint32 {
 	ref, ok := fieldMap[key]
 	if !ok {
 		if *arena == nil {
-			*arena = getPostingAddArena(capHint)
+			if pooledArena {
+				*arena = getPostingAddArena(capHint)
+			} else {
+				*arena = &PostingAddArena{}
+			}
 		}
 		ref = (*arena).alloc()
 		fieldMap[key] = ref
@@ -337,7 +451,11 @@ func (d *LenPostingDiff) Reset() {
 			lengthDelta.Add.Release()
 			lengthDelta.Remove.Release()
 		}
-		clear(d.lengths)
+		if len(d.lengths) > 4<<10 {
+			d.lengths = nil
+		} else {
+			clear(d.lengths)
+		}
 	}
 	d.nonEmpty.Add.Release()
 	d.nonEmpty.Remove.Release()
@@ -350,7 +468,11 @@ func (d *LenPostingDiff) resetAfterMove() {
 		return
 	}
 	if d.lengths != nil {
-		clear(d.lengths)
+		if len(d.lengths) > 4<<10 {
+			d.lengths = nil
+		} else {
+			clear(d.lengths)
+		}
 	}
 	d.nonEmpty = BatchPostingDelta{}
 	d.hasNonEmpty = false
@@ -373,11 +495,44 @@ func AddLenPostingBucketDiff(fieldDelta **LenPostingDiff, idx uint64, length int
 
 func AddLenPostingNonEmptyDiff(fieldDelta **LenPostingDiff, idx uint64, isAdd bool) {
 	delta := ensureLenPostingDiff(fieldDelta)
-	delta.hasNonEmpty = true
+	delta.AddNonEmpty(idx, isAdd)
+}
+
+func AddLenPostingBucket(fieldDelta *LenPostingDiff, idx uint64, length int, isAdd bool) *LenPostingDiff {
+	if fieldDelta == nil {
+		fieldDelta = &LenPostingDiff{}
+	}
+	fieldDelta.AddBucket(idx, length, isAdd)
+	return fieldDelta
+}
+
+func AddLenPostingNonEmpty(fieldDelta *LenPostingDiff, idx uint64, isAdd bool) *LenPostingDiff {
+	if fieldDelta == nil {
+		fieldDelta = &LenPostingDiff{}
+	}
+	fieldDelta.AddNonEmpty(idx, isAdd)
+	return fieldDelta
+}
+
+func (d *LenPostingDiff) AddBucket(idx uint64, length int, isAdd bool) {
+	if d.lengths == nil {
+		d.lengths = make(map[uint64]BatchPostingDelta, 64)
+	}
+	delta := d.lengths[uint64(length)]
 	if isAdd {
-		delta.nonEmpty.Add = delta.nonEmpty.Add.BuildAdded(idx)
+		delta.Add = delta.Add.BuildAdded(idx)
 	} else {
-		delta.nonEmpty.Remove = delta.nonEmpty.Remove.BuildAdded(idx)
+		delta.Remove = delta.Remove.BuildAdded(idx)
+	}
+	d.lengths[uint64(length)] = delta
+}
+
+func (d *LenPostingDiff) AddNonEmpty(idx uint64, isAdd bool) {
+	d.hasNonEmpty = true
+	if isAdd {
+		d.nonEmpty.Add = d.nonEmpty.Add.BuildAdded(idx)
+	} else {
+		d.nonEmpty.Remove = d.nonEmpty.Remove.BuildAdded(idx)
 	}
 }
 

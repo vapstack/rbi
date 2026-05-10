@@ -1601,7 +1601,7 @@ func (qe *queryEngine) buildPreparedSnapshotInsertOnlyNoLock(seq uint64, prev *i
 			}
 			changed[i] = true
 		}
-		state.release()
+		state.reset()
 	}
 	measureDeltas.ApplyToMeasureStorageSlotsOwned(next.measure)
 	measureDeltas.Release()
