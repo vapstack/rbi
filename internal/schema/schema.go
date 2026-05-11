@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"reflect"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 	"unsafe"
@@ -84,7 +85,14 @@ func FieldUsesOrderedNumericKeys(f *Field) bool {
 }
 
 func QueryValueToUnixSeconds(v reflect.Value) (int64, bool) {
-	if !v.IsValid() || !v.Type().ConvertibleTo(nativeTimeType) {
+	if !v.IsValid() {
+		return 0, false
+	}
+	t := v.Type()
+	if t == nativeTimeType {
+		return v.Interface().(time.Time).Unix(), true
+	}
+	if !t.ConvertibleTo(nativeTimeType) {
 		return 0, false
 	}
 	return v.Convert(nativeTimeType).Interface().(time.Time).Unix(), true
@@ -137,11 +145,7 @@ func (rt *Runtime) HasQueryFields() bool {
 
 func (rt *Runtime) PatchNameTouchesUnique(name string) bool {
 	f, ok := rt.Patch.Fields[name]
-	if !ok {
-		return false
-	}
-	acc, ok := rt.IndexedByName[f.DBName]
-	return ok && acc.Field.Unique
+	return ok && f.Unique
 }
 
 type IndexedFieldMap map[string]IndexedFieldAccessor
@@ -206,12 +210,14 @@ func Compile(vtype reflect.Type, config Config) (*Runtime, error) {
 		return nil, fmt.Errorf("failed to initialize field accessors: %w", err)
 	}
 	for i := range access {
-		ordinal, ok := patch.Ordinals[access[i].Field.Name]
-		if !ok {
-			access[i].PatchOrdinal = -1
-			continue
+		access[i].PatchOrdinal = -1
+		for ordinal := range patch.Access {
+			if slices.Equal(patch.Access[ordinal].Field.Index, access[i].Field.Index) {
+				access[i].PatchOrdinal = ordinal
+				patch.Access[ordinal].Field.Unique = access[i].Field.Unique
+				break
+			}
 		}
-		access[i].PatchOrdinal = ordinal
 	}
 	for i := range access {
 		fieldMap[access[i].Name] = access[i]
@@ -273,7 +279,7 @@ func (collector *fieldCollector) populateFieldsFromTags(t reflect.Type, idx []in
 				if skip {
 					continue
 				}
-				newIdx := append(slices.Clone(idx), i)
+				newIdx := append(idx, i)
 				if err := collector.populateFieldsFromTags(f.Type, newIdx); err != nil {
 					return err
 				}
@@ -283,7 +289,7 @@ func (collector *fieldCollector) populateFieldsFromTags(t reflect.Type, idx []in
 		if skip || !use {
 			continue
 		}
-		if err := collector.addIndexedField(f, append(slices.Clone(idx), i), indexKind); err != nil {
+		if err := collector.addIndexedField(f, append(idx, i), indexKind); err != nil {
 			return err
 		}
 	}
@@ -373,7 +379,7 @@ func collectOptionIndexFields(t reflect.Type, idx []int, byGo map[string]optionI
 		if !sf.IsExported() {
 			continue
 		}
-		nextIdx := append(slices.Clone(idx), i)
+		nextIdx := append(idx, i)
 		if sf.Anonymous && sf.Type.Kind() == reflect.Struct {
 			if err := collectOptionIndexFields(sf.Type, nextIdx, byGo, byDB); err != nil {
 				return err
@@ -389,7 +395,7 @@ func collectOptionIndexFields(t reflect.Type, idx []int, byGo map[string]optionI
 		}
 		info := optionIndexField{
 			structField: sf,
-			index:       nextIdx,
+			index:       slices.Clone(nextIdx),
 			dbName:      dbName,
 		}
 		if existing, ok := byGo[sf.Name]; ok && !slices.Equal(existing.index, nextIdx) {
@@ -408,14 +414,18 @@ func collectOptionIndexFields(t reflect.Type, idx []int, byGo map[string]optionI
 }
 
 func fieldIndexID(index []int) string {
-	var b strings.Builder
-	for i, v := range index {
-		if i > 0 {
-			b.WriteByte('.')
-		}
-		b.WriteString(fmt.Sprint(v))
+	if len(index) == 1 {
+		return strconv.Itoa(index[0])
 	}
-	return b.String()
+	var scratch [64]byte
+	buf := scratch[:0]
+	for i := range index {
+		if i != 0 {
+			buf = append(buf, '.')
+		}
+		buf = strconv.AppendInt(buf, int64(index[i]), 10)
+	}
+	return string(buf)
 }
 
 func (collector *fieldCollector) addIndexedField(sf reflect.StructField, index []int, indexKind IndexKind) error {
@@ -587,7 +597,7 @@ type (
 	ScratchFieldWriteAccessorFn func(ptr unsafe.Pointer, sink *WriteScratch)
 )
 
-func populatePatcher(patchMap map[string]*Field, t reflect.Type, idx []int) error {
+func populatePatcher(patchMap map[string]*Field, t reflect.Type, idx []int, single []int) error {
 	for i := 0; i < t.NumField(); i++ {
 
 		rf := t.Field(i)
@@ -598,20 +608,27 @@ func populatePatcher(patchMap map[string]*Field, t reflect.Type, idx []int) erro
 
 		if rf.Anonymous {
 			if rf.Type.Kind() == reflect.Struct {
-				nidx := append(slices.Clone(idx), i)
-				if err := populatePatcher(patchMap, rf.Type, nidx); err != nil {
+				nidx := append(idx, i)
+				if err := populatePatcher(patchMap, rf.Type, nidx, single); err != nil {
 					return err
 				}
 			}
 			continue
 		}
 
+		var fieldIndex []int
+		if len(idx) == 0 {
+			single[i] = i
+			fieldIndex = single[i : i+1 : i+1]
+		} else {
+			fieldIndex = append(slices.Clone(idx), i)
+		}
 		f := &Field{
 			Name:     rf.Name,
 			DBName:   rf.Name,
 			JSONName: rf.Name,
 			Kind:     rf.Type.Kind(),
-			Index:    append(slices.Clone(idx), i),
+			Index:    fieldIndex,
 		}
 
 		f.UseVI = rf.Type.Implements(viType)
@@ -641,8 +658,7 @@ func populatePatcher(patchMap map[string]*Field, t reflect.Type, idx []int) erro
 		}
 
 		if jsonTag := rf.Tag.Get("json"); jsonTag != "" && jsonTag != "-" {
-			tagParts := strings.Split(jsonTag, ",")
-			jsonName := tagParts[0]
+			jsonName, _, _ := strings.Cut(jsonTag, ",")
 			if jsonName == "" {
 				continue
 			}
@@ -657,8 +673,8 @@ func populatePatcher(patchMap map[string]*Field, t reflect.Type, idx []int) erro
 }
 
 func makePatchRuntime(vtype reflect.Type) (PatchRuntime, error) {
-	patchMap := make(map[string]*Field)
-	if err := populatePatcher(patchMap, vtype, nil); err != nil {
+	patchMap := make(map[string]*Field, vtype.NumField()*2)
+	if err := populatePatcher(patchMap, vtype, nil, make([]int, vtype.NumField())); err != nil {
 		return PatchRuntime{}, err
 	}
 	access, ordinals := makePatchFieldAccessors(vtype, patchMap)
@@ -674,13 +690,23 @@ func makePatchFieldAccessors(vtype reflect.Type, fields map[string]*Field) ([]Pa
 		return nil, nil
 	}
 
-	access := make([]PatchFieldAccessor, 0, len(fields))
-	ordinals := make(map[string]int, len(fields))
+	patchFields := make([]*Field, 0, len(fields))
+	for _, f := range fields {
+		patchFields = append(patchFields, f)
+	}
+	slices.SortFunc(patchFields, func(a, b *Field) int {
+		return slices.Compare(a.Index, b.Index)
+	})
 
-	for patchKey, f := range fields {
-		if patchKey != f.Name {
+	access := make([]PatchFieldAccessor, 0, len(patchFields))
+	ordinals := make(map[string]int, vtype.NumField())
+
+	var prev *Field
+	for _, f := range patchFields {
+		if prev != nil && slices.Equal(prev.Index, f.Index) {
 			continue
 		}
+		prev = f
 
 		acc := PatchFieldAccessor{Field: f}
 		fieldType, offset := resolveFieldTypeAndOffset(vtype, f.Index)

@@ -16,6 +16,8 @@ type (
 	PatchValueCopyFn  func(ptr unsafe.Pointer) any
 )
 
+const smallDistinctLimit = 8
+
 type fieldAccessorBundle struct {
 	unique       UniqueScalarGetterFn
 	writeBuild   BuildFieldWriteAccessorFn
@@ -25,10 +27,9 @@ type fieldAccessorBundle struct {
 	modified     FieldModifiedFn
 }
 
-type unsafeSliceHeader struct {
+type ifaceWords struct {
+	tab  unsafe.Pointer
 	data unsafe.Pointer
-	len  int
-	cap  int
 }
 
 type signedFieldValue interface {
@@ -95,8 +96,29 @@ func ptrFieldValue[T any](ptr unsafe.Pointer, offset uintptr) *T {
 }
 
 func sliceFieldValue[T any](ptr unsafe.Pointer, offset uintptr) []T {
-	hdr := *(*unsafeSliceHeader)(unsafe.Add(ptr, offset))
-	return unsafe.Slice((*T)(hdr.data), hdr.len)
+	return *(*[]T)(unsafe.Add(ptr, offset))
+}
+
+func sliceFieldData(ptr unsafe.Pointer, offset uintptr) (unsafe.Pointer, int) {
+	// The element type is only known at runtime on this path; the []byte view
+	// is used only to read the slice data pointer and element count.
+	vals := *(*[]byte)(unsafe.Add(ptr, offset))
+	return unsafe.Pointer(unsafe.SliceData(vals)), len(vals)
+}
+
+func valueIndexerPtrTab(t reflect.Type) unsafe.Pointer {
+	vi := reflect.New(t).Interface().(ValueIndexer)
+	return (*ifaceWords)(unsafe.Pointer(&vi)).tab
+}
+
+func valueIndexerAt(tab unsafe.Pointer, data unsafe.Pointer) ValueIndexer {
+	// The compiled accessor already proved that *T implements ValueIndexer;
+	// rebuilding the interface avoids reflect.NewAt on every indexed value.
+	var vi ValueIndexer
+	words := (*ifaceWords)(unsafe.Pointer(&vi))
+	words.tab = tab
+	words.data = data
+	return vi
 }
 
 func slicesEqualExact[T comparable](lhs, rhs []T) bool {
@@ -148,6 +170,12 @@ func reflectSlicePatchValueCopy(fieldType reflect.Type, offset uintptr) PatchVal
 	}
 }
 
+func scalarPatchValueCopy[T any](offset uintptr) PatchValueCopyFn {
+	return func(root unsafe.Pointer) any {
+		return scalarFieldValue[T](root, offset)
+	}
+}
+
 func typeHasMutableReferencePayload(t reflect.Type) bool {
 	switch t.Kind() {
 	case reflect.Pointer, reflect.Interface, reflect.Map, reflect.Slice, reflect.Chan, reflect.Func, reflect.UnsafePointer:
@@ -172,8 +200,26 @@ func addDistinctStringsToSink[S stringValueSink](vals []string, sink S) int {
 		sink.addString(vals[0])
 		return 1
 	}
+	if len(vals) <= smallDistinctLimit {
+		distinct := 0
+		for i := range vals {
+			cur := vals[i]
+			seen := false
+			for j := 0; j < i; j++ {
+				if vals[j] == cur {
+					seen = true
+					break
+				}
+			}
+			if seen {
+				continue
+			}
+			distinct++
+			sink.addString(cur)
+		}
+		return distinct
+	}
 	seen := stringSetPool.Get(len(vals))
-	defer stringSetPool.Put(seen)
 	distinct := 0
 	for i := range vals {
 		cur := vals[i]
@@ -184,6 +230,7 @@ func addDistinctStringsToSink[S stringValueSink](vals []string, sink S) int {
 		distinct++
 		sink.addString(cur)
 	}
+	stringSetPool.Put(seen)
 	return distinct
 }
 
@@ -196,8 +243,28 @@ func addDistinctValueIndexerStringsToSink[S stringValueSink](vals reflect.Value,
 		sink.addString(vals.Index(0).Interface().(ValueIndexer).IndexingValue())
 		return 1
 	}
+	if n <= smallDistinctLimit {
+		var keys [smallDistinctLimit]string
+		distinct := 0
+		for i := 0; i < n; i++ {
+			cur := vals.Index(i).Interface().(ValueIndexer).IndexingValue()
+			seen := false
+			for j := 0; j < distinct; j++ {
+				if keys[j] == cur {
+					seen = true
+					break
+				}
+			}
+			if seen {
+				continue
+			}
+			keys[distinct] = cur
+			distinct++
+			sink.addString(cur)
+		}
+		return distinct
+	}
 	seen := stringSetPool.Get(n)
-	defer stringSetPool.Put(seen)
 	distinct := 0
 	for i := 0; i < n; i++ {
 		cur := vals.Index(i).Interface().(ValueIndexer).IndexingValue()
@@ -208,6 +275,51 @@ func addDistinctValueIndexerStringsToSink[S stringValueSink](vals reflect.Value,
 		distinct++
 		sink.addString(cur)
 	}
+	stringSetPool.Put(seen)
+	return distinct
+}
+
+func addDistinctValueIndexerPtrStringsToSink[S stringValueSink](data unsafe.Pointer, n int, size uintptr, tab unsafe.Pointer, sink S) int {
+	if n == 0 {
+		return 0
+	}
+	if n == 1 {
+		sink.addString(valueIndexerAt(tab, data).IndexingValue())
+		return 1
+	}
+	if n <= smallDistinctLimit {
+		var keys [smallDistinctLimit]string
+		distinct := 0
+		for i := 0; i < n; i++ {
+			cur := valueIndexerAt(tab, unsafe.Add(data, uintptr(i)*size)).IndexingValue()
+			seen := false
+			for j := 0; j < distinct; j++ {
+				if keys[j] == cur {
+					seen = true
+					break
+				}
+			}
+			if seen {
+				continue
+			}
+			keys[distinct] = cur
+			distinct++
+			sink.addString(cur)
+		}
+		return distinct
+	}
+	seen := stringSetPool.Get(n)
+	distinct := 0
+	for i := 0; i < n; i++ {
+		cur := valueIndexerAt(tab, unsafe.Add(data, uintptr(i)*size)).IndexingValue()
+		if _, ok := seen[cur]; ok {
+			continue
+		}
+		seen[cur] = struct{}{}
+		distinct++
+		sink.addString(cur)
+	}
+	stringSetPool.Put(seen)
 	return distinct
 }
 
@@ -219,8 +331,28 @@ func addDistinctSignedFixedKeysToSink[S fixedValueSink, T signedFieldValue](vals
 		sink.addFixed(keycodec.OrderedInt64Key(int64(vals[0])))
 		return 1
 	}
+	if len(vals) <= smallDistinctLimit {
+		var keys [smallDistinctLimit]uint64
+		distinct := 0
+		for i := range vals {
+			cur := keycodec.OrderedInt64Key(int64(vals[i]))
+			seen := false
+			for j := 0; j < distinct; j++ {
+				if keys[j] == cur {
+					seen = true
+					break
+				}
+			}
+			if seen {
+				continue
+			}
+			keys[distinct] = cur
+			distinct++
+			sink.addFixed(cur)
+		}
+		return distinct
+	}
 	seen := newU64Set(len(vals))
-	defer releaseU64Set(&seen)
 	distinct := 0
 	for i := range vals {
 		cur := keycodec.OrderedInt64Key(int64(vals[i]))
@@ -230,6 +362,7 @@ func addDistinctSignedFixedKeysToSink[S fixedValueSink, T signedFieldValue](vals
 		distinct++
 		sink.addFixed(cur)
 	}
+	releaseU64Set(&seen)
 	return distinct
 }
 
@@ -241,8 +374,28 @@ func addDistinctUnsignedFixedKeysToSink[S fixedValueSink, T unsignedFieldValue](
 		sink.addFixed(uint64(vals[0]))
 		return 1
 	}
+	if len(vals) <= smallDistinctLimit {
+		var keys [smallDistinctLimit]uint64
+		distinct := 0
+		for i := range vals {
+			cur := uint64(vals[i])
+			seen := false
+			for j := 0; j < distinct; j++ {
+				if keys[j] == cur {
+					seen = true
+					break
+				}
+			}
+			if seen {
+				continue
+			}
+			keys[distinct] = cur
+			distinct++
+			sink.addFixed(cur)
+		}
+		return distinct
+	}
 	seen := newU64Set(len(vals))
-	defer releaseU64Set(&seen)
 	distinct := 0
 	for i := range vals {
 		cur := uint64(vals[i])
@@ -252,6 +405,7 @@ func addDistinctUnsignedFixedKeysToSink[S fixedValueSink, T unsignedFieldValue](
 		distinct++
 		sink.addFixed(cur)
 	}
+	releaseU64Set(&seen)
 	return distinct
 }
 
@@ -263,8 +417,28 @@ func addDistinctFloatFixedKeysToSink[S fixedValueSink, T floatFieldValue](vals [
 		sink.addFixed(keycodec.OrderedFloat64Key(float64(vals[0])))
 		return 1
 	}
+	if len(vals) <= smallDistinctLimit {
+		var keys [smallDistinctLimit]uint64
+		distinct := 0
+		for i := range vals {
+			cur := keycodec.OrderedFloat64Key(float64(vals[i]))
+			seen := false
+			for j := 0; j < distinct; j++ {
+				if keys[j] == cur {
+					seen = true
+					break
+				}
+			}
+			if seen {
+				continue
+			}
+			keys[distinct] = cur
+			distinct++
+			sink.addFixed(cur)
+		}
+		return distinct
+	}
 	seen := newU64Set(len(vals))
-	defer releaseU64Set(&seen)
 	distinct := 0
 	for i := range vals {
 		cur := keycodec.OrderedFloat64Key(float64(vals[i]))
@@ -274,6 +448,7 @@ func addDistinctFloatFixedKeysToSink[S fixedValueSink, T floatFieldValue](vals [
 		distinct++
 		sink.addFixed(cur)
 	}
+	releaseU64Set(&seen)
 	return distinct
 }
 
@@ -423,6 +598,10 @@ func slicesModified[T comparable](lhs, rhs []T) bool {
 }
 
 func valueIndexerScalarReflectAccessorBundle(fieldType reflect.Type, offset uintptr) fieldAccessorBundle {
+	if fieldType.Kind() != reflect.Interface && fieldType.Kind() != reflect.Pointer {
+		return valueIndexerScalarPtrAccessorBundle(fieldType, offset)
+	}
+
 	return fieldAccessorBundle{
 		unique: func(ptr unsafe.Pointer) (keycodec.IndexLookupKey, bool, bool) {
 			fv := reflect.NewAt(fieldType, unsafe.Add(ptr, offset)).Elem()
@@ -452,7 +631,43 @@ func valueIndexerScalarReflectAccessorBundle(fieldType reflect.Type, offset uint
 	}
 }
 
+func valueIndexerScalarPtrAccessorBundle(fieldType reflect.Type, offset uintptr) fieldAccessorBundle {
+	tab := valueIndexerPtrTab(fieldType)
+	return fieldAccessorBundle{
+		unique: func(ptr unsafe.Pointer) (keycodec.IndexLookupKey, bool, bool) {
+			vi := valueIndexerAt(tab, unsafe.Add(ptr, offset))
+			return keycodec.IndexLookupString(vi.IndexingValue()), true, false
+		},
+		writeBuild: func(ptr unsafe.Pointer, sink BuildSink) {
+			vi := valueIndexerAt(tab, unsafe.Add(ptr, offset))
+			sink.addString(vi.IndexingValue())
+		},
+		writeOverlay: func(ptr unsafe.Pointer, sink OverlaySink) {
+			vi := valueIndexerAt(tab, unsafe.Add(ptr, offset))
+			sink.addString(vi.IndexingValue())
+		},
+		writeInsert: func(ptr unsafe.Pointer, sink InsertSink) {
+			vi := valueIndexerAt(tab, unsafe.Add(ptr, offset))
+			sink.addString(vi.IndexingValue())
+		},
+		writeScratch: func(ptr unsafe.Pointer, sink *WriteScratch) {
+			vi := valueIndexerAt(tab, unsafe.Add(ptr, offset))
+			sink.addString(vi.IndexingValue())
+		},
+		modified: func(v1, v2 unsafe.Pointer) bool {
+			vi1 := valueIndexerAt(tab, unsafe.Add(v1, offset))
+			vi2 := valueIndexerAt(tab, unsafe.Add(v2, offset))
+			return vi1.IndexingValue() != vi2.IndexingValue()
+		},
+	}
+}
+
 func valueIndexerSliceReflectAccessorBundle(sliceType reflect.Type, offset uintptr) fieldAccessorBundle {
+	elemType := sliceType.Elem()
+	if elemType.Kind() != reflect.Interface && elemType.Kind() != reflect.Pointer {
+		return valueIndexerSlicePtrAccessorBundle(sliceType, offset)
+	}
+
 	return fieldAccessorBundle{
 		writeBuild: func(ptr unsafe.Pointer, sink BuildSink) {
 			fv := reflect.NewAt(sliceType, unsafe.Add(ptr, offset)).Elem()
@@ -479,6 +694,44 @@ func valueIndexerSliceReflectAccessorBundle(sliceType reflect.Type, offset uintp
 			for i := 0; i < fv1.Len(); i++ {
 				if fv1.Index(i).Interface().(ValueIndexer).IndexingValue() !=
 					fv2.Index(i).Interface().(ValueIndexer).IndexingValue() {
+					return true
+				}
+			}
+			return false
+		},
+	}
+}
+
+func valueIndexerSlicePtrAccessorBundle(sliceType reflect.Type, offset uintptr) fieldAccessorBundle {
+	elemType := sliceType.Elem()
+	tab := valueIndexerPtrTab(elemType)
+	size := elemType.Size()
+	return fieldAccessorBundle{
+		writeBuild: func(ptr unsafe.Pointer, sink BuildSink) {
+			data, n := sliceFieldData(ptr, offset)
+			sink.setLen(addDistinctValueIndexerPtrStringsToSink(data, n, size, tab, sink))
+		},
+		writeOverlay: func(ptr unsafe.Pointer, sink OverlaySink) {
+			data, n := sliceFieldData(ptr, offset)
+			sink.setLen(addDistinctValueIndexerPtrStringsToSink(data, n, size, tab, sink))
+		},
+		writeInsert: func(ptr unsafe.Pointer, sink InsertSink) {
+			data, n := sliceFieldData(ptr, offset)
+			sink.setLen(addDistinctValueIndexerPtrStringsToSink(data, n, size, tab, sink))
+		},
+		writeScratch: func(ptr unsafe.Pointer, sink *WriteScratch) {
+			data, n := sliceFieldData(ptr, offset)
+			sink.setLen(addDistinctValueIndexerPtrStringsToSink(data, n, size, tab, sink))
+		},
+		modified: func(v1, v2 unsafe.Pointer) bool {
+			data1, n1 := sliceFieldData(v1, offset)
+			data2, n2 := sliceFieldData(v2, offset)
+			if n1 != n2 {
+				return true
+			}
+			for i := 0; i < n1; i++ {
+				if valueIndexerAt(tab, unsafe.Add(data1, uintptr(i)*size)).IndexingValue() !=
+					valueIndexerAt(tab, unsafe.Add(data2, uintptr(i)*size)).IndexingValue() {
 					return true
 				}
 			}
@@ -885,6 +1138,39 @@ func floatSliceAccessorBundle[T floatFieldValue](offset uintptr) fieldAccessorBu
 
 func buildPatchValueEqualFn(f *Field, fieldType reflect.Type, offset uintptr) PatchValueEqualFn {
 	if f.UseVI {
+		if f.Slice {
+			return nil
+		}
+		switch f.Kind {
+		case reflect.String:
+			return scalarPatchValueEqual[string](offset, f.Ptr)
+		case reflect.Bool:
+			return scalarPatchValueEqual[bool](offset, f.Ptr)
+		case reflect.Int:
+			return scalarPatchValueEqual[int](offset, f.Ptr)
+		case reflect.Int8:
+			return scalarPatchValueEqual[int8](offset, f.Ptr)
+		case reflect.Int16:
+			return scalarPatchValueEqual[int16](offset, f.Ptr)
+		case reflect.Int32:
+			return scalarPatchValueEqual[int32](offset, f.Ptr)
+		case reflect.Int64:
+			return scalarPatchValueEqual[int64](offset, f.Ptr)
+		case reflect.Uint:
+			return scalarPatchValueEqual[uint](offset, f.Ptr)
+		case reflect.Uint8:
+			return scalarPatchValueEqual[uint8](offset, f.Ptr)
+		case reflect.Uint16:
+			return scalarPatchValueEqual[uint16](offset, f.Ptr)
+		case reflect.Uint32:
+			return scalarPatchValueEqual[uint32](offset, f.Ptr)
+		case reflect.Uint64:
+			return scalarPatchValueEqual[uint64](offset, f.Ptr)
+		case reflect.Float32:
+			return scalarPatchValueEqual[float32](offset, f.Ptr)
+		case reflect.Float64:
+			return scalarPatchValueEqual[float64](offset, f.Ptr)
+		}
 		return nil
 	}
 
@@ -960,6 +1246,39 @@ func buildPatchValueEqualFn(f *Field, fieldType reflect.Type, offset uintptr) Pa
 func buildPatchValueCopyFn(f *Field, fieldType reflect.Type, offset uintptr) PatchValueCopyFn {
 	if f.UseVI {
 		return nil
+	}
+
+	if !f.Ptr && !f.Slice {
+		switch fieldType {
+		case reflect.TypeFor[string]():
+			return scalarPatchValueCopy[string](offset)
+		case reflect.TypeFor[bool]():
+			return scalarPatchValueCopy[bool](offset)
+		case reflect.TypeFor[int]():
+			return scalarPatchValueCopy[int](offset)
+		case reflect.TypeFor[int8]():
+			return scalarPatchValueCopy[int8](offset)
+		case reflect.TypeFor[int16]():
+			return scalarPatchValueCopy[int16](offset)
+		case reflect.TypeFor[int32]():
+			return scalarPatchValueCopy[int32](offset)
+		case reflect.TypeFor[int64]():
+			return scalarPatchValueCopy[int64](offset)
+		case reflect.TypeFor[uint]():
+			return scalarPatchValueCopy[uint](offset)
+		case reflect.TypeFor[uint8]():
+			return scalarPatchValueCopy[uint8](offset)
+		case reflect.TypeFor[uint16]():
+			return scalarPatchValueCopy[uint16](offset)
+		case reflect.TypeFor[uint32]():
+			return scalarPatchValueCopy[uint32](offset)
+		case reflect.TypeFor[uint64]():
+			return scalarPatchValueCopy[uint64](offset)
+		case reflect.TypeFor[float32]():
+			return scalarPatchValueCopy[float32](offset)
+		case reflect.TypeFor[float64]():
+			return scalarPatchValueCopy[float64](offset)
+		}
 	}
 
 	if f.Slice && fieldType.Kind() == reflect.Slice {

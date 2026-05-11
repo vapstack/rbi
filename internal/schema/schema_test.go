@@ -76,6 +76,44 @@ type schemaTestOptionRec struct {
 	Amount int64  `db:"amount"`
 }
 
+type SchemaTestShadowedUniqueEmbedded struct {
+	Code string `db:"inner_code" json:"innerCode" rbi:"unique"`
+}
+
+type schemaTestShadowedPatchRec struct {
+	SchemaTestShadowedUniqueEmbedded
+	Code string `db:"outer_code" json:"outerCode"`
+}
+
+func TestPatchNameTouchesUniqueWithShadowedEmbeddedAliases(t *testing.T) {
+	rt, err := Compile(reflect.TypeFor[schemaTestShadowedPatchRec](), Config{})
+	if err != nil {
+		t.Fatalf("Compile: %v", err)
+	}
+	if !rt.PatchNameTouchesUnique("inner_code") {
+		t.Fatal("db alias for shadowed embedded unique field was not marked unique")
+	}
+	if !rt.PatchNameTouchesUnique("innerCode") {
+		t.Fatal("json alias for shadowed embedded unique field was not marked unique")
+	}
+	innerAcc := rt.IndexedByName["inner_code"]
+	if innerAcc.PatchOrdinal < 0 {
+		t.Fatal("shadowed embedded unique field did not get a patch ordinal")
+	}
+	if rt.Patch.Access[innerAcc.PatchOrdinal].Field.DBName != "inner_code" {
+		t.Fatalf("shadowed embedded unique PatchOrdinal=%d field=%+v", innerAcc.PatchOrdinal, rt.Patch.Access[innerAcc.PatchOrdinal].Field)
+	}
+	if rt.PatchNameTouchesUnique("Code") {
+		t.Fatal("shadowing Go name was marked unique for the outer field")
+	}
+	if rt.PatchNameTouchesUnique("outer_code") {
+		t.Fatal("outer non-indexed db alias was marked unique")
+	}
+	if rt.PatchNameTouchesUnique("outerCode") {
+		t.Fatal("outer non-indexed json alias was marked unique")
+	}
+}
+
 func TestCompileOptionsNilEmptyAndNameResolution(t *testing.T) {
 	vtype := reflect.TypeFor[schemaTestOptionRec]()
 	rt, err := Compile(vtype, Config{})
@@ -331,6 +369,7 @@ type schemaTestPatchRec struct {
 	Named  schemaTestNamedStrings
 	Nested schemaTestPatchNested
 	VI     schemaTestVI
+	VIPtr  *schemaTestVI
 }
 
 func TestPatchAccessorsEqualCopyAndOrdinalCopies(t *testing.T) {
@@ -338,8 +377,10 @@ func TestPatchAccessorsEqualCopyAndOrdinalCopies(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Compile: %v", err)
 	}
-	oldRec := schemaTestPatchRec{Scalar: 1, Typed: []string{"a"}, Named: schemaTestNamedStrings{"n1"}, Nested: schemaTestPatchNested{Values: []int{1}}, VI: "AA"}
-	newRec := schemaTestPatchRec{Scalar: 2, Typed: []string{"b"}, Named: schemaTestNamedStrings{"n2"}, Nested: schemaTestPatchNested{Values: []int{2}}, VI: "BB"}
+	oldVI := schemaTestVI("AA")
+	newVI := schemaTestVI("BB")
+	oldRec := schemaTestPatchRec{Scalar: 1, Typed: []string{"a"}, Named: schemaTestNamedStrings{"n1"}, Nested: schemaTestPatchNested{Values: []int{1}}, VI: "AA", VIPtr: &oldVI}
+	newRec := schemaTestPatchRec{Scalar: 2, Typed: []string{"b"}, Named: schemaTestNamedStrings{"n2"}, Nested: schemaTestPatchNested{Values: []int{2}}, VI: "BB", VIPtr: &newVI}
 	oldPtr := unsafe.Pointer(&oldRec)
 	newPtr := unsafe.Pointer(&newRec)
 
@@ -347,8 +388,8 @@ func TestPatchAccessorsEqualCopyAndOrdinalCopies(t *testing.T) {
 	if scalar.ValueEqual == nil || scalar.ValueEqual(oldPtr, newPtr) {
 		t.Fatal("scalar patch equality failed")
 	}
-	if scalar.CopyValue != nil {
-		t.Fatal("scalar copy should use caller scalar path")
+	if scalar.CopyValue == nil || scalar.CopyValue(newPtr).(int64) != 2 {
+		t.Fatal("scalar patch copy failed")
 	}
 
 	typed := rt.Patch.Access[rt.Patch.Ordinals["Typed"]]
@@ -370,8 +411,28 @@ func TestPatchAccessorsEqualCopyAndOrdinalCopies(t *testing.T) {
 		t.Fatal("mutable nested patch field must use root fallback")
 	}
 	vi := rt.Patch.Access[rt.Patch.Ordinals["VI"]]
-	if vi.ValueEqual != nil || vi.CopyValue != nil {
-		t.Fatal("ValueIndexer patch field must use root fallback")
+	if vi.ValueEqual == nil || vi.ValueEqual(oldPtr, newPtr) {
+		t.Fatal("ValueIndexer scalar patch equality failed")
+	}
+	if vi.CopyValue != nil {
+		t.Fatal("ValueIndexer copy should use root fallback")
+	}
+	viPtr := rt.Patch.Access[rt.Patch.Ordinals["VIPtr"]]
+	if viPtr.ValueEqual == nil || viPtr.ValueEqual(oldPtr, newPtr) {
+		t.Fatal("ValueIndexer pointer patch equality failed")
+	}
+	newRec.VIPtr = &oldVI
+	if !viPtr.ValueEqual(oldPtr, newPtr) {
+		t.Fatal("ValueIndexer pointer patch equality should compare pointed value")
+	}
+	oldRec.VIPtr = nil
+	newRec.VIPtr = nil
+	if !viPtr.ValueEqual(oldPtr, newPtr) {
+		t.Fatal("ValueIndexer pointer patch equality should treat nil pointers as equal")
+	}
+	newRec.VIPtr = &newVI
+	if viPtr.ValueEqual(oldPtr, newPtr) {
+		t.Fatal("ValueIndexer pointer patch equality should detect nil/non-nil change")
 	}
 
 	for _, acc := range rt.Indexed {
