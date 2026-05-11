@@ -3,16 +3,19 @@ package strmap
 import "sync"
 
 type Snapshot struct {
-	next      uint64
-	keys      map[string]uint64
-	strs      map[uint64]string
-	denseStrs []string
-	denseUsed []bool
-	base      *Snapshot
-	anchor    *Snapshot
-	depth     int
-	readDirs  []*readDir
-	keysOnce  sync.Once
+	next       uint64
+	keys       map[string]uint64
+	strs       map[uint64]string
+	singleIdx  uint64
+	singleStr  string
+	denseStart uint64
+	denseStrs  []string
+	denseUsed  []bool
+	base       *Snapshot
+	anchor     *Snapshot
+	depth      int
+	readDirs   []*readDir
+	keysOnce   sync.Once
 }
 
 type Lookup struct {
@@ -37,6 +40,8 @@ type readPage struct {
 	start     uint64
 	next      uint64
 	strs      map[uint64]string
+	singleIdx uint64
+	singleStr string
 	denseStrs []string
 	denseUsed []bool
 }
@@ -65,12 +70,60 @@ func (l *Lookup) String(idx uint64) (string, bool) {
 			l.pageIdx = curPage
 			l.page = s.readPageAtNoLock(curPage)
 		}
-		if l.page != nil {
-			if value, ok := l.page.getStringNoLock(idx); ok {
-				return value, true
+
+		page := l.page
+
+		if page != nil && idx >= page.start && idx <= page.next {
+
+			if len(page.denseStrs) > 0 || len(page.denseUsed) > 0 {
+				if idx-page.start <= maxIntUint64 {
+					i := int(idx - page.start)
+					if i < len(page.denseStrs) && (len(page.denseUsed) == 0 || i < len(page.denseUsed) && page.denseUsed[i]) {
+						return page.denseStrs[i], true
+					}
+				}
+				return "", false
+			}
+
+			if page.singleIdx != 0 {
+				if idx == page.singleIdx {
+					return page.singleStr, true
+				}
+				return "", false
+			}
+
+			if page.strs != nil {
+				v, ok := page.strs[idx]
+				return v, ok
 			}
 		}
 	}
+
+	if s.base == nil && idx != 0 && idx <= s.next {
+
+		if len(s.denseStrs) > 0 || len(s.denseUsed) > 0 {
+			if idx <= maxIntUint64 && idx >= s.denseStart {
+				i := int(idx - s.denseStart)
+				if i < len(s.denseStrs) && (len(s.denseUsed) == 0 || i < len(s.denseUsed) && s.denseUsed[i]) {
+					return s.denseStrs[i], true
+				}
+			}
+			return "", false
+		}
+
+		if s.singleIdx != 0 {
+			if idx == s.singleIdx {
+				return s.singleStr, true
+			}
+			return "", false
+		}
+
+		if s.strs != nil {
+			v, ok := s.strs[idx]
+			return v, ok
+		}
+	}
+
 	return s.getStringNoLock(idx)
 }
 
@@ -85,44 +138,64 @@ func (s *Snapshot) getOwnStringNoLock(idx uint64) (string, bool) {
 	if idx > s.next {
 		return "", false
 	}
+
 	if len(s.denseStrs) > 0 || len(s.denseUsed) > 0 {
-		if idx > maxIntUint64 {
+		if idx > maxIntUint64 || idx < s.denseStart {
 			return "", false
 		}
-		i := int(idx)
-		if i < len(s.denseStrs) && i < len(s.denseUsed) && s.denseUsed[i] {
+		i := int(idx - s.denseStart)
+		if i < len(s.denseStrs) && (len(s.denseUsed) == 0 || i < len(s.denseUsed) && s.denseUsed[i]) {
 			return s.denseStrs[i], true
 		}
 		return "", false
 	}
+
+	if s.singleIdx != 0 {
+		if idx == s.singleIdx {
+			return s.singleStr, true
+		}
+		return "", false
+	}
+
 	if s.strs == nil {
 		return "", false
 	}
+
 	v, ok := s.strs[idx]
 	return v, ok
 }
 
-func denseWindowNoLock(strs []string, used []bool, start, next uint64) ([]string, []bool) {
-	if start > next || start > maxIntUint64 {
+func denseWindowNoLock(denseStart uint64, strs []string, used []bool, start, next uint64) ([]string, []bool) {
+	if start > next || next < denseStart || start > maxIntUint64 {
 		return nil, nil
 	}
-	limit := min(len(strs), len(used))
+	limit := len(strs)
+	usedAll := len(used) == 0
+	if !usedAll {
+		limit = min(limit, len(used))
+	}
 	if limit == 0 {
 		return nil, nil
 	}
-	pos := int(start)
-	if pos < 0 || pos >= limit {
+	if start < denseStart {
+		start = denseStart
+	}
+	pos := int(start - denseStart)
+	if pos >= limit {
 		return nil, nil
 	}
 	end := limit
-	if next < maxIntUint64 {
-		maxPos := int(next) + 1
+	if next-denseStart < maxIntUint64 {
+		maxPos := int(next-denseStart) + 1
 		if maxPos < end {
 			end = maxPos
 		}
 	}
 	if pos >= end {
 		return nil, nil
+	}
+	if usedAll {
+		return strs[pos:end], nil
 	}
 	return strs[pos:end], used[pos:end]
 }
@@ -131,8 +204,20 @@ func newReadPageNoLock(node *Snapshot, start, next uint64) *readPage {
 	if start > next {
 		return nil
 	}
+	if node.singleIdx != 0 {
+		if node.singleIdx < start || node.singleIdx > next {
+			return nil
+		}
+		return &readPage{
+			start:     start,
+			next:      next,
+			singleIdx: node.singleIdx,
+			singleStr: node.singleStr,
+		}
+	}
+
 	if len(node.denseStrs) > 0 || len(node.denseUsed) > 0 {
-		denseStrs, denseUsed := denseWindowNoLock(node.denseStrs, node.denseUsed, start, next)
+		denseStrs, denseUsed := denseWindowNoLock(node.denseStart, node.denseStrs, node.denseUsed, start, next)
 		if len(denseStrs) == 0 && len(denseUsed) == 0 {
 			return nil
 		}
@@ -143,9 +228,11 @@ func newReadPageNoLock(node *Snapshot, start, next uint64) *readPage {
 			denseUsed: denseUsed,
 		}
 	}
+
 	if node.strs == nil {
 		return nil
 	}
+
 	return &readPage{
 		start: start,
 		next:  next,
@@ -160,18 +247,26 @@ func materializeReadPageNoLock(prefix *readPage, delta *Snapshot, deltaStart, st
 	size := int(next-start) + 1
 
 	denseStrs := make([]string, size)
-	denseUsed := make([]bool, size)
+	var denseUsed []bool
 
 	if prefix != nil {
 		prefixNext := min(next, deltaStart-1)
 		for idx := start; idx <= prefixNext; idx++ {
 			value, ok := prefix.getStringNoLock(idx)
 			if !ok {
+				if denseUsed == nil {
+					denseUsed = make([]bool, size)
+					for i := 0; i < int(idx-start); i++ {
+						denseUsed[i] = true
+					}
+				}
 				continue
 			}
 			pos := int(idx - start)
 			denseStrs[pos] = value
-			denseUsed[pos] = true
+			if denseUsed != nil {
+				denseUsed[pos] = true
+			}
 		}
 	}
 
@@ -180,11 +275,19 @@ func materializeReadPageNoLock(prefix *readPage, delta *Snapshot, deltaStart, st
 		for idx := deltaPos; idx <= next; idx++ {
 			value, ok := delta.getOwnStringNoLock(idx)
 			if !ok {
+				if denseUsed == nil {
+					denseUsed = make([]bool, size)
+					for i := 0; i < int(idx-start); i++ {
+						denseUsed[i] = true
+					}
+				}
 				continue
 			}
 			pos := int(idx - start)
 			denseStrs[pos] = value
-			denseUsed[pos] = true
+			if denseUsed != nil {
+				denseUsed[pos] = true
+			}
 		}
 	}
 
@@ -220,19 +323,29 @@ func (page *readPage) getStringNoLock(idx uint64) (string, bool) {
 	if idx < page.start || idx > page.next {
 		return "", false
 	}
+
 	if len(page.denseStrs) > 0 || len(page.denseUsed) > 0 {
 		if idx-page.start > maxIntUint64 {
 			return "", false
 		}
 		i := int(idx - page.start)
-		if i < len(page.denseStrs) && i < len(page.denseUsed) && page.denseUsed[i] {
+		if i < len(page.denseStrs) && (len(page.denseUsed) == 0 || i < len(page.denseUsed) && page.denseUsed[i]) {
 			return page.denseStrs[i], true
 		}
 		return "", false
 	}
+
+	if page.singleIdx != 0 {
+		if idx == page.singleIdx {
+			return page.singleStr, true
+		}
+		return "", false
+	}
+
 	if page.strs == nil {
 		return "", false
 	}
+
 	v, ok := page.strs[idx]
 	return v, ok
 }
@@ -241,6 +354,12 @@ func (page *readPage) appendKeysNoLock(dst map[string]uint64) {
 	if page == nil {
 		return
 	}
+
+	if page.singleIdx != 0 {
+		dst[page.singleStr] = page.singleIdx
+		return
+	}
+
 	if page.strs != nil {
 		for idx, value := range page.strs {
 			if idx >= page.start && idx <= page.next {
@@ -249,9 +368,14 @@ func (page *readPage) appendKeysNoLock(dst map[string]uint64) {
 		}
 		return
 	}
+
 	limit := min(len(page.denseStrs), len(page.denseUsed))
+	if len(page.denseUsed) == 0 {
+		limit = len(page.denseStrs)
+	}
+
 	for i := 0; i < limit; i++ {
-		if !page.denseUsed[i] {
+		if len(page.denseUsed) != 0 && !page.denseUsed[i] {
 			continue
 		}
 		dst[page.denseStrs[i]] = page.start + uint64(i)
@@ -262,6 +386,9 @@ func (page *readPage) usedCountNoLock() int {
 	if page == nil {
 		return 0
 	}
+	if page.singleIdx != 0 {
+		return 1
+	}
 	if page.strs != nil {
 		count := 0
 		for idx := range page.strs {
@@ -271,7 +398,12 @@ func (page *readPage) usedCountNoLock() int {
 		}
 		return count
 	}
+
 	limit := min(len(page.denseStrs), len(page.denseUsed))
+	if len(page.denseUsed) == 0 {
+		return len(page.denseStrs)
+	}
+
 	count := 0
 	for i := 0; i < limit; i++ {
 		if !page.denseUsed[i] {
@@ -279,6 +411,7 @@ func (page *readPage) usedCountNoLock() int {
 		}
 		count++
 	}
+
 	return count
 }
 
@@ -391,6 +524,7 @@ func (s *Snapshot) getIdxNoLock(key string) (uint64, bool) {
 	}
 
 	for cur := s; cur != nil; cur = cur.base {
+
 		if cur.base == nil {
 			keys := cur.ensureKeysNoLock()
 			if keys == nil {
@@ -399,13 +533,23 @@ func (s *Snapshot) getIdxNoLock(key string) (uint64, bool) {
 			v, ok := keys[key]
 			return v, ok
 		}
+
+		if cur.singleIdx != 0 {
+			if cur.singleStr == key {
+				return cur.singleIdx, true
+			}
+			continue
+		}
+
 		if cur.keys == nil {
 			continue
 		}
+
 		if v, ok := cur.keys[key]; ok {
 			return v, true
 		}
 	}
+
 	return 0, false
 }
 
@@ -427,6 +571,7 @@ func (s *Snapshot) getStringNoLock(idx uint64) (string, bool) {
 	}
 
 	for cur := s; cur != nil; {
+
 		if len(cur.denseStrs) > 0 || len(cur.denseUsed) > 0 {
 			if value, ok := cur.getOwnStringNoLock(idx); ok {
 				return value, true
@@ -444,15 +589,36 @@ func (s *Snapshot) getStringNoLock(idx uint64) (string, bool) {
 			}
 			return "", false
 		}
+
+		if cur.singleIdx != 0 {
+			if idx == cur.singleIdx {
+				return cur.singleStr, true
+			}
+			if cur.base == nil {
+				return "", false
+			}
+			if idx <= cur.base.next {
+				if cur.anchor != nil && cur.anchor != cur.base && idx <= cur.anchor.next {
+					cur = cur.anchor
+				} else {
+					cur = cur.base
+				}
+				continue
+			}
+			return "", false
+		}
+
 		if cur.strs != nil {
 			v, ok := cur.strs[idx]
 			if ok {
 				return v, true
 			}
 		}
+
 		if cur.base == nil {
 			return "", false
 		}
+
 		if idx <= cur.base.next {
 			if cur.anchor != nil && cur.anchor != cur.base && idx <= cur.anchor.next {
 				cur = cur.anchor
@@ -525,19 +691,40 @@ func appendReadPagesNoLock(builder *readBuilder, node *Snapshot, start, next uin
 
 	firstPage := readPageIndex(start)
 	lastPage := readPageIndex(next)
+
 	if node.strs == nil {
+
 		for page := firstPage; page <= lastPage; page++ {
+
 			pageStart, pageNext := readPageBounds(page, next)
+
 			if pageStart < start {
 				existing := builder.pageAtNoLock(page)
+
 				if existing != nil {
-					builder.setPageNoLock(page, materializeReadPageNoLock(existing, node, start, pageStart, pageNext))
+					hasDelta := false
+					if node.singleIdx != 0 {
+						hasDelta = node.singleIdx >= start && node.singleIdx <= pageNext
+					} else {
+						denseStrs, denseUsed := denseWindowNoLock(node.denseStart, node.denseStrs, node.denseUsed, start, pageNext)
+						hasDelta = len(denseStrs) != 0 || len(denseUsed) != 0
+					}
+					if hasDelta {
+						builder.setPageNoLock(page, materializeReadPageNoLock(existing, node, start, pageStart, pageNext))
+					}
+
 				} else {
-					builder.setPageNoLock(page, newReadPageNoLock(node, start, pageNext))
+					if rp := newReadPageNoLock(node, start, pageNext); rp != nil {
+						builder.setPageNoLock(page, rp)
+					}
 				}
+
 				continue
 			}
-			builder.setPageNoLock(page, newReadPageNoLock(node, pageStart, pageNext))
+
+			if rp := newReadPageNoLock(node, pageStart, pageNext); rp != nil {
+				builder.setPageNoLock(page, rp)
+			}
 		}
 		return
 	}
@@ -558,7 +745,9 @@ func appendReadPagesNoLock(builder *readBuilder, node *Snapshot, start, next uin
 
 	pageMaps := buildSparsePageMapsNoLock(node.strs, start, next)
 	for page := firstPage; page <= lastPage; page++ {
+
 		pageStart, pageNext := readPageBounds(page, next)
+
 		if pageStart < start {
 			existing := builder.pageAtNoLock(page)
 			if existing != nil {
@@ -567,10 +756,31 @@ func appendReadPagesNoLock(builder *readBuilder, node *Snapshot, start, next uin
 			}
 			pageStart = start
 		}
+
 		pageStrs := pageMaps[page]
 		if len(pageStrs) == 0 {
 			continue
 		}
+
+		pageLen := int(pageNext-pageStart) + 1
+
+		if estimateDenseReverseBytes(pageLen) <= estimateSparseReverseBytes(len(pageStrs)) {
+			denseStrs := make([]string, pageLen)
+			denseUsed := make([]bool, pageLen)
+			for idx, value := range pageStrs {
+				pos := int(idx - pageStart)
+				denseStrs[pos] = value
+				denseUsed[pos] = true
+			}
+			builder.setPageNoLock(page, &readPage{
+				start:     pageStart,
+				next:      pageNext,
+				denseStrs: denseStrs,
+				denseUsed: denseUsed,
+			})
+			continue
+		}
+
 		builder.setPageNoLock(page, &readPage{
 			start: pageStart,
 			next:  pageNext,
@@ -607,6 +817,7 @@ func buildPublishedSnapshotFromChain(state *Snapshot) *Snapshot {
 		}
 		appendReadPagesNoLock(&builder, node, start, node.next)
 	}
+
 	return &Snapshot{
 		next:     state.next,
 		readDirs: builder.dirs,
@@ -636,10 +847,13 @@ func buildPublishedSnapshot(state, prevSource, prevPublished *Snapshot) *Snapsho
 	}
 	if state.base == nil {
 		return &Snapshot{
-			next:      state.next,
-			strs:      state.strs,
-			denseStrs: state.denseStrs,
-			denseUsed: state.denseUsed,
+			next:       state.next,
+			strs:       state.strs,
+			singleIdx:  state.singleIdx,
+			singleStr:  state.singleStr,
+			denseStart: state.denseStart,
+			denseStrs:  state.denseStrs,
+			denseUsed:  state.denseUsed,
 		}
 	}
 	if prevPublished != nil && prevSource == state.base && len(prevPublished.readDirs) > 0 {
@@ -668,8 +882,14 @@ func snapshotOwnUsedCount(s *Snapshot) int {
 	if len(s.keys) > 0 {
 		return len(s.keys)
 	}
+	if s.singleIdx != 0 {
+		return 1
+	}
 	if s.strs != nil {
 		return len(s.strs)
+	}
+	if s.denseStart != 0 && len(s.denseUsed) == 0 {
+		return len(s.denseStrs)
 	}
 	limit := min(len(s.denseStrs), len(s.denseUsed))
 	if limit <= 1 {

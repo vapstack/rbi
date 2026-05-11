@@ -300,11 +300,16 @@ func (m *Mapper) deltaSnapshotNoLock(base *Snapshot) (*Snapshot, bool) {
 
 	start := base.next + 1
 	count := 0
+	singleIdx := uint64(0)
+	singleStr := ""
 
 	if m.sparseStrs != nil {
 		for idx := start; idx <= m.next; idx++ {
-			if _, ok := m.sparseStrs[idx]; ok {
+			s, ok := m.sparseStrs[idx]
+			if ok {
 				count++
+				singleIdx = idx
+				singleStr = s
 			}
 		}
 
@@ -316,12 +321,49 @@ func (m *Mapper) deltaSnapshotNoLock(base *Snapshot) (*Snapshot, bool) {
 		for i := int(start); i <= end; i++ {
 			if i < len(m.strsUsed) && m.strsUsed[i] {
 				count++
+				singleIdx = uint64(i)
+				singleStr = m.strs[i]
 			}
 		}
 	}
 
 	if count == 0 {
 		return base, true
+	}
+
+	anchor := base
+	if anchor.depth > 1 && anchor.anchor != nil {
+		anchor = anchor.anchor
+	}
+
+	if count == 1 {
+		return &Snapshot{
+			next:      m.next,
+			singleIdx: singleIdx,
+			singleStr: singleStr,
+			base:      base,
+			anchor:    anchor,
+			depth:     base.depth + 1,
+		}, true
+	}
+
+	if count == int(m.next-start+1) {
+		denseStrs := make([]string, count)
+		if m.sparseStrs != nil {
+			for i := range denseStrs {
+				denseStrs[i] = m.sparseStrs[start+uint64(i)]
+			}
+		} else {
+			copy(denseStrs, m.strs[int(start):int(m.next)+1])
+		}
+		return &Snapshot{
+			next:       m.next,
+			denseStart: start,
+			denseStrs:  denseStrs,
+			base:       base,
+			anchor:     anchor,
+			depth:      base.depth + 1,
+		}, true
 	}
 
 	strs := make(map[uint64]string, count)
@@ -345,11 +387,6 @@ func (m *Mapper) deltaSnapshotNoLock(base *Snapshot) (*Snapshot, bool) {
 			idx := uint64(i)
 			strs[idx] = s
 		}
-	}
-
-	anchor := base
-	if anchor.depth > 1 && anchor.anchor != nil {
-		anchor = anchor.anchor
 	}
 
 	return &Snapshot{

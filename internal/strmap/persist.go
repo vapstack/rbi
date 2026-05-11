@@ -9,6 +9,7 @@ import (
 	"unsafe"
 
 	"github.com/vapstack/rbi/internal/indexdata"
+	"github.com/vapstack/rbi/internal/pooled"
 )
 
 const (
@@ -31,6 +32,235 @@ func WriteSnapshot(writer *bufio.Writer, sm *Snapshot) error {
 		return fmt.Errorf("encode: writing strmap next: %w", err)
 	}
 
+	if len(sm.readDirs) == 0 && sm.base == nil {
+		if len(sm.denseStrs) > 0 || len(sm.denseUsed) > 0 {
+
+			usedCount := snapshotOwnUsedCount(sm)
+			limit := min(len(sm.denseStrs), len(sm.denseUsed))
+
+			if snapshotShouldPersistSparse(sm, usedCount) {
+				if err := writer.WriteByte(encodingSparse); err != nil {
+					return fmt.Errorf("encode: writing strmap encoding: %w", err)
+				}
+				if err := writeUvarint(writer, uint64(usedCount)); err != nil {
+					return fmt.Errorf("encode: writing strmap sparse len: %w", err)
+				}
+				for i := 1; i < limit; i++ {
+					if !sm.denseUsed[i] {
+						continue
+					}
+					if err := writeUvarint(writer, uint64(i)); err != nil {
+						return fmt.Errorf("encode: writing strmap sparse idx: %w", err)
+					}
+					if err := writeString(writer, sm.denseStrs[i]); err != nil {
+						return fmt.Errorf("encode: writing strmap sparse string: %w", err)
+					}
+				}
+				return nil
+			}
+
+			if err := writer.WriteByte(encodingDense); err != nil {
+				return fmt.Errorf("encode: writing strmap encoding: %w", err)
+			}
+
+			denseLen := int(sm.next) + 1
+			if err := writeUvarint(writer, uint64(denseLen)); err != nil {
+				return fmt.Errorf("encode: writing strmap dense len: %w", err)
+			}
+			if limit > denseLen {
+				limit = denseLen
+			}
+			for base := 0; base < denseLen; base += 8 {
+				start := base
+				if start == 0 {
+					start = 1
+				}
+				end := min(base+8, limit)
+				var flags byte
+				for i := start; i < end; i++ {
+					if sm.denseUsed[i] {
+						flags |= 1 << uint(i-base)
+					}
+				}
+				if err := writer.WriteByte(flags); err != nil {
+					return fmt.Errorf("encode: writing strmap flags: %w", err)
+				}
+			}
+
+			for i := 1; i < limit; i++ {
+				if !sm.denseUsed[i] {
+					continue
+				}
+				if err := writeString(writer, sm.denseStrs[i]); err != nil {
+					return fmt.Errorf("encode: writing strmap string: %w", err)
+				}
+			}
+
+			return nil
+		}
+
+		if sm.strs != nil {
+
+			usedCount := len(sm.strs)
+
+			if snapshotShouldPersistSparse(sm, usedCount) {
+				if err := writer.WriteByte(encodingSparse); err != nil {
+					return fmt.Errorf("encode: writing strmap encoding: %w", err)
+				}
+				if err := writeUvarint(writer, uint64(usedCount)); err != nil {
+					return fmt.Errorf("encode: writing strmap sparse len: %w", err)
+				}
+				if len(sm.strs) <= 64 {
+					var idxs [64]uint64
+					count := 0
+					for idx := range sm.strs {
+						i := count
+						count++
+						for i > 0 && idxs[i-1] > idx {
+							idxs[i] = idxs[i-1]
+							i--
+						}
+						idxs[i] = idx
+					}
+					for _, idx := range idxs[:count] {
+						if err := writeUvarint(writer, idx); err != nil {
+							return fmt.Errorf("encode: writing strmap sparse idx: %w", err)
+						}
+						if err := writeString(writer, sm.strs[idx]); err != nil {
+							return fmt.Errorf("encode: writing strmap sparse string: %w", err)
+						}
+					}
+					return nil
+				}
+
+				idxs := pooled.GetUint64Slice(len(sm.strs))
+				for idx := range sm.strs {
+					idxs = append(idxs, idx)
+				}
+				slices.Sort(idxs)
+
+				for _, idx := range idxs {
+					if err := writeUvarint(writer, idx); err != nil {
+						pooled.ReleaseUint64Slice(idxs)
+						return fmt.Errorf("encode: writing strmap sparse idx: %w", err)
+					}
+					if err := writeString(writer, sm.strs[idx]); err != nil {
+						pooled.ReleaseUint64Slice(idxs)
+						return fmt.Errorf("encode: writing strmap sparse string: %w", err)
+					}
+				}
+
+				pooled.ReleaseUint64Slice(idxs)
+
+				return nil
+			}
+
+			if err := writer.WriteByte(encodingDense); err != nil {
+				return fmt.Errorf("encode: writing strmap encoding: %w", err)
+			}
+
+			denseLen := int(sm.next) + 1
+			if err := writeUvarint(writer, uint64(denseLen)); err != nil {
+				return fmt.Errorf("encode: writing strmap dense len: %w", err)
+			}
+
+			for base := 0; base < denseLen; base += 8 {
+				start := base
+				if start == 0 {
+					start = 1
+				}
+				end := min(base+8, denseLen)
+				var flags byte
+				for i := start; i < end; i++ {
+					if _, ok := sm.strs[uint64(i)]; ok {
+						flags |= 1 << uint(i-base)
+					}
+				}
+				if err := writer.WriteByte(flags); err != nil {
+					return fmt.Errorf("encode: writing strmap flags: %w", err)
+				}
+			}
+
+			for i := 1; i < denseLen; i++ {
+				value, ok := sm.strs[uint64(i)]
+				if !ok {
+					continue
+				}
+				if err := writeString(writer, value); err != nil {
+					return fmt.Errorf("encode: writing strmap string: %w", err)
+				}
+			}
+
+			return nil
+		}
+	}
+
+	if len(sm.readDirs) > 0 {
+
+		usedCount := snapshotUsedCountNoLock(sm)
+
+		if snapshotShouldPersistSparse(sm, usedCount) {
+			return writeSparseReadDirsSnapshot(writer, sm, usedCount)
+		}
+
+		if err := writer.WriteByte(encodingDense); err != nil {
+			return fmt.Errorf("encode: writing strmap encoding: %w", err)
+		}
+		denseLen := int(sm.next) + 1
+		if err := writeUvarint(writer, uint64(denseLen)); err != nil {
+			return fmt.Errorf("encode: writing strmap dense len: %w", err)
+		}
+
+		pageIdx := -1
+		var page *readPage
+		for base := 0; base < denseLen; base += 8 {
+			start := base
+			if start == 0 {
+				start = 1
+			}
+			end := min(base+8, denseLen)
+			var flags byte
+			for i := start; i < end; i++ {
+				curPage := readPageIndex(uint64(i))
+				if curPage != pageIdx {
+					pageIdx = curPage
+					page = sm.readPageAtNoLock(curPage)
+				}
+				if page == nil {
+					continue
+				}
+				if _, ok := page.getStringNoLock(uint64(i)); ok {
+					flags |= 1 << uint(i-base)
+				}
+			}
+			if err := writer.WriteByte(flags); err != nil {
+				return fmt.Errorf("encode: writing strmap flags: %w", err)
+			}
+		}
+
+		pageIdx = -1
+		page = nil
+		for i := 1; i < denseLen; i++ {
+			curPage := readPageIndex(uint64(i))
+			if curPage != pageIdx {
+				pageIdx = curPage
+				page = sm.readPageAtNoLock(curPage)
+			}
+			if page == nil {
+				continue
+			}
+			value, ok := page.getStringNoLock(uint64(i))
+			if !ok {
+				continue
+			}
+			if err := writeString(writer, value); err != nil {
+				return fmt.Errorf("encode: writing strmap string: %w", err)
+			}
+		}
+
+		return nil
+	}
+
 	var chainInline [32]snapshotPersistNode
 	chain, usedCount := snapshotPersistNodes(sm, chainInline[:0])
 
@@ -41,6 +271,7 @@ func WriteSnapshot(writer *bufio.Writer, sm *Snapshot) error {
 		if err := writeUvarint(writer, uint64(usedCount)); err != nil {
 			return fmt.Errorf("encode: writing strmap sparse len: %w", err)
 		}
+
 		it := snapshotPersistIter{chain: chain}
 		for {
 			idx, value, ok := it.next()
@@ -48,9 +279,11 @@ func WriteSnapshot(writer *bufio.Writer, sm *Snapshot) error {
 				break
 			}
 			if err := writeUvarint(writer, idx); err != nil {
+				it.release()
 				return fmt.Errorf("encode: writing strmap sparse idx: %w", err)
 			}
 			if err := writeString(writer, value); err != nil {
+				it.release()
 				return fmt.Errorf("encode: writing strmap sparse string: %w", err)
 			}
 		}
@@ -77,6 +310,7 @@ func WriteSnapshot(writer *bufio.Writer, sm *Snapshot) error {
 			idx, _, ok = flagIter.next()
 		}
 		if err := writer.WriteByte(flags); err != nil {
+			flagIter.release()
 			return fmt.Errorf("encode: writing strmap flags: %w", err)
 		}
 	}
@@ -88,6 +322,7 @@ func WriteSnapshot(writer *bufio.Writer, sm *Snapshot) error {
 			break
 		}
 		if err := writeString(writer, value); err != nil {
+			valueIter.release()
 			return fmt.Errorf("encode: writing strmap string: %w", err)
 		}
 	}
@@ -98,13 +333,15 @@ type snapshotPersistNode struct {
 	start     uint64
 	next      uint64
 	strs      map[uint64]string
+	singleIdx uint64
+	singleStr string
 	denseStrs []string
 	denseUsed []bool
 }
 
 func snapshotPersistNodes(sm *Snapshot, inline []snapshotPersistNode) ([]snapshotPersistNode, int) {
 	if len(sm.readDirs) > 0 {
-		var nodes []snapshotPersistNode
+		nodes := inline
 		usedCount := 0
 		pageCount := readPageCount(sm.next)
 		for page := 0; page < pageCount; page++ {
@@ -116,6 +353,8 @@ func snapshotPersistNodes(sm *Snapshot, inline []snapshotPersistNode) ([]snapsho
 				start:     rp.start,
 				next:      rp.next,
 				strs:      rp.strs,
+				singleIdx: rp.singleIdx,
+				singleStr: rp.singleStr,
 				denseStrs: rp.denseStrs,
 				denseUsed: rp.denseUsed,
 			})
@@ -123,10 +362,6 @@ func snapshotPersistNodes(sm *Snapshot, inline []snapshotPersistNode) ([]snapsho
 		}
 		if len(nodes) == 0 {
 			return nil, usedCount
-		}
-		if len(nodes) <= cap(inline) {
-			copy(inline[:len(nodes)], nodes)
-			nodes = inline[:len(nodes)]
 		}
 		return nodes, usedCount
 	}
@@ -154,11 +389,13 @@ func snapshotPersistNodes(sm *Snapshot, inline []snapshotPersistNode) ([]snapsho
 		if cur.base == nil {
 			start = 1
 		}
-		denseStrs, denseUsed := denseWindowNoLock(cur.denseStrs, cur.denseUsed, start, cur.next)
+		denseStrs, denseUsed := denseWindowNoLock(cur.denseStart, cur.denseStrs, cur.denseUsed, start, cur.next)
 		nodes[i] = snapshotPersistNode{
 			start:     start,
 			next:      cur.next,
 			strs:      cur.strs,
+			singleIdx: cur.singleIdx,
+			singleStr: cur.singleStr,
 			denseStrs: denseStrs,
 			denseUsed: denseUsed,
 		}
@@ -167,13 +404,14 @@ func snapshotPersistNodes(sm *Snapshot, inline []snapshotPersistNode) ([]snapsho
 }
 
 type snapshotPersistIter struct {
-	chain      []snapshotPersistNode
-	node       int
-	mode       byte
-	densePos   int
-	denseLimit int
-	sparse     []sparseEntry
-	sparsePos  int
+	chain        []snapshotPersistNode
+	node         int
+	mode         byte
+	densePos     int
+	denseLimit   int
+	sparse       []sparseEntry
+	sparsePos    int
+	sparsePooled bool
 }
 
 func (it *snapshotPersistIter) next() (uint64, string, bool) {
@@ -186,7 +424,7 @@ func (it *snapshotPersistIter) next() (uint64, string, bool) {
 				idx := uint64(it.densePos)
 				it.densePos++
 				pos := int(idx - node.start)
-				if pos < 0 || pos >= len(node.denseUsed) || !node.denseUsed[pos] {
+				if pos < 0 || pos >= len(node.denseStrs) || len(node.denseUsed) != 0 && (pos >= len(node.denseUsed) || !node.denseUsed[pos]) {
 					continue
 				}
 				return idx, node.denseStrs[pos], true
@@ -201,7 +439,11 @@ func (it *snapshotPersistIter) next() (uint64, string, bool) {
 				it.sparsePos++
 				return entry.idx, entry.value, true
 			}
-			it.sparse = it.sparse[:0]
+			if it.sparsePooled {
+				sparseEntryPool.Put(it.sparse)
+				it.sparsePooled = false
+			}
+			it.sparse = nil
 			it.sparsePos = 0
 			it.mode = 0
 			it.node++
@@ -210,9 +452,21 @@ func (it *snapshotPersistIter) next() (uint64, string, bool) {
 
 		node := it.chain[it.node]
 
+		if node.singleIdx != 0 {
+			it.node++
+			if node.singleIdx >= node.start && node.singleIdx <= node.next {
+				return node.singleIdx, node.singleStr, true
+			}
+			continue
+		}
+
 		if len(node.denseStrs) > 0 || len(node.denseUsed) > 0 {
 			start := int(node.start)
-			limit := start + min(len(node.denseStrs), len(node.denseUsed))
+			limitLen := len(node.denseStrs)
+			if len(node.denseUsed) != 0 {
+				limitLen = min(limitLen, len(node.denseUsed))
+			}
+			limit := start + limitLen
 			if start >= limit {
 				it.node++
 				continue
@@ -228,7 +482,8 @@ func (it *snapshotPersistIter) next() (uint64, string, bool) {
 			continue
 		}
 
-		it.sparse = it.sparse[:0]
+		it.sparse = sparseEntryPool.Get(len(node.strs))
+		it.sparsePooled = true
 		for idx, value := range node.strs {
 			if idx < node.start || idx > node.next {
 				continue
@@ -252,11 +507,122 @@ func (it *snapshotPersistIter) next() (uint64, string, bool) {
 	return 0, "", false
 }
 
+func (it *snapshotPersistIter) release() {
+	if it.sparsePooled {
+		sparseEntryPool.Put(it.sparse)
+		it.sparsePooled = false
+		it.sparse = nil
+	}
+}
+
+func writeSparseReadDirsSnapshot(writer *bufio.Writer, sm *Snapshot, usedCount int) error {
+	if err := writer.WriteByte(encodingSparse); err != nil {
+		return fmt.Errorf("encode: writing strmap encoding: %w", err)
+	}
+	if err := writeUvarint(writer, uint64(usedCount)); err != nil {
+		return fmt.Errorf("encode: writing strmap sparse len: %w", err)
+	}
+
+	pageCount := readPageCount(sm.next)
+	for pageIdx := 0; pageIdx < pageCount; pageIdx++ {
+		page := sm.readPageAtNoLock(pageIdx)
+		if page == nil {
+			continue
+		}
+
+		if page.singleIdx != 0 {
+			if err := writeUvarint(writer, page.singleIdx); err != nil {
+				return fmt.Errorf("encode: writing strmap sparse idx: %w", err)
+			}
+			if err := writeString(writer, page.singleStr); err != nil {
+				return fmt.Errorf("encode: writing strmap sparse string: %w", err)
+			}
+			continue
+		}
+
+		if len(page.denseStrs) > 0 || len(page.denseUsed) > 0 {
+			limit := min(len(page.denseStrs), len(page.denseUsed))
+			if len(page.denseUsed) == 0 {
+				limit = len(page.denseStrs)
+			}
+			for i := 0; i < limit; i++ {
+				if len(page.denseUsed) != 0 && !page.denseUsed[i] {
+					continue
+				}
+				if err := writeUvarint(writer, page.start+uint64(i)); err != nil {
+					return fmt.Errorf("encode: writing strmap sparse idx: %w", err)
+				}
+				if err := writeString(writer, page.denseStrs[i]); err != nil {
+					return fmt.Errorf("encode: writing strmap sparse string: %w", err)
+				}
+			}
+			continue
+		}
+
+		if len(page.strs) == 0 {
+			continue
+		}
+
+		if len(page.strs) <= 64 {
+			var idxs [64]uint64
+			count := 0
+
+			for idx := range page.strs {
+				if idx < page.start || idx > page.next {
+					continue
+				}
+				i := count
+				count++
+				for i > 0 && idxs[i-1] > idx {
+					idxs[i] = idxs[i-1]
+					i--
+				}
+				idxs[i] = idx
+			}
+
+			for _, idx := range idxs[:count] {
+				if err := writeUvarint(writer, idx); err != nil {
+					return fmt.Errorf("encode: writing strmap sparse idx: %w", err)
+				}
+				if err := writeString(writer, page.strs[idx]); err != nil {
+					return fmt.Errorf("encode: writing strmap sparse string: %w", err)
+				}
+			}
+
+			continue
+		}
+
+		idxs := pooled.GetUint64Slice(len(page.strs))
+		for idx := range page.strs {
+			if idx >= page.start && idx <= page.next {
+				idxs = append(idxs, idx)
+			}
+		}
+		slices.Sort(idxs)
+
+		for _, idx := range idxs {
+			if err := writeUvarint(writer, idx); err != nil {
+				pooled.ReleaseUint64Slice(idxs)
+				return fmt.Errorf("encode: writing strmap sparse idx: %w", err)
+			}
+			if err := writeString(writer, page.strs[idx]); err != nil {
+				pooled.ReleaseUint64Slice(idxs)
+				return fmt.Errorf("encode: writing strmap sparse string: %w", err)
+			}
+		}
+
+		pooled.ReleaseUint64Slice(idxs)
+
+	}
+	return nil
+}
+
 func Read(reader *bufio.Reader, compactAt int) (*Mapper, error) {
 	next, err := binary.ReadUvarint(reader)
 	if err != nil {
 		return nil, fmt.Errorf("decode: reading strmap next: %w", err)
 	}
+
 	enc, err := reader.ReadByte()
 	if err != nil {
 		return nil, fmt.Errorf("decode: reading strmap encoding: %w", err)
@@ -278,8 +644,21 @@ func Read(reader *bufio.Reader, compactAt int) (*Mapper, error) {
 			return nil, fmt.Errorf("decode: strmap next out of range: next=%v denseLen=%v", next, denseLen)
 		}
 
-		flags := make([]byte, (int(denseLen)+7)>>3)
+		flagLen := (int(denseLen) + 7) >> 3
+		var flagsInline [128]byte
+		flags := flagsInline[:]
+		pooledFlags := false
+		if flagLen > len(flagsInline) {
+			flags = pooled.GetByteSlice(flagLen)[:flagLen]
+			pooledFlags = true
+		} else {
+			flags = flags[:flagLen]
+		}
+
 		if _, err = io.ReadFull(reader, flags); err != nil {
+			if pooledFlags {
+				pooled.ReleaseByteSlice(flags)
+			}
 			return nil, fmt.Errorf("decode: reading strmap flags: %w", err)
 		}
 
@@ -293,13 +672,23 @@ func Read(reader *bufio.Reader, compactAt int) (*Mapper, error) {
 		strs := make([]string, int(denseLen))
 		used := make([]bool, int(denseLen))
 		keys := make(map[string]uint64, max(0, usedCount-1))
+		arenaCap := usedCount
+		if arenaCap > indexdata.MaxStoredStringLen/16 {
+			arenaCap = indexdata.MaxStoredStringLen
+		} else {
+			arenaCap *= 16
+		}
+		stringArena := make([]byte, 0, arenaCap)
 
 		for i := 0; i < int(denseLen); i++ {
 			if flags[i>>3]&(1<<uint(i&7)) == 0 {
 				continue
 			}
-			s, err := readString(reader)
+			s, err := readString(reader, &stringArena)
 			if err != nil {
+				if pooledFlags {
+					pooled.ReleaseByteSlice(flags)
+				}
 				return nil, fmt.Errorf("decode: reading strmap dense string idx=%d: %w", i, err)
 			}
 			strs[i] = s
@@ -308,8 +697,13 @@ func Read(reader *bufio.Reader, compactAt int) (*Mapper, error) {
 				keys[s] = uint64(i)
 			}
 		}
+		if pooledFlags {
+			pooled.ReleaseByteSlice(flags)
+		}
 
-		m := New(uint64(max(0, usedCount-1)), compactAt)
+		m := &Mapper{
+			compactAt: compactAt,
+		}
 		m.replaceAllDenseNoLock(keys, strs, used, next)
 		return m, nil
 
@@ -324,6 +718,14 @@ func Read(reader *bufio.Reader, compactAt int) (*Mapper, error) {
 		keys := make(map[string]uint64, int(count))
 		strs := make(map[uint64]string, int(count))
 
+		arenaCap := int(count)
+		if arenaCap > indexdata.MaxStoredStringLen/16 {
+			arenaCap = indexdata.MaxStoredStringLen
+		} else {
+			arenaCap *= 16
+		}
+		stringArena := make([]byte, 0, arenaCap)
+
 		for i := uint64(0); i < count; i++ {
 			idx, err := binary.ReadUvarint(reader)
 			if err != nil {
@@ -335,7 +737,7 @@ func Read(reader *bufio.Reader, compactAt int) (*Mapper, error) {
 			if _, exists := strs[idx]; exists {
 				return nil, fmt.Errorf("decode: duplicate strmap sparse idx at entry=%d/%d: %v", i+1, count, idx)
 			}
-			s, err := readString(reader)
+			s, err := readString(reader, &stringArena)
 			if err != nil {
 				return nil, fmt.Errorf("decode: reading strmap sparse string idx=%d entry=%d/%d: %w", idx, i+1, count, err)
 			}
@@ -345,8 +747,11 @@ func Read(reader *bufio.Reader, compactAt int) (*Mapper, error) {
 			keys[s] = idx
 			strs[idx] = s
 		}
-		m := New(count, compactAt)
+		m := &Mapper{
+			compactAt: compactAt,
+		}
 		m.replaceAllSparseNoLock(keys, strs, next)
+
 		return m, nil
 
 	default:
@@ -358,6 +763,8 @@ type sparseEntry struct {
 	idx   uint64
 	value string
 }
+
+var sparseEntryPool = pooled.NewSlicePool[sparseEntry](4096, pooled.ClearCap)
 
 func snapshotShouldPersistSparse(sm *Snapshot, usedCount int) bool {
 	if sm.next > maxIntUint64 {
@@ -398,12 +805,13 @@ func estimateSparseReverseBytes(usedCount int) uint64 {
 }
 
 func writeUvarint(writer *bufio.Writer, v uint64) error {
-	var buf [binary.MaxVarintLen64]byte
-	n := binary.PutUvarint(buf[:], v)
-	if _, err := writer.Write(buf[:n]); err != nil {
-		return err
+	for v >= 0x80 {
+		if err := writer.WriteByte(byte(v&0x7f) | 0x80); err != nil {
+			return err
+		}
+		v >>= 7
 	}
-	return nil
+	return writer.WriteByte(byte(v))
 }
 
 func writeString(writer *bufio.Writer, s string) error {
@@ -413,13 +821,13 @@ func writeString(writer *bufio.Writer, s string) error {
 	if len(s) == 0 {
 		return nil
 	}
-	if _, err := io.WriteString(writer, s); err != nil {
+	if _, err := writer.WriteString(s); err != nil {
 		return err
 	}
 	return nil
 }
 
-func readString(reader *bufio.Reader) (string, error) {
+func readString(reader *bufio.Reader, arena *[]byte) (string, error) {
 	n, err := binary.ReadUvarint(reader)
 	if err != nil {
 		return "", err
@@ -433,10 +841,37 @@ func readString(reader *bufio.Reader) (string, error) {
 	if n > maxIntUint64 {
 		return "", fmt.Errorf("string len %v overflows int", n)
 	}
-	b := make([]byte, int(n))
+
+	l := int(n)
+	buf := *arena
+	if l > cap(buf)-len(buf) {
+		capHint := l
+		if c := cap(buf) * 2; c > capHint {
+			capHint = c
+		}
+		if capHint < 256 {
+			capHint = 256
+		}
+		if capHint > indexdata.MaxStoredStringLen {
+			capHint = indexdata.MaxStoredStringLen
+		}
+		buf = make([]byte, l, capHint)
+		*arena = buf
+
+		if _, err = io.ReadFull(reader, buf); err != nil {
+			return "", err
+		}
+
+		return unsafe.String(unsafe.SliceData(buf), l), nil
+	}
+
+	start := len(buf)
+	buf = buf[:start+l]
+	*arena = buf
+	b := buf[start:]
+
 	if _, err = io.ReadFull(reader, b); err != nil {
 		return "", err
 	}
-	s := unsafe.String(unsafe.SliceData(b), len(b))
-	return s, nil
+	return unsafe.String(unsafe.SliceData(b), l), nil
 }
