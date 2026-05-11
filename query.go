@@ -25,7 +25,7 @@ func (db *DB[K, V]) Query(q *qx.QX) ([]*V, error) {
 	if q == nil {
 		return nil, fmt.Errorf("QX is nil")
 	}
-	prepared, err := qir.PrepareQuery(q, db.engine.indexedFieldMap)
+	prepared, err := qir.PrepareQuery(q, db.engine.schema.IndexedByName)
 	if err != nil {
 		return nil, err
 	}
@@ -215,7 +215,7 @@ func (db *DB[K, V]) QueryKeys(q *qx.QX) ([]K, error) {
 	if q == nil {
 		return nil, fmt.Errorf("QX is nil")
 	}
-	prepared, err := qir.PrepareQuery(q, db.engine.indexedFieldMap)
+	prepared, err := qir.PrepareQuery(q, db.engine.schema.IndexedByName)
 	if err != nil {
 		return nil, err
 	}

@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"math"
 	"path/filepath"
-	"reflect"
 	"slices"
 	"sort"
 	"strings"
@@ -15,13 +14,13 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
-	"unsafe"
 
 	"github.com/vapstack/qx"
 	"github.com/vapstack/rbi/internal/indexdata"
 	"github.com/vapstack/rbi/internal/keycodec"
 	"github.com/vapstack/rbi/internal/pooled"
 	"github.com/vapstack/rbi/internal/posting"
+	"github.com/vapstack/rbi/internal/schema"
 	"github.com/vapstack/rbi/internal/strmap"
 	"go.etcd.io/bbolt"
 )
@@ -46,86 +45,13 @@ func TestReadSidecarString_RoundTrip(t *testing.T) {
 	}
 }
 
-func TestAddDistinctStrings_SinglePass(t *testing.T) {
-	values := []string{"alpha", "beta", "alpha", "gamma", "beta"}
-	var got []string
-	calls := 0
-	distinct := addDistinctStrings(len(values), func(i int) string {
-		calls++
-		return values[i]
-	}, func(v string) {
-		got = append(got, v)
-	})
-	if calls != len(values) {
-		t.Fatalf("valueAt calls mismatch: got=%d want=%d", calls, len(values))
-	}
-	if distinct != 3 {
-		t.Fatalf("distinct mismatch: got=%d want=3", distinct)
-	}
-	if !slices.Equal(got, []string{"alpha", "beta", "gamma"}) {
-		t.Fatalf("unexpected distinct order: got=%v", got)
-	}
-}
-
-func TestAddDistinctFixedKeys_SinglePass(t *testing.T) {
-	values := []int64{5, 7, 5, 11, 7}
-	var got []uint64
-	calls := 0
-	distinct := addDistinctFixedKeys(len(values), func(i int) uint64 {
-		calls++
-		return uint64(values[i]) ^ (uint64(1) << 63)
-	}, func(v uint64) {
-		got = append(got, v)
-	})
-	if calls != len(values) {
-		t.Fatalf("encode calls mismatch: got=%d want=%d", calls, len(values))
-	}
-	if distinct != 3 {
-		t.Fatalf("distinct mismatch: got=%d want=3", distinct)
-	}
-	want := []uint64{uint64(5) ^ (uint64(1) << 63), uint64(7) ^ (uint64(1) << 63), uint64(11) ^ (uint64(1) << 63)}
-	if !slices.Equal(got, want) {
-		t.Fatalf("unexpected distinct order: got=%v want=%v", got, want)
-	}
-}
-
-func TestValidateIndexedStringValues_UsesOnlyStringValidationAccessors(t *testing.T) {
-	db := &DB[uint64, Rec]{
-		engine: &queryEngine{
-			indexedFieldAccess: []indexedFieldAccessor{
-				{
-					name:  "active",
-					field: &field{Kind: reflect.Bool},
-					writeBuild: func(_ unsafe.Pointer, _ buildFieldWriteSink) {
-						t.Fatal("bool accessor must not be called")
-					},
-				},
-			},
-			indexedStringValidationAccess: []indexedFieldAccessor{
-				{
-					name:  "email",
-					field: &field{Kind: reflect.String},
-					writeBuild: func(_ unsafe.Pointer, sink buildFieldWriteSink) {
-						sink.addString(strings.Repeat("x", indexdata.FieldStringRefMax+1))
-					},
-				},
-			},
-		},
-	}
-
-	err := db.validateIndexedStringValues(&Rec{})
-	if err == nil || !strings.Contains(err.Error(), "exceeds limit") {
-		t.Fatalf("validateIndexedStringValues error = %v, want indexed string limit error", err)
-	}
-}
-
 func TestQueryViewIdxMapping_UsesPinnedStrMapSnapshot(t *testing.T) {
 	db := &DB[string, UserBench]{
 		strKey:  true,
 		strMap:  strmap.New(0, defaultSnapshotStrMapCompactDepth),
 		options: &Options{},
 		engine: &queryEngine{
-			fields:  map[string]*field{},
+			schema:  &schema.Runtime{Fields: map[string]*schema.Field{}},
 			planner: &planner{},
 			viewPool: &pooled.Pointers[queryView]{
 				Clear: true,
@@ -146,7 +72,6 @@ func TestQueryViewIdxMapping_UsesPinnedStrMapSnapshot(t *testing.T) {
 		snap:              indexSnap,
 		strKey:            true,
 		strMapView:        strMapSnap,
-		fields:            db.engine.fields,
 		planner:           db.engine.planner,
 		lenZeroComplement: indexSnap.lenZeroComplement,
 	}

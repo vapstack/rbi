@@ -1470,7 +1470,7 @@ func preparePreparedRouteQuery(src any, q *qx.QX) (*qir.Query, qir.Shape, error)
 		return prepareTestQuery(db.engine, q)
 	}
 	view := preparedRouteViewUint64(src)
-	prepared, err := qir.PrepareQuery(q, view.engine.indexedFieldMap)
+	prepared, err := qir.PrepareQuery(q, view.engine.schema.IndexedByName)
 	if err != nil {
 		return nil, qir.Shape{}, err
 	}
@@ -1482,7 +1482,7 @@ func preparePreparedRouteQueryString(src any, q *qx.QX) (*qir.Query, qir.Shape, 
 		return prepareTestQuery(db.engine, q)
 	}
 	view := preparedRouteViewString(src)
-	prepared, err := qir.PrepareQuery(q, view.engine.indexedFieldMap)
+	prepared, err := qir.PrepareQuery(q, view.engine.schema.IndexedByName)
 	if err != nil {
 		return nil, qir.Shape{}, err
 	}

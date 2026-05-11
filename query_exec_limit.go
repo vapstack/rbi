@@ -909,7 +909,7 @@ func (qv *queryView) tryLimitQueryOrderBasic(q *qir.Shape, leaves []qir.Expr, tr
 
 func (qv *queryView) tryLimitQueryRangeNoOrderByField(q *qir.Shape, field string, bounds indexdata.Bounds, leaves []qir.Expr, trace *queryTrace) ([]uint64, bool, error) {
 
-	fm := qv.fields[field]
+	fm := qv.engine.schema.Fields[field]
 	if fm == nil || fm.Slice {
 		return nil, false, nil
 	}

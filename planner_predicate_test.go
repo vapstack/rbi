@@ -454,7 +454,7 @@ func TestBuildPredRange_PrefixMaterializationStoredInCache(t *testing.T) {
 		t.Fatalf("unexpected cache hit before predicate evaluation")
 	}
 
-	fm := db.engine.fields["email"]
+	fm := db.engine.schema.Fields["email"]
 	if fm == nil {
 		t.Fatalf("expected field metadata for email")
 	}
@@ -505,7 +505,7 @@ func TestBuildPredRange_PrefixMaterializationSkippedWhenCacheDisabled(t *testing
 		t.Fatalf("expected empty materialized cache key when cache is disabled, got %q", cacheKey)
 	}
 
-	fm := db.engine.fields["email"]
+	fm := db.engine.schema.Fields["email"]
 	if fm == nil {
 		t.Fatalf("expected field metadata for email")
 	}
@@ -658,7 +658,7 @@ func TestBuildPredRange_OverlayNumericPostingFilter_ComplementMaterializedFallba
 	if err := db.RebuildIndex(); err != nil {
 		t.Fatalf("RebuildIndex: %v", err)
 	}
-	fm := db.engine.fields["age"]
+	fm := db.engine.schema.Fields["age"]
 	if fm == nil {
 		t.Fatalf("expected field metadata for age")
 	}

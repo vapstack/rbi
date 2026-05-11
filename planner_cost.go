@@ -1042,7 +1042,7 @@ func (qv *queryView) estimateMergedScalarRangeOrderCost(
 	if field == "" {
 		return 0, 0, false
 	}
-	if qv.fields[field] == nil {
+	if qv.engine.schema.Fields[field] == nil {
 		return 0, 0, false
 	}
 	if !qv.fieldOverlay(field).HasData() {
@@ -2228,7 +2228,7 @@ func (qv *queryView) estimateInLikeSelectivity(field string, value any, universe
 			return 0, valueCount, true
 		}
 	}
-	if fm := qv.fields[field]; hasNil && fm != nil && !fm.Slice {
+	if fm := qv.engine.schema.Fields[field]; hasNil && fm != nil && !fm.Slice {
 		card := qv.nilFieldOverlay(field).LookupCardinality(nilIndexEntryKey)
 		sum += card
 		if minCard == 0 || card < minCard {

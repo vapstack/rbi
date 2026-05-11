@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/vapstack/qx"
+	"github.com/vapstack/rbi/internal/schema"
 	"go.etcd.io/bbolt"
 )
 
@@ -716,8 +717,8 @@ func TestReflectExt_ModifiedIndexedFields_EmbeddedUnsafeAccessorPaths(t *testing
 		t.Fatalf("expected no modified indexed fields, got %v", mods)
 	}
 	var uniqueMods []string
-	db.forEachModifiedAccessor(db.engine.uniqueFieldAccessors, base, same, func(acc indexedFieldAccessor) bool {
-		uniqueMods = append(uniqueMods, acc.name)
+	db.forEachModifiedAccessor(db.engine.schema.Unique, base, same, func(acc schema.IndexedFieldAccessor) bool {
+		uniqueMods = append(uniqueMods, acc.Name)
 		return true
 	})
 	if len(uniqueMods) != 0 {

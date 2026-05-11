@@ -652,7 +652,7 @@ func baselineEmitAcceptedPostingNoOrder(cursor *queryCursor, ids posting.List, e
 }
 
 func (qv *queryView) baselineTryQueryRangeNoOrderWithLimit(q *qx.QX) ([]uint64, bool, error) {
-	prepared, err := qir.PrepareQuery(q, qv.engine.indexedFieldMap)
+	prepared, err := qir.PrepareQuery(q, qv.engine.schema.IndexedByName)
 	if err != nil {
 		return nil, false, err
 	}
@@ -682,7 +682,7 @@ func (qv *queryView) baselineTryQueryRangeNoOrderWithLimit(q *qx.QX) ([]uint64, 
 		return nil, false, nil
 	}
 
-	fm := qv.fields[f]
+	fm := qv.engine.schema.Fields[f]
 	if fm == nil || fm.Slice {
 		return nil, false, nil
 	}
@@ -753,7 +753,7 @@ func (qv *queryView) baselineTryQueryRangeNoOrderWithLimit(q *qx.QX) ([]uint64, 
 }
 
 func (qv *queryView) baselineTryQueryPrefixNoOrderWithLimit(q *qx.QX) ([]uint64, bool, error) {
-	prepared, err := qir.PrepareQuery(q, qv.engine.indexedFieldMap)
+	prepared, err := qir.PrepareQuery(q, qv.engine.schema.IndexedByName)
 	if err != nil {
 		return nil, false, err
 	}
@@ -776,7 +776,7 @@ func (qv *queryView) baselineTryQueryPrefixNoOrderWithLimit(q *qx.QX) ([]uint64,
 		return nil, false, nil
 	}
 
-	fm := qv.fields[f]
+	fm := qv.engine.schema.Fields[f]
 	if fm == nil || fm.Slice {
 		return nil, false, nil
 	}

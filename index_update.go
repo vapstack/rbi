@@ -6,6 +6,7 @@ import (
 
 	"github.com/vapstack/rbi/internal/keycodec"
 	"github.com/vapstack/rbi/internal/posting"
+	"github.com/vapstack/rbi/internal/schema"
 )
 
 type uniqueBatchCheckState struct {
@@ -75,36 +76,36 @@ func rollbackUniqueBatchLeaving(state uniqueBatchCheckState, touched []uniqueLea
 func (qe *queryEngine) checkUniqueBatchCandidateAndCollectSeen(
 	state uniqueBatchCheckState,
 	idx uint64,
-	acc indexedFieldAccessor,
+	acc schema.IndexedFieldAccessor,
 	ptr unsafe.Pointer,
 	seenWrites []uniqueSeenWrite,
 ) ([]uniqueSeenWrite, error) {
-	single, ok, isNil := acc.uniqueGetter(ptr)
+	single, ok, isNil := acc.UniqueGetter(ptr)
 	if !ok || isNil {
 		return seenWrites, nil
 	}
 
-	if sm := state.seen[acc.name]; sm != nil {
+	if sm := state.seen[acc.Name]; sm != nil {
 		if prev, ok := sm[single]; ok && prev != idx {
-			return seenWrites, fmt.Errorf("%w: duplicate value for field %v within batch", ErrUniqueViolation, acc.name)
+			return seenWrites, fmt.Errorf("%w: duplicate value for field %v within batch", ErrUniqueViolation, acc.Name)
 		}
 	}
 
-	ids := qe.getSnapshot().fieldLookupPostingRetainedKey(acc.name, single)
+	ids := qe.getSnapshot().fieldLookupPostingRetainedKey(acc.Name, single)
 	if ids.IsEmpty() {
-		return append(seenWrites, uniqueSeenWrite{field: acc.name, key: single}), nil
+		return append(seenWrites, uniqueSeenWrite{field: acc.Name, key: single}), nil
 	}
 
 	var lv posting.List
-	if fm := state.leaving[acc.name]; fm != nil {
+	if fm := state.leaving[acc.Name]; fm != nil {
 		lv = fm[single]
 	}
 
 	if lv.IsEmpty() {
 		if ids.Cardinality() == 1 && ids.Contains(idx) {
-			return append(seenWrites, uniqueSeenWrite{field: acc.name, key: single}), nil
+			return append(seenWrites, uniqueSeenWrite{field: acc.Name, key: single}), nil
 		}
-		return seenWrites, fmt.Errorf("%w: value for field %v already exists", ErrUniqueViolation, acc.name)
+		return seenWrites, fmt.Errorf("%w: value for field %v already exists", ErrUniqueViolation, acc.Name)
 	}
 
 	iter := ids.Iter()
@@ -117,13 +118,13 @@ func (qe *queryEngine) checkUniqueBatchCandidateAndCollectSeen(
 		if lv.Contains(other) {
 			continue
 		}
-		return seenWrites, fmt.Errorf("%w: value for field %v already exists", ErrUniqueViolation, acc.name)
+		return seenWrites, fmt.Errorf("%w: value for field %v already exists", ErrUniqueViolation, acc.Name)
 	}
-	return append(seenWrites, uniqueSeenWrite{field: acc.name, key: single}), nil
+	return append(seenWrites, uniqueSeenWrite{field: acc.Name, key: single}), nil
 }
 
 func (qe *queryEngine) checkUniqueBatchAppend(state uniqueBatchCheckState, idx uint64, oldVal, newVal unsafe.Pointer) error {
-	if len(qe.uniqueFieldAccessors) == 0 {
+	if len(qe.schema.Unique) == 0 {
 		return nil
 	}
 	var (
@@ -132,23 +133,23 @@ func (qe *queryEngine) checkUniqueBatchAppend(state uniqueBatchCheckState, idx u
 	)
 	if oldVal != nil {
 		if newVal == nil {
-			for _, acc := range qe.uniqueFieldAccessors {
-				single, ok, isNil := acc.uniqueGetter(oldVal)
+			for _, acc := range qe.schema.Unique {
+				single, ok, isNil := acc.UniqueGetter(oldVal)
 				if !ok || isNil {
 					continue
 				}
-				touched = appendUniqueBatchLeavingTouch(state, touched, acc.name, single, idx)
+				touched = appendUniqueBatchLeavingTouch(state, touched, acc.Name, single, idx)
 			}
 		} else {
-			for _, acc := range qe.uniqueFieldAccessors {
-				if acc.modified == nil || !acc.modified(oldVal, newVal) {
+			for _, acc := range qe.schema.Unique {
+				if !acc.Modified(oldVal, newVal) {
 					continue
 				}
-				single, ok, isNil := acc.uniqueGetter(oldVal)
+				single, ok, isNil := acc.UniqueGetter(oldVal)
 				if !ok || isNil {
 					continue
 				}
-				touched = appendUniqueBatchLeavingTouch(state, touched, acc.name, single, idx)
+				touched = appendUniqueBatchLeavingTouch(state, touched, acc.Name, single, idx)
 			}
 		}
 	}
@@ -163,7 +164,7 @@ func (qe *queryEngine) checkUniqueBatchAppend(state uniqueBatchCheckState, idx u
 	)
 
 	if oldVal == nil {
-		for _, acc := range qe.uniqueFieldAccessors {
+		for _, acc := range qe.schema.Unique {
 			var err error
 			seenWrites, err = qe.checkUniqueBatchCandidateAndCollectSeen(state, idx, acc, newVal, seenWrites)
 			if err != nil {
@@ -172,8 +173,8 @@ func (qe *queryEngine) checkUniqueBatchAppend(state uniqueBatchCheckState, idx u
 			}
 		}
 	} else {
-		for _, acc := range qe.uniqueFieldAccessors {
-			if acc.modified == nil || !acc.modified(oldVal, newVal) {
+		for _, acc := range qe.schema.Unique {
+			if !acc.Modified(oldVal, newVal) {
 				continue
 			}
 			var err error
@@ -225,7 +226,7 @@ func collapseUniqueWriteMulti(idxs []uint64, oldVals, newVals []unsafe.Pointer, 
 }
 
 func (qe *queryEngine) checkUniqueOnWriteMulti(idxs []uint64, oldVals, newVals []unsafe.Pointer) error {
-	if len(idxs) == 0 || len(qe.uniqueFieldAccessors) == 0 {
+	if len(idxs) == 0 || len(qe.schema.Unique) == 0 {
 		return nil
 	}
 
@@ -253,15 +254,15 @@ func (qe *queryEngine) checkUniqueOnWriteMulti(idxs []uint64, oldVals, newVals [
 		// On delete (newVal == nil), the record releases all unique scalar values.
 		// On update, only modified unique fields can release previous values.
 		if newVal == nil {
-			for _, acc := range qe.uniqueFieldAccessors {
-				single, ok, isNil := acc.uniqueGetter(oldVal)
+			for _, acc := range qe.schema.Unique {
+				single, ok, isNil := acc.UniqueGetter(oldVal)
 				if !ok || isNil {
 					continue
 				}
-				m := leaving[acc.name]
+				m := leaving[acc.Name]
 				if m == nil {
 					m = uniqueLeavingInnerPool.Get()
-					leaving[acc.name] = m
+					leaving[acc.Name] = m
 				}
 				ids := m[single]
 				ids = ids.BuildAdded(idx)
@@ -270,18 +271,18 @@ func (qe *queryEngine) checkUniqueOnWriteMulti(idxs []uint64, oldVals, newVals [
 			continue
 		}
 
-		for _, acc := range qe.uniqueFieldAccessors {
-			if acc.modified == nil || !acc.modified(oldVal, newVal) {
+		for _, acc := range qe.schema.Unique {
+			if !acc.Modified(oldVal, newVal) {
 				continue
 			}
-			single, ok, isNil := acc.uniqueGetter(oldVal)
+			single, ok, isNil := acc.UniqueGetter(oldVal)
 			if !ok || isNil {
 				continue
 			}
-			m := leaving[acc.name]
+			m := leaving[acc.Name]
 			if m == nil {
 				m = uniqueLeavingInnerPool.Get()
-				leaving[acc.name] = m
+				leaving[acc.Name] = m
 			}
 			ids := m[single]
 			ids = ids.BuildAdded(idx)
@@ -301,7 +302,7 @@ func (qe *queryEngine) checkUniqueOnWriteMulti(idxs []uint64, oldVals, newVals [
 		}
 
 		if oldVals[i] == nil {
-			for _, acc := range qe.uniqueFieldAccessors {
+			for _, acc := range qe.schema.Unique {
 				if err := qe.checkUniqueBatchCandidate(idx, newVal, acc, seen, leaving); err != nil {
 					return err
 				}
@@ -309,8 +310,8 @@ func (qe *queryEngine) checkUniqueOnWriteMulti(idxs []uint64, oldVals, newVals [
 			continue
 		}
 
-		for _, acc := range qe.uniqueFieldAccessors {
-			if acc.modified == nil || !acc.modified(oldVals[i], newVal) {
+		for _, acc := range qe.schema.Unique {
+			if !acc.Modified(oldVals[i], newVal) {
 				continue
 			}
 			if err := qe.checkUniqueBatchCandidate(idx, newVal, acc, seen, leaving); err != nil {
@@ -324,32 +325,32 @@ func (qe *queryEngine) checkUniqueOnWriteMulti(idxs []uint64, oldVals, newVals [
 func (qe *queryEngine) checkUniqueBatchCandidate(
 	idx uint64,
 	ptr unsafe.Pointer,
-	acc indexedFieldAccessor,
+	acc schema.IndexedFieldAccessor,
 	seen map[string]map[keycodec.IndexLookupKey]uint64,
 	leaving map[string]map[keycodec.IndexLookupKey]posting.List,
 ) error {
-	single, ok, isNil := acc.uniqueGetter(ptr)
+	single, ok, isNil := acc.UniqueGetter(ptr)
 	if !ok || isNil {
 		return nil
 	}
 
-	sm := seen[acc.name]
+	sm := seen[acc.Name]
 	if sm == nil {
 		sm = uniqueSeenInnerPool.Get()
-		seen[acc.name] = sm
+		seen[acc.Name] = sm
 	}
 	if prev, ok := sm[single]; ok && prev != idx {
-		return fmt.Errorf("%w: duplicate value for field %v within batch", ErrUniqueViolation, acc.name)
+		return fmt.Errorf("%w: duplicate value for field %v within batch", ErrUniqueViolation, acc.Name)
 	}
 	sm[single] = idx
 
-	ids := qe.getSnapshot().fieldLookupPostingRetainedKey(acc.name, single)
+	ids := qe.getSnapshot().fieldLookupPostingRetainedKey(acc.Name, single)
 	if ids.IsEmpty() {
 		return nil
 	}
 
 	var lv posting.List
-	if fm := leaving[acc.name]; fm != nil {
+	if fm := leaving[acc.Name]; fm != nil {
 		lv = fm[single]
 	}
 
@@ -357,7 +358,7 @@ func (qe *queryEngine) checkUniqueBatchCandidate(
 		if ids.Cardinality() == 1 && ids.Contains(idx) {
 			return nil
 		}
-		return fmt.Errorf("%w: value for field %v already exists", ErrUniqueViolation, acc.name)
+		return fmt.Errorf("%w: value for field %v already exists", ErrUniqueViolation, acc.Name)
 	}
 
 	iter := ids.Iter()
@@ -370,7 +371,7 @@ func (qe *queryEngine) checkUniqueBatchCandidate(
 		if lv.Contains(other) {
 			continue
 		}
-		return fmt.Errorf("%w: value for field %v already exists", ErrUniqueViolation, acc.name)
+		return fmt.Errorf("%w: value for field %v already exists", ErrUniqueViolation, acc.Name)
 	}
 	return nil
 }

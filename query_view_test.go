@@ -14,6 +14,7 @@ import (
 	"github.com/vapstack/rbi/internal/pooled"
 	"github.com/vapstack/rbi/internal/posting"
 	"github.com/vapstack/rbi/internal/qir"
+	"github.com/vapstack/rbi/internal/schema"
 )
 
 func (qe *queryEngine) currentQueryViewForTests() *queryView {
@@ -26,7 +27,6 @@ func (qe *queryEngine) currentQueryViewForTests() *queryView {
 			snap:              snap,
 			strKey:            snap.strmap != nil,
 			strMapView:        snap.strmap,
-			fields:            qe.fields,
 			planner:           qe.planner,
 			lenZeroComplement: snap.lenZeroComplement,
 		}
@@ -44,7 +44,6 @@ func (qe *queryEngine) currentQueryViewForTests() *queryView {
 		snap:              snap,
 		strKey:            snap.strmap != nil,
 		strMapView:        snap.strmap,
-		fields:            qe.fields,
 		planner:           qe.planner,
 		lenZeroComplement: snap.lenZeroComplement,
 	}
@@ -117,7 +116,7 @@ func prepareTestQuery(qe *queryEngine, q *qx.QX) (*qir.Query, qir.Shape, error) 
 	if qe == nil {
 		prepared, err = qir.PrepareQueryNoResolve(q)
 	} else {
-		prepared, err = qir.PrepareQuery(q, qe.indexedFieldMap)
+		prepared, err = qir.PrepareQuery(q, qe.schema.IndexedByName)
 	}
 	if err != nil {
 		return nil, qir.Shape{}, err
@@ -133,7 +132,7 @@ func prepareTestExpr(qe *queryEngine, expr qx.Expr) (*qir.Query, qir.Expr, error
 	if qe == nil {
 		prepared, err = qir.PrepareCountExprsNoResolve(expr)
 	} else {
-		prepared, err = qir.PrepareCountExprsResolved(qe.indexedFieldMap, expr)
+		prepared, err = qir.PrepareCountExprsResolved(qe.schema.IndexedByName, expr)
 	}
 	if err != nil {
 		return nil, qir.Expr{}, err
@@ -419,7 +418,7 @@ func (qe *queryEngine) materializedPredCacheKey(e qx.Expr) string {
 	return qe.currentQueryViewForTests().materializedPredCacheKey(expr)
 }
 
-func (qe *queryEngine) buildPredRangeCandidateWithMode(e qx.Expr, fm *field, ov indexdata.FieldOverlay, allowMaterialize bool) (predicate, bool) {
+func (qe *queryEngine) buildPredRangeCandidateWithMode(e qx.Expr, fm *schema.Field, ov indexdata.FieldOverlay, allowMaterialize bool) (predicate, bool) {
 	prepared, expr, err := prepareTestExpr(qe, e)
 	if err != nil {
 		return predicate{}, false
@@ -550,7 +549,7 @@ func (qe *queryEngine) shouldUseCandidateOrder(o qx.Order, leaves []qx.Expr) boo
 	if o.Desc {
 		dir = qx.DESC
 	}
-	order, err := qir.PrepareQuery(qx.Query().SortBy(o.By, dir), qe.indexedFieldMap)
+	order, err := qir.PrepareQuery(qx.Query().SortBy(o.By, dir), qe.schema.IndexedByName)
 	if err != nil {
 		return false
 	}
@@ -725,10 +724,10 @@ func (qe *queryEngine) exprValueToIdxOwned(expr qx.Expr) ([]string, bool, bool, 
 	var (
 		prepared *qir.Query
 		compiled qir.Expr
-		fm       *field
+		fm       *schema.Field
 		err      error
 	)
-	if qv.engine == nil || len(qv.engine.indexedFieldAccess) == 0 {
+	if qv.engine == nil || len(qv.engine.schema.Indexed) == 0 {
 		prepared, err = qir.PrepareCountExprResolved(testExprFieldResolver{}, expr)
 		if err != nil {
 			return nil, false, false, err
@@ -739,7 +738,7 @@ func (qe *queryEngine) exprValueToIdxOwned(expr qx.Expr) ([]string, bool, bool, 
 		if err != nil {
 			return nil, false, false, err
 		}
-		fm = qv.fields[qv.engine.fieldNameByOrdinal(compiled.FieldOrdinal)]
+		fm = qv.engine.schema.Fields[qv.engine.fieldNameByOrdinal(compiled.FieldOrdinal)]
 	}
 	defer prepared.Release()
 
@@ -798,7 +797,7 @@ func (qe *queryEngine) exprValueToDistinctIdxOwned(expr qx.Expr) ([]string, bool
 		compiled qir.Expr
 		err      error
 	)
-	if qv.engine == nil || len(qv.engine.indexedFieldAccess) == 0 {
+	if qv.engine == nil || len(qv.engine.schema.Indexed) == 0 {
 		prepared, err = qir.PrepareCountExprResolved(testExprFieldResolver{}, expr)
 		if err != nil {
 			return nil, false, false, err
@@ -811,7 +810,7 @@ func (qe *queryEngine) exprValueToDistinctIdxOwned(expr qx.Expr) ([]string, bool
 		}
 	}
 	defer prepared.Release()
-	if qv.engine == nil || len(qv.engine.indexedFieldAccess) == 0 {
+	if qv.engine == nil || len(qv.engine.schema.Indexed) == 0 {
 		if compiled.Value == nil {
 			if compiled.Op == qir.OpIN {
 				return nil, true, false, nil

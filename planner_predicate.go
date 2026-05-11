@@ -10,6 +10,7 @@ import (
 	"github.com/vapstack/rbi/internal/pooled"
 	"github.com/vapstack/rbi/internal/posting"
 	"github.com/vapstack/rbi/internal/qir"
+	"github.com/vapstack/rbi/internal/schema"
 )
 
 type predicate struct {
@@ -958,7 +959,7 @@ func (qv *queryView) buildPredicateCandidate(e qir.Expr) (predicate, bool) {
 	}
 }
 
-func (qv *queryView) buildPredEqCandidate(e qir.Expr, fm *field, ov indexdata.FieldOverlay) (predicate, bool) {
+func (qv *queryView) buildPredEqCandidate(e qir.Expr, fm *schema.Field, ov indexdata.FieldOverlay) (predicate, bool) {
 	key, isSlice, isNil, err := qv.exprValueToLookupKey(qir.Expr{
 		Op:           e.Op,
 		FieldOrdinal: e.FieldOrdinal,
@@ -1070,7 +1071,7 @@ func (qv *queryView) buildPredEqCandidate(e qir.Expr, fm *field, ov indexdata.Fi
 	}, true
 }
 
-func (qv *queryView) buildPredInCandidate(e qir.Expr, fm *field, ov indexdata.FieldOverlay) (predicate, bool) {
+func (qv *queryView) buildPredInCandidate(e qir.Expr, fm *schema.Field, ov indexdata.FieldOverlay) (predicate, bool) {
 	if fm.Slice {
 		return predicate{}, false
 	}
@@ -1154,7 +1155,7 @@ func (qv *queryView) buildPredInCandidate(e qir.Expr, fm *field, ov indexdata.Fi
 	}, true
 }
 
-func (qv *queryView) buildPredHasCandidate(e qir.Expr, fm *field, ov indexdata.FieldOverlay) (predicate, bool) {
+func (qv *queryView) buildPredHasCandidate(e qir.Expr, fm *schema.Field, ov indexdata.FieldOverlay) (predicate, bool) {
 	if !fm.Slice {
 		return predicate{}, false
 	}
@@ -1279,7 +1280,7 @@ func (qv *queryView) buildPredHasCandidate(e qir.Expr, fm *field, ov indexdata.F
 	}, true
 }
 
-func (qv *queryView) buildPredHasAnyCandidate(e qir.Expr, fm *field, ov indexdata.FieldOverlay) (predicate, bool) {
+func (qv *queryView) buildPredHasAnyCandidate(e qir.Expr, fm *schema.Field, ov indexdata.FieldOverlay) (predicate, bool) {
 	if !fm.Slice {
 		return predicate{}, false
 	}
@@ -1440,11 +1441,11 @@ func (it *overlayRangeIter) Next() uint64 {
 	return it.curIt.Next()
 }
 
-func (qv *queryView) buildPredRangeCandidateWithMode(e qir.Expr, fm *field, ov indexdata.FieldOverlay, allowMaterialize bool) (predicate, bool) {
+func (qv *queryView) buildPredRangeCandidateWithMode(e qir.Expr, fm *schema.Field, ov indexdata.FieldOverlay, allowMaterialize bool) (predicate, bool) {
 	return qv.buildPredRangeCandidateWithColdMode(e, fm, ov, allowMaterialize, false)
 }
 
-func (qv *queryView) buildPredRangeCandidateWithColdMode(e qir.Expr, fm *field, ov indexdata.FieldOverlay, allowMaterialize bool, lazyColdMaterialize bool) (predicate, bool) {
+func (qv *queryView) buildPredRangeCandidateWithColdMode(e qir.Expr, fm *schema.Field, ov indexdata.FieldOverlay, allowMaterialize bool, lazyColdMaterialize bool) (predicate, bool) {
 	return qv.buildPredRangeCandidateWithColdModeAndWarmLoad(
 		e,
 		fm,
@@ -1457,7 +1458,7 @@ func (qv *queryView) buildPredRangeCandidateWithColdMode(e qir.Expr, fm *field, 
 
 func (qv *queryView) buildPredRangeCandidateWithColdModeAndWarmLoad(
 	e qir.Expr,
-	fm *field,
+	fm *schema.Field,
 	ov indexdata.FieldOverlay,
 	allowMaterialize bool,
 	lazyColdMaterialize bool,
@@ -1558,7 +1559,7 @@ func (qv *queryView) materializedPredKeyForScalar(field string, op qir.Op, key s
 	if qv.snap.matPredCacheMaxEntries <= 0 {
 		return materializedPredKey{}
 	}
-	if fm := qv.fields[field]; fieldUsesOrderedNumericKeys(fm) && len(key) == 8 {
+	if fm := qv.engine.schema.Fields[field]; schema.FieldUsesOrderedNumericKeys(fm) && len(key) == 8 {
 		return materializedPredKeyForNumericScalar(field, op, keycodec.FromFixed8String(key))
 	}
 	return materializedPredKeyForScalar(field, op, key)
@@ -1572,7 +1573,7 @@ func (qv *queryView) materializedPredComplementKeyForScalar(field string, op qir
 	if qv.snap.matPredCacheMaxEntries <= 0 {
 		return materializedPredKey{}
 	}
-	if fm := qv.fields[field]; fieldUsesOrderedNumericKeys(fm) && len(key) == 8 {
+	if fm := qv.engine.schema.Fields[field]; schema.FieldUsesOrderedNumericKeys(fm) && len(key) == 8 {
 		return materializedPredComplementKeyForNumericScalar(field, op, keycodec.FromFixed8String(key))
 	}
 	return materializedPredComplementKeyForScalar(field, op, key)
@@ -3191,7 +3192,7 @@ func (qv *queryView) isPositiveOrderedNumericRangeLeaf(e qir.Expr, orderField st
 		return false
 	}
 	fm := qv.fieldMetaByExpr(e)
-	return fieldUsesOrderedNumericKeys(fm)
+	return schema.FieldUsesOrderedNumericKeys(fm)
 }
 
 func (qv *queryView) buildMergedNumericRangePredicate(e qir.Expr, bounds indexdata.Bounds, allowMaterialize bool) (predicate, bool) {
@@ -3561,8 +3562,8 @@ type rangePostingFilterProbe interface {
 	appendIntersectingPosting(posting.List, postingUnionBuilder) postingUnionBuilder
 }
 
-func shouldUseNumericRangePostingFilter(e qir.Expr, fm *field) bool {
-	if !fieldUsesOrderedNumericKeys(fm) || !isNumericRangeOp(e.Op) {
+func shouldUseNumericRangePostingFilter(e qir.Expr, fm *schema.Field) bool {
+	if !schema.FieldUsesOrderedNumericKeys(fm) || !isNumericRangeOp(e.Op) {
 		return false
 	}
 	return true

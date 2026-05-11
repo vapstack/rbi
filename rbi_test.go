@@ -426,30 +426,6 @@ func TestIndexTags_OptInSupportRBIOnlyAndIgnoresDBI(t *testing.T) {
 		t.Fatal("expected indexed mode")
 	}
 
-	for _, f := range []string{
-		"rbi_index",
-		"rbi_unique",
-		"rbi_wins_non_unique",
-		"rbi_wins_unique",
-		"rbi_wins_enabled",
-	} {
-		if _, ok := db.engine.fields[f]; !ok {
-			t.Fatalf("expected indexed field %q", f)
-		}
-	}
-	if _, ok := db.engine.fields["untagged"]; ok {
-		t.Fatal("untagged field must stay non-indexed")
-	}
-	if _, ok := db.engine.fields["db_default"]; ok {
-		t.Fatal("dbi default must be ignored")
-	}
-	if _, ok := db.engine.fields["db_unique"]; ok {
-		t.Fatal("dbi unique must be ignored")
-	}
-	if _, ok := db.engine.fields["rbi_wins_disabled"]; ok {
-		t.Fatal("rbi disable must ignore dbi")
-	}
-
 	if err := db.Set(1, &optInTaggedRec{
 		DBDefault:        "db-default-1",
 		DBUnique:         10,
@@ -495,6 +471,11 @@ func TestIndexTags_OptInSupportRBIOnlyAndIgnoresDBI(t *testing.T) {
 		}
 		if !slices.Equal(ids, tc.want) {
 			t.Fatalf("QueryKeys(%s)=%v want %v", tc.field, ids, tc.want)
+		}
+	}
+	for _, field := range []string{"untagged", "db_default", "db_unique", "rbi_wins_disabled"} {
+		if _, err := db.QueryKeys(qx.Query(qx.EQ(field, "ignored"))); err == nil {
+			t.Fatalf("QueryKeys(%s) must fail for non-indexed field", field)
 		}
 	}
 
@@ -619,9 +600,6 @@ func TestIndexTags_RBIIndexIgnoresDBIDisable(t *testing.T) {
 	if db.engine == nil {
 		t.Fatal("expected indexed mode")
 	}
-	if _, ok := db.engine.fields["name"]; !ok {
-		t.Fatal("expected name to be indexed")
-	}
 
 	if err := db.Set(1, &rbiIndexIgnoresDBIDisableRec{Name: "alice"}); err != nil {
 		t.Fatalf("Set(1): %v", err)
@@ -647,12 +625,6 @@ func TestIndexTags_EmbeddedParentIndexDoesNotEnableSharedFields(t *testing.T) {
 	if db.engine == nil {
 		t.Fatal("expected indexed mode because embedded Email has its own unique tag")
 	}
-	if _, ok := db.engine.fields["name"]; ok {
-		t.Fatal("embedded parent index tag must not enable untagged child field")
-	}
-	if _, ok := db.engine.fields["email"]; !ok {
-		t.Fatal("embedded child field with its own tag must stay indexed")
-	}
 
 	if err := db.Set(1, &embeddedEnabledByParentRec{
 		EmbeddedSharedFields: EmbeddedSharedFields{Name: "alice", Email: "alice@example.com"},
@@ -663,6 +635,9 @@ func TestIndexTags_EmbeddedParentIndexDoesNotEnableSharedFields(t *testing.T) {
 		EmbeddedSharedFields: EmbeddedSharedFields{Name: "bob", Email: "alice@example.com"},
 	}); !errors.Is(err, ErrUniqueViolation) {
 		t.Fatalf("duplicate embedded unique err=%v want %v", err, ErrUniqueViolation)
+	}
+	if _, err := db.QueryKeys(qx.Query(qx.EQ("name", "alice"))); err == nil {
+		t.Fatal("embedded parent index tag must not enable untagged child field")
 	}
 }
 
@@ -703,13 +678,6 @@ func TestIndexTags_DBTagDashDoesNotDisableIndexing(t *testing.T) {
 	if db.engine == nil {
 		t.Fatal("expected indexed mode")
 	}
-	f, ok := db.engine.fields["Name"]
-	if !ok {
-		t.Fatal("expected field to be indexed under Go field name")
-	}
-	if f.DBName != "Name" {
-		t.Fatalf("unexpected DBName: got=%q want=%q", f.DBName, "Name")
-	}
 
 	if err := db.Set(1, &dbDashDoesNotDisableIndexRec{Name: "alice"}); err != nil {
 		t.Fatalf("Set(1): %v", err)
@@ -749,26 +717,6 @@ func TestIndexOptions_OverrideTagsAndResolveGoAndDBNames(t *testing.T) {
 	if db.engine == nil {
 		t.Fatal("expected indexed mode")
 	}
-	if _, ok := db.engine.fields["name"]; !ok {
-		t.Fatal("Options.Index must accept Go field name")
-	}
-	if _, ok := db.engine.fields["score_db"]; !ok {
-		t.Fatal("Options.Index must accept db field name")
-	}
-	if _, ok := db.engine.fields["email"]; ok {
-		t.Fatal("Options.Index must ignore rbi tags when map is non-nil")
-	}
-	if _, ok := db.engine.fields["amount"]; ok {
-		t.Fatal("measure field must not be registered as ordinary index")
-	}
-	if _, ok := db.engine.measureFields["amount"]; !ok {
-		t.Fatal("Options.Index measure field is missing")
-	}
-	if acc, ok := db.engine.measureFieldMap["amount"]; !ok {
-		t.Fatal("Options.Index measure accessor is missing")
-	} else if acc.kind != measureValueSigned {
-		t.Fatalf("measure accessor kind=%d want signed", acc.kind)
-	}
 
 	if err := db.Set(1, &optionsIndexRec{Name: "alice", Email: "ignored", Score: 10, Amount: 100}); err != nil {
 		t.Fatalf("Set(1): %v", err)
@@ -776,6 +724,21 @@ func TestIndexOptions_OverrideTagsAndResolveGoAndDBNames(t *testing.T) {
 	if err := db.Set(2, &optionsIndexRec{Name: "bob", Email: "ignored", Score: 10, Amount: 200}); !errors.Is(err, ErrUniqueViolation) {
 		t.Fatalf("duplicate unique from Options.Index err=%v want %v", err, ErrUniqueViolation)
 	}
+	ids, err := db.QueryKeys(qx.Query(qx.EQ("name", "alice")))
+	if err != nil {
+		t.Fatalf("QueryKeys(name): %v", err)
+	}
+	if !slices.Equal(ids, []uint64{1}) {
+		t.Fatalf("QueryKeys(name)=%v want [1]", ids)
+	}
+	if _, err := db.QueryKeys(qx.Query(qx.EQ("email", "ignored"))); err == nil {
+		t.Fatal("non-nil Options.Index must ignore rbi tag on email")
+	}
+	result, err := db.Aggregate(qx.Aggregate(qx.SUM("amount").AS("amount_sum")))
+	if err != nil {
+		t.Fatalf("Aggregate amount: %v", err)
+	}
+	requireAggregateInt(t, result.Rows[0][0], 100)
 }
 
 func TestIndexOptions_DBTagsResolveWhenEmbeddedGoNamesCollide(t *testing.T) {
@@ -799,11 +762,25 @@ func TestIndexOptions_DBTagsResolveWhenEmbeddedGoNamesCollide(t *testing.T) {
 		_ = db.Close()
 		_ = rawDBTags.Close()
 	})
-	if _, ok := db.engine.fields["left_id"]; !ok {
-		t.Fatal("Options.Index must accept left db tag despite colliding Go names")
+	if err := db.Set(1, &optionsIndexEmbeddedCollisionRec{
+		OptionsIndexLeftEmbeddedRec:  OptionsIndexLeftEmbeddedRec{ID: 10},
+		OptionsIndexRightEmbeddedRec: OptionsIndexRightEmbeddedRec{ID: 20},
+	}); err != nil {
+		t.Fatalf("Set db-tag collision record: %v", err)
 	}
-	if _, ok := db.engine.fields["right_id"]; !ok {
-		t.Fatal("Options.Index must accept right db tag despite colliding Go names")
+	ids, err := db.QueryKeys(qx.Query(qx.EQ("left_id", 10)))
+	if err != nil {
+		t.Fatalf("QueryKeys(left_id): %v", err)
+	}
+	if !slices.Equal(ids, []uint64{1}) {
+		t.Fatalf("QueryKeys(left_id)=%v want [1]", ids)
+	}
+	ids, err = db.QueryKeys(qx.Query(qx.EQ("right_id", 20)))
+	if err != nil {
+		t.Fatalf("QueryKeys(right_id): %v", err)
+	}
+	if !slices.Equal(ids, []uint64{1}) {
+		t.Fatalf("QueryKeys(right_id)=%v want [1]", ids)
 	}
 
 	rawGoName, err := bbolt.Open(filepath.Join(dir, "options_embedded_go_name.db"), 0o600, nil)
@@ -958,60 +935,49 @@ func TestIndexTags_MeasureMetadataIsSeparateFromOrdinaryIndex(t *testing.T) {
 	if db.engine == nil {
 		t.Fatal("measure DB must not be transparent")
 	}
-	if _, ok := db.engine.fields["status"]; !ok {
-		t.Fatal("ordinary indexed field is missing")
-	}
-	if _, ok := db.engine.fields["amount"]; ok {
-		t.Fatal("measure field must not be visible to ordinary indexes")
-	}
-	if _, ok := db.engine.measureFields["amount"]; !ok {
-		t.Fatal("measure field is missing")
-	}
-	if acc, ok := db.engine.measureFieldMap["amount"]; !ok {
-		t.Fatal("measure accessor is missing")
-	} else if acc.ordinal != 0 {
-		t.Fatalf("measure accessor ordinal=%d want 0", acc.ordinal)
-	}
 	if err := db.Set(1, &measureTaggedRec{Status: "ok", Amount: 42}); err != nil {
 		t.Fatalf("Set measure record: %v", err)
 	}
-	acc := db.engine.measureFieldMap["amount"]
-	if got, ok := db.engine.getSnapshot().measure[acc.ordinal].Lookup(1); !ok || got != 42 {
-		t.Fatalf("measure storage lookup=(%d,%v) want (42,true)", got, ok)
-	}
+	requireMeasureTaggedSum(t, db, 42)
 	if err := db.Set(2, &measureTaggedRec{Status: "ok", Amount: 100}); err != nil {
 		t.Fatalf("Set second measure record: %v", err)
 	}
-	if got, ok := db.engine.getSnapshot().measure[acc.ordinal].Lookup(2); !ok || got != 100 {
-		t.Fatalf("measure storage lookup id=2=(%d,%v) want (100,true)", got, ok)
+	requireMeasureTaggedSum(t, db, 142)
+	ids, err := db.QueryKeys(qx.Query(qx.EQ("status", "ok")))
+	if err != nil {
+		t.Fatalf("QueryKeys(status): %v", err)
+	}
+	if !slices.Equal(ids, []uint64{1, 2}) {
+		t.Fatalf("QueryKeys(status)=%v want [1 2]", ids)
 	}
 	if err := db.Set(1, &measureTaggedRec{Status: "ok", Amount: 43}); err != nil {
 		t.Fatalf("Update measure record: %v", err)
 	}
-	if got, ok := db.engine.getSnapshot().measure[acc.ordinal].Lookup(1); !ok || got != 43 {
-		t.Fatalf("measure storage update lookup=(%d,%v) want (43,true)", got, ok)
-	}
+	requireMeasureTaggedSum(t, db, 143)
 	if err := db.Patch(2, []Field{{Name: "amount", Value: int64(55)}}); err != nil {
 		t.Fatalf("Patch measure record: %v", err)
 	}
-	if got, ok := db.engine.getSnapshot().measure[acc.ordinal].Lookup(2); !ok || got != 55 {
-		t.Fatalf("measure storage patch lookup=(%d,%v) want (55,true)", got, ok)
-	}
+	requireMeasureTaggedSum(t, db, 98)
 	if err := db.Delete(1); err != nil {
 		t.Fatalf("Delete measure record: %v", err)
 	}
-	if got, ok := db.engine.getSnapshot().measure[acc.ordinal].Lookup(1); ok {
-		t.Fatalf("deleted measure storage lookup=(%d,%v) want missing", got, ok)
-	}
+	requireMeasureTaggedSum(t, db, 55)
 	if err := db.RebuildIndex(); err != nil {
 		t.Fatalf("RebuildIndex: %v", err)
 	}
-	if got, ok := db.engine.getSnapshot().measure[acc.ordinal].Lookup(2); !ok || got != 55 {
-		t.Fatalf("rebuilt measure storage lookup=(%d,%v) want (55,true)", got, ok)
-	}
+	requireMeasureTaggedSum(t, db, 55)
 	if _, err := db.QueryKeys(qx.Query(qx.EQ("amount", int64(100)))); err == nil {
 		t.Fatal("measure field must not be queryable through ordinary planner")
 	}
+}
+
+func requireMeasureTaggedSum(t *testing.T, db *DB[uint64, measureTaggedRec], want int64) {
+	t.Helper()
+	result, err := db.Aggregate(qx.Aggregate(qx.SUM("amount").AS("amount_sum")))
+	if err != nil {
+		t.Fatalf("Aggregate amount: %v", err)
+	}
+	requireAggregateInt(t, result.Rows[0][0], want)
 }
 
 func TestIndexTags_MeasureOnlyDBKeepsSnapshotMode(t *testing.T) {
@@ -1034,28 +1000,26 @@ func TestIndexTags_MeasureOnlyDBKeepsSnapshotMode(t *testing.T) {
 	if db.engine == nil {
 		t.Fatal("measure-only DB must not be transparent")
 	}
-	if len(db.engine.fields) != 0 {
-		t.Fatalf("expected no ordinary fields, got %d", len(db.engine.fields))
-	}
-	if _, ok := db.engine.measureFields["amount"]; !ok {
-		t.Fatal("measure field is missing")
-	}
-	if len(db.engine.measureFieldAccess) != 1 {
-		t.Fatalf("measure accessor count=%d want 1", len(db.engine.measureFieldAccess))
-	}
 	if err := db.Set(1, &measureOnlyRec{Amount: 7}); err != nil {
 		t.Fatalf("Set measure-only record: %v", err)
 	}
-	acc := db.engine.measureFieldMap["amount"]
-	if got, ok := db.engine.getSnapshot().measure[acc.ordinal].Lookup(1); !ok || got != 7 {
-		t.Fatalf("measure-only storage lookup=(%d,%v) want (7,true)", got, ok)
-	}
+	requireMeasureOnlySum(t, db, 7)
 	if err := db.Set(1, &measureOnlyRec{Amount: 8}); err != nil {
 		t.Fatalf("Update measure-only record: %v", err)
 	}
-	if got, ok := db.engine.getSnapshot().measure[acc.ordinal].Lookup(1); !ok || got != 8 {
-		t.Fatalf("measure-only storage update lookup=(%d,%v) want (8,true)", got, ok)
+	requireMeasureOnlySum(t, db, 8)
+	if _, err := db.QueryKeys(qx.Query(qx.EQ("amount", int64(8)))); err == nil {
+		t.Fatal("measure-only field must not be queryable through ordinary planner")
 	}
+}
+
+func requireMeasureOnlySum(t *testing.T, db *DB[uint64, measureOnlyRec], want int64) {
+	t.Helper()
+	result, err := db.Aggregate(qx.Aggregate(qx.SUM("amount").AS("amount_sum")))
+	if err != nil {
+		t.Fatalf("Aggregate amount: %v", err)
+	}
+	requireAggregateInt(t, result.Rows[0][0], want)
 }
 
 func TestIndexTags_MeasureRejectsUnsupportedType(t *testing.T) {
@@ -5682,59 +5646,4 @@ func TestComponentAccessors(t *testing.T) {
 	if bs.Window <= 0 {
 		t.Fatalf("expected AutoBatchStats.Window > 0")
 	}
-}
-
-type stableOrdinalRec struct {
-	Z string `rbi:"index"`
-	A string `rbi:"index"`
-	M int    `rbi:"index"`
-}
-
-func TestInitIndexedFieldAccessors_AssignsStableSortedOrdinals(t *testing.T) {
-	db := &DB[uint64, stableOrdinalRec]{
-		vtype:   reflect.TypeFor[stableOrdinalRec](),
-		options: &Options{},
-		engine: &queryEngine{
-			fields: make(map[string]*field),
-		},
-	}
-	if err := db.populateFields(db.vtype, nil); err != nil {
-		t.Fatalf("populateFields: %v", err)
-	}
-	if err := db.engine.initIndexedFieldAccessors(db.vtype); err != nil {
-		t.Fatalf("initIndexedFieldAccessors: %v", err)
-	}
-
-	got := make([]string, len(db.engine.indexedFieldAccess))
-	for i, acc := range db.engine.indexedFieldAccess {
-		got[i] = acc.name
-		if acc.ordinal != i {
-			t.Fatalf("expected ordinal %d for %q, got %d", i, acc.name, acc.ordinal)
-		}
-	}
-
-	want := []string{"A", "M", "Z"}
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("unexpected field ordinal order:\n got=%v\nwant=%v", got, want)
-	}
-}
-
-func (db *DB[K, V]) populateFields(t reflect.Type, idx []int) error {
-	collector := fieldCollector{
-		options: db.options,
-	}
-	if db.engine != nil {
-		collector.indexFields = db.engine.fields
-		collector.measureFields = db.engine.measureFields
-		collector.hasUnique = db.engine.hasUnique
-	}
-	if err := collector.populateFields(t, idx); err != nil {
-		return err
-	}
-	if db.engine != nil {
-		db.engine.fields = collector.indexFields
-		db.engine.measureFields = collector.measureFields
-		db.engine.hasUnique = collector.hasUnique
-	}
-	return nil
 }

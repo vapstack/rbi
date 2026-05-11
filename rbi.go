@@ -19,6 +19,7 @@ import (
 	"github.com/vapstack/rbi/internal/keycodec"
 	"github.com/vapstack/rbi/internal/pooled"
 	"github.com/vapstack/rbi/internal/posting"
+	"github.com/vapstack/rbi/internal/schema"
 	"github.com/vapstack/rbi/internal/strmap"
 	"go.etcd.io/bbolt"
 )
@@ -399,7 +400,19 @@ func New[K ~uint64 | ~string, V any](bolt *bbolt.DB, options Options, execOpts .
 		db.strKey = true
 	}
 
-	db.engine, db.strMap, err = newQueryEngineForType(vtype, db.options, db.strKey, calPath)
+	var schemaIndex map[string]schema.IndexKind
+	if options.Index != nil {
+		schemaIndex = make(map[string]schema.IndexKind, len(options.Index))
+		for name, kind := range options.Index {
+			schemaIndex[name] = schema.IndexKind(kind)
+		}
+	}
+	db.schema, err = schema.Compile(vtype, schema.Config{Index: schemaIndex})
+	if err != nil {
+		return nil, err
+	}
+
+	db.engine, db.strMap, err = newQueryEngineForRuntime(db.schema, db.options, db.strKey, calPath)
 	if err != nil {
 		return nil, err
 	}
@@ -441,7 +454,7 @@ func New[K ~uint64 | ~string, V any](bolt *bbolt.DB, options Options, execOpts .
 
 		loadedOrdinaryFieldCount = len(skipFields)
 		loadedFieldCount = loadedOrdinaryFieldCount + len(skipMeasureFields)
-		totalFieldCount := len(db.engine.fields) + len(db.engine.measureFields)
+		totalFieldCount := len(db.schema.Fields) + len(db.schema.MeasureFields)
 		if rebuildReason != "" {
 			buildMode = "full"
 			db.logger.Printf("rbi: %s", rebuildReason)
@@ -475,20 +488,15 @@ func New[K ~uint64 | ~string, V any](bolt *bbolt.DB, options Options, execOpts .
 		}
 	}
 
-	db.patchMap = make(map[string]*field)
-	if err = populatePatcher(db.patchMap, vtype, nil); err != nil {
-		return nil, fmt.Errorf("failed to populate patch fields: %w", err)
-	}
-	db.patchFieldAccess, db.patchFieldOrdinal = initPatchFieldAccessors(vtype, db.patchMap, db.engine)
 	db.initBatcher()
 
 	if db.engine != nil {
-		db.stats.FieldCount = len(db.engine.fields) + len(db.engine.measureFields)
+		db.stats.FieldCount = len(db.schema.Fields) + len(db.schema.MeasureFields)
 		if err = db.engine.publishCurrentSequenceSnapshotNoLock(db.bolt, db.bucket, db.strMap); err != nil {
 			return nil, fmt.Errorf("failed to publish initial snapshot: %w", err)
 		}
 
-		if loadedPlannerStats != nil && loadedOrdinaryFieldCount == len(db.engine.fields) {
+		if loadedPlannerStats != nil && loadedOrdinaryFieldCount == len(db.schema.Fields) {
 			db.engine.publishLoadedPlannerStats(loadedPlannerStats, db.engine.getSnapshot())
 
 		} else {
@@ -507,15 +515,8 @@ func New[K ~uint64 | ~string, V any](bolt *bbolt.DB, options Options, execOpts .
 	return db, nil
 }
 
-func newQueryEngineForType(vtype reflect.Type, options *Options, strKey bool, calPath string) (*queryEngine, *strmap.Mapper, error) {
-	collector := fieldCollector{
-		options: options,
-	}
-	if err := collector.populateFields(vtype, nil); err != nil {
-		return nil, nil, fmt.Errorf("failed to populate index fields: %w", err)
-	}
-
-	if len(collector.indexFields) == 0 && len(collector.measureFields) == 0 {
+func newQueryEngineForRuntime(rt *schema.Runtime, options *Options, strKey bool, calPath string) (*queryEngine, *strmap.Mapper, error) {
+	if !rt.HasQueryFields() {
 		return nil, nil, nil
 	}
 
@@ -525,9 +526,7 @@ func newQueryEngineForType(vtype reflect.Type, options *Options, strKey bool, ca
 	}
 
 	qe := &queryEngine{
-		fields:                         collector.indexFields,
-		measureFields:                  collector.measureFields,
-		hasUnique:                      collector.hasUnique,
+		schema:                         rt,
 		universe:                       posting.List{},
 		matPredCacheMaxEntries:         max(0, options.SnapshotMaterializedPredCacheMaxEntries),
 		matPredCacheMaxCard:            materializedPredCacheMaxCardinality(options.SnapshotMaterializedPredCacheMaxCardinality),
@@ -557,107 +556,15 @@ func newQueryEngineForType(vtype reflect.Type, options *Options, strKey bool, ca
 			Clear: true,
 		},
 	}
-	if err := qe.initIndexedFieldAccessors(vtype); err != nil {
-		return nil, nil, fmt.Errorf("failed to initialize field accessors: %w", err)
-	}
-	if err := qe.initMeasureFieldAccessors(vtype); err != nil {
-		return nil, nil, fmt.Errorf("failed to initialize measure field accessors: %w", err)
-	}
-	slotCount := len(qe.indexedFieldAccess)
+	slotCount := len(rt.Indexed)
 	qe.index = indexdata.GetFieldStorageSlice(slotCount)[:slotCount]
 	qe.nilIndex = indexdata.GetFieldStorageSlice(slotCount)[:slotCount]
 	qe.lenIndex = indexdata.GetFieldStorageSlice(slotCount)[:slotCount]
 	qe.lenZeroComplement = pooled.GetBoolSlice(slotCount)[:slotCount]
 	clear(qe.lenZeroComplement)
-	measureSlotCount := len(qe.measureFieldAccess)
+	measureSlotCount := len(rt.Measures)
 	qe.measure = indexdata.GetMeasureStorageSlice(measureSlotCount)[:measureSlotCount]
 	return qe, strMap, nil
-}
-
-func (qe *queryEngine) initIndexedFieldAccessors(vtype reflect.Type) error {
-	access, validationAccess, uniqueAccess, fieldMap, err := makeIndexedFieldAccessors(vtype, qe.fields)
-	qe.indexedFieldAccess = access
-	qe.indexedStringValidationAccess = validationAccess
-	qe.indexedFieldMap = fieldMap
-	qe.uniqueFieldAccessors = uniqueAccess
-	return err
-}
-
-func makeIndexedFieldAccessors(vtype reflect.Type, fields map[string]*field) (access, validationAccess, uniqueAccess []indexedFieldAccessor, fieldMap indexedFieldMap, err error) {
-	if len(fields) == 0 {
-		return nil, nil, nil, nil, nil
-	}
-
-	access = make([]indexedFieldAccessor, 0, len(fields))
-	validationAccess = make([]indexedFieldAccessor, 0, len(fields))
-	uniqueAccess = make([]indexedFieldAccessor, 0, 4)
-	fieldMap = make(indexedFieldMap, len(fields))
-
-	names := make([]string, 0, len(fields))
-	for name := range fields {
-		names = append(names, name)
-	}
-	slices.Sort(names)
-
-	for _, name := range names {
-		f := fields[name]
-		acc, err := makeIndexedFieldAccessor(vtype, f)
-		if err != nil {
-			return nil, nil, nil, nil, err
-		}
-		acc.ordinal = len(access)
-		access = append(access, acc)
-		if f.UseVI || f.Kind == reflect.String {
-			validationAccess = append(validationAccess, acc)
-		}
-		fieldMap[f.DBName] = acc
-		if f.Unique && !f.Slice {
-			uniqueAccess = append(uniqueAccess, acc)
-		}
-	}
-	return access, validationAccess, uniqueAccess, fieldMap, nil
-}
-
-func initPatchFieldAccessors(vtype reflect.Type, patchMap map[string]*field, engine *queryEngine) ([]patchFieldAccessor, map[string]int) {
-	access, ordinals := makePatchFieldAccessors(vtype, patchMap)
-	if engine == nil {
-		return access, ordinals
-	}
-	for i := range engine.indexedFieldAccess {
-		ordinal, ok := ordinals[engine.indexedFieldAccess[i].field.Name]
-		if !ok {
-			engine.indexedFieldAccess[i].patchOrdinal = -1
-			continue
-		}
-		engine.indexedFieldAccess[i].patchOrdinal = ordinal
-	}
-	return access, ordinals
-}
-
-func makePatchFieldAccessors(vtype reflect.Type, fields map[string]*field) ([]patchFieldAccessor, map[string]int) {
-	if len(fields) == 0 {
-		return nil, nil
-	}
-
-	access := make([]patchFieldAccessor, 0, len(fields))
-	ordinals := make(map[string]int, len(fields))
-
-	for patchKey, f := range fields {
-		if patchKey != f.Name {
-			continue
-		}
-
-		acc := patchFieldAccessor{field: f}
-		fieldType, offset := resolveFieldTypeAndOffset(vtype, f.Index)
-		acc.valueEqual = buildPatchValueEqualFn(f, fieldType, offset)
-		acc.copyValue = buildPatchValueCopyFn(f, fieldType, offset)
-
-		ordinal := len(access)
-		access = append(access, acc)
-		ordinals[f.Name] = ordinal
-	}
-
-	return access, ordinals
 }
 
 func (db *DB[K, V]) initBatcher() {
@@ -668,7 +575,7 @@ func (db *DB[K, V]) initBatcher() {
 		strKey:             db.strKey,
 		strMap:             db.strMap,
 		engine:             db.engine,
-		patchMap:           db.patchMap,
+		schema:             db.schema,
 		testHookAccessor:   func() *testHooks { return db.testHooks },
 		broken:             &db.broken,
 		logger:             db.logger,
@@ -856,25 +763,6 @@ type snapshotManager struct {
 	mu sync.RWMutex
 }
 
-type indexedFieldAccessor struct {
-	ordinal      int
-	patchOrdinal int
-	name         string
-	field        *field
-	uniqueGetter uniqueScalarGetterFn
-	writeBuild   buildFieldWriteAccessorFn
-	writeOverlay overlayFieldWriteAccessorFn
-	writeInsert  insertFieldWriteAccessorFn
-	writeScratch scratchFieldWriteAccessorFn
-	modified     fieldModifiedFn
-}
-
-type patchFieldAccessor struct {
-	field      *field
-	valueEqual patchValueEqualFn
-	copyValue  patchValueCopyFn
-}
-
 type autoBatchScheduler struct {
 	statsEnabled bool
 	window       time.Duration
@@ -965,9 +853,7 @@ type (
 		strKey bool
 		strMap *strmap.Mapper
 
-		patchMap          map[string]*field
-		patchFieldAccess  []patchFieldAccessor
-		patchFieldOrdinal map[string]int
+		schema *schema.Runtime
 
 		engine    *queryEngine // nil in transparent mode
 		rebuilder *rebuilder
@@ -992,9 +878,6 @@ type (
 
 		testHooks *testHooks
 	}
-
-	indexedFieldMap map[string]indexedFieldAccessor
-	measureFieldMap map[string]measureFieldAccessor
 
 	// PlannerStats contains planner snapshot metadata, per-field stats and sampling settings.
 	PlannerStats struct {
@@ -1239,14 +1122,6 @@ type (
 		PinnedRefs int
 	}
 )
-
-func (m indexedFieldMap) ResolveField(name string) (int, bool) {
-	acc, ok := m[name]
-	if !ok {
-		return 0, false
-	}
-	return acc.ordinal, true
-}
 
 // DisableSync disables fsync for bolt writes. Can help with batch inserts.
 // It should not be used during normal operation.
@@ -1560,7 +1435,7 @@ func (qe *queryEngine) indexStats(snap *indexSnapshot) IndexStats {
 		FieldApproxHeapBytes:   make(map[string]uint64),
 	}
 	sharedStructBytes := indexdata.FieldStorageSlotsApproxBytes(snap.index) + indexdata.FieldStorageSlotsApproxBytes(snap.nilIndex)
-	fieldCount := len(qe.indexedFieldAccess)
+	fieldCount := len(qe.schema.Indexed)
 	sharedStructPerField := uint64(0)
 	sharedStructRemainder := uint64(0)
 	if fieldCount > 0 {
@@ -1568,10 +1443,10 @@ func (qe *queryEngine) indexStats(snap *indexSnapshot) IndexStats {
 		sharedStructRemainder = sharedStructBytes % uint64(fieldCount)
 	}
 
-	for i, acc := range qe.indexedFieldAccess {
-		name := acc.name
-		fieldStats := snap.index[acc.ordinal].Stats(true)
-		nilStats := snap.nilIndex[acc.ordinal].Stats(false)
+	for i, acc := range qe.schema.Indexed {
+		name := acc.Name
+		fieldStats := snap.index[acc.Ordinal].Stats(true)
+		nilStats := snap.nilIndex[acc.Ordinal].Stats(false)
 
 		unique := fieldStats.Unique + nilStats.Unique
 		size := fieldStats.PostingBytes + nilStats.PostingBytes
@@ -1833,13 +1708,13 @@ func (db *DB[K, V]) Truncate() error {
 		return fmt.Errorf("advance bucket sequence: %w", err)
 	}
 
-	slotCount := len(db.engine.indexedFieldAccess)
+	slotCount := len(db.engine.schema.Indexed)
 	nextIndex := indexdata.GetFieldStorageSlice(slotCount)[:slotCount]
 	nextNilIndex := indexdata.GetFieldStorageSlice(slotCount)[:slotCount]
 	nextLenIndex := indexdata.GetFieldStorageSlice(slotCount)[:slotCount]
 	nextLenZeroComplement := pooled.GetBoolSlice(slotCount)[:slotCount]
 	clear(nextLenZeroComplement)
-	measureSlotCount := len(db.engine.measureFieldAccess)
+	measureSlotCount := len(db.engine.schema.Measures)
 	nextMeasure := indexdata.GetMeasureStorageSlice(measureSlotCount)[:measureSlotCount]
 	nextUniverse := posting.List{}
 	var nextStrMap *strmap.Snapshot
@@ -1853,7 +1728,7 @@ func (db *DB[K, V]) Truncate() error {
 		lenIndex:           nextLenIndex,
 		lenZeroComplement:  nextLenZeroComplement,
 		measure:            nextMeasure,
-		indexedFieldByName: db.engine.indexedFieldMap,
+		indexedFieldByName: db.engine.schema.IndexedByName,
 		universe:           nextUniverse,
 		strmap:             nextStrMap,
 	}

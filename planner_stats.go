@@ -122,11 +122,11 @@ func (s *indexSnapshot) universeCardinality() uint64 {
 }
 
 func (qe *queryEngine) collectPlannerFieldStatsFromOverlay(s *indexSnapshot, fieldName string) PlannerFieldStats {
-	acc, ok := qe.indexedFieldMap[fieldName]
-	if !ok || s.index == nil || acc.ordinal >= len(s.index) {
+	acc, ok := qe.schema.IndexedByName[fieldName]
+	if !ok || s.index == nil || acc.Ordinal >= len(s.index) {
 		return PlannerFieldStats{}
 	}
-	ov := indexdata.NewFieldOverlayStorage(s.index[acc.ordinal])
+	ov := indexdata.NewFieldOverlayStorage(s.index[acc.Ordinal])
 	if !ov.HasData() {
 		return PlannerFieldStats{}
 	}
@@ -374,12 +374,12 @@ func (qe *queryEngine) buildPlannerStatsSnapshot(snap *indexSnapshot, version ui
 }
 
 func (qe *queryEngine) sortedPlannerFieldNames() []string {
-	if len(qe.indexedFieldAccess) == 0 {
+	if len(qe.schema.Indexed) == 0 {
 		return nil
 	}
-	fields := make([]string, 0, len(qe.indexedFieldAccess))
-	for _, acc := range qe.indexedFieldAccess {
-		fields = append(fields, acc.name)
+	fields := make([]string, 0, len(qe.schema.Indexed))
+	for _, acc := range qe.schema.Indexed {
+		fields = append(fields, acc.Name)
 	}
 	sort.Strings(fields)
 	return fields
@@ -390,7 +390,7 @@ func (qe *queryEngine) publishLoadedPlannerStats(s *plannerStatsSnapshot, snap *
 		Version:             s.Version,
 		GeneratedAt:         s.GeneratedAt,
 		UniverseCardinality: snap.universeCardinality(),
-		Fields:              make(map[string]PlannerFieldStats, len(qe.indexedFieldAccess)),
+		Fields:              make(map[string]PlannerFieldStats, len(qe.schema.Indexed)),
 	}
 	if out.Version == 0 {
 		out.Version = 1

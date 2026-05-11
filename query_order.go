@@ -8,6 +8,7 @@ import (
 	"github.com/vapstack/rbi/internal/pooled"
 	"github.com/vapstack/rbi/internal/posting"
 	"github.com/vapstack/rbi/internal/qir"
+	"github.com/vapstack/rbi/internal/schema"
 )
 
 func shouldUseOnePassIntersectionPosting(a posting.List, b posting.List, need uint64, all bool) bool {
@@ -587,7 +588,7 @@ func (qv *queryView) queryOrderArrayPosScalarOverlay(result postingResult, field
 	return cursor.out, nil
 }
 
-func (qv *queryView) orderDataValues(v any, fm *field) ([]string, error) {
+func (qv *queryView) orderDataValues(v any, fm *schema.Field) ([]string, error) {
 	if vals, ok := v.([]string); ok {
 		return vals, nil
 	}
@@ -603,7 +604,7 @@ func (qv *queryView) orderDataValues(v any, fm *field) ([]string, error) {
 	}
 	collection := queryValueIsCollectionForField(rv, fm)
 	if !collection && rv.Kind() == reflect.Slice {
-		collection = !rv.Type().Implements(viType)
+		collection = !rv.Type().Implements(schema.ValueIndexerType)
 	}
 	if collection {
 		valsBuf, _, err := sliceValueToIdxStringBuf(rv, fm)

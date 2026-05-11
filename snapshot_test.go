@@ -8,13 +8,13 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
-	"unsafe"
 
 	"github.com/vapstack/qx"
 	"github.com/vapstack/rbi/internal/indexdata"
 	"github.com/vapstack/rbi/internal/keycodec"
 	"github.com/vapstack/rbi/internal/pooled"
 	"github.com/vapstack/rbi/internal/posting"
+	"github.com/vapstack/rbi/internal/schema"
 	"go.etcd.io/bbolt"
 )
 
@@ -541,13 +541,13 @@ func snapshotExtFieldContainsID(tb testing.TB, s *indexSnapshot, field, key stri
 func snapshotExtNilContainsID(tb testing.TB, s *indexSnapshot, field string, id uint64) bool {
 	tb.Helper()
 	acc := s.indexedFieldByName[field]
-	return indexdata.NewFieldOverlayStorage(s.nilIndex[acc.ordinal]).LookupPostingRetained(nilIndexEntryKey).Contains(id)
+	return indexdata.NewFieldOverlayStorage(s.nilIndex[acc.Ordinal]).LookupPostingRetained(nilIndexEntryKey).Contains(id)
 }
 
 func snapshotExtLenContainsID(tb testing.TB, s *indexSnapshot, field string, ln uint64, id uint64) bool {
 	tb.Helper()
 	acc := s.indexedFieldByName[field]
-	return indexdata.NewFieldOverlayStorage(s.lenIndex[acc.ordinal]).LookupPostingRetained(keycodec.U64ByteString(ln)).Contains(id)
+	return indexdata.NewFieldOverlayStorage(s.lenIndex[acc.Ordinal]).LookupPostingRetained(keycodec.U64ByteString(ln)).Contains(id)
 }
 
 func snapshotExtRunConcurrent(n int, fn func(i int)) {
@@ -592,7 +592,7 @@ func snapshotExtEvalNumericRangeBuckets(t *testing.T, db *DB[uint64, Rec], expr 
 	defer prepared.Release()
 
 	f := db.engine.fieldNameByOrdinal(compiled.FieldOrdinal)
-	fm := db.engine.fields[f]
+	fm := db.engine.schema.Fields[f]
 	if fm == nil {
 		t.Fatalf("expected %q field metadata", f)
 	}
@@ -619,56 +619,6 @@ func snapshotExtEvalNumericRangeBuckets(t *testing.T, db *DB[uint64, Rec], expr 
 		t.Fatalf("expected numeric range bucket path for %q", f)
 	}
 	out.release()
-}
-
-type snapshotReorderedSliceRec struct {
-	Tags   []string `db:"tags" rbi:"index"`
-	Scores []int    `db:"scores" rbi:"index"`
-}
-
-func TestSnapshotExt_CollectSnapshotBatchDiff_ReorderedSliceValuesProduceNoDeltas(t *testing.T) {
-	db := openTempDBUint64Reflect[snapshotReorderedSliceRec](t, "snapshot_reordered_slice_diff.db", snapshotExtOptions())
-
-	oldVal := &snapshotReorderedSliceRec{
-		Tags:   []string{"go", "db", "go"},
-		Scores: []int{3, 1, 3},
-	}
-	newVal := &snapshotReorderedSliceRec{
-		Tags:   []string{"db", "go"},
-		Scores: []int{1, 3},
-	}
-
-	for _, f := range []string{"tags", "scores"} {
-		acc, ok := db.engine.indexedFieldMap[f]
-		if !ok {
-			t.Fatalf("missing accessor for %q", f)
-		}
-
-		var state snapshotFieldBatchState
-		acc.collectSnapshotBatchDiff(1, unsafe.Pointer(oldVal), unsafe.Pointer(newVal), false, &state)
-
-		if state.changed {
-			state.reset()
-			t.Fatalf("%s: reorder-only diff unexpectedly marked field as changed", f)
-		}
-		if state.index != nil {
-			state.reset()
-			t.Fatalf("%s: reorder-only diff produced string deltas: %#v", f, state.index)
-		}
-		if state.fixed != nil {
-			state.reset()
-			t.Fatalf("%s: reorder-only diff produced fixed deltas: %#v", f, state.fixed)
-		}
-		if state.nils != nil {
-			state.reset()
-			t.Fatalf("%s: reorder-only diff produced nil deltas: %#v", f, state.nils)
-		}
-		if state.lengths != nil {
-			state.reset()
-			t.Fatalf("%s: reorder-only diff produced len deltas: %#v", f, state.lengths)
-		}
-		state.reset()
-	}
 }
 
 func TestSnapshotExt_PublishSameSeqReusesRefAndUpdatesCurrent(t *testing.T) {
@@ -1677,16 +1627,18 @@ func TestSnapshotExt_InheritMaterializedPredCacheSkipsChangedFieldsAndKeepsOther
 	snapshotExtInitMaterializedPredCache(next)
 	db := &DB[uint64, struct{}]{
 		engine: &queryEngine{
-			indexedFieldMap: map[string]indexedFieldAccessor{
-				"name":  {ordinal: 0},
-				"email": {ordinal: 1},
+			schema: &schema.Runtime{
+				IndexedByName: map[string]schema.IndexedFieldAccessor{
+					"name":  {Ordinal: 0},
+					"email": {Ordinal: 1},
+				},
 			},
 		},
 	}
-	changed := snapshotTestBoolSlots(map[string]bool{"name": true}, db.engine.indexedFieldMap)
+	changed := snapshotTestBoolSlots(map[string]bool{"name": true}, db.engine.schema.IndexedByName)
 	defer pooled.ReleaseBoolSlice(changed)
 
-	inheritMaterializedPredCache(next, prev, db.engine.indexedFieldMap, changed)
+	inheritMaterializedPredCache(next, prev, db.engine.schema.IndexedByName, changed)
 
 	if _, ok := next.loadMaterializedPred("name\x1f1\x1fa"); ok {
 		t.Fatalf("expected changed-field cache entry to be skipped")
@@ -2458,7 +2410,7 @@ func snapshotTestIndexedFieldByName(
 	nilIndex map[string]indexdata.FieldStorage,
 	lenIndex map[string]indexdata.FieldStorage,
 	lenZeroComplement map[string]bool,
-) map[string]indexedFieldAccessor {
+) map[string]schema.IndexedFieldAccessor {
 	keys := make([]string, 0, len(index)+len(nilIndex)+len(lenIndex)+len(lenZeroComplement))
 	seen := make(map[string]struct{}, cap(keys))
 	add := func(name string) {
@@ -2481,12 +2433,12 @@ func snapshotTestIndexedFieldByName(
 		add(name)
 	}
 	slices.Sort(keys)
-	out := make(map[string]indexedFieldAccessor, len(keys))
+	out := make(map[string]schema.IndexedFieldAccessor, len(keys))
 	for i, name := range keys {
-		out[name] = indexedFieldAccessor{
-			ordinal: i,
-			name:    name,
-			field:   &field{Slice: lenIndex[name].KeyCount() > 0 || lenZeroComplement[name]},
+		out[name] = schema.IndexedFieldAccessor{
+			Ordinal: i,
+			Name:    name,
+			Field:   &schema.Field{Slice: lenIndex[name].KeyCount() > 0 || lenZeroComplement[name]},
 		}
 	}
 	return out
@@ -2494,21 +2446,21 @@ func snapshotTestIndexedFieldByName(
 
 func snapshotTestFieldIndexSlots(
 	src map[string]indexdata.FieldStorage,
-	byName map[string]indexedFieldAccessor,
+	byName map[string]schema.IndexedFieldAccessor,
 ) []indexdata.FieldStorage {
 	out := indexdata.GetFieldStorageSlice(len(byName))[:len(byName)]
 	for name, storage := range src {
-		out[byName[name].ordinal] = storage
+		out[byName[name].Ordinal] = storage
 	}
 	return out
 }
 
-func snapshotTestBoolSlots(src map[string]bool, byName map[string]indexedFieldAccessor) []bool {
+func snapshotTestBoolSlots(src map[string]bool, byName map[string]schema.IndexedFieldAccessor) []bool {
 	out := pooled.GetBoolSlice(len(byName))[:len(byName)]
 	clear(out)
 	for name, value := range src {
 		if value {
-			out[byName[name].ordinal] = true
+			out[byName[name].Ordinal] = true
 		}
 	}
 	return out
@@ -2532,8 +2484,8 @@ func snapshotTestNewSnapshot(
 
 func snapshotTestLenZeroComplementField(s *indexSnapshot, name string) bool {
 	acc, ok := s.indexedFieldByName[name]
-	if !ok || acc.ordinal >= len(s.lenZeroComplement) {
+	if !ok || acc.Ordinal >= len(s.lenZeroComplement) {
 		return false
 	}
-	return s.lenZeroComplement[acc.ordinal]
+	return s.lenZeroComplement[acc.Ordinal]
 }

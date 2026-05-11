@@ -18,6 +18,7 @@ import (
 
 	"github.com/vapstack/rbi/internal/keycodec"
 	"github.com/vapstack/rbi/internal/pooled"
+	"github.com/vapstack/rbi/internal/schema"
 	"github.com/vmihailenco/msgpack/v5"
 	"go.etcd.io/bbolt"
 )
@@ -120,7 +121,8 @@ func (db *DB[K, V]) makePatch(oldVal, newVal *V, target []Field, useJSON bool) [
 	rvNew = reflect.ValueOf(newVal).Elem()
 
 	scratch := patchScratchPool.Get()
-	scratch.seen = slices.Grow(scratch.seen[:0], len(db.patchFieldAccess))[:len(db.patchFieldAccess)]
+	patchAccess := db.schema.Patch.Access
+	scratch.seen = slices.Grow(scratch.seen[:0], len(patchAccess))[:len(patchAccess)]
 	defer patchScratchPool.Put(scratch)
 
 	newPtr := unsafe.Pointer(newVal)
@@ -129,22 +131,22 @@ func (db *DB[K, V]) makePatch(oldVal, newVal *V, target []Field, useJSON bool) [
 		oldPtr = unsafe.Pointer(oldVal)
 	}
 
-	db.forEachModifiedIndexedField(oldVal, newVal, func(acc indexedFieldAccessor) bool {
-		if acc.patchOrdinal < 0 {
+	db.forEachModifiedIndexedField(oldVal, newVal, func(acc schema.IndexedFieldAccessor) bool {
+		if acc.PatchOrdinal < 0 {
 			return true
 		}
-		patchAcc := db.patchFieldAccess[acc.patchOrdinal]
+		patchAcc := patchAccess[acc.PatchOrdinal]
 		var value any
-		if patchAcc.copyValue != nil {
-			value = patchAcc.copyValue(newPtr)
+		if patchAcc.CopyValue != nil {
+			value = patchAcc.CopyValue(newPtr)
 		} else {
-			value = deepCopyValue(rvNew.FieldByIndex(patchAcc.field.Index).Interface())
+			value = deepCopyValue(rvNew.FieldByIndex(patchAcc.Field.Index).Interface())
 		}
-		name := patchAcc.field.DBName
+		name := patchAcc.Field.DBName
 		if useJSON {
-			name = patchAcc.field.JSONName
+			name = patchAcc.Field.JSONName
 		}
-		scratch.seen[acc.patchOrdinal] = true
+		scratch.seen[acc.PatchOrdinal] = true
 		target = append(target, Field{
 			Name:  name,
 			Value: value,
@@ -152,35 +154,35 @@ func (db *DB[K, V]) makePatch(oldVal, newVal *V, target []Field, useJSON bool) [
 		return true
 	})
 
-	for ordinal, patchAcc := range db.patchFieldAccess {
+	for ordinal, patchAcc := range patchAccess {
 		if scratch.seen[ordinal] {
 			continue
 		}
 
 		var newValue any
 		if rvOld.IsValid() {
-			if patchAcc.valueEqual != nil {
-				if patchAcc.valueEqual(oldPtr, newPtr) {
+			if patchAcc.ValueEqual != nil {
+				if patchAcc.ValueEqual(oldPtr, newPtr) {
 					continue
 				}
 			} else {
-				oldValue := rvOld.FieldByIndex(patchAcc.field.Index).Interface()
-				newValue = rvNew.FieldByIndex(patchAcc.field.Index).Interface()
+				oldValue := rvOld.FieldByIndex(patchAcc.Field.Index).Interface()
+				newValue = rvNew.FieldByIndex(patchAcc.Field.Index).Interface()
 				if reflect.DeepEqual(oldValue, newValue) {
 					continue
 				}
 			}
 		}
-		if patchAcc.copyValue != nil {
-			newValue = patchAcc.copyValue(newPtr)
+		if patchAcc.CopyValue != nil {
+			newValue = patchAcc.CopyValue(newPtr)
 		} else if newValue == nil {
-			newValue = deepCopyValue(rvNew.FieldByIndex(patchAcc.field.Index).Interface())
+			newValue = deepCopyValue(rvNew.FieldByIndex(patchAcc.Field.Index).Interface())
 		} else {
 			newValue = deepCopyValue(newValue)
 		}
-		name := patchAcc.field.DBName
+		name := patchAcc.Field.DBName
 		if useJSON {
-			name = patchAcc.field.JSONName
+			name = patchAcc.Field.JSONName
 		}
 
 		target = append(target, Field{

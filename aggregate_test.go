@@ -1080,8 +1080,8 @@ func TestAggregateMeasureEmptyBaseBatchSetDuplicateIDsUsesLastValue(t *testing.T
 		t.Fatalf("BatchSet duplicate ids: %v", err)
 	}
 
-	acc := db.engine.measureFieldMap["amount"]
-	storage := db.engine.getSnapshot().measure[acc.ordinal]
+	acc := db.engine.schema.MeasuresByName["amount"]
+	storage := db.engine.getSnapshot().measure[acc.Ordinal]
 	if storage.Rows() != 1 {
 		t.Fatalf("measure rows=%d, want 1", storage.Rows())
 	}
@@ -1127,8 +1127,8 @@ func TestAggregateWideMeasureUsesFullAndMergeScans(t *testing.T) {
 		}
 	}
 
-	acc := db.engine.measureFieldMap["amount"]
-	storage := db.engine.getSnapshot().measure[acc.ordinal]
+	acc := db.engine.schema.MeasuresByName["amount"]
+	storage := db.engine.getSnapshot().measure[acc.Ordinal]
 	if !useMeasureMergeScan(keep, storage) {
 		t.Fatal("wide filtered measure aggregate must use merge scan")
 	}

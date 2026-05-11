@@ -9,13 +9,14 @@ import (
 
 	"github.com/vapstack/rbi/internal/pooled"
 	"github.com/vapstack/rbi/internal/posting"
+	"github.com/vapstack/rbi/internal/schema"
 )
 
 const numericRangeFullSpanCacheMaxEntries = 4
 
 type numericRangeBucketCache struct {
 	mu    sync.Mutex
-	slots *pooled.Slice[numericRangeBucketCacheSlot]
+	slots []numericRangeBucketCacheSlot
 }
 
 type numericRangeBucketIndex struct {
@@ -52,10 +53,6 @@ var numericRangeBucketCachePool = pooled.Pointers[numericRangeBucketCache]{
 	},
 }
 
-var numericRangeBucketCacheSlotPool = pooled.Slices[numericRangeBucketCacheSlot]{
-	Clear: true,
-}
-
 var numericRangeBucketCacheEntryPool = pooled.Pointers[numericRangeBucketCacheEntry]{
 	Cleanup: func(e *numericRangeBucketCacheEntry) {
 		e.releaseFullSpanCache()
@@ -72,45 +69,42 @@ func numericRangeFullSpanCacheBounds(key uint64) (int, int) {
 }
 
 func (c *numericRangeBucketCache) init(fieldCount int) {
-	if c.slots == nil {
-		c.slots = numericRangeBucketCacheSlotPool.Get()
+	if cap(c.slots) < fieldCount {
+		c.slots = make([]numericRangeBucketCacheSlot, fieldCount)
+		return
 	}
-	c.slots.SetLen(fieldCount)
+	c.slots = c.slots[:fieldCount]
 }
 
 func (c *numericRangeBucketCache) clearEntries() {
-	if c == nil || c.slots == nil {
+	if len(c.slots) == 0 {
 		return
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	for i := 0; i < c.slots.Len(); i++ {
-		slot := c.slots.Get(i)
+
+	for i := range c.slots {
+		slot := c.slots[i]
 		if slot.entry != nil {
 			slot.entry.release()
-			slot.entry = nil
 		}
-		slot.field = ""
-		c.slots.Set(i, slot)
+		c.slots[i] = numericRangeBucketCacheSlot{}
 	}
 }
 
 func (c *numericRangeBucketCache) release() {
-	if c == nil || c.slots == nil {
-		return
-	}
 	c.clearEntries()
-	numericRangeBucketCacheSlotPool.Put(c.slots)
-	c.slots = nil
+	c.slots = c.slots[:0]
 }
 
 func (c *numericRangeBucketCache) loadSlot(field string, ordinal int) (*numericRangeBucketCacheEntry, bool) {
-	if c == nil || c.slots == nil || ordinal < 0 || ordinal >= c.slots.Len() {
+	if ordinal < 0 || ordinal >= len(c.slots) {
 		return nil, false
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	slot := c.slots.Get(ordinal)
+
+	slot := c.slots[ordinal]
 	if slot.entry == nil || slot.field != field {
 		return nil, false
 	}
@@ -118,25 +112,26 @@ func (c *numericRangeBucketCache) loadSlot(field string, ordinal int) (*numericR
 }
 
 func (c *numericRangeBucketCache) storeSlot(field string, ordinal int, entry *numericRangeBucketCacheEntry) {
-	if c == nil || c.slots == nil || ordinal < 0 || ordinal >= c.slots.Len() {
+	if ordinal < 0 || ordinal >= len(c.slots) {
 		return
 	}
+
 	c.mu.Lock()
-	slot := c.slots.Get(ordinal)
+	slot := c.slots[ordinal]
 	slot.field = field
 	slot.entry = entry
-	c.slots.Set(ordinal, slot)
+	c.slots[ordinal] = slot
 	c.mu.Unlock()
 }
 
 func (c *numericRangeBucketCache) loadField(field string) (*numericRangeBucketCacheEntry, bool) {
-	if c == nil || c.slots == nil || field == "" {
+	if len(c.slots) == 0 || field == "" {
 		return nil, false
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	for i := 0; i < c.slots.Len(); i++ {
-		slot := c.slots.Get(i)
+	for i := range c.slots {
+		slot := c.slots[i]
 		if slot.field == field && slot.entry != nil {
 			return slot.entry, true
 		}
@@ -145,14 +140,14 @@ func (c *numericRangeBucketCache) loadField(field string) (*numericRangeBucketCa
 }
 
 func (c *numericRangeBucketCache) entryCount() int {
-	if c == nil || c.slots == nil {
+	if len(c.slots) == 0 {
 		return 0
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	count := 0
-	for i := 0; i < c.slots.Len(); i++ {
-		if c.slots.Get(i).entry != nil {
+	for i := range c.slots {
+		if c.slots[i].entry != nil {
 			count++
 		}
 	}
@@ -448,11 +443,11 @@ func (s *indexSnapshot) getNumericRangeBucketCacheEntry(field string, ordinal in
 }
 
 func (qv *queryView) numericRangeFieldOrdinal(field string) (int, bool) {
-	acc, ok := qv.engine.indexedFieldMap[field]
+	acc, ok := qv.engine.schema.IndexedByName[field]
 	if !ok {
 		return 0, false
 	}
-	return acc.ordinal, true
+	return acc.Ordinal, true
 }
 
 func (qv *queryView) numericRangeBucketCacheEntry(field string, storage indexdata.FieldStorage, bucketSize, minFieldKeys int) *numericRangeBucketCacheEntry {
@@ -463,8 +458,8 @@ func (qv *queryView) numericRangeBucketCacheEntry(field string, storage indexdat
 	return qv.snap.getNumericRangeBucketCacheEntry(field, ordinal, storage, bucketSize, minFieldKeys)
 }
 
-func (qv *queryView) tryEvalNumericRangeBuckets(field string, fm *field, ov indexdata.FieldOverlay, br indexdata.OverlayRange) (postingResult, bool) {
-	if !fieldUsesOrderedNumericKeys(fm) {
+func (qv *queryView) tryEvalNumericRangeBuckets(field string, fm *schema.Field, ov indexdata.FieldOverlay, br indexdata.OverlayRange) (postingResult, bool) {
+	if !schema.FieldUsesOrderedNumericKeys(fm) {
 		return postingResult{}, false
 	}
 
@@ -553,8 +548,8 @@ func (qv *queryView) tryEvalNumericRangeBuckets(field string, fm *field, ov inde
 	return postingResult{ids: res}, true
 }
 
-func (qv *queryView) tryLoadNumericRangeBuckets(field string, fm *field, ov indexdata.FieldOverlay, br indexdata.OverlayRange) (postingResult, bool) {
-	if !fieldUsesOrderedNumericKeys(fm) {
+func (qv *queryView) tryLoadNumericRangeBuckets(field string, fm *schema.Field, ov indexdata.FieldOverlay, br indexdata.OverlayRange) (postingResult, bool) {
+	if !schema.FieldUsesOrderedNumericKeys(fm) {
 		return postingResult{}, false
 	}
 
@@ -624,8 +619,8 @@ func (qv *queryView) tryLoadNumericRangeBuckets(field string, fm *field, ov inde
 	return postingResult{ids: res}, true
 }
 
-func (qv *queryView) tryCountSnapshotNumericRange(field string, fm *field, ov indexdata.FieldOverlay, start, end int) (uint64, bool) {
-	if !fieldUsesOrderedNumericKeys(fm) {
+func (qv *queryView) tryCountSnapshotNumericRange(field string, fm *schema.Field, ov indexdata.FieldOverlay, start, end int) (uint64, bool) {
+	if !schema.FieldUsesOrderedNumericKeys(fm) {
 		return 0, false
 	}
 	if start < 0 || start > end || end > ov.KeyCount() {

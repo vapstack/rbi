@@ -7,6 +7,7 @@ import (
 	"github.com/vapstack/rbi/internal/pooled"
 	"github.com/vapstack/rbi/internal/posting"
 	"github.com/vapstack/rbi/internal/qir"
+	"github.com/vapstack/rbi/internal/schema"
 )
 
 func (qv *queryView) tryExecutionPlan(q *qir.Shape, trace *queryTrace) ([]uint64, bool, error) {
@@ -1008,7 +1009,7 @@ func applyRangeOp(rb *indexdata.Bounds, op qir.Op, key string) bool {
 	return true
 }
 
-func orderNilTailField(fm *field, field string, bounds indexdata.Bounds) string {
+func orderNilTailField(fm *schema.Field, field string, bounds indexdata.Bounds) string {
 	if fm == nil || !fm.Ptr || field == "" {
 		return ""
 	}
@@ -1179,8 +1180,8 @@ type orderBasicBaseCore struct {
 	collapsed preparedScalarExactRange
 }
 
-func isOrderBasicCollapsibleNumericRangeExpr(op qir.Expr, fm *field) bool {
-	if op.Not || op.FieldOrdinal < 0 || !fieldUsesOrderedNumericKeys(fm) {
+func isOrderBasicCollapsibleNumericRangeExpr(op qir.Expr, fm *schema.Field) bool {
+	if op.Not || op.FieldOrdinal < 0 || !schema.FieldUsesOrderedNumericKeys(fm) {
 		return false
 	}
 	return isScalarRangeEqOp(op.Op)

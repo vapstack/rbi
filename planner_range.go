@@ -5,12 +5,13 @@ import (
 	"github.com/vapstack/rbi/internal/pooled"
 	"github.com/vapstack/rbi/internal/posting"
 	"github.com/vapstack/rbi/internal/qir"
+	"github.com/vapstack/rbi/internal/schema"
 )
 
 type preparedScalarRangePredicate struct {
 	qv                 *queryView
 	expr               qir.Expr
-	fm                 *field
+	fm                 *schema.Field
 	bound              normalizedScalarBound
 	bounds             indexdata.Bounds
 	complementCacheKey materializedPredKey
@@ -164,7 +165,7 @@ func (qv *queryView) isPositiveMergedNumericRangeLeaf(e qir.Expr) bool {
 		return false
 	}
 	fm := qv.fieldMetaByExpr(e)
-	return fieldUsesOrderedNumericKeys(fm)
+	return schema.FieldUsesOrderedNumericKeys(fm)
 }
 
 func isSimpleScalarRangeOrPrefixLeaf(e qir.Expr) bool {
@@ -207,7 +208,7 @@ func rangeBoundsForNormalizedScalarBound(bound normalizedScalarBound) indexdata.
 func (qv *queryView) initPreparedScalarRangePredicateFromBound(
 	core *preparedScalarRangePredicate,
 	e qir.Expr,
-	fm *field,
+	fm *schema.Field,
 	bound normalizedScalarBound,
 ) {
 	cacheKey := materializedPredKey{}
@@ -237,12 +238,12 @@ func (qv *queryView) initPreparedScalarRangePredicateFromBound(
 func (qv *queryView) initPreparedExactScalarRangePredicate(
 	core *preparedScalarRangePredicate,
 	e qir.Expr,
-	fm *field,
+	fm *schema.Field,
 	bounds indexdata.Bounds,
 ) {
 	cacheKey := qv.materializedPredKeyForExactScalarRange(qv.engine.fieldNameByOrdinal(e.FieldOrdinal), bounds)
 	complementCacheKey := materializedPredKey{}
-	if fieldUsesOrderedNumericKeys(fm) && isNumericRangeOp(e.Op) {
+	if schema.FieldUsesOrderedNumericKeys(fm) && isNumericRangeOp(e.Op) {
 		complementCacheKey = qv.materializedPredComplementKeyForExactScalarRange(qv.engine.fieldNameByOrdinal(e.FieldOrdinal), bounds)
 	}
 	loadReuse := newMaterializedPredReadOnlyReuse(qv.snap, cacheKey)
@@ -257,14 +258,14 @@ func (qv *queryView) initPreparedExactScalarRangePredicate(
 		loadReuse:          loadReuse,
 		sharedReuse:        sharedReuse,
 		secondHitReuse:     secondHitReuse,
-		usePostingFilter:   fieldUsesOrderedNumericKeys(fm),
+		usePostingFilter:   schema.FieldUsesOrderedNumericKeys(fm),
 	}
 }
 
 func (qv *queryView) initPreparedScalarRangePredicate(
 	core *preparedScalarRangePredicate,
 	e qir.Expr,
-	fm *field,
+	fm *schema.Field,
 ) (predicate, bool, bool) {
 	if fm == nil || fm.Slice {
 		return predicate{}, false, false
@@ -311,7 +312,7 @@ func (qv *queryView) prepareScalarRangeRoutingCandidate(
 	return preparedScalarRangeRoutingCandidate{
 		core:    core,
 		plan:    plan,
-		numeric: fieldUsesOrderedNumericKeys(fm),
+		numeric: schema.FieldUsesOrderedNumericKeys(fm),
 	}, true
 }
 
@@ -341,7 +342,7 @@ func (qv *queryView) preparePredicateScalarRangeRoutingCandidate(
 	return preparedScalarRangeRoutingCandidate{
 		core:    core,
 		plan:    plan,
-		numeric: fieldUsesOrderedNumericKeys(fm),
+		numeric: schema.FieldUsesOrderedNumericKeys(fm),
 	}, true
 }
 
@@ -742,7 +743,7 @@ func (core *preparedScalarRangePredicate) buildFromOverlay(
 		}
 	}
 	reuse := core.runtimeReuse(plan.est, useRuntimeComplement)
-	if allowMaterialize && !useRuntimeComplement && !fieldUsesOrderedNumericKeys(core.fm) {
+	if allowMaterialize && !useRuntimeComplement && !schema.FieldUsesOrderedNumericKeys(core.fm) {
 		reuse = core.sharedReuse
 	}
 	materializeAfter := rangeMaterializeAfterForProbe(probe.probeLen, probe.probeEst)
@@ -907,8 +908,8 @@ func (qv *queryView) loadWarmPreparedScalarExactRange(op preparedScalarExactRang
 			return postingResult{ids: cached}, true
 		}
 	}
-	fm := qv.fields[op.field]
-	if !fieldUsesOrderedNumericKeys(fm) {
+	fm := qv.engine.schema.Fields[op.field]
+	if !schema.FieldUsesOrderedNumericKeys(fm) {
 		return postingResult{}, false
 	}
 	ov := qv.fieldOverlay(op.field)
@@ -928,8 +929,8 @@ func (qv *queryView) evalPreparedScalarExactRange(op preparedScalarExactRange) (
 			return postingResult{ids: cached}, nil
 		}
 	}
-	fm := qv.fields[op.field]
-	if !fieldUsesOrderedNumericKeys(fm) {
+	fm := qv.engine.schema.Fields[op.field]
+	if !schema.FieldUsesOrderedNumericKeys(fm) {
 		return postingResult{}, nil
 	}
 	ov := qv.fieldOverlay(op.field)

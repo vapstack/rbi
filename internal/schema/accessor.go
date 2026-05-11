@@ -1,25 +1,28 @@
-package rbi
+package schema
 
 import (
 	"fmt"
-	"github.com/vapstack/rbi/internal/keycodec"
 	"reflect"
 	"slices"
 	"time"
 	"unsafe"
+
+	"github.com/vapstack/rbi/internal/keycodec"
 )
 
-type fieldModifiedFn func(v1, v2 unsafe.Pointer) bool
-type patchValueEqualFn func(v1, v2 unsafe.Pointer) bool
-type patchValueCopyFn func(ptr unsafe.Pointer) any
+type (
+	FieldModifiedFn   func(v1, v2 unsafe.Pointer) bool
+	PatchValueEqualFn func(v1, v2 unsafe.Pointer) bool
+	PatchValueCopyFn  func(ptr unsafe.Pointer) any
+)
 
 type fieldAccessorBundle struct {
-	unique       uniqueScalarGetterFn
-	writeBuild   buildFieldWriteAccessorFn
-	writeOverlay overlayFieldWriteAccessorFn
-	writeInsert  insertFieldWriteAccessorFn
-	writeScratch scratchFieldWriteAccessorFn
-	modified     fieldModifiedFn
+	unique       UniqueScalarGetterFn
+	writeBuild   BuildFieldWriteAccessorFn
+	writeOverlay OverlayFieldWriteAccessorFn
+	writeInsert  InsertFieldWriteAccessorFn
+	writeScratch ScratchFieldWriteAccessorFn
+	modified     FieldModifiedFn
 }
 
 type unsafeSliceHeader struct {
@@ -111,7 +114,7 @@ func slicesEqualExact[T comparable](lhs, rhs []T) bool {
 	return true
 }
 
-func scalarPatchValueEqual[T comparable](offset uintptr, ptr bool) patchValueEqualFn {
+func scalarPatchValueEqual[T comparable](offset uintptr, ptr bool) PatchValueEqualFn {
 	if ptr {
 		return func(v1, v2 unsafe.Pointer) bool {
 			p1 := ptrFieldValue[T](v1, offset)
@@ -127,13 +130,13 @@ func scalarPatchValueEqual[T comparable](offset uintptr, ptr bool) patchValueEqu
 	}
 }
 
-func slicePatchValueEqual[T comparable](offset uintptr) patchValueEqualFn {
+func slicePatchValueEqual[T comparable](offset uintptr) PatchValueEqualFn {
 	return func(v1, v2 unsafe.Pointer) bool {
 		return slicesEqualExact(sliceFieldValue[T](v1, offset), sliceFieldValue[T](v2, offset))
 	}
 }
 
-func reflectSlicePatchValueCopy(fieldType reflect.Type, offset uintptr) patchValueCopyFn {
+func reflectSlicePatchValueCopy(fieldType reflect.Type, offset uintptr) PatchValueCopyFn {
 	return func(root unsafe.Pointer) any {
 		src := reflect.NewAt(fieldType, unsafe.Add(root, offset)).Elem()
 		if src.IsNil() {
@@ -159,28 +162,6 @@ func typeHasMutableReferencePayload(t reflect.Type) bool {
 		}
 	}
 	return false
-}
-
-func addDistinctFixedKeys(n int, keyAt func(int) uint64, add func(uint64)) int {
-	if n == 0 {
-		return 0
-	}
-	if n == 1 {
-		add(keyAt(0))
-		return 1
-	}
-	seen := newU64Set(n)
-	defer releaseU64Set(&seen)
-	distinct := 0
-	for i := 0; i < n; i++ {
-		cur := keyAt(i)
-		if !seen.Add(cur) {
-			continue
-		}
-		distinct++
-		add(cur)
-	}
-	return distinct
 }
 
 func addDistinctStringsToSink[S stringValueSink](vals []string, sink S) int {
@@ -324,9 +305,6 @@ func addDistinctBoolValuesToSink[S stringValueSink](vals []bool, sink S) int {
 }
 
 func writePtrStringField[S nilStringValueSink](ptr unsafe.Pointer, sink S, offset uintptr) {
-	if ptr == nil {
-		return
-	}
 	v := ptrFieldValue[string](ptr, offset)
 	if v == nil {
 		sink.setNil()
@@ -336,16 +314,10 @@ func writePtrStringField[S nilStringValueSink](ptr unsafe.Pointer, sink S, offse
 }
 
 func writeScalarStringField[S stringValueSink](ptr unsafe.Pointer, sink S, offset uintptr) {
-	if ptr == nil {
-		return
-	}
 	sink.addString(scalarFieldValue[string](ptr, offset))
 }
 
 func writePtrBoolField[S nilStringValueSink](ptr unsafe.Pointer, sink S, offset uintptr) {
-	if ptr == nil {
-		return
-	}
 	v := ptrFieldValue[bool](ptr, offset)
 	if v == nil {
 		sink.setNil()
@@ -359,9 +331,6 @@ func writePtrBoolField[S nilStringValueSink](ptr unsafe.Pointer, sink S, offset 
 }
 
 func writeScalarBoolField[S stringValueSink](ptr unsafe.Pointer, sink S, offset uintptr) {
-	if ptr == nil {
-		return
-	}
 	if scalarFieldValue[bool](ptr, offset) {
 		sink.addString("1")
 		return
@@ -370,9 +339,6 @@ func writeScalarBoolField[S stringValueSink](ptr unsafe.Pointer, sink S, offset 
 }
 
 func writePtrIntField[S nilFixedValueSink, T signedFieldValue](ptr unsafe.Pointer, sink S, offset uintptr) {
-	if ptr == nil {
-		return
-	}
 	v := ptrFieldValue[T](ptr, offset)
 	if v == nil {
 		sink.setNil()
@@ -382,16 +348,10 @@ func writePtrIntField[S nilFixedValueSink, T signedFieldValue](ptr unsafe.Pointe
 }
 
 func writeScalarIntField[S fixedValueSink, T signedFieldValue](ptr unsafe.Pointer, sink S, offset uintptr) {
-	if ptr == nil {
-		return
-	}
 	sink.addFixed(keycodec.OrderedInt64Key(int64(scalarFieldValue[T](ptr, offset))))
 }
 
 func writePtrUintField[S nilFixedValueSink, T unsignedFieldValue](ptr unsafe.Pointer, sink S, offset uintptr) {
-	if ptr == nil {
-		return
-	}
 	v := ptrFieldValue[T](ptr, offset)
 	if v == nil {
 		sink.setNil()
@@ -401,16 +361,10 @@ func writePtrUintField[S nilFixedValueSink, T unsignedFieldValue](ptr unsafe.Poi
 }
 
 func writeScalarUintField[S fixedValueSink, T unsignedFieldValue](ptr unsafe.Pointer, sink S, offset uintptr) {
-	if ptr == nil {
-		return
-	}
 	sink.addFixed(uint64(scalarFieldValue[T](ptr, offset)))
 }
 
 func writePtrFloatField[S nilFixedValueSink, T floatFieldValue](ptr unsafe.Pointer, sink S, offset uintptr) {
-	if ptr == nil {
-		return
-	}
 	v := ptrFieldValue[T](ptr, offset)
 	if v == nil {
 		sink.setNil()
@@ -420,51 +374,30 @@ func writePtrFloatField[S nilFixedValueSink, T floatFieldValue](ptr unsafe.Point
 }
 
 func writeScalarFloatField[S fixedValueSink, T floatFieldValue](ptr unsafe.Pointer, sink S, offset uintptr) {
-	if ptr == nil {
-		return
-	}
 	sink.addFixed(keycodec.OrderedFloat64Key(float64(scalarFieldValue[T](ptr, offset))))
 }
 
 func writeStringSliceField[S lenStringValueSink](ptr unsafe.Pointer, sink S, offset uintptr) {
-	if ptr == nil {
-		return
-	}
 	sink.setLen(addDistinctStringsToSink(sliceFieldValue[string](ptr, offset), sink))
 }
 
 func writeBoolSliceField[S lenStringValueSink](ptr unsafe.Pointer, sink S, offset uintptr) {
-	if ptr == nil {
-		return
-	}
 	sink.setLen(addDistinctBoolValuesToSink(sliceFieldValue[bool](ptr, offset), sink))
 }
 
 func writeIntSliceField[S lenFixedValueSink, T signedFieldValue](ptr unsafe.Pointer, sink S, offset uintptr) {
-	if ptr == nil {
-		return
-	}
 	sink.setLen(addDistinctSignedFixedKeysToSink(sliceFieldValue[T](ptr, offset), sink))
 }
 
 func writeUintSliceField[S lenFixedValueSink, T unsignedFieldValue](ptr unsafe.Pointer, sink S, offset uintptr) {
-	if ptr == nil {
-		return
-	}
 	sink.setLen(addDistinctUnsignedFixedKeysToSink(sliceFieldValue[T](ptr, offset), sink))
 }
 
 func writeFloatSliceField[S lenFixedValueSink, T floatFieldValue](ptr unsafe.Pointer, sink S, offset uintptr) {
-	if ptr == nil {
-		return
-	}
 	sink.setLen(addDistinctFloatFixedKeysToSink(sliceFieldValue[T](ptr, offset), sink))
 }
 
 func writePtrTimeField[S nilFixedValueSink](ptr unsafe.Pointer, sink S, offset uintptr) {
-	if ptr == nil {
-		return
-	}
 	v := ptrFieldValue[time.Time](ptr, offset)
 	if v == nil {
 		sink.setNil()
@@ -474,9 +407,6 @@ func writePtrTimeField[S nilFixedValueSink](ptr unsafe.Pointer, sink S, offset u
 }
 
 func writeScalarTimeField[S fixedValueSink](ptr unsafe.Pointer, sink S, offset uintptr) {
-	if ptr == nil {
-		return
-	}
 	sink.addFixed(keycodec.OrderedInt64Key(scalarFieldValue[time.Time](ptr, offset).Unix()))
 }
 
@@ -495,37 +425,22 @@ func slicesModified[T comparable](lhs, rhs []T) bool {
 func valueIndexerScalarReflectAccessorBundle(fieldType reflect.Type, offset uintptr) fieldAccessorBundle {
 	return fieldAccessorBundle{
 		unique: func(ptr unsafe.Pointer) (keycodec.IndexLookupKey, bool, bool) {
-			if ptr == nil {
-				return keycodec.IndexLookupKey{}, false, false
-			}
 			fv := reflect.NewAt(fieldType, unsafe.Add(ptr, offset)).Elem()
 			return keycodec.IndexLookupString(fv.Interface().(ValueIndexer).IndexingValue()), true, false
 		},
-		writeBuild: func(ptr unsafe.Pointer, sink buildFieldWriteSink) {
-			if ptr == nil {
-				return
-			}
+		writeBuild: func(ptr unsafe.Pointer, sink BuildSink) {
 			fv := reflect.NewAt(fieldType, unsafe.Add(ptr, offset)).Elem()
 			sink.addString(fv.Interface().(ValueIndexer).IndexingValue())
 		},
-		writeOverlay: func(ptr unsafe.Pointer, sink snapshotOverlayWriteSink) {
-			if ptr == nil {
-				return
-			}
+		writeOverlay: func(ptr unsafe.Pointer, sink OverlaySink) {
 			fv := reflect.NewAt(fieldType, unsafe.Add(ptr, offset)).Elem()
 			sink.addString(fv.Interface().(ValueIndexer).IndexingValue())
 		},
-		writeInsert: func(ptr unsafe.Pointer, sink snapshotInsertWriteSink) {
-			if ptr == nil {
-				return
-			}
+		writeInsert: func(ptr unsafe.Pointer, sink InsertSink) {
 			fv := reflect.NewAt(fieldType, unsafe.Add(ptr, offset)).Elem()
 			sink.addString(fv.Interface().(ValueIndexer).IndexingValue())
 		},
-		writeScratch: func(ptr unsafe.Pointer, sink *fieldWriteScratch) {
-			if ptr == nil {
-				return
-			}
+		writeScratch: func(ptr unsafe.Pointer, sink *WriteScratch) {
 			fv := reflect.NewAt(fieldType, unsafe.Add(ptr, offset)).Elem()
 			sink.addString(fv.Interface().(ValueIndexer).IndexingValue())
 		},
@@ -539,31 +454,19 @@ func valueIndexerScalarReflectAccessorBundle(fieldType reflect.Type, offset uint
 
 func valueIndexerSliceReflectAccessorBundle(sliceType reflect.Type, offset uintptr) fieldAccessorBundle {
 	return fieldAccessorBundle{
-		writeBuild: func(ptr unsafe.Pointer, sink buildFieldWriteSink) {
-			if ptr == nil {
-				return
-			}
+		writeBuild: func(ptr unsafe.Pointer, sink BuildSink) {
 			fv := reflect.NewAt(sliceType, unsafe.Add(ptr, offset)).Elem()
 			sink.setLen(addDistinctValueIndexerStringsToSink(fv, sink))
 		},
-		writeOverlay: func(ptr unsafe.Pointer, sink snapshotOverlayWriteSink) {
-			if ptr == nil {
-				return
-			}
+		writeOverlay: func(ptr unsafe.Pointer, sink OverlaySink) {
 			fv := reflect.NewAt(sliceType, unsafe.Add(ptr, offset)).Elem()
 			sink.setLen(addDistinctValueIndexerStringsToSink(fv, sink))
 		},
-		writeInsert: func(ptr unsafe.Pointer, sink snapshotInsertWriteSink) {
-			if ptr == nil {
-				return
-			}
+		writeInsert: func(ptr unsafe.Pointer, sink InsertSink) {
 			fv := reflect.NewAt(sliceType, unsafe.Add(ptr, offset)).Elem()
 			sink.setLen(addDistinctValueIndexerStringsToSink(fv, sink))
 		},
-		writeScratch: func(ptr unsafe.Pointer, sink *fieldWriteScratch) {
-			if ptr == nil {
-				return
-			}
+		writeScratch: func(ptr unsafe.Pointer, sink *WriteScratch) {
 			fv := reflect.NewAt(sliceType, unsafe.Add(ptr, offset)).Elem()
 			sink.setLen(addDistinctValueIndexerStringsToSink(fv, sink))
 		},
@@ -588,19 +491,18 @@ func timeFieldAccessorBundle(offset uintptr, ptr bool) fieldAccessorBundle {
 	if ptr {
 		return fieldAccessorBundle{
 			unique: func(ptr unsafe.Pointer) (keycodec.IndexLookupKey, bool, bool) {
-				if ptr == nil {
-					return keycodec.IndexLookupKey{}, false, false
-				}
 				v := ptrFieldValue[time.Time](ptr, offset)
 				if v == nil {
 					return keycodec.IndexLookupKey{}, true, true
 				}
 				return keycodec.IndexLookupU64(keycodec.OrderedInt64Key(v.Unix())), true, false
 			},
-			writeBuild:   func(ptr unsafe.Pointer, sink buildFieldWriteSink) { writePtrTimeField(ptr, sink, offset) },
-			writeOverlay: func(ptr unsafe.Pointer, sink snapshotOverlayWriteSink) { writePtrTimeField(ptr, sink, offset) },
-			writeInsert:  func(ptr unsafe.Pointer, sink snapshotInsertWriteSink) { writePtrTimeField(ptr, sink, offset) },
-			writeScratch: func(ptr unsafe.Pointer, sink *fieldWriteScratch) { writePtrTimeField(ptr, sink, offset) },
+
+			writeBuild:   func(ptr unsafe.Pointer, sink BuildSink) { writePtrTimeField(ptr, sink, offset) },
+			writeOverlay: func(ptr unsafe.Pointer, sink OverlaySink) { writePtrTimeField(ptr, sink, offset) },
+			writeInsert:  func(ptr unsafe.Pointer, sink InsertSink) { writePtrTimeField(ptr, sink, offset) },
+			writeScratch: func(ptr unsafe.Pointer, sink *WriteScratch) { writePtrTimeField(ptr, sink, offset) },
+
 			modified: func(v1, v2 unsafe.Pointer) bool {
 				p1 := ptrFieldValue[time.Time](v1, offset)
 				p2 := ptrFieldValue[time.Time](v2, offset)
@@ -611,17 +513,17 @@ func timeFieldAccessorBundle(offset uintptr, ptr bool) fieldAccessorBundle {
 			},
 		}
 	}
+
 	return fieldAccessorBundle{
 		unique: func(ptr unsafe.Pointer) (keycodec.IndexLookupKey, bool, bool) {
-			if ptr == nil {
-				return keycodec.IndexLookupKey{}, false, false
-			}
 			return keycodec.IndexLookupU64(keycodec.OrderedInt64Key(scalarFieldValue[time.Time](ptr, offset).Unix())), true, false
 		},
-		writeBuild:   func(ptr unsafe.Pointer, sink buildFieldWriteSink) { writeScalarTimeField(ptr, sink, offset) },
-		writeOverlay: func(ptr unsafe.Pointer, sink snapshotOverlayWriteSink) { writeScalarTimeField(ptr, sink, offset) },
-		writeInsert:  func(ptr unsafe.Pointer, sink snapshotInsertWriteSink) { writeScalarTimeField(ptr, sink, offset) },
-		writeScratch: func(ptr unsafe.Pointer, sink *fieldWriteScratch) { writeScalarTimeField(ptr, sink, offset) },
+
+		writeBuild:   func(ptr unsafe.Pointer, sink BuildSink) { writeScalarTimeField(ptr, sink, offset) },
+		writeOverlay: func(ptr unsafe.Pointer, sink OverlaySink) { writeScalarTimeField(ptr, sink, offset) },
+		writeInsert:  func(ptr unsafe.Pointer, sink InsertSink) { writeScalarTimeField(ptr, sink, offset) },
+		writeScratch: func(ptr unsafe.Pointer, sink *WriteScratch) { writeScalarTimeField(ptr, sink, offset) },
+
 		modified: func(v1, v2 unsafe.Pointer) bool {
 			return scalarFieldValue[time.Time](v1, offset).Unix() != scalarFieldValue[time.Time](v2, offset).Unix()
 		},
@@ -632,19 +534,18 @@ func stringFieldAccessorBundle(offset uintptr, ptr bool) fieldAccessorBundle {
 	if ptr {
 		return fieldAccessorBundle{
 			unique: func(ptr unsafe.Pointer) (keycodec.IndexLookupKey, bool, bool) {
-				if ptr == nil {
-					return keycodec.IndexLookupKey{}, false, false
-				}
 				v := ptrFieldValue[string](ptr, offset)
 				if v == nil {
 					return keycodec.IndexLookupKey{}, true, true
 				}
 				return keycodec.IndexLookupString(*v), true, false
 			},
-			writeBuild:   func(ptr unsafe.Pointer, sink buildFieldWriteSink) { writePtrStringField(ptr, sink, offset) },
-			writeOverlay: func(ptr unsafe.Pointer, sink snapshotOverlayWriteSink) { writePtrStringField(ptr, sink, offset) },
-			writeInsert:  func(ptr unsafe.Pointer, sink snapshotInsertWriteSink) { writePtrStringField(ptr, sink, offset) },
-			writeScratch: func(ptr unsafe.Pointer, sink *fieldWriteScratch) { writePtrStringField(ptr, sink, offset) },
+
+			writeBuild:   func(ptr unsafe.Pointer, sink BuildSink) { writePtrStringField(ptr, sink, offset) },
+			writeOverlay: func(ptr unsafe.Pointer, sink OverlaySink) { writePtrStringField(ptr, sink, offset) },
+			writeInsert:  func(ptr unsafe.Pointer, sink InsertSink) { writePtrStringField(ptr, sink, offset) },
+			writeScratch: func(ptr unsafe.Pointer, sink *WriteScratch) { writePtrStringField(ptr, sink, offset) },
+
 			modified: func(v1, v2 unsafe.Pointer) bool {
 				p1 := ptrFieldValue[string](v1, offset)
 				p2 := ptrFieldValue[string](v2, offset)
@@ -657,15 +558,14 @@ func stringFieldAccessorBundle(offset uintptr, ptr bool) fieldAccessorBundle {
 	}
 	return fieldAccessorBundle{
 		unique: func(ptr unsafe.Pointer) (keycodec.IndexLookupKey, bool, bool) {
-			if ptr == nil {
-				return keycodec.IndexLookupKey{}, false, false
-			}
 			return keycodec.IndexLookupString(scalarFieldValue[string](ptr, offset)), true, false
 		},
-		writeBuild:   func(ptr unsafe.Pointer, sink buildFieldWriteSink) { writeScalarStringField(ptr, sink, offset) },
-		writeOverlay: func(ptr unsafe.Pointer, sink snapshotOverlayWriteSink) { writeScalarStringField(ptr, sink, offset) },
-		writeInsert:  func(ptr unsafe.Pointer, sink snapshotInsertWriteSink) { writeScalarStringField(ptr, sink, offset) },
-		writeScratch: func(ptr unsafe.Pointer, sink *fieldWriteScratch) { writeScalarStringField(ptr, sink, offset) },
+
+		writeBuild:   func(ptr unsafe.Pointer, sink BuildSink) { writeScalarStringField(ptr, sink, offset) },
+		writeOverlay: func(ptr unsafe.Pointer, sink OverlaySink) { writeScalarStringField(ptr, sink, offset) },
+		writeInsert:  func(ptr unsafe.Pointer, sink InsertSink) { writeScalarStringField(ptr, sink, offset) },
+		writeScratch: func(ptr unsafe.Pointer, sink *WriteScratch) { writeScalarStringField(ptr, sink, offset) },
+
 		modified: func(v1, v2 unsafe.Pointer) bool {
 			return scalarFieldValue[string](v1, offset) != scalarFieldValue[string](v2, offset)
 		},
@@ -676,9 +576,6 @@ func boolFieldAccessorBundle(offset uintptr, ptr bool) fieldAccessorBundle {
 	if ptr {
 		return fieldAccessorBundle{
 			unique: func(ptr unsafe.Pointer) (keycodec.IndexLookupKey, bool, bool) {
-				if ptr == nil {
-					return keycodec.IndexLookupKey{}, false, false
-				}
 				v := ptrFieldValue[bool](ptr, offset)
 				if v == nil {
 					return keycodec.IndexLookupKey{}, true, true
@@ -688,10 +585,12 @@ func boolFieldAccessorBundle(offset uintptr, ptr bool) fieldAccessorBundle {
 				}
 				return keycodec.IndexLookupString("0"), true, false
 			},
-			writeBuild:   func(ptr unsafe.Pointer, sink buildFieldWriteSink) { writePtrBoolField(ptr, sink, offset) },
-			writeOverlay: func(ptr unsafe.Pointer, sink snapshotOverlayWriteSink) { writePtrBoolField(ptr, sink, offset) },
-			writeInsert:  func(ptr unsafe.Pointer, sink snapshotInsertWriteSink) { writePtrBoolField(ptr, sink, offset) },
-			writeScratch: func(ptr unsafe.Pointer, sink *fieldWriteScratch) { writePtrBoolField(ptr, sink, offset) },
+
+			writeBuild:   func(ptr unsafe.Pointer, sink BuildSink) { writePtrBoolField(ptr, sink, offset) },
+			writeOverlay: func(ptr unsafe.Pointer, sink OverlaySink) { writePtrBoolField(ptr, sink, offset) },
+			writeInsert:  func(ptr unsafe.Pointer, sink InsertSink) { writePtrBoolField(ptr, sink, offset) },
+			writeScratch: func(ptr unsafe.Pointer, sink *WriteScratch) { writePtrBoolField(ptr, sink, offset) },
+
 			modified: func(v1, v2 unsafe.Pointer) bool {
 				p1 := ptrFieldValue[bool](v1, offset)
 				p2 := ptrFieldValue[bool](v2, offset)
@@ -704,18 +603,17 @@ func boolFieldAccessorBundle(offset uintptr, ptr bool) fieldAccessorBundle {
 	}
 	return fieldAccessorBundle{
 		unique: func(ptr unsafe.Pointer) (keycodec.IndexLookupKey, bool, bool) {
-			if ptr == nil {
-				return keycodec.IndexLookupKey{}, false, false
-			}
 			if scalarFieldValue[bool](ptr, offset) {
 				return keycodec.IndexLookupString("1"), true, false
 			}
 			return keycodec.IndexLookupString("0"), true, false
 		},
-		writeBuild:   func(ptr unsafe.Pointer, sink buildFieldWriteSink) { writeScalarBoolField(ptr, sink, offset) },
-		writeOverlay: func(ptr unsafe.Pointer, sink snapshotOverlayWriteSink) { writeScalarBoolField(ptr, sink, offset) },
-		writeInsert:  func(ptr unsafe.Pointer, sink snapshotInsertWriteSink) { writeScalarBoolField(ptr, sink, offset) },
-		writeScratch: func(ptr unsafe.Pointer, sink *fieldWriteScratch) { writeScalarBoolField(ptr, sink, offset) },
+
+		writeBuild:   func(ptr unsafe.Pointer, sink BuildSink) { writeScalarBoolField(ptr, sink, offset) },
+		writeOverlay: func(ptr unsafe.Pointer, sink OverlaySink) { writeScalarBoolField(ptr, sink, offset) },
+		writeInsert:  func(ptr unsafe.Pointer, sink InsertSink) { writeScalarBoolField(ptr, sink, offset) },
+		writeScratch: func(ptr unsafe.Pointer, sink *WriteScratch) { writeScalarBoolField(ptr, sink, offset) },
+
 		modified: func(v1, v2 unsafe.Pointer) bool {
 			return scalarFieldValue[bool](v1, offset) != scalarFieldValue[bool](v2, offset)
 		},
@@ -726,27 +624,26 @@ func intFieldAccessorBundle[T signedFieldValue](offset uintptr, ptr bool) fieldA
 	if ptr {
 		return fieldAccessorBundle{
 			unique: func(ptr unsafe.Pointer) (keycodec.IndexLookupKey, bool, bool) {
-				if ptr == nil {
-					return keycodec.IndexLookupKey{}, false, false
-				}
 				v := ptrFieldValue[T](ptr, offset)
 				if v == nil {
 					return keycodec.IndexLookupKey{}, true, true
 				}
 				return keycodec.IndexLookupU64(keycodec.OrderedInt64Key(int64(*v))), true, false
 			},
-			writeBuild: func(ptr unsafe.Pointer, sink buildFieldWriteSink) {
-				writePtrIntField[buildFieldWriteSink, T](ptr, sink, offset)
+
+			writeBuild: func(ptr unsafe.Pointer, sink BuildSink) {
+				writePtrIntField[BuildSink, T](ptr, sink, offset)
 			},
-			writeOverlay: func(ptr unsafe.Pointer, sink snapshotOverlayWriteSink) {
-				writePtrIntField[snapshotOverlayWriteSink, T](ptr, sink, offset)
+			writeOverlay: func(ptr unsafe.Pointer, sink OverlaySink) {
+				writePtrIntField[OverlaySink, T](ptr, sink, offset)
 			},
-			writeInsert: func(ptr unsafe.Pointer, sink snapshotInsertWriteSink) {
-				writePtrIntField[snapshotInsertWriteSink, T](ptr, sink, offset)
+			writeInsert: func(ptr unsafe.Pointer, sink InsertSink) {
+				writePtrIntField[InsertSink, T](ptr, sink, offset)
 			},
-			writeScratch: func(ptr unsafe.Pointer, sink *fieldWriteScratch) {
-				writePtrIntField[*fieldWriteScratch, T](ptr, sink, offset)
+			writeScratch: func(ptr unsafe.Pointer, sink *WriteScratch) {
+				writePtrIntField[*WriteScratch, T](ptr, sink, offset)
 			},
+
 			modified: func(v1, v2 unsafe.Pointer) bool {
 				p1 := ptrFieldValue[T](v1, offset)
 				p2 := ptrFieldValue[T](v2, offset)
@@ -759,23 +656,22 @@ func intFieldAccessorBundle[T signedFieldValue](offset uintptr, ptr bool) fieldA
 	}
 	return fieldAccessorBundle{
 		unique: func(ptr unsafe.Pointer) (keycodec.IndexLookupKey, bool, bool) {
-			if ptr == nil {
-				return keycodec.IndexLookupKey{}, false, false
-			}
 			return keycodec.IndexLookupU64(keycodec.OrderedInt64Key(int64(scalarFieldValue[T](ptr, offset)))), true, false
 		},
-		writeBuild: func(ptr unsafe.Pointer, sink buildFieldWriteSink) {
-			writeScalarIntField[buildFieldWriteSink, T](ptr, sink, offset)
+
+		writeBuild: func(ptr unsafe.Pointer, sink BuildSink) {
+			writeScalarIntField[BuildSink, T](ptr, sink, offset)
 		},
-		writeOverlay: func(ptr unsafe.Pointer, sink snapshotOverlayWriteSink) {
-			writeScalarIntField[snapshotOverlayWriteSink, T](ptr, sink, offset)
+		writeOverlay: func(ptr unsafe.Pointer, sink OverlaySink) {
+			writeScalarIntField[OverlaySink, T](ptr, sink, offset)
 		},
-		writeInsert: func(ptr unsafe.Pointer, sink snapshotInsertWriteSink) {
-			writeScalarIntField[snapshotInsertWriteSink, T](ptr, sink, offset)
+		writeInsert: func(ptr unsafe.Pointer, sink InsertSink) {
+			writeScalarIntField[InsertSink, T](ptr, sink, offset)
 		},
-		writeScratch: func(ptr unsafe.Pointer, sink *fieldWriteScratch) {
-			writeScalarIntField[*fieldWriteScratch, T](ptr, sink, offset)
+		writeScratch: func(ptr unsafe.Pointer, sink *WriteScratch) {
+			writeScalarIntField[*WriteScratch, T](ptr, sink, offset)
 		},
+
 		modified: func(v1, v2 unsafe.Pointer) bool {
 			return scalarFieldValue[T](v1, offset) != scalarFieldValue[T](v2, offset)
 		},
@@ -786,27 +682,26 @@ func uintFieldAccessorBundle[T unsignedFieldValue](offset uintptr, ptr bool) fie
 	if ptr {
 		return fieldAccessorBundle{
 			unique: func(ptr unsafe.Pointer) (keycodec.IndexLookupKey, bool, bool) {
-				if ptr == nil {
-					return keycodec.IndexLookupKey{}, false, false
-				}
 				v := ptrFieldValue[T](ptr, offset)
 				if v == nil {
 					return keycodec.IndexLookupKey{}, true, true
 				}
 				return keycodec.IndexLookupU64(uint64(*v)), true, false
 			},
-			writeBuild: func(ptr unsafe.Pointer, sink buildFieldWriteSink) {
-				writePtrUintField[buildFieldWriteSink, T](ptr, sink, offset)
+
+			writeBuild: func(ptr unsafe.Pointer, sink BuildSink) {
+				writePtrUintField[BuildSink, T](ptr, sink, offset)
 			},
-			writeOverlay: func(ptr unsafe.Pointer, sink snapshotOverlayWriteSink) {
-				writePtrUintField[snapshotOverlayWriteSink, T](ptr, sink, offset)
+			writeOverlay: func(ptr unsafe.Pointer, sink OverlaySink) {
+				writePtrUintField[OverlaySink, T](ptr, sink, offset)
 			},
-			writeInsert: func(ptr unsafe.Pointer, sink snapshotInsertWriteSink) {
-				writePtrUintField[snapshotInsertWriteSink, T](ptr, sink, offset)
+			writeInsert: func(ptr unsafe.Pointer, sink InsertSink) {
+				writePtrUintField[InsertSink, T](ptr, sink, offset)
 			},
-			writeScratch: func(ptr unsafe.Pointer, sink *fieldWriteScratch) {
-				writePtrUintField[*fieldWriteScratch, T](ptr, sink, offset)
+			writeScratch: func(ptr unsafe.Pointer, sink *WriteScratch) {
+				writePtrUintField[*WriteScratch, T](ptr, sink, offset)
 			},
+
 			modified: func(v1, v2 unsafe.Pointer) bool {
 				p1 := ptrFieldValue[T](v1, offset)
 				p2 := ptrFieldValue[T](v2, offset)
@@ -819,23 +714,22 @@ func uintFieldAccessorBundle[T unsignedFieldValue](offset uintptr, ptr bool) fie
 	}
 	return fieldAccessorBundle{
 		unique: func(ptr unsafe.Pointer) (keycodec.IndexLookupKey, bool, bool) {
-			if ptr == nil {
-				return keycodec.IndexLookupKey{}, false, false
-			}
 			return keycodec.IndexLookupU64(uint64(scalarFieldValue[T](ptr, offset))), true, false
 		},
-		writeBuild: func(ptr unsafe.Pointer, sink buildFieldWriteSink) {
-			writeScalarUintField[buildFieldWriteSink, T](ptr, sink, offset)
+
+		writeBuild: func(ptr unsafe.Pointer, sink BuildSink) {
+			writeScalarUintField[BuildSink, T](ptr, sink, offset)
 		},
-		writeOverlay: func(ptr unsafe.Pointer, sink snapshotOverlayWriteSink) {
-			writeScalarUintField[snapshotOverlayWriteSink, T](ptr, sink, offset)
+		writeOverlay: func(ptr unsafe.Pointer, sink OverlaySink) {
+			writeScalarUintField[OverlaySink, T](ptr, sink, offset)
 		},
-		writeInsert: func(ptr unsafe.Pointer, sink snapshotInsertWriteSink) {
-			writeScalarUintField[snapshotInsertWriteSink, T](ptr, sink, offset)
+		writeInsert: func(ptr unsafe.Pointer, sink InsertSink) {
+			writeScalarUintField[InsertSink, T](ptr, sink, offset)
 		},
-		writeScratch: func(ptr unsafe.Pointer, sink *fieldWriteScratch) {
-			writeScalarUintField[*fieldWriteScratch, T](ptr, sink, offset)
+		writeScratch: func(ptr unsafe.Pointer, sink *WriteScratch) {
+			writeScalarUintField[*WriteScratch, T](ptr, sink, offset)
 		},
+
 		modified: func(v1, v2 unsafe.Pointer) bool {
 			return scalarFieldValue[T](v1, offset) != scalarFieldValue[T](v2, offset)
 		},
@@ -846,27 +740,26 @@ func floatFieldAccessorBundle[T floatFieldValue](offset uintptr, ptr bool) field
 	if ptr {
 		return fieldAccessorBundle{
 			unique: func(ptr unsafe.Pointer) (keycodec.IndexLookupKey, bool, bool) {
-				if ptr == nil {
-					return keycodec.IndexLookupKey{}, false, false
-				}
 				v := ptrFieldValue[T](ptr, offset)
 				if v == nil {
 					return keycodec.IndexLookupKey{}, true, true
 				}
 				return keycodec.IndexLookupU64(keycodec.OrderedFloat64Key(float64(*v))), true, false
 			},
-			writeBuild: func(ptr unsafe.Pointer, sink buildFieldWriteSink) {
-				writePtrFloatField[buildFieldWriteSink, T](ptr, sink, offset)
+
+			writeBuild: func(ptr unsafe.Pointer, sink BuildSink) {
+				writePtrFloatField[BuildSink, T](ptr, sink, offset)
 			},
-			writeOverlay: func(ptr unsafe.Pointer, sink snapshotOverlayWriteSink) {
-				writePtrFloatField[snapshotOverlayWriteSink, T](ptr, sink, offset)
+			writeOverlay: func(ptr unsafe.Pointer, sink OverlaySink) {
+				writePtrFloatField[OverlaySink, T](ptr, sink, offset)
 			},
-			writeInsert: func(ptr unsafe.Pointer, sink snapshotInsertWriteSink) {
-				writePtrFloatField[snapshotInsertWriteSink, T](ptr, sink, offset)
+			writeInsert: func(ptr unsafe.Pointer, sink InsertSink) {
+				writePtrFloatField[InsertSink, T](ptr, sink, offset)
 			},
-			writeScratch: func(ptr unsafe.Pointer, sink *fieldWriteScratch) {
-				writePtrFloatField[*fieldWriteScratch, T](ptr, sink, offset)
+			writeScratch: func(ptr unsafe.Pointer, sink *WriteScratch) {
+				writePtrFloatField[*WriteScratch, T](ptr, sink, offset)
 			},
+
 			modified: func(v1, v2 unsafe.Pointer) bool {
 				p1 := ptrFieldValue[T](v1, offset)
 				p2 := ptrFieldValue[T](v2, offset)
@@ -879,23 +772,22 @@ func floatFieldAccessorBundle[T floatFieldValue](offset uintptr, ptr bool) field
 	}
 	return fieldAccessorBundle{
 		unique: func(ptr unsafe.Pointer) (keycodec.IndexLookupKey, bool, bool) {
-			if ptr == nil {
-				return keycodec.IndexLookupKey{}, false, false
-			}
 			return keycodec.IndexLookupU64(keycodec.OrderedFloat64Key(float64(scalarFieldValue[T](ptr, offset)))), true, false
 		},
-		writeBuild: func(ptr unsafe.Pointer, sink buildFieldWriteSink) {
-			writeScalarFloatField[buildFieldWriteSink, T](ptr, sink, offset)
+
+		writeBuild: func(ptr unsafe.Pointer, sink BuildSink) {
+			writeScalarFloatField[BuildSink, T](ptr, sink, offset)
 		},
-		writeOverlay: func(ptr unsafe.Pointer, sink snapshotOverlayWriteSink) {
-			writeScalarFloatField[snapshotOverlayWriteSink, T](ptr, sink, offset)
+		writeOverlay: func(ptr unsafe.Pointer, sink OverlaySink) {
+			writeScalarFloatField[OverlaySink, T](ptr, sink, offset)
 		},
-		writeInsert: func(ptr unsafe.Pointer, sink snapshotInsertWriteSink) {
-			writeScalarFloatField[snapshotInsertWriteSink, T](ptr, sink, offset)
+		writeInsert: func(ptr unsafe.Pointer, sink InsertSink) {
+			writeScalarFloatField[InsertSink, T](ptr, sink, offset)
 		},
-		writeScratch: func(ptr unsafe.Pointer, sink *fieldWriteScratch) {
-			writeScalarFloatField[*fieldWriteScratch, T](ptr, sink, offset)
+		writeScratch: func(ptr unsafe.Pointer, sink *WriteScratch) {
+			writeScalarFloatField[*WriteScratch, T](ptr, sink, offset)
 		},
+
 		modified: func(v1, v2 unsafe.Pointer) bool {
 			return scalarFieldValue[T](v1, offset) != scalarFieldValue[T](v2, offset)
 		},
@@ -904,10 +796,11 @@ func floatFieldAccessorBundle[T floatFieldValue](offset uintptr, ptr bool) field
 
 func stringSliceAccessorBundle(offset uintptr) fieldAccessorBundle {
 	return fieldAccessorBundle{
-		writeBuild:   func(ptr unsafe.Pointer, sink buildFieldWriteSink) { writeStringSliceField(ptr, sink, offset) },
-		writeOverlay: func(ptr unsafe.Pointer, sink snapshotOverlayWriteSink) { writeStringSliceField(ptr, sink, offset) },
-		writeInsert:  func(ptr unsafe.Pointer, sink snapshotInsertWriteSink) { writeStringSliceField(ptr, sink, offset) },
-		writeScratch: func(ptr unsafe.Pointer, sink *fieldWriteScratch) { writeStringSliceField(ptr, sink, offset) },
+		writeBuild:   func(ptr unsafe.Pointer, sink BuildSink) { writeStringSliceField(ptr, sink, offset) },
+		writeOverlay: func(ptr unsafe.Pointer, sink OverlaySink) { writeStringSliceField(ptr, sink, offset) },
+		writeInsert:  func(ptr unsafe.Pointer, sink InsertSink) { writeStringSliceField(ptr, sink, offset) },
+		writeScratch: func(ptr unsafe.Pointer, sink *WriteScratch) { writeStringSliceField(ptr, sink, offset) },
+
 		modified: func(v1, v2 unsafe.Pointer) bool {
 			return slicesModified(sliceFieldValue[string](v1, offset), sliceFieldValue[string](v2, offset))
 		},
@@ -916,10 +809,11 @@ func stringSliceAccessorBundle(offset uintptr) fieldAccessorBundle {
 
 func boolSliceAccessorBundle(offset uintptr) fieldAccessorBundle {
 	return fieldAccessorBundle{
-		writeBuild:   func(ptr unsafe.Pointer, sink buildFieldWriteSink) { writeBoolSliceField(ptr, sink, offset) },
-		writeOverlay: func(ptr unsafe.Pointer, sink snapshotOverlayWriteSink) { writeBoolSliceField(ptr, sink, offset) },
-		writeInsert:  func(ptr unsafe.Pointer, sink snapshotInsertWriteSink) { writeBoolSliceField(ptr, sink, offset) },
-		writeScratch: func(ptr unsafe.Pointer, sink *fieldWriteScratch) { writeBoolSliceField(ptr, sink, offset) },
+		writeBuild:   func(ptr unsafe.Pointer, sink BuildSink) { writeBoolSliceField(ptr, sink, offset) },
+		writeOverlay: func(ptr unsafe.Pointer, sink OverlaySink) { writeBoolSliceField(ptr, sink, offset) },
+		writeInsert:  func(ptr unsafe.Pointer, sink InsertSink) { writeBoolSliceField(ptr, sink, offset) },
+		writeScratch: func(ptr unsafe.Pointer, sink *WriteScratch) { writeBoolSliceField(ptr, sink, offset) },
+
 		modified: func(v1, v2 unsafe.Pointer) bool {
 			return slicesModified(sliceFieldValue[bool](v1, offset), sliceFieldValue[bool](v2, offset))
 		},
@@ -928,18 +822,19 @@ func boolSliceAccessorBundle(offset uintptr) fieldAccessorBundle {
 
 func intSliceAccessorBundle[T signedFieldValue](offset uintptr) fieldAccessorBundle {
 	return fieldAccessorBundle{
-		writeBuild: func(ptr unsafe.Pointer, sink buildFieldWriteSink) {
-			writeIntSliceField[buildFieldWriteSink, T](ptr, sink, offset)
+		writeBuild: func(ptr unsafe.Pointer, sink BuildSink) {
+			writeIntSliceField[BuildSink, T](ptr, sink, offset)
 		},
-		writeOverlay: func(ptr unsafe.Pointer, sink snapshotOverlayWriteSink) {
-			writeIntSliceField[snapshotOverlayWriteSink, T](ptr, sink, offset)
+		writeOverlay: func(ptr unsafe.Pointer, sink OverlaySink) {
+			writeIntSliceField[OverlaySink, T](ptr, sink, offset)
 		},
-		writeInsert: func(ptr unsafe.Pointer, sink snapshotInsertWriteSink) {
-			writeIntSliceField[snapshotInsertWriteSink, T](ptr, sink, offset)
+		writeInsert: func(ptr unsafe.Pointer, sink InsertSink) {
+			writeIntSliceField[InsertSink, T](ptr, sink, offset)
 		},
-		writeScratch: func(ptr unsafe.Pointer, sink *fieldWriteScratch) {
-			writeIntSliceField[*fieldWriteScratch, T](ptr, sink, offset)
+		writeScratch: func(ptr unsafe.Pointer, sink *WriteScratch) {
+			writeIntSliceField[*WriteScratch, T](ptr, sink, offset)
 		},
+
 		modified: func(v1, v2 unsafe.Pointer) bool {
 			return slicesModified(sliceFieldValue[T](v1, offset), sliceFieldValue[T](v2, offset))
 		},
@@ -948,18 +843,19 @@ func intSliceAccessorBundle[T signedFieldValue](offset uintptr) fieldAccessorBun
 
 func uintSliceAccessorBundle[T unsignedFieldValue](offset uintptr) fieldAccessorBundle {
 	return fieldAccessorBundle{
-		writeBuild: func(ptr unsafe.Pointer, sink buildFieldWriteSink) {
-			writeUintSliceField[buildFieldWriteSink, T](ptr, sink, offset)
+		writeBuild: func(ptr unsafe.Pointer, sink BuildSink) {
+			writeUintSliceField[BuildSink, T](ptr, sink, offset)
 		},
-		writeOverlay: func(ptr unsafe.Pointer, sink snapshotOverlayWriteSink) {
-			writeUintSliceField[snapshotOverlayWriteSink, T](ptr, sink, offset)
+		writeOverlay: func(ptr unsafe.Pointer, sink OverlaySink) {
+			writeUintSliceField[OverlaySink, T](ptr, sink, offset)
 		},
-		writeInsert: func(ptr unsafe.Pointer, sink snapshotInsertWriteSink) {
-			writeUintSliceField[snapshotInsertWriteSink, T](ptr, sink, offset)
+		writeInsert: func(ptr unsafe.Pointer, sink InsertSink) {
+			writeUintSliceField[InsertSink, T](ptr, sink, offset)
 		},
-		writeScratch: func(ptr unsafe.Pointer, sink *fieldWriteScratch) {
-			writeUintSliceField[*fieldWriteScratch, T](ptr, sink, offset)
+		writeScratch: func(ptr unsafe.Pointer, sink *WriteScratch) {
+			writeUintSliceField[*WriteScratch, T](ptr, sink, offset)
 		},
+
 		modified: func(v1, v2 unsafe.Pointer) bool {
 			return slicesModified(sliceFieldValue[T](v1, offset), sliceFieldValue[T](v2, offset))
 		},
@@ -968,28 +864,26 @@ func uintSliceAccessorBundle[T unsignedFieldValue](offset uintptr) fieldAccessor
 
 func floatSliceAccessorBundle[T floatFieldValue](offset uintptr) fieldAccessorBundle {
 	return fieldAccessorBundle{
-		writeBuild: func(ptr unsafe.Pointer, sink buildFieldWriteSink) {
-			writeFloatSliceField[buildFieldWriteSink, T](ptr, sink, offset)
+		writeBuild: func(ptr unsafe.Pointer, sink BuildSink) {
+			writeFloatSliceField[BuildSink, T](ptr, sink, offset)
 		},
-		writeOverlay: func(ptr unsafe.Pointer, sink snapshotOverlayWriteSink) {
-			writeFloatSliceField[snapshotOverlayWriteSink, T](ptr, sink, offset)
+		writeOverlay: func(ptr unsafe.Pointer, sink OverlaySink) {
+			writeFloatSliceField[OverlaySink, T](ptr, sink, offset)
 		},
-		writeInsert: func(ptr unsafe.Pointer, sink snapshotInsertWriteSink) {
-			writeFloatSliceField[snapshotInsertWriteSink, T](ptr, sink, offset)
+		writeInsert: func(ptr unsafe.Pointer, sink InsertSink) {
+			writeFloatSliceField[InsertSink, T](ptr, sink, offset)
 		},
-		writeScratch: func(ptr unsafe.Pointer, sink *fieldWriteScratch) {
-			writeFloatSliceField[*fieldWriteScratch, T](ptr, sink, offset)
+		writeScratch: func(ptr unsafe.Pointer, sink *WriteScratch) {
+			writeFloatSliceField[*WriteScratch, T](ptr, sink, offset)
 		},
+
 		modified: func(v1, v2 unsafe.Pointer) bool {
 			return slicesModified(sliceFieldValue[T](v1, offset), sliceFieldValue[T](v2, offset))
 		},
 	}
 }
 
-func buildPatchValueEqualFn(f *field, fieldType reflect.Type, offset uintptr) patchValueEqualFn {
-	if f == nil {
-		return nil
-	}
+func buildPatchValueEqualFn(f *Field, fieldType reflect.Type, offset uintptr) PatchValueEqualFn {
 	if f.UseVI {
 		return nil
 	}
@@ -1063,10 +957,7 @@ func buildPatchValueEqualFn(f *field, fieldType reflect.Type, offset uintptr) pa
 	}
 }
 
-func buildPatchValueCopyFn(f *field, fieldType reflect.Type, offset uintptr) patchValueCopyFn {
-	if f == nil {
-		return nil
-	}
+func buildPatchValueCopyFn(f *Field, fieldType reflect.Type, offset uintptr) PatchValueCopyFn {
 	if f.UseVI {
 		return nil
 	}
@@ -1139,12 +1030,8 @@ func buildPatchValueCopyFn(f *field, fieldType reflect.Type, offset uintptr) pat
 	return nil
 }
 
-func buildFieldAccessorBundle(f *field, fieldType reflect.Type, offset uintptr) (fieldAccessorBundle, error) {
-	if f == nil {
-		return fieldAccessorBundle{}, nil
-	}
-
-	if isNativeTimeField(f) {
+func buildFieldAccessorBundle(f *Field, fieldType reflect.Type, offset uintptr) (fieldAccessorBundle, error) {
+	if IsNativeTimeField(f) {
 		return timeFieldAccessorBundle(offset, f.Ptr), nil
 	}
 
@@ -1224,25 +1111,62 @@ func buildFieldAccessorBundle(f *field, fieldType reflect.Type, offset uintptr) 
 	}
 }
 
-func makeIndexedFieldAccessor(vtype reflect.Type, f *field) (indexedFieldAccessor, error) {
-	acc := indexedFieldAccessor{
-		name:  f.DBName,
-		field: f,
+func makeIndexedFieldAccessor(vtype reflect.Type, f *Field) (IndexedFieldAccessor, error) {
+	acc := IndexedFieldAccessor{
+		Name:  f.DBName,
+		Field: f,
 	}
 
 	fieldType, offset := resolveFieldTypeAndOffset(vtype, f.Index)
 	bundle, err := buildFieldAccessorBundle(f, fieldType, offset)
 	if err != nil {
-		return indexedFieldAccessor{}, err
+		return IndexedFieldAccessor{}, err
 	}
 
-	acc.writeBuild = bundle.writeBuild
-	acc.writeOverlay = bundle.writeOverlay
-	acc.writeInsert = bundle.writeInsert
-	acc.writeScratch = bundle.writeScratch
-	acc.modified = bundle.modified
+	acc.WriteBuild = bundle.writeBuild
+	acc.WriteOverlay = bundle.writeOverlay
+	acc.WriteInsert = bundle.writeInsert
+	acc.WriteScratch = bundle.writeScratch
+	acc.Modified = bundle.modified
+
 	if f.Unique && !f.Slice {
-		acc.uniqueGetter = bundle.unique
+		acc.UniqueGetter = bundle.unique
 	}
 	return acc, nil
+}
+
+func makeIndexedFieldAccessors(vtype reflect.Type, fields map[string]*Field) ([]IndexedFieldAccessor, []IndexedFieldAccessor, []IndexedFieldAccessor, IndexedFieldMap, error) {
+	if len(fields) == 0 {
+		return nil, nil, nil, nil, nil
+	}
+
+	access := make([]IndexedFieldAccessor, 0, len(fields))
+	validationAccess := make([]IndexedFieldAccessor, 0, len(fields))
+	uniqueAccess := make([]IndexedFieldAccessor, 0, 4)
+	fieldMap := make(IndexedFieldMap, len(fields))
+
+	names := make([]string, 0, len(fields))
+	for name := range fields {
+		names = append(names, name)
+	}
+	slices.Sort(names)
+
+	for _, name := range names {
+		f := fields[name]
+		acc, err := makeIndexedFieldAccessor(vtype, f)
+		if err != nil {
+			return nil, nil, nil, nil, err
+		}
+		acc.Ordinal = len(access)
+		access = append(access, acc)
+		if f.UseVI || f.Kind == reflect.String {
+			validationAccess = append(validationAccess, acc)
+		}
+		fieldMap[f.DBName] = acc
+		if f.Unique && !f.Slice {
+			uniqueAccess = append(uniqueAccess, acc)
+		}
+	}
+
+	return access, validationAccess, uniqueAccess, fieldMap, nil
 }

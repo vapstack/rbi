@@ -8,26 +8,19 @@ import (
 	"github.com/vapstack/rbi/internal/pooled"
 	"github.com/vapstack/rbi/internal/posting"
 	"github.com/vapstack/rbi/internal/qir"
+	"github.com/vapstack/rbi/internal/schema"
 	"github.com/vapstack/rbi/internal/strmap"
 )
 
 type queryEngine struct {
 	snapshot                       *snapshotManager
-	fields                         map[string]*field
-	measureFields                  map[string]*field
-	indexedFieldAccess             []indexedFieldAccessor
-	indexedStringValidationAccess  []indexedFieldAccessor
-	indexedFieldMap                indexedFieldMap
-	uniqueFieldAccessors           []indexedFieldAccessor
-	measureFieldAccess             []measureFieldAccessor
-	measureFieldMap                measureFieldMap
+	schema                         *schema.Runtime
 	index                          []indexdata.FieldStorage
 	nilIndex                       []indexdata.FieldStorage
 	lenIndex                       []indexdata.FieldStorage
 	lenZeroComplement              []bool
 	measure                        []indexdata.MeasureStorage
 	universe                       posting.List
-	hasUnique                      bool
 	lenIndexLoaded                 bool
 	matPredCacheMaxEntries         int
 	matPredCacheMaxCard            uint64
@@ -47,7 +40,6 @@ func (qe *queryEngine) makeQueryView(snap *indexSnapshot) *queryView {
 		snap:              snap,
 		strKey:            snap.strmap != nil,
 		strMapView:        snap.strmap,
-		fields:            qe.fields,
 		planner:           qe.planner,
 		lenZeroComplement: snap.lenZeroComplement,
 	}
@@ -60,7 +52,7 @@ func (qe *queryEngine) releaseQueryView(view *queryView) {
 
 func (qe *queryEngine) initSnapshotRuntimeCaches(s *indexSnapshot) {
 	s.numericRangeBucketCache = numericRangeBucketCachePool.Get()
-	s.numericRangeBucketCache.init(len(qe.indexedFieldAccess))
+	s.numericRangeBucketCache.init(len(qe.schema.Indexed))
 	s.matPredCacheMaxEntries = qe.matPredCacheMaxEntries
 	s.matPredCacheMaxCard = qe.matPredCacheMaxCard
 	if s.matPredCacheMaxEntries > 0 {
@@ -78,7 +70,7 @@ func (qe *queryEngine) buildPublishedSnapshotNoLock(seq uint64, sm *strmap.Snaps
 		lenIndex:           qe.lenIndex,
 		lenZeroComplement:  qe.lenZeroComplement,
 		measure:            qe.measure,
-		indexedFieldByName: qe.indexedFieldMap,
+		indexedFieldByName: qe.schema.IndexedByName,
 		universe:           qe.universe,
 		strmap:             sm,
 	}
@@ -90,11 +82,11 @@ func (qe *queryEngine) publishSnapshotNoLock(seq uint64, sm *strmap.Snapshot) {
 	prev := qe.snapshot.current.Load()
 	snap := qe.buildPublishedSnapshotNoLock(seq, sm)
 	if prev != nil {
-		snap.index = indexdata.CloneFieldStorageSlots(qe.index, len(qe.indexedFieldAccess))
-		snap.nilIndex = indexdata.CloneFieldStorageSlots(qe.nilIndex, len(qe.indexedFieldAccess))
-		snap.lenIndex = indexdata.CloneFieldStorageSlots(qe.lenIndex, len(qe.indexedFieldAccess))
-		snap.lenZeroComplement = cloneFieldIndexBoolSlots(qe.lenZeroComplement, len(qe.indexedFieldAccess))
-		snap.measure = indexdata.CloneMeasureStorageSlots(qe.measure, len(qe.measureFieldAccess))
+		snap.index = indexdata.CloneFieldStorageSlots(qe.index, len(qe.schema.Indexed))
+		snap.nilIndex = indexdata.CloneFieldStorageSlots(qe.nilIndex, len(qe.schema.Indexed))
+		snap.lenIndex = indexdata.CloneFieldStorageSlots(qe.lenIndex, len(qe.schema.Indexed))
+		snap.lenZeroComplement = cloneFieldIndexBoolSlots(qe.lenZeroComplement, len(qe.schema.Indexed))
+		snap.measure = indexdata.CloneMeasureStorageSlots(qe.measure, len(qe.schema.Measures))
 	}
 	snap.retainSharedOwnedStorageFrom(prev)
 	qe.finishSnapshotPublishNoLock(snap)
@@ -150,10 +142,10 @@ func (qe *queryEngine) unpinCurrentSnapshot(seq uint64, ref *snapshotRef, pinned
 }
 
 func (qe *queryEngine) fieldNameByOrdinal(ordinal int) string {
-	if ordinal < 0 || ordinal >= len(qe.indexedFieldAccess) {
+	if ordinal < 0 || ordinal >= len(qe.schema.Indexed) {
 		return ""
 	}
-	return qe.indexedFieldAccess[ordinal].name
+	return qe.schema.Indexed[ordinal].Name
 }
 
 func (qe *queryEngine) traceOrCalibrationSamplingEnabled() bool {

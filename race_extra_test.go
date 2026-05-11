@@ -957,7 +957,7 @@ func TestRaceExtra_PublicNumericRangeQueriesStayExactAcrossConcurrentUnchangedFi
 		}
 		defer prepared.Release()
 		f := db.engine.fieldNameByOrdinal(compiled.FieldOrdinal)
-		fm := view.fields[f]
+		fm := view.engine.schema.Fields[f]
 		if fm == nil {
 			t.Fatalf("expected field metadata for %q", f)
 		}

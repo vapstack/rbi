@@ -21,25 +21,26 @@ import (
 	"github.com/vapstack/rbi/internal/keycodec"
 	"github.com/vapstack/rbi/internal/pooled"
 	"github.com/vapstack/rbi/internal/posting"
+	"github.com/vapstack/rbi/internal/schema"
 	"github.com/vapstack/rbi/internal/strmap"
 	"go.etcd.io/bbolt"
 )
 
-func cleanupBuildIndexFailure(buildOK *bool, fieldStates []*buildIndexFieldState, localUniverse []posting.List) {
+func cleanupBuildIndexFailure(buildOK *bool, fieldStates []*schema.BuildFieldState, localUniverse []posting.List) {
 	if *buildOK {
 		return
 	}
 	for i := range fieldStates {
-		fieldStates[i].release()
+		fieldStates[i].Release()
 	}
 	for i := range localUniverse {
 		localUniverse[i].Release()
 	}
 }
 
-func releaseBuildIndexLocalStates(localStates []buildIndexFieldLocalState) {
+func releaseBuildIndexLocalStates(localStates []schema.BuildFieldLocalState) {
 	for i := range localStates {
-		localStates[i].release()
+		localStates[i].Release()
 	}
 }
 
@@ -123,193 +124,6 @@ func formatBuildIndexKeyDiagnostic(strKey bool, key []byte) string {
 	return fmt.Sprintf("key_len=%d key_prefix_hex=%s", len(key), formatDiagnosticBytesPrefix(key, 24))
 }
 
-/**/
-
-type buildIndexFieldState struct {
-	runsMu sync.Mutex
-	runs   []indexdata.FieldStorageRun
-
-	nilMu sync.Mutex
-	nils  posting.List
-
-	lenMu  sync.Mutex
-	lenMap map[uint32]posting.List
-}
-
-type buildIndexFieldLocalState struct {
-	numeric bool
-	vals    map[string]posting.List
-	fixed   map[uint64]posting.List
-	lenMap  map[uint32]posting.List
-	nils    posting.List
-}
-
-func buildIndexRunTargetEntries() int {
-	return max(4<<10, indexdata.FieldChunkTargetEntries*16)
-}
-
-func newBuildIndexFieldState(slice bool) *buildIndexFieldState {
-	state := &buildIndexFieldState{}
-	if slice {
-		state.lenMap = make(map[uint32]posting.List, 8)
-	}
-	return state
-}
-
-func newBuildIndexFieldLocalState(numeric bool, slice bool) buildIndexFieldLocalState {
-	state := buildIndexFieldLocalState{numeric: numeric}
-	if slice {
-		state.lenMap = make(map[uint32]posting.List, 8)
-	}
-	return state
-}
-
-func (s *buildIndexFieldLocalState) addValue(key string, idx uint64) {
-	if s.vals == nil {
-		s.vals = indexdata.GetPostingMap()
-	}
-	s.vals[key] = s.vals[key].BuildAdded(idx)
-}
-
-func (s *buildIndexFieldLocalState) addFixedValue(key uint64, idx uint64) {
-	if s.fixed == nil {
-		s.fixed = indexdata.GetFixedPostingMap()
-	}
-	s.fixed[key] = s.fixed[key].BuildAdded(idx)
-}
-
-func (s *buildIndexFieldLocalState) addNil(idx uint64) {
-	s.nils = s.nils.BuildAdded(idx)
-}
-
-func (s *buildIndexFieldLocalState) addLen(length int, idx uint64) {
-	if length < 0 {
-		return
-	}
-	if s.lenMap == nil {
-		s.lenMap = make(map[uint32]posting.List, 8)
-	}
-	ln := uint32(length)
-	s.lenMap[ln] = s.lenMap[ln].BuildAdded(idx)
-}
-
-func (s *buildIndexFieldLocalState) shouldFlushRegular() bool {
-	if s.numeric {
-		return len(s.fixed) >= buildIndexRunTargetEntries()
-	}
-	return len(s.vals) >= buildIndexRunTargetEntries()
-}
-
-func (s *buildIndexFieldState) appendRun(run indexdata.FieldStorageRun) {
-	if s == nil || run.KeyCount() == 0 {
-		return
-	}
-	s.runsMu.Lock()
-	s.runs = append(s.runs, run)
-	s.runsMu.Unlock()
-}
-
-func (s *buildIndexFieldLocalState) flushRegularInto(dst *buildIndexFieldState) {
-	if s == nil || dst == nil {
-		return
-	}
-	if s.numeric {
-		if run := indexdata.NewFixedFieldStorageRunFromPostingMap(s.fixed); run.KeyCount() > 0 {
-			dst.appendRun(run)
-		}
-		return
-	}
-	if run := indexdata.NewStringFieldStorageRunFromPostingMap(s.vals); run.KeyCount() > 0 {
-		dst.appendRun(run)
-	}
-}
-
-func (s *buildIndexFieldLocalState) flushAllInto(dst *buildIndexFieldState) {
-	if s == nil || dst == nil {
-		return
-	}
-	s.flushRegularInto(dst)
-	if !s.nils.IsEmpty() {
-		dst.nilMu.Lock()
-		ids := dst.nils
-		ids = ids.BuildMergedOwned(s.nils)
-		dst.nils = ids
-		dst.nilMu.Unlock()
-		s.nils = posting.List{}
-	}
-	if len(s.lenMap) > 0 {
-		dst.lenMu.Lock()
-		for ln, ids := range s.lenMap {
-			merged := dst.lenMap[ln]
-			merged = merged.BuildMergedOwned(ids)
-			dst.lenMap[ln] = merged
-		}
-		dst.lenMu.Unlock()
-		clear(s.lenMap)
-	}
-}
-
-func (s *buildIndexFieldLocalState) release() {
-	if s == nil {
-		return
-	}
-
-	posting.ReleaseMap(s.vals)
-	indexdata.ReleasePostingMap(s.vals)
-	s.vals = nil
-
-	posting.ReleaseMap(s.fixed)
-	indexdata.ReleaseFixedPostingMap(s.fixed)
-	s.fixed = nil
-
-	posting.ReleaseMap(s.lenMap)
-	s.lenMap = nil
-
-	s.nils.Release()
-	s.nils = posting.List{}
-}
-
-func (s *buildIndexFieldState) materializeStorage() indexdata.FieldStorage {
-	if s == nil || len(s.runs) == 0 {
-		return indexdata.FieldStorage{}
-	}
-	runs := s.runs
-	s.runs = nil
-	return indexdata.NewRegularFieldStorageFromRunsOwned(runs)
-}
-
-func (s *buildIndexFieldState) release() {
-	if s == nil {
-		return
-	}
-	indexdata.ReleaseFieldStorageRunsOwned(s.runs)
-	s.runs = nil
-
-	s.nils.Release()
-	s.nils = posting.List{}
-
-	posting.ReleaseMap(s.lenMap)
-	s.lenMap = nil
-}
-
-func (s *buildIndexFieldState) materializeNilStorage() indexdata.FieldStorage {
-	if s == nil {
-		return indexdata.FieldStorage{}
-	}
-	ids := s.nils
-	s.nils = posting.List{}
-	return indexdata.NewNilFieldStorageOwned(ids)
-}
-
-func (s *buildIndexFieldState) materializeLenStorage(universe posting.List) (indexdata.FieldStorage, bool) {
-	if s == nil {
-		return indexdata.FieldStorage{}, false
-	}
-	lenMap := s.lenMap
-	s.lenMap = nil
-	return indexdata.NewLenFieldStorageFromMapOwned(universe, lenMap)
-}
-
 func (db *DB[K, V]) buildIndex(skipFields map[string]struct{}, skipMeasureFields map[string]struct{}) error {
 	result, err := db.engine.buildIndex(
 		db.bolt,
@@ -364,25 +178,25 @@ func (qe *queryEngine) buildIndex(
 	}
 
 	type buildField struct {
-		acc     indexedFieldAccessor
+		acc     schema.IndexedFieldAccessor
 		slice   bool
 		numeric bool
 	}
 
-	active := make([]buildField, 0, len(qe.indexedFieldAccess))
-	for _, acc := range qe.indexedFieldAccess {
-		if _, skip := skipFields[acc.name]; skip {
+	active := make([]buildField, 0, len(qe.schema.Indexed))
+	for _, acc := range qe.schema.Indexed {
+		if _, skip := skipFields[acc.Name]; skip {
 			continue
 		}
 		active = append(active, buildField{
 			acc:     acc,
-			slice:   acc.field.Slice,
-			numeric: acc.field.KeyKind == fieldWriteKeysOrderedU64,
+			slice:   acc.Field.Slice,
+			numeric: acc.Field.KeyKind == schema.FieldWriteKeysOrderedU64,
 		})
 	}
-	activeMeasures := make([]measureFieldAccessor, 0, len(qe.measureFieldAccess))
-	for _, acc := range qe.measureFieldAccess {
-		if _, skip := skipMeasureFields[acc.name]; skip {
+	activeMeasures := make([]schema.MeasureFieldAccessor, 0, len(qe.schema.Measures))
+	for _, acc := range qe.schema.Measures {
+		if _, skip := skipMeasureFields[acc.Name]; skip {
 			continue
 		}
 		activeMeasures = append(activeMeasures, acc)
@@ -407,9 +221,9 @@ func (qe *queryEngine) buildIndex(
 		pos uint64
 	}
 
-	fieldStates := make([]*buildIndexFieldState, len(active))
+	fieldStates := make([]*schema.BuildFieldState, len(active))
 	for i := range active {
-		fieldStates[i] = newBuildIndexFieldState(active[i].slice)
+		fieldStates[i] = schema.NewBuildFieldState(active[i].slice)
 	}
 
 	jobs := make(chan rawdata, 10000)
@@ -437,12 +251,12 @@ func (qe *queryEngine) buildIndex(
 			lu := localUniverse[widx]
 			lu.Release()
 			lu = posting.List{}
-			localStates := make([]buildIndexFieldLocalState, len(active))
+			localStates := make([]schema.BuildFieldLocalState, len(active))
 			for i := range active {
-				localStates[i] = newBuildIndexFieldLocalState(active[i].numeric, active[i].slice)
+				localStates[i] = schema.NewBuildFieldLocalState(active[i].numeric, active[i].slice)
 			}
 			defer releaseBuildIndexLocalStates(localStates)
-			localMeasures := make([][]indexdata.MeasureEntry, len(qe.measureFieldAccess))
+			localMeasures := make([][]indexdata.MeasureEntry, len(qe.schema.Measures))
 			measureOK := false
 			defer func() {
 				if !measureOK {
@@ -473,11 +287,11 @@ func (qe *queryEngine) buildIndex(
 
 				for k := range active {
 					var fieldErr error
-					active[k].acc.writeBuild(ptr, buildFieldWriteSink{
-						state: &localStates[k],
-						idx:   idx,
-						field: active[k].acc.name,
-						err:   &fieldErr,
+					active[k].acc.WriteBuild(ptr, schema.BuildSink{
+						State: &localStates[k],
+						Idx:   idx,
+						Field: active[k].acc.Name,
+						Err:   &fieldErr,
 					})
 					if fieldErr != nil {
 						release(ptr)
@@ -488,31 +302,31 @@ func (qe *queryEngine) buildIndex(
 							kv.pos,
 							formatBuildIndexKeyDiagnostic(strKey, kv.key),
 							kv.idx,
-							active[k].acc.name,
+							active[k].acc.Name,
 							fieldErr,
 						)
 						cancel()
 						return
 					}
-					if localStates[k].shouldFlushRegular() {
-						localStates[k].flushRegularInto(fieldStates[k])
+					if localStates[k].ShouldFlushRegular() {
+						localStates[k].FlushRegularInto(fieldStates[k])
 					}
 				}
 				for _, acc := range activeMeasures {
-					if value, ok := acc.read(ptr); ok {
-						buf := localMeasures[acc.ordinal]
+					if value, ok := acc.Read(ptr); ok {
+						buf := localMeasures[acc.Ordinal]
 						if buf == nil {
 							buf = indexdata.GetMeasureEntrySlice(0)
-							localMeasures[acc.ordinal] = buf
+							localMeasures[acc.Ordinal] = buf
 						}
 						buf = append(buf, indexdata.MeasureEntry{ID: idx, Value: value})
-						localMeasures[acc.ordinal] = buf
+						localMeasures[acc.Ordinal] = buf
 					}
 				}
 				release(ptr)
 			}
 			for i := range localStates {
-				localStates[i].flushAllInto(fieldStates[i])
+				localStates[i].FlushAllInto(fieldStates[i])
 			}
 			localUniverse[widx] = lu
 			localMeasureStates[widx] = localMeasures
@@ -581,7 +395,7 @@ func (qe *queryEngine) buildIndex(
 		}
 	}
 
-	slotCount := len(qe.indexedFieldAccess)
+	slotCount := len(qe.schema.Indexed)
 	if qe.index == nil || len(qe.index) != slotCount {
 		indexdata.ReleaseFieldStorageSlots(qe.index)
 		qe.index = indexdata.GetFieldStorageSlice(slotCount)[:slotCount]
@@ -604,12 +418,12 @@ func (qe *queryEngine) buildIndex(
 		clear(qe.lenZeroComplement)
 	} else {
 		for i := range active {
-			qe.lenZeroComplement[active[i].acc.ordinal] = false
+			qe.lenZeroComplement[active[i].acc.Ordinal] = false
 		}
 	}
-	if qe.measure == nil || len(qe.measure) != len(qe.measureFieldAccess) {
+	if qe.measure == nil || len(qe.measure) != len(qe.schema.Measures) {
 		indexdata.ReleaseMeasureStorageSlots(qe.measure)
-		measureSlotCount := len(qe.measureFieldAccess)
+		measureSlotCount := len(qe.schema.Measures)
 		qe.measure = indexdata.GetMeasureStorageSlice(measureSlotCount)[:measureSlotCount]
 	}
 
@@ -622,9 +436,9 @@ func (qe *queryEngine) buildIndex(
 	}
 
 	for i := range fieldStates {
-		ordinal := active[i].acc.ordinal
+		ordinal := active[i].acc.Ordinal
 		oldIndexStorage := qe.index[ordinal]
-		if storage := fieldStates[i].materializeStorage(); storage.KeyCount() > 0 {
+		if storage := fieldStates[i].MaterializeStorage(); storage.KeyCount() > 0 {
 			oldIndexStorage.Release()
 			qe.index[ordinal] = storage
 		} else {
@@ -632,7 +446,7 @@ func (qe *queryEngine) buildIndex(
 			qe.index[ordinal] = indexdata.FieldStorage{}
 		}
 		oldNilStorage := qe.nilIndex[ordinal]
-		if storage := fieldStates[i].materializeNilStorage(); storage.KeyCount() > 0 {
+		if storage := fieldStates[i].MaterializeNilStorage(); storage.KeyCount() > 0 {
 			oldNilStorage.Release()
 			qe.nilIndex[ordinal] = storage
 		} else {
@@ -640,7 +454,7 @@ func (qe *queryEngine) buildIndex(
 			qe.nilIndex[ordinal] = indexdata.FieldStorage{}
 		}
 		oldLenStorage := qe.lenIndex[ordinal]
-		if storage, useZeroComplement := fieldStates[i].materializeLenStorage(qe.universe); active[i].slice {
+		if storage, useZeroComplement := fieldStates[i].MaterializeLenStorage(qe.universe); active[i].slice {
 			if storage.KeyCount() > 0 {
 				oldLenStorage.Release()
 				qe.lenIndex[ordinal] = storage
@@ -657,7 +471,7 @@ func (qe *queryEngine) buildIndex(
 	if len(activeMeasures) > 0 {
 		oldMeasureStorages = indexdata.GetMeasureStorageSlice(len(activeMeasures))
 		for _, acc := range activeMeasures {
-			i := acc.ordinal
+			i := acc.Ordinal
 			entries := indexdata.GetMeasureEntrySlice(0)
 			for worker := range localMeasureStates {
 				if i >= len(localMeasureStates[worker]) {
@@ -684,10 +498,10 @@ func (qe *queryEngine) buildIndex(
 	buildTime := time.Since(start)
 	buildRPS := int(float64(recordCount) / max(buildTime.Seconds(), 1))
 
-	for name, f := range qe.fields {
+	for name, f := range qe.schema.Fields {
 		if f.Slice {
-			acc, ok := qe.indexedFieldMap[name]
-			if !ok || qe.lenIndex[acc.ordinal].KeyCount() == 0 {
+			acc, ok := qe.schema.IndexedByName[name]
+			if !ok || qe.lenIndex[acc.Ordinal].KeyCount() == 0 {
 				qe.buildLenIndex()
 				break
 			}
@@ -720,82 +534,16 @@ func (qe *queryEngine) buildIndex(
 	}, nil
 }
 
-func addDistinctStrings(n int, valueAt func(int) string, add func(string)) int {
-	if n == 0 {
-		return 0
-	}
-	if n == 1 {
-		add(valueAt(0))
-		return 1
-	}
-	seen := stringSetPool.Get(n)
-	defer stringSetPool.Put(seen)
-	distinct := 0
-	for i := 0; i < n; i++ {
-		cur := valueAt(i)
-		if _, ok := seen[cur]; ok {
-			continue
-		}
-		seen[cur] = struct{}{}
-		distinct++
-		add(cur)
-	}
-	return distinct
-}
-
-type buildFieldWriteSink struct {
-	state *buildIndexFieldLocalState
-	idx   uint64
-	field string
-	err   *error
-}
-
-func (s buildFieldWriteSink) setNil() {
-	if s.state == nil {
-		return
-	}
-	s.state.addNil(s.idx)
-}
-
-func (s buildFieldWriteSink) setLen(length int) {
-	if s.state == nil {
-		return
-	}
-	s.state.addLen(length, s.idx)
-}
-
-func (s buildFieldWriteSink) addString(key string) {
-	if s.err != nil && *s.err == nil && len(key) > indexdata.FieldStringRefMax {
-		if s.field != "" {
-			*s.err = fmt.Errorf("field %q indexed string value len %d exceeds limit %d", s.field, len(key), indexdata.FieldStringRefMax)
-		} else {
-			*s.err = indexdata.ValidateIndexedStringKeyLen(len(key))
-		}
-		return
-	}
-	if s.state == nil {
-		return
-	}
-	s.state.addValue(key, s.idx)
-}
-
-func (s buildFieldWriteSink) addFixed(key uint64) {
-	if s.state == nil {
-		return
-	}
-	s.state.addFixedValue(key, s.idx)
-}
-
 func (db *DB[K, V]) validateIndexedStringValues(val *V) error {
 	if db.engine == nil || val == nil {
 		return nil
 	}
 	ptr := unsafe.Pointer(val)
-	for _, acc := range db.engine.indexedStringValidationAccess {
+	for _, acc := range db.engine.schema.StringValidation {
 		var fieldErr error
-		acc.writeBuild(ptr, buildFieldWriteSink{
-			field: acc.name,
-			err:   &fieldErr,
+		acc.WriteBuild(ptr, schema.BuildSink{
+			Field: acc.Name,
+			Err:   &fieldErr,
 		})
 		if fieldErr != nil {
 			return fieldErr
@@ -806,7 +554,7 @@ func (db *DB[K, V]) validateIndexedStringValues(val *V) error {
 
 func (qe *queryEngine) buildLenIndex() {
 	indexdata.ReleaseFieldStorageSlots(qe.lenIndex)
-	slotCount := len(qe.indexedFieldAccess)
+	slotCount := len(qe.schema.Indexed)
 	qe.lenIndex = indexdata.GetFieldStorageSlice(slotCount)[:slotCount]
 	if qe.lenZeroComplement != nil {
 		pooled.ReleaseBoolSlice(qe.lenZeroComplement)
@@ -814,14 +562,14 @@ func (qe *queryEngine) buildLenIndex() {
 	qe.lenZeroComplement = pooled.GetBoolSlice(slotCount)[:slotCount]
 	clear(qe.lenZeroComplement)
 
-	for _, acc := range qe.indexedFieldAccess {
-		if !acc.field.Slice {
+	for _, acc := range qe.schema.Indexed {
+		if !acc.Field.Slice {
 			continue
 		}
-		storage, useZeroComplement := indexdata.RebuildLenFieldStorageFromOverlay(qe.universe, indexdata.NewFieldOverlayStorage(qe.index[acc.ordinal]))
-		qe.lenIndex[acc.ordinal] = storage
+		storage, useZeroComplement := indexdata.RebuildLenFieldStorageFromOverlay(qe.universe, indexdata.NewFieldOverlayStorage(qe.index[acc.Ordinal]))
+		qe.lenIndex[acc.Ordinal] = storage
 		if useZeroComplement {
-			qe.lenZeroComplement[acc.ordinal] = true
+			qe.lenZeroComplement[acc.Ordinal] = true
 		}
 	}
 }
@@ -830,13 +578,13 @@ func (db *DB[K, V]) isLenZeroComplementField(field string) bool {
 	if field == "" {
 		return false
 	}
-	acc, ok := db.engine.indexedFieldMap[field]
-	if !ok || acc.ordinal >= len(db.engine.lenZeroComplement) {
+	acc, ok := db.engine.schema.IndexedByName[field]
+	if !ok || acc.Ordinal >= len(db.engine.lenZeroComplement) {
 		return false
 	}
 	db.mu.RLock()
 	defer db.mu.RUnlock()
-	return db.engine.lenZeroComplement[acc.ordinal]
+	return db.engine.lenZeroComplement[acc.Ordinal]
 }
 
 const (
@@ -965,11 +713,11 @@ func (qe *queryEngine) loadIndexPayload(
 		return nil, nil, nil, nil, false, err
 	}
 
-	compatible, err := readFieldCompatibility(reader, qe.fields)
+	compatible, err := readFieldCompatibility(reader, qe.schema.Fields)
 	if err != nil {
 		return nil, nil, nil, nil, false, err
 	}
-	measureCompatible, err := readFieldCompatibility(reader, qe.measureFields)
+	measureCompatible, err := readFieldCompatibility(reader, qe.schema.MeasureFields)
 	if err != nil {
 		return nil, nil, nil, nil, false, err
 	}
@@ -999,16 +747,16 @@ func (qe *queryEngine) loadIndexPayload(
 		return nil, nil, nil, nil, false, fmt.Errorf("decode: reading planner stats: %w", err)
 	}
 
-	skipFields := make(map[string]struct{}, len(qe.fields))
-	for name := range qe.fields {
+	skipFields := make(map[string]struct{}, len(qe.schema.Fields))
+	for name := range qe.schema.Fields {
 		_, hasRegular := indexes[name]
 		_, hasNil := nilIndexes[name]
 		if compatible[name] && (hasRegular || hasNil) {
 			skipFields[name] = struct{}{}
 		}
 	}
-	skipMeasureFields := make(map[string]struct{}, len(qe.measureFields))
-	for name := range qe.measureFields {
+	skipMeasureFields := make(map[string]struct{}, len(qe.schema.MeasureFields))
+	for name := range qe.schema.MeasureFields {
 		if measureCompatible[name] {
 			if _, hasMeasure := measureIndexes[name]; hasMeasure {
 				skipMeasureFields[name] = struct{}{}
@@ -1024,59 +772,59 @@ func (qe *queryEngine) loadIndexPayload(
 	if qe.lenZeroComplement != nil {
 		pooled.ReleaseBoolSlice(qe.lenZeroComplement)
 	}
-	slotCount := len(qe.indexedFieldAccess)
+	slotCount := len(qe.schema.Indexed)
 	qe.index = indexdata.GetFieldStorageSlice(slotCount)[:slotCount]
 	qe.nilIndex = indexdata.GetFieldStorageSlice(slotCount)[:slotCount]
 	qe.lenIndex = indexdata.GetFieldStorageSlice(slotCount)[:slotCount]
-	measureSlotCount := len(qe.measureFieldAccess)
+	measureSlotCount := len(qe.schema.Measures)
 	qe.measure = indexdata.GetMeasureStorageSlice(measureSlotCount)[:measureSlotCount]
-	for _, acc := range qe.indexedFieldAccess {
-		if storage, ok := indexes[acc.name]; ok {
-			qe.index[acc.ordinal] = storage
-			delete(indexes, acc.name)
+	for _, acc := range qe.schema.Indexed {
+		if storage, ok := indexes[acc.Name]; ok {
+			qe.index[acc.Ordinal] = storage
+			delete(indexes, acc.Name)
 		}
-		if storage, ok := nilIndexes[acc.name]; ok {
-			qe.nilIndex[acc.ordinal] = storage
-			delete(nilIndexes, acc.name)
+		if storage, ok := nilIndexes[acc.Name]; ok {
+			qe.nilIndex[acc.Ordinal] = storage
+			delete(nilIndexes, acc.Name)
 		}
-		if storage, ok := lenIndexes[acc.name]; ok {
-			qe.lenIndex[acc.ordinal] = storage
-			delete(lenIndexes, acc.name)
+		if storage, ok := lenIndexes[acc.Name]; ok {
+			qe.lenIndex[acc.Ordinal] = storage
+			delete(lenIndexes, acc.Name)
 		}
 	}
-	for _, acc := range qe.measureFieldAccess {
-		if storage, ok := measureIndexes[acc.name]; ok {
-			qe.measure[acc.ordinal] = storage
-			delete(measureIndexes, acc.name)
+	for _, acc := range qe.schema.Measures {
+		if storage, ok := measureIndexes[acc.Name]; ok {
+			qe.measure[acc.Ordinal] = storage
+			delete(measureIndexes, acc.Name)
 		}
 	}
 	indexdata.ReleaseFieldStorageMap(indexes)
 	indexdata.ReleaseFieldStorageMap(nilIndexes)
 	indexdata.ReleaseFieldStorageMap(lenIndexes)
 	indexdata.ReleaseMeasureStorageMap(measureIndexes)
-	qe.lenZeroComplement = detectLenZeroComplement(qe.lenIndex, qe.indexedFieldAccess)
+	qe.lenZeroComplement = detectLenZeroComplement(qe.lenIndex, qe.schema.Indexed)
 
 	lenLoaded := true
-	for name := range qe.fields {
+	for name := range qe.schema.Fields {
 		if _, ok := skipFields[name]; !ok {
 			lenLoaded = false
 			break
 		}
 	}
 	if lenLoaded && !universe.IsEmpty() {
-		for name, f := range qe.fields {
+		for name, f := range qe.schema.Fields {
 			if f == nil || !f.Slice {
 				continue
 			}
 			if _, ok := skipFields[name]; !ok {
 				continue
 			}
-			acc, ok := qe.indexedFieldMap[name]
+			acc, ok := qe.schema.IndexedByName[name]
 			if !ok {
 				lenLoaded = false
 				break
 			}
-			if qe.lenIndex[acc.ordinal].KeyCount() == 0 {
+			if qe.lenIndex[acc.Ordinal].KeyCount() == 0 {
 				lenLoaded = false
 				break
 			}
@@ -1086,24 +834,24 @@ func (qe *queryEngine) loadIndexPayload(
 	return skipFields, skipMeasureFields, plannerStats, sm, lenLoaded, nil
 }
 
-func detectLenZeroComplement(indexes []indexdata.FieldStorage, access []indexedFieldAccessor) []bool {
+func detectLenZeroComplement(indexes []indexdata.FieldStorage, access []schema.IndexedFieldAccessor) []bool {
 	out := pooled.GetBoolSlice(len(access))[:len(access)]
 	clear(out)
 	if indexes == nil {
 		return out
 	}
 	for _, acc := range access {
-		if acc.ordinal >= len(indexes) {
+		if acc.Ordinal >= len(indexes) {
 			continue
 		}
-		if indexdata.NewFieldOverlayStorage(indexes[acc.ordinal]).LookupCardinality(indexdata.LenIndexNonEmptyKey) > 0 {
-			out[acc.ordinal] = true
+		if indexdata.NewFieldOverlayStorage(indexes[acc.Ordinal]).LookupCardinality(indexdata.LenIndexNonEmptyKey) > 0 {
+			out[acc.Ordinal] = true
 		}
 	}
 	return out
 }
 
-func readFieldCompatibility(reader *bufio.Reader, current map[string]*field) (map[string]bool, error) {
+func readFieldCompatibility(reader *bufio.Reader, current map[string]*schema.Field) (map[string]bool, error) {
 	count, err := binary.ReadUvarint(reader)
 	if err != nil {
 		return nil, fmt.Errorf("decode: reading fields len: %w", err)
@@ -1131,7 +879,7 @@ func readFieldCompatibility(reader *bufio.Reader, current map[string]*field) (ma
 	return compatible, nil
 }
 
-func sameFieldDefinition(a, b *field) bool {
+func sameFieldDefinition(a, b *schema.Field) bool {
 	if a == nil || b == nil {
 		return false
 	}
@@ -1225,10 +973,10 @@ func (qe *queryEngine) storeIndexPayload(writer *bufio.Writer) error {
 		return err
 	}
 
-	if err := writeFields(writer, qe.fields); err != nil {
+	if err := writeFields(writer, qe.schema.Fields); err != nil {
 		return err
 	}
-	if err := writeFields(writer, qe.measureFields); err != nil {
+	if err := writeFields(writer, qe.schema.MeasureFields); err != nil {
 		return err
 	}
 
@@ -1257,7 +1005,7 @@ func (qe *queryEngine) storeIndexPayload(writer *bufio.Writer) error {
 			return fmt.Errorf("encode: writing index field %q name: %w", field, err)
 		}
 		acc := snap.indexedFieldByName[field]
-		if err := snap.nilIndex[acc.ordinal].WriteInto(writer); err != nil {
+		if err := snap.nilIndex[acc.Ordinal].WriteInto(writer); err != nil {
 			return fmt.Errorf("encode: writing index field %q: %w", field, err)
 		}
 	}
@@ -1272,12 +1020,12 @@ func (qe *queryEngine) storeIndexPayload(writer *bufio.Writer) error {
 			return fmt.Errorf("encode: writing index field %q name: %w", field, err)
 		}
 		acc := snap.indexedFieldByName[field]
-		if err := snap.lenIndex[acc.ordinal].WriteInto(writer); err != nil {
+		if err := snap.lenIndex[acc.Ordinal].WriteInto(writer); err != nil {
 			return fmt.Errorf("encode: writing index field %q: %w", field, err)
 		}
 	}
 
-	measureFieldNames := sortedMapFieldNames(qe.measureFields)
+	measureFieldNames := sortedMapFieldNames(qe.schema.MeasureFields)
 
 	if err := writeSidecarUvarint(writer, uint64(len(measureFieldNames))); err != nil {
 		return fmt.Errorf("encode: writing measure index family len: %w", err)
@@ -1286,12 +1034,12 @@ func (qe *queryEngine) storeIndexPayload(writer *bufio.Writer) error {
 		if err := writeSidecarString(writer, field); err != nil {
 			return fmt.Errorf("encode: writing measure field %q name: %w", field, err)
 		}
-		acc := qe.measureFieldMap[field]
+		acc := qe.schema.MeasuresByName[field]
 		var storage indexdata.MeasureStorage
-		if snap.measure == nil || acc.ordinal >= len(snap.measure) {
+		if snap.measure == nil || acc.Ordinal >= len(snap.measure) {
 			storage = indexdata.MeasureStorage{}
 		} else {
-			storage = snap.measure[acc.ordinal]
+			storage = snap.measure[acc.Ordinal]
 		}
 		if err := storage.WriteInto(writer); err != nil {
 			return fmt.Errorf("encode: writing measure field %q: %w", field, err)
@@ -1311,7 +1059,7 @@ func (qe *queryEngine) storeIndexPayload(writer *bufio.Writer) error {
 	return nil
 }
 
-func writeFields(writer *bufio.Writer, fields map[string]*field) error {
+func writeFields(writer *bufio.Writer, fields map[string]*schema.Field) error {
 	names := make([]string, 0, len(fields))
 	for name := range fields {
 		names = append(names, name)
@@ -1329,7 +1077,7 @@ func writeFields(writer *bufio.Writer, fields map[string]*field) error {
 	return nil
 }
 
-func writeField(writer *bufio.Writer, name string, f *field) error {
+func writeField(writer *bufio.Writer, name string, f *schema.Field) error {
 	if err := writeSidecarString(writer, name); err != nil {
 		return err
 	}
@@ -1368,7 +1116,7 @@ func writeField(writer *bufio.Writer, name string, f *field) error {
 	return nil
 }
 
-func readField(reader *bufio.Reader) (string, *field, error) {
+func readField(reader *bufio.Reader) (string, *schema.Field, error) {
 	name, err := readSidecarString(reader)
 	if err != nil {
 		return "", nil, err
@@ -1381,11 +1129,11 @@ func readField(reader *bufio.Reader) (string, *field, error) {
 	if err != nil {
 		return "", nil, err
 	}
-	if indexKind > uint64(^IndexKind(0)) {
+	if indexKind > uint64(^schema.IndexKind(0)) {
 		return "", nil, fmt.Errorf("invalid IndexKind %d", indexKind)
 	}
-	fieldIndexKind := IndexKind(indexKind)
-	if err := validateIndexKind(fieldIndexKind); err != nil {
+	fieldIndexKind := schema.IndexKind(indexKind)
+	if err := schema.ValidateIndexKind(fieldIndexKind); err != nil {
 		return "", nil, err
 	}
 	kind, err := binary.ReadUvarint(reader)
@@ -1423,7 +1171,7 @@ func readField(reader *bufio.Reader) (string, *field, error) {
 		}
 		valIndex = append(valIndex, int(v))
 	}
-	return name, &field{
+	return name, &schema.Field{
 		Unique:    unique,
 		IndexKind: fieldIndexKind,
 		Kind:      reflect.Kind(kind),

@@ -12,6 +12,7 @@ import (
 	"github.com/vapstack/rbi/internal/pooled"
 	"github.com/vapstack/rbi/internal/posting"
 	"github.com/vapstack/rbi/internal/qir"
+	"github.com/vapstack/rbi/internal/schema"
 )
 
 type aggregateMetricOp uint8
@@ -42,8 +43,8 @@ const (
 type aggregateFieldRef struct {
 	name      string
 	out       string
-	ordinary  indexedFieldAccessor
-	measure   measureFieldAccessor
+	ordinary  schema.IndexedFieldAccessor
+	measure   schema.MeasureFieldAccessor
 	isMeasure bool
 	kind      aggregateValueKind
 }
@@ -176,7 +177,7 @@ func (qe *queryEngine) prepareAggregate(src *qx.QX) (*aggregateQuery, error) {
 		return nil, fmt.Errorf("%w: aggregate projection is not supported", ErrInvalidQuery)
 	}
 
-	filter, err := qir.PrepareQuery(&qx.QX{Filter: src.Filter}, qe.indexedFieldMap)
+	filter, err := qir.PrepareQuery(&qx.QX{Filter: src.Filter}, qe.schema.IndexedByName)
 	if err != nil {
 		return nil, err
 	}
@@ -387,7 +388,7 @@ func aggregateLiteralRawValue(raw any) (Value, error) {
 	if isNil {
 		return Value{}, nil
 	}
-	if unix, ok := queryValueToUnixSeconds(v); ok {
+	if unix, ok := schema.QueryValueToUnixSeconds(v); ok {
 		return Value{num: uint64(unix), any: ValueKindInt}, nil
 	}
 	switch v.Kind() {
@@ -439,21 +440,21 @@ func (qe *queryEngine) prepareAggregateGroup(expr qx.Expr) (aggregateFieldRef, e
 	if expr.Kind != qx.KindREF || expr.Name == "" {
 		return aggregateFieldRef{}, fmt.Errorf("%w: GROUP BY supports only field references", ErrInvalidQuery)
 	}
-	acc, ok := qe.indexedFieldMap[expr.Name]
+	acc, ok := qe.schema.IndexedByName[expr.Name]
 	if !ok {
-		if _, measure := qe.measureFieldMap[expr.Name]; measure {
+		if _, measure := qe.schema.MeasuresByName[expr.Name]; measure {
 			return aggregateFieldRef{}, fmt.Errorf("%w: GROUP BY measure field %q is not supported", ErrInvalidQuery, expr.Name)
 		}
 		return aggregateFieldRef{}, fmt.Errorf("%w: no index for group field %q", ErrInvalidQuery, expr.Name)
 	}
-	if acc.field.Slice {
+	if acc.Field.Slice {
 		return aggregateFieldRef{}, fmt.Errorf("%w: GROUP BY slice field %q is not supported", ErrInvalidQuery, expr.Name)
 	}
 	out := expr.Alias
 	if out == "" {
 		out = expr.Name
 	}
-	return aggregateFieldRef{name: expr.Name, out: out, ordinary: acc, kind: aggregateFieldValueKind(acc.field)}, nil
+	return aggregateFieldRef{name: expr.Name, out: out, ordinary: acc, kind: aggregateFieldValueKind(acc.Field)}, nil
 }
 
 func (qe *queryEngine) prepareAggregateMetric(expr qx.Expr) (aggregateMetric, error) {
@@ -514,25 +515,25 @@ func (qe *queryEngine) prepareAggregateMetric(expr qx.Expr) (aggregateMetric, er
 }
 
 func (qe *queryEngine) prepareAggregateMetricField(name string, op aggregateMetricOp) (aggregateFieldRef, error) {
-	if acc, ok := qe.measureFieldMap[name]; ok {
+	if acc, ok := qe.schema.MeasuresByName[name]; ok {
 		if op == aggregateMetricDistinct || op == aggregateMetricCountDistinct {
 			return aggregateFieldRef{}, fmt.Errorf("%w: DISTINCT over measure field %q is not supported", ErrInvalidQuery, name)
 		}
-		return aggregateFieldRef{name: name, measure: acc, isMeasure: true, kind: aggregateMeasureValueKind(acc.kind)}, nil
+		return aggregateFieldRef{name: name, measure: acc, isMeasure: true, kind: aggregateMeasureValueKind(acc.Kind)}, nil
 	}
-	acc, ok := qe.indexedFieldMap[name]
+	acc, ok := qe.schema.IndexedByName[name]
 	if !ok {
 		return aggregateFieldRef{}, fmt.Errorf("%w: no index for aggregate field %q", ErrInvalidQuery, name)
 	}
-	if acc.field.Slice {
+	if acc.Field.Slice {
 		return aggregateFieldRef{}, fmt.Errorf("%w: aggregate over slice field %q is not supported", ErrInvalidQuery, name)
 	}
-	kind := aggregateFieldValueKind(acc.field)
+	kind := aggregateFieldValueKind(acc.Field)
 	if op == aggregateMetricSum || op == aggregateMetricAvg {
-		if acc.field.UseVI ||
-			!(isAggregateSignedKind(acc.field.Kind) ||
-				isAggregateUnsignedKind(acc.field.Kind) ||
-				isAggregateFloatKind(acc.field.Kind)) {
+		if acc.Field.UseVI ||
+			!(isAggregateSignedKind(acc.Field.Kind) ||
+				isAggregateUnsignedKind(acc.Field.Kind) ||
+				isAggregateFloatKind(acc.Field.Kind)) {
 			return aggregateFieldRef{}, fmt.Errorf("%w: %s requires numeric field %q", ErrInvalidQuery, aggregateMetricOpName(op), name)
 		}
 	}
@@ -571,11 +572,11 @@ func aggregateMetricOpName(op aggregateMetricOp) string {
 	}
 }
 
-func aggregateFieldValueKind(f *field) aggregateValueKind {
+func aggregateFieldValueKind(f *schema.Field) aggregateValueKind {
 	if f.UseVI {
 		return aggregateValueString
 	}
-	if isNativeTimeField(f) {
+	if schema.IsNativeTimeField(f) {
 		return aggregateValueSigned
 	}
 	switch f.Kind {
@@ -592,13 +593,13 @@ func aggregateFieldValueKind(f *field) aggregateValueKind {
 	}
 }
 
-func aggregateMeasureValueKind(kind measureValueKind) aggregateValueKind {
+func aggregateMeasureValueKind(kind schema.MeasureValueKind) aggregateValueKind {
 	switch kind {
-	case measureValueSigned:
+	case schema.MeasureValueSigned:
 		return aggregateValueSigned
-	case measureValueUnsigned:
+	case schema.MeasureValueUnsigned:
 		return aggregateValueUnsigned
-	case measureValueFloat:
+	case schema.MeasureValueFloat:
 		return aggregateValueFloat
 	default:
 		return aggregateValueInvalid
@@ -766,7 +767,7 @@ func (qv *queryView) aggregateOrdinaryMetricWork(q *aggregateQuery) (uint64, uin
 		if metric.rowCount || hasPriorOrdinaryAggregateMetric(q.metrics, i) {
 			continue
 		}
-		ov := indexdata.NewFieldOverlayStorage(qv.snap.index[metric.field.ordinary.ordinal])
+		ov := indexdata.NewFieldOverlayStorage(qv.snap.index[metric.field.ordinary.Ordinal])
 		fieldRows := ov.Rows()
 		keys += uint64(ov.KeyCount())
 		rows += fieldRows
@@ -781,8 +782,8 @@ func (qv *queryView) aggregateGroupCountUpperBound(q *aggregateQuery, filterCard
 	groups := uint64(1)
 	for i := range q.groups {
 		acc := q.groups[i].ordinary
-		distinct := uint64(indexdata.NewFieldOverlayStorage(qv.snap.index[acc.ordinal]).KeyCount())
-		if indexdata.NewFieldOverlayStorage(qv.snap.nilIndex[acc.ordinal]).KeyCount() > 0 {
+		distinct := uint64(indexdata.NewFieldOverlayStorage(qv.snap.index[acc.Ordinal]).KeyCount())
+		if indexdata.NewFieldOverlayStorage(qv.snap.nilIndex[acc.Ordinal]).KeyCount() > 0 {
 			distinct++
 		}
 		if distinct == 0 {
@@ -871,7 +872,7 @@ func (qv *queryView) buildGroupedOrdinaryIDMap(
 	}
 
 	acc := q.groups[level].ordinary
-	ov := indexdata.NewFieldOverlayStorage(qv.snap.index[acc.ordinal])
+	ov := indexdata.NewFieldOverlayStorage(qv.snap.index[acc.Ordinal])
 	cur := ov.NewCursor(ov.RangeByRanks(0, ov.KeyCount()), false)
 	for {
 		key, bucketIDs, ok := cur.Next()
@@ -883,14 +884,14 @@ func (qv *queryView) buildGroupedOrdinaryIDMap(
 			next.Release()
 			continue
 		}
-		groupValues[level] = aggregateValueFromIndexKey(acc.field, key)
+		groupValues[level] = aggregateValueFromIndexKey(acc.Field, key)
 		if err := qv.buildGroupedOrdinaryIDMap(q, next, level+1, groupValues, rows, states, groupByID); err != nil {
 			next.Release()
 			return err
 		}
 		next.Release()
 	}
-	nilIDs := indexdata.NewFieldOverlayStorage(qv.snap.nilIndex[acc.ordinal]).LookupPostingRetained(nilIndexEntryKey)
+	nilIDs := indexdata.NewFieldOverlayStorage(qv.snap.nilIndex[acc.Ordinal]).LookupPostingRetained(nilIndexEntryKey)
 	if !nilIDs.IsEmpty() {
 		next := current.Borrow().BuildAnd(nilIDs)
 		if !next.IsEmpty() {
@@ -952,7 +953,7 @@ func (qv *queryView) foldGroupedOrdinaryFieldByID(
 	touched := pooled.GetIntSlice(len(rows))
 
 	acc := q.metrics[first].field.ordinary
-	ov := indexdata.NewFieldOverlayStorage(qv.snap.index[acc.ordinal])
+	ov := indexdata.NewFieldOverlayStorage(qv.snap.index[acc.Ordinal])
 	cur := ov.NewCursor(ov.RangeByRanks(0, ov.KeyCount()), false)
 	var err error
 	for {
@@ -978,7 +979,7 @@ func (qv *queryView) foldGroupedOrdinaryFieldByID(
 		}
 		it.Release()
 		if len(touched) > 0 {
-			err = addGroupedOrdinaryBucketValue(q, states, first, acc.field, key, counts, touched)
+			err = addGroupedOrdinaryBucketValue(q, states, first, acc.Field, key, counts, touched)
 			touched = resetAggregateGroupBucketCounts(counts, touched)
 			if err != nil {
 				break
@@ -996,7 +997,7 @@ func addGroupedOrdinaryBucketValue(
 	q *aggregateQuery,
 	states *pooled.Slice[aggregateMetricState],
 	first int,
-	field *field,
+	field *schema.Field,
 	key keycodec.IndexKey,
 	counts []uint64,
 	touched []int,
@@ -1065,7 +1066,7 @@ func (qv *queryView) aggregateGroupRecursive(
 	}
 
 	acc := q.groups[level].ordinary
-	ov := indexdata.NewFieldOverlayStorage(qv.snap.index[acc.ordinal])
+	ov := indexdata.NewFieldOverlayStorage(qv.snap.index[acc.Ordinal])
 	cur := ov.NewCursor(ov.RangeByRanks(0, ov.KeyCount()), false)
 	for {
 		key, bucketIDs, ok := cur.Next()
@@ -1077,14 +1078,14 @@ func (qv *queryView) aggregateGroupRecursive(
 			next.Release()
 			continue
 		}
-		groupValues[level] = aggregateValueFromIndexKey(acc.field, key)
+		groupValues[level] = aggregateValueFromIndexKey(acc.Field, key)
 		if err := qv.aggregateGroupRecursive(q, next, level+1, groupValues, rows); err != nil {
 			next.Release()
 			return err
 		}
 		next.Release()
 	}
-	nilIDs := indexdata.NewFieldOverlayStorage(qv.snap.nilIndex[acc.ordinal]).LookupPostingRetained(nilIndexEntryKey)
+	nilIDs := indexdata.NewFieldOverlayStorage(qv.snap.nilIndex[acc.Ordinal]).LookupPostingRetained(nilIndexEntryKey)
 	if !nilIDs.IsEmpty() {
 		next := current.Borrow().BuildAnd(nilIDs)
 		if !next.IsEmpty() {
@@ -1099,8 +1100,8 @@ func (qv *queryView) aggregateGroupRecursive(
 	return nil
 }
 
-func (qv *queryView) appendDistinctRows(rows *[]Row, acc indexedFieldAccessor, ids posting.List) error {
-	ov := indexdata.NewFieldOverlayStorage(qv.snap.index[acc.ordinal])
+func (qv *queryView) appendDistinctRows(rows *[]Row, acc schema.IndexedFieldAccessor, ids posting.List) error {
+	ov := indexdata.NewFieldOverlayStorage(qv.snap.index[acc.Ordinal])
 	universe := qv.snapshotUniverseCardinality()
 	filterCardinality := ids.Cardinality()
 	cur := ov.NewCursor(ov.RangeByRanks(0, ov.KeyCount()), false)
@@ -1112,9 +1113,9 @@ func (qv *queryView) appendDistinctRows(rows *[]Row, acc indexedFieldAccessor, i
 		if aggregateIntersectCardinalityKnown(ids, bucketIDs, filterCardinality, universe) == 0 {
 			continue
 		}
-		*rows = append(*rows, Row{aggregateValueFromIndexKey(acc.field, key)})
+		*rows = append(*rows, Row{aggregateValueFromIndexKey(acc.Field, key)})
 	}
-	nilIDs := indexdata.NewFieldOverlayStorage(qv.snap.nilIndex[acc.ordinal]).LookupPostingRetained(nilIndexEntryKey)
+	nilIDs := indexdata.NewFieldOverlayStorage(qv.snap.nilIndex[acc.Ordinal]).LookupPostingRetained(nilIndexEntryKey)
 	if aggregateIntersectCardinalityKnown(ids, nilIDs, filterCardinality, universe) > 0 {
 		*rows = append(*rows, Row{Value{}})
 	}
@@ -1147,7 +1148,7 @@ func (qv *queryView) foldAggregateMetricStates(states []aggregateMetricState, id
 
 func (qv *queryView) foldMeasureMetric(state *aggregateMetricState, ids posting.List) error {
 	acc := state.metric.field.measure
-	storage := qv.snap.measure[acc.ordinal]
+	storage := qv.snap.measure[acc.Ordinal]
 	if ids.IsEmpty() || storage.Rows() == 0 {
 		return nil
 	}
@@ -1157,10 +1158,10 @@ func (qv *queryView) foldMeasureMetric(state *aggregateMetricState, ids posting.
 			state.seen = true
 			return nil
 		}
-		return state.addMeasureStorageAll(storage, acc.kind)
+		return state.addMeasureStorageAll(storage, acc.Kind)
 	}
 	if useMeasureMergeScan(ids.Cardinality(), storage) {
-		return state.addMeasureStorageIntersect(storage, acc.kind, ids)
+		return state.addMeasureStorageIntersect(storage, acc.Kind, ids)
 	}
 	it := ids.Iter()
 	for it.HasNext() {
@@ -1169,7 +1170,7 @@ func (qv *queryView) foldMeasureMetric(state *aggregateMetricState, ids posting.
 		if !ok {
 			continue
 		}
-		if err := state.addRawMeasure(raw, acc.kind, 1); err != nil {
+		if err := state.addRawMeasure(raw, acc.Kind, 1); err != nil {
 			it.Release()
 			return err
 		}
@@ -1186,7 +1187,7 @@ func useMeasureMergeScan(idCardinality uint64, storage indexdata.MeasureStorage)
 	return idCardinality > uint64(storage.Rows())/(lookupSteps-1)
 }
 
-func (state *aggregateMetricState) addMeasureStorageAll(storage indexdata.MeasureStorage, kind measureValueKind) error {
+func (state *aggregateMetricState) addMeasureStorageAll(storage indexdata.MeasureStorage, kind schema.MeasureValueKind) error {
 	_, values, ok := storage.FlatSlices()
 	if ok {
 		for i := range values {
@@ -1207,7 +1208,7 @@ func (state *aggregateMetricState) addMeasureStorageAll(storage indexdata.Measur
 	return nil
 }
 
-func (state *aggregateMetricState) addMeasureStorageIntersect(storage indexdata.MeasureStorage, kind measureValueKind, ids posting.List) error {
+func (state *aggregateMetricState) addMeasureStorageIntersect(storage indexdata.MeasureStorage, kind schema.MeasureValueKind, ids posting.List) error {
 	it := ids.Iter()
 	if !it.HasNext() {
 		it.Release()
@@ -1271,12 +1272,12 @@ func aggregateMetricsShareOrdinaryField(a aggregateMetric, b aggregateMetric) bo
 		!b.rowCount &&
 		!a.field.isMeasure &&
 		!b.field.isMeasure &&
-		a.field.ordinary.ordinal == b.field.ordinary.ordinal
+		a.field.ordinary.Ordinal == b.field.ordinary.Ordinal
 }
 
 func (qv *queryView) foldOrdinaryMetricStates(states []aggregateMetricState, ids posting.List, first int) error {
 	acc := states[first].metric.field.ordinary
-	ov := indexdata.NewFieldOverlayStorage(qv.snap.index[acc.ordinal])
+	ov := indexdata.NewFieldOverlayStorage(qv.snap.index[acc.Ordinal])
 	universe := qv.snapshotUniverseCardinality()
 	filterCardinality := ids.Cardinality()
 	cur := ov.NewCursor(ov.RangeByRanks(0, ov.KeyCount()), false)
@@ -1304,7 +1305,7 @@ func (qv *queryView) foldOrdinaryMetricStates(states []aggregateMetricState, ids
 				states[i].seen = true
 			default:
 				if !valueReady {
-					value = aggregateValueFromIndexKey(acc.field, key)
+					value = aggregateValueFromIndexKey(acc.Field, key)
 					valueReady = true
 				}
 				if err := states[i].addValue(value, n); err != nil {
@@ -1326,13 +1327,13 @@ func aggregateIntersectCardinalityKnown(filter posting.List, bucket posting.List
 	return filter.AndCardinality(bucket)
 }
 
-func (state *aggregateMetricState) addRawMeasure(raw uint64, kind measureValueKind, n uint64) error {
+func (state *aggregateMetricState) addRawMeasure(raw uint64, kind schema.MeasureValueKind, n uint64) error {
 	switch kind {
-	case measureValueSigned:
+	case schema.MeasureValueSigned:
 		return state.addSigned(int64(raw), n)
-	case measureValueUnsigned:
+	case schema.MeasureValueUnsigned:
 		return state.addUnsigned(raw, n)
-	case measureValueFloat:
+	case schema.MeasureValueFloat:
 		return state.addFloat(math.Float64frombits(raw), n)
 	default:
 		return fmt.Errorf("%w: unsupported measure value kind", ErrInvalidQuery)
@@ -1472,12 +1473,12 @@ func (state *aggregateMetricState) finish() Value {
 			}
 		}
 		if state.metric.field.isMeasure {
-			switch state.metric.field.measure.kind {
-			case measureValueSigned:
+			switch state.metric.field.measure.Kind {
+			case schema.MeasureValueSigned:
 				return Value{num: uint64(state.intSum), any: ValueKindInt}
-			case measureValueUnsigned:
+			case schema.MeasureValueUnsigned:
 				return Value{num: state.uintSum, any: ValueKindUint}
-			case measureValueFloat:
+			case schema.MeasureValueFloat:
 				return Value{num: math.Float64bits(state.floatSum), any: ValueKindFloat}
 			}
 		}
@@ -1569,7 +1570,7 @@ func compareString(a string, b string) int {
 	return 0
 }
 
-func aggregateValueFromIndexKey(f *field, key keycodec.IndexKey) Value {
+func aggregateValueFromIndexKey(f *schema.Field, key keycodec.IndexKey) Value {
 	raw := key.U64()
 	if !key.IsNumeric() {
 		s := key.UnsafeString()
@@ -1582,7 +1583,7 @@ func aggregateValueFromIndexKey(f *field, key keycodec.IndexKey) Value {
 		return valueFromUnsafeString(s)
 	}
 	switch {
-	case isNativeTimeField(f):
+	case schema.IsNativeTimeField(f):
 		return Value{num: uint64(keycodec.Int64FromOrderedKey(raw)), any: ValueKindInt}
 	case isAggregateSignedKind(f.Kind):
 		return Value{num: uint64(keycodec.Int64FromOrderedKey(raw)), any: ValueKindInt}

@@ -13,6 +13,7 @@ import (
 
 	"github.com/vapstack/rbi/internal/pooled"
 	"github.com/vapstack/rbi/internal/posting"
+	"github.com/vapstack/rbi/internal/schema"
 )
 
 func releasePostingResults(buf *pooled.Slice[postingResult]) {
@@ -529,7 +530,7 @@ func unwrapExprValue(v reflect.Value) (reflect.Value, bool) {
 	}
 }
 
-func queryValueIsCollectionForField(v reflect.Value, fm *field) bool {
+func queryValueIsCollectionForField(v reflect.Value, fm *schema.Field) bool {
 	if v.Kind() != reflect.Slice {
 		return false
 	}
@@ -687,13 +688,13 @@ func numericQueryValueToUint64Exact(v reflect.Value) (uint64, bool) {
 }
 
 func timeQueryValueToInt64Exact(v reflect.Value) (int64, bool) {
-	if unix, ok := queryValueToUnixSeconds(v); ok {
+	if unix, ok := schema.QueryValueToUnixSeconds(v); ok {
 		return unix, true
 	}
 	return numericQueryValueToInt64Exact(v)
 }
 
-func scalarValueToLookupKeyField(raw any, v reflect.Value, fm *field) (keycodec.IndexLookupKey, error) {
+func scalarValueToLookupKeyField(raw any, v reflect.Value, fm *schema.Field) (keycodec.IndexLookupKey, error) {
 	if fm != nil && fm.UseVI {
 		if vi, ok := raw.(ValueIndexer); ok {
 			return keycodec.IndexLookupString(vi.IndexingValue()), nil
@@ -714,7 +715,7 @@ func scalarValueToLookupKeyField(raw any, v reflect.Value, fm *field) (keycodec.
 	}
 
 	switch {
-	case isNativeTimeField(fm):
+	case schema.IsNativeTimeField(fm):
 		if unix, ok := timeQueryValueToInt64Exact(v); ok {
 			return keycodec.IndexLookupU64(keycodec.OrderedInt64Key(unix)), nil
 		}
@@ -739,7 +740,7 @@ func scalarValueToLookupKeyField(raw any, v reflect.Value, fm *field) (keycodec.
 	}
 }
 
-func scalarValueToIdxField(raw any, v reflect.Value, fm *field) (string, error) {
+func scalarValueToIdxField(raw any, v reflect.Value, fm *schema.Field) (string, error) {
 	key, err := scalarValueToLookupKeyField(raw, v, fm)
 	if err != nil {
 		return "", err
@@ -751,7 +752,7 @@ func scalarValueToIdxField(raw any, v reflect.Value, fm *field) (string, error) 
 }
 
 func normalizeUnixTimeRangeBound(op qir.Op, v reflect.Value) normalizedScalarBound {
-	if unix, ok := queryValueToUnixSeconds(v); ok {
+	if unix, ok := schema.QueryValueToUnixSeconds(v); ok {
 		return normalizedScalarBoundFromIndexKey(op, keycodec.FromU64(keycodec.OrderedInt64Key(unix)))
 	}
 	return normalizeSignedIntRangeBound(op, v)
@@ -926,7 +927,7 @@ func (qv *queryView) exprValueToNormalizedScalarBound(expr qir.Expr) (normalized
 		return bound, false, nil
 	}
 	if expr.Op == qir.OpPREFIX {
-		if fm != nil && fm.KeyKind == fieldWriteKeysOrderedU64 {
+		if fm != nil && fm.KeyKind == schema.FieldWriteKeysOrderedU64 {
 			bound := normalizedScalarBound{empty: true}
 			qv.storeNormalizedScalarBound(expr, v, bound)
 			return bound, false, nil
@@ -942,7 +943,7 @@ func (qv *queryView) exprValueToNormalizedScalarBound(expr qir.Expr) (normalized
 
 	if fm != nil && !fm.UseVI {
 		switch {
-		case isNativeTimeField(fm):
+		case schema.IsNativeTimeField(fm):
 			bound := normalizeUnixTimeRangeBound(expr.Op, v)
 			qv.storeNormalizedScalarBound(expr, v, bound)
 			return bound, false, nil
@@ -1038,7 +1039,7 @@ func dedupStringBufInPlace(buf []string) []string {
 	return buf[:write]
 }
 
-func sliceValueToIdxStringBuf(v reflect.Value, fm *field) ([]string, bool, error) {
+func sliceValueToIdxStringBuf(v reflect.Value, fm *schema.Field) ([]string, bool, error) {
 	if v.Len() == 0 {
 		return nil, false, nil
 	}

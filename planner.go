@@ -8,6 +8,7 @@ import (
 	"github.com/vapstack/rbi/internal/pooled"
 	"github.com/vapstack/rbi/internal/posting"
 	"github.com/vapstack/rbi/internal/qir"
+	"github.com/vapstack/rbi/internal/schema"
 )
 
 // PlanName is a stable plan identifier used by tracing and calibration.
@@ -2111,7 +2112,7 @@ func (qv *queryView) orderedORMaterializedExactRangePredicateCosts(
 		return materializedPredKey{}, 0, 0, 0, false
 	}
 	fm := qv.fieldMetaByExpr(p.expr)
-	if !fieldUsesOrderedNumericKeys(fm) {
+	if !schema.FieldUsesOrderedNumericKeys(fm) {
 		return materializedPredKey{}, 0, 0, 0, false
 	}
 
@@ -3280,7 +3281,7 @@ func (qv *queryView) shouldKeepORBranchNumericRangeLazy(e qir.Expr) bool {
 		return false
 	}
 	fm := qv.fieldMetaByExpr(e)
-	if !fieldUsesOrderedNumericKeys(fm) {
+	if !schema.FieldUsesOrderedNumericKeys(fm) {
 		return false
 	}
 	candidate, ok := qv.prepareScalarRangeRoutingCandidate(e)
@@ -3313,7 +3314,7 @@ func (qv *queryView) shouldForceORBranchNumericRangeMaterialize(e qir.Expr) bool
 		return false
 	}
 	fm := qv.fieldMetaByExpr(e)
-	if !fieldUsesOrderedNumericKeys(fm) {
+	if !schema.FieldUsesOrderedNumericKeys(fm) {
 		return false
 	}
 	candidate, ok := qv.prepareScalarRangeRoutingCandidate(e)
@@ -3331,7 +3332,7 @@ func (qv *queryView) shouldBuildORBranchLeafLazy(e qir.Expr, branchLeafCount int
 		return false
 	}
 	fm := qv.fieldMetaByExpr(e)
-	if !fieldUsesOrderedNumericKeys(fm) {
+	if !schema.FieldUsesOrderedNumericKeys(fm) {
 		return false
 	}
 	candidate, ok := qv.prepareScalarRangeRoutingCandidate(e)
@@ -3380,7 +3381,7 @@ func (qv *queryView) mayNeedORBranchRangeRewrite(leaves []qir.Expr) bool {
 			continue
 		}
 		fm := qv.fieldMetaByExpr(e)
-		if fieldUsesOrderedNumericKeys(fm) {
+		if schema.FieldUsesOrderedNumericKeys(fm) {
 			if qv.snap != nil && qv.snap.matPredCacheMaxEntries > 0 {
 				return true
 			}

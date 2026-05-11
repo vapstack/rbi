@@ -82,21 +82,21 @@ func TestQuery_SliceEQ_EmptyDBAndAfterLastDelete(t *testing.T) {
 func hideLenIndexForTest[K ~string | ~uint64, V any](t *testing.T, db *DB[K, V], field string) {
 	t.Helper()
 	snap := db.engine.getSnapshot()
-	acc, ok := db.engine.indexedFieldMap[field]
+	acc, ok := db.engine.schema.IndexedByName[field]
 	if !ok {
 		t.Fatalf("missing indexed field %q", field)
 	}
-	oldStorage := snap.lenIndex[acc.ordinal]
+	oldStorage := snap.lenIndex[acc.Ordinal]
 	oldZeroComplement := false
-	if acc.ordinal < len(snap.lenZeroComplement) {
-		oldZeroComplement = snap.lenZeroComplement[acc.ordinal]
-		snap.lenZeroComplement[acc.ordinal] = false
+	if acc.Ordinal < len(snap.lenZeroComplement) {
+		oldZeroComplement = snap.lenZeroComplement[acc.Ordinal]
+		snap.lenZeroComplement[acc.Ordinal] = false
 	}
-	snap.lenIndex[acc.ordinal] = indexdata.FieldStorage{}
+	snap.lenIndex[acc.Ordinal] = indexdata.FieldStorage{}
 	t.Cleanup(func() {
-		snap.lenIndex[acc.ordinal] = oldStorage
-		if acc.ordinal < len(snap.lenZeroComplement) {
-			snap.lenZeroComplement[acc.ordinal] = oldZeroComplement
+		snap.lenIndex[acc.Ordinal] = oldStorage
+		if acc.Ordinal < len(snap.lenZeroComplement) {
+			snap.lenZeroComplement[acc.Ordinal] = oldZeroComplement
 		}
 	})
 }

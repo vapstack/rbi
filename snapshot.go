@@ -8,6 +8,7 @@ import (
 	"github.com/vapstack/rbi/internal/keycodec"
 	"github.com/vapstack/rbi/internal/pooled"
 	"github.com/vapstack/rbi/internal/posting"
+	"github.com/vapstack/rbi/internal/schema"
 	"github.com/vapstack/rbi/internal/strmap"
 )
 
@@ -20,7 +21,7 @@ type indexSnapshot struct {
 	lenIndex           []indexdata.FieldStorage
 	lenZeroComplement  []bool
 	measure            []indexdata.MeasureStorage
-	indexedFieldByName map[string]indexedFieldAccessor
+	indexedFieldByName schema.IndexedFieldMap
 	universe           posting.List
 	universeOwner      *snapshotPostingOwner
 	strmap             *strmap.Snapshot
@@ -47,7 +48,7 @@ type materializedPredCacheEntry struct {
 type materializedPredCache struct {
 	refs    atomic.Int32
 	mu      sync.RWMutex
-	slots   *pooled.Slice[materializedPredCacheSlot]
+	slots   []materializedPredCacheSlot
 	retired *pooled.Slice[*materializedPredCacheEntry]
 }
 
@@ -102,8 +103,6 @@ var materializedPredCachePool = pooled.Pointers[materializedPredCache]{
 		c.release()
 	},
 }
-
-var materializedPredCacheSlotPool = pooled.Slices[materializedPredCacheSlot]{Clear: true}
 
 var materializedPredCacheRetiredPool = pooled.Slices[*materializedPredCacheEntry]{
 	Clear: true,
@@ -334,10 +333,11 @@ func (c *materializedPredCache) init(limit int) {
 	if limit <= 0 {
 		return
 	}
-	if c.slots == nil {
-		c.slots = materializedPredCacheSlotPool.Get()
+	if cap(c.slots) < limit {
+		c.slots = make([]materializedPredCacheSlot, limit)
+		return
 	}
-	c.slots.SetLen(limit)
+	c.slots = c.slots[:limit]
 }
 
 func (c *materializedPredCache) retain() {
@@ -352,14 +352,14 @@ func (c *materializedPredCache) releaseRef() {
 }
 
 func (c *materializedPredCache) entryCount() int {
-	if c == nil || c.slots == nil {
+	if c == nil || len(c.slots) == 0 {
 		return 0
 	}
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	count := 0
-	for i := 0; i < c.slots.Len(); i++ {
-		if c.slots.Get(i).used {
+	for i := range c.slots {
+		if c.slots[i].used {
 			count++
 		}
 	}
@@ -367,11 +367,11 @@ func (c *materializedPredCache) entryCount() int {
 }
 
 func (c *materializedPredCache) lookupLocked(key materializedPredKey) (*materializedPredCacheEntry, bool) {
-	if c == nil || c.slots == nil || key.isZero() {
+	if c == nil || len(c.slots) == 0 || key.isZero() {
 		return nil, false
 	}
-	for i := 0; i < c.slots.Len(); i++ {
-		slot := c.slots.Get(i)
+	for i := range c.slots {
+		slot := c.slots[i]
 		if slot.used && slot.key == key {
 			return slot.entry, true
 		}
@@ -397,11 +397,11 @@ func (c *materializedPredCache) load(key materializedPredKey, clock *atomic.Uint
 }
 
 func (c *materializedPredCache) firstFreeSlotLocked() int {
-	if c == nil || c.slots == nil {
+	if c == nil || len(c.slots) == 0 {
 		return -1
 	}
-	for i := 0; i < c.slots.Len(); i++ {
-		if !c.slots.Get(i).used {
+	for i := range c.slots {
+		if !c.slots[i].used {
 			return i
 		}
 	}
@@ -438,14 +438,12 @@ func (c *materializedPredCache) clearLocked() {
 	if c == nil {
 		return
 	}
-	if c.slots != nil {
-		for i := 0; i < c.slots.Len(); i++ {
-			slot := c.slots.Get(i)
-			if slot.entry != nil {
-				slot.entry.release()
-			}
-			c.slots.Set(i, materializedPredCacheSlot{})
+	for i := range c.slots {
+		slot := c.slots[i]
+		if slot.entry != nil {
+			slot.entry.release()
 		}
+		c.slots[i] = materializedPredCacheSlot{}
 	}
 	if c.retired != nil {
 		for i := 0; i < c.retired.Len(); i++ {
@@ -470,22 +468,19 @@ func (c *materializedPredCache) release() {
 		return
 	}
 	c.clear()
-	if c.slots != nil {
-		materializedPredCacheSlotPool.Put(c.slots)
-		c.slots = nil
-	}
+	c.slots = c.slots[:0]
 }
 
 func (c *materializedPredCache) findVictimLocked(mode materializedPredCacheEvictMode) int {
-	if c == nil || c.slots == nil {
+	if c == nil || len(c.slots) == 0 {
 		return -1
 	}
 	evictIdx := -1
 	fallbackIdx := -1
 	evictStamp := ^uint64(0)
 	fallbackStamp := ^uint64(0)
-	for i := 0; i < c.slots.Len(); i++ {
-		slot := c.slots.Get(i)
+	for i := range c.slots {
+		slot := c.slots[i]
 		if !slot.used {
 			continue
 		}
@@ -527,8 +522,8 @@ func (c *materializedPredCache) evictLocked(mode materializedPredCacheEvictMode,
 	if idx < 0 {
 		return false
 	}
-	slot := c.slots.Get(idx)
-	c.slots.Set(idx, materializedPredCacheSlot{})
+	slot := c.slots[idx]
+	c.slots[idx] = materializedPredCacheSlot{}
 	if count != nil {
 		count.Add(-1)
 	}
@@ -540,18 +535,18 @@ func (c *materializedPredCache) evictLocked(mode materializedPredCacheEvictMode,
 }
 
 func (c *materializedPredCache) insertLocked(key materializedPredKey, entry *materializedPredCacheEntry) bool {
-	if c == nil || c.slots == nil || key.isZero() {
+	if c == nil || len(c.slots) == 0 || key.isZero() {
 		return false
 	}
 	idx := c.firstFreeSlotLocked()
 	if idx < 0 {
 		return false
 	}
-	c.slots.Set(idx, materializedPredCacheSlot{
+	c.slots[idx] = materializedPredCacheSlot{
 		key:   key,
 		entry: entry,
 		used:  true,
-	})
+	}
 	return true
 }
 
@@ -588,30 +583,30 @@ func inheritNumericRangeBucketCache(next, prev *indexSnapshot) {
 	if prev == nil || prev.numericRangeBucketCache == nil {
 		return
 	}
-	if next.numericRangeBucketCache == nil || next.numericRangeBucketCache.slots == nil {
+	if next.numericRangeBucketCache == nil || len(next.numericRangeBucketCache.slots) == 0 {
 		return
 	}
 	prev.numericRangeBucketCache.mu.Lock()
 	defer prev.numericRangeBucketCache.mu.Unlock()
-	for i := 0; i < prev.numericRangeBucketCache.slots.Len(); i++ {
-		slot := prev.numericRangeBucketCache.slots.Get(i)
+	for i := range prev.numericRangeBucketCache.slots {
+		slot := prev.numericRangeBucketCache.slots[i]
 		if slot.field == "" || slot.entry == nil || slot.entry.storage.KeyCount() == 0 {
 			continue
 		}
 		acc, ok := next.indexedFieldByName[slot.field]
-		if !ok || next.index == nil || acc.ordinal >= len(next.index) {
+		if !ok || next.index == nil || acc.Ordinal >= len(next.index) {
 			continue
 		}
-		nextStorage := next.index[acc.ordinal]
+		nextStorage := next.index[acc.Ordinal]
 		if nextStorage != slot.entry.storage {
 			continue
 		}
 		slot.entry.retain()
-		next.numericRangeBucketCache.storeSlot(slot.field, acc.ordinal, slot.entry)
+		next.numericRangeBucketCache.storeSlot(slot.field, acc.Ordinal, slot.entry)
 	}
 }
 
-func inheritMaterializedPredCache(next, prev *indexSnapshot, indexedFieldMap indexedFieldMap, changedFields []bool) {
+func inheritMaterializedPredCache(next, prev *indexSnapshot, fields schema.IndexedFieldMap, changedFields []bool) {
 	if next == nil || prev == nil {
 		return
 	}
@@ -624,11 +619,11 @@ func inheritMaterializedPredCache(next, prev *indexSnapshot, indexedFieldMap ind
 	var maxStamp uint64
 	prev.matPredCache.mu.RLock()
 	next.matPredCache.mu.Lock()
-	for i := 0; i < prev.matPredCache.slots.Len(); i++ {
+	for i := range prev.matPredCache.slots {
 		if int(next.matPredCacheCount.Load()) >= limit {
 			break
 		}
-		slot := prev.matPredCache.slots.Get(i)
+		slot := prev.matPredCache.slots[i]
 		if !slot.used {
 			continue
 		}
@@ -638,8 +633,8 @@ func inheritMaterializedPredCache(next, prev *indexSnapshot, indexedFieldMap ind
 			continue
 		}
 		if changedFields != nil {
-			acc, ok := indexedFieldMap[f]
-			if !ok || changedFields[acc.ordinal] {
+			acc, ok := fields[f]
+			if !ok || changedFields[acc.Ordinal] {
 				continue
 			}
 		}
@@ -1033,10 +1028,10 @@ func (s *indexSnapshot) fieldIndexStorage(field string) (indexdata.FieldStorage,
 		return indexdata.FieldStorage{}, false
 	}
 	acc, ok := s.indexedFieldByName[field]
-	if !ok || acc.ordinal >= len(s.index) {
+	if !ok || acc.Ordinal >= len(s.index) {
 		return indexdata.FieldStorage{}, false
 	}
-	storage := s.index[acc.ordinal]
+	storage := s.index[acc.Ordinal]
 	return storage, storage.KeyCount() > 0
 }
 
@@ -1046,7 +1041,7 @@ func (s *indexSnapshot) nilFieldNameSet() map[string]struct{} {
 	}
 	fields := make(map[string]struct{}, len(s.indexedFieldByName))
 	for f, acc := range s.indexedFieldByName {
-		if acc.ordinal < len(s.nilIndex) && s.nilIndex[acc.ordinal].KeyCount() > 0 {
+		if acc.Ordinal < len(s.nilIndex) && s.nilIndex[acc.Ordinal].KeyCount() > 0 {
 			fields[f] = struct{}{}
 		}
 	}
@@ -1059,7 +1054,7 @@ func (s *indexSnapshot) fieldNameSet() map[string]struct{} {
 	}
 	fields := make(map[string]struct{}, len(s.indexedFieldByName))
 	for f, acc := range s.indexedFieldByName {
-		if acc.ordinal < len(s.index) && s.index[acc.ordinal].KeyCount() > 0 {
+		if acc.Ordinal < len(s.index) && s.index[acc.Ordinal].KeyCount() > 0 {
 			fields[f] = struct{}{}
 		}
 	}
@@ -1072,7 +1067,7 @@ func (s *indexSnapshot) lenFieldNameSet() map[string]struct{} {
 	}
 	fields := make(map[string]struct{}, len(s.indexedFieldByName))
 	for f, acc := range s.indexedFieldByName {
-		if !acc.field.Slice || acc.ordinal >= len(s.lenIndex) || s.lenIndex[acc.ordinal].KeyCount() == 0 {
+		if !acc.Field.Slice || acc.Ordinal >= len(s.lenIndex) || s.lenIndex[acc.Ordinal].KeyCount() == 0 {
 			continue
 		}
 		fields[f] = struct{}{}
@@ -1085,10 +1080,10 @@ func (s *indexSnapshot) fieldLookupPostingRetained(field, key string) posting.Li
 		return posting.List{}
 	}
 	acc, ok := s.indexedFieldByName[field]
-	if !ok || acc.ordinal >= len(s.index) {
+	if !ok || acc.Ordinal >= len(s.index) {
 		return posting.List{}
 	}
-	return indexdata.NewFieldOverlayStorage(s.index[acc.ordinal]).LookupPostingRetained(key)
+	return indexdata.NewFieldOverlayStorage(s.index[acc.Ordinal]).LookupPostingRetained(key)
 }
 
 func (s *indexSnapshot) fieldLookupPostingRetainedKey(field string, key keycodec.IndexLookupKey) posting.List {
@@ -1096,10 +1091,10 @@ func (s *indexSnapshot) fieldLookupPostingRetainedKey(field string, key keycodec
 		return posting.List{}
 	}
 	acc, ok := s.indexedFieldByName[field]
-	if !ok || acc.ordinal >= len(s.index) {
+	if !ok || acc.Ordinal >= len(s.index) {
 		return posting.List{}
 	}
-	ov := indexdata.NewFieldOverlayStorage(s.index[acc.ordinal])
+	ov := indexdata.NewFieldOverlayStorage(s.index[acc.Ordinal])
 	if key.IsNumeric() {
 		return ov.LookupPostingRetainedKey(key.IndexKey())
 	}
@@ -1347,7 +1342,7 @@ func addFixedFieldPostingList(fieldMap map[uint64]posting.List, key uint64, idx 
 	return fieldMap
 }
 
-func (qe *queryEngine) buildPreparedSnapshotNoLock(seq uint64, strMap *strmap.Mapper, patchMap map[string]*field, entries []snapshotBatchEntry) *indexSnapshot {
+func (qe *queryEngine) buildPreparedSnapshotNoLock(seq uint64, strMap *strmap.Mapper, patchFields map[string]*schema.Field, entries []snapshotBatchEntry) *indexSnapshot {
 	prev := qe.getSnapshot()
 	if snap, ok := qe.buildPreparedSnapshotFromEmptyBaseNoLock(seq, prev, strMap, entries); ok {
 		return snap
@@ -1355,7 +1350,7 @@ func (qe *queryEngine) buildPreparedSnapshotNoLock(seq uint64, strMap *strmap.Ma
 	if snap, ok := qe.buildPreparedSnapshotInsertOnlyNoLock(seq, prev, strMap, entries); ok {
 		return snap
 	}
-	return qe.buildPreparedSnapshotAggregatedNoLock(seq, prev, strMap, patchMap, entries)
+	return qe.buildPreparedSnapshotAggregatedNoLock(seq, prev, strMap, patchFields, entries)
 }
 
 func (qe *queryEngine) buildPreparedSnapshotFromEmptyBaseNoLock(seq uint64, prev *indexSnapshot, strMap *strmap.Mapper, entries []snapshotBatchEntry) (*indexSnapshot, bool) {
@@ -1389,8 +1384,8 @@ func (qe *queryEngine) buildPreparedSnapshotFromEmptyBaseNoLock(seq uint64, prev
 		}
 	}
 
-	fieldStates := make([]snapshotFieldOverlayState, len(qe.indexedFieldAccess))
-	measureStates := make([][]indexdata.MeasureEntry, len(qe.measureFieldAccess))
+	fieldStates := make([]schema.OverlayState, len(qe.schema.Indexed))
+	measureStates := make([][]indexdata.MeasureEntry, len(qe.schema.Measures))
 
 	for i := range entries {
 		if hasRepeated && lastByIdx[entries[i].idx] != i {
@@ -1399,18 +1394,18 @@ func (qe *queryEngine) buildPreparedSnapshotFromEmptyBaseNoLock(seq uint64, prev
 		op := entries[i]
 		ptr := op.newVal
 
-		for _, acc := range qe.indexedFieldAccess {
-			acc.collectSnapshotOverlayValue(ptr, op.idx, &fieldStates[acc.ordinal])
+		for _, acc := range qe.schema.Indexed {
+			acc.CollectOverlayValue(ptr, op.idx, &fieldStates[acc.Ordinal])
 		}
-		for _, acc := range qe.measureFieldAccess {
-			if value, ok := acc.read(ptr); ok {
-				buf := measureStates[acc.ordinal]
+		for _, acc := range qe.schema.Measures {
+			if value, ok := acc.Read(ptr); ok {
+				buf := measureStates[acc.Ordinal]
 				if buf == nil {
 					buf = indexdata.GetMeasureEntrySlice(0)
-					measureStates[acc.ordinal] = buf
+					measureStates[acc.Ordinal] = buf
 				}
 				buf = append(buf, indexdata.MeasureEntry{ID: op.idx, Value: value})
-				measureStates[acc.ordinal] = buf
+				measureStates[acc.Ordinal] = buf
 			}
 		}
 	}
@@ -1418,31 +1413,19 @@ func (qe *queryEngine) buildPreparedSnapshotFromEmptyBaseNoLock(seq uint64, prev
 		uint64IntMapPool.Put(lastByIdx)
 	}
 
-	slotCount := len(qe.indexedFieldAccess)
+	slotCount := len(qe.schema.Indexed)
 	nextIndex := indexdata.GetFieldStorageSlice(slotCount)[:slotCount]
-	for i, acc := range qe.indexedFieldAccess {
+	for i, acc := range qe.schema.Indexed {
 		state := &fieldStates[i]
-		var storage indexdata.FieldStorage
-		if acc.field != nil && acc.field.KeyKind == fieldWriteKeysOrderedU64 {
-			fixed := state.fixed
-			state.fixed = nil
-			storage = indexdata.NewRegularFieldStorageFromFixedPostingMapOwned(fixed)
-		} else {
-			idx := state.index
-			state.index = nil
-			storage = indexdata.NewRegularFieldStorageFromPostingMapOwned(idx, false)
-		}
+		storage := state.MaterializeStorage(acc.Field.KeyKind == schema.FieldWriteKeysOrderedU64)
 		if storage.KeyCount() > 0 {
 			nextIndex[i] = storage
 		}
 	}
 
 	nextNilIndex := indexdata.GetFieldStorageSlice(slotCount)[:slotCount]
-	for i := range qe.indexedFieldAccess {
-		state := &fieldStates[i]
-		nils := state.nils
-		state.nils = nil
-		if storage := indexdata.NewFlatFieldStorageFromPostingMapOwned(nils, false); storage.KeyCount() > 0 {
+	for i := range qe.schema.Indexed {
+		if storage := fieldStates[i].MaterializeNilStorage(); storage.KeyCount() > 0 {
 			nextNilIndex[i] = storage
 		}
 	}
@@ -1450,21 +1433,19 @@ func (qe *queryEngine) buildPreparedSnapshotFromEmptyBaseNoLock(seq uint64, prev
 	nextLenIndex := indexdata.GetFieldStorageSlice(slotCount)[:slotCount]
 	nextLenZeroComplement := pooled.GetBoolSlice(slotCount)[:slotCount]
 	clear(nextLenZeroComplement)
-	for i, acc := range qe.indexedFieldAccess {
-		if !acc.field.Slice {
+	for i, acc := range qe.schema.Indexed {
+		if !acc.Field.Slice {
 			continue
 		}
-		lengths := fieldStates[i].lengths
-		fieldStates[i].lengths = nil
-		storage, useZeroComplement := indexdata.NewLenFieldStorageFromMapOwned(universe, lengths)
+		storage, useZeroComplement := fieldStates[i].MaterializeLenStorage(universe)
 		nextLenIndex[i] = storage
 		if useZeroComplement {
 			nextLenZeroComplement[i] = true
 		}
 	}
-	measureSlotCount := len(qe.measureFieldAccess)
+	measureSlotCount := len(qe.schema.Measures)
 	nextMeasure := indexdata.GetMeasureStorageSlice(measureSlotCount)[:measureSlotCount]
-	for i := range qe.measureFieldAccess {
+	for i := range qe.schema.Measures {
 		storage := indexdata.NewMeasureStorageFromEntriesOwned(measureStates[i])
 		nextMeasure[i] = storage
 		measureStates[i] = nil
@@ -1481,7 +1462,7 @@ func (qe *queryEngine) buildPreparedSnapshotFromEmptyBaseNoLock(seq uint64, prev
 		lenIndex:           nextLenIndex,
 		lenZeroComplement:  nextLenZeroComplement,
 		measure:            nextMeasure,
-		indexedFieldByName: qe.indexedFieldMap,
+		indexedFieldByName: qe.schema.IndexedByName,
 		universe:           universe,
 		strmap:             sm,
 	}
@@ -1489,22 +1470,22 @@ func (qe *queryEngine) buildPreparedSnapshotFromEmptyBaseNoLock(seq uint64, prev
 	inheritNumericRangeBucketCache(snap, prev)
 	changedCount := 0
 	for i := range fieldStates {
-		if fieldStates[i].changed {
+		if fieldStates[i].Changed() {
 			changedCount++
 		}
 	}
 	if changedCount > 0 {
-		changed := pooled.GetBoolSlice(len(qe.indexedFieldAccess))[:len(qe.indexedFieldAccess)]
+		changed := pooled.GetBoolSlice(len(qe.schema.Indexed))[:len(qe.schema.Indexed)]
 		clear(changed)
 		for i := range fieldStates {
-			if fieldStates[i].changed {
+			if fieldStates[i].Changed() {
 				changed[i] = true
 			}
 		}
-		inheritMaterializedPredCache(snap, prev, qe.indexedFieldMap, changed)
+		inheritMaterializedPredCache(snap, prev, qe.schema.IndexedByName, changed)
 		pooled.ReleaseBoolSlice(changed)
 	} else {
-		inheritMaterializedPredCache(snap, prev, qe.indexedFieldMap, nil)
+		inheritMaterializedPredCache(snap, prev, qe.schema.IndexedByName, nil)
 	}
 	snap.ensureUniverseOwner()
 	return snap, true
@@ -1536,44 +1517,43 @@ func (qe *queryEngine) buildPreparedSnapshotInsertOnlyNoLock(seq uint64, prev *i
 	next := &indexSnapshot{
 		seq: seq,
 
-		index:              indexdata.CloneFieldStorageSlots(prev.index, len(qe.indexedFieldAccess)),
-		nilIndex:           indexdata.CloneFieldStorageSlots(prev.nilIndex, len(qe.indexedFieldAccess)),
-		lenIndex:           indexdata.CloneFieldStorageSlots(prev.lenIndex, len(qe.indexedFieldAccess)),
-		lenZeroComplement:  cloneFieldIndexBoolSlots(prev.lenZeroComplement, len(qe.indexedFieldAccess)),
-		measure:            indexdata.CloneMeasureStorageSlots(prev.measure, len(qe.measureFieldAccess)),
-		indexedFieldByName: qe.indexedFieldMap,
+		index:              indexdata.CloneFieldStorageSlots(prev.index, len(qe.schema.Indexed)),
+		nilIndex:           indexdata.CloneFieldStorageSlots(prev.nilIndex, len(qe.schema.Indexed)),
+		lenIndex:           indexdata.CloneFieldStorageSlots(prev.lenIndex, len(qe.schema.Indexed)),
+		lenZeroComplement:  cloneFieldIndexBoolSlots(prev.lenZeroComplement, len(qe.schema.Indexed)),
+		measure:            indexdata.CloneMeasureStorageSlots(prev.measure, len(qe.schema.Measures)),
+		indexedFieldByName: qe.schema.IndexedByName,
 		universe:           prev.universe.Clone(),
 		strmap:             sm,
 	}
 	next.universe = next.universe.BuildMergedOwned(addedUniverse)
 	qe.initSnapshotRuntimeCaches(next)
 
-	fieldStates := snapshotFieldInsertStateSlicePool.Get(len(qe.indexedFieldAccess))
-	fieldStates = fieldStates[:len(qe.indexedFieldAccess)]
-	initSnapshotFieldInsertStateHints(fieldStates, qe.indexedFieldAccess, prev, len(entries))
-	measureDeltas := indexdata.NewMeasureDeltaBatch(len(qe.measureFieldAccess))
+	fieldStates := schema.GetInsertStates(len(qe.schema.Indexed))
+	schema.InitInsertStateHints(fieldStates, qe.schema.Indexed, prev.index, prev.nilIndex, prev.lenIndex, len(entries))
+	measureDeltas := indexdata.NewMeasureDeltaBatch(len(qe.schema.Measures))
 
 	for i := range entries {
 		op := entries[i]
 		ptr := op.newVal
 
-		for _, acc := range qe.indexedFieldAccess {
-			useZeroComplement := acc.ordinal < len(prev.lenZeroComplement) && prev.lenZeroComplement[acc.ordinal]
-			acc.collectSnapshotInsertValue(ptr, op.idx, useZeroComplement, &fieldStates[acc.ordinal])
+		for _, acc := range qe.schema.Indexed {
+			useZeroComplement := acc.Ordinal < len(prev.lenZeroComplement) && prev.lenZeroComplement[acc.Ordinal]
+			acc.CollectInsertValue(ptr, op.idx, useZeroComplement, &fieldStates[acc.Ordinal])
 		}
-		for _, acc := range qe.measureFieldAccess {
-			if value, ok := acc.read(ptr); ok {
-				measureDeltas.Append(acc.ordinal, op.idx, true, value)
+		for _, acc := range qe.schema.Measures {
+			if value, ok := acc.Read(ptr); ok {
+				measureDeltas.Append(acc.Ordinal, op.idx, true, value)
 			}
 		}
 	}
 
 	changedCount := 0
 	var changed []bool
-	for i, acc := range qe.indexedFieldAccess {
+	for i, acc := range qe.schema.Indexed {
 		state := &fieldStates[i]
 		baseIndex := next.index[i]
-		if storage := acc.mergeSnapshotInsertStorageOwned(baseIndex, state, true); storage.KeyCount() > 0 {
+		if storage := acc.MergeInsertStorageOwned(baseIndex, state, true); storage.KeyCount() > 0 {
 			if storage != baseIndex {
 				next.index[i] = storage
 			}
@@ -1581,41 +1561,41 @@ func (qe *queryEngine) buildPreparedSnapshotInsertOnlyNoLock(seq uint64, prev *i
 			next.index[i] = indexdata.FieldStorage{}
 		}
 		baseNil := next.nilIndex[i]
-		if storage := acc.mergeSnapshotInsertNilStorageOwned(baseNil, state); storage.KeyCount() > 0 {
+		if storage := acc.MergeInsertNilStorageOwned(baseNil, state); storage.KeyCount() > 0 {
 			if storage != baseNil {
 				next.nilIndex[i] = storage
 			}
 		} else if baseNil.KeyCount() > 0 {
 			next.nilIndex[i] = indexdata.FieldStorage{}
 		}
-		if state.lengths != nil {
+		if lenDiff := state.LenDiff(); lenDiff != nil {
 			baseLen := next.lenIndex[i]
-			if storage := baseLen.ApplyLenPostingDiffRetainOwned(state.lengths); storage != baseLen {
+			if storage := baseLen.ApplyLenPostingDiffRetainOwned(lenDiff); storage != baseLen {
 				next.lenIndex[i] = storage
 			}
 		}
-		if state.changed {
+		if state.Changed() {
 			changedCount++
 			if changed == nil {
-				changed = pooled.GetBoolSlice(len(qe.indexedFieldAccess))[:len(qe.indexedFieldAccess)]
+				changed = pooled.GetBoolSlice(len(qe.schema.Indexed))[:len(qe.schema.Indexed)]
 				clear(changed)
 			}
 			changed[i] = true
 		}
-		state.reset()
+		state.Reset()
 	}
 	measureDeltas.ApplyToMeasureStorageSlotsOwned(next.measure)
 	measureDeltas.Release()
 	inheritNumericRangeBucketCache(next, prev)
 
 	if changedCount > 0 {
-		inheritMaterializedPredCache(next, prev, qe.indexedFieldMap, changed)
+		inheritMaterializedPredCache(next, prev, qe.schema.IndexedByName, changed)
 		pooled.ReleaseBoolSlice(changed)
 	} else {
-		inheritMaterializedPredCache(next, prev, qe.indexedFieldMap, nil)
+		inheritMaterializedPredCache(next, prev, qe.schema.IndexedByName, nil)
 	}
 	next.retainSharedOwnedStorageFrom(prev)
-	snapshotFieldInsertStateSlicePool.Put(fieldStates)
+	schema.ReleaseInsertStates(fieldStates)
 
 	return next, true
 }

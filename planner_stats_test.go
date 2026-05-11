@@ -44,7 +44,7 @@ func TestPlannerStatsCollector_PeriodicBudgetAdvancesCursor(t *testing.T) {
 	_ = seedData(t, db, 3_000)
 
 	db.mu.RLock()
-	fieldCount := len(db.engine.indexedFieldAccess)
+	fieldCount := len(db.engine.schema.Indexed)
 	db.mu.RUnlock()
 	if fieldCount < 2 {
 		t.Skip("not enough indexed fields for cursor progression test")

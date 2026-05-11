@@ -6,6 +6,7 @@ import (
 	"github.com/vapstack/rbi/internal/pooled"
 	"github.com/vapstack/rbi/internal/posting"
 	"github.com/vapstack/rbi/internal/qir"
+	"github.com/vapstack/rbi/internal/schema"
 )
 
 const countPredicateScanMaxLeaves = 16
@@ -41,9 +42,9 @@ func (db *DB[K, V]) Count(exprs ...qx.Expr) (uint64, error) {
 	)
 	switch len(exprs) {
 	case 1:
-		prepared, err = qir.PrepareCountExprResolved(db.engine.indexedFieldMap, exprs[0])
+		prepared, err = qir.PrepareCountExprResolved(db.engine.schema.IndexedByName, exprs[0])
 	default:
-		prepared, err = qir.PrepareCountExprsResolved(db.engine.indexedFieldMap, exprs...)
+		prepared, err = qir.PrepareCountExprsResolved(db.engine.schema.IndexedByName, exprs...)
 	}
 	if err != nil {
 		return 0, err
@@ -2371,7 +2372,7 @@ func (qv *queryView) tryMaterializeBroadRangeComplementPredicateForCount(p *pred
 	if fm == nil || fm.Slice {
 		return false
 	}
-	if !route.coarseMaterialize && !fieldUsesOrderedNumericKeys(fm) {
+	if !route.coarseMaterialize && !schema.FieldUsesOrderedNumericKeys(fm) {
 		return false
 	}
 	candidate, ok := qv.preparePredicateScalarRangeRoutingCandidate(*p)

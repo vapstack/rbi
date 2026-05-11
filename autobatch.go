@@ -14,6 +14,7 @@ import (
 
 	"github.com/vapstack/rbi/internal/keycodec"
 	"github.com/vapstack/rbi/internal/pooled"
+	"github.com/vapstack/rbi/internal/schema"
 	"github.com/vapstack/rbi/internal/strmap"
 	"go.etcd.io/bbolt"
 )
@@ -107,7 +108,7 @@ type autoBatchRuntime struct {
 	strKey             bool
 	strMap             *strmap.Mapper
 	engine             *queryEngine
-	patchMap           map[string]*field
+	schema             *schema.Runtime
 	testHookAccessor   func() *testHooks
 	broken             *atomic.Bool
 	logger             *log.Logger
@@ -331,23 +332,11 @@ func (rt *autoBatchRuntime) rollbackCreated(ops []autoBatchPrepared) {
 }
 
 func (rt *autoBatchRuntime) patchTouchesUnique(patch []Field) bool {
-	if rt.engine == nil {
+	if rt.schema == nil {
 		return false
 	}
 	for _, p := range patch {
-		f, ok := rt.patchMap[p.Name]
-		if !ok {
-			continue
-		}
-		if f.Unique {
-			return true
-		}
-		if f.DBName != "" {
-			if indexed, ok := rt.engine.fields[f.DBName]; ok && indexed.Unique {
-				return true
-			}
-		}
-		if indexed, ok := rt.engine.fields[f.Name]; ok && indexed.Unique {
+		if rt.schema.PatchNameTouchesUnique(p.Name) {
 			return true
 		}
 	}
@@ -589,7 +578,7 @@ func (db *DB[K, V]) buildPatchAutoBatchRequest(id K, fields []Field, ignoreUnkno
 	req.beforeStore = beforeStore
 	req.beforeCommit = beforeCommit
 	rt := db.autoBatcher.runtime
-	if rt.engine == nil || !rt.engine.hasUnique {
+	if rt.engine == nil || !rt.engine.schema.HasUnique {
 		req.policy = autoBatchReqRepeatIDSafeShared
 	} else if len(beforeProcess) == 0 && len(beforeStore) == 0 && !rt.patchTouchesUnique(fields) {
 		req.policy = autoBatchReqRepeatIDSafeShared
@@ -1234,7 +1223,7 @@ func (ab *autoBatcher) filterAutoBatchAcceptedLocked(att *autoBatchAttemptState,
 	rt := ab.runtime
 	att.accepted = att.prepared
 	att.acceptedSnapshots = att.preparedSnapshots
-	if rt.engine == nil || !rt.engine.hasUnique {
+	if rt.engine == nil || !rt.engine.schema.HasUnique {
 		return nil
 	}
 
@@ -1728,7 +1717,7 @@ func (ab *autoBatcher) executeAutoBatchAttempt(active *pooled.Slice[*autoBatchRe
 		rt.mu.Unlock()
 		return nil, true, fmt.Errorf("advance bucket sequence: %w", err)
 	}
-	snap := rt.engine.buildPreparedSnapshotNoLock(seq, rt.strMap, rt.patchMap, att.acceptedSnapshots)
+	snap := rt.engine.buildPreparedSnapshotNoLock(seq, rt.strMap, rt.schema.Patch.Fields, att.acceptedSnapshots)
 	rt.engine.snapshot.stage(snap)
 
 	if err = commitTx(tx, opName, rt.testHookAccessor()); err != nil {
