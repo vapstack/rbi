@@ -13,7 +13,7 @@ type snapshotBatchEntry struct {
 	idx       uint64
 	oldVal    unsafe.Pointer
 	newVal    unsafe.Pointer
-	patch     []Field
+	patch     []schema.PatchItem
 	patchOnly bool
 }
 

@@ -372,6 +372,26 @@ type schemaTestPatchRec struct {
 	VIPtr  *schemaTestVI
 }
 
+type SchemaTestPatchApplyEmbedded struct {
+	Embedded string `db:"embedded_db" json:"embeddedJSON"`
+}
+
+type schemaTestPatchApplyRec struct {
+	SchemaTestPatchApplyEmbedded
+	GoName   string
+	DBName   string `db:"db_name"`
+	JSONName string `json:"jsonName"`
+	Ptr      *int
+	Tags     []int16
+	Named    schemaTestNamedStrings
+	Nested   schemaTestPatchNested
+	I8       int8
+	U8       uint8
+	F32      float32
+	VI       schemaTestVI
+	VIPtr    *schemaTestVI
+}
+
 func TestPatchAccessorsEqualCopyAndOrdinalCopies(t *testing.T) {
 	rt, err := Compile(reflect.TypeFor[schemaTestPatchRec](), Config{Index: map[string]IndexKind{"Scalar": IndexDefault, "VI": IndexUnique}})
 	if err != nil {
@@ -449,6 +469,91 @@ func TestPatchAccessorsEqualCopyAndOrdinalCopies(t *testing.T) {
 		if rt.IndexedByName[acc.Name].PatchOrdinal != acc.PatchOrdinal {
 			t.Fatalf("Unique PatchOrdinal mismatch for %s", acc.Name)
 		}
+	}
+}
+
+func TestPatchRuntimeApplyNamesAndConversions(t *testing.T) {
+	rt, err := Compile(reflect.TypeFor[schemaTestPatchApplyRec](), Config{})
+	if err != nil {
+		t.Fatalf("Compile: %v", err)
+	}
+
+	vi := schemaTestVI("BB")
+	rec := schemaTestPatchApplyRec{}
+	err = rt.Patch.Apply(unsafe.Pointer(&rec), []PatchItem{
+		{Name: "GoName", Value: "go"},
+		{Name: "db_name", Value: "db"},
+		{Name: "jsonName", Value: "json"},
+		{Name: "embedded_db", Value: "embedded"},
+		{Name: "Ptr", Value: int64(42)},
+		{Name: "Tags", Value: []int{1, 2}},
+		{Name: "Named", Value: []string{"n1", "n2"}},
+		{Name: "Nested", Value: schemaTestPatchNested{Values: []int{7, 8}}},
+		{Name: "I8", Value: int64(12)},
+		{Name: "U8", Value: float64(13)},
+		{Name: "F32", Value: uint64(14)},
+		{Name: "VI", Value: "aa"},
+		{Name: "VIPtr", Value: vi},
+	}, false)
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	if rec.GoName != "go" || rec.DBName != "db" || rec.JSONName != "json" || rec.Embedded != "embedded" {
+		t.Fatalf("name resolution failed: %+v", rec)
+	}
+	if rec.Ptr == nil || *rec.Ptr != 42 {
+		t.Fatalf("pointer conversion failed: %+v", rec.Ptr)
+	}
+	if !slices.Equal(rec.Tags, []int16{1, 2}) {
+		t.Fatalf("slice numeric conversion failed: %#v", rec.Tags)
+	}
+	if !slices.Equal(rec.Named, schemaTestNamedStrings{"n1", "n2"}) {
+		t.Fatalf("named slice conversion failed: %#v", rec.Named)
+	}
+	if !slices.Equal(rec.Nested.Values, []int{7, 8}) {
+		t.Fatalf("nested field assignment failed: %#v", rec.Nested)
+	}
+	if rec.I8 != 12 || rec.U8 != 13 || rec.F32 != 14 {
+		t.Fatalf("numeric conversion failed: %+v", rec)
+	}
+	if rec.VI != "aa" || rec.VIPtr == nil || *rec.VIPtr != "BB" {
+		t.Fatalf("ValueIndexer assignment failed: VI=%q VIPtr=%v", rec.VI, rec.VIPtr)
+	}
+}
+
+func TestPatchRuntimeApplyUnknownNilAndConversionErrors(t *testing.T) {
+	rt, err := Compile(reflect.TypeFor[schemaTestPatchApplyRec](), Config{})
+	if err != nil {
+		t.Fatalf("Compile: %v", err)
+	}
+
+	n := 5
+	rec := schemaTestPatchApplyRec{GoName: "old", Ptr: &n, Tags: []int16{1}}
+	if err = rt.Patch.Apply(unsafe.Pointer(&rec), []PatchItem{{Name: "Missing", Value: 1}}, true); err != nil {
+		t.Fatalf("Apply ignored unknown: %v", err)
+	}
+	if rec.GoName != "old" {
+		t.Fatalf("ignored unknown changed record: %+v", rec)
+	}
+	if err = rt.Patch.Apply(unsafe.Pointer(&rec), []PatchItem{{Name: "Missing", Value: 1}}, false); err == nil || !strings.Contains(err.Error(), "cannot patch field Missing") {
+		t.Fatalf("strict unknown error=%v", err)
+	}
+
+	if err = rt.Patch.Apply(unsafe.Pointer(&rec), []PatchItem{{Name: "Ptr", Value: nil}, {Name: "Tags", Value: nil}}, false); err != nil {
+		t.Fatalf("Apply nil nillable: %v", err)
+	}
+	if rec.Ptr != nil || rec.Tags != nil {
+		t.Fatalf("nil nillable assignment failed: %+v", rec)
+	}
+	if err = rt.Patch.Apply(unsafe.Pointer(&rec), []PatchItem{{Name: "GoName", Value: nil}}, false); err == nil || !strings.Contains(err.Error(), "cannot assign nil to non-nillable field") {
+		t.Fatalf("nil non-nillable error=%v", err)
+	}
+	if err = rt.Patch.Apply(unsafe.Pointer(&rec), []PatchItem{{Name: "I8", Value: int64(200)}}, false); err == nil || !strings.Contains(err.Error(), "overflows int field") {
+		t.Fatalf("int overflow error=%v", err)
+	}
+	if err = rt.Patch.Apply(unsafe.Pointer(&rec), []PatchItem{{Name: "Tags", Value: []any{nil}}}, false); err == nil || !strings.Contains(err.Error(), "cannot set nil to non-pointer slice element") {
+		t.Fatalf("slice nil element error=%v", err)
 	}
 }
 

@@ -10,8 +10,10 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"unsafe"
 
 	"github.com/vapstack/rbi/internal/keycodec"
+	"github.com/vapstack/rbi/internal/schema"
 	"github.com/vmihailenco/msgpack/v5"
 	"go.etcd.io/bbolt"
 )
@@ -206,7 +208,7 @@ func rawSetBench(db *DB[uint64, UserBench], raw *bbolt.DB, id uint64, rec *UserB
 	})
 }
 
-func rawPatchBench(db *DB[uint64, UserBench], raw *bbolt.DB, id uint64, patch []Field) error {
+func rawPatchBench(db *DB[uint64, UserBench], raw *bbolt.DB, id uint64, patch []schema.PatchItem) error {
 	return raw.Update(func(tx *bbolt.Tx) error {
 		bucket := tx.Bucket(db.bucket)
 		if bucket == nil {
@@ -231,7 +233,7 @@ func rawPatchBench(db *DB[uint64, UserBench], raw *bbolt.DB, id uint64, patch []
 		}
 		defer db.ReleaseRecords(oldVal, newVal)
 
-		if err = db.applyPatch(newVal, patch, true); err != nil {
+		if err = db.schema.Patch.Apply(unsafe.Pointer(newVal), patch, true); err != nil {
 			return fmt.Errorf("apply patch: %w", err)
 		}
 
@@ -480,14 +482,14 @@ func Benchmark_Write_Patch_NoIndex(b *testing.B) {
 	targetID := uint64(2000)
 	prepareWriteBenchStableBase(b, db)
 
-	patchA := []Field{{Name: "age", Value: 100}}
-	patchB := []Field{{Name: "age", Value: 200}}
+	patchA := []schema.PatchItem{{Name: "age", Value: 100}}
+	patchB := []schema.PatchItem{{Name: "age", Value: 200}}
 
 	b.ResetTimer()
 	b.ReportAllocs()
 
 	for i := 0; i < b.N; i++ {
-		var patch []Field
+		var patch []schema.PatchItem
 		if i%2 == 0 {
 			patch = patchA
 		} else {

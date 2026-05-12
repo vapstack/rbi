@@ -845,7 +845,7 @@ func TestUnique_ExecuteBatch_MixedOps_MatchesSequentialModel(t *testing.T) {
 				reqs = append(reqs, &autoBatchRequest{
 					op:                 autoBatchPatch,
 					id:                 dataKeyFromID(op.id),
-					patch:              cloneFields(op.patch),
+					patch:              schemaPatchItemsForTest(op.patch...),
 					patchIgnoreUnknown: true,
 					done:               make(chan error, 1),
 				})

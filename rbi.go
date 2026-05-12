@@ -596,9 +596,6 @@ func (db *DB[K, V]) initBatcher() {
 			release: func(ptr unsafe.Pointer) {
 				db.ReleaseRecords((*V)(ptr))
 			},
-			applyPatch: func(ptr unsafe.Pointer, patch []Field, ignoreUnknown bool) error {
-				return db.applyPatch((*V)(ptr), patch, ignoreUnknown)
-			},
 			validateIndex: func(ptr unsafe.Pointer) error {
 				return db.validateIndexedStringValues((*V)(ptr))
 			},

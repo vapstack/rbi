@@ -712,9 +712,7 @@ func TestMakePatch_EmitsNilToEmptySliceTransition(t *testing.T) {
 	}
 
 	applied := *oldVal
-	if err := db.applyPatch(&applied, patch, false); err != nil {
-		t.Fatalf("applyPatch: %v", err)
-	}
+	applyPatchForTest(t, db, &applied, patch, false)
 	if applied.Tags == nil || len(applied.Tags) != 0 {
 		t.Fatalf("patched record lost non-nil empty slice: %#v", applied.Tags)
 	}

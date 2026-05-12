@@ -97,7 +97,6 @@ type autoBatchRecordOps struct {
 	encode        func(unsafe.Pointer, *bytes.Buffer) error
 	decode        func([]byte) (unsafe.Pointer, error)
 	release       func(unsafe.Pointer)
-	applyPatch    func(unsafe.Pointer, []Field, bool) error
 	validateIndex func(unsafe.Pointer) error
 }
 
@@ -126,7 +125,7 @@ type autoBatchRequest struct {
 	setBaseline unsafe.Pointer
 	setPayload  *bytes.Buffer
 
-	patch []Field
+	patch []schema.PatchItem
 
 	patchIgnoreUnknown bool
 
@@ -331,7 +330,7 @@ func (rt *autoBatchRuntime) rollbackCreated(ops []autoBatchPrepared) {
 	}
 }
 
-func (rt *autoBatchRuntime) patchTouchesUnique(patch []Field) bool {
+func (rt *autoBatchRuntime) patchTouchesUnique(patch []schema.PatchItem) bool {
 	if rt.schema == nil {
 		return false
 	}
@@ -572,7 +571,9 @@ func (db *DB[K, V]) buildPatchAutoBatchRequest(id K, fields []Field, ignoreUnkno
 		req.patch = slices.Grow(req.patch, len(fields))
 	}
 	req.patch = req.patch[:len(fields)]
-	copy(req.patch, fields)
+	for i := range fields {
+		req.patch[i] = schema.PatchItem(fields[i])
+	}
 	req.patchIgnoreUnknown = ignoreUnknown
 	req.beforeProcess = beforeProcess
 	req.beforeStore = beforeStore
@@ -580,7 +581,7 @@ func (db *DB[K, V]) buildPatchAutoBatchRequest(id K, fields []Field, ignoreUnkno
 	rt := db.autoBatcher.runtime
 	if rt.engine == nil || !rt.engine.schema.HasUnique {
 		req.policy = autoBatchReqRepeatIDSafeShared
-	} else if len(beforeProcess) == 0 && len(beforeStore) == 0 && !rt.patchTouchesUnique(fields) {
+	} else if len(beforeProcess) == 0 && len(beforeStore) == 0 && !rt.patchTouchesUnique(req.patch) {
 		req.policy = autoBatchReqRepeatIDSafeShared
 	}
 	return req
@@ -1122,7 +1123,7 @@ func (ab *autoBatcher) prepareAutoBatchPatch(att *autoBatchAttemptState, req *au
 			rt.ops.release(newVal)
 		}
 	}()
-	if err = rt.ops.applyPatch(newVal, req.patch, req.patchIgnoreUnknown); err != nil {
+	if err = rt.schema.Patch.Apply(newVal, req.patch, req.patchIgnoreUnknown); err != nil {
 		req.err = formatAutoBatchPrepareErr(autoBatchPrepareErrApplyPatch, err)
 		return
 	}

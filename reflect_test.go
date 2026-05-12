@@ -10,6 +10,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unsafe"
 
 	"github.com/vapstack/qx"
 	"github.com/vapstack/rbi/internal/schema"
@@ -212,6 +213,17 @@ func patchFieldsByName(fields []Field) map[string]any {
 		out[f.Name] = f.Value
 	}
 	return out
+}
+
+func applyPatchForTest[K ~uint64 | ~string, V any](t testing.TB, db *DB[K, V], v *V, patch []Field, ignoreUnknown bool) {
+	t.Helper()
+	items := make([]schema.PatchItem, len(patch))
+	for i := range patch {
+		items[i] = schema.PatchItem(patch[i])
+	}
+	if err := db.schema.Patch.Apply(unsafe.Pointer(v), items, ignoreUnknown); err != nil {
+		t.Fatalf("applyPatch: %v", err)
+	}
 }
 
 func assertUint64Slice(t *testing.T, got, want []uint64) {
@@ -895,9 +907,7 @@ func TestReflectExt_MakePatch_RoundTripPreservesTimeValue(t *testing.T) {
 	}
 
 	applied := *oldVal
-	if err := db.applyPatch(&applied, patch, false); err != nil {
-		t.Fatalf("applyPatch: %v", err)
-	}
+	applyPatchForTest(t, db, &applied, patch, false)
 	if applied.When != newVal.When {
 		t.Fatalf("patched record lost time value: got=%#v want=%#v", applied.When, newVal.When)
 	}
@@ -928,9 +938,7 @@ func TestReflectExt_MakePatch_RoundTripPreservesTimeSlice(t *testing.T) {
 	}
 
 	applied := *oldVal
-	if err := db.applyPatch(&applied, patch, false); err != nil {
-		t.Fatalf("applyPatch: %v", err)
-	}
+	applyPatchForTest(t, db, &applied, patch, false)
 	if !reflect.DeepEqual(applied.Slots, newVal.Slots) {
 		t.Fatalf("patched record lost time slice contents: got=%#v want=%#v", applied.Slots, newVal.Slots)
 	}
@@ -961,9 +969,7 @@ func TestReflectExt_MakePatch_RoundTripPreservesTimeMapKeys(t *testing.T) {
 	}
 
 	applied := *oldVal
-	if err := db.applyPatch(&applied, patch, false); err != nil {
-		t.Fatalf("applyPatch: %v", err)
-	}
+	applyPatchForTest(t, db, &applied, patch, false)
 	if !reflect.DeepEqual(applied.Windows, newVal.Windows) {
 		t.Fatalf("patched record lost time map contents: got=%#v want=%#v", applied.Windows, newVal.Windows)
 	}
@@ -995,9 +1001,7 @@ func TestReflectExt_MakePatch_PreservesNamedSliceType(t *testing.T) {
 	}
 
 	applied := *oldVal
-	if err := db.applyPatch(&applied, patch, false); err != nil {
-		t.Fatalf("applyPatch: %v", err)
-	}
+	applyPatchForTest(t, db, &applied, patch, false)
 	if !reflect.DeepEqual(applied.Tags, reflectNamedTags{"go", "db"}) {
 		t.Fatalf("patched record lost named slice type/content: %#v", applied.Tags)
 	}
@@ -1026,9 +1030,7 @@ func TestReflectExt_MakePatch_UsesFullFieldEqualityForValueIndexer(t *testing.T)
 	}
 
 	applied := *oldVal
-	if err := db.applyPatch(&applied, patch, false); err != nil {
-		t.Fatalf("applyPatch: %v", err)
-	}
+	applyPatchForTest(t, db, &applied, patch, false)
 	if !reflect.DeepEqual(applied.Key, reflectMapVI{"id": "a", "note": "new"}) {
 		t.Fatalf("patched record lost ValueIndexer-backed field contents: %#v", applied.Key)
 	}
@@ -1076,9 +1078,7 @@ func TestReflectExt_MakePatch_RoundTripDetachesStructReferences(t *testing.T) {
 	}
 
 	applied := *oldVal
-	if err := db.applyPatch(&applied, patch, false); err != nil {
-		t.Fatalf("applyPatch: %v", err)
-	}
+	applyPatchForTest(t, db, &applied, patch, false)
 	if !reflect.DeepEqual(applied.Nested.Tags, []string{"before"}) {
 		t.Fatalf("patched record aliased struct slice field: %#v", applied.Nested.Tags)
 	}
@@ -1135,9 +1135,7 @@ func TestReflectExt_MakePatch_RoundTripDetachesPointerStructReferences(t *testin
 	}
 
 	applied := *oldVal
-	if err := db.applyPatch(&applied, patch, false); err != nil {
-		t.Fatalf("applyPatch: %v", err)
-	}
+	applyPatchForTest(t, db, &applied, patch, false)
 	if applied.NestedPtr == nil || !reflect.DeepEqual(applied.NestedPtr.Tags, []string{"before"}) {
 		t.Fatalf("patched record aliased pointer struct slice field: %#v", applied.NestedPtr)
 	}
@@ -1199,9 +1197,7 @@ func TestReflectExt_MakePatch_RoundTripDetachesSliceStructReferences(t *testing.
 	}
 
 	applied := *oldVal
-	if err := db.applyPatch(&applied, patch, false); err != nil {
-		t.Fatalf("applyPatch: %v", err)
-	}
+	applyPatchForTest(t, db, &applied, patch, false)
 	if len(applied.Items) != 1 {
 		t.Fatalf("patched record lost slice contents: %#v", applied.Items)
 	}

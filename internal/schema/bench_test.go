@@ -550,6 +550,27 @@ func BenchmarkPatchValueCopy(b *testing.B) {
 	}
 }
 
+func BenchmarkPatchApply(b *testing.B) {
+	rt := benchmarkSchemaMustCompile(b)
+	rec := benchmarkSchemaRecordValue()
+	items := []PatchItem{
+		{Name: "string", Value: "beta"},
+		{Name: "signed", Value: int32(18)},
+		{Name: "ptr", Value: int64(24)},
+		{Name: "tags", Value: []string{"go", "query"}},
+		{Name: "scores", Value: []int16{4, 2}},
+	}
+	ptr := unsafe.Pointer(&rec)
+
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		if err := rt.Patch.Apply(ptr, items, false); err != nil {
+			b.Fatal(err)
+		}
+	}
+	benchmarkSchemaAnySink = rec.Tags
+}
+
 func benchmarkSchemaDeepCopyValue(src any) any {
 	if src == nil {
 		return nil

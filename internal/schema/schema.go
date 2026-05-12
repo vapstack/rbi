@@ -188,10 +188,16 @@ type PatchFieldAccessor struct {
 	CopyValue  PatchValueCopyFn
 }
 
+type PatchItem struct {
+	Name  string
+	Value any
+}
+
 type PatchRuntime struct {
 	Fields   map[string]*Field
 	Access   []PatchFieldAccessor
 	Ordinals map[string]int
+	typ      reflect.Type
 }
 
 func Compile(vtype reflect.Type, config Config) (*Runtime, error) {
@@ -682,6 +688,7 @@ func makePatchRuntime(vtype reflect.Type) (PatchRuntime, error) {
 		Fields:   patchMap,
 		Access:   access,
 		Ordinals: ordinals,
+		typ:      vtype,
 	}, nil
 }
 

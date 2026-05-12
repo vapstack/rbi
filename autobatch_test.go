@@ -16,9 +16,18 @@ import (
 	"github.com/vapstack/rbi/internal/indexdata"
 	"github.com/vapstack/rbi/internal/keycodec"
 	"github.com/vapstack/rbi/internal/pooled"
+	"github.com/vapstack/rbi/internal/schema"
 	"github.com/vapstack/rbi/internal/strmap"
 	"go.etcd.io/bbolt"
 )
+
+func schemaPatchItemsForTest(fields ...Field) []schema.PatchItem {
+	items := make([]schema.PatchItem, len(fields))
+	for i := range fields {
+		items[i] = schema.PatchItem(fields[i])
+	}
+	return items
+}
 
 func testStrMapCount[V any](tb testing.TB, db *DB[string, V]) int {
 	tb.Helper()
@@ -793,7 +802,7 @@ func TestBatch_DuplicatePatchSameID_NonUniqueFieldsStayBatched(t *testing.T) {
 	req1 := &autoBatchRequest{
 		op:                 autoBatchPatch,
 		id:                 dataKeyFromID(uint64(1)),
-		patch:              []Field{{Name: "tags", Value: []string{"x"}}},
+		patch:              schemaPatchItemsForTest(Field{Name: "tags", Value: []string{"x"}}),
 		patchIgnoreUnknown: true,
 		policy:             autoBatchReqRepeatIDSafeShared,
 		done:               make(chan error, 1),
@@ -801,7 +810,7 @@ func TestBatch_DuplicatePatchSameID_NonUniqueFieldsStayBatched(t *testing.T) {
 	req2 := &autoBatchRequest{
 		op:                 autoBatchPatch,
 		id:                 dataKeyFromID(uint64(1)),
-		patch:              []Field{{Name: "tags", Value: []string{"y"}}},
+		patch:              schemaPatchItemsForTest(Field{Name: "tags", Value: []string{"y"}}),
 		patchIgnoreUnknown: true,
 		policy:             autoBatchReqRepeatIDSafeShared,
 		done:               make(chan error, 1),
@@ -809,7 +818,7 @@ func TestBatch_DuplicatePatchSameID_NonUniqueFieldsStayBatched(t *testing.T) {
 	req3 := &autoBatchRequest{
 		op:                 autoBatchPatch,
 		id:                 dataKeyFromID(uint64(2)),
-		patch:              []Field{{Name: "tags", Value: []string{"z"}}},
+		patch:              schemaPatchItemsForTest(Field{Name: "tags", Value: []string{"z"}}),
 		patchIgnoreUnknown: true,
 		policy:             autoBatchReqRepeatIDSafeShared,
 		done:               make(chan error, 1),
@@ -877,14 +886,14 @@ func TestBatch_DuplicatePatchSameID_DecodeFailurePropagatesToLaterRequests(t *te
 	req1 := &autoBatchRequest{
 		op:                 autoBatchPatch,
 		id:                 dataKeyFromID(uint64(1)),
-		patch:              []Field{{Name: "age", Value: 31}},
+		patch:              schemaPatchItemsForTest(Field{Name: "age", Value: 31}),
 		patchIgnoreUnknown: true,
 		done:               make(chan error, 1),
 	}
 	req2 := &autoBatchRequest{
 		op:                 autoBatchPatch,
 		id:                 dataKeyFromID(uint64(1)),
-		patch:              []Field{{Name: "age", Value: 32}},
+		patch:              schemaPatchItemsForTest(Field{Name: "age", Value: 32}),
 		patchIgnoreUnknown: true,
 		done:               make(chan error, 1),
 	}
@@ -909,21 +918,21 @@ func TestBatch_DuplicatePatchSameID_UniqueFieldCutsBatch(t *testing.T) {
 	req1 := &autoBatchRequest{
 		op:                 autoBatchPatch,
 		id:                 dataKeyFromID(uint64(1)),
-		patch:              []Field{{Name: "email", Value: "next@x"}},
+		patch:              schemaPatchItemsForTest(Field{Name: "email", Value: "next@x"}),
 		patchIgnoreUnknown: true,
 		done:               make(chan error, 1),
 	}
 	req2 := &autoBatchRequest{
 		op:                 autoBatchPatch,
 		id:                 dataKeyFromID(uint64(1)),
-		patch:              []Field{{Name: "tags", Value: []string{"y"}}},
+		patch:              schemaPatchItemsForTest(Field{Name: "tags", Value: []string{"y"}}),
 		patchIgnoreUnknown: true,
 		done:               make(chan error, 1),
 	}
 	req3 := &autoBatchRequest{
 		op:                 autoBatchPatch,
 		id:                 dataKeyFromID(uint64(2)),
-		patch:              []Field{{Name: "tags", Value: []string{"z"}}},
+		patch:              schemaPatchItemsForTest(Field{Name: "tags", Value: []string{"z"}}),
 		patchIgnoreUnknown: true,
 		done:               make(chan error, 1),
 	}
@@ -964,7 +973,7 @@ func TestBatch_DuplicatePatchSameID_BeforeStoreOnUniqueDBCutsBatch(t *testing.T)
 	req1 := &autoBatchRequest{
 		op:                 autoBatchPatch,
 		id:                 dataKeyFromID(uint64(1)),
-		patch:              []Field{{Name: "tags", Value: []string{"x"}}},
+		patch:              schemaPatchItemsForTest(Field{Name: "tags", Value: []string{"x"}}),
 		patchIgnoreUnknown: true,
 		beforeStore:        testBeforeStoreHooks([]beforeStoreFunc[uint64, UniqueTestRec]{cb}),
 		done:               make(chan error, 1),
@@ -972,7 +981,7 @@ func TestBatch_DuplicatePatchSameID_BeforeStoreOnUniqueDBCutsBatch(t *testing.T)
 	req2 := &autoBatchRequest{
 		op:                 autoBatchPatch,
 		id:                 dataKeyFromID(uint64(1)),
-		patch:              []Field{{Name: "tags", Value: []string{"y"}}},
+		patch:              schemaPatchItemsForTest(Field{Name: "tags", Value: []string{"y"}}),
 		patchIgnoreUnknown: true,
 		beforeStore:        testBeforeStoreHooks([]beforeStoreFunc[uint64, UniqueTestRec]{cb}),
 		done:               make(chan error, 1),
@@ -980,7 +989,7 @@ func TestBatch_DuplicatePatchSameID_BeforeStoreOnUniqueDBCutsBatch(t *testing.T)
 	req3 := &autoBatchRequest{
 		op:                 autoBatchPatch,
 		id:                 dataKeyFromID(uint64(2)),
-		patch:              []Field{{Name: "email", Value: "other@x"}},
+		patch:              schemaPatchItemsForTest(Field{Name: "email", Value: "other@x"}),
 		patchIgnoreUnknown: true,
 		done:               make(chan error, 1),
 	}
@@ -1031,7 +1040,7 @@ func TestBatch_DuplicatePatchSameID_BeforeProcessOnUniqueDBCutsBatch(t *testing.
 	req1 := &autoBatchRequest{
 		op:                 autoBatchPatch,
 		id:                 dataKeyFromID(uint64(1)),
-		patch:              []Field{{Name: "tags", Value: []string{"x"}}},
+		patch:              schemaPatchItemsForTest(Field{Name: "tags", Value: []string{"x"}}),
 		patchIgnoreUnknown: true,
 		beforeProcess:      testBeforeProcessHooks([]beforeProcessFunc[uint64, UniqueTestRec]{cb}),
 		done:               make(chan error, 1),
@@ -1039,7 +1048,7 @@ func TestBatch_DuplicatePatchSameID_BeforeProcessOnUniqueDBCutsBatch(t *testing.
 	req2 := &autoBatchRequest{
 		op:                 autoBatchPatch,
 		id:                 dataKeyFromID(uint64(1)),
-		patch:              []Field{{Name: "tags", Value: []string{"y"}}},
+		patch:              schemaPatchItemsForTest(Field{Name: "tags", Value: []string{"y"}}),
 		patchIgnoreUnknown: true,
 		beforeProcess:      testBeforeProcessHooks([]beforeProcessFunc[uint64, UniqueTestRec]{cb}),
 		done:               make(chan error, 1),
@@ -1047,7 +1056,7 @@ func TestBatch_DuplicatePatchSameID_BeforeProcessOnUniqueDBCutsBatch(t *testing.
 	req3 := &autoBatchRequest{
 		op:                 autoBatchPatch,
 		id:                 dataKeyFromID(uint64(2)),
-		patch:              []Field{{Name: "email", Value: "other@x"}},
+		patch:              schemaPatchItemsForTest(Field{Name: "email", Value: "other@x"}),
 		patchIgnoreUnknown: true,
 		done:               make(chan error, 1),
 	}
@@ -1296,7 +1305,7 @@ func TestBatch_PatchFailures_IsolateFailedRequest(t *testing.T) {
 				return &autoBatchRequest{
 					op:                 autoBatchPatch,
 					id:                 dataKeyFromID(uint64(999)),
-					patch:              []Field{{Name: "age", Value: 77}},
+					patch:              schemaPatchItemsForTest(Field{Name: "age", Value: 77}),
 					patchIgnoreUnknown: true,
 					done:               make(chan error, 1),
 				}
@@ -1309,7 +1318,7 @@ func TestBatch_PatchFailures_IsolateFailedRequest(t *testing.T) {
 				return &autoBatchRequest{
 					op:                 autoBatchPatch,
 					id:                 dataKeyFromID(uint64(1)),
-					patch:              []Field{{Name: "age", Value: "not-an-int"}},
+					patch:              schemaPatchItemsForTest(Field{Name: "age", Value: "not-an-int"}),
 					patchIgnoreUnknown: true,
 					done:               make(chan error, 1),
 				}
