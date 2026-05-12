@@ -7,7 +7,6 @@ import (
 )
 
 const (
-	materializedPredKeySlicePoolMaxCap      = 512
 	stringSetPoolMaxLen                     = 4 << 10
 	uint64IntMapPoolMaxLen                  = 16 << 10
 	u64SetPoolMaxCap                        = 16 << 10
@@ -44,14 +43,6 @@ var orderedMergedScalarRangeFieldSlicePool = pooled.Slices[orderedMergedScalarRa
 var aggregateMetricStateSlicePool = pooled.Slices[aggregateMetricState]{
 	MinCap: 16,
 	MaxCap: aggregateMetricStateSlicePoolMaxCap,
-	Clear:  true,
-}
-
-/**/
-
-var materializedPredKeySlicePool = pooled.Slices[materializedPredKey]{
-	MinCap: 8,
-	MaxCap: materializedPredKeySlicePoolMaxCap,
 	Clear:  true,
 }
 

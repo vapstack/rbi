@@ -9,6 +9,7 @@ import (
 	"github.com/vapstack/rbi/internal/keycodec"
 	"github.com/vapstack/rbi/internal/pooled"
 	"github.com/vapstack/rbi/internal/posting"
+	"github.com/vapstack/rbi/internal/qcache"
 	"github.com/vapstack/rbi/internal/qir"
 )
 
@@ -527,15 +528,17 @@ func TestBuildPredRange_PrefixMaterializationSkippedWhenCacheDisabled(t *testing
 	releasePredicates([]predicate{p})
 
 	rawKey := materializedPredCacheKeyFromScalar("email", compileScalarOpForTest(qx.OpPREFIX), "user1")
-	parsedKey, ok := materializedPredKeyFromEncoded(rawKey)
+	parsedKey, ok := qcache.MaterializedPredKeyFromEncoded(rawKey)
 	if !ok {
 		t.Fatalf("expected parseable materialized cache key %q", rawKey)
 	}
 	if _, ok := db.engine.getSnapshot().loadMaterializedPredKey(parsedKey); ok {
 		t.Fatalf("expected no cache store when materialized predicate cache is disabled")
 	}
-	if got := db.engine.getSnapshot().matPredCacheCount.Load(); got != 0 {
-		t.Fatalf("expected zero materialized cache entries, got %d", got)
+	if cache := db.engine.getSnapshot().matPredCache; cache != nil {
+		if got := cache.EntryCount(); got != 0 {
+			t.Fatalf("expected zero materialized cache entries, got %d", got)
+		}
 	}
 }
 
@@ -847,7 +850,7 @@ func TestBuildPredicateWithMode_AllowMaterializeSkipsColdNumericRangeUnionWhenPo
 	if p.kind == predicateKindMaterialized || p.kind == predicateKindMaterializedNot {
 		t.Fatalf("unexpected eager materialized predicate kind=%v", p.kind)
 	}
-	if got := db.engine.getSnapshot().matPredCacheCount.Load(); got != 0 {
+	if got := db.engine.getSnapshot().matPredCache.EntryCount(); got != 0 {
 		t.Fatalf("unexpected shared materialized predicate cache entry: %d", got)
 	}
 }
@@ -882,7 +885,7 @@ func TestBuildPredicateWithMode_RuntimeNumericRangeMaterializationKeepsScalarCac
 		if p.overlayState == nil {
 			t.Fatalf("expected chunked numeric range to stay on overlay runtime state")
 		}
-		if got := db.engine.getSnapshot().matPredCacheCount.Load(); got != 0 {
+		if got := db.engine.getSnapshot().matPredCache.EntryCount(); got != 0 {
 			t.Fatalf("unexpected shared materialized predicate cache before runtime materialization: %d", got)
 		}
 		matchCalls := max(128, p.overlayState.materializeAfter+1)
@@ -898,7 +901,7 @@ func TestBuildPredicateWithMode_RuntimeNumericRangeMaterializationKeepsScalarCac
 		if p.overlayState.probeMaterialized && p.overlayState.probeIDs.IsEmpty() {
 			t.Fatalf("expected locally materialized overlay probe ids")
 		}
-		if got := db.engine.getSnapshot().matPredCacheCount.Load(); got != 0 {
+		if got := db.engine.getSnapshot().matPredCache.EntryCount(); got != 0 {
 			t.Fatalf("unexpected shared scalar cache entry from runtime overlay materialization: %d", got)
 		}
 		if cached, ok := db.engine.getSnapshot().loadMaterializedPred(cacheKey); ok && !cached.IsEmpty() {
@@ -935,13 +938,13 @@ func TestBuildPredicateWithMode_RuntimeNumericRangeMaterializationKeepsScalarCac
 		if p.overlayState == nil {
 			t.Fatalf("expected numeric range to stay on runtime overlay state")
 		}
-		if got := db.engine.getSnapshot().matPredCacheCount.Load(); got != 0 {
+		if got := db.engine.getSnapshot().matPredCache.EntryCount(); got != 0 {
 			t.Fatalf("unexpected shared materialized predicate cache before runtime materialization: %d", got)
 		}
 		for i := 1; i <= 128; i++ {
 			_ = p.matches(uint64(i))
 		}
-		if got := db.engine.getSnapshot().matPredCacheCount.Load(); got != 0 {
+		if got := db.engine.getSnapshot().matPredCache.EntryCount(); got != 0 {
 			t.Fatalf("unexpected shared scalar cache entry from runtime overlay materialization: %d", got)
 		}
 		if cached, ok := db.engine.getSnapshot().loadMaterializedPred(cacheKey); ok && !cached.IsEmpty() {
@@ -997,7 +1000,7 @@ func TestBuildPredRange_BroadPositiveRuntimeKeepsComplementCacheLocal(t *testing
 	if !p.overlayState.probe.useComplement {
 		t.Fatalf("expected broad positive range to use complement probe")
 	}
-	if got := db.engine.getSnapshot().matPredCacheCount.Load(); got != 0 {
+	if got := db.engine.getSnapshot().matPredCache.EntryCount(); got != 0 {
 		t.Fatalf("unexpected shared materialized predicate cache before runtime materialization: %d", got)
 	}
 
@@ -1005,7 +1008,7 @@ func TestBuildPredRange_BroadPositiveRuntimeKeepsComplementCacheLocal(t *testing
 		_ = p.matches(uint64(i))
 	}
 
-	if got := db.engine.getSnapshot().matPredCacheCount.Load(); got != 0 {
+	if got := db.engine.getSnapshot().matPredCache.EntryCount(); got != 0 {
 		t.Fatalf("expected complement-backed runtime matches to stay local, cacheCount=%d", got)
 	}
 	if _, ok := db.engine.getSnapshot().loadMaterializedPred(fullCacheKey); ok {
@@ -1072,7 +1075,7 @@ func TestBuildPredRange_BroadPositivePostingFilterKeepsComplementCacheLocal(t *t
 		next.Release()
 	}
 
-	if got := db.engine.getSnapshot().matPredCacheCount.Load(); got != 0 {
+	if got := db.engine.getSnapshot().matPredCache.EntryCount(); got != 0 {
 		t.Fatalf("expected complement-backed posting filters to stay local, cacheCount=%d", got)
 	}
 	if _, ok := db.engine.getSnapshot().loadMaterializedPred(complementCacheKey); ok {
@@ -1293,7 +1296,7 @@ func TestBuildPredicatesOrdered_CoveredExactRangeWarmCacheHitLoadsWhenPredicateS
 		t.Fatalf("expected merged exact-range warm predicate")
 	}
 	cacheKey := view.materializedPredComplementKeyForExactScalarRange("age", warm[0].effectiveBounds)
-	if cacheKey.isZero() {
+	if cacheKey.IsZero() {
 		releasePredicates(warm)
 		t.Fatalf("expected non-zero exact-range complement cache key")
 	}
@@ -1362,7 +1365,7 @@ func TestBuildPredicatesOrderedBuf_CoveredExactRangeWarmCacheHitLoadsWhenPredica
 		t.Fatalf("expected merged exact-range warm predicate")
 	}
 	cacheKey := view.materializedPredComplementKeyForExactScalarRange("age", warmPred.effectiveBounds)
-	if cacheKey.isZero() {
+	if cacheKey.IsZero() {
 		warm.Release()
 		t.Fatalf("expected non-zero exact-range complement cache key")
 	}
@@ -1601,7 +1604,7 @@ func TestMaterializeOrderedORPredicate_ExactRangeComplementSharesCache(t *testin
 	}
 	bounds := rangeBoundsForNormalizedScalarBound(bound)
 	cacheKey := view.materializedPredComplementKeyForExactScalarRange("age", bounds)
-	if cacheKey.isZero() {
+	if cacheKey.IsZero() {
 		t.Fatal("expected non-zero exact-range complement cache key")
 	}
 
@@ -1680,7 +1683,7 @@ func TestOrderedORMaterializedRangeLeafCosts_NullableComplementPrefersPositiveCa
 		t.Fatalf("expected nullable ordered range to prefer positive-side materialization")
 	}
 	wantKey := view.materializedPredKeyForNormalizedScalarBound("rank", candidate.core.bound)
-	if wantKey.isZero() {
+	if wantKey.IsZero() {
 		t.Fatalf("expected non-zero positive-side cache key")
 	}
 	gotKey, buildWork, checkWork, cachedCheckWork, ok := view.orderedORMaterializedRangeLeafCosts("name", expr)
@@ -1747,7 +1750,7 @@ func TestOrderedORMaterializedExactRangePredicateCosts_NullableComplementPrefers
 		t.Fatalf("expected merged exact-range predicate")
 	}
 	wantKey := view.materializedPredKeyForExactScalarRange("rank", preds[0].effectiveBounds)
-	if wantKey.isZero() {
+	if wantKey.IsZero() {
 		t.Fatalf("expected non-zero positive-side exact-range cache key")
 	}
 	gotKey, buildWork, checkWork, cachedCheckWork, ok := view.orderedORMaterializedExactRangePredicateCosts("name", preds[0])
@@ -1802,7 +1805,7 @@ func TestMaterializeOrderedORPredicate_PreservesMergedExactRangeBounds(t *testin
 	}
 	wantBounds := preds[0].effectiveBounds
 	wantKey := view.materializedPredKeyForExactScalarRange("age", wantBounds)
-	if wantKey.isZero() {
+	if wantKey.IsZero() {
 		t.Fatalf("expected non-zero exact-range cache key")
 	}
 
@@ -1859,7 +1862,7 @@ func TestBuildPredicatesOrdered_MergedExactComplementWarmCacheHitLoadsWhenOrdere
 	}
 	wantBounds := warm[0].effectiveBounds
 	cacheKey := view.materializedPredComplementKeyForExactScalarRange("age", warm[0].effectiveBounds)
-	if cacheKey.isZero() {
+	if cacheKey.IsZero() {
 		releasePredicates(warm)
 		t.Fatalf("expected non-zero exact-range complement cache key")
 	}
@@ -1960,7 +1963,7 @@ func TestBuildPredicatesOrdered_MergedExactNonBroadComplementWarmCacheHitLoadsWh
 		t.Fatalf("expected merged exact-range warm predicate")
 	}
 	cacheKey := view.materializedPredComplementKeyForExactScalarRange("rank", warm[0].effectiveBounds)
-	if cacheKey.isZero() {
+	if cacheKey.IsZero() {
 		releasePredicates(warm)
 		t.Fatalf("expected non-zero exact-range complement cache key")
 	}
@@ -2034,7 +2037,7 @@ func TestBuildPredicatesOrdered_CoverOrderRangeMergedExactComplementWarmCacheHit
 	}
 	wantBounds := warm[0].effectiveBounds
 	cacheKey := view.materializedPredComplementKeyForExactScalarRange("age", warm[0].effectiveBounds)
-	if cacheKey.isZero() {
+	if cacheKey.IsZero() {
 		releasePredicates(warm)
 		t.Fatalf("expected non-zero exact-range complement cache key")
 	}
@@ -2111,7 +2114,7 @@ func TestOrderedORMaterializedPrefixLeafBuildWork_RejectsBroadComplementPrefix(t
 	}
 
 	cacheKey, buildWork, ok := view.orderedORMaterializedPrefixLeafBuildWork("score", expr)
-	if ok || buildWork != 0 || !cacheKey.isZero() {
+	if ok || buildWork != 0 || !cacheKey.IsZero() {
 		t.Fatalf("expected broad prefix complement candidate to be rejected, got ok=%v build=%d key=%q", ok, buildWork, cacheKey.String())
 	}
 }
@@ -2121,7 +2124,7 @@ func TestBuildPredicateWithMode_RuntimeExactUnionPromotesOnSecondMaterialize(t *
 		t *testing.T,
 		expr qx.Expr,
 		wantKind predicateKind,
-		cacheKey materializedPredKey,
+		cacheKey qcache.MaterializedPredKey,
 		seed func(*DB[uint64, Rec]),
 	) {
 		db, _ := openTempDBUint64(t, Options{
@@ -2189,7 +2192,7 @@ func TestBuildPredicateWithMode_RuntimeExactUnionPromotesOnSecondMaterialize(t *
 	t.Run("IN", func(t *testing.T) {
 		vals := pooled.GetStringSlice(2)
 		vals = append(vals, "DE", "FR")
-		cacheKey := materializedPredKeyForDistinctSetTerms("country", compileScalarOpForTest(qx.OpIN), vals, false)
+		cacheKey := qcache.MaterializedPredKeyForDistinctSetTerms("country", compileScalarOpForTest(qx.OpIN), vals, false)
 		pooled.ReleaseStringSlice(vals)
 
 		run(t,
@@ -2216,7 +2219,7 @@ func TestBuildPredicateWithMode_RuntimeExactUnionPromotesOnSecondMaterialize(t *
 	t.Run("HASANY", func(t *testing.T) {
 		vals := pooled.GetStringSlice(2)
 		vals = append(vals, "db", "go")
-		cacheKey := materializedPredKeyForDistinctSetTerms("tags", compileScalarOpForTest(qx.OpHASANY), vals, false)
+		cacheKey := qcache.MaterializedPredKeyForDistinctSetTerms("tags", compileScalarOpForTest(qx.OpHASANY), vals, false)
 		pooled.ReleaseStringSlice(vals)
 
 		run(t,
@@ -2246,7 +2249,7 @@ func TestBuildPredicateWithMode_RuntimeExactUnionPromotesOnSecondMaterialize(t *
 	t.Run("NOTIN", func(t *testing.T) {
 		vals := pooled.GetStringSlice(2)
 		vals = append(vals, "DE", "FR")
-		cacheKey := materializedPredKeyForDistinctSetTerms("country", compileScalarOpForTest(qx.OpIN), vals, false)
+		cacheKey := qcache.MaterializedPredKeyForDistinctSetTerms("country", compileScalarOpForTest(qx.OpIN), vals, false)
 		pooled.ReleaseStringSlice(vals)
 
 		run(t,
@@ -2273,7 +2276,7 @@ func TestBuildPredicateWithMode_RuntimeExactUnionPromotesOnSecondMaterialize(t *
 	t.Run("HASNONE", func(t *testing.T) {
 		vals := pooled.GetStringSlice(2)
 		vals = append(vals, "db", "go")
-		cacheKey := materializedPredKeyForDistinctSetTerms("tags", compileScalarOpForTest(qx.OpHASANY), vals, false)
+		cacheKey := qcache.MaterializedPredKeyForDistinctSetTerms("tags", compileScalarOpForTest(qx.OpHASANY), vals, false)
 		pooled.ReleaseStringSlice(vals)
 
 		run(t,
@@ -2328,7 +2331,7 @@ func TestBuildPredicateWithMode_HasPromotesOnSecondBuild(t *testing.T) {
 
 	vals := pooled.GetStringSlice(2)
 	vals = append(vals, "db", "go")
-	cacheKey := materializedPredKeyForDistinctSetTerms("tags", compileScalarOpForTest(qx.OpHASALL), vals, false)
+	cacheKey := qcache.MaterializedPredKeyForDistinctSetTerms("tags", compileScalarOpForTest(qx.OpHASALL), vals, false)
 	pooled.ReleaseStringSlice(vals)
 
 	expr := qx.HASALL("tags", []string{"go", "db"})
@@ -2383,7 +2386,7 @@ func TestOrderedScalarRangeCanEagerMaterialize_RequiresPromotionOnlyForSmallOrde
 
 	expr := qx.GTE("age", 10)
 	cacheKey := view.materializedPredKey(mustTestQIRExprForDB(t, db, expr))
-	if cacheKey.isZero() {
+	if cacheKey.IsZero() {
 		t.Fatalf("expected non-zero materialized predicate cache key")
 	}
 
@@ -2458,7 +2461,7 @@ func TestOrderedScalarRangeCanEagerMaterialize_UsesComplementPromotionKey(t *tes
 	if !route.useComplement {
 		t.Fatalf("expected merged exact-range ordered route to use complement")
 	}
-	if route.cacheKey.isZero() || route.complementCacheKey.isZero() {
+	if route.cacheKey.IsZero() || route.complementCacheKey.IsZero() {
 		t.Fatalf("expected both exact-range cache keys to be non-zero")
 	}
 	if route.cacheKey == route.complementCacheKey {

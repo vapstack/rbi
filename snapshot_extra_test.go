@@ -12,6 +12,7 @@ import (
 
 	"github.com/vapstack/qx"
 	"github.com/vapstack/rbi/internal/posting"
+	"github.com/vapstack/rbi/internal/qcache"
 	"go.etcd.io/bbolt"
 )
 
@@ -242,16 +243,16 @@ func snapshotExtraQueryTxRecords[K ~string | ~uint64](t *testing.T, db *DB[K, sn
 	return items
 }
 
-func snapshotExtraRequireNumericRangeBucketCacheEntry(t *testing.T, snap *indexSnapshot, field string) *numericRangeBucketCacheEntry {
+func snapshotExtraRequireNumericRangeBucketCacheEntry(t *testing.T, snap *indexSnapshot, field string) *qcache.NumericRangeBucketEntry {
 	t.Helper()
 	if snap == nil || snap.numericRangeBucketCache == nil {
 		t.Fatalf("expected non-nil numeric range bucket cache for field %q", field)
 	}
-	e, ok := snap.numericRangeBucketCache.loadField(field)
+	e, ok := snap.numericRangeBucketCache.LoadField(field)
 	if !ok {
 		t.Fatalf("expected numeric range bucket cache entry for field %q", field)
 	}
-	if e == nil || e.idx.bucketSize <= 0 {
+	if e == nil || e.Index().BucketSize() <= 0 {
 		t.Fatalf("expected non-nil numeric range bucket index for field %q", field)
 	}
 	return e
@@ -2240,7 +2241,7 @@ func TestSnapshotExtra_PinnedOldNumericRangeBucketCacheSurvivesTruncateRebuild(t
 	})
 
 	current := db.engine.getSnapshot()
-	if _, ok := current.numericRangeBucketCache.loadField("age"); ok {
+	if _, ok := current.numericRangeBucketCache.LoadField("age"); ok {
 		t.Fatalf("current snapshot inherited stale numeric range cache across truncate rebuild")
 	}
 
@@ -2746,10 +2747,10 @@ func TestSnapshotExtra_RebuildIndexSameSeqPinnedOldSnapshotIsReleasedAfterLastUn
 	if _, err := db.QueryKeys(qx.Query(qx.GTE("age", 400))); err != nil {
 		t.Fatalf("QueryKeys(warm numeric range): %v", err)
 	}
-	if old.matPredCache == nil || old.matPredCacheCount.Load() == 0 {
+	if old.matPredCache == nil || old.matPredCache.EntryCount() == 0 {
 		t.Fatalf("expected warmed materialized predicate cache on old snapshot")
 	}
-	if old.numericRangeBucketCache == nil || old.numericRangeBucketCache.entryCount() == 0 {
+	if old.numericRangeBucketCache == nil || old.numericRangeBucketCache.EntryCount() == 0 {
 		t.Fatalf("expected warmed numeric range cache on old snapshot")
 	}
 

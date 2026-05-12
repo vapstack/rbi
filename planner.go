@@ -7,6 +7,7 @@ import (
 	"github.com/vapstack/rbi/internal/indexdata"
 	"github.com/vapstack/rbi/internal/pooled"
 	"github.com/vapstack/rbi/internal/posting"
+	"github.com/vapstack/rbi/internal/qcache"
 	"github.com/vapstack/rbi/internal/qir"
 	"github.com/vapstack/rbi/internal/schema"
 )
@@ -2048,15 +2049,15 @@ func setOROrderMergeFallbackTrace(trace *queryTrace, examined, scanWidth uint64,
 func (qv *queryView) orderedORMaterializedRangeLeafCosts(
 	orderField string,
 	leaf qir.Expr,
-) (materializedPredKey, uint64, uint64, uint64, bool) {
+) (qcache.MaterializedPredKey, uint64, uint64, uint64, bool) {
 	candidate, ok := qv.prepareScalarRangeRoutingCandidate(leaf)
 	if !ok || !candidate.numeric || qv.engine.fieldNameByOrdinal(leaf.FieldOrdinal) == orderField {
-		return materializedPredKey{}, 0, 0, 0, false
+		return qcache.MaterializedPredKey{}, 0, 0, 0, false
 	}
 	core := candidate.core
 	plan := candidate.plan
 	if core.bound.full || plan.bucketCount == 0 || plan.est == 0 {
-		return materializedPredKey{}, 0, 0, 0, false
+		return qcache.MaterializedPredKey{}, 0, 0, 0, false
 	}
 	if !plan.useComplement {
 		return core.sharedReuse.cacheKey,
@@ -2068,7 +2069,7 @@ func (qv *queryView) orderedORMaterializedRangeLeafCosts(
 
 	compPlan, ok := core.prepareComplementMaterialization()
 	if !ok || compPlan.buckets == 0 || compPlan.est == 0 {
-		return materializedPredKey{}, 0, 0, 0, false
+		return qcache.MaterializedPredKey{}, 0, 0, 0, false
 	}
 	if candidate.shouldPreferPositiveMaterializationForNullableComplement(compPlan) {
 		return core.sharedReuse.cacheKey,
@@ -2091,7 +2092,7 @@ func (qv *queryView) orderedORMaterializedRangeLeafCosts(
 		}
 	}
 	if checkBuckets == 0 || checkEst == 0 {
-		return materializedPredKey{}, 0, 0, 0, false
+		return qcache.MaterializedPredKey{}, 0, 0, 0, false
 	}
 	return compPlan.sharedReuse.cacheKey,
 		rangeProbeMaterializeWork(compPlan.buckets, compPlan.est),
@@ -2103,28 +2104,28 @@ func (qv *queryView) orderedORMaterializedRangeLeafCosts(
 func (qv *queryView) orderedORMaterializedExactRangePredicateCosts(
 	orderField string,
 	p predicate,
-) (materializedPredKey, uint64, uint64, uint64, bool) {
+) (qcache.MaterializedPredKey, uint64, uint64, uint64, bool) {
 	if !p.hasEffectiveBounds || p.expr.FieldOrdinal < 0 {
-		return materializedPredKey{}, 0, 0, 0, false
+		return qcache.MaterializedPredKey{}, 0, 0, 0, false
 	}
 	fieldName := qv.engine.fieldNameByOrdinal(p.expr.FieldOrdinal)
 	if fieldName == orderField {
-		return materializedPredKey{}, 0, 0, 0, false
+		return qcache.MaterializedPredKey{}, 0, 0, 0, false
 	}
 	fm := qv.fieldMetaByExpr(p.expr)
 	if !schema.FieldUsesOrderedNumericKeys(fm) {
-		return materializedPredKey{}, 0, 0, 0, false
+		return qcache.MaterializedPredKey{}, 0, 0, 0, false
 	}
 
 	var core preparedScalarRangePredicate
 	qv.initPreparedExactScalarRangePredicate(&core, p.expr, fm, p.effectiveBounds)
 	ov := qv.fieldOverlayForExpr(p.expr)
 	if !ov.HasData() {
-		return materializedPredKey{}, 0, 0, 0, false
+		return qcache.MaterializedPredKey{}, 0, 0, 0, false
 	}
 	plan, _, done := core.planOverlay(ov)
 	if done || plan.bucketCount == 0 || plan.est == 0 {
-		return materializedPredKey{}, 0, 0, 0, false
+		return qcache.MaterializedPredKey{}, 0, 0, 0, false
 	}
 	if !plan.useComplement {
 		return core.sharedReuse.cacheKey,
@@ -2136,7 +2137,7 @@ func (qv *queryView) orderedORMaterializedExactRangePredicateCosts(
 
 	compPlan, ok := core.prepareComplementMaterialization()
 	if !ok || compPlan.buckets == 0 || compPlan.est == 0 {
-		return materializedPredKey{}, 0, 0, 0, false
+		return qcache.MaterializedPredKey{}, 0, 0, 0, false
 	}
 	candidate := preparedScalarRangeRoutingCandidate{
 		core:    core,
@@ -2164,7 +2165,7 @@ func (qv *queryView) orderedORMaterializedExactRangePredicateCosts(
 		}
 	}
 	if checkBuckets == 0 || checkEst == 0 {
-		return materializedPredKey{}, 0, 0, 0, false
+		return qcache.MaterializedPredKey{}, 0, 0, 0, false
 	}
 	return compPlan.sharedReuse.cacheKey,
 		rangeProbeMaterializeWork(compPlan.buckets, compPlan.est),
@@ -2176,33 +2177,37 @@ func (qv *queryView) orderedORMaterializedExactRangePredicateCosts(
 func (qv *queryView) orderedORMaterializedPrefixLeafBuildWork(
 	orderField string,
 	leaf qir.Expr,
-) (materializedPredKey, uint64, bool) {
+) (qcache.MaterializedPredKey, uint64, bool) {
 	if !qv.isPositiveNonOrderScalarPrefixLeaf(orderField, leaf) {
-		return materializedPredKey{}, 0, false
+		return qcache.MaterializedPredKey{}, 0, false
 	}
 	candidate, ok := qv.prepareScalarRangeRoutingCandidate(leaf)
-	if !ok || candidate.plan.useComplement || candidate.core.sharedReuse.cacheKey.isZero() {
-		return materializedPredKey{}, 0, false
+	if !ok || candidate.plan.useComplement || candidate.core.sharedReuse.cacheKey.IsZero() {
+		return qcache.MaterializedPredKey{}, 0, false
 	}
 	core := candidate.core
 	snap := qv.planner.stats.Load()
 	universe := max(qv.snapshotUniverseCardinality(), uint64(1))
 	sel, _, _, _, ok := qv.estimateLeafOrderCost(leaf, snap, universe, orderField, qv.fieldOverlay(orderField).HasData())
 	if !ok || sel <= 0 {
-		return materializedPredKey{}, 0, false
+		return qcache.MaterializedPredKey{}, 0, false
 	}
 	estCard := uint64(sel*float64(universe) + 0.5)
 	if estCard == 0 {
 		estCard = 1
 	}
-	if qv.snap.matPredCacheMaxCard > 0 && estCard > qv.snap.matPredCacheMaxCard {
-		return materializedPredKey{}, 0, false
+	cache := qv.snap.matPredCache
+	if cache == nil {
+		return qcache.MaterializedPredKey{}, 0, false
+	}
+	if maxCard := cache.MaxCardinality(); maxCard > 0 && estCard > maxCard {
+		return qcache.MaterializedPredKey{}, 0, false
 	}
 	return core.sharedReuse.cacheKey, estCard, true
 }
 
 type orderedORMaterializedPredicateBuildInfo struct {
-	cacheKey        materializedPredKey
+	cacheKey        qcache.MaterializedPredKey
 	buildWork       uint64
 	checkWork       uint64
 	cachedCheckWork uint64
@@ -2588,7 +2593,7 @@ func (qv *queryView) shouldEagerMaterializeOrderedORPredicate(
 	if !info.ok || info.buildWork == 0 {
 		return false, false
 	}
-	if !info.cacheKey.isZero() && qv.snap != nil {
+	if !info.cacheKey.IsZero() && qv.snap != nil {
 		if _, hit := qv.snap.loadMaterializedPredKey(info.cacheKey); hit {
 			if !info.isPrefix && !orderedORMaterializedPredicateWarmHitWorth(leafChecks, info.checkWork, info.cachedCheckWork) {
 				return false, false
@@ -2604,7 +2609,7 @@ func (qv *queryView) shouldEagerMaterializeOrderedORPredicate(
 		return false, false
 	}
 	requiresPromotion := qv.orderedORMaterializedPredicateRequiresPromotion(p, est.need, orderedOffset, est.universe)
-	if info.cacheKey.isZero() || qv.snap == nil {
+	if info.cacheKey.IsZero() || qv.snap == nil {
 		return true, false
 	}
 	if !requiresPromotion && orderedORMaterializedPredicateColdBuildWorth(info.buildWork, info.cachedCheckWork, leafChecks, savedWork) {
@@ -2617,7 +2622,7 @@ func (qv *queryView) shouldEagerMaterializeOrderedORPredicate(
 }
 
 func (qv *queryView) maybeWarmMaterializeOrderedORPredicates(q *qir.Shape, branches plannerORBranches, analysis *plannerOROrderAnalysis, trace *queryTrace) bool {
-	if qv.snap == nil || qv.snap.matPredCacheCount.Load() == 0 {
+	if qv.snap == nil || qv.snap.matPredCache == nil || qv.snap.matPredCache.EntryCount() == 0 {
 		return false
 	}
 	return qv.maybeMaterializeOrderedORPredicates(q, branches, analysis, false, false, trace)
@@ -2959,7 +2964,7 @@ func (qv *queryView) maybeMaterializeOrderedORPredicates(
 }
 
 func (qv *queryView) maybeEagerMaterializeNoOrderORPredicates(q *qir.Shape, branches plannerORBranches) {
-	if q == nil || q.HasOrder || qv.snap == nil || qv.snap.matPredCacheMaxEntries <= 0 || branches.Len() == 0 {
+	if q == nil || q.HasOrder || qv.snap == nil || qv.snap.materializedPredCacheLimit() <= 0 || branches.Len() == 0 {
 		return
 	}
 	if !noOrderOREagerMaterializeEligible(branches) {
@@ -3034,9 +3039,8 @@ func (qv *queryView) promoteOrderedORMaterializedBaseOps(
 		repCap += len(branchChecks[bi])
 	}
 
-	cacheKeysBuf := materializedPredKeySlicePool.Get()
-	cacheKeysBuf.Grow(repCap)
-	defer materializedPredKeySlicePool.Put(cacheKeysBuf)
+	cacheKeysBuf := qcache.GetMaterializedPredKeySlice(repCap)
+	defer qcache.ReleaseMaterializedPredKeySlice(cacheKeysBuf)
 
 	repBranchBuf := pooled.GetIntSlice(repCap)
 	defer pooled.ReleaseIntSlice(repBranchBuf)
@@ -3070,12 +3074,12 @@ func (qv *queryView) promoteOrderedORMaterializedBaseOps(
 				continue
 			}
 			info := qv.orderedORPredicateBuildInfoForBranch(orderField, p, analysis, branch, bi, pi)
-			if !info.ok || info.cacheKey.isZero() || info.buildWork == 0 {
+			if !info.ok || info.cacheKey.IsZero() || info.buildWork == 0 {
 				continue
 			}
 			found := false
-			for slot := 0; slot < cacheKeysBuf.Len(); slot++ {
-				if cacheKeysBuf.Get(slot) == info.cacheKey {
+			for slot := 0; slot < len(cacheKeysBuf); slot++ {
+				if cacheKeysBuf[slot] == info.cacheKey {
 					if info.isPrefix {
 						observedWorksBuf[slot] = satAddUint64(observedWorksBuf[slot], leafChecks)
 					} else if info.checkWork > info.cachedCheckWork {
@@ -3088,7 +3092,7 @@ func (qv *queryView) promoteOrderedORMaterializedBaseOps(
 			if found {
 				continue
 			}
-			cacheKeysBuf.Append(info.cacheKey)
+			cacheKeysBuf = append(cacheKeysBuf, info.cacheKey)
 			repBranchBuf = append(repBranchBuf, bi)
 			repPredBuf = append(repPredBuf, pi)
 			buildWorksBuf = append(buildWorksBuf, info.buildWork)
@@ -3101,17 +3105,17 @@ func (qv *queryView) promoteOrderedORMaterializedBaseOps(
 			}
 		}
 	}
-	if cacheKeysBuf.Len() == 0 {
+	if len(cacheKeysBuf) == 0 {
 		return
 	}
-	for i := 0; i < cacheKeysBuf.Len(); i++ {
+	for i := 0; i < len(cacheKeysBuf); i++ {
 		if observedWorksBuf[i] == 0 {
 			continue
 		}
-		if _, ok := qv.snap.loadMaterializedPredKey(cacheKeysBuf.Get(i)); ok {
+		if _, ok := qv.snap.loadMaterializedPredKey(cacheKeysBuf[i]); ok {
 			continue
 		}
-		if !qv.snap.shouldPromoteObservedOrderedORMaterializedPredKey(cacheKeysBuf.Get(i), observedWorksBuf[i], buildWorksBuf[i]) {
+		if !qv.snap.shouldPromoteObservedOrderedORMaterializedPredKey(cacheKeysBuf[i], observedWorksBuf[i], buildWorksBuf[i]) {
 			continue
 		}
 		branchIdx := repBranchBuf[i]
@@ -3151,9 +3155,8 @@ func (qv *queryView) promoteObservedOrderedORKWayMaterializedBaseOps(
 		repCap += len(branchChecks[bi])
 	}
 
-	cacheKeysBuf := materializedPredKeySlicePool.Get()
-	cacheKeysBuf.Grow(repCap)
-	defer materializedPredKeySlicePool.Put(cacheKeysBuf)
+	cacheKeysBuf := qcache.GetMaterializedPredKeySlice(repCap)
+	defer qcache.ReleaseMaterializedPredKeySlice(cacheKeysBuf)
 
 	repBranchBuf := pooled.GetIntSlice(repCap)
 	defer pooled.ReleaseIntSlice(repBranchBuf)
@@ -3187,7 +3190,7 @@ func (qv *queryView) promoteObservedOrderedORKWayMaterializedBaseOps(
 				continue
 			}
 			info := qv.orderedORPredicateBuildInfoForBranch(orderField, p, analysis, branch, bi, pi)
-			if info.ok && !info.cacheKey.isZero() && info.buildWork != 0 {
+			if info.ok && !info.cacheKey.IsZero() && info.buildWork != 0 {
 				observedWork := uint64(0)
 				if info.isPrefix {
 					observedWork = rows
@@ -3196,15 +3199,15 @@ func (qv *queryView) promoteObservedOrderedORKWayMaterializedBaseOps(
 				}
 				if observedWork != 0 {
 					found := false
-					for slot := 0; slot < cacheKeysBuf.Len(); slot++ {
-						if cacheKeysBuf.Get(slot) == info.cacheKey {
+					for slot := 0; slot < len(cacheKeysBuf); slot++ {
+						if cacheKeysBuf[slot] == info.cacheKey {
 							observedWorksBuf[slot] = satAddUint64(observedWorksBuf[slot], observedWork)
 							found = true
 							break
 						}
 					}
 					if !found {
-						cacheKeysBuf.Append(info.cacheKey)
+						cacheKeysBuf = append(cacheKeysBuf, info.cacheKey)
 						repBranchBuf = append(repBranchBuf, bi)
 						repPredBuf = append(repPredBuf, pi)
 						buildWorksBuf = append(buildWorksBuf, info.buildWork)
@@ -3216,14 +3219,14 @@ func (qv *queryView) promoteObservedOrderedORKWayMaterializedBaseOps(
 		}
 	}
 
-	for i := 0; i < cacheKeysBuf.Len(); i++ {
+	for i := 0; i < len(cacheKeysBuf); i++ {
 		if observedWorksBuf[i] == 0 {
 			continue
 		}
-		if _, ok := qv.snap.loadMaterializedPredKey(cacheKeysBuf.Get(i)); ok {
+		if _, ok := qv.snap.loadMaterializedPredKey(cacheKeysBuf[i]); ok {
 			continue
 		}
-		if !qv.snap.shouldPromoteObservedOrderedORMaterializedPredKey(cacheKeysBuf.Get(i), observedWorksBuf[i], buildWorksBuf[i]) {
+		if !qv.snap.shouldPromoteObservedOrderedORMaterializedPredKey(cacheKeysBuf[i], observedWorksBuf[i], buildWorksBuf[i]) {
 			continue
 		}
 		branchIdx := repBranchBuf[i]
@@ -3233,7 +3236,7 @@ func (qv *queryView) promoteObservedOrderedORKWayMaterializedBaseOps(
 }
 
 func (qv *queryView) shouldObserveOrderedORPredicate(p predicate, info orderedORMaterializedPredicateBuildInfo) bool {
-	if !info.ok || info.cacheKey.isZero() || info.buildWork == 0 {
+	if !info.ok || info.cacheKey.IsZero() || info.buildWork == 0 {
 		return false
 	}
 	if !info.isPrefix && info.checkWork == 0 {
@@ -3277,7 +3280,7 @@ func branchHasPositiveLeafOR(e qir.Expr) bool {
 }
 
 func (qv *queryView) shouldKeepORBranchNumericRangeLazy(e qir.Expr) bool {
-	if qv.snap == nil || e.Not || e.FieldOrdinal < 0 || !isNumericRangeOp(e.Op) {
+	if qv.snap == nil || e.Not || e.FieldOrdinal < 0 || !e.Op.IsNumericRange() {
 		return false
 	}
 	fm := qv.fieldMetaByExpr(e)
@@ -3310,7 +3313,7 @@ func (qv *queryView) shouldForceORBranchNumericRangeMaterializeWithCandidate(
 }
 
 func (qv *queryView) shouldForceORBranchNumericRangeMaterialize(e qir.Expr) bool {
-	if e.Not || e.FieldOrdinal < 0 || !isNumericRangeOp(e.Op) {
+	if e.Not || e.FieldOrdinal < 0 || !e.Op.IsNumericRange() {
 		return false
 	}
 	fm := qv.fieldMetaByExpr(e)
@@ -3325,10 +3328,10 @@ func (qv *queryView) shouldForceORBranchNumericRangeMaterialize(e qir.Expr) bool
 }
 
 func (qv *queryView) shouldBuildORBranchLeafLazy(e qir.Expr, branchLeafCount int) bool {
-	if qv.snap == nil || qv.snap.matPredCacheMaxEntries <= 0 || branchLeafCount <= 1 {
+	if qv.snap == nil || qv.snap.materializedPredCacheLimit() <= 0 || branchLeafCount <= 1 {
 		return false
 	}
-	if e.Not || e.FieldOrdinal < 0 || !isNumericRangeOp(e.Op) {
+	if e.Not || e.FieldOrdinal < 0 || !e.Op.IsNumericRange() {
 		return false
 	}
 	fm := qv.fieldMetaByExpr(e)
@@ -3347,14 +3350,14 @@ func (qv *queryView) shouldBuildORBranchLeafLazy(e qir.Expr, branchLeafCount int
 		return false
 	}
 	key := qv.materializedPredKey(e)
-	if key.isZero() {
+	if key.IsZero() {
 		return false
 	}
 	hot := qv.snap.shouldPromoteRuntimeMaterializedPredKey(key)
 	if qv.shouldKeepORBranchNumericRangeLazy(e) {
 		if candidate, ok := qv.prepareScalarRangeRoutingCandidate(e); ok &&
 			candidate.plan.useComplement &&
-			!candidate.core.complementCacheKey.isZero() {
+			!candidate.core.complementCacheKey.IsZero() {
 			qv.snap.shouldPromoteRuntimeMaterializedPredKey(candidate.core.complementCacheKey)
 		}
 		return true
@@ -3363,7 +3366,7 @@ func (qv *queryView) shouldBuildORBranchLeafLazy(e qir.Expr, branchLeafCount int
 }
 
 func predicateHasBroadPositiveComplementRuntimeRange(p predicate) bool {
-	if p.expr.Not || p.expr.FieldOrdinal < 0 || !isNumericRangeOp(p.expr.Op) {
+	if p.expr.Not || p.expr.FieldOrdinal < 0 || !p.expr.Op.IsNumericRange() {
 		return false
 	}
 	if p.overlayState != nil {
@@ -3377,12 +3380,12 @@ func (qv *queryView) mayNeedORBranchRangeRewrite(leaves []qir.Expr) bool {
 		return false
 	}
 	for _, e := range leaves {
-		if e.Not || e.FieldOrdinal < 0 || !isNumericRangeOp(e.Op) {
+		if e.Not || e.FieldOrdinal < 0 || !e.Op.IsNumericRange() {
 			continue
 		}
 		fm := qv.fieldMetaByExpr(e)
 		if schema.FieldUsesOrderedNumericKeys(fm) {
-			if qv.snap != nil && qv.snap.matPredCacheMaxEntries > 0 {
+			if qv.snap != nil && qv.snap.materializedPredCacheLimit() > 0 {
 				return true
 			}
 			if qv.shouldForceORBranchNumericRangeMaterialize(e) {
@@ -5729,11 +5732,11 @@ func plannerOROrderMergePrecountWorth(branch plannerORBranch, need int) bool {
 }
 
 func (qv *queryView) canPrecountORBranchExpr(e qir.Expr) bool {
-	if !isMaterializedScalarCacheOp(e.Op) {
+	if !e.Op.IsMaterializedScalarCache() {
 		return true
 	}
 	cacheKey := qv.materializedPredKey(e)
-	if cacheKey.isZero() {
+	if cacheKey.IsZero() {
 		return false
 	}
 	_, ok := qv.snap.loadMaterializedPredKey(cacheKey)

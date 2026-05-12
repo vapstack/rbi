@@ -4,6 +4,7 @@ import (
 	"github.com/vapstack/rbi/internal/indexdata"
 	"github.com/vapstack/rbi/internal/pooled"
 	"github.com/vapstack/rbi/internal/posting"
+	"github.com/vapstack/rbi/internal/qcache"
 	"github.com/vapstack/rbi/internal/qir"
 	"github.com/vapstack/rbi/internal/schema"
 )
@@ -14,7 +15,7 @@ type preparedScalarRangePredicate struct {
 	fm                 *schema.Field
 	bound              normalizedScalarBound
 	bounds             indexdata.Bounds
-	complementCacheKey materializedPredKey
+	complementCacheKey qcache.MaterializedPredKey
 	loadReuse          materializedPredReuse
 	sharedReuse        materializedPredReuse
 	secondHitReuse     materializedPredReuse
@@ -31,7 +32,7 @@ type preparedOverlayRangePredicatePlan struct {
 }
 
 type scalarMaterializationStats struct {
-	cacheKey        materializedPredKey
+	cacheKey        qcache.MaterializedPredKey
 	probeBuckets    int
 	probeEst        uint64
 	buildBuckets    int
@@ -51,7 +52,7 @@ type scalarComplementMaterializationPlan struct {
 type preparedScalarExactRange struct {
 	field    string
 	bounds   indexdata.Bounds
-	cacheKey materializedPredKey
+	cacheKey qcache.MaterializedPredKey
 }
 
 type orderFieldScalarLeafKind uint8
@@ -93,7 +94,7 @@ type preparedScalarOverlaySpan struct {
 }
 
 func storeEmptyScalarComplementMaterialization(plan scalarComplementMaterializationPlan) {
-	if plan.sharedReuse.snap == nil || plan.sharedReuse.cacheKey.isZero() {
+	if plan.sharedReuse.snap == nil || plan.sharedReuse.cacheKey.IsZero() {
 		return
 	}
 	plan.sharedReuse.snap.storeMaterializedPredKey(plan.sharedReuse.cacheKey, posting.List{})
@@ -115,15 +116,6 @@ func (qv *queryView) classifyOrderFieldScalarLeaf(orderField string, e qir.Expr)
 	return orderFieldScalarLeafInvalid
 }
 
-func isNumericRangeOp(op qir.Op) bool {
-	switch op {
-	case qir.OpGT, qir.OpGTE, qir.OpLT, qir.OpLTE:
-		return true
-	default:
-		return false
-	}
-}
-
 func isScalarEqOp(op qir.Op) bool {
 	return op == qir.OpEQ
 }
@@ -133,7 +125,7 @@ func isScalarEqOrInOp(op qir.Op) bool {
 }
 
 func isScalarRangeEqOp(op qir.Op) bool {
-	return isScalarEqOp(op) || isNumericRangeOp(op)
+	return isScalarEqOp(op) || op.IsNumericRange()
 }
 
 func isPositiveScalarEqLeaf(e qir.Expr) bool {
@@ -172,23 +164,7 @@ func isSimpleScalarRangeOrPrefixLeaf(e qir.Expr) bool {
 	if e.Not || e.FieldOrdinal < 0 {
 		return false
 	}
-	return isScalarRangeOrPrefixOp(e.Op)
-}
-
-func isScalarRangeOrPrefixOp(op qir.Op) bool {
-	if isNumericRangeOp(op) || op == qir.OpPREFIX {
-		return true
-	}
-	return false
-}
-
-func isMaterializedScalarCacheOp(op qir.Op) bool {
-	switch op {
-	case qir.OpSUFFIX, qir.OpCONTAINS:
-		return true
-	default:
-		return isScalarRangeOrPrefixOp(op)
-	}
+	return e.Op.IsScalarRangeOrPrefix()
 }
 
 func (qv *queryView) normalizedScalarBoundForExpr(e qir.Expr) (normalizedScalarBound, bool, error) {
@@ -211,8 +187,8 @@ func (qv *queryView) initPreparedScalarRangePredicateFromBound(
 	fm *schema.Field,
 	bound normalizedScalarBound,
 ) {
-	cacheKey := materializedPredKey{}
-	complementCacheKey := materializedPredKey{}
+	cacheKey := qcache.MaterializedPredKey{}
+	complementCacheKey := qcache.MaterializedPredKey{}
 	fieldName := qv.engine.fieldNameByOrdinal(e.FieldOrdinal)
 	if !bound.full {
 		cacheKey = qv.materializedPredKeyForNormalizedScalarBound(fieldName, bound)
@@ -242,8 +218,8 @@ func (qv *queryView) initPreparedExactScalarRangePredicate(
 	bounds indexdata.Bounds,
 ) {
 	cacheKey := qv.materializedPredKeyForExactScalarRange(qv.engine.fieldNameByOrdinal(e.FieldOrdinal), bounds)
-	complementCacheKey := materializedPredKey{}
-	if schema.FieldUsesOrderedNumericKeys(fm) && isNumericRangeOp(e.Op) {
+	complementCacheKey := qcache.MaterializedPredKey{}
+	if schema.FieldUsesOrderedNumericKeys(fm) && e.Op.IsNumericRange() {
 		complementCacheKey = qv.materializedPredComplementKeyForExactScalarRange(qv.engine.fieldNameByOrdinal(e.FieldOrdinal), bounds)
 	}
 	loadReuse := newMaterializedPredReadOnlyReuse(qv.snap, cacheKey)
@@ -804,7 +780,7 @@ func (core *preparedScalarRangePredicate) evalMaterializedPostingResult(ov index
 
 	br := ov.RangeForBounds(core.bounds)
 	if br.Empty() {
-		if core.sharedReuse.snap != nil && !core.sharedReuse.cacheKey.isZero() {
+		if core.sharedReuse.snap != nil && !core.sharedReuse.cacheKey.IsZero() {
 			core.sharedReuse.snap.storeMaterializedPredKey(core.sharedReuse.cacheKey, posting.List{})
 		}
 		return postingResult{}
@@ -866,7 +842,7 @@ func (core *preparedScalarRangePredicate) orderBasicMaterializationStats(univers
 		stats.probeBuckets = complementBuckets
 		stats.probeEst = complementEst
 
-		if isNumericRangeOp(core.expr.Op) {
+		if core.expr.Op.IsNumericRange() {
 			stats.cacheKey = core.complementCacheKey
 			stats.buildBuckets = complementBuckets
 			stats.buildEst = complementEst
@@ -882,7 +858,7 @@ func (core *preparedScalarRangePredicate) loadWarmScalarPostingResult() (posting
 	if !ok {
 		return postingResult{}, false
 	}
-	if !stats.cacheKey.isZero() {
+	if !stats.cacheKey.IsZero() {
 		if cached, ok := core.qv.snap.loadMaterializedPredKey(stats.cacheKey); ok {
 			return postingResult{ids: cached, neg: stats.buildComplement}, true
 		}
@@ -903,7 +879,7 @@ func (core *preparedScalarRangePredicate) loadWarmScalarPostingResult() (posting
 }
 
 func (qv *queryView) loadWarmPreparedScalarExactRange(op preparedScalarExactRange) (postingResult, bool) {
-	if !op.cacheKey.isZero() {
+	if !op.cacheKey.IsZero() {
 		if cached, ok := qv.snap.loadMaterializedPredKey(op.cacheKey); ok {
 			return postingResult{ids: cached}, true
 		}
@@ -924,7 +900,7 @@ func (qv *queryView) loadWarmPreparedScalarExactRange(op preparedScalarExactRang
 }
 
 func (qv *queryView) evalPreparedScalarExactRange(op preparedScalarExactRange) (postingResult, error) {
-	if !op.cacheKey.isZero() {
+	if !op.cacheKey.IsZero() {
 		if cached, ok := qv.snap.loadMaterializedPredKey(op.cacheKey); ok {
 			return postingResult{ids: cached}, nil
 		}
@@ -942,13 +918,13 @@ func (qv *queryView) evalPreparedScalarExactRange(op preparedScalarExactRange) (
 		return postingResult{}, nil
 	}
 	if out, ok := qv.tryEvalNumericRangeBuckets(op.field, fm, ov, br); ok {
-		if !op.cacheKey.isZero() {
+		if !op.cacheKey.IsZero() {
 			out.ids = qv.tryShareMaterializedPred(op.cacheKey, out.ids)
 		}
 		return out, nil
 	}
 	ids := ov.UnionRangePostings(br, indexdata.OverlayRange{})
-	if !op.cacheKey.isZero() {
+	if !op.cacheKey.IsZero() {
 		ids = qv.tryShareMaterializedPred(op.cacheKey, ids)
 	}
 	return postingResult{ids: ids}, nil
@@ -977,7 +953,7 @@ func (qv *queryView) shouldPromoteObservedPreparedScalarExactRange(
 }
 
 func (core *preparedScalarRangePredicate) prepareComplementMaterialization() (scalarComplementMaterializationPlan, bool) {
-	if !isNumericRangeOp(core.expr.Op) {
+	if !core.expr.Op.IsNumericRange() {
 		return scalarComplementMaterializationPlan{}, false
 	}
 

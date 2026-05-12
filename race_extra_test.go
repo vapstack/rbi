@@ -3,6 +3,7 @@ package rbi
 import (
 	"fmt"
 	"github.com/vapstack/rbi/internal/indexdata"
+	"github.com/vapstack/rbi/internal/qcache"
 	"path/filepath"
 	"runtime"
 	"slices"
@@ -11,7 +12,6 @@ import (
 	"testing"
 
 	"github.com/vapstack/qx"
-	"github.com/vapstack/rbi/internal/posting"
 	"go.etcd.io/bbolt"
 )
 
@@ -183,36 +183,20 @@ func raceExtraSetNumericBucketKnobs(t *testing.T, db *DB[uint64, raceExtraRec], 
 	})
 }
 
-func raceExtraRequireNumericRangeBucketCacheEntry(t *testing.T, snap *indexSnapshot, field string) *numericRangeBucketCacheEntry {
+func raceExtraRequireNumericRangeBucketCacheEntry(t *testing.T, snap *indexSnapshot, field string) *qcache.NumericRangeBucketEntry {
 	t.Helper()
 
 	if snap == nil || snap.numericRangeBucketCache == nil {
 		t.Fatalf("expected non-nil numeric range bucket cache for field %q", field)
 	}
-	entry, ok := snap.numericRangeBucketCache.loadField(field)
+	entry, ok := snap.numericRangeBucketCache.LoadField(field)
 	if !ok {
 		t.Fatalf("expected numeric range bucket cache entry for field %q", field)
 	}
-	if entry == nil || entry.idx.bucketSize <= 0 {
+	if entry == nil || entry.Index().BucketSize() <= 0 {
 		t.Fatalf("expected non-nil numeric range bucket entry for field %q", field)
 	}
 	return entry
-}
-
-func raceExtraPosting(ids ...uint64) posting.List {
-	var out posting.List
-	for _, id := range ids {
-		out = out.BuildAdded(id)
-	}
-	return out
-}
-
-func raceExtraAssertPostingSet(t *testing.T, got posting.List, want []uint64) {
-	t.Helper()
-	gotIDs := got.ToArray()
-	if !slices.Equal(gotIDs, want) {
-		t.Fatalf("posting mismatch: got=%v want=%v", gotIDs, want)
-	}
 }
 
 func raceExtraRangeKeys(startInclusive, endExclusive, total int) []uint64 {
@@ -230,235 +214,6 @@ func raceExtraRangeKeys(startInclusive, endExclusive, total int) []uint64 {
 		out = append(out, uint64(i))
 	}
 	return out
-}
-
-func TestRaceExtra_NumericRangeBucketSpanCacheDetachedLoadsUnderConcurrency(t *testing.T) {
-	entry := &numericRangeBucketCacheEntry{}
-
-	base := raceExtraPosting()
-	for i := uint64(1); i <= 48; i++ {
-		base = base.BuildAdded(i * 5)
-	}
-	want := base.ToArray()
-
-	stored := base.Borrow()
-	var ok bool
-	stored, ok = entry.tryStoreFullSpan(11, 23, stored)
-	if !ok {
-		t.Fatal("expected initial full-span store to succeed")
-	}
-	stored.Release()
-	base.Release()
-
-	remove := raceExtraPosting(want[0], want[1], want[2])
-	add := raceExtraPosting(1<<32|3, 1<<32|7)
-	defer remove.Release()
-	defer add.Release()
-
-	var failed atomic.Pointer[string]
-	setFailed := func(msg string) {
-		if failed.Load() != nil {
-			return
-		}
-		copyMsg := msg
-		failed.CompareAndSwap(nil, &copyMsg)
-	}
-
-	start := make(chan struct{})
-	var wg sync.WaitGroup
-
-	readerN := max(6, runtime.GOMAXPROCS(0))
-	for g := 0; g < readerN; g++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			<-start
-			for i := 0; i < 1000; i++ {
-				cached, ok := entry.loadFullSpan(11, 23)
-				if !ok {
-					setFailed("full-span cache entry unexpectedly missing")
-					return
-				}
-				if !slices.Equal(cached.ToArray(), want) {
-					setFailed(fmt.Sprintf("cached full-span mismatch: got=%v want=%v", cached.ToArray(), want))
-					cached.Release()
-					return
-				}
-				cached.Release()
-			}
-		}()
-	}
-
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		<-start
-		for i := 0; i < 300; i++ {
-			cached, ok := entry.loadFullSpan(11, 23)
-			if !ok {
-				setFailed("writer unexpectedly missed full-span cache entry")
-				return
-			}
-			cached = cached.BuildAndNot(remove)
-			cached = cached.BuildOr(add)
-			cached = cached.BuildAdded(6<<32 | uint64(i))
-			cached = cached.BuildOptimized()
-			cached.Release()
-		}
-	}()
-
-	close(start)
-	wg.Wait()
-	if msg := failed.Load(); msg != nil {
-		t.Fatal(*msg)
-	}
-
-	cached, ok := entry.loadFullSpan(11, 23)
-	if !ok {
-		t.Fatal("full-span cache entry missing after concurrent mutations")
-	}
-	defer cached.Release()
-	raceExtraAssertPostingSet(t, cached, want)
-}
-
-func TestRaceExtra_MaterializedPredBorrowedViewSurvivesConcurrentEviction(t *testing.T) {
-	snap := &indexSnapshot{matPredCacheMaxEntries: 1}
-	snapshotExtInitMaterializedPredCache(snap)
-
-	base := raceExtraPosting()
-	for i := uint64(1); i <= 48; i++ {
-		base = base.BuildAdded(i * 7)
-	}
-	want := base.ToArray()
-
-	snap.storeMaterializedPred("hold", base.Borrow())
-	base.Release()
-
-	held, ok := snap.loadMaterializedPred("hold")
-	if !ok || held.IsEmpty() {
-		t.Fatal("expected held cache entry")
-	}
-	defer held.Release()
-
-	var failed atomic.Pointer[string]
-	setFailed := func(msg string) {
-		if failed.Load() != nil {
-			return
-		}
-		copyMsg := msg
-		failed.CompareAndSwap(nil, &copyMsg)
-	}
-
-	start := make(chan struct{})
-	var wg sync.WaitGroup
-
-	readerN := max(6, runtime.GOMAXPROCS(0))
-	for g := 0; g < readerN; g++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			<-start
-			for i := 0; i < 1000; i++ {
-				if !slices.Equal(held.ToArray(), want) {
-					setFailed(fmt.Sprintf("held materialized posting changed under eviction: got=%v want=%v", held.ToArray(), want))
-					return
-				}
-			}
-		}()
-	}
-
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		<-start
-		for i := 0; i < 400; i++ {
-			ids := raceExtraPosting(uint64(i+1), 1<<32|uint64(i+1))
-			snap.storeMaterializedPred(fmt.Sprintf("evict-%d", i), ids)
-		}
-	}()
-
-	close(start)
-	wg.Wait()
-	if msg := failed.Load(); msg != nil {
-		t.Fatal(*msg)
-	}
-
-	raceExtraAssertPostingSet(t, held, want)
-}
-
-func TestRaceExtra_NumericRangeFullSpanBorrowedViewSurvivesConcurrentEviction(t *testing.T) {
-	entry := &numericRangeBucketCacheEntry{}
-
-	base := raceExtraPosting()
-	for i := uint64(1); i <= 48; i++ {
-		base = base.BuildAdded(i * 9)
-	}
-	want := base.ToArray()
-
-	stored := base.Borrow()
-	stored, ok := entry.tryStoreFullSpan(0, 0, stored)
-	if !ok {
-		t.Fatal("expected initial full-span store to succeed")
-	}
-	stored.Release()
-	base.Release()
-
-	held, ok := entry.loadFullSpan(0, 0)
-	if !ok || held.IsEmpty() {
-		t.Fatal("expected held full-span cache entry")
-	}
-	defer held.Release()
-
-	var failed atomic.Pointer[string]
-	setFailed := func(msg string) {
-		if failed.Load() != nil {
-			return
-		}
-		copyMsg := msg
-		failed.CompareAndSwap(nil, &copyMsg)
-	}
-
-	start := make(chan struct{})
-	var wg sync.WaitGroup
-
-	readerN := max(6, runtime.GOMAXPROCS(0))
-	for g := 0; g < readerN; g++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			<-start
-			for i := 0; i < 1000; i++ {
-				if !slices.Equal(held.ToArray(), want) {
-					setFailed(fmt.Sprintf("held full-span posting changed under eviction: got=%v want=%v", held.ToArray(), want))
-					return
-				}
-			}
-		}()
-	}
-
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		<-start
-		for i := 1; i <= 256; i++ {
-			ids := raceExtraPosting(uint64(i), 1<<32|uint64(i))
-			var ok bool
-			ids, ok = entry.tryStoreFullSpan(i, i, ids)
-			if !ok {
-				setFailed(fmt.Sprintf("tryStoreFullSpan(%d,%d) failed", i, i))
-				return
-			}
-			ids.Release()
-		}
-	}()
-
-	close(start)
-	wg.Wait()
-	if msg := failed.Load(); msg != nil {
-		t.Fatal(*msg)
-	}
-
-	raceExtraAssertPostingSet(t, held, want)
 }
 
 func TestRaceExtra_PublicQueriesStayExactUnderConcurrentMaterializedCacheThrash(t *testing.T) {
@@ -595,10 +350,10 @@ func TestRaceExtra_PublicQueriesStayExactUnderConcurrentMaterializedCacheThrash(
 	}
 
 	snap := db.engine.getSnapshot()
-	if got := snap.matPredCacheCount.Load(); got > 2 {
+	if got := snap.matPredCache.EntryCount(); got > 2 {
 		t.Fatalf("materialized predicate cache exceeded global limit: got=%d", got)
 	}
-	if got := snap.matPredCacheOversizedCount.Load(); got > materializedPredCacheOversizedLimit(snap.matPredCacheMaxEntries) {
+	if got := snap.matPredCache.OversizedCount(); got > qcache.MaterializedPredOversizedLimit(snap.materializedPredCacheLimit()) {
 		t.Fatalf("oversized materialized predicate cache exceeded limit: got=%d", got)
 	}
 }
@@ -945,7 +700,7 @@ func TestRaceExtra_PublicNumericRangeQueriesStayExactAcrossConcurrentUnchangedFi
 		return db.engine.makeQueryView(db.engine.getSnapshot())
 	}
 
-	spanFor := func(expr qx.Expr) (indexdata.OverlayRange, *numericRangeBucketCacheEntry) {
+	spanFor := func(expr qx.Expr) (indexdata.OverlayRange, *qcache.NumericRangeBucketEntry) {
 		t.Helper()
 
 		view := makeView()
@@ -1024,11 +779,11 @@ func TestRaceExtra_PublicNumericRangeQueriesStayExactAcrossConcurrentUnchangedFi
 
 	br1, entry1 := spanFor(exprGTE2500)
 	br2, entry2 := spanFor(exprGTE2501)
-	start1, end1, ok := entry1.idx.fullBucketSpan(br1)
+	start1, end1, ok := entry1.Index().FullBucketSpan(br1)
 	if !ok {
 		t.Fatal("expected full bucket span for GTE age>=2500")
 	}
-	start2, end2, ok := entry2.idx.fullBucketSpan(br2)
+	start2, end2, ok := entry2.Index().FullBucketSpan(br2)
 	if !ok {
 		t.Fatal("expected full bucket span for GTE age>=2501")
 	}
@@ -1038,11 +793,11 @@ func TestRaceExtra_PublicNumericRangeQueriesStayExactAcrossConcurrentUnchangedFi
 
 	br3, entry3 := spanFor(exprLT4500)
 	br4, entry4 := spanFor(exprLT4499)
-	start3, end3, ok := entry3.idx.fullBucketSpan(br3)
+	start3, end3, ok := entry3.Index().FullBucketSpan(br3)
 	if !ok {
 		t.Fatal("expected full bucket span for LT age<4500")
 	}
-	start4, end4, ok := entry4.idx.fullBucketSpan(br4)
+	start4, end4, ok := entry4.Index().FullBucketSpan(br4)
 	if !ok {
 		t.Fatal("expected full bucket span for LT age<4499")
 	}

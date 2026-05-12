@@ -5,6 +5,7 @@ import (
 	"github.com/vapstack/rbi/internal/indexdata"
 	"github.com/vapstack/rbi/internal/pooled"
 	"github.com/vapstack/rbi/internal/posting"
+	"github.com/vapstack/rbi/internal/qcache"
 	"github.com/vapstack/rbi/internal/qir"
 	"github.com/vapstack/rbi/internal/schema"
 )
@@ -25,9 +26,9 @@ const countPredBroadRangeComplementFastAvgPerBucketMax = 8
 const countPredLeadResidualHasAnyExactMaxTerms = 4
 const countPredLeadResidualHasAnyExactMinCard = 65_536
 
-var countORMaterializedRouteKeys = [4]materializedPredKey{
-	2: {kind: materializedPredKeyOpaque, raw: "count_or_materialized_2"},
-	3: {kind: materializedPredKeyOpaque, raw: "count_or_materialized_3"},
+var countORMaterializedRouteKeys = [4]qcache.MaterializedPredKey{
+	2: qcache.MaterializedPredKeyFromOpaque("count_or_materialized_2"),
+	3: qcache.MaterializedPredKeyFromOpaque("count_or_materialized_3"),
 }
 
 // Count evaluates the given filter predicates and returns the number of matching records.
@@ -1267,7 +1268,7 @@ func shouldTryCountByPredicates(leaves []qir.Expr) bool {
 		case qir.OpPREFIX, qir.OpSUFFIX, qir.OpCONTAINS, qir.OpHASALL, qir.OpHASANY, qir.OpIN:
 			hasComplex = true
 		default:
-			if isNumericRangeOp(e.Op) {
+			if e.Op.IsNumericRange() {
 				hasRange = true
 			}
 		}
@@ -1331,7 +1332,7 @@ func shouldTryMaterializedCountAND(expr qir.Expr) bool {
 		case qir.OpHASANY, qir.OpHASALL:
 			hasSet = true
 		default:
-			if isNumericRangeOp(e.Op) {
+			if e.Op.IsNumericRange() {
 				hasRange = true
 			}
 		}
@@ -2346,7 +2347,7 @@ func shouldMaterializeCustomCountPredicate(p predicate, probeEst uint64, univers
 type countScalarComplementRouting struct {
 	coarseMaterialize  bool
 	exactMaterialize   bool
-	complementCacheKey materializedPredKey
+	complementCacheKey qcache.MaterializedPredKey
 }
 
 func (route countScalarComplementRouting) wantsComplementMaterialization() bool {
@@ -2360,17 +2361,17 @@ func (route countScalarComplementRouting) prefersLazyPostingFilter(p predicate, 
 	if !route.wantsComplementMaterialization() {
 		return false
 	}
-	if snap == nil || snap.matPredCacheMaxEntries <= 0 {
+	if snap == nil || snap.materializedPredCacheLimit() <= 0 {
 		return true
 	}
-	if route.complementCacheKey.isZero() {
+	if route.complementCacheKey.IsZero() {
 		return true
 	}
 	return !snap.shouldPromoteRuntimeMaterializedPredKey(route.complementCacheKey)
 }
 
 func (qv *queryView) countScalarComplementRouting(p predicate, leadProbeEst uint64, universe uint64) countScalarComplementRouting {
-	if universe == 0 || leadProbeEst == 0 || !p.isCustomUnmaterialized() || p.expr.Not || !isNumericRangeOp(p.expr.Op) {
+	if universe == 0 || leadProbeEst == 0 || !p.isCustomUnmaterialized() || p.expr.Not || !p.expr.Op.IsNumericRange() {
 		return countScalarComplementRouting{}
 	}
 
@@ -3388,7 +3389,7 @@ func countLeadOpWeight(op qir.Op) uint64 {
 	case qir.OpHASANY:
 		return 12
 	default:
-		if isScalarRangeOrPrefixOp(op) {
+		if op.IsScalarRangeOrPrefix() {
 			return 2
 		}
 		return 8
@@ -3409,7 +3410,7 @@ func countPredicateLeadWeight(p predicate) uint64 {
 	case qir.OpHASANY:
 		return 12
 	default:
-		if isScalarRangeOrPrefixOp(p.expr.Op) {
+		if p.expr.Op.IsScalarRangeOrPrefix() {
 			return 4
 		}
 		return countLeadOpWeight(p.expr.Op)
@@ -3421,7 +3422,7 @@ func countPredicateLeadScanWeight(p predicate) uint64 {
 	if !p.isCustomUnmaterialized() {
 		return weight
 	}
-	if isScalarRangeOrPrefixOp(p.expr.Op) {
+	if p.expr.Op.IsScalarRangeOrPrefix() {
 		return satMulUint64(weight, 3)
 	}
 	return weight
@@ -4063,7 +4064,7 @@ func countLeafOpCost(e qir.Expr) int {
 	case qir.OpSUFFIX, qir.OpCONTAINS:
 		cost = 4
 	default:
-		if isNumericRangeOp(e.Op) {
+		if e.Op.IsNumericRange() {
 			cost = 2
 		}
 	}
@@ -4088,7 +4089,7 @@ func countPredicateResidualOpWeight(p predicate) uint64 {
 	case qir.OpCONTAINS:
 		return 10
 	default:
-		if isNumericRangeOp(p.expr.Op) {
+		if p.expr.Op.IsNumericRange() {
 			return 4
 		}
 		return max(2, p.checkCost()+2)
@@ -4128,7 +4129,7 @@ func countLeafPlanLess(plans []countLeafPlan, a, b int) bool {
 }
 
 func countLeafPlanStartsBroadScalarMaterialization(plan countLeafPlan) bool {
-	if plan.expr.Not || !plan.hasSel || !isScalarRangeOrPrefixOp(plan.expr.Op) {
+	if plan.expr.Not || !plan.hasSel || !plan.expr.Op.IsScalarRangeOrPrefix() {
 		return false
 	}
 	return plan.selectivity > 0.5
@@ -4152,7 +4153,7 @@ func (qv *queryView) reorderCountEvalAndPositivePlans(plans []countLeafPlan, pos
 	for i := 1; i < len(pos); i++ {
 		if countLeafPlanSeedsCustomMaterialization(plans[pos[i]]) {
 			cacheKey := qv.materializedPredKey(plans[pos[i]].expr)
-			if !cacheKey.isZero() {
+			if !cacheKey.IsZero() {
 				if cached, ok := qv.snap.loadMaterializedPredKey(cacheKey); ok && !cached.IsEmpty() {
 					continue
 				}
@@ -4177,11 +4178,11 @@ func (qv *queryView) applyAndPostingResultExpr(acc *postingResult, hasAcc *bool,
 			usePostingApply := false
 			if isScalarEqOrInOp(expr.Op) || expr.Op == qir.OpHASALL || expr.Op == qir.OpHASANY {
 				usePostingApply = true
-			} else if isScalarRangeOrPrefixOp(expr.Op) {
+			} else if expr.Op.IsScalarRangeOrPrefix() {
 				usePostingApply = true
 				if qv.snap != nil {
 					cacheKey := qv.materializedPredKey(expr)
-					if !cacheKey.isZero() {
+					if !cacheKey.IsZero() {
 						if _, ok := qv.snap.loadMaterializedPredKey(cacheKey); ok {
 							usePostingApply = false
 						} else if qv.snap.shouldPromoteRuntimeMaterializedPredKey(cacheKey) {

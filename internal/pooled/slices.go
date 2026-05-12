@@ -51,7 +51,7 @@ func NewSlicePool[T any](maxCap uint, clearPolicy SliceClearPolicy, cleanup ...f
 }
 
 func (s *SlicePool[T]) Get(capHint int) []T {
-	if capHint > s.maxCap {
+	if capHint > s.maxCap || s.pools == nil {
 		return make([]T, 0, capHint)
 	}
 	shift := bits.Len(uint(max(capHint-1, sliceMinCapMask))) // ceil(log2(cap))

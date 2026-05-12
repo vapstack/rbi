@@ -1,14 +1,12 @@
-package rbi
+package qcache
 
 import (
-	"slices"
 	"testing"
 
-	"github.com/vapstack/qx"
 	"github.com/vapstack/rbi/internal/indexdata"
 	"github.com/vapstack/rbi/internal/keycodec"
 	"github.com/vapstack/rbi/internal/pooled"
-	"github.com/vapstack/rbi/internal/posting"
+	"github.com/vapstack/rbi/internal/qir"
 )
 
 func TestMaterializedPredKeyExactScalarRange_RoundTripNumeric(t *testing.T) {
@@ -24,12 +22,12 @@ func TestMaterializedPredKeyExactScalarRange_RoundTripNumeric(t *testing.T) {
 		HiIndex:   keycodec.FromU64(keycodec.OrderedInt64Key(60)),
 	}
 
-	key := materializedPredKeyForExactScalarRange("age", bounds)
-	if key.isZero() {
+	key := MaterializedPredKeyForExactScalarRange("age", bounds)
+	if key.IsZero() {
 		t.Fatal("expected non-zero exact range cache key")
 	}
 
-	parsed, ok := materializedPredKeyFromEncoded(key.String())
+	parsed, ok := MaterializedPredKeyFromEncoded(key.String())
 	if !ok {
 		t.Fatal("expected numeric exact range cache key to parse")
 	}
@@ -51,12 +49,12 @@ func TestMaterializedPredKeyExactScalarRangeComplement_RoundTripNumeric(t *testi
 		HiIndex:   keycodec.FromU64(keycodec.OrderedInt64Key(60)),
 	}
 
-	key := materializedPredComplementKeyForExactScalarRange("age", bounds)
-	if key.isZero() {
+	key := MaterializedPredComplementKeyForExactScalarRange("age", bounds)
+	if key.IsZero() {
 		t.Fatal("expected non-zero exact range complement cache key")
 	}
 
-	parsed, ok := materializedPredKeyFromEncoded(key.String())
+	parsed, ok := MaterializedPredKeyFromEncoded(key.String())
 	if !ok {
 		t.Fatal("expected numeric exact range complement cache key to parse")
 	}
@@ -67,7 +65,7 @@ func TestMaterializedPredKeyExactScalarRangeComplement_RoundTripNumeric(t *testi
 
 func TestMaterializedPredKeyExactScalarRange_ParseLegacyEncoding(t *testing.T) {
 	legacy := "age\x1frange_exact\x1f[\x00\x00\x00\x00\x00\x00\x00\x1e\x1f)\x00\x00\x00\x00\x00\x00\x00<"
-	parsed, ok := materializedPredKeyFromEncoded(legacy)
+	parsed, ok := MaterializedPredKeyFromEncoded(legacy)
 	if !ok {
 		t.Fatal("expected legacy exact range cache key to parse")
 	}
@@ -83,13 +81,13 @@ func TestMaterializedPredKeyExactScalarRange_ParseLegacyEncoding(t *testing.T) {
 }
 
 func TestMaterializedPredKeyScalar_NumericBoundsDoNotCollide(t *testing.T) {
-	k30 := materializedPredKeyForNumericScalar("age", compileScalarOpForTest(qx.OpGTE), keycodec.FromU64(keycodec.OrderedInt64Key(30)))
-	k40 := materializedPredKeyForNumericScalar("age", compileScalarOpForTest(qx.OpGTE), keycodec.FromU64(keycodec.OrderedInt64Key(40)))
+	k30 := MaterializedPredKeyForNumericScalar("age", qir.OpGTE, keycodec.FromU64(keycodec.OrderedInt64Key(30)))
+	k40 := MaterializedPredKeyForNumericScalar("age", qir.OpGTE, keycodec.FromU64(keycodec.OrderedInt64Key(40)))
 	if k30 == k40 {
 		t.Fatal("expected distinct numeric scalar cache keys")
 	}
 
-	p30, ok := materializedPredKeyFromEncoded(k30.String())
+	p30, ok := MaterializedPredKeyFromEncoded(k30.String())
 	if !ok {
 		t.Fatal("expected numeric scalar cache key to parse")
 	}
@@ -97,24 +95,47 @@ func TestMaterializedPredKeyScalar_NumericBoundsDoNotCollide(t *testing.T) {
 		t.Fatalf("scalar round-trip mismatch:\n got=%#v\nwant=%#v", p30, k30)
 	}
 
-	c30 := materializedPredComplementKeyForNumericScalar("age", compileScalarOpForTest(qx.OpGTE), keycodec.FromU64(keycodec.OrderedInt64Key(30)))
-	c40 := materializedPredComplementKeyForNumericScalar("age", compileScalarOpForTest(qx.OpGTE), keycodec.FromU64(keycodec.OrderedInt64Key(40)))
+	c30 := MaterializedPredComplementKeyForNumericScalar("age", qir.OpGTE, keycodec.FromU64(keycodec.OrderedInt64Key(30)))
+	c40 := MaterializedPredComplementKeyForNumericScalar("age", qir.OpGTE, keycodec.FromU64(keycodec.OrderedInt64Key(40)))
 	if c30 == c40 {
 		t.Fatal("expected distinct numeric scalar complement cache keys")
 	}
 }
 
-func TestMaterializedPredKeyDistinctSet_RoundTripThroughStringCacheAPI(t *testing.T) {
+func TestMaterializedPredKeyLookup_RoundTrip(t *testing.T) {
+	str := MaterializedPredKeyForLookupKey("email", qir.OpPREFIX, keycodec.IndexLookupString("user"))
+	if str.IsZero() || str.Field() != "email" {
+		t.Fatalf("unexpected string lookup key: %#v", str)
+	}
+	parsedStr, ok := MaterializedPredKeyFromEncoded(str.String())
+	if !ok || parsedStr != str {
+		t.Fatalf("string lookup round-trip mismatch:\n got=%#v\nwant=%#v", parsedStr, str)
+	}
+
+	num := MaterializedPredKeyForLookupKey("age", qir.OpGTE, keycodec.IndexLookupU64(keycodec.OrderedInt64Key(30)))
+	parsedNum, ok := MaterializedPredKeyFromEncoded(num.String())
+	if !ok || parsedNum != num {
+		t.Fatalf("numeric lookup round-trip mismatch:\n got=%#v\nwant=%#v", parsedNum, num)
+	}
+
+	comp := MaterializedPredComplementKeyForLookupKey("age", qir.OpGTE, keycodec.IndexLookupU64(keycodec.OrderedInt64Key(30)))
+	parsedComp, ok := MaterializedPredKeyFromEncoded(comp.String())
+	if !ok || parsedComp != comp {
+		t.Fatalf("numeric complement lookup round-trip mismatch:\n got=%#v\nwant=%#v", parsedComp, comp)
+	}
+}
+
+func TestMaterializedPredKeyDistinctSet_RoundTrip(t *testing.T) {
 	vals := pooled.GetStringSlice(2)
 	defer pooled.ReleaseStringSlice(vals)
 	vals = append(vals, "DE", "FR")
 
-	key := materializedPredKeyForDistinctSetTerms("country", compileScalarOpForTest(qx.OpIN), vals, true)
-	if key.isZero() {
+	key := MaterializedPredKeyForDistinctSetTerms("country", qir.OpIN, vals, true)
+	if key.IsZero() {
 		t.Fatal("expected non-zero distinct-set cache key")
 	}
 
-	parsed, ok := materializedPredKeyFromEncoded(key.String())
+	parsed, ok := MaterializedPredKeyFromEncoded(key.String())
 	if !ok {
 		t.Fatal("expected distinct-set cache key to parse")
 	}
@@ -122,22 +143,16 @@ func TestMaterializedPredKeyDistinctSet_RoundTripThroughStringCacheAPI(t *testin
 		t.Fatalf("distinct-set round-trip mismatch:\n got=%#v\nwant=%#v", parsed, key)
 	}
 
-	db, _ := openTempDBUint64(t, Options{
-		AnalyzeInterval:                         -1,
-		SnapshotMaterializedPredCacheMaxEntries: 16,
-	})
-	ids := posting.BuildFromSorted([]uint64{1, 3, 5, 8})
-	defer ids.Release()
+}
 
-	snap := db.engine.getSnapshot()
-	snap.storeMaterializedPred(key.String(), ids.Borrow())
-	got, ok := snap.loadMaterializedPred(key.String())
-	if !ok {
-		t.Fatal("expected string-key cache API to load stored distinct-set key")
+func TestMaterializedPredKeySlicePool(t *testing.T) {
+	keys := GetMaterializedPredKeySlice(2)
+	keys = append(keys,
+		MaterializedPredKeyForScalar("email", qir.OpPREFIX, "a"),
+		MaterializedPredKeyForScalar("name", qir.OpSUFFIX, "b"),
+	)
+	if len(keys) != 2 {
+		t.Fatalf("unexpected key slice len=%d", len(keys))
 	}
-	defer got.Release()
-
-	if !slices.Equal(got.ToArray(), ids.ToArray()) {
-		t.Fatalf("string-key cache round-trip mismatch: got=%v want=%v", got.ToArray(), ids.ToArray())
-	}
+	ReleaseMaterializedPredKeySlice(keys)
 }

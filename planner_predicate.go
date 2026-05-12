@@ -9,6 +9,7 @@ import (
 	"github.com/vapstack/rbi/internal/keycodec"
 	"github.com/vapstack/rbi/internal/pooled"
 	"github.com/vapstack/rbi/internal/posting"
+	"github.com/vapstack/rbi/internal/qcache"
 	"github.com/vapstack/rbi/internal/qir"
 	"github.com/vapstack/rbi/internal/schema"
 )
@@ -949,7 +950,7 @@ func (qv *queryView) buildPredicateCandidate(e qir.Expr) (predicate, bool) {
 		return qv.buildPredMaterializedCandidate(e)
 
 	default:
-		if isScalarRangeOrPrefixOp(e.Op) {
+		if e.Op.IsScalarRangeOrPrefix() {
 			if !ov.HasData() {
 				return predicate{}, false
 			}
@@ -1093,9 +1094,9 @@ func (qv *queryView) buildPredInCandidate(e qir.Expr, fm *schema.Field, ov index
 	}
 	fieldName := qv.engine.fieldNameByOrdinal(e.FieldOrdinal)
 	postsBuf, est := qv.scalarLookupPostings(fieldName, e.FieldOrdinal, valsBuf, hasNil)
-	cacheKey := materializedPredKey{}
-	if qv.snap != nil && qv.snap.matPredCacheMaxEntries > 0 {
-		cacheKey = materializedPredKeyForDistinctSetTerms(fieldName, e.Op, valsBuf, hasNil)
+	cacheKey := qcache.MaterializedPredKey{}
+	if qv.snap != nil && qv.snap.materializedPredCacheLimit() > 0 {
+		cacheKey = qcache.MaterializedPredKeyForDistinctSetTerms(fieldName, e.Op, valsBuf, hasNil)
 	}
 
 	if e.Not {
@@ -1177,10 +1178,10 @@ func (qv *queryView) buildPredHasCandidate(e qir.Expr, fm *schema.Field, ov inde
 
 	raw := e
 	raw.Not = false
-	var cacheKey materializedPredKey
-	if qv.snap != nil && qv.snap.matPredCacheMaxEntries > 0 {
-		cacheKey = materializedPredKeyForDistinctSetTerms(qv.engine.fieldNameByOrdinal(raw.FieldOrdinal), raw.Op, valsBuf, false)
-		if !cacheKey.isZero() {
+	var cacheKey qcache.MaterializedPredKey
+	if qv.snap != nil && qv.snap.materializedPredCacheLimit() > 0 {
+		cacheKey = qcache.MaterializedPredKeyForDistinctSetTerms(qv.engine.fieldNameByOrdinal(raw.FieldOrdinal), raw.Op, valsBuf, false)
+		if !cacheKey.IsZero() {
 			if cached, ok := qv.snap.loadMaterializedPredKey(cacheKey); ok {
 				if e.Not {
 					return predicate{
@@ -1312,9 +1313,9 @@ func (qv *queryView) buildPredHasAnyCandidate(e qir.Expr, fm *schema.Field, ov i
 		postsBuf = append(postsBuf, ids)
 		est += ids.Cardinality()
 	}
-	cacheKey := materializedPredKey{}
-	if qv.snap != nil && qv.snap.matPredCacheMaxEntries > 0 {
-		cacheKey = materializedPredKeyForDistinctSetTerms(qv.engine.fieldNameByOrdinal(e.FieldOrdinal), e.Op, valsBuf, false)
+	cacheKey := qcache.MaterializedPredKey{}
+	if qv.snap != nil && qv.snap.materializedPredCacheLimit() > 0 {
+		cacheKey = qcache.MaterializedPredKeyForDistinctSetTerms(qv.engine.fieldNameByOrdinal(e.FieldOrdinal), e.Op, valsBuf, false)
 	}
 	if e.Not {
 		if len(postsBuf) == 0 {
@@ -1504,27 +1505,27 @@ func (qv *queryView) buildPredMaterializedCandidate(e qir.Expr) (predicate, bool
 	}, true
 }
 
-func (qv *queryView) evalLazyMaterializedPredicateWithKey(raw qir.Expr, cacheKey materializedPredKey) posting.List {
-	if !cacheKey.isZero() {
+func (qv *queryView) evalLazyMaterializedPredicateWithKey(raw qir.Expr, cacheKey qcache.MaterializedPredKey) posting.List {
+	if !cacheKey.IsZero() {
 		if cached, ok := qv.snap.loadMaterializedPredKey(cacheKey); ok {
 			return cached
 		}
 	}
 
-	if isScalarRangeOrPrefixOp(raw.Op) {
+	if raw.Op.IsScalarRangeOrPrefix() {
 		fm := qv.fieldMetaByExpr(raw)
 		var core preparedScalarRangePredicate
 		pred, done, ok := qv.initPreparedScalarRangePredicate(&core, raw, fm)
 		if ok {
 			if done {
-				if pred.alwaysFalse && !cacheKey.isZero() {
+				if pred.alwaysFalse && !cacheKey.IsZero() {
 					qv.snap.storeMaterializedPredKey(cacheKey, posting.List{})
 				}
 				return posting.List{}
 			}
 			ov := qv.fieldOverlayForExpr(raw)
 			if !ov.HasData() {
-				if !cacheKey.isZero() {
+				if !cacheKey.IsZero() {
 					qv.snap.storeMaterializedPredKey(cacheKey, posting.List{})
 				}
 				return posting.List{}
@@ -1535,14 +1536,14 @@ func (qv *queryView) evalLazyMaterializedPredicateWithKey(raw qir.Expr, cacheKey
 
 	b, err := qv.evalSimple(raw)
 	if err != nil {
-		if !cacheKey.isZero() {
+		if !cacheKey.IsZero() {
 			qv.snap.storeMaterializedPredKey(cacheKey, posting.List{})
 		}
 		return posting.List{}
 	}
 	if b.ids.IsEmpty() {
 		b.release()
-		if !cacheKey.isZero() {
+		if !cacheKey.IsZero() {
 			qv.snap.storeMaterializedPredKey(cacheKey, posting.List{})
 		}
 		return posting.List{}
@@ -1551,58 +1552,58 @@ func (qv *queryView) evalLazyMaterializedPredicateWithKey(raw qir.Expr, cacheKey
 }
 
 func (qv *queryView) evalLazyMaterializedPredicate(raw qir.Expr, cacheKey string) posting.List {
-	parsed, _ := materializedPredKeyFromEncoded(cacheKey)
+	parsed, _ := qcache.MaterializedPredKeyFromEncoded(cacheKey)
 	return qv.evalLazyMaterializedPredicateWithKey(raw, parsed)
 }
 
-func (qv *queryView) materializedPredKeyForScalar(field string, op qir.Op, key string) materializedPredKey {
-	if qv.snap.matPredCacheMaxEntries <= 0 {
-		return materializedPredKey{}
+func (qv *queryView) materializedPredKeyForScalar(field string, op qir.Op, key string) qcache.MaterializedPredKey {
+	if qv.snap.materializedPredCacheLimit() <= 0 {
+		return qcache.MaterializedPredKey{}
 	}
 	if fm := qv.engine.schema.Fields[field]; schema.FieldUsesOrderedNumericKeys(fm) && len(key) == 8 {
-		return materializedPredKeyForNumericScalar(field, op, keycodec.FromFixed8String(key))
+		return qcache.MaterializedPredKeyForLookupKey(field, op, keycodec.IndexLookupU64(keycodec.Fixed8StringToU64(key)))
 	}
-	return materializedPredKeyForScalar(field, op, key)
+	return qcache.MaterializedPredKeyForLookupKey(field, op, keycodec.IndexLookupString(key))
 }
 
 func (qv *queryView) materializedPredCacheKeyForScalar(field string, op qir.Op, key string) string {
 	return qv.materializedPredKeyForScalar(field, op, key).String()
 }
 
-func (qv *queryView) materializedPredComplementKeyForScalar(field string, op qir.Op, key string) materializedPredKey {
-	if qv.snap.matPredCacheMaxEntries <= 0 {
-		return materializedPredKey{}
+func (qv *queryView) materializedPredComplementKeyForScalar(field string, op qir.Op, key string) qcache.MaterializedPredKey {
+	if qv.snap.materializedPredCacheLimit() <= 0 {
+		return qcache.MaterializedPredKey{}
 	}
 	if fm := qv.engine.schema.Fields[field]; schema.FieldUsesOrderedNumericKeys(fm) && len(key) == 8 {
-		return materializedPredComplementKeyForNumericScalar(field, op, keycodec.FromFixed8String(key))
+		return qcache.MaterializedPredComplementKeyForLookupKey(field, op, keycodec.IndexLookupU64(keycodec.Fixed8StringToU64(key)))
 	}
-	return materializedPredComplementKeyForScalar(field, op, key)
+	return qcache.MaterializedPredComplementKeyForLookupKey(field, op, keycodec.IndexLookupString(key))
 }
 
 func (qv *queryView) materializedPredComplementCacheKeyForScalar(field string, op qir.Op, key string) string {
 	return qv.materializedPredComplementKeyForScalar(field, op, key).String()
 }
 
-func (qv *queryView) materializedPredKeyForNormalizedScalarBound(field string, bound normalizedScalarBound) materializedPredKey {
+func (qv *queryView) materializedPredKeyForNormalizedScalarBound(field string, bound normalizedScalarBound) qcache.MaterializedPredKey {
 	if bound.hasIndexKey {
-		return materializedPredKeyForNumericScalar(field, bound.op, bound.keyIndex)
+		return qcache.MaterializedPredKeyForLookupKey(field, bound.op, keycodec.IndexLookupU64(bound.keyIndex.U64()))
 	}
 	return qv.materializedPredKeyForScalar(field, bound.op, bound.key)
 }
 
-func (qv *queryView) materializedPredComplementKeyForNormalizedScalarBound(field string, bound normalizedScalarBound) materializedPredKey {
+func (qv *queryView) materializedPredComplementKeyForNormalizedScalarBound(field string, bound normalizedScalarBound) qcache.MaterializedPredKey {
 	if bound.hasIndexKey {
-		return materializedPredComplementKeyForNumericScalar(field, bound.op, bound.keyIndex)
+		return qcache.MaterializedPredComplementKeyForLookupKey(field, bound.op, keycodec.IndexLookupU64(bound.keyIndex.U64()))
 	}
 	return qv.materializedPredComplementKeyForScalar(field, bound.op, bound.key)
 }
 
-func (qv *queryView) materializedPredKey(e qir.Expr) materializedPredKey {
+func (qv *queryView) materializedPredKey(e qir.Expr) qcache.MaterializedPredKey {
 	fieldName := qv.engine.fieldNameByOrdinal(e.FieldOrdinal)
-	if isScalarRangeOrPrefixOp(e.Op) {
+	if e.Op.IsScalarRangeOrPrefix() {
 		bound, isSlice, err := qv.normalizedScalarBoundForExpr(e)
 		if err != nil || isSlice || bound.empty || bound.full {
-			return materializedPredKey{}
+			return qcache.MaterializedPredKey{}
 		}
 		return qv.materializedPredKeyForNormalizedScalarBound(fieldName, bound)
 	}
@@ -1612,9 +1613,9 @@ func (qv *queryView) materializedPredKey(e qir.Expr) materializedPredKey {
 		Value:        e.Value,
 	})
 	if err != nil || isSlice || isNil {
-		return materializedPredKey{}
+		return qcache.MaterializedPredKey{}
 	}
-	return materializedPredKeyForLookupKey(fieldName, e.Op, key)
+	return qcache.MaterializedPredKeyForLookupKey(fieldName, e.Op, key)
 }
 
 func (qv *queryView) materializedPredCacheKey(e qir.Expr) string {
@@ -1622,7 +1623,7 @@ func (qv *queryView) materializedPredCacheKey(e qir.Expr) string {
 }
 
 func materializedPredCacheKeyFromScalar(field string, op qir.Op, key string) string {
-	if field == "" || !isMaterializedScalarCacheOp(op) {
+	if field == "" || !op.IsMaterializedScalarCache() {
 		return ""
 	}
 	return field + "\x1f" + strconv.Itoa(int(op)) + "\x1f" + key
@@ -1630,7 +1631,7 @@ func materializedPredCacheKeyFromScalar(field string, op qir.Op, key string) str
 
 // tryShareMaterializedPred caches ids and, on success, rewrites the caller
 // handle to a borrowed alias of the cached payload.
-func (qv *queryView) tryShareMaterializedPred(cacheKey materializedPredKey, ids posting.List) posting.List {
+func (qv *queryView) tryShareMaterializedPred(cacheKey qcache.MaterializedPredKey, ids posting.List) posting.List {
 	return tryShareMaterializedPredOnSnapshot(qv.snap, cacheKey, ids)
 }
 
@@ -3021,8 +3022,8 @@ func (qv *queryView) buildPredicatesOrdered(leaves []qir.Expr, orderField string
 type orderedScalarRangeRouting struct {
 	eagerMaterialize   bool
 	broadComplement    bool
-	cacheKey           materializedPredKey
-	complementCacheKey materializedPredKey
+	cacheKey           qcache.MaterializedPredKey
+	complementCacheKey qcache.MaterializedPredKey
 	requirePromotion   bool
 	forceComplement    bool
 	useComplement      bool
@@ -3038,7 +3039,7 @@ func (qv *queryView) orderedPredicateScalarRangeRouting(
 	orderedOffset uint64,
 	universe uint64,
 ) orderedScalarRangeRouting {
-	if universe == 0 || p.expr.Not || p.expr.FieldOrdinal < 0 || !isNumericRangeOp(p.expr.Op) {
+	if universe == 0 || p.expr.Not || p.expr.FieldOrdinal < 0 || !p.expr.Op.IsNumericRange() {
 		return orderedScalarRangeRouting{}
 	}
 	candidate, ok := qv.preparePredicateScalarRangeRoutingCandidate(p)
@@ -3082,10 +3083,10 @@ func (qv *queryView) orderedScalarRangeCanEagerMaterialize(route orderedScalarRa
 		return false
 	}
 	promotionKey := route.cacheKey
-	if route.useComplement && !route.complementCacheKey.isZero() {
+	if route.useComplement && !route.complementCacheKey.IsZero() {
 		promotionKey = route.complementCacheKey
 	}
-	if !route.requirePromotion || qv.snap == nil || promotionKey.isZero() {
+	if !route.requirePromotion || qv.snap == nil || promotionKey.IsZero() {
 		return true
 	}
 	return qv.snap.shouldPromoteRuntimeMaterializedPredKey(promotionKey)
@@ -3137,7 +3138,7 @@ func (qv *queryView) tryMaterializeBroadRangeComplementPredicateForOrdered(
 		setPredicateMaterializedNot(p, ids)
 		return true
 	}
-	if qv.snap == nil || candidate.core.complementCacheKey.isZero() {
+	if qv.snap == nil || candidate.core.complementCacheKey.IsZero() {
 		return false
 	}
 	if plan.est >= p.estCard {
@@ -3188,7 +3189,7 @@ func (qv *queryView) loadWarmComplementPredicateForOrdered(p *predicate, useComp
 }
 
 func (qv *queryView) isPositiveOrderedNumericRangeLeaf(e qir.Expr, orderField string) bool {
-	if e.Not || e.FieldOrdinal < 0 || qv.engine.fieldNameByOrdinal(e.FieldOrdinal) == orderField || !isNumericRangeOp(e.Op) {
+	if e.Not || e.FieldOrdinal < 0 || qv.engine.fieldNameByOrdinal(e.FieldOrdinal) == orderField || !e.Op.IsNumericRange() {
 		return false
 	}
 	fm := qv.fieldMetaByExpr(e)
@@ -3497,7 +3498,7 @@ func (qv *queryView) buildPredicateWithColdModeAndWarmLoad(
 		return predicate{}, false
 	}
 
-	if isScalarRangeOrPrefixOp(e.Op) {
+	if e.Op.IsScalarRangeOrPrefix() {
 		ov := qv.fieldOverlayForExpr(e)
 		if !ov.HasData() {
 			return predicate{}, false
@@ -3563,7 +3564,7 @@ type rangePostingFilterProbe interface {
 }
 
 func shouldUseNumericRangePostingFilter(e qir.Expr, fm *schema.Field) bool {
-	if !schema.FieldUsesOrderedNumericKeys(fm) || !isNumericRangeOp(e.Op) {
+	if !schema.FieldUsesOrderedNumericKeys(fm) || !e.Op.IsNumericRange() {
 		return false
 	}
 	return true
@@ -3994,7 +3995,7 @@ func orderedAnchorLeadOpWeight(op qir.Op) float64 {
 	case qir.OpIN, qir.OpHASALL, qir.OpHASANY:
 		return 1.35
 	default:
-		if isScalarRangeOrPrefixOp(op) {
+		if op.IsScalarRangeOrPrefix() {
 			return 1.9
 		}
 		return 2.5
@@ -4002,7 +4003,7 @@ func orderedAnchorLeadOpWeight(op qir.Op) float64 {
 }
 
 func orderedPredicateIsRangeLike(p predicate) bool {
-	return isScalarRangeOrPrefixOp(p.expr.Op)
+	return p.expr.Op.IsScalarRangeOrPrefix()
 }
 
 func chooseOrderedAnchorLeadReader(qv *queryView, orderField string, preds predicateReader, active []int) (int, bool) {

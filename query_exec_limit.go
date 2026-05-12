@@ -1036,7 +1036,7 @@ func (qv *queryView) buildLeafPredsExcludingBounds(leaves []qir.Expr, field stri
 				// Multiple exact bucket siblings already cut broad range work
 				// aggressively, so first-hit complement materialization is only
 				// worth taking when a warm shared complement already exists.
-				if orderedRoute.complementCacheKey.isZero() || qv.snap == nil {
+				if orderedRoute.complementCacheKey.IsZero() || qv.snap == nil {
 					continue
 				}
 				if _, ok := qv.snap.loadMaterializedPredKey(orderedRoute.complementCacheKey); !ok {

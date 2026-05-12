@@ -55,6 +55,28 @@ func (op Op) String() string {
 	return fmt.Sprintf("Op(%d)", op)
 }
 
+func (op Op) IsNumericRange() bool {
+	switch op {
+	case OpGT, OpGTE, OpLT, OpLTE:
+		return true
+	default:
+		return false
+	}
+}
+
+func (op Op) IsScalarRangeOrPrefix() bool {
+	return op.IsNumericRange() || op == OpPREFIX
+}
+
+func (op Op) IsMaterializedScalarCache() bool {
+	switch op {
+	case OpSUFFIX, OpCONTAINS:
+		return true
+	default:
+		return op.IsScalarRangeOrPrefix()
+	}
+}
+
 type OrderKind byte
 
 const (

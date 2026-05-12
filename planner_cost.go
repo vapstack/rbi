@@ -1767,7 +1767,7 @@ func (qv *queryView) estimateOrderedAnchorSetupCost(
 		}
 
 		activeCount++
-		rangeLike := isScalarRangeOrPrefixOp(e.Op)
+		rangeLike := e.Op.IsScalarRangeOrPrefix()
 		if rangeLike {
 			activeRangeLikeCount++
 		}
@@ -2132,7 +2132,7 @@ func (qv *queryView) estimateLeafOrderCost(
 	case qir.OpPREFIX:
 		fallbackWork *= 1.20
 	default:
-		if isNumericRangeOp(e.Op) {
+		if e.Op.IsNumericRange() {
 			fallbackWork *= 1.05
 		}
 	}

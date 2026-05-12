@@ -2484,7 +2484,7 @@ func TestQueryExt_MixedCaching_NumericRangesRemainExactAcrossClearAndPublish(t *
 	}
 
 	checkQueries("warm")
-	if got := db.engine.getSnapshot().matPredCacheCount.Load(); got == 0 {
+	if got := db.engine.getSnapshot().matPredCache.EntryCount(); got == 0 {
 		t.Fatalf("expected shared runtime caches to warm up")
 	}
 
@@ -2497,12 +2497,12 @@ func TestQueryExt_MixedCaching_NumericRangesRemainExactAcrossClearAndPublish(t *
 
 	db.clearCurrentSnapshotCachesForTesting()
 	snap := db.engine.getSnapshot()
-	if got := snap.matPredCacheCount.Load(); got != 0 {
+	if got := snap.matPredCache.EntryCount(); got != 0 {
 		t.Fatalf("expected cleared materialized predicate cache, got=%d", got)
 	}
 
 	checkQueries("after_clear")
-	if got := db.engine.getSnapshot().matPredCacheCount.Load(); got == 0 {
+	if got := db.engine.getSnapshot().matPredCache.EntryCount(); got == 0 {
 		t.Fatalf("expected caches to repopulate after cold queries")
 	}
 }
@@ -2565,7 +2565,7 @@ func TestQueryExt_ConcurrentEvictingMaterializedPredicates_RemainStable(t *testi
 	if _, err := db.QueryKeys(queries[0]); err != nil {
 		t.Fatalf("warm QueryKeys: %v", err)
 	}
-	if got := db.engine.getSnapshot().matPredCacheCount.Load(); got == 0 {
+	if got := db.engine.getSnapshot().matPredCache.EntryCount(); got == 0 {
 		t.Fatalf("expected deep ordered window to materialize a predicate cache entry")
 	}
 
@@ -2624,7 +2624,7 @@ func TestQueryExt_ConcurrentEvictingMaterializedPredicates_RemainStable(t *testi
 		t.Fatal(err)
 	}
 
-	if got := db.engine.getSnapshot().matPredCacheCount.Load(); got > 1 {
+	if got := db.engine.getSnapshot().matPredCache.EntryCount(); got > 1 {
 		t.Fatalf("materialized predicate cache exceeded configured bound: got=%d", got)
 	}
 }
@@ -2817,7 +2817,7 @@ func TestQueryExt_NumericRangeFieldMutation_DoesNotReuseStaleCaches(t *testing.T
 	}
 
 	checkQueries("warm")
-	if got := db.engine.getSnapshot().matPredCacheCount.Load(); got == 0 {
+	if got := db.engine.getSnapshot().matPredCache.EntryCount(); got == 0 {
 		t.Fatalf("expected warmed numeric-range query to populate predicate cache")
 	}
 

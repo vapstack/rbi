@@ -7,6 +7,7 @@ import (
 
 	"github.com/vapstack/rbi/internal/pooled"
 	"github.com/vapstack/rbi/internal/posting"
+	"github.com/vapstack/rbi/internal/qcache"
 	"github.com/vapstack/rbi/internal/qir"
 	"github.com/vapstack/rbi/internal/schema"
 	"github.com/vapstack/rbi/internal/strmap"
@@ -51,14 +52,9 @@ func (qe *queryEngine) releaseQueryView(view *queryView) {
 }
 
 func (qe *queryEngine) initSnapshotRuntimeCaches(s *indexSnapshot) {
-	s.numericRangeBucketCache = numericRangeBucketCachePool.Get()
-	s.numericRangeBucketCache.init(len(qe.schema.Indexed))
-	s.matPredCacheMaxEntries = qe.matPredCacheMaxEntries
-	s.matPredCacheMaxCard = qe.matPredCacheMaxCard
-	if s.matPredCacheMaxEntries > 0 {
-		s.matPredCache = materializedPredCachePool.Get()
-		s.matPredCache.refs.Store(1)
-		s.matPredCache.init(s.matPredCacheMaxEntries)
+	s.numericRangeBucketCache = qcache.GetNumericRangeBucketCache(len(qe.schema.Indexed), qe.matPredCacheMaxCard)
+	if qe.matPredCacheMaxEntries > 0 {
+		s.matPredCache = qcache.GetMaterializedPredCache(qe.matPredCacheMaxEntries, qe.matPredCacheMaxCard)
 	}
 }
 

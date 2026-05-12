@@ -1,4 +1,4 @@
-package rbi
+package qcache
 
 import (
 	"strconv"
@@ -6,6 +6,7 @@ import (
 
 	"github.com/vapstack/rbi/internal/indexdata"
 	"github.com/vapstack/rbi/internal/keycodec"
+	"github.com/vapstack/rbi/internal/pooled"
 	"github.com/vapstack/rbi/internal/qir"
 )
 
@@ -37,7 +38,11 @@ const (
 // allocation-free; wider sets simply skip this cache class.
 const materializedPredKeyDistinctSetInlineMax = 4
 
-type materializedPredKey struct {
+const materializedPredKeySlicePoolMaxCap = 512
+
+var materializedPredKeySlicePool = pooled.NewSlicePool[MaterializedPredKey](materializedPredKeySlicePoolMaxCap, pooled.ClearCap)
+
+type MaterializedPredKey struct {
 	kind        materializedPredKeyKind
 	raw         string
 	field       string
@@ -55,7 +60,7 @@ type materializedPredKey struct {
 	setValueCnt uint8
 }
 
-func (key materializedPredKey) isZero() bool {
+func (key MaterializedPredKey) IsZero() bool {
 	switch key.kind {
 	case materializedPredKeyNone:
 		return true
@@ -66,23 +71,28 @@ func (key materializedPredKey) isZero() bool {
 	}
 }
 
-func (key materializedPredKey) String() string {
-	if key.isZero() {
+func (key MaterializedPredKey) Field() string {
+	return key.field
+}
+
+func (key MaterializedPredKey) String() string {
+	if key.IsZero() {
 		return ""
 	}
 	switch key.kind {
+
 	case materializedPredKeyOpaque:
 		return key.raw
+
 	case materializedPredKeyDistinctSet:
-
 		var buf strings.Builder
-
 		buf.WriteString(key.field)
 		buf.WriteByte('\x1f')
 		buf.WriteString("set_exact")
 		buf.WriteByte('\x1f')
 		buf.WriteString(strconv.Itoa(int(key.op)))
 		buf.WriteByte('\x1f')
+
 		if key.flags&materializedPredKeySetHasNil != 0 {
 			buf.WriteByte('1')
 		} else {
@@ -198,11 +208,11 @@ func (key materializedPredKey) String() string {
 	}
 }
 
-func materializedPredKeyForScalar(field string, op qir.Op, key string) materializedPredKey {
-	if field == "" || !isMaterializedScalarCacheOp(op) {
-		return materializedPredKey{}
+func MaterializedPredKeyForScalar(field string, op qir.Op, key string) MaterializedPredKey {
+	if field == "" || !op.IsMaterializedScalarCache() {
+		return MaterializedPredKey{}
 	}
-	return materializedPredKey{
+	return MaterializedPredKey{
 		kind:  materializedPredKeyScalar,
 		field: field,
 		op:    op,
@@ -210,11 +220,11 @@ func materializedPredKeyForScalar(field string, op qir.Op, key string) materiali
 	}
 }
 
-func materializedPredKeyForNumericScalar(field string, op qir.Op, key keycodec.IndexKey) materializedPredKey {
-	if field == "" || !key.IsNumeric() || !isMaterializedScalarCacheOp(op) {
-		return materializedPredKey{}
+func MaterializedPredKeyForNumericScalar(field string, op qir.Op, key keycodec.IndexKey) MaterializedPredKey {
+	if field == "" || !key.IsNumeric() || !op.IsMaterializedScalarCache() {
+		return MaterializedPredKey{}
 	}
-	return materializedPredKey{
+	return MaterializedPredKey{
 		kind:     materializedPredKeyScalar,
 		field:    field,
 		op:       op,
@@ -223,18 +233,18 @@ func materializedPredKeyForNumericScalar(field string, op qir.Op, key keycodec.I
 	}
 }
 
-func materializedPredKeyForLookupKey(field string, op qir.Op, key keycodec.IndexLookupKey) materializedPredKey {
+func MaterializedPredKeyForLookupKey(field string, op qir.Op, key keycodec.IndexLookupKey) MaterializedPredKey {
 	if key.IsNumeric() {
-		return materializedPredKeyForNumericScalar(field, op, key.IndexKey())
+		return MaterializedPredKeyForNumericScalar(field, op, key.IndexKey())
 	}
-	return materializedPredKeyForScalar(field, op, key.StringKey())
+	return MaterializedPredKeyForScalar(field, op, key.StringKey())
 }
 
-func materializedPredComplementKeyForScalar(field string, op qir.Op, key string) materializedPredKey {
-	if field == "" || key == "" || !isNumericRangeOp(op) {
-		return materializedPredKey{}
+func MaterializedPredComplementKeyForScalar(field string, op qir.Op, key string) MaterializedPredKey {
+	if field == "" || key == "" || !op.IsNumericRange() {
+		return MaterializedPredKey{}
 	}
-	return materializedPredKey{
+	return MaterializedPredKey{
 		kind:  materializedPredKeyScalarComplement,
 		field: field,
 		op:    op,
@@ -242,11 +252,11 @@ func materializedPredComplementKeyForScalar(field string, op qir.Op, key string)
 	}
 }
 
-func materializedPredComplementKeyForNumericScalar(field string, op qir.Op, key keycodec.IndexKey) materializedPredKey {
-	if field == "" || !key.IsNumeric() || !isNumericRangeOp(op) {
-		return materializedPredKey{}
+func MaterializedPredComplementKeyForNumericScalar(field string, op qir.Op, key keycodec.IndexKey) MaterializedPredKey {
+	if field == "" || !key.IsNumeric() || !op.IsNumericRange() {
+		return MaterializedPredKey{}
 	}
-	return materializedPredKey{
+	return MaterializedPredKey{
 		kind:     materializedPredKeyScalarComplement,
 		field:    field,
 		op:       op,
@@ -255,9 +265,16 @@ func materializedPredComplementKeyForNumericScalar(field string, op qir.Op, key 
 	}
 }
 
-func materializedPredKeyForExactScalarRangeKind(kind materializedPredKeyKind, field string, bounds indexdata.Bounds) materializedPredKey {
+func MaterializedPredComplementKeyForLookupKey(field string, op qir.Op, key keycodec.IndexLookupKey) MaterializedPredKey {
+	if key.IsNumeric() {
+		return MaterializedPredComplementKeyForNumericScalar(field, op, key.IndexKey())
+	}
+	return MaterializedPredComplementKeyForScalar(field, op, key.StringKey())
+}
+
+func materializedPredKeyForExactScalarRangeKind(kind materializedPredKeyKind, field string, bounds indexdata.Bounds) MaterializedPredKey {
 	if field == "" || bounds.Empty || (!bounds.HasLo && !bounds.HasHi) {
-		return materializedPredKey{}
+		return MaterializedPredKey{}
 	}
 	var flags uint8
 	if bounds.HasLo {
@@ -278,7 +295,7 @@ func materializedPredKeyForExactScalarRangeKind(kind materializedPredKeyKind, fi
 			flags |= materializedPredKeyHiNumeric
 		}
 	}
-	key := materializedPredKey{
+	key := MaterializedPredKey{
 		kind:  kind,
 		field: field,
 		flags: flags,
@@ -300,25 +317,25 @@ func materializedPredKeyForExactScalarRangeKind(kind materializedPredKeyKind, fi
 	return key
 }
 
-func materializedPredKeyForExactScalarRange(field string, bounds indexdata.Bounds) materializedPredKey {
+func MaterializedPredKeyForExactScalarRange(field string, bounds indexdata.Bounds) MaterializedPredKey {
 	return materializedPredKeyForExactScalarRangeKind(materializedPredKeyExactScalarRange, field, bounds)
 }
 
-func materializedPredComplementKeyForExactScalarRange(field string, bounds indexdata.Bounds) materializedPredKey {
+func MaterializedPredComplementKeyForExactScalarRange(field string, bounds indexdata.Bounds) MaterializedPredKey {
 	return materializedPredKeyForExactScalarRangeKind(materializedPredKeyExactScalarRangeComplement, field, bounds)
 }
 
-func parseMaterializedPredKeyExactScalarRange(kind materializedPredKeyKind, field, tail string) (materializedPredKey, bool) {
+func parseMaterializedPredKeyExactScalarRange(kind materializedPredKeyKind, field, tail string) (MaterializedPredKey, bool) {
 	if loTag, rest, ok := strings.Cut(tail, "\x1f"); ok {
 		if loVal, rest, ok := strings.Cut(rest, "\x1f"); ok {
 			if hiTag, hiVal, ok := strings.Cut(rest, "\x1f"); ok {
-				out := materializedPredKey{
+				out := MaterializedPredKey{
 					kind:  kind,
 					field: field,
 				}
 				if loTag != "" {
 					if len(loTag) != 2 {
-						return materializedPredKey{}, false
+						return MaterializedPredKey{}, false
 					}
 					switch loTag[1] {
 					case '[':
@@ -326,24 +343,24 @@ func parseMaterializedPredKeyExactScalarRange(kind materializedPredKeyKind, fiel
 					case '(':
 						out.flags |= materializedPredKeyHasLo
 					default:
-						return materializedPredKey{}, false
+						return MaterializedPredKey{}, false
 					}
 					switch loTag[0] {
 					case 'n':
 						if len(loVal) != 8 {
-							return materializedPredKey{}, false
+							return MaterializedPredKey{}, false
 						}
 						out.flags |= materializedPredKeyLoNumeric
 						out.loIndex = keycodec.FromU64(keycodec.Fixed8StringToU64(loVal))
 					case 's':
 						out.loKey = loVal
 					default:
-						return materializedPredKey{}, false
+						return MaterializedPredKey{}, false
 					}
 				}
 				if hiTag != "" {
 					if len(hiTag) != 2 {
-						return materializedPredKey{}, false
+						return MaterializedPredKey{}, false
 					}
 					switch hiTag[1] {
 					case ']':
@@ -351,23 +368,23 @@ func parseMaterializedPredKeyExactScalarRange(kind materializedPredKeyKind, fiel
 					case ')':
 						out.flags |= materializedPredKeyHasHi
 					default:
-						return materializedPredKey{}, false
+						return MaterializedPredKey{}, false
 					}
 					switch hiTag[0] {
 					case 'n':
 						if len(hiVal) != 8 {
-							return materializedPredKey{}, false
+							return MaterializedPredKey{}, false
 						}
 						out.flags |= materializedPredKeyHiNumeric
 						out.hiIndex = keycodec.FromU64(keycodec.Fixed8StringToU64(hiVal))
 					case 's':
 						out.hiKey = hiVal
 					default:
-						return materializedPredKey{}, false
+						return MaterializedPredKey{}, false
 					}
 				}
 				if out.flags&(materializedPredKeyHasLo|materializedPredKeyHasHi) == 0 {
-					return materializedPredKey{}, false
+					return MaterializedPredKey{}, false
 				}
 				return out, true
 			}
@@ -375,9 +392,9 @@ func parseMaterializedPredKeyExactScalarRange(kind materializedPredKeyKind, fiel
 	}
 	loRaw, hiRaw, ok := strings.Cut(tail, "\x1f")
 	if !ok {
-		return materializedPredKey{}, false
+		return MaterializedPredKey{}, false
 	}
-	out := materializedPredKey{
+	out := MaterializedPredKey{
 		kind:  kind,
 		field: field,
 	}
@@ -388,7 +405,7 @@ func parseMaterializedPredKeyExactScalarRange(kind materializedPredKeyKind, fiel
 		case '(':
 			out.flags |= materializedPredKeyHasLo
 		default:
-			return materializedPredKey{}, false
+			return MaterializedPredKey{}, false
 		}
 		out.loKey = loRaw[1:]
 	}
@@ -399,21 +416,21 @@ func parseMaterializedPredKeyExactScalarRange(kind materializedPredKeyKind, fiel
 		case ')':
 			out.flags |= materializedPredKeyHasHi
 		default:
-			return materializedPredKey{}, false
+			return MaterializedPredKey{}, false
 		}
 		out.hiKey = hiRaw[1:]
 	}
 	if out.flags&(materializedPredKeyHasLo|materializedPredKeyHasHi) == 0 {
-		return materializedPredKey{}, false
+		return MaterializedPredKey{}, false
 	}
 	return out, true
 }
 
-func materializedPredKeyForNumericBucketSpan(field string, startBucket, endBucket int) materializedPredKey {
+func MaterializedPredKeyForNumericBucketSpan(field string, startBucket, endBucket int) MaterializedPredKey {
 	if field == "" || startBucket < 0 || endBucket < startBucket {
-		return materializedPredKey{}
+		return MaterializedPredKey{}
 	}
-	return materializedPredKey{
+	return MaterializedPredKey{
 		kind:        materializedPredKeyNumericBucketSpan,
 		field:       field,
 		startBucket: startBucket,
@@ -421,20 +438,23 @@ func materializedPredKeyForNumericBucketSpan(field string, startBucket, endBucke
 	}
 }
 
-func materializedPredKeyForDistinctSetTerms(field string, op qir.Op, vals []string, includeNil bool) materializedPredKey {
-	termCount := len(vals) + btoi(includeNil)
+func MaterializedPredKeyForDistinctSetTerms(field string, op qir.Op, vals []string, includeNil bool) MaterializedPredKey {
+	termCount := len(vals)
+	if includeNil {
+		termCount++
+	}
 	if field == "" || termCount < 2 {
-		return materializedPredKey{}
+		return MaterializedPredKey{}
 	}
 	switch op {
 	case qir.OpIN, qir.OpHASANY, qir.OpHASALL:
 	default:
-		return materializedPredKey{}
+		return MaterializedPredKey{}
 	}
 	if len(vals) > materializedPredKeyDistinctSetInlineMax {
-		return materializedPredKey{}
+		return MaterializedPredKey{}
 	}
-	key := materializedPredKey{
+	key := MaterializedPredKey{
 		kind:  materializedPredKeyDistinctSet,
 		field: field,
 		op:    op,
@@ -449,38 +469,39 @@ func materializedPredKeyForDistinctSetTerms(field string, op qir.Op, vals []stri
 	return key
 }
 
-func materializedPredKeyFromEncoded(key string) (materializedPredKey, bool) {
+func MaterializedPredKeyFromEncoded(key string) (MaterializedPredKey, bool) {
 	if key == "" {
-		return materializedPredKey{}, false
+		return MaterializedPredKey{}, false
 	}
 	f, rem, ok := strings.Cut(key, "\x1f")
 	if !ok {
-		return materializedPredKey{
+		return MaterializedPredKey{
 			kind: materializedPredKeyOpaque,
 			raw:  key,
 		}, true
 	}
 	if f == "" {
-		return materializedPredKey{}, false
+		return MaterializedPredKey{}, false
 	}
 	head, tail, ok := strings.Cut(rem, "\x1f")
 	if !ok {
-		return materializedPredKey{}, false
+		return MaterializedPredKey{}, false
 	}
+
 	switch head {
 	case "set_exact":
 		opStr, rest, ok := strings.Cut(tail, "\x1f")
 		if !ok {
-			return materializedPredKey{}, false
+			return MaterializedPredKey{}, false
 		}
 		op, err := strconv.Atoi(opStr)
 		if err != nil {
-			return materializedPredKey{}, false
+			return MaterializedPredKey{}, false
 		}
 		if rest == "" {
-			return materializedPredKey{}, false
+			return MaterializedPredKey{}, false
 		}
-		out := materializedPredKey{
+		out := MaterializedPredKey{
 			kind:  materializedPredKeyDistinctSet,
 			field: f,
 			op:    qir.Op(op),
@@ -490,7 +511,7 @@ func materializedPredKeyFromEncoded(key string) (materializedPredKey, bool) {
 		case '1':
 			out.flags |= materializedPredKeySetHasNil
 		default:
-			return materializedPredKey{}, false
+			return MaterializedPredKey{}, false
 		}
 		rest = rest[1:]
 		if len(rest) > 0 && rest[0] == '\x1f' {
@@ -498,43 +519,47 @@ func materializedPredKeyFromEncoded(key string) (materializedPredKey, bool) {
 		}
 		for rest != "" {
 			if int(out.setValueCnt) >= len(out.setTerms) {
-				return materializedPredKey{}, false
+				return MaterializedPredKey{}, false
 			}
 			if rest[0] != '\x1e' {
-				return materializedPredKey{}, false
+				return MaterializedPredKey{}, false
 			}
 			rest = rest[1:]
 			lenStr, next, ok := strings.Cut(rest, "\x1f")
 			if !ok {
-				return materializedPredKey{}, false
+				return MaterializedPredKey{}, false
 			}
 			n, err := strconv.Atoi(lenStr)
 			if err != nil || n < 0 || len(next) < n {
-				return materializedPredKey{}, false
+				return MaterializedPredKey{}, false
 			}
 			out.setTerms[out.setValueCnt] = next[:n]
 			out.setValueCnt++
 			rest = next[n:]
 		}
-		if int(out.setValueCnt)+btoi(out.flags&materializedPredKeySetHasNil != 0) < 2 {
-			return materializedPredKey{}, false
+		termCount := int(out.setValueCnt)
+		if out.flags&materializedPredKeySetHasNil != 0 {
+			termCount++
+		}
+		if termCount < 2 {
+			return MaterializedPredKey{}, false
 		}
 		return out, true
 
 	case "count_range_complement":
 		opStr, scalarKey, ok := strings.Cut(tail, "\x1f")
 		if !ok {
-			return materializedPredKey{}, false
+			return MaterializedPredKey{}, false
 		}
 		op, err := strconv.Atoi(opStr)
 		if err != nil {
-			return materializedPredKey{}, false
+			return MaterializedPredKey{}, false
 		}
 		if tag, val, ok := strings.Cut(scalarKey, "\x1f"); ok {
 			if tag != "n" || len(val) != 8 {
-				return materializedPredKey{}, false
+				return MaterializedPredKey{}, false
 			}
-			return materializedPredKey{
+			return MaterializedPredKey{
 				kind:     materializedPredKeyScalarComplement,
 				field:    f,
 				op:       qir.Op(op),
@@ -542,7 +567,7 @@ func materializedPredKeyFromEncoded(key string) (materializedPredKey, bool) {
 				flags:    materializedPredKeyScalarNumeric,
 			}, true
 		}
-		return materializedPredKey{
+		return MaterializedPredKey{
 			kind:  materializedPredKeyScalarComplement,
 			field: f,
 			op:    qir.Op(op),
@@ -558,29 +583,29 @@ func materializedPredKeyFromEncoded(key string) (materializedPredKey, bool) {
 	case "range_bucket":
 		startStr, endStr, ok := strings.Cut(tail, "\x1f")
 		if !ok {
-			return materializedPredKey{}, false
+			return MaterializedPredKey{}, false
 		}
 		startBucket, err := strconv.Atoi(startStr)
 		if err != nil {
-			return materializedPredKey{}, false
+			return MaterializedPredKey{}, false
 		}
 		endBucket, err := strconv.Atoi(endStr)
 		if err != nil {
-			return materializedPredKey{}, false
+			return MaterializedPredKey{}, false
 		}
-		out := materializedPredKeyForNumericBucketSpan(f, startBucket, endBucket)
-		return out, !out.isZero()
+		out := MaterializedPredKeyForNumericBucketSpan(f, startBucket, endBucket)
+		return out, !out.IsZero()
 
 	default:
 		op, err := strconv.Atoi(head)
 		if err != nil {
-			return materializedPredKey{}, false
+			return MaterializedPredKey{}, false
 		}
 		if tag, val, ok := strings.Cut(tail, "\x1f"); ok {
 			if tag != "n" || len(val) != 8 {
-				return materializedPredKey{}, false
+				return MaterializedPredKey{}, false
 			}
-			return materializedPredKey{
+			return MaterializedPredKey{
 				kind:     materializedPredKeyScalar,
 				field:    f,
 				op:       qir.Op(op),
@@ -588,11 +613,29 @@ func materializedPredKeyFromEncoded(key string) (materializedPredKey, bool) {
 				flags:    materializedPredKeyScalarNumeric,
 			}, true
 		}
-		return materializedPredKey{
+		return MaterializedPredKey{
 			kind:  materializedPredKeyScalar,
 			field: f,
 			op:    qir.Op(op),
 			key:   tail,
 		}, true
 	}
+}
+
+func MaterializedPredKeyFromOpaque(raw string) MaterializedPredKey {
+	if raw == "" {
+		return MaterializedPredKey{}
+	}
+	return MaterializedPredKey{
+		kind: materializedPredKeyOpaque,
+		raw:  raw,
+	}
+}
+
+func GetMaterializedPredKeySlice(capHint int) []MaterializedPredKey {
+	return materializedPredKeySlicePool.Get(capHint)
+}
+
+func ReleaseMaterializedPredKeySlice(s []MaterializedPredKey) {
+	materializedPredKeySlicePool.Put(s)
 }

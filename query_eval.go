@@ -364,7 +364,7 @@ func (qv *queryView) evalSimple(e qir.Expr) (postingResult, error) {
 			return postingResult{}, nil
 		}
 		cacheKey := qv.materializedPredKeyForScalar(fieldName, e.Op, v)
-		if !cacheKey.isZero() {
+		if !cacheKey.IsZero() {
 			if cached, ok := qv.snap.loadMaterializedPredKey(cacheKey); ok {
 				if cached.IsEmpty() {
 					return postingResult{}, nil

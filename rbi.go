@@ -19,6 +19,7 @@ import (
 	"github.com/vapstack/rbi/internal/keycodec"
 	"github.com/vapstack/rbi/internal/pooled"
 	"github.com/vapstack/rbi/internal/posting"
+	"github.com/vapstack/rbi/internal/qcache"
 	"github.com/vapstack/rbi/internal/schema"
 	"github.com/vapstack/rbi/internal/strmap"
 	"go.etcd.io/bbolt"
@@ -529,7 +530,7 @@ func newQueryEngineForRuntime(rt *schema.Runtime, options *Options, strKey bool,
 		schema:                         rt,
 		universe:                       posting.List{},
 		matPredCacheMaxEntries:         max(0, options.SnapshotMaterializedPredCacheMaxEntries),
-		matPredCacheMaxCard:            materializedPredCacheMaxCardinality(options.SnapshotMaterializedPredCacheMaxCardinality),
+		matPredCacheMaxCard:            qcache.MaterializedPredMaxCardinality(options.SnapshotMaterializedPredCacheMaxCardinality),
 		numericRangeBucketSize:         options.NumericRangeBucketSize,
 		numericRangeBucketMinFieldKeys: options.NumericRangeBucketMinFieldKeys,
 		numericRangeBucketMinSpanKeys:  options.NumericRangeBucketMinSpanKeys,

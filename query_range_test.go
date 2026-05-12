@@ -11,19 +11,19 @@ import (
 	"testing"
 
 	"github.com/vapstack/qx"
-	"github.com/vapstack/rbi/internal/posting"
+	"github.com/vapstack/rbi/internal/qcache"
 )
 
-func requireNumericRangeBucketCacheEntry(t *testing.T, snap *indexSnapshot, field string) *numericRangeBucketCacheEntry {
+func requireNumericRangeBucketCacheEntry(t *testing.T, snap *indexSnapshot, field string) *qcache.NumericRangeBucketEntry {
 	t.Helper()
 	if snap == nil || snap.numericRangeBucketCache == nil {
 		t.Fatalf("expected non-nil numeric range bucket cache for field %q", field)
 	}
-	e, ok := snap.numericRangeBucketCache.loadField(field)
+	e, ok := snap.numericRangeBucketCache.LoadField(field)
 	if !ok {
 		t.Fatalf("expected numeric range bucket cache entry for field %q", field)
 	}
-	if e == nil || e.idx.bucketSize <= 0 {
+	if e == nil || e.Index().BucketSize() <= 0 {
 		t.Fatalf("expected non-nil numeric range bucket index for field %q", field)
 	}
 	return e
@@ -64,47 +64,11 @@ func bitmapToIDs(t *testing.T, b postingResult) []uint64 {
 	return b.ids.ToArray()
 }
 
-func numericRangeFullSpanCacheEntryCount(entry *numericRangeBucketCacheEntry) int {
-	count := 0
-	for i := range entry.fullSpanCache {
-		if entry.fullSpanCache[i].used {
-			count++
-		}
-	}
-	return count
+func numericRangeFullSpanCacheEntryCount(entry *qcache.NumericRangeBucketEntry) int {
+	return entry.FullSpanEntryCount()
 }
 
-func TestNumericRangeBucketSpanCache_LoadExtendedFullSpan(t *testing.T) {
-	entry := numericRangeBucketCacheEntryPool.Get()
-	defer numericRangeBucketCacheEntryPool.Put(entry)
-	entry.refs.Store(1)
-
-	base := (posting.List{}).BuildAddedMany([]uint64{10, 20, 30, 40})
-	if _, ok := entry.tryStoreFullSpan(4, 10, base); !ok {
-		base.Release()
-		t.Fatalf("expected first full span store to succeed")
-	}
-
-	cachedSuffix, startSuffix, endSuffix, ok := entry.loadExtendedFullSpan(2, 10)
-	if !ok {
-		t.Fatalf("expected suffix extension hit")
-	}
-	if startSuffix != 4 || endSuffix != 10 {
-		t.Fatalf("unexpected suffix extension bounds: got=%d..%d want=4..10", startSuffix, endSuffix)
-	}
-	cachedSuffix.Release()
-
-	cachedPrefix, startPrefix, endPrefix, ok := entry.loadExtendedFullSpan(4, 12)
-	if !ok {
-		t.Fatalf("expected prefix extension hit")
-	}
-	if startPrefix != 4 || endPrefix != 10 {
-		t.Fatalf("unexpected prefix extension bounds: got=%d..%d want=4..10", startPrefix, endPrefix)
-	}
-	cachedPrefix.Release()
-}
-
-func warmNumericRangeBucketEntry(t *testing.T, db *DB[uint64, Rec], expr qx.Expr) (*numericRangeBucketCacheEntry, indexdata.OverlayRange) {
+func warmNumericRangeBucketEntry(t *testing.T, db *DB[uint64, Rec], expr qx.Expr) (*qcache.NumericRangeBucketEntry, indexdata.OverlayRange) {
 	t.Helper()
 
 	prepared, compiled, err := prepareTestExpr(db.engine, expr)
@@ -354,7 +318,7 @@ func TestEvalSimple_NumericRangeBuckets_WorkWithoutPredicateCacheWhenReuseEnable
 	got1.release()
 
 	entry := requireNumericRangeBucketCacheEntry(t, db.engine.getSnapshot(), "age")
-	if entry.storage.KeyCount() == 0 {
+	if entry.Storage().KeyCount() == 0 {
 		t.Fatalf("expected cached numeric range entry to point at live field storage")
 	}
 
@@ -394,7 +358,7 @@ func TestNumericRangeBucketCache_InheritsSafeEntriesAcrossSnapshotsWhenFieldInde
 		t.Fatalf("expected non-nil numeric range cache in initial snapshot")
 	}
 	storage1, ok := snap1.fieldIndexStorage("age")
-	if !ok || entry1.storage != storage1 {
+	if !ok || entry1.Storage() != storage1 {
 		t.Fatalf("expected cached numeric range entry to point at initial age storage")
 	}
 
@@ -411,7 +375,7 @@ func TestNumericRangeBucketCache_InheritsSafeEntriesAcrossSnapshotsWhenFieldInde
 	}
 	entry2 := requireNumericRangeBucketCacheEntry(t, snap2, "age")
 	storage2, ok := snap2.fieldIndexStorage("age")
-	if !ok || entry2.storage != storage2 {
+	if !ok || entry2.Storage() != storage2 {
 		t.Fatalf("expected inherited numeric range entry to point at current age storage")
 	}
 	if storage2 != storage1 {
@@ -440,7 +404,7 @@ func TestNumericRangeBucketCache_DropsChangedFieldEntryAcrossSnapshots(t *testin
 
 	snap1 := db.engine.getSnapshot()
 	storage1, ok := snap1.fieldIndexStorage("age")
-	if !ok || entry1.storage != storage1 {
+	if !ok || entry1.Storage() != storage1 {
 		t.Fatalf("expected cached numeric range entry to point at original age storage")
 	}
 
@@ -455,7 +419,7 @@ func TestNumericRangeBucketCache_DropsChangedFieldEntryAcrossSnapshots(t *testin
 	if snap2.numericRangeBucketCache == snap1.numericRangeBucketCache {
 		t.Fatalf("expected changed-field snapshot to use a distinct numeric range cache")
 	}
-	if _, ok := snap2.numericRangeBucketCache.loadField("age"); ok {
+	if _, ok := snap2.numericRangeBucketCache.LoadField("age"); ok {
 		t.Fatalf("expected changed numeric field cache entry to be dropped on inherited snapshot")
 	}
 
@@ -464,7 +428,7 @@ func TestNumericRangeBucketCache_DropsChangedFieldEntryAcrossSnapshots(t *testin
 	snap3 := db.engine.getSnapshot()
 	entry3 := requireNumericRangeBucketCacheEntry(t, snap3, "age")
 	storage3, ok := snap3.fieldIndexStorage("age")
-	if !ok || entry3.storage != storage3 {
+	if !ok || entry3.Storage() != storage3 {
 		t.Fatalf("expected rebuilt numeric range entry to point at current age storage")
 	}
 	if storage3 == storage1 {
@@ -520,11 +484,11 @@ func TestNumericRangeBucketSpanCache_ReusedForNearbyBounds(t *testing.T) {
 	out1.release()
 
 	entry := requireNumericRangeBucketCacheEntry(t, snap, "age")
-	start1, end1, ok := entry.idx.fullBucketSpan(br1)
+	start1, end1, ok := entry.Index().FullBucketSpan(br1)
 	if !ok {
 		t.Fatalf("expected full bucket span for first bound")
 	}
-	cached1, ok := entry.loadFullSpan(start1, end1)
+	cached1, ok := entry.LoadFullSpan(start1, end1)
 	if !ok || cached1.IsEmpty() {
 		t.Fatalf("expected local cached full bucket span after first evaluation")
 	}
@@ -532,7 +496,7 @@ func TestNumericRangeBucketSpanCache_ReusedForNearbyBounds(t *testing.T) {
 	countAfterFirst := numericRangeFullSpanCacheEntryCount(entry)
 
 	br2 := makeRange(2501)
-	start2, end2, ok := entry.idx.fullBucketSpan(br2)
+	start2, end2, ok := entry.Index().FullBucketSpan(br2)
 	if !ok {
 		t.Fatalf("expected full bucket span for second bound")
 	}
@@ -598,18 +562,18 @@ func TestNumericRangeBucketSpanCache_ReusedFullSpanStillMergesEdgeBuckets(t *tes
 	out1.release()
 
 	entry := requireNumericRangeBucketCacheEntry(t, snap, "age")
-	start1, end1, ok := entry.idx.fullBucketSpan(br1)
+	start1, end1, ok := entry.Index().FullBucketSpan(br1)
 	if !ok {
 		t.Fatalf("expected full bucket span for first bound")
 	}
-	cached, ok := entry.loadFullSpan(start1, end1)
+	cached, ok := entry.LoadFullSpan(start1, end1)
 	if !ok || cached.IsEmpty() {
 		t.Fatalf("expected local cached full bucket span after first evaluation")
 	}
 	cached.Release()
 
 	br2 := makeRange(2501)
-	start2, end2, ok := entry.idx.fullBucketSpan(br2)
+	start2, end2, ok := entry.Index().FullBucketSpan(br2)
 	if !ok {
 		t.Fatalf("expected full bucket span for second bound")
 	}
@@ -693,13 +657,13 @@ func TestNumericRangeBucketSpanCache_ExtendedSuffixSpanStillMatchesRange(t *test
 	outNarrow.release()
 
 	entry := requireNumericRangeBucketCacheEntry(t, snap, "age")
-	startNarrow, endNarrow, ok := entry.idx.fullBucketSpan(brNarrow)
+	startNarrow, endNarrow, ok := entry.Index().FullBucketSpan(brNarrow)
 	if !ok {
 		t.Fatalf("expected full bucket span for narrow bound")
 	}
 
 	brWide := makeRange(2000)
-	startWide, endWide, ok := entry.idx.fullBucketSpan(brWide)
+	startWide, endWide, ok := entry.Index().FullBucketSpan(brWide)
 	if !ok {
 		t.Fatalf("expected full bucket span for wide bound")
 	}
@@ -758,11 +722,11 @@ func TestNumericRangeBucketSpanCache_PredicateReleaseKeepsSharedPosting_Base(t *
 		}
 	})
 
-	start, end, ok := entry.idx.fullBucketSpan(br)
+	start, end, ok := entry.Index().FullBucketSpan(br)
 	if !ok {
 		t.Fatal("expected full bucket span")
 	}
-	cachedBefore, ok := entry.loadFullSpan(start, end)
+	cachedBefore, ok := entry.LoadFullSpan(start, end)
 	if !ok || cachedBefore.IsEmpty() {
 		t.Fatal("expected cached full-span posting after predicate build")
 	}
@@ -770,7 +734,7 @@ func TestNumericRangeBucketSpanCache_PredicateReleaseKeepsSharedPosting_Base(t *
 	releasePredicates([]predicate{pred})
 	released = true
 
-	cachedAfter, ok := entry.loadFullSpan(start, end)
+	cachedAfter, ok := entry.LoadFullSpan(start, end)
 	if !ok || cachedAfter.IsEmpty() {
 		t.Fatal("expected cached full-span posting to survive predicate cleanup")
 	}
@@ -819,11 +783,11 @@ func TestNumericRangeBucketSpanCache_PredicateReleaseKeepsSharedPosting_AfterPat
 		}
 	})
 
-	start, end, ok := entry.idx.fullBucketSpan(br)
+	start, end, ok := entry.Index().FullBucketSpan(br)
 	if !ok {
 		t.Fatal("expected full bucket span")
 	}
-	cachedBefore, ok := entry.loadFullSpan(start, end)
+	cachedBefore, ok := entry.LoadFullSpan(start, end)
 	if !ok || cachedBefore.IsEmpty() {
 		t.Fatal("expected cached full-span posting after predicate build")
 	}
@@ -831,7 +795,7 @@ func TestNumericRangeBucketSpanCache_PredicateReleaseKeepsSharedPosting_AfterPat
 	releasePredicates([]predicate{pred})
 	released = true
 
-	cachedAfter, ok := entry.loadFullSpan(start, end)
+	cachedAfter, ok := entry.LoadFullSpan(start, end)
 	if !ok || cachedAfter.IsEmpty() {
 		t.Fatal("expected cached full-span posting to survive predicate cleanup")
 	}
@@ -887,11 +851,11 @@ func TestNumericRangeBucketSpanCache_RespectsCardinalityGuard(t *testing.T) {
 	out.release()
 
 	entry := requireNumericRangeBucketCacheEntry(t, snap, "age")
-	start, end, ok := entry.idx.fullBucketSpan(br)
+	start, end, ok := entry.Index().FullBucketSpan(br)
 	if !ok {
 		t.Fatal("expected full bucket span")
 	}
-	if cached, ok := entry.loadFullSpan(start, end); ok && !cached.IsEmpty() {
+	if cached, ok := entry.LoadFullSpan(start, end); ok && !cached.IsEmpty() {
 		t.Fatal("expected oversized full-span posting to be rejected by cache guard")
 	}
 }
@@ -1025,7 +989,7 @@ func TestMaterializeOrderBasicLimitComplementBaseOp_AllocsPerRunStayZeroAfterWar
 	qv := db.engine.currentQueryViewForTests()
 	op := mustTestQIRExprForDB(t, db, qx.GTE("age", 2_500))
 	stats, ok := qv.orderBasicRawBaseOpStats(op, qv.snapshotUniverseCardinality())
-	if !ok || stats.cacheKey.isZero() || !stats.buildComplement {
+	if !ok || stats.cacheKey.IsZero() || !stats.buildComplement {
 		t.Fatalf("expected complement materialization stats for %v", op)
 	}
 

@@ -183,10 +183,10 @@ func warmBenchReadHotSteady[K ~string | ~uint64, V any](
 		return
 	}
 	stable := 0
-	prevCount := db.engine.getSnapshot().matPredCacheCount.Load()
+	prevCount := db.engine.getSnapshot().matPredCache.EntryCount()
 	for i := 0; i < benchHotWarmMaxCycles; i++ {
 		run(b, db, q)
-		count := db.engine.getSnapshot().matPredCacheCount.Load()
+		count := db.engine.getSnapshot().matPredCache.EntryCount()
 		if count == prevCount {
 			stable++
 			if stable >= benchHotWarmStableCycles {
@@ -458,7 +458,7 @@ func TestBenchMode_ColdFreshPublishesAndClearsNewSnapshotCaches(t *testing.T) {
 		t.Fatalf("warm QueryKeys: %v", err)
 	}
 	oldSnap := db.engine.getSnapshot()
-	if oldSnap.matPredCacheCount.Load() == 0 {
+	if oldSnap.matPredCache.EntryCount() == 0 {
 		t.Fatalf("expected warm snapshot to populate materialized predicate cache")
 	}
 	heldSnap, heldRef, ok := db.engine.snapshot.pinRefBySeq(oldSnap.seq)
@@ -478,10 +478,10 @@ func TestBenchMode_ColdFreshPublishesAndClearsNewSnapshotCaches(t *testing.T) {
 	if newSnap == oldSnap || newSnap.seq == oldSnap.seq {
 		t.Fatalf("expected ColdFresh to publish a new snapshot")
 	}
-	if newSnap.matPredCacheCount.Load() != 0 {
-		t.Fatalf("expected ColdFresh to clear new snapshot caches, got=%d", newSnap.matPredCacheCount.Load())
+	if newSnap.matPredCache.EntryCount() != 0 {
+		t.Fatalf("expected ColdFresh to clear new snapshot caches, got=%d", newSnap.matPredCache.EntryCount())
 	}
-	if oldSnap.matPredCacheCount.Load() == 0 {
+	if oldSnap.matPredCache.EntryCount() == 0 {
 		t.Fatalf("expected old snapshot caches to remain intact")
 	}
 }

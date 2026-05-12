@@ -1081,7 +1081,7 @@ func TestBuildORBranches_BroadNumericRangeStaysRuntimeOnSecondBuild(t *testing.T
 	}
 	checkRangePred(branches)
 	branches.Release()
-	if got := db.engine.getSnapshot().matPredCacheCount.Load(); got != 0 {
+	if got := db.engine.getSnapshot().matPredCache.EntryCount(); got != 0 {
 		t.Fatalf("unexpected shared materialized predicate cache entry after first build: %d", got)
 	}
 
@@ -1094,7 +1094,7 @@ func TestBuildORBranches_BroadNumericRangeStaysRuntimeOnSecondBuild(t *testing.T
 		t.Fatalf("unexpected alwaysFalse on second build")
 	}
 	checkRangePred(branches)
-	if got := db.engine.getSnapshot().matPredCacheCount.Load(); got != 0 {
+	if got := db.engine.getSnapshot().matPredCache.EntryCount(); got != 0 {
 		t.Fatalf("unexpected shared materialized predicate cache entry after second build: %d", got)
 	}
 }
@@ -1183,7 +1183,7 @@ func TestPlannerORNoOrder_BroadResidualRangePromotesRouteAware(t *testing.T) {
 	checkScorePred(branches, predicateKindMaterializedNot)
 	branches.Release()
 
-	if got := db.engine.getSnapshot().matPredCacheCount.Load(); got == 0 {
+	if got := db.engine.getSnapshot().matPredCache.EntryCount(); got == 0 {
 		t.Fatalf("expected route-aware residual materialization to populate shared cache")
 	}
 }
@@ -1792,7 +1792,7 @@ func TestPlannerOROrder_RepeatedExecutionPromotesMaterializedRange(t *testing.T)
 	).Sort("score", qx.DESC).Limit(240)
 
 	db.clearCurrentSnapshotCachesForTesting()
-	if got := db.engine.getSnapshot().matPredCacheCount.Load(); got != 0 {
+	if got := db.engine.getSnapshot().matPredCache.EntryCount(); got != 0 {
 		t.Fatalf("unexpected materialized predicate cache before ordered OR execution: %d", got)
 	}
 
@@ -1806,7 +1806,7 @@ func TestPlannerOROrder_RepeatedExecutionPromotesMaterializedRange(t *testing.T)
 		}
 	}
 
-	if got := db.engine.getSnapshot().matPredCacheCount.Load(); got == 0 {
+	if got := db.engine.getSnapshot().matPredCache.EntryCount(); got == 0 {
 		t.Fatalf("expected repeated ordered OR execution to promote materialized predicate")
 	}
 }
@@ -1838,7 +1838,7 @@ func TestPlannerOROrderKWay_RepeatedExecutionPromotesExactOnlyMaterializedRange(
 	).Sort("score", qx.DESC).Limit(96)
 
 	db.clearCurrentSnapshotCachesForTesting()
-	if got := db.engine.getSnapshot().matPredCacheCount.Load(); got != 0 {
+	if got := db.engine.getSnapshot().matPredCache.EntryCount(); got != 0 {
 		t.Fatalf("unexpected materialized predicate cache before ordered OR k-way execution: %d", got)
 	}
 
@@ -1907,7 +1907,7 @@ func TestPlannerOROrderKWay_RepeatedExecutionPromotesExactOnlyMaterializedRange(
 		}
 	}
 
-	if got := db.engine.getSnapshot().matPredCacheCount.Load(); got == 0 {
+	if got := db.engine.getSnapshot().matPredCache.EntryCount(); got == 0 {
 		t.Fatalf("expected repeated ordered OR k-way execution to promote exact-only materialized predicate")
 	}
 }

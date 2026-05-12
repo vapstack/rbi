@@ -11,6 +11,7 @@ import (
 	"github.com/vapstack/rbi/internal/indexdata"
 	"github.com/vapstack/rbi/internal/pooled"
 	"github.com/vapstack/rbi/internal/posting"
+	"github.com/vapstack/rbi/internal/qcache"
 	"github.com/vapstack/rbi/internal/qir"
 )
 
@@ -1219,7 +1220,7 @@ func TestQuery_OrderBasic_RangeBaseOpsMaterializeBroadComplementWithoutExactSibl
 		t.Fatalf("Patch(age): %v", err)
 	}
 
-	if got := db.engine.getSnapshot().matPredCacheCount.Load(); got != 0 {
+	if got := db.engine.getSnapshot().matPredCache.EntryCount(); got != 0 {
 		t.Fatalf("unexpected materialized predicate cache before query: %d", got)
 	}
 
@@ -1238,7 +1239,7 @@ func TestQuery_OrderBasic_RangeBaseOpsMaterializeBroadComplementWithoutExactSibl
 	assertSameSlice(t, got, want)
 
 	after := db.engine.getSnapshot()
-	if got := after.matPredCacheCount.Load(); got == 0 {
+	if got := after.matPredCache.EntryCount(); got == 0 {
 		t.Fatalf("expected ordered predicate path to materialize broad complement, cache entries=%d", got)
 	}
 }
@@ -1268,7 +1269,7 @@ func TestQuery_OrderBasic_SmallAndDeepWindowMaterializeNonOrderNumericRangeWhenC
 	if _, err := db.QueryKeys(small); err != nil {
 		t.Fatalf("small QueryKeys: %v", err)
 	}
-	if got := db.engine.getSnapshot().matPredCacheCount.Load(); got == 0 {
+	if got := db.engine.getSnapshot().matPredCache.EntryCount(); got == 0 {
 		t.Fatalf("expected materialized predicate cache for small ordered window: %d", got)
 	}
 
@@ -1285,7 +1286,7 @@ func TestQuery_OrderBasic_SmallAndDeepWindowMaterializeNonOrderNumericRangeWhenC
 	}
 	assertSameSlice(t, got, want)
 
-	if got := db.engine.getSnapshot().matPredCacheCount.Load(); got == 0 {
+	if got := db.engine.getSnapshot().matPredCache.EntryCount(); got == 0 {
 		t.Fatalf("expected deep ordered window to keep materialized numeric range predicate")
 	}
 }
@@ -1890,11 +1891,11 @@ func TestQuery_OrderBasic_WarmQueryPromotesMaterializedRangeBaseOps(t *testing.T
 		var missing []string
 		for _, op := range baseOps {
 			stats, ok := view.orderBasicRawBaseOpStats(op, view.snapshotUniverseCardinality())
-			cacheKey := materializedPredKey{}
+			cacheKey := qcache.MaterializedPredKey{}
 			if ok {
 				cacheKey = stats.cacheKey
 			}
-			if cacheKey.isZero() {
+			if cacheKey.IsZero() {
 				missing = append(missing, fmt.Sprintf("%s:%v=<no-key>", testExprFieldName(db.engine, op), op.Op))
 				continue
 			}
@@ -1904,7 +1905,7 @@ func TestQuery_OrderBasic_WarmQueryPromotesMaterializedRangeBaseOps(t *testing.T
 		}
 		t.Fatalf("expected warm ordered query to promote materialized range base ops, missing=%v", missing)
 	}
-	exactKey := materializedPredKeyForExactScalarRange(collapsed.collapsed.field, collapsed.collapsed.bounds).String()
+	exactKey := qcache.MaterializedPredKeyForExactScalarRange(collapsed.collapsed.field, collapsed.collapsed.bounds).String()
 	if exactKey == "" {
 		t.Fatalf("expected collapsed exact range cache key")
 	}
