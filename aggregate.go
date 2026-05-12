@@ -132,6 +132,24 @@ func (db *DB[K, V]) Aggregate(q *qx.QX) (Result, error) {
 	view := db.engine.makeQueryView(snap)
 	defer db.engine.releaseQueryView(view)
 
+	if len(prepared.groups) == 0 && len(prepared.metrics) == 1 && prepared.metrics[0].rowCount {
+		viewQ := qir.NewShape(prepared.filter)
+		count, err := view.aggregateCount(&viewQ, true)
+		if err != nil {
+			return Result{}, err
+		}
+		result := Result{
+			Layout: []string{prepared.metrics[0].out},
+			Rows: []Row{{
+				Value{num: count, any: ValueKindUint},
+			}},
+		}
+		if prepared.hasHaving {
+			result = applyAggregateHaving(result, prepared.having)
+		}
+		return applyAggregateWindow(result, prepared.offset, prepared.limit), nil
+	}
+
 	ids, err := view.aggregateMatchedIDs(prepared.filter)
 	if err != nil {
 		return Result{}, err

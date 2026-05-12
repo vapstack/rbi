@@ -3225,9 +3225,9 @@ func TestQuery_Metamorphic_RandomizedProfiles_RouteEquivalence(t *testing.T) {
 					)
 				}
 
-				preparedCount, err := db.engine.countPreparedExpr(normalizeQueryForTest(q).Filter)
+				preparedCount, err := db.engine.aggregateCountPreparedExpr(normalizeQueryForTest(q).Filter)
 				if err != nil {
-					t.Fatalf("countPreparedExpr(profile=%s i=%d): %v\nq=%+v", p.name, i, err, q)
+					t.Fatalf("aggregateCountPreparedExpr(profile=%s i=%d): %v\nq=%+v", p.name, i, err, q)
 				}
 				if preparedCount != wantCount {
 					t.Fatalf(
@@ -3597,9 +3597,9 @@ func TestQuery_RouteEquivalence_PreparedExecutionPlanner_BaseAndMutated(t *testi
 			}
 
 			if q.Window.Limit == 0 && q.Window.Offset == 0 {
-				cnt, err := db.engine.countPreparedExpr(nq.Filter)
+				cnt, err := db.engine.aggregateCountPreparedExpr(nq.Filter)
 				if err != nil {
-					t.Fatalf("%s q%d countPreparedExpr: %v", label, i, err)
+					t.Fatalf("%s q%d aggregateCountPreparedExpr: %v", label, i, err)
 				}
 				if cnt != uint64(len(ref)) {
 					t.Fatalf("%s q%d count mismatch on prepared route: got=%d want=%d", label, i, cnt, len(ref))

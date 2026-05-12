@@ -221,12 +221,12 @@ func (c queryContract[K]) assertPreparedCountMatchesReference(q *qx.QX, ref *que
 
 	nq := normalizeQueryForTest(q)
 	want := ref.count(c, q)
-	got, err := c.db.engine.countPreparedExpr(nq.Filter)
+	got, err := c.db.engine.aggregateCountPreparedExpr(nq.Filter)
 	if err != nil {
-		c.t.Fatalf("countPreparedExpr(%+v): %v", nq.Filter, err)
+		c.t.Fatalf("aggregateCountPreparedExpr(%+v): %v", nq.Filter, err)
 	}
 	if got != want {
-		c.t.Fatalf("countPreparedExpr mismatch:\nq=%+v\ngot=%d\nwant=%d", nq, got, want)
+		c.t.Fatalf("aggregateCountPreparedExpr mismatch:\nq=%+v\ngot=%d\nwant=%d", nq, got, want)
 	}
 	return got
 }

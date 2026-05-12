@@ -282,6 +282,12 @@ func Benchmark_Query_Index_Count_Simple_HASANY_Count(b *testing.B) {
 	runCountBench(b, db, q)
 }
 
+func Benchmark_Query_Index_Count_Simple_HASALL_Count(b *testing.B) {
+	db := buildBenchDB(b, benchN)
+	q := qx.Query(qx.HASALL("tags", []string{"go", "db"}))
+	runCountBench(b, db, q)
+}
+
 func Benchmark_Query_Index_Count_Simple_NOTIN_Count(b *testing.B) {
 	db := buildBenchDB(b, benchN)
 	q := qx.Query(qx.NOTIN("status", []string{"banned"}))

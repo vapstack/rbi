@@ -5692,7 +5692,7 @@ func (qv *queryView) planOROrderMergeBranchLimit(branch plannerORBranch, need in
 	}
 
 	var cnt uint64
-	cnt, err = qv.countPreparedExpr(branch.expr)
+	cnt, err = qv.aggregateCountPreparedExpr(branch.expr)
 	if err != nil {
 		return 0, false, err
 	}

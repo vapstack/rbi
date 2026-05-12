@@ -25,6 +25,11 @@ const countPredBroadRangeComplementFastAvgPerBucketMax = 8
 const countPredLeadResidualHasAnyExactMaxTerms = 4
 const countPredLeadResidualHasAnyExactMinCard = 65_536
 
+var countORMaterializedRouteKeys = [4]materializedPredKey{
+	2: {kind: materializedPredKeyOpaque, raw: "count_or_materialized_2"},
+	3: {kind: materializedPredKeyOpaque, raw: "count_or_materialized_3"},
+}
+
 // Count evaluates the given filter predicates and returns the number of matching records.
 // Zero predicates mean match-all.
 func (db *DB[K, V]) Count(exprs ...qx.Expr) (uint64, error) {
@@ -57,59 +62,90 @@ func (db *DB[K, V]) Count(exprs ...qx.Expr) (uint64, error) {
 
 	view := db.engine.makeQueryView(snap)
 	defer db.engine.releaseQueryView(view)
-	return view.countInternal(&viewQ, true)
+	return view.aggregateCount(&viewQ, true)
 }
 
-func countInternalFinishTrace(trace *queryTrace, out uint64, err error) (uint64, error) {
+func aggregateCountFinishTrace(trace *queryTrace, out uint64, err error) (uint64, error) {
 	if trace != nil {
 		trace.finish(out, err)
 	}
 	return out, err
 }
 
-func (qv *queryView) countInternal(q *qir.Shape, emitTrace bool) (uint64, error) {
-	if q == nil {
-		return qv.snapshotUniverseCardinality(), nil
-	}
-
-	traceEnabled := emitTrace && qv.engine.traceOrCalibrationSamplingEnabled()
-	if !traceEnabled && q.Expr.FieldOrdinal >= 0 && len(q.Expr.Operands) == 0 && q.Expr.Op != qir.OpNOOP {
-		if out, ok, err := qv.tryCountByScalarLookup(q.Expr, nil); ok || err != nil {
-			return out, err
-		}
-		if out, ok, err := qv.tryCountBySliceLookup(q.Expr, nil); ok || err != nil {
-			return out, err
-		}
-	}
-
+func (qv *queryView) aggregateCount(q *qir.Shape, emitTrace bool) (uint64, error) {
 	expr := q.Expr
+	traceEnabled := emitTrace && qv.engine.traceOrCalibrationSamplingEnabled()
+	if !traceEnabled {
+		if expr.Op == qir.OpNOOP {
+			if expr.Not {
+				return 0, nil
+			}
+			return qv.snapshotUniverseCardinality(), nil
+		}
+		if expr.FieldOrdinal >= 0 && len(expr.Operands) == 0 {
+			if out, ok, err := qv.tryCountByScalarLookup(expr, nil); ok || err != nil {
+				return out, err
+			}
+			if out, ok, err := qv.tryCountBySliceLookup(expr, nil); ok || err != nil {
+				return out, err
+			}
+		}
+	}
+
 	var trace *queryTrace
 	if traceEnabled {
 		trace = qv.engine.beginTrace(q.WithExpr(expr))
 	}
 
-	if out, ok, err := qv.tryCountByUniqueEq(expr, trace); ok || err != nil {
-		return countInternalFinishTrace(trace, out, err)
-	}
-	if out, ok, err := qv.tryCountByScalarLookup(expr, trace); ok || err != nil {
-		return countInternalFinishTrace(trace, out, err)
-	}
-	if out, ok, err := qv.tryCountBySliceLookup(expr, trace); ok || err != nil {
-		return countInternalFinishTrace(trace, out, err)
-	}
-	if out, ok, err := qv.tryCountByScalarInSplit(expr, trace); ok || err != nil {
-		return countInternalFinishTrace(trace, out, err)
-	}
-	if out, ok, err := qv.tryCountByPredicates(expr, trace); ok || err != nil {
-		return countInternalFinishTrace(trace, out, err)
-	}
-	if out, ok, err := qv.tryCountORByPredicates(expr, trace); ok || err != nil {
-		return countInternalFinishTrace(trace, out, err)
+	if expr.Op == qir.OpNOOP {
+		out := qv.snapshotUniverseCardinality()
+		if expr.Not {
+			out = 0
+		}
+		if trace != nil {
+			trace.setPlan(PlanCountMaterialized)
+			if !expr.Not {
+				trace.addExamined(out)
+			}
+		}
+		return aggregateCountFinishTrace(trace, out, nil)
 	}
 
+	if out, ok, err := qv.tryCountByUniqueEq(expr, trace); ok || err != nil {
+		return aggregateCountFinishTrace(trace, out, err)
+	}
+	if out, ok, err := qv.tryCountByScalarLookup(expr, trace); ok || err != nil {
+		return aggregateCountFinishTrace(trace, out, err)
+	}
+	if out, ok, err := qv.tryCountBySliceLookup(expr, trace); ok || err != nil {
+		return aggregateCountFinishTrace(trace, out, err)
+	}
+	if out, ok, err := qv.tryCountByScalarInSplit(expr, trace); ok || err != nil {
+		return aggregateCountFinishTrace(trace, out, err)
+	}
+	if shouldTryMaterializedCountAND(expr) {
+		if out, ok, err := qv.tryCountPreparedAndReordered(expr); ok || err != nil {
+			if trace != nil && ok {
+				trace.setPlan(PlanCountMaterialized)
+			}
+			return aggregateCountFinishTrace(trace, out, err)
+		}
+	}
+	if out, ok, err := qv.tryCountByPredicates(expr, trace); ok || err != nil {
+		return aggregateCountFinishTrace(trace, out, err)
+	}
+	if out, ok, err := qv.tryCountORByPredicates(expr, trace); ok || err != nil {
+		return aggregateCountFinishTrace(trace, out, err)
+	}
+
+	out, err := qv.countByMaterializedExpr(expr, trace)
+	return aggregateCountFinishTrace(trace, out, err)
+}
+
+func (qv *queryView) countByMaterializedExpr(expr qir.Expr, trace *queryTrace) (uint64, error) {
 	b, err := qv.evalExpr(expr)
 	if err != nil {
-		return countInternalFinishTrace(trace, 0, err)
+		return 0, err
 	}
 	defer b.release()
 
@@ -122,7 +158,7 @@ func (qv *queryView) countInternal(q *qir.Shape, emitTrace bool) (uint64, error)
 		}
 	}
 
-	return countInternalFinishTrace(trace, qv.countPostingResult(b), nil)
+	return qv.countPostingResult(b), nil
 }
 
 func (qv *queryView) tryCountByScalarLookup(expr qir.Expr, trace *queryTrace) (uint64, bool, error) {
@@ -1268,6 +1304,39 @@ func shouldPreferMaterializedCountEval(preds predicateReader, leadScore, univers
 		}
 	}
 	return materializedPositive > 0
+}
+
+func shouldTryMaterializedCountAND(expr qir.Expr) bool {
+	if expr.Not || expr.Op != qir.OpAND || len(expr.Operands) < 2 {
+		return false
+	}
+
+	var leavesBuf [countPredicateScanMaxLeaves]qir.Expr
+	leaves, ok := collectAndLeavesModeScratch(expr, leavesBuf[:0], andLeafModeCollect)
+	if !ok || len(leaves) < 2 || len(leaves) > countPredicateScanMaxLeaves {
+		return false
+	}
+
+	hasSet := false
+	hasRange := false
+	for i := range leaves {
+		e := leaves[i]
+		if e.Op == qir.OpSUFFIX || e.Op == qir.OpCONTAINS {
+			return false
+		}
+		if e.Not {
+			continue
+		}
+		switch e.Op {
+		case qir.OpHASANY, qir.OpHASALL:
+			hasSet = true
+		default:
+			if isNumericRangeOp(e.Op) {
+				hasRange = true
+			}
+		}
+	}
+	return hasSet && hasRange
 }
 
 func countBroadLeadResidualScoreLimit(leadEst, universe uint64) uint64 {
@@ -2613,10 +2682,10 @@ func (qv *queryView) tryCountByPredicates(expr qir.Expr, trace *queryTrace) (uin
 	if !ok {
 		return 0, false, nil
 	}
-	defer predSet.Release()
 
 	universe := qv.snapshotUniverseCardinality()
 	if universe == 0 {
+		predSet.Release()
 		return 0, true, nil
 	}
 
@@ -2624,16 +2693,21 @@ func (qv *queryView) tryCountByPredicates(expr qir.Expr, trace *queryTrace) (uin
 	// HASANY unions are better left to postingResult fallback than to posts_union scans.
 	for i := 0; i < predSet.Len(); i++ {
 		if predSet.Get(i).alwaysFalse {
+			predSet.Release()
 			return 0, true, nil
 		}
 	}
 	leadIdx, leadEst, leadScore := qv.pickCountLeadPredicate(predSet, universe)
 	if leadIdx < 0 {
+		predSet.Release()
 		return 0, false, nil
 	}
 	if shouldPreferMaterializedCountEval(predSet, leadScore, universe) {
-		return 0, false, nil
+		predSet.Release()
+		out, err := qv.countByMaterializedExpr(expr, trace)
+		return out, true, err
 	}
+	defer predSet.Release()
 	if err := qv.prepareCountPredicateWithTrace(predSet.GetPtr(leadIdx), leadEst, universe, trace); err != nil {
 		return 0, true, err
 	}
@@ -2669,7 +2743,8 @@ func (qv *queryView) tryCountByPredicates(expr qir.Expr, trace *queryTrace) (uin
 	// model as lead picking instead of a fixed active-count gate so cheap
 	// materialized/exact-filter residuals can still stay on the count fast path.
 	if !predSet.GetPtr(leadIdx).isMaterializedLike() && qv.shouldRejectBroadLeadPredicateScan(predSet, active, leadEst, universe) {
-		return 0, false, nil
+		out, err := qv.countByMaterializedExpr(expr, trace)
+		return out, true, err
 	}
 	for _, pi := range active {
 		if err := qv.prepareCountPredicateWithTrace(predSet.GetPtr(pi), leadEst, universe, trace); err != nil {
@@ -3201,6 +3276,41 @@ func shouldTryCountORByPredicates(expr qir.Expr) bool {
 	return true
 }
 
+func (qv *queryView) shouldPreferMaterializedCountOR(expr qir.Expr) bool {
+	n := len(expr.Operands)
+	if n < 2 || n > 3 {
+		return false
+	}
+	for _, op := range expr.Operands {
+		if countORBranchHasExpensiveMaterialization(op) {
+			return false
+		}
+	}
+	return qv.snap.shouldPromoteRuntimeMaterializedPredKey(countORMaterializedRouteKeys[n])
+}
+
+func countORBranchHasExpensiveMaterialization(expr qir.Expr) bool {
+	switch expr.Op {
+	case qir.OpAND, qir.OpOR:
+		if expr.Not {
+			return true
+		}
+		if len(expr.Operands) == 0 {
+			return true
+		}
+		for _, op := range expr.Operands {
+			if countORBranchHasExpensiveMaterialization(op) {
+				return true
+			}
+		}
+		return false
+	case qir.OpSUFFIX, qir.OpCONTAINS:
+		return true
+	default:
+		return len(expr.Operands) != 0
+	}
+}
+
 func countORPredicateBranchLimit(universe uint64) int {
 	limit := countORPredicateMaxBranchesBase
 	switch {
@@ -3529,9 +3639,14 @@ func (qv *queryView) tryCountORByPredicates(expr qir.Expr, trace *queryTrace) (u
 	if uc == 0 {
 		return 0, true, nil
 	}
+	if qv.shouldPreferMaterializedCountOR(expr) {
+		out, err := qv.countByMaterializedExpr(expr, trace)
+		return out, true, err
+	}
 	branchCount := len(expr.Operands)
 	if branchCount > countORPredicateBranchLimit(uc) {
-		return 0, false, nil
+		out, err := qv.countByMaterializedExpr(expr, trace)
+		return out, true, err
 	}
 	strictWide := branchCount > 3
 	fullTrace := trace.full()
@@ -3794,7 +3909,8 @@ branchLoop:
 	}
 	useMaterializedSpill := len(materializedBranches) > 0
 	if useMaterializedSpill && !shouldTryCountORHybridMaterializedSpill(branchCount, branchesBuf.Len(), len(materializedBranches), expectedProbes, materializedBranchEst, uc) {
-		return 0, false, nil
+		out, err := qv.countByMaterializedExpr(expr, trace)
+		return out, true, err
 	}
 
 	// Guardrail: skip this path when projected probe volume approaches a broad
@@ -3804,7 +3920,8 @@ branchLoop:
 		limit = uc
 	}
 	if !useMaterializedSpill && expectedProbes > limit {
-		return 0, false, nil
+		out, err := qv.countByMaterializedExpr(expr, trace)
+		return out, true, err
 	}
 
 	useSeenDedup := useMaterializedSpill || countORBranchesShouldUseSeenDedupBuf(branchesBuf, uc, expectedProbes)
@@ -3914,7 +4031,7 @@ branchLoop:
 	return cnt, true, nil
 }
 
-func (qv *queryView) countPreparedExpr(expr qir.Expr) (uint64, error) {
+func (qv *queryView) aggregateCountPreparedExpr(expr qir.Expr) (uint64, error) {
 	if cnt, ok, err := qv.tryCountPreparedAndReordered(expr); ok || err != nil {
 		return cnt, err
 	}

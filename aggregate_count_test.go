@@ -154,6 +154,392 @@ func TestCount_SimpleScalarLeaf_TraceUsesScalarLookupPlan(t *testing.T) {
 	}
 }
 
+func TestAggregateRowCount_TraceUsesAggregateCountRoute(t *testing.T) {
+	var events []TraceEvent
+	opts := Options{
+		TraceSink: func(ev TraceEvent) {
+			events = append(events, ev)
+		},
+		TraceSampleEvery: 1,
+	}
+	db, _ := openTempDBUint64(t, opts)
+
+	if err := db.Set(1, &Rec{Name: "a", Age: 20, Meta: Meta{Country: "NL"}}); err != nil {
+		t.Fatalf("Set(1): %v", err)
+	}
+	if err := db.Set(2, &Rec{Name: "b", Age: 30, Meta: Meta{Country: "DE"}}); err != nil {
+		t.Fatalf("Set(2): %v", err)
+	}
+
+	result, err := db.Aggregate(qx.Query(qx.EQ("country", "NL")).Metrics(qx.ROWCOUNT().AS("rows")))
+	if err != nil {
+		t.Fatalf("Aggregate: %v", err)
+	}
+	requireAggregateLayout(t, result.Layout, []string{"rows"})
+	if len(result.Rows) != 1 {
+		t.Fatalf("rows len=%d, want 1", len(result.Rows))
+	}
+	requireAggregateUint(t, result.Rows[0][0], 1)
+	if len(events) == 0 {
+		t.Fatalf("expected trace event")
+	}
+	last := events[len(events)-1]
+	if last.Plan != string(PlanCountScalarLookup) {
+		t.Fatalf("expected plan %q, got %q", PlanCountScalarLookup, last.Plan)
+	}
+}
+
+func TestAggregateRowCount_MaterializedCountRoute(t *testing.T) {
+	var events []TraceEvent
+	opts := Options{
+		AnalyzeInterval: -1,
+		TraceSink: func(ev TraceEvent) {
+			events = append(events, ev)
+		},
+		TraceSampleEvery: 1,
+	}
+	db, _ := openTempDBUint64(t, opts)
+
+	seedGeneratedUint64Data(t, db, 20_000, func(i int) *Rec {
+		return &Rec{
+			Name:   fmt.Sprintf("u_%d", i),
+			Email:  fmt.Sprintf("user%06d@example.com", i),
+			Active: i%2 == 0,
+		}
+	})
+	if err := db.RebuildIndex(); err != nil {
+		t.Fatalf("RebuildIndex: %v", err)
+	}
+
+	expr := qx.OR(
+		qx.AND(qx.PREFIX("email", "user00"), qx.EQ("active", true)),
+		qx.AND(qx.PREFIX("email", "user01"), qx.EQ("active", true)),
+		qx.AND(qx.PREFIX("email", "user02"), qx.EQ("active", true)),
+		qx.AND(qx.PREFIX("email", "user03"), qx.EQ("active", true)),
+		qx.AND(qx.PREFIX("email", "user04"), qx.EQ("active", true)),
+	)
+	want := countByExprBitmap(t, db, expr)
+
+	result, err := db.Aggregate(qx.Query(expr).Metrics(qx.ROWCOUNT().AS("rows")))
+	if err != nil {
+		t.Fatalf("Aggregate: %v", err)
+	}
+	requireAggregateLayout(t, result.Layout, []string{"rows"})
+	if len(result.Rows) != 1 {
+		t.Fatalf("rows len=%d, want 1", len(result.Rows))
+	}
+	requireAggregateUint(t, result.Rows[0][0], want)
+	if len(events) == 0 {
+		t.Fatalf("expected trace event")
+	}
+	last := events[len(events)-1]
+	if last.Plan != string(PlanCountMaterialized) {
+		t.Fatalf("expected plan %q, got %q", PlanCountMaterialized, last.Plan)
+	}
+}
+
+func TestCount_ANDSetRangeUsesMaterializedRoute(t *testing.T) {
+	var events []TraceEvent
+	db := countOpenORBenchSharedDB(t, "test_count_and_set_range_materialized.db", Options{
+		AnalyzeInterval: -1,
+		TraceSink: func(ev TraceEvent) {
+			events = append(events, ev)
+		},
+		TraceSampleEvery: 1,
+	})
+
+	expr := qx.AND(
+		qx.EQ("status", "active"),
+		qx.NOTIN("plan", []string{"free"}),
+		qx.GTE("score", 120.0),
+		qx.HASANY("tags", []string{"go", "security", "ops"}),
+	)
+
+	got, err := db.Count(expr)
+	if err != nil {
+		t.Fatalf("Count: %v", err)
+	}
+	want := countByExprBitmapCountORBench(t, db, expr)
+	if got != want {
+		t.Fatalf("count mismatch: got=%d want=%d", got, want)
+	}
+	if len(events) == 0 {
+		t.Fatalf("expected trace event")
+	}
+	last := events[len(events)-1]
+	if last.Plan != string(PlanCountMaterialized) {
+		t.Fatalf("expected plan %q, got %q", PlanCountMaterialized, last.Plan)
+	}
+}
+
+func TestCount_ORMaterializedRoutePromotesAfterRepeat(t *testing.T) {
+	var events []TraceEvent
+	db := countOpenORBenchSharedDB(t, "test_count_or_materialized_promotes.db", Options{
+		AnalyzeInterval: -1,
+		TraceSink: func(ev TraceEvent) {
+			events = append(events, ev)
+		},
+		TraceSampleEvery: 1,
+	})
+
+	expr := qx.OR(
+		qx.AND(
+			qx.PREFIX("email", "user1"),
+			qx.EQ("status", "active"),
+			qx.GTE("score", 60.0),
+		),
+		qx.AND(
+			qx.EQ("country", "DE"),
+			qx.HASANY("tags", []string{"rust", "go"}),
+			qx.GTE("age", 24),
+		),
+		qx.AND(
+			qx.EQ("plan", "enterprise"),
+			qx.HASANY("roles", []string{"admin", "support"}),
+			qx.NOTIN("status", []string{"banned"}),
+		),
+	)
+
+	first, err := db.Count(expr)
+	if err != nil {
+		t.Fatalf("first Count: %v", err)
+	}
+	if len(events) == 0 {
+		t.Fatalf("expected first trace event")
+	}
+	if plan := events[len(events)-1].Plan; plan != string(PlanCountORPredicates) {
+		t.Fatalf("expected first plan %q, got %q", PlanCountORPredicates, plan)
+	}
+
+	second, err := db.Count(expr)
+	if err != nil {
+		t.Fatalf("second Count: %v", err)
+	}
+	if second != first {
+		t.Fatalf("count mismatch between repeated runs: first=%d second=%d", first, second)
+	}
+	if plan := events[len(events)-1].Plan; plan != string(PlanCountMaterialized) {
+		t.Fatalf("expected second plan %q, got %q", PlanCountMaterialized, plan)
+	}
+
+	want := countByExprBitmapCountORBench(t, db, expr)
+	if second != want {
+		t.Fatalf("count mismatch: got=%d want=%d", second, want)
+	}
+}
+
+func TestAggregateRowCount_MatchesCountForRepresentativeFilters(t *testing.T) {
+	opts := benchOptions()
+	opts.AnalyzeInterval = -1
+
+	path := filepath.Join(t.TempDir(), "rowcount_equiv.db")
+	db, raw := openBoltAndNew[uint64, UserBench](t, path, opts)
+	t.Cleanup(func() {
+		_ = db.Close()
+		_ = raw.Close()
+	})
+
+	seedBenchData(t, db, 150_000)
+
+	cases := []struct {
+		name string
+		q    *qx.QX
+		all  bool
+	}{
+		{name: "NoFilter", all: true},
+		{name: "SimpleEQ", q: qx.Query(qx.EQ("country", "NL"))},
+		{name: "SimpleIN", q: qx.Query(qx.IN("country", []string{"NL", "DE", "PL"}))},
+		{name: "SimpleHASANY", q: qx.Query(qx.HASANY("roles", []string{"admin", "moderator"}))},
+		{name: "SimpleHASALL", q: qx.Query(qx.HASALL("tags", []string{"go", "db"}))},
+		{name: "SimpleNOTIN", q: qx.Query(qx.NOTIN("status", []string{"banned"}))},
+		{name: "BroadMixedAND", q: qx.Query(
+			qx.PREFIX("email", "user"),
+			qx.EQ("status", "active"),
+			qx.NOTIN("plan", []string{"free"}),
+		)},
+		{name: "FeedEligible", q: qx.Query(
+			qx.EQ("status", "active"),
+			qx.NOTIN("plan", []string{"free"}),
+			qx.GTE("score", 120.0),
+			qx.HASANY("tags", []string{"go", "security", "ops"}),
+		)},
+		{name: "HeavyOR", q: qx.Query(
+			qx.OR(
+				qx.AND(
+					qx.EQ("country", "DE"),
+					qx.HASANY("tags", []string{"rust", "go"}),
+					qx.GTE("score", 40.0),
+				),
+				qx.AND(
+					qx.PREFIX("email", "user1"),
+					qx.EQ("status", "active"),
+				),
+				qx.AND(
+					qx.EQ("plan", "enterprise"),
+					qx.GTE("age", 30),
+				),
+				qx.AND(
+					qx.HASANY("roles", []string{"admin"}),
+					qx.NOTIN("status", []string{"banned"}),
+				),
+				qx.AND(
+					qx.CONTAINS("name", "user-1"),
+					qx.GTE("score", 20.0),
+				),
+			),
+		)},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var (
+				count uint64
+				err   error
+				aggQ  *qx.QX
+			)
+			if tc.all {
+				count, err = db.Count()
+				aggQ = qx.Aggregate(qx.ROWCOUNT().AS("rows"))
+			} else {
+				count, err = db.Count(tc.q.Filter)
+				aggQ = qx.Query(tc.q.Filter).Metrics(qx.ROWCOUNT().AS("rows"))
+			}
+			if err != nil {
+				t.Fatalf("Count: %v", err)
+			}
+			result, err := db.Aggregate(aggQ)
+			if err != nil {
+				t.Fatalf("Aggregate: %v", err)
+			}
+			requireAggregateLayout(t, result.Layout, []string{"rows"})
+			if len(result.Rows) != 1 {
+				t.Fatalf("rows len=%d, want 1", len(result.Rows))
+			}
+			requireAggregateUint(t, result.Rows[0][0], count)
+		})
+	}
+}
+
+func TestAggregateRowCount_MatchesCountForSmallWorldFilters(t *testing.T) {
+	exprs := smallWorldExprCases()
+
+	for _, world := range smallWorldCases() {
+		t.Run(world.name, func(t *testing.T) {
+			db := openSmallWorldDB(t, world)
+
+			for _, exprCase := range exprs {
+				t.Run(exprCase.name, func(t *testing.T) {
+					var (
+						count uint64
+						err   error
+						aggQ  *qx.QX
+					)
+					if exprCase.noFilter {
+						count, err = db.Count()
+						aggQ = qx.Aggregate(qx.ROWCOUNT().AS("rows"))
+					} else {
+						count, err = db.Count(exprCase.expr)
+						aggQ = qx.Query(exprCase.expr).Metrics(qx.ROWCOUNT().AS("rows"))
+					}
+					if err != nil {
+						t.Fatalf("Count: %v", err)
+					}
+					result, err := db.Aggregate(aggQ)
+					if err != nil {
+						t.Fatalf("Aggregate: %v", err)
+					}
+					requireAggregateLayout(t, result.Layout, []string{"rows"})
+					if len(result.Rows) != 1 {
+						t.Fatalf("rows len=%d, want 1", len(result.Rows))
+					}
+					requireAggregateUint(t, result.Rows[0][0], count)
+				})
+			}
+		})
+	}
+}
+
+func TestCount_PublicRoutesAllocsPerRunStayZeroAfterWarmup(t *testing.T) {
+	if testRaceEnabled {
+		t.Skip("testing.AllocsPerRun is not stable under -race")
+	}
+
+	opts := benchOptions()
+	opts.AnalyzeInterval = -1
+
+	path := filepath.Join(t.TempDir(), "count_public_allocs.db")
+	db, raw := openBoltAndNew[uint64, UserBench](t, path, opts)
+	t.Cleanup(func() {
+		_ = db.Close()
+		_ = raw.Close()
+	})
+
+	seedBenchData(t, db, 150_000)
+
+	cases := []struct {
+		name string
+		q    *qx.QX
+	}{
+		{name: "SimpleEQ", q: qx.Query(qx.EQ("country", "NL"))},
+		{name: "SimpleIN", q: qx.Query(qx.IN("country", []string{"NL", "DE", "PL"}))},
+		{name: "SimpleHASANY", q: qx.Query(qx.HASANY("roles", []string{"admin", "moderator"}))},
+		{name: "SimpleNOTIN", q: qx.Query(qx.NOTIN("status", []string{"banned"}))},
+		{name: "BroadMixedAND", q: qx.Query(
+			qx.PREFIX("email", "user"),
+			qx.EQ("status", "active"),
+			qx.NOTIN("plan", []string{"free"}),
+		)},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			run := func() {
+				if _, err := db.Count(tc.q.Filter); err != nil {
+					t.Fatalf("Count: %v", err)
+				}
+			}
+			run()
+			allocs := testing.AllocsPerRun(50, run)
+			if allocs != 0 {
+				t.Fatalf("unexpected allocs after warmup: got=%v want=0", allocs)
+			}
+		})
+	}
+
+	orDB, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
+	_ = seedData(t, orDB, 20_000)
+	orQ := qx.Query(qx.OR(
+		qx.AND(
+			qx.CONTAINS("full_name", "ZZZ"),
+			qx.GTE("score", 10.0),
+		),
+		qx.AND(
+			qx.PREFIX("full_name", "FN-1"),
+			qx.EQ("active", true),
+		),
+		qx.AND(
+			qx.EQ("name", "alice"),
+			qx.EQ("active", true),
+		),
+		qx.AND(
+			qx.EQ("country", "NL"),
+			qx.HASANY("tags", []string{"go"}),
+		),
+	))
+	t.Run("ORHybrid", func(t *testing.T) {
+		run := func() {
+			if _, err := orDB.Count(orQ.Filter); err != nil {
+				t.Fatalf("Count: %v", err)
+			}
+		}
+		run()
+		allocs := testing.AllocsPerRun(50, run)
+		if allocs != 0 {
+			t.Fatalf("unexpected allocs after warmup: got=%v want=0", allocs)
+		}
+	})
+}
+
 func expectPredicateExactPostingFilterCount(t *testing.T, p predicate, src posting.List, want uint64) {
 	t.Helper()
 

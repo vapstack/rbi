@@ -217,13 +217,13 @@ func (qe *queryEngine) tryPlan(q *qx.QX, trace *queryTrace) ([]uint64, bool, err
 	return qe.currentQueryViewForTests().tryPlan(&viewQ, trace)
 }
 
-func (qe *queryEngine) countPreparedExpr(expr qx.Expr) (uint64, error) {
+func (qe *queryEngine) aggregateCountPreparedExpr(expr qx.Expr) (uint64, error) {
 	prepared, compiled, err := prepareTestExpr(qe, expr)
 	if err != nil {
 		return 0, err
 	}
 	defer prepared.Release()
-	return qe.currentQueryViewForTests().countPreparedExpr(compiled)
+	return qe.currentQueryViewForTests().aggregateCountPreparedExpr(compiled)
 }
 
 func (qe *queryEngine) tryPlanCandidate(q *qx.QX, trace *queryTrace) ([]uint64, bool, error) {

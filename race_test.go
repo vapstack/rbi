@@ -463,12 +463,12 @@ func TestRace_ConcurrentWriters_SnapshotRouteEquivalence(t *testing.T) {
 				db.engine.unpinCurrentSnapshot(seq, snapRef, pinned)
 				t.Fatalf("prepareTestExpr(count): %v", err)
 			}
-			cnt, err := view.countPreparedExpr(compiledCount)
+			cnt, err := view.aggregateCountPreparedExpr(compiledCount)
 			preparedCount.Release()
 			if err != nil {
 				db.engine.releaseQueryView(view)
 				db.engine.unpinCurrentSnapshot(seq, snapRef, pinned)
-				t.Fatalf("countPreparedExpr: %v", err)
+				t.Fatalf("aggregateCountPreparedExpr: %v", err)
 			}
 			if cnt != uint64(len(ref)) {
 				db.engine.releaseQueryView(view)
@@ -864,12 +864,12 @@ func TestRace_StringKeyGrowth_FastPaths_SnapshotRouteEquivalence(t *testing.T) {
 				db.engine.unpinCurrentSnapshot(seq, snapRef, pinned)
 				t.Fatalf("prepareTestExpr(count): %v", err)
 			}
-			cnt, err := view.countPreparedExpr(compiledCount)
+			cnt, err := view.aggregateCountPreparedExpr(compiledCount)
 			preparedCount.Release()
 			if err != nil {
 				db.engine.releaseQueryView(view)
 				db.engine.unpinCurrentSnapshot(seq, snapRef, pinned)
-				t.Fatalf("countPreparedExpr: %v", err)
+				t.Fatalf("aggregateCountPreparedExpr: %v", err)
 			}
 			if cnt != uint64(len(ref)) {
 				db.engine.releaseQueryView(view)
