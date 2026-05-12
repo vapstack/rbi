@@ -4,15 +4,22 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"github.com/vapstack/rbi/internal/pooled"
 	"github.com/vapstack/rbi/internal/posting"
 	"github.com/vapstack/rbi/internal/schema"
 )
 
 const (
+	// oversized postings get at most one quarter of the regular materialized
+	// cache, with one slot still available for very small cache limits.
+	materializedPredCacheOversizedDivisor = 4
+
+	// hard cap on oversized entries keeps high-cardinality postings from
+	// dominating memory when the regular cache limit is large.
 	materializedPredCacheOversizedMaxEntries = 4
-	recentKeyCacheSlotPoolMaxCap             = 512
-	materializedPredCacheRetiredPoolMaxCap   = 512
+
+	// linear scan is cheaper for tiny caches; above eight slots the hash index
+	// wins on qcache lookup and recent-key hot benchmarks.
+	materializedPredCacheLinearMaxEntries = 8
 )
 
 type materializedPredCacheEvictMode uint8
@@ -26,10 +33,12 @@ type MaterializedPredCache struct {
 	refs           atomic.Int32
 	mu             sync.RWMutex
 	slots          []materializedPredCacheSlot
+	index          map[uint64]int
 	retired        []*materializedPredCacheEntry
 	count          atomic.Int32
 	oversizedCount atomic.Int32
 	clock          atomic.Uint64
+	freeHint       int
 	maxEntries     int
 	maxCard        uint64
 }
@@ -43,41 +52,25 @@ type materializedPredCacheEntry struct {
 
 type materializedPredCacheSlot struct {
 	key   MaterializedPredKey
+	hash  uint64
 	entry *materializedPredCacheEntry
 	used  bool
 }
 
 type RecentKeyCache struct {
-	mu    sync.Mutex
-	clock uint64
-	slots []recentKeyCacheSlot
+	mu       sync.Mutex
+	clock    uint64
+	slots    []recentKeyCacheSlot
+	index    map[uint64]int
+	indexLen int
 }
 
 type recentKeyCacheSlot struct {
 	key   MaterializedPredKey
+	hash  uint64
 	stamp uint64
 	work  uint64
 	used  bool
-}
-
-var recentKeyCacheSlotPool = pooled.NewSlicePool[recentKeyCacheSlot](
-	recentKeyCacheSlotPoolMaxCap,
-	pooled.ClearCap,
-)
-
-var materializedPredCachePool = pooled.Pointers[MaterializedPredCache]{
-	Cleanup: func(c *MaterializedPredCache) {
-		c.release()
-	},
-}
-
-var materializedPredCacheRetiredPool = pooled.NewSlicePool[*materializedPredCacheEntry](
-	materializedPredCacheRetiredPoolMaxCap,
-	pooled.ClearCap,
-)
-
-var materializedPredCacheEntryPool = pooled.Pointers[materializedPredCacheEntry]{
-	Clear: true,
 }
 
 func MaterializedPredMaxCardinality(v int) uint64 {
@@ -91,10 +84,10 @@ func MaterializedPredOversizedLimit(limit int) int32 {
 	if limit <= 0 {
 		return 0
 	}
-	if limit <= 4 {
+	if limit <= materializedPredCacheOversizedDivisor {
 		return 1
 	}
-	oversized := int32(limit / 4)
+	oversized := int32(limit / materializedPredCacheOversizedDivisor)
 	if oversized > materializedPredCacheOversizedMaxEntries {
 		oversized = materializedPredCacheOversizedMaxEntries
 	}
@@ -125,11 +118,18 @@ func (c *MaterializedPredCache) Init(maxEntries int, maxCardinality uint64) {
 	}
 	c.maxEntries = maxEntries
 	c.maxCard = maxCardinality
+	c.freeHint = 0
 	if cap(c.slots) < maxEntries {
 		c.slots = make([]materializedPredCacheSlot, maxEntries)
+		if maxEntries > materializedPredCacheLinearMaxEntries && c.index == nil {
+			c.index = materializedPredCacheIndexPool.Get(maxEntries)
+		}
 		return
 	}
 	c.slots = c.slots[:maxEntries]
+	if maxEntries > materializedPredCacheLinearMaxEntries && c.index == nil {
+		c.index = materializedPredCacheIndexPool.Get(maxEntries)
+	}
 }
 
 func (c *MaterializedPredCache) Retain() {
@@ -172,7 +172,7 @@ func (c *MaterializedPredCache) Load(key MaterializedPredKey) (posting.List, boo
 	}
 
 	c.mu.RLock()
-	entry, ok := c.lookupLocked(key)
+	entry, ok := c.lookupLocked(&key)
 	c.mu.RUnlock()
 
 	if !ok {
@@ -200,7 +200,7 @@ func (c *MaterializedPredCache) Store(key MaterializedPredKey, ids posting.List)
 	}
 
 	c.mu.Lock()
-	if _, ok := c.lookupLocked(key); ok {
+	if _, ok := c.lookupLocked(&key); ok {
 		c.mu.Unlock()
 		return
 	}
@@ -232,7 +232,7 @@ func (c *MaterializedPredCache) TryStoreOversized(key MaterializedPredKey, ids p
 	}
 
 	c.mu.Lock()
-	if _, ok := c.lookupLocked(key); ok {
+	if _, ok := c.lookupLocked(&key); ok {
 		c.mu.Unlock()
 		return false
 	}
@@ -275,7 +275,7 @@ func (c *MaterializedPredCache) LoadOrStore(key MaterializedPredKey, ids posting
 	}
 
 	c.mu.Lock()
-	if entry, ok := c.lookupLocked(key); ok {
+	if entry, ok := c.lookupLocked(&key); ok {
 		c.mu.Unlock()
 		ids.Release()
 		if entry == nil {
@@ -318,7 +318,7 @@ func (c *MaterializedPredCache) TryLoadOrStoreOversized(key MaterializedPredKey,
 	}
 
 	c.mu.Lock()
-	if entry, ok := c.lookupLocked(key); ok {
+	if entry, ok := c.lookupLocked(&key); ok {
 		c.mu.Unlock()
 		ids.Release()
 		if entry == nil {
@@ -379,7 +379,7 @@ func (c *MaterializedPredCache) InheritFrom(prev *MaterializedPredCache, fields 
 				continue
 			}
 		}
-		if _, exists := c.lookupLocked(key); exists {
+		if _, exists := c.lookupLocked(&key); exists {
 			continue
 		}
 		if slot.entry != nil {
@@ -436,18 +436,38 @@ func (c *MaterializedPredCache) DrainRetired() {
 
 func (c *MaterializedPredCache) release() {
 	c.Clear()
+	if c.index != nil {
+		materializedPredCacheIndexPool.Put(c.index)
+		c.index = nil
+	}
 	c.slots = c.slots[:0]
 	c.maxEntries = 0
 	c.maxCard = 0
 }
 
-func (c *MaterializedPredCache) lookupLocked(key MaterializedPredKey) (*materializedPredCacheEntry, bool) {
-	if len(c.slots) == 0 || key.IsZero() {
+func (c *MaterializedPredCache) lookupLocked(key *MaterializedPredKey) (*materializedPredCacheEntry, bool) {
+	if len(c.slots) == 0 {
+		return nil, false
+	}
+	if len(c.slots) > materializedPredCacheLinearMaxEntries {
+		hash := key.hash()
+		if idx, ok := c.index[hash]; ok {
+			slot := c.slots[idx]
+			if slot.used && slot.hash == hash && slot.key == *key {
+				return slot.entry, true
+			}
+			for i := range c.slots {
+				slot = c.slots[i]
+				if slot.used && slot.hash == hash && slot.key == *key {
+					return slot.entry, true
+				}
+			}
+		}
 		return nil, false
 	}
 	for i := range c.slots {
 		slot := c.slots[i]
-		if slot.used && slot.key == key {
+		if slot.used && slot.key == *key {
 			return slot.entry, true
 		}
 	}
@@ -458,8 +478,15 @@ func (c *MaterializedPredCache) firstFreeSlotLocked() int {
 	if len(c.slots) == 0 {
 		return -1
 	}
-	for i := range c.slots {
+	for i := c.freeHint; i < len(c.slots); i++ {
 		if !c.slots[i].used {
+			c.freeHint = i + 1
+			return i
+		}
+	}
+	for i := 0; i < c.freeHint; i++ {
+		if !c.slots[i].used {
+			c.freeHint = i + 1
 			return i
 		}
 	}
@@ -484,6 +511,9 @@ func (c *MaterializedPredCache) clearLocked() {
 		}
 		c.slots[i] = materializedPredCacheSlot{}
 	}
+	if c.index != nil {
+		clear(c.index)
+	}
 	if c.retired != nil {
 		for i := range c.retired {
 			c.retired[i].release()
@@ -491,6 +521,7 @@ func (c *MaterializedPredCache) clearLocked() {
 		materializedPredCacheRetiredPool.Put(c.retired)
 		c.retired = nil
 	}
+	c.freeHint = 0
 }
 
 func (c *MaterializedPredCache) findVictimLocked(mode materializedPredCacheEvictMode) int {
@@ -546,6 +577,20 @@ func (c *MaterializedPredCache) evictLocked(mode materializedPredCacheEvictMode)
 	}
 	slot := c.slots[idx]
 	c.slots[idx] = materializedPredCacheSlot{}
+	if len(c.slots) > materializedPredCacheLinearMaxEntries {
+		if c.index[slot.hash] == idx {
+			delete(c.index, slot.hash)
+			for i := range c.slots {
+				if i != idx && c.slots[i].used && c.slots[i].hash == slot.hash {
+					c.index[slot.hash] = i
+					break
+				}
+			}
+		}
+	}
+	if idx < c.freeHint {
+		c.freeHint = idx
+	}
 	c.count.Add(-1)
 	if slot.entry != nil && slot.entry.oversized {
 		c.oversizedCount.Add(-1)
@@ -562,8 +607,17 @@ func (c *MaterializedPredCache) insertLocked(key MaterializedPredKey, entry *mat
 	if idx < 0 {
 		return false
 	}
+	hash := uint64(0)
+	if len(c.slots) > materializedPredCacheLinearMaxEntries {
+		if c.index == nil {
+			c.index = materializedPredCacheIndexPool.Get(len(c.slots))
+		}
+		hash = key.hash()
+		c.index[hash] = idx
+	}
 	c.slots[idx] = materializedPredCacheSlot{
 		key:   key,
+		hash:  hash,
 		entry: entry,
 		used:  true,
 	}
@@ -612,6 +666,11 @@ func (c *RecentKeyCache) Clear() {
 		recentKeyCacheSlotPool.Put(c.slots)
 		c.slots = nil
 	}
+	if c.index != nil {
+		recentKeyCacheIndexPool.Put(c.index)
+		c.index = nil
+	}
+	c.indexLen = 0
 	c.clock = 0
 }
 
@@ -650,8 +709,17 @@ func (c *RecentKeyCache) TouchOrRemember(key MaterializedPredKey, limit int) boo
 	if idx < 0 {
 		return false
 	}
+	if len(c.slots) > materializedPredCacheLinearMaxEntries && c.slots[idx].used {
+		c.removeRecentIndexLocked(c.slots[idx].hash, idx)
+	}
+	hash := uint64(0)
+	if len(c.slots) > materializedPredCacheLinearMaxEntries {
+		hash = key.hash()
+		c.index[hash] = idx
+	}
 	c.slots[idx] = recentKeyCacheSlot{
 		key:   key,
+		hash:  hash,
 		stamp: c.nextStamp(),
 		used:  true,
 	}
@@ -678,14 +746,26 @@ func (c *RecentKeyCache) AddWorkAndShouldPromote(key MaterializedPredKey, limit 
 			return false
 		}
 		c.slots[idx] = recentKeyCacheSlot{}
+		if len(c.slots) > materializedPredCacheLinearMaxEntries {
+			c.removeRecentIndexLocked(slot.hash, idx)
+		}
 		return true
 	}
 	idx := c.selectVictimSlot()
 	if idx < 0 {
 		return false
 	}
+	if len(c.slots) > materializedPredCacheLinearMaxEntries && c.slots[idx].used {
+		c.removeRecentIndexLocked(c.slots[idx].hash, idx)
+	}
+	hash := uint64(0)
+	if len(c.slots) > materializedPredCacheLinearMaxEntries {
+		hash = key.hash()
+		c.index[hash] = idx
+	}
 	c.slots[idx] = recentKeyCacheSlot{
 		key:   key,
+		hash:  hash,
 		stamp: c.nextStamp(),
 		work:  delta,
 		used:  true,
@@ -704,9 +784,45 @@ func (c *RecentKeyCache) initSlots(limit int) {
 		c.slots = slots
 	}
 	c.slots = c.slots[:limit]
+	if limit > materializedPredCacheLinearMaxEntries {
+		if c.index == nil {
+			c.index = recentKeyCacheIndexPool.Get(limit)
+		}
+		if c.indexLen != limit {
+			clear(c.index)
+			for i := range c.slots {
+				if c.slots[i].used {
+					hash := c.slots[i].key.hash()
+					c.slots[i].hash = hash
+					c.index[hash] = i
+				}
+			}
+			c.indexLen = limit
+		}
+	} else if c.index != nil {
+		recentKeyCacheIndexPool.Put(c.index)
+		c.index = nil
+		c.indexLen = 0
+	}
 }
 
 func (c *RecentKeyCache) findSlot(key MaterializedPredKey) (int, bool) {
+	if len(c.slots) > materializedPredCacheLinearMaxEntries {
+		hash := key.hash()
+		if idx, ok := c.index[hash]; ok {
+			slot := c.slots[idx]
+			if slot.used && slot.hash == hash && slot.key == key {
+				return idx, true
+			}
+			for i := range c.slots {
+				slot = c.slots[i]
+				if slot.used && slot.hash == hash && slot.key == key {
+					return i, true
+				}
+			}
+		}
+		return 0, false
+	}
 	for i := range c.slots {
 		slot := c.slots[i]
 		if slot.used && slot.key == key {
@@ -714,6 +830,19 @@ func (c *RecentKeyCache) findSlot(key MaterializedPredKey) (int, bool) {
 		}
 	}
 	return 0, false
+}
+
+func (c *RecentKeyCache) removeRecentIndexLocked(hash uint64, idx int) {
+	if c.index[hash] != idx {
+		return
+	}
+	delete(c.index, hash)
+	for i := range c.slots {
+		if i != idx && c.slots[i].used && c.slots[i].hash == hash {
+			c.index[hash] = i
+			return
+		}
+	}
 }
 
 func (c *RecentKeyCache) nextStamp() uint64 {

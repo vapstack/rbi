@@ -6,7 +6,6 @@ import (
 
 	"github.com/vapstack/rbi/internal/indexdata"
 	"github.com/vapstack/rbi/internal/keycodec"
-	"github.com/vapstack/rbi/internal/pooled"
 	"github.com/vapstack/rbi/internal/qir"
 )
 
@@ -38,9 +37,39 @@ const (
 // allocation-free; wider sets simply skip this cache class.
 const materializedPredKeyDistinctSetInlineMax = 4
 
-const materializedPredKeySlicePoolMaxCap = 512
+const (
+	// 64-bit FNV-1a constants. The hash is only a cache-slot index; lookups
+	// still compare the full MaterializedPredKey, so collisions keep correctness.
+	materializedPredKeyHashOffset = 1469598103934665603
+	materializedPredKeyHashPrime  = 1099511628211
 
-var materializedPredKeySlicePool = pooled.NewSlicePool[MaterializedPredKey](materializedPredKeySlicePoolMaxCap, pooled.ClearCap)
+	// hash uint64 values in two 32-bit halves so both high and low bits affect
+	// the FNV stream without a loop or byte buffer.
+	materializedPredKeyHashHalfBits = 32
+
+	// small overestimate for encoded key separators/tags so String builders stay
+	// single-allocation without counting every delimiter on the hot path.
+	materializedPredKeyEncodedSlack = 12
+)
+
+// encoded keys store qir.Op as its iota byte value; the table avoids
+// strconv.Itoa on common String hot paths.
+var materializedPredKeyOpText = [...]string{
+	qir.OpNOOP:     "0",
+	qir.OpAND:      "1",
+	qir.OpOR:       "2",
+	qir.OpEQ:       "3",
+	qir.OpGT:       "4",
+	qir.OpGTE:      "5",
+	qir.OpLT:       "6",
+	qir.OpLTE:      "7",
+	qir.OpIN:       "8",
+	qir.OpHASALL:   "9",
+	qir.OpHASANY:   "10",
+	qir.OpPREFIX:   "11",
+	qir.OpSUFFIX:   "12",
+	qir.OpCONTAINS: "13",
+}
 
 type MaterializedPredKey struct {
 	kind        materializedPredKeyKind
@@ -90,7 +119,7 @@ func (key MaterializedPredKey) String() string {
 		buf.WriteByte('\x1f')
 		buf.WriteString("set_exact")
 		buf.WriteByte('\x1f')
-		buf.WriteString(strconv.Itoa(int(key.op)))
+		buf.WriteString(materializedPredKeyOpString(key.op))
 		buf.WriteByte('\x1f')
 
 		if key.flags&materializedPredKeySetHasNil != 0 {
@@ -110,65 +139,53 @@ func (key MaterializedPredKey) String() string {
 		return buf.String()
 
 	case materializedPredKeyScalar:
+		op := materializedPredKeyOpString(key.op)
 		if key.flags&materializedPredKeyScalarNumeric != 0 {
 			var raw [8]byte
 			var buf strings.Builder
-			buf.Grow(len(key.field) + 8 + 8)
+			buf.Grow(len(key.field) + len(op) + materializedPredKeyEncodedSlack)
 			buf.WriteString(key.field)
 			buf.WriteByte('\x1f')
-			buf.WriteString(strconv.Itoa(int(key.op)))
+			buf.WriteString(op)
 			buf.WriteString("\x1fn\x1f")
 			buf.Write(key.keyIndex.AppendBytes(raw[:0]))
 			return buf.String()
 		}
-		return key.field + "\x1f" + strconv.Itoa(int(key.op)) + "\x1f" + key.key
+		return key.field + "\x1f" + op + "\x1f" + key.key
 
 	case materializedPredKeyScalarComplement:
+		op := materializedPredKeyOpString(key.op)
 		if key.flags&materializedPredKeyScalarNumeric != 0 {
 			var raw [8]byte
 			var buf strings.Builder
-			buf.Grow(len(key.field) + len("count_range_complement") + 8 + 8)
+			buf.Grow(len(key.field) + len("count_range_complement") + len(op) + materializedPredKeyEncodedSlack)
 			buf.WriteString(key.field)
 			buf.WriteByte('\x1f')
 			buf.WriteString("count_range_complement")
 			buf.WriteByte('\x1f')
-			buf.WriteString(strconv.Itoa(int(key.op)))
+			buf.WriteString(op)
 			buf.WriteString("\x1fn\x1f")
 			buf.Write(key.keyIndex.AppendBytes(raw[:0]))
 			return buf.String()
 		}
 		return key.field + "\x1f" + "count_range_complement" + "\x1f" +
-			strconv.Itoa(int(key.op)) + "\x1f" + key.key
+			op + "\x1f" + key.key
 
 	case materializedPredKeyExactScalarRange, materializedPredKeyExactScalarRangeComplement:
-		loTag := ""
-		loVal := ""
-		hiTag := ""
-		hiVal := ""
+		loValLen := 0
+		hiValLen := 0
 		if key.flags&materializedPredKeyHasLo != 0 {
 			if key.flags&materializedPredKeyLoNumeric != 0 {
-				loTag = "n"
+				loValLen = 8
 			} else {
-				loTag = "s"
-				loVal = key.loKey
-			}
-			if key.flags&materializedPredKeyLoInc != 0 {
-				loTag += "["
-			} else {
-				loTag += "("
+				loValLen = len(key.loKey)
 			}
 		}
 		if key.flags&materializedPredKeyHasHi != 0 {
 			if key.flags&materializedPredKeyHiNumeric != 0 {
-				hiTag = "n"
+				hiValLen = 8
 			} else {
-				hiTag = "s"
-				hiVal = key.hiKey
-			}
-			if key.flags&materializedPredKeyHiInc != 0 {
-				hiTag += "]"
-			} else {
-				hiTag += ")"
+				hiValLen = len(key.hiKey)
 			}
 		}
 		head := "range_exact"
@@ -177,25 +194,47 @@ func (key MaterializedPredKey) String() string {
 		}
 		var raw [8]byte
 		var buf strings.Builder
-		buf.Grow(len(key.field) + len(head) + len(loTag) + len(loVal) + len(hiTag) + len(hiVal) + 40)
+		buf.Grow(len(key.field) + len(head) + loValLen + hiValLen + materializedPredKeyEncodedSlack)
 		buf.WriteString(key.field)
 		buf.WriteByte('\x1f')
 		buf.WriteString(head)
 		buf.WriteByte('\x1f')
-		buf.WriteString(loTag)
+		if key.flags&materializedPredKeyHasLo != 0 {
+			if key.flags&materializedPredKeyLoNumeric != 0 {
+				buf.WriteByte('n')
+			} else {
+				buf.WriteByte('s')
+			}
+			if key.flags&materializedPredKeyLoInc != 0 {
+				buf.WriteByte('[')
+			} else {
+				buf.WriteByte('(')
+			}
+		}
 		buf.WriteByte('\x1f')
 		if key.flags&materializedPredKeyLoNumeric != 0 {
 			buf.Write(key.loIndex.AppendBytes(raw[:0]))
 		} else {
-			buf.WriteString(loVal)
+			buf.WriteString(key.loKey)
 		}
 		buf.WriteByte('\x1f')
-		buf.WriteString(hiTag)
+		if key.flags&materializedPredKeyHasHi != 0 {
+			if key.flags&materializedPredKeyHiNumeric != 0 {
+				buf.WriteByte('n')
+			} else {
+				buf.WriteByte('s')
+			}
+			if key.flags&materializedPredKeyHiInc != 0 {
+				buf.WriteByte(']')
+			} else {
+				buf.WriteByte(')')
+			}
+		}
 		buf.WriteByte('\x1f')
 		if key.flags&materializedPredKeyHiNumeric != 0 {
 			buf.Write(key.hiIndex.AppendBytes(raw[:0]))
 		} else {
-			buf.WriteString(hiVal)
+			buf.WriteString(key.hiKey)
 		}
 		return buf.String()
 
@@ -206,6 +245,86 @@ func (key MaterializedPredKey) String() string {
 	default:
 		return ""
 	}
+}
+
+func materializedPredKeyOpString(op qir.Op) string {
+	if int(op) < len(materializedPredKeyOpText) {
+		return materializedPredKeyOpText[op]
+	}
+	return strconv.Itoa(int(op))
+}
+
+func (key *MaterializedPredKey) hash() uint64 {
+	h := materializedPredKeyHashUint(materializedPredKeyHashOffset, uint64(key.kind))
+
+	switch key.kind {
+
+	case materializedPredKeyOpaque:
+		return materializedPredKeyHashString(h, key.raw)
+
+	case materializedPredKeyScalar, materializedPredKeyScalarComplement:
+		h = materializedPredKeyHashString(h, key.field)
+		h = materializedPredKeyHashUint(h, uint64(key.op))
+		h = materializedPredKeyHashUint(h, uint64(key.flags))
+		if key.flags&materializedPredKeyScalarNumeric != 0 {
+			return materializedPredKeyHashUint(h, key.keyIndex.U64())
+		}
+		return materializedPredKeyHashString(h, key.key)
+
+	case materializedPredKeyExactScalarRange, materializedPredKeyExactScalarRangeComplement:
+		h = materializedPredKeyHashString(h, key.field)
+		h = materializedPredKeyHashUint(h, uint64(key.flags))
+		if key.flags&materializedPredKeyHasLo != 0 {
+			if key.flags&materializedPredKeyLoNumeric != 0 {
+				h = materializedPredKeyHashUint(h, key.loIndex.U64())
+			} else {
+				h = materializedPredKeyHashString(h, key.loKey)
+			}
+		}
+		if key.flags&materializedPredKeyHasHi != 0 {
+			if key.flags&materializedPredKeyHiNumeric != 0 {
+				h = materializedPredKeyHashUint(h, key.hiIndex.U64())
+			} else {
+				h = materializedPredKeyHashString(h, key.hiKey)
+			}
+		}
+		return h
+
+	case materializedPredKeyNumericBucketSpan:
+		h = materializedPredKeyHashString(h, key.field)
+		h = materializedPredKeyHashUint(h, uint64(key.startBucket))
+		return materializedPredKeyHashUint(h, uint64(key.endBucket))
+
+	case materializedPredKeyDistinctSet:
+		h = materializedPredKeyHashString(h, key.field)
+		h = materializedPredKeyHashUint(h, uint64(key.op))
+		h = materializedPredKeyHashUint(h, uint64(key.flags))
+		h = materializedPredKeyHashUint(h, uint64(key.setValueCnt))
+		for i := 0; i < int(key.setValueCnt); i++ {
+			h = materializedPredKeyHashString(h, key.setTerms[i])
+		}
+		return h
+
+	default:
+		return h
+	}
+}
+
+func materializedPredKeyHashString(h uint64, s string) uint64 {
+	h = materializedPredKeyHashUint(h, uint64(len(s)))
+	for i := 0; i < len(s); i++ {
+		h ^= uint64(s[i])
+		h *= materializedPredKeyHashPrime
+	}
+	return h
+}
+
+func materializedPredKeyHashUint(h, v uint64) uint64 {
+	h ^= v
+	h *= materializedPredKeyHashPrime
+	h ^= v >> materializedPredKeyHashHalfBits
+	h *= materializedPredKeyHashPrime
+	return h
 }
 
 func MaterializedPredKeyForScalar(field string, op qir.Op, key string) MaterializedPredKey {

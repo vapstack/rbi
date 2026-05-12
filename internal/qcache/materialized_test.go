@@ -14,6 +14,9 @@ import (
 
 func requireZeroAllocsAfterWarmupQCache(t *testing.T, fn func()) {
 	t.Helper()
+	if testRaceEnabled {
+		t.Skip("testing.AllocsPerRun is not stable under -race")
+	}
 	for i := 0; i < 32; i++ {
 		fn()
 	}
@@ -94,6 +97,29 @@ func TestRecentKeyCache_AllocsPerRunStayZeroAfterWarmup(t *testing.T) {
 				t.Fatalf("AddWorkAndShouldPromote failed to promote key %v", keys[i])
 			}
 		}
+	}
+
+	requireZeroAllocsAfterWarmupQCache(t, run)
+}
+
+func TestRecentKeyCache_ShortLivedOwnersReuseIndexMapAfterWarmup(t *testing.T) {
+	keys := qcacheBenchKeys(32)
+	var seen RecentKeyCache
+	var observed RecentKeyCache
+
+	run := func() {
+		for i := range keys {
+			if seen.TouchOrRemember(keys[i], len(keys)) {
+				t.Fatalf("TouchOrRemember unexpectedly reported warm hit for cold key %v", keys[i])
+			}
+			if observed.AddWorkAndShouldPromote(keys[i], len(keys), 1, ^uint64(0)) {
+				t.Fatalf("AddWorkAndShouldPromote unexpectedly promoted key %v", keys[i])
+			}
+		}
+		seen.Clear()
+		observed.Clear()
+		seen = RecentKeyCache{}
+		observed = RecentKeyCache{}
 	}
 
 	requireZeroAllocsAfterWarmupQCache(t, run)
@@ -775,8 +801,8 @@ func TestMaterializedPredCache_InheritPreservesRecencyStamps(t *testing.T) {
 	next.InheritFrom(prev, nil, nil)
 
 	next.mu.RLock()
-	gotA, okA := next.lookupLocked(keyA)
-	gotB, okB := next.lookupLocked(keyB)
+	gotA, okA := next.lookupLocked(&keyA)
+	gotB, okB := next.lookupLocked(&keyB)
 	next.mu.RUnlock()
 	if !okA || gotA == nil || gotA.stamp.Load() != 7 {
 		t.Fatalf("expected first inherited stamp to stay at 7")

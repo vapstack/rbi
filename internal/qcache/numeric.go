@@ -5,17 +5,30 @@ import (
 	"sync/atomic"
 
 	"github.com/vapstack/rbi/internal/indexdata"
-	"github.com/vapstack/rbi/internal/pooled"
 	"github.com/vapstack/rbi/internal/posting"
 	"github.com/vapstack/rbi/internal/schema"
 )
 
-const numericRangeFullSpanCacheMaxEntries = 4
+const (
+	// full-span cache is a tiny linearly scanned LRU per numeric bucket entry;
+	// four slots keep hit reuse without making every lookup scan a larger table.
+	numericRangeFullSpanCacheMaxEntries = 4
+
+	// requests for smaller buckets are normalized to 16 keys because tiny
+	// buckets create too many spans to amortize materialization.
+	numericRangeBucketMinSize = 16
+
+	// full-span keys pack start and end bucket numbers as two uint32 values.
+	numericRangeFullSpanCacheCoordBits = 32
+)
 
 type NumericRangeBucketCache struct {
-	mu      sync.Mutex
-	slots   []numericRangeBucketCacheSlot
-	maxCard uint64
+	mu            sync.Mutex
+	slots         []numericRangeBucketCacheSlot
+	fieldIndex    map[string]*NumericRangeBucketEntry
+	fieldIndexLen int
+	count         int
+	maxCard       uint64
 }
 
 type NumericRangeBucketIndex struct {
@@ -46,19 +59,6 @@ type numericRangeFullSpanCacheSlot struct {
 	used  bool
 }
 
-var numericRangeBucketCachePool = pooled.Pointers[NumericRangeBucketCache]{
-	Cleanup: func(c *NumericRangeBucketCache) {
-		c.release()
-	},
-}
-
-var numericRangeBucketEntryPool = pooled.Pointers[NumericRangeBucketEntry]{
-	Cleanup: func(e *NumericRangeBucketEntry) {
-		e.releaseFullSpanCache()
-	},
-	Clear: true,
-}
-
 func GetNumericRangeBucketCache(fieldCount int, maxCard uint64) *NumericRangeBucketCache {
 	c := numericRangeBucketCachePool.Get()
 	c.Init(fieldCount, maxCard)
@@ -80,6 +80,8 @@ func GetNumericRangeBucketEntry(storage indexdata.FieldStorage, idx NumericRange
 
 func (c *NumericRangeBucketCache) Init(fieldCount int, maxCard uint64) {
 	c.maxCard = maxCard
+	c.count = 0
+	c.fieldIndexLen = 0
 	if cap(c.slots) < fieldCount {
 		c.slots = make([]numericRangeBucketCacheSlot, fieldCount)
 		return
@@ -89,6 +91,12 @@ func (c *NumericRangeBucketCache) Init(fieldCount int, maxCard uint64) {
 
 func (c *NumericRangeBucketCache) ClearEntries() {
 	if len(c.slots) == 0 {
+		if c.fieldIndex != nil {
+			numericRangeBucketFieldIndexPool.Put(c.fieldIndex)
+			c.fieldIndex = nil
+		}
+		c.fieldIndexLen = 0
+		c.count = 0
 		return
 	}
 	c.mu.Lock()
@@ -101,6 +109,12 @@ func (c *NumericRangeBucketCache) ClearEntries() {
 		}
 		c.slots[i] = numericRangeBucketCacheSlot{}
 	}
+	if c.fieldIndex != nil {
+		numericRangeBucketFieldIndexPool.Put(c.fieldIndex)
+		c.fieldIndex = nil
+	}
+	c.fieldIndexLen = 0
+	c.count = 0
 }
 
 func (c *NumericRangeBucketCache) LoadSlot(field string, ordinal int) (*NumericRangeBucketEntry, bool) {
@@ -124,6 +138,21 @@ func (c *NumericRangeBucketCache) StoreSlot(field string, ordinal int, entry *Nu
 
 	c.mu.Lock()
 	slot := c.slots[ordinal]
+	if slot.entry == nil {
+		if entry != nil {
+			c.count++
+		}
+	} else if entry == nil {
+		c.count--
+	}
+	if c.fieldIndex != nil {
+		if slot.field != "" {
+			delete(c.fieldIndex, slot.field)
+		}
+		if field != "" && entry != nil {
+			c.fieldIndex[field] = entry
+		}
+	}
 	slot.field = field
 	slot.entry = entry
 	c.slots[ordinal] = slot
@@ -137,28 +166,35 @@ func (c *NumericRangeBucketCache) LoadField(field string) (*NumericRangeBucketEn
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	if c.fieldIndex != nil && c.fieldIndexLen == len(c.slots) {
+		entry, ok := c.fieldIndex[field]
+		return entry, ok
+	}
+	if c.fieldIndex == nil {
+		c.fieldIndex = numericRangeBucketFieldIndexPool.Get(len(c.slots))
+	} else {
+		clear(c.fieldIndex)
+	}
 	for i := range c.slots {
 		slot := c.slots[i]
-		if slot.field == field && slot.entry != nil {
-			return slot.entry, true
+		if slot.field != "" && slot.entry != nil {
+			c.fieldIndex[slot.field] = slot.entry
 		}
 	}
-	return nil, false
+	c.fieldIndexLen = len(c.slots)
+	entry, ok := c.fieldIndex[field]
+	return entry, ok
 }
 
 func (c *NumericRangeBucketCache) EntryCount() int {
 	if len(c.slots) == 0 {
 		return 0
 	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
 
-	count := 0
-	for i := range c.slots {
-		if c.slots[i].entry != nil {
-			count++
-		}
-	}
+	c.mu.Lock()
+	count := c.count
+	c.mu.Unlock()
+
 	return count
 }
 
@@ -167,11 +203,11 @@ func (c *NumericRangeBucketCache) MaxCardinality() uint64 {
 }
 
 func (c *NumericRangeBucketCache) InheritFrom(prev *NumericRangeBucketCache, nextIndex []indexdata.FieldStorage, fields schema.IndexedFieldMap) {
-	if len(c.slots) == 0 {
+	if len(c.slots) == 0 || nextIndex == nil || len(fields) == 0 {
 		return
 	}
 	prev.mu.Lock()
-	defer prev.mu.Unlock()
+	c.mu.Lock()
 
 	for i := range prev.slots {
 		slot := prev.slots[i]
@@ -179,15 +215,30 @@ func (c *NumericRangeBucketCache) InheritFrom(prev *NumericRangeBucketCache, nex
 			continue
 		}
 		acc, ok := fields[slot.field]
-		if !ok || nextIndex == nil || acc.Ordinal >= len(nextIndex) {
+		if !ok || acc.Ordinal >= len(nextIndex) || acc.Ordinal >= len(c.slots) {
 			continue
 		}
 		if nextIndex[acc.Ordinal] != slot.entry.storage {
 			continue
 		}
 		slot.entry.Retain()
-		c.StoreSlot(slot.field, acc.Ordinal, slot.entry)
+		prevSlot := c.slots[acc.Ordinal]
+		if prevSlot.entry == nil {
+			c.count++
+		}
+		if c.fieldIndex != nil {
+			if prevSlot.field != "" {
+				delete(c.fieldIndex, prevSlot.field)
+			}
+			c.fieldIndex[slot.field] = slot.entry
+		}
+		c.slots[acc.Ordinal] = numericRangeBucketCacheSlot{
+			field: slot.field,
+			entry: slot.entry,
+		}
 	}
+	c.mu.Unlock()
+	prev.mu.Unlock()
 }
 
 func (c *NumericRangeBucketCache) release() {
@@ -460,8 +511,8 @@ func BuildNumericRangeBucketIndex(ov indexdata.FieldOverlay, bucketSize, minFiel
 	if ov.KeyCount() < minFieldKeys {
 		return NumericRangeBucketIndex{}, false
 	}
-	if bucketSize < 16 {
-		bucketSize = 16
+	if bucketSize < numericRangeBucketMinSize {
+		bucketSize = numericRangeBucketMinSize
 	}
 
 	keyCount := ov.KeyCount()
@@ -472,9 +523,9 @@ func BuildNumericRangeBucketIndex(ov indexdata.FieldOverlay, bucketSize, minFiel
 }
 
 func numericRangeFullSpanCacheKey(start, end int) uint64 {
-	return uint64(uint32(start))<<32 | uint64(uint32(end))
+	return uint64(uint32(start))<<numericRangeFullSpanCacheCoordBits | uint64(uint32(end))
 }
 
 func numericRangeFullSpanCacheBounds(key uint64) (int, int) {
-	return int(uint32(key >> 32)), int(uint32(key))
+	return int(uint32(key >> numericRangeFullSpanCacheCoordBits)), int(uint32(key))
 }
