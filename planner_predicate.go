@@ -24,16 +24,16 @@ type predicate struct {
 	iter     func() posting.Iterator
 	estCard  uint64
 
-	kind          predicateKind
-	iterKind      predicateIterKind
-	posting       posting.List
-	ids           posting.List
-	rangeMat      bool
-	postsBuf      []posting.List
-	releaseIDs    bool
-	postsAnyState *postsAnyFilterState
-	overlayState  *overlayRangePredicateState
-	lazyMatState  *lazyMaterializedPredicateState
+	kind                 predicateKind
+	iterKind             predicateIterKind
+	posting              posting.List
+	ids                  posting.List
+	rangeMat             bool
+	postsBuf             []posting.List
+	releaseIDs           bool
+	postsAnyState        *postsAnyFilterState
+	fieldIndexRangeState *fieldIndexRangePredicateState
+	lazyMatState         *lazyMaterializedPredicateState
 
 	alwaysTrue  bool
 	alwaysFalse bool
@@ -170,7 +170,7 @@ func (ps *predicateSet) Release() {
 }
 
 func (p *predicate) hasRuntimeRangeState() bool {
-	return p.overlayState != nil
+	return p.fieldIndexRangeState != nil
 }
 
 func (p *predicate) isMaterializedLike() bool {
@@ -188,36 +188,36 @@ func (p *predicate) setExpectedContainsCalls(expected int) {
 	if p.postsAnyState != nil {
 		p.postsAnyState.setExpectedContainsCalls(expected)
 	}
-	if p.overlayState != nil {
-		p.overlayState.setExpectedContainsCalls(expected)
+	if p.fieldIndexRangeState != nil {
+		p.fieldIndexRangeState.setExpectedContainsCalls(expected)
 	}
 }
 
 func (p *predicate) runtimeRangeIter() (posting.Iterator, bool) {
-	if p.overlayState != nil {
-		return p.overlayState.newIter(), true
+	if p.fieldIndexRangeState != nil {
+		return p.fieldIndexRangeState.newIter(), true
 	}
 	return nil, false
 }
 
 func (p *predicate) runtimeRangeMatches(idx uint64) (bool, bool) {
-	if p.overlayState != nil {
-		return p.overlayState.matches(idx), true
+	if p.fieldIndexRangeState != nil {
+		return p.fieldIndexRangeState.matches(idx), true
 	}
 	return false, false
 }
 
 func (p *predicate) runtimeRangeCountBucket(bucket posting.List) (uint64, bool, bool) {
-	if p.overlayState != nil {
-		in, ok := p.overlayState.countBucket(bucket)
+	if p.fieldIndexRangeState != nil {
+		in, ok := p.fieldIndexRangeState.countBucket(bucket)
 		return in, ok, true
 	}
 	return 0, false, false
 }
 
 func (p *predicate) runtimeRangeApply(dst posting.List) (posting.List, bool, bool) {
-	if p.overlayState != nil {
-		next, ok := p.overlayState.applyToPosting(dst)
+	if p.fieldIndexRangeState != nil {
+		next, ok := p.fieldIndexRangeState.applyToPosting(dst)
 		return next, ok, true
 	}
 	return posting.List{}, false, false
@@ -848,7 +848,7 @@ func (qv *queryView) shouldUseCandidateOrder(o qir.Order, leaves []qir.Expr) boo
 	if fm == nil || fm.Slice {
 		return false
 	}
-	if !qv.fieldOverlayForOrder(o).HasData() {
+	if !qv.fieldIndexViewForOrder(o).HasData() {
 		return false
 	}
 	if len(leaves) < 2 {
@@ -918,7 +918,7 @@ func (qv *queryView) buildPredicateCandidate(e qir.Expr) (predicate, bool) {
 	if fm == nil {
 		return predicate{}, false
 	}
-	ov := qv.fieldOverlayForExpr(e)
+	ov := qv.fieldIndexViewForExpr(e)
 
 	switch e.Op {
 
@@ -960,7 +960,7 @@ func (qv *queryView) buildPredicateCandidate(e qir.Expr) (predicate, bool) {
 	}
 }
 
-func (qv *queryView) buildPredEqCandidate(e qir.Expr, fm *schema.Field, ov indexdata.FieldOverlay) (predicate, bool) {
+func (qv *queryView) buildPredEqCandidate(e qir.Expr, fm *schema.Field, ov indexdata.FieldIndexView) (predicate, bool) {
 	key, isSlice, isNil, err := qv.exprValueToLookupKey(qir.Expr{
 		Op:           e.Op,
 		FieldOrdinal: e.FieldOrdinal,
@@ -975,7 +975,7 @@ func (qv *queryView) buildPredEqCandidate(e qir.Expr, fm *schema.Field, ov index
 			return predicate{}, false
 		}
 		if isNil {
-			ids := qv.nilFieldOverlayForExpr(e).LookupPostingRetained(nilIndexEntryKey)
+			ids := qv.nilFieldIndexViewForExpr(e).LookupPostingRetained(nilIndexEntryKey)
 			if e.Not {
 				if ids.IsEmpty() {
 					return predicate{expr: e, alwaysTrue: true}, true
@@ -1072,7 +1072,7 @@ func (qv *queryView) buildPredEqCandidate(e qir.Expr, fm *schema.Field, ov index
 	}, true
 }
 
-func (qv *queryView) buildPredInCandidate(e qir.Expr, fm *schema.Field, ov indexdata.FieldOverlay) (predicate, bool) {
+func (qv *queryView) buildPredInCandidate(e qir.Expr, fm *schema.Field, ov indexdata.FieldIndexView) (predicate, bool) {
 	if fm.Slice {
 		return predicate{}, false
 	}
@@ -1156,7 +1156,7 @@ func (qv *queryView) buildPredInCandidate(e qir.Expr, fm *schema.Field, ov index
 	}, true
 }
 
-func (qv *queryView) buildPredHasCandidate(e qir.Expr, fm *schema.Field, ov indexdata.FieldOverlay) (predicate, bool) {
+func (qv *queryView) buildPredHasCandidate(e qir.Expr, fm *schema.Field, ov indexdata.FieldIndexView) (predicate, bool) {
 	if !fm.Slice {
 		return predicate{}, false
 	}
@@ -1281,7 +1281,7 @@ func (qv *queryView) buildPredHasCandidate(e qir.Expr, fm *schema.Field, ov inde
 	}, true
 }
 
-func (qv *queryView) buildPredHasAnyCandidate(e qir.Expr, fm *schema.Field, ov indexdata.FieldOverlay) (predicate, bool) {
+func (qv *queryView) buildPredHasAnyCandidate(e qir.Expr, fm *schema.Field, ov indexdata.FieldIndexView) (predicate, bool) {
 	if !fm.Slice {
 		return predicate{}, false
 	}
@@ -1383,12 +1383,12 @@ func rangeBoundsForOp(op qir.Op, key string) (indexdata.Bounds, bool) {
 	return rb, true
 }
 
-func overlayComplementRangeSpans(ov indexdata.FieldOverlay, br indexdata.OverlayRange) (before, after indexdata.OverlayRange) {
+func fieldIndexComplementRangeSpans(ov indexdata.FieldIndexView, br indexdata.FieldIndexRange) (before, after indexdata.FieldIndexRange) {
 	return ov.RangeByRanks(0, br.BaseStart), ov.RangeByRanks(br.BaseEnd, ov.KeyCount())
 }
 
-type overlayRangeIter struct {
-	cur    indexdata.OverlayCursor
+type fieldIndexRangeIter struct {
+	cur    indexdata.FieldIndexCursor
 	curIt  posting.Iterator
 	single struct {
 		set bool
@@ -1396,13 +1396,13 @@ type overlayRangeIter struct {
 	}
 }
 
-func (it *overlayRangeIter) Release() {
+func (it *fieldIndexRangeIter) Release() {
 	if it != nil {
-		overlayRangeIterPool.Put(it)
+		fieldIndexRangeIterPool.Put(it)
 	}
 }
 
-func (it *overlayRangeIter) HasNext() bool {
+func (it *fieldIndexRangeIter) HasNext() bool {
 	for {
 		if it.single.set {
 			return true
@@ -1431,7 +1431,7 @@ func (it *overlayRangeIter) HasNext() bool {
 	}
 }
 
-func (it *overlayRangeIter) Next() uint64 {
+func (it *fieldIndexRangeIter) Next() uint64 {
 	if !it.HasNext() {
 		return 0
 	}
@@ -1442,11 +1442,11 @@ func (it *overlayRangeIter) Next() uint64 {
 	return it.curIt.Next()
 }
 
-func (qv *queryView) buildPredRangeCandidateWithMode(e qir.Expr, fm *schema.Field, ov indexdata.FieldOverlay, allowMaterialize bool) (predicate, bool) {
+func (qv *queryView) buildPredRangeCandidateWithMode(e qir.Expr, fm *schema.Field, ov indexdata.FieldIndexView, allowMaterialize bool) (predicate, bool) {
 	return qv.buildPredRangeCandidateWithColdMode(e, fm, ov, allowMaterialize, false)
 }
 
-func (qv *queryView) buildPredRangeCandidateWithColdMode(e qir.Expr, fm *schema.Field, ov indexdata.FieldOverlay, allowMaterialize bool, lazyColdMaterialize bool) (predicate, bool) {
+func (qv *queryView) buildPredRangeCandidateWithColdMode(e qir.Expr, fm *schema.Field, ov indexdata.FieldIndexView, allowMaterialize bool, lazyColdMaterialize bool) (predicate, bool) {
 	return qv.buildPredRangeCandidateWithColdModeAndWarmLoad(
 		e,
 		fm,
@@ -1460,7 +1460,7 @@ func (qv *queryView) buildPredRangeCandidateWithColdMode(e qir.Expr, fm *schema.
 func (qv *queryView) buildPredRangeCandidateWithColdModeAndWarmLoad(
 	e qir.Expr,
 	fm *schema.Field,
-	ov indexdata.FieldOverlay,
+	ov indexdata.FieldIndexView,
 	allowMaterialize bool,
 	lazyColdMaterialize bool,
 	allowWarmLoad bool,
@@ -1473,7 +1473,7 @@ func (qv *queryView) buildPredRangeCandidateWithColdModeAndWarmLoad(
 	if done {
 		return pred, true
 	}
-	return core.buildFromOverlay(ov, allowMaterialize, lazyColdMaterialize, allowWarmLoad)
+	return core.buildFromFieldIndexRange(ov, allowMaterialize, lazyColdMaterialize, allowWarmLoad)
 }
 
 func (qv *queryView) buildPredMaterializedCandidate(e qir.Expr) (predicate, bool) {
@@ -1523,7 +1523,7 @@ func (qv *queryView) evalLazyMaterializedPredicateWithKey(raw qir.Expr, cacheKey
 				}
 				return posting.List{}
 			}
-			ov := qv.fieldOverlayForExpr(raw)
+			ov := qv.fieldIndexViewForExpr(raw)
 			if !ov.HasData() {
 				if !cacheKey.IsZero() {
 					qv.snap.StoreMaterializedPredKey(cacheKey, posting.List{})
@@ -1738,7 +1738,7 @@ func (qv *queryView) tryExecLeadScanNoOrderBuckets(q *qir.Shape, preds predicate
 	}
 	lead := preds.Get(leadIdx)
 	e := lead.expr
-	span, ok, err := qv.prepareScalarOverlaySpan(e)
+	span, ok, err := qv.prepareScalarIndexSpan(e)
 	if err != nil || !ok {
 		return nil, false
 	}
@@ -1763,7 +1763,7 @@ func (qv *queryView) execPlanCandidateOrderBasic(q *qir.Shape, preds predicateRe
 		return nil
 	}
 
-	ov := qv.fieldOverlayForOrder(o)
+	ov := qv.fieldIndexViewForOrder(o)
 	if !ov.HasData() {
 		return nil
 	}
@@ -1771,7 +1771,7 @@ func (qv *queryView) execPlanCandidateOrderBasic(q *qir.Shape, preds predicateRe
 	br := ov.RangeForBounds((indexdata.Bounds{Has: true}))
 	var rangeCovered []bool
 	orderField := qv.engine.fieldNameByOrdinal(o.FieldOrdinal)
-	if coveredRange, covered, ok := qv.extractOrderRangeCoverageOverlayReader(orderField, preds, ov); ok {
+	if coveredRange, covered, ok := qv.extractOrderRangeCoverageIndexViewReader(orderField, preds, ov); ok {
 		br = coveredRange
 		rangeCovered = covered
 	}
@@ -1809,17 +1809,17 @@ func (qv *queryView) execPlanCandidateOrderBasic(q *qir.Shape, preds predicateRe
 	return out
 }
 
-func (qv *queryView) extractOrderRangeCoverageOverlayWithBoundsReader(field string, preds predicateReader, ov indexdata.FieldOverlay) (indexdata.Bounds, indexdata.OverlayRange, []bool, bool) {
+func (qv *queryView) extractOrderRangeCoverageIndexViewWithBoundsReader(field string, preds predicateReader, ov indexdata.FieldIndexView) (indexdata.Bounds, indexdata.FieldIndexRange, []bool, bool) {
 	rb, covered, _, ok := qv.collectPredicateRangeBoundsReader(field, preds)
 	if !ok {
-		return indexdata.Bounds{}, indexdata.OverlayRange{}, nil, false
+		return indexdata.Bounds{}, indexdata.FieldIndexRange{}, nil, false
 	}
 
 	return rb, ov.RangeForBounds(rb), covered, true
 }
 
-func (qv *queryView) extractOrderRangeCoverageOverlayReader(field string, preds predicateReader, ov indexdata.FieldOverlay) (indexdata.OverlayRange, []bool, bool) {
-	_, br, covered, ok := qv.extractOrderRangeCoverageOverlayWithBoundsReader(field, preds, ov)
+func (qv *queryView) extractOrderRangeCoverageIndexViewReader(field string, preds predicateReader, ov indexdata.FieldIndexView) (indexdata.FieldIndexRange, []bool, bool) {
+	_, br, covered, ok := qv.extractOrderRangeCoverageIndexViewWithBoundsReader(field, preds, ov)
 	return br, covered, ok
 }
 
@@ -2127,7 +2127,7 @@ func orderedPredicateExpectedRows(orderedWindow int, est, universe uint64) uint6
 	return rows
 }
 
-func orderedOverlayRangeExpectedContainsCalls(state *overlayRangePredicateState, orderedWindow int, universe uint64) int {
+func orderedFieldIndexRangeExpectedContainsCalls(state *fieldIndexRangePredicateState, orderedWindow int, universe uint64) int {
 	if state == nil || orderedWindow <= 0 || universe == 0 {
 		return 0
 	}
@@ -2311,13 +2311,13 @@ func (p predicate) checkCost() uint64 {
 		} else {
 			cost = uint64(n)
 		}
-	case p.overlayState != nil:
-		if !p.overlayState.rangeIDs.IsEmpty() {
+	case p.fieldIndexRangeState != nil:
+		if !p.fieldIndexRangeState.rangeIDs.IsEmpty() {
 			cost = 1
-		} else if p.overlayState.bucketCount <= 1 {
+		} else if p.fieldIndexRangeState.bucketCount <= 1 {
 			cost = 1
-		} else if p.overlayState.bucketCount <= 4 {
-			cost = uint64(p.overlayState.bucketCount)
+		} else if p.fieldIndexRangeState.bucketCount <= 4 {
+			cost = uint64(p.fieldIndexRangeState.bucketCount)
 		} else {
 			cost = 3
 		}
@@ -2901,9 +2901,9 @@ func releasePredicateRuntimeState(p *predicate) {
 	if p == nil {
 		return
 	}
-	if p.overlayState != nil {
-		overlayRangePredicateStatePool.Put(p.overlayState)
-		p.overlayState = nil
+	if p.fieldIndexRangeState != nil {
+		fieldIndexRangePredicateStatePool.Put(p.fieldIndexRangeState)
+		p.fieldIndexRangeState = nil
 	}
 	if p.postsAnyState != nil {
 		postsAnyFilterStatePool.Put(p.postsAnyState)
@@ -3059,7 +3059,7 @@ func (qv *queryView) orderedPredicateScalarRangeRouting(
 	}
 	route.broadComplement = candidate.broadComplementCardinality(universe)
 	route.forceComplement = candidate.plan.useComplement &&
-		candidate.core.qv.nilFieldOverlayForExpr(candidate.core.expr).LookupCardinality(nilIndexEntryKey) > 0
+		candidate.core.qv.nilFieldIndexViewForExpr(candidate.core.expr).LookupCardinality(nilIndexEntryKey) > 0
 	return route
 }
 
@@ -3222,11 +3222,11 @@ func (qv *queryView) buildMergedNumericRangePredicateWithColdModeAndWarmLoad(
 	}
 	var core preparedScalarRangePredicate
 	qv.initPreparedExactScalarRangePredicate(&core, e, fm, bounds)
-	ov := qv.fieldOverlayForExpr(e)
+	ov := qv.fieldIndexViewForExpr(e)
 	if !ov.HasData() {
 		return predicate{}, false
 	}
-	p, ok := core.buildFromOverlay(ov, allowMaterialize, lazyColdMaterialize, allowWarmLoad)
+	p, ok := core.buildFromFieldIndexRange(ov, allowMaterialize, lazyColdMaterialize, allowWarmLoad)
 	if ok {
 		p.effectiveBounds = bounds
 		p.hasEffectiveBounds = true
@@ -3238,9 +3238,9 @@ func (qv *queryView) initOrderedPredicateExpectedContainsCalls(p *predicate, ord
 	if p == nil || orderedWindow <= 0 || universe == 0 {
 		return
 	}
-	if p.overlayState != nil {
+	if p.fieldIndexRangeState != nil {
 		p.setExpectedContainsCalls(
-			orderedOverlayRangeExpectedContainsCalls(p.overlayState, orderedWindow, universe),
+			orderedFieldIndexRangeExpectedContainsCalls(p.fieldIndexRangeState, orderedWindow, universe),
 		)
 	}
 	if p.postsAnyState != nil {
@@ -3499,7 +3499,7 @@ func (qv *queryView) buildPredicateWithColdModeAndWarmLoad(
 	}
 
 	if e.Op.IsScalarRangeOrPrefix() {
-		ov := qv.fieldOverlayForExpr(e)
+		ov := qv.fieldIndexViewForExpr(e)
 		if !ov.HasData() {
 			return predicate{}, false
 		}
@@ -3684,25 +3684,25 @@ func applyRangeProbePostingFilter[T rangePostingFilterProbe](
 	return out, true
 }
 
-type overlayRangeProbe struct {
-	ov            indexdata.FieldOverlay
-	spans         [2]indexdata.OverlayRange
+type fieldIndexRangeProbe struct {
+	ov            indexdata.FieldIndexView
+	spans         [2]indexdata.FieldIndexRange
 	spanCnt       int
 	useComplement bool
 	probeLen      int
 	probeEst      uint64
 }
 
-func newOverlayRangeProbe(
-	ov indexdata.FieldOverlay,
-	br indexdata.OverlayRange,
+func newFieldIndexRangeProbe(
+	ov indexdata.FieldIndexView,
+	br indexdata.FieldIndexRange,
 	useComplement bool,
 	precomputedProbeLen int,
 	precomputedProbeEst uint64,
-) overlayRangeProbe {
-	p := overlayRangeProbe{ov: ov, useComplement: useComplement}
+) fieldIndexRangeProbe {
+	p := fieldIndexRangeProbe{ov: ov, useComplement: useComplement}
 	if useComplement {
-		before, after := overlayComplementRangeSpans(ov, br)
+		before, after := fieldIndexComplementRangeSpans(ov, br)
 		if !before.Empty() {
 			p.spans[p.spanCnt] = before
 			p.spanCnt++
@@ -3724,7 +3724,7 @@ func newOverlayRangeProbe(
 	return p
 }
 
-func (p *overlayRangeProbe) scanStats() {
+func (p *fieldIndexRangeProbe) scanStats() {
 	if p == nil {
 		return
 	}
@@ -3749,7 +3749,7 @@ func (p *overlayRangeProbe) scanStats() {
 	}
 }
 
-func (p overlayRangeProbe) linearContains(idx uint64) bool {
+func (p fieldIndexRangeProbe) linearContains(idx uint64) bool {
 	for i := 0; i < p.spanCnt; i++ {
 		cur := p.ov.NewCursor(p.spans[i], false)
 		for {
@@ -3765,7 +3765,7 @@ func (p overlayRangeProbe) linearContains(idx uint64) bool {
 	return false
 }
 
-func (p overlayRangeProbe) buildAndNotPosting(dst posting.List) posting.List {
+func (p fieldIndexRangeProbe) buildAndNotPosting(dst posting.List) posting.List {
 	if dst.IsEmpty() {
 		return dst
 	}
@@ -3788,7 +3788,7 @@ func (p overlayRangeProbe) buildAndNotPosting(dst posting.List) posting.List {
 	return dst
 }
 
-func (p overlayRangeProbe) appendIntersectingPosting(dst posting.List, builder postingUnionBuilder) postingUnionBuilder {
+func (p fieldIndexRangeProbe) appendIntersectingPosting(dst posting.List, builder postingUnionBuilder) postingUnionBuilder {
 	if dst.IsEmpty() {
 		return builder
 	}
@@ -3805,7 +3805,7 @@ func (p overlayRangeProbe) appendIntersectingPosting(dst posting.List, builder p
 	return builder
 }
 
-func (p overlayRangeProbe) countBucket(bucket posting.List) (uint64, bool) {
+func (p fieldIndexRangeProbe) countBucket(bucket posting.List) (uint64, bool) {
 	if bucket.IsEmpty() {
 		return 0, true
 	}
@@ -4069,7 +4069,7 @@ func chooseOrderedAnchorLeadBufReader(qv *queryView, orderField string, preds pr
 	return lead, lead >= 0
 }
 
-func (qv *queryView) execPlanOrderedBasicAnchored(q *qir.Shape, preds predicateReader, active []int, ov indexdata.FieldOverlay, br indexdata.OverlayRange, trace *queryTrace) ([]uint64, bool) {
+func (qv *queryView) execPlanOrderedBasicAnchored(q *qir.Shape, preds predicateReader, active []int, ov indexdata.FieldIndexView, br indexdata.FieldIndexRange, trace *queryTrace) ([]uint64, bool) {
 	if len(active) < plannerOrderedAnchorMinActive {
 		return nil, false
 	}
@@ -4319,7 +4319,7 @@ func (qv *queryView) execPlanOrderedBasicAnchored(q *qir.Shape, preds predicateR
 	return cursor.out, true
 }
 
-func (qv *queryView) execPlanOrderedBasicAnchoredBuf(q *qir.Shape, preds predicateReader, active []int, ov indexdata.FieldOverlay, br indexdata.OverlayRange, trace *queryTrace) ([]uint64, bool) {
+func (qv *queryView) execPlanOrderedBasicAnchoredBuf(q *qir.Shape, preds predicateReader, active []int, ov indexdata.FieldIndexView, br indexdata.FieldIndexRange, trace *queryTrace) ([]uint64, bool) {
 	if len(active) < plannerOrderedAnchorMinActive {
 		return nil, false
 	}
@@ -4576,14 +4576,14 @@ func (qv *queryView) execPlanOrderedBasicReader(q *qir.Shape, preds predicateRea
 	if fm == nil || fm.Slice {
 		return nil, false
 	}
-	ov := qv.fieldOverlayForOrder(o)
-	nilOV := qv.nilFieldOverlayForOrder(o)
+	ov := qv.fieldIndexViewForOrder(o)
+	nilOV := qv.nilFieldIndexViewForOrder(o)
 	if !ov.HasData() && !nilOV.HasData() {
 		return nil, false
 	}
 
 	orderField := qv.engine.fieldNameByOrdinal(o.FieldOrdinal)
-	rb, br, rangeCovered, ok := qv.extractOrderRangeCoverageOverlayWithBoundsReader(orderField, preds, ov)
+	rb, br, rangeCovered, ok := qv.extractOrderRangeCoverageIndexViewWithBoundsReader(orderField, preds, ov)
 	if !ok {
 		return nil, false
 	}
@@ -4657,15 +4657,15 @@ func (qv *queryView) execPlanOrderedBasicReader(q *qir.Shape, preds predicateRea
 
 // execPlanOrderedBasicFallback scans ordered buckets and applies remaining
 // predicates when ordered-anchor shortcuts are not available.
-func (qv *queryView) execPlanOrderedBasicFallback(q *qir.Shape, preds []predicate, active []int, ov indexdata.FieldOverlay, br indexdata.OverlayRange, trace *queryTrace) []uint64 {
+func (qv *queryView) execPlanOrderedBasicFallback(q *qir.Shape, preds []predicate, active []int, ov indexdata.FieldIndexView, br indexdata.FieldIndexRange, trace *queryTrace) []uint64 {
 	return qv.execPlanOrderedBasicFallbackWithNilTail(q, preds, active, ov, br, "", trace)
 }
 
-func (qv *queryView) execPlanOrderedBasicFallbackWithNilTail(q *qir.Shape, preds []predicate, active []int, ov indexdata.FieldOverlay, br indexdata.OverlayRange, nilTailField string, trace *queryTrace) []uint64 {
-	return qv.scanOrderedOverlayWithPredicatesWithNilTail(q, preds, active, ov, br, q.Order.Desc, nilTailField, trace)
+func (qv *queryView) execPlanOrderedBasicFallbackWithNilTail(q *qir.Shape, preds []predicate, active []int, ov indexdata.FieldIndexView, br indexdata.FieldIndexRange, nilTailField string, trace *queryTrace) []uint64 {
+	return qv.scanOrderedIndexViewWithPredicatesWithNilTail(q, preds, active, ov, br, q.Order.Desc, nilTailField, trace)
 }
 
-func (qv *queryView) scanOrderedOverlayNoPredicatesWithNilTail(q *qir.Shape, ov indexdata.FieldOverlay, br indexdata.OverlayRange, desc bool, nilTailField string, trace *queryTrace) []uint64 {
+func (qv *queryView) scanOrderedIndexViewNoPredicatesWithNilTail(q *qir.Shape, ov indexdata.FieldIndexView, br indexdata.FieldIndexRange, desc bool, nilTailField string, trace *queryTrace) []uint64 {
 	out := make([]uint64, 0, int(q.Limit))
 	cursor := qv.newQueryCursor(out, q.Offset, q.Limit, false, 0)
 
@@ -4683,7 +4683,7 @@ func (qv *queryView) scanOrderedOverlayNoPredicatesWithNilTail(q *qir.Shape, ov 
 	}
 
 	if cursor.need > 0 && nilTailField != "" {
-		ids := qv.nilFieldOverlay(nilTailField).LookupPostingRetained(nilIndexEntryKey)
+		ids := qv.nilFieldIndexView(nilTailField).LookupPostingRetained(nilIndexEntryKey)
 		orderedScanEmitBucketNoPredicates(&cursor, ids, trace, &scanWidth)
 	}
 
@@ -4699,9 +4699,9 @@ func (qv *queryView) scanOrderedOverlayNoPredicatesWithNilTail(q *qir.Shape, ov 
 	return cursor.out
 }
 
-func (qv *queryView) scanOrderedOverlayWithPredicatesWithNilTail(q *qir.Shape, preds []predicate, active []int, ov indexdata.FieldOverlay, br indexdata.OverlayRange, desc bool, nilTailField string, trace *queryTrace) []uint64 {
+func (qv *queryView) scanOrderedIndexViewWithPredicatesWithNilTail(q *qir.Shape, preds []predicate, active []int, ov indexdata.FieldIndexView, br indexdata.FieldIndexRange, desc bool, nilTailField string, trace *queryTrace) []uint64 {
 	if len(active) == 0 {
-		return qv.scanOrderedOverlayNoPredicatesWithNilTail(q, ov, br, desc, nilTailField, trace)
+		return qv.scanOrderedIndexViewNoPredicatesWithNilTail(q, ov, br, desc, nilTailField, trace)
 	}
 
 	out := make([]uint64, 0, int(q.Limit))
@@ -4753,7 +4753,7 @@ func (qv *queryView) scanOrderedOverlayWithPredicatesWithNilTail(q *qir.Shape, p
 	}
 
 	if cursor.need > 0 && nilTailField != "" {
-		ids := qv.nilFieldOverlay(nilTailField).LookupPostingRetained(nilIndexEntryKey)
+		ids := qv.nilFieldIndexView(nilTailField).LookupPostingRetained(nilIndexEntryKey)
 		_, exactWork = orderedScanEmitBucketWithPredicates(
 			&cursor,
 			predicateSliceView(preds),

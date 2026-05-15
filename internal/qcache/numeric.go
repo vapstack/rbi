@@ -442,7 +442,7 @@ func (e *NumericRangeBucketEntry) TryStoreFullSpan(start, end int, ids posting.L
 	return stored.Borrow(), true
 }
 
-func (idx NumericRangeBucketIndex) FullBucketSpan(br indexdata.OverlayRange) (start, end int, ok bool) {
+func (idx NumericRangeBucketIndex) FullBucketSpan(br indexdata.FieldIndexRange) (start, end int, ok bool) {
 	if idx.bucketSize <= 0 || idx.keyCount <= 0 {
 		return 0, 0, false
 	}
@@ -501,7 +501,7 @@ func (idx NumericRangeBucketIndex) BucketSize() int {
 	return idx.bucketSize
 }
 
-func BuildNumericRangeBucketIndex(ov indexdata.FieldOverlay, bucketSize, minFieldKeys int) (NumericRangeBucketIndex, bool) {
+func BuildNumericRangeBucketIndex(ov indexdata.FieldIndexView, bucketSize, minFieldKeys int) (NumericRangeBucketIndex, bool) {
 	if !ov.HasData() {
 		return NumericRangeBucketIndex{}, false
 	}

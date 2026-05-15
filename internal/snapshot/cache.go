@@ -40,7 +40,7 @@ func (s *View) NumericRangeBucketCacheEntry(field string, ordinal int, storage i
 	if entry, ok := cache.LoadSlot(field, ordinal); ok && entry.Storage() == storage {
 		return entry
 	}
-	ov := indexdata.NewFieldOverlayStorage(storage)
+	ov := indexdata.NewFieldIndexViewFromStorage(storage)
 	idx, _ := qcache.BuildNumericRangeBucketIndex(ov, bucketSize, minFieldKeys)
 	entry := qcache.GetNumericRangeBucketEntry(storage, idx, cache.MaxCardinality())
 	if cached, ok := cache.LoadSlot(field, ordinal); ok && cached.Storage() == storage {

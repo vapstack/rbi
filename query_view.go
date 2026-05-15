@@ -225,111 +225,111 @@ func (qv *queryView) snapshotUniverseView() posting.List {
 	return qv.snap.Universe.Borrow()
 }
 
-func fieldOverlayForAccessor(slots []indexdata.FieldStorage, acc schema.IndexedFieldAccessor) indexdata.FieldOverlay {
+func fieldIndexViewFromSlots(slots []indexdata.FieldStorage, acc schema.IndexedFieldAccessor) indexdata.FieldIndexView {
 	if acc.Ordinal >= len(slots) {
-		return indexdata.FieldOverlay{}
+		return indexdata.FieldIndexView{}
 	}
-	return indexdata.NewFieldOverlayStorage(slots[acc.Ordinal])
+	return indexdata.NewFieldIndexViewFromStorage(slots[acc.Ordinal])
 }
 
-func (qv *queryView) indexedOverlayByOrdinal(slots []indexdata.FieldStorage, ordinal int) indexdata.FieldOverlay {
+func (qv *queryView) fieldIndexViewFromSlotsByOrdinal(slots []indexdata.FieldStorage, ordinal int) indexdata.FieldIndexView {
 	acc, ok := qv.indexedFieldAccessorByOrdinal(ordinal)
 	if !ok {
-		return indexdata.FieldOverlay{}
+		return indexdata.FieldIndexView{}
 	}
-	return fieldOverlayForAccessor(slots, acc)
+	return fieldIndexViewFromSlots(slots, acc)
 }
 
-func (qv *queryView) indexedOverlayRef(slots []indexdata.FieldStorage, field string, ordinal int) indexdata.FieldOverlay {
+func (qv *queryView) fieldIndexViewFromSlotsRef(slots []indexdata.FieldStorage, field string, ordinal int) indexdata.FieldIndexView {
 	acc, ok := qv.indexedFieldAccessor(field, ordinal)
 	if !ok {
-		return indexdata.FieldOverlay{}
+		return indexdata.FieldIndexView{}
 	}
-	return fieldOverlayForAccessor(slots, acc)
+	return fieldIndexViewFromSlots(slots, acc)
 }
 
-func (qv *queryView) indexedOverlayByName(slots []indexdata.FieldStorage, field string) indexdata.FieldOverlay {
+func (qv *queryView) fieldIndexViewFromSlotsByName(slots []indexdata.FieldStorage, field string) indexdata.FieldIndexView {
 	acc, ok := qv.indexedFieldAccessorByName(field)
 	if !ok {
-		return indexdata.FieldOverlay{}
+		return indexdata.FieldIndexView{}
 	}
-	return fieldOverlayForAccessor(slots, acc)
+	return fieldIndexViewFromSlots(slots, acc)
 }
 
-func (qv *queryView) indexedOverlayForExpr(slots []indexdata.FieldStorage, expr qir.Expr) indexdata.FieldOverlay {
+func (qv *queryView) fieldIndexViewFromSlotsForExpr(slots []indexdata.FieldStorage, expr qir.Expr) indexdata.FieldIndexView {
 	acc, ok := qv.indexedFieldAccessorByOrdinal(expr.FieldOrdinal)
 	if !ok {
-		return indexdata.FieldOverlay{}
+		return indexdata.FieldIndexView{}
 	}
-	return fieldOverlayForAccessor(slots, acc)
+	return fieldIndexViewFromSlots(slots, acc)
 }
 
-func (qv *queryView) indexedOverlayForOrder(slots []indexdata.FieldStorage, order qir.Order) indexdata.FieldOverlay {
+func (qv *queryView) fieldIndexViewFromSlotsForOrder(slots []indexdata.FieldStorage, order qir.Order) indexdata.FieldIndexView {
 	acc, ok := qv.indexedFieldAccessorByOrdinal(order.FieldOrdinal)
 	if !ok {
-		return indexdata.FieldOverlay{}
+		return indexdata.FieldIndexView{}
 	}
-	return fieldOverlayForAccessor(slots, acc)
+	return fieldIndexViewFromSlots(slots, acc)
 }
 
-func (qv *queryView) fieldOverlayByOrdinal(ordinal int) indexdata.FieldOverlay {
-	return qv.indexedOverlayByOrdinal(qv.snap.Index, ordinal)
+func (qv *queryView) fieldIndexViewByOrdinal(ordinal int) indexdata.FieldIndexView {
+	return qv.fieldIndexViewFromSlotsByOrdinal(qv.snap.Index, ordinal)
 }
 
-func (qv *queryView) fieldOverlayRef(field string, ordinal int) indexdata.FieldOverlay {
-	return qv.indexedOverlayRef(qv.snap.Index, field, ordinal)
+func (qv *queryView) fieldIndexViewRef(field string, ordinal int) indexdata.FieldIndexView {
+	return qv.fieldIndexViewFromSlotsRef(qv.snap.Index, field, ordinal)
 }
 
-func (qv *queryView) fieldOverlay(field string) indexdata.FieldOverlay {
-	return qv.indexedOverlayByName(qv.snap.Index, field)
+func (qv *queryView) fieldIndexView(field string) indexdata.FieldIndexView {
+	return qv.fieldIndexViewFromSlotsByName(qv.snap.Index, field)
 }
 
-func (qv *queryView) fieldOverlayForExpr(expr qir.Expr) indexdata.FieldOverlay {
-	return qv.indexedOverlayForExpr(qv.snap.Index, expr)
+func (qv *queryView) fieldIndexViewForExpr(expr qir.Expr) indexdata.FieldIndexView {
+	return qv.fieldIndexViewFromSlotsForExpr(qv.snap.Index, expr)
 }
 
-func (qv *queryView) fieldOverlayForOrder(order qir.Order) indexdata.FieldOverlay {
-	return qv.indexedOverlayForOrder(qv.snap.Index, order)
+func (qv *queryView) fieldIndexViewForOrder(order qir.Order) indexdata.FieldIndexView {
+	return qv.fieldIndexViewFromSlotsForOrder(qv.snap.Index, order)
 }
 
-func (qv *queryView) nilFieldOverlayByOrdinal(ordinal int) indexdata.FieldOverlay {
-	return qv.indexedOverlayByOrdinal(qv.snap.NilIndex, ordinal)
+func (qv *queryView) nilFieldIndexViewByOrdinal(ordinal int) indexdata.FieldIndexView {
+	return qv.fieldIndexViewFromSlotsByOrdinal(qv.snap.NilIndex, ordinal)
 }
 
-func (qv *queryView) nilFieldOverlayRef(field string, ordinal int) indexdata.FieldOverlay {
-	return qv.indexedOverlayRef(qv.snap.NilIndex, field, ordinal)
+func (qv *queryView) nilFieldIndexViewRef(field string, ordinal int) indexdata.FieldIndexView {
+	return qv.fieldIndexViewFromSlotsRef(qv.snap.NilIndex, field, ordinal)
 }
 
-func (qv *queryView) nilFieldOverlay(field string) indexdata.FieldOverlay {
-	return qv.indexedOverlayByName(qv.snap.NilIndex, field)
+func (qv *queryView) nilFieldIndexView(field string) indexdata.FieldIndexView {
+	return qv.fieldIndexViewFromSlotsByName(qv.snap.NilIndex, field)
 }
 
-func (qv *queryView) nilFieldOverlayForExpr(expr qir.Expr) indexdata.FieldOverlay {
-	return qv.indexedOverlayForExpr(qv.snap.NilIndex, expr)
+func (qv *queryView) nilFieldIndexViewForExpr(expr qir.Expr) indexdata.FieldIndexView {
+	return qv.fieldIndexViewFromSlotsForExpr(qv.snap.NilIndex, expr)
 }
 
-func (qv *queryView) nilFieldOverlayForOrder(order qir.Order) indexdata.FieldOverlay {
-	return qv.indexedOverlayForOrder(qv.snap.NilIndex, order)
+func (qv *queryView) nilFieldIndexViewForOrder(order qir.Order) indexdata.FieldIndexView {
+	return qv.fieldIndexViewFromSlotsForOrder(qv.snap.NilIndex, order)
 }
 
-func (qv *queryView) lenFieldOverlayByOrdinal(ordinal int) indexdata.FieldOverlay {
-	return qv.indexedOverlayByOrdinal(qv.snap.LenIndex, ordinal)
+func (qv *queryView) lenFieldIndexViewByOrdinal(ordinal int) indexdata.FieldIndexView {
+	return qv.fieldIndexViewFromSlotsByOrdinal(qv.snap.LenIndex, ordinal)
 }
 
-func (qv *queryView) lenFieldOverlayRef(field string, ordinal int) indexdata.FieldOverlay {
-	return qv.indexedOverlayRef(qv.snap.LenIndex, field, ordinal)
+func (qv *queryView) lenFieldIndexViewRef(field string, ordinal int) indexdata.FieldIndexView {
+	return qv.fieldIndexViewFromSlotsRef(qv.snap.LenIndex, field, ordinal)
 }
 
-func (qv *queryView) lenFieldOverlay(field string) indexdata.FieldOverlay {
-	return qv.indexedOverlayByName(qv.snap.LenIndex, field)
+func (qv *queryView) lenFieldIndexView(field string) indexdata.FieldIndexView {
+	return qv.fieldIndexViewFromSlotsByName(qv.snap.LenIndex, field)
 }
 
-func (qv *queryView) lenFieldOverlayForExpr(expr qir.Expr) indexdata.FieldOverlay {
-	return qv.indexedOverlayForExpr(qv.snap.LenIndex, expr)
+func (qv *queryView) lenFieldIndexViewForExpr(expr qir.Expr) indexdata.FieldIndexView {
+	return qv.fieldIndexViewFromSlotsForExpr(qv.snap.LenIndex, expr)
 }
 
-func (qv *queryView) lenFieldOverlayForOrder(order qir.Order) indexdata.FieldOverlay {
-	return qv.indexedOverlayForOrder(qv.snap.LenIndex, order)
+func (qv *queryView) lenFieldIndexViewForOrder(order qir.Order) indexdata.FieldIndexView {
+	return qv.fieldIndexViewFromSlotsForOrder(qv.snap.LenIndex, order)
 }
 
 func (qv *queryView) hasIndexedFieldOrdinal(ordinal int) bool {

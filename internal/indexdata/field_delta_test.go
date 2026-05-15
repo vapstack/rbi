@@ -402,8 +402,8 @@ func TestFieldStorageApplyPostingDiff_EmptyExistingDeltaDoesNotSharePayload(t *t
 	if got == base {
 		t.Fatalf("expected inserted key to create new storage")
 	}
-	baseOV := NewFieldOverlayStorage(base)
-	gotOV := NewFieldOverlayStorage(got)
+	baseOV := NewFieldIndexViewFromStorage(base)
+	gotOV := NewFieldIndexViewFromStorage(got)
 	if baseOV.KeyCount() != 1 || gotOV.KeyCount() != 2 {
 		t.Fatalf("unexpected flat storage state")
 	}
@@ -483,7 +483,7 @@ func TestFieldStorageMergeStringPostingAddsOwned_SortsAndDeduplicates(t *testing
 	storage := FieldStorage{}.MergeStringPostingAddsOwned(adds, arena, false, false)
 	defer storage.Release()
 
-	ov := NewFieldOverlayStorage(storage)
+	ov := NewFieldIndexViewFromStorage(storage)
 	if ov.KeyCount() != 2 {
 		t.Fatalf("unexpected key count: got %d want 2", ov.KeyCount())
 	}
@@ -507,7 +507,7 @@ func TestFieldStorageMergeFixedPostingAddsOwned_SortsAndDeduplicates(t *testing.
 	storage := FieldStorage{}.MergeFixedPostingAddsOwned(adds, arena, false)
 	defer storage.Release()
 
-	ov := NewFieldOverlayStorage(storage)
+	ov := NewFieldIndexViewFromStorage(storage)
 	if ov.KeyCount() != 2 {
 		t.Fatalf("unexpected key count: got %d want 2", ov.KeyCount())
 	}
@@ -538,7 +538,7 @@ func TestFieldStorageApplyStringPostingDiffOwned_UpdatesAndRemoves(t *testing.T)
 	storage := base.ApplyStringPostingDiffOwned(deltas, arena, false, false)
 	defer storage.Release()
 
-	ov := NewFieldOverlayStorage(storage)
+	ov := NewFieldIndexViewFromStorage(storage)
 	if ov.LookupCardinality("a") != 0 {
 		t.Fatalf("removed string key still has posting")
 	}
@@ -563,7 +563,7 @@ func TestFieldStorageApplyFixedPostingDiffOwned_UpdatesAndRemoves(t *testing.T) 
 	storage := base.ApplyFixedPostingDiffOwned(deltas, arena, false)
 	defer storage.Release()
 
-	ov := NewFieldOverlayStorage(storage)
+	ov := NewFieldIndexViewFromStorage(storage)
 	if ov.LookupCardinality(keycodec.U64ByteString(2)) != 0 {
 		t.Fatalf("removed fixed key still has posting")
 	}
@@ -588,7 +588,7 @@ func TestFieldStorageApplyLenPostingDiffOwned_UpdatesNonEmptyMarker(t *testing.T
 	storage := base.ApplyLenPostingDiffOwned(deltas)
 	defer storage.Release()
 
-	ov := NewFieldOverlayStorage(storage)
+	ov := NewFieldIndexViewFromStorage(storage)
 	if ov.LookupCardinality(keycodec.U64ByteString(1)) != 0 {
 		t.Fatalf("old len bucket still has posting")
 	}

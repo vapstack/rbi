@@ -688,7 +688,7 @@ func (qv *queryView) baselineTryQueryRangeNoOrderWithLimit(q *qx.QX) ([]uint64, 
 		return nil, false, nil
 	}
 
-	ov := qv.fieldOverlay(f)
+	ov := qv.fieldIndexView(f)
 	if !ov.HasData() {
 		return nil, true, nil
 	}
@@ -705,7 +705,7 @@ func (qv *queryView) baselineTryQueryRangeNoOrderWithLimit(q *qx.QX) ([]uint64, 
 		}
 		isNil = eqNil
 		if isNil {
-			ids := qv.nilFieldOverlay(f).LookupPostingRetained(nilIndexEntryKey)
+			ids := qv.nilFieldIndexView(f).LookupPostingRetained(nilIndexEntryKey)
 			if ids.IsEmpty() {
 				return nil, true, nil
 			}
@@ -793,7 +793,7 @@ func (qv *queryView) baselineTryQueryPrefixNoOrderWithLimit(q *qx.QX) ([]uint64,
 		return nil, true, nil
 	}
 
-	ov := qv.fieldOverlay(f)
+	ov := qv.fieldIndexView(f)
 	if !ov.HasData() {
 		if !qv.hasIndexedField(f) {
 			return nil, true, fmt.Errorf("no index for field: %v", f)
@@ -830,7 +830,7 @@ func (qv *queryView) baselineTryQueryPrefixNoOrderWithLimit(q *qx.QX) ([]uint64,
 	return cursor.out, true, nil
 }
 
-func baselineScanLimitByOverlayBounds(db *queryView, q *qx.QX, ov indexdata.FieldOverlay, br indexdata.OverlayRange, desc bool, preds *pooled.Slice[leafPred], nilTailField string) []uint64 {
+func baselineScanLimitByFieldIndexBounds(db *queryView, q *qx.QX, ov indexdata.FieldIndexView, br indexdata.FieldIndexRange, desc bool, preds *pooled.Slice[leafPred], nilTailField string) []uint64 {
 	limit := int(q.Window.Limit)
 	out := make([]uint64, 0, limit)
 	cursor := db.newQueryCursor(out, 0, q.Window.Limit, false, 0)
@@ -880,7 +880,7 @@ func baselineScanLimitByOverlayBounds(db *queryView, q *qx.QX, ov indexdata.Fiel
 	}
 
 	if nilTailField != "" {
-		ids := db.engine.currentQueryViewForTests().nilFieldOverlay(nilTailField).LookupPostingRetained(nilIndexEntryKey)
+		ids := db.engine.currentQueryViewForTests().nilFieldIndexView(nilTailField).LookupPostingRetained(nilIndexEntryKey)
 		if !ids.IsEmpty() && emitBucketPosting(ids) {
 			return cursor.out
 		}
@@ -1062,8 +1062,8 @@ func TestQuery_LimitRangeNoOrder_ResidualsUseBucketExactFilter(t *testing.T) {
 		defer leafPredSlicePool.Put(predsBuf)
 	}
 
-	br := view.fieldOverlay(f).RangeForBounds(bounds)
-	want := baselineScanLimitByOverlayBounds(view, q, view.fieldOverlay(f), br, false, predsBuf, "")
+	br := view.fieldIndexView(f).RangeForBounds(bounds)
+	want := baselineScanLimitByFieldIndexBounds(view, q, view.fieldIndexView(f), br, false, predsBuf, "")
 
 	preparedQ, viewQ, err := prepareTestQuery(db.engine, q)
 	if err != nil {
@@ -1160,9 +1160,9 @@ func TestQuery_LimitOrderBasic_ResidualsUseBucketExactFilter(t *testing.T) {
 		defer leafPredSlicePool.Put(predsBuf)
 	}
 
-	ov := view.fieldOverlay("age")
+	ov := view.fieldIndexView("age")
 	br := ov.RangeForBounds(bounds)
-	want := baselineScanLimitByOverlayBounds(view, q, ov, br, false, predsBuf, "")
+	want := baselineScanLimitByFieldIndexBounds(view, q, ov, br, false, predsBuf, "")
 
 	preparedQ, viewQ, err := prepareTestQuery(db.engine, q)
 	if err != nil {

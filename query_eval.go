@@ -199,7 +199,7 @@ func (qv *queryView) evalAndOperands(ops []qir.Expr, negate bool) (postingResult
 // immutable snapshot indexes.
 func (qv *queryView) evalSimple(e qir.Expr) (postingResult, error) {
 	fieldName := qv.engine.fieldNameByOrdinal(e.FieldOrdinal)
-	ov := qv.fieldOverlayForExpr(e)
+	ov := qv.fieldIndexViewForExpr(e)
 	if !ov.HasData() && !qv.hasIndexedFieldForExpr(e) {
 		return postingResult{}, fmt.Errorf("no index for field: %v", fieldName)
 	}
@@ -222,7 +222,7 @@ func (qv *queryView) evalSimple(e qir.Expr) (postingResult, error) {
 
 			var ids posting.List
 			if isNil {
-				ids = qv.nilFieldOverlayForExpr(e).LookupPostingRetained(nilIndexEntryKey)
+				ids = qv.nilFieldIndexViewForExpr(e).LookupPostingRetained(nilIndexEntryKey)
 			} else {
 				ids = lookupScalarPostingRetained(ov, key)
 			}
@@ -278,7 +278,7 @@ func (qv *queryView) evalSimple(e qir.Expr) (postingResult, error) {
 			builder.addPosting(ids)
 		}
 		if hasNil {
-			ids := qv.nilFieldOverlayForExpr(e).LookupPostingRetained(nilIndexEntryKey)
+			ids := qv.nilFieldIndexViewForExpr(e).LookupPostingRetained(nilIndexEntryKey)
 			if !ids.IsEmpty() {
 				builder.addPosting(ids)
 			}
@@ -474,7 +474,7 @@ func parallelBatchedPostingUnionOwned(posts []posting.List) posting.List {
 // this path can stay read-only.
 func (qv *queryView) evalSliceEQ(field string, fieldOrdinal int, vals []string) (postingResult, error) {
 	valCount := len(vals)
-	lenOV := qv.lenFieldOverlayRef(field, fieldOrdinal)
+	lenOV := qv.lenFieldIndexViewRef(field, fieldOrdinal)
 
 	useZeroComplement := valCount == 0 && qv.isLenZeroComplementRef(field, fieldOrdinal)
 
@@ -499,7 +499,7 @@ func (qv *queryView) evalSliceEQ(field string, fieldOrdinal int, vals []string) 
 		return postingResult{}, nil
 	}
 
-	ov := qv.fieldOverlayRef(field, fieldOrdinal)
+	ov := qv.fieldIndexViewRef(field, fieldOrdinal)
 	acc := lenBM.Clone()
 	for i := 0; i < valCount; i++ {
 		ids := ov.LookupPostingRetained(vals[i])
@@ -559,14 +559,14 @@ func normalizedScalarBoundFromIndexKey(op qir.Op, key keycodec.IndexKey) normali
 	}
 }
 
-func lookupScalarPostingRetained(ov indexdata.FieldOverlay, key keycodec.IndexLookupKey) posting.List {
+func lookupScalarPostingRetained(ov indexdata.FieldIndexView, key keycodec.IndexLookupKey) posting.List {
 	if key.IsNumeric() {
 		return ov.LookupPostingRetainedKey(key.IndexKey())
 	}
 	return ov.LookupPostingRetained(key.StringKey())
 }
 
-func lookupScalarCardinality(ov indexdata.FieldOverlay, key keycodec.IndexLookupKey) uint64 {
+func lookupScalarCardinality(ov indexdata.FieldIndexView, key keycodec.IndexLookupKey) uint64 {
 	if key.IsNumeric() {
 		return ov.LookupCardinalityKey(key.IndexKey())
 	}
@@ -1084,7 +1084,7 @@ func (qv *queryView) scalarLookupPostings(field string, fieldOrdinal int, keys [
 	postsBuf := posting.GetSlice(keyCount + btoi(includeNil))
 	var est uint64
 
-	ov := qv.fieldOverlayRef(field, fieldOrdinal)
+	ov := qv.fieldIndexViewRef(field, fieldOrdinal)
 	for i := 0; i < keyCount; i++ {
 		ids := ov.LookupPostingRetained(keys[i])
 		if ids.IsEmpty() {
@@ -1094,7 +1094,7 @@ func (qv *queryView) scalarLookupPostings(field string, fieldOrdinal int, keys [
 		est += ids.Cardinality()
 	}
 	if includeNil {
-		ids := qv.nilFieldOverlayRef(field, fieldOrdinal).LookupPostingRetained(nilIndexEntryKey)
+		ids := qv.nilFieldIndexViewRef(field, fieldOrdinal).LookupPostingRetained(nilIndexEntryKey)
 		if !ids.IsEmpty() {
 			postsBuf = append(postsBuf, ids)
 			est += ids.Cardinality()

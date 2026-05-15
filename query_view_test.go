@@ -324,7 +324,7 @@ func (qe *queryEngine) execPlanOrderedBasic(q *qx.QX, preds []predicate, trace *
 	return qe.currentQueryViewForTests().execPlanOrderedBasicReader(&viewQ, predicateSliceView(preds), trace)
 }
 
-func (qe *queryEngine) execPlanOrderedBasicFallback(q *qx.QX, preds []predicate, active []int, ov indexdata.FieldOverlay, br indexdata.OverlayRange, trace *queryTrace) []uint64 {
+func (qe *queryEngine) execPlanOrderedBasicFallback(q *qx.QX, preds []predicate, active []int, ov indexdata.FieldIndexView, br indexdata.FieldIndexRange, trace *queryTrace) []uint64 {
 	prepared, viewQ, err := prepareTestQuery(qe, q)
 	if err != nil {
 		return nil
@@ -419,7 +419,7 @@ func (qe *queryEngine) materializedPredCacheKey(e qx.Expr) string {
 	return qe.currentQueryViewForTests().materializedPredCacheKey(expr)
 }
 
-func (qe *queryEngine) buildPredRangeCandidateWithMode(e qx.Expr, fm *schema.Field, ov indexdata.FieldOverlay, allowMaterialize bool) (predicate, bool) {
+func (qe *queryEngine) buildPredRangeCandidateWithMode(e qx.Expr, fm *schema.Field, ov indexdata.FieldIndexView, allowMaterialize bool) (predicate, bool) {
 	prepared, expr, err := prepareTestExpr(qe, e)
 	if err != nil {
 		return predicate{}, false
@@ -457,8 +457,8 @@ func (qe *queryEngine) collectOrderRangeBounds(field string, n int, exprAt func(
 	return rb, copyBoolBufAndRelease(covered), has, ok
 }
 
-func (qe *queryEngine) extractOrderRangeCoverageOverlay(field string, preds []predicate, ov indexdata.FieldOverlay) (indexdata.OverlayRange, []bool, bool) {
-	br, covered, ok := qe.currentQueryViewForTests().extractOrderRangeCoverageOverlayReader(field, predicateSliceView(preds), ov)
+func (qe *queryEngine) extractOrderRangeCoverageIndexView(field string, preds []predicate, ov indexdata.FieldIndexView) (indexdata.FieldIndexRange, []bool, bool) {
+	br, covered, ok := qe.currentQueryViewForTests().extractOrderRangeCoverageIndexViewReader(field, predicateSliceView(preds), ov)
 	return br, copyBoolBufAndRelease(covered), ok
 }
 

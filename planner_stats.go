@@ -2,12 +2,13 @@ package rbi
 
 import (
 	"errors"
-	"github.com/vapstack/rbi/internal/indexdata"
-	"github.com/vapstack/rbi/internal/snapshot"
 	"math"
 	"math/rand/v2"
 	"sort"
 	"time"
+
+	"github.com/vapstack/rbi/internal/indexdata"
+	"github.com/vapstack/rbi/internal/snapshot"
 )
 
 const (
@@ -100,7 +101,7 @@ func (qe *queryEngine) refreshPlannerStatsWithBudgetOnSnapshot(snap *snapshot.Vi
 		}
 		fieldName := fieldNames[fieldIdx]
 
-		stats := qe.collectPlannerFieldStatsFromOverlay(snap, fieldName)
+		stats := qe.collectPlannerFieldStatsFromIndexView(snap, fieldName)
 		out.Fields[fieldName] = stats
 		processed++
 	}
@@ -115,19 +116,19 @@ func (qe *queryEngine) refreshPlannerStatsWithBudgetOnSnapshot(snap *snapshot.Vi
 	qe.planner.stats.Store(&out)
 }
 
-func (qe *queryEngine) collectPlannerFieldStatsFromOverlay(s *snapshot.View, fieldName string) PlannerFieldStats {
+func (qe *queryEngine) collectPlannerFieldStatsFromIndexView(s *snapshot.View, fieldName string) PlannerFieldStats {
 	acc, ok := qe.schema.IndexedByName[fieldName]
 	if !ok || s.Index == nil || acc.Ordinal >= len(s.Index) {
 		return PlannerFieldStats{}
 	}
-	ov := indexdata.NewFieldOverlayStorage(s.Index[acc.Ordinal])
+	ov := indexdata.NewFieldIndexViewFromStorage(s.Index[acc.Ordinal])
 	if !ov.HasData() {
 		return PlannerFieldStats{}
 	}
-	return plannerFieldOverlayStats(ov)
+	return plannerFieldIndexViewStats(ov)
 }
 
-func plannerFieldOverlayStats(o indexdata.FieldOverlay) PlannerFieldStats {
+func plannerFieldIndexViewStats(o indexdata.FieldIndexView) PlannerFieldStats {
 	var (
 		total    uint64
 		maxCard  uint64
@@ -361,7 +362,7 @@ func (qe *queryEngine) buildPlannerStatsSnapshot(snap *snapshot.View, version ui
 	}
 
 	for _, fieldName := range fields {
-		out.Fields[fieldName] = qe.collectPlannerFieldStatsFromOverlay(snap, fieldName)
+		out.Fields[fieldName] = qe.collectPlannerFieldStatsFromIndexView(snap, fieldName)
 	}
 
 	return out

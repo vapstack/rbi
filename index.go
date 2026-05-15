@@ -604,7 +604,7 @@ func (qe *queryEngine) buildLenIndexStorage(index []indexdata.FieldStorage, univ
 		if !acc.Field.Slice {
 			continue
 		}
-		storage, useZeroComplement := indexdata.RebuildLenFieldStorageFromOverlay(universe, indexdata.NewFieldOverlayStorage(index[acc.Ordinal]))
+		storage, useZeroComplement := indexdata.RebuildLenFieldStorageFromIndexView(universe, indexdata.NewFieldIndexViewFromStorage(index[acc.Ordinal]))
 		lenIndex[acc.Ordinal] = storage
 		if useZeroComplement {
 			lenZeroComplement[acc.Ordinal] = true
@@ -883,7 +883,7 @@ func detectLenZeroComplement(indexes []indexdata.FieldStorage, access []schema.I
 		if acc.Ordinal >= len(indexes) {
 			continue
 		}
-		if indexdata.NewFieldOverlayStorage(indexes[acc.Ordinal]).LookupCardinality(indexdata.LenIndexNonEmptyKey) > 0 {
+		if indexdata.NewFieldIndexViewFromStorage(indexes[acc.Ordinal]).LookupCardinality(indexdata.LenIndexNonEmptyKey) > 0 {
 			out[acc.Ordinal] = true
 		}
 	}

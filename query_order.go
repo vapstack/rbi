@@ -323,7 +323,7 @@ func (qv *queryView) emitArrayCountZeroBucketResult(cursor *queryCursor, result 
 	return false
 }
 
-func (qv *queryView) queryOrderBasic(result postingResult, ov indexdata.FieldOverlay, o qir.Order, skip, need uint64, all bool) ([]uint64, error) {
+func (qv *queryView) queryOrderBasic(result postingResult, ov indexdata.FieldIndexView, o qir.Order, skip, need uint64, all bool) ([]uint64, error) {
 	resultCard := qv.postingResultCardinality(result)
 	if resultCard == 0 {
 		return nil, nil
@@ -350,7 +350,7 @@ func (qv *queryView) queryOrderBasic(result postingResult, ov indexdata.FieldOve
 		if fm := qv.fieldMetaByOrder(o); fm != nil && fm.Ptr {
 			out = appendMaterializedNumericPostingResultKeys(
 				out,
-				qv.nilFieldOverlayForOrder(o).LookupPostingRetained(nilIndexEntryKey),
+				qv.nilFieldIndexViewForOrder(o).LookupPostingRetained(nilIndexEntryKey),
 				result,
 			)
 		}
@@ -379,7 +379,7 @@ func (qv *queryView) queryOrderBasic(result postingResult, ov indexdata.FieldOve
 	}
 
 	if fm := qv.fieldMetaByOrder(o); fm != nil && fm.Ptr {
-		nilIDs := qv.nilFieldOverlayForOrder(o).LookupPostingRetained(nilIndexEntryKey)
+		nilIDs := qv.nilFieldIndexViewForOrder(o).LookupPostingRetained(nilIndexEntryKey)
 		if !nilIDs.IsEmpty() {
 			var done bool
 			tmp, done = emitPostingResultBucketToCursor(qv, &cursor, tmp, nilIDs, result)
@@ -433,7 +433,7 @@ func orderedDistinctStrings(vals []string, desc bool) []string {
 	return vals
 }
 
-func scalarArrayPosPriorityCoversAllKeysOverlay(ov indexdata.FieldOverlay, vals []string) bool {
+func scalarArrayPosPriorityCoversAllKeysIndexView(ov indexdata.FieldIndexView, vals []string) bool {
 	if !ov.HasData() {
 		return true
 	}
@@ -474,8 +474,8 @@ func scalarArrayPosPriorityCoversAllKeysOverlay(ov indexdata.FieldOverlay, vals 
 	}
 }
 
-func scalarArrayPosPriorityCoversAllResultsOverlay(resultBM posting.List, ov, nilOV indexdata.FieldOverlay, vals []string) bool {
-	if !scalarArrayPosPriorityCoversAllKeysOverlay(ov, vals) {
+func scalarArrayPosPriorityCoversAllResultsIndexView(resultBM posting.List, ov, nilOV indexdata.FieldIndexView, vals []string) bool {
+	if !scalarArrayPosPriorityCoversAllKeysIndexView(ov, vals) {
 		return false
 	}
 	if !nilOV.HasData() {
@@ -484,7 +484,7 @@ func scalarArrayPosPriorityCoversAllResultsOverlay(resultBM posting.List, ov, ni
 	return !nilOV.LookupPostingRetained(nilIndexEntryKey).Intersects(resultBM)
 }
 
-func (qv *queryView) queryOrderArrayPosOverlay(result postingResult, ov indexdata.FieldOverlay, o qir.Order, skip, need uint64, all bool) ([]uint64, error) {
+func (qv *queryView) queryOrderArrayPosIndexView(result postingResult, ov indexdata.FieldIndexView, o qir.Order, skip, need uint64, all bool) ([]uint64, error) {
 	resultCard := qv.postingResultCardinality(result)
 	if resultCard == 0 {
 		return nil, nil
@@ -495,7 +495,7 @@ func (qv *queryView) queryOrderArrayPosOverlay(result postingResult, ov indexdat
 		return nil, err
 	}
 	if fm := qv.fieldMetaByOrder(o); fm != nil && !fm.Slice {
-		return qv.queryOrderArrayPosScalarOverlay(result, qv.engine.fieldNameByOrdinal(o.FieldOrdinal), o.FieldOrdinal, ov, vals, o.Desc, skip, need, all)
+		return qv.queryOrderArrayPosScalarIndexView(result, qv.engine.fieldNameByOrdinal(o.FieldOrdinal), o.FieldOrdinal, ov, vals, o.Desc, skip, need, all)
 	}
 
 	out := makeOutSlice(resultCard, need)
@@ -529,17 +529,17 @@ func (qv *queryView) queryOrderArrayPosOverlay(result postingResult, ov indexdat
 	return cursor.out, nil
 }
 
-func (qv *queryView) queryOrderArrayPosScalarOverlay(result postingResult, field string, fieldOrdinal int, ov indexdata.FieldOverlay, vals []string, desc bool, skip, need uint64, all bool) ([]uint64, error) {
+func (qv *queryView) queryOrderArrayPosScalarIndexView(result postingResult, field string, fieldOrdinal int, ov indexdata.FieldIndexView, vals []string, desc bool, skip, need uint64, all bool) ([]uint64, error) {
 	resultCard := qv.postingResultCardinality(result)
 	if resultCard == 0 {
 		return nil, nil
 	}
-	nilOV := indexdata.FieldOverlay{}
+	nilOV := indexdata.FieldIndexView{}
 	if fm := qv.fieldMeta(field, fieldOrdinal); fm != nil && fm.Ptr {
-		nilOV = qv.nilFieldOverlayRef(field, fieldOrdinal)
+		nilOV = qv.nilFieldIndexViewRef(field, fieldOrdinal)
 	}
 	orderedVals := orderedDistinctStrings(vals, desc)
-	coversAll := !result.neg && len(orderedVals) > 0 && scalarArrayPosPriorityCoversAllResultsOverlay(result.ids, ov, nilOV, orderedVals)
+	coversAll := !result.neg && len(orderedVals) > 0 && scalarArrayPosPriorityCoversAllResultsIndexView(result.ids, ov, nilOV, orderedVals)
 	// Empty priorities still require a full fallback pass; they just do not need
 	// duplicate tracking against priority buckets because none were emitted.
 	needFallback := result.neg || !coversAll
@@ -628,7 +628,7 @@ func (qv *queryView) orderDataValues(v any, fm *schema.Field) ([]string, error) 
 	return []string{key}, nil
 }
 
-func (qv *queryView) queryOrderArrayCount(result postingResult, ov indexdata.FieldOverlay, o qir.Order, skip, need uint64, all bool, useZeroComplement bool) ([]uint64, error) {
+func (qv *queryView) queryOrderArrayCount(result postingResult, ov indexdata.FieldIndexView, o qir.Order, skip, need uint64, all bool, useZeroComplement bool) ([]uint64, error) {
 	resultCard := qv.postingResultCardinality(result)
 	if resultCard == 0 {
 		return nil, nil

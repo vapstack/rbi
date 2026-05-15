@@ -513,7 +513,7 @@ func TestOrderRangeCoverage_ConsistencyBetweenPredicateKinds(t *testing.T) {
 		{Key: keycodec.FromString("alina"), IDs: postingOf(2)},
 		{Key: keycodec.FromString("bob"), IDs: postingOf(3)},
 	}
-	ov := indexdata.NewFieldOverlay(&s)
+	ov := indexdata.NewFieldIndexView(&s)
 
 	exprs := []qx.Expr{
 		qx.PREFIX("name", "al"),
@@ -529,11 +529,11 @@ func TestOrderRangeCoverage_ConsistencyBetweenPredicateKinds(t *testing.T) {
 		preds[i] = predicate{expr: mustTestQIRExprForDB(t, db, exprs[i])}
 	}
 
-	br1, covOv1, okOv1 := db.engine.extractOrderRangeCoverageOverlay("name", cands, ov)
+	br1, covOv1, okOv1 := db.engine.extractOrderRangeCoverageIndexView("name", cands, ov)
 	if !okOv1 {
 		t.Fatalf("extractOrderRangeCoverageOverlay failed")
 	}
-	br2, covOv2, okOv2 := db.engine.extractOrderRangeCoverageOverlay("name", preds, ov)
+	br2, covOv2, okOv2 := db.engine.extractOrderRangeCoverageIndexView("name", preds, ov)
 	if !okOv2 {
 		t.Fatalf("extractOrderRangeCoverageOverlay failed")
 	}
@@ -1062,7 +1062,7 @@ func TestBuildORBranches_BroadNumericRangeStaysRuntimeOnSecondBuild(t *testing.T
 				if p.isMaterializedLike() || p.lazyMatState != nil {
 					t.Fatalf("expected broad range leaf to stay on runtime state")
 				}
-				if p.overlayState == nil {
+				if p.fieldIndexRangeState == nil {
 					t.Fatalf("expected broad range leaf runtime state")
 				}
 			}
@@ -1686,7 +1686,7 @@ func TestPlannerOROrderBranchIter_ResidualRowsExcludeExactOnlyChecks(t *testing.
 		checks:         checks,
 		exactChecks:    exactChecks,
 		residualChecks: residualChecks,
-		overlay:        indexdata.NewFieldOverlay(&[]indexdata.Entry{{IDs: bucket.Borrow()}}),
+		indexView:      indexdata.NewFieldIndexView(&[]indexdata.Entry{{IDs: bucket.Borrow()}}),
 		single:         -1,
 		exactSingle:    0,
 		residualSingle: 1,
@@ -2550,7 +2550,7 @@ func TestBuildOROrderAnalysis_NonRangeOrderPredicateKeepsOrderedPath(t *testing.
 	}
 	defer analysis.release()
 
-	orderOV := view.fieldOverlayForOrder(viewQ.Order)
+	orderOV := view.fieldIndexViewForOrder(viewQ.Order)
 	if analysis.branches[0].rangeStart != 0 || analysis.branches[0].rangeEnd != orderOV.KeyCount() {
 		t.Fatalf(
 			"expected non-range order predicate branch to keep full-span order coverage, got start=%d end=%d want_end=%d",
@@ -2675,7 +2675,7 @@ func TestPlannerORBranchesOrdered_BoundedCoveredOnlyBranchNotAlwaysTrue(t *testi
 	foundAgeRange := false
 	snap := view.planner.stats.Load()
 	universe := snap.universeOr(view.snapshotUniverseCardinality())
-	ov := view.fieldOverlay("age")
+	ov := view.fieldIndexView("age")
 	for i := 0; i < branches.Len(); i++ {
 		branch := branches.GetPtr(i)
 		if branch.expr.Op == compileScalarOpForTest(qx.OpGTE) && db.engine.fieldNameByOrdinal(branch.expr.FieldOrdinal) == "age" {
@@ -2686,7 +2686,7 @@ func TestPlannerORBranchesOrdered_BoundedCoveredOnlyBranchNotAlwaysTrue(t *testi
 			if !branch.coveredRangeBounded {
 				t.Fatalf("bounded covered-only age branch must retain covered range metadata")
 			}
-			br, _, ok := view.extractOrderRangeCoverageOverlayReader("age", branch.preds, ov)
+			br, _, ok := view.extractOrderRangeCoverageIndexViewReader("age", branch.preds, ov)
 			if !ok {
 				t.Fatalf("extractOrderRangeCoverageOverlay: ok=false")
 			}
@@ -2799,7 +2799,7 @@ func TestPlannerOROrderDecision_PrefersMergeWhenRouteEstimatorBeatsStream(t *tes
 	if universe == 0 {
 		t.Fatalf("unexpected zero universe")
 	}
-	ov := view.fieldOverlay("score")
+	ov := view.fieldIndexView("score")
 	orderDistinct := uint64(ov.KeyCount())
 	if orderDistinct == 0 {
 		t.Fatalf("unexpected zero order distinct")
@@ -2929,8 +2929,8 @@ func TestBuildPredicatesOrdered_MergesPositiveNumericRangeLeavesOnSameField(t *t
 	}
 	probeLen := 0
 	switch {
-	case preds[1].overlayState != nil:
-		probeLen = preds[1].overlayState.probe.probeLen
+	case preds[1].fieldIndexRangeState != nil:
+		probeLen = preds[1].fieldIndexRangeState.probe.probeLen
 	default:
 		t.Fatalf("expected merged age predicate to remain runtime range state")
 	}
@@ -2963,7 +2963,7 @@ func TestPlannerOROrderMergeBranchStats_SkipFullSpanRowCountingWithoutOrderBound
 	}
 	defer branches.Release()
 
-	stats := view.orderMergeBranchStats("age", branches, view.fieldOverlay("age"))
+	stats := view.orderMergeBranchStats("age", branches, view.fieldIndexView("age"))
 	for i := 0; i < branches.Len(); i++ {
 		if stats[i].rangeRows != 0 {
 			t.Fatalf("expected no full-span row counting for branch %d without order bounds, got rangeRows=%d", i, stats[i].rangeRows)
@@ -3006,9 +3006,9 @@ func TestBuildPredRangeCandidateWithColdMode_NullableComplementRouteKeepsPositiv
 	if fm == nil {
 		t.Fatal("expected field metadata")
 	}
-	ov := view.fieldOverlayForExpr(expr)
+	ov := view.fieldIndexViewForExpr(expr)
 	if !ov.HasData() {
-		t.Fatal("expected overlay data")
+		t.Fatal("expected index view data")
 	}
 
 	candidate, ok := view.prepareScalarRangeRoutingCandidate(expr)
@@ -3027,10 +3027,10 @@ func TestBuildPredRangeCandidateWithColdMode_NullableComplementRouteKeepsPositiv
 		t.Fatal("buildPredRangeCandidateWithColdMode: ok=false")
 	}
 	defer releasePredicateOwnedState(&p)
-	if p.overlayState == nil {
+	if p.fieldIndexRangeState == nil {
 		t.Fatal("expected overlay range predicate state")
 	}
-	if p.overlayState.probe.useComplement {
+	if p.fieldIndexRangeState.probe.useComplement {
 		t.Fatal("expected nullable complement route to keep positive runtime probe")
 	}
 	if p.matches(1) || p.matches(50) {
@@ -3240,9 +3240,9 @@ func TestPlannerOrderedAnchor_MatchesBaseline(t *testing.T) {
 	defer releasePredicates(predsB)
 
 	orderField := q.Order[0].By.Name
-	ov := db.engine.currentQueryViewForTests().fieldOverlay(orderField)
+	ov := db.engine.currentQueryViewForTests().fieldIndexView(orderField)
 	br := ov.RangeByRanks(0, ov.KeyCount())
-	if coveredRange, cov, ok := db.engine.extractOrderRangeCoverageOverlay(orderField, predsB, ov); ok {
+	if coveredRange, cov, ok := db.engine.extractOrderRangeCoverageIndexView(orderField, predsB, ov); ok {
 		br = coveredRange
 		for i := range cov {
 			if cov[i] {
@@ -3355,7 +3355,7 @@ func TestOrderedFallback_TracksMatchedRowsAndExactBitmapFilters(t *testing.T) {
 	}
 	defer releasePredicates(preds)
 
-	ov := db.engine.currentQueryViewForTests().fieldOverlay("country")
+	ov := db.engine.currentQueryViewForTests().fieldIndexView("country")
 	br := ov.RangeByRanks(0, ov.KeyCount())
 	if br.Empty() {
 		t.Fatalf("country overlay must be present")

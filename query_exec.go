@@ -81,7 +81,7 @@ func (qv *queryView) tryOrderBasicNoFilterWithLimit(q *qir.Shape, trace *queryTr
 
 	fullBounds := indexdata.Bounds{Has: true}
 	nilTailField := orderNilTailField(fm, orderField, fullBounds)
-	ov := qv.fieldOverlayForOrder(order)
+	ov := qv.fieldIndexViewForOrder(order)
 	if !ov.HasData() && nilTailField == "" {
 		if !qv.hasIndexedFieldForOrder(order) {
 			return nil, false, nil
@@ -792,8 +792,8 @@ func (qv *queryView) runOrderBasicBaseQuery(
 	baseOps []qir.Expr,
 	needWindow int,
 	order qir.Order,
-	ov indexdata.FieldOverlay,
-	br indexdata.OverlayRange,
+	ov indexdata.FieldIndexView,
+	br indexdata.FieldIndexRange,
 	nilTailField string,
 	base postingResult,
 	residualPreds predicateReader,
@@ -820,7 +820,7 @@ func (qv *queryView) runOrderBasicBaseQuery(
 		examined  uint64
 		scanWidth uint64
 	)
-	nilOV := qv.nilFieldOverlay(nilTailField)
+	nilOV := qv.nilFieldIndexView(nilTailField)
 	for {
 		_, ids, ok := keyCur.Next()
 		if !ok {
@@ -893,8 +893,8 @@ func (qv *queryView) runOrderBasicBaseQueryBuf(
 	baseOps []qir.Expr,
 	needWindow int,
 	order qir.Order,
-	ov indexdata.FieldOverlay,
-	br indexdata.OverlayRange,
+	ov indexdata.FieldIndexView,
+	br indexdata.FieldIndexRange,
 	nilTailField string,
 	base postingResult,
 	residualPreds predicateReader,
@@ -921,7 +921,7 @@ func (qv *queryView) runOrderBasicBaseQueryBuf(
 		examined  uint64
 		scanWidth uint64
 	)
-	nilOV := qv.nilFieldOverlay(nilTailField)
+	nilOV := qv.nilFieldIndexView(nilTailField)
 	for {
 		_, ids, ok := keyCur.Next()
 		if !ok {
@@ -1068,7 +1068,7 @@ func (qv *queryView) validateOrderBasicSimpleExpr(e qir.Expr) error {
 		return fmt.Errorf("%w: invalid expression, op: %v", ErrInvalidQuery, e.Op)
 	}
 	fieldName := qv.engine.fieldNameByOrdinal(e.FieldOrdinal)
-	ov := qv.fieldOverlayForExpr(e)
+	ov := qv.fieldIndexViewForExpr(e)
 	if !ov.HasData() && !qv.hasIndexedFieldForExpr(e) {
 		return fmt.Errorf("no index for field: %v", fieldName)
 	}
@@ -1192,7 +1192,7 @@ func (qv *queryView) shouldCollapseOrderBasicNumericRange(field string, fieldOrd
 	if field == "" || rb.Empty {
 		return false
 	}
-	ov := qv.fieldOverlayRef(field, fieldOrdinal)
+	ov := qv.fieldIndexViewRef(field, fieldOrdinal)
 	if !ov.HasData() {
 		return true
 	}
@@ -1213,7 +1213,7 @@ func (qv *queryView) shouldCollapseOrderBasicNumericRange(field string, fieldOrd
 		return false
 	}
 	complementBuckets := ov.KeyCount() - bucketCount
-	if qv.nilFieldOverlayRef(field, fieldOrdinal).LookupCardinality(nilIndexEntryKey) > 0 {
+	if qv.nilFieldIndexViewRef(field, fieldOrdinal).LookupCardinality(nilIndexEntryKey) > 0 {
 		complementBuckets++
 	}
 	complementEst := uint64(0)
@@ -1786,7 +1786,7 @@ func (qv *queryView) tryQueryOrderBasicWithLimit(q *qir.Shape, trace *queryTrace
 		}
 		nilTailField = f
 	}
-	ov := qv.fieldOverlayForOrder(order)
+	ov := qv.fieldIndexViewForOrder(order)
 	if !ov.HasData() && nilTailField == "" {
 		if !qv.hasIndexedFieldForOrder(order) {
 			return nil, false, nil
@@ -1967,7 +1967,7 @@ func (qv *queryView) tryQueryOrderBasicWithLimit(q *qir.Shape, trace *queryTrace
 	return out, used, err
 }
 
-func (qv *queryView) scanOrderLimitNoPredicates(q *qir.Shape, ov indexdata.FieldOverlay, br indexdata.OverlayRange, desc bool, nilTailField string, trace *queryTrace) ([]uint64, bool) {
+func (qv *queryView) scanOrderLimitNoPredicates(q *qir.Shape, ov indexdata.FieldIndexView, br indexdata.FieldIndexRange, desc bool, nilTailField string, trace *queryTrace) ([]uint64, bool) {
 	out := make([]uint64, 0, q.Limit)
 	cursor := qv.newQueryCursor(out, q.Offset, q.Limit, false, 0)
 
@@ -1997,7 +1997,7 @@ func (qv *queryView) scanOrderLimitNoPredicates(q *qir.Shape, ov indexdata.Field
 	}
 
 	if nilTailField != "" {
-		ids := qv.nilFieldOverlay(nilTailField).LookupPostingRetained(nilIndexEntryKey)
+		ids := qv.nilFieldIndexView(nilTailField).LookupPostingRetained(nilIndexEntryKey)
 		if !ids.IsEmpty() {
 			scanWidth++
 			if emitOrderLimitPosting(&cursor, ids, &examined, trace) {
@@ -2019,7 +2019,7 @@ func (qv *queryView) scanOrderLimitNoPredicates(q *qir.Shape, ov indexdata.Field
 	return cursor.out, true
 }
 
-func (qv *queryView) scanOrderLimitWithPredicatesReader(q *qir.Shape, ov indexdata.FieldOverlay, br indexdata.OverlayRange, desc bool, preds predicateReader, nilTailField string, trace *queryTrace) ([]uint64, bool) {
+func (qv *queryView) scanOrderLimitWithPredicatesReader(q *qir.Shape, ov indexdata.FieldIndexView, br indexdata.FieldIndexRange, desc bool, preds predicateReader, nilTailField string, trace *queryTrace) ([]uint64, bool) {
 	if preds.Len() > limitQueryFastPathMaxLeaves {
 		activeBuf := pooled.GetIntSlice(preds.Len())
 		defer pooled.ReleaseIntSlice(activeBuf)
@@ -2098,7 +2098,7 @@ func (qv *queryView) scanOrderLimitWithPredicatesReader(q *qir.Shape, ov indexda
 		}
 
 		if nilTailField != "" {
-			ids := qv.nilFieldOverlay(nilTailField).LookupPostingRetained(nilIndexEntryKey)
+			ids := qv.nilFieldIndexView(nilTailField).LookupPostingRetained(nilIndexEntryKey)
 			if !ids.IsEmpty() {
 				scanWidth++
 				stop, nextExactWork := orderPredicatesEmitPostingBufReader(
@@ -2208,7 +2208,7 @@ func (qv *queryView) scanOrderLimitWithPredicatesReader(q *qir.Shape, ov indexda
 	}
 
 	if nilTailField != "" {
-		ids := qv.nilFieldOverlay(nilTailField).LookupPostingRetained(nilIndexEntryKey)
+		ids := qv.nilFieldIndexView(nilTailField).LookupPostingRetained(nilIndexEntryKey)
 		if !ids.IsEmpty() {
 			scanWidth++
 			stop, nextExactWork := orderPredicatesEmitPostingReader(
@@ -2265,7 +2265,7 @@ func (qv *queryView) tryQueryOrderPrefixWithLimit(q *qir.Shape, trace *queryTrac
 		return nil, false, nil
 	}
 
-	ov := qv.fieldOverlayForOrder(ord)
+	ov := qv.fieldIndexViewForOrder(ord)
 	if !ov.HasData() {
 		return nil, true, nil
 	}
@@ -2434,7 +2434,7 @@ func (qv *queryView) tryQueryRangeNoOrderWithLimit(q *qir.Shape, trace *queryTra
 		}
 		isNil = eqNil
 		if isNil {
-			ids := qv.nilFieldOverlayForExpr(e).LookupPostingRetained(nilIndexEntryKey)
+			ids := qv.nilFieldIndexViewForExpr(e).LookupPostingRetained(nilIndexEntryKey)
 			if ids.IsEmpty() {
 				return nil, true, nil
 			}
@@ -2480,7 +2480,7 @@ func (qv *queryView) tryQueryRangeNoOrderWithLimit(q *qir.Shape, trace *queryTra
 		rb = nextRB
 	}
 
-	ov := qv.fieldOverlayForExpr(e)
+	ov := qv.fieldIndexViewForExpr(e)
 	if !ov.HasData() {
 		return nil, true, nil
 	}

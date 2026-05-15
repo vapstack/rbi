@@ -670,9 +670,9 @@ func (qv *queryView) tryDirectSingleUniqueEqNoOrder(q *qir.Shape, trace *queryTr
 
 	var ids posting.List
 	if isNil {
-		ids = qv.nilFieldOverlayForExpr(e).LookupPostingRetained(nilIndexEntryKey)
+		ids = qv.nilFieldIndexViewForExpr(e).LookupPostingRetained(nilIndexEntryKey)
 	} else {
-		ids = lookupScalarPostingRetained(qv.fieldOverlayForExpr(e), key)
+		ids = lookupScalarPostingRetained(qv.fieldIndexViewForExpr(e), key)
 	}
 	if ids.IsEmpty() {
 		if trace != nil {
@@ -828,7 +828,7 @@ func (qv *queryView) tryLimitQueryOrderBasic(q *qir.Shape, leaves []qir.Expr, tr
 		return nil, false, nil
 	}
 	nilTailField := orderNilTailField(fm, f, bounds)
-	ov := qv.fieldOverlayForOrder(order)
+	ov := qv.fieldIndexViewForOrder(order)
 	if !ov.HasData() && nilTailField == "" {
 		if !qv.hasIndexedFieldForOrder(order) {
 			return nil, false, nil
@@ -855,11 +855,11 @@ func (qv *queryView) tryLimitQueryOrderBasic(q *qir.Shape, leaves []qir.Expr, tr
 		if predsBuf != nil {
 			for i := 0; i < predsBuf.Len(); i++ {
 				pred := predsBuf.Get(i)
-				if pred.kind != leafPredKindPredicate || pred.pred.overlayState == nil {
+				if pred.kind != leafPredKindPredicate || pred.pred.fieldIndexRangeState == nil {
 					continue
 				}
 				pred.pred.setExpectedContainsCalls(
-					orderedOverlayRangeExpectedContainsCalls(pred.pred.overlayState, needWindow, universe),
+					orderedFieldIndexRangeExpectedContainsCalls(pred.pred.fieldIndexRangeState, needWindow, universe),
 				)
 				predsBuf.Set(i, pred)
 			}
@@ -872,7 +872,7 @@ func (qv *queryView) tryLimitQueryOrderBasic(q *qir.Shape, leaves []qir.Expr, tr
 		} else {
 			observedStart = execTrace.ev.RowsExamined
 		}
-		out := qv.scanLimitByOverlayBounds(q, ov, br, order.Desc, predsBuf, nilTailField, execTrace)
+		out := qv.scanLimitByFieldIndexBounds(q, ov, br, order.Desc, predsBuf, nilTailField, execTrace)
 		qv.promoteObservedLimitLeafPreds(f, predsBuf, execTrace.ev.RowsExamined-observedStart, q.Limit)
 		return out, true, nil
 	}
@@ -913,7 +913,7 @@ func (qv *queryView) tryLimitQueryRangeNoOrderByField(q *qir.Shape, field string
 	if fm == nil || fm.Slice {
 		return nil, false, nil
 	}
-	ov := qv.fieldOverlay(field)
+	ov := qv.fieldIndexView(field)
 	if !ov.HasData() {
 		if !qv.hasIndexedField(field) {
 			return nil, false, nil
@@ -939,7 +939,7 @@ func (qv *queryView) tryLimitQueryRangeNoOrderByField(q *qir.Shape, field string
 	if br.Empty() {
 		return nil, true, nil
 	}
-	return qv.scanLimitByOverlayBounds(q, ov, br, false, predsBuf, "", trace), true, nil
+	return qv.scanLimitByFieldIndexBounds(q, ov, br, false, predsBuf, "", trace), true, nil
 }
 
 func (qv *queryView) buildLeafPredsExcludingBounds(leaves []qir.Expr, field string, orderedWindow int) (*pooled.Slice[leafPred], bool, error) {
@@ -1056,7 +1056,7 @@ func (qv *queryView) buildLeafPredsExcludingBounds(leaves []qir.Expr, field stri
 	return predsBuf, true, nil
 }
 
-func (qv *queryView) scanLimitByOverlayBounds(q *qir.Shape, ov indexdata.FieldOverlay, br indexdata.OverlayRange, desc bool, preds *pooled.Slice[leafPred], nilTailField string, trace *queryTrace) []uint64 {
+func (qv *queryView) scanLimitByFieldIndexBounds(q *qir.Shape, ov indexdata.FieldIndexView, br indexdata.FieldIndexRange, desc bool, preds *pooled.Slice[leafPred], nilTailField string, trace *queryTrace) []uint64 {
 	limit := int(q.Limit)
 	out := make([]uint64, 0, limit)
 	cursor := qv.newQueryCursor(out, 0, q.Limit, false, 0)
@@ -1137,7 +1137,7 @@ func (qv *queryView) scanLimitByOverlayBounds(q *qir.Shape, ov indexdata.FieldOv
 	}
 
 	if nilTailField != "" {
-		ids := qv.nilFieldOverlay(nilTailField).LookupPostingRetained(nilIndexEntryKey)
+		ids := qv.nilFieldIndexView(nilTailField).LookupPostingRetained(nilIndexEntryKey)
 		if !ids.IsEmpty() {
 			if trackScanWidth {
 				scanWidth++
@@ -1225,7 +1225,7 @@ func (qv *queryView) buildLeafPred(e qir.Expr) (leafPred, bool, error) {
 	}
 
 	fieldName := qv.engine.fieldNameByOrdinal(e.FieldOrdinal)
-	ov := qv.fieldOverlayForExpr(e)
+	ov := qv.fieldIndexViewForExpr(e)
 	if !ov.HasData() && !qv.hasIndexedFieldForExpr(e) {
 		return leafPred{}, false, nil
 	}
@@ -1250,7 +1250,7 @@ func (qv *queryView) buildLeafPred(e qir.Expr) (leafPred, bool, error) {
 			return leafPred{}, false, nil
 		}
 		if isNil {
-			ids := qv.nilFieldOverlayForExpr(e).LookupPostingRetained(nilIndexEntryKey)
+			ids := qv.nilFieldIndexViewForExpr(e).LookupPostingRetained(nilIndexEntryKey)
 			if ids.IsEmpty() {
 				return emptyLeaf(), true, nil
 			}
@@ -1478,7 +1478,7 @@ func (qv *queryView) supportsLimitLeafPredExpr(e qir.Expr) bool {
 	if fm == nil {
 		return false
 	}
-	if !qv.fieldOverlayForExpr(e).HasData() && !qv.hasIndexedFieldForExpr(e) {
+	if !qv.fieldIndexViewForExpr(e).HasData() && !qv.hasIndexedFieldForExpr(e) {
 		return false
 	}
 	switch e.Op {

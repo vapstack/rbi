@@ -109,7 +109,7 @@ func plannerArgminOROrderCandidatesForTest(
 		return plannerOROrderArgminCandidates{}, false
 	}
 
-	ov := qv.fieldOverlayForOrder(o)
+	ov := qv.fieldIndexViewForOrder(o)
 	if !ov.HasData() {
 		return plannerOROrderArgminCandidates{}, false
 	}

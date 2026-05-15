@@ -693,7 +693,7 @@ func TestRaceExtra_PublicNumericRangeQueriesStayExactAcrossConcurrentUnchangedFi
 		return db.engine.makeQueryView(db.engine.snapshot.Current())
 	}
 
-	spanFor := func(expr qx.Expr) (indexdata.OverlayRange, *qcache.NumericRangeBucketEntry) {
+	spanFor := func(expr qx.Expr) (indexdata.FieldIndexRange, *qcache.NumericRangeBucketEntry) {
 		t.Helper()
 
 		view := makeView()
@@ -709,7 +709,7 @@ func TestRaceExtra_PublicNumericRangeQueriesStayExactAcrossConcurrentUnchangedFi
 		if fm == nil {
 			t.Fatalf("expected field metadata for %q", f)
 		}
-		ov := view.fieldOverlay(f)
+		ov := view.fieldIndexView(f)
 		if !ov.HasData() {
 			t.Fatalf("expected field overlay for %q", f)
 		}

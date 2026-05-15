@@ -1059,7 +1059,7 @@ func NewLenFieldStorageFromMapOwned(universe posting.List, lengths map[uint32]po
 	return newLenFieldStorageFromMapOwned(universe, lengths, posting.List{})
 }
 
-func RebuildLenFieldStorageFromOverlay(universe posting.List, fieldOV FieldOverlay) (FieldStorage, bool) {
+func RebuildLenFieldStorageFromIndexView(universe posting.List, fieldOV FieldIndexView) (FieldStorage, bool) {
 	if universe.IsEmpty() {
 		return FieldStorage{}, false
 	}

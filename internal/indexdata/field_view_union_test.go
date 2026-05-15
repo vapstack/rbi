@@ -16,7 +16,7 @@ func TestFieldOverlayRangePostingsUnionAndMerge(t *testing.T) {
 			entries := fieldStorageEntriesForTest(tc.rows, true)
 			storage := newRegularFieldStorage(entries)
 			defer storage.Release()
-			ov := NewFieldOverlayStorage(storage)
+			ov := NewFieldIndexViewFromStorage(storage)
 
 			first := ov.RangeByRanks(10, 40)
 			second := ov.RangeByRanks(30, 60)

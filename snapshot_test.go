@@ -131,7 +131,7 @@ func TestSnapshot_PublishedAsFullState(t *testing.T) {
 	tagsIDs := s.FieldLookupPostingRetained("tags", "go")
 	snapshotPostingContainsAll(t, tagsIDs, 1)
 
-	lenIDs := db.engine.currentQueryViewForTests().lenFieldOverlay("tags").LookupPostingRetained(keycodec.U64ByteString(2))
+	lenIDs := db.engine.currentQueryViewForTests().lenFieldIndexView("tags").LookupPostingRetained(keycodec.U64ByteString(2))
 	snapshotPostingContainsAll(t, lenIDs, 1)
 }
 
@@ -399,13 +399,13 @@ func snapshotExtFieldContainsID(tb testing.TB, s *snapshot.View, field, key stri
 func snapshotExtNilContainsID(tb testing.TB, s *snapshot.View, field string, id uint64) bool {
 	tb.Helper()
 	acc := s.IndexedFieldByName[field]
-	return indexdata.NewFieldOverlayStorage(s.NilIndex[acc.Ordinal]).LookupPostingRetained(nilIndexEntryKey).Contains(id)
+	return indexdata.NewFieldIndexViewFromStorage(s.NilIndex[acc.Ordinal]).LookupPostingRetained(nilIndexEntryKey).Contains(id)
 }
 
 func snapshotExtLenContainsID(tb testing.TB, s *snapshot.View, field string, ln uint64, id uint64) bool {
 	tb.Helper()
 	acc := s.IndexedFieldByName[field]
-	return indexdata.NewFieldOverlayStorage(s.LenIndex[acc.Ordinal]).LookupPostingRetained(keycodec.U64ByteString(ln)).Contains(id)
+	return indexdata.NewFieldIndexViewFromStorage(s.LenIndex[acc.Ordinal]).LookupPostingRetained(keycodec.U64ByteString(ln)).Contains(id)
 }
 
 func snapshotExtQueryTxRecords[K ~string | ~uint64, V any](t *testing.T, db *DB[K, V], tx *bbolt.Tx, snap *snapshot.View, q *qx.QX) []*V {

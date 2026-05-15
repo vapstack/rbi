@@ -260,7 +260,7 @@ func BenchmarkRecentKeyCacheAddWorkHot(b *testing.B) {
 func BenchmarkNumericRangeBucketIndexBuild(b *testing.B) {
 	storage := qcacheTestFieldStorage(4096, 1000)
 	defer storage.Release()
-	ov := indexdata.NewFieldOverlayStorage(storage)
+	ov := indexdata.NewFieldIndexViewFromStorage(storage)
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
@@ -275,7 +275,7 @@ func BenchmarkNumericRangeBucketIndexBuild(b *testing.B) {
 func BenchmarkNumericRangeBucketIndexFullBucketSpan(b *testing.B) {
 	storage := qcacheTestFieldStorage(4096, 1000)
 	defer storage.Release()
-	ov := indexdata.NewFieldOverlayStorage(storage)
+	ov := indexdata.NewFieldIndexViewFromStorage(storage)
 	idx, ok := BuildNumericRangeBucketIndex(ov, 32, 1)
 	if !ok {
 		b.Fatal("index build rejected")

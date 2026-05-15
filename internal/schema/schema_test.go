@@ -558,11 +558,11 @@ func TestPatchRuntimeApplyUnknownNilAndConversionErrors(t *testing.T) {
 }
 
 func schemaTestOverlayContains(storage indexdata.FieldStorage, key string, id uint64) bool {
-	return indexdata.NewFieldOverlayStorage(storage).LookupPostingRetained(key).Contains(id)
+	return indexdata.NewFieldIndexViewFromStorage(storage).LookupPostingRetained(key).Contains(id)
 }
 
 func schemaTestOverlayContainsKey(storage indexdata.FieldStorage, key uint64, id uint64) bool {
-	return indexdata.NewFieldOverlayStorage(storage).LookupPostingRetainedKey(keycodec.FromU64(key)).Contains(id)
+	return indexdata.NewFieldIndexViewFromStorage(storage).LookupPostingRetainedKey(keycodec.FromU64(key)).Contains(id)
 }
 
 func TestRuntimeLookupHelpers(t *testing.T) {

@@ -104,7 +104,7 @@ func TestNumericRangeBucketCache_InheritRetainsMatchingStorage(t *testing.T) {
 func TestNumericRangeBucketIndex_BuildAndFullBucketSpan(t *testing.T) {
 	storage := qcacheTestFieldStorage(100, 1000)
 	defer storage.Release()
-	ov := indexdata.NewFieldOverlayStorage(storage)
+	ov := indexdata.NewFieldIndexViewFromStorage(storage)
 
 	idx, ok := BuildNumericRangeBucketIndex(ov, 20, 1)
 	if !ok {

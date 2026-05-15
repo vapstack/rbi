@@ -548,7 +548,7 @@ func TestQuery_BroadBasicOrder_NoLimit_MatchesExpected(t *testing.T) {
 			result.release()
 			t.Fatalf("prepareTestQuery(%+v): %v", q, err)
 		}
-		got, err := qv.queryOrderBasic(result, qv.fieldOverlay(testOrderFieldName(db.engine, viewQ.Order)), viewQ.Order, 0, 0, true)
+		got, err := qv.queryOrderBasic(result, qv.fieldIndexView(testOrderFieldName(db.engine, viewQ.Order)), viewQ.Order, 0, 0, true)
 		prepared.Release()
 		result.release()
 		if err != nil {

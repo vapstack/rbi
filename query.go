@@ -67,9 +67,9 @@ func (qv *queryView) tryQueryEmptyOnSnapshot(q *qir.Shape) (bool, error) {
 			return false, nil
 		}
 		if isNil {
-			return qv.nilFieldOverlayForExpr(e).LookupCardinality(nilIndexEntryKey) == 0, nil
+			return qv.nilFieldIndexViewForExpr(e).LookupCardinality(nilIndexEntryKey) == 0, nil
 		}
-		return lookupScalarCardinality(qv.fieldOverlayForExpr(e), key) == 0, nil
+		return lookupScalarCardinality(qv.fieldIndexViewForExpr(e), key) == 0, nil
 
 	case qir.OpGT, qir.OpGTE, qir.OpLT, qir.OpLTE, qir.OpPREFIX:
 		fm := qv.fieldMetaByExpr(e)
@@ -89,7 +89,7 @@ func (qv *queryView) tryQueryEmptyOnSnapshot(q *qir.Shape) (bool, error) {
 		if bounds.Empty {
 			return true, nil
 		}
-		ov := qv.fieldOverlayForExpr(e)
+		ov := qv.fieldIndexViewForExpr(e)
 		if !ov.HasData() {
 			return true, nil
 		}
@@ -455,14 +455,14 @@ func (qv *queryView) execQuery(q *qir.Shape, emitTrace bool, prepared bool) (out
 		switch order.Kind {
 
 		case qir.OrderKindArrayPos:
-			ov := qv.fieldOverlayForOrder(order)
+			ov := qv.fieldIndexViewForOrder(order)
 			if !ov.HasData() && !qv.hasIndexedFieldForOrder(order) {
 				return nil, fmt.Errorf("cannot sort non-indexed field: %v", orderField)
 			}
-			return qv.queryOrderArrayPosOverlay(result, ov, order, skip, need, needAll)
+			return qv.queryOrderArrayPosIndexView(result, ov, order, skip, need, needAll)
 
 		case qir.OrderKindArrayCount:
-			lenOV := qv.lenFieldOverlayForOrder(order)
+			lenOV := qv.lenFieldIndexViewForOrder(order)
 			useZeroComplement := qv.isLenZeroComplementOrdinal(order.FieldOrdinal)
 			if !lenOV.HasData() && !useZeroComplement {
 				return nil, fmt.Errorf("no lenIndex for slice field: %v", orderField)
@@ -470,7 +470,7 @@ func (qv *queryView) execQuery(q *qir.Shape, emitTrace bool, prepared bool) (out
 			return qv.queryOrderArrayCount(result, lenOV, order, skip, need, needAll, useZeroComplement)
 		}
 
-		ov := qv.fieldOverlayForOrder(order)
+		ov := qv.fieldIndexViewForOrder(order)
 		if !ov.HasData() && !qv.hasIndexedFieldForOrder(order) {
 			return nil, fmt.Errorf("cannot sort non-indexed field: %v", orderField)
 		}

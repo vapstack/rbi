@@ -531,13 +531,13 @@ func (state *lazyMaterializedPredicateState) materialize() posting.List {
 	return state.ids
 }
 
-var overlayRangeIterPool = pooled.Pointers[overlayRangeIter]{
-	Cleanup: func(it *overlayRangeIter) {
+var fieldIndexRangeIterPool = pooled.Pointers[fieldIndexRangeIter]{
+	Cleanup: func(it *fieldIndexRangeIter) {
 		if it.curIt != nil {
 			it.curIt.Release()
 			it.curIt = nil
 		}
-		it.cur = indexdata.OverlayCursor{}
+		it.cur = indexdata.FieldIndexCursor{}
 		it.single = struct {
 			set bool
 			v   uint64
@@ -546,10 +546,10 @@ var overlayRangeIterPool = pooled.Pointers[overlayRangeIter]{
 	Clear: true,
 }
 
-type overlayRangePredicateState struct {
-	ov                    indexdata.FieldOverlay
-	br                    indexdata.OverlayRange
-	probe                 overlayRangeProbe
+type fieldIndexRangePredicateState struct {
+	ov                    indexdata.FieldIndexView
+	br                    indexdata.FieldIndexRange
+	probe                 fieldIndexRangeProbe
 	reuse                 materializedPredReuse
 	neg                   bool
 	keepProbeHits         bool
@@ -571,8 +571,8 @@ type overlayRangePredicateState struct {
 	probeIDs              posting.List
 }
 
-var overlayRangePredicateStatePool = pooled.Pointers[overlayRangePredicateState]{
-	Cleanup: func(state *overlayRangePredicateState) {
+var fieldIndexRangePredicateStatePool = pooled.Pointers[fieldIndexRangePredicateState]{
+	Cleanup: func(state *fieldIndexRangePredicateState) {
 		state.releaseLinearPosts()
 		state.probeIDs.Release()
 		state.rangeIDs.Release()
@@ -580,7 +580,7 @@ var overlayRangePredicateStatePool = pooled.Pointers[overlayRangePredicateState]
 	Clear: true,
 }
 
-func (state *overlayRangePredicateState) setExpectedContainsCalls(expectedCalls int) {
+func (state *fieldIndexRangePredicateState) setExpectedContainsCalls(expectedCalls int) {
 	if state == nil {
 		return
 	}
@@ -600,14 +600,14 @@ func (state *overlayRangePredicateState) setExpectedContainsCalls(expectedCalls 
 	)
 }
 
-func (state *overlayRangePredicateState) growContainsMode(expectedCalls int) {
+func (state *fieldIndexRangePredicateState) growContainsMode(expectedCalls int) {
 	if state == nil || expectedCalls <= state.expectedContainsCalls {
 		return
 	}
 	state.setExpectedContainsCalls(expectedCalls)
 }
 
-func (state *overlayRangePredicateState) releaseLinearPosts() {
+func (state *fieldIndexRangePredicateState) releaseLinearPosts() {
 	if state == nil || state.linearPostsBuf == nil {
 		return
 	}
@@ -615,7 +615,7 @@ func (state *overlayRangePredicateState) releaseLinearPosts() {
 	state.linearPostsBuf = nil
 }
 
-func (state *overlayRangePredicateState) materializeRange() posting.List {
+func (state *fieldIndexRangePredicateState) materializeRange() posting.List {
 	if state == nil {
 		return posting.List{}
 	}
@@ -630,7 +630,7 @@ func (state *overlayRangePredicateState) materializeRange() posting.List {
 			return state.rangeIDs
 		}
 	}
-	state.rangeIDs = state.ov.UnionRangePostings(state.br, indexdata.OverlayRange{})
+	state.rangeIDs = state.ov.UnionRangePostings(state.br, indexdata.FieldIndexRange{})
 	state.rangeMaterialized = true
 	state.releaseLinearPosts()
 	if !state.probe.useComplement {
@@ -639,7 +639,7 @@ func (state *overlayRangePredicateState) materializeRange() posting.List {
 	return state.rangeIDs
 }
 
-func (state *overlayRangePredicateState) ensureLinearPosts() []posting.List {
+func (state *fieldIndexRangePredicateState) ensureLinearPosts() []posting.List {
 	if state == nil {
 		return nil
 	}
@@ -663,7 +663,7 @@ func (state *overlayRangePredicateState) ensureLinearPosts() []posting.List {
 	return state.linearPostsBuf
 }
 
-func (state *overlayRangePredicateState) linearContains(idx uint64) bool {
+func (state *fieldIndexRangePredicateState) linearContains(idx uint64) bool {
 	if state == nil {
 		return false
 	}
@@ -679,7 +679,7 @@ func (state *overlayRangePredicateState) linearContains(idx uint64) bool {
 	return false
 }
 
-func (state *overlayRangePredicateState) materializeProbe() posting.List {
+func (state *fieldIndexRangePredicateState) materializeProbe() posting.List {
 	if state == nil {
 		return posting.List{}
 	}
@@ -694,7 +694,7 @@ func (state *overlayRangePredicateState) materializeProbe() posting.List {
 		state.releaseLinearPosts()
 		return posting.List{}
 	}
-	var second indexdata.OverlayRange
+	var second indexdata.FieldIndexRange
 	if state.probe.spanCnt > 1 {
 		second = state.probe.spans[1]
 	}
@@ -704,7 +704,7 @@ func (state *overlayRangePredicateState) materializeProbe() posting.List {
 	return state.probeIDs
 }
 
-func (state *overlayRangePredicateState) rawHit(idx uint64) bool {
+func (state *fieldIndexRangePredicateState) rawHit(idx uint64) bool {
 	if state == nil {
 		return false
 	}
@@ -730,7 +730,7 @@ func (state *overlayRangePredicateState) rawHit(idx uint64) bool {
 	return state.linearContains(idx)
 }
 
-func (state *overlayRangePredicateState) matches(idx uint64) bool {
+func (state *fieldIndexRangePredicateState) matches(idx uint64) bool {
 	if state == nil {
 		return false
 	}
@@ -748,7 +748,7 @@ func (state *overlayRangePredicateState) matches(idx uint64) bool {
 	return !hit
 }
 
-func (state *overlayRangePredicateState) countBucket(bucket posting.List) (uint64, bool) {
+func (state *fieldIndexRangePredicateState) countBucket(bucket posting.List) (uint64, bool) {
 	if state == nil {
 		return 0, false
 	}
@@ -788,7 +788,7 @@ func (state *overlayRangePredicateState) countBucket(bucket posting.List) (uint6
 	return bc - in, true
 }
 
-func (state *overlayRangePredicateState) applyToPosting(dst posting.List) (posting.List, bool) {
+func (state *fieldIndexRangePredicateState) applyToPosting(dst posting.List) (posting.List, bool) {
 	if dst.IsEmpty() {
 		return dst, true
 	}
@@ -833,11 +833,11 @@ func (state *overlayRangePredicateState) applyToPosting(dst posting.List) (posti
 	return dst, true
 }
 
-func (state *overlayRangePredicateState) newIter() posting.Iterator {
+func (state *fieldIndexRangePredicateState) newIter() posting.Iterator {
 	if state == nil || state.neg {
 		return nil
 	}
-	it := overlayRangeIterPool.Get()
+	it := fieldIndexRangeIterPool.Get()
 	it.cur = state.ov.NewCursor(state.br, false)
 	return it
 }

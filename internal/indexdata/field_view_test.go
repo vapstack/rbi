@@ -22,7 +22,7 @@ func TestFieldOverlayFlatCursorReturnsBorrowedPostings(t *testing.T) {
 	defer entries[0].IDs.Release()
 	defer entries[1].IDs.Release()
 
-	ov := NewFieldOverlay(&entries)
+	ov := NewFieldIndexView(&entries)
 	br := ov.RangeByRanks(0, 2)
 
 	cur := ov.NewCursor(br, false)
@@ -74,7 +74,7 @@ func TestFieldOverlayCursorRangeOrderFlatAndChunked(t *testing.T) {
 			if storage.IsChunked() != tc.wantChunk {
 				t.Fatalf("storage chunked: got %v want %v", storage.IsChunked(), tc.wantChunk)
 			}
-			ov := NewFieldOverlayStorage(storage)
+			ov := NewFieldIndexViewFromStorage(storage)
 			br := ov.RangeByRanks(tc.start, tc.end)
 
 			cur := ov.NewCursor(br, false)
@@ -132,7 +132,7 @@ func TestFieldOverlayRangeByRanksClampsFlatAndChunked(t *testing.T) {
 			if storage.IsChunked() != tc.wantChunk {
 				t.Fatalf("storage chunked: got %v want %v", storage.IsChunked(), tc.wantChunk)
 			}
-			ov := NewFieldOverlayStorage(storage)
+			ov := NewFieldIndexViewFromStorage(storage)
 
 			br := ov.RangeByRanks(-7, 5)
 			if br.BaseStart != 0 || br.BaseEnd != 5 || br.Len() != 5 {
@@ -150,7 +150,7 @@ func TestFieldOverlayRangeByRanksClampsFlatAndChunked(t *testing.T) {
 	}
 }
 
-func TestOverlayRangeStats_ChunkedMatchesPostingCardinality(t *testing.T) {
+func TestIndexViewRangeStats_ChunkedMatchesPostingCardinality(t *testing.T) {
 	entries := make([]Entry, 0, fieldIndexChunkThreshold+37)
 	var expected uint64
 	start := 17
@@ -174,7 +174,7 @@ func TestOverlayRangeStats_ChunkedMatchesPostingCardinality(t *testing.T) {
 	if root == nil {
 		t.Fatalf("expected chunked root")
 	}
-	ov := FieldOverlay{chunked: root}
+	ov := FieldIndexView{chunked: root}
 	br := ov.RangeByRanks(start, end)
 	buckets, rows := ov.RangeStats(br)
 	if buckets != end-start {
@@ -280,7 +280,7 @@ func TestFieldOverlayRangeForBounds_PrefixIntersectsRange(t *testing.T) {
 		{Key: keycodec.FromStoredString("ad", false)},
 		{Key: keycodec.FromStoredString("b0", false)},
 	}
-	ov := NewFieldOverlay(&entries)
+	ov := NewFieldIndexView(&entries)
 
 	bounds := Bounds{Has: true}
 	bounds.ApplyPrefix("a")
@@ -317,7 +317,7 @@ func TestFieldOverlayRangeForBounds_ExclusiveLowerExactAndMissing(t *testing.T) 
 			entries := fieldStorageEntriesForTest(tc.rows, tc.numeric)
 			storage := newRegularFieldStorage(entries)
 			defer storage.Release()
-			ov := NewFieldOverlayStorage(storage)
+			ov := NewFieldIndexViewFromStorage(storage)
 			rank := tc.rows / 2
 
 			var exact Bounds
@@ -380,7 +380,7 @@ func TestFieldOverlayRangeForBounds_HighPrefixAndDescendingCursor(t *testing.T) 
 			entries := fieldStorageEntriesForTest(tc.rows, false)
 			storage := newRegularFieldStorage(entries)
 			defer storage.Release()
-			ov := NewFieldOverlayStorage(storage)
+			ov := NewFieldIndexViewFromStorage(storage)
 
 			exclusive := ov.RangeForBounds(Bounds{HasHi: true, HiKey: "k/000020"})
 			if exclusive.BaseEnd != 20 {
@@ -412,7 +412,7 @@ func TestFieldOverlayRangeForBounds_HighPrefixAndDescendingCursor(t *testing.T) 
 			entries := fieldStorageEntriesForTest(tc.rows, true)
 			storage := newRegularFieldStorage(entries)
 			defer storage.Release()
-			ov := NewFieldOverlayStorage(storage)
+			ov := NewFieldIndexViewFromStorage(storage)
 
 			exclusive := ov.RangeForBounds(Bounds{
 				HasHi:     true,
@@ -542,7 +542,7 @@ func TestFieldOverlayRangeStats_ChunkedMatchesCursorScanForBounds(t *testing.T) 
 			if !storage.IsChunked() {
 				t.Fatalf("expected chunked storage")
 			}
-			ov := NewFieldOverlayStorage(storage)
+			ov := NewFieldIndexViewFromStorage(storage)
 			for i, bounds := range tc.bounds {
 				br := ov.RangeForBounds(bounds)
 				gotBuckets, gotRows := ov.RangeStats(br)
@@ -568,8 +568,8 @@ func TestFieldOverlayRangeStats_ChunkedRankOnlyRangeUsesRankBounds(t *testing.T)
 	if !storage.IsChunked() {
 		t.Fatalf("expected chunked storage")
 	}
-	ov := NewFieldOverlayStorage(storage)
-	br := OverlayRange{
+	ov := NewFieldIndexViewFromStorage(storage)
+	br := FieldIndexRange{
 		BaseStart: 13,
 		BaseEnd:   fieldIndexChunkThreshold + 7,
 	}
@@ -584,7 +584,7 @@ func TestFieldOverlayLookupPostingsSkipsMissingAndReturnsEstimate(t *testing.T) 
 	entries := fieldStorageEntriesForTest(8, false)
 	storage := newRegularFieldStorage(entries)
 	defer storage.Release()
-	ov := NewFieldOverlayStorage(storage)
+	ov := NewFieldIndexViewFromStorage(storage)
 
 	posts, est := ov.LookupPostings([]string{"k/000001", "missing", "k/000004"})
 	defer posting.ReleaseSlice(posts)
@@ -617,7 +617,7 @@ func TestFieldOverlayAccessorsFlatAndChunked(t *testing.T) {
 			if storage.KeyCount() != tc.rows {
 				t.Fatalf("storage key count: got %d want %d", storage.KeyCount(), tc.rows)
 			}
-			ov := NewFieldOverlayStorage(storage)
+			ov := NewFieldIndexViewFromStorage(storage)
 			if !ov.HasData() {
 				t.Fatalf("overlay must report data")
 			}
@@ -648,7 +648,7 @@ func TestFieldOverlayAccessorsFlatAndChunked(t *testing.T) {
 	}
 }
 
-func fieldStorageOverlayRangeStats(ov FieldOverlay, br OverlayRange) (int, uint64) {
+func fieldStorageOverlayRangeStats(ov FieldIndexView, br FieldIndexRange) (int, uint64) {
 	if br.BaseStart >= br.BaseEnd {
 		return 0, 0
 	}

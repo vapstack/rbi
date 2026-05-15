@@ -60,7 +60,7 @@ func predicateMatchIDs(pred predicate, universe posting.List) []uint64 {
 
 func runPredicatePostingFilter(t *testing.T, pred predicate, universe posting.List) posting.List {
 	t.Helper()
-	if pred.postingFilter == nil && pred.overlayState == nil {
+	if pred.postingFilter == nil && pred.fieldIndexRangeState == nil {
 		t.Fatal("expected numeric predicate to expose postingFilter")
 	}
 	for i := 0; i < 8; i++ {
@@ -131,8 +131,8 @@ func TestSetPredicateMaterializedNot_PreservesEstCard(t *testing.T) {
 
 func TestPredicateSupportsPostingFilter_RangeStateDoesNotRequireCheapFlag(t *testing.T) {
 	p := predicate{
-		overlayState:       &overlayRangePredicateState{},
-		postingFilterCheap: false,
+		fieldIndexRangeState: &fieldIndexRangePredicateState{},
+		postingFilterCheap:   false,
 	}
 	if !p.supportsPostingApply() {
 		t.Fatalf("overlay range state lost posting-filter capability when filter is not cheap")
@@ -158,7 +158,7 @@ func TestPredicateSupportsPostingFilter_RangeMaterializedSupportsExact(t *testin
 }
 
 func TestPredicateSupportsExactBucketPostingFilter_RangeStatesCheapOnly(t *testing.T) {
-	p := predicate{overlayState: &overlayRangePredicateState{}}
+	p := predicate{fieldIndexRangeState: &fieldIndexRangePredicateState{}}
 	if p.supportsExactBucketPostingFilter() {
 		t.Fatalf("non-cheap overlay range state must stay out of exact bucket posting-filter path")
 	}
@@ -170,7 +170,7 @@ func TestPredicateSupportsExactBucketPostingFilter_RangeStatesCheapOnly(t *testi
 
 func TestPredicateSupportsCheapPostingFilter_UsesUnifiedCapability(t *testing.T) {
 	t.Run("OverlayRangeNonCheap", func(t *testing.T) {
-		p := predicate{overlayState: &overlayRangePredicateState{}}
+		p := predicate{fieldIndexRangeState: &fieldIndexRangePredicateState{}}
 		if p.supportsCheapPostingApply() {
 			t.Fatalf("non-cheap overlay range state must stay out of cheap posting-filter class")
 		}
@@ -178,8 +178,8 @@ func TestPredicateSupportsCheapPostingFilter_UsesUnifiedCapability(t *testing.T)
 
 	t.Run("OverlayRangeCheap", func(t *testing.T) {
 		p := predicate{
-			overlayState:       &overlayRangePredicateState{},
-			postingFilterCheap: true,
+			fieldIndexRangeState: &fieldIndexRangePredicateState{},
+			postingFilterCheap:   true,
 		}
 		if !p.supportsCheapPostingApply() {
 			t.Fatalf("cheap overlay range state must stay in cheap posting-filter class")
@@ -259,25 +259,25 @@ func TestPredicatePostsAnyNotRuntimeApplyToPosting(t *testing.T) {
 }
 
 func TestPredicateLeadIterMayDuplicate_RangeStatesStayUnique(t *testing.T) {
-	if predicateLeadIterMayDuplicate(predicate{overlayState: &overlayRangePredicateState{}}) {
+	if predicateLeadIterMayDuplicate(predicate{fieldIndexRangeState: &fieldIndexRangePredicateState{}}) {
 		t.Fatalf("overlay range iterator should stay unique for ordered-anchor lead scans")
 	}
 }
 
-func TestOverlayRangeProbe_CountBucket_ComplementProbe(t *testing.T) {
+func TestIndexViewRangeProbe_CountBucket_ComplementProbe(t *testing.T) {
 	probeIDs := posting.BuildFromSorted([]uint64{2, 4})
 	defer probeIDs.Release()
 	bucket := posting.BuildFromSorted([]uint64{1, 2, 3, 4})
 	defer bucket.Release()
 
-	probe := overlayRangeProbe{
-		ov:            indexdata.NewFieldOverlay(&[]indexdata.Entry{{IDs: probeIDs.Borrow()}}),
+	probe := fieldIndexRangeProbe{
+		ov:            indexdata.NewFieldIndexView(&[]indexdata.Entry{{IDs: probeIDs.Borrow()}}),
 		spanCnt:       1,
 		useComplement: true,
 		probeLen:      1,
 		probeEst:      2,
 	}
-	probe.spans[0] = indexdata.OverlayRange{BaseStart: 0, BaseEnd: 1}
+	probe.spans[0] = indexdata.FieldIndexRange{BaseStart: 0, BaseEnd: 1}
 
 	in, ok := probe.countBucket(bucket.Borrow())
 	if !ok {
@@ -288,16 +288,16 @@ func TestOverlayRangeProbe_CountBucket_ComplementProbe(t *testing.T) {
 	}
 }
 
-func TestOverlayRangePredicateState_Matches_MaterializedComplementProbe(t *testing.T) {
-	state := &overlayRangePredicateState{
-		probe: overlayRangeProbe{
+func TestIndexViewRangePredicateState_Matches_MaterializedComplementProbe(t *testing.T) {
+	state := &fieldIndexRangePredicateState{
+		probe: fieldIndexRangeProbe{
 			useComplement: true,
 		},
 		keepProbeHits:     false,
 		probeMaterialized: true,
 		probeIDs:          posting.BuildFromSorted([]uint64{2, 4}),
 	}
-	defer overlayRangePredicateStatePool.Put(state)
+	defer fieldIndexRangePredicateStatePool.Put(state)
 
 	if state.matches(2) {
 		t.Fatalf("complement probe hit must be excluded from positive broad range")
@@ -308,12 +308,12 @@ func TestOverlayRangePredicateState_Matches_MaterializedComplementProbe(t *testi
 }
 
 func TestPredicateSetExpectedContainsCalls_UpdatesOverlayRangeState(t *testing.T) {
-	state := overlayRangePredicateStatePool.Get()
-	state.ov = indexdata.NewFieldOverlay(&[]indexdata.Entry{{Key: keycodec.FromString("a")}, {Key: keycodec.FromString("b")}, {Key: keycodec.FromString("c")}})
-	state.br = indexdata.OverlayRange{BaseStart: 0, BaseEnd: 3}
-	state.probe = overlayRangeProbe{
-		ov:       indexdata.NewFieldOverlay(&[]indexdata.Entry{{Key: keycodec.FromString("a")}, {Key: keycodec.FromString("b")}, {Key: keycodec.FromString("c")}}),
-		spans:    [2]indexdata.OverlayRange{{BaseStart: 0, BaseEnd: 3}},
+	state := fieldIndexRangePredicateStatePool.Get()
+	state.ov = indexdata.NewFieldIndexView(&[]indexdata.Entry{{Key: keycodec.FromString("a")}, {Key: keycodec.FromString("b")}, {Key: keycodec.FromString("c")}})
+	state.br = indexdata.FieldIndexRange{BaseStart: 0, BaseEnd: 3}
+	state.probe = fieldIndexRangeProbe{
+		ov:       indexdata.NewFieldIndexView(&[]indexdata.Entry{{Key: keycodec.FromString("a")}, {Key: keycodec.FromString("b")}, {Key: keycodec.FromString("c")}}),
+		spans:    [2]indexdata.FieldIndexRange{{BaseStart: 0, BaseEnd: 3}},
 		spanCnt:  1,
 		probeLen: 32,
 		probeEst: 2048,
@@ -324,9 +324,9 @@ func TestPredicateSetExpectedContainsCalls_UpdatesOverlayRangeState(t *testing.T
 	state.rangeMaterializeAt = rangePostingFilterMaterializeAfterForProbe(3, 2048)
 	state.keepProbeHits = false
 	state.setExpectedContainsCalls(state.materializeAfter)
-	defer overlayRangePredicateStatePool.Put(state)
+	defer fieldIndexRangePredicateStatePool.Put(state)
 
-	p := predicate{overlayState: state}
+	p := predicate{fieldIndexRangeState: state}
 	p.setExpectedContainsCalls(1)
 	if state.expectedContainsCalls != 1 {
 		t.Fatalf("expected overlay expectedContainsCalls=1, got %d", state.expectedContainsCalls)
@@ -336,16 +336,16 @@ func TestPredicateSetExpectedContainsCalls_UpdatesOverlayRangeState(t *testing.T
 	}
 }
 
-func TestOverlayRangePredicateState_LinearContains_NonLinearModeSkipsLinearPosts(t *testing.T) {
+func TestIndexViewRangePredicateState_LinearContains_NonLinearModeSkipsLinearPosts(t *testing.T) {
 	base := []indexdata.Entry{
 		{Key: keycodec.FromString("a"), IDs: posting.BuildFromSorted([]uint64{1, 2})},
 		{Key: keycodec.FromString("b"), IDs: posting.BuildFromSorted([]uint64{3, 4})},
 	}
-	state := overlayRangePredicateStatePool.Get()
-	state.ov = indexdata.NewFieldOverlay(&base)
-	state.probe = overlayRangeProbe{
-		ov:       indexdata.NewFieldOverlay(&base),
-		spans:    [2]indexdata.OverlayRange{{BaseStart: 0, BaseEnd: 2}},
+	state := fieldIndexRangePredicateStatePool.Get()
+	state.ov = indexdata.NewFieldIndexView(&base)
+	state.probe = fieldIndexRangeProbe{
+		ov:       indexdata.NewFieldIndexView(&base),
+		spans:    [2]indexdata.FieldIndexRange{{BaseStart: 0, BaseEnd: 2}},
 		spanCnt:  1,
 		probeLen: 2,
 		probeEst: 4,
@@ -353,7 +353,7 @@ func TestOverlayRangePredicateState_LinearContains_NonLinearModeSkipsLinearPosts
 	state.bucketCount = 2
 	state.expectedContainsCalls = 8
 	state.containsMode = rangeContainsPosting
-	defer overlayRangePredicateStatePool.Put(state)
+	defer fieldIndexRangePredicateStatePool.Put(state)
 
 	if !state.linearContains(3) {
 		t.Fatalf("expected overlay linearContains to probe-match idx 3")
@@ -364,12 +364,12 @@ func TestOverlayRangePredicateState_LinearContains_NonLinearModeSkipsLinearPosts
 }
 
 func TestAcquireOverlayRangePredicateState_PositiveDirectProbeKeepsProbeHitsWithoutPostingFilter(t *testing.T) {
-	state := overlayRangePredicateStatePool.Get()
-	state.ov = indexdata.NewFieldOverlay(&[]indexdata.Entry{{Key: keycodec.FromString("a")}, {Key: keycodec.FromString("b")}})
-	state.br = indexdata.OverlayRange{BaseStart: 0, BaseEnd: 1}
-	state.probe = overlayRangeProbe{
-		ov:       indexdata.NewFieldOverlay(&[]indexdata.Entry{{Key: keycodec.FromString("a")}, {Key: keycodec.FromString("b")}}),
-		spans:    [2]indexdata.OverlayRange{{BaseStart: 0, BaseEnd: 1}},
+	state := fieldIndexRangePredicateStatePool.Get()
+	state.ov = indexdata.NewFieldIndexView(&[]indexdata.Entry{{Key: keycodec.FromString("a")}, {Key: keycodec.FromString("b")}})
+	state.br = indexdata.FieldIndexRange{BaseStart: 0, BaseEnd: 1}
+	state.probe = fieldIndexRangeProbe{
+		ov:       indexdata.NewFieldIndexView(&[]indexdata.Entry{{Key: keycodec.FromString("a")}, {Key: keycodec.FromString("b")}}),
+		spans:    [2]indexdata.FieldIndexRange{{BaseStart: 0, BaseEnd: 1}},
 		spanCnt:  1,
 		probeLen: 1,
 		probeEst: 1,
@@ -380,7 +380,7 @@ func TestAcquireOverlayRangePredicateState_PositiveDirectProbeKeepsProbeHitsWith
 	state.rangeMaterializeAt = rangePostingFilterMaterializeAfterForProbe(1, 1)
 	state.keepProbeHits = true
 	state.setExpectedContainsCalls(state.materializeAfter)
-	defer overlayRangePredicateStatePool.Put(state)
+	defer fieldIndexRangePredicateStatePool.Put(state)
 
 	if !state.keepProbeHits {
 		t.Fatalf("positive direct overlay probe must keep probe hits even when posting filter is disabled")
@@ -459,7 +459,7 @@ func TestBuildPredRange_PrefixMaterializationStoredInCache(t *testing.T) {
 	if fm == nil {
 		t.Fatalf("expected field metadata for email")
 	}
-	ov := db.engine.currentQueryViewForTests().fieldOverlay("email")
+	ov := db.engine.currentQueryViewForTests().fieldIndexView("email")
 	if !ov.HasData() {
 		t.Fatalf("expected field index data for email")
 	}
@@ -510,7 +510,7 @@ func TestBuildPredRange_PrefixMaterializationSkippedWhenCacheDisabled(t *testing
 	if fm == nil {
 		t.Fatalf("expected field metadata for email")
 	}
-	ov := db.engine.currentQueryViewForTests().fieldOverlay("email")
+	ov := db.engine.currentQueryViewForTests().fieldIndexView("email")
 	if !ov.HasData() {
 		t.Fatalf("expected field index data for email")
 	}
@@ -587,7 +587,7 @@ func TestBuildPredRange_BaseNumericPostingFilter_NotComplementMaterializedFallba
 	if err := db.RebuildIndex(); err != nil {
 		t.Fatalf("RebuildIndex: %v", err)
 	}
-	if ov := db.engine.currentQueryViewForTests().fieldOverlay("age"); ov.IsChunked() {
+	if ov := db.engine.currentQueryViewForTests().fieldIndexView("age"); ov.IsChunked() {
 		t.Fatalf("expected base numeric index path for age, got chunked overlay")
 	}
 
@@ -624,7 +624,7 @@ func TestBuildPredRange_OverlayNumericPostingFilter_NotComplementMaterializedFal
 	if err := db.RebuildIndex(); err != nil {
 		t.Fatalf("RebuildIndex: %v", err)
 	}
-	if ov := db.engine.currentQueryViewForTests().fieldOverlay("age"); !ov.IsChunked() {
+	if ov := db.engine.currentQueryViewForTests().fieldIndexView("age"); !ov.IsChunked() {
 		t.Fatalf("expected chunked overlay path for age")
 	}
 
@@ -665,7 +665,7 @@ func TestBuildPredRange_OverlayNumericPostingFilter_ComplementMaterializedFallba
 	if fm == nil {
 		t.Fatalf("expected field metadata for age")
 	}
-	ov := db.engine.currentQueryViewForTests().fieldOverlay("age")
+	ov := db.engine.currentQueryViewForTests().fieldIndexView("age")
 	if !ov.IsChunked() {
 		t.Fatalf("expected chunked overlay path for age")
 	}
@@ -775,7 +775,7 @@ func TestBuildPredRangeCandidate_ChunkedRangeMatchesBitmapBaseline(t *testing.T)
 	}
 }
 
-func TestOverlayRangeIter_AllocsPerRunStayZeroAfterWarmup(t *testing.T) {
+func TestIndexViewRangeIter_AllocsPerRunStayZeroAfterWarmup(t *testing.T) {
 	if testRaceEnabled {
 		t.Skip("testing.AllocsPerRun is not stable under -race")
 	}
@@ -790,11 +790,11 @@ func TestOverlayRangeIter_AllocsPerRunStayZeroAfterWarmup(t *testing.T) {
 			buckets[i].IDs.Release()
 		}
 	}()
-	ov := indexdata.NewFieldOverlay(&buckets)
+	ov := indexdata.NewFieldIndexView(&buckets)
 	br := ov.RangeByRanks(0, ov.KeyCount())
 
 	run := func() {
-		it := overlayRangeIterPool.Get()
+		it := fieldIndexRangeIterPool.Get()
 		it.cur = ov.NewCursor(br, false)
 		var sum uint64
 		for it.HasNext() {
@@ -841,11 +841,11 @@ func TestBuildPredicateWithMode_AllowMaterializeSkipsColdNumericRangeUnionWhenPo
 	}
 	defer releasePredicates([]predicate{p})
 
-	if p.overlayState == nil {
+	if p.fieldIndexRangeState == nil {
 		t.Fatalf("expected cold numeric range to stay on overlay runtime state")
 	}
-	if p.overlayState.probeMaterializeAt <= 1 {
-		t.Fatalf("expected runtime posting filter to defer materialization, got probeMaterializeAt=%d", p.overlayState.probeMaterializeAt)
+	if p.fieldIndexRangeState.probeMaterializeAt <= 1 {
+		t.Fatalf("expected runtime posting filter to defer materialization, got probeMaterializeAt=%d", p.fieldIndexRangeState.probeMaterializeAt)
 	}
 	if p.kind == predicateKindMaterialized || p.kind == predicateKindMaterializedNot {
 		t.Fatalf("unexpected eager materialized predicate kind=%v", p.kind)
@@ -882,23 +882,23 @@ func TestBuildPredicateWithMode_RuntimeNumericRangeMaterializationKeepsScalarCac
 		}
 		defer releasePredicates([]predicate{p})
 
-		if p.overlayState == nil {
+		if p.fieldIndexRangeState == nil {
 			t.Fatalf("expected chunked numeric range to stay on overlay runtime state")
 		}
 		if got := db.engine.snapshot.Current().MaterializedPredCache().EntryCount(); got != 0 {
 			t.Fatalf("unexpected shared materialized predicate cache before runtime materialization: %d", got)
 		}
-		matchCalls := max(128, p.overlayState.materializeAfter+1)
+		matchCalls := max(128, p.fieldIndexRangeState.materializeAfter+1)
 		for i := 1; i <= matchCalls; i++ {
 			_ = p.matches(uint64(i))
 		}
-		if !p.overlayState.rangeMaterialized && !p.overlayState.probeMaterialized {
+		if !p.fieldIndexRangeState.rangeMaterialized && !p.fieldIndexRangeState.probeMaterialized {
 			t.Fatalf("expected runtime overlay state to build local membership state")
 		}
-		if p.overlayState.rangeMaterialized && p.overlayState.rangeIDs.IsEmpty() {
+		if p.fieldIndexRangeState.rangeMaterialized && p.fieldIndexRangeState.rangeIDs.IsEmpty() {
 			t.Fatalf("expected locally materialized overlay range ids")
 		}
-		if p.overlayState.probeMaterialized && p.overlayState.probeIDs.IsEmpty() {
+		if p.fieldIndexRangeState.probeMaterialized && p.fieldIndexRangeState.probeIDs.IsEmpty() {
 			t.Fatalf("expected locally materialized overlay probe ids")
 		}
 		if got := db.engine.snapshot.Current().MaterializedPredCache().EntryCount(); got != 0 {
@@ -935,7 +935,7 @@ func TestBuildPredicateWithMode_RuntimeNumericRangeMaterializationKeepsScalarCac
 		}
 		defer releasePredicates([]predicate{p})
 
-		if p.overlayState == nil {
+		if p.fieldIndexRangeState == nil {
 			t.Fatalf("expected numeric range to stay on runtime overlay state")
 		}
 		if got := db.engine.snapshot.Current().MaterializedPredCache().EntryCount(); got != 0 {
@@ -994,10 +994,10 @@ func TestBuildPredRange_BroadPositiveRuntimeKeepsComplementCacheLocal(t *testing
 	}
 	defer releasePredicates([]predicate{p})
 
-	if p.overlayState == nil {
+	if p.fieldIndexRangeState == nil {
 		t.Fatalf("expected numeric range to stay on runtime overlay state")
 	}
-	if !p.overlayState.probe.useComplement {
+	if !p.fieldIndexRangeState.probe.useComplement {
 		t.Fatalf("expected broad positive range to use complement probe")
 	}
 	if got := db.engine.snapshot.Current().MaterializedPredCache().EntryCount(); got != 0 {
@@ -1055,7 +1055,7 @@ func TestBuildPredRange_BroadPositivePostingFilterKeepsComplementCacheLocal(t *t
 		t.Fatalf("expected predicate build to succeed")
 	}
 	defer releasePredicates([]predicate{p})
-	if p.overlayState == nil || !p.overlayState.probe.useComplement {
+	if p.fieldIndexRangeState == nil || !p.fieldIndexRangeState.probe.useComplement {
 		t.Fatalf("expected broad positive overlay range state with complement probe")
 	}
 

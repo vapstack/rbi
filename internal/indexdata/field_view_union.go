@@ -6,28 +6,28 @@ import (
 )
 
 const (
-	overlaySingleChunkCap       = 32768
-	overlaySingleAdaptiveMaxLen = 200_000
-	overlaySingleInlineCap      = 16
+	fieldIndexSingleChunkCap       = 32768
+	fieldIndexSingleAdaptiveMaxLen = 200_000
+	fieldIndexSingleInlineCap      = 16
 )
 
-type overlayPostingUnionBuilder struct {
+type fieldIndexPostingUnionBuilder struct {
 	ids           posting.List
 	singles       []uint64
-	inlineSingles [overlaySingleInlineCap]uint64
+	inlineSingles [fieldIndexSingleInlineCap]uint64
 	inlineLen     int
 	batchSingles  bool
 }
 
-func overlayPostingBatchSinglesEnabled(capHint uint64) bool {
-	return capHint > posting.SmallCap && capHint <= overlaySingleAdaptiveMaxLen
+func fieldIndexPostingBatchSinglesEnabled(capHint uint64) bool {
+	return capHint > posting.SmallCap && capHint <= fieldIndexSingleAdaptiveMaxLen
 }
 
-func newOverlayPostingUnionBuilder(batchSingles bool) overlayPostingUnionBuilder {
-	return overlayPostingUnionBuilder{batchSingles: batchSingles}
+func newFieldIndexPostingUnionBuilder(batchSingles bool) fieldIndexPostingUnionBuilder {
+	return fieldIndexPostingUnionBuilder{batchSingles: batchSingles}
 }
 
-func (b *overlayPostingUnionBuilder) flushSingles() {
+func (b *fieldIndexPostingUnionBuilder) flushSingles() {
 	if b.singles != nil {
 		if len(b.singles) == 0 {
 			return
@@ -43,7 +43,7 @@ func (b *overlayPostingUnionBuilder) flushSingles() {
 	b.inlineLen = 0
 }
 
-func (b *overlayPostingUnionBuilder) addSingle(idx uint64) {
+func (b *fieldIndexPostingUnionBuilder) addSingle(idx uint64) {
 	if !b.batchSingles {
 		b.ids = b.ids.BuildAdded(idx)
 		return
@@ -54,7 +54,7 @@ func (b *overlayPostingUnionBuilder) addSingle(idx uint64) {
 			b.inlineLen++
 			return
 		}
-		b.singles = pooled.GetUint64Slice(overlaySingleChunkCap)
+		b.singles = pooled.GetUint64Slice(fieldIndexSingleChunkCap)
 		b.singles = append(b.singles, b.inlineSingles[:]...)
 		b.inlineLen = 0
 	}
@@ -64,7 +64,7 @@ func (b *overlayPostingUnionBuilder) addSingle(idx uint64) {
 	}
 }
 
-func (b *overlayPostingUnionBuilder) addPosting(ids posting.List) {
+func (b *fieldIndexPostingUnionBuilder) addPosting(ids posting.List) {
 	if ids.IsEmpty() {
 		return
 	}
@@ -89,7 +89,7 @@ func (b *overlayPostingUnionBuilder) addPosting(ids posting.List) {
 	b.ids = b.ids.BuildOr(ids)
 }
 
-func (b *overlayPostingUnionBuilder) finish(optimize bool) posting.List {
+func (b *fieldIndexPostingUnionBuilder) finish(optimize bool) posting.List {
 	b.flushSingles()
 	out := b.ids
 	if out.IsBorrowed() {
@@ -107,7 +107,7 @@ func (b *overlayPostingUnionBuilder) finish(optimize bool) posting.List {
 	return out
 }
 
-func (o FieldOverlay) appendRangePostingsUnion(builder *overlayPostingUnionBuilder, br OverlayRange) {
+func (o FieldIndexView) appendRangePostingsUnion(builder *fieldIndexPostingUnionBuilder, br FieldIndexRange) {
 	if br.Empty() {
 		return
 	}
@@ -124,18 +124,18 @@ func (o FieldOverlay) appendRangePostingsUnion(builder *overlayPostingUnionBuild
 	}
 }
 
-func (o FieldOverlay) unionRangePostingsBatchSinglesEnabled(first, second OverlayRange) bool {
+func (o FieldIndexView) unionRangePostingsBatchSinglesEnabled(first, second FieldIndexRange) bool {
 	totalSpan := first.Len() + second.Len()
 	if totalSpan == 0 {
 		return false
 	}
-	if totalSpan <= overlaySingleAdaptiveMaxLen {
+	if totalSpan <= fieldIndexSingleAdaptiveMaxLen {
 		return true
 	}
 	_, estFirst := o.RangeStats(first)
 	_, estSecond := o.RangeStats(second)
 
-	return overlayPostingBatchSinglesEnabled(satAddUint64(estFirst, estSecond))
+	return fieldIndexPostingBatchSinglesEnabled(satAddUint64(estFirst, estSecond))
 }
 
 func satAddUint64(total, add uint64) uint64 {
@@ -145,26 +145,26 @@ func satAddUint64(total, add uint64) uint64 {
 	return total + add
 }
 
-func (o FieldOverlay) UnionRangePostings(first, second OverlayRange) posting.List {
+func (o FieldIndexView) UnionRangePostings(first, second FieldIndexRange) posting.List {
 	if first.Empty() && second.Empty() {
 		return posting.List{}
 	}
-	builder := newOverlayPostingUnionBuilder(o.unionRangePostingsBatchSinglesEnabled(first, second))
+	builder := newFieldIndexPostingUnionBuilder(o.unionRangePostingsBatchSinglesEnabled(first, second))
 	o.appendRangePostingsUnion(&builder, first)
 	o.appendRangePostingsUnion(&builder, second)
 
 	return builder.finish(true)
 }
 
-func (o FieldOverlay) MergeRangePostingsInto(dst posting.List, first, second OverlayRange) posting.List {
+func (o FieldIndexView) MergeRangePostingsInto(dst posting.List, first, second FieldIndexRange) posting.List {
 	totalSpan := first.Len() + second.Len()
 	if totalSpan == 0 {
 		return dst
 	}
-	const mergeOverlayRangeDirectMaxBuckets = 32
+	const mergeFieldIndexRangeDirectMaxBuckets = 32
 
-	builder := newOverlayPostingUnionBuilder(totalSpan <= overlaySingleAdaptiveMaxLen)
-	if !dst.IsEmpty() && totalSpan > mergeOverlayRangeDirectMaxBuckets {
+	builder := newFieldIndexPostingUnionBuilder(totalSpan <= fieldIndexSingleAdaptiveMaxLen)
+	if !dst.IsEmpty() && totalSpan > mergeFieldIndexRangeDirectMaxBuckets {
 		o.appendRangePostingsUnion(&builder, first)
 		o.appendRangePostingsUnion(&builder, second)
 		return dst.BuildMergedOwned(builder.finish(false))

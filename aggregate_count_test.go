@@ -986,7 +986,7 @@ func TestCount_ScalarInSplit_ResidualFilterMatchesBitmap(t *testing.T) {
 	}
 
 	var got uint64
-	ov := qv.fieldOverlay("country")
+	ov := qv.fieldIndexView("country")
 	for i := 0; i < len(valsBuf); i++ {
 		ids := ov.LookupPostingRetained(valsBuf[i])
 		if ids.IsEmpty() {
@@ -2718,7 +2718,7 @@ func TestCount_PreparePredicate_BroadRangeComplementMatchesChunkedRangeAfterChur
 		}
 	}
 
-	if !db.engine.currentQueryViewForTests().fieldOverlay("age").IsChunked() {
+	if !db.engine.currentQueryViewForTests().fieldIndexView("age").IsChunked() {
 		t.Fatalf("expected age field to use chunked storage")
 	}
 

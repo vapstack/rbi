@@ -744,7 +744,7 @@ func BenchmarkFieldOverlayLookupFlat(b *testing.B) {
 	if storage.IsChunked() {
 		b.Fatalf("flat benchmark built chunked storage")
 	}
-	ov := NewFieldOverlayStorage(storage)
+	ov := NewFieldIndexViewFromStorage(storage)
 	key := entries[len(entries)/2].Key.UnsafeString()
 
 	b.ReportAllocs()
@@ -760,7 +760,7 @@ func BenchmarkFieldOverlayLookupChunked(b *testing.B) {
 	entries := benchmarkFieldEntries(FieldChunkThreshold*8, false)
 	storage := newRegularFieldStorage(entries)
 	defer storage.Release()
-	ov := NewFieldOverlayStorage(storage)
+	ov := NewFieldIndexViewFromStorage(storage)
 	key := entries[len(entries)/2].Key.UnsafeString()
 
 	b.ReportAllocs()
@@ -776,7 +776,7 @@ func BenchmarkFieldOverlayCursorChunkedRange(b *testing.B) {
 	entries := benchmarkFieldEntries(FieldChunkThreshold*8, false)
 	storage := newRegularFieldStorage(entries)
 	defer storage.Release()
-	ov := NewFieldOverlayStorage(storage)
+	ov := NewFieldIndexViewFromStorage(storage)
 	br := ov.RangeByRanks(FieldChunkTargetEntries, FieldChunkTargetEntries*3)
 
 	b.ReportAllocs()
@@ -802,7 +802,7 @@ func BenchmarkFieldOverlayCursorFlatRange(b *testing.B) {
 	if storage.IsChunked() {
 		b.Fatalf("flat benchmark built chunked storage")
 	}
-	ov := NewFieldOverlayStorage(storage)
+	ov := NewFieldIndexViewFromStorage(storage)
 	br := ov.RangeByRanks(16, FieldChunkTargetEntries/2-16)
 
 	b.ReportAllocs()
@@ -825,7 +825,7 @@ func BenchmarkFieldOverlayCursorChunkedRangeDesc(b *testing.B) {
 	entries := benchmarkFieldEntries(FieldChunkThreshold*8, false)
 	storage := newRegularFieldStorage(entries)
 	defer storage.Release()
-	ov := NewFieldOverlayStorage(storage)
+	ov := NewFieldIndexViewFromStorage(storage)
 	br := ov.RangeByRanks(FieldChunkTargetEntries, FieldChunkTargetEntries*3)
 
 	b.ReportAllocs()
@@ -861,7 +861,7 @@ func BenchmarkFieldOverlayRangeForBounds(b *testing.B) {
 			entries := benchmarkFieldEntries(tc.rows, tc.numeric)
 			storage := newRegularFieldStorage(entries)
 			defer storage.Release()
-			ov := NewFieldOverlayStorage(storage)
+			ov := NewFieldIndexViewFromStorage(storage)
 			rank := len(entries) / 2
 			bounds := Bounds{
 				HasLo: true,
@@ -898,7 +898,7 @@ func BenchmarkFieldOverlayRangeStats(b *testing.B) {
 			entries := benchmarkFieldEntriesWithPostingCardinality(tc.rows, false, 4)
 			storage := newRegularFieldStorage(entries)
 			defer storage.Release()
-			ov := NewFieldOverlayStorage(storage)
+			ov := NewFieldIndexViewFromStorage(storage)
 			br := ov.RangeByRanks(tc.rows/4, tc.rows*3/4)
 
 			b.ReportAllocs()
@@ -962,7 +962,7 @@ func BenchmarkFieldOverlayLookupPostingsChunked(b *testing.B) {
 	entries := benchmarkFieldEntries(FieldChunkThreshold*8, false)
 	storage := newRegularFieldStorage(entries)
 	defer storage.Release()
-	ov := NewFieldOverlayStorage(storage)
+	ov := NewFieldIndexViewFromStorage(storage)
 	keys := make([]string, 0, 64)
 	base := len(entries) / 3
 	for i := 0; i < 64; i++ {
@@ -984,7 +984,7 @@ func BenchmarkFieldOverlayUnionRangePostingsChunked(b *testing.B) {
 	entries := benchmarkFieldEntries(FieldChunkThreshold*8, true)
 	storage := newRegularFieldStorage(entries)
 	defer storage.Release()
-	ov := NewFieldOverlayStorage(storage)
+	ov := NewFieldIndexViewFromStorage(storage)
 	first := ov.RangeByRanks(FieldChunkTargetEntries, FieldChunkTargetEntries*3)
 	second := ov.RangeByRanks(FieldChunkTargetEntries*2, FieldChunkTargetEntries*4)
 
@@ -1003,7 +1003,7 @@ func BenchmarkFieldOverlayMergeRangePostingsChunked(b *testing.B) {
 	entries := benchmarkFieldEntries(FieldChunkThreshold*8, true)
 	storage := newRegularFieldStorage(entries)
 	defer storage.Release()
-	ov := NewFieldOverlayStorage(storage)
+	ov := NewFieldIndexViewFromStorage(storage)
 	first := ov.RangeByRanks(FieldChunkTargetEntries, FieldChunkTargetEntries*3)
 	second := ov.RangeByRanks(FieldChunkTargetEntries*2, FieldChunkTargetEntries*4)
 
@@ -1033,7 +1033,7 @@ func BenchmarkFieldStorageBuilderChunked(b *testing.B) {
 			entries := benchmarkFieldEntries(rows, tc.numeric)
 			source := newRegularFieldStorage(entries)
 			defer source.Release()
-			ov := NewFieldOverlayStorage(source)
+			ov := NewFieldIndexViewFromStorage(source)
 			keys := make([]keycodec.IndexKey, rows)
 			posts := posting.GetSlice(rows)
 			for i := 0; i < rows; i++ {
@@ -1337,14 +1337,14 @@ func BenchmarkRebuildLenFieldStorageFromOverlay(b *testing.B) {
 	}
 	base := newRegularFieldStorage(entries)
 	defer base.Release()
-	ov := NewFieldOverlayStorage(base)
+	ov := NewFieldIndexViewFromStorage(base)
 
 	b.ReportAllocs()
 	b.ResetTimer()
 	var total uint64
 	var used bool
 	for i := 0; i < b.N; i++ {
-		storage, useZeroComplement := RebuildLenFieldStorageFromOverlay(universe, ov)
+		storage, useZeroComplement := RebuildLenFieldStorageFromIndexView(universe, ov)
 		total += uint64(storage.KeyCount())
 		used = used || useZeroComplement
 

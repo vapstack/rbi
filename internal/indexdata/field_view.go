@@ -164,13 +164,13 @@ func (b *Bounds) ApplyPrefix(prefix string) {
 	b.Normalize()
 }
 
-// FieldOverlay provides read helpers over one immutable field storage view.
-type FieldOverlay struct {
+// FieldIndexView provides read helpers over one immutable field storage view.
+type FieldIndexView struct {
 	base    []Entry
 	chunked *fieldIndexChunkedRoot
 }
 
-type OverlayRange struct {
+type FieldIndexRange struct {
 	BaseStart int
 	BaseEnd   int
 
@@ -178,7 +178,7 @@ type OverlayRange struct {
 	endPos   fieldIndexChunkPos
 }
 
-type OverlayCursor struct {
+type FieldIndexCursor struct {
 	base    []Entry
 	chunked *fieldIndexChunkedRoot
 
@@ -194,50 +194,50 @@ type OverlayCursor struct {
 	desc     bool
 }
 
-func (br OverlayRange) Empty() bool {
+func (br FieldIndexRange) Empty() bool {
 	return br.BaseStart >= br.BaseEnd
 }
 
-func (br OverlayRange) Len() int {
+func (br FieldIndexRange) Len() int {
 	if br.BaseStart >= br.BaseEnd {
 		return 0
 	}
 	return br.BaseEnd - br.BaseStart
 }
 
-func NewFieldOverlay(base *[]Entry) FieldOverlay {
+func NewFieldIndexView(base *[]Entry) FieldIndexView {
 	if base == nil {
-		return FieldOverlay{}
+		return FieldIndexView{}
 	}
-	return FieldOverlay{base: *base}
+	return FieldIndexView{base: *base}
 }
 
-func NewFieldOverlayStorage(storage FieldStorage) FieldOverlay {
+func NewFieldIndexViewFromStorage(storage FieldStorage) FieldIndexView {
 	if storage.chunked != nil {
-		return FieldOverlay{chunked: storage.chunked}
+		return FieldIndexView{chunked: storage.chunked}
 	}
 	if storage.flat != nil {
-		return FieldOverlay{base: storage.flat.entries}
+		return FieldIndexView{base: storage.flat.entries}
 	}
-	return FieldOverlay{}
+	return FieldIndexView{}
 }
 
-func (o FieldOverlay) HasData() bool {
+func (o FieldIndexView) HasData() bool {
 	return o.KeyCount() > 0
 }
 
-func (o FieldOverlay) KeyCount() int {
+func (o FieldIndexView) KeyCount() int {
 	if o.chunked != nil {
 		return o.chunked.keyCount
 	}
 	return len(o.base)
 }
 
-func (o FieldOverlay) IsChunked() bool {
+func (o FieldIndexView) IsChunked() bool {
 	return o.chunked != nil
 }
 
-func (o FieldOverlay) Rows() uint64 {
+func (o FieldIndexView) Rows() uint64 {
 	if o.chunked != nil {
 		if len(o.chunked.rowPrefix) > 0 {
 			return o.chunked.rowPrefix[len(o.chunked.rowPrefix)-1]
@@ -251,7 +251,7 @@ func (o FieldOverlay) Rows() uint64 {
 	return rows
 }
 
-func (o FieldOverlay) RangeRows(start, end int) uint64 {
+func (o FieldIndexView) RangeRows(start, end int) uint64 {
 	if start < 0 || start > end || end > o.KeyCount() {
 		return 0
 	}
@@ -271,7 +271,7 @@ func (o FieldOverlay) RangeRows(start, end int) uint64 {
 	return rows
 }
 
-func (o FieldOverlay) RangeStats(br OverlayRange) (int, uint64) {
+func (o FieldIndexView) RangeStats(br FieldIndexRange) (int, uint64) {
 	if br.BaseStart >= br.BaseEnd {
 		return 0, 0
 	}
@@ -289,7 +289,7 @@ func (o FieldOverlay) RangeStats(br OverlayRange) (int, uint64) {
 	return br.BaseEnd - br.BaseStart, o.RangeRows(br.BaseStart, br.BaseEnd)
 }
 
-func (o FieldOverlay) KeyAt(rank int) keycodec.IndexKey {
+func (o FieldIndexView) KeyAt(rank int) keycodec.IndexKey {
 	if o.chunked != nil {
 		pos := o.chunked.posForRank(rank)
 		ref, ok := o.chunked.refAtChunk(pos.chunk)
@@ -301,14 +301,14 @@ func (o FieldOverlay) KeyAt(rank int) keycodec.IndexKey {
 	return o.base[rank].Key
 }
 
-func (o FieldOverlay) LowerBound(key string) int {
+func (o FieldIndexView) LowerBound(key string) int {
 	if o.chunked != nil {
 		return o.chunked.lowerBound(key)
 	}
 	return lowerBoundIndex(o.base, key)
 }
 
-func (o FieldOverlay) LowerBoundKey(key keycodec.IndexKey) int {
+func (o FieldIndexView) LowerBoundKey(key keycodec.IndexKey) int {
 	if o.chunked != nil {
 		_, rank := o.chunked.lowerBoundPosKey(key)
 		return rank
@@ -316,14 +316,14 @@ func (o FieldOverlay) LowerBoundKey(key keycodec.IndexKey) int {
 	return lowerBoundIndexEntriesKey(o.base, key)
 }
 
-func (o FieldOverlay) UpperBound(key string) int {
+func (o FieldIndexView) UpperBound(key string) int {
 	if o.chunked != nil {
 		return o.chunked.upperBound(key)
 	}
 	return upperBoundIndex(o.base, key)
 }
 
-func (o FieldOverlay) UpperBoundKey(key keycodec.IndexKey) int {
+func (o FieldIndexView) UpperBoundKey(key keycodec.IndexKey) int {
 	if o.chunked != nil {
 		_, rank := o.chunked.upperBoundPosKey(key)
 		return rank
@@ -331,14 +331,14 @@ func (o FieldOverlay) UpperBoundKey(key keycodec.IndexKey) int {
 	return upperBoundIndexEntriesKey(o.base, key)
 }
 
-func (o FieldOverlay) PrefixRangeEnd(prefix string, start int) int {
+func (o FieldIndexView) PrefixRangeEnd(prefix string, start int) int {
 	if o.chunked != nil {
 		return o.chunked.prefixRangeEnd(prefix, start)
 	}
 	return prefixRangeEndIndex(o.base, prefix, start)
 }
 
-func (o FieldOverlay) LookupCardinality(key string) uint64 {
+func (o FieldIndexView) LookupCardinality(key string) uint64 {
 	if o.chunked != nil {
 		return o.chunked.lookupCardinality(key)
 	}
@@ -349,7 +349,7 @@ func (o FieldOverlay) LookupCardinality(key string) uint64 {
 	return o.base[i].IDs.Cardinality()
 }
 
-func (o FieldOverlay) LookupCardinalityKey(key keycodec.IndexKey) uint64 {
+func (o FieldIndexView) LookupCardinalityKey(key keycodec.IndexKey) uint64 {
 	if o.chunked != nil {
 		return o.chunked.lookupCardinalityKey(key)
 	}
@@ -360,7 +360,7 @@ func (o FieldOverlay) LookupCardinalityKey(key keycodec.IndexKey) uint64 {
 	return o.base[i].IDs.Cardinality()
 }
 
-func (o FieldOverlay) LookupPostingRetained(key string) posting.List {
+func (o FieldIndexView) LookupPostingRetained(key string) posting.List {
 	if o.chunked != nil {
 		return o.chunked.lookupPostingRetained(key)
 	}
@@ -374,7 +374,7 @@ func (o FieldOverlay) LookupPostingRetained(key string) posting.List {
 	return o.base[i].IDs.Borrow()
 }
 
-func (o FieldOverlay) LookupPostingRetainedKey(key keycodec.IndexKey) posting.List {
+func (o FieldIndexView) LookupPostingRetainedKey(key keycodec.IndexKey) posting.List {
 	if o.chunked != nil {
 		return o.chunked.lookupPostingRetainedKey(key)
 	}
@@ -388,7 +388,7 @@ func (o FieldOverlay) LookupPostingRetainedKey(key keycodec.IndexKey) posting.Li
 	return o.base[i].IDs.Borrow()
 }
 
-func (o FieldOverlay) PostingAt(rank int) posting.List {
+func (o FieldIndexView) PostingAt(rank int) posting.List {
 	if rank < 0 || rank >= o.KeyCount() {
 		return posting.List{}
 	}
@@ -403,7 +403,7 @@ func (o FieldOverlay) PostingAt(rank int) posting.List {
 	return o.base[rank].IDs.Borrow()
 }
 
-func (o FieldOverlay) LookupPostings(keys []string) ([]posting.List, uint64) {
+func (o FieldIndexView) LookupPostings(keys []string) ([]posting.List, uint64) {
 	keyCount := len(keys)
 	postsBuf := posting.GetSlice(keyCount)
 	var est uint64
@@ -419,12 +419,12 @@ func (o FieldOverlay) LookupPostings(keys []string) ([]posting.List, uint64) {
 	return postsBuf, est
 }
 
-func (o FieldOverlay) RangeForBounds(b Bounds) OverlayRange {
+func (o FieldIndexView) RangeForBounds(b Bounds) FieldIndexRange {
 	if o.chunked != nil {
 		return o.rangeForBoundsChunked(b)
 	}
 
-	br := OverlayRange{
+	br := FieldIndexRange{
 		BaseStart: 0,
 		BaseEnd:   o.KeyCount(),
 	}
@@ -492,8 +492,8 @@ func (o FieldOverlay) RangeForBounds(b Bounds) OverlayRange {
 	return br
 }
 
-func (o FieldOverlay) rangeForBoundsChunked(b Bounds) OverlayRange {
-	br := OverlayRange{
+func (o FieldIndexView) rangeForBoundsChunked(b Bounds) FieldIndexRange {
+	br := FieldIndexRange{
 		BaseStart: 0,
 		BaseEnd:   o.KeyCount(),
 	}
@@ -584,7 +584,7 @@ func (o FieldOverlay) rangeForBoundsChunked(b Bounds) OverlayRange {
 	return br
 }
 
-func (o FieldOverlay) RangeByRanks(start, end int) OverlayRange {
+func (o FieldIndexView) RangeByRanks(start, end int) FieldIndexRange {
 	if start < 0 {
 		start = 0
 	}
@@ -594,7 +594,7 @@ func (o FieldOverlay) RangeByRanks(start, end int) OverlayRange {
 	if start > end {
 		start = end
 	}
-	br := OverlayRange{
+	br := FieldIndexRange{
 		BaseStart: start,
 		BaseEnd:   end,
 	}
@@ -605,8 +605,8 @@ func (o FieldOverlay) RangeByRanks(start, end int) OverlayRange {
 	return br
 }
 
-func (o FieldOverlay) NewCursor(br OverlayRange, desc bool) OverlayCursor {
-	c := OverlayCursor{
+func (o FieldIndexView) NewCursor(br FieldIndexRange, desc bool) FieldIndexCursor {
+	c := FieldIndexCursor{
 		base:    o.base,
 		chunked: o.chunked,
 		desc:    desc,
@@ -652,7 +652,7 @@ func (o FieldOverlay) NewCursor(br OverlayRange, desc bool) OverlayCursor {
 	return c
 }
 
-func (c *OverlayCursor) Next() (keycodec.IndexKey, posting.List, bool) {
+func (c *FieldIndexCursor) Next() (keycodec.IndexKey, posting.List, bool) {
 	if c.desc {
 		if c.chunked != nil {
 			if c.remaining <= 0 || c.chunk == nil {

@@ -173,7 +173,7 @@ func (qv *queryView) tryCountByScalarLookup(expr qir.Expr, trace *queryTrace) (u
 		return 0, false, nil
 	}
 
-	ov := qv.fieldOverlayForExpr(expr)
+	ov := qv.fieldIndexViewForExpr(expr)
 	if !ov.HasData() && !qv.hasIndexedFieldForExpr(expr) {
 		return 0, false, nil
 	}
@@ -186,7 +186,7 @@ func (qv *queryView) tryCountByScalarLookup(expr qir.Expr, trace *queryTrace) (u
 		}
 		hit := uint64(0)
 		if isNil {
-			hit = qv.nilFieldOverlayForExpr(expr).LookupCardinality(nilIndexEntryKey)
+			hit = qv.nilFieldIndexViewForExpr(expr).LookupCardinality(nilIndexEntryKey)
 		} else {
 			hit = lookupScalarCardinality(ov, key)
 		}
@@ -211,7 +211,7 @@ func (qv *queryView) tryCountByScalarLookup(expr qir.Expr, trace *queryTrace) (u
 			sum += ov.LookupCardinality(valsBuf[i])
 		}
 		if hasNil {
-			sum += qv.nilFieldOverlayForExpr(expr).LookupCardinality(nilIndexEntryKey)
+			sum += qv.nilFieldIndexViewForExpr(expr).LookupCardinality(nilIndexEntryKey)
 		}
 		if trace != nil {
 			trace.setPlan(PlanCountScalarLookup)
@@ -308,7 +308,7 @@ func (qv *queryView) tryCountBySliceLookup(expr qir.Expr, trace *queryTrace) (ui
 		return 0, false, nil
 	}
 
-	ov := qv.fieldOverlayForExpr(expr)
+	ov := qv.fieldIndexViewForExpr(expr)
 	if !ov.HasData() && !qv.hasIndexedFieldForExpr(expr) {
 		return 0, false, nil
 	}
@@ -923,7 +923,7 @@ func (qv *queryView) evalMergedExactRangePostingResult(e qir.Expr, bounds indexd
 	if fm == nil || fm.Slice {
 		return postingResult{}, false
 	}
-	ov := qv.fieldOverlayForExpr(e)
+	ov := qv.fieldIndexViewForExpr(e)
 	if !ov.HasData() {
 		return postingResult{}, false
 	}
@@ -950,7 +950,7 @@ func (qv *queryView) evalMergedExactRangePostingResult(e qir.Expr, bounds indexd
 		}
 	}
 
-	ids := ov.UnionRangePostings(br, indexdata.OverlayRange{})
+	ids := ov.UnionRangePostings(br, indexdata.FieldIndexRange{})
 	if ids.IsEmpty() {
 		return postingResult{}, true
 	}
@@ -1012,7 +1012,7 @@ func (qv *queryView) tryCountByScalarInSplit(expr qir.Expr, trace *queryTrace) (
 	}
 
 	inLeaf := leaves[lead]
-	ov := qv.fieldOverlayForExpr(inLeaf)
+	ov := qv.fieldIndexViewForExpr(inLeaf)
 	if !ov.HasData() {
 		return 0, false, nil
 	}
@@ -1078,7 +1078,7 @@ func (qv *queryView) tryCountByScalarInSplit(expr qir.Expr, trace *queryTrace) (
 		cnt += ids.Cardinality()
 	}
 	if hasNil {
-		ids := qv.nilFieldOverlayForExpr(inLeaf).LookupPostingRetained(nilIndexEntryKey)
+		ids := qv.nilFieldIndexViewForExpr(inLeaf).LookupPostingRetained(nilIndexEntryKey)
 		if !ids.IsEmpty() {
 			examined += ids.Cardinality()
 			if useFilter {
@@ -2826,7 +2826,7 @@ func (qv *queryView) tryCountByPredicatesLeadBuckets(preds predicateSet, leadIdx
 	}
 	lead := preds.Get(leadIdx)
 	e := lead.expr
-	span, ok, err := qv.prepareScalarOverlaySpan(e)
+	span, ok, err := qv.prepareScalarIndexSpan(e)
 	if err != nil || !ok {
 		return 0, 0, false
 	}

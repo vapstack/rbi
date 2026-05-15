@@ -284,7 +284,7 @@ func scalarStringDuplicateSample(t testing.TB, db *DB[uint64, Rec], field string
 	view := db.engine.currentQueryViewForTests()
 
 	acc := db.engine.schema.IndexedByName[field]
-	ov := view.fieldOverlayByOrdinal(acc.Ordinal)
+	ov := view.fieldIndexViewByOrdinal(acc.Ordinal)
 	cur := ov.NewCursor(ov.RangeByRanks(0, ov.KeyCount()), false)
 	seen := make(map[uint64]string, db.Stats().KeyCount)
 	out := ""
@@ -323,7 +323,7 @@ func scalarStringOrderBreak(t testing.TB, db *DB[uint64, Rec], field string) str
 
 	view := db.engine.currentQueryViewForTests()
 	acc := db.engine.schema.IndexedByName[field]
-	ov := view.fieldOverlayByOrdinal(acc.Ordinal)
+	ov := view.fieldIndexViewByOrdinal(acc.Ordinal)
 	cur := ov.NewCursor(ov.RangeByRanks(0, ov.KeyCount()), false)
 	prev := ""
 	for {

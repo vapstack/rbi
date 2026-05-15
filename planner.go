@@ -1196,7 +1196,7 @@ type plannerOROrderMergeBranchStats struct {
 	rangeBounded bool
 }
 
-func (qv *queryView) orderMergeBranchStats(orderField string, branches plannerORBranches, ov indexdata.FieldOverlay) [plannerORBranchLimit]plannerOROrderMergeBranchStats {
+func (qv *queryView) orderMergeBranchStats(orderField string, branches plannerORBranches, ov indexdata.FieldIndexView) [plannerORBranchLimit]plannerOROrderMergeBranchStats {
 	var stats [plannerORBranchLimit]plannerOROrderMergeBranchStats
 	n := branches.Len()
 	if n > plannerORBranchLimit {
@@ -1213,7 +1213,7 @@ func (qv *queryView) orderMergeBranchStats(orderField string, branches plannerOR
 			if branch.estKnown {
 				stats[i].rangeRows = branch.estCard
 			} else {
-				br := indexdata.OverlayRange{
+				br := indexdata.FieldIndexRange{
 					BaseStart: branch.coveredRangeStart,
 					BaseEnd:   branch.coveredRangeEnd,
 				}
@@ -1226,7 +1226,7 @@ func (qv *queryView) orderMergeBranchStats(orderField string, branches plannerOR
 		if orderField == "" || !ov.HasData() {
 			continue
 		}
-		br, covered, ok := qv.extractOrderRangeCoverageOverlayReader(orderField, branch.preds, ov)
+		br, covered, ok := qv.extractOrderRangeCoverageIndexViewReader(orderField, branch.preds, ov)
 		if !ok || len(covered) == 0 {
 			if ok && (br.BaseStart != 0 || br.BaseEnd != ov.KeyCount()) {
 				stats[i].rangeBounded = true
@@ -1479,7 +1479,7 @@ func (qv *queryView) estimateOROrderMergeRouteCost(
 	if universe == 0 {
 		return plannerOROrderRouteCost{}, false
 	}
-	orderOV := qv.fieldOverlayForOrder(order)
+	orderOV := qv.fieldIndexViewForOrder(order)
 	orderDistinct := uint64(orderOV.KeyCount())
 	orderStats := qv.plannerOrderFieldStats(orderField, snap, universe, orderDistinct)
 
@@ -2119,11 +2119,11 @@ func (qv *queryView) orderedORMaterializedExactRangePredicateCosts(
 
 	var core preparedScalarRangePredicate
 	qv.initPreparedExactScalarRangePredicate(&core, p.expr, fm, p.effectiveBounds)
-	ov := qv.fieldOverlayForExpr(p.expr)
+	ov := qv.fieldIndexViewForExpr(p.expr)
 	if !ov.HasData() {
 		return qcache.MaterializedPredKey{}, 0, 0, 0, false
 	}
-	plan, _, done := core.planOverlay(ov)
+	plan, _, done := core.planFieldIndexRange(ov)
 	if done || plan.bucketCount == 0 || plan.est == 0 {
 		return qcache.MaterializedPredKey{}, 0, 0, 0, false
 	}
@@ -2188,7 +2188,7 @@ func (qv *queryView) orderedORMaterializedPrefixLeafBuildWork(
 	core := candidate.core
 	snap := qv.planner.stats.Load()
 	universe := max(qv.snapshotUniverseCardinality(), uint64(1))
-	sel, _, _, _, ok := qv.estimateLeafOrderCost(leaf, snap, universe, orderField, qv.fieldOverlay(orderField).HasData())
+	sel, _, _, _, ok := qv.estimateLeafOrderCost(leaf, snap, universe, orderField, qv.fieldIndexView(orderField).HasData())
 	if !ok || sel <= 0 {
 		return qcache.MaterializedPredKey{}, 0, false
 	}
@@ -2355,7 +2355,7 @@ func (qv *queryView) materializePositiveScalarRangePredicate(p *predicate) bool 
 }
 
 func (qv *queryView) materializePositiveScalarRangePredicateWithCandidate(p *predicate, candidate preparedScalarRangeRoutingCandidate) bool {
-	ov := qv.fieldOverlayForExpr(p.expr)
+	ov := qv.fieldIndexViewForExpr(p.expr)
 	if !ov.HasData() {
 		hasEffectiveBounds := p.hasEffectiveBounds
 		effectiveBounds := p.effectiveBounds
@@ -3305,7 +3305,7 @@ func (qv *queryView) shouldForceORBranchNumericRangeMaterializeWithCandidate(
 	_ uint64,
 ) bool {
 	return candidate.plan.useComplement &&
-		candidate.core.qv.nilFieldOverlayForExpr(candidate.core.expr).LookupCardinality(nilIndexEntryKey) > 0
+		candidate.core.qv.nilFieldIndexViewForExpr(candidate.core.expr).LookupCardinality(nilIndexEntryKey) > 0
 }
 
 func (qv *queryView) shouldForceORBranchNumericRangeMaterialize(e qir.Expr) bool {
@@ -3365,8 +3365,8 @@ func predicateHasBroadPositiveComplementRuntimeRange(p predicate) bool {
 	if p.expr.Not || p.expr.FieldOrdinal < 0 || !p.expr.Op.IsNumericRange() {
 		return false
 	}
-	if p.overlayState != nil {
-		return p.overlayState.probe.useComplement && !p.overlayState.keepProbeHits
+	if p.fieldIndexRangeState != nil {
+		return p.fieldIndexRangeState.probe.useComplement && !p.fieldIndexRangeState.keepProbeHits
 	}
 	return false
 }
@@ -3526,7 +3526,7 @@ func (qv *queryView) buildORBranchesOrdered(
 	}
 
 	branches := out
-	ov := qv.fieldOverlay(orderField)
+	ov := qv.fieldIndexView(orderField)
 	if !ov.HasData() {
 		return branches, false, true
 	}
@@ -3535,7 +3535,7 @@ func (qv *queryView) buildORBranchesOrdered(
 		if !branch.alwaysTrue || branch.predLen() == 0 {
 			continue
 		}
-		br, covered, rangeOK := qv.extractOrderRangeCoverageOverlayReader(orderField, branch.preds, ov)
+		br, covered, rangeOK := qv.extractOrderRangeCoverageIndexViewReader(orderField, branch.preds, ov)
 		if !rangeOK {
 			branches.Release()
 			return plannerORBranches{}, false, false
@@ -3575,7 +3575,7 @@ func (qv *queryView) execPlanOROrderBasic(q *qir.Shape, branches plannerORBranch
 		return nil, false
 	}
 
-	ov := qv.fieldOverlayForOrder(o)
+	ov := qv.fieldIndexViewForOrder(o)
 	if !ov.HasData() {
 		return nil, false
 	}
@@ -3604,7 +3604,7 @@ func (qv *queryView) execPlanOROrderBasic(q *qir.Shape, branches plannerORBranch
 			branchStart[i] = analysis.branches[i].rangeStart
 			branchEnd[i] = analysis.branches[i].rangeEnd
 		} else {
-			br, rangeCovered, ok := qv.extractOrderRangeCoverageOverlayReader(f, branch.preds, ov)
+			br, rangeCovered, ok := qv.extractOrderRangeCoverageIndexViewReader(f, branch.preds, ov)
 			if !ok {
 				releasePlannerOROrderBasicCheckBufs(branchCount, &branchChecks)
 				return nil, false
@@ -3901,7 +3901,7 @@ func (qv *queryView) decideOROrderFallbackFirstWithAnalysis(
 	}
 
 	order := q.Order
-	ov := qv.fieldOverlayForOrder(order)
+	ov := qv.fieldIndexViewForOrder(order)
 	var mergeStats [plannerORBranchLimit]plannerOROrderMergeBranchStats
 	if analysis != nil {
 		mergeStats = analysis.mergeStats
@@ -4001,7 +4001,7 @@ func (qv *queryView) decideOROrderKWayRuntimeFallbackWithAnalysis(
 		return plannerOROrderRuntimeGuardDecision{}, false
 	}
 
-	ov := qv.fieldOverlayForOrder(order)
+	ov := qv.fieldIndexViewForOrder(order)
 	var mergeStats [plannerORBranchLimit]plannerOROrderMergeBranchStats
 	if analysis != nil {
 		mergeStats = analysis.mergeStats
@@ -4401,7 +4401,7 @@ type plannerOROrderBranchIter struct {
 	checks         []int
 	exactChecks    []int
 	residualChecks []int
-	overlay        indexdata.FieldOverlay
+	indexView      indexdata.FieldIndexView
 	desc           bool
 	single         int
 	exactSingle    int
@@ -4427,8 +4427,8 @@ type plannerOROrderBranchIter struct {
 }
 
 type plannerOrderIndexView struct {
-	overlay indexdata.FieldOverlay
-	release func()
+	indexView indexdata.FieldIndexView
+	release   func()
 }
 
 func (v plannerOrderIndexView) close() {
@@ -4439,19 +4439,19 @@ func (v plannerOrderIndexView) close() {
 
 // plannerOrderIndexSnapshotViewByOrdinal returns the current immutable order-index slice.
 func (qv *queryView) plannerOrderIndexSnapshotViewByOrdinal(fieldOrdinal int) (plannerOrderIndexView, bool) {
-	ov := qv.fieldOverlayByOrdinal(fieldOrdinal)
+	ov := qv.fieldIndexViewByOrdinal(fieldOrdinal)
 	if !ov.HasData() {
 		return plannerOrderIndexView{}, false
 	}
-	return plannerOrderIndexView{overlay: ov}, true
+	return plannerOrderIndexView{indexView: ov}, true
 }
 
 func (it *plannerOROrderBranchIter) init() {
 	if it.startBucket < 0 {
 		it.startBucket = 0
 	}
-	if it.endBucket <= 0 || it.endBucket > it.overlay.KeyCount() {
-		it.endBucket = it.overlay.KeyCount()
+	if it.endBucket <= 0 || it.endBucket > it.indexView.KeyCount() {
+		it.endBucket = it.indexView.KeyCount()
 	}
 	if it.endBucket < it.startBucket {
 		it.endBucket = it.startBucket
@@ -4573,7 +4573,7 @@ func (it *plannerOROrderBranchIter) advance() (uint64, uint64, uint64, bool) {
 			}
 			b := it.nextBucket
 			it.nextBucket--
-			bucket := it.overlay.PostingAt(b)
+			bucket := it.indexView.PostingAt(b)
 			if bucket.IsEmpty() {
 				continue
 			}
@@ -4656,7 +4656,7 @@ func (it *plannerOROrderBranchIter) advance() (uint64, uint64, uint64, bool) {
 		}
 		b := it.nextBucket
 		it.nextBucket++
-		bucket := it.overlay.PostingAt(b)
+		bucket := it.indexView.PostingAt(b)
 		if bucket.IsEmpty() {
 			continue
 		}
@@ -4755,7 +4755,7 @@ func (qv *queryView) execPlanOROrderKWay(
 		return nil, false, nil
 	}
 	defer orderView.close()
-	ov := orderView.overlay
+	ov := orderView.indexView
 	if !ov.HasData() {
 		return nil, true, nil
 	}
@@ -4840,7 +4840,7 @@ func (qv *queryView) execPlanOROrderKWay(
 			branchEnd = analysis.branches[i].rangeEnd
 			branchUniverse = analysis.branches[i].universe
 		} else {
-			br, rangeCovered, rangeOK := qv.extractOrderRangeCoverageOverlayReader(orderField, branch.preds, ov)
+			br, rangeCovered, rangeOK := qv.extractOrderRangeCoverageIndexViewReader(orderField, branch.preds, ov)
 			if !rangeOK {
 				return nil, false, nil
 			}
@@ -4897,7 +4897,7 @@ func (qv *queryView) execPlanOROrderKWay(
 			checks:         checksBuf,
 			exactChecks:    exactChecksBuf,
 			residualChecks: residualChecksBuf,
-			overlay:        ov,
+			indexView:      ov,
 			desc:           o.Desc,
 			single:         singleCheck,
 			exactSingle:    exactSingle,
@@ -5081,9 +5081,9 @@ func (qv *queryView) execPlanOROrderMergeFallback(q *qir.Shape, branches planner
 
 	order := q.Order
 	directBranchCollect := false
-	var orderOV indexdata.FieldOverlay
+	var orderOV indexdata.FieldIndexView
 	if order.FieldOrdinal >= 0 {
-		orderOV = qv.fieldOverlayForOrder(order)
+		orderOV = qv.fieldIndexViewForOrder(order)
 		directBranchCollect = orderOV.HasData()
 	}
 
@@ -5180,7 +5180,7 @@ func (qv *queryView) execPlanOROrderMergeFallback(q *qir.Shape, branches planner
 		candidateIDs.Release()
 		return nil, false, nil
 	}
-	ov := orderView.overlay
+	ov := orderView.indexView
 	if !ov.HasData() {
 		orderView.close()
 		candidateIDs.Release()
@@ -5426,7 +5426,7 @@ func (c *plannerOROrderFallbackAccumulatorBuf) emitExact(idx uint64) bool {
 func (qv *queryView) collectOROrderFallbackBranchCandidatesWithChecks(
 	branch *plannerORBranch,
 	branchLimit int,
-	ov indexdata.FieldOverlay,
+	ov indexdata.FieldIndexView,
 	desc bool,
 	start, end int,
 	dst *postingLazySetBuilder,
@@ -5506,7 +5506,7 @@ func (qv *queryView) collectOROrderFallbackBranchCandidatesWithChecks(
 func (qv *queryView) collectOROrderFallbackBranchCandidatesWithChecksBuf(
 	branch *plannerORBranch,
 	branchLimit int,
-	ov indexdata.FieldOverlay,
+	ov indexdata.FieldIndexView,
 	desc bool,
 	start, end int,
 	dst *postingLazySetBuilder,
@@ -5590,7 +5590,7 @@ func (qv *queryView) collectOROrderFallbackBranchCandidates(
 	branch *plannerORBranch,
 	order qir.Order,
 	branchLimit int,
-	ov indexdata.FieldOverlay,
+	ov indexdata.FieldIndexView,
 	dst *postingLazySetBuilder,
 ) (uint64, uint64, uint64, bool) {
 	if branchLimit <= 0 {
@@ -5605,12 +5605,12 @@ func (qv *queryView) collectOROrderFallbackBranchCandidates(
 		return 0, 0, 0, false
 	}
 	if !ov.HasData() {
-		ov = qv.fieldOverlay(fieldName)
+		ov = qv.fieldIndexView(fieldName)
 	}
 	if !ov.HasData() {
 		return 0, 0, 0, false
 	}
-	br, covered, rangeOK := qv.extractOrderRangeCoverageOverlayReader(fieldName, branch.preds, ov)
+	br, covered, rangeOK := qv.extractOrderRangeCoverageIndexViewReader(fieldName, branch.preds, ov)
 	if !rangeOK {
 		return 0, 0, 0, false
 	}

@@ -632,7 +632,7 @@ func TestLenFieldStorageFromMapOwned_ZeroComplement(t *testing.T) {
 	if !useZeroComplement {
 		t.Fatalf("expected zero complement")
 	}
-	ov := NewFieldOverlayStorage(storage)
+	ov := NewFieldIndexViewFromStorage(storage)
 	if ov.LookupCardinality(keycodec.U64ByteString(0)) != 0 {
 		t.Fatalf("zero posting must be omitted when zero complement is used")
 	}
@@ -676,7 +676,7 @@ func TestLenFieldStorageFromMapOwned_StoresZeroWhenComplementIsNotUsed(t *testin
 	fieldStorageAssertPostingContains(t, storage, keycodec.U64ByteString(0), 1, 2)
 	fieldStorageAssertPostingContains(t, storage, keycodec.U64ByteString(1), 3, 4)
 	fieldStorageAssertPostingContains(t, storage, keycodec.U64ByteString(2), 5, 6)
-	if NewFieldOverlayStorage(storage).LookupCardinality(LenIndexNonEmptyKey) != 0 {
+	if NewFieldIndexViewFromStorage(storage).LookupCardinality(LenIndexNonEmptyKey) != 0 {
 		t.Fatalf("unexpected non-empty marker")
 	}
 }
@@ -691,7 +691,7 @@ func TestRebuildLenFieldStorageFromOverlay_CountsValuesAndStoresZero(t *testing.
 	base := newRegularFieldStorage(entries)
 	defer base.Release()
 
-	storage, useZeroComplement := RebuildLenFieldStorageFromOverlay(universe, NewFieldOverlayStorage(base))
+	storage, useZeroComplement := RebuildLenFieldStorageFromIndexView(universe, NewFieldIndexViewFromStorage(base))
 	defer storage.Release()
 	universe.Release()
 
@@ -702,7 +702,7 @@ func TestRebuildLenFieldStorageFromOverlay_CountsValuesAndStoresZero(t *testing.
 	fieldStorageAssertPostingContains(t, storage, keycodec.U64ByteString(1), 2)
 	fieldStorageAssertPostingContains(t, storage, keycodec.U64ByteString(2), 1)
 	fieldStorageAssertPostingContains(t, storage, keycodec.U64ByteString(3), 3)
-	if NewFieldOverlayStorage(storage).LookupCardinality(LenIndexNonEmptyKey) != 0 {
+	if NewFieldIndexViewFromStorage(storage).LookupCardinality(LenIndexNonEmptyKey) != 0 {
 		t.Fatalf("unexpected non-empty complement posting")
 	}
 }
@@ -717,14 +717,14 @@ func TestRebuildLenFieldStorageFromOverlay_UsesZeroComplement(t *testing.T) {
 	base := newRegularFieldStorage(entries)
 	defer base.Release()
 
-	storage, useZeroComplement := RebuildLenFieldStorageFromOverlay(universe, NewFieldOverlayStorage(base))
+	storage, useZeroComplement := RebuildLenFieldStorageFromIndexView(universe, NewFieldIndexViewFromStorage(base))
 	defer storage.Release()
 	universe.Release()
 
 	if !useZeroComplement {
 		t.Fatalf("expected zero complement")
 	}
-	ov := NewFieldOverlayStorage(storage)
+	ov := NewFieldIndexViewFromStorage(storage)
 	if ov.LookupCardinality(keycodec.U64ByteString(0)) != 0 {
 		t.Fatalf("zero posting must be omitted when zero complement is used")
 	}

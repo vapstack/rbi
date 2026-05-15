@@ -69,7 +69,7 @@ func (s *View) FieldLookupPostingRetained(field, key string) posting.List {
 	if !ok || acc.Ordinal >= len(s.Index) {
 		return posting.List{}
 	}
-	return indexdata.NewFieldOverlayStorage(s.Index[acc.Ordinal]).LookupPostingRetained(key)
+	return indexdata.NewFieldIndexViewFromStorage(s.Index[acc.Ordinal]).LookupPostingRetained(key)
 }
 
 func (s *View) FieldLookupPostingRetainedKey(field string, key keycodec.IndexLookupKey) posting.List {
@@ -80,7 +80,7 @@ func (s *View) FieldLookupPostingRetainedKey(field string, key keycodec.IndexLoo
 	if !ok || acc.Ordinal >= len(s.Index) {
 		return posting.List{}
 	}
-	ov := indexdata.NewFieldOverlayStorage(s.Index[acc.Ordinal])
+	ov := indexdata.NewFieldIndexViewFromStorage(s.Index[acc.Ordinal])
 	if key.IsNumeric() {
 		return ov.LookupPostingRetainedKey(key.IndexKey())
 	}

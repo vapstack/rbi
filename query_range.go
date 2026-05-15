@@ -37,7 +37,7 @@ func (qv *queryView) numericRangeBucketCacheEntry(field string, storage indexdat
 	return qv.snap.NumericRangeBucketCacheEntry(field, ordinal, storage, bucketSize, minFieldKeys)
 }
 
-func (qv *queryView) tryEvalNumericRangeBuckets(field string, fm *schema.Field, ov indexdata.FieldOverlay, br indexdata.OverlayRange) (postingResult, bool) {
+func (qv *queryView) tryEvalNumericRangeBuckets(field string, fm *schema.Field, ov indexdata.FieldIndexView, br indexdata.FieldIndexRange) (postingResult, bool) {
 	if !schema.FieldUsesOrderedNumericKeys(fm) {
 		return postingResult{}, false
 	}
@@ -99,17 +99,17 @@ func (qv *queryView) tryEvalNumericRangeBuckets(field string, fm *schema.Field, 
 				res = ov.MergeRangePostingsInto(
 					res,
 					ov.RangeByRanks(idx.BucketStart(cachedEnd+1), idx.BucketEnd(endFull)),
-					indexdata.OverlayRange{},
+					indexdata.FieldIndexRange{},
 				)
 			case cachedEnd == endFull && cachedStart > startFull:
 				res = ov.MergeRangePostingsInto(
 					res,
 					ov.RangeByRanks(idx.BucketStart(startFull), idx.BucketStart(cachedStart)),
-					indexdata.OverlayRange{},
+					indexdata.FieldIndexRange{},
 				)
 			}
 		} else {
-			res = ov.MergeRangePostingsInto(res, ov.RangeByRanks(idx.BucketStart(startFull), idx.BucketEnd(endFull)), indexdata.OverlayRange{})
+			res = ov.MergeRangePostingsInto(res, ov.RangeByRanks(idx.BucketStart(startFull), idx.BucketEnd(endFull)), indexdata.FieldIndexRange{})
 		}
 		res, _ = entry.TryStoreFullSpan(startFull, endFull, res)
 	}
@@ -127,7 +127,7 @@ func (qv *queryView) tryEvalNumericRangeBuckets(field string, fm *schema.Field, 
 	return postingResult{ids: res}, true
 }
 
-func (qv *queryView) tryLoadNumericRangeBuckets(field string, fm *schema.Field, ov indexdata.FieldOverlay, br indexdata.OverlayRange) (postingResult, bool) {
+func (qv *queryView) tryLoadNumericRangeBuckets(field string, fm *schema.Field, ov indexdata.FieldIndexView, br indexdata.FieldIndexRange) (postingResult, bool) {
 	if !schema.FieldUsesOrderedNumericKeys(fm) {
 		return postingResult{}, false
 	}
@@ -198,7 +198,7 @@ func (qv *queryView) tryLoadNumericRangeBuckets(field string, fm *schema.Field, 
 	return postingResult{ids: res}, true
 }
 
-func (qv *queryView) tryCountSnapshotNumericRange(field string, fm *schema.Field, ov indexdata.FieldOverlay, start, end int) (uint64, bool) {
+func (qv *queryView) tryCountSnapshotNumericRange(field string, fm *schema.Field, ov indexdata.FieldIndexView, start, end int) (uint64, bool) {
 	if !schema.FieldUsesOrderedNumericKeys(fm) {
 		return 0, false
 	}
@@ -213,5 +213,5 @@ func (qv *queryView) tryCountSnapshotNumericRange(field string, fm *schema.Field
 	if storage.KeyCount() != ov.KeyCount() {
 		return 0, false
 	}
-	return indexdata.NewFieldOverlayStorage(storage).RangeRows(start, end), true
+	return indexdata.NewFieldIndexViewFromStorage(storage).RangeRows(start, end), true
 }

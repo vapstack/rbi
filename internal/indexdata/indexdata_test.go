@@ -115,7 +115,7 @@ func fieldStorageFullPageSplitNumericRoot() *fieldIndexChunkedRoot {
 
 func fieldStorageAssertPostingContains(t *testing.T, storage FieldStorage, key string, want ...uint64) {
 	t.Helper()
-	ids := NewFieldOverlayStorage(storage).LookupPostingRetained(key)
+	ids := NewFieldIndexViewFromStorage(storage).LookupPostingRetained(key)
 	if ids.Cardinality() != uint64(len(want)) {
 		t.Fatalf("posting %q cardinality: got %d want %d", key, ids.Cardinality(), len(want))
 	}
@@ -157,7 +157,7 @@ func measureStorageAssertMissing(t *testing.T, storage MeasureStorage, id uint64
 
 func fieldStorageAssertStorageMatchesEntries(t *testing.T, storage FieldStorage, entries []Entry) {
 	t.Helper()
-	ov := NewFieldOverlayStorage(storage)
+	ov := NewFieldIndexViewFromStorage(storage)
 	if ov.KeyCount() != len(entries) {
 		t.Fatalf("unexpected storage size: got %d want %d", ov.KeyCount(), len(entries))
 	}
