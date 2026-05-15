@@ -737,7 +737,7 @@ func BenchmarkReadMeasureStorage(b *testing.B) {
 	}
 }
 
-func BenchmarkFieldOverlayLookupFlat(b *testing.B) {
+func BenchmarkFieldIndexViewLookupFlat(b *testing.B) {
 	entries := benchmarkFieldEntries(FieldChunkTargetEntries/2, false)
 	storage := newRegularFieldStorage(entries)
 	defer storage.Release()
@@ -756,7 +756,7 @@ func BenchmarkFieldOverlayLookupFlat(b *testing.B) {
 	benchUint64 = total
 }
 
-func BenchmarkFieldOverlayLookupChunked(b *testing.B) {
+func BenchmarkFieldIndexViewLookupChunked(b *testing.B) {
 	entries := benchmarkFieldEntries(FieldChunkThreshold*8, false)
 	storage := newRegularFieldStorage(entries)
 	defer storage.Release()
@@ -772,7 +772,7 @@ func BenchmarkFieldOverlayLookupChunked(b *testing.B) {
 	benchUint64 = total
 }
 
-func BenchmarkFieldOverlayCursorChunkedRange(b *testing.B) {
+func BenchmarkFieldIndexViewCursorChunkedRange(b *testing.B) {
 	entries := benchmarkFieldEntries(FieldChunkThreshold*8, false)
 	storage := newRegularFieldStorage(entries)
 	defer storage.Release()
@@ -795,7 +795,7 @@ func BenchmarkFieldOverlayCursorChunkedRange(b *testing.B) {
 	benchUint64 = total
 }
 
-func BenchmarkFieldOverlayCursorFlatRange(b *testing.B) {
+func BenchmarkFieldIndexViewCursorFlatRange(b *testing.B) {
 	entries := benchmarkFieldEntries(FieldChunkTargetEntries/2, false)
 	storage := newRegularFieldStorage(entries)
 	defer storage.Release()
@@ -821,7 +821,7 @@ func BenchmarkFieldOverlayCursorFlatRange(b *testing.B) {
 	benchUint64 = total
 }
 
-func BenchmarkFieldOverlayCursorChunkedRangeDesc(b *testing.B) {
+func BenchmarkFieldIndexViewCursorChunkedRangeDesc(b *testing.B) {
 	entries := benchmarkFieldEntries(FieldChunkThreshold*8, false)
 	storage := newRegularFieldStorage(entries)
 	defer storage.Release()
@@ -844,7 +844,7 @@ func BenchmarkFieldOverlayCursorChunkedRangeDesc(b *testing.B) {
 	benchUint64 = total
 }
 
-func BenchmarkFieldOverlayRangeForBounds(b *testing.B) {
+func BenchmarkFieldIndexViewRangeForBounds(b *testing.B) {
 	tests := []struct {
 		name    string
 		rows    int
@@ -884,7 +884,7 @@ func BenchmarkFieldOverlayRangeForBounds(b *testing.B) {
 	}
 }
 
-func BenchmarkFieldOverlayRangeStats(b *testing.B) {
+func BenchmarkFieldIndexViewRangeStats(b *testing.B) {
 	tests := []struct {
 		name string
 		rows int
@@ -958,7 +958,7 @@ func BenchmarkBoundsApply(b *testing.B) {
 	})
 }
 
-func BenchmarkFieldOverlayLookupPostingsChunked(b *testing.B) {
+func BenchmarkFieldIndexViewLookupPostingsChunked(b *testing.B) {
 	entries := benchmarkFieldEntries(FieldChunkThreshold*8, false)
 	storage := newRegularFieldStorage(entries)
 	defer storage.Release()
@@ -980,7 +980,7 @@ func BenchmarkFieldOverlayLookupPostingsChunked(b *testing.B) {
 	benchUint64 = total
 }
 
-func BenchmarkFieldOverlayUnionRangePostingsChunked(b *testing.B) {
+func BenchmarkFieldIndexViewUnionRangePostingsChunked(b *testing.B) {
 	entries := benchmarkFieldEntries(FieldChunkThreshold*8, true)
 	storage := newRegularFieldStorage(entries)
 	defer storage.Release()
@@ -999,7 +999,7 @@ func BenchmarkFieldOverlayUnionRangePostingsChunked(b *testing.B) {
 	benchUint64 = total
 }
 
-func BenchmarkFieldOverlayMergeRangePostingsChunked(b *testing.B) {
+func BenchmarkFieldIndexViewMergeRangePostingsChunked(b *testing.B) {
 	entries := benchmarkFieldEntries(FieldChunkThreshold*8, true)
 	storage := newRegularFieldStorage(entries)
 	defer storage.Release()
@@ -1302,7 +1302,7 @@ func BenchmarkNewLenFieldStorageFromMapOwned(b *testing.B) {
 	benchBool = used
 }
 
-func BenchmarkRebuildLenFieldStorageFromOverlay(b *testing.B) {
+func BenchmarkRebuildLenFieldStorageFromIndexView(b *testing.B) {
 	const rows = 16_384
 	const values = FieldChunkThreshold * 4
 

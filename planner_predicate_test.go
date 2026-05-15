@@ -169,14 +169,14 @@ func TestPredicateSupportsExactBucketPostingFilter_RangeStatesCheapOnly(t *testi
 }
 
 func TestPredicateSupportsCheapPostingFilter_UsesUnifiedCapability(t *testing.T) {
-	t.Run("OverlayRangeNonCheap", func(t *testing.T) {
+	t.Run("FieldIndexRangeNonCheap", func(t *testing.T) {
 		p := predicate{fieldIndexRangeState: &fieldIndexRangePredicateState{}}
 		if p.supportsCheapPostingApply() {
 			t.Fatalf("non-cheap overlay range state must stay out of cheap posting-filter class")
 		}
 	})
 
-	t.Run("OverlayRangeCheap", func(t *testing.T) {
+	t.Run("FieldIndexRangeCheap", func(t *testing.T) {
 		p := predicate{
 			fieldIndexRangeState: &fieldIndexRangePredicateState{},
 			postingFilterCheap:   true,
@@ -307,7 +307,7 @@ func TestIndexViewRangePredicateState_Matches_MaterializedComplementProbe(t *tes
 	}
 }
 
-func TestPredicateSetExpectedContainsCalls_UpdatesOverlayRangeState(t *testing.T) {
+func TestPredicateSetExpectedContainsCalls_UpdatesFieldIndexRangeState(t *testing.T) {
 	state := fieldIndexRangePredicateStatePool.Get()
 	state.ov = indexdata.NewFieldIndexView(&[]indexdata.Entry{{Key: keycodec.FromString("a")}, {Key: keycodec.FromString("b")}, {Key: keycodec.FromString("c")}})
 	state.br = indexdata.FieldIndexRange{BaseStart: 0, BaseEnd: 3}
@@ -363,7 +363,7 @@ func TestIndexViewRangePredicateState_LinearContains_NonLinearModeSkipsLinearPos
 	}
 }
 
-func TestAcquireOverlayRangePredicateState_PositiveDirectProbeKeepsProbeHitsWithoutPostingFilter(t *testing.T) {
+func TestAcquireFieldIndexRangePredicateState_PositiveDirectProbeKeepsProbeHitsWithoutPostingFilter(t *testing.T) {
 	state := fieldIndexRangePredicateStatePool.Get()
 	state.ov = indexdata.NewFieldIndexView(&[]indexdata.Entry{{Key: keycodec.FromString("a")}, {Key: keycodec.FromString("b")}})
 	state.br = indexdata.FieldIndexRange{BaseStart: 0, BaseEnd: 1}
@@ -611,7 +611,7 @@ func TestBuildPredRange_BaseNumericPostingFilter_NotComplementMaterializedFallba
 	assertPostingConsumerSet(t, got, want)
 }
 
-func TestBuildPredRange_OverlayNumericPostingFilter_NotComplementMaterializedFallback(t *testing.T) {
+func TestBuildPredRange_FieldIndexNumericPostingFilter_NotComplementMaterializedFallback(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
 
 	seedGeneratedUint64Data(t, db, 20_000, func(i int) *Rec {
@@ -648,7 +648,7 @@ func TestBuildPredRange_OverlayNumericPostingFilter_NotComplementMaterializedFal
 	assertPostingConsumerSet(t, got, want)
 }
 
-func TestBuildPredRange_OverlayNumericPostingFilter_ComplementMaterializedFallback(t *testing.T) {
+func TestBuildPredRange_FieldIndexNumericPostingFilter_ComplementMaterializedFallback(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
 
 	seedGeneratedUint64Data(t, db, 20_000, func(i int) *Rec {
@@ -856,7 +856,7 @@ func TestBuildPredicateWithMode_AllowMaterializeSkipsColdNumericRangeUnionWhenPo
 }
 
 func TestBuildPredicateWithMode_RuntimeNumericRangeMaterializationKeepsScalarCacheLocal(t *testing.T) {
-	t.Run("OverlayState", func(t *testing.T) {
+	t.Run("FieldIndexRangeState", func(t *testing.T) {
 		db, _ := openTempDBUint64(t, Options{
 			AnalyzeInterval:                         -1,
 			SnapshotMaterializedPredCacheMaxEntries: 16,

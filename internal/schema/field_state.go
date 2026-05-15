@@ -9,7 +9,7 @@ import (
 	"github.com/vapstack/rbi/internal/posting"
 )
 
-type OverlayState struct {
+type IndexState struct {
 	index   map[string]posting.List
 	fixed   map[uint64]posting.List
 	lengths map[uint32]posting.List
@@ -48,10 +48,10 @@ var snapshotFieldInsertStateSlicePool = pooled.NewSlicePool[InsertState](
 	cleanupSnapshotFieldInsertStateSlice,
 )
 
-var snapshotFieldOverlayStateSlicePool = pooled.NewSlicePool[OverlayState](
+var snapshotFieldIndexStateSlicePool = pooled.NewSlicePool[IndexState](
 	snapshotFieldStateSlicePoolMaxCap,
 	pooled.ClearCap,
-	cleanupSnapshotFieldOverlayStateSlice,
+	cleanupSnapshotFieldIndexStateSlice,
 )
 
 type WriteScratch struct {
@@ -84,13 +84,13 @@ func GetInsertStates(n int) []InsertState {
 	return states[:n]
 }
 
-func GetOverlayStates(n int) []OverlayState {
-	states := snapshotFieldOverlayStateSlicePool.Get(n)
+func GetIndexStates(n int) []IndexState {
+	states := snapshotFieldIndexStateSlicePool.Get(n)
 	return states[:n]
 }
 
-func ReleaseOverlayStates(states []OverlayState) {
-	snapshotFieldOverlayStateSlicePool.Put(states)
+func ReleaseIndexStates(states []IndexState) {
+	snapshotFieldIndexStateSlicePool.Put(states)
 }
 
 func ReleaseInsertStates(states []InsertState) {
@@ -106,11 +106,11 @@ func ReleaseBatchStates(states []BatchState) {
 	snapshotFieldBatchStateSlicePool.Put(states)
 }
 
-func (state *OverlayState) Changed() bool {
+func (state *IndexState) Changed() bool {
 	return state.changed
 }
 
-func (state *OverlayState) MaterializeStorage(numeric bool) indexdata.FieldStorage {
+func (state *IndexState) MaterializeStorage(numeric bool) indexdata.FieldStorage {
 	if numeric {
 		fixed := state.fixed
 		state.fixed = nil
@@ -121,13 +121,13 @@ func (state *OverlayState) MaterializeStorage(numeric bool) indexdata.FieldStora
 	return indexdata.NewRegularFieldStorageFromPostingMapOwned(idx, false)
 }
 
-func (state *OverlayState) MaterializeNilStorage() indexdata.FieldStorage {
+func (state *IndexState) MaterializeNilStorage() indexdata.FieldStorage {
 	nils := state.nils
 	state.nils = nil
 	return indexdata.NewFlatFieldStorageFromPostingMapOwned(nils, false)
 }
 
-func (state *OverlayState) MaterializeLenStorage(universe posting.List) (indexdata.FieldStorage, bool) {
+func (state *IndexState) MaterializeLenStorage(universe posting.List) (indexdata.FieldStorage, bool) {
 	lengths := state.lengths
 	state.lengths = nil
 	storage, useZeroComplement := indexdata.NewLenFieldStorageFromMapOwned(universe, lengths)
@@ -135,7 +135,7 @@ func (state *OverlayState) MaterializeLenStorage(universe posting.List) (indexda
 	return storage, useZeroComplement
 }
 
-func (state *OverlayState) Reset() {
+func (state *IndexState) Reset() {
 	if state.index != nil {
 		indexdata.ReleasePostingMap(state.index)
 		state.index = nil
@@ -258,17 +258,17 @@ func (s *WriteScratch) sortForField(f *Field) {
 	}
 }
 
-type OverlaySink struct {
-	state *OverlayState
+type IndexSink struct {
+	state *IndexState
 	idx   uint64
 }
 
-func (s OverlaySink) setNil() {
+func (s IndexSink) setNil() {
 	s.state.nils = addFieldPostingList(s.state.nils, indexdata.NilIndexEntryKey, s.idx)
 	s.state.changed = true
 }
 
-func (s OverlaySink) setLen(length int) {
+func (s IndexSink) setLen(length int) {
 	if s.state.lengths == nil {
 		s.state.lengths = indexdata.GetLenPostingMap(8)
 	}
@@ -279,12 +279,12 @@ func (s OverlaySink) setLen(length int) {
 	s.state.changed = true
 }
 
-func (s OverlaySink) addString(key string) {
+func (s IndexSink) addString(key string) {
 	s.state.index = addFieldPostingList(s.state.index, key, s.idx)
 	s.state.changed = true
 }
 
-func (s OverlaySink) addFixed(key uint64) {
+func (s IndexSink) addFixed(key uint64) {
 	s.state.fixed = addFixedFieldPostingList(s.state.fixed, key, s.idx)
 	s.state.changed = true
 }
@@ -321,8 +321,8 @@ func (s InsertSink) addFixed(key uint64) {
 	s.state.changed = true
 }
 
-func (acc IndexedFieldAccessor) CollectOverlayValue(ptr unsafe.Pointer, idx uint64, state *OverlayState) {
-	acc.WriteOverlay(ptr, OverlaySink{state: state, idx: idx})
+func (acc IndexedFieldAccessor) CollectIndexValue(ptr unsafe.Pointer, idx uint64, state *IndexState) {
+	acc.WriteIndex(ptr, IndexSink{state: state, idx: idx})
 }
 
 func (acc IndexedFieldAccessor) CollectInsertValue(
@@ -810,7 +810,7 @@ func cleanupSnapshotFieldInsertStateSlice(states []InsertState) {
 	}
 }
 
-func cleanupSnapshotFieldOverlayStateSlice(states []OverlayState) {
+func cleanupSnapshotFieldIndexStateSlice(states []IndexState) {
 	for i := range states {
 		states[i].Reset()
 	}

@@ -167,7 +167,7 @@ type IndexedFieldAccessor struct {
 	Field        *Field
 	UniqueGetter UniqueScalarGetterFn
 	WriteBuild   BuildFieldWriteAccessorFn
-	WriteOverlay OverlayFieldWriteAccessorFn
+	WriteIndex   IndexFieldWriteAccessorFn
 	WriteInsert  InsertFieldWriteAccessorFn
 	WriteScratch ScratchFieldWriteAccessorFn
 	Modified     FieldModifiedFn
@@ -598,7 +598,7 @@ func buildFieldDefinition(sf reflect.StructField, index []int, indexKind IndexKi
 type (
 	UniqueScalarGetterFn        func(ptr unsafe.Pointer) (keycodec.IndexLookupKey, bool, bool)
 	BuildFieldWriteAccessorFn   func(ptr unsafe.Pointer, sink BuildSink)
-	OverlayFieldWriteAccessorFn func(ptr unsafe.Pointer, sink OverlaySink)
+	IndexFieldWriteAccessorFn   func(ptr unsafe.Pointer, sink IndexSink)
 	InsertFieldWriteAccessorFn  func(ptr unsafe.Pointer, sink InsertSink)
 	ScratchFieldWriteAccessorFn func(ptr unsafe.Pointer, sink *WriteScratch)
 )

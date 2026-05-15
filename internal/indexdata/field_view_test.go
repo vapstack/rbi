@@ -8,7 +8,7 @@ import (
 	"github.com/vapstack/rbi/internal/posting"
 )
 
-func TestFieldOverlayFlatCursorReturnsBorrowedPostings(t *testing.T) {
+func TestFieldIndexViewFlatCursorReturnsBorrowedPostings(t *testing.T) {
 	entries := []Entry{
 		{
 			Key: keycodec.FromStoredString("a", false),
@@ -54,7 +54,7 @@ func TestFieldOverlayFlatCursorReturnsBorrowedPostings(t *testing.T) {
 	}
 }
 
-func TestFieldOverlayCursorRangeOrderFlatAndChunked(t *testing.T) {
+func TestFieldIndexViewCursorRangeOrderFlatAndChunked(t *testing.T) {
 	tests := []struct {
 		name      string
 		rows      int
@@ -114,7 +114,7 @@ func TestFieldOverlayCursorRangeOrderFlatAndChunked(t *testing.T) {
 	}
 }
 
-func TestFieldOverlayRangeByRanksClampsFlatAndChunked(t *testing.T) {
+func TestFieldIndexViewRangeByRanksClampsFlatAndChunked(t *testing.T) {
 	tests := []struct {
 		name      string
 		rows      int
@@ -272,7 +272,7 @@ func TestBoundsApplyPrefixIntersectionAndContradiction(t *testing.T) {
 	}
 }
 
-func TestFieldOverlayRangeForBounds_PrefixIntersectsRange(t *testing.T) {
+func TestFieldIndexViewRangeForBounds_PrefixIntersectsRange(t *testing.T) {
 	entries := []Entry{
 		{Key: keycodec.FromStoredString("aa", false)},
 		{Key: keycodec.FromStoredString("ab", false)},
@@ -300,7 +300,7 @@ func TestFieldOverlayRangeForBounds_PrefixIntersectsRange(t *testing.T) {
 	}
 }
 
-func TestFieldOverlayRangeForBounds_ExclusiveLowerExactAndMissing(t *testing.T) {
+func TestFieldIndexViewRangeForBounds_ExclusiveLowerExactAndMissing(t *testing.T) {
 	tests := []struct {
 		name    string
 		numeric bool
@@ -366,7 +366,7 @@ func TestFieldOverlayRangeForBounds_ExclusiveLowerExactAndMissing(t *testing.T) 
 	}
 }
 
-func TestFieldOverlayRangeForBounds_HighPrefixAndDescendingCursor(t *testing.T) {
+func TestFieldIndexViewRangeForBounds_HighPrefixAndDescendingCursor(t *testing.T) {
 	tests := []struct {
 		name string
 		rows int
@@ -493,7 +493,7 @@ func TestBoundsNormalizeComparesEndpoints(t *testing.T) {
 	mixedBounds.Normalize()
 }
 
-func TestFieldOverlayRangeStats_ChunkedMatchesCursorScanForBounds(t *testing.T) {
+func TestFieldIndexViewRangeStats_ChunkedMatchesCursorScanForBounds(t *testing.T) {
 	const rows = fieldIndexChunkThreshold + 113
 	tests := []struct {
 		name    string
@@ -546,7 +546,7 @@ func TestFieldOverlayRangeStats_ChunkedMatchesCursorScanForBounds(t *testing.T) 
 			for i, bounds := range tc.bounds {
 				br := ov.RangeForBounds(bounds)
 				gotBuckets, gotRows := ov.RangeStats(br)
-				wantBuckets, wantRows := fieldStorageOverlayRangeStats(ov, br)
+				wantBuckets, wantRows := fieldIndexViewRangeStats(ov, br)
 				if gotBuckets != wantBuckets || gotRows != wantRows {
 					t.Fatalf("case %d range stats mismatch: got buckets=%d rows=%d want buckets=%d rows=%d", i, gotBuckets, gotRows, wantBuckets, wantRows)
 				}
@@ -555,7 +555,7 @@ func TestFieldOverlayRangeStats_ChunkedMatchesCursorScanForBounds(t *testing.T) 
 	}
 }
 
-func TestFieldOverlayRangeStats_ChunkedRankOnlyRangeUsesRankBounds(t *testing.T) {
+func TestFieldIndexViewRangeStats_ChunkedRankOnlyRangeUsesRankBounds(t *testing.T) {
 	entries := make([]Entry, 0, fieldIndexChunkThreshold+17)
 	for i := 0; i < fieldIndexChunkThreshold+17; i++ {
 		entries = append(entries, Entry{
@@ -574,13 +574,13 @@ func TestFieldOverlayRangeStats_ChunkedRankOnlyRangeUsesRankBounds(t *testing.T)
 		BaseEnd:   fieldIndexChunkThreshold + 7,
 	}
 	gotBuckets, gotRows := ov.RangeStats(br)
-	wantBuckets, wantRows := fieldStorageOverlayRangeStats(ov, br)
+	wantBuckets, wantRows := fieldIndexViewRangeStats(ov, br)
 	if gotBuckets != wantBuckets || gotRows != wantRows {
 		t.Fatalf("rank-only range stats mismatch: got buckets=%d rows=%d want buckets=%d rows=%d", gotBuckets, gotRows, wantBuckets, wantRows)
 	}
 }
 
-func TestFieldOverlayLookupPostingsSkipsMissingAndReturnsEstimate(t *testing.T) {
+func TestFieldIndexViewLookupPostingsSkipsMissingAndReturnsEstimate(t *testing.T) {
 	entries := fieldStorageEntriesForTest(8, false)
 	storage := newRegularFieldStorage(entries)
 	defer storage.Release()
@@ -599,7 +599,7 @@ func TestFieldOverlayLookupPostingsSkipsMissingAndReturnsEstimate(t *testing.T) 
 	}
 }
 
-func TestFieldOverlayAccessorsFlatAndChunked(t *testing.T) {
+func TestFieldIndexViewAccessorsFlatAndChunked(t *testing.T) {
 	tests := []struct {
 		name      string
 		rows      int
@@ -648,7 +648,7 @@ func TestFieldOverlayAccessorsFlatAndChunked(t *testing.T) {
 	}
 }
 
-func fieldStorageOverlayRangeStats(ov FieldIndexView, br FieldIndexRange) (int, uint64) {
+func fieldIndexViewRangeStats(ov FieldIndexView, br FieldIndexRange) (int, uint64) {
 	if br.BaseStart >= br.BaseEnd {
 		return 0, 0
 	}

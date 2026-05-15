@@ -2608,7 +2608,7 @@ func TestQuery_RandomMixedMultiWrites_MatchSeqScanModel(t *testing.T) {
 	}
 }
 
-func TestQuery_ByArrayPos_Scalar_DuplicatePriority_BaseAndOverlay(t *testing.T) {
+func TestQuery_ByArrayPos_Scalar_DuplicatePriority_BaseAndFieldIndexView(t *testing.T) {
 	db, _ := openTempDBUint64(t)
 	_ = seedData(t, db, 260)
 

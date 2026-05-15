@@ -142,7 +142,7 @@ func TestQuery_LimitNoFilterNoOrder_UsesDirectLimitPlan(t *testing.T) {
 	}
 }
 
-func TestQuery_RangeNoOrderWithLimit_NilEQ_UsesNilOverlayInEarlyRoute(t *testing.T) {
+func TestQuery_RangeNoOrderWithLimit_NilEQ_UsesNilFieldIndexViewInEarlyRoute(t *testing.T) {
 	db, _ := openTempDBUint64(t)
 
 	if err := db.Set(1, &Rec{Name: "nil-a", Opt: nil}); err != nil {

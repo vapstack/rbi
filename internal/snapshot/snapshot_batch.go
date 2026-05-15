@@ -239,7 +239,7 @@ func buildPreparedSnapshotFromEmptyBase(seq uint64, prev *View, rt *schema.Runti
 		}
 	}
 
-	fieldStates := schema.GetOverlayStates(len(rt.Indexed))
+	fieldStates := schema.GetIndexStates(len(rt.Indexed))
 	measureStates := indexdata.GetMeasureEntrySlots(len(rt.Measures))
 
 	for i := range entries {
@@ -250,7 +250,7 @@ func buildPreparedSnapshotFromEmptyBase(seq uint64, prev *View, rt *schema.Runti
 		ptr := op.New
 
 		for _, acc := range rt.Indexed {
-			acc.CollectOverlayValue(ptr, op.ID, &fieldStates[acc.Ordinal])
+			acc.CollectIndexValue(ptr, op.ID, &fieldStates[acc.Ordinal])
 		}
 		for _, acc := range rt.Measures {
 			if value, ok := acc.Read(ptr); ok {
@@ -339,7 +339,7 @@ func buildPreparedSnapshotFromEmptyBase(seq uint64, prev *View, rt *schema.Runti
 			pooled.ReleaseBoolSlice(changed)
 		}
 	}
-	schema.ReleaseOverlayStates(fieldStates)
+	schema.ReleaseIndexStates(fieldStates)
 	indexdata.ReleaseMeasureEntrySlots(measureStates)
 	snap.ensureUniverseOwner()
 	return snap, true
@@ -484,7 +484,7 @@ func buildPreparedSnapshotDeletedAll(seq uint64, rt *schema.Runtime, cfg CacheCo
 }
 
 func buildPreparedSnapshotFullReplace(seq uint64, prev *View, rt *schema.Runtime, cfg CacheConfig, strMap *strmap.Mapper, entries []BatchEntry) *View {
-	fieldStates := schema.GetOverlayStates(len(rt.Indexed))
+	fieldStates := schema.GetIndexStates(len(rt.Indexed))
 	measureStates := indexdata.GetMeasureEntrySlots(len(rt.Measures))
 
 	for i := range entries {
@@ -492,7 +492,7 @@ func buildPreparedSnapshotFullReplace(seq uint64, prev *View, rt *schema.Runtime
 		ptr := op.New
 
 		for _, acc := range rt.Indexed {
-			acc.CollectOverlayValue(ptr, op.ID, &fieldStates[acc.Ordinal])
+			acc.CollectIndexValue(ptr, op.ID, &fieldStates[acc.Ordinal])
 		}
 		for _, acc := range rt.Measures {
 			if value, ok := acc.Read(ptr); ok {
@@ -564,7 +564,7 @@ func buildPreparedSnapshotFullReplace(seq uint64, prev *View, rt *schema.Runtime
 		StrMap:             sm,
 	}
 	next.initRuntimeCaches(rt, cfg)
-	schema.ReleaseOverlayStates(fieldStates)
+	schema.ReleaseIndexStates(fieldStates)
 	indexdata.ReleaseMeasureEntrySlots(measureStates)
 	next.retainSharedOwnedStorageFrom(prev)
 	return next

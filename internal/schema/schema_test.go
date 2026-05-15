@@ -557,11 +557,11 @@ func TestPatchRuntimeApplyUnknownNilAndConversionErrors(t *testing.T) {
 	}
 }
 
-func schemaTestOverlayContains(storage indexdata.FieldStorage, key string, id uint64) bool {
+func schemaTestIndexViewContains(storage indexdata.FieldStorage, key string, id uint64) bool {
 	return indexdata.NewFieldIndexViewFromStorage(storage).LookupPostingRetained(key).Contains(id)
 }
 
-func schemaTestOverlayContainsKey(storage indexdata.FieldStorage, key uint64, id uint64) bool {
+func schemaTestIndexViewContainsKey(storage indexdata.FieldStorage, key uint64, id uint64) bool {
 	return indexdata.NewFieldIndexViewFromStorage(storage).LookupPostingRetainedKey(keycodec.FromU64(key)).Contains(id)
 }
 
@@ -614,7 +614,7 @@ func TestBuildFieldStateHotPaths(t *testing.T) {
 	stringLocal.FlushRegularInto(stringState)
 	stringStorage := stringState.MaterializeStorage()
 	defer stringStorage.Release()
-	if !schemaTestOverlayContains(stringStorage, "alice", 1) {
+	if !schemaTestIndexViewContains(stringStorage, "alice", 1) {
 		t.Fatal("string build materialization lost posting")
 	}
 
@@ -624,13 +624,13 @@ func TestBuildFieldStateHotPaths(t *testing.T) {
 	fixedLocal.FlushAllInto(fixedState)
 	fixedStorage := fixedState.MaterializeStorage()
 	defer fixedStorage.Release()
-	if !schemaTestOverlayContainsKey(fixedStorage, keycodec.OrderedInt64Key(5), 2) {
+	if !schemaTestIndexViewContainsKey(fixedStorage, keycodec.OrderedInt64Key(5), 2) {
 		t.Fatal("fixed build materialization lost posting")
 	}
 	universe := (posting.List{}).BuildAdded(2)
 	lenStorage, _ := fixedState.MaterializeLenStorage(universe)
 	defer lenStorage.Release()
-	if !schemaTestOverlayContains(lenStorage, keycodec.U64ByteString(2), 2) {
+	if !schemaTestIndexViewContains(lenStorage, keycodec.U64ByteString(2), 2) {
 		t.Fatal("len build materialization lost posting")
 	}
 
@@ -640,7 +640,7 @@ func TestBuildFieldStateHotPaths(t *testing.T) {
 	nilLocal.FlushAllInto(nilState)
 	nilStorage := nilState.MaterializeNilStorage()
 	defer nilStorage.Release()
-	if !schemaTestOverlayContains(nilStorage, indexdata.NilIndexEntryKey, 3) {
+	if !schemaTestIndexViewContains(nilStorage, indexdata.NilIndexEntryKey, 3) {
 		t.Fatal("nil build materialization lost posting")
 	}
 
@@ -660,7 +660,7 @@ func TestBuildFieldStateHotPaths(t *testing.T) {
 	}
 }
 
-func TestOverlayStateCollectAndMaterialize(t *testing.T) {
+func TestIndexStateCollectAndMaterialize(t *testing.T) {
 	rt, err := Compile(reflect.TypeFor[schemaTestAccessorRec](), Config{})
 	if err != nil {
 		t.Fatalf("Compile: %v", err)
@@ -671,35 +671,35 @@ func TestOverlayStateCollectAndMaterialize(t *testing.T) {
 	}
 	ptr := unsafe.Pointer(&rec)
 
-	var stringState OverlayState
-	rt.IndexedByName["name"].CollectOverlayValue(ptr, 1, &stringState)
+	var stringState IndexState
+	rt.IndexedByName["name"].CollectIndexValue(ptr, 1, &stringState)
 	if !stringState.Changed() {
 		t.Fatal("string overlay state not marked changed")
 	}
 	stringStorage := stringState.MaterializeStorage(false)
 	defer stringStorage.Release()
-	if !schemaTestOverlayContains(stringStorage, "alice", 1) {
+	if !schemaTestIndexViewContains(stringStorage, "alice", 1) {
 		t.Fatal("string overlay materialization lost posting")
 	}
 
-	var fixedState OverlayState
-	rt.IndexedByName["scores"].CollectOverlayValue(ptr, 2, &fixedState)
+	var fixedState IndexState
+	rt.IndexedByName["scores"].CollectIndexValue(ptr, 2, &fixedState)
 	fixedStorage := fixedState.MaterializeStorage(true)
 	defer fixedStorage.Release()
-	if !schemaTestOverlayContainsKey(fixedStorage, keycodec.OrderedInt64Key(7), 2) {
+	if !schemaTestIndexViewContainsKey(fixedStorage, keycodec.OrderedInt64Key(7), 2) {
 		t.Fatal("fixed overlay materialization lost posting")
 	}
 	lenStorage, _ := fixedState.MaterializeLenStorage((posting.List{}).BuildAdded(2))
 	defer lenStorage.Release()
-	if !schemaTestOverlayContains(lenStorage, keycodec.U64ByteString(2), 2) {
+	if !schemaTestIndexViewContains(lenStorage, keycodec.U64ByteString(2), 2) {
 		t.Fatal("len overlay materialization lost posting")
 	}
 
-	var nilState OverlayState
-	rt.IndexedByName["maybe"].CollectOverlayValue(ptr, 3, &nilState)
+	var nilState IndexState
+	rt.IndexedByName["maybe"].CollectIndexValue(ptr, 3, &nilState)
 	nilStorage := nilState.MaterializeNilStorage()
 	defer nilStorage.Release()
-	if !schemaTestOverlayContains(nilStorage, indexdata.NilIndexEntryKey, 3) {
+	if !schemaTestIndexViewContains(nilStorage, indexdata.NilIndexEntryKey, 3) {
 		t.Fatal("nil overlay materialization lost posting")
 	}
 }
@@ -722,7 +722,7 @@ func TestInsertStateCollectMergeResetAndHints(t *testing.T) {
 	}
 	storage := rt.IndexedByName["scores"].MergeInsertStorageOwned(indexdata.FieldStorage{}, &state, false)
 	defer storage.Release()
-	if !schemaTestOverlayContainsKey(storage, keycodec.OrderedInt64Key(5), 1) {
+	if !schemaTestIndexViewContainsKey(storage, keycodec.OrderedInt64Key(5), 1) {
 		t.Fatal("insert merge lost fixed posting")
 	}
 	if diff := state.LenDiff(); diff == nil {
@@ -754,7 +754,7 @@ func TestInsertStateCollectMergeResetAndHints(t *testing.T) {
 	rt.IndexedByName["name"].CollectInsertValue(ptr, 11, false, &stringState)
 	stringStorage := rt.IndexedByName["name"].MergeInsertStorageOwned(indexdata.FieldStorage{}, &stringState, false)
 	defer stringStorage.Release()
-	if !schemaTestOverlayContains(stringStorage, "alice", 11) {
+	if !schemaTestIndexViewContains(stringStorage, "alice", 11) {
 		t.Fatal("insert merge lost string posting")
 	}
 	stringState.discard()
@@ -763,7 +763,7 @@ func TestInsertStateCollectMergeResetAndHints(t *testing.T) {
 	rt.IndexedByName["maybe"].CollectInsertValue(ptr, 12, false, &nilState)
 	nilStorage := rt.IndexedByName["maybe"].MergeInsertNilStorageOwned(indexdata.FieldStorage{}, &nilState)
 	defer nilStorage.Release()
-	if !schemaTestOverlayContains(nilStorage, indexdata.NilIndexEntryKey, 12) {
+	if !schemaTestIndexViewContains(nilStorage, indexdata.NilIndexEntryKey, 12) {
 		t.Fatal("insert merge lost nil posting")
 	}
 	nilState.discard()
@@ -798,7 +798,7 @@ func TestBatchStateCollectApplyReset(t *testing.T) {
 	}
 	scalarStorage := rt.IndexedByName["name"].ApplyBatchStorageOwned(indexdata.FieldStorage{}, &scalar, false)
 	defer scalarStorage.Release()
-	if !schemaTestOverlayContains(scalarStorage, "bob", 1) {
+	if !schemaTestIndexViewContains(scalarStorage, "bob", 1) {
 		t.Fatal("scalar batch apply lost add posting")
 	}
 	scalar.Reset()
@@ -813,7 +813,7 @@ func TestBatchStateCollectApplyReset(t *testing.T) {
 	}
 	fixedScalarStorage := rt.IndexedByName["age"].ApplyBatchStorageOwned(indexdata.FieldStorage{}, &fixedScalar, false)
 	defer fixedScalarStorage.Release()
-	if !schemaTestOverlayContainsKey(fixedScalarStorage, keycodec.OrderedInt64Key(9), 4) {
+	if !schemaTestIndexViewContainsKey(fixedScalarStorage, keycodec.OrderedInt64Key(9), 4) {
 		t.Fatal("fixed scalar batch apply lost add posting")
 	}
 	fixedScalar.Reset()
@@ -825,7 +825,7 @@ func TestBatchStateCollectApplyReset(t *testing.T) {
 	}
 	stringSliceStorage := rt.IndexedByName["tags"].ApplyBatchStorageOwned(indexdata.FieldStorage{}, &stringSlice, false)
 	defer stringSliceStorage.Release()
-	if !schemaTestOverlayContains(stringSliceStorage, "search", 5) {
+	if !schemaTestIndexViewContains(stringSliceStorage, "search", 5) {
 		t.Fatal("string slice batch apply lost add posting")
 	}
 	stringSlice.Reset()
@@ -837,7 +837,7 @@ func TestBatchStateCollectApplyReset(t *testing.T) {
 	}
 	sliceStorage := rt.IndexedByName["scores"].ApplyBatchStorageOwned(indexdata.FieldStorage{}, &slice, false)
 	defer sliceStorage.Release()
-	if !schemaTestOverlayContainsKey(sliceStorage, keycodec.OrderedInt64Key(9), 2) {
+	if !schemaTestIndexViewContainsKey(sliceStorage, keycodec.OrderedInt64Key(9), 2) {
 		t.Fatal("slice batch apply lost fixed add posting")
 	}
 	if diff := slice.LenDiff(); diff == nil {
@@ -855,7 +855,7 @@ func TestBatchStateCollectApplyReset(t *testing.T) {
 	}
 	nilStorage := rt.IndexedByName["maybe"].ApplyBatchNilStorageOwned(indexdata.FieldStorage{}, &nilDiff)
 	defer nilStorage.Release()
-	if !schemaTestOverlayContains(nilStorage, indexdata.NilIndexEntryKey, 6) {
+	if !schemaTestIndexViewContains(nilStorage, indexdata.NilIndexEntryKey, 6) {
 		t.Fatal("batch nil apply lost nil posting")
 	}
 	nilDiff.discard()

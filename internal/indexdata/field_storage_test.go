@@ -681,7 +681,7 @@ func TestLenFieldStorageFromMapOwned_StoresZeroWhenComplementIsNotUsed(t *testin
 	}
 }
 
-func TestRebuildLenFieldStorageFromOverlay_CountsValuesAndStoresZero(t *testing.T) {
+func TestRebuildLenFieldStorageFromIndexView_CountsValuesAndStoresZero(t *testing.T) {
 	universe := fieldStoragePosting(1, 2, 3, 4, 5, 6)
 	entries := []Entry{
 		{Key: keycodec.FromStoredString("a", false), IDs: fieldStoragePosting(1, 3)},
@@ -707,7 +707,7 @@ func TestRebuildLenFieldStorageFromOverlay_CountsValuesAndStoresZero(t *testing.
 	}
 }
 
-func TestRebuildLenFieldStorageFromOverlay_UsesZeroComplement(t *testing.T) {
+func TestRebuildLenFieldStorageFromIndexView_UsesZeroComplement(t *testing.T) {
 	universe := fieldStoragePosting(1, 2, 3, 4, 5, 6, 7, 8, 9, 10)
 	entries := []Entry{
 		{Key: keycodec.FromStoredString("a", false), IDs: fieldStoragePosting(7, 8)},

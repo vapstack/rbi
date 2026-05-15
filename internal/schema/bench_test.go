@@ -340,7 +340,7 @@ func BenchmarkBuildFieldStateFlushMaterialize(b *testing.B) {
 	}
 }
 
-func BenchmarkOverlayStateCollectMaterialize(b *testing.B) {
+func BenchmarkIndexStateCollectMaterialize(b *testing.B) {
 	rt := benchmarkSchemaMustCompile(b)
 	rec := benchmarkSchemaRecordValue()
 	ptr := unsafe.Pointer(&rec)
@@ -352,8 +352,8 @@ func BenchmarkOverlayStateCollectMaterialize(b *testing.B) {
 		b.Run(name, func(b *testing.B) {
 			b.ReportAllocs()
 			for i := 0; i < b.N; i++ {
-				var state OverlayState
-				acc.CollectOverlayValue(ptr, uint64(i+1), &state)
+				var state IndexState
+				acc.CollectIndexValue(ptr, uint64(i+1), &state)
 				storage := state.MaterializeStorage(numeric)
 				nilStorage := state.MaterializeNilStorage()
 				benchmarkSchemaIntSink = storage.KeyCount() + nilStorage.KeyCount()

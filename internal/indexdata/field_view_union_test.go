@@ -2,7 +2,7 @@ package indexdata
 
 import "testing"
 
-func TestFieldOverlayRangePostingsUnionAndMerge(t *testing.T) {
+func TestFieldIndexViewRangePostingsUnionAndMerge(t *testing.T) {
 	tests := []struct {
 		name string
 		rows int
