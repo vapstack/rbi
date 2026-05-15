@@ -1,20 +1,19 @@
 package rbi
 
 import (
-	"github.com/vapstack/rbi/internal/indexdata"
 	"math"
 	"time"
 
+	"github.com/vapstack/rbi/internal/indexdata"
 	"github.com/vapstack/rbi/internal/pooled"
 	"github.com/vapstack/rbi/internal/posting"
-	"github.com/vapstack/rbi/internal/qcache"
 	"github.com/vapstack/rbi/internal/qir"
 	"github.com/vapstack/rbi/internal/schema"
-	"github.com/vapstack/rbi/internal/strmap"
+	"github.com/vapstack/rbi/internal/snapshot"
 )
 
 type queryEngine struct {
-	snapshot                       *snapshotManager
+	snapshot                       *snapshot.Manager
 	schema                         *schema.Runtime
 	index                          []indexdata.FieldStorage
 	nilIndex                       []indexdata.FieldStorage
@@ -34,15 +33,22 @@ type queryEngine struct {
 	viewPool *pooled.Pointers[queryView]
 }
 
-func (qe *queryEngine) makeQueryView(snap *indexSnapshot) *queryView {
+func (qe *queryEngine) snapshotCacheConfig() snapshot.CacheConfig {
+	return snapshot.CacheConfig{
+		MatPredMaxEntries: qe.matPredCacheMaxEntries,
+		MatPredMaxCard:    qe.matPredCacheMaxCard,
+	}
+}
+
+func (qe *queryEngine) makeQueryView(snap *snapshot.View) *queryView {
 	view := qe.viewPool.Get()
 	*view = queryView{
 		engine:            qe,
 		snap:              snap,
-		strKey:            snap.strmap != nil,
-		strMapView:        snap.strmap,
+		strKey:            snap.StrMap != nil,
+		strMapView:        snap.StrMap,
 		planner:           qe.planner,
-		lenZeroComplement: snap.lenZeroComplement,
+		lenZeroComplement: snap.LenZeroComplement,
 	}
 	return view
 }
@@ -51,90 +57,14 @@ func (qe *queryEngine) releaseQueryView(view *queryView) {
 	qe.viewPool.Put(view)
 }
 
-func (qe *queryEngine) initSnapshotRuntimeCaches(s *indexSnapshot) {
-	s.numericRangeBucketCache = qcache.GetNumericRangeBucketCache(len(qe.schema.Indexed), qe.matPredCacheMaxCard)
-	if qe.matPredCacheMaxEntries > 0 {
-		s.matPredCache = qcache.GetMaterializedPredCache(qe.matPredCacheMaxEntries, qe.matPredCacheMaxCard)
-	}
-}
-
-func (qe *queryEngine) buildPublishedSnapshotNoLock(seq uint64, sm *strmap.Snapshot) *indexSnapshot {
-	snap := &indexSnapshot{
-		seq:                seq,
-		index:              qe.index,
-		nilIndex:           qe.nilIndex,
-		lenIndex:           qe.lenIndex,
-		lenZeroComplement:  qe.lenZeroComplement,
-		measure:            qe.measure,
-		indexedFieldByName: qe.schema.IndexedByName,
-		universe:           qe.universe,
-		strmap:             sm,
-	}
-	qe.initSnapshotRuntimeCaches(snap)
-	return snap
-}
-
-func (qe *queryEngine) publishSnapshotNoLock(seq uint64, sm *strmap.Snapshot) {
-	prev := qe.snapshot.current.Load()
-	snap := qe.buildPublishedSnapshotNoLock(seq, sm)
-	if prev != nil {
-		snap.index = indexdata.CloneFieldStorageSlots(qe.index, len(qe.schema.Indexed))
-		snap.nilIndex = indexdata.CloneFieldStorageSlots(qe.nilIndex, len(qe.schema.Indexed))
-		snap.lenIndex = indexdata.CloneFieldStorageSlots(qe.lenIndex, len(qe.schema.Indexed))
-		snap.lenZeroComplement = cloneFieldIndexBoolSlots(qe.lenZeroComplement, len(qe.schema.Indexed))
-		snap.measure = indexdata.CloneMeasureStorageSlots(qe.measure, len(qe.schema.Measures))
-	}
-	snap.retainSharedOwnedStorageFrom(prev)
-	qe.finishSnapshotPublishNoLock(snap)
-}
-
-func (qe *queryEngine) finishSnapshotPublishNoLock(s *indexSnapshot) {
-	qe.index = s.index
-	qe.nilIndex = s.nilIndex
-	qe.lenIndex = s.lenIndex
-	qe.lenZeroComplement = s.lenZeroComplement
-	qe.measure = s.measure
-	qe.universe = s.universe
-	retired := qe.snapshot.publishRef(s)
-	releaseRetiredSnapshots(retired)
-}
-
-func (qe *queryEngine) getSnapshot() *indexSnapshot {
-	if s := qe.snapshot.current.Load(); s != nil {
-		return s
-	}
-	return qe.buildPublishedSnapshotNoLock(0, nil)
-}
-
-func (qe *queryEngine) pinCurrentSnapshot() (*indexSnapshot, uint64, *snapshotRef, bool) {
-	for {
-		qe.snapshot.mu.RLock()
-		ref := qe.snapshot.currentRef.Load()
-		if ref == nil {
-			qe.snapshot.mu.RUnlock()
-			return qe.buildPublishedSnapshotNoLock(0, nil), 0, nil, false
-		}
-		ref.refs.Add(1)
-		if qe.snapshot.currentRef.Load() != ref {
-			qe.snapshot.mu.RUnlock()
-			ref.refs.Add(-1)
-			continue
-		}
-		snap := ref.snap
-		qe.snapshot.mu.RUnlock()
-		if snap == nil {
-			ref.refs.Add(-1)
-			continue
-		}
-		return snap, snap.seq, ref, true
-	}
-}
-
-func (qe *queryEngine) unpinCurrentSnapshot(seq uint64, ref *snapshotRef, pinned bool) {
-	if !pinned {
-		return
-	}
-	qe.snapshot.unpinRef(seq, ref)
+func (qe *queryEngine) installViewNoLock(s *snapshot.View) {
+	qe.index = s.Index
+	qe.nilIndex = s.NilIndex
+	qe.lenIndex = s.LenIndex
+	qe.lenZeroComplement = s.LenZeroComplement
+	qe.measure = s.Measure
+	qe.universe = s.Universe
+	qe.snapshot.Publish(s)
 }
 
 func (qe *queryEngine) fieldNameByOrdinal(ordinal int) string {

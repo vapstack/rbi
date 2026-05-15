@@ -1220,7 +1220,7 @@ func TestQuery_OrderBasic_RangeBaseOpsMaterializeBroadComplementWithoutExactSibl
 		t.Fatalf("Patch(age): %v", err)
 	}
 
-	if got := db.engine.getSnapshot().matPredCache.EntryCount(); got != 0 {
+	if got := db.engine.snapshot.Current().MaterializedPredCache().EntryCount(); got != 0 {
 		t.Fatalf("unexpected materialized predicate cache before query: %d", got)
 	}
 
@@ -1238,8 +1238,8 @@ func TestQuery_OrderBasic_RangeBaseOpsMaterializeBroadComplementWithoutExactSibl
 	}
 	assertSameSlice(t, got, want)
 
-	after := db.engine.getSnapshot()
-	if got := after.matPredCache.EntryCount(); got == 0 {
+	after := db.engine.snapshot.Current()
+	if got := after.MaterializedPredCache().EntryCount(); got == 0 {
 		t.Fatalf("expected ordered predicate path to materialize broad complement, cache entries=%d", got)
 	}
 }
@@ -1269,7 +1269,7 @@ func TestQuery_OrderBasic_SmallAndDeepWindowMaterializeNonOrderNumericRangeWhenC
 	if _, err := db.QueryKeys(small); err != nil {
 		t.Fatalf("small QueryKeys: %v", err)
 	}
-	if got := db.engine.getSnapshot().matPredCache.EntryCount(); got == 0 {
+	if got := db.engine.snapshot.Current().MaterializedPredCache().EntryCount(); got == 0 {
 		t.Fatalf("expected materialized predicate cache for small ordered window: %d", got)
 	}
 
@@ -1286,7 +1286,7 @@ func TestQuery_OrderBasic_SmallAndDeepWindowMaterializeNonOrderNumericRangeWhenC
 	}
 	assertSameSlice(t, got, want)
 
-	if got := db.engine.getSnapshot().matPredCache.EntryCount(); got == 0 {
+	if got := db.engine.snapshot.Current().MaterializedPredCache().EntryCount(); got == 0 {
 		t.Fatalf("expected deep ordered window to keep materialized numeric range predicate")
 	}
 }
@@ -1351,7 +1351,7 @@ func TestQuery_OrderBasic_BuildLeafPredsExcludingBounds_MaterializesBroadComplem
 		t.Fatalf("expected first ordered broad complement to materialize, got kind=%v", first.pred.kind)
 	}
 	leafPredSlicePool.Put(preds1)
-	if _, ok = db.engine.getSnapshot().loadMaterializedPred(cacheKey); !ok {
+	if _, ok = snapshotExtLoadMaterializedPred(db.engine.snapshot.Current(), cacheKey); !ok {
 		t.Fatalf("expected shared complement cache entry after first ordered leaf build")
 	}
 
@@ -1373,7 +1373,7 @@ func TestQuery_OrderBasic_BuildLeafPredsExcludingBounds_MaterializesBroadComplem
 	if second.pred.kind != predicateKindMaterializedNot {
 		t.Fatalf("expected second ordered broad complement to materialize, got kind=%v", second.pred.kind)
 	}
-	if _, ok := db.engine.getSnapshot().loadMaterializedPred(cacheKey); !ok {
+	if _, ok := snapshotExtLoadMaterializedPred(db.engine.snapshot.Current(), cacheKey); !ok {
 		t.Fatalf("expected shared complement cache entry after second ordered leaf build")
 	}
 }
@@ -1465,7 +1465,7 @@ func TestQuery_OrderBasic_BuildLeafPredsExcludingBounds_DelaysBroadComplementWit
 	if rangePred.pred.kind == predicateKindMaterializedNot {
 		t.Fatalf("expected broad complement to stay delayed with multiple exact siblings")
 	}
-	if _, ok := db.engine.getSnapshot().loadMaterializedPred(cacheKey); ok {
+	if _, ok := snapshotExtLoadMaterializedPred(db.engine.snapshot.Current(), cacheKey); ok {
 		t.Fatalf("unexpected shared complement cache entry on first build with multiple exact siblings")
 	}
 }
@@ -1680,8 +1680,8 @@ func TestQuery_OrderBasic_DeepWindowCachePersistsAcrossUnchangedFieldPatch(t *te
 		t.Fatalf("unexpected scalar flags: isSlice=%v isNil=%v", isSlice, isNil)
 	}
 	cacheKey := db.engine.currentQueryViewForTests().materializedPredCacheKeyForScalar("score", compileScalarOpForTest(qx.OpLT), keyValue)
-	prevSnap := db.engine.getSnapshot()
-	prevBM, ok := prevSnap.loadMaterializedPred(cacheKey)
+	prevSnap := db.engine.snapshot.Current()
+	prevBM, ok := snapshotExtLoadMaterializedPred(prevSnap, cacheKey)
 	if !ok || prevBM.IsEmpty() {
 		t.Fatalf("expected score range cache entry before unrelated patch")
 	}
@@ -1690,8 +1690,8 @@ func TestQuery_OrderBasic_DeepWindowCachePersistsAcrossUnchangedFieldPatch(t *te
 		t.Fatalf("Patch(active): %v", err)
 	}
 
-	nextSnap := db.engine.getSnapshot()
-	nextBM, ok := nextSnap.loadMaterializedPred(cacheKey)
+	nextSnap := db.engine.snapshot.Current()
+	nextBM, ok := snapshotExtLoadMaterializedPred(nextSnap, cacheKey)
 	if !ok || nextBM.IsEmpty() {
 		t.Fatalf("expected score range cache entry after unrelated patch")
 	}
@@ -1748,15 +1748,15 @@ func TestQuery_OrderBasic_ComplementCachedBaseOpCountsAsMaterialized(t *testing.
 	lteScalarKey := view.materializedPredKeyForNormalizedScalarBound("age", lteBound).String()
 	complementSeed := posting.List{}.BuildAdded(1)
 	defer complementSeed.Release()
-	db.engine.getSnapshot().storeMaterializedPred(gteComplementKey, complementSeed)
+	snapshotExtStoreMaterializedPred(db.engine.snapshot.Current(), gteComplementKey, complementSeed)
 	leaves := mustLimitQIRLeaves(t, db, q.Filter)
 	baseOps := filterQIRLeavesByField(db, leaves, "score")
 	coresBuf, rawCoreIdxBuf := mustPrepareOrderBasicBaseCoresForTest(t, view, baseOps)
 	defer orderBasicBaseCoreSlicePool.Put(coresBuf)
 	defer pooled.ReleaseIntSlice(rawCoreIdxBuf)
 	if !view.hasWarmOrderBasicBaseCores(coresBuf) {
-		_, gteHit := db.engine.getSnapshot().loadMaterializedPred(gteComplementKey)
-		_, lteHit := db.engine.getSnapshot().loadMaterializedPred(lteScalarKey)
+		_, gteHit := snapshotExtLoadMaterializedPred(db.engine.snapshot.Current(), gteComplementKey)
+		_, lteHit := snapshotExtLoadMaterializedPred(db.engine.snapshot.Current(), lteScalarKey)
 		t.Fatalf("expected complement-backed cached range base op to count as materialized: gteComplementHit=%v lteScalarHit=%v", gteHit, lteHit)
 	}
 }
@@ -1899,7 +1899,7 @@ func TestQuery_OrderBasic_WarmQueryPromotesMaterializedRangeBaseOps(t *testing.T
 				missing = append(missing, fmt.Sprintf("%s:%v=<no-key>", testExprFieldName(db.engine, op), op.Op))
 				continue
 			}
-			if _, ok := db.engine.getSnapshot().loadMaterializedPredKey(cacheKey); !ok {
+			if _, ok := db.engine.snapshot.Current().LoadMaterializedPredKey(cacheKey); !ok {
 				missing = append(missing, fmt.Sprintf("%s:%v", testExprFieldName(db.engine, op), op.Op))
 			}
 		}
@@ -1909,7 +1909,7 @@ func TestQuery_OrderBasic_WarmQueryPromotesMaterializedRangeBaseOps(t *testing.T
 	if exactKey == "" {
 		t.Fatalf("expected collapsed exact range cache key")
 	}
-	if _, ok := db.engine.getSnapshot().loadMaterializedPred(exactKey); !ok {
+	if _, ok := snapshotExtLoadMaterializedPred(db.engine.snapshot.Current(), exactKey); !ok {
 		t.Fatalf("expected warm ordered query to promote collapsed exact numeric range cache entry")
 	}
 }

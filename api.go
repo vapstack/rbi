@@ -137,15 +137,15 @@ func (db *DB[K, V]) ScanKeys(seek K, fn func(K) (bool, error)) error {
 		return ErrNoIndex
 	}
 
-	snap, seq, ref, pinned := db.engine.pinCurrentSnapshot()
-	defer db.engine.unpinCurrentSnapshot(seq, ref, pinned)
+	snap, seq, ref := db.engine.snapshot.PinCurrent()
+	defer db.engine.snapshot.Unpin(seq, ref)
 
-	universe := snap.universe
+	universe := snap.Universe
 	iter := universe.Iter()
 	defer iter.Release()
 
 	if db.strKey {
-		return db.scanStringKeys(snap.strmap, universe, iter, seek, fn)
+		return db.scanStringKeys(snap.StrMap, universe, iter, seek, fn)
 	}
 
 	for iter.HasNext() {

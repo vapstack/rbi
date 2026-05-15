@@ -3,6 +3,7 @@ package rbi
 import (
 	"errors"
 	"github.com/vapstack/rbi/internal/indexdata"
+	"github.com/vapstack/rbi/internal/snapshot"
 	"math"
 	"math/rand/v2"
 	"sort"
@@ -44,16 +45,16 @@ func (db *DB[K, V]) refreshPlannerStatsWithBudget(softBudget time.Duration, useC
 	if err := db.unavailableErr(); err != nil {
 		return err
 	}
-	snap, seq, ref, pinned := db.engine.pinCurrentSnapshot()
-	defer db.engine.unpinCurrentSnapshot(seq, ref, pinned)
+	snap, seq, ref := db.engine.snapshot.PinCurrent()
+	defer db.engine.snapshot.Unpin(seq, ref)
 
 	db.engine.refreshPlannerStatsWithBudgetOnSnapshot(snap, softBudget, useCursor)
 	return nil
 }
 
-func (qe *queryEngine) refreshPlannerStatsWithBudgetOnSnapshot(snap *indexSnapshot, softBudget time.Duration, useCursor bool) {
+func (qe *queryEngine) refreshPlannerStatsWithBudgetOnSnapshot(snap *snapshot.View, softBudget time.Duration, useCursor bool) {
 	fieldNames := qe.sortedPlannerFieldNames()
-	universeCardinality := snap.universeCardinality()
+	universeCardinality := snap.UniverseCardinality()
 
 	prev := qe.planner.stats.Load()
 	capHint := len(fieldNames)
@@ -114,19 +115,12 @@ func (qe *queryEngine) refreshPlannerStatsWithBudgetOnSnapshot(snap *indexSnapsh
 	qe.planner.stats.Store(&out)
 }
 
-func (s *indexSnapshot) universeCardinality() uint64 {
-	if s == nil {
-		return 0
-	}
-	return s.universe.Cardinality()
-}
-
-func (qe *queryEngine) collectPlannerFieldStatsFromOverlay(s *indexSnapshot, fieldName string) PlannerFieldStats {
+func (qe *queryEngine) collectPlannerFieldStatsFromOverlay(s *snapshot.View, fieldName string) PlannerFieldStats {
 	acc, ok := qe.schema.IndexedByName[fieldName]
-	if !ok || s.index == nil || acc.Ordinal >= len(s.index) {
+	if !ok || s.Index == nil || acc.Ordinal >= len(s.Index) {
 		return PlannerFieldStats{}
 	}
-	ov := indexdata.NewFieldOverlayStorage(s.index[acc.Ordinal])
+	ov := indexdata.NewFieldOverlayStorage(s.Index[acc.Ordinal])
 	if !ov.HasData() {
 		return PlannerFieldStats{}
 	}
@@ -335,34 +329,34 @@ func (db *DB[K, V]) refreshPlannerStatsLocked() {
 func (qe *queryEngine) plannerStatsSnapshotForPersistLocked(version uint64) *plannerStatsSnapshot {
 	current := qe.planner.stats.Load()
 	if current == nil {
-		snap, seq, ref, pinned := qe.pinCurrentSnapshot()
-		defer qe.unpinCurrentSnapshot(seq, ref, pinned)
+		snap, seq, ref := qe.snapshot.PinCurrent()
+		defer qe.snapshot.Unpin(seq, ref)
 		return qe.buildPlannerStatsSnapshot(snap, version)
 	}
-	snap, seq, ref, pinned := qe.pinCurrentSnapshot()
-	defer qe.unpinCurrentSnapshot(seq, ref, pinned)
+	snap, seq, ref := qe.snapshot.PinCurrent()
+	defer qe.snapshot.Unpin(seq, ref)
 
 	return &plannerStatsSnapshot{
 		Version:             version,
 		GeneratedAt:         time.Now(),
-		UniverseCardinality: snap.universeCardinality(),
+		UniverseCardinality: snap.UniverseCardinality(),
 		Fields:              current.Fields,
 	}
 }
 
 func (db *DB[K, V]) buildPlannerStatsSnapshotLocked(version uint64) *plannerStatsSnapshot {
-	snap, seq, ref, pinned := db.engine.pinCurrentSnapshot()
-	defer db.engine.unpinCurrentSnapshot(seq, ref, pinned)
+	snap, seq, ref := db.engine.snapshot.PinCurrent()
+	defer db.engine.snapshot.Unpin(seq, ref)
 
 	return db.engine.buildPlannerStatsSnapshot(snap, version)
 }
 
-func (qe *queryEngine) buildPlannerStatsSnapshot(snap *indexSnapshot, version uint64) *plannerStatsSnapshot {
+func (qe *queryEngine) buildPlannerStatsSnapshot(snap *snapshot.View, version uint64) *plannerStatsSnapshot {
 	fields := qe.sortedPlannerFieldNames()
 	out := &plannerStatsSnapshot{
 		Version:             version,
 		GeneratedAt:         time.Now(),
-		UniverseCardinality: snap.universeCardinality(),
+		UniverseCardinality: snap.UniverseCardinality(),
 		Fields:              make(map[string]PlannerFieldStats, len(fields)),
 	}
 
@@ -385,11 +379,11 @@ func (qe *queryEngine) sortedPlannerFieldNames() []string {
 	return fields
 }
 
-func (qe *queryEngine) publishLoadedPlannerStats(s *plannerStatsSnapshot, snap *indexSnapshot) {
+func (qe *queryEngine) publishLoadedPlannerStats(s *plannerStatsSnapshot, snap *snapshot.View) {
 	out := &plannerStatsSnapshot{
 		Version:             s.Version,
 		GeneratedAt:         s.GeneratedAt,
-		UniverseCardinality: snap.universeCardinality(),
+		UniverseCardinality: snap.UniverseCardinality(),
 		Fields:              make(map[string]PlannerFieldStats, len(qe.schema.Indexed)),
 	}
 	if out.Version == 0 {

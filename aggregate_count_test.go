@@ -965,7 +965,7 @@ func TestCount_ScalarInSplit_ResidualFilterMatchesBitmap(t *testing.T) {
 		t.Fatalf("country IN lead not found")
 	}
 
-	qv := db.engine.makeQueryView(db.engine.getSnapshot())
+	qv := db.engine.makeQueryView(db.engine.snapshot.Current())
 	defer db.engine.releaseQueryView(qv)
 
 	filter, ok, err := qv.evalAndOperandsExceptReordered(leaves, lead)
@@ -1011,7 +1011,7 @@ func TestCount_EvalAndOperandsExceptReordered_BroadRangeAfterContainsMatchesBitm
 		qx.GTE("score", 20.0),
 	)
 
-	qv := db.engine.makeQueryView(db.engine.getSnapshot())
+	qv := db.engine.makeQueryView(db.engine.snapshot.Current())
 	defer db.engine.releaseQueryView(qv)
 
 	var leavesBuf [countPredicateScanMaxLeaves]qir.Expr
@@ -2198,7 +2198,7 @@ func TestCount_BuildPredicates_DeferBroadRangeMaterialization(t *testing.T) {
 	if cacheKey == "" {
 		t.Fatalf("expected non-empty materialized cache key for numeric range")
 	}
-	if _, ok := db.engine.getSnapshot().loadMaterializedPred(cacheKey); ok {
+	if _, ok := snapshotExtLoadMaterializedPred(db.engine.snapshot.Current(), cacheKey); ok {
 		t.Fatalf("expected empty materialized cache before building predicates")
 	}
 
@@ -2207,7 +2207,7 @@ func TestCount_BuildPredicates_DeferBroadRangeMaterialization(t *testing.T) {
 		t.Fatalf("buildCountPredicatesWithMode failed")
 	}
 	releasePredicates(predsCount)
-	if _, ok := db.engine.getSnapshot().loadMaterializedPred(cacheKey); ok {
+	if _, ok := snapshotExtLoadMaterializedPred(db.engine.snapshot.Current(), cacheKey); ok {
 		t.Fatalf("count-path predicate build should not eagerly populate numeric range cache")
 	}
 
@@ -2216,7 +2216,7 @@ func TestCount_BuildPredicates_DeferBroadRangeMaterialization(t *testing.T) {
 		t.Fatalf("buildPredicates failed")
 	}
 	releasePredicates(predsDefault)
-	cached, ok := db.engine.getSnapshot().loadMaterializedPred(cacheKey)
+	cached, ok := snapshotExtLoadMaterializedPred(db.engine.snapshot.Current(), cacheKey)
 	if !ok || cached.IsEmpty() {
 		t.Fatalf("expected default predicate build to populate numeric range cache")
 	}
@@ -2448,7 +2448,7 @@ func TestCount_PreparePredicate_UsesProbeBoundedBroadRangeComplement(t *testing.
 					t.Fatalf("exprValueToIdxScalar: err=%v isSlice=%v isNil=%v", err, isSlice, isNil)
 				}
 				cacheKey := db.engine.currentQueryViewForTests().materializedPredComplementCacheKeyForScalar("age", compileScalarOpForTest(qx.OpGTE), key)
-				cached, ok := db.engine.getSnapshot().loadMaterializedPred(cacheKey)
+				cached, ok := snapshotExtLoadMaterializedPred(db.engine.snapshot.Current(), cacheKey)
 				if !ok || cached.IsEmpty() {
 					t.Fatalf("expected complement postingResult to be cached after promotion")
 				}
@@ -2591,18 +2591,18 @@ func TestCount_PreparePredicate_BroadRangeComplementCacheInvalidatedByNilFieldWr
 		db := countOpenBroadRangeComplementOptDB(t, "count_prepare_predicate_broad_range_opt_no_nil.db", false)
 
 		p, cacheKey := prepareBroadRangeComplementPredicate(t, db, expr, 3_000)
-		prevSnap := db.engine.getSnapshot()
-		prevCached, ok := prevSnap.loadMaterializedPred(cacheKey)
+		prevSnap := db.engine.snapshot.Current()
+		prevCached, ok := snapshotExtLoadMaterializedPred(prevSnap, cacheKey)
 		if !ok || prevCached.IsEmpty() {
 			releasePredicates([]predicate{p})
 			t.Fatalf("expected cached complement postingResult before nil insert")
 		}
-		heldSnap, heldRef, ok := db.engine.snapshot.pinRefBySeq(prevSnap.seq)
+		heldSnap, heldRef, ok := db.engine.snapshot.PinBySeq(prevSnap.Seq)
 		if !ok || heldSnap != prevSnap || heldRef == nil {
 			releasePredicates([]predicate{p})
-			t.Fatalf("pinSnapshotRefBySeq(seq=%d) failed", prevSnap.seq)
+			t.Fatalf("pinSnapshotRefBySeq(seq=%d) failed", prevSnap.Seq)
 		}
-		defer db.engine.snapshot.unpinRef(prevSnap.seq, heldRef)
+		defer db.engine.snapshot.Unpin(prevSnap.Seq, heldRef)
 		releasePredicates([]predicate{p})
 
 		if err := db.Set(90_001, &Rec{
@@ -2619,13 +2619,13 @@ func TestCount_PreparePredicate_BroadRangeComplementCacheInvalidatedByNilFieldWr
 			t.Fatalf("Set(nil insert): %v", err)
 		}
 
-		if _, ok := db.engine.getSnapshot().loadMaterializedPred(cacheKey); ok {
+		if _, ok := snapshotExtLoadMaterializedPred(db.engine.snapshot.Current(), cacheKey); ok {
 			t.Fatalf("expected nil-only insert to invalidate inherited complement cache")
 		}
 
 		p, _ = prepareBroadRangeComplementPredicate(t, db, expr, 3_000)
 		defer releasePredicates([]predicate{p})
-		nextCached, ok := db.engine.getSnapshot().loadMaterializedPred(cacheKey)
+		nextCached, ok := snapshotExtLoadMaterializedPred(db.engine.snapshot.Current(), cacheKey)
 		if !ok || nextCached.IsEmpty() {
 			t.Fatalf("expected complement cache to be rebuilt after nil insert")
 		}
@@ -2643,18 +2643,18 @@ func TestCount_PreparePredicate_BroadRangeComplementCacheInvalidatedByNilFieldWr
 		db := countOpenBroadRangeComplementOptDB(t, "count_prepare_predicate_broad_range_opt_delete.db", true)
 
 		p, cacheKey := prepareBroadRangeComplementPredicate(t, db, expr, 3_000)
-		prevSnap := db.engine.getSnapshot()
-		prevCached, ok := prevSnap.loadMaterializedPred(cacheKey)
+		prevSnap := db.engine.snapshot.Current()
+		prevCached, ok := snapshotExtLoadMaterializedPred(prevSnap, cacheKey)
 		if !ok || prevCached.IsEmpty() {
 			releasePredicates([]predicate{p})
 			t.Fatalf("expected cached complement postingResult before nil delete")
 		}
-		heldSnap, heldRef, ok := db.engine.snapshot.pinRefBySeq(prevSnap.seq)
+		heldSnap, heldRef, ok := db.engine.snapshot.PinBySeq(prevSnap.Seq)
 		if !ok || heldSnap != prevSnap || heldRef == nil {
 			releasePredicates([]predicate{p})
-			t.Fatalf("pinSnapshotRefBySeq(seq=%d) failed", prevSnap.seq)
+			t.Fatalf("pinSnapshotRefBySeq(seq=%d) failed", prevSnap.Seq)
 		}
-		defer db.engine.snapshot.unpinRef(prevSnap.seq, heldRef)
+		defer db.engine.snapshot.Unpin(prevSnap.Seq, heldRef)
 		releasePredicates([]predicate{p})
 
 		nilID := uint64(80_000)
@@ -2662,13 +2662,13 @@ func TestCount_PreparePredicate_BroadRangeComplementCacheInvalidatedByNilFieldWr
 			t.Fatalf("Delete(nil row): %v", err)
 		}
 
-		if _, ok := db.engine.getSnapshot().loadMaterializedPred(cacheKey); ok {
+		if _, ok := snapshotExtLoadMaterializedPred(db.engine.snapshot.Current(), cacheKey); ok {
 			t.Fatalf("expected nil-only delete to invalidate inherited complement cache")
 		}
 
 		p, _ = prepareBroadRangeComplementPredicate(t, db, expr, 3_000)
 		defer releasePredicates([]predicate{p})
-		nextCached, ok := db.engine.getSnapshot().loadMaterializedPred(cacheKey)
+		nextCached, ok := snapshotExtLoadMaterializedPred(db.engine.snapshot.Current(), cacheKey)
 		if !ok || nextCached.IsEmpty() {
 			t.Fatalf("expected complement cache to be rebuilt after nil delete")
 		}
@@ -3181,7 +3181,7 @@ func TestCount_LeadPostingsSingleResidualBucketCount_AllocsPerRunStayZeroAfterWa
 	compiledExpr := mustCountQIRExprForDB(t, db, q.Filter)
 
 	run := func() {
-		qv := db.engine.makeQueryView(db.engine.getSnapshot())
+		qv := db.engine.makeQueryView(db.engine.snapshot.Current())
 		defer db.engine.releaseQueryView(qv)
 		var leavesBuf [countPredicateScanMaxLeaves]qir.Expr
 		leaves, ok := collectAndLeavesModeScratch(compiledExpr, leavesBuf[:0], andLeafModeCollect)

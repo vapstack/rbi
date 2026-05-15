@@ -21,6 +21,7 @@ import (
 	"github.com/vapstack/rbi/internal/pooled"
 	"github.com/vapstack/rbi/internal/posting"
 	"github.com/vapstack/rbi/internal/schema"
+	"github.com/vapstack/rbi/internal/snapshot"
 	"github.com/vapstack/rbi/internal/strmap"
 	"go.etcd.io/bbolt"
 )
@@ -63,9 +64,9 @@ func TestQueryViewIdxMapping_UsesPinnedStrMapSnapshot(t *testing.T) {
 		t.Fatalf("snap Create = %d/%v, want 1/true", idx, created)
 	}
 	strMapSnap := snapMapper.Snapshot()
-	indexSnap := &indexSnapshot{
-		strmap:            strMapSnap,
-		lenZeroComplement: snapshotTestBoolSlots(nil, nil),
+	indexSnap := &snapshot.View{
+		StrMap:            strMapSnap,
+		LenZeroComplement: snapshotTestBoolSlots(nil, nil),
 	}
 	view := &queryView{
 		engine:            db.engine,
@@ -73,7 +74,7 @@ func TestQueryViewIdxMapping_UsesPinnedStrMapSnapshot(t *testing.T) {
 		strKey:            true,
 		strMapView:        strMapSnap,
 		planner:           db.engine.planner,
-		lenZeroComplement: indexSnap.lenZeroComplement,
+		lenZeroComplement: indexSnap.LenZeroComplement,
 	}
 
 	db.strMap.Create("live-key")
@@ -146,7 +147,7 @@ func TestIndexPersistence_ChunkedFieldRoundTrip(t *testing.T) {
 		}
 	}
 
-	if storage, ok := db.engine.getSnapshot().fieldIndexStorage("name"); !ok || !storage.IsChunked() {
+	if storage, ok := db.engine.snapshot.Current().FieldIndexStorage("name"); !ok || !storage.IsChunked() {
 		t.Fatalf("expected chunked name index before close")
 	}
 
@@ -167,7 +168,7 @@ func TestIndexPersistence_ChunkedFieldRoundTrip(t *testing.T) {
 		}
 	})
 
-	if storage, ok := db2.engine.getSnapshot().fieldIndexStorage("name"); !ok || !storage.IsChunked() {
+	if storage, ok := db2.engine.snapshot.Current().FieldIndexStorage("name"); !ok || !storage.IsChunked() {
 		t.Fatalf("expected chunked name index after reopen")
 	}
 
@@ -296,6 +297,88 @@ func TestRebuildIndex_LenZeroComplementClearsStaleFlags(t *testing.T) {
 	if len(got) != 0 {
 		t.Fatalf("expected no empty-tags ids after rebuild, got %v", got)
 	}
+}
+
+type rebuildPinnedSnapshotRec struct {
+	Name   string   `db:"name"   rbi:"index"`
+	Tags   []string `db:"tags"   rbi:"index"`
+	Amount int64    `db:"amount" rbi:"measure"`
+}
+
+func TestRebuildIndex_KeepsPinnedSnapshotStorage(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "rebuild_pinned_snapshot.db")
+	db, raw := openBoltAndNew[uint64, rebuildPinnedSnapshotRec](t, path, Options{AnalyzeInterval: -1})
+	t.Cleanup(func() {
+		_ = db.Close()
+		_ = raw.Close()
+	})
+
+	rows := []rebuildPinnedSnapshotRec{
+		{Name: "alice", Tags: []string{"go"}, Amount: 10},
+		{Name: "bob", Tags: []string{}, Amount: 20},
+	}
+	for i := range rows {
+		if err := db.Set(uint64(i+1), &rows[i]); err != nil {
+			t.Fatalf("Set(%d): %v", i+1, err)
+		}
+	}
+
+	snap, seq, ref := db.engine.snapshot.PinCurrent()
+	if snap == nil || ref == nil {
+		t.Fatalf("expected current snapshot pin")
+	}
+	defer db.engine.snapshot.Unpin(seq, ref)
+
+	if err := db.RebuildIndex(); err != nil {
+		t.Fatalf("RebuildIndex: %v", err)
+	}
+
+	view := db.engine.makeQueryView(snap)
+	defer db.engine.releaseQueryView(view)
+	namePrepared, nameShape, err := prepareTestQuery(db.engine, qx.Query(qx.EQ("name", "alice")))
+	if err != nil {
+		t.Fatalf("prepare name query: %v", err)
+	}
+	nameIDs, err := view.execQuery(&nameShape, false, false)
+	namePrepared.Release()
+	if err != nil {
+		t.Fatalf("old snapshot name query: %v", err)
+	}
+	if !slices.Equal(nameIDs, []uint64{1}) {
+		t.Fatalf("old snapshot name query mismatch: got=%v want=[1]", nameIDs)
+	}
+
+	tagsPrepared, tagsShape, err := prepareTestQuery(db.engine, qx.Query(qx.EQ("tags", []string{})))
+	if err != nil {
+		t.Fatalf("prepare empty-tags query: %v", err)
+	}
+	tagIDs, err := view.execQuery(&tagsShape, false, false)
+	tagsPrepared.Release()
+	if err != nil {
+		t.Fatalf("old snapshot empty-tags query: %v", err)
+	}
+	if !slices.Equal(tagIDs, []uint64{2}) {
+		t.Fatalf("old snapshot empty-tags query mismatch: got=%v want=[2]", tagIDs)
+	}
+
+	agg, err := db.engine.prepareAggregate(qx.Aggregate(qx.SUM("amount").AS("sum_amount")))
+	if err != nil {
+		t.Fatalf("prepare aggregate: %v", err)
+	}
+	ids, err := view.aggregateMatchedIDs(agg.filter)
+	if err != nil {
+		agg.release()
+		t.Fatalf("old snapshot aggregate ids: %v", err)
+	}
+	result, err := view.executeAggregate(agg, ids)
+	ids.Release()
+	agg.release()
+	if err != nil {
+		t.Fatalf("old snapshot aggregate: %v", err)
+	}
+	requireAggregateLayout(t, result.Layout, []string{"sum_amount"})
+	requireAggregateInt(t, result.Rows[0][0], 30)
 }
 
 func TestRebuildIndex_CleanState(t *testing.T) {
@@ -2261,12 +2344,12 @@ func TestIndexExt_SnapshotQueryStableDuringConcurrentWrites(t *testing.T) {
 		return &Rec{Name: name, Age: i}
 	})
 
-	snap := db.engine.getSnapshot()
-	pinnedSnap, pinnedRef, ok := db.engine.snapshot.pinRefBySeq(snap.seq)
+	snap := db.engine.snapshot.Current()
+	pinnedSnap, pinnedRef, ok := db.engine.snapshot.PinBySeq(snap.Seq)
 	if !ok {
-		t.Fatalf("pinSnapshotRefBySeq(%d): false", snap.seq)
+		t.Fatalf("pinSnapshotRefBySeq(%d): false", snap.Seq)
 	}
-	defer db.engine.snapshot.unpinRef(snap.seq, pinnedRef)
+	defer db.engine.snapshot.Unpin(snap.Seq, pinnedRef)
 	snap = pinnedSnap
 
 	prepared, viewQ, err := prepareTestQuery(db.engine, qx.Query(qx.PREFIX("name", "aa/")).Sort("name", qx.ASC))

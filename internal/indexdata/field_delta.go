@@ -555,8 +555,15 @@ func sortedStringPostingDeltasBufOwned(deltas map[string]uint32, arena *PostingD
 		return nil
 	}
 
+	keys := pooled.GetStringSlice(len(deltas))
+	for raw := range deltas {
+		keys = append(keys, raw)
+	}
+	slices.Sort(keys)
+
 	buf := GetPostingDeltaSlice(len(deltas))
-	for raw, ref := range deltas {
+	for _, raw := range keys {
+		ref := deltas[raw]
 		delta := arena.accum(ref).materializeOwned()
 		if delta.Add.IsEmpty() && delta.Remove.IsEmpty() {
 			continue
@@ -566,12 +573,11 @@ func sortedStringPostingDeltasBufOwned(deltas map[string]uint32, arena *PostingD
 			Delta: delta,
 		})
 	}
+	pooled.ReleaseStringSlice(keys)
 	if len(buf) == 0 {
 		ReleasePostingDeltaSlice(buf)
 		return nil
 	}
-
-	sortPostingDeltasBuf(buf)
 	return buf
 }
 
@@ -580,8 +586,15 @@ func sortedFixedPostingDeltasBufOwned(deltas map[uint64]uint32, arena *PostingDi
 		return nil
 	}
 
+	keys := pooled.GetUint64Slice(len(deltas))
+	for raw := range deltas {
+		keys = append(keys, raw)
+	}
+	slices.Sort(keys)
+
 	buf := GetPostingDeltaSlice(len(deltas))
-	for raw, ref := range deltas {
+	for _, raw := range keys {
+		ref := deltas[raw]
 		delta := arena.accum(ref).materializeOwned()
 		if delta.Add.IsEmpty() && delta.Remove.IsEmpty() {
 			continue
@@ -591,12 +604,11 @@ func sortedFixedPostingDeltasBufOwned(deltas map[uint64]uint32, arena *PostingDi
 			Delta: delta,
 		})
 	}
+	pooled.ReleaseUint64Slice(keys)
 	if len(buf) == 0 {
 		ReleasePostingDeltaSlice(buf)
 		return nil
 	}
-
-	sortPostingDeltasBuf(buf)
 	return buf
 }
 
@@ -648,8 +660,15 @@ func sortedStringPostingAddsBufOwned(adds map[string]uint32, arena *PostingAddAr
 	if len(adds) == 0 {
 		return nil
 	}
+	keys := pooled.GetStringSlice(len(adds))
+	for raw := range adds {
+		keys = append(keys, raw)
+	}
+	slices.Sort(keys)
+
 	buf := GetPostingDeltaSlice(len(adds))
-	for raw, ref := range adds {
+	for _, raw := range keys {
+		ref := adds[raw]
 		ids := arena.accum(ref).materializeOwned()
 		buf = append(buf, PostingDelta{
 			Key: keycodec.FromStoredString(raw, fixed8),
@@ -658,7 +677,7 @@ func sortedStringPostingAddsBufOwned(adds map[string]uint32, arena *PostingAddAr
 			},
 		})
 	}
-	sortPostingDeltasBuf(buf)
+	pooled.ReleaseStringSlice(keys)
 	return buf
 }
 
@@ -666,8 +685,15 @@ func sortedFixedPostingAddsBufOwned(adds map[uint64]uint32, arena *PostingAddAre
 	if len(adds) == 0 {
 		return nil
 	}
+	keys := pooled.GetUint64Slice(len(adds))
+	for raw := range adds {
+		keys = append(keys, raw)
+	}
+	slices.Sort(keys)
+
 	buf := GetPostingDeltaSlice(len(adds))
-	for raw, ref := range adds {
+	for _, raw := range keys {
+		ref := adds[raw]
 		ids := arena.accum(ref).materializeOwned()
 		buf = append(buf, PostingDelta{
 			Key: keycodec.FromU64(raw),
@@ -676,7 +702,7 @@ func sortedFixedPostingAddsBufOwned(adds map[uint64]uint32, arena *PostingAddAre
 			},
 		})
 	}
-	sortPostingDeltasBuf(buf)
+	pooled.ReleaseUint64Slice(keys)
 	return buf
 }
 

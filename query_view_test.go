@@ -15,37 +15,38 @@ import (
 	"github.com/vapstack/rbi/internal/posting"
 	"github.com/vapstack/rbi/internal/qir"
 	"github.com/vapstack/rbi/internal/schema"
+	"github.com/vapstack/rbi/internal/snapshot"
 )
 
 func (qe *queryEngine) currentQueryViewForTests() *queryView {
 	if qe == nil || qe.snapshot == nil {
-		return &queryView{snap: &indexSnapshot{}}
+		return &queryView{snap: &snapshot.View{}}
 	}
-	if snap := qe.snapshot.current.Load(); snap != nil {
+	if snap := qe.snapshot.Current(); snap != nil {
 		return &queryView{
 			engine:            qe,
 			snap:              snap,
-			strKey:            snap.strmap != nil,
-			strMapView:        snap.strmap,
+			strKey:            snap.StrMap != nil,
+			strMapView:        snap.StrMap,
 			planner:           qe.planner,
-			lenZeroComplement: snap.lenZeroComplement,
+			lenZeroComplement: snap.LenZeroComplement,
 		}
 	}
 
-	snap := &indexSnapshot{
-		index:             qe.index,
-		nilIndex:          qe.nilIndex,
-		lenIndex:          qe.lenIndex,
-		lenZeroComplement: qe.lenZeroComplement,
-		universe:          qe.universe,
+	snap := &snapshot.View{
+		Index:             qe.index,
+		NilIndex:          qe.nilIndex,
+		LenIndex:          qe.lenIndex,
+		LenZeroComplement: qe.lenZeroComplement,
+		Universe:          qe.universe,
 	}
 	return &queryView{
 		engine:            qe,
 		snap:              snap,
-		strKey:            snap.strmap != nil,
-		strMapView:        snap.strmap,
+		strKey:            snap.StrMap != nil,
+		strMapView:        snap.StrMap,
 		planner:           qe.planner,
-		lenZeroComplement: snap.lenZeroComplement,
+		lenZeroComplement: snap.LenZeroComplement,
 	}
 }
 

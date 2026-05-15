@@ -21,6 +21,7 @@ import (
 	"github.com/vapstack/rbi/internal/posting"
 	"github.com/vapstack/rbi/internal/qcache"
 	"github.com/vapstack/rbi/internal/schema"
+	"github.com/vapstack/rbi/internal/snapshot"
 	"github.com/vapstack/rbi/internal/strmap"
 	"go.etcd.io/bbolt"
 )
@@ -498,7 +499,7 @@ func New[K ~uint64 | ~string, V any](bolt *bbolt.DB, options Options, execOpts .
 		}
 
 		if loadedPlannerStats != nil && loadedOrdinaryFieldCount == len(db.schema.Fields) {
-			db.engine.publishLoadedPlannerStats(loadedPlannerStats, db.engine.getSnapshot())
+			db.engine.publishLoadedPlannerStats(loadedPlannerStats, db.engine.snapshot.Current())
 
 		} else {
 			if err = db.RefreshPlannerStats(); err != nil {
@@ -534,10 +535,7 @@ func newQueryEngineForRuntime(rt *schema.Runtime, options *Options, strKey bool,
 		numericRangeBucketSize:         options.NumericRangeBucketSize,
 		numericRangeBucketMinFieldKeys: options.NumericRangeBucketMinFieldKeys,
 		numericRangeBucketMinSpanKeys:  options.NumericRangeBucketMinSpanKeys,
-		snapshot: &snapshotManager{
-			bySeq:        make(map[uint64]*snapshotRef, 128),
-			statsEnabled: options.EnableSnapshotStats,
-		},
+		snapshot:                       snapshot.NewManager(options.EnableSnapshotStats),
 		planner: &planner{
 			analyzer: &analyzer{
 				interval:   plannerAnalyzeInterval(options.AnalyzeInterval),
@@ -749,16 +747,6 @@ type calibrator struct {
 	persistPath string
 
 	sync.Mutex
-}
-
-type snapshotManager struct {
-	current      atomic.Pointer[indexSnapshot]
-	currentRef   atomic.Pointer[snapshotRef]
-	statsEnabled bool
-
-	bySeq map[uint64]*snapshotRef
-
-	mu sync.RWMutex
 }
 
 type autoBatchScheduler struct {
@@ -1242,15 +1230,52 @@ func (qe *queryEngine) publishCurrentSequenceSnapshotNoLock(bolt *bbolt.DB, buck
 	if err != nil {
 		return err
 	}
-	var snap *strmap.Snapshot
+	var strSnap *strmap.Snapshot
 	if strMap != nil {
-		snap = strMap.Snapshot()
+		strSnap = strMap.Snapshot()
 	}
-	qe.publishSnapshotNoLock(seq, snap)
+	prev := qe.snapshot.Current()
+	var snap *snapshot.View
+	if prev != nil {
+		lenZeroComplement := pooled.GetBoolSlice(len(qe.schema.Indexed))[:len(qe.schema.Indexed)]
+		clear(lenZeroComplement)
+		copy(lenZeroComplement, qe.lenZeroComplement)
+		snap = snapshot.NewView(seq, prev, qe.schema, qe.snapshotCacheConfig(), snapshot.Storage{
+			Index:             indexdata.CloneFieldStorageSlots(qe.index, len(qe.schema.Indexed)),
+			NilIndex:          indexdata.CloneFieldStorageSlots(qe.nilIndex, len(qe.schema.Indexed)),
+			LenIndex:          indexdata.CloneFieldStorageSlots(qe.lenIndex, len(qe.schema.Indexed)),
+			LenZeroComplement: lenZeroComplement,
+			Measure:           indexdata.CloneMeasureStorageSlots(qe.measure, len(qe.schema.Measures)),
+			Universe:          qe.universe,
+			StrMap:            strSnap,
+		})
+	} else {
+		snap = snapshot.NewView(seq, nil, qe.schema, qe.snapshotCacheConfig(), snapshot.Storage{
+			Index:             qe.index,
+			NilIndex:          qe.nilIndex,
+			LenIndex:          qe.lenIndex,
+			LenZeroComplement: qe.lenZeroComplement,
+			Measure:           qe.measure,
+			Universe:          qe.universe,
+			StrMap:            strSnap,
+		})
+	}
+	qe.installViewNoLock(snap)
 	if strMap != nil {
-		strMap.MarkCommittedPublished(snap)
+		strMap.MarkCommittedPublished(strSnap)
 	}
 	return nil
+}
+
+func (qe *queryEngine) publishStorageSnapshotNoLock(seq uint64, strMap *strmap.Mapper, st snapshot.Storage) {
+	if strMap != nil {
+		st.StrMap = strMap.Snapshot()
+	}
+	snap := snapshot.NewView(seq, qe.snapshot.Current(), qe.schema, qe.snapshotCacheConfig(), st)
+	qe.installViewNoLock(snap)
+	if strMap != nil {
+		strMap.MarkCommittedPublished(st.StrMap)
+	}
 }
 
 func publishAfterCommitLocked(testHooks *testHooks, broken *atomic.Bool, logger *log.Logger, engine *queryEngine, seq uint64, op string, publish func()) (err error) {
@@ -1267,7 +1292,7 @@ func publishAfterCommitLocked(testHooks *testHooks, broken *atomic.Bool, logger 
 				}
 			}
 			err = ErrBroken
-			engine.snapshot.dropStaged(seq)
+			engine.snapshot.DropStaged(seq)
 		}
 	}()
 	if testHooks != nil {
@@ -1345,12 +1370,12 @@ func (db *DB[K, V]) Stats() Stats[K] {
 	db.mu.RUnlock()
 
 	if db.engine != nil {
-		snap, seq, ref, pinned := db.engine.pinCurrentSnapshot()
-		defer db.engine.unpinCurrentSnapshot(seq, ref, pinned)
+		snap, seq, ref := db.engine.snapshot.PinCurrent()
+		defer db.engine.snapshot.Unpin(seq, ref)
 
-		out.KeyCount = snap.universeCardinality()
+		out.KeyCount = snap.UniverseCardinality()
 		out.LastKey = db.statsLastKeyFromSnapshot(snap, out.KeyCount)
-		out.SnapshotSequence = snap.seq
+		out.SnapshotSequence = snap.Seq
 	}
 
 	db.autoBatcher.mu.Lock()
@@ -1366,28 +1391,28 @@ func (db *DB[K, V]) Stats() Stats[K] {
 	return out
 }
 
-func (db *DB[K, V]) statsLastKeyFromSnapshot(snap *indexSnapshot, keyCount uint64) K {
+func (db *DB[K, V]) statsLastKeyFromSnapshot(snap *snapshot.View, keyCount uint64) K {
 	var zero K
 	if snap == nil || keyCount == 0 {
 		return zero
 	}
 
 	var maxIdx uint64
-	if snap.universe.IsEmpty() {
+	if snap.Universe.IsEmpty() {
 		return zero
 	}
-	maxIdx, _ = snap.universe.Maximum()
+	maxIdx, _ = snap.Universe.Maximum()
 
 	return db.statsKeyFromIdx(snap, maxIdx)
 }
 
-func (db *DB[K, V]) statsKeyFromIdx(snap *indexSnapshot, idx uint64) K {
+func (db *DB[K, V]) statsKeyFromIdx(snap *snapshot.View, idx uint64) K {
 	var zero K
 	if db.strKey {
-		if snap == nil || snap.strmap == nil {
+		if snap == nil || snap.StrMap == nil {
 			return zero
 		}
-		if key, ok := snap.strmap.String(idx); ok {
+		if key, ok := snap.StrMap.String(idx); ok {
 			return *(*K)(unsafe.Pointer(&key))
 		}
 		return zero
@@ -1417,13 +1442,13 @@ func (db *DB[K, V]) IndexStats() IndexStats {
 		return IndexStats{}
 	}
 
-	snap, seq, ref, pinned := db.engine.pinCurrentSnapshot()
-	defer db.engine.unpinCurrentSnapshot(seq, ref, pinned)
+	snap, seq, ref := db.engine.snapshot.PinCurrent()
+	defer db.engine.snapshot.Unpin(seq, ref)
 
 	return db.engine.indexStats(snap)
 }
 
-func (qe *queryEngine) indexStats(snap *indexSnapshot) IndexStats {
+func (qe *queryEngine) indexStats(snap *snapshot.View) IndexStats {
 	idx := IndexStats{
 		UniqueFieldKeys:        make(map[string]uint64),
 		FieldSize:              make(map[string]uint64),
@@ -1432,7 +1457,7 @@ func (qe *queryEngine) indexStats(snap *indexSnapshot) IndexStats {
 		FieldApproxStructBytes: make(map[string]uint64),
 		FieldApproxHeapBytes:   make(map[string]uint64),
 	}
-	sharedStructBytes := indexdata.FieldStorageSlotsApproxBytes(snap.index) + indexdata.FieldStorageSlotsApproxBytes(snap.nilIndex)
+	sharedStructBytes := indexdata.FieldStorageSlotsApproxBytes(snap.Index) + indexdata.FieldStorageSlotsApproxBytes(snap.NilIndex)
 	fieldCount := len(qe.schema.Indexed)
 	sharedStructPerField := uint64(0)
 	sharedStructRemainder := uint64(0)
@@ -1443,8 +1468,8 @@ func (qe *queryEngine) indexStats(snap *indexSnapshot) IndexStats {
 
 	for i, acc := range qe.schema.Indexed {
 		name := acc.Name
-		fieldStats := snap.index[acc.Ordinal].Stats(true)
-		nilStats := snap.nilIndex[acc.Ordinal].Stats(false)
+		fieldStats := snap.Index[acc.Ordinal].Stats(true)
+		nilStats := snap.NilIndex[acc.Ordinal].Stats(false)
 
 		unique := fieldStats.Unique + nilStats.Unique
 		size := fieldStats.PostingBytes + nilStats.PostingBytes
@@ -1719,21 +1744,18 @@ func (db *DB[K, V]) Truncate() error {
 	if db.strKey {
 		nextStrMap = strmap.EmptySnapshot()
 	}
-	snap := &indexSnapshot{
-		seq:                seq,
-		index:              nextIndex,
-		nilIndex:           nextNilIndex,
-		lenIndex:           nextLenIndex,
-		lenZeroComplement:  nextLenZeroComplement,
-		measure:            nextMeasure,
-		indexedFieldByName: db.engine.schema.IndexedByName,
-		universe:           nextUniverse,
-		strmap:             nextStrMap,
-	}
-	db.engine.initSnapshotRuntimeCaches(snap)
-	db.engine.snapshot.stage(snap)
+	snap := snapshot.NewView(seq, db.engine.snapshot.Current(), db.engine.schema, db.engine.snapshotCacheConfig(), snapshot.Storage{
+		Index:             nextIndex,
+		NilIndex:          nextNilIndex,
+		LenIndex:          nextLenIndex,
+		LenZeroComplement: nextLenZeroComplement,
+		Measure:           nextMeasure,
+		Universe:          nextUniverse,
+		StrMap:            nextStrMap,
+	})
+	db.engine.snapshot.Stage(snap)
 	if err = commitTx(tx, "truncate", db.testHooks); err != nil {
-		db.engine.snapshot.dropStaged(seq)
+		db.engine.snapshot.DropStaged(seq)
 		return fmt.Errorf("commit error: %w", err)
 	}
 
@@ -1749,9 +1771,9 @@ func (db *DB[K, V]) Truncate() error {
 	// Keep previously published snapshots immutable for concurrent readers.
 	db.engine.universe = nextUniverse
 	if err = publishAfterCommitLocked(db.testHooks, &db.broken, db.logger, db.engine, seq, "truncate", func() {
-		db.engine.finishSnapshotPublishNoLock(snap)
+		db.engine.installViewNoLock(snap)
 		if db.strMap != nil {
-			db.strMap.MarkCommittedPublished(snap.strmap)
+			db.strMap.MarkCommittedPublished(snap.StrMap)
 		}
 	}); err != nil {
 		return err

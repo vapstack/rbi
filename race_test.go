@@ -449,7 +449,7 @@ func TestRace_ConcurrentWriters_SnapshotRouteEquivalence(t *testing.T) {
 		}
 
 		q := queries[r.IntN(len(queries))]
-		snap, seq, snapRef, pinned := db.engine.pinCurrentSnapshot()
+		snap, seq, snapRef := db.engine.snapshot.PinCurrent()
 		view := db.engine.makeQueryView(snap)
 
 		nq, ref, usedExec, usedPlan := assertPreparedRouteEquivalence(t, view, q)
@@ -460,25 +460,25 @@ func TestRace_ConcurrentWriters_SnapshotRouteEquivalence(t *testing.T) {
 			preparedCount, compiledCount, err := prepareTestExpr(db.engine, nq.Filter)
 			if err != nil {
 				db.engine.releaseQueryView(view)
-				db.engine.unpinCurrentSnapshot(seq, snapRef, pinned)
+				db.engine.snapshot.Unpin(seq, snapRef)
 				t.Fatalf("prepareTestExpr(count): %v", err)
 			}
 			cnt, err := view.aggregateCountPreparedExpr(compiledCount)
 			preparedCount.Release()
 			if err != nil {
 				db.engine.releaseQueryView(view)
-				db.engine.unpinCurrentSnapshot(seq, snapRef, pinned)
+				db.engine.snapshot.Unpin(seq, snapRef)
 				t.Fatalf("aggregateCountPreparedExpr: %v", err)
 			}
 			if cnt != uint64(len(ref)) {
 				db.engine.releaseQueryView(view)
-				db.engine.unpinCurrentSnapshot(seq, snapRef, pinned)
+				db.engine.snapshot.Unpin(seq, snapRef)
 				t.Fatalf("count mismatch on snapshot view: got=%d want=%d", cnt, len(ref))
 			}
 		}
 
 		db.engine.releaseQueryView(view)
-		db.engine.unpinCurrentSnapshot(seq, snapRef, pinned)
+		db.engine.snapshot.Unpin(seq, snapRef)
 	}
 
 	close(stop)
@@ -651,14 +651,14 @@ func TestRace_ConcurrentWriters_OROrderScoreChurn_SnapshotRouteEquivalence(t *te
 		}
 
 		q := queries[r.IntN(len(queries))]
-		snap, seq, snapRef, pinned := db.engine.pinCurrentSnapshot()
+		snap, seq, snapRef := db.engine.snapshot.PinCurrent()
 		view := db.engine.makeQueryView(snap)
 
 		_, _, _, usedPlan := assertPreparedRouteEquivalence(t, view, q)
 		sawPlan = sawPlan || usedPlan
 
 		db.engine.releaseQueryView(view)
-		db.engine.unpinCurrentSnapshot(seq, snapRef, pinned)
+		db.engine.snapshot.Unpin(seq, snapRef)
 	}
 
 	close(stop)
@@ -834,7 +834,7 @@ func TestRace_StringKeyGrowth_FastPaths_SnapshotRouteEquivalence(t *testing.T) {
 		}
 
 		q := queries[r.IntN(len(queries))]
-		snap, seq, snapRef, pinned := db.engine.pinCurrentSnapshot()
+		snap, seq, snapRef := db.engine.snapshot.PinCurrent()
 		view := db.engine.makeQueryView(snap)
 
 		nq, ref, usedExec, usedPlan := assertPreparedRouteEquivalenceString(t, view, q)
@@ -846,13 +846,13 @@ func TestRace_StringKeyGrowth_FastPaths_SnapshotRouteEquivalence(t *testing.T) {
 			idx, ok := view.strMapView.Index(key)
 			if !ok {
 				db.engine.releaseQueryView(view)
-				db.engine.unpinCurrentSnapshot(seq, snapRef, pinned)
+				db.engine.snapshot.Unpin(seq, snapRef)
 				t.Fatalf("missing idx mapping in strmap snapshot for key=%q", key)
 			}
 			back, ok := view.strMapView.String(idx)
 			if !ok || back != key {
 				db.engine.releaseQueryView(view)
-				db.engine.unpinCurrentSnapshot(seq, snapRef, pinned)
+				db.engine.snapshot.Unpin(seq, snapRef)
 				t.Fatalf("strmap round-trip mismatch: key=%q idx=%d back=%q ok=%v", key, idx, back, ok)
 			}
 		}
@@ -861,25 +861,25 @@ func TestRace_StringKeyGrowth_FastPaths_SnapshotRouteEquivalence(t *testing.T) {
 			preparedCount, compiledCount, err := prepareTestExpr(db.engine, nq.Filter)
 			if err != nil {
 				db.engine.releaseQueryView(view)
-				db.engine.unpinCurrentSnapshot(seq, snapRef, pinned)
+				db.engine.snapshot.Unpin(seq, snapRef)
 				t.Fatalf("prepareTestExpr(count): %v", err)
 			}
 			cnt, err := view.aggregateCountPreparedExpr(compiledCount)
 			preparedCount.Release()
 			if err != nil {
 				db.engine.releaseQueryView(view)
-				db.engine.unpinCurrentSnapshot(seq, snapRef, pinned)
+				db.engine.snapshot.Unpin(seq, snapRef)
 				t.Fatalf("aggregateCountPreparedExpr: %v", err)
 			}
 			if cnt != uint64(len(ref)) {
 				db.engine.releaseQueryView(view)
-				db.engine.unpinCurrentSnapshot(seq, snapRef, pinned)
+				db.engine.snapshot.Unpin(seq, snapRef)
 				t.Fatalf("count mismatch on string snapshot view: got=%d want=%d", cnt, len(ref))
 			}
 		}
 
 		db.engine.releaseQueryView(view)
-		db.engine.unpinCurrentSnapshot(seq, snapRef, pinned)
+		db.engine.snapshot.Unpin(seq, snapRef)
 	}
 
 	close(stop)

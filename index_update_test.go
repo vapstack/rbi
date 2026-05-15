@@ -38,7 +38,7 @@ func TestSet_ReindexesAllSliceValues_OnReplace(t *testing.T) {
 		t.Fatalf("Set(215): %v", err)
 	}
 
-	has := db.engine.currentQueryViewForTests().snap.fieldLookupPostingRetained("tags", "db").Contains(215)
+	has := db.engine.currentQueryViewForTests().snap.FieldLookupPostingRetained("tags", "db").Contains(215)
 	if !has {
 		v, err := db.Get(215)
 		if err != nil {
@@ -74,10 +74,10 @@ func TestSet_ReindexesScalarString_OnReplace(t *testing.T) {
 	}
 
 	snap := db.engine.currentQueryViewForTests().snap
-	if snap.fieldLookupPostingRetained("full_name", oldFullName).Contains(215) {
+	if snap.FieldLookupPostingRetained("full_name", oldFullName).Contains(215) {
 		t.Fatalf("old full_name index still contains id=215")
 	}
-	if !snap.fieldLookupPostingRetained("full_name", rec.FullName).Contains(215) {
+	if !snap.FieldLookupPostingRetained("full_name", rec.FullName).Contains(215) {
 		t.Fatalf("new full_name index does not contain id=215")
 	}
 }
@@ -111,13 +111,13 @@ func TestBatchSet_RepeatedIDReindexesScalarString(t *testing.T) {
 	}
 
 	snap := db.engine.currentQueryViewForTests().snap
-	if snap.fieldLookupPostingRetained("full_name", oldFullName).Contains(215) {
+	if snap.FieldLookupPostingRetained("full_name", oldFullName).Contains(215) {
 		t.Fatalf("old full_name index still contains id=215")
 	}
-	if snap.fieldLookupPostingRetained("full_name", first.FullName).Contains(215) {
+	if snap.FieldLookupPostingRetained("full_name", first.FullName).Contains(215) {
 		t.Fatalf("intermediate full_name index contains id=215")
 	}
-	if !snap.fieldLookupPostingRetained("full_name", second.FullName).Contains(215) {
+	if !snap.FieldLookupPostingRetained("full_name", second.FullName).Contains(215) {
 		t.Fatalf("final full_name index does not contain id=215")
 	}
 }
@@ -136,7 +136,7 @@ func TestDelete_ReindexesScalarString(t *testing.T) {
 	if err := db.Delete(215); err != nil {
 		t.Fatalf("Delete(215): %v", err)
 	}
-	if db.engine.currentQueryViewForTests().snap.fieldLookupPostingRetained("full_name", oldFullName).Contains(215) {
+	if db.engine.currentQueryViewForTests().snap.FieldLookupPostingRetained("full_name", oldFullName).Contains(215) {
 		t.Fatalf("old full_name index still contains id=215 after delete")
 	}
 }

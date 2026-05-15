@@ -1345,7 +1345,7 @@ func (qv *queryView) shouldPromoteObservedOrderBasicBaseCore(
 	case orderBasicBaseCoreCollapsedRange:
 		return qv.shouldPromoteObservedPreparedScalarExactRange(core.collapsed, observedRows, needWindow)
 	case orderBasicBaseCoreRawExpr:
-		if qv.snap.materializedPredCacheLimit() <= 0 {
+		if qv.snap.MaterializedPredCacheLimit() <= 0 {
 			return false
 		}
 		return qv.shouldPromoteObservedOrderBasicRawBaseOp(
@@ -1365,7 +1365,7 @@ func (qv *queryView) promoteObservedOrderBasicBaseCore(core orderBasicBaseCore) 
 	case orderBasicBaseCoreCollapsedRange:
 		cacheKey := core.collapsed.cacheKey
 		if !cacheKey.IsZero() {
-			if _, ok := qv.snap.loadMaterializedPredKey(cacheKey); ok {
+			if _, ok := qv.snap.LoadMaterializedPredKey(cacheKey); ok {
 				return
 			}
 		}
@@ -1382,7 +1382,7 @@ func (qv *queryView) promoteObservedOrderBasicBaseCore(core orderBasicBaseCore) 
 		if cacheKey.IsZero() {
 			return
 		}
-		if _, ok := qv.snap.loadMaterializedPredKey(cacheKey); ok {
+		if _, ok := qv.snap.LoadMaterializedPredKey(cacheKey); ok {
 			return
 		}
 		scalarKey := qv.materializedPredKey(core.expr)
@@ -1468,12 +1468,12 @@ func (qv *queryView) materializeOrderBasicLimitComplementBaseOp(op qir.Expr, cac
 		return false
 	}
 	if plan.est == 0 {
-		qv.snap.storeMaterializedPredKey(cacheKey, posting.List{})
+		qv.snap.StoreMaterializedPredKey(cacheKey, posting.List{})
 		return true
 	}
 	ids := candidate.core.materializeComplement(plan)
 	if ids.IsEmpty() {
-		qv.snap.storeMaterializedPredKey(cacheKey, posting.List{})
+		qv.snap.StoreMaterializedPredKey(cacheKey, posting.List{})
 		return true
 	}
 	ids = tryShareMaterializedPredOnSnapshot(qv.snap, cacheKey, ids)
@@ -1525,7 +1525,7 @@ func (qv *queryView) promoteOrderBasicLimitMaterializedBaseOps(orderField string
 		if key.IsZero() {
 			continue
 		}
-		if requiresSecondHit && !qv.snap.shouldPromoteRuntimeMaterializedPredKey(key) {
+		if requiresSecondHit && !qv.snap.ShouldPromoteRuntimeMaterializedPredKey(key) {
 			continue
 		}
 		seen := false
@@ -1599,7 +1599,7 @@ func (qv *queryView) promoteObservedLimitLeafPreds(orderField string, preds *poo
 		if key.IsZero() {
 			continue
 		}
-		if requiresSecondHit && !qv.snap.shouldPromoteRuntimeMaterializedPredKey(key) {
+		if requiresSecondHit && !qv.snap.ShouldPromoteRuntimeMaterializedPredKey(key) {
 			continue
 		}
 
@@ -1625,7 +1625,7 @@ func (qv *queryView) evalOrderBasicRawBaseOp(op qir.Expr) (postingResult, error)
 		cacheKey = stats.cacheKey
 	}
 	if !cacheKey.IsZero() {
-		if cached, ok := qv.snap.loadMaterializedPredKey(cacheKey); ok {
+		if cached, ok := qv.snap.LoadMaterializedPredKey(cacheKey); ok {
 			if cacheKey == qv.materializedPredKey(op) {
 				return postingResult{ids: cached}, nil
 			}

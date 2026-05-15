@@ -97,7 +97,7 @@ func storeEmptyScalarComplementMaterialization(plan scalarComplementMaterializat
 	if plan.sharedReuse.snap == nil || plan.sharedReuse.cacheKey.IsZero() {
 		return
 	}
-	plan.sharedReuse.snap.storeMaterializedPredKey(plan.sharedReuse.cacheKey, posting.List{})
+	plan.sharedReuse.snap.StoreMaterializedPredKey(plan.sharedReuse.cacheKey, posting.List{})
 }
 
 func (qv *queryView) classifyOrderFieldScalarLeaf(orderField string, e qir.Expr) orderFieldScalarLeafKind {
@@ -781,7 +781,7 @@ func (core *preparedScalarRangePredicate) evalMaterializedPostingResult(ov index
 	br := ov.RangeForBounds(core.bounds)
 	if br.Empty() {
 		if core.sharedReuse.snap != nil && !core.sharedReuse.cacheKey.IsZero() {
-			core.sharedReuse.snap.storeMaterializedPredKey(core.sharedReuse.cacheKey, posting.List{})
+			core.sharedReuse.snap.StoreMaterializedPredKey(core.sharedReuse.cacheKey, posting.List{})
 		}
 		return postingResult{}
 	}
@@ -859,7 +859,7 @@ func (core *preparedScalarRangePredicate) loadWarmScalarPostingResult() (posting
 		return postingResult{}, false
 	}
 	if !stats.cacheKey.IsZero() {
-		if cached, ok := core.qv.snap.loadMaterializedPredKey(stats.cacheKey); ok {
+		if cached, ok := core.qv.snap.LoadMaterializedPredKey(stats.cacheKey); ok {
 			return postingResult{ids: cached, neg: stats.buildComplement}, true
 		}
 	}
@@ -880,7 +880,7 @@ func (core *preparedScalarRangePredicate) loadWarmScalarPostingResult() (posting
 
 func (qv *queryView) loadWarmPreparedScalarExactRange(op preparedScalarExactRange) (postingResult, bool) {
 	if !op.cacheKey.IsZero() {
-		if cached, ok := qv.snap.loadMaterializedPredKey(op.cacheKey); ok {
+		if cached, ok := qv.snap.LoadMaterializedPredKey(op.cacheKey); ok {
 			return postingResult{ids: cached}, true
 		}
 	}
@@ -901,7 +901,7 @@ func (qv *queryView) loadWarmPreparedScalarExactRange(op preparedScalarExactRang
 
 func (qv *queryView) evalPreparedScalarExactRange(op preparedScalarExactRange) (postingResult, error) {
 	if !op.cacheKey.IsZero() {
-		if cached, ok := qv.snap.loadMaterializedPredKey(op.cacheKey); ok {
+		if cached, ok := qv.snap.LoadMaterializedPredKey(op.cacheKey); ok {
 			return postingResult{ids: cached}, nil
 		}
 	}

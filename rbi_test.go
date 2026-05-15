@@ -1196,21 +1196,12 @@ func readBucketSequence(tb testing.TB, raw *bbolt.DB, bucket []byte) uint64 {
 func assertNoFutureSnapshotRefs[K ~uint64 | ~string, V any](tb testing.TB, db *DB[K, V]) {
 	tb.Helper()
 
-	current := db.engine.getSnapshot()
-	currentSeq := uint64(0)
-	if current != nil {
-		currentSeq = current.seq
+	if db.engine.snapshot.Current() == nil {
+		return
 	}
-
-	db.engine.snapshot.mu.RLock()
-	defer db.engine.snapshot.mu.RUnlock()
-	for seq, ref := range db.engine.snapshot.bySeq {
-		if ref == nil || ref.snap == nil {
-			tb.Fatalf("snapshot registry contains nil entry for seq=%d", seq)
-		}
-		if seq > currentSeq {
-			tb.Fatalf("staged snapshot leaked into registry: seq=%d current=%d", seq, currentSeq)
-		}
+	stats := db.engine.snapshot.Stats(db.engine.snapshot.Current(), nil)
+	if stats.RegistrySize != 1 {
+		tb.Fatalf("snapshot registry contains staged or retired refs: %+v", stats)
 	}
 }
 
@@ -3926,11 +3917,11 @@ func TestTruncate_PreservesSequenceMonotonicityAcrossBucketRecreate(t *testing.T
 	if got := readBucketSequence(t, raw3, db3.bucket); got != truncateSeq {
 		t.Fatalf("reopened bucket sequence mismatch: got=%d want=%d", got, truncateSeq)
 	}
-	if snap := db3.engine.getSnapshot(); snap == nil || snap.seq != truncateSeq {
+	if snap := db3.engine.snapshot.Current(); snap == nil || snap.Seq != truncateSeq {
 		if snap == nil {
 			t.Fatalf("expected published snapshot after reopen")
 		}
-		t.Fatalf("snapshot sequence mismatch after reopen: got=%d want=%d", snap.seq, truncateSeq)
+		t.Fatalf("snapshot sequence mismatch after reopen: got=%d want=%d", snap.Seq, truncateSeq)
 	}
 
 	ids, err := db3.QueryKeys(qx.Query(qx.EQ("age", 30)))

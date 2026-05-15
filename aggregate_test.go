@@ -247,8 +247,8 @@ func TestAggregateGroupedOrdinaryByIDGateUsesSelectivity(t *testing.T) {
 	}
 	defer selective.release()
 
-	snap, seq, ref, pinned := db.engine.pinCurrentSnapshot()
-	defer db.engine.unpinCurrentSnapshot(seq, ref, pinned)
+	snap, seq, ref := db.engine.snapshot.PinCurrent()
+	defer db.engine.snapshot.Unpin(seq, ref)
 	view := db.engine.makeQueryView(snap)
 	defer db.engine.releaseQueryView(view)
 
@@ -1081,7 +1081,7 @@ func TestAggregateMeasureEmptyBaseBatchSetDuplicateIDsUsesLastValue(t *testing.T
 	}
 
 	acc := db.engine.schema.MeasuresByName["amount"]
-	storage := db.engine.getSnapshot().measure[acc.Ordinal]
+	storage := db.engine.snapshot.Current().Measure[acc.Ordinal]
 	if storage.Rows() != 1 {
 		t.Fatalf("measure rows=%d, want 1", storage.Rows())
 	}
@@ -1128,7 +1128,7 @@ func TestAggregateWideMeasureUsesFullAndMergeScans(t *testing.T) {
 	}
 
 	acc := db.engine.schema.MeasuresByName["amount"]
-	storage := db.engine.getSnapshot().measure[acc.Ordinal]
+	storage := db.engine.snapshot.Current().Measure[acc.Ordinal]
 	if !useMeasureMergeScan(keep, storage) {
 		t.Fatal("wide filtered measure aggregate must use merge scan")
 	}
@@ -1297,8 +1297,8 @@ func TestAggregatePinnedSnapshotIsolation(t *testing.T) {
 	}
 	defer prepared.release()
 
-	snap, seq, ref, pinned := db.engine.pinCurrentSnapshot()
-	defer db.engine.unpinCurrentSnapshot(seq, ref, pinned)
+	snap, seq, ref := db.engine.snapshot.PinCurrent()
+	defer db.engine.snapshot.Unpin(seq, ref)
 
 	if err := db.Set(1, &measureOnlyRec{Amount: 99}); err != nil {
 		t.Fatalf("Set update: %v", err)

@@ -9,18 +9,19 @@ import (
 	"testing"
 
 	"github.com/vapstack/qx"
+	"github.com/vapstack/rbi/internal/snapshot"
 )
 
-func stringTestScanSnapshotKeys(db *DB[string, Rec], snap *indexSnapshot, seek string) ([]string, error) {
+func stringTestScanSnapshotKeys(db *DB[string, Rec], snap *snapshot.View, seek string) ([]string, error) {
 	if snap == nil {
 		return nil, fmt.Errorf("snapshot is nil")
 	}
 
-	iter := snap.universe.Iter()
+	iter := snap.Universe.Iter()
 	defer iter.Release()
 
 	var out []string
-	if err := db.scanStringKeys(snap.strmap, snap.universe, iter, seek, func(id string) (bool, error) {
+	if err := db.scanStringKeys(snap.StrMap, snap.Universe, iter, seek, func(id string) (bool, error) {
 		out = append(out, id)
 		return true, nil
 	}); err != nil {
@@ -60,10 +61,10 @@ func TestStringExt_ReopenReinsertDeletedKeysPreserveOriginalInternalOrder(t *tes
 		}
 	}
 
-	initial := db.engine.getSnapshot()
+	initial := db.engine.snapshot.Current()
 	wantIdx := make(map[string]uint64, len(order))
 	for _, key := range order {
-		idx, ok := initial.strmap.Index(key)
+		idx, ok := initial.StrMap.Index(key)
 		if !ok || idx == 0 {
 			t.Fatalf("initial snapshot missing idx for %q", key)
 		}
@@ -97,9 +98,9 @@ func TestStringExt_ReopenReinsertDeletedKeysPreserveOriginalInternalOrder(t *tes
 		t.Fatalf("live order before reopen mismatch: got=%v want=%v", gotLive, liveOrder)
 	}
 
-	afterDelete := db.engine.getSnapshot()
+	afterDelete := db.engine.snapshot.Current()
 	for key := range deleted {
-		idx, ok := afterDelete.strmap.Index(key)
+		idx, ok := afterDelete.StrMap.Index(key)
 		if !ok || idx != wantIdx[key] {
 			t.Fatalf("deleted key %q lost retained idx: got=%d ok=%v want=%d", key, idx, ok, wantIdx[key])
 		}
@@ -109,9 +110,9 @@ func TestStringExt_ReopenReinsertDeletedKeysPreserveOriginalInternalOrder(t *tes
 
 	db, raw = openBoltAndNew[string, Rec](t, path)
 
-	reopened := db.engine.getSnapshot()
+	reopened := db.engine.snapshot.Current()
 	for _, key := range order {
-		idx, ok := reopened.strmap.Index(key)
+		idx, ok := reopened.StrMap.Index(key)
 		if !ok || idx != wantIdx[key] {
 			t.Fatalf("reopened snapshot changed idx for %q: got=%d ok=%v want=%d", key, idx, ok, wantIdx[key])
 		}
@@ -205,29 +206,29 @@ func TestStringExt_SharedAutoBatchUniqueRejectHolePersistsAcrossReopen(t *testin
 	assertHole := func(label string) {
 		t.Helper()
 
-		snap := db.engine.getSnapshot()
-		if snap == nil || snap.strmap == nil {
+		snap := db.engine.snapshot.Current()
+		if snap == nil || snap.StrMap == nil {
 			t.Fatalf("%s: expected published strmap snapshot", label)
 		}
-		if snap.strmap.Next() != 3 {
-			t.Fatalf("%s: strmap.Next = %d, want 3", label, snap.strmap.Next())
+		if snap.StrMap.Next() != 3 {
+			t.Fatalf("%s: strmap.Next = %d, want 3", label, snap.StrMap.Next())
 		}
 
-		seedIdx, ok := snap.strmap.Index("seed")
+		seedIdx, ok := snap.StrMap.Index("seed")
 		if !ok || seedIdx != 1 {
 			t.Fatalf("%s: seed idx = %d ok=%v, want 1", label, seedIdx, ok)
 		}
-		if _, ok := snap.strmap.Index("ghost-hole"); ok {
+		if _, ok := snap.StrMap.Index("ghost-hole"); ok {
 			t.Fatalf("%s: rejected key unexpectedly remained in strmap", label)
 		}
-		realIdx, ok := snap.strmap.Index("real-hole")
+		realIdx, ok := snap.StrMap.Index("real-hole")
 		if !ok || realIdx != 3 {
 			t.Fatalf("%s: real-hole idx = %d ok=%v, want 3", label, realIdx, ok)
 		}
-		if s, ok := snap.strmap.String(2); ok {
+		if s, ok := snap.StrMap.String(2); ok {
 			t.Fatalf("%s: hole idx 2 unexpectedly mapped to %q", label, s)
 		}
-		if s, ok := snap.strmap.String(3); !ok || s != "real-hole" {
+		if s, ok := snap.StrMap.String(3); !ok || s != "real-hole" {
 			t.Fatalf("%s: idx 3 reverse mapping = %q ok=%v, want real-hole", label, s, ok)
 		}
 
@@ -291,7 +292,7 @@ func TestStringExt_RollbackCreatedStrIdxRestoresCommittedSnapshotBase(t *testing
 		}
 	}
 
-	before := db.engine.getSnapshot().strmap
+	before := db.engine.snapshot.Current().StrMap
 	if before == nil || before.Next() != uint64(len(seed)) {
 		t.Fatalf("unexpected committed base before reject: %#v", before)
 	}
@@ -300,10 +301,10 @@ func TestStringExt_RollbackCreatedStrIdxRestoresCommittedSnapshotBase(t *testing
 	if !errors.Is(err, ErrUniqueViolation) {
 		t.Fatalf("duplicate Set error = %v, want %v", err, ErrUniqueViolation)
 	}
-	if _, ok := db.engine.getSnapshot().strmap.Index("ghost-dup"); ok {
+	if _, ok := db.engine.snapshot.Current().StrMap.Index("ghost-dup"); ok {
 		t.Fatalf("rejected key unexpectedly remained in published strmap")
 	}
-	if next := db.engine.getSnapshot().strmap.Next(); next != before.Next() {
+	if next := db.engine.snapshot.Current().StrMap.Next(); next != before.Next() {
 		t.Fatalf("rollback changed published strmap next: got=%d want=%d", next, before.Next())
 	}
 
@@ -311,7 +312,7 @@ func TestStringExt_RollbackCreatedStrIdxRestoresCommittedSnapshotBase(t *testing
 		t.Fatalf("good Set: %v", err)
 	}
 
-	latest := db.engine.getSnapshot().strmap
+	latest := db.engine.snapshot.Current().StrMap
 	if latest == nil {
 		t.Fatalf("missing latest state snapshot after successful insert")
 	}
@@ -336,8 +337,8 @@ func TestStringExt_ConcurrentLazySnapshotKeyLookup(t *testing.T) {
 		}
 	}
 
-	snap := db.engine.getSnapshot()
-	if snap == nil || snap.strmap == nil {
+	snap := db.engine.snapshot.Current()
+	if snap == nil || snap.StrMap == nil {
 		t.Fatalf("expected published string snapshot")
 	}
 	start := make(chan struct{})
@@ -349,12 +350,12 @@ func TestStringExt_ConcurrentLazySnapshotKeyLookup(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			<-start
-			idx, ok := snap.strmap.Index(key)
+			idx, ok := snap.StrMap.Index(key)
 			if !ok {
 				errCh <- fmt.Errorf("missing idx for %q", key)
 				return
 			}
-			back, ok := snap.strmap.String(idx)
+			back, ok := snap.StrMap.String(idx)
 			if !ok || back != key {
 				errCh <- fmt.Errorf("round-trip mismatch for %q: idx=%d back=%q ok=%v", key, idx, back, ok)
 			}
@@ -384,8 +385,8 @@ func TestStringExt_PublishedReadPagesPreserveQueryAndScanOrder(t *testing.T) {
 		}
 	}
 
-	snap := db.engine.getSnapshot()
-	if snap == nil || snap.strmap == nil {
+	snap := db.engine.snapshot.Current()
+	if snap == nil || snap.StrMap == nil {
 		t.Fatalf("expected published string snapshot")
 	}
 	gotKeys, err := db.QueryKeys(qx.Query())
@@ -513,7 +514,7 @@ func TestStringExt_BeginQueryTxSnapshotScanAndQueryStayConsistentDuringDeleteRei
 				}
 
 				rollback(tx)
-				db.engine.snapshot.unpinRef(seq, ref)
+				db.engine.snapshot.Unpin(seq, ref)
 
 				if scanErr != nil {
 					errCh <- fmt.Errorf("reader=%d iter=%d: %w", reader, i, scanErr)

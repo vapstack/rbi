@@ -307,8 +307,8 @@ func execPreparedQueryForTest[K ~uint64 | ~string](db *DB[K, Rec], q *qx.QX) ([]
 	}
 	defer prepared.Release()
 
-	snap, seq, ref, pinned := db.engine.pinCurrentSnapshot()
-	defer db.engine.unpinCurrentSnapshot(seq, ref, pinned)
+	snap, seq, ref := db.engine.snapshot.PinCurrent()
+	defer db.engine.snapshot.Unpin(seq, ref)
 
 	view := db.engine.makeQueryView(snap)
 	defer db.engine.releaseQueryView(view)

@@ -12,14 +12,15 @@ import (
 
 	"github.com/vapstack/qx"
 	"github.com/vapstack/rbi/internal/qcache"
+	"github.com/vapstack/rbi/internal/snapshot"
 )
 
-func requireNumericRangeBucketCacheEntry(t *testing.T, snap *indexSnapshot, field string) *qcache.NumericRangeBucketEntry {
+func requireNumericRangeBucketCacheEntry(t *testing.T, snap *snapshot.View, field string) *qcache.NumericRangeBucketEntry {
 	t.Helper()
-	if snap == nil || snap.numericRangeBucketCache == nil {
+	if snap == nil || snap.NumericRangeBucketCache() == nil {
 		t.Fatalf("expected non-nil numeric range bucket cache for field %q", field)
 	}
-	e, ok := snap.numericRangeBucketCache.LoadField(field)
+	e, ok := snap.NumericRangeBucketCache().LoadField(field)
 	if !ok {
 		t.Fatalf("expected numeric range bucket cache entry for field %q", field)
 	}
@@ -102,7 +103,7 @@ func warmNumericRangeBucketEntry(t *testing.T, db *DB[uint64, Rec], expr qx.Expr
 		t.Fatalf("expected numeric range bucket path for %s", f)
 	}
 	out.release()
-	return requireNumericRangeBucketCacheEntry(t, db.engine.getSnapshot(), f), br
+	return requireNumericRangeBucketCacheEntry(t, db.engine.snapshot.Current(), f), br
 }
 
 func TestEvalSimple_NumericRangeBuckets_MatchClassicPath(t *testing.T) {
@@ -305,8 +306,8 @@ func TestEvalSimple_NumericRangeBuckets_WorkWithoutPredicateCacheWhenReuseEnable
 	setNumericBucketKnobs(t, db, 128, 1, 1)
 
 	expr := qx.GTE("age", 2_500)
-	snap := db.engine.getSnapshot()
-	if snap.numericRangeBucketCache == nil {
+	snap := db.engine.snapshot.Current()
+	if snap.NumericRangeBucketCache() == nil {
 		t.Fatalf("expected numeric range bucket cache when reuse is enabled")
 	}
 
@@ -317,7 +318,7 @@ func TestEvalSimple_NumericRangeBuckets_WorkWithoutPredicateCacheWhenReuseEnable
 	ids1 := bitmapToIDs(t, got1)
 	got1.release()
 
-	entry := requireNumericRangeBucketCacheEntry(t, db.engine.getSnapshot(), "age")
+	entry := requireNumericRangeBucketCacheEntry(t, db.engine.snapshot.Current(), "age")
 	if entry.Storage().KeyCount() == 0 {
 		t.Fatalf("expected cached numeric range entry to point at live field storage")
 	}
@@ -353,11 +354,11 @@ func TestNumericRangeBucketCache_InheritsSafeEntriesAcrossSnapshotsWhenFieldInde
 	setNumericBucketKnobs(t, db, 128, 1, 1)
 	entry1, _ := warmNumericRangeBucketEntry(t, db, qx.GTE("age", 2_000))
 
-	snap1 := db.engine.getSnapshot()
-	if snap1.numericRangeBucketCache == nil {
+	snap1 := db.engine.snapshot.Current()
+	if snap1.NumericRangeBucketCache() == nil {
 		t.Fatalf("expected non-nil numeric range cache in initial snapshot")
 	}
-	storage1, ok := snap1.fieldIndexStorage("age")
+	storage1, ok := snap1.FieldIndexStorage("age")
 	if !ok || entry1.Storage() != storage1 {
 		t.Fatalf("expected cached numeric range entry to point at initial age storage")
 	}
@@ -366,15 +367,15 @@ func TestNumericRangeBucketCache_InheritsSafeEntriesAcrossSnapshotsWhenFieldInde
 		t.Fatalf("Patch: %v", err)
 	}
 
-	snap2 := db.engine.getSnapshot()
+	snap2 := db.engine.snapshot.Current()
 	if snap2 == nil {
 		t.Fatalf("expected current snapshot after patch")
 	}
-	if snap2.numericRangeBucketCache == snap1.numericRangeBucketCache {
+	if snap2.NumericRangeBucketCache() == snap1.NumericRangeBucketCache() {
 		t.Fatalf("expected each snapshot to own its numeric range cache")
 	}
 	entry2 := requireNumericRangeBucketCacheEntry(t, snap2, "age")
-	storage2, ok := snap2.fieldIndexStorage("age")
+	storage2, ok := snap2.FieldIndexStorage("age")
 	if !ok || entry2.Storage() != storage2 {
 		t.Fatalf("expected inherited numeric range entry to point at current age storage")
 	}
@@ -402,8 +403,8 @@ func TestNumericRangeBucketCache_DropsChangedFieldEntryAcrossSnapshots(t *testin
 	setNumericBucketKnobs(t, db, 128, 1, 1)
 	entry1, _ := warmNumericRangeBucketEntry(t, db, qx.GTE("age", 2_000))
 
-	snap1 := db.engine.getSnapshot()
-	storage1, ok := snap1.fieldIndexStorage("age")
+	snap1 := db.engine.snapshot.Current()
+	storage1, ok := snap1.FieldIndexStorage("age")
 	if !ok || entry1.Storage() != storage1 {
 		t.Fatalf("expected cached numeric range entry to point at original age storage")
 	}
@@ -412,22 +413,22 @@ func TestNumericRangeBucketCache_DropsChangedFieldEntryAcrossSnapshots(t *testin
 		t.Fatalf("Patch(age): %v", err)
 	}
 
-	snap2 := db.engine.getSnapshot()
-	if snap2 == nil || snap2.numericRangeBucketCache == nil {
+	snap2 := db.engine.snapshot.Current()
+	if snap2 == nil || snap2.NumericRangeBucketCache() == nil {
 		t.Fatalf("expected current snapshot with initialized numeric range cache")
 	}
-	if snap2.numericRangeBucketCache == snap1.numericRangeBucketCache {
+	if snap2.NumericRangeBucketCache() == snap1.NumericRangeBucketCache() {
 		t.Fatalf("expected changed-field snapshot to use a distinct numeric range cache")
 	}
-	if _, ok := snap2.numericRangeBucketCache.LoadField("age"); ok {
+	if _, ok := snap2.NumericRangeBucketCache().LoadField("age"); ok {
 		t.Fatalf("expected changed numeric field cache entry to be dropped on inherited snapshot")
 	}
 
 	warmNumericRangeBucketEntry(t, db, qx.GTE("age", 2_000))
 
-	snap3 := db.engine.getSnapshot()
+	snap3 := db.engine.snapshot.Current()
 	entry3 := requireNumericRangeBucketCacheEntry(t, snap3, "age")
-	storage3, ok := snap3.fieldIndexStorage("age")
+	storage3, ok := snap3.FieldIndexStorage("age")
 	if !ok || entry3.Storage() != storage3 {
 		t.Fatalf("expected rebuilt numeric range entry to point at current age storage")
 	}
@@ -452,7 +453,7 @@ func TestNumericRangeBucketSpanCache_ReusedForNearbyBounds(t *testing.T) {
 
 	setNumericBucketKnobs(t, db, 128, 1, 1)
 
-	snap := db.engine.getSnapshot()
+	snap := db.engine.snapshot.Current()
 	fm := db.engine.schema.Fields["age"]
 	if fm == nil {
 		t.Fatalf("expected age field metadata")
@@ -529,7 +530,7 @@ func TestNumericRangeBucketSpanCache_ReusedFullSpanStillMergesEdgeBuckets(t *tes
 
 	setNumericBucketKnobs(t, db, 128, 1, 1)
 
-	snap := db.engine.getSnapshot()
+	snap := db.engine.snapshot.Current()
 	fm := db.engine.schema.Fields["age"]
 	if fm == nil {
 		t.Fatalf("expected age field metadata")
@@ -625,7 +626,7 @@ func TestNumericRangeBucketSpanCache_ExtendedSuffixSpanStillMatchesRange(t *test
 
 	setNumericBucketKnobs(t, db, 128, 1, 1)
 
-	snap := db.engine.getSnapshot()
+	snap := db.engine.snapshot.Current()
 	fm := db.engine.schema.Fields["age"]
 	if fm == nil {
 		t.Fatalf("expected age field metadata")
@@ -823,7 +824,7 @@ func TestNumericRangeBucketSpanCache_RespectsCardinalityGuard(t *testing.T) {
 
 	setNumericBucketKnobs(t, db, 128, 1, 1)
 
-	snap := db.engine.getSnapshot()
+	snap := db.engine.snapshot.Current()
 	fm := db.engine.schema.Fields["age"]
 	if fm == nil {
 		t.Fatalf("expected age field metadata")

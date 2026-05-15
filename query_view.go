@@ -9,6 +9,7 @@ import (
 	"github.com/vapstack/rbi/internal/posting"
 	"github.com/vapstack/rbi/internal/qir"
 	"github.com/vapstack/rbi/internal/schema"
+	"github.com/vapstack/rbi/internal/snapshot"
 	"github.com/vapstack/rbi/internal/strmap"
 )
 
@@ -40,7 +41,7 @@ type normalizedScalarBoundCacheEntry struct {
 // Zero value is invalid; construct it via makeQueryView.
 type queryView struct {
 	engine            *queryEngine
-	snap              *indexSnapshot
+	snap              *snapshot.View
 	strKey            bool
 	strMapView        *strmap.Snapshot
 	planner           *planner
@@ -217,11 +218,11 @@ func (qv *queryView) fieldMetaByOrder(order qir.Order) *schema.Field {
 }
 
 func (qv *queryView) snapshotUniverseCardinality() uint64 {
-	return qv.snap.universe.Cardinality()
+	return qv.snap.Universe.Cardinality()
 }
 
 func (qv *queryView) snapshotUniverseView() posting.List {
-	return qv.snap.universe.Borrow()
+	return qv.snap.Universe.Borrow()
 }
 
 func fieldOverlayForAccessor(slots []indexdata.FieldStorage, acc schema.IndexedFieldAccessor) indexdata.FieldOverlay {
@@ -272,63 +273,63 @@ func (qv *queryView) indexedOverlayForOrder(slots []indexdata.FieldStorage, orde
 }
 
 func (qv *queryView) fieldOverlayByOrdinal(ordinal int) indexdata.FieldOverlay {
-	return qv.indexedOverlayByOrdinal(qv.snap.index, ordinal)
+	return qv.indexedOverlayByOrdinal(qv.snap.Index, ordinal)
 }
 
 func (qv *queryView) fieldOverlayRef(field string, ordinal int) indexdata.FieldOverlay {
-	return qv.indexedOverlayRef(qv.snap.index, field, ordinal)
+	return qv.indexedOverlayRef(qv.snap.Index, field, ordinal)
 }
 
 func (qv *queryView) fieldOverlay(field string) indexdata.FieldOverlay {
-	return qv.indexedOverlayByName(qv.snap.index, field)
+	return qv.indexedOverlayByName(qv.snap.Index, field)
 }
 
 func (qv *queryView) fieldOverlayForExpr(expr qir.Expr) indexdata.FieldOverlay {
-	return qv.indexedOverlayForExpr(qv.snap.index, expr)
+	return qv.indexedOverlayForExpr(qv.snap.Index, expr)
 }
 
 func (qv *queryView) fieldOverlayForOrder(order qir.Order) indexdata.FieldOverlay {
-	return qv.indexedOverlayForOrder(qv.snap.index, order)
+	return qv.indexedOverlayForOrder(qv.snap.Index, order)
 }
 
 func (qv *queryView) nilFieldOverlayByOrdinal(ordinal int) indexdata.FieldOverlay {
-	return qv.indexedOverlayByOrdinal(qv.snap.nilIndex, ordinal)
+	return qv.indexedOverlayByOrdinal(qv.snap.NilIndex, ordinal)
 }
 
 func (qv *queryView) nilFieldOverlayRef(field string, ordinal int) indexdata.FieldOverlay {
-	return qv.indexedOverlayRef(qv.snap.nilIndex, field, ordinal)
+	return qv.indexedOverlayRef(qv.snap.NilIndex, field, ordinal)
 }
 
 func (qv *queryView) nilFieldOverlay(field string) indexdata.FieldOverlay {
-	return qv.indexedOverlayByName(qv.snap.nilIndex, field)
+	return qv.indexedOverlayByName(qv.snap.NilIndex, field)
 }
 
 func (qv *queryView) nilFieldOverlayForExpr(expr qir.Expr) indexdata.FieldOverlay {
-	return qv.indexedOverlayForExpr(qv.snap.nilIndex, expr)
+	return qv.indexedOverlayForExpr(qv.snap.NilIndex, expr)
 }
 
 func (qv *queryView) nilFieldOverlayForOrder(order qir.Order) indexdata.FieldOverlay {
-	return qv.indexedOverlayForOrder(qv.snap.nilIndex, order)
+	return qv.indexedOverlayForOrder(qv.snap.NilIndex, order)
 }
 
 func (qv *queryView) lenFieldOverlayByOrdinal(ordinal int) indexdata.FieldOverlay {
-	return qv.indexedOverlayByOrdinal(qv.snap.lenIndex, ordinal)
+	return qv.indexedOverlayByOrdinal(qv.snap.LenIndex, ordinal)
 }
 
 func (qv *queryView) lenFieldOverlayRef(field string, ordinal int) indexdata.FieldOverlay {
-	return qv.indexedOverlayRef(qv.snap.lenIndex, field, ordinal)
+	return qv.indexedOverlayRef(qv.snap.LenIndex, field, ordinal)
 }
 
 func (qv *queryView) lenFieldOverlay(field string) indexdata.FieldOverlay {
-	return qv.indexedOverlayByName(qv.snap.lenIndex, field)
+	return qv.indexedOverlayByName(qv.snap.LenIndex, field)
 }
 
 func (qv *queryView) lenFieldOverlayForExpr(expr qir.Expr) indexdata.FieldOverlay {
-	return qv.indexedOverlayForExpr(qv.snap.lenIndex, expr)
+	return qv.indexedOverlayForExpr(qv.snap.LenIndex, expr)
 }
 
 func (qv *queryView) lenFieldOverlayForOrder(order qir.Order) indexdata.FieldOverlay {
-	return qv.indexedOverlayForOrder(qv.snap.lenIndex, order)
+	return qv.indexedOverlayForOrder(qv.snap.LenIndex, order)
 }
 
 func (qv *queryView) hasIndexedFieldOrdinal(ordinal int) bool {

@@ -9,6 +9,7 @@ import (
 	"github.com/vapstack/rbi/internal/keycodec"
 	"github.com/vapstack/rbi/internal/posting"
 	"github.com/vapstack/rbi/internal/qir"
+	"github.com/vapstack/rbi/internal/snapshot"
 	"go.etcd.io/bbolt"
 )
 
@@ -36,7 +37,7 @@ func (db *DB[K, V]) Query(q *qx.QX) ([]*V, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer db.engine.snapshot.unpinRef(seq, ref)
+	defer db.engine.snapshot.Unpin(seq, ref)
 	defer rollback(tx)
 
 	return db.queryRecords(tx, snap, &viewQ)
@@ -98,41 +99,39 @@ func (qv *queryView) tryQueryEmptyOnSnapshot(q *qir.Shape) (bool, error) {
 	return false, nil
 }
 
-func (db *DB[K, V]) beginQueryTxSnapshot() (*bbolt.Tx, *indexSnapshot, uint64, *snapshotRef, error) {
+func (db *DB[K, V]) beginQueryTxSnapshot() (*bbolt.Tx, *snapshot.View, uint64, *snapshot.Ref, error) {
 	// Hold the registry read lock across Begin(false) -> Sequence() -> pin so a
 	// writer cannot publish/retire away the exact snapshot needed by this read tx
 	// in the gap between opening the tx and pinning its sequence-aligned snapshot.
-	db.engine.snapshot.mu.RLock()
+	guard := db.engine.snapshot.LockPin()
 	tx, err := db.bolt.Begin(false)
 	if err != nil {
-		db.engine.snapshot.mu.RUnlock()
+		guard.Unlock()
 		return nil, nil, 0, nil, fmt.Errorf("tx error: %w", err)
 	}
 
 	bucket := tx.Bucket(db.bucket)
 	if bucket == nil {
-		db.engine.snapshot.mu.RUnlock()
+		guard.Unlock()
 		_ = tx.Rollback()
 		return nil, nil, 0, nil, fmt.Errorf("bucket does not exist")
 	}
 
 	seq := bucket.Sequence()
-	ref := db.engine.snapshot.bySeq[seq]
-	if ref == nil || ref.snap == nil {
-		db.engine.snapshot.mu.RUnlock()
+	snap, ref, ok := guard.PinBySeq(seq)
+	if !ok {
+		guard.Unlock()
 		_ = tx.Rollback()
 		if err = db.unavailableErr(); err != nil {
 			return nil, nil, 0, nil, err
 		}
 		return nil, nil, 0, nil, fmt.Errorf("snapshot sequence %d is not available", seq)
 	}
-	ref.refs.Add(1)
-	snap := ref.snap
-	db.engine.snapshot.mu.RUnlock()
+	guard.Unlock()
 	return tx, snap, seq, ref, nil
 }
 
-func (db *DB[K, V]) queryRecords(tx *bbolt.Tx, snap *indexSnapshot, q *qir.Shape) ([]*V, error) {
+func (db *DB[K, V]) queryRecords(tx *bbolt.Tx, snap *snapshot.View, q *qir.Shape) ([]*V, error) {
 	view := db.engine.makeQueryView(snap)
 	defer db.engine.releaseQueryView(view)
 
@@ -156,7 +155,7 @@ func (db *DB[K, V]) queryRecords(tx *bbolt.Tx, snap *indexSnapshot, q *qir.Shape
 	return values, nil
 }
 
-func (db *DB[K, V]) batchGetTxCompactByIdx(tx *bbolt.Tx, snap *indexSnapshot, ids []uint64) ([]*V, error) {
+func (db *DB[K, V]) batchGetTxCompactByIdx(tx *bbolt.Tx, snap *snapshot.View, ids []uint64) ([]*V, error) {
 	bucket := tx.Bucket(db.bucket)
 	if bucket == nil {
 		return nil, fmt.Errorf("bucket does not exist")
@@ -167,7 +166,7 @@ func (db *DB[K, V]) batchGetTxCompactByIdx(tx *bbolt.Tx, snap *indexSnapshot, id
 
 	out := make([]*V, 0, len(ids))
 	if db.strKey {
-		strmapView := snap.strmap
+		strmapView := snap.StrMap
 		lookup := strmapView.Lookup()
 		for _, idx := range ids {
 			s, ok := lookup.String(idx)
@@ -222,8 +221,8 @@ func (db *DB[K, V]) QueryKeys(q *qx.QX) ([]K, error) {
 	defer prepared.Release()
 	viewQ := qir.NewShape(prepared)
 
-	snap, seq, ref, pinned := db.engine.pinCurrentSnapshot()
-	defer db.engine.unpinCurrentSnapshot(seq, ref, pinned)
+	snap, seq, ref := db.engine.snapshot.PinCurrent()
+	defer db.engine.snapshot.Unpin(seq, ref)
 
 	view := db.engine.makeQueryView(snap)
 	defer db.engine.releaseQueryView(view)
@@ -235,7 +234,7 @@ func (db *DB[K, V]) QueryKeys(q *qx.QX) ([]K, error) {
 	return db.queryKeysFromIDs(snap, ids), nil
 }
 
-func (db *DB[K, V]) queryKeysFromIDs(snap *indexSnapshot, ids []uint64) []K {
+func (db *DB[K, V]) queryKeysFromIDs(snap *snapshot.View, ids []uint64) []K {
 	if len(ids) == 0 {
 		return nil
 	}
@@ -243,7 +242,7 @@ func (db *DB[K, V]) queryKeysFromIDs(snap *indexSnapshot, ids []uint64) []K {
 		return unsafe.Slice((*K)(unsafe.Pointer(&ids[0])), len(ids))
 	}
 	out := make([]K, len(ids))
-	strmapView := snap.strmap
+	strmapView := snap.StrMap
 	lookup := strmapView.Lookup()
 	for i, idx := range ids {
 		s, ok := lookup.String(idx)
@@ -258,8 +257,8 @@ func (db *DB[K, V]) queryKeysFromIDs(snap *indexSnapshot, ids []uint64) []K {
 // execPreparedQuery skips normalize/field-validation and tracing for internal
 // callers that already operate on validated/normalized QX.
 func (db *DB[K, V]) execPreparedQuery(q *qir.Shape) ([]uint64, error) {
-	snap, seq, ref, pinned := db.engine.pinCurrentSnapshot()
-	defer db.engine.unpinCurrentSnapshot(seq, ref, pinned)
+	snap, seq, ref := db.engine.snapshot.PinCurrent()
+	defer db.engine.snapshot.Unpin(seq, ref)
 
 	view := db.engine.makeQueryView(snap)
 	defer db.engine.releaseQueryView(view)

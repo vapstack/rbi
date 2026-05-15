@@ -2196,11 +2196,7 @@ func (qv *queryView) orderedORMaterializedPrefixLeafBuildWork(
 	if estCard == 0 {
 		estCard = 1
 	}
-	cache := qv.snap.matPredCache
-	if cache == nil {
-		return qcache.MaterializedPredKey{}, 0, false
-	}
-	if maxCard := cache.MaxCardinality(); maxCard > 0 && estCard > maxCard {
+	if !qv.snap.AllowsMaterializedPredCard(estCard) {
 		return qcache.MaterializedPredKey{}, 0, false
 	}
 	return core.sharedReuse.cacheKey, estCard, true
@@ -2594,7 +2590,7 @@ func (qv *queryView) shouldEagerMaterializeOrderedORPredicate(
 		return false, false
 	}
 	if !info.cacheKey.IsZero() && qv.snap != nil {
-		if _, hit := qv.snap.loadMaterializedPredKey(info.cacheKey); hit {
+		if _, hit := qv.snap.LoadMaterializedPredKey(info.cacheKey); hit {
 			if !info.isPrefix && !orderedORMaterializedPredicateWarmHitWorth(leafChecks, info.checkWork, info.cachedCheckWork) {
 				return false, false
 			}
@@ -2615,14 +2611,14 @@ func (qv *queryView) shouldEagerMaterializeOrderedORPredicate(
 	if !requiresPromotion && orderedORMaterializedPredicateColdBuildWorth(info.buildWork, info.cachedCheckWork, leafChecks, savedWork) {
 		return true, false
 	}
-	if !qv.snap.shouldPromoteRuntimeMaterializedPredKey(info.cacheKey) {
+	if !qv.snap.ShouldPromoteRuntimeMaterializedPredKey(info.cacheKey) {
 		return false, false
 	}
 	return true, false
 }
 
 func (qv *queryView) maybeWarmMaterializeOrderedORPredicates(q *qir.Shape, branches plannerORBranches, analysis *plannerOROrderAnalysis, trace *queryTrace) bool {
-	if qv.snap == nil || qv.snap.matPredCache == nil || qv.snap.matPredCache.EntryCount() == 0 {
+	if qv.snap == nil || qv.snap.MaterializedPredCacheEntryCount() == 0 {
 		return false
 	}
 	return qv.maybeMaterializeOrderedORPredicates(q, branches, analysis, false, false, trace)
@@ -2964,7 +2960,7 @@ func (qv *queryView) maybeMaterializeOrderedORPredicates(
 }
 
 func (qv *queryView) maybeEagerMaterializeNoOrderORPredicates(q *qir.Shape, branches plannerORBranches) {
-	if q == nil || q.HasOrder || qv.snap == nil || qv.snap.materializedPredCacheLimit() <= 0 || branches.Len() == 0 {
+	if q == nil || q.HasOrder || qv.snap == nil || qv.snap.MaterializedPredCacheLimit() <= 0 || branches.Len() == 0 {
 		return
 	}
 	if !noOrderOREagerMaterializeEligible(branches) {
@@ -3112,10 +3108,10 @@ func (qv *queryView) promoteOrderedORMaterializedBaseOps(
 		if observedWorksBuf[i] == 0 {
 			continue
 		}
-		if _, ok := qv.snap.loadMaterializedPredKey(cacheKeysBuf[i]); ok {
+		if _, ok := qv.snap.LoadMaterializedPredKey(cacheKeysBuf[i]); ok {
 			continue
 		}
-		if !qv.snap.shouldPromoteObservedOrderedORMaterializedPredKey(cacheKeysBuf[i], observedWorksBuf[i], buildWorksBuf[i]) {
+		if !qv.snap.ShouldPromoteObservedOrderedORMaterializedPredKey(cacheKeysBuf[i], observedWorksBuf[i], buildWorksBuf[i]) {
 			continue
 		}
 		branchIdx := repBranchBuf[i]
@@ -3223,10 +3219,10 @@ func (qv *queryView) promoteObservedOrderedORKWayMaterializedBaseOps(
 		if observedWorksBuf[i] == 0 {
 			continue
 		}
-		if _, ok := qv.snap.loadMaterializedPredKey(cacheKeysBuf[i]); ok {
+		if _, ok := qv.snap.LoadMaterializedPredKey(cacheKeysBuf[i]); ok {
 			continue
 		}
-		if !qv.snap.shouldPromoteObservedOrderedORMaterializedPredKey(cacheKeysBuf[i], observedWorksBuf[i], buildWorksBuf[i]) {
+		if !qv.snap.ShouldPromoteObservedOrderedORMaterializedPredKey(cacheKeysBuf[i], observedWorksBuf[i], buildWorksBuf[i]) {
 			continue
 		}
 		branchIdx := repBranchBuf[i]
@@ -3242,7 +3238,7 @@ func (qv *queryView) shouldObserveOrderedORPredicate(p predicate, info orderedOR
 	if !info.isPrefix && info.checkWork == 0 {
 		return false
 	}
-	if _, hit := qv.snap.loadMaterializedPredKey(info.cacheKey); hit {
+	if _, hit := qv.snap.LoadMaterializedPredKey(info.cacheKey); hit {
 		return false
 	}
 	return true
@@ -3328,7 +3324,7 @@ func (qv *queryView) shouldForceORBranchNumericRangeMaterialize(e qir.Expr) bool
 }
 
 func (qv *queryView) shouldBuildORBranchLeafLazy(e qir.Expr, branchLeafCount int) bool {
-	if qv.snap == nil || qv.snap.materializedPredCacheLimit() <= 0 || branchLeafCount <= 1 {
+	if qv.snap == nil || qv.snap.MaterializedPredCacheLimit() <= 0 || branchLeafCount <= 1 {
 		return false
 	}
 	if e.Not || e.FieldOrdinal < 0 || !e.Op.IsNumericRange() {
@@ -3353,12 +3349,12 @@ func (qv *queryView) shouldBuildORBranchLeafLazy(e qir.Expr, branchLeafCount int
 	if key.IsZero() {
 		return false
 	}
-	hot := qv.snap.shouldPromoteRuntimeMaterializedPredKey(key)
+	hot := qv.snap.ShouldPromoteRuntimeMaterializedPredKey(key)
 	if qv.shouldKeepORBranchNumericRangeLazy(e) {
 		if candidate, ok := qv.prepareScalarRangeRoutingCandidate(e); ok &&
 			candidate.plan.useComplement &&
 			!candidate.core.complementCacheKey.IsZero() {
-			qv.snap.shouldPromoteRuntimeMaterializedPredKey(candidate.core.complementCacheKey)
+			qv.snap.ShouldPromoteRuntimeMaterializedPredKey(candidate.core.complementCacheKey)
 		}
 		return true
 	}
@@ -3385,7 +3381,7 @@ func (qv *queryView) mayNeedORBranchRangeRewrite(leaves []qir.Expr) bool {
 		}
 		fm := qv.fieldMetaByExpr(e)
 		if schema.FieldUsesOrderedNumericKeys(fm) {
-			if qv.snap != nil && qv.snap.materializedPredCacheLimit() > 0 {
+			if qv.snap != nil && qv.snap.MaterializedPredCacheLimit() > 0 {
 				return true
 			}
 			if qv.shouldForceORBranchNumericRangeMaterialize(e) {
@@ -5739,7 +5735,7 @@ func (qv *queryView) canPrecountORBranchExpr(e qir.Expr) bool {
 	if cacheKey.IsZero() {
 		return false
 	}
-	_, ok := qv.snap.loadMaterializedPredKey(cacheKey)
+	_, ok := qv.snap.LoadMaterializedPredKey(cacheKey)
 	return ok
 }
 

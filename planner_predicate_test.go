@@ -451,7 +451,7 @@ func TestBuildPredRange_PrefixMaterializationStoredInCache(t *testing.T) {
 	if cacheKey == "" {
 		t.Fatalf("expected non-empty materialized cache key for prefix predicate")
 	}
-	if _, ok := db.engine.getSnapshot().loadMaterializedPred(cacheKey); ok {
+	if _, ok := snapshotExtLoadMaterializedPred(db.engine.snapshot.Current(), cacheKey); ok {
 		t.Fatalf("unexpected cache hit before predicate evaluation")
 	}
 
@@ -476,7 +476,7 @@ func TestBuildPredRange_PrefixMaterializationStoredInCache(t *testing.T) {
 	}
 	releasePredicates([]predicate{p})
 
-	cached, ok := db.engine.getSnapshot().loadMaterializedPred(cacheKey)
+	cached, ok := snapshotExtLoadMaterializedPred(db.engine.snapshot.Current(), cacheKey)
 	if !ok || cached.IsEmpty() {
 		t.Fatalf("expected cached materialized bitmap for prefix predicate")
 	}
@@ -532,10 +532,10 @@ func TestBuildPredRange_PrefixMaterializationSkippedWhenCacheDisabled(t *testing
 	if !ok {
 		t.Fatalf("expected parseable materialized cache key %q", rawKey)
 	}
-	if _, ok := db.engine.getSnapshot().loadMaterializedPredKey(parsedKey); ok {
+	if _, ok := db.engine.snapshot.Current().LoadMaterializedPredKey(parsedKey); ok {
 		t.Fatalf("expected no cache store when materialized predicate cache is disabled")
 	}
-	if cache := db.engine.getSnapshot().matPredCache; cache != nil {
+	if cache := db.engine.snapshot.Current().MaterializedPredCache(); cache != nil {
 		if got := cache.EntryCount(); got != 0 {
 			t.Fatalf("expected zero materialized cache entries, got %d", got)
 		}
@@ -604,9 +604,9 @@ func TestBuildPredRange_BaseNumericPostingFilter_NotComplementMaterializedFallba
 	}
 	defer releasePredicates([]predicate{predFilter})
 
-	snap := db.engine.getSnapshot()
-	want := predicateMatchIDs(predExpected, snap.universe)
-	got := runPredicatePostingFilter(t, predFilter, snap.universe)
+	snap := db.engine.snapshot.Current()
+	want := predicateMatchIDs(predExpected, snap.Universe)
+	got := runPredicatePostingFilter(t, predFilter, snap.Universe)
 	defer got.Release()
 	assertPostingConsumerSet(t, got, want)
 }
@@ -641,9 +641,9 @@ func TestBuildPredRange_OverlayNumericPostingFilter_NotComplementMaterializedFal
 	}
 	defer releasePredicates([]predicate{predFilter})
 
-	snap := db.engine.getSnapshot()
-	want := predicateMatchIDs(predExpected, snap.universe)
-	got := runPredicatePostingFilter(t, predFilter, snap.universe)
+	snap := db.engine.snapshot.Current()
+	want := predicateMatchIDs(predExpected, snap.Universe)
+	got := runPredicatePostingFilter(t, predFilter, snap.Universe)
 	defer got.Release()
 	assertPostingConsumerSet(t, got, want)
 }
@@ -699,9 +699,9 @@ func TestBuildPredRange_OverlayNumericPostingFilter_ComplementMaterializedFallba
 	}
 	defer releasePredicates([]predicate{predFilter})
 
-	snap := db.engine.getSnapshot()
-	want := predicateMatchIDs(predExpected, snap.universe)
-	got := runPredicatePostingFilter(t, predFilter, snap.universe)
+	snap := db.engine.snapshot.Current()
+	want := predicateMatchIDs(predExpected, snap.Universe)
+	got := runPredicatePostingFilter(t, predFilter, snap.Universe)
 	defer got.Release()
 	assertPostingConsumerSet(t, got, want)
 }
@@ -850,7 +850,7 @@ func TestBuildPredicateWithMode_AllowMaterializeSkipsColdNumericRangeUnionWhenPo
 	if p.kind == predicateKindMaterialized || p.kind == predicateKindMaterializedNot {
 		t.Fatalf("unexpected eager materialized predicate kind=%v", p.kind)
 	}
-	if got := db.engine.getSnapshot().matPredCache.EntryCount(); got != 0 {
+	if got := db.engine.snapshot.Current().MaterializedPredCache().EntryCount(); got != 0 {
 		t.Fatalf("unexpected shared materialized predicate cache entry: %d", got)
 	}
 }
@@ -885,7 +885,7 @@ func TestBuildPredicateWithMode_RuntimeNumericRangeMaterializationKeepsScalarCac
 		if p.overlayState == nil {
 			t.Fatalf("expected chunked numeric range to stay on overlay runtime state")
 		}
-		if got := db.engine.getSnapshot().matPredCache.EntryCount(); got != 0 {
+		if got := db.engine.snapshot.Current().MaterializedPredCache().EntryCount(); got != 0 {
 			t.Fatalf("unexpected shared materialized predicate cache before runtime materialization: %d", got)
 		}
 		matchCalls := max(128, p.overlayState.materializeAfter+1)
@@ -901,10 +901,10 @@ func TestBuildPredicateWithMode_RuntimeNumericRangeMaterializationKeepsScalarCac
 		if p.overlayState.probeMaterialized && p.overlayState.probeIDs.IsEmpty() {
 			t.Fatalf("expected locally materialized overlay probe ids")
 		}
-		if got := db.engine.getSnapshot().matPredCache.EntryCount(); got != 0 {
+		if got := db.engine.snapshot.Current().MaterializedPredCache().EntryCount(); got != 0 {
 			t.Fatalf("unexpected shared scalar cache entry from runtime overlay materialization: %d", got)
 		}
-		if cached, ok := db.engine.getSnapshot().loadMaterializedPred(cacheKey); ok && !cached.IsEmpty() {
+		if cached, ok := snapshotExtLoadMaterializedPred(db.engine.snapshot.Current(), cacheKey); ok && !cached.IsEmpty() {
 			t.Fatalf("unexpected shared scalar cache entry from runtime overlay materialization")
 		}
 	})
@@ -938,16 +938,16 @@ func TestBuildPredicateWithMode_RuntimeNumericRangeMaterializationKeepsScalarCac
 		if p.overlayState == nil {
 			t.Fatalf("expected numeric range to stay on runtime overlay state")
 		}
-		if got := db.engine.getSnapshot().matPredCache.EntryCount(); got != 0 {
+		if got := db.engine.snapshot.Current().MaterializedPredCache().EntryCount(); got != 0 {
 			t.Fatalf("unexpected shared materialized predicate cache before runtime materialization: %d", got)
 		}
 		for i := 1; i <= 128; i++ {
 			_ = p.matches(uint64(i))
 		}
-		if got := db.engine.getSnapshot().matPredCache.EntryCount(); got != 0 {
+		if got := db.engine.snapshot.Current().MaterializedPredCache().EntryCount(); got != 0 {
 			t.Fatalf("unexpected shared scalar cache entry from runtime overlay materialization: %d", got)
 		}
-		if cached, ok := db.engine.getSnapshot().loadMaterializedPred(cacheKey); ok && !cached.IsEmpty() {
+		if cached, ok := snapshotExtLoadMaterializedPred(db.engine.snapshot.Current(), cacheKey); ok && !cached.IsEmpty() {
 			t.Fatalf("unexpected shared scalar cache entry from runtime overlay materialization")
 		}
 	})
@@ -1000,7 +1000,7 @@ func TestBuildPredRange_BroadPositiveRuntimeKeepsComplementCacheLocal(t *testing
 	if !p.overlayState.probe.useComplement {
 		t.Fatalf("expected broad positive range to use complement probe")
 	}
-	if got := db.engine.getSnapshot().matPredCache.EntryCount(); got != 0 {
+	if got := db.engine.snapshot.Current().MaterializedPredCache().EntryCount(); got != 0 {
 		t.Fatalf("unexpected shared materialized predicate cache before runtime materialization: %d", got)
 	}
 
@@ -1008,13 +1008,13 @@ func TestBuildPredRange_BroadPositiveRuntimeKeepsComplementCacheLocal(t *testing
 		_ = p.matches(uint64(i))
 	}
 
-	if got := db.engine.getSnapshot().matPredCache.EntryCount(); got != 0 {
+	if got := db.engine.snapshot.Current().MaterializedPredCache().EntryCount(); got != 0 {
 		t.Fatalf("expected complement-backed runtime matches to stay local, cacheCount=%d", got)
 	}
-	if _, ok := db.engine.getSnapshot().loadMaterializedPred(fullCacheKey); ok {
+	if _, ok := snapshotExtLoadMaterializedPred(db.engine.snapshot.Current(), fullCacheKey); ok {
 		t.Fatalf("unexpected positive scalar cache entry for complement-backed runtime state")
 	}
-	if _, ok := db.engine.getSnapshot().loadMaterializedPred(complementCacheKey); ok {
+	if _, ok := snapshotExtLoadMaterializedPred(db.engine.snapshot.Current(), complementCacheKey); ok {
 		t.Fatalf("unexpected shared complement cache entry from runtime overlay materialization")
 	}
 }
@@ -1075,10 +1075,10 @@ func TestBuildPredRange_BroadPositivePostingFilterKeepsComplementCacheLocal(t *t
 		next.Release()
 	}
 
-	if got := db.engine.getSnapshot().matPredCache.EntryCount(); got != 0 {
+	if got := db.engine.snapshot.Current().MaterializedPredCache().EntryCount(); got != 0 {
 		t.Fatalf("expected complement-backed posting filters to stay local, cacheCount=%d", got)
 	}
-	if _, ok := db.engine.getSnapshot().loadMaterializedPred(complementCacheKey); ok {
+	if _, ok := snapshotExtLoadMaterializedPred(db.engine.snapshot.Current(), complementCacheKey); ok {
 		t.Fatalf("unexpected shared complement cache entry from posting-filter path")
 	}
 }
@@ -1127,7 +1127,7 @@ func TestBuildPredicatesOrdered_BroadComplementMaterializesOnFirstSightWhenCostW
 	if preds1[0].kind != predicateKindMaterializedNot {
 		t.Fatalf("expected first ordered broad complement to materialize, got kind=%v", preds1[0].kind)
 	}
-	if _, ok := db.engine.getSnapshot().loadMaterializedPred(cacheKey); !ok {
+	if _, ok := snapshotExtLoadMaterializedPred(db.engine.snapshot.Current(), cacheKey); !ok {
 		t.Fatalf("expected shared complement cache entry after first ordered build")
 	}
 
@@ -1142,7 +1142,7 @@ func TestBuildPredicatesOrdered_BroadComplementMaterializesOnFirstSightWhenCostW
 	if preds2[0].kind != predicateKindMaterializedNot {
 		t.Fatalf("expected second ordered broad complement to materialize, got kind=%v", preds2[0].kind)
 	}
-	if _, ok := db.engine.getSnapshot().loadMaterializedPred(cacheKey); !ok {
+	if _, ok := snapshotExtLoadMaterializedPred(db.engine.snapshot.Current(), cacheKey); !ok {
 		t.Fatalf("expected shared complement cache entry after second ordered build")
 	}
 }
@@ -1185,7 +1185,7 @@ func TestBuildPredicatesOrdered_BroadComplementWarmCacheHitLoadsWhenOrderedEager
 		t.Fatalf("warm buildPredicatesOrderedWithMode: ok=false")
 	}
 	releasePredicates(warm)
-	if _, ok := db.engine.getSnapshot().loadMaterializedPred(cacheKey); !ok {
+	if _, ok := snapshotExtLoadMaterializedPred(db.engine.snapshot.Current(), cacheKey); !ok {
 		t.Fatalf("expected shared complement cache entry after warm build")
 	}
 
@@ -1243,7 +1243,7 @@ func TestBuildPredicatesOrdered_CoverOrderRangeBroadComplementWarmCacheHitLoadsW
 		t.Fatalf("warm buildPredicatesOrderedWithMode: ok=false")
 	}
 	releasePredicates(warm)
-	if _, ok := db.engine.getSnapshot().loadMaterializedPred(cacheKey); !ok {
+	if _, ok := snapshotExtLoadMaterializedPred(db.engine.snapshot.Current(), cacheKey); !ok {
 		t.Fatalf("expected shared complement cache entry after warm build")
 	}
 
@@ -1305,7 +1305,7 @@ func TestBuildPredicatesOrdered_CoveredExactRangeWarmCacheHitLoadsWhenPredicateS
 		t.Fatalf("expected merged exact-range warm predicate to materialize")
 	}
 	releasePredicates(warm)
-	cached, ok := db.engine.getSnapshot().loadMaterializedPredKey(cacheKey)
+	cached, ok := db.engine.snapshot.Current().LoadMaterializedPredKey(cacheKey)
 	if !ok || cached.IsEmpty() {
 		t.Fatalf("expected shared merged exact-range complement cache entry after warm materialization")
 	}
@@ -1374,7 +1374,7 @@ func TestBuildPredicatesOrderedBuf_CoveredExactRangeWarmCacheHitLoadsWhenPredica
 		t.Fatalf("expected merged exact-range warm predicate to materialize")
 	}
 	warm.Release()
-	cached, ok := db.engine.getSnapshot().loadMaterializedPredKey(cacheKey)
+	cached, ok := db.engine.snapshot.Current().LoadMaterializedPredKey(cacheKey)
 	if !ok || cached.IsEmpty() {
 		t.Fatalf("expected shared merged exact-range complement cache entry after warm materialization")
 	}
@@ -1444,7 +1444,7 @@ func TestBuildPredicatesOrdered_BroadComplementStaysDeferredWhenOrderedEagerMate
 	if !preds[0].hasRuntimeRangeState() {
 		t.Fatalf("expected deferred ordered broad complement to keep runtime range state")
 	}
-	if _, ok := db.engine.getSnapshot().loadMaterializedPred(cacheKey); ok {
+	if _, ok := snapshotExtLoadMaterializedPred(db.engine.snapshot.Current(), cacheKey); ok {
 		t.Fatalf("unexpected shared complement cache entry with eager materialization disabled")
 	}
 }
@@ -1631,7 +1631,7 @@ func TestMaterializeOrderedORPredicate_ExactRangeComplementSharesCache(t *testin
 		t.Fatalf("expected complement-backed materialized predicate, got kind=%v", p.kind)
 	}
 
-	cached, ok := db.engine.getSnapshot().loadMaterializedPredKey(cacheKey)
+	cached, ok := db.engine.snapshot.Current().LoadMaterializedPredKey(cacheKey)
 	if !ok || cached.IsEmpty() {
 		t.Fatal("expected shared exact-range complement cache entry after materialization")
 	}
@@ -1888,7 +1888,7 @@ func TestBuildPredicatesOrdered_MergedExactComplementWarmCacheHitLoadsWhenOrdere
 		t.Fatalf("unexpected exact-range complement cache key after materialization: got=%q want=%q", gotKey.String(), cacheKey.String())
 	}
 	releasePredicates(warm)
-	cached, ok := db.engine.getSnapshot().loadMaterializedPredKey(cacheKey)
+	cached, ok := db.engine.snapshot.Current().LoadMaterializedPredKey(cacheKey)
 	if !ok || cached.IsEmpty() {
 		t.Fatalf("expected shared merged exact-range complement cache entry after warm materialization")
 	}
@@ -1981,7 +1981,7 @@ func TestBuildPredicatesOrdered_MergedExactNonBroadComplementWarmCacheHitLoadsWh
 	}
 	releasePredicates(warm)
 
-	cached, ok := db.engine.getSnapshot().loadMaterializedPredKey(cacheKey)
+	cached, ok := db.engine.snapshot.Current().LoadMaterializedPredKey(cacheKey)
 	if !ok || cached.IsEmpty() {
 		t.Fatalf("expected shared merged exact-range complement cache entry after warm materialization")
 	}
@@ -2046,7 +2046,7 @@ func TestBuildPredicatesOrdered_CoverOrderRangeMergedExactComplementWarmCacheHit
 		t.Fatalf("expected merged exact-range warm predicate to materialize")
 	}
 	releasePredicates(warm)
-	cached, ok := db.engine.getSnapshot().loadMaterializedPredKey(cacheKey)
+	cached, ok := db.engine.snapshot.Current().LoadMaterializedPredKey(cacheKey)
 	if !ok || cached.IsEmpty() {
 		t.Fatalf("expected shared merged exact-range complement cache entry after warm materialization")
 	}
@@ -2157,7 +2157,7 @@ func TestBuildPredicateWithMode_RuntimeExactUnionPromotesOnSecondMaterialize(t *
 		}
 
 		first := materialize()
-		if _, ok := db.engine.getSnapshot().loadMaterializedPredKey(cacheKey); ok {
+		if _, ok := db.engine.snapshot.Current().LoadMaterializedPredKey(cacheKey); ok {
 			releasePredicates([]predicate{first})
 			t.Fatalf("unexpected shared exact-union cache entry after first materialize")
 		}
@@ -2166,7 +2166,7 @@ func TestBuildPredicateWithMode_RuntimeExactUnionPromotesOnSecondMaterialize(t *
 		second := materialize()
 		releasePredicates([]predicate{second})
 
-		cached, ok := db.engine.getSnapshot().loadMaterializedPredKey(cacheKey)
+		cached, ok := db.engine.snapshot.Current().LoadMaterializedPredKey(cacheKey)
 		if !ok || cached.IsEmpty() {
 			t.Fatalf("expected shared exact-union cache entry after second materialize")
 		}
@@ -2358,7 +2358,7 @@ func TestBuildPredicateWithMode_HasPromotesOnSecondBuild(t *testing.T) {
 		t.Fatalf("expected second predicate to hold materialized ids")
 	}
 
-	cached, ok := db.engine.getSnapshot().loadMaterializedPredKey(cacheKey)
+	cached, ok := db.engine.snapshot.Current().LoadMaterializedPredKey(cacheKey)
 	if !ok || cached.IsEmpty() {
 		t.Fatalf("expected shared HAS cache entry after second build")
 	}
@@ -2473,7 +2473,7 @@ func TestOrderedScalarRangeCanEagerMaterialize_UsesComplementPromotionKey(t *tes
 	if view.orderedScalarRangeCanEagerMaterialize(route) {
 		t.Fatalf("expected cold complement promotion gate to stay disabled")
 	}
-	if !db.engine.getSnapshot().shouldPromoteRuntimeMaterializedPredKey(route.complementCacheKey) {
+	if !db.engine.snapshot.Current().ShouldPromoteRuntimeMaterializedPredKey(route.complementCacheKey) {
 		t.Fatalf("expected warmed complement key to trigger promotion gate")
 	}
 	if !view.orderedScalarRangeCanEagerMaterialize(route) {

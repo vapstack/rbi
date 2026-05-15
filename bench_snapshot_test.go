@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/vapstack/qx"
+	"github.com/vapstack/rbi/internal/snapshot"
 )
 
 type benchCacheModeKind uint8
@@ -42,8 +43,8 @@ type benchTurnoverRing[K ~string | ~uint64] struct {
 }
 
 type benchPinnedSnapshot struct {
-	seq uint64
-	ref *snapshotRef
+	Seq uint64
+	ref *snapshot.Ref
 }
 
 type benchReadRunner[K ~string | ~uint64, V any] func(*testing.B, *DB[K, V], *qx.QX)
@@ -103,16 +104,16 @@ func (s *benchReadModeState[K, V]) beforeQuery(b *testing.B, db *DB[K, V]) {
 	switch s.mode.kind {
 	case benchCacheModeColdFresh:
 		s.applyTurnover(b, db)
-		db.engine.getSnapshot().clearRuntimeCachesForTesting()
+		db.engine.snapshot.Current().ClearRuntimeCaches()
 	case benchCacheModeCold:
 		s.applyTurnover(b, db)
 	case benchCacheModeColdPinned:
-		s.pinCurrentSnapshot(b, db)
+		s.pinCurrentView(b, db)
 		s.applyTurnover(b, db)
 		if len(s.pinned) > benchPinnedSnapshotLimit {
 			oldest := s.pinned[0]
 			s.pinned = s.pinned[1:]
-			db.engine.snapshot.unpinRef(oldest.seq, oldest.ref)
+			db.engine.snapshot.Unpin(oldest.Seq, oldest.ref)
 		}
 	}
 	b.StartTimer()
@@ -123,7 +124,7 @@ func (s *benchReadModeState[K, V]) close(tb testing.TB, db *DB[K, V]) {
 		return
 	}
 	for i := range s.pinned {
-		db.engine.snapshot.unpinRef(s.pinned[i].seq, s.pinned[i].ref)
+		db.engine.snapshot.Unpin(s.pinned[i].Seq, s.pinned[i].ref)
 	}
 	s.pinned = s.pinned[:0]
 }
@@ -144,14 +145,14 @@ func (s *benchReadModeState[K, V]) applyTurnover(tb testing.TB, db *DB[K, V]) {
 	entry.altActive = !entry.altActive
 }
 
-func (s *benchReadModeState[K, V]) pinCurrentSnapshot(tb testing.TB, db *DB[K, V]) {
+func (s *benchReadModeState[K, V]) pinCurrentView(tb testing.TB, db *DB[K, V]) {
 	tb.Helper()
-	snap := db.engine.getSnapshot()
-	got, ref, ok := db.engine.snapshot.pinRefBySeq(snap.seq)
+	snap := db.engine.snapshot.Current()
+	got, ref, ok := db.engine.snapshot.PinBySeq(snap.Seq)
 	if !ok || got != snap || ref == nil {
-		tb.Fatalf("pinSnapshotRefBySeq(seq=%d) failed", snap.seq)
+		tb.Fatalf("PinBySeq(seq=%d) failed", snap.Seq)
 	}
-	s.pinned = append(s.pinned, benchPinnedSnapshot{seq: snap.seq, ref: ref})
+	s.pinned = append(s.pinned, benchPinnedSnapshot{Seq: snap.Seq, ref: ref})
 }
 
 func (s *benchReadModeState[K, V]) warmPools(
@@ -183,10 +184,10 @@ func warmBenchReadHotSteady[K ~string | ~uint64, V any](
 		return
 	}
 	stable := 0
-	prevCount := db.engine.getSnapshot().matPredCache.EntryCount()
+	prevCount := db.engine.snapshot.Current().MaterializedPredCache().EntryCount()
 	for i := 0; i < benchHotWarmMaxCycles; i++ {
 		run(b, db, q)
-		count := db.engine.getSnapshot().matPredCache.EntryCount()
+		count := db.engine.snapshot.Current().MaterializedPredCache().EntryCount()
 		if count == prevCount {
 			stable++
 			if stable >= benchHotWarmStableCycles {
@@ -348,7 +349,7 @@ func stressBenchAltPatch(rec *StressBenchUser) []Field {
 
 func buildUserBenchTurnoverRingUint64(tb testing.TB, db *DB[uint64, UserBench]) *benchTurnoverRing[uint64] {
 	tb.Helper()
-	total := int(db.engine.getSnapshot().universe.Cardinality())
+	total := int(db.engine.snapshot.Current().Universe.Cardinality())
 	ords := benchTurnoverSampleOrdinals(total, benchTurnoverRingSize)
 	entries := make([]benchTurnoverEntry[uint64], 0, len(ords))
 	for _, ord := range ords {
@@ -372,7 +373,7 @@ func buildUserBenchTurnoverRingUint64(tb testing.TB, db *DB[uint64, UserBench]) 
 
 func buildUserBenchTurnoverRingString(tb testing.TB, db *DB[string, UserBench]) *benchTurnoverRing[string] {
 	tb.Helper()
-	total := int(db.engine.getSnapshot().universe.Cardinality())
+	total := int(db.engine.snapshot.Current().Universe.Cardinality())
 	ords := benchTurnoverSampleOrdinals(total, benchTurnoverRingSize)
 	entries := make([]benchTurnoverEntry[string], 0, len(ords))
 	for _, ord := range ords {
@@ -396,7 +397,7 @@ func buildUserBenchTurnoverRingString(tb testing.TB, db *DB[string, UserBench]) 
 
 func buildStressBenchTurnoverRing(tb testing.TB, db *DB[uint64, StressBenchUser]) *benchTurnoverRing[uint64] {
 	tb.Helper()
-	total := int(db.engine.getSnapshot().universe.Cardinality())
+	total := int(db.engine.snapshot.Current().Universe.Cardinality())
 	ords := benchTurnoverSampleOrdinals(total, benchTurnoverRingSize)
 	entries := make([]benchTurnoverEntry[uint64], 0, len(ords))
 	for _, ord := range ords {
@@ -457,15 +458,15 @@ func TestBenchMode_ColdFreshPublishesAndClearsNewSnapshotCaches(t *testing.T) {
 	if _, err := db.QueryKeys(q); err != nil {
 		t.Fatalf("warm QueryKeys: %v", err)
 	}
-	oldSnap := db.engine.getSnapshot()
-	if oldSnap.matPredCache.EntryCount() == 0 {
+	oldSnap := db.engine.snapshot.Current()
+	if oldSnap.MaterializedPredCache().EntryCount() == 0 {
 		t.Fatalf("expected warm snapshot to populate materialized predicate cache")
 	}
-	heldSnap, heldRef, ok := db.engine.snapshot.pinRefBySeq(oldSnap.seq)
+	heldSnap, heldRef, ok := db.engine.snapshot.PinBySeq(oldSnap.Seq)
 	if !ok || heldSnap != oldSnap || heldRef == nil {
-		t.Fatalf("pinSnapshotRefBySeq(seq=%d) failed", oldSnap.seq)
+		t.Fatalf("PinBySeq(seq=%d) failed", oldSnap.Seq)
 	}
-	defer db.engine.snapshot.unpinRef(oldSnap.seq, heldRef)
+	defer db.engine.snapshot.Unpin(oldSnap.Seq, heldRef)
 	state := newBenchReadModeState[uint64, UserBench](
 		t,
 		benchCacheMode{suffix: "ColdFresh", kind: benchCacheModeColdFresh},
@@ -474,14 +475,14 @@ func TestBenchMode_ColdFreshPublishesAndClearsNewSnapshotCaches(t *testing.T) {
 	t.Cleanup(func() { state.close(t, db) })
 	runBenchModeBeforeQueryForTest(t, db, state)
 
-	newSnap := db.engine.getSnapshot()
-	if newSnap == oldSnap || newSnap.seq == oldSnap.seq {
+	newSnap := db.engine.snapshot.Current()
+	if newSnap == oldSnap || newSnap.Seq == oldSnap.Seq {
 		t.Fatalf("expected ColdFresh to publish a new snapshot")
 	}
-	if newSnap.matPredCache.EntryCount() != 0 {
-		t.Fatalf("expected ColdFresh to clear new snapshot caches, got=%d", newSnap.matPredCache.EntryCount())
+	if newSnap.MaterializedPredCache().EntryCount() != 0 {
+		t.Fatalf("expected ColdFresh to clear new snapshot caches, got=%d", newSnap.MaterializedPredCache().EntryCount())
 	}
-	if oldSnap.matPredCache.EntryCount() == 0 {
+	if oldSnap.MaterializedPredCache().EntryCount() == 0 {
 		t.Fatalf("expected old snapshot caches to remain intact")
 	}
 }
@@ -502,8 +503,8 @@ func TestBenchMode_ColdInheritsUnchangedFieldCaches(t *testing.T) {
 	if _, err := db.QueryKeys(qx.Query(expr)); err != nil {
 		t.Fatalf("warm QueryKeys: %v", err)
 	}
-	oldSnap := db.engine.getSnapshot()
-	if _, ok := oldSnap.loadMaterializedPred(cacheKey); !ok {
+	oldSnap := db.engine.snapshot.Current()
+	if _, ok := snapshotExtLoadMaterializedPred(oldSnap, cacheKey); !ok {
 		t.Fatalf("expected old snapshot cache hit before turnover")
 	}
 	state := newBenchReadModeState[uint64, UserBench](
@@ -514,11 +515,11 @@ func TestBenchMode_ColdInheritsUnchangedFieldCaches(t *testing.T) {
 	t.Cleanup(func() { state.close(t, db) })
 	runBenchModeBeforeQueryForTest(t, db, state)
 
-	newSnap := db.engine.getSnapshot()
-	if newSnap == oldSnap || newSnap.seq == oldSnap.seq {
+	newSnap := db.engine.snapshot.Current()
+	if newSnap == oldSnap || newSnap.Seq == oldSnap.Seq {
 		t.Fatalf("expected Cold to publish a new snapshot")
 	}
-	if _, ok := newSnap.loadMaterializedPred(cacheKey); !ok {
+	if _, ok := snapshotExtLoadMaterializedPred(newSnap, cacheKey); !ok {
 		t.Fatalf("expected unchanged-field materialized cache to survive turnover")
 	}
 }
@@ -559,16 +560,16 @@ func runBenchModeBeforeQueryForTest[K ~string | ~uint64, V any](tb testing.TB, d
 	switch state.mode.kind {
 	case benchCacheModeColdFresh:
 		state.applyTurnover(tb, db)
-		db.engine.getSnapshot().clearRuntimeCachesForTesting()
+		db.engine.snapshot.Current().ClearRuntimeCaches()
 	case benchCacheModeCold:
 		state.applyTurnover(tb, db)
 	case benchCacheModeColdPinned:
-		state.pinCurrentSnapshot(tb, db)
+		state.pinCurrentView(tb, db)
 		state.applyTurnover(tb, db)
 		if len(state.pinned) > benchPinnedSnapshotLimit {
 			oldest := state.pinned[0]
 			state.pinned = state.pinned[1:]
-			db.engine.snapshot.unpinRef(oldest.seq, oldest.ref)
+			db.engine.snapshot.Unpin(oldest.Seq, oldest.ref)
 		}
 	}
 }

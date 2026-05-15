@@ -165,6 +165,7 @@ var (
 	fieldIndexChunkRefSlicePool     = pooled.NewSlicePool[fieldIndexChunkRef](1<<8, pooled.ClearCap)
 	fieldIndexChunkDirPageSlicePool = pooled.NewSlicePool[*fieldIndexChunkDirPage](16<<10, pooled.ClearCap)
 	measureEntrySlicePool           = pooled.NewSlicePool[MeasureEntry](16<<10, pooled.NoClear)
+	measureEntrySlotSlicePool       = pooled.NewSlicePool[[]MeasureEntry](4<<10, pooled.ClearCap, ReleaseMeasureEntryBufs)
 	measureBatchDeltaSlicePool      = pooled.NewSlicePool[MeasureDelta](8<<10, pooled.NoClear)
 	measureDeltaSlotSlicePool       = pooled.NewSlicePool[[]MeasureDelta](4<<10, pooled.ClearCap)
 	measureStorageSlicePool         = pooled.NewSlicePool[MeasureStorage](4<<10, pooled.ClearCap)
@@ -187,6 +188,9 @@ func ReleaseFieldEntrySlice(buf []Entry)     { fieldEntrySlicePool.Put(buf) }
 
 func GetBatchPostingDeltaMap() map[uint64]BatchPostingDelta      { return batchPostingDeltaMapPool.Get() }
 func ReleaseBatchPostingDeltaMap(m map[uint64]BatchPostingDelta) { batchPostingDeltaMapPool.Put(m) }
+
+func GetLenPostingMap(capHint int) map[uint32]posting.List { return lenPostingMapPool.Get(capHint) }
+func ReleaseLenPostingMap(m map[uint32]posting.List)       { lenPostingMapPool.Put(m) }
 
 // todo: rework this >>
 
@@ -212,6 +216,11 @@ func releaseOwnedFieldIndexChunkRefSlice(buf []fieldIndexChunkRef) {
 
 func GetMeasureEntrySlice(hint int) []MeasureEntry { return measureEntrySlicePool.Get(hint) }
 func ReleaseMeasureEntrySlice(buf []MeasureEntry)  { measureEntrySlicePool.Put(buf) }
+
+func GetMeasureEntrySlots(hint int) [][]MeasureEntry {
+	return measureEntrySlotSlicePool.Get(hint)[:hint]
+}
+func ReleaseMeasureEntrySlots(slots [][]MeasureEntry) { measureEntrySlotSlicePool.Put(slots) }
 
 func GetMeasureDeltaSlice(hint int) []MeasureDelta { return measureBatchDeltaSlicePool.Get(hint) }
 func ReleaseMeasureDeltaSlice(buf []MeasureDelta)  { measureBatchDeltaSlicePool.Put(buf) }

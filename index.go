@@ -22,6 +22,7 @@ import (
 	"github.com/vapstack/rbi/internal/pooled"
 	"github.com/vapstack/rbi/internal/posting"
 	"github.com/vapstack/rbi/internal/schema"
+	"github.com/vapstack/rbi/internal/snapshot"
 	"github.com/vapstack/rbi/internal/strmap"
 	"go.etcd.io/bbolt"
 )
@@ -206,7 +207,19 @@ func (qe *queryEngine) buildIndex(
 	mcnt := len(activeMeasures)
 	if fcnt <= 0 && mcnt <= 0 {
 		if !qe.lenIndexLoaded {
-			qe.buildLenIndex()
+			seq, err := currentBucketSequence(bolt, bucket)
+			if err != nil {
+				return buildIndexResult{}, err
+			}
+			nextLenIndex, nextLenZeroComplement := qe.buildLenIndexStorage(qe.index, qe.universe)
+			qe.publishStorageSnapshotNoLock(seq, strMap, snapshot.Storage{
+				Index:             indexdata.CloneFieldStorageSlots(qe.index, len(qe.schema.Indexed)),
+				NilIndex:          indexdata.CloneFieldStorageSlots(qe.nilIndex, len(qe.schema.Indexed)),
+				LenIndex:          nextLenIndex,
+				LenZeroComplement: nextLenZeroComplement,
+				Measure:           indexdata.CloneMeasureStorageSlots(qe.measure, len(qe.schema.Measures)),
+				Universe:          qe.universe,
+			})
 		}
 		qe.lenIndexLoaded = false
 		return buildIndexResult{}, nil
@@ -395,81 +408,107 @@ func (qe *queryEngine) buildIndex(
 		}
 	}
 
-	slotCount := len(qe.schema.Indexed)
-	if qe.index == nil || len(qe.index) != slotCount {
-		indexdata.ReleaseFieldStorageSlots(qe.index)
-		qe.index = indexdata.GetFieldStorageSlice(slotCount)[:slotCount]
-	}
-	if qe.nilIndex == nil || len(qe.nilIndex) != slotCount {
-		indexdata.ReleaseFieldStorageSlots(qe.nilIndex)
-		qe.nilIndex = indexdata.GetFieldStorageSlice(slotCount)[:slotCount]
-	}
-	if qe.lenIndex == nil || len(qe.lenIndex) != slotCount {
-		indexdata.ReleaseFieldStorageSlots(qe.lenIndex)
-		qe.lenIndex = indexdata.GetFieldStorageSlice(slotCount)[:slotCount]
-	}
-	if len(qe.lenZeroComplement) != slotCount {
-		if qe.lenZeroComplement != nil {
-			pooled.ReleaseBoolSlice(qe.lenZeroComplement)
-		}
-		qe.lenZeroComplement = pooled.GetBoolSlice(slotCount)[:slotCount]
-		clear(qe.lenZeroComplement)
-	} else if len(skipFields) == 0 {
-		clear(qe.lenZeroComplement)
-	} else {
-		for i := range active {
-			qe.lenZeroComplement[active[i].acc.Ordinal] = false
-		}
-	}
-	if qe.measure == nil || len(qe.measure) != len(qe.schema.Measures) {
-		indexdata.ReleaseMeasureStorageSlots(qe.measure)
-		measureSlotCount := len(qe.schema.Measures)
-		qe.measure = indexdata.GetMeasureStorageSlice(measureSlotCount)[:measureSlotCount]
+	seq, err := currentBucketSequence(bolt, bucket)
+	if err != nil {
+		return buildIndexResult{}, err
 	}
 
-	qe.universe = posting.List{}
+	slotCount := len(qe.schema.Indexed)
+	firstFullBuild := qe.snapshot.Current() == nil && len(skipFields) == 0 && len(skipMeasureFields) == 0
+	var nextIndex []indexdata.FieldStorage
+	if firstFullBuild {
+		for i := range qe.index {
+			qe.index[i].Release()
+			qe.index[i] = indexdata.FieldStorage{}
+		}
+		nextIndex = qe.index
+	} else if len(skipFields) == 0 {
+		nextIndex = indexdata.GetFieldStorageSlice(slotCount)[:slotCount]
+	} else {
+		nextIndex = indexdata.CloneFieldStorageSlots(qe.index, slotCount)
+	}
+	var nextNilIndex []indexdata.FieldStorage
+	if firstFullBuild {
+		for i := range qe.nilIndex {
+			qe.nilIndex[i].Release()
+			qe.nilIndex[i] = indexdata.FieldStorage{}
+		}
+		nextNilIndex = qe.nilIndex
+	} else if len(skipFields) == 0 {
+		nextNilIndex = indexdata.GetFieldStorageSlice(slotCount)[:slotCount]
+	} else {
+		nextNilIndex = indexdata.CloneFieldStorageSlots(qe.nilIndex, slotCount)
+	}
+	var nextLenIndex []indexdata.FieldStorage
+	var nextLenZeroComplement []bool
+	if firstFullBuild {
+		for i := range qe.lenIndex {
+			qe.lenIndex[i].Release()
+			qe.lenIndex[i] = indexdata.FieldStorage{}
+		}
+		nextLenIndex = qe.lenIndex
+		nextLenZeroComplement = qe.lenZeroComplement
+		clear(nextLenZeroComplement)
+	} else if len(skipFields) == 0 {
+		nextLenIndex = indexdata.GetFieldStorageSlice(slotCount)[:slotCount]
+		nextLenZeroComplement = pooled.GetBoolSlice(slotCount)[:slotCount]
+		clear(nextLenZeroComplement)
+	} else {
+		nextLenIndex = indexdata.CloneFieldStorageSlots(qe.lenIndex, slotCount)
+		nextLenZeroComplement = pooled.GetBoolSlice(slotCount)[:slotCount]
+		clear(nextLenZeroComplement)
+		copy(nextLenZeroComplement, qe.lenZeroComplement[:min(slotCount, len(qe.lenZeroComplement))])
+	}
+	measureSlotCount := len(qe.schema.Measures)
+	var nextMeasure []indexdata.MeasureStorage
+	if firstFullBuild {
+		for i := range qe.measure {
+			qe.measure[i].Release()
+			qe.measure[i] = indexdata.MeasureStorage{}
+		}
+		nextMeasure = qe.measure
+		qe.universe.Release()
+		qe.universe = posting.List{}
+	} else if len(skipMeasureFields) == 0 {
+		nextMeasure = indexdata.GetMeasureStorageSlice(measureSlotCount)[:measureSlotCount]
+	} else {
+		nextMeasure = indexdata.CloneMeasureStorageSlots(qe.measure, measureSlotCount)
+	}
+
+	nextUniverse := posting.List{}
 	for i := range localUniverse {
 		if localUniverse[i].IsEmpty() {
 			continue
 		}
-		qe.universe = qe.universe.BuildMergedOwned(localUniverse[i])
+		nextUniverse = nextUniverse.BuildMergedOwned(localUniverse[i])
+		localUniverse[i] = posting.List{}
 	}
 
 	for i := range fieldStates {
 		ordinal := active[i].acc.Ordinal
-		oldIndexStorage := qe.index[ordinal]
 		if storage := fieldStates[i].MaterializeStorage(); storage.KeyCount() > 0 {
-			oldIndexStorage.Release()
-			qe.index[ordinal] = storage
+			nextIndex[ordinal] = storage
 		} else {
-			oldIndexStorage.Release()
-			qe.index[ordinal] = indexdata.FieldStorage{}
+			nextIndex[ordinal] = indexdata.FieldStorage{}
 		}
-		oldNilStorage := qe.nilIndex[ordinal]
 		if storage := fieldStates[i].MaterializeNilStorage(); storage.KeyCount() > 0 {
-			oldNilStorage.Release()
-			qe.nilIndex[ordinal] = storage
+			nextNilIndex[ordinal] = storage
 		} else {
-			oldNilStorage.Release()
-			qe.nilIndex[ordinal] = indexdata.FieldStorage{}
+			nextNilIndex[ordinal] = indexdata.FieldStorage{}
 		}
-		oldLenStorage := qe.lenIndex[ordinal]
-		if storage, useZeroComplement := fieldStates[i].MaterializeLenStorage(qe.universe); active[i].slice {
+		if storage, useZeroComplement := fieldStates[i].MaterializeLenStorage(nextUniverse); active[i].slice {
 			if storage.KeyCount() > 0 {
-				oldLenStorage.Release()
-				qe.lenIndex[ordinal] = storage
+				nextLenIndex[ordinal] = storage
 			} else {
-				oldLenStorage.Release()
-				qe.lenIndex[ordinal] = indexdata.FieldStorage{}
+				nextLenIndex[ordinal] = indexdata.FieldStorage{}
 			}
+			nextLenZeroComplement[ordinal] = false
 			if useZeroComplement {
-				qe.lenZeroComplement[ordinal] = true
+				nextLenZeroComplement[ordinal] = true
 			}
 		}
 	}
-	var oldMeasureStorages []indexdata.MeasureStorage
 	if len(activeMeasures) > 0 {
-		oldMeasureStorages = indexdata.GetMeasureStorageSlice(len(activeMeasures))
 		for _, acc := range activeMeasures {
 			i := acc.Ordinal
 			entries := indexdata.GetMeasureEntrySlice(0)
@@ -487,37 +526,40 @@ func (qe *queryEngine) buildIndex(
 				indexdata.ReleaseMeasureEntrySlice(buf)
 				localMeasureStates[worker][i] = nil
 			}
-			oldStorage := qe.measure[i]
 			storage := indexdata.NewMeasureStorageFromEntriesOwned(entries)
-			oldMeasureStorages = append(oldMeasureStorages, oldStorage)
-			qe.measure[i] = storage
+			nextMeasure[i] = storage
 		}
 	}
 
-	recordCount := qe.universe.Cardinality()
+	recordCount := nextUniverse.Cardinality()
 	buildTime := time.Since(start)
 	buildRPS := int(float64(recordCount) / max(buildTime.Seconds(), 1))
 
 	for name, f := range qe.schema.Fields {
 		if f.Slice {
 			acc, ok := qe.schema.IndexedByName[name]
-			if !ok || qe.lenIndex[acc.Ordinal].KeyCount() == 0 {
-				qe.buildLenIndex()
+			if !ok || nextLenIndex[acc.Ordinal].KeyCount() == 0 {
+				for i := range active {
+					if active[i].slice {
+						nextLenIndex[active[i].acc.Ordinal].Release()
+					}
+				}
+				indexdata.ReleaseFieldStorageSlice(nextLenIndex)
+				pooled.ReleaseBoolSlice(nextLenZeroComplement)
+				nextLenIndex, nextLenZeroComplement = qe.buildLenIndexStorage(nextIndex, nextUniverse)
 				break
 			}
 		}
 	}
 	qe.lenIndexLoaded = false
-	err = qe.publishCurrentSequenceSnapshotNoLock(bolt, bucket, strMap)
-	if oldMeasureStorages != nil {
-		for i := 0; i < len(oldMeasureStorages); i++ {
-			oldMeasureStorages[i].Release()
-		}
-		indexdata.ReleaseMeasureStorageSlice(oldMeasureStorages)
-	}
-	if err != nil {
-		return buildIndexResult{}, fmt.Errorf("publish snapshot: %w", err)
-	}
+	qe.publishStorageSnapshotNoLock(seq, strMap, snapshot.Storage{
+		Index:             nextIndex,
+		NilIndex:          nextNilIndex,
+		LenIndex:          nextLenIndex,
+		LenZeroComplement: nextLenZeroComplement,
+		Measure:           nextMeasure,
+		Universe:          nextUniverse,
+	})
 
 	active = nil
 	fieldStates = nil
@@ -552,26 +594,23 @@ func (db *DB[K, V]) validateIndexedStringValues(val *V) error {
 	return nil
 }
 
-func (qe *queryEngine) buildLenIndex() {
-	indexdata.ReleaseFieldStorageSlots(qe.lenIndex)
+func (qe *queryEngine) buildLenIndexStorage(index []indexdata.FieldStorage, universe posting.List) ([]indexdata.FieldStorage, []bool) {
 	slotCount := len(qe.schema.Indexed)
-	qe.lenIndex = indexdata.GetFieldStorageSlice(slotCount)[:slotCount]
-	if qe.lenZeroComplement != nil {
-		pooled.ReleaseBoolSlice(qe.lenZeroComplement)
-	}
-	qe.lenZeroComplement = pooled.GetBoolSlice(slotCount)[:slotCount]
-	clear(qe.lenZeroComplement)
+	lenIndex := indexdata.GetFieldStorageSlice(slotCount)[:slotCount]
+	lenZeroComplement := pooled.GetBoolSlice(slotCount)[:slotCount]
+	clear(lenZeroComplement)
 
 	for _, acc := range qe.schema.Indexed {
 		if !acc.Field.Slice {
 			continue
 		}
-		storage, useZeroComplement := indexdata.RebuildLenFieldStorageFromOverlay(qe.universe, indexdata.NewFieldOverlayStorage(qe.index[acc.Ordinal]))
-		qe.lenIndex[acc.Ordinal] = storage
+		storage, useZeroComplement := indexdata.RebuildLenFieldStorageFromOverlay(universe, indexdata.NewFieldOverlayStorage(index[acc.Ordinal]))
+		lenIndex[acc.Ordinal] = storage
 		if useZeroComplement {
-			qe.lenZeroComplement[acc.Ordinal] = true
+			lenZeroComplement[acc.Ordinal] = true
 		}
 	}
+	return lenIndex, lenZeroComplement
 }
 
 func (db *DB[K, V]) isLenZeroComplementField(field string) bool {
@@ -962,14 +1001,14 @@ func (qe *queryEngine) storeIndexV26(writer *bufio.Writer, bucketSeq uint64) err
 }
 
 func (qe *queryEngine) storeIndexPayload(writer *bufio.Writer) error {
-	snap := qe.getSnapshot()
-	universe := snap.universe.Borrow()
+	snap := qe.snapshot.Current()
+	universe := snap.Universe.Borrow()
 
 	if err := universe.WriteTo(writer); err != nil {
 		return fmt.Errorf("encode: writing universe: %w", err)
 	}
 
-	if err := strmap.WriteSnapshot(writer, snap.strmap); err != nil {
+	if err := strmap.WriteSnapshot(writer, snap.StrMap); err != nil {
 		return err
 	}
 
@@ -980,7 +1019,7 @@ func (qe *queryEngine) storeIndexPayload(writer *bufio.Writer) error {
 		return err
 	}
 
-	fieldNames := sortedFieldNames(snap.fieldNameSet())
+	fieldNames := sortedFieldNames(snap.FieldNameSet())
 
 	if err := writeSidecarUvarint(writer, uint64(len(fieldNames))); err != nil {
 		return fmt.Errorf("encode: writing index family len: %w", err)
@@ -989,13 +1028,13 @@ func (qe *queryEngine) storeIndexPayload(writer *bufio.Writer) error {
 		if err := writeSidecarString(writer, field); err != nil {
 			return fmt.Errorf("encode: writing index field %q name: %w", field, err)
 		}
-		storage, _ := snap.fieldIndexStorage(field)
+		storage, _ := snap.FieldIndexStorage(field)
 		if err := storage.WriteInto(writer); err != nil {
 			return fmt.Errorf("encode: writing index field %q: %w", field, err)
 		}
 	}
 
-	nilFieldNames := sortedFieldNames(snap.nilFieldNameSet())
+	nilFieldNames := sortedFieldNames(snap.NilFieldNameSet())
 
 	if err := writeSidecarUvarint(writer, uint64(len(nilFieldNames))); err != nil {
 		return fmt.Errorf("encode: writing index family len: %w", err)
@@ -1004,13 +1043,13 @@ func (qe *queryEngine) storeIndexPayload(writer *bufio.Writer) error {
 		if err := writeSidecarString(writer, field); err != nil {
 			return fmt.Errorf("encode: writing index field %q name: %w", field, err)
 		}
-		acc := snap.indexedFieldByName[field]
-		if err := snap.nilIndex[acc.Ordinal].WriteInto(writer); err != nil {
+		acc := snap.IndexedFieldByName[field]
+		if err := snap.NilIndex[acc.Ordinal].WriteInto(writer); err != nil {
 			return fmt.Errorf("encode: writing index field %q: %w", field, err)
 		}
 	}
 
-	lenFieldNames := sortedFieldNames(snap.lenFieldNameSet())
+	lenFieldNames := sortedFieldNames(snap.LenFieldNameSet())
 
 	if err := writeSidecarUvarint(writer, uint64(len(lenFieldNames))); err != nil {
 		return fmt.Errorf("encode: writing index family len: %w", err)
@@ -1019,8 +1058,8 @@ func (qe *queryEngine) storeIndexPayload(writer *bufio.Writer) error {
 		if err := writeSidecarString(writer, field); err != nil {
 			return fmt.Errorf("encode: writing index field %q name: %w", field, err)
 		}
-		acc := snap.indexedFieldByName[field]
-		if err := snap.lenIndex[acc.Ordinal].WriteInto(writer); err != nil {
+		acc := snap.IndexedFieldByName[field]
+		if err := snap.LenIndex[acc.Ordinal].WriteInto(writer); err != nil {
 			return fmt.Errorf("encode: writing index field %q: %w", field, err)
 		}
 	}
@@ -1036,10 +1075,10 @@ func (qe *queryEngine) storeIndexPayload(writer *bufio.Writer) error {
 		}
 		acc := qe.schema.MeasuresByName[field]
 		var storage indexdata.MeasureStorage
-		if snap.measure == nil || acc.Ordinal >= len(snap.measure) {
+		if snap.Measure == nil || acc.Ordinal >= len(snap.Measure) {
 			storage = indexdata.MeasureStorage{}
 		} else {
-			storage = snap.measure[acc.Ordinal]
+			storage = snap.Measure[acc.Ordinal]
 		}
 		if err := storage.WriteInto(writer); err != nil {
 			return fmt.Errorf("encode: writing measure field %q: %w", field, err)

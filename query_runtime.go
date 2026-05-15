@@ -9,6 +9,7 @@ import (
 	"github.com/vapstack/rbi/internal/posting"
 	"github.com/vapstack/rbi/internal/qcache"
 	"github.com/vapstack/rbi/internal/qir"
+	"github.com/vapstack/rbi/internal/snapshot"
 )
 
 type postsAnyFilterState struct {
@@ -841,21 +842,21 @@ func (state *overlayRangePredicateState) newIter() posting.Iterator {
 	return it
 }
 
-func tryShareMaterializedPredOnSnapshot(snap *indexSnapshot, cacheKey qcache.MaterializedPredKey, ids posting.List) posting.List {
+func tryShareMaterializedPredOnSnapshot(snap *snapshot.View, cacheKey qcache.MaterializedPredKey, ids posting.List) posting.List {
 	if snap == nil || cacheKey.IsZero() {
 		return ids
 	}
-	if snap.materializedPredCacheLimit() <= 0 {
+	if snap.MaterializedPredCacheLimit() <= 0 {
 		return ids
 	}
 	if ids.IsEmpty() {
-		snap.storeMaterializedPredKey(cacheKey, posting.List{})
+		snap.StoreMaterializedPredKey(cacheKey, posting.List{})
 		return ids
 	}
-	if next, ok := snap.loadOrStoreMaterializedPredKey(cacheKey, ids); ok {
+	if next, ok := snap.LoadOrStoreMaterializedPredKey(cacheKey, ids); ok {
 		return next
 	}
-	if next, ok := snap.tryLoadOrStoreMaterializedPredOversizedKey(cacheKey, ids); ok {
+	if next, ok := snap.TryLoadOrStoreMaterializedPredOversizedKey(cacheKey, ids); ok {
 		return next
 	}
 	return ids
@@ -873,12 +874,12 @@ const (
 )
 
 type materializedPredReuse struct {
-	snap     *indexSnapshot
+	snap     *snapshot.View
 	cacheKey qcache.MaterializedPredKey
 	mode     materializedPredReuseMode
 }
 
-func newMaterializedPredReadOnlyReuse(snap *indexSnapshot, cacheKey qcache.MaterializedPredKey) materializedPredReuse {
+func newMaterializedPredReadOnlyReuse(snap *snapshot.View, cacheKey qcache.MaterializedPredKey) materializedPredReuse {
 	if snap == nil || cacheKey.IsZero() {
 		return materializedPredReuse{}
 	}
@@ -889,7 +890,7 @@ func newMaterializedPredReadOnlyReuse(snap *indexSnapshot, cacheKey qcache.Mater
 	}
 }
 
-func newMaterializedPredSharedReuse(snap *indexSnapshot, cacheKey qcache.MaterializedPredKey) materializedPredReuse {
+func newMaterializedPredSharedReuse(snap *snapshot.View, cacheKey qcache.MaterializedPredKey) materializedPredReuse {
 	if snap == nil || cacheKey.IsZero() {
 		return materializedPredReuse{}
 	}
@@ -900,7 +901,7 @@ func newMaterializedPredSharedReuse(snap *indexSnapshot, cacheKey qcache.Materia
 	}
 }
 
-func newMaterializedPredSecondHitSharedReuse(snap *indexSnapshot, cacheKey qcache.MaterializedPredKey) materializedPredReuse {
+func newMaterializedPredSecondHitSharedReuse(snap *snapshot.View, cacheKey qcache.MaterializedPredKey) materializedPredReuse {
 	if snap == nil || cacheKey.IsZero() {
 		return materializedPredReuse{}
 	}
@@ -915,7 +916,7 @@ func (reuse materializedPredReuse) load() (posting.List, bool) {
 	if reuse.mode == materializedPredReuseNone || reuse.snap == nil || reuse.cacheKey.IsZero() {
 		return posting.List{}, false
 	}
-	return reuse.snap.loadMaterializedPredKey(reuse.cacheKey)
+	return reuse.snap.LoadMaterializedPredKey(reuse.cacheKey)
 }
 
 func (reuse materializedPredReuse) share(ids posting.List) posting.List {
@@ -924,7 +925,7 @@ func (reuse materializedPredReuse) share(ids posting.List) posting.List {
 		return ids
 	}
 	if reuse.mode == materializedPredReuseSecondHitShared &&
-		!reuse.snap.shouldPromoteRuntimeMaterializedPredKey(reuse.cacheKey) {
+		!reuse.snap.ShouldPromoteRuntimeMaterializedPredKey(reuse.cacheKey) {
 		return ids
 	}
 	return tryShareMaterializedPredOnSnapshot(reuse.snap, reuse.cacheKey, ids)
@@ -934,41 +935,18 @@ func (reuse materializedPredReuse) canSecondHitShareModeratelyOversizedEstimate(
 	if reuse.mode != materializedPredReuseSecondHitShared || reuse.snap == nil || reuse.cacheKey.IsZero() || est == 0 {
 		return false
 	}
-	cache := reuse.snap.matPredCache
-	if cache == nil {
-		return false
-	}
-	cacheLimit := cache.Limit()
-	if cacheLimit <= 0 {
-		return false
-	}
-	maxCard := cache.MaxCardinality()
-	if maxCard == 0 {
-		return false
-	}
-	if est <= maxCard {
-		return true
-	}
-	oversizedLimit := qcache.MaterializedPredOversizedLimit(cacheLimit)
-	if oversizedLimit <= 0 {
-		return false
-	}
-	mul := uint64(oversizedLimit)
-	if ^uint64(0)/maxCard < mul {
-		return false
-	}
-	return est <= maxCard*mul
+	return reuse.snap.CanShareModeratelyOversizedMaterializedPred(est)
 }
 
 func (qv *queryView) materializedPredKeyForExactScalarRange(field string, bounds indexdata.Bounds) qcache.MaterializedPredKey {
-	if qv.snap.materializedPredCacheLimit() <= 0 {
+	if qv.snap.MaterializedPredCacheLimit() <= 0 {
 		return qcache.MaterializedPredKey{}
 	}
 	return qcache.MaterializedPredKeyForExactScalarRange(field, bounds)
 }
 
 func (qv *queryView) materializedPredComplementKeyForExactScalarRange(field string, bounds indexdata.Bounds) qcache.MaterializedPredKey {
-	if qv.snap.materializedPredCacheLimit() <= 0 {
+	if qv.snap.MaterializedPredCacheLimit() <= 0 {
 		return qcache.MaterializedPredKey{}
 	}
 	return qcache.MaterializedPredComplementKeyForExactScalarRange(field, bounds)

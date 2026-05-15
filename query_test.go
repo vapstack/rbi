@@ -2250,7 +2250,7 @@ func TestQuery_ArrayOrder_RandomMutations_MatchSeqScan(t *testing.T) {
 								vals := queryTestOrderValues(q)
 								var bits []string
 								for _, tag := range vals {
-									ids := db.engine.currentQueryViewForTests().snap.fieldLookupPostingRetained("tags", tag)
+									ids := db.engine.currentQueryViewForTests().snap.FieldLookupPostingRetained("tags", tag)
 									gHas := ids.Contains(gid)
 									wHas := ids.Contains(wid)
 									bits = append(bits, fmt.Sprintf("%s:g=%v,w=%v", tag, gHas, wHas))
@@ -2272,7 +2272,7 @@ func TestQuery_ArrayOrder_RandomMutations_MatchSeqScan(t *testing.T) {
 								vals := queryTestOrderValues(q)
 								var bits []string
 								for _, country := range vals {
-									ids := db.engine.currentQueryViewForTests().snap.fieldLookupPostingRetained("country", country)
+									ids := db.engine.currentQueryViewForTests().snap.FieldLookupPostingRetained("country", country)
 									gHas := ids.Contains(gid)
 									wHas := ids.Contains(wid)
 									bits = append(bits, fmt.Sprintf("%s:g=%v,w=%v", country, gHas, wHas))
@@ -2509,7 +2509,7 @@ func TestQuery_RandomMixedMultiWrites_MatchSeqScanModel(t *testing.T) {
 						vals := queryTestOrderValues(q)
 						var gm, wm []string
 						for _, country := range vals {
-							ids := db.engine.currentQueryViewForTests().snap.fieldLookupPostingRetained("country", country)
+							ids := db.engine.currentQueryViewForTests().snap.FieldLookupPostingRetained("country", country)
 							gHas := ids.Contains(gid)
 							wHas := ids.Contains(wid)
 							gm = append(gm, fmt.Sprintf("%s=%v", country, gHas))
@@ -2555,7 +2555,7 @@ func TestQuery_RandomMixedMultiWrites_MatchSeqScanModel(t *testing.T) {
 						}
 						var gm, wm []string
 						for _, tag := range []string{"rust", "java", "infra", "go", "db"} {
-							ids := db.engine.currentQueryViewForTests().snap.fieldLookupPostingRetained("tags", tag)
+							ids := db.engine.currentQueryViewForTests().snap.FieldLookupPostingRetained("tags", tag)
 							gHas := ids.Contains(gid)
 							wHas := ids.Contains(wid)
 							gm = append(gm, fmt.Sprintf("%s=%v", tag, gHas))

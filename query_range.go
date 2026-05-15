@@ -21,30 +21,6 @@ func isNumericScalarKind(kind reflect.Kind) bool {
 	}
 }
 
-func (s *indexSnapshot) getNumericRangeBucketCacheEntry(field string, ordinal int, storage indexdata.FieldStorage, bucketSize, minFieldKeys int) *qcache.NumericRangeBucketEntry {
-	if s == nil || storage.KeyCount() == 0 {
-		return nil
-	}
-	ov := indexdata.NewFieldOverlayStorage(storage)
-	cache := s.numericRangeBucketCache
-	if cache == nil {
-		return nil
-	}
-
-	if entry, ok := cache.LoadSlot(field, ordinal); ok && entry.Storage() == storage {
-		return entry
-	}
-
-	idx, _ := qcache.BuildNumericRangeBucketIndex(ov, bucketSize, minFieldKeys)
-	entry := qcache.GetNumericRangeBucketEntry(storage, idx, cache.MaxCardinality())
-	if cached, ok := cache.LoadSlot(field, ordinal); ok && cached.Storage() == storage {
-		entry.Release()
-		return cached
-	}
-	cache.StoreSlot(field, ordinal, entry)
-	return entry
-}
-
 func (qv *queryView) numericRangeFieldOrdinal(field string) (int, bool) {
 	acc, ok := qv.engine.schema.IndexedByName[field]
 	if !ok {
@@ -58,7 +34,7 @@ func (qv *queryView) numericRangeBucketCacheEntry(field string, storage indexdat
 	if !ok {
 		return nil
 	}
-	return qv.snap.getNumericRangeBucketCacheEntry(field, ordinal, storage, bucketSize, minFieldKeys)
+	return qv.snap.NumericRangeBucketCacheEntry(field, ordinal, storage, bucketSize, minFieldKeys)
 }
 
 func (qv *queryView) tryEvalNumericRangeBuckets(field string, fm *schema.Field, ov indexdata.FieldOverlay, br indexdata.OverlayRange) (postingResult, bool) {
@@ -80,7 +56,7 @@ func (qv *queryView) tryEvalNumericRangeBuckets(field string, fm *schema.Field, 
 		return postingResult{}, false
 	}
 
-	storage, ok := qv.snap.fieldIndexStorage(field)
+	storage, ok := qv.snap.FieldIndexStorage(field)
 	if !ok || storage.KeyCount() == 0 {
 		return postingResult{}, false
 	}
@@ -170,7 +146,7 @@ func (qv *queryView) tryLoadNumericRangeBuckets(field string, fm *schema.Field, 
 		return postingResult{}, false
 	}
 
-	storage, ok := qv.snap.fieldIndexStorage(field)
+	storage, ok := qv.snap.FieldIndexStorage(field)
 	if !ok || storage.KeyCount() == 0 {
 		return postingResult{}, false
 	}
@@ -230,7 +206,7 @@ func (qv *queryView) tryCountSnapshotNumericRange(field string, fm *schema.Field
 		return 0, false
 	}
 
-	storage, ok := qv.snap.fieldIndexStorage(field)
+	storage, ok := qv.snap.FieldIndexStorage(field)
 	if !ok || storage.KeyCount() == 0 {
 		return 0, false
 	}

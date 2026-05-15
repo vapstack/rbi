@@ -1039,7 +1039,7 @@ func (qv *queryView) buildLeafPredsExcludingBounds(leaves []qir.Expr, field stri
 				if orderedRoute.complementCacheKey.IsZero() || qv.snap == nil {
 					continue
 				}
-				if _, ok := qv.snap.loadMaterializedPredKey(orderedRoute.complementCacheKey); !ok {
+				if _, ok := qv.snap.LoadMaterializedPredKey(orderedRoute.complementCacheKey); !ok {
 					continue
 				}
 			}

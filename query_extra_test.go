@@ -2337,7 +2337,7 @@ func TestQueryExt_OrderBasicNilShortCircuit_DoesNotMaterializeResiduals(t *testi
 	if cacheKey == "" {
 		t.Fatalf("expected non-empty materialized cache key")
 	}
-	if _, ok := db.engine.getSnapshot().loadMaterializedPred(cacheKey); ok {
+	if _, ok := snapshotExtLoadMaterializedPred(db.engine.snapshot.Current(), cacheKey); ok {
 		t.Fatalf("unexpected residual cache entry before execution")
 	}
 
@@ -2351,7 +2351,7 @@ func TestQueryExt_OrderBasicNilShortCircuit_DoesNotMaterializeResiduals(t *testi
 	if len(got) != 0 {
 		t.Fatalf("expected empty fast-path result, got=%v", got)
 	}
-	if _, ok := db.engine.getSnapshot().loadMaterializedPred(cacheKey); ok {
+	if _, ok := snapshotExtLoadMaterializedPred(db.engine.snapshot.Current(), cacheKey); ok {
 		t.Fatalf("unexpected residual cache entry after empty nil-order short-circuit")
 	}
 }
@@ -2484,7 +2484,7 @@ func TestQueryExt_MixedCaching_NumericRangesRemainExactAcrossClearAndPublish(t *
 	}
 
 	checkQueries("warm")
-	if got := db.engine.getSnapshot().matPredCache.EntryCount(); got == 0 {
+	if got := db.engine.snapshot.Current().MaterializedPredCache().EntryCount(); got == 0 {
 		t.Fatalf("expected shared runtime caches to warm up")
 	}
 
@@ -2496,13 +2496,13 @@ func TestQueryExt_MixedCaching_NumericRangesRemainExactAcrossClearAndPublish(t *
 	checkQueries("after_unrelated_publish")
 
 	db.clearCurrentSnapshotCachesForTesting()
-	snap := db.engine.getSnapshot()
-	if got := snap.matPredCache.EntryCount(); got != 0 {
+	snap := db.engine.snapshot.Current()
+	if got := snap.MaterializedPredCache().EntryCount(); got != 0 {
 		t.Fatalf("expected cleared materialized predicate cache, got=%d", got)
 	}
 
 	checkQueries("after_clear")
-	if got := db.engine.getSnapshot().matPredCache.EntryCount(); got == 0 {
+	if got := db.engine.snapshot.Current().MaterializedPredCache().EntryCount(); got == 0 {
 		t.Fatalf("expected caches to repopulate after cold queries")
 	}
 }
@@ -2565,7 +2565,7 @@ func TestQueryExt_ConcurrentEvictingMaterializedPredicates_RemainStable(t *testi
 	if _, err := db.QueryKeys(queries[0]); err != nil {
 		t.Fatalf("warm QueryKeys: %v", err)
 	}
-	if got := db.engine.getSnapshot().matPredCache.EntryCount(); got == 0 {
+	if got := db.engine.snapshot.Current().MaterializedPredCache().EntryCount(); got == 0 {
 		t.Fatalf("expected deep ordered window to materialize a predicate cache entry")
 	}
 
@@ -2624,7 +2624,7 @@ func TestQueryExt_ConcurrentEvictingMaterializedPredicates_RemainStable(t *testi
 		t.Fatal(err)
 	}
 
-	if got := db.engine.getSnapshot().matPredCache.EntryCount(); got > 1 {
+	if got := db.engine.snapshot.Current().MaterializedPredCache().EntryCount(); got > 1 {
 		t.Fatalf("materialized predicate cache exceeded configured bound: got=%d", got)
 	}
 }
@@ -2817,7 +2817,7 @@ func TestQueryExt_NumericRangeFieldMutation_DoesNotReuseStaleCaches(t *testing.T
 	}
 
 	checkQueries("warm")
-	if got := db.engine.getSnapshot().matPredCache.EntryCount(); got == 0 {
+	if got := db.engine.snapshot.Current().MaterializedPredCache().EntryCount(); got == 0 {
 		t.Fatalf("expected warmed numeric-range query to populate predicate cache")
 	}
 

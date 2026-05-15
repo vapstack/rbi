@@ -91,7 +91,7 @@ func (qe *queryEngine) checkUniqueBatchCandidateAndCollectSeen(
 		}
 	}
 
-	ids := qe.getSnapshot().fieldLookupPostingRetainedKey(acc.Name, single)
+	ids := qe.snapshot.Current().FieldLookupPostingRetainedKey(acc.Name, single)
 	if ids.IsEmpty() {
 		return append(seenWrites, uniqueSeenWrite{field: acc.Name, key: single}), nil
 	}
@@ -344,7 +344,7 @@ func (qe *queryEngine) checkUniqueBatchCandidate(
 	}
 	sm[single] = idx
 
-	ids := qe.getSnapshot().fieldLookupPostingRetainedKey(acc.Name, single)
+	ids := qe.snapshot.Current().FieldLookupPostingRetainedKey(acc.Name, single)
 	if ids.IsEmpty() {
 		return nil
 	}

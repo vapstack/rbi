@@ -126,8 +126,8 @@ func (db *DB[K, V]) Aggregate(q *qx.QX) (Result, error) {
 	}
 	defer prepared.release()
 
-	snap, seq, ref, pinned := db.engine.pinCurrentSnapshot()
-	defer db.engine.unpinCurrentSnapshot(seq, ref, pinned)
+	snap, seq, ref := db.engine.snapshot.PinCurrent()
+	defer db.engine.snapshot.Unpin(seq, ref)
 
 	view := db.engine.makeQueryView(snap)
 	defer db.engine.releaseQueryView(view)
@@ -785,7 +785,7 @@ func (qv *queryView) aggregateOrdinaryMetricWork(q *aggregateQuery) (uint64, uin
 		if metric.rowCount || hasPriorOrdinaryAggregateMetric(q.metrics, i) {
 			continue
 		}
-		ov := indexdata.NewFieldOverlayStorage(qv.snap.index[metric.field.ordinary.Ordinal])
+		ov := indexdata.NewFieldOverlayStorage(qv.snap.Index[metric.field.ordinary.Ordinal])
 		fieldRows := ov.Rows()
 		keys += uint64(ov.KeyCount())
 		rows += fieldRows
@@ -800,8 +800,8 @@ func (qv *queryView) aggregateGroupCountUpperBound(q *aggregateQuery, filterCard
 	groups := uint64(1)
 	for i := range q.groups {
 		acc := q.groups[i].ordinary
-		distinct := uint64(indexdata.NewFieldOverlayStorage(qv.snap.index[acc.Ordinal]).KeyCount())
-		if indexdata.NewFieldOverlayStorage(qv.snap.nilIndex[acc.Ordinal]).KeyCount() > 0 {
+		distinct := uint64(indexdata.NewFieldOverlayStorage(qv.snap.Index[acc.Ordinal]).KeyCount())
+		if indexdata.NewFieldOverlayStorage(qv.snap.NilIndex[acc.Ordinal]).KeyCount() > 0 {
 			distinct++
 		}
 		if distinct == 0 {
@@ -890,7 +890,7 @@ func (qv *queryView) buildGroupedOrdinaryIDMap(
 	}
 
 	acc := q.groups[level].ordinary
-	ov := indexdata.NewFieldOverlayStorage(qv.snap.index[acc.Ordinal])
+	ov := indexdata.NewFieldOverlayStorage(qv.snap.Index[acc.Ordinal])
 	cur := ov.NewCursor(ov.RangeByRanks(0, ov.KeyCount()), false)
 	for {
 		key, bucketIDs, ok := cur.Next()
@@ -909,7 +909,7 @@ func (qv *queryView) buildGroupedOrdinaryIDMap(
 		}
 		next.Release()
 	}
-	nilIDs := indexdata.NewFieldOverlayStorage(qv.snap.nilIndex[acc.Ordinal]).LookupPostingRetained(nilIndexEntryKey)
+	nilIDs := indexdata.NewFieldOverlayStorage(qv.snap.NilIndex[acc.Ordinal]).LookupPostingRetained(nilIndexEntryKey)
 	if !nilIDs.IsEmpty() {
 		next := current.Borrow().BuildAnd(nilIDs)
 		if !next.IsEmpty() {
@@ -971,7 +971,7 @@ func (qv *queryView) foldGroupedOrdinaryFieldByID(
 	touched := pooled.GetIntSlice(len(rows))
 
 	acc := q.metrics[first].field.ordinary
-	ov := indexdata.NewFieldOverlayStorage(qv.snap.index[acc.Ordinal])
+	ov := indexdata.NewFieldOverlayStorage(qv.snap.Index[acc.Ordinal])
 	cur := ov.NewCursor(ov.RangeByRanks(0, ov.KeyCount()), false)
 	var err error
 	for {
@@ -1084,7 +1084,7 @@ func (qv *queryView) aggregateGroupRecursive(
 	}
 
 	acc := q.groups[level].ordinary
-	ov := indexdata.NewFieldOverlayStorage(qv.snap.index[acc.Ordinal])
+	ov := indexdata.NewFieldOverlayStorage(qv.snap.Index[acc.Ordinal])
 	cur := ov.NewCursor(ov.RangeByRanks(0, ov.KeyCount()), false)
 	for {
 		key, bucketIDs, ok := cur.Next()
@@ -1103,7 +1103,7 @@ func (qv *queryView) aggregateGroupRecursive(
 		}
 		next.Release()
 	}
-	nilIDs := indexdata.NewFieldOverlayStorage(qv.snap.nilIndex[acc.Ordinal]).LookupPostingRetained(nilIndexEntryKey)
+	nilIDs := indexdata.NewFieldOverlayStorage(qv.snap.NilIndex[acc.Ordinal]).LookupPostingRetained(nilIndexEntryKey)
 	if !nilIDs.IsEmpty() {
 		next := current.Borrow().BuildAnd(nilIDs)
 		if !next.IsEmpty() {
@@ -1119,7 +1119,7 @@ func (qv *queryView) aggregateGroupRecursive(
 }
 
 func (qv *queryView) appendDistinctRows(rows *[]Row, acc schema.IndexedFieldAccessor, ids posting.List) error {
-	ov := indexdata.NewFieldOverlayStorage(qv.snap.index[acc.Ordinal])
+	ov := indexdata.NewFieldOverlayStorage(qv.snap.Index[acc.Ordinal])
 	universe := qv.snapshotUniverseCardinality()
 	filterCardinality := ids.Cardinality()
 	cur := ov.NewCursor(ov.RangeByRanks(0, ov.KeyCount()), false)
@@ -1133,7 +1133,7 @@ func (qv *queryView) appendDistinctRows(rows *[]Row, acc schema.IndexedFieldAcce
 		}
 		*rows = append(*rows, Row{aggregateValueFromIndexKey(acc.Field, key)})
 	}
-	nilIDs := indexdata.NewFieldOverlayStorage(qv.snap.nilIndex[acc.Ordinal]).LookupPostingRetained(nilIndexEntryKey)
+	nilIDs := indexdata.NewFieldOverlayStorage(qv.snap.NilIndex[acc.Ordinal]).LookupPostingRetained(nilIndexEntryKey)
 	if aggregateIntersectCardinalityKnown(ids, nilIDs, filterCardinality, universe) > 0 {
 		*rows = append(*rows, Row{Value{}})
 	}
@@ -1166,7 +1166,7 @@ func (qv *queryView) foldAggregateMetricStates(states []aggregateMetricState, id
 
 func (qv *queryView) foldMeasureMetric(state *aggregateMetricState, ids posting.List) error {
 	acc := state.metric.field.measure
-	storage := qv.snap.measure[acc.Ordinal]
+	storage := qv.snap.Measure[acc.Ordinal]
 	if ids.IsEmpty() || storage.Rows() == 0 {
 		return nil
 	}
@@ -1295,7 +1295,7 @@ func aggregateMetricsShareOrdinaryField(a aggregateMetric, b aggregateMetric) bo
 
 func (qv *queryView) foldOrdinaryMetricStates(states []aggregateMetricState, ids posting.List, first int) error {
 	acc := states[first].metric.field.ordinary
-	ov := indexdata.NewFieldOverlayStorage(qv.snap.index[acc.Ordinal])
+	ov := indexdata.NewFieldOverlayStorage(qv.snap.Index[acc.Ordinal])
 	universe := qv.snapshotUniverseCardinality()
 	filterCardinality := ids.Cardinality()
 	cur := ov.NewCursor(ov.RangeByRanks(0, ov.KeyCount()), false)

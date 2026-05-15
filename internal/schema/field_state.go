@@ -48,6 +48,12 @@ var snapshotFieldInsertStateSlicePool = pooled.NewSlicePool[InsertState](
 	cleanupSnapshotFieldInsertStateSlice,
 )
 
+var snapshotFieldOverlayStateSlicePool = pooled.NewSlicePool[OverlayState](
+	snapshotFieldStateSlicePoolMaxCap,
+	pooled.ClearCap,
+	cleanupSnapshotFieldOverlayStateSlice,
+)
+
 type WriteScratch struct {
 	strings []string
 	fixed   []uint64
@@ -76,6 +82,15 @@ var snapshotFieldBatchStateSlicePool = pooled.NewSlicePool[BatchState](
 func GetInsertStates(n int) []InsertState {
 	states := snapshotFieldInsertStateSlicePool.Get(n)
 	return states[:n]
+}
+
+func GetOverlayStates(n int) []OverlayState {
+	states := snapshotFieldOverlayStateSlicePool.Get(n)
+	return states[:n]
+}
+
+func ReleaseOverlayStates(states []OverlayState) {
+	snapshotFieldOverlayStateSlicePool.Put(states)
 }
 
 func ReleaseInsertStates(states []InsertState) {
@@ -115,7 +130,30 @@ func (state *OverlayState) MaterializeNilStorage() indexdata.FieldStorage {
 func (state *OverlayState) MaterializeLenStorage(universe posting.List) (indexdata.FieldStorage, bool) {
 	lengths := state.lengths
 	state.lengths = nil
-	return indexdata.NewLenFieldStorageFromMapOwned(universe, lengths)
+	storage, useZeroComplement := indexdata.NewLenFieldStorageFromMapOwned(universe, lengths)
+	indexdata.ReleaseLenPostingMap(lengths)
+	return storage, useZeroComplement
+}
+
+func (state *OverlayState) Reset() {
+	if state.index != nil {
+		indexdata.ReleasePostingMap(state.index)
+		state.index = nil
+	}
+	if state.fixed != nil {
+		indexdata.ReleaseFixedPostingMap(state.fixed)
+		state.fixed = nil
+	}
+	if state.lengths != nil {
+		posting.ReleaseMap(state.lengths)
+		indexdata.ReleaseLenPostingMap(state.lengths)
+		state.lengths = nil
+	}
+	if state.nils != nil {
+		indexdata.ReleasePostingMap(state.nils)
+		state.nils = nil
+	}
+	state.changed = false
 }
 
 func (state *InsertState) LenDiff() *indexdata.LenPostingDiff {
@@ -232,7 +270,7 @@ func (s OverlaySink) setNil() {
 
 func (s OverlaySink) setLen(length int) {
 	if s.state.lengths == nil {
-		s.state.lengths = make(map[uint32]posting.List, 8)
+		s.state.lengths = indexdata.GetLenPostingMap(8)
 	}
 	ln := uint32(length)
 	ids := s.state.lengths[ln]
@@ -769,6 +807,12 @@ func cleanupSnapshotFieldInsertStateSlice(states []InsertState) {
 	states = states[:cap(states)]
 	for i := range states {
 		states[i].discard()
+	}
+}
+
+func cleanupSnapshotFieldOverlayStateSlice(states []OverlayState) {
+	for i := range states {
+		states[i].Reset()
 	}
 }
 

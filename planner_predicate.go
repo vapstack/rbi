@@ -1095,7 +1095,7 @@ func (qv *queryView) buildPredInCandidate(e qir.Expr, fm *schema.Field, ov index
 	fieldName := qv.engine.fieldNameByOrdinal(e.FieldOrdinal)
 	postsBuf, est := qv.scalarLookupPostings(fieldName, e.FieldOrdinal, valsBuf, hasNil)
 	cacheKey := qcache.MaterializedPredKey{}
-	if qv.snap != nil && qv.snap.materializedPredCacheLimit() > 0 {
+	if qv.snap != nil && qv.snap.MaterializedPredCacheLimit() > 0 {
 		cacheKey = qcache.MaterializedPredKeyForDistinctSetTerms(fieldName, e.Op, valsBuf, hasNil)
 	}
 
@@ -1179,10 +1179,10 @@ func (qv *queryView) buildPredHasCandidate(e qir.Expr, fm *schema.Field, ov inde
 	raw := e
 	raw.Not = false
 	var cacheKey qcache.MaterializedPredKey
-	if qv.snap != nil && qv.snap.materializedPredCacheLimit() > 0 {
+	if qv.snap != nil && qv.snap.MaterializedPredCacheLimit() > 0 {
 		cacheKey = qcache.MaterializedPredKeyForDistinctSetTerms(qv.engine.fieldNameByOrdinal(raw.FieldOrdinal), raw.Op, valsBuf, false)
 		if !cacheKey.IsZero() {
-			if cached, ok := qv.snap.loadMaterializedPredKey(cacheKey); ok {
+			if cached, ok := qv.snap.LoadMaterializedPredKey(cacheKey); ok {
 				if e.Not {
 					return predicate{
 						expr: e,
@@ -1198,7 +1198,7 @@ func (qv *queryView) buildPredHasCandidate(e qir.Expr, fm *schema.Field, ov inde
 					estCard:  cached.Cardinality(),
 				}, true
 			}
-			if qv.snap.shouldPromoteRuntimeMaterializedPredKey(cacheKey) {
+			if qv.snap.ShouldPromoteRuntimeMaterializedPredKey(cacheKey) {
 				ids := qv.evalLazyMaterializedPredicateWithKey(raw, cacheKey)
 				if ids.IsEmpty() {
 					if e.Not {
@@ -1207,7 +1207,7 @@ func (qv *queryView) buildPredHasCandidate(e qir.Expr, fm *schema.Field, ov inde
 					return predicate{expr: e, alwaysFalse: true}, true
 				}
 				releaseIDs := true
-				if cached, ok := qv.snap.loadMaterializedPredKey(cacheKey); ok {
+				if cached, ok := qv.snap.LoadMaterializedPredKey(cacheKey); ok {
 					if !ids.SharesPayload(cached) {
 						ids.Release()
 					}
@@ -1314,7 +1314,7 @@ func (qv *queryView) buildPredHasAnyCandidate(e qir.Expr, fm *schema.Field, ov i
 		est += ids.Cardinality()
 	}
 	cacheKey := qcache.MaterializedPredKey{}
-	if qv.snap != nil && qv.snap.materializedPredCacheLimit() > 0 {
+	if qv.snap != nil && qv.snap.MaterializedPredCacheLimit() > 0 {
 		cacheKey = qcache.MaterializedPredKeyForDistinctSetTerms(qv.engine.fieldNameByOrdinal(e.FieldOrdinal), e.Op, valsBuf, false)
 	}
 	if e.Not {
@@ -1507,7 +1507,7 @@ func (qv *queryView) buildPredMaterializedCandidate(e qir.Expr) (predicate, bool
 
 func (qv *queryView) evalLazyMaterializedPredicateWithKey(raw qir.Expr, cacheKey qcache.MaterializedPredKey) posting.List {
 	if !cacheKey.IsZero() {
-		if cached, ok := qv.snap.loadMaterializedPredKey(cacheKey); ok {
+		if cached, ok := qv.snap.LoadMaterializedPredKey(cacheKey); ok {
 			return cached
 		}
 	}
@@ -1519,14 +1519,14 @@ func (qv *queryView) evalLazyMaterializedPredicateWithKey(raw qir.Expr, cacheKey
 		if ok {
 			if done {
 				if pred.alwaysFalse && !cacheKey.IsZero() {
-					qv.snap.storeMaterializedPredKey(cacheKey, posting.List{})
+					qv.snap.StoreMaterializedPredKey(cacheKey, posting.List{})
 				}
 				return posting.List{}
 			}
 			ov := qv.fieldOverlayForExpr(raw)
 			if !ov.HasData() {
 				if !cacheKey.IsZero() {
-					qv.snap.storeMaterializedPredKey(cacheKey, posting.List{})
+					qv.snap.StoreMaterializedPredKey(cacheKey, posting.List{})
 				}
 				return posting.List{}
 			}
@@ -1537,14 +1537,14 @@ func (qv *queryView) evalLazyMaterializedPredicateWithKey(raw qir.Expr, cacheKey
 	b, err := qv.evalSimple(raw)
 	if err != nil {
 		if !cacheKey.IsZero() {
-			qv.snap.storeMaterializedPredKey(cacheKey, posting.List{})
+			qv.snap.StoreMaterializedPredKey(cacheKey, posting.List{})
 		}
 		return posting.List{}
 	}
 	if b.ids.IsEmpty() {
 		b.release()
 		if !cacheKey.IsZero() {
-			qv.snap.storeMaterializedPredKey(cacheKey, posting.List{})
+			qv.snap.StoreMaterializedPredKey(cacheKey, posting.List{})
 		}
 		return posting.List{}
 	}
@@ -1557,7 +1557,7 @@ func (qv *queryView) evalLazyMaterializedPredicate(raw qir.Expr, cacheKey string
 }
 
 func (qv *queryView) materializedPredKeyForScalar(field string, op qir.Op, key string) qcache.MaterializedPredKey {
-	if qv.snap.materializedPredCacheLimit() <= 0 {
+	if qv.snap.MaterializedPredCacheLimit() <= 0 {
 		return qcache.MaterializedPredKey{}
 	}
 	if fm := qv.engine.schema.Fields[field]; schema.FieldUsesOrderedNumericKeys(fm) && len(key) == 8 {
@@ -1571,7 +1571,7 @@ func (qv *queryView) materializedPredCacheKeyForScalar(field string, op qir.Op, 
 }
 
 func (qv *queryView) materializedPredComplementKeyForScalar(field string, op qir.Op, key string) qcache.MaterializedPredKey {
-	if qv.snap.materializedPredCacheLimit() <= 0 {
+	if qv.snap.MaterializedPredCacheLimit() <= 0 {
 		return qcache.MaterializedPredKey{}
 	}
 	if fm := qv.engine.schema.Fields[field]; schema.FieldUsesOrderedNumericKeys(fm) && len(key) == 8 {
@@ -3089,7 +3089,7 @@ func (qv *queryView) orderedScalarRangeCanEagerMaterialize(route orderedScalarRa
 	if !route.requirePromotion || qv.snap == nil || promotionKey.IsZero() {
 		return true
 	}
-	return qv.snap.shouldPromoteRuntimeMaterializedPredKey(promotionKey)
+	return qv.snap.ShouldPromoteRuntimeMaterializedPredKey(promotionKey)
 }
 
 func (qv *queryView) tryMaterializeBroadRangeComplementPredicateForOrdered(

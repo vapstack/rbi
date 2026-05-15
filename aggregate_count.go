@@ -8,6 +8,7 @@ import (
 	"github.com/vapstack/rbi/internal/qcache"
 	"github.com/vapstack/rbi/internal/qir"
 	"github.com/vapstack/rbi/internal/schema"
+	"github.com/vapstack/rbi/internal/snapshot"
 )
 
 const countPredicateScanMaxLeaves = 16
@@ -58,8 +59,8 @@ func (db *DB[K, V]) Count(exprs ...qx.Expr) (uint64, error) {
 	defer prepared.Release()
 	viewQ := qir.NewShape(prepared)
 
-	snap, seq, ref, pinned := db.engine.pinCurrentSnapshot()
-	defer db.engine.unpinCurrentSnapshot(seq, ref, pinned)
+	snap, seq, ref := db.engine.snapshot.PinCurrent()
+	defer db.engine.snapshot.Unpin(seq, ref)
 
 	view := db.engine.makeQueryView(snap)
 	defer db.engine.releaseQueryView(view)
@@ -2354,20 +2355,20 @@ func (route countScalarComplementRouting) wantsComplementMaterialization() bool 
 	return route.coarseMaterialize || route.exactMaterialize
 }
 
-func (route countScalarComplementRouting) prefersLazyPostingFilter(p predicate, snap *indexSnapshot) bool {
+func (route countScalarComplementRouting) prefersLazyPostingFilter(p predicate, snap *snapshot.View) bool {
 	if !p.isCustomUnmaterialized() || !p.supportsCheapPostingApply() {
 		return false
 	}
 	if !route.wantsComplementMaterialization() {
 		return false
 	}
-	if snap == nil || snap.materializedPredCacheLimit() <= 0 {
+	if snap == nil || snap.MaterializedPredCacheLimit() <= 0 {
 		return true
 	}
 	if route.complementCacheKey.IsZero() {
 		return true
 	}
-	return !snap.shouldPromoteRuntimeMaterializedPredKey(route.complementCacheKey)
+	return !snap.ShouldPromoteRuntimeMaterializedPredKey(route.complementCacheKey)
 }
 
 func (qv *queryView) countScalarComplementRouting(p predicate, leadProbeEst uint64, universe uint64) countScalarComplementRouting {
@@ -3287,7 +3288,7 @@ func (qv *queryView) shouldPreferMaterializedCountOR(expr qir.Expr) bool {
 			return false
 		}
 	}
-	return qv.snap.shouldPromoteRuntimeMaterializedPredKey(countORMaterializedRouteKeys[n])
+	return qv.snap.ShouldPromoteRuntimeMaterializedPredKey(countORMaterializedRouteKeys[n])
 }
 
 func countORBranchHasExpensiveMaterialization(expr qir.Expr) bool {
@@ -4154,7 +4155,7 @@ func (qv *queryView) reorderCountEvalAndPositivePlans(plans []countLeafPlan, pos
 		if countLeafPlanSeedsCustomMaterialization(plans[pos[i]]) {
 			cacheKey := qv.materializedPredKey(plans[pos[i]].expr)
 			if !cacheKey.IsZero() {
-				if cached, ok := qv.snap.loadMaterializedPredKey(cacheKey); ok && !cached.IsEmpty() {
+				if cached, ok := qv.snap.LoadMaterializedPredKey(cacheKey); ok && !cached.IsEmpty() {
 					continue
 				}
 			}
@@ -4183,9 +4184,9 @@ func (qv *queryView) applyAndPostingResultExpr(acc *postingResult, hasAcc *bool,
 				if qv.snap != nil {
 					cacheKey := qv.materializedPredKey(expr)
 					if !cacheKey.IsZero() {
-						if _, ok := qv.snap.loadMaterializedPredKey(cacheKey); ok {
+						if _, ok := qv.snap.LoadMaterializedPredKey(cacheKey); ok {
 							usePostingApply = false
-						} else if qv.snap.shouldPromoteRuntimeMaterializedPredKey(cacheKey) {
+						} else if qv.snap.ShouldPromoteRuntimeMaterializedPredKey(cacheKey) {
 							usePostingApply = false
 						}
 					}

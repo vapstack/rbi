@@ -15,6 +15,7 @@ import (
 	"github.com/vapstack/rbi/internal/keycodec"
 	"github.com/vapstack/rbi/internal/pooled"
 	"github.com/vapstack/rbi/internal/schema"
+	"github.com/vapstack/rbi/internal/snapshot"
 	"github.com/vapstack/rbi/internal/strmap"
 	"go.etcd.io/bbolt"
 )
@@ -176,8 +177,8 @@ type autoBatchAttemptCore struct {
 	bucket       *bbolt.Bucket
 	statsEnabled bool
 
-	preparedSnapshots []snapshotBatchEntry
-	acceptedSnapshots []snapshotBatchEntry
+	preparedSnapshots []snapshot.BatchEntry
+	acceptedSnapshots []snapshot.BatchEntry
 	ownedPayloads     []*bytes.Buffer
 
 	uniqueIdxs    []uint64
@@ -1081,10 +1082,10 @@ func (ab *autoBatcher) prepareAutoBatchSet(att *autoBatchAttemptState, req *auto
 		newVal:  newVal,
 	})
 	if rt.engine != nil {
-		att.preparedSnapshots = append(att.preparedSnapshots, snapshotBatchEntry{
-			idx:    state.idx,
-			oldVal: oldVal,
-			newVal: newVal,
+		att.preparedSnapshots = append(att.preparedSnapshots, snapshot.BatchEntry{
+			ID:  state.idx,
+			Old: oldVal,
+			New: newVal,
 		})
 	}
 	state.value = newVal
@@ -1173,12 +1174,12 @@ func (ab *autoBatcher) prepareAutoBatchPatch(att *autoBatchAttemptState, req *au
 		newVal:  newVal,
 	})
 	if rt.engine != nil {
-		att.preparedSnapshots = append(att.preparedSnapshots, snapshotBatchEntry{
-			idx:       state.idx,
-			oldVal:    oldVal,
-			newVal:    newVal,
-			patch:     req.patch,
-			patchOnly: len(req.beforeProcess) == 0 && len(req.beforeStore) == 0,
+		att.preparedSnapshots = append(att.preparedSnapshots, snapshot.BatchEntry{
+			ID:        state.idx,
+			Old:       oldVal,
+			New:       newVal,
+			Patch:     req.patch,
+			PatchOnly: len(req.beforeProcess) == 0 && len(req.beforeStore) == 0,
 		})
 	}
 	state.value = newVal
@@ -1211,9 +1212,9 @@ func (ab *autoBatcher) prepareAutoBatchDelete(att *autoBatchAttemptState, req *a
 		newVal: nil,
 	})
 	if rt.engine != nil {
-		att.preparedSnapshots = append(att.preparedSnapshots, snapshotBatchEntry{
-			idx:    state.idx,
-			oldVal: oldVal,
+		att.preparedSnapshots = append(att.preparedSnapshots, snapshot.BatchEntry{
+			ID:  state.idx,
+			Old: oldVal,
 		})
 	}
 	state.value = nil
@@ -1718,14 +1719,14 @@ func (ab *autoBatcher) executeAutoBatchAttempt(active *pooled.Slice[*autoBatchRe
 		rt.mu.Unlock()
 		return nil, true, fmt.Errorf("advance bucket sequence: %w", err)
 	}
-	snap := rt.engine.buildPreparedSnapshotNoLock(seq, rt.strMap, rt.schema.Patch.Fields, att.acceptedSnapshots)
-	rt.engine.snapshot.stage(snap)
+	snap := snapshot.BuildPrepared(seq, rt.engine.snapshot.Current(), rt.schema, rt.engine.snapshotCacheConfig(), rt.strMap, rt.schema.Patch.Fields, att.acceptedSnapshots)
+	rt.engine.snapshot.Stage(snap)
 
 	if err = commitTx(tx, opName, rt.testHookAccessor()); err != nil {
 		if ab.statsEnabled {
 			ab.txCommitErrors.Add(1)
 		}
-		rt.engine.snapshot.dropStaged(seq)
+		rt.engine.snapshot.DropStaged(seq)
 		rt.rollbackCreated(att.accepted)
 		rt.mu.Unlock()
 		assignAutoBatchPreparedErr(att.accepted, err)
@@ -1740,9 +1741,9 @@ func (ab *autoBatcher) executeAutoBatchAttempt(active *pooled.Slice[*autoBatchRe
 		seq,
 		opName,
 		func() {
-			rt.engine.finishSnapshotPublishNoLock(snap)
+			rt.engine.installViewNoLock(snap)
 			if rt.strMap != nil {
-				rt.strMap.MarkCommittedPublished(snap.strmap)
+				rt.strMap.MarkCommittedPublished(snap.StrMap)
 			}
 		},
 	)
