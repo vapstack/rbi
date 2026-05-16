@@ -20,6 +20,7 @@ import (
 	"github.com/vapstack/rbi/internal/pooled"
 	"github.com/vapstack/rbi/internal/posting"
 	"github.com/vapstack/rbi/internal/qcache"
+	"github.com/vapstack/rbi/internal/qexec"
 	"github.com/vapstack/rbi/internal/schema"
 	"github.com/vapstack/rbi/internal/snapshot"
 	"github.com/vapstack/rbi/internal/strmap"
@@ -32,7 +33,7 @@ var (
 	ErrBroken            = errors.New("index is broken")
 	ErrNoIndex           = errors.New("index is disabled (transparent mode)")
 	ErrRebuildInProgress = errors.New("index rebuild in progress")
-	ErrInvalidQuery      = errors.New("invalid query")
+	ErrInvalidQuery      = qexec.ErrInvalidQuery
 	ErrInvalidBucketName = errors.New("invalid bucket name")
 	ErrUniqueViolation   = errors.New("unique constraint violation")
 	ErrNoValidKeyIndex   = errors.New("no valid key for index")
@@ -44,7 +45,7 @@ var (
 
 const (
 	defaultOptionsAnalyzeInterval                  = time.Hour
-	defaultOptionsCalibrationSampleEvery           = 16
+	defaultOptionsCalibrationSampleEvery           = qexec.DefaultCalibrationSampleEvery
 	defaultBucketFillPercent                       = 0.8
 	defaultSnapshotMaterializedPredCacheMaxEntries = 24
 	defaultSnapshotMatPredCacheMaxCardinality      = 64 << 10
@@ -428,7 +429,7 @@ func New[K ~uint64 | ~string, V any](bolt *bbolt.DB, options Options, execOpts .
 	}
 
 	var (
-		loadedPlannerStats       *plannerStatsSnapshot
+		loadedPlannerStats       *qexec.PlannerStatsSnapshot
 		loadedFieldCount         int
 		loadedOrdinaryFieldCount int
 		buildMode                string
@@ -499,7 +500,7 @@ func New[K ~uint64 | ~string, V any](bolt *bbolt.DB, options Options, execOpts .
 		}
 
 		if loadedPlannerStats != nil && loadedOrdinaryFieldCount == len(db.schema.Fields) {
-			db.engine.publishLoadedPlannerStats(loadedPlannerStats, db.engine.snapshot.Current())
+			db.engine.exec.PublishLoadedPlannerStats(loadedPlannerStats, db.engine.snapshot.Current())
 
 		} else {
 			if err = db.RefreshPlannerStats(); err != nil {
@@ -528,32 +529,24 @@ func newQueryEngineForRuntime(rt *schema.Runtime, options *Options, strKey bool,
 	}
 
 	qe := &queryEngine{
-		schema:                         rt,
-		universe:                       posting.List{},
-		matPredCacheMaxEntries:         max(0, options.SnapshotMaterializedPredCacheMaxEntries),
-		matPredCacheMaxCard:            qcache.MaterializedPredMaxCardinality(options.SnapshotMaterializedPredCacheMaxCardinality),
-		numericRangeBucketSize:         options.NumericRangeBucketSize,
-		numericRangeBucketMinFieldKeys: options.NumericRangeBucketMinFieldKeys,
-		numericRangeBucketMinSpanKeys:  options.NumericRangeBucketMinSpanKeys,
-		snapshot:                       snapshot.NewManager(options.EnableSnapshotStats),
-		planner: &planner{
-			analyzer: &analyzer{
-				interval:   plannerAnalyzeInterval(options.AnalyzeInterval),
-				softBudget: defaultAnalyzeSoftBudget,
-			},
-			tracer: &tracer{
-				sink:        options.TraceSink,
-				sampleEvery: traceSampleEvery(options.TraceSampleEvery, options.TraceSink),
-			},
-			calibrator: &calibrator{
-				enabled:     options.CalibrationEnabled,
-				sampleEvery: calibrationSampleEvery(options.CalibrationEnabled, options.CalibrationSampleEvery),
-				persistPath: calPath,
-			},
-		},
-		viewPool: &pooled.Pointers[queryView]{
-			Clear: true,
-		},
+		schema:                 rt,
+		universe:               posting.List{},
+		matPredCacheMaxEntries: max(0, options.SnapshotMaterializedPredCacheMaxEntries),
+		matPredCacheMaxCard:    qcache.MaterializedPredMaxCardinality(options.SnapshotMaterializedPredCacheMaxCardinality),
+		snapshot:               snapshot.NewManager(options.EnableSnapshotStats),
+		exec: qexec.NewRuntime(qexec.Config{
+			Schema:                         rt,
+			NumericRangeBucketSize:         options.NumericRangeBucketSize,
+			NumericRangeBucketMinFieldKeys: options.NumericRangeBucketMinFieldKeys,
+			NumericRangeBucketMinSpanKeys:  options.NumericRangeBucketMinSpanKeys,
+			AnalyzeInterval:                plannerAnalyzeInterval(options.AnalyzeInterval),
+			AnalyzeSoftBudget:              defaultAnalyzeSoftBudget,
+			TraceSink:                      options.TraceSink,
+			TraceSampleEvery:               options.TraceSampleEvery,
+			CalibrationEnabled:             options.CalibrationEnabled,
+			CalibrationSampleEvery:         options.CalibrationSampleEvery,
+			CalibrationPersistPath:         calPath,
+		}),
 	}
 	slotCount := len(rt.Indexed)
 	qe.index = indexdata.GetFieldStorageSlice(slotCount)[:slotCount]
@@ -613,9 +606,7 @@ func newAutoBatcher(options *Options, runtime *autoBatchRuntime) *autoBatcher {
 		repeatStringIDPool: pooled.Maps[string, int]{
 			NewCap: 8,
 		},
-		requestScratchPool: pooled.Slices[*autoBatchRequest]{
-			Clear: true,
-		},
+		requestScratchPool: pooled.NewSlicePool[*autoBatchRequest](uint(max(defaultAutoBatchMax, options.AutoBatchMax)), pooled.ClearCap),
 		attemptStatePool: pooled.Pointers[autoBatchAttemptState]{
 			Cleanup: func(st *autoBatchAttemptState) {
 				st.autoBatchAttemptCore.cleanup()
@@ -714,41 +705,6 @@ func newAutoBatchScheduler(options *Options) autoBatchScheduler {
 	}
 }
 
-type planner struct {
-	statsVersion atomic.Uint64
-	stats        atomic.Pointer[plannerStatsSnapshot]
-
-	analyzer   *analyzer
-	tracer     *tracer
-	calibrator *calibrator
-}
-
-type analyzer struct {
-	interval   time.Duration
-	stop       chan struct{}
-	done       chan struct{}
-	softBudget time.Duration
-	cursor     int
-
-	sync.Mutex
-}
-
-type tracer struct {
-	sink        func(TraceEvent)
-	sampleEvery uint64
-	seq         atomic.Uint64
-}
-
-type calibrator struct {
-	enabled     bool
-	sampleEvery uint64
-	seq         atomic.Uint64
-	state       atomic.Pointer[calibration]
-	persistPath string
-
-	sync.Mutex
-}
-
 type autoBatchScheduler struct {
 	statsEnabled bool
 	window       time.Duration
@@ -803,7 +759,7 @@ type autoBatcher struct {
 	runtime            *autoBatchRuntime
 	repeatUintIDPool   pooled.Maps[uint64, int]
 	repeatStringIDPool pooled.Maps[string, int]
-	requestScratchPool pooled.Slices[*autoBatchRequest]
+	requestScratchPool *pooled.SlicePool[*autoBatchRequest]
 	attemptStatePool   pooled.Pointers[autoBatchAttemptState]
 	requestPool        pooled.Pointers[autoBatchRequest]
 }
@@ -1283,7 +1239,7 @@ func publishAfterCommitLocked(testHooks *testHooks, broken *atomic.Bool, logger 
 		if r := recover(); r != nil {
 			if broken.CompareAndSwap(false, true) {
 				logger.Printf("rbi: index entered broken state: post-commit snapshot publish failed (%v): %v", op, r)
-				if stop := engine.planner.analyzer.stop; stop != nil {
+				if stop := engine.exec.Analyzer.Stop; stop != nil {
 					select {
 					case <-stop:
 					default:
@@ -1580,7 +1536,7 @@ func (db *DB[K, V]) PlannerStats() PlannerStats {
 	}
 	out.Fields = make(map[string]PlannerFieldStats)
 
-	if ps := db.engine.planner.stats.Load(); ps != nil {
+	if ps := db.engine.exec.Stats.Load(); ps != nil {
 		out.Version = ps.Version
 		out.GeneratedAt = ps.GeneratedAt
 		out.UniverseCardinality = ps.UniverseCardinality
@@ -1592,10 +1548,10 @@ func (db *DB[K, V]) PlannerStats() PlannerStats {
 			}
 		}
 	}
-	out.TraceSampleEvery = db.engine.planner.tracer.sampleEvery
-	db.engine.planner.analyzer.Lock()
-	out.AnalyzeInterval = db.engine.planner.analyzer.interval
-	db.engine.planner.analyzer.Unlock()
+	out.TraceSampleEvery = db.engine.exec.Tracer.SampleEvery()
+	db.engine.exec.Analyzer.Lock()
+	out.AnalyzeInterval = db.engine.exec.Analyzer.Interval
+	db.engine.exec.Analyzer.Unlock()
 	return out
 }
 
@@ -1611,16 +1567,15 @@ func (db *DB[K, V]) PlannerStats() PlannerStats {
 // returned calibration payload is zero-valued.
 func (db *DB[K, V]) CalibrationStats() CalibrationStats {
 	out := CalibrationStats{
-		Multipliers: make(map[string]float64, int(plannerCalPlanCount)),
-		Samples:     make(map[string]uint64, int(plannerCalPlanCount)),
+		Multipliers: make(map[string]float64, int(qexec.CalPlanCount)),
+		Samples:     make(map[string]uint64, int(qexec.CalPlanCount)),
 	}
 	if db.engine == nil {
 		return out
 	}
-	out.Enabled = db.engine.planner.calibrator.enabled
-	out.SampleEvery = db.engine.planner.calibrator.sampleEvery
-	if cs := db.engine.planner.calibrator.state.Load(); cs != nil {
-		cal := calibrationSnapshotFromState(cs)
+	out.Enabled = db.engine.exec.Calibrator.Enabled()
+	out.SampleEvery = db.engine.exec.Calibrator.SampleEvery()
+	if cal, ok := db.engine.exec.Calibrator.Snapshot(); ok {
 		out.UpdatedAt = cal.UpdatedAt
 		out.Multipliers = cal.Multipliers
 		out.Samples = cal.Samples

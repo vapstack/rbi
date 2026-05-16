@@ -11,9 +11,6 @@ type Shape struct {
 }
 
 func NewShape(query *Query) Shape {
-	if query == nil {
-		return Shape{}
-	}
 	shape := Shape{
 		Expr:   query.Expr,
 		Offset: query.Offset,

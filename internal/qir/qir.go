@@ -134,9 +134,6 @@ func (q *Query) Release() {
 }
 
 func (q *Query) releaseOwned() {
-	if q == nil {
-		return
-	}
 	for i := 0; i < q.exprOwnersUsed; i++ {
 		s := q.exprOwners[i]
 		if cap(s) > queryExprOwnerMaxCap {

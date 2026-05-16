@@ -534,16 +534,13 @@ type Codec interface {
 If it does, RBI uses it instead of msgpack for all encoding/decoding work.
 Fallback decoding, if required, is the responsibility of the implementation.
 
-## Non-goals
+## Limitations
 
 This package does not aim to be a relational database or a SQL engine.
 
 * no projections (`SELECT field1, field2`),
 * no joins,
-* no aggregation functions (for now),
 * no query-time computed fields.
-
-The focus is on fast selection of complete documents.
 
 ## Performance notes
 
@@ -618,6 +615,10 @@ Write speed depends on how many index entries are touched per operation
 Insertions are typically more expensive than updates.
 
 Batch APIs (`BatchSet`, `BatchPatch`, `BatchDelete`) significantly reduce per-record overhead.
+
+Throughput of many parallel single operations can be increased
+using `AutoBatchMax`, `AutoBatchWindow` and `AutoBatchMaxQueue`. 
+
 
 ## Contributing
 

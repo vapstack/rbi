@@ -98,6 +98,20 @@ func QueryValueToUnixSeconds(v reflect.Value) (int64, bool) {
 	return v.Convert(nativeTimeType).Interface().(time.Time).Unix(), true
 }
 
+func UnwrapQueryValue(v reflect.Value) (reflect.Value, bool) {
+	for {
+		switch v.Kind() {
+		case reflect.Interface, reflect.Pointer:
+			if v.IsNil() {
+				return v, true
+			}
+			v = v.Elem()
+			continue
+		}
+		return v, false
+	}
+}
+
 func inferFieldWriteKeyKind(kind reflect.Kind, useVI, nativeTime bool) FieldKeyKind {
 	if nativeTime {
 		return FieldWriteKeysOrderedU64

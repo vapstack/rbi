@@ -1772,16 +1772,16 @@ func TestAPI_SetCalibrationSnapshot_ClampsInvalidMultipliers(t *testing.T) {
 		t.Fatalf("expected calibration snapshot")
 	}
 
-	if math.Abs(got.Multipliers["plan_ordered"]-calibrationMultiplierMin) > 0.0001 {
+	if math.Abs(got.Multipliers["plan_ordered"]-0.40) > 0.0001 {
 		t.Fatalf("plan_ordered not clamped to min: %v", got.Multipliers["plan_ordered"])
 	}
-	if math.Abs(got.Multipliers["plan_or_merge_no_order"]-calibrationMultiplierMax) > 0.0001 {
+	if math.Abs(got.Multipliers["plan_or_merge_no_order"]-4.0) > 0.0001 {
 		t.Fatalf("plan_or_merge_no_order not clamped to max: %v", got.Multipliers["plan_or_merge_no_order"])
 	}
-	if math.Abs(got.Multipliers["plan_limit_order_basic"]-calibrationMultiplierMin) > 0.0001 {
+	if math.Abs(got.Multipliers["plan_limit_order_basic"]-0.40) > 0.0001 {
 		t.Fatalf("plan_limit_order_basic NaN was not clamped to min: %v", got.Multipliers["plan_limit_order_basic"])
 	}
-	if math.Abs(got.Multipliers["plan_limit_order_prefix"]-calibrationMultiplierMin) > 0.0001 {
+	if math.Abs(got.Multipliers["plan_limit_order_prefix"]-0.40) > 0.0001 {
 		t.Fatalf("plan_limit_order_prefix +Inf was not clamped to min: %v", got.Multipliers["plan_limit_order_prefix"])
 	}
 }

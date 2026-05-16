@@ -197,6 +197,51 @@ func TestPrepareCountExpr_NormalizedTreeAvoidsExtraOwnedCopy(t *testing.T) {
 	}
 }
 
+func TestCollectAndLeaves_ExtractRejectsNegatedAndGroup(t *testing.T) {
+	e := Expr{
+		Op: OpAND,
+		Operands: []Expr{
+			{
+				Op:  OpAND,
+				Not: true,
+				Operands: []Expr{
+					{Op: OpEQ, FieldOrdinal: 1, Value: "a@example.com"},
+					{Op: OpEQ, FieldOrdinal: 2, Value: 42},
+				},
+			},
+			{Op: OpEQ, FieldOrdinal: 3, Value: true},
+		},
+	}
+
+	leaves, ok := CollectAndLeaves(e, LeafModeExtract)
+	if ok || leaves != nil {
+		t.Fatalf("expected negated AND group to be rejected, got ok=%v leaves=%v", ok, leaves)
+	}
+}
+
+func TestCollectAndLeavesFixed_RejectsNegatedAndGroup(t *testing.T) {
+	e := Expr{
+		Op: OpAND,
+		Operands: []Expr{
+			{
+				Op:  OpAND,
+				Not: true,
+				Operands: []Expr{
+					{Op: OpEQ, FieldOrdinal: 1, Value: "a@example.com"},
+					{Op: OpEQ, FieldOrdinal: 2, Value: 42},
+				},
+			},
+			{Op: OpEQ, FieldOrdinal: 3, Value: true},
+		},
+	}
+
+	var buf [4]Expr
+	leaves, ok := CollectAndLeavesFixed(e, buf[:0])
+	if ok || leaves != nil {
+		t.Fatalf("expected negated AND group to be rejected, got ok=%v leaves=%v", ok, leaves)
+	}
+}
+
 func TestNormalizeExpr_OrFalseCollapsesToLeaf(t *testing.T) {
 	leaf := Expr{Op: OpGTE, FieldOrdinal: 1, Value: 21}
 	in := Expr{
@@ -214,6 +259,67 @@ func TestNormalizeExpr_OrFalseCollapsesToLeaf(t *testing.T) {
 	}
 	if !reflect.DeepEqual(out, leaf) {
 		t.Fatalf("unexpected normalize result:\n got=%+v\nwant=%+v", out, leaf)
+	}
+}
+
+func TestNormalizeExpr_AlreadyCanonicalAND_AllocsPerRunStayZero(t *testing.T) {
+	if testRaceEnabled {
+		t.Skip("testing.AllocsPerRun is not stable under -race")
+	}
+
+	expr := Expr{
+		Op: OpAND,
+		Operands: []Expr{
+			{Op: OpEQ, FieldOrdinal: 0, Value: true},
+			{Op: OpIN, FieldOrdinal: 1, Value: []string{"DE", "NL"}},
+			{Op: OpHASANY, FieldOrdinal: 2, Value: []string{"go", "ops"}},
+			{Op: OpGTE, FieldOrdinal: 3, Value: 21},
+		},
+	}
+
+	out, changed := NormalizeExpr(expr)
+	if changed {
+		t.Fatalf("expected canonical AND to stay unchanged")
+	}
+	if !reflect.DeepEqual(out, expr) {
+		t.Fatalf("unexpected normalize result:\n got=%+v\nwant=%+v", out, expr)
+	}
+
+	allocs := testing.AllocsPerRun(100, func() {
+		_, _ = NormalizeExpr(expr)
+	})
+	if allocs > 0 {
+		t.Fatalf("unexpected allocs per run: got=%v want=0", allocs)
+	}
+}
+
+func TestNormalizeExpr_AlreadyCanonicalOR_AllocsPerRunStayZero(t *testing.T) {
+	if testRaceEnabled {
+		t.Skip("testing.AllocsPerRun is not stable under -race")
+	}
+
+	expr := Expr{
+		Op: OpOR,
+		Operands: []Expr{
+			{Op: OpEQ, FieldOrdinal: 0, Value: true},
+			{Op: OpIN, FieldOrdinal: 1, Value: []string{"DE", "NL"}},
+			{Op: OpPREFIX, FieldOrdinal: 2, Value: "ali"},
+		},
+	}
+
+	out, changed := NormalizeExpr(expr)
+	if changed {
+		t.Fatalf("expected canonical OR to stay unchanged")
+	}
+	if !reflect.DeepEqual(out, expr) {
+		t.Fatalf("unexpected normalize result:\n got=%+v\nwant=%+v", out, expr)
+	}
+
+	allocs := testing.AllocsPerRun(100, func() {
+		_, _ = NormalizeExpr(expr)
+	})
+	if allocs > 0 {
+		t.Fatalf("unexpected allocs per run: got=%v want=0", allocs)
 	}
 }
 

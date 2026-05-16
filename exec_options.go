@@ -8,9 +8,11 @@ import (
 	"go.etcd.io/bbolt"
 )
 
-type beforeProcessFunc[K ~string | ~uint64, V any] = func(key K, value *V) error
-type beforeStoreFunc[K ~string | ~uint64, V any] = func(key K, oldValue, newValue *V) error
-type beforeCommitFunc[K ~string | ~uint64, V any] = func(tx *bbolt.Tx, key K, oldValue, newValue *V) error
+type (
+	beforeProcessFunc[K ~string | ~uint64, V any] = func(key K, value *V) error
+	beforeStoreFunc[K ~string | ~uint64, V any]   = func(key K, oldValue, newValue *V) error
+	beforeCommitFunc[K ~string | ~uint64, V any]  = func(tx *bbolt.Tx, key K, oldValue, newValue *V) error
+)
 
 type execOptions[K ~string | ~uint64, V any] struct {
 	beforeProcess []autoBatchBeforeProcessHook

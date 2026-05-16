@@ -18,13 +18,125 @@ import (
 	"github.com/vapstack/qx"
 	"github.com/vapstack/rbi/internal/indexdata"
 	"github.com/vapstack/rbi/internal/keycodec"
-	"github.com/vapstack/rbi/internal/pooled"
 	"github.com/vapstack/rbi/internal/posting"
-	"github.com/vapstack/rbi/internal/schema"
+	"github.com/vapstack/rbi/internal/qagg"
 	"github.com/vapstack/rbi/internal/snapshot"
 	"github.com/vapstack/rbi/internal/strmap"
 	"go.etcd.io/bbolt"
 )
+
+type indexStatsTestRec struct {
+	Name string `db:"name" rbi:"index"`
+	Rank *int   `db:"rank" rbi:"index"`
+}
+
+func openTempDBUint64IndexStats(t *testing.T, options ...Options) *DB[uint64, indexStatsTestRec] {
+	t.Helper()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "index_stats.db")
+	db, raw := openBoltAndNew[uint64, indexStatsTestRec](t, path, options...)
+
+	t.Cleanup(func() {
+		_ = db.Close()
+		_ = raw.Close()
+	})
+
+	return db
+}
+
+func TestIndexStats_ReportsFieldsAndTotals(t *testing.T) {
+	db := openTempDBUint64IndexStats(t)
+
+	const total = 96
+	rankNil := 0
+	var rankSeen [7]bool
+	for i := 0; i < total; i++ {
+		var rank *int
+		if i%5 != 0 {
+			rank = new(int)
+			*rank = i % 7
+			rankSeen[i%7] = true
+		} else {
+			rankNil++
+		}
+		if err := db.Set(uint64(i+1), &indexStatsTestRec{
+			Name: fmt.Sprintf("user_%04d", i),
+			Rank: rank,
+		}); err != nil {
+			t.Fatalf("Set(%d): %v", i+1, err)
+		}
+	}
+	rankUnique := 0
+	for i := range rankSeen {
+		if rankSeen[i] {
+			rankUnique++
+		}
+	}
+	rankEntries := rankUnique + 1
+
+	got := db.IndexStats()
+	if got.UniqueFieldKeys["name"] != total {
+		t.Fatalf("name unique keys=%d, want %d", got.UniqueFieldKeys["name"], total)
+	}
+	if got.UniqueFieldKeys["rank"] != uint64(rankUnique) {
+		t.Fatalf("rank unique keys=%d, want %d", got.UniqueFieldKeys["rank"], rankUnique)
+	}
+	if got.FieldTotalCardinality["name"] != total {
+		t.Fatalf("name cardinality=%d, want %d", got.FieldTotalCardinality["name"], total)
+	}
+	if got.FieldTotalCardinality["rank"] != total {
+		t.Fatalf("rank cardinality=%d, want %d", got.FieldTotalCardinality["rank"], total)
+	}
+	if got.EntryCount != uint64(total+rankEntries) {
+		t.Fatalf("entry count=%d, want %d", got.EntryCount, total+rankEntries)
+	}
+	if got.PostingCardinality != total*2 {
+		t.Fatalf("posting cardinality=%d, want %d", got.PostingCardinality, total*2)
+	}
+	if rankNil == 0 {
+		t.Fatalf("test setup did not generate nil rank rows")
+	}
+
+	var structSum uint64
+	var sizeSum uint64
+	var keySum uint64
+	var cardSum uint64
+	var heapSum uint64
+	for _, name := range []string{"name", "rank"} {
+		if got.FieldSize[name] == 0 {
+			t.Fatalf("expected FieldSize[%q] to be populated", name)
+		}
+		if got.FieldKeyBytes[name] == 0 {
+			t.Fatalf("expected FieldKeyBytes[%q] to be populated", name)
+		}
+		fieldStruct := got.FieldApproxStructBytes[name]
+		fieldHeap := got.FieldApproxHeapBytes[name]
+		if fieldHeap != got.FieldSize[name]+got.FieldKeyBytes[name]+fieldStruct {
+			t.Fatalf("field heap mismatch for %q: got=%d want=%d", name, fieldHeap, got.FieldSize[name]+got.FieldKeyBytes[name]+fieldStruct)
+		}
+		sizeSum += got.FieldSize[name]
+		keySum += got.FieldKeyBytes[name]
+		cardSum += got.FieldTotalCardinality[name]
+		structSum += fieldStruct
+		heapSum += fieldHeap
+	}
+	if sizeSum != got.Size {
+		t.Fatalf("FieldSize sum mismatch: got=%d want=%d", sizeSum, got.Size)
+	}
+	if keySum != got.KeyBytes {
+		t.Fatalf("FieldKeyBytes sum mismatch: got=%d want=%d", keySum, got.KeyBytes)
+	}
+	if cardSum != got.PostingCardinality {
+		t.Fatalf("FieldTotalCardinality sum mismatch: got=%d want=%d", cardSum, got.PostingCardinality)
+	}
+	if structSum != got.ApproxStructBytes {
+		t.Fatalf("FieldApproxStructBytes sum mismatch: got=%d want=%d", structSum, got.ApproxStructBytes)
+	}
+	if heapSum != got.ApproxHeapBytes {
+		t.Fatalf("FieldApproxHeapBytes sum mismatch: got=%d want=%d", heapSum, got.ApproxHeapBytes)
+	}
+}
 
 func TestReadSidecarString_RoundTrip(t *testing.T) {
 	var payload bytes.Buffer
@@ -46,19 +158,8 @@ func TestReadSidecarString_RoundTrip(t *testing.T) {
 	}
 }
 
-func TestQueryViewIdxMapping_UsesPinnedStrMapSnapshot(t *testing.T) {
-	db := &DB[string, UserBench]{
-		strKey:  true,
-		strMap:  strmap.New(0, defaultSnapshotStrMapCompactDepth),
-		options: &Options{},
-		engine: &queryEngine{
-			schema:  &schema.Runtime{Fields: map[string]*schema.Field{}},
-			planner: &planner{},
-			viewPool: &pooled.Pointers[queryView]{
-				Clear: true,
-			},
-		},
-	}
+func TestPinnedStrMapSnapshotKeepsOriginalMapping(t *testing.T) {
+	liveMapper := strmap.New(0, defaultSnapshotStrMapCompactDepth)
 	snapMapper := strmap.New(0, defaultSnapshotStrMapCompactDepth)
 	if idx, created := snapMapper.Create("snap-key"); idx != 1 || !created {
 		t.Fatalf("snap Create = %d/%v, want 1/true", idx, created)
@@ -68,18 +169,9 @@ func TestQueryViewIdxMapping_UsesPinnedStrMapSnapshot(t *testing.T) {
 		StrMap:            strMapSnap,
 		LenZeroComplement: snapshotTestBoolSlots(nil, nil),
 	}
-	view := &queryView{
-		engine:            db.engine,
-		snap:              indexSnap,
-		strKey:            true,
-		strMapView:        strMapSnap,
-		planner:           db.engine.planner,
-		lenZeroComplement: indexSnap.LenZeroComplement,
-	}
+	liveMapper.Create("live-key")
 
-	db.strMap.Create("live-key")
-
-	if got, ok := view.strMapView.String(1); !ok || got != "snap-key" {
+	if got, ok := indexSnap.StrMap.String(1); !ok || got != "snap-key" {
 		t.Fatalf("strmap snapshot mismatch: got=%q ok=%v want=%q", got, ok, "snap-key")
 	}
 }
@@ -334,13 +426,13 @@ func TestRebuildIndex_KeepsPinnedSnapshotStorage(t *testing.T) {
 		t.Fatalf("RebuildIndex: %v", err)
 	}
 
-	view := db.engine.makeQueryView(snap)
-	defer db.engine.releaseQueryView(view)
 	namePrepared, nameShape, err := prepareTestQuery(db.engine, qx.Query(qx.EQ("name", "alice")))
 	if err != nil {
 		t.Fatalf("prepare name query: %v", err)
 	}
-	nameIDs, err := view.execQuery(&nameShape, false, false)
+	view := db.engine.exec.AcquireView(snap)
+	nameIDs, err := view.Query(&nameShape, false, false)
+	db.engine.exec.ReleaseView(view)
 	namePrepared.Release()
 	if err != nil {
 		t.Fatalf("old snapshot name query: %v", err)
@@ -353,7 +445,9 @@ func TestRebuildIndex_KeepsPinnedSnapshotStorage(t *testing.T) {
 	if err != nil {
 		t.Fatalf("prepare empty-tags query: %v", err)
 	}
-	tagIDs, err := view.execQuery(&tagsShape, false, false)
+	view = db.engine.exec.AcquireView(snap)
+	tagIDs, err := view.Query(&tagsShape, false, false)
+	db.engine.exec.ReleaseView(view)
 	tagsPrepared.Release()
 	if err != nil {
 		t.Fatalf("old snapshot empty-tags query: %v", err)
@@ -362,18 +456,14 @@ func TestRebuildIndex_KeepsPinnedSnapshotStorage(t *testing.T) {
 		t.Fatalf("old snapshot empty-tags query mismatch: got=%v want=[2]", tagIDs)
 	}
 
-	agg, err := db.engine.prepareAggregate(qx.Aggregate(qx.SUM("amount").AS("sum_amount")))
+	agg, err := qagg.Prepare(qx.Aggregate(qx.SUM("amount").AS("sum_amount")), db.engine.schema)
 	if err != nil {
 		t.Fatalf("prepare aggregate: %v", err)
 	}
-	ids, err := view.aggregateMatchedIDs(agg.filter)
-	if err != nil {
-		agg.release()
-		t.Fatalf("old snapshot aggregate ids: %v", err)
-	}
-	result, err := view.executeAggregate(agg, ids)
-	ids.Release()
-	agg.release()
+	view = db.engine.exec.AcquireView(snap)
+	result, err := qagg.Execute(view, snap, agg)
+	db.engine.exec.ReleaseView(view)
+	agg.Release()
 	if err != nil {
 		t.Fatalf("old snapshot aggregate: %v", err)
 	}
@@ -1654,14 +1744,11 @@ func TestPlanCandidateOrder_SkipsPointerSortField(t *testing.T) {
 	}
 	assertSameSlice(t, got, want)
 
-	nq := normalizeQueryForTest(q)
-	planOut, ok, err := db.engine.tryPlan(nq, nil)
+	got, err = db.QueryKeys(q)
 	if err != nil {
-		t.Fatalf("tryPlan: %v", err)
+		t.Fatalf("QueryKeys(second): %v", err)
 	}
-	if ok {
-		t.Fatalf("expected tryPlan to skip pointer ORDER fast paths, got %v", planOut)
-	}
+	assertSameSlice(t, got, want)
 }
 
 func TestPointerNil_OrderExecutionFastPaths(t *testing.T) {
@@ -1680,96 +1767,21 @@ func TestPointerNil_OrderExecutionFastPaths(t *testing.T) {
 		}
 	}
 
-	qLimit := qx.Query(qx.EQ("active", true)).Sort("opt", qx.ASC).Limit(3)
-	limitLeaves := mustExtractAndLeaves(t, qLimit.Filter)
-	out, used, err := db.engine.tryLimitQueryOrderBasic(qLimit, limitLeaves, nil)
-	if err != nil {
-		t.Fatalf("tryLimitQueryOrderBasic: %v", err)
+	queries := []*qx.QX{
+		qx.Query(qx.EQ("active", true)).Sort("opt", qx.ASC).Limit(3),
+		qx.Query(qx.EQ("active", true)).Sort("opt", qx.ASC).Offset(1).Limit(2),
+		qx.Query(qx.EQ("opt", nil)).Sort("opt", qx.ASC).Limit(10),
+		qx.Query(qx.PREFIX("opt", "")).Sort("opt", qx.ASC).Offset(1).Limit(2),
+		qx.Query(qx.PREFIX("opt", "")).Sort("opt", qx.DESC).Offset(1).Limit(2),
 	}
-	want, err := expectedKeysUint64(t, db, qLimit)
-	if err != nil {
-		t.Fatalf("expectedKeysUint64(limit): %v", err)
-	}
-	if used {
-		assertSameSlice(t, out, want)
-	} else {
-		got, err := db.QueryKeys(qLimit)
+	for i, q := range queries {
+		got, err := db.QueryKeys(q)
 		if err != nil {
-			t.Fatalf("QueryKeys(limit): %v", err)
+			t.Fatalf("q%d QueryKeys: %v", i, err)
 		}
-		assertSameSlice(t, got, want)
-	}
-
-	qOffset := qx.Query(qx.EQ("active", true)).Sort("opt", qx.ASC).Offset(1).Limit(2)
-	out, used, err = db.engine.tryQueryOrderBasicWithLimit(qOffset, nil)
-	if err != nil {
-		t.Fatalf("tryQueryOrderBasicWithLimit: %v", err)
-	}
-	if !used {
-		t.Fatalf("expected tryQueryOrderBasicWithLimit to be used")
-	}
-	want, err = expectedKeysUint64(t, db, qOffset)
-	if err != nil {
-		t.Fatalf("expectedKeysUint64(offset): %v", err)
-	}
-	assertSameSlice(t, out, want)
-
-	qEqNilLimit := qx.Query(qx.EQ("opt", nil)).Sort("opt", qx.ASC).Limit(10)
-	eqNilLeaves := mustExtractAndLeaves(t, qEqNilLimit.Filter)
-	out, used, err = db.engine.tryLimitQueryOrderBasic(qEqNilLimit, eqNilLeaves, nil)
-	if err != nil {
-		t.Fatalf("tryLimitQueryOrderBasic(eq nil): %v", err)
-	}
-	want, err = expectedKeysUint64(t, db, qEqNilLimit)
-	if err != nil {
-		t.Fatalf("expectedKeysUint64(eq nil limit): %v", err)
-	}
-	if used {
-		assertSameSlice(t, out, want)
-	}
-	planOut, used, err := db.engine.tryExecutionPlan(qEqNilLimit, nil)
-	if err != nil {
-		t.Fatalf("tryExecutionPlan(eq nil limit): %v", err)
-	}
-	if !used {
-		t.Fatalf("expected tryExecutionPlan to use ORDER+LIMIT fast path for eq nil")
-	}
-	assertSameSlice(t, planOut, want)
-
-	qPrefix := qx.Query(qx.PREFIX("opt", "")).Sort("opt", qx.ASC).Offset(1).Limit(2)
-	out, used, err = db.engine.tryQueryOrderPrefixWithLimit(qPrefix, nil)
-	if err != nil {
-		t.Fatalf("tryQueryOrderPrefixWithLimit: %v", err)
-	}
-	want, err = expectedKeysUint64(t, db, qPrefix)
-	if err != nil {
-		t.Fatalf("expectedKeysUint64(prefix): %v", err)
-	}
-	if used {
-		assertSameSlice(t, out, want)
-	} else {
-		got, err := db.QueryKeys(qPrefix)
+		want, err := expectedKeysUint64(t, db, q)
 		if err != nil {
-			t.Fatalf("QueryKeys(prefix): %v", err)
-		}
-		assertSameSlice(t, got, want)
-	}
-
-	qPrefixDesc := qx.Query(qx.PREFIX("opt", "")).Sort("opt", qx.DESC).Offset(1).Limit(2)
-	out, used, err = db.engine.tryQueryOrderPrefixWithLimit(qPrefixDesc, nil)
-	if err != nil {
-		t.Fatalf("tryQueryOrderPrefixWithLimit(desc): %v", err)
-	}
-	want, err = expectedKeysUint64(t, db, qPrefixDesc)
-	if err != nil {
-		t.Fatalf("expectedKeysUint64(prefix desc): %v", err)
-	}
-	if used {
-		assertSameSlice(t, out, want)
-	} else {
-		got, err := db.QueryKeys(qPrefixDesc)
-		if err != nil {
-			t.Fatalf("QueryKeys(prefix desc): %v", err)
+			t.Fatalf("q%d expectedKeysUint64: %v", i, err)
 		}
 		assertSameSlice(t, got, want)
 	}
@@ -1819,27 +1831,13 @@ func TestPointerNil_ExecPlanOrderedBasic_BaseNilTail(t *testing.T) {
 		qx.NOT(qx.EQ("active", false)),
 	).Sort("opt", qx.ASC).Offset(1).Limit(3))
 
-	preparedQ, viewQ, err := prepareTestQuery(db.engine, q)
+	got, err := db.QueryKeys(q)
 	if err != nil {
-		t.Fatalf("prepareTestQuery: %v", err)
+		t.Fatalf("QueryKeys: %v", err)
 	}
-	defer preparedQ.Release()
-
-	leaves := mustExtractAndLeaves(t, q.Filter)
-	window, _ := orderWindow(&viewQ)
-	preds, ok := db.engine.buildPredicatesOrderedWithMode(leaves, "opt", false, window, q.Window.Offset, true, true)
-	if !ok {
-		t.Fatalf("buildPredicatesOrderedWithMode: ok=false")
-	}
-	defer releasePredicates(preds)
-
-	got, ok := db.engine.execPlanOrderedBasic(q, preds, nil)
-	if !ok {
-		t.Fatalf("execPlanOrderedBasic: ok=false")
-	}
-	want, err := db.engine.currentQueryViewForTests().execPreparedQuery(&viewQ)
+	want, err := expectedKeysUint64(t, db, q)
 	if err != nil {
-		t.Fatalf("execPreparedQuery: %v", err)
+		t.Fatalf("expectedKeysUint64: %v", err)
 	}
 	assertSameSlice(t, got, want)
 }
@@ -1891,22 +1889,13 @@ func TestPointerNil_TryPlanOrdered_AllowsPointerSortField(t *testing.T) {
 		qx.NOT(qx.EQ("active", false)),
 	).Sort("opt", qx.DESC).Offset(1).Limit(2))
 
-	got, ok, err := db.engine.tryPlan(q, nil)
+	got, err := db.QueryKeys(q)
 	if err != nil {
-		t.Fatalf("tryPlan: %v", err)
+		t.Fatalf("QueryKeys: %v", err)
 	}
-	if !ok {
-		t.Fatalf("expected tryPlan to use ordered planner path for pointer sort field")
-	}
-	preparedQ, viewQ, err := prepareTestQuery(db.engine, q)
+	want, err := expectedKeysUint64(t, db, q)
 	if err != nil {
-		t.Fatalf("prepareTestQuery: %v", err)
-	}
-	defer preparedQ.Release()
-
-	want, err := db.engine.currentQueryViewForTests().execPreparedQuery(&viewQ)
-	if err != nil {
-		t.Fatalf("execPreparedQuery: %v", err)
+		t.Fatalf("expectedKeysUint64: %v", err)
 	}
 	assertSameSlice(t, got, want)
 }
@@ -2358,9 +2347,9 @@ func TestIndexExt_SnapshotQueryStableDuringConcurrentWrites(t *testing.T) {
 	}
 	defer prepared.Release()
 
-	view := db.engine.makeQueryView(snap)
-	wantKeys, err := view.execQuery(&viewQ, false, false)
-	db.engine.releaseQueryView(view)
+	view := db.engine.exec.AcquireView(snap)
+	wantKeys, err := view.Query(&viewQ, false, false)
+	db.engine.exec.ReleaseView(view)
 	if err != nil {
 		t.Fatalf("pinned snapshot query: %v", err)
 	}
@@ -2380,9 +2369,9 @@ func TestIndexExt_SnapshotQueryStableDuringConcurrentWrites(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for i := 0; i < 200; i++ {
-				view := db.engine.makeQueryView(snap)
-				gotKeys, err := view.execQuery(&viewQ, false, false)
-				db.engine.releaseQueryView(view)
+				view := db.engine.exec.AcquireView(snap)
+				gotKeys, err := view.Query(&viewQ, false, false)
+				db.engine.exec.ReleaseView(view)
 				if err != nil {
 					setFailed(fmt.Sprintf("pinned snapshot query: %v", err))
 					return
@@ -2663,4 +2652,431 @@ func TestIndexExt_DBFloatFieldBinaryStringEqualityMatchesExpected(t *testing.T) 
 
 func postingConsumerExpected(ids posting.List) []uint64 {
 	return ids.ToArray()
+}
+
+func TestSet_ReindexesAllSliceValues_OnReplace(t *testing.T) {
+	db, _ := openTempDBUint64(t)
+	_ = seedData(t, db, 420)
+
+	old, err := db.Get(215)
+	if err != nil {
+		t.Fatalf("Get(before 215): %v", err)
+	}
+
+	rec := &Rec{
+		Meta:     Meta{Country: "PL"},
+		Name:     "alice",
+		Email:    "alice-215@example.test",
+		Age:      73,
+		Score:    35.20025742868052,
+		Active:   false,
+		Tags:     []string{"rust", "db", "ops"},
+		FullName: "FN-00215",
+	}
+	mods := db.getModifiedIndexedFields(old, rec)
+	if !slices.Contains(mods, "tags") {
+		t.Fatalf("expected tags in modified fields, got: %v", mods)
+	}
+
+	if err := db.Set(215, rec); err != nil {
+		t.Fatalf("Set(215): %v", err)
+	}
+
+	has := db.engine.snapshot.Current().FieldLookupPostingRetained("tags", "db").Contains(215)
+	if !has {
+		v, err := db.Get(215)
+		if err != nil {
+			t.Fatalf("Get(215): %v", err)
+		}
+		t.Fatalf("expected tags=db index to contain id=215 after Set, rec=%#v old=%#v mods=%v", v, old, mods)
+	}
+}
+
+func TestSet_ReindexesScalarString_OnReplace(t *testing.T) {
+	db, _ := openTempDBUint64(t)
+	_ = seedData(t, db, 420)
+
+	old, err := db.Get(215)
+	if err != nil {
+		t.Fatalf("Get(before 215): %v", err)
+	}
+	oldFullName := old.FullName
+	db.ReleaseRecords(old)
+
+	rec := &Rec{
+		Meta:     Meta{Country: "PL"},
+		Name:     "alice",
+		Email:    "alice-215@example.test",
+		Age:      73,
+		Score:    35.20025742868052,
+		Active:   false,
+		Tags:     []string{"rust", "db", "ops"},
+		FullName: "FN-99999",
+	}
+	if err := db.Set(215, rec); err != nil {
+		t.Fatalf("Set(215): %v", err)
+	}
+
+	snap := db.engine.snapshot.Current()
+	if snap.FieldLookupPostingRetained("full_name", oldFullName).Contains(215) {
+		t.Fatalf("old full_name index still contains id=215")
+	}
+	if !snap.FieldLookupPostingRetained("full_name", rec.FullName).Contains(215) {
+		t.Fatalf("new full_name index does not contain id=215")
+	}
+}
+
+func TestBatchSet_RepeatedIDReindexesScalarString(t *testing.T) {
+	db, _ := openTempDBUint64(t)
+	_ = seedData(t, db, 420)
+
+	old, err := db.Get(215)
+	if err != nil {
+		t.Fatalf("Get(before 215): %v", err)
+	}
+	oldFullName := old.FullName
+	db.ReleaseRecords(old)
+
+	first := &Rec{
+		Meta:     Meta{Country: "PL"},
+		Name:     "alice",
+		Email:    "alice-215-a@example.test",
+		Age:      73,
+		Score:    35.20025742868052,
+		Active:   false,
+		Tags:     []string{"rust", "db", "ops"},
+		FullName: "FN-88888",
+	}
+	second := *first
+	second.Email = "alice-215-b@example.test"
+	second.FullName = "FN-99999"
+	if err := db.BatchSet([]uint64{215, 215}, []*Rec{first, &second}); err != nil {
+		t.Fatalf("BatchSet repeated id: %v", err)
+	}
+
+	snap := db.engine.snapshot.Current()
+	if snap.FieldLookupPostingRetained("full_name", oldFullName).Contains(215) {
+		t.Fatalf("old full_name index still contains id=215")
+	}
+	if snap.FieldLookupPostingRetained("full_name", first.FullName).Contains(215) {
+		t.Fatalf("intermediate full_name index contains id=215")
+	}
+	if !snap.FieldLookupPostingRetained("full_name", second.FullName).Contains(215) {
+		t.Fatalf("final full_name index does not contain id=215")
+	}
+}
+
+func TestDelete_ReindexesScalarString(t *testing.T) {
+	db, _ := openTempDBUint64(t)
+	_ = seedData(t, db, 420)
+
+	old, err := db.Get(215)
+	if err != nil {
+		t.Fatalf("Get(before 215): %v", err)
+	}
+	oldFullName := old.FullName
+	db.ReleaseRecords(old)
+
+	if err := db.Delete(215); err != nil {
+		t.Fatalf("Delete(215): %v", err)
+	}
+	if db.engine.snapshot.Current().FieldLookupPostingRetained("full_name", oldFullName).Contains(215) {
+		t.Fatalf("old full_name index still contains id=215 after delete")
+	}
+}
+
+func TestSequentialSetChurnMaintainsScalarStringCardinality(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1, AutoBatchMax: 1})
+	_ = seedData(t, db, 1_600)
+
+	countries := []string{"NL", "PL", "DE", "Finland", "Iceland", "Thailand", "US"}
+	tagPool := []string{"go", "db", "ops", "rust", "java", "infra"}
+	names := []string{"alice", "albert", "bob", "carol", "dave", "eve"}
+	r := newRand(20260304)
+	for i := 0; i < 1_200; i++ {
+		id := uint64(1 + r.IntN(24_000))
+		name := names[r.IntN(len(names))]
+		country := countries[r.IntN(len(countries))]
+		age := 18 + r.IntN(65)
+		score := float64(r.IntN(20_000))/10.0 + r.Float64()*0.001
+		active := r.IntN(2) == 0
+		tagA := tagPool[r.IntN(len(tagPool))]
+		tagB := tagPool[r.IntN(len(tagPool))]
+		fullName := fmt.Sprintf("FN-%05d", 1+r.IntN(30_000))
+		if err := db.Set(id, &Rec{
+			Meta:     Meta{Country: country},
+			Name:     name,
+			Email:    fmt.Sprintf("%s-%d@example.test", name, id),
+			Age:      age,
+			Score:    score,
+			Active:   active,
+			Tags:     []string{tagA, tagB},
+			FullName: fullName,
+		}); err != nil {
+			t.Fatalf("Set(%d): %v", id, err)
+		}
+		if order := scalarStringOrderBreak(t, db, "full_name"); order != "" {
+			t.Fatalf("iter=%d id=%d order=%s", i, id, order)
+		}
+	}
+
+	stats := db.Stats()
+	indexStats := db.IndexStats()
+	if got := indexStats.FieldTotalCardinality["full_name"]; got != stats.KeyCount {
+		t.Fatalf("full_name cardinality=%d key_count=%d duplicates=%s", got, stats.KeyCount, scalarStringDuplicateSample(t, db, "full_name"))
+	}
+}
+
+func TestConcurrentSetPatchDeleteMaintainsScalarStringCardinality(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
+	_ = seedData(t, db, 1_600)
+
+	countries := []string{"NL", "PL", "DE", "Finland", "Iceland", "Thailand", "US"}
+	tagPool := []string{"go", "db", "ops", "rust", "java", "infra"}
+	names := []string{"alice", "albert", "bob", "carol", "dave", "eve"}
+
+	var firstErr atomic.Pointer[error]
+	reportErr := func(err error) {
+		if err == nil {
+			return
+		}
+		firstErr.CompareAndSwap(nil, &err)
+	}
+	var wg sync.WaitGroup
+	for w := 0; w < 6; w++ {
+		wg.Add(1)
+		go func(seed int64) {
+			defer wg.Done()
+
+			r := newRand(seed)
+			randomRec := func(id uint64) *Rec {
+				name := names[r.IntN(len(names))]
+				score := float64(r.IntN(20_000))/10.0 + r.Float64()*0.001
+				if r.IntN(100) < 5 {
+					score = 9_000 + float64(r.IntN(1_000)) + r.Float64()*0.001
+				}
+				return &Rec{
+					Meta:     Meta{Country: countries[r.IntN(len(countries))]},
+					Name:     name,
+					Email:    fmt.Sprintf("%s-%d@example.test", name, id),
+					Age:      18 + r.IntN(65),
+					Score:    score,
+					Active:   r.IntN(2) == 0,
+					Tags:     []string{tagPool[r.IntN(len(tagPool))], tagPool[r.IntN(len(tagPool))]},
+					FullName: fmt.Sprintf("FN-%05d", 1+r.IntN(30_000)),
+				}
+			}
+			randomPatch := func() []Field {
+				switch r.IntN(5) {
+				case 0:
+					return []Field{{Name: "score", Value: float64(r.IntN(20_000))/10.0 + r.Float64()*0.001}}
+				case 1:
+					return []Field{
+						{Name: "score", Value: float64(r.IntN(20_000))/10.0 + r.Float64()*0.001},
+						{Name: "active", Value: r.IntN(2) == 0},
+					}
+				case 2:
+					return []Field{
+						{Name: "score", Value: float64(r.IntN(20_000))/10.0 + r.Float64()*0.001},
+						{Name: "country", Value: countries[r.IntN(len(countries))]},
+					}
+				case 3:
+					return []Field{
+						{Name: "score", Value: float64(r.IntN(20_000))/10.0 + r.Float64()*0.001},
+						{Name: "tags", Value: []string{tagPool[r.IntN(len(tagPool))], tagPool[r.IntN(len(tagPool))]}},
+					}
+				default:
+					return []Field{
+						{Name: "score", Value: float64(r.IntN(20_000))/10.0 + r.Float64()*0.001},
+						{Name: "age", Value: float64(18 + r.IntN(65))},
+					}
+				}
+			}
+
+			for i := 0; i < 800; i++ {
+				id := uint64(1 + r.IntN(24_000))
+				switch r.IntN(10) {
+				case 0, 1, 2, 3:
+					rec := randomRec(id)
+					reportErr(db.Set(id, rec))
+				case 4, 5, 6, 7, 8:
+					reportErr(db.Patch(id, randomPatch()))
+				default:
+					reportErr(db.Delete(id))
+				}
+				if firstErr.Load() != nil {
+					return
+				}
+			}
+		}(int64(20260304 + w))
+	}
+	wg.Wait()
+	if errPtr := firstErr.Load(); errPtr != nil {
+		t.Fatalf("writer error: %v", *errPtr)
+	}
+
+	stats := db.Stats()
+	indexStats := db.IndexStats()
+	if got := indexStats.FieldTotalCardinality["full_name"]; got != stats.KeyCount {
+		t.Fatalf("full_name cardinality=%d key_count=%d duplicates=%s", got, stats.KeyCount, scalarStringDuplicateSample(t, db, "full_name"))
+	}
+}
+
+func scalarStringDuplicateSample(t testing.TB, db *DB[uint64, Rec], field string) string {
+	t.Helper()
+
+	acc := db.engine.schema.IndexedByName[field]
+	snap := db.engine.snapshot.Current()
+	ov := indexdata.NewFieldIndexViewFromStorage(snap.Index[acc.Ordinal])
+	cur := ov.NewCursor(ov.RangeByRanks(0, ov.KeyCount()), false)
+	seen := make(map[uint64]string, db.Stats().KeyCount)
+	out := ""
+	for {
+		key, ids, ok := cur.Next()
+		if !ok {
+			break
+		}
+		keyString := key.UnsafeString()
+		it := ids.Iter()
+		for it.HasNext() {
+			id := it.Next()
+			if prev, ok := seen[id]; ok && prev != keyString {
+				rec, err := db.Get(id)
+				if err != nil {
+					out += fmt.Sprintf("%d:%s/%s get_err=%v;", id, prev, keyString, err)
+				} else {
+					out += fmt.Sprintf("%d:%s/%s actual=%s;", id, prev, keyString, rec.FullName)
+					db.ReleaseRecords(rec)
+				}
+				if len(out) > 512 {
+					it.Release()
+					return out
+				}
+			} else {
+				seen[id] = keyString
+			}
+		}
+		it.Release()
+	}
+	return out
+}
+
+func scalarStringOrderBreak(t testing.TB, db *DB[uint64, Rec], field string) string {
+	t.Helper()
+
+	acc := db.engine.schema.IndexedByName[field]
+	snap := db.engine.snapshot.Current()
+	ov := indexdata.NewFieldIndexViewFromStorage(snap.Index[acc.Ordinal])
+	cur := ov.NewCursor(ov.RangeByRanks(0, ov.KeyCount()), false)
+	prev := ""
+	for {
+		key, _, ok := cur.Next()
+		if !ok {
+			return ""
+		}
+		curKey := key.UnsafeString()
+		if prev != "" && prev > curKey {
+			return prev + ">" + curKey
+		}
+		prev = curKey
+	}
+}
+
+func TestQuery_DeleteUpdatesIndex_Correctness(t *testing.T) {
+	db, _ := openTempDBUint64(t)
+
+	// arrange deterministic values so the query result is known
+	for i := 1; i <= 50; i++ {
+		rec := &Rec{
+			Meta:     Meta{Country: "NL"},
+			Name:     "alice",
+			Age:      30,
+			Score:    1.0,
+			Active:   true,
+			Tags:     []string{"go"},
+			FullName: fmt.Sprintf("FN-%02d", i),
+		}
+		if err := db.Set(uint64(i), rec); err != nil {
+			t.Fatalf("Set: %v", err)
+		}
+	}
+
+	q := qx.Query(
+		qx.EQ("country", "NL"),
+		qx.EQ("name", "alice"),
+		qx.EQ("active", true),
+	)
+
+	got0, err := db.QueryKeys(q)
+	if err != nil {
+		t.Fatalf("QueryKeys baseline: %v", err)
+	}
+	if len(got0) != 50 {
+		t.Fatalf("expected 50, got %d", len(got0))
+	}
+
+	// delete a subset and verify indexes reflect it
+	for _, id := range []uint64{3, 7, 10, 25, 50} {
+		if err := db.Delete(id); err != nil {
+			t.Fatalf("Delete(%d): %v", id, err)
+		}
+	}
+
+	got1, err := db.QueryKeys(q)
+	if err != nil {
+		t.Fatalf("QueryKeys after delete: %v", err)
+	}
+
+	want, err := expectedKeysUint64(t, db, q)
+	if err != nil {
+		t.Fatalf("expectedKeysUint64: %v", err)
+	}
+	assertSameSlice(t, got1, want)
+}
+
+func TestQuery_PatchUpdatesIndex_Correctness(t *testing.T) {
+	db, _ := openTempDBUint64(t)
+
+	// put some records with age=10, then patch some to age=40 and ensure range queries reflect changes
+	for i := 1; i <= 60; i++ {
+		rec := &Rec{
+			Meta:     Meta{Country: "NL"},
+			Name:     "u",
+			Age:      10,
+			Score:    0.1,
+			Active:   true,
+			Tags:     []string{"go"},
+			FullName: fmt.Sprintf("FN-%02d", i),
+		}
+		if err := db.Set(uint64(i), rec); err != nil {
+			t.Fatalf("Set: %v", err)
+		}
+	}
+
+	for _, id := range []uint64{2, 5, 9, 11, 17, 31} {
+		if err := db.Patch(id, []Field{{Name: "age", Value: float64(40)}}); err != nil {
+			t.Fatalf("Patch(%d): %v", id, err)
+		}
+	}
+
+	q := qx.Query(qx.GTE("age", 35)).Sort("age", qx.ASC)
+
+	got, err := db.QueryKeys(q)
+	if err != nil {
+		t.Fatalf("QueryKeys: %v", err)
+	}
+
+	want, err := expectedKeysUint64(t, db, q)
+	if err != nil {
+		t.Fatalf("expectedKeysUint64: %v", err)
+	}
+	assertSameSlice(t, got, want)
+
+	cnt, err := db.Count(q.Filter)
+	if err != nil {
+		t.Fatalf("Count: %v", err)
+	}
+	if cnt != uint64(len(want)) {
+		t.Fatalf("Count mismatch: got=%d want=%d", cnt, len(want))
+	}
 }

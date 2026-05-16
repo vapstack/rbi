@@ -362,10 +362,9 @@ func (db *DB[K, V]) Set(id K, newVal *V, execOpts ...ExecOption[K, V]) error {
 	if err != nil {
 		return err
 	}
-	reqScratch := db.autoBatcher.requestScratchPool.Get()
+	reqScratch := db.autoBatcher.requestScratchPool.Get(1)
+	reqScratch = append(reqScratch, req)
 	defer db.autoBatcher.requestScratchPool.Put(reqScratch)
-
-	reqScratch.Append(req)
 
 	return db.autoBatcher.submitAutoBatchRequests(reqScratch, cfg.noBatch)
 }
@@ -410,25 +409,23 @@ func (db *DB[K, V]) BatchSet(ids []K, newVals []*V, execOpts ...ExecOption[K, V]
 	var keyScratch []keycodec.DataKey
 	if len(cfg.beforeProcess) != 0 {
 		keyScratch = keycodec.GetDataKeySlice(len(ids))
-		defer keycodec.ReleaseDataKeySlice(keyScratch)
 
 		for i := range newVals {
 			key := keycodec.DataKeyFromUserKey(ids[i], db.strKey)
 			if err := runBeforeProcessHooks(key, unsafe.Pointer(newVals[i]), cfg.beforeProcess); err != nil {
+				keycodec.ReleaseDataKeySlice(keyScratch)
 				return err
 			}
 			keyScratch = append(keyScratch, key)
 		}
+		defer keycodec.ReleaseDataKeySlice(keyScratch)
 	}
 	if err := db.beginOp(); err != nil {
 		return err
 	}
 	defer db.endOp()
 
-	reqScratch := db.autoBatcher.requestScratchPool.Get()
-	defer db.autoBatcher.requestScratchPool.Put(reqScratch)
-
-	reqScratch.Grow(len(ids))
+	reqScratch := db.autoBatcher.requestScratchPool.Get(len(ids))
 
 	for i := range ids {
 		key := keycodec.DataKeyFromUserKey(ids[i], db.strKey)
@@ -437,13 +434,15 @@ func (db *DB[K, V]) BatchSet(ids []K, newVals []*V, execOpts ...ExecOption[K, V]
 		}
 		req, err := db.buildSetAutoBatchRequest(key, newVals[i], cfg.beforeStore, cfg.beforeCommit, cfg.cloneValue)
 		if err != nil {
-			for j := 0; j < reqScratch.Len(); j++ {
-				db.autoBatcher.requestPool.Put(reqScratch.Get(j))
+			for j := 0; j < len(reqScratch); j++ {
+				db.autoBatcher.requestPool.Put(reqScratch[j])
 			}
+			db.autoBatcher.requestScratchPool.Put(reqScratch)
 			return err
 		}
-		reqScratch.Append(req)
+		reqScratch = append(reqScratch, req)
 	}
+	defer db.autoBatcher.requestScratchPool.Put(reqScratch)
 
 	return db.autoBatcher.submitAutoBatchRequests(reqScratch, true)
 }
@@ -478,10 +477,10 @@ func (db *DB[K, V]) Patch(id K, patch []Field, execOpts ...ExecOption[K, V]) err
 
 	req := db.buildPatchAutoBatchRequest(id, patch, ignoreUnknown, cfg.beforeProcess, cfg.beforeStore, cfg.beforeCommit)
 
-	reqScratch := db.autoBatcher.requestScratchPool.Get()
+	reqScratch := db.autoBatcher.requestScratchPool.Get(1)
+	reqScratch = append(reqScratch, req)
 	defer db.autoBatcher.requestScratchPool.Put(reqScratch)
 
-	reqScratch.Append(req)
 	return db.autoBatcher.submitAutoBatchRequests(reqScratch, cfg.noBatch)
 }
 
@@ -507,14 +506,12 @@ func (db *DB[K, V]) BatchPatch(ids []K, patch []Field, execOpts ...ExecOption[K,
 	cfg := db.resolveExecOptions(execOpts)
 	ignoreUnknown := !cfg.patchStrict
 
-	reqScratch := db.autoBatcher.requestScratchPool.Get()
-	defer db.autoBatcher.requestScratchPool.Put(reqScratch)
-
-	reqScratch.Grow(len(ids))
+	reqScratch := db.autoBatcher.requestScratchPool.Get(len(ids))
 
 	for i := range ids {
-		reqScratch.Append(db.buildPatchAutoBatchRequest(ids[i], patch, ignoreUnknown, cfg.beforeProcess, cfg.beforeStore, cfg.beforeCommit))
+		reqScratch = append(reqScratch, db.buildPatchAutoBatchRequest(ids[i], patch, ignoreUnknown, cfg.beforeProcess, cfg.beforeStore, cfg.beforeCommit))
 	}
+	defer db.autoBatcher.requestScratchPool.Put(reqScratch)
 
 	return db.autoBatcher.submitAutoBatchRequests(reqScratch, true)
 }
@@ -534,10 +531,9 @@ func (db *DB[K, V]) Delete(id K, execOpts ...ExecOption[K, V]) error {
 	cfg := db.resolveExecOptions(execOpts)
 	req := db.buildDeleteAutoBatchRequest(id, cfg.beforeCommit)
 
-	reqScratch := db.autoBatcher.requestScratchPool.Get()
+	reqScratch := db.autoBatcher.requestScratchPool.Get(1)
+	reqScratch = append(reqScratch, req)
 	defer db.autoBatcher.requestScratchPool.Put(reqScratch)
-
-	reqScratch.Append(req)
 
 	return db.autoBatcher.submitAutoBatchRequests(reqScratch, cfg.noBatch)
 }
@@ -561,14 +557,12 @@ func (db *DB[K, V]) BatchDelete(ids []K, execOpts ...ExecOption[K, V]) error {
 
 	cfg := db.resolveExecOptions(execOpts)
 
-	reqScratch := db.autoBatcher.requestScratchPool.Get()
-	defer db.autoBatcher.requestScratchPool.Put(reqScratch)
-
-	reqScratch.Grow(len(ids))
+	reqScratch := db.autoBatcher.requestScratchPool.Get(len(ids))
 
 	for i := range ids {
-		reqScratch.Append(db.buildDeleteAutoBatchRequest(ids[i], cfg.beforeCommit))
+		reqScratch = append(reqScratch, db.buildDeleteAutoBatchRequest(ids[i], cfg.beforeCommit))
 	}
+	defer db.autoBatcher.requestScratchPool.Put(reqScratch)
 
 	return db.autoBatcher.submitAutoBatchRequests(reqScratch, true)
 }

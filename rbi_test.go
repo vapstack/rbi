@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"math/rand"
 	"os"
@@ -22,6 +23,15 @@ import (
 	"github.com/vapstack/rbi/internal/keycodec"
 	"go.etcd.io/bbolt"
 )
+
+var testDiscardLogger = log.New(io.Discard, "", 0)
+
+func testOptions(opts Options) Options {
+	if opts.Logger == nil {
+		opts.Logger = testDiscardLogger
+	}
+	return opts
+}
 
 type Product struct {
 	SKU   string   `db:"sku"   rbi:"index"`
@@ -5471,7 +5481,7 @@ func TestComponentAccessors_ExposePlannerCalibrationAndSnapshotDiagnostics(t *te
 		t.Fatalf("Set(2): %v", err)
 	}
 
-	db.engine.observeCalibration(TraceEvent{
+	db.engine.exec.Calibrator.Observe(TraceEvent{
 		Plan:          string(PlanOrdered),
 		EstimatedRows: 64,
 		RowsExamined:  96,
@@ -5590,7 +5600,7 @@ func TestComponentAccessors(t *testing.T) {
 		t.Fatalf("Set(2): %v", err)
 	}
 
-	db.engine.observeCalibration(TraceEvent{
+	db.engine.exec.Calibrator.Observe(TraceEvent{
 		Plan:          string(PlanOrdered),
 		EstimatedRows: 64,
 		RowsExamined:  96,

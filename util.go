@@ -211,33 +211,6 @@ func (db *DB[K, V]) idxFromUserKeyWithCreated(id K) (uint64, bool) {
 	return *(*uint64)(unsafe.Pointer(&id)), false
 }
 
-func (db *DB[K, V]) addCheckedIdxsFromUserKeys(ids []K, dst *postingLazySetBuilder) uint64 {
-	if len(ids) == 0 || dst == nil {
-		return 0
-	}
-
-	dedupe := uint64(0)
-	if db.strKey {
-		s := *(*[]string)(unsafe.Pointer(&ids))
-		writer := db.strMap.LockWriter()
-		for i := range s {
-			idx, _ := writer.Create(s[i])
-			if !dst.addChecked(idx) {
-				dedupe++
-			}
-		}
-		writer.Unlock()
-		return dedupe
-	}
-
-	for _, idx := range *(*[]uint64)(unsafe.Pointer(&ids)) {
-		if !dst.addChecked(idx) {
-			dedupe++
-		}
-	}
-	return dedupe
-}
-
 var msgpackEncPool = pooled.Pointers[msgpack.Encoder]{
 	New: func() *msgpack.Encoder { return msgpack.NewEncoder(io.Discard) },
 	Cleanup: func(enc *msgpack.Encoder) {
@@ -448,11 +421,4 @@ const randStreamMix uint64 = 0x9e3779b97f4a7c15
 func newRand(seed int64) *rand.Rand {
 	s := uint64(seed)
 	return rand.New(rand.NewPCG(s, s^randStreamMix))
-}
-
-func satAddUint64(total, add uint64) uint64 {
-	if ^uint64(0)-total < add {
-		return ^uint64(0)
-	}
-	return total + add
 }

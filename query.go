@@ -8,7 +8,9 @@ import (
 	"github.com/vapstack/rbi/internal/indexdata"
 	"github.com/vapstack/rbi/internal/keycodec"
 	"github.com/vapstack/rbi/internal/posting"
+	"github.com/vapstack/rbi/internal/qexec"
 	"github.com/vapstack/rbi/internal/qir"
+	"github.com/vapstack/rbi/internal/schema"
 	"github.com/vapstack/rbi/internal/snapshot"
 	"go.etcd.io/bbolt"
 )
@@ -41,62 +43,6 @@ func (db *DB[K, V]) Query(q *qx.QX) ([]*V, error) {
 	defer rollback(tx)
 
 	return db.queryRecords(tx, snap, &viewQ)
-}
-
-func (qv *queryView) tryQueryEmptyOnSnapshot(q *qir.Shape) (bool, error) {
-	if q == nil || q.Offset != 0 || q.Limit != 0 || q.HasOrder {
-		return false, nil
-	}
-
-	e := q.Expr
-	if e.Not || e.FieldOrdinal < 0 || len(e.Operands) != 0 {
-		return false, nil
-	}
-
-	switch e.Op {
-	case qir.OpEQ:
-		fm := qv.fieldMetaByExpr(e)
-		if fm == nil || fm.Slice {
-			return false, nil
-		}
-		key, isSlice, isNil, err := qv.exprValueToLookupKey(e)
-		if err != nil {
-			return false, err
-		}
-		if isSlice {
-			return false, nil
-		}
-		if isNil {
-			return qv.nilFieldIndexViewForExpr(e).LookupCardinality(nilIndexEntryKey) == 0, nil
-		}
-		return lookupScalarCardinality(qv.fieldIndexViewForExpr(e), key) == 0, nil
-
-	case qir.OpGT, qir.OpGTE, qir.OpLT, qir.OpLTE, qir.OpPREFIX:
-		fm := qv.fieldMetaByExpr(e)
-		if fm == nil || fm.Slice {
-			return false, nil
-		}
-		bound, isSlice, err := qv.exprValueToNormalizedScalarBound(e)
-		if err != nil {
-			return false, err
-		}
-		if isSlice {
-			return false, nil
-		}
-		var bounds indexdata.Bounds
-		bounds.Has = true
-		applyNormalizedScalarBound(&bounds, bound)
-		if bounds.Empty {
-			return true, nil
-		}
-		ov := qv.fieldIndexViewForExpr(e)
-		if !ov.HasData() {
-			return true, nil
-		}
-		return ov.RangeForBounds(bounds).Empty(), nil
-	}
-
-	return false, nil
 }
 
 func (db *DB[K, V]) beginQueryTxSnapshot() (*bbolt.Tx, *snapshot.View, uint64, *snapshot.Ref, error) {
@@ -132,16 +78,16 @@ func (db *DB[K, V]) beginQueryTxSnapshot() (*bbolt.Tx, *snapshot.View, uint64, *
 }
 
 func (db *DB[K, V]) queryRecords(tx *bbolt.Tx, snap *snapshot.View, q *qir.Shape) ([]*V, error) {
-	view := db.engine.makeQueryView(snap)
-	defer db.engine.releaseQueryView(view)
+	view := db.engine.exec.AcquireView(snap)
+	defer db.engine.exec.ReleaseView(view)
 
-	if !db.engine.traceOrCalibrationSamplingEnabled() {
-		if empty, err := view.tryQueryEmptyOnSnapshot(q); empty || err != nil {
+	if !db.engine.exec.TraceOrCalibrationSamplingEnabled() {
+		if empty, err := view.TryQueryEmptyOnSnapshot(q); empty || err != nil {
 			return nil, err
 		}
 	}
 
-	ids, err := view.execQuery(q, true, false)
+	ids, err := view.Query(q, true, false)
 	if err != nil {
 		return nil, err
 	}
@@ -224,10 +170,10 @@ func (db *DB[K, V]) QueryKeys(q *qx.QX) ([]K, error) {
 	snap, seq, ref := db.engine.snapshot.PinCurrent()
 	defer db.engine.snapshot.Unpin(seq, ref)
 
-	view := db.engine.makeQueryView(snap)
-	defer db.engine.releaseQueryView(view)
+	view := db.engine.exec.AcquireView(snap)
+	defer db.engine.exec.ReleaseView(view)
 
-	ids, err := view.execQuery(&viewQ, true, false)
+	ids, err := view.Query(&viewQ, true, false)
 	if err != nil {
 		return nil, err
 	}
@@ -260,246 +206,41 @@ func (db *DB[K, V]) execPreparedQuery(q *qir.Shape) ([]uint64, error) {
 	snap, seq, ref := db.engine.snapshot.PinCurrent()
 	defer db.engine.snapshot.Unpin(seq, ref)
 
-	view := db.engine.makeQueryView(snap)
-	defer db.engine.releaseQueryView(view)
+	view := db.engine.exec.AcquireView(snap)
+	defer db.engine.exec.ReleaseView(view)
 
-	return view.execPreparedQuery(q)
+	return view.PreparedQuery(q)
 }
 
-func shouldSkipPlannerForArrayOrderShape(q *qir.Shape) bool {
-	if q == nil || !q.HasOrder {
-		return false
-	}
-	switch q.Order.Kind {
-	case qir.OrderKindArrayPos, qir.OrderKindArrayCount:
-		return true
-	default:
-		return false
+type queryEngine struct {
+	snapshot               *snapshot.Manager
+	schema                 *schema.Runtime
+	index                  []indexdata.FieldStorage
+	nilIndex               []indexdata.FieldStorage
+	lenIndex               []indexdata.FieldStorage
+	lenZeroComplement      []bool
+	measure                []indexdata.MeasureStorage
+	universe               posting.List
+	lenIndexLoaded         bool
+	matPredCacheMaxEntries int
+	matPredCacheMaxCard    uint64
+
+	exec *qexec.Runtime
+}
+
+func (qe *queryEngine) snapshotCacheConfig() snapshot.CacheConfig {
+	return snapshot.CacheConfig{
+		MatPredMaxEntries: qe.matPredCacheMaxEntries,
+		MatPredMaxCard:    qe.matPredCacheMaxCard,
 	}
 }
 
-func finishQueryTrace(trace *queryTrace, out *[]uint64, err *error) {
-	if trace == nil {
-		return
-	}
-	trace.finish(uint64(len(*out)), *err)
-}
-
-// Broad negative full scans are faster when we materialize the complement once
-// instead of probing exclusion membership for every universe id.
-func shouldMaterializeNegativeAllNumericKeys(universeCard, excludedCard uint64) bool {
-	if universeCard == 0 || excludedCard >= universeCard {
-		return false
-	}
-	resultCard := universeCard - excludedCard
-	if resultCard < 64_000 {
-		return false
-	}
-	return resultCard >= excludedCard*2
-}
-
-func (qv *queryView) materializeNegativeResultKeys() []uint64 {
-	universe := qv.snapshotUniverseView()
-	return universe.ToArray()
-}
-
-func (qv *queryView) materializeNegativeResultKeysExcluding(exclude posting.List) []uint64 {
-	if exclude.IsEmpty() {
-		return qv.materializeNegativeResultKeys()
-	}
-	ids := qv.snapshotUniverseView().BuildAndNot(exclude)
-	if ids.IsEmpty() {
-		return nil
-	}
-	out := ids.ToArray()
-	ids.Release()
-	return out
-}
-
-func (qv *queryView) execPreparedQuery(q *qir.Shape) ([]uint64, error) {
-	return qv.execQuery(q, false, true)
-}
-
-// execQuery runs the full query pipeline against one snapshot view.
-//
-// The method keeps all routing decisions in one place so fast-path/planner
-// selection remains consistent across QueryKeys and Query callers.
-func (qv *queryView) execQuery(q *qir.Shape, emitTrace bool, prepared bool) (out []uint64, err error) {
-	traceEnabled := emitTrace && qv.engine.traceOrCalibrationSamplingEnabled()
-
-	if !prepared && !traceEnabled {
-		if out, ok, fastErr := qv.tryDirectSingleUniqueEqNoOrder(q, nil); ok {
-			return out, fastErr
-		}
-		if out, ok, fastErr := qv.tryNoFilterNoOrderWithLimit(q, nil); ok {
-			return out, fastErr
-		}
-		if out, ok, fastErr := qv.tryOrderBasicNoFilterWithLimit(q, nil); ok {
-			return out, fastErr
-		}
-		if out, ok, fastErr := qv.tryQueryPrefixNoOrderWithLimit(q, nil); ok {
-			return out, fastErr
-		}
-		if out, ok, fastErr := qv.tryQueryRangeNoOrderWithLimit(q, nil); ok {
-			return out, fastErr
-		}
-	}
-
-	var trace *queryTrace
-	if traceEnabled {
-		trace = qv.engine.beginTrace(*q)
-		if trace != nil {
-			defer finishQueryTrace(trace, &out, &err)
-		}
-	}
-
-	var ok bool
-
-	if out, ok, err = qv.tryUniqueEqNoOrder(q, trace); ok {
-		return out, err
-	}
-
-	if out, ok, err = qv.tryNoFilterNoOrderWithLimit(q, trace); ok {
-		if trace != nil {
-			trace.setPlan(PlanLimit)
-		}
-		return out, err
-	}
-
-	if out, ok, err = qv.tryOrderBasicNoFilterWithLimit(q, trace); ok {
-		if trace != nil {
-			trace.setPlan(PlanLimitOrderBasic)
-		}
-		return out, err
-	}
-
-	// Planner/execution fast-paths are attempted before postingResult fallback because
-	// they can short-circuit large scans when query shape matches known patterns.
-	if !shouldSkipPlannerForArrayOrderShape(q) {
-		if qv.shouldPreferExecutionPlan(q, trace) {
-			if out, ok, err = qv.tryExecutionPlan(q, trace); ok {
-				return out, err
-			}
-			if out, ok, err = qv.tryPlan(q, trace); ok {
-				return out, err
-			}
-		} else {
-			if out, ok, err = qv.tryPlan(q, trace); ok {
-				return out, err
-			}
-			if out, ok, err = qv.tryExecutionPlan(q, trace); ok {
-				return out, err
-			}
-		}
-	}
-
-	if trace != nil {
-		trace.setPlan(PlanMaterialized)
-	}
-
-	result, err := qv.evalExpr(q.Expr)
-	if err != nil {
-		return nil, err
-	}
-	if !result.neg {
-		if result.ids.IsEmpty() {
-			result.release()
-			return nil, nil
-		}
-	} else {
-		if qv.snapshotUniverseCardinality() == 0 {
-			result.release()
-			return nil, nil
-		}
-	}
-	defer result.release()
-
-	skip := q.Offset
-	needAll := q.Limit == 0
-	need := q.Limit
-
-	// case 1: no ordering, negative result: iterate over universe excluding the result set
-	if !q.HasOrder && result.neg {
-		if !qv.strKey && needAll && skip == 0 &&
-			shouldMaterializeNegativeAllNumericKeys(qv.snapshotUniverseCardinality(), result.ids.Cardinality()) {
-			ids := qv.materializeNegativeResultKeysExcluding(result.ids)
-			if len(ids) == 0 {
-				return nil, nil
-			}
-			return ids, nil
-		}
-		out = makeOutSlice(qv.postingResultCardinality(result), need)
-		cursor := qv.newQueryCursor(out, skip, need, needAll, 0)
-
-		ex := result.ids
-		universe := qv.snapshotUniverseView()
-		it := universe.Iter()
-		defer it.Release()
-		for it.HasNext() {
-			idx := it.Next()
-			if ex.Contains(idx) {
-				continue
-			}
-			if cursor.emit(idx) {
-				return cursor.out, nil
-			}
-		}
-		return cursor.out, nil
-	}
-
-	// case 2: ordering
-	if q.HasOrder {
-		order := q.Order
-		orderField := qv.engine.fieldNameByOrdinal(order.FieldOrdinal)
-
-		switch order.Kind {
-
-		case qir.OrderKindArrayPos:
-			ov := qv.fieldIndexViewForOrder(order)
-			if !ov.HasData() && !qv.hasIndexedFieldForOrder(order) {
-				return nil, fmt.Errorf("cannot sort non-indexed field: %v", orderField)
-			}
-			return qv.queryOrderArrayPosIndexView(result, ov, order, skip, need, needAll)
-
-		case qir.OrderKindArrayCount:
-			lenOV := qv.lenFieldIndexViewForOrder(order)
-			useZeroComplement := qv.isLenZeroComplementOrdinal(order.FieldOrdinal)
-			if !lenOV.HasData() && !useZeroComplement {
-				return nil, fmt.Errorf("no lenIndex for slice field: %v", orderField)
-			}
-			return qv.queryOrderArrayCount(result, lenOV, order, skip, need, needAll, useZeroComplement)
-		}
-
-		ov := qv.fieldIndexViewForOrder(order)
-		if !ov.HasData() && !qv.hasIndexedFieldForOrder(order) {
-			return nil, fmt.Errorf("cannot sort non-indexed field: %v", orderField)
-		}
-		return qv.queryOrderBasic(result, ov, order, skip, need, needAll)
-	}
-
-	// case 3: no ordering, positive result:
-	// for numeric keys and unbounded result, return a zero-copy reinterpretation
-	// to avoid an extra allocation/copy in the hottest read path.
-
-	// Fast-path only when unbounded query also has no offset.
-	// Offset requires cursor-based pagination logic.
-	if !qv.strKey && needAll && skip == 0 {
-		ids := result.ids.ToArray()
-		if len(ids) == 0 {
-			return nil, nil
-		}
-		return ids, nil
-	}
-
-	out = makeOutSlice(result.ids.Cardinality(), need)
-	cursor := qv.newQueryCursor(out, skip, need, needAll, 0)
-
-	iter := result.ids.Iter()
-	defer iter.Release()
-	for iter.HasNext() {
-		if cursor.emit(iter.Next()) {
-			return cursor.out, nil
-		}
-	}
-	return cursor.out, nil
+func (qe *queryEngine) installViewNoLock(s *snapshot.View) {
+	qe.index = s.Index
+	qe.nilIndex = s.NilIndex
+	qe.lenIndex = s.LenIndex
+	qe.lenZeroComplement = s.LenZeroComplement
+	qe.measure = s.Measure
+	qe.universe = s.Universe
+	qe.snapshot.Publish(s)
 }

@@ -2,10 +2,14 @@ package rbi
 
 import (
 	"bytes"
+	"fmt"
+	"io"
 	"log"
 	"math"
+	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/vapstack/qx"
@@ -227,50 +231,45 @@ func TestAggregateGroupedOrdinaryByIDGateUsesSelectivity(t *testing.T) {
 		t.Fatalf("BatchSet: %v", err)
 	}
 
-	full, err := db.engine.prepareAggregate(qx.Group("group").Metrics(
+	full, err := db.Aggregate(qx.Group("group").Metrics(
 		qx.COUNT("score").AS("score_count"),
 		qx.SUM("score").AS("score_sum"),
 		qx.MIN("score").AS("score_min"),
 	))
 	if err != nil {
-		t.Fatalf("prepare full aggregate: %v", err)
+		t.Fatalf("full aggregate: %v", err)
 	}
-	defer full.release()
+	requireAggregateLayout(t, full.Layout, []string{"group", "score_count", "score_sum", "score_min"})
+	fullRows := make(map[string]Row, len(full.Rows))
+	for i := range full.Rows {
+		fullRows[mustAggregateString(t, full.Rows[i][0])] = full.Rows[i]
+	}
+	if len(fullRows) != 2 {
+		t.Fatalf("full group count=%d, want 2; rows=%#v", len(fullRows), full.Rows)
+	}
+	requireAggregateUint(t, fullRows["a"][1], 10)
+	requireAggregateInt(t, fullRows["a"][2], 100)
+	requireAggregateInt(t, fullRows["a"][3], 1)
+	requireAggregateUint(t, fullRows["b"][1], 10)
+	requireAggregateInt(t, fullRows["b"][2], 110)
+	requireAggregateInt(t, fullRows["b"][3], 2)
 
-	selective, err := db.engine.prepareAggregate(qx.Query(qx.EQ("score", 1)).Group("group").Metrics(
+	selective, err := db.Aggregate(qx.Query(qx.EQ("score", 1)).Group("group").Metrics(
 		qx.COUNT("score").AS("score_count"),
 		qx.SUM("score").AS("score_sum"),
 		qx.MIN("score").AS("score_min"),
 	))
 	if err != nil {
-		t.Fatalf("prepare selective aggregate: %v", err)
+		t.Fatalf("selective aggregate: %v", err)
 	}
-	defer selective.release()
-
-	snap, seq, ref := db.engine.snapshot.PinCurrent()
-	defer db.engine.snapshot.Unpin(seq, ref)
-	view := db.engine.makeQueryView(snap)
-	defer db.engine.releaseQueryView(view)
-
-	fullIDs, err := view.aggregateMatchedIDs(full.filter)
-	if err != nil {
-		t.Fatalf("full aggregate ids: %v", err)
+	requireAggregateLayout(t, selective.Layout, []string{"group", "score_count", "score_sum", "score_min"})
+	if len(selective.Rows) != 1 {
+		t.Fatalf("selective group count=%d, want 1; rows=%#v", len(selective.Rows), selective.Rows)
 	}
-	if !view.canExecuteGroupedOrdinaryByID(full, fullIDs) {
-		fullIDs.Release()
-		t.Fatal("full high-card grouped ordinary aggregate did not use by-ID gate")
-	}
-	fullIDs.Release()
-
-	selectiveIDs, err := view.aggregateMatchedIDs(selective.filter)
-	if err != nil {
-		t.Fatalf("selective aggregate ids: %v", err)
-	}
-	if view.canExecuteGroupedOrdinaryByID(selective, selectiveIDs) {
-		selectiveIDs.Release()
-		t.Fatal("selective grouped ordinary aggregate used by-ID gate")
-	}
-	selectiveIDs.Release()
+	requireAggregateString(t, selective.Rows[0][0], "a")
+	requireAggregateUint(t, selective.Rows[0][1], 1)
+	requireAggregateInt(t, selective.Rows[0][2], 1)
+	requireAggregateInt(t, selective.Rows[0][3], 1)
 }
 
 func TestAggregateUngroupedMeasureAndOrdinaryMetrics(t *testing.T) {
@@ -1127,12 +1126,6 @@ func TestAggregateWideMeasureUsesFullAndMergeScans(t *testing.T) {
 		}
 	}
 
-	acc := db.engine.schema.MeasuresByName["amount"]
-	storage := db.engine.snapshot.Current().Measure[acc.Ordinal]
-	if !useMeasureMergeScan(keep, storage) {
-		t.Fatal("wide filtered measure aggregate must use merge scan")
-	}
-
 	result, err := db.Aggregate(qx.Aggregate(
 		qx.COUNT("amount").AS("count"),
 		qx.SUM("amount").AS("sum"),
@@ -1279,52 +1272,6 @@ func TestAggregateMeasureStorageLoadsFromPersistedIndex(t *testing.T) {
 	requireAggregateInt(t, result.Rows[0][0], 30)
 }
 
-func TestAggregatePinnedSnapshotIsolation(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "aggregate_snapshot_isolation.db")
-	db, raw := openBoltAndNew[uint64, measureOnlyRec](t, path, Options{AnalyzeInterval: -1})
-	t.Cleanup(func() {
-		_ = db.Close()
-		_ = raw.Close()
-	})
-
-	if err := db.Set(1, &measureOnlyRec{Amount: 10}); err != nil {
-		t.Fatalf("Set initial: %v", err)
-	}
-	prepared, err := db.engine.prepareAggregate(qx.Aggregate(qx.SUM("amount").AS("sum")))
-	if err != nil {
-		t.Fatalf("prepareAggregate: %v", err)
-	}
-	defer prepared.release()
-
-	snap, seq, ref := db.engine.snapshot.PinCurrent()
-	defer db.engine.snapshot.Unpin(seq, ref)
-
-	if err := db.Set(1, &measureOnlyRec{Amount: 99}); err != nil {
-		t.Fatalf("Set update: %v", err)
-	}
-
-	view := db.engine.makeQueryView(snap)
-	ids, err := view.aggregateMatchedIDs(prepared.filter)
-	if err != nil {
-		db.engine.releaseQueryView(view)
-		t.Fatalf("aggregateMatchedIDs: %v", err)
-	}
-	oldResult, err := view.executeAggregate(prepared, ids)
-	ids.Release()
-	db.engine.releaseQueryView(view)
-	if err != nil {
-		t.Fatalf("executeAggregate old snapshot: %v", err)
-	}
-	requireAggregateInt(t, oldResult.Rows[0][0], 10)
-
-	currentResult, err := db.Aggregate(qx.Aggregate(qx.SUM("amount").AS("sum")))
-	if err != nil {
-		t.Fatalf("Aggregate current: %v", err)
-	}
-	requireAggregateInt(t, currentResult.Rows[0][0], 99)
-}
-
 func TestPersistedMeasureLoadDoesNotSatisfyOrdinaryPlannerStats(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "measure_planner_stats.db")
@@ -1350,7 +1297,7 @@ func TestPersistedMeasureLoadDoesNotSatisfyOrdinaryPlannerStats(t *testing.T) {
 		_ = raw2.Close()
 	})
 
-	stats := db2.engine.planner.stats.Load()
+	stats := db2.engine.exec.Stats.Load()
 	if stats == nil {
 		t.Fatalf("planner stats are missing")
 	}
@@ -1690,4 +1637,724 @@ func aggregateGroupKey(t *testing.T, v Value) string {
 		return "<null>"
 	}
 	return mustAggregateString(t, v)
+}
+
+/**/
+
+func copySeededDBWithSidecars(t *testing.T, src, name string) string {
+	t.Helper()
+
+	dst := filepath.Join(t.TempDir(), name)
+	copySeededFile(t, src, dst)
+
+	sidecars, err := filepath.Glob(src + ".*.rbi")
+	if err != nil {
+		t.Fatalf("glob seeded sidecars: %v", err)
+	}
+	for _, sidecar := range sidecars {
+		copySeededFile(t, sidecar, dst+sidecar[len(src):])
+	}
+
+	return dst
+}
+
+func copySeededFile(t *testing.T, src, dst string) {
+	t.Helper()
+
+	in, err := os.Open(src)
+	if err != nil {
+		t.Fatalf("open seeded file %q: %v", src, err)
+	}
+	defer func() { _ = in.Close() }()
+
+	out, err := os.Create(dst)
+	if err != nil {
+		t.Fatalf("create copied file %q: %v", dst, err)
+	}
+	defer func() { _ = out.Close() }()
+
+	if _, err = io.Copy(out, in); err != nil {
+		t.Fatalf("copy seeded file %q: %v", src, err)
+	}
+}
+
+func countByExprBitmap(t *testing.T, db *DB[uint64, Rec], expr qx.Expr) uint64 {
+	t.Helper()
+	ids, err := db.QueryKeys(qx.Query(expr))
+	if err != nil {
+		t.Fatalf("QueryKeys: %v", err)
+	}
+	return uint64(len(ids))
+}
+
+func countByExprBitmapUserBench(t *testing.T, db *DB[uint64, UserBench], expr qx.Expr) uint64 {
+	t.Helper()
+	ids, err := db.QueryKeys(qx.Query(expr))
+	if err != nil {
+		t.Fatalf("QueryKeys: %v", err)
+	}
+	return uint64(len(ids))
+}
+
+func countByExprBitmapCountORBench(t *testing.T, db *DB[uint64, countORBenchRec], expr qx.Expr) uint64 {
+	t.Helper()
+	ids, err := db.QueryKeys(qx.Query(expr))
+	if err != nil {
+		t.Fatalf("QueryKeys: %v", err)
+	}
+	return uint64(len(ids))
+}
+
+func TestCount_SimpleScalarLeaf_TraceUsesScalarLookupPlan(t *testing.T) {
+	var events []TraceEvent
+	opts := Options{
+		TraceSink: func(ev TraceEvent) {
+			events = append(events, ev)
+		},
+		TraceSampleEvery: 1,
+	}
+	db, _ := openTempDBUint64(t, opts)
+
+	if err := db.Set(1, &Rec{Name: "a", Age: 20, Meta: Meta{Country: "NL"}}); err != nil {
+		t.Fatalf("Set(1): %v", err)
+	}
+	if err := db.Set(2, &Rec{Name: "b", Age: 30, Meta: Meta{Country: "DE"}}); err != nil {
+		t.Fatalf("Set(2): %v", err)
+	}
+
+	got, err := db.Count(qx.Query(qx.EQ("country", "NL")).Filter)
+	if err != nil {
+		t.Fatalf("Count: %v", err)
+	}
+	if got != 1 {
+		t.Fatalf("expected count=1, got %d", got)
+	}
+	if len(events) == 0 {
+		t.Fatalf("expected trace event")
+	}
+	last := events[len(events)-1]
+	if last.Plan != string(PlanCountScalarLookup) {
+		t.Fatalf("expected plan %q, got %q", PlanCountScalarLookup, last.Plan)
+	}
+}
+
+func TestAggregateRowCount_TraceUsesAggregateCountRoute(t *testing.T) {
+	var events []TraceEvent
+	opts := Options{
+		TraceSink: func(ev TraceEvent) {
+			events = append(events, ev)
+		},
+		TraceSampleEvery: 1,
+	}
+	db, _ := openTempDBUint64(t, opts)
+
+	if err := db.Set(1, &Rec{Name: "a", Age: 20, Meta: Meta{Country: "NL"}}); err != nil {
+		t.Fatalf("Set(1): %v", err)
+	}
+	if err := db.Set(2, &Rec{Name: "b", Age: 30, Meta: Meta{Country: "DE"}}); err != nil {
+		t.Fatalf("Set(2): %v", err)
+	}
+
+	result, err := db.Aggregate(qx.Query(qx.EQ("country", "NL")).Metrics(qx.ROWCOUNT().AS("rows")))
+	if err != nil {
+		t.Fatalf("Aggregate: %v", err)
+	}
+	requireAggregateLayout(t, result.Layout, []string{"rows"})
+	if len(result.Rows) != 1 {
+		t.Fatalf("rows len=%d, want 1", len(result.Rows))
+	}
+	requireAggregateUint(t, result.Rows[0][0], 1)
+	if len(events) == 0 {
+		t.Fatalf("expected trace event")
+	}
+	last := events[len(events)-1]
+	if last.Plan != string(PlanCountScalarLookup) {
+		t.Fatalf("expected plan %q, got %q", PlanCountScalarLookup, last.Plan)
+	}
+}
+
+func TestAggregateRowCount_MaterializedCountRoute(t *testing.T) {
+	var events []TraceEvent
+	opts := Options{
+		AnalyzeInterval: -1,
+		TraceSink: func(ev TraceEvent) {
+			events = append(events, ev)
+		},
+		TraceSampleEvery: 1,
+	}
+	db, _ := openTempDBUint64(t, opts)
+
+	seedGeneratedUint64Data(t, db, 20_000, func(i int) *Rec {
+		return &Rec{
+			Name:   fmt.Sprintf("u_%d", i),
+			Email:  fmt.Sprintf("user%06d@example.com", i),
+			Active: i%2 == 0,
+		}
+	})
+	if err := db.RebuildIndex(); err != nil {
+		t.Fatalf("RebuildIndex: %v", err)
+	}
+
+	expr := qx.OR(
+		qx.AND(qx.PREFIX("email", "user00"), qx.EQ("active", true)),
+		qx.AND(qx.PREFIX("email", "user01"), qx.EQ("active", true)),
+		qx.AND(qx.PREFIX("email", "user02"), qx.EQ("active", true)),
+		qx.AND(qx.PREFIX("email", "user03"), qx.EQ("active", true)),
+		qx.AND(qx.PREFIX("email", "user04"), qx.EQ("active", true)),
+	)
+	want := countByExprBitmap(t, db, expr)
+
+	result, err := db.Aggregate(qx.Query(expr).Metrics(qx.ROWCOUNT().AS("rows")))
+	if err != nil {
+		t.Fatalf("Aggregate: %v", err)
+	}
+	requireAggregateLayout(t, result.Layout, []string{"rows"})
+	if len(result.Rows) != 1 {
+		t.Fatalf("rows len=%d, want 1", len(result.Rows))
+	}
+	requireAggregateUint(t, result.Rows[0][0], want)
+	if len(events) == 0 {
+		t.Fatalf("expected trace event")
+	}
+	last := events[len(events)-1]
+	if last.Plan != string(PlanCountMaterialized) {
+		t.Fatalf("expected plan %q, got %q", PlanCountMaterialized, last.Plan)
+	}
+}
+
+func TestCount_ANDSetRangeUsesMaterializedRoute(t *testing.T) {
+	var events []TraceEvent
+	db := countOpenORBenchSharedDB(t, "test_count_and_set_range_materialized.db", Options{
+		AnalyzeInterval: -1,
+		TraceSink: func(ev TraceEvent) {
+			events = append(events, ev)
+		},
+		TraceSampleEvery: 1,
+	})
+
+	expr := qx.AND(
+		qx.EQ("status", "active"),
+		qx.NOTIN("plan", []string{"free"}),
+		qx.GTE("score", 120.0),
+		qx.HASANY("tags", []string{"go", "security", "ops"}),
+	)
+
+	got, err := db.Count(expr)
+	if err != nil {
+		t.Fatalf("Count: %v", err)
+	}
+	if len(events) == 0 {
+		t.Fatalf("expected trace event")
+	}
+	last := events[len(events)-1]
+	want := countByExprBitmapCountORBench(t, db, expr)
+	if got != want {
+		t.Fatalf("count mismatch: got=%d want=%d", got, want)
+	}
+	if last.Plan != string(PlanCountMaterialized) {
+		t.Fatalf("expected plan %q, got %q", PlanCountMaterialized, last.Plan)
+	}
+}
+
+func TestCount_ORMaterializedRoutePromotesAfterRepeat(t *testing.T) {
+	var events []TraceEvent
+	db := countOpenORBenchSharedDB(t, "test_count_or_materialized_promotes.db", Options{
+		AnalyzeInterval: -1,
+		TraceSink: func(ev TraceEvent) {
+			events = append(events, ev)
+		},
+		TraceSampleEvery: 1,
+	})
+
+	expr := qx.OR(
+		qx.AND(
+			qx.PREFIX("email", "user1"),
+			qx.EQ("status", "active"),
+			qx.GTE("score", 60.0),
+		),
+		qx.AND(
+			qx.EQ("country", "DE"),
+			qx.HASANY("tags", []string{"rust", "go"}),
+			qx.GTE("age", 24),
+		),
+		qx.AND(
+			qx.EQ("plan", "enterprise"),
+			qx.HASANY("roles", []string{"admin", "support"}),
+			qx.NOTIN("status", []string{"banned"}),
+		),
+	)
+
+	first, err := db.Count(expr)
+	if err != nil {
+		t.Fatalf("first Count: %v", err)
+	}
+	if len(events) == 0 {
+		t.Fatalf("expected first trace event")
+	}
+	if plan := events[len(events)-1].Plan; plan != string(PlanCountORPredicates) {
+		t.Fatalf("expected first plan %q, got %q", PlanCountORPredicates, plan)
+	}
+
+	second, err := db.Count(expr)
+	if err != nil {
+		t.Fatalf("second Count: %v", err)
+	}
+	if second != first {
+		t.Fatalf("count mismatch between repeated runs: first=%d second=%d", first, second)
+	}
+	if plan := events[len(events)-1].Plan; plan != string(PlanCountMaterialized) {
+		t.Fatalf("expected second plan %q, got %q", PlanCountMaterialized, plan)
+	}
+
+	want := countByExprBitmapCountORBench(t, db, expr)
+	if second != want {
+		t.Fatalf("count mismatch: got=%d want=%d", second, want)
+	}
+}
+
+func TestAggregateRowCount_MatchesCountForRepresentativeFilters(t *testing.T) {
+	opts := benchOptions()
+	opts.AnalyzeInterval = -1
+
+	path := filepath.Join(t.TempDir(), "rowcount_equiv.db")
+	db, raw := openBoltAndNew[uint64, UserBench](t, path, opts)
+	t.Cleanup(func() {
+		_ = db.Close()
+		_ = raw.Close()
+	})
+
+	seedBenchData(t, db, 150_000)
+
+	cases := []struct {
+		name string
+		q    *qx.QX
+		all  bool
+	}{
+		{name: "NoFilter", all: true},
+		{name: "SimpleEQ", q: qx.Query(qx.EQ("country", "NL"))},
+		{name: "SimpleIN", q: qx.Query(qx.IN("country", []string{"NL", "DE", "PL"}))},
+		{name: "SimpleHASANY", q: qx.Query(qx.HASANY("roles", []string{"admin", "moderator"}))},
+		{name: "SimpleHASALL", q: qx.Query(qx.HASALL("tags", []string{"go", "db"}))},
+		{name: "SimpleNOTIN", q: qx.Query(qx.NOTIN("status", []string{"banned"}))},
+		{name: "BroadMixedAND", q: qx.Query(
+			qx.PREFIX("email", "user"),
+			qx.EQ("status", "active"),
+			qx.NOTIN("plan", []string{"free"}),
+		)},
+		{name: "FeedEligible", q: qx.Query(
+			qx.EQ("status", "active"),
+			qx.NOTIN("plan", []string{"free"}),
+			qx.GTE("score", 120.0),
+			qx.HASANY("tags", []string{"go", "security", "ops"}),
+		)},
+		{name: "HeavyOR", q: qx.Query(
+			qx.OR(
+				qx.AND(
+					qx.EQ("country", "DE"),
+					qx.HASANY("tags", []string{"rust", "go"}),
+					qx.GTE("score", 40.0),
+				),
+				qx.AND(
+					qx.PREFIX("email", "user1"),
+					qx.EQ("status", "active"),
+				),
+				qx.AND(
+					qx.EQ("plan", "enterprise"),
+					qx.GTE("age", 30),
+				),
+				qx.AND(
+					qx.HASANY("roles", []string{"admin"}),
+					qx.NOTIN("status", []string{"banned"}),
+				),
+				qx.AND(
+					qx.CONTAINS("name", "user-1"),
+					qx.GTE("score", 20.0),
+				),
+			),
+		)},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var (
+				count uint64
+				err   error
+				aggQ  *qx.QX
+			)
+			if tc.all {
+				count, err = db.Count()
+				aggQ = qx.Aggregate(qx.ROWCOUNT().AS("rows"))
+			} else {
+				count, err = db.Count(tc.q.Filter)
+				aggQ = qx.Query(tc.q.Filter).Metrics(qx.ROWCOUNT().AS("rows"))
+			}
+			if err != nil {
+				t.Fatalf("Count: %v", err)
+			}
+			result, err := db.Aggregate(aggQ)
+			if err != nil {
+				t.Fatalf("Aggregate: %v", err)
+			}
+			requireAggregateLayout(t, result.Layout, []string{"rows"})
+			if len(result.Rows) != 1 {
+				t.Fatalf("rows len=%d, want 1", len(result.Rows))
+			}
+			requireAggregateUint(t, result.Rows[0][0], count)
+		})
+	}
+}
+
+func TestAggregateRowCount_MatchesCountForSmallWorldFilters(t *testing.T) {
+	exprs := smallWorldExprCases()
+
+	for _, world := range smallWorldCases() {
+		t.Run(world.name, func(t *testing.T) {
+			db := openSmallWorldDB(t, world)
+
+			for _, exprCase := range exprs {
+				t.Run(exprCase.name, func(t *testing.T) {
+					var (
+						count uint64
+						err   error
+						aggQ  *qx.QX
+					)
+					if exprCase.noFilter {
+						count, err = db.Count()
+						aggQ = qx.Aggregate(qx.ROWCOUNT().AS("rows"))
+					} else {
+						count, err = db.Count(exprCase.expr)
+						aggQ = qx.Query(exprCase.expr).Metrics(qx.ROWCOUNT().AS("rows"))
+					}
+					if err != nil {
+						t.Fatalf("Count: %v", err)
+					}
+					result, err := db.Aggregate(aggQ)
+					if err != nil {
+						t.Fatalf("Aggregate: %v", err)
+					}
+					requireAggregateLayout(t, result.Layout, []string{"rows"})
+					if len(result.Rows) != 1 {
+						t.Fatalf("rows len=%d, want 1", len(result.Rows))
+					}
+					requireAggregateUint(t, result.Rows[0][0], count)
+				})
+			}
+		})
+	}
+}
+
+func TestCount_PublicRoutesAllocsPerRunStayZeroAfterWarmup(t *testing.T) {
+	if testRaceEnabled {
+		t.Skip("testing.AllocsPerRun is not stable under -race")
+	}
+
+	opts := benchOptions()
+	opts.AnalyzeInterval = -1
+
+	path := filepath.Join(t.TempDir(), "count_public_allocs.db")
+	db, raw := openBoltAndNew[uint64, UserBench](t, path, opts)
+	t.Cleanup(func() {
+		_ = db.Close()
+		_ = raw.Close()
+	})
+
+	seedBenchData(t, db, 150_000)
+
+	cases := []struct {
+		name string
+		q    *qx.QX
+	}{
+		{name: "SimpleEQ", q: qx.Query(qx.EQ("country", "NL"))},
+		{name: "SimpleIN", q: qx.Query(qx.IN("country", []string{"NL", "DE", "PL"}))},
+		{name: "SimpleHASANY", q: qx.Query(qx.HASANY("roles", []string{"admin", "moderator"}))},
+		{name: "SimpleNOTIN", q: qx.Query(qx.NOTIN("status", []string{"banned"}))},
+		{name: "BroadMixedAND", q: qx.Query(
+			qx.PREFIX("email", "user"),
+			qx.EQ("status", "active"),
+			qx.NOTIN("plan", []string{"free"}),
+		)},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			run := func() {
+				if _, err := db.Count(tc.q.Filter); err != nil {
+					t.Fatalf("Count: %v", err)
+				}
+			}
+			run()
+			allocs := testing.AllocsPerRun(50, run)
+			if allocs != 0 {
+				t.Fatalf("unexpected allocs after warmup: got=%v want=0", allocs)
+			}
+		})
+	}
+
+	orDB, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
+	_ = seedData(t, orDB, 20_000)
+	orQ := qx.Query(qx.OR(
+		qx.AND(
+			qx.CONTAINS("full_name", "ZZZ"),
+			qx.GTE("score", 10.0),
+		),
+		qx.AND(
+			qx.PREFIX("full_name", "FN-1"),
+			qx.EQ("active", true),
+		),
+		qx.AND(
+			qx.EQ("name", "alice"),
+			qx.EQ("active", true),
+		),
+		qx.AND(
+			qx.EQ("country", "NL"),
+			qx.HASANY("tags", []string{"go"}),
+		),
+	))
+	t.Run("ORHybrid", func(t *testing.T) {
+		run := func() {
+			if _, err := orDB.Count(orQ.Filter); err != nil {
+				t.Fatalf("Count: %v", err)
+			}
+		}
+		run()
+		allocs := testing.AllocsPerRun(50, run)
+		if allocs != 0 {
+			t.Fatalf("unexpected allocs after warmup: got=%v want=0", allocs)
+		}
+	})
+}
+
+type countORBenchRec struct {
+	Country string   `db:"country" rbi:"index"`
+	Plan    string   `db:"plan"    rbi:"index"`
+	Status  string   `db:"status"  rbi:"index"`
+	Age     int      `db:"age"     rbi:"index"`
+	Score   float64  `db:"score"   rbi:"index"`
+	Email   string   `db:"email"   rbi:"index"`
+	Tags    []string `db:"tags"    rbi:"index"`
+	Roles   []string `db:"roles"   rbi:"index"`
+}
+
+type seededDBFixture struct {
+	once sync.Once
+	path string
+	err  error
+}
+
+var countORBenchSharedSeeded seededDBFixture
+
+func seedCountORBenchData(t *testing.T, db *DB[uint64, countORBenchRec], n int) {
+	t.Helper()
+
+	countries := []string{"US", "DE", "NL", "FR"}
+	plans := []string{"free", "pro", "enterprise", "basic"}
+	statuses := []string{"active", "trial", "paused", "banned"}
+	tagsPool := [][]string{
+		{"go", "db"},
+		{"security", "ops"},
+		{"go", "security"},
+		{"rust", "ops"},
+	}
+	rolesPool := [][]string{
+		{"admin", "support"},
+		{"admin", "moderator"},
+		{"support"},
+		{"moderator"},
+	}
+
+	ids := make([]uint64, n)
+	vals := make([]*countORBenchRec, n)
+	for i := 0; i < n; i++ {
+		ids[i] = uint64(i + 1)
+		vals[i] = &countORBenchRec{
+			Country: countries[i%len(countries)],
+			Plan:    plans[(i/2)%len(plans)],
+			Status:  statuses[(i/3)%len(statuses)],
+			Age:     18 + (i % 55),
+			Score:   float64(i % 200),
+			Email:   fmt.Sprintf("user%06d@example.com", i),
+			Tags:    append([]string(nil), tagsPool[i%len(tagsPool)]...),
+			Roles:   append([]string(nil), rolesPool[(i/5)%len(rolesPool)]...),
+		}
+	}
+	if err := db.BatchSet(ids, vals); err != nil {
+		t.Fatalf("BatchSet: %v", err)
+	}
+	if err := db.RebuildIndex(); err != nil {
+		t.Fatalf("RebuildIndex: %v", err)
+	}
+}
+
+func countORBenchSharedSeedPath(t *testing.T) string {
+	t.Helper()
+
+	countORBenchSharedSeeded.once.Do(func() {
+		dir, err := os.MkdirTemp("", "rbi-count-or-shared-")
+		if err != nil {
+			countORBenchSharedSeeded.err = err
+			return
+		}
+
+		path := filepath.Join(dir, "seed.db")
+		db, raw := openBoltAndNew[uint64, countORBenchRec](t, path, Options{AnalyzeInterval: -1})
+		seedCountORBenchData(t, db, 128_000)
+		if err = db.Close(); err != nil {
+			countORBenchSharedSeeded.err = err
+			_ = raw.Close()
+			return
+		}
+		if err = raw.Close(); err != nil {
+			countORBenchSharedSeeded.err = err
+			return
+		}
+		countORBenchSharedSeeded.path = path
+	})
+
+	if countORBenchSharedSeeded.err != nil {
+		t.Fatalf("count or shared seeded fixture: %v", countORBenchSharedSeeded.err)
+	}
+	return countORBenchSharedSeeded.path
+}
+
+func countOpenORBenchSharedDB(t *testing.T, name string, opts Options) *DB[uint64, countORBenchRec] {
+	t.Helper()
+
+	path := copySeededDBWithSidecars(t, countORBenchSharedSeedPath(t), name)
+	db, raw := openBoltAndNew[uint64, countORBenchRec](t, path, opts)
+	t.Cleanup(func() {
+		_ = db.Close()
+		_ = raw.Close()
+	})
+	return db
+}
+
+func TestCount_ScalarInSplit_MixedResiduals_UsesPlan(t *testing.T) {
+	var (
+		mu     sync.Mutex
+		events []TraceEvent
+	)
+
+	sink := func(ev TraceEvent) {
+		mu.Lock()
+		events = append(events, ev)
+		mu.Unlock()
+	}
+
+	db := countOpenORBenchSharedDB(t, "test_count_scalar_in_split_mixed.db", Options{
+		AnalyzeInterval:  -1,
+		TraceSink:        sink,
+		TraceSampleEvery: 1,
+	})
+
+	q := qx.Query(
+		qx.IN("country", []string{"US", "DE", "NL"}),
+		qx.NOTIN("status", []string{"banned"}),
+		qx.HASANY("tags", []string{"security", "ops"}),
+		qx.GTE("age", 24),
+		qx.GTE("score", 60.0),
+	)
+
+	got, err := db.Count(q.Filter)
+	if err != nil {
+		t.Fatalf("Count: %v", err)
+	}
+	mu.Lock()
+	if len(events) == 0 {
+		mu.Unlock()
+		t.Fatalf("expected trace event")
+	}
+	ev := events[len(events)-1]
+	mu.Unlock()
+	want := countByExprBitmapCountORBench(t, db, q.Filter)
+	if got != want {
+		t.Fatalf("count mismatch: got=%d want=%d", got, want)
+	}
+	if ev.Plan != string(PlanCountScalarInSplit) {
+		t.Fatalf("expected %q, got %q", PlanCountScalarInSplit, ev.Plan)
+	}
+}
+
+func TestCount_ScalarInSplit_CohortShape_MatchesBitmap(t *testing.T) {
+	var (
+		mu     sync.Mutex
+		events []TraceEvent
+	)
+
+	sink := func(ev TraceEvent) {
+		mu.Lock()
+		events = append(events, ev)
+		mu.Unlock()
+	}
+
+	dir := t.TempDir()
+	db, raw := openBoltAndNew[uint64, countORBenchRec](t, filepath.Join(dir, "test_count_scalar_in_split_cohort.db"), Options{
+		AnalyzeInterval:  -1,
+		TraceSink:        sink,
+		TraceSampleEvery: 1,
+	})
+	t.Cleanup(func() {
+		_ = db.Close()
+		_ = raw.Close()
+	})
+	db.DisableSync()
+	defer db.EnableSync()
+
+	countries := []string{"NL", "DE", "PL", "SE", "FR", "ES", "GB", "US"}
+	statuses := []string{"active", "trial", "paused", "banned"}
+	tagsPool := [][]string{
+		{"go", "db"},
+		{"security", "ops"},
+		{"go", "security"},
+		{"rust", "ops"},
+		{"db", "security"},
+	}
+
+	const n = 128_000
+	ids := make([]uint64, n)
+	vals := make([]*countORBenchRec, n)
+	for i := 0; i < n; i++ {
+		ids[i] = uint64(i + 1)
+		vals[i] = &countORBenchRec{
+			Country: countries[i%len(countries)],
+			Status:  statuses[(i/4)%len(statuses)],
+			Age:     18 + (i % 55),
+			Score:   float64(i % 120),
+			Email:   fmt.Sprintf("user%06d@example.com", i),
+			Tags:    append([]string(nil), tagsPool[i%len(tagsPool)]...),
+		}
+	}
+	if err := db.BatchSet(ids, vals); err != nil {
+		t.Fatalf("BatchSet: %v", err)
+	}
+	if err := db.RebuildIndex(); err != nil {
+		t.Fatalf("RebuildIndex: %v", err)
+	}
+
+	q := qx.Query(
+		qx.NOTIN("status", []string{"banned"}),
+		qx.IN("country", []string{"NL", "DE", "PL", "SE", "FR", "ES", "GB"}),
+		qx.GTE("age", 25),
+		qx.LTE("age", 45),
+		qx.HASANY("tags", []string{"go", "db", "security"}),
+		qx.GTE("score", 80.0),
+	)
+
+	got, err := db.Count(q.Filter)
+	if err != nil {
+		t.Fatalf("Count: %v", err)
+	}
+	mu.Lock()
+	if len(events) == 0 {
+		mu.Unlock()
+		t.Fatalf("expected trace event")
+	}
+	ev := events[len(events)-1]
+	mu.Unlock()
+	want := countByExprBitmapCountORBench(t, db, q.Filter)
+	if got != want {
+		t.Fatalf("count mismatch: got=%d want=%d", got, want)
+	}
+	if ev.Plan != string(PlanCountScalarInSplit) {
+		t.Fatalf("expected %q, got %q", PlanCountScalarInSplit, ev.Plan)
+	}
 }

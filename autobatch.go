@@ -13,7 +13,6 @@ import (
 	"unsafe"
 
 	"github.com/vapstack/rbi/internal/keycodec"
-	"github.com/vapstack/rbi/internal/pooled"
 	"github.com/vapstack/rbi/internal/schema"
 	"github.com/vapstack/rbi/internal/snapshot"
 	"github.com/vapstack/rbi/internal/strmap"
@@ -143,7 +142,7 @@ type autoBatchRequest struct {
 }
 
 type autoBatchJob struct {
-	reqs       *pooled.Slice[*autoBatchRequest]
+	reqs       []*autoBatchRequest
 	isolated   bool
 	done       chan error
 	enqueuedAt int64
@@ -522,9 +521,9 @@ func assignAutoBatchPreparedErr(ops []autoBatchPrepared, err error) {
 	}
 }
 
-func assignAutoBatchRequestErr(reqs *pooled.Slice[*autoBatchRequest], err error) {
-	for i := 0; i < reqs.Len(); i++ {
-		req := reqs.Get(i)
+func assignAutoBatchRequestErr(reqs []*autoBatchRequest, err error) {
+	for i := 0; i < len(reqs); i++ {
+		req := reqs[i]
 		if req.err == nil {
 			req.err = err
 		}
@@ -600,8 +599,8 @@ func (db *DB[K, V]) buildDeleteAutoBatchRequest(id K, beforeCommit []autoBatchBe
 	return req
 }
 
-func (ab *autoBatcher) submitAutoBatchRequests(reqs *pooled.Slice[*autoBatchRequest], isolated bool) error {
-	if reqs.Len() == 0 {
+func (ab *autoBatcher) submitAutoBatchRequests(reqs []*autoBatchRequest, isolated bool) error {
+	if len(reqs) == 0 {
 		return nil
 	}
 
@@ -610,8 +609,8 @@ func (ab *autoBatcher) submitAutoBatchRequests(reqs *pooled.Slice[*autoBatchRequ
 		ab.submitted.Add(1)
 	}
 	if err := ab.runtime.unavailableErr(); err != nil {
-		for i := 0; i < reqs.Len(); i++ {
-			ab.requestPool.Put(reqs.Get(i))
+		for i := 0; i < len(reqs); i++ {
+			ab.requestPool.Put(reqs[i])
 		}
 		if stats {
 			ab.fallbackClosed.Add(1)
@@ -621,14 +620,14 @@ func (ab *autoBatcher) submitAutoBatchRequests(reqs *pooled.Slice[*autoBatchRequ
 
 	job := ab.jobPool.Get()
 	job.reqs = reqs
-	job.isolated = isolated || reqs.Len() != 1
+	job.isolated = isolated || len(reqs) != 1
 
 	ab.mu.Lock()
 	for {
 		if err := ab.runtime.unavailableErr(); err != nil {
 			ab.mu.Unlock()
-			for i := 0; i < reqs.Len(); i++ {
-				ab.requestPool.Put(reqs.Get(i))
+			for i := 0; i < len(reqs); i++ {
+				ab.requestPool.Put(reqs[i])
 			}
 			ab.jobPool.Put(job)
 			if stats {
@@ -659,8 +658,8 @@ func (ab *autoBatcher) submitAutoBatchRequests(reqs *pooled.Slice[*autoBatchRequ
 	ab.mu.Unlock()
 
 	err := <-job.done
-	for i := 0; i < reqs.Len(); i++ {
-		ab.requestPool.Put(reqs.Get(i))
+	for i := 0; i < len(reqs); i++ {
+		ab.requestPool.Put(reqs[i])
 	}
 	ab.jobPool.Put(job)
 	return err
@@ -844,12 +843,12 @@ func (ab *autoBatcher) autoBatchRepeatedIDLimitLocked(limit int) int {
 	if ab.runtime.strKey {
 		lastByID := ab.repeatStringIDPool.Get(limit)
 		for i := 0; i < limit; i++ {
-			req := ab.queueAt(i).reqs.Get(0)
+			req := ab.queueAt(i).reqs[0]
 			id := req.id.String()
 
 			prevIdx, seen := lastByID[id]
 			if seen {
-				prev := ab.queueAt(prevIdx).reqs.Get(0)
+				prev := ab.queueAt(prevIdx).reqs[0]
 				if !autoBatchRepeatedIDCompatible(prev, req) {
 					limit = i
 					break
@@ -863,12 +862,12 @@ func (ab *autoBatcher) autoBatchRepeatedIDLimitLocked(limit int) int {
 
 	lastByID := ab.repeatUintIDPool.Get(limit)
 	for i := 0; i < limit; i++ {
-		req := ab.queueAt(i).reqs.Get(0)
+		req := ab.queueAt(i).reqs[0]
 		id := req.id.Uint()
 
 		prevIdx, seen := lastByID[id]
 		if seen {
-			prev := ab.queueAt(prevIdx).reqs.Get(0)
+			prev := ab.queueAt(prevIdx).reqs[0]
 			if !autoBatchRepeatedIDCompatible(prev, req) {
 				limit = i
 				break
@@ -941,13 +940,13 @@ func (ab *autoBatcher) markSupersededSetDeleteJobs(batch []*autoBatchJob) {
 	if ab.runtime.strKey {
 		lastByID := ab.repeatStringIDPool.Get(len(batch))
 		for i := range batch {
-			req := batch[i].reqs.Get(0)
+			req := batch[i].reqs[0]
 			req.replacedBy = nil
 			id := req.id.String()
 
 			prevIdx, seen := lastByID[id]
 			if seen && req.canCoalesceSetDelete() {
-				prev := batch[prevIdx].reqs.Get(0)
+				prev := batch[prevIdx].reqs[0]
 				if prev.canCoalesceSetDelete() {
 					prev.replacedBy = req
 					if stats {
@@ -963,13 +962,13 @@ func (ab *autoBatcher) markSupersededSetDeleteJobs(batch []*autoBatchJob) {
 
 	lastByID := ab.repeatUintIDPool.Get(len(batch))
 	for i := range batch {
-		req := batch[i].reqs.Get(0)
+		req := batch[i].reqs[0]
 		req.replacedBy = nil
 		id := req.id.Uint()
 
 		prevIdx, seen := lastByID[id]
 		if seen && req.canCoalesceSetDelete() {
-			prev := batch[prevIdx].reqs.Get(0)
+			prev := batch[prevIdx].reqs[0]
 			if prev.canCoalesceSetDelete() {
 				prev.replacedBy = req
 				if stats {
@@ -982,9 +981,9 @@ func (ab *autoBatcher) markSupersededSetDeleteJobs(batch []*autoBatchJob) {
 	ab.repeatUintIDPool.Put(lastByID)
 }
 
-func (ab *autoBatcher) prepareAutoBatchActive(att *autoBatchAttemptState, active *pooled.Slice[*autoBatchRequest]) {
-	for i := 0; i < active.Len(); i++ {
-		req := active.Get(i)
+func (ab *autoBatcher) prepareAutoBatchActive(att *autoBatchAttemptState, active []*autoBatchRequest) {
+	for i := 0; i < len(active); i++ {
+		req := active[i]
 		if req.err != nil {
 			continue
 		}
@@ -1407,18 +1406,17 @@ func (ab *autoBatcher) executeAutoBatchJobs(batch []*autoBatchJob) {
 		return
 	}
 
-	reqScratch := ab.requestScratchPool.Get()
-	reqScratch.Grow(len(batch))
+	reqScratch := ab.requestScratchPool.Get(len(batch))
 
 	for _, job := range batch {
 		reqs := job.reqs
-		if reqs.Len() != 1 {
+		if len(reqs) != 1 {
 			assignAutoBatchRequestErr(reqs, fmt.Errorf("internal auto-batch error: mixed grouped request in shared batch"))
 			continue
 		}
-		reqScratch.Append(reqs.Get(0))
+		reqScratch = append(reqScratch, reqs[0])
 	}
-	if reqScratch.Len() != 0 {
+	if len(reqScratch) != 0 {
 		ab.runAutoBatchShared(reqScratch)
 	}
 	ab.finishAutoBatchJobs(batch)
@@ -1428,9 +1426,9 @@ func (ab *autoBatcher) executeAutoBatchJobs(batch []*autoBatchJob) {
 	}
 }
 
-func resolveAutoBatchRequestErrs(batch *pooled.Slice[*autoBatchRequest]) {
-	for i := 0; i < batch.Len(); i++ {
-		req := batch.Get(i)
+func resolveAutoBatchRequestErrs(batch []*autoBatchRequest) {
+	for i := 0; i < len(batch); i++ {
+		req := batch[i]
 		if req.replacedBy == nil {
 			continue
 		}
@@ -1448,8 +1446,8 @@ func (ab *autoBatcher) finishAutoBatchJobs(batch []*autoBatchJob) {
 	}
 	for _, job := range batch {
 		var err error
-		if job.reqs.Len() == 1 {
-			err = job.reqs.Get(0).err
+		if len(job.reqs) == 1 {
+			err = job.reqs[0].err
 		} else {
 			err = firstAutoBatchRequestErr(job.reqs)
 		}
@@ -1464,8 +1462,8 @@ func (ab *autoBatcher) executeAutoBatch(batch []*autoBatchRequest) {
 	if stats {
 		started = time.Now()
 	}
-	reqScratch := ab.requestScratchPool.Get()
-	reqScratch.AppendAll(batch)
+	reqScratch := ab.requestScratchPool.Get(len(batch))
+	reqScratch = append(reqScratch, batch...)
 	ab.runAutoBatchShared(reqScratch)
 	ab.requestScratchPool.Put(reqScratch)
 	ab.finishAutoBatch(batch)
@@ -1474,22 +1472,19 @@ func (ab *autoBatcher) executeAutoBatch(batch []*autoBatchRequest) {
 	}
 }
 
-func (ab *autoBatcher) runAutoBatchShared(batch *pooled.Slice[*autoBatchRequest]) {
-	for i := 0; i < batch.Len(); i++ {
-		batch.Get(i).err = nil
+func (ab *autoBatcher) runAutoBatchShared(batch []*autoBatchRequest) {
+	for i := 0; i < len(batch); i++ {
+		batch[i].err = nil
 	}
 
-	activeScratch := ab.requestScratchPool.Get()
-	defer ab.requestScratchPool.Put(activeScratch)
-
-	activeScratch.Grow(batch.Len())
-
-	for i := 0; i < batch.Len(); i++ {
-		req := batch.Get(i)
+	activeScratch := ab.requestScratchPool.Get(len(batch))
+	for i := 0; i < len(batch); i++ {
+		req := batch[i]
 		if req.replacedBy == nil {
-			activeScratch.Append(req)
+			activeScratch = append(activeScratch, req)
 		}
 	}
+	defer ab.requestScratchPool.Put(activeScratch)
 
 	for {
 		retryWithoutReq, done, fatalErr := ab.executeAutoBatchAttempt(activeScratch, false)
@@ -1503,27 +1498,27 @@ func (ab *autoBatcher) runAutoBatchShared(batch *pooled.Slice[*autoBatchRequest]
 
 		write := 0
 		removed := false
-		for i := 0; i < activeScratch.Len(); i++ {
-			req := activeScratch.Get(i)
+		for i := 0; i < len(activeScratch); i++ {
+			req := activeScratch[i]
 			if !removed && req == retryWithoutReq {
 				removed = true
 				continue
 			}
 			if write != i {
-				activeScratch.Set(write, req)
+				activeScratch[write] = req
 			}
 			write++
 		}
-		activeScratch.SetLen(write)
+		activeScratch = activeScratch[:write]
 		if !removed {
 			assignAutoBatchRequestErr(batch, fmt.Errorf("internal auto-batch retry error: failed request not found"))
 			return
 		}
-		if activeScratch.Len() == 0 {
+		if len(activeScratch) == 0 {
 			return
 		}
-		for i := 0; i < activeScratch.Len(); i++ {
-			req := activeScratch.Get(i)
+		for i := 0; i < len(activeScratch); i++ {
+			req := activeScratch[i]
 			if errors.Is(req.err, ErrUniqueViolation) {
 				req.err = nil
 			}
@@ -1531,9 +1526,9 @@ func (ab *autoBatcher) runAutoBatchShared(batch *pooled.Slice[*autoBatchRequest]
 	}
 }
 
-func firstAutoBatchRequestErr(reqs *pooled.Slice[*autoBatchRequest]) error {
-	for i := 0; i < reqs.Len(); i++ {
-		req := reqs.Get(i)
+func firstAutoBatchRequestErr(reqs []*autoBatchRequest) error {
+	for i := 0; i < len(reqs); i++ {
+		req := reqs[i]
 		if req.err != nil {
 			return req.err
 		}
@@ -1584,9 +1579,9 @@ func autoBatchOpName(op autoBatchOp, reqLen int, atomicAll bool, maxOps int) str
 	}
 }
 
-func (ab *autoBatcher) runAutoBatchAtomic(batch *pooled.Slice[*autoBatchRequest]) {
-	for i := 0; i < batch.Len(); i++ {
-		req := batch.Get(i)
+func (ab *autoBatcher) runAutoBatchAtomic(batch []*autoBatchRequest) {
+	for i := 0; i < len(batch); i++ {
+		req := batch[i]
 		req.err = nil
 		req.replacedBy = nil
 	}
@@ -1600,13 +1595,13 @@ func (ab *autoBatcher) runAutoBatchAtomic(batch *pooled.Slice[*autoBatchRequest]
 	}
 }
 
-func (ab *autoBatcher) executeAutoBatchAttempt(active *pooled.Slice[*autoBatchRequest], atomicAll bool) (*autoBatchRequest, bool, error) {
+func (ab *autoBatcher) executeAutoBatchAttempt(active []*autoBatchRequest, atomicAll bool) (*autoBatchRequest, bool, error) {
 	rt := ab.runtime
 	var firstOp autoBatchOp
-	if active.Len() != 0 {
-		firstOp = active.Get(0).op
+	if len(active) != 0 {
+		firstOp = active[0].op
 	}
-	opName := autoBatchOpName(firstOp, active.Len(), atomicAll, ab.maxOps)
+	opName := autoBatchOpName(firstOp, len(active), atomicAll, ab.maxOps)
 
 	tx, err := rt.bolt.Begin(true)
 	if err != nil {
@@ -1626,7 +1621,7 @@ func (ab *autoBatcher) executeAutoBatchAttempt(active *pooled.Slice[*autoBatchRe
 	bucket.FillPercent = rt.bucketFillPercent
 	defer rollback(tx)
 
-	capHint := max(active.Len(), 1)
+	capHint := max(len(active), 1)
 	if capHint <= 8 {
 		capHint = 8
 	} else {

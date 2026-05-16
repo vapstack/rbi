@@ -15,7 +15,6 @@ import (
 	"github.com/vapstack/qx"
 	"github.com/vapstack/rbi/internal/indexdata"
 	"github.com/vapstack/rbi/internal/keycodec"
-	"github.com/vapstack/rbi/internal/pooled"
 	"github.com/vapstack/rbi/internal/schema"
 	"github.com/vapstack/rbi/internal/strmap"
 	"go.etcd.io/bbolt"
@@ -56,10 +55,8 @@ func dataKeyID[K ~string | ~uint64](key keycodec.DataKey) K {
 	return keycodec.UserKeyFromDataKey[K](key, false)
 }
 
-func testAutoBatchRequestBuf(reqs ...*autoBatchRequest) *pooled.Slice[*autoBatchRequest] {
-	buf := new(pooled.Slice[*autoBatchRequest])
-	buf.AppendAll(reqs)
-	return buf
+func testAutoBatchRequestBuf(reqs ...*autoBatchRequest) []*autoBatchRequest {
+	return append([]*autoBatchRequest(nil), reqs...)
 }
 
 func queuedSingleJob(req *autoBatchRequest) *autoBatchJob {
@@ -481,7 +478,7 @@ func TestBatch_PopSkipsCoalescingWindowForIsolatedHead(t *testing.T) {
 	after := db.AutoBatchStats()
 
 	poppedReqs := batch[0].reqs
-	if len(batch) != 1 || poppedReqs.Len() != 1 || poppedReqs.Get(0) != isolatedReq {
+	if len(batch) != 1 || len(poppedReqs) != 1 || poppedReqs[0] != isolatedReq {
 		t.Fatalf("expected isolated head to pop immediately alone, got=%+v", batch)
 	}
 	if after.CoalesceWaits != before.CoalesceWaits {
@@ -525,7 +522,7 @@ func TestBatch_PopSkipsCoalescingWindowBeforeIsolatedFollower(t *testing.T) {
 	after := db.AutoBatchStats()
 
 	poppedReqs := batch[0].reqs
-	if len(batch) != 1 || poppedReqs.Len() != 1 || poppedReqs.Get(0) != headReq {
+	if len(batch) != 1 || len(poppedReqs) != 1 || poppedReqs[0] != headReq {
 		t.Fatalf("expected head request before isolated follower to pop immediately alone, got=%+v", batch)
 	}
 	if after.CoalesceWaits != before.CoalesceWaits {
@@ -608,7 +605,7 @@ func TestBatch_CallbackRequestsStayBatchable(t *testing.T) {
 		t.Fatalf("expected callbacks to remain batchable, got %d", len(batch))
 	}
 	middleReqs := batch[1].reqs
-	if middleReqs.Len() != 1 || len(middleReqs.Get(0).beforeCommit) == 0 {
+	if len(middleReqs) != 1 || len(middleReqs[0].beforeCommit) == 0 {
 		t.Fatalf("expected middle request with callback to stay in a multi-request batch")
 	}
 }
@@ -953,7 +950,7 @@ func TestBatch_DuplicatePatchSameID_UniqueFieldCutsBatch(t *testing.T) {
 		t.Fatalf("expected repeated unique-touching patches to cut batch, got=%d", len(batch))
 	}
 	poppedReqs := batch[0].reqs
-	if poppedReqs.Len() != 1 || poppedReqs.Get(0) != req1 {
+	if len(poppedReqs) != 1 || poppedReqs[0] != req1 {
 		t.Fatalf("expected first request to stay alone in batch")
 	}
 }
@@ -1010,7 +1007,7 @@ func TestBatch_DuplicatePatchSameID_BeforeStoreOnUniqueDBCutsBatch(t *testing.T)
 		t.Fatalf("expected BeforeStore-bearing repeated same-id patch to cut batch on unique DB, got=%d", len(batch))
 	}
 	poppedReqs := batch[0].reqs
-	if poppedReqs.Len() != 1 || poppedReqs.Get(0) != req1 {
+	if len(poppedReqs) != 1 || poppedReqs[0] != req1 {
 		t.Fatalf("expected first request to stay alone in batch")
 	}
 
@@ -1019,8 +1016,8 @@ func TestBatch_DuplicatePatchSameID_BeforeStoreOnUniqueDBCutsBatch(t *testing.T)
 	queuedReqs0 := db.autoBatcher.queueAt(0).reqs
 	queuedReqs1 := db.autoBatcher.queueAt(1).reqs
 	if db.autoBatcher.queueLen() != 2 ||
-		queuedReqs0.Len() != 1 || queuedReqs0.Get(0) != req2 ||
-		queuedReqs1.Len() != 1 || queuedReqs1.Get(0) != req3 {
+		len(queuedReqs0) != 1 || queuedReqs0[0] != req2 ||
+		len(queuedReqs1) != 1 || queuedReqs1[0] != req3 {
 		t.Fatalf("expected remaining requests to stay queued in order")
 	}
 }
@@ -1077,7 +1074,7 @@ func TestBatch_DuplicatePatchSameID_BeforeProcessOnUniqueDBCutsBatch(t *testing.
 		t.Fatalf("expected BeforeProcess-bearing repeated same-id patch to cut batch on unique DB, got=%d", len(batch))
 	}
 	poppedReqs := batch[0].reqs
-	if poppedReqs.Len() != 1 || poppedReqs.Get(0) != req1 {
+	if len(poppedReqs) != 1 || poppedReqs[0] != req1 {
 		t.Fatalf("expected first request to stay alone in batch")
 	}
 
@@ -1086,8 +1083,8 @@ func TestBatch_DuplicatePatchSameID_BeforeProcessOnUniqueDBCutsBatch(t *testing.
 	queuedReqs0 := db.autoBatcher.queueAt(0).reqs
 	queuedReqs1 := db.autoBatcher.queueAt(1).reqs
 	if db.autoBatcher.queueLen() != 2 ||
-		queuedReqs0.Len() != 1 || queuedReqs0.Get(0) != req2 ||
-		queuedReqs1.Len() != 1 || queuedReqs1.Get(0) != req3 {
+		len(queuedReqs0) != 1 || queuedReqs0[0] != req2 ||
+		len(queuedReqs1) != 1 || queuedReqs1[0] != req3 {
 		t.Fatalf("expected remaining requests to stay queued in order")
 	}
 }
