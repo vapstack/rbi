@@ -304,6 +304,23 @@ func postsAnyDirectIntersectWork(posts []posting.List, dstCard uint64) uint64 {
 	return work
 }
 
+func postsAnyMaterializedApplyWork(dstCard, unionCard uint64) uint64 {
+	if dstCard <= posting.MidCap || unionCard <= posting.MidCap {
+		return satMulUint64(dstCard, postingContainsLookupWork(unionCard))
+	}
+	// Large posting intersection is container-oriented; pricing it as per-row Contains
+	// makes broad HASANY filters stay on the much slower direct-intersect path.
+	card := dstCard
+	if unionCard < card {
+		card = unionCard
+	}
+	work := card >> 6
+	if card&63 != 0 {
+		work++
+	}
+	return work
+}
+
 func (state *postsAnyFilterState) applyWork(dstCard uint64) (uint64, uint64, uint64, uint64, bool) {
 	if state.postsBuf == nil || dstCard == 0 {
 		return 0, 0, 0, 0, false
@@ -332,7 +349,7 @@ func (state *postsAnyFilterState) applyWork(dstCard uint64) (uint64, uint64, uin
 		}
 	}
 	directWork := postsAnyDirectIntersectWork(state.postsBuf, dstCard)
-	materializedCheckWork := satMulUint64(dstCard, postingContainsLookupWork(unionCard))
+	materializedCheckWork := postsAnyMaterializedApplyWork(dstCard, unionCard)
 	return unionCard, buildWork, directWork, materializedCheckWork, true
 }
 

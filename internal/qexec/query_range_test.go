@@ -61,6 +61,49 @@ func bitmapToIDs(t *testing.T, b postingResult) []uint64 {
 	return b.ids.ToArray()
 }
 
+func TestEvalExprMergesPositiveNumericRangeOperandsOnSameField(t *testing.T) {
+	db := newCorrectnessDB(t, Options{AnalyzeInterval: -1})
+
+	res, err := db.engine.evalExpr(qx.AND(
+		qx.GTE("age", 30),
+		qx.LT("age", 60),
+		qx.EQ("active", true),
+	))
+	if err != nil {
+		t.Fatalf("evalExpr: %v", err)
+	}
+	got := bitmapToIDs(t, res)
+	res.ids.Release()
+
+	want := expectedRecIDs(db, func(_ uint64, r *Rec) bool {
+		return r.Active && r.Age >= 30 && r.Age < 60
+	}, nil, 0, 0)
+	if !slices.Equal(got, want) {
+		t.Fatalf("evalExpr mismatch: got=%v want=%v", got, want)
+	}
+}
+
+func TestEvalExprAppliesRangeResidualToLookupLead(t *testing.T) {
+	db := newCorrectnessDB(t, Options{AnalyzeInterval: -1})
+
+	res, err := db.engine.evalExpr(qx.AND(
+		qx.EQ("country", "JP"),
+		qx.GTE("age", 30),
+	))
+	if err != nil {
+		t.Fatalf("evalExpr: %v", err)
+	}
+	got := bitmapToIDs(t, res)
+	res.ids.Release()
+
+	want := expectedRecIDs(db, func(_ uint64, r *Rec) bool {
+		return r.Country == "JP" && r.Age >= 30
+	}, nil, 0, 0)
+	if !slices.Equal(got, want) {
+		t.Fatalf("evalExpr mismatch: got=%v want=%v", got, want)
+	}
+}
+
 func numericRangeFullSpanCacheEntryCount(entry *qcache.NumericRangeBucketEntry) int {
 	return entry.FullSpanEntryCount()
 }

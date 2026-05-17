@@ -274,6 +274,43 @@ func TestPostsAnyFilterStateSetExpectedContainsCalls_PromotesFirstUseMaterializa
 	}
 }
 
+func TestMaterializePostingUnionBufOwned_TwoTermSubsetFastPath(t *testing.T) {
+	largeIDs := make([]uint64, 0, 128)
+	subsetIDs := make([]uint64, 0, 16)
+	controlIDs := make([]uint64, 0, 16)
+	for i := uint64(0); i < 128; i++ {
+		id := i*2 + 2
+		largeIDs = append(largeIDs, id)
+		if i&7 == 0 {
+			subsetIDs = append(subsetIDs, id)
+			controlIDs = append(controlIDs, id-1)
+		}
+	}
+
+	large := posting.BuildFromSorted(largeIDs)
+	subset := posting.BuildFromSorted(subsetIDs)
+	control := posting.BuildFromSorted(controlIDs)
+	defer large.Release()
+	defer subset.Release()
+	defer control.Release()
+
+	subsetPosts := []posting.List{subset, large}
+	got := materializePostingUnionBufOwned(subsetPosts)
+	if !slices.Equal(got.ToArray(), largeIDs) {
+		t.Fatalf("subset union mismatch: got=%v want=%v", got.ToArray(), largeIDs)
+	}
+	got.Release()
+
+	controlPosts := []posting.List{control, large}
+	got = materializePostingUnionBufOwned(controlPosts)
+	want := append(controlIDs[:len(controlIDs):len(controlIDs)], largeIDs...)
+	slices.Sort(want)
+	if !slices.Equal(got.ToArray(), want) {
+		t.Fatalf("control union mismatch: got=%v want=%v", got.ToArray(), want)
+	}
+	got.Release()
+}
+
 func TestPostingUnionBuilder_SmallPostingsBatchSinglesMatchesBaseline(t *testing.T) {
 	left := posting.BuildFromSorted([]uint64{3, 5, 7, 9, 11, 13, 15, 17})
 	right := posting.BuildFromSorted([]uint64{5, 6, 7, 18, 19, 20, 21, 22, 23, 24})

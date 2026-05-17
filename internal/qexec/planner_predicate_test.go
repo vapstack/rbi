@@ -2,10 +2,10 @@ package qexec
 
 import (
 	"fmt"
-	"github.com/vapstack/rbi/internal/indexdata"
 	"testing"
 
 	"github.com/vapstack/qx"
+	"github.com/vapstack/rbi/internal/indexdata"
 	"github.com/vapstack/rbi/internal/keycodec"
 	"github.com/vapstack/rbi/internal/pooled"
 	"github.com/vapstack/rbi/internal/posting"
@@ -233,7 +233,7 @@ func TestPredicateLeadIterMayDuplicate_RangeStatesStayUnique(t *testing.T) {
 func TestIndexViewRangeProbe_CountBucket_ComplementProbe(t *testing.T) {
 	probeIDs := posting.BuildFromSorted([]uint64{2, 4})
 	defer probeIDs.Release()
-	bucket := posting.BuildFromSorted([]uint64{1, 2, 3, 4})
+	bucket := posting.BuildFromSorted([]uint64{1, 2, 3, 4, 5})
 	defer bucket.Release()
 
 	probe := fieldIndexRangeProbe{
@@ -249,8 +249,43 @@ func TestIndexViewRangeProbe_CountBucket_ComplementProbe(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected overlay complement probe to support countBucket")
 	}
+	if in != 3 {
+		t.Fatalf("countBucket = %d, want 3", in)
+	}
+}
+
+func TestIndexViewRangePredicateState_CountBucket_ComplementProbe(t *testing.T) {
+	probeIDs := posting.BuildFromSorted([]uint64{2, 4})
+	defer probeIDs.Release()
+	bucket := posting.BuildFromSorted([]uint64{1, 2, 3, 4, 5})
+	defer bucket.Release()
+
+	state := &fieldIndexRangePredicateState{
+		probe: fieldIndexRangeProbe{
+			ov:            indexdata.NewFieldIndexView(&[]indexdata.Entry{{IDs: probeIDs.Borrow()}}),
+			spanCnt:       1,
+			useComplement: true,
+			probeLen:      1,
+			probeEst:      2,
+		},
+	}
+	state.probe.spans[0] = indexdata.FieldIndexRange{BaseStart: 0, BaseEnd: 1}
+
+	in, ok := state.countBucket(bucket.Borrow())
+	if !ok {
+		t.Fatalf("expected positive complement-backed range count")
+	}
+	if in != 3 {
+		t.Fatalf("positive countBucket = %d, want 3", in)
+	}
+
+	state.neg = true
+	in, ok = state.countBucket(bucket.Borrow())
+	if !ok {
+		t.Fatalf("expected negative complement-backed range count")
+	}
 	if in != 2 {
-		t.Fatalf("countBucket = %d, want 2", in)
+		t.Fatalf("negative countBucket = %d, want 2", in)
 	}
 }
 
@@ -1289,6 +1324,44 @@ func TestBuildPredicatesOrdered_CoveredExactRangeWarmCacheHitLoadsWhenPredicateS
 	}
 	if preds[0].hasRuntimeRangeState() {
 		t.Fatalf("expected covered exact-range warm cache hit to avoid runtime range state")
+	}
+}
+
+func TestBuildPredicatesOrdered_MergesStringScalarRangeBounds(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
+	seedGeneratedUint64Data(t, db, 2_000, func(i int) *Rec {
+		return &Rec{
+			Name:   fmt.Sprintf("u_%d", i),
+			Email:  fmt.Sprintf("user%06d@example.com", i),
+			Score:  float64(i),
+			Active: true,
+		}
+	})
+	if err := db.RebuildIndex(); err != nil {
+		t.Fatalf("RebuildIndex: %v", err)
+	}
+
+	leaves := []qx.Expr{
+		qx.GTE("email", "user000400@example.com"),
+		qx.LT("email", "user001600@example.com"),
+	}
+	preds, ok := db.engine.buildPredicatesOrderedWithMode(leaves, "score", false, 128, 0, true, true)
+	if !ok {
+		t.Fatalf("buildPredicatesOrderedWithMode: ok=false")
+	}
+	defer releasePredicates(preds)
+
+	if len(preds) != 1 {
+		t.Fatalf("expected merged string range predicate, got %d predicates", len(preds))
+	}
+	if !preds[0].hasEffectiveBounds {
+		t.Fatalf("expected merged string range effective bounds")
+	}
+	if preds[0].fieldIndexRangeState == nil {
+		t.Fatalf("expected merged string range to keep runtime range state")
+	}
+	if preds[0].isMaterializedLike() {
+		t.Fatalf("expected cold merged string range to avoid eager materialization")
 	}
 }
 

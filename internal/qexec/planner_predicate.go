@@ -481,12 +481,21 @@ func (p predicate) countBucket(bucket posting.List) (uint64, bool) {
 		return bc - hit, true
 
 	case predicateKindPostsAny:
+		// Distinct scalar values for one field are mutually exclusive, so IN term postings do not overlap.
+		if p.expr.Op == qir.OpIN {
+			return countBucketDisjointPostsAnyBuf(p.postsBuf, bucket), true
+		}
 		if p.postsAnyState != nil {
 			return p.postsAnyState.countBucket(bucket)
 		}
 		return countBucketPostsAnyBuf(p.postsBuf, bucket)
 
 	case predicateKindPostsAnyNot:
+		if p.expr.Op == qir.OpIN {
+			bc := bucket.Cardinality()
+			hit := countBucketDisjointPostsAnyBuf(p.postsBuf, bucket)
+			return bc - hit, true
+		}
 		if p.postsAnyState != nil {
 			return p.postsAnyState.countBucket(bucket)
 		}
@@ -678,6 +687,14 @@ func countBucketPostsAnyBuf(posts []posting.List, bucket posting.List) (uint64, 
 		}
 	}
 	return 0, true
+}
+
+func countBucketDisjointPostsAnyBuf(posts []posting.List, bucket posting.List) uint64 {
+	var hit uint64
+	for i := 0; i < len(posts); i++ {
+		hit += posts[i].AndCardinality(bucket)
+	}
+	return hit
 }
 
 func countBucketPostsAnyNotBuf(posts []posting.List, bucket posting.List) (uint64, bool) {
@@ -2666,6 +2683,7 @@ func orderedScanEmitBucketWithPredicates(
 func orderedBasicAnchoredEmitPosting(
 	cursor *queryCursor,
 	candidateIDs posting.List,
+	candidateHash *u64set,
 	preds predicateReader,
 	deferredChecks []int,
 	singleDeferred int,
@@ -2683,7 +2701,11 @@ func orderedBasicAnchoredEmitPosting(
 	}
 
 	if idx, ok := ids.TrySingle(); ok {
-		if !candidateIDs.Contains(idx) {
+		if candidateHash != nil {
+			if !candidateHash.Has(idx) {
+				return false
+			}
+		} else if !candidateIDs.Contains(idx) {
 			return false
 		}
 		*seenCandidates = *seenCandidates + 1
@@ -2696,7 +2718,11 @@ func orderedBasicAnchoredEmitPosting(
 	it := ids.Iter()
 	for it.HasNext() {
 		idx := it.Next()
-		if !candidateIDs.Contains(idx) {
+		if candidateHash != nil {
+			if !candidateHash.Has(idx) {
+				continue
+			}
+		} else if !candidateIDs.Contains(idx) {
 			continue
 		}
 		*seenCandidates = *seenCandidates + 1
@@ -2812,8 +2838,76 @@ func (qv *View) buildPredicatesWithColdMode(leaves []qir.Expr, allowMaterialize 
 		return preds, true
 	}
 
+	if len(leaves) > 2 && qv.hasMergeableNumericRangeLeaves(leaves) {
+		return qv.buildPredicatesWithMergedNumericRanges(leaves, allowMaterialize, lazyColdMaterialize)
+	}
+
 	preds := newPredicateSet(len(leaves))
 	for _, e := range leaves {
+		p, ok := qv.buildPredicateWithColdMode(e, allowMaterialize, lazyColdMaterialize)
+		if !ok {
+			preds.Release()
+			return predicateSet{}, false
+		}
+		preds.Append(p)
+	}
+	return preds, true
+}
+
+func (qv *View) hasMergeableNumericRangeLeaves(leaves []qir.Expr) bool {
+	for i := 0; i < len(leaves)-1; i++ {
+		e := leaves[i]
+		if !qv.isPositiveMergedNumericRangeLeaf(e) {
+			continue
+		}
+		fieldName := qv.exec.FieldNameByOrdinal(e.FieldOrdinal)
+		count := 1
+		for j := i + 1; j < len(leaves); j++ {
+			next := leaves[j]
+			if qv.isPositiveMergedNumericRangeLeaf(next) &&
+				qv.exec.FieldNameByOrdinal(next.FieldOrdinal) == fieldName {
+				count++
+			}
+		}
+		if count > 1 && len(leaves) > count {
+			return true
+		}
+	}
+	return false
+}
+
+func (qv *View) buildPredicatesWithMergedNumericRanges(leaves []qir.Expr, allowMaterialize bool, lazyColdMaterialize bool) (predicateSet, bool) {
+	preds := newPredicateSet(len(leaves))
+	mergedRangesBuf := orderedMergedScalarRangeFieldSlicePool.Get(len(leaves))
+	var ok bool
+	mergedRangesBuf, ok = qv.collectMergedNumericRangeFields(leaves, mergedRangesBuf)
+	if !ok {
+		preds.Release()
+		orderedMergedScalarRangeFieldSlicePool.Put(mergedRangesBuf)
+		return predicateSet{}, false
+	}
+	defer orderedMergedScalarRangeFieldSlicePool.Put(mergedRangesBuf)
+
+	for i, e := range leaves {
+		if qv.isPositiveMergedNumericRangeLeaf(e) {
+			idx := findOrderedMergedScalarRangeField(mergedRangesBuf, qv.exec.FieldNameByOrdinal(e.FieldOrdinal))
+			if idx >= 0 {
+				merged := mergedRangesBuf[idx]
+				if merged.count > 1 && len(leaves) > merged.count {
+					if merged.first != i {
+						continue
+					}
+					p, ok := qv.buildMergedScalarRangePredicateWithColdMode(merged.expr, merged.bounds, allowMaterialize, lazyColdMaterialize)
+					if !ok {
+						preds.Release()
+						return predicateSet{}, false
+					}
+					preds.Append(p)
+					continue
+				}
+			}
+		}
+
 		p, ok := qv.buildPredicateWithColdMode(e, allowMaterialize, lazyColdMaterialize)
 		if !ok {
 			preds.Release()
@@ -2922,6 +3016,17 @@ func (qv *View) orderedScalarRangeCanEagerMaterialize(route orderedScalarRangeRo
 	return qv.snap.ShouldPromoteRuntimeMaterializedPredKey(promotionKey)
 }
 
+func (qv *View) orderedScalarRangeHasWarmComplement(route orderedScalarRangeRouting) bool {
+	if !route.useComplement || route.complementCacheKey.IsZero() {
+		return false
+	}
+	cached, ok := qv.snap.LoadMaterializedPredKey(route.complementCacheKey)
+	if ok {
+		cached.Release()
+	}
+	return ok
+}
+
 func (qv *View) tryMaterializeBroadRangeComplementPredicateForOrdered(
 	p *predicate,
 	broadComplement bool,
@@ -3024,20 +3129,20 @@ func (qv *View) loadWarmComplementPredicateForOrdered(p *predicate, useComplemen
 	return true
 }
 
-func (qv *View) isPositiveOrderedNumericRangeLeaf(e qir.Expr, orderField string) bool {
-	if e.Not || e.FieldOrdinal < 0 || qv.exec.FieldNameByOrdinal(e.FieldOrdinal) == orderField || !e.Op.IsNumericRange() {
+func (qv *View) isPositiveOrderedMergedScalarRangeLeaf(e qir.Expr, orderField string) bool {
+	if e.Not || e.FieldOrdinal < 0 || qv.exec.FieldNameByOrdinal(e.FieldOrdinal) == orderField || len(e.Operands) != 0 || !isScalarRangeEqOp(e.Op) {
 		return false
 	}
 	fm := qv.fieldMetaByExpr(e)
-	return schema.FieldUsesOrderedNumericKeys(fm)
+	return fm != nil && !fm.Slice
 }
 
-func (qv *View) buildMergedNumericRangePredicate(e qir.Expr, bounds indexdata.Bounds, allowMaterialize bool) (predicate, bool) {
-	return qv.buildMergedNumericRangePredicateWithColdMode(e, bounds, allowMaterialize, false)
+func (qv *View) buildMergedScalarRangePredicate(e qir.Expr, bounds indexdata.Bounds, allowMaterialize bool) (predicate, bool) {
+	return qv.buildMergedScalarRangePredicateWithColdMode(e, bounds, allowMaterialize, false)
 }
 
-func (qv *View) buildMergedNumericRangePredicateWithColdMode(e qir.Expr, bounds indexdata.Bounds, allowMaterialize, lazyColdMaterialize bool) (predicate, bool) {
-	return qv.buildMergedNumericRangePredicateWithColdModeAndWarmLoad(
+func (qv *View) buildMergedScalarRangePredicateWithColdMode(e qir.Expr, bounds indexdata.Bounds, allowMaterialize, lazyColdMaterialize bool) (predicate, bool) {
+	return qv.buildMergedScalarRangePredicateWithColdModeAndWarmLoad(
 		e,
 		bounds,
 		allowMaterialize,
@@ -3046,7 +3151,7 @@ func (qv *View) buildMergedNumericRangePredicateWithColdMode(e qir.Expr, bounds 
 	)
 }
 
-func (qv *View) buildMergedNumericRangePredicateWithColdModeAndWarmLoad(
+func (qv *View) buildMergedScalarRangePredicateWithColdModeAndWarmLoad(
 	e qir.Expr,
 	bounds indexdata.Bounds,
 	allowMaterialize, lazyColdMaterialize, allowWarmLoad bool,
@@ -3205,7 +3310,7 @@ func (qv *View) buildPredicatesOrderedWithMode(
 			continue
 		}
 
-		if qv.isPositiveOrderedNumericRangeLeaf(e, orderField) {
+		if qv.isPositiveOrderedMergedScalarRangeLeaf(e, orderField) {
 			idx := findOrderedMergedScalarRangeField(mergedRangesBuf, fieldName)
 			if idx >= 0 {
 				merged := mergedRangesBuf[idx]
@@ -3232,13 +3337,14 @@ func (qv *View) buildPredicatesOrderedWithMode(
 					orderedEagerMaterialize := false
 					if !predAllowMaterialize &&
 						allowOrderedEagerMaterialize &&
+						!qv.orderedScalarRangeHasWarmComplement(orderedRoute) &&
 						qv.orderedScalarRangeCanEagerMaterialize(orderedRoute) {
 						predAllowMaterialize = true
 						orderedEagerMaterialize = true
 					}
 
 					lazyColdMaterialize := predAllowMaterialize && !orderedRoute.eagerMaterialize
-					p, ok := qv.buildMergedNumericRangePredicateWithColdModeAndWarmLoad(
+					p, ok := qv.buildMergedScalarRangePredicateWithColdModeAndWarmLoad(
 						merged.expr,
 						merged.bounds,
 						predAllowMaterialize,
@@ -3278,6 +3384,7 @@ func (qv *View) buildPredicatesOrderedWithMode(
 			!orderRangeDeferred &&
 			orderedMergedScalarRangeFieldCount(mergedRangesBuf, fieldName) <= 1 &&
 			fieldName != orderField &&
+			!qv.orderedScalarRangeHasWarmComplement(orderedRoute) &&
 			qv.orderedScalarRangeCanEagerMaterialize(orderedRoute) {
 			predAllowMaterialize = true
 			orderedEagerMaterialize = true
@@ -3599,15 +3706,18 @@ func (p *fieldIndexRangeProbe) scanStats() {
 	for i := 0; i < p.spanCnt; i++ {
 		cur := p.ov.NewCursor(p.spans[i], false)
 		for {
-			_, ids, ok := cur.Next()
+			ids, _, single, ok := cur.NextPostingOrSingle()
 			if !ok {
 				break
 			}
-			if ids.IsEmpty() {
-				continue
+			card := uint64(1)
+			if !single {
+				if ids.IsEmpty() {
+					continue
+				}
+				card = ids.Cardinality()
 			}
 			p.probeLen++
-			card := ids.Cardinality()
 			if ^uint64(0)-p.probeEst < card {
 				p.probeEst = ^uint64(0)
 			} else {
@@ -3621,9 +3731,15 @@ func (p fieldIndexRangeProbe) linearContains(idx uint64) bool {
 	for i := 0; i < p.spanCnt; i++ {
 		cur := p.ov.NewCursor(p.spans[i], false)
 		for {
-			_, ids, ok := cur.Next()
+			ids, singleIdx, single, ok := cur.NextPostingOrSingle()
 			if !ok {
 				break
+			}
+			if single {
+				if singleIdx == idx {
+					return true
+				}
+				continue
 			}
 			if !ids.IsEmpty() && ids.Contains(idx) {
 				return true
@@ -3640,9 +3756,16 @@ func (p fieldIndexRangeProbe) buildAndNotPosting(dst posting.List) posting.List 
 	for i := 0; i < p.spanCnt; i++ {
 		cur := p.ov.NewCursor(p.spans[i], false)
 		for {
-			_, ids, ok := cur.Next()
+			ids, idx, single, ok := cur.NextPostingOrSingle()
 			if !ok {
 				break
+			}
+			if single {
+				dst = dst.BuildRemoved(idx)
+				if dst.IsEmpty() {
+					return dst
+				}
+				continue
 			}
 			if ids.IsEmpty() {
 				continue
@@ -3663,9 +3786,15 @@ func (p fieldIndexRangeProbe) appendIntersectingPosting(dst posting.List, builde
 	for i := 0; i < p.spanCnt; i++ {
 		cur := p.ov.NewCursor(p.spans[i], false)
 		for {
-			_, ids, ok := cur.Next()
+			ids, idx, single, ok := cur.NextPostingOrSingle()
 			if !ok {
 				break
+			}
+			if single {
+				if dst.Contains(idx) {
+					builder.addSingle(idx)
+				}
+				continue
 			}
 			builder = postingListAppendIntersecting(dst, ids, builder)
 		}
@@ -3685,9 +3814,15 @@ func (p fieldIndexRangeProbe) countBucket(bucket posting.List) (uint64, bool) {
 	for i := 0; i < p.spanCnt; i++ {
 		cur := p.ov.NewCursor(p.spans[i], false)
 		for {
-			_, ids, ok := cur.Next()
+			ids, idx, single, ok := cur.NextPostingOrSingle()
 			if !ok {
 				break
+			}
+			if single {
+				if bucket.Contains(idx) {
+					hit++
+				}
+				continue
 			}
 			if ids.IsEmpty() {
 				continue
@@ -3772,7 +3907,28 @@ func materializePostingBufFast(probe []posting.List) posting.List {
 	return builder.finish(true)
 }
 
+const postingUnionSubsetProbeMaxRatio = 4 // Keep failed two-term subset probes cheaper than the full union path they guard.
+
 func materializePostingUnionBufOwned(posts []posting.List) posting.List {
+	if len(posts) == 2 {
+		a := posts[0]
+		b := posts[1]
+		if a.IsEmpty() {
+			return b.Clone().BuildOptimized()
+		}
+		if b.IsEmpty() {
+			return a.Clone().BuildOptimized()
+		}
+		ac := a.Cardinality()
+		bc := b.Cardinality()
+		if ac <= bc/postingUnionSubsetProbeMaxRatio && a.AndCardinality(b) == ac {
+			return b.Clone().BuildOptimized()
+		}
+		if bc <= ac/postingUnionSubsetProbeMaxRatio && b.AndCardinality(a) == bc {
+			return a.Clone().BuildOptimized()
+		}
+	}
+
 	builder := newPostingUnionBuilder(true)
 	defer builder.release()
 
@@ -3794,6 +3950,8 @@ const (
 	plannerOrderedAnchorCandidateCapMin  = 8_192
 	plannerOrderedAnchorCandidateCapMax  = 300_000
 	plannerOrderedAnchorCandidateNeedMul = 64
+	plannerOrderedAnchorHashCandidateMin = 64                   // Below this, posting.Contains is cheaper than building a pooled hash for order-anchor probes.
+	plannerOrderedAnchorHashCandidateMax = u64SetPoolMaxCap / 2 // Larger candidate sets would leave pooled hash classes and increase reader heap pressure.
 )
 
 func plannerOrderedAnchorBudgets(needWindow int, activeCount int, leadEst uint64) (leadBudget uint64, candidateCap uint64) {
@@ -3917,6 +4075,13 @@ func (qv *View) execPlanOrderedBasicAnchoredWithScratch(
 ) ([]uint64, bool) {
 
 	if len(active) < plannerOrderedAnchorMinActive {
+		if len(active) != 1 ||
+			!orderedPredicateIsRangeLike(preds[active[0]]) ||
+			qv.exec.FieldNameByOrdinal(preds[active[0]].expr.FieldOrdinal) == qv.exec.FieldNameByOrdinal(q.Order.FieldOrdinal) {
+			return nil, false
+		}
+	}
+	if len(active) == 0 {
 		return nil, false
 	}
 	if br.BaseEnd-br.BaseStart < plannerOrderedAnchorSpanMin {
@@ -3984,9 +4149,41 @@ func (qv *View) execPlanOrderedBasicAnchoredWithScratch(
 	useExactPosting := len(exactChecks) > 0 && (len(residualChecks) == 0 || orderedExactPreferred)
 
 	var candidates posting.List
+	var candidateIDs posting.List
+	var candidateHash u64set
+	var candidateHashPtr *u64set
+	var exactWork posting.List
+	totalCandidates := uint64(0)
 
 	leadExamined := uint64(0)
-	if useExactPosting {
+	directHash := candidateCap <= uint64(plannerOrderedAnchorHashCandidateMax) &&
+		br.Len() > int(candidateCap)*4
+	if directHash {
+		candidateHash = getU64Set(int(candidateCap))
+		defer releaseU64Set(&candidateHash)
+		candidateHashPtr = &candidateHash
+		for leadIt.HasNext() {
+			leadExamined++
+			if leadExamined > leadBudget {
+				return nil, false
+			}
+			if trace != nil {
+				trace.AddExamined(1)
+			}
+			idx := leadIt.Next()
+			if !orderedBasicAnchoredMatchesActiveReader(preds, active, leadIdx, leadNeedsCheck, idx) {
+				continue
+			}
+			if candidateHash.Add(idx) {
+				totalCandidates++
+				if totalCandidates > candidateCap {
+					return nil, false
+				}
+			}
+		}
+		deferredChecks = deferredChecks[:0]
+
+	} else if useExactPosting {
 		builder := newPostingUnionBuilder(postingBatchSinglesEnabled(leadBudget))
 		defer builder.release()
 		for leadIt.HasNext() {
@@ -4054,16 +4251,22 @@ func (qv *View) execPlanOrderedBasicAnchoredWithScratch(
 		}
 	}
 
-	if candidates.IsEmpty() {
+	if directHash {
+		if totalCandidates == 0 {
+			if trace != nil {
+				trace.SetEarlyStopReason("no_candidates")
+			}
+			return nil, true
+		}
+
+	} else if candidates.IsEmpty() {
 		if trace != nil {
 			trace.SetEarlyStopReason("no_candidates")
 		}
 		return nil, true
-	}
 
-	candidateIDs := candidates
-	var exactWork posting.List
-	if useExactPosting {
+	} else if useExactPosting {
+		candidateIDs = candidates
 		exactApplied := false
 		mode, exactIDs, exactWork, _ := plannerFilterPostingByPredicateChecks(preds, exactChecks, candidates, exactWork, true)
 		switch mode {
@@ -4120,13 +4323,18 @@ func (qv *View) execPlanOrderedBasicAnchoredWithScratch(
 			exactWork.Release()
 			return nil, false
 		}
+
+	} else {
+		candidateIDs = candidates
+	}
+	if !directHash {
+		totalCandidates = candidateIDs.Cardinality()
 	}
 
 	o := q.Order
 	skip := q.Offset
 	need := q.Limit
 	out := make([]uint64, 0, need)
-	totalCandidates := candidateIDs.Cardinality()
 	seenCandidates := uint64(0)
 	scanWidth := uint64(0)
 	singleDeferred := -1
@@ -4134,17 +4342,58 @@ func (qv *View) execPlanOrderedBasicAnchoredWithScratch(
 	if len(deferredChecks) == 1 {
 		singleDeferred = deferredChecks[0]
 	}
+	if candidateHashPtr == nil &&
+		totalCandidates >= plannerOrderedAnchorHashCandidateMin &&
+		totalCandidates <= uint64(plannerOrderedAnchorHashCandidateMax) &&
+		br.Len() > int(totalCandidates)*4 {
+		candidateHash = getU64Set(int(totalCandidates))
+		it := candidateIDs.Iter()
+		for it.HasNext() {
+			candidateHash.Add(it.Next())
+		}
+		it.Release()
+		candidateHashPtr = &candidateHash
+		defer releaseU64Set(&candidateHash)
+	}
 	cursor := newQueryCursor(out, skip, need, false, 0)
 
 	keyCur := ov.NewCursor(br, o.Desc)
 	for {
-		_, ids, ok := keyCur.Next()
+		ids, idx, single, ok := keyCur.NextPostingOrSingle()
 		if !ok {
 			break
+		}
+		if single {
+			scanWidth++
+			if trace != nil {
+				trace.AddExamined(1)
+			}
+			if candidateHashPtr != nil {
+				if !candidateHashPtr.Has(idx) {
+					continue
+				}
+			} else if !candidateIDs.Contains(idx) {
+				continue
+			}
+			seenCandidates++
+			if !orderedPredicateChecksMatchReader(preds, deferredChecks, singleDeferred, idx) {
+				if seenCandidates == totalCandidates {
+					break
+				}
+				continue
+			}
+			if cursor.emit(idx) {
+				break
+			}
+			if seenCandidates == totalCandidates {
+				break
+			}
+			continue
 		}
 		if orderedBasicAnchoredEmitPosting(
 			&cursor,
 			candidateIDs,
+			candidateHashPtr,
 			preds,
 			deferredChecks,
 			singleDeferred,
@@ -4316,9 +4565,20 @@ func (qv *View) scanOrderedIndexViewNoPredicatesWithNilTail(q *qir.Shape, ov ind
 
 	cur := ov.NewCursor(br, desc)
 	for {
-		_, ids, ok := cur.Next()
+		ids, idx, single, ok := cur.NextPostingOrSingle()
 		if !ok {
 			break
+		}
+		if single {
+			scanWidth++
+			if trace != nil {
+				trace.AddExamined(1)
+				trace.AddMatched(1)
+			}
+			if cursor.emit(idx) {
+				break
+			}
+			continue
 		}
 		if orderedScanEmitBucketNoPredicates(&cursor, ids, trace, &scanWidth) {
 			break
@@ -4373,9 +4633,20 @@ func (qv *View) scanOrderedIndexViewWithPredicatesWithNilTail(q *qir.Shape, pred
 
 	cur := ov.NewCursor(br, desc)
 	for {
-		_, ids, ok := cur.Next()
+		ids, idx, single, ok := cur.NextPostingOrSingle()
 		if !ok {
 			break
+		}
+		if single {
+			scanWidth++
+			if trace != nil {
+				trace.AddExamined(1)
+			}
+			if orderedPredicateChecksMatchReader(preds, active, singleActive, idx) &&
+				orderedScanEmitMatched(&cursor, trace, idx) {
+				break
+			}
+			continue
 		}
 		stop, nextExactWork := orderedScanEmitBucketWithPredicates(
 			&cursor,

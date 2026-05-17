@@ -484,6 +484,10 @@ func BenchmarkQueryPreparedShape(b *testing.B) {
 						q:    qx.Query(ageStart, ageEnd).Sort("score", qx.DESC).Limit(128),
 					},
 					{
+						name: "OrderBound_RangeResidual_Limit128",
+						q:    qx.Query(ageStart, ageEnd, scoreStart).Sort("score", qx.DESC).Limit(128),
+					},
+					{
 						name: "OR_NoOrder_Limit256",
 						q: qx.Query(
 							qx.OR(
@@ -513,6 +517,391 @@ func BenchmarkQueryPreparedShape(b *testing.B) {
 			})
 		}
 	})
+}
+
+func BenchmarkQueryPreparedShapeOrderBoundLowCardResidual(b *testing.B) {
+	db := newTestDB(b, qexecBenchOptions())
+	countries := [...]string{"US", "DE", "NL", "PL", "BR", "JP", "IN", "CA"}
+	names := [...]string{"alice", "albert", "bob", "bobby", "carol", "dave", "eve", "mallory"}
+	tags := []string{"tag_broad", "go"}
+	seedQexecBenchData(b, db, qexecBenchRows, func(id uint64) testRec {
+		return testRec{
+			Meta:     Meta{Country: countries[id&7]},
+			Name:     names[(id>>3)&7],
+			Email:    qexecBenchHighCardEmail(id),
+			Age:      18 + int(id%60),
+			Score:    float64((id*7919)%10_000) + float64(id&15)/16,
+			Active:   id&1 == 0,
+			Tags:     tags,
+			FullName: "user-broad",
+		}
+	})
+
+	cases := []struct {
+		name  string
+		lo    int
+		hi    int
+		limit int
+	}{
+		{name: "Rows100K/OrderLimit/OrderBound_LowCardRangeResidual", lo: 25, hi: 40, limit: 100},
+		{name: "Rows100K/OrderLimit/OrderBound_LowCardRangeResidual_BelowThreshold", lo: 25, hi: 27, limit: 100},
+		{name: "Rows100K/OrderLimit/OrderBound_LowCardRangeResidual_AboveThreshold", lo: 25, hi: 28, limit: 100},
+	}
+	for i := range cases {
+		tc := cases[i]
+		b.Run(tc.name, func(b *testing.B) {
+			q := qx.Query(
+				qx.GTE("age", tc.lo),
+				qx.LTE("age", tc.hi),
+				qx.GT("score", 0.5),
+			).Sort("score", qx.DESC).Limit(tc.limit)
+			benchmarkPreparedQueryShape(b, db, q)
+		})
+	}
+}
+
+func BenchmarkQueryPreparedShapeOrderBoundHighCardResidualControl(b *testing.B) {
+	db := newQexecBenchDBWithOptionsAndRows(b, qexecBenchOptions(), qexecBenchRows)
+	ageStart, ageEnd := qexecBenchAgeRange(qexecBenchRows, qexecBenchAllSelectivities[1])
+
+	b.Run("Rows100K/OrderLimit/OrderBound_HighCardRangeResidual_Control", func(b *testing.B) {
+		q := qx.Query(
+			ageStart,
+			ageEnd,
+			qx.GTE("score", 1000.0),
+		).Sort("score", qx.ASC).Limit(100)
+		benchmarkPreparedQueryShape(b, db, q)
+	})
+}
+
+func BenchmarkQueryPreparedShapeOrderBoundMixedResiduals(b *testing.B) {
+	db := newQexecBenchDBWithOptionsAndRows(b, qexecBenchOptions(), qexecBenchRows)
+	ageStart, _ := qexecBenchAgeRange(qexecBenchRows, qexecBenchAllSelectivities[2])
+	scoreStart, _ := qexecBenchScoreRange(qexecBenchRows, qexecBenchAllSelectivities[2])
+
+	b.Run("Rows100K/OrderLimit/OrderBound_MixedResiduals_Limit50", func(b *testing.B) {
+		q := qx.Query(
+			qx.EQ("active", true),
+			ageStart,
+			scoreStart,
+		).Sort("score", qx.DESC).Limit(50)
+		benchmarkPreparedQueryShape(b, db, q)
+	})
+}
+
+func BenchmarkQueryPreparedShapeOrderBoundNegativeOffset(b *testing.B) {
+	db := newQexecBenchDBWithOptionsAndRows(b, qexecBenchOptions(), qexecBenchRows)
+	_, end := qexecBenchRange(qexecBenchRows, qexecBenchAllSelectivities[2])
+
+	b.Run("Rows100K/OrderLimit/OrderBound_NegativeResiduals_Offset", func(b *testing.B) {
+		q := qx.Query(
+			qx.LT("age", end),
+			qx.NOTIN("country", []string{"DE", "PL"}),
+			qx.NOTIN("name", []string{"alice", "bob"}),
+			qx.LT("score", float64(end)),
+		).Sort("age", qx.ASC).Offset(2500).Limit(100)
+		benchmarkPreparedQueryShape(b, db, q)
+	})
+}
+
+func BenchmarkQueryPreparedShapePrefixOrderLimit(b *testing.B) {
+	db := newQexecBenchDBWithOptionsAndRows(b, qexecBenchOptions(), qexecBenchRows)
+
+	b.Run("Rows100K/OrderLimit/PrefixOrderField_EQResidual_Limit12", func(b *testing.B) {
+		q := qx.Query(
+			qx.PREFIX("email", qexecBenchHighCardEmailPrefix(qexecBenchAllSelectivities[2])),
+			qx.EQ("active", true),
+		).Sort("email", qx.ASC).Limit(12)
+		benchmarkPreparedQueryShape(b, db, q)
+	})
+}
+
+func BenchmarkQueryPreparedShapeNoOrderBroadRangeLead(b *testing.B) {
+	db := newQexecBenchDBWithOptionsAndRows(b, qexecBenchOptions(), qexecBenchRows)
+	broadStart, broadEnd := qexecBenchRange(qexecBenchRows, qexecBenchAllSelectivities[2])
+	narrowStart, narrowEnd := qexecBenchRange(qexecBenchRows, qexecBenchAllSelectivities[0])
+	gateLimit := 128
+	gateWidth := gateLimit * limitRangeNoOrderBroadResidualRowsPerNeed
+	gateStart := (qexecBenchRows - gateWidth) / 2
+	gateBelowEnd := gateStart + gateWidth
+	gateAboveEnd := gateBelowEnd + 1
+
+	cases := []struct {
+		name string
+		q    *qx.QX
+	}{
+		{
+			name: "Rows100K/NoOrderLimit/BroadRangeLead_ThreeSelectiveResiduals_BelowThreshold_Control",
+			q: qx.Query(
+				qx.GTE("age", gateStart),
+				qx.LT("age", gateBelowEnd),
+				qx.EQ("country", "US"),
+				qx.EQ("name", "alice"),
+				qx.HASANY("tags", []string{"tag_tiny", "missing_tag"}),
+			).Limit(gateLimit),
+		},
+		{
+			name: "Rows100K/NoOrderLimit/BroadRangeLead_ThreeSelectiveResiduals_AboveThreshold",
+			q: qx.Query(
+				qx.GTE("age", gateStart),
+				qx.LT("age", gateAboveEnd),
+				qx.EQ("country", "US"),
+				qx.EQ("name", "alice"),
+				qx.HASANY("tags", []string{"tag_tiny", "missing_tag"}),
+			).Limit(gateLimit),
+		},
+		{
+			name: "Rows100K/NoOrderLimit/BroadRangeLead_ThreeSelectiveResiduals",
+			q: qx.Query(
+				qx.GTE("age", broadStart),
+				qx.LT("age", broadEnd),
+				qx.EQ("country", "US"),
+				qx.EQ("name", "alice"),
+				qx.HASANY("tags", []string{"tag_tiny", "missing_tag"}),
+			).Limit(128),
+		},
+		{
+			name: "Rows100K/NoOrderLimit/BroadRangeLead_ThreeWeakResiduals_Control",
+			q: qx.Query(
+				qx.GTE("age", broadStart),
+				qx.LT("age", broadEnd),
+				qx.EQ("active", true),
+				qx.HASANY("tags", []string{"tag_broad", "go"}),
+				qx.PREFIX("full_name", "user-broad"),
+			).Limit(128),
+		},
+		{
+			name: "Rows100K/NoOrderLimit/NarrowRangeLead_ThreeResiduals_Control",
+			q: qx.Query(
+				qx.GTE("age", narrowStart),
+				qx.LT("age", narrowEnd),
+				qx.EQ("active", true),
+				qx.HASANY("tags", []string{"tag_broad", "go"}),
+				qx.PREFIX("full_name", "user-broad"),
+			).Limit(32),
+		},
+		{
+			name: "Rows100K/NoOrderLimit/BroadRangeLead_ThreeSelectiveResiduals_None",
+			q: qx.Query(
+				qx.GTE("age", broadStart),
+				qx.LT("age", broadEnd),
+				qx.EQ("country", "US"),
+				qx.EQ("name", "mallory"),
+				qx.HASANY("tags", []string{"tag_tiny", "missing_tag"}),
+			).Limit(128),
+		},
+		{
+			name: "Rows100K/NoOrderLimit/MissingEqualityResidual",
+			q: qx.Query(
+				qx.GTE("age", broadStart),
+				qx.LT("age", broadEnd),
+				qx.EQ("country", "ZZ"),
+			).Limit(128),
+		},
+	}
+	for i := range cases {
+		tc := cases[i]
+		b.Run(tc.name, func(b *testing.B) {
+			benchmarkPreparedQueryShape(b, db, tc.q)
+		})
+	}
+}
+
+func BenchmarkQueryPreparedShapeLowCardOrderBucket(b *testing.B) {
+	db := newTestDB(b, qexecBenchOptions())
+	earlyTags := []string{"bucket_early", "mix"}
+	lateTags := []string{"bucket_late", "mix"}
+	sparseTags := []string{"bucket_sparse", "mix"}
+	otherTags := []string{"other"}
+
+	seedQexecBenchData(b, db, qexecBenchRows, func(id uint64) testRec {
+		bucket := int((id - 1) % 100)
+		pos := int((id - 1) / 100)
+		country := "CA"
+		name := "other"
+		tags := otherTags
+
+		// Score has 100 order buckets, so residual checks dominate inside tied buckets.
+		if bucket < 8 {
+			country = "US"
+			name = "early"
+			tags = earlyTags
+		} else if bucket >= 92 {
+			country = "DE"
+			name = "late"
+			tags = lateTags
+		}
+		if pos == 10 || pos == 20 {
+			country = "NL"
+			name = "sparse"
+			tags = sparseTags
+		}
+
+		return testRec{
+			Meta:     Meta{Country: country},
+			Name:     name,
+			Email:    qexecBenchHighCardEmail(id),
+			Age:      int(id),
+			Score:    float64(bucket),
+			Active:   pos&1 == 0,
+			Tags:     tags,
+			FullName: "low-card-order",
+		}
+	})
+
+	cases := []struct {
+		name string
+		q    *qx.QX
+	}{
+		{
+			name: "Rows100K/OrderLimit/LowCardOrderBucket_MixedResiduals_Early",
+			q: qx.Query(
+				qx.EQ("country", "US"),
+				qx.HASANY("tags", []string{"bucket_early", "missing_tag"}),
+			).Sort("score", qx.ASC).Limit(128),
+		},
+		{
+			name: "Rows100K/OrderLimit/LowCardOrderBucket_MixedResiduals_Late",
+			q: qx.Query(
+				qx.EQ("country", "DE"),
+				qx.HASANY("tags", []string{"bucket_late", "missing_tag"}),
+			).Sort("score", qx.ASC).Limit(128),
+		},
+		{
+			name: "Rows100K/OrderLimit/LowCardOrderBucket_MixedResiduals_Sparse",
+			q: qx.Query(
+				qx.EQ("country", "NL"),
+				qx.HASANY("tags", []string{"bucket_sparse", "missing_tag"}),
+			).Sort("score", qx.ASC).Limit(128),
+		},
+		{
+			name: "Rows100K/OrderLimit/LowCardOrderBucket_MixedResiduals_None",
+			q: qx.Query(
+				qx.EQ("country", "BR"),
+				qx.HASANY("tags", []string{"bucket_none", "missing_tag"}),
+			).Sort("score", qx.ASC).Limit(128),
+		},
+	}
+	for i := range cases {
+		tc := cases[i]
+		b.Run(tc.name, func(b *testing.B) {
+			benchmarkPreparedQueryShape(b, db, tc.q)
+		})
+	}
+}
+
+func BenchmarkQueryPreparedShapeUniqueOrderCorrelation(b *testing.B) {
+	db := newTestDB(b, qexecBenchOptions())
+	earlyTags := []string{"corr_early", "mix"}
+	lateTags := []string{"corr_late", "mix"}
+	sparseTags := []string{"corr_sparse", "mix"}
+	otherTags := []string{"other"}
+
+	seedQexecBenchData(b, db, qexecBenchRows, func(id uint64) testRec {
+		country := "CA"
+		name := "other"
+		tags := otherTags
+
+		// Early, late, and sparse variants keep roughly 2K residual matches each.
+		switch {
+		case id <= 2048:
+			country = "US"
+			name = "corr_early"
+			tags = earlyTags
+		case id > qexecBenchRows-2048:
+			country = "DE"
+			name = "corr_late"
+			tags = lateTags
+		case id%48 == 0:
+			country = "NL"
+			name = "corr_sparse"
+			tags = sparseTags
+		}
+
+		return testRec{
+			Meta:     Meta{Country: country},
+			Name:     name,
+			Email:    qexecBenchHighCardEmail(id),
+			Age:      int(id),
+			Score:    float64(id),
+			Active:   id&1 == 0,
+			Tags:     tags,
+			FullName: "unique-order",
+		}
+	})
+
+	cases := []struct {
+		name string
+		q    *qx.QX
+	}{
+		{
+			name: "Rows100K/OrderLimit/UniqueOrder_Residuals_CorrelatedEarly",
+			q: qx.Query(
+				qx.EQ("name", "corr_early"),
+				qx.HASANY("tags", []string{"corr_early", "missing_tag"}),
+			).Sort("score", qx.ASC).Limit(128),
+		},
+		{
+			name: "Rows100K/OrderLimit/UniqueOrder_Residuals_AntiCorrelatedLate",
+			q: qx.Query(
+				qx.EQ("name", "corr_late"),
+				qx.HASANY("tags", []string{"corr_late", "missing_tag"}),
+			).Sort("score", qx.ASC).Limit(128),
+		},
+		{
+			name: "Rows100K/OrderLimit/UniqueOrder_Residuals_Sparse",
+			q: qx.Query(
+				qx.EQ("name", "corr_sparse"),
+				qx.HASANY("tags", []string{"corr_sparse", "missing_tag"}),
+			).Sort("score", qx.ASC).Limit(128),
+		},
+		{
+			name: "Rows100K/OrderLimit/UniqueOrder_Residuals_None",
+			q: qx.Query(
+				qx.EQ("name", "corr_none"),
+				qx.HASANY("tags", []string{"corr_none", "missing_tag"}),
+			).Sort("score", qx.ASC).Limit(128),
+		},
+	}
+	for i := range cases {
+		tc := cases[i]
+		b.Run(tc.name, func(b *testing.B) {
+			benchmarkPreparedQueryShape(b, db, tc.q)
+		})
+	}
+}
+
+func BenchmarkQueryPreparedShapeOrderBoundMissingResidual(b *testing.B) {
+	db := newQexecBenchDBWithOptionsAndRows(b, qexecBenchOptions(), qexecBenchRows)
+	cases := []struct {
+		name string
+		q    *qx.QX
+	}{
+		{
+			name: "Rows100K/OrderLimit/OrderBound_MissingResidual",
+			q: qx.Query(
+				qx.GTE("score", 1000.0),
+				qx.LT("score", 90_000.0),
+				qx.EQ("country", "ZZ"),
+			).Sort("score", qx.ASC).Limit(128),
+		},
+		{
+			name: "Rows100K/OrderLimit/OrderBound_RangeResidual_ExactAbsent",
+			q: qx.Query(
+				qx.GTE("score", 1000.0),
+				qx.LT("score", 90_000.0),
+				qx.GTE("age", 20_000),
+				qx.LT("age", 80_000),
+				qx.EQ("country", "ZZ"),
+			).Sort("score", qx.ASC).Limit(128),
+		},
+	}
+	for i := range cases {
+		tc := cases[i]
+		b.Run(tc.name, func(b *testing.B) {
+			benchmarkPreparedQueryShape(b, db, tc.q)
+		})
+	}
 }
 
 func benchmarkPreparedQueryShapeCalibration(b *testing.B, db *testDB, q *qx.QX) {
@@ -580,6 +969,38 @@ func BenchmarkPlannerStatsAndCalibration(b *testing.B) {
 				qexecBenchCount = uint64(len(cur.Fields))
 			}
 		})
+	})
+
+	b.Run("Rows100K/FieldStatsUniqueFastPath", func(b *testing.B) {
+		db := newQexecBenchDBWithOptionsAndRows(b, qexecBenchOptions(), qexecBenchRows)
+		view := db.view()
+		ov := view.fieldIndexViewFromSlotsByName(view.snap.Index, "age")
+		if !ov.HasData() {
+			b.Fatal("missing age index")
+		}
+		var stats PlannerFieldStats
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			stats = plannerFieldIndexViewStats(ov)
+		}
+		qexecBenchCount = stats.TotalBucketCard
+	})
+
+	b.Run("Rows100K/FieldStatsNonUniqueScan", func(b *testing.B) {
+		db := newQexecBenchDBWithOptionsAndRows(b, qexecBenchOptions(), qexecBenchRows)
+		view := db.view()
+		ov := view.fieldIndexViewFromSlotsByName(view.snap.Index, "country")
+		if !ov.HasData() {
+			b.Fatal("missing country index")
+		}
+		var stats PlannerFieldStats
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			stats = plannerFieldIndexViewStats(ov)
+		}
+		qexecBenchCount = stats.TotalBucketCard
 	})
 
 	b.Run("Rows100K/CalibrationObserve", func(b *testing.B) {
@@ -1031,6 +1452,21 @@ func BenchmarkCardinalityRoutes(b *testing.B) {
 			qx.AND(qx.EQ("country", "JP"), qx.LT("score", float64(scoreEnd))),
 		), qexecBenchCardinalityORPredicates, planFilterCardinalityORHybrid)
 	})
+	b.Run("Rows100K/ORPredicates_DisjointScalarEQ", func(b *testing.B) {
+		benchmarkCardinalityRoute(b, hybridView, hybridDB.rt.IndexedByName, qx.OR(
+			qx.AND(qx.PREFIX("full_name", "user-tiny"), qx.EQ("country", "US")),
+			qx.AND(qx.EQ("country", "DE"), qx.GTE("age", ageStart)),
+			qx.AND(qx.EQ("country", "NL"), qx.EQ("active", true)),
+		), qexecBenchCardinalityORPredicates, planFilterCardinalityORPredicates)
+	})
+	b.Run("Rows100K/ORPredicates_OverlappingScalarEQ", func(b *testing.B) {
+		benchmarkCardinalityRoute(b, hybridView, hybridDB.rt.IndexedByName, qx.OR(
+			qx.AND(qx.PREFIX("full_name", "user-tiny"), qx.EQ("country", "US")),
+			qx.AND(qx.EQ("country", "US"), qx.GTE("age", ageStart)),
+			qx.AND(qx.EQ("country", "DE"), qx.EQ("active", true)),
+			qx.AND(qx.EQ("country", "JP"), qx.LT("score", float64(scoreEnd))),
+		), qexecBenchCardinalityORPredicates, "")
+	})
 
 	uniqueDB := newQexecBenchUniqueDB(b)
 	uniqueView := uniqueDB.engine.currentQueryViewForTests()
@@ -1192,6 +1628,15 @@ func BenchmarkCardinalityPredicateExecutors(b *testing.B) {
 				scoreEnd,
 			), qexecBenchCardinalityLeadBuckets)
 		})
+		b.Run("LeadBuckets_RangeResidualExactControl", func(b *testing.B) {
+			benchmarkCardinalityPredicateExecutor(b, db, qx.AND(
+				ageStart,
+				ageEnd,
+				scoreStart,
+				scoreEnd,
+				qx.HASANY("tags", []string{"go", "java"}),
+			), qexecBenchCardinalityLeadBuckets)
+		})
 		b.Run("LeadPostings_EQResiduals", func(b *testing.B) {
 			benchmarkCardinalityPredicateExecutor(b, db, qx.AND(
 				qx.EQ("country", "US"),
@@ -1270,6 +1715,7 @@ func BenchmarkEvalPreparedExpr(b *testing.B) {
 			sel := sels[i]
 			b.Run(sel.name, func(b *testing.B) {
 				ageStart, ageEnd := qexecBenchAgeRange(scale.rows, sel)
+				scoreStart, _ := qexecBenchScoreRange(scale.rows, sel)
 				tag := qexecBenchTag(sel)
 				prefix := qexecBenchPrefix(sel)
 				cases := []struct {
@@ -1278,6 +1724,7 @@ func BenchmarkEvalPreparedExpr(b *testing.B) {
 				}{
 					{name: "SliceHASALL", expr: qx.HASALL("tags", []string{tag, "go"})},
 					{name: "RangeNumeric", expr: qx.AND(ageStart, ageEnd)},
+					{name: "RangeNumericMergeControl", expr: qx.AND(ageStart, scoreStart)},
 					{name: "Prefix", expr: qx.PREFIX("full_name", prefix)},
 					{
 						name: "ANDMixed",
@@ -1345,6 +1792,7 @@ func BenchmarkStringIndexHighCardinality(b *testing.B) {
 func BenchmarkEvalPreparedExprColdCaches(b *testing.B) {
 	qexecBenchRunScaleSelectivities(b, func(b *testing.B, db *testDB, scale qexecBenchScale, sel qexecBenchSelectivity) {
 		ageStart, ageEnd := qexecBenchAgeRange(scale.rows, sel)
+		scoreStart, _ := qexecBenchScoreRange(scale.rows, sel)
 		tag := qexecBenchTag(sel)
 		prefix := qexecBenchPrefix(sel)
 		cases := []struct {
@@ -1352,6 +1800,7 @@ func BenchmarkEvalPreparedExprColdCaches(b *testing.B) {
 			expr qx.Expr
 		}{
 			{name: "RangeNumeric", expr: qx.AND(ageStart, ageEnd)},
+			{name: "RangeNumericMergeControl", expr: qx.AND(ageStart, scoreStart)},
 			{name: "Prefix", expr: qx.PREFIX("full_name", prefix)},
 			{
 				name: "ORMixed",
@@ -1431,6 +1880,15 @@ func BenchmarkBuildPredicates(b *testing.B) {
 
 		b.Run("Query_Unordered", func(b *testing.B) {
 			benchmarkBuildPredicates(b, db, unordered, "")
+		})
+		b.Run("Query_Unordered_RangeMergeControl", func(b *testing.B) {
+			benchmarkBuildPredicates(b, db, qx.AND(
+				qx.EQ("country", "US"),
+				qx.EQ("active", true),
+				ageStart,
+				scoreStart,
+				qx.HASANY("tags", []string{tag, "missing_tag"}),
+			), "")
 		})
 		b.Run("Query_Ordered", func(b *testing.B) {
 			benchmarkBuildPredicates(b, db, ordered, "ordered")
@@ -1761,6 +2219,9 @@ func benchmarkPreparedQueryShapeColdCaches(b *testing.B, db *testDB, q *qx.QX) {
 func BenchmarkQueryPreparedShapeColdCaches(b *testing.B) {
 	qexecBenchRunScaleSelectivities(b, func(b *testing.B, db *testDB, scale qexecBenchScale, sel qexecBenchSelectivity) {
 		ageStart, ageEnd := qexecBenchAgeRange(scale.rows, sel)
+		_, end := qexecBenchRange(scale.rows, sel)
+		scoreStart, _ := qexecBenchScoreRange(scale.rows, sel)
+		emailPrefix := qexecBenchHighCardEmailPrefix(sel)
 		tag := qexecBenchTag(sel)
 		prefix := qexecBenchPrefix(sel)
 		cases := []struct {
@@ -1769,6 +2230,30 @@ func BenchmarkQueryPreparedShapeColdCaches(b *testing.B) {
 		}{
 			{name: "Range_NoOrder_Limit128", q: qx.Query(ageStart, ageEnd).Limit(128)},
 			{name: "Range_Order_Limit128", q: qx.Query(ageStart, ageEnd).Sort("score", qx.DESC).Limit(128)},
+			{
+				name: "OrderBound_MixedResiduals_Limit50",
+				q: qx.Query(
+					qx.EQ("active", true),
+					ageStart,
+					scoreStart,
+				).Sort("score", qx.DESC).Limit(50),
+			},
+			{
+				name: "OrderBound_NegativeResiduals_Offset",
+				q: qx.Query(
+					qx.LT("age", end),
+					qx.NOTIN("country", []string{"DE", "PL"}),
+					qx.NOTIN("name", []string{"alice", "bob"}),
+					qx.LT("score", float64(end)),
+				).Sort("age", qx.ASC).Offset(2500).Limit(100),
+			},
+			{
+				name: "PrefixOrderField_EQResidual_Limit12",
+				q: qx.Query(
+					qx.PREFIX("email", emailPrefix),
+					qx.EQ("active", true),
+				).Sort("email", qx.ASC).Limit(12),
+			},
 			{
 				name: "OR_Order_Limit128",
 				q: qx.Query(
@@ -1797,6 +2282,7 @@ func BenchmarkQueryPreparedArrayOrder(b *testing.B) {
 		}{
 			{name: "TagsLEN_DESC_Limit128", q: qx.Query(qx.EQ("active", true)).SortBy(qx.LEN("tags"), qx.DESC).Limit(128)},
 			{name: "CountryPOS_ASC_Limit128", q: qx.Query(qx.EQ("active", true)).SortBy(qx.POS("country", []string{"DE", "US", "JP", "NL"}), qx.ASC).Limit(128)},
+			{name: "TagsPOS_ActiveFilter_Limit128", q: qx.Query(qx.EQ("active", true)).SortBy(qx.POS("tags", []string{"tag_mid", "go", "db"}), qx.ASC).Limit(128)},
 		}
 		for i := range fixed {
 			tc := fixed[i]
@@ -2002,6 +2488,7 @@ const (
 	qexecBenchRouteNoFilterNoOrder qexecBenchRoute = iota
 	qexecBenchRouteLimit
 	qexecBenchRouteOrderBasicLimit
+	qexecBenchRouteOrderPrefixLimit
 	qexecBenchRouteRangeNoOrderLimit
 	qexecBenchRoutePrefixNoOrderLimit
 	qexecBenchRoutePlanCandidate
@@ -2017,6 +2504,8 @@ func runQexecBenchRoute(view *View, shape *qir.Shape, route qexecBenchRoute) ([]
 		return out, ok, err
 	case qexecBenchRouteOrderBasicLimit:
 		return view.tryQueryOrderBasicWithLimit(shape, nil)
+	case qexecBenchRouteOrderPrefixLimit:
+		return view.tryQueryOrderPrefixWithLimit(shape, nil)
 	case qexecBenchRouteRangeNoOrderLimit:
 		return view.tryQueryRangeNoOrderWithLimit(shape, nil)
 	case qexecBenchRoutePrefixNoOrderLimit:
@@ -2067,6 +2556,9 @@ func benchmarkQueryRoute(b *testing.B, db *testDB, q *qx.QX, route qexecBenchRou
 
 func BenchmarkQueryRoutes(b *testing.B) {
 	qexecBenchRunScales(b, func(b *testing.B, db *testDB, scale qexecBenchScale) {
+		_, end := qexecBenchRange(scale.rows, qexecBenchAllSelectivities[2])
+		scoreStart, _ := qexecBenchScoreRange(scale.rows, qexecBenchAllSelectivities[2])
+		emailPrefix := qexecBenchHighCardEmailPrefix(qexecBenchAllSelectivities[2])
 		fixed := []struct {
 			name  string
 			q     *qx.QX
@@ -2075,6 +2567,33 @@ func BenchmarkQueryRoutes(b *testing.B) {
 			{name: "NoFilterNoOrderLimit", q: qx.Query().Limit(100), route: qexecBenchRouteNoFilterNoOrder},
 			{name: "LimitPlanner_Filtered", q: qx.Query(qx.EQ("active", true), qx.EQ("country", "US")).Limit(128), route: qexecBenchRouteLimit},
 			{name: "OrderBasicLimit_Filtered", q: qx.Query(qx.EQ("active", true)).Sort("score", qx.DESC).Limit(128), route: qexecBenchRouteOrderBasicLimit},
+			{
+				name: "OrderBasicLimit_OrderBoundMixedResiduals",
+				q: qx.Query(
+					qx.EQ("active", true),
+					qx.GTE("age", end/2),
+					scoreStart,
+				).Sort("score", qx.DESC).Limit(50),
+				route: qexecBenchRouteOrderBasicLimit,
+			},
+			{
+				name: "OrderBasicLimit_OrderBoundNegativeOffset",
+				q: qx.Query(
+					qx.LT("age", end),
+					qx.NOTIN("country", []string{"DE", "PL"}),
+					qx.NOTIN("name", []string{"alice", "bob"}),
+					qx.LT("score", float64(end)),
+				).Sort("age", qx.ASC).Offset(2500).Limit(100),
+				route: qexecBenchRouteOrderBasicLimit,
+			},
+			{
+				name: "OrderPrefixLimit_EQResidual",
+				q: qx.Query(
+					qx.PREFIX("email", emailPrefix),
+					qx.EQ("active", true),
+				).Sort("email", qx.ASC).Limit(12),
+				route: qexecBenchRouteOrderPrefixLimit,
+			},
 		}
 		for i := range fixed {
 			tc := fixed[i]
@@ -2345,6 +2864,9 @@ func BenchmarkNegativeNilComplementShapes(b *testing.B) {
 		b.Run("Query_NullableOrderNilTail", func(b *testing.B) {
 			benchmarkPreparedQueryShape(b, db, qx.Query(qx.NOT(qx.EQ("active", false))).Sort("opt", qx.ASC).Offset(1).Limit(128))
 		})
+		b.Run("Query_NOTIN_NoRange_Limit256", func(b *testing.B) {
+			benchmarkPreparedQueryShape(b, db, qx.Query(qx.NOTIN("country", []string{"DE", "PL"})).Limit(256))
+		})
 	})
 
 	qexecBenchRunScaleSelectivities(b, func(b *testing.B, db *testDB, scale qexecBenchScale, sel qexecBenchSelectivity) {
@@ -2390,6 +2912,21 @@ func BenchmarkNegativeNilComplementShapes(b *testing.B) {
 		b.Run("Query_PositiveRangeComplementCandidate", func(b *testing.B) {
 			benchmarkPreparedQueryShape(b, db, qx.Query(qx.GTE("age", start)).Sort("score", qx.DESC).Limit(128))
 		})
+	})
+
+	b.Run("Rows1M/Cardinality_NOTIN_RangeResidual_NonTrigger", func(b *testing.B) {
+		scale := qexecBenchScale{name: "Rows1M", rows: 1_000_000}
+		db := newQexecBenchDBWithOptionsAndRows(b, qexecBenchOptions(), scale.rows)
+		sel := qexecBenchAllSelectivities[2]
+		ageStart, ageEnd := qexecBenchAgeRange(scale.rows, sel)
+		scoreStart, scoreEnd := qexecBenchScoreRange(scale.rows, sel)
+		benchmarkPreparedCardinality(b, db, qx.AND(
+			qx.NOTIN("country", []string{"DE", "PL"}),
+			ageStart,
+			ageEnd,
+			scoreStart,
+			scoreEnd,
+		))
 	})
 }
 
@@ -3093,6 +3630,46 @@ func BenchmarkPostingBuilders(b *testing.B) {
 				builder.addChecked(uint64((j & 4095) + 1))
 			}
 			ids := builder.finish(true)
+			qexecBenchCount = ids.Cardinality()
+			ids.Release()
+		}
+		b.ReportMetric(float64(qexecBenchCount), "rows/op")
+	})
+
+	largeVals := make([]uint64, 65536)
+	subsetVals := make([]uint64, 0, 4096)
+	controlVals := make([]uint64, 0, 4096)
+	for i := range largeVals {
+		id := uint64(i*2 + 2)
+		largeVals[i] = id
+		if i&15 == 0 {
+			subsetVals = append(subsetVals, id)
+			controlVals = append(controlVals, id-1)
+		}
+	}
+	large := posting.BuildFromSorted(largeVals)
+	subset := posting.BuildFromSorted(subsetVals)
+	control := posting.BuildFromSorted(controlVals)
+	defer large.Release()
+	defer subset.Release()
+	defer control.Release()
+
+	b.Run("UnionPairSubset", func(b *testing.B) {
+		posts := [...]posting.List{subset, large}
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			ids := materializePostingUnionBufOwned(posts[:])
+			qexecBenchCount = ids.Cardinality()
+			ids.Release()
+		}
+		b.ReportMetric(float64(qexecBenchCount), "rows/op")
+	})
+
+	b.Run("UnionPairOverlapControl", func(b *testing.B) {
+		posts := [...]posting.List{control, large}
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			ids := materializePostingUnionBufOwned(posts[:])
 			qexecBenchCount = ids.Cardinality()
 			ids.Release()
 		}

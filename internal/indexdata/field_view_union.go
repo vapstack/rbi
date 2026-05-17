@@ -113,9 +113,13 @@ func (o FieldIndexView) appendRangePostingsUnion(builder *fieldIndexPostingUnion
 	}
 	cur := o.NewCursor(br, false)
 	for {
-		_, ids, ok := cur.Next()
+		ids, idx, single, ok := cur.NextPostingOrSingle()
 		if !ok {
 			break
+		}
+		if single {
+			builder.addSingle(idx)
+			continue
 		}
 		if ids.IsEmpty() {
 			continue

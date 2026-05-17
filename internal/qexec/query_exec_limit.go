@@ -32,6 +32,10 @@ const (
 
 const limitQueryFastPathMaxLeaves = 8
 
+// Broad range leads need this many estimated rows per requested result before
+// a multi-residual LIMIT query is handed back to the general lead picker.
+const limitRangeNoOrderBroadResidualRowsPerNeed = 64
+
 func (p leafPred) postCount() int {
 	return len(p.postsBuf)
 }
@@ -470,7 +474,7 @@ func (qv *View) tryLimitQuery(q *qir.Shape, trace *Trace) ([]uint64, bool, PlanN
 	}
 
 	var leavesBuf [8]qir.Expr
-	leaves, ok := qir.CollectAndLeavesScratch(q.Expr, leavesBuf[:0], qir.LeafModeExtract)
+	leaves, ok := qir.CollectAndLeavesScratch(q.Expr, leavesBuf[:0], qir.LeafModeCollect)
 	if !ok || len(leaves) == 0 {
 		return nil, false, "", nil
 	}
@@ -500,6 +504,27 @@ func (qv *View) tryLimitQuery(q *qir.Shape, trace *Trace) ([]uint64, bool, PlanN
 		return nil, false, "", err
 	}
 	if ok {
+		boundLeaves := 0
+		for _, e := range leaves {
+			if isBoundOp(e.Op) && !e.Not && qv.exec.FieldNameByOrdinal(e.FieldOrdinal) == f {
+				boundLeaves++
+			}
+		}
+		if len(leaves)-boundLeaves >= 3 {
+			fm := qv.exec.Schema.Fields[f]
+			if fm != nil && !fm.Slice {
+				ov := qv.fieldIndexViewFromSlotsByName(qv.snap.Index, f)
+				if ov.HasData() {
+					br := ov.RangeForBounds(bounds)
+					_, est := ov.RangeStats(br)
+					// A broad scalar range with many residual predicates is a poor
+					// LIMIT lead; let the planner pick a selective posting lead.
+					if est > satMulUint64(q.Limit, limitRangeNoOrderBroadResidualRowsPerNeed) {
+						return nil, false, "", nil
+					}
+				}
+			}
+		}
 		out, used, err := qv.tryLimitQueryRangeNoOrderByField(q, f, bounds, leaves, trace)
 		if !used {
 			return nil, false, "", err
@@ -892,6 +917,19 @@ func (qv *View) tryLimitQueryOrderBasic(q *qir.Shape, leaves []qir.Expr, trace *
 		if hasEmptyLeafPred(predsBuf) {
 			return nil, true, nil
 		}
+		if len(predsBuf) > 0 {
+			var baseOpsStack [limitQueryFastPathMaxLeaves]qir.Expr
+			baseOps := baseOpsStack[:0]
+			for _, e := range leaves {
+				if isBoundOp(e.Op) && !e.Not && e.FieldOrdinal == order.FieldOrdinal {
+					continue
+				}
+				baseOps = append(baseOps, e)
+			}
+			if qv.shouldPreferOrderBasicBaseCorePath(q, f, baseOps, bounds) {
+				return nil, false, nil
+			}
+		}
 
 		universe := qv.snap.Universe.Cardinality()
 		if predsBuf != nil {
@@ -1009,6 +1047,29 @@ func (qv *View) buildLeafPredsExcludingBounds(leaves []qir.Expr, field string, o
 			leafPredSlicePool.Put(predsBuf)
 			orderedMergedScalarRangeFieldSlicePool.Put(mergedRangesBuf)
 			return nil, false, nil
+		}
+		// Bound leaves on the scan field are covered by the scan range; emit
+		// the merged residual at the first non-covered leaf from that group.
+		for gi := range mergedRangesBuf {
+			if mergedRangesBuf[gi].field != field {
+				continue
+			}
+			first := -1
+			for i, e := range leaves {
+				if !qv.isPositiveMergedNumericRangeLeaf(e) || qv.exec.FieldNameByOrdinal(e.FieldOrdinal) != field {
+					continue
+				}
+				if isBoundOp(e.Op) {
+					continue
+				}
+				first = i
+				break
+			}
+			mergedRangesBuf[gi].first = first
+			if first >= 0 {
+				mergedRangesBuf[gi].expr = leaves[first]
+			}
+			break
 		}
 		defer orderedMergedScalarRangeFieldSlicePool.Put(mergedRangesBuf)
 	}
@@ -1140,6 +1201,13 @@ func (qv *View) scanLimitByFieldIndexBounds(q *qir.Shape, ov indexdata.FieldInde
 	var exactActiveBuf [limitQueryFastPathMaxLeaves]int
 	exactActive := buildExactBucketPostingFilterActiveLeaf(exactActiveBuf[:0], active, preds)
 	exactOnly := len(active) > 0 && len(active) == len(exactActive)
+	if q.Offset == 0 && len(active) == 1 && len(exactActive) == 1 {
+		// Single residual checks on ordered LIMIT scans are cheaper as direct
+		// candidate tests; per-bucket exact filtering adds work before the
+		// LIMIT can stop.
+		exactActive = exactActive[:0]
+		exactOnly = false
+	}
 
 	var residualActiveBuf [limitQueryFastPathMaxLeaves]int
 	residualActive := plannerResidualChecks(residualActiveBuf[:0], active, exactActive)
@@ -1189,11 +1257,13 @@ func (qv *View) scanLimitByFieldIndexBounds(q *qir.Shape, ov indexdata.FieldInde
 		applyWork = nextApplyWork
 
 		if stop {
-			trace.AddExamined(examined)
-			if trackScanWidth {
-				trace.AddOrderScanWidth(scanWidth)
+			if trace != nil {
+				trace.AddExamined(examined)
+				if trackScanWidth {
+					trace.AddOrderScanWidth(scanWidth)
+				}
+				trace.SetEarlyStopReason("limit_reached")
 			}
-			trace.SetEarlyStopReason("limit_reached")
 
 			exactWork.Release()
 			applyWork.Release()
@@ -1227,11 +1297,13 @@ func (qv *View) scanLimitByFieldIndexBounds(q *qir.Shape, ov indexdata.FieldInde
 			applyWork = nextApplyWork
 
 			if stop {
-				trace.AddExamined(examined)
-				if trackScanWidth {
-					trace.AddOrderScanWidth(scanWidth)
+				if trace != nil {
+					trace.AddExamined(examined)
+					if trackScanWidth {
+						trace.AddOrderScanWidth(scanWidth)
+					}
+					trace.SetEarlyStopReason("limit_reached")
 				}
-				trace.SetEarlyStopReason("limit_reached")
 
 				exactWork.Release()
 				applyWork.Release()
@@ -1241,11 +1313,13 @@ func (qv *View) scanLimitByFieldIndexBounds(q *qir.Shape, ov indexdata.FieldInde
 		}
 	}
 
-	trace.AddExamined(examined)
-	if trackScanWidth {
-		trace.AddOrderScanWidth(scanWidth)
+	if trace != nil {
+		trace.AddExamined(examined)
+		if trackScanWidth {
+			trace.AddOrderScanWidth(scanWidth)
+		}
+		trace.SetEarlyStopReason("input_exhausted")
 	}
-	trace.SetEarlyStopReason("input_exhausted")
 
 	exactWork.Release()
 	applyWork.Release()
@@ -1292,7 +1366,7 @@ func (qv *View) extractBoundsForField(field string, leaves []qir.Expr) (indexdat
 }
 
 func (qv *View) buildLeafPred(e qir.Expr) (leafPred, bool, error) {
-	if e.Not || e.FieldOrdinal < 0 {
+	if e.FieldOrdinal < 0 {
 		return leafPred{}, false, nil
 	}
 
@@ -1305,6 +1379,22 @@ func (qv *View) buildLeafPred(e qir.Expr) (leafPred, bool, error) {
 	fm := qv.fieldMetaByExpr(e)
 	if fm == nil {
 		return leafPred{}, false, nil
+	}
+
+	if e.Not {
+		p, ok := qv.buildPredicateWithMode(e, false)
+		if !ok {
+			return leafPred{}, false, nil
+		}
+		if p.alwaysFalse {
+			releasePredicateOwnedState(&p)
+			return emptyLeaf(), true, nil
+		}
+		return leafPred{
+			kind:    leafPredKindPredicate,
+			pred:    p,
+			estCard: p.estCard,
+		}, true, nil
 	}
 
 	switch e.Op {
@@ -1524,7 +1614,7 @@ func (qv *View) buildMergedLimitLeafPred(e qir.Expr, bounds indexdata.Bounds, or
 		allowMaterialize = core.orderedEagerMaterializeUseful(orderedWindow)
 	}
 
-	p, ok := qv.buildMergedNumericRangePredicate(e, bounds, allowMaterialize)
+	p, ok := qv.buildMergedScalarRangePredicate(e, bounds, allowMaterialize)
 	if !ok {
 		return leafPred{}, false, nil
 	}
@@ -1551,7 +1641,7 @@ func (qv *View) buildMergedLimitLeafPred(e qir.Expr, bounds indexdata.Bounds, or
 }
 
 func (qv *View) supportsLimitLeafPredExpr(e qir.Expr) bool {
-	if e.Not || e.FieldOrdinal < 0 {
+	if e.FieldOrdinal < 0 {
 		return false
 	}
 	fm := qv.fieldMetaByExpr(e)

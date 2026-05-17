@@ -193,6 +193,13 @@ func (qv *View) Query(q *qir.Shape, emitTrace bool, prepared bool) (out []uint64
 		return out, err
 	}
 
+	if out, ok, err = qv.tryQueryOrderArrayPosSingleHasAny(q, trace); ok {
+		if trace != nil {
+			trace.SetPlan(PlanMaterialized)
+		}
+		return out, err
+	}
+
 	// Planner/execution fast-paths are attempted before postingResult fallback because
 	// they can short-circuit large scans when query shape matches known patterns.
 	if !shouldSkipPlannerForArrayOrderShape(q) {

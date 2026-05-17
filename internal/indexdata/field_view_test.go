@@ -114,6 +114,57 @@ func TestFieldIndexViewCursorRangeOrderFlatAndChunked(t *testing.T) {
 	}
 }
 
+func TestFieldIndexViewCursorNextPostingOrSingle(t *testing.T) {
+	entries := fieldStorageEntriesForTest(fieldIndexChunkThreshold+17, true)
+	storage := newRegularFieldStorage(entries)
+	defer storage.Release()
+
+	ov := NewFieldIndexViewFromStorage(storage)
+	br := ov.RangeByRanks(fieldIndexChunkTargetEntries-3, fieldIndexChunkTargetEntries+5)
+
+	cur := ov.NewCursor(br, false)
+	for rank := br.BaseStart; rank < br.BaseEnd; rank++ {
+		ids, idx, single, ok := cur.NextPostingOrSingle()
+		if !ok {
+			t.Fatalf("ascending cursor ended at rank %d", rank)
+		}
+		if !single || !ids.IsEmpty() || idx != uint64(rank+1) {
+			t.Fatalf("ascending item[%d]: ids=%v idx=%d single=%v", rank, ids, idx, single)
+		}
+	}
+	if _, _, _, ok := cur.NextPostingOrSingle(); ok {
+		t.Fatalf("ascending cursor returned extra row")
+	}
+
+	cur = ov.NewCursor(br, true)
+	for rank := br.BaseEnd - 1; rank >= br.BaseStart; rank-- {
+		ids, idx, single, ok := cur.NextPostingOrSingle()
+		if !ok {
+			t.Fatalf("descending cursor ended at rank %d", rank)
+		}
+		if !single || !ids.IsEmpty() || idx != uint64(rank+1) {
+			t.Fatalf("descending item[%d]: ids=%v idx=%d single=%v", rank, ids, idx, single)
+		}
+	}
+	if _, _, _, ok := cur.NextPostingOrSingle(); ok {
+		t.Fatalf("descending cursor returned extra row")
+	}
+
+	multi := []Entry{
+		{Key: keycodec.FromStoredString("a", false), IDs: fieldStorageOwnedTestPosting(10)},
+		{Key: keycodec.FromStoredString("b", false), IDs: fieldStorageOwnedTestPosting(20)},
+	}
+	defer multi[0].IDs.Release()
+	defer multi[1].IDs.Release()
+
+	ov = NewFieldIndexView(&multi)
+	cur = ov.NewCursor(ov.RangeByRanks(0, 2), false)
+	ids, _, single, ok := cur.NextPostingOrSingle()
+	if !ok || single || !ids.IsBorrowed() || ids.Cardinality() != 2 || !ids.Contains(10) {
+		t.Fatalf("flat multi posting mismatch: ok=%v single=%v ids=%v", ok, single, ids)
+	}
+}
+
 func TestFieldIndexViewRangeByRanksClampsFlatAndChunked(t *testing.T) {
 	tests := []struct {
 		name      string

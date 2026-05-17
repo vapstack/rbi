@@ -85,6 +85,18 @@ func assertCorrectQuery(t *testing.T, db *DB[uint64, Rec], q *qx.QX, want []uint
 	assertQueryIDsEqual(t, q, got, want)
 }
 
+func assertCorrectNoOrderPage(t *testing.T, db *DB[uint64, Rec], q *qx.QX, match correctnessRowMatch) {
+	t.Helper()
+	got, err := db.QueryKeys(q)
+	if err != nil {
+		t.Fatalf("QueryKeys: %v", err)
+	}
+	full := expectedRecIDs(db, match, nil, 0, 0)
+	if err := testValidateNoOrderPage(q, got, full); err != nil {
+		t.Fatalf("no-order page mismatch: %v\ngot=%v\nfull=%v", err, got, full)
+	}
+}
+
 func countExpected(db *DB[uint64, Rec], match correctnessRowMatch) uint64 {
 	var n uint64
 	for id, rec := range db.values {
@@ -175,7 +187,7 @@ func TestQueryCorrectness_NegativeNilComplementAndCount(t *testing.T) {
 		qx.GTE("age", 20),
 		qx.LT("age", 60),
 	).Limit(32)
-	assertCorrectQuery(t, db, q, expectedRecIDs(db, notInRange, nil, 0, 32))
+	assertCorrectNoOrderPage(t, db, q, notInRange)
 
 	hasNoneRange := func(_ uint64, r *Rec) bool {
 		return hasNoneString(r.Tags, "go", "db") && r.Age >= 20 && r.Age < 60
@@ -185,7 +197,7 @@ func TestQueryCorrectness_NegativeNilComplementAndCount(t *testing.T) {
 		qx.GTE("age", 20),
 		qx.LT("age", 60),
 	).Limit(32)
-	assertCorrectQuery(t, db, q, expectedRecIDs(db, hasNoneRange, nil, 0, 32))
+	assertCorrectNoOrderPage(t, db, q, hasNoneRange)
 
 	nilOpt := func(_ uint64, r *Rec) bool {
 		return r.Opt == nil
@@ -214,6 +226,56 @@ func TestQueryCorrectness_NegativeNilComplementAndCount(t *testing.T) {
 	}
 }
 
+func TestCardinalityORByPredicates_DisjointScalarEQBranches(t *testing.T) {
+	db := newCorrectnessDB(t)
+
+	disjoint := qx.OR(
+		qx.AND(qx.EQ("country", "US"), qx.PREFIX("full_name", "FN-0")),
+		qx.AND(qx.EQ("country", "DE"), qx.GTE("age", 30)),
+		qx.AND(qx.EQ("country", "NL"), qx.EQ("active", true)),
+	)
+	trace := &Trace{}
+	got, ok, err := db.engine.tryFilterCardinalityORByPredicates(disjoint, trace)
+	if err != nil {
+		t.Fatalf("disjoint cardinality OR: %v", err)
+	}
+	if !ok {
+		t.Fatalf("disjoint cardinality OR route was not used")
+	}
+	want := countExpected(db, func(_ uint64, r *Rec) bool {
+		return r.Country == "US" && strings.HasPrefix(r.FullName, "FN-0") ||
+			r.Country == "DE" && r.Age >= 30 ||
+			r.Country == "NL" && r.Active
+	})
+	if got != want {
+		t.Fatalf("disjoint cardinality OR mismatch: got=%d want=%d", got, want)
+	}
+	if trace.Event().Plan != string(planFilterCardinalityORPredicates) {
+		t.Fatalf("disjoint cardinality OR plan=%q, want %q", trace.Event().Plan, planFilterCardinalityORPredicates)
+	}
+
+	overlap := qx.OR(
+		qx.AND(qx.EQ("country", "US"), qx.PREFIX("full_name", "FN-0")),
+		qx.AND(qx.EQ("country", "US"), qx.GTE("age", 30)),
+		qx.AND(qx.EQ("country", "DE"), qx.EQ("active", true)),
+	)
+	got, ok, err = db.engine.tryFilterCardinalityORByPredicates(overlap, nil)
+	if err != nil {
+		t.Fatalf("overlap cardinality OR: %v", err)
+	}
+	if !ok {
+		t.Fatalf("overlap cardinality OR route was not used")
+	}
+	want = countExpected(db, func(_ uint64, r *Rec) bool {
+		return r.Country == "US" && strings.HasPrefix(r.FullName, "FN-0") ||
+			r.Country == "US" && r.Age >= 30 ||
+			r.Country == "DE" && r.Active
+	})
+	if got != want {
+		t.Fatalf("overlap cardinality OR mismatch: got=%d want=%d", got, want)
+	}
+}
+
 func TestQueryCorrectness_WindowArrayOrderAndPreparedQuery(t *testing.T) {
 	db := newCorrectnessDB(t)
 
@@ -227,7 +289,7 @@ func TestQueryCorrectness_WindowArrayOrderAndPreparedQuery(t *testing.T) {
 		return r.Active && strings.HasPrefix(r.FullName, "FN-0")
 	}
 	q = qx.Query(qx.PREFIX("full_name", "FN-0"), qx.EQ("active", true)).Limit(32)
-	assertCorrectQuery(t, db, q, expectedRecIDs(db, prefixActive, nil, 0, 32))
+	assertCorrectNoOrderPage(t, db, q, prefixActive)
 
 	priority := []string{"tag_mid", "go", "db"}
 	hasPriorityTag := func(_ uint64, r *Rec) bool {
@@ -235,6 +297,14 @@ func TestQueryCorrectness_WindowArrayOrderAndPreparedQuery(t *testing.T) {
 	}
 	q = qx.Query(qx.HASANY("tags", priority)).SortBy(qx.POS("tags", priority), qx.ASC).Offset(1).Limit(5)
 	assertCorrectQuery(t, db, q, expectedRecIDs(db, hasPriorityTag, tagPosAsc(priority), 1, 5))
+
+	hasSingleIndexedPriorityTag := func(_ uint64, r *Rec) bool {
+		return hasAnyString(r.Tags, "tag_mid", "missing_tag")
+	}
+	q = qx.Query(qx.HASANY("tags", []string{"tag_mid", "missing_tag"})).SortBy(qx.POS("tags", priority), qx.ASC).Offset(1).Limit(5)
+	assertCorrectQuery(t, db, q, expectedRecIDs(db, hasSingleIndexedPriorityTag, tagPosAsc(priority), 1, 5))
+	q = qx.Query(qx.HASANY("tags", []string{"tag_mid", "missing_tag"})).SortBy(qx.POS("tags", priority), qx.ASC)
+	assertCorrectQuery(t, db, q, expectedRecIDs(db, hasSingleIndexedPriorityTag, tagPosAsc(priority), 0, 0))
 
 	prepared, shape, err := prepareTestQuery(db.engine, q)
 	if err != nil {
@@ -245,7 +315,7 @@ func TestQueryCorrectness_WindowArrayOrderAndPreparedQuery(t *testing.T) {
 	if err != nil {
 		t.Fatalf("PreparedQuery: %v", err)
 	}
-	assertQueryIDsEqual(t, q, got, expectedRecIDs(db, hasPriorityTag, tagPosAsc(priority), 1, 5))
+	assertQueryIDsEqual(t, q, got, expectedRecIDs(db, hasSingleIndexedPriorityTag, tagPosAsc(priority), 0, 0))
 }
 
 func TestQueryCorrectness_PublicWrappersAndCacheModes(t *testing.T) {

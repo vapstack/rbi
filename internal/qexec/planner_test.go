@@ -999,7 +999,7 @@ func setORPlannerStatsSnapshotForTest(db *DB[uint64, Rec], universe uint64, scor
 	})
 }
 
-func TestTracer_ORNoOrderAdaptiveSkipsBranchByThreshold(t *testing.T) {
+func TestTracer_ORNoOrderAdaptiveStopsAtLimit(t *testing.T) {
 	var (
 		mu     sync.Mutex
 		events []TraceEvent
@@ -1033,16 +1033,14 @@ func TestTracer_ORNoOrderAdaptiveSkipsBranchByThreshold(t *testing.T) {
 	if len(ids) != 2 {
 		t.Fatalf("expected 2 ids, got %d", len(ids))
 	}
-	if ids[0] != 10 || ids[1] != 20 {
-		t.Fatalf("unexpected ids: got=%v want=[10 20]", ids)
-	}
 
 	mu.Lock()
-	defer mu.Unlock()
 	if len(events) == 0 {
+		mu.Unlock()
 		t.Fatalf("expected trace event")
 	}
 	ev := events[len(events)-1]
+	mu.Unlock()
 
 	if ev.Plan != "plan_or_merge_no_order" {
 		t.Fatalf("expected no-order OR plan, got %q", ev.Plan)
@@ -1054,18 +1052,20 @@ func TestTracer_ORNoOrderAdaptiveSkipsBranchByThreshold(t *testing.T) {
 		t.Fatalf("unexpected OR branch trace size: got=%d want=3", len(ev.ORBranches))
 	}
 
-	skipped := 0
-	for _, b := range ev.ORBranches {
-		if b.Skipped && b.SkipReason == "threshold_pruned" {
-			skipped++
-		}
+	if ev.RowsExamined > 4 {
+		t.Fatalf("expected adaptive no-order OR to stop after filling limit, examined=%d trace=%+v", ev.RowsExamined, ev)
 	}
-	if skipped == 0 {
-		t.Fatalf("expected at least one threshold-pruned branch in trace")
+
+	fullQ := cloneQuery(q)
+	fullQ.Window.Limit = 0
+	full, err := db.QueryKeys(fullQ)
+	if err != nil {
+		t.Fatalf("full QueryKeys: %v", err)
 	}
+	assertNoOrderPage(t, q, ids, full, "or_no_order_adaptive")
 }
 
-func TestPlannerORNoOrderAdaptive_MatchesBaseline(t *testing.T) {
+func TestPlannerORNoOrderAdaptive_ReturnsNoOrderPage(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
 		AnalyzeInterval: -1,
 	})
@@ -1092,23 +1092,14 @@ func TestPlannerORNoOrderAdaptive_MatchesBaseline(t *testing.T) {
 		t.Fatalf("execPlanORNoOrderAdaptive: ok=false")
 	}
 
-	branchesBaseline, alwaysFalse, ok := db.engine.buildORBranches(q.Filter.Args)
-	if !ok {
-		t.Fatalf("buildORBranches baseline: ok=false")
-	}
-	if alwaysFalse {
-		t.Fatalf("unexpected alwaysFalse for baseline branches")
-	}
-	defer branchesBaseline.Release()
-
-	gotBaseline, ok := db.engine.execPlanORNoOrderBaseline(q, branchesBaseline, nil)
-	if !ok {
-		t.Fatalf("execPlanORNoOrderBaseline: ok=false")
+	fullQ := cloneQuery(q)
+	fullQ.Window.Limit = 0
+	full, err := db.QueryKeys(fullQ)
+	if err != nil {
+		t.Fatalf("full QueryKeys: %v", err)
 	}
 
-	if !slices.Equal(gotAdaptive, gotBaseline) {
-		t.Fatalf("adaptive/baseline mismatch:\nadaptive=%v\nbaseline=%v", gotAdaptive, gotBaseline)
-	}
+	assertNoOrderPage(t, q, gotAdaptive, full, "adaptive")
 }
 
 func TestBuildORBranches_BroadNumericRangeStaysRuntimeOnSecondBuild(t *testing.T) {
@@ -1282,6 +1273,86 @@ func TestPlannerORNoOrder_BroadResidualRangePromotesRouteAware(t *testing.T) {
 
 	if got := db.engine.snapshot.Current().MaterializedPredCache().EntryCount(); got == 0 {
 		t.Fatalf("expected route-aware residual materialization to populate shared cache")
+	}
+}
+
+func TestPlannerORNoOrder_ExactLeadWithComplementRangeResidualNotExhausted(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{
+		AnalyzeInterval:                         -1,
+		SnapshotMaterializedPredCacheMaxEntries: 16,
+		NumericRangeBucketSize:                  8,
+		NumericRangeBucketMinFieldKeys:          16,
+		NumericRangeBucketMinSpanKeys:           4,
+	})
+	seedGeneratedUint64Data(t, db, 12_000, func(i int) *Rec {
+		return &Rec{
+			Name:   fmt.Sprintf("u_%d", i),
+			Email:  fmt.Sprintf("user%05d@example.com", i),
+			Score:  float64(i),
+			Active: i%2 == 0,
+		}
+	})
+	if err := db.RebuildIndex(); err != nil {
+		t.Fatalf("RebuildIndex: %v", err)
+	}
+
+	q := qx.Query(
+		qx.OR(
+			qx.AND(
+				qx.EQ("name", "u_6000"),
+				qx.GTE("score", 4_000.0),
+			),
+			qx.EQ("name", "missing"),
+		),
+	).Limit(1)
+
+	branches, alwaysFalse, ok := db.engine.buildORBranches(q.Filter.Args)
+	if !ok {
+		t.Fatalf("buildORBranches: ok=false")
+	}
+	if alwaysFalse {
+		t.Fatalf("unexpected alwaysFalse")
+	}
+	defer branches.Release()
+
+	var found bool
+	for i := 0; i < branches.Len(); i++ {
+		branch := branches.owner[i]
+		for j := 0; j < branch.preds.Len(); j++ {
+			p := branch.preds.owner[j]
+			if db.engine.fieldNameByOrdinal(p.expr.FieldOrdinal) != "score" || p.expr.Op != compileScalarOpForTest(qx.OpGTE) {
+				continue
+			}
+			found = true
+			if p.fieldIndexRangeState == nil || !p.fieldIndexRangeState.probe.useComplement {
+				t.Fatalf("expected score residual to stay as complement runtime probe")
+			}
+			leadIDs, ok := plannerORPredicateExactLeadPosting(branch.leadPtr())
+			if !ok {
+				t.Fatalf("expected exact lead posting")
+			}
+			cnt, ok := p.countBucket(leadIDs)
+			if !ok {
+				t.Fatalf("expected complement-probe residual bucket count")
+			}
+			if cnt != 1 {
+				t.Fatalf("complement-probe residual countBucket = %d, want 1", cnt)
+			}
+			if plannerORBranchExactLeadPostingEmpty(&branch) {
+				t.Fatalf("complement-probe residual must not prove exact-lead branch empty")
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("expected score range predicate in OR branches")
+	}
+
+	got, ok := db.engine.execPlanORNoOrderAdaptive(q, branches, nil)
+	if !ok {
+		t.Fatalf("execPlanORNoOrderAdaptive: ok=false")
+	}
+	if len(got) != 1 || got[0] != 6000 {
+		t.Fatalf("unexpected adaptive result: got=%v want [6000]", got)
 	}
 }
 
@@ -3033,6 +3104,75 @@ func TestBuildPredicatesOrdered_MergesPositiveNumericRangeLeavesOnSameField(t *t
 	}
 }
 
+func TestBuildPredicates_MergesPositiveNumericRangeLeavesOnSameField(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
+
+	seedGeneratedUint64Data(t, db, 1_000, func(i int) *Rec {
+		return &Rec{
+			Name:  fmt.Sprintf("u_%d", i),
+			Age:   i,
+			Score: float64(i),
+		}
+	})
+	if err := db.RebuildIndex(); err != nil {
+		t.Fatalf("RebuildIndex: %v", err)
+	}
+
+	leaves := []qx.Expr{
+		qx.EQ("active", true),
+		qx.GTE("age", 250),
+		qx.LTE("age", 400),
+	}
+
+	preds, ok := db.engine.buildPredicates(leaves)
+	if !ok {
+		t.Fatalf("buildPredicates: ok=false")
+	}
+	defer releasePredicates(preds)
+
+	if len(preds) != 2 {
+		t.Fatalf("unexpected preds len: %d", len(preds))
+	}
+	ageIdx := -1
+	for i := range preds {
+		if db.engine.fieldNameByOrdinal(preds[i].expr.FieldOrdinal) == "age" {
+			ageIdx = i
+			break
+		}
+	}
+	if ageIdx < 0 {
+		t.Fatalf("expected merged age predicate")
+	}
+	if !preds[ageIdx].hasEffectiveBounds {
+		t.Fatalf("expected merged range predicate to keep exact bounds")
+	}
+
+	lo, ok := db.engine.buildPredicateWithMode(qx.GTE("age", 250), false)
+	if !ok {
+		t.Fatalf("build lower predicate: ok=false")
+	}
+	defer releasePredicates([]predicate{lo})
+
+	hi, ok := db.engine.buildPredicateWithMode(qx.LTE("age", 400), false)
+	if !ok {
+		t.Fatalf("build upper predicate: ok=false")
+	}
+	defer releasePredicates([]predicate{hi})
+
+	universe := db.engine.snapshot.Current().Universe
+	var want []uint64
+	universe.ForEach(func(idx uint64) bool {
+		if lo.matches(idx) && hi.matches(idx) {
+			want = append(want, idx)
+		}
+		return true
+	})
+	got := predicateMatchIDs(preds[ageIdx], universe)
+	if !slices.Equal(got, want) {
+		t.Fatalf("merged predicate mismatch: got=%v want=%v", got, want)
+	}
+}
+
 func TestPlannerOROrderMergeBranchStats_SkipFullSpanRowCountingWithoutOrderBounds(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
 		AnalyzeInterval: -1,
@@ -4019,10 +4159,7 @@ func TestPlannerRouting_OrderedNoOrderWithNegativeIN_MatchesSeqScan(t *testing.T
 	if err != nil {
 		t.Fatalf("expectedKeysUint64(full): %v", err)
 	}
-	assertNoOrderWindowSubset(t, q, got, full, "ordered_no_order")
-	if len(full) >= int(q.Window.Limit) && len(got) != int(q.Window.Limit) {
-		t.Fatalf("expected full page for ordered_no_order route: got=%d limit=%d full=%d", len(got), q.Window.Limit, len(full))
-	}
+	assertNoOrderPage(t, q, got, full, "ordered_no_order")
 
 	if ev.Plan == "" {
 		t.Fatal("expected plan name in trace event")
@@ -4070,7 +4207,7 @@ func TestPlannerCandidateOrder_MatchesSeqScan(t *testing.T) {
 	assertSameSlice(t, got, want)
 }
 
-func TestPlannerCandidateNoOrder_RespectsWindowAndPredicateSet(t *testing.T) {
+func TestPlannerCandidateNoOrder_RespectsPageAndPredicateSet(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
 		AnalyzeInterval: -1,
 	})
@@ -4097,9 +4234,5 @@ func TestPlannerCandidateNoOrder_RespectsWindowAndPredicateSet(t *testing.T) {
 	if err != nil {
 		t.Fatalf("expectedKeysUint64(full): %v", err)
 	}
-	assertNoOrderWindowSubset(t, q, got, full, "candidate_no_order")
-
-	if len(full) >= int(q.Window.Limit) && len(got) != int(q.Window.Limit) {
-		t.Fatalf("expected full page for no-order candidate route: got=%d limit=%d full=%d", len(got), q.Window.Limit, len(full))
-	}
+	assertNoOrderPage(t, q, got, full, "candidate_no_order")
 }

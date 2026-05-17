@@ -505,7 +505,7 @@ func (qv *View) collectOrderedMergedScalarRangeFields(
 
 	dst = dst[:0]
 	for i, e := range leaves {
-		if !qv.isPositiveOrderedNumericRangeLeaf(e, orderField) {
+		if !qv.isPositiveOrderedMergedScalarRangeLeaf(e, orderField) {
 			continue
 		}
 		rb, ok, err := qv.rangeBoundsForScalarExpr(e)
@@ -695,8 +695,8 @@ func (core *preparedScalarRangePredicate) buildFromFieldIndexRange(
 	probeLen := plan.bucketCount
 	probeEst := plan.est
 	if useRuntimeComplement {
-		probeLen = -1
-		probeEst = 0
+		probeLen = plan.runtimeProbeBuckets
+		probeEst = plan.runtimeProbeEst
 	}
 	probe := newFieldIndexRangeProbe(ov, plan.br, useRuntimeComplement, probeLen, probeEst)
 
@@ -924,10 +924,6 @@ func (qv *View) evalPreparedScalarExactRange(op preparedScalarExactRange) (posti
 	}
 
 	fm := qv.exec.Schema.Fields[op.field]
-	if !schema.FieldUsesOrderedNumericKeys(fm) {
-		return postingResult{}, nil
-	}
-
 	ov := qv.fieldIndexViewFromSlotsByName(qv.snap.Index, op.field)
 	if !ov.HasData() {
 		return postingResult{}, nil
@@ -938,11 +934,13 @@ func (qv *View) evalPreparedScalarExactRange(op preparedScalarExactRange) (posti
 		return postingResult{}, nil
 	}
 
-	if out, ok := qv.tryEvalNumericRangeBuckets(op.field, fm, ov, br); ok {
-		if !op.cacheKey.IsZero() {
-			out.ids = qv.tryShareMaterializedPred(op.cacheKey, out.ids)
+	if schema.FieldUsesOrderedNumericKeys(fm) {
+		if out, ok := qv.tryEvalNumericRangeBuckets(op.field, fm, ov, br); ok {
+			if !op.cacheKey.IsZero() {
+				out.ids = qv.tryShareMaterializedPred(op.cacheKey, out.ids)
+			}
+			return out, nil
 		}
-		return out, nil
 	}
 
 	ids := ov.UnionRangePostings(br, indexdata.FieldIndexRange{})
@@ -968,7 +966,18 @@ func (qv *View) shouldPromoteObservedPreparedScalarExactRange(op preparedScalarE
 		return false
 	}
 	br := ov.RangeForBounds(op.bounds)
-	return !br.Empty()
+	if br.Empty() {
+		return false
+	}
+	buckets, est := ov.RangeStats(br)
+	if buckets == 0 || est == 0 {
+		return false
+	}
+	buildWork := rangeProbeMaterializeWork(buckets, est)
+	if buildWork == 0 {
+		return false
+	}
+	return rangeProbeTotalWorkForRows(clampUint64ToInt(observedRows-needWindow), buckets, est) >= buildWork
 }
 
 func (core *preparedScalarRangePredicate) prepareComplementMaterialization() (scalarComplementMaterializationPlan, bool) {

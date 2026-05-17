@@ -13,6 +13,7 @@ import (
 const (
 	cardinalityPredicateScanMaxLeaves                  = 16
 	cardinalityORPredicateMaxBranchesBase              = 5
+	cardinalityORScalarDisjointMaxBranches             = 8 // Matches the max OR predicate branch limit; keeps disjoint-branch probes on stack.
 	cardinalityORHybridMaterializedBranchMax           = 3
 	cardinalityORSeenUnionThresholdBase                = 64_000
 	cardinalityORSeenUniverseDiv                       = 16
@@ -26,6 +27,7 @@ const (
 	cardinalityBroadRangeComplementFastAvgPerBucketMax = 8
 	cardinalityLeadResidualHasAnyExactMaxTerms         = 4
 	cardinalityLeadResidualHasAnyExactMinCard          = 65_536
+	cardinalityNumericBucketExactMinRows               = 65_536 // Below this, direct lead iteration is cheaper than building bucket postings for exact residual counts.
 )
 
 var cardinalityORMaterializedRouteKeys = [4]qcache.MaterializedPredKey{
@@ -1163,6 +1165,7 @@ func shouldTryCardinalityByPredicates(leaves []qir.Expr) bool {
 	hasNeg := false
 	hasComplex := false
 	hasRange := false
+	hasScalarEQ := false
 
 	for i := range leaves {
 		e := leaves[i]
@@ -1172,6 +1175,8 @@ func shouldTryCardinalityByPredicates(leaves []qir.Expr) bool {
 		switch e.Op {
 		case qir.OpPREFIX, qir.OpSUFFIX, qir.OpCONTAINS, qir.OpHASALL, qir.OpHASANY, qir.OpIN:
 			hasComplex = true
+		case qir.OpEQ:
+			hasScalarEQ = e.FieldOrdinal >= 0 && len(e.Operands) == 0
 		default:
 			if e.Op.IsNumericRange() {
 				hasRange = true
@@ -1179,7 +1184,7 @@ func shouldTryCardinalityByPredicates(leaves []qir.Expr) bool {
 		}
 	}
 
-	return hasNeg || hasComplex || (hasRange && len(leaves) >= 3)
+	return hasNeg || hasComplex || (hasRange && (len(leaves) >= 3 || hasScalarEQ))
 }
 
 func shouldPreferMaterializedCardinalityEval(preds predicateReader, leadScore, universe uint64) bool {
@@ -1303,7 +1308,7 @@ func (qv *View) buildCardinalityPredicatesWithMode(leaves []qir.Expr, allowMater
 					if merged.first != i {
 						continue
 					}
-					p, ok := qv.buildMergedNumericRangePredicate(merged.expr, merged.bounds, allowMaterialize)
+					p, ok := qv.buildMergedScalarRangePredicate(merged.expr, merged.bounds, allowMaterialize)
 					if !ok {
 						preds.Release()
 						return predicateSet{}, false
@@ -2751,13 +2756,284 @@ func (qv *View) TryFilterCardinalityByPredicates(expr qir.Expr, trace *Trace) (u
 	return cnt, true, nil
 }
 
+func cardinalityNumericBucketResidualsExact(preds predicateReader, active []int) bool {
+	if len(active) == 0 {
+		return false
+	}
+	for _, pi := range active {
+		if preds[pi].expr.Op.IsNumericRange() {
+			return false
+		}
+		capability := preds[pi].postingFilterCapability()
+		if !capability.supportsExactBucket() || !capability.isCheap() {
+			return false
+		}
+	}
+	return true
+}
+
+func cardinalityNumericBucketResidualsCountable(preds predicateReader, active []int) bool {
+	hasRange := false
+	for _, pi := range active {
+		if preds[pi].expr.Op.IsNumericRange() {
+			if hasRange {
+				return false
+			}
+			hasRange = true
+			continue
+		}
+		if preds[pi].expr.Not {
+			return false
+		}
+		capability := preds[pi].postingFilterCapability()
+		if !capability.supportsExactBucket() || !capability.isCheap() {
+			return false
+		}
+	}
+	return hasRange
+}
+
+func cardinalityCountPredicateBucket(preds predicateSet, checks []int, ids posting.List, work posting.List) (uint64, posting.List) {
+	if ids.IsEmpty() {
+		return 0, work
+	}
+	if len(checks) == 0 {
+		return ids.Cardinality(), work
+	}
+	if idx, ok := ids.TrySingle(); ok {
+		if cardinalityPredicatesMatchSet(preds, checks, idx) {
+			return 1, work
+		}
+		return 0, work
+	}
+	if len(checks) == 1 {
+		if in, ok := preds.owner[checks[0]].countBucket(ids); ok {
+			return in, work
+		}
+	}
+
+	mode, exactIDs, nextWork, card := plannerFilterPostingByPredicateChecks(preds.owner, checks, ids, work, true)
+	work = nextWork
+	switch mode {
+	case plannerPredicateBucketEmpty:
+		return 0, work
+	case plannerPredicateBucketAll:
+		return card, work
+	case plannerPredicateBucketExact:
+		return exactIDs.Cardinality(), work
+	default:
+		return postingMatchesMultiSetCardinality(preds, checks, ids), work
+	}
+}
+
+func countCardinalityNumericBucketRange(
+	preds predicateSet,
+	active []int,
+	ov indexdata.FieldIndexView,
+	start, end int,
+	work posting.List,
+) (uint64, uint64, posting.List) {
+
+	if start >= end {
+		return 0, 0, work
+	}
+	ids := ov.UnionRangePostings(ov.RangeByRanks(start, end), indexdata.FieldIndexRange{})
+	if ids.IsEmpty() {
+		return 0, 0, work
+	}
+	examined := ids.Cardinality()
+	cnt, work := cardinalityCountPredicateBucket(preds, active, ids, work)
+	ids.Release()
+	return cnt, examined, work
+}
+
+func (qv *View) TryFilterCardinalityByPredicatesNumericBucketPosting(
+	preds predicateSet,
+	lead *predicate,
+	ov indexdata.FieldIndexView,
+	br indexdata.FieldIndexRange,
+	field string,
+	fm *schema.Field,
+	active []int,
+) (uint64, uint64, bool) {
+
+	if fm == nil || br.Empty() {
+		return 0, 0, false
+	}
+	if br.BaseEnd-br.BaseStart < cardinalityNumericBucketExactMinRows {
+		return 0, 0, false
+	}
+	if !cardinalityNumericBucketResidualsCountable(preds.owner, active) {
+		return 0, 0, false
+	}
+	rows := ov.RangeRows(br.BaseStart, br.BaseEnd)
+	if rows < cardinalityNumericBucketExactMinRows {
+		return 0, 0, false
+	}
+	if lead.fieldIndexRangeState != nil && !lead.expr.Not {
+		leadIDs := lead.fieldIndexRangeState.materializeRange()
+		examined := leadIDs.Cardinality()
+		if len(active) == 1 {
+			p := &preds.owner[active[0]]
+			if p.fieldIndexRangeState != nil && !p.expr.Not {
+				ids := p.fieldIndexRangeState.materializeRange()
+				return leadIDs.AndCardinality(ids), examined, true
+			}
+		}
+		var work posting.List
+		cnt, work := cardinalityCountPredicateBucket(preds, active, leadIDs, work)
+		work.Release()
+		return cnt, examined, true
+	}
+	res, ok := qv.tryEvalNumericRangeBuckets(field, fm, ov, br)
+	if !ok {
+		return 0, 0, false
+	}
+	examined := res.ids.Cardinality()
+
+	if len(active) == 1 {
+		p := &preds.owner[active[0]]
+		if p.rangeMat || p.kind == predicateKindMaterialized {
+			cnt := res.ids.AndCardinality(p.ids)
+			res.ids.Release()
+			return cnt, examined, true
+		}
+		if p.kind == predicateKindMaterializedNot {
+			excluded := res.ids.AndCardinality(p.ids)
+			cnt := uint64(0)
+			if excluded < examined {
+				cnt = examined - excluded
+			}
+			res.ids.Release()
+			return cnt, examined, true
+		}
+	}
+
+	if len(active) == 0 {
+		cnt := examined
+		res.ids.Release()
+		return cnt, examined, true
+	}
+
+	var work posting.List
+	cnt, work := cardinalityCountPredicateBucket(preds, active, res.ids, work)
+	work.Release()
+	res.ids.Release()
+	return cnt, examined, true
+}
+
+func (qv *View) TryFilterCardinalityByPredicatesNumericBuckets(
+	preds predicateSet,
+	ov indexdata.FieldIndexView,
+	br indexdata.FieldIndexRange,
+	field string,
+	fm *schema.Field,
+	active []int,
+) (uint64, uint64, bool) {
+
+	if fm == nil || !cardinalityNumericBucketResidualsExact(preds.owner, active) || br.Empty() {
+		return 0, 0, false
+	}
+	if !schema.FieldUsesOrderedNumericKeys(fm) {
+		return 0, 0, false
+	}
+
+	bucketSize := qv.exec.NumericRangeBucketSize
+	minFieldKeys := qv.exec.NumericRangeBucketMinFieldKeys
+	minSpan := qv.exec.NumericRangeBucketMinSpanKeys
+	if bucketSize <= 0 || minFieldKeys <= 0 || minSpan <= 0 {
+		return 0, 0, false
+	}
+
+	span := br.BaseEnd - br.BaseStart
+	if span < minSpan {
+		return 0, 0, false
+	}
+
+	storage, ok := qv.snap.FieldIndexStorage(field)
+	if !ok || storage.KeyCount() == 0 {
+		return 0, 0, false
+	}
+
+	entry := qv.numericRangeBucketCacheEntry(field, storage, bucketSize, minFieldKeys)
+	if entry == nil {
+		return 0, 0, false
+	}
+
+	idx := entry.Index()
+	if idx.BucketCount() == 0 || idx.KeyCount() != ov.KeyCount() {
+		return 0, 0, false
+	}
+
+	startFull, endFull, ok := idx.FullBucketSpan(br)
+	if !ok {
+		return 0, 0, false
+	}
+
+	rows := ov.RangeRows(br.BaseStart, br.BaseEnd)
+	if rows < cardinalityNumericBucketExactMinRows {
+		return 0, 0, false
+	}
+
+	if qv.snap.AllowsMaterializedPredCard(rows) {
+		res, ok := qv.tryEvalNumericRangeBuckets(field, fm, ov, br)
+		if ok {
+			examined := res.ids.Cardinality()
+			var work posting.List
+			cnt, work := cardinalityCountPredicateBucket(preds, active, res.ids, work)
+			work.Release()
+			res.ids.Release()
+			return cnt, examined, true
+		}
+	}
+
+	var cnt uint64
+	var examined uint64
+	var work posting.List
+
+	leftEnd := min(br.BaseEnd, idx.BucketStart(startFull))
+	if leftEnd > br.BaseStart {
+		var partCnt, partExamined uint64
+		partCnt, partExamined, work = countCardinalityNumericBucketRange(preds, active, ov, br.BaseStart, leftEnd, work)
+		cnt += partCnt
+		examined += partExamined
+	}
+
+	for bucket := startFull; bucket <= endFull; bucket++ {
+		var bucketCnt, bucketExamined uint64
+		bucketCnt, bucketExamined, work = countCardinalityNumericBucketRange(
+			preds,
+			active,
+			ov,
+			idx.BucketStart(bucket),
+			idx.BucketEnd(bucket),
+			work,
+		)
+		cnt += bucketCnt
+		examined += bucketExamined
+	}
+
+	rightStart := max(br.BaseStart, idx.BucketEnd(endFull))
+	if rightStart < br.BaseEnd {
+		var partCnt, partExamined uint64
+		partCnt, partExamined, work = countCardinalityNumericBucketRange(preds, active, ov, rightStart, br.BaseEnd, work)
+		cnt += partCnt
+		examined += partExamined
+	}
+
+	work.Release()
+	return cnt, examined, true
+}
+
 func (qv *View) TryFilterCardinalityByPredicatesLeadBuckets(preds predicateSet, leadIdx int, active []int) (uint64, uint64, bool) {
 	if leadIdx < 0 || leadIdx >= len(preds.owner) {
 		return 0, 0, false
 	}
 
-	lead := preds.owner[leadIdx]
+	lead := &preds.owner[leadIdx]
 	e := lead.expr
+	field := qv.exec.FieldNameByOrdinal(e.FieldOrdinal)
+	fm := qv.fieldMetaByExpr(e)
 
 	span, ok, err := qv.prepareScalarIndexSpan(e)
 	if err != nil || !ok {
@@ -2766,7 +3042,7 @@ func (qv *View) TryFilterCardinalityByPredicatesLeadBuckets(preds predicateSet, 
 
 	ov := span.ov
 	if ov.IsChunked() {
-		rb, covered, hasBounds, ok := qv.collectPredicateRangeBoundsReader(qv.exec.FieldNameByOrdinal(e.FieldOrdinal), preds.owner)
+		rb, covered, hasBounds, ok := qv.collectPredicateRangeBoundsReader(field, preds.owner)
 		if !ok || !hasBounds {
 			if ok {
 				pooled.ReleaseBoolSlice(covered)
@@ -2792,6 +3068,13 @@ func (qv *View) TryFilterCardinalityByPredicatesLeadBuckets(preds predicateSet, 
 			activeChecks = append(activeChecks, pi)
 		}
 		pooled.ReleaseBoolSlice(covered)
+
+		if cnt, examined, ok := qv.TryFilterCardinalityByPredicatesNumericBucketPosting(preds, lead, ov, br, field, fm, activeChecks); ok {
+			return cnt, examined, true
+		}
+		if cnt, examined, ok := qv.TryFilterCardinalityByPredicatesNumericBuckets(preds, ov, br, field, fm, activeChecks); ok {
+			return cnt, examined, true
+		}
 
 		var (
 			exactActiveBuf          [cardinalityPredicateScanMaxLeaves]int
@@ -2925,7 +3208,7 @@ func (qv *View) TryFilterCardinalityByPredicatesLeadBuckets(preds predicateSet, 
 	if !span.hasData {
 		return 0, 0, false
 	}
-	rb, covered, hasBounds, ok := qv.collectPredicateRangeBoundsReader(qv.exec.FieldNameByOrdinal(e.FieldOrdinal), preds.owner)
+	rb, covered, hasBounds, ok := qv.collectPredicateRangeBoundsReader(field, preds.owner)
 	if !ok || !hasBounds {
 		if ok {
 			pooled.ReleaseBoolSlice(covered)
@@ -2954,6 +3237,13 @@ func (qv *View) TryFilterCardinalityByPredicatesLeadBuckets(preds predicateSet, 
 		activeChecks = append(activeChecks, pi)
 	}
 	pooled.ReleaseBoolSlice(covered)
+
+	if cnt, examined, ok := qv.TryFilterCardinalityByPredicatesNumericBucketPosting(preds, lead, ov, br, field, fm, activeChecks); ok {
+		return cnt, examined, true
+	}
+	if cnt, examined, ok := qv.TryFilterCardinalityByPredicatesNumericBuckets(preds, ov, br, field, fm, activeChecks); ok {
+		return cnt, examined, true
+	}
 
 	var (
 		exactActiveBuf          [cardinalityPredicateScanMaxLeaves]int
@@ -3340,6 +3630,75 @@ func cardinalityHasPositivePrefixLikeAndLeaf(e qir.Expr) (bool, bool) {
 	}
 }
 
+func (qv *View) cardinalityORBranchesDisjointByScalarEQ(expr qir.Expr) bool {
+	branchCount := len(expr.Operands)
+	if branchCount < 2 || branchCount > cardinalityORScalarDisjointMaxBranches {
+		return false
+	}
+
+	var leavesBuf [cardinalityPredicateScanMaxLeaves]qir.Expr
+	leaves, ok := qir.CollectAndLeavesFixed(expr.Operands[0], leavesBuf[:0])
+	if !ok {
+		return false
+	}
+
+	fieldOrdinal := -1
+	for i := range leaves {
+		e := leaves[i]
+		if e.Not || e.Op != qir.OpEQ || e.FieldOrdinal < 0 || len(e.Operands) != 0 {
+			continue
+		}
+		fm := qv.fieldMetaByExpr(e)
+		if fm == nil || fm.Slice {
+			continue
+		}
+		fieldOrdinal = e.FieldOrdinal
+		break
+	}
+	if fieldOrdinal < 0 {
+		return false
+	}
+
+	var keys [cardinalityORScalarDisjointMaxBranches]string
+	var nils [cardinalityORScalarDisjointMaxBranches]bool
+	for branchIdx, op := range expr.Operands {
+		leaves, ok = qir.CollectAndLeavesFixed(op, leavesBuf[:0])
+		if !ok {
+			return false
+		}
+
+		found := false
+		var key string
+		var isNil bool
+		for i := range leaves {
+			e := leaves[i]
+			if e.Not || e.Op != qir.OpEQ || e.FieldOrdinal != fieldOrdinal || len(e.Operands) != 0 {
+				continue
+			}
+			nextKey, isSlice, nextNil, err := qv.exprValueToIdxScalar(e)
+			if err != nil || isSlice {
+				return false
+			}
+			key = nextKey
+			isNil = nextNil
+			found = true
+			break
+		}
+		if !found {
+			return false
+		}
+		for i := 0; i < branchIdx; i++ {
+			if nils[i] == isNil && keys[i] == key {
+				return false
+			}
+		}
+		keys[branchIdx] = key
+		nils[branchIdx] = isNil
+	}
+
+	return true
+}
+
 func cardinalityLeadOpWeight(op qir.Op) uint64 {
 	switch op {
 	case qir.OpEQ:
@@ -3592,12 +3951,27 @@ func (qv *View) TryFilterCardinalityORByPredicates(expr qir.Expr, trace *Trace) 
 	if uc == 0 {
 		return 0, true, nil
 	}
-	if qv.shouldPreferMaterializedCardinalityOR(expr) {
+	branchCount := len(expr.Operands)
+	if branchCount > cardinalityORPredicateBranchLimit(uc) {
 		out, err := qv.FilterCardinalityByMaterializedExpr(expr, trace)
 		return out, true, err
 	}
-	branchCount := len(expr.Operands)
-	if branchCount > cardinalityORPredicateBranchLimit(uc) {
+	if qv.cardinalityORBranchesDisjointByScalarEQ(expr) {
+		var cnt uint64
+		for i := range expr.Operands {
+			branchCnt, err := qv.exactExprCardinality(expr.Operands[i])
+			if err != nil {
+				return 0, true, err
+			}
+			cnt = satAddUint64(cnt, branchCnt)
+		}
+		if trace != nil {
+			trace.SetPlan(planFilterCardinalityORPredicates)
+			trace.AddExamined(cnt)
+		}
+		return cnt, true, nil
+	}
+	if qv.shouldPreferMaterializedCardinalityOR(expr) {
 		out, err := qv.FilterCardinalityByMaterializedExpr(expr, trace)
 		return out, true, err
 	}
@@ -4179,6 +4553,10 @@ func (qv *View) reorderCardinalityEvalAndPositivePlans(plans []cardinalityLeafPl
 	pos[0] = cur
 }
 
+// Complement range apply also mutates the accumulated posting, so it needs a
+// clear build-work win over materializing the positive range and intersecting it.
+const evalAndComplementRangeApplyMinWorkGain = 2
+
 func (qv *View) applyAndPostingResultExpr(acc *postingResult, hasAcc *bool, expr qir.Expr) (bool, error) {
 	if *hasAcc {
 		if !acc.neg && !acc.ids.IsEmpty() && expr.FieldOrdinal >= 0 {
@@ -4214,15 +4592,40 @@ func (qv *View) applyAndPostingResultExpr(acc *postingResult, hasAcc *bool, expr
 					}
 
 					if !p.alwaysTrue && !p.covered {
-						if next, ok := p.applyToPosting(acc.ids); ok {
-							acc.ids = next
-							acc.neg = false
-							if acc.ids.IsEmpty() {
-								acc.ids.Release()
-								*acc = postingResult{}
-								return true, nil
+						if p.fieldIndexRangeState != nil {
+							dstCard := acc.ids.Cardinality()
+							p.setExpectedContainsCalls(clampUint64ToInt(dstCard))
+							state := p.fieldIndexRangeState
+							if state.probePostingFilter && state.keepProbeHits {
+								maxRowsForContains := rangePostingFilterKeepRowsMaxCard
+								if state.probe.probeLen > 0 {
+									maxRowsForContains = maxRowsForContains / state.probe.probeLen
+									if maxRowsForContains < 1 {
+										maxRowsForContains = 1
+									}
+								}
+								if dstCard > uint64(maxRowsForContains) {
+									usePostingApply = false
+								}
+							} else if state.probePostingFilter && !state.keepProbeHits {
+								applyWork := postingUnionLinearWork(state.probe.probeLen, state.probe.probeEst)
+								materializeWork := postingUnionLinearWork(state.bucketCount, p.estCard)
+								if satMulUint64(applyWork, evalAndComplementRangeApplyMinWorkGain) >= materializeWork {
+									usePostingApply = false
+								}
 							}
-							return false, nil
+						}
+						if usePostingApply {
+							if next, ok := p.applyToPosting(acc.ids); ok {
+								acc.ids = next
+								acc.neg = false
+								if acc.ids.IsEmpty() {
+									acc.ids.Release()
+									*acc = postingResult{}
+									return true, nil
+								}
+								return false, nil
+							}
 						}
 					}
 				}
@@ -4280,69 +4683,110 @@ func (qv *View) tryFilterCardinalityPreparedAndReordered(expr qir.Expr) (uint64,
 		return 0, true, nil
 	}
 
-	var plansBuf [cardinalityPredicateScanMaxLeaves]cardinalityLeafPlan
-	plans := plansBuf[:len(leaves)]
-	var posBuf [cardinalityPredicateScanMaxLeaves]int
-	pos := posBuf[:0]
-	var negBuf [cardinalityPredicateScanMaxLeaves]int
-	neg := negBuf[:0]
+	if !qv.snap.AllowsMaterializedPredCard(universe) && !qv.snap.CanShareModeratelyOversizedMaterializedPred(universe) {
+		mergedRanges := orderedMergedScalarRangeFieldSlicePool.Get(len(leaves))
+		mergedRanges, ok = qv.collectMergedNumericRangeFields(leaves, mergedRanges)
+		if ok {
+			for i := range mergedRanges {
+				merged := mergedRanges[i]
+				if merged.count < 2 {
+					continue
+				}
+				fm := qv.exec.Schema.Fields[merged.field]
+				if fm == nil || fm.Slice {
+					continue
+				}
+				ov := qv.fieldIndexViewFromSlotsForExpr(qv.snap.Index, merged.expr)
+				if !ov.HasData() {
+					continue
+				}
+				br := ov.RangeForBounds(merged.bounds)
+				if br.Empty() {
+					orderedMergedScalarRangeFieldSlicePool.Put(mergedRanges)
+					return 0, true, nil
+				}
+				_, est := ov.RangeStats(br)
+				if est == 0 || qv.snap.AllowsMaterializedPredCard(est) || qv.snap.CanShareModeratelyOversizedMaterializedPred(est) {
+					continue
+				}
 
-	for i := range leaves {
-		e := leaves[i]
-		plans[i] = cardinalityLeafPlan{expr: e}
-		if sel, _, _, _, ok := qv.estimateLeafOrderCost(e, nil, universe, "", false); ok {
-			if sel < 0 {
-				sel = 0
+				// Count-only callers discard the merged range posting immediately; for
+				// unshareable broad ranges, count against the residual accumulator instead.
+				var filteredBuf [cardinalityPredicateScanMaxLeaves]qir.Expr
+				filtered := filteredBuf[:0]
+				for j := range leaves {
+					e := leaves[j]
+					if qv.isPositiveMergedNumericRangeLeaf(e) && qv.exec.FieldNameByOrdinal(e.FieldOrdinal) == merged.field {
+						continue
+					}
+					filtered = append(filtered, e)
+				}
+
+				if len(filtered) == 0 {
+					cnt, ok := qv.trySnapshotNumericRangeCardinality(merged.field, fm, ov, br.BaseStart, br.BaseEnd)
+					orderedMergedScalarRangeFieldSlicePool.Put(mergedRanges)
+					if ok {
+						return cnt, true, nil
+					}
+					return est, true, nil
+				}
+
+				acc, ok, err := qv.evalAndOperandsExceptReordered(filtered, -1)
+				if err != nil {
+					orderedMergedScalarRangeFieldSlicePool.Put(mergedRanges)
+					return 0, true, err
+				}
+				if !ok {
+					orderedMergedScalarRangeFieldSlicePool.Put(mergedRanges)
+					return 0, false, nil
+				}
+				if acc.neg {
+					acc.ids.Release()
+					break
+				}
+				var core preparedScalarRangePredicate
+				qv.initPreparedExactScalarRangePredicate(&core, merged.expr, fm, merged.bounds)
+				if plan, ok := core.prepareComplementMaterialization(); ok && plan.est > 0 && plan.est < est {
+					ids := core.materializeComplement(plan)
+					accCard := acc.ids.Cardinality()
+					if ids.IsEmpty() {
+						acc.ids.Release()
+						orderedMergedScalarRangeFieldSlicePool.Put(mergedRanges)
+						return accCard, true, nil
+					}
+					excluded := acc.ids.AndCardinality(ids)
+					ids.Release()
+					acc.ids.Release()
+					orderedMergedScalarRangeFieldSlicePool.Put(mergedRanges)
+					if excluded >= accCard {
+						return 0, true, nil
+					}
+					return accCard - excluded, true, nil
+				}
+				p, ok := qv.buildMergedScalarRangePredicate(merged.expr, merged.bounds, false)
+				if ok {
+					cnt, counted := p.countBucket(acc.ids)
+					releasePredicateOwnedState(&p)
+					if counted {
+						acc.ids.Release()
+						orderedMergedScalarRangeFieldSlicePool.Put(mergedRanges)
+						return cnt, true, nil
+					}
+				}
+				acc.ids.Release()
+				break
 			}
-			if sel > 1 {
-				sel = 1
-			}
-			plans[i].selectivity = sel
-			plans[i].hasSel = true
 		}
-		if e.Not {
-			neg = append(neg, i)
-			continue
-		}
-		pos = append(pos, i)
+		orderedMergedScalarRangeFieldSlicePool.Put(mergedRanges)
 	}
 
-	// Pure-NOT conjunctions are rare and don't benefit from this path.
-	if len(pos) == 0 {
+	acc, ok, err := qv.evalAndOperandsExceptReordered(leaves, -1)
+	if err != nil {
+		return 0, true, err
+	}
+	if !ok {
 		return 0, false, nil
 	}
-
-	sortCardinalityLeafPlanOrder(plans, pos)
-	sortCardinalityLeafPlanOrder(plans, neg)
-
-	var (
-		acc    postingResult
-		hasAcc bool
-	)
-
-	for _, pi := range pos {
-		done, err := qv.applyAndPostingResultExpr(&acc, &hasAcc, plans[pi].expr)
-		if err != nil {
-			return 0, true, err
-		}
-		if done {
-			return 0, true, nil
-		}
-	}
-	for _, ni := range neg {
-		done, err := qv.applyAndPostingResultExpr(&acc, &hasAcc, plans[ni].expr)
-		if err != nil {
-			return 0, true, err
-		}
-		if done {
-			return 0, true, nil
-		}
-	}
-
-	if !hasAcc {
-		return 0, true, nil
-	}
-
 	cnt := qv.postingResultCardinality(acc)
 	acc.ids.Release()
 	return cnt, true, nil

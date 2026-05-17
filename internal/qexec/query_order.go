@@ -562,6 +562,120 @@ func (qv *View) queryOrderArrayPosIndexView(result postingResult, ov indexdata.F
 	return cursor.out, nil
 }
 
+func (qv *View) tryQueryOrderArrayPosSingleHasAny(q *qir.Shape, trace *Trace) ([]uint64, bool, error) {
+	if !q.HasOrder || q.Order.Kind != qir.OrderKindArrayPos {
+		return nil, false, nil
+	}
+
+	e := q.Expr
+	if e.Op != qir.OpHASANY || e.Not || e.FieldOrdinal != q.Order.FieldOrdinal || len(e.Operands) != 0 {
+		return nil, false, nil
+	}
+
+	fm := qv.fieldMetaByExpr(e)
+	if fm == nil || !fm.Slice {
+		return nil, false, nil
+	}
+
+	// Existing array-order execution stops cheaply for tiny bounded windows.
+	if q.Limit != 0 && q.Offset <= uint64(iteratorThreshold) && q.Limit <= uint64(iteratorThreshold)-q.Offset {
+		return nil, false, nil
+	}
+
+	valsBuf, isSlice, _, err := qv.exprValueToDistinctIdxBuf(e)
+	if valsBuf != nil {
+		defer pooled.ReleaseStringSlice(valsBuf)
+	}
+	if err != nil || (!isSlice && e.Value != nil) || len(valsBuf) == 0 {
+		return nil, false, nil
+	}
+
+	orderVals, err := qv.orderDataValues(q.Order.Data, fm)
+	if err != nil || len(orderVals) == 0 {
+		return nil, false, nil
+	}
+
+	ov := qv.fieldIndexViewFromSlotsForOrder(qv.snap.Index, q.Order)
+	if !ov.HasData() && !qv.hasIndexedFieldForOrder(q.Order) {
+		return nil, false, nil
+	}
+
+	var filterKey string
+	var filterIDs posting.List
+	for i := 0; i < len(valsBuf); i++ {
+		ids := ov.LookupPostingRetained(valsBuf[i])
+		if ids.IsEmpty() {
+			continue
+		}
+		if !filterIDs.IsEmpty() {
+			return nil, false, nil
+		}
+		filterKey = valsBuf[i]
+		filterIDs = ids
+	}
+	if filterIDs.IsEmpty() {
+		return nil, true, nil
+	}
+
+	filterCard := filterIDs.Cardinality()
+	// Small bounded windows are cheaper on the existing materialized route; this
+	// path is for avoiding large union/dedupe work.
+	if q.Limit != 0 && filterCard <= iteratorThreshold*4 {
+		return nil, false, nil
+	}
+
+	if !q.Order.Desc {
+		for i := 0; i < len(orderVals); i++ {
+			v := orderVals[i]
+			if v == filterKey {
+				return emitSinglePostingOrderArrayPosResult(filterIDs, filterCard, q.Offset, q.Limit, trace), true, nil
+			}
+			ids := ov.LookupPostingRetained(v)
+			if !ids.IsEmpty() && ids.Intersects(filterIDs) {
+				return nil, false, nil
+			}
+		}
+	} else {
+		for i := len(orderVals) - 1; i >= 0; i-- {
+			v := orderVals[i]
+			if v == filterKey {
+				return emitSinglePostingOrderArrayPosResult(filterIDs, filterCard, q.Offset, q.Limit, trace), true, nil
+			}
+			ids := ov.LookupPostingRetained(v)
+			if !ids.IsEmpty() && ids.Intersects(filterIDs) {
+				return nil, false, nil
+			}
+		}
+	}
+
+	return emitSinglePostingOrderArrayPosResult(filterIDs, filterCard, q.Offset, q.Limit, trace), true, nil
+}
+
+func emitSinglePostingOrderArrayPosResult(ids posting.List, card, skip, need uint64, trace *Trace) []uint64 {
+	if ids.IsEmpty() {
+		return nil
+	}
+
+	all := need == 0
+	if skip == 0 && all {
+		if trace != nil {
+			trace.AddMatched(card)
+		}
+		return ids.ToArray()
+	}
+	if skip >= card {
+		return nil
+	}
+
+	out := makeOutSlice(card, need)
+	cursor := newQueryCursor(out, skip, need, all, 0)
+	cursor.emitPosting(ids)
+	if trace != nil {
+		trace.AddMatched(uint64(len(cursor.out)))
+	}
+	return cursor.out
+}
+
 func (qv *View) queryOrderArrayPosScalarIndexView(result postingResult, field string, fieldOrdinal int, ov indexdata.FieldIndexView, vals []string, desc bool, skip, need uint64, all bool) ([]uint64, error) {
 	resultCard := qv.postingResultCardinality(result)
 	if resultCard == 0 {

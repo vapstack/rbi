@@ -132,6 +132,22 @@ func (r *Runtime) collectPlannerFieldStatsFromIndexView(s *snapshot.View, fieldN
 }
 
 func plannerFieldIndexViewStats(o indexdata.FieldIndexView) PlannerFieldStats {
+	keyCount := uint64(o.KeyCount())
+	if keyCount == 0 {
+		return PlannerFieldStats{}
+	}
+	if o.Rows() == keyCount {
+		return PlannerFieldStats{
+			DistinctKeys:    keyCount,
+			NonEmptyKeys:    keyCount,
+			TotalBucketCard: keyCount,
+			AvgBucketCard:   1,
+			MaxBucketCard:   1,
+			P50BucketCard:   1,
+			P95BucketCard:   1,
+		}
+	}
+
 	var (
 		total    uint64
 		maxCard  uint64
@@ -147,11 +163,14 @@ func plannerFieldIndexViewStats(o indexdata.FieldIndexView) PlannerFieldStats {
 	q95 := newP2Quantile(0.95)
 	cur := o.NewCursor(br, false)
 	for {
-		_, ids, ok := cur.Next()
+		ids, _, single, ok := cur.NextPostingOrSingle()
 		if !ok {
 			break
 		}
-		card := ids.Cardinality()
+		card := uint64(1)
+		if !single {
+			card = ids.Cardinality()
+		}
 		q50.observe(card)
 		q95.observe(card)
 		distinct++

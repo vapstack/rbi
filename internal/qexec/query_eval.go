@@ -141,6 +141,113 @@ func (qv *View) evalAndOperands(ops []qir.Expr, negate bool) (postingResult, err
 		return postingResult{}, fmt.Errorf("%w: empty AND expression", ErrInvalidQuery)
 	}
 
+	if len(ops) > 1 && qv.hasEvalMergeableNumericRangeOperands(ops) {
+		res, ok, err := qv.evalAndOperandsWithMergedNumericRanges(ops, negate)
+		if ok || err != nil {
+			return res, err
+		}
+	}
+
+	return qv.evalAndOperandsDefault(ops, negate)
+}
+
+func (qv *View) hasEvalMergeableNumericRangeOperands(ops []qir.Expr) bool {
+	for i := 0; i < len(ops)-1; i++ {
+		e := ops[i]
+		if !qv.isPositiveMergedNumericRangeLeaf(e) {
+			continue
+		}
+		for j := i + 1; j < len(ops); j++ {
+			next := ops[j]
+			if next.FieldOrdinal == e.FieldOrdinal && qv.isPositiveMergedNumericRangeLeaf(next) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func (qv *View) evalAndOperandsWithMergedNumericRanges(ops []qir.Expr, negate bool) (postingResult, bool, error) {
+	mergedRangesBuf := orderedMergedScalarRangeFieldSlicePool.Get(len(ops))
+	var ok bool
+	mergedRangesBuf, ok = qv.collectMergedNumericRangeFields(ops, mergedRangesBuf)
+	if !ok {
+		orderedMergedScalarRangeFieldSlicePool.Put(mergedRangesBuf)
+		return postingResult{}, false, nil
+	}
+	defer orderedMergedScalarRangeFieldSlicePool.Put(mergedRangesBuf)
+
+	var (
+		first    postingResult
+		hasFirst bool
+	)
+
+	for i, op := range ops {
+		var (
+			b      postingResult
+			err    error
+			merged bool
+		)
+		if qv.isPositiveMergedNumericRangeLeaf(op) {
+			idx := findOrderedMergedScalarRangeField(mergedRangesBuf, qv.exec.FieldNameByOrdinal(op.FieldOrdinal))
+			if idx >= 0 {
+				group := mergedRangesBuf[idx]
+				if group.count > 1 {
+					if group.first != i {
+						continue
+					}
+					merged = true
+					b, err = qv.evalPreparedScalarExactRange(preparedScalarExactRange{
+						field:    group.field,
+						bounds:   group.bounds,
+						cacheKey: qv.materializedPredKeyForExactScalarRange(group.field, group.bounds),
+					})
+				}
+			}
+		}
+		if !merged {
+			b, err = qv.evalExpr(op)
+		}
+		if err != nil {
+			if hasFirst {
+				first.ids.Release()
+			}
+			return postingResult{}, true, err
+		}
+
+		if !b.neg && b.ids.IsEmpty() {
+			b.ids.Release()
+			if hasFirst {
+				first.ids.Release()
+			}
+			return postingResult{}, true, nil
+		}
+
+		if !hasFirst {
+			first = b
+			hasFirst = true
+			continue
+		}
+
+		first, err = qv.andPostingResult(first, b)
+		if err != nil {
+			first.ids.Release()
+			return postingResult{}, true, err
+		}
+
+		if !first.neg && first.ids.IsEmpty() {
+			first.ids.Release()
+			return postingResult{}, true, nil
+		}
+	}
+
+	if negate {
+		first.neg = !first.neg
+	}
+	return first, true, nil
+}
+
+func (qv *View) evalAndOperandsDefault(ops []qir.Expr, negate bool) (postingResult, error) {
 	var (
 		first    postingResult
 		hasFirst bool

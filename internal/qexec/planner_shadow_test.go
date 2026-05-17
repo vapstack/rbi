@@ -93,7 +93,7 @@ func (h *plannerShadowHarness) run(
 func (h *plannerShadowHarness) assertEquivalent(a, b plannerShadowResult) {
 	h.t.Helper()
 
-	if testQueryNoOrderWindow(h.q) {
+	if testQueryNoOrderPage(h.q) {
 		return
 	}
 	if !slices.Equal(a.keys, b.keys) {

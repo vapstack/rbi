@@ -243,7 +243,7 @@ func runPlannerGuardrailFamily(t *testing.T, family plannerGuardrailFamily) {
 				t.Fatalf("expected chosen plan %q, got %q", tc.wantChosenPlan, chosen.trace.Plan)
 			}
 			alternative := h.run("guardrail_alternative", family.runAlternative)
-			if !testQueryNoOrderWindow(tc.q) {
+			if !testQueryNoOrderPage(tc.q) {
 				h.assertEquivalent(chosen, alternative)
 			}
 

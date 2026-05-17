@@ -1277,6 +1277,42 @@ func (qv *View) shouldPreferExecutionPlan(q *qir.Shape, trace *Trace) bool {
 	}
 
 	if !q.HasOrder {
+		if q.Limit != 0 && q.Offset == 0 {
+			field, _, ok, err := qv.extractNoOrderBounds(leaves)
+			if err == nil && ok {
+				boundOnly := true
+				negResidual := false
+				residualOK := true
+				for _, e := range leaves {
+					if !e.Not && e.FieldOrdinal >= 0 && qv.exec.FieldNameByOrdinal(e.FieldOrdinal) == field && isBoundOp(e.Op) {
+						continue
+					}
+					boundOnly = false
+					if e.Not {
+						negResidual = true
+					}
+					if !qv.supportsLimitLeafPredExpr(e) {
+						residualOK = false
+						break
+					}
+				}
+				fm := qv.exec.Schema.Fields[field]
+				if fm != nil && !fm.Slice {
+					if boundOnly {
+						if trace != nil {
+							trace.SetEstimated(q.Limit, 1.0, 1.05)
+						}
+						return true
+					}
+					if negResidual && residualOK {
+						if trace != nil {
+							trace.SetEstimated(q.Limit, 1.0, 1.15)
+						}
+						return true
+					}
+				}
+			}
+		}
 		if qv.shouldPreferExecutionNoOrderPrefix(q, leaves) {
 			if trace != nil {
 				trace.SetEstimated(q.Limit, 1.0, 1.1)

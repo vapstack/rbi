@@ -874,14 +874,14 @@ type orderBasicBaseCore struct {
 	collapsed preparedScalarExactRange
 }
 
-func isOrderBasicCollapsibleNumericRangeExpr(op qir.Expr, fm *schema.Field) bool {
-	if op.Not || op.FieldOrdinal < 0 || !schema.FieldUsesOrderedNumericKeys(fm) {
+func isOrderBasicCollapsibleScalarRangeExpr(op qir.Expr, fm *schema.Field) bool {
+	if op.Not || op.FieldOrdinal < 0 || fm == nil || fm.Slice || len(op.Operands) != 0 {
 		return false
 	}
 	return isScalarRangeEqOp(op.Op)
 }
 
-func (qv *View) shouldCollapseOrderBasicNumericRange(field string, fieldOrdinal int, rb indexdata.Bounds) bool {
+func (qv *View) shouldCollapseOrderBasicScalarRange(field string, fieldOrdinal int, rb indexdata.Bounds) bool {
 	if field == "" || rb.Empty {
 		return false
 	}
@@ -946,7 +946,7 @@ func (qv *View) prepareOrderBasicBaseCores(baseOps []qir.Expr) ([]orderBasicBase
 			continue
 		}
 		fm := qv.fieldMetaByExpr(op)
-		if !isOrderBasicCollapsibleNumericRangeExpr(op, fm) {
+		if !isOrderBasicCollapsibleScalarRangeExpr(op, fm) {
 			continue
 		}
 		fieldName := qv.exec.FieldNameByOrdinal(op.FieldOrdinal)
@@ -958,7 +958,7 @@ func (qv *View) prepareOrderBasicBaseCores(baseOps []qir.Expr) ([]orderBasicBase
 				continue
 			}
 			other := baseOps[j]
-			if other.FieldOrdinal != op.FieldOrdinal || !isOrderBasicCollapsibleNumericRangeExpr(other, fm) {
+			if other.FieldOrdinal != op.FieldOrdinal || !isOrderBasicCollapsibleScalarRangeExpr(other, fm) {
 				continue
 			}
 			nextRB, ok, err := qv.rangeBoundsForScalarExpr(other)
@@ -983,7 +983,7 @@ func (qv *View) prepareOrderBasicBaseCores(baseOps []qir.Expr) ([]orderBasicBase
 			pooled.ReleaseIntSlice(rawCoreIdxBuf)
 			return nil, nil, true, nil
 		}
-		if !qv.shouldCollapseOrderBasicNumericRange(fieldName, op.FieldOrdinal, rb) {
+		if !qv.shouldCollapseOrderBasicScalarRange(fieldName, op.FieldOrdinal, rb) {
 			continue
 		}
 
@@ -998,7 +998,7 @@ func (qv *View) prepareOrderBasicBaseCores(baseOps []qir.Expr) ([]orderBasicBase
 		})
 		for j := i; j < len(baseOps); j++ {
 			other := baseOps[j]
-			if other.FieldOrdinal == op.FieldOrdinal && isOrderBasicCollapsibleNumericRangeExpr(other, fm) {
+			if other.FieldOrdinal == op.FieldOrdinal && isOrderBasicCollapsibleScalarRangeExpr(other, fm) {
 				rawCoreIdxBuf[j] = coreIdx
 			}
 		}
@@ -1222,6 +1222,23 @@ func (qv *View) promoteOrderBasicLimitMaterializedBaseOps(orderField string, bas
 
 	for i := 0; i < len(coresBuf); i++ {
 		core := coresBuf[i]
+		if core.kind == orderBasicBaseCoreRawExpr {
+			fm := qv.fieldMetaByExpr(core.expr)
+			if isOrderBasicCollapsibleScalarRangeExpr(core.expr, fm) {
+				groupCount := 0
+				for j := 0; j < len(baseOps); j++ {
+					op := baseOps[j]
+					if op.FieldOrdinal == core.expr.FieldOrdinal && isOrderBasicCollapsibleScalarRangeExpr(op, fm) {
+						groupCount++
+					}
+				}
+				if groupCount > 1 {
+					// The ordered predicate builder merges same-field scalar bounds; promoting
+					// individual half-ranges adds large cache entries that this route won't use.
+					continue
+				}
+			}
+		}
 		if !qv.shouldPromoteObservedOrderBasicBaseCore(orderField, core, universe, observedRows, needWindow) {
 			continue
 		}
@@ -1358,7 +1375,11 @@ func (qv *View) loadWarmOrderBasicRawBaseOp(op qir.Expr) (postingResult, bool) {
 	return candidate.core.loadWarmScalarPostingResult()
 }
 
-func (qv *View) shouldPreferOrderBasicBaseCorePathForNonOrderPrefix(q *qir.Shape, orderField string, baseOps []qir.Expr) bool {
+// Require a large residual range per requested row before pre-materializing it
+// for an order-field-bounded LIMIT scan.
+const orderBasicBoundedRangeBaseMinRowsPerNeed = 64
+
+func (qv *View) shouldPreferOrderBasicBaseCorePath(q *qir.Shape, orderField string, baseOps []qir.Expr, orderBounds indexdata.Bounds) bool {
 	if len(baseOps) == 0 {
 		return false
 	}
@@ -1372,6 +1393,7 @@ func (qv *View) shouldPreferOrderBasicBaseCorePathForNonOrderPrefix(q *qir.Shape
 		return false
 	}
 
+	hasOrderBounds := orderBounds.HasLo || orderBounds.HasHi || orderBounds.HasPrefix
 	for _, op := range baseOps {
 		if !qv.isPositiveNonOrderScalarPrefixLeaf(orderField, op) {
 			continue
@@ -1381,6 +1403,65 @@ func (qv *View) shouldPreferOrderBasicBaseCorePathForNonOrderPrefix(q *qir.Shape
 			continue
 		}
 		if candidate.plan.orderedEagerMaterializeUseful(window, universe) {
+			return true
+		}
+	}
+
+	if !hasOrderBounds {
+		return false
+	}
+
+	minRows := satMulUint64(uint64(window), orderBasicBoundedRangeBaseMinRowsPerNeed)
+	for i := 0; i < len(baseOps); i++ {
+		expr := baseOps[i]
+		if !qv.isPositiveMergedNumericRangeLeaf(expr) {
+			continue
+		}
+		fieldName := qv.exec.FieldNameByOrdinal(expr.FieldOrdinal)
+		if fieldName == orderField {
+			continue
+		}
+		seen := false
+		for j := 0; j < i; j++ {
+			prev := baseOps[j]
+			if prev.FieldOrdinal == expr.FieldOrdinal && qv.isPositiveMergedNumericRangeLeaf(prev) {
+				seen = true
+				break
+			}
+		}
+		if seen {
+			continue
+		}
+		rb, ok, err := qv.rangeBoundsForScalarExpr(expr)
+		if err != nil || !ok {
+			return false
+		}
+		for j := i + 1; j < len(baseOps); j++ {
+			next := baseOps[j]
+			if next.FieldOrdinal != expr.FieldOrdinal || !qv.isPositiveMergedNumericRangeLeaf(next) {
+				continue
+			}
+			nextRB, ok, err := qv.rangeBoundsForScalarExpr(next)
+			if err != nil || !ok {
+				return false
+			}
+			mergeRangeBounds(&rb, nextRB)
+		}
+		fm := qv.fieldMetaByExpr(expr)
+		if fm == nil || fm.Slice {
+			continue
+		}
+		var core preparedScalarRangePredicate
+		qv.initPreparedExactScalarRangePredicate(&core, expr, fm, rb)
+		ov := qv.fieldIndexViewFromSlotsForExpr(qv.snap.Index, expr)
+		if !ov.HasData() {
+			continue
+		}
+		plan, _, done := core.planFieldIndexRange(ov)
+		if done {
+			continue
+		}
+		if plan.bucketCount <= rangePostingFilterKeepProbeMaxBuckets && plan.est >= minRows {
 			return true
 		}
 	}
@@ -1524,9 +1605,8 @@ func (qv *View) tryQueryOrderBasicWithLimit(q *qir.Shape, trace *Trace) ([]uint6
 		return nil, true, nil
 	}
 
-	preferBaseCores := !rb.HasLo && !rb.HasHi && !rb.HasPrefix &&
-		q.Offset == 0 &&
-		qv.shouldPreferOrderBasicBaseCorePathForNonOrderPrefix(q, f, baseOps)
+	preferBaseCores := q.Offset == 0 &&
+		qv.shouldPreferOrderBasicBaseCorePath(q, f, baseOps, rb)
 
 	hasWarmBaseOps := len(baseCoresBuf) > 0 && qv.hasWarmOrderBasicBaseCores(baseCoresBuf)
 
@@ -1589,9 +1669,22 @@ func (qv *View) tryQueryOrderBasicWithLimit(q *qir.Shape, trace *Trace) ([]uint6
 		residualPredSet   predicateSet
 		residualActiveBuf []int
 		residualActive    []int
+		warmBaseLoaded    bool
 	)
 
 	if hasWarmBaseOps {
+		if len(baseCoresBuf) == 1 {
+			var ok bool
+			base, ok = qv.loadWarmOrderBasicBaseCore(baseCoresBuf[0])
+			if !ok {
+				hasWarmBaseOps = false
+			} else {
+				warmBaseLoaded = true
+			}
+		}
+	}
+
+	if hasWarmBaseOps && !warmBaseLoaded {
 		residualOpsBuf := qir.GetExprSlice(len(baseOps))
 		defer qir.ReleaseExprSlice(residualOpsBuf)
 
@@ -1723,9 +1816,25 @@ func (qv *View) scanOrderLimitNoPredicates(q *qir.Shape, ov indexdata.FieldIndex
 
 	keyCur := ov.NewCursor(br, desc)
 	for {
-		_, ids, ok := keyCur.Next()
+		ids, idx, single, ok := keyCur.NextPostingOrSingle()
 		if !ok {
 			break
+		}
+		if single {
+			scanWidth++
+			examined++
+			if trace != nil {
+				trace.AddMatched(1)
+			}
+			if cursor.emit(idx) {
+				if trace != nil {
+					trace.AddExamined(examined)
+					trace.AddOrderScanWidth(scanWidth)
+					trace.SetEarlyStopReason("limit_reached")
+				}
+				return cursor.out, true
+			}
+			continue
 		}
 		if ids.IsEmpty() {
 			continue
@@ -1797,6 +1906,11 @@ func (qv *View) scanOrderLimitWithPredicatesReader(q *qir.Shape, ov indexdata.Fi
 		defer pooled.ReleaseIntSlice(exactActiveBuf)
 
 		exactActiveBuf = buildExactBucketPostingFilterActiveReader(exactActiveBuf, activeBuf, preds)
+		if q.Offset == 0 && len(activeBuf) == 1 && len(exactActiveBuf) == 1 {
+			// A single residual check reaches LIMIT faster by testing emitted
+			// candidates directly than by exact-filtering every order bucket.
+			exactActiveBuf = exactActiveBuf[:0]
+		}
 
 		residualActiveBuf := pooled.GetIntSlice(len(activeBuf))
 		defer pooled.ReleaseIntSlice(residualActiveBuf)
@@ -1817,13 +1931,27 @@ func (qv *View) scanOrderLimitWithPredicatesReader(q *qir.Shape, ov indexdata.Fi
 
 		keyCur := ov.NewCursor(br, desc)
 		for {
-			_, ids, ok := keyCur.Next()
+			ids, idx, single, ok := keyCur.NextPostingOrSingle()
 			if !ok {
 				break
 			}
-			if !ids.IsEmpty() {
+			if single {
 				scanWidth++
+				if orderPredicatesEmitCandidateReader(&cursor, preds, activeBuf, trace, idx, &examined) {
+					if trace != nil {
+						trace.AddExamined(examined)
+						trace.AddOrderScanWidth(scanWidth)
+						trace.SetEarlyStopReason("limit_reached")
+					}
+					exactWork.Release()
+					return cursor.out, true
+				}
+				continue
 			}
+			if ids.IsEmpty() {
+				continue
+			}
+			scanWidth++
 			stop, nextExactWork := orderPredicatesEmitPostingReader(
 				&cursor,
 				preds,
@@ -1915,6 +2043,11 @@ func (qv *View) scanOrderLimitWithPredicatesReader(q *qir.Shape, ov indexdata.Fi
 		residualActiveInline [limitQueryFastPathMaxLeaves]int
 	)
 	exactActive := buildExactBucketPostingFilterActiveReader(exactActiveInline[:0], active, preds)
+	if q.Offset == 0 && len(active) == 1 && len(exactActive) == 1 {
+		// A single residual check reaches LIMIT faster by testing emitted
+		// candidates directly than by exact-filtering every order bucket.
+		exactActive = exactActive[:0]
+	}
 	residualActive := plannerResidualChecks(residualActiveInline[:0], active, exactActive)
 	exactOnly := len(active) > 0 && len(active) == len(exactActive)
 
@@ -1930,13 +2063,27 @@ func (qv *View) scanOrderLimitWithPredicatesReader(q *qir.Shape, ov indexdata.Fi
 
 	keyCur := ov.NewCursor(br, desc)
 	for {
-		_, ids, ok := keyCur.Next()
+		ids, idx, single, ok := keyCur.NextPostingOrSingle()
 		if !ok {
 			break
 		}
-		if !ids.IsEmpty() {
+		if single {
 			scanWidth++
+			if orderPredicatesEmitCandidateReader(&cursor, preds, active, trace, idx, &examined) {
+				if trace != nil {
+					trace.AddExamined(examined)
+					trace.AddOrderScanWidth(scanWidth)
+					trace.SetEarlyStopReason("limit_reached")
+				}
+				exactWork.Release()
+				return cursor.out, true
+			}
+			continue
 		}
+		if ids.IsEmpty() {
+			continue
+		}
+		scanWidth++
 		stop, nextExactWork := orderPredicatesEmitPostingReader(
 			&cursor,
 			preds,

@@ -551,10 +551,10 @@ func assertSameSlice(t *testing.T, got, want []uint64) {
 	}
 }
 
-func assertNoOrderWindowSubset(t testing.TB, q *qx.QX, got, full []uint64, label string) {
+func assertNoOrderPage(t testing.TB, q *qx.QX, got, full []uint64, label string) {
 	t.Helper()
-	if err := testValidateNoOrderWindow(q, got, full); err != nil {
-		t.Fatalf("%s no-order window mismatch: %v\ngot=%v\nfull=%v", label, err, got, full)
+	if err := testValidateNoOrderPage(q, got, full); err != nil {
+		t.Fatalf("%s no-order page mismatch: %v\ngot=%v\nfull=%v", label, err, got, full)
 	}
 }
 
@@ -1456,7 +1456,7 @@ func (db *testDB) assertKeysMatchReference(t testing.TB, label string, q *qx.QX,
 	if err := testValidateNoDuplicateKeys(label, got); err != nil {
 		t.Fatal(err)
 	}
-	if testQueryNoOrderWindow(q) {
+	if testQueryNoOrderPage(q) {
 		fullQ := qx.Clone(q)
 		fullQ.Order = nil
 		fullQ.Window.Offset = 0
@@ -1465,8 +1465,8 @@ func (db *testDB) assertKeysMatchReference(t testing.TB, label string, q *qx.QX,
 		if err != nil {
 			t.Fatalf("reference query(%+v): %v", fullQ, err)
 		}
-		if err := testValidateNoOrderWindow(q, got, full); err != nil {
-			t.Fatalf("%s no-order window mismatch: %v\ngot=%v\nfull=%v", label, err, got, full)
+		if err := testValidateNoOrderPage(q, got, full); err != nil {
+			t.Fatalf("%s no-order page mismatch: %v\ngot=%v\nfull=%v", label, err, got, full)
 		}
 		return
 	}
@@ -1479,7 +1479,7 @@ func (db *testDB) assertKeysMatchReference(t testing.TB, label string, q *qx.QX,
 	}
 }
 
-func testQueryNoOrderWindow(q *qx.QX) bool {
+func testQueryNoOrderPage(q *qx.QX) bool {
 	return q != nil && len(q.Order) == 0 && (q.Window.Offset > 0 || q.Window.Limit > 0)
 }
 
@@ -1494,26 +1494,31 @@ func testValidateNoDuplicateKeys(label string, keys []uint64) error {
 	return nil
 }
 
-func testValidateNoOrderWindow(q *qx.QX, got []uint64, full []uint64) error {
+func testValidateNoOrderPage(q *qx.QX, got []uint64, full []uint64) error {
 	offset := int(q.Window.Offset)
 	if offset > len(full) {
 		offset = len(full)
 	}
-	maxLen := len(full) - offset
-	if q.Window.Limit > 0 && int(q.Window.Limit) < maxLen {
-		maxLen = int(q.Window.Limit)
+	wantLen := len(full) - offset
+	if q.Window.Limit > 0 && int(q.Window.Limit) < wantLen {
+		wantLen = int(q.Window.Limit)
 	}
-	if len(got) > maxLen {
-		return fmt.Errorf("result length %d exceeds max window length %d", len(got), maxLen)
+	if len(got) != wantLen {
+		return fmt.Errorf("result length %d want %d full=%d offset=%d limit=%d", len(got), wantLen, len(full), q.Window.Offset, q.Window.Limit)
 	}
 	fullSet := make(map[uint64]struct{}, len(full))
 	for _, key := range full {
 		fullSet[key] = struct{}{}
 	}
+	seen := make(map[uint64]struct{}, len(got))
 	for _, key := range got {
 		if _, ok := fullSet[key]; !ok {
 			return fmt.Errorf("key %v is outside full result set", key)
 		}
+		if _, ok := seen[key]; ok {
+			return fmt.Errorf("duplicate key %v", key)
+		}
+		seen[key] = struct{}{}
 	}
 	return nil
 }

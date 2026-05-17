@@ -22,10 +22,9 @@ const (
 	plannerOROrderOffsetMax    = 1_000_000
 	plannerORMinOperandCount   = 2
 
-	plannerORNoOrderInitActiveBranches = 2
-	plannerORNoOrderMinBranchBudget    = 64
-	plannerORNoOrderMaxBranchBudget    = 65_536
-	plannerORNoOrderLinearSeenNeedMax  = 8
+	plannerORNoOrderMinBranchBudget   = 64
+	plannerORNoOrderMaxBranchBudget   = 65_536
+	plannerORNoOrderLinearSeenNeedMax = 8
 
 	plannerOROrderFallbackFirstLeadNeedMul = 6
 	plannerOROrderFallbackFirstGain        = 0.95
@@ -728,26 +727,78 @@ func (b plannerORBranch) evalScore() float64 {
 	return float64(est) / float64(checks)
 }
 
-func (b plannerORBranch) noOrderScore() float64 {
+func (b plannerORBranch) noOrderLeadScore(leadIdx, need int) uint64 {
 	if b.alwaysTrue {
 		return 0
 	}
-	leadEst := uint64(1)
-	if b.hasLead() && b.preds.owner[b.leadIdx].estCard > 0 {
-		leadEst = b.preds.owner[b.leadIdx].estCard
+	if leadIdx < 0 || leadIdx >= b.preds.Len() {
+		return 1
 	}
-	extraChecks := 1.0
+	leadEst := b.preds.owner[leadIdx].estCard
+	if leadEst == 0 {
+		leadEst = 1
+	}
+	outEst := leadEst
+	checks := uint64(1)
+	var skip uint64
+	for i := 0; i < b.preds.Len(); i++ {
+		if i == leadIdx {
+			continue
+		}
+		p := b.preds.owner[i]
+		if p.alwaysTrue || p.covered {
+			continue
+		}
+		checks++
+		if p.estCard > 0 && p.estCard < outEst {
+			outEst = p.estCard
+		}
+		if p.hasEffectiveBounds && p.effectiveBounds.HasLo && !p.effectiveBounds.HasHi && p.fieldIndexRangeState != nil {
+			keyCount := p.fieldIndexRangeState.ov.KeyCount()
+			if keyCount > 0 && p.fieldIndexRangeState.br.BaseStart > 0 {
+				skip = satAddUint64(skip, satMulUint64(leadEst, uint64(p.fieldIndexRangeState.br.BaseStart))/uint64(keyCount))
+			}
+		}
+	}
+	scan := uint64(need)
+	if scan == 0 {
+		scan = 1
+	}
+	if outEst < leadEst {
+		scan = satMulUint64(scan, leadEst)
+		scan = satAddUint64(scan, outEst-1) / outEst
+	}
+	if scan > leadEst {
+		scan = leadEst
+	}
+	return satMulUint64(satAddUint64(scan, skip), checks)
+}
+
+func (b plannerORBranch) noOrderLeadIndex(need int) int {
+	best := b.leadIdx
+	bestScore := b.noOrderLeadScore(best, need)
 	for i := 0; i < b.preds.Len(); i++ {
 		if i == b.leadIdx {
 			continue
 		}
 		p := b.preds.owner[i]
-		if p.alwaysTrue {
+		if p.alwaysTrue || p.covered || p.alwaysFalse || !p.hasContains() || !p.hasIter() {
 			continue
 		}
-		extraChecks += 1.0
+		score := b.noOrderLeadScore(i, need)
+		if score < bestScore || (score == bestScore && p.estCard < b.preds.owner[best].estCard) {
+			best = i
+			bestScore = score
+		}
 	}
-	return float64(leadEst) * extraChecks
+	return best
+}
+
+func (b plannerORBranch) noOrderScore(need int) float64 {
+	if b.alwaysTrue {
+		return 0
+	}
+	return float64(b.noOrderLeadScore(b.leadIdx, need))
 }
 
 func (b plannerORBranch) noOrderBudget(need int) uint64 {
@@ -767,9 +818,6 @@ func (b plannerORBranch) noOrderBudget(need int) uint64 {
 	if budget < plannerORNoOrderMinBranchBudget {
 		budget = plannerORNoOrderMinBranchBudget
 	}
-
-	// for small LIMIT queries, probing too deeply in broad branches tends to
-	// waste work before we even establish an initial threshold window
 
 	if need > 0 {
 		perNeedCap := uint64(need) << 6
@@ -1274,15 +1322,15 @@ func (it *plannerORIter) Release() {
 	it.cur = 0
 }
 
-func releasePlannerORNoOrderStateIters(states []plannerORNoOrderBranchState) {
-	for i := range states {
-		states[i].iter.Release()
-	}
-}
-
 func releasePlannerORIters(iters []plannerORIter) {
 	for i := range iters {
 		iters[i].Release()
+	}
+}
+
+func releasePlannerORNoOrderStateIters(states []plannerORNoOrderBranchState) {
+	for i := range states {
+		states[i].iter.Release()
 	}
 }
 
@@ -3055,12 +3103,61 @@ func (qv *View) buildORBranchPredicates(leaves []qir.Expr) (predicateSet, bool) 
 
 	preds := newPredicateSet(len(leaves))
 
+	var mergedRangesBuf []orderedMergedScalarRangeField
+	if len(leaves) > 1 {
+		mergedRangesBuf = orderedMergedScalarRangeFieldSlicePool.Get(len(leaves))
+		var ok bool
+		mergedRangesBuf, ok = qv.collectMergedNumericRangeFields(leaves, mergedRangesBuf)
+		if !ok {
+			preds.Release()
+			orderedMergedScalarRangeFieldSlicePool.Put(mergedRangesBuf)
+			return predicateSet{}, false
+		}
+		defer orderedMergedScalarRangeFieldSlicePool.Put(mergedRangesBuf)
+	}
+
 	forced := pooled.GetIntSlice(len(leaves))
 	defer pooled.ReleaseIntSlice(forced)
 
 	leadIdx := -1
 	leadEst := uint64(0)
-	for _, e := range leaves {
+	for i, e := range leaves {
+		merged := false
+		if qv.isPositiveMergedNumericRangeLeaf(e) && mergedRangesBuf != nil {
+			idx := findOrderedMergedScalarRangeField(mergedRangesBuf, qv.exec.FieldNameByOrdinal(e.FieldOrdinal))
+			if idx >= 0 {
+				group := mergedRangesBuf[idx]
+				if group.count > 1 {
+					if group.first != i {
+						continue
+					}
+					e = group.expr
+					p, ok := qv.buildMergedScalarRangePredicateWithColdMode(group.expr, group.bounds, true, qv.shouldBuildORBranchLeafLazy(group.expr, len(leaves)))
+					if !ok {
+						preds.Release()
+						return predicateSet{}, false
+					}
+					preds.Append(p)
+					pi := len(preds.owner) - 1
+					if qv.shouldForceORBranchNumericRangeMaterialize(group.expr) && p.hasRuntimeRangeState() {
+						forced = append(forced, pi)
+						continue
+					}
+					if p.alwaysTrue || p.covered || p.alwaysFalse || !p.hasContains() || !p.hasIter() {
+						continue
+					}
+					if leadIdx == -1 || p.estCard < leadEst {
+						leadIdx = pi
+						leadEst = p.estCard
+					}
+					merged = true
+				}
+			}
+		}
+		if merged {
+			continue
+		}
+
 		forceMaterialize := qv.shouldForceORBranchNumericRangeMaterialize(e)
 		p, ok := qv.buildPredicateWithColdMode(e, true, qv.shouldBuildORBranchLeafLazy(e, len(leaves)))
 		if !ok {
@@ -5389,19 +5486,6 @@ func (qv *View) uniqueLeadBranchCardinality(branch plannerORBranch) (uint64, boo
 	return cnt, ok
 }
 
-type plannerORNoOrderBranchState struct {
-	index int
-
-	score  float64
-	budget uint64
-
-	initialized bool
-	capped      bool
-	exhausted   bool
-
-	iter plannerORIter
-}
-
 type plannerORNoOrderMode uint8
 
 const (
@@ -5422,6 +5506,19 @@ func plannerORNoOrderClassify(branches plannerORBranches) plannerORNoOrderMode {
 		}
 	}
 	return plannerORNoOrderModeRun
+}
+
+type plannerORNoOrderBranchState struct {
+	index int
+
+	score  float64
+	budget uint64
+
+	initialized bool
+	capped      bool
+	exhausted   bool
+
+	iter plannerORIter
 }
 
 func plannerORNoOrderSortBranchOrder(order []int, states []plannerORNoOrderBranchState) {
@@ -5451,11 +5548,69 @@ func plannerORNoOrderNextBudget(cur uint64) uint64 {
 	return n
 }
 
+func plannerORPredicateExactLeadPosting(p *predicate) (posting.List, bool) {
+	if p == nil || p.expr.Not || p.leadIterNeedsContainsCheck() {
+		return posting.List{}, false
+	}
+	if p.rangeMat {
+		return p.ids, true
+	}
+	switch p.kind {
+	case predicateKindPosting:
+		return p.posting, true
+	case predicateKindMaterialized:
+		return p.ids, true
+	case predicateKindPostsAny, predicateKindPostsAll:
+		if len(p.postsBuf) == 1 {
+			return p.postsBuf[0], true
+		}
+	}
+	return posting.List{}, false
+}
+
+func plannerORBranchExactLeadPostingEmpty(branch *plannerORBranch) bool {
+	if branch == nil || !branch.hasLead() {
+		return false
+	}
+	leadIDs, ok := plannerORPredicateExactLeadPosting(branch.leadPtr())
+	if !ok {
+		return false
+	}
+	if leadIDs.IsEmpty() {
+		return true
+	}
+	for i := 0; i < branch.preds.Len(); i++ {
+		if i == branch.leadIdx {
+			continue
+		}
+		p := branch.preds.owner[i]
+		if p.covered || p.alwaysTrue {
+			continue
+		}
+		if p.alwaysFalse {
+			return true
+		}
+		cnt, ok := p.countBucket(leadIDs)
+		if !ok {
+			return false
+		}
+		if cnt == 0 {
+			return true
+		}
+	}
+	return false
+}
+
 func plannerORNoOrderProbeBranch(st *plannerORNoOrderBranchState) (uint64, uint64) {
 	if st.exhausted || st.iter.has {
 		return 0, 0
 	}
 	st.initialized = true
+	if plannerORBranchExactLeadPostingEmpty(st.iter.branch) {
+		st.capped = false
+		st.exhausted = true
+		return 0, 0
+	}
 	examinedDelta, emittedDelta, budgetHit := st.iter.advanceWithBudget(st.budget)
 	if st.iter.has {
 		st.capped = false
@@ -5490,103 +5645,6 @@ func plannerORNoOrderConsumeBranch(st *plannerORNoOrderBranchState) (uint64, uin
 	return examinedDelta, emittedDelta
 }
 
-func plannerORNoOrderFindReadyMin(states []plannerORNoOrderBranchState, maxInclusive uint64, useMax bool) *plannerORNoOrderBranchState {
-	var best *plannerORNoOrderBranchState
-	for i := range states {
-		st := &states[i]
-		if !st.iter.has {
-			continue
-		}
-		if useMax && st.iter.cur > maxInclusive {
-			continue
-		}
-		if best == nil || st.iter.cur < best.iter.cur {
-			best = st
-		}
-	}
-	return best
-}
-
-func plannerORNoOrderFindNextUninitialized(order []int, states []plannerORNoOrderBranchState) *plannerORNoOrderBranchState {
-	for _, idx := range order {
-		st := &states[idx]
-		if st.initialized || st.exhausted {
-			continue
-		}
-		return st
-	}
-	return nil
-}
-
-func plannerORNoOrderFindNextCapped(order []int, states []plannerORNoOrderBranchState) *plannerORNoOrderBranchState {
-	for _, idx := range order {
-		st := &states[idx]
-		if st.exhausted || !st.capped || st.iter.has {
-			continue
-		}
-		return st
-	}
-	return nil
-}
-
-func plannerORNoOrderInsertTopN(top []uint64, idx uint64, n int) []uint64 {
-	if n <= 0 {
-		return top
-	}
-	lo, hi := 0, len(top)
-	for lo < hi {
-		mid := lo + (hi-lo)/2
-		if top[mid] < idx {
-			lo = mid + 1
-			continue
-		}
-		hi = mid
-	}
-	pos := lo
-
-	if len(top) < n {
-		top = append(top, 0)
-		copy(top[pos+1:], top[pos:len(top)-1])
-		top[pos] = idx
-		return top
-	}
-	if pos >= len(top) {
-		return top
-	}
-
-	copy(top[pos+1:], top[pos:len(top)-1])
-	top[pos] = idx
-	return top
-}
-
-func plannerORNoOrderAddCandidate(top []uint64, idx uint64, need int, useLinearSeen bool, seen *u64set, trace *Trace) []uint64 {
-
-	// Threshold prune prevents growing a candidate set that can no longer
-	// improve top-N; it is key for large OR unions with small LIMIT.
-
-	if len(top) == need && idx > top[len(top)-1] {
-		return top
-	}
-
-	if useLinearSeen {
-		for i := 0; i < len(top); i++ {
-			if top[i] == idx {
-				if trace != nil {
-					trace.AddDedupe(1)
-				}
-				return top
-			}
-		}
-	} else if !seen.Add(idx) {
-		if trace != nil {
-			trace.AddDedupe(1)
-		}
-		return top
-	}
-
-	return plannerORNoOrderInsertTopN(top, idx, need)
-}
-
 func (qv *View) execPlanORNoOrder(q *qir.Shape, branches plannerORBranches, trace *Trace) ([]uint64, bool) {
 	switch plannerORNoOrderClassify(branches) {
 	case plannerORNoOrderModeUniverse:
@@ -5594,7 +5652,6 @@ func (qv *View) execPlanORNoOrder(q *qir.Shape, branches plannerORBranches, trac
 	case plannerORNoOrderModeUnsupported:
 		return nil, false
 	}
-
 	if q.Offset == 0 && branches.Len() >= 3 {
 		if out, ok := qv.execPlanORNoOrderAdaptiveCore(q, branches, trace); ok {
 			return out, true
@@ -5603,9 +5660,6 @@ func (qv *View) execPlanORNoOrder(q *qir.Shape, branches plannerORBranches, trac
 	return qv.execPlanORNoOrderBaselineCore(q, branches, trace)
 }
 
-// execPlanORNoOrderAdaptive collects top-N ids for no-order OR via adaptive per-branch probing.
-//
-// It starts with cheap branches and increases probe budgets only when needed to prove top-N completeness.
 func (qv *View) execPlanORNoOrderAdaptive(q *qir.Shape, branches plannerORBranches, trace *Trace) ([]uint64, bool) {
 	switch plannerORNoOrderClassify(branches) {
 	case plannerORNoOrderModeUniverse:
@@ -5650,16 +5704,17 @@ func (qv *View) execPlanORNoOrderAdaptiveCore(q *qir.Shape, branches plannerORBr
 	var orderInline [plannerORBranchLimit]int
 	order := orderInline[:branches.Len()]
 	for i := 0; i < branches.Len(); i++ {
-		branch := branches.owner[i]
+		branch := &branches.owner[i]
+		branch.leadIdx = branch.noOrderLeadIndex(need)
 		state := &states[i]
 		state.index = i
-		state.score = branch.noOrderScore()
+		state.score = branch.noOrderScore(need)
 		state.budget = branch.noOrderBudget(need)
 		order[i] = i
 		lead := branch.leadPtr()
 		state.iter = plannerORIter{
 			it:     lead.newIter(),
-			branch: &branches.owner[i],
+			branch: branch,
 		}
 	}
 	defer releasePlannerORNoOrderStateIters(states)
@@ -5672,128 +5727,89 @@ func (qv *View) execPlanORNoOrderAdaptiveCore(q *qir.Shape, branches plannerORBr
 		seen = getU64Set(max(64, need*2))
 		defer releaseU64Set(&seen)
 	}
-	topBuf := pooled.GetUint64Slice(need)
-	defer func() { pooled.ReleaseUint64Slice(topBuf) }()
 
-	initialActive := plannerORNoOrderInitActiveBranches
-	if initialActive > len(order) {
-		initialActive = len(order)
-	}
-
-	for i := 0; i < initialActive; i++ {
-		st := &states[order[i]]
-		examinedDelta, emittedDelta := plannerORNoOrderProbeBranch(st)
-		examined += examinedDelta
-		if fullTrace {
-			branchMetrics[st.index].RowsExamined += examinedDelta
-			branchMetrics[st.index].RowsEmitted += emittedDelta
-		}
-	}
-
-	// Phase 1: gather enough unique candidates from cheap-first branches.
-	for len(topBuf) < need {
-		st := plannerORNoOrderFindReadyMin(states, 0, false)
-		if st != nil {
-			topBuf = plannerORNoOrderAddCandidate(topBuf, st.iter.cur, need, useLinearSeen, &seen, trace)
-			examinedDelta, emittedDelta := plannerORNoOrderConsumeBranch(st)
-			examined += examinedDelta
-			if fullTrace {
-				branchMetrics[st.index].RowsExamined += examinedDelta
-				branchMetrics[st.index].RowsEmitted += emittedDelta
-			}
-			continue
-		}
-
-		if st = plannerORNoOrderFindNextUninitialized(order, states); st != nil {
-			examinedDelta, emittedDelta := plannerORNoOrderProbeBranch(st)
-			examined += examinedDelta
-			if fullTrace {
-				branchMetrics[st.index].RowsExamined += examinedDelta
-				branchMetrics[st.index].RowsEmitted += emittedDelta
-			}
-			continue
-		}
-		if st = plannerORNoOrderFindNextCapped(order, states); st != nil {
-			examinedDelta, emittedDelta := plannerORNoOrderProbeBranch(st)
-			examined += examinedDelta
-			if fullTrace {
-				branchMetrics[st.index].RowsExamined += examinedDelta
-				branchMetrics[st.index].RowsEmitted += emittedDelta
-			}
-			continue
-		}
-		break
-	}
-
+	out := make([]uint64, 0, need)
 	earlyStopReason := "input_exhausted"
 
-	// Phase 2: if LIMIT is already filled, prove all unseen branches cannot
-	// contribute ids <= current threshold.
-	for len(topBuf) == need {
-		threshold := topBuf[len(topBuf)-1]
-
-		st := plannerORNoOrderFindReadyMin(states, threshold, true)
-		if st != nil {
-			topBuf = plannerORNoOrderAddCandidate(topBuf, st.iter.cur, need, useLinearSeen, &seen, trace)
-			examinedDelta, emittedDelta := plannerORNoOrderConsumeBranch(st)
-			examined += examinedDelta
-			if fullTrace {
-				branchMetrics[st.index].RowsExamined += examinedDelta
-				branchMetrics[st.index].RowsEmitted += emittedDelta
+	for len(out) < need {
+		progress := false
+		for _, idx := range order {
+			st := &states[idx]
+			if st.exhausted {
+				continue
 			}
-			continue
-		}
+			for len(out) < need && !st.exhausted {
+				if !st.iter.has {
+					examinedDelta, emittedDelta := plannerORNoOrderProbeBranch(st)
+					examined += examinedDelta
+					if fullTrace {
+						branchMetrics[st.index].RowsExamined += examinedDelta
+						branchMetrics[st.index].RowsEmitted += emittedDelta
+					}
+					if examinedDelta != 0 || emittedDelta != 0 || st.exhausted {
+						progress = true
+					}
+					if !st.iter.has {
+						break
+					}
+				}
 
-		if st = plannerORNoOrderFindNextUninitialized(order, states); st != nil {
-			examinedDelta, emittedDelta := plannerORNoOrderProbeBranch(st)
-			examined += examinedDelta
-			if fullTrace {
-				branchMetrics[st.index].RowsExamined += examinedDelta
-				branchMetrics[st.index].RowsEmitted += emittedDelta
-			}
-			continue
-		}
-		if st = plannerORNoOrderFindNextCapped(order, states); st != nil {
-			examinedDelta, emittedDelta := plannerORNoOrderProbeBranch(st)
-			examined += examinedDelta
-			if fullTrace {
-				branchMetrics[st.index].RowsExamined += examinedDelta
-				branchMetrics[st.index].RowsEmitted += emittedDelta
-			}
-			continue
-		}
+				idx := st.iter.cur
+				if useLinearSeen {
+					dup := false
+					for i := 0; i < len(out); i++ {
+						if out[i] == idx {
+							dup = true
+							break
+						}
+					}
+					if dup {
+						if trace != nil {
+							trace.AddDedupe(1)
+						}
+					} else {
+						out = append(out, idx)
+					}
+				} else if seen.Add(idx) {
+					out = append(out, idx)
+				} else if trace != nil {
+					trace.AddDedupe(1)
+				}
 
-		earlyStopReason = "limit_reached"
-		break
+				progress = true
+				if len(out) == need {
+					earlyStopReason = "limit_reached"
+					break
+				}
+				examinedDelta, emittedDelta := plannerORNoOrderConsumeBranch(st)
+				examined += examinedDelta
+				if fullTrace {
+					branchMetrics[st.index].RowsExamined += examinedDelta
+					branchMetrics[st.index].RowsEmitted += emittedDelta
+				}
+				if st.capped {
+					break
+				}
+			}
+			if len(out) == need {
+				break
+			}
+		}
+		if len(out) == need || !progress {
+			break
+		}
 	}
 
 	if trace != nil {
 		trace.AddExamined(examined)
-
-		if fullTrace && len(topBuf) == need {
-			threshold := topBuf[len(topBuf)-1]
-			for i := range states {
-				st := &states[i]
-				if st.exhausted {
-					continue
-				}
-				if st.iter.has && st.iter.cur > threshold {
-					branchMetrics[i].Skipped = true
-					branchMetrics[i].SkipReason = "threshold_pruned"
-				}
-			}
-		}
-
 		trace.SetORBranches(branchMetrics)
 		trace.SetEarlyStopReason(earlyStopReason)
 	}
 
-	if len(topBuf) == 0 {
+	if len(out) == 0 {
 		return nil, true
 	}
 
-	out := make([]uint64, len(topBuf))
-	copy(out, topBuf)
 	return out, true
 }
 
