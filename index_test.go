@@ -1842,11 +1842,9 @@ func TestPointerNil_ExecPlanOrderedBasic_BaseNilTail(t *testing.T) {
 	assertSameSlice(t, got, want)
 }
 
-func TestPointerNil_TryPlanOrdered_AllowsPointerSortField(t *testing.T) {
+func TestPointerNil_QueryKeys_AllowsPointerSortFieldAfterPatch(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
-		AnalyzeInterval:        -1,
-		CalibrationEnabled:     true,
-		CalibrationSampleEvery: -1,
+		AnalyzeInterval: -1,
 	})
 
 	rows := map[uint64]*Rec{
@@ -1869,20 +1867,6 @@ func TestPointerNil_TryPlanOrdered_AllowsPointerSortField(t *testing.T) {
 	}
 	if err := db.Patch(2, []Field{{Name: "opt", Value: (*string)(nil)}}); err != nil {
 		t.Fatalf("Patch(2 opt=nil): %v", err)
-	}
-
-	if err := db.SetCalibrationSnapshot(CalibrationSnapshot{
-		UpdatedAt: time.Now(),
-		Multipliers: map[string]float64{
-			string(PlanOrdered):         0.01,
-			string(PlanLimitOrderBasic): 100,
-		},
-		Samples: map[string]uint64{
-			string(PlanOrdered):         1,
-			string(PlanLimitOrderBasic): 1,
-		},
-	}); err != nil {
-		t.Fatalf("SetCalibrationSnapshot: %v", err)
 	}
 
 	q := normalizeQueryForTest(qx.Query(

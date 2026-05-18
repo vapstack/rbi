@@ -7,61 +7,49 @@ import (
 )
 
 type Trace struct {
-	sink       func(TraceEvent)
-	calibrator *Calibrator
-	start      time.Time
-	ev         TraceEvent
+	sink  func(TraceEvent)
+	start time.Time
+	ev    TraceEvent
 }
 
-func (r *Runtime) TraceOrCalibrationSamplingEnabled() bool {
-	if r.Tracer.Enabled() {
-		return true
-	}
-	return r.Calibrator.SamplingEnabled()
+func (r *Runtime) TraceSamplingEnabled() bool {
+	return r.Tracer.Enabled()
 }
 
 func (r *Runtime) BeginTrace(q qir.Shape, orderField string) *Trace {
 	sink := r.Tracer.SampleSink()
-	emitTrace := sink != nil
-	emitCalibration := r.Calibrator.TakeSample()
-
-	if !emitTrace && !emitCalibration {
+	if sink == nil {
 		return nil
 	}
 
 	tr := new(Trace)
-	if emitTrace {
-		tr.ev = TraceEvent{
-			Timestamp: time.Now(),
-			Offset:    q.Offset,
-			Limit:     q.Limit,
-		}
-		if q.HasOrder {
-			tr.ev.HasOrder = true
-			tr.ev.OrderField = orderField
-			tr.ev.OrderDesc = q.Order.Desc
-		}
+	tr.ev = TraceEvent{
+		Timestamp: time.Now(),
+		Offset:    q.Offset,
+		Limit:     q.Limit,
+	}
+	if q.HasOrder {
+		tr.ev.HasOrder = true
+		tr.ev.OrderField = orderField
+		tr.ev.OrderDesc = q.Order.Desc
+	}
 
-		var leavesBuf [8]qir.Expr
-		leaves, ok := qir.CollectAndLeavesScratch(q.Expr, leavesBuf[:0], qir.LeafModeCollect)
-		if ok {
-			tr.ev.LeafCount = len(leaves)
-			for _, expr := range leaves {
-				if expr.Not {
-					tr.ev.HasNeg = true
-				}
-				if expr.Op == qir.OpPREFIX {
-					tr.ev.HasPrefix = true
-				}
+	var leavesBuf [8]qir.Expr
+	leaves, ok := qir.CollectAndLeavesScratch(q.Expr, leavesBuf[:0], qir.LeafModeCollect)
+	if ok {
+		tr.ev.LeafCount = len(leaves)
+		for _, expr := range leaves {
+			if expr.Not {
+				tr.ev.HasNeg = true
+			}
+			if expr.Op == qir.OpPREFIX {
+				tr.ev.HasPrefix = true
 			}
 		}
+	}
 
-		tr.start = tr.ev.Timestamp
-		tr.sink = sink
-	}
-	if emitCalibration {
-		tr.calibrator = r.Calibrator
-	}
+	tr.start = tr.ev.Timestamp
+	tr.sink = sink
 	return tr
 }
 
@@ -253,9 +241,6 @@ func (t *Trace) Finish(rowsReturned uint64, err error) {
 	}
 	if t.Full() && err != nil {
 		t.ev.Error = err.Error()
-	}
-	if t.calibrator != nil {
-		t.calibrator.Observe(t.ev)
 	}
 	if t.sink != nil {
 		t.sink(t.ev)

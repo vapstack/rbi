@@ -212,7 +212,7 @@ func qexecBenchRunScaleSelectivities(b *testing.B, fn func(*testing.B, *testDB, 
 
 func newQexecBenchDBWithOptionsAndRows(b *testing.B, opts testOptions, rows int) *testDB {
 	b.Helper()
-	if opts.TraceSink != nil || opts.CalibrationEnabled {
+	if opts.TraceSink != nil {
 		return buildQexecBenchDBWithOptionsAndRows(b, opts, rows)
 	}
 
@@ -306,8 +306,6 @@ func qexecBenchPublicOptions(opts testOptions) Options {
 		NumericRangeBucketMinSpanKeys:               opts.NumericRangeBucketMinSpanKeys,
 		TraceSink:                                   opts.TraceSink,
 		TraceSampleEvery:                            opts.TraceSampleEvery,
-		CalibrationEnabled:                          opts.CalibrationEnabled,
-		CalibrationSampleEvery:                      opts.CalibrationSampleEvery,
 	}
 }
 
@@ -904,36 +902,7 @@ func BenchmarkQueryPreparedShapeOrderBoundMissingResidual(b *testing.B) {
 	}
 }
 
-func benchmarkPreparedQueryShapeCalibration(b *testing.B, db *testDB, q *qx.QX) {
-	b.Helper()
-
-	prepared, shape, err := db.prepareQuery(q)
-	if err != nil {
-		b.Fatalf("prepareQuery: %v", err)
-	}
-	defer prepared.Release()
-
-	db.clearCurrentSnapshotCaches()
-	view := db.view()
-	out, err := view.Query(&shape, true, false)
-	if err != nil {
-		b.Fatalf("Query warmup: %v", err)
-	}
-	qexecBenchIDs = out
-
-	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		out, err = view.Query(&shape, true, false)
-		if err != nil {
-			b.Fatalf("Query: %v", err)
-		}
-		qexecBenchIDs = out
-	}
-	b.ReportMetric(float64(len(qexecBenchIDs)), "rows/op")
-}
-
-func BenchmarkPlannerStatsAndCalibration(b *testing.B) {
+func BenchmarkPlannerStats(b *testing.B) {
 	qexecBenchRunScales(b, func(b *testing.B, db *testDB, _ qexecBenchScale) {
 		b.Run("BuildPlannerStatsSnapshot", func(b *testing.B) {
 			var out *PlannerStatsSnapshot
@@ -1003,121 +972,6 @@ func BenchmarkPlannerStatsAndCalibration(b *testing.B) {
 		qexecBenchCount = stats.TotalBucketCard
 	})
 
-	b.Run("Rows100K/CalibrationObserve", func(b *testing.B) {
-		cal := NewCalibrator(true, 1, "")
-		cal.Init()
-		ev := TraceEvent{
-			Plan:          string(PlanOrdered),
-			EstimatedRows: 128,
-			RowsExamined:  256,
-		}
-		b.ReportAllocs()
-		b.ResetTimer()
-		for i := 0; i < b.N; i++ {
-			cal.Observe(ev)
-		}
-		snap, _ := cal.Snapshot()
-		qexecBenchCount = snap.Samples[string(PlanOrdered)]
-	})
-
-	b.Run("Rows100K/CalibrationSnapshot", func(b *testing.B) {
-		cal := NewCalibrator(true, 1, "")
-		cal.Init()
-		cal.Observe(TraceEvent{Plan: string(PlanOrdered), EstimatedRows: 128, RowsExamined: 256})
-		var snap CalibrationSnapshot
-		b.ReportAllocs()
-		b.ResetTimer()
-		for i := 0; i < b.N; i++ {
-			snap, _ = cal.Snapshot()
-			qexecBenchCount = snap.Samples[string(PlanOrdered)]
-		}
-	})
-
-	b.Run("Rows100K/CalibrationSetSnapshot", func(b *testing.B) {
-		cal := NewCalibrator(true, 1, "")
-		snap := CalibrationSnapshot{
-			UpdatedAt: time.Now(),
-			Multipliers: map[string]float64{
-				string(PlanORMergeNoOrder):     1.65,
-				string(PlanORMergeOrderMerge):  1.20,
-				string(PlanORMergeOrderStream): 1.05,
-				string(PlanOrdered):            0.88,
-			},
-			Samples: map[string]uint64{
-				string(PlanORMergeNoOrder):     10,
-				string(PlanORMergeOrderMerge):  7,
-				string(PlanORMergeOrderStream): 5,
-				string(PlanOrdered):            3,
-			},
-		}
-		b.ReportAllocs()
-		b.ResetTimer()
-		for i := 0; i < b.N; i++ {
-			if err := cal.SetSnapshot(snap); err != nil {
-				b.Fatalf("SetSnapshot: %v", err)
-			}
-		}
-		out, _ := cal.Snapshot()
-		qexecBenchCount = out.Samples[string(PlanOrdered)]
-	})
-
-	b.Run("Rows100K/CalibrationSaveLoad", func(b *testing.B) {
-		db, raw := openBoltAndNew[uint64, testRec](b, filepath.Join(b.TempDir(), "qexec_bench_calibration.db"), Options{
-			AnalyzeInterval:    -1,
-			CalibrationEnabled: true,
-		})
-		b.Cleanup(func() {
-			_ = db.Close()
-			_ = raw.Close()
-		})
-		if err := db.SetCalibrationSnapshot(CalibrationSnapshot{
-			UpdatedAt: time.Now(),
-			Multipliers: map[string]float64{
-				string(PlanORMergeNoOrder):     1.65,
-				string(PlanORMergeOrderMerge):  1.20,
-				string(PlanORMergeOrderStream): 1.05,
-				string(PlanOrdered):            0.88,
-			},
-			Samples: map[string]uint64{
-				string(PlanORMergeNoOrder):     10,
-				string(PlanORMergeOrderMerge):  7,
-				string(PlanORMergeOrderStream): 5,
-				string(PlanOrdered):            3,
-			},
-		}); err != nil {
-			b.Fatalf("SetCalibrationSnapshot: %v", err)
-		}
-		path := filepath.Join(b.TempDir(), "planner_calibration.json")
-		if err := db.SaveCalibration(path); err != nil {
-			b.Fatalf("SaveCalibration warmup: %v", err)
-		}
-		b.ReportAllocs()
-		b.ResetTimer()
-		for i := 0; i < b.N; i++ {
-			if err := db.SaveCalibration(path); err != nil {
-				b.Fatalf("SaveCalibration: %v", err)
-			}
-			if err := db.LoadCalibration(path); err != nil {
-				b.Fatalf("LoadCalibration: %v", err)
-			}
-		}
-		snap, _ := db.GetCalibrationSnapshot()
-		qexecBenchCount = snap.Samples[string(PlanOrdered)]
-	})
-
-	b.Run("Rows100K/CalibrationOnlyQuery", func(b *testing.B) {
-		opts := qexecBenchOptions()
-		opts.CalibrationEnabled = true
-		opts.CalibrationSampleEvery = 1
-		db := newQexecBenchDBWithOptionsAndRows(b, opts, qexecBenchRows)
-		q := qx.Query(
-			qx.OR(
-				qx.EQ("active", true),
-				qx.EQ("name", "alice"),
-			),
-		).Limit(120)
-		benchmarkPreparedQueryShapeCalibration(b, db, q)
-	})
 }
 
 func benchmarkPreparedCardinality(b *testing.B, db *testDB, expr qx.Expr) {

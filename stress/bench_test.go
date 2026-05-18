@@ -180,23 +180,6 @@ var focusedReadBenchCases = []focusedReadBenchCase{
 	},
 }
 
-type focusedRoutingMode struct {
-	name        string
-	multipliers map[string]float64
-}
-
-var focusedRoutingModes = []focusedRoutingMode{
-	{name: "default"},
-	{
-		name: "ordered_bias",
-		multipliers: map[string]float64{
-			string(rbi.PlanOrdered):          0.4,
-			string(rbi.PlanLimitOrderBasic):  4.0,
-			string(rbi.PlanLimitOrderPrefix): 4.0,
-		},
-	},
-}
-
 var focusedRoutingQueryNames = []string{
 	"read_active_region_pro_items",
 	"read_leaderboard_top_items",
@@ -220,12 +203,9 @@ func BenchmarkStressFocusedReadRoutingTrace(b *testing.B) {
 			b.Fatalf("missing focused bench case %q", queryName)
 		}
 		benchCaseCopy := benchCase
-		for _, mode := range focusedRoutingModes {
-			mode := mode
-			b.Run(queryName+"/"+mode.name, func(b *testing.B) {
-				runFocusedReadRoutingCase(b, benchCaseCopy, mode)
-			})
-		}
+		b.Run(queryName, func(b *testing.B) {
+			runFocusedReadRoutingCase(b, benchCaseCopy)
+		})
 	}
 }
 
@@ -262,7 +242,7 @@ func focusedReadBenchCaseByName(name string) (focusedReadBenchCase, bool) {
 	return focusedReadBenchCase{}, false
 }
 
-func runFocusedReadRoutingCase(b *testing.B, benchCase focusedReadBenchCase, mode focusedRoutingMode) {
+func runFocusedReadRoutingCase(b *testing.B, benchCase focusedReadBenchCase) {
 	catalog, _, byName, err := loadClassCatalog()
 	if err != nil {
 		b.Fatalf("load stress catalog: %v", err)
@@ -274,7 +254,6 @@ func runFocusedReadRoutingCase(b *testing.B, benchCase focusedReadBenchCase, mod
 	}
 
 	handle, collector, epoch := openFocusedBenchHandle(b, true)
-	applyFocusedCalibration(b, handle.DB, mode)
 	now := time.Now().Unix()
 	warmFocusedReadBenchmarkCase(b, handle, desc, benchCase, now, true)
 
@@ -287,34 +266,9 @@ func runFocusedReadRoutingCase(b *testing.B, benchCase focusedReadBenchCase, mod
 	if epoch != nil {
 		report := epoch.snapshot().queryReport(desc.Info.Name, benchCase.name)
 		if report != nil {
-			b.Logf("routing_mode=%s plan_counts=%v", mode.name, report.PlanCounts)
+			b.Logf("plan_counts=%v", report.PlanCounts)
 		}
 		reportFocusedReadTraceMetrics(b, report)
-	}
-}
-
-func applyFocusedCalibration(b *testing.B, db *rbi.DB[uint64, UserBench], mode focusedRoutingMode) {
-	b.Helper()
-
-	snap := rbi.CalibrationSnapshot{
-		UpdatedAt:   time.Now(),
-		Multipliers: map[string]float64{},
-		Samples:     map[string]uint64{},
-	}
-	for _, name := range []string{
-		string(rbi.PlanOrdered),
-		string(rbi.PlanLimitOrderBasic),
-		string(rbi.PlanLimitOrderPrefix),
-	} {
-		snap.Multipliers[name] = 1.0
-		snap.Samples[name] = 1
-	}
-	for name, value := range mode.multipliers {
-		snap.Multipliers[name] = value
-		snap.Samples[name] = 1
-	}
-	if err := db.SetCalibrationSnapshot(snap); err != nil {
-		b.Fatalf("SetCalibrationSnapshot(%s): %v", mode.name, err)
 	}
 }
 
@@ -340,10 +294,8 @@ func openFocusedBenchHandle(b *testing.B, withTrace bool) (*DBHandle, *plannerTr
 	var collector *plannerTraceCollector
 	var epoch *plannerTraceEpoch
 	cfg := DBConfig{
-		DBFile:           focusedBenchDBPath(b),
-		AnalyzeInterval:  -1,
-		CalibrationOn:    true,
-		CalibrationEvery: -1,
+		DBFile:          focusedBenchDBPath(b),
+		AnalyzeInterval: -1,
 	}
 	if withTrace {
 		collector = newPlannerTraceCollector(nil, 1, 8)

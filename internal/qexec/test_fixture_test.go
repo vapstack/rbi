@@ -1,11 +1,9 @@
 package qexec
 
 import (
-	"encoding/json"
 	"fmt"
 	"math"
 	"math/rand/v2"
-	"os"
 	"path/filepath"
 	"reflect"
 	"slices"
@@ -34,17 +32,11 @@ const (
 	nilIndexEntryKey           = indexdata.NilIndexEntryKey
 )
 
-const defaultOptionsCalibrationSampleEvery = DefaultCalibrationSampleEvery
-
 type Options struct {
 	AnalyzeInterval time.Duration
 
 	TraceSink        func(TraceEvent)
 	TraceSampleEvery int
-
-	CalibrationEnabled     bool
-	CalibrationSampleEvery int
-	PersistCalibration     bool
 
 	SnapshotMaterializedPredCacheMaxEntries     int
 	SnapshotMaterializedPredCacheMaxCardinality int
@@ -89,9 +81,6 @@ type PtrIntRec struct {
 type testOptions struct {
 	TraceSink        func(TraceEvent)
 	TraceSampleEvery int
-
-	CalibrationEnabled     bool
-	CalibrationSampleEvery int
 
 	NumericRangeBucketSize         int
 	NumericRangeBucketMinFieldKeys int
@@ -179,10 +168,6 @@ func newFixtureDB[K ~string | ~uint64, V any](tb testing.TB, path string, option
 		tb.Fatalf("schema.Compile: %v", err)
 	}
 
-	persistPath := ""
-	if options.PersistCalibration {
-		persistPath = path + ".cal"
-	}
 	exec := NewRuntime(Config{
 		Schema:                         rt,
 		AnalyzeInterval:                options.AnalyzeInterval,
@@ -191,11 +176,7 @@ func newFixtureDB[K ~string | ~uint64, V any](tb testing.TB, path string, option
 		NumericRangeBucketMinSpanKeys:  options.NumericRangeBucketMinSpanKeys,
 		TraceSink:                      options.TraceSink,
 		TraceSampleEvery:               options.TraceSampleEvery,
-		CalibrationEnabled:             options.CalibrationEnabled,
-		CalibrationSampleEvery:         options.CalibrationSampleEvery,
-		CalibrationPersistPath:         persistPath,
 	})
-	exec.Calibrator.Init()
 
 	qe := &queryEngine{
 		snapshot: snapshot.NewManager(false),
@@ -212,18 +193,12 @@ func newFixtureDB[K ~string | ~uint64, V any](tb testing.TB, path string, option
 		values:  make(map[uint64]*V),
 		path:    path,
 	}
-	if persistPath != "" {
-		_ = db.LoadCalibration(persistPath)
-	}
 	return db
 }
 
 func (o *Options) setDefaults() {
 	if o.TraceSink != nil && o.TraceSampleEvery == 0 {
 		o.TraceSampleEvery = 1
-	}
-	if o.CalibrationSampleEvery == 0 {
-		o.CalibrationSampleEvery = defaultOptionsCalibrationSampleEvery
 	}
 	if o.SnapshotMaterializedPredCacheMaxEntries == 0 {
 		o.SnapshotMaterializedPredCacheMaxEntries = testMatPredCacheMaxEntries
@@ -373,54 +348,7 @@ func (db *DB[K, V]) Close() error {
 		return nil
 	}
 	db.closed = true
-	path := db.engine.exec.Calibrator.PersistPath()
-	if path == "" || !db.engine.exec.Calibrator.HasState() {
-		return nil
-	}
-	return db.saveCalibration(path)
-}
-
-func (db *DB[K, V]) GetCalibrationSnapshot() (CalibrationSnapshot, bool) {
-	return db.engine.exec.Calibrator.Snapshot()
-}
-
-func (db *DB[K, V]) SetCalibrationSnapshot(s CalibrationSnapshot) error {
-	return db.engine.exec.Calibrator.SetSnapshot(s)
-}
-
-func (db *DB[K, V]) SaveCalibration(path string) error {
-	return db.saveCalibration(path)
-}
-
-func (db *DB[K, V]) saveCalibration(path string) error {
-	if path == "" {
-		return fmt.Errorf("planner calibration path is empty")
-	}
-	snap, ok := db.GetCalibrationSnapshot()
-	if !ok {
-		snap = db.engine.exec.Calibrator.SnapshotOrNew()
-	}
-	raw, err := json.MarshalIndent(snap, "", "  ")
-	if err != nil {
-		return err
-	}
-	raw = append(raw, '\n')
-	return os.WriteFile(path, raw, 0o644)
-}
-
-func (db *DB[K, V]) LoadCalibration(path string) error {
-	if path == "" {
-		return fmt.Errorf("planner calibration path is empty")
-	}
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		return err
-	}
-	var snap CalibrationSnapshot
-	if err = json.Unmarshal(raw, &snap); err != nil {
-		return err
-	}
-	return db.SetCalibrationSnapshot(snap)
+	return nil
 }
 
 func (db *DB[K, V]) publish(entries []snapshot.BatchEntry) {
@@ -677,10 +605,7 @@ func newTestDB(t testing.TB, opts testOptions) *testDB {
 		NumericRangeBucketMinSpanKeys:  opts.NumericRangeBucketMinSpanKeys,
 		TraceSink:                      opts.TraceSink,
 		TraceSampleEvery:               opts.TraceSampleEvery,
-		CalibrationEnabled:             opts.CalibrationEnabled,
-		CalibrationSampleEvery:         opts.CalibrationSampleEvery,
 	})
-	exec.Calibrator.Init()
 
 	return &testDB{
 		rt:   rt,
@@ -1434,13 +1359,6 @@ func (db *testDB) decidePlanORNoOrder(q *qx.QX, branches plannerORBranches) plan
 	return db.view().decidePlanORNoOrder(&viewQ, branches)
 }
 
-func (db *testDB) setCalibrationSnapshot(t testing.TB, snap CalibrationSnapshot) {
-	t.Helper()
-	if err := db.exec.Calibrator.SetSnapshot(snap); err != nil {
-		t.Fatalf("SetSnapshot: %v", err)
-	}
-}
-
 func (db *testDB) setPlannerStatsSnapshot(universe uint64, scoreStats PlannerFieldStats) {
 	db.exec.Stats.Store(&PlannerStatsSnapshot{
 		Version:             1,
@@ -1588,7 +1506,7 @@ func cloneQuery(q *qx.QX) *qx.QX {
 	return qx.Clone(q)
 }
 
-func makeORBranchForCalibrationDecisionTest(estCard uint64, extraChecks int) plannerORBranch {
+func makeORBranchForPlannerDecisionTest(estCard uint64, extraChecks int) plannerORBranch {
 	if extraChecks < 0 {
 		extraChecks = 0
 	}
@@ -1610,11 +1528,4 @@ func makeORBranchForCalibrationDecisionTest(estCard uint64, extraChecks int) pla
 	b := newPlannerORBranch(qir.Expr{}, predSet)
 	b.leadIdx = 0
 	return b
-}
-
-func testCalibrationSnapshot(multipliers map[string]float64) CalibrationSnapshot {
-	return CalibrationSnapshot{
-		UpdatedAt:   time.Now(),
-		Multipliers: multipliers,
-	}
 }

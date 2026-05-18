@@ -1500,17 +1500,15 @@ func TestPlannerExt_Race_NoOrderORDuplicatesOnOverlap(t *testing.T) {
 	})
 }
 
-func TestPlannerExt_Race_TraceAndCalibrationUnderConcurrentQueries(t *testing.T) {
+func TestPlannerExt_Race_TraceUnderConcurrentQueries(t *testing.T) {
 	var (
 		mu     sync.Mutex
 		events []TraceEvent
 	)
 	db := plannerExtOpenSeededDB(t, Options{
-		AnalyzeInterval:        -1,
-		TraceSink:              func(ev TraceEvent) { mu.Lock(); events = append(events, ev); mu.Unlock() },
-		TraceSampleEvery:       1,
-		CalibrationEnabled:     true,
-		CalibrationSampleEvery: 1,
+		AnalyzeInterval:  -1,
+		TraceSink:        func(ev TraceEvent) { mu.Lock(); events = append(events, ev); mu.Unlock() },
+		TraceSampleEvery: 1,
 	})
 
 	q := plannerExtQuery717()
@@ -1535,26 +1533,6 @@ func TestPlannerExt_Race_TraceAndCalibrationUnderConcurrentQueries(t *testing.T)
 				if !queryIDsEqual(q, got, want) {
 					errCh <- fmt.Errorf("got=%v want=%v", got, want)
 					return
-				}
-			}
-		}()
-	}
-
-	for i := 0; i < 3; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for round := 0; round < 50; round++ {
-				snap, ok := db.GetCalibrationSnapshot()
-				if !ok {
-					errCh <- fmt.Errorf("expected initialized calibration snapshot")
-					return
-				}
-				for name, mult := range snap.Multipliers {
-					if mult <= 0 {
-						errCh <- fmt.Errorf("invalid multiplier %q=%v", name, mult)
-						return
-					}
 				}
 			}
 		}()

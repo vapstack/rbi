@@ -45,7 +45,6 @@ func newQaggTestDB(t testing.TB, traceSink func(qexec.TraceEvent)) *qaggTestDB {
 		TraceSink:        traceSink,
 		TraceSampleEvery: 1,
 	})
-	exec.Calibrator.Init()
 
 	rows := []qaggTestRec{
 		{Country: "NL", Segment: qaggString("core"), Active: true, Age: 25, Big: math.MaxInt64, Tags: []string{"go", "db"}, Amount: qaggI64(10)},
@@ -433,7 +432,6 @@ func TestExecutePinnedSnapshotIsolation(t *testing.T) {
 		t.Fatalf("schema.Compile: %v", err)
 	}
 	exec := qexec.NewRuntime(qexec.Config{Schema: rt})
-	exec.Calibrator.Init()
 
 	oldRec := qaggPinnedSnapshotRec{Amount: 10}
 	oldSnap := snapshot.BuildPrepared(1, nil, rt, snapshot.CacheConfig{}, nil, nil, []snapshot.BatchEntry{

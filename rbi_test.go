@@ -330,21 +330,6 @@ func TestTransparentMode_DisablesIndexedAPIsAndUsesDirectBoltSeqScans(t *testing
 	if got := db.PlannerStats(); got.Version != 0 || got.FieldCount != 0 || got.AnalyzeInterval != 0 || got.TraceSampleEvery != 0 || len(got.Fields) != 0 {
 		t.Fatalf("PlannerStats in transparent mode=%+v want zero planner payload", got)
 	}
-	if got := db.CalibrationStats(); got.Enabled || got.SampleEvery != 0 || !got.UpdatedAt.IsZero() || got.SamplesTotal != 0 || len(got.Multipliers) != 0 || len(got.Samples) != 0 {
-		t.Fatalf("CalibrationStats in transparent mode=%+v want zero calibration payload", got)
-	}
-	if _, ok := db.GetCalibrationSnapshot(); ok {
-		t.Fatal("GetCalibrationSnapshot in transparent mode returned state")
-	}
-	if err := db.SetCalibrationSnapshot(CalibrationSnapshot{}); !errors.Is(err, ErrNoIndex) {
-		t.Fatalf("SetCalibrationSnapshot err=%v want %v", err, ErrNoIndex)
-	}
-	if err := db.SaveCalibration(filepath.Join(dir, "transparent.cal")); !errors.Is(err, ErrNoIndex) {
-		t.Fatalf("SaveCalibration err=%v want %v", err, ErrNoIndex)
-	}
-	if err := db.LoadCalibration(filepath.Join(dir, "transparent.cal")); !errors.Is(err, ErrNoIndex) {
-		t.Fatalf("LoadCalibration err=%v want %v", err, ErrNoIndex)
-	}
 
 	var seq []string
 	if err := db.SeqScan("k-02", func(id string, v *noIndexRec) (bool, error) {
@@ -5467,11 +5452,9 @@ func TestBatchSet_UniqueReject_DoesNotGrowStrMap(t *testing.T) {
 
 /**/
 
-func TestComponentAccessors_ExposePlannerCalibrationAndSnapshotDiagnostics(t *testing.T) {
+func TestComponentAccessors_ExposePlannerAndSnapshotDiagnostics(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
-		CalibrationEnabled:     true,
-		CalibrationSampleEvery: 1,
-		AnalyzeInterval:        -1,
+		AnalyzeInterval: -1,
 	})
 
 	if err := db.Set(1, &Rec{Name: "alice", Age: 10, Tags: []string{"go"}}); err != nil {
@@ -5480,12 +5463,6 @@ func TestComponentAccessors_ExposePlannerCalibrationAndSnapshotDiagnostics(t *te
 	if err := db.Set(2, &Rec{Name: "bob", Age: 20, Tags: []string{"db"}}); err != nil {
 		t.Fatalf("Set(2): %v", err)
 	}
-
-	db.engine.exec.Calibrator.Observe(TraceEvent{
-		Plan:          string(PlanOrdered),
-		EstimatedRows: 64,
-		RowsExamined:  96,
-	})
 
 	st := db.Stats()
 	if st.KeyCount != 2 {
@@ -5537,26 +5514,6 @@ func TestComponentAccessors_ExposePlannerCalibrationAndSnapshotDiagnostics(t *te
 		t.Fatalf("expected disabled analyze interval (0), got %v", pl.AnalyzeInterval)
 	}
 
-	cal := db.CalibrationStats()
-	if !cal.Enabled {
-		t.Fatalf("expected calibration to be enabled in stats")
-	}
-	if cal.SampleEvery != 1 {
-		t.Fatalf("expected calibration sample_every=1, got %d", cal.SampleEvery)
-	}
-	if cal.UpdatedAt.IsZero() {
-		t.Fatalf("expected calibration updated_at to be set")
-	}
-	if cal.SamplesTotal == 0 {
-		t.Fatalf("expected calibration samples_total > 0")
-	}
-	if cal.Samples[string(PlanOrdered)] == 0 {
-		t.Fatalf("expected calibration samples for %q > 0", PlanOrdered)
-	}
-	if _, ok := cal.Multipliers[string(PlanOrdered)]; !ok {
-		t.Fatalf("expected calibration multiplier for %q to be present", PlanOrdered)
-	}
-
 	bs := db.AutoBatchStats()
 	if bs.Window <= 0 {
 		t.Fatalf("expected positive auto-batch window, got %v", bs.Window)
@@ -5588,9 +5545,7 @@ func TestStats_PreservesIndexTimingFields(t *testing.T) {
 
 func TestComponentAccessors(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
-		CalibrationEnabled:     true,
-		CalibrationSampleEvery: 1,
-		AnalyzeInterval:        -1,
+		AnalyzeInterval: -1,
 	})
 
 	if err := db.Set(1, &Rec{Name: "alice", Age: 10, Tags: []string{"go"}}); err != nil {
@@ -5599,12 +5554,6 @@ func TestComponentAccessors(t *testing.T) {
 	if err := db.Set(2, &Rec{Name: "bob", Age: 20, Tags: []string{"db"}}); err != nil {
 		t.Fatalf("Set(2): %v", err)
 	}
-
-	db.engine.exec.Calibrator.Observe(TraceEvent{
-		Plan:          string(PlanOrdered),
-		EstimatedRows: 64,
-		RowsExamined:  96,
-	})
 
 	st := db.Stats()
 	if st.KeyCount != 2 {
@@ -5628,14 +5577,6 @@ func TestComponentAccessors(t *testing.T) {
 	}
 	if pl.GeneratedAt.IsZero() {
 		t.Fatalf("expected PlannerStats.GeneratedAt to be set")
-	}
-
-	cal := db.CalibrationStats()
-	if !cal.Enabled {
-		t.Fatalf("expected CalibrationStats.Enabled=true")
-	}
-	if cal.SamplesTotal == 0 {
-		t.Fatalf("expected CalibrationStats.SamplesTotal > 0")
 	}
 
 	snap := db.SnapshotStats()

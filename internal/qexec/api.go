@@ -7,7 +7,7 @@ import (
 
 var ErrInvalidQuery = errors.New("invalid query")
 
-// PlanName is a stable plan identifier used by tracing and calibration.
+// PlanName is a stable plan identifier used by tracing.
 type PlanName string
 
 const (
@@ -183,12 +183,4 @@ func (s *PlannerStatsSnapshot) UniverseOr(fallback uint64) uint64 {
 		return s.UniverseCardinality
 	}
 	return fallback
-}
-
-// CalibrationSnapshot is a serializable view of planner calibration
-// coefficients and sample counts.
-type CalibrationSnapshot struct {
-	UpdatedAt   time.Time          `json:"updated_at"`
-	Multipliers map[string]float64 `json:"multipliers"`
-	Samples     map[string]uint64  `json:"samples"`
 }

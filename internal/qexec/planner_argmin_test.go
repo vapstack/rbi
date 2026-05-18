@@ -143,7 +143,6 @@ func plannerArgminOROrderCandidatesForTest(
 
 	streamChecks := branches.orderStreamChecksByBranch(hasAlwaysTrue, analysis.mergeStats)
 	candidates.streamCost = float64(expectedRows) * streamChecks * plannerFieldStatsSkew(orderStats)
-	candidates.streamCost *= qv.exec.Calibrator.CostMultiplier(CalOROrderStream)
 
 	mergeNeedLimit := plannerOROrderMergeNeedLimit(need, branches.Len(), unionCard, sumCard, q.Offset)
 	candidates.mergeApplicable = !hasAlwaysTrue && need <= mergeNeedLimit
@@ -170,7 +169,6 @@ func plannerArgminOROrderCandidatesForTest(
 		!branches.hasKWayExactBucketApplyWork(analysis.mergeStats) {
 		candidates.mergeCost = routeCost.kWay
 	}
-	candidates.mergeCost *= qv.exec.Calibrator.CostMultiplier(CalOROrderMerge)
 	return candidates, true
 }
 
@@ -213,123 +211,67 @@ func plannerArgminOrderedQuery() *qx.QX {
 }
 
 func TestPlannerArgmin_ORNoOrderDecisionMatchesCandidatePolicy(t *testing.T) {
-	openDB := func(t *testing.T, calibrated bool) *testDB {
-		t.Helper()
-		db := newTestDB(t, testOptions{
-			CalibrationEnabled: calibrated,
-		})
-		_ = db.seedData(t, 2_000)
-		db.setPlannerStatsSnapshot(100_000, PlannerFieldStats{
-			DistinctKeys:    100_000,
-			NonEmptyKeys:    100_000,
-			TotalBucketCard: 100_000,
-			AvgBucketCard:   1,
-			MaxBucketCard:   2,
-			P50BucketCard:   1,
-			P95BucketCard:   2,
-		})
-		return db
+	db := newTestDB(t, testOptions{})
+	_ = db.seedData(t, 2_000)
+	db.setPlannerStatsSnapshot(100_000, PlannerFieldStats{
+		DistinctKeys:    100_000,
+		NonEmptyKeys:    100_000,
+		TotalBucketCard: 100_000,
+		AvgBucketCard:   1,
+		MaxBucketCard:   2,
+		P50BucketCard:   1,
+		P95BucketCard:   2,
+	})
+
+	q := qx.Query(
+		qx.OR(
+			qx.EQ("active", true),
+			qx.EQ("name", "alice"),
+		),
+	).Limit(100)
+
+	branches := newPlannerORBranches(3)
+	branches.Append(makeORBranchForPlannerDecisionTest(4_000, 4))
+	branches.Append(makeORBranchForPlannerDecisionTest(4_000, 4))
+	branches.Append(makeORBranchForPlannerDecisionTest(4_000, 4))
+	defer branches.Release()
+
+	decision := db.decidePlanORNoOrder(q, branches)
+	if decision.kWayCost <= 0 || decision.fallbackCost <= 0 {
+		t.Fatalf("expected positive candidate costs: kway=%v fallback=%v", decision.kWayCost, decision.fallbackCost)
 	}
 
-	tests := []struct {
-		name       string
-		calibrated bool
-		calibrate  func(*testing.T, *testDB)
-	}{
-		{
-			name:       "BaseWinnerIsKWay",
-			calibrated: false,
-		},
-		{
-			name:       "CalibrationFlipsWinnerToFallback",
-			calibrated: true,
-			calibrate: func(t *testing.T, db *testDB) {
-				db.setCalibrationSnapshot(t, testCalibrationSnapshot(map[string]float64{
-					"plan_or_merge_no_order": 3.8,
-				}))
-			},
-		},
+	candidates := plannerORNoOrderArgminCandidates{
+		kWayCost:     decision.kWayCost,
+		fallbackCost: decision.fallbackCost,
 	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			db := openDB(t, tc.calibrated)
-			if tc.calibrate != nil {
-				tc.calibrate(t, db)
-			}
-
-			q := qx.Query(
-				qx.OR(
-					qx.EQ("active", true),
-					qx.EQ("name", "alice"),
-				),
-			).Limit(100)
-
-			branches := newPlannerORBranches(3)
-			branches.Append(makeORBranchForCalibrationDecisionTest(4_000, 4))
-			branches.Append(makeORBranchForCalibrationDecisionTest(4_000, 4))
-			branches.Append(makeORBranchForCalibrationDecisionTest(4_000, 4))
-			defer branches.Release()
-
-			decision := db.decidePlanORNoOrder(q, branches)
-			if decision.kWayCost <= 0 || decision.fallbackCost <= 0 {
-				t.Fatalf("expected positive candidate costs: kway=%v fallback=%v", decision.kWayCost, decision.fallbackCost)
-			}
-
-			candidates := plannerORNoOrderArgminCandidates{
-				kWayCost:     decision.kWayCost,
-				fallbackCost: decision.fallbackCost,
-			}
-			if decision.use != candidates.expectedUse() {
-				t.Fatalf(
-					"OR no-order winner mismatch: use=%v kway=%v fallback=%v threshold=%v",
-					decision.use, decision.kWayCost, decision.fallbackCost, decision.fallbackCost*plannerORNoOrderAdvantage,
-				)
-			}
-		})
+	if decision.use != candidates.expectedUse() {
+		t.Fatalf(
+			"OR no-order winner mismatch: use=%v kway=%v fallback=%v threshold=%v",
+			decision.use, decision.kWayCost, decision.fallbackCost, decision.fallbackCost*plannerORNoOrderAdvantage,
+		)
 	}
 }
 
 func TestPlannerArgmin_OROrderDecisionMatchesCandidatePolicy(t *testing.T) {
 	tests := []struct {
-		name      string
-		calibrate func(*testing.T, *testDB)
-		q         func() *qx.QX
-		wantPlan  plannerOROrderPlan
+		name string
+		q    func() *qx.QX
 	}{
 		{
-			name: "CalibrationPrefersMerge",
-			calibrate: func(t *testing.T, db *testDB) {
-				db.setCalibrationSnapshot(t, testCalibrationSnapshot(map[string]float64{
-					"plan_or_merge_order_merge":  0.45,
-					"plan_or_merge_order_stream": 2.00,
-				}))
-			},
-			q:        plannerArgminOROrderMergeQuery,
-			wantPlan: plannerOROrderMerge,
+			name: "MergeQuery",
+			q:    plannerArgminOROrderMergeQuery,
 		},
 		{
-			name: "StreamWinner",
-			calibrate: func(t *testing.T, db *testDB) {
-				db.setCalibrationSnapshot(t, testCalibrationSnapshot(map[string]float64{
-					"plan_or_merge_order_merge":  2.00,
-					"plan_or_merge_order_stream": 0.40,
-				}))
-			},
-			q:        plannerArgminOROrderStreamQuery,
-			wantPlan: plannerOROrderStream,
+			name: "StreamQuery",
+			q:    plannerArgminOROrderStreamQuery,
 		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			db := newTestDB(t, testOptions{
-				CalibrationEnabled: tc.calibrate != nil,
-			})
+			db := newTestDB(t, testOptions{})
 			_ = db.seedData(t, 20_000)
-			if tc.calibrate != nil {
-				tc.calibrate(t, db)
-			}
 
 			q := tc.q()
 			window, ok := testOrderWindow(q)
@@ -374,13 +316,6 @@ func TestPlannerArgmin_OROrderDecisionMatchesCandidatePolicy(t *testing.T) {
 			}
 
 			wantPlan, wantCost := candidates.expectedPlan()
-			if wantPlan != tc.wantPlan {
-				t.Fatalf(
-					"expected candidate enumeration to choose %v, got %v (merge_applicable=%v merge=%v stream=%v fallback=%v)",
-					tc.wantPlan, wantPlan, candidates.mergeApplicable, candidates.mergeCost, candidates.streamCost, candidates.fallbackCost,
-				)
-			}
-
 			decision := view.decidePlanOROrderWithAnalysis(&viewQ, branches, &analysis)
 			if decision.plan != wantPlan {
 				t.Fatalf("ordered OR winner mismatch: got=%v want=%v", decision.plan, wantPlan)
@@ -392,9 +327,7 @@ func TestPlannerArgmin_OROrderDecisionMatchesCandidatePolicy(t *testing.T) {
 }
 
 func TestPlannerArgmin_OROrderDecisionMatchesCandidatePolicy_FallbackSynthetic(t *testing.T) {
-	db := newTestDB(t, testOptions{
-		CalibrationEnabled: true,
-	})
+	db := newTestDB(t, testOptions{})
 	_ = db.seedData(t, 2_000)
 	db.setPlannerStatsSnapshot(100_000, PlannerFieldStats{
 		DistinctKeys:    100_000,
@@ -406,18 +339,13 @@ func TestPlannerArgmin_OROrderDecisionMatchesCandidatePolicy_FallbackSynthetic(t
 		P95BucketCard:   2,
 	})
 
-	db.setCalibrationSnapshot(t, testCalibrationSnapshot(map[string]float64{
-		"plan_or_merge_order_merge":  4.0,
-		"plan_or_merge_order_stream": 4.0,
-	}))
-
 	q := qx.Query(
 		qx.OR(
 			qx.EQ("active", true),
 			qx.EQ("name", "alice"),
 			qx.EQ("country", "NL"),
 		),
-	).Sort("score", qx.DESC).Limit(100)
+	).Sort("score", qx.DESC).Limit(20_000)
 
 	preparedQ, viewQ, err := db.prepareQuery(q)
 	if err != nil {
@@ -426,9 +354,9 @@ func TestPlannerArgmin_OROrderDecisionMatchesCandidatePolicy_FallbackSynthetic(t
 	defer preparedQ.Release()
 
 	branches := newPlannerORBranches(3)
-	branches.Append(makeORBranchForCalibrationDecisionTest(8_000, 64))
-	branches.Append(makeORBranchForCalibrationDecisionTest(8_000, 64))
-	branches.Append(makeORBranchForCalibrationDecisionTest(8_000, 64))
+	branches.Append(makeORBranchForPlannerDecisionTest(8_000, 64))
+	branches.Append(makeORBranchForPlannerDecisionTest(8_000, 64))
+	branches.Append(makeORBranchForPlannerDecisionTest(8_000, 64))
 	defer branches.Release()
 
 	var analysis plannerOROrderAnalysis
@@ -463,79 +391,39 @@ func TestPlannerArgmin_OROrderDecisionMatchesCandidatePolicy_FallbackSynthetic(t
 }
 
 func TestPlannerArgmin_OrderedDecisionMatchesCandidatePolicy(t *testing.T) {
-	tests := []struct {
-		name      string
-		calibrate func(*testing.T, *testDB)
-		wantUse   bool
-	}{
-		{
-			name: "CalibrationPrefersOrdered",
-			calibrate: func(t *testing.T, db *testDB) {
-				db.setCalibrationSnapshot(t, testCalibrationSnapshot(map[string]float64{
-					"plan_ordered": 0.001,
-				}))
-			},
-			wantUse: true,
-		},
-		{
-			name: "CalibrationForcesFallback",
-			calibrate: func(t *testing.T, db *testDB) {
-				db.setCalibrationSnapshot(t, testCalibrationSnapshot(map[string]float64{
-					"plan_ordered": 4.0,
-				}))
-			},
-			wantUse: false,
-		},
+	db := newTestDB(t, testOptions{})
+	_ = db.seedData(t, 20_000)
+
+	q := plannerArgminOrderedQuery()
+	preparedQ, viewQ, err := db.prepareQuery(q)
+	if err != nil {
+		t.Fatalf("prepareTestQuery: %v", err)
+	}
+	defer preparedQ.Release()
+
+	var leavesBuf [plannerPredicateFastPathMaxLeaves]qir.Expr
+	leaves, ok := qir.CollectAndLeavesScratch(viewQ.Expr, leavesBuf[:0], qir.LeafModeCollect)
+	if !ok || len(leaves) == 0 {
+		t.Fatalf("collectAndLeavesScratch: ok=%v len=%d", ok, len(leaves))
 	}
 
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			db := newTestDB(t, testOptions{
-				CalibrationEnabled: tc.calibrate != nil,
-			})
-			_ = db.seedData(t, 20_000)
-			if tc.calibrate != nil {
-				tc.calibrate(t, db)
-			}
+	view := db.view()
+	decision := view.decideOrderedByCost(&viewQ, leaves)
+	if decision.orderedCost <= 0 || decision.fallbackCost <= 0 {
+		t.Fatalf(
+			"expected positive ordered candidate costs: ordered=%v fallback=%v",
+			decision.orderedCost, decision.fallbackCost,
+		)
+	}
 
-			q := plannerArgminOrderedQuery()
-			preparedQ, viewQ, err := db.prepareQuery(q)
-			if err != nil {
-				t.Fatalf("prepareTestQuery: %v", err)
-			}
-			defer preparedQ.Release()
-
-			var leavesBuf [plannerPredicateFastPathMaxLeaves]qir.Expr
-			leaves, ok := qir.CollectAndLeavesScratch(viewQ.Expr, leavesBuf[:0], qir.LeafModeCollect)
-			if !ok || len(leaves) == 0 {
-				t.Fatalf("collectAndLeavesScratch: ok=%v len=%d", ok, len(leaves))
-			}
-
-			view := db.view()
-			decision := view.decideOrderedByCost(&viewQ, leaves)
-			if decision.orderedCost <= 0 || decision.fallbackCost <= 0 {
-				t.Fatalf(
-					"expected positive ordered candidate costs: ordered=%v fallback=%v",
-					decision.orderedCost, decision.fallbackCost,
-				)
-			}
-
-			candidates, ok := plannerArgminOrderedCandidatesForDecision(&viewQ, leaves, decision)
-			if !ok {
-				t.Fatalf("plannerArgminOrderedCandidatesForDecision: ok=false")
-			}
-			if candidates.expectedUse() != tc.wantUse {
-				t.Fatalf(
-					"expected candidate policy wantUse=%v, got %v (ordered=%v fallback=%v gain=%v offset=%d)",
-					tc.wantUse, candidates.expectedUse(), candidates.orderedCost, candidates.fallbackCost, candidates.gainReq, q.Window.Offset,
-				)
-			}
-			if decision.use != candidates.expectedUse() {
-				t.Fatalf(
-					"ordered winner mismatch: use=%v ordered=%v fallback=%v gain=%v",
-					decision.use, decision.orderedCost, decision.fallbackCost, candidates.gainReq,
-				)
-			}
-		})
+	candidates, ok := plannerArgminOrderedCandidatesForDecision(&viewQ, leaves, decision)
+	if !ok {
+		t.Fatalf("plannerArgminOrderedCandidatesForDecision: ok=false")
+	}
+	if decision.use != candidates.expectedUse() {
+		t.Fatalf(
+			"ordered winner mismatch: use=%v ordered=%v fallback=%v gain=%v",
+			decision.use, decision.orderedCost, decision.fallbackCost, candidates.gainReq,
+		)
 	}
 }

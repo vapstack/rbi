@@ -306,7 +306,6 @@ func (qv *View) decidePlanORNoOrder(q *qir.Shape, branches plannerORBranches) pl
 	expectedRows := estimateRowsForNeed(uint64(need), unionCard, universe)
 	avgChecks := branches.noOrderChecks(&branchCards, branchCount)
 	costKWay := float64(expectedRows) * (1.0 + avgChecks)
-	costKWay *= qv.exec.Calibrator.CostMultiplier(CalORNoOrder)
 
 	fallbackRows := min(unionCard, uint64(need))
 	costFallback := float64(sumCard) + float64(fallbackRows)
@@ -400,7 +399,6 @@ func (qv *View) decidePlanOROrderWithAnalysis(
 	streamChecks := branches.orderStreamChecksByBranch(hasAlwaysTrue, analysis.mergeStats)
 	streamSkew := plannerFieldStatsSkew(orderStats)
 	costStream := float64(expectedRows) * streamChecks * streamSkew
-	costStream *= qv.exec.Calibrator.CostMultiplier(CalOROrderStream)
 
 	costFallback := float64(sumCard) + float64(expectedRows)
 	bestPlan := plannerOROrderFallback
@@ -421,7 +419,6 @@ func (qv *View) decidePlanOROrderWithAnalysis(
 			costMerge = routeCost.kWay
 		}
 
-		costMerge *= qv.exec.Calibrator.CostMultiplier(CalOROrderMerge)
 		if costMerge <= bestCost*plannerOROrderMergeGain {
 			bestPlan = plannerOROrderMerge
 			bestCost = costMerge
@@ -1208,10 +1205,8 @@ func (qv *View) decideExecutionOrderByCost(q *qir.Shape, leaves []qir.Expr) plan
 	}
 
 	plan := PlanLimitOrderBasic
-	calPlan := CalLimitOrderBasic
 	if hasOrderPrefix {
 		plan = PlanLimitOrderPrefix
-		calPlan = CalLimitOrderPrefix
 	}
 
 	d.use = true
@@ -1219,7 +1214,7 @@ func (qv *View) decideExecutionOrderByCost(q *qir.Shape, leaves []qir.Expr) plan
 
 	if profile.selectivity <= 0 {
 		d.expectedProbeRows = 0
-		d.executionCost = 1.0 * qv.exec.Calibrator.CostMultiplier(calPlan)
+		d.executionCost = 1.0
 		return d
 	}
 
@@ -1255,7 +1250,6 @@ func (qv *View) decideExecutionOrderByCost(q *qir.Shape, leaves []qir.Expr) plan
 		}
 		executionCost += baseWorkCost
 	}
-	executionCost *= qv.exec.Calibrator.CostMultiplier(calPlan)
 
 	d.expectedProbeRows = uint64(expectedProbeRows)
 	d.executionCost = executionCost
@@ -1754,7 +1748,6 @@ func (qv *View) decideOrderedByCost(q *qir.Shape, leaves []qir.Expr) plannerOrde
 		profile.coverage,
 		int(need),
 	)
-	orderedCost *= qv.exec.Calibrator.CostMultiplier(CalOrdered)
 
 	fallbackProbeFactor := plannerOrderedFallbackProbeFactor(orderSkew, profile, q.Offset)
 	fallbackCost := profile.fallbackWorkRows + expectedProbeRows*fallbackProbeFactor + float64(len(leaves))*20.0

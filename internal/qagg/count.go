@@ -19,7 +19,7 @@ func PrepareCount(rt *schema.Runtime, exprs ...qx.Expr) (*qir.Query, error) {
 func Count(view *qexec.View, q *qir.Query, emitTrace bool) (uint64, error) {
 	shape := qir.NewShape(q)
 	expr := shape.Expr
-	traceEnabled := emitTrace && view.TraceOrCalibrationSamplingEnabled()
+	traceEnabled := emitTrace && view.TraceSamplingEnabled()
 	if !traceEnabled {
 		if expr.Op == qir.OpNOOP {
 			if expr.Not {

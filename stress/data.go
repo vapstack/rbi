@@ -45,8 +45,6 @@ type DBConfig struct {
 	OpenTimeout          time.Duration
 	BoltNoSync           bool
 	AnalyzeInterval      time.Duration
-	CalibrationOn        bool
-	CalibrationEvery     int
 	DisableRuntimeCaches bool
 	TraceSink            func(rbi.TraceEvent)
 	TraceSampleEvery     int
@@ -74,10 +72,6 @@ func buildRBIOptions(cfg DBConfig) rbi.Options {
 	}
 	if cfg.AnalyzeInterval != 0 {
 		dbOpts.AnalyzeInterval = cfg.AnalyzeInterval
-	}
-	if cfg.CalibrationOn {
-		dbOpts.CalibrationEnabled = true
-		dbOpts.CalibrationSampleEvery = cfg.CalibrationEvery
 	}
 	if cfg.TraceSink != nil {
 		dbOpts.TraceSink = cfg.TraceSink

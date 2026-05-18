@@ -1,10 +1,9 @@
 old.txt
 new.txt
-rbi.test
-mem.out
+*.test
+*.out
 benchdiff
 bench/bench
-stress.test
 stress/stress
 bench.db
 bench.db.UserBench.rbi

@@ -32,8 +32,7 @@ RBI is not a replacement for a relational database.
 * Batch and auto-batched writes
 * Uniqueness constraints
 * Optional transparent mode for typed/generic work with plain bbolt db when index is not needed
-* Optional runtime diagnostics: query tracing, planner/snapshot/auto-batch stats, and online
-  calibration
+* Optional runtime diagnostics: query tracing and planner/snapshot/auto-batch stats
 
 ### LLM notice
 Starting from v0.7, parts of the code, documentation and tests were created 
@@ -261,12 +260,7 @@ db, err := rbi.New[uint64, User](bolt, rbi.Options{
     AnalyzeInterval: 30 * time.Minute, // < 0 disables periodic analyze loop
     TraceSink: func(ev rbi.TraceEvent) { /* log/collect trace */ },
     TraceSampleEvery: 1000, // 0 uses default (1), < 0 disables tracing    
-    
-    // Online calibration settings
-    CalibrationEnabled: true, // false disables calibration (default)
-    CalibrationSampleEvery: 32, // 0 uses default (16), < 0 disables sampled calibration
-    PersistCalibration: true, // optional auto load/save to .cal file
-    
+
     // Single-op auto-batcher settings
     AutoBatchWindow: 100 * time.Microsecond,
     AutoBatchMax: 128,

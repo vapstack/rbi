@@ -45,7 +45,6 @@ var (
 
 const (
 	defaultOptionsAnalyzeInterval                  = time.Hour
-	defaultOptionsCalibrationSampleEvery           = qexec.DefaultCalibrationSampleEvery
 	defaultBucketFillPercent                       = 0.8
 	defaultSnapshotMaterializedPredCacheMaxEntries = 24
 	defaultSnapshotMatPredCacheMaxCardinality      = 64 << 10
@@ -113,36 +112,6 @@ type Options struct {
 	//
 	// Default: 1
 	TraceSampleEvery int
-
-	// CalibrationEnabled enables online self-calibration of planner
-	// cost coefficients using sampled query traces.
-	//
-	// Enable for workloads with evolving predicate selectivity/cost profile.
-	// Keep disabled when strict latency determinism is preferred.
-	CalibrationEnabled bool
-
-	// CalibrationSampleEvery controls calibration sampling:
-	//   - 0: use default sampling interval
-	//   - 1: calibrate every query
-	//   - N: calibrate every Nth query
-	// The value is ignored when CalibrationEnabled is false.
-	//
-	// Negative value disables sampled calibration.
-	//
-	// Default: 16
-	//
-	// Lower values adapt faster but add overhead and sensitivity to noise.
-	// Higher values reduce overhead but adapt slower to workload shifts.
-	CalibrationSampleEvery int
-
-	// PersistCalibration enables automatic load/save of planner calibration
-	// state in a sidecar JSON file next to the Bolt DB.
-	//
-	// File name is derived from the Bolt path and validated bucket name,
-	// using the same pattern as the index sidecar but with ".cal" extension.
-	//
-	// Default: false (disabled).
-	PersistCalibration bool
 
 	// BucketFillPercent controls bbolt bucket fill factor for write operations.
 	//
@@ -267,9 +236,6 @@ func (o *Options) setDefaults() {
 	if o.TraceSampleEvery == 0 {
 		o.TraceSampleEvery = 1
 	}
-	if o.CalibrationSampleEvery == 0 {
-		o.CalibrationSampleEvery = defaultOptionsCalibrationSampleEvery
-	}
 	if o.BucketFillPercent == 0 {
 		o.BucketFillPercent = defaultBucketFillPercent
 	}
@@ -377,11 +343,6 @@ func New[K ~uint64 | ~string, V any](bolt *bbolt.DB, options Options, execOpts .
 	}
 	defer unregInstanceOnError(&err, boltPath, vname)
 
-	calPath := ""
-	if options.PersistCalibration {
-		calPath = bolt.Path() + "." + vname + ".cal"
-	}
-
 	db = &DB[K, V]{
 		vtype:     vtype,
 		bolt:      bolt,
@@ -415,7 +376,7 @@ func New[K ~uint64 | ~string, V any](bolt *bbolt.DB, options Options, execOpts .
 		return nil, err
 	}
 
-	db.engine, db.strMap, err = newQueryEngineForRuntime(db.schema, db.options, db.strKey, calPath)
+	db.engine, db.strMap, err = newQueryEngineForRuntime(db.schema, db.options, db.strKey)
 	if err != nil {
 		return nil, err
 	}
@@ -511,14 +472,13 @@ func New[K ~uint64 | ~string, V any](bolt *bbolt.DB, options Options, execOpts .
 			}
 		}
 
-		db.initCalibration()
 		db.startPlannerAnalyzeLoop()
 	}
 
 	return db, nil
 }
 
-func newQueryEngineForRuntime(rt *schema.Runtime, options *Options, strKey bool, calPath string) (*queryEngine, *strmap.Mapper, error) {
+func newQueryEngineForRuntime(rt *schema.Runtime, options *Options, strKey bool) (*queryEngine, *strmap.Mapper, error) {
 	if !rt.HasQueryFields() {
 		return nil, nil, nil
 	}
@@ -543,9 +503,6 @@ func newQueryEngineForRuntime(rt *schema.Runtime, options *Options, strKey bool,
 			AnalyzeSoftBudget:              defaultAnalyzeSoftBudget,
 			TraceSink:                      options.TraceSink,
 			TraceSampleEvery:               options.TraceSampleEvery,
-			CalibrationEnabled:             options.CalibrationEnabled,
-			CalibrationSampleEvery:         options.CalibrationSampleEvery,
-			CalibrationPersistPath:         calPath,
 		}),
 	}
 	slotCount := len(rt.Indexed)
@@ -839,24 +796,6 @@ type (
 		AnalyzeInterval time.Duration
 		// TraceSampleEvery controls trace sampling frequency (every Nth query).
 		TraceSampleEvery uint64
-	}
-
-	// CalibrationStats contains online planner calibration diagnostics.
-	CalibrationStats struct {
-		// Enabled reports whether online calibration is enabled.
-		Enabled bool
-		// SampleEvery controls calibration sampling frequency (every Nth query).
-		SampleEvery uint64
-
-		// UpdatedAt is the timestamp of the last calibration state update.
-		UpdatedAt time.Time
-		// SamplesTotal is the total number of accumulated calibration samples.
-		SamplesTotal uint64
-
-		// Multipliers stores per-plan calibration multipliers.
-		Multipliers map[string]float64
-		// Samples stores per-plan calibration sample counters.
-		Samples map[string]uint64
 	}
 
 	// Stats is a lightweight database status snapshot.
@@ -1555,37 +1494,6 @@ func (db *DB[K, V]) PlannerStats() PlannerStats {
 	return out
 }
 
-// CalibrationStats returns current planner calibration settings and state.
-//
-// When planner calibration is enabled, it returns the current calibration
-// multipliers and sample counters.
-//
-// When calibration is disabled, or no calibration state has been initialized yet,
-// it returns the current settings with zeroed calibration data.
-//
-// In transparent mode no query engine and no runtime planner exist, so the
-// returned calibration payload is zero-valued.
-func (db *DB[K, V]) CalibrationStats() CalibrationStats {
-	out := CalibrationStats{
-		Multipliers: make(map[string]float64, int(qexec.CalPlanCount)),
-		Samples:     make(map[string]uint64, int(qexec.CalPlanCount)),
-	}
-	if db.engine == nil {
-		return out
-	}
-	out.Enabled = db.engine.exec.Calibrator.Enabled()
-	out.SampleEvery = db.engine.exec.Calibrator.SampleEvery()
-	if cal, ok := db.engine.exec.Calibrator.Snapshot(); ok {
-		out.UpdatedAt = cal.UpdatedAt
-		out.Multipliers = cal.Multipliers
-		out.Samples = cal.Samples
-		for _, n := range cal.Samples {
-			out.SamplesTotal += n
-		}
-	}
-	return out
-}
-
 // Close closes the indexer and persists the current index state
 // to the .rbi file unless index persistence is disabled.
 //
@@ -1616,15 +1524,6 @@ func (db *DB[K, V]) Close() error {
 		err = db.storeIndex()
 	}
 
-	if db.engine != nil {
-		if e := db.persistCalibrationOnClose(); e != nil {
-			if err == nil {
-				err = e
-			} else {
-				db.logger.Println("rbi: failed to persist planner calibration:", e)
-			}
-		}
-	}
 	if err == nil && db.broken.Load() {
 		err = ErrBroken
 	}

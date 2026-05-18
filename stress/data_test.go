@@ -37,8 +37,6 @@ func TestOpenBenchDBFailsFastOnLockedDB(t *testing.T) {
 func TestBuildRBIOptions(t *testing.T) {
 	opts := buildRBIOptions(DBConfig{
 		AnalyzeInterval:      -1,
-		CalibrationOn:        true,
-		CalibrationEvery:     -1,
 		DisableRuntimeCaches: true,
 		TraceSink:            func(rbi.TraceEvent) {},
 		TraceSampleEvery:     17,
@@ -49,9 +47,6 @@ func TestBuildRBIOptions(t *testing.T) {
 	}
 	if opts.AnalyzeInterval != -1 {
 		t.Fatalf("AnalyzeInterval = %s, want -1", opts.AnalyzeInterval)
-	}
-	if !opts.CalibrationEnabled || opts.CalibrationSampleEvery != -1 {
-		t.Fatalf("calibration = enabled:%t every:%d, want true/-1", opts.CalibrationEnabled, opts.CalibrationSampleEvery)
 	}
 	if opts.SnapshotMaterializedPredCacheMaxEntries != -1 {
 		t.Fatalf("SnapshotMaterializedPredCacheMaxEntries = %d, want -1", opts.SnapshotMaterializedPredCacheMaxEntries)

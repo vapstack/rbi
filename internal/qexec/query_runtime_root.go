@@ -145,7 +145,7 @@ func (qv *View) PreparedQuery(q *qir.Shape) ([]uint64, error) {
 // The method keeps all routing decisions in one place so fast-path/planner
 // selection remains consistent across QueryKeys and Query callers.
 func (qv *View) Query(q *qir.Shape, emitTrace bool, prepared bool) (out []uint64, err error) {
-	traceEnabled := emitTrace && qv.exec.TraceOrCalibrationSamplingEnabled()
+	traceEnabled := emitTrace && qv.exec.TraceSamplingEnabled()
 
 	if !prepared && !traceEnabled {
 		if out, ok, fastErr := qv.tryDirectSingleUniqueEqNoOrder(q, nil); ok {

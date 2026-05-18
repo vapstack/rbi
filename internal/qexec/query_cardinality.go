@@ -35,8 +35,8 @@ var cardinalityORMaterializedRouteKeys = [4]qcache.MaterializedPredKey{
 	3: qcache.MaterializedPredKeyFromOpaque("cardinality_or_materialized_3"),
 }
 
-func (qv *View) TraceOrCalibrationSamplingEnabled() bool {
-	return qv.exec.TraceOrCalibrationSamplingEnabled()
+func (qv *View) TraceSamplingEnabled() bool {
+	return qv.exec.TraceSamplingEnabled()
 }
 
 func (qv *View) TryFilterCardinalityPreparedAndReordered(expr qir.Expr) (uint64, bool, error) {

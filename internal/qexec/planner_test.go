@@ -2,13 +2,10 @@ package qexec
 
 import (
 	"fmt"
-	"math"
-	"os"
 	"path/filepath"
 	"slices"
 	"sync"
 	"testing"
-	"time"
 
 	"github.com/vapstack/qx"
 	"github.com/vapstack/rbi/internal/indexdata"
@@ -357,254 +354,14 @@ func TestPlannerFilterPostingByPredicateChecksBuf_PreferredExactBypassesSmallBuc
 	}
 }
 
-func TestPlannerCalibration_ObserveUpdatesMultiplier(t *testing.T) {
+func TestTraceDisabled_BeginTraceReturnsNil(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
-		AnalyzeInterval:        -1,
-		CalibrationEnabled:     true,
-		CalibrationSampleEvery: 1,
+		AnalyzeInterval:  -1,
+		TraceSink:        nil,
+		TraceSampleEvery: 1,
 	})
-
-	before, ok := db.GetCalibrationSnapshot()
-	if !ok {
-		t.Fatalf("expected initialized planner calibration snapshot")
-	}
-	base := before.Multipliers["plan_or_merge_no_order"]
-	if base <= 0 {
-		t.Fatalf("unexpected base multiplier: %v", base)
-	}
-
-	db.engine.exec.Calibrator.Observe(TraceEvent{
-		Plan:          "plan_or_merge_no_order",
-		EstimatedRows: 100,
-		RowsExamined:  300,
-	})
-
-	after, ok := db.GetCalibrationSnapshot()
-	if !ok {
-		t.Fatalf("expected planner calibration snapshot after update")
-	}
-	if after.Samples["plan_or_merge_no_order"] != before.Samples["plan_or_merge_no_order"]+1 {
-		t.Fatalf("unexpected sample count: before=%d after=%d", before.Samples["plan_or_merge_no_order"], after.Samples["plan_or_merge_no_order"])
-	}
-	if after.Multipliers["plan_or_merge_no_order"] <= base {
-		t.Fatalf("expected multiplier to increase: before=%v after=%v", base, after.Multipliers["plan_or_merge_no_order"])
-	}
-}
-
-func TestPlannerCalibration_QueryPathUpdatesWithoutTracerSink(t *testing.T) {
-	db, _ := openTempDBUint64(t, Options{
-		AnalyzeInterval:        -1,
-		CalibrationEnabled:     true,
-		CalibrationSampleEvery: 1,
-	})
-	_ = seedData(t, db, 20_000)
-
-	before, ok := db.GetCalibrationSnapshot()
-	if !ok {
-		t.Fatalf("expected initialized planner calibration snapshot")
-	}
-
-	q := qx.Query(
-		qx.OR(
-			qx.EQ("active", true),
-			qx.EQ("name", "alice"),
-		),
-	).Limit(120)
-
-	ids, err := db.QueryKeys(q)
-	if err != nil {
-		t.Fatalf("QueryKeys: %v", err)
-	}
-	if len(ids) == 0 {
-		t.Fatalf("expected non-empty query result")
-	}
-
-	after, ok := db.GetCalibrationSnapshot()
-	if !ok {
-		t.Fatalf("expected planner calibration snapshot after query")
-	}
-	if after.Samples["plan_or_merge_no_order"] <= before.Samples["plan_or_merge_no_order"] {
-		t.Fatalf(
-			"expected calibration samples to increase from query path: before=%d after=%d",
-			before.Samples["plan_or_merge_no_order"],
-			after.Samples["plan_or_merge_no_order"],
-		)
-	}
-}
-
-func TestPlannerCalibration_BeginTraceUsesMinimalCollectorWithoutTracerSink(t *testing.T) {
-	db, _ := openTempDBUint64(t, Options{
-		AnalyzeInterval:        -1,
-		CalibrationEnabled:     true,
-		CalibrationSampleEvery: 1,
-	})
-
-	before, ok := db.GetCalibrationSnapshot()
-	if !ok {
-		t.Fatalf("expected initialized planner calibration snapshot")
-	}
-
-	q := qx.Query(
-		qx.OR(
-			qx.EQ("active", true),
-			qx.EQ("name", "alice"),
-		),
-	).Sort("age", qx.ASC).Offset(5).Limit(10)
-
-	preparedQ, viewQ, err := prepareTestQuery(db.engine, q)
-	if err != nil {
-		t.Fatalf("prepareTestQuery: %v", err)
-	}
-	defer preparedQ.Release()
-
-	tr := db.engine.beginTraceForTests(viewQ)
-	if tr == nil {
-		t.Fatalf("expected calibration-only trace collector")
-	}
-	if tr.Full() {
-		t.Fatalf("expected calibration-only collector without TraceSink")
-	}
-	ev := tr.Event()
-	if !ev.Timestamp.IsZero() {
-		t.Fatalf("expected zero timestamp in calibration-only mode, got=%v", ev.Timestamp)
-	}
-	if ev.Offset != 0 || ev.Limit != 0 || ev.HasOrder || ev.LeafCount != 0 || ev.HasNeg || ev.HasPrefix {
-		t.Fatalf("expected trace-only query metadata to stay empty, got=%+v", ev)
-	}
-
-	tr.SetPlan(PlanOrdered)
-	tr.SetEstimated(42, 12.5, 9.5)
-	tr.AddExamined(7)
-	tr.Finish(3, nil)
-
-	ev = tr.Event()
-	if ev.Plan != string(PlanOrdered) {
-		t.Fatalf("unexpected plan: got=%q want=%q", ev.Plan, PlanOrdered)
-	}
-	if ev.EstimatedRows != 42 || ev.RowsExamined != 7 || ev.RowsReturned != 3 {
-		t.Fatalf(
-			"unexpected minimal calibration fields: estimated=%d examined=%d returned=%d",
-			ev.EstimatedRows, ev.RowsExamined, ev.RowsReturned,
-		)
-	}
-	if ev.EstimatedCost != 0 || ev.FallbackCost != 0 || ev.Duration != 0 || ev.Error != "" || len(ev.ORBranches) != 0 {
-		t.Fatalf("expected full-trace fields to remain empty, got=%+v", ev)
-	}
-
-	after, ok := db.GetCalibrationSnapshot()
-	if !ok {
-		t.Fatalf("expected planner calibration snapshot after finish")
-	}
-	if after.Samples[string(PlanOrdered)] <= before.Samples[string(PlanOrdered)] {
-		t.Fatalf(
-			"expected calibration sample to increase from minimal collector: before=%d after=%d",
-			before.Samples[string(PlanOrdered)],
-			after.Samples[string(PlanOrdered)],
-		)
-	}
-}
-
-func TestPlannerCalibration_QueryViewUsesRootSnapshot(t *testing.T) {
-	db, _ := openTempDBUint64(t, Options{
-		AnalyzeInterval:        -1,
-		CalibrationEnabled:     true,
-		CalibrationSampleEvery: -1,
-	})
-	if err := db.SetCalibrationSnapshot(CalibrationSnapshot{
-		UpdatedAt: time.Now(),
-		Multipliers: map[string]float64{
-			string(PlanOrdered):         0.73,
-			string(PlanLimitOrderBasic): 1.41,
-		},
-		Samples: map[string]uint64{
-			string(PlanOrdered):         3,
-			string(PlanLimitOrderBasic): 5,
-		},
-	}); err != nil {
-		t.Fatalf("SetCalibrationSnapshot: %v", err)
-	}
-
-	view := db.engine.queryViewForSnapshotForTests(db.engine.snapshot.Current())
-
-	assertApproxMultiplier(t, view.exec.Calibrator.CostMultiplier(CalOrdered), 0.73)
-	assertApproxMultiplier(t, view.exec.Calibrator.CostMultiplier(CalLimitOrderBasic), 1.41)
-}
-
-func TestPlannerCalibration_DisabledUsesManualSnapshot(t *testing.T) {
-	db, _ := openTempDBUint64(t, Options{
-		AnalyzeInterval:        -1,
-		CalibrationEnabled:     false,
-		CalibrationSampleEvery: 1,
-	})
-	if err := db.SetCalibrationSnapshot(CalibrationSnapshot{
-		UpdatedAt: time.Now(),
-		Multipliers: map[string]float64{
-			string(PlanOrdered):         0.73,
-			string(PlanLimitOrderBasic): 1.41,
-		},
-		Samples: map[string]uint64{
-			string(PlanOrdered):         3,
-			string(PlanLimitOrderBasic): 5,
-		},
-	}); err != nil {
-		t.Fatalf("SetCalibrationSnapshot: %v", err)
-	}
-
-	view := db.engine.queryViewForSnapshotForTests(db.engine.snapshot.Current())
-
-	assertApproxMultiplier(t, view.exec.Calibrator.CostMultiplier(CalOrdered), 0.73)
-	assertApproxMultiplier(t, view.exec.Calibrator.CostMultiplier(CalLimitOrderBasic), 1.41)
-	if db.engine.exec.TraceOrCalibrationSamplingEnabled() {
-		t.Fatalf("expected online calibration sampling to remain disabled")
-	}
-}
-
-func TestPlannerCalibration_DisabledWithoutSnapshotUsesIdentityMultiplier(t *testing.T) {
-	db, _ := openTempDBUint64(t, Options{
-		AnalyzeInterval:        -1,
-		CalibrationEnabled:     false,
-		CalibrationSampleEvery: 1,
-	})
-
-	view := db.engine.queryViewForSnapshotForTests(db.engine.snapshot.Current())
-
-	assertApproxMultiplier(t, view.exec.Calibrator.CostMultiplier(CalOrdered), 1.0)
-	assertApproxMultiplier(t, view.exec.Calibrator.CostMultiplier(CalLimitOrderBasic), 1.0)
-	if _, ok := db.GetCalibrationSnapshot(); ok {
-		t.Fatalf("expected no calibration snapshot when online calibration is disabled and nothing was loaded")
-	}
-}
-
-func TestPlannerCalibration_SampleEveryNormalization(t *testing.T) {
-	dbEnabled, _ := openTempDBUint64(t, Options{
-		AnalyzeInterval:        -1,
-		CalibrationEnabled:     true,
-		CalibrationSampleEvery: 0,
-	})
-	if got := dbEnabled.engine.exec.Calibrator.SampleEvery(); got != defaultOptionsCalibrationSampleEvery {
-		t.Fatalf("expected default calibration sampleEvery=%d, got=%d", defaultOptionsCalibrationSampleEvery, got)
-	}
-
-	dbDisabled, _ := openTempDBUint64(t, Options{
-		AnalyzeInterval:        -1,
-		CalibrationEnabled:     false,
-		CalibrationSampleEvery: 1,
-	})
-	if got := dbDisabled.engine.exec.Calibrator.SampleEvery(); got != 0 {
-		t.Fatalf("expected calibration sampleEvery=0 when disabled, got=%d", got)
-	}
-}
-
-func TestTraceAndCalibrationDisabled_BeginTraceReturnsNil(t *testing.T) {
-	db, _ := openTempDBUint64(t, Options{
-		AnalyzeInterval:        -1,
-		CalibrationEnabled:     false,
-		CalibrationSampleEvery: 1,
-		TraceSink:              nil,
-		TraceSampleEvery:       1,
-	})
-	if db.engine.exec.TraceOrCalibrationSamplingEnabled() {
-		t.Fatalf("expected trace/calibration sampling to be disabled")
+	if db.engine.exec.TraceSamplingEnabled() {
+		t.Fatalf("expected trace sampling to be disabled")
 	}
 
 	q := qx.Query(qx.EQ("age", 10))
@@ -614,7 +371,62 @@ func TestTraceAndCalibrationDisabled_BeginTraceReturnsNil(t *testing.T) {
 	}
 	defer preparedQ.Release()
 	if tr := db.engine.beginTraceForTests(viewQ); tr != nil {
-		t.Fatalf("expected nil trace when trace sink and calibration are disabled")
+		t.Fatalf("expected nil trace when trace sink is disabled")
+	}
+}
+
+func TestTryPlanOrdered_AllowsPointerSortField(t *testing.T) {
+	db := newTestDB(t, testOptions{})
+	db.seedGeneratedData(t, 10_000, func(id uint64) testRec {
+		rec := testRec{
+			Name:     fmt.Sprintf("user_%05d", id),
+			Active:   id%20 != 0,
+			FullName: fmt.Sprintf("FN-%05d", id),
+		}
+		if id%10 != 0 {
+			opt := fmt.Sprintf("opt-%05d", id)
+			rec.Opt = &opt
+		}
+		return rec
+	})
+
+	q := qx.Query(
+		qx.NOT(qx.EQ("active", false)),
+	).Sort("opt", qx.DESC).Offset(10).Limit(25)
+
+	prepared, shape, err := db.prepareQuery(q)
+	if err != nil {
+		t.Fatalf("prepareQuery: %v", err)
+	}
+	defer prepared.Release()
+
+	view := db.view()
+	trace := Trace{sink: func(TraceEvent) {}}
+	got, ok, err := view.tryPlanOrdered(&shape, &trace)
+	if err != nil {
+		t.Fatalf("tryPlanOrdered: %v", err)
+	}
+	if !ok {
+		t.Fatalf("tryPlanOrdered: ok=false estimated=%d ordered=%v fallback=%v", trace.ev.EstimatedRows, trace.ev.EstimatedCost, trace.ev.FallbackCost)
+	}
+	if trace.ev.Plan != string(PlanOrdered) {
+		t.Fatalf("unexpected plan: got=%q want=%q", trace.ev.Plan, PlanOrdered)
+	}
+
+	want := make([]uint64, 0, 25)
+	skipped := 0
+	for id := uint64(10_000); id >= 1 && len(want) < 25; id-- {
+		if id%10 == 0 || id%20 == 0 {
+			continue
+		}
+		if skipped < 10 {
+			skipped++
+			continue
+		}
+		want = append(want, id)
+	}
+	if !slices.Equal(got, want) {
+		t.Fatalf("tryPlanOrdered result mismatch: got=%v want=%v", got, want)
 	}
 }
 
@@ -734,269 +546,6 @@ func TestPlannerOrderedFallbackProbeFactor_Adaptive(t *testing.T) {
 	if highSkew <= lowSkew {
 		t.Fatalf("expected higher skew to increase fallback probe factor: low=%.3f high=%.3f", lowSkew, highSkew)
 	}
-}
-
-func TestPlannerCalibration_InfluencesORNoOrderDecision(t *testing.T) {
-	db, _ := openTempDBUint64(t, Options{
-		AnalyzeInterval:        -1,
-		CalibrationEnabled:     true,
-		CalibrationSampleEvery: 1,
-	})
-	_ = seedData(t, db, 2_000)
-
-	q := qx.Query(
-		qx.OR(
-			qx.EQ("active", true),
-			qx.EQ("name", "alice"),
-		),
-	).Limit(100)
-
-	setORPlannerStatsSnapshotForTest(db, 100_000, PlannerFieldStats{
-		DistinctKeys:    100_000,
-		NonEmptyKeys:    100_000,
-		TotalBucketCard: 100_000,
-		AvgBucketCard:   1,
-		MaxBucketCard:   2,
-		P50BucketCard:   1,
-		P95BucketCard:   2,
-	})
-
-	branches := newPlannerORBranches(3)
-	branches.Append(makeORBranchForCalibrationDecisionTest(4_000, 4))
-	branches.Append(makeORBranchForCalibrationDecisionTest(4_000, 4))
-	branches.Append(makeORBranchForCalibrationDecisionTest(4_000, 4))
-	defer branches.Release()
-
-	base := db.engine.decidePlanORNoOrder(q, branches)
-	if !base.use {
-		t.Fatalf("expected base decision to use OR no-order plan")
-	}
-
-	err := db.SetCalibrationSnapshot(CalibrationSnapshot{
-		UpdatedAt: time.Now(),
-		Multipliers: map[string]float64{
-			"plan_or_merge_no_order": 3.8,
-		},
-	})
-	if err != nil {
-		t.Fatalf("SetCalibrationSnapshot: %v", err)
-	}
-
-	adjusted := db.engine.decidePlanORNoOrder(q, branches)
-	if adjusted.use {
-		t.Fatalf("expected calibrated decision to reject OR no-order plan")
-	}
-}
-
-func TestPlannerCalibration_SaveLoadRoundTrip(t *testing.T) {
-	db, _ := openTempDBUint64(t, Options{
-		AnalyzeInterval:    -1,
-		CalibrationEnabled: true,
-	})
-
-	err := db.SetCalibrationSnapshot(CalibrationSnapshot{
-		UpdatedAt: time.Now().UTC().Round(time.Second),
-		Multipliers: map[string]float64{
-			"plan_or_merge_no_order":     1.65,
-			"plan_or_merge_order_merge":  1.20,
-			"plan_or_merge_order_stream": 1.05,
-			"plan_ordered":               0.88,
-		},
-		Samples: map[string]uint64{
-			"plan_or_merge_no_order":     10,
-			"plan_or_merge_order_merge":  7,
-			"plan_or_merge_order_stream": 5,
-			"plan_ordered":               3,
-		},
-	})
-	if err != nil {
-		t.Fatalf("SetCalibrationSnapshot: %v", err)
-	}
-
-	path := filepath.Join(t.TempDir(), "planner_calibration.json")
-	if err = db.SaveCalibration(path); err != nil {
-		t.Fatalf("SaveCalibration: %v", err)
-	}
-
-	db2, _ := openTempDBUint64(t, Options{
-		AnalyzeInterval:    -1,
-		CalibrationEnabled: true,
-	})
-	if err = db2.LoadCalibration(path); err != nil {
-		t.Fatalf("LoadCalibration: %v", err)
-	}
-
-	got, ok := db2.GetCalibrationSnapshot()
-	if !ok {
-		t.Fatalf("expected snapshot after load")
-	}
-
-	assertApproxMultiplier(t, got.Multipliers["plan_or_merge_no_order"], 1.65)
-	assertApproxMultiplier(t, got.Multipliers["plan_or_merge_order_merge"], 1.20)
-	assertApproxMultiplier(t, got.Multipliers["plan_or_merge_order_stream"], 1.05)
-	assertApproxMultiplier(t, got.Multipliers["plan_ordered"], 0.88)
-	if got.Samples["plan_or_merge_no_order"] != 10 {
-		t.Fatalf("unexpected sample count for plan_or_merge_no_order: %d", got.Samples["plan_or_merge_no_order"])
-	}
-	if got.Samples["plan_ordered"] != 3 {
-		t.Fatalf("unexpected sample count for plan_ordered: %d", got.Samples["plan_ordered"])
-	}
-}
-
-func TestPlannerCalibration_AutoPersist(t *testing.T) {
-	dir := t.TempDir()
-	dbPath := filepath.Join(dir, "auto_persist.db")
-
-	opts := Options{
-		AnalyzeInterval:    -1,
-		CalibrationEnabled: true,
-		PersistCalibration: true,
-	}
-
-	db, raw := openBoltAndNew[uint64, Rec](t, dbPath, opts)
-	calPath := db.engine.exec.Calibrator.PersistPath()
-
-	if err := db.SetCalibrationSnapshot(CalibrationSnapshot{
-		UpdatedAt: time.Now(),
-		Multipliers: map[string]float64{
-			"plan_ordered": 1.42,
-		},
-		Samples: map[string]uint64{
-			"plan_ordered": 12,
-		},
-	}); err != nil {
-		t.Fatalf("SetCalibrationSnapshot: %v", err)
-	}
-
-	if err := db.Close(); err != nil {
-		t.Fatalf("Close: %v", err)
-	}
-	if err := raw.Close(); err != nil {
-		t.Fatalf("raw close: %v", err)
-	}
-	if _, err := os.Stat(calPath); err != nil {
-		t.Fatalf("expected persisted calibration file %q: %v", calPath, err)
-	}
-
-	db2, raw2 := openBoltAndNew[uint64, Rec](t, dbPath, opts)
-	defer func() { _ = db2.Close() }()
-	defer func() { _ = raw2.Close() }()
-
-	snap, ok := db2.GetCalibrationSnapshot()
-	if !ok {
-		t.Fatalf("expected snapshot after reopen")
-	}
-	assertApproxMultiplier(t, snap.Multipliers["plan_ordered"], 1.42)
-	if snap.Samples["plan_ordered"] != 12 {
-		t.Fatalf("unexpected sample count after reopen: %d", snap.Samples["plan_ordered"])
-	}
-}
-
-func TestPlannerCalibration_AutoPersist_DisabledUsesFrozenState(t *testing.T) {
-	dir := t.TempDir()
-	dbPath := filepath.Join(dir, "auto_persist_disabled.db")
-
-	opts := Options{
-		AnalyzeInterval:    -1,
-		CalibrationEnabled: false,
-		PersistCalibration: true,
-	}
-
-	db, raw := openBoltAndNew[uint64, Rec](t, dbPath, opts)
-	calPath := db.engine.exec.Calibrator.PersistPath()
-
-	if err := db.SetCalibrationSnapshot(CalibrationSnapshot{
-		UpdatedAt: time.Now(),
-		Multipliers: map[string]float64{
-			"plan_ordered": 1.42,
-		},
-		Samples: map[string]uint64{
-			"plan_ordered": 12,
-		},
-	}); err != nil {
-		t.Fatalf("SetCalibrationSnapshot: %v", err)
-	}
-
-	if err := db.Close(); err != nil {
-		t.Fatalf("Close: %v", err)
-	}
-	if err := raw.Close(); err != nil {
-		t.Fatalf("raw close: %v", err)
-	}
-	if _, err := os.Stat(calPath); err != nil {
-		t.Fatalf("expected persisted calibration file %q: %v", calPath, err)
-	}
-
-	db2, raw2 := openBoltAndNew[uint64, Rec](t, dbPath, opts)
-	defer func() { _ = db2.Close() }()
-	defer func() { _ = raw2.Close() }()
-
-	snap, ok := db2.GetCalibrationSnapshot()
-	if !ok {
-		t.Fatalf("expected snapshot after reopen")
-	}
-	assertApproxMultiplier(t, snap.Multipliers["plan_ordered"], 1.42)
-	if snap.Samples["plan_ordered"] != 12 {
-		t.Fatalf("unexpected sample count after reopen: %d", snap.Samples["plan_ordered"])
-	}
-
-	view := db2.engine.queryViewForSnapshotForTests(db2.engine.snapshot.Current())
-	assertApproxMultiplier(t, view.exec.Calibrator.CostMultiplier(CalOrdered), 1.42)
-	if db2.engine.exec.TraceOrCalibrationSamplingEnabled() {
-		t.Fatalf("expected online calibration sampling to remain disabled")
-	}
-}
-
-func TestPlannerCalibration_SupportsExecutionPlanNames(t *testing.T) {
-	db, _ := openTempDBUint64(t, Options{
-		AnalyzeInterval:    -1,
-		CalibrationEnabled: true,
-	})
-
-	err := db.SetCalibrationSnapshot(CalibrationSnapshot{
-		UpdatedAt: time.Now(),
-		Multipliers: map[string]float64{
-			"plan_limit_order_basic":  1.15,
-			"plan_limit_order_prefix": 0.92,
-		},
-		Samples: map[string]uint64{
-			"plan_limit_order_basic":  4,
-			"plan_limit_order_prefix": 7,
-		},
-	})
-	if err != nil {
-		t.Fatalf("SetCalibrationSnapshot: %v", err)
-	}
-
-	snap, ok := db.GetCalibrationSnapshot()
-	if !ok {
-		t.Fatalf("expected snapshot")
-	}
-	assertApproxMultiplier(t, snap.Multipliers["plan_limit_order_basic"], 1.15)
-	assertApproxMultiplier(t, snap.Multipliers["plan_limit_order_prefix"], 0.92)
-	if snap.Samples["plan_limit_order_basic"] != 4 {
-		t.Fatalf("unexpected sample count: %d", snap.Samples["plan_limit_order_basic"])
-	}
-	if snap.Samples["plan_limit_order_prefix"] != 7 {
-		t.Fatalf("unexpected sample count: %d", snap.Samples["plan_limit_order_prefix"])
-	}
-}
-
-func assertApproxMultiplier(t *testing.T, got, want float64) {
-	t.Helper()
-	if math.Abs(got-want) > 0.001 {
-		t.Fatalf("multiplier mismatch: got=%v want=%v", got, want)
-	}
-}
-
-func setORPlannerStatsSnapshotForTest(db *DB[uint64, Rec], universe uint64, scoreStats PlannerFieldStats) {
-	db.engine.exec.Stats.Store(&PlannerStatsSnapshot{
-		Version:             1,
-		UniverseCardinality: universe,
-		Fields: map[string]PlannerFieldStats{
-			"score": scoreStats,
-		},
-	})
 }
 
 func TestTracer_ORNoOrderAdaptiveStopsAtLimit(t *testing.T) {
@@ -3058,9 +2607,7 @@ func TestPlannerORBranchesOrdered_AvoidsMaterializingDeferredOrderRangeLeaves(t 
 
 func TestBuildPredicatesOrdered_MergesPositiveNumericRangeLeavesOnSameField(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
-		AnalyzeInterval:        -1,
-		CalibrationEnabled:     true,
-		CalibrationSampleEvery: -1,
+		AnalyzeInterval: -1,
 	})
 
 	seedGeneratedUint64Data(t, db, 1_000, func(i int) *Rec {

@@ -190,18 +190,13 @@ func TestPlannerShadow_NoOrderOR_ChosenVsBaseline(t *testing.T) {
 	plannerShadowAssertNoMoreRowsExamined(t, chosen, baseline)
 }
 
-func TestPlannerShadow_OrderedOR_StreamVsFallback(t *testing.T) {
+func TestPlannerShadow_OrderedOR_MergeVsFallback(t *testing.T) {
 	recorder := &traceContractRecorder{}
 	db := newTestDB(t, testOptions{
-		CalibrationEnabled: true,
-		TraceSink:          recorder.sink,
-		TraceSampleEvery:   1,
+		TraceSink:        recorder.sink,
+		TraceSampleEvery: 1,
 	})
 	_ = db.seedData(t, 20_000)
-	db.setCalibrationSnapshot(t, testCalibrationSnapshot(map[string]float64{
-		"plan_or_merge_order_merge":  2.00,
-		"plan_or_merge_order_stream": 0.40,
-	}))
 
 	q := plannerArgminOROrderStreamQuery()
 	h := newPlannerShadowHarness(t, db, recorder, q)
@@ -209,8 +204,8 @@ func TestPlannerShadow_OrderedOR_StreamVsFallback(t *testing.T) {
 	chosen := h.run("shadow_or_order_stream_chosen", func(view *View, viewQ *qir.Shape, trace *Trace) ([]uint64, bool, error) {
 		return view.tryPlanORMergeMode(viewQ, trace)
 	})
-	if chosen.trace.Plan != string(PlanORMergeOrderStream) {
-		t.Fatalf("expected chosen ordered OR plan %q, got %q", PlanORMergeOrderStream, chosen.trace.Plan)
+	if chosen.trace.Plan != string(PlanORMergeOrderMerge) {
+		t.Fatalf("expected chosen ordered OR plan %q, got %q", PlanORMergeOrderMerge, chosen.trace.Plan)
 	}
 
 	fallback := h.run("shadow_or_order_fallback", func(view *View, viewQ *qir.Shape, trace *Trace) ([]uint64, bool, error) {
@@ -239,19 +234,13 @@ func TestPlannerShadow_OrderedOR_StreamVsFallback(t *testing.T) {
 	plannerShadowAssertNoMoreRowsExamined(t, chosen, fallback)
 }
 
-func TestPlannerShadow_OrderedORMergeVsFallback(t *testing.T) {
+func TestPlannerShadow_OrderedOR_StreamVsFallback(t *testing.T) {
 	recorder := &traceContractRecorder{}
 	db := newTestDB(t, testOptions{
-		CalibrationEnabled: true,
-		TraceSink:          recorder.sink,
-		TraceSampleEvery:   1,
+		TraceSink:        recorder.sink,
+		TraceSampleEvery: 1,
 	})
 	_ = db.seedData(t, 20_000)
-
-	db.setCalibrationSnapshot(t, testCalibrationSnapshot(map[string]float64{
-		"plan_or_merge_order_merge":  0.45,
-		"plan_or_merge_order_stream": 2.00,
-	}))
 
 	q := plannerArgminOROrderMergeQuery()
 	h := newPlannerShadowHarness(t, db, recorder, q)
@@ -259,8 +248,8 @@ func TestPlannerShadow_OrderedORMergeVsFallback(t *testing.T) {
 	chosen := h.run("shadow_or_order_merge_chosen", func(view *View, viewQ *qir.Shape, trace *Trace) ([]uint64, bool, error) {
 		return view.tryPlanORMergeMode(viewQ, trace)
 	})
-	if chosen.trace.Plan != string(PlanORMergeOrderMerge) {
-		t.Fatalf("expected chosen ordered OR plan %q, got %q", PlanORMergeOrderMerge, chosen.trace.Plan)
+	if chosen.trace.Plan != string(PlanORMergeOrderStream) {
+		t.Fatalf("expected chosen ordered OR plan %q, got %q", PlanORMergeOrderStream, chosen.trace.Plan)
 	}
 
 	fallback := h.run("shadow_or_order_merge_fallback", func(view *View, viewQ *qir.Shape, trace *Trace) ([]uint64, bool, error) {

@@ -1,10 +1,8 @@
 package rbi
 
 import (
-	"encoding/json"
 	"errors"
 	"math/rand/v2"
-	"os"
 	"time"
 
 	"github.com/vapstack/rbi/internal/qagg"
@@ -44,112 +42,11 @@ const (
 )
 
 type (
-	TraceEvent          = qexec.TraceEvent
-	TraceORRoute        = qexec.TraceORRoute
-	TraceORBranch       = qexec.TraceORBranch
-	PlannerFieldStats   = qexec.PlannerFieldStats
-	CalibrationSnapshot = qexec.CalibrationSnapshot
+	TraceEvent        = qexec.TraceEvent
+	TraceORRoute      = qexec.TraceORRoute
+	TraceORBranch     = qexec.TraceORBranch
+	PlannerFieldStats = qexec.PlannerFieldStats
 )
-
-func (db *DB[K, V]) initCalibration() {
-	db.engine.exec.Calibrator.Init()
-
-	path := db.engine.exec.Calibrator.PersistPath()
-	if path == "" {
-		return
-	}
-
-	if err := db.LoadCalibration(path); err != nil && !errors.Is(err, os.ErrNotExist) {
-		db.logger.Printf("rbi: failed to load planner calibration (%v): %v", path, err)
-	}
-}
-
-func (db *DB[K, V]) persistCalibrationOnClose() error {
-	path := db.engine.exec.Calibrator.PersistPath()
-	if path == "" {
-		return nil
-	}
-	if !db.engine.exec.Calibrator.HasState() {
-		return nil
-	}
-	return db.saveCalibration(path)
-}
-
-// GetCalibrationSnapshot returns a copy of current planner calibration state.
-//
-// The bool result is false if state was not initialized yet.
-//
-// In indexed mode startup initializes calibration state when calibration is
-// enabled. In transparent mode no runtime planner exists, so this method
-// returns (zero, false).
-func (db *DB[K, V]) GetCalibrationSnapshot() (CalibrationSnapshot, bool) {
-	if db.engine == nil {
-		return CalibrationSnapshot{}, false
-	}
-	return db.engine.exec.Calibrator.Snapshot()
-}
-
-// SetCalibrationSnapshot replaces planner calibration state with the provided snapshot.
-//
-// In transparent mode no runtime planner exists, so the method returns ErrNoIndex.
-func (db *DB[K, V]) SetCalibrationSnapshot(s CalibrationSnapshot) error {
-	if err := db.unavailableErr(); err != nil {
-		return err
-	}
-	if db.engine == nil {
-		return ErrNoIndex
-	}
-	return db.engine.exec.Calibrator.SetSnapshot(s)
-}
-
-// SaveCalibration writes planner calibration snapshot to a JSON file.
-func (db *DB[K, V]) SaveCalibration(path string) error {
-	if db.engine == nil {
-		return ErrNoIndex
-	}
-	return db.saveCalibration(path)
-}
-
-func (db *DB[K, V]) saveCalibration(path string) error {
-	if path == "" {
-		return errors.New("planner calibration path is empty")
-	}
-
-	snap, ok := db.GetCalibrationSnapshot()
-	if !ok {
-		snap = db.engine.exec.Calibrator.SnapshotOrNew()
-	}
-
-	raw, err := json.MarshalIndent(snap, "", "  ")
-	if err != nil {
-		return err
-	}
-	raw = append(raw, '\n')
-	return os.WriteFile(path, raw, 0o644)
-}
-
-// LoadCalibration reads planner calibration snapshot from a JSON file.
-func (db *DB[K, V]) LoadCalibration(path string) error {
-	if err := db.unavailableErr(); err != nil {
-		return err
-	}
-	if db.engine == nil {
-		return ErrNoIndex
-	}
-	if path == "" {
-		return errors.New("planner calibration path is empty")
-	}
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		return err
-	}
-
-	var snap CalibrationSnapshot
-	if err = json.Unmarshal(raw, &snap); err != nil {
-		return err
-	}
-	return db.SetCalibrationSnapshot(snap)
-}
 
 const (
 	// defaultAnalyzeSoftBudget bounds one periodic analyze cycle.

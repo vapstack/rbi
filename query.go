@@ -81,7 +81,7 @@ func (db *DB[K, V]) queryRecords(tx *bbolt.Tx, snap *snapshot.View, q *qir.Shape
 	view := db.engine.exec.AcquireView(snap)
 	defer db.engine.exec.ReleaseView(view)
 
-	if !db.engine.exec.TraceOrCalibrationSamplingEnabled() {
+	if !db.engine.exec.TraceSamplingEnabled() {
 		if empty, err := view.TryQueryEmptyOnSnapshot(q); empty || err != nil {
 			return nil, err
 		}

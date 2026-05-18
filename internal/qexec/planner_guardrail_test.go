@@ -34,15 +34,10 @@ func plannerGuardrailOpenSeededDB(
 	t.Helper()
 
 	db := newTestDB(t, testOptions{
-		CalibrationEnabled: true,
-		TraceSink:          recorder.sink,
-		TraceSampleEvery:   1,
+		TraceSink:        recorder.sink,
+		TraceSampleEvery: 1,
 	})
 	_ = db.seedData(t, 20_000)
-	db.setCalibrationSnapshot(t, testCalibrationSnapshot(map[string]float64{
-		"plan_or_merge_order_merge":  2.00,
-		"plan_or_merge_order_stream": 0.40,
-	}))
 	return db
 }
 
@@ -53,15 +48,10 @@ func plannerGuardrailOpenOrderedORMergeDB(
 	t.Helper()
 
 	db := newTestDB(t, testOptions{
-		CalibrationEnabled: true,
-		TraceSink:          recorder.sink,
-		TraceSampleEvery:   1,
+		TraceSink:        recorder.sink,
+		TraceSampleEvery: 1,
 	})
 	_ = db.seedData(t, 20_000)
-	db.setCalibrationSnapshot(t, testCalibrationSnapshot(map[string]float64{
-		"plan_or_merge_order_merge":  0.45,
-		"plan_or_merge_order_stream": 2.00,
-	}))
 	return db
 }
 
@@ -324,7 +314,7 @@ func TestPlannerGuardrails_NoOrderORAdaptiveFamily(t *testing.T) {
 	})
 }
 
-func TestPlannerGuardrails_OrderedORStreamFamily(t *testing.T) {
+func TestPlannerGuardrails_OrderedORMergeNaturalFamily(t *testing.T) {
 	base := plannerArgminOROrderStreamQuery()
 	q40 := cloneQuery(base)
 	q40.Window.Limit = 40
@@ -332,19 +322,19 @@ func TestPlannerGuardrails_OrderedORStreamFamily(t *testing.T) {
 	q80.Window.Limit = 80
 
 	runPlannerGuardrailFamily(t, plannerGuardrailFamily{
-		name: "OrderedORStreamFamily",
+		name: "OrderedORMergeNaturalFamily",
 		open: plannerGuardrailOpenSeededDB,
 		cases: []plannerGuardrailCase{
-			{name: "Limit40", q: q40, wantChosenPlan: PlanORMergeOrderStream},
-			{name: "Limit80", q: q80, wantChosenPlan: PlanORMergeOrderStream},
-			{name: "Limit120", q: base, wantChosenPlan: PlanORMergeOrderStream},
+			{name: "Limit40", q: q40, wantChosenPlan: PlanORMergeOrderMerge},
+			{name: "Limit80", q: q80, wantChosenPlan: PlanORMergeOrderMerge},
+			{name: "Limit120", q: base, wantChosenPlan: PlanORMergeOrderMerge},
 		},
 		runChosen:      plannerGuardrailRunTryPlanORMergeMode,
 		runAlternative: plannerGuardrailRunForcedOROrderFallback,
 	})
 }
 
-func TestPlannerGuardrails_OrderedORMergeFamily(t *testing.T) {
+func TestPlannerGuardrails_OrderedORStreamNaturalFamily(t *testing.T) {
 	base := plannerArgminOROrderMergeQuery()
 	q60 := cloneQuery(base)
 	q60.Window.Limit = 60
@@ -352,12 +342,12 @@ func TestPlannerGuardrails_OrderedORMergeFamily(t *testing.T) {
 	q90.Window.Limit = 90
 
 	runPlannerGuardrailFamily(t, plannerGuardrailFamily{
-		name: "OrderedORMergeFamily",
+		name: "OrderedORStreamNaturalFamily",
 		open: plannerGuardrailOpenOrderedORMergeDB,
 		cases: []plannerGuardrailCase{
-			{name: "Limit60", q: q60, wantChosenPlan: PlanORMergeOrderMerge},
-			{name: "Limit90", q: q90, wantChosenPlan: PlanORMergeOrderMerge},
-			{name: "Limit120", q: base, wantChosenPlan: PlanORMergeOrderMerge},
+			{name: "Limit60", q: q60, wantChosenPlan: PlanORMergeOrderStream},
+			{name: "Limit90", q: q90, wantChosenPlan: PlanORMergeOrderStream},
+			{name: "Limit120", q: base, wantChosenPlan: PlanORMergeOrderStream},
 		},
 		runChosen:      plannerGuardrailRunTryPlanORMergeMode,
 		runAlternative: plannerGuardrailRunForcedOROrderFallback,
