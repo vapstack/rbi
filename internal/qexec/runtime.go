@@ -18,8 +18,7 @@ type Config struct {
 	NumericRangeBucketMinFieldKeys int
 	NumericRangeBucketMinSpanKeys  int
 
-	AnalyzeInterval   time.Duration
-	AnalyzeSoftBudget time.Duration
+	AnalyzeInterval time.Duration
 
 	TraceSink        func(TraceEvent)
 	TraceSampleEvery int
@@ -48,8 +47,7 @@ func NewRuntime(cfg Config) *Runtime {
 		NumericRangeBucketMinFieldKeys: cfg.NumericRangeBucketMinFieldKeys,
 		NumericRangeBucketMinSpanKeys:  cfg.NumericRangeBucketMinSpanKeys,
 		Analyzer: &Analyzer{
-			Interval:   cfg.AnalyzeInterval,
-			SoftBudget: cfg.AnalyzeSoftBudget,
+			Interval: cfg.AnalyzeInterval,
 		},
 		Tracer: NewTracer(cfg.TraceSink, cfg.TraceSampleEvery),
 		viewPool: pooled.Pointers[View]{
@@ -76,11 +74,9 @@ func (r *Runtime) FieldNameByOrdinal(ordinal int) string {
 }
 
 type Analyzer struct {
-	Interval   time.Duration
-	Stop       chan struct{}
-	Done       chan struct{}
-	SoftBudget time.Duration
-	Cursor     int
+	Interval time.Duration
+	Stop     chan struct{}
+	Done     chan struct{}
 
 	sync.Mutex
 }

@@ -5,7 +5,6 @@ import (
 	"strconv"
 	"sync"
 	"testing"
-	"time"
 	"unsafe"
 
 	"github.com/vapstack/qx"
@@ -920,24 +919,13 @@ func BenchmarkPlannerStats(b *testing.B) {
 			b.ReportAllocs()
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
-				db.exec.RefreshPlannerStatsOnSnapshot(snap, 0, false)
+				db.exec.RefreshPlannerStatsOnSnapshot(snap)
 			}
 			if cur := db.exec.Stats.Load(); cur != nil {
 				qexecBenchCount = uint64(len(cur.Fields))
 			}
 		})
 
-		b.Run("RefreshPlannerStatsCursorBudget", func(b *testing.B) {
-			snap := db.snap
-			b.ReportAllocs()
-			b.ResetTimer()
-			for i := 0; i < b.N; i++ {
-				db.exec.RefreshPlannerStatsOnSnapshot(snap, time.Nanosecond, true)
-			}
-			if cur := db.exec.Stats.Load(); cur != nil {
-				qexecBenchCount = uint64(len(cur.Fields))
-			}
-		})
 	})
 
 	b.Run("Rows100K/FieldStatsUniqueFastPath", func(b *testing.B) {

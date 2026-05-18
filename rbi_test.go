@@ -1008,6 +1008,40 @@ func TestIndexTags_MeasureOnlyDBKeepsSnapshotMode(t *testing.T) {
 	}
 }
 
+func TestPlannerAnalyzeScheduler_MeasureOnlyRefreshesUniverse(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "measure_only_analyze.db")
+	db, raw := openBoltAndNew[uint64, measureOnlyRec](t, path, Options{AnalyzeInterval: 5 * time.Millisecond})
+	t.Cleanup(func() {
+		_ = db.Close()
+		_ = raw.Close()
+	})
+
+	if len(db.engine.schema.Indexed) != 0 {
+		t.Fatalf("measure-only DB indexed fields=%d, want 0", len(db.engine.schema.Indexed))
+	}
+
+	start := db.PlannerStats()
+	if start.UniverseCardinality != 0 {
+		t.Fatalf("initial planner universe=%d want 0", start.UniverseCardinality)
+	}
+	if err := db.Set(1, &measureOnlyRec{Amount: 7}); err != nil {
+		t.Fatalf("Set measure-only record: %v", err)
+	}
+
+	deadline := time.Now().Add(250 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		stats := db.PlannerStats()
+		if stats.Version > start.Version && stats.UniverseCardinality == 1 {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	stats := db.PlannerStats()
+	t.Fatalf("measure-only analyzer did not refresh universe: start_version=%d version=%d universe=%d", start.Version, stats.Version, stats.UniverseCardinality)
+}
+
 func requireMeasureOnlySum(t *testing.T, db *DB[uint64, measureOnlyRec], want int64) {
 	t.Helper()
 	result, err := db.Aggregate(qx.Aggregate(qx.SUM("amount").AS("amount_sum")))

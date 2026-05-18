@@ -500,7 +500,6 @@ func newQueryEngineForRuntime(rt *schema.Runtime, options *Options, strKey bool)
 			NumericRangeBucketMinFieldKeys: options.NumericRangeBucketMinFieldKeys,
 			NumericRangeBucketMinSpanKeys:  options.NumericRangeBucketMinSpanKeys,
 			AnalyzeInterval:                plannerAnalyzeInterval(options.AnalyzeInterval),
-			AnalyzeSoftBudget:              defaultAnalyzeSoftBudget,
 			TraceSink:                      options.TraceSink,
 			TraceSampleEvery:               options.TraceSampleEvery,
 		}),

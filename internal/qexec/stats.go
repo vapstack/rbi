@@ -9,61 +9,18 @@ import (
 	"github.com/vapstack/rbi/internal/snapshot"
 )
 
-func (r *Runtime) RefreshPlannerStatsOnSnapshot(snap *snapshot.View, softBudget time.Duration, useCursor bool) {
+func (r *Runtime) RefreshPlannerStatsOnSnapshot(snap *snapshot.View) {
 	fieldNames := r.sortedPlannerFieldNames()
 	universeCardinality := snap.UniverseCardinality()
-
-	prev := r.Stats.Load()
-	capHint := len(fieldNames)
-	if prev != nil && len(prev.Fields) > capHint {
-		capHint = len(prev.Fields)
-	}
 
 	out := PlannerStatsSnapshot{
 		GeneratedAt:         time.Now(),
 		UniverseCardinality: universeCardinality,
-		Fields:              make(map[string]PlannerFieldStats, capHint),
+		Fields:              make(map[string]PlannerFieldStats, len(fieldNames)),
 	}
 
-	if prev != nil {
-		for k, v := range prev.Fields {
-			out.Fields[k] = v
-		}
-	}
-
-	startIdx := 0
-	if useCursor && len(fieldNames) > 0 {
-		if r.Analyzer.Cursor < 0 || r.Analyzer.Cursor >= len(fieldNames) {
-			r.Analyzer.Cursor = 0
-		}
-		startIdx = r.Analyzer.Cursor
-	}
-
-	processed := 0
-	deadline := time.Time{}
-	if softBudget > 0 {
-		deadline = time.Now().Add(softBudget)
-	}
-
-	for i := 0; i < len(fieldNames); i++ {
-		if !deadline.IsZero() && processed > 0 && time.Now().After(deadline) {
-			break
-		}
-
-		fieldIdx := i
-		if useCursor {
-			fieldIdx = (startIdx + i) % len(fieldNames)
-		}
-		fieldName := fieldNames[fieldIdx]
-
+	for _, fieldName := range fieldNames {
 		out.Fields[fieldName] = r.collectPlannerFieldStatsFromIndexView(snap, fieldName)
-		processed++
-	}
-
-	if useCursor && len(fieldNames) > 0 && processed > 0 {
-		r.Analyzer.Cursor = (startIdx + processed) % len(fieldNames)
-	} else if !useCursor {
-		r.Analyzer.Cursor = 0
 	}
 
 	out.Version = r.StatsVersion.Add(1)

@@ -48,15 +48,10 @@ type (
 	PlannerFieldStats = qexec.PlannerFieldStats
 )
 
-const (
-	// defaultAnalyzeSoftBudget bounds one periodic analyze cycle.
-	// A zero/negative value means no time budget.
-	defaultAnalyzeSoftBudget = 100 * time.Millisecond
-)
-
 // RefreshPlannerStats rebuilds planner statistics from the current in-memory index.
 //
-// This is a synchronous, full refresh intended for explicit/manual calls.
+// This is a synchronous, full refresh: the call returns after the planner stats
+// snapshot is rebuilt and published, or after an error.
 //
 // In indexed mode it scans the current published index snapshot and replaces
 // the planner stats payload atomically.
@@ -64,10 +59,6 @@ const (
 // In transparent mode planner stats are disabled because no runtime index
 // exists; the method returns ErrNoIndex.
 func (db *DB[K, V]) RefreshPlannerStats() error {
-	return db.refreshPlannerStatsWithBudget(0, false)
-}
-
-func (db *DB[K, V]) refreshPlannerStatsWithBudget(softBudget time.Duration, useCursor bool) error {
 	if err := db.beginOp(); err != nil {
 		return err
 	}
@@ -86,7 +77,7 @@ func (db *DB[K, V]) refreshPlannerStatsWithBudget(softBudget time.Duration, useC
 	snap, seq, ref := db.engine.snapshot.PinCurrent()
 	defer db.engine.snapshot.Unpin(seq, ref)
 
-	db.engine.exec.RefreshPlannerStatsOnSnapshot(snap, softBudget, useCursor)
+	db.engine.exec.RefreshPlannerStatsOnSnapshot(snap)
 	return nil
 }
 
@@ -155,7 +146,7 @@ func (db *DB[K, V]) runPlannerAnalyzeLoop(stop <-chan struct{}, done chan<- stru
 		case <-timer.C:
 		}
 
-		err := db.refreshPlannerStatsWithBudget(db.engine.exec.Analyzer.SoftBudget, true)
+		err := db.RefreshPlannerStats()
 		if err != nil {
 			if errors.Is(err, ErrClosed) || errors.Is(err, ErrBroken) {
 				return
