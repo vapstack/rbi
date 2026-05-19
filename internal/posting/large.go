@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"math/bits"
-	"slices"
 	"unsafe"
 )
 
@@ -203,18 +202,21 @@ func (lp *largePosting) clear() {
 }
 
 func (lp *largePosting) toArray() []uint64 {
+	keys := lp.highlowcontainer.keys
+	containers := lp.highlowcontainer.containers
 	out := make([]uint64, 0, lp.cardinality())
-	for i := 0; i < lp.highlowcontainer.size(); i++ {
-		hs := uint64(lp.highlowcontainer.getKeyAtIndex(i)) << 32
-		out = lp.highlowcontainer.getContainerAtIndex(i).appendToArray64(out, hs)
+	for i := 0; i < len(keys); i++ {
+		out = containers[i].appendToArray64(out, uint64(keys[i])<<32)
 	}
 	return out
 }
 
 func (rb *bitmap32) appendToArray64(dst []uint64, hs64 uint64) []uint64 {
-	for i := 0; i < rb.highlowcontainer.size(); i++ {
-		hs := hs64 | uint64(rb.highlowcontainer.getKeyAtIndex(i))<<16
-		dst = appendContainerToArray64(dst, hs, rb.highlowcontainer.getContainerAtIndex(i))
+	keys := rb.highlowcontainer.keys
+	containers := rb.highlowcontainer.containers
+	for i := 0; i < len(keys); i++ {
+		hs := hs64 | uint64(keys[i])<<16
+		dst = appendContainerToArray64(dst, hs, containers[i])
 	}
 	return dst
 }
@@ -234,7 +236,6 @@ func appendContainerToArray64(dst []uint64, hs uint64, c container16) []uint64 {
 
 func appendArrayContainerToArray64(dst []uint64, hs uint64, ac *containerArray) []uint64 {
 	start := len(dst)
-	dst = slices.Grow(dst, len(ac.content))
 	dst = dst[:start+len(ac.content)]
 	for i, v := range ac.content {
 		dst[start+i] = hs | uint64(v)
@@ -244,21 +245,21 @@ func appendArrayContainerToArray64(dst []uint64, hs uint64, ac *containerArray) 
 
 func appendBitmapContainerToArray64(dst []uint64, hs uint64, bc *containerBitmap) []uint64 {
 	start := len(dst)
-	dst = slices.Grow(dst, bc.cardinality)
-	dst = dst[:start+bc.cardinality]
+	end := start + bc.cardinality
+	dst = dst[:end]
 	it := bitmapContainerManyIterator{ptr: bc, base: 0, bitset: bc.bitmap[0]}
-	n := it.nextMany64(hs, dst[start:])
-	return dst[:start+n]
+	it.nextMany64(hs, dst[start:end])
+	return dst
 }
 
 func appendRunContainerToArray64(dst []uint64, hs uint64, rc *containerRun) []uint64 {
 	for i := range rc.iv {
 		runLen := rc.iv[i].runlen()
 		start := len(dst)
-		dst = slices.Grow(dst, runLen)
-		dst = dst[:start+runLen]
+		end := start + runLen
+		dst = dst[:end]
 		base := hs | uint64(rc.iv[i].start)
-		buf := dst[start:]
+		buf := dst[start:end]
 		for j := range buf {
 			buf[j] = base + uint64(j)
 		}
@@ -388,6 +389,22 @@ func (lp *largePosting) addMany(dat []uint64) {
 		return
 	}
 	if isNonDecreasingU64(dat) {
+		first := dat[0]
+		last := dat[len(dat)-1]
+		if len(dat) > 1 && last != ^uint64(0) && last-first == uint64(len(dat)-1) {
+			prev := first
+			for i := 1; ; i++ {
+				if i == len(dat) {
+					lp.addRange(first, last+1)
+					return
+				}
+				id := dat[i]
+				if id != prev+1 {
+					break
+				}
+				prev = id
+			}
+		}
 		lp.addManySorted(dat)
 		return
 	}

@@ -697,8 +697,42 @@ func (bc *containerBitmap) xor(a container16) container16 {
 }
 
 func (bc *containerBitmap) xorArray(value2 *containerArray) container16 {
-	answer := bc.clone().(*containerBitmap)
 	c := value2.getCardinality()
+	cardinality := bc.cardinality + c - 2*bc.andArrayCardinality(value2)
+	if cardinality <= arrayDefaultMaxSize {
+		answer := getContainerArrayWithLen(cardinality)
+		dst := answer.content
+		content := value2.content
+		arrayPos := 0
+		pos := 0
+		for wordIdx := 0; wordIdx < len(bc.bitmap); wordIdx++ {
+			word := bc.bitmap[wordIdx]
+			base := wordIdx * 64
+			for word != 0 {
+				v := uint16(base + bits.TrailingZeros64(word))
+				for arrayPos < c && content[arrayPos] < v {
+					dst[pos] = content[arrayPos]
+					pos++
+					arrayPos++
+				}
+				if arrayPos < c && content[arrayPos] == v {
+					arrayPos++
+				} else {
+					dst[pos] = v
+					pos++
+				}
+				word &= word - 1
+			}
+		}
+		for arrayPos < c {
+			dst[pos] = content[arrayPos]
+			pos++
+			arrayPos++
+		}
+		return answer
+	}
+
+	answer := bc.clone().(*containerBitmap)
 	for k := 0; k < c; k++ {
 		vc := value2.content[k]
 		index := uint(vc) >> 6
@@ -1027,6 +1061,12 @@ func (bc *containerBitmap) toArrayContainer() *containerArray {
 }
 
 func (bc *containerBitmap) fillArray(container16 []uint16) {
+	if bc.cardinality == maxCapacity {
+		for i := range container16 {
+			container16[i] = uint16(i)
+		}
+		return
+	}
 	pos := 0
 	base := 0
 	for k := 0; k < len(bc.bitmap); k++ {

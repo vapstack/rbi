@@ -471,6 +471,37 @@ func TestHotPathPools_NoAllocsAfterWarmup(t *testing.T) {
 		})
 	})
 
+	denseBitmapIDs := buildTestBitmap32IDs(4, 4097, 0)
+	denseBitmapOtherIDs := make([]uint32, len(denseBitmapIDs))
+	for high := 0; high < 4; high++ {
+		base := uint32(high) << 16
+		for i := 0; i < 4097; i++ {
+			denseBitmapOtherIDs[high*4097+i] = base + uint32(i*2)
+		}
+	}
+	denseBitmap := buildBitmap32(denseBitmapIDs...)
+	defer denseBitmap.Release()
+	denseBitmapOther := buildBitmap32(denseBitmapOtherIDs...)
+	defer denseBitmapOther.Release()
+
+	t.Run("Bitmap32AndEmptyBitmapPayloads", func(t *testing.T) {
+		requireZeroAllocsAfterPoolWarmup(t, func() {
+			out := denseBitmap.clone()
+			out.and(denseBitmapOther)
+			allocUint64Sink = out.cardinality()
+			out.Release()
+		})
+	})
+
+	t.Run("Bitmap32AndNotEmptyBitmapPayloads", func(t *testing.T) {
+		requireZeroAllocsAfterPoolWarmup(t, func() {
+			out := denseBitmap.clone()
+			out.andNot(denseBitmap)
+			allocUint64Sink = out.cardinality()
+			out.Release()
+		})
+	})
+
 	t.Run("ContainerIndexGrowWide", func(t *testing.T) {
 		requireZeroAllocsAfterPoolWarmup(t, func() {
 			allocContainerIndexScratch.grow(8)

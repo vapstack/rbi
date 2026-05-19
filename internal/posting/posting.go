@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"math/bits"
 	"unsafe"
 )
 
@@ -863,33 +864,114 @@ func fromLargeOwnedWithCardinality(lp *largePosting, card uint64) List {
 		lp.release()
 		return singleton(id)
 	}
-	if card <= SmallCap {
-		sp := getSmallPosting()
-		sp.n = uint8(card)
-		it := lp.iterator()
-		defer it.Release()
-		i := 0
-		for it.HasNext() {
-			sp.ids[i] = it.Next()
-			i++
-		}
-		lp.release()
-		return smallValue(sp)
-	}
 	if card <= MidCap {
-		mp := getMidPosting()
-		mp.n = uint8(card)
-		it := lp.iterator()
-		defer it.Release()
+		n := int(card)
+		var sp *smallPosting
+		var mp *midPosting
+		var dst []uint64
+		if n <= SmallCap {
+			sp = getSmallPosting()
+			sp.n = uint8(n)
+			dst = sp.ids[:n]
+		} else {
+			mp = getMidPosting()
+			mp.n = uint8(n)
+			dst = mp.ids[:n]
+		}
 		i := 0
-		for it.HasNext() {
-			mp.ids[i] = it.Next()
-			i++
+		for j := 0; j < len(lp.highlowcontainer.keys); j++ {
+			base32 := uint64(lp.highlowcontainer.keys[j]) << 32
+			rb := lp.highlowcontainer.containers[j]
+			for k := 0; k < len(rb.highlowcontainer.keys); k++ {
+				base := base32 | uint64(rb.highlowcontainer.keys[k])<<16
+				switch c := rb.highlowcontainer.containers[k].(type) {
+				case *containerArray:
+					for l := 0; l < len(c.content); l++ {
+						dst[i] = base | uint64(c.content[l])
+						i++
+					}
+				case *containerBitmap:
+					for l := 0; l < len(c.bitmap); l++ {
+						word := c.bitmap[l]
+						for word != 0 {
+							dst[i] = base | uint64(l*64+bits.TrailingZeros64(word))
+							i++
+							word &= word - 1
+						}
+					}
+				case *containerRun:
+					for l := 0; l < len(c.iv); l++ {
+						last := int(c.iv[l].last())
+						for v := int(c.iv[l].start); v <= last; v++ {
+							dst[i] = base | uint64(v)
+							i++
+						}
+					}
+				}
+			}
 		}
 		lp.release()
+		if n <= SmallCap {
+			return smallValue(sp)
+		}
 		return midValue(mp)
 	}
 	return largeValue(lp)
+}
+
+func fromLargeBorrowedWithCardinality(lp *largePosting, card uint64) List {
+	if card == 1 {
+		return singleton(lp.minimum())
+	}
+	n := int(card)
+	var sp *smallPosting
+	var mp *midPosting
+	var dst []uint64
+	if n <= SmallCap {
+		sp = getSmallPosting()
+		sp.n = uint8(n)
+		dst = sp.ids[:n]
+	} else {
+		mp = getMidPosting()
+		mp.n = uint8(n)
+		dst = mp.ids[:n]
+	}
+	i := 0
+	for j := 0; j < len(lp.highlowcontainer.keys); j++ {
+		base32 := uint64(lp.highlowcontainer.keys[j]) << 32
+		rb := lp.highlowcontainer.containers[j]
+		for k := 0; k < len(rb.highlowcontainer.keys); k++ {
+			base := base32 | uint64(rb.highlowcontainer.keys[k])<<16
+			switch c := rb.highlowcontainer.containers[k].(type) {
+			case *containerArray:
+				for l := 0; l < len(c.content); l++ {
+					dst[i] = base | uint64(c.content[l])
+					i++
+				}
+			case *containerBitmap:
+				for l := 0; l < len(c.bitmap); l++ {
+					word := c.bitmap[l]
+					for word != 0 {
+						dst[i] = base | uint64(l*64+bits.TrailingZeros64(word))
+						i++
+						word &= word - 1
+					}
+				}
+			case *containerRun:
+				for l := 0; l < len(c.iv); l++ {
+					last := int(c.iv[l].last())
+					for v := int(c.iv[l].start); v <= last; v++ {
+						dst[i] = base | uint64(v)
+						i++
+					}
+				}
+			}
+		}
+	}
+	if n <= SmallCap {
+		return smallValue(sp)
+	}
+	return midValue(mp)
 }
 
 func (p List) IsEmpty() bool {
@@ -1076,16 +1158,12 @@ func (p List) ToArray() []uint64 {
 	}
 	if sp := p.small(); sp != nil {
 		out := make([]uint64, int(sp.n))
-		for i := 0; i < int(sp.n); i++ {
-			out[i] = sp.ids[i]
-		}
+		copy(out, sp.ids[:sp.n])
 		return out
 	}
 	if mp := p.mid(); mp != nil {
 		out := make([]uint64, int(mp.n))
-		for i := 0; i < int(mp.n); i++ {
-			out[i] = mp.ids[i]
-		}
+		copy(out, mp.ids[:mp.n])
 		return out
 	}
 	return p.largeRef().toArray()
@@ -1591,6 +1669,34 @@ func (p List) BuildAddedMany(ids []uint64) List {
 		return p
 	}
 
+	if p.IsEmpty() && len(ids) <= MidCap {
+		prev := ids[0]
+		strict := true
+		for i := 1; i < len(ids); i++ {
+			id := ids[i]
+			if id <= prev {
+				strict = false
+				break
+			}
+			prev = id
+		}
+		if strict {
+			if len(ids) == 1 {
+				return singleton(ids[0])
+			}
+			if len(ids) <= SmallCap {
+				sp := getSmallPosting()
+				sp.n = uint8(len(ids))
+				copy(sp.ids[:], ids)
+				return smallValue(sp)
+			}
+			mp := getMidPosting()
+			mp.n = uint8(len(ids))
+			copy(mp.ids[:], ids)
+			return midValue(mp)
+		}
+	}
+
 	if len(ids) <= MidCap {
 		for _, id := range ids {
 			p = buildAdded(p, id)
@@ -2016,13 +2122,17 @@ func (p List) BuildOptimized() List {
 	if p.ptr == nil || p.ptr == singleValue || p.kind() != postingKindLarge {
 		return p
 	}
-	if p.IsBorrowed() {
-		p = p.Clone()
-	}
 	lp := p.largeRef()
 	card := lp.cardinality()
 	if card <= MidCap {
+		if p.IsBorrowed() {
+			return fromLargeBorrowedWithCardinality(lp, card)
+		}
 		return fromLargeOwnedWithCardinality(lp, card)
+	}
+	if p.IsBorrowed() {
+		p = p.Clone()
+		lp = p.largeRef()
 	}
 	lp.runOptimize()
 	return p

@@ -459,6 +459,26 @@ func TestContainerBitmapBitmapSpecificBranches(t *testing.T) {
 		t.Fatalf("xorBitmap full-result mismatch")
 	}
 
+	bitmapIDs := make([]uint16, 4097)
+	for i := range bitmapIDs {
+		bitmapIDs[i] = uint16(i * 2)
+	}
+	arrayIDs := make([]uint16, 32)
+	for i := range arrayIDs {
+		arrayIDs[i] = uint16(i * 4)
+	}
+	array := getContainerArrayFromSlice(arrayIDs)
+	defer array.release()
+	bitmap := buildContainerBitmap(bitmapIDs).(*containerBitmap)
+	defer bitmap.release()
+
+	xorArray := bitmap.xorArray(array)
+	defer xorArray.release()
+	if _, ok := xorArray.(*containerArray); !ok {
+		t.Fatalf("xorArray must shrink directly to array, got %T", xorArray)
+	}
+	assertSameContainerSet(t, xorArray, xorUint16(bitmapIDs, arrayIDs))
+
 	denseLeft := newContainerBitmap()
 	defer denseLeft.release()
 	denseLeft.iaddRange(0, 6000)

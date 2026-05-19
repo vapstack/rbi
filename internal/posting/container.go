@@ -1346,6 +1346,20 @@ func union2by2(set1 []uint16, set2 []uint16, buffer []uint16) int {
 		copy(buffer, set2[:])
 		return len(set2)
 	}
+	if set1[len(set1)-1] < set2[0] {
+		n := len(set1)
+		buffer = buffer[:n+len(set2)]
+		copy(buffer, set1)
+		copy(buffer[n:], set2)
+		return len(buffer)
+	}
+	if set2[len(set2)-1] < set1[0] {
+		n := len(set2)
+		buffer = buffer[:n+len(set1)]
+		copy(buffer, set2)
+		copy(buffer[n:], set1)
+		return len(buffer)
+	}
 	s1 := set1[k1]
 	s2 := set2[k2]
 	buffer = buffer[:cap(buffer)]

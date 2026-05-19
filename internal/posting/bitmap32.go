@@ -1172,6 +1172,8 @@ main:
 							rb.highlowcontainer.clearContainerAtIndex(pos1)
 						}
 						intersectionsize++
+					} else if diff != c1 {
+						diff.release()
 					}
 					pos1++
 					pos2++
@@ -1876,6 +1878,8 @@ main:
 							rb.highlowcontainer.clearContainerAtIndex(pos1)
 						}
 						intersectionsize++
+					} else if diff != c1 {
+						diff.release()
 					}
 					pos1++
 					pos2++

@@ -432,6 +432,12 @@ func TestLowLevelSetKernelsAndSearchHelpers(t *testing.T) {
 	}
 
 	unionBuf := make([]uint16, len(set1)+len(set2))
+	if n := union2by2([]uint16{1, 3, 5}, []uint16{10, 12}, unionBuf); !slices.Equal(unionBuf[:n], []uint16{1, 3, 5, 10, 12}) {
+		t.Fatalf("union2by2 disjoint ascending mismatch: got=%v", unionBuf[:n])
+	}
+	if n := union2by2([]uint16{10, 12}, []uint16{1, 3, 5}, unionBuf); !slices.Equal(unionBuf[:n], []uint16{1, 3, 5, 10, 12}) {
+		t.Fatalf("union2by2 disjoint descending mismatch: got=%v", unionBuf[:n])
+	}
 	if n := exclusiveUnion2by2(set1, set2, unionBuf); !slices.Equal(unionBuf[:n], []uint16{1, 4, 7, 8, 9, 2048}) {
 		t.Fatalf("exclusiveUnion2by2 mismatch: got=%v want=%v", unionBuf[:n], []uint16{1, 4, 7, 8, 9, 2048})
 	}
