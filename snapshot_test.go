@@ -642,12 +642,13 @@ func TestSnapshotExt_ZeroComplementLenIndexImmutableAcrossPatchToEmpty(t *testin
 	if snapshotExtLenContainsID(t, s2, "tags", 1, 1) {
 		t.Fatalf("new snapshot kept stale len=1 posting")
 	}
-	got, err := db.QueryKeys(qx.Query(qx.EQ("tags", []string{})))
+	emptyTagsQ := qx.Query(qx.EQ("tags", []string{}))
+	got, err := db.QueryKeys(emptyTagsQ)
 	if err != nil {
 		t.Fatalf("QueryKeys(empty tags): %v", err)
 	}
 	want := []uint64{1, 2, 3, 4}
-	if !slices.Equal(got, want) {
+	if !queryIDsEqual(emptyTagsQ, got, want) {
 		t.Fatalf("empty-tags query mismatch: got=%v want=%v", got, want)
 	}
 }
@@ -2748,8 +2749,9 @@ func TestSnapshotExtra_BeginQueryTxSnapshotIgnoresRealStagedBatchDeleteBeforeCom
 	if !slices.Equal(oldKeys, []uint64{1, 2, 3, 4}) {
 		t.Fatalf("pinned old snapshot changed after batch_delete publish: got=%v want=[1 2 3 4]", oldKeys)
 	}
-	oldDeleted := snapshotExtraQuerySnapshotKeys(t, db, pinned, qx.Query(qx.IN("name", []string{"bob", "carol"})))
-	if !slices.Equal(oldDeleted, []uint64{2, 3}) {
+	oldDeletedQ := qx.Query(qx.IN("name", []string{"bob", "carol"}))
+	oldDeleted := snapshotExtraQuerySnapshotKeys(t, db, pinned, oldDeletedQ)
+	if !queryIDsEqual(oldDeletedQ, oldDeleted, []uint64{2, 3}) {
 		t.Fatalf("pinned old snapshot lost batch-deleted rows after publish: got=%v want=[2 3]", oldDeleted)
 	}
 
@@ -3270,7 +3272,7 @@ func TestSnapshotExtra_PinnedOldMaterializedPredCacheSurvivesTruncateRebuild(t *
 	if err != nil {
 		t.Fatalf("QueryKeys(alpha warm): %v", err)
 	}
-	if !slices.Equal(oldAlpha, []uint64{1, 3}) {
+	if !queryIDsEqual(alphaQ, oldAlpha, []uint64{1, 3}) {
 		t.Fatalf("unexpected alpha warm result: got=%v want=[1 3]", oldAlpha)
 	}
 	oldFuture, err := db.QueryKeys(futureQ)
@@ -3314,7 +3316,7 @@ func TestSnapshotExtra_PinnedOldMaterializedPredCacheSurvivesTruncateRebuild(t *
 	}
 
 	pinnedAlpha := snapshotExtraQuerySnapshotKeys(t, db, pinned, alphaQ)
-	if !slices.Equal(pinnedAlpha, []uint64{1, 3}) {
+	if !queryIDsEqual(alphaQ, pinnedAlpha, []uint64{1, 3}) {
 		t.Fatalf("pinned old snapshot lost alpha cache result after truncate rebuild: got=%v want=[1 3]", pinnedAlpha)
 	}
 	pinnedFuture := snapshotExtraQuerySnapshotKeys(t, db, pinned, futureQ)
@@ -3594,7 +3596,7 @@ func TestSnapshotExtra_PinnedOldMaterializedPredCacheStaysExactAcrossConcurrentT
 				setFailed(fmt.Sprintf("pinned old alpha query failed: %v", err))
 				return
 			}
-			if !slices.Equal(got, wantOld) {
+			if !queryIDsEqual(alphaQ, got, wantOld) {
 				setFailed(fmt.Sprintf("pinned old alpha query mismatch: got=%v want=%v", got, wantOld))
 				return
 			}
@@ -3611,7 +3613,7 @@ func TestSnapshotExtra_PinnedOldMaterializedPredCacheStaysExactAcrossConcurrentT
 	if err != nil {
 		t.Fatalf("pinned old alpha query after churn: %v", err)
 	}
-	if !slices.Equal(gotFinal, wantOld) {
+	if !queryIDsEqual(alphaQ, gotFinal, wantOld) {
 		t.Fatalf("pinned old alpha query drift after churn: got=%v want=%v", gotFinal, wantOld)
 	}
 
@@ -3728,7 +3730,7 @@ func TestSnapshotExtra_PinnedOldNumericRangeCacheStaysExactAcrossConcurrentAgeCh
 				setFailed(fmt.Sprintf("pinned old range query failed: %v", err))
 				return
 			}
-			if !slices.Equal(got, wantOld) {
+			if !queryIDsEqual(rangeQ, got, wantOld) {
 				setFailed(fmt.Sprintf("pinned old range query mismatch: got=%v want=%v", got, wantOld))
 				return
 			}
@@ -3745,7 +3747,7 @@ func TestSnapshotExtra_PinnedOldNumericRangeCacheStaysExactAcrossConcurrentAgeCh
 	if err != nil {
 		t.Fatalf("pinned old range query after churn: %v", err)
 	}
-	if !slices.Equal(gotFinal, wantOld) {
+	if !queryIDsEqual(rangeQ, gotFinal, wantOld) {
 		t.Fatalf("pinned old range query drift after age churn: got=%v want=%v", gotFinal, wantOld)
 	}
 

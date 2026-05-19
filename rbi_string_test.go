@@ -248,11 +248,12 @@ func TestStringExt_SharedAutoBatchUniqueRejectHolePersistsAcrossReopen(t *testin
 			t.Fatalf("%s: real-hole payload mismatch: %#v", label, v)
 		}
 
-		gotAll, queryErr := db.QueryKeys(qx.Query())
+		allQ := qx.Query()
+		gotAll, queryErr := db.QueryKeys(allQ)
 		if queryErr != nil {
 			t.Fatalf("%s: QueryKeys(NOOP): %v", label, queryErr)
 		}
-		if !slices.Equal(gotAll, []string{"seed", "real-hole"}) {
+		if !queryStringIDsEqual(allQ, gotAll, []string{"seed", "real-hole"}) {
 			t.Fatalf("%s: NOOP query mismatch: got=%v want=[seed real-hole]", label, gotAll)
 		}
 
@@ -372,7 +373,7 @@ func TestStringExt_ConcurrentLazySnapshotKeyLookup(t *testing.T) {
 	}
 }
 
-func TestStringExt_PublishedReadPagesPreserveQueryAndScanOrder(t *testing.T) {
+func TestStringExt_PublishedReadPagesPreserveQuerySetAndScanOrder(t *testing.T) {
 	db, _ := openTempDBString(t)
 
 	const n = 320
@@ -389,12 +390,13 @@ func TestStringExt_PublishedReadPagesPreserveQueryAndScanOrder(t *testing.T) {
 	if snap == nil || snap.StrMap == nil {
 		t.Fatalf("expected published string snapshot")
 	}
-	gotKeys, err := db.QueryKeys(qx.Query())
+	allQ := qx.Query()
+	gotKeys, err := db.QueryKeys(allQ)
 	if err != nil {
 		t.Fatalf("QueryKeys(NOOP): %v", err)
 	}
-	if !slices.Equal(gotKeys, want) {
-		t.Fatalf("query order mismatch: got=%v want=%v", gotKeys[:min(len(gotKeys), 8)], want[:8])
+	if !queryStringIDsEqual(allQ, gotKeys, want) {
+		t.Fatalf("query set mismatch: got=%v want=%v", gotKeys[:min(len(gotKeys), 8)], want[:8])
 	}
 
 	gotScan, err := stringTestScanSnapshotKeys(db, snap, "")

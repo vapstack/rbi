@@ -466,6 +466,9 @@ func queryIDsEqual(q *qx.QX, a, b []uint64) bool {
 
 func assertQueryIDsEqual(t *testing.T, q *qx.QX, a, b []uint64) {
 	t.Helper()
+	if testQueryNoOrderPage(q) {
+		t.Fatalf("no-order page results must be checked with assertNoOrderPage: q=%+v\nA=%v\nB=%v", q, a, b)
+	}
 	if queryIDsEqual(q, a, b) {
 		return
 	}

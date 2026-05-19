@@ -143,7 +143,7 @@ func TestQuery_RouteEquivalence_StringKeys_Randomized(t *testing.T) {
 			if err != nil {
 				t.Fatalf("step=%d expectedKeysString(page %+v): %v", step, q, err)
 			}
-			if !slices.Equal(gotKeys, wantPage) {
+			if !queryStringIDsEqual(q, gotKeys, wantPage) {
 				t.Fatalf("step=%d page mismatch q=%+v\ngot=%v\nwant=%v", step, q, gotKeys, wantPage)
 			}
 		}
@@ -362,7 +362,7 @@ func TestQueryCorrectnessAgainstSeqScan_Uint64Keys(t *testing.T) {
 			if err != nil {
 				t.Fatalf("expectedKeysUint64(page): %v", err)
 			}
-			assertSameSlice(t, gotKeys, wantPageKeys)
+			assertQueryIDsEqual(t, q, gotKeys, wantPageKeys)
 
 			gotItems, err := db.Query(q)
 			if err != nil {
@@ -525,11 +525,13 @@ func TestQuery_NegativeNoOrder_ExcludesCorrectly_WithPaging(t *testing.T) {
 		t.Fatalf("QueryKeys: %v", err)
 	}
 
-	want, err := expectedKeysUint64(t, db, q)
+	fullQ := cloneQuery(q)
+	clearQueryOrderWindowForTest(fullQ)
+	full, err := expectedKeysUint64(t, db, fullQ)
 	if err != nil {
-		t.Fatalf("expectedKeysUint64: %v", err)
+		t.Fatalf("expectedKeysUint64(full): %v", err)
 	}
-	assertSameSlice(t, got, want)
+	assertNoOrderWindowSubset(t, q, got, full, "QueryKeys")
 }
 
 func TestQuery_RandomMixedMultiWrites_MatchSeqScanModel(t *testing.T) {
@@ -950,23 +952,6 @@ func TestQuery_Metamorphic_RandomizedProfiles_RouteEquivalence(t *testing.T) {
 			for i := 0; i < queryCount; i++ {
 				q := randomMetamorphicQuery(r)
 
-				base := runQueryKeysChecked(t, db, q)
-
-				nq := normalizeQueryForTest(q)
-				normalized := runQueryKeysChecked(t, db, nq)
-				if !queryIDsEqual(q, base, normalized) {
-					t.Fatalf(
-						"normalize mismatch (profile=%s, i=%d):\nq=%+v\nnq=%+v\nbase=%v\nnorm=%v",
-						p.name, i, q, nq, base, normalized,
-					)
-				}
-
-				noisy := runQueryKeysChecked(t, db, withNoisyEquivalentQuery(q, i))
-				assertQueryIDsEqual(t, q, base, noisy)
-
-				_, prepared, _, _ := assertPreparedRouteEquivalence(t, db, q)
-				assertQueryIDsEqual(t, q, base, prepared)
-
 				countQ := cloneQuery(q)
 				countQ.Order = nil
 				countQ.Window.Offset = 0
@@ -978,6 +963,32 @@ func TestQuery_Metamorphic_RandomizedProfiles_RouteEquivalence(t *testing.T) {
 						"expectedKeysUint64(count profile=%s i=%d): %v\nq=%+v",
 						p.name, i, err, q,
 					)
+				}
+
+				base := runQueryKeysChecked(t, db, q)
+
+				nq := normalizeQueryForTest(q)
+				normalized := runQueryKeysChecked(t, db, nq)
+				if queryContractNoOrderWindow(q) {
+					assertNoOrderWindowSubset(t, q, base, wantCountKeys, fmt.Sprintf("base profile=%s i=%d", p.name, i))
+					assertNoOrderWindowSubset(t, nq, normalized, wantCountKeys, fmt.Sprintf("normalize profile=%s i=%d", p.name, i))
+				} else if !queryIDsEqual(q, base, normalized) {
+					t.Fatalf("normalize mismatch (profile=%s, i=%d):\nq=%+v\nnq=%+v\nbase=%v\nnorm=%v", p.name, i, q, nq, base, normalized)
+				}
+
+				noisyQ := withNoisyEquivalentQuery(q, i)
+				noisy := runQueryKeysChecked(t, db, noisyQ)
+				if queryContractNoOrderWindow(q) {
+					assertNoOrderWindowSubset(t, noisyQ, noisy, wantCountKeys, fmt.Sprintf("noisy profile=%s i=%d", p.name, i))
+				} else {
+					assertQueryIDsEqual(t, q, base, noisy)
+				}
+
+				_, prepared, _, _ := assertPreparedRouteEquivalence(t, db, q)
+				if queryContractNoOrderWindow(q) {
+					assertNoOrderWindowSubset(t, q, prepared, wantCountKeys, fmt.Sprintf("prepared profile=%s i=%d", p.name, i))
+				} else {
+					assertQueryIDsEqual(t, q, base, prepared)
 				}
 				wantCount := uint64(len(wantCountKeys))
 

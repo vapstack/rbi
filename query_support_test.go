@@ -1242,6 +1242,9 @@ func runQueryKeysChecked(t *testing.T, db *DB[uint64, Rec], q *qx.QX) []uint64 {
 
 func assertQueryIDsEqual(t *testing.T, q *qx.QX, a, b []uint64) {
 	t.Helper()
+	if queryContractNoOrderWindow(q) {
+		t.Fatalf("no-order window results must be checked with assertNoOrderWindowSubset: q=%+v\nA=%v\nB=%v", q, a, b)
+	}
 	if queryIDsEqual(q, a, b) {
 		return
 	}

@@ -938,11 +938,12 @@ func TestIndexTags_MeasureMetadataIsSeparateFromOrdinaryIndex(t *testing.T) {
 		t.Fatalf("Set second measure record: %v", err)
 	}
 	requireMeasureTaggedSum(t, db, 142)
-	ids, err := db.QueryKeys(qx.Query(qx.EQ("status", "ok")))
+	statusQ := qx.Query(qx.EQ("status", "ok"))
+	ids, err := db.QueryKeys(statusQ)
 	if err != nil {
 		t.Fatalf("QueryKeys(status): %v", err)
 	}
-	if !slices.Equal(ids, []uint64{1, 2}) {
+	if !queryIDsEqual(statusQ, ids, []uint64{1, 2}) {
 		t.Fatalf("QueryKeys(status)=%v want [1 2]", ids)
 	}
 	if err := db.Set(1, &measureTaggedRec{Status: "ok", Amount: 43}); err != nil {
@@ -1116,11 +1117,12 @@ func TestTransparentMode_WritesAdvanceBucketSequenceAndInvalidateStaleSidecar(t 
 		t.Fatalf("bucket sequence did not advance across transparent writes: current=%d stored=%d", currentSeq, storedSeq)
 	}
 
-	keys, err := dbReopen.QueryKeys(qx.Query())
+	allQ := qx.Query()
+	keys, err := dbReopen.QueryKeys(allQ)
 	if err != nil {
 		t.Fatalf("reopen QueryKeys(all): %v", err)
 	}
-	if !slices.Equal(keys, []uint64{2, 3}) {
+	if !queryIDsEqual(allQ, keys, []uint64{2, 3}) {
 		t.Fatalf("reopen QueryKeys(all)=%v want [2 3]", keys)
 	}
 }
@@ -1821,11 +1823,12 @@ func TestWrap_PartialPersistedLoad_PreservesLenZeroComplementFlags(t *testing.T)
 			want = append(want, uint64(i))
 		}
 	}
-	got, err := db2.QueryKeys(qx.Query(qx.EQ("tags", []string{})))
+	emptyTagsQ := qx.Query(qx.EQ("tags", []string{}))
+	got, err := db2.QueryKeys(emptyTagsQ)
 	if err != nil {
 		t.Fatalf("QueryKeys(empty tags): %v", err)
 	}
-	if !slices.Equal(got, want) {
+	if !queryIDsEqual(emptyTagsQ, got, want) {
 		t.Fatalf("unexpected empty-tags result after partial load: got=%v want=%v", got, want)
 	}
 }

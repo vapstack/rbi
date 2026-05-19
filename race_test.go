@@ -1081,7 +1081,7 @@ func TestRaceExtra_PublicQueriesStayExactUnderConcurrentMaterializedCacheThrash(
 		if err != nil {
 			t.Fatalf("warm QueryKeys(%d): %v", i, err)
 		}
-		if !slices.Equal(got, tc.want) {
+		if !queryIDsEqual(tc.q, got, tc.want) {
 			t.Fatalf("warm QueryKeys(%d) mismatch: got=%v want=%v", i, got, tc.want)
 		}
 	}
@@ -1128,7 +1128,7 @@ func TestRaceExtra_PublicQueriesStayExactUnderConcurrentMaterializedCacheThrash(
 					setFailed(fmt.Sprintf("QueryKeys failed: %v", err))
 					return
 				}
-				if !slices.Equal(got, tc.want) {
+				if !queryIDsEqual(tc.q, got, tc.want) {
 					setFailed(fmt.Sprintf("QueryKeys mismatch: got=%v want=%v", got, tc.want))
 					return
 				}
@@ -1233,7 +1233,7 @@ func TestRaceExtra_PinnedSnapshotQueryViewStaysExactAcrossConcurrentPublishes(t 
 		if err != nil {
 			return err
 		}
-		if !slices.Equal(got, want) {
+		if !queryIDsEqual(q, got, want) {
 			return fmt.Errorf("pinned snapshot query mismatch: got=%v want=%v", got, want)
 		}
 		return nil
@@ -1528,7 +1528,7 @@ func TestRaceExtra_PublicNumericRangeQueriesStayExactAcrossConcurrentUnchangedFi
 		if err != nil {
 			t.Fatalf("warm QueryKeys(%d): %v", i, err)
 		}
-		if !slices.Equal(got, wants[i]) {
+		if !queryIDsEqual(q, got, wants[i]) {
 			t.Fatalf("warm QueryKeys(%d) mismatch: got=%v want=%v", i, got, wants[i])
 		}
 	}
@@ -1622,7 +1622,7 @@ func TestRaceExtra_PublicNumericRangeQueriesStayExactAcrossConcurrentUnchangedFi
 					setFailed(fmt.Sprintf("QueryKeys(%d) failed: %v", idx, err))
 					return
 				}
-				if !slices.Equal(got, want) {
+				if !queryIDsEqual(q, got, want) {
 					setFailed(fmt.Sprintf("QueryKeys(%d) mismatch: got=%v want=%v", idx, got, want))
 					return
 				}

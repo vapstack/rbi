@@ -115,10 +115,21 @@ func TestRegression_MultiTermHAS_LeadSelfCheck_RouteAndCount(t *testing.T) {
 			if err != nil {
 				t.Fatalf("expectedKeysUint64: %v", err)
 			}
-			assertQueryIDsEqual(t, tc.q, got, want)
 
 			_, prepared, _, _ := assertPreparedRouteEquivalence(t, db, tc.q)
-			assertQueryIDsEqual(t, tc.q, got, prepared)
+			if queryContractNoOrderWindow(tc.q) {
+				fullQ := cloneQuery(tc.q)
+				clearQueryOrderWindowForTest(fullQ)
+				full, err := expectedKeysUint64(t, db, fullQ)
+				if err != nil {
+					t.Fatalf("expectedKeysUint64(full): %v", err)
+				}
+				assertNoOrderWindowSubset(t, tc.q, got, full, "QueryKeys")
+				assertNoOrderWindowSubset(t, tc.q, prepared, full, "prepared")
+			} else {
+				assertQueryIDsEqual(t, tc.q, got, want)
+				assertQueryIDsEqual(t, tc.q, got, prepared)
+			}
 
 			countQ := cloneQuery(tc.q)
 			countQ.Order = nil

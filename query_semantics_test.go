@@ -320,7 +320,7 @@ func TestQuery_OR_WithNegativeBranch_EqualsUniverse(t *testing.T) {
 		t.Fatalf("expectedKeysUint64: %v", err)
 	}
 
-	assertSameSlice(t, got, want)
+	assertQueryIDsEqual(t, q, got, want)
 
 	if uint64(len(got)) != uint64(len(ids)) {
 		t.Fatalf("expected universe size %d, got %d", len(ids), len(got))
@@ -368,7 +368,7 @@ func TestQuery_DoubleNot_SameAsOriginal(t *testing.T) {
 	if err != nil {
 		t.Fatalf("expectedKeysUint64: %v", err)
 	}
-	assertSameSlice(t, got, want)
+	assertQueryIDsEqual(t, q, got, want)
 }
 
 func TestQuery_RangeBoundaries_Int_Correctness(t *testing.T) {
@@ -413,7 +413,7 @@ func TestQuery_RangeBoundaries_Int_Correctness(t *testing.T) {
 			if err != nil {
 				t.Fatalf("expectedKeysUint64: %v", err)
 			}
-			assertSameSlice(t, got, want)
+			assertQueryIDsEqual(t, tc.q, got, want)
 		})
 	}
 }
@@ -442,7 +442,7 @@ func TestQuery_IN_WithDuplicates_DoesNotDuplicateResults(t *testing.T) {
 	if err != nil {
 		t.Fatalf("expectedKeysUint64: %v", err)
 	}
-	assertSameSlice(t, got, want)
+	assertQueryIDsEqual(t, q, got, want)
 }
 
 func TestQuery_SliceField_HASANY_WithDuplicateNeedles(t *testing.T) {
@@ -471,7 +471,7 @@ func TestQuery_SliceField_HASANY_WithDuplicateNeedles(t *testing.T) {
 		t.Fatalf("expectedKeysUint64: %v", err)
 	}
 
-	assertSameSlice(t, got, want)
+	assertQueryIDsEqual(t, q, got, want)
 }
 
 func TestQuery_SliceField_HAS_DuplicateNeedles_MatchesAccordingToHarness(t *testing.T) {
@@ -500,5 +500,5 @@ func TestQuery_SliceField_HAS_DuplicateNeedles_MatchesAccordingToHarness(t *test
 		t.Fatalf("expectedKeysUint64: %v", err)
 	}
 
-	assertSameSlice(t, got, want)
+	assertQueryIDsEqual(t, q, got, want)
 }
