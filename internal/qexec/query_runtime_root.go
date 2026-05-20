@@ -147,24 +147,6 @@ func (qv *View) PreparedQuery(q *qir.Shape) ([]uint64, error) {
 func (qv *View) Query(q *qir.Shape, emitTrace bool, prepared bool) (out []uint64, err error) {
 	traceEnabled := emitTrace && qv.exec.TraceSamplingEnabled()
 
-	if !prepared && !traceEnabled {
-		if out, ok, fastErr := qv.tryDirectSingleUniqueEqNoOrder(q, nil); ok {
-			return out, fastErr
-		}
-		if out, ok, fastErr := qv.tryNoFilterNoOrderWithLimit(q, nil); ok {
-			return out, fastErr
-		}
-		if out, ok, fastErr := qv.tryOrderBasicNoFilterWithLimit(q, nil); ok {
-			return out, fastErr
-		}
-		if out, ok, fastErr := qv.tryQueryPrefixNoOrderWithLimit(q, nil); ok {
-			return out, fastErr
-		}
-		if out, ok, fastErr := qv.tryQueryRangeNoOrderWithLimit(q, nil); ok {
-			return out, fastErr
-		}
-	}
-
 	var trace *Trace
 	if traceEnabled {
 		trace = qv.BeginTrace(*q)
@@ -175,46 +157,51 @@ func (qv *View) Query(q *qir.Shape, emitTrace bool, prepared bool) (out []uint64
 
 	var ok bool
 
-	if out, ok, err = qv.tryUniqueEqNoOrder(q, trace); ok {
-		return out, err
-	}
-
-	if out, ok, err = qv.tryNoFilterNoOrderWithLimit(q, trace); ok {
-		if trace != nil {
-			trace.SetPlan(PlanLimit)
+	if out, ok, plan, err := qv.executeArrayPosOrder(q, trace); ok {
+		if trace != nil && plan != "" {
+			trace.SetPlan(plan)
 		}
 		return out, err
 	}
 
-	if out, ok, err = qv.tryOrderBasicNoFilterWithLimit(q, trace); ok {
-		if trace != nil {
-			trace.SetPlan(PlanLimitOrderBasic)
-		}
-		return out, err
-	}
-
-	if out, ok, err = qv.tryQueryOrderArrayPosSingleHasAny(q, trace); ok {
-		if trace != nil {
-			trace.SetPlan(PlanMaterialized)
-		}
-		return out, err
-	}
-
-	// Planner/execution fast-paths are attempted before postingResult fallback because
-	// they can short-circuit large scans when query shape matches known patterns.
+	// Bounded selectors and planner kernels run before postingResult fallback
+	// because they can short-circuit large scans for supported shapes.
 	if !shouldSkipPlannerForArrayOrderShape(q) {
-		if qv.shouldPreferExecutionPlan(q, trace) {
-			if out, ok, err = qv.tryExecutionPlan(q, trace); ok {
-				return out, err
+		if !q.HasOrder {
+			if q.Expr.Op == qir.OpOR && !q.Expr.Not {
+				if out, ok, err = qv.executeOR(q, trace); ok {
+					return out, err
+				}
+			} else {
+				if out, ok, plan, err := qv.executeNoOrderLimit(q, trace); ok {
+					if trace != nil {
+						trace.SetPlan(plan)
+					}
+					return out, err
+				}
+				if q.Limit == 0 {
+					if out, ok, err = qv.executeOR(q, trace); ok {
+						return out, err
+					}
+				}
 			}
-			if out, ok, err = qv.tryPlan(q, trace); ok {
-				return out, err
+		} else if q.Order.Kind == qir.OrderKindBasic && q.Limit != 0 {
+			if q.Expr.Op == qir.OpOR && !q.Expr.Not {
+				if out, ok, err = qv.executeOR(q, trace); ok {
+					return out, err
+				}
+			} else {
+				// Ordered LIMIT entrypoint chooses the selector family only;
+				// physical routes are selected by selectOrderedLimit.
+				if out, ok, plan, err := qv.executeOrderedLimit(q, trace); ok {
+					if trace != nil && plan != "" {
+						trace.SetPlan(plan)
+					}
+					return out, err
+				}
 			}
 		} else {
-			if out, ok, err = qv.tryPlan(q, trace); ok {
-				return out, err
-			}
-			if out, ok, err = qv.tryExecutionPlan(q, trace); ok {
+			if out, ok, err = qv.executeOR(q, trace); ok {
 				return out, err
 			}
 		}
@@ -224,6 +211,10 @@ func (qv *View) Query(q *qir.Shape, emitTrace bool, prepared bool) (out []uint64
 		trace.SetPlan(PlanMaterialized)
 	}
 
+	return qv.queryMaterialized(q)
+}
+
+func (qv *View) queryMaterialized(q *qir.Shape) ([]uint64, error) {
 	result, err := qv.evalExpr(q.Expr)
 	if err != nil {
 		return nil, err
@@ -255,7 +246,7 @@ func (qv *View) Query(q *qir.Shape, emitTrace bool, prepared bool) (out []uint64
 			}
 			return ids, nil
 		}
-		out = makeOutSlice(qv.postingResultCardinality(result), need)
+		out := makeOutSlice(qv.postingResultCardinality(result), need)
 		cursor := newQueryCursor(out, skip, need, needAll, 0)
 
 		ex := result.ids
@@ -314,7 +305,7 @@ func (qv *View) Query(q *qir.Shape, emitTrace bool, prepared bool) (out []uint64
 		return ids, nil
 	}
 
-	out = makeOutSlice(result.ids.Cardinality(), need)
+	out := makeOutSlice(result.ids.Cardinality(), need)
 	cursor := newQueryCursor(out, skip, need, needAll, 0)
 
 	iter := result.ids.Iter()

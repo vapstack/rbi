@@ -3976,7 +3976,7 @@ func (qv *View) TryFilterCardinalityORByPredicates(expr qir.Expr, trace *Trace) 
 		return out, true, err
 	}
 	strictWide := branchCount > 3
-	fullTrace := trace.Full()
+	fullTrace := trace != nil && trace.Full()
 
 	var branchTrace []TraceORBranch
 	if fullTrace {

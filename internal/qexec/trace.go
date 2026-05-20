@@ -184,6 +184,17 @@ func (t *Trace) SetORRoute(route TraceORRoute) {
 	}
 	t.ev.ORRoute.Route = route.Route
 	t.ev.ORRoute.Reason = route.Reason
+	if route.Selected != "" {
+		t.ev.ORRoute.Selected = route.Selected
+		t.ev.ORRoute.Rejected = route.Rejected
+		t.ev.ORRoute.SelectedCost = route.SelectedCost
+		t.ev.ORRoute.RejectedCost = route.RejectedCost
+		t.ev.ORRoute.ExpectedRows = route.ExpectedRows
+		t.ev.ORRoute.UnionRows = route.UnionRows
+		t.ev.ORRoute.SumRows = route.SumRows
+		t.ev.ORRoute.CacheState = route.CacheState
+		t.ev.ORRoute.PostingBuild = route.PostingBuild
+	}
 	t.ev.ORRoute.KWayCost = route.KWayCost
 	t.ev.ORRoute.FallbackCost = route.FallbackCost
 	t.ev.ORRoute.Overlap = route.Overlap
@@ -191,6 +202,63 @@ func (t *Trace) SetORRoute(route TraceORRoute) {
 	t.ev.ORRoute.HasPrefixNonOrder = route.HasPrefixNonOrder
 	t.ev.ORRoute.HasSelectiveLead = route.HasSelectiveLead
 	t.ev.ORRoute.FallbackCollectFast = route.FallbackCollectFast
+}
+
+func (t *Trace) SetORSelectionRoute(route TraceORRoute) {
+	if !t.Full() {
+		return
+	}
+	t.ev.ORRoute.Selected = route.Selected
+	t.ev.ORRoute.Rejected = route.Rejected
+	t.ev.ORRoute.SelectedCost = route.SelectedCost
+	t.ev.ORRoute.RejectedCost = route.RejectedCost
+	t.ev.ORRoute.ExpectedRows = route.ExpectedRows
+	t.ev.ORRoute.UnionRows = route.UnionRows
+	t.ev.ORRoute.SumRows = route.SumRows
+	t.ev.ORRoute.CacheState = route.CacheState
+	t.ev.ORRoute.PostingBuild = route.PostingBuild
+	t.ev.ORRoute.Overlap = route.Overlap
+	t.ev.ORRoute.AvgChecks = route.AvgChecks
+	t.ev.ORRoute.HasPrefixNonOrder = route.HasPrefixNonOrder
+	t.ev.ORRoute.HasSelectiveLead = route.HasSelectiveLead
+	t.ev.ORRoute.FallbackCollectFast = route.FallbackCollectFast
+}
+
+func (t *Trace) SetOrderedLimitRoute(route TraceOrderedLimitRoute) {
+	if !t.Full() {
+		return
+	}
+	t.ev.OrderedLimitRoute = route
+}
+
+func (t *Trace) SetOrderedLimitRuntimeGuard(enabled bool, reason string) {
+	if !t.Full() {
+		return
+	}
+	t.ev.OrderedLimitRoute.RuntimeGuardEnabled = enabled
+	t.ev.OrderedLimitRoute.RuntimeGuardReason = reason
+}
+
+func (t *Trace) SetOrderedLimitRuntimeFallback(reason string) {
+	if !t.Full() {
+		return
+	}
+	t.ev.OrderedLimitRoute.RuntimeFallbackTriggered = true
+	t.ev.OrderedLimitRoute.RuntimeFallbackReason = reason
+}
+
+func (t *Trace) SetNoOrderLimitRoute(route TraceNoOrderLimitRoute) {
+	if !t.Full() {
+		return
+	}
+	t.ev.NoOrderLimitRoute = route
+}
+
+func (t *Trace) SetArrayPosOrderRoute(route TraceArrayPosOrderRoute) {
+	if !t.Full() {
+		return
+	}
+	t.ev.ArrayPosOrderRoute = route
 }
 
 func (t *Trace) AddOROrderPlannerAnalysis(

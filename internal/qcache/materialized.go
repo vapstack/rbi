@@ -187,6 +187,17 @@ func (c *MaterializedPredCache) Load(key MaterializedPredKey) (posting.List, boo
 	return entry.ids.Borrow(), true
 }
 
+func (c *MaterializedPredCache) Has(key MaterializedPredKey) bool {
+	if key.IsZero() {
+		return false
+	}
+
+	c.mu.RLock()
+	_, ok := c.lookupLocked(&key)
+	c.mu.RUnlock()
+	return ok
+}
+
 func (c *MaterializedPredCache) Store(key MaterializedPredKey, ids posting.List) {
 	if key.IsZero() {
 		return
@@ -688,6 +699,21 @@ func (c *RecentKeyCache) EntryCount() int {
 		}
 	}
 	return count
+}
+
+func (c *RecentKeyCache) Contains(key MaterializedPredKey) bool {
+	if key.IsZero() {
+		return false
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.slots == nil {
+		return false
+	}
+	_, ok := c.findSlot(key)
+	return ok
 }
 
 func (c *RecentKeyCache) TouchOrRemember(key MaterializedPredKey, limit int) bool {

@@ -95,8 +95,14 @@ type TraceEvent struct {
 
 	// ORBranches contains per-branch runtime metrics for OR plans.
 	ORBranches []TraceORBranch
-	// ORRoute contains route/cost diagnostics for ordered OR merge path.
+	// ORRoute contains route/cost diagnostics for OR selectors and runtime guards.
 	ORRoute TraceORRoute
+	// OrderedLimitRoute contains route/cost diagnostics for ordered LIMIT selectors.
+	OrderedLimitRoute TraceOrderedLimitRoute
+	// NoOrderLimitRoute contains route/cost diagnostics for no-order LIMIT selectors.
+	NoOrderLimitRoute TraceNoOrderLimitRoute
+	// ArrayPosOrderRoute contains route diagnostics for ArrayPos order selectors.
+	ArrayPosOrderRoute TraceArrayPosOrderRoute
 
 	// OrderIndexScanWidth is the number of non-empty order-index buckets
 	// traversed while producing query output.
@@ -116,6 +122,16 @@ type TraceEvent struct {
 type TraceORRoute struct {
 	Route  string
 	Reason string
+
+	Selected     string
+	Rejected     string
+	SelectedCost float64
+	RejectedCost float64
+	ExpectedRows uint64
+	UnionRows    uint64
+	SumRows      uint64
+	CacheState   string
+	PostingBuild uint64
 
 	KWayCost     float64
 	FallbackCost float64
@@ -140,6 +156,49 @@ type TraceORRoute struct {
 	RuntimeExaminedPerUnique    float64
 	RuntimeProjectedExamined    float64
 	RuntimeProjectedExaminedMax float64
+}
+
+type TraceOrderedLimitRoute struct {
+	Selected   string
+	Rejected   string
+	CacheState string
+
+	SelectedCost float64
+	RejectedCost float64
+
+	ExpectedRows    uint64
+	OrderBuckets    uint64
+	PredicateChecks uint64
+	ExactFilters    uint64
+	PostingBuild    uint64
+
+	RuntimeGuardEnabled      bool
+	RuntimeGuardReason       string
+	RuntimeFallbackTriggered bool
+	RuntimeFallbackReason    string
+}
+
+type TraceNoOrderLimitRoute struct {
+	Selected string
+	Rejected string
+
+	SelectedCost float64
+	RejectedCost float64
+
+	ExpectedRows uint64
+	LeadRows     uint64
+	Checks       uint64
+	PostingBuild uint64
+}
+
+type TraceArrayPosOrderRoute struct {
+	Selected string
+	Rejected string
+
+	SelectedCost float64
+	RejectedCost float64
+
+	ExpectedRows uint64
 }
 
 type TraceORBranch struct {

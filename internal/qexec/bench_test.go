@@ -8,6 +8,7 @@ import (
 	"unsafe"
 
 	"github.com/vapstack/qx"
+	"github.com/vapstack/rbi/internal/pooled"
 	"github.com/vapstack/rbi/internal/posting"
 	"github.com/vapstack/rbi/internal/qir"
 	"github.com/vapstack/rbi/internal/snapshot"
@@ -37,12 +38,7 @@ type qexecBenchSelectivity struct {
 }
 
 type qexecBenchDBKey struct {
-	rows                         int
-	matPredCacheMaxEntries       int
-	matPredCacheMaxCard          uint64
-	numericRangeBucketSize       int
-	numericRangeBucketMinKeys    int
-	numericRangeBucketMinSpanKey int
+	rows int
 }
 
 var (
@@ -211,37 +207,85 @@ func qexecBenchRunScaleSelectivities(b *testing.B, fn func(*testing.B, *testDB, 
 
 func newQexecBenchDBWithOptionsAndRows(b *testing.B, opts testOptions, rows int) *testDB {
 	b.Helper()
-	if opts.TraceSink != nil {
-		return buildQexecBenchDBWithOptionsAndRows(b, opts, rows)
+	if opts.NumericRangeBucketSize == 0 {
+		opts.NumericRangeBucketSize = testNumericRangeBucketSize
+	}
+	if opts.NumericRangeBucketMinFieldKeys == 0 {
+		opts.NumericRangeBucketMinFieldKeys = testNumericRangeMinKeys
+	}
+	if opts.NumericRangeBucketMinSpanKeys == 0 {
+		opts.NumericRangeBucketMinSpanKeys = testNumericRangeMinSpan
+	}
+	if opts.TraceSink != nil && opts.TraceSampleEvery == 0 {
+		opts.TraceSampleEvery = 1
+	}
+	if opts.MatPredCacheMaxEntries == 0 {
+		opts.MatPredCacheMaxEntries = testMatPredCacheMaxEntries
+	}
+	if opts.MatPredCacheMaxCard == 0 {
+		opts.MatPredCacheMaxCard = testMatPredCacheMaxCard
 	}
 
-	key := qexecBenchDBKey{
-		rows:                         rows,
-		matPredCacheMaxEntries:       opts.MatPredCacheMaxEntries,
-		matPredCacheMaxCard:          opts.MatPredCacheMaxCard,
-		numericRangeBucketSize:       opts.NumericRangeBucketSize,
-		numericRangeBucketMinKeys:    opts.NumericRangeBucketMinFieldKeys,
-		numericRangeBucketMinSpanKey: opts.NumericRangeBucketMinSpanKeys,
-	}
+	key := qexecBenchDBKey{rows: rows}
 
 	qexecBenchDBsMu.Lock()
 	db := qexecBenchDBs[key]
 	qexecBenchDBsMu.Unlock()
-	if db != nil {
+	if db == nil {
+		db = buildQexecBenchDBWithOptionsAndRows(b, qexecBenchOptions(), rows)
+		qexecBenchDBsMu.Lock()
+		if cached := qexecBenchDBs[key]; cached != nil {
+			qexecBenchDBsMu.Unlock()
+			db = cached
+		} else {
+			qexecBenchDBs[key] = db
+			qexecBenchDBsMu.Unlock()
+		}
+	}
+
+	defaultOpts := qexecBenchOptions()
+	if opts.TraceSink == nil &&
+		opts.TraceSampleEvery == defaultOpts.TraceSampleEvery &&
+		opts.NumericRangeBucketSize == defaultOpts.NumericRangeBucketSize &&
+		opts.NumericRangeBucketMinFieldKeys == defaultOpts.NumericRangeBucketMinFieldKeys &&
+		opts.NumericRangeBucketMinSpanKeys == defaultOpts.NumericRangeBucketMinSpanKeys &&
+		opts.MatPredCacheMaxEntries == defaultOpts.MatPredCacheMaxEntries &&
+		opts.MatPredCacheMaxCard == defaultOpts.MatPredCacheMaxCard {
 		db.clearCurrentSnapshotCaches()
 		return db
 	}
+	return newQexecBenchDBWithSharedDataAndOptions(db, opts)
+}
 
-	db = buildQexecBenchDBWithOptionsAndRows(b, opts, rows)
-	qexecBenchDBsMu.Lock()
-	if cached := qexecBenchDBs[key]; cached != nil {
-		qexecBenchDBsMu.Unlock()
-		cached.clearCurrentSnapshotCaches()
-		return cached
+func newQexecBenchDBWithSharedDataAndOptions(base *testDB, opts testOptions) *testDB {
+	cfg := snapshot.CacheConfig{
+		MatPredMaxEntries: opts.MatPredCacheMaxEntries,
+		MatPredMaxCard:    opts.MatPredCacheMaxCard,
 	}
-	qexecBenchDBs[key] = db
-	qexecBenchDBsMu.Unlock()
-	return db
+	exec := NewRuntime(Config{
+		Schema:                         base.rt,
+		NumericRangeBucketSize:         opts.NumericRangeBucketSize,
+		NumericRangeBucketMinFieldKeys: opts.NumericRangeBucketMinFieldKeys,
+		NumericRangeBucketMinSpanKeys:  opts.NumericRangeBucketMinSpanKeys,
+		TraceSink:                      opts.TraceSink,
+		TraceSampleEvery:               opts.TraceSampleEvery,
+	})
+	snap := snapshot.NewView(base.snap.Seq, base.snap, base.rt, cfg, snapshot.Storage{
+		Index:             base.snap.Index,
+		NilIndex:          base.snap.NilIndex,
+		LenIndex:          base.snap.LenIndex,
+		LenZeroComplement: base.snap.LenZeroComplement,
+		Measure:           base.snap.Measure,
+		Universe:          base.snap.Universe,
+		StrMap:            base.snap.StrMap,
+	})
+	return &testDB{
+		rt:   base.rt,
+		exec: exec,
+		snap: snap,
+		seq:  base.seq,
+		cfg:  cfg,
+	}
 }
 
 func buildQexecBenchDBWithOptionsAndRows(b *testing.B, opts testOptions, rows int) *testDB {
@@ -1136,7 +1180,7 @@ func runQexecBenchCardinalityRoute(view *View, expr qir.Expr, route qexecBenchCa
 	}
 }
 
-func benchmarkCardinalityRoute(b *testing.B, view *View, resolve qir.FieldResolver, expr qx.Expr, route qexecBenchCardinalityRoute, wantPlan PlanName) {
+func benchmarkCardinalityRoute(b *testing.B, view *View, resolve qir.FieldResolver, expr qx.Expr, route qexecBenchCardinalityRoute) {
 	b.Helper()
 
 	prepared, err := qir.PrepareCountExprsResolved(resolve, expr)
@@ -1152,19 +1196,6 @@ func benchmarkCardinalityRoute(b *testing.B, view *View, resolve qir.FieldResolv
 	}
 	if !ok {
 		b.Fatalf("cardinality route warmup was not used")
-	}
-	if wantPlan != "" {
-		trace := &Trace{}
-		cnt, ok, err = runQexecBenchCardinalityRoute(view, prepared.Expr, route, trace)
-		if err != nil {
-			b.Fatalf("cardinality route trace warmup: %v", err)
-		}
-		if !ok {
-			b.Fatalf("cardinality route trace warmup was not used")
-		}
-		if got := trace.Event().Plan; got != string(wantPlan) {
-			b.Fatalf("trace plan=%q, want %q", got, wantPlan)
-		}
 	}
 	qexecBenchCount = cnt
 
@@ -1190,16 +1221,15 @@ func BenchmarkCardinalityRoutes(b *testing.B) {
 			name  string
 			expr  qx.Expr
 			route qexecBenchCardinalityRoute
-			plan  PlanName
 		}{
-			{name: "ScalarLookup_EQ", expr: qx.EQ("country", "US"), route: qexecBenchCardinalityScalarLookup, plan: planFilterCardinalityScalarLookup},
-			{name: "ScalarLookup_IN", expr: qx.IN("country", []string{"US", "DE", "NL", "PL"}), route: qexecBenchCardinalityScalarLookup, plan: planFilterCardinalityScalarLookup},
-			{name: "ScalarLookup_EQNil", expr: qx.EQ("opt", nil), route: qexecBenchCardinalityScalarLookup, plan: planFilterCardinalityScalarLookup},
+			{name: "ScalarLookup_EQ", expr: qx.EQ("country", "US"), route: qexecBenchCardinalityScalarLookup},
+			{name: "ScalarLookup_IN", expr: qx.IN("country", []string{"US", "DE", "NL", "PL"}), route: qexecBenchCardinalityScalarLookup},
+			{name: "ScalarLookup_EQNil", expr: qx.EQ("opt", nil), route: qexecBenchCardinalityScalarLookup},
 		}
 		for i := range fixed {
 			tc := fixed[i]
 			b.Run(tc.name, func(b *testing.B) {
-				benchmarkCardinalityRoute(b, view, db.rt.IndexedByName, tc.expr, tc.route, tc.plan)
+				benchmarkCardinalityRoute(b, view, db.rt.IndexedByName, tc.expr, tc.route)
 			})
 		}
 
@@ -1215,10 +1245,9 @@ func BenchmarkCardinalityRoutes(b *testing.B) {
 					name  string
 					expr  qx.Expr
 					route qexecBenchCardinalityRoute
-					plan  PlanName
 				}{
-					{name: "SliceLookup_HASANY2", expr: qx.HASANY("tags", []string{tag, "missing_tag"}), route: qexecBenchCardinalitySliceLookup, plan: planFilterCardinalityScalarLookup},
-					{name: "SliceLookup_HASALL", expr: qx.HASALL("tags", []string{tag, "go"}), route: qexecBenchCardinalitySliceLookup, plan: planFilterCardinalityScalarLookup},
+					{name: "SliceLookup_HASANY2", expr: qx.HASANY("tags", []string{tag, "missing_tag"}), route: qexecBenchCardinalitySliceLookup},
+					{name: "SliceLookup_HASALL", expr: qx.HASALL("tags", []string{tag, "go"}), route: qexecBenchCardinalitySliceLookup},
 					{
 						name: "ScalarInSplit_Filtered",
 						expr: qx.AND(
@@ -1227,7 +1256,6 @@ func BenchmarkCardinalityRoutes(b *testing.B) {
 							ageEnd,
 						),
 						route: qexecBenchCardinalityScalarInSplit,
-						plan:  planFilterCardinalityScalarInSplit,
 					},
 					{
 						name: "PreparedReordered_SetRange",
@@ -1247,7 +1275,6 @@ func BenchmarkCardinalityRoutes(b *testing.B) {
 							ageEnd,
 						),
 						route: qexecBenchCardinalityPredicates,
-						plan:  planFilterCardinalityPredicates,
 					},
 					{
 						name: "ORPredicates_BranchScans",
@@ -1258,7 +1285,6 @@ func BenchmarkCardinalityRoutes(b *testing.B) {
 							qx.AND(qx.EQ("country", "NL"), qx.EQ("active", true)),
 						),
 						route: qexecBenchCardinalityORPredicates,
-						plan:  planFilterCardinalityORPredicates,
 					},
 					{
 						name: "Materialized_AND",
@@ -1269,13 +1295,12 @@ func BenchmarkCardinalityRoutes(b *testing.B) {
 							ageEnd,
 						),
 						route: qexecBenchCardinalityMaterialized,
-						plan:  planFilterCardinalityMaterialized,
 					},
 				}
 				for j := range cases {
 					tc := cases[j]
 					b.Run(tc.name, func(b *testing.B) {
-						benchmarkCardinalityRoute(b, view, db.rt.IndexedByName, tc.expr, tc.route, tc.plan)
+						benchmarkCardinalityRoute(b, view, db.rt.IndexedByName, tc.expr, tc.route)
 					})
 				}
 			})
@@ -1292,14 +1317,14 @@ func BenchmarkCardinalityRoutes(b *testing.B) {
 			qx.HASANY("tags", []string{"tag_broad", "tag_mid"}),
 			qx.AND(qx.EQ("country", "DE"), qx.GTE("age", ageStart)),
 			qx.AND(qx.EQ("country", "JP"), qx.LT("score", float64(scoreEnd))),
-		), qexecBenchCardinalityORPredicates, planFilterCardinalityORHybrid)
+		), qexecBenchCardinalityORPredicates)
 	})
 	b.Run("Rows100K/ORPredicates_DisjointScalarEQ", func(b *testing.B) {
 		benchmarkCardinalityRoute(b, hybridView, hybridDB.rt.IndexedByName, qx.OR(
 			qx.AND(qx.PREFIX("full_name", "user-tiny"), qx.EQ("country", "US")),
 			qx.AND(qx.EQ("country", "DE"), qx.GTE("age", ageStart)),
 			qx.AND(qx.EQ("country", "NL"), qx.EQ("active", true)),
-		), qexecBenchCardinalityORPredicates, planFilterCardinalityORPredicates)
+		), qexecBenchCardinalityORPredicates)
 	})
 	b.Run("Rows100K/ORPredicates_OverlappingScalarEQ", func(b *testing.B) {
 		benchmarkCardinalityRoute(b, hybridView, hybridDB.rt.IndexedByName, qx.OR(
@@ -1307,7 +1332,7 @@ func BenchmarkCardinalityRoutes(b *testing.B) {
 			qx.AND(qx.EQ("country", "US"), qx.GTE("age", ageStart)),
 			qx.AND(qx.EQ("country", "DE"), qx.EQ("active", true)),
 			qx.AND(qx.EQ("country", "JP"), qx.LT("score", float64(scoreEnd))),
-		), qexecBenchCardinalityORPredicates, "")
+		), qexecBenchCardinalityORPredicates)
 	})
 
 	uniqueDB := newQexecBenchUniqueDB(b)
@@ -1324,7 +1349,6 @@ func BenchmarkCardinalityRoutes(b *testing.B) {
 				qx.LT("score", 50_000),
 			),
 			qexecBenchCardinalityUniqueEq,
-			planFilterCardinalityUniqueEq,
 		)
 	})
 }
@@ -1856,10 +1880,10 @@ func benchmarkORPlannerDecision(b *testing.B, db *testDB, q *qx.QX, ordered bool
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		if ordered {
-			d := view.decidePlanOROrder(&shape, branches)
+			d := view.selectPlanOROrder(&shape, branches)
 			decisionRows = d.expectedRows
 		} else {
-			d := view.decidePlanORNoOrder(&shape, branches)
+			d := view.selectPlanORNoOrder(&shape, branches)
 			decisionRows = d.expectedRows
 		}
 	}
@@ -1895,7 +1919,81 @@ func BenchmarkORPlannerDecision(b *testing.B) {
 	})
 }
 
-func benchmarkTryPlanOrdered(b *testing.B, db *testDB, q *qx.QX, wantPlan PlanName) {
+func benchmarkORSelector(b *testing.B, db *testDB, q *qx.QX) {
+	b.Helper()
+
+	prepared, shape, err := db.prepareQuery(q)
+	if err != nil {
+		b.Fatalf("prepareQuery: %v", err)
+	}
+	defer prepared.Release()
+	if shape.Expr.Op != qir.OpOR {
+		b.Fatalf("expected OR query")
+	}
+
+	view := db.view()
+	var facts plannerORFacts
+	ok := view.collectORFacts(&shape, &facts)
+	if !ok {
+		facts.Release()
+		b.Skip("OR facts not collected for this shape")
+	}
+	decision := view.selectOR(&shape, &facts)
+	facts.Release()
+	if decision.kind == plannerORDecisionNone {
+		b.Skip("OR selector did not choose a route")
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		var facts plannerORFacts
+		ok := view.collectORFacts(&shape, &facts)
+		if !ok {
+			facts.Release()
+			b.Fatal("OR facts were not collected")
+		}
+		decision := view.selectOR(&shape, &facts)
+		facts.Release()
+		if decision.kind == plannerORDecisionNone {
+			b.Fatal("OR selector did not choose a route")
+		}
+		if decision.kind == plannerORDecisionOrder {
+			qexecBenchCount = decision.order.expectedRows
+		} else {
+			qexecBenchCount = decision.noOrder.expectedRows
+		}
+	}
+}
+
+func BenchmarkORSelector(b *testing.B) {
+	qexecBenchRunScaleSelectivities(b, func(b *testing.B, db *testDB, scale qexecBenchScale, sel qexecBenchSelectivity) {
+		ageStart, ageEnd := qexecBenchAgeRange(scale.rows, sel)
+		tag := qexecBenchTag(sel)
+		prefix := qexecBenchPrefix(sel)
+
+		b.Run("NoOrder", func(b *testing.B) {
+			benchmarkORSelector(b, db, qx.Query(
+				qx.OR(
+					qx.AND(qx.EQ("country", "US"), qx.HASANY("tags", []string{tag, "missing_tag"})),
+					qx.AND(qx.EQ("country", "DE"), ageStart),
+					qx.AND(ageStart, ageEnd),
+				),
+			).Limit(256))
+		})
+		b.Run("Ordered", func(b *testing.B) {
+			benchmarkORSelector(b, db, qx.Query(
+				qx.OR(
+					qx.AND(qx.EQ("country", "US"), qx.HASANY("tags", []string{tag, "missing_tag"})),
+					qx.AND(qx.EQ("country", "JP"), ageStart),
+					qx.AND(qx.PREFIX("full_name", prefix), qx.EQ("active", true)),
+				),
+			).Sort("score", qx.DESC).Limit(128))
+		})
+	})
+}
+
+func benchmarkOrderedLimitSelector(b *testing.B, db *testDB, q *qx.QX) {
 	b.Helper()
 
 	prepared, shape, err := db.prepareQuery(q)
@@ -1905,35 +2003,494 @@ func benchmarkTryPlanOrdered(b *testing.B, db *testDB, q *qx.QX, wantPlan PlanNa
 	defer prepared.Release()
 
 	view := db.view()
-	trace := &Trace{}
-	out, ok, err := view.tryPlanOrdered(&shape, trace)
+	facts := orderedLimitFactsPool.Get()
+	ok, err := view.collectOrderedLimitFacts(&shape, facts)
 	if err != nil {
-		b.Fatalf("tryPlanOrdered warmup: %v", err)
+		facts.Release()
+		b.Fatalf("collectOrderedLimitFacts warmup: %v", err)
 	}
 	if !ok {
-		b.Skip("ordered plan path is not used for this shape")
+		facts.Release()
+		b.Skip("ordered LIMIT facts not collected for this shape")
 	}
-	if wantPlan != "" && trace.Event().Plan != string(wantPlan) {
-		b.Skip("requested ordered plan variant is not used for this shape")
+	decision, ok, err := view.selectOrderedLimit(&shape, facts)
+	facts.Release()
+	if err != nil {
+		b.Fatalf("selectOrderedLimit warmup: %v", err)
+	}
+	if !ok {
+		b.Skip("ordered LIMIT selector did not choose a route")
+	}
+	qexecBenchCount = decision.selected.expectedRows
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		facts := orderedLimitFactsPool.Get()
+		ok, err := view.collectOrderedLimitFacts(&shape, facts)
+		if err != nil {
+			facts.Release()
+			b.Fatalf("collectOrderedLimitFacts: %v", err)
+		}
+		if !ok {
+			facts.Release()
+			b.Fatal("ordered LIMIT facts were not collected")
+		}
+		decision, ok, err := view.selectOrderedLimit(&shape, facts)
+		facts.Release()
+		if err != nil {
+			b.Fatalf("selectOrderedLimit: %v", err)
+		}
+		if !ok {
+			b.Fatal("ordered LIMIT selector did not choose a route")
+		}
+		qexecBenchCount = decision.selected.expectedRows
+	}
+}
+
+func BenchmarkOrderedLimitSelector(b *testing.B) {
+	qexecBenchRunScaleSelectivities(b, func(b *testing.B, db *testDB, scale qexecBenchScale, sel qexecBenchSelectivity) {
+		ageStart, ageEnd := qexecBenchAgeRange(scale.rows, sel)
+		tag := qexecBenchTag(sel)
+
+		b.Run("NoFilter", func(b *testing.B) {
+			benchmarkOrderedLimitSelector(b, db, qx.Query().Sort("age", qx.ASC).Limit(128))
+		})
+		b.Run("OrderBounds", func(b *testing.B) {
+			benchmarkOrderedLimitSelector(b, db, qx.Query(ageStart, ageEnd).Sort("age", qx.ASC).Limit(128))
+		})
+		b.Run("AmbiguousResiduals", func(b *testing.B) {
+			benchmarkOrderedLimitSelector(b, db, qx.Query(
+				ageStart,
+				ageEnd,
+				qx.EQ("country", "US"),
+				qx.HASANY("tags", []string{tag, "missing_tag"}),
+			).Sort("age", qx.ASC).Limit(128))
+		})
+	})
+}
+
+func benchmarkNoOrderLimitSelector(b *testing.B, db *testDB, q *qx.QX) {
+	b.Helper()
+
+	prepared, shape, err := db.prepareQuery(q)
+	if err != nil {
+		b.Fatalf("prepareQuery: %v", err)
+	}
+	defer prepared.Release()
+
+	view := db.view()
+	facts := noOrderLimitFactsPool.Get()
+	ok, err := view.collectNoOrderLimitFacts(&shape, facts)
+	if err != nil {
+		facts.Release()
+		b.Fatalf("collectNoOrderLimitFacts warmup: %v", err)
+	}
+	if !ok {
+		facts.Release()
+		b.Skip("no-order LIMIT facts not collected for this shape")
+	}
+	decision := view.selectNoOrderLimit(&shape, facts)
+	facts.Release()
+	if decision.selected.kind == plannerNoOrderLimitCandidateNone {
+		b.Skip("no-order LIMIT selector did not choose a route")
+	}
+	qexecBenchCount = decision.selected.expectedRows
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		facts := noOrderLimitFactsPool.Get()
+		ok, err := view.collectNoOrderLimitFacts(&shape, facts)
+		if err != nil {
+			facts.Release()
+			b.Fatalf("collectNoOrderLimitFacts: %v", err)
+		}
+		if !ok {
+			facts.Release()
+			b.Fatal("no-order LIMIT facts were not collected")
+		}
+		decision := view.selectNoOrderLimit(&shape, facts)
+		facts.Release()
+		if decision.selected.kind == plannerNoOrderLimitCandidateNone {
+			b.Fatal("no-order LIMIT selector did not choose a route")
+		}
+		qexecBenchCount = decision.selected.expectedRows
+	}
+}
+
+func BenchmarkNoOrderLimitSelector(b *testing.B) {
+	qexecBenchRunScaleSelectivities(b, func(b *testing.B, db *testDB, scale qexecBenchScale, sel qexecBenchSelectivity) {
+		ageStart, ageEnd := qexecBenchAgeRange(scale.rows, sel)
+		tag := qexecBenchTag(sel)
+
+		b.Run("NoFilter", func(b *testing.B) {
+			benchmarkNoOrderLimitSelector(b, db, qx.Query().Limit(128))
+		})
+		b.Run("SingleRange", func(b *testing.B) {
+			benchmarkNoOrderLimitSelector(b, db, qx.Query(ageStart).Limit(128))
+		})
+		b.Run("SameFieldBounds", func(b *testing.B) {
+			benchmarkNoOrderLimitSelector(b, db, qx.Query(ageStart, ageEnd).Limit(128))
+		})
+		b.Run("AmbiguousResiduals", func(b *testing.B) {
+			benchmarkNoOrderLimitSelector(b, db, qx.Query(
+				ageStart,
+				ageEnd,
+				qx.EQ("country", "US"),
+				qx.HASANY("tags", []string{tag, "missing_tag"}),
+			).Limit(128))
+		})
+	})
+}
+
+func benchmarkArrayPosOrderSelector(b *testing.B, db *testDB, q *qx.QX) {
+	b.Helper()
+
+	prepared, shape, err := db.prepareQuery(q)
+	if err != nil {
+		b.Fatalf("prepareQuery: %v", err)
+	}
+	defer prepared.Release()
+
+	view := db.view()
+	var facts plannerArrayPosOrderFacts
+	if !view.collectArrayPosOrderFacts(&shape, &facts) {
+		b.Skip("ArrayPos order facts not collected for this shape")
+	}
+	decision, ok := view.selectArrayPosOrder(&shape, &facts)
+	if !ok || decision.selected.kind == plannerArrayPosOrderCandidateNone {
+		b.Skip("ArrayPos order selector did not choose a route")
+	}
+	qexecBenchCount = decision.selected.expectedRows
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		var facts plannerArrayPosOrderFacts
+		if !view.collectArrayPosOrderFacts(&shape, &facts) {
+			b.Fatal("ArrayPos order facts were not collected")
+		}
+		decision, ok := view.selectArrayPosOrder(&shape, &facts)
+		if !ok || decision.selected.kind == plannerArrayPosOrderCandidateNone {
+			b.Fatal("ArrayPos order selector did not choose a route")
+		}
+		qexecBenchCount = decision.selected.expectedRows
+	}
+}
+
+func BenchmarkArrayPosOrderSelector(b *testing.B) {
+	qexecBenchRunScales(b, func(b *testing.B, db *testDB, scale qexecBenchScale) {
+		_ = scale
+		benchmarkArrayPosOrderSelector(b, db, qx.Query(
+			qx.HASANY("tags", []string{"go", "missing_tag"}),
+		).SortBy(qx.POS("tags", []string{"go", "db"}), qx.ASC).Offset(4096).Limit(128))
+	})
+}
+
+func benchmarkOrderedLimitDispatch(b *testing.B, db *testDB, q *qx.QX) {
+	b.Helper()
+
+	prepared, shape, err := db.prepareQuery(q)
+	if err != nil {
+		b.Fatalf("prepareQuery: %v", err)
+	}
+	defer prepared.Release()
+
+	view := db.view()
+	facts := orderedLimitFactsPool.Get()
+	defer facts.Release()
+
+	ok, err := view.collectOrderedLimitFacts(&shape, facts)
+	if err != nil {
+		b.Fatalf("collectOrderedLimitFacts: %v", err)
+	}
+	if !ok {
+		b.Skip("ordered LIMIT facts not collected for this shape")
+	}
+	decision, ok, err := view.selectOrderedLimit(&shape, facts)
+	if err != nil {
+		b.Fatalf("selectOrderedLimit: %v", err)
+	}
+	if !ok {
+		b.Skip("ordered LIMIT selector did not choose a route")
+	}
+	guard := decision.runtimeGuard(&shape)
+
+	out, ok, _, err := view.dispatchOrderedLimit(&shape, facts, decision, guard, nil)
+	if err != nil {
+		b.Fatalf("dispatchOrderedLimit warmup: %v", err)
+	}
+	if !ok {
+		b.Fatalf("dispatchOrderedLimit warmup was not used")
 	}
 	qexecBenchIDs = out
 
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		out, ok, err = view.tryPlanOrdered(&shape, nil)
+		out, ok, _, err = view.dispatchOrderedLimit(&shape, facts, decision, guard, nil)
 		if err != nil {
-			b.Fatalf("tryPlanOrdered: %v", err)
+			b.Fatalf("dispatchOrderedLimit: %v", err)
 		}
 		if !ok {
-			b.Fatal("ordered plan path was not used")
+			b.Fatal("dispatchOrderedLimit was not used")
 		}
 		qexecBenchIDs = out
 	}
 	b.ReportMetric(float64(len(qexecBenchIDs)), "rows/op")
 }
 
-func benchmarkExecPlanOrderedBasicReader(b *testing.B, db *testDB, q *qx.QX, wantPlan PlanName) {
+func benchmarkNoOrderLimitDispatch(b *testing.B, db *testDB, q *qx.QX) {
+	b.Helper()
+
+	prepared, shape, err := db.prepareQuery(q)
+	if err != nil {
+		b.Fatalf("prepareQuery: %v", err)
+	}
+	defer prepared.Release()
+
+	view := db.view()
+	facts := noOrderLimitFactsPool.Get()
+	defer facts.Release()
+
+	ok, err := view.collectNoOrderLimitFacts(&shape, facts)
+	if err != nil {
+		b.Fatalf("collectNoOrderLimitFacts: %v", err)
+	}
+	if !ok {
+		b.Skip("no-order LIMIT facts not collected for this shape")
+	}
+	decision := view.selectNoOrderLimit(&shape, facts)
+	if decision.selected.kind == plannerNoOrderLimitCandidateNone {
+		b.Skip("no-order LIMIT selector did not choose a route")
+	}
+
+	out, ok, _, err := view.dispatchNoOrderLimit(&shape, facts, decision, nil)
+	if err != nil {
+		b.Fatalf("dispatchNoOrderLimit warmup: %v", err)
+	}
+	if !ok {
+		b.Fatalf("dispatchNoOrderLimit warmup was not used")
+	}
+	qexecBenchIDs = out
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		out, ok, _, err = view.dispatchNoOrderLimit(&shape, facts, decision, nil)
+		if err != nil {
+			b.Fatalf("dispatchNoOrderLimit: %v", err)
+		}
+		if !ok {
+			b.Fatal("dispatchNoOrderLimit was not used")
+		}
+		qexecBenchIDs = out
+	}
+	b.ReportMetric(float64(len(qexecBenchIDs)), "rows/op")
+}
+
+func benchmarkORDispatch(b *testing.B, db *testDB, q *qx.QX) {
+	b.Helper()
+
+	prepared, shape, err := db.prepareQuery(q)
+	if err != nil {
+		b.Fatalf("prepareQuery: %v", err)
+	}
+	defer prepared.Release()
+	if shape.Expr.Op != qir.OpOR {
+		b.Fatalf("expected OR query")
+	}
+
+	view := db.view()
+	var facts plannerORFacts
+	ok := view.collectORFacts(&shape, &facts)
+	if !ok {
+		facts.Release()
+		b.Skip("OR facts not collected for this shape")
+	}
+	defer facts.Release()
+
+	decision := view.selectOR(&shape, &facts)
+	if decision.kind == plannerORDecisionNone {
+		b.Skip("OR selector did not choose a route")
+	}
+
+	out, ok, err := view.dispatchOR(&shape, &facts, decision, nil)
+	if err != nil {
+		b.Fatalf("dispatchOR warmup: %v", err)
+	}
+	if !ok {
+		b.Fatalf("dispatchOR warmup was not used")
+	}
+	qexecBenchIDs = out
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		out, ok, err = view.dispatchOR(&shape, &facts, decision, nil)
+		if err != nil {
+			b.Fatalf("dispatchOR: %v", err)
+		}
+		if !ok {
+			b.Fatal("dispatchOR was not used")
+		}
+		qexecBenchIDs = out
+	}
+	b.ReportMetric(float64(len(qexecBenchIDs)), "rows/op")
+}
+
+func benchmarkArrayPosOrderDispatch(b *testing.B, db *testDB, q *qx.QX) {
+	b.Helper()
+
+	prepared, shape, err := db.prepareQuery(q)
+	if err != nil {
+		b.Fatalf("prepareQuery: %v", err)
+	}
+	defer prepared.Release()
+
+	view := db.view()
+	var facts plannerArrayPosOrderFacts
+	if !view.collectArrayPosOrderFacts(&shape, &facts) {
+		b.Skip("ArrayPos order facts not collected for this shape")
+	}
+	decision, ok := view.selectArrayPosOrder(&shape, &facts)
+	if !ok || decision.selected.kind == plannerArrayPosOrderCandidateNone {
+		b.Skip("ArrayPos order selector did not choose a route")
+	}
+
+	out, ok, _, err := view.dispatchArrayPosOrder(&shape, &facts, decision, nil)
+	if err != nil {
+		b.Fatalf("dispatchArrayPosOrder warmup: %v", err)
+	}
+	if !ok {
+		b.Fatalf("dispatchArrayPosOrder warmup was not used")
+	}
+	qexecBenchIDs = out
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		out, ok, _, err = view.dispatchArrayPosOrder(&shape, &facts, decision, nil)
+		if err != nil {
+			b.Fatalf("dispatchArrayPosOrder: %v", err)
+		}
+		if !ok {
+			b.Fatal("dispatchArrayPosOrder was not used")
+		}
+		qexecBenchIDs = out
+	}
+	b.ReportMetric(float64(len(qexecBenchIDs)), "rows/op")
+}
+
+func BenchmarkPlannerDispatch(b *testing.B) {
+	qexecBenchRunScaleSelectivities(b, func(b *testing.B, db *testDB, scale qexecBenchScale, sel qexecBenchSelectivity) {
+		ageStart, ageEnd := qexecBenchAgeRange(scale.rows, sel)
+		tag := qexecBenchTag(sel)
+		prefix := qexecBenchPrefix(sel)
+
+		b.Run("OrderedLimit/NoFilter", func(b *testing.B) {
+			benchmarkOrderedLimitDispatch(b, db, qx.Query().Sort("age", qx.ASC).Limit(128))
+		})
+		b.Run("OrderedLimit/OrderBounds", func(b *testing.B) {
+			benchmarkOrderedLimitDispatch(b, db, qx.Query(ageStart, ageEnd).Sort("age", qx.ASC).Limit(128))
+		})
+		b.Run("OrderedLimit/AmbiguousResiduals", func(b *testing.B) {
+			benchmarkOrderedLimitDispatch(b, db, qx.Query(
+				ageStart,
+				ageEnd,
+				qx.EQ("country", "US"),
+				qx.HASANY("tags", []string{tag, "missing_tag"}),
+			).Sort("age", qx.ASC).Limit(128))
+		})
+		b.Run("NoOrderLimit/NoFilter", func(b *testing.B) {
+			benchmarkNoOrderLimitDispatch(b, db, qx.Query().Limit(128))
+		})
+		b.Run("NoOrderLimit/SingleRange", func(b *testing.B) {
+			benchmarkNoOrderLimitDispatch(b, db, qx.Query(ageStart).Limit(128))
+		})
+		b.Run("NoOrderLimit/SameFieldBounds", func(b *testing.B) {
+			benchmarkNoOrderLimitDispatch(b, db, qx.Query(ageStart, ageEnd).Limit(128))
+		})
+		b.Run("NoOrderLimit/AmbiguousResiduals", func(b *testing.B) {
+			benchmarkNoOrderLimitDispatch(b, db, qx.Query(
+				ageStart,
+				ageEnd,
+				qx.EQ("country", "US"),
+				qx.HASANY("tags", []string{tag, "missing_tag"}),
+			).Limit(128))
+		})
+		b.Run("OR/NoOrder", func(b *testing.B) {
+			benchmarkORDispatch(b, db, qx.Query(
+				qx.OR(
+					qx.AND(qx.EQ("country", "US"), qx.HASANY("tags", []string{tag, "missing_tag"})),
+					qx.AND(qx.EQ("country", "DE"), ageStart),
+					qx.AND(ageStart, ageEnd),
+				),
+			).Limit(256))
+		})
+		b.Run("OR/Ordered", func(b *testing.B) {
+			benchmarkORDispatch(b, db, qx.Query(
+				qx.OR(
+					qx.AND(qx.EQ("country", "US"), qx.HASANY("tags", []string{tag, "missing_tag"})),
+					qx.AND(qx.EQ("country", "JP"), ageStart),
+					qx.AND(qx.PREFIX("full_name", prefix), qx.EQ("active", true)),
+				),
+			).Sort("score", qx.DESC).Limit(128))
+		})
+		b.Run("ArrayPosOrder/SingleHasAny", func(b *testing.B) {
+			benchmarkArrayPosOrderDispatch(b, db, qx.Query(
+				qx.HASANY("tags", []string{"go", "missing_tag"}),
+			).SortBy(qx.POS("tags", []string{"go", "db"}), qx.ASC).Offset(4096).Limit(128))
+		})
+	})
+}
+
+func benchmarkLimitSelectorDispatch(b *testing.B, db *testDB, q *qx.QX) {
+	b.Helper()
+
+	prepared, shape, err := db.prepareQuery(q)
+	if err != nil {
+		b.Fatalf("prepareQuery: %v", err)
+	}
+	defer prepared.Release()
+
+	view := db.view()
+	var out []uint64
+	var ok bool
+	if shape.HasOrder {
+		out, ok, _, err = view.executeOrderedLimit(&shape, nil)
+	} else {
+		out, ok, _, err = view.executeNoOrderLimit(&shape, nil)
+	}
+	if err != nil {
+		b.Fatalf("limit route warmup: %v", err)
+	}
+	if !ok {
+		b.Fatal("limit selector/dispatch was not used")
+	}
+	qexecBenchIDs = out
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if shape.HasOrder {
+			out, ok, _, err = view.executeOrderedLimit(&shape, nil)
+		} else {
+			out, ok, _, err = view.executeNoOrderLimit(&shape, nil)
+		}
+		if err != nil {
+			b.Fatalf("limit route: %v", err)
+		}
+		if !ok {
+			b.Fatal("limit route was not used")
+		}
+		qexecBenchIDs = out
+	}
+	b.ReportMetric(float64(len(qexecBenchIDs)), "rows/op")
+}
+
+func benchmarkExecPlanOrderedBasicReader(b *testing.B, db *testDB, q *qx.QX) {
 	b.Helper()
 
 	prepared, shape, err := db.prepareQuery(q)
@@ -1962,13 +2519,9 @@ func benchmarkExecPlanOrderedBasicReader(b *testing.B, db *testDB, q *qx.QX, wan
 		work = make([]predicate, preds.Len())
 	}
 	copy(work, preds.owner)
-	trace := &Trace{}
-	out, ok := view.execPlanOrderedBasicReader(&shape, work, trace)
+	out, ok := view.execPlanOrderedBasicReader(&shape, work, nil)
 	if !ok {
-		b.Skip("ordered basic reader path is not used for this shape")
-	}
-	if wantPlan != "" && trace.Event().Plan != string(wantPlan) {
-		b.Skip("requested ordered basic reader variant is not used for this shape")
+		b.Fatal("ordered basic reader path was not used")
 	}
 	qexecBenchIDs = out
 
@@ -1985,10 +2538,115 @@ func benchmarkExecPlanOrderedBasicReader(b *testing.B, db *testDB, q *qx.QX, wan
 	b.ReportMetric(float64(len(qexecBenchIDs)), "rows/op")
 }
 
+func benchmarkExecPlanOrderedBasicAnchor(b *testing.B, db *testDB, q *qx.QX) {
+	b.Helper()
+
+	prepared, shape, err := db.prepareQuery(q)
+	if err != nil {
+		b.Fatalf("prepareQuery: %v", err)
+	}
+	defer prepared.Release()
+
+	leaves, ok := qir.CollectAndLeaves(shape.Expr, qir.LeafModeCollect)
+	if !ok {
+		b.Fatalf("CollectAndLeaves failed")
+	}
+	view := db.view()
+	order := shape.Order
+	fm := view.fieldMetaByOrder(order)
+	if fm == nil || fm.Slice {
+		b.Fatal("ordered basic anchor requires a scalar order field")
+	}
+	ov := view.fieldIndexViewFromSlotsForOrder(view.snap.Index, order)
+	if !ov.HasData() {
+		b.Fatal("ordered basic anchor requires order index data")
+	}
+	orderField := db.exec.FieldNameByOrdinal(order.FieldOrdinal)
+	preds, ok := view.buildPredicatesOrdered(leaves, orderField)
+	if !ok {
+		b.Fatalf("buildPredicatesOrdered failed")
+	}
+	defer preds.Release()
+
+	var inline [plannerPredicateFastPathMaxLeaves]predicate
+	var work []predicate
+	if preds.Len() <= len(inline) {
+		work = inline[:preds.Len()]
+	} else {
+		work = make([]predicate, preds.Len())
+	}
+	copy(work, preds.owner)
+
+	_, br, rangeCovered, ok := view.extractOrderRangeCoverageIndexViewWithBoundsReader(orderField, work, ov)
+	if !ok {
+		b.Fatal("extractOrderRangeCoverageIndexViewWithBoundsReader failed")
+	}
+	for i, covered := range rangeCovered {
+		if covered {
+			(&work[i]).covered = true
+		}
+	}
+	pooled.ReleaseBoolSlice(rangeCovered)
+	if br.Empty() {
+		b.Fatal("ordered basic anchor requires a non-empty order range")
+	}
+
+	var activeInline [plannerPredicateFastPathMaxLeaves]int
+	active := activeInline[:0]
+	if len(work) > len(activeInline) {
+		active = pooled.GetIntSlice(len(work))
+		defer pooled.ReleaseIntSlice(active)
+	}
+	for i := 0; i < len(work); i++ {
+		p := work[i]
+		if p.covered || p.alwaysTrue {
+			continue
+		}
+		if p.alwaysFalse {
+			b.Fatal("unexpected always-false predicate")
+		}
+		active = append(active, i)
+	}
+	if len(active) == 0 {
+		b.Fatal("ordered basic anchor requires active predicates")
+	}
+
+	var exactInline [plannerPredicateFastPathMaxLeaves]int
+	var residualInline [plannerPredicateFastPathMaxLeaves]int
+	var deferredInline [plannerPredicateFastPathMaxLeaves]int
+	exact := exactInline[:0]
+	residual := residualInline[:0]
+	deferred := deferredInline[:0]
+	if len(active) > len(exactInline) {
+		exact = pooled.GetIntSlice(len(active))
+		residual = pooled.GetIntSlice(len(active))
+		deferred = pooled.GetIntSlice(len(active))
+		defer pooled.ReleaseIntSlice(exact)
+		defer pooled.ReleaseIntSlice(residual)
+		defer pooled.ReleaseIntSlice(deferred)
+	}
+
+	out, ok := view.execPlanOrderedBasicAnchoredWithScratch(&shape, work, active, ov, br, nil, exact, residual, deferred)
+	if !ok {
+		b.Fatal("ordered basic anchor path was not used")
+	}
+	qexecBenchIDs = out
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		out, ok = view.execPlanOrderedBasicAnchoredWithScratch(&shape, work, active, ov, br, nil, exact, residual, deferred)
+		if !ok {
+			b.Fatal("ordered basic anchor path was not used")
+		}
+		qexecBenchIDs = out
+	}
+	b.ReportMetric(float64(len(qexecBenchIDs)), "rows/op")
+}
+
 func BenchmarkOrderedPlannerInternals(b *testing.B) {
 	qexecBenchRunScaleSelectivities(b, func(b *testing.B, db *testDB, scale qexecBenchScale, sel qexecBenchSelectivity) {
 		ageStart, ageEnd := qexecBenchAgeRange(scale.rows, sel)
-		tag := qexecBenchTag(sel)
 		noOrder := qx.Query(
 			qx.EQ("active", true),
 			qx.NOTIN("country", []string{"NL", "DE"}),
@@ -2001,23 +2659,26 @@ func BenchmarkOrderedPlannerInternals(b *testing.B) {
 			ageStart,
 			ageEnd,
 		).Sort("score", qx.DESC).Limit(128)
-		anchored := qx.Query(
-			qx.EQ("country", "US"),
-			qx.EQ("active", true),
-			qx.HASANY("tags", []string{tag, "go"}),
-			ageStart,
-			ageEnd,
-		).Sort("score", qx.DESC).Limit(128)
 
-		b.Run("TryPlanOrdered_NoOrderLeadScan", func(b *testing.B) {
-			benchmarkTryPlanOrdered(b, db, noOrder, PlanOrderedNoOrder)
+		b.Run("LimitSelectorDispatch_NoOrderFiltered", func(b *testing.B) {
+			benchmarkLimitSelectorDispatch(b, db, noOrder)
 		})
 		b.Run("ExecBasicReader", func(b *testing.B) {
-			benchmarkExecPlanOrderedBasicReader(b, db, basic, "")
+			benchmarkExecPlanOrderedBasicReader(b, db, basic)
 		})
-		b.Run("ExecBasicReader_Anchor", func(b *testing.B) {
-			benchmarkExecPlanOrderedBasicReader(b, db, anchored, PlanOrderedAnchor)
-		})
+		if sel.name == "Tiny" {
+			tag := qexecBenchTag(sel)
+			anchored := qx.Query(
+				qx.EQ("country", "US"),
+				qx.EQ("active", true),
+				qx.HASANY("tags", []string{tag, "go"}),
+				ageStart,
+				ageEnd,
+			).Sort("score", qx.DESC).Limit(128)
+			b.Run("ExecBasicReader_Anchor", func(b *testing.B) {
+				benchmarkExecPlanOrderedBasicAnchor(b, db, anchored)
+			})
+		}
 	})
 
 	qexecBenchRunScales(b, func(b *testing.B, db *testDB, _ qexecBenchScale) {
@@ -2026,7 +2687,7 @@ func BenchmarkOrderedPlannerInternals(b *testing.B) {
 			qx.EQ("active", true),
 		).Sort("opt", qx.ASC).Limit(128)
 		b.Run("NullableFallbackExactNilTail", func(b *testing.B) {
-			benchmarkExecPlanOrderedBasicReader(b, db, nullable, "")
+			benchmarkExecPlanOrderedBasicReader(b, db, nullable)
 		})
 	})
 }
@@ -2333,29 +2994,32 @@ const (
 	qexecBenchRouteOrderPrefixLimit
 	qexecBenchRouteRangeNoOrderLimit
 	qexecBenchRoutePrefixNoOrderLimit
-	qexecBenchRoutePlanCandidate
-	qexecBenchRoutePlanORMerge
+	qexecBenchRouteOR
 )
 
 func runQexecBenchRoute(view *View, shape *qir.Shape, route qexecBenchRoute) ([]uint64, bool, error) {
 	switch route {
 	case qexecBenchRouteNoFilterNoOrder:
-		return view.tryNoFilterNoOrderWithLimit(shape, nil)
+		return view.execSelectedNoOrderNoFilter(shape, nil)
 	case qexecBenchRouteLimit:
-		out, ok, _, err := view.tryLimitQuery(shape, nil)
+		if !shape.HasOrder {
+			out, ok, _, err := view.executeNoOrderLimit(shape, nil)
+			return out, ok, err
+		}
+		out, ok, _, err := view.executeOrderedLimit(shape, nil)
 		return out, ok, err
 	case qexecBenchRouteOrderBasicLimit:
-		return view.tryQueryOrderBasicWithLimit(shape, nil)
+		out, ok, _, err := view.executeOrderedLimit(shape, nil)
+		return out, ok, err
 	case qexecBenchRouteOrderPrefixLimit:
-		return view.tryQueryOrderPrefixWithLimit(shape, nil)
+		out, ok, _, err := view.executeOrderedLimit(shape, nil)
+		return out, ok, err
 	case qexecBenchRouteRangeNoOrderLimit:
-		return view.tryQueryRangeNoOrderWithLimit(shape, nil)
+		return view.execSelectedNoOrderDirectRange(shape, nil)
 	case qexecBenchRoutePrefixNoOrderLimit:
-		return view.tryQueryPrefixNoOrderWithLimit(shape, nil)
-	case qexecBenchRoutePlanCandidate:
-		return view.tryPlanCandidate(shape, nil)
-	case qexecBenchRoutePlanORMerge:
-		return view.tryPlanORMergeMode(shape, nil)
+		return view.execSelectedNoOrderDirectPrefix(shape, nil)
+	case qexecBenchRouteOR:
+		return view.executeOR(shape, nil)
 	default:
 		return nil, false, nil
 	}
@@ -2459,18 +3123,16 @@ func BenchmarkQueryRoutes(b *testing.B) {
 					{name: "RangeNoOrderLimit", q: qx.Query(ageStart).Limit(128), route: qexecBenchRouteRangeNoOrderLimit},
 					{name: "PrefixNoOrderLimit", q: qx.Query(qx.PREFIX("full_name", prefix)).Limit(128), route: qexecBenchRoutePrefixNoOrderLimit},
 					{
-						name: "PlanCandidate_NoOrder",
+						name: "LimitPlanner_NoOrderFiltered",
 						q: qx.Query(
 							qx.EQ("country", "US"),
 							qx.EQ("active", true),
-							ageStart,
-							ageEnd,
 							qx.HASANY("tags", []string{tag, "missing_tag"}),
 						).Limit(256),
-						route: qexecBenchRoutePlanCandidate,
+						route: qexecBenchRouteLimit,
 					},
 					{
-						name: "PlanORMerge_NoOrder",
+						name: "ORPlanner_NoOrder",
 						q: qx.Query(
 							qx.OR(
 								qx.EQ("country", "US"),
@@ -2478,7 +3140,7 @@ func BenchmarkQueryRoutes(b *testing.B) {
 								qx.AND(ageStart, ageEnd),
 							),
 						).Limit(256),
-						route: qexecBenchRoutePlanORMerge,
+						route: qexecBenchRouteOR,
 					},
 				}
 				for j := range cases {
@@ -2554,10 +3216,10 @@ func benchmarkORExecutor(b *testing.B, db *testDB, q *qx.QX, route qexecBenchORE
 	for i := 0; i < b.N; i++ {
 		switch route {
 		case qexecBenchORExecNoOrderAdaptive:
-			out, ok = view.execPlanORNoOrderAdaptive(&shape, branches, nil)
+			out, ok = view.execPlanORNoOrderAdaptiveCore(&shape, branches, nil)
 			err = nil
 		case qexecBenchORExecNoOrderBaseline:
-			out, ok = view.execPlanORNoOrderBaseline(&shape, branches, nil)
+			out, ok = view.execPlanORNoOrderBaselineCore(&shape, branches, nil)
 			err = nil
 		case qexecBenchORExecOrderKWay:
 			out, ok, err = view.execPlanOROrderKWay(&shape, branches, &analysis, nil)

@@ -19,12 +19,13 @@ type plannerGuardrailCase struct {
 }
 
 type plannerGuardrailFamily struct {
-	name                  string
-	open                  func(*testing.T, *traceContractRecorder) *testDB
-	cases                 []plannerGuardrailCase
-	runChosen             func(*View, *qir.Shape, *Trace) ([]uint64, bool, error)
-	runAlternative        func(*View, *qir.Shape, *Trace) ([]uint64, bool, error)
-	compareOrderScanWidth bool
+	name                    string
+	open                    func(*testing.T, *traceContractRecorder) *testDB
+	cases                   []plannerGuardrailCase
+	runChosen               func(*View, *qir.Shape, *Trace) ([]uint64, bool, error)
+	runAlternative          func(*View, *qir.Shape, *Trace) ([]uint64, bool, error)
+	skipRowsExaminedCompare bool
+	compareOrderScanWidth   bool
 }
 
 func plannerGuardrailOpenSeededDB(
@@ -90,7 +91,7 @@ func plannerGuardrailRunTryPlanORMergeMode(
 	viewQ *qir.Shape,
 	trace *Trace,
 ) ([]uint64, bool, error) {
-	return view.tryPlanORMergeMode(viewQ, trace)
+	return view.executeOR(viewQ, trace)
 }
 
 func plannerGuardrailRunForcedORNoOrderBaseline(
@@ -107,7 +108,7 @@ func plannerGuardrailRunForcedORNoOrderBaseline(
 		return nil, true, nil
 	}
 	defer branches.Release()
-	out, ok := view.execPlanORNoOrderBaseline(viewQ, branches, trace)
+	out, ok := view.execPlanORNoOrderBaselineCore(viewQ, branches, trace)
 	return out, ok, nil
 }
 
@@ -137,12 +138,12 @@ func plannerGuardrailRunForcedOROrderFallback(
 	return view.execPlanOROrderMergeFallback(viewQ, branches, trace)
 }
 
-func plannerGuardrailRunTryExecutionPlan(
+func plannerGuardrailRunLimitRoutes(
 	view *View,
 	viewQ *qir.Shape,
 	trace *Trace,
 ) ([]uint64, bool, error) {
-	return view.tryExecutionPlan(viewQ, trace)
+	return tryLimitRoutesForTest(view, viewQ, trace)
 }
 
 func plannerGuardrailRunForcedOrderedPlanner(
@@ -182,7 +183,24 @@ func plannerGuardrailRunTryPlanCandidate(
 	viewQ *qir.Shape,
 	trace *Trace,
 ) ([]uint64, bool, error) {
-	return view.tryPlanCandidate(viewQ, trace)
+	if viewQ.HasOrder {
+		out, ok, plan, err := view.executeOrderedLimit(viewQ, trace)
+		if ok && plan == PlanCandidateOrder {
+			if trace != nil {
+				trace.SetPlan(plan)
+			}
+			return out, true, err
+		}
+		return nil, false, err
+	}
+	out, ok, plan, err := view.executeNoOrderLimit(viewQ, trace)
+	if ok && plan == PlanCandidateNoOrder {
+		if trace != nil {
+			trace.SetPlan(plan)
+		}
+		return out, true, err
+	}
+	return nil, false, err
 }
 
 func plannerGuardrailRunForcedOrderedNoOrderPlanner(
@@ -211,7 +229,52 @@ func plannerGuardrailRunForcedOrderedNoOrderPlanner(
 	if trace != nil {
 		trace.SetPlan(PlanOrderedNoOrder)
 	}
-	return view.execPlanLeadScanNoOrder(viewQ, predSet.owner, trace), true, nil
+	return view.execPlanLeadScanNoOrder(viewQ, predSet.owner, -1, trace), true, nil
+}
+
+func plannerGuardrailRunNoOrderLimitSelector(
+	view *View,
+	viewQ *qir.Shape,
+	trace *Trace,
+) ([]uint64, bool, error) {
+	out, ok, plan, err := view.executeNoOrderLimit(viewQ, trace)
+	if ok && trace != nil {
+		trace.SetPlan(plan)
+	}
+	return out, ok, err
+}
+
+func plannerGuardrailRunForcedNoOrderRange(
+	view *View,
+	viewQ *qir.Shape,
+	trace *Trace,
+) ([]uint64, bool, error) {
+	var leavesBuf [plannerPredicateFastPathMaxLeaves]qir.Expr
+	leaves, ok := qir.CollectAndLeavesScratch(viewQ.Expr, leavesBuf[:0], qir.LeafModeCollect)
+	if !ok {
+		return nil, false, nil
+	}
+	f, bounds, ok, err := view.extractNoOrderBounds(leaves)
+	if err != nil || !ok {
+		if err != nil {
+			return nil, false, err
+		}
+		for _, e := range leaves {
+			if e.Not || !isBoundOp(e.Op) || e.FieldOrdinal < 0 {
+				continue
+			}
+			f = view.exec.FieldNameByOrdinal(e.FieldOrdinal)
+			bounds, ok, err = view.extractBoundsForField(f, leaves)
+			break
+		}
+		if err != nil || !ok {
+			return nil, false, err
+		}
+	}
+	if trace != nil {
+		trace.SetPlan(PlanLimitRangeNoOrder)
+	}
+	return view.execSelectedNoOrderBounds(viewQ, f, bounds, leaves, trace)
 }
 
 func runPlannerGuardrailFamily(t *testing.T, family plannerGuardrailFamily) {
@@ -244,21 +307,23 @@ func runPlannerGuardrailFamily(t *testing.T, family plannerGuardrailFamily) {
 		})
 	}
 
-	if chosenTotals.rowsExamined == 0 || alternativeTotals.rowsExamined == 0 {
-		t.Fatalf(
-			"%s: expected positive aggregate RowsExamined: chosen=%d alternative=%d",
-			family.name,
-			chosenTotals.rowsExamined,
-			alternativeTotals.rowsExamined,
-		)
-	}
-	if chosenTotals.rowsExamined > alternativeTotals.rowsExamined {
-		t.Fatalf(
-			"%s: expected chosen family to examine no more rows: chosen=%d alternative=%d",
-			family.name,
-			chosenTotals.rowsExamined,
-			alternativeTotals.rowsExamined,
-		)
+	if !family.skipRowsExaminedCompare {
+		if chosenTotals.rowsExamined == 0 || alternativeTotals.rowsExamined == 0 {
+			t.Fatalf(
+				"%s: expected positive aggregate RowsExamined: chosen=%d alternative=%d",
+				family.name,
+				chosenTotals.rowsExamined,
+				alternativeTotals.rowsExamined,
+			)
+		}
+		if chosenTotals.rowsExamined > alternativeTotals.rowsExamined {
+			t.Fatalf(
+				"%s: expected chosen family to examine no more rows: chosen=%d alternative=%d",
+				family.name,
+				chosenTotals.rowsExamined,
+				alternativeTotals.rowsExamined,
+			)
+		}
 	}
 	if family.compareOrderScanWidth && chosenTotals.orderScanWidth > alternativeTotals.orderScanWidth {
 		t.Fatalf(
@@ -373,7 +438,7 @@ func TestPlannerGuardrails_OrderedLimitExecutionFamily(t *testing.T) {
 			{name: "Limit60", q: q60, wantChosenPlan: PlanLimitOrderBasic},
 			{name: "Limit120", q: base, wantChosenPlan: PlanLimitOrderBasic},
 		},
-		runChosen:             plannerGuardrailRunTryExecutionPlan,
+		runChosen:             plannerGuardrailRunLimitRoutes,
 		runAlternative:        plannerGuardrailRunForcedOrderedPlanner,
 		compareOrderScanWidth: true,
 	})
@@ -425,5 +490,217 @@ func TestPlannerGuardrails_CandidateNoOrderFamily(t *testing.T) {
 		},
 		runChosen:      plannerGuardrailRunTryPlanCandidate,
 		runAlternative: plannerGuardrailRunForcedOrderedNoOrderPlanner,
+	})
+}
+
+func TestPlannerGuardrails_NoOrderBroadRangeLeadNamedFamily(t *testing.T) {
+	broadSelective := qx.Query(
+		qx.GTE("age", 18),
+		qx.LT("age", 68),
+		qx.EQ("country", "NL"),
+		qx.EQ("name", "alice"),
+		qx.HASANY("tags", []string{"go", "db"}),
+	).Limit(64)
+	broadSelectiveNone := qx.Query(
+		qx.GTE("age", 18),
+		qx.LT("age", 68),
+		qx.EQ("country", "NL"),
+		qx.EQ("name", "mallory"),
+		qx.HASANY("tags", []string{"go", "db"}),
+	).Limit(64)
+	missingEquality := qx.Query(
+		qx.GTE("age", 18),
+		qx.LT("age", 68),
+		qx.EQ("country", "ZZ"),
+	).Limit(64)
+	weakControl := qx.Query(
+		qx.GTE("age", 18),
+		qx.LT("age", 68),
+		qx.EQ("active", true),
+		qx.HASANY("tags", []string{"go", "db"}),
+		qx.PREFIX("full_name", "FN-"),
+	).Limit(64)
+	narrowControl := qx.Query(
+		qx.GTE("age", 18),
+		qx.LT("age", 22),
+		qx.EQ("active", true),
+		qx.HASANY("tags", []string{"go", "db"}),
+		qx.PREFIX("full_name", "FN-"),
+	).Limit(32)
+
+	runPlannerGuardrailFamily(t, plannerGuardrailFamily{
+		name: "NoOrderBroadRangeLeadNamedFamily",
+		open: plannerGuardrailOpenSeededDB,
+		cases: []plannerGuardrailCase{
+			{name: "BroadRangeLead_ThreeSelectiveResiduals", q: broadSelective, wantChosenPlan: PlanCandidateNoOrder},
+			{name: "BroadRangeLead_ThreeSelectiveResiduals_None", q: broadSelectiveNone},
+			{name: "MissingEqualityResidual", q: missingEquality},
+			{name: "BroadRangeLead_ThreeWeakResiduals_Control", q: weakControl, wantChosenPlan: PlanLimitRangeNoOrder},
+			{name: "NarrowRangeLead_ThreeResiduals_Control", q: narrowControl, wantChosenPlan: PlanLimitRangeNoOrder},
+		},
+		runChosen:               plannerGuardrailRunNoOrderLimitSelector,
+		runAlternative:          plannerGuardrailRunForcedNoOrderRange,
+		skipRowsExaminedCompare: true,
+	})
+}
+
+func plannerGuardrailOrderedLimitBaseCandidate(
+	t *testing.T,
+	db *testDB,
+	q *qx.QX,
+	markSecondHit bool,
+	warm bool,
+) plannerOrderedLimitCandidate {
+	t.Helper()
+
+	preparedQ, viewQ, err := db.prepareQuery(q)
+	if err != nil {
+		t.Fatalf("prepareQuery: %v", err)
+	}
+	defer preparedQ.Release()
+
+	view := db.view()
+	var leavesBuf [limitQueryFastPathMaxLeaves]qir.Expr
+	leaves, ok := qir.CollectAndLeavesScratch(viewQ.Expr, leavesBuf[:0], qir.LeafModeCollect)
+	if !ok || len(leaves) == 0 {
+		t.Fatalf("CollectAndLeavesScratch: ok=%v len=%d", ok, len(leaves))
+	}
+
+	orderField := view.exec.FieldNameByOrdinal(viewQ.Order.FieldOrdinal)
+	bounds, ok, err := view.extractBoundsForField(orderField, leaves)
+	if err != nil {
+		t.Fatalf("extractBoundsForField: %v", err)
+	}
+	if !ok {
+		t.Fatalf("expected order bounds for %q", orderField)
+	}
+
+	var baseOpsBuf [limitQueryFastPathMaxLeaves]qir.Expr
+	baseOps := baseOpsBuf[:0]
+	for _, e := range leaves {
+		if isBoundOp(e.Op) && !e.Not && e.FieldOrdinal == viewQ.Order.FieldOrdinal {
+			continue
+		}
+		baseOps = append(baseOps, e)
+	}
+	if len(baseOps) == 0 {
+		t.Fatalf("expected ordered LIMIT base ops")
+	}
+
+	if markSecondHit {
+		universe := view.snap.Universe.Cardinality()
+		for _, op := range baseOps {
+			stats, ok := view.orderBasicRawBaseOpStats(op, universe)
+			if ok && !stats.cacheKey.IsZero() {
+				view.snap.ShouldPromoteRuntimeMaterializedPredKey(stats.cacheKey)
+			}
+		}
+	}
+	if warm {
+		view.promoteOrderBasicLimitMaterializedBaseOps(orderField, baseOps, 5_000, uint64(viewQ.Limit))
+	}
+
+	ov := view.fieldIndexViewFromSlotsForOrder(view.snap.Index, viewQ.Order)
+	if ov.RangeForBounds(bounds).Empty() {
+		t.Fatalf("expected non-empty order range")
+	}
+	orderCandidate := plannerOrderedLimitCandidate{
+		kind:         plannerOrderedLimitCandidateOrderScan,
+		cost:         1_000_000,
+		expectedRows: 5_000,
+		buckets:      uint64(ov.KeyCount()),
+		checks:       uint64(len(leaves)),
+	}
+	candidate, ok, noMatch, err := view.orderedLimitBaseOpsCandidate(baseOps, int(viewQ.Limit), true, viewQ.Offset > 0, orderCandidate)
+	if err != nil {
+		t.Fatalf("orderedLimitBaseOpsCandidate: %v", err)
+	}
+	if noMatch {
+		t.Fatalf("orderedLimitBaseOpsCandidate: noMatch")
+	}
+	if !ok {
+		t.Fatalf("orderedLimitBaseOpsCandidate: ok=false")
+	}
+	return candidate
+}
+
+func TestPlannerGuardrails_OrderedLimitCacheStates(t *testing.T) {
+	ageRangeQ := qx.Query(
+		qx.GTE("age", 25),
+		qx.LTE("age", 40),
+		qx.GT("score", 0.5),
+	).Sort("score", qx.DESC).Limit(10)
+
+	twoRangeQ := qx.Query(
+		qx.GTE("age", 25),
+		qx.LTE("age", 40),
+		qx.GTE("score", 10.0),
+		qx.LTE("score", 20.0),
+		qx.PREFIX("full_name", "FN-"),
+	).Sort("full_name", qx.ASC).Limit(10)
+
+	secondHitQ := qx.Query(
+		qx.PREFIX("name", "a"),
+		qx.PREFIX("full_name", "FN-"),
+	).Sort("full_name", qx.ASC).Limit(10)
+
+	t.Run("Warm", func(t *testing.T) {
+		db := newTestDB(t, testOptions{MatPredCacheMaxEntries: 16})
+		_ = db.seedData(t, 20_000)
+		candidate := plannerGuardrailOrderedLimitBaseCandidate(t, db, ageRangeQ, false, true)
+		if candidate.kind != plannerOrderedLimitCandidateWarmBaseCore {
+			t.Fatalf("kind=%v want=%v", candidate.kind, plannerOrderedLimitCandidateWarmBaseCore)
+		}
+		if candidate.cacheState != plannerMaterializedCacheWarmHit {
+			t.Fatalf("cacheState=%v want=%v", candidate.cacheState, plannerMaterializedCacheWarmHit)
+		}
+	})
+
+	t.Run("ColdRetained", func(t *testing.T) {
+		db := newTestDB(t, testOptions{MatPredCacheMaxEntries: 16})
+		_ = db.seedData(t, 20_000)
+		candidate := plannerGuardrailOrderedLimitBaseCandidate(t, db, twoRangeQ, false, false)
+		if candidate.kind != plannerOrderedLimitCandidateColdRetainedBaseCore {
+			t.Fatalf("kind=%v want=%v", candidate.kind, plannerOrderedLimitCandidateColdRetainedBaseCore)
+		}
+		if candidate.cacheState != plannerMaterializedCacheColdRegularAdmissible {
+			t.Fatalf("cacheState=%v want=%v", candidate.cacheState, plannerMaterializedCacheColdRegularAdmissible)
+		}
+	})
+
+	t.Run("SecondHitRequired", func(t *testing.T) {
+		db := newTestDB(t, testOptions{MatPredCacheMaxEntries: 16})
+		_ = db.seedData(t, 20_000)
+		candidate := plannerGuardrailOrderedLimitBaseCandidate(t, db, secondHitQ, false, false)
+		if candidate.kind != plannerOrderedLimitCandidateColdUnretainedBaseCore {
+			t.Fatalf("kind=%v want=%v", candidate.kind, plannerOrderedLimitCandidateColdUnretainedBaseCore)
+		}
+		if candidate.cacheState != plannerMaterializedCacheColdSecondHitRequired {
+			t.Fatalf("cacheState=%v want=%v", candidate.cacheState, plannerMaterializedCacheColdSecondHitRequired)
+		}
+	})
+
+	t.Run("Disabled", func(t *testing.T) {
+		db := newTestDB(t, testOptions{MatPredCacheMaxEntries: -1})
+		_ = db.seedData(t, 20_000)
+		candidate := plannerGuardrailOrderedLimitBaseCandidate(t, db, ageRangeQ, false, false)
+		if candidate.kind != plannerOrderedLimitCandidateColdUnretainedBaseCore {
+			t.Fatalf("kind=%v want=%v", candidate.kind, plannerOrderedLimitCandidateColdUnretainedBaseCore)
+		}
+		if candidate.cacheState != plannerMaterializedCacheDisabled {
+			t.Fatalf("cacheState=%v want=%v", candidate.cacheState, plannerMaterializedCacheDisabled)
+		}
+	})
+
+	t.Run("Tiny", func(t *testing.T) {
+		db := newTestDB(t, testOptions{MatPredCacheMaxEntries: 1})
+		_ = db.seedData(t, 20_000)
+		candidate := plannerGuardrailOrderedLimitBaseCandidate(t, db, twoRangeQ, false, false)
+		if candidate.kind != plannerOrderedLimitCandidateColdUnretainedBaseCore {
+			t.Fatalf("kind=%v want=%v", candidate.kind, plannerOrderedLimitCandidateColdUnretainedBaseCore)
+		}
+		if candidate.cacheState != plannerMaterializedCacheColdUnretainedByPolicy {
+			t.Fatalf("cacheState=%v want=%v", candidate.cacheState, plannerMaterializedCacheColdUnretainedByPolicy)
+		}
 	})
 }

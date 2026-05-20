@@ -5,6 +5,8 @@ import (
 	"testing"
 
 	"github.com/vapstack/qx"
+	"github.com/vapstack/rbi/internal/posting"
+	"github.com/vapstack/rbi/internal/qcache"
 	"github.com/vapstack/rbi/internal/qir"
 )
 
@@ -136,13 +138,18 @@ func plannerArgminOROrderCandidatesForTest(
 
 	orderStats := qv.plannerOrderFieldStats(analysis.orderField, snap, universe, orderDistinct)
 	expectedRows := estimateRowsForNeed(uint64(need), unionCard, universe)
+	_, eagerBuildWork := qv.orderedORCacheCandidateState(branches, analysis, need, q.Offset)
+	eagerCost := 0.0
+	if q.Offset > 0 && eagerBuildWork > 0 {
+		eagerCost = float64(eagerBuildWork)
+	}
 
 	candidates := plannerOROrderArgminCandidates{
 		fallbackCost: float64(sumCard) + float64(expectedRows),
 	}
 
 	streamChecks := branches.orderStreamChecksByBranch(hasAlwaysTrue, analysis.mergeStats)
-	candidates.streamCost = float64(expectedRows) * streamChecks * plannerFieldStatsSkew(orderStats)
+	candidates.streamCost = float64(expectedRows)*streamChecks*plannerFieldStatsSkew(orderStats) + eagerCost
 
 	mergeNeedLimit := plannerOROrderMergeNeedLimit(need, branches.Len(), unionCard, sumCard, q.Offset)
 	candidates.mergeApplicable = !hasAlwaysTrue && need <= mergeNeedLimit
@@ -169,6 +176,7 @@ func plannerArgminOROrderCandidatesForTest(
 		!branches.hasKWayExactBucketApplyWork(analysis.mergeStats) {
 		candidates.mergeCost = routeCost.kWay
 	}
+	candidates.mergeCost += eagerCost
 	return candidates, true
 }
 
@@ -236,7 +244,7 @@ func TestPlannerArgmin_ORNoOrderDecisionMatchesCandidatePolicy(t *testing.T) {
 	branches.Append(makeORBranchForPlannerDecisionTest(4_000, 4))
 	defer branches.Release()
 
-	decision := db.decidePlanORNoOrder(q, branches)
+	decision := db.selectPlanORNoOrder(q, branches)
 	if decision.kWayCost <= 0 || decision.fallbackCost <= 0 {
 		t.Fatalf("expected positive candidate costs: kway=%v fallback=%v", decision.kWayCost, decision.fallbackCost)
 	}
@@ -316,7 +324,7 @@ func TestPlannerArgmin_OROrderDecisionMatchesCandidatePolicy(t *testing.T) {
 			}
 
 			wantPlan, wantCost := candidates.expectedPlan()
-			decision := view.decidePlanOROrderWithAnalysis(&viewQ, branches, &analysis)
+			decision := view.selectPlanOROrderWithAnalysis(&viewQ, branches, &analysis)
 			if decision.plan != wantPlan {
 				t.Fatalf("ordered OR winner mismatch: got=%v want=%v", decision.plan, wantPlan)
 			}
@@ -382,7 +390,7 @@ func TestPlannerArgmin_OROrderDecisionMatchesCandidatePolicy_FallbackSynthetic(t
 		)
 	}
 
-	decision := view.decidePlanOROrderWithAnalysis(&viewQ, branches, &analysis)
+	decision := view.selectPlanOROrderWithAnalysis(&viewQ, branches, &analysis)
 	if decision.plan != wantPlan {
 		t.Fatalf("synthetic ordered OR winner mismatch: got=%v want=%v", decision.plan, wantPlan)
 	}
@@ -425,5 +433,162 @@ func TestPlannerArgmin_OrderedDecisionMatchesCandidatePolicy(t *testing.T) {
 			"ordered winner mismatch: use=%v ordered=%v fallback=%v gain=%v",
 			decision.use, decision.orderedCost, decision.fallbackCost, candidates.gainReq,
 		)
+	}
+}
+
+func TestPlannerArgmin_OrderedLimitCandidatePolicy(t *testing.T) {
+	candidates := [...]plannerOrderedLimitCandidate{
+		{kind: plannerOrderedLimitCandidateOrderScan, cost: 90},
+		{kind: plannerOrderedLimitCandidateColdRetainedBaseCore, cost: 80},
+		{kind: plannerOrderedLimitCandidateMaterializedFallback, cost: 120},
+	}
+
+	decision := plannerOrderedLimitPick(candidates[:])
+	if decision.selected.kind != plannerOrderedLimitCandidateColdRetainedBaseCore {
+		t.Fatalf("selected=%v want=%v", decision.selected.kind, plannerOrderedLimitCandidateColdRetainedBaseCore)
+	}
+	if decision.rejected.kind != plannerOrderedLimitCandidateOrderScan {
+		t.Fatalf("nearest rejected=%v want=%v", decision.rejected.kind, plannerOrderedLimitCandidateOrderScan)
+	}
+	if decision.runtimeFallback.kind != plannerOrderedLimitCandidateOrderScan {
+		t.Fatalf("runtime fallback=%v want=%v", decision.runtimeFallback.kind, plannerOrderedLimitCandidateOrderScan)
+	}
+	if decision.materializedFallback.kind != plannerOrderedLimitCandidateMaterializedFallback {
+		t.Fatalf("materialized fallback=%v want=%v", decision.materializedFallback.kind, plannerOrderedLimitCandidateMaterializedFallback)
+	}
+}
+
+func TestPlannerArgmin_NoOrderLimitCandidatePolicy(t *testing.T) {
+	candidates := [...]plannerNoOrderLimitCandidate{
+		{kind: plannerNoOrderLimitCandidateDirectRange, cost: 90},
+		{kind: plannerNoOrderLimitCandidateLeadScan, cost: 75},
+		{kind: plannerNoOrderLimitCandidateMaterializedFallback, cost: 140},
+	}
+
+	decision := plannerNoOrderLimitPick(candidates[:])
+	if decision.selected.kind != plannerNoOrderLimitCandidateLeadScan {
+		t.Fatalf("selected=%v want=%v", decision.selected.kind, plannerNoOrderLimitCandidateLeadScan)
+	}
+	if decision.rejected.kind != plannerNoOrderLimitCandidateDirectRange {
+		t.Fatalf("nearest rejected=%v want=%v", decision.rejected.kind, plannerNoOrderLimitCandidateDirectRange)
+	}
+	if decision.materializedFallback.kind != plannerNoOrderLimitCandidateMaterializedFallback {
+		t.Fatalf("materialized fallback=%v want=%v", decision.materializedFallback.kind, plannerNoOrderLimitCandidateMaterializedFallback)
+	}
+}
+
+func TestPlannerArgmin_ORNoOrderCandidatePolicy(t *testing.T) {
+	candidates := [...]plannerORNoOrderCandidate{
+		{kind: plannerORNoOrderCandidateAdaptiveMerge, cost: 90},
+		{kind: plannerORNoOrderCandidateBaselineMerge, cost: 95},
+		{kind: plannerORNoOrderCandidateMaterializedFallback, cost: 120},
+	}
+
+	decision := plannerORNoOrderPick(candidates[:], false)
+	if decision.selected.kind != plannerORNoOrderCandidateAdaptiveMerge {
+		t.Fatalf("selected=%v want=%v", decision.selected.kind, plannerORNoOrderCandidateAdaptiveMerge)
+	}
+	if decision.rejected.kind != plannerORNoOrderCandidateBaselineMerge {
+		t.Fatalf("nearest rejected=%v want=%v", decision.rejected.kind, plannerORNoOrderCandidateBaselineMerge)
+	}
+	if decision.materializedFallback.kind != plannerORNoOrderCandidateMaterializedFallback {
+		t.Fatalf("materialized fallback=%v want=%v", decision.materializedFallback.kind, plannerORNoOrderCandidateMaterializedFallback)
+	}
+
+	decision = plannerORNoOrderPick(candidates[:], true)
+	if decision.selected.kind != plannerORNoOrderCandidateMaterializedFallback {
+		t.Fatalf("forced selected=%v want=%v", decision.selected.kind, plannerORNoOrderCandidateMaterializedFallback)
+	}
+}
+
+func TestPlannerArgmin_OROrderCandidatePolicy(t *testing.T) {
+	candidates := [...]plannerOROrderCandidate{
+		{kind: plannerOROrderCandidateMaterializedFallback, cost: 100},
+		{kind: plannerOROrderCandidateKWayMerge, cost: 95},
+		{kind: plannerOROrderCandidateBranchCollect, cost: 70},
+		{kind: plannerOROrderCandidateStream, cost: 80},
+	}
+
+	decision := plannerOROrderPick(candidates[:], false)
+	if decision.selected.kind != plannerOROrderCandidateBranchCollect {
+		t.Fatalf("selected=%v want=%v", decision.selected.kind, plannerOROrderCandidateBranchCollect)
+	}
+	if decision.rejected.kind != plannerOROrderCandidateStream {
+		t.Fatalf("nearest rejected=%v want=%v", decision.rejected.kind, plannerOROrderCandidateStream)
+	}
+	if decision.materializedFallback.kind != plannerOROrderCandidateMaterializedFallback {
+		t.Fatalf("materialized fallback=%v want=%v", decision.materializedFallback.kind, plannerOROrderCandidateMaterializedFallback)
+	}
+
+	decision = plannerOROrderPick(candidates[:], true)
+	if decision.selected.kind != plannerOROrderCandidateMaterializedFallback {
+		t.Fatalf("forced selected=%v want=%v", decision.selected.kind, plannerOROrderCandidateMaterializedFallback)
+	}
+}
+
+func TestPlannerArgmin_OrderedLimitRuntimeGuard(t *testing.T) {
+	q := &qir.Shape{Limit: 10}
+	decision := plannerOrderedLimitDecision{
+		selected: plannerOrderedLimitCandidate{
+			kind:         plannerOrderedLimitCandidateOrderScan,
+			expectedRows: 10,
+			checks:       1,
+		},
+		runtimeFallback: plannerOrderedLimitCandidate{
+			kind: plannerOrderedLimitCandidateMaterializedFallback,
+			cost: 100,
+		},
+	}
+
+	guard := decision.runtimeGuard(q)
+	if !guard.enabled {
+		t.Fatalf("expected runtime guard")
+	}
+	if guard.shouldFallback(guard.minExamined-1, 0) {
+		t.Fatalf("guard fired before minExamined")
+	}
+	if !guard.shouldFallback(guard.minExamined, 0) {
+		t.Fatalf("guard did not fire after underestimated scan work")
+	}
+	if guard.shouldFallback(guard.minExamined, 3) {
+		t.Fatalf("guard fired after enough early output")
+	}
+}
+
+func TestPlannerMaterializedCacheClassifierStates(t *testing.T) {
+	key := qcache.MaterializedPredKeyForScalar("name", qir.OpPREFIX, "a")
+
+	db := newTestDB(t, testOptions{
+		MatPredCacheMaxEntries: 4,
+		MatPredCacheMaxCard:    8,
+	})
+	_ = db.seedData(t, 64)
+	view := db.view()
+
+	if got := view.classifyPlannerMaterializedCacheKey(key, 4, false); got != plannerMaterializedCacheColdRegularAdmissible {
+		t.Fatalf("regular state=%v want=%v", got, plannerMaterializedCacheColdRegularAdmissible)
+	}
+	if got := view.classifyPlannerMaterializedCacheKey(key, 16, false); got != plannerMaterializedCacheColdOversizedAdmissible {
+		t.Fatalf("oversized state=%v want=%v", got, plannerMaterializedCacheColdOversizedAdmissible)
+	}
+
+	secondHitKey := qcache.MaterializedPredKeyForScalar("email", qir.OpPREFIX, "u")
+	if got := view.classifyPlannerMaterializedCacheKey(secondHitKey, 4, true); got != plannerMaterializedCacheColdSecondHitRequired {
+		t.Fatalf("second-hit state=%v want=%v", got, plannerMaterializedCacheColdSecondHitRequired)
+	}
+	view.snap.ShouldPromoteRuntimeMaterializedPredKey(secondHitKey)
+	if got := view.classifyPlannerMaterializedCacheKey(secondHitKey, 4, true); got != plannerMaterializedCacheColdRegularAdmissible {
+		t.Fatalf("seen second-hit state=%v want=%v", got, plannerMaterializedCacheColdRegularAdmissible)
+	}
+
+	view.snap.StoreMaterializedPredKey(key, posting.List{})
+	if got := view.classifyPlannerMaterializedCacheKey(key, 4, false); got != plannerMaterializedCacheWarmHit {
+		t.Fatalf("warm state=%v want=%v", got, plannerMaterializedCacheWarmHit)
+	}
+
+	disabled := newTestDB(t, testOptions{MatPredCacheMaxEntries: -1})
+	_ = disabled.seedData(t, 16)
+	if got := disabled.view().classifyPlannerMaterializedCacheKey(key, 4, false); got != plannerMaterializedCacheDisabled {
+		t.Fatalf("disabled state=%v want=%v", got, plannerMaterializedCacheDisabled)
 	}
 }

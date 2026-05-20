@@ -402,12 +402,15 @@ func TestTryPlanOrdered_AllowsPointerSortField(t *testing.T) {
 
 	view := db.view()
 	trace := Trace{sink: func(TraceEvent) {}}
-	got, ok, err := view.tryPlanOrdered(&shape, &trace)
+	got, ok, plan, err := view.executeOrderedLimit(&shape, &trace)
 	if err != nil {
-		t.Fatalf("tryPlanOrdered: %v", err)
+		t.Fatalf("executeOrderedLimit: %v", err)
 	}
 	if !ok {
-		t.Fatalf("tryPlanOrdered: ok=false estimated=%d ordered=%v fallback=%v", trace.ev.EstimatedRows, trace.ev.EstimatedCost, trace.ev.FallbackCost)
+		t.Fatalf("executeOrderedLimit: ok=false estimated=%d ordered=%v fallback=%v", trace.ev.EstimatedRows, trace.ev.EstimatedCost, trace.ev.FallbackCost)
+	}
+	if plan != "" {
+		trace.SetPlan(plan)
 	}
 	if trace.ev.Plan != string(PlanOrdered) {
 		t.Fatalf("unexpected plan: got=%q want=%q", trace.ev.Plan, PlanOrdered)
@@ -636,7 +639,7 @@ func TestPlannerORNoOrderAdaptive_ReturnsNoOrderPage(t *testing.T) {
 	}
 	defer branchesAdaptive.Release()
 
-	gotAdaptive, ok := db.engine.execPlanORNoOrderAdaptive(q, branchesAdaptive, nil)
+	gotAdaptive, ok := db.engine.execPlanORNoOrderAdaptiveCore(q, branchesAdaptive, nil)
 	if !ok {
 		t.Fatalf("execPlanORNoOrderAdaptive: ok=false")
 	}
@@ -736,7 +739,7 @@ func TestBuildORBranches_BroadNumericRangeStaysRuntimeOnSecondBuild(t *testing.T
 	}
 }
 
-func TestPlannerORNoOrder_BroadResidualRangePromotesRouteAware(t *testing.T) {
+func TestPlannerORNoOrder_BroadResidualRangeStaysLazyDuringAdaptiveLimit(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
 		AnalyzeInterval:                         -1,
 		SnapshotMaterializedPredCacheMaxEntries: 16,
@@ -813,15 +816,15 @@ func TestPlannerORNoOrder_BroadResidualRangePromotesRouteAware(t *testing.T) {
 	}
 	checkScorePred(branches, predicateKindCustom)
 
-	if _, ok := db.engine.execPlanORNoOrderAdaptive(q, branches, nil); !ok {
+	if _, ok := db.engine.execPlanORNoOrderAdaptiveCore(q, branches, nil); !ok {
 		branches.Release()
 		t.Fatalf("execPlanORNoOrderAdaptive: ok=false")
 	}
-	checkScorePred(branches, predicateKindMaterializedNot)
+	checkScorePred(branches, predicateKindCustom)
 	branches.Release()
 
-	if got := db.engine.snapshot.Current().MaterializedPredCache().EntryCount(); got == 0 {
-		t.Fatalf("expected route-aware residual materialization to populate shared cache")
+	if got := db.engine.snapshot.Current().MaterializedPredCache().EntryCount(); got != 0 {
+		t.Fatalf("unexpected shared materialized predicate cache entry: %d", got)
 	}
 }
 
@@ -896,7 +899,7 @@ func TestPlannerORNoOrder_ExactLeadWithComplementRangeResidualNotExhausted(t *te
 		t.Fatalf("expected score range predicate in OR branches")
 	}
 
-	got, ok := db.engine.execPlanORNoOrderAdaptive(q, branches, nil)
+	got, ok := db.engine.execPlanORNoOrderAdaptiveCore(q, branches, nil)
 	if !ok {
 		t.Fatalf("execPlanORNoOrderAdaptive: ok=false")
 	}
@@ -1182,7 +1185,7 @@ func TestPlannerORNoOrder_NullableNonBroadComplementResidualRangeDoesNotStayLazy
 		t.Fatalf("expected rank range predicate in OR branches")
 	}
 
-	gotBaseline, ok := db.engine.execPlanORNoOrderBaseline(q, branches, nil)
+	gotBaseline, ok := db.engine.execPlanORNoOrderBaselineCore(q, branches, nil)
 	if !ok {
 		t.Fatalf("execPlanORNoOrderBaseline: ok=false")
 	}
@@ -1277,7 +1280,7 @@ func TestPlannerORNoOrder_NullableNonBroadComplementOnlyPositiveLeafKeepsLead(t 
 		t.Fatalf("expected rank range branch with negative sibling leaf")
 	}
 
-	gotBaseline, ok := db.engine.execPlanORNoOrderBaseline(q, branches, nil)
+	gotBaseline, ok := db.engine.execPlanORNoOrderBaselineCore(q, branches, nil)
 	if !ok {
 		t.Fatalf("execPlanORNoOrderBaseline: ok=false")
 	}
@@ -1295,7 +1298,7 @@ func TestPlannerORNoOrder_NullableNonBroadComplementOnlyPositiveLeafKeepsLead(t 
 	if alwaysFalse {
 		t.Fatalf("unexpected alwaysFalse on second build")
 	}
-	gotAdaptive, ok := db.engine.execPlanORNoOrderAdaptive(q, branches2, nil)
+	gotAdaptive, ok := db.engine.execPlanORNoOrderAdaptiveCore(q, branches2, nil)
 	if !ok {
 		t.Fatalf("execPlanORNoOrderAdaptive: ok=false")
 	}
@@ -1709,7 +1712,7 @@ func TestPlannerOROrder_WarmMaterializationRefreshesAnalysisBeforeDecision(t *te
 		}
 	}
 
-	if !view.maybeWarmMaterializeOrderedORPredicates(&viewQ, branches, &analysis, nil) {
+	if !view.maybeMaterializeOrderedORPredicates(&viewQ, branches, &analysis, false, false, nil) {
 		t.Fatalf("expected warm ordered-OR materialization to rewrite predicates")
 	}
 
@@ -2347,7 +2350,7 @@ func TestPlannerOROrderDecision_PrefersStreamWhenAllBranchesAreOrderBounded(t *t
 	}
 	defer preparedQ.Release()
 
-	decision := view.decidePlanOROrder(&viewQ, branches)
+	decision := view.selectPlanOROrder(&viewQ, branches)
 	if decision.plan != plannerOROrderStream && decision.plan != plannerOROrderMerge {
 		t.Fatalf("expected ordered OR stream/merge plan for fully order-bounded branches, got=%v", decision.plan)
 	}
@@ -2543,7 +2546,7 @@ func TestPlannerOROrderDecision_PrefersMergeWhenRouteEstimatorBeatsStream(t *tes
 		t.Fatalf("expected merge route estimate to beat stream: kway=%v stream=%v", routeCost.kWay, streamCost)
 	}
 
-	decision := view.decidePlanOROrder(&viewQ, branches)
+	decision := view.selectPlanOROrder(&viewQ, branches)
 	if decision.plan != plannerOROrderMerge {
 		if decision.plan != plannerOROrderStream || !branches.hasKWayExactBucketApplyWork(mergeStats) {
 			t.Fatalf("expected ordered OR merge or stream vetoed by exact bucket work, got=%v", decision.plan)
@@ -3234,7 +3237,7 @@ func TestPlannerRouting_PrefersExecutionForPrefixOrderLimit(t *testing.T) {
 	ev := events[len(events)-1]
 
 	if ev.Plan != "plan_limit_order_prefix" {
-		t.Fatalf("expected prefix execution plan, got %q", ev.Plan)
+		t.Fatalf("expected prefix limit route, got %q", ev.Plan)
 	}
 	if ev.EstimatedRows == 0 {
 		t.Fatalf("expected estimated rows to be set")
@@ -3290,7 +3293,7 @@ func TestPlannerRouting_PrefersExecutionForPrefixNoOrderLimit(t *testing.T) {
 	ev := events[len(events)-1]
 
 	if ev.Plan != "plan_limit_range_no_order" {
-		t.Fatalf("expected no-order prefix execution plan, got %q", ev.Plan)
+		t.Fatalf("expected no-order prefix limit route, got %q", ev.Plan)
 	}
 }
 
@@ -3342,7 +3345,7 @@ func TestPlannerRouting_PrefersExecutionForWidePrefixNoOrderLimit(t *testing.T) 
 	}
 	ev := events[len(events)-1]
 	if ev.Plan != "plan_limit_range_no_order" {
-		t.Fatalf("expected no-order prefix execution plan, got %q", ev.Plan)
+		t.Fatalf("expected no-order prefix limit route, got %q", ev.Plan)
 	}
 }
 
@@ -3412,7 +3415,11 @@ func TestPlannerOROrderMergeFallbackFirst_ComplexOffset(t *testing.T) {
 		),
 	).Sort("score", qx.DESC).Offset(500).Limit(100)
 
-	branchesComplex, alwaysFalse, ok := db.engine.buildORBranches(qComplex.Filter.Args)
+	needComplex, ok := orderWindowForTest(qComplex)
+	if !ok {
+		t.Fatalf("orderWindow complex: ok=false")
+	}
+	branchesComplex, alwaysFalse, ok := db.engine.buildORBranchesOrderedWithOffset(qComplex.Filter.Args, "score", needComplex, qComplex.Window.Offset)
 	if !ok {
 		t.Fatalf("buildORBranches complex: ok=false")
 	}
@@ -3421,19 +3428,15 @@ func TestPlannerOROrderMergeFallbackFirst_ComplexOffset(t *testing.T) {
 	}
 	defer branchesComplex.Release()
 
-	if !db.engine.shouldPreferOROrderFallbackFirst(qComplex, branchesComplex) {
-		needComplex, ok := orderWindowForTest(qComplex)
-		if !ok {
-			t.Fatalf("orderWindow complex: ok=false")
-		}
+	preparedComplex, viewComplex, err := prepareTestQuery(db.engine, qComplex)
+	if err != nil {
+		t.Fatalf("prepareTestQuery complex: %v", err)
+	}
+	defer preparedComplex.Release()
+	decisionComplex := db.engine.currentQueryViewForTests().selectPlanOROrder(&viewComplex, branchesComplex)
+	if decisionComplex.selected.kind != plannerOROrderCandidateBranchCollect {
 		if !db.engine.shouldUseOROrderKWayRuntimeFallback(qComplex, branchesComplex, needComplex) {
-			preparedQ, viewQ, err := prepareTestQuery(db.engine, qComplex)
-			if err != nil {
-				t.Fatalf("prepareTestQuery: %v", err)
-			}
-			defer preparedQ.Release()
-			decision := db.engine.currentQueryViewForTests().decidePlanOROrder(&viewQ, branchesComplex)
-			if decision.plan != plannerOROrderStream {
+			if decisionComplex.plan != plannerOROrderStream {
 				t.Fatalf("expected fallback-first, runtime fallback guard, or stream plan for complex offset ordered OR")
 			}
 		}
@@ -3453,7 +3456,11 @@ func TestPlannerOROrderMergeFallbackFirst_ComplexOffset(t *testing.T) {
 		),
 	).Sort("age", qx.ASC).Limit(80)
 
-	branchesLight, alwaysFalse, ok := db.engine.buildORBranches(qLight.Filter.Args)
+	needLight, ok := orderWindowForTest(qLight)
+	if !ok {
+		t.Fatalf("orderWindow light: ok=false")
+	}
+	branchesLight, alwaysFalse, ok := db.engine.buildORBranchesOrdered(qLight.Filter.Args, "age", needLight)
 	if !ok {
 		t.Fatalf("buildORBranches light: ok=false")
 	}
@@ -3462,8 +3469,14 @@ func TestPlannerOROrderMergeFallbackFirst_ComplexOffset(t *testing.T) {
 	}
 	defer branchesLight.Release()
 
-	if db.engine.shouldPreferOROrderFallbackFirst(qLight, branchesLight) {
-		t.Fatalf("unexpected fallback-first preference for light ordered OR")
+	preparedLight, viewLight, err := prepareTestQuery(db.engine, qLight)
+	if err != nil {
+		t.Fatalf("prepareTestQuery light: %v", err)
+	}
+	defer preparedLight.Release()
+	decisionLight := db.engine.currentQueryViewForTests().selectPlanOROrder(&viewLight, branchesLight)
+	if decisionLight.selected.kind == plannerOROrderCandidateBranchCollect {
+		t.Fatalf("unexpected branch-collect preference for light ordered OR")
 	}
 }
 
@@ -3508,7 +3521,7 @@ func TestPlannerRouting_PrefersExecutionForRangeOrderLimit(t *testing.T) {
 	ev := events[len(events)-1]
 
 	if ev.Plan != "plan_limit_order_basic" {
-		t.Fatalf("expected basic execution plan, got %q", ev.Plan)
+		t.Fatalf("expected basic limit route, got %q", ev.Plan)
 	}
 	if ev.EstimatedRows == 0 {
 		t.Fatalf("expected estimated rows to be set")
@@ -3629,7 +3642,7 @@ func TestPlannerRouting_OrderLimitWithSecondaryRangeAndHasAny_MatchesSeqScan(t *
 	}
 }
 
-func TestExecutionPlan_OrderLimitWithNegativeResidual_MatchesSeqScan(t *testing.T) {
+func TestLimitRoutes_OrderLimitWithNegativeResidual_MatchesSeqScan(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
 		AnalyzeInterval: -1,
 	})
@@ -3651,12 +3664,12 @@ func TestExecutionPlan_OrderLimitWithNegativeResidual_MatchesSeqScan(t *testing.
 	}
 	assertQueryIDsEqual(t, q, got, want)
 
-	execOut, ok, err := db.engine.tryExecutionPlan(q, nil)
+	execOut, ok, err := db.engine.tryLimitRoutes(q, nil)
 	if err != nil {
-		t.Fatalf("tryExecutionPlan: %v", err)
+		t.Fatalf("tryLimitRoutes: %v", err)
 	}
 	if !ok {
-		t.Fatalf("expected execution plan to be applicable")
+		t.Fatalf("expected limit route to be applicable")
 	}
 	assertQueryIDsEqual(t, q, execOut, want)
 }
@@ -3739,9 +3752,9 @@ func TestPlannerCandidateOrder_MatchesSeqScan(t *testing.T) {
 		t.Fatalf("expected candidate-order precheck to pass for query shape")
 	}
 
-	got, used, err := db.engine.tryPlanCandidate(q, nil)
+	got, used, err := db.engine.tryCandidateLimitRoute(q, nil)
 	if err != nil {
-		t.Fatalf("tryPlanCandidate: %v", err)
+		t.Fatalf("tryCandidateLimitRoute: %v", err)
 	}
 	if !used {
 		t.Fatalf("expected candidate-order route to be used")
@@ -3766,9 +3779,9 @@ func TestPlannerCandidateNoOrder_RespectsPageAndPredicateSet(t *testing.T) {
 		qx.IN("name", []string{"alice", "bob", "carol"}),
 	).Limit(90)
 
-	got, used, err := db.engine.tryPlanCandidate(q, nil)
+	got, used, err := db.engine.tryCandidateLimitRoute(q, nil)
 	if err != nil {
-		t.Fatalf("tryPlanCandidate: %v", err)
+		t.Fatalf("tryCandidateLimitRoute: %v", err)
 	}
 	if !used {
 		t.Fatalf("expected candidate no-order route to be used")

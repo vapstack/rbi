@@ -46,6 +46,39 @@ func runPredicatePostingFilter(t *testing.T, pred predicate, universe posting.Li
 	return posting.List{}
 }
 
+func TestExecPlanLeadScanNoOrderUsesSelectedLead(t *testing.T) {
+	narrow := posting.BuildFromSorted([]uint64{3})
+	wide := posting.BuildFromSorted([]uint64{1, 2, 3, 4, 5})
+	defer narrow.Release()
+	defer wide.Release()
+
+	preds := []predicate{
+		{
+			expr:     qir.Expr{Op: qir.OpEQ},
+			contains: narrow.Contains,
+			iter:     narrow.Iter,
+			estCard:  1,
+		},
+		{
+			expr:     qir.Expr{Op: qir.OpEQ},
+			contains: wide.Contains,
+			iter:     wide.Iter,
+			estCard:  5,
+		},
+	}
+
+	var qv View
+	q := qir.Shape{Limit: 1}
+	var trace Trace
+	out := qv.execPlanLeadScanNoOrder(&q, preds, 1, &trace)
+	if len(out) != 1 || out[0] != 3 {
+		t.Fatalf("unexpected output: %v", out)
+	}
+	if trace.RowsExamined() != 5 {
+		t.Fatalf("expected selected lead to drive scan, RowsExamined=%d", trace.RowsExamined())
+	}
+}
+
 func TestReleasePredicateOwnedState_ClearsRangeMaterializedRewriteState(t *testing.T) {
 	p := materializedRangePredicateWithMode(
 		mustTestQIRExpr(t, qx.GTE("age", 10)),
@@ -855,6 +888,58 @@ func TestBuildPredicateWithMode_AllowMaterializeSkipsColdNumericRangeUnionWhenPo
 	}
 	if p.kind == predicateKindMaterialized || p.kind == predicateKindMaterializedNot {
 		t.Fatalf("unexpected eager materialized predicate kind=%v", p.kind)
+	}
+	if got := db.engine.snapshot.Current().MaterializedPredCache().EntryCount(); got != 0 {
+		t.Fatalf("unexpected shared materialized predicate cache entry: %d", got)
+	}
+}
+
+func TestBuildPredicates_DefaultBuildKeepsColdNumericRangesLazy(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{
+		AnalyzeInterval:                         -1,
+		SnapshotMaterializedPredCacheMaxEntries: 16,
+		NumericRangeBucketSize:                  8,
+		NumericRangeBucketMinFieldKeys:          16,
+		NumericRangeBucketMinSpanKeys:           4,
+	})
+	seedGeneratedUint64Data(t, db, 12_000, func(i int) *Rec {
+		return &Rec{
+			Name:   fmt.Sprintf("u_%d", i),
+			Email:  fmt.Sprintf("user%05d@example.com", i),
+			Age:    i,
+			Score:  float64(i),
+			Active: i%2 == 0,
+		}
+	})
+	if err := db.RebuildIndex(); err != nil {
+		t.Fatalf("RebuildIndex: %v", err)
+	}
+
+	preds, ok := db.engine.buildPredicates([]qx.Expr{
+		qx.EQ("active", true),
+		qx.GTE("age", 6_000),
+		qx.GTE("score", 6_000.0),
+	})
+	if !ok {
+		t.Fatalf("buildPredicates: ok=false")
+	}
+	defer releasePredicates(preds)
+
+	rangeStates := 0
+	for i := range preds {
+		p := preds[i]
+		if p.expr.Op.IsNumericRange() {
+			if p.fieldIndexRangeState == nil {
+				t.Fatalf("expected numeric range predicate to stay lazy: %+v", p.expr)
+			}
+			if p.isMaterializedLike() {
+				t.Fatalf("unexpected eager materialized numeric range: %+v", p.expr)
+			}
+			rangeStates++
+		}
+	}
+	if rangeStates != 2 {
+		t.Fatalf("range predicate count=%d want=2", rangeStates)
 	}
 	if got := db.engine.snapshot.Current().MaterializedPredCache().EntryCount(); got != 0 {
 		t.Fatalf("unexpected shared materialized predicate cache entry: %d", got)

@@ -111,6 +111,9 @@ func TestTracer_ORDecisionEstimates(t *testing.T) {
 	if !strings.HasPrefix(ev.Plan, "plan_or_merge_") {
 		t.Fatalf("expected OR planner plan, got %q", ev.Plan)
 	}
+	if ev.ORRoute.Selected == "" {
+		t.Fatalf("expected OR selector route, trace=%+v", ev.ORRoute)
+	}
 	if ev.EstimatedRows == 0 {
 		t.Fatalf("expected estimated rows to be set")
 	}
@@ -189,6 +192,9 @@ func TestTracer_OROrderMetrics(t *testing.T) {
 
 	if !strings.HasPrefix(ev.Plan, "plan_or_merge_order_") {
 		t.Fatalf("expected ordered OR planner plan, got %q", ev.Plan)
+	}
+	if ev.ORRoute.Selected == "" {
+		t.Fatalf("expected ordered OR selector route, trace=%+v", ev.ORRoute)
 	}
 	if len(ev.ORBranches) == 0 {
 		t.Fatalf("expected OR branch trace")
@@ -296,7 +302,7 @@ func TestTracer_OROrderPlannerAnalysisMetrics(t *testing.T) {
 	}
 
 	trace := NewRuntime(Config{TraceSink: func(TraceEvent) {}, TraceSampleEvery: 1}).BeginTrace(viewQ, "score")
-	if !view.maybeWarmMaterializeOrderedORPredicates(&viewQ, branches, &analysis, trace) {
+	if !view.maybeMaterializeOrderedORPredicates(&viewQ, branches, &analysis, false, false, trace) {
 		t.Fatalf("expected warm ordered-OR materialization to rewrite predicates")
 	}
 	ev := trace.Event()
@@ -385,7 +391,7 @@ func TestTracer_OROrderPlannerAnalysisRangeCountersNotDoubleCountAcrossPhases(t 
 	defer analysis.release()
 
 	trace := NewRuntime(Config{TraceSink: func(TraceEvent) {}, TraceSampleEvery: 1}).BeginTrace(viewQ, "score")
-	view.maybeWarmMaterializeOrderedORPredicates(&viewQ, branches, &analysis, trace)
+	view.maybeMaterializeOrderedORPredicates(&viewQ, branches, &analysis, false, false, trace)
 	view.maybeEagerMaterializeOrderedORPredicates(&viewQ, branches, &analysis, false, trace)
 
 	ev := trace.Event()
@@ -400,6 +406,15 @@ func TestTracer_OROrderPlannerAnalysisRangeCountersNotDoubleCountAcrossPhases(t 
 func TestTracer_ORRoutePreservesPlannerAnalysis(t *testing.T) {
 	trace := NewRuntime(Config{TraceSink: func(TraceEvent) {}, TraceSampleEvery: 1}).BeginTrace(qir.Shape{Limit: 1}, "")
 	trace.AddOROrderPlannerAnalysis(10*time.Microsecond, 3, 2, 1, 4, 5)
+	trace.SetORSelectionRoute(TraceORRoute{
+		Selected:     "stream",
+		Rejected:     "materialized_fallback",
+		SelectedCost: 12,
+		RejectedCost: 34,
+		ExpectedRows: 8,
+		UnionRows:    13,
+		SumRows:      21,
+	})
 	trace.SetORRoute(TraceORRoute{
 		Route:               "kway_first",
 		Reason:              "cost",
@@ -420,6 +435,15 @@ func TestTracer_ORRoutePreservesPlannerAnalysis(t *testing.T) {
 		ev.ORRoute.PlannerExactRanges != 4 ||
 		ev.ORRoute.PlannerReusedRanges != 5 {
 		t.Fatalf("planner analysis counters were not preserved: %+v", ev.ORRoute)
+	}
+	if ev.ORRoute.Selected != "stream" ||
+		ev.ORRoute.Rejected != "materialized_fallback" ||
+		ev.ORRoute.SelectedCost != 12 ||
+		ev.ORRoute.RejectedCost != 34 ||
+		ev.ORRoute.ExpectedRows != 8 ||
+		ev.ORRoute.UnionRows != 13 ||
+		ev.ORRoute.SumRows != 21 {
+		t.Fatalf("selector fields were not preserved: %+v", ev.ORRoute)
 	}
 	if ev.ORRoute.Route != "kway_first" ||
 		ev.ORRoute.Reason != "cost" ||

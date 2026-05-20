@@ -167,7 +167,7 @@ func TestPlannerShadow_NoOrderOR_ChosenVsBaseline(t *testing.T) {
 	h := newPlannerShadowHarness(t, db, recorder, q)
 
 	chosen := h.run("shadow_or_no_order_chosen", func(view *View, viewQ *qir.Shape, trace *Trace) ([]uint64, bool, error) {
-		return view.tryPlanORMergeMode(viewQ, trace)
+		return view.executeOR(viewQ, trace)
 	})
 	if chosen.trace.Plan != string(PlanORMergeNoOrder) {
 		t.Fatalf("expected chosen no-order OR plan %q, got %q", PlanORMergeNoOrder, chosen.trace.Plan)
@@ -183,7 +183,7 @@ func TestPlannerShadow_NoOrderOR_ChosenVsBaseline(t *testing.T) {
 			return nil, true, nil
 		}
 		defer branches.Release()
-		out, ok := view.execPlanORNoOrderBaseline(viewQ, branches, trace)
+		out, ok := view.execPlanORNoOrderBaselineCore(viewQ, branches, trace)
 		return out, ok, nil
 	})
 
@@ -202,7 +202,7 @@ func TestPlannerShadow_OrderedOR_MergeVsFallback(t *testing.T) {
 	h := newPlannerShadowHarness(t, db, recorder, q)
 
 	chosen := h.run("shadow_or_order_stream_chosen", func(view *View, viewQ *qir.Shape, trace *Trace) ([]uint64, bool, error) {
-		return view.tryPlanORMergeMode(viewQ, trace)
+		return view.executeOR(viewQ, trace)
 	})
 	if chosen.trace.Plan != string(PlanORMergeOrderMerge) {
 		t.Fatalf("expected chosen ordered OR plan %q, got %q", PlanORMergeOrderMerge, chosen.trace.Plan)
@@ -246,7 +246,7 @@ func TestPlannerShadow_OrderedOR_StreamVsFallback(t *testing.T) {
 	h := newPlannerShadowHarness(t, db, recorder, q)
 
 	chosen := h.run("shadow_or_order_merge_chosen", func(view *View, viewQ *qir.Shape, trace *Trace) ([]uint64, bool, error) {
-		return view.tryPlanORMergeMode(viewQ, trace)
+		return view.executeOR(viewQ, trace)
 	})
 	if chosen.trace.Plan != string(PlanORMergeOrderStream) {
 		t.Fatalf("expected chosen ordered OR plan %q, got %q", PlanORMergeOrderStream, chosen.trace.Plan)
@@ -291,23 +291,13 @@ func TestPlannerShadow_OrderedLimitExecutionVsPlanner(t *testing.T) {
 		qx.GTE("age", 22),
 		qx.LT("age", 45),
 	).Sort("age", qx.ASC).Limit(120)
-	prepared, viewQ, err := db.prepareQuery(q)
-	if err != nil {
-		t.Fatalf("prepareQuery: %v", err)
-	}
-	if !db.view().shouldPreferExecutionPlan(&viewQ, nil) {
-		prepared.Release()
-		t.Fatalf("expected ordered-limit shape to prefer execution plan")
-	}
-	prepared.Release()
-
 	h := newPlannerShadowHarness(t, db, recorder, q)
 
 	chosen := h.run("shadow_order_limit_execution", func(view *View, viewQ *qir.Shape, trace *Trace) ([]uint64, bool, error) {
-		return view.tryExecutionPlan(viewQ, trace)
+		return tryLimitRoutesForTest(view, viewQ, trace)
 	})
 	if chosen.trace.Plan != string(PlanLimitOrderBasic) {
-		t.Fatalf("expected chosen execution plan %q, got %q", PlanLimitOrderBasic, chosen.trace.Plan)
+		t.Fatalf("expected chosen limit route %q, got %q", PlanLimitOrderBasic, chosen.trace.Plan)
 	}
 
 	ordered := h.run("shadow_order_limit_planner", func(view *View, viewQ *qir.Shape, trace *Trace) ([]uint64, bool, error) {
@@ -368,7 +358,14 @@ func TestPlannerShadow_CandidateOrderVsOrderedPlanner(t *testing.T) {
 	h := newPlannerShadowHarness(t, db, recorder, q)
 
 	candidate := h.run("shadow_candidate_order", func(view *View, viewQ *qir.Shape, trace *Trace) ([]uint64, bool, error) {
-		return view.tryPlanCandidate(viewQ, trace)
+		out, ok, plan, err := view.executeOrderedLimit(viewQ, trace)
+		if ok && plan == PlanCandidateOrder {
+			if trace != nil {
+				trace.SetPlan(plan)
+			}
+			return out, true, err
+		}
+		return nil, false, err
 	})
 	if candidate.trace.Plan != string(PlanCandidateOrder) {
 		t.Fatalf("expected candidate-order plan %q, got %q", PlanCandidateOrder, candidate.trace.Plan)
@@ -417,14 +414,21 @@ func TestPlannerShadow_CandidateNoOrderVsOrderedPlanner(t *testing.T) {
 	h := newPlannerShadowHarness(t, db, recorder, q)
 
 	candidate := h.run("shadow_candidate_no_order", func(view *View, viewQ *qir.Shape, trace *Trace) ([]uint64, bool, error) {
-		return view.tryPlanCandidate(viewQ, trace)
+		out, ok, plan, err := view.executeNoOrderLimit(viewQ, trace)
+		if ok && plan == PlanCandidateNoOrder {
+			if trace != nil {
+				trace.SetPlan(plan)
+			}
+			return out, true, err
+		}
+		return nil, false, err
 	})
 	if candidate.trace.Plan != string(PlanCandidateNoOrder) {
 		t.Fatalf("expected candidate no-order plan %q, got %q", PlanCandidateNoOrder, candidate.trace.Plan)
 	}
 
 	ordered := h.run("shadow_candidate_no_order_alt_planner", func(view *View, viewQ *qir.Shape, trace *Trace) ([]uint64, bool, error) {
-		return view.tryPlanOrdered(viewQ, trace)
+		return plannerGuardrailRunForcedOrderedNoOrderPlanner(view, viewQ, trace)
 	})
 	if ordered.trace.Plan != string(PlanOrderedNoOrder) {
 		t.Fatalf("expected no-order planner plan %q, got %q", PlanOrderedNoOrder, ordered.trace.Plan)

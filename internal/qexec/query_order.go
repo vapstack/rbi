@@ -1,6 +1,7 @@
 package qexec
 
 import (
+	"fmt"
 	"reflect"
 
 	"github.com/vapstack/rbi/internal/indexdata"
@@ -562,58 +563,203 @@ func (qv *View) queryOrderArrayPosIndexView(result postingResult, ov indexdata.F
 	return cursor.out, nil
 }
 
-func (qv *View) tryQueryOrderArrayPosSingleHasAny(q *qir.Shape, trace *Trace) ([]uint64, bool, error) {
+type plannerArrayPosOrderCandidateKind uint8
+
+const (
+	plannerArrayPosOrderCandidateNone plannerArrayPosOrderCandidateKind = iota
+	plannerArrayPosOrderCandidateSingleHasAny
+	plannerArrayPosOrderCandidateMaterializedFallback
+)
+
+func (k plannerArrayPosOrderCandidateKind) String() string {
+	switch k {
+	case plannerArrayPosOrderCandidateSingleHasAny:
+		return "single_hasany"
+	case plannerArrayPosOrderCandidateMaterializedFallback:
+		return "materialized_fallback"
+	default:
+		return ""
+	}
+}
+
+type plannerArrayPosOrderCandidate struct {
+	kind         plannerArrayPosOrderCandidateKind
+	cost         float64
+	expectedRows uint64
+}
+
+type plannerArrayPosOrderDecision struct {
+	selected             plannerArrayPosOrderCandidate
+	materializedFallback plannerArrayPosOrderCandidate
+	rejected             plannerArrayPosOrderCandidate
+}
+
+func (d plannerArrayPosOrderDecision) traceRoute() TraceArrayPosOrderRoute {
+	return TraceArrayPosOrderRoute{
+		Selected:     d.selected.kind.String(),
+		Rejected:     d.rejected.kind.String(),
+		SelectedCost: d.selected.cost,
+		RejectedCost: d.rejected.cost,
+		ExpectedRows: d.selected.expectedRows,
+	}
+}
+
+type plannerArrayPosOrderFacts struct {
+	expr  qir.Expr
+	order qir.Order
+	fm    *schema.Field
+	ov    indexdata.FieldIndexView
+}
+
+func (qv *View) collectArrayPosOrderFacts(q *qir.Shape, facts *plannerArrayPosOrderFacts) bool {
 	if !q.HasOrder || q.Order.Kind != qir.OrderKindArrayPos {
-		return nil, false, nil
+		return false
 	}
 
 	e := q.Expr
 	if e.Op != qir.OpHASANY || e.Not || e.FieldOrdinal != q.Order.FieldOrdinal || len(e.Operands) != 0 {
-		return nil, false, nil
+		return false
 	}
 
 	fm := qv.fieldMetaByExpr(e)
 	if fm == nil || !fm.Slice {
-		return nil, false, nil
+		return false
 	}
 
-	// Existing array-order execution stops cheaply for tiny bounded windows.
+	facts.expr = e
+	facts.order = q.Order
+	facts.fm = fm
+	facts.ov = qv.fieldIndexViewFromSlotsForOrder(qv.snap.Index, q.Order)
+	return true
+}
+
+func (qv *View) selectArrayPosOrder(q *qir.Shape, facts *plannerArrayPosOrderFacts) (plannerArrayPosOrderDecision, bool) {
+	expected := q.Limit
+	if expected == 0 {
+		expected = qv.snap.Universe.Cardinality()
+	}
+
 	if q.Limit != 0 && q.Offset <= uint64(iteratorThreshold) && q.Limit <= uint64(iteratorThreshold)-q.Offset {
-		return nil, false, nil
+		return plannerArrayPosOrderDecision{
+			selected: plannerArrayPosOrderCandidate{
+				kind:         plannerArrayPosOrderCandidateMaterializedFallback,
+				cost:         float64(expected),
+				expectedRows: expected,
+			},
+			materializedFallback: plannerArrayPosOrderCandidate{
+				kind:         plannerArrayPosOrderCandidateMaterializedFallback,
+				cost:         float64(expected),
+				expectedRows: expected,
+			},
+		}, true
 	}
 
-	valsBuf, isSlice, _, err := qv.exprValueToDistinctIdxBuf(e)
+	return plannerArrayPosOrderDecision{
+		selected: plannerArrayPosOrderCandidate{
+			kind:         plannerArrayPosOrderCandidateSingleHasAny,
+			cost:         float64(expected) * 0.75,
+			expectedRows: expected,
+		},
+		materializedFallback: plannerArrayPosOrderCandidate{
+			kind:         plannerArrayPosOrderCandidateMaterializedFallback,
+			cost:         float64(expected),
+			expectedRows: expected,
+		},
+		rejected: plannerArrayPosOrderCandidate{
+			kind:         plannerArrayPosOrderCandidateMaterializedFallback,
+			cost:         float64(expected),
+			expectedRows: expected,
+		},
+	}, true
+}
+
+func (qv *View) executeArrayPosOrder(q *qir.Shape, trace *Trace) ([]uint64, bool, PlanName, error) {
+	var facts plannerArrayPosOrderFacts
+	if !qv.collectArrayPosOrderFacts(q, &facts) {
+		return nil, false, "", nil
+	}
+
+	decision, ok := qv.selectArrayPosOrder(q, &facts)
+	if !ok {
+		return nil, false, "", nil
+	}
+	if trace != nil {
+		trace.SetArrayPosOrderRoute(decision.traceRoute())
+	}
+
+	return qv.dispatchArrayPosOrder(q, &facts, decision, trace)
+}
+
+func (qv *View) dispatchArrayPosOrder(
+	q *qir.Shape,
+	facts *plannerArrayPosOrderFacts,
+	decision plannerArrayPosOrderDecision,
+	trace *Trace,
+) ([]uint64, bool, PlanName, error) {
+	switch decision.selected.kind {
+	case plannerArrayPosOrderCandidateMaterializedFallback:
+		return qv.dispatchLimitMaterialized(q)
+	case plannerArrayPosOrderCandidateSingleHasAny:
+		out, used, err := qv.execSelectedArrayPosOrderSingleHasAny(q, facts, trace)
+		if err != nil {
+			return nil, true, "", err
+		}
+		if !used {
+			if decision.materializedFallback.kind == plannerArrayPosOrderCandidateMaterializedFallback {
+				return qv.dispatchLimitMaterialized(q)
+			}
+			return nil, true, "", fmt.Errorf("selected ArrayPos ORDER route %s was not executable", decision.selected.kind.String())
+		}
+		return out, true, PlanMaterialized, nil
+	}
+	return nil, false, "", nil
+}
+
+func (qv *View) execSelectedArrayPosOrderSingleHasAny(q *qir.Shape, facts *plannerArrayPosOrderFacts, trace *Trace) ([]uint64, bool, error) {
+	valsBuf, isSlice, _, err := qv.exprValueToDistinctIdxBuf(facts.expr)
 	if valsBuf != nil {
 		defer pooled.ReleaseStringSlice(valsBuf)
 	}
-	if err != nil || (!isSlice && e.Value != nil) || len(valsBuf) == 0 {
+	if err != nil {
+		return nil, false, err
+	}
+	if (!isSlice && facts.expr.Value != nil) || len(valsBuf) == 0 {
 		return nil, false, nil
 	}
 
-	orderVals, err := qv.orderDataValues(q.Order.Data, fm)
+	orderVals, err := qv.orderDataValues(facts.order.Data, facts.fm)
 	if err != nil || len(orderVals) == 0 {
-		return nil, false, nil
+		return nil, false, err
 	}
 
-	ov := qv.fieldIndexViewFromSlotsForOrder(qv.snap.Index, q.Order)
-	if !ov.HasData() && !qv.hasIndexedFieldForOrder(q.Order) {
+	ov := facts.ov
+	if !ov.HasData() && !qv.hasIndexedFieldForOrder(facts.order) {
 		return nil, false, nil
 	}
 
 	var filterKey string
 	var filterIDs posting.List
+	filterSet := false
+	defer func() {
+		if filterSet {
+			filterIDs.Release()
+		}
+	}()
 	for i := 0; i < len(valsBuf); i++ {
 		ids := ov.LookupPostingRetained(valsBuf[i])
 		if ids.IsEmpty() {
+			ids.Release()
 			continue
 		}
-		if !filterIDs.IsEmpty() {
+		if filterSet {
+			ids.Release()
 			return nil, false, nil
 		}
 		filterKey = valsBuf[i]
 		filterIDs = ids
+		filterSet = true
 	}
-	if filterIDs.IsEmpty() {
+	if !filterSet {
 		return nil, true, nil
 	}
 
@@ -631,7 +777,9 @@ func (qv *View) tryQueryOrderArrayPosSingleHasAny(q *qir.Shape, trace *Trace) ([
 				return emitSinglePostingOrderArrayPosResult(filterIDs, filterCard, q.Offset, q.Limit, trace), true, nil
 			}
 			ids := ov.LookupPostingRetained(v)
-			if !ids.IsEmpty() && ids.Intersects(filterIDs) {
+			intersects := !ids.IsEmpty() && ids.Intersects(filterIDs)
+			ids.Release()
+			if intersects {
 				return nil, false, nil
 			}
 		}
@@ -642,7 +790,9 @@ func (qv *View) tryQueryOrderArrayPosSingleHasAny(q *qir.Shape, trace *Trace) ([
 				return emitSinglePostingOrderArrayPosResult(filterIDs, filterCard, q.Offset, q.Limit, trace), true, nil
 			}
 			ids := ov.LookupPostingRetained(v)
-			if !ids.IsEmpty() && ids.Intersects(filterIDs) {
+			intersects := !ids.IsEmpty() && ids.Intersects(filterIDs)
+			ids.Release()
+			if intersects {
 				return nil, false, nil
 			}
 		}

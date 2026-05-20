@@ -364,7 +364,7 @@ func (qv *View) evalSimple(e qir.Expr) (postingResult, error) {
 		}
 		valCount := len(valsBuf)
 		if valCount == 0 && !hasNil {
-			return postingResult{}, fmt.Errorf("%v: %v: no values provided", ErrInvalidQuery, e.Op)
+			return postingResult{}, fmt.Errorf("%w: %v: no values provided", ErrInvalidQuery, e.Op)
 		}
 
 		capHint := valCount
@@ -406,7 +406,7 @@ func (qv *View) evalSimple(e qir.Expr) (postingResult, error) {
 		}
 		valCount := len(valsBuf)
 		if valCount == 0 {
-			return postingResult{}, fmt.Errorf("%v: %v: no values provided", ErrInvalidQuery, e.Op)
+			return postingResult{}, fmt.Errorf("%w: %v: no values provided", ErrInvalidQuery, e.Op)
 		}
 
 		if e.Op == qir.OpHASALL {

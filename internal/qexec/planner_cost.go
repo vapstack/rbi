@@ -26,18 +26,149 @@ const (
 	plannerOROrderStream
 )
 
-type plannerORNoOrderDecision struct {
-	use          bool
+type plannerORNoOrderCandidateKind uint8
+
+const (
+	plannerORNoOrderCandidateNone plannerORNoOrderCandidateKind = iota
+	plannerORNoOrderCandidateUniverse
+	plannerORNoOrderCandidateAdaptiveMerge
+	plannerORNoOrderCandidateBaselineMerge
+	plannerORNoOrderCandidateMaterializedFallback
+)
+
+func (k plannerORNoOrderCandidateKind) String() string {
+	switch k {
+	case plannerORNoOrderCandidateUniverse:
+		return "universe"
+	case plannerORNoOrderCandidateAdaptiveMerge:
+		return "adaptive_merge"
+	case plannerORNoOrderCandidateBaselineMerge:
+		return "baseline_merge"
+	case plannerORNoOrderCandidateMaterializedFallback:
+		return "materialized_fallback"
+	default:
+		return ""
+	}
+}
+
+type plannerORNoOrderCandidate struct {
+	kind         plannerORNoOrderCandidateKind
+	cost         float64
 	expectedRows uint64
-	kWayCost     float64
-	fallbackCost float64
+	unionRows    uint64
+	sumRows      uint64
+	avgChecks    float64
+}
+
+type plannerORNoOrderDecision struct {
+	selected             plannerORNoOrderCandidate
+	materializedFallback plannerORNoOrderCandidate
+	rejected             plannerORNoOrderCandidate
+	use                  bool
+	expectedRows         uint64
+	kWayCost             float64
+	fallbackCost         float64
+}
+
+func (d plannerORNoOrderDecision) selectedKind() plannerORNoOrderCandidateKind {
+	return d.selected.kind
+}
+
+func (d plannerORNoOrderDecision) traceRoute() TraceORRoute {
+	return TraceORRoute{
+		Selected:     d.selected.kind.String(),
+		Rejected:     d.rejected.kind.String(),
+		SelectedCost: d.selected.cost,
+		RejectedCost: d.rejected.cost,
+		ExpectedRows: d.selected.expectedRows,
+		UnionRows:    d.selected.unionRows,
+		SumRows:      d.selected.sumRows,
+		AvgChecks:    d.selected.avgChecks,
+	}
+}
+
+type plannerOROrderCandidateKind uint8
+
+const (
+	plannerOROrderCandidateNone plannerOROrderCandidateKind = iota
+	plannerOROrderCandidateStream
+	plannerOROrderCandidateKWayMerge
+	plannerOROrderCandidateBranchCollect
+	plannerOROrderCandidateMaterializedFallback
+)
+
+func (k plannerOROrderCandidateKind) String() string {
+	switch k {
+	case plannerOROrderCandidateStream:
+		return "stream"
+	case plannerOROrderCandidateKWayMerge:
+		return "kway_merge"
+	case plannerOROrderCandidateBranchCollect:
+		return "branch_collect"
+	case plannerOROrderCandidateMaterializedFallback:
+		return "materialized_fallback"
+	default:
+		return ""
+	}
+}
+
+type plannerOROrderCandidate struct {
+	kind                plannerOROrderCandidateKind
+	cost                float64
+	expectedRows        uint64
+	unionRows           uint64
+	sumRows             uint64
+	avgChecks           float64
+	overlap             float64
+	cacheState          plannerMaterializedCacheState
+	eagerBuildWork      uint64
+	hasPrefixTailRisk   bool
+	hasSelectiveLead    bool
+	fallbackCollectFast bool
+}
+
+func (k plannerOROrderCandidateKind) plan() plannerOROrderPlan {
+	switch k {
+	case plannerOROrderCandidateStream:
+		return plannerOROrderStream
+	case plannerOROrderCandidateKWayMerge, plannerOROrderCandidateBranchCollect:
+		return plannerOROrderMerge
+	default:
+		return plannerOROrderFallback
+	}
 }
 
 type plannerOROrderDecision struct {
-	plan         plannerOROrderPlan
-	expectedRows uint64
-	bestCost     float64
-	fallbackCost float64
+	selected             plannerOROrderCandidate
+	materializedFallback plannerOROrderCandidate
+	rejected             plannerOROrderCandidate
+	plan                 plannerOROrderPlan
+	expectedRows         uint64
+	bestCost             float64
+	fallbackCost         float64
+}
+
+func (d plannerOROrderDecision) selectedKind() plannerOROrderCandidateKind {
+	return d.selected.kind
+}
+
+func (d plannerOROrderDecision) traceRoute() TraceORRoute {
+	return TraceORRoute{
+		Selected:            d.selected.kind.String(),
+		Rejected:            d.rejected.kind.String(),
+		SelectedCost:        d.selected.cost,
+		RejectedCost:        d.rejected.cost,
+		ExpectedRows:        d.selected.expectedRows,
+		UnionRows:           d.selected.unionRows,
+		SumRows:             d.selected.sumRows,
+		CacheState:          d.selected.cacheState.String(),
+		PostingBuild:        d.selected.eagerBuildWork,
+		Overlap:             d.selected.overlap,
+		AvgChecks:           d.selected.avgChecks,
+		HasPrefixNonOrder:   d.selected.hasPrefixTailRisk,
+		HasSelectiveLead:    d.selected.hasSelectiveLead,
+		FallbackCollectFast: d.selected.fallbackCollectFast,
+	}
 }
 
 type plannerOROrderBranchAnalysis struct {
@@ -260,64 +391,132 @@ func (qv *View) buildOROrderAnalysis(q *qir.Shape, branches plannerORBranches) (
 	return analysis, true
 }
 
-func (qv *View) decidePlanORNoOrder(q *qir.Shape, branches plannerORBranches) plannerORNoOrderDecision {
-	var d plannerORNoOrderDecision
-
-	if q.HasOrder {
-		return d
+func plannerORNoOrderPick(candidates []plannerORNoOrderCandidate, forceMaterialized bool) plannerORNoOrderDecision {
+	var (
+		d        plannerORNoOrderDecision
+		bestRun  plannerORNoOrderCandidate
+		fallback plannerORNoOrderCandidate
+	)
+	for i := range candidates {
+		c := candidates[i]
+		if c.kind == plannerORNoOrderCandidateNone {
+			continue
+		}
+		if c.kind == plannerORNoOrderCandidateMaterializedFallback {
+			fallback = c
+			continue
+		}
+		if bestRun.kind == plannerORNoOrderCandidateNone || c.cost < bestRun.cost {
+			bestRun = c
+		}
 	}
+
+	d.kWayCost = bestRun.cost
+	d.fallbackCost = fallback.cost
+	d.materializedFallback = fallback
+	if !forceMaterialized &&
+		bestRun.kind != plannerORNoOrderCandidateNone &&
+		(fallback.kind == plannerORNoOrderCandidateNone || bestRun.cost <= fallback.cost*plannerORNoOrderAdvantage) {
+		d.selected = bestRun
+		d.use = true
+	} else {
+		d.selected = fallback
+	}
+	for i := range candidates {
+		c := candidates[i]
+		if c.kind == plannerORNoOrderCandidateNone || c.kind == d.selected.kind {
+			continue
+		}
+		if d.rejected.kind == plannerORNoOrderCandidateNone || c.cost < d.rejected.cost {
+			d.rejected = c
+		}
+	}
+	d.expectedRows = d.selected.expectedRows
+	return d
+}
+
+func (qv *View) selectPlanORNoOrder(q *qir.Shape, branches plannerORBranches) plannerORNoOrderDecision {
 	need, ok := orderWindow(q)
 	if !ok || need <= 0 {
-		return d
+		return plannerORNoOrderDecision{}
 	}
-
-	for i := 0; i < branches.Len(); i++ {
-		branch := branches.owner[i]
-		if branch.alwaysTrue {
-			d.use = true
-			d.expectedRows = uint64(need)
-			return d
+	switch plannerORNoOrderClassify(branches) {
+	case plannerORNoOrderModeUniverse:
+		return plannerORNoOrderDecision{
+			selected:     plannerORNoOrderCandidate{kind: plannerORNoOrderCandidateUniverse, cost: 1, expectedRows: uint64(need)},
+			use:          true,
+			expectedRows: uint64(need),
 		}
-		lead := branch.leadPtr()
-		if lead == nil || !lead.hasIter() {
-			return d
+	case plannerORNoOrderModeUnsupported:
+		fallback := plannerORNoOrderCandidate{
+			kind:         plannerORNoOrderCandidateMaterializedFallback,
+			cost:         float64(need) * float64(max(1, branches.Len())),
+			expectedRows: uint64(need),
+		}
+		return plannerORNoOrderDecision{
+			selected:             fallback,
+			materializedFallback: fallback,
 		}
 	}
 
 	snap := qv.exec.Stats.Load()
 	universe := snap.UniverseOr(qv.snap.Universe.Cardinality())
 	if universe == 0 {
-		return d
+		return plannerORNoOrderDecision{}
 	}
 
 	var branchCards [plannerORBranchLimit]uint64
 	unionCard, sumCard, branchCount, hasAlwaysTrue := branches.unionCards(universe, &branchCards)
 	if hasAlwaysTrue {
-		d.use = true
-		d.expectedRows = uint64(need)
-		return d
+		return plannerORNoOrderDecision{
+			selected:     plannerORNoOrderCandidate{kind: plannerORNoOrderCandidateUniverse, cost: 1, expectedRows: uint64(need), unionRows: universe, sumRows: universe},
+			use:          true,
+			expectedRows: uint64(need),
+		}
 	}
 	if unionCard == 0 {
-		return d
+		return plannerORNoOrderDecision{}
 	}
 
-	// expectedRows models how many ids we need to inspect before collecting N
-	// unique outputs from a union with the given cardinality.
 	expectedRows := estimateRowsForNeed(uint64(need), unionCard, universe)
 	avgChecks := branches.noOrderChecks(&branchCards, branchCount)
 	costKWay := float64(expectedRows) * (1.0 + avgChecks)
-
 	fallbackRows := min(unionCard, uint64(need))
 	costFallback := float64(sumCard) + float64(fallbackRows)
 
-	d.expectedRows = expectedRows
-	d.kWayCost = costKWay
-	d.fallbackCost = costFallback
+	var candidates [3]plannerORNoOrderCandidate
+	n := 0
+	if q.Offset == 0 && branches.Len() >= 3 {
+		candidates[n] = plannerORNoOrderCandidate{
+			kind:         plannerORNoOrderCandidateAdaptiveMerge,
+			cost:         costKWay,
+			expectedRows: expectedRows,
+			unionRows:    unionCard,
+			sumRows:      sumCard,
+			avgChecks:    avgChecks,
+		}
+		n++
+	}
+	candidates[n] = plannerORNoOrderCandidate{
+		kind:         plannerORNoOrderCandidateBaselineMerge,
+		cost:         costKWay,
+		expectedRows: expectedRows,
+		unionRows:    unionCard,
+		sumRows:      sumCard,
+		avgChecks:    avgChecks,
+	}
+	n++
+	candidates[n] = plannerORNoOrderCandidate{
+		kind:         plannerORNoOrderCandidateMaterializedFallback,
+		cost:         costFallback,
+		expectedRows: fallbackRows,
+		unionRows:    unionCard,
+		sumRows:      sumCard,
+		avgChecks:    avgChecks,
+	}
+	n++
 
-	// Require advantage margin to avoid route flapping on close/noisy estimates.
-	d.use = costKWay <= costFallback*plannerORNoOrderAdvantage
-
-	return d
+	return plannerORNoOrderPick(candidates[:n], q.Limit > plannerORNoOrderLimitMax || q.Offset > plannerORNoOrderOffsetMax)
 }
 
 func (qv *View) hasNonOrderPrefixTailRisk(branches plannerORBranches, orderField string) bool {
@@ -333,84 +532,269 @@ func (qv *View) hasNonOrderPrefixTailRisk(branches plannerORBranches, orderField
 	return false
 }
 
-func (qv *View) decidePlanOROrder(q *qir.Shape, branches plannerORBranches) plannerOROrderDecision {
+func (qv *View) selectPlanOROrder(q *qir.Shape, branches plannerORBranches) plannerOROrderDecision {
 	analysis, ok := qv.buildOROrderAnalysis(q, branches)
 	if !ok {
 		return plannerOROrderDecision{plan: plannerOROrderFallback}
 	}
 	defer analysis.release()
 
-	return qv.decidePlanOROrderWithAnalysis(q, branches, &analysis)
+	return qv.selectPlanOROrderWithAnalysis(q, branches, &analysis)
 }
 
-func (qv *View) decidePlanOROrderWithAnalysis(
+func plannerOROrderPick(candidates []plannerOROrderCandidate, forceMaterialized bool) plannerOROrderDecision {
+	var (
+		d        plannerOROrderDecision
+		fallback plannerOROrderCandidate
+	)
+	for i := range candidates {
+		if candidates[i].kind == plannerOROrderCandidateMaterializedFallback {
+			fallback = candidates[i]
+			break
+		}
+	}
+	if fallback.kind == plannerOROrderCandidateNone {
+		return d
+	}
+
+	best := fallback
+	if !forceMaterialized {
+		for i := range candidates {
+			c := candidates[i]
+			switch c.kind {
+			case plannerOROrderCandidateKWayMerge, plannerOROrderCandidateBranchCollect:
+				if c.cost <= best.cost*plannerOROrderMergeGain {
+					best = c
+				}
+			}
+		}
+		for i := range candidates {
+			c := candidates[i]
+			if c.kind == plannerOROrderCandidateStream && c.cost <= best.cost*plannerOROrderStreamGain {
+				best = c
+				break
+			}
+		}
+	}
+
+	d.selected = best
+	d.materializedFallback = fallback
+	for i := range candidates {
+		c := candidates[i]
+		if c.kind == plannerOROrderCandidateNone || c.kind == best.kind {
+			continue
+		}
+		if d.rejected.kind == plannerOROrderCandidateNone || c.cost < d.rejected.cost {
+			d.rejected = c
+		}
+	}
+	d.plan = best.kind.plan()
+	d.expectedRows = best.expectedRows
+	d.bestCost = best.cost
+	d.fallbackCost = fallback.cost
+	return d
+}
+
+func plannerOROrderFallbackFirstDecisionFromCost(
+	q *qir.Shape,
+	need int,
+	routeCost plannerOROrderRouteCost,
+	fallbackCollectFast bool,
+) plannerOROrderFallbackDecision {
+	avgChecks := routeCost.avgChecks
+	if avgChecks <= 0 {
+		avgChecks = 1
+	}
+
+	d := plannerOROrderFallbackDecision{
+		routeCost:           routeCost,
+		avgChecks:           avgChecks,
+		fallbackCollectFast: fallbackCollectFast,
+	}
+	if !fallbackCollectFast {
+		d.reason = "order_field_no_index_data"
+		return d
+	}
+
+	fallbackGain := plannerOROrderFallbackFirstGainForShape(routeCost, q, need)
+	offsetFallbackGain := plannerOROrderFallbackFirstOffsetGainForShape(routeCost, q, need)
+
+	if routeCost.fallback <= routeCost.kWay*fallbackGain {
+		d.prefer = true
+		d.reason = "fallback_cost_better"
+		return d
+	}
+
+	if q.Offset > 0 {
+		offsetRiskMin := uint64(max(64, need/5))
+		checksRiskMin := 1.0 + routeCost.overlap
+		if checksRiskMin < 2.3 {
+			checksRiskMin = 2.3
+		}
+		if checksRiskMin > 3.4 {
+			checksRiskMin = 3.4
+		}
+		if q.Offset >= offsetRiskMin &&
+			avgChecks >= checksRiskMin &&
+			(routeCost.hasSelectiveLead || routeCost.hasPrefixTailRisk) {
+			d.prefer = true
+			d.reason = "deep_offset_risk"
+			return d
+		}
+		if routeCost.hasPrefixTailRisk && routeCost.fallback <= routeCost.kWay*offsetFallbackGain {
+			d.prefer = true
+			d.reason = "prefix_offset_near_tie"
+			return d
+		}
+		if !routeCost.hasSelectiveLead && routeCost.overlap >= 1.2 &&
+			routeCost.fallback <= routeCost.kWay*1.25 {
+			d.prefer = true
+			d.reason = "overlap_offset_near_tie"
+			return d
+		}
+	}
+
+	d.reason = "kway_preferred"
+	return d
+}
+
+func (qv *View) orderedORCacheCandidateState(
+	branches plannerORBranches,
+	analysis *plannerOROrderAnalysis,
+	needWindow int,
+	orderedOffset uint64,
+) (plannerMaterializedCacheState, uint64) {
+	var branchUniverses [plannerORBranchLimit]uint64
+	n := branches.Len()
+	if n > plannerORBranchLimit {
+		n = plannerORBranchLimit
+	}
+	for i := 0; i < n; i++ {
+		branchUniverses[i] = analysis.branches[i].universe
+	}
+
+	var estimates [plannerORBranchLimit]plannerOROrderedBranchEstimate
+	qv.initOrderedORBranchEstimates(branches, &branchUniverses, needWindow, &estimates)
+
+	state := plannerMaterializedCacheDisabled
+	buildWork := uint64(0)
+	for bi := 0; bi < n; bi++ {
+		est := estimates[bi]
+		if est.probeRows == 0 || est.universe == 0 {
+			continue
+		}
+		branch := branches.owner[bi]
+		rows := est.probeRows
+		for pi := 0; pi < branch.preds.Len() && rows > 0; pi++ {
+			p := branch.preds.owner[pi]
+			if p.alwaysTrue || p.alwaysFalse || p.covered || !p.hasContains() {
+				continue
+			}
+			info := qv.orderedORPredicateBuildInfoForBranch(analysis.orderField, p, analysis, branch, bi, pi)
+			if !info.ok || info.buildWork == 0 {
+				rows = orderedORNextPredicateRows(rows, p.estCard, est.card, est.universe)
+				continue
+			}
+			nextRows := orderedORNextPredicateRows(rows, p.estCard, est.card, est.universe)
+			next := qv.classifyPlannerMaterializedCacheKey(info.cacheKey, p.estCard, false)
+			if next == plannerMaterializedCacheWarmHit {
+				if info.isPrefix || orderedORMaterializedPredicateWarmHitWorth(rows, info.checkWork, info.cachedCheckWork) {
+					state = plannerOrderedLimitCacheGroupState(state, next)
+				}
+				rows = nextRows
+				continue
+			}
+			if !info.isPrefix && rows > 0 && info.checkWork > info.cachedCheckWork {
+				savedWork := satMulUint64(rows, info.checkWork-info.cachedCheckWork)
+				if savedWork >= info.buildWork {
+					requiresPromotion := qv.orderedORMaterializedPredicateRequiresPromotion(p, est.need, orderedOffset, est.universe)
+					requiresSecondHit := requiresPromotion ||
+						!orderedORMaterializedPredicateColdBuildWorth(info.buildWork, info.cachedCheckWork, rows, savedWork)
+					next = qv.classifyPlannerMaterializedCacheKey(info.cacheKey, p.estCard, requiresSecondHit)
+					state = plannerOrderedLimitCacheGroupState(state, next)
+					if next != plannerMaterializedCacheColdSecondHitRequired {
+						buildWork = satAddUint64(buildWork, info.buildWork)
+					}
+				}
+			}
+			rows = nextRows
+		}
+	}
+	return state, buildWork
+}
+
+func (qv *View) selectPlanOROrderWithAnalysis(
 	q *qir.Shape,
 	branches plannerORBranches,
 	analysis *plannerOROrderAnalysis,
 ) plannerOROrderDecision {
-
-	d := plannerOROrderDecision{plan: plannerOROrderFallback}
-
 	if q == nil || !q.HasOrder || analysis == nil {
-		return d
+		return plannerOROrderDecision{plan: plannerOROrderFallback}
 	}
 
 	o := q.Order
 	if o.Kind != qir.OrderKindBasic {
-		return d
+		return plannerOROrderDecision{plan: plannerOROrderFallback}
 	}
 	orderField := analysis.orderField
 
 	fm := qv.fieldMetaByOrder(o)
 	if fm == nil || fm.Slice {
-		return d
+		return plannerOROrderDecision{plan: plannerOROrderFallback}
 	}
 
 	ov := qv.fieldIndexViewFromSlotsForOrder(qv.snap.Index, o)
 	if !ov.HasData() {
-		return d
+		return plannerOROrderDecision{plan: plannerOROrderFallback}
 	}
 	orderDistinct := uint64(ov.KeyCount())
 	if orderDistinct == 0 {
-		return d
+		return plannerOROrderDecision{plan: plannerOROrderFallback}
 	}
 	need, ok := orderWindow(q)
 	if !ok || need <= 0 {
-		return d
+		return plannerOROrderDecision{plan: plannerOROrderFallback}
 	}
 
 	snap := qv.exec.Stats.Load()
 	universe := snap.UniverseOr(analysis.snapshotUniverse)
 	if universe == 0 {
-		return d
+		return plannerOROrderDecision{plan: plannerOROrderFallback}
 	}
 
 	var branchCards [plannerORBranchLimit]uint64
 	unionCard, sumCard, branchCount, hasAlwaysTrue := branches.unionCards(universe, &branchCards)
 	if unionCard == 0 {
-		return d
+		return plannerOROrderDecision{plan: plannerOROrderFallback}
 	}
 
 	orderStats := qv.plannerOrderFieldStats(orderField, snap, universe, orderDistinct)
 	expectedRows := estimateRowsForNeed(uint64(need), unionCard, universe)
-	routeCost, routeOK := qv.estimateOROrderMergeRouteCost(q, branches, need, analysis.mergeStats)
-
-	// Stream cost tracks row-by-row predicate checks during ordered scan.
 	streamChecks := branches.orderStreamChecksByBranch(hasAlwaysTrue, analysis.mergeStats)
-	streamSkew := plannerFieldStatsSkew(orderStats)
-	costStream := float64(expectedRows) * streamChecks * streamSkew
-
 	costFallback := float64(sumCard) + float64(expectedRows)
-	bestPlan := plannerOROrderFallback
-	bestCost := costFallback
+	cacheState, eagerBuildWork := qv.orderedORCacheCandidateState(branches, analysis, need, q.Offset)
+	eagerCost := 0.0
+	if q.Offset > 0 && eagerBuildWork > 0 {
+		eagerCost = float64(eagerBuildWork)
+	}
+	costStream := float64(expectedRows)*streamChecks*plannerFieldStatsSkew(orderStats) + eagerCost
 
-	// Merge strategy only makes sense when no branch is tautological and the
-	// requested window is bounded enough to amortize branch merge overhead.
+	var candidates [4]plannerOROrderCandidate
+	n := 0
+	candidates[n] = plannerOROrderCandidate{
+		kind:         plannerOROrderCandidateMaterializedFallback,
+		cost:         costFallback,
+		expectedRows: expectedRows,
+		unionRows:    unionCard,
+		sumRows:      sumCard,
+		cacheState:   cacheState,
+	}
+	n++
+
+	routeCost, routeOK := qv.estimateOROrderMergeRouteCost(q, branches, need, analysis.mergeStats)
 	mergeNeedLimit := plannerOROrderMergeNeedLimit(need, branches.Len(), unionCard, sumCard, q.Offset)
 	mergeAllowed := !hasAlwaysTrue && need <= mergeNeedLimit
-
 	if mergeAllowed {
-
 		costMerge := branches.orderMergeCost(uint64(need), &branchCards, branchCount, unionCard, sumCard, universe, orderStats, analysis.mergeStats)
 		if routeOK && routeCost.kWay > 0 && routeCost.kWay < costMerge &&
 			branches.hasFullSpanOrderBranch(analysis.mergeStats) &&
@@ -418,23 +802,57 @@ func (qv *View) decidePlanOROrderWithAnalysis(
 			!branches.hasKWayExactBucketApplyWork(analysis.mergeStats) {
 			costMerge = routeCost.kWay
 		}
-
-		if costMerge <= bestCost*plannerOROrderMergeGain {
-			bestPlan = plannerOROrderMerge
-			bestCost = costMerge
+		costMerge += eagerCost
+		candidates[n] = plannerOROrderCandidate{
+			kind:                plannerOROrderCandidateKWayMerge,
+			cost:                costMerge,
+			expectedRows:        expectedRows,
+			unionRows:           unionCard,
+			sumRows:             sumCard,
+			avgChecks:           routeCost.avgChecks,
+			overlap:             routeCost.overlap,
+			cacheState:          cacheState,
+			eagerBuildWork:      eagerBuildWork,
+			hasPrefixTailRisk:   routeCost.hasPrefixTailRisk,
+			hasSelectiveLead:    routeCost.hasSelectiveLead,
+			fallbackCollectFast: ov.HasData(),
+		}
+		n++
+		if routeOK && routeCost.fallback > 0 {
+			fallbackFirst := plannerOROrderFallbackFirstDecisionFromCost(q, need, routeCost, ov.HasData())
+			if fallbackFirst.prefer {
+				candidates[n] = plannerOROrderCandidate{
+					kind:                plannerOROrderCandidateBranchCollect,
+					cost:                routeCost.fallback + eagerCost,
+					expectedRows:        expectedRows,
+					unionRows:           unionCard,
+					sumRows:             sumCard,
+					avgChecks:           fallbackFirst.avgChecks,
+					overlap:             routeCost.overlap,
+					cacheState:          cacheState,
+					eagerBuildWork:      eagerBuildWork,
+					hasPrefixTailRisk:   routeCost.hasPrefixTailRisk,
+					hasSelectiveLead:    routeCost.hasSelectiveLead,
+					fallbackCollectFast: fallbackFirst.fallbackCollectFast,
+				}
+				n++
+			}
 		}
 	}
 
-	if costStream <= bestCost*plannerOROrderStreamGain {
-		bestPlan = plannerOROrderStream
-		bestCost = costStream
+	candidates[n] = plannerOROrderCandidate{
+		kind:           plannerOROrderCandidateStream,
+		cost:           costStream,
+		expectedRows:   expectedRows,
+		unionRows:      unionCard,
+		sumRows:        sumCard,
+		avgChecks:      streamChecks,
+		cacheState:     cacheState,
+		eagerBuildWork: eagerBuildWork,
 	}
+	n++
 
-	d.plan = bestPlan
-	d.expectedRows = expectedRows
-	d.bestCost = bestCost
-	d.fallbackCost = costFallback
-	return d
+	return plannerOROrderPick(candidates[:n], q.Limit > plannerOROrderLimitMax || q.Offset > plannerOROrderOffsetMax)
 }
 
 // unionCards estimates planner metrics for OR union cardinalities.
@@ -1256,160 +1674,6 @@ func (qv *View) decideExecutionOrderByCost(q *qir.Shape, leaves []qir.Expr) plan
 	return d
 }
 
-func (qv *View) shouldPreferExecutionPlan(q *qir.Shape, trace *Trace) bool {
-	if plannerObviousExecutionFastPath(q) {
-		if trace != nil {
-			trace.SetEstimated(q.Limit, 1.0, 2.0)
-		}
-		return true
-	}
-
-	var leavesBuf [8]qir.Expr
-	leaves, ok := qir.CollectAndLeavesScratch(q.Expr, leavesBuf[:0], qir.LeafModeCollect)
-	if !ok || len(leaves) == 0 {
-		return false
-	}
-
-	if !q.HasOrder {
-		if q.Limit != 0 && q.Offset == 0 {
-			field, _, ok, err := qv.extractNoOrderBounds(leaves)
-			if err == nil && ok {
-				boundOnly := true
-				negResidual := false
-				residualOK := true
-				for _, e := range leaves {
-					if !e.Not && e.FieldOrdinal >= 0 && qv.exec.FieldNameByOrdinal(e.FieldOrdinal) == field && isBoundOp(e.Op) {
-						continue
-					}
-					boundOnly = false
-					if e.Not {
-						negResidual = true
-					}
-					if !qv.supportsLimitLeafPredExpr(e) {
-						residualOK = false
-						break
-					}
-				}
-				fm := qv.exec.Schema.Fields[field]
-				if fm != nil && !fm.Slice {
-					if boundOnly {
-						if trace != nil {
-							trace.SetEstimated(q.Limit, 1.0, 1.05)
-						}
-						return true
-					}
-					if negResidual && residualOK {
-						if trace != nil {
-							trace.SetEstimated(q.Limit, 1.0, 1.15)
-						}
-						return true
-					}
-				}
-			}
-		}
-		if qv.shouldPreferExecutionNoOrderPrefix(q, leaves) {
-			if trace != nil {
-				trace.SetEstimated(q.Limit, 1.0, 1.1)
-			}
-			return true
-		}
-		return false
-	}
-
-	if q.Offset == 0 && q.HasOrder && q.Order.Kind == qir.OrderKindBasic && len(leaves) == 1 {
-		e := leaves[0]
-		orderField := qv.exec.FieldNameByOrdinal(q.Order.FieldOrdinal)
-		if !e.Not && e.FieldOrdinal >= 0 && qv.exec.FieldNameByOrdinal(e.FieldOrdinal) != orderField && len(e.Operands) == 0 {
-			switch e.Op {
-			case qir.OpEQ, qir.OpIN, qir.OpHASALL, qir.OpHASANY:
-				return false
-			}
-		}
-	}
-
-	execDecision := qv.decideExecutionOrderByCost(q, leaves)
-	if !execDecision.use {
-		return false
-	}
-
-	if q.Offset == 0 && q.HasOrder && q.Order.Kind == qir.OrderKindBasic {
-		orderField := qv.exec.FieldNameByOrdinal(q.Order.FieldOrdinal)
-		if _, ok, err := qv.extractBoundsForField(orderField, leaves); err == nil && ok {
-			if qv.supportsLimitLeafPredsExcludingBounds(leaves, orderField) &&
-				!qv.hasWarmScalarLimitLeafPredsExcludingBounds(leaves, orderField) {
-				if trace != nil {
-					trace.SetEstimated(execDecision.expectedProbeRows, execDecision.executionCost, execDecision.executionCost*plannerExecutionPreferGain)
-				}
-				return true
-			}
-		}
-	}
-
-	orderedDecision := qv.decideOrderedByCost(q, leaves)
-	if orderedDecision.use && orderedDecision.orderedCost > 0 {
-		if execDecision.executionCost >= orderedDecision.orderedCost*plannerExecutionPreferGain {
-			return false
-		}
-	}
-
-	if trace != nil {
-		fallbackCost := orderedDecision.orderedCost
-		if fallbackCost <= 0 {
-			fallbackCost = orderedDecision.fallbackCost
-		}
-		trace.SetEstimated(execDecision.expectedProbeRows, execDecision.executionCost, fallbackCost)
-	}
-
-	return true
-}
-
-func plannerObviousExecutionFastPath(q *qir.Shape) bool {
-	if q == nil || q.Limit == 0 || q.Expr.Not {
-		return false
-	}
-
-	if !q.HasOrder {
-		e := q.Expr
-		return isPositiveScalarPrefixLeaf(e)
-	}
-
-	if !q.HasOrder {
-		return false
-	}
-	ord := q.Order
-	if ord.Kind != qir.OrderKindBasic || ord.FieldOrdinal < 0 {
-		return false
-	}
-	orderFieldOrdinal := ord.FieldOrdinal
-
-	expr := q.Expr
-	if expr.Op == qir.OpAND {
-		hasPrefix := false
-		for i := range expr.Operands {
-			op := expr.Operands[i]
-			if op.Not {
-				return false
-			}
-			if op.FieldOrdinal < 0 {
-				return false
-			}
-			if op.FieldOrdinal != orderFieldOrdinal {
-				continue
-			}
-			if op.Op == qir.OpPREFIX {
-				hasPrefix = true
-				continue
-			}
-			if !isScalarRangeEqOp(op.Op) {
-				return false
-			}
-		}
-		return hasPrefix
-	}
-
-	return expr.FieldOrdinal == orderFieldOrdinal && expr.Op == qir.OpPREFIX && len(expr.Operands) == 0
-}
-
 func plannerExecutionNoOrderPrefixLeafLimit(qLimit uint64, universe uint64) int {
 	limit := plannerExecutionNoOrderPrefixLeafMax
 	if qLimit <= 64 {
@@ -1542,7 +1806,7 @@ func (qv *View) shouldPreferExecutionNoOrderPrefix(q *qir.Shape, leaves []qir.Ex
 		}
 
 		if isPositiveScalarPrefixLeaf(e) {
-			prefix, ok, err := qv.prepareScalarPrefixSpan(e)
+			prefix, ok, err := qv.prepareScalarPrefixRoute(e)
 			if err != nil || !ok {
 				return false
 			}
@@ -1552,14 +1816,15 @@ func (qv *View) shouldPreferExecutionNoOrderPrefix(q *qir.Shape, leaves []qir.Ex
 			if prefix.br.Empty() {
 				return true
 			}
-			if prefix.span <= 0 {
+			span, rows := prefix.ov.RangeStats(prefix.br)
+			if span <= 0 {
 				return true
 			}
-			prefixSpan = prefix.span
-			if prefix.rows == 0 {
+			prefixSpan = span
+			if rows == 0 {
 				return true
 			}
-			prefixRows = prefix.rows
+			prefixRows = rows
 
 			prefixCount++
 			if prefixCount > 1 {

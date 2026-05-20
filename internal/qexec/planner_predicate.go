@@ -761,78 +761,9 @@ func countBucketPostsAllNotBuf(posts []posting.List, bucket posting.List) (uint6
 	return 0, false
 }
 
-// tryPlanCandidate attempts the internal plan candidate path and returns ok=false when fast-path preconditions are not satisfied.
-func (qv *View) tryPlanCandidate(q *qir.Shape, trace *Trace) ([]uint64, bool, error) {
-
-	// candidate planner is focused on the latency-critical paged path.
-	if q.Limit == 0 {
-		return nil, false, nil
-	}
-	var leavesBuf [plannerPredicateFastPathMaxLeaves]qir.Expr
-	leaves, ok := qir.CollectAndLeavesScratch(q.Expr, leavesBuf[:0], qir.LeafModeCollect)
-	if !ok {
-		return nil, false, nil
-	}
-	if q.HasOrder {
-		o := q.Order
-		if o.Kind != qir.OrderKindBasic {
-			return nil, false, nil
-		}
-		if q.Offset != 0 {
-			return nil, false, nil
-		}
-		if !qv.shouldUseCandidateOrder(o, leaves) {
-			return nil, false, nil
-		}
-
-		predSet, ok := qv.buildPredicatesCandidate(leaves)
-		if !ok {
-			return nil, false, nil
-		}
-		defer predSet.Release()
-		for i := 0; i < predSet.Len(); i++ {
-			if predSet.owner[i].alwaysFalse {
-				return nil, true, nil
-			}
-		}
-
-		if trace != nil {
-			trace.SetPlan(PlanCandidateOrder)
-		}
-		return qv.execPlanCandidateOrderBasic(q, predSet.owner, trace), true, nil
-	}
-
-	// baseline fast-paths are better for trivial single-field range/prefix scans with limit;
-	// candidate strategy is intended for mixed/complex predicates
-	if len(leaves) == 1 && isSimpleScalarRangeOrPrefixLeaf(leaves[0]) {
-		return nil, false, nil
-	}
-
-	// pure EQ conjunctions are already handled very well by baseline paths
-	if allPositiveScalarEqLeaves(leaves) {
-		return nil, false, nil
-	}
-
-	predSet, ok := qv.buildPredicatesCandidate(leaves)
-	if !ok {
-		return nil, false, nil
-	}
-	defer predSet.Release()
-	for i := 0; i < predSet.Len(); i++ {
-		if predSet.owner[i].alwaysFalse {
-			return nil, true, nil
-		}
-	}
-
-	if trace != nil {
-		trace.SetPlan(PlanCandidateNoOrder)
-	}
-	return qv.execPlanLeadScanNoOrder(q, predSet.owner, trace), true, nil
-}
-
 func (qv *View) shouldUseCandidateOrder(o qir.Order, leaves []qir.Expr) bool {
 	fm := qv.fieldMetaByOrder(o)
-	if fm == nil || fm.Slice {
+	if fm == nil || fm.Slice || fm.Ptr {
 		return false
 	}
 	if !qv.fieldIndexViewFromSlotsForOrder(qv.snap.Index, o).HasData() {
@@ -1640,17 +1571,20 @@ func (qv *View) tryShareMaterializedPred(cacheKey qcache.MaterializedPredKey, id
 	return tryShareMaterializedPredOnSnapshot(qv.snap, cacheKey, ids)
 }
 
-func (qv *View) execPlanLeadScanNoOrder(q *qir.Shape, preds predicateReader, trace *Trace) []uint64 {
-	var leadIdx = -1
+func (qv *View) execPlanLeadScanNoOrder(q *qir.Shape, preds predicateReader, leadIdx int, trace *Trace) []uint64 {
 	var best uint64
-	for i := 0; i < len(preds); i++ {
-		p := preds[i]
-		if p.alwaysTrue || p.alwaysFalse || !p.hasIter() {
-			continue
-		}
-		if leadIdx == -1 || p.estCard < best {
-			leadIdx = i
-			best = p.estCard
+	if leadIdx >= 0 {
+		best = preds[leadIdx].estCard
+	} else {
+		for i := 0; i < len(preds); i++ {
+			p := preds[i]
+			if p.alwaysTrue || p.alwaysFalse || !p.hasIter() {
+				continue
+			}
+			if leadIdx == -1 || p.estCard < best {
+				leadIdx = i
+				best = p.estCard
+			}
 		}
 	}
 
@@ -1695,7 +1629,7 @@ func (qv *View) execPlanLeadScanNoOrder(q *qir.Shape, preds predicateReader, tra
 		singleActive = active[0]
 	}
 
-	if out, ok := qv.tryExecLeadScanNoOrderBuckets(q, preds, leadIdx, active, trace); ok {
+	if out, ok := qv.execLeadScanNoOrderBuckets(q, preds, leadIdx, active, trace); ok {
 		return out
 	}
 
@@ -1740,7 +1674,7 @@ func (qv *View) execPlanLeadScanNoOrder(q *qir.Shape, preds predicateReader, tra
 	return cursor.out
 }
 
-func (qv *View) tryExecLeadScanNoOrderBuckets(q *qir.Shape, preds predicateReader, leadIdx int, active []int, trace *Trace) ([]uint64, bool) {
+func (qv *View) execLeadScanNoOrderBuckets(q *qir.Shape, preds predicateReader, leadIdx int, active []int, trace *Trace) ([]uint64, bool) {
 	if leadIdx < 0 || leadIdx >= len(preds) {
 		return nil, false
 	}
@@ -2213,103 +2147,6 @@ func shouldUseFastSinglesUnion(probeLen, singletonCount int, est uint64) bool {
 		return false
 	}
 	return postingUnionFastSinglesWork(probeLen, singletonCount, est) < postingUnionLinearWork(probeLen, est)
-}
-
-// tryPlanOrdered attempts the internal plan ordered path and returns false when fast-path preconditions are not satisfied.
-func (qv *View) tryPlanOrdered(q *qir.Shape, trace *Trace) ([]uint64, bool, error) {
-	if q.Limit == 0 {
-		return nil, false, nil
-	}
-	var leavesBuf [plannerPredicateFastPathMaxLeaves]qir.Expr
-	leaves, ok := qir.CollectAndLeavesScratch(q.Expr, leavesBuf[:0], qir.LeafModeCollect)
-	if !ok {
-		return nil, false, nil
-	}
-
-	if q.HasOrder {
-		o := q.Order
-		if o.Kind != qir.OrderKindBasic {
-			return nil, false, nil
-		}
-		decision := qv.decideOrderedByCost(q, leaves)
-		if trace != nil {
-			trace.SetEstimated(decision.expectedProbeRows, decision.orderedCost, decision.fallbackCost)
-		}
-		if !decision.use {
-			return nil, false, nil
-		}
-		window, _ := orderWindow(q)
-		orderField := qv.exec.FieldNameByOrdinal(o.FieldOrdinal)
-		predSet, ok := qv.buildPredicatesOrderedWithMode(leaves, orderField, false, window, q.Offset, true, true)
-		if !ok {
-			return nil, false, nil
-		}
-		defer predSet.Release()
-		for i := 0; i < predSet.Len(); i++ {
-			if predSet.owner[i].alwaysFalse {
-				return nil, true, nil
-			}
-		}
-
-		if trace != nil {
-			trace.SetPlan(PlanOrdered)
-		}
-
-		execTrace := trace
-		var observedTrace Trace
-		observedStart := uint64(0)
-		if execTrace == nil {
-			execTrace = &observedTrace
-		} else {
-			observedStart = execTrace.RowsExamined()
-		}
-
-		out, ok := qv.execPlanOrderedBasicReader(q, predSet.owner, execTrace)
-		if !ok {
-			return nil, false, nil
-		}
-
-		needWindow, _ := orderWindow(q)
-
-		var baseOpsBuf [plannerPredicateFastPathMaxLeaves]qir.Expr
-		baseOps := baseOpsBuf[:0]
-
-		for _, op := range leaves {
-			if op.FieldOrdinal == o.FieldOrdinal {
-				continue
-			}
-			baseOps = append(baseOps, op)
-		}
-
-		qv.promoteOrderBasicLimitMaterializedBaseOps(orderField, baseOps, execTrace.RowsExamined()-observedStart, uint64(needWindow))
-
-		return out, true, nil
-	}
-
-	// keep baseline paths for trivial patterns where ordered strategy usually has no advantage
-	if len(leaves) == 1 && isSimpleScalarRangeOrPrefixLeaf(leaves[0]) {
-		return nil, false, nil
-	}
-	if allPositiveScalarEqLeaves(leaves) {
-		return nil, false, nil
-	}
-
-	predSet, ok := qv.buildPredicates(leaves)
-	if !ok {
-		return nil, false, nil
-	}
-	defer predSet.Release()
-
-	for i := 0; i < predSet.Len(); i++ {
-		if predSet.owner[i].alwaysFalse {
-			return nil, true, nil
-		}
-	}
-
-	if trace != nil {
-		trace.SetPlan(PlanOrderedNoOrder)
-	}
-	return qv.execPlanLeadScanNoOrder(q, predSet.owner, trace), true, nil
 }
 
 func (p predicate) checkCost() uint64 {
@@ -2919,7 +2756,7 @@ func (qv *View) buildPredicatesWithMergedNumericRanges(leaves []qir.Expr, allowM
 }
 
 func (qv *View) buildPredicatesWithMode(leaves []qir.Expr, allowMaterialize bool) (predicateSet, bool) {
-	return qv.buildPredicatesWithColdMode(leaves, allowMaterialize, false)
+	return qv.buildPredicatesWithColdMode(leaves, allowMaterialize, allowMaterialize)
 }
 
 func (qv *View) buildPredicates(leaves []qir.Expr) (predicateSet, bool) {
@@ -4425,6 +4262,10 @@ func (qv *View) execPlanOrderedBasicAnchoredWithScratch(
 }
 
 func (qv *View) execPlanOrderedBasicReader(q *qir.Shape, preds predicateReader, trace *Trace) ([]uint64, bool) {
+	return qv.execPlanOrderedBasicReaderGuarded(q, preds, plannerOrderedLimitRuntimeGuard{}, trace)
+}
+
+func (qv *View) execPlanOrderedBasicReaderGuarded(q *qir.Shape, preds predicateReader, guard plannerOrderedLimitRuntimeGuard, trace *Trace) ([]uint64, bool) {
 	o := q.Order
 
 	fm := qv.fieldMetaByOrder(o)
@@ -4500,7 +4341,7 @@ func (qv *View) execPlanOrderedBasicReader(q *qir.Shape, preds predicateReader, 
 		if len(activeBuf) == 0 {
 			return qv.scanOrderLimitNoPredicates(q, ov, br, o.Desc, nilTailField, trace)
 		}
-		return qv.scanOrderLimitWithPredicatesReader(q, ov, br, o.Desc, preds, nilTailField, trace)
+		return qv.scanOrderLimitWithPredicatesReaderGuarded(q, ov, br, o.Desc, preds, nilTailField, guard, trace)
 	}
 
 	var activeInline [plannerPredicateFastPathMaxLeaves]int
@@ -4544,7 +4385,7 @@ func (qv *View) execPlanOrderedBasicReader(q *qir.Shape, preds predicateReader, 
 	if len(active) == 0 {
 		return qv.scanOrderLimitNoPredicates(q, ov, br, o.Desc, nilTailField, trace)
 	}
-	return qv.scanOrderLimitWithPredicatesReader(q, ov, br, o.Desc, preds, nilTailField, trace)
+	return qv.scanOrderLimitWithPredicatesReaderGuarded(q, ov, br, o.Desc, preds, nilTailField, guard, trace)
 }
 
 // execPlanOrderedBasicFallback scans ordered buckets and applies remaining

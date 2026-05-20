@@ -106,6 +106,13 @@ func (s *View) LoadMaterializedPredKey(key qcache.MaterializedPredKey) (posting.
 	return s.matPredCache.Load(key)
 }
 
+func (s *View) HasMaterializedPredKey(key qcache.MaterializedPredKey) bool {
+	if key.IsZero() || s.matPredCache == nil {
+		return false
+	}
+	return s.matPredCache.Has(key)
+}
+
 func (s *View) StoreMaterializedPredKey(key qcache.MaterializedPredKey, ids posting.List) {
 	if key.IsZero() || s.matPredCache == nil {
 		return
@@ -186,6 +193,13 @@ func (s *View) ShouldPromoteRuntimeMaterializedPredKey(key qcache.MaterializedPr
 		return false
 	}
 	return s.runtimeMatPredSeen.TouchOrRemember(key, qcache.RecentKeyLimit(s.MaterializedPredCacheLimit()))
+}
+
+func (s *View) HasRuntimeMaterializedPredSeenKey(key qcache.MaterializedPredKey) bool {
+	if key.IsZero() {
+		return false
+	}
+	return s.runtimeMatPredSeen.Contains(key)
 }
 
 func (s *View) ShouldPromoteObservedOrderedORMaterializedPredKey(key qcache.MaterializedPredKey, observedWork uint64, buildWork uint64) bool {

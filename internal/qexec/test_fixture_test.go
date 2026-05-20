@@ -895,13 +895,37 @@ func (qe *queryEngine) evalExpr(e qx.Expr) (postingResult, error) {
 	return qe.currentQueryViewForTests().evalExpr(expr)
 }
 
-func (qe *queryEngine) tryExecutionPlan(q *qx.QX, trace *Trace) ([]uint64, bool, error) {
+func (qe *queryEngine) tryLimitRoutes(q *qx.QX, trace *Trace) ([]uint64, bool, error) {
 	prepared, viewQ, err := prepareTestQuery(qe, q)
 	if err != nil {
 		return nil, false, err
 	}
 	defer prepared.Release()
-	return qe.currentQueryViewForTests().tryExecutionPlan(&viewQ, trace)
+	return tryLimitRoutesForTest(qe.currentQueryViewForTests(), &viewQ, trace)
+}
+
+func tryLimitRoutesForTest(view *View, viewQ *qir.Shape, trace *Trace) ([]uint64, bool, error) {
+	if viewQ.HasOrder && viewQ.Order.Kind != qir.OrderKindBasic {
+		return nil, false, nil
+	}
+	if !viewQ.HasOrder && viewQ.Limit != 0 {
+		if out, ok, plan, err := view.executeNoOrderLimit(viewQ, trace); ok {
+			if trace != nil {
+				trace.SetPlan(plan)
+			}
+			return out, true, err
+		}
+	}
+	if viewQ.HasOrder && viewQ.Order.Kind == qir.OrderKindBasic && viewQ.Limit != 0 {
+		out, ok, plan, err := view.executeOrderedLimit(viewQ, trace)
+		if ok && trace != nil && plan != "" {
+			trace.SetPlan(plan)
+		}
+		if ok {
+			return out, true, err
+		}
+	}
+	return nil, false, nil
 }
 
 func (qe *queryEngine) tryPlan(q *qx.QX, trace *Trace) ([]uint64, bool, error) {
@@ -910,33 +934,50 @@ func (qe *queryEngine) tryPlan(q *qx.QX, trace *Trace) ([]uint64, bool, error) {
 		return nil, false, err
 	}
 	defer prepared.Release()
-	return qe.currentQueryViewForTests().tryPlan(&viewQ, trace)
+	return qe.currentQueryViewForTests().executeOR(&viewQ, trace)
 }
 
-func (qe *queryEngine) tryPlanCandidate(q *qx.QX, trace *Trace) ([]uint64, bool, error) {
+func (qe *queryEngine) tryCandidateLimitRoute(q *qx.QX, trace *Trace) ([]uint64, bool, error) {
 	prepared, viewQ, err := prepareTestQuery(qe, q)
 	if err != nil {
 		return nil, false, err
 	}
 	defer prepared.Release()
-	return qe.currentQueryViewForTests().tryPlanCandidate(&viewQ, trace)
+	view := qe.currentQueryViewForTests()
+	if viewQ.HasOrder {
+		out, ok, plan, err := view.executeOrderedLimit(&viewQ, trace)
+		if ok && plan == PlanCandidateOrder {
+			if trace != nil {
+				trace.SetPlan(plan)
+			}
+			return out, true, err
+		}
+		return nil, false, err
+	}
+	out, ok, plan, err := view.executeNoOrderLimit(&viewQ, trace)
+	if ok && plan == PlanCandidateNoOrder {
+		if trace != nil {
+			trace.SetPlan(plan)
+		}
+		return out, true, err
+	}
+	return nil, false, err
 }
 
-func (qe *queryEngine) tryLimitQueryOrderBasic(q *qx.QX, leaves []qx.Expr, trace *Trace) ([]uint64, bool, error) {
+func (qe *queryEngine) executeOrderedLimit(q *qx.QX, trace *Trace) ([]uint64, bool, error) {
 	preparedQ, viewQ, err := prepareTestQuery(qe, q)
 	if err != nil {
 		return nil, false, err
 	}
 	defer preparedQ.Release()
-	preparedLeaves, compiledLeaves, err := prepareTestExprs(qe, leaves)
-	if err != nil {
-		return nil, false, err
+	out, ok, plan, err := qe.currentQueryViewForTests().executeOrderedLimit(&viewQ, trace)
+	if ok && trace != nil && plan != "" {
+		trace.SetPlan(plan)
 	}
-	defer releasePreparedQueriesForTest(preparedLeaves)
-	return qe.currentQueryViewForTests().tryLimitQueryOrderBasic(&viewQ, compiledLeaves, trace)
+	return out, ok, err
 }
 
-func (qe *queryEngine) tryLimitQueryRangeNoOrderByField(q *qx.QX, field string, bounds indexdata.Bounds, rest []qx.Expr, trace *Trace) ([]uint64, bool, error) {
+func (qe *queryEngine) execSelectedNoOrderBounds(q *qx.QX, field string, bounds indexdata.Bounds, rest []qx.Expr, trace *Trace) ([]uint64, bool, error) {
 	preparedQ, viewQ, err := prepareTestQuery(qe, q)
 	if err != nil {
 		return nil, false, err
@@ -947,43 +988,25 @@ func (qe *queryEngine) tryLimitQueryRangeNoOrderByField(q *qx.QX, field string, 
 		return nil, false, err
 	}
 	defer releasePreparedQueriesForTest(preparedRest)
-	return qe.currentQueryViewForTests().tryLimitQueryRangeNoOrderByField(&viewQ, field, bounds, compiledRest, trace)
+	return qe.currentQueryViewForTests().execSelectedNoOrderBounds(&viewQ, field, bounds, compiledRest, trace)
 }
 
-func (qe *queryEngine) tryQueryOrderBasicWithLimit(q *qx.QX, trace *Trace) ([]uint64, bool, error) {
+func (qe *queryEngine) execSelectedNoOrderDirectRange(q *qx.QX, trace *Trace) ([]uint64, bool, error) {
 	prepared, viewQ, err := prepareTestQuery(qe, q)
 	if err != nil {
 		return nil, false, err
 	}
 	defer prepared.Release()
-	return qe.currentQueryViewForTests().tryQueryOrderBasicWithLimit(&viewQ, trace)
+	return qe.currentQueryViewForTests().execSelectedNoOrderDirectRange(&viewQ, trace)
 }
 
-func (qe *queryEngine) tryQueryOrderPrefixWithLimit(q *qx.QX, trace *Trace) ([]uint64, bool, error) {
+func (qe *queryEngine) execSelectedNoOrderDirectPrefix(q *qx.QX, trace *Trace) ([]uint64, bool, error) {
 	prepared, viewQ, err := prepareTestQuery(qe, q)
 	if err != nil {
 		return nil, false, err
 	}
 	defer prepared.Release()
-	return qe.currentQueryViewForTests().tryQueryOrderPrefixWithLimit(&viewQ, trace)
-}
-
-func (qe *queryEngine) tryQueryRangeNoOrderWithLimit(q *qx.QX, trace *Trace) ([]uint64, bool, error) {
-	prepared, viewQ, err := prepareTestQuery(qe, q)
-	if err != nil {
-		return nil, false, err
-	}
-	defer prepared.Release()
-	return qe.currentQueryViewForTests().tryQueryRangeNoOrderWithLimit(&viewQ, trace)
-}
-
-func (qe *queryEngine) tryQueryPrefixNoOrderWithLimit(q *qx.QX, trace *Trace) ([]uint64, bool, error) {
-	prepared, viewQ, err := prepareTestQuery(qe, q)
-	if err != nil {
-		return nil, false, err
-	}
-	defer prepared.Release()
-	return qe.currentQueryViewForTests().tryQueryPrefixNoOrderWithLimit(&viewQ, trace)
+	return qe.currentQueryViewForTests().execSelectedNoOrderDirectPrefix(&viewQ, trace)
 }
 
 func (qe *queryEngine) buildPredicatesOrderedWithMode(leaves []qx.Expr, orderField string, allowMaterialize bool, orderedWindow int, orderedOffset uint64, coverOrderRange bool, allowOrderedEagerMaterialize bool) ([]predicate, bool) {
@@ -1041,22 +1064,22 @@ func (qe *queryEngine) buildORBranchesOrderedWithOffset(ops []qx.Expr, orderFiel
 	return qe.currentQueryViewForTests().buildORBranchesOrdered(compiledOps, orderField, orderedWindow, orderedOffset)
 }
 
-func (qe *queryEngine) execPlanORNoOrderAdaptive(q *qx.QX, branches plannerORBranches, trace *Trace) ([]uint64, bool) {
+func (qe *queryEngine) execPlanORNoOrderAdaptiveCore(q *qx.QX, branches plannerORBranches, trace *Trace) ([]uint64, bool) {
 	prepared, viewQ, err := prepareTestQuery(qe, q)
 	if err != nil {
 		return nil, false
 	}
 	defer prepared.Release()
-	return qe.currentQueryViewForTests().execPlanORNoOrderAdaptive(&viewQ, branches, trace)
+	return qe.currentQueryViewForTests().execPlanORNoOrderAdaptiveCore(&viewQ, branches, trace)
 }
 
-func (qe *queryEngine) execPlanORNoOrderBaseline(q *qx.QX, branches plannerORBranches, trace *Trace) ([]uint64, bool) {
+func (qe *queryEngine) execPlanORNoOrderBaselineCore(q *qx.QX, branches plannerORBranches, trace *Trace) ([]uint64, bool) {
 	prepared, viewQ, err := prepareTestQuery(qe, q)
 	if err != nil {
 		return nil, false
 	}
 	defer prepared.Release()
-	return qe.currentQueryViewForTests().execPlanORNoOrderBaseline(&viewQ, branches, trace)
+	return qe.currentQueryViewForTests().execPlanORNoOrderBaselineCore(&viewQ, branches, trace)
 }
 
 func (qe *queryEngine) execPlanOROrderBasic(q *qx.QX, branches plannerORBranches, trace *Trace) ([]uint64, bool) {
@@ -1146,13 +1169,13 @@ func copyBoolBufAndRelease(buf []bool) []bool {
 	return out
 }
 
-func (qe *queryEngine) decidePlanORNoOrder(q *qx.QX, branches plannerORBranches) plannerORNoOrderDecision {
+func (qe *queryEngine) selectPlanORNoOrder(q *qx.QX, branches plannerORBranches) plannerORNoOrderDecision {
 	prepared, viewQ, err := prepareTestQuery(qe, q)
 	if err != nil {
 		return plannerORNoOrderDecision{}
 	}
 	defer prepared.Release()
-	return qe.currentQueryViewForTests().decidePlanORNoOrder(&viewQ, branches)
+	return qe.currentQueryViewForTests().selectPlanORNoOrder(&viewQ, branches)
 }
 
 func (qe *queryEngine) shouldUseOROrderKWayRuntimeFallback(q *qx.QX, branches plannerORBranches, needWindow int) bool {
@@ -1196,24 +1219,6 @@ func (qe *queryEngine) shouldPreferExecutionNoOrderPrefix(q *qx.QX, leaves []qx.
 	}
 	defer releasePreparedQueriesForTest(preparedLeaves)
 	return qe.currentQueryViewForTests().shouldPreferExecutionNoOrderPrefix(&viewQ, compiledLeaves)
-}
-
-func (qe *queryEngine) shouldPreferExecutionPlan(q *qx.QX) bool {
-	prepared, viewQ, err := prepareTestQuery(qe, q)
-	if err != nil {
-		return false
-	}
-	defer prepared.Release()
-	return qe.currentQueryViewForTests().shouldPreferExecutionPlan(&viewQ, nil)
-}
-
-func (qe *queryEngine) shouldPreferOROrderFallbackFirst(q *qx.QX, branches plannerORBranches) bool {
-	prepared, viewQ, err := prepareTestQuery(qe, q)
-	if err != nil {
-		return false
-	}
-	defer prepared.Release()
-	return qe.currentQueryViewForTests().shouldPreferOROrderFallbackFirst(&viewQ, branches)
 }
 
 func (qe *queryEngine) shouldUseCandidateOrder(o qx.Order, leaves []qx.Expr) bool {
@@ -1353,13 +1358,13 @@ func (db *testDB) buildORBranchesOrdered(ops []qx.Expr, orderField string, order
 	return db.view().buildORBranchesOrdered(compiledOps, orderField, orderedWindow, 0)
 }
 
-func (db *testDB) decidePlanORNoOrder(q *qx.QX, branches plannerORBranches) plannerORNoOrderDecision {
+func (db *testDB) selectPlanORNoOrder(q *qx.QX, branches plannerORBranches) plannerORNoOrderDecision {
 	prepared, viewQ, err := db.prepareQuery(q)
 	if err != nil {
 		return plannerORNoOrderDecision{}
 	}
 	defer prepared.Release()
-	return db.view().decidePlanORNoOrder(&viewQ, branches)
+	return db.view().selectPlanORNoOrder(&viewQ, branches)
 }
 
 func (db *testDB) setPlannerStatsSnapshot(universe uint64, scoreStats PlannerFieldStats) {
