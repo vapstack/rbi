@@ -848,38 +848,42 @@ func (qv *View) buildLeafPredsExcludingBounds(leaves []qir.Expr, field string, o
 		orderedUniverse = qv.snap.Universe.Cardinality()
 	}
 
+	if len(leaves) == 2 {
+		prefixExpr, ok, err := qv.mergeAdjacentStringPrefixLeaves(field, leaves[0], leaves[1])
+		if err != nil {
+			leafPredSlicePool.Put(predsBuf)
+			return nil, true, err
+		}
+		if ok {
+			p, ok, err := qv.buildLimitLeafPred(prefixExpr, orderedWindow)
+			if err != nil {
+				leafPredSlicePool.Put(predsBuf)
+				return nil, true, err
+			}
+			if !ok {
+				leafPredSlicePool.Put(predsBuf)
+				return nil, false, nil
+			}
+			qv.attachLeafPredPostingFilter(&p)
+			if orderedUniverse > 0 && (p.kind == leafPredKindPosting || p.postsAnyState != nil) {
+				p.setExpectedContainsCalls(
+					clampUint64ToInt(orderedPredicateExpectedRows(orderedWindow, p.estCard, orderedUniverse)),
+				)
+			}
+			predsBuf = append(predsBuf, p)
+			return predsBuf, true, nil
+		}
+	}
+
 	var mergedRangesBuf []orderedMergedScalarRangeField
 	if len(leaves) > 1 {
 		mergedRangesBuf = orderedMergedScalarRangeFieldSlicePool.Get(len(leaves))
 		var ok bool
-		mergedRangesBuf, ok = qv.collectMergedNumericRangeFields(leaves, mergedRangesBuf)
+		mergedRangesBuf, ok = qv.collectOrderedMergedScalarRangeFields(field, leaves, mergedRangesBuf)
 		if !ok {
 			leafPredSlicePool.Put(predsBuf)
 			orderedMergedScalarRangeFieldSlicePool.Put(mergedRangesBuf)
 			return nil, false, nil
-		}
-		// Bound leaves on the scan field are covered by the scan range; emit
-		// the merged residual at the first non-covered leaf from that group.
-		for gi := range mergedRangesBuf {
-			if mergedRangesBuf[gi].field != field {
-				continue
-			}
-			first := -1
-			for i, e := range leaves {
-				if !qv.isPositiveMergedNumericRangeLeaf(e) || qv.exec.FieldNameByOrdinal(e.FieldOrdinal) != field {
-					continue
-				}
-				if isBoundOp(e.Op) {
-					continue
-				}
-				first = i
-				break
-			}
-			mergedRangesBuf[gi].first = first
-			if first >= 0 {
-				mergedRangesBuf[gi].expr = leaves[first]
-			}
-			break
 		}
 		defer orderedMergedScalarRangeFieldSlicePool.Put(mergedRangesBuf)
 	}
@@ -888,7 +892,7 @@ func (qv *View) buildLeafPredsExcludingBounds(leaves []qir.Expr, field string, o
 		if isBoundOp(e.Op) && !e.Not && qv.exec.FieldNameByOrdinal(e.FieldOrdinal) == field {
 			continue
 		}
-		if mergedRangesBuf != nil && qv.isPositiveMergedNumericRangeLeaf(e) {
+		if mergedRangesBuf != nil && qv.isPositiveOrderedMergedScalarRangeLeaf(e, field) {
 			idx := findOrderedMergedScalarRangeField(mergedRangesBuf, qv.exec.FieldNameByOrdinal(e.FieldOrdinal))
 			if idx >= 0 {
 				merged := mergedRangesBuf[idx]
@@ -1291,8 +1295,11 @@ func (qv *View) scanLimitByFieldIndexBounds(q *qir.Shape, ov indexdata.FieldInde
 func scanLimitByFieldIndexBoundsPostingFilterNoTrace(q *qir.Shape, ov indexdata.FieldIndexView, br indexdata.FieldIndexRange, desc bool, filter posting.List, guard plannerOrderedLimitRuntimeGuard) ([]uint64, bool) {
 	limit := int(q.Limit)
 	out := make([]uint64, 0, limit)
+	cursor := newQueryCursor(out, q.Offset, q.Limit, false, 0)
 	keyCur := ov.NewCursor(br, desc)
 	examined := uint64(0)
+	var filterCur posting.ContainsCursor
+	filterCur.Reset(filter)
 	for {
 		ids, idx, single, ok := keyCur.NextPostingOrSingle()
 		if !ok {
@@ -1300,10 +1307,9 @@ func scanLimitByFieldIndexBoundsPostingFilterNoTrace(q *qir.Shape, ov indexdata.
 		}
 		if single {
 			examined++
-			if filter.Contains(idx) {
-				out = append(out, idx)
-				if len(out) >= limit {
-					return out, true
+			if filterCur.Contains(idx) {
+				if cursor.emit(idx) {
+					return cursor.out, true
 				}
 			}
 		} else {
@@ -1311,21 +1317,20 @@ func scanLimitByFieldIndexBoundsPostingFilterNoTrace(q *qir.Shape, ov indexdata.
 			for it.HasNext() {
 				examined++
 				idx = it.Next()
-				if filter.Contains(idx) {
-					out = append(out, idx)
-					if len(out) >= limit {
+				if filterCur.Contains(idx) {
+					if cursor.emit(idx) {
 						it.Release()
-						return out, true
+						return cursor.out, true
 					}
 				}
 			}
 			it.Release()
 		}
-		if guard.enabled && guard.shouldFallback(examined, len(out)) {
+		if guard.enabled && guard.shouldFallback(examined, len(cursor.out)) {
 			return nil, false
 		}
 	}
-	return out, true
+	return cursor.out, true
 }
 
 func isBoundOp(op qir.Op) bool {
@@ -1625,6 +1630,12 @@ func (qv *View) buildMergedLimitLeafPred(e qir.Expr, bounds indexdata.Bounds, or
 	}
 
 	fieldName := qv.exec.FieldNameByOrdinal(e.FieldOrdinal)
+	if boundsExactStringPrefix(bounds) {
+		prefixExpr := e
+		prefixExpr.Op = qir.OpPREFIX
+		prefixExpr.Value = bounds.Prefix
+		return qv.buildLimitLeafPred(prefixExpr, orderedWindow)
+	}
 	allowMaterialize := false
 
 	if orderedWindow > 0 {

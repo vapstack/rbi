@@ -12,6 +12,7 @@ import (
 	"github.com/vapstack/rbi/internal/keycodec"
 	"github.com/vapstack/rbi/internal/pooled"
 	"github.com/vapstack/rbi/internal/posting"
+	"github.com/vapstack/rbi/internal/qir"
 )
 
 type plannerPrecountRec struct {
@@ -529,6 +530,125 @@ func TestPlannerExecutionOrderFactors_Adaptive(t *testing.T) {
 	_, highSkewCheck, _, _ := plannerExecutionOrderFactors(baseProfile, 5.0, 500_000)
 	if highSkewCheck <= lowSkewCheck {
 		t.Fatalf("expected higher skew to increase check factor: low=%.3f high=%.3f", lowSkewCheck, highSkewCheck)
+	}
+}
+
+func TestPlannerOrderedProfileCountsNonOrderPrefixResidual(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
+	_ = seedData(t, db, 1_000)
+
+	q := qx.Query(qx.PREFIX("full_name", "FN-1")).Sort("age", qx.ASC).Limit(10)
+	prepared, viewQ, err := prepareTestQuery(db.engine, q)
+	if err != nil {
+		t.Fatalf("prepareTestQuery: %v", err)
+	}
+	defer prepared.Release()
+
+	leaves, ok := qir.CollectAndLeaves(viewQ.Expr, qir.LeafModeCollect)
+	if !ok {
+		t.Fatalf("CollectAndLeaves: ok=false")
+	}
+
+	view := db.engine.currentQueryViewForTests()
+	snap := view.exec.Stats.Load()
+	universe := snap.UniverseOr(view.snap.Universe.Cardinality())
+	orderField := view.exec.FieldNameByOrdinal(viewQ.Order.FieldOrdinal)
+	ov := view.fieldIndexViewFromSlotsForOrder(view.snap.Index, viewQ.Order)
+	profile, ok := view.estimateOrderedProfileIndexView(orderField, leaves, ov, snap, universe)
+	if !ok {
+		t.Fatalf("estimateOrderedProfileIndexView: ok=false")
+	}
+	if profile.basePrefixLeaves != 1 {
+		t.Fatalf("basePrefixLeaves=%d want 1", profile.basePrefixLeaves)
+	}
+	if profile.baseRangeLeaves != 0 {
+		t.Fatalf("baseRangeLeaves=%d want 0", profile.baseRangeLeaves)
+	}
+}
+
+func TestPlannerNoOrderLimit_NegativeResidualKeepsDirectRange(t *testing.T) {
+	const rows = 100_000
+	db := newTestDB(t, qexecBenchOptions())
+	countries := [...]string{"US", "DE", "NL", "PL", "BR", "JP", "IN", "CA"}
+	tagsTiny := []string{"tag_tiny", "go", "db"}
+	tagsMid := []string{"tag_mid", "go", "ops"}
+	tagsBroad := []string{"tag_broad", "go"}
+	tagsDB := []string{"db"}
+	tagsOther := []string{"java"}
+	db.seedGeneratedData(t, rows, func(id uint64) testRec {
+		tags := tagsOther
+		switch {
+		case id%2048 == 0:
+			tags = tagsTiny
+		case id%100 == 0:
+			tags = tagsMid
+		case id%2 == 0:
+			tags = tagsBroad
+		case id%5 == 0:
+			tags = tagsDB
+		}
+		return testRec{
+			Meta:  Meta{Country: countries[id&7]},
+			Age:   int(id),
+			Tags:  tags,
+			Email: qexecBenchHighCardEmail(id),
+		}
+	})
+
+	sel := qexecBenchAllSelectivities[2]
+	ageStart, ageEnd := qexecBenchAgeRange(rows, sel)
+	tag := qexecBenchTag(sel)
+	cases := [...]struct {
+		name string
+		q    *qx.QX
+	}{
+		{
+			name: "notin",
+			q: qx.Query(
+				qx.NOTIN("country", []string{"DE", "PL"}),
+				ageStart,
+				ageEnd,
+			).Limit(256),
+		},
+		{
+			name: "hasnone",
+			q: qx.Query(
+				qx.HASNONE("tags", []string{tag, "missing_tag"}),
+				ageStart,
+				ageEnd,
+			).Limit(256),
+		},
+	}
+
+	view := db.view()
+	for i := range cases {
+		tc := cases[i]
+		t.Run(tc.name, func(t *testing.T) {
+			prepared, shape, err := db.prepareQuery(tc.q)
+			if err != nil {
+				t.Fatalf("prepareQuery: %v", err)
+			}
+			defer prepared.Release()
+
+			facts := noOrderLimitFactsPool.Get()
+			defer facts.Release()
+			ok, err := view.collectNoOrderLimitFacts(&shape, facts)
+			if err != nil {
+				t.Fatalf("collectNoOrderLimitFacts: %v", err)
+			}
+			if !ok {
+				t.Fatalf("collectNoOrderLimitFacts: ok=false")
+			}
+			decision := view.selectNoOrderLimit(&shape, facts)
+			if decision.selected.kind != plannerNoOrderLimitCandidateSameFieldBounds {
+				t.Fatalf("selected=%s want %s rejected=%s selectedCost=%.3f rejectedCost=%.3f",
+					decision.selected.kind.String(),
+					plannerNoOrderLimitCandidateSameFieldBounds.String(),
+					decision.rejected.kind.String(),
+					decision.selected.cost,
+					decision.rejected.cost)
+			}
+		})
 	}
 }
 

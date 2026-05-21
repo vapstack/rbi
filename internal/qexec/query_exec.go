@@ -2,6 +2,7 @@ package qexec
 
 import (
 	"fmt"
+	"reflect"
 
 	"github.com/vapstack/rbi/internal/indexdata"
 	"github.com/vapstack/rbi/internal/pooled"
@@ -51,6 +52,194 @@ func (qv *View) execSelectedNoOrderNoFilter(q *qir.Shape, trace *Trace) ([]uint6
 		} else {
 			trace.SetEarlyStopReason("input_exhausted")
 		}
+	}
+	return cursor.out, true, nil
+}
+
+func (qv *View) execSelectedNoOrderUniverseScan(q *qir.Shape, leaves []qir.Expr, expectedRows uint64, trace *Trace) ([]uint64, bool, error) {
+	universe := qv.snap.Universe.Borrow()
+	if universe.IsEmpty() {
+		if trace != nil {
+			trace.AddExamined(0)
+			trace.SetEarlyStopReason("input_exhausted")
+		}
+		return nil, true, nil
+	}
+	if len(leaves) == 1 {
+		if out, ok, err := qv.execSelectedNoOrderSingleNegativeScalarUniverseScan(q, leaves[0], universe, expectedRows, trace); ok || err != nil {
+			return out, ok, err
+		}
+	}
+
+	predsBuf := leafPredSlicePool.Get(len(leaves))
+	for i := range leaves {
+		p, ok, err := qv.buildLimitLeafPred(leaves[i], 0)
+		if err != nil {
+			leafPredSlicePool.Put(predsBuf)
+			return nil, true, err
+		}
+		if !ok {
+			leafPredSlicePool.Put(predsBuf)
+			return nil, false, nil
+		}
+		if p.kind == leafPredKindEmpty {
+			leafPredSlicePool.Put(predsBuf)
+			return nil, true, nil
+		}
+		p.setExpectedContainsCalls(clampUint64ToInt(expectedRows))
+		predsBuf = append(predsBuf, p)
+	}
+	defer leafPredSlicePool.Put(predsBuf)
+
+	var activeBuf [limitQueryFastPathMaxLeaves]int
+	active := activeBuf[:0]
+	var activeHeap []int
+	if len(predsBuf) > limitQueryFastPathMaxLeaves {
+		activeHeap = pooled.GetIntSlice(len(predsBuf))
+		active = activeHeap
+	}
+	for i := 0; i < len(predsBuf); i++ {
+		active = append(active, i)
+	}
+	if activeHeap != nil {
+		defer pooled.ReleaseIntSlice(activeHeap)
+	}
+
+	out := makeOutSlice(expectedRows, q.Limit)
+	cursor := newQueryCursor(out, q.Offset, q.Limit, false, 0)
+	it := universe.Iter()
+	var examined uint64
+	for it.HasNext() {
+		if leafPredsEmitCandidate(&cursor, predsBuf, active, trace, it.Next(), &examined) {
+			it.Release()
+			if trace != nil {
+				trace.AddExamined(examined)
+				trace.SetEarlyStopReason("limit_reached")
+			}
+			return cursor.out, true, nil
+		}
+	}
+	it.Release()
+	if trace != nil {
+		trace.AddExamined(examined)
+		trace.SetEarlyStopReason("input_exhausted")
+	}
+	return cursor.out, true, nil
+}
+
+func (qv *View) execSelectedNoOrderSingleNegativeScalarUniverseScan(q *qir.Shape, e qir.Expr, universe posting.List, expectedRows uint64, trace *Trace) ([]uint64, bool, error) {
+	if !e.Not || e.FieldOrdinal < 0 || len(e.Operands) != 0 {
+		return nil, false, nil
+	}
+	if e.Op != qir.OpEQ && e.Op != qir.OpIN {
+		return nil, false, nil
+	}
+	fm := qv.fieldMetaByExpr(e)
+	if fm == nil || fm.Slice {
+		return nil, false, nil
+	}
+
+	var postsBuf []posting.List
+	switch e.Op {
+	case qir.OpEQ:
+		key, isSlice, isNil, err := qv.exprValueToLookupKey(e)
+		if err != nil {
+			return nil, true, err
+		}
+		if isSlice {
+			return nil, false, nil
+		}
+		var ids posting.List
+		if isNil {
+			ids = qv.fieldIndexViewFromSlotsForExpr(qv.snap.NilIndex, e).LookupPostingRetained(indexdata.NilIndexEntryKey)
+		} else {
+			ids = lookupScalarPostingRetained(qv.fieldIndexViewFromSlotsForExpr(qv.snap.Index, e), key)
+		}
+		if !ids.IsEmpty() {
+			postsBuf = posting.GetSlice(1)
+			postsBuf = append(postsBuf, ids)
+			defer posting.ReleaseSlice(postsBuf)
+		}
+
+	case qir.OpIN:
+		keysBuf, isSlice, hasNil, err := qv.exprValueToDistinctIdxBuf(e)
+		if err != nil {
+			return nil, true, err
+		}
+		if keysBuf != nil {
+			defer pooled.ReleaseStringSlice(keysBuf)
+		}
+		if !isSlice || (len(keysBuf) == 0 && !hasNil) {
+			return nil, false, nil
+		}
+		postsBuf, _ = qv.scalarLookupPostings(qv.exec.FieldNameByOrdinal(e.FieldOrdinal), e.FieldOrdinal, keysBuf, hasNil)
+		if len(postsBuf) > 4 {
+			posting.ReleaseSlice(postsBuf)
+			return nil, false, nil
+		}
+		if postsBuf != nil {
+			defer posting.ReleaseSlice(postsBuf)
+		}
+	}
+
+	out := makeOutSlice(expectedRows, q.Limit)
+	cursor := newQueryCursor(out, q.Offset, q.Limit, false, 0)
+	it := universe.Iter()
+	var examined uint64
+	var cur0, cur1, cur2, cur3 posting.ContainsCursor
+	if len(postsBuf) > 0 {
+		cur0.Reset(postsBuf[0])
+	}
+	if len(postsBuf) > 1 {
+		cur1.Reset(postsBuf[1])
+	}
+	if len(postsBuf) > 2 {
+		cur2.Reset(postsBuf[2])
+	}
+	if len(postsBuf) > 3 {
+		cur3.Reset(postsBuf[3])
+	}
+	for it.HasNext() {
+		idx := it.Next()
+		examined++
+		excluded := false
+		switch len(postsBuf) {
+		case 0:
+		case 1:
+			excluded = cur0.Contains(idx)
+		case 2:
+			excluded = cur0.Contains(idx) || cur1.Contains(idx)
+		case 3:
+			excluded = cur0.Contains(idx) || cur1.Contains(idx) || cur2.Contains(idx)
+		case 4:
+			excluded = cur0.Contains(idx) || cur1.Contains(idx) || cur2.Contains(idx) || cur3.Contains(idx)
+		default:
+			for i := 0; i < len(postsBuf); i++ {
+				if postsBuf[i].Contains(idx) {
+					excluded = true
+					break
+				}
+			}
+		}
+		if excluded {
+			continue
+		}
+		if trace != nil {
+			trace.AddMatched(1)
+		}
+		if cursor.emit(idx) {
+			it.Release()
+			if trace != nil {
+				trace.AddExamined(examined)
+				trace.SetEarlyStopReason("limit_reached")
+			}
+			return cursor.out, true, nil
+		}
+	}
+	it.Release()
+	if trace != nil {
+		trace.AddExamined(examined)
+		trace.SetEarlyStopReason("input_exhausted")
 	}
 	return cursor.out, true, nil
 }
@@ -484,6 +673,25 @@ func (qv *View) runOrderBasicBaseQuery(
 
 	if trace == nil && !base.neg && nilTailField == "" {
 		baseCard := baseBM.Cardinality()
+		if len(residualActive) == 0 {
+			if fm := qv.fieldMetaByOrder(order); fm == nil || !fm.Ptr {
+				keyCount := uint64(ov.KeyCount())
+				dense := baseCard >= (keyCount+3)/4
+				sparseWarm := baseCard > 128 && baseCard <= 512 && keyCount >= baseCard*8
+				if dense || sparseWarm {
+					if q.Offset >= baseCard {
+						return nil, true, nil
+					}
+					need := q.Limit
+					if remaining := baseCard - q.Offset; need > remaining {
+						need = remaining
+					}
+					out := make([]uint64, 0, need)
+					out, _, _ = ov.AppendPostingFilter(out, br, order.Desc, baseBM, q.Offset, need)
+					return out, true, nil
+				}
+			}
+		}
 		if baseCard > 0 && baseCard <= 4096 {
 			out, examined, ok := scanOrderLimitDenseBaseNoTrace(q, ov, br, order.Desc, baseBM, int(baseCard), residualPreds, residualActive)
 			if ok {
@@ -1483,13 +1691,22 @@ dispatch:
 			}
 			return out, true, plan, nil
 		}
-		if trace == nil && q.Offset == 0 && nilTailField == "" && len(baseOps) == 1 {
+		if trace == nil && len(baseOps) == 1 {
 			e := baseOps[0]
-			if !e.Not && e.Op == qir.OpEQ && e.FieldOrdinal >= 0 && len(e.Operands) == 0 {
+			if e.Op == qir.OpEQ && e.FieldOrdinal >= 0 && len(e.Operands) == 0 {
 				residualMeta := qv.fieldMetaByExpr(e)
 				residualView := qv.fieldIndexViewFromSlotsForExpr(qv.snap.Index, e)
-				if residualMeta != nil && !residualMeta.Slice && residualView.HasData() {
-					key, isSlice, isNil, err := qv.exprValueToLookupKey(e)
+				if residualMeta != nil && !residualMeta.Slice && residualView.HasData() && (!e.Not || (!residualMeta.UseVI && !residualMeta.Ptr && residualMeta.Kind == reflect.Bool)) {
+					filterExpr := e
+					if e.Not {
+						v, ok := e.Value.(bool)
+						if !ok {
+							goto orderScanPostingFilterDone
+						}
+						filterExpr.Not = false
+						filterExpr.Value = !v
+					}
+					key, isSlice, isNil, err := qv.exprValueToLookupKey(filterExpr)
 					if err != nil {
 						return nil, true, "", err
 					}
@@ -1502,20 +1719,34 @@ dispatch:
 						if filter.IsEmpty() {
 							return nil, true, plan, nil
 						}
-						out, ok := scanLimitByFieldIndexBoundsPostingFilterNoTrace(q, ov, br, order.Desc, filter, guard)
-						if !ok {
-							if guard.enabled && decision.runtimeFallback.kind != plannerOrderedLimitCandidateNone {
-								selected = decision.runtimeFallback.kind
-								guard = plannerOrderedLimitRuntimeGuard{}
-								goto dispatch
+						if guard.enabled {
+							out, ok := scanLimitByFieldIndexBoundsPostingFilterNoTrace(q, ov, br, order.Desc, filter, guard)
+							if !ok {
+								if decision.runtimeFallback.kind != plannerOrderedLimitCandidateNone {
+									selected = decision.runtimeFallback.kind
+									guard = plannerOrderedLimitRuntimeGuard{}
+									goto dispatch
+								}
+								return qv.dispatchOrderedLimitFallback(q, decision)
 							}
-							return qv.dispatchOrderedLimitFallback(q, decision)
+							if uint64(len(out)) < q.Limit {
+								if nilTailField != "" {
+									goto orderScanPostingFilterDone
+								}
+							}
+							return out, true, plan, nil
+						}
+						out := make([]uint64, 0, q.Limit)
+						out, _, _ = ov.AppendPostingFilter(out, br, order.Desc, filter, q.Offset, q.Limit)
+						if uint64(len(out)) < q.Limit && nilTailField != "" {
+							goto orderScanPostingFilterDone
 						}
 						return out, true, plan, nil
 					}
 				}
 			}
 		}
+	orderScanPostingFilterDone:
 		if q.Offset == 0 || !fm.Ptr || nilTailField != "" {
 			predsBuf, ok, err := qv.buildLeafPredsExcludingBounds(ops, f, needWindow)
 			if err != nil {

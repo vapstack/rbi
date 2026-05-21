@@ -1450,6 +1450,54 @@ func TestBuildPredicatesOrdered_MergesStringScalarRangeBounds(t *testing.T) {
 	}
 }
 
+func TestBuildPredicatesOrdered_MergedStringPrefixPreservesTightenedBounds(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
+	rows := [...]struct {
+		email string
+		score float64
+	}{
+		{"user1@example.com", 1},
+		{"user8@example.com", 2},
+		{"user9@example.com", 3},
+		{"user90@example.com", 4},
+		{"uses0@example.com", 5},
+	}
+	for i := range rows {
+		if err := db.Set(uint64(i+1), &Rec{
+			Name:   rows[i].email,
+			Email:  rows[i].email,
+			Score:  rows[i].score,
+			Active: true,
+		}); err != nil {
+			t.Fatalf("Set(%d): %v", i+1, err)
+		}
+	}
+	if err := db.RebuildIndex(); err != nil {
+		t.Fatalf("RebuildIndex: %v", err)
+	}
+
+	leaves := []qx.Expr{
+		qx.GTE("email", "user"),
+		qx.LT("email", "uses"),
+		qx.GTE("email", "user9"),
+	}
+	preds, ok := db.engine.buildPredicatesOrderedWithMode(leaves, "score", false, 10, 0, true, true)
+	if !ok {
+		t.Fatalf("buildPredicatesOrderedWithMode: ok=false")
+	}
+	defer releasePredicates(preds)
+
+	if len(preds) != 1 {
+		t.Fatalf("expected merged string range predicate, got %d predicates", len(preds))
+	}
+	if !preds[0].matches(3) || !preds[0].matches(4) {
+		t.Fatalf("tightened prefix range should match user9/user90 rows")
+	}
+	if preds[0].matches(1) || preds[0].matches(2) || preds[0].matches(5) {
+		t.Fatalf("tightened prefix range matched rows outside the merged bounds")
+	}
+}
+
 func TestBuildPredicatesOrderedBuf_CoveredExactRangeWarmCacheHitLoadsWhenPredicateStaysLazy(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
 		AnalyzeInterval:                         -1,

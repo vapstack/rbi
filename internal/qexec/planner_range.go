@@ -2,6 +2,7 @@ package qexec
 
 import (
 	"github.com/vapstack/rbi/internal/indexdata"
+	"github.com/vapstack/rbi/internal/keycodec"
 	"github.com/vapstack/rbi/internal/posting"
 	"github.com/vapstack/rbi/internal/qcache"
 	"github.com/vapstack/rbi/internal/qir"
@@ -570,6 +571,7 @@ func (qv *View) collectMergedNumericRangeFields(
 func mergeRangeBounds(dst *indexdata.Bounds, src indexdata.Bounds) {
 	if !dst.Has {
 		*dst = src
+		normalizeAdjacentStringPrefixBounds(dst)
 		return
 	}
 	if src.Empty {
@@ -596,6 +598,112 @@ func mergeRangeBounds(dst *indexdata.Bounds, src indexdata.Bounds) {
 	if src.Has {
 		dst.Has = true
 	}
+	normalizeAdjacentStringPrefixBounds(dst)
+}
+
+func normalizeAdjacentStringPrefixBounds(b *indexdata.Bounds) {
+	if b.Empty || b.HasPrefix || !b.HasLo || !b.HasHi || !b.LoInc || b.HiInc || b.LoNumeric || b.HiNumeric || b.LoKey == "" {
+		return
+	}
+	upper, ok := keycodec.NewPrefixUpperBound(b.LoKey)
+	if !ok || keycodec.CompareStringPrefixUpperBound(b.HiKey, upper) != 0 {
+		return
+	}
+	b.ApplyPrefix(b.LoKey)
+}
+
+func boundsExactStringPrefix(b indexdata.Bounds) bool {
+	if b.Empty || !b.HasPrefix || b.Prefix == "" {
+		return false
+	}
+	if b.HasLo && (b.LoNumeric || !b.LoInc || b.LoKey != b.Prefix) {
+		return false
+	}
+	if !b.HasHi {
+		return true
+	}
+	if b.HiNumeric || b.HiInc {
+		return false
+	}
+	upper, ok := keycodec.NewPrefixUpperBound(b.Prefix)
+	return ok && keycodec.CompareStringPrefixUpperBound(b.HiKey, upper) == 0
+}
+
+func (qv *View) mergeAdjacentStringPrefixLeaves(excludedField string, a, b qir.Expr) (qir.Expr, bool, error) {
+	if a.Not || b.Not ||
+		a.FieldOrdinal < 0 ||
+		a.FieldOrdinal != b.FieldOrdinal ||
+		len(a.Operands) != 0 ||
+		len(b.Operands) != 0 ||
+		!isScalarRangeEqOp(a.Op) ||
+		!isScalarRangeEqOp(b.Op) {
+		return qir.Expr{}, false, nil
+	}
+	if qv.exec.FieldNameByOrdinal(a.FieldOrdinal) == excludedField {
+		return qir.Expr{}, false, nil
+	}
+	fm := qv.fieldMetaByExpr(a)
+	if fm == nil || fm.Slice {
+		return qir.Expr{}, false, nil
+	}
+	if !fm.UseVI && fm.KeyKind == schema.FieldWriteKeysString {
+		lo := ""
+		hi := ""
+		var loValue any
+		if a.Op == qir.OpGTE && b.Op == qir.OpLT {
+			var ok bool
+			lo, ok = a.Value.(string)
+			if ok {
+				hi, ok = b.Value.(string)
+			}
+			if !ok {
+				lo = ""
+			} else {
+				loValue = a.Value
+			}
+		} else if b.Op == qir.OpGTE && a.Op == qir.OpLT {
+			var ok bool
+			lo, ok = b.Value.(string)
+			if ok {
+				hi, ok = a.Value.(string)
+			}
+			if !ok {
+				lo = ""
+			} else {
+				loValue = b.Value
+			}
+		}
+		if lo != "" {
+			upper, ok := keycodec.NewPrefixUpperBound(lo)
+			if ok && keycodec.CompareStringPrefixUpperBound(hi, upper) == 0 {
+				out := a
+				out.Op = qir.OpPREFIX
+				out.Value = loValue
+				return out, true, nil
+			}
+		}
+	}
+	rb0, ok0, err := qv.rangeBoundsForScalarExpr(a)
+	if err != nil {
+		return qir.Expr{}, false, err
+	}
+	rb1, ok1, err := qv.rangeBoundsForScalarExpr(b)
+	if err != nil {
+		return qir.Expr{}, false, err
+	}
+	if !ok0 || !ok1 {
+		return qir.Expr{}, false, nil
+	}
+	var bounds indexdata.Bounds
+	mergeRangeBounds(&bounds, rb0)
+	mergeRangeBounds(&bounds, rb1)
+	if !bounds.HasPrefix || bounds.Prefix == "" {
+		return qir.Expr{}, false, nil
+	}
+	out := a
+	out.Op = qir.OpPREFIX
+	out.Value = bounds.Prefix
+	return out, true, nil
 }
 
 func (core *preparedScalarRangePredicate) runtimeReuse(est uint64, useComplement bool) materializedPredReuse {

@@ -869,6 +869,9 @@ func (bc *containerBitmap) getCardinalityInRange(start, end uint) int {
 	if start >= end {
 		return 0
 	}
+	if start == 0 && end > MaxUint16 {
+		return bc.cardinality
+	}
 	firstWord := start / 64
 	endWord := (end - 1) / 64
 	const allOnes = ^uint64(0)

@@ -168,6 +168,11 @@ func plannerArgminOROrderCandidatesForTest(
 		analysis.mergeStats,
 	)
 	routeCost, routeOK := qv.estimateOROrderMergeRouteCost(q, branches, need, analysis.mergeStats)
+	prefixTailRisk := routeOK && routeCost.hasPrefixTailRisk
+	if prefixTailRisk {
+		candidates.mergeCost *= plannerOROrderExactBucketApplyPenalty(&analysis.mergeStats, branchCount)
+	}
+	candidates.mergeCost *= plannerOROrderPrefixTailRiskPenalty(prefixTailRisk, branchCount, q.Offset)
 	if routeOK &&
 		routeCost.kWay > 0 &&
 		routeCost.kWay < candidates.mergeCost &&

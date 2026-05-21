@@ -216,6 +216,22 @@ type List struct {
 	single uint64
 }
 
+type ContainsCursor struct {
+	kind   uint64
+	single uint64
+	small  *smallPosting
+	mid    *midPosting
+	large  *largePosting
+
+	largeKey uint32
+	largeSet bool
+	rb       *bitmap32
+
+	bitmapKey uint16
+	bitmapSet bool
+	container container16
+}
+
 var singleValue = unsafe.Pointer(new(byte))
 
 const (
@@ -1082,6 +1098,93 @@ func (p List) Contains(id uint64) bool {
 		return false
 	default:
 		return (*largePosting)(p.ptr).contains(id)
+	}
+}
+
+func (c *ContainsCursor) Reset(p List) {
+	*c = ContainsCursor{}
+	if p.ptr == nil {
+		return
+	}
+	if p.ptr == singleValue {
+		c.kind = ^uint64(0)
+		c.single = p.single
+		return
+	}
+	c.kind = p.single & postingMetaKindMask
+	switch c.kind {
+	case postingKindSmall:
+		c.small = (*smallPosting)(p.ptr)
+	case postingKindMid:
+		c.mid = (*midPosting)(p.ptr)
+	default:
+		c.large = (*largePosting)(p.ptr)
+	}
+}
+
+func (c *ContainsCursor) Contains(id uint64) bool {
+	switch c.kind {
+	case ^uint64(0):
+		return c.single == id
+	case postingKindSmall:
+		sp := c.small
+		if sp == nil {
+			return false
+		}
+		for i := 0; i < int(sp.n); i++ {
+			if sp.ids[i] == id {
+				return true
+			}
+			if sp.ids[i] > id {
+				return false
+			}
+		}
+		return false
+	case postingKindMid:
+		mp := c.mid
+		if mp == nil {
+			return false
+		}
+		lo := 0
+		hi := int(mp.n) - 1
+		for lo <= hi {
+			mid := int(uint(lo+hi) >> 1)
+			v := mp.ids[mid]
+			if v < id {
+				lo = mid + 1
+				continue
+			}
+			if v == id {
+				return true
+			}
+			hi = mid - 1
+		}
+		return false
+	case postingKindLarge:
+		lp := c.large
+		if lp == nil {
+			return false
+		}
+		hb64 := highbits64(id)
+		if !c.largeSet || c.largeKey != hb64 {
+			c.largeKey = hb64
+			c.largeSet = true
+			c.rb = lp.highlowcontainer.getContainer(hb64)
+			c.bitmapSet = false
+		}
+		if c.rb == nil {
+			return false
+		}
+		x := lowbits64(id)
+		hb := highbits(x)
+		if !c.bitmapSet || c.bitmapKey != hb {
+			c.bitmapKey = hb
+			c.bitmapSet = true
+			c.container = c.rb.highlowcontainer.getContainer(hb)
+		}
+		return c.container != nil && c.container.contains(lowbits(x))
+	default:
+		return false
 	}
 }
 

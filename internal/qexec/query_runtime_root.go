@@ -250,12 +250,14 @@ func (qv *View) queryMaterialized(q *qir.Shape) ([]uint64, error) {
 		cursor := newQueryCursor(out, skip, need, needAll, 0)
 
 		ex := result.ids
+		var exCur posting.ContainsCursor
+		exCur.Reset(ex)
 		universe := qv.snap.Universe.Borrow()
 		it := universe.Iter()
 		defer it.Release()
 		for it.HasNext() {
 			idx := it.Next()
-			if ex.Contains(idx) {
+			if exCur.Contains(idx) {
 				continue
 			}
 			if cursor.emit(idx) {

@@ -204,8 +204,8 @@ func TestPlannerShadow_OrderedOR_MergeVsFallback(t *testing.T) {
 	chosen := h.run("shadow_or_order_stream_chosen", func(view *View, viewQ *qir.Shape, trace *Trace) ([]uint64, bool, error) {
 		return view.executeOR(viewQ, trace)
 	})
-	if chosen.trace.Plan != string(PlanORMergeOrderMerge) {
-		t.Fatalf("expected chosen ordered OR plan %q, got %q", PlanORMergeOrderMerge, chosen.trace.Plan)
+	if chosen.trace.Plan != string(PlanORMergeOrderMerge) && chosen.trace.Plan != string(PlanORMergeOrderStream) {
+		t.Fatalf("expected chosen ordered OR plan %q or %q, got %q", PlanORMergeOrderMerge, PlanORMergeOrderStream, chosen.trace.Plan)
 	}
 
 	fallback := h.run("shadow_or_order_fallback", func(view *View, viewQ *qir.Shape, trace *Trace) ([]uint64, bool, error) {

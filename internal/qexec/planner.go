@@ -332,49 +332,49 @@ func (b *plannerORBranch) matchesChecks(idx uint64, checks []int) bool {
 		return true
 
 	case 1:
-		p0 := b.predPtr(checks[0])
-		return !p0.alwaysFalse && p0.hasContains() && p0.matches(idx)
+		p0 := &b.preds.owner[checks[0]]
+		return p0.matches(idx)
 
 	case 2:
-		p0 := b.predPtr(checks[0])
-		if p0.alwaysFalse || !p0.hasContains() || !p0.matches(idx) {
+		p0 := &b.preds.owner[checks[0]]
+		if !p0.matches(idx) {
 			return false
 		}
-		p1 := b.predPtr(checks[1])
-		return !p1.alwaysFalse && p1.hasContains() && p1.matches(idx)
+		p1 := &b.preds.owner[checks[1]]
+		return p1.matches(idx)
 
 	case 3:
-		p0 := b.predPtr(checks[0])
-		if p0.alwaysFalse || !p0.hasContains() || !p0.matches(idx) {
+		p0 := &b.preds.owner[checks[0]]
+		if !p0.matches(idx) {
 			return false
 		}
-		p1 := b.predPtr(checks[1])
-		if p1.alwaysFalse || !p1.hasContains() || !p1.matches(idx) {
+		p1 := &b.preds.owner[checks[1]]
+		if !p1.matches(idx) {
 			return false
 		}
-		p2 := b.predPtr(checks[2])
-		return !p2.alwaysFalse && p2.hasContains() && p2.matches(idx)
+		p2 := &b.preds.owner[checks[2]]
+		return p2.matches(idx)
 
 	case 4:
-		p0 := b.predPtr(checks[0])
-		if p0.alwaysFalse || !p0.hasContains() || !p0.matches(idx) {
+		p0 := &b.preds.owner[checks[0]]
+		if !p0.matches(idx) {
 			return false
 		}
-		p1 := b.predPtr(checks[1])
-		if p1.alwaysFalse || !p1.hasContains() || !p1.matches(idx) {
+		p1 := &b.preds.owner[checks[1]]
+		if !p1.matches(idx) {
 			return false
 		}
-		p2 := b.predPtr(checks[2])
-		if p2.alwaysFalse || !p2.hasContains() || !p2.matches(idx) {
+		p2 := &b.preds.owner[checks[2]]
+		if !p2.matches(idx) {
 			return false
 		}
-		p3 := b.predPtr(checks[3])
-		return !p3.alwaysFalse && p3.hasContains() && p3.matches(idx)
+		p3 := &b.preds.owner[checks[3]]
+		return p3.matches(idx)
 	}
 
 	for _, i := range checks {
-		p := b.predPtr(i)
-		if p.alwaysFalse || !p.hasContains() || !p.matches(idx) {
+		p := &b.preds.owner[i]
+		if !p.matches(idx) {
 			return false
 		}
 	}
@@ -398,71 +398,71 @@ func (b *plannerORBranch) matchesChecksObservedBuf(idx uint64, branch int, check
 		if observed != nil && observed.candidatesBuf[offset] {
 			observed.countsBuf[offset]++
 		}
-		p0 := b.predPtr(checks[0])
-		return !p0.alwaysFalse && p0.hasContains() && p0.matches(idx)
+		p0 := &b.preds.owner[checks[0]]
+		return p0.matches(idx)
 
 	case 2:
 		if observed != nil && observed.candidatesBuf[offset] {
 			observed.countsBuf[offset]++
 		}
-		p0 := b.predPtr(checks[0])
-		if p0.alwaysFalse || !p0.hasContains() || !p0.matches(idx) {
+		p0 := &b.preds.owner[checks[0]]
+		if !p0.matches(idx) {
 			return false
 		}
 		if observed != nil && observed.candidatesBuf[offset+1] {
 			observed.countsBuf[offset+1]++
 		}
-		p1 := b.predPtr(checks[1])
-		return !p1.alwaysFalse && p1.hasContains() && p1.matches(idx)
+		p1 := &b.preds.owner[checks[1]]
+		return p1.matches(idx)
 
 	case 3:
 		if observed != nil && observed.candidatesBuf[offset] {
 			observed.countsBuf[offset]++
 		}
-		p0 := b.predPtr(checks[0])
-		if p0.alwaysFalse || !p0.hasContains() || !p0.matches(idx) {
+		p0 := &b.preds.owner[checks[0]]
+		if !p0.matches(idx) {
 			return false
 		}
 		if observed != nil && observed.candidatesBuf[offset+1] {
 			observed.countsBuf[offset+1]++
 		}
-		p1 := b.predPtr(checks[1])
-		if p1.alwaysFalse || !p1.hasContains() || !p1.matches(idx) {
+		p1 := &b.preds.owner[checks[1]]
+		if !p1.matches(idx) {
 			return false
 		}
 		if observed != nil && observed.candidatesBuf[offset+2] {
 			observed.countsBuf[offset+2]++
 		}
-		p2 := b.predPtr(checks[2])
-		return !p2.alwaysFalse && p2.hasContains() && p2.matches(idx)
+		p2 := &b.preds.owner[checks[2]]
+		return p2.matches(idx)
 
 	case 4:
 		if observed != nil && observed.candidatesBuf[offset] {
 			observed.countsBuf[offset]++
 		}
-		p0 := b.predPtr(checks[0])
-		if p0.alwaysFalse || !p0.hasContains() || !p0.matches(idx) {
+		p0 := &b.preds.owner[checks[0]]
+		if !p0.matches(idx) {
 			return false
 		}
 		if observed != nil && observed.candidatesBuf[offset+1] {
 			observed.countsBuf[offset+1]++
 		}
-		p1 := b.predPtr(checks[1])
-		if p1.alwaysFalse || !p1.hasContains() || !p1.matches(idx) {
+		p1 := &b.preds.owner[checks[1]]
+		if !p1.matches(idx) {
 			return false
 		}
 		if observed != nil && observed.candidatesBuf[offset+2] {
 			observed.countsBuf[offset+2]++
 		}
-		p2 := b.predPtr(checks[2])
-		if p2.alwaysFalse || !p2.hasContains() || !p2.matches(idx) {
+		p2 := &b.preds.owner[checks[2]]
+		if !p2.matches(idx) {
 			return false
 		}
 		if observed != nil && observed.candidatesBuf[offset+3] {
 			observed.countsBuf[offset+3]++
 		}
-		p3 := b.predPtr(checks[3])
-		return !p3.alwaysFalse && p3.hasContains() && p3.matches(idx)
+		p3 := &b.preds.owner[checks[3]]
+		return p3.matches(idx)
 	}
 
 	for ci, check := range checks {
@@ -470,8 +470,8 @@ func (b *plannerORBranch) matchesChecksObservedBuf(idx uint64, branch int, check
 			slot := offset + ci
 			observed.countsBuf[slot]++
 		}
-		p := b.predPtr(check)
-		if p.alwaysFalse || !p.hasContains() || !p.matches(idx) {
+		p := &b.preds.owner[check]
+		if !p.matches(idx) {
 			return false
 		}
 	}
@@ -1154,7 +1154,7 @@ func (qv *View) estimateOROrderMergeRouteCost(
 	}
 
 	snap := qv.exec.Stats.Load()
-	universe := snap.UniverseOr(qv.snap.Universe.Cardinality())
+	universe := qv.plannerUniverseCardinality(snap)
 	if universe == 0 {
 		return plannerOROrderRouteCost{}, false
 	}
@@ -1462,7 +1462,7 @@ func (qv *View) collectORFacts(q *qir.Shape, facts *plannerORFacts) bool {
 	facts.operandCount = len(q.Expr.Operands)
 
 	snap := qv.exec.Stats.Load()
-	facts.universe = snap.UniverseOr(qv.snap.Universe.Cardinality())
+	facts.universe = qv.plannerUniverseCardinality(snap)
 
 	if !q.HasOrder {
 		return qv.collectORBranchFacts(q, facts, snap)
@@ -1861,6 +1861,11 @@ func (qv *View) selectOROrder(q *qir.Shape, facts *plannerORFacts) plannerOROrde
 	mergeAllowed := !facts.hasAlwaysTrue && need <= mergeNeedLimit
 	if mergeAllowed {
 		costMerge := facts.orderMergeCost(uint64(need))
+		prefixTailRisk := routeOK && routeCost.hasPrefixTailRisk
+		if prefixTailRisk {
+			costMerge *= plannerOROrderExactBucketApplyPenalty(&facts.mergeStats, facts.branchCount)
+		}
+		costMerge *= plannerOROrderPrefixTailRiskPenalty(prefixTailRisk, facts.branchCount, q.Offset)
 		if routeOK && routeCost.kWay > 0 && routeCost.kWay < costMerge &&
 			facts.hasFullSpanOrderBranch() &&
 			!routeCost.hasPrefixTailRisk &&
@@ -1958,6 +1963,33 @@ func (facts *plannerORFacts) hasKWayExactBucketApplyWork() bool {
 		}
 	}
 	return false
+}
+
+func plannerOROrderExactBucketApplyPenalty(stats *[plannerORBranchLimit]plannerOROrderMergeBranchStats, branchCount int) float64 {
+	exactOnly := 0
+	active := 0
+	for i := 0; i < branchCount && i < plannerORBranchLimit; i++ {
+		streamChecks := stats[i].streamChecks
+		mergeChecks := stats[i].mergeChecks
+		if streamChecks == 0 && mergeChecks == 0 {
+			continue
+		}
+		active++
+		if streamChecks > mergeChecks {
+			exactOnly += streamChecks - mergeChecks
+		}
+	}
+	if exactOnly == 0 || active == 0 {
+		return 1
+	}
+	return 1 + float64(exactOnly)*2.4/float64(active)
+}
+
+func plannerOROrderPrefixTailRiskPenalty(hasPrefixTailRisk bool, branchCount int, offset uint64) float64 {
+	if !hasPrefixTailRisk || offset != 0 || branchCount <= 0 {
+		return 1
+	}
+	return 1 + float64(branchCount)*0.09
 }
 
 func (facts *plannerORFacts) hasSelectiveLead(need int) bool {
@@ -2190,6 +2222,12 @@ func (qv *View) dispatchOR(
 	decision plannerORDecision,
 	trace *Trace,
 ) ([]uint64, bool, error) {
+	facts.branches.Release()
+	if facts.hasAnalysis {
+		facts.analysis.release()
+		facts.hasAnalysis = false
+	}
+
 	if decision.kind == plannerORDecisionAlwaysFalse {
 		return nil, true, nil
 	}
@@ -2263,15 +2301,20 @@ func (qv *View) dispatchOR(
 			return nil, true, nil
 		}
 		facts.branches = branches
-		analysis, ok := qv.buildOROrderAnalysis(q, branches)
-		if !ok {
-			return qv.dispatchORFallback(q, decision, trace)
+		if selected == plannerOROrderCandidateKWayMerge || q.Offset > 0 {
+			analysis, ok := qv.buildOROrderAnalysis(q, branches)
+			if !ok {
+				return qv.dispatchORFallback(q, decision, trace)
+			}
+			facts.analysis = analysis
+			facts.hasAnalysis = true
 		}
-		facts.analysis = analysis
-		facts.hasAnalysis = true
 	}
 	branches := facts.branches
-	analysis := &facts.analysis
+	var analysis *plannerOROrderAnalysis
+	if facts.hasAnalysis {
+		analysis = &facts.analysis
+	}
 	switch selected {
 
 	case plannerOROrderCandidateKWayMerge:
@@ -2317,12 +2360,7 @@ func (qv *View) dispatchOR(
 		if q.Offset > 0 {
 			qv.maybeEagerMaterializeOrderedORPredicates(q, branches, analysis, false, trace)
 		}
-		var observed orderedORObservedStats
 		var observe *orderedORObservedStats
-		if trace == nil {
-			observe = &observed
-			defer observed.release()
-		}
 		out, ok := qv.execPlanOROrderBasic(q, branches, analysis, trace, observe)
 		if !ok {
 			return qv.dispatchORFallback(q, decision, trace)
@@ -4803,8 +4841,7 @@ func (it *plannerOROrderBranchIter) matchesChecks(idx uint64, checks []int, sing
 		return true
 	}
 	if single >= 0 {
-		p := it.branch.predPtr(single)
-		return !p.alwaysFalse && p.hasContains() && p.matches(idx)
+		return it.branch.preds.owner[single].matches(idx)
 	}
 	return it.branch.matchesChecks(idx, checks)
 }

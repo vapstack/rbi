@@ -408,10 +408,12 @@ func (qv *View) orderedLimitOrderScanCost(
 		}
 	}
 	if pureOrder {
-		_, rows := ov.RangeStats(br)
 		expectedRows := uint64(needWindow)
-		if rows > 0 && expectedRows > rows {
-			expectedRows = rows
+		if br.BaseStart != 0 || br.BaseEnd != ov.KeyCount() {
+			_, rows := ov.RangeStats(br)
+			if rows > 0 && expectedRows > rows {
+				expectedRows = rows
+			}
 		}
 		buckets := uint64(ov.KeyCount())
 		if !br.Empty() && br.BaseEnd >= br.BaseStart {
@@ -443,7 +445,19 @@ func (qv *View) orderedLimitOrderScanCost(
 		cost = float64(expectedRows) * (1.0 + float64(len(leaves))*0.75)
 	}
 
-	_, orderRows := ov.RangeStats(br)
+	var orderRows uint64
+	if br.BaseStart == 0 && br.BaseEnd == ov.KeyCount() {
+		snap := qv.exec.Stats.Load()
+		stats := qv.plannerOrderFieldStats(
+			qv.exec.FieldNameByOrdinal(q.Order.FieldOrdinal),
+			snap,
+			qv.plannerUniverseCardinality(snap),
+			uint64(ov.KeyCount()),
+		)
+		orderRows = stats.TotalBucketCard
+	} else {
+		_, orderRows = ov.RangeStats(br)
+	}
 	if expectedRows == 0 || (orderRows > 0 && expectedRows > orderRows) {
 		expectedRows = orderRows
 	}
@@ -833,6 +847,22 @@ func (qv *View) collectOrderedLimitFacts(
 	}
 
 	facts.bounds = rb
+	if len(facts.baseOps) == 2 {
+		prefixExpr, merged, err := qv.mergeAdjacentStringPrefixLeaves(facts.orderField, facts.baseOps[0], facts.baseOps[1])
+		if err != nil {
+			return true, err
+		}
+		if merged {
+			if orderFirst < 0 {
+				facts.opsBuf = append(facts.opsBuf[:0], prefixExpr)
+				facts.ops = facts.opsBuf
+				facts.baseOps = facts.ops
+			} else {
+				facts.baseOpsBuf = append(facts.baseOpsBuf[:0], prefixExpr)
+				facts.baseOps = facts.baseOpsBuf
+			}
+		}
+	}
 
 	if orderEqNilConflict {
 		facts.empty = true
@@ -890,34 +920,6 @@ func (qv *View) selectOrderedLimit(
 	var candidates [7]plannerOrderedLimitCandidate
 	n := 0
 
-	snap := qv.exec.Stats.Load()
-	universe := snap.UniverseOr(qv.snap.Universe.Cardinality())
-	baseSupported := true
-	emptySupported := false
-	for i := 0; i < len(facts.baseOps); i++ {
-		e := facts.baseOps[i]
-		if !qv.supportsLimitLeafPredExpr(e) {
-			baseSupported = false
-		}
-		sel, _, _, _, ok := qv.estimateLeafOrderCost(e, snap, universe, facts.orderField, facts.ov.HasData())
-		if !ok {
-			baseSupported = false
-			continue
-		}
-		if !e.Not && sel == 0 {
-			emptySupported = true
-			continue
-		}
-	}
-	if emptySupported && baseSupported {
-		return plannerOrderedLimitDecision{
-			selected: plannerOrderedLimitCandidate{
-				kind: plannerOrderedLimitCandidateEmpty,
-				cost: 1,
-			},
-		}, true, nil
-	}
-
 	if q.Offset == 0 && facts.bounds.HasPrefix && len(facts.baseOps) > 0 && len(facts.baseOps) <= 2 {
 		fastPrefix := true
 		for i := 0; i < len(facts.baseOps); i++ {
@@ -933,19 +935,14 @@ func (qv *View) selectOrderedLimit(
 			}
 		}
 		if fastPrefix {
-			expectedRows := uint64(facts.needWindow)
-			_, rows := facts.ov.RangeStats(facts.br)
-			if rows > 0 && expectedRows > rows {
-				expectedRows = rows
-			}
 			buckets := uint64(0)
 			if !facts.br.Empty() && facts.br.BaseEnd >= facts.br.BaseStart {
 				buckets = uint64(facts.br.BaseEnd - facts.br.BaseStart)
 			}
 			orderScan := plannerOrderedLimitCandidate{
 				kind:         plannerOrderedLimitCandidateOrderScan,
-				cost:         float64(expectedRows) * (1.0 + float64(len(facts.baseOps))*0.35),
-				expectedRows: expectedRows,
+				cost:         float64(facts.needWindow) * (1.0 + float64(len(facts.baseOps))*0.35),
+				expectedRows: uint64(facts.needWindow),
 				buckets:      buckets,
 				checks:       uint64(len(facts.baseOps)),
 				cacheState:   plannerMaterializedCacheDisabled,
@@ -958,6 +955,36 @@ func (qv *View) selectOrderedLimit(
 				rejected:             fallback,
 			}, true, nil
 		}
+	}
+
+	baseSupported := true
+	emptySupported := false
+	if len(facts.baseOps) != 0 {
+		snap := qv.exec.Stats.Load()
+		universe := qv.plannerUniverseCardinality(snap)
+		for i := 0; i < len(facts.baseOps); i++ {
+			e := facts.baseOps[i]
+			if !qv.supportsLimitLeafPredExpr(e) {
+				baseSupported = false
+			}
+			sel, _, _, _, ok := qv.estimateLeafOrderCost(e, snap, universe, facts.orderField, facts.ov.HasData())
+			if !ok {
+				baseSupported = false
+				continue
+			}
+			if !e.Not && sel == 0 {
+				emptySupported = true
+				continue
+			}
+		}
+	}
+	if emptySupported && baseSupported {
+		return plannerOrderedLimitDecision{
+			selected: plannerOrderedLimitCandidate{
+				kind: plannerOrderedLimitCandidateEmpty,
+				cost: 1,
+			},
+		}, true, nil
 	}
 
 	var orderedDecision plannerOrderedDecision

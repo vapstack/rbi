@@ -3200,6 +3200,57 @@ func (qv *View) buildPredicatesOrderedWithMode(
 					if merged.first != i {
 						continue
 					}
+					if boundsExactStringPrefix(merged.bounds) {
+						prefixExpr := merged.expr
+						prefixExpr.Op = qir.OpPREFIX
+						prefixExpr.Value = merged.bounds.Prefix
+
+						predAllowMaterialize := allowMaterialize
+						orderedRoute := qv.orderedScalarRangeRoutingForBuild(
+							predicate{expr: prefixExpr},
+							predAllowMaterialize,
+							orderedWindow,
+							orderedOffset,
+							universe,
+							routeUniverse,
+						)
+
+						orderedEagerMaterialize := false
+						if !predAllowMaterialize &&
+							allowOrderedEagerMaterialize &&
+							!qv.orderedScalarRangeHasWarmComplement(orderedRoute) &&
+							qv.orderedScalarRangeCanEagerMaterialize(orderedRoute) {
+							predAllowMaterialize = true
+							orderedEagerMaterialize = true
+						}
+
+						lazyColdMaterialize := predAllowMaterialize && !orderedRoute.eagerMaterialize
+						p, ok := qv.buildPredicateWithColdModeAndWarmLoad(
+							prefixExpr,
+							predAllowMaterialize,
+							lazyColdMaterialize,
+							allowWarmScalarRangeLoad,
+						)
+						if !ok {
+							preds.Release()
+							return predicateSet{}, false
+						}
+						p.hasEffectiveBounds = true
+						p.effectiveBounds = merged.bounds
+
+						qv.postprocessBuiltOrderedPredicate(
+							&p,
+							orderedRoute,
+							predAllowMaterialize,
+							orderedEagerMaterialize,
+							false,
+							allowWarmOrderedRangeLoad,
+							orderedWindow,
+							universe,
+						)
+						preds.Append(p)
+						continue
+					}
 					mergedPred := predicate{
 						expr:               merged.expr,
 						hasEffectiveBounds: true,

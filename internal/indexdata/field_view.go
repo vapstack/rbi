@@ -848,6 +848,256 @@ func (c *FieldIndexCursor) NextPostingOrSingle() (posting.List, uint64, bool, bo
 	return ent.IDs.Borrow(), 0, false, true
 }
 
+func (o FieldIndexView) AppendPostingFilter(out []uint64, br FieldIndexRange, desc bool, filter posting.List, offset, limit uint64) ([]uint64, uint64, bool) {
+	if filter.IsEmpty() || br.Empty() || limit == 0 {
+		return out, 0, true
+	}
+
+	need := limit
+	skip := offset
+	var examined uint64
+	var filterCur posting.ContainsCursor
+	filterCur.Reset(filter)
+
+	if o.chunked == nil {
+		if desc {
+			for i := br.BaseEnd - 1; i >= br.BaseStart; i-- {
+				ids := o.base[i].IDs.Borrow()
+				if idx, ok := ids.TrySingle(); ok {
+					examined++
+					if filterCur.Contains(idx) {
+						if skip > 0 {
+							skip--
+						} else {
+							out = append(out, idx)
+							need--
+							if need == 0 {
+								return out, examined, true
+							}
+						}
+					}
+					if i == br.BaseStart {
+						break
+					}
+					continue
+				}
+				it := ids.Iter()
+				for it.HasNext() {
+					idx := it.Next()
+					examined++
+					if !filterCur.Contains(idx) {
+						continue
+					}
+					if skip > 0 {
+						skip--
+						continue
+					}
+					out = append(out, idx)
+					need--
+					if need == 0 {
+						it.Release()
+						return out, examined, true
+					}
+				}
+				it.Release()
+				if i == br.BaseStart {
+					break
+				}
+			}
+			return out, examined, true
+		}
+		for i := br.BaseStart; i < br.BaseEnd; i++ {
+			ids := o.base[i].IDs.Borrow()
+			if idx, ok := ids.TrySingle(); ok {
+				examined++
+				if filterCur.Contains(idx) {
+					if skip > 0 {
+						skip--
+					} else {
+						out = append(out, idx)
+						need--
+						if need == 0 {
+							return out, examined, true
+						}
+					}
+				}
+				continue
+			}
+			it := ids.Iter()
+			for it.HasNext() {
+				idx := it.Next()
+				examined++
+				if !filterCur.Contains(idx) {
+					continue
+				}
+				if skip > 0 {
+					skip--
+					continue
+				}
+				out = append(out, idx)
+				need--
+				if need == 0 {
+					it.Release()
+					return out, examined, true
+				}
+			}
+			it.Release()
+		}
+		return out, examined, true
+	}
+
+	c := o.NewCursor(br, desc)
+	if desc {
+		for c.remaining > 0 && c.chunk != nil {
+			chunk := c.chunk
+			n := c.entryIdx + 1
+			if n > c.remaining {
+				n = c.remaining
+			}
+			end := c.entryIdx - n + 1
+			if chunk.posts == nil {
+				for i := c.entryIdx; ; i-- {
+					var idx uint64
+					if chunk.stringRefs != nil {
+						idx = chunk.numeric[i]
+					} else {
+						idx = chunk.numeric[(i<<1)+1]
+					}
+					examined++
+					if filterCur.Contains(idx) {
+						if skip > 0 {
+							skip--
+						} else {
+							out = append(out, idx)
+							need--
+							if need == 0 {
+								return out, examined, true
+							}
+						}
+					}
+					if i == end {
+						break
+					}
+				}
+			} else {
+				for i := c.entryIdx; ; i-- {
+					ids := chunk.posts[i].Borrow()
+					it := ids.Iter()
+					for it.HasNext() {
+						idx := it.Next()
+						examined++
+						if !filterCur.Contains(idx) {
+							continue
+						}
+						if skip > 0 {
+							skip--
+							continue
+						}
+						out = append(out, idx)
+						need--
+						if need == 0 {
+							it.Release()
+							return out, examined, true
+						}
+					}
+					it.Release()
+					if i == end {
+						break
+					}
+				}
+			}
+			c.remaining -= n
+			if c.remaining <= 0 {
+				break
+			}
+			c.chunkIdx--
+			if c.refIdx > 0 {
+				c.refIdx--
+			} else {
+				c.pageIdx--
+				if c.pageIdx < 0 {
+					break
+				}
+				c.refIdx = len(c.chunked.pages[c.pageIdx].refs) - 1
+			}
+			c.chunk = c.chunked.pages[c.pageIdx].refs[c.refIdx].chunk
+			c.entryIdx = c.chunk.keyCount() - 1
+		}
+		return out, examined, true
+	}
+
+	for c.remaining > 0 && c.chunk != nil {
+		chunk := c.chunk
+		n := chunk.keyCount() - c.entryIdx
+		if n > c.remaining {
+			n = c.remaining
+		}
+		end := c.entryIdx + n
+		if chunk.posts == nil {
+			for i := c.entryIdx; i < end; i++ {
+				var idx uint64
+				if chunk.stringRefs != nil {
+					idx = chunk.numeric[i]
+				} else {
+					idx = chunk.numeric[(i<<1)+1]
+				}
+				examined++
+				if !filterCur.Contains(idx) {
+					continue
+				}
+				if skip > 0 {
+					skip--
+					continue
+				}
+				out = append(out, idx)
+				need--
+				if need == 0 {
+					return out, examined, true
+				}
+			}
+		} else {
+			for i := c.entryIdx; i < end; i++ {
+				ids := chunk.posts[i].Borrow()
+				it := ids.Iter()
+				for it.HasNext() {
+					idx := it.Next()
+					examined++
+					if !filterCur.Contains(idx) {
+						continue
+					}
+					if skip > 0 {
+						skip--
+						continue
+					}
+					out = append(out, idx)
+					need--
+					if need == 0 {
+						it.Release()
+						return out, examined, true
+					}
+				}
+				it.Release()
+			}
+		}
+		c.remaining -= n
+		if c.remaining <= 0 {
+			break
+		}
+		c.chunkIdx++
+		c.refIdx++
+		if c.refIdx >= len(c.chunked.pages[c.pageIdx].refs) {
+			c.pageIdx++
+			if c.pageIdx >= len(c.chunked.pages) {
+				break
+			}
+			c.refIdx = 0
+		}
+		c.chunk = c.chunked.pages[c.pageIdx].refs[c.refIdx].chunk
+		c.entryIdx = 0
+	}
+	return out, examined, true
+}
+
 func lowerBoundIndex(s []Entry, key string) int {
 	lo, hi := 0, len(s)
 	for lo < hi {

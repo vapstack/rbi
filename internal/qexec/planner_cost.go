@@ -18,6 +18,13 @@ const (
 	plannerORBranchFallbackDiv = 32
 )
 
+func (qv *View) plannerUniverseCardinality(snap *PlannerStatsSnapshot) uint64 {
+	if snap != nil && snap.UniverseCardinality > 0 {
+		return snap.UniverseCardinality
+	}
+	return qv.snap.Universe.Cardinality()
+}
+
 type plannerOROrderPlan int
 
 const (
@@ -460,7 +467,7 @@ func (qv *View) selectPlanORNoOrder(q *qir.Shape, branches plannerORBranches) pl
 	}
 
 	snap := qv.exec.Stats.Load()
-	universe := snap.UniverseOr(qv.snap.Universe.Cardinality())
+	universe := qv.plannerUniverseCardinality(snap)
 	if universe == 0 {
 		return plannerORNoOrderDecision{}
 	}
@@ -834,6 +841,11 @@ func (qv *View) selectPlanOROrderWithAnalysis(
 	mergeAllowed := !hasAlwaysTrue && need <= mergeNeedLimit
 	if mergeAllowed {
 		costMerge := branches.orderMergeCost(uint64(need), &branchCards, branchCount, unionCard, sumCard, universe, orderStats, analysis.mergeStats)
+		prefixTailRisk := routeOK && routeCost.hasPrefixTailRisk
+		if prefixTailRisk {
+			costMerge *= plannerOROrderExactBucketApplyPenalty(&analysis.mergeStats, branchCount)
+		}
+		costMerge *= plannerOROrderPrefixTailRiskPenalty(prefixTailRisk, branchCount, q.Offset)
 		if routeOK && routeCost.kWay > 0 && routeCost.kWay < costMerge &&
 			branches.hasFullSpanOrderBranch(analysis.mergeStats) &&
 			!routeCost.hasPrefixTailRisk &&
@@ -1447,6 +1459,7 @@ type plannerOrderedProfile struct {
 	orderRangeLeaves int
 	baseWorkRows     float64
 	baseRangeLeaves  int
+	basePrefixLeaves int
 }
 
 type plannerOrderedDecision struct {
@@ -1646,7 +1659,7 @@ func (qv *View) decideExecutionOrderByCost(q *qir.Shape, leaves []qir.Expr) plan
 	}
 
 	snap := qv.exec.Stats.Load()
-	universe := snap.UniverseOr(qv.snap.Universe.Cardinality())
+	universe := qv.plannerUniverseCardinality(snap)
 	if universe == 0 {
 		return d
 	}
@@ -1708,6 +1721,15 @@ func (qv *View) decideExecutionOrderByCost(q *qir.Shape, leaves []qir.Expr) plan
 			baseWorkCost *= 1.10
 		}
 		executionCost += baseWorkCost
+	}
+	if profile.baseWorkRows > 0 &&
+		(profile.baseRangeLeaves > 0 || profile.basePrefixLeaves > 0) &&
+		profile.baseWorkRows <= expectedProbeRows*2.0 {
+		probeAmp := expectedProbeRows / profile.baseWorkRows
+		if probeAmp > 4.0 {
+			probeAmp = 4.0
+		}
+		executionCost *= 1.0 + probeAmp*1.20
 	}
 
 	d.expectedProbeRows = uint64(expectedProbeRows)
@@ -1964,7 +1986,7 @@ func (qv *View) decideOrderedByCost(q *qir.Shape, leaves []qir.Expr) plannerOrde
 	}
 
 	snap := qv.exec.Stats.Load()
-	universe := snap.UniverseOr(qv.snap.Universe.Cardinality())
+	universe := qv.plannerUniverseCardinality(snap)
 	if universe == 0 {
 		return d
 	}
@@ -2254,6 +2276,7 @@ func (qv *View) estimateOrderedProfileIndexView(orderField string, leaves []qir.
 	orderRangeLeaves := 0
 	baseWork := 0.0
 	baseRangeLeaves := 0
+	basePrefixLeaves := 0
 	orderHasBuckets := totalBuckets > 0
 
 	var mergedBaseRangesArr [plannerOrderedLeafMax]mergedBaseScalarRangeField
@@ -2282,6 +2305,7 @@ func (qv *View) estimateOrderedProfileIndexView(orderField string, leaves []qir.
 				orderRangeLeaves: orderRangeLeaves + btoi(leafOrderRange),
 				baseWorkRows:     baseWork,
 				baseRangeLeaves:  baseRangeLeaves,
+				basePrefixLeaves: basePrefixLeaves,
 			}, true
 		}
 
@@ -2309,7 +2333,10 @@ func (qv *View) estimateOrderedProfileIndexView(orderField string, leaves []qir.
 		}
 		activeChecks++
 		baseWork += leafWork
-		if isBoundOp(e.Op) && qv.exec.FieldNameByOrdinal(e.FieldOrdinal) != orderField {
+		fieldName := qv.exec.FieldNameByOrdinal(e.FieldOrdinal)
+		if e.Op == qir.OpPREFIX && fieldName != orderField {
+			basePrefixLeaves++
+		} else if isBoundOp(e.Op) && fieldName != orderField {
 			baseRangeLeaves++
 		}
 	}
@@ -2331,6 +2358,7 @@ func (qv *View) estimateOrderedProfileIndexView(orderField string, leaves []qir.
 				orderRangeLeaves: orderRangeLeaves,
 				baseWorkRows:     baseWork,
 				baseRangeLeaves:  baseRangeLeaves,
+				basePrefixLeaves: basePrefixLeaves,
 			}, true
 		}
 		selProd *= leafSel
@@ -2340,7 +2368,12 @@ func (qv *View) estimateOrderedProfileIndexView(orderField string, leaves []qir.
 		fallbackWork += leafWork
 		activeChecks++
 		baseWork += leafWork
-		baseRangeLeaves++
+		if merged.bounds.HasPrefix {
+			hasPrefix = true
+			basePrefixLeaves++
+		} else {
+			baseRangeLeaves++
+		}
 	}
 
 	selectivity := selProd
@@ -2370,6 +2403,7 @@ func (qv *View) estimateOrderedProfileIndexView(orderField string, leaves []qir.
 		orderRangeLeaves: orderRangeLeaves,
 		baseWorkRows:     baseWork,
 		baseRangeLeaves:  baseRangeLeaves,
+		basePrefixLeaves: basePrefixLeaves,
 	}, true
 }
 

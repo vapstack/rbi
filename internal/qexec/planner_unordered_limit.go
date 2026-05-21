@@ -18,6 +18,7 @@ const (
 	plannerNoOrderLimitCandidateDirectPrefix
 	plannerNoOrderLimitCandidateDirectRange
 	plannerNoOrderLimitCandidateSameFieldBounds
+	plannerNoOrderLimitCandidateUniverseScan
 	plannerNoOrderLimitCandidateLeadScan
 	plannerNoOrderLimitCandidateMaterializedFallback
 )
@@ -36,6 +37,8 @@ func (k plannerNoOrderLimitCandidateKind) String() string {
 		return "direct_range"
 	case plannerNoOrderLimitCandidateSameFieldBounds:
 		return "same_field_bounds"
+	case plannerNoOrderLimitCandidateUniverseScan:
+		return "universe_scan"
 	case plannerNoOrderLimitCandidateLeadScan:
 		return "lead_scan"
 	case plannerNoOrderLimitCandidateMaterializedFallback:
@@ -137,7 +140,7 @@ func plannerNoOrderLimitPick(candidates []plannerNoOrderLimitCandidate) plannerN
 }
 
 func (qv *View) collectNoOrderLimitFacts(q *qir.Shape, facts *noOrderLimitFacts) (bool, error) {
-	if q.Expr.Not {
+	if q.Expr.Not && (q.Expr.FieldOrdinal < 0 || len(q.Expr.Operands) != 0) {
 		return false, nil
 	}
 	if qir.IsTrueConst(q.Expr) {
@@ -296,13 +299,8 @@ func (qv *View) selectNoOrderLimit(q *qir.Shape, facts *noOrderLimitFacts) plann
 		return plannerNoOrderLimitDecision{}
 	}
 
-	snap := qv.exec.Stats.Load()
-	universe := snap.UniverseOr(qv.snap.Universe.Cardinality())
 	if facts.noFilter {
 		expected := q.Limit
-		if expected > universe {
-			expected = universe
-		}
 		return plannerNoOrderLimitDecision{
 			selected: plannerNoOrderLimitCandidate{
 				kind:         plannerNoOrderLimitCandidateNoFilter,
@@ -311,7 +309,10 @@ func (qv *View) selectNoOrderLimit(q *qir.Shape, facts *noOrderLimitFacts) plann
 			},
 		}
 	}
+
 	if facts.hasUnique {
+		snap := qv.exec.Stats.Load()
+		universe := qv.plannerUniverseCardinality(snap)
 		expected := q.Limit
 		if expected == 0 || expected > 1 {
 			expected = 1
@@ -334,21 +335,12 @@ func (qv *View) selectNoOrderLimit(q *qir.Shape, facts *noOrderLimitFacts) plann
 	if q.Limit == 0 {
 		return plannerNoOrderLimitDecision{}
 	}
-	if universe == 0 {
-		return plannerNoOrderLimitDecision{
-			selected:             plannerNoOrderLimitCandidate{kind: plannerNoOrderLimitCandidateMaterializedFallback, cost: 1},
-			materializedFallback: plannerNoOrderLimitCandidate{kind: plannerNoOrderLimitCandidateMaterializedFallback, cost: 1},
-		}
-	}
 
 	if facts.singlePrefix {
 		expected := needWindow
-		if expected > universe {
-			expected = universe
-		}
 		fallback := plannerNoOrderLimitCandidate{
 			kind:         plannerNoOrderLimitCandidateMaterializedFallback,
-			cost:         float64(universe) + 18.0,
+			cost:         float64(expected) + 18.0,
 			expectedRows: expected,
 		}
 		selected := plannerNoOrderLimitCandidate{
@@ -366,12 +358,9 @@ func (qv *View) selectNoOrderLimit(q *qir.Shape, facts *noOrderLimitFacts) plann
 
 	if facts.singleRange {
 		expected := needWindow
-		if expected > universe {
-			expected = universe
-		}
 		fallback := plannerNoOrderLimitCandidate{
 			kind:         plannerNoOrderLimitCandidateMaterializedFallback,
-			cost:         float64(universe) + 18.0,
+			cost:         float64(expected) + 18.0,
 			expectedRows: expected,
 		}
 		selected := plannerNoOrderLimitCandidate{
@@ -383,6 +372,15 @@ func (qv *View) selectNoOrderLimit(q *qir.Shape, facts *noOrderLimitFacts) plann
 			selected:             selected,
 			materializedFallback: fallback,
 			rejected:             fallback,
+		}
+	}
+
+	snap := qv.exec.Stats.Load()
+	universe := qv.plannerUniverseCardinality(snap)
+	if universe == 0 {
+		return plannerNoOrderLimitDecision{
+			selected:             plannerNoOrderLimitCandidate{kind: plannerNoOrderLimitCandidateMaterializedFallback, cost: 1},
+			materializedFallback: plannerNoOrderLimitCandidate{kind: plannerNoOrderLimitCandidateMaterializedFallback, cost: 1},
 		}
 	}
 
@@ -498,7 +496,7 @@ func (qv *View) selectNoOrderLimit(q *qir.Shape, facts *noOrderLimitFacts) plann
 		}
 	}
 
-	var candidates [5]plannerNoOrderLimitCandidate
+	var candidates [6]plannerNoOrderLimitCandidate
 	n := 0
 
 	materializedRows := uint64(combinedSel * float64(universe))
@@ -506,6 +504,9 @@ func (qv *View) selectNoOrderLimit(q *qir.Shape, facts *noOrderLimitFacts) plann
 		materializedRows = 1
 	}
 	materializedCost := materializedWork*1.15 + float64(materializedRows)*0.35 + float64(len(leaves))*18.0
+	if !facts.directBoundsOK && !leadFound && allSupported && qv.snap.AllowsMaterializedPredCard(materializedRows) {
+		materializedCost = float64(needWindow)*0.60 + float64(len(leaves))*18.0
+	}
 	candidates[n] = plannerNoOrderLimitCandidate{
 		kind:         plannerNoOrderLimitCandidateMaterializedFallback,
 		cost:         materializedCost,
@@ -588,6 +589,25 @@ func (qv *View) selectNoOrderLimit(q *qir.Shape, facts *noOrderLimitFacts) plann
 			expectedRows: expected,
 			leadRows:     leadRows,
 			leadIdx:      leadIdx,
+			checks:       uint64(checks),
+		}
+		n++
+	}
+
+	if !leadFound && allSupported {
+		expected := uint64(float64(needWindow) / combinedSel)
+		if expected < needWindow {
+			expected = needWindow
+		}
+		if expected > universe {
+			expected = universe
+		}
+		checks = len(leaves)
+		candidates[n] = plannerNoOrderLimitCandidate{
+			kind:         plannerNoOrderLimitCandidateUniverseScan,
+			cost:         float64(expected)*(0.80+float64(checks)*0.70) + float64(checks)*10.0,
+			expectedRows: expected,
+			leadRows:     universe,
 			checks:       uint64(checks),
 		}
 		n++
@@ -711,6 +731,16 @@ func (qv *View) dispatchNoOrderLimit(
 
 	case plannerNoOrderLimitCandidateLeadScan:
 		out, used, err := qv.execSelectedNoOrderLeadScan(q, facts, decision.selected.leadIdx, trace)
+		if !used {
+			if err != nil {
+				return nil, true, "", err
+			}
+			return qv.dispatchNoOrderLimitFallback(q, decision)
+		}
+		return out, true, PlanCandidateNoOrder, err
+
+	case plannerNoOrderLimitCandidateUniverseScan:
+		out, used, err := qv.execSelectedNoOrderUniverseScan(q, leaves, decision.selected.expectedRows, trace)
 		if !used {
 			if err != nil {
 				return nil, true, "", err

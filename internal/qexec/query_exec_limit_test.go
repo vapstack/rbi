@@ -219,6 +219,124 @@ func TestQuery_LimitNoFilterNoOrder_UsesDirectLimitPlan(t *testing.T) {
 	}
 }
 
+func TestQuery_NoOrderLimitUniverseScanCapsLargeLimitAllocation(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
+
+	const rows = 5
+	for i := 1; i <= rows; i++ {
+		if err := db.Set(uint64(i), &Rec{
+			Name:  fmt.Sprintf("u%d", i),
+			Email: fmt.Sprintf("u%d@example.com", i),
+			Age:   20 + i,
+		}); err != nil {
+			t.Fatalf("Set(%d): %v", i, err)
+		}
+	}
+	if err := db.RebuildIndex(); err != nil {
+		t.Fatalf("RebuildIndex: %v", err)
+	}
+
+	tests := []struct {
+		name string
+		q    *qx.QX
+	}{
+		{
+			name: "single_negative_fast_path",
+			q:    qx.Query(qx.NOT(qx.EQ("email", "missing@example.com"))).Limit(100_000),
+		},
+		{
+			name: "generic_negative_universe_scan",
+			q: qx.Query(
+				qx.NOT(qx.EQ("email", "missing@example.com")),
+				qx.NOT(qx.EQ("name", "missing")),
+			).Limit(100_000),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			prepared, viewQ, err := prepareTestQuery(db.engine, tt.q)
+			if err != nil {
+				t.Fatalf("prepareTestQuery: %v", err)
+			}
+			defer prepared.Release()
+
+			got, ok, plan, err := db.engine.currentQueryViewForTests().executeNoOrderLimit(&viewQ, nil)
+			if err != nil {
+				t.Fatalf("executeNoOrderLimit: %v", err)
+			}
+			if !ok {
+				t.Fatalf("executeNoOrderLimit: ok=false")
+			}
+			if plan != PlanCandidateNoOrder {
+				t.Fatalf("plan=%s want %s", plan, PlanCandidateNoOrder)
+			}
+			if len(got) != rows {
+				t.Fatalf("len(got)=%d want %d: %v", len(got), rows, got)
+			}
+			if cap(got) > rows {
+				t.Fatalf("cap(got)=%d want <= %d", cap(got), rows)
+			}
+			if err := testValidateNoDuplicateKeys(tt.name, got); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestQuery_NoOrderLimitWideNotINUsesGenericPostsAnyState(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
+
+	terms := []string{"C0", "C1", "C2", "C3", "C4", "C5"}
+	for i := 1; i <= 24; i++ {
+		country := terms[i%len(terms)]
+		if i > 18 {
+			country = "KEEP"
+		}
+		if err := db.Set(uint64(i), &Rec{
+			Meta: Meta{Country: country},
+			Name: fmt.Sprintf("u%d", i),
+			Age:  20 + i,
+		}); err != nil {
+			t.Fatalf("Set(%d): %v", i, err)
+		}
+	}
+	if err := db.RebuildIndex(); err != nil {
+		t.Fatalf("RebuildIndex: %v", err)
+	}
+
+	prepared, viewQ, err := prepareTestQuery(db.engine, qx.Query(qx.NOTIN("country", terms)).Limit(100_000))
+	if err != nil {
+		t.Fatalf("prepareTestQuery: %v", err)
+	}
+	defer prepared.Release()
+
+	view := db.engine.currentQueryViewForTests()
+	universe := view.snap.Universe.Borrow()
+	out, ok, err := view.execSelectedNoOrderSingleNegativeScalarUniverseScan(&viewQ, viewQ.Expr, universe, view.snap.Universe.Cardinality(), nil)
+	universe.Release()
+	if err != nil {
+		t.Fatalf("execSelectedNoOrderSingleNegativeScalarUniverseScan: %v", err)
+	}
+	if ok {
+		t.Fatalf("wide NOT IN should use generic postsAnyState path, got shortcut output %v", out)
+	}
+
+	got, ok, plan, err := view.executeNoOrderLimit(&viewQ, nil)
+	if err != nil {
+		t.Fatalf("executeNoOrderLimit: %v", err)
+	}
+	if !ok {
+		t.Fatalf("executeNoOrderLimit: ok=false")
+	}
+	if plan != PlanCandidateNoOrder {
+		t.Fatalf("plan=%s want %s", plan, PlanCandidateNoOrder)
+	}
+	if len(got) != 6 {
+		t.Fatalf("len(got)=%d want 6: %v", len(got), got)
+	}
+}
+
 func TestQuery_UniqueEqNoOrder_UsesSelectorTrace(t *testing.T) {
 	var events []TraceEvent
 	db, raw := openBoltAndNew[uint64, plannerPrecountRec](t, t.TempDir()+"/unique_eq_no_order.db", Options{
@@ -442,6 +560,74 @@ func TestQuery_SingleExactOrderedLimit_PrefersPlannerLimitPath(t *testing.T) {
 	}
 	if plan := events[len(events)-1].Plan; plan != string(PlanLimitOrderBasic) {
 		t.Fatalf("expected %q, got %q", PlanLimitOrderBasic, plan)
+	}
+}
+
+func TestQuery_OrderBasicBaseFastPathCapsLargeLimitByBaseCard(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
+
+	const (
+		rows     = 32
+		baseRows = 10
+	)
+	for i := 1; i <= rows; i++ {
+		country := "DE"
+		if i <= baseRows {
+			country = "US"
+		}
+		if err := db.Set(uint64(i), &Rec{
+			Meta:  Meta{Country: country},
+			Name:  fmt.Sprintf("u_%02d", i),
+			Age:   i,
+			Score: float64(i),
+		}); err != nil {
+			t.Fatalf("Set(%d): %v", i, err)
+		}
+	}
+	if err := db.RebuildIndex(); err != nil {
+		t.Fatalf("RebuildIndex: %v", err)
+	}
+
+	tests := []struct {
+		name    string
+		offset  int
+		wantLen int
+		wantCap int
+	}{
+		{name: "limit_capped", offset: 3, wantLen: baseRows - 3, wantCap: baseRows - 3},
+		{name: "offset_exhausts_base", offset: baseRows, wantLen: 0, wantCap: 0},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			prepared, shape, err := prepareTestQuery(db.engine, qx.Query(qx.EQ("country", "US")).Sort("score", qx.ASC).Offset(tt.offset).Limit(100_000))
+			if err != nil {
+				t.Fatalf("prepareTestQuery: %v", err)
+			}
+			defer prepared.Release()
+
+			view := db.engine.currentQueryViewForTests()
+			base, err := view.evalExpr(shape.Expr)
+			if err != nil {
+				t.Fatalf("evalExpr: %v", err)
+			}
+			ov := view.fieldIndexViewFromSlotsForOrder(view.snap.Index, shape.Order)
+			br := ov.RangeForBounds(indexdata.Bounds{Has: true})
+
+			got, used, err := view.runOrderBasicBaseQuery(&shape, "score", nil, 0, shape.Order, ov, br, "", base, nil, nil, nil)
+			if err != nil {
+				t.Fatalf("runOrderBasicBaseQuery: %v", err)
+			}
+			if !used {
+				t.Fatalf("runOrderBasicBaseQuery: used=false")
+			}
+			if len(got) != tt.wantLen {
+				t.Fatalf("len(got)=%d want %d: %v", len(got), tt.wantLen, got)
+			}
+			if cap(got) > tt.wantCap {
+				t.Fatalf("cap(got)=%d want <= %d", cap(got), tt.wantCap)
+			}
+		})
 	}
 }
 
@@ -678,6 +864,74 @@ func TestQuery_LimitOrderAndRange_UnsatisfiableRest_ReturnEmpty(t *testing.T) {
 	}
 	if len(out) != 0 {
 		t.Fatalf("expected empty result from execSelectedNoOrderBounds, got %v", out)
+	}
+}
+
+func TestQuery_OrderBasicLimit_MergedStringPrefixPreservesTightenedBounds(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
+	rows := [...]struct {
+		email string
+		score float64
+	}{
+		{"user1@example.com", 1},
+		{"user8@example.com", 2},
+		{"user9@example.com", 3},
+		{"user90@example.com", 4},
+		{"uses0@example.com", 5},
+	}
+	for i := range rows {
+		if err := db.Set(uint64(i+1), &Rec{
+			Name:   rows[i].email,
+			Email:  rows[i].email,
+			Score:  rows[i].score,
+			Active: true,
+		}); err != nil {
+			t.Fatalf("Set(%d): %v", i+1, err)
+		}
+	}
+	if err := db.RebuildIndex(); err != nil {
+		t.Fatalf("RebuildIndex: %v", err)
+	}
+
+	q := qx.Query(
+		qx.GTE("email", "user"),
+		qx.LT("email", "uses"),
+		qx.GTE("email", "user9"),
+	).Sort("score", qx.ASC).Limit(10)
+
+	view := db.engine.currentQueryViewForTests()
+	leaves := mustLimitQIRLeaves(t, db, q.Filter)
+	preds, ok, err := view.buildLeafPredsExcludingBounds(leaves, "score", 10)
+	if err != nil {
+		t.Fatalf("buildLeafPredsExcludingBounds: %v", err)
+	}
+	if !ok {
+		t.Fatalf("expected merged residual leaf preds to be supported")
+	}
+	if len(preds) != 1 {
+		if preds != nil {
+			leafPredSlicePool.Put(preds)
+		}
+		t.Fatalf("expected one merged leaf predicate, got %d", len(preds))
+	}
+	defer leafPredSlicePool.Put(preds)
+
+	if !preds[0].containsIdx(3) || !preds[0].containsIdx(4) {
+		t.Fatalf("tightened LIMIT prefix range should match user9/user90 rows")
+	}
+	if preds[0].containsIdx(1) || preds[0].containsIdx(2) || preds[0].containsIdx(5) {
+		t.Fatalf("tightened LIMIT prefix range matched rows outside the merged bounds")
+	}
+
+	out, used, err := db.engine.executeOrderedLimit(q, nil)
+	if err != nil {
+		t.Fatalf("executeOrderedLimit: %v", err)
+	}
+	if !used {
+		t.Fatalf("expected executeOrderedLimit to handle the query")
+	}
+	if !slices.Equal(out, []uint64{3, 4}) {
+		t.Fatalf("executeOrderedLimit ids=%v want [3 4]", out)
 	}
 }
 
@@ -1027,6 +1281,44 @@ func TestQuery_OrderBasicLimit_RuntimeGuardAppliesToLeafPredScan(t *testing.T) {
 	}
 	if !ev.OrderedLimitRoute.RuntimeFallbackTriggered {
 		t.Fatalf("expected ordered LIMIT runtime fallback, route=%+v", ev.OrderedLimitRoute)
+	}
+}
+
+func TestQuery_OrderBasicLimit_RuntimeGuardAppliesToPostingFilterScanNoTrace(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
+
+	const rows = 20_000
+	seedGeneratedUint64Data(t, db, rows, func(i int) *Rec {
+		return &Rec{
+			Name:   fmt.Sprintf("u_%05d", i),
+			Score:  float64(i),
+			Active: i <= rows/2,
+		}
+	})
+	if err := db.RebuildIndex(); err != nil {
+		t.Fatalf("RebuildIndex: %v", err)
+	}
+
+	q := qx.Query(qx.EQ("active", true)).Sort("score", qx.DESC).Limit(10)
+	prepared, viewQ, err := prepareTestQuery(db.engine, q)
+	if err != nil {
+		t.Fatalf("prepareTestQuery: %v", err)
+	}
+	defer prepared.Release()
+
+	got, ok, plan, err := db.engine.currentQueryViewForTests().executeOrderedLimit(&viewQ, nil)
+	if err != nil {
+		t.Fatalf("executeOrderedLimit: %v", err)
+	}
+	if !ok {
+		t.Fatalf("executeOrderedLimit: ok=false")
+	}
+	want := []uint64{10_000, 9_999, 9_998, 9_997, 9_996, 9_995, 9_994, 9_993, 9_992, 9_991}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("keys=%v want=%v", got, want)
+	}
+	if plan != PlanMaterialized {
+		t.Fatalf("plan=%s want %s", plan, PlanMaterialized)
 	}
 }
 
