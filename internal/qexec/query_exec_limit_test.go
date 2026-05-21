@@ -284,6 +284,86 @@ func TestQuery_NoOrderLimitUniverseScanCapsLargeLimitAllocation(t *testing.T) {
 	}
 }
 
+func TestQuery_LimitDirectScansCapLargeLimitAllocation(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
+
+	for i := 1; i <= 5; i++ {
+		name := fmt.Sprintf("drop_%d", i)
+		if i <= 3 {
+			name = fmt.Sprintf("keep_%d", i)
+		}
+		if err := db.Set(uint64(i), &Rec{
+			Name:  name,
+			Age:   i,
+			Score: float64(i),
+		}); err != nil {
+			t.Fatalf("Set(%d): %v", i, err)
+		}
+	}
+	if err := db.RebuildIndex(); err != nil {
+		t.Fatalf("RebuildIndex: %v", err)
+	}
+
+	noOrder := []struct {
+		name    string
+		q       *qx.QX
+		wantLen int
+		wantCap int
+	}{
+		{name: "range", q: qx.Query(qx.GTE("age", 4)).Limit(100_000), wantLen: 2, wantCap: 2},
+		{name: "prefix", q: qx.Query(qx.PREFIX("name", "keep_")).Limit(100_000), wantLen: 3, wantCap: 3},
+	}
+	for _, tt := range noOrder {
+		t.Run(tt.name, func(t *testing.T) {
+			prepared, viewQ, err := prepareTestQuery(db.engine, tt.q)
+			if err != nil {
+				t.Fatalf("prepareTestQuery: %v", err)
+			}
+			defer prepared.Release()
+			got, ok, _, err := db.engine.currentQueryViewForTests().executeNoOrderLimit(&viewQ, nil)
+			if err != nil {
+				t.Fatalf("executeNoOrderLimit: %v", err)
+			}
+			if !ok {
+				t.Fatalf("executeNoOrderLimit: ok=false")
+			}
+			if len(got) != tt.wantLen {
+				t.Fatalf("len(got)=%d want %d: %v", len(got), tt.wantLen, got)
+			}
+			if cap(got) > tt.wantCap {
+				t.Fatalf("cap(got)=%d want <= %d", cap(got), tt.wantCap)
+			}
+		})
+	}
+
+	ordered := []struct {
+		name    string
+		q       *qx.QX
+		wantLen int
+		wantCap int
+	}{
+		{name: "order_no_filter", q: qx.Query().Sort("score", qx.ASC).Limit(100_000), wantLen: 5, wantCap: 5},
+		{name: "order_offset_exhausted", q: qx.Query().Sort("score", qx.ASC).Offset(5).Limit(100_000), wantLen: 0, wantCap: 0},
+	}
+	for _, tt := range ordered {
+		t.Run(tt.name, func(t *testing.T) {
+			got, used, err := db.engine.executeOrderedLimit(tt.q, nil)
+			if err != nil {
+				t.Fatalf("executeOrderedLimit: %v", err)
+			}
+			if !used {
+				t.Fatalf("executeOrderedLimit: used=false")
+			}
+			if len(got) != tt.wantLen {
+				t.Fatalf("len(got)=%d want %d: %v", len(got), tt.wantLen, got)
+			}
+			if cap(got) > tt.wantCap {
+				t.Fatalf("cap(got)=%d want <= %d", cap(got), tt.wantCap)
+			}
+		})
+	}
+}
+
 func TestQuery_NoOrderLimitWideNotINUsesGenericPostsAnyState(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
 
@@ -2485,7 +2565,7 @@ func TestQuery_OrderBasic_ComplementCachedBaseOpCountsAsMaterialized(t *testing.
 	coresBuf, rawCoreIdxBuf := mustPrepareOrderBasicBaseCoresForTest(t, view, baseOps)
 	defer orderBasicBaseCoreSlicePool.Put(coresBuf)
 	defer pooled.ReleaseIntSlice(rawCoreIdxBuf)
-	if !view.hasWarmOrderBasicBaseCores(coresBuf) {
+	if !hasWarmOrderBasicBaseCoresForTest(view, coresBuf) {
 		_, gteHit := snapshotExtLoadMaterializedPred(db.engine.snapshot.Current(), gteComplementKey)
 		_, lteHit := snapshotExtLoadMaterializedPred(db.engine.snapshot.Current(), lteScalarKey)
 		t.Fatalf("expected complement-backed cached range base op to count as materialized: gteComplementHit=%v lteScalarHit=%v", gteHit, lteHit)
@@ -2579,7 +2659,7 @@ func TestQuery_OrderBasic_WarmQueryLoadsCollapsedNumericRangeSpan(t *testing.T) 
 		t.Fatalf("expected collapsed numeric range span to be directly reusable")
 	}
 	spanHit.ids.Release()
-	if !view.hasWarmOrderBasicBaseCores(coresBuf) {
+	if !hasWarmOrderBasicBaseCoresForTest(view, coresBuf) {
 		t.Fatalf("expected collapsed numeric range span to be reusable as warm order-basic base op")
 	}
 }
@@ -2598,6 +2678,14 @@ func mustPrepareOrderBasicBaseCoresForTest(
 		t.Fatalf("prepareOrderBasicBaseCores: unexpected no-match")
 	}
 	return coresBuf, rawCoreIdxBuf
+}
+
+func hasWarmOrderBasicBaseCoresForTest(view *View, cores []orderBasicBaseCore) bool {
+	_, hit, ok := view.loadFirstWarmOrderBasicBaseCore(cores)
+	if ok {
+		hit.ids.Release()
+	}
+	return ok
 }
 
 func mustFindCollapsedOrderBasicBaseCoreForTest(
@@ -2663,7 +2751,7 @@ func TestQuery_OrderBasic_WarmQueryPromotesMaterializedRangeBaseOps(t *testing.T
 	defer orderBasicBaseCoreSlicePool.Put(coresBuf)
 	defer pooled.ReleaseIntSlice(rawCoreIdxBuf)
 	collapsed := mustFindCollapsedOrderBasicBaseCoreForTest(t, coresBuf)
-	if !view.hasWarmOrderBasicBaseCores(coresBuf) {
+	if !hasWarmOrderBasicBaseCoresForTest(view, coresBuf) {
 		var missing []string
 		for _, op := range baseOps {
 			stats, ok := view.orderBasicRawBaseOpStats(op, view.snap.Universe.Cardinality())
@@ -2775,7 +2863,7 @@ func TestQuery_OrderBasic_WarmAnalyticsRangeUsesLimitOrderBasicPlan(t *testing.T
 	} else {
 		hit.ids.Release()
 	}
-	if !view.hasWarmOrderBasicBaseCores(coresBuf) {
+	if !hasWarmOrderBasicBaseCoresForTest(view, coresBuf) {
 		t.Fatalf("expected warm order-basic base ops after first analytics query")
 	}
 	if _, err := db.QueryKeys(q); err != nil {

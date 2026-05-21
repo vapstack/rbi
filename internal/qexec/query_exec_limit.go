@@ -991,9 +991,22 @@ func (qv *View) buildLeafPredsExcludingBounds(leaves []qir.Expr, field string, o
 }
 
 func (qv *View) scanLimitByFieldIndexBounds(q *qir.Shape, ov indexdata.FieldIndexView, br indexdata.FieldIndexRange, desc bool, preds []leafPred, nilTailField string, guard plannerOrderedLimitRuntimeGuard, trace *Trace) ([]uint64, bool) {
-	limit := int(q.Limit)
-	out := make([]uint64, 0, limit)
+	limit := clampUint64ToInt(q.Limit)
+	var extraRows uint64
+	if nilTailField != "" {
+		extraRows = qv.fieldIndexViewFromSlotsByName(qv.snap.NilIndex, nilTailField).LookupCardinality(indexdata.NilIndexEntryKey)
+	}
+	capHint, exhausted := fieldIndexRangeWindowCap(ov, br, q.Offset, q.Limit, extraRows)
+	if exhausted {
+		if trace != nil {
+			trace.AddExamined(0)
+			trace.SetEarlyStopReason("input_exhausted")
+		}
+		return nil, true
+	}
+	out := make([]uint64, 0, clampUint64ToInt(capHint))
 	if trace == nil && q.Offset == 0 && len(preds) == 0 {
+		limit = clampUint64ToInt(q.Limit)
 		keyCur := ov.NewCursor(br, desc)
 		for {
 			ids, idx, single, ok := keyCur.NextPostingOrSingle()
@@ -1293,8 +1306,11 @@ func (qv *View) scanLimitByFieldIndexBounds(q *qir.Shape, ov indexdata.FieldInde
 }
 
 func scanLimitByFieldIndexBoundsPostingFilterNoTrace(q *qir.Shape, ov indexdata.FieldIndexView, br indexdata.FieldIndexRange, desc bool, filter posting.List, guard plannerOrderedLimitRuntimeGuard) ([]uint64, bool) {
-	limit := int(q.Limit)
-	out := make([]uint64, 0, limit)
+	capHint, exhausted := boundedWindowCap(filter.Cardinality(), q.Offset, q.Limit)
+	if exhausted {
+		return nil, true
+	}
+	out := make([]uint64, 0, clampUint64ToInt(capHint))
 	cursor := newQueryCursor(out, q.Offset, q.Limit, false, 0)
 	keyCur := ov.NewCursor(br, desc)
 	examined := uint64(0)

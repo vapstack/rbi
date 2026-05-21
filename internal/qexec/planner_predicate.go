@@ -1667,7 +1667,17 @@ func (qv *View) execPlanLeadScanNoOrder(q *qir.Shape, preds predicateReader, lea
 
 	sortActivePredicatesReader(active, preds)
 
-	out := make([]uint64, 0, int(q.Limit))
+	capHint := q.Limit
+	cardHint := best
+	if leadIdx < 0 {
+		cardHint = qv.snap.Universe.Cardinality()
+	}
+	if q.Offset >= cardHint {
+		capHint = 0
+	} else if remaining := cardHint - q.Offset; q.Limit == 0 || capHint > remaining {
+		capHint = remaining
+	}
+	out := make([]uint64, 0, clampUint64ToInt(capHint))
 	cursor := newQueryCursor(out, q.Offset, q.Limit, q.Limit == 0, 0)
 	singleActive := -1
 	if len(active) == 1 {
@@ -4267,7 +4277,8 @@ func (qv *View) execPlanOrderedBasicAnchoredWithScratch(
 	o := q.Order
 	skip := q.Offset
 	need := q.Limit
-	out := make([]uint64, 0, need)
+	capHint, _ := boundedWindowCap(totalCandidates, skip, need)
+	out := make([]uint64, 0, clampUint64ToInt(capHint))
 	seenCandidates := uint64(0)
 	scanWidth := uint64(0)
 	singleDeferred := -1
@@ -4495,7 +4506,19 @@ func (qv *View) execPlanOrderedBasicFallbackWithNilTail(q *qir.Shape, preds []pr
 }
 
 func (qv *View) scanOrderedIndexViewNoPredicatesWithNilTail(q *qir.Shape, ov indexdata.FieldIndexView, br indexdata.FieldIndexRange, desc bool, nilTailField string, trace *Trace) []uint64 {
-	out := make([]uint64, 0, int(q.Limit))
+	extraRows := uint64(0)
+	if nilTailField != "" {
+		extraRows = qv.fieldIndexViewFromSlotsByName(qv.snap.NilIndex, nilTailField).LookupCardinality(indexdata.NilIndexEntryKey)
+	}
+	capHint, exhausted := fieldIndexRangeWindowCap(ov, br, q.Offset, q.Limit, extraRows)
+	if exhausted {
+		if trace != nil {
+			trace.AddOrderScanWidth(0)
+			trace.SetEarlyStopReason("input_exhausted")
+		}
+		return nil
+	}
+	out := make([]uint64, 0, clampUint64ToInt(capHint))
 	cursor := newQueryCursor(out, q.Offset, q.Limit, false, 0)
 
 	var scanWidth uint64
@@ -4544,7 +4567,19 @@ func (qv *View) scanOrderedIndexViewWithPredicatesWithNilTail(q *qir.Shape, pred
 		return qv.scanOrderedIndexViewNoPredicatesWithNilTail(q, ov, br, desc, nilTailField, trace)
 	}
 
-	out := make([]uint64, 0, int(q.Limit))
+	extraRows := uint64(0)
+	if nilTailField != "" {
+		extraRows = qv.fieldIndexViewFromSlotsByName(qv.snap.NilIndex, nilTailField).LookupCardinality(indexdata.NilIndexEntryKey)
+	}
+	capHint, exhausted := fieldIndexRangeWindowCap(ov, br, q.Offset, q.Limit, extraRows)
+	if exhausted {
+		if trace != nil {
+			trace.AddOrderScanWidth(0)
+			trace.SetEarlyStopReason("input_exhausted")
+		}
+		return nil
+	}
+	out := make([]uint64, 0, clampUint64ToInt(capHint))
 	cursor := newQueryCursor(out, q.Offset, q.Limit, false, 0)
 
 	var exactActiveInline [plannerPredicateFastPathMaxLeaves]int

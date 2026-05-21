@@ -1281,17 +1281,16 @@ func (qv *View) promoteObservedOrderBasicBaseCore(core orderBasicBaseCore) {
 	}
 }
 
-func (qv *View) hasWarmOrderBasicBaseCores(cores []orderBasicBaseCore) bool {
+func (qv *View) loadFirstWarmOrderBasicBaseCore(cores []orderBasicBaseCore) (int, postingResult, bool) {
 	if cores == nil {
-		return false
+		return -1, postingResult{}, false
 	}
 	for i := 0; i < len(cores); i++ {
 		if hit, ok := qv.loadWarmOrderBasicBaseCore(cores[i]); ok {
-			hit.ids.Release()
-			return true
+			return i, hit, true
 		}
 	}
-	return false
+	return -1, postingResult{}, false
 }
 
 func (qv *View) orderBasicRawBaseOpStats(
@@ -1736,9 +1735,13 @@ dispatch:
 							}
 							return out, true, plan, nil
 						}
-						out := make([]uint64, 0, q.Limit)
-						out, _, _ = ov.AppendPostingFilter(out, br, order.Desc, filter, q.Offset, q.Limit)
-						if uint64(len(out)) < q.Limit && nilTailField != "" {
+						need, exhausted := boundedWindowCap(filter.Cardinality(), q.Offset, q.Limit)
+						if exhausted {
+							return nil, true, plan, nil
+						}
+						out := make([]uint64, 0, clampUint64ToInt(need))
+						out, _, _ = ov.AppendPostingFilter(out, br, order.Desc, filter, q.Offset, need)
+						if uint64(len(out)) < need && nilTailField != "" {
 							goto orderScanPostingFilterDone
 						}
 						return out, true, plan, nil
@@ -1950,7 +1953,7 @@ dispatch:
 		}
 		return nil, true, PlanLimitOrderBasic, nil
 	}
-	hasWarmBaseOps := len(baseCoresBuf) > 0 && qv.hasWarmOrderBasicBaseCores(baseCoresBuf)
+	warmBaseIdx, warmBase, hasWarmBaseOps := qv.loadFirstWarmOrderBasicBaseCore(baseCoresBuf)
 
 	var (
 		base              postingResult
@@ -1962,39 +1965,42 @@ dispatch:
 
 	if hasWarmBaseOps {
 		if len(baseCoresBuf) == 1 {
-			var ok bool
-			base, ok = qv.loadWarmOrderBasicBaseCore(baseCoresBuf[0])
-			if !ok {
-				hasWarmBaseOps = false
-			} else {
-				warmBaseLoaded = true
-			}
+			base = warmBase
+			warmBaseLoaded = true
 		}
 	}
 
 	if hasWarmBaseOps && !warmBaseLoaded {
-		residualOpsBuf := qir.GetExprSlice(len(baseOps))
+		var loadedCoreInline [limitQueryFastPathMaxLeaves]bool
+		var loadedCoreBuf []bool
+		var loadedCoreHeap []bool
+		if len(baseCoresBuf) <= limitQueryFastPathMaxLeaves {
+			loadedCoreBuf = loadedCoreInline[:len(baseCoresBuf)]
+		} else {
+			loadedCoreHeap = pooled.GetBoolSlice(len(baseCoresBuf))[:len(baseCoresBuf)]
+			clear(loadedCoreHeap)
+			loadedCoreBuf = loadedCoreHeap
+		}
 
-		loadedCoreBuf := pooled.GetBoolSlice(len(baseCoresBuf))[:len(baseCoresBuf)]
-		clear(loadedCoreBuf)
-
-		baseBuilt := false
+		base = warmBase
+		loadedCoreBuf[warmBaseIdx] = true
+		loadedCount := 1
 		for i := 0; i < len(baseCoresBuf); i++ {
+			if i == warmBaseIdx {
+				continue
+			}
 			b, ok := qv.loadWarmOrderBasicBaseCore(baseCoresBuf[i])
 			if !ok {
 				continue
 			}
 			loadedCoreBuf[i] = true
-			if !baseBuilt {
-				base = b
-				baseBuilt = true
-				continue
-			}
+			loadedCount++
 			var err error
 			base, err = qv.andPostingResult(base, b)
 			if err != nil {
-				qir.ReleaseExprSlice(residualOpsBuf)
-				pooled.ReleaseBoolSlice(loadedCoreBuf)
+				if loadedCoreHeap != nil {
+					pooled.ReleaseBoolSlice(loadedCoreHeap)
+				}
 				orderBasicBaseCoreSlicePool.Put(baseCoresBuf)
 				pooled.ReleaseIntSlice(baseRawCoreIdxBuf)
 				base.ids.Release()
@@ -2002,20 +2008,18 @@ dispatch:
 			}
 		}
 
-		for i, op := range baseOps {
-			if loadedCoreBuf[baseRawCoreIdxBuf[i]] {
-				continue
+		if loadedCount < len(baseCoresBuf) {
+			residualOpsBuf := qir.GetExprSlice(len(baseOps))
+			for i, op := range baseOps {
+				if loadedCoreBuf[baseRawCoreIdxBuf[i]] {
+					continue
+				}
+				residualOpsBuf = append(residualOpsBuf, op)
 			}
-			residualOpsBuf = append(residualOpsBuf, op)
-		}
-
-		if !baseBuilt {
-			hasWarmBaseOps = false
-
-		} else if len(residualOpsBuf) > 0 {
 			window, _ := orderWindow(q)
 			var ok bool
 			residualPredSet, ok = qv.buildPredicatesOrderedWithMode(residualOpsBuf, f, false, window, q.Offset, false, true)
+			qir.ReleaseExprSlice(residualOpsBuf)
 
 			if !ok {
 				base.ids.Release()
@@ -2033,8 +2037,9 @@ dispatch:
 				for i := 0; i < residualPredSet.Len(); i++ {
 					p := residualPredSet.owner[i]
 					if p.alwaysFalse {
-						qir.ReleaseExprSlice(residualOpsBuf)
-						pooled.ReleaseBoolSlice(loadedCoreBuf)
+						if loadedCoreHeap != nil {
+							pooled.ReleaseBoolSlice(loadedCoreHeap)
+						}
 						orderBasicBaseCoreSlicePool.Put(baseCoresBuf)
 						pooled.ReleaseIntSlice(baseRawCoreIdxBuf)
 						base.ids.Release()
@@ -2052,8 +2057,9 @@ dispatch:
 				}
 			}
 		}
-		qir.ReleaseExprSlice(residualOpsBuf)
-		pooled.ReleaseBoolSlice(loadedCoreBuf)
+		if loadedCoreHeap != nil {
+			pooled.ReleaseBoolSlice(loadedCoreHeap)
+		}
 	}
 	if baseRawCoreIdxBuf != nil {
 		pooled.ReleaseIntSlice(baseRawCoreIdxBuf)
@@ -2106,8 +2112,35 @@ dispatch:
 	return out, used, PlanLimitOrderBasic, err
 }
 
+func fieldIndexRangeWindowCap(ov indexdata.FieldIndexView, br indexdata.FieldIndexRange, offset, limit, extraRows uint64) (uint64, bool) {
+	window := satAddUint64(offset, limit)
+	if br.Empty() {
+		return boundedWindowCap(extraRows, offset, limit)
+	}
+	if uint64(br.Len()) < window {
+		_, rows := ov.RangeStats(br)
+		if extraRows != 0 {
+			rows = satAddUint64(rows, extraRows)
+		}
+		return boundedWindowCap(rows, offset, limit)
+	}
+	return limit, limit == 0
+}
+
 func (qv *View) scanOrderLimitNoPredicates(q *qir.Shape, ov indexdata.FieldIndexView, br indexdata.FieldIndexRange, desc bool, nilTailField string, trace *Trace) ([]uint64, bool) {
-	out := make([]uint64, 0, q.Limit)
+	var extraRows uint64
+	if nilTailField != "" {
+		extraRows = qv.fieldIndexViewFromSlotsByName(qv.snap.NilIndex, nilTailField).LookupCardinality(indexdata.NilIndexEntryKey)
+	}
+	capHint, exhausted := fieldIndexRangeWindowCap(ov, br, q.Offset, q.Limit, extraRows)
+	if exhausted {
+		if trace != nil {
+			trace.AddExamined(0)
+			trace.SetEarlyStopReason("input_exhausted")
+		}
+		return nil, true
+	}
+	out := make([]uint64, 0, clampUint64ToInt(capHint))
 	if trace == nil && q.Offset == 0 {
 		limit := clampUint64ToInt(q.Limit)
 		keyCur := ov.NewCursor(br, desc)
@@ -2251,7 +2284,19 @@ func (qv *View) scanOrderLimitWithPredicatesReaderGuarded(q *qir.Shape, ov index
 
 		exactOnly := len(activeBuf) > 0 && len(activeBuf) == len(exactActiveBuf)
 
-		out := make([]uint64, 0, q.Limit)
+		var extraRows uint64
+		if nilTailField != "" {
+			extraRows = qv.fieldIndexViewFromSlotsByName(qv.snap.NilIndex, nilTailField).LookupCardinality(indexdata.NilIndexEntryKey)
+		}
+		capHint, exhausted := fieldIndexRangeWindowCap(ov, br, q.Offset, q.Limit, extraRows)
+		if exhausted {
+			if trace != nil {
+				trace.AddExamined(0)
+				trace.SetEarlyStopReason("input_exhausted")
+			}
+			return nil, true
+		}
+		out := make([]uint64, 0, clampUint64ToInt(capHint))
 		cursor := newQueryCursor(out, q.Offset, q.Limit, false, 0)
 
 		var (
@@ -2403,7 +2448,19 @@ func (qv *View) scanOrderLimitWithPredicatesReaderGuarded(q *qir.Shape, ov index
 	residualActive := plannerResidualChecks(residualActiveInline[:0], active, exactActive)
 	exactOnly := len(active) > 0 && len(active) == len(exactActive)
 
-	out := make([]uint64, 0, q.Limit)
+	var extraRows uint64
+	if nilTailField != "" {
+		extraRows = qv.fieldIndexViewFromSlotsByName(qv.snap.NilIndex, nilTailField).LookupCardinality(indexdata.NilIndexEntryKey)
+	}
+	capHint, exhausted := fieldIndexRangeWindowCap(ov, br, q.Offset, q.Limit, extraRows)
+	if exhausted {
+		if trace != nil {
+			trace.AddExamined(0)
+			trace.SetEarlyStopReason("input_exhausted")
+		}
+		return nil, true
+	}
+	out := make([]uint64, 0, clampUint64ToInt(capHint))
 	cursor := newQueryCursor(out, q.Offset, q.Limit, false, 0)
 
 	var (
@@ -2541,7 +2598,7 @@ func scanOrderLimitDenseBaseNoTrace(q *qir.Shape, ov indexdata.FieldIndexView, b
 		return nil, 0, false
 	}
 
-	limit := int(q.Limit)
+	limit := clampUint64ToInt(q.Limit)
 	skip := int(q.Offset)
 	need := limit
 	if remaining := baseCard - skip; need > remaining {
@@ -2674,7 +2731,7 @@ func scanOrderLimitSmallBaseNoTrace(q *qir.Shape, ov indexdata.FieldIndexView, b
 	}
 	it.Release()
 
-	limit := int(q.Limit)
+	limit := clampUint64ToInt(q.Limit)
 	skip := int(q.Offset)
 	need := limit
 	if remaining := baseCard - skip; need > remaining {
@@ -2766,7 +2823,7 @@ func scanOrderLimitBaseHashNoTrace(q *qir.Shape, ov indexdata.FieldIndexView, br
 	}
 	it.Release()
 
-	limit := int(q.Limit)
+	limit := clampUint64ToInt(q.Limit)
 	skip := int(q.Offset)
 	need := limit
 	if remaining := baseCard - skip; need > remaining {
@@ -2861,9 +2918,18 @@ func (qv *View) execSelectedNoOrderDirectRange(q *qir.Shape, trace *Trace) ([]ui
 			if ids.IsEmpty() {
 				return nil, true, nil
 			}
+			capHint, exhausted := boundedWindowCap(ids.Cardinality(), q.Offset, q.Limit)
+			if exhausted {
+				ids.Release()
+				if trace != nil {
+					trace.AddExamined(0)
+					trace.SetEarlyStopReason("input_exhausted")
+				}
+				return nil, true, nil
+			}
 			skip := q.Offset
 			need := q.Limit
-			out := make([]uint64, 0, need)
+			out := make([]uint64, 0, clampUint64ToInt(capHint))
 			cursor := newQueryCursor(out, skip, need, false, 0)
 			var (
 				examined    uint64
@@ -2919,8 +2985,16 @@ func (qv *View) execSelectedNoOrderDirectRange(q *qir.Shape, trace *Trace) ([]ui
 
 	skip := q.Offset
 	need := q.Limit
+	capHint, exhausted := fieldIndexRangeWindowCap(ov, br, skip, need, 0)
+	if exhausted {
+		if trace != nil {
+			trace.AddExamined(0)
+			trace.SetEarlyStopReason("input_exhausted")
+		}
+		return nil, true, nil
+	}
 
-	out := make([]uint64, 0, need)
+	out := make([]uint64, 0, clampUint64ToInt(capHint))
 	cursor := newQueryCursor(out, skip, need, false, 0)
 
 	keyCur := ov.NewCursor(br, false)
@@ -3007,7 +3081,15 @@ func (qv *View) execSelectedNoOrderDirectPrefix(q *qir.Shape, trace *Trace) ([]u
 
 	skip := q.Offset
 	need := q.Limit
-	out := make([]uint64, 0, need)
+	capHint, exhausted := fieldIndexRangeWindowCap(prefixState.ov, prefixState.br, skip, need, 0)
+	if exhausted {
+		if trace != nil {
+			trace.AddExamined(0)
+			trace.SetEarlyStopReason("input_exhausted")
+		}
+		return nil, true, nil
+	}
+	out := make([]uint64, 0, clampUint64ToInt(capHint))
 	cursor := newQueryCursor(out, skip, need, false, 0)
 
 	keyCur := prefixState.ov.NewCursor(prefixState.br, false)

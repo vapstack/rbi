@@ -4101,6 +4101,20 @@ func (qv *View) execPlanOROrderBasic(q *qir.Shape, branches plannerORBranches, a
 		branchChecks[i] = pooled.GetIntSlice(branch.preds.Len())
 		branchChecks[i] = branch.buildMatchChecks(branchChecks[i])
 	}
+	scanStart := ov.KeyCount()
+	scanEnd := 0
+	for i := 0; i < branches.Len(); i++ {
+		if branchStart[i] < scanStart {
+			scanStart = branchStart[i]
+		}
+		if branchEnd[i] > scanEnd {
+			scanEnd = branchEnd[i]
+		}
+	}
+	if scanStart >= scanEnd {
+		releasePlannerOROrderBasicCheckBufs(branchCount, &branchChecks)
+		return nil, true
+	}
 
 	promoteObserved := false
 	if observed != nil {
@@ -4113,7 +4127,7 @@ func (qv *View) execPlanOROrderBasic(q *qir.Shape, branches plannerORBranches, a
 	}
 
 	skip := q.Offset
-	need := int(q.Limit)
+	need := clampUint64ToInt(q.Limit)
 	out := make([]uint64, 0, need)
 
 	var branchEvalOrder [plannerORBranchLimit]int
@@ -4124,14 +4138,14 @@ func (qv *View) execPlanOROrderBasic(q *qir.Shape, branches plannerORBranches, a
 		branchEvalOrder, branchEvalN = branches.evalOrder()
 	}
 
-	br := ov.RangeForBounds(indexdata.Bounds{Has: true})
+	br := ov.RangeByRanks(scanStart, scanEnd)
 	fullTrace := trace != nil && trace.Full()
 
 	if !fullTrace {
 		cur := ov.NewCursor(br, o.Desc)
-		bucket := 0
+		bucket := br.BaseStart
 		if o.Desc {
-			bucket = ov.KeyCount() - 1
+			bucket = br.BaseEnd - 1
 		}
 		for need > 0 {
 			_, bm, ok := cur.Next()
@@ -4249,9 +4263,9 @@ func (qv *View) execPlanOROrderBasic(q *qir.Shape, branches plannerORBranches, a
 	stopReason := "input_exhausted"
 
 	cur := ov.NewCursor(br, o.Desc)
-	bucket := 0
+	bucket := br.BaseStart
 	if o.Desc {
-		bucket = ov.KeyCount() - 1
+		bucket = br.BaseEnd - 1
 	}
 	for need > 0 {
 		_, bm, ok := cur.Next()
@@ -4767,7 +4781,7 @@ type plannerOROrderBranchIter struct {
 	curResidual   bool
 	curSplitExact bool
 	bucketWork    posting.List
-	bucketSeen    []bool
+	bucketSeen    *u64set
 
 	has bool
 	cur uint64
@@ -4925,8 +4939,8 @@ func (it *plannerOROrderBranchIter) advance() (uint64, uint64, uint64, bool) {
 				return examinedDelta, residualExaminedDelta, emittedDelta, false
 			}
 
-			if it.bucketSeen != nil && !it.bucketSeen[b] {
-				it.bucketSeen[b] = true
+			if it.bucketSeen != nil {
+				it.bucketSeen.Add(uint64(b))
 			}
 			it.curBucket = b
 			if single {
@@ -5014,8 +5028,8 @@ func (it *plannerOROrderBranchIter) advance() (uint64, uint64, uint64, bool) {
 			return examinedDelta, residualExaminedDelta, emittedDelta, false
 		}
 
-		if it.bucketSeen != nil && !it.bucketSeen[b] {
-			it.bucketSeen[b] = true
+		if it.bucketSeen != nil {
+			it.bucketSeen.Add(uint64(b))
 		}
 
 		it.curBucket = b
@@ -5159,9 +5173,14 @@ func (qv *View) execPlanOROrderKWay(
 		}
 	}
 
-	var bucketSeen []bool
+	var (
+		bucketSeen    u64set
+		bucketSeenPtr *u64set
+	)
 	if fullTrace {
-		bucketSeen = make([]bool, ov.KeyCount())
+		bucketSeen = getU64Set(max(64, needWindow*branches.Len()))
+		bucketSeenPtr = &bucketSeen
+		defer releaseU64Set(&bucketSeen)
 	}
 
 	var (
@@ -5279,7 +5298,7 @@ func (qv *View) execPlanOROrderKWay(
 			allChecksExact: len(checksBuf) > 0 && len(exactChecksBuf) == len(checksBuf),
 			startBucket:    branchStart,
 			endBucket:      branchEnd,
-			bucketSeen:     bucketSeen,
+			bucketSeen:     bucketSeenPtr,
 		}
 		iter.init()
 
@@ -5320,11 +5339,7 @@ func (qv *View) execPlanOROrderKWay(
 		qv.promoteObservedOrderedORKWayMaterializedBaseOps(q, branches, branchObservedChecks, &observedCheckRows, &branchUniverses, analysis)
 		if trace != nil {
 			if fullTrace {
-				for i := range bucketSeen {
-					if bucketSeen[i] {
-						scanWidth++
-					}
-				}
+				scanWidth = uint64(bucketSeen.Len())
 			}
 			trace.AddExamined(examined)
 			trace.AddOrderScanWidth(scanWidth)
@@ -5334,7 +5349,7 @@ func (qv *View) execPlanOROrderKWay(
 		return nil, true, nil
 	}
 
-	outCap := int(q.Limit)
+	outCap := clampUint64ToInt(q.Limit)
 	if outCap <= 0 {
 		outCap = needWindow
 	}
@@ -5429,11 +5444,7 @@ func (qv *View) execPlanOROrderKWay(
 	qv.promoteObservedOrderedORKWayMaterializedBaseOps(q, branches, branchObservedChecks, &observedCheckRows, &branchUniverses, analysis)
 	if trace != nil {
 		if fullTrace {
-			for i := range bucketSeen {
-				if bucketSeen[i] {
-					scanWidth++
-				}
-			}
+			scanWidth = uint64(bucketSeen.Len())
 		}
 		trace.AddExamined(examined)
 		trace.AddDedupe(dedupe)
@@ -6237,7 +6248,12 @@ func (qv *View) execPlanORNoOrderAdaptiveCore(q *qir.Shape, branches plannerORBr
 		return nil, false
 	}
 
-	need := int(q.Limit)
+	need64 := q.Limit
+	universeCard := qv.snap.Universe.Cardinality()
+	if need64 > universeCard {
+		need64 = universeCard
+	}
+	need := clampUint64ToInt(need64)
 	if need <= 0 {
 		return nil, true
 	}
@@ -6409,7 +6425,11 @@ func (qv *View) execPlanORNoOrderBaselineCore(q *qir.Shape, branches plannerORBr
 	}
 
 	skip := q.Offset
-	need := int(q.Limit)
+	capHint, exhausted := boundedWindowCap(qv.snap.Universe.Cardinality(), skip, q.Limit)
+	if exhausted {
+		return nil, true
+	}
+	need := clampUint64ToInt(capHint)
 	out := make([]uint64, 0, need)
 	stopReason := "input_exhausted"
 	needWindow := need
@@ -6518,7 +6538,15 @@ func (qv *View) execPlanORNoOrderBaselineCore(q *qir.Shape, branches plannerORBr
 
 func (qv *View) execPlanORUniverseNoOrder(q *qir.Shape, trace *Trace) []uint64 {
 	skip := q.Offset
-	need := int(q.Limit)
+	capHint, exhausted := boundedWindowCap(qv.snap.Universe.Cardinality(), skip, q.Limit)
+	if exhausted {
+		if trace != nil {
+			trace.AddExamined(qv.snap.Universe.Cardinality())
+			trace.SetEarlyStopReason("input_exhausted")
+		}
+		return nil
+	}
+	need := clampUint64ToInt(capHint)
 	out := make([]uint64, 0, need)
 	stopReason := "input_exhausted"
 

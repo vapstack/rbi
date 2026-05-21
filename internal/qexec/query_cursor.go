@@ -57,6 +57,17 @@ func clampUint64ToInt(v uint64) int {
 	return int(v)
 }
 
+func boundedWindowCap(cardinality, offset, limit uint64) (uint64, bool) {
+	if limit == 0 || offset >= cardinality {
+		return 0, true
+	}
+	remaining := cardinality - offset
+	if limit < remaining {
+		return limit, false
+	}
+	return remaining, false
+}
+
 func (c *queryCursor) release() {
 	if c == nil || !c.dedupe {
 		return
