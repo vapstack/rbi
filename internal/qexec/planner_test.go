@@ -412,8 +412,8 @@ func TestTryPlanOrdered_AllowsPointerSortField(t *testing.T) {
 	if plan != "" {
 		trace.SetPlan(plan)
 	}
-	if trace.ev.Plan != string(PlanOrdered) {
-		t.Fatalf("unexpected plan: got=%q want=%q", trace.ev.Plan, PlanOrdered)
+	if trace.ev.Plan != string(PlanOrdered) && trace.ev.Plan != string(PlanLimitOrderBasic) {
+		t.Fatalf("unexpected plan: got=%q want %q or %q", trace.ev.Plan, PlanOrdered, PlanLimitOrderBasic)
 	}
 
 	want := make([]uint64, 0, 25)

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -68,6 +69,20 @@ func hideLenIndexForTest[K ~string | ~uint64, V any](t *testing.T, db *DB[K, V],
 			snap.LenZeroComplement[acc.Ordinal] = oldZeroComplement
 		}
 	})
+}
+
+type limitBoolVI bool
+
+func (v limitBoolVI) IndexingValue() string {
+	if v {
+		return "yes"
+	}
+	return "no"
+}
+
+type limitBoolVIRec struct {
+	Flag  limitBoolVI `db:"flag"  rbi:"index"`
+	Score int         `db:"score" rbi:"index"`
 }
 
 func TestQuery_SliceEQ_MissingLenIndexStorageReturnsError(t *testing.T) {
@@ -889,6 +904,83 @@ func TestQuery_NoOrderLimit_EmptyRangeValidatesResidual(t *testing.T) {
 	).Limit(5)
 	if _, err := db.QueryKeys(q); !errors.Is(err, ErrInvalidQuery) {
 		t.Fatalf("QueryKeys err=%v, want ErrInvalidQuery", err)
+	}
+}
+
+func TestQuery_NoOrderLimit_EmptyLeafValidatesUnsupportedResidual(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
+	seedGeneratedUint64Data(t, db, 20, func(i int) *Rec {
+		return &Rec{
+			Name: fmt.Sprintf("u_%d", i),
+			Age:  i,
+		}
+	})
+	if err := db.RebuildIndex(); err != nil {
+		t.Fatalf("RebuildIndex: %v", err)
+	}
+
+	q := qx.Query(
+		qx.HASANY("name", []string{"u_1"}),
+		qx.EQ("age", -1),
+	).Limit(5)
+	if _, err := db.QueryKeys(q); !errors.Is(err, ErrInvalidQuery) {
+		t.Fatalf("QueryKeys err=%v, want ErrInvalidQuery", err)
+	}
+}
+
+func TestQuery_OrderLimit_EmptyBaseLeafValidatesUnsupportedBaseOp(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
+	seedGeneratedUint64Data(t, db, 20, func(i int) *Rec {
+		return &Rec{
+			Name:  fmt.Sprintf("u_%d", i),
+			Age:   i,
+			Score: float64(i),
+		}
+	})
+	if err := db.RebuildIndex(); err != nil {
+		t.Fatalf("RebuildIndex: %v", err)
+	}
+
+	q := qx.Query(
+		qx.HASANY("name", []string{"u_1"}),
+		qx.EQ("age", -1),
+	).Sort("score", qx.ASC).Limit(5)
+	if _, err := db.QueryKeys(q); !errors.Is(err, ErrInvalidQuery) {
+		t.Fatalf("QueryKeys err=%v, want ErrInvalidQuery", err)
+	}
+}
+
+func TestQuery_OrderLimit_NegatedBoolEQRespectsValueIndexer(t *testing.T) {
+	db, raw := openBoltAndNew[uint64, limitBoolVIRec](t, filepath.Join(t.TempDir(), "bool_vi.db"), Options{AnalyzeInterval: -1})
+	t.Cleanup(func() {
+		_ = db.Close()
+		_ = raw.Close()
+	})
+
+	rows := []limitBoolVIRec{
+		{Flag: true, Score: 1},
+		{Flag: false, Score: 2},
+		{Flag: false, Score: 3},
+	}
+	for i := range rows {
+		if err := db.Set(uint64(i+1), &rows[i]); err != nil {
+			t.Fatalf("Set(%d): %v", i+1, err)
+		}
+	}
+
+	invalid := qx.Query(qx.NOT(qx.EQ("flag", true))).Sort("score", qx.ASC).Limit(5)
+	if _, err := db.QueryKeys(invalid); err == nil {
+		t.Fatalf("plain bool QueryKeys succeeded, want error")
+	}
+
+	valid := qx.Query(qx.NOT(qx.EQ("flag", limitBoolVI(true)))).Sort("score", qx.ASC).Limit(5)
+	got, err := db.QueryKeys(valid)
+	if err != nil {
+		t.Fatalf("typed bool QueryKeys: %v", err)
+	}
+	want := []uint64{2, 3}
+	if !slices.Equal(got, want) {
+		t.Fatalf("typed bool QueryKeys got=%v want=%v", got, want)
 	}
 }
 

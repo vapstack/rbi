@@ -1,7 +1,10 @@
 package qexec
 
 import (
+	"reflect"
+
 	"github.com/vapstack/rbi/internal/indexdata"
+	"github.com/vapstack/rbi/internal/keycodec"
 	"github.com/vapstack/rbi/internal/pooled"
 	"github.com/vapstack/rbi/internal/posting"
 	"github.com/vapstack/rbi/internal/qir"
@@ -17,6 +20,9 @@ type leafPred struct {
 	postingFilter func(posting.List) (posting.List, bool)
 	postsBuf      []posting.List
 	postsAnyState *postsAnyFilterState
+	hash          u64set
+	hashAt        int
+	contains      int
 }
 
 type leafPredKind uint8
@@ -36,11 +42,43 @@ const limitQueryFastPathMaxLeaves = 8
 // a multi-residual LIMIT query is handed back to the general lead picker.
 const limitRangeNoOrderBroadResidualRowsPerNeed = 64
 
-func (p leafPred) postCount() int {
+type leafPostingScanCursor struct {
+	it   posting.Iterator
+	cur  uint64
+	done bool
+}
+
+func releaseLeafPostingScanCursors(cursors []leafPostingScanCursor) {
+	for i := range cursors {
+		cursors[i].it.Release()
+	}
+}
+
+func leafPostingScanCursorsMatch(cursors []leafPostingScanCursor, idx uint64) bool {
+	for i := range cursors {
+		c := &cursors[i]
+		if c.done {
+			return false
+		}
+		for c.cur < idx {
+			if !c.it.HasNext() {
+				c.done = true
+				return false
+			}
+			c.cur = c.it.Next()
+		}
+		if c.cur != idx {
+			return false
+		}
+	}
+	return true
+}
+
+func (p *leafPred) postCount() int {
 	return len(p.postsBuf)
 }
 
-func (p leafPred) postAt(i int) posting.List {
+func (p *leafPred) postAt(i int) posting.List {
 	return p.postsBuf[i]
 }
 
@@ -51,12 +89,23 @@ func (p *leafPred) setExpectedContainsCalls(expected int) {
 	if p.kind == leafPredKindPredicate {
 		p.pred.setExpectedContainsCalls(expected)
 	}
+	if p.kind == leafPredKindPosting && p.estCard > 0 && p.estCard <= uint64(u64SetPoolMaxCap/2) {
+		at := int(p.estCard >> 3)
+		if at < 256 {
+			at = 256
+		} else if at > 1024 {
+			at = 1024
+		}
+		if expected > at*2 {
+			p.hashAt = at
+		}
+	}
 	if p.postsAnyState != nil {
 		p.postsAnyState.setExpectedContainsCalls(expected)
 	}
 }
 
-func (p leafPred) hasIter() bool {
+func (p *leafPred) hasIter() bool {
 	switch p.kind {
 	case leafPredKindEmpty:
 		return true
@@ -69,7 +118,7 @@ func (p leafPred) hasIter() bool {
 	}
 }
 
-func (p leafPred) leadIterNeedsContainsCheck() bool {
+func (p *leafPred) leadIterNeedsContainsCheck() bool {
 	if p.kind == leafPredKindPredicate {
 		return p.pred.leadIterNeedsContainsCheck()
 	}
@@ -78,7 +127,7 @@ func (p leafPred) leadIterNeedsContainsCheck() bool {
 	return p.kind == leafPredKindPostsAll && p.postCount() > 1
 }
 
-func (p leafPred) iterNew() posting.Iterator {
+func (p *leafPred) iterNew() posting.Iterator {
 	switch p.kind {
 	case leafPredKindEmpty:
 		return emptyIter{}
@@ -97,13 +146,29 @@ func (p leafPred) iterNew() posting.Iterator {
 	}
 }
 
-func (p leafPred) containsIdx(idx uint64) bool {
+func (p *leafPred) containsIdx(idx uint64) bool {
 	switch p.kind {
 
 	case leafPredKindPredicate:
 		return p.pred.matches(idx)
 
 	case leafPredKindPosting:
+		if p.hashAt < 0 {
+			return p.hash.Has(idx)
+		}
+		if p.hashAt > 0 {
+			p.contains++
+			if p.contains >= p.hashAt {
+				p.hash = getU64Set(int(p.estCard))
+				it := p.posting.Iter()
+				for it.HasNext() {
+					p.hash.Add(it.Next())
+				}
+				it.Release()
+				p.hashAt = -1
+				return p.hash.Has(idx)
+			}
+		}
 		return p.posting.Contains(idx)
 
 	case leafPredKindPostsConcat, leafPredKindPostsUnion:
@@ -133,7 +198,7 @@ func (p leafPred) containsIdx(idx uint64) bool {
 	}
 }
 
-func (p leafPred) supportsExactBucketPostingFilter() bool {
+func (p *leafPred) supportsExactBucketPostingFilter() bool {
 	switch p.kind {
 
 	case leafPredKindPredicate:
@@ -150,7 +215,7 @@ func (p leafPred) supportsExactBucketPostingFilter() bool {
 	}
 }
 
-func (p leafPred) prefersExactBucketPostingFilter() bool {
+func (p *leafPred) prefersExactBucketPostingFilter() bool {
 	switch p.kind {
 
 	case leafPredKindPredicate:
@@ -164,7 +229,7 @@ func (p leafPred) prefersExactBucketPostingFilter() bool {
 	}
 }
 
-func (p leafPred) supportsPostingApply() bool {
+func (p *leafPred) supportsPostingApply() bool {
 	switch p.kind {
 	case leafPredKindPredicate:
 		return p.pred.postingFilterCapability().supportsApply()
@@ -180,7 +245,7 @@ func (p leafPred) supportsPostingApply() bool {
 	}
 }
 
-func (p leafPred) countBucket(bucket posting.List) (uint64, bool) {
+func (p *leafPred) countBucket(bucket posting.List) (uint64, bool) {
 	switch p.kind {
 
 	case leafPredKindEmpty:
@@ -206,7 +271,7 @@ func (p leafPred) countBucket(bucket posting.List) (uint64, bool) {
 	}
 }
 
-func (p leafPred) applyToPosting(dst posting.List) (posting.List, bool) {
+func (p *leafPred) applyToPosting(dst posting.List) (posting.List, bool) {
 	switch p.kind {
 
 	case leafPredKindEmpty:
@@ -841,7 +906,7 @@ func (qv *View) buildLeafPredsExcludingBounds(leaves []qir.Expr, field string, o
 						return nil, false, nil
 					}
 					qv.attachLeafPredPostingFilter(&p)
-					if orderedUniverse > 0 && p.postsAnyState != nil {
+					if orderedUniverse > 0 && (p.kind == leafPredKindPosting || p.postsAnyState != nil) {
 						p.setExpectedContainsCalls(
 							clampUint64ToInt(orderedPredicateExpectedRows(orderedWindow, p.estCard, orderedUniverse)),
 						)
@@ -864,7 +929,7 @@ func (qv *View) buildLeafPredsExcludingBounds(leaves []qir.Expr, field string, o
 		}
 
 		qv.attachLeafPredPostingFilter(&p)
-		if orderedUniverse > 0 && p.postsAnyState != nil {
+		if orderedUniverse > 0 && (p.kind == leafPredKindPosting || p.postsAnyState != nil) {
 			p.setExpectedContainsCalls(
 				clampUint64ToInt(orderedPredicateExpectedRows(orderedWindow, p.estCard, orderedUniverse)),
 			)
@@ -1014,35 +1079,92 @@ func (qv *View) scanLimitByFieldIndexBounds(q *qir.Shape, ov indexdata.FieldInde
 		applyWork posting.List
 	)
 
+	var postingCursorBuf [limitQueryFastPathMaxLeaves]leafPostingScanCursor
+	postingCursors := postingCursorBuf[:0]
+	postingCursorActive := false
+	if !desc && len(active) > 0 && len(active) == len(exactActive) && len(active) <= len(postingCursorBuf) &&
+		uint64(ov.KeyCount())*2 >= qv.snap.Universe.Cardinality() &&
+		uint64(br.Len())*4 >= uint64(ov.KeyCount()) {
+		postingCursorActive = true
+		for _, pi := range active {
+			if preds[pi].kind != leafPredKindPosting {
+				postingCursorActive = false
+				break
+			}
+			it := preds[pi].posting.Iter()
+			postingCursors = append(postingCursors, leafPostingScanCursor{
+				it:  it,
+				cur: it.Next(),
+			})
+		}
+		if !postingCursorActive {
+			releaseLeafPostingScanCursors(postingCursors)
+			postingCursors = postingCursors[:0]
+		}
+	}
+
 	keyCur := ov.NewCursor(br, desc)
+	lastSingle := uint64(0)
+	hasLastSingle := false
 	for {
-		_, ids, ok := keyCur.Next()
+		ids, idx, single, ok := keyCur.NextPostingOrSingle()
 		if !ok {
 			break
-		}
-		if ids.IsEmpty() {
-			continue
 		}
 		if trackScanWidth {
 			scanWidth++
 		}
-		stop, nextExactWork, nextApplyWork := leafPredsEmitPosting(
-			&cursor,
-			preds,
-			active,
-			exactActive,
-			residualActive,
-			exactOnly,
-			residualApplyOnly,
-			ids,
-			exactWork,
-			applyWork,
-			trace,
-			&examined,
-		)
+		var stop bool
+		if single {
+			if postingCursorActive {
+				if hasLastSingle && idx < lastSingle {
+					releaseLeafPostingScanCursors(postingCursors)
+					postingCursorActive = false
+					postingCursors = postingCursors[:0]
+				} else {
+					hasLastSingle = true
+					lastSingle = idx
+					examined++
+					if leafPostingScanCursorsMatch(postingCursors, idx) {
+						if trace != nil {
+							trace.AddMatched(1)
+						}
+						stop = cursor.emit(idx)
+					}
+				}
+			}
+			if !postingCursorActive {
+				stop = leafPredsEmitCandidate(&cursor, preds, active, trace, idx, &examined)
+			}
+		} else {
+			if ids.IsEmpty() {
+				continue
+			}
+			if postingCursorActive {
+				releaseLeafPostingScanCursors(postingCursors)
+				postingCursorActive = false
+				postingCursors = postingCursors[:0]
+			}
+			var nextExactWork posting.List
+			var nextApplyWork posting.List
+			stop, nextExactWork, nextApplyWork = leafPredsEmitPosting(
+				&cursor,
+				preds,
+				active,
+				exactActive,
+				residualActive,
+				exactOnly,
+				residualApplyOnly,
+				ids,
+				exactWork,
+				applyWork,
+				trace,
+				&examined,
+			)
 
-		exactWork = nextExactWork
-		applyWork = nextApplyWork
+			exactWork = nextExactWork
+			applyWork = nextApplyWork
+		}
 
 		if stop {
 			if trace != nil {
@@ -1055,6 +1177,9 @@ func (qv *View) scanLimitByFieldIndexBounds(q *qir.Shape, ov indexdata.FieldInde
 
 			exactWork.Release()
 			applyWork.Release()
+			if postingCursorActive {
+				releaseLeafPostingScanCursors(postingCursors)
+			}
 			if activeHeap != nil {
 				pooled.ReleaseIntSlice(residualActiveHeap)
 				pooled.ReleaseIntSlice(exactActiveHeap)
@@ -1075,6 +1200,9 @@ func (qv *View) scanLimitByFieldIndexBounds(q *qir.Shape, ov indexdata.FieldInde
 
 			exactWork.Release()
 			applyWork.Release()
+			if postingCursorActive {
+				releaseLeafPostingScanCursors(postingCursors)
+			}
 			if activeHeap != nil {
 				pooled.ReleaseIntSlice(residualActiveHeap)
 				pooled.ReleaseIntSlice(exactActiveHeap)
@@ -1086,6 +1214,10 @@ func (qv *View) scanLimitByFieldIndexBounds(q *qir.Shape, ov indexdata.FieldInde
 	}
 
 	if nilTailField != "" {
+		if postingCursorActive {
+			releaseLeafPostingScanCursors(postingCursors)
+			postingCursorActive = false
+		}
 		ids := qv.fieldIndexViewFromSlotsByName(qv.snap.NilIndex, nilTailField).LookupPostingRetained(indexdata.NilIndexEntryKey)
 		if !ids.IsEmpty() {
 			if trackScanWidth {
@@ -1120,6 +1252,9 @@ func (qv *View) scanLimitByFieldIndexBounds(q *qir.Shape, ov indexdata.FieldInde
 
 				exactWork.Release()
 				applyWork.Release()
+				if postingCursorActive {
+					releaseLeafPostingScanCursors(postingCursors)
+				}
 				if activeHeap != nil {
 					pooled.ReleaseIntSlice(residualActiveHeap)
 					pooled.ReleaseIntSlice(exactActiveHeap)
@@ -1141,6 +1276,9 @@ func (qv *View) scanLimitByFieldIndexBounds(q *qir.Shape, ov indexdata.FieldInde
 
 	exactWork.Release()
 	applyWork.Release()
+	if postingCursorActive {
+		releaseLeafPostingScanCursors(postingCursors)
+	}
 	if activeHeap != nil {
 		pooled.ReleaseIntSlice(residualActiveHeap)
 		pooled.ReleaseIntSlice(exactActiveHeap)
@@ -1245,6 +1383,24 @@ func (qv *View) buildLeafPred(e qir.Expr) (leafPred, bool, error) {
 	}
 
 	if e.Not {
+		if e.Op == qir.OpEQ && !fm.UseVI && !fm.Slice && !fm.Ptr && fm.Kind == reflect.Bool {
+			v, ok := e.Value.(bool)
+			if ok {
+				key := keycodec.IndexLookupString("1")
+				if v {
+					key = keycodec.IndexLookupString("0")
+				}
+				ids := lookupScalarPostingRetained(ov, key)
+				if ids.IsEmpty() {
+					return emptyLeaf(), true, nil
+				}
+				return leafPred{
+					kind:    leafPredKindPosting,
+					posting: ids,
+					estCard: ids.Cardinality(),
+				}, true, nil
+			}
+		}
 		p, ok := qv.buildPredicateWithMode(e, false)
 		if !ok {
 			return leafPred{}, false, nil

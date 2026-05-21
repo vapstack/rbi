@@ -12,6 +12,7 @@ type plannerNoOrderLimitCandidateKind uint8
 
 const (
 	plannerNoOrderLimitCandidateNone plannerNoOrderLimitCandidateKind = iota
+	plannerNoOrderLimitCandidateEmpty
 	plannerNoOrderLimitCandidateNoFilter
 	plannerNoOrderLimitCandidateUniqueEq
 	plannerNoOrderLimitCandidateDirectPrefix
@@ -23,6 +24,8 @@ const (
 
 func (k plannerNoOrderLimitCandidateKind) String() string {
 	switch k {
+	case plannerNoOrderLimitCandidateEmpty:
+		return "empty"
 	case plannerNoOrderLimitCandidateNoFilter:
 		return "no_filter"
 	case plannerNoOrderLimitCandidateUniqueEq:
@@ -62,6 +65,7 @@ type noOrderLimitFacts struct {
 	leaves       []qir.Expr
 	leavesBuf    []qir.Expr
 	leavesInline [plannerPredicateFastPathMaxLeaves]qir.Expr
+	leafEst      [plannerPredicateFastPathMaxLeaves]uint64
 
 	directField              string
 	directBounds             indexdata.Bounds
@@ -192,6 +196,9 @@ func (qv *View) collectNoOrderLimitFacts(q *qir.Shape, facts *noOrderLimitFacts)
 			if fm := qv.fieldMetaByExpr(e); fm != nil && !fm.Slice {
 				facts.singleRange = true
 			}
+		}
+		if facts.singlePrefix || facts.singleRange {
+			return true, nil
 		}
 	}
 
@@ -334,6 +341,51 @@ func (qv *View) selectNoOrderLimit(q *qir.Shape, facts *noOrderLimitFacts) plann
 		}
 	}
 
+	if facts.singlePrefix {
+		expected := needWindow
+		if expected > universe {
+			expected = universe
+		}
+		fallback := plannerNoOrderLimitCandidate{
+			kind:         plannerNoOrderLimitCandidateMaterializedFallback,
+			cost:         float64(universe) + 18.0,
+			expectedRows: expected,
+		}
+		selected := plannerNoOrderLimitCandidate{
+			kind:         plannerNoOrderLimitCandidateDirectPrefix,
+			cost:         float64(expected) * 0.72,
+			expectedRows: expected,
+			leadRows:     expected,
+		}
+		return plannerNoOrderLimitDecision{
+			selected:             selected,
+			materializedFallback: fallback,
+			rejected:             fallback,
+		}
+	}
+
+	if facts.singleRange {
+		expected := needWindow
+		if expected > universe {
+			expected = universe
+		}
+		fallback := plannerNoOrderLimitCandidate{
+			kind:         plannerNoOrderLimitCandidateMaterializedFallback,
+			cost:         float64(universe) + 18.0,
+			expectedRows: expected,
+		}
+		selected := plannerNoOrderLimitCandidate{
+			kind:         plannerNoOrderLimitCandidateDirectRange,
+			cost:         float64(expected) * 0.72,
+			expectedRows: expected,
+		}
+		return plannerNoOrderLimitDecision{
+			selected:             selected,
+			materializedFallback: fallback,
+			rejected:             fallback,
+		}
+	}
+
 	combinedSel := 1.0
 	materializedWork := 0.0
 	leadFound := false
@@ -343,11 +395,58 @@ func (qv *View) selectNoOrderLimit(q *qir.Shape, facts *noOrderLimitFacts) plann
 	leadIdx := -1
 	checks := 0
 	allSupported := true
+	emptySupported := false
+
+	var directBR indexdata.FieldIndexRange
+	directRows := uint64(0)
+	directRangeOK := false
+	directRangeEmpty := false
+	if facts.directBoundsOK {
+		fm := qv.exec.Schema.Fields[facts.directField]
+		ov := qv.fieldIndexViewFromSlotsByName(qv.snap.Index, facts.directField)
+		if fm != nil && !fm.Slice && ov.HasData() {
+			directBR = ov.RangeForBounds(facts.directBounds)
+			directRangeOK = true
+			if directBR.Empty() {
+				directRangeEmpty = true
+			} else {
+				_, rows := ov.RangeStats(directBR)
+				if rows == 0 {
+					rows = 1
+				}
+				directRows = rows
+				sel := float64(rows) / float64(universe)
+				if sel <= 0 {
+					sel = 1.0 / float64(universe)
+				}
+				if sel > 1 {
+					sel = 1
+				}
+				combinedSel *= sel
+				if combinedSel < 1.0/float64(universe) {
+					combinedSel = 1.0 / float64(universe)
+				}
+				materializedWork += float64(rows) * 1.05
+			}
+		}
+	}
 
 	for i, e := range leaves {
+		if directRangeOK && isBoundOp(e.Op) && !e.Not && e.FieldOrdinal >= 0 &&
+			qv.exec.FieldNameByOrdinal(e.FieldOrdinal) == facts.directField {
+			continue
+		}
+		leafSupported := qv.supportsLimitLeafPredExpr(e)
+		if !leafSupported {
+			allSupported = false
+		}
 		sel, work, _, _, ok := qv.estimateLeafOrderCost(e, snap, universe, "", false)
 		if !ok {
 			allSupported = false
+			continue
+		}
+		if !e.Not && sel == 0 {
+			emptySupported = true
 			continue
 		}
 		if sel > 1 {
@@ -356,17 +455,20 @@ func (qv *View) selectNoOrderLimit(q *qir.Shape, facts *noOrderLimitFacts) plann
 		if sel <= 0 {
 			sel = 1.0 / float64(universe)
 		}
+		est := uint64(sel * float64(universe))
+		if est == 0 {
+			est = 1
+		}
+		if i < len(facts.leafEst) {
+			facts.leafEst[i] = est
+		}
 		combinedSel *= sel
 		if combinedSel < 1.0/float64(universe) {
 			combinedSel = 1.0 / float64(universe)
 		}
 		materializedWork += work
 
-		if !e.Not && qv.supportsLimitLeafPredExpr(e) {
-			est := uint64(sel * float64(universe))
-			if est == 0 {
-				est = 1
-			}
+		if !e.Not && leafSupported {
 			weight := 1.0
 			switch e.Op {
 			case qir.OpGT, qir.OpGTE, qir.OpLT, qir.OpLTE, qir.OpPREFIX:
@@ -387,6 +489,15 @@ func (qv *View) selectNoOrderLimit(q *qir.Shape, facts *noOrderLimitFacts) plann
 		}
 	}
 
+	if emptySupported && allSupported {
+		return plannerNoOrderLimitDecision{
+			selected: plannerNoOrderLimitCandidate{
+				kind: plannerNoOrderLimitCandidateEmpty,
+				cost: 1,
+			},
+		}
+	}
+
 	var candidates [5]plannerNoOrderLimitCandidate
 	n := 0
 
@@ -403,93 +514,53 @@ func (qv *View) selectNoOrderLimit(q *qir.Shape, facts *noOrderLimitFacts) plann
 	}
 	n++
 
-	if facts.singlePrefix {
-		prefix, ok, err := qv.prepareScalarPrefixRoute(leaves[0])
-		if err == nil && ok {
-			rows := universe
-			span := 0
-			if prefix.hasData && !prefix.br.Empty() {
-				span, rows = prefix.ov.RangeStats(prefix.br)
-				if rows == 0 {
-					rows = 1
-				}
-			}
-			expected := rows
-			if expected > needWindow {
-				expected = needWindow
-			}
+	if facts.directBoundsOK && directRangeOK {
+		kind := plannerNoOrderLimitCandidateDirectRange
+		if facts.directBoundLeaves > 1 {
+			kind = plannerNoOrderLimitCandidateSameFieldBounds
+		}
+		residuals := facts.directResiduals
+		if directRangeEmpty {
 			candidates[n] = plannerNoOrderLimitCandidate{
-				kind:         plannerNoOrderLimitCandidateDirectPrefix,
-				cost:         float64(expected)*0.72 + float64(span)*0.25 + 4.0,
-				expectedRows: expected,
-				leadRows:     rows,
+				kind:   kind,
+				checks: uint64(residuals),
 			}
 			n++
-		}
-	}
-
-	if facts.singleRange && !facts.singlePrefix {
-		candidates[n] = plannerNoOrderLimitCandidate{
-			kind:         plannerNoOrderLimitCandidateDirectRange,
-			cost:         float64(needWindow) * 0.72,
-			expectedRows: needWindow,
-		}
-		n++
-	} else if facts.directBoundsOK && !facts.singlePrefix {
-		fm := qv.exec.Schema.Fields[facts.directField]
-		ov := qv.fieldIndexViewFromSlotsByName(qv.snap.Index, facts.directField)
-		if fm != nil && !fm.Slice && ov.HasData() {
-			br := ov.RangeForBounds(facts.directBounds)
-			kind := plannerNoOrderLimitCandidateDirectRange
-			if facts.directBoundLeaves > 1 {
-				kind = plannerNoOrderLimitCandidateSameFieldBounds
+		} else if facts.directResidualsSupported {
+			rows := directRows
+			restSel := combinedSel / (float64(rows) / float64(universe))
+			if restSel <= 0 {
+				restSel = 1.0 / float64(universe)
 			}
-			residuals := facts.directResiduals
-			if br.Empty() {
-				candidates[n] = plannerNoOrderLimitCandidate{
-					kind:   kind,
-					checks: uint64(residuals),
-				}
-				n++
-			} else if facts.directResidualsSupported {
-				_, rows := ov.RangeStats(br)
-				if rows == 0 {
-					rows = 1
-				}
-				restSel := combinedSel / (float64(rows) / float64(universe))
-				if restSel <= 0 {
-					restSel = 1.0 / float64(universe)
-				}
-				if restSel > 1 {
-					restSel = 1
-				}
-				expected := uint64(float64(needWindow) / restSel)
-				if expected < needWindow {
-					expected = needWindow
-				}
-				if expected > rows {
-					expected = rows
-				}
-				cost := float64(expected) * 0.72
-				if residuals > 0 {
-					cost = float64(expected)*(0.75+float64(residuals)*0.35) + float64(residuals)*16.0
-					broadMin := satMulUint64(needWindow, uint64(limitRangeNoOrderBroadResidualRowsPerNeed))
-					if residuals >= 3 && leadFound && rows > broadMin && expected > leadRows {
-						cost = float64(expected)*(1.0+float64(residuals)*0.70) + float64(br.BaseEnd-br.BaseStart)*0.20
-					}
-				}
-				if qv.hasPrefixBoundForField(leaves, facts.directField) && qv.shouldPreferExecutionNoOrderPrefix(q, leaves) {
-					cost = float64(needWindow)*(0.70+float64(residuals)*0.15) + float64(br.BaseEnd-br.BaseStart)*0.001
-				}
-				candidates[n] = plannerNoOrderLimitCandidate{
-					kind:         kind,
-					cost:         cost,
-					expectedRows: expected,
-					leadRows:     rows,
-					checks:       uint64(residuals),
-				}
-				n++
+			if restSel > 1 {
+				restSel = 1
 			}
+			expected := uint64(float64(needWindow) / restSel)
+			if expected < needWindow {
+				expected = needWindow
+			}
+			if expected > rows {
+				expected = rows
+			}
+			cost := float64(expected) * 0.72
+			if residuals > 0 {
+				cost = float64(expected)*(0.75+float64(residuals)*0.35) + float64(residuals)*16.0
+				broadMin := satMulUint64(needWindow, uint64(limitRangeNoOrderBroadResidualRowsPerNeed))
+				if residuals >= 3 && leadFound && rows > broadMin && expected > leadRows {
+					cost = float64(expected)*(1.0+float64(residuals)*0.70) + float64(directBR.BaseEnd-directBR.BaseStart)*0.20
+				}
+			}
+			if qv.hasPrefixBoundForField(leaves, facts.directField) && qv.shouldPreferExecutionNoOrderPrefix(q, leaves) {
+				cost = float64(needWindow)*(0.70+float64(residuals)*0.15) + float64(directBR.BaseEnd-directBR.BaseStart)*0.001
+			}
+			candidates[n] = plannerNoOrderLimitCandidate{
+				kind:         kind,
+				cost:         cost,
+				expectedRows: expected,
+				leadRows:     rows,
+				checks:       uint64(residuals),
+			}
+			n++
 		}
 	}
 
@@ -569,6 +640,9 @@ func (qv *View) dispatchNoOrderLimit(
 	leaves := facts.leaves
 
 	switch decision.selectedKind() {
+	case plannerNoOrderLimitCandidateEmpty:
+		return nil, true, PlanCandidateNoOrder, nil
+
 	case plannerNoOrderLimitCandidateNoFilter:
 		out, used, err := qv.execSelectedNoOrderNoFilter(q, trace)
 		if !used {
@@ -636,7 +710,7 @@ func (qv *View) dispatchNoOrderLimit(
 		return out, true, PlanLimitRangeNoOrder, err
 
 	case plannerNoOrderLimitCandidateLeadScan:
-		out, used, err := qv.execSelectedNoOrderLeadScan(q, leaves, decision.selected.leadIdx, trace)
+		out, used, err := qv.execSelectedNoOrderLeadScan(q, facts, decision.selected.leadIdx, trace)
 		if !used {
 			if err != nil {
 				return nil, true, "", err
@@ -652,10 +726,60 @@ func (qv *View) dispatchNoOrderLimit(
 	return nil, false, "", nil
 }
 
-func (qv *View) execSelectedNoOrderLeadScan(q *qir.Shape, leaves []qir.Expr, leadIdx int, trace *Trace) ([]uint64, bool, error) {
-	predSet, ok := qv.buildPredicatesCandidate(leaves)
-	if !ok {
-		return nil, false, nil
+func (qv *View) execSelectedNoOrderLeadScan(q *qir.Shape, facts *noOrderLimitFacts, leadIdx int, trace *Trace) ([]uint64, bool, error) {
+	leaves := facts.leaves
+	var predSet predicateSet
+
+	if facts.directBoundsOK && facts.directBoundLeaves > 1 {
+		predSet = newPredicateSet(len(leaves) - facts.directBoundLeaves + 1)
+		leadPredIdx := -1
+		rangePredBuilt := false
+
+		for i, e := range leaves {
+			if isBoundOp(e.Op) && !e.Not && e.FieldOrdinal >= 0 &&
+				qv.exec.FieldNameByOrdinal(e.FieldOrdinal) == facts.directField {
+				if rangePredBuilt {
+					continue
+				}
+				p, ok := qv.buildMergedScalarRangePredicate(e, facts.directBounds, true)
+				if !ok {
+					predSet.Release()
+					return nil, false, nil
+				}
+				predSet.Append(p)
+				rangePredBuilt = true
+				continue
+			}
+
+			var (
+				p  predicate
+				ok bool
+			)
+			if e.Op == qir.OpEQ && i < len(facts.leafEst) && facts.leafEst[i] > 0 {
+				p, ok = qv.buildPredEqCandidateWithEst(e, facts.leafEst[i])
+			} else {
+				p, ok = qv.buildPredicateCandidate(e)
+			}
+			if !ok {
+				predSet.Release()
+				return nil, false, nil
+			}
+			predSet.Append(p)
+			if i == leadIdx {
+				leadPredIdx = predSet.Len() - 1
+			}
+		}
+
+		leadIdx = leadPredIdx
+	} else {
+		var ok bool
+		predSet, ok = qv.buildPredicatesCandidate(leaves)
+		if !ok {
+			return nil, false, nil
+		}
+		if predSet.Len() != len(leaves) {
+			leadIdx = -1
+		}
 	}
 	defer predSet.Release()
 	for i := 0; i < predSet.Len(); i++ {

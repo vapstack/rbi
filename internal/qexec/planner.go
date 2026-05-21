@@ -786,6 +786,12 @@ func (b plannerORBranch) noOrderLeadIndex(need int) int {
 		if p.alwaysTrue || p.covered || p.alwaysFalse || !p.hasContains() || !p.hasIter() {
 			continue
 		}
+		if best >= 0 && p.expr.Op.IsNumericRange() && !b.preds.owner[best].expr.Op.IsNumericRange() {
+			bestEst := b.preds.owner[best].estCard
+			if bestEst > 0 && p.estCard < satMulUint64(bestEst, 4) {
+				continue
+			}
+		}
 		score := b.noOrderLeadScore(i, need)
 		if score < bestScore || (score == bestScore && p.estCard < b.preds.owner[best].estCard) {
 			best = i
@@ -1740,7 +1746,19 @@ func (qv *View) selectORNoOrder(q *qir.Shape, facts *plannerORFacts) plannerORNo
 
 	expectedRows := estimateRowsForNeed(uint64(need), facts.unionCard, facts.universe)
 	avgChecks := facts.noOrderChecks()
-	costKWay := float64(expectedRows) * (1.0 + avgChecks)
+	runRows := expectedRows
+	leadRows := uint64(0)
+	for i := 0; i < facts.branchCount; i++ {
+		lead := facts.branchesFacts[i].leadEst
+		if lead == 0 {
+			lead = facts.branchCards[i]
+		}
+		leadRows = satAddUint64(leadRows, lead)
+	}
+	if leadRows > 0 && leadRows < runRows {
+		runRows = leadRows
+	}
+	costKWay := float64(runRows) * (1.0 + avgChecks)
 	fallbackRows := min(facts.unionCard, uint64(need))
 	costFallback := float64(facts.sumCard) + float64(fallbackRows)
 
@@ -1750,7 +1768,7 @@ func (qv *View) selectORNoOrder(q *qir.Shape, facts *plannerORFacts) plannerORNo
 		candidates[n] = plannerORNoOrderCandidate{
 			kind:         plannerORNoOrderCandidateAdaptiveMerge,
 			cost:         costKWay,
-			expectedRows: expectedRows,
+			expectedRows: runRows,
 			unionRows:    facts.unionCard,
 			sumRows:      facts.sumCard,
 			avgChecks:    avgChecks,
@@ -1760,7 +1778,7 @@ func (qv *View) selectORNoOrder(q *qir.Shape, facts *plannerORFacts) plannerORNo
 	candidates[n] = plannerORNoOrderCandidate{
 		kind:         plannerORNoOrderCandidateBaselineMerge,
 		cost:         costKWay,
-		expectedRows: expectedRows,
+		expectedRows: runRows,
 		unionRows:    facts.unionCard,
 		sumRows:      facts.sumCard,
 		avgChecks:    avgChecks,
@@ -3836,6 +3854,15 @@ func (qv *View) buildORBranchPredicates(leaves []qir.Expr) (predicateSet, bool) 
 		if !ok {
 			preds.Release()
 			return predicateSet{}, false
+		}
+		if p.hasRuntimeRangeState() && e.Op.IsNumericRange() {
+			bounds, ok, err := qv.rangeBoundsForScalarExpr(e)
+			if err != nil || !ok {
+				preds.Release()
+				return predicateSet{}, false
+			}
+			p.effectiveBounds = bounds
+			p.hasEffectiveBounds = true
 		}
 		preds.Append(p)
 		pi := len(preds.owner) - 1

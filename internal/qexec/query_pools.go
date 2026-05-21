@@ -83,6 +83,9 @@ var leafPredSlicePool = pooled.NewSlicePool[leafPred](256, pooled.ClearCap,
 			if pred.postsBuf != nil {
 				posting.ReleaseSlice(pred.postsBuf)
 			}
+			if pred.hashAt < 0 {
+				releaseU64Set(&pred.hash)
+			}
 		}
 	},
 )

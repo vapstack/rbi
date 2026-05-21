@@ -482,22 +482,22 @@ func (qv *View) runOrderBasicBaseQuery(
 		return nil, true, nil
 	}
 
-	if trace == nil && q.Offset == 0 && len(residualActive) == 0 && !base.neg && nilTailField == "" {
+	if trace == nil && !base.neg && nilTailField == "" {
 		baseCard := baseBM.Cardinality()
 		if baseCard > 0 && baseCard <= 4096 {
-			out, examined, ok := scanOrderLimitDenseBaseNoTrace(q, ov, br, order.Desc, baseBM, int(baseCard))
+			out, examined, ok := scanOrderLimitDenseBaseNoTrace(q, ov, br, order.Desc, baseBM, int(baseCard), residualPreds, residualActive)
 			if ok {
 				qv.promoteOrderBasicLimitMaterializedBaseOps(orderField, baseOps, examined, uint64(needWindow))
 				return out, true, nil
 			}
 		}
 		if baseCard > 0 && baseCard <= 128 {
-			out, examined := scanOrderLimitSmallBaseNoTrace(q, ov, br, order.Desc, baseBM, int(baseCard))
+			out, examined := scanOrderLimitSmallBaseNoTrace(q, ov, br, order.Desc, baseBM, int(baseCard), residualPreds, residualActive)
 			qv.promoteOrderBasicLimitMaterializedBaseOps(orderField, baseOps, examined, uint64(needWindow))
 			return out, true, nil
 		}
 		if baseCard <= 4096 {
-			out, examined := scanOrderLimitPooledBaseNoTrace(q, ov, br, order.Desc, baseBM, int(baseCard))
+			out, examined := scanOrderLimitPooledBaseNoTrace(q, ov, br, order.Desc, baseBM, int(baseCard), residualPreds, residualActive)
 			qv.promoteOrderBasicLimitMaterializedBaseOps(orderField, baseOps, examined, uint64(needWindow))
 			return out, true, nil
 		}
@@ -1455,6 +1455,9 @@ func (qv *View) dispatchOrderedLimit(
 
 dispatch:
 	switch selected {
+	case plannerOrderedLimitCandidateEmpty:
+		return nil, true, PlanLimitOrderBasic, nil
+
 	case plannerOrderedLimitCandidateMaterializedFallback:
 		return qv.dispatchLimitMaterialized(q)
 
@@ -1513,7 +1516,7 @@ dispatch:
 				}
 			}
 		}
-		if q.Offset == 0 || !fm.Ptr {
+		if q.Offset == 0 || !fm.Ptr || nilTailField != "" {
 			predsBuf, ok, err := qv.buildLeafPredsExcludingBounds(ops, f, needWindow)
 			if err != nil {
 				return nil, true, "", err
@@ -1611,7 +1614,7 @@ dispatch:
 		return out, true, PlanOrdered, nil
 
 	case plannerOrderedLimitCandidateOrderedAnchor:
-		if q.Offset > 0 && !fm.Ptr {
+		if q.Offset > 0 && (!fm.Ptr || nilTailField != "") {
 			predsBuf, ok, err := qv.buildLeafPredsExcludingBounds(ops, f, needWindow)
 			if err != nil {
 				return nil, true, "", err
@@ -2285,7 +2288,10 @@ func (qv *View) scanOrderLimitWithPredicatesReaderGuarded(q *qir.Shape, ov index
 	return cursor.out, true
 }
 
-func scanOrderLimitDenseBaseNoTrace(q *qir.Shape, ov indexdata.FieldIndexView, br indexdata.FieldIndexRange, desc bool, base posting.List, baseCard int) ([]uint64, uint64, bool) {
+func scanOrderLimitDenseBaseNoTrace(q *qir.Shape, ov indexdata.FieldIndexView, br indexdata.FieldIndexRange, desc bool, base posting.List, baseCard int, preds predicateReader, active []int) ([]uint64, uint64, bool) {
+	if q.Offset >= uint64(baseCard) {
+		return nil, 0, true
+	}
 	it := base.Iter()
 	minID := it.Next()
 	maxID := minID
@@ -2305,9 +2311,10 @@ func scanOrderLimitDenseBaseNoTrace(q *qir.Shape, ov indexdata.FieldIndexView, b
 	}
 
 	limit := int(q.Limit)
+	skip := int(q.Offset)
 	need := limit
-	if need > baseCard {
-		need = baseCard
+	if remaining := baseCard - skip; need > remaining {
+		need = remaining
 	}
 	out := make([]uint64, 0, need)
 
@@ -2322,7 +2329,13 @@ func scanOrderLimitDenseBaseNoTrace(q *qir.Shape, ov indexdata.FieldIndexView, b
 			if single {
 				examined++
 				if idx >= minID && idx-minID < span {
-					out = append(out, idx)
+					if len(active) == 0 || orderBasicResidualMatchesReader(preds, active, idx) {
+						if skip > 0 {
+							skip--
+						} else {
+							out = append(out, idx)
+						}
+					}
 				}
 				continue
 			}
@@ -2331,10 +2344,16 @@ func scanOrderLimitDenseBaseNoTrace(q *qir.Shape, ov indexdata.FieldIndexView, b
 				examined++
 				idx = it.Next()
 				if idx >= minID && idx-minID < span {
-					out = append(out, idx)
-					if len(out) >= need {
-						it.Release()
-						return out, examined, true
+					if len(active) == 0 || orderBasicResidualMatchesReader(preds, active, idx) {
+						if skip > 0 {
+							skip--
+						} else {
+							out = append(out, idx)
+						}
+						if len(out) >= need {
+							it.Release()
+							return out, examined, true
+						}
 					}
 				}
 			}
@@ -2363,7 +2382,13 @@ func scanOrderLimitDenseBaseNoTrace(q *qir.Shape, ov indexdata.FieldIndexView, b
 			if idx >= minID {
 				off := idx - minID
 				if off < span && bits[off>>6]&(uint64(1)<<(off&63)) != 0 {
-					out = append(out, idx)
+					if len(active) == 0 || orderBasicResidualMatchesReader(preds, active, idx) {
+						if skip > 0 {
+							skip--
+						} else {
+							out = append(out, idx)
+						}
+					}
 				}
 			}
 			continue
@@ -2375,10 +2400,16 @@ func scanOrderLimitDenseBaseNoTrace(q *qir.Shape, ov indexdata.FieldIndexView, b
 			if idx >= minID {
 				off := idx - minID
 				if off < span && bits[off>>6]&(uint64(1)<<(off&63)) != 0 {
-					out = append(out, idx)
-					if len(out) >= need {
-						it.Release()
-						return out, examined, true
+					if len(active) == 0 || orderBasicResidualMatchesReader(preds, active, idx) {
+						if skip > 0 {
+							skip--
+						} else {
+							out = append(out, idx)
+						}
+						if len(out) >= need {
+							it.Release()
+							return out, examined, true
+						}
 					}
 				}
 			}
@@ -2388,7 +2419,10 @@ func scanOrderLimitDenseBaseNoTrace(q *qir.Shape, ov indexdata.FieldIndexView, b
 	return out, examined, true
 }
 
-func scanOrderLimitSmallBaseNoTrace(q *qir.Shape, ov indexdata.FieldIndexView, br indexdata.FieldIndexRange, desc bool, base posting.List, baseCard int) ([]uint64, uint64) {
+func scanOrderLimitSmallBaseNoTrace(q *qir.Shape, ov indexdata.FieldIndexView, br indexdata.FieldIndexRange, desc bool, base posting.List, baseCard int, preds predicateReader, active []int) ([]uint64, uint64) {
+	if q.Offset >= uint64(baseCard) {
+		return nil, 0
+	}
 	size := 1
 	for size < baseCard*2 {
 		size <<= 1
@@ -2410,9 +2444,10 @@ func scanOrderLimitSmallBaseNoTrace(q *qir.Shape, ov indexdata.FieldIndexView, b
 	it.Release()
 
 	limit := int(q.Limit)
+	skip := int(q.Offset)
 	need := limit
-	if need > baseCard {
-		need = baseCard
+	if remaining := baseCard - skip; need > remaining {
+		need = remaining
 	}
 	out := make([]uint64, 0, need)
 	keyCur := ov.NewCursor(br, desc)
@@ -2427,7 +2462,13 @@ func scanOrderLimitSmallBaseNoTrace(q *qir.Shape, ov indexdata.FieldIndexView, b
 			slot := (idx * 11400714819323198485) & mask
 			for used[slot] {
 				if keys[slot] == idx {
-					out = append(out, idx)
+					if len(active) == 0 || orderBasicResidualMatchesReader(preds, active, idx) {
+						if skip > 0 {
+							skip--
+						} else {
+							out = append(out, idx)
+						}
+					}
 					break
 				}
 				slot = (slot + 1) & mask
@@ -2441,7 +2482,13 @@ func scanOrderLimitSmallBaseNoTrace(q *qir.Shape, ov indexdata.FieldIndexView, b
 			slot := (idx * 11400714819323198485) & mask
 			for used[slot] {
 				if keys[slot] == idx {
-					out = append(out, idx)
+					if len(active) == 0 || orderBasicResidualMatchesReader(preds, active, idx) {
+						if skip > 0 {
+							skip--
+						} else {
+							out = append(out, idx)
+						}
+					}
 					break
 				}
 				slot = (slot + 1) & mask
@@ -2456,7 +2503,7 @@ func scanOrderLimitSmallBaseNoTrace(q *qir.Shape, ov indexdata.FieldIndexView, b
 	return out, examined
 }
 
-func scanOrderLimitPooledBaseNoTrace(q *qir.Shape, ov indexdata.FieldIndexView, br indexdata.FieldIndexRange, desc bool, base posting.List, baseCard int) ([]uint64, uint64) {
+func scanOrderLimitPooledBaseNoTrace(q *qir.Shape, ov indexdata.FieldIndexView, br indexdata.FieldIndexRange, desc bool, base posting.List, baseCard int, preds predicateReader, active []int) ([]uint64, uint64) {
 	size := 1
 	for size < baseCard*2 {
 		size <<= 1
@@ -2464,13 +2511,16 @@ func scanOrderLimitPooledBaseNoTrace(q *qir.Shape, ov indexdata.FieldIndexView, 
 	keys := pooled.GetUint64Slice(size)[:size]
 	used := pooled.GetBoolSlice(size)[:size]
 	clear(used)
-	out, examined := scanOrderLimitBaseHashNoTrace(q, ov, br, desc, base, baseCard, keys, used)
+	out, examined := scanOrderLimitBaseHashNoTrace(q, ov, br, desc, base, baseCard, keys, used, preds, active)
 	pooled.ReleaseBoolSlice(used)
 	pooled.ReleaseUint64Slice(keys)
 	return out, examined
 }
 
-func scanOrderLimitBaseHashNoTrace(q *qir.Shape, ov indexdata.FieldIndexView, br indexdata.FieldIndexRange, desc bool, base posting.List, baseCard int, keys []uint64, used []bool) ([]uint64, uint64) {
+func scanOrderLimitBaseHashNoTrace(q *qir.Shape, ov indexdata.FieldIndexView, br indexdata.FieldIndexRange, desc bool, base posting.List, baseCard int, keys []uint64, used []bool, preds predicateReader, active []int) ([]uint64, uint64) {
+	if q.Offset >= uint64(baseCard) {
+		return nil, 0
+	}
 	mask := uint64(len(keys) - 1)
 
 	it := base.Iter()
@@ -2486,9 +2536,10 @@ func scanOrderLimitBaseHashNoTrace(q *qir.Shape, ov indexdata.FieldIndexView, br
 	it.Release()
 
 	limit := int(q.Limit)
+	skip := int(q.Offset)
 	need := limit
-	if need > baseCard {
-		need = baseCard
+	if remaining := baseCard - skip; need > remaining {
+		need = remaining
 	}
 	out := make([]uint64, 0, need)
 	keyCur := ov.NewCursor(br, desc)
@@ -2503,7 +2554,13 @@ func scanOrderLimitBaseHashNoTrace(q *qir.Shape, ov indexdata.FieldIndexView, br
 			slot := (idx * 11400714819323198485) & mask
 			for used[slot] {
 				if keys[slot] == idx {
-					out = append(out, idx)
+					if len(active) == 0 || orderBasicResidualMatchesReader(preds, active, idx) {
+						if skip > 0 {
+							skip--
+						} else {
+							out = append(out, idx)
+						}
+					}
 					break
 				}
 				slot = (slot + 1) & mask
@@ -2517,7 +2574,13 @@ func scanOrderLimitBaseHashNoTrace(q *qir.Shape, ov indexdata.FieldIndexView, br
 			slot := (idx * 11400714819323198485) & mask
 			for used[slot] {
 				if keys[slot] == idx {
-					out = append(out, idx)
+					if len(active) == 0 || orderBasicResidualMatchesReader(preds, active, idx) {
+						if skip > 0 {
+							skip--
+						} else {
+							out = append(out, idx)
+						}
+					}
 					break
 				}
 				slot = (slot + 1) & mask

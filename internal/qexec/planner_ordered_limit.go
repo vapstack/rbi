@@ -45,6 +45,7 @@ type plannerOrderedLimitCandidateKind uint8
 
 const (
 	plannerOrderedLimitCandidateNone plannerOrderedLimitCandidateKind = iota
+	plannerOrderedLimitCandidateEmpty
 	plannerOrderedLimitCandidateOrderScan
 	plannerOrderedLimitCandidateOrderedAnchor
 	plannerOrderedLimitCandidateWarmBaseCore
@@ -56,6 +57,8 @@ const (
 
 func (k plannerOrderedLimitCandidateKind) String() string {
 	switch k {
+	case plannerOrderedLimitCandidateEmpty:
+		return "empty"
 	case plannerOrderedLimitCandidateOrderScan:
 		return "order_scan"
 	case plannerOrderedLimitCandidateOrderedAnchor:
@@ -189,7 +192,7 @@ func (d plannerOrderedLimitDecision) runtimeGuard(q *qir.Shape) plannerOrderedLi
 	}
 	minExamined := expected * 2
 	minByNeed := uint64(need) * 64
-	if minExamined < minByNeed {
+	if minExamined > minByNeed {
 		minExamined = minByNeed
 	}
 	if minExamined < 512 {
@@ -199,11 +202,16 @@ func (d plannerOrderedLimitDecision) runtimeGuard(q *qir.Shape) plannerOrderedLi
 	if rowCost < 1 {
 		rowCost = 1
 	}
+	fallbackCost := d.runtimeFallback.cost
+	placementFallbackCap := float64(need) * (48.0 + float64(d.selected.checks)*8.0)
+	if placementFallbackCap > 0 && fallbackCost > placementFallbackCap {
+		fallbackCost = placementFallbackCap
+	}
 	return plannerOrderedLimitRuntimeGuard{
 		enabled:      true,
 		minExamined:  minExamined,
 		needWindow:   uint64(need),
-		fallbackCost: d.runtimeFallback.cost,
+		fallbackCost: fallbackCost,
 		rowCost:      rowCost,
 		reason:       "placement_guard",
 	}
@@ -620,8 +628,12 @@ func (qv *View) orderedLimitBaseOpsCandidate(
 		cacheState = plannerOrderedLimitCacheGroupState(cacheState, state)
 	}
 
+	placementFallback := false
 	if !warm && !useful {
-		return plannerOrderedLimitCandidate{}, false, false, nil
+		if hasOffset || orderCandidate.cost <= 0 || buildWork == 0 {
+			return plannerOrderedLimitCandidate{}, false, false, nil
+		}
+		placementFallback = true
 	}
 	if limit <= 0 {
 		cacheState = plannerMaterializedCacheDisabled
@@ -647,6 +659,9 @@ func (qv *View) orderedLimitBaseOpsCandidate(
 			saved = maxSaved
 		}
 		baseCost = math.Max(1, baseCost-saved*0.35)
+	}
+	if placementFallback && baseCost <= orderCandidate.cost {
+		baseCost = orderCandidate.cost * 1.08
 	}
 	placementCapAllowed := buildWork == 0 || (maxCard > 0 && buildWork <= maxCard)
 	if placementCapAllowed && hasOffset && hasOrderBounds && orderCandidate.cost > 0 && orderCandidate.expectedRows > uint64(needWindow) {
@@ -875,6 +890,34 @@ func (qv *View) selectOrderedLimit(
 	var candidates [7]plannerOrderedLimitCandidate
 	n := 0
 
+	snap := qv.exec.Stats.Load()
+	universe := snap.UniverseOr(qv.snap.Universe.Cardinality())
+	baseSupported := true
+	emptySupported := false
+	for i := 0; i < len(facts.baseOps); i++ {
+		e := facts.baseOps[i]
+		if !qv.supportsLimitLeafPredExpr(e) {
+			baseSupported = false
+		}
+		sel, _, _, _, ok := qv.estimateLeafOrderCost(e, snap, universe, facts.orderField, facts.ov.HasData())
+		if !ok {
+			baseSupported = false
+			continue
+		}
+		if !e.Not && sel == 0 {
+			emptySupported = true
+			continue
+		}
+	}
+	if emptySupported && baseSupported {
+		return plannerOrderedLimitDecision{
+			selected: plannerOrderedLimitCandidate{
+				kind: plannerOrderedLimitCandidateEmpty,
+				cost: 1,
+			},
+		}, true, nil
+	}
+
 	if q.Offset == 0 && facts.bounds.HasPrefix && len(facts.baseOps) > 0 && len(facts.baseOps) <= 2 {
 		fastPrefix := true
 		for i := 0; i < len(facts.baseOps); i++ {
@@ -919,7 +962,19 @@ func (qv *View) selectOrderedLimit(
 
 	var orderedDecision plannerOrderedDecision
 	if len(facts.baseOps) != 0 {
-		orderedDecision = qv.decideOrderedByCost(q, facts.ops)
+		needOrderedDecision := true
+		if q.Offset == 0 && !facts.bounds.HasLo && !facts.bounds.HasHi && !facts.bounds.HasPrefix {
+			needOrderedDecision = false
+			for i := 0; i < len(facts.ops); i++ {
+				if facts.ops[i].Not {
+					needOrderedDecision = true
+					break
+				}
+			}
+		}
+		if needOrderedDecision {
+			orderedDecision = qv.decideOrderedByCost(q, facts.ops)
+		}
 	}
 
 	orderScan := qv.orderedLimitOrderScanCost(q, facts.ops, facts.ov, facts.br, facts.needWindow, orderedDecision)

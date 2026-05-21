@@ -808,6 +808,9 @@ func (qv *View) buildPredicatesCandidate(leaves []qir.Expr) (predicateSet, bool)
 		preds.Append(predicate{alwaysFalse: true})
 		return preds, true
 	}
+	if len(leaves) > 2 && qv.hasMergeableNumericRangeLeaves(leaves) {
+		return qv.buildPredicatesWithMergedNumericRanges(leaves, true, false)
+	}
 
 	preds := newPredicateSet(len(leaves))
 	for _, e := range leaves {
@@ -989,6 +992,48 @@ func (qv *View) buildPredEqCandidate(e qir.Expr, fm *schema.Field, ov indexdata.
 		ids:        ids,
 		estCard:    ids.Cardinality(),
 		releaseIDs: true,
+	}, true
+}
+
+func (qv *View) buildPredEqCandidateWithEst(e qir.Expr, est uint64) (predicate, bool) {
+	if e.Op != qir.OpEQ || e.Not || e.FieldOrdinal < 0 || est == 0 {
+		return qv.buildPredicateCandidate(e)
+	}
+
+	fm := qv.fieldMetaByExpr(e)
+	if fm == nil || fm.Slice {
+		return qv.buildPredicateCandidate(e)
+	}
+
+	ov := qv.fieldIndexViewFromSlotsForExpr(qv.snap.Index, e)
+	if !ov.HasData() {
+		return predicate{}, false
+	}
+
+	key, isSlice, isNil, err := qv.exprValueToLookupKey(qir.Expr{
+		Op:           e.Op,
+		FieldOrdinal: e.FieldOrdinal,
+		Value:        e.Value,
+	})
+	if err != nil || isSlice {
+		return predicate{}, false
+	}
+
+	var ids posting.List
+	if isNil {
+		ids = qv.fieldIndexViewFromSlotsForExpr(qv.snap.NilIndex, e).LookupPostingRetained(indexdata.NilIndexEntryKey)
+	} else {
+		ids = lookupScalarPostingRetained(ov, key)
+	}
+	if ids.IsEmpty() {
+		return predicate{expr: e, alwaysFalse: true}, true
+	}
+	return predicate{
+		expr:     e,
+		kind:     predicateKindPosting,
+		iterKind: predicateIterPosting,
+		posting:  ids,
+		estCard:  est,
 	}, true
 }
 

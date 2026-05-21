@@ -216,6 +216,10 @@ func emitPostingResultBucketToCursor(
 		return tmp, false
 	}
 
+	if !result.neg && !ids.Intersects(result.ids) {
+		return tmp, false
+	}
+
 	if shouldUseOnePassPostingResultFilter(ids, result, cursor.need, cursor.all) {
 		return tmp, qv.forEachPostingResultBucket(ids, result, cursor.emit)
 	}
@@ -237,6 +241,119 @@ func (qv *View) postingResultCardinality(result postingResult) uint64 {
 		return result.ids.Cardinality()
 	}
 	return qv.snap.Universe.Cardinality() - result.ids.Cardinality()
+}
+
+const orderBasicSingletonChunkCap = 1024
+
+func emitOrderBasicSingletonChunk(cursor *queryCursor, result postingResult, singles []uint64, minID, maxID, resultMin, resultMax uint64, ordered bool) bool {
+	if len(singles) == 0 || maxID < resultMin || minID > resultMax {
+		return false
+	}
+	if ordered {
+		for i := 0; i < len(singles); i++ {
+			idx := singles[i]
+			if result.ids.Contains(idx) && cursor.emit(idx) {
+				return true
+			}
+		}
+		return false
+	}
+	builder := newPostingUnionBuilder(true)
+	for i := 0; i < len(singles); i++ {
+		builder.addSingle(singles[i])
+	}
+	chunk := builder.finish(false)
+	if chunk.IsEmpty() || !chunk.Intersects(result.ids) {
+		chunk.Release()
+		return false
+	}
+	chunk.Release()
+	for i := 0; i < len(singles); i++ {
+		idx := singles[i]
+		if result.ids.Contains(idx) && cursor.emit(idx) {
+			return true
+		}
+	}
+	return false
+}
+
+func (qv *View) queryOrderBasicSingletonChunks(result postingResult, ov indexdata.FieldIndexView, o qir.Order, resultCard, skip, need uint64) []uint64 {
+	out := makeOutSlice(resultCard, need)
+	cursor := newQueryCursor(out, skip, need, false, 0)
+
+	resultMin, _ := result.ids.Minimum()
+	resultMax, _ := result.ids.Maximum()
+
+	var singlesBuf [orderBasicSingletonChunkCap]uint64
+	singles := singlesBuf[:0]
+	var minID uint64
+	var maxID uint64
+	inc := true
+	dec := true
+
+	var tmp posting.List
+	br := ov.RangeForBounds(indexdata.Bounds{Has: true})
+	cur := ov.NewCursor(br, o.Desc)
+	for {
+		ids, idx, single, ok := cur.NextPostingOrSingle()
+		if !ok {
+			break
+		}
+		if single {
+			n := len(singles)
+			if n == 0 {
+				minID = idx
+				maxID = idx
+			} else {
+				prev := singles[n-1]
+				if idx < prev {
+					inc = false
+				} else if idx > prev {
+					dec = false
+				}
+				if idx < minID {
+					minID = idx
+				} else if idx > maxID {
+					maxID = idx
+				}
+			}
+			singles = append(singles, idx)
+			if len(singles) < orderBasicSingletonChunkCap {
+				continue
+			}
+			if emitOrderBasicSingletonChunk(&cursor, result, singles, minID, maxID, resultMin, resultMax, inc || dec) {
+				tmp.Release()
+				return cursor.out
+			}
+			singles = singles[:0]
+			inc = true
+			dec = true
+			continue
+		}
+
+		if len(singles) > 0 {
+			if emitOrderBasicSingletonChunk(&cursor, result, singles, minID, maxID, resultMin, resultMax, inc || dec) {
+				tmp.Release()
+				return cursor.out
+			}
+			singles = singles[:0]
+			inc = true
+			dec = true
+		}
+
+		var done bool
+		tmp, done = emitPostingResultBucketToCursor(qv, &cursor, tmp, ids, result)
+		if done {
+			tmp.Release()
+			return cursor.out
+		}
+	}
+	if len(singles) > 0 && emitOrderBasicSingletonChunk(&cursor, result, singles, minID, maxID, resultMin, resultMax, inc || dec) {
+		tmp.Release()
+		return cursor.out
+	}
+	tmp.Release()
+	return cursor.out
 }
 
 func (qv *View) forEachPostingResultBucket(ids posting.List, result postingResult, fn func(uint64) bool) bool {
@@ -352,9 +469,12 @@ func (qv *View) queryOrderBasic(result postingResult, ov indexdata.FieldIndexVie
 		return nil, nil
 	}
 
-	isSliceOrderField := false
-	if fm := qv.fieldMetaByOrder(o); fm != nil && fm.Slice {
-		isSliceOrderField = true
+	fm := qv.fieldMetaByOrder(o)
+	isSliceOrderField := fm != nil && fm.Slice
+	if !result.neg && !isSliceOrderField && !all && need > 0 && resultCard <= 4096 {
+		if (fm == nil || !fm.Ptr) && uint64(ov.KeyCount()) >= resultCard*8 {
+			return qv.queryOrderBasicSingletonChunks(result, ov, o, resultCard, skip, need), nil
+		}
 	}
 
 	var tmp posting.List
