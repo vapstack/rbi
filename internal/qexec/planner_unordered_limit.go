@@ -470,9 +470,9 @@ func (qv *View) selectNoOrderLimit(q *qir.Shape, facts *noOrderLimitFacts) plann
 				if expected > rows {
 					expected = rows
 				}
-				cost := float64(expected)*0.82 + float64(br.BaseEnd-br.BaseStart)*0.20
+				cost := float64(expected) * 0.72
 				if residuals > 0 {
-					cost = float64(expected)*0.08 + float64(br.BaseEnd-br.BaseStart)*(1.0+float64(residuals)*0.55)
+					cost = float64(expected)*(0.75+float64(residuals)*0.35) + float64(residuals)*16.0
 					broadMin := satMulUint64(needWindow, uint64(limitRangeNoOrderBroadResidualRowsPerNeed))
 					if residuals >= 3 && leadFound && rows > broadMin && expected > leadRows {
 						cost = float64(expected)*(1.0+float64(residuals)*0.70) + float64(br.BaseEnd-br.BaseStart)*0.20

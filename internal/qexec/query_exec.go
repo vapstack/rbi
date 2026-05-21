@@ -28,6 +28,11 @@ func (qv *View) execSelectedNoOrderNoFilter(q *qir.Shape, trace *Trace) ([]uint6
 	}
 
 	out := make([]uint64, 0, clampUint64ToInt(outCap))
+	if trace == nil && q.Offset == 0 {
+		out, _ = appendPostingLimitNoTrace(out, universe, clampUint64ToInt(q.Limit))
+		return out, true, nil
+	}
+
 	cursor := newQueryCursor(out, 0, q.Limit, false, 0)
 
 	var (
@@ -85,6 +90,27 @@ func emitAcceptedPostingNoOrder(cursor *queryCursor, ids posting.List, examined 
 		}
 	}
 	return false
+}
+
+func appendPostingLimitNoTrace(out []uint64, ids posting.List, limit int) ([]uint64, bool) {
+	if ids.IsEmpty() {
+		return out, false
+	}
+	if idx, ok := ids.TrySingle(); ok {
+		out = append(out, idx)
+		return out, len(out) >= limit
+	}
+
+	it := ids.Iter()
+	for it.HasNext() {
+		out = append(out, it.Next())
+		if len(out) >= limit {
+			it.Release()
+			return out, true
+		}
+	}
+	it.Release()
+	return out, false
 }
 
 func predicatesMatchActiveReader(preds predicateReader, active []int, idx uint64) bool {
@@ -456,6 +482,27 @@ func (qv *View) runOrderBasicBaseQuery(
 		return nil, true, nil
 	}
 
+	if trace == nil && q.Offset == 0 && len(residualActive) == 0 && !base.neg && nilTailField == "" {
+		baseCard := baseBM.Cardinality()
+		if baseCard > 0 && baseCard <= 4096 {
+			out, examined, ok := scanOrderLimitDenseBaseNoTrace(q, ov, br, order.Desc, baseBM, int(baseCard))
+			if ok {
+				qv.promoteOrderBasicLimitMaterializedBaseOps(orderField, baseOps, examined, uint64(needWindow))
+				return out, true, nil
+			}
+		}
+		if baseCard > 0 && baseCard <= 128 {
+			out, examined := scanOrderLimitSmallBaseNoTrace(q, ov, br, order.Desc, baseBM, int(baseCard))
+			qv.promoteOrderBasicLimitMaterializedBaseOps(orderField, baseOps, examined, uint64(needWindow))
+			return out, true, nil
+		}
+		if baseCard <= 4096 {
+			out, examined := scanOrderLimitPooledBaseNoTrace(q, ov, br, order.Desc, baseBM, int(baseCard))
+			qv.promoteOrderBasicLimitMaterializedBaseOps(orderField, baseOps, examined, uint64(needWindow))
+			return out, true, nil
+		}
+	}
+
 	skip := q.Offset
 	need := q.Limit
 	out := make([]uint64, 0, need)
@@ -472,18 +519,18 @@ func (qv *View) runOrderBasicBaseQuery(
 	nilOV := qv.fieldIndexViewFromSlotsByName(qv.snap.NilIndex, nilTailField)
 
 	for {
-		_, ids, ok := keyCur.Next()
+		ids, idx, single, ok := keyCur.NextPostingOrSingle()
 		if !ok {
 			break
 		}
-		if ids.IsEmpty() {
+		if !single && ids.IsEmpty() {
 			continue
 		}
 		scanWidth++
 		var stop bool
-		if len(residualActive) == 0 {
-			if idx, ok := ids.TrySingle(); ok {
-				examined++
+		if single {
+			examined++
+			if len(residualActive) == 0 {
 				if base.neg {
 					if baseNegUniverse || !baseBM.Contains(idx) {
 						stop = cursor.emit(idx)
@@ -491,6 +538,22 @@ func (qv *View) runOrderBasicBaseQuery(
 				} else if baseBM.Contains(idx) {
 					stop = cursor.emit(idx)
 				}
+			} else if orderBasicContainsReader(residualPreds, residualActive, baseBM, base.neg, baseNegUniverse, idx) {
+				stop = cursor.emit(idx)
+			}
+		} else if !ids.IsEmpty() {
+			if len(residualActive) == 0 {
+				stop, tmp = orderBasicEmitFilteredPostingReader(
+					&cursor,
+					residualPreds,
+					residualActive,
+					baseBM,
+					base.neg,
+					baseNegUniverse,
+					ids,
+					tmp,
+					&examined,
+				)
 			} else {
 				stop, tmp = orderBasicEmitFilteredPostingReader(
 					&cursor,
@@ -504,18 +567,6 @@ func (qv *View) runOrderBasicBaseQuery(
 					&examined,
 				)
 			}
-		} else {
-			stop, tmp = orderBasicEmitFilteredPostingReader(
-				&cursor,
-				residualPreds,
-				residualActive,
-				baseBM,
-				base.neg,
-				baseNegUniverse,
-				ids,
-				tmp,
-				&examined,
-			)
 		}
 		if stop {
 			if trace != nil {
@@ -1421,6 +1472,47 @@ dispatch:
 		return qv.execPlanCandidateOrderBasic(q, predSet.owner, trace), true, PlanCandidateOrder, nil
 
 	case plannerOrderedLimitCandidateOrderScan:
+		if len(baseOps) == 0 {
+			out, _ := qv.scanOrderLimitNoPredicates(q, ov, br, order.Desc, nilTailField, trace)
+			plan := PlanLimitOrderBasic
+			if qv.hasPrefixBoundForField(ops, f) {
+				plan = PlanLimitOrderPrefix
+			}
+			return out, true, plan, nil
+		}
+		if trace == nil && q.Offset == 0 && nilTailField == "" && len(baseOps) == 1 {
+			e := baseOps[0]
+			if !e.Not && e.Op == qir.OpEQ && e.FieldOrdinal >= 0 && len(e.Operands) == 0 {
+				residualMeta := qv.fieldMetaByExpr(e)
+				residualView := qv.fieldIndexViewFromSlotsForExpr(qv.snap.Index, e)
+				if residualMeta != nil && !residualMeta.Slice && residualView.HasData() {
+					key, isSlice, isNil, err := qv.exprValueToLookupKey(e)
+					if err != nil {
+						return nil, true, "", err
+					}
+					if !isSlice && !isNil {
+						filter := lookupScalarPostingRetained(residualView, key)
+						plan := PlanLimitOrderBasic
+						if facts.bounds.HasPrefix {
+							plan = PlanLimitOrderPrefix
+						}
+						if filter.IsEmpty() {
+							return nil, true, plan, nil
+						}
+						out, ok := scanLimitByFieldIndexBoundsPostingFilterNoTrace(q, ov, br, order.Desc, filter, guard)
+						if !ok {
+							if guard.enabled && decision.runtimeFallback.kind != plannerOrderedLimitCandidateNone {
+								selected = decision.runtimeFallback.kind
+								guard = plannerOrderedLimitRuntimeGuard{}
+								goto dispatch
+							}
+							return qv.dispatchOrderedLimitFallback(q, decision)
+						}
+						return out, true, plan, nil
+					}
+				}
+			}
+		}
 		if q.Offset == 0 || !fm.Ptr {
 			predsBuf, ok, err := qv.buildLeafPredsExcludingBounds(ops, f, needWindow)
 			if err != nil {
@@ -1448,11 +1540,12 @@ dispatch:
 				}
 
 				execTrace := trace
+				observePreds := len(predsBuf) > 0
 				var observedTrace Trace
 				observedStart := uint64(0)
-				if execTrace == nil {
+				if observePreds && execTrace == nil {
 					execTrace = &observedTrace
-				} else {
+				} else if observePreds {
 					observedStart = execTrace.RowsExamined()
 				}
 
@@ -1468,7 +1561,9 @@ dispatch:
 					}
 					return qv.dispatchOrderedLimitFallback(q, decision)
 				}
-				qv.promoteObservedLimitLeafPreds(f, predsBuf, execTrace.RowsExamined()-observedStart, uint64(needWindow))
+				if observePreds {
+					qv.promoteObservedLimitLeafPreds(f, predsBuf, execTrace.RowsExamined()-observedStart, uint64(needWindow))
+				}
 				if predsBuf != nil {
 					leafPredSlicePool.Put(predsBuf)
 				}
@@ -1478,14 +1573,6 @@ dispatch:
 				}
 				return out, true, plan, nil
 			}
-		}
-		if len(baseOps) == 0 {
-			out, _ := qv.scanOrderLimitNoPredicates(q, ov, br, order.Desc, nilTailField, trace)
-			plan := PlanLimitOrderBasic
-			if qv.hasPrefixBoundForField(ops, f) {
-				plan = PlanLimitOrderPrefix
-			}
-			return out, true, plan, nil
 		}
 
 		predSet, ok := qv.buildPredicatesOrderedWithMode(ops, f, false, needWindow, q.Offset, true, true)
@@ -1551,11 +1638,12 @@ dispatch:
 				}
 
 				execTrace := trace
+				observePreds := len(predsBuf) > 0
 				var observedTrace Trace
 				observedStart := uint64(0)
-				if execTrace == nil {
+				if observePreds && execTrace == nil {
 					execTrace = &observedTrace
-				} else {
+				} else if observePreds {
 					observedStart = execTrace.RowsExamined()
 				}
 
@@ -1571,7 +1659,9 @@ dispatch:
 					}
 					return qv.dispatchOrderedLimitFallback(q, decision)
 				}
-				qv.promoteObservedLimitLeafPreds(f, predsBuf, execTrace.RowsExamined()-observedStart, uint64(needWindow))
+				if observePreds {
+					qv.promoteObservedLimitLeafPreds(f, predsBuf, execTrace.RowsExamined()-observedStart, uint64(needWindow))
+				}
 				if predsBuf != nil {
 					leafPredSlicePool.Put(predsBuf)
 				}
@@ -1784,6 +1874,33 @@ dispatch:
 
 func (qv *View) scanOrderLimitNoPredicates(q *qir.Shape, ov indexdata.FieldIndexView, br indexdata.FieldIndexRange, desc bool, nilTailField string, trace *Trace) ([]uint64, bool) {
 	out := make([]uint64, 0, q.Limit)
+	if trace == nil && q.Offset == 0 {
+		limit := clampUint64ToInt(q.Limit)
+		keyCur := ov.NewCursor(br, desc)
+		for {
+			ids, idx, single, ok := keyCur.NextPostingOrSingle()
+			if !ok {
+				break
+			}
+			if single {
+				out = append(out, idx)
+				if len(out) >= limit {
+					return out, true
+				}
+				continue
+			}
+			out, ok = appendPostingLimitNoTrace(out, ids, limit)
+			if ok {
+				return out, true
+			}
+		}
+		if nilTailField != "" {
+			ids := qv.fieldIndexViewFromSlotsByName(qv.snap.NilIndex, nilTailField).LookupPostingRetained(indexdata.NilIndexEntryKey)
+			out, _ = appendPostingLimitNoTrace(out, ids, limit)
+		}
+		return out, true
+	}
+
 	cursor := newQueryCursor(out, q.Offset, q.Limit, false, 0)
 
 	var (
@@ -2168,6 +2285,253 @@ func (qv *View) scanOrderLimitWithPredicatesReaderGuarded(q *qir.Shape, ov index
 	return cursor.out, true
 }
 
+func scanOrderLimitDenseBaseNoTrace(q *qir.Shape, ov indexdata.FieldIndexView, br indexdata.FieldIndexRange, desc bool, base posting.List, baseCard int) ([]uint64, uint64, bool) {
+	it := base.Iter()
+	minID := it.Next()
+	maxID := minID
+	for it.HasNext() {
+		idx := it.Next()
+		if idx < minID {
+			minID = idx
+		} else if idx > maxID {
+			maxID = idx
+		}
+	}
+	it.Release()
+
+	span := maxID - minID + 1
+	if span == 0 || span > 4096 {
+		return nil, 0, false
+	}
+
+	limit := int(q.Limit)
+	need := limit
+	if need > baseCard {
+		need = baseCard
+	}
+	out := make([]uint64, 0, need)
+
+	if span == uint64(baseCard) {
+		keyCur := ov.NewCursor(br, desc)
+		examined := uint64(0)
+		for len(out) < need {
+			ids, idx, single, ok := keyCur.NextPostingOrSingle()
+			if !ok {
+				break
+			}
+			if single {
+				examined++
+				if idx >= minID && idx-minID < span {
+					out = append(out, idx)
+				}
+				continue
+			}
+			it = ids.Iter()
+			for it.HasNext() {
+				examined++
+				idx = it.Next()
+				if idx >= minID && idx-minID < span {
+					out = append(out, idx)
+					if len(out) >= need {
+						it.Release()
+						return out, examined, true
+					}
+				}
+			}
+			it.Release()
+		}
+		return out, examined, true
+	}
+
+	var bits [64]uint64
+	it = base.Iter()
+	for it.HasNext() {
+		off := it.Next() - minID
+		bits[off>>6] |= uint64(1) << (off & 63)
+	}
+	it.Release()
+
+	keyCur := ov.NewCursor(br, desc)
+	examined := uint64(0)
+	for len(out) < need {
+		ids, idx, single, ok := keyCur.NextPostingOrSingle()
+		if !ok {
+			break
+		}
+		if single {
+			examined++
+			if idx >= minID {
+				off := idx - minID
+				if off < span && bits[off>>6]&(uint64(1)<<(off&63)) != 0 {
+					out = append(out, idx)
+				}
+			}
+			continue
+		}
+		it = ids.Iter()
+		for it.HasNext() {
+			examined++
+			idx = it.Next()
+			if idx >= minID {
+				off := idx - minID
+				if off < span && bits[off>>6]&(uint64(1)<<(off&63)) != 0 {
+					out = append(out, idx)
+					if len(out) >= need {
+						it.Release()
+						return out, examined, true
+					}
+				}
+			}
+		}
+		it.Release()
+	}
+	return out, examined, true
+}
+
+func scanOrderLimitSmallBaseNoTrace(q *qir.Shape, ov indexdata.FieldIndexView, br indexdata.FieldIndexRange, desc bool, base posting.List, baseCard int) ([]uint64, uint64) {
+	size := 1
+	for size < baseCard*2 {
+		size <<= 1
+	}
+	var keys [256]uint64
+	var used [256]bool
+	mask := uint64(size - 1)
+
+	it := base.Iter()
+	for it.HasNext() {
+		idx := it.Next()
+		slot := (idx * 11400714819323198485) & mask
+		for used[slot] {
+			slot = (slot + 1) & mask
+		}
+		used[slot] = true
+		keys[slot] = idx
+	}
+	it.Release()
+
+	limit := int(q.Limit)
+	need := limit
+	if need > baseCard {
+		need = baseCard
+	}
+	out := make([]uint64, 0, need)
+	keyCur := ov.NewCursor(br, desc)
+	examined := uint64(0)
+	for len(out) < need {
+		ids, idx, single, ok := keyCur.NextPostingOrSingle()
+		if !ok {
+			break
+		}
+		if single {
+			examined++
+			slot := (idx * 11400714819323198485) & mask
+			for used[slot] {
+				if keys[slot] == idx {
+					out = append(out, idx)
+					break
+				}
+				slot = (slot + 1) & mask
+			}
+			continue
+		}
+		it := ids.Iter()
+		for it.HasNext() {
+			examined++
+			idx = it.Next()
+			slot := (idx * 11400714819323198485) & mask
+			for used[slot] {
+				if keys[slot] == idx {
+					out = append(out, idx)
+					break
+				}
+				slot = (slot + 1) & mask
+			}
+			if len(out) >= need {
+				it.Release()
+				return out, examined
+			}
+		}
+		it.Release()
+	}
+	return out, examined
+}
+
+func scanOrderLimitPooledBaseNoTrace(q *qir.Shape, ov indexdata.FieldIndexView, br indexdata.FieldIndexRange, desc bool, base posting.List, baseCard int) ([]uint64, uint64) {
+	size := 1
+	for size < baseCard*2 {
+		size <<= 1
+	}
+	keys := pooled.GetUint64Slice(size)[:size]
+	used := pooled.GetBoolSlice(size)[:size]
+	clear(used)
+	out, examined := scanOrderLimitBaseHashNoTrace(q, ov, br, desc, base, baseCard, keys, used)
+	pooled.ReleaseBoolSlice(used)
+	pooled.ReleaseUint64Slice(keys)
+	return out, examined
+}
+
+func scanOrderLimitBaseHashNoTrace(q *qir.Shape, ov indexdata.FieldIndexView, br indexdata.FieldIndexRange, desc bool, base posting.List, baseCard int, keys []uint64, used []bool) ([]uint64, uint64) {
+	mask := uint64(len(keys) - 1)
+
+	it := base.Iter()
+	for it.HasNext() {
+		idx := it.Next()
+		slot := (idx * 11400714819323198485) & mask
+		for used[slot] {
+			slot = (slot + 1) & mask
+		}
+		used[slot] = true
+		keys[slot] = idx
+	}
+	it.Release()
+
+	limit := int(q.Limit)
+	need := limit
+	if need > baseCard {
+		need = baseCard
+	}
+	out := make([]uint64, 0, need)
+	keyCur := ov.NewCursor(br, desc)
+	examined := uint64(0)
+	for len(out) < need {
+		ids, idx, single, ok := keyCur.NextPostingOrSingle()
+		if !ok {
+			break
+		}
+		if single {
+			examined++
+			slot := (idx * 11400714819323198485) & mask
+			for used[slot] {
+				if keys[slot] == idx {
+					out = append(out, idx)
+					break
+				}
+				slot = (slot + 1) & mask
+			}
+			continue
+		}
+		it := ids.Iter()
+		for it.HasNext() {
+			examined++
+			idx = it.Next()
+			slot := (idx * 11400714819323198485) & mask
+			for used[slot] {
+				if keys[slot] == idx {
+					out = append(out, idx)
+					break
+				}
+				slot = (slot + 1) & mask
+			}
+			if len(out) >= need {
+				it.Release()
+				return out, examined
+			}
+		}
+		it.Release()
+	}
+	return out, examined
+}
+
 func (qv *View) execSelectedNoOrderDirectRange(q *qir.Shape, trace *Trace) ([]uint64, bool, error) {
 	e := q.Expr
 	if e.Op == qir.OpAND || e.Op == qir.OpOR || len(e.Operands) != 0 {
@@ -2266,6 +2630,28 @@ func (qv *View) execSelectedNoOrderDirectRange(q *qir.Shape, trace *Trace) ([]ui
 	cursor := newQueryCursor(out, skip, need, false, 0)
 
 	keyCur := ov.NewCursor(br, false)
+	if trace == nil && skip == 0 {
+		limit := clampUint64ToInt(need)
+		for {
+			ids, idx, single, ok := keyCur.NextPostingOrSingle()
+			if !ok {
+				break
+			}
+			if single {
+				out = append(out, idx)
+				if len(out) >= limit {
+					return out, true, nil
+				}
+				continue
+			}
+			out, ok = appendPostingLimitNoTrace(out, ids, limit)
+			if ok {
+				return out, true, nil
+			}
+		}
+		return out, true, nil
+	}
+
 	var (
 		examined    uint64
 		examinedPtr *uint64
@@ -2331,6 +2717,28 @@ func (qv *View) execSelectedNoOrderDirectPrefix(q *qir.Shape, trace *Trace) ([]u
 	cursor := newQueryCursor(out, skip, need, false, 0)
 
 	keyCur := prefixState.ov.NewCursor(prefixState.br, false)
+	if trace == nil && skip == 0 {
+		limit := clampUint64ToInt(need)
+		for {
+			ids, idx, single, ok := keyCur.NextPostingOrSingle()
+			if !ok {
+				break
+			}
+			if single {
+				out = append(out, idx)
+				if len(out) >= limit {
+					return out, true, nil
+				}
+				continue
+			}
+			out, ok = appendPostingLimitNoTrace(out, ids, limit)
+			if ok {
+				return out, true, nil
+			}
+		}
+		return out, true, nil
+	}
+
 	var (
 		examined    uint64
 		examinedPtr *uint64

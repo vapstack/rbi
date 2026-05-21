@@ -924,6 +924,32 @@ func (qv *View) buildLeafPredsExcludingBounds(leaves []qir.Expr, field string, o
 func (qv *View) scanLimitByFieldIndexBounds(q *qir.Shape, ov indexdata.FieldIndexView, br indexdata.FieldIndexRange, desc bool, preds []leafPred, nilTailField string, guard plannerOrderedLimitRuntimeGuard, trace *Trace) ([]uint64, bool) {
 	limit := int(q.Limit)
 	out := make([]uint64, 0, limit)
+	if trace == nil && q.Offset == 0 && len(preds) == 0 {
+		keyCur := ov.NewCursor(br, desc)
+		for {
+			ids, idx, single, ok := keyCur.NextPostingOrSingle()
+			if !ok {
+				break
+			}
+			if single {
+				out = append(out, idx)
+				if len(out) >= limit {
+					return out, true
+				}
+				continue
+			}
+			out, ok = appendPostingLimitNoTrace(out, ids, limit)
+			if ok {
+				return out, true
+			}
+		}
+		if nilTailField != "" {
+			ids := qv.fieldIndexViewFromSlotsByName(qv.snap.NilIndex, nilTailField).LookupPostingRetained(indexdata.NilIndexEntryKey)
+			out, _ = appendPostingLimitNoTrace(out, ids, limit)
+		}
+		return out, true
+	}
+
 	cursor := newQueryCursor(out, q.Offset, q.Limit, false, 0)
 	trackScanWidth := q.HasOrder
 
@@ -1122,6 +1148,46 @@ func (qv *View) scanLimitByFieldIndexBounds(q *qir.Shape, ov indexdata.FieldInde
 	}
 
 	return cursor.out, true
+}
+
+func scanLimitByFieldIndexBoundsPostingFilterNoTrace(q *qir.Shape, ov indexdata.FieldIndexView, br indexdata.FieldIndexRange, desc bool, filter posting.List, guard plannerOrderedLimitRuntimeGuard) ([]uint64, bool) {
+	limit := int(q.Limit)
+	out := make([]uint64, 0, limit)
+	keyCur := ov.NewCursor(br, desc)
+	examined := uint64(0)
+	for {
+		ids, idx, single, ok := keyCur.NextPostingOrSingle()
+		if !ok {
+			break
+		}
+		if single {
+			examined++
+			if filter.Contains(idx) {
+				out = append(out, idx)
+				if len(out) >= limit {
+					return out, true
+				}
+			}
+		} else {
+			it := ids.Iter()
+			for it.HasNext() {
+				examined++
+				idx = it.Next()
+				if filter.Contains(idx) {
+					out = append(out, idx)
+					if len(out) >= limit {
+						it.Release()
+						return out, true
+					}
+				}
+			}
+			it.Release()
+		}
+		if guard.enabled && guard.shouldFallback(examined, len(out)) {
+			return nil, false
+		}
+	}
+	return out, true
 }
 
 func isBoundOp(op qir.Op) bool {

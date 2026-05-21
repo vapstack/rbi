@@ -875,6 +875,48 @@ func (qv *View) selectOrderedLimit(
 	var candidates [7]plannerOrderedLimitCandidate
 	n := 0
 
+	if q.Offset == 0 && facts.bounds.HasPrefix && len(facts.baseOps) > 0 && len(facts.baseOps) <= 2 {
+		fastPrefix := true
+		for i := 0; i < len(facts.baseOps); i++ {
+			e := facts.baseOps[i]
+			if e.Not || e.FieldOrdinal < 0 || len(e.Operands) != 0 || !isScalarEqOrInOp(e.Op) {
+				fastPrefix = false
+				break
+			}
+			fm := qv.fieldMetaByExpr(e)
+			if fm == nil || fm.Slice {
+				fastPrefix = false
+				break
+			}
+		}
+		if fastPrefix {
+			expectedRows := uint64(facts.needWindow)
+			_, rows := facts.ov.RangeStats(facts.br)
+			if rows > 0 && expectedRows > rows {
+				expectedRows = rows
+			}
+			buckets := uint64(0)
+			if !facts.br.Empty() && facts.br.BaseEnd >= facts.br.BaseStart {
+				buckets = uint64(facts.br.BaseEnd - facts.br.BaseStart)
+			}
+			orderScan := plannerOrderedLimitCandidate{
+				kind:         plannerOrderedLimitCandidateOrderScan,
+				cost:         float64(expectedRows) * (1.0 + float64(len(facts.baseOps))*0.35),
+				expectedRows: expectedRows,
+				buckets:      buckets,
+				checks:       uint64(len(facts.baseOps)),
+				cacheState:   plannerMaterializedCacheDisabled,
+			}
+			fallback := orderedLimitMaterializedFallbackCandidate(q, facts.ops, orderScan.cost, plannerOrderedDecision{})
+			return plannerOrderedLimitDecision{
+				selected:             orderScan,
+				runtimeFallback:      fallback,
+				materializedFallback: fallback,
+				rejected:             fallback,
+			}, true, nil
+		}
+	}
+
 	var orderedDecision plannerOrderedDecision
 	if len(facts.baseOps) != 0 {
 		orderedDecision = qv.decideOrderedByCost(q, facts.ops)

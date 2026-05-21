@@ -595,6 +595,40 @@ func plannerOROrderPick(candidates []plannerOROrderCandidate, forceMaterialized 
 	return d
 }
 
+func plannerOROrderPreferMaterializedSmallSideBranches(
+	q *qir.Shape,
+	branchCards *[plannerORBranchLimit]uint64,
+	branchCount int,
+	unionCard uint64,
+	need int,
+	stats *[plannerORBranchLimit]plannerOROrderMergeBranchStats,
+) bool {
+	if q.Offset != 0 || branchCount < 3 || unionCard == 0 || need <= 0 {
+		return false
+	}
+	smallMax := uint64(need) * 32
+	if smallMax < 4096 {
+		smallMax = 4096
+	}
+	wideMin := smallMax * 8
+	if unionCard < wideMin {
+		return false
+	}
+	small := 0
+	for i := 0; i < branchCount && i < plannerORBranchLimit; i++ {
+		card := branchCards[i]
+		// A dominant covered order branch can satisfy LIMIT by scanning order buckets;
+		// forcing fallback would materialize the broad side branch.
+		if card > smallMax && card >= unionCard-card && stats[i].streamChecks == 0 {
+			return false
+		}
+		if card > 0 && card <= smallMax {
+			small++
+		}
+	}
+	return small >= 2
+}
+
 func plannerOROrderFallbackFirstDecisionFromCost(
 	q *qir.Shape,
 	need int,
@@ -772,9 +806,13 @@ func (qv *View) selectPlanOROrderWithAnalysis(
 	expectedRows := estimateRowsForNeed(uint64(need), unionCard, universe)
 	streamChecks := branches.orderStreamChecksByBranch(hasAlwaysTrue, analysis.mergeStats)
 	costFallback := float64(sumCard) + float64(expectedRows)
-	cacheState, eagerBuildWork := qv.orderedORCacheCandidateState(branches, analysis, need, q.Offset)
+	cacheState := plannerMaterializedCacheDisabled
+	eagerBuildWork := uint64(0)
+	if q.Offset > 0 {
+		cacheState, eagerBuildWork = qv.orderedORCacheCandidateState(branches, analysis, need, q.Offset)
+	}
 	eagerCost := 0.0
-	if q.Offset > 0 && eagerBuildWork > 0 {
+	if eagerBuildWork > 0 {
 		eagerCost = float64(eagerBuildWork)
 	}
 	costStream := float64(expectedRows)*streamChecks*plannerFieldStatsSkew(orderStats) + eagerCost
@@ -852,7 +890,10 @@ func (qv *View) selectPlanOROrderWithAnalysis(
 	}
 	n++
 
-	return plannerOROrderPick(candidates[:n], q.Limit > plannerOROrderLimitMax || q.Offset > plannerOROrderOffsetMax)
+	forceMaterialized := q.Limit > plannerOROrderLimitMax ||
+		q.Offset > plannerOROrderOffsetMax ||
+		plannerOROrderPreferMaterializedSmallSideBranches(q, &branchCards, branchCount, unionCard, need, &analysis.mergeStats)
+	return plannerOROrderPick(candidates[:n], forceMaterialized)
 }
 
 // unionCards estimates planner metrics for OR union cardinalities.

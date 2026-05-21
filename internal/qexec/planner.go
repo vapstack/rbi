@@ -1895,7 +1895,10 @@ func (qv *View) selectOROrder(q *qir.Shape, facts *plannerORFacts) plannerOROrde
 	}
 	n++
 
-	return plannerOROrderPick(candidates[:n], q.Limit > plannerOROrderLimitMax || q.Offset > plannerOROrderOffsetMax)
+	forceMaterialized := q.Limit > plannerOROrderLimitMax ||
+		q.Offset > plannerOROrderOffsetMax ||
+		plannerOROrderPreferMaterializedSmallSideBranches(q, &facts.branchCards, facts.branchCount, facts.unionCard, need, &facts.mergeStats)
+	return plannerOROrderPick(candidates[:n], forceMaterialized)
 }
 
 func (facts *plannerORFacts) orderStreamChecks() float64 {
@@ -3916,7 +3919,6 @@ func (qv *View) buildORBranchesOrdered(
 		// Eager materializing non-order range predicates here can dominate total
 		// query cost before branch streaming even starts.
 		preds, ok := qv.buildPredicatesOrderedWithMode(leaves, orderField, false, orderedWindow, orderedOffset, true, false)
-		// preds, ok := qv.buildPredicatesOrderedWithMode(leaves, orderField, false, orderedWindow, orderedOffset, true, true)
 		if !ok {
 			out.Release()
 			return plannerORBranches{}, false, false
@@ -4692,6 +4694,7 @@ type plannerOROrderBranchIter struct {
 
 	nextBucket    int
 	curBucket     int
+	curCursor     indexdata.FieldIndexCursor
 	curIter       posting.Iterator
 	curExact      bool
 	curChecks     []int
@@ -4740,6 +4743,7 @@ func (it *plannerOROrderBranchIter) init() {
 	} else {
 		it.nextBucket = it.startBucket
 	}
+	it.curCursor = it.indexView.NewCursor(it.indexView.RangeByRanks(it.startBucket, it.endBucket), it.desc)
 	it.curBucket = -1
 }
 
@@ -4852,16 +4856,16 @@ func (it *plannerOROrderBranchIter) advance() (uint64, uint64, uint64, bool) {
 			}
 			b := it.nextBucket
 			it.nextBucket--
-			bucket := it.indexView.PostingAt(b)
-			if bucket.IsEmpty() {
-				continue
+			bucket, idx, single, ok := it.curCursor.NextPostingOrSingle()
+			if !ok {
+				return examinedDelta, residualExaminedDelta, emittedDelta, false
 			}
 
 			if it.bucketSeen != nil && !it.bucketSeen[b] {
 				it.bucketSeen[b] = true
 			}
 			it.curBucket = b
-			if idx, ok := bucket.TrySingle(); ok {
+			if single {
 				examinedDelta++
 				matched, residualChecked := it.matchBucketCandidate(idx)
 				if residualChecked {
@@ -4941,9 +4945,9 @@ func (it *plannerOROrderBranchIter) advance() (uint64, uint64, uint64, bool) {
 		b := it.nextBucket
 		it.nextBucket++
 
-		bucket := it.indexView.PostingAt(b)
-		if bucket.IsEmpty() {
-			continue
+		bucket, idx, single, ok := it.curCursor.NextPostingOrSingle()
+		if !ok {
+			return examinedDelta, residualExaminedDelta, emittedDelta, false
 		}
 
 		if it.bucketSeen != nil && !it.bucketSeen[b] {
@@ -4951,7 +4955,7 @@ func (it *plannerOROrderBranchIter) advance() (uint64, uint64, uint64, bool) {
 		}
 
 		it.curBucket = b
-		if idx, ok := bucket.TrySingle(); ok {
+		if single {
 			examinedDelta++
 			matched, residualChecked := it.matchBucketCandidate(idx)
 			if residualChecked {

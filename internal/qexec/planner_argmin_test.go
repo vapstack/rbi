@@ -398,6 +398,95 @@ func TestPlannerArgmin_OROrderDecisionMatchesCandidatePolicy_FallbackSynthetic(t
 	plannerArgminAssertApproxCost(t, "synthetic ordered OR fallback", decision.fallbackCost, candidates.fallbackCost)
 }
 
+func TestPlannerArgmin_OROrderSmallSideBranchesKeepsBroadCoveredStream(t *testing.T) {
+	tests := []struct {
+		name         string
+		card         uint64
+		rangeRows    uint64
+		rangeBounded bool
+	}{
+		{name: "BoundedRange", card: 60_000, rangeRows: 60_000, rangeBounded: true},
+		{name: "FullSpan", card: 100_000},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			db := newTestDB(t, testOptions{})
+			_ = db.seedData(t, 2_000)
+			db.setPlannerStatsSnapshot(100_000, PlannerFieldStats{
+				DistinctKeys:    100_000,
+				NonEmptyKeys:    100_000,
+				TotalBucketCard: 100_000,
+				AvgBucketCard:   1,
+				MaxBucketCard:   2,
+				P50BucketCard:   1,
+				P95BucketCard:   2,
+			})
+
+			q := qx.Query(
+				qx.OR(
+					qx.GTE("score", 10.0),
+					qx.EQ("country", "NL"),
+					qx.EQ("name", "alice"),
+				),
+			).Sort("score", qx.DESC).Limit(10)
+
+			preparedQ, viewQ, err := db.prepareQuery(q)
+			if err != nil {
+				t.Fatalf("prepareTestQuery: %v", err)
+			}
+			defer preparedQ.Release()
+
+			branches := newPlannerORBranches(3)
+			branches.Append(makeORBranchForPlannerDecisionTest(tc.card, 0))
+			branches.Append(makeORBranchForPlannerDecisionTest(100, 1))
+			branches.Append(makeORBranchForPlannerDecisionTest(100, 1))
+			defer branches.Release()
+
+			var analysis plannerOROrderAnalysis
+			analysis.orderField = "score"
+			analysis.snapshotUniverse = 100_000
+			analysis.branchCount = branches.Len()
+			analysis.mergeStats[0] = plannerOROrderMergeBranchStats{
+				streamChecks: 0,
+				mergeChecks:  0,
+				rangeRows:    tc.rangeRows,
+				rangeBounded: tc.rangeBounded,
+			}
+			for i := 1; i < branches.Len(); i++ {
+				checks := branches.owner[i].containsChecks()
+				analysis.mergeStats[i].streamChecks = checks
+				analysis.mergeStats[i].mergeChecks = checks
+			}
+
+			view := db.view()
+			candidates, ok := plannerArgminOROrderCandidatesForTest(view, &viewQ, branches, &analysis)
+			if !ok {
+				t.Fatalf("plannerArgminOROrderCandidatesForTest: ok=false")
+			}
+			wantPlan, wantCost := candidates.expectedPlan()
+			if wantPlan == plannerOROrderFallback {
+				t.Fatalf(
+					"expected candidate policy to avoid fallback, got %v (stream=%v fallback=%v merge=%v)",
+					wantPlan, candidates.streamCost, candidates.fallbackCost, candidates.mergeCost,
+				)
+			}
+
+			decision := view.selectPlanOROrderWithAnalysis(&viewQ, branches, &analysis)
+			if decision.selected.kind == plannerOROrderCandidateMaterializedFallback {
+				t.Fatalf(
+					"small-side heuristic forced fallback despite dominant covered order branch: stream=%v fallback=%v",
+					candidates.streamCost, candidates.fallbackCost,
+				)
+			}
+			if decision.plan != wantPlan {
+				t.Fatalf("ordered OR winner mismatch: got=%v want=%v", decision.plan, wantPlan)
+			}
+			plannerArgminAssertApproxCost(t, "covered-stream ordered OR best", decision.bestCost, wantCost)
+		})
+	}
+}
+
 func TestPlannerArgmin_OrderedDecisionMatchesCandidatePolicy(t *testing.T) {
 	db := newTestDB(t, testOptions{})
 	_ = db.seedData(t, 20_000)
