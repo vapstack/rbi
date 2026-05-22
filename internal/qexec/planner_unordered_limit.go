@@ -82,10 +82,14 @@ type noOrderLimitFacts struct {
 	hasUnique                bool
 }
 
+const plannerLimitFactsRetainExprCap = 64
+
 var noOrderLimitFactsPool = pooled.Pointers[noOrderLimitFacts]{
 	Cleanup: func(facts *noOrderLimitFacts) {
 		leavesBuf := facts.leavesBuf
-		if cap(leavesBuf) > 0 {
+		if cap(leavesBuf) > plannerLimitFactsRetainExprCap {
+			leavesBuf = nil
+		} else if cap(leavesBuf) > 0 {
 			clear(leavesBuf[:cap(leavesBuf)])
 			leavesBuf = leavesBuf[:0]
 		}

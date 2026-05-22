@@ -1488,7 +1488,7 @@ func (qv *View) collectORFacts(q *qir.Shape, facts *plannerORFacts) bool {
 }
 
 func (qv *View) collectORBranchFacts(q *qir.Shape, facts *plannerORFacts, snap *PlannerStatsSnapshot) bool {
-	var leavesBuf [8]qir.Expr
+	var leavesBuf [plannerPredicateFastPathMaxLeaves]qir.Expr
 	for i := 0; i < len(q.Expr.Operands); i++ {
 		fact, keep, ok := qv.collectORBranchFact(q.Expr.Operands[i], facts, snap, leavesBuf[:0])
 		if !ok {
@@ -1523,15 +1523,22 @@ func (qv *View) collectORBranchFacts(q *qir.Shape, facts *plannerORFacts, snap *
 	return true
 }
 
+func collectORBranchLeaves(op qir.Expr, leavesBuf []qir.Expr) ([]qir.Expr, []qir.Expr, bool) {
+	return qir.CollectAndLeavesPooled(op, leavesBuf[:0], qir.LeafModeCollect)
+}
+
 func (qv *View) collectORBranchFact(
 	op qir.Expr,
 	facts *plannerORFacts,
 	snap *PlannerStatsSnapshot,
 	leavesBuf []qir.Expr,
 ) (plannerORBranchFact, bool, bool) {
-	leaves, ok := qir.CollectAndLeavesScratch(op, leavesBuf[:0], qir.LeafModeCollect)
+	leaves, leavesHeap, ok := collectORBranchLeaves(op, leavesBuf)
 	if !ok {
 		return plannerORBranchFact{}, false, false
+	}
+	if leavesHeap != nil {
+		defer qir.ReleaseExprSlice(leavesHeap)
 	}
 	if len(leaves) == 0 {
 		return plannerORBranchFact{alwaysTrue: true, card: facts.universe}, true, true
@@ -1623,6 +1630,9 @@ func (qv *View) collectORBranchFact(
 	}
 	if hasRange {
 		br := facts.orderView.RangeForBounds(rb)
+		if br.Empty() {
+			return plannerORBranchFact{}, false, true
+		}
 		if br.BaseStart != 0 || br.BaseEnd != facts.orderView.KeyCount() {
 			fact.rangeBounded = true
 			_, fact.rangeRows = facts.orderView.RangeStats(br)
@@ -3931,16 +3941,19 @@ func (qv *View) buildORBranchPredicates(leaves []qir.Expr) (predicateSet, bool) 
 // lead iterators used by OR execution strategies.
 func (qv *View) buildORBranches(ops []qir.Expr) (plannerORBranches, bool, bool) {
 	out := newPlannerORBranches(len(ops))
-	var leavesBuf [8]qir.Expr
+	var leavesBuf [plannerPredicateFastPathMaxLeaves]qir.Expr
 
 	for _, op := range ops {
-		leaves, ok := qir.CollectAndLeavesScratch(op, leavesBuf[:0], qir.LeafModeCollect)
+		leaves, leavesHeap, ok := collectORBranchLeaves(op, leavesBuf[:0])
 		if !ok {
 			out.Release()
 			return plannerORBranches{}, false, false
 		}
 
 		preds, ok := qv.buildORBranchPredicates(leaves)
+		if leavesHeap != nil {
+			qir.ReleaseExprSlice(leavesHeap)
+		}
 		if !ok {
 			out.Release()
 			return plannerORBranches{}, false, false
@@ -3971,10 +3984,10 @@ func (qv *View) buildORBranchesOrdered(
 ) (plannerORBranches, bool, bool) {
 
 	out := newPlannerORBranches(len(ops))
-	var leavesBuf [8]qir.Expr
+	var leavesBuf [plannerPredicateFastPathMaxLeaves]qir.Expr
 
 	for _, op := range ops {
-		leaves, ok := qir.CollectAndLeavesScratch(op, leavesBuf[:0], qir.LeafModeCollect)
+		leaves, leavesHeap, ok := collectORBranchLeaves(op, leavesBuf[:0])
 		if !ok {
 			out.Release()
 			return plannerORBranches{}, false, false
@@ -3984,6 +3997,9 @@ func (qv *View) buildORBranchesOrdered(
 		// Eager materializing non-order range predicates here can dominate total
 		// query cost before branch streaming even starts.
 		preds, ok := qv.buildPredicatesOrderedWithMode(leaves, orderField, false, orderedWindow, orderedOffset, true, false)
+		if leavesHeap != nil {
+			qir.ReleaseExprSlice(leavesHeap)
+		}
 		if !ok {
 			out.Release()
 			return plannerORBranches{}, false, false

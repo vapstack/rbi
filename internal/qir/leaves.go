@@ -57,6 +57,38 @@ func CollectAndLeavesScratch(e Expr, dst []Expr, mode LeafMode) ([]Expr, bool) {
 	}
 }
 
+func CollectAndLeavesPooled(e Expr, dst []Expr, mode LeafMode) ([]Expr, []Expr, bool) {
+	dst, status := appendAndLeaves(dst[:0], e, mode)
+	switch status {
+
+	case leafStatusOK:
+		if len(dst) == 0 {
+			return nil, nil, true
+		}
+		return dst, nil, true
+
+	case leafStatusOverflow:
+		n, ok := AndLeafLen(e, mode)
+		if !ok {
+			return nil, nil, false
+		}
+		heap := GetExprSlice(n)
+		out, status := appendAndLeaves(heap[:0], e, mode)
+		if status != leafStatusOK {
+			ReleaseExprSlice(heap)
+			return nil, nil, false
+		}
+		if len(out) == 0 {
+			ReleaseExprSlice(heap)
+			return nil, nil, true
+		}
+		return out, heap, true
+
+	default:
+		return nil, nil, false
+	}
+}
+
 func AndLeafLen(e Expr, mode LeafMode) (int, bool) {
 	switch e.Op {
 

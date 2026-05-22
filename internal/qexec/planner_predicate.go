@@ -1633,16 +1633,9 @@ func (qv *View) execPlanLeadScanNoOrder(q *qir.Shape, preds predicateReader, lea
 		}
 	}
 
-	var it posting.Iterator
 	leadNeedsCheck := false
 	if leadIdx >= 0 {
-		it = (&preds[leadIdx]).newIter()
 		leadNeedsCheck = (&preds[leadIdx]).leadIterNeedsContainsCheck()
-	} else {
-		it = qv.snap.Universe.Borrow().Iter()
-	}
-	if it != nil {
-		defer it.Release()
 	}
 
 	var activeBuf [plannerPredicateFastPathMaxLeaves]int
@@ -1684,8 +1677,18 @@ func (qv *View) execPlanLeadScanNoOrder(q *qir.Shape, preds predicateReader, lea
 		singleActive = active[0]
 	}
 
-	if out, ok := qv.execLeadScanNoOrderBuckets(q, preds, leadIdx, active, trace); ok {
+	if out, ok := qv.execLeadScanNoOrderBuckets(q, preds, leadIdx, trace); ok {
 		return out
+	}
+
+	var it posting.Iterator
+	if leadIdx >= 0 {
+		it = (&preds[leadIdx]).newIter()
+	} else {
+		it = qv.snap.Universe.Borrow().Iter()
+	}
+	if it != nil {
+		defer it.Release()
 	}
 
 	if trace != nil {
@@ -1729,14 +1732,40 @@ func (qv *View) execPlanLeadScanNoOrder(q *qir.Shape, preds predicateReader, lea
 	return cursor.out
 }
 
-func (qv *View) execLeadScanNoOrderBuckets(q *qir.Shape, preds predicateReader, leadIdx int, active []int, trace *Trace) ([]uint64, bool) {
+func (qv *View) execLeadScanNoOrderBuckets(q *qir.Shape, preds predicateReader, leadIdx int, trace *Trace) ([]uint64, bool) {
 	if leadIdx < 0 || leadIdx >= len(preds) {
 		return nil, false
 	}
 	lead := preds[leadIdx]
-	e := lead.expr
-	span, ok, err := qv.prepareScalarIndexSpan(e)
-	if err != nil || !ok {
+	var span preparedScalarIndexSpan
+	ok := false
+	if lead.hasEffectiveBounds {
+		if lead.effectiveBounds.Empty {
+			return nil, true
+		}
+		e := lead.expr
+		if !isSimpleScalarRangeOrPrefixLeaf(e) {
+			return nil, false
+		}
+		fm := qv.fieldMetaByExpr(e)
+		if fm == nil || fm.Slice {
+			return nil, false
+		}
+		span.ov = qv.fieldIndexViewFromSlotsForExpr(qv.snap.Index, e)
+		if !span.ov.HasData() {
+			return nil, true
+		}
+		span.hasData = true
+		span.br = span.ov.RangeForBounds(lead.effectiveBounds)
+		ok = true
+	} else {
+		var err error
+		span, ok, err = qv.prepareScalarIndexSpan(lead.expr)
+		if err != nil {
+			return nil, false
+		}
+	}
+	if !ok {
 		return nil, false
 	}
 	if !span.hasData {
@@ -1748,6 +1777,7 @@ func (qv *View) execLeadScanNoOrderBuckets(q *qir.Shape, preds predicateReader, 
 	if span.br.BaseEnd-span.br.BaseStart < 4 {
 		return nil, false
 	}
+	preds[leadIdx].covered = true
 	out, _ := qv.scanOrderLimitWithPredicatesReader(q, span.ov, span.br, false, preds, "", trace)
 	return out, true
 }
@@ -1787,9 +1817,7 @@ func (qv *View) execPlanCandidateOrderBasic(q *qir.Shape, preds predicateReader,
 	}
 	pooled.ReleaseBoolSlice(rangeCovered)
 
-	var activeBuf [plannerPredicateFastPathMaxLeaves]int
-	active := activeBuf[:0]
-
+	activeCount := 0
 	for i := 0; i < len(preds); i++ {
 		p := preds[i]
 		if p.covered || p.alwaysTrue {
@@ -1798,11 +1826,10 @@ func (qv *View) execPlanCandidateOrderBasic(q *qir.Shape, preds predicateReader,
 		if p.alwaysFalse {
 			return nil
 		}
-		active = append(active, i)
+		activeCount++
 	}
-	sortActivePredicatesReader(active, preds)
 
-	if len(active) == 0 {
+	if activeCount == 0 {
 		out, _ := qv.scanOrderLimitNoPredicates(q, ov, br, o.Desc, "", trace)
 		return out
 	}

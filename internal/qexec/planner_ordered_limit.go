@@ -132,11 +132,15 @@ var orderedLimitFactsPool = pooled.Pointers[orderedLimitFacts]{
 	Cleanup: func(facts *orderedLimitFacts) {
 		opsBuf := facts.opsBuf
 		baseOpsBuf := facts.baseOpsBuf
-		if cap(opsBuf) > 0 {
+		if cap(opsBuf) > plannerLimitFactsRetainExprCap {
+			opsBuf = nil
+		} else if cap(opsBuf) > 0 {
 			clear(opsBuf[:cap(opsBuf)])
 			opsBuf = opsBuf[:0]
 		}
-		if cap(baseOpsBuf) > 0 {
+		if cap(baseOpsBuf) > plannerLimitFactsRetainExprCap {
+			baseOpsBuf = nil
+		} else if cap(baseOpsBuf) > 0 {
 			clear(baseOpsBuf[:cap(baseOpsBuf)])
 			baseOpsBuf = baseOpsBuf[:0]
 		}

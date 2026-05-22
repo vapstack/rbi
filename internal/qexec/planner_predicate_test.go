@@ -79,6 +79,63 @@ func TestExecPlanLeadScanNoOrderUsesSelectedLead(t *testing.T) {
 	}
 }
 
+func TestExecPlanLeadScanNoOrderMergedRangeLeadUsesEffectiveBounds(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
+
+	for age := 11; age <= 20; age++ {
+		if err := db.Set(uint64(age), &Rec{
+			Meta:  Meta{Country: "US"},
+			Age:   age,
+			Score: float64(age),
+		}); err != nil {
+			t.Fatalf("Set(%d): %v", age, err)
+		}
+	}
+	if err := db.RebuildIndex(); err != nil {
+		t.Fatalf("RebuildIndex: %v", err)
+	}
+
+	q := qx.Query(
+		qx.GT("age", 10),
+		qx.EQ("age", 15),
+		qx.EQ("country", "US"),
+	).Limit(8)
+	prepared, shape, err := prepareTestQuery(db.engine, q)
+	if err != nil {
+		t.Fatalf("prepareTestQuery: %v", err)
+	}
+	defer prepared.Release()
+
+	var leavesBuf [plannerPredicateFastPathMaxLeaves]qir.Expr
+	leaves, ok := qir.CollectAndLeavesScratch(shape.Expr, leavesBuf[:0], qir.LeafModeCollect)
+	if !ok {
+		t.Fatalf("CollectAndLeavesScratch: ok=false")
+	}
+
+	view := db.engine.currentQueryViewForTests()
+	preds, ok := view.buildPredicates(leaves)
+	if !ok {
+		t.Fatalf("buildPredicates: ok=false")
+	}
+	defer preds.Release()
+
+	leadIdx := -1
+	for i := 0; i < preds.Len(); i++ {
+		if preds.owner[i].hasEffectiveBounds && preds.owner[i].expr.FieldOrdinal == shape.Expr.Operands[0].FieldOrdinal {
+			leadIdx = i
+			break
+		}
+	}
+	if leadIdx < 0 {
+		t.Fatalf("expected merged range lead predicate")
+	}
+
+	got := view.execPlanLeadScanNoOrder(&shape, preds.owner, leadIdx, nil)
+	if len(got) != 1 || got[0] != 15 {
+		t.Fatalf("execPlanLeadScanNoOrder returned %v, want [15]", got)
+	}
+}
+
 func TestReleasePredicateOwnedState_ClearsRangeMaterializedRewriteState(t *testing.T) {
 	p := materializedRangePredicateWithMode(
 		mustTestQIRExpr(t, qx.GTE("age", 10)),

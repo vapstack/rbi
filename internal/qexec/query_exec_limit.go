@@ -803,6 +803,20 @@ func (qv *View) execSelectedNoOrderBounds(q *qir.Shape, field string, bounds ind
 		break
 	}
 
+	if br.Empty() {
+		if hasResidual {
+			for _, e := range leaves {
+				if isBoundOp(e.Op) && !e.Not && e.FieldOrdinal >= 0 && qv.exec.FieldNameByOrdinal(e.FieldOrdinal) == field {
+					continue
+				}
+				if err := qv.validateOrderBasicExpr(e); err != nil {
+					return nil, true, err
+				}
+			}
+		}
+		return nil, true, nil
+	}
+
 	var predsBuf []leafPred
 	if hasResidual {
 		var ok bool
@@ -812,17 +826,6 @@ func (qv *View) execSelectedNoOrderBounds(q *qir.Shape, field string, bounds ind
 			return nil, true, err
 		}
 		if !ok {
-			if br.Empty() {
-				for _, e := range leaves {
-					if isBoundOp(e.Op) && !e.Not && e.FieldOrdinal >= 0 && qv.exec.FieldNameByOrdinal(e.FieldOrdinal) == field {
-						continue
-					}
-					if err := qv.validateOrderBasicExpr(e); err != nil {
-						return nil, true, err
-					}
-				}
-				return nil, true, nil
-			}
 			return nil, false, nil
 		}
 		if predsBuf != nil {
@@ -833,9 +836,6 @@ func (qv *View) execSelectedNoOrderBounds(q *qir.Shape, field string, bounds ind
 		}
 	}
 
-	if br.Empty() {
-		return nil, true, nil
-	}
 	out, _ := qv.scanLimitByFieldIndexBounds(q, ov, br, false, predsBuf, "", plannerOrderedLimitRuntimeGuard{}, trace)
 	return out, true, nil
 }
