@@ -2112,10 +2112,15 @@ dispatch:
 	return out, used, PlanLimitOrderBasic, err
 }
 
+const fieldIndexRangeExactCapMinLimit = 4096
+
 func fieldIndexRangeWindowCap(ov indexdata.FieldIndexView, br indexdata.FieldIndexRange, offset, limit, extraRows uint64) (uint64, bool) {
 	window := satAddUint64(offset, limit)
 	if br.Empty() {
 		return boundedWindowCap(extraRows, offset, limit)
+	}
+	if limit != 0 && limit <= fieldIndexRangeExactCapMinLimit {
+		return limit, false
 	}
 	if uint64(br.Len()) < window {
 		_, rows := ov.RangeStats(br)
