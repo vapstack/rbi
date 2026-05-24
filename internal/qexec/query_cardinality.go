@@ -4535,8 +4535,12 @@ func (qv *View) reorderCardinalityEvalAndPositivePlans(plans []cardinalityLeafPl
 		if cardinalityLeafPlanSeedsCustomMaterialization(plans[pos[i]]) {
 			cacheKey := qv.materializedPredKey(plans[pos[i]].expr)
 			if !cacheKey.IsZero() {
-				if cached, ok := qv.snap.LoadMaterializedPredKey(cacheKey); ok && !cached.IsEmpty() {
-					continue
+				if cached, ok := qv.snap.LoadMaterializedPredKey(cacheKey); ok {
+					if !cached.IsEmpty() {
+						cached.Release()
+						continue
+					}
+					cached.Release()
 				}
 			}
 			pick = i
@@ -4571,7 +4575,7 @@ func (qv *View) applyAndPostingResultExpr(acc *postingResult, hasAcc *bool, expr
 				if qv.snap != nil {
 					cacheKey := qv.materializedPredKey(expr)
 					if !cacheKey.IsZero() {
-						if _, ok := qv.snap.LoadMaterializedPredKey(cacheKey); ok {
+						if qv.snap.HasMaterializedPredKey(cacheKey) {
 							usePostingApply = false
 						} else if qv.snap.ShouldPromoteRuntimeMaterializedPredKey(cacheKey) {
 							usePostingApply = false

@@ -625,7 +625,7 @@ func TestBuildPredRange_PrefixMaterializationSkippedWhenCacheDisabled(t *testing
 	if !ok {
 		t.Fatalf("expected parseable materialized cache key %q", rawKey)
 	}
-	if _, ok := db.engine.snapshot.Current().LoadMaterializedPredKey(parsedKey); ok {
+	if db.engine.snapshot.Current().HasMaterializedPredKey(parsedKey) {
 		t.Fatalf("expected no cache store when materialized predicate cache is disabled")
 	}
 	if cache := db.engine.snapshot.Current().MaterializedPredCache(); cache != nil {
@@ -2434,7 +2434,7 @@ func TestBuildPredicateWithMode_RuntimeExactUnionPromotesOnSecondMaterialize(t *
 		}
 
 		first := materialize()
-		if _, ok := db.engine.snapshot.Current().LoadMaterializedPredKey(cacheKey); ok {
+		if db.engine.snapshot.Current().HasMaterializedPredKey(cacheKey) {
 			releasePredicates([]predicate{first})
 			t.Fatalf("unexpected shared exact-union cache entry after first materialize")
 		}

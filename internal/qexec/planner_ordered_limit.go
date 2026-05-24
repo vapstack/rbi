@@ -728,80 +728,284 @@ func orderedLimitBasicCandidate(decision plannerOrderedDecision, leaves []qir.Ex
 
 func orderedLimitResidualExactFilterCandidate(e qir.Expr) bool {
 	switch e.Op {
-	case qir.OpEQ, qir.OpIN, qir.OpHASALL, qir.OpHASANY,
-		qir.OpGT, qir.OpGTE, qir.OpLT, qir.OpLTE, qir.OpPREFIX:
+	case qir.OpEQ, qir.OpIN, qir.OpHASALL, qir.OpHASANY:
 		return true
 	default:
 		return false
 	}
 }
 
-func (qv *View) orderedLimitBoundsScanCandidateAllowed(
+func (qv *View) orderedLimitScalarRangeHasCheapBucketFilter(
+	e qir.Expr,
+	bounds indexdata.Bounds,
+	useBounds bool,
+	needWindow int,
+	universe uint64,
+) bool {
+	var plan preparedFieldIndexRangePredicatePlan
+	useRuntimeComplement := false
+	if useBounds {
+		fm := qv.fieldMetaByExpr(e)
+		if fm == nil || fm.Slice {
+			return false
+		}
+		var core preparedScalarRangePredicate
+		qv.initPreparedExactScalarRangePredicate(&core, e, fm, bounds)
+		ov := qv.fieldIndexViewFromSlotsForExpr(qv.snap.Index, e)
+		if !ov.HasData() {
+			return false
+		}
+		var done bool
+		plan, _, done = core.planFieldIndexRange(ov)
+		if done {
+			return false
+		}
+		useRuntimeComplement = core.usesRuntimeComplement(plan.useComplement)
+	} else {
+		candidate, ok := qv.prepareScalarRangeRoutingCandidate(e)
+		if !ok {
+			return false
+		}
+		plan = candidate.plan
+		useRuntimeComplement = candidate.core.usesRuntimeComplement(plan.useComplement)
+	}
+	if plan.est == 0 {
+		return false
+	}
+	if plan.orderedEagerMaterializeUseful(needWindow, universe) {
+		return true
+	}
+	return rangeProbeSupportsCheapPostingFilter(useRuntimeComplement == e.Not, plan.runtimeProbeBuckets)
+}
+
+func (qv *View) orderedLimitBoundsScanCandidate(
 	q *qir.Shape,
 	facts *orderedLimitFacts,
 	orderScan plannerOrderedLimitCandidate,
-) bool {
+) (plannerOrderedLimitCandidate, bool) {
 	if len(facts.baseOps) == 0 {
-		return true
+		return orderScan, true
 	}
 	if q.Offset > 0 && facts.orderMeta.Ptr && facts.nilTailField == "" {
-		return false
+		return orderScan, false
 	}
 	maxResiduals := 3
 	if len(facts.baseOps) > maxResiduals {
-		return false
+		return orderScan, false
 	}
 
 	snap := qv.exec.Stats.Load()
 	universe := qv.plannerUniverseCardinality(snap)
 	if universe == 0 {
-		return false
+		return orderScan, false
+	}
+
+	if q.Offset > 0 {
+		residualSel := 1.0
+		exactFilters := 0
+		for i := 0; i < len(facts.baseOps); i++ {
+			e := facts.baseOps[i]
+			sel, _, _, _, ok := qv.estimateLeafOrderCost(e, snap, universe, facts.orderField, facts.ov.HasData())
+			if !ok {
+				return orderScan, false
+			}
+			if sel <= 0 {
+				return orderScan, true
+			}
+			residualSel *= sel
+			switch e.Op {
+			case qir.OpEQ, qir.OpIN, qir.OpHASALL, qir.OpHASANY,
+				qir.OpGT, qir.OpGTE, qir.OpLT, qir.OpLTE, qir.OpPREFIX:
+				exactFilters++
+			}
+		}
+		if exactFilters == 0 {
+			return orderScan, false
+		}
+		residualRows := uint64(residualSel * float64(universe))
+		if residualRows == 0 {
+			return orderScan, false
+		}
+		need := uint64(facts.needWindow)
+		if need > residualRows/2 {
+			return orderScan, false
+		}
+		orderScan.exactFilters = uint64(exactFilters)
+		return orderScan, true
 	}
 
 	residualSel := 1.0
 	exactFilters := 0
+	residualChecks := 0
+	rangeResiduals := 0
+	broadRangeResiduals := 0
+	cheapRangeFilters := 0
+	var mergedRangesArr [plannerOrderedLeafMax]orderedMergedScalarRangeField
+	mergedRanges, mergeOK := qv.collectOrderedMergedScalarRangeFields(facts.orderField, facts.baseOps, mergedRangesArr[:0])
+	if !mergeOK {
+		return orderScan, false
+	}
 	for i := 0; i < len(facts.baseOps); i++ {
 		e := facts.baseOps[i]
+		if !e.Not && e.FieldOrdinal >= 0 && len(e.Operands) == 0 && isScalarRangeEqOp(e.Op) {
+			fieldName := qv.exec.FieldNameByOrdinal(e.FieldOrdinal)
+			if fieldName != facts.orderField {
+				idx := findOrderedMergedScalarRangeField(mergedRanges, fieldName)
+				if idx >= 0 {
+					merged := mergedRanges[idx]
+					if merged.count > 1 {
+						if merged.first != i {
+							continue
+						}
+						fieldStats := qv.plannerFieldStats(merged.field, snap, universe)
+						mergedSel, _, ok := qv.estimateMergedScalarRangeOrderCost(merged.field, merged.bounds, universe, fieldStats)
+						if !ok {
+							return orderScan, false
+						}
+						if mergedSel <= 0 {
+							return orderScan, true
+						}
+						residualSel *= mergedSel
+						rangeResiduals++
+						if qv.orderedLimitScalarRangeHasCheapBucketFilter(merged.expr, merged.bounds, true, facts.needWindow, universe) {
+							exactFilters++
+							cheapRangeFilters++
+							continue
+						}
+						residualChecks++
+						broadRangeResiduals++
+						continue
+					}
+				}
+			}
+		}
+
 		sel, _, _, _, ok := qv.estimateLeafOrderCost(e, snap, universe, facts.orderField, facts.ov.HasData())
 		if !ok {
-			return false
+			return orderScan, false
 		}
 		if sel <= 0 {
-			return true
+			return orderScan, true
 		}
 		residualSel *= sel
-		if orderedLimitResidualExactFilterCandidate(e) {
-			exactFilters++
+
+		switch e.Op {
+
+		case qir.OpEQ, qir.OpIN, qir.OpHASALL, qir.OpHASANY:
+			if !e.Not {
+				exactFilters++
+				continue
+			}
+
+		case qir.OpGT, qir.OpGTE, qir.OpLT, qir.OpLTE:
+			rangeResiduals++
+			if !e.Not && qv.orderedLimitScalarRangeHasCheapBucketFilter(e, indexdata.Bounds{}, false, facts.needWindow, universe) {
+				exactFilters++
+				cheapRangeFilters++
+				continue
+			}
+			if !e.Not {
+				broadRangeResiduals++
+			}
+
+		case qir.OpPREFIX:
+			rangeResiduals++
+			prefix, ok, err := qv.prepareScalarPrefixRoute(e)
+			if !e.Not && err == nil && ok && prefix.hasData && !prefix.br.Empty() && prefix.br.Len() <= rangePostingFilterKeepProbeMaxBuckets {
+				exactFilters++
+				cheapRangeFilters++
+				continue
+			}
+			if !e.Not {
+				broadRangeResiduals++
+			}
+		}
+		residualChecks++
+	}
+	orderScan.checks = uint64(exactFilters + residualChecks)
+	orderScan.exactFilters = uint64(exactFilters)
+
+	if residualChecks > 0 {
+		expectedRows := orderScan.expectedRows
+		need := uint64(facts.needWindow)
+		if expectedRows < need {
+			expectedRows = need
+		}
+
+		rowsForContains := float64(expectedRows)
+		if exactFilters > 0 && residualChecks > 0 {
+			rowsForContains *= residualSel
+			if rowsForContains < float64(need) {
+				rowsForContains = float64(need)
+			}
+		}
+
+		orderStats := qv.plannerOrderFieldStats(facts.orderField, snap, universe, uint64(facts.ov.KeyCount()))
+		bucketAmp := 1.0
+		if facts.needWindow > 0 && orderStats.AvgBucketCard > float64(facts.needWindow) {
+			bucketAmp += ClampFloat((orderStats.AvgBucketCard/float64(facts.needWindow)-1.0)*0.18, 0, 2.0)
+		}
+		if orderSkew := plannerFieldStatsSkew(orderStats); orderSkew > 1 {
+			bucketAmp += (orderSkew - 1) * 0.12
+		}
+
+		residualCost := rowsForContains * float64(residualChecks) * bucketAmp
+		if rangeResiduals == 0 {
+			residualCost = 0
+		} else {
+			residualCost *= 1.0 + float64(rangeResiduals)*0.45
+		}
+		if broadRangeResiduals > 0 && (facts.bounds.HasLo || facts.bounds.HasHi || facts.bounds.HasPrefix) {
+			residualCost *= 1.0 + float64(broadRangeResiduals)*0.55
+		}
+		exactCost := float64(expectedRows) * float64(exactFilters) * 0.22
+		if cheapRangeFilters > 0 {
+			exactCost += float64(expectedRows) * float64(cheapRangeFilters) * 0.18
+		}
+
+		charged := float64(expectedRows) + exactCost + residualCost
+		if charged > orderScan.cost {
+			orderScan.cost = charged
 		}
 	}
 	if exactFilters == 0 {
-		return false
+		return orderScan, false
+	}
+	if residualChecks == 0 &&
+		rangeResiduals == 0 &&
+		(facts.bounds.HasLo || facts.bounds.HasHi || facts.bounds.HasPrefix) {
+		return orderScan, true
 	}
 
 	residualRows := uint64(residualSel * float64(universe))
 	if residualRows == 0 {
-		return false
+		return orderScan, false
 	}
 	need := uint64(facts.needWindow)
 	if q.Offset > 0 && need > residualRows/2 {
-		return false
+		return orderScan, false
 	}
 	if q.Offset > 0 {
-		return true
+		return orderScan, true
 	}
 	expectedRows := orderScan.expectedRows
 	if expectedRows == 0 {
 		expectedRows = need
 	}
+	if broadRangeResiduals > 0 &&
+		(facts.bounds.HasLo || facts.bounds.HasHi || facts.bounds.HasPrefix) &&
+		exactFilters == cheapRangeFilters {
+		return orderScan, false
+	}
 	if len(facts.baseOps) >= 3 &&
 		(facts.bounds.HasLo || facts.bounds.HasHi || facts.bounds.HasPrefix) &&
 		expectedRows/32 > need {
-		return false
+		return orderScan, false
 	}
 	if len(facts.baseOps) == 1 {
-		return expectedRows <= residualRows
+		return orderScan, expectedRows <= residualRows
 	}
-	return expectedRows <= residualRows/2
+	return orderScan, expectedRows <= residualRows/2
 }
 
 func orderedLimitMaterializedFallbackCandidate(
@@ -1317,10 +1521,10 @@ func (qv *View) selectOrderedLimit(
 	if len(facts.baseOps) == 0 {
 		return plannerOrderedLimitDecision{selected: orderScan}, true, nil
 	}
-	orderCandidate := orderScan
 
 	basic, hasBasic := orderedLimitBasicCandidate(orderedDecision, facts.ops, orderScan)
-	boundsScanAllowed := qv.orderedLimitBoundsScanCandidateAllowed(q, facts, orderScan)
+	orderScan, boundsScanAllowed := qv.orderedLimitBoundsScanCandidate(q, facts, orderScan)
+	orderCandidate := orderScan
 	useCandidateOrder := qv.shouldUseCandidateOrder(facts.order, facts.ops)
 	if boundsScanAllowed {
 		candidates[n] = orderScan

@@ -2447,6 +2447,100 @@ func BenchmarkPlannerDispatch(b *testing.B) {
 	})
 }
 
+func benchmarkPlannerRegressionBudget(b *testing.B, db *testDB, q *qx.QX, cold bool) {
+	b.Helper()
+
+	prepared, shape, err := db.prepareQuery(q)
+	if err != nil {
+		b.Fatalf("prepareQuery: %v", err)
+	}
+	defer prepared.Release()
+
+	view := db.view()
+	if cold {
+		db.clearCurrentSnapshotCaches()
+	} else {
+		db.clearCurrentSnapshotCaches()
+		out, err := view.Query(&shape, false, false)
+		if err != nil {
+			b.Fatalf("Query warmup: %v", err)
+		}
+		qexecBenchIDs = out
+	}
+
+	var out []uint64
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if cold {
+			b.StopTimer()
+			db.clearCurrentSnapshotCaches()
+			b.StartTimer()
+		}
+		out, err = view.Query(&shape, false, false)
+		if err != nil {
+			b.Fatalf("Query: %v", err)
+		}
+		qexecBenchIDs = out
+	}
+	b.ReportMetric(float64(len(qexecBenchIDs)), "rows/op")
+}
+
+func BenchmarkPlannerRegressionBudget(b *testing.B) {
+	qexecBenchRunScaleSelectivities(b, func(b *testing.B, db *testDB, scale qexecBenchScale, sel qexecBenchSelectivity) {
+		ageStart, ageEnd := qexecBenchAgeRange(scale.rows, sel)
+		scoreStart, _ := qexecBenchScoreRange(scale.rows, sel)
+		tag := qexecBenchTag(sel)
+		prefix := qexecBenchPrefix(sel)
+		cases := []struct {
+			name string
+			q    *qx.QX
+			cold bool
+		}{
+			{name: "NoFilterLimit", q: qx.Query().Limit(128)},
+			{name: "ScalarEQIN", q: qx.Query(qx.EQ("country", "US"), qx.IN("name", []string{"alice", "bob", "carol"})).Limit(128)},
+			{name: "DirectPrefixLimit", q: qx.Query(qx.PREFIX("full_name", prefix)).Limit(128)},
+			{name: "DirectRangeLimit", q: qx.Query(ageStart, ageEnd).Limit(128)},
+			{name: "OrderedLimitOneResidual", q: qx.Query(qx.EQ("active", true)).Sort("score", qx.DESC).Limit(128)},
+			{
+				name: "OrderedLimitMultiResidual",
+				q: qx.Query(
+					scoreStart,
+					qx.EQ("active", true),
+					qx.GTE("age", 1),
+				).Sort("score", qx.DESC).Limit(128),
+			},
+			{
+				name: "OrderedORHot",
+				q: qx.Query(
+					qx.OR(
+						qx.AND(qx.EQ("country", "US"), qx.HASANY("tags", []string{tag, "missing_tag"})),
+						qx.AND(qx.EQ("country", "JP"), ageStart),
+						qx.AND(qx.PREFIX("full_name", prefix), qx.EQ("active", true)),
+					),
+				).Sort("score", qx.DESC).Limit(128),
+			},
+			{
+				name: "OrderedORCold",
+				q: qx.Query(
+					qx.OR(
+						qx.AND(qx.EQ("country", "US"), qx.HASANY("tags", []string{tag, "missing_tag"})),
+						qx.AND(qx.EQ("country", "JP"), ageStart),
+						qx.AND(qx.PREFIX("full_name", prefix), qx.EQ("active", true)),
+					),
+				).Sort("score", qx.DESC).Limit(128),
+				cold: true,
+			},
+		}
+		for i := range cases {
+			tc := cases[i]
+			b.Run(tc.name, func(b *testing.B) {
+				benchmarkPlannerRegressionBudget(b, db, tc.q, tc.cold)
+			})
+		}
+	})
+}
+
 func benchmarkLimitSelectorDispatch(b *testing.B, db *testDB, q *qx.QX) {
 	b.Helper()
 

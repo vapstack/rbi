@@ -3904,7 +3904,7 @@ func (qv *View) shouldEagerMaterializeOrderedORPredicate(
 		return false, false
 	}
 	if !info.cacheKey.IsZero() && qv.snap != nil {
-		if _, hit := qv.snap.LoadMaterializedPredKey(info.cacheKey); hit {
+		if qv.snap.HasMaterializedPredKey(info.cacheKey) {
 			if !info.isPrefix && !orderedORMaterializedPredicateWarmHitWorth(leafChecks, info.checkWork, info.cachedCheckWork) {
 				return false, false
 			}
@@ -4377,7 +4377,7 @@ func (qv *View) promoteOrderedORMaterializedBaseOps(
 		if observedWorksBuf[i] == 0 {
 			continue
 		}
-		if _, ok := qv.snap.LoadMaterializedPredKey(cacheKeysBuf[i]); ok {
+		if qv.snap.HasMaterializedPredKey(cacheKeysBuf[i]) {
 			continue
 		}
 		if !qv.snap.ShouldPromoteObservedMaterializedPredKey(cacheKeysBuf[i], observedWorksBuf[i], buildWorksBuf[i]) {
@@ -4491,7 +4491,7 @@ func (qv *View) promoteObservedOrderedORKWayMaterializedBaseOps(
 		if observedWorksBuf[i] == 0 {
 			continue
 		}
-		if _, ok := qv.snap.LoadMaterializedPredKey(cacheKeysBuf[i]); ok {
+		if qv.snap.HasMaterializedPredKey(cacheKeysBuf[i]) {
 			continue
 		}
 		if !qv.snap.ShouldPromoteObservedMaterializedPredKey(cacheKeysBuf[i], observedWorksBuf[i], buildWorksBuf[i]) {
@@ -4507,7 +4507,7 @@ func (qv *View) shouldObserveOrderedORPredicate(p predicate, info orderedORMater
 	if !orderedORPredicateObservationEligible(info) {
 		return false
 	}
-	if _, hit := qv.snap.LoadMaterializedPredKey(info.cacheKey); hit {
+	if qv.snap.HasMaterializedPredKey(info.cacheKey) {
 		return false
 	}
 	if qv.snap.HasRuntimeMaterializedPredSeenKey(info.cacheKey) {
@@ -4522,7 +4522,7 @@ func (qv *View) shouldRememberColdOrderedORPredicate(info orderedORMaterializedP
 	if !orderedORPredicateObservationEligible(info) {
 		return false
 	}
-	if _, hit := qv.snap.LoadMaterializedPredKey(info.cacheKey); hit {
+	if qv.snap.HasMaterializedPredKey(info.cacheKey) {
 		return false
 	}
 	return !qv.snap.HasRuntimeMaterializedPredSeenKey(info.cacheKey)
@@ -6929,8 +6929,7 @@ func (qv *View) canPrecountORBranchExpr(e qir.Expr) bool {
 	if cacheKey.IsZero() {
 		return false
 	}
-	_, ok := qv.snap.LoadMaterializedPredKey(cacheKey)
-	return ok
+	return qv.snap.HasMaterializedPredKey(cacheKey)
 }
 
 func (qv *View) uniqueLeadBranchCardinalityWithChecks(branch plannerORBranch, leadIdx int, checks []int) (uint64, bool) {

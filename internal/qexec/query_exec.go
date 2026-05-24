@@ -1278,12 +1278,123 @@ func (qv *View) shouldPromoteObservedOrderBasicBaseCore(
 	}
 }
 
+func (qv *View) materializedPredObservationCandidate(key qcache.MaterializedPredKey, est, buildWork uint64) bool {
+	if key.IsZero() || buildWork == 0 {
+		return false
+	}
+	if qv.snap.HasMaterializedPredKey(key) {
+		return false
+	}
+	cache := qv.snap.MaterializedPredCache()
+	maxCard := cache.MaxCardinality()
+	return maxCard == 0 || est <= maxCard || qcache.MaterializedPredOversizedLimit(cache.Limit()) > 0
+}
+
+func (qv *View) orderBasicBaseCoreObservationCandidate(orderField string, core orderBasicBaseCore, universe uint64) bool {
+	switch core.kind {
+
+	case orderBasicBaseCoreCollapsedRange:
+		stats, ok := qv.orderedLimitCollapsedRangeStats(core.collapsed)
+		if !ok {
+			return false
+		}
+		buildWork := rangeProbeMaterializeWork(stats.buildBuckets, stats.buildEst)
+		return qv.materializedPredObservationCandidate(stats.cacheKey, stats.buildEst, buildWork)
+
+	case orderBasicBaseCoreRawExpr:
+		op := core.expr
+		if op.Not || op.FieldOrdinal < 0 || qv.exec.FieldNameByOrdinal(op.FieldOrdinal) == orderField {
+			return false
+		}
+		stats, ok := qv.orderBasicRawBaseOpStats(op, universe)
+		if !ok {
+			return false
+		}
+		buildWork := rangeProbeMaterializeWork(stats.buildBuckets, stats.buildEst)
+		return qv.materializedPredObservationCandidate(stats.cacheKey, stats.buildEst, buildWork)
+
+	default:
+		return false
+	}
+}
+
+func (qv *View) hasOrderBasicBaseOpObservationCandidate(orderField string, baseOps []qir.Expr) bool {
+	if qv.snap.MaterializedPredCacheLimit() <= 0 || len(baseOps) == 0 {
+		return false
+	}
+	universe := qv.snap.Universe.Cardinality()
+	if universe == 0 {
+		return false
+	}
+	if len(baseOps) == 1 {
+		return qv.orderBasicBaseCoreObservationCandidate(orderField, orderBasicBaseCore{
+			kind: orderBasicBaseCoreRawExpr,
+			expr: baseOps[0],
+		}, universe)
+	}
+
+	coresBuf, rawCoreIdxBuf, empty, err := qv.prepareOrderBasicBaseCores(baseOps)
+	if err != nil || empty {
+		if coresBuf != nil {
+			orderBasicBaseCoreSlicePool.Put(coresBuf)
+		}
+		if rawCoreIdxBuf != nil {
+			pooled.ReleaseIntSlice(rawCoreIdxBuf)
+		}
+		return false
+	}
+
+	found := false
+	for i := 0; i < len(coresBuf); i++ {
+		if qv.orderBasicBaseCoreObservationCandidate(orderField, coresBuf[i], universe) {
+			found = true
+			break
+		}
+	}
+	orderBasicBaseCoreSlicePool.Put(coresBuf)
+	pooled.ReleaseIntSlice(rawCoreIdxBuf)
+	return found
+}
+
+func (qv *View) hasLimitLeafPredObservationCandidate(orderField string, preds []leafPred) bool {
+	if qv.snap.MaterializedPredCacheLimit() <= 0 || len(preds) == 0 {
+		return false
+	}
+	universe := qv.snap.Universe.Cardinality()
+	if universe == 0 {
+		return false
+	}
+	for i := 0; i < len(preds); i++ {
+		pred := preds[i]
+		if pred.kind != leafPredKindPredicate {
+			continue
+		}
+		if pred.hasBaseCore {
+			if qv.orderBasicBaseCoreObservationCandidate(orderField, pred.baseCore, universe) {
+				return true
+			}
+			continue
+		}
+		op := pred.pred.expr
+		if !isSimpleScalarRangeOrPrefixLeaf(op) || op.FieldOrdinal < 0 || qv.exec.FieldNameByOrdinal(op.FieldOrdinal) == orderField || op.Not {
+			continue
+		}
+		if qv.orderBasicBaseCoreObservationCandidate(orderField, orderBasicBaseCore{
+			kind: orderBasicBaseCoreRawExpr,
+			expr: op,
+		}, universe) {
+			return true
+		}
+	}
+	return false
+}
+
 func (qv *View) promoteObservedOrderBasicBaseCore(core orderBasicBaseCore) {
 	switch core.kind {
 	case orderBasicBaseCoreCollapsedRange:
 		cacheKey := core.collapsed.cacheKey
 		if !cacheKey.IsZero() {
-			if _, ok := qv.snap.LoadMaterializedPredKey(cacheKey); ok {
+			if qv.snap.HasMaterializedPredKey(cacheKey) {
 				return
 			}
 		}
@@ -1301,7 +1412,7 @@ func (qv *View) promoteObservedOrderBasicBaseCore(core orderBasicBaseCore) {
 		if cacheKey.IsZero() {
 			return
 		}
-		if _, ok := qv.snap.LoadMaterializedPredKey(cacheKey); ok {
+		if qv.snap.HasMaterializedPredKey(cacheKey) {
 			return
 		}
 		scalarKey := qv.materializedPredKey(core.expr)
@@ -1801,7 +1912,7 @@ dispatch:
 					}
 				}
 
-				sampleAllowed := guard.enabled && len(predsBuf) > 0 && len(baseOps) > 0
+				sampleAllowed := guard.enabled && guard.fallbackCost < decision.selected.cost && len(predsBuf) > 0 && len(baseOps) > 0
 				if sampleAllowed && len(baseOps) <= 2 {
 					simpleResiduals := true
 					for i := 0; i < len(baseOps); i++ {
@@ -1844,7 +1955,7 @@ dispatch:
 				}
 
 				execTrace := trace
-				observePreds := len(predsBuf) > 0 && qv.snap.MaterializedPredCacheLimit() > 0
+				observePreds := qv.hasLimitLeafPredObservationCandidate(f, predsBuf)
 				var observedTrace Trace
 				observedStart := uint64(0)
 				if observePreds && execTrace == nil {
@@ -1892,7 +2003,7 @@ dispatch:
 			}
 		}
 		execTrace := trace
-		observeBaseOps := len(baseOps) > 0 && qv.snap.MaterializedPredCacheLimit() > 0
+		observeBaseOps := qv.hasOrderBasicBaseOpObservationCandidate(f, baseOps)
 		var observedTrace Trace
 		observedStart := uint64(0)
 		if observeBaseOps {

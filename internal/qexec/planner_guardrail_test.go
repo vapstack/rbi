@@ -856,6 +856,100 @@ func TestPlannerGuardrails_OrderedLimitBroadResidualNoOffsetUsesOrderScan(t *tes
 	}
 }
 
+func TestPlannerGuardrails_OrderedLimitBoundedExactResidualsUsesOrderScan(t *testing.T) {
+	var events []TraceEvent
+	db := newTestDB(t, testOptions{
+		TraceSink: func(ev TraceEvent) {
+			events = append(events, ev)
+		},
+		TraceSampleEvery: 1,
+	})
+	countries := [...]string{"US", "DE", "NL", "PL", "BR", "JP", "IN", "CA"}
+	db.seedGeneratedData(t, 20_000, func(id uint64) testRec {
+		tags := []string{"other"}
+		if id%2048 == 0 {
+			tags = []string{"tag_tiny", "go", "db"}
+		}
+		return testRec{
+			Meta: Meta{Country: countries[id&7]},
+			Age:  int(id),
+			Tags: tags,
+		}
+	})
+
+	q := qx.Query(
+		qx.GTE("age", 8192),
+		qx.LT("age", 8256),
+		qx.EQ("country", "US"),
+		qx.HASANY("tags", []string{"tag_tiny", "missing_tag"}),
+	).Sort("age", qx.ASC).Limit(128)
+	prepared, viewQ, err := db.prepareQuery(q)
+	if err != nil {
+		t.Fatalf("prepareQuery: %v", err)
+	}
+	defer prepared.Release()
+
+	ids, err := db.view().Query(&viewQ, true, false)
+	if err != nil {
+		t.Fatalf("Query: %v", err)
+	}
+	if len(ids) != 1 || ids[0] != 8192 {
+		t.Fatalf("ids=%v want [8192]", ids)
+	}
+	if len(events) == 0 {
+		t.Fatalf("expected trace event")
+	}
+	route := events[len(events)-1].OrderedLimitRoute
+	if route.Selected != plannerOrderedLimitCandidateOrderScan.String() {
+		t.Fatalf("selected=%q want=%q route=%+v", route.Selected, plannerOrderedLimitCandidateOrderScan.String(), route)
+	}
+}
+
+func TestPlannerGuardrails_OrderedLimitMergedResidualRangeKeepsOrderScanCandidate(t *testing.T) {
+	db := newTestDB(t, testOptions{
+		NumericRangeBucketSize:         256,
+		NumericRangeBucketMinFieldKeys: 1024,
+		NumericRangeBucketMinSpanKeys:  256,
+	})
+	db.seedGeneratedData(t, 20_000, func(id uint64) testRec {
+		return testRec{
+			Age:   int(id),
+			Score: float64(id),
+		}
+	})
+
+	q := qx.Query(
+		qx.GTE("score", 1.0),
+		qx.LT("score", 701.0),
+		qx.GTE("age", 10_000),
+		qx.LT("age", 12_000),
+	).Sort("score", qx.ASC).Limit(128)
+	prepared, viewQ, err := db.prepareQuery(q)
+	if err != nil {
+		t.Fatalf("prepareQuery: %v", err)
+	}
+	defer prepared.Release()
+
+	view := db.view()
+	facts := orderedLimitFactsPool.Get()
+	ok, err := view.collectOrderedLimitFacts(&viewQ, facts)
+	if err != nil {
+		facts.Release()
+		t.Fatalf("collectOrderedLimitFacts: %v", err)
+	}
+	if !ok {
+		facts.Release()
+		t.Fatalf("collectOrderedLimitFacts ok=false")
+	}
+	orderedDecision := view.decideOrderedByCost(&viewQ, facts.ops)
+	orderScan := view.orderedLimitOrderScanCost(&viewQ, facts.ops, facts.ov, facts.br, facts.needWindow, orderedDecision)
+	_, ok = view.orderedLimitBoundsScanCandidate(&viewQ, facts, orderScan)
+	facts.Release()
+	if !ok {
+		t.Fatalf("merged residual range rejected bounded order scan: orderScan=%+v", orderScan)
+	}
+}
+
 func TestPlannerGuardrails_OROrderTinyCacheRouteSet(t *testing.T) {
 	db := newTestDB(t, testOptions{MatPredCacheMaxEntries: 1})
 	_ = db.seedData(t, 20_000)

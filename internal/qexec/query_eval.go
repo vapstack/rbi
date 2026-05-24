@@ -472,6 +472,7 @@ func (qv *View) evalSimple(e qir.Expr) (postingResult, error) {
 		if !cacheKey.IsZero() {
 			if cached, ok := qv.snap.LoadMaterializedPredKey(cacheKey); ok {
 				if cached.IsEmpty() {
+					cached.Release()
 					return postingResult{}, nil
 				}
 				return postingResult{ids: cached}, nil

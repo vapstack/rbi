@@ -641,7 +641,7 @@ func TestBuildPreparedEmptyBaseDropsTouchedMaterializedPredCache(t *testing.T) {
 
 	key := qcache.MaterializedPredKeyForScalar("email", qir.OpPREFIX, "user")
 	prev.StoreMaterializedPredKey(key, posting.List{})
-	if _, ok := prev.LoadMaterializedPredKey(key); !ok {
+	if !prev.HasMaterializedPredKey(key) {
 		t.Fatal("expected cached negative predicate on empty snapshot")
 	}
 
@@ -652,7 +652,7 @@ func TestBuildPreparedEmptyBaseDropsTouchedMaterializedPredCache(t *testing.T) {
 	defer next.releaseRuntimeCaches()
 	defer next.releaseStorage()
 
-	if _, ok := next.LoadMaterializedPredKey(key); ok {
+	if next.HasMaterializedPredKey(key) {
 		t.Fatal("expected first write from empty base to drop touched predicate cache")
 	}
 }
@@ -721,7 +721,7 @@ func TestBuildPreparedPatchTouchedFieldDropsOnlyTouchedMaterializedPredCache(t *
 	defer next.releaseRuntimeCaches()
 	defer next.releaseStorage()
 
-	if _, ok := next.LoadMaterializedPredKey(nameKey); ok {
+	if next.HasMaterializedPredKey(nameKey) {
 		t.Fatal("expected touched field cache entry to be dropped")
 	}
 	cached, ok := next.LoadMaterializedPredKey(emailKey)
@@ -752,7 +752,7 @@ func TestBuildPreparedPatchDuplicateTouchedFieldDropsTouchedCacheAndKeepsOthers(
 	defer next.releaseRuntimeCaches()
 	defer next.releaseStorage()
 
-	if _, ok := next.LoadMaterializedPredKey(nameKey); ok {
+	if next.HasMaterializedPredKey(nameKey) {
 		t.Fatal("expected duplicate touched field cache entry to be dropped")
 	}
 	cached, ok := next.LoadMaterializedPredKey(emailKey)
@@ -781,7 +781,7 @@ func TestBuildPreparedPatchTouchedNilFieldDropsNilPredicateCache(t *testing.T) {
 	defer next.releaseRuntimeCaches()
 	defer next.releaseStorage()
 
-	if _, ok := next.LoadMaterializedPredKey(optKey); ok {
+	if next.HasMaterializedPredKey(optKey) {
 		t.Fatal("expected touched nil-field cache entry to be dropped")
 	}
 	cached, ok := next.LoadMaterializedPredKey(emailKey)
@@ -846,13 +846,13 @@ func TestBuildPreparedPatchTouchedFieldSeparatesDirtyObservedMaterializedPredWor
 	defer next.releaseRuntimeCaches()
 	defer next.releaseStorage()
 
-	if _, ok := next.LoadMaterializedPredKey(key); ok {
+	if next.HasMaterializedPredKey(key) {
 		t.Fatal("expected touched-field materialized predicate cache to be dropped")
 	}
 	if next.HasRuntimeMaterializedPredSeenKey(key) {
 		t.Fatal("expected runtime seen keys not to inherit across snapshots")
 	}
-	if _, ok := next.LoadMaterializedPredKey(secondKey); ok {
+	if next.HasMaterializedPredKey(secondKey) {
 		t.Fatal("expected second touched-field materialized predicate cache to be dropped")
 	}
 	if got := next.ObservedMaterializedPredWork(key); got != 0 {
@@ -1144,7 +1144,7 @@ func TestMaterializedPredInheritedEvictAndDrainKeepsSiblingSnapshotEntry(t *test
 	prev.StoreMaterializedPredKey(qcache.MaterializedPredKeyForScalar("email", qir.OpPREFIX, "other"), evictor.Borrow())
 	evictor.Release()
 
-	if _, ok := prev.LoadMaterializedPredKey(key); ok {
+	if prev.HasMaterializedPredKey(key) {
 		t.Fatal("expected prev snapshot to evict old materialized entry")
 	}
 	prev.drainRetiredRuntimeCaches()

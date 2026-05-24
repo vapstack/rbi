@@ -1629,7 +1629,7 @@ func TestQuery_OrderBasicLimit_OffsetPromotionUsesFullWindow(t *testing.T) {
 	if ev.OrderedLimitRoute.RuntimeFallbackTriggered {
 		t.Fatalf("unexpected runtime fallback, route=%+v", ev.OrderedLimitRoute)
 	}
-	if _, ok := view.snap.LoadMaterializedPredKey(stats.cacheKey); ok {
+	if view.snap.HasMaterializedPredKey(stats.cacheKey) {
 		t.Fatalf("unexpected materialized residual predicate after offset-only scan work")
 	}
 }
@@ -2700,6 +2700,49 @@ func TestQuery_OrderBasic_BuildLimitLeafPred_NullableComplementUsesPositiveProbe
 	}
 }
 
+func TestQuery_OrderBasic_NullablePositiveRangeCheapFilterUsesRuntimeProbe(t *testing.T) {
+	db, _ := openTempDBUint64PtrInt(t, Options{
+		AnalyzeInterval: -1,
+	})
+	for i := 0; i < 32; i++ {
+		if err := db.Set(uint64(i+1), &PtrIntRec{Name: fmt.Sprintf("nil_%02d", i), Rank: nil, Active: true}); err != nil {
+			t.Fatalf("Set(nil_%02d): %v", i, err)
+		}
+	}
+	for i := 0; i < 2000; i++ {
+		v := i
+		if err := db.Set(uint64(i+33), &PtrIntRec{Name: fmt.Sprintf("rank_%04d", i), Rank: &v, Active: true}); err != nil {
+			t.Fatalf("Set(rank_%04d): %v", i, err)
+		}
+	}
+	if err := db.RebuildIndex(); err != nil {
+		t.Fatalf("RebuildIndex: %v", err)
+	}
+
+	view := db.engine.currentQueryViewForTests()
+	expr := mustLimitQIRExpr(t, db, qx.GTE("rank", 1))
+	candidate, ok := view.prepareScalarRangeRoutingCandidate(expr)
+	if !ok {
+		t.Fatalf("expected nullable range routing candidate")
+	}
+	if !candidate.plan.useComplement {
+		t.Fatalf("expected complement plan for broad nullable positive range")
+	}
+	if candidate.plan.runtimeProbeBuckets != candidate.plan.bucketCount {
+		t.Fatalf("runtimeProbeBuckets=%d want positive bucketCount=%d", candidate.plan.runtimeProbeBuckets, candidate.plan.bucketCount)
+	}
+	if candidate.plan.runtimeProbeBuckets <= rangePostingFilterKeepProbeMaxBuckets {
+		t.Fatalf("runtimeProbeBuckets=%d must exceed cheap keep threshold", candidate.plan.runtimeProbeBuckets)
+	}
+	universe := view.snap.Universe.Cardinality()
+	if candidate.plan.orderedEagerMaterializeUseful(5, universe) {
+		t.Fatalf("expected eager materialization to stay disabled")
+	}
+	if view.orderedLimitScalarRangeHasCheapBucketFilter(expr, indexdata.Bounds{}, false, 5, universe) {
+		t.Fatalf("nullable positive runtime range probe must not be priced as cheap complement filter")
+	}
+}
+
 func TestQuery_OrderBasic_DeepWindowCachePersistsAcrossUnchangedFieldPatch(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
 		AnalyzeInterval:                         -1,
@@ -3004,7 +3047,7 @@ func TestQuery_OrderBasic_WarmQueryPromotesMaterializedRangeBaseOps(t *testing.T
 				missing = append(missing, fmt.Sprintf("%s:%v=<no-key>", testExprFieldName(db.engine, op), op.Op))
 				continue
 			}
-			if _, ok := db.engine.snapshot.Current().LoadMaterializedPredKey(cacheKey); !ok {
+			if !db.engine.snapshot.Current().HasMaterializedPredKey(cacheKey) {
 				missing = append(missing, fmt.Sprintf("%s:%v", testExprFieldName(db.engine, op), op.Op))
 			}
 		}
