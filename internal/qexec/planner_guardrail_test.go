@@ -2,9 +2,12 @@ package qexec
 
 import (
 	"testing"
+	"unsafe"
 
 	"github.com/vapstack/qx"
 	"github.com/vapstack/rbi/internal/qir"
+	"github.com/vapstack/rbi/internal/schema"
+	"github.com/vapstack/rbi/internal/snapshot"
 )
 
 type plannerGuardrailTotals struct {
@@ -680,6 +683,109 @@ func TestPlannerGuardrails_OrderedLimitCacheStates(t *testing.T) {
 		}
 	})
 
+	t.Run("DirtyObserved", func(t *testing.T) {
+		db := newTestDB(t, testOptions{MatPredCacheMaxEntries: 16})
+		gen := func(id uint64) testRec {
+			name := "bob"
+			if id&1 == 0 {
+				name = "alice"
+			}
+			return testRec{
+				Name:     name,
+				Email:    "user@example.com",
+				Age:      18 + int(id%50),
+				Score:    float64(id % 100),
+				Active:   true,
+				FullName: "FN-",
+			}
+		}
+		db.seedGeneratedData(t, 20_000, gen)
+
+		preparedQ, viewQ, err := db.prepareQuery(secondHitQ)
+		if err != nil {
+			t.Fatalf("prepareQuery: %v", err)
+		}
+		defer preparedQ.Release()
+
+		view := db.view()
+		var leavesBuf [limitQueryFastPathMaxLeaves]qir.Expr
+		leaves, ok := qir.CollectAndLeavesScratch(viewQ.Expr, leavesBuf[:0], qir.LeafModeCollect)
+		if !ok || len(leaves) == 0 {
+			t.Fatalf("CollectAndLeavesScratch: ok=%v len=%d", ok, len(leaves))
+		}
+
+		var baseOpsBuf [limitQueryFastPathMaxLeaves]qir.Expr
+		baseOps := baseOpsBuf[:0]
+		for _, e := range leaves {
+			if isBoundOp(e.Op) && !e.Not && e.FieldOrdinal == viewQ.Order.FieldOrdinal {
+				continue
+			}
+			baseOps = append(baseOps, e)
+		}
+
+		var dirtyStats scalarMaterializationStats
+		var dirtyOp qir.Expr
+		dirtyBuildWork := uint64(0)
+		universe := view.snap.Universe.Cardinality()
+		for _, op := range baseOps {
+			stats, ok := view.orderBasicRawBaseOpStats(op, universe)
+			if !ok || stats.cacheKey.IsZero() {
+				continue
+			}
+			buildWork := rangeProbeMaterializeWork(stats.buildBuckets, stats.buildEst)
+			if buildWork == 0 {
+				continue
+			}
+			if !view.snap.ShouldPromoteObservedMaterializedPredKey(stats.cacheKey, buildWork, buildWork) {
+				t.Fatalf("expected clean observed work to cross build threshold")
+			}
+			dirtyStats = stats
+			dirtyOp = op
+			dirtyBuildWork = buildWork
+			break
+		}
+		if dirtyStats.cacheKey.IsZero() {
+			t.Fatal("expected materializable base op")
+		}
+
+		oldRec := gen(1)
+		newRec := oldRec
+		newRec.Name = "zach"
+		db.seq++
+		db.snap = snapshot.BuildPrepared(db.seq, db.snap, db.rt, db.cfg, nil, db.rt.Patch.Fields, []snapshot.BatchEntry{{
+			ID:        1,
+			Old:       unsafe.Pointer(&oldRec),
+			New:       unsafe.Pointer(&newRec),
+			Patch:     []schema.PatchItem{{Name: "name", Value: newRec.Name}},
+			PatchOnly: true,
+		}})
+		if got := db.snap.DirtyObservedMaterializedPredWork(dirtyStats.cacheKey); got < dirtyBuildWork {
+			t.Fatalf("dirty observed work=%d want>=%d", got, dirtyBuildWork)
+		}
+
+		view = db.view()
+		stats, ok := view.orderedLimitBaseCoreStats(
+			orderBasicBaseCore{kind: orderBasicBaseCoreRawExpr, expr: dirtyOp},
+			view.snap.Universe.Cardinality(),
+			int(viewQ.Limit),
+			true,
+		)
+		if !ok {
+			t.Fatalf("orderedLimitBaseCoreStats: ok=false")
+		}
+		if stats.routeWork != 0 {
+			t.Fatalf("dirty observed work leaked into routeWork=%d", stats.routeWork)
+		}
+
+		candidate := plannerGuardrailOrderedLimitBaseCandidate(t, db, secondHitQ, false, false)
+		if candidate.kind != plannerOrderedLimitCandidateColdUnretainedBaseCore {
+			t.Fatalf("kind=%v want=%v", candidate.kind, plannerOrderedLimitCandidateColdUnretainedBaseCore)
+		}
+		if candidate.cacheState != plannerMaterializedCacheColdSecondHitRequired {
+			t.Fatalf("cacheState=%v want=%v", candidate.cacheState, plannerMaterializedCacheColdSecondHitRequired)
+		}
+	})
+
 	t.Run("Disabled", func(t *testing.T) {
 		db := newTestDB(t, testOptions{MatPredCacheMaxEntries: -1})
 		_ = db.seedData(t, 20_000)
@@ -703,4 +809,80 @@ func TestPlannerGuardrails_OrderedLimitCacheStates(t *testing.T) {
 			t.Fatalf("cacheState=%v want=%v", candidate.cacheState, plannerMaterializedCacheColdUnretainedByPolicy)
 		}
 	})
+
+	t.Run("TinyPartialWarm", func(t *testing.T) {
+		db := newTestDB(t, testOptions{MatPredCacheMaxEntries: 1})
+		_ = db.seedData(t, 20_000)
+		candidate := plannerGuardrailOrderedLimitBaseCandidate(t, db, twoRangeQ, false, true)
+		if candidate.kind != plannerOrderedLimitCandidateColdUnretainedBaseCore {
+			t.Fatalf("kind=%v want=%v", candidate.kind, plannerOrderedLimitCandidateColdUnretainedBaseCore)
+		}
+		if candidate.cacheState != plannerMaterializedCacheColdUnretainedByPolicy {
+			t.Fatalf("cacheState=%v want=%v", candidate.cacheState, plannerMaterializedCacheColdUnretainedByPolicy)
+		}
+	})
+}
+
+func TestPlannerGuardrails_OrderedLimitBroadResidualNoOffsetUsesOrderScan(t *testing.T) {
+	var events []TraceEvent
+	db := newTestDB(t, testOptions{
+		TraceSink: func(ev TraceEvent) {
+			events = append(events, ev)
+		},
+		TraceSampleEvery: 1,
+	})
+	_ = db.seedData(t, 20_000)
+
+	q := qx.Query(qx.GTE("age", 20)).Sort("score", qx.DESC).Limit(100)
+	prepared, viewQ, err := db.prepareQuery(q)
+	if err != nil {
+		t.Fatalf("prepareQuery: %v", err)
+	}
+	defer prepared.Release()
+
+	ids, err := db.view().Query(&viewQ, true, false)
+	if err != nil {
+		t.Fatalf("Query: %v", err)
+	}
+	if len(ids) != 100 {
+		t.Fatalf("len(ids)=%d want=100", len(ids))
+	}
+	if len(events) == 0 {
+		t.Fatalf("expected trace event")
+	}
+	route := events[len(events)-1].OrderedLimitRoute
+	if route.Selected != plannerOrderedLimitCandidateOrderScan.String() {
+		t.Fatalf("selected=%q want=%q route=%+v", route.Selected, plannerOrderedLimitCandidateOrderScan.String(), route)
+	}
+}
+
+func TestPlannerGuardrails_OROrderTinyCacheRouteSet(t *testing.T) {
+	db := newTestDB(t, testOptions{MatPredCacheMaxEntries: 1})
+	_ = db.seedData(t, 20_000)
+
+	preparedQ, viewQ, err := db.prepareQuery(qx.Query(
+		qx.OR(
+			qx.AND(qx.GTE("age", 25), qx.EQ("country", "NL")),
+			qx.AND(qx.PREFIX("full_name", "FN-0"), qx.EQ("active", true)),
+		),
+	).Sort("score", qx.DESC).Limit(128))
+	if err != nil {
+		t.Fatalf("prepareQuery: %v", err)
+	}
+	defer preparedQ.Release()
+
+	view := db.view()
+	var facts plannerORFacts
+	if !view.collectORFacts(&viewQ, &facts) {
+		t.Fatalf("collectORFacts: ok=false")
+	}
+	defer facts.Release()
+
+	decision := view.selectOR(&viewQ, &facts)
+	if decision.kind != plannerORDecisionOrder {
+		t.Fatalf("decision.kind=%v want=%v", decision.kind, plannerORDecisionOrder)
+	}
+	if decision.order.selected.cacheState != plannerMaterializedCacheColdUnretainedByPolicy {
+		t.Fatalf("cacheState=%v want=%v route=%+v", decision.order.selected.cacheState, plannerMaterializedCacheColdUnretainedByPolicy, decision.order.traceRoute())
+	}
 }

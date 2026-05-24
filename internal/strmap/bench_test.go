@@ -389,7 +389,7 @@ func BenchmarkPublishedLookupByStringColdReadDirs(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		cold := *snap
+		cold := Snapshot{next: snap.next, readDirs: snap.readDirs}
 		key := keys[i&4095]
 		if _, ok := cold.Index(key); !ok {
 			b.Fatalf("missing key %q", key)

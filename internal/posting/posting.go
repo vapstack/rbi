@@ -405,6 +405,20 @@ func (it *arrayIter) Next() uint64 {
 	return v
 }
 
+func (it *arrayIter) AdvanceIfNeeded(minval uint64) {
+	lo := it.i
+	hi := len(it.ids)
+	for lo < hi {
+		mid := int(uint(lo+hi) >> 1)
+		if it.ids[mid] < minval {
+			lo = mid + 1
+		} else {
+			hi = mid
+		}
+	}
+	it.i = lo
+}
+
 func (p List) kind() uint64 {
 	return p.single & postingMetaKindMask
 }
@@ -2514,6 +2528,8 @@ func (emptyIter) HasNext() bool { return false }
 
 func (emptyIter) Next() uint64 { return 0 }
 
+func (emptyIter) AdvanceIfNeeded(uint64) {}
+
 func (emptyIter) Release() {}
 
 type singletonIter struct {
@@ -2529,6 +2545,12 @@ func (it *singletonIter) Next() uint64 {
 	}
 	it.has = false
 	return it.v
+}
+
+func (it *singletonIter) AdvanceIfNeeded(minval uint64) {
+	if it.has && it.v < minval {
+		it.has = false
+	}
 }
 
 func (it *singletonIter) Release() {

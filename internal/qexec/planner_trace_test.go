@@ -221,6 +221,123 @@ func TestTracer_OROrderMetrics(t *testing.T) {
 	}
 }
 
+func TestTracer_OrderedLimitRouteWorkSeparatesExactBucketFilter(t *testing.T) {
+	var events []TraceEvent
+	db := newTestDB(t, testOptions{
+		TraceSink: func(ev TraceEvent) {
+			events = append(events, ev)
+		},
+		TraceSampleEvery: 1,
+	})
+	_ = db.seedData(t, 20_000)
+
+	q := qx.Query(
+		qx.PREFIX("full_name", "FN-"),
+		qx.EQ("active", true),
+	).Sort("full_name", qx.ASC).Limit(12)
+
+	prepared, shape, err := db.prepareQuery(q)
+	if err != nil {
+		t.Fatalf("prepareQuery: %v", err)
+	}
+	defer prepared.Release()
+
+	ids, err := db.view().Query(&shape, true, false)
+	if err != nil {
+		t.Fatalf("Query: %v", err)
+	}
+	if len(ids) == 0 {
+		t.Fatalf("expected non-empty ids")
+	}
+	if len(events) == 0 {
+		t.Fatalf("expected trace event")
+	}
+
+	route := events[len(events)-1].OrderedLimitRoute
+	if route.Selected != plannerOrderedLimitCandidateOrderScan.String() {
+		t.Fatalf("selected=%q want %q route=%+v", route.Selected, plannerOrderedLimitCandidateOrderScan.String(), route)
+	}
+	if route.SelectedWork.CandidateScan <= 0 || route.SelectedWork.ExactBucketFilter <= 0 {
+		t.Fatalf("ordered LIMIT trace work did not preserve scan/exact-filter components: %+v", route.SelectedWork)
+	}
+	if route.SelectedWork.PostingContains != 0 {
+		t.Fatalf("exact bucket filter leaked into posting contains: %+v", route.SelectedWork)
+	}
+}
+
+func TestTracer_OROrderRouteWorkSeparatesExactBucketPenalty(t *testing.T) {
+	db := newTestDB(t, testOptions{})
+	_ = db.seedData(t, 8)
+	view := db.view()
+
+	shape := qir.Shape{
+		HasOrder: true,
+		Order:    qir.Order{FieldOrdinal: 0, Kind: qir.OrderKindBasic},
+		Limit:    100,
+	}
+	facts := plannerORFacts{
+		ordered:       true,
+		universe:      100_000,
+		unionCard:     50_000,
+		sumCard:       75_000,
+		branchCount:   2,
+		orderDistinct: 1_000,
+		orderStats: PlannerFieldStats{
+			DistinctKeys:    1_000,
+			NonEmptyKeys:    1_000,
+			TotalBucketCard: 100_000,
+			AvgBucketCard:   100,
+			P95BucketCard:   180,
+			MaxBucketCard:   220,
+		},
+	}
+	facts.branchCards[0] = 45_000
+	facts.branchCards[1] = 30_000
+	facts.branchesFacts[0] = plannerORBranchFact{
+		card:              45_000,
+		hasLead:           true,
+		leadEst:           45_000,
+		hasPrefixTailRisk: true,
+	}
+	facts.branchesFacts[1] = plannerORBranchFact{
+		card:    30_000,
+		hasLead: true,
+		leadEst: 30_000,
+	}
+	facts.mergeStats[0] = plannerOROrderMergeBranchStats{streamChecks: 3, mergeChecks: 1}
+	facts.mergeStats[1] = plannerOROrderMergeBranchStats{streamChecks: 1, mergeChecks: 1}
+
+	need := 100
+	cost := facts.orderMergeCost(uint64(need))
+	cost *= plannerOROrderExactBucketApplyPenalty(&facts.mergeStats, facts.branchCount)
+	cost *= plannerOROrderPrefixTailRiskPenalty(true, facts.branchCount, 0)
+
+	decision := plannerOROrderDecision{
+		selected: plannerOROrderCandidate{
+			kind:              plannerOROrderCandidateKWayMerge,
+			cost:              cost,
+			expectedRows:      estimateRowsForNeed(uint64(need), facts.unionCard, facts.universe),
+			unionRows:         facts.unionCard,
+			sumRows:           facts.sumCard,
+			avgChecks:         facts.avgMergeChecks(),
+			overlap:           float64(facts.sumCard) / float64(facts.unionCard),
+			hasPrefixTailRisk: true,
+		},
+		rejected: plannerOROrderCandidate{
+			kind:         plannerOROrderCandidateStream,
+			cost:         float64(need) * 4,
+			expectedRows: uint64(need),
+			avgChecks:    facts.orderStreamChecks(),
+		},
+	}
+
+	route := view.traceOROrderRoute(&shape, &facts, decision)
+	work := route.SelectedWork
+	if work.CandidateScan <= 0 || work.BranchMerge <= 0 || work.ExactBucketFilter <= 0 || work.TailRiskPenalty <= 0 {
+		t.Fatalf("ordered OR trace work did not preserve merge/exact/tail components: %+v", work)
+	}
+}
+
 func TestTracer_OROrderPlannerAnalysisMetrics(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
 		AnalyzeInterval:                         -1,
@@ -411,6 +528,14 @@ func TestTracer_ORRoutePreservesPlannerAnalysis(t *testing.T) {
 		Rejected:     "materialized_fallback",
 		SelectedCost: 12,
 		RejectedCost: 34,
+		SelectedWork: TraceRouteWork{
+			CandidateScan:   8,
+			PostingContains: 4,
+		},
+		RejectedWork: TraceRouteWork{
+			MaterializedBuild: 30,
+			BranchMerge:       4,
+		},
 		ExpectedRows: 8,
 		UnionRows:    13,
 		SumRows:      21,
@@ -440,6 +565,10 @@ func TestTracer_ORRoutePreservesPlannerAnalysis(t *testing.T) {
 		ev.ORRoute.Rejected != "materialized_fallback" ||
 		ev.ORRoute.SelectedCost != 12 ||
 		ev.ORRoute.RejectedCost != 34 ||
+		ev.ORRoute.SelectedWork.CandidateScan != 8 ||
+		ev.ORRoute.SelectedWork.PostingContains != 4 ||
+		ev.ORRoute.RejectedWork.MaterializedBuild != 30 ||
+		ev.ORRoute.RejectedWork.BranchMerge != 4 ||
 		ev.ORRoute.ExpectedRows != 8 ||
 		ev.ORRoute.UnionRows != 13 ||
 		ev.ORRoute.SumRows != 21 {

@@ -30,6 +30,7 @@ const (
 )
 
 const aggregateGroupIDOrdinalMaxLen = 8 << 20
+const aggregateFullScanMaxAvgBucketRows = 64
 
 type aggregateValueKind uint8
 
@@ -1311,6 +1312,16 @@ func (ae *aggregateExecutor) foldOrdinaryMetricStates(states []aggregateMetricSt
 	ov := indexdata.NewFieldIndexViewFromStorage(ae.snap.Index[acc.Ordinal])
 	universe := ae.snap.Universe.Cardinality()
 	filterCardinality := ids.Cardinality()
+	if filterCardinality == universe {
+		keyCount := ov.KeyCount()
+		if keyCount > len(states)*aggregateFullScanMaxAvgBucketRows {
+			br := ov.RangeByRanks(0, keyCount)
+			_, rows := ov.RangeStats(br)
+			if rows <= uint64(keyCount)*aggregateFullScanMaxAvgBucketRows {
+				return ae.foldOrdinaryMetricStatesAll(states, first, ov, br, keyCount, rows)
+			}
+		}
+	}
 	cur := ov.NewCursor(ov.RangeByRanks(0, ov.KeyCount()), false)
 	for {
 		key, bucketIDs, ok := cur.Next()
@@ -1345,6 +1356,108 @@ func (ae *aggregateExecutor) foldOrdinaryMetricStates(states []aggregateMetricSt
 				if err := states[i].addValue(value, n); err != nil {
 					return err
 				}
+			}
+		}
+	}
+	return nil
+}
+
+func (ae *aggregateExecutor) foldOrdinaryMetricStatesAll(states []aggregateMetricState, first int, ov indexdata.FieldIndexView, br indexdata.FieldIndexRange, keyCount int, rows uint64) error {
+	if rows == 0 {
+		return nil
+	}
+
+	metric := states[first].metric
+	firstValue := aggregateValueFromIndexKey(metric.field.ordinary.Field, ov.KeyAt(0))
+	lastValue := firstValue
+	if keyCount > 1 {
+		lastValue = aggregateValueFromIndexKey(metric.field.ordinary.Field, ov.KeyAt(keyCount-1))
+	}
+
+	scanValues := false
+	var scanIdx [8]int
+	scanN := 0
+	scanAll := false
+	for i := first; i < len(states); i++ {
+		if !aggregateMetricsShareOrdinaryField(metric, states[i].metric) {
+			continue
+		}
+		switch states[i].metric.op {
+		case aggregateMetricCount:
+			states[i].count += rows
+			states[i].seen = true
+		case aggregateMetricCountDistinct:
+			states[i].count += uint64(keyCount)
+			states[i].seen = true
+		case aggregateMetricMin:
+			states[i].best = firstValue
+			states[i].seen = true
+		case aggregateMetricMax:
+			states[i].best = lastValue
+			states[i].seen = true
+		default:
+			scanValues = true
+			if scanN < len(scanIdx) {
+				scanIdx[scanN] = i
+				scanN++
+			} else {
+				scanAll = true
+			}
+		}
+	}
+	if !scanValues {
+		return nil
+	}
+
+	cur := ov.NewCursor(br, false)
+	if metric.field.kind == aggregateValueFloat && !scanAll {
+		for {
+			key, bucketIDs, ok := cur.Next()
+			if !ok {
+				break
+			}
+			n := bucketIDs.Cardinality()
+			if n == 0 {
+				continue
+			}
+			add := keycodec.Float64FromOrderedKey(key.U64()) * float64(n)
+			for j := 0; j < scanN; j++ {
+				state := &states[scanIdx[j]]
+				state.count += n
+				state.floatSum += add
+				state.seen = true
+			}
+		}
+		return nil
+	}
+
+	for {
+		key, bucketIDs, ok := cur.Next()
+		if !ok {
+			break
+		}
+		n := bucketIDs.Cardinality()
+		if n == 0 {
+			continue
+		}
+		value := aggregateValueFromIndexKey(metric.field.ordinary.Field, key)
+		if scanAll {
+			for i := first; i < len(states); i++ {
+				if !aggregateMetricsShareOrdinaryField(metric, states[i].metric) {
+					continue
+				}
+				switch states[i].metric.op {
+				case aggregateMetricSum, aggregateMetricAvg:
+					if err := states[i].addValue(value, n); err != nil {
+						return err
+					}
+				}
+			}
+			continue
+		}
+		for j := 0; j < scanN; j++ {
+			if err := states[scanIdx[j]].addValue(value, n); err != nil {
+				return err
 			}
 		}
 	}

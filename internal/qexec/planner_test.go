@@ -12,6 +12,7 @@ import (
 	"github.com/vapstack/rbi/internal/keycodec"
 	"github.com/vapstack/rbi/internal/pooled"
 	"github.com/vapstack/rbi/internal/posting"
+	"github.com/vapstack/rbi/internal/qcache"
 	"github.com/vapstack/rbi/internal/qir"
 )
 
@@ -503,6 +504,19 @@ func TestRangeContainsThresholds_Adaptive(t *testing.T) {
 	afterLarge := rangeMaterializeAfterForProbe(8_192, 65_536)
 	if afterLarge > afterSmall {
 		t.Fatalf("expected wider probe to materialize no later than small: small=%d large=%d", afterSmall, afterLarge)
+	}
+
+	materializeAt := rangeAdaptiveProbeMaterializeAt(2_048, 2_048*256)
+	if materializeAt == 0 {
+		t.Fatalf("expected adaptive range probe to materialize")
+	}
+	perCall := rangeProbeContainsWork(2_048, 2_048*256)
+	if before := materializeAt - 1; rangeAdaptiveProbeWorkForRows(before, 2_048, 2_048*256) != satMulUint64(before, perCall) {
+		t.Fatalf("adaptive work must stay linear before materialization")
+	}
+	linearAt := satMulUint64(materializeAt, perCall)
+	if adaptiveAt := rangeAdaptiveProbeWorkForRows(materializeAt, 2_048, 2_048*256); adaptiveAt <= linearAt {
+		t.Fatalf("adaptive work at materialization threshold must include build: adaptive=%d linear=%d", adaptiveAt, linearAt)
 	}
 }
 
@@ -1649,6 +1663,35 @@ func TestPlannerOROrder_RepeatedExecutionPromotesMaterializedRange(t *testing.T)
 	}
 }
 
+func TestPlannerOROrderObserverHotCheckDoesNotTouchSeenKeys(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{
+		AnalyzeInterval:                         -1,
+		SnapshotMaterializedPredCacheMaxEntries: 16,
+	})
+	_ = seedData(t, db, 1)
+	view := db.engine.currentQueryViewForTests()
+	key := qcache.MaterializedPredKeyForScalar("age", qir.OpGTE, "30")
+	info := orderedORMaterializedPredicateBuildInfo{
+		cacheKey:        key,
+		buildWork:       64,
+		checkWork:       4,
+		cachedCheckWork: 1,
+		ok:              true,
+	}
+
+	if view.shouldObserveOrderedORPredicate(predicate{}, info) {
+		t.Fatalf("cold key must not be observed")
+	}
+	if got := view.snap.RuntimeMaterializedPredSeenEntryCount(); got != 0 {
+		t.Fatalf("hot check touched runtime seen keys: %d", got)
+	}
+
+	view.snap.ShouldPromoteRuntimeMaterializedPredKey(key)
+	if !view.shouldObserveOrderedORPredicate(predicate{}, info) {
+		t.Fatalf("seen key must be observed")
+	}
+}
+
 func TestPlannerOROrderKWay_RepeatedExecutionPromotesExactOnlyMaterializedRange(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
 		AnalyzeInterval:                         -1,
@@ -2674,6 +2717,59 @@ func TestPlannerOROrderDecision_PrefersMergeWhenRouteEstimatorBeatsStream(t *tes
 	}
 }
 
+func TestPlannerOROrderDecision_KWayOverrideKeepsTailRiskPenalties(t *testing.T) {
+	db := newTestDB(t, testOptions{})
+	_ = db.seedData(t, 8)
+	view := db.view()
+
+	q := qir.Shape{
+		HasOrder: true,
+		Order:    qir.Order{FieldOrdinal: 0, Kind: qir.OrderKindBasic},
+		Limit:    100,
+	}
+	facts := plannerORFacts{
+		ordered:       true,
+		universe:      100_000,
+		unionCard:     50_000,
+		sumCard:       60_000,
+		branchCount:   2,
+		orderDistinct: 1_000,
+		orderStats: PlannerFieldStats{
+			DistinctKeys:    1_000,
+			NonEmptyKeys:    1_000,
+			TotalBucketCard: 100_000,
+			AvgBucketCard:   100,
+			MaxBucketCard:   200,
+		},
+	}
+	facts.branchCards[0] = 50_000
+	facts.branchCards[1] = 30_000
+	facts.branchesFacts[0] = plannerORBranchFact{card: 50_000, hasLead: true, leadEst: 50_000, broadResidual: true}
+	facts.branchesFacts[1] = plannerORBranchFact{card: 30_000, hasLead: true, leadEst: 30_000}
+
+	routeCost, ok := view.estimateOROrderMergeRouteCostFacts(&q, &facts, 100)
+	if !ok {
+		t.Fatalf("estimateOROrderMergeRouteCostFacts: ok=false")
+	}
+	if raw := facts.orderMergeCost(100); routeCost.kWay >= raw {
+		t.Fatalf("fixture must exercise k-way override: route=%v raw=%v", routeCost.kWay, raw)
+	}
+
+	decision := view.selectOROrder(&q, &facts)
+	kwayCost := 0.0
+	switch {
+	case decision.selected.kind == plannerOROrderCandidateKWayMerge:
+		kwayCost = decision.selected.cost
+	case decision.rejected.kind == plannerOROrderCandidateKWayMerge:
+		kwayCost = decision.rejected.cost
+	default:
+		t.Fatalf("expected k-way candidate in decision, got selected=%v rejected=%v", decision.selected.kind, decision.rejected.kind)
+	}
+	if kwayCost <= routeCost.kWay*1.20 {
+		t.Fatalf("k-way tail penalty was lost: raw=%v final=%v", routeCost.kWay, kwayCost)
+	}
+}
+
 func TestPlannerORBranchesOrdered_AvoidsMaterializingDeferredOrderRangeLeaves(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
 		AnalyzeInterval: -1,
@@ -2947,6 +3043,55 @@ func TestBuildPredRangeCandidateWithColdMode_NullableComplementRouteKeepsPositiv
 	}
 }
 
+func TestOrderedLimitBaseCoreStats_NullableComplementCacheUsesBuildCardinality(t *testing.T) {
+	db, _ := openTempDBUint64PtrInt(t, Options{
+		AnalyzeInterval:                         -1,
+		SnapshotMaterializedPredCacheMaxEntries: 16,
+		NumericRangeBucketSize:                  8,
+		NumericRangeBucketMinFieldKeys:          16,
+		NumericRangeBucketMinSpanKeys:           4,
+	})
+	for i := 0; i < 5; i++ {
+		rec := &PtrIntRec{Name: fmt.Sprintf("nil_%02d", i), Rank: nil, Active: true}
+		if err := db.Set(uint64(i+1), rec); err != nil {
+			t.Fatalf("Set(nil_%02d): %v", i, err)
+		}
+	}
+	for i := 0; i < 995; i++ {
+		v := i
+		rec := &PtrIntRec{Name: fmt.Sprintf("rank_%03d", i), Rank: &v, Active: true}
+		if err := db.Set(uint64(i+6), rec); err != nil {
+			t.Fatalf("Set(rank_%03d): %v", i, err)
+		}
+	}
+	if err := db.RebuildIndex(); err != nil {
+		t.Fatalf("RebuildIndex: %v", err)
+	}
+
+	view := db.engine.currentQueryViewForTests()
+	expr := mustTestQIRExprForDB(t, db, qx.LT("rank", 900))
+	universe := view.snap.Universe.Cardinality()
+	stats, ok := view.orderBasicRawBaseOpStats(expr, universe)
+	if !ok {
+		t.Fatal("expected raw base op stats")
+	}
+	if !stats.buildComplement {
+		t.Fatalf("expected nullable broad range to build complement cache: %+v", stats)
+	}
+	if stats.probeEst <= stats.buildEst {
+		t.Fatalf("expected positive probe cardinality to exceed complement build cardinality: %+v", stats)
+	}
+
+	core := orderBasicBaseCore{kind: orderBasicBaseCoreRawExpr, expr: expr}
+	st, ok := view.orderedLimitBaseCoreStats(core, universe, 8, false)
+	if !ok {
+		t.Fatal("expected ordered LIMIT base-core stats")
+	}
+	if !st.useful {
+		t.Fatalf("expected complement cache to be useful when costed by build cardinality: stats=%+v ordered=%+v", stats, st)
+	}
+}
+
 func TestPlannerOROrderMergePaths_MixedExactAndNonExactChecks_MatchSeqScan(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{
 		AnalyzeInterval: -1,
@@ -3043,6 +3188,14 @@ func TestPlannerORKWayShouldFallbackRuntime(t *testing.T) {
 	if !plannerORKWayShouldFallbackRuntimeDetailed(250_000, 3_000, 2_900, 300_000).fallback {
 		t.Fatalf("expected fallback for large-window low-overlap stream")
 	}
+	dup := plannerORKWayShouldFallbackRuntimeDetailedWithProgress(120, 80, 20, 20_000, 30, 0, 0, plannerORKWayRuntimeShape{overlap: 1, avgChecks: 1})
+	if !dup.fallback || dup.reason != "duplicate_drop_projected_work" {
+		t.Fatalf("expected duplicate-drop fallback, got %+v", dup)
+	}
+	imbalanced := plannerORKWayShouldFallbackRuntimeDetailedWithProgress(120, 80, 20, 280_000, 0, 230_000, 4, plannerORKWayRuntimeShape{overlap: 1, avgChecks: 1})
+	if !imbalanced.fallback || imbalanced.reason != "branch_imbalance_projected_work" {
+		t.Fatalf("expected branch-imbalance fallback, got %+v", imbalanced)
+	}
 }
 
 func TestPlannerOROrderKWayRuntimeFallbackEnable(t *testing.T) {
@@ -3105,6 +3258,30 @@ func TestPlannerOROrderKWayRuntimeFallbackEnable(t *testing.T) {
 	}
 	if db.engine.shouldUseOROrderKWayRuntimeFallback(qSimple, branchesSimple, needSimple) {
 		t.Fatalf("expected runtime fallback guard to stay disabled for simple OR shape")
+	}
+
+	preparedSimple, viewSimple, err := prepareTestQuery(db.engine, qSimple)
+	if err != nil {
+		t.Fatalf("prepareTestQuery simple: %v", err)
+	}
+	defer preparedSimple.Release()
+	view := db.engine.currentQueryViewForTests()
+	analysisSimple, ok := view.buildOROrderAnalysis(&viewSimple, branchesSimple)
+	if !ok {
+		t.Fatalf("buildOROrderAnalysis simple: ok=false")
+	}
+	defer analysisSimple.release()
+	routeCost, ok := view.estimateOROrderMergeRouteCost(&viewSimple, branchesSimple, needSimple, analysisSimple.mergeStats)
+	if !ok || routeCost.kWay <= 0 {
+		t.Fatalf("estimateOROrderMergeRouteCost simple: ok=%v route=%+v", ok, routeCost)
+	}
+	selectorFallback := plannerOROrderCandidate{
+		kind: plannerOROrderCandidateStream,
+		cost: routeCost.kWay,
+	}
+	guard, ok := view.decideOROrderKWayRuntimeFallbackWithAnalysisAndFallback(&viewSimple, branchesSimple, needSimple, &analysisSimple, selectorFallback)
+	if !ok || !guard.enable || guard.reason != "near_tie_cost" {
+		t.Fatalf("expected selector stream fallback to enable near-tie guard, ok=%v guard=%+v", ok, guard)
 	}
 }
 
@@ -3173,7 +3350,7 @@ func TestPlannerOrderedAnchor_MatchesBaseline(t *testing.T) {
 	}
 }
 
-func TestPlannerRouting_PrefersOrderedAnchorForMixedPredicates(t *testing.T) {
+func TestPlannerRouting_MixedPredicatesMayUseMaterialized(t *testing.T) {
 	var (
 		mu     sync.Mutex
 		events []TraceEvent
@@ -3214,14 +3391,18 @@ func TestPlannerRouting_PrefersOrderedAnchorForMixedPredicates(t *testing.T) {
 	}
 	ev := events[len(events)-1]
 
-	if ev.Plan != "plan_ordered_anchor" && ev.Plan != "plan_ordered" && ev.Plan != "plan_limit_order_basic" {
-		t.Fatalf("expected ordered or order-basic plan, got %q", ev.Plan)
+	switch ev.Plan {
+	case string(PlanMaterialized), string(PlanOrderedAnchor), string(PlanOrdered), string(PlanLimitOrderBasic):
+	default:
+		t.Fatalf("unexpected plan: %q", ev.Plan)
 	}
-	if ev.OrderIndexScanWidth == 0 {
-		t.Fatalf("expected non-zero order index scan width")
-	}
-	if ev.EarlyStopReason == "" {
-		t.Fatalf("expected early stop reason to be set")
+	if ev.Plan != string(PlanMaterialized) {
+		if ev.OrderIndexScanWidth == 0 {
+			t.Fatalf("expected non-zero order index scan width")
+		}
+		if ev.EarlyStopReason == "" {
+			t.Fatalf("expected early stop reason to be set")
+		}
 	}
 }
 
@@ -3757,7 +3938,7 @@ func TestPlannerRouting_OrderLimitWithSecondaryRangeAndHasAny_MatchesSeqScan(t *
 	if ev.RowsReturned < uint64(len(got)) {
 		t.Fatalf("rows returned below page size: ev=%d got=%d", ev.RowsReturned, len(got))
 	}
-	if ev.RowsExamined == 0 {
+	if ev.Plan != string(PlanMaterialized) && ev.RowsExamined == 0 {
 		t.Fatalf("expected rows examined to be recorded")
 	}
 }

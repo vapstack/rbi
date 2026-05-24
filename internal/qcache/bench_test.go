@@ -248,12 +248,12 @@ func BenchmarkRecentKeyCacheAddWorkHot(b *testing.B) {
 	var cache RecentKeyCache
 	defer cache.Clear()
 	for i := range keys {
-		cache.AddWorkAndShouldPromote(keys[i], len(keys), 1, ^uint64(0))
+		_, _ = cache.AddWorkAndShouldPromote(keys[i], len(keys), 1, ^uint64(0))
 	}
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		qcacheBenchBool = cache.AddWorkAndShouldPromote(keys[i&31], len(keys), 1, ^uint64(0))
+		qcacheBenchBool, _ = cache.AddWorkAndShouldPromote(keys[i&31], len(keys), 1, ^uint64(0))
 	}
 }
 

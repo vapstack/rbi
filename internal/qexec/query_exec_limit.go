@@ -42,10 +42,27 @@ const limitQueryFastPathMaxLeaves = 8
 // a multi-residual LIMIT query is handed back to the general lead picker.
 const limitRangeNoOrderBroadResidualRowsPerNeed = 64
 
+const (
+	plannerLimitSampleMaxBuckets = 128
+	plannerLimitSampleMaxRows    = 1024
+	plannerLimitSampleMaxMatches = 16
+)
+
+type plannerLimitSample struct {
+	examined uint64
+	matched  uint64
+	buckets  uint64
+}
+
 type leafPostingScanCursor struct {
 	it   posting.Iterator
+	adv  leafPostingAdvanceIterator
 	cur  uint64
 	done bool
+}
+
+type leafPostingAdvanceIterator interface {
+	AdvanceIfNeeded(uint64)
 }
 
 func releaseLeafPostingScanCursors(cursors []leafPostingScanCursor) {
@@ -60,7 +77,8 @@ func leafPostingScanCursorsMatch(cursors []leafPostingScanCursor, idx uint64) bo
 		if c.done {
 			return false
 		}
-		for c.cur < idx {
+		if c.cur < idx {
+			c.adv.AdvanceIfNeeded(idx)
 			if !c.it.HasNext() {
 				c.done = true
 				return false
@@ -325,6 +343,82 @@ func leafPredsMatchActive(preds []leafPred, checks []int, idx uint64) bool {
 		}
 	}
 	return true
+}
+
+func plannerLimitSampleTarget(need uint64) uint64 {
+	target := need >> 3
+	if target < 4 {
+		target = 4
+	}
+	if target > plannerLimitSampleMaxMatches {
+		target = plannerLimitSampleMaxMatches
+	}
+	return target
+}
+
+func sampleLimitByFieldIndexBounds(
+	ov indexdata.FieldIndexView,
+	br indexdata.FieldIndexRange,
+	desc bool,
+	preds []leafPred,
+	target uint64,
+) plannerLimitSample {
+	if len(preds) == 0 || target == 0 || br.Empty() {
+		return plannerLimitSample{}
+	}
+
+	var activeBuf [limitQueryFastPathMaxLeaves]int
+	active := activeBuf[:0]
+	var activeHeap []int
+	if len(preds) > limitQueryFastPathMaxLeaves {
+		activeHeap = pooled.GetIntSlice(len(preds))
+		active = activeHeap[:0]
+	}
+	for i := 0; i < len(preds); i++ {
+		active = append(active, i)
+	}
+
+	var sample plannerLimitSample
+	cur := ov.NewCursor(br, desc)
+	for sample.buckets < plannerLimitSampleMaxBuckets && sample.examined < plannerLimitSampleMaxRows {
+		ids, idx, single, ok := cur.NextPostingOrSingle()
+		if !ok {
+			break
+		}
+		sample.buckets++
+		if single {
+			sample.examined++
+			if leafPredsMatchActive(preds, active, idx) {
+				sample.matched++
+				if sample.matched >= target {
+					break
+				}
+			}
+			continue
+		}
+		if ids.IsEmpty() {
+			continue
+		}
+		it := ids.Iter()
+		for it.HasNext() && sample.examined < plannerLimitSampleMaxRows {
+			sample.examined++
+			if leafPredsMatchActive(preds, active, it.Next()) {
+				sample.matched++
+				if sample.matched >= target {
+					break
+				}
+			}
+		}
+		it.Release()
+		if sample.matched >= target {
+			break
+		}
+	}
+
+	if activeHeap != nil {
+		pooled.ReleaseIntSlice(activeHeap)
+	}
+	return sample
 }
 
 func leafPredsEmitCandidate(
@@ -779,17 +873,22 @@ func (qv *View) hasPrefixBoundForField(leaves []qir.Expr, field string) bool {
 }
 
 func (qv *View) execSelectedNoOrderBounds(q *qir.Shape, field string, bounds indexdata.Bounds, leaves []qir.Expr, trace *Trace) ([]uint64, bool, error) {
+	out, used, _, err := qv.execNoOrderBounds(q, field, bounds, leaves, plannerNoOrderLimitRuntimeGuard{}, trace)
+	return out, used, err
+}
+
+func (qv *View) execNoOrderBounds(q *qir.Shape, field string, bounds indexdata.Bounds, leaves []qir.Expr, guard plannerNoOrderLimitRuntimeGuard, trace *Trace) ([]uint64, bool, bool, error) {
 	fm := qv.exec.Schema.Fields[field]
 	if fm == nil || fm.Slice {
-		return nil, false, nil
+		return nil, false, false, nil
 	}
 
 	ov := qv.fieldIndexViewFromSlotsByName(qv.snap.Index, field)
 	if !ov.HasData() {
 		if !qv.hasIndexedField(field) {
-			return nil, false, nil
+			return nil, false, false, nil
 		}
-		return nil, true, nil
+		return nil, true, false, nil
 	}
 
 	br := ov.RangeForBounds(bounds)
@@ -810,11 +909,11 @@ func (qv *View) execSelectedNoOrderBounds(q *qir.Shape, field string, bounds ind
 					continue
 				}
 				if err := qv.validateOrderBasicExpr(e); err != nil {
-					return nil, true, err
+					return nil, true, false, err
 				}
 			}
 		}
-		return nil, true, nil
+		return nil, true, false, nil
 	}
 
 	var predsBuf []leafPred
@@ -823,21 +922,44 @@ func (qv *View) execSelectedNoOrderBounds(q *qir.Shape, field string, bounds ind
 		var err error
 		predsBuf, ok, err = qv.buildLeafPredsExcludingBounds(leaves, field, 0)
 		if err != nil {
-			return nil, true, err
+			return nil, true, false, err
 		}
 		if !ok {
-			return nil, false, nil
+			return nil, false, false, nil
 		}
 		if predsBuf != nil {
 			defer leafPredSlicePool.Put(predsBuf)
 		}
 		if hasEmptyLeafPred(predsBuf) {
-			return nil, true, nil
+			return nil, true, false, nil
+		}
+	}
+
+	if guard.enabled && len(predsBuf) > 0 {
+		target := plannerLimitSampleTarget(guard.needWindow)
+		sample := sampleLimitByFieldIndexBounds(ov, br, false, predsBuf, target)
+		fallback := guard.shouldFallback(sample.examined, int(sample.matched))
+		reason := "sample_keep"
+		if fallback {
+			reason = "sample_" + guard.reason
+		} else if sample.examined < guard.minExamined {
+			reason = "sample_short"
+		} else if sample.matched >= target {
+			reason = "sample_hits"
+		}
+		if trace != nil {
+			trace.SetNoOrderLimitSample(sample.examined, sample.matched, sample.buckets, fallback, reason)
+		}
+		if fallback {
+			if trace != nil {
+				trace.SetNoOrderLimitRuntimeFallback(guard.reason)
+			}
+			return nil, false, true, nil
 		}
 	}
 
 	out, _ := qv.scanLimitByFieldIndexBounds(q, ov, br, false, predsBuf, "", plannerOrderedLimitRuntimeGuard{}, trace)
-	return out, true, nil
+	return out, true, false, nil
 }
 
 func (qv *View) buildLeafPredsExcludingBounds(leaves []qir.Expr, field string, orderedWindow int) ([]leafPred, bool, error) {
@@ -863,6 +985,11 @@ func (qv *View) buildLeafPredsExcludingBounds(leaves []qir.Expr, field string, o
 			if !ok {
 				leafPredSlicePool.Put(predsBuf)
 				return nil, false, nil
+			}
+			if p.kind == leafPredKindPredicate && p.pred.alwaysTrue {
+				releasePredicateOwnedState(&p.pred)
+				leafPredSlicePool.Put(predsBuf)
+				return nil, true, nil
 			}
 			qv.attachLeafPredPostingFilter(&p)
 			if orderedUniverse > 0 && (p.kind == leafPredKindPosting || p.postsAnyState != nil) {
@@ -931,6 +1058,10 @@ func (qv *View) buildLeafPredsExcludingBounds(leaves []qir.Expr, field string, o
 			leafPredSlicePool.Put(predsBuf)
 			return nil, false, nil
 		}
+		if p.kind == leafPredKindPredicate && p.pred.alwaysTrue {
+			releasePredicateOwnedState(&p.pred)
+			continue
+		}
 
 		qv.attachLeafPredPostingFilter(&p)
 		if orderedUniverse > 0 && (p.kind == leafPredKindPosting || p.postsAnyState != nil) {
@@ -991,7 +1122,10 @@ func (qv *View) buildLeafPredsExcludingBounds(leaves []qir.Expr, field string, o
 }
 
 func (qv *View) scanLimitByFieldIndexBounds(q *qir.Shape, ov indexdata.FieldIndexView, br indexdata.FieldIndexRange, desc bool, preds []leafPred, nilTailField string, guard plannerOrderedLimitRuntimeGuard, trace *Trace) ([]uint64, bool) {
-	limit := clampUint64ToInt(q.Limit)
+	if len(preds) == 0 {
+		return qv.scanOrderLimitNoPredicates(q, ov, br, desc, nilTailField, trace)
+	}
+
 	var extraRows uint64
 	if nilTailField != "" {
 		extraRows = qv.fieldIndexViewFromSlotsByName(qv.snap.NilIndex, nilTailField).LookupCardinality(indexdata.NilIndexEntryKey)
@@ -1005,33 +1139,6 @@ func (qv *View) scanLimitByFieldIndexBounds(q *qir.Shape, ov indexdata.FieldInde
 		return nil, true
 	}
 	out := make([]uint64, 0, clampUint64ToInt(capHint))
-	if trace == nil && q.Offset == 0 && len(preds) == 0 {
-		limit = clampUint64ToInt(q.Limit)
-		keyCur := ov.NewCursor(br, desc)
-		for {
-			ids, idx, single, ok := keyCur.NextPostingOrSingle()
-			if !ok {
-				break
-			}
-			if single {
-				out = append(out, idx)
-				if len(out) >= limit {
-					return out, true
-				}
-				continue
-			}
-			out, ok = appendPostingLimitNoTrace(out, ids, limit)
-			if ok {
-				return out, true
-			}
-		}
-		if nilTailField != "" {
-			ids := qv.fieldIndexViewFromSlotsByName(qv.snap.NilIndex, nilTailField).LookupPostingRetained(indexdata.NilIndexEntryKey)
-			out, _ = appendPostingLimitNoTrace(out, ids, limit)
-		}
-		return out, true
-	}
-
 	cursor := newQueryCursor(out, q.Offset, q.Limit, false, 0)
 	trackScanWidth := q.HasOrder
 
@@ -1108,14 +1215,18 @@ func (qv *View) scanLimitByFieldIndexBounds(q *qir.Shape, ov indexdata.FieldInde
 				postingCursorActive = false
 				break
 			}
-			it := preds[pi].posting.Iter()
-			postingCursors = append(postingCursors, leafPostingScanCursor{
-				it:  it,
-				cur: it.Next(),
-			})
+		}
+		if postingCursorActive {
+			for _, pi := range active {
+				it := preds[pi].posting.Iter()
+				postingCursors = append(postingCursors, leafPostingScanCursor{
+					it:  it,
+					adv: it.(leafPostingAdvanceIterator),
+					cur: it.Next(),
+				})
+			}
 		}
 		if !postingCursorActive {
-			releaseLeafPostingScanCursors(postingCursors)
 			postingCursors = postingCursors[:0]
 		}
 	}

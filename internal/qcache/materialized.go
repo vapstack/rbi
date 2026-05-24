@@ -716,6 +716,24 @@ func (c *RecentKeyCache) Contains(key MaterializedPredKey) bool {
 	return ok
 }
 
+func (c *RecentKeyCache) Work(key MaterializedPredKey) uint64 {
+	if key.IsZero() {
+		return 0
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.slots == nil {
+		return 0
+	}
+	idx, ok := c.findSlot(key)
+	if !ok {
+		return 0
+	}
+	return c.slots[idx].work
+}
+
 func (c *RecentKeyCache) TouchOrRemember(key MaterializedPredKey, limit int) bool {
 	if key.IsZero() || limit <= 0 {
 		return false
@@ -752,12 +770,9 @@ func (c *RecentKeyCache) TouchOrRemember(key MaterializedPredKey, limit int) boo
 	return false
 }
 
-func (c *RecentKeyCache) AddWorkAndShouldPromote(key MaterializedPredKey, limit int, delta, threshold uint64) bool {
+func (c *RecentKeyCache) AddWorkAndShouldPromote(key MaterializedPredKey, limit int, delta, threshold uint64) (promote bool, hadWork bool) {
 	if key.IsZero() || limit <= 0 || delta == 0 || threshold == 0 {
-		return false
-	}
-	if delta >= threshold {
-		return true
+		return false, false
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -765,21 +780,15 @@ func (c *RecentKeyCache) AddWorkAndShouldPromote(key MaterializedPredKey, limit 
 	c.initSlots(limit)
 	if idx, ok := c.findSlot(key); ok {
 		slot := c.slots[idx]
+		hadWork = slot.work != 0
 		slot.stamp = c.nextStamp()
 		slot.work = addObservedWork(slot.work, delta)
-		if slot.work < threshold {
-			c.slots[idx] = slot
-			return false
-		}
-		c.slots[idx] = recentKeyCacheSlot{}
-		if len(c.slots) > materializedPredCacheLinearMaxEntries {
-			c.removeRecentIndexLocked(slot.hash, idx)
-		}
-		return true
+		c.slots[idx] = slot
+		return slot.work >= threshold, hadWork
 	}
 	idx := c.selectVictimSlot()
 	if idx < 0 {
-		return false
+		return false, false
 	}
 	if len(c.slots) > materializedPredCacheLinearMaxEntries && c.slots[idx].used {
 		c.removeRecentIndexLocked(c.slots[idx].hash, idx)
@@ -796,7 +805,78 @@ func (c *RecentKeyCache) AddWorkAndShouldPromote(key MaterializedPredKey, limit 
 		work:  delta,
 		used:  true,
 	}
-	return false
+	return delta >= threshold, false
+}
+
+func (c *RecentKeyCache) InheritObservedWorkFrom(prev *RecentKeyCache, fields schema.IndexedFieldMap, changedFields []bool, limit int) {
+	c.inheritObservedWorkFrom(prev, fields, changedFields, false, limit)
+}
+
+func (c *RecentKeyCache) InheritChangedObservedWorkFrom(prev *RecentKeyCache, fields schema.IndexedFieldMap, changedFields []bool, limit int) {
+	c.inheritObservedWorkFrom(prev, fields, changedFields, true, limit)
+}
+
+func (c *RecentKeyCache) inheritObservedWorkFrom(prev *RecentKeyCache, fields schema.IndexedFieldMap, changedFields []bool, changedOnly bool, limit int) {
+	if limit <= 0 {
+		return
+	}
+	if changedOnly && len(changedFields) == 0 {
+		return
+	}
+
+	prev.mu.Lock()
+	if prev.slots == nil {
+		prev.mu.Unlock()
+		return
+	}
+
+	c.mu.Lock()
+	c.initSlots(limit)
+
+	maxStamp := c.clock
+	for i := range prev.slots {
+		slot := prev.slots[i]
+		if !slot.used || slot.work == 0 {
+			continue
+		}
+		f := slot.key.Field()
+		if f == "" {
+			continue
+		}
+		if changedFields != nil {
+			acc, ok := fields[f]
+			if !ok || changedFields[acc.Ordinal] != changedOnly {
+				continue
+			}
+		} else if changedOnly {
+			continue
+		}
+		idx := c.selectVictimSlot()
+		if idx < 0 {
+			break
+		}
+		if len(c.slots) > materializedPredCacheLinearMaxEntries && c.slots[idx].used {
+			c.removeRecentIndexLocked(c.slots[idx].hash, idx)
+		}
+		hash := uint64(0)
+		if len(c.slots) > materializedPredCacheLinearMaxEntries {
+			hash = slot.key.hash()
+			c.index[hash] = idx
+		}
+		c.slots[idx] = recentKeyCacheSlot{
+			key:   slot.key,
+			hash:  hash,
+			stamp: slot.stamp,
+			work:  slot.work,
+			used:  true,
+		}
+		if slot.stamp > maxStamp {
+			maxStamp = slot.stamp
+		}
+	}
+	c.clock = maxStamp
+	c.mu.Unlock()
+	prev.mu.Unlock()
 }
 
 func (c *RecentKeyCache) initSlots(limit int) {

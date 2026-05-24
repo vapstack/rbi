@@ -189,6 +189,8 @@ func (t *Trace) SetORRoute(route TraceORRoute) {
 		t.ev.ORRoute.Rejected = route.Rejected
 		t.ev.ORRoute.SelectedCost = route.SelectedCost
 		t.ev.ORRoute.RejectedCost = route.RejectedCost
+		t.ev.ORRoute.SelectedWork = route.SelectedWork
+		t.ev.ORRoute.RejectedWork = route.RejectedWork
 		t.ev.ORRoute.ExpectedRows = route.ExpectedRows
 		t.ev.ORRoute.UnionRows = route.UnionRows
 		t.ev.ORRoute.SumRows = route.SumRows
@@ -212,6 +214,8 @@ func (t *Trace) SetORSelectionRoute(route TraceORRoute) {
 	t.ev.ORRoute.Rejected = route.Rejected
 	t.ev.ORRoute.SelectedCost = route.SelectedCost
 	t.ev.ORRoute.RejectedCost = route.RejectedCost
+	t.ev.ORRoute.SelectedWork = route.SelectedWork
+	t.ev.ORRoute.RejectedWork = route.RejectedWork
 	t.ev.ORRoute.ExpectedRows = route.ExpectedRows
 	t.ev.ORRoute.UnionRows = route.UnionRows
 	t.ev.ORRoute.SumRows = route.SumRows
@@ -239,6 +243,17 @@ func (t *Trace) SetOrderedLimitRuntimeGuard(enabled bool, reason string) {
 	t.ev.OrderedLimitRoute.RuntimeGuardReason = reason
 }
 
+func (t *Trace) SetOrderedLimitSample(examined, matched, buckets uint64, fallback bool, reason string) {
+	if !t.Full() {
+		return
+	}
+	t.ev.OrderedLimitRoute.SampleExamined = examined
+	t.ev.OrderedLimitRoute.SampleMatched = matched
+	t.ev.OrderedLimitRoute.SampleBuckets = buckets
+	t.ev.OrderedLimitRoute.SampleFallback = fallback
+	t.ev.OrderedLimitRoute.SampleReason = reason
+}
+
 func (t *Trace) SetOrderedLimitRuntimeFallback(reason string) {
 	if !t.Full() {
 		return
@@ -252,6 +267,33 @@ func (t *Trace) SetNoOrderLimitRoute(route TraceNoOrderLimitRoute) {
 		return
 	}
 	t.ev.NoOrderLimitRoute = route
+}
+
+func (t *Trace) SetNoOrderLimitRuntimeGuard(enabled bool, reason string) {
+	if !t.Full() {
+		return
+	}
+	t.ev.NoOrderLimitRoute.RuntimeGuardEnabled = enabled
+	t.ev.NoOrderLimitRoute.RuntimeGuardReason = reason
+}
+
+func (t *Trace) SetNoOrderLimitSample(examined, matched, buckets uint64, fallback bool, reason string) {
+	if !t.Full() {
+		return
+	}
+	t.ev.NoOrderLimitRoute.SampleExamined = examined
+	t.ev.NoOrderLimitRoute.SampleMatched = matched
+	t.ev.NoOrderLimitRoute.SampleBuckets = buckets
+	t.ev.NoOrderLimitRoute.SampleFallback = fallback
+	t.ev.NoOrderLimitRoute.SampleReason = reason
+}
+
+func (t *Trace) SetNoOrderLimitRuntimeFallback(reason string) {
+	if !t.Full() {
+		return
+	}
+	t.ev.NoOrderLimitRoute.RuntimeFallbackTriggered = true
+	t.ev.NoOrderLimitRoute.RuntimeFallbackReason = reason
 }
 
 func (t *Trace) SetArrayPosOrderRoute(route TraceArrayPosOrderRoute) {
@@ -286,6 +328,18 @@ func (t *Trace) SetOROrderRuntimeGuard(enabled bool, reason string) {
 	}
 	t.ev.ORRoute.RuntimeGuardEnabled = enabled
 	t.ev.ORRoute.RuntimeGuardReason = reason
+}
+
+func (t *Trace) SetOROrderSample(examined, matched, buckets, dropped uint64, fallback bool, reason string) {
+	if !t.Full() {
+		return
+	}
+	t.ev.ORRoute.SampleExamined = examined
+	t.ev.ORRoute.SampleMatched = matched
+	t.ev.ORRoute.SampleBuckets = buckets
+	t.ev.ORRoute.SampleDropped = dropped
+	t.ev.ORRoute.SampleFallback = fallback
+	t.ev.ORRoute.SampleReason = reason
 }
 
 func (t *Trace) SetOROrderRuntimeFallback(reason string, examinedPerUnique, projectedExamined, projectedExaminedMax float64) {

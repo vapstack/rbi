@@ -449,7 +449,7 @@ func BenchmarkViewMaterializedPredMethods(b *testing.B) {
 			if i&1 == 0 {
 				v.ShouldPromoteRuntimeMaterializedPredKey(key)
 			} else {
-				v.ShouldPromoteObservedOrderedORMaterializedPredKey(key, 32, 64)
+				v.ShouldPromoteObservedMaterializedPredKey(key, 32, 64)
 			}
 		}
 	})

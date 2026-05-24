@@ -635,6 +635,67 @@ func TestBuildPredRange_PrefixMaterializationSkippedWhenCacheDisabled(t *testing
 	}
 }
 
+func TestBuildPredRange_NumericBucketsRunWhenPredicateCacheDisabled(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{
+		AnalyzeInterval:                         -1,
+		SnapshotMaterializedPredCacheMaxEntries: -1,
+		NumericRangeBucketSize:                  8,
+		NumericRangeBucketMinFieldKeys:          16,
+		NumericRangeBucketMinSpanKeys:           4,
+	})
+	seedGeneratedUint64Data(t, db, 12_000, func(i int) *Rec {
+		return &Rec{
+			Name:   fmt.Sprintf("u_%d", i),
+			Email:  fmt.Sprintf("user%05d@example.com", i),
+			Age:    i,
+			Score:  float64(i),
+			Active: true,
+		}
+	})
+	if err := db.RebuildIndex(); err != nil {
+		t.Fatalf("RebuildIndex: %v", err)
+	}
+
+	view := db.engine.currentQueryViewForTests()
+	expr := mustTestQIRExprForDB(t, db, qx.LT("age", 11_000))
+	fm := view.fieldMetaByExpr(expr)
+	if fm == nil {
+		t.Fatal("expected field metadata")
+	}
+	ov := view.fieldIndexViewFromSlotsForExpr(view.snap.Index, expr)
+	if !ov.HasData() {
+		t.Fatal("expected index view data")
+	}
+	candidate, ok := view.prepareScalarRangeRoutingCandidate(expr)
+	if !ok {
+		t.Fatal("prepareScalarRangeRoutingCandidate: ok=false")
+	}
+	if !candidate.plan.useComplement {
+		t.Fatal("expected broad numeric range to use complement probing when it stays lazy")
+	}
+
+	p, ok := view.buildPredRangeCandidateWithMode(expr, fm, ov, true)
+	if !ok {
+		t.Fatal("buildPredRangeCandidateWithMode: ok=false")
+	}
+	defer releasePredicates([]predicate{p})
+	if !p.isMaterializedLike() {
+		t.Fatalf("expected numeric bucket path to materialize current-query predicate, kind=%v", p.kind)
+	}
+	if p.fieldIndexRangeState != nil {
+		t.Fatal("expected numeric bucket path instead of repeated runtime range probes")
+	}
+	if !p.matches(1) || !p.matches(10_999) || p.matches(11_000) {
+		t.Fatal("numeric bucket materialized predicate returned wrong matches")
+	}
+	if view.snap.MaterializedPredCache() != nil {
+		t.Fatal("materialized predicate cache must stay disabled")
+	}
+	if view.snap.NumericRangeBucketCache().EntryCount() == 0 {
+		t.Fatal("expected numeric range bucket cache entry")
+	}
+}
+
 func TestBuildPredRangeCandidate_FullUniversePrefixBecomesAlwaysTrue(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
 

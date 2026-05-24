@@ -127,6 +127,8 @@ type TraceORRoute struct {
 	Rejected     string
 	SelectedCost float64
 	RejectedCost float64
+	SelectedWork TraceRouteWork
+	RejectedWork TraceRouteWork
 	ExpectedRows uint64
 	UnionRows    uint64
 	SumRows      uint64
@@ -151,11 +153,31 @@ type TraceORRoute struct {
 	RuntimeGuardEnabled bool
 	RuntimeGuardReason  string
 
+	SampleExamined uint64
+	SampleMatched  uint64
+	SampleBuckets  uint64
+	SampleDropped  uint64
+	SampleFallback bool
+	SampleReason   string
+
 	RuntimeFallbackTriggered    bool
 	RuntimeFallbackReason       string
 	RuntimeExaminedPerUnique    float64
 	RuntimeProjectedExamined    float64
 	RuntimeProjectedExaminedMax float64
+}
+
+// TraceRouteWork decomposes a selector's scalar cost into planner-visible work classes.
+type TraceRouteWork struct {
+	CandidateScan            float64
+	PostingContains          float64
+	RangeProbe               float64
+	ExactBucketFilter        float64
+	BranchMerge              float64
+	MaterializedBuild        float64
+	RetainedCacheBenefit     float64
+	UnretainedRebuildPenalty float64
+	TailRiskPenalty          float64
 }
 
 type TraceOrderedLimitRoute struct {
@@ -165,6 +187,8 @@ type TraceOrderedLimitRoute struct {
 
 	SelectedCost float64
 	RejectedCost float64
+	SelectedWork TraceRouteWork
+	RejectedWork TraceRouteWork
 
 	ExpectedRows    uint64
 	OrderBuckets    uint64
@@ -174,6 +198,11 @@ type TraceOrderedLimitRoute struct {
 
 	RuntimeGuardEnabled      bool
 	RuntimeGuardReason       string
+	SampleExamined           uint64
+	SampleMatched            uint64
+	SampleBuckets            uint64
+	SampleFallback           bool
+	SampleReason             string
 	RuntimeFallbackTriggered bool
 	RuntimeFallbackReason    string
 }
@@ -184,11 +213,23 @@ type TraceNoOrderLimitRoute struct {
 
 	SelectedCost float64
 	RejectedCost float64
+	SelectedWork TraceRouteWork
+	RejectedWork TraceRouteWork
 
 	ExpectedRows uint64
 	LeadRows     uint64
 	Checks       uint64
 	PostingBuild uint64
+
+	RuntimeGuardEnabled      bool
+	RuntimeGuardReason       string
+	SampleExamined           uint64
+	SampleMatched            uint64
+	SampleBuckets            uint64
+	SampleFallback           bool
+	SampleReason             string
+	RuntimeFallbackTriggered bool
+	RuntimeFallbackReason    string
 }
 
 type TraceArrayPosOrderRoute struct {

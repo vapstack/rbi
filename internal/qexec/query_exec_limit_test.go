@@ -533,6 +533,63 @@ func TestQuery_DirectRangeNoOrderWithLimit_UsesSelectorTrace(t *testing.T) {
 	}
 }
 
+func TestNoOrderLimitTraceWork_DirectRangeSeparatesRangeProbe(t *testing.T) {
+	db := newTestDB(t, testOptions{})
+	db.seedData(t, 20_000)
+
+	q := qx.Query(
+		qx.GTE("age", 20),
+		qx.LT("age", 90),
+		qx.NOTIN("country", []string{"DE", "PL"}),
+		qx.NOT(qx.EQ("active", false)),
+		qx.NOTIN("name", []string{"alice", "bob"}),
+	).Limit(64)
+
+	prepared, shape, err := db.prepareQuery(q)
+	if err != nil {
+		t.Fatalf("prepareQuery: %v", err)
+	}
+	defer prepared.Release()
+
+	view := db.view()
+	facts := noOrderLimitFactsPool.Get()
+	defer facts.Release()
+
+	ok, err := view.collectNoOrderLimitFacts(&shape, facts)
+	if err != nil {
+		t.Fatalf("collectNoOrderLimitFacts: %v", err)
+	}
+	if !ok || !facts.directBoundsOK || facts.directResiduals < 3 {
+		t.Fatalf("fixture did not collect broad direct range facts: ok=%v direct=%v residuals=%d", ok, facts.directBoundsOK, facts.directResiduals)
+	}
+
+	ov := view.fieldIndexViewFromSlotsByName(view.snap.Index, facts.directField)
+	br := ov.RangeForBounds(facts.directBounds)
+	if br.Empty() || br.BaseEnd <= br.BaseStart {
+		t.Fatalf("fixture direct range is empty: %+v", br)
+	}
+
+	expected := uint64(128)
+	residuals := float64(facts.directResiduals)
+	width := float64(br.BaseEnd - br.BaseStart)
+	kind := plannerNoOrderLimitCandidateDirectRange
+	if facts.directBoundLeaves > 1 {
+		kind = plannerNoOrderLimitCandidateSameFieldBounds
+	}
+	c := plannerNoOrderLimitCandidate{
+		kind:         kind,
+		cost:         float64(expected)*(1.0+residuals*0.70) + width*0.20,
+		expectedRows: expected,
+		leadRows:     expected * 4,
+		checks:       uint64(facts.directResiduals),
+	}
+
+	work := view.noOrderLimitCandidateTraceWork(&shape, facts, c)
+	if work.RangeProbe <= 0 || work.CandidateScan <= 0 || work.PostingContains <= 0 {
+		t.Fatalf("direct-range trace work did not preserve components: %+v", work)
+	}
+}
+
 func TestQuery_ArrayPosSingleHasAny_UsesSelectorTrace(t *testing.T) {
 	var events []TraceEvent
 	db, _ := openTempDBUint64(t, Options{
@@ -1219,6 +1276,35 @@ func TestQuery_OrderBasicLimit_EmptySnapshotValidatesResidual(t *testing.T) {
 	}
 }
 
+func TestQuery_ORLimit_InvalidSuffixContainsBranchReturnsError(t *testing.T) {
+	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
+	seedGeneratedUint64Data(t, db, 40, func(i int) *Rec {
+		return &Rec{
+			Email:  fmt.Sprintf("user%d@example.com", i),
+			Active: i%2 == 0,
+			Score:  float64(i),
+		}
+	})
+	if err := db.RebuildIndex(); err != nil {
+		t.Fatalf("RebuildIndex: %v", err)
+	}
+
+	for _, invalid := range []qx.Expr{
+		qx.SUFFIX("email", []string{"@example.com"}),
+		qx.CONTAINS("email", []string{"example"}),
+	} {
+		q := qx.Query(qx.OR(qx.EQ("active", true), invalid)).Limit(3)
+		if _, err := db.QueryKeys(q); !errors.Is(err, ErrInvalidQuery) {
+			t.Fatalf("no-order QueryKeys err=%v, want ErrInvalidQuery", err)
+		}
+
+		q = qx.Query(qx.OR(qx.EQ("active", true), invalid)).Sort("score", qx.ASC).Limit(3)
+		if _, err := db.QueryKeys(q); !errors.Is(err, ErrInvalidQuery) {
+			t.Fatalf("ordered QueryKeys err=%v, want ErrInvalidQuery", err)
+		}
+	}
+}
+
 func TestQuery_NoOrderLimit_EmptyRangeValidatesResidual(t *testing.T) {
 	db, _ := openTempDBUint64(t, Options{AnalyzeInterval: -1})
 	seedGeneratedUint64Data(t, db, 20, func(i int) *Rec {
@@ -1361,6 +1447,83 @@ func TestQuery_OrderBasicLimit_RuntimeGuardAppliesToLeafPredScan(t *testing.T) {
 	}
 	if !ev.OrderedLimitRoute.RuntimeFallbackTriggered {
 		t.Fatalf("expected ordered LIMIT runtime fallback, route=%+v", ev.OrderedLimitRoute)
+	}
+}
+
+func TestQuery_NoOrderLimitRuntimeFallbackUsesFallbackLead(t *testing.T) {
+	db := newTestDB(t, testOptions{})
+	db.seedGeneratedData(t, 2_000, func(id uint64) testRec {
+		country := "COMMON"
+		if id == 2_000 {
+			country = "RARE"
+		}
+		return testRec{
+			Meta: Meta{Country: country},
+			Age:  int(id),
+		}
+	})
+
+	q := qx.Query(
+		qx.GTE("age", 1),
+		qx.EQ("country", "RARE"),
+	).Limit(1)
+	prepared, shape, err := db.prepareQuery(q)
+	if err != nil {
+		t.Fatalf("prepareQuery: %v", err)
+	}
+	defer prepared.Release()
+
+	view := db.view()
+	facts := noOrderLimitFactsPool.Get()
+	defer facts.Release()
+
+	ok, err := view.collectNoOrderLimitFacts(&shape, facts)
+	if err != nil {
+		t.Fatalf("collectNoOrderLimitFacts: %v", err)
+	}
+	if !ok {
+		t.Fatalf("collectNoOrderLimitFacts: ok=false")
+	}
+
+	var trace Trace
+	out, used, plan, err := view.dispatchNoOrderLimit(
+		&shape,
+		facts,
+		plannerNoOrderLimitDecision{
+			selected: plannerNoOrderLimitCandidate{
+				kind:    plannerNoOrderLimitCandidateDirectRange,
+				leadIdx: 0,
+				checks:  1,
+			},
+			runtimeFallback: plannerNoOrderLimitCandidate{
+				kind:    plannerNoOrderLimitCandidateLeadScan,
+				leadIdx: 1,
+			},
+		},
+		plannerNoOrderLimitRuntimeGuard{
+			enabled:      true,
+			minExamined:  1,
+			needWindow:   shape.Limit,
+			fallbackCost: 1,
+			rowCost:      2,
+			reason:       "test_direct_range_guard",
+		},
+		&trace,
+	)
+	if err != nil {
+		t.Fatalf("dispatchNoOrderLimit: %v", err)
+	}
+	if !used {
+		t.Fatalf("dispatchNoOrderLimit: used=false")
+	}
+	if plan != PlanCandidateNoOrder {
+		t.Fatalf("plan=%s want %s", plan, PlanCandidateNoOrder)
+	}
+	if !slices.Equal(out, []uint64{2_000}) {
+		t.Fatalf("out=%v want [2000]", out)
+	}
+	if trace.RowsExamined() > 10 {
+		t.Fatalf("fallback scanned the broad selected lead, rowsExamined=%d", trace.RowsExamined())
 	}
 }
 
@@ -1731,6 +1894,84 @@ func TestQuery_LimitRangeNoOrder_ResidualsUseBucketExactFilter(t *testing.T) {
 		t.Fatalf("full QueryKeys: %v", err)
 	}
 	assertNoOrderPage(t, q, got, full, "range_no_order_bucket_exact")
+}
+
+func TestQuery_LimitRangeNoOrder_NoResidualDoesNotTraceOrderScanWidth(t *testing.T) {
+	var (
+		mu     sync.Mutex
+		events []TraceEvent
+	)
+
+	db, _ := openTempDBUint64(t, Options{
+		TraceSink: func(ev TraceEvent) {
+			mu.Lock()
+			events = append(events, ev)
+			mu.Unlock()
+		},
+		TraceSampleEvery: 1,
+	})
+
+	seedGeneratedUint64Data(t, db, 512, func(i int) *Rec {
+		return &Rec{
+			Name:   fmt.Sprintf("u_%d", i),
+			Age:    i,
+			Score:  float64(i),
+			Active: i%2 == 0,
+		}
+	})
+	if err := db.RebuildIndex(); err != nil {
+		t.Fatalf("RebuildIndex: %v", err)
+	}
+
+	q := qx.Query(
+		qx.GTE("age", 100),
+		qx.LT("age", 400),
+	).Limit(25)
+
+	leaves := mustExtractAndLeaves(t, q.Filter)
+	f, bounds, ok, err := db.engine.extractNoOrderBounds(leaves)
+	if err != nil {
+		t.Fatalf("extractNoOrderBounds: %v", err)
+	}
+	if !ok {
+		t.Fatalf("expected no-order bounds to be recognized")
+	}
+
+	preparedQ, viewQ, err := prepareTestQuery(db.engine, q)
+	if err != nil {
+		t.Fatalf("prepareTestQuery: %v", err)
+	}
+	defer preparedQ.Release()
+
+	tr := db.engine.beginTraceForTests(viewQ)
+	if tr == nil {
+		t.Fatalf("expected trace to be enabled")
+	}
+	got, used, err := db.engine.execSelectedNoOrderBounds(q, f, bounds, leaves, tr)
+	tr.Finish(uint64(len(got)), err)
+	if err != nil {
+		t.Fatalf("execSelectedNoOrderBounds: %v", err)
+	}
+	if !used {
+		t.Fatalf("expected range limit fast path to be used")
+	}
+	if len(got) == 0 {
+		t.Fatalf("expected non-empty result")
+	}
+
+	mu.Lock()
+	if len(events) == 0 {
+		mu.Unlock()
+		t.Fatalf("expected trace event")
+	}
+	ev := events[len(events)-1]
+	mu.Unlock()
+	if ev.RowsExamined == 0 || ev.RowsMatched == 0 {
+		t.Fatalf("expected non-zero row counters, trace=%+v", ev)
+	}
+	if ev.OrderIndexScanWidth != 0 {
+		t.Fatalf("expected no order-index scan width for no-order bounds, trace=%+v", ev)
+	}
 }
 
 func TestQuery_LimitOrderBasic_ResidualsUseBucketExactFilter(t *testing.T) {

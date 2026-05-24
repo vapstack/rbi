@@ -26,7 +26,8 @@ type View struct {
 
 	matPredCache           *qcache.MaterializedPredCache
 	runtimeMatPredSeen     qcache.RecentKeyCache
-	orderORMatPredObserved qcache.RecentKeyCache
+	runtimeMatPredObserved qcache.RecentKeyCache
+	runtimeMatPredDirty    qcache.RecentKeyCache
 }
 
 type CacheConfig struct {

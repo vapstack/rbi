@@ -87,10 +87,36 @@ func (d plannerORNoOrderDecision) traceRoute() TraceORRoute {
 		Rejected:     d.rejected.kind.String(),
 		SelectedCost: d.selected.cost,
 		RejectedCost: d.rejected.cost,
+		SelectedWork: d.selected.traceWork(),
+		RejectedWork: d.rejected.traceWork(),
 		ExpectedRows: d.selected.expectedRows,
 		UnionRows:    d.selected.unionRows,
 		SumRows:      d.selected.sumRows,
 		AvgChecks:    d.selected.avgChecks,
+	}
+}
+
+func (c plannerORNoOrderCandidate) traceWork() TraceRouteWork {
+	if c.cost <= 0 {
+		return TraceRouteWork{}
+	}
+	switch c.kind {
+	case plannerORNoOrderCandidateMaterializedFallback:
+		build := float64(c.sumRows)
+		if build > c.cost {
+			build = c.cost
+		}
+		return TraceRouteWork{CandidateScan: c.cost - build, MaterializedBuild: build}
+	case plannerORNoOrderCandidateAdaptiveMerge, plannerORNoOrderCandidateBaselineMerge:
+		scan := float64(c.expectedRows)
+		if scan > c.cost {
+			scan = c.cost
+		}
+		return TraceRouteWork{CandidateScan: scan, PostingContains: c.cost - scan}
+	case plannerORNoOrderCandidateUniverse:
+		return TraceRouteWork{CandidateScan: c.cost}
+	default:
+		return TraceRouteWork{}
 	}
 }
 
@@ -130,6 +156,7 @@ type plannerOROrderCandidate struct {
 	cacheState          plannerMaterializedCacheState
 	eagerBuildWork      uint64
 	hasPrefixTailRisk   bool
+	hasBroadResidual    bool
 	hasSelectiveLead    bool
 	fallbackCollectFast bool
 }
@@ -165,6 +192,8 @@ func (d plannerOROrderDecision) traceRoute() TraceORRoute {
 		Rejected:            d.rejected.kind.String(),
 		SelectedCost:        d.selected.cost,
 		RejectedCost:        d.rejected.cost,
+		SelectedWork:        d.selected.traceWork(),
+		RejectedWork:        d.rejected.traceWork(),
 		ExpectedRows:        d.selected.expectedRows,
 		UnionRows:           d.selected.unionRows,
 		SumRows:             d.selected.sumRows,
@@ -175,6 +204,70 @@ func (d plannerOROrderDecision) traceRoute() TraceORRoute {
 		HasPrefixNonOrder:   d.selected.hasPrefixTailRisk,
 		HasSelectiveLead:    d.selected.hasSelectiveLead,
 		FallbackCollectFast: d.selected.fallbackCollectFast,
+	}
+}
+
+func (c plannerOROrderCandidate) traceWork() TraceRouteWork {
+	if c.cost <= 0 {
+		return TraceRouteWork{}
+	}
+	switch c.kind {
+	case plannerOROrderCandidateMaterializedFallback:
+		build := float64(c.sumRows)
+		if build > c.cost {
+			build = c.cost
+		}
+		return TraceRouteWork{CandidateScan: c.cost - build, MaterializedBuild: build}
+	case plannerOROrderCandidateStream:
+		build := float64(c.eagerBuildWork)
+		if build > c.cost {
+			build = c.cost
+		}
+		remain := c.cost - build
+		scan := float64(c.expectedRows)
+		if scan > remain {
+			scan = remain
+		}
+		return TraceRouteWork{CandidateScan: scan, PostingContains: remain - scan, MaterializedBuild: build}
+	case plannerOROrderCandidateKWayMerge:
+		build := float64(c.eagerBuildWork)
+		if build > c.cost {
+			build = c.cost
+		}
+		remain := c.cost - build
+		scan := float64(c.expectedRows)
+		if c.overlap > 1 {
+			scan *= c.overlap
+		}
+		if scan > remain {
+			scan = remain
+		}
+		contains := scan * c.avgChecks * 0.55
+		if scan+contains > remain {
+			contains = remain - scan
+		}
+		work := TraceRouteWork{CandidateScan: scan, PostingContains: contains, BranchMerge: remain - scan - contains, MaterializedBuild: build}
+		if plannerMaterializedCacheStateUnretained(c.cacheState) {
+			work.UnretainedRebuildPenalty = work.BranchMerge
+			work.BranchMerge = 0
+		} else if c.hasPrefixTailRisk || c.hasBroadResidual {
+			work.TailRiskPenalty = work.BranchMerge
+			work.BranchMerge = 0
+		}
+		return work
+	case plannerOROrderCandidateBranchCollect:
+		build := float64(c.eagerBuildWork)
+		if build > c.cost {
+			build = c.cost
+		}
+		remain := c.cost - build
+		scan := float64(c.expectedRows)
+		if scan > remain {
+			scan = remain
+		}
+		return TraceRouteWork{CandidateScan: scan, BranchMerge: remain - scan, MaterializedBuild: build}
+	default:
+		return TraceRouteWork{}
 	}
 }
 
@@ -704,11 +797,41 @@ func (qv *View) orderedORCacheCandidateState(
 	analysis *plannerOROrderAnalysis,
 	needWindow int,
 	orderedOffset uint64,
-) (plannerMaterializedCacheState, uint64) {
+) (plannerMaterializedCacheState, uint64, float64) {
+	if qv.snap == nil {
+		return plannerMaterializedCacheDisabled, 0, 1
+	}
+	cache := qv.snap.MaterializedPredCache()
+	if cache == nil {
+		return plannerMaterializedCacheDisabled, 0, 1
+	}
 	var branchUniverses [plannerORBranchLimit]uint64
 	n := branches.Len()
 	if n > plannerORBranchLimit {
 		n = plannerORBranchLimit
+	}
+	if orderedOffset == 0 {
+		potentialKeys := 0
+		maxUniverse := analysis.snapshotUniverse
+		for i := 0; i < n; i++ {
+			if analysis.branches[i].universe > maxUniverse {
+				maxUniverse = analysis.branches[i].universe
+			}
+			branch := branches.owner[i]
+			for pi := 0; pi < branch.preds.Len(); pi++ {
+				p := branch.preds.owner[pi]
+				if p.alwaysTrue || p.alwaysFalse || p.covered || !p.hasContains() {
+					continue
+				}
+				potentialKeys++
+			}
+		}
+		if potentialKeys == 0 {
+			return plannerMaterializedCacheDisabled, 0, 1
+		}
+		if plannerMaterializedCacheRouteEnvelopeRetained(cache, potentialKeys, maxUniverse) {
+			return plannerMaterializedCacheColdRegularAdmissible, 0, 1
+		}
 	}
 	for i := 0; i < n; i++ {
 		branchUniverses[i] = analysis.branches[i].universe
@@ -717,7 +840,8 @@ func (qv *View) orderedORCacheCandidateState(
 	var estimates [plannerORBranchLimit]plannerOROrderedBranchEstimate
 	qv.initOrderedORBranchEstimates(branches, &branchUniverses, needWindow, &estimates)
 
-	state := plannerMaterializedCacheDisabled
+	var routeSet plannerMaterializedCacheRouteSet
+	routeSet.init(qv)
 	buildWork := uint64(0)
 	for bi := 0; bi < n; bi++ {
 		est := estimates[bi]
@@ -740,7 +864,7 @@ func (qv *View) orderedORCacheCandidateState(
 			next := qv.classifyPlannerMaterializedCacheKey(info.cacheKey, p.estCard, false)
 			if next == plannerMaterializedCacheWarmHit {
 				if info.isPrefix || orderedORMaterializedPredicateWarmHitWorth(rows, info.checkWork, info.cachedCheckWork) {
-					state = plannerOrderedLimitCacheGroupState(state, next)
+					routeSet.add(info.cacheKey, p.estCard, next)
 				}
 				rows = nextRows
 				continue
@@ -751,9 +875,12 @@ func (qv *View) orderedORCacheCandidateState(
 					requiresPromotion := qv.orderedORMaterializedPredicateRequiresPromotion(p, est.need, orderedOffset, est.universe)
 					requiresSecondHit := requiresPromotion ||
 						!orderedORMaterializedPredicateColdBuildWorth(info.buildWork, info.cachedCheckWork, rows, savedWork)
+					if qv.snap.ObservedMaterializedPredWork(info.cacheKey) >= info.buildWork {
+						requiresSecondHit = false
+					}
 					next = qv.classifyPlannerMaterializedCacheKey(info.cacheKey, p.estCard, requiresSecondHit)
-					state = plannerOrderedLimitCacheGroupState(state, next)
-					if next != plannerMaterializedCacheColdSecondHitRequired {
+					if routeSet.add(info.cacheKey, p.estCard, next) &&
+						next != plannerMaterializedCacheColdSecondHitRequired {
 						buildWork = satAddUint64(buildWork, info.buildWork)
 					}
 				}
@@ -761,7 +888,7 @@ func (qv *View) orderedORCacheCandidateState(
 			rows = nextRows
 		}
 	}
-	return state, buildWork
+	return routeSet.finish(), buildWork, routeSet.pressurePenalty()
 }
 
 func (qv *View) selectPlanOROrderWithAnalysis(
@@ -813,10 +940,68 @@ func (qv *View) selectPlanOROrderWithAnalysis(
 	expectedRows := estimateRowsForNeed(uint64(need), unionCard, universe)
 	streamChecks := branches.orderStreamChecksByBranch(hasAlwaysTrue, analysis.mergeStats)
 	costFallback := float64(sumCard) + float64(expectedRows)
+	cacheLimit := qv.snap.MaterializedPredCacheLimit()
+	cacheEntries := 0
+	cache := qv.snap.MaterializedPredCache()
+	if cache != nil {
+		cacheEntries = cache.EntryCount()
+	}
+	cacheColdTiny := cacheLimit <= 0 || (cacheLimit < branchCount && cacheEntries < branchCount)
+	cacheCold := cacheEntries == 0
+	hasFullSpanOrderBranch := branches.hasFullSpanOrderBranch(analysis.mergeStats)
+	hasPrefixTailRisk := false
+	hasBroadResidual := false
+	highBranchLeads := 0
+	potentialCacheKeys := 0
+	cacheRouteUniverse := analysis.snapshotUniverse
+	for i := 0; i < branchCount; i++ {
+		if analysis.branches[i].universe > cacheRouteUniverse {
+			cacheRouteUniverse = analysis.branches[i].universe
+		}
+		branch := branches.owner[i]
+		for pi := 0; pi < branch.preds.Len(); pi++ {
+			p := branch.preds.owner[pi]
+			if p.hasContains() && !p.alwaysTrue && !p.alwaysFalse && !p.covered {
+				potentialCacheKeys++
+			}
+			if qv.isPositiveNonOrderScalarPrefixLeaf(orderField, p.expr) && !p.isMaterializedLike() {
+				hasPrefixTailRisk = true
+			}
+			if p.covered ||
+				p.expr.Not ||
+				qv.exec.FieldNameByOrdinal(p.expr.FieldOrdinal) == orderField ||
+				(p.expr.Op != qir.OpPREFIX && !p.expr.Op.IsNumericRange()) ||
+				p.estCard < universe/4 {
+				continue
+			}
+			hasBroadResidual = true
+			break
+		}
+		lead := branchCards[i]
+		if branch.hasLead() {
+			lead = branch.preds.owner[branch.leadIdx].estCard
+		}
+		if lead >= uint64(need)*64 && lead >= universe/16 {
+			highBranchLeads++
+		}
+	}
+	if cacheColdTiny && branchCount > 1 {
+		costFallback *= 1.0 + float64(branchCount)*0.65
+		if hasPrefixTailRisk || hasBroadResidual {
+			costFallback *= 1.35
+		}
+	}
 	cacheState := plannerMaterializedCacheDisabled
 	eagerBuildWork := uint64(0)
-	if q.Offset > 0 {
-		cacheState, eagerBuildWork = qv.orderedORCacheCandidateState(branches, analysis, need, q.Offset)
+	cachePressurePenalty := 1.0
+	if cache != nil && q.Offset == 0 && potentialCacheKeys > 0 &&
+		plannerMaterializedCacheRouteEnvelopeRetained(cache, potentialCacheKeys, cacheRouteUniverse) {
+		cacheState = plannerMaterializedCacheColdRegularAdmissible
+	} else {
+		cacheState, eagerBuildWork, cachePressurePenalty = qv.orderedORCacheCandidateState(branches, analysis, need, q.Offset)
+	}
+	if q.Offset == 0 {
+		eagerBuildWork = 0
 	}
 	eagerCost := 0.0
 	if eagerBuildWork > 0 {
@@ -841,16 +1026,32 @@ func (qv *View) selectPlanOROrderWithAnalysis(
 	mergeAllowed := !hasAlwaysTrue && need <= mergeNeedLimit
 	if mergeAllowed {
 		costMerge := branches.orderMergeCost(uint64(need), &branchCards, branchCount, unionCard, sumCard, universe, orderStats, analysis.mergeStats)
-		prefixTailRisk := routeOK && routeCost.hasPrefixTailRisk
-		if prefixTailRisk {
-			costMerge *= plannerOROrderExactBucketApplyPenalty(&analysis.mergeStats, branchCount)
-		}
-		costMerge *= plannerOROrderPrefixTailRiskPenalty(prefixTailRisk, branchCount, q.Offset)
 		if routeOK && routeCost.kWay > 0 && routeCost.kWay < costMerge &&
-			branches.hasFullSpanOrderBranch(analysis.mergeStats) &&
+			hasFullSpanOrderBranch &&
 			!routeCost.hasPrefixTailRisk &&
 			!branches.hasKWayExactBucketApplyWork(analysis.mergeStats) {
 			costMerge = routeCost.kWay
+		}
+		if hasPrefixTailRisk {
+			costMerge *= plannerOROrderExactBucketApplyPenalty(&analysis.mergeStats, branchCount)
+		}
+		costMerge *= plannerOROrderPrefixTailRiskPenalty(hasPrefixTailRisk, branchCount, q.Offset)
+		if routeOK {
+			if hasBroadResidual {
+				costMerge *= 1.25
+			}
+			if (cacheCold || cacheColdTiny) && hasFullSpanOrderBranch && expectedRows <= uint64(need*8) && highBranchLeads > 0 {
+				costMerge *= 1.0 + float64(highBranchLeads)*0.12
+			}
+			if cacheColdTiny && (hasPrefixTailRisk || hasBroadResidual || branches.hasKWayExactBucketApplyWork(analysis.mergeStats)) {
+				costMerge *= 1.35
+				if costStream > 0 && costMerge >= costStream*0.70 && costMerge <= costStream*1.15 {
+					costMerge *= 1.35
+				}
+			}
+			if plannerMaterializedCacheStateUnretained(cacheState) {
+				costMerge *= cachePressurePenalty
+			}
 		}
 		costMerge += eagerCost
 		candidates[n] = plannerOROrderCandidate{
@@ -904,7 +1105,9 @@ func (qv *View) selectPlanOROrderWithAnalysis(
 
 	forceMaterialized := q.Limit > plannerOROrderLimitMax ||
 		q.Offset > plannerOROrderOffsetMax ||
-		plannerOROrderPreferMaterializedSmallSideBranches(q, &branchCards, branchCount, unionCard, need, &analysis.mergeStats)
+		(!cacheColdTiny &&
+			!plannerMaterializedCacheStateUnretained(cacheState) &&
+			plannerOROrderPreferMaterializedSmallSideBranches(q, &branchCards, branchCount, unionCard, need, &analysis.mergeStats))
 	return plannerOROrderPick(candidates[:n], forceMaterialized)
 }
 
@@ -1220,7 +1423,6 @@ func (branches plannerORBranches) orderMergeCost(
 	orderStats PlannerFieldStats,
 	branchStats [plannerORBranchLimit]plannerOROrderMergeBranchStats,
 ) float64 {
-
 	if need == 0 || universe == 0 {
 		return math.Inf(1)
 	}
@@ -2080,10 +2282,15 @@ func (qv *View) decideOrderedByCost(q *qir.Shape, leaves []qir.Expr) plannerOrde
 	fallbackProbeFactor := plannerOrderedFallbackProbeFactor(orderSkew, profile, q.Offset)
 	fallbackCost := profile.fallbackWorkRows + expectedProbeRows*fallbackProbeFactor + float64(len(leaves))*20.0
 
-	// execution-plan fallback is considered here so ordered planner does not
-	// preempt a cheaper execution fast-path
+	// When the order key window is narrower than the estimated matching row
+	// density, execution-order cost is the ordered reader path, not fallback cost.
+	boundedOrderWindow := profile.orderRangeLeaves > 0 && profile.coverage > 0 && profile.coverage < profile.selectivity
 	execDecision := qv.decideExecutionOrderByCost(q, leaves)
-	if execDecision.use && execDecision.executionCost > 0 && execDecision.executionCost < fallbackCost {
+	if boundedOrderWindow {
+		if execDecision.use && execDecision.executionCost > 0 && execDecision.executionCost < orderedCost {
+			orderedCost = execDecision.executionCost
+		}
+	} else if execDecision.use && execDecision.executionCost > 0 && execDecision.executionCost < fallbackCost {
 		fallbackCost = execDecision.executionCost
 	}
 

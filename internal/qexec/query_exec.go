@@ -302,6 +302,39 @@ func appendPostingLimitNoTrace(out []uint64, ids posting.List, limit int) ([]uin
 	return out, false
 }
 
+func appendPostingWindowNoTrace(out []uint64, ids posting.List, skip uint64, limit int) ([]uint64, uint64, bool) {
+	if ids.IsEmpty() {
+		return out, skip, false
+	}
+	if idx, ok := ids.TrySingle(); ok {
+		if skip > 0 {
+			return out, skip - 1, false
+		}
+		out = append(out, idx)
+		return out, 0, len(out) >= limit
+	}
+	if skip > 0 {
+		card := ids.Cardinality()
+		if skip >= card {
+			return out, skip - card, false
+		}
+	}
+	it := ids.Iter()
+	for skip > 0 {
+		it.Next()
+		skip--
+	}
+	for it.HasNext() {
+		out = append(out, it.Next())
+		if len(out) >= limit {
+			it.Release()
+			return out, 0, true
+		}
+	}
+	it.Release()
+	return out, 0, false
+}
+
 func predicatesMatchActiveReader(preds predicateReader, active []int, idx uint64) bool {
 	switch len(active) {
 	case 0:
@@ -1322,9 +1355,9 @@ func (qv *View) shouldPromoteObservedOrderBasicRawBaseOp(
 	if observedRows <= needWindow {
 		return false
 	}
-
 	stats, ok := qv.orderBasicRawBaseOpStats(op, universe)
-	if !ok || stats.cacheKey.IsZero() || stats.probeBuckets == 0 || stats.probeEst == 0 {
+	emptyComplement := ok && stats.buildComplement && stats.buildEst == 0
+	if !ok || stats.cacheKey.IsZero() || (!emptyComplement && (stats.probeBuckets == 0 || stats.probeEst == 0)) {
 		return false
 	}
 
@@ -1337,10 +1370,12 @@ func (qv *View) shouldPromoteObservedOrderBasicRawBaseOp(
 		observedRows = universe
 	}
 
-	excessRows := observedRows - needWindow
-	probeWork := rangeProbeTotalWorkForRows(clampUint64ToInt(excessRows), stats.probeBuckets, stats.probeEst)
+	probeWork := rangeAdaptiveProbeWorkForRows(observedRows, stats.probeBuckets, stats.probeEst)
 
-	return probeWork >= buildWork
+	if satAddUint64(probeWork, probeWork) < buildWork {
+		return false
+	}
+	return qv.snap.ShouldPromoteObservedMaterializedPredKey(stats.cacheKey, probeWork, buildWork)
 }
 
 func (qv *View) materializeOrderBasicLimitComplementBaseOp(op qir.Expr, cacheKey qcache.MaterializedPredKey) bool {
@@ -1374,7 +1409,7 @@ func (qv *View) materializeOrderBasicLimitComplementBaseOp(op qir.Expr, cacheKey
 }
 
 func (qv *View) promoteOrderBasicLimitMaterializedBaseOps(orderField string, baseOps []qir.Expr, observedRows uint64, needWindow uint64) {
-	if qv.snap == nil || len(baseOps) == 0 || observedRows == 0 {
+	if qv.snap == nil || qv.snap.MaterializedPredCacheLimit() <= 0 || len(baseOps) == 0 || observedRows == 0 {
 		return
 	}
 	universe := qv.snap.Universe.Cardinality()
@@ -1422,7 +1457,6 @@ func (qv *View) promoteOrderBasicLimitMaterializedBaseOps(orderField string, bas
 			continue
 		}
 		key := qcache.MaterializedPredKey{}
-		requiresSecondHit := false
 		switch core.kind {
 		case orderBasicBaseCoreCollapsedRange:
 			key = core.collapsed.cacheKey
@@ -1430,13 +1464,9 @@ func (qv *View) promoteOrderBasicLimitMaterializedBaseOps(orderField string, bas
 			stats, ok := qv.orderBasicRawBaseOpStats(core.expr, qv.snap.Universe.Cardinality())
 			if ok {
 				key = stats.cacheKey
-				requiresSecondHit = true
 			}
 		}
 		if key.IsZero() {
-			continue
-		}
-		if requiresSecondHit && !qv.snap.ShouldPromoteRuntimeMaterializedPredKey(key) {
 			continue
 		}
 		seen := false
@@ -1455,7 +1485,7 @@ func (qv *View) promoteOrderBasicLimitMaterializedBaseOps(orderField string, bas
 }
 
 func (qv *View) promoteObservedLimitLeafPreds(orderField string, preds []leafPred, observedRows uint64, needWindow uint64) {
-	if qv.snap == nil || len(preds) == 0 || observedRows == 0 {
+	if qv.snap == nil || qv.snap.MaterializedPredCacheLimit() <= 0 || len(preds) == 0 || observedRows == 0 {
 		return
 	}
 	universe := qv.snap.Universe.Cardinality()
@@ -1492,7 +1522,6 @@ func (qv *View) promoteObservedLimitLeafPreds(orderField string, preds []leafPre
 		}
 
 		key := qcache.MaterializedPredKey{}
-		requiresSecondHit := false
 
 		switch core.kind {
 		case orderBasicBaseCoreCollapsedRange:
@@ -1502,14 +1531,10 @@ func (qv *View) promoteObservedLimitLeafPreds(orderField string, preds []leafPre
 			stats, ok := qv.orderBasicRawBaseOpStats(core.expr, universe)
 			if ok {
 				key = stats.cacheKey
-				requiresSecondHit = true
 			}
 		}
 
 		if key.IsZero() {
-			continue
-		}
-		if requiresSecondHit && !qv.snap.ShouldPromoteRuntimeMaterializedPredKey(key) {
 			continue
 		}
 
@@ -1620,7 +1645,7 @@ func (qv *View) executeOrderedLimit(q *qir.Shape, trace *Trace) ([]uint64, bool,
 
 	guard := decision.runtimeGuard(q)
 	if trace != nil {
-		trace.SetOrderedLimitRoute(decision.traceRoute())
+		trace.SetOrderedLimitRoute(qv.traceOrderedLimitRoute(q, facts, decision))
 		fallbackCost := decision.materializedFallback.cost
 		if fallbackCost <= 0 {
 			fallbackCost = decision.rejected.cost
@@ -1776,8 +1801,50 @@ dispatch:
 					}
 				}
 
+				sampleAllowed := guard.enabled && len(predsBuf) > 0 && len(baseOps) > 0
+				if sampleAllowed && len(baseOps) <= 2 {
+					simpleResiduals := true
+					for i := 0; i < len(baseOps); i++ {
+						e := baseOps[i]
+						if e.Not || e.FieldOrdinal < 0 || len(e.Operands) != 0 || !isScalarEqOrInOp(e.Op) {
+							simpleResiduals = false
+							break
+						}
+					}
+					if simpleResiduals {
+						sampleAllowed = false
+					}
+				}
+				if sampleAllowed {
+					target := plannerLimitSampleTarget(guard.needWindow)
+					sample := sampleLimitByFieldIndexBounds(ov, br, order.Desc, predsBuf, target)
+					fallback := guard.shouldFallback(sample.examined, int(sample.matched))
+					reason := "sample_keep"
+					if fallback {
+						reason = "sample_" + guard.reason
+					} else if sample.examined < guard.minExamined {
+						reason = "sample_short"
+					} else if sample.matched >= target {
+						reason = "sample_hits"
+					}
+					if trace != nil {
+						trace.SetOrderedLimitSample(sample.examined, sample.matched, sample.buckets, fallback, reason)
+					}
+					if fallback {
+						if predsBuf != nil {
+							leafPredSlicePool.Put(predsBuf)
+						}
+						if decision.runtimeFallback.kind != plannerOrderedLimitCandidateNone {
+							selected = decision.runtimeFallback.kind
+							guard = plannerOrderedLimitRuntimeGuard{}
+							goto dispatch
+						}
+						return qv.dispatchOrderedLimitFallback(q, decision)
+					}
+				}
+
 				execTrace := trace
-				observePreds := len(predsBuf) > 0
+				observePreds := len(predsBuf) > 0 && qv.snap.MaterializedPredCacheLimit() > 0
 				var observedTrace Trace
 				observedStart := uint64(0)
 				if observePreds && execTrace == nil {
@@ -1811,7 +1878,9 @@ dispatch:
 				return out, true, plan, nil
 			}
 		}
+		return qv.dispatchOrderedLimitFallback(q, decision)
 
+	case plannerOrderedLimitCandidateOrderedBasic:
 		predSet, ok := qv.buildPredicatesOrderedWithMode(ops, f, false, needWindow, q.Offset, true, true)
 		if !ok {
 			return qv.dispatchOrderedLimitFallback(q, decision)
@@ -1822,113 +1891,24 @@ dispatch:
 				return nil, true, PlanOrdered, nil
 			}
 		}
-
 		execTrace := trace
+		observeBaseOps := len(baseOps) > 0 && qv.snap.MaterializedPredCacheLimit() > 0
 		var observedTrace Trace
 		observedStart := uint64(0)
-		if execTrace == nil {
-			execTrace = &observedTrace
-		} else {
-			observedStart = execTrace.RowsExamined()
+		if observeBaseOps {
+			if execTrace == nil {
+				execTrace = &observedTrace
+			} else {
+				observedStart = execTrace.RowsExamined()
+			}
 		}
-		out, ok := qv.execPlanOrderedBasicReaderGuarded(q, predSet.owner, guard, execTrace)
+		out, ok := qv.execPlanOrderedBasicReaderGuarded(q, predSet.owner, plannerOrderedLimitRuntimeGuard{}, execTrace)
 		predSet.Release()
 		if !ok {
-			if guard.enabled && decision.runtimeFallback.kind != plannerOrderedLimitCandidateNone {
-				selected = decision.runtimeFallback.kind
-				guard = plannerOrderedLimitRuntimeGuard{}
-				goto dispatch
-			}
 			return qv.dispatchOrderedLimitFallback(q, decision)
 		}
-		qv.promoteOrderBasicLimitMaterializedBaseOps(f, baseOps, execTrace.RowsExamined()-observedStart, uint64(needWindow))
-		if trace != nil && trace.ev.Plan != "" {
-			return out, true, "", nil
-		}
-		return out, true, PlanOrdered, nil
-
-	case plannerOrderedLimitCandidateOrderedAnchor:
-		if q.Offset > 0 && (!fm.Ptr || nilTailField != "") {
-			predsBuf, ok, err := qv.buildLeafPredsExcludingBounds(ops, f, needWindow)
-			if err != nil {
-				return nil, true, "", err
-			}
-			if ok {
-				if hasEmptyLeafPred(predsBuf) {
-					if predsBuf != nil {
-						leafPredSlicePool.Put(predsBuf)
-					}
-					return nil, true, PlanLimitOrderBasic, nil
-				}
-				universe := qv.snap.Universe.Cardinality()
-				if predsBuf != nil {
-					for i := 0; i < len(predsBuf); i++ {
-						pred := predsBuf[i]
-						if pred.kind != leafPredKindPredicate || pred.pred.fieldIndexRangeState == nil {
-							continue
-						}
-						pred.pred.setExpectedContainsCalls(
-							orderedFieldIndexRangeExpectedContainsCalls(pred.pred.fieldIndexRangeState, needWindow, universe),
-						)
-						predsBuf[i] = pred
-					}
-				}
-
-				execTrace := trace
-				observePreds := len(predsBuf) > 0
-				var observedTrace Trace
-				observedStart := uint64(0)
-				if observePreds && execTrace == nil {
-					execTrace = &observedTrace
-				} else if observePreds {
-					observedStart = execTrace.RowsExamined()
-				}
-
-				out, ok := qv.scanLimitByFieldIndexBounds(q, ov, br, order.Desc, predsBuf, nilTailField, guard, execTrace)
-				if !ok {
-					if predsBuf != nil {
-						leafPredSlicePool.Put(predsBuf)
-					}
-					if guard.enabled && decision.runtimeFallback.kind != plannerOrderedLimitCandidateNone {
-						selected = decision.runtimeFallback.kind
-						guard = plannerOrderedLimitRuntimeGuard{}
-						goto dispatch
-					}
-					return qv.dispatchOrderedLimitFallback(q, decision)
-				}
-				if observePreds {
-					qv.promoteObservedLimitLeafPreds(f, predsBuf, execTrace.RowsExamined()-observedStart, uint64(needWindow))
-				}
-				if predsBuf != nil {
-					leafPredSlicePool.Put(predsBuf)
-				}
-				plan := PlanLimitOrderBasic
-				if qv.hasPrefixBoundForField(ops, f) {
-					plan = PlanLimitOrderPrefix
-				}
-				return out, true, plan, nil
-			}
-		}
-
-		predSet, ok := qv.buildPredicatesOrderedWithMode(ops, f, false, needWindow, q.Offset, true, true)
-		if !ok {
-			return qv.dispatchOrderedLimitFallback(q, decision)
-		}
-		for i := 0; i < predSet.Len(); i++ {
-			if predSet.owner[i].alwaysFalse {
-				predSet.Release()
-				return nil, true, PlanOrdered, nil
-			}
-		}
-		out, ok := qv.execPlanOrderedBasicReaderGuarded(q, predSet.owner, guard, trace)
-		predSet.Release()
-		if !ok {
-			if guard.enabled && decision.runtimeFallback.kind != plannerOrderedLimitCandidateNone {
-				selected = decision.runtimeFallback.kind
-				guard = plannerOrderedLimitRuntimeGuard{}
-				goto dispatch
-			}
-			return qv.dispatchOrderedLimitFallback(q, decision)
+		if observeBaseOps {
+			qv.promoteOrderBasicLimitMaterializedBaseOps(f, baseOps, execTrace.RowsExamined()-observedStart, uint64(needWindow))
 		}
 		if trace != nil && trace.ev.Plan != "" {
 			return out, true, "", nil
@@ -2067,12 +2047,25 @@ dispatch:
 
 	if !hasWarmBaseOps {
 		baseBuilt := false
+		recordMaterializedWork := qv.snap.MaterializedPredCacheLimit() > 0
+		universe := uint64(0)
+		hasOrderBounds := false
+		if recordMaterializedWork {
+			universe = qv.snap.Universe.Cardinality()
+			hasOrderBounds = facts.bounds.HasLo || facts.bounds.HasHi || facts.bounds.HasPrefix
+		}
 		for i := 0; i < len(baseCoresBuf); i++ {
 			b, err := qv.evalOrderBasicBaseCore(baseCoresBuf[i])
 			if err != nil {
 				orderBasicBaseCoreSlicePool.Put(baseCoresBuf)
 				base.ids.Release()
 				return nil, true, "", err
+			}
+			if recordMaterializedWork {
+				st, ok := qv.orderedLimitBaseCoreStats(baseCoresBuf[i], universe, needWindow, hasOrderBounds)
+				if ok {
+					qv.snap.ShouldPromoteObservedMaterializedPredKey(st.cacheKey, st.buildWork, st.buildWork)
+				}
 			}
 			if !baseBuilt {
 				base = b
@@ -2146,8 +2139,12 @@ func (qv *View) scanOrderLimitNoPredicates(q *qir.Shape, ov indexdata.FieldIndex
 		return nil, true
 	}
 	out := make([]uint64, 0, clampUint64ToInt(capHint))
-	if trace == nil && q.Offset == 0 {
+	if trace == nil {
 		limit := clampUint64ToInt(q.Limit)
+		if limit <= 0 {
+			return out, true
+		}
+		skip := q.Offset
 		keyCur := ov.NewCursor(br, desc)
 		for {
 			ids, idx, single, ok := keyCur.NextPostingOrSingle()
@@ -2155,20 +2152,24 @@ func (qv *View) scanOrderLimitNoPredicates(q *qir.Shape, ov indexdata.FieldIndex
 				break
 			}
 			if single {
+				if skip > 0 {
+					skip--
+					continue
+				}
 				out = append(out, idx)
 				if len(out) >= limit {
 					return out, true
 				}
 				continue
 			}
-			out, ok = appendPostingLimitNoTrace(out, ids, limit)
+			out, skip, ok = appendPostingWindowNoTrace(out, ids, skip, limit)
 			if ok {
 				return out, true
 			}
 		}
 		if nilTailField != "" {
 			ids := qv.fieldIndexViewFromSlotsByName(qv.snap.NilIndex, nilTailField).LookupPostingRetained(indexdata.NilIndexEntryKey)
-			out, _ = appendPostingLimitNoTrace(out, ids, limit)
+			out, _, _ = appendPostingWindowNoTrace(out, ids, skip, limit)
 		}
 		return out, true
 	}
@@ -2176,8 +2177,9 @@ func (qv *View) scanOrderLimitNoPredicates(q *qir.Shape, ov indexdata.FieldIndex
 	cursor := newQueryCursor(out, q.Offset, q.Limit, false, 0)
 
 	var (
-		examined  uint64
-		scanWidth uint64
+		examined       uint64
+		scanWidth      uint64
+		trackScanWidth = q.HasOrder
 	)
 
 	keyCur := ov.NewCursor(br, desc)
@@ -2187,7 +2189,9 @@ func (qv *View) scanOrderLimitNoPredicates(q *qir.Shape, ov indexdata.FieldIndex
 			break
 		}
 		if single {
-			scanWidth++
+			if trackScanWidth {
+				scanWidth++
+			}
 			examined++
 			if trace != nil {
 				trace.AddMatched(1)
@@ -2195,7 +2199,9 @@ func (qv *View) scanOrderLimitNoPredicates(q *qir.Shape, ov indexdata.FieldIndex
 			if cursor.emit(idx) {
 				if trace != nil {
 					trace.AddExamined(examined)
-					trace.AddOrderScanWidth(scanWidth)
+					if trackScanWidth {
+						trace.AddOrderScanWidth(scanWidth)
+					}
 					trace.SetEarlyStopReason("limit_reached")
 				}
 				return cursor.out, true
@@ -2205,11 +2211,15 @@ func (qv *View) scanOrderLimitNoPredicates(q *qir.Shape, ov indexdata.FieldIndex
 		if ids.IsEmpty() {
 			continue
 		}
-		scanWidth++
+		if trackScanWidth {
+			scanWidth++
+		}
 		if emitOrderLimitPosting(&cursor, ids, &examined, trace) {
 			if trace != nil {
 				trace.AddExamined(examined)
-				trace.AddOrderScanWidth(scanWidth)
+				if trackScanWidth {
+					trace.AddOrderScanWidth(scanWidth)
+				}
 				trace.SetEarlyStopReason("limit_reached")
 			}
 			return cursor.out, true
@@ -2219,11 +2229,15 @@ func (qv *View) scanOrderLimitNoPredicates(q *qir.Shape, ov indexdata.FieldIndex
 	if nilTailField != "" {
 		ids := qv.fieldIndexViewFromSlotsByName(qv.snap.NilIndex, nilTailField).LookupPostingRetained(indexdata.NilIndexEntryKey)
 		if !ids.IsEmpty() {
-			scanWidth++
+			if trackScanWidth {
+				scanWidth++
+			}
 			if emitOrderLimitPosting(&cursor, ids, &examined, trace) {
 				if trace != nil {
 					trace.AddExamined(examined)
-					trace.AddOrderScanWidth(scanWidth)
+					if trackScanWidth {
+						trace.AddOrderScanWidth(scanWidth)
+					}
 					trace.SetEarlyStopReason("limit_reached")
 				}
 				return cursor.out, true
@@ -2233,7 +2247,9 @@ func (qv *View) scanOrderLimitNoPredicates(q *qir.Shape, ov indexdata.FieldIndex
 
 	if trace != nil {
 		trace.AddExamined(examined)
-		trace.AddOrderScanWidth(scanWidth)
+		if trackScanWidth {
+			trace.AddOrderScanWidth(scanWidth)
+		}
 		trace.SetEarlyStopReason("input_exhausted")
 	}
 	return cursor.out, true

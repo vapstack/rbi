@@ -107,8 +107,8 @@ func testShouldPromoteRuntimeMaterializedPred(v *View, key string) bool {
 	return v.ShouldPromoteRuntimeMaterializedPredKey(testMatPredKey(key))
 }
 
-func testShouldPromoteObservedOrderedORMaterializedPred(v *View, key string, observedWork uint64, buildWork uint64) bool {
-	return v.ShouldPromoteObservedOrderedORMaterializedPredKey(testMatPredKey(key), observedWork, buildWork)
+func testShouldPromoteObservedMaterializedPred(v *View, key string, observedWork uint64, buildWork uint64) bool {
+	return v.ShouldPromoteObservedMaterializedPredKey(testMatPredKey(key), observedWork, buildWork)
 }
 
 func testRunConcurrent(n int, fn func(i int)) {
@@ -164,17 +164,20 @@ func TestViewRuntimeSeenPromotionBounded(t *testing.T) {
 func TestViewOrderedORObservedPromotionAccumulates(t *testing.T) {
 	v := testMatPredView(2, 0)
 	key := "age\x1fcount_range_complement\x1f5\x1f30"
-	if testShouldPromoteObservedOrderedORMaterializedPred(v, key, 10, 25) {
+	if testShouldPromoteObservedMaterializedPred(v, key, 10, 25) {
 		t.Fatalf("expected first observed work below threshold to stay local")
 	}
-	if got := v.OrderedORMaterializedPredObservedEntryCount(); got != 1 {
+	if got := v.RuntimeMaterializedPredObservedEntryCount(); got != 1 {
 		t.Fatalf("expected one ordered OR observed-work entry, got=%d", got)
 	}
-	if !testShouldPromoteObservedOrderedORMaterializedPred(v, key, 15, 25) {
+	if !testShouldPromoteObservedMaterializedPred(v, key, 15, 25) {
 		t.Fatalf("expected accumulated observed work to trigger promotion")
 	}
-	if got := v.OrderedORMaterializedPredObservedEntryCount(); got != 0 {
-		t.Fatalf("expected promoted ordered OR observed-work entry to be removed, got=%d", got)
+	if got := v.RuntimeMaterializedPredObservedEntryCount(); got != 1 {
+		t.Fatalf("expected promoted ordered OR observed-work entry to stay as evidence, got=%d", got)
+	}
+	if got := v.ObservedMaterializedPredWork(testMatPredKey(key)); got != 25 {
+		t.Fatalf("observed work after promotion=%d want 25", got)
 	}
 }
 
@@ -787,6 +790,91 @@ func TestBuildPreparedPatchTouchedNilFieldDropsNilPredicateCache(t *testing.T) {
 	}
 }
 
+func TestBuildPreparedPatchUnchangedFieldInheritsObservedMaterializedPredWork(t *testing.T) {
+	rt := buildCacheRuntime(t)
+	oldRec := buildCacheRec{Name: "alice", Email: "alice@example.com", Age: 30}
+	prev := buildCacheSeedView(t, rt, &oldRec)
+	defer prev.releaseRuntimeCaches()
+	defer prev.releaseStorage()
+
+	key := qcache.MaterializedPredKeyForScalar("email", qir.OpPREFIX, "ali")
+	if prev.ShouldPromoteObservedMaterializedPredKey(key, 10, 25) {
+		t.Fatal("expected initial observed work to stay below promotion threshold")
+	}
+	if prev.ShouldPromoteRuntimeMaterializedPredKey(key) {
+		t.Fatal("expected initial runtime seen key to stay cold")
+	}
+
+	newRec := oldRec
+	newRec.Age = 31
+	next := buildCachePatchView(t, rt, prev, &oldRec, &newRec, []schema.PatchItem{{Name: "age", Value: 31}})
+	defer next.releaseRuntimeCaches()
+	defer next.releaseStorage()
+
+	if next.HasRuntimeMaterializedPredSeenKey(key) {
+		t.Fatal("expected runtime seen keys not to inherit across snapshots")
+	}
+	if !next.ShouldPromoteObservedMaterializedPredKey(key, 15, 25) {
+		t.Fatal("expected unchanged-field observed work to inherit across snapshots")
+	}
+}
+
+func TestBuildPreparedPatchTouchedFieldSeparatesDirtyObservedMaterializedPredWork(t *testing.T) {
+	rt := buildCacheRuntime(t)
+	oldRec := buildCacheRec{Name: "alice", Email: "alice@example.com"}
+	prev := buildCacheSeedView(t, rt, &oldRec)
+	defer prev.releaseRuntimeCaches()
+	defer prev.releaseStorage()
+
+	key := qcache.MaterializedPredKeyForScalar("email", qir.OpPREFIX, "ali")
+	secondKey := qcache.MaterializedPredKeyForScalar("email", qir.OpPREFIX, "bob")
+	prev.StoreMaterializedPredKey(key, posting.List{})
+	prev.StoreMaterializedPredKey(secondKey, posting.List{})
+	if prev.ShouldPromoteObservedMaterializedPredKey(key, 10, 25) {
+		t.Fatal("expected initial observed work to stay below promotion threshold")
+	}
+	if prev.ShouldPromoteObservedMaterializedPredKey(secondKey, 10, 25) {
+		t.Fatal("expected second initial observed work to stay below promotion threshold")
+	}
+	if prev.ShouldPromoteRuntimeMaterializedPredKey(key) {
+		t.Fatal("expected initial runtime seen key to stay cold")
+	}
+
+	newRec := oldRec
+	newRec.Email = "ally@example.com"
+	next := buildCachePatchView(t, rt, prev, &oldRec, &newRec, []schema.PatchItem{{Name: "email", Value: "ally@example.com"}})
+	defer next.releaseRuntimeCaches()
+	defer next.releaseStorage()
+
+	if _, ok := next.LoadMaterializedPredKey(key); ok {
+		t.Fatal("expected touched-field materialized predicate cache to be dropped")
+	}
+	if next.HasRuntimeMaterializedPredSeenKey(key) {
+		t.Fatal("expected runtime seen keys not to inherit across snapshots")
+	}
+	if _, ok := next.LoadMaterializedPredKey(secondKey); ok {
+		t.Fatal("expected second touched-field materialized predicate cache to be dropped")
+	}
+	if got := next.ObservedMaterializedPredWork(key); got != 0 {
+		t.Fatalf("expected touched-field clean observed work to be dropped, got=%d", got)
+	}
+	if got := next.DirtyObservedMaterializedPredWork(key); got != 10 {
+		t.Fatalf("expected touched-field dirty observed work to be retained as evidence, got=%d", got)
+	}
+	if next.ShouldPromoteObservedMaterializedPredKey(key, 20, 25) {
+		t.Fatal("expected inherited dirty work not to participate in promotion")
+	}
+	if got := next.RuntimeMaterializedPredObservedEntryCount(); got != 1 {
+		t.Fatalf("expected only new observed work entry, got=%d", got)
+	}
+	if next.ShouldPromoteObservedMaterializedPredKey(secondKey, 30, 25) {
+		t.Fatal("expected first clean sight for dirty touched field to stay local")
+	}
+	if !next.ShouldPromoteObservedMaterializedPredKey(secondKey, 1, 25) {
+		t.Fatal("expected second clean sight in same snapshot to promote")
+	}
+}
+
 func TestViewClearRuntimeCachesClearsCacheState(t *testing.T) {
 	v := testMatPredView(64, 0)
 	defer v.releaseRuntimeCaches()
@@ -798,7 +886,7 @@ func TestViewClearRuntimeCachesClearsCacheState(t *testing.T) {
 		t.Fatal("expected first runtime promotion sight to stay local")
 	}
 	orKey := qcache.MaterializedPredKeyForScalar("age", qir.OpGTE, "30")
-	if v.ShouldPromoteObservedOrderedORMaterializedPredKey(orKey, 10, 25) {
+	if v.ShouldPromoteObservedMaterializedPredKey(orKey, 10, 25) {
 		t.Fatal("expected first observed work below threshold to stay local")
 	}
 	if v.MaterializedPredCacheEntryCount() == 0 {
@@ -807,7 +895,7 @@ func TestViewClearRuntimeCachesClearsCacheState(t *testing.T) {
 	if v.RuntimeMaterializedPredSeenEntryCount() != 1 {
 		t.Fatal("expected runtime seen-key entry before clear")
 	}
-	if v.OrderedORMaterializedPredObservedEntryCount() != 1 {
+	if v.RuntimeMaterializedPredObservedEntryCount() != 1 {
 		t.Fatal("expected ordered OR observed-work entry before clear")
 	}
 
@@ -819,7 +907,7 @@ func TestViewClearRuntimeCachesClearsCacheState(t *testing.T) {
 	if got := v.RuntimeMaterializedPredSeenEntryCount(); got != 0 {
 		t.Fatalf("expected runtime seen-key cache to clear, got=%d", got)
 	}
-	if got := v.OrderedORMaterializedPredObservedEntryCount(); got != 0 {
+	if got := v.RuntimeMaterializedPredObservedEntryCount(); got != 0 {
 		t.Fatalf("expected ordered OR observed-work cache to clear, got=%d", got)
 	}
 }

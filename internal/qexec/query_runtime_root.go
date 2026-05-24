@@ -93,7 +93,7 @@ func shouldMaterializeNegativeAllNumericKeys(universeCard, excludedCard uint64) 
 	if resultCard < 64_000 {
 		return false
 	}
-	return resultCard >= excludedCard*2
+	return resultCard >= excludedCard
 }
 
 func (qv *View) materializeNegativeResultKeys() []uint64 {

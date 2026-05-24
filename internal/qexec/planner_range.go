@@ -808,6 +808,11 @@ func (core *preparedScalarRangePredicate) buildFromFieldIndexRange(
 	}
 	probe := newFieldIndexRangeProbe(ov, plan.br, useRuntimeComplement, probeLen, probeEst)
 
+	allowPositiveMaterialize := allowMaterialize
+	if useRuntimeComplement && !core.qv.snap.AllowsMaterializedPredCard(plan.est) {
+		allowPositiveMaterialize = false
+	}
+
 	coldMaterializeAllowed := allowMaterialize
 	if coldMaterializeAllowed && lazyColdMaterialize && core.usePostingFilter {
 		totalBuckets := probe.ov.KeyCount()
@@ -824,21 +829,26 @@ func (core *preparedScalarRangePredicate) buildFromFieldIndexRange(
 		}
 	}
 
-	if allowMaterialize {
+	if allowMaterialize && core.expr.Op.IsNumericRange() && (allowPositiveMaterialize || core.qv.snap.MaterializedPredCacheLimit() <= 0) {
 		fieldName := core.qv.exec.FieldNameByOrdinal(core.expr.FieldOrdinal)
 		if coldMaterializeAllowed {
 			if out, ok := core.qv.tryEvalNumericRangeBuckets(fieldName, core.fm, ov, plan.br); ok {
-				out.ids = core.sharedReuse.share(out.ids)
+				if allowPositiveMaterialize {
+					out.ids = core.sharedReuse.share(out.ids)
+				}
 				return materializedRangePredicateWithMode(core.expr, out.ids), true
 			}
 		} else if out, ok := core.qv.tryLoadNumericRangeBuckets(fieldName, core.fm, ov, plan.br); ok {
-			out.ids = core.sharedReuse.share(out.ids)
+			if allowPositiveMaterialize {
+				out.ids = core.sharedReuse.share(out.ids)
+			}
 			return materializedRangePredicateWithMode(core.expr, out.ids), true
 		}
 	}
 
 	reuse := core.runtimeReuse(plan.est, useRuntimeComplement)
-	if allowMaterialize && !useRuntimeComplement && !schema.FieldUsesOrderedNumericKeys(core.fm) {
+	if allowMaterialize && !useRuntimeComplement &&
+		(!schema.FieldUsesOrderedNumericKeys(core.fm) || core.usePostingFilter) {
 		reuse = core.sharedReuse
 	}
 
@@ -947,6 +957,7 @@ func (core *preparedScalarRangePredicate) orderBasicMaterializationStats(univers
 		buildEst:     plan.est,
 	}
 
+	useRuntimeComplement := core.usesRuntimeComplement(plan.useComplement)
 	if plan.useComplement {
 		complementBuckets := ov.KeyCount() - plan.bucketCount
 		complementEst := uint64(0)
@@ -960,8 +971,10 @@ func (core *preparedScalarRangePredicate) orderBasicMaterializationStats(univers
 			complementBuckets = 1
 		}
 
-		stats.probeBuckets = complementBuckets
-		stats.probeEst = complementEst
+		if useRuntimeComplement {
+			stats.probeBuckets = complementBuckets
+			stats.probeEst = complementEst
+		}
 
 		if core.expr.Op.IsNumericRange() {
 			stats.cacheKey = core.complementCacheKey
@@ -1081,11 +1094,45 @@ func (qv *View) shouldPromoteObservedPreparedScalarExactRange(op preparedScalarE
 	if buckets == 0 || est == 0 {
 		return false
 	}
+	fm := qv.exec.Schema.Fields[op.field]
+	universe := qv.snap.Universe.Cardinality()
+	nilTail := fm != nil && fm.Ptr &&
+		qv.fieldIndexViewFromSlotsByName(qv.snap.NilIndex, op.field).LookupCardinality(indexdata.NilIndexEntryKey) > 0
+	totalBuckets := ov.KeyCount()
+	useComplementProbe := !nilTail && totalBuckets > buckets && totalBuckets-buckets < buckets
+	if schema.FieldUsesOrderedNumericKeys(fm) && useComplementProbe {
+		if universe > est && needWindow < universe-est {
+			return false
+		}
+	}
 	buildWork := rangeProbeMaterializeWork(buckets, est)
 	if buildWork == 0 {
 		return false
 	}
-	return rangeProbeTotalWorkForRows(clampUint64ToInt(observedRows-needWindow), buckets, est) >= buildWork
+	probeBuckets := buckets
+	probeEst := est
+	if useComplementProbe {
+		probeBuckets = totalBuckets - buckets
+		if universe > est {
+			probeEst = universe - est
+		} else {
+			probeEst = 0
+		}
+		if probeBuckets == 0 && probeEst > 0 {
+			probeBuckets = 1
+		}
+	}
+	probeWork := rangeAdaptiveProbeWorkForRows(observedRows, probeBuckets, probeEst)
+	if op.cacheKey.IsZero() {
+		return probeWork >= buildWork
+	}
+	if probeWork >= buildWork {
+		return qv.snap.ShouldPromoteObservedMaterializedPredKey(op.cacheKey, probeWork, buildWork)
+	}
+	if satAddUint64(probeWork, probeWork) < buildWork {
+		return false
+	}
+	return qv.snap.ShouldPromoteObservedMaterializedPredKey(op.cacheKey, probeWork, buildWork)
 }
 
 func (core *preparedScalarRangePredicate) prepareComplementMaterialization() (scalarComplementMaterializationPlan, bool) {

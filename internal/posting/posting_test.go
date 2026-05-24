@@ -1002,6 +1002,53 @@ func TestListCheckedAddAddManyAndIterators(t *testing.T) {
 	(&singletonIter{v: 1, has: true}).Release()
 }
 
+func TestListIteratorAdvanceIfNeeded(t *testing.T) {
+	type advancingIterator interface {
+		AdvanceIfNeeded(uint64)
+	}
+	tests := []struct {
+		name string
+		ids  []uint64
+		min  uint64
+		want uint64
+		has  bool
+	}{
+		{name: "empty", min: 10},
+		{name: "single-exhausted", ids: []uint64{42}, min: 50},
+		{name: "small", ids: []uint64{3, 7, 11, 19}, min: 10, want: 11, has: true},
+		{name: "mid", ids: []uint64{2, 4, 8, 16, 24, 32, 40, 48, 56}, min: 31, want: 32, has: true},
+		{name: "large", ids: []uint64{
+			3, 6, 9, 12, 15, 18, 21, 24,
+			27, 30, 33, 36, 39, 42, 45, 48,
+			51, 54, 57, 60, 63, 66, 69, 72,
+			75, 78, 81, 84, 87, 90, 93, 96,
+			99, 102, 105,
+		}, min: 100, want: 102, has: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			list := postingFromIDs(tc.ids...)
+			defer list.Release()
+			it := list.Iter()
+			defer it.Release()
+			if len(tc.ids) > 0 {
+				if got := it.Next(); got != tc.ids[0] {
+					t.Fatalf("first Next mismatch: got=%d want=%d", got, tc.ids[0])
+				}
+			}
+			it.(advancingIterator).AdvanceIfNeeded(tc.min)
+			if got := it.HasNext(); got != tc.has {
+				t.Fatalf("HasNext mismatch: got=%v want=%v", got, tc.has)
+			}
+			if tc.has {
+				if got := it.Next(); got != tc.want {
+					t.Fatalf("Next after AdvanceIfNeeded mismatch: got=%d want=%d", got, tc.want)
+				}
+			}
+		})
+	}
+}
+
 func TestListCheckedAddBorrowedDuplicateNoDetach(t *testing.T) {
 	t.Run("small", func(t *testing.T) {
 		base := postingFromIDs(3, 7, 11, 19)

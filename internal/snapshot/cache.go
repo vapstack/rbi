@@ -97,6 +97,18 @@ func inheritMaterializedPredCache(next, prev *View, fields schema.IndexedFieldMa
 		return
 	}
 	next.matPredCache.InheritFrom(prev.matPredCache, fields, changedFields)
+	next.runtimeMatPredObserved.InheritObservedWorkFrom(
+		&prev.runtimeMatPredObserved,
+		fields,
+		changedFields,
+		qcache.RecentKeyLimit(next.MaterializedPredCacheLimit()),
+	)
+	next.runtimeMatPredDirty.InheritChangedObservedWorkFrom(
+		&prev.runtimeMatPredObserved,
+		fields,
+		changedFields,
+		qcache.RecentKeyLimit(next.MaterializedPredCacheLimit()),
+	)
 }
 
 func (s *View) LoadMaterializedPredKey(key qcache.MaterializedPredKey) (posting.List, bool) {
@@ -158,15 +170,16 @@ func (s *View) ClearRuntimeCaches() {
 		s.matPredCache.Clear()
 	}
 	s.runtimeMatPredSeen.Clear()
-	s.orderORMatPredObserved.Clear()
+	s.runtimeMatPredObserved.Clear()
+	s.runtimeMatPredDirty.Clear()
 }
 
 func (s *View) RuntimeMaterializedPredSeenEntryCount() int {
 	return s.runtimeMatPredSeen.EntryCount()
 }
 
-func (s *View) OrderedORMaterializedPredObservedEntryCount() int {
-	return s.orderORMatPredObserved.EntryCount()
+func (s *View) RuntimeMaterializedPredObservedEntryCount() int {
+	return s.runtimeMatPredObserved.EntryCount()
 }
 
 func (s *View) drainRetiredRuntimeCaches() {
@@ -185,7 +198,8 @@ func (s *View) releaseRuntimeCaches() {
 		s.matPredCache = nil
 	}
 	s.runtimeMatPredSeen.Clear()
-	s.orderORMatPredObserved.Clear()
+	s.runtimeMatPredObserved.Clear()
+	s.runtimeMatPredDirty.Clear()
 }
 
 func (s *View) ShouldPromoteRuntimeMaterializedPredKey(key qcache.MaterializedPredKey) bool {
@@ -202,14 +216,29 @@ func (s *View) HasRuntimeMaterializedPredSeenKey(key qcache.MaterializedPredKey)
 	return s.runtimeMatPredSeen.Contains(key)
 }
 
-func (s *View) ShouldPromoteObservedOrderedORMaterializedPredKey(key qcache.MaterializedPredKey, observedWork uint64, buildWork uint64) bool {
+func (s *View) ShouldPromoteObservedMaterializedPredKey(key qcache.MaterializedPredKey, observedWork uint64, buildWork uint64) bool {
 	if key.IsZero() || observedWork == 0 || buildWork == 0 {
 		return false
 	}
-	return s.orderORMatPredObserved.AddWorkAndShouldPromote(
+	promote, hadWork := s.runtimeMatPredObserved.AddWorkAndShouldPromote(
 		key,
 		qcache.RecentKeyLimit(s.MaterializedPredCacheLimit()),
 		observedWork,
 		buildWork,
 	)
+	return promote && (hadWork || s.runtimeMatPredDirty.Work(key) == 0)
+}
+
+func (s *View) ObservedMaterializedPredWork(key qcache.MaterializedPredKey) uint64 {
+	if key.IsZero() {
+		return 0
+	}
+	return s.runtimeMatPredObserved.Work(key)
+}
+
+func (s *View) DirtyObservedMaterializedPredWork(key qcache.MaterializedPredKey) uint64 {
+	if key.IsZero() {
+		return 0
+	}
+	return s.runtimeMatPredDirty.Work(key)
 }

@@ -88,12 +88,12 @@ func TestRecentKeyCache_AllocsPerRunStayZeroAfterWarmup(t *testing.T) {
 		}
 		cache.Clear()
 		for i := range keys {
-			if cache.AddWorkAndShouldPromote(keys[i], limit, 1, 2) {
+			if promote, _ := cache.AddWorkAndShouldPromote(keys[i], limit, 1, 2); promote {
 				t.Fatalf("AddWorkAndShouldPromote promoted too early for key %v", keys[i])
 			}
 		}
 		for i := range keys {
-			if !cache.AddWorkAndShouldPromote(keys[i], limit, 1, 2) {
+			if promote, _ := cache.AddWorkAndShouldPromote(keys[i], limit, 1, 2); !promote {
 				t.Fatalf("AddWorkAndShouldPromote failed to promote key %v", keys[i])
 			}
 		}
@@ -112,7 +112,7 @@ func TestRecentKeyCache_ShortLivedOwnersReuseIndexMapAfterWarmup(t *testing.T) {
 			if seen.TouchOrRemember(keys[i], len(keys)) {
 				t.Fatalf("TouchOrRemember unexpectedly reported warm hit for cold key %v", keys[i])
 			}
-			if observed.AddWorkAndShouldPromote(keys[i], len(keys), 1, ^uint64(0)) {
+			if promote, _ := observed.AddWorkAndShouldPromote(keys[i], len(keys), 1, ^uint64(0)); promote {
 				t.Fatalf("AddWorkAndShouldPromote unexpectedly promoted key %v", keys[i])
 			}
 		}
@@ -148,14 +148,25 @@ func TestRecentKeyCache_LimitAndEntryCount(t *testing.T) {
 	if got := cache.EntryCount(); got != 2 {
 		t.Fatalf("EntryCount=%d want 2", got)
 	}
-	if cache.AddWorkAndShouldPromote(keyA, 2, 1, 3) {
+	promote, hadWork := cache.AddWorkAndShouldPromote(keyA, 2, 1, 3)
+	if promote {
 		t.Fatal("expected first observed work increment to stay below threshold")
 	}
-	if !cache.AddWorkAndShouldPromote(keyA, 2, 2, 3) {
+	if hadWork {
+		t.Fatal("expected first observed work increment to have no prior work")
+	}
+	promote, hadWork = cache.AddWorkAndShouldPromote(keyA, 2, 2, 3)
+	if !promote {
 		t.Fatal("expected accumulated work to promote key")
 	}
-	if got := cache.EntryCount(); got != 1 {
-		t.Fatalf("EntryCount after promotion=%d want 1", got)
+	if !hadWork {
+		t.Fatal("expected accumulated work increment to report prior work")
+	}
+	if got := cache.EntryCount(); got != 2 {
+		t.Fatalf("EntryCount after promotion=%d want 2", got)
+	}
+	if got := cache.Work(keyA); got != 3 {
+		t.Fatalf("observed work after promotion=%d want 3", got)
 	}
 	cache.Clear()
 }

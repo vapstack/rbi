@@ -933,6 +933,10 @@ func (it *largeIterator) advanceIfNeeded(minval uint64) {
 	}
 }
 
+func (it *largeIterator) AdvanceIfNeeded(minval uint64) {
+	it.advanceIfNeeded(minval)
+}
+
 func (it *largeIterator) initialize(lp *largePosting) {
 	it.initializeSnapshot(lp)
 	it.init()

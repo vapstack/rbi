@@ -1456,7 +1456,14 @@ func (qv *View) buildPredRangeCandidateWithColdModeAndWarmLoad(
 func (qv *View) buildPredMaterializedCandidate(e qir.Expr) (predicate, bool) {
 	raw := e
 	raw.Not = false
-	cacheKey := qv.materializedPredKey(raw)
+	key, isSlice, isNil, err := qv.exprValueToLookupKey(raw)
+	if err != nil || isSlice {
+		return predicate{}, false
+	}
+	cacheKey := qcache.MaterializedPredKey{}
+	if !isNil {
+		cacheKey = qcache.MaterializedPredKeyForLookupKey(qv.exec.FieldNameByOrdinal(e.FieldOrdinal), e.Op, key)
+	}
 	state := lazyMaterializedPredicateStatePool.Get()
 	state.loader = qv
 	state.raw = raw
@@ -2183,6 +2190,52 @@ func rangeProbeTotalWorkForRows(rows, probeLen int, est uint64) uint64 {
 		return ^uint64(0)
 	}
 	return uint64(rows) * perRow
+}
+
+func rangeAdaptiveProbeWorkForRows(rows uint64, probeLen int, est uint64) uint64 {
+	if rows == 0 {
+		return 0
+	}
+	perCall := rangeProbeContainsWork(probeLen, est)
+	materializeAt := rangeAdaptiveProbeMaterializeAt(probeLen, est)
+	if materializeAt == 0 || rows < materializeAt {
+		return satMulUint64(rows, perCall)
+	}
+	lookupWork := postingContainsLookupWork(est)
+	buildWork := rangeProbeMaterializeWork(probeLen, est)
+	linearCalls := materializeAt - 1
+	work := satMulUint64(linearCalls, perCall)
+	work = satAddUint64(work, buildWork)
+	return satAddUint64(
+		work,
+		satMulUint64(rows-linearCalls, lookupWork),
+	)
+}
+
+func rangeAdaptiveProbeMaterializeAt(probeLen int, est uint64) uint64 {
+	if probeLen <= rangeLinearContainsLimit(probeLen, est) {
+		return 0
+	}
+	materializeAfter := rangeMaterializeAfterForProbe(probeLen, est)
+	if materializeAfter <= 0 {
+		return 0
+	}
+	perCall := rangeProbeContainsWork(probeLen, est)
+	lookupWork := postingContainsLookupWork(est)
+	if perCall <= lookupWork {
+		return 0
+	}
+	buildWork := rangeProbeMaterializeWork(probeLen, est)
+	savedPerCall := perCall - lookupWork
+	materializeAt := buildWork / savedPerCall
+	if materializeAt == ^uint64(0) {
+		return 0
+	}
+	materializeAt++
+	if materializeAt < uint64(materializeAfter) {
+		materializeAt = uint64(materializeAfter)
+	}
+	return materializeAt
 }
 
 func postingUnionLinearWork(probeLen int, est uint64) uint64 {

@@ -47,7 +47,7 @@ const (
 	plannerOrderedLimitCandidateNone plannerOrderedLimitCandidateKind = iota
 	plannerOrderedLimitCandidateEmpty
 	plannerOrderedLimitCandidateOrderScan
-	plannerOrderedLimitCandidateOrderedAnchor
+	plannerOrderedLimitCandidateOrderedBasic
 	plannerOrderedLimitCandidateWarmBaseCore
 	plannerOrderedLimitCandidateColdRetainedBaseCore
 	plannerOrderedLimitCandidateColdUnretainedBaseCore
@@ -61,8 +61,8 @@ func (k plannerOrderedLimitCandidateKind) String() string {
 		return "empty"
 	case plannerOrderedLimitCandidateOrderScan:
 		return "order_scan"
-	case plannerOrderedLimitCandidateOrderedAnchor:
-		return "ordered_anchor"
+	case plannerOrderedLimitCandidateOrderedBasic:
+		return "ordered_basic"
 	case plannerOrderedLimitCandidateWarmBaseCore:
 		return "warm_base_core"
 	case plannerOrderedLimitCandidateColdRetainedBaseCore:
@@ -170,6 +170,8 @@ func (d plannerOrderedLimitDecision) traceRoute() TraceOrderedLimitRoute {
 		CacheState:      d.selected.cacheState.String(),
 		SelectedCost:    d.selected.cost,
 		RejectedCost:    d.rejected.cost,
+		SelectedWork:    d.selected.traceWork(),
+		RejectedWork:    d.rejected.traceWork(),
 		ExpectedRows:    d.selected.expectedRows,
 		OrderBuckets:    d.selected.buckets,
 		PredicateChecks: d.selected.checks,
@@ -178,12 +180,117 @@ func (d plannerOrderedLimitDecision) traceRoute() TraceOrderedLimitRoute {
 	}
 }
 
+func (c plannerOrderedLimitCandidate) traceWork() TraceRouteWork {
+	if c.cost <= 0 {
+		return TraceRouteWork{}
+	}
+	switch c.kind {
+	case plannerOrderedLimitCandidateEmpty:
+		return TraceRouteWork{CandidateScan: c.cost}
+	case plannerOrderedLimitCandidateMaterializedFallback:
+		return TraceRouteWork{MaterializedBuild: c.cost}
+	case plannerOrderedLimitCandidateWarmBaseCore,
+		plannerOrderedLimitCandidateColdRetainedBaseCore,
+		plannerOrderedLimitCandidateColdUnretainedBaseCore:
+		scan := float64(c.expectedRows) * (0.60 + float64(c.checks)*0.16)
+		build := float64(c.buildWork)
+		work := TraceRouteWork{CandidateScan: scan, MaterializedBuild: build}
+		total := scan + build
+		if total > c.cost {
+			work.RetainedCacheBenefit = total - c.cost
+		} else if total < c.cost {
+			if plannerMaterializedCacheStateUnretained(c.cacheState) {
+				work.UnretainedRebuildPenalty = c.cost - total
+			} else {
+				work.TailRiskPenalty = c.cost - total
+			}
+		}
+		return work
+	default:
+		scan := float64(c.expectedRows)
+		if scan <= 0 {
+			scan = c.cost
+		}
+		if scan > c.cost {
+			scan = c.cost
+		}
+		return TraceRouteWork{CandidateScan: scan, PostingContains: c.cost - scan}
+	}
+}
+
+func (qv *View) traceOrderedLimitRoute(q *qir.Shape, facts *orderedLimitFacts, d plannerOrderedLimitDecision) TraceOrderedLimitRoute {
+	route := d.traceRoute()
+	route.SelectedWork = qv.orderedLimitCandidateTraceWork(q, facts, d.selected)
+	route.RejectedWork = qv.orderedLimitCandidateTraceWork(q, facts, d.rejected)
+	return route
+}
+
+func (qv *View) orderedLimitCandidateTraceWork(q *qir.Shape, facts *orderedLimitFacts, c plannerOrderedLimitCandidate) TraceRouteWork {
+	if c.cost <= 0 || q == nil || facts == nil {
+		return c.traceWork()
+	}
+	switch c.kind {
+	case plannerOrderedLimitCandidateOrderScan, plannerOrderedLimitCandidateOrderedBasic, plannerOrderedLimitCandidateCandidateOrder:
+		return qv.orderedLimitScanTraceWork(facts, c)
+	default:
+		return c.traceWork()
+	}
+}
+
+func (qv *View) orderedLimitScanTraceWork(facts *orderedLimitFacts, c plannerOrderedLimitCandidate) TraceRouteWork {
+	scan := float64(c.expectedRows)
+	if scan <= 0 {
+		scan = c.cost
+	}
+	if scan > c.cost {
+		scan = c.cost
+	}
+	remaining := c.cost - scan
+	work := TraceRouteWork{CandidateScan: scan}
+	if remaining <= 0 {
+		return work
+	}
+
+	exactFilters := 0
+	for i := 0; i < len(facts.baseOps); i++ {
+		if orderedLimitResidualExactFilterCandidate(facts.baseOps[i]) {
+			exactFilters++
+		}
+	}
+	if exactFilters > 0 {
+		exact := float64(c.expectedRows) * float64(exactFilters) * 0.35
+		if exact > remaining {
+			exact = remaining
+		}
+		work.ExactBucketFilter = exact
+		remaining -= exact
+	}
+
+	if c.kind == plannerOrderedLimitCandidateOrderScan && c.buckets > c.expectedRows && remaining > 0 {
+		probe := float64(c.buckets-c.expectedRows) * 0.0001
+		if probe > remaining {
+			probe = remaining
+		}
+		work.RangeProbe = probe
+		remaining -= probe
+	}
+
+	work.PostingContains = remaining
+	return work
+}
+
 func (d plannerOrderedLimitDecision) runtimeGuard(q *qir.Shape) plannerOrderedLimitRuntimeGuard {
-	if d.selected.kind != plannerOrderedLimitCandidateOrderScan &&
-		d.selected.kind != plannerOrderedLimitCandidateOrderedAnchor {
+	if d.selected.kind != plannerOrderedLimitCandidateOrderScan {
 		return plannerOrderedLimitRuntimeGuard{}
 	}
 	if d.runtimeFallback.kind == plannerOrderedLimitCandidateNone || d.runtimeFallback.cost <= 0 {
+		return plannerOrderedLimitRuntimeGuard{}
+	}
+	if d.runtimeFallback.kind != plannerOrderedLimitCandidateOrderedBasic &&
+		d.runtimeFallback.kind != plannerOrderedLimitCandidateMaterializedFallback {
+		return plannerOrderedLimitRuntimeGuard{}
+	}
+	if q.Offset > 0 {
 		return plannerOrderedLimitRuntimeGuard{}
 	}
 	need, ok := orderWindow(q)
@@ -217,7 +324,7 @@ func (d plannerOrderedLimitDecision) runtimeGuard(q *qir.Shape) plannerOrderedLi
 		needWindow:   uint64(need),
 		fallbackCost: fallbackCost,
 		rowCost:      rowCost,
-		reason:       "placement_guard",
+		reason:       "bounds_scan_guard",
 	}
 }
 
@@ -236,6 +343,7 @@ type plannerOrderedLimitBaseCoreStats struct {
 	est        uint64
 	buildWork  uint64
 	probeWork  uint64
+	routeWork  uint64
 	warm       bool
 	useful     bool
 	cacheState plannerMaterializedCacheState
@@ -269,6 +377,110 @@ func plannerMaterializedCacheStateRetained(s plannerMaterializedCacheState) bool
 	return s == plannerMaterializedCacheWarmHit ||
 		s == plannerMaterializedCacheColdRegularAdmissible ||
 		s == plannerMaterializedCacheColdOversizedAdmissible
+}
+
+func plannerMaterializedCacheStateUnretained(s plannerMaterializedCacheState) bool {
+	return s == plannerMaterializedCacheColdUnretainedByCardinality ||
+		s == plannerMaterializedCacheColdUnretainedByPolicy
+}
+
+func plannerMaterializedCacheRouteEnvelopeRetained(cache *qcache.MaterializedPredCache, potentialKeys int, universe uint64) bool {
+	if cache == nil || potentialKeys <= 0 || potentialKeys > cache.Limit() {
+		return false
+	}
+	maxCard := cache.MaxCardinality()
+	if maxCard == 0 || universe <= maxCard {
+		return true
+	}
+	return qcache.MaterializedPredOversizedLimit(cache.Limit()) >= int32(potentialKeys)
+}
+
+const plannerMaterializedCacheRouteKeyMax = plannerORBranchLimit * plannerPredicateFastPathMaxLeaves
+
+type plannerMaterializedCacheRouteSet struct {
+	keys           [plannerMaterializedCacheRouteKeyMax]qcache.MaterializedPredKey
+	limit          int
+	oversizedLimit int32
+	maxCard        uint64
+	keyCount       int
+	warmCount      int
+	oversizedCount int32
+	overflow       bool
+	state          plannerMaterializedCacheState
+}
+
+func (set *plannerMaterializedCacheRouteSet) init(qv *View) {
+	*set = plannerMaterializedCacheRouteSet{state: plannerMaterializedCacheDisabled}
+	if qv == nil || qv.snap == nil {
+		return
+	}
+	cache := qv.snap.MaterializedPredCache()
+	if cache == nil {
+		return
+	}
+	set.limit = cache.Limit()
+	set.oversizedLimit = qcache.MaterializedPredOversizedLimit(set.limit)
+	set.maxCard = cache.MaxCardinality()
+}
+
+func (set *plannerMaterializedCacheRouteSet) add(key qcache.MaterializedPredKey, est uint64, state plannerMaterializedCacheState) bool {
+	set.state = plannerOrderedLimitCacheGroupState(set.state, state)
+	if key.IsZero() || state == plannerMaterializedCacheDisabled {
+		return false
+	}
+	for i := 0; i < set.keyCount; i++ {
+		if set.keys[i] == key {
+			return false
+		}
+	}
+	if set.keyCount == len(set.keys) {
+		set.overflow = true
+		return true
+	}
+	set.keys[set.keyCount] = key
+	set.keyCount++
+	if state == plannerMaterializedCacheWarmHit {
+		set.warmCount++
+	}
+	if set.maxCard > 0 && est > set.maxCard {
+		set.oversizedCount++
+	}
+	return true
+}
+
+func (set *plannerMaterializedCacheRouteSet) finish() plannerMaterializedCacheState {
+	if set.limit <= 0 || set.state == plannerMaterializedCacheDisabled {
+		return plannerMaterializedCacheDisabled
+	}
+	if set.overflow || set.keyCount > set.limit || set.oversizedCount > set.oversizedLimit {
+		return plannerMaterializedCacheColdUnretainedByPolicy
+	}
+	return set.state
+}
+
+func (set *plannerMaterializedCacheRouteSet) allWarm() bool {
+	return !set.overflow && set.keyCount > 0 && set.keyCount == set.warmCount
+}
+
+func (set *plannerMaterializedCacheRouteSet) pressurePenalty() float64 {
+	if set.limit <= 0 || set.keyCount == 0 || !plannerMaterializedCacheStateUnretained(set.finish()) {
+		return 1
+	}
+	keyCount := set.keyCount
+	if set.overflow {
+		keyCount++
+	}
+	penalty := 1.0 + float64(keyCount)/float64(set.limit)
+	if set.oversizedLimit >= 0 && set.oversizedCount > set.oversizedLimit {
+		penalty += float64(set.oversizedCount-set.oversizedLimit) * 0.5
+	}
+	if set.overflow {
+		penalty += 1
+	}
+	if penalty > 8 {
+		return 8
+	}
+	return penalty
 }
 
 func (qv *View) orderedLimitCollapsedRangeStats(op preparedScalarExactRange) (scalarMaterializationStats, bool) {
@@ -314,7 +526,8 @@ func (qv *View) orderedLimitBaseCoreStats(
 	default:
 		return plannerOrderedLimitBaseCoreStats{}, false
 	}
-	if !ok || stats.buildBuckets == 0 || stats.buildEst == 0 {
+	emptyComplement := stats.buildComplement && stats.buildEst == 0
+	if !ok || (!emptyComplement && (stats.buildBuckets == 0 || stats.buildEst == 0)) {
 		return plannerOrderedLimitBaseCoreStats{}, false
 	}
 
@@ -325,12 +538,22 @@ func (qv *View) orderedLimitBaseCoreStats(
 
 	expectedRows := orderedPredicateExpectedRows(needWindow, stats.probeEst, universe)
 	probeWork := rangeProbeTotalWorkForRows(clampUint64ToInt(expectedRows), stats.probeBuckets, stats.probeEst)
-	retainedPenalty := satMulUint64(stats.probeEst, postingContainsLookupWork(stats.probeEst))
+	retainedPenalty := satMulUint64(stats.buildEst, postingContainsLookupWork(stats.buildEst))
+	routeWork := qv.snap.ObservedMaterializedPredWork(stats.cacheKey)
+	if routeWork >= buildWork {
+		requiresSecondHit = false
+		if routeWork > probeWork {
+			probeWork = routeWork
+		}
+	}
 
 	useful := probeWork >= satAddUint64(buildWork, retainedPenalty)
 	if !useful && hasOrderBounds {
 		minRows := satMulUint64(uint64(needWindow), orderBasicBoundedRangeBaseMinRowsPerNeed)
 		useful = stats.probeBuckets <= rangePostingFilterKeepProbeMaxBuckets && stats.probeEst >= minRows
+	}
+	if routeWork >= buildWork {
+		useful = true
 	}
 
 	cacheState := qv.classifyPlannerMaterializedCacheKey(stats.cacheKey, stats.buildEst, requiresSecondHit)
@@ -339,6 +562,7 @@ func (qv *View) orderedLimitBaseCoreStats(
 		est:        stats.buildEst,
 		buildWork:  buildWork,
 		probeWork:  probeWork,
+		routeWork:  routeWork,
 		warm:       cacheState == plannerMaterializedCacheWarmHit,
 		useful:     useful,
 		cacheState: cacheState,
@@ -484,17 +708,100 @@ func (qv *View) orderedLimitOrderScanCost(
 	}
 }
 
-func orderedLimitAnchorCandidate(decision plannerOrderedDecision, leaves []qir.Expr) (plannerOrderedLimitCandidate, bool) {
+func orderedLimitBasicCandidate(decision plannerOrderedDecision, leaves []qir.Expr, orderScan plannerOrderedLimitCandidate) (plannerOrderedLimitCandidate, bool) {
 	if !decision.use || decision.orderedCost <= 0 {
 		return plannerOrderedLimitCandidate{}, false
 	}
+	expectedRows := decision.expectedProbeRows
+	if expectedRows == 0 {
+		expectedRows = orderScan.expectedRows
+	}
 	return plannerOrderedLimitCandidate{
-		kind:         plannerOrderedLimitCandidateOrderedAnchor,
+		kind:         plannerOrderedLimitCandidateOrderedBasic,
 		cost:         decision.orderedCost,
-		expectedRows: decision.expectedProbeRows,
+		expectedRows: expectedRows,
+		buckets:      orderScan.buckets,
 		checks:       uint64(len(leaves)),
 		cacheState:   plannerMaterializedCacheDisabled,
 	}, true
+}
+
+func orderedLimitResidualExactFilterCandidate(e qir.Expr) bool {
+	switch e.Op {
+	case qir.OpEQ, qir.OpIN, qir.OpHASALL, qir.OpHASANY,
+		qir.OpGT, qir.OpGTE, qir.OpLT, qir.OpLTE, qir.OpPREFIX:
+		return true
+	default:
+		return false
+	}
+}
+
+func (qv *View) orderedLimitBoundsScanCandidateAllowed(
+	q *qir.Shape,
+	facts *orderedLimitFacts,
+	orderScan plannerOrderedLimitCandidate,
+) bool {
+	if len(facts.baseOps) == 0 {
+		return true
+	}
+	if q.Offset > 0 && facts.orderMeta.Ptr && facts.nilTailField == "" {
+		return false
+	}
+	maxResiduals := 3
+	if len(facts.baseOps) > maxResiduals {
+		return false
+	}
+
+	snap := qv.exec.Stats.Load()
+	universe := qv.plannerUniverseCardinality(snap)
+	if universe == 0 {
+		return false
+	}
+
+	residualSel := 1.0
+	exactFilters := 0
+	for i := 0; i < len(facts.baseOps); i++ {
+		e := facts.baseOps[i]
+		sel, _, _, _, ok := qv.estimateLeafOrderCost(e, snap, universe, facts.orderField, facts.ov.HasData())
+		if !ok {
+			return false
+		}
+		if sel <= 0 {
+			return true
+		}
+		residualSel *= sel
+		if orderedLimitResidualExactFilterCandidate(e) {
+			exactFilters++
+		}
+	}
+	if exactFilters == 0 {
+		return false
+	}
+
+	residualRows := uint64(residualSel * float64(universe))
+	if residualRows == 0 {
+		return false
+	}
+	need := uint64(facts.needWindow)
+	if q.Offset > 0 && need > residualRows/2 {
+		return false
+	}
+	if q.Offset > 0 {
+		return true
+	}
+	expectedRows := orderScan.expectedRows
+	if expectedRows == 0 {
+		expectedRows = need
+	}
+	if len(facts.baseOps) >= 3 &&
+		(facts.bounds.HasLo || facts.bounds.HasHi || facts.bounds.HasPrefix) &&
+		expectedRows/32 > need {
+		return false
+	}
+	if len(facts.baseOps) == 1 {
+		return expectedRows <= residualRows
+	}
+	return expectedRows <= residualRows/2
 }
 
 func orderedLimitMaterializedFallbackCandidate(
@@ -535,27 +842,24 @@ func (qv *View) orderedLimitBaseOpsCandidate(
 
 	cache := qv.snap.MaterializedPredCache()
 	limit := 0
-	oversizedLimit := int32(0)
 	maxCard := uint64(0)
 	if cache != nil {
 		limit = cache.Limit()
-		oversizedLimit = qcache.MaterializedPredOversizedLimit(limit)
 		maxCard = cache.MaxCardinality()
 	}
 
 	var (
-		cacheState   plannerMaterializedCacheState
-		buildWork    uint64
-		probeWork    uint64
-		warm         bool
-		useful       bool
-		coldRegular  int
-		coldOversize int32
-		coreCount    int
+		cacheState plannerMaterializedCacheState
+		buildWork  uint64
+		probeWork  uint64
+		routeWork  uint64
+		hasWarm    bool
+		useful     bool
+		coreCount  int
 	)
 
-	var keys [limitQueryFastPathMaxLeaves]qcache.MaterializedPredKey
-	keyCount := 0
+	var routeSet plannerMaterializedCacheRouteSet
+	routeSet.init(qv)
 
 	for i, op := range baseOps {
 		core := orderBasicBaseCore{
@@ -613,41 +917,24 @@ func (qv *View) orderedLimitBaseOpsCandidate(
 			continue
 		}
 		if st.warm {
-			warm = true
+			hasWarm = true
 		} else {
 			buildWork = satAddUint64(buildWork, st.buildWork)
 		}
 		probeWork = satAddUint64(probeWork, st.probeWork)
+		if !st.warm && st.routeWork >= st.buildWork {
+			routeWork = satAddUint64(routeWork, st.routeWork)
+		}
 		if st.useful {
 			useful = true
 		}
 
 		state := st.cacheState
-		if state != plannerMaterializedCacheWarmHit && !st.cacheKey.IsZero() {
-			seen := false
-			for j := 0; j < keyCount; j++ {
-				if keys[j] == st.cacheKey {
-					seen = true
-					break
-				}
-			}
-			if !seen {
-				if keyCount < len(keys) {
-					keys[keyCount] = st.cacheKey
-					keyCount++
-				}
-				if state == plannerMaterializedCacheColdRegularAdmissible {
-					coldRegular++
-				} else if state == plannerMaterializedCacheColdOversizedAdmissible {
-					coldOversize++
-				}
-			}
-		}
-		cacheState = plannerOrderedLimitCacheGroupState(cacheState, state)
+		routeSet.add(st.cacheKey, st.est, state)
 	}
 
 	placementFallback := false
-	if !warm && !useful {
+	if !hasWarm && !useful {
 		if hasOffset || orderCandidate.cost <= 0 || buildWork == 0 {
 			return plannerOrderedLimitCandidate{}, false, false, nil
 		}
@@ -655,8 +942,8 @@ func (qv *View) orderedLimitBaseOpsCandidate(
 	}
 	if limit <= 0 {
 		cacheState = plannerMaterializedCacheDisabled
-	} else if coldRegular+int(coldOversize) > limit || coldOversize > oversizedLimit {
-		cacheState = plannerMaterializedCacheColdUnretainedByPolicy
+	} else {
+		cacheState = routeSet.finish()
 	}
 
 	expectedRows := orderCandidate.expectedRows
@@ -664,11 +951,17 @@ func (qv *View) orderedLimitBaseOpsCandidate(
 		expectedRows = uint64(needWindow)
 	}
 	baseCost := float64(expectedRows)*(0.60+float64(coreCount)*0.16) + plannerOrderedLimitCost(buildWork)
-	if warm {
+	if hasWarm {
 		baseCost *= 0.82
 	}
 	if !plannerMaterializedCacheStateRetained(cacheState) {
 		baseCost += plannerOrderedLimitCost(buildWork) * 0.35
+	}
+	if routeWork >= buildWork && buildWork > 0 && orderCandidate.cost > 0 && plannerMaterializedCacheStateRetained(cacheState) {
+		buildCost := orderCandidate.cost * float64(buildWork) / float64(routeWork)
+		if buildCost < baseCost {
+			baseCost = buildCost
+		}
 	}
 	if useful && probeWork > buildWork {
 		saved := plannerOrderedLimitCost(probeWork - buildWork)
@@ -690,7 +983,7 @@ func (qv *View) orderedLimitBaseOpsCandidate(
 	}
 
 	return plannerOrderedLimitCandidate{
-		kind:         plannerOrderedLimitBaseKind(warm, cacheState),
+		kind:         plannerOrderedLimitBaseKind(routeSet.allWarm(), cacheState),
 		cost:         baseCost,
 		expectedRows: expectedRows,
 		buckets:      orderCandidate.buckets,
@@ -724,6 +1017,18 @@ func plannerOrderedLimitPick(candidates []plannerOrderedLimitCandidate) plannerO
 		}
 	}
 	d.runtimeFallback = d.rejected
+	if d.selected.kind == plannerOrderedLimitCandidateOrderScan {
+		d.runtimeFallback = plannerOrderedLimitCandidate{}
+		for i := range candidates {
+			if candidates[i].kind != plannerOrderedLimitCandidateOrderedBasic &&
+				candidates[i].kind != plannerOrderedLimitCandidateMaterializedFallback {
+				continue
+			}
+			if d.runtimeFallback.kind == plannerOrderedLimitCandidateNone || candidates[i].cost < d.runtimeFallback.cost {
+				d.runtimeFallback = candidates[i]
+			}
+		}
+	}
 	return d
 }
 
@@ -1012,15 +1317,20 @@ func (qv *View) selectOrderedLimit(
 	if len(facts.baseOps) == 0 {
 		return plannerOrderedLimitDecision{selected: orderScan}, true, nil
 	}
-	candidates[n] = orderScan
-	n++
 	orderCandidate := orderScan
 
-	if anchor, ok := orderedLimitAnchorCandidate(orderedDecision, facts.ops); ok {
-		candidates[n] = anchor
+	basic, hasBasic := orderedLimitBasicCandidate(orderedDecision, facts.ops, orderScan)
+	boundsScanAllowed := qv.orderedLimitBoundsScanCandidateAllowed(q, facts, orderScan)
+	useCandidateOrder := qv.shouldUseCandidateOrder(facts.order, facts.ops)
+	if boundsScanAllowed {
+		candidates[n] = orderScan
 		n++
-		if anchor.cost > 0 && (orderCandidate.cost <= 0 || anchor.cost < orderCandidate.cost) {
-			orderCandidate = anchor
+	}
+	if hasBasic {
+		candidates[n] = basic
+		n++
+		if !boundsScanAllowed && basic.cost > 0 && (orderCandidate.cost <= 0 || basic.cost < orderCandidate.cost) {
+			orderCandidate = basic
 		}
 	}
 
@@ -1054,7 +1364,7 @@ func (qv *View) selectOrderedLimit(
 		n++
 	}
 
-	if qv.shouldUseCandidateOrder(facts.order, facts.ops) {
+	if useCandidateOrder {
 		cost := orderScan.cost * 0.88
 		if cost <= 0 {
 			cost = float64(facts.needWindow) * (2.0 + float64(len(facts.ops))*0.55)
@@ -1070,7 +1380,8 @@ func (qv *View) selectOrderedLimit(
 		n++
 	}
 
-	candidates[n] = orderedLimitMaterializedFallbackCandidate(q, facts.ops, orderScan.cost, orderedDecision)
+	materialized := orderedLimitMaterializedFallbackCandidate(q, facts.ops, orderScan.cost, orderedDecision)
+	candidates[n] = materialized
 	n++
 
 	return plannerOrderedLimitPick(candidates[:n]), true, nil

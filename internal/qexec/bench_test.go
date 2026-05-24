@@ -2266,7 +2266,8 @@ func benchmarkNoOrderLimitDispatch(b *testing.B, db *testDB, q *qx.QX) {
 		b.Skip("no-order LIMIT selector did not choose a route")
 	}
 
-	out, ok, _, err := view.dispatchNoOrderLimit(&shape, facts, decision, nil)
+	guard := decision.runtimeGuard(&shape)
+	out, ok, _, err := view.dispatchNoOrderLimit(&shape, facts, decision, guard, nil)
 	if err != nil {
 		b.Fatalf("dispatchNoOrderLimit warmup: %v", err)
 	}
@@ -2278,7 +2279,7 @@ func benchmarkNoOrderLimitDispatch(b *testing.B, db *testDB, q *qx.QX) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		out, ok, _, err = view.dispatchNoOrderLimit(&shape, facts, decision, nil)
+		out, ok, _, err = view.dispatchNoOrderLimit(&shape, facts, decision, guard, nil)
 		if err != nil {
 			b.Fatalf("dispatchNoOrderLimit: %v", err)
 		}
