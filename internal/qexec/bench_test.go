@@ -75,13 +75,6 @@ func qexecBenchOptions() testOptions {
 	}
 }
 
-func qexecBenchScales() []qexecBenchScale {
-	if testing.Short() {
-		return qexecBenchAllScales[:1]
-	}
-	return qexecBenchAllScales[:]
-}
-
 func qexecBenchSelectivities() []qexecBenchSelectivity {
 	return qexecBenchAllSelectivities[:]
 }
@@ -177,7 +170,7 @@ func qexecBenchHighCardEmail(id uint64) string {
 
 func qexecBenchRunScales(b *testing.B, fn func(*testing.B, *testDB, qexecBenchScale)) {
 	b.Helper()
-	scales := qexecBenchScales()
+	scales := qexecBenchAllScales[:]
 	for i := range scales {
 		scale := scales[i]
 		b.Run(scale.name, func(b *testing.B) {
@@ -189,7 +182,7 @@ func qexecBenchRunScales(b *testing.B, fn func(*testing.B, *testDB, qexecBenchSc
 
 func qexecBenchRunScaleSelectivities(b *testing.B, fn func(*testing.B, *testDB, qexecBenchScale, qexecBenchSelectivity)) {
 	b.Helper()
-	scales := qexecBenchScales()
+	scales := qexecBenchAllScales[:]
 	sels := qexecBenchSelectivities()
 	for i := range scales {
 		scale := scales[i]
@@ -2964,7 +2957,7 @@ func BenchmarkQueryCacheModes(b *testing.B) {
 	modes[1].opts.MatPredCacheMaxEntries = 1
 	modes[1].opts.MatPredCacheMaxCard = 1024
 
-	scales := qexecBenchScales()
+	scales := qexecBenchAllScales[:]
 	sels := qexecBenchSelectivities()
 	for i := range modes {
 		mode := modes[i]
