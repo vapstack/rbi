@@ -2,7 +2,6 @@ package qagg
 
 import (
 	"reflect"
-	"sort"
 	"sync"
 	"testing"
 	"unsafe"
@@ -726,7 +725,7 @@ func BenchmarkAggregatePostprocessOnly(b *testing.B) {
 					copy(scratch, base.Rows)
 					result := Result{Layout: base.Layout, Rows: scratch[:len(base.Rows)]}
 					result = applyAggregateHaving(result, prepared.having)
-					sort.Sort(aggregateRowSorter{rows: result.Rows, order: prepared.order})
+					result = applyAggregateOrder(result, prepared.order, prepared.orderUnique, prepared.offset, prepared.limit)
 					result = applyAggregateWindow(result, prepared.offset, prepared.limit)
 					qaggBenchResult = result
 				}

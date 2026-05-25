@@ -423,6 +423,118 @@ func TestAggregateMetamorphicCounts(t *testing.T) {
 	requireQaggUint(t, countSegmentResult.Rows[0][0], 4)
 }
 
+func TestApplyAggregateOrderTopKMatchesFullSort(t *testing.T) {
+	const rowCount = 2048
+	rows := make([]Row, rowCount)
+	for i := range rows {
+		rows[i] = Row{
+			Value{num: uint64((i * 37) % rowCount), any: ValueKindUint},
+			Value{num: uint64(i), any: ValueKindUint},
+		}
+	}
+
+	order := []aggregateOrder{{index: 0, desc: true}, {index: 1}}
+	full := Result{Layout: []string{"score", "id"}, Rows: append([]Row(nil), rows...)}
+	sort.Sort(aggregateRowSorter{rows: full.Rows, order: order})
+	full = applyAggregateWindow(full, 17, 113)
+
+	top := Result{Layout: []string{"score", "id"}, Rows: append([]Row(nil), rows...)}
+	top = applyAggregateOrder(top, order, true, 17, 113)
+	top = applyAggregateWindow(top, 17, 113)
+
+	requireQaggLayout(t, top.Layout, full.Layout)
+	if len(top.Rows) != len(full.Rows) {
+		t.Fatalf("rows len=%d, want %d", len(top.Rows), len(full.Rows))
+	}
+	for i := range top.Rows {
+		topScore, _ := top.Rows[i][0].Uint()
+		fullScore, _ := full.Rows[i][0].Uint()
+		topID, _ := top.Rows[i][1].Uint()
+		fullID, _ := full.Rows[i][1].Uint()
+		if topScore != fullScore || topID != fullID {
+			t.Fatalf("row[%d]=%v, want %v", i, top.Rows[i], full.Rows[i])
+		}
+	}
+}
+
+func TestApplyAggregateOrderTiedOrderMatchesFullSort(t *testing.T) {
+	rows := []Row{
+		{
+			Value{num: 4, any: ValueKindUint},
+			Value{num: 0, any: ValueKindUint},
+		},
+		{
+			Value{num: 4, any: ValueKindUint},
+			Value{num: 1, any: ValueKindUint},
+		},
+		{
+			Value{num: 3, any: ValueKindUint},
+			Value{num: 2, any: ValueKindUint},
+		},
+	}
+	for i := 3; i < 64; i++ {
+		rows = append(rows, Row{
+			Value{num: uint64(i + 5), any: ValueKindUint},
+			Value{num: uint64(i), any: ValueKindUint},
+		})
+	}
+
+	order := []aggregateOrder{{index: 0}}
+	full := Result{Layout: []string{"score", "id"}, Rows: append([]Row(nil), rows...)}
+	sort.Sort(aggregateRowSorter{rows: full.Rows, order: order})
+	full = applyAggregateWindow(full, 0, 2)
+
+	got := Result{Layout: []string{"score", "id"}, Rows: append([]Row(nil), rows...)}
+	got = applyAggregateOrder(got, order, false, 0, 2)
+	got = applyAggregateWindow(got, 0, 2)
+
+	if len(got.Rows) != len(full.Rows) {
+		t.Fatalf("rows len=%d, want %d", len(got.Rows), len(full.Rows))
+	}
+	for i := range got.Rows {
+		gotID, _ := got.Rows[i][1].Uint()
+		fullID, _ := full.Rows[i][1].Uint()
+		if gotID != fullID {
+			t.Fatalf("row[%d]=%v, want %v", i, got.Rows[i], full.Rows[i])
+		}
+	}
+}
+
+func TestPrepareAggregateOrderUniqueRequiresGroupCoverage(t *testing.T) {
+	db := newQaggTestDB(t, nil)
+
+	metricOrder, err := Prepare(
+		qx.Group("country", "segment").
+			Metrics(qx.ROWCOUNT().AS("rows")).
+			SortOut("rows").
+			Limit(2),
+		db.rt,
+	)
+	if err != nil {
+		t.Fatalf("Prepare metric order: %v", err)
+	}
+	if metricOrder.orderUnique {
+		t.Fatalf("metric order marked unique")
+	}
+	metricOrder.Release()
+
+	groupOrder, err := Prepare(
+		qx.Group("country", "segment").
+			Metrics(qx.ROWCOUNT().AS("rows")).
+			SortOut("country").
+			SortOut("segment").
+			Limit(2),
+		db.rt,
+	)
+	if err != nil {
+		t.Fatalf("Prepare group order: %v", err)
+	}
+	if !groupOrder.orderUnique {
+		t.Fatalf("group order not marked unique")
+	}
+	groupOrder.Release()
+}
+
 func newQaggSparseIDTestDB(t testing.TB, traceSink ...func(qexec.TraceEvent)) *qaggTestDB {
 	t.Helper()
 

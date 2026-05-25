@@ -7,6 +7,7 @@ const (
 	aggregateOrderSlicePoolMaxCap       = 4 << 10
 	aggregateOutputPositionMapMaxLen    = 4 << 10
 	aggregateGroupOrdinalMapMaxLen      = 8 << 20
+	aggregateGroupOrdinalMapPoolMaxCap  = 1 << 20
 )
 
 var aggregateMetricStateSlicePool = pooled.NewSlicePool[aggregateMetricState](

@@ -3,6 +3,7 @@ package qagg
 import (
 	"fmt"
 	"math"
+	"math/bits"
 	"reflect"
 	"sort"
 
@@ -54,6 +55,12 @@ func (m *aggregateGroupOrdinalMap) init(n int) {
 }
 
 func (m *aggregateGroupOrdinalMap) reset() {
+	if cap(m.keys) > aggregateGroupOrdinalMapPoolMaxCap {
+		m.keys = nil
+		m.values = nil
+		m.mask = 0
+		return
+	}
 	clear(m.values)
 }
 
@@ -145,14 +152,15 @@ type aggregateHavingExpr struct {
 }
 
 type Query struct {
-	filter    *qir.Query
-	groups    []aggregateFieldRef
-	metrics   []aggregateMetric
-	having    aggregateHavingExpr
-	hasHaving bool
-	order     []aggregateOrder
-	offset    uint64
-	limit     uint64
+	filter      *qir.Query
+	groups      []aggregateFieldRef
+	metrics     []aggregateMetric
+	having      aggregateHavingExpr
+	hasHaving   bool
+	order       []aggregateOrder
+	orderUnique bool
+	offset      uint64
+	limit       uint64
 }
 
 type aggregateMetricState struct {
@@ -203,7 +211,7 @@ func Execute(view *qexec.View, snap *snapshot.View, prepared *Query) (result Res
 		result = applyAggregateHaving(result, prepared.having)
 	}
 	if len(prepared.order) > 0 {
-		sort.Sort(aggregateRowSorter{rows: result.Rows, order: prepared.order})
+		result = applyAggregateOrder(result, prepared.order, prepared.orderUnique, prepared.offset, prepared.limit)
 	}
 	result = applyAggregateWindow(result, prepared.offset, prepared.limit)
 	return result, nil
@@ -304,6 +312,25 @@ func Prepare(src *qx.QX, rt *schema.Runtime) (*Query, error) {
 			return nil, err
 		}
 		out.order = order
+		if len(out.groups) > 0 {
+			uniq := true
+			for i := range out.groups {
+				found := false
+				for j := range order {
+					if order[j].index == i {
+						found = true
+						break
+					}
+				}
+				if !found {
+					uniq = false
+					break
+				}
+			}
+			out.orderUnique = uniq
+		} else if len(out.metrics) == 1 && out.metrics[0].op == aggregateMetricDistinct {
+			out.orderUnique = true
+		}
 	}
 
 	return out, nil
@@ -1822,8 +1849,8 @@ func (ae *aggregateExecutor) foldOrdinaryMetricStates(states []aggregateMetricSt
 	ov := indexdata.NewFieldIndexViewFromStorage(ae.snap.Index[acc.Ordinal])
 	universe := ae.snap.Universe.Cardinality()
 	filterCardinality := ids.Cardinality()
+	keyCount := ov.KeyCount()
 	if filterCardinality == universe {
-		keyCount := ov.KeyCount()
 		if keyCount > len(states)*aggregateFullScanMaxAvgBucketRows {
 			br := ov.RangeByRanks(0, keyCount)
 			_, rows := ov.RangeStats(br)
@@ -1832,7 +1859,49 @@ func (ae *aggregateExecutor) foldOrdinaryMetricStates(states []aggregateMetricSt
 			}
 		}
 	}
-	cur := ov.NewCursor(ov.RangeByRanks(0, ov.KeyCount()), false)
+	if ov.Rows() == uint64(keyCount) {
+		var contains posting.ContainsCursor
+		contains.Reset(ids)
+		cur := ov.NewCursor(ov.RangeByRanks(0, keyCount), false)
+		for {
+			key, bucketIDs, ok := cur.Next()
+			if !ok {
+				break
+			}
+			id, _ := bucketIDs.TrySingle()
+			if !contains.Contains(id) {
+				continue
+			}
+			var value Value
+			valueReady := false
+			for i := first; i < len(states); i++ {
+				if !aggregateMetricsShareOrdinaryField(states[first].metric, states[i].metric) {
+					continue
+				}
+				switch states[i].metric.op {
+
+				case aggregateMetricCount:
+					states[i].count++
+					states[i].seen = true
+
+				case aggregateMetricCountDistinct:
+					states[i].count++
+					states[i].seen = true
+
+				default:
+					if !valueReady {
+						value = aggregateValueFromIndexKey(acc.Field, key)
+						valueReady = true
+					}
+					if err := states[i].addValue(value, 1); err != nil {
+						return err
+					}
+				}
+			}
+		}
+		return nil
+	}
+	cur := ov.NewCursor(ov.RangeByRanks(0, keyCount), false)
 	for {
 		key, bucketIDs, ok := cur.Next()
 		if !ok {
@@ -2379,10 +2448,12 @@ func (s aggregateRowSorter) Len() int {
 }
 
 func (s aggregateRowSorter) Less(i int, j int) bool {
-	left := s.rows[i]
-	right := s.rows[j]
-	for k := range s.order {
-		order := s.order[k]
+	return aggregateRowsLess(s.order, s.rows[i], s.rows[j])
+}
+
+func aggregateRowsLess(orders []aggregateOrder, left Row, right Row) bool {
+	for k := range orders {
+		order := orders[k]
 		cmp := aggregateCompareOrderValues(left[order.index], right[order.index])
 		if cmp == 0 {
 			continue
@@ -2397,6 +2468,70 @@ func (s aggregateRowSorter) Less(i int, j int) bool {
 
 func (s aggregateRowSorter) Swap(i int, j int) {
 	s.rows[i], s.rows[j] = s.rows[j], s.rows[i]
+}
+
+func applyAggregateOrder(result Result, order []aggregateOrder, orderUnique bool, offset uint64, limit uint64) Result {
+	if len(result.Rows) < 2 {
+		return result
+	}
+	if limit == 0 {
+		sort.Sort(aggregateRowSorter{rows: result.Rows, order: order})
+		return result
+	}
+	if offset >= uint64(len(result.Rows)) {
+		result.Rows = nil
+		return result
+	}
+	need := offset + limit
+	if need < offset || need >= uint64(len(result.Rows)) {
+		sort.Sort(aggregateRowSorter{rows: result.Rows, order: order})
+		return result
+	}
+	if !orderUnique {
+		sort.Sort(aggregateRowSorter{rows: result.Rows, order: order})
+		return result
+	}
+	k := int(need)
+	n := len(result.Rows)
+	nLog := bits.Len(uint(n)) - 1
+	kLog := bits.Len(uint(k)) - 1
+	if uint64(n)*uint64(nLog) <= (uint64(n)+uint64(k))*uint64(kLog) {
+		sort.Sort(aggregateRowSorter{rows: result.Rows, order: order})
+		return result
+	}
+	aggregateRowsTopK(result.Rows, order, k)
+	sort.Sort(aggregateRowSorter{rows: result.Rows[:k], order: order})
+	result.Rows = result.Rows[:k]
+	return result
+}
+
+func aggregateRowsTopK(rows []Row, order []aggregateOrder, k int) {
+	for i := k/2 - 1; i >= 0; i-- {
+		aggregateRowsTopKDown(rows, order, i, k)
+	}
+	for i := k; i < len(rows); i++ {
+		if aggregateRowsLess(order, rows[i], rows[0]) {
+			rows[0], rows[i] = rows[i], rows[0]
+			aggregateRowsTopKDown(rows, order, 0, k)
+		}
+	}
+}
+
+func aggregateRowsTopKDown(rows []Row, order []aggregateOrder, i int, n int) {
+	for {
+		child := i*2 + 1
+		if child >= n {
+			return
+		}
+		if child+1 < n && aggregateRowsLess(order, rows[child], rows[child+1]) {
+			child++
+		}
+		if !aggregateRowsLess(order, rows[i], rows[child]) {
+			return
+		}
+		rows[i], rows[child] = rows[child], rows[i]
+		i = child
+	}
 }
 
 func aggregateComparePredicateValues(a Value, b Value) (int, bool) {
