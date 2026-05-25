@@ -150,11 +150,9 @@ func runCLI(args []string, stdout io.Writer, stderr io.Writer, useColor bool) in
 
 	currentSummaries := summarizeSet(current)
 	rows := buildRows(previousSummaries, current.Order, currentSummaries, options.hide, useColor)
-	if len(rows) == 0 {
-		return 0
-	}
+	summary := buildSummaryRow(previousSummaries, current.Order, currentSummaries, useColor)
 
-	_, _ = fmt.Fprintln(stdout, renderRows(rows))
+	_, _ = fmt.Fprintln(stdout, renderRowsWithSummary(rows, summary, nil))
 	return 0
 }
 
@@ -380,6 +378,13 @@ func buildRows(previousSummaries map[string]benchmarkSummary, order []string, cu
 		nsDisplay := compareMetric(metricNS, previousSummary.NSPerOp, currentSummary.NSPerOp)
 		bytesDisplay := compareMetric(metricBytes, previousSummary.BytesPerOp, currentSummary.BytesPerOp)
 		allocsDisplay := compareMetric(metricAllocs, previousSummary.AllocsPerOp, currentSummary.AllocsPerOp)
+		bytesColor := bytesDisplay.Color
+		if currentSummary.AllocsPerOp == 0 && currentSummary.BytesPerOp > 0 {
+			bytesColor = colorWhite
+			if !bytesDisplay.Significant {
+				bytesColor = colorGray
+			}
+		}
 
 		if hideInsignificant && !nsDisplay.Significant && !bytesDisplay.Significant && !allocsDisplay.Significant {
 			continue
@@ -401,8 +406,8 @@ func buildRows(previousSummaries map[string]benchmarkSummary, order []string, cu
 			plain[1],
 			maybeColor(plain[2], nsDisplay.Color, useColor),
 			maybeColor(plain[3], nsDisplay.Color, useColor),
-			maybeColor(plain[4], bytesDisplay.Color, useColor),
-			maybeColor(plain[5], bytesDisplay.Color, useColor),
+			maybeColor(plain[4], bytesColor, useColor),
+			maybeColor(plain[5], bytesColor, useColor),
 			maybeColor(plain[6], allocsDisplay.Color, useColor),
 			maybeColor(plain[7], allocsDisplay.Color, useColor),
 		}
@@ -439,10 +444,170 @@ func buildNewBenchmarkRow(currentSummary benchmarkSummary, useColor bool) output
 	return outputRow{Plain: plain, Colored: colored}
 }
 
+func buildSummaryRow(previousSummaries map[string]benchmarkSummary, order []string, currentSummaries map[string]benchmarkSummary, useColor bool) outputRow {
+	var knownCount int
+	var newCount int
+	var previousNS float64
+	var currentNS float64
+	var previousBytes float64
+	var currentBytes float64
+	var previousAllocs float64
+	var currentAllocs float64
+
+	for _, name := range order {
+		currentSummary, ok := currentSummaries[name]
+		if !ok {
+			continue
+		}
+
+		previousSummary, ok := previousSummaries[name]
+		if !ok {
+			newCount++
+			continue
+		}
+
+		knownCount++
+		previousNS += previousSummary.NSPerOp
+		currentNS += currentSummary.NSPerOp
+		previousBytes += previousSummary.BytesPerOp
+		currentBytes += currentSummary.BytesPerOp
+		previousAllocs += previousSummary.AllocsPerOp
+		currentAllocs += currentSummary.AllocsPerOp
+	}
+
+	nsDisplay := compareSummaryMetric(metricNS, previousNS, currentNS)
+	bytesDisplay := compareSummaryMetric(metricBytes, previousBytes, currentBytes)
+	allocsDisplay := compareSummaryMetric(metricAllocs, previousAllocs, currentAllocs)
+	bytesColor := bytesDisplay.Color
+	if currentAllocs == 0 && currentBytes > 0 {
+		bytesColor = colorWhite
+		if !bytesDisplay.Significant {
+			bytesColor = colorGray
+		}
+	}
+
+	nsDelta := currentNS - previousNS
+	bytesDelta := currentBytes - previousBytes
+	allocsDelta := currentAllocs - previousAllocs
+
+	plain := []string{
+		formatProgress(knownCount, len(previousSummaries), newCount),
+		"",
+		formatSummaryMetric(metricNS, nsDelta),
+		nsDisplay.DeltaText,
+		formatSummaryMetric(metricBytes, bytesDelta),
+		bytesDisplay.DeltaText,
+		formatSummaryMetric(metricAllocs, allocsDelta),
+		allocsDisplay.DeltaText,
+	}
+
+	colored := []string{
+		plain[0],
+		plain[1],
+		maybeColor(plain[2], nsDisplay.Color, useColor),
+		maybeColor(plain[3], nsDisplay.Color, useColor),
+		maybeColor(plain[4], bytesColor, useColor),
+		maybeColor(plain[5], bytesColor, useColor),
+		maybeColor(plain[6], allocsDisplay.Color, useColor),
+		maybeColor(plain[7], allocsDisplay.Color, useColor),
+	}
+
+	return outputRow{Plain: plain, Colored: colored}
+}
+
+func compareSummaryMetric(kind metricKind, previous float64, current float64) metricDisplay {
+	change, finite := percentChange(previous, current)
+	magnitude := math.Abs(change)
+	thresholds := percentThresholds(kind)
+	significant := magnitude >= thresholds.significant
+	level := severityFor(magnitude, thresholds)
+	if !finite {
+		magnitude = math.Inf(1)
+		significant = previous != current
+	}
+	if kind == metricAllocs {
+		significant = previous != current
+		level = allocsSeverityFor(magnitude, thresholds)
+	}
+
+	return metricDisplay{
+		Significant: significant,
+		Color:       colorFor(level, current < previous),
+		DeltaText:   formatPercentChange(change, finite, current),
+	}
+}
+
+func formatProgress(done int, total int, newCount int) string {
+	totalText := strconv.Itoa(total)
+	percent := 0
+	if total > 0 {
+		percent = (done * 100) / total
+	}
+
+	text := fmt.Sprintf("%*d/%s | %3d%%", len(totalText), done, totalText, percent)
+	if newCount > 0 {
+		text += " | +" + strconv.Itoa(newCount)
+	}
+	return text
+}
+
+func formatSummaryMetric(kind metricKind, value float64) string {
+	switch kind {
+	case metricNS:
+		return formatSummaryNS(value)
+	case metricBytes:
+		return formatSummaryBytes(value)
+	default:
+		return formatSignedValue(value)
+	}
+}
+
+func formatSummaryNS(value float64) string {
+	abs := math.Abs(value)
+	scale := 1.0
+	unit := "ns"
+	switch {
+	case abs >= 1e9:
+		scale = 1e9
+		unit = "s"
+	case abs >= 1e6:
+		scale = 1e6
+		unit = "ms"
+	case abs >= 1e3:
+		scale = 1e3
+		unit = "us"
+	}
+	return formatSignedValue(value/scale) + unit
+}
+
+func formatSummaryBytes(value float64) string {
+	abs := math.Abs(value)
+	scale := 1.0
+	unit := "B"
+	switch {
+	case abs >= 1<<40:
+		scale = 1 << 40
+		unit = " TiB"
+	case abs >= 1<<30:
+		scale = 1 << 30
+		unit = " GiB"
+	case abs >= 1<<20:
+		scale = 1 << 20
+		unit = " MiB"
+	case abs >= 1<<10:
+		scale = 1 << 10
+		unit = " KiB"
+	}
+	return formatSignedValue(value/scale) + unit
+}
+
 func runFollowCLI(previousSummaries map[string]benchmarkSummary, currentPath string, stdout io.Writer, hideInsignificant bool, useColor bool, pollInterval time.Duration, interrupted <-chan struct{}) error {
 	current := newBenchmarkSet()
 	reader := followReader{path: currentPath}
 	widths := estimateFollowWidths(previousSummaries)
+	completedNames := make([]string, 0, len(previousSummaries))
+	renderedSummary := false
+	renderedRows := false
 
 	ticker := time.NewTicker(pollInterval)
 	defer ticker.Stop()
@@ -453,17 +618,24 @@ func runFollowCLI(previousSummaries map[string]benchmarkSummary, currentPath str
 			if errors.Is(err, errFileTruncated) {
 				reader.reset()
 				current = newBenchmarkSet()
+				completedNames = completedNames[:0]
 				continue
 			}
 			return err
 		}
 
 		if len(changedNames) > 0 {
+			completedNames = append(completedNames, changedNames...)
 			currentSummaries := summarizeSet(current)
 			rows := buildRows(previousSummaries, changedNames, currentSummaries, hideInsignificant, useColor)
-			if len(rows) > 0 {
-				_, _ = fmt.Fprintln(stdout, renderRowsWithWidths(rows, widths))
+			summary := buildSummaryRow(previousSummaries, completedNames, currentSummaries, useColor)
+			for _, row := range rows {
+				widths = growWidths(widths, row)
 			}
+			widths = growWidths(widths, summary)
+			_, _ = fmt.Fprint(stdout, renderFollowUpdate(rows, summary, widths, renderedSummary, renderedRows))
+			renderedSummary = true
+			renderedRows = renderedRows || len(rows) > 0
 		}
 
 		if stop {
@@ -598,9 +770,15 @@ func compareMetric(kind metricKind, previous float64, current float64) metricDis
 		delta := current - previous
 		magnitude := math.Abs(delta)
 		thresholds := stepThresholds()
+		significant := magnitude >= thresholds.significant
+		level := severityFor(magnitude, thresholds)
+		if kind == metricAllocs {
+			significant = previous != current
+			level = allocsSeverityFor(magnitude, thresholds)
+		}
 		return metricDisplay{
-			Significant: magnitude >= thresholds.significant,
-			Color:       colorFor(severityFor(magnitude, thresholds), current < previous),
+			Significant: significant,
+			Color:       colorFor(level, current < previous),
 			DeltaText:   formatSignedValue(delta),
 		}
 	}
@@ -609,14 +787,34 @@ func compareMetric(kind metricKind, previous float64, current float64) metricDis
 	magnitude := math.Abs(change)
 	thresholds := percentThresholds(kind)
 	significant := magnitude >= thresholds.significant
+	level := severityFor(magnitude, thresholds)
 	if !finite {
 		significant = previous != current
+	}
+	if kind == metricAllocs {
+		significant = previous != current
+		level = allocsSeverityFor(magnitude, thresholds)
 	}
 
 	return metricDisplay{
 		Significant: significant,
-		Color:       colorFor(severityFor(magnitude, thresholds), current < previous),
+		Color:       colorFor(level, current < previous),
 		DeltaText:   formatPercentChange(change, finite, current),
+	}
+}
+
+func allocsSeverityFor(delta float64, thresholds severityThresholds) severity {
+	switch {
+	case delta == 0:
+		return severityMuted
+	case delta < thresholds.neutralMax:
+		return severityNeutral
+	case delta < thresholds.mildMax:
+		return severityMild
+	case delta <= thresholds.highMax:
+		return severityHigh
+	default:
+		return severityExtreme
 	}
 }
 
@@ -820,13 +1018,43 @@ func renderRowsWithWidths(rows []outputRow, minWidths []int) string {
 	}
 
 	widths := measureRowWidths(rows)
-	for i, width := range minWidths {
-		if i >= len(widths) {
-			break
+	applyMinWidths(widths, minWidths)
+	return renderRowsAligned(rows, widths)
+}
+
+func renderRowsWithSummary(rows []outputRow, summary outputRow, minWidths []int) string {
+	if len(rows) == 0 {
+		return renderRowsWithWidths([]outputRow{summary}, minWidths)
+	}
+
+	widths := measureRowWidths(rows)
+	widths = growWidths(widths, summary)
+	applyMinWidths(widths, minWidths)
+	return renderRowsAligned(rows, widths) + "\n\n" + renderRowsAligned([]outputRow{summary}, widths)
+}
+
+func renderFollowUpdate(rows []outputRow, summary outputRow, widths []int, renderedSummary bool, renderedRows bool) string {
+	var builder strings.Builder
+	if renderedSummary {
+		if renderedRows {
+			builder.WriteString("\x1b[2A\r\x1b[J")
+		} else {
+			builder.WriteString("\x1b[1A\r\x1b[J")
 		}
-		if width > widths[i] {
-			widths[i] = width
-		}
+	}
+	if len(rows) == 0 && renderedRows {
+		builder.WriteByte('\n')
+		builder.WriteString(renderRowsWithWidths([]outputRow{summary}, widths))
+	} else {
+		builder.WriteString(renderRowsWithSummary(rows, summary, widths))
+	}
+	builder.WriteByte('\n')
+	return builder.String()
+}
+
+func renderRowsAligned(rows []outputRow, widths []int) string {
+	if len(rows) == 0 {
+		return ""
 	}
 
 	var builder strings.Builder
@@ -849,6 +1077,17 @@ func renderRowsWithWidths(rows []outputRow, minWidths []int) string {
 	return builder.String()
 }
 
+func applyMinWidths(widths []int, minWidths []int) {
+	for i, width := range minWidths {
+		if i >= len(widths) {
+			break
+		}
+		if width > widths[i] {
+			widths[i] = width
+		}
+	}
+}
+
 func measureRowWidths(rows []outputRow) []int {
 	widths := make([]int, len(rows[0].Plain))
 	for _, row := range rows {
@@ -856,6 +1095,20 @@ func measureRowWidths(rows []outputRow) []int {
 			if len(cell) > widths[i] {
 				widths[i] = len(cell)
 			}
+		}
+	}
+	return widths
+}
+
+func growWidths(widths []int, row outputRow) []int {
+	if len(widths) < len(row.Plain) {
+		grown := make([]int, len(row.Plain))
+		copy(grown, widths)
+		widths = grown
+	}
+	for i, cell := range row.Plain {
+		if len(cell) > widths[i] {
+			widths[i] = len(cell)
 		}
 	}
 	return widths

@@ -126,7 +126,7 @@ func TestCompareMetricUsesUnitStepsForSmallValues(t *testing.T) {
 	if !display.Significant {
 		t.Fatal("expected difference to be significant")
 	}
-	if display.Color != colorGray {
+	if display.Color != "" {
 		t.Fatalf("unexpected color: %q", display.Color)
 	}
 	if display.DeltaText != "-1" {
@@ -227,18 +227,29 @@ func TestCompareMetricUsesUpdatedSeverityBandsForNSAndBytes(t *testing.T) {
 	}
 }
 
-func TestCompareMetricKeepsPercentSensitivityForAllocs(t *testing.T) {
+func TestCompareMetricTreatsAnyAllocsChangeAsSignificant(t *testing.T) {
 	t.Parallel()
 
-	display := compareMetric(metricAllocs, 100, 100.75)
+	display := compareMetric(metricAllocs, 100, 100.25)
 	if !display.Significant {
-		t.Fatal("expected allocs difference above half percent to stay significant")
+		t.Fatal("expected any allocs difference to be significant")
 	}
-	if display.Color != colorGray {
+	if display.Color != "" {
 		t.Fatalf("unexpected color: %q", display.Color)
 	}
-	if display.DeltaText != "+0.75%" {
+	if display.DeltaText != "+0.25%" {
 		t.Fatalf("unexpected delta text: %q", display.DeltaText)
+	}
+
+	display = compareSummaryMetric(metricAllocs, 100, 100.25)
+	if !display.Significant {
+		t.Fatal("expected any summary allocs difference to be significant")
+	}
+	if display.Color != "" {
+		t.Fatalf("unexpected summary color: %q", display.Color)
+	}
+	if display.DeltaText != "+0.25%" {
+		t.Fatalf("unexpected summary delta text: %q", display.DeltaText)
 	}
 }
 
@@ -407,6 +418,57 @@ func TestRunCLIRendersAllRowsByDefault(t *testing.T) {
 	}
 }
 
+func TestRunCLIRendersSummaryAsLastLine(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	previous := filepath.Join(dir, "previous.txt")
+	current := filepath.Join(dir, "current.txt")
+
+	previousText := strings.Join([]string{
+		"Benchmark__Foo-16 100 100 ns/op 1024 B/op 10 allocs/op",
+		"Benchmark__Bar-16 100 200 ns/op 2048 B/op 20 allocs/op",
+		"Benchmark__Baz-16 100 300 ns/op 4096 B/op 30 allocs/op",
+	}, "\n")
+	currentText := strings.Join([]string{
+		"Benchmark__Foo-16 100 80 ns/op 512 B/op 12 allocs/op",
+		"Benchmark__Bar-16 100 240 ns/op 1024 B/op 25 allocs/op",
+		"Benchmark__Qux-16 100 50 ns/op 1 B/op 1 allocs/op",
+	}, "\n")
+
+	if err := os.WriteFile(previous, []byte(previousText), 0o644); err != nil {
+		t.Fatalf("write previous: %v", err)
+	}
+	if err := os.WriteFile(current, []byte(currentText), 0o644); err != nil {
+		t.Fatalf("write current: %v", err)
+	}
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	code := runCLI([]string{previous, current}, &stdout, &stderr, false)
+	if code != 0 {
+		t.Fatalf("unexpected exit code %d, stderr=%q", code, stderr.String())
+	}
+
+	lines := strings.Split(strings.TrimRight(stdout.String(), "\n"), "\n")
+	if len(lines) < 3 {
+		t.Fatalf("expected data rows, blank line, and summary, got %q", stdout.String())
+	}
+	if lines[len(lines)-2] != "" {
+		t.Fatalf("expected blank line before summary, got %q", stdout.String())
+	}
+
+	summary := lines[len(lines)-1]
+	for _, fragment := range []string{"2/3 |  66% | +1", "+20ns", "+6.67%", "-1.5 KiB", "-50%", "+7", "+23.3%"} {
+		if !strings.Contains(summary, fragment) {
+			t.Fatalf("expected summary to contain %q, got %q", fragment, summary)
+		}
+	}
+	if strings.Contains(summary, "/op") {
+		t.Fatalf("summary metric values must not contain /op suffixes: %q", summary)
+	}
+}
+
 func TestRunCLIHidesInsignificantRowsWithHideFlag(t *testing.T) {
 	t.Parallel()
 
@@ -536,6 +598,44 @@ func TestBuildRowsLeavesNeutralBandUncolored(t *testing.T) {
 	}
 }
 
+func TestBuildRowsKeepsNonAllocatingBytesValueWhite(t *testing.T) {
+	t.Parallel()
+
+	previousSummaries := map[string]benchmarkSummary{
+		"Benchmark__Bar-16": {
+			Name:        "Benchmark__Bar-16",
+			DisplayName: "Bar-16",
+			Iterations:  100,
+			NSPerOp:     1000,
+			BytesPerOp:  100,
+			AllocsPerOp: 0,
+		},
+	}
+	currentSummaries := map[string]benchmarkSummary{
+		"Benchmark__Bar-16": {
+			Name:        "Benchmark__Bar-16",
+			DisplayName: "Bar-16",
+			Iterations:  100,
+			NSPerOp:     1000,
+			BytesPerOp:  130,
+			AllocsPerOp: 0,
+		},
+	}
+
+	rows := buildRows(previousSummaries, []string{"Benchmark__Bar-16"}, currentSummaries, false, true)
+	if len(rows) != 1 {
+		t.Fatalf("unexpected row count: %d", len(rows))
+	}
+
+	row := rows[0]
+	if row.Colored[4] != colorWhite+"130B/op"+colorReset {
+		t.Fatalf("unexpected B/op value color: %q", row.Colored[4])
+	}
+	if row.Colored[5] != colorWhite+"+30%"+colorReset {
+		t.Fatalf("unexpected B/op delta color: %q", row.Colored[5])
+	}
+}
+
 func TestRunCLIRendersNewBenchmarksWithZeroDeltas(t *testing.T) {
 	t.Parallel()
 
@@ -585,8 +685,8 @@ func TestRunCLIRendersNewBenchmarksWithZeroDeltas(t *testing.T) {
 	if !strings.Contains(output, "Foo-16") {
 		t.Fatalf("expected unchanged baseline benchmark to stay visible by default: %q", output)
 	}
-	if strings.Count(output, "0%") != 5 {
-		t.Fatalf("expected five percent-based neutral deltas, got %q", output)
+	if !strings.Contains(output, "1/1 | 100% | +1") {
+		t.Fatalf("expected summary progress with new benchmark count, got %q", output)
 	}
 }
 
@@ -756,9 +856,14 @@ func TestRunFollowCLIUsesPreviousWidthsAcrossSeparateRenders(t *testing.T) {
 		t.Fatal("runFollowCLI did not stop after PASS")
 	}
 
-	lines := strings.Split(strings.TrimSpace(stdout.String()), "\n")
+	var lines []string
+	for _, line := range strings.Split(strings.TrimSpace(stdout.String()), "\n") {
+		if strings.Contains(line, "VeryLongBenchmarkName-16") || strings.Contains(line, "X-16") {
+			lines = append(lines, stripCursorControls(line))
+		}
+	}
 	if len(lines) != 2 {
-		t.Fatalf("unexpected line count: %d, output=%q", len(lines), stdout.String())
+		t.Fatalf("unexpected data line count: %d, output=%q", len(lines), stdout.String())
 	}
 
 	if got, want := strings.Index(lines[0], "900ns/op")+len("900ns/op"), strings.Index(lines[1], "1_800ns/op")+len("1_800ns/op"); got != want {
@@ -766,6 +871,49 @@ func TestRunFollowCLIUsesPreviousWidthsAcrossSeparateRenders(t *testing.T) {
 	}
 	if got, want := strings.Index(lines[0], "-10%")+len("-10%"), strings.Index(lines[1], "-10%")+len("-10%"); got != want {
 		t.Fatalf("delta column is not aligned:\n%s\n%s", lines[0], lines[1])
+	}
+}
+
+func TestRenderFollowUpdateRewritesPreviousSummary(t *testing.T) {
+	t.Parallel()
+
+	firstRows := []outputRow{
+		{
+			Plain:   []string{"Foo-16", "100", "800ns/op", "-20%", "100B/op", "0%", "1 allocs/op", "0"},
+			Colored: []string{"Foo-16", "100", "800ns/op", "-20%", "100B/op", "0%", "1 allocs/op", "0"},
+		},
+	}
+	firstSummary := outputRow{
+		Plain:   []string{"1/2 |  50%", "", "-200ns", "-20%", "0B", "0%", "0", "0%"},
+		Colored: []string{"1/2 |  50%", "", "-200ns", "-20%", "0B", "0%", "0", "0%"},
+	}
+	secondRows := []outputRow{
+		{
+			Plain:   []string{"Bar-16", "100", "2_400ns/op", "+20%", "200B/op", "0%", "2 allocs/op", "0"},
+			Colored: []string{"Bar-16", "100", "2_400ns/op", "+20%", "200B/op", "0%", "2 allocs/op", "0"},
+		},
+	}
+	secondSummary := outputRow{
+		Plain:   []string{"2/2 | 100%", "", "+200ns", "+6.67%", "0B", "0%", "0", "0%"},
+		Colored: []string{"2/2 | 100%", "", "+200ns", "+6.67%", "0B", "0%", "0", "0%"},
+	}
+
+	widths := measureRowWidths(firstRows)
+	widths = growWidths(widths, firstSummary)
+	output := renderFollowUpdate(firstRows, firstSummary, widths, false, false)
+	widths = growWidths(widths, secondRows[0])
+	widths = growWidths(widths, secondSummary)
+	output += renderFollowUpdate(secondRows, secondSummary, widths, true, true)
+
+	if !strings.Contains(output, "\x1b[2A\r\x1b[J") {
+		t.Fatalf("expected follow update to clear previous blank line and summary, got %q", output)
+	}
+	lines := strings.Split(strings.TrimRight(output, "\n"), "\n")
+	last := lines[len(lines)-1]
+	for _, fragment := range []string{"2/2 | 100%", "+200ns", "+6.67%", "0B", "0%"} {
+		if !strings.Contains(last, fragment) {
+			t.Fatalf("expected latest summary to contain %q, got %q", fragment, last)
+		}
 	}
 }
 
@@ -893,6 +1041,11 @@ func TestRunFollowCLIStopsOnInterrupt(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("runFollowCLI did not stop after interrupt")
 	}
+}
+
+func stripCursorControls(line string) string {
+	line = strings.ReplaceAll(line, "\x1b[2A\r\x1b[J", "")
+	return strings.ReplaceAll(line, "\x1b[1A\r\x1b[J", "")
 }
 
 func appendText(path string, text string) error {
